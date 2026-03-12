@@ -1,0 +1,29 @@
+# Credentials & secrets
+.credentials.json
+
+# Ephemeral state
+history.jsonl
+mcp-needs-auth-cache.json
+
+# Plugin runtime data
+plugins/
+
+# Scratch/tmp folder
+tmp/
+
+# Runtime/cache directories
+cache/
+debug/
+downloads/
+backups/
+file-history/
+session-env/
+shell-snapshots/
+telemetry/
+
+# Project-specific data (per-project, not global)
+projects/
+
+# Tasks & plans (session-specific)
+tasks/
+plans/
