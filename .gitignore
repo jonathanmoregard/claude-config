@@ -20,6 +20,8 @@ file-history/
 session-env/
 shell-snapshots/
 telemetry/
+paste-cache/
+sessions/
 
 # Project-specific data (per-project, not global)
 projects/
