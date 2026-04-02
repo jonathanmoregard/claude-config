@@ -1,28 +1,4 @@
 {
-  "hooks": {
-    "UserPromptSubmit": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "$HOME/.claude/opus-warn.sh"
-          }
-        ]
-      }
-    ],
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/home/jonathan/.local/bin/dcg"
-          }
-        ]
-      }
-    ]
-  },
   "permissions": {
     "allow": [
       "Bash",
@@ -50,12 +26,56 @@
       "Read(~/.gem/credentials)"
     ]
   },
+  "model": "opus",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.claude/opus-warn.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "You are a JSON-only evaluator. You MUST respond with a single JSON object and NOTHING else. No markdown, no code fences, no explanation, no preamble. Just the raw JSON object.\n\nReview the assistant's final response. Reject if the assistant is rationalizing incomplete work: claiming issues are 'pre-existing' or 'out of scope', saying 'too many issues' to fix, deferring to unrequested 'follow-ups', listing problems without fixing them, or skipping test/lint failures with excuses.\n\nIf any of those patterns apply, respond:\n{\"ok\": false, \"reason\": \"You are rationalizing incomplete work. [specific issue]. Go back and finish.\"}\n\nOtherwise respond:\n{\"ok\": true}"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/jonathan/.local/bin/dcg"
+          }
+        ]
+      }
+    ]
+  },
   "enabledPlugins": {
     "skill-creator@claude-plugins-official": true,
     "code-review@claude-plugins-official": true,
     "code-simplifier@claude-plugins-official": true,
     "typescript-lsp@claude-plugins-official": true,
-    "security-guidance@claude-plugins-official": true
+    "security-guidance@claude-plugins-official": true,
+    "ask-questions-if-underspecified@trailofbits": true,
+    "claude-in-chrome-troubleshooting@trailofbits": true,
+    "insecure-defaults@trailofbits": true,
+    "property-based-testing@trailofbits": true,
+    "sharp-edges@trailofbits": true,
+    "supply-chain-risk-auditor@trailofbits": true,
+    "humanizer@skills-curated": true,
+    "openai-gh-fix-ci@skills-curated": true,
+    "security-awareness@skills-curated": true
   },
   "voiceEnabled": true
 }
