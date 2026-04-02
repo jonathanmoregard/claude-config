@@ -66,16 +66,9 @@
     "code-review@claude-plugins-official": true,
     "code-simplifier@claude-plugins-official": true,
     "typescript-lsp@claude-plugins-official": true,
-    "security-guidance@claude-plugins-official": true,
     "ask-questions-if-underspecified@trailofbits": true,
-    "claude-in-chrome-troubleshooting@trailofbits": true,
     "insecure-defaults@trailofbits": true,
-    "property-based-testing@trailofbits": true,
-    "sharp-edges@trailofbits": true,
-    "supply-chain-risk-auditor@trailofbits": true,
-    "humanizer@skills-curated": true,
-    "openai-gh-fix-ci@skills-curated": true,
-    "security-awareness@skills-curated": true
+    "sharp-edges@trailofbits": true
   },
   "voiceEnabled": true
 }
