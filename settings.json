@@ -28,7 +28,6 @@
       "Read(~/.gem/credentials)"
     ]
   },
-  "model": "opus",
   "hooks": {
     "UserPromptSubmit": [
       {
@@ -37,11 +36,14 @@
           {
             "type": "command",
             "command": "$HOME/.claude/opus-warn.sh"
+          },
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/context-baggage.py"
           }
         ]
       }
     ],
-
     "PreToolUse": [
       {
         "matcher": "Bash",
@@ -54,6 +56,10 @@
       }
     ]
   },
+  "statusLine": {
+    "type": "command",
+    "command": "npx -y @owloops/claude-powerline@latest --style=powerline"
+  },
   "enabledPlugins": {
     "skill-creator@claude-plugins-official": true,
     "code-review@claude-plugins-official": true,
@@ -63,9 +69,5 @@
     "insecure-defaults@trailofbits": true,
     "sharp-edges@trailofbits": true
   },
-  "voiceEnabled": true,
-  "statusLine": {
-    "type": "command",
-    "command": "npx -y @owloops/claude-powerline@latest --style=powerline"
-  }
+  "voiceEnabled": true
 }
