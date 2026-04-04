@@ -22,6 +22,7 @@ shell-snapshots/
 telemetry/
 paste-cache/
 sessions/
+powerline/usage/today.json
 
 # Project-specific data (per-project, not global)
 projects/
