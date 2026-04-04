@@ -72,5 +72,9 @@
     "insecure-defaults@trailofbits": true,
     "sharp-edges@trailofbits": true
   },
-  "voiceEnabled": true
+  "voiceEnabled": true,
+  "statusLine": {
+    "type": "command",
+    "command": "npx -y @owloops/claude-powerline@latest --style=powerline"
+  }
 }
