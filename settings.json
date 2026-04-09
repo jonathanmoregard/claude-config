@@ -4,8 +4,6 @@
       "Bash",
       "Edit",
       "Write",
-      "Edit(~/.claude/**)",
-      "Write(~/.claude/**)",
       "Glob",
       "Grep",
       "WebFetch",
@@ -42,10 +40,6 @@
           {
             "type": "command",
             "command": "python3 $HOME/.claude/context-baggage.py"
-          },
-          {
-            "type": "command",
-            "command": "python3 $HOME/.claude/date-reminder-hook.py"
           }
         ]
       }
