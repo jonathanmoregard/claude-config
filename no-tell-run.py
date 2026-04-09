@@ -121,23 +121,23 @@ def main():
 
     commands = extract_candidate_commands(text)
 
-    should_flag = False
+    flagged_cmd = None
     for cmd in commands:
         if needs_sudo(cmd):
             continue
         if dcg_would_block(cmd):
             continue
-        should_flag = True
+        flagged_cmd = cmd
         break
 
-    if not should_flag:
+    if flagged_cmd is None:
         sys.exit(0)
 
     print(json.dumps({
         "decision": "block",
         "reason": (
-            "don't tell the user to run commands you can run yourself. "
-            "Just run the command!"
+            f"~/.claude/no-tell-run.py activated! It looks like you asked the user to run the command {flagged_cmd}. "
+            "If this is true, run it yourself instead. If this is not the case, then reply \"mu!\""
         ),
     }))
 

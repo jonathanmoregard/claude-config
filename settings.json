@@ -40,10 +40,6 @@
           {
             "type": "command",
             "command": "python3 $HOME/.claude/context-baggage.py"
-          },
-          {
-            "type": "command",
-            "command": "python3 $HOME/.claude/date-reminder-hook.py"
           }
         ]
       }
