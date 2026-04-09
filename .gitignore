@@ -23,6 +23,7 @@ telemetry/
 paste-cache/
 sessions/
 powerline/usage/today.json
+powerline/usage/pricing.json
 
 # Project-specific data (per-project, not global)
 projects/

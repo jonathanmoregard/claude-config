@@ -54,6 +54,16 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/no-tell-run.py"
+          }
+        ]
+      }
     ]
   },
   "statusLine": {
