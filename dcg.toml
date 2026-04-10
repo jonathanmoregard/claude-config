@@ -14,12 +14,9 @@ disabled = []
 allow = []
 
 # Block destructive HTTP methods via common CLI tools and Python clients.
-# When blocked, Claude will explain what it was trying to do and ask for
-# explicit approval. To bypass: either run the command yourself with
-# `! <command>` in the prompt, or tell Claude to proceed and it will use
-# `dcg allowlist add` to temporarily whitelist, run, then remove the rule.
-# Note: custom [overrides] block patterns do not generate allow-once codes
-# (only built-in packs do). Use the manual bypass flows above instead.
+# Bypass: run the command yourself with `! <command>` in the Claude Code
+# prompt. Claude cannot bypass these blocks on your behalf.
+# Note: custom [overrides] block patterns do not generate allow-once codes.
 #
 # Known gaps (DCG cannot catch these reliably):
 #   - Variable-interpolated methods: METHOD=DELETE; curl -X $METHOD ...
@@ -29,35 +26,35 @@ allow = []
 block = [
     # ── DELETE / PUT / PATCH — always destructive ─────────────────────────
     # curl: short flag (-X) and long flag (--request)
-    { pattern = "curl.*-X\\s+(DELETE|PUT|PATCH)", reason = "Destructive HTTP method — deletes or overwrites a remote resource. Say 'proceed' for Claude to bypass, or run it yourself with ! <command>." },
-    { pattern = "curl.*--request\\s+(DELETE|PUT|PATCH)", reason = "Destructive HTTP method — deletes or overwrites a remote resource. Say 'proceed' for Claude to bypass, or run it yourself with ! <command>." },
+    { pattern = "curl.*-X\\s+(DELETE|PUT|PATCH)", reason = "Destructive HTTP method — deletes or overwrites a remote resource. Run it yourself with `! <command>` if intentional." },
+    { pattern = "curl.*--request\\s+(DELETE|PUT|PATCH)", reason = "Destructive HTTP method — deletes or overwrites a remote resource. Run it yourself with `! <command>` if intentional." },
 
     # wget
-    { pattern = "wget.*--method[=\\s](DELETE|PUT|PATCH)", reason = "Destructive HTTP method via wget — modifies or deletes a remote resource. Say 'proceed' to bypass." },
+    { pattern = "wget.*--method[=\\s](DELETE|PUT|PATCH)", reason = "Destructive HTTP method via wget — modifies or deletes a remote resource. Run it yourself with `! <command>` if intentional." },
 
     # httpie CLI: `http DELETE url`, `http PUT url`, `http PATCH url`
-    { pattern = "\\bhttp\\s+(DELETE|PUT|PATCH)\\s", reason = "httpie destructive HTTP method — modifies or deletes a remote resource. Say 'proceed' to bypass." },
+    { pattern = "\\bhttp\\s+(DELETE|PUT|PATCH)\\s", reason = "httpie destructive HTTP method — modifies or deletes a remote resource. Run it yourself with `! <command>` if intentional." },
 
     # Python requests library
-    { pattern = "requests\\.(delete|put|patch)\\(", reason = "Python requests destructive HTTP call — modifies or deletes a remote resource. Say 'proceed' to bypass." },
+    { pattern = "requests\\.(delete|put|patch)\\(", reason = "Python requests destructive HTTP call — modifies or deletes a remote resource. Run it yourself with `! <command>` if intentional." },
 
     # Python httpx library
-    { pattern = "httpx\\.(delete|put|patch)\\(", reason = "Python httpx destructive HTTP call — modifies or deletes a remote resource. Say 'proceed' to bypass." },
+    { pattern = "httpx\\.(delete|put|patch)\\(", reason = "Python httpx destructive HTTP call — modifies or deletes a remote resource. Run it yourself with `! <command>` if intentional." },
 
     # ── POST — requires explicit user approval ─────────────────────────────
     # curl: short flag (-X) and long flag (--request)
-    { pattern = "curl.*-X\\s+POST", reason = "POST to external API requires explicit approval. Say 'proceed' for Claude to bypass, or run it yourself with ! <command>." },
-    { pattern = "curl.*--request\\s+POST", reason = "POST to external API requires explicit approval. Say 'proceed' for Claude to bypass, or run it yourself with ! <command>." },
+    { pattern = "curl.*-X\\s+POST", reason = "POST to external API requires explicit approval. Run it yourself with `! <command>` if intentional." },
+    { pattern = "curl.*--request\\s+POST", reason = "POST to external API requires explicit approval. Run it yourself with `! <command>` if intentional." },
 
     # wget
-    { pattern = "wget.*--method[=\\s]POST", reason = "POST via wget requires explicit approval. Say 'proceed' to bypass." },
+    { pattern = "wget.*--method[=\\s]POST", reason = "POST via wget requires explicit approval. Run it yourself with `! <command>` if intentional." },
 
     # httpie CLI
-    { pattern = "\\bhttp\\s+POST\\s", reason = "httpie POST requires explicit approval. Say 'proceed' to bypass." },
+    { pattern = "\\bhttp\\s+POST\\s", reason = "httpie POST requires explicit approval. Run it yourself with `! <command>` if intentional." },
 
     # Python requests library
-    { pattern = "requests\\.post\\(", reason = "Python requests POST requires explicit approval. Say 'proceed' to bypass." },
+    { pattern = "requests\\.post\\(", reason = "Python requests POST requires explicit approval. Run it yourself with `! <command>` if intentional." },
 
     # Python httpx library
-    { pattern = "httpx\\.post\\(", reason = "Python httpx POST requires explicit approval. Say 'proceed' to bypass." },
+    { pattern = "httpx\\.post\\(", reason = "Python httpx POST requires explicit approval. Run it yourself with `! <command>` if intentional." },
 ]
