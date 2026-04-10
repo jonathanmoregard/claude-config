@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-UserPromptSubmit hook: surfaces a pending date-night suggestion at the start
-of a Claude Code session (once per pending suggestion).
+UserPromptSubmit hook: injects a pending date-night suggestion once per session.
+Uses session_id to fire on the first message of each new session only.
 
-Config: ~/Dropbox/1. Exocortex/_Engine/automation/dates/config.json
-State:  ~/Dropbox/1. Exocortex/_Engine/automation/dates/state.json
+State: ~/.claude/dates/state.json
 """
 import json
 import os
@@ -22,58 +21,56 @@ def load_json(path, default=None):
         with open(path) as f:
             return json.load(f)
     except Exception:
-        return default
+        return default if default is not None else {}
 
 
 def main():
     try:
-        json.load(sys.stdin)
+        hook_input = json.load(sys.stdin)
     except Exception:
-        pass
-
-    os.makedirs(DATES_DIR, exist_ok=True)
-
-    if not os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "w") as f:
-            json.dump(DEFAULT_STATE, f, indent=2)
         sys.exit(0)
 
+    session_id = hook_input.get("session_id", "")
+
+    os.makedirs(DATES_DIR, exist_ok=True)
     state = load_json(STATE_FILE, DEFAULT_STATE)
-    config = load_json(CONFIG_FILE, {})
-    partner = config.get("partner_name", "your partner")
 
     suggestion = state.get("pending_suggestion")
     if not suggestion:
         sys.exit(0)
 
-    if suggestion.get("shown"):
+    # Only fire once per session
+    if state.get("last_nudge_session") == session_id:
         sys.exit(0)
 
+    config = load_json(CONFIG_FILE, {})
+    partner = config.get("partner_name", "your partner")
     idea = suggestion.get("idea", "a date")
-    windows = suggestion.get("suggested_windows", [])
 
-    parts = [
-        f"Date reminder: no date with {partner} is planned in the next 2 weeks.",
-        f"Suggested idea: {idea}.",
-    ]
-    if windows:
-        parts.append("Good windows: " + "; ".join(windows) + ".")
+    from datetime import datetime
+    created = suggestion.get("created_at", "")
+    try:
+        days_pending = (datetime.now().date() - datetime.fromisoformat(created).date()).days
+    except Exception:
+        days_pending = None
 
-    parts.append(
-        "Mention this to the user when a task is done or just before getting started, "
-        "or if the user has been away for some time and then writes a message (time gap)."
+    days_str = f" (pending {days_pending}d)" if days_pending is not None else ""
+
+    context = (
+        f"Date reminder: fewer than 2 dates with {partner} are planned in the next 31 days. "
+        f"Suggested idea: {idea}{days_str}. "
+        f"Bring this up at a natural moment — when the user completes a task, starts a new one, "
+        f"or there's a lull. Keep it brief and casual, one sentence."
     )
 
-    # Print first — if output fails, we haven't consumed the one-shot yet.
     print(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
-            "additionalContext": " ".join(parts)
+            "additionalContext": context,
         }
     }))
 
-    # Mark as shown so subsequent sessions don't re-surface the same suggestion.
-    suggestion["shown"] = True
+    state["last_nudge_session"] = session_id
     try:
         with open(STATE_FILE, "w") as f:
             json.dump(state, f, indent=2)

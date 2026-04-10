@@ -3,7 +3,7 @@
 # Agent access: Read + Write only (no MCP, no calendar).
 # Escalation (creating a TickTick reminder) is handled here in the shell,
 # not by the agent — the agent never touches the todo_created flag.
-# Cron: CRON_TZ=Europe/Stockholm 0 9 * * 1  (Mondays at 9am local time)
+# Cron: CRON_TZ=Europe/Stockholm 0 9 * * 1  (Mondays at 09:00 Stockholm time)
 
 set -euo pipefail
 
@@ -78,18 +78,25 @@ m = date.today().month
 print('Winter' if m in (12,1,2) else 'Spring' if m in (3,4,5) else 'Summer' if m in (6,7,8) else 'Fall')
 ")
 
+# ── Check Google Calendar (shell-side, no MCP needed) ────────────────────────
+GCAL_RESULT=$(python3 "$HOME/.claude/gcal-check.py" --partner "$PARTNER" --days 31 2>/dev/null \
+  || echo "GCAL_ERROR: gcal-check.py failed")
+echo "Calendar check: $GCAL_RESULT"
+
 # ── Run the agent (Read + Write only) ────────────────────────────────────────
 PROMPT="You are a weekly date-night planner helping Jonathan stay on a regular date rhythm with $PARTNER in $CITY.
 
 ## Context
 - Today: $TODAY ($MONTH, $SEASON)
 - Target: ~$DATES_PER_MONTH dates per month
-- Config: $CONFIG_FILE
 - State file: $STATE_FILE
 - Ideas file: $IDEAS_FILE
 
 ## 14-Day Weather Forecast ($CITY)
 $WEATHER_SUMMARY
+
+## Google Calendar Result
+$GCAL_RESULT
 
 ## Your Task
 
@@ -97,10 +104,19 @@ $WEATHER_SUMMARY
 
 ### Step 2 — Decide and write state
 
-**Case A — No pending suggestion:**
-1. Pick ONE idea from ideas.md that fits the current season ($SEASON).
-   Prefer outdoor ideas when the next few days look clear; indoor otherwise. Vary picks over time.
-2. Write:
+The calendar result starts with DATE_COUNT: N where N is the number of upcoming dates with $PARTNER in the next 31 days.
+
+**Case A — DATE_COUNT is 2 or more (or GCAL_ERROR and you want to be safe):**
+Enough dates are planned. Clear any pending suggestion and write:
+{
+  \"last_checked\": \"$TODAY\",
+  \"pending_suggestion\": null
+}
+
+**Case B — DATE_COUNT is 0 or 1, and no pending suggestion exists:**
+Pick ONE idea from ideas.md that fits the current season ($SEASON).
+Prefer outdoor ideas when the next few days look clear; indoor otherwise. Vary picks over time.
+Write:
 {
   \"last_checked\": \"$TODAY\",
   \"pending_suggestion\": {
@@ -111,18 +127,34 @@ $WEATHER_SUMMARY
   }
 }
 
-**Case B — Pending suggestion already exists:**
-Only update last_checked. Leave pending_suggestion unchanged.
+**Case C — DATE_COUNT is 0 or 1, and a pending suggestion already exists:**
+Only update last_checked. Leave pending_suggestion completely unchanged.
 Do NOT touch the todo_created flag — the shell script owns escalation.
 
 ## Rules
-- Write state as valid JSON with 2-space indentation.
-- End with ONE summary line of what action you took.
+- Do NOT use any Write tool. Instead, output the new state JSON on a single line
+  prefixed exactly with: STATE_JSON:
+  followed immediately by the compact JSON (no newlines inside it).
+- After that line, end with ONE summary line of what action you took.
 "
 
-"$CLAUDE" --print --dangerously-skip-permissions \
-  --allowedTools "Read,Write" \
-  -p "$PROMPT"
+AGENT_OUTPUT=$("$CLAUDE" --print --dangerously-skip-permissions \
+  --allowedTools "Read" \
+  -p "$PROMPT")
+
+echo "$AGENT_OUTPUT"
+
+# Extract and write the state JSON (shell owns all writes)
+STATE_LINE=$(echo "$AGENT_OUTPUT" | grep '^STATE_JSON:')
+if [[ -n "$STATE_LINE" ]]; then
+  NEW_STATE="${STATE_LINE#STATE_JSON:}"
+  echo "$NEW_STATE" | python3 -c "import json,sys; json.dumps(json.load(sys.stdin))" 2>/dev/null \
+    && echo "$NEW_STATE" | python3 -c "import json,sys; print(json.dumps(json.load(sys.stdin), indent=2))" > "$STATE_FILE" \
+    && echo "State written by shell." \
+    || echo "State parse error — not written."
+else
+  echo "No STATE_JSON line found in agent output — state not updated."
+fi
 
 # ── Escalation: create a TickTick reminder if suggestion has sat for 7+ days ─
 # The shell owns the todo_created flag. The agent never sets it.
