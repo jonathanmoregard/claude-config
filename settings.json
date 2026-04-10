@@ -4,8 +4,6 @@
       "Bash",
       "Edit",
       "Write",
-      "Edit(//home/jonathan/.claude/**)",
-      "Write(//home/jonathan/.claude/**)",
       "Glob",
       "Grep",
       "WebFetch",
@@ -27,7 +25,11 @@
       "Read(~/.kube/**)",
       "Read(~/.npmrc)",
       "Read(~/.pypirc)",
-      "Read(~/.gem/credentials)"
+      "Read(~/.gem/credentials)",
+      "Read(~/.config/todo/env)",
+      "Read(~/Dropbox/1. Exocortex/**)",
+      "Edit(~/Dropbox/1. Exocortex/**)",
+      "Write(~/Dropbox/1. Exocortex/**)"
     ]
   },
   "hooks": {
@@ -42,6 +44,10 @@
           {
             "type": "command",
             "command": "python3 $HOME/.claude/context-baggage.py"
+          },
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/date-reminder-hook.py"
           }
         ]
       }

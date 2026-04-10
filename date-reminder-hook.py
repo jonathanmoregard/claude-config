@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""
+UserPromptSubmit hook: injects a pending date-night suggestion once per session.
+Uses session_id to fire on the first message of each new session only.
+
+State: ~/.claude/dates/state.json
+"""
+import json
+import os
+import sys
+
+DATES_DIR = os.path.expanduser("~/.claude/dates")
+CONFIG_FILE = os.path.join(DATES_DIR, "config.json")
+STATE_FILE  = os.path.join(DATES_DIR, "state.json")
+
+DEFAULT_STATE = {"last_checked": None, "pending_suggestion": None}
+
+
+def load_json(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default if default is not None else {}
+
+
+def main():
+    try:
+        hook_input = json.load(sys.stdin)
+    except Exception:
+        sys.exit(0)
+
+    session_id = hook_input.get("session_id", "")
+
+    os.makedirs(DATES_DIR, exist_ok=True)
+    state = load_json(STATE_FILE, DEFAULT_STATE)
+
+    suggestion = state.get("pending_suggestion")
+    if not suggestion:
+        sys.exit(0)
+
+    # Only fire once per session
+    if state.get("last_nudge_session") == session_id:
+        sys.exit(0)
+
+    config = load_json(CONFIG_FILE, {})
+    partner = config.get("partner_name", "your partner")
+    idea = suggestion.get("idea", "a date")
+
+    from datetime import datetime
+    created = suggestion.get("created_at", "")
+    try:
+        days_pending = (datetime.now().date() - datetime.fromisoformat(created).date()).days
+    except Exception:
+        days_pending = None
+
+    days_str = f" (pending {days_pending}d)" if days_pending is not None else ""
+
+    context = (
+        f"Date reminder: fewer than 2 dates with {partner} are planned in the next 31 days. "
+        f"Suggested idea: {idea}{days_str}. "
+        f"Bring this up at a natural moment — when the user completes a task, starts a new one, "
+        f"or there's a lull. Keep it brief and casual, one sentence."
+    )
+
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": context,
+        }
+    }))
+
+    state["last_nudge_session"] = session_id
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    main()
