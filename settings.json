@@ -25,7 +25,8 @@
       "Read(~/.kube/**)",
       "Read(~/.npmrc)",
       "Read(~/.pypirc)",
-      "Read(~/.gem/credentials)"
+      "Read(~/.gem/credentials)",
+      "Read(~/.config/todo/env)"
     ]
   },
   "hooks": {
@@ -40,6 +41,10 @@
           {
             "type": "command",
             "command": "python3 $HOME/.claude/context-baggage.py"
+          },
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/date-reminder-hook.py"
           }
         ]
       }

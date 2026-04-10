@@ -122,7 +122,7 @@ Write: { \"last_checked\": \"$TODAY\", \"pending_suggestion\": null }
     \"idea\": \"<chosen idea>\",
     \"suggested_windows\": [\"<e.g. Sat Apr 19 evening — Clear sky, 15°C>\", \"<window 2>\"],
     \"created_at\": \"$TODAY\",
-    \"shown_in_session\": false,
+    \"shown\": false,
     \"todo_created\": false
   }
 }

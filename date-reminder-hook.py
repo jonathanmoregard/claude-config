@@ -46,16 +46,8 @@ def main():
     if not suggestion:
         sys.exit(0)
 
-    if suggestion.get("shown_in_session"):
+    if suggestion.get("shown"):
         sys.exit(0)
-
-    # Mark as shown before outputting (prevents double-firing if hook runs twice)
-    suggestion["shown_in_session"] = True
-    try:
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f, indent=2)
-    except Exception:
-        pass
 
     idea = suggestion.get("idea", "a date")
     windows = suggestion.get("suggested_windows", [])
@@ -72,12 +64,21 @@ def main():
         "or if the user has been away for some time and then writes a message (time gap)."
     )
 
+    # Print first — if output fails, we haven't consumed the one-shot yet.
     print(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
             "additionalContext": " ".join(parts)
         }
     }))
+
+    # Mark as shown so subsequent sessions don't re-surface the same suggestion.
+    suggestion["shown"] = True
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
