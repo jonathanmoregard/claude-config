@@ -10,7 +10,7 @@ import json
 import os
 import sys
 
-DATES_DIR = os.path.expanduser("~/Dropbox/1. Exocortex/_Engine/automation/dates")
+DATES_DIR = os.path.expanduser("~/.claude/dates")
 CONFIG_FILE = os.path.join(DATES_DIR, "config.json")
 STATE_FILE  = os.path.join(DATES_DIR, "state.json")
 

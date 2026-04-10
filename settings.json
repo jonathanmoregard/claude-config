@@ -26,7 +26,10 @@
       "Read(~/.npmrc)",
       "Read(~/.pypirc)",
       "Read(~/.gem/credentials)",
-      "Read(~/.config/todo/env)"
+      "Read(~/.config/todo/env)",
+      "Read(~/Dropbox/1. Exocortex/**)",
+      "Edit(~/Dropbox/1. Exocortex/**)",
+      "Write(~/Dropbox/1. Exocortex/**)"
     ]
   },
   "hooks": {
@@ -84,17 +87,5 @@
     "insecure-defaults@trailofbits": true,
     "sharp-edges@trailofbits": true
   },
-  "voiceEnabled": true,
-  "mcpServers": {
-    "google-calendar": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@cocal/google-calendar-mcp"
-      ],
-      "env": {
-        "GOOGLE_OAUTH_CREDENTIALS": "/home/jonathan/.config/google-calendar-mcp/gcp-oauth.keys.json"
-      }
-    }
-  }
+  "voiceEnabled": true
 }

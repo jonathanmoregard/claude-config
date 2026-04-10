@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
 # Weekly date-checker.
-# Agent access: Read + Write + Google Calendar MCP only (--strict-mcp-config).
+# Agent access: Read + Write only (no MCP, no calendar).
 # Escalation (creating a TickTick reminder) is handled here in the shell,
 # not by the agent — the agent never touches the todo_created flag.
 # Cron: CRON_TZ=Europe/Stockholm 0 9 * * 1  (Mondays at 9am local time)
 
 set -euo pipefail
 
-DATES_DIR="$HOME/Dropbox/1. Exocortex/_Engine/automation/dates"
+DATES_DIR="$HOME/.claude/dates"
 CONFIG_FILE="$DATES_DIR/config.json"
 STATE_FILE="$DATES_DIR/state.json"
 IDEAS_FILE="$DATES_DIR/ideas.md"
-MCP_CONFIG="$HOME/.claude/date-check-mcp.json"
 LOG_FILE="$HOME/.claude/tmp/date-check.log"
 CLAUDE="$HOME/.local/bin/claude"
 TODO_ADD="$HOME/.claude/todo-add"
@@ -79,7 +78,7 @@ m = date.today().month
 print('Winter' if m in (12,1,2) else 'Spring' if m in (3,4,5) else 'Summer' if m in (6,7,8) else 'Fall')
 ")
 
-# ── Run the agent (Read + Write + Google Calendar MCP only) ──────────────────
+# ── Run the agent (Read + Write only) ────────────────────────────────────────
 PROMPT="You are a weekly date-night planner helping Jonathan stay on a regular date rhythm with $PARTNER in $CITY.
 
 ## Context
@@ -94,54 +93,35 @@ $WEATHER_SUMMARY
 
 ## Your Task
 
-### Step 1 — Check Jonathan's Google Calendar
-Fetch events for the next 14 days. Identify any that look like a planned date or social
-outing with $PARTNER: events mentioning '$PARTNER', 'date', 'dinner', 'restaurant',
-'bio', 'concert', 'museum', 'weekend trip', or any deliberate shared activity.
+### Step 1 — Read state and ideas files
 
-### Step 2 — Check $PARTNER's freebusy
-Query ONLY the freebusy (busy time blocks) for $PARTNER's calendar for the next 14 days.
-Do NOT read event titles or details — freebusy only. This is a hard privacy requirement.
+### Step 2 — Decide and write state
 
-### Step 3 — Read state and ideas files
-
-### Step 4 — Decide and write state
-
-**Case A — A date IS already planned in the next 14 days:**
-Write: { \"last_checked\": \"$TODAY\", \"pending_suggestion\": null }
-
-**Case B — No date found, no pending suggestion:**
-1. Find 2–3 time windows where both are free: evenings (after 17:00) or weekends.
-   Prefer windows with good weather for outdoor ideas (avoid rain/thunderstorm).
-2. Pick ONE idea from ideas.md that fits the current season ($SEASON) and those windows.
-   Prefer outdoor when weather is good; indoor otherwise. Vary picks over time.
-3. Write:
+**Case A — No pending suggestion:**
+1. Pick ONE idea from ideas.md that fits the current season ($SEASON).
+   Prefer outdoor ideas when the next few days look clear; indoor otherwise. Vary picks over time.
+2. Write:
 {
   \"last_checked\": \"$TODAY\",
   \"pending_suggestion\": {
     \"idea\": \"<chosen idea>\",
-    \"suggested_windows\": [\"<e.g. Sat Apr 19 evening — Clear sky, 15°C>\", \"<window 2>\"],
     \"created_at\": \"$TODAY\",
     \"shown\": false,
     \"todo_created\": false
   }
 }
 
-**Case C — No date found, pending suggestion already exists:**
+**Case B — Pending suggestion already exists:**
 Only update last_checked. Leave pending_suggestion unchanged.
 Do NOT touch the todo_created flag — the shell script owns escalation.
 
 ## Rules
 - Write state as valid JSON with 2-space indentation.
-- If the Calendar MCP is unavailable: update last_checked only; do not clear a pending suggestion.
-- If $PARTNER's freebusy is unavailable: proceed without suggested_windows.
 - End with ONE summary line of what action you took.
 "
 
 "$CLAUDE" --print --dangerously-skip-permissions \
   --allowedTools "Read,Write" \
-  --mcp-config "$MCP_CONFIG" \
-  --strict-mcp-config \
   -p "$PROMPT"
 
 # ── Escalation: create a TickTick reminder if suggestion has sat for 7+ days ─
@@ -181,16 +161,8 @@ if days_old < 7:
     sys.exit(0)
 
 idea = s.get("idea", "Plan a date")
-windows = s.get("suggested_windows", []) or []
 title = f"Plan date with {partner}: {idea}"
-notes_lines = [f"No date with {partner} planned in the next 2 weeks."]
-if windows:
-    notes_lines.append("")
-    notes_lines.append("Good windows:")
-    notes_lines.extend(f"- {w}" for w in windows)
-notes = "\n".join(notes_lines)
-
-# Due in 3 days to nudge soon without being instant.
+notes = f"No date with {partner} planned recently. Suggestion: {idea}"
 due = (date.today() + timedelta(days=3)).isoformat()
 
 try:
