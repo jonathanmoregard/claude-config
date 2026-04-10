@@ -31,3 +31,4 @@ projects/
 # Tasks & plans (session-specific)
 tasks/
 plans/
+**/__pycache__/
