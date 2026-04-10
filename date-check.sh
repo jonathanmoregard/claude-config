@@ -1,14 +1,11 @@
 #!/usr/bin/env bash
 # Weekly date-checker.
 # Agent access: Read + Write + Google Calendar MCP only (--strict-mcp-config).
-# Email fallback handled here in the shell, not by the agent.
-# Cron: 0 7 * * 1 (Mondays at 7am UTC = 9am Europe/Stockholm)
+# Escalation (creating a TickTick reminder) is handled here in the shell,
+# not by the agent — the agent never touches the todo_created flag.
+# Cron: CRON_TZ=Europe/Stockholm 0 9 * * 1  (Mondays at 9am local time)
 
 set -euo pipefail
-
-# Load credentials (kept outside the repo, chmod 600)
-# shellcheck source=/dev/null
-[ -f "$HOME/.config/date-check/env" ] && source "$HOME/.config/date-check/env"
 
 DATES_DIR="$HOME/Dropbox/1. Exocortex/_Engine/automation/dates"
 CONFIG_FILE="$DATES_DIR/config.json"
@@ -17,17 +14,24 @@ IDEAS_FILE="$DATES_DIR/ideas.md"
 MCP_CONFIG="$HOME/.claude/date-check-mcp.json"
 LOG_FILE="$HOME/.claude/tmp/date-check.log"
 CLAUDE="$HOME/.local/bin/claude"
+TODO_ADD="$HOME/.claude/todo-add"
 
 mkdir -p "$(dirname "$LOG_FILE")"
 exec >> "$LOG_FILE" 2>&1
 echo "--- $(date '+%Y-%m-%d %H:%M:%S') ---"
 
-# Load config
-PARTNER=$(python3 -c "import json; d=json.load(open('$CONFIG_FILE')); print(d['partner_name'])")
-CITY=$(python3 -c "import json; d=json.load(open('$CONFIG_FILE')); print(d['city'])")
-LAT=$(python3 -c "import json; d=json.load(open('$CONFIG_FILE')); print(d['city_lat'])")
-LON=$(python3 -c "import json; d=json.load(open('$CONFIG_FILE')); print(d['city_lon'])")
-DATES_PER_MONTH=$(python3 -c "import json; d=json.load(open('$CONFIG_FILE')); print(d['dates_per_month'])")
+# Load config in one python invocation.
+eval "$(CONFIG_FILE="$CONFIG_FILE" python3 <<'PYEOF'
+import json, os, shlex
+d = json.load(open(os.environ["CONFIG_FILE"]))
+for k in ("partner_name", "city", "city_lat", "city_lon", "dates_per_month"):
+    print(f"{k.upper()}={shlex.quote(str(d[k]))}")
+PYEOF
+)"
+PARTNER="$PARTNER_NAME"
+CITY="$CITY"
+LAT="$CITY_LAT"
+LON="$CITY_LON"
 
 # Fetch 14-day weather forecast from Open-Meteo (no API key required)
 WEATHER_RAW=$(curl -sf \
@@ -119,16 +123,13 @@ Write: { \"last_checked\": \"$TODAY\", \"pending_suggestion\": null }
     \"suggested_windows\": [\"<e.g. Sat Apr 19 evening — Clear sky, 15°C>\", \"<window 2>\"],
     \"created_at\": \"$TODAY\",
     \"shown_in_session\": false,
-    \"email_sent\": false
+    \"todo_created\": false
   }
 }
 
-**Case C — No date found, pending suggestion exists, created_at is 7+ days ago, email_sent is false:**
-Update state: set email_sent to true, update last_checked. Keep idea and suggested_windows.
-(The shell script will send the actual email — you just flip the flag.)
-
-**Case D — No date found, pending suggestion < 7 days old:**
+**Case C — No date found, pending suggestion already exists:**
 Only update last_checked. Leave pending_suggestion unchanged.
+Do NOT touch the todo_created flag — the shell script owns escalation.
 
 ## Rules
 - Write state as valid JSON with 2-space indentation.
@@ -143,52 +144,72 @@ Only update last_checked. Leave pending_suggestion unchanged.
   --strict-mcp-config \
   -p "$PROMPT"
 
-# ── Email fallback (handled here, not by the agent) ──────────────────────────
-STATE=$(python3 -c "import json; print(json.dumps(json.load(open('$STATE_FILE'))))" 2>/dev/null || echo "{}")
+# ── Escalation: create a TickTick reminder if suggestion has sat for 7+ days ─
+# The shell owns the todo_created flag. The agent never sets it.
+STATE_FILE="$STATE_FILE" TODO_ADD="$TODO_ADD" PARTNER="$PARTNER" python3 <<'PYEOF'
+import json, os, subprocess, sys
+from datetime import date, datetime, timedelta
 
-SHOULD_EMAIL=$(python3 << PYEOF
-import json, sys
-from datetime import date, datetime
-state = json.loads('''$STATE''')
-s = state.get("pending_suggestion")
-if not s or s.get("email_sent"):
-    print("no"); sys.exit(0)
+state_file = os.environ["STATE_FILE"]
+todo_add   = os.environ["TODO_ADD"]
+partner    = os.environ["PARTNER"]
+
+try:
+    with open(state_file) as f:
+        state = json.load(f)
+except Exception as e:
+    print(f"Escalation: cannot read state ({e}), skipping.")
+    sys.exit(0)
+
+s = state.get("pending_suggestion") or {}
+if not s:
+    print("Escalation: no pending suggestion.")
+    sys.exit(0)
+if s.get("todo_created"):
+    print("Escalation: todo already created for this suggestion.")
+    sys.exit(0)
+
 try:
     created = datetime.strptime(s["created_at"], "%Y-%m-%d").date()
 except Exception:
-    print("no"); sys.exit(0)
+    print("Escalation: bad created_at, skipping.")
+    sys.exit(0)
+
 days_old = (date.today() - created).days
-print("yes" if days_old >= 7 else "no")
+if days_old < 7:
+    print(f"Escalation: suggestion is {days_old}d old, not yet due.")
+    sys.exit(0)
+
+idea = s.get("idea", "Plan a date")
+windows = s.get("suggested_windows", []) or []
+title = f"Plan date with {partner}: {idea}"
+notes_lines = [f"No date with {partner} planned in the next 2 weeks."]
+if windows:
+    notes_lines.append("")
+    notes_lines.append("Good windows:")
+    notes_lines.extend(f"- {w}" for w in windows)
+notes = "\n".join(notes_lines)
+
+# Due in 3 days to nudge soon without being instant.
+due = (date.today() + timedelta(days=3)).isoformat()
+
+try:
+    result = subprocess.run(
+        [todo_add, title, "--due", due, "--notes", notes],
+        check=True, capture_output=True, text=True,
+    )
+    task_id = result.stdout.strip()
+    print(f"Escalation: TickTick task created ({task_id}).")
+except subprocess.CalledProcessError as e:
+    print(f"Escalation: todo-add failed ({e.returncode}): {e.stderr.strip()}")
+    sys.exit(0)  # do not flip flag; retry next week
+
+# Flip the flag so we don't recreate the task next week.
+s["todo_created"] = True
+state["pending_suggestion"] = s
+with open(state_file, "w") as f:
+    json.dump(state, f, indent=2)
+print("Escalation: state updated (todo_created=true).")
 PYEOF
-)
-
-if [ "$SHOULD_EMAIL" = "yes" ]; then
-    IDEA=$(python3 -c "
-import json
-s = json.load(open('$STATE_FILE')).get('pending_suggestion', {})
-print(s.get('idea','a date'))
-")
-    WINDOWS=$(python3 -c "
-import json
-s = json.load(open('$STATE_FILE')).get('pending_suggestion', {})
-ws = s.get('suggested_windows', [])
-print(', '.join(ws) if ws else '')
-")
-
-    BODY="Hey — no date with $PARTNER is planned in the next 2 weeks.
-
-Suggestion: $IDEA"
-    if [ -n "$WINDOWS" ]; then
-        BODY="$BODY
-
-Good windows: $WINDOWS"
-    fi
-
-    python3 "$HOME/.claude/date-send-email.py" \
-      "Date night reminder 💛" \
-      "$BODY" \
-      && echo "Email sent." \
-      || echo "Email failed (check ~/.config/date-check/email.json)"
-fi
 
 echo "--- done ---"
