@@ -4,6 +4,7 @@
 # Ephemeral state
 history.jsonl
 mcp-needs-auth-cache.json
+dates/state.json
 
 # Plugin runtime data
 plugins/
