@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""
+Webcam snapshot with terminal countdown.
+
+Usage:
+    snap [output_file]
+
+If no output file is given, saves to ~/snap_YYYYMMDD_HHMMSS.jpg and prints the path.
+"""
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+def main():
+    if len(sys.argv) > 1:
+        out = sys.argv[1]
+    else:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out = os.path.expanduser(f"~/snap_{ts}.jpg")
+
+    device = os.environ.get("SNAP_DEVICE", "/dev/video0")
+
+    print("Get ready...")
+    time.sleep(0.5)
+
+    for n in range(3, 0, -1):
+        print(f"  {n}...", flush=True)
+        time.sleep(1)
+
+    print("  📸", flush=True)
+
+    result = subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-f", "v4l2",
+            "-input_format", "mjpeg",
+            "-video_size", "1280x720",
+            "-i", device,
+            "-frames:v", "1",
+            "-q:v", "2",
+            out,
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        # Retry without mjpeg (some cameras don't support it)
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-f", "v4l2",
+                "-video_size", "1280x720",
+                "-i", device,
+                "-frames:v", "1",
+                "-q:v", "2",
+                out,
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+    if result.returncode != 0:
+        print(f"Error: ffmpeg failed:\n{result.stderr}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Saved: {out}")
+    return out
+
+
+if __name__ == "__main__":
+    main()
