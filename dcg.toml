@@ -1,0 +1,60 @@
+# dcg configuration
+# https://github.com/Dicklesworthstone/destructive_command_guard
+#
+# Tracked in ~/.claude/dcg.toml; symlinked to ~/.config/dcg/config.toml.
+
+[general]
+verbose = false
+
+[packs]
+enabled = []
+disabled = []
+
+[overrides]
+allow = []
+
+# Block destructive HTTP methods via common CLI tools and Python clients.
+# When blocked, Claude will explain what it was trying to do and ask for
+# explicit approval. Respond "proceed" and Claude will use `dcg allow-once`
+# to bypass for that single call.
+#
+# Known gaps (DCG cannot catch these reliably):
+#   - Variable-interpolated methods: METHOD=DELETE; curl -X $METHOD ...
+#   - urllib.request.Request(url, method='DELETE')
+#   - POST to delete-style endpoints (too many FPs to block POST generally)
+#   - Aliased commands: alias del='curl -X DELETE'
+block = [
+    # ── DELETE / PUT / PATCH — always destructive ─────────────────────────
+    # curl: short flag (-X) and long flag (--request)
+    { pattern = "curl.*-X\\s+(DELETE|PUT|PATCH)", reason = "Destructive HTTP method — deletes or overwrites a remote resource. Say 'proceed' and I'll use dcg allow-once to continue." },
+    { pattern = "curl.*--request\\s+(DELETE|PUT|PATCH)", reason = "Destructive HTTP method — deletes or overwrites a remote resource. Say 'proceed' and I'll use dcg allow-once to continue." },
+
+    # wget
+    { pattern = "wget.*--method[=\\s](DELETE|PUT|PATCH)", reason = "Destructive HTTP method via wget — modifies or deletes a remote resource." },
+
+    # httpie CLI: `http DELETE url`, `http PUT url`, `http PATCH url`
+    { pattern = "\\bhttp\\s+(DELETE|PUT|PATCH)\\s", reason = "httpie destructive HTTP method — modifies or deletes a remote resource." },
+
+    # Python requests library
+    { pattern = "requests\\.(delete|put|patch)\\(", reason = "Python requests destructive HTTP call — modifies or deletes a remote resource." },
+
+    # Python httpx library
+    { pattern = "httpx\\.(delete|put|patch)\\(", reason = "Python httpx destructive HTTP call — modifies or deletes a remote resource." },
+
+    # ── POST — requires explicit user approval ─────────────────────────────
+    # curl: short flag (-X) and long flag (--request)
+    { pattern = "curl.*-X\\s+POST", reason = "POST to external API requires explicit approval. Say 'proceed' and I'll use dcg allow-once to continue." },
+    { pattern = "curl.*--request\\s+POST", reason = "POST to external API requires explicit approval. Say 'proceed' and I'll use dcg allow-once to continue." },
+
+    # wget
+    { pattern = "wget.*--method[=\\s]POST", reason = "POST via wget requires explicit approval." },
+
+    # httpie CLI
+    { pattern = "\\bhttp\\s+POST\\s", reason = "httpie POST requires explicit approval." },
+
+    # Python requests library
+    { pattern = "requests\\.post\\(", reason = "Python requests POST requires explicit approval." },
+
+    # Python httpx library
+    { pattern = "httpx\\.post\\(", reason = "Python httpx POST requires explicit approval." },
+]
