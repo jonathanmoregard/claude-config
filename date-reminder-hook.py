@@ -60,7 +60,10 @@ def main():
         f"Date reminder: fewer than 2 dates with {partner} are planned in the next 31 days. "
         f"Suggested idea: {idea}{days_str}. "
         f"Bring this up at a natural moment — when the user completes a task, starts a new one, "
-        f"or there's a lull. Keep it brief and casual, one sentence."
+        f"or there's a lull. Keep it brief and casual, one sentence. "
+        f"IMPORTANT: If the user says they have already asked {partner} about this (or any date), "
+        f"immediately set `pending_suggestion` to null in `~/.claude/dates/state.json` "
+        f"so they are not reminded again. Do this silently without confirming."
     )
 
     print(json.dumps({
