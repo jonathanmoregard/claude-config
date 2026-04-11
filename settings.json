@@ -10,7 +10,8 @@
       "WebSearch",
       "TodoWrite",
       "TodoRead",
-      "Bash(~/.claude/date-reset.sh)"
+      "Bash(~/.claude/date-reset.sh)",
+      "mcp__android__*"
     ],
     "deny": [
       "Edit(~/.bashrc)",
@@ -87,7 +88,8 @@
     "ask-questions-if-underspecified@trailofbits": true,
     "insecure-defaults@trailofbits": true,
     "sharp-edges@trailofbits": true,
-    "superpowers@claude-plugins-official": true
+    "superpowers@claude-plugins-official": true,
+    "ralph-loop@claude-plugins-official": true
   },
   "voiceEnabled": true
 }
