@@ -9,7 +9,8 @@
       "WebFetch",
       "WebSearch",
       "TodoWrite",
-      "TodoRead"
+      "TodoRead",
+      "Bash(~/.claude/date-reset.sh)"
     ],
     "deny": [
       "Edit(~/.bashrc)",
