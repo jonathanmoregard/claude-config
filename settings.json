@@ -51,6 +51,10 @@
           {
             "type": "command",
             "command": "python3 $HOME/.claude/date-reminder-hook.py"
+          },
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/late-night-warn.sh"
           }
         ]
       }
