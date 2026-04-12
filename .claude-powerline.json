@@ -1,0 +1,56 @@
+{
+  "theme": "custom",
+  "display": {
+    "padding": 0,
+    "style": "powerline",
+    "charset": "unicode"
+  },
+  "colors": {
+    "custom": {
+      "directory": {
+        "bg": "#8B4513",
+        "fg": "#FFFFFF"
+      },
+      "model": {
+        "bg": "#CC5500",
+        "fg": "#FFFFFF"
+      },
+      "session": {
+        "bg": "#B8600A",
+        "fg": "#FFF3E0"
+      },
+      "block": {
+        "bg": "#A0522D",
+        "fg": "#FFE0B2"
+      },
+      "context": {
+        "bg": "#D2691E",
+        "fg": "#FFFFFF"
+      },
+      "contextWarning": {
+        "bg": "#FF8C00",
+        "fg": "#3E2723"
+      },
+      "contextCritical": {
+        "bg": "#FF4500",
+        "fg": "#FFFFFF"
+      },
+      "metrics": {
+        "bg": "#C46200",
+        "fg": "#FFF8E1"
+      },
+      "version": {
+        "bg": "#E67E22",
+        "fg": "#FFFFFF"
+      },
+      "today": {
+        "bg": "#9E4A00",
+        "fg": "#FFE0B2"
+      },
+      "git": {
+        "bg": "#7A3B00",
+        "fg": "#FFCC80"
+      }
+    }
+  }
+}

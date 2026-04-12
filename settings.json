@@ -78,7 +78,7 @@
   },
   "statusLine": {
     "type": "command",
-    "command": "tee ~/.claude/last-statusline.json | npx -y @owloops/claude-powerline@latest --style=powerline"
+    "command": "bash ~/.claude/statusline-wrapper.sh"
   },
   "enabledPlugins": {
     "skill-creator@claude-plugins-official": true,
@@ -89,7 +89,29 @@
     "insecure-defaults@trailofbits": true,
     "sharp-edges@trailofbits": true,
     "superpowers@claude-plugins-official": true,
-    "ralph-loop@claude-plugins-official": true
+    "ralph-loop@claude-plugins-official": true,
+    "nix-search@nix-search-marketplace": true,
+    "nixos@kettleofskills": true
+  },
+  "extraKnownMarketplaces": {
+    "zach-source-plugins": {
+      "source": {
+        "source": "git",
+        "url": "https://github.com/zach-source/claude-plugins.git"
+      }
+    },
+    "nix-search-marketplace": {
+      "source": {
+        "source": "git",
+        "url": "https://github.com/aldoborrero/nix-search.git"
+      }
+    },
+    "kettleofskills": {
+      "source": {
+        "source": "git",
+        "url": "https://github.com/kettleofketchup/KettleOfSkills.git"
+      }
+    }
   },
   "voiceEnabled": true
 }
