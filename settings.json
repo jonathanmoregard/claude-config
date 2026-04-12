@@ -78,7 +78,7 @@
   },
   "statusLine": {
     "type": "command",
-    "command": "npx -y @owloops/claude-powerline@latest --style=powerline"
+    "command": "tee ~/.claude/last-statusline.json | npx -y @owloops/claude-powerline@latest --style=powerline"
   },
   "enabledPlugins": {
     "skill-creator@claude-plugins-official": true,
