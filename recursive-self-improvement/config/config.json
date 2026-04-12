@@ -1,0 +1,55 @@
+{
+  "categories": {
+    "productivity": true,
+    "automation": true,
+    "alignment": true,
+    "wellbeing": true
+  },
+  "daily_proposal_limit": 2,
+  "north_star": "I co-create a flourishing world by caring deeply. Present in my body, I allow my care to manifest through my actions, directing me to work for the flourishing of all beings, including humans, animals, and myself. For animals: avoid exploitation (vegan). For humans/me: Be well, be in agentic loving care, get rid of old restrictive patterns, freedom of self-expression, capability and dynamic range. Also: boost myself and my relationships/communities, both for joy of doing it, but also for increased capacity to work for the good of all.",
+  "current_goals": [
+    {
+      "category": "Personal FOOM / Agentic Coding",
+      "items": [
+        "Mac mini setup with NixOS",
+        "Second brain / exocortex development",
+        "Harness-driven impact app development",
+        "Claude Code usage as automatic/frictionless as possible"
+      ],
+      "connection": "Multiplying personal capability and automation increases capacity to direct care into the world — becoming a more effective agent for flourishing."
+    },
+    {
+      "category": "Embodiment & Wellbeing",
+      "items": [
+        "Mix productive output with being very human: present, mindful, high wellbeing",
+        "Mindful forest walks, breaks from screen",
+        "Vajrayana practice and evolving ground — working towards enlightenment",
+        "Physical: workout, appearance, deep voice"
+      ],
+      "connection": "Embodiment is both the foundation to act from and the transformation itself — 'present in my body' is the north star lived daily. Vajrayana and inner work directly serve freedom from old restrictive patterns."
+    },
+    {
+      "category": "Relationships & Community",
+      "items": [
+        "Good relationships with friends and partner",
+        "Find the others — people for co-creation of the mission"
+      ],
+      "connection": "Both intrinsically valuable (flourishing includes connection and joy) and instrumentally necessary (the mission of co-creating a flourishing world needs a team)."
+    },
+    {
+      "category": "Impact & Intellect",
+      "items": [
+        "Drive impact through positive-sum tech: coordination, anti-addiction, veganism, d/acc, gov tech",
+        "Substack writing and lively intellectual discussions",
+        "Learn LLM automation, harness engineering, exocortex",
+        "Frameworks for effective action and paradigm shifts",
+        "Balance automation with security and integrity"
+      ],
+      "connection": "The direct expression of care becoming concrete impact in the world. Intellectual rigor (frameworks, writing, paradigm shifts) ensures care is directed effectively — care without clarity can misfire."
+    }
+  ],
+  "schedule": {
+    "analysis_cron": "17:00",
+    "timezone": "Europe/Stockholm"
+  }
+}
