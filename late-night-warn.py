@@ -13,37 +13,26 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 STAMP = Path.home() / ".claude" / "tmp" / ".late-night-warn-stamp"
+CACHE = Path.home() / ".claude" / "tmp" / ".late-night-cache.json"
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 COOLDOWN_SECONDS = 3600
+CACHE_SECONDS = 300  # reparse at most every 5 minutes
 MAX_HOURS_ANY_TIME = 9
 MIN_HOUR = 20
 
 
-def main():
-    now = datetime.now()
-
-    # Cheap early exit: if it's before 20:00 and fewer than MAX_HOURS_ANY_TIME
-    # have elapsed since midnight, 9h is impossible — skip the expensive parse.
-    hours_since_midnight = now.hour + now.minute / 60
-    if now.hour < MIN_HOUR and hours_since_midnight < MAX_HOURS_ANY_TIME:
-        sys.exit(0)
-
-    # Cooldown check
-    STAMP.parent.mkdir(parents=True, exist_ok=True)
-    if STAMP.exists():
+def _get_active_hours(now):
+    """Return wall-clock active hours today, cached for CACHE_SECONDS."""
+    if CACHE.exists():
         try:
-            last = float(STAMP.read_text().strip())
-            if time.time() - last < COOLDOWN_SECONDS:
-                sys.exit(0)
-        except (ValueError, OSError):
+            cached = json.loads(CACHE.read_text())
+            if time.time() - cached["ts"] < CACHE_SECONDS:
+                return cached["hours"]
+        except (json.JSONDecodeError, KeyError, OSError):
             pass
 
-    # Find all jsonl files modified today
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     today_ts = today_start.timestamp()
-
-    # Collect (start, end) intervals per session, then merge overlaps
-    # so parallel sessions count as wall-clock time, not summed time.
     intervals = []
 
     for jsonl in PROJECTS_DIR.rglob("*.jsonl"):
@@ -87,7 +76,6 @@ def main():
         if first_ts and last_ts and last_ts > first_ts:
             intervals.append((first_ts, last_ts))
 
-    # Merge overlapping intervals
     intervals.sort()
     merged = []
     for start, end in intervals:
@@ -96,9 +84,34 @@ def main():
         else:
             merged.append((start, end))
 
-    total_seconds = sum((e - s).total_seconds() for s, e in merged)
+    total_hours = sum((e - s).total_seconds() for s, e in merged) / 3600
 
-    total_hours = total_seconds / 3600
+    CACHE.parent.mkdir(parents=True, exist_ok=True)
+    CACHE.write_text(json.dumps({"ts": time.time(), "hours": total_hours}))
+
+    return total_hours
+
+
+def main():
+    now = datetime.now()
+
+    # Cheap early exit: if it's before 20:00 and fewer than MAX_HOURS_ANY_TIME
+    # have elapsed since midnight, 9h is impossible — skip the expensive parse.
+    hours_since_midnight = now.hour + now.minute / 60
+    if now.hour < MIN_HOUR and hours_since_midnight < MAX_HOURS_ANY_TIME:
+        sys.exit(0)
+
+    # Cooldown check
+    STAMP.parent.mkdir(parents=True, exist_ok=True)
+    if STAMP.exists():
+        try:
+            last = float(STAMP.read_text().strip())
+            if time.time() - last < COOLDOWN_SECONDS:
+                sys.exit(0)
+        except (ValueError, OSError):
+            pass
+
+    total_hours = _get_active_hours(now)
 
     is_late = now.hour >= MIN_HOUR
     is_marathon = total_hours >= MAX_HOURS_ANY_TIME
