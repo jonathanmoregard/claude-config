@@ -4,5 +4,18 @@
       "Edit(~/.claude/**)",
       "Write(~/.claude/**)"
     ]
+  },
+  "hooks": {
+    "PermissionRequest": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/jonathan/.claude/scripts/allow-claude-dir.sh"
+          }
+        ]
+      }
+    ]
   }
 }
