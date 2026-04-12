@@ -54,7 +54,7 @@
           },
           {
             "type": "command",
-            "command": "bash $HOME/.claude/late-night-warn.sh"
+            "command": "python3 $HOME/.claude/late-night-warn.py"
           }
         ]
       }
