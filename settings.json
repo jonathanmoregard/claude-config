@@ -34,6 +34,7 @@
       "Write(~/Dropbox/1. Exocortex/**)"
     ]
   },
+  "model": "opus",
   "hooks": {
     "UserPromptSubmit": [
       {
@@ -97,8 +98,8 @@
   "extraKnownMarketplaces": {
     "jonathanmoregard": {
       "source": {
-        "source": "github",
-        "repo": "jonathanmoregard/jonathan-claude-marketplace"
+        "source": "directory",
+        "path": "/home/jonathan/Repos/jonathan-claude-marketplace"
       }
     },
     "zach-source-plugins": {
@@ -120,6 +121,5 @@
       }
     }
   },
-  "voiceEnabled": true,
-  "model": "opus"
+  "voiceEnabled": true
 }
