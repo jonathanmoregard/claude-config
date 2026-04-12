@@ -91,9 +91,16 @@
     "superpowers@claude-plugins-official": true,
     "ralph-loop@claude-plugins-official": true,
     "nix-search@nix-search-marketplace": true,
-    "nixos@kettleofskills": true
+    "nixos@kettleofskills": true,
+    "recursive-self-improvement@jonathanmoregard": true
   },
   "extraKnownMarketplaces": {
+    "jonathanmoregard": {
+      "source": {
+        "source": "github",
+        "repo": "jonathanmoregard/jonathan-claude-marketplace"
+      }
+    },
     "zach-source-plugins": {
       "source": {
         "source": "git",
