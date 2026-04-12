@@ -113,5 +113,6 @@
       }
     }
   },
-  "voiceEnabled": true
+  "voiceEnabled": true,
+  "model": "opus"
 }

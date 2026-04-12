@@ -5,6 +5,7 @@
 history.jsonl
 mcp-needs-auth-cache.json
 dates/state.json
+last-statusline.json
 
 # Plugin runtime data
 plugins/
