@@ -38,7 +38,9 @@ def main():
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     today_ts = today_start.timestamp()
 
-    total_seconds = 0
+    # Collect (start, end) intervals per session, then merge overlaps
+    # so parallel sessions count as wall-clock time, not summed time.
+    intervals = []
 
     for jsonl in PROJECTS_DIR.rglob("*.jsonl"):
         if "subagents" in jsonl.parts:
@@ -49,7 +51,6 @@ def main():
         except OSError:
             continue
 
-        # Parse session: find first and last message timestamps today
         first_ts = None
         last_ts = None
         try:
@@ -80,7 +81,18 @@ def main():
             continue
 
         if first_ts and last_ts and last_ts > first_ts:
-            total_seconds += (last_ts - first_ts).total_seconds()
+            intervals.append((first_ts, last_ts))
+
+    # Merge overlapping intervals
+    intervals.sort()
+    merged = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+
+    total_seconds = sum((e - s).total_seconds() for s, e in merged)
 
     total_hours = total_seconds / 3600
 
