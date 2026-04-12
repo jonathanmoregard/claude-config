@@ -15,13 +15,17 @@ from pathlib import Path
 STAMP = Path.home() / ".claude" / "tmp" / ".late-night-warn-stamp"
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 COOLDOWN_SECONDS = 3600
-MIN_ACTIVE_HOURS = 5
+MAX_HOURS_ANY_TIME = 9
 MIN_HOUR = 20
 
 
 def main():
     now = datetime.now()
-    if now.hour < MIN_HOUR:
+
+    # Cheap early exit: if it's before 20:00 and fewer than MAX_HOURS_ANY_TIME
+    # have elapsed since midnight, 9h is impossible — skip the expensive parse.
+    hours_since_midnight = now.hour + now.minute / 60
+    if now.hour < MIN_HOUR and hours_since_midnight < MAX_HOURS_ANY_TIME:
         sys.exit(0)
 
     # Cooldown check
@@ -96,15 +100,26 @@ def main():
 
     total_hours = total_seconds / 3600
 
-    if total_hours < MIN_ACTIVE_HOURS:
+    is_late = now.hour >= MIN_HOUR
+    is_marathon = total_hours >= MAX_HOURS_ANY_TIME
+
+    if not is_late and not is_marathon:
         sys.exit(0)
 
     STAMP.write_text(str(time.time()))
 
     hours = int(total_hours)
     minutes = int((total_hours - hours) * 60)
+
+    if is_late and is_marathon:
+        reason = f"It's after {MIN_HOUR}:00 and the user has {hours}h{minutes:02d}m of active session time today."
+    elif is_late:
+        reason = f"It's after {MIN_HOUR}:00 ({hours}h{minutes:02d}m active today)."
+    else:
+        reason = f"The user has been active for {hours}h{minutes:02d}m today."
+
     print(
-        f"It's after {MIN_HOUR}:00 and the user has {hours}h{minutes:02d}m of active session time today. "
+        f"{reason} "
         f"Gently remind the user — their wellbeing goals include mindful breaks and not marathoning. "
         f"This is a nudge, not an order."
     )
