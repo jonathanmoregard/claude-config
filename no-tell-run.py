@@ -136,8 +136,9 @@ def main():
     print(json.dumps({
         "decision": "block",
         "reason": (
-            f"~/.claude/no-tell-run.py activated! It looks like you asked the user to run the command {flagged_cmd}. "
-            "If this is true, run it yourself instead. If this is not the case, then reply \"mu!\""
+            f"STOP: You told the user to run `{flagged_cmd}` instead of running it yourself. "
+            "This violates the CLAUDE.md rule: 'Run commands yourself — never tell the user to run something you can run.' "
+            "Run the command now. If it genuinely requires sudo or interactive input, say so explicitly."
         ),
     }))
 

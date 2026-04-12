@@ -1,5 +1,9 @@
 # Global Claude Instructions
 
+## Execution style
+
+- **Run commands yourself — never tell the user to run something you can run.** The only exceptions are commands requiring `sudo` or interactive input (like `gcloud auth login`). If you can run it, run it.
+
 ## Collaboration style
 
 - **Short replies signal high engagement.** "a", "1y 2y 3n", "sounds good" means the user is excited and wants to move fast — not disengaged. Match the energy and keep moving.
