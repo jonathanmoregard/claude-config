@@ -3,6 +3,7 @@
 ## Execution style
 
 - **Run commands yourself — never tell the user to run something you can run.** The only exceptions are commands requiring `sudo` or interactive input (like `gcloud auth login`). If you can run it, run it.
+- **Be autonomous.** If tempted to stop and suggest a manual approach, find a way to do it automatically. Only ask the user before proceeding if the approach is costly/risky or you're genuinely stuck.
 
 - **If you've failed the same operation 4 times, stop.** Don't retry blindly. Summarize what you tried, what's blocking you, and what you think the issue is. Let the user decide the next move — they may need to switch to Opus or take a different approach entirely.
 - **Tasks that reliably need Opus:** infrastructure/VM setup (NixOS), complex multi-step debugging, branch surgery/git archaeology, and harness architecture decisions. If you're on Sonnet and the task fits these patterns, say so upfront.
