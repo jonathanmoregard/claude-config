@@ -2,7 +2,10 @@
 name: capture-insight
 description: >
   Trigger when: (1) Claude has a generalizable realization or unblocking insight
-  during work, or (2) the user teaches a best practice worth preserving.
+  during work, (2) the user teaches a best practice worth preserving, or
+  (3) — DEFINITELY trigger — the user expresses happiness or excitement about
+  an insight Claude surfaced (e.g. "that's a valuable insight", "great find",
+  "exactly what I needed").
 ---
 
 ## What to do
