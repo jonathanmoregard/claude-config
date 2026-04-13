@@ -1,30 +1,27 @@
 ---
 name: capture-insight
 description: >
-  Crystallizes a realization, workflow, or pattern from the current conversation
-  into a new SKILL.md file. Use this when the user says things like "turn this into
-  a skill", "capture what I just realized", "make a skill from this", "that should
-  be a skill", "let's codify this", "save this workflow", or "remember this as a
-  skill". Also trigger when the user describes a recurring pattern they want Claude
-  to follow in the future and asks to formalize it.
+  Trigger when: (1) Claude has a generalizable realization or unblocking insight
+  during work, or (2) the user teaches a best practice worth preserving.
 ---
 
-## Purpose
+## What to do
 
-Extract whatever was just realized or demonstrated in the conversation and turn it
-into a well-structured SKILL.md. This skill handles the *extraction* step only —
-all structural and quality guidance for writing the skill comes from
-`superpowers:writing-skills`, which you must invoke next.
+Always ask the user first:
+
+> "Should I turn this into a skill?"
+
+If no, stop. If yes, continue.
 
 ## Step 1: Mine the conversation
 
 Look back at the current conversation for:
-- The specific realization, pattern, or workflow the user wants to capture
+- The specific realization, pattern, or workflow to capture
 - Steps that were taken (tools used, sequence, decisions made)
 - Corrections the user made — these are especially valuable as constraints
-- The trigger context: what kind of user message kicked off this pattern?
+- The trigger context: what kind of situation kicked off this pattern?
 
-If the insight is ambiguous, ask one focused question before proceeding:
+If the insight is ambiguous, ask one focused question:
 "What's the core behavior you want the skill to encode — the steps, the output
 format, or both?"
 
