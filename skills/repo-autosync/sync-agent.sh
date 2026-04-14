@@ -34,5 +34,5 @@ PROMPT="There are uncommitted changes in $REPO. Group the changes into logical c
 
 "$CLAUDE" \
   --model claude-sonnet-4-6 \
-  --dangerously-skip-permissions \
+  --allowedTools "Read Bash(git status:*) Bash(git diff:*) Bash(git add:*) Bash(git commit:*) Bash(git push:*) Bash(git log:*) Bash(git rm:*)" \
   -p "$PROMPT"
