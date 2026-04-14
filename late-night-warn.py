@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 UserPromptSubmit hook: warns if it's after 20:00 and the user has 5+ hours
-of actual Claude session time today. Counts real active time by summing
-per-session durations (first message to last message in each jsonl).
+of actual Claude session time today. Active time is computed from real user
+prompts only: each prompt claims a 4-minute forward window; overlapping
+windows merge, and gaps >4 minutes between prompts count as idle.
 60-minute cooldown between warnings.
 """
 import json
@@ -19,6 +20,7 @@ COOLDOWN_SECONDS = 3600
 CACHE_SECONDS = 300  # reparse at most every 5 minutes
 MAX_HOURS_ANY_TIME = 9
 MIN_HOUR = 20
+IDLE_SECONDS = 4 * 60  # gaps longer than this between user prompts = idle
 
 
 def _get_active_hours(now):
@@ -33,7 +35,7 @@ def _get_active_hours(now):
 
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     today_ts = today_start.timestamp()
-    intervals = []
+    prompt_times = []
 
     for jsonl in PROJECTS_DIR.rglob("*.jsonl"):
         if "subagents" in jsonl.parts:
@@ -44,8 +46,6 @@ def _get_active_hours(now):
         except OSError:
             continue
 
-        first_ts = None
-        last_ts = None
         try:
             with open(jsonl) as f:
                 for line in f:
@@ -55,6 +55,16 @@ def _get_active_hours(now):
                     try:
                         entry = json.loads(line)
                     except json.JSONDecodeError:
+                        continue
+                    if entry.get("type") != "user":
+                        continue
+                    if entry.get("isSidechain") or entry.get("isMeta"):
+                        continue
+                    content = entry.get("message", {}).get("content")
+                    if isinstance(content, list) and any(
+                        isinstance(c, dict) and c.get("type") == "tool_result"
+                        for c in content
+                    ):
                         continue
                     ts_str = entry.get("timestamp")
                     if not ts_str:
@@ -66,17 +76,14 @@ def _get_active_hours(now):
                         continue
                     if ts_local < today_start:
                         continue
-                    if first_ts is None or ts_local < first_ts:
-                        first_ts = ts_local
-                    if last_ts is None or ts_local > last_ts:
-                        last_ts = ts_local
+                    prompt_times.append(ts_local)
         except OSError:
             continue
 
-        if first_ts and last_ts and last_ts > first_ts:
-            intervals.append((first_ts, last_ts))
-
-    intervals.sort()
+    # Each user prompt claims a forward IDLE_SECONDS window. Merge overlaps
+    # across all sessions so concurrent terminals don't double-count.
+    idle = timedelta(seconds=IDLE_SECONDS)
+    intervals = sorted((t, t + idle) for t in prompt_times)
     merged = []
     for start, end in intervals:
         if merged and start <= merged[-1][1]:
