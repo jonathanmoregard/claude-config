@@ -8,41 +8,26 @@ user-invocable: true
 
 This skill sets up a `sync-agent.sh` script inside a repo that auto-commits and pushes changes on a schedule, using a headless Claude Sonnet agent to decide how to group commits logically.
 
+## Prerequisites
+
+- `claude` CLI on PATH (for the headless agent)
+- `gitleaks` on PATH (the script aborts if not installed — secret scanning is mandatory before any auto-push). Install: `curl -fsSL https://github.com/gitleaks/gitleaks/releases/latest/download/gitleaks_$(curl -s https://api.github.com/repos/gitleaks/gitleaks/releases/latest | grep tag_name | cut -d '"' -f 4 | sed 's/v//')_linux_x64.tar.gz | tar -xz -C ~/.local/bin gitleaks && chmod +x ~/.local/bin/gitleaks`
+
 ## Step 1: Confirm the target repo
 
 If not already clear from context, ask which repo to set up auto-sync for and what cron schedule to use (default: daily at a random minute past the hour to avoid thundering herd).
 
-## Step 2: Create sync-agent.sh in the repo root
+## Step 2: Fetch sync-agent.sh into the repo root
 
-Write this script verbatim (the path auto-detects from script location):
+The canonical script lives in the user's `~/.claude` repo. Fetch the latest version directly:
 
 ```bash
-#!/usr/bin/env bash
-# Spins off a Claude agent to commit and push any changes in a git repo.
-# Designed to be run from system cron — no Claude Code session required.
-# Place this script inside the repo it should sync; path is inferred automatically.
-
-set -euo pipefail
-
-REPO="$(cd "$(dirname "$0")" && pwd)"
-CLAUDE=/home/jonathan/.local/bin/claude
-
-# Skip if nothing to commit
-cd "$REPO"
-if git diff --quiet && git diff --cached --quiet && [ -z "$(git ls-files --others --exclude-standard)" ]; then
-  exit 0
-fi
-
-PROMPT="There are uncommitted changes in $REPO. Group the changes into logical commits using your own judgment — related files should go together, unrelated changes should be separate commits. Use concise conventional commit messages (e.g. 'chore: sync ghostty config'). After all commits are done, push origin main once. Do nothing else."
-
-"$CLAUDE" \
-  --model claude-sonnet-4-6 \
-  --dangerously-skip-permissions \
-  -p "$PROMPT" \
-  --cwd "$REPO"
+curl -fsSL https://raw.githubusercontent.com/jonathanmoregard/.claude/master/skills/repo-autosync/sync-agent.sh \
+  -o sync-agent.sh
+chmod +x sync-agent.sh
 ```
 
-Make it executable: `chmod +x sync-agent.sh`
+The script auto-detects its repo path from its own location, so no edits are needed after fetching. Do NOT inline or rewrite the script body — always pull from the canonical source so all repos stay in sync when the script is improved.
 
 ## Step 3: Add a crontab entry
 
