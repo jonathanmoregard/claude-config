@@ -35,5 +35,4 @@ PROMPT="There are uncommitted changes in $REPO. Group the changes into logical c
 "$CLAUDE" \
   --model claude-sonnet-4-6 \
   --dangerously-skip-permissions \
-  -p "$PROMPT" \
-  --cwd "$REPO"
+  -p "$PROMPT"

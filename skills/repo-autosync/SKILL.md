@@ -17,17 +17,16 @@ This skill sets up a `sync-agent.sh` script inside a repo that auto-commits and 
 
 If not already clear from context, ask which repo to set up auto-sync for and what cron schedule to use (default: daily at a random minute past the hour to avoid thundering herd).
 
-## Step 2: Fetch sync-agent.sh into the repo root
+## Step 2: Copy sync-agent.sh into the repo root
 
-The canonical script lives in the user's `~/.claude` repo. Fetch the latest version directly:
+The canonical script lives next to this skill on disk. Copy it into the target repo:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jonathanmoregard/.claude/master/skills/repo-autosync/sync-agent.sh \
-  -o sync-agent.sh
+cp ~/.claude/skills/repo-autosync/sync-agent.sh ./sync-agent.sh
 chmod +x sync-agent.sh
 ```
 
-The script auto-detects its repo path from its own location, so no edits are needed after fetching. Do NOT inline or rewrite the script body — always pull from the canonical source so all repos stay in sync when the script is improved.
+The script auto-detects its repo path from its own location, so no edits are needed after copying. Do NOT inline or rewrite the script body — always copy from the canonical source so all repos stay in sync when the script is improved.
 
 ## Step 3: Add a crontab entry
 
