@@ -34,7 +34,6 @@
       "Write(~/Dropbox/1. Exocortex/**)"
     ]
   },
-  "model": "opus",
   "hooks": {
     "UserPromptSubmit": [
       {
@@ -108,9 +107,23 @@
     "ralph-loop@claude-plugins-official": true,
     "nix-search@nix-search-marketplace": true,
     "nixos@kettleofskills": true,
-    "recursive-self-improvement@jonathanmoregard": true
+    "recursive-self-improvement@jonathanmoregard": true,
+    "differential-review@trailofbits": true,
+    "mutation-testing@trailofbits": true,
+    "static-analysis@trailofbits": true,
+    "modern-python@trailofbits": true,
+    "debug-buttercup@trailofbits": true,
+    "spec-to-code-compliance@trailofbits": true,
+    "entry-point-analyzer@trailofbits": true,
+    "caveman@caveman": true
   },
   "extraKnownMarketplaces": {
+    "caveman": {
+      "source": {
+        "source": "directory",
+        "path": "/home/jonathan/.claude/skills/caveman"
+      }
+    },
     "jonathanmoregard": {
       "source": {
         "source": "directory",
@@ -136,5 +149,11 @@
       }
     }
   },
-  "voiceEnabled": true
+  "sandbox": {
+    "enabled": false,
+    "autoAllowBashIfSandboxed": true,
+    "allowUnsandboxedCommands": false
+  },
+  "advisorModel": "opus",
+  "voiceEnabled": false
 }
