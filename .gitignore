@@ -34,3 +34,17 @@ projects/
 tasks/
 plans/
 **/__pycache__/
+
+# Caveman state flag
+.caveman-active
+
+# Powerline / per-session usage telemetry
+usage-data/
+
+# Cron-driven log output (review-agent.log is hand-curated)
+logs/submodule-update.log
+
+# Externally cloned skill repos (each has its own .git; track upstream
+# as submodules later if pinning becomes useful)
+skills/caveman/
+skills/planning-with-files/
