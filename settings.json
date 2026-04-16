@@ -68,6 +68,15 @@
             "command": "python3 $HOME/.claude/wrap-untrusted-tavily.py"
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/wrap-untrusted-bash.py"
+          }
+        ]
       }
     ],
     "PreToolUse": [
