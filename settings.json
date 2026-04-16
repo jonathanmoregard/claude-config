@@ -6,14 +6,14 @@
       "Write",
       "Glob",
       "Grep",
-      "WebFetch",
-      "WebSearch",
       "TodoWrite",
       "TodoRead",
       "Bash(~/.claude/date-reset.sh)",
       "mcp__android__*"
     ],
     "deny": [
+      "WebFetch",
+      "WebSearch",
       "Edit(~/.bashrc)",
       "Edit(~/.zshrc)",
       "Edit(~/.ssh/**)",
@@ -55,6 +55,17 @@
           {
             "type": "command",
             "command": "python3 $HOME/.claude/late-night-warn.py"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "mcp__tavily-remote-mcp__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/wrap-untrusted-tavily.py"
           }
         ]
       }
