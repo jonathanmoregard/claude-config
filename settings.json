@@ -54,6 +54,10 @@
           {
             "type": "command",
             "command": "python3 $HOME/.claude/late-night-warn.py"
+          },
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/evolve-reminder.py"
           }
         ]
       }
@@ -76,6 +80,15 @@
             "command": "python3 $HOME/.claude/wrap-untrusted-bash.py"
           }
         ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/skills/continuous-learning-v2/hooks/observe.sh post"
+          }
+        ]
       }
     ],
     "PreToolUse": [
@@ -85,6 +98,15 @@
           {
             "type": "command",
             "command": "/home/jonathan/.local/bin/dcg"
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/skills/continuous-learning-v2/hooks/observe.sh pre"
           }
         ]
       }
