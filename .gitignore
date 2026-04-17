@@ -52,3 +52,26 @@ logs/submodule-update.log
 # as submodules later if pinning becomes useful)
 skills/caveman/
 skills/planning-with-files/
+
+# Python virtualenvs + build artefacts inside tools/
+**/.venv/
+tools/*/state.json
+
+# Token-optimizer runtime (plugin data dir + backups)
+token-optimizer/
+_backups/
+
+# Homunculus observer artefact
+observer-last-run.log
+
+# Claude Code session lockfile
+.settings.lock
+
+# Worker runtime state (scaffolded by CC on each run)
+workers/.claude-profile/backups/
+workers/.claude-profile/projects/
+workers/.claude-profile/sessions/
+workers/*/scratch/
+
+# Local-only permissions (CC writes dynamically)
+.claude/settings.local.json
