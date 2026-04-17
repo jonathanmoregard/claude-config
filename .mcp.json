@@ -1,7 +1,0 @@
-{
-  "mcpServers": {
-    "ghostty": {
-      "command": "/home/jonathan/.claude/tools/ghostty-mcp/run.sh"
-    }
-  }
-}
