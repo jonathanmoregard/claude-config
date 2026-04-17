@@ -70,6 +70,15 @@
             "command": "python3 $HOME/.claude/evolve-reminder.py"
           }
         ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/jonathan/.claude/hooks/router-nudge-hook --queue-root /home/jonathan/.local/state/router/queue --marker /home/jonathan/.local/state/router/audit/nudge-marker || true"
+          }
+        ]
       }
     ],
     "PostToolUse": [
