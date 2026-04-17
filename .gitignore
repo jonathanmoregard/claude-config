@@ -71,6 +71,7 @@ observer-last-run.log
 workers/.claude-profile/backups/
 workers/.claude-profile/projects/
 workers/.claude-profile/sessions/
+workers/.claude-profile/.claude.json
 workers/*/scratch/
 
 # Local-only permissions (CC writes dynamically)

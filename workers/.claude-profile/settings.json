@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "defaultMode": "dontAsk",
+    "allow": [],
+    "deny": [
+      "Bash", "Read", "Write", "Edit", "NotebookEdit",
+      "Glob", "Grep", "WebFetch", "WebSearch",
+      "Task", "Agent", "Skill",
+      "TodoWrite", "ToolSearch",
+      "CronCreate", "CronDelete", "CronList",
+      "EnterPlanMode", "ExitPlanMode",
+      "EnterWorktree", "ExitWorktree",
+      "LSP", "Monitor",
+      "PushNotification", "RemoteTrigger", "ScheduleWakeup",
+      "TaskOutput", "TaskStop",
+      "AskUserQuestion",
+      "ListMcpResourcesTool", "ReadMcpResourceTool"
+    ]
+  },
+  "enableAllProjectMcpServers": false,
+  "disableAllHooks": true,
+  "env": {
+    "CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1",
+    "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+    "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+    "ENABLE_CLAUDEAI_MCP_SERVERS": "false",
+    "BASH_DEFAULT_TIMEOUT_MS": "30000",
+    "BASH_MAX_TIMEOUT_MS": "120000",
+    "BASH_MAX_OUTPUT_LENGTH": "30000",
+    "MAX_MCP_OUTPUT_TOKENS": "25000"
+  }
+}
