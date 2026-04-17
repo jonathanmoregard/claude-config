@@ -1,4 +1,5 @@
 {
+  "cleanupPeriodDays": 99999,
   "permissions": {
     "allow": [
       "Bash",
@@ -9,7 +10,8 @@
       "TodoWrite",
       "TodoRead",
       "Bash(~/.claude/date-reset.sh)",
-      "mcp__android__*"
+      "mcp__android__*",
+      "mcp__ghostty__*"
     ],
     "deny": [
       "WebFetch",
@@ -34,7 +36,18 @@
       "Write(~/Dropbox/1. Exocortex/**)"
     ]
   },
+  "model": "sonnet",
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=/home/jonathan/.claude/token-optimizer/.security-alert; [ -f \"$f\" ] && echo \"[token-optimizer] SECURITY ALERT: $(cat $f)\" || true"
+          }
+        ]
+      }
+    ],
     "UserPromptSubmit": [
       {
         "matcher": "",
@@ -58,6 +71,15 @@
           {
             "type": "command",
             "command": "python3 $HOME/.claude/evolve-reminder.py"
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --directory /home/jonathan/Repos/jonathans-assistant router-nudge-hook --queue-root /home/jonathan/.local/state/router/queue --marker /home/jonathan/.local/state/router/audit/nudge-marker"
           }
         ]
       }
@@ -111,11 +133,20 @@
         ]
       }
     ],
-    "Stop": []
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo COMPACTION GUIDANCE: Preserve code changes, key decisions, and file paths. Discard intermediate attempts, explanations, and verbose tool output."
+          }
+        ]
+      }
+    ]
   },
   "statusLine": {
     "type": "command",
-    "command": "bash ~/.claude/statusline-wrapper.sh"
+    "command": "node '/home/jonathan/Repos/token-optimizer/skills/token-optimizer/scripts/statusline.js'"
   },
   "enabledPlugins": {
     "skill-creator@claude-plugins-official": true,
@@ -137,7 +168,8 @@
     "debug-buttercup@trailofbits": true,
     "spec-to-code-compliance@trailofbits": true,
     "entry-point-analyzer@trailofbits": true,
-    "caveman@caveman": true
+    "caveman@caveman": true,
+    "token-optimizer@alexgreensh-token-optimizer": true
   },
   "extraKnownMarketplaces": {
     "caveman": {
@@ -150,6 +182,12 @@
       "source": {
         "source": "directory",
         "path": "/home/jonathan/Repos/jonathan-claude-marketplace"
+      }
+    },
+    "alexgreensh-token-optimizer": {
+      "source": {
+        "source": "directory",
+        "path": "/home/jonathan/Repos/token-optimizer/.claude-plugin"
       }
     },
     "zach-source-plugins": {
@@ -176,6 +214,7 @@
     "autoAllowBashIfSandboxed": true,
     "allowUnsandboxedCommands": false
   },
+  "effortLevel": "high",
   "advisorModel": "opus",
   "voiceEnabled": false
 }
