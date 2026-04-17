@@ -10,6 +10,10 @@ last-statusline.json
 # Plugin runtime data
 plugins/
 
+# Homunculus runtime state (observer archives, PIDs, per-project memory)
+# Skill content lives in ~/Repos/everything-claude-code/.claude/homunculus
+homunculus/
+
 # Scratch/tmp folder
 tmp/
 
