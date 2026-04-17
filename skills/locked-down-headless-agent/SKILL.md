@@ -140,14 +140,18 @@ Drop `--bare` and let CC use the user's existing OAuth session. This avoids mana
 # Symlink credentials into the isolated profile (once, in install script):
 ln -sf "$HOME/.claude/.credentials.json" "$CLAUDE_CONFIG_DIR/.credentials.json"
 
-# In env-i invocation, set CLAUDE_CONFIG_DIR so CC finds the symlinked creds.
+# Capture real home BEFORE env-i strips it. MCP servers inherit env from claude,
+# so HOME="$SCRATCH" would break any proxy that expands ~/... paths from configs.
+REAL_HOME="$HOME"
+
 # cd into scratch BEFORE invoking CC so CLAUDE.md files aren't picked up from cwd.
 cd "$SCRATCH"
 
 env -i \
-  HOME="$SCRATCH" \
-  PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+  HOME="$REAL_HOME" \
+  PATH="$REAL_HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" \
   CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR" \
+  UV_CACHE_DIR="$REAL_HOME/.cache/uv" \
   ... \
   timeout 300 \
   claude -p "$PROMPT" \
@@ -156,14 +160,18 @@ env -i \
     --strict-mcp-config \
     --permission-mode dontAsk \
     --tools "" \
-    --allowedTools "mcp__<your-proxy>__*" \
+    --allowedTools "mcp__<your-proxy>__* ToolSearch" \
     --max-turns 20 \
     --output-format json
 ```
 
-**What you lose vs `--bare`:** CC may still auto-discover hooks/plugins before `CLAUDE_CONFIG_DIR` isolation kicks in (mitigated by `HOME="$SCRATCH"` and `CLAUDE_CODE_DISABLE_*` env vars). Token refresh may need network access beyond `api.anthropic.com` — if using sandbox network allowlist, add auth domains.
+**What you lose vs `--bare`:** CC may still auto-discover hooks/plugins before `CLAUDE_CONFIG_DIR` isolation kicks in (mitigated by `CLAUDE_CODE_DISABLE_*` env vars). Token refresh may need network access beyond `api.anthropic.com` — if using sandbox network allowlist, add auth domains.
 
 **`cd "$SCRATCH"` is mandatory.** Without it, CC walks up from cwd looking for CLAUDE.md files; if cwd is inside a repo those files inject into the system prompt.
+
+**Do not use `HOME="$SCRATCH"` in env-i.** MCP server processes are spawned as children of `claude` and inherit the env. If `HOME` points to a temp dir, any proxy that resolves `~/...` paths from a config file will silently expand to the scratch dir — and find nothing. Use the real `HOME` and rely on `CLAUDE_CODE_DISABLE_CLAUDE_MDS` + `cd "$SCRATCH"` to prevent CLAUDE.md discovery instead.
+
+**`ToolSearch` in `--allowedTools` is required when your proxy has many tools.** Claude Code defers MCP tool schemas when the combined tool count is large (exact threshold varies). The agent needs `ToolSearch` to load deferred schemas before it can call those tools. Without it, the agent sees the tool names but cannot use them, and ToolSearch calls get blocked by the hook. Allow `ToolSearch` explicitly — it is a read-only meta-tool that cannot execute actions. Update the hook whitelist too: `[[ "$TOOL_NAME" == mcp__<proxy>__* ]] || [[ "$TOOL_NAME" == "ToolSearch" ]]`.
 
 Flag notes (both options):
 - `--tools ""` disables the entire built-in tool set (Bash, Read, Write, Edit, Glob, Grep, WebFetch, WebSearch, Task/Agent, NotebookEdit, Skill). Cleaner and more complete than enumerating `--disallowedTools`. Per-tool `--allowedTools` / `--disallowedTools` then layer on top of this baseline.
