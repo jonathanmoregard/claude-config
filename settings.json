@@ -45,6 +45,16 @@
             "command": "f=/home/jonathan/.claude/token-optimizer/.security-alert; [ -f \"$f\" ] && echo \"[token-optimizer] SECURITY ALERT: $(cat $f)\" || true"
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"/home/jonathan/.claude/hooks/caveman-activate.js\"",
+            "timeout": 5,
+            "statusMessage": "Loading caveman mode..."
+          }
+        ]
       }
     ],
     "UserPromptSubmit": [
@@ -79,6 +89,16 @@
           {
             "type": "command",
             "command": "/home/jonathan/.claude/hooks/router-nudge-hook --queue-root /home/jonathan/.local/state/router/queue --marker /home/jonathan/.local/state/router/audit/nudge-marker || true"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"/home/jonathan/.claude/hooks/caveman-mode-tracker.js\"",
+            "timeout": 5,
+            "statusMessage": "Tracking caveman mode..."
           }
         ]
       }

@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
-"""Ghostty terminal MCP server - opens repos in Ghostty splits with Claude Code"""
+"""Ghostty terminal MCP server - opens repos in Ghostty splits/tabs with Claude Code.
+
+Single-window model: assumes one Ghostty window. Counts existing surfaces via
+the ghostty process tree and alternates split-right / new-tab:
+  odd count  -> split-right (fills out current tab)
+  even count -> new-tab (starts a fresh tab)
+"""
 
 import json
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -9,84 +16,75 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 DBUS_DEST = "com.mitchellh.ghostty"
-WINDOW_PATH = "/com/mitchellh/ghostty/window/1"
-MIN_SPLIT_WIDTH = 900  # px — below this, open new tab instead of splitting
+DBUS_WINDOW_ROOT = "/com/mitchellh/ghostty/window"
 
 mcp = FastMCP("ghostty")
 
 
-def dbus_activate(action: str, params: str = "[]") -> None:
-    subprocess.run(
-        [
-            "gdbus", "call",
-            "--session",
-            "--dest", DBUS_DEST,
-            "--object-path", WINDOW_PATH,
-            "--method", "org.gtk.Actions.Activate",
-            action, params, "{}",
-        ],
-        capture_output=True,
-        check=False,
-    )
+def _run(argv: list[str], check: bool = False) -> subprocess.CompletedProcess:
+    return subprocess.run(argv, capture_output=True, text=True, check=check)
 
 
-def get_active_window_id() -> str | None:
-    result = subprocess.run(
-        ["xdotool", "getactivewindow"],
-        capture_output=True,
-        text=True,
-    )
-    wid = result.stdout.strip()
-    return wid or None
+def dbus_activate(window_node: str, action: str, params: str = "[]") -> None:
+    _run([
+        "gdbus", "call", "--session",
+        "--dest", DBUS_DEST,
+        "--object-path", f"{DBUS_WINDOW_ROOT}/{window_node}",
+        "--method", "org.gtk.Actions.Activate",
+        action, params, "{}",
+    ])
 
 
-def get_window_width(window_id: str) -> int | None:
-    result = subprocess.run(
-        ["xdotool", "getwindowgeometry", "--shell", window_id],
-        capture_output=True,
-        text=True,
-    )
+def get_ghostty_window_nodes() -> list[str]:
+    """Return dbus window node names (e.g. ['1', '4']) via introspection."""
+    result = _run([
+        "gdbus", "introspect", "--session",
+        "--dest", DBUS_DEST,
+        "--object-path", DBUS_WINDOW_ROOT,
+    ])
+    return re.findall(r"node\s+(\d+)\s*\{", result.stdout)
+
+
+def get_ghostty_pid() -> int | None:
+    result = _run(["pgrep", "-x", "ghostty"])
+    pids = [int(p) for p in result.stdout.split() if p.strip()]
+    return pids[0] if pids else None
+
+
+def count_surfaces(ghostty_pid: int) -> int:
+    """Count surfaces across the Ghostty instance by counting direct shell children."""
+    result = _run(["pgrep", "-P", str(ghostty_pid)])
+    return len([p for p in result.stdout.split() if p.strip()])
+
+
+def get_ghostty_x11_wid() -> str | None:
+    """Return the currently active Ghostty X11 window id, or first Ghostty window as fallback."""
+    active = _run(["xdotool", "getactivewindow"]).stdout.strip()
+    if active:
+        wm_class = _run(["xdotool", "getwindowclassname", active]).stdout.strip().lower()
+        if "ghostty" in wm_class:
+            return active
+
+    # Fallback: first managed Ghostty window from wmctrl.
+    result = _run(["wmctrl", "-lx"])
     for line in result.stdout.splitlines():
-        if line.startswith("WIDTH="):
+        parts = line.split(None, 4)
+        if len(parts) >= 3 and "ghostty" in parts[2].lower():
+            wid_hex = parts[0]
             try:
-                return int(line.split("=", 1)[1])
+                return str(int(wid_hex, 16))
             except ValueError:
-                return None
+                continue
     return None
 
 
-def type_in_active(command: str, settle: float) -> None:
-    time.sleep(settle)
-    window_id = get_active_window_id()
-    if not window_id:
-        return
-    subprocess.run(
-        ["xdotool", "type", "--clearmodifiers", "--delay", "10",
-         "--window", window_id, command],
-        check=False,
-    )
-    subprocess.run(
-        ["xdotool", "key", "--window", window_id, "Return"],
-        check=False,
-    )
+def focus_window(wid: str) -> None:
+    _run(["wmctrl", "-ia", hex(int(wid))])
 
 
-def _open_area(cmd: str) -> str:
-    """Split current pane if wide enough; otherwise open new tab."""
-    active = get_active_window_id()
-    width = get_window_width(active) if active else None
-
-    if width is not None and width >= MIN_SPLIT_WIDTH * 2:
-        dbus_activate("split-right")
-        placement = f"split right (pane width was {width}px)"
-        settle = 0.8
-    else:
-        dbus_activate("new-tab")
-        placement = f"new tab (pane width {width}px below {MIN_SPLIT_WIDTH * 2}px split threshold)"
-        settle = 1.2
-
-    type_in_active(cmd, settle=settle)
-    return placement
+def type_in_window(wid: str, command: str) -> None:
+    _run(["xdotool", "type", "--window", wid, "--delay", "10", command])
+    _run(["xdotool", "key", "--window", wid, "Return"])
 
 
 @mcp.tool()
@@ -145,35 +143,67 @@ def _collect(root: Path, name_lower: str, max_depth: int, out: list[Path], depth
 @mcp.tool()
 def open_claude_session(dir: str, session_id: str = "") -> str:
     """
-    Open a Ghostty split/tab running Claude Code in the given directory.
-    Splits the current pane if wide enough; otherwise opens a new tab.
-    Runs 'claude --continue <session_id>' if session_id is provided,
-    otherwise 'claude --continue' (resumes most recent session in that dir).
+    Open a Ghostty split or tab running Claude Code in the given directory.
+
+    Alternates: odd surface count -> split-right, even -> new-tab.
+    Assumes a single Ghostty window. Targets the first dbus window node and
+    focuses the matching X11 window before typing the command.
     """
     repo = Path(dir).expanduser().resolve()
     if not repo.exists():
         return f"Error: path does not exist: {dir}"
 
+    nodes = get_ghostty_window_nodes()
+    if not nodes:
+        return "Error: no Ghostty windows found on dbus. Is Ghostty running?"
+    window_node = nodes[0]
+
+    ghostty_pid = get_ghostty_pid()
+    if ghostty_pid is None:
+        return "Error: ghostty process not found."
+    surfaces = count_surfaces(ghostty_pid)
+
+    action = "split-right" if surfaces % 2 == 1 else "new-tab"
+    settle = 0.5 if action == "split-right" else 1.0
+
+    wid = get_ghostty_x11_wid()
+    if wid is None:
+        return "Error: no Ghostty X11 window visible to WM."
+    focus_window(wid)
+    time.sleep(0.15)
+
+    dbus_activate(window_node, action)
+    time.sleep(settle)
+
     session_arg = f" {session_id}" if session_id else ""
     cmd = f"cd {repo} && claude --continue{session_arg}"
-    placement = _open_area(cmd)
-    return f"Opened {repo}{' session=' + session_id if session_id else ''} — {placement}"
+    type_in_window(wid, cmd)
+
+    return (
+        f"Opened {repo}{' session=' + session_id if session_id else ''} "
+        f"via {action} (surfaces_before={surfaces}, window_node={window_node}, wid={wid})"
+    )
 
 
 @mcp.tool()
 def get_layout() -> str:
-    """Report current active Ghostty window geometry (no tracked state)."""
-    active = get_active_window_id()
-    if not active:
-        return json.dumps({"error": "no active window"})
-    width = get_window_width(active)
-    return json.dumps({"active_window": active, "width": width})
+    """Report current Ghostty window/surface state via dbus + process tree."""
+    nodes = get_ghostty_window_nodes()
+    ghostty_pid = get_ghostty_pid()
+    surfaces = count_surfaces(ghostty_pid) if ghostty_pid else 0
+    wid = get_ghostty_x11_wid()
+    return json.dumps({
+        "window_nodes": nodes,
+        "ghostty_pid": ghostty_pid,
+        "surfaces_total": surfaces,
+        "x11_wid": wid,
+    })
 
 
 @mcp.tool()
 def reset_layout() -> str:
-    """No-op — layout tracking removed. Placement now queries live window state."""
-    return "No-op: layout tracking removed. Placement derives from active window width at call time."
+    """No-op — placement derives from live state each call."""
+    return "No-op: placement derives from live dbus + process state."
 
 
 if __name__ == "__main__":
