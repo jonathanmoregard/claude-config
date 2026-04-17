@@ -110,9 +110,13 @@ Avoid `npx` / unpinned installs; a compromised upstream package is a direct agen
 
 **Optional hardening** (managed settings): `deniedMcpServers` for explicit blocklist, `disableAllHooks: true` or `allowedHttpHookUrls`/`httpHookAllowedEnvVars` if you need hooks but want them scoped.
 
-## Layer 2 — Invocation in `--bare` mode
+## Layer 2 — Invocation: `--bare` (production) or OAuth (personal)
 
-`--bare` is the single biggest lock-down win. It skips auto-discovery of hooks, skills, plugins, MCP servers from user/project scopes, auto-memory, CLAUDE.md walking, attribution, background prefetches, and keychain reads. Auth is strictly `ANTHROPIC_API_KEY` or `apiKeyHelper` via `--settings` — **OAuth (`CLAUDE_CODE_OAUTH_TOKEN`) and keychain are never read**. Nothing the agent inherits except what you pass explicitly:
+Two auth paths. Choose one:
+
+### Option A — `--bare` + API key (recommended for production / CI)
+
+`--bare` is the maximum lock-down mode. Skips auto-discovery of hooks, skills, plugins, MCP servers from user/project scopes, auto-memory, CLAUDE.md walking, attribution, background prefetches, and keychain reads. Auth is strictly `ANTHROPIC_API_KEY` or `apiKeyHelper` — **OAuth and keychain are never read**.
 
 ```bash
 claude --bare -p "$PROMPT" \
@@ -126,14 +130,48 @@ claude --bare -p "$PROMPT" \
   --output-format json
 ```
 
-Flag notes:
+Requires `ANTHROPIC_API_KEY` in the env. Use a worker-scoped key, never the user's primary key.
+
+### Option B — OAuth credentials (personal / single-user)
+
+Drop `--bare` and let CC use the user's existing OAuth session. This avoids managing a separate API key but the worker shares your account's quota and permissions.
+
+```bash
+# Symlink credentials into the isolated profile (once, in install script):
+ln -sf "$HOME/.claude/.credentials.json" "$CLAUDE_CONFIG_DIR/.credentials.json"
+
+# In env-i invocation, set CLAUDE_CONFIG_DIR so CC finds the symlinked creds.
+# cd into scratch BEFORE invoking CC so CLAUDE.md files aren't picked up from cwd.
+cd "$SCRATCH"
+
+env -i \
+  HOME="$SCRATCH" \
+  PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+  CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR" \
+  ... \
+  timeout 300 \
+  claude -p "$PROMPT" \
+    --settings "$CLAUDE_CONFIG_DIR/settings.json" \
+    --mcp-config "$CLAUDE_CONFIG_DIR/.mcp.json" \
+    --strict-mcp-config \
+    --permission-mode dontAsk \
+    --tools "" \
+    --allowedTools "mcp__<your-proxy>__*" \
+    --max-turns 20 \
+    --output-format json
+```
+
+**What you lose vs `--bare`:** CC may still auto-discover hooks/plugins before `CLAUDE_CONFIG_DIR` isolation kicks in (mitigated by `HOME="$SCRATCH"` and `CLAUDE_CODE_DISABLE_*` env vars). Token refresh may need network access beyond `api.anthropic.com` — if using sandbox network allowlist, add auth domains.
+
+**`cd "$SCRATCH"` is mandatory.** Without it, CC walks up from cwd looking for CLAUDE.md files; if cwd is inside a repo those files inject into the system prompt.
+
+Flag notes (both options):
 - `--tools ""` disables the entire built-in tool set (Bash, Read, Write, Edit, Glob, Grep, WebFetch, WebSearch, Task/Agent, NotebookEdit, Skill). Cleaner and more complete than enumerating `--disallowedTools`. Per-tool `--allowedTools` / `--disallowedTools` then layer on top of this baseline.
 - `--strict-mcp-config` forces only the `--mcp-config` file's servers to load — no user/project MCP inheritance.
 - `--allowedTools` / `--disallowedTools` accept tool-qualified forms (`Bash(git status:*)`, `WebFetch(domain:github.com)`); same syntax as `permissions.allow`/`deny`.
 - `dontAsk` auto-denies anything not in `permissions.allow`. Never use `bypassPermissions` — it propagates to subagents and cannot be cancelled.
 - Disallowing `Task` also blocks the aliased `Agent` tool, but list both for clarity.
-- **No human-in-the-loop for trust prompts.** `-p` (headless) skips the trust-verification prompt on new directories — so a compromised cwd cannot ask for trust, but also cannot refuse it. Rely on sandbox + `--bare` + cwd hygiene instead of trust dialogs.
-- **Working directory must not be inside any repo.** CLAUDE.md files walk up from cwd and get concatenated into the system prompt unless `--bare` is set. `--bare` covers this, but keep cwd to a scratch dir anyway as belt + suspenders.
+- **No human-in-the-loop for trust prompts.** `-p` (headless) skips the trust-verification prompt on new directories — so a compromised cwd cannot ask for trust, but also cannot refuse it. Rely on sandbox + cwd hygiene instead of trust dialogs.
 
 ## Layer 3 — PreToolUse hook as tripwire
 
@@ -208,7 +246,7 @@ After editing settings or invocation flags, verify the lock-down still holds:
 - Run a canary prompt: "Use the Bash tool to print the current date." It should be blocked.
 - Check the violations log: the attempt should appear.
 - Check the permission-mode banner on startup: should say `dontAsk`, not `acceptAll` or `bypassPermissions`.
-- Verify `claude --bare` is in the invocation (check audit of the systemd unit or cron line).
+- If using Option A: verify `claude --bare` is in the invocation. If Option B: verify `cd "$SCRATCH"` precedes the invocation and `CLAUDE_CONFIG_DIR` is set in env-i.
 - Confirm `$CLAUDE_CONFIG_DIR` in the agent's env is your profile, not `~/.claude`.
 - If using managed settings, confirm they are present at the system path.
 

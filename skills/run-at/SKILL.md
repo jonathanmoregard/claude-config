@@ -16,27 +16,11 @@ description: >
 
 **For "next limit reset" / "next reset window":**
 
-Run ccusage to get the active block's remaining time:
+Run `bunx ccusage blocks --active --timezone Europe/Stockholm` and read the
+"Time Remaining:" line. Add that duration to the current time to get the
+reset time, then format as a cron expression.
 
-```bash
-output=$(bunx ccusage blocks --active --timezone Europe/Stockholm 2>/dev/null)
-remaining_line=$(echo "$output" | grep "Time Remaining:")
-if [ -z "$remaining_line" ]; then
-  echo "UNAVAILABLE — no active block"
-else
-  remaining=$(echo "$remaining_line" | sed 's/.*Time Remaining: //')
-  hours=$(echo "$remaining" | grep -oP '\d+(?=h)' | head -1)
-  mins=$(echo "$remaining" | grep -oP '\d+(?=m)' | head -1)
-  [ -z "$hours" ] && hours=0
-  [ -z "$mins" ] && mins=0
-  total_mins=$(( hours * 60 + mins ))
-  reset_epoch=$(( $(date +%s) + total_mins * 60 ))
-  echo "cron:  $(date -d @$reset_epoch '+%M %H %d %m') *"
-  echo "human: $(date -d @$reset_epoch '+%H:%M on %Y-%m-%d')"
-fi
-```
-
-If UNAVAILABLE (no active block) or `bunx` not found, **ask the user** for
+If there is no active block or `bunx` is not available, **ask the user** for
 the reset time — they can see it in the Claude Code UI or error message.
 
 **For an explicit clock time (e.g. "01:15"):**
