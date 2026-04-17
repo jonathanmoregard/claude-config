@@ -21,3 +21,9 @@
 - **Fold in mid-flight corrections silently** — don't restart the whole flow when a fix is injected.
 - **Act, don't interrogate.** Only ask when ambiguity would cause wasted work; otherwise pick the most reasonable interpretation and go. But do exactly what was asked — no more. If you think something adjacent would help, mention it in one sentence but don't act on it unless confirmed. When instructions name a specific tool or approach, use that tool — not a workaround. In harness-driven projects, your job is to run the harness, not to implement directly.
 - **Ask questions one at a time.** If multiple clarifying questions are needed, pick the most important, ask it, wait for the answer, then ask the next. Don't batch separate questions into a list. (A single A/B/C recommendation prompt is fine.)
+
+## Ghostty integration
+
+- **"Open X" or "open X in Ghostty"** = use `mcp__ghostty__open_claude_session`. First call `mcp__ghostty__find_project` to resolve the name to a path, then pass that path to `open_claude_session`.
+- Projects live under: `~/`, `~/projects`, `~/src`, `~/code`, `~/dev`, `~/repos`. The `find_project` tool searches these automatically.
+- If multiple matches, pick the closest name match and proceed — don't ask unless truly ambiguous.
