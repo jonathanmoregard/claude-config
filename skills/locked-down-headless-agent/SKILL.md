@@ -33,7 +33,11 @@ Inside `$CLAUDE_CONFIG_DIR/settings.json`:
   "permissions": {
     "defaultMode": "dontAsk",
     "allow": ["mcp__<your-proxy>__*"],
-    "deny": ["*"]
+    "deny": [
+      "Bash", "Read", "Write", "Edit", "NotebookEdit",
+      "Glob", "Grep", "WebFetch", "WebSearch",
+      "Task", "Agent", "Skill"
+    ]
   },
   "sandbox": {
     "enabled": true,
@@ -42,61 +46,93 @@ Inside `$CLAUDE_CONFIG_DIR/settings.json`:
     "network": {
       "allowedDomains": ["api.anthropic.com"],
       "allowManagedDomainsOnly": true
+    },
+    "filesystem": {
+      "allowRead": ["./scratch"],
+      "allowWrite": ["./scratch"],
+      "denyRead": ["~/.ssh", "~/.aws", "~/.config", "~/.gnupg"]
     }
   },
   "env": {
     "ENABLE_CLAUDEAI_MCP_SERVERS": "false",
-    "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"
+    "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+    "CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1",
+    "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+    "BASH_DEFAULT_TIMEOUT_MS": "30000",
+    "BASH_MAX_TIMEOUT_MS": "120000",
+    "BASH_MAX_OUTPUT_LENGTH": "30000",
+    "MAX_MCP_OUTPUT_TOKENS": "25000"
   }
 }
 ```
 
-**Stronger: managed settings (system path).** If you can write to `/etc/claude-code/managed-settings.json` (Linux) or `/Library/Application Support/ClaudeCode/managed-settings.json` (macOS), add:
+**On `deny`:** `defaultMode: "dontAsk"` auto-denies anything not in `allow`, so `deny` is defense-in-depth. Permission rules use tool-qualified forms (`Bash`, `Bash(git status:*)`, `Read(path/**)`, `WebFetch(domain:...)`, `mcp__.*`) per the settings JSON schema. A bare `"*"` glob is not in the documented pattern — prefer the explicit tool-name list above. **Network and filesystem lockdown are independent** — set both sandbox blocks, or a sandboxed agent can still `Read` outside the worktree.
+
+**Stronger: managed settings (system path).** If you can write to `/etc/claude-code/managed-settings.json` (Linux) or `/Library/Application Support/ClaudeCode/managed-settings.json` (macOS):
 
 ```json
+// /etc/claude-code/managed-settings.json
 {
   "allowManagedPermissionRulesOnly": true,
   "allowManagedHooksOnly": true,
   "allowManagedMcpServersOnly": true,
   "disableBypassPermissionsMode": "disable",
   "disableAutoMode": "disable",
-  "disableSkillShellExecution": true
+  "disableSkillShellExecution": true,
+  "allowedMcpServers": [
+    { "serverName": "<your-proxy>" }
+  ],
+  "sandbox": {
+    "filesystem": {
+      "allowManagedReadPathsOnly": true
+    }
+  }
 }
 ```
 
 Managed settings are read regardless of `CLAUDE_CONFIG_DIR`, and **CLI flags cannot override them**. This is the only tier the agent process cannot loosen. On shared hosts, always prefer managed settings for these keys.
 
-Pin MCP servers by absolute command path in `managed-mcp.json`:
+Pin the proxy's absolute command path in `$CLAUDE_CONFIG_DIR/.mcp.json`:
 
 ```json
+// $CLAUDE_CONFIG_DIR/.mcp.json
 {
-  "<your-proxy>": {
-    "serverCommand": ["/opt/your-proxy/bin/proxy"]
+  "mcpServers": {
+    "<your-proxy>": {
+      "command": "/opt/your-proxy/bin/proxy",
+      "args": []
+    }
   }
 }
 ```
 
-Avoid `npx` / unpinned installs; a compromised upstream package is a direct agent escalation.
+Avoid `npx` / unpinned installs; a compromised upstream package is a direct agent escalation. Pair with `--strict-mcp-config` at invocation (Layer 2) so only the pinned config is loaded.
+
+**Optional hardening** (managed settings): `deniedMcpServers` for explicit blocklist, `disableAllHooks: true` or `allowedHttpHookUrls`/`httpHookAllowedEnvVars` if you need hooks but want them scoped.
 
 ## Layer 2 — Invocation in `--bare` mode
 
-`--bare` is the single biggest lock-down win. It skips auto-discovery of hooks, skills, plugins, MCP servers from user/project scopes, auto-memory, and CLAUDE.md walking. Nothing the agent inherits except what you pass explicitly:
+`--bare` is the single biggest lock-down win. It skips auto-discovery of hooks, skills, plugins, MCP servers from user/project scopes, auto-memory, CLAUDE.md walking, attribution, background prefetches, and keychain reads. Auth is strictly `ANTHROPIC_API_KEY` or `apiKeyHelper` via `--settings` — **OAuth (`CLAUDE_CODE_OAUTH_TOKEN`) and keychain are never read**. Nothing the agent inherits except what you pass explicitly:
 
 ```bash
 claude --bare -p "$PROMPT" \
   --settings "$CLAUDE_CONFIG_DIR/settings.json" \
   --mcp-config "$CLAUDE_CONFIG_DIR/.mcp.json" \
+  --strict-mcp-config \
   --permission-mode dontAsk \
+  --tools "" \
   --allowedTools "mcp__<your-proxy>__*" \
-  --disallowedTools "Read,Write,Edit,Bash,Glob,Grep,WebFetch,WebSearch,Task,Agent,NotebookEdit,Skill" \
   --max-turns 20 \
   --output-format json
 ```
 
 Flag notes:
-- `--allowedTools` / `--disallowedTools` are camelCase (CC 2.x).
-- `dontAsk` auto-denies anything not explicitly in `permissions.allow`. Never use `bypassPermissions` — it propagates to subagents and cannot be cancelled.
+- `--tools ""` disables the entire built-in tool set (Bash, Read, Write, Edit, Glob, Grep, WebFetch, WebSearch, Task/Agent, NotebookEdit, Skill). Cleaner and more complete than enumerating `--disallowedTools`. Per-tool `--allowedTools` / `--disallowedTools` then layer on top of this baseline.
+- `--strict-mcp-config` forces only the `--mcp-config` file's servers to load — no user/project MCP inheritance.
+- `--allowedTools` / `--disallowedTools` accept tool-qualified forms (`Bash(git status:*)`, `WebFetch(domain:github.com)`); same syntax as `permissions.allow`/`deny`.
+- `dontAsk` auto-denies anything not in `permissions.allow`. Never use `bypassPermissions` — it propagates to subagents and cannot be cancelled.
 - Disallowing `Task` also blocks the aliased `Agent` tool, but list both for clarity.
+- **No human-in-the-loop for trust prompts.** `-p` (headless) skips the trust-verification prompt on new directories — so a compromised cwd cannot ask for trust, but also cannot refuse it. Rely on sandbox + `--bare` + cwd hygiene instead of trust dialogs.
 - **Working directory must not be inside any repo.** CLAUDE.md files walk up from cwd and get concatenated into the system prompt unless `--bare` is set. `--bare` covers this, but keep cwd to a scratch dir anyway as belt + suspenders.
 
 ## Layer 3 — PreToolUse hook as tripwire
