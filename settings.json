@@ -1,5 +1,4 @@
 {
-  "cleanupPeriodDays": 99999,
   "permissions": {
     "allow": [
       "Bash",
@@ -10,8 +9,7 @@
       "TodoWrite",
       "TodoRead",
       "Bash(~/.claude/date-reset.sh)",
-      "mcp__android__*",
-      "mcp__ghostty__*"
+      "mcp__android__*"
     ],
     "deny": [
       "WebFetch",
@@ -36,7 +34,6 @@
       "Write(~/Dropbox/1. Exocortex/**)"
     ]
   },
-  "model": "sonnet",
   "hooks": {
     "SessionStart": [
       {
@@ -71,15 +68,6 @@
           {
             "type": "command",
             "command": "python3 $HOME/.claude/evolve-reminder.py"
-          }
-        ]
-      },
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "uv run --directory /home/jonathan/Repos/jonathans-assistant router-nudge-hook --queue-root /home/jonathan/.local/state/router/queue --marker /home/jonathan/.local/state/router/audit/nudge-marker"
           }
         ]
       }
@@ -133,16 +121,7 @@
         ]
       }
     ],
-    "PreCompact": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "echo COMPACTION GUIDANCE: Preserve code changes, key decisions, and file paths. Discard intermediate attempts, explanations, and verbose tool output."
-          }
-        ]
-      }
-    ]
+    "Stop": []
   },
   "statusLine": {
     "type": "command",
@@ -214,7 +193,6 @@
     "autoAllowBashIfSandboxed": true,
     "allowUnsandboxedCommands": false
   },
-  "effortLevel": "high",
   "advisorModel": "opus",
   "voiceEnabled": false
 }
