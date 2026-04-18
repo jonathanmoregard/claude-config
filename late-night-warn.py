@@ -60,6 +60,12 @@ def _get_active_hours(now):
                         continue
                     if entry.get("isSidechain") or entry.get("isMeta"):
                         continue
+                    # Exclude SDK-driven / background automation sessions: these
+                    # aren't real user presence (hooks, schedule, headless agents).
+                    if entry.get("entrypoint") == "sdk-cli":
+                        continue
+                    if "/homunculus/" in entry.get("cwd", ""):
+                        continue
                     content = entry.get("message", {}).get("content")
                     if isinstance(content, list) and any(
                         isinstance(c, dict) and c.get("type") == "tool_result"
