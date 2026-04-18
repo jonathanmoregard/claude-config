@@ -55,6 +55,16 @@
             "statusMessage": "Loading caveman mode..."
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "(CLV2_PYTHON_CMD=/usr/bin/python3 ~/.claude/skills/continuous-learning-v2/agents/start-observer.sh start >/dev/null 2>&1 &) || true",
+            "timeout": 3,
+            "statusMessage": "Launching instinct observer..."
+          }
+        ]
       }
     ],
     "UserPromptSubmit": [
@@ -151,16 +161,6 @@
           }
         ]
       }
-    ],
-    "PreCompact": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "echo COMPACTION GUIDANCE: Preserve code changes, key decisions, and file paths. Discard intermediate attempts, explanations, and verbose tool output."
-          }
-        ]
-      }
     ]
   },
   "statusLine": {
@@ -200,31 +200,49 @@
     "jonathanmoregard": {
       "source": {
         "source": "directory",
-        "path": "/home/jonathan/Repos/jonathan-claude-marketplace"
+        "path": "/home/jonathan/.claude/plugins/marketplaces/jonathanmoregard"
       }
     },
     "alexgreensh-token-optimizer": {
       "source": {
         "source": "directory",
-        "path": "/home/jonathan/Repos/token-optimizer/.claude-plugin"
+        "path": "/home/jonathan/Repos/token-optimizer"
       }
     },
     "zach-source-plugins": {
       "source": {
-        "source": "git",
-        "url": "https://github.com/zach-source/claude-plugins.git"
+        "source": "directory",
+        "path": "/home/jonathan/.claude/plugins/marketplaces/zach-source-plugins"
       }
     },
     "nix-search-marketplace": {
       "source": {
-        "source": "git",
-        "url": "https://github.com/aldoborrero/nix-search.git"
+        "source": "directory",
+        "path": "/home/jonathan/.claude/plugins/marketplaces/nix-search-marketplace"
       }
     },
     "kettleofskills": {
       "source": {
-        "source": "git",
-        "url": "https://github.com/kettleofketchup/KettleOfSkills.git"
+        "source": "directory",
+        "path": "/home/jonathan/.claude/plugins/marketplaces/kettleofskills"
+      }
+    },
+    "trailofbits": {
+      "source": {
+        "source": "directory",
+        "path": "/home/jonathan/.claude/plugins/marketplaces/trailofbits"
+      }
+    },
+    "skills-curated": {
+      "source": {
+        "source": "directory",
+        "path": "/home/jonathan/.claude/plugins/marketplaces/skills-curated"
+      }
+    },
+    "claude-plugins-official": {
+      "source": {
+        "source": "github",
+        "repo": "anthropics/claude-plugins-official"
       }
     }
   },
@@ -233,7 +251,7 @@
     "autoAllowBashIfSandboxed": true,
     "allowUnsandboxedCommands": false
   },
-  "effortLevel": "high",
+  "effortLevel": "xhigh",
   "advisorModel": "opus",
   "voiceEnabled": false
 }
