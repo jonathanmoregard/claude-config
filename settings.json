@@ -86,7 +86,7 @@
           },
           {
             "type": "command",
-            "command": "python3 $HOME/.claude/late-night-warn.py"
+            "command": "python3 $HOME/.claude/wellbeing-nudge.py"
           },
           {
             "type": "command",
@@ -184,7 +184,6 @@
     "differential-review@trailofbits": true,
     "mutation-testing@trailofbits": true,
     "static-analysis@trailofbits": true,
-    "modern-python@trailofbits": true,
     "debug-buttercup@trailofbits": true,
     "spec-to-code-compliance@trailofbits": true,
     "entry-point-analyzer@trailofbits": true,
