@@ -11,7 +11,8 @@
       "TodoRead",
       "Bash(~/.claude/date-reset.sh)",
       "mcp__android__*",
-      "mcp__ghostty__*"
+      "mcp__ghostty__*",
+      "Write(/home/jonathan/.claude/homunculus/projects/ba55d347afb5/instincts/personal/**)"
     ],
     "deny": [
       "WebFetch",
@@ -60,7 +61,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "(CLV2_PYTHON_CMD=/usr/bin/python3 ~/.claude/skills/continuous-learning-v2/agents/start-observer.sh start >/dev/null 2>&1 &) || true",
+            "command": "(CLV2_PYTHON_CMD=/usr/bin/python3 ECC_OBSERVER_TIMEOUT_SECONDS=300 ~/.claude/skills/continuous-learning-v2/agents/start-observer.sh start >/dev/null 2>&1 &) || true",
             "timeout": 3,
             "statusMessage": "Launching instinct observer..."
           }
