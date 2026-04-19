@@ -1,0 +1,28 @@
+# Local habit deadlines for habit-tracker / habit-nudge.
+#
+# Map habit NAME (exact, case-sensitive, UTF-8) -> deadline_hour (24h int).
+# The habit must be checked in TickTick before this hour, otherwise the nudge
+# hook reminds you (1h before, then again 1h after).
+#
+# This is independent of TickTick "reminders" — set deadlines here without
+# triggering TickTick push notifications.
+#
+# Habits not listed here fall back to:
+#   1. preferred_hour from TickTick reminders[] (if set in app)
+#   2. default_nudge_hour below
+#
+# Edit freely; tracker reloads each run (cron */30).
+
+default_nudge_hour = 18
+
+[deadlines]
+# Examples — fill in or delete as you like.
+# "Meditate" = 11
+# "Vitaminer!" = 13
+# "Kolla Slack" = 16
+# "Schampo" = 22
+# "Överkropp, stenis" = 14
+# "Gymma ben" = 14
+# "Hälsmörj" = 22
+# "Byt örngott och underlakan" = 22
+# "Alphabet Aerobics" = 14

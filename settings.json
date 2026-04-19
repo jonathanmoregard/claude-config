@@ -86,7 +86,19 @@
           },
           {
             "type": "command",
-            "command": "python3 $HOME/.claude/wellbeing-nudge.py"
+            "command": "python3 $HOME/.claude/wellbeing/work-hours-nudge.py"
+          },
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/wellbeing/habit-nudge.py"
+          },
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/wellbeing/sunset-walk-nudge.py"
+          },
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/step-back-nudge.py"
           },
           {
             "type": "command",
@@ -139,6 +151,16 @@
           {
             "type": "command",
             "command": "~/.claude/skills/continuous-learning-v2/hooks/observe.sh post"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/step-back-detector.py"
           }
         ]
       }

@@ -85,6 +85,32 @@ class TickTickBackend:
         resp = self._request("POST", "/task", body)
         return str(resp.get("id", "")) if isinstance(resp, dict) else ""
 
+    def list_habits(self) -> list[dict]:
+        """Return all habits (OpenHabit objects)."""
+        resp = self._request("GET", "/habit")
+        return resp if isinstance(resp, list) else []
+
+    def get_checkins(
+        self,
+        habit_ids: list[str],
+        from_date: Union[str, date],
+        to_date: Union[str, date],
+    ) -> list[dict]:
+        """Return check-in documents for habits in [from_date, to_date].
+
+        Dates accepted as ``date`` or ``YYYYMMDD`` string (TickTick's format).
+        Returns the raw OpenHabitCheckin list — each item has ``habitId`` and
+        a ``checkins`` array.
+        """
+        if not habit_ids:
+            return []
+        f = from_date.strftime("%Y%m%d") if isinstance(from_date, date) else str(from_date)
+        t = to_date.strftime("%Y%m%d") if isinstance(to_date, date) else str(to_date)
+        ids = ",".join(habit_ids)
+        path = f"/habit/checkins?habitIds={ids}&from={f}&to={t}"
+        resp = self._request("GET", path)
+        return resp if isinstance(resp, list) else []
+
     # --- Auth / refresh -----------------------------------------------------
 
     def force_login(self) -> None:
@@ -92,12 +118,46 @@ class TickTickBackend:
         self._refresh(force=True)
 
     def _ensure_fresh_token(self) -> None:
-        if not self.access_token:
-            self._refresh()
-            return
-        if self.expires_at and time.time() < self.expires_at - EXPIRY_MARGIN_SECONDS:
+        if self.access_token and self.expires_at and time.time() < self.expires_at - EXPIRY_MARGIN_SECONDS:
             return  # plenty of headroom
+        # Token missing or near-expiry — another process (e.g. CLI --login) may
+        # have refreshed it since this instance was created. Re-read env file
+        # before falling back to interactive refresh.
+        if self._reload_token_from_envfile() and time.time() < self.expires_at - EXPIRY_MARGIN_SECONDS:
+            return
         self._refresh()
+
+    def _reload_token_from_envfile(self) -> bool:
+        """Re-read TickTick token from the env file. Returns True if a usable
+        token was found (caller still checks expiry)."""
+        from .._envfile import ENV_FILE_PATH
+        if not os.path.exists(ENV_FILE_PATH):
+            return False
+        new_token = None
+        new_expires = 0
+        try:
+            with open(ENV_FILE_PATH) as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    if key == "TICKTICK_ACCESS_TOKEN":
+                        new_token = value
+                    elif key == "TICKTICK_TOKEN_EXPIRES_AT":
+                        try:
+                            new_expires = int(value)
+                        except ValueError:
+                            pass
+        except OSError:
+            return False
+        if not new_token:
+            return False
+        self.access_token = new_token
+        self.expires_at = new_expires
+        return True
 
     def _refresh(self, force: bool = False) -> None:
         if not (self.client_id and self.client_secret):
@@ -169,9 +229,12 @@ class TickTickBackend:
                 raw = r.read().decode()
         except urllib.error.HTTPError as e:
             if e.code == 401 and not _retried:
-                # Token might have been revoked earlier than advertised; reauth.
+                # Token might have been revoked earlier than advertised.
+                # First try reloading from env file (another process may have
+                # refreshed it); fall back to interactive refresh if still stale.
                 self.expires_at = 0
-                self._refresh()
+                if not self._reload_token_from_envfile():
+                    self._refresh()
                 return self._request(method, path, body, _retried=True)
             detail = e.read().decode(errors="replace")
             raise BackendError(
