@@ -17,6 +17,9 @@ homunculus/
 # Scratch/tmp folder
 tmp/
 
+# Step-back detector runtime state (per-session flags + classifier log)
+step-back/
+
 # Runtime/cache directories
 cache/
 debug/
