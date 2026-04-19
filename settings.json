@@ -1,5 +1,6 @@
 {
   "cleanupPeriodDays": 99999,
+  "enableAllProjectMcpServers": false,
   "env": {
     "DISABLE_TELEMETRY": "1",
     "DISABLE_ERROR_REPORTING": "1",
@@ -12,11 +13,8 @@
       "Write",
       "Glob",
       "Grep",
-      "TodoWrite",
-      "TodoRead",
       "Bash(~/.claude/date-reset.sh)",
       "mcp__android__*",
-      "mcp__ghostty__*",
       "Write(/home/jonathan/.claude/homunculus/projects/ba55d347afb5/instincts/personal/**)"
     ],
     "deny": [
