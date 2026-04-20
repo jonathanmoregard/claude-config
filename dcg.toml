@@ -24,6 +24,16 @@ allow = []
 #   - POST to delete-style endpoints (too many FPs to block POST generally)
 #   - Aliased commands: alias del='curl -X DELETE'
 block = [
+    # ── ADB destructive operations ─────────────────────────────────────────
+    { pattern = "adb\\s+uninstall", reason = "ADB uninstall blocked — do not remove apps from device. Run it yourself with `! <command>` if intentional." },
+    { pattern = "adb\\s+shell\\s+pm\\s+uninstall", reason = "ADB pm uninstall blocked. Run it yourself if intentional." },
+    { pattern = "adb\\s+shell\\s+pm\\s+clear", reason = "ADB pm clear blocked — wipes all app storage. Run it yourself if intentional." },
+    { pattern = "adb\\s+shell\\s+rm", reason = "ADB shell rm blocked — do not delete files on device. Run it yourself if intentional." },
+    { pattern = "adb\\s+shell\\s+reboot", reason = "ADB reboot blocked. Run it yourself if intentional." },
+    { pattern = "adb\\s+shell\\s+wipe", reason = "ADB wipe blocked — extremely destructive. Run it yourself if intentional." },
+    { pattern = "adb\\s+shell\\s+settings\\s+put", reason = "ADB system settings write blocked. Run it yourself if intentional." },
+    { pattern = "adb\\s+shell\\s+am\\s+kill\\b", reason = "ADB am kill blocked — use force-stop com.jhana.app instead. Run it yourself if intentional." },
+
     # ── DELETE / PUT / PATCH — always destructive ─────────────────────────
     # curl: short flag (-X) and long flag (--request)
     { pattern = "curl.*-X\\s+(DELETE|PUT|PATCH)", reason = "Destructive HTTP method — deletes or overwrites a remote resource. Run it yourself with `! <command>` if intentional." },
