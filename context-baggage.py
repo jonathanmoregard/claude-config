@@ -1,15 +1,44 @@
 #!/usr/bin/env python3
 """
-UserPromptSubmit hook: warns when context is over 40% full with potentially
-stale/off-topic content. Activates every 5 user messages once threshold is met.
+UserPromptSubmit hook: warns when context is over THRESHOLD with potentially
+stale/off-topic content. Fires every MESSAGE_INTERVAL user messages once
+threshold is met.
+
+Context window detection (in priority order):
+    1. CLAUDE_CONTEXT_MAX env var (explicit override, in tokens)
+    2. Model ID prefix — Opus/Sonnet 4.x run with 1M in this setup
+    3. Observed usage — if any assistant turn has exceeded 200k tokens,
+       the session is 1M, regardless of model name
+    4. Default 200k
 """
 import json
 import os
 import sys
 
-MAX_TOKENS = 200_000
+BASE_MAX = 200_000
+ONE_M = 1_000_000
 THRESHOLD = 0.40
 MESSAGE_INTERVAL = 5
+
+# Claude Code model IDs that run at 1M context by default.
+ONE_M_MODEL_PREFIXES = (
+    "claude-opus-4-",
+    "claude-sonnet-4-",
+)
+
+
+def detect_max_tokens(model: str | None, observed_max: int) -> int:
+    override = os.environ.get("CLAUDE_CONTEXT_MAX")
+    if override:
+        try:
+            return int(override)
+        except ValueError:
+            pass
+    if model and any(model.startswith(p) for p in ONE_M_MODEL_PREFIXES):
+        return ONE_M
+    if observed_max > BASE_MAX:
+        return ONE_M
+    return BASE_MAX
 
 
 def main():
@@ -26,6 +55,8 @@ def main():
 
     user_msg_count = 0
     last_usage = None
+    last_model = None
+    observed_max = 0
 
     with open(transcript_path, "r", errors="replace") as f:
         for line in f:
@@ -43,32 +74,42 @@ def main():
                 user_msg_count += 1
             elif obj_type == "assistant":
                 msg = obj.get("message", {})
+                model = msg.get("model")
+                if model and model != "<synthetic>":
+                    last_model = model
                 usage = msg.get("usage")
                 if usage:
                     last_usage = usage
+                    total = (
+                        usage.get("input_tokens", 0)
+                        + usage.get("cache_creation_input_tokens", 0)
+                        + usage.get("cache_read_input_tokens", 0)
+                    )
+                    if total > observed_max:
+                        observed_max = total
 
-    # Fire every MESSAGE_INTERVAL messages
     if user_msg_count == 0 or user_msg_count % MESSAGE_INTERVAL != 0:
         sys.exit(0)
 
-    # Calculate context fill
+    max_tokens = detect_max_tokens(last_model, observed_max)
+
     if last_usage:
         total_tokens = (
             last_usage.get("input_tokens", 0)
             + last_usage.get("cache_creation_input_tokens", 0)
             + last_usage.get("cache_read_input_tokens", 0)
         )
-        fill_pct = total_tokens / MAX_TOKENS
+        fill_pct = total_tokens / max_tokens
     else:
-        # Fallback: file size heuristic (4 chars ≈ 1 token)
-        fill_pct = file_size / (MAX_TOKENS * 4)
+        fill_pct = file_size / (max_tokens * 4)
 
     if fill_pct < THRESHOLD:
         sys.exit(0)
 
     pct_display = int(fill_pct * 100)
     message = (
-        f"Context is {pct_display}% full ({user_msg_count} messages in this session). "
+        f"Context is {pct_display}% full ({user_msg_count} messages in this session; "
+        f"window: {max_tokens // 1000}k tokens). "
         "Review the conversation history: identify any content that appears to be leftover "
         "from a previous task or is no longer relevant to the current task. "
         "Summarize what seems stale or off-topic, and warn the user clearly if you are "
