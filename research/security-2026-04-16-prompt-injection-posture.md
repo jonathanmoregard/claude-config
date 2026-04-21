@@ -66,16 +66,9 @@ Every channel below now reaches context un-inspected.
 
 Ordered by end-user addressability, highest first.
 
-### 1. Capability-based egress containment (CaMeL-style)
+### 1. Token-canary tripwire → lockdown
 
-DeepMind, 2024. Paradigm: stop trying to detect injection in content; instead bound what the agent can *do* after untrusted content enters context.
-
-Concrete sketch for this setup:
-- Any PreToolUse hook that encounters "untrusted-sourced" content writes a `~/.claude/state/tainted-session` flag.
-- Subsequent PreToolUse hooks for Bash / WebFetch / MCP-write consult the flag and either deny or escalate to the user.
-- Flag clears on session end or manual reset.
-
-Single-handedly addresses D1 and multiplies protection across B1, B2, B3, B5. Composes cleanly with `dcg`. Worth prototyping.
+Egress tainting on every untrusted ingress (CaMeL-style) rejected — too draconic. Replaced with token canary: plant canary directives in untrusted content; lockdown fires only when model acts on one. No friction on benign sessions. Delivery mechanism TBD.
 
 ### 2. Behavioral / sacrificial-agent detection
 
@@ -137,3 +130,8 @@ Full detail: `security-2026-04-14-b1-mcp-bash-research.md`.
 3. **Exit-code-2 + stderr is safer than structured `permissionDecision: "deny"` for MCP PreToolUse blocking.** Predates permissionDecision and is more battle-tested. Verify empirically before depending.
 4. **`updatedMCPToolOutput` remains the only documented replace-not-warn primitive** for tool output, and works reliably when invoked via shell-command PostToolUse hooks. Still valuable even post-classifier — it's the plumbing for any future redaction regardless of what makes the redact decision.
 5. **If MCP-wrapping is ever adopted, self-author the wrapper** (tiny stdlib-only script) to eliminate supply-chain and tool-description-poisoning risk.
+
+## TODO
+
+- **Central secret scrub on capture.** Apply at the MCP-wrapper layer, not as hooks — each self-authored MCP shim scrubs secrets before content crosses the boundary, so every ingress shares one ruleset and hooks aren't the enforcement point. Mirror research-agent `scanner/secret_shapes.py`. Raised by CL-v2 vetted-extraction review 2026-04-21 (F6); generalized here because the concern isn't CL-v2 specific.
+- **Submodule content delivery** into sandbox — `git submodule update` inside an already-trusted session fetches attacker-controlled public github repos (allowed by proxy). Trust file doesn't gate this; sandbox containment does. Residual: malicious code ends up on disk within the sandbox. Acceptable under current blast-radius model; note if future work tightens.
