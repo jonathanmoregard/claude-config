@@ -7,12 +7,10 @@
   },
   "permissions": {
     "allow": [
-      "Bash",
       "Edit",
       "Write",
       "Glob",
       "Grep",
-      "Bash(~/.claude/date-reset.sh)",
       "mcp__research-agent__*",
       "mcp__safe-bash__*",
       "Write(/home/jonathan/.claude/homunculus/projects/ba55d347afb5/instincts/personal/**)",
@@ -26,37 +24,9 @@
     "deny": [
       "WebFetch",
       "WebSearch",
-      "Bash(curl *)",
-      "Bash(curl)",
-      "Bash(wget *)",
-      "Bash(wget)",
-      "Bash(http *)",
-      "Bash(https *)",
-      "Bash(secret-tool*)",
-      "Bash(docker exec research-agent*)",
-      "Bash(docker exec -* research-agent*)",
-      "Bash(docker inspect*research-agent*)",
-      "Bash(docker logs*research-agent*)",
-      "Bash(docker cp*research-agent*)",
+      "Bash",
       "Read(/home/jonathan/Repos/research-agent/.env)",
       "Read(/home/jonathan/Repos/research-agent/.env.*)",
-      "Bash(rm -rf *)",
-      "Bash(rm -fr *)",
-      "Bash(sudo *)",
-      "Bash(mkfs *)",
-      "Bash(mkfs.*)",
-      "Bash(dd *)",
-      "Bash(wget *|bash*)",
-      "Bash(wget *| bash*)",
-      "Bash(curl *|bash*)",
-      "Bash(curl *| bash*)",
-      "Bash(curl *|sh*)",
-      "Bash(curl *| sh*)",
-      "Bash(git push --force*)",
-      "Bash(git push *--force*)",
-      "Bash(git push -f*)",
-      "Bash(git push *-f *)",
-      "Bash(git reset --hard*)",
       "Edit(~/.bashrc)",
       "Edit(~/.zshrc)",
       "Edit(~/.ssh/**)",
@@ -200,24 +170,6 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "mcp__tavily-remote-mcp__.*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 $HOME/.claude/wrap-untrusted-tavily.py"
-          }
-        ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 $HOME/.claude/wrap-untrusted-bash.py"
-          }
-        ]
-      },
-      {
         "matcher": "*",
         "hooks": [
           {
@@ -238,15 +190,6 @@
       }
     ],
     "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/home/jonathan/.local/bin/dcg"
-          }
-        ]
-      },
       {
         "matcher": "*",
         "hooks": [
