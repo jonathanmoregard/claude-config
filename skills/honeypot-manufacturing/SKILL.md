@@ -50,8 +50,86 @@ Concretely, at minimum:
 - Container / victim exit non-zero AND no trigger signal → report `error`, not `ok`.
 - Trap state / log writes must be atomic (tempfile + rename), so a crashed victim can't leave a partial file that reads as "no trigger".
 - Cleanup paths must not swallow errors that affected the outcome (remove container: yes; hide a failed state read: no).
+- Any exception raised inside a scanner / detection layer must reduce to *reject*, not *pass*. Wrap each layer in a blanket try/except that builds a synthetic "layer error" verdict and treats the incident as a rejection. A silent pass on `ImportError` / network blip / SDK timeout is the same class of bug as a silent pass on cleanup failure — both invent a positive signal from the absence of a negative.
 
 The positive signal must come from a **successful write by the trap**, not from the *absence* of a failure.
+
+## Invariant 4 — The caught bytes never return
+
+Every piece of data the honeypot catches — the matched canary, the coerced tool-call arguments, the report body that triggered the trap, any exception stringification from the harness — is attacker-shaped. If any of it flows back into a calling LLM's context, the honeypot becomes a *re-delivery vehicle* for the injection it was built to stop. Treat caught bytes like radioactive material: harvest into the log, never read into any model.
+
+### Caller response must be generic
+
+Reject/trigger responses return a fixed string + a correlation id. That's it. No reason code, no layer name, no matched snippet, no layer-specific timing, no exception repr, no sanitized excerpt. Example shape:
+
+```json
+{"status": "error",
+ "error": "scanner rejected report (quarantined)",
+ "report_id": "<uuid>",
+ "timings_ms": {"scan": <bucketized>, ...}}
+```
+
+The caller learns *that* it was rejected and a handle for operator diagnosis. Nothing else. If the caller needs a retry affordance, design it to take the `report_id` only — never echoes of the content.
+
+### Full diagnostic goes to a quarantine zone, not the response
+
+Write the attacker bytes, the per-layer verdict, and the timing breakdown into an append-only log (`.jsonl`) inside a quarantine directory. One row per incident, self-contained enough that an operator reading from a bare terminal can diagnose without cross-referencing anything an LLM has touched.
+
+| Field | Content | Source |
+|---|---|---|
+| `ts` | ISO-8601 UTC | harness clock |
+| `report_id` | correlation uuid | harness mint |
+| `prompt` | truncated operator prompt | harness input (not attacker) |
+| `verdict` | reason, layers, stats — with raw sanitized text scrubbed | scanner |
+| `report_text` | full raw suspected-injection bytes | harvested from sandbox, never LLM-read |
+
+The quarantine dir is deny-listed at project scope: `Read`, `Edit`, `Write`, `NotebookEdit`, `Grep`, `Glob` all rejected for every path form (`./`, bare, absolute). Also extend the deny-list to every shell-ish MCP the host runs (`Bash`, `mcp__safe-bash__exec`, etc.) with command patterns covering `cat|head|tail|less|more|xxd|od|strings|grep|rg|awk|sed|cp|mv|ln *<quarantine-path>*`. Enforcement at the MCP layer, not hooks — hooks don't propagate to subagents.
+
+### Harvest means no LLM touched it
+
+Between "attacker bytes leave the sandbox" and "audit row is written", no model sees the bytes. No LLM-backed classifier reads the full body into its context. No "summarize why we rejected this" pass. The layered scanner's internal model call (e.g. a downstream judge used for detection) is fine — its *output* must not flow to caller context, and its arguments are the bytes we're containing anyway.
+
+### Exception stringification is attacker surface
+
+SDK exceptions frequently embed request/response fragments. `str(e)` on an `anthropic.APIStatusError` can include the rejected prompt verbatim; `urllib.error.HTTPError.read()` returns the response body. Never interpolate `{e}` into audit signals or caller responses. Use `type(e).__name__` only. Wrap scanner calls in a blanket try/except that builds a synthetic "scanner error" verdict with the type name and fails closed.
+
+### Timing is a side-channel
+
+Different layers reject in different time buckets (regex ~ms, downstream-model judge ~seconds). Callers who measure response latency can fingerprint which layer fired and tune payloads to beat the cheap ones first. On reject: bucketize scan timing to a fixed ceiling (e.g. 5000 ms) regardless of the actual layer. On pass: precise timing is fine.
+
+### Wrap framing is defeatable — make it not
+
+If the harness delivers the retrieved content wrapped in framing tags (`<untrusted_external_content>`, `<system-reminder>`), a body containing a literal close tag escapes the wrap. Reject any body that embeds wrap-framing tag names OR elevated-trust tag names the downstream model weighs (`important_instructions`, `developer`, `admin`, `priority`, `reminder`, `instructions`). And fold Unicode-confusable variants (U+2215 DIVISION SLASH, U+2044 FRACTION SLASH) to ASCII `/` BEFORE the regex runs — NFKC does not cover these.
+
+### File I/O is attacker surface
+
+A same-user attacker who prompt-injects the caller into issuing shell tool calls can swap directories/files between your checks and your writes. Default to:
+
+- **Reads:** `O_NOFOLLOW | O_CLOEXEC` + `fstat` for `S_ISREG`, plus a byte-count cap.
+- **Writes:** open the parent directory with `O_DIRECTORY | O_NOFOLLOW` → `dir_fd`, then `os.open(name, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW, dir_fd=dir_fd)`. The fd pins the inode — namespace swaps don't redirect the write.
+- **Size:** cap content bytes. An attacker that forces megabytes of rejected content into a quarantine log is a disk-exhaust primitive; cap the audit `report_text` too and skip the quarantine-file write on oversized rejects (audit row's length marker is sufficient diagnostic).
+
+### Checklist: walk the pipe end-to-end
+
+For each surface, trace *every* code path from harvest to response and prove no branch echoes attacker bytes to the caller. The paths that matter in practice:
+
+- Pass response body (if you return content)
+- Reject response `error` field
+- Reject response `reason` / `layers` / `snippet` fields (should not exist)
+- Agent/subprocess failure error string
+- External-API error stringification (HTTP body, exception repr)
+- Scanner exception repr
+- Timing side channel
+- Write-parent symlink redirect
+- Read-leaf symlink redirect
+- Oversized-content context-window flood
+- Oversized-content disk-exhaust via audit log
+- Wrap framing forged via literal tags
+- Wrap framing forged via Unicode-confusable characters
+- Audit log readable via Read / Grep / Glob / shell
+- Any downstream model call that reads audit back in
+
+A canary-based regression test is the only way to keep the invariant honest. For every surface above: plant a unique canary string, run the end-to-end flow, assert the canary appears only in the quarantine audit and nowhere in the caller return. Rerun on every change to the harness.
 
 ## Detection Mechanism
 
