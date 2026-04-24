@@ -75,7 +75,20 @@
       "Read(~/.terraformrc)",
       "Read(~/.terraform.d/credentials.tfrc.json)",
       "Read(~/.config/heroku/**)",
-      "Read(~/.npm/**)"
+      "Read(~/.npm/**)",
+      "Read(**/quarantine/**)",
+      "Read(**/quarantine)",
+      "Edit(**/quarantine/**)",
+      "Edit(**/quarantine)",
+      "Write(**/quarantine/**)",
+      "Write(**/quarantine)",
+      "NotebookEdit(**/quarantine/**)",
+      "NotebookEdit(**/quarantine)",
+      "Grep(**/quarantine/**)",
+      "Grep(**/quarantine)",
+      "Glob(**/quarantine/**)",
+      "Glob(**/quarantine)",
+      "Bash(*quarantine*)"
     ]
   },
   "enableAllProjectMcpServers": false,
