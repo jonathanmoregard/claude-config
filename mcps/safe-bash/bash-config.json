@@ -29,7 +29,7 @@
       "Bash(* BLOCKED_TEST_COMPOUND *)",
       "Bash(echo BLOCKED_TEST_ESCAPED\\*)",
       "Bash(BLOCKED_TEST_SUBCMD*)",
-      "Bash(*_quarantine*)"
+      "Bash(*quarantine*)"
     ]
   },
   "untrusted_ingress_single": {
