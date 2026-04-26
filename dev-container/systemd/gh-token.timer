@@ -1,0 +1,10 @@
+[Unit]
+Description=Rotate GitHub App tokens every 50 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=50min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

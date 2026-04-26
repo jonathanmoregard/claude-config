@@ -1,0 +1,26 @@
+[Unit]
+Description=Vet container-captured CL-v2 observations and merge to host homunculus
+After=default.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/Repos/research-agent/.venv/bin/python3 %h/.claude/dev-container/bin/claude-cl-sync
+Nice=10
+
+# Hardening (H-B, advice-refine round 1)
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# Writable: host homunculus (approved lands here), per-project staging dirs
+# (rotate + quarantine), and scanner's __pycache__ under the venv.
+ReadWritePaths=%h/.claude/homunculus %h/.claude/container-staging %h/Repos/research-agent/scanner/__pycache__
+# Readable: scanner source + venv (interpreter + site-packages).
+ReadOnlyPaths=%h/Repos/research-agent
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryMax=1G
+TasksMax=256

@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""Hostname-allowlisted HTTP/HTTPS forwarding proxy for Claude sandboxes.
+
+- HTTPS: parses CONNECT verb, checks destination hostname against allowlist,
+  blindly tunnels bytes if allowed. No TLS termination — certs stay end-to-end.
+- HTTP (plain): parses Host, allowlist-checks, forwards.
+- Listens on 127.0.0.1 and the docker bridge (172.17.0.1) so containers on the
+  default bridge can reach it at http://172.17.0.1:8888/.
+- Configured via ~/.claude/dev-container/proxy-allow.txt (one pattern per line;
+  lines starting with # ignored). Falls back to a built-in minimal list.
+"""
+
+from __future__ import annotations
+
+import fnmatch
+import http.server
+import logging
+import os
+import select
+import socket
+import socketserver
+import sys
+import threading
+from pathlib import Path
+from urllib.parse import urlparse
+
+DEFAULT_ALLOW = [
+    "github.com",
+    "*.github.com",
+    "codeload.github.com",
+    "*.githubusercontent.com",
+    "registry.npmjs.org",
+    "registry.yarnpkg.com",
+    "pypi.org",
+    "files.pythonhosted.org",
+    "crates.io",
+    "index.crates.io",
+    "static.crates.io",
+    "hackage.haskell.org",
+    "api.anthropic.com",
+    "statsig.anthropic.com",
+    "docs.anthropic.com",
+    "developer.mozilla.org",
+    "docs.python.org",
+    "docs.github.com",
+]
+
+
+def load_allowlist() -> list[str]:
+    path = Path.home() / ".claude" / "dev-container" / "proxy-allow.txt"
+    if not path.exists():
+        return DEFAULT_ALLOW
+    out = []
+    for line in path.read_text().splitlines():
+        s = line.strip()
+        if s and not s.startswith("#"):
+            out.append(s.lower())
+    return out or DEFAULT_ALLOW
+
+
+ALLOW = load_allowlist()
+
+
+def is_allowed(host: str) -> bool:
+    host = (host or "").lower().rstrip(".")
+    return any(fnmatch.fnmatchcase(host, pat) for pat in ALLOW)
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    timeout = 30
+
+    def do_CONNECT(self) -> None:
+        host, _, port_s = self.path.partition(":")
+        try:
+            port = int(port_s or "443")
+        except ValueError:
+            self.send_error(400, "bad port")
+            return
+        if not is_allowed(host):
+            logging.warning("DENY CONNECT %s:%d", host, port)
+            self.send_error(403, f"host not allowlisted: {host}")
+            return
+        try:
+            upstream = socket.create_connection((host, port), timeout=10)
+        except OSError as e:
+            logging.warning("upstream fail %s:%d %s", host, port, e)
+            self.send_error(502, f"upstream: {e}")
+            return
+        logging.info("CONNECT %s:%d", host, port)
+        self.send_response(200, "Connection established")
+        self.send_header("Proxy-Agent", "claude-sandbox-proxy")
+        self.end_headers()
+        try:
+            self.connection.setblocking(True)
+            self._tunnel(self.connection, upstream)
+        finally:
+            try:
+                upstream.close()
+            except OSError:
+                pass
+
+    def _handle_plain(self) -> None:
+        u = urlparse(self.path)
+        host = u.hostname or ""
+        port = u.port or 80
+        if not is_allowed(host):
+            logging.warning("DENY %s %s", self.command, self.path)
+            self.send_error(403, f"host not allowlisted: {host}")
+            return
+        try:
+            upstream = socket.create_connection((host, port), timeout=10)
+        except OSError as e:
+            self.send_error(502, f"upstream: {e}")
+            return
+        rel_path = u.path or "/"
+        if u.query:
+            rel_path += "?" + u.query
+        req_lines = [f"{self.command} {rel_path} HTTP/1.1\r\n"]
+        for k, v in self.headers.items():
+            if k.lower() in ("proxy-connection",):
+                continue
+            req_lines.append(f"{k}: {v}\r\n")
+        req_lines.append("\r\n")
+        upstream.sendall("".join(req_lines).encode("iso-8859-1"))
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self.send_error(400, "bad Content-Length")
+            return
+        MAX_BODY = 32 * 1024 * 1024  # 32 MiB hard cap on proxied body
+        if length < 0:
+            self.send_error(400, "negative Content-Length")
+            return
+        if length > MAX_BODY:
+            self.send_error(413, f"body too large (>{MAX_BODY} bytes)")
+            return
+        if length:
+            upstream.sendall(self.rfile.read(length))
+        logging.info("%s %s", self.command, self.path)
+        try:
+            self._tunnel(self.connection, upstream)
+        finally:
+            try:
+                upstream.close()
+            except OSError:
+                pass
+
+    do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = _handle_plain
+
+    @staticmethod
+    def _tunnel(a: socket.socket, b: socket.socket) -> None:
+        sockets = [a, b]
+        try:
+            while True:
+                r, _, _ = select.select(sockets, [], [], 120)
+                if not r:
+                    break
+                for s in r:
+                    try:
+                        data = s.recv(65536)
+                    except OSError:
+                        return
+                    if not data:
+                        return
+                    other = b if s is a else a
+                    try:
+                        other.sendall(data)
+                    except OSError:
+                        return
+        finally:
+            pass
+
+    def log_message(self, fmt: str, *args) -> None:  # noqa: A003
+        logging.info("%s %s", self.address_string(), fmt % args)
+
+
+class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def main() -> int:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s claude-sandbox-proxy %(levelname)s %(message)s",
+    )
+    port = int(os.environ.get("PROXY_PORT", "8888"))
+    binds = []
+    for addr in ("127.0.0.1", "172.17.0.1"):
+        try:
+            srv = ThreadedHTTPServer((addr, port), Handler)
+            t = threading.Thread(target=srv.serve_forever, daemon=True)
+            t.start()
+            binds.append((addr, port))
+            logging.info("listening on %s:%d (allow %d patterns)", addr, port, len(ALLOW))
+        except OSError as e:
+            logging.warning("bind %s:%d failed: %s", addr, port, e)
+    if not binds:
+        logging.error("no listeners — aborting")
+        return 1
+    try:
+        threading.Event().wait()
+    except KeyboardInterrupt:
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

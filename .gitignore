@@ -37,9 +37,9 @@ powerline/usage/pricing.json
 # Project-specific data (per-project, not global)
 projects/
 
-# Tasks & plans (session-specific)
-tasks/
-plans/
+# Tasks & plans (session-specific) — anchored to root so dev-container/plans/ tracks
+/tasks/
+/plans/
 **/__pycache__/
 
 # Caveman state flag

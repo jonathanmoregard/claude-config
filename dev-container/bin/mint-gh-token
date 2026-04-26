@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Mint per-sandbox GitHub App installation tokens.
+# Walks TOKEN_ROOT/<sandbox-id>/repo_id, mints a token scoped to that repo,
+# atomically replaces TOKEN_ROOT/<sandbox-id>/token.
+
+set -euo pipefail
+
+CONFIG="${GH_APP_CONFIG:-$HOME/.config/github-app/config}"
+[ -r "$CONFIG" ] || { echo "mint-gh-token: cannot read $CONFIG" >&2; exit 1; }
+# shellcheck disable=SC1090
+. "$CONFIG"
+
+: "${APP_ID:?APP_ID not set}"
+: "${INSTALLATION_ID:?INSTALLATION_ID not set}"
+: "${KEY_PATH:?KEY_PATH not set}"
+: "${TOKEN_ROOT:?TOKEN_ROOT not set}"
+
+if [ "$APP_ID" = "FILL_ME_IN" ] || [ "$INSTALLATION_ID" = "FILL_ME_IN" ]; then
+    echo "mint-gh-token: APP_ID / INSTALLATION_ID not populated in $CONFIG" >&2
+    exit 1
+fi
+[ -r "$KEY_PATH" ] || { echo "mint-gh-token: cannot read $KEY_PATH" >&2; exit 1; }
+
+b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+
+build_jwt() {
+    local now exp header payload signing_input sig
+    now=$(date +%s)
+    exp=$((now + 540))
+    header=$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)
+    payload=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "$((now - 60))" "$exp" "$APP_ID" | b64url)
+    signing_input="${header}.${payload}"
+    sig=$(printf '%s' "$signing_input" | openssl dgst -sha256 -sign "$KEY_PATH" | b64url)
+    printf '%s.%s' "$signing_input" "$sig"
+}
+
+mint_for_sandbox() {
+    local dir="$1" repo_id token_file tmp response token
+    [ -f "$dir/repo_id" ] || return 0
+    repo_id=$(cat "$dir/repo_id")
+    [ -n "$repo_id" ] || { echo "mint-gh-token: empty repo_id in $dir" >&2; return 0; }
+
+    local jwt auth_file
+    jwt=$(build_jwt)
+    auth_file=$(mktemp) && chmod 600 "$auth_file" || return 1
+    printf 'Authorization: Bearer %s' "$jwt" > "$auth_file"
+
+    response=$(curl -sS --fail-with-body -X POST \
+        -H "@$auth_file" \
+        -H "Accept: application/vnd.github+json" \
+        -H "X-GitHub-Api-Version: 2022-11-28" \
+        -d "{\"repository_ids\":[$repo_id]}" \
+        "https://api.github.com/app/installations/$INSTALLATION_ID/access_tokens" 2>&1)
+    local rc=$?
+    : > "$auth_file"
+    rm -f "$auth_file"
+    if [ $rc -ne 0 ]; then
+        echo "mint-gh-token: curl failed for $dir: $response" >&2
+        return 1
+    fi
+
+    token=$(printf '%s' "$response" | jq -r '.token // empty')
+    [ -n "$token" ] || { echo "mint-gh-token: no token in response for $dir: $response" >&2; return 1; }
+
+    tmp="$dir/token.new"
+    token_file="$dir/token"
+    ( umask 077; printf '%s' "$token" > "$tmp" )
+    mv "$tmp" "$token_file"
+}
+
+mkdir -p "$TOKEN_ROOT"
+shopt -s nullglob
+exit_code=0
+for dir in "$TOKEN_ROOT"/*/; do
+    mint_for_sandbox "${dir%/}" || exit_code=1
+done
+exit "$exit_code"

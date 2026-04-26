@@ -1,0 +1,22 @@
+[Unit]
+Description=Rotate GitHub App installation tokens for active Claude sandboxes
+
+[Service]
+Type=oneshot
+ExecStart=%h/.claude/dev-container/bin/mint-gh-token
+Nice=5
+
+# Hardening (H-B, advice-refine round 1)
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.cache/gh-tokens
+ReadOnlyPaths=%h/.config/github-app/app.pem
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryMax=128M
+TasksMax=32
