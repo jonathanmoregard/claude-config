@@ -119,9 +119,15 @@ uv pip install --python ~/.claude/dev-container/.venv/bin/python3 \
 
 every time the service fires. Effects:
 
-- **Bad push to `main` fails the tick loud** — the install errors,
-  `ExecStart` never runs, no records get processed by an unverified
-  scanner. Better than a silent regression.
+- **Install errors fail the tick loud** — if `uv pip install` errors
+  (network, git auth, package build failure), `ExecStart` never runs,
+  no records get processed and the unit shows as failed in
+  `systemctl --user status`. This catches accidental breakage.
+- **`main` of `jonathanmoregard/injection-scanner` is in the trust
+  boundary.** A successful-but-malicious push to `main` is NOT caught
+  by this loop — the install succeeds, the tick proceeds with the new
+  code. If you don't fully trust your own `main`, pin a commit SHA in
+  the service file and bump deliberately.
 - The dev-container venv at `~/.claude/dev-container/.venv/` is
   ephemeral / regenerable (gitignored via `**/.venv/`); `uv` rebuilds
   on demand.
@@ -131,6 +137,12 @@ every time the service fires. Effects:
 For manual testing outside systemd, install into the same venv and run
 the script directly. The script's `ImportError` fallback message
 contains the exact `uv pip install` command.
+
+**Heads-up for local development:** if you `uv pip install -e ~/Repos/injection-scanner`
+into `dev-container/.venv` to iterate on the scanner, the **next service
+fire (within 6h) silently replaces it** with a non-editable install from
+`origin/main`. To keep an editable install safe, stop the timer first
+(`systemctl --user stop claude-cl-sync.timer`) and restart when done.
 
 ## Customizing the proxy allowlist
 
