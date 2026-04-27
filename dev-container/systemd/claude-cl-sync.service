@@ -4,10 +4,15 @@ After=default.target
 
 [Service]
 Type=oneshot
+# Pull the latest scanner from origin/main into our venv every tick.
+# A bad push to main makes this tick fail loud (sync skipped) instead of
+# letting an unverified scanner silently process records. uv falls back
+# to /tmp under PrivateTmp; --no-cache avoids needing ~/.cache writable.
+ExecStartPre=%h/.local/bin/uv pip install --python %h/.claude/dev-container/.venv/bin/python3 --no-cache --quiet --upgrade --force-reinstall injection-scanner@git+https://github.com/jonathanmoregard/injection-scanner@main
 ExecStart=%h/.claude/dev-container/.venv/bin/python3 %h/.claude/dev-container/bin/claude-cl-sync
 Nice=10
-# Skip .pyc writes so we don't need to grant write to the editable
-# injection-scanner source tree or the venv site-packages.
+# Skip .pyc writes so the runtime python interpreter doesn't try to
+# materialize bytecode (uv handles real installs in ExecStartPre).
 Environment=PYTHONDONTWRITEBYTECODE=1
 
 # Hardening (H-B, advice-refine round 1)
@@ -15,9 +20,9 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
-# Writable: host homunculus (approved lands here) + per-project staging
-# dirs (rotate + quarantine).
-ReadWritePaths=%h/.claude/homunculus %h/.claude/container-staging
+# Writable: host homunculus (approved lands here), per-project staging
+# dirs, and the dev-container venv (ExecStartPre rewrites site-packages).
+ReadWritePaths=%h/.claude/homunculus %h/.claude/container-staging %h/.claude/dev-container/.venv
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
