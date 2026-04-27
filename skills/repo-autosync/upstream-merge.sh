@@ -134,10 +134,12 @@ VERDICT=$(jq -r '.verdict // "unknown"' "$REPORT" 2>/dev/null || echo "unknown")
 REASON=$(jq -r '.verdict_reason // ""' "$REPORT" 2>/dev/null || echo "")
 log "repo-check verdict=$VERDICT reason=$REASON"
 
-# repo-check went binary (approve | reject) — the residual-risk score
-# and the "review" middle band were removed because the score was
+# repo-check's verdict is binary (approve | reject), driven only by
+# deterministic gates. The report ALSO carries a .risk_advisory
+# field (score + per-axis components) for the manual-CLI path —
+# autosync ignores it on purpose: gating on a continuous score was
 # symmetric-flaky (false-rejected legit plugins; false-approved
-# popular-but-compromised repos). Any non-approve outcome here is
+# popular-but-compromised repos). Any non-approve verdict here is
 # fail-closed.
 case "$VERDICT" in
   reject)
