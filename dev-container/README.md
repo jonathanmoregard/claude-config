@@ -106,6 +106,32 @@ claude-cl-sync.timer  every 6 h         vets ~/.claude/container-staging/*/homun
 claude-sandbox-proxy  resident          listens 127.0.0.1:8888 + 172.17.0.1:8888; allowlists hostname per CONNECT/Host
 ```
 
+## injection-scanner: auto-pulled per tick
+
+`claude-cl-sync.service` does **not** rely on a pre-installed scanner.
+Its `ExecStartPre` runs:
+
+```
+uv pip install --python ~/.claude/dev-container/.venv/bin/python3 \
+    --no-cache --quiet --upgrade --force-reinstall \
+    injection-scanner@git+https://github.com/jonathanmoregard/injection-scanner@main
+```
+
+every time the service fires. Effects:
+
+- **Bad push to `main` fails the tick loud** — the install errors,
+  `ExecStart` never runs, no records get processed by an unverified
+  scanner. Better than a silent regression.
+- The dev-container venv at `~/.claude/dev-container/.venv/` is
+  ephemeral / regenerable (gitignored via `**/.venv/`); `uv` rebuilds
+  on demand.
+- `PYTHONDONTWRITEBYTECODE=1` keeps `__pycache__` out of the way under
+  `ProtectHome=read-only`.
+
+For manual testing outside systemd, install into the same venv and run
+the script directly. The script's `ImportError` fallback message
+contains the exact `uv pip install` command.
+
 ## Customizing the proxy allowlist
 
 `claude-sandbox-proxy` falls back to a built-in 18-pattern `DEFAULT_ALLOW`
