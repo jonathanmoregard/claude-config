@@ -104,8 +104,7 @@ What the installer does:
 1. `git fetch upstream`
 2. No new commits → exit 0
 3. `uv run python ~/Repos/repo-check/check.py <upstream-url> --output report.json` (all phases: A metadata+OSV, B SAST+plugin surface, C docker-sandboxed canary)
-   - `verdict == reject` → write `.security-alert`, notify, exit
-   - `verdict == review` → append to `pending_for_human.md`, notify, exit
+   - `verdict == reject` → write `.security-alert`, notify, exit (the `verdict_reason` field names which gate fired)
    - `verdict == approve` → continue
    - any other outcome (execution failure, unknown verdict) → fail closed, alert, exit
 4. `git merge --ff-only upstream/$BRANCH` → push on success
@@ -119,9 +118,9 @@ What the installer does:
 ### repo-check integration notes
 
 - **All phases are mandatory.** The pipeline invokes `check.py <URL> --output report.json` with no disable flags. Phase A: OSV/CVE + GitHub metadata. Phase B: semgrep + gitleaks + symlink/archive safety + Claude-plugin surface (hooks, external MCP = instant reject, prompt-injection patterns, install scripts). Phase C: docker-sandboxed behavioral canary running 3 real incident scenarios (needs OAuth auto-found at `~/.claude/.credentials.json` + prebuilt docker image).
-- repo-check is under active development. Our integration parses only `.verdict` / `.risk_score`. Re-test after repo-check releases.
+- repo-check is under active development. Our integration parses `.verdict` and `.verdict_reason`. The verdict is binary (`approve` | `reject`) — the prior `review` middle band and continuous `risk_score` were removed because the score was symmetric-flaky (false-rejected legitimate plugins on hook count; false-approved popular-but-compromised repos that scored well on metadata). Re-test after repo-check releases.
 - **Full-scan, not diff.** Every run vets upstream HEAD in full. Correct for "is landing state safe" but a CVE in an existing dep blocks every run until it is resolved (or repo-check gains `--upstream-base SHA`).
-- **Fail-closed on:** clone failure, execution error, unknown verdict, `phase_b.aborted`, Phase C error, Phase C triggered. Verdicts `reject` and `review` also stop the merge.
+- **Fail-closed on:** clone failure, execution error, unknown verdict, `phase_b.aborted`, Phase C error, Phase C triggered, any deterministic gate. Verdict `reject` stops the merge.
 
 ### Pin mode
 
@@ -137,7 +136,7 @@ No cron. Installer records current `upstream/$BRANCH` SHA to `<data>/pinned-sha`
 ├── last-update.log                      # append-only log
 ├── repo-check-report.json               # last vet result
 ├── .security-alert                      # present when blocked (absent = healthy)
-├── pending_for_human.md                 # appended on 'review' verdict
+├── pending_for_human.md                 # appended on no-op-but-stale repos / unknown failure modes
 └── pinned-sha                           # present in pin mode only
 ```
 

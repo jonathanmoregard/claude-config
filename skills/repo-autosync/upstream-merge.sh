@@ -131,26 +131,19 @@ if ! (cd "$REPO_CHECK_DIR" && uv run python check.py "$UPSTREAM_URL" --output "$
 fi
 
 VERDICT=$(jq -r '.verdict // "unknown"' "$REPORT" 2>/dev/null || echo "unknown")
-RISK=$(jq -r '.risk_score // "?"' "$REPORT" 2>/dev/null || echo "?")
-log "repo-check verdict=$VERDICT risk=$RISK"
+REASON=$(jq -r '.verdict_reason // ""' "$REPORT" 2>/dev/null || echo "")
+log "repo-check verdict=$VERDICT reason=$REASON"
 
+# repo-check went binary (approve | reject) — the residual-risk score
+# and the "review" middle band were removed because the score was
+# symmetric-flaky (false-rejected legit plugins; false-approved
+# popular-but-compromised repos). Any non-approve outcome here is
+# fail-closed.
 case "$VERDICT" in
   reject)
-    echo "repo-check REJECTED upstream of $REPO (risk=$RISK). See $REPORT" > "$ALERT"
+    echo "repo-check REJECTED upstream of $REPO (reason=$REASON). See $REPORT" > "$ALERT"
     notify "upstream-merge: repo-check reject" "$REPO"
     log "BLOCKED by repo-check — not merging."
-    exit 0
-    ;;
-  review)
-    {
-      echo "## $(date -u +%F): $REPO upstream review required"
-      echo "**Verdict:** review (risk=$RISK)"
-      echo "**Report:** $REPORT"
-      echo "**Upstream:** $UPSTREAM_URL"
-      echo ""
-    } >> "$PENDING"
-    log "repo-check review — appended to $PENDING, not merging."
-    notify "upstream-merge: manual review needed" "$REPO"
     exit 0
     ;;
   approve)
