@@ -34,13 +34,16 @@ from pathlib import Path
 HOME = Path(os.environ["HOME"])
 STAGING_ROOT = HOME / ".claude" / "container-staging"
 HOST_HOMUNC = HOME / ".claude" / "homunculus"
-RESEARCH_AGENT_ROOT = HOME / "Repos" / "research-agent"
 
-sys.path.insert(0, str(RESEARCH_AGENT_ROOT))
 try:
-    from scanner.intercept import scan as intercept_scan
+    from injection_scanner.intercept import scan as intercept_scan
 except ImportError as e:
-    sys.stderr.write(f"claude-cl-sync: cannot import scanner.intercept from {RESEARCH_AGENT_ROOT}: {e}\n")
+    sys.stderr.write(
+        "claude-cl-sync: cannot import injection_scanner.intercept. "
+        "Install it into the venv this script runs under: "
+        "`uv pip install -e ~/Repos/injection-scanner` "
+        f"(or equivalent). Original error: {e}\n"
+    )
     sys.exit(1)
 
 # Exact field set observe.sh produces. Anything outside these per-event

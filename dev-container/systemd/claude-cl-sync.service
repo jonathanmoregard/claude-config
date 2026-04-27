@@ -4,19 +4,20 @@ After=default.target
 
 [Service]
 Type=oneshot
-ExecStart=%h/Repos/research-agent/.venv/bin/python3 %h/.claude/dev-container/bin/claude-cl-sync
+ExecStart=%h/.claude/dev-container/.venv/bin/python3 %h/.claude/dev-container/bin/claude-cl-sync
 Nice=10
+# Skip .pyc writes so we don't need to grant write to the editable
+# injection-scanner source tree or the venv site-packages.
+Environment=PYTHONDONTWRITEBYTECODE=1
 
 # Hardening (H-B, advice-refine round 1)
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
-# Writable: host homunculus (approved lands here), per-project staging dirs
-# (rotate + quarantine), and scanner's __pycache__ under the venv.
-ReadWritePaths=%h/.claude/homunculus %h/.claude/container-staging %h/Repos/research-agent/scanner/__pycache__
-# Readable: scanner source + venv (interpreter + site-packages).
-ReadOnlyPaths=%h/Repos/research-agent
+# Writable: host homunculus (approved lands here) + per-project staging
+# dirs (rotate + quarantine).
+ReadWritePaths=%h/.claude/homunculus %h/.claude/container-staging
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
