@@ -105,10 +105,17 @@ export REPO_CHECK_DIR="$HOME/Repos/repo-check"
 EOF
 
 # --- wrapper.sh ---
+# PATH is captured from the install-time environment so cron-fired runs
+# (which start with a minimal PATH like /usr/bin:/bin) can still find
+# uv, claude, gitleaks, etc. — typically in ~/.local/bin. Without this,
+# upstream-merge.sh aborts at the `uv run python check.py` line with
+# `uv: command not found` and the pipeline silently fail-closes every
+# cron tick.
 cat > "$DATA_DIR/wrapper.sh" <<EOF
 #!/usr/bin/env bash
 # Generated. Sources per-repo config and invokes canonical upstream-merge.sh.
 set -euo pipefail
+export PATH="$PATH"
 source "$DATA_DIR/config.env"
 exec "$SKILL_DIR/upstream-merge.sh"
 EOF
