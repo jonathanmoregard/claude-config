@@ -315,21 +315,104 @@ def _check_denied_by_dcg(command: str) -> Optional[str]:
     return None
 
 
+# find-with-no-filter detector. The danger isn't `-delete` per se — it's
+# `-delete` without any predicate that constrains WHAT gets deleted. The set
+# below is the file-property predicate vocabulary (names, types, ages, sizes,
+# permissions, ownership). `-maxdepth` / `-mindepth` / `-depth` are NOT in the
+# set: they only bound traversal, not which files match.
+_FIND_FILTER_PREDICATES = frozenset({
+    "-name", "-iname", "-path", "-ipath", "-regex", "-iregex", "-lname", "-ilname",
+    "-type", "-xtype",
+    "-mtime", "-ctime", "-atime", "-mmin", "-cmin", "-amin", "-newer", "-anewer", "-cnewer",
+    "-size", "-empty",
+    "-perm", "-readable", "-writable", "-executable",
+    "-user", "-uid", "-group", "-gid", "-nouser", "-nogroup",
+    "-links", "-inum", "-samefile",
+})
+
+_FIND_DANGEROUS_HINT = (
+    "find ... -delete denied: no filter predicate before -delete, so this "
+    "would delete everything under the given path(s).\n"
+    "Real incident this guards against: deleted active plugin runtime data "
+    "thinking the dir held only old worker logs.\n"
+    "Safer alternatives:\n"
+    "  1. List first, no -delete:  find PATH -maxdepth 1\n"
+    "     Eyeball the output before deleting anything.\n"
+    "  2. Filter by property:      find PATH -name 'PATTERN' -delete\n"
+    "                              find PATH -type f -mtime +30 -delete\n"
+    "  3. Per-file:                find PATH -maxdepth 1 -name 'specific.log' -delete\n"
+    "If you genuinely intend to wipe a whole tree, ask the user first."
+)
+
+
+def _check_dangerous_find(command: str) -> Optional[str]:
+    """Detect `find ... -delete` invocations with no filter predicate.
+
+    Allows: -delete combined with -name/-type/-mtime/-size/etc.
+    Denies: bare `find PATH -delete`, `find PATH -maxdepth 1 -delete`, etc.
+    `-maxdepth`/`-mindepth`/`-depth` are not filters — they bound traversal,
+    not which files match.
+
+    Splits the command into pipeline subcommands so each `find` invocation
+    is evaluated independently — `find /a -name X | ls; find /b -delete`
+    correctly flags the second one.
+
+    Tokenization via shlex; on parse failure (unbalanced quotes, etc.) we
+    decline to flag — the dcg pack and config rules still get a turn.
+    """
+    if "-delete" not in command:
+        return None
+    for sub in _pipeline_subcommands(command) + [command.strip()]:
+        try:
+            tokens = shlex.split(sub)
+        except ValueError:
+            continue
+        if "find" not in tokens or "-delete" not in tokens:
+            continue
+        # Scan tokens after each `find` up to the first -delete. If no filter
+        # predicate appeared in between, deny.
+        i = 0
+        while i < len(tokens):
+            if tokens[i] != "find":
+                i += 1
+                continue
+            j = i + 1
+            delete_pos = -1
+            has_filter = False
+            while j < len(tokens):
+                t = tokens[j]
+                if t == "-delete":
+                    delete_pos = j
+                    break
+                if t in _FIND_FILTER_PREDICATES:
+                    has_filter = True
+                j += 1
+            if delete_pos != -1 and not has_filter:
+                return _FIND_DANGEROUS_HINT
+            i = j + 1 if delete_pos != -1 else i + 1
+    return None
+
+
 def _check_denied(command: str, config: dict) -> Optional[str]:
     """Return rejection reason if the command matches a deny pattern, else None.
 
     Evaluation order:
       1. dcg (Rust binary, richer pattern packs) — runs first so its specific
          rule IDs surface in the error message.
-      2. Config-driven Bash(pattern) rules — same glob syntax as Claude Code's
+      2. Built-in semantic checks (e.g. `find ... -delete` without a filter
+         predicate). These exist where glob rules over-block.
+      3. Config-driven Bash(pattern) rules — same glob syntax as Claude Code's
          settings.json, matched against each pipeline subcommand.
 
-    Either source can veto. No allowlist override; if you need a command,
+    Any source can veto. No allowlist override; if you need a command,
     amend bash-config.json (or use `dcg allow` / allowlist entries).
     """
     dcg_reason = _check_denied_by_dcg(command)
     if dcg_reason is not None:
         return dcg_reason
+    find_reason = _check_dangerous_find(command)
+    if find_reason is not None:
+        return find_reason
     rules = _deny_rules_from_config(config)
     if not rules:
         return None

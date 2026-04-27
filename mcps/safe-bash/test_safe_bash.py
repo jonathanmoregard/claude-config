@@ -138,6 +138,36 @@ check("compound sudo rejected (via split)",
       cd("echo start && sudo rm -v", cfg) is not None)
 check("docker exec research-agent rejected",
       cd("docker exec research-agent ls", cfg) is not None)
+
+# find ... -delete semantic check
+section("dangerous-find detector")
+df = server._check_dangerous_find
+check("bare find PATH -delete denied", df("find /tmp/x -delete") is not None)
+check("find with -name -delete allowed", df("find /tmp -name 'X' -delete") is None)
+check("find with -type f -delete allowed", df("find /tmp -type f -delete") is None)
+check("find with -mtime -delete allowed", df("find /tmp -mtime +30 -delete") is None)
+check("find with -size -delete allowed", df("find /tmp -size +1M -delete") is None)
+check("find PATH -maxdepth 1 -delete denied (maxdepth not a filter)",
+      df("find /tmp -maxdepth 1 -delete") is not None)
+check("find PATH -depth -delete denied (depth not a filter)",
+      df("find /tmp -depth -delete") is not None)
+check("find without -delete passes",
+      df("find /tmp -name 'X'") is None)
+check("plain ls passes",
+      df("ls /tmp") is None)
+check("find with quoted -name -delete allowed",
+      df("find /tmp -name '*.tmp' -delete") is None)
+check("multi-find pipeline: bare -delete still flagged",
+      df("find /a -name X | xargs ls; find /b -delete") is not None)
+check("multi-find pipeline: both filtered passes",
+      df("find /a -name X -delete; find /b -type f -delete") is None)
+# integrated: _check_denied surfaces the find hint
+combined = cd("find /tmp/something -delete", cfg)
+check("integrated _check_denied flags bare find -delete",
+      combined is not None and "find" in (combined or ""),
+      detail=str(combined)[:120] if combined else "<None>")
+check("integrated _check_denied allows filtered find -delete",
+      cd("find /tmp -name 'X' -delete", cfg) is None)
 check("docker exec -i research-agent rejected",
       cd("docker exec -i research-agent ls", cfg) is not None)
 check("secret-tool rejected", cd("secret-tool lookup app x key y", cfg) is not None)
