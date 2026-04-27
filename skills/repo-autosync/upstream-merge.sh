@@ -246,6 +246,18 @@ if git -C "$REPO" diff --name-only --diff-filter=U | grep -q .; then
   exit 1
 fi
 
+# Belt-and-suspenders: a 'git add' without 'git commit' would clear the
+# unmerged-stage filter above but leave MERGE_HEAD set and the merge
+# uncommitted. push_origin would then push pre-merge HEAD without the
+# resolution. Refuse to push if the merge is still in progress.
+if git -C "$REPO" rev-parse --verify -q MERGE_HEAD >/dev/null 2>&1; then
+  log "Agent cleared conflict markers but did not commit (MERGE_HEAD still set) — aborting"
+  git -C "$REPO" merge --abort 2>> "$LOG" || true
+  echo "Agent left merge in MERGING state for ${REPO} — manual cleanup required" > "$ALERT"
+  notify "upstream-merge: incomplete merge" "$REPO"
+  exit 1
+fi
+
 log "Conflict resolved by agent"
 rm -f "$ALERT"
 push_origin
