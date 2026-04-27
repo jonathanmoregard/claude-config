@@ -169,9 +169,17 @@ esac
 # upstream catch-ups or fork branches with regenerated lockfiles. The agent
 # can read conflicted files directly via the Read tool — these diffs are
 # orientation only, not load-bearing.
+#
+# Truncate via bash parameter expansion rather than `| head -c`. With
+# pipefail, head -c closing the pipe early sends SIGPIPE to git diff,
+# which then exits 141; pipefail propagates that to the $() capture
+# and set -e kills the whole script. Reading the full diff into a
+# bash variable first then slicing avoids the SIGPIPE entirely.
 _DIFF_CAP=200000  # ~200 KB per side
-DIFF=$(git -C "$REPO" diff "${MERGE_BASE}" "$UPSTREAM_REMOTE/$UPSTREAM_BRANCH" | head -c "$_DIFF_CAP")
-LOCAL_DIFF=$(git -C "$REPO" diff "${MERGE_BASE}" "$LOCAL_BRANCH" | head -c "$_DIFF_CAP")
+DIFF=$(git -C "$REPO" diff "${MERGE_BASE}" "$UPSTREAM_REMOTE/$UPSTREAM_BRANCH")
+DIFF=${DIFF:0:_DIFF_CAP}
+LOCAL_DIFF=$(git -C "$REPO" diff "${MERGE_BASE}" "$LOCAL_BRANCH")
+LOCAL_DIFF=${LOCAL_DIFF:0:_DIFF_CAP}
 
 # --- Phase 2: fast-forward ---
 if git -C "$REPO" merge --ff-only "$UPSTREAM_REMOTE/$UPSTREAM_BRANCH" 2>> "$LOG"; then
@@ -228,14 +236,19 @@ Your job:
 # allow/deny lists are not enforced under permission-mode dontAsk, so allowed
 # tools must be expressed via this flag. Keep --settings for path-scoping
 # Read/Edit/Write to {{REPO}} only.
+#
+# Pipe the prompt via stdin instead of -p arg. Linux MAX_ARG_STRLEN is
+# typically 128 KB, and the prompt embeds two diffs capped at 200 KB each
+# plus boilerplate — passing as an argv string would exceed the single-arg
+# limit and execve() returns E2BIG ("Argument list too long").
 (
   cd "$REPO"
-  claude \
+  printf '%s' "$RESOLVE_PROMPT" | claude \
     --settings "$RESOLVE_SETTINGS" \
     --max-turns 30 \
     --output-format text \
     --allowedTools "Read Edit Write Bash(git status:*) Bash(git diff:*) Bash(git log:*) Bash(git show:*) Bash(git ls-files:*) Bash(git add:*) Bash(git commit:*)" \
-    -p "$RESOLVE_PROMPT"
+    -p
 ) >> "$LOG" 2>&1
 
 if git -C "$REPO" diff --name-only --diff-filter=U | grep -q .; then
