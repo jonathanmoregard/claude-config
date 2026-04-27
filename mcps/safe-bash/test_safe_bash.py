@@ -300,6 +300,114 @@ check("E2E: escaped-wildcard literal-star sentinel rejected",
 
 
 # ----------------------------------------------------------------------
+# Timeout regression — server must survive a hanging command and remain
+# responsive on the next JSON-RPC call. Reproduces the bug where a
+# grandchild holding stdout/stderr pipes (and inherited stdin) caused
+# `subprocess.run`'s communicate() to hang and the MCP parent to consider
+# the server gone.
+# ----------------------------------------------------------------------
+section("timeout regression (server survives hang, next call OK)")
+
+
+def mcp_session(commands_with_timeouts: list[tuple[str, int]]) -> list[dict]:
+    """Spawn server once, send N sequential tools/call invocations, return results.
+
+    Each (command, timeout_ms) is sent as its own tools/call. We collect every
+    JSON-RPC response with id matching one of our calls and return them in
+    request order.
+    """
+    init = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "safe-bash-test", "version": "1.0"},
+        },
+    }
+    initialized = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+    msgs: list[dict] = [init, initialized]
+    expected_ids: list[int] = []
+    for i, (cmd, timeout_ms) in enumerate(commands_with_timeouts, start=2):
+        msgs.append({
+            "jsonrpc": "2.0",
+            "id": i,
+            "method": "tools/call",
+            "params": {
+                "name": "exec",
+                "arguments": {"command": cmd, "timeout": timeout_ms},
+            },
+        })
+        expected_ids.append(i)
+    stdin = "\n".join(json.dumps(m) for m in msgs) + "\n"
+    proc = subprocess.run(
+        [sys.executable, server_py],
+        input=stdin,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    by_id: dict[int, dict] = {}
+    for line in proc.stdout.splitlines():
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if msg.get("id") in expected_ids:
+            by_id[msg["id"]] = msg
+    return [by_id.get(i, {}) for i in expected_ids]
+
+
+# Reproduction case 1 from the writeup: command emits output, then hangs
+# past the timeout. Expected: exit 124 returned cleanly, partial stdout
+# preserved, MCP still alive for the follow-up call.
+results = mcp_session([
+    ("echo START; sleep 9999", 1500),
+    ("echo AFTER_HANG", 5000),
+])
+hang_resp, follow_resp = results
+hang_text = (hang_resp.get("result", {}).get("content") or [{}])[0].get("text", "")
+follow_text = (follow_resp.get("result", {}).get("content") or [{}])[0].get("text", "")
+
+check("hang call returned a response (server didn't die)",
+      bool(hang_text), detail=hang_text[:160])
+check("hang call reports timeout exit 124",
+      "exit 124" in hang_text, detail=hang_text[:160])
+check("hang call preserves partial stdout 'START'",
+      "START" in hang_text, detail=hang_text[:160])
+check("hang call mentions safe-bash timeout banner",
+      "exceeded timeout" in hang_text, detail=hang_text[:160])
+check("follow-up call after hang still gets a response (server stayed alive)",
+      bool(follow_text), detail=follow_text[:160])
+check("follow-up call output is correct",
+      "AFTER_HANG" in follow_text and "exit 0" in follow_text,
+      detail=follow_text[:160])
+
+
+# Process-group kill: a hang produced by a grandchild that outlives bash.
+# Without `start_new_session=True` + killpg, the grandchild keeps the
+# stdout/stderr pipe fds open and communicate() blocks forever. This test
+# verifies the server returns and the next call works.
+results = mcp_session([
+    # bash spawns a sleeper as a grandchild via subshell + disown-ish pattern
+    ("bash -c 'sleep 9999 & echo SPAWNED; wait'", 1500),
+    ("echo NEXT_OK", 5000),
+])
+gc_resp, next_resp = results
+gc_text = (gc_resp.get("result", {}).get("content") or [{}])[0].get("text", "")
+next_text = (next_resp.get("result", {}).get("content") or [{}])[0].get("text", "")
+
+check("grandchild-hang call returned a response",
+      bool(gc_text), detail=gc_text[:160])
+check("grandchild-hang call reports timeout exit 124",
+      "exit 124" in gc_text, detail=gc_text[:160])
+check("call after grandchild-hang gets correct output",
+      "NEXT_OK" in next_text and "exit 0" in next_text,
+      detail=next_text[:160])
+
+
+# ----------------------------------------------------------------------
 # dcg integration
 # ----------------------------------------------------------------------
 section("dcg integration")

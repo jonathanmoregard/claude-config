@@ -24,6 +24,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 from typing import Optional
@@ -440,19 +441,81 @@ def _xml_attr_escape(s: str) -> str:
 
 
 def _run(command: str, timeout_ms: int) -> tuple[int, str, str]:
+    """Run command with a timeout that kills the whole process group.
+
+    Two hardenings vs. plain `subprocess.run`:
+
+    1. `stdin=DEVNULL`. Without this, the child inherits the MCP server's
+       stdin — which IS the JSON-RPC pipe from Claude Code. A surviving
+       grandchild (e.g. an `ssh` we spawned via `bash -c`) would then
+       compete with the server for incoming JSON-RPC bytes, manifesting
+       upstream as "MCP server disconnected".
+
+    2. `start_new_session=True` + process-group kill. On timeout, plain
+       `subprocess.run` kills only the direct bash child; grandchildren
+       hold the pipe fds open and `communicate()` blocks on EOF that
+       never comes. We put the child into its own session and signal
+       the whole group (SIGTERM, then SIGKILL after a grace period).
+
+    Final fallback: if the group still won't reap (pipes leaked to a
+    detached descendant), give up reaping rather than hang forever —
+    init will adopt the strays. The MCP server stays responsive.
+    """
+    timeout_s = max(1, timeout_ms) / 1000.0
+    proc = subprocess.Popen(
+        ["bash", "-c", command],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
     try:
-        proc = subprocess.run(
-            ["bash", "-c", command],
-            capture_output=True,
-            text=True,
-            timeout=max(1, timeout_ms) / 1000.0,
-        )
-        return proc.returncode, proc.stdout, proc.stderr
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        pgid = None
+
+    def _signal_group(sig: int) -> None:
+        if pgid is not None:
+            try:
+                os.killpg(pgid, sig)
+                return
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        try:
+            proc.send_signal(sig)
+        except OSError:
+            pass
+
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_s)
+        return proc.returncode, stdout or "", stderr or ""
     except subprocess.TimeoutExpired as e:
-        stdout = (e.stdout or b"").decode("utf-8", errors="replace") if isinstance(e.stdout, (bytes, bytearray)) else (e.stdout or "")
-        stderr = (e.stderr or b"").decode("utf-8", errors="replace") if isinstance(e.stderr, (bytes, bytearray)) else (e.stderr or "")
-        stderr = (stderr + f"\n[safe-bash] command exceeded timeout of {timeout_ms} ms").strip()
-        return 124, stdout, stderr
+        stdout = e.stdout or ""
+        stderr = e.stderr or ""
+
+    _signal_group(signal.SIGTERM)
+    try:
+        out, err = proc.communicate(timeout=2.0)
+        stdout, stderr = out or stdout, err or stderr
+    except subprocess.TimeoutExpired as e:
+        stdout = e.stdout or stdout
+        stderr = e.stderr or stderr
+        _signal_group(signal.SIGKILL)
+        try:
+            out, err = proc.communicate(timeout=2.0)
+            stdout, stderr = out or stdout, err or stderr
+        except subprocess.TimeoutExpired as e2:
+            stdout = e2.stdout or stdout
+            stderr = e2.stderr or stderr
+            sys.stderr.write(
+                "[safe-bash] timeout fallback: pipes still held by detached "
+                "descendant; giving up reaping to keep MCP server alive\n"
+            )
+            sys.stderr.flush()
+
+    stderr = ((stderr or "") + f"\n[safe-bash] command exceeded timeout of {timeout_ms} ms").strip()
+    return 124, stdout or "", stderr
 
 
 def _compose_output(rc: int, stdout: str, stderr: str) -> str:
