@@ -86,10 +86,36 @@ if [ -f "$DATA_DIR/pinned-sha" ]; then
   exit 0
 fi
 
+push_origin() {
+  if git -C "$REPO" push origin "$LOCAL_BRANCH" 2>> "$LOG"; then
+    log "Pushed to origin"
+    return 0
+  fi
+  log "Push to origin failed — leaving merge committed locally, alerting"
+  alert "$REPO: push to origin failed after merge — manual resolution required" "push failed"
+  exit 1
+}
+
 MERGE_BASE=$(git -C "$REPO" merge-base "$LOCAL_BRANCH" "$UPSTREAM_REMOTE/$UPSTREAM_BRANCH")
 NEW_COMMITS=$(git -C "$REPO" log "${MERGE_BASE}..$UPSTREAM_REMOTE/$UPSTREAM_BRANCH" --oneline)
 
 if [ -z "$NEW_COMMITS" ]; then
+  # No new upstream commits, but local may have a merge commit from a prior
+  # successful merge whose push to origin failed. Catch that here so we
+  # don't silently lose updates on the next cron tick.
+  LOCAL_AHEAD=$(git -C "$REPO" rev-list --count "origin/$LOCAL_BRANCH..$LOCAL_BRANCH" 2>/dev/null || echo 0)
+  ORIGIN_AHEAD=$(git -C "$REPO" rev-list --count "$LOCAL_BRANCH..origin/$LOCAL_BRANCH" 2>/dev/null || echo 0)
+  if [ "$LOCAL_AHEAD" -gt 0 ] && [ "$ORIGIN_AHEAD" -eq 0 ]; then
+    log "No new upstream, but local is $LOCAL_AHEAD commits ahead of origin — pushing"
+    rm -f "$ALERT"
+    push_origin
+    exit 0
+  fi
+  if [ "$LOCAL_AHEAD" -gt 0 ] && [ "$ORIGIN_AHEAD" -gt 0 ]; then
+    log "Local and origin/$LOCAL_BRANCH diverged ($LOCAL_AHEAD/$ORIGIN_AHEAD) — manual resolution required"
+    alert "$REPO: local and origin/$LOCAL_BRANCH diverged — see $LOG" "diverged from origin"
+    exit 1
+  fi
   log "Already up to date."
   exit 0
 fi
@@ -138,18 +164,14 @@ case "$VERDICT" in
     ;;
 esac
 
-DIFF=$(git -C "$REPO" diff "${MERGE_BASE}" "$UPSTREAM_REMOTE/$UPSTREAM_BRANCH")
-LOCAL_DIFF=$(git -C "$REPO" diff "${MERGE_BASE}" "$LOCAL_BRANCH")
-
-push_origin() {
-  if git -C "$REPO" push origin "$LOCAL_BRANCH" 2>> "$LOG"; then
-    log "Pushed to origin"
-    return 0
-  fi
-  log "Push to origin failed — leaving merge committed locally, alerting"
-  alert "$REPO: push to origin failed after merge — manual resolution required" "push failed"
-  exit 1
-}
+# Diffs are inlined into the conflict-resolve prompt as context. Cap to keep
+# the prompt under context-window limits and bound cost on multi-month
+# upstream catch-ups or fork branches with regenerated lockfiles. The agent
+# can read conflicted files directly via the Read tool — these diffs are
+# orientation only, not load-bearing.
+_DIFF_CAP=200000  # ~200 KB per side
+DIFF=$(git -C "$REPO" diff "${MERGE_BASE}" "$UPSTREAM_REMOTE/$UPSTREAM_BRANCH" | head -c "$_DIFF_CAP")
+LOCAL_DIFF=$(git -C "$REPO" diff "${MERGE_BASE}" "$LOCAL_BRANCH" | head -c "$_DIFF_CAP")
 
 # --- Phase 2: fast-forward ---
 if git -C "$REPO" merge --ff-only "$UPSTREAM_REMOTE/$UPSTREAM_BRANCH" 2>> "$LOG"; then
@@ -174,6 +196,7 @@ log "Merge conflict detected — invoking Claude to resolve"
 CONFLICT_FILES=$(git -C "$REPO" diff --name-only --diff-filter=U)
 
 RESOLVE_PROMPT="You are resolving a git merge conflict in a fork at ${REPO}.
+Working directory is set to ${REPO}; use bare git commands.
 
 Upstream is ${UPSTREAM_URL}. Local has customizations committed on top of upstream.
 The merge of ${UPSTREAM_REMOTE}/${UPSTREAM_BRANCH} into ${LOCAL_BRANCH} produced conflicts.
@@ -192,21 +215,28 @@ ${DIFF}
 ${CONFLICT_FILES}
 
 Your job:
-1. Read each conflicted file in ${REPO} (contains <<<<<<< / ======= / >>>>>>> markers)
+1. Read each conflicted file (contains <<<<<<< / ======= / >>>>>>> markers).
 2. Resolve each conflict: preserve intent of BOTH sides where possible. Local changes take priority for files customized locally.
 3. Edit to remove conflict markers and produce correct merged content.
-4. Run: git -C ${REPO} add <resolved-files>
-5. Run: git -C ${REPO} commit --no-edit
-6. Append a one-line summary to ${LOG}: [timestamp] Resolved conflict and merged N commits
+4. Run: git add <resolved-files>
+5. Run: git commit --no-edit
+6. Stop. The wrapper script logs the result; you do not need to write to any log file."
 
-Do NOT run git merge --abort. Do NOT notify-send. Just resolve and commit."
-
-claude \
-  --settings "$RESOLVE_SETTINGS" \
-  --permission-mode dontAsk \
-  --max-turns 30 \
-  --output-format text \
-  -p "$RESOLVE_PROMPT" >> "$LOG" 2>&1
+# Run the resolve agent with cwd at the repo so the prompt's bare \`git\`
+# commands work (and we can use simple Bash(git verb:*) allowlist patterns).
+# --allowedTools is the LOAD-BEARING permission gate here: the settings file's
+# allow/deny lists are not enforced under permission-mode dontAsk, so allowed
+# tools must be expressed via this flag. Keep --settings for path-scoping
+# Read/Edit/Write to {{REPO}} only.
+(
+  cd "$REPO"
+  claude \
+    --settings "$RESOLVE_SETTINGS" \
+    --max-turns 30 \
+    --output-format text \
+    --allowedTools "Read Edit Write Bash(git status:*) Bash(git diff:*) Bash(git log:*) Bash(git show:*) Bash(git ls-files:*) Bash(git add:*) Bash(git commit:*)" \
+    -p "$RESOLVE_PROMPT"
+) >> "$LOG" 2>&1
 
 if git -C "$REPO" diff --name-only --diff-filter=U | grep -q .; then
   log "CONFLICT unresolved after agent attempt — aborting merge"
