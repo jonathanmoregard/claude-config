@@ -47,6 +47,39 @@ and these directories are listed in `~/.claude/settings.json` deny rules.
 
 `~/.zshrc` sources `shell/dispatch.zsh` directly (no symlink — zsh sources by path).
 
+`~/.local/bin/devc` is also a symlink, but its target is **not** under
+`dev-container/` — it points to the upstream ToB clone at
+`~/src/claude-code-devcontainer/install.sh`. See "Open dependencies".
+
+## Recovery: rebuilding symlinks
+
+All 9 symlinks under `~/.local/bin/` and `~/.config/systemd/user/` use
+absolute paths into `~/.claude/dev-container/`. If `~/.claude/` is moved,
+renamed, or wiped, every symlink dangles silently — `claude-sandbox`
+disappears from PATH, systemd units no longer load.
+
+To rebuild from a fresh `~/.claude/dev-container/`:
+
+```sh
+ln -sfn ~/.claude/dev-container/bin/mint-gh-token        ~/.local/bin/mint-gh-token
+ln -sfn ~/.claude/dev-container/bin/claude-sandbox       ~/.local/bin/claude-sandbox
+ln -sfn ~/.claude/dev-container/bin/claude-sandbox-proxy ~/.local/bin/claude-sandbox-proxy
+ln -sfn ~/.claude/dev-container/bin/claude-cl-sync       ~/.local/bin/claude-cl-sync
+
+ln -sfn ~/.claude/dev-container/systemd/gh-token.service             ~/.config/systemd/user/gh-token.service
+ln -sfn ~/.claude/dev-container/systemd/gh-token.timer               ~/.config/systemd/user/gh-token.timer
+ln -sfn ~/.claude/dev-container/systemd/claude-sandbox-proxy.service ~/.config/systemd/user/claude-sandbox-proxy.service
+ln -sfn ~/.claude/dev-container/systemd/claude-cl-sync.service       ~/.config/systemd/user/claude-cl-sync.service
+ln -sfn ~/.claude/dev-container/systemd/claude-cl-sync.timer         ~/.config/systemd/user/claude-cl-sync.timer
+
+systemctl --user daemon-reload
+systemctl --user enable --now gh-token.timer claude-sandbox-proxy.service claude-cl-sync.timer
+```
+
+`~/.zshrc` line that sources `dispatch.zsh` is independent of these
+symlinks; it points at `$HOME/.claude/dev-container/shell/dispatch.zsh`
+directly.
+
 ## Lives elsewhere on purpose
 
 | Path | Content | Why outside `~/.claude/` |
@@ -72,6 +105,19 @@ gh-token.timer        every 50 min      walks ~/.cache/gh-tokens/*/repo_id, mint
 claude-cl-sync.timer  every 6 h         vets ~/.claude/container-staging/*/homunculus/observations.jsonl
 claude-sandbox-proxy  resident          listens 127.0.0.1:8888 + 172.17.0.1:8888; allowlists hostname per CONNECT/Host
 ```
+
+## Customizing the proxy allowlist
+
+`claude-sandbox-proxy` falls back to a built-in 18-pattern `DEFAULT_ALLOW`
+when no override file exists. To extend or replace:
+
+```sh
+$EDITOR ~/.claude/dev-container/proxy-allow.txt   # one fnmatch pattern per line; # comments
+systemctl --user restart claude-sandbox-proxy.service
+```
+
+The proxy reads the file once at startup, so a restart is required to
+pick up changes. The file is gitignored by default (user-local override).
 
 Verify:
 ```sh

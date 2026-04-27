@@ -45,6 +45,9 @@ projects/
 # Caveman state flag
 .caveman-active
 
+# Dev-container user-local overrides
+dev-container/proxy-allow.txt
+
 # Powerline / per-session usage telemetry
 usage-data/
 
