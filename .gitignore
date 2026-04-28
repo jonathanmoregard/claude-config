@@ -56,8 +56,10 @@ dev-container/proxy-allow.txt
 # Powerline / per-session usage telemetry
 usage-data/
 
-# Cron-driven log output (review-agent.log is hand-curated)
-logs/submodule-update.log
+# Cron-driven log output. All runtime-emitted logs are ignored;
+# hand-curated ones (review-agent.log) are negated back in.
+logs/*.log
+!logs/review-agent.log
 
 # Externally cloned skill repos (each has its own .git; track upstream
 # as submodules later if pinning becomes useful)
