@@ -1,6 +1,11 @@
 # Credentials & secrets
 .credentials.json
 
+# Honeypot harvest dirs — must never be tracked. Substring match so
+# `quarantine`, `quarantine-old`, `container-staging/.../quarantine`,
+# etc. are all covered.
+**/*quarantine*
+
 # Ephemeral state
 history.jsonl
 mcp-needs-auth-cache.json
