@@ -131,6 +131,14 @@
             "statusMessage": "Launching instinct observer..."
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.claude/nixos-reminder-hook.sh"
+          }
+        ]
       }
     ],
     "UserPromptSubmit": [
