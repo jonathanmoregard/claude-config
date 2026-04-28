@@ -83,7 +83,7 @@ Write the attacker bytes, the per-layer verdict, and the timing breakdown into a
 | `verdict` | reason, layers, stats — with raw sanitized text scrubbed | scanner |
 | `report_text` | full raw suspected-injection bytes | harvested from sandbox, never LLM-read |
 
-The quarantine dir is deny-listed at project scope: `Read`, `Edit`, `Write`, `NotebookEdit`, `Grep`, `Glob` all rejected for every path form (`./`, bare, absolute). Also extend the deny-list to every shell-ish MCP the host runs (`Bash`, `mcp__safe-bash__exec`, etc.) with command patterns covering `cat|head|tail|less|more|xxd|od|strings|grep|rg|awk|sed|cp|mv|ln *<quarantine-path>*`. Enforcement at the MCP layer, not hooks — hooks don't propagate to subagents.
+**Name the directory `quarantine`.** That exact name is covered by a centrally-maintained user-scope deny-list rule that blocks `Read`, `Edit`, `Write`, `NotebookEdit`, `Grep`, `Glob`, and shell-ish MCP access (`Bash`, `mcp__safe-bash__exec`, etc.) against any path matching `**/quarantine/**`. Do NOT add a project-scope `.claude/settings.json` deny-list — per-project permission rules have known gaps against subagents and shell patterns, and the central rule already covers the name. Rely on the central rule and use the matching folder name. If you must use a different name (e.g. integrating into a repo where `quarantine` collides), add the deny-list at user scope, not project scope.
 
 ### Harvest means no LLM touched it
 
