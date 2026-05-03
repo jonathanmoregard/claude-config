@@ -139,6 +139,15 @@
             "command": "$HOME/.claude/nixos-reminder-hook.sh"
           }
         ]
+      },
+      {
+        "matcher": "startup|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CLAUDE_PLUGIN_ROOT=/home/jonathan/Repos/superpowers /home/jonathan/Repos/superpowers/hooks/session-start"
+          }
+        ]
       }
     ],
     "UserPromptSubmit": [
