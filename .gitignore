@@ -89,3 +89,12 @@ workers/*/scratch/
 
 # Local-only permissions (CC writes dynamically)
 .claude/settings.local.json
+
+# Credential backups (.credentials.json itself already ignored above; .bak-* variants too)
+.credentials.json.bak-*
+
+# Repo-autosync runtime state (per-repo cache, security alerts, logs)
+repo-autosync-data/
+
+# Scheduled-task lockfile (ephemeral)
+scheduled_tasks.lock
