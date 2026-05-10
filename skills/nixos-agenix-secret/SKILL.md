@@ -30,3 +30,7 @@ error: attribute '"<name>.age"' missing
 4. `git add secrets/<name>.age`.
 
 After the secret exists, declaring it (`age.secrets.<name>`) and consuming it (systemd / wrapper) is downstream wiring not covered by this skill.
+
+## File content
+
+Raw value only — no `KEY=VALUE` wrapping. Consumers read via `$(< /run/agenix/<name>)` and export themselves. `EnvironmentFile=` and `source` don't work against raw files; wrap with `pkgs.writeShellApplication` instead.
