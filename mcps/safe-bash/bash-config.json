@@ -19,6 +19,11 @@
       "Bash(git push -f*)",
       "Bash(git push *-f *)",
       "Bash(git reset --hard*)",
+      "Bash(gh pr merge --admin*)",
+      "Bash(gh pr merge *--admin*)",
+      "Bash(gh pr merge *--admin)",
+      "Bash(*gh pr merge --admin*)",
+      "Bash(*gh pr merge *--admin*)",
       "Bash(secret-tool*)",
       "Bash(docker exec research-agent*)",
       "Bash(docker exec -* research-agent*)",
@@ -29,7 +34,8 @@
       "Bash(* BLOCKED_TEST_COMPOUND *)",
       "Bash(echo BLOCKED_TEST_ESCAPED\\*)",
       "Bash(BLOCKED_TEST_SUBCMD*)",
-      "Bash(*quarantine*)"
+      "Bash(*quarantine*)",
+      "Bash(*/run/agenix/*)"
     ]
   },
   "untrusted_ingress_single": {

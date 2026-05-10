@@ -518,6 +518,43 @@ def _run(command: str, timeout_ms: int) -> tuple[int, str, str]:
     return 124, stdout or "", stderr
 
 
+# High-entropy secret prefixes. If a command's output contains a string
+# matching any of these patterns, the matched substring is replaced with
+# `[REDACTED:<label>:<len>chars]` before the body is returned to the
+# model. Triggered after a real incident where `cat /run/agenix/...`
+# placed an Anthropic API key into the assistant's context window.
+# Prefixes only — generic high-entropy matching is too false-positive
+# prone (hashes, store paths, base64 blobs).
+_SECRET_PATTERNS: list[tuple[str, "re.Pattern[str]"]] = [
+    ("anthropic-api", re.compile(r"sk-ant-(?:api|oat)\d{2}-[A-Za-z0-9_\-]{20,}")),
+    ("openai-project", re.compile(r"sk-proj-[A-Za-z0-9_\-]{20,}")),
+    ("openai-legacy", re.compile(r"sk-[A-Za-z0-9]{20,}")),
+    ("github-token", re.compile(r"\bgh[psoure]_[A-Za-z0-9]{36,}\b")),
+    ("github-pat", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{82}\b")),
+    ("slack-token", re.compile(r"\bxox[boaprs]-[A-Za-z0-9\-]{10,}\b")),
+    ("aws-access", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b")),
+    ("tavily-key", re.compile(r"\btvly-[A-Za-z0-9_\-]{20,}\b")),
+]
+
+
+def _redact_secrets(body: str) -> str:
+    """Replace known-shape secret values with `[REDACTED:<label>:<len>chars]`.
+
+    Runs on every tool output before return. The model sees only the
+    redaction marker — never the bytes. False positives are acceptable
+    (the model knows what it asked for; the marker tells it the call
+    succeeded but the value is gated). False negatives are not (each
+    missed pattern is a future incident waiting to happen).
+    """
+    for label, pat in _SECRET_PATTERNS:
+        body = pat.sub(
+            lambda m, _label=label: f"[REDACTED:{_label}:{len(m.group(0))}chars]",
+            body,
+        )
+    return body
+
+
 def _compose_output(rc: int, stdout: str, stderr: str) -> str:
     parts: list[str] = []
     if stdout:
@@ -528,7 +565,7 @@ def _compose_output(rc: int, stdout: str, stderr: str) -> str:
     combined = "\n".join(parts)
     if len(combined) > OUTPUT_LIMIT_CHARS:
         combined = combined[:OUTPUT_LIMIT_CHARS] + "\n[safe-bash] output truncated"
-    return combined
+    return _redact_secrets(combined)
 
 
 def _wrap_if_untrusted(command: str, body: str, config: dict) -> str:
