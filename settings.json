@@ -107,7 +107,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "f=/home/jonathan/.claude/token-optimizer/.security-alert; [ -f \"$f\" ] && echo \"[token-optimizer] SECURITY ALERT: $(cat $f)\" || true"
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; f=/home/jonathan/.claude/token-optimizer/.security-alert; [ -f \"$f\" ] && echo \"[token-optimizer] SECURITY ALERT: $(cat $f)\" || true"
           }
         ]
       },
@@ -125,7 +125,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "$HOME/.claude/nixos-reminder-hook.sh"
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; $HOME/.claude/nixos-reminder-hook.sh"
           }
         ]
       },
@@ -134,7 +134,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "CLAUDE_PLUGIN_ROOT=/home/jonathan/Repos/superpowers /home/jonathan/Repos/superpowers/hooks/session-start"
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; CLAUDE_PLUGIN_ROOT=/home/jonathan/Repos/superpowers /home/jonathan/Repos/superpowers/hooks/session-start"
           }
         ]
       },
@@ -142,7 +142,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "claude-kitty-pane-record || true"
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; claude-kitty-pane-record || true"
           }
         ]
       }
@@ -153,35 +153,35 @@
         "hooks": [
           {
             "type": "command",
-            "command": "$HOME/.claude/opus-warn.sh"
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; $HOME/.claude/opus-warn.sh"
           },
           {
             "type": "command",
-            "command": "python3 $HOME/.claude/context-baggage.py"
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/context-baggage.py"
           },
           {
             "type": "command",
-            "command": "python3 $HOME/.claude/date-reminder-hook.py"
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/date-reminder-hook.py"
           },
           {
             "type": "command",
-            "command": "python3 $HOME/.claude/wellbeing/work-hours-nudge.py"
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/wellbeing/work-hours-nudge.py"
           },
           {
             "type": "command",
-            "command": "python3 $HOME/.claude/wellbeing/habit-nudge.py"
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/wellbeing/habit-nudge.py"
           },
           {
             "type": "command",
-            "command": "python3 $HOME/.claude/wellbeing/sunset-walk-nudge.py"
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/wellbeing/sunset-walk-nudge.py"
           },
           {
             "type": "command",
-            "command": "python3 $HOME/.claude/step-back-nudge.py"
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/step-back-nudge.py"
           },
           {
             "type": "command",
-            "command": "python3 $HOME/.claude/evolve-reminder.py"
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/evolve-reminder.py"
           }
         ]
       },
@@ -190,7 +190,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/jonathan/.claude/hooks/router-nudge-hook --queue-root /home/jonathan/.local/state/router/queue --marker /home/jonathan/.local/state/router/audit/nudge-marker || true"
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; /home/jonathan/.claude/hooks/router-nudge-hook --queue-root /home/jonathan/.local/state/router/queue --marker /home/jonathan/.local/state/router/audit/nudge-marker || true"
           }
         ]
       }
@@ -211,7 +211,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 $HOME/.claude/step-back-detector.py"
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/step-back-detector.py"
           }
         ]
       }
@@ -231,7 +231,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "$HOME/.claude/hooks/git-push-merge-check.sh",
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; $HOME/.claude/hooks/git-push-merge-check.sh",
             "timeout": 12
           }
         ]

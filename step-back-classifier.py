@@ -147,12 +147,21 @@ def build_conversation(transcript_path):
 
 
 def call_haiku(prompt):
+    # Run claude from STATE_DIR so the subprocess's session jsonl lands in
+    # ~/.claude/projects/-home-jonathan--claude-step-back/ instead of the
+    # parent session's project dir. Otherwise every Stop tick drops a
+    # classifier-prompt session into the user's project — and on resume,
+    # Claude Code's latest-by-mtime pick can land on the classifier jsonl,
+    # opening the next session with the watcher prompt as the first user
+    # message.
     try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
         result = subprocess.run(
             ["claude", "-p", "--model", "haiku", prompt],
             capture_output=True,
             text=True,
             timeout=HAIKU_TIMEOUT,
+            cwd=str(STATE_DIR),
         )
     except subprocess.TimeoutExpired:
         log("classifier timeout")
