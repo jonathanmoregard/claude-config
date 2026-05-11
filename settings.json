@@ -115,7 +115,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "(CLV2_PYTHON_CMD=/usr/bin/python3 ECC_OBSERVER_TIMEOUT_SECONDS=300 ~/.claude/skills/continuous-learning-v2/agents/start-observer.sh start >/dev/null 2>&1 &) || true",
+            "command": "(CLV2_PYTHON_CMD=python3 ECC_OBSERVER_TIMEOUT_SECONDS=300 ~/.claude/skills/continuous-learning-v2/agents/start-observer.sh start >/dev/null 2>&1 &) || true",
             "timeout": 3,
             "statusMessage": "Launching instinct observer..."
           }
