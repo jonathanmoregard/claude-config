@@ -14,7 +14,8 @@
       "mcp__research-agent__*",
       "mcp__safe-bash__*",
       "Write(/home/jonathan/.claude/homunculus/projects/ba55d347afb5/instincts/personal/**)",
-      "Write(/home/jonathan/.claude/homunculus/projects/c087f65d08a2/instincts/personal/**)"
+      "Write(/home/jonathan/.claude/homunculus/projects/c087f65d08a2/instincts/personal/**)",
+      "Write(/home/jonathan/.claude/homunculus/projects/01de338d7cc7/instincts/personal/**)"
     ],
     "deny": [
       "WebFetch",
@@ -224,6 +225,16 @@
             "command": "~/.claude/skills/continuous-learning-v2/hooks/observe.sh pre"
           }
         ]
+      },
+      {
+        "matcher": "Bash|mcp__safe-bash__exec",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.claude/hooks/git-push-merge-check.sh",
+            "timeout": 12
+          }
+        ]
       }
     ]
   },
@@ -301,6 +312,7 @@
     "autoAllowBashIfSandboxed": true,
     "allowUnsandboxedCommands": false
   },
+  "skillListingBudgetFraction": 0.03,
   "effortLevel": "xhigh",
   "advisorModel": "opus",
   "voiceEnabled": false
