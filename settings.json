@@ -114,16 +114,6 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"/home/jonathan/.claude/hooks/caveman-activate.js\"",
-            "timeout": 5,
-            "statusMessage": "Loading caveman mode..."
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
             "command": "(CLV2_PYTHON_CMD=/usr/bin/python3 ECC_OBSERVER_TIMEOUT_SECONDS=300 ~/.claude/skills/continuous-learning-v2/agents/start-observer.sh start >/dev/null 2>&1 &) || true",
             "timeout": 3,
             "statusMessage": "Launching instinct observer..."
@@ -194,16 +184,6 @@
             "command": "/home/jonathan/.claude/hooks/router-nudge-hook --queue-root /home/jonathan/.local/state/router/queue --marker /home/jonathan/.local/state/router/audit/nudge-marker || true"
           }
         ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node \"/home/jonathan/.claude/hooks/caveman-mode-tracker.js\"",
-            "timeout": 5,
-            "statusMessage": "Tracking caveman mode..."
-          }
-        ]
       }
     ],
     "PostToolUse": [
@@ -256,11 +236,11 @@
     "nixos@kettleofskills": true,
     "recursive-self-improvement@jonathanmoregard": true,
     "differential-review@trailofbits": true,
-    "mutation-testing@trailofbits": true,
-    "static-analysis@trailofbits": true,
-    "debug-buttercup@trailofbits": true,
-    "spec-to-code-compliance@trailofbits": true,
-    "entry-point-analyzer@trailofbits": true,
+    "mutation-testing@trailofbits": false,
+    "static-analysis@trailofbits": false,
+    "debug-buttercup@trailofbits": false,
+    "spec-to-code-compliance@trailofbits": false,
+    "entry-point-analyzer@trailofbits": false,
     "caveman@caveman": true,
     "token-optimizer@alexgreensh-token-optimizer": true
   },
@@ -283,12 +263,6 @@
         "path": "/home/jonathan/Repos/token-optimizer"
       }
     },
-    "zach-source-plugins": {
-      "source": {
-        "source": "directory",
-        "path": "/home/jonathan/.claude/plugins/marketplaces/zach-source-plugins"
-      }
-    },
     "nix-search-marketplace": {
       "source": {
         "source": "directory",
@@ -305,12 +279,6 @@
       "source": {
         "source": "directory",
         "path": "/home/jonathan/.claude/plugins/marketplaces/trailofbits"
-      }
-    },
-    "skills-curated": {
-      "source": {
-        "source": "directory",
-        "path": "/home/jonathan/.claude/plugins/marketplaces/skills-curated"
       }
     },
     "claude-plugins-official": {
