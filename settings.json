@@ -98,7 +98,10 @@
       "Grep(**/quarantine)",
       "Glob(**/quarantine/**)",
       "Glob(**/quarantine)",
-      "Bash(*quarantine*)"
+      "Bash(*quarantine*)",
+      "Edit(/etc/nixos/**)",
+      "Write(/etc/nixos/**)",
+      "NotebookEdit(/etc/nixos/**)"
     ]
   },
   "enableAllProjectMcpServers": false,

@@ -16,5 +16,6 @@ Best practices:
 - Prefer declarative modules (modules/nixos/*.nix imported from hosts/<host>/default.nix) over imperative tweaks.
 - Flake-based config: changes need `nixos-rebuild switch --flake /etc/nixos#<host>` (host = `dellan`, `vm`, etc.).
 - BEFORE rebuilding the flake, `git add -A` (or `git add <new-file>`) inside /etc/nixos. Flakes evaluate only git-tracked files; new/untracked files are invisible and rebuild fails with `Path '<file>' in the repository "/etc/nixos" is not tracked by Git`. Staging is enough — no commit required.
+- VM e2e tests are the DEFAULT gate before `nixos-rebuild switch` on `dellan`. Run `nix build .#checks.x86_64-linux.dellan-vm -L` first — boots ephemeral QEMU, asserts HM activation + user systemd units + binaries, ~2-3 min, host untouched. When adding HM units / scripts / timers, also add an assertion in `tests/dellan-vm.nix`. Skip only when iterating on hardware-specific config that the VM can't model (real touchpad, GPU, LUKS).
 - FHS-assuming binaries: wrap in `buildFHSEnv` or use `pkgs.steam-run`, don't try to recreate /lib paths.
 EOF

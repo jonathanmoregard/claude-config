@@ -98,3 +98,10 @@ repo-autosync-data/
 
 # Scheduled-task lockfile (ephemeral)
 scheduled_tasks.lock
+
+# Cleanup timestamp (runtime)
+.last-cleanup
+
+# Home-manager-managed skill symlinks (point into /nix/store)
+skills/nixos-config-dev
+skills/nixos-vm-test-gate
