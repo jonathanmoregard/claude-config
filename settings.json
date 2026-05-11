@@ -136,6 +136,14 @@
             "command": "CLAUDE_PLUGIN_ROOT=/home/jonathan/Repos/superpowers /home/jonathan/Repos/superpowers/hooks/session-start"
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "claude-kitty-pane-record || true"
+          }
+        ]
       }
     ],
     "UserPromptSubmit": [
