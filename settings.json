@@ -14,12 +14,7 @@
       "mcp__research-agent__*",
       "mcp__safe-bash__*",
       "Write(/home/jonathan/.claude/homunculus/projects/ba55d347afb5/instincts/personal/**)",
-      "Write(/home/jonathan/.claude/homunculus/projects/c087f65d08a2/instincts/personal/**)",
-      "WebFetch(domain:docs.github.com)",
-      "WebFetch(domain:docs.anthropic.com)",
-      "WebFetch(domain:docs.python.org)",
-      "WebFetch(domain:developer.mozilla.org)",
-      "WebFetch(domain:docs.aws.amazon.com)"
+      "Write(/home/jonathan/.claude/homunculus/projects/c087f65d08a2/instincts/personal/**)"
     ],
     "deny": [
       "WebFetch",
