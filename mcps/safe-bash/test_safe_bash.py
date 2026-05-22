@@ -408,6 +408,380 @@ check("call after grandchild-hang gets correct output",
 
 
 # ----------------------------------------------------------------------
+# nixos-config worktree push gate
+# ----------------------------------------------------------------------
+section("nixos push gate")
+
+import tempfile
+from pathlib import Path
+
+
+def _git_run(repo: str, *args: str) -> tuple[int, str, str]:
+    r = subprocess.run(
+        ["git", "-C", repo, *args],
+        capture_output=True, text=True, timeout=15,
+    )
+    return r.returncode, r.stdout, r.stderr
+
+
+def _make_nixos_fixture(tmpdir: str) -> tuple[str, str]:
+    """Create bare origin + base worktree under tmpdir.
+
+    Returns (base_clone_path, bare_origin_path).
+    """
+    tmp = Path(tmpdir)
+    bare = tmp / "origin.git"
+    base = tmp / "base"
+    bare.mkdir()
+    base.mkdir()
+    _git_run(str(bare), "init", "--bare", "-b", "main")
+    _git_run(str(base), "init", "-b", "main")
+    _git_run(str(base), "config", "user.email", "test@x.local")
+    _git_run(str(base), "config", "user.name", "test")
+    (base / "flake.nix").write_text("{}\n")
+    (base / "modules" / "nixos").mkdir(parents=True)
+    (base / "modules" / "nixos" / "feature-vm.nix").write_text("# baseline\n")
+    (base / "home").mkdir()
+    (base / "home" / "kitty.nix").write_text('# baseline kitty\n')
+    _git_run(str(base), "add", "-A")
+    _git_run(str(base), "commit", "-m", "init")
+    _git_run(str(base), "remote", "add", "origin", str(bare))
+    _git_run(str(base), "push", "-u", "origin", "main")
+    return str(base), str(bare)
+
+
+def _make_worktree(
+    base: str,
+    bare: str,
+    slug: str,
+    head_msg: str,
+    *,
+    kitty_content: str = '+ map ctrl+c sh -c "echo hi"\n',
+    mod_feature_vm: bool = False,
+    package_only: bool = False,
+    behind_main: bool = False,
+) -> tuple[str, str]:
+    """Create a feature worktree under <tmp>/worktrees/<slug>.
+
+    Returns (worktree_path, worktrees_root).
+    """
+    worktrees_root = str(Path(base).parent / "worktrees")
+    Path(worktrees_root).mkdir(exist_ok=True)
+    wt = str(Path(worktrees_root) / slug)
+    _git_run(base, "worktree", "add", "-b", f"feat/{slug}", wt)
+    _git_run(wt, "config", "user.email", "test@x.local")
+    _git_run(wt, "config", "user.name", "test")
+    _git_run(wt, "remote", "set-url", "origin", bare)
+    if package_only:
+        (Path(wt) / "home" / "packages.nix").write_text(
+            '{ pkgs }: with pkgs; [ inotify-tools ]\n'
+        )
+    else:
+        (Path(wt) / "home" / "kitty.nix").write_text(kitty_content)
+    if mod_feature_vm:
+        (Path(wt) / "modules" / "nixos" / "feature-vm.nix").write_text(
+            "# modified to stub shares\n"
+        )
+    _git_run(wt, "add", "-A")
+    _git_run(wt, "commit", "-m", head_msg)
+    if not behind_main:
+        _git_run(wt, "fetch", "origin", "main")
+    else:
+        # Advance origin/main past the merge-base so the branch is "behind".
+        (Path(base) / "README.md").write_text("# advance main\n")
+        _git_run(base, "add", "-A")
+        _git_run(base, "commit", "-m", "advance main")
+        _git_run(base, "push", "origin", "main")
+        _git_run(wt, "fetch", "origin", "main")
+    return wt, worktrees_root
+
+
+def gate_for(command: str, worktrees_root: str) -> "Optional[str]":  # type: ignore[name-defined]
+    real_root = server.NIXOS_WORKTREES_ROOT
+    try:
+        server.NIXOS_WORKTREES_ROOT = worktrees_root
+        return server._check_nixos_push(command)
+    finally:
+        server.NIXOS_WORKTREES_ROOT = real_root
+
+
+# Unit-level helpers first (no fixture needed).
+
+ec = server._nixos_extract_cd_target
+check("extract_cd: simple chain", ec("cd /a/b && git push") == "/a/b")
+check("extract_cd: last cd wins", ec("cd /a && cd /b && git push") == "/b")
+check("extract_cd: quoted path", ec('cd "/a/b c" && git push') == "/a/b c")
+check("extract_cd: subshell parens stripped",
+      ec("(cd /a/b && git push)") == "/a/b")
+check("extract_cd: none → None", ec("git push -u origin feat/foo") is None)
+
+cp = server._nixos_command_pushes
+check("command_pushes: yes", cp("cd /x && git push -u origin feat/y") is True)
+check("command_pushes: -C variant", cp("git -C /x push origin feat/y") is True)
+check("command_pushes: --dry-run excluded",
+      cp("git push --dry-run origin feat/y") is False)
+check("command_pushes: no push", cp("git status") is False)
+
+pc = server._nixos_parse_checklist
+sample_msg = (
+    "feat: do thing\n"
+    "\n"
+    "Body explaining stuff.\n"
+    "\n"
+    "Pre-push checklist:\n"
+    "- Type: risky\n"
+    "- Rebased on origin/main: yes\n"
+    "- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+    "- feature-vm.nix modified: no    # MUST match diff\n"
+    "- Risky markers in diff: mkIf, sh -c\n"
+    "- Behavioural evidence: ran X and saw Y\n"
+)
+parsed = pc(sample_msg)
+check("parse_checklist: returns dict", isinstance(parsed, dict))
+check("parse_checklist: type field", parsed and parsed.get("type") == "risky")
+check("parse_checklist: trims inline comment from value",
+      parsed and parsed.get("feature-vm.nix modified") == "no",
+      detail=str(parsed.get("feature-vm.nix modified") if parsed else None))
+check("parse_checklist: behavioural evidence captured",
+      parsed and parsed.get("behavioural evidence", "").startswith("ran X"))
+check("parse_checklist: header absent → None",
+      pc("commit body with no checklist") is None)
+
+
+# Fixture-based gate tests.
+
+with tempfile.TemporaryDirectory() as tmpdir:
+    base, bare = _make_nixos_fixture(tmpdir)
+
+    # Case A: no checklist → reject.
+    wt, wt_root = _make_worktree(
+        base, bare, "no-checklist", "feat: risky change, no checklist\n"
+    )
+    res = gate_for(f"cd {wt} && git push -u origin feat/no-checklist", wt_root)
+    check("gate: no checklist → reject",
+          res is not None and "Pre-push checklist" in (res or ""),
+          detail=(res or "<None>")[:160])
+
+    # Case B: override → bypass.
+    wt, wt_root = _make_worktree(
+        base, bare, "override",
+        "feat: emergency\n\nOverride: [skip-vm-gate] hotfix for dellan deploy outage\n",
+    )
+    res = gate_for(f"cd {wt} && git push -u origin feat/override", wt_root)
+    check("gate: override bypass", res is None, detail=(res or "<None>")[:160])
+
+    # Case C: pure-data + benign diff (package-only) → pass.
+    wt, wt_root = _make_worktree(
+        base, bare, "pure-data-ok",
+        "feat: add inotify-tools\n\n"
+        "Pre-push checklist:\n"
+        "- Type: pure-data\n",
+        package_only=True,
+    )
+    res = gate_for(f"cd {wt} && git push -u origin feat/pure-data-ok", wt_root)
+    check("gate: pure-data + benign diff → pass",
+          res is None, detail=(res or "<None>")[:200])
+
+    # Case D: pure-data + risky diff (sh -c in kitty) → reject.
+    wt, wt_root = _make_worktree(
+        base, bare, "pure-data-mismatch",
+        "feat: kitty binding\n\n"
+        "Pre-push checklist:\n"
+        "- Type: pure-data\n",
+    )
+    res = gate_for(
+        f"cd {wt} && git push -u origin feat/pure-data-mismatch", wt_root
+    )
+    check("gate: pure-data + risky diff → reject",
+          res is not None and "pure-data" in (res or "") and "risky markers" in (res or ""),
+          detail=(res or "<None>")[:200])
+
+    # Case E: risky + missing fields → reject.
+    wt, wt_root = _make_worktree(
+        base, bare, "risky-missing",
+        "feat: kitty binding\n\n"
+        "Pre-push checklist:\n"
+        "- Type: risky\n"
+        "- Rebased on origin/main: yes\n",
+    )
+    res = gate_for(f"cd {wt} && git push -u origin feat/risky-missing", wt_root)
+    check("gate: risky + missing fields → reject",
+          res is not None and "missing" in (res or "") and "checklist fields" in (res or ""),
+          detail=(res or "<None>")[:200])
+
+    # Case F (INCIDENT 1): risky + claims feature-vm.nix: no but diff DOES touch it.
+    wt, wt_root = _make_worktree(
+        base, bare, "incident-1",
+        "feat: research-agent microvm\n\n"
+        "Pre-push checklist:\n"
+        "- Type: risky\n"
+        "- Rebased on origin/main: yes\n"
+        "- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+        "- feature-vm.nix modified: no\n"
+        "- Risky markers in diff: microvm, sh -c\n"
+        "- Behavioural evidence: feature-vm SSH journal grep\n",
+        mod_feature_vm=True,
+    )
+    res = gate_for(f"cd {wt} && git push -u origin feat/incident-1", wt_root)
+    check("gate: claim 'feature-vm.nix: no' vs touched diff → reject (incident 1)",
+          res is not None and "feature-vm.nix" in (res or "") and "hollow smoke" in (res or ""),
+          detail=(res or "<None>")[:240])
+
+    # Case G: risky + claim "yes (unrelated)" + diff touches feature-vm.nix → pass.
+    wt, wt_root = _make_worktree(
+        base, bare, "risky-fv-acknowledged",
+        "feat: legit feature-vm work\n\n"
+        "Pre-push checklist:\n"
+        "- Type: risky\n"
+        "- Rebased on origin/main: yes\n"
+        "- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+        "- feature-vm.nix modified: yes (added new module to vmVariant for testing)\n"
+        "- Risky markers in diff: microvm, sh -c\n"
+        "- Behavioural evidence: nix run .#feature-vm; ssh; curl /health → 200\n",
+        mod_feature_vm=True,
+    )
+    res = gate_for(
+        f"cd {wt} && git push -u origin feat/risky-fv-acknowledged", wt_root
+    )
+    check("gate: risky + feature-vm claim 'yes' + diff touches → pass",
+          res is None, detail=(res or "<None>")[:240])
+
+    # Case H: risky + claim rebased:yes but actually behind main → reject.
+    wt, wt_root = _make_worktree(
+        base, bare, "behind-main",
+        "feat: kitty binding\n\n"
+        "Pre-push checklist:\n"
+        "- Type: risky\n"
+        "- Rebased on origin/main: yes\n"
+        "- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+        "- feature-vm.nix modified: no\n"
+        "- Risky markers in diff: sh -c\n"
+        "- Behavioural evidence: ran feature-vm; ssh; pressed ctrl+shift+c\n",
+        behind_main=True,
+    )
+    res = gate_for(f"cd {wt} && git push -u origin feat/behind-main", wt_root)
+    check("gate: rebased=yes claim but actually behind main → reject",
+          res is not None and "Rebased on origin/main" in (res or "")
+          and "behind main" in (res or ""),
+          detail=(res or "<None>")[:240])
+
+    # Case I: risky + all fields OK → pass.
+    wt, wt_root = _make_worktree(
+        base, bare, "risky-ok",
+        "feat: kitty binding behavioural test\n\n"
+        "Pre-push checklist:\n"
+        "- Type: risky\n"
+        "- Rebased on origin/main: yes\n"
+        "- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+        "- feature-vm.nix modified: no\n"
+        "- Risky markers in diff: sh -c\n"
+        "- Behavioural evidence: ran nix run .#feature-vm; ssh; xdotool ctrl+shift+c; xclip selection 'foo' no trailing newline\n",
+    )
+    res = gate_for(f"cd {wt} && git push -u origin feat/risky-ok", wt_root)
+    check("gate: risky + complete checklist + consistent → pass",
+          res is None, detail=(res or "<None>")[:240])
+
+    # Case J: --dry-run bypasses gate (no real push).
+    res = gate_for(f"cd {wt} && git push --dry-run origin feat/risky-ok", wt_root)
+    check("gate: --dry-run not gated", res is None, detail=(res or "<None>")[:160])
+
+    # Case K: non-nixos cwd (random tmp dir) → not gated.
+    res = gate_for(f"cd /tmp && git push -u origin feat/foo", wt_root)
+    check("gate: non-nixos cwd not gated", res is None, detail=(res or "<None>")[:160])
+
+    # Case L: main worktree (slug == 'main') not gated even if would push.
+    # We didn't create main as a worktree under worktrees/, so this is the
+    # path-filter check — `_nixos_worktree_root_from_path` returns None for
+    # 'main' subdir.
+    main_path = str(Path(wt_root) / "main")
+    res = gate_for(f"cd {main_path} && git push -u origin feat/whatever", wt_root)
+    check("gate: 'main' worktree path filtered → not gated",
+          res is None, detail=(res or "<None>")[:160])
+
+    # Case M1: pure-data + BOTH risky markers AND feature-vm.nix touch →
+    # rejection reports both reasons, not just markers (advisor R2/MEDIUM #1).
+    wt, wt_root = _make_worktree(
+        base, bare, "pure-data-double",
+        "feat: combined\n\n"
+        "Pre-push checklist:\n"
+        "- Type: pure-data\n",
+        mod_feature_vm=True,  # touches feature-vm.nix
+        # default kitty_content includes `sh -c` so diff also has risky markers
+    )
+    res = gate_for(f"cd {wt} && git push -u origin feat/pure-data-double", wt_root)
+    check("gate: pure-data + risky AND feature-vm.nix → both reasons in message",
+          res is not None and "risky markers" in (res or "")
+          and "feature-vm.nix" in (res or ""),
+          detail=(res or "<None>")[:240])
+
+    # Case M2: indented sub-bullet inside Behavioural evidence does NOT
+    # overwrite parent field map (advisor R2/MEDIUM #2).
+    parsed = server._nixos_parse_checklist(
+        "feat: thing\n\n"
+        "Pre-push checklist:\n"
+        "- Type: risky\n"
+        "- Rebased on origin/main: yes\n"
+        "- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+        "- feature-vm.nix modified: no\n"
+        "- Risky markers in diff: sh -c\n"
+        "- Behavioural evidence: ran feature-vm\n"
+        "  - inner cmd: nix run .#feature-vm\n"   # indented sub-bullet
+        "  - inner cmd: ssh -p 2222 ...\n"
+    )
+    check("parse_checklist: indented sub-bullets do NOT overwrite top-level fields",
+          parsed is not None and parsed.get("feature-vm.nix modified") == "no"
+          and "inner cmd" not in parsed,
+          detail=str(parsed)[:200])
+
+    # Case M3: template-placeholder `<...>` value treated as empty
+    # (advisor R2/MEDIUM #3).
+    wt, wt_root = _make_worktree(
+        base, bare, "template-leftover",
+        "feat: thing\n\n"
+        "Pre-push checklist:\n"
+        "- Type: risky\n"
+        "- Rebased on origin/main: yes\n"
+        "- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+        "- feature-vm.nix modified: no\n"
+        "- Risky markers in diff: <list, or 'none'>\n"   # left as template
+        "- Behavioural evidence: <cmd + observed output>\n",  # left as template
+    )
+    res = gate_for(f"cd {wt} && git push -u origin feat/template-leftover", wt_root)
+    check("gate: template-placeholder values rejected as empty",
+          res is not None and "template-placeholder" in (res or "")
+          and "risky markers in diff" in (res or "")
+          and "behavioural evidence" in (res or ""),
+          detail=(res or "<None>")[:300])
+
+    # Case M4: `git push origin main` from a feat branch still gates (advisor
+    # R2/H8 nice-to-have).
+    wt, wt_root = _make_worktree(
+        base, bare, "push-main-from-feat",
+        "feat: thing\n",  # no checklist
+    )
+    res = gate_for(f"cd {wt} && git push origin main", wt_root)
+    check("gate: `git push origin main` from feat/* still gated",
+          res is not None and "Pre-push checklist" in (res or ""),
+          detail=(res or "<None>")[:160])
+
+    # Case M: git -C <worktree> variant resolves correctly.
+    wt, wt_root = _make_worktree(
+        base, bare, "git-c-variant",
+        "feat: thing\n\n"
+        "Pre-push checklist:\n"
+        "- Type: risky\n"
+        "- Rebased on origin/main: yes\n"
+        "- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+        "- feature-vm.nix modified: no\n"
+        "- Risky markers in diff: sh -c\n"
+        "- Behavioural evidence: feature-vm smoke\n",
+    )
+    res = gate_for(f"git -C {wt} push -u origin feat/git-c-variant", wt_root)
+    check("gate: git -C <worktree> push resolves and passes",
+          res is None, detail=(res or "<None>")[:240])
+
+
+# ----------------------------------------------------------------------
 # dcg integration
 # ----------------------------------------------------------------------
 section("dcg integration")

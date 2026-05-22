@@ -394,6 +394,361 @@ def _check_dangerous_find(command: str) -> Optional[str]:
     return None
 
 
+# nixos-config worktree push gate.
+#
+# Two recent PRs deployed broken changes to dellan despite the SessionStart
+# hook's HARD RULE and the nixos-config-dev / nixos-agent-testing skills:
+#
+#   PR #61 (research-agent → microvm): agent ran `nix run .#feature-vm` and
+#     SSH-smoked it, but stubbed `modules/nixos/feature-vm.nix` to make boot
+#     succeed (missing virtiofsd share-source dirs). Smoke ran against a
+#     mutated artefact, not the prod path. Inner microvm `networking.useDHCP`
+#     defaulted false → no resolver → sshd never started → research-agent
+#     unreachable post-deploy.
+#
+#   PR #57 (kitty ctrl+shift+c strip newline): agent ran only the automated
+#     gate (`nix build .#checks.x86_64-linux.dellan-vm`) whose assertion was
+#     grep-the-rendered-config — never launched kitty, never pressed the key.
+#     `pass_selection_to_program sh -c '… kitten clipboard'` fails silently
+#     at runtime because the child has no controlling tty for OSC52.
+#
+# The shared failure mode is the agent equating "build green" with "feature
+# works" — and the SessionStart prose (which both sessions had in context)
+# did not gate behaviour. This MCP gate is the enforcement layer that the
+# prose isn't.
+#
+# Design:
+#   - Fires on `git push` from a `~/Repos/nixos-config-worktrees/<slug>` cwd
+#     (or `cd <worktree> && git push`).
+#   - Requires a `Pre-push checklist:` block in the HEAD commit message.
+#   - For `Type: pure-data` → diff verified empty of risky markers.
+#   - For `Type: risky` → all required fields filled AND the
+#     `feature-vm.nix modified: <yes/no>` claim is mechanically cross-checked
+#     against the actual diff (catches incident 1's hollow smoke), AND the
+#     `Rebased on origin/main: yes` claim is verified via merge-base.
+#   - Override: `Override: [skip-vm-gate] <reason>` line in the commit message.
+#     Visible in `git log` post-merge for retrospective review.
+
+NIXOS_WORKTREES_ROOT = "/home/jonathan/Repos/nixos-config-worktrees"
+
+# Heuristic "this diff has branching / runtime / multistep behaviour" markers.
+# Order matters only for the rejection-message hit list (first-match labels).
+_NIXOS_RISKY_MARKERS = re.compile(
+    r"\bmkIf\b"
+    r"|\boptionals\b"
+    r"|\bExecStart"
+    r"|writeShellApplication"
+    r"|writeShellScriptBin"
+    r"|pass_selection_to_program"
+    r"|\bmicrovm\b"
+    r"|\bvirtiofsd\b"
+    r"|networking\.useDHCP"
+    r"|activationScripts?"
+    r"|systemd\.(?:services|timers|user\.services)\."
+    r"|\bsh\s+-c\s+"
+    r"|\bbash\s+-c\s+"
+)
+
+_NIXOS_CHECKLIST_HEADER = re.compile(r"^Pre-push checklist:\s*$", re.MULTILINE)
+# Field lines are top-level only (anchored `^-\s`, NOT `^\s*-\s`). Indented
+# sub-bullets inside a multi-line `Behavioural evidence` value must not
+# overwrite the parent field map.
+_NIXOS_CHECKLIST_FIELD = re.compile(r"^-\s*([^:\n]+?)\s*:\s*(.*)$")
+_NIXOS_OVERRIDE = re.compile(r"^Override:\s*\[skip-vm-gate\]\s*(\S.+)$", re.MULTILINE)
+# `<placeholder>` template hints (`<list, or 'none'>`, `<cmd + output>`) left
+# unfilled by the agent are treated as empty. The angle-brackets are the
+# template's hint marker; real values never start with `<` AND end with `>`.
+_NIXOS_TEMPLATE_PLACEHOLDER = re.compile(r"^<.*>$")
+_NIXOS_FEATURE_VM_FILE_IN_DIFF = re.compile(
+    r"^diff --git .*modules/nixos/feature-vm\.nix\b", re.MULTILINE
+)
+
+_NIXOS_GATE_HELP = (
+    "[safe-bash] nixos worktree push gate refused this push.\n\n"
+    "HEAD commit message must contain a 'Pre-push checklist:' block.\n"
+    "Template (copy verbatim, then fill values):\n\n"
+    "  Pre-push checklist:\n"
+    "  - Type: pure-data           # OR 'risky' for branching/multistep/runtime\n"
+    "  - Rebased on origin/main: yes\n"
+    "  - Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+    "  - feature-vm.nix modified: no    # MUST match actual diff\n"
+    "  - Risky markers in diff: <list, or 'none'>\n"
+    "  - Behavioural evidence: <what you actually exercised — command + observed output>\n\n"
+    "For 'Type: pure-data' (package add, version bump, comment), only Type +\n"
+    "brief justification are required; diff is verified to have no risky markers.\n\n"
+    "Bypass (audited): add 'Override: [skip-vm-gate] <reason>' to commit message.\n"
+)
+
+
+def _nixos_pipeline_subcommands(command: str) -> list[str]:
+    """Pipeline split that also strips a leading '(' from subshell forms.
+
+    The existing `_pipeline_subcommands` correctly splits on `&&`/`;`/etc.
+    but doesn't strip `(` from `(cd X && git push)`. We need the inside.
+    """
+    out: list[str] = []
+    for sub in _pipeline_subcommands(command):
+        s = sub.strip()
+        # strip leading "(" and trailing ")" from subshell wraps
+        while s.startswith("("):
+            s = s[1:].lstrip()
+        while s.endswith(")"):
+            s = s[:-1].rstrip()
+        if s:
+            out.append(s)
+    return out
+
+
+def _nixos_extract_cd_target(command: str) -> Optional[str]:
+    """Last `cd <path>` target encountered in the pipeline chain.
+
+    Returns absolute path (with ~ expansion) or None. Quotes around the path
+    are stripped. Only `cd` as the leading token of a subcommand counts —
+    a `cd` mid-command (rare) is ignored.
+    """
+    last: Optional[str] = None
+    for sub in _nixos_pipeline_subcommands(command):
+        m = re.match(r'^cd\s+(.+?)\s*$', sub)
+        if not m:
+            continue
+        raw = m.group(1).strip()
+        if (raw.startswith('"') and raw.endswith('"')) or (
+            raw.startswith("'") and raw.endswith("'")
+        ):
+            raw = raw[1:-1]
+        try:
+            last = os.path.abspath(os.path.expanduser(raw))
+        except (ValueError, OSError):
+            continue
+    return last
+
+
+def _nixos_worktree_root_from_path(path: str) -> Optional[str]:
+    """Map any path inside `~/Repos/nixos-config-worktrees/<slug>/...` to the worktree root.
+
+    Returns None for the `main/` worktree (read-only browse, never push from there)
+    and for the bare-repo path.
+    """
+    root_prefix = NIXOS_WORKTREES_ROOT.rstrip("/") + "/"
+    if not path.startswith(root_prefix):
+        return None
+    rel = path[len(root_prefix):]
+    slug = rel.split("/", 1)[0]
+    if not slug or slug.startswith(".") or slug == "main":
+        return None
+    return os.path.join(NIXOS_WORKTREES_ROOT, slug)
+
+
+def _nixos_resolve_worktree(command: str) -> Optional[str]:
+    """Worktree root if the command targets one, else None.
+
+    Resolution order:
+      1. `cd <path>` chain in the command itself
+      2. `git -C <path>` flag in the command
+      3. MCP server's own cwd (Claude Code launched from a worktree)
+    """
+    cd_target = _nixos_extract_cd_target(command)
+    if cd_target:
+        wt = _nixos_worktree_root_from_path(cd_target)
+        if wt:
+            return wt
+    m = re.search(r"\bgit\s+(?:[^\n;|&]*?\s+)?-C\s+(\S+)", command)
+    if m:
+        raw = m.group(1).strip("\"'")
+        try:
+            path = os.path.abspath(os.path.expanduser(raw))
+        except (ValueError, OSError):
+            path = None
+        if path:
+            wt = _nixos_worktree_root_from_path(path)
+            if wt:
+                return wt
+    try:
+        cwd = os.getcwd()
+    except OSError:
+        return None
+    return _nixos_worktree_root_from_path(cwd)
+
+
+def _nixos_command_pushes(command: str) -> bool:
+    """True if a `git push` is present (excluding --dry-run)."""
+    for sub in _nixos_pipeline_subcommands(command):
+        if not re.search(r"\bgit\s+(?:-C\s+\S+\s+)?(?:[\w-]+\s+)*push\b", sub):
+            continue
+        if re.search(r"(?:^|\s)--dry-run(?:\s|$)", sub):
+            continue
+        return True
+    return False
+
+
+def _nixos_git(worktree: str, args: list[str], timeout_s: float = 10.0) -> tuple[int, str, str]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", worktree, *args],
+            capture_output=True, text=True, timeout=timeout_s,
+        )
+        return result.returncode, result.stdout, result.stderr
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        return -1, "", str(e)
+
+
+def _nixos_parse_checklist(commit_msg: str) -> Optional[dict[str, str]]:
+    """Extract `Pre-push checklist:` field map. None if header missing.
+
+    Block ends at the first non-field, non-blank, non-comment line after the
+    header, or at end-of-message. Keys lowercased + stripped.
+    """
+    if not _NIXOS_CHECKLIST_HEADER.search(commit_msg):
+        return None
+    fields: dict[str, str] = {}
+    in_block = False
+    for line in commit_msg.splitlines():
+        if _NIXOS_CHECKLIST_HEADER.match(line):
+            in_block = True
+            continue
+        if not in_block:
+            continue
+        stripped = line.strip()
+        if stripped == "" or stripped.startswith("#"):
+            continue
+        m = _NIXOS_CHECKLIST_FIELD.match(line)
+        if m:
+            key = m.group(1).strip().lower()
+            val = m.group(2).strip()
+            # Drop inline `# comment` tails so the template's hint text doesn't
+            # poison values when the agent left it untrimmed.
+            val = re.sub(r"\s+#.*$", "", val).strip()
+            fields[key] = val
+            continue
+        # First unrelated line ends the block.
+        break
+    return fields
+
+
+def _check_nixos_push(command: str) -> Optional[str]:
+    """Gate `git push` of a nixos-config worktree branch.
+
+    Returns rejection text or None. Pure-data pushes with a minimal trailer
+    are accepted. Risky pushes require the full trailer AND the mechanical
+    cross-checks to agree with the diff.
+    """
+    if not _nixos_command_pushes(command):
+        return None
+    worktree = _nixos_resolve_worktree(command)
+    if not worktree:
+        return None
+    rc, branch, _ = _nixos_git(worktree, ["branch", "--show-current"])
+    if rc == 0 and branch.strip() == "main":
+        return None  # Pushing main is already branch-protected upstream.
+
+    rc, msg, _ = _nixos_git(worktree, ["log", "-1", "--format=%B"])
+    if rc != 0:
+        return None  # No HEAD — let git itself fail with a clear error.
+
+    override = _NIXOS_OVERRIDE.search(msg)
+    if override:
+        sys.stderr.write(
+            f"[safe-bash] nixos push gate: bypass via Override: [skip-vm-gate] "
+            f"{override.group(1).strip()[:120]!r}\n"
+        )
+        return None
+
+    fields = _nixos_parse_checklist(msg)
+    if fields is None:
+        return _NIXOS_GATE_HELP
+
+    # Diff against origin/main (falls back to local main, then empty).
+    rc, diff, _ = _nixos_git(
+        worktree, ["diff", "origin/main...HEAD"], timeout_s=15.0
+    )
+    if rc != 0 or not diff:
+        rc2, diff2, _ = _nixos_git(worktree, ["diff", "main...HEAD"], timeout_s=15.0)
+        if rc2 == 0:
+            diff = diff2
+    diff_has_risky = bool(_NIXOS_RISKY_MARKERS.search(diff)) if diff else False
+    diff_touches_fv = bool(_NIXOS_FEATURE_VM_FILE_IN_DIFF.search(diff)) if diff else False
+
+    type_ = fields.get("type", "").lower()
+
+    if type_ == "pure-data":
+        # Report both incompatibilities if they coexist — the markers-only
+        # message hides the structural feature-vm.nix signal which is the
+        # PR #61 anti-pattern tell.
+        reasons: list[str] = []
+        if diff_has_risky:
+            hits = sorted({m.group(0) for m in _NIXOS_RISKY_MARKERS.finditer(diff)})
+            reasons.append(
+                "diff contains risky markers: " + ", ".join(hits[:8])
+            )
+        if diff_touches_fv:
+            reasons.append(
+                "diff touches modules/nixos/feature-vm.nix (always 'Type: risky')"
+            )
+        if reasons:
+            return (
+                "[safe-bash] nixos push gate: checklist claims 'Type: pure-data' "
+                "but " + "; ".join(reasons) + ".\n"
+                "Update the checklist to 'Type: risky' and fill remaining fields, "
+                "OR remove the runtime/branching change from this PR."
+            )
+        return None
+
+    if type_ != "risky":
+        return (
+            f"[safe-bash] nixos push gate: checklist 'Type:' must be "
+            f"'pure-data' or 'risky' (got: {type_!r}).\n\n{_NIXOS_GATE_HELP}"
+        )
+
+    required = [
+        "rebased on origin/main",
+        "local gate",
+        "feature-vm.nix modified",
+        "risky markers in diff",
+        "behavioural evidence",
+    ]
+    # Field counts as empty when blank OR still holding the template
+    # `<...>` placeholder. The latter slips past truthy checks but signals
+    # the agent left the template untouched.
+    def _empty_or_placeholder(v: str) -> bool:
+        return (not v) or bool(_NIXOS_TEMPLATE_PLACEHOLDER.match(v.strip()))
+    missing = [k for k in required if _empty_or_placeholder(fields.get(k, ""))]
+    if missing:
+        return (
+            "[safe-bash] nixos push gate: missing, empty, or template-placeholder "
+            "checklist fields: " + ", ".join(missing) + ".\n\n" + _NIXOS_GATE_HELP
+        )
+
+    fv_claim = fields["feature-vm.nix modified"].lower()
+    fv_claims_no = fv_claim.startswith("no") or fv_claim in ("n", "false")
+    if fv_claims_no and diff_touches_fv:
+        return (
+            "[safe-bash] nixos push gate: checklist claims 'feature-vm.nix "
+            "modified: no' but the diff DOES touch modules/nixos/feature-vm.nix. "
+            "This is the load-bearing tell for hollow smoke evidence (cf. PR #61: "
+            "agent stubbed virtiofsd shares to make boot succeed, smoke ran against "
+            "a mutated artefact, not the prod path).\n"
+            "If the edit was needed to make the smoke test pass, state 'yes' + "
+            "explain why the prod code path was still exercised. If the edit is "
+            "unrelated, state 'yes (unrelated: <reason>)'."
+        )
+
+    rebased_claim = fields["rebased on origin/main"].lower()
+    if rebased_claim.startswith("yes"):
+        rc_mb, merge_base, _ = _nixos_git(worktree, ["merge-base", "HEAD", "origin/main"])
+        rc_om, origin_main_sha, _ = _nixos_git(worktree, ["rev-parse", "origin/main"])
+        if rc_mb == 0 and rc_om == 0:
+            if merge_base.strip() != origin_main_sha.strip():
+                return (
+                    "[safe-bash] nixos push gate: checklist claims 'Rebased on "
+                    "origin/main: yes' but `git merge-base HEAD origin/main` "
+                    f"({merge_base.strip()[:12]}) != `origin/main` "
+                    f"({origin_main_sha.strip()[:12]}). Branch is behind main; "
+                    "rebase before pushing."
+                )
+
+    return None
+
+
 def _check_denied(command: str, config: dict) -> Optional[str]:
     """Return rejection reason if the command matches a deny pattern, else None.
 
@@ -402,7 +757,11 @@ def _check_denied(command: str, config: dict) -> Optional[str]:
          rule IDs surface in the error message.
       2. Built-in semantic checks (e.g. `find ... -delete` without a filter
          predicate). These exist where glob rules over-block.
-      3. Config-driven Bash(pattern) rules — same glob syntax as Claude Code's
+      3. nixos-config worktree push gate (`_check_nixos_push`) — requires a
+         structured `Pre-push checklist:` trailer in the HEAD commit message
+         with mechanical claim-vs-diff cross-checks. Catches the failure
+         mode behind PR #57 and PR #61.
+      4. Config-driven Bash(pattern) rules — same glob syntax as Claude Code's
          settings.json, matched against each pipeline subcommand.
 
     Any source can veto. No allowlist override; if you need a command,
@@ -414,6 +773,9 @@ def _check_denied(command: str, config: dict) -> Optional[str]:
     find_reason = _check_dangerous_find(command)
     if find_reason is not None:
         return find_reason
+    nixos_reason = _check_nixos_push(command)
+    if nixos_reason is not None:
+        return nixos_reason
     rules = _deny_rules_from_config(config)
     if not rules:
         return None
