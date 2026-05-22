@@ -1,0 +1,4 @@
+/home/jonathan/.claude/commands/evolve.md -> /home/jonathan/Repos/everything-claude-code/commands/evolve.md
+/home/jonathan/.claude/commands/instinct-export.md -> /home/jonathan/Repos/everything-claude-code/commands/instinct-export.md
+/home/jonathan/.claude/commands/instinct-import.md -> /home/jonathan/Repos/everything-claude-code/commands/instinct-import.md
+/home/jonathan/.claude/commands/instinct-status.md -> /home/jonathan/Repos/everything-claude-code/commands/instinct-status.md

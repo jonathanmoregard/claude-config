@@ -1,0 +1,2 @@
+/home/jonathan/.claude/agents/chief-of-staff.md
+/home/jonathan/.claude/mcp-configs/mcp-servers.json
