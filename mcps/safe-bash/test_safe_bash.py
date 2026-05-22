@@ -559,6 +559,8 @@ sample_msg = (
     "- Type: risky\n"
     "- Rebased on origin/main: yes\n"
     "- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+    "- Interactive smoke (nixos-agent-testing): yes — ran feature-vm, ssh exec\n"
+    "- Advisor review (advice-refine-test-loop): N/A — small contained PR\n"
     "- feature-vm.nix modified: no    # MUST match diff\n"
     "- Risky markers in diff: mkIf, sh -c\n"
     "- Behavioural evidence: ran X and saw Y\n"
@@ -644,6 +646,8 @@ with tempfile.TemporaryDirectory() as tmpdir:
         "- Type: risky\n"
         "- Rebased on origin/main: yes\n"
         "- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+        "- Interactive smoke (nixos-agent-testing): yes — ran feature-vm SSH\n"
+        "- Advisor review (advice-refine-test-loop): yes — 2 rounds, SAFE TO SHIP\n"
         "- feature-vm.nix modified: no\n"
         "- Risky markers in diff: microvm, sh -c\n"
         "- Behavioural evidence: feature-vm SSH journal grep\n",
@@ -662,6 +666,8 @@ with tempfile.TemporaryDirectory() as tmpdir:
         "- Type: risky\n"
         "- Rebased on origin/main: yes\n"
         "- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+        "- Interactive smoke (nixos-agent-testing): yes — ran feature-vm; curl /health → 200\n"
+        "- Advisor review (advice-refine-test-loop): yes — 1 round, SAFE TO SHIP\n"
         "- feature-vm.nix modified: yes (added new module to vmVariant for testing)\n"
         "- Risky markers in diff: microvm, sh -c\n"
         "- Behavioural evidence: nix run .#feature-vm; ssh; curl /health → 200\n",
@@ -681,6 +687,8 @@ with tempfile.TemporaryDirectory() as tmpdir:
         "- Type: risky\n"
         "- Rebased on origin/main: yes\n"
         "- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+        "- Interactive smoke (nixos-agent-testing): yes — ran feature-vm, xdotool keypress\n"
+        "- Advisor review (advice-refine-test-loop): N/A — small contained PR\n"
         "- feature-vm.nix modified: no\n"
         "- Risky markers in diff: sh -c\n"
         "- Behavioural evidence: ran feature-vm; ssh; pressed ctrl+shift+c\n",
@@ -700,6 +708,8 @@ with tempfile.TemporaryDirectory() as tmpdir:
         "- Type: risky\n"
         "- Rebased on origin/main: yes\n"
         "- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+        "- Interactive smoke (nixos-agent-testing): yes — feature-vm boot, xdotool ctrl+shift+c, xclip read\n"
+        "- Advisor review (advice-refine-test-loop): yes — 2 rounds, SAFE TO SHIP\n"
         "- feature-vm.nix modified: no\n"
         "- Risky markers in diff: sh -c\n"
         "- Behavioural evidence: ran nix run .#feature-vm; ssh; xdotool ctrl+shift+c; xclip selection 'foo' no trailing newline\n",
@@ -792,6 +802,8 @@ with tempfile.TemporaryDirectory() as tmpdir:
         "- Type: risky\n"
         "- Rebased on origin/main: yes\n"
         "- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+        "- Interactive smoke (nixos-agent-testing): yes — exercised path\n"
+        "- Advisor review (advice-refine-test-loop): N/A — small PR\n"
         "- feature-vm.nix modified: no\n"
         "- Risky markers in diff: sh -c\n"
         "- Behavioural evidence: ran feature-vm\n"
@@ -822,6 +834,62 @@ with tempfile.TemporaryDirectory() as tmpdir:
           and "risky markers in diff" in (res or "")
           and "behavioural evidence" in (res or ""),
           detail=(res or "<None>")[:300])
+
+    # Case M3a: NEW — risky missing the `Interactive smoke` field → reject.
+    wt, wt_root = _make_worktree(
+        base, bare, "missing-agent-testing",
+        "feat: thing\n\n"
+        "Pre-push checklist:\n"
+        "- Type: risky\n"
+        "- Rebased on origin/main: yes\n"
+        "- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+        "- Advisor review (advice-refine-test-loop): N/A — small PR\n"
+        "- feature-vm.nix modified: no\n"
+        "- Risky markers in diff: sh -c\n"
+        "- Behavioural evidence: feature-vm smoke\n",
+    )
+    res = gate_for(f"cd {wt} && git push -u origin feat/missing-agent-testing", wt_root)
+    check("gate: risky missing 'Interactive smoke (nixos-agent-testing)' field → reject",
+          res is not None and "interactive smoke" in (res or "").lower(),
+          detail=(res or "<None>")[:240])
+
+    # Case M3b: NEW — risky missing the `Advisor review` field → reject.
+    wt, wt_root = _make_worktree(
+        base, bare, "missing-advisor",
+        "feat: thing\n\n"
+        "Pre-push checklist:\n"
+        "- Type: risky\n"
+        "- Rebased on origin/main: yes\n"
+        "- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+        "- Interactive smoke (nixos-agent-testing): yes — feature-vm cmd\n"
+        "- feature-vm.nix modified: no\n"
+        "- Risky markers in diff: sh -c\n"
+        "- Behavioural evidence: feature-vm smoke\n",
+    )
+    res = gate_for(f"cd {wt} && git push -u origin feat/missing-advisor", wt_root)
+    check("gate: risky missing 'Advisor review (advice-refine-test-loop)' field → reject",
+          res is not None and "advisor review" in (res or "").lower(),
+          detail=(res or "<None>")[:240])
+
+    # Case M3c: NEW — N/A is an acceptable value (mirrors skill: not every
+    # risky PR needs the interactive VM or the advisor loop, but the typed
+    # claim must be present).
+    wt, wt_root = _make_worktree(
+        base, bare, "na-acceptable",
+        "feat: hardware-only touchpad palm rejection\n\n"
+        "Pre-push checklist:\n"
+        "- Type: risky\n"
+        "- Rebased on origin/main: yes\n"
+        "- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+        "- Interactive smoke (nixos-agent-testing): N/A — hardware-only (touchpad), VM can't model\n"
+        "- Advisor review (advice-refine-test-loop): N/A — small contained PR\n"
+        "- feature-vm.nix modified: no\n"
+        "- Risky markers in diff: mkIf\n"
+        "- Behavioural evidence: will verify post-merge on real host with nixos-rebuild switch --rollback ready\n",
+    )
+    res = gate_for(f"cd {wt} && git push -u origin feat/na-acceptable", wt_root)
+    check("gate: N/A values for nixos-agent-testing + advisor fields are acceptable",
+          res is None, detail=(res or "<None>")[:240])
 
     # Case M4: `git push origin main` from a feat branch still gates (advisor
     # R2/H8 nice-to-have).
@@ -968,6 +1036,8 @@ with tempfile.TemporaryDirectory() as tmpdir:
         "- Type: risky\n"
         "- Rebased on origin/main: yes\n"
         "- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+        "- Interactive smoke (nixos-agent-testing): yes — exercised cmd\n"
+        "- Advisor review (advice-refine-test-loop): N/A — small PR\n"
         "- feature-vm.nix modified: no\n"
         "- Risky markers in diff: sh -c\n"
         "- Behavioural evidence: feature-vm smoke\n",

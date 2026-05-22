@@ -481,6 +481,8 @@ _NIXOS_GATE_HELP = (
     "  - Type: pure-data           # OR 'risky' for branching/multistep/runtime\n"
     "  - Rebased on origin/main: yes\n"
     "  - Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+    "  - Interactive smoke (nixos-agent-testing): <yes — cmd + observed | N/A — reason>\n"
+    "  - Advisor review (advice-refine-test-loop): <yes — rounds + verdict | N/A — reason>\n"
     "  - feature-vm.nix modified: no    # MUST match actual diff\n"
     "  - Risky markers in diff: <list, or 'none'>\n"
     "  - Behavioural evidence: <what you actually exercised — command + observed output>\n\n"
@@ -752,6 +754,8 @@ def _check_nixos_push(command: str) -> Optional[str]:
     required = [
         "rebased on origin/main",
         "local gate",
+        "interactive smoke (nixos-agent-testing)",
+        "advisor review (advice-refine-test-loop)",
         "feature-vm.nix modified",
         "risky markers in diff",
         "behavioural evidence",
