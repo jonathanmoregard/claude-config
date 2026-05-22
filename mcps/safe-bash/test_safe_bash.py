@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -496,16 +497,42 @@ def _make_worktree(
     return wt, worktrees_root
 
 
-def gate_for(command: str, worktrees_root: str) -> "Optional[str]":  # type: ignore[name-defined]
-    real_root = server.NIXOS_WORKTREES_ROOT
+def gate_for(command: str, _unused_worktrees_root: str) -> "Optional[str]":  # type: ignore[name-defined]
+    """Run the gate with a permissive remote-URL pattern so the tmpdir
+    bare-repo URL (`<tmp>/origin.git`) is recognised as a "nixos-config"
+    clone for the test's purposes. The 2nd arg is kept for source-compat
+    with the older path-based fixture signature but ignored.
+    """
+    real_patterns = server._NIXOS_REPO_REMOTE_PATTERNS
     try:
-        server.NIXOS_WORKTREES_ROOT = worktrees_root
+        server._NIXOS_REPO_REMOTE_PATTERNS = [
+            re.compile(r"/origin\.git/?$"),
+        ]
         return server._check_nixos_push(command)
     finally:
-        server.NIXOS_WORKTREES_ROOT = real_root
+        server._NIXOS_REPO_REMOTE_PATTERNS = real_patterns
 
 
 # Unit-level helpers first (no fixture needed).
+
+# Remote-URL predicate (production patterns).
+rin = server._remote_is_nixos_config
+check("remote_is_nixos: ssh form",
+      rin("git@github.com:jonathanmoregard/nixos-config.git") is True)
+check("remote_is_nixos: https form",
+      rin("https://github.com/jonathanmoregard/nixos-config") is True)
+check("remote_is_nixos: https + .git",
+      rin("https://github.com/jonathanmoregard/nixos-config.git") is True)
+check("remote_is_nixos: trailing slash",
+      rin("https://github.com/jonathanmoregard/nixos-config/") is True)
+check("remote_is_nixos: different owner",
+      rin("git@github.com:someone-else/nixos-config.git") is False)
+check("remote_is_nixos: different repo",
+      rin("git@github.com:jonathanmoregard/something-else.git") is False)
+check("remote_is_nixos: suffix-collision (nixos-config-extras)",
+      rin("git@github.com:jonathanmoregard/nixos-config-extras.git") is False)
+check("remote_is_nixos: empty string",
+      rin("") is False)
 
 ec = server._nixos_extract_cd_target
 check("extract_cd: simple chain", ec("cd /a/b && git push") == "/a/b")
@@ -689,14 +716,57 @@ with tempfile.TemporaryDirectory() as tmpdir:
     res = gate_for(f"cd /tmp && git push -u origin feat/foo", wt_root)
     check("gate: non-nixos cwd not gated", res is None, detail=(res or "<None>")[:160])
 
-    # Case L: main worktree (slug == 'main') not gated even if would push.
-    # We didn't create main as a worktree under worktrees/, so this is the
-    # path-filter check — `_nixos_worktree_root_from_path` returns None for
-    # 'main' subdir.
-    main_path = str(Path(wt_root) / "main")
-    res = gate_for(f"cd {main_path} && git push -u origin feat/whatever", wt_root)
-    check("gate: 'main' worktree path filtered → not gated",
+    # Case L: nonexistent path → `git rev-parse --show-toplevel` returns
+    # non-zero, candidate skipped. Fallback chain finds no nixos remote
+    # (test runner cwd is the harness's own cwd) → gate no-ops.
+    nonexistent = str(Path(wt_root) / "does-not-exist")
+    res = gate_for(f"cd {nonexistent} && git push -u origin feat/whatever", wt_root)
+    check("gate: nonexistent path → not gated (no repo to inspect)",
           res is None, detail=(res or "<None>")[:160])
+
+    # Case L2: NEW — worktree at a non-canonical filesystem location
+    # (outside `~/Repos/nixos-config-worktrees/`) but with the nixos-config
+    # remote configured → gate STILL fires. Detection is by remote URL,
+    # not by path prefix.
+    elsewhere_root = str(Path(tmpdir) / "scratch-clones")
+    Path(elsewhere_root).mkdir(exist_ok=True)
+    elsewhere_wt = str(Path(elsewhere_root) / "feat-elsewhere")
+    _git_run(base, "worktree", "add", "-b", "feat/elsewhere", elsewhere_wt)
+    _git_run(elsewhere_wt, "config", "user.email", "test@x.local")
+    _git_run(elsewhere_wt, "config", "user.name", "test")
+    _git_run(elsewhere_wt, "remote", "set-url", "origin", bare)
+    (Path(elsewhere_wt) / "home" / "kitty.nix").write_text(
+        '+ map ctrl+c sh -c "echo hi"\n'
+    )
+    _git_run(elsewhere_wt, "add", "-A")
+    _git_run(elsewhere_wt, "commit", "-m", "feat: from elsewhere, no checklist")
+    _git_run(elsewhere_wt, "fetch", "origin", "main")
+    res = gate_for(
+        f"cd {elsewhere_wt} && git push -u origin feat/elsewhere", wt_root
+    )
+    check("gate: worktree at non-canonical path with nixos remote → still gated",
+          res is not None and "Pre-push checklist" in (res or ""),
+          detail=(res or "<None>")[:200])
+
+    # Case L3: NEW — repo with a non-nixos remote → not gated, even if its
+    # path happens to live under the canonical worktrees dir (the path no
+    # longer matters; only the remote URL does).
+    nonnixos_bare = Path(tmpdir) / "other-origin.git"
+    nonnixos_bare.mkdir()
+    _git_run(str(nonnixos_bare), "init", "--bare", "-b", "main")
+    nonnixos_wt = str(Path(wt_root) / "fake-nixos-by-name")
+    _git_run(base, "worktree", "add", "-b", "feat/fake-nixos", nonnixos_wt)
+    _git_run(nonnixos_wt, "remote", "set-url", "origin", str(nonnixos_bare))
+    (Path(nonnixos_wt) / "home" / "kitty.nix").write_text("sh -c noise\n")
+    _git_run(nonnixos_wt, "config", "user.email", "test@x.local")
+    _git_run(nonnixos_wt, "config", "user.name", "test")
+    _git_run(nonnixos_wt, "add", "-A")
+    _git_run(nonnixos_wt, "commit", "-m", "feat: not nixos")
+    res = gate_for(
+        f"cd {nonnixos_wt} && git push -u origin feat/fake-nixos", wt_root
+    )
+    check("gate: canonical path but non-nixos remote → NOT gated",
+          res is None, detail=(res or "<None>")[:200])
 
     # Case M1: pure-data + BOTH risky markers AND feature-vm.nix touch →
     # rejection reports both reasons, not just markers (advisor R2/MEDIUM #1).
@@ -807,10 +877,9 @@ with tempfile.TemporaryDirectory() as tmpdir:
         }
         stdin = "\n".join(json.dumps(m) for m in (init, initialized, call)) + "\n"
         env = os.environ.copy()
-        # Pin NIXOS_WORKTREES_ROOT for the spawned process so the fixture
-        # path is recognised by the gate even though server.py defaults to
-        # the real ~/Repos/... path.
-        env["DCG_PATH"] = "/nonexistent"  # bypass dcg fail-open path
+        # Bypass dcg fail-open path; remote-pattern override is applied via
+        # the bootstrap script below, not via env vars.
+        env["DCG_PATH"] = "/nonexistent"
         if env_overrides:
             env.update(env_overrides)
         proc = subprocess.run(
@@ -827,16 +896,17 @@ with tempfile.TemporaryDirectory() as tmpdir:
                 return msg["result"]["content"][0]["text"]
         raise RuntimeError(f"no response id=2; stderr={proc.stderr!r}")
 
-    # The spawned server module needs the worktrees-root monkey-patched.
-    # Since env vars can't reach module constants directly, write a tiny
-    # bootstrap that imports server, patches the constant, then runs main.
-    bootstrap = Path(tmpdir) / "server_with_patched_root.py"
+    # The spawned server module needs its remote-pattern list monkey-patched
+    # so the fixture bare-repo URL (`<tmp>/origin.git`) counts as a
+    # "nixos-config" remote for the test. Write a tiny bootstrap that
+    # imports server, swaps the pattern list, then runs main.
+    bootstrap = Path(tmpdir) / "server_with_patched_remote.py"
     bootstrap.write_text(
-        f"import sys\n"
+        "import re, sys\n"
         f"sys.path.insert(0, {HERE!r})\n"
-        f"import server\n"
-        f"server.NIXOS_WORKTREES_ROOT = {wt_root!r}\n"
-        f"server.main()\n"
+        "import server\n"
+        "server._NIXOS_REPO_REMOTE_PATTERNS = [re.compile(r'/origin\\.git/?$')]\n"
+        "server.main()\n"
     )
 
     def mcp_call_via_bootstrap(command: str, cwd: str) -> str:

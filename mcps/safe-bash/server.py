@@ -431,6 +431,15 @@ def _check_dangerous_find(command: str) -> Optional[str]:
 
 NIXOS_WORKTREES_ROOT = "/home/jonathan/Repos/nixos-config-worktrees"
 
+# The gate detects a "nixos-config repo" by remote URL, not by filesystem
+# path — so the same gate fires whether the worktree lives at the canonical
+# `~/Repos/nixos-config-worktrees/<slug>/` location or anywhere else
+# (scratch clone in `/tmp`, secondary worktree under `~/projects`, etc.).
+# Patterns match the tail `[:/]owner/repo(.git)?` of a remote URL.
+_NIXOS_REPO_REMOTE_PATTERNS: list["re.Pattern[str]"] = [
+    re.compile(r"[:/]jonathanmoregard/nixos-config(?:\.git)?/?$"),
+]
+
 # Heuristic "this diff has branching / runtime / multistep behaviour" markers.
 # Order matters only for the rejection-message hit list (first-match labels).
 _NIXOS_RISKY_MARKERS = re.compile(
@@ -464,7 +473,8 @@ _NIXOS_FEATURE_VM_FILE_IN_DIFF = re.compile(
 )
 
 _NIXOS_GATE_HELP = (
-    "nixos worktree push gate refused this push.\n\n"
+    "nixos-config push gate refused this push (remote points at "
+    "jonathanmoregard/nixos-config).\n\n"
     "HEAD commit message must contain a 'Pre-push checklist:' block.\n"
     "Template (copy verbatim, then fill values):\n\n"
     "  Pre-push checklist:\n"
@@ -523,51 +533,87 @@ def _nixos_extract_cd_target(command: str) -> Optional[str]:
     return last
 
 
-def _nixos_worktree_root_from_path(path: str) -> Optional[str]:
-    """Map any path inside `~/Repos/nixos-config-worktrees/<slug>/...` to the worktree root.
+def _remote_is_nixos_config(url: str) -> bool:
+    """True if a git remote URL points at the nixos-config repo.
 
-    Returns None for the `main/` worktree (read-only browse, never push from there)
-    and for the bare-repo path.
+    Tail-match against `_NIXOS_REPO_REMOTE_PATTERNS` so the same predicate
+    works for `git@github.com:owner/repo.git`, `https://github.com/owner/repo`,
+    `ssh://git@github.com/owner/repo`, etc.
     """
-    root_prefix = NIXOS_WORKTREES_ROOT.rstrip("/") + "/"
-    if not path.startswith(root_prefix):
-        return None
-    rel = path[len(root_prefix):]
-    slug = rel.split("/", 1)[0]
-    if not slug or slug.startswith(".") or slug == "main":
-        return None
-    return os.path.join(NIXOS_WORKTREES_ROOT, slug)
+    url = (url or "").strip()
+    if not url:
+        return False
+    return any(p.search(url) for p in _NIXOS_REPO_REMOTE_PATTERNS)
 
 
-def _nixos_resolve_worktree(command: str) -> Optional[str]:
-    """Worktree root if the command targets one, else None.
+def _repo_has_nixos_remote(repo_root: str) -> bool:
+    """True if the repo at `repo_root` has any remote whose URL matches nixos-config.
 
-    Resolution order:
-      1. `cd <path>` chain in the command itself
-      2. `git -C <path>` flag in the command
-      3. MCP server's own cwd (Claude Code launched from a worktree)
+    Checks ALL configured remotes (fetch + push entries), not just origin,
+    so forks / mirrors with a different push target still gate correctly.
     """
+    rc, out, _ = _nixos_git(repo_root, ["remote", "-v"])
+    if rc != 0:
+        return False
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and _remote_is_nixos_config(parts[1]):
+            return True
+    return False
+
+
+def _candidate_repo_paths(command: str) -> list[str]:
+    """Candidate working-dir paths to probe for a git repo.
+
+    Order:
+      1. Last `cd <path>` target in the command's pipeline chain
+      2. `git -C <path>` flag
+      3. MCP server's own cwd (Claude Code launched from inside the repo)
+    """
+    candidates: list[str] = []
     cd_target = _nixos_extract_cd_target(command)
     if cd_target:
-        wt = _nixos_worktree_root_from_path(cd_target)
-        if wt:
-            return wt
+        candidates.append(cd_target)
     m = re.search(r"\bgit\s+(?:[^\n;|&]*?\s+)?-C\s+(\S+)", command)
     if m:
         raw = m.group(1).strip("\"'")
         try:
-            path = os.path.abspath(os.path.expanduser(raw))
+            candidates.append(os.path.abspath(os.path.expanduser(raw)))
         except (ValueError, OSError):
-            path = None
-        if path:
-            wt = _nixos_worktree_root_from_path(path)
-            if wt:
-                return wt
+            pass
     try:
-        cwd = os.getcwd()
+        candidates.append(os.getcwd())
     except OSError:
-        return None
-    return _nixos_worktree_root_from_path(cwd)
+        pass
+    # Dedupe while preserving order.
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for p in candidates:
+        if p and p not in seen:
+            seen.add(p)
+            deduped.append(p)
+    return deduped
+
+
+def _nixos_resolve_target_repo(command: str) -> Optional[str]:
+    """Return the working-tree top-level if any candidate path resolves to a
+    nixos-config clone (identified by remote URL match).
+
+    Detection is by remote URL, NOT by filesystem path — so a worktree at
+    `~/scratch/foo/`, `/tmp/clones/nixos-config/`, or anywhere outside the
+    canonical `~/Repos/nixos-config-worktrees/` tree still gates as long as
+    one of its configured remotes points at jonathanmoregard/nixos-config.
+    """
+    for path in _candidate_repo_paths(command):
+        rc, toplevel, _ = _nixos_git(path, ["rev-parse", "--show-toplevel"])
+        if rc != 0:
+            continue
+        repo_root = toplevel.strip()
+        if not repo_root:
+            continue
+        if _repo_has_nixos_remote(repo_root):
+            return repo_root
+    return None
 
 
 def _nixos_command_pushes(command: str) -> bool:
@@ -626,7 +672,11 @@ def _nixos_parse_checklist(commit_msg: str) -> Optional[dict[str, str]]:
 
 
 def _check_nixos_push(command: str) -> Optional[str]:
-    """Gate `git push` of a nixos-config worktree branch.
+    """Gate `git push` of a nixos-config branch.
+
+    Detection: any candidate path (from `cd`/`-C`/cwd) that resolves to a
+    git working tree whose remotes include a URL matching nixos-config.
+    Worktree location is NOT part of the check.
 
     Returns rejection text or None. Pure-data pushes with a minimal trailer
     are accepted. Risky pushes require the full trailer AND the mechanical
@@ -634,7 +684,7 @@ def _check_nixos_push(command: str) -> Optional[str]:
     """
     if not _nixos_command_pushes(command):
         return None
-    worktree = _nixos_resolve_worktree(command)
+    worktree = _nixos_resolve_target_repo(command)
     if not worktree:
         return None
     rc, branch, _ = _nixos_git(worktree, ["branch", "--show-current"])
