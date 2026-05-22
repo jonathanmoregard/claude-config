@@ -464,7 +464,7 @@ _NIXOS_FEATURE_VM_FILE_IN_DIFF = re.compile(
 )
 
 _NIXOS_GATE_HELP = (
-    "[safe-bash] nixos worktree push gate refused this push.\n\n"
+    "nixos worktree push gate refused this push.\n\n"
     "HEAD commit message must contain a 'Pre-push checklist:' block.\n"
     "Template (copy verbatim, then fill values):\n\n"
     "  Pre-push checklist:\n"
@@ -686,7 +686,7 @@ def _check_nixos_push(command: str) -> Optional[str]:
             )
         if reasons:
             return (
-                "[safe-bash] nixos push gate: checklist claims 'Type: pure-data' "
+                "nixos push gate: checklist claims 'Type: pure-data' "
                 "but " + "; ".join(reasons) + ".\n"
                 "Update the checklist to 'Type: risky' and fill remaining fields, "
                 "OR remove the runtime/branching change from this PR."
@@ -695,7 +695,7 @@ def _check_nixos_push(command: str) -> Optional[str]:
 
     if type_ != "risky":
         return (
-            f"[safe-bash] nixos push gate: checklist 'Type:' must be "
+            f"nixos push gate: checklist 'Type:' must be "
             f"'pure-data' or 'risky' (got: {type_!r}).\n\n{_NIXOS_GATE_HELP}"
         )
 
@@ -714,7 +714,7 @@ def _check_nixos_push(command: str) -> Optional[str]:
     missing = [k for k in required if _empty_or_placeholder(fields.get(k, ""))]
     if missing:
         return (
-            "[safe-bash] nixos push gate: missing, empty, or template-placeholder "
+            "nixos push gate: missing, empty, or template-placeholder "
             "checklist fields: " + ", ".join(missing) + ".\n\n" + _NIXOS_GATE_HELP
         )
 
@@ -722,7 +722,7 @@ def _check_nixos_push(command: str) -> Optional[str]:
     fv_claims_no = fv_claim.startswith("no") or fv_claim in ("n", "false")
     if fv_claims_no and diff_touches_fv:
         return (
-            "[safe-bash] nixos push gate: checklist claims 'feature-vm.nix "
+            "nixos push gate: checklist claims 'feature-vm.nix "
             "modified: no' but the diff DOES touch modules/nixos/feature-vm.nix. "
             "This is the load-bearing tell for hollow smoke evidence (cf. PR #61: "
             "agent stubbed virtiofsd shares to make boot succeed, smoke ran against "
@@ -739,7 +739,7 @@ def _check_nixos_push(command: str) -> Optional[str]:
         if rc_mb == 0 and rc_om == 0:
             if merge_base.strip() != origin_main_sha.strip():
                 return (
-                    "[safe-bash] nixos push gate: checklist claims 'Rebased on "
+                    "nixos push gate: checklist claims 'Rebased on "
                     "origin/main: yes' but `git merge-base HEAD origin/main` "
                     f"({merge_base.strip()[:12]}) != `origin/main` "
                     f"({origin_main_sha.strip()[:12]}). Branch is behind main; "

@@ -764,6 +764,132 @@ with tempfile.TemporaryDirectory() as tmpdir:
           res is not None and "Pre-push checklist" in (res or ""),
           detail=(res or "<None>")[:160])
 
+    # Case M5: CWD fallback. Claude Code launched INSIDE worktree, agent
+    # runs bare `git push` (no cd prefix, no -C flag). Gate must still
+    # fire via os.getcwd(). This is the most common real-world path —
+    # untested by earlier cases which all include `cd <wt>`.
+    wt, wt_root = _make_worktree(
+        base, bare, "cwd-fallback",
+        "feat: bare push\n",  # no checklist → should reject
+    )
+    cwd_save = os.getcwd()
+    try:
+        os.chdir(wt)
+        res = gate_for("git push -u origin feat/cwd-fallback", wt_root)
+    finally:
+        os.chdir(cwd_save)
+    check("gate: cwd-fallback (no cd prefix, server cwd inside worktree) fires",
+          res is not None and "Pre-push checklist" in (res or ""),
+          detail=(res or "<None>")[:200])
+
+    # Case M6: MCP roundtrip via real JSON-RPC stdio. Proves the gate
+    # fires through the actual exec path, not just direct function call.
+    # Spawn `python3 server.py` with cwd inside the fixture worktree;
+    # send tools/call with a bare `git push`; expect the gate text back.
+    wt, wt_root = _make_worktree(
+        base, bare, "mcp-roundtrip-gate",
+        "feat: thing\n",  # no checklist
+    )
+
+    def mcp_roundtrip_in_cwd(command: str, cwd: str, env_overrides: dict | None = None) -> str:
+        init = {
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "safe-bash-test", "version": "1.0"},
+            },
+        }
+        initialized = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+        call = {
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "exec", "arguments": {"command": command}},
+        }
+        stdin = "\n".join(json.dumps(m) for m in (init, initialized, call)) + "\n"
+        env = os.environ.copy()
+        # Pin NIXOS_WORKTREES_ROOT for the spawned process so the fixture
+        # path is recognised by the gate even though server.py defaults to
+        # the real ~/Repos/... path.
+        env["DCG_PATH"] = "/nonexistent"  # bypass dcg fail-open path
+        if env_overrides:
+            env.update(env_overrides)
+        proc = subprocess.run(
+            [sys.executable, server_py],
+            input=stdin, capture_output=True, text=True, timeout=30,
+            cwd=cwd, env=env,
+        )
+        for line in proc.stdout.splitlines():
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if msg.get("id") == 2:
+                return msg["result"]["content"][0]["text"]
+        raise RuntimeError(f"no response id=2; stderr={proc.stderr!r}")
+
+    # The spawned server module needs the worktrees-root monkey-patched.
+    # Since env vars can't reach module constants directly, write a tiny
+    # bootstrap that imports server, patches the constant, then runs main.
+    bootstrap = Path(tmpdir) / "server_with_patched_root.py"
+    bootstrap.write_text(
+        f"import sys\n"
+        f"sys.path.insert(0, {HERE!r})\n"
+        f"import server\n"
+        f"server.NIXOS_WORKTREES_ROOT = {wt_root!r}\n"
+        f"server.main()\n"
+    )
+
+    def mcp_call_via_bootstrap(command: str, cwd: str) -> str:
+        init = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                           "clientInfo": {"name": "t", "version": "1"}}}
+        initialized = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+        call = {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "exec", "arguments": {"command": command}}}
+        stdin = "\n".join(json.dumps(m) for m in (init, initialized, call)) + "\n"
+        env = os.environ.copy()
+        env["DCG_PATH"] = "/nonexistent"
+        proc = subprocess.run(
+            [sys.executable, str(bootstrap)],
+            input=stdin, capture_output=True, text=True, timeout=30,
+            cwd=cwd, env=env,
+        )
+        for line in proc.stdout.splitlines():
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if msg.get("id") == 2:
+                return msg["result"]["content"][0]["text"]
+        raise RuntimeError(f"no response id=2; stderr={proc.stderr!r}")
+
+    text = mcp_call_via_bootstrap(
+        f"cd {wt} && git push -u origin feat/mcp-roundtrip-gate",
+        cwd=str(tmpdir),
+    )
+    check("E2E (MCP stdio): gate fires on no-checklist push",
+          "[safe-bash] nixos worktree push gate refused" in text
+          or "Pre-push checklist" in text,
+          detail=text[:300])
+
+    # And: override bypass survives MCP roundtrip too. Uses REAL push (no
+    # --dry-run) so the gate's override branch is actually exercised — not
+    # the dry-run short-circuit. Bare origin is a filesystem URL so the
+    # push will succeed and git's transport output ("branch 'feat/...'
+    # set up to track ..." or "To <bare>") confirms the gate let it through.
+    wt2, _ = _make_worktree(
+        base, bare, "mcp-override",
+        "feat: bypass\n\nOverride: [skip-vm-gate] emergency\n",
+    )
+    text = mcp_call_via_bootstrap(
+        f"cd {wt2} && git push -u origin feat/mcp-override",
+        cwd=str(tmpdir),
+    )
+    check("E2E (MCP stdio): override bypasses gate AND real push lands",
+          "Pre-push checklist" not in text and "gate refused" not in text
+          and ("feat/mcp-override" in text and ("->" in text or "set up to track" in text)),
+          detail=text[:300])
+
     # Case M: git -C <worktree> variant resolves correctly.
     wt, wt_root = _make_worktree(
         base, bare, "git-c-variant",
