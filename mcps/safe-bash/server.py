@@ -928,9 +928,19 @@ def _run(
     # cancellation handler can SIGTERM the whole bash process group.
     # `rec` is None for the legacy synchronous call path (tests + any
     # direct callers); the threaded MCP dispatcher passes a record.
+    #
+    # Both the proc-publish AND the cancelled-flag read happen under
+    # `_in_flight_lock` to keep the invariant safe against memory-model
+    # reorderings on non-GIL Pythons (PEP 703 / free-threaded CPython,
+    # PyPy STM). Under stock CPython the GIL already serializes these,
+    # but holding the lock makes the contract explicit and forward-
+    # compatible. The killpg syscall stays outside the lock — it's
+    # only ordered-after the flag read, not racing with it.
     if rec is not None:
-        rec.proc = proc
-        if rec.cancelled:
+        with _in_flight_lock:
+            rec.proc = proc
+            cancelled_already = rec.cancelled
+        if cancelled_already:
             # Cancellation slipped in between InFlight registration and
             # Popen; tear down immediately so we don't run the bash body
             # for output that will be suppressed anyway.
@@ -1300,6 +1310,34 @@ def _handle(msg: dict) -> None:
         _respond(msg_id, result={"tools": TOOLS})
         return
     if method == "tools/call":
+        # JSON-RPC requires an `id` on requests. A `tools/call`
+        # without one is malformed and would leak an `_InFlight`
+        # entry at key None (no later cancel could pop it). Reject
+        # before registering. The peer cannot recover a response —
+        # they sent a notification-shaped request — but at least we
+        # log the protocol violation and don't grow memory.
+        if msg_id is None:
+            sys.stderr.write("[safe-bash] tools/call missing id; dropping\n")
+            sys.stderr.flush()
+            return
+        # Reject id collision so a re-used id can't orphan a prior
+        # in-flight rec. JSON-RPC 2.0 §5: "An identifier established
+        # by the Client that MUST contain a String, Number, or NULL".
+        # Sane clients don't reuse, but a defensive guard is cheap.
+        with _in_flight_lock:
+            if msg_id in _in_flight:
+                already_in_flight = True
+            else:
+                already_in_flight = False
+        if already_in_flight:
+            _respond(
+                msg_id,
+                error={
+                    "code": -32600,
+                    "message": f"Request id {msg_id} already in flight",
+                },
+            )
+            return
         # Dispatch to a worker thread so the read loop stays
         # responsive — without this, a long bash blocks the main
         # `for line in sys.stdin` loop and we cannot receive
