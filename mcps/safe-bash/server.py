@@ -27,7 +27,41 @@ import shlex
 import signal
 import subprocess
 import sys
-from typing import Optional
+import threading
+import time
+from typing import Any, Optional
+
+
+class _InFlight:
+    """Per-request state for the threaded dispatcher.
+
+    `cancelled` flips to True when `notifications/cancelled` arrives
+    for this id. The check + the actual response write live under the
+    same `_write_lock` in `_send_response`, so cancellation arriving
+    even one nanosecond before the response is reliably observed.
+
+    `proc` is the `subprocess.Popen` of the bash child (set by `_run`
+    once it has the handle). Cancel-handler reads it to send SIGTERM
+    to the bash process group; left None means the cancel arrived
+    before bash booted, in which case the cancelled flag alone
+    suppresses the response when `_tool_exec` returns.
+    """
+    __slots__ = ("cancelled", "proc")
+
+    def __init__(self) -> None:
+        self.cancelled = False
+        self.proc: Optional[subprocess.Popen] = None
+
+
+# Stdout writes from main thread + N worker threads MUST be serialized,
+# else JSON-RPC frames interleave and corrupt the protocol.
+_write_lock = threading.Lock()
+# `_in_flight` is mutated by main thread (insert/delete), worker threads
+# (delete on completion), and cancel-handler reads. Guarded by its own
+# lock to keep critical sections short — we explicitly do NOT hold
+# `_in_flight_lock` while writing to stdout.
+_in_flight_lock = threading.Lock()
+_in_flight: dict[Any, _InFlight] = {}
 
 DEFAULT_TIMEOUT_MS = 120_000
 MAX_TIMEOUT_MS = 600_000
@@ -856,7 +890,11 @@ def _xml_attr_escape(s: str) -> str:
     )
 
 
-def _run(command: str, timeout_ms: int) -> tuple[int, str, str]:
+def _run(
+    command: str,
+    timeout_ms: int,
+    rec: Optional[_InFlight] = None,
+) -> tuple[int, str, str]:
     """Run command with a timeout that kills the whole process group.
 
     Two hardenings vs. plain `subprocess.run`:
@@ -886,6 +924,20 @@ def _run(command: str, timeout_ms: int) -> tuple[int, str, str]:
         text=True,
         start_new_session=True,
     )
+    # Register the live handle with the in-flight record so the
+    # cancellation handler can SIGTERM the whole bash process group.
+    # `rec` is None for the legacy synchronous call path (tests + any
+    # direct callers); the threaded MCP dispatcher passes a record.
+    if rec is not None:
+        rec.proc = proc
+        if rec.cancelled:
+            # Cancellation slipped in between InFlight registration and
+            # Popen; tear down immediately so we don't run the bash body
+            # for output that will be suppressed anyway.
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
     try:
         pgid = os.getpgid(proc.pid)
     except OSError:
@@ -1071,17 +1123,137 @@ SERVER_INFO = {"name": "safe-bash", "version": "1.0.0"}
 CAPABILITIES = {"tools": {"listChanged": False}}
 
 
+def _write_msg(msg: dict) -> None:
+    """Serialized write of one JSON-RPC frame to stdout.
+
+    The lock is essential: under threaded dispatch, two worker threads
+    could otherwise interleave JSON bytes mid-frame, corrupting the
+    protocol. The cost is one mutex per response. Initialize/tools-list
+    on the main thread go through the same lock for the same reason.
+    """
+    with _write_lock:
+        sys.stdout.write(json.dumps(msg) + "\n")
+        sys.stdout.flush()
+
+
 def _respond(msg_id, result=None, error=None) -> None:
+    """Send a response on the synchronous (main-thread) path.
+
+    Init, tools/list, method-not-found, and tools/call dispatch errors
+    use this — none of them are tracked in `_in_flight`, so no
+    cancellation check applies. Goes through the serialized writer so
+    the frame is still atomic relative to worker-thread responses.
+    """
     out: dict = {"jsonrpc": "2.0", "id": msg_id}
     if error is not None:
         out["error"] = error
     else:
         out["result"] = result
-    sys.stdout.write(json.dumps(out) + "\n")
-    sys.stdout.flush()
+    _write_msg(out)
 
 
-def _tool_exec(args: dict) -> str:
+def _send_response(msg_id, result=None, error=None) -> None:
+    """Send the response for an in-flight tools/call, OR silently drop
+    it if the request was cancelled.
+
+    Per MCP cancellation spec (2025-06-18 §Cancellation):
+        > A receiver SHOULD stop processing the cancelled request and
+        > free associated resources. A receiver SHOULD NOT send a
+        > response for the cancelled request.
+
+    The cancelled-flag check and the response write must be atomic
+    relative to the cancellation handler — if they aren't, the
+    handler can flip `cancelled=True` between our check and our
+    write, and we'd emit the spurious response that triggers Claude
+    Code's transport drop ("Received a response for an unknown
+    message ID"). Hold both `_write_lock` (write atomicity) and
+    `_in_flight_lock` (registration atomicity) across the decision.
+
+    The `_in_flight` entry is popped here on the success path; on the
+    cancel path it's already popped by the cancellation handler.
+    """
+    with _write_lock:
+        with _in_flight_lock:
+            rec = _in_flight.pop(msg_id, None)
+            if rec is not None and rec.cancelled:
+                return
+        # NOTE: writing inline rather than calling `_write_msg(...)`
+        # is deliberate — `_write_lock` is a non-reentrant
+        # `threading.Lock`. Routing through `_write_msg` would
+        # self-acquire and deadlock. If a future refactor wants the
+        # single chokepoint, switch to `threading.RLock` first.
+        out: dict = {"jsonrpc": "2.0", "id": msg_id}
+        if error is not None:
+            out["error"] = error
+        else:
+            out["result"] = result
+        sys.stdout.write(json.dumps(out) + "\n")
+        sys.stdout.flush()
+
+
+def _on_cancelled(req_id) -> None:
+    """Handle `notifications/cancelled` for an in-flight tool call.
+
+    The cancelled-flag assignment MUST happen under `_in_flight_lock`,
+    same lock `_send_response` holds while it decides whether to write
+    the response. If the flag flip happens outside the lock, the
+    worker can interleave between (cancel-handler's lookup, releasing
+    lock) and (cancel-handler's flag-set) — popping the rec, reading
+    cancelled=False, and shipping the spurious response that triggers
+    Claude Code's transport drop. The kill, by contrast, can stay
+    outside the lock — killpg is the syscall-heavy part, and we only
+    need it to follow flag-flip in happens-before order, which it does
+    by sequenced statement order.
+
+    Three race-safe outcomes (all covered under the same lock):
+      1. Request not yet dispatched (handler thread hasn't even
+         started bash): `rec.proc is None`, mark `cancelled=True`; the
+         handler will observe and exit early via `_send_response`.
+      2. Request running bash: SIGTERM the process group (set up by
+         `_run` via `start_new_session=True`); `_run`'s normal
+         SIGTERM-then-SIGKILL escalation reaps any stragglers.
+      3. Request already responded (very late cancel): the id was
+         popped by `_send_response`; `rec is None`, silent no-op per
+         spec ("MAY ignore if the request is unknown or already
+         completed").
+    """
+    with _in_flight_lock:
+        rec = _in_flight.get(req_id)
+        if rec is None:
+            return
+        rec.cancelled = True
+        proc = rec.proc
+    if proc is not None:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+
+def _dispatch_tools_call(msg_id, params, rec) -> None:
+    """Worker-thread body for a tools/call request.
+
+    Runs `_tool_exec` synchronously in this thread; on completion
+    (success, error, or cancellation-triggered teardown), funnels
+    through `_send_response` which decides whether to actually write
+    the response or silently drop it.
+    """
+    try:
+        name = params.get("name")
+        arguments = params.get("arguments") or {}
+        if name != "exec":
+            _send_response(msg_id, error={"code": -32601, "message": f"Unknown tool: {name}"})
+            return
+        text = _tool_exec(arguments, rec)
+        _send_response(msg_id, result={"content": [{"type": "text", "text": text}]})
+    except Exception as e:
+        _send_response(
+            msg_id,
+            result={"content": [{"type": "text", "text": f"ERROR: {e}"}], "isError": True},
+        )
+
+
+def _tool_exec(args: dict, rec: Optional[_InFlight] = None) -> str:
     command = args.get("command")
     if not isinstance(command, str) or not command.strip():
         raise RuntimeError("command must be a non-empty string")
@@ -1095,7 +1267,7 @@ def _tool_exec(args: dict) -> str:
     reason = _check_denied(command, config)
     if reason is not None:
         return f"[safe-bash] {reason}"
-    rc, stdout, stderr = _run(command, timeout_ms)
+    rc, stdout, stderr = _run(command, timeout_ms, rec)
     body = _compose_output(rc, stdout, stderr)
     return _wrap_if_untrusted(command, body, config)
 
@@ -1117,26 +1289,62 @@ def _handle(msg: dict) -> None:
         return
     if method == "notifications/initialized":
         return
+    if method == "notifications/cancelled":
+        # JSON-RPC notification — no response. params.requestId is the
+        # id of the in-flight request the peer wants stopped.
+        req_id = params.get("requestId")
+        if req_id is not None:
+            _on_cancelled(req_id)
+        return
     if method == "tools/list":
         _respond(msg_id, result={"tools": TOOLS})
         return
     if method == "tools/call":
-        name = params.get("name")
-        arguments = params.get("arguments") or {}
-        if name != "exec":
-            _respond(msg_id, error={"code": -32601, "message": f"Unknown tool: {name}"})
-            return
-        try:
-            text = _tool_exec(arguments)
-            _respond(msg_id, result={"content": [{"type": "text", "text": text}]})
-        except Exception as e:
-            _respond(
-                msg_id,
-                result={"content": [{"type": "text", "text": f"ERROR: {e}"}], "isError": True},
-            )
+        # Dispatch to a worker thread so the read loop stays
+        # responsive — without this, a long bash blocks the main
+        # `for line in sys.stdin` loop and we cannot receive
+        # `notifications/cancelled` for the very request we're
+        # running. Register the in-flight record BEFORE starting
+        # the worker so a cancel that arrives during thread startup
+        # has a record to attach to.
+        rec = _InFlight()
+        with _in_flight_lock:
+            _in_flight[msg_id] = rec
+        t = threading.Thread(
+            target=_dispatch_tools_call,
+            args=(msg_id, params, rec),
+            daemon=True,
+            name=f"safe-bash-tool-{msg_id}",
+        )
+        t.start()
         return
     if msg_id is not None:
         _respond(msg_id, error={"code": -32601, "message": f"Method not found: {method}"})
+
+
+def _drain_in_flight(timeout_s: float = 30.0) -> None:
+    """Wait for in-flight tool-call workers to complete after the
+    main read loop sees EOF on stdin.
+
+    Workers are daemon threads so a runaway bash can't keep the
+    process alive forever, but exiting immediately on EOF orphans
+    fast-path callers that send `init + tools/call` then close stdin
+    (`subprocess.run(input=...)` shape — heavily used by the test
+    harness). Without this drain, the worker is killed mid-bash and
+    the response never lands on stdout. Cap is generous so a 25s
+    bash invoked by a test completes; well under MAX_TIMEOUT_MS.
+    """
+    # Take a snapshot of the threads under the lock — main() never
+    # writes to _in_flight again after the read loop exits.
+    with _in_flight_lock:
+        if not _in_flight:
+            return
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        with _in_flight_lock:
+            if not _in_flight:
+                return
+        time.sleep(0.05)
 
 
 def main() -> None:
@@ -1153,6 +1361,10 @@ def main() -> None:
         except Exception as e:
             sys.stderr.write(f"[safe-bash] unhandled error: {e}\n")
             sys.stderr.flush()
+    # Stdin closed. Workers may still be running. Drain so any
+    # already-dispatched tool call gets its response on stdout before
+    # the process exits.
+    _drain_in_flight(timeout_s=30.0)
 
 
 if __name__ == "__main__":
