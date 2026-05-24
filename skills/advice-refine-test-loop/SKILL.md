@@ -12,7 +12,7 @@ Single-pass review reliably misses fail-open paths, silently-swallowed exception
 ```
 1. SELF-REVIEW: read each changed file top-to-bottom (not just diff)
 2. VERIFY: tests + syntax + smoke green before inviting external eyes
-3. ADVISE: Agent(subagent_type="general-purpose", model="opus", prompt=...)
+3. ADVISE: Agent(subagent_type="advisor", prompt=...)  // read-only Opus reviewer; see ~/.claude/agents/advisor.md. NEW SESSION REQUIRED after editing the advisor agent file — Claude Code loads agent definitions at session start. If `advisor` is unknown in the current session, restart before continuing the loop; do NOT fall back to `general-purpose` (loses both invariants: whitelist + bypassPermissions).
 4. REPRODUCE each blocker/high claim before fixing — advisors hallucinate
 5. FIX by severity, re-verify after each
 6. COMMIT the round (per-round granularity, not a batch)
@@ -31,7 +31,7 @@ Every round's prompt must contain:
 - **Seeded hypotheses:** your own doubts, phrased as "verify X"
 - **Format:** severity-ranked (BLOCKER / HIGH / MEDIUM / LOW), file:line citations
 - **Closer:** one-line verdict `SAFE TO SHIP` or `BLOCKS SHIPPING`
-- **Length cap:** ~500–800 words
+- **Length cap:** ≤500 words
 
 ## Reproduce Before Fixing
 
