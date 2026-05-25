@@ -9,6 +9,7 @@
     "allow": [
       "Glob",
       "Grep",
+      "Skill",
       "Read(/tmp/**)",
       "Read(/tmp/*)",
       "Read(/home/jonathan/Repos/nixos-config-worktrees/**)",
