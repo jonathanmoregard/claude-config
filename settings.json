@@ -11,6 +11,8 @@
       "Write",
       "Glob",
       "Grep",
+      "Read(/tmp/**)",
+      "Read(/home/jonathan/Repos/nixos-config-worktrees/**)",
       "mcp__research-agent__*",
       "mcp__safe-bash__*",
       "Write(/home/jonathan/.claude/homunculus/projects/ba55d347afb5/instincts/personal/**)",
