@@ -11,7 +11,9 @@
       "/home/jonathan/.claude/projects",
       "/home/jonathan/.claude/skills",
       "/tmp",
-      "/etc/nixos"
+      "/etc/nixos",
+      "/nix/store",
+      "/home/jonathan/worktrees"
     ],
     "allow": [
       "Glob",
@@ -20,14 +22,18 @@
       "Read(/tmp/**)",
       "Read(/home/jonathan/Repos/**)",
       "Read(/etc/nixos/**)",
+      "Read(/nix/store/**)",
+      "Read(/home/jonathan/worktrees/**)",
       "Edit(/tmp/**)",
       "Edit(/home/jonathan/Repos/nixos-config-worktrees/**)",
+      "Edit(/home/jonathan/worktrees/**)",
       "Edit(/home/jonathan/.claude/projects/**)",
       "Edit(/home/jonathan/.claude/skills/**)",
       "Edit(/home/jonathan/.claude/homunculus/**)",
       "Edit(/home/jonathan/.claude/loops/**)",
       "Write(/tmp/**)",
       "Write(/home/jonathan/Repos/nixos-config-worktrees/**)",
+      "Write(/home/jonathan/worktrees/**)",
       "Write(/home/jonathan/.claude/projects/**)",
       "Write(/home/jonathan/.claude/skills/**)",
       "Write(/home/jonathan/.claude/homunculus/**)",
@@ -126,7 +132,10 @@
       "Bash(*quarantine*)",
       "Edit(/etc/nixos/**)",
       "Write(/etc/nixos/**)",
-      "NotebookEdit(/etc/nixos/**)"
+      "NotebookEdit(/etc/nixos/**)",
+      "Edit(/nix/store/**)",
+      "Write(/nix/store/**)",
+      "NotebookEdit(/nix/store/**)"
     ]
   },
   "enableAllProjectMcpServers": false,
