@@ -105,3 +105,8 @@ scheduled_tasks.lock
 # Home-manager-managed skill symlinks (point into /nix/store)
 skills/nixos-config-dev
 skills/nixos-vm-test-gate
+skills/nixos-agent-testing
+skills/nixos-automated-testing
+
+# CI-stability monitoring runtime (per-PR logs + state)
+loops/
