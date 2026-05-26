@@ -8,7 +8,8 @@
   "permissions": {
     "additionalDirectories": [
       "/home/jonathan/Repos/nixos-config-worktrees",
-      "/home/jonathan/.claude",
+      "/home/jonathan/.claude/projects",
+      "/home/jonathan/.claude/skills",
       "/tmp"
     ],
     "allow": [
@@ -18,11 +19,8 @@
       "Read(/tmp/**)",
       "Read(/tmp/*)",
       "Read(/home/jonathan/Repos/**)",
-      "Read(/home/jonathan/Repos/**/*)",
       "Read(**/Repos/**)",
-      "Read(**/Repos/**/*)",
       "Read(**/nixos-config-worktrees/**)",
-      "Read(**/nixos-config-worktrees/**/*)",
       "Edit(/tmp/**)",
       "Edit(/tmp/*)",
       "Edit(/home/jonathan/Repos/nixos-config-worktrees/**)",
