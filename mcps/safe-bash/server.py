@@ -664,12 +664,17 @@ def _nixos_command_pushes(command: str) -> bool:
 
 
 def _nixos_git(worktree: str, args: list[str], timeout_s: float = 10.0) -> tuple[int, str, str]:
+    # Capture bytes, decode permissively. `text=True` raises UnicodeDecodeError
+    # on `git diff` output for commits that add/modify binary blobs (e.g. .age
+    # files), which would otherwise crash the whole gate before it can run.
     try:
         result = subprocess.run(
             ["git", "-C", worktree, *args],
-            capture_output=True, text=True, timeout=timeout_s,
+            capture_output=True, text=False, timeout=timeout_s,
         )
-        return result.returncode, result.stdout, result.stderr
+        stdout = result.stdout.decode("utf-8", errors="replace")
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        return result.returncode, stdout, stderr
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
         return -1, "", str(e)
 
