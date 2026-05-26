@@ -6,6 +6,11 @@
     "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1"
   },
   "permissions": {
+    "additionalDirectories": [
+      "/home/jonathan/Repos/nixos-config-worktrees",
+      "/home/jonathan/.claude",
+      "/tmp"
+    ],
     "allow": [
       "Glob",
       "Grep",
