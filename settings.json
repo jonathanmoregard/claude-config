@@ -10,7 +10,8 @@
       "/home/jonathan/Repos/nixos-config-worktrees",
       "/home/jonathan/.claude/projects",
       "/home/jonathan/.claude/skills",
-      "/tmp"
+      "/tmp",
+      "/etc/nixos"
     ],
     "allow": [
       "Glob",
@@ -18,6 +19,7 @@
       "Skill",
       "Read(/tmp/**)",
       "Read(/home/jonathan/Repos/**)",
+      "Read(/etc/nixos/**)",
       "Edit(/tmp/**)",
       "Edit(/home/jonathan/Repos/nixos-config-worktrees/**)",
       "Edit(/home/jonathan/.claude/projects/**)",
@@ -40,8 +42,6 @@
       "Read(**/.git/**)",
       "Edit(**/.git/**)",
       "Write(**/.git/**)",
-      "Edit(/home/jonathan/.claude/settings.json)",
-      "Write(/home/jonathan/.claude/settings.json)",
       "Edit(/home/jonathan/.claude/settings.local.json)",
       "Write(/home/jonathan/.claude/settings.local.json)",
       "Edit(/home/jonathan/.claude/hooks/**)",
