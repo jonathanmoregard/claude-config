@@ -1,20 +1,12 @@
 {
   "cleanupPeriodDays": 99999,
+  "skillListingBudgetFraction": 0.03,
   "env": {
     "DISABLE_TELEMETRY": "1",
     "DISABLE_ERROR_REPORTING": "1",
     "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1"
   },
   "permissions": {
-    "additionalDirectories": [
-      "/home/jonathan/Repos/nixos-config-worktrees",
-      "/home/jonathan/.claude/projects",
-      "/home/jonathan/.claude/skills",
-      "/tmp",
-      "/etc/nixos",
-      "/nix/store",
-      "/home/jonathan/worktrees"
-    ],
     "allow": [
       "Glob",
       "Grep",
@@ -83,9 +75,6 @@
       "Read(~/.pypirc)",
       "Read(~/.gem/credentials)",
       "Read(~/.config/todo/env)",
-      "Read(~/Dropbox/1. Exocortex/**)",
-      "Edit(~/Dropbox/1. Exocortex/**)",
-      "Write(~/Dropbox/1. Exocortex/**)",
       "Read(~/.local/share/keyrings/**)",
       "Read(~/.config/libsecret/**)",
       "Read(~/.local/share/kwalletd/**)",
@@ -136,8 +125,19 @@
       "Edit(/nix/store/**)",
       "Write(/nix/store/**)",
       "NotebookEdit(/nix/store/**)"
+    ],
+    "ask": [],
+    "additionalDirectories": [
+      "/home/jonathan/Repos/nixos-config-worktrees",
+      "/home/jonathan/.claude/projects",
+      "/home/jonathan/.claude/skills",
+      "/tmp",
+      "/etc/nixos",
+      "/nix/store",
+      "/home/jonathan/worktrees"
     ]
   },
+  "model": "claude-fable-5[1m]",
   "enableAllProjectMcpServers": false,
   "hooks": {
     "SessionStart": [
@@ -350,7 +350,6 @@
     "autoAllowBashIfSandboxed": true,
     "allowUnsandboxedCommands": false
   },
-  "skillListingBudgetFraction": 0.03,
   "effortLevel": "xhigh",
   "advisorModel": "opus",
   "voiceEnabled": false

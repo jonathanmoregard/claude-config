@@ -102,6 +102,9 @@ scheduled_tasks.lock
 # Cleanup timestamp (runtime)
 .last-cleanup
 
+# Auto-updater outcome stamp (runtime)
+.last-update-result.json
+
 # Home-manager-managed skill symlinks (point into /nix/store)
 skills/nixos-config-dev
 skills/nixos-vm-test-gate
