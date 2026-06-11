@@ -18,7 +18,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Optional, Tuple, Union
 
 from .._envfile import update as update_env_file
@@ -101,11 +101,16 @@ class TickTickBackend:
         Dates accepted as ``date`` or ``YYYYMMDD`` string (TickTick's format).
         Returns the raw OpenHabitCheckin list — each item has ``habitId`` and
         a ``checkins`` array.
+
+        TickTick's API treats ``to`` as exclusive, so we shift it by one day
+        to honor the inclusive range promised here (verified empirically:
+        from=to=today returns nothing, while to=tomorrow includes today).
         """
         if not habit_ids:
             return []
         f = from_date.strftime("%Y%m%d") if isinstance(from_date, date) else str(from_date)
-        t = to_date.strftime("%Y%m%d") if isinstance(to_date, date) else str(to_date)
+        t_date = to_date if isinstance(to_date, date) else datetime.strptime(str(to_date), "%Y%m%d").date()
+        t = (t_date + timedelta(days=1)).strftime("%Y%m%d")
         ids = ",".join(habit_ids)
         path = f"/habit/checkins?habitIds={ids}&from={f}&to={t}"
         resp = self._request("GET", path)
