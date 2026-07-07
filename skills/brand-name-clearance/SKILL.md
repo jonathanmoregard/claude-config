@@ -75,17 +75,18 @@ bash-only and calls the shims' internal helpers — if it breaks, check
 ```bash
 cd ~/Repos/research-agent && PRV_CACHE_DIR=~/.cache/prv python3 -c "
 import sys; sys.path.insert(0, 'agent/shims')
-import prv_shim
-print(prv_shim._tool_prv_search({'name': 'CANDIDATE', 'max_hits': 6}))"
-# bolagsverket_shim._tool_bolagsverket_search({'query': 'CANDIDATE'})  — note: query, not name
+import prv_shim, bolagsverket_shim
+print(prv_shim._tool_prv_search({'name': 'CANDIDATE', 'max_hits': 6}))
+print(bolagsverket_shim._tool_bolagsverket_search({'query': 'CANDIDATE'}))"
+# NB: prv takes 'name', bolagsverket takes 'query'
 ```
 
 **Screen the STEM too, not just the exact name** — stem hits killed
 JUBLAT (live JUBLA!) and VIMLAR (live VIMLA cl 9/35/38). Rules: live
-Registered mark in overlapping Nice classes (9/35/38/41/42 for SaaS) =
-strike; Expired/Refused = fine; Bolagsverket substring FTS hits = noise,
-only exact-name active companies matter. (Classes 9/35/38/41/42 fit
-SaaS — re-derive Nice classes for other product categories.)
+Registered mark in overlapping Nice classes (9/35/38/41/42 for SaaS —
+re-derive for other product categories) = strike; Expired/Refused =
+fine; Bolagsverket substring FTS hits = noise, only exact-name active
+companies matter.
 
 ### 3. Web collision sweep (research-agent, ~3 min, batch 4–6 names/call)
 
