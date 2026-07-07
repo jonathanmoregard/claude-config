@@ -65,6 +65,8 @@ One-off posts/campaigns in an already-established voice → use brand-voice / co
 ## Reference
 
 - Hargrave frameworks in depth (RCV trust ladder, pink spoon, hubs, Niching Spiral):
-  re-research marketingforhippies.com primary sources; don't run from memory.
+  re-research marketingforhippies.com primary sources via
+  `mcp__research-agent__research` (WebFetch is denied on this machine);
+  don't run from memory.
 - Worked end-to-end example (rant → locked brand + design spec):
   `~/Repos/kablong/docs/brand/klaffat-brand-workbook.md`

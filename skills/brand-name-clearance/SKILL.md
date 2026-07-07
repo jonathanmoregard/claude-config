@@ -53,19 +53,24 @@ Authoritative servers only — local resolvers lie:
 for n in cand1 cand2 ...; do
   c=$(dig @a.gtld-servers.net ${n}.com +norecurse +time=3 +tries=2 | grep -o 'status: [A-Z]*' | head -1 | awk '{print $2}')
   s=$(dig @a.ns.se ${n}.se +norecurse +time=3 +tries=2 | grep -o 'status: [A-Z]*' | head -1 | awk '{print $2}')
-  printf '%-16s com=%-10s se=%s\n' "$n" "$c" "$s"
+  printf '%-16s com=%-10s se=%s\n' "$n" "${c:-FAIL}" "${s:-FAIL}"
 done
 ```
 
-NXDOMAIN = available. ALWAYS include controls: google.com (NOERROR),
-a garbage string (NXDOMAIN), and a domain the user owns.
+NXDOMAIN = available; NOERROR = registered. **Anything else (FAIL /
+SERVFAIL / REFUSED) = re-run that name, never conclude from it.**
+ALWAYS include controls: google.com (NOERROR), a garbage string
+(NXDOMAIN), and a domain the user owns.
 
 ### 2. Swedish registers, locally (seconds — warm indexes)
 
 Both shims live in `~/Repos/research-agent/agent/shims/`; warm caches in
 `~/.cache/prv/marks.db` and `~/.cache/bolagsverket/orgs.db` (also seeded
-at `/var/lib/research-agent/tool-cache/` for in-VM use). PRV rebuilds if
-marks.db mtime > 7 days.
+at `/var/lib/research-agent/tool-cache/` for in-VM use) — **check the
+paths first**; if missing, the first call rebuilds (minutes, needs
+network). PRV rebuilds when marks.db mtime > 7 days. Snippet is
+bash-only and calls the shims' internal helpers — if it breaks, check
+`TOOL_IMPL` in the shim source.
 
 ```bash
 cd ~/Repos/research-agent && PRV_CACHE_DIR=~/.cache/prv python3 -c "
@@ -79,7 +84,8 @@ print(prv_shim._tool_prv_search({'name': 'CANDIDATE', 'max_hits': 6}))"
 JUBLAT (live JUBLA!) and VIMLAR (live VIMLA cl 9/35/38). Rules: live
 Registered mark in overlapping Nice classes (9/35/38/41/42 for SaaS) =
 strike; Expired/Refused = fine; Bolagsverket substring FTS hits = noise,
-only exact-name active companies matter.
+only exact-name active companies matter. (Classes 9/35/38/41/42 fit
+SaaS — re-derive Nice classes for other product categories.)
 
 ### 3. Web collision sweep (research-agent, ~3 min, batch 4–6 names/call)
 
