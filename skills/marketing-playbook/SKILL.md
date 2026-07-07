@@ -22,7 +22,7 @@ One-off posts/campaigns in an already-established voice → use brand-voice / co
 
 ## The protocol (in order, iteratively; ONE question per message)
 
-1. **Voice profile** — **REQUIRED SUB-SKILL:** Use brand-voice — from the founder's real writing
+1. **Voice profile** (REQUIRED SUB-SKILL: brand-voice) from the founder's real writing
    (blog, posts, emails). This is HOW the brand sounds; steps 2–5 supply WHAT it believes.
 2. **Industry rant** — ask: *"What BS in this industry are you sick of? What broke your
    heart about it?"* Want beer-honest first-person heat, not design-doc language.
