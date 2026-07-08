@@ -45,6 +45,17 @@ produces the content).
    only in prose) and re-run the linter on the batch.
 4. Commit doc updates (default; skip only if the user asked to peek first).
 
+## Linter engine note (decided 2026-07-08)
+
+The bundled `lint.py` is deliberately hand-rolled (~150 lines, stdlib-only): the
+config is the asset, the engine is swappable. Migrate to Vale (nixpkgs `vale`) when
+ANY tripwire hits: (1) linting whole markdown files rather than copy snippets
+(markup-aware scoping becomes load-bearing — lint.py false-positives on code blocks/
+URLs), (2) rule count grows past ~2 dozen or needs per-surface variation, (3) CI or
+editor integration wanted. Migration: port copy-rules.toml → Vale styles YAML, keep a
+small burstiness script alongside (Vale can't do sentence-stdev natively), update the
+lint command above.
+
 ## Never
 
 - Show a candidate with linter ERRORs, or lock copy without explicit approval.
