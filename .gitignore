@@ -110,6 +110,7 @@ skills/nixos-config-dev
 skills/nixos-vm-test-gate
 skills/nixos-agent-testing
 skills/nixos-automated-testing
+skills/nixos-agenix-secret
 
 # CI-stability monitoring runtime (per-PR logs + state)
 loops/
