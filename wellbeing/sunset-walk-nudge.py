@@ -90,11 +90,16 @@ def main() -> int:
 
     cloud = cache.get("cloud_cover_pct")
     sunset_hhmm = cache.get("sunset_hhmm", "")
-    cloud_str = f"{cloud}%" if cloud is not None else "low"
+    if cloud is not None:
+        weather_str = f"cloud cover {cloud}%, clear visibility"
+    else:
+        # Cache came from local sunset computation (tracker offline);
+        # weather was not verified, so don't claim it.
+        weather_str = "weather not verified (tracker offline)"
 
     print(
-        f"Sunset is at {sunset_hhmm} in the configured place — cloud cover {cloud_str}, "
-        f"clear visibility, walk window {window_start.strftime('%H:%M')}-"
+        f"Sunset is at {sunset_hhmm} in the configured place — {weather_str}, "
+        f"walk window {window_start.strftime('%H:%M')}-"
         f"{window_end.strftime('%H:%M')}. Gently nudge the user to step outside "
         "for the sunset light. This is a wellbeing nudge, not an order."
     )
