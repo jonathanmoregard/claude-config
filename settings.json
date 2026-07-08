@@ -134,7 +134,8 @@
       "/tmp",
       "/etc/nixos",
       "/nix/store",
-      "/home/jonathan/worktrees"
+      "/home/jonathan/worktrees",
+      "/home/jonathan/Repos/research-agent/reports"
     ]
   },
   "model": "claude-fable-5[1m]",
