@@ -45,6 +45,17 @@ produces the content).
    only in prose) and re-run the linter on the batch.
 4. Commit doc updates (default; skip only if the user asked to peek first).
 
+## Voice fidelity (when the goal is "sounds like the author", not just on-brand)
+
+Beyond the rule linter, a stylometric detector scores whether a draft sits inside the
+author's own statistical variation and emits targeted feedback:
+`python3 ~/.claude/skills/brand-copy/style-detector.py CORPUS DRAFT` (also `--json`,
+`--self-test`). Run the draft→score→fix→rescore loop per `adversarial-refine.md` in this
+dir; stop when the feedback list empties (don't chase a passed detector's noise). This is
+the locally-runnable stylometric SOTA; the neural/perplexity detector families (torch +
+models) are the documented optional next rung. `style-divergence.py` is the older, simpler
+scorer — prefer `style-detector.py`.
+
 ## Linter engine note (decided 2026-07-08)
 
 The bundled `lint.py` is deliberately hand-rolled (~150 lines, stdlib-only): the
