@@ -50,6 +50,10 @@ Explicit user instructions always override this.
 - **Use `mcp__safe-bash__exec`, not native Bash.** Native `Bash` is denied in settings. `safe-bash` enforces a combined deny-list (dcg destructive-pattern packs + `~/.claude/mcps/safe-bash/bash-config.json`) and wraps output from untrusted-ingress commands (`curl`, `wget`, `npx`, `gh pr view`, `gh api`, `git clone`, package installers) in `<untrusted_external_content>` tags.
 - **Tool schema mirrors native Bash:** same `command` / `timeout` / `description` params.
 
+## Autonomous build+review (default for substantial work)
+
+- For anything you'd branch for — features, migrations, redesigns, "build build build" sessions, multi-chunk reviews — invoke the `autonomous-orchestration` skill and follow it: orchestrate via fresh-context subagents, never implement inline. Not for trivial single-file edits or quick questions.
+
 ## Execution style
 
 - **Tasks that reliably need Opus:** infrastructure/VM setup (NixOS), complex multi-step debugging, branch surgery/git archaeology, and harness architecture decisions. If you're on Sonnet and the task fits these patterns, say so upfront.
