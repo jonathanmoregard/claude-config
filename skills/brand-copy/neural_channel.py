@@ -82,7 +82,15 @@ HF_SERVERLESS_URL = (
     "https://router.huggingface.co/hf-inference/models/"
     "StyleDistance/styledistance/pipeline/feature-extraction"
 )
-DEEPINFRA_COMPLETIONS_URL = "https://api.deepinfra.com/v1/openai/completions"
+# Provider is configurable so DeepInfra can be swapped for any OpenAI-compatible
+# completions endpoint that supports echo+logprobs (e.g. Fireworks:
+#   FASTDETECT_COMPLETIONS_URL=https://api.fireworks.ai/inference/v1/completions
+#   FASTDETECT_MODEL=accounts/fireworks/models/llama-v3p1-8b-instruct
+# Together: https://api.together.xyz/v1/completions ). Auth key still read from
+# DEEPINFRA_API_KEY (kept as the env name for wrapper compatibility).
+DEEPINFRA_COMPLETIONS_URL = os.environ.get(
+    "FASTDETECT_COMPLETIONS_URL", "https://api.deepinfra.com/v1/openai/completions"
+)
 DEFAULT_FASTDETECT_MODEL = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 
 
