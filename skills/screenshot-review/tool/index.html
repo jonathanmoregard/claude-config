@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Screenshot review</title>
+<link rel="icon" href="data:," />
+<style>
+  :root {
+    --bg: #14161a; --panel: #1c1f26; --ink: #e8e8ea; --muted: #8a8f99;
+    --line: #2a2e37; --accent: #6ea8fe;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--ink);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column; height: 100vh; overflow: hidden;
+  }
+
+  /* Top bar */
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 8px 12px; background: var(--panel); border-bottom: 1px solid var(--line);
+    flex: 0 0 auto;
+  }
+  header .name { font-weight: 600; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  header .count { color: var(--muted); font-variant-numeric: tabular-nums; }
+  header .spacer { flex: 1; }
+  button, label.btn {
+    background: #262a33; color: var(--ink); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 12px; cursor: pointer; font: inherit;
+  }
+  button:hover, label.btn:hover { border-color: var(--accent); }
+  button:disabled { opacity: .4; cursor: default; border-color: var(--line); }
+  .hint { color: var(--muted); font-size: 12px; }
+
+  /* Stage — scrollable so zoomed images can be panned */
+  .stage {
+    position: relative; flex: 1 1 auto; min-height: 0;
+    display: flex; align-items: flex-start; justify-content: center;
+    background: #0e0f12; overflow: auto;
+  }
+  .stage img { display: block; margin: auto; }
+  .stage .empty { color: var(--muted); text-align: center; padding: 24px; max-width: 46ch; margin: auto; }
+  .nav {
+    position: fixed; top: 50%; transform: translateY(-50%); z-index: 5;
+    width: 46px; height: 78px; font-size: 28px; line-height: 1;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(0,0,0,.45); border: none; color: #fff; border-radius: 8px;
+  }
+  .nav:hover { background: rgba(110,168,254,.5); }
+  .nav.prev { left: 10px; } .nav.next { right: 10px; }
+  .zoom { display: flex; align-items: center; gap: 4px; }
+  .zoom button { padding: 5px 9px; }
+  .zoom #zlabel { min-width: 44px; text-align: center; }
+
+  /* Editor */
+  .editor { flex: 0 0 auto; border-top: 1px solid var(--line); background: var(--panel); }
+  .editor .toolbar { display: flex; align-items: center; gap: 8px; padding: 6px 12px; }
+  textarea {
+    width: 100%; height: 30vh; resize: vertical; border: none; outline: none;
+    background: #101216; color: var(--ink); padding: 12px;
+    font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .saved { color: var(--muted); font-size: 12px; }
+  kbd {
+    background: #262a33; border: 1px solid var(--line); border-bottom-width: 2px;
+    border-radius: 4px; padding: 0 5px; font-size: 11px; font-family: ui-monospace, monospace;
+  }
+</style>
+</head>
+<body>
+  <header>
+    <label class="btn">Load folder…
+      <input id="picker" type="file" webkitdirectory multiple hidden />
+    </label>
+    <span id="name" class="name"></span>
+    <span id="count" class="count"></span>
+    <span class="spacer"></span>
+    <div class="zoom">
+      <button id="zfit" title="Fit whole image">Fit</button>
+      <button id="zwidth" title="Fit to width">Width</button>
+      <button id="zout" title="Zoom out">−</button>
+      <span id="zlabel" class="count">Width</span>
+      <button id="zin" title="Zoom in">+</button>
+    </div>
+    <span class="hint" style="margin-left:12px">Nav <kbd>Ctrl</kbd>+<kbd>←</kbd>/<kbd>→</kbd> · zoom <kbd>Ctrl</kbd>+scroll</span>
+  </header>
+
+  <div class="stage" id="stage">
+    <button class="nav prev" id="prev" title="Previous (Ctrl+←)" disabled>‹</button>
+    <div class="empty" id="empty">
+      Click <strong>Load folder…</strong> and choose a directory of screenshots
+      (e.g. <code>docs/brand/screenshots/major</code>).<br /><br />
+      Then: hold your dictation hotkey, describe the image, release, press <kbd>›</kbd> for the next.
+    </div>
+    <img id="img" alt="" hidden />
+    <button class="nav next" id="next" title="Next (Ctrl+→)" disabled>›</button>
+  </div>
+
+  <div class="editor">
+    <div class="toolbar">
+      <button id="copy">Copy all</button>
+      <button id="download">Download .md</button>
+      <button id="clear">Clear text</button>
+      <span class="spacer" style="flex:1"></span>
+      <span class="saved" id="saved"></span>
+    </div>
+    <textarea id="notes" placeholder="Your feedback for the current image goes here (voice or type). Headings are inserted automatically as you navigate." spellcheck="true"></textarea>
+  </div>
+
+<script>
+(() => {
+  const IMG_RE = /\.(png|jpe?g|gif|webp|avif|svg|bmp)$/i;
+  const $ = (id) => document.getElementById(id);
+  const picker = $('picker'), img = $('img'), empty = $('empty'), stage = $('stage');
+  const nameEl = $('name'), countEl = $('count'), notes = $('notes'), savedEl = $('saved');
+  const prevBtn = $('prev'), nextBtn = $('next'), zlabel = $('zlabel');
+
+  let files = [];          // [{ path, url }]
+  let idx = -1;
+  let folderKey = '';      // localStorage key for this folder's transcript
+  const headed = new Set(); // paths that already have a heading in the transcript
+
+  // Natural sort so admin-2 < admin-10.
+  const natCompare = (a, b) =>
+    a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
+
+  // Shared: install a list of { path, url } and start reviewing.
+  function mount(list, key) {
+    files.forEach((f) => f.revoke && URL.revokeObjectURL(f.url)); // free only object URLs
+    files = list;
+    folderKey = key;
+    notes.value = localStorage.getItem(folderKey) || '';
+    headed.clear();
+    // Re-derive which images already have a heading (so reloads don't duplicate).
+    for (const f of files) if (notes.value.includes(headingFor(f.path))) headed.add(f.path);
+    empty.hidden = true; img.hidden = false;
+    go(0);
+  }
+
+  // Manual pick (works everywhere, incl. file://).
+  picker.addEventListener('change', () => {
+    const picked = [...picker.files]
+      .filter((f) => IMG_RE.test(f.name))
+      .map((f) => ({ path: f.webkitRelativePath || f.name, file: f }))
+      .sort((a, b) => natCompare(a.path, b.path));
+    if (!picked.length) { alert('No image files found in that folder.'); return; }
+    const list = picked.map((p) => ({
+      path: p.path, url: URL.createObjectURL(p.file), revoke: true,
+    }));
+    // One transcript per top-level folder name, remembered across reloads.
+    mount(list, 'shotreview:' + (list[0].path.split('/')[0] || 'folder'));
+  });
+
+  // Auto-load when served over http with ?dir=<path> (the dir must contain a
+  // manifest.json = a JSON array of image filenames). Heading = parentDir/filename.
+  async function loadFromManifest(dir) {
+    const base = dir.replace(/\/+$/, '');
+    const res = await fetch(base + '/manifest.json', { cache: 'no-store' });
+    if (!res.ok) throw new Error('manifest.json ' + res.status);
+    const names = (await res.json()).filter((n) => IMG_RE.test(n)).sort(natCompare);
+    if (!names.length) throw new Error('manifest lists no images');
+    const parent = base.split('/').filter(Boolean).pop() || 'folder';
+    const list = names.map((n) => ({ path: parent + '/' + n, url: base + '/' + n }));
+    mount(list, 'shotreview:' + parent);
+  }
+
+  const autoDir = new URLSearchParams(location.search).get('dir');
+  if (autoDir) {
+    loadFromManifest(autoDir).catch((e) => {
+      empty.innerHTML = 'Could not auto-load <code>' + autoDir + '</code> (' + e.message +
+        '). Click <strong>Load folder…</strong> to pick it manually.';
+    });
+  }
+
+  const headingFor = (path) => '## ' + path;
+
+  function go(n) {
+    if (!files.length) return;
+    idx = Math.max(0, Math.min(files.length - 1, n));
+    const f = files[idx];
+    img.src = f.url; img.alt = f.path;
+    nameEl.textContent = f.path;
+    countEl.textContent = `${idx + 1} / ${files.length}`;
+    prevBtn.disabled = idx === 0;
+    nextBtn.disabled = idx === files.length - 1;
+    stage.scrollTop = 0; stage.scrollLeft = 0; applyZoom(); // keep the chosen zoom, scroll to top
+    ensureHeading(f.path);
+    focusSection(f.path);      // put the cursor at the end of THIS image's section
+  }
+
+  // ---- zoom / scroll ----
+  // 'fit' = whole image visible; 'width' = fill the stage width (scroll down);
+  // number = scale factor of the image's natural pixels.
+  let zoom = 'width';
+  const clamp = (v) => Math.min(8, Math.max(0.1, v));
+  const currentScale = () => (img.naturalWidth ? img.clientWidth / img.naturalWidth : 1);
+
+  function applyZoom() {
+    if (zoom === 'fit') {
+      stage.style.alignItems = 'center';
+      Object.assign(img.style, { maxWidth: '100%', maxHeight: '100%', width: 'auto', height: 'auto' });
+      zlabel.textContent = 'Fit';
+    } else if (zoom === 'width') {
+      stage.style.alignItems = 'flex-start';
+      Object.assign(img.style, { maxWidth: 'none', maxHeight: 'none', width: stage.clientWidth + 'px', height: 'auto' });
+      zlabel.textContent = 'Width';
+    } else {
+      stage.style.alignItems = 'flex-start';
+      const w = (img.naturalWidth || stage.clientWidth) * zoom;
+      Object.assign(img.style, { maxWidth: 'none', maxHeight: 'none', width: w + 'px', height: 'auto' });
+      zlabel.textContent = Math.round(zoom * 100) + '%';
+    }
+  }
+  const setZoom = (z) => { zoom = z; applyZoom(); };
+
+  img.addEventListener('load', applyZoom);        // natural size known → numeric zoom is exact
+  window.addEventListener('resize', () => { if (zoom === 'width') applyZoom(); });
+
+  // Keep focus in the notes box so dictation isn't interrupted by zooming.
+  for (const id of ['zfit', 'zwidth', 'zout', 'zin'])
+    $(id).addEventListener('mousedown', (e) => e.preventDefault());
+  $('zfit').addEventListener('click', () => setZoom('fit'));
+  $('zwidth').addEventListener('click', () => setZoom('width'));
+  $('zin').addEventListener('click', () => setZoom(clamp(currentScale() * 1.25)));
+  $('zout').addEventListener('click', () => setZoom(clamp(currentScale() / 1.25)));
+  stage.addEventListener('wheel', (e) => {
+    if (!e.ctrlKey) return;                        // plain wheel = native scroll/pan
+    e.preventDefault();
+    setZoom(clamp(currentScale() * (e.deltaY < 0 ? 1.15 : 1 / 1.15)));
+  }, { passive: false });
+
+  // Insert a heading for an image the first time it's shown (in visit order).
+  function ensureHeading(path) {
+    if (headed.has(path)) return;
+    const h = headingFor(path);
+    let v = notes.value;
+    if (v && !v.endsWith('\n\n')) v += v.endsWith('\n') ? '\n' : '\n\n';
+    v += h + '\n';
+    notes.value = v;
+    headed.add(path);
+    save();
+  }
+
+  // Move the caret to the end of the section under `path`'s heading, and focus,
+  // so dictation/typing always lands under the image you're looking at — even
+  // when you arrow back to an earlier one.
+  function focusSection(path) {
+    const v = notes.value;
+    const h = headingFor(path);
+    const start = v.indexOf(h);
+    let caret = v.length;
+    if (start !== -1) {
+      const afterHeading = start + h.length;
+      const nextH = v.indexOf('\n## ', afterHeading);
+      caret = nextH === -1 ? v.length : nextH; // end of this section
+    }
+    notes.focus();
+    notes.setSelectionRange(caret, caret);
+    // Keep the caret line in view within the textarea.
+    notes.blur(); notes.focus();
+    notes.setSelectionRange(caret, caret);
+  }
+
+  // ---- persistence ----
+  let saveTimer = null;
+  function save() {
+    if (!folderKey) return;
+    localStorage.setItem(folderKey, notes.value);
+    savedEl.textContent = 'saved ' + new Date().toLocaleTimeString();
+  }
+  notes.addEventListener('input', () => {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(save, 250);
+  });
+
+  // ---- navigation ----
+  prevBtn.addEventListener('mousedown', (e) => e.preventDefault()); // don't steal focus
+  nextBtn.addEventListener('mousedown', (e) => e.preventDefault());
+  prevBtn.addEventListener('click', () => go(idx - 1));
+  nextBtn.addEventListener('click', () => go(idx + 1));
+
+  document.addEventListener('keydown', (e) => {
+    if (!files.length) return;
+    // Ctrl/Meta+Arrows navigate, so plain arrows still edit text normally.
+    if ((e.ctrlKey || e.metaKey) && e.key === 'ArrowRight') { e.preventDefault(); go(idx + 1); }
+    if ((e.ctrlKey || e.metaKey) && e.key === 'ArrowLeft')  { e.preventDefault(); go(idx - 1); }
+  });
+
+  // ---- toolbar ----
+  $('copy').addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText(notes.value); flash($('copy'), 'Copied'); }
+    catch { notes.select(); document.execCommand('copy'); flash($('copy'), 'Copied'); }
+  });
+  $('download').addEventListener('click', () => {
+    const blob = new Blob([notes.value], { type: 'text/markdown' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = (folderKey.replace('shotreview:', '') || 'screenshot') + '-feedback.md';
+    a.click(); URL.revokeObjectURL(a.href);
+  });
+  $('clear').addEventListener('click', () => {
+    if (!confirm('Clear all feedback text for this folder?')) return;
+    notes.value = ''; headed.clear(); save();
+    if (files[idx]) go(idx); // re-seed the current heading
+  });
+
+  function flash(btn, label) {
+    const old = btn.textContent; btn.textContent = label;
+    setTimeout(() => (btn.textContent = old), 1000);
+  }
+})();
+</script>
+</body>
+</html>
