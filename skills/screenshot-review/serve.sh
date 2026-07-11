@@ -15,11 +15,20 @@ NAME="$(basename "$DIR")"
 STATE="${XDG_CACHE_HOME:-$HOME/.cache}/screenshot-review"
 mkdir -p "$STATE"
 
-# Stop any previous instance (server + its staging dir), free the port.
+# Free a TCP port robustly — fuser may be absent, so fall back to ss.
+free_port() {
+  local port="$1" pids
+  command -v fuser >/dev/null 2>&1 && fuser -k "${port}/tcp" 2>/dev/null || true
+  pids="$(ss -ltnpH 2>/dev/null | awk -v port="$port" '$4 ~ ":"port"$"' \
+          | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)"
+  [ -n "$pids" ] && kill $pids 2>/dev/null || true
+}
+
+# Stop any previous instance (server + its staging dir), then free the port.
 [ -f "$STATE/pid" ] && kill "$(cat "$STATE/pid")" 2>/dev/null || true
-fuser -k "$PORT/tcp" 2>/dev/null || true
+free_port "$PORT"
 [ -f "$STATE/root" ] && rm -rf "$(cat "$STATE/root")" 2>/dev/null || true
-sleep 0.3
+sleep 0.5
 
 # Stage a serve-root of symlinks (no copying; your folder is left untouched).
 ROOT="$(mktemp -d)"
