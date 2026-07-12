@@ -20,7 +20,7 @@ free_port() {
   local port="$1" pids
   command -v fuser >/dev/null 2>&1 && fuser -k "${port}/tcp" 2>/dev/null || true
   pids="$(ss -ltnpH 2>/dev/null | awk -v port="$port" '$4 ~ ":"port"$"' \
-          | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)"
+          | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u || true)"
   [ -n "$pids" ] && kill $pids 2>/dev/null || true
 }
 
