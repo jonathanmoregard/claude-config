@@ -284,9 +284,18 @@
 
   document.addEventListener('keydown', (e) => {
     if (!files.length) return;
-    // Ctrl/Meta+Arrows navigate, so plain arrows still edit text normally.
-    if ((e.ctrlKey || e.metaKey) && e.key === 'ArrowRight') { e.preventDefault(); go(idx + 1); }
-    if ((e.ctrlKey || e.metaKey) && e.key === 'ArrowLeft')  { e.preventDefault(); go(idx - 1); }
+    // Ctrl/Meta+Left/Right navigate between images.
+    if ((e.ctrlKey || e.metaKey) && e.key === 'ArrowRight') { e.preventDefault(); go(idx + 1); return; }
+    if ((e.ctrlKey || e.metaKey) && e.key === 'ArrowLeft')  { e.preventDefault(); go(idx - 1); return; }
+    // Plain Up/Down (and PageUp/Down) scroll the current image. Dictation types via
+    // the OS, not the arrow keys, so repurposing them for scrolling is safe.
+    if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+      const step = stage.clientHeight * 0.85;
+      if (e.key === 'ArrowDown')  { e.preventDefault(); stage.scrollBy({ top: 120 }); }
+      if (e.key === 'ArrowUp')    { e.preventDefault(); stage.scrollBy({ top: -120 }); }
+      if (e.key === 'PageDown')   { e.preventDefault(); stage.scrollBy({ top: step }); }
+      if (e.key === 'PageUp')     { e.preventDefault(); stage.scrollBy({ top: -step }); }
+    }
   });
 
   // ---- toolbar ----
