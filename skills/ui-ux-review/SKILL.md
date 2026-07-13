@@ -24,8 +24,11 @@ change; never assume a CSS/template edit produced the intended look.
    time with per-image feedback capture (voice or typed).
 3. **User reviews → returns a markdown doc** whose `## <folder>/<file>.png` headings
    delimit one section per image, feedback beneath each.
-4. **Apply per-screen fixes.** For each heading with notes: map the filename to the
-   surface behind it (template/component + CSS/handler), make the change, keep the
+4. **Apply per-screen fixes.** REQUIRED SUB-SKILL: use **integrating-feedback** —
+   ledger EVERY item (atomize compound ones, tag `must-fix`/`question`/`discussion`,
+   never implement `question`/`discussion`), and close no item until it's verified
+   against the regenerated screenshot. For each heading with notes: map the filename to
+   the surface behind it (template/component + CSS/handler), make the change, keep the
    project's gate green. Group shared changes (a token/component touched by many
    screens) so you fix once.
 5. **Re-render + verify.** Re-run the screenshot spec for the changed surfaces (or the
