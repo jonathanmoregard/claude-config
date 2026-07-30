@@ -23,13 +23,6 @@
       "Edit(/home/jonathan/.claude/skills/**)",
       "Edit(/home/jonathan/.claude/homunculus/**)",
       "Edit(/home/jonathan/.claude/loops/**)",
-      "Write(/tmp/**)",
-      "Write(/home/jonathan/Repos/nixos-config-worktrees/**)",
-      "Write(/home/jonathan/worktrees/**)",
-      "Write(/home/jonathan/.claude/projects/**)",
-      "Write(/home/jonathan/.claude/skills/**)",
-      "Write(/home/jonathan/.claude/homunculus/**)",
-      "Write(/home/jonathan/.claude/loops/**)",
       "mcp__research-agent__*",
       "mcp__safe-bash__*"
     ],
@@ -39,19 +32,13 @@
       "Bash",
       "Read(**/.git/**)",
       "Edit(**/.git/**)",
-      "Write(**/.git/**)",
       "Edit(/home/jonathan/.claude/settings.local.json)",
-      "Write(/home/jonathan/.claude/settings.local.json)",
       "Edit(/home/jonathan/.claude/hooks/**)",
-      "Write(/home/jonathan/.claude/hooks/**)",
       "Edit(/home/jonathan/.claude/mcps/**)",
-      "Write(/home/jonathan/.claude/mcps/**)",
       "Read(/home/jonathan/Repos/research-agent/.env)",
       "Read(/home/jonathan/Repos/research-agent/.env.*)",
       "Edit(~/.bashrc)",
-      "Write(~/.bashrc)",
       "Edit(~/.zshrc)",
-      "Write(~/.zshrc)",
       "Edit(~/.ssh/**)",
       "Read(~/.ssh/**)",
       "Read(~/.gnupg/**)",
@@ -60,13 +47,9 @@
       "Read(~/.config/gh/**)",
       "Read(~/.config/github-app/**)",
       "Edit(~/.config/github-app/**)",
-      "Write(~/.config/github-app/**)",
-      "Glob(~/.config/github-app/**)",
       "Grep(~/.config/github-app/**)",
       "Read(~/.config/claude-sandbox/**)",
       "Edit(~/.config/claude-sandbox/**)",
-      "Write(~/.config/claude-sandbox/**)",
-      "Glob(~/.config/claude-sandbox/**)",
       "Grep(~/.config/claude-sandbox/**)",
       "Read(~/.git-credentials)",
       "Read(~/.docker/config.json)",
@@ -110,21 +93,20 @@
       "Read(**/quarantine)",
       "Edit(**/quarantine/**)",
       "Edit(**/quarantine)",
-      "Write(**/quarantine/**)",
-      "Write(**/quarantine)",
-      "NotebookEdit(**/quarantine/**)",
-      "NotebookEdit(**/quarantine)",
       "Grep(**/quarantine/**)",
       "Grep(**/quarantine)",
-      "Glob(**/quarantine/**)",
-      "Glob(**/quarantine)",
       "Bash(*quarantine*)",
+      "Read(**/_quarantine/**)",
+      "Read(**/_quarantine)",
+      "Edit(**/_quarantine/**)",
+      "Edit(**/_quarantine)",
+      "Grep(**/_quarantine/**)",
+      "Grep(**/_quarantine)",
+      "mcp__futuresearch__futuresearch_results",
+      "mcp__futuresearch__futuresearch_progress",
+      "mcp__futuresearch__futuresearch_status",
       "Edit(/etc/nixos/**)",
-      "Write(/etc/nixos/**)",
-      "NotebookEdit(/etc/nixos/**)",
-      "Edit(/nix/store/**)",
-      "Write(/nix/store/**)",
-      "NotebookEdit(/nix/store/**)"
+      "Edit(/nix/store/**)"
     ],
     "ask": [],
     "additionalDirectories": [
@@ -138,7 +120,7 @@
       "/home/jonathan/Repos/research-agent/reports"
     ]
   },
-  "model": "claude-fable-5[1m]",
+  "model": "opus[1m]",
   "enableAllProjectMcpServers": false,
   "hooks": {
     "SessionStart": [
@@ -190,10 +172,6 @@
       {
         "matcher": "",
         "hooks": [
-          {
-            "type": "command",
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; $HOME/.claude/opus-warn.sh"
-          },
           {
             "type": "command",
             "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/context-baggage.py"
