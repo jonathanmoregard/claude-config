@@ -1,0 +1,28 @@
+# Voice-neutral anti-AI-slop rules — the zero-config baseline for the copywriting skill.
+# Consumed by ~/.claude/skills/brand-copy/lint.py (same schema as any copy-rules.toml).
+# Used when the user picks "no voice, just don't sound like AI".
+
+[errors]
+banned_phrases = [
+  # AI-tell hedges, openers, closers
+  "it's worth noting", "it is worth noting", "that said,", "ultimately,",
+  "the key takeaway", "in conclusion,", "in today's fast-paced",
+  # slop vocabulary
+  "delve into", "tapestry", "testament to", "elevate your", "unlock the",
+  "seamless", "game-changing", "revolutionize", "supercharge", "10x",
+  # thought-leader register
+  "excited to share", "no fluff", "thought leader", "let that sink in",
+]
+
+[errors.em_dash]
+# Em dashes read as an AI tell in 2026. Parens or colons cover the same need.
+ban_em_dash = true
+allow_en_dash_between_digits = true
+
+[warnings]
+not_x_but_y = "\\bnot\\s+(?:just\\s+)?\\w[^.!?]{0,40}?\\b(?:but|it[’']s)\\b"
+tricolon = "\\b\\w+,\\s+\\w+,?\\s+(?:and|or)\\s+\\w+[.!]"
+
+[warnings.burstiness]
+min_sentences = 10
+min_stdev_words = 4.0

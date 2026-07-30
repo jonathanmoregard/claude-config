@@ -229,6 +229,9 @@ def http_post_json(
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST")
     req.add_header("Content-Type", "application/json")
+    # Default UA; providers behind Cloudflare 403 the "Python-urllib" default
+    # (error 1010) before auth. Per-call headers can override.
+    req.add_header("User-Agent", "klaffat-style-detector/1.0")
     for key, value in headers.items():
         req.add_header(key, value)
     try:
@@ -425,7 +428,13 @@ def score_style(draft: str) -> dict:
 # --------------------------------------------------------------------------- #
 
 def deepinfra_headers(key: str) -> dict:
-    return {"Authorization": f"Bearer {key}"}
+    # Explicit User-Agent: some providers (Fireworks/Cloudflare) 403 the default
+    # "Python-urllib" UA at the WAF (Cloudflare error 1010) before auth.
+    return {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "User-Agent": "klaffat-style-detector/1.0",
+    }
 
 
 def _parse_completion_logprobs(body: str) -> tuple[list[float], list[dict]]:

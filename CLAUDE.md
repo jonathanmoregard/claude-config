@@ -69,7 +69,7 @@ Explicit user instructions always override this.
 ## Web access
 
 - **Default: you have no web access.** `WebFetch`, `WebSearch`, `curl`, `wget` are all denied. Do not work around this (no HTTP clients via Python, node, etc. — treat those as denied too).
-- **Preferred path: `mcp__research-agent__research(prompt, depth)`.** It runs inside an isolated dev container, scans its output for injections, and returns a sandboxed, citation-ready report. Use for ANY look-up of external information beyond the user's workspace.
+- **Preferred path: `mcp__research-agent__research(prompt, depth, model?)`.** It runs inside an isolated dev container, scans its output for injections, and returns a sandboxed, citation-ready report. Use for ANY look-up of external information beyond the user's workspace. Default model is the strongest current tier (claude-fable-5); pass `model` to override per call (normal/deep only — the fast path has no agent).
 - **Depth has a real latency cost — pick deliberately:**
 
   | depth | typical wall time | when to use |
@@ -84,9 +84,3 @@ Explicit user instructions always override this.
 ## Git worktrees
 
 - Place new worktrees under `~/worktrees/<repo>-<branch>/`. Don't nest in repo, don't scatter under `~/Repos/`.
-
-## Ghostty integration
-
-- **"Open X" or "open X in Ghostty"** = use `mcp__ghostty__open_claude_session`. First call `mcp__ghostty__find_project` to resolve the name to a path, then pass that path to `open_claude_session`.
-- Projects live under: `~/`, `~/projects`, `~/src`, `~/code`, `~/dev`, `~/repos`. The `find_project` tool searches these automatically.
-- If multiple matches, pick the closest name match and proceed — don't ask unless truly ambiguous.

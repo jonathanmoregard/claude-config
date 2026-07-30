@@ -1,0 +1,22 @@
+# Voice: Jonathan's personal blog (Honest Living)
+description = "Personal blog voice (Honest Living) — essays, blurbs, announcements"
+craft = "~/Dropbox/Blogg/docs/brand/writing-craft.md"  # read before drafting substance
+
+[local]
+corpus = "~/Dropbox/Blogg/extract/honest_living_archive.md"
+voice_config = "~/Dropbox/Blogg/docs/brand/voice-config.md"
+copy_rules = "~/Dropbox/Blogg/docs/brand/copy-rules.toml"
+
+[neural]
+endpoint = "https://jonathanmoregard--voice-lora-serve.modal.run"
+model = "voice"
+# neural_channel.py scoring needs these (keys stay in agenix, decrypted per-run).
+# DEEPINFRA_API_KEY is the legacy var name neural_channel.py reads — it carries the
+# FIREWORKS key (provider moved, var name didn't). Not a mix-up.
+score_env = """
+cd ~/Repos/nixos-config-worktrees/blog-style-neural
+export DEEPINFRA_API_KEY=$(nix run nixpkgs#rage -- -d -i ~/.ssh/id_ed25519 secrets/fireworks-api-key.age)
+export HF_TOKEN=$(nix run nixpkgs#rage -- -d -i ~/.ssh/id_ed25519 secrets/hf-token.age)
+export FASTDETECT_COMPLETIONS_URL=https://api.fireworks.ai/inference/v1/completions
+export FASTDETECT_MODEL=accounts/fireworks/models/gpt-oss-20b
+"""

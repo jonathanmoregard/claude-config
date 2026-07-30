@@ -1,6 +1,6 @@
 ---
 name: forecasting-with-futuresearch
-description: Use when forecasting future events, probabilities, dates, or outcomes with the futuresearch MCP tools — submitting forecast/rank/classify/agent jobs, polling them, or retrieving their results/rationale.
+description: Use when forecasting future events, probabilities, dates, or outcomes with the futuresearch MCP tools — submitting forecast/rank/classify/agent jobs, polling them, or retrieving their results/rationale. NOT for general web research, fact look-ups, or market/landscape surveys — those go through mcp__research-agent__research ONLY, even when that tool appears disconnected; never substitute futuresearch for it.
 ---
 
 # Forecasting with FutureSearch
@@ -8,6 +8,20 @@ description: Use when forecasting future events, probabilities, dates, or outcom
 ## Overview
 
 FutureSearch turns questions into calibrated probabilities/distributions via autonomous web-research agents (#1/150 on Metaculus FutureEval). Async: submit → poll → retrieve. **Results retrieval goes through the gate, never raw.**
+
+## Scope boundary (check BEFORE submitting anything)
+
+FutureSearch is for **forecasting and dataset ops** (forecast/rank/classify/dedupe/merge, and agent/multi_agent ONLY to build inputs for those). It is **not a general web-research tool**, even though its server instructions advertise "web research agents".
+
+General web research — fact look-ups, landscape/market surveys, "what's out there", competitive snapshots — goes through `mcp__research-agent__research` and nothing else (CLAUDE.md Web access rule).
+
+**If `mcp__research-agent__research` is not connected in this session, that is an outage, not permission to fall back.** Do NOT substitute futuresearch (or any other web-capable MCP). Instead: try to restore it (check the MCP config, ask the user to run `/mcp`), run it out-of-band (e.g. a one-shot `claude -p` with the research-agent `--mcp-config`, as sota-watch's runner does), or log the blocker and continue other work.
+
+Red-flag rationalizations — any of these means STOP, you are about to misuse futuresearch:
+- "research-agent isn't connected, so I'll use futuresearch instead"
+- "the futuresearch server says it does open-ended web research"
+- "the results are injection-scanned via the gate, so it's safe enough"
+- "it's only one call and the user is waiting"
 
 ## The gate rule (security-critical)
 
@@ -48,6 +62,7 @@ Rationale text is synthesized from web pages FutureSearch crawled — indirect p
 
 | Mistake | Fix |
 |---|---|
+| Using futuresearch agent/multi_agent for general web research because research-agent is disconnected | Never substitute — restore research-agent, run it out-of-band, or log the blocker (see Scope boundary) |
 | Polling via raw `futuresearch_progress`/`status` (denied) | Use gate `task_progress` |
 | "Factor in that I think it's likely" baked into question/context | Present the user's prior separately from the model's independent estimate |
 | Steering: "consider SMHI data / check X" in background | Delete it — state only facts the web can't provide |
