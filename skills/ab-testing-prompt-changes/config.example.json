@@ -1,0 +1,53 @@
+{
+  "_comment": "Copy to your experiment dir as config.json and edit. Paths are relative to this file unless absolute.",
+
+  "repo": "/home/jonathan/Repos/gdocs-review-mcp",
+  "pinned_sha": "d5723a735a7ffb76d2264be87fe513d2f338e7c3",
+  "_pinned_sha_comment": "The commit BEFORE the fix, and before anyone recorded the answer. Verify with `git log --format='%H %ad %s'` around the fix commit.",
+
+  "worktree_root": "/home/jonathan/worktrees",
+  "worktree_prefix": "skillab",
+
+  "skill_name": "advice-refine-test-loop",
+  "arms": {
+    "a": "arms/arm_a_SKILL.md",
+    "b": "arms/arm_b_SKILL.md"
+  },
+  "_arms_comment": "arm_a is the CURRENT text, copied verbatim (md5-check it against the installed file). arm_b is arm_a plus EXACTLY ONE surgical change. Never edit the installed skill.",
+
+  "task_prompt": "task_prompt.md",
+  "prereg": "PREREGISTRATION.md",
+  "grader_rubric": "grader_rubric.txt",
+  "_grader_rubric_comment": "Criteria ONLY. No hypothesis, no arm names, no expected direction.",
+
+  "n_per_arm": 6,
+  "_n_comment": "n=6/arm detects only huge effects. Say so in RESULTS.md. n=25-36/arm is where a 30-40pp swing becomes detectable.",
+
+  "model": "sonnet",
+  "max_budget_usd": 1.5,
+  "_budget_comment": "MEASURE with `ab_harness.py probe`, at least TWICE, then cap at 3-4x the WORST probe with a floor of ~$1 and never below the most expensive run this rig has produced. Do not double a single probe: an observed $0.2559 probe (3 turns) implies $0.51, while runs on that same rig had reached $1.29 over 35 turns, and the exploratory runs a low cap truncates are exactly the ones most likely to differ between arms. The first turn alone can cost $0.20+ in cache-write on the system prompt; a cap set by intuition voids most runs as INCONCLUSIVE and buys zero data (a guessed $0.75 cap would have voided 9 of 12 runs in the reference experiment).",
+
+  "concurrency": 4,
+  "wall_timeout_s": 900,
+  "allowed_tools": ["Read", "Grep", "Glob"],
+  "_tools_comment": "Read-only by construction keeps the pinned worktree clean and makes the final message the whole deliverable. Everything else is denied, including Skill and Bash.",
+
+  "grader_model": "sonnet",
+  "grader_max_budget_usd": 0.4,
+  "keywords": ["_echo_suggestion", "_KEPT_FIELDS", "suggestion_ledger"],
+  "_keywords_comment": "Fingerprint-free mechanical cross-check on the primary outcome. Disagreements with the LLM grader get reported, not silently resolved.",
+
+  "seed": 20260731,
+
+  "contamination": {
+    "must_be_present": ["_echo_suggestion", "_KEPT_FIELDS"],
+    "_must_be_present_comment": "Proves the bug really is in the pinned tree.",
+    "must_be_absent": [
+      "echo.{0,80}(segment|tab_id|address)",
+      "not an address|whole address|index without"
+    ],
+    "_must_be_absent_comment": "Proves nobody recorded the ANSWER in the tree. Sweep .py, .md, tests, comments, plan docs. If the answer is discoverable in-tree, the experiment is worthless.",
+    "later_shas": ["6e554de"],
+    "_later_shas_comment": "Commits/artifacts that record the later discovery. `git merge-base --is-ancestor <later> <pin>` must FAIL for each."
+  }
+}

@@ -32,7 +32,19 @@
       "Bash(echo BLOCKED_TEST_ESCAPED\\*)",
       "Bash(BLOCKED_TEST_SUBCMD*)",
       "Bash(*quarantine*)",
-      "Bash(*/run/agenix/*)"
+      "Bash(*/run/agenix/*)",
+      "Bash(*docs.googleapis.com*)",
+      "Bash(*www.googleapis.com/drive*)",
+      "Bash(*discovery/v1/apis/docs*)",
+      "Bash(*googleapiclient*)",
+      "Bash(*from googleapiclient*)",
+      "Bash(*build(\"docs\"*)",
+      "Bash(*build('docs'*)",
+      "Bash(*build(\"drive\"*)",
+      "Bash(*build('drive'*)",
+      "Bash(*documents().batchUpdate*)",
+      "Bash(*documents().get*)",
+      "Bash(*documents().create*)"
     ]
   },
   "untrusted_ingress_single": {
@@ -41,24 +53,145 @@
     "npx": "npx"
   },
   "untrusted_ingress_multi": [
-    {"prefix": ["gh", "pr", "view"], "label": "gh-fetch"},
-    {"prefix": ["gh", "pr", "diff"], "label": "gh-fetch"},
-    {"prefix": ["gh", "pr", "comment"], "label": "gh-fetch"},
-    {"prefix": ["gh", "pr", "list"], "label": "gh-fetch"},
-    {"prefix": ["gh", "issue", "view"], "label": "gh-fetch"},
-    {"prefix": ["gh", "issue", "comment"], "label": "gh-fetch"},
-    {"prefix": ["gh", "issue", "list"], "label": "gh-fetch"},
-    {"prefix": ["gh", "api"], "label": "gh-api"},
-    {"prefix": ["git", "clone"], "label": "git-clone"},
-    {"prefix": ["pip", "install"], "label": "pip-install"},
-    {"prefix": ["pip3", "install"], "label": "pip-install"},
-    {"prefix": ["npm", "install"], "label": "npm-install"},
-    {"prefix": ["npm", "i"], "label": "npm-install"},
-    {"prefix": ["npm", "ci"], "label": "npm-install"},
-    {"prefix": ["cargo", "install"], "label": "cargo-install"},
-    {"prefix": ["gem", "install"], "label": "gem-install"},
-    {"prefix": ["go", "install"], "label": "go-fetch"},
-    {"prefix": ["go", "get"], "label": "go-fetch"},
-    {"prefix": ["bundle", "install"], "label": "bundle-install"}
+    {
+      "prefix": [
+        "gh",
+        "pr",
+        "view"
+      ],
+      "label": "gh-fetch"
+    },
+    {
+      "prefix": [
+        "gh",
+        "pr",
+        "diff"
+      ],
+      "label": "gh-fetch"
+    },
+    {
+      "prefix": [
+        "gh",
+        "pr",
+        "comment"
+      ],
+      "label": "gh-fetch"
+    },
+    {
+      "prefix": [
+        "gh",
+        "pr",
+        "list"
+      ],
+      "label": "gh-fetch"
+    },
+    {
+      "prefix": [
+        "gh",
+        "issue",
+        "view"
+      ],
+      "label": "gh-fetch"
+    },
+    {
+      "prefix": [
+        "gh",
+        "issue",
+        "comment"
+      ],
+      "label": "gh-fetch"
+    },
+    {
+      "prefix": [
+        "gh",
+        "issue",
+        "list"
+      ],
+      "label": "gh-fetch"
+    },
+    {
+      "prefix": [
+        "gh",
+        "api"
+      ],
+      "label": "gh-api"
+    },
+    {
+      "prefix": [
+        "git",
+        "clone"
+      ],
+      "label": "git-clone"
+    },
+    {
+      "prefix": [
+        "pip",
+        "install"
+      ],
+      "label": "pip-install"
+    },
+    {
+      "prefix": [
+        "pip3",
+        "install"
+      ],
+      "label": "pip-install"
+    },
+    {
+      "prefix": [
+        "npm",
+        "install"
+      ],
+      "label": "npm-install"
+    },
+    {
+      "prefix": [
+        "npm",
+        "i"
+      ],
+      "label": "npm-install"
+    },
+    {
+      "prefix": [
+        "npm",
+        "ci"
+      ],
+      "label": "npm-install"
+    },
+    {
+      "prefix": [
+        "cargo",
+        "install"
+      ],
+      "label": "cargo-install"
+    },
+    {
+      "prefix": [
+        "gem",
+        "install"
+      ],
+      "label": "gem-install"
+    },
+    {
+      "prefix": [
+        "go",
+        "install"
+      ],
+      "label": "go-fetch"
+    },
+    {
+      "prefix": [
+        "go",
+        "get"
+      ],
+      "label": "go-fetch"
+    },
+    {
+      "prefix": [
+        "bundle",
+        "install"
+      ],
+      "label": "bundle-install"
+    }
   ]
 }
