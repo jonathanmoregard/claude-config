@@ -1,0 +1,280 @@
+#!/usr/bin/env -S uv run --script
+# visual-verify screenshot wrapper.
+# Shebang uses `uv run --script` so PEP-723 deps below auto-install on first run.
+# Fallback: any python3 works, but PyYAML + playwright must be provided by env.
+#
+# DPR=2, boundary widths, fresh browser context per state, document.fonts.ready,
+# readiness selectors (not networkidle). Batch mode builds an index.html contact
+# sheet. Exits non-zero on HTTP errors / unresolved auth walls so callers see it.
+#
+# Requires: playwright installed (pip / uv / nix devshell).
+# PEP-723 inline deps — run with `uv run` for zero-install:
+#
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["playwright>=1.47", "PyYAML>=6"]
+# ///
+
+import argparse
+import asyncio
+import os
+import pathlib
+import sys
+from typing import Optional
+
+try:
+    import yaml  # type: ignore
+except ModuleNotFoundError:  # keep working without PyYAML — just no config discovery
+    yaml = None  # type: ignore
+
+
+def _find_project_config(start: pathlib.Path) -> Optional[pathlib.Path]:
+    """Walk up from start looking for .claude/visual-verify.yml."""
+    cur = start.resolve()
+    for _ in range(20):
+        candidate = cur / ".claude" / "visual-verify.yml"
+        if candidate.is_file():
+            return candidate
+        if cur.parent == cur:
+            return None
+        cur = cur.parent
+    return None
+
+
+def _load_project_config(explicit: Optional[str]) -> tuple[dict, Optional[pathlib.Path]]:
+    """Return (config_dict, found_path). found_path=None means no file existed."""
+    path = pathlib.Path(explicit) if explicit else _find_project_config(pathlib.Path.cwd())
+    if not path or not path.is_file():
+        return {}, None
+    if yaml is None:
+        sys.stderr.write(
+            f"[visual-verify] FOUND {path} but PyYAML is not importable — cannot parse.\n"
+            "  Either: (a) `pip install PyYAML` (or use the project's python env), or\n"
+            "  (b) invoke this script via `uv run` — the PEP-723 header at the top of\n"
+            "      bin/screenshot declares PyYAML as a dependency and uv fetches it.\n"
+            "  Continuing without config; results will use CLI-flag defaults only.\n"
+        )
+        return {}, path
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        sys.stderr.write(f"[visual-verify] loaded project config: {path}\n")
+        return data, path
+    except Exception as e:
+        sys.stderr.write(f"[visual-verify] config parse failed at {path}: {e}\n")
+        return {}, path
+
+
+def _config_defaults(cfg: dict) -> dict:
+    """Extract CLI defaults from the project config."""
+    app = cfg.get("app") or {}
+    dev_auth = cfg.get("dev_auth") or {}
+    shots = cfg.get("screenshots") or {}
+    token_env = dev_auth.get("token_env")
+    token_val = os.environ.get(token_env) if token_env else None
+    return {
+        "base_url": app.get("base_url"),
+        "ready": app.get("ready_selector"),
+        "out_dir": shots.get("out_dir"),
+        "dev_auth_header_name": dev_auth.get("header"),
+        "dev_auth_cookie": dev_auth.get("cookie"),
+        "dev_auth_token": token_val,
+    }
+
+DEFAULT_WIDTHS = [390, 767, 768, 1280]  # boundary widths, not representatives
+
+
+async def _capture_one(
+    browser,
+    url: str,
+    width: int,
+    height: int,
+    selector: Optional[str],
+    ready_selector: str,
+    out_path: pathlib.Path,
+    dev_auth_token: Optional[str],
+    dev_auth_header_name: str,
+    dev_auth_cookie: Optional[str],
+) -> int:
+    """Return HTTP status (0 = ok, non-zero = capture at http error or auth wall)."""
+    ctx = await browser.new_context(
+        viewport={"width": width, "height": height},
+        device_scale_factor=2,
+    )
+    if dev_auth_cookie:
+        # Cookie form: name=value; domain=host — split on first `;`
+        cookie_str, _, domain_part = dev_auth_cookie.partition(";")
+        name, _, value = cookie_str.partition("=")
+        domain = domain_part.strip().removeprefix("domain=") if domain_part else None
+        await ctx.add_cookies(
+            [{
+                "name": name.strip(),
+                "value": value.strip(),
+                "domain": domain,
+                "path": "/",
+            }]
+        )
+    page = await ctx.new_page()
+    if dev_auth_token:
+        await page.set_extra_http_headers({dev_auth_header_name: dev_auth_token})
+    resp = await page.goto(url, wait_until="domcontentloaded")
+    status = resp.status if resp else 0
+    if status >= 400:
+        sys.stderr.write(f"[visual-verify] HTTP {status} for {url}\n")
+    # Detect auth wall — if final URL is a login-ish path, flag it.
+    if any(s in page.url for s in ("/login", "/signin", "/oauth", "/magic")):
+        sys.stderr.write(f"[visual-verify] auth wall — landed on {page.url}\n")
+        status = 401
+    # Readiness — replace 'main' with your app's ready selector for accuracy.
+    try:
+        await page.wait_for_selector(ready_selector, state="visible", timeout=8000)
+    except Exception as e:
+        sys.stderr.write(f"[visual-verify] readiness wait failed: {e}\n")
+    await page.evaluate("document.fonts.ready")
+    if selector:
+        try:
+            el = page.locator(selector).first
+            await el.screenshot(path=str(out_path))
+        except Exception as e:
+            sys.stderr.write(f"[visual-verify] selector capture failed: {e}\n")
+            await page.screenshot(path=str(out_path), full_page=True)
+    else:
+        await page.screenshot(path=str(out_path), full_page=True)
+    await ctx.close()
+    return status
+
+
+async def run(args):
+    cfg, cfg_path = _load_project_config(args.config)
+    defaults = _config_defaults(cfg)
+
+    url = args.url or defaults.get("base_url")
+    if not url:
+        if cfg_path is None:
+            sys.stderr.write(
+                "[visual-verify] no project config found (.claude/visual-verify.yml) and no URL passed.\n"
+                "  Two options:\n"
+                "  1) pass a URL: `bin/screenshot http://localhost:PORT`\n"
+                "  2) generate a project config — follow the 'Setup' section in\n"
+                "     ~/.claude/skills/visual-verify/SKILL.md (9 steps, all discoverable\n"
+                "     from the repo). Then re-run.\n"
+            )
+        elif not cfg:
+            sys.stderr.write(
+                f"[visual-verify] project config at {cfg_path} could not be parsed (see warning above).\n"
+                "  Fix parseability (install PyYAML or use `uv run`), or pass a URL directly.\n"
+            )
+        else:
+            sys.stderr.write(
+                f"[visual-verify] project config {cfg_path} loaded but no app.base_url set — either\n"
+                "  add it there, or pass a URL on the command line.\n"
+            )
+        return 2
+
+    out_dir = pathlib.Path(args.out or defaults.get("out_dir") or "/tmp/visual-verify").expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    ready = args.ready or defaults.get("ready") or "main"
+    dev_auth_token = args.dev_auth_token or defaults.get("dev_auth_token")
+    dev_auth_header_name = defaults.get("dev_auth_header_name") or "X-Dev-Auth"
+    dev_auth_cookie = args.dev_auth_cookie or defaults.get("dev_auth_cookie")
+
+    widths = args.widths or DEFAULT_WIDTHS
+    shots: list[dict] = []
+    exit_code = 0
+
+    try:
+        from playwright.async_api import async_playwright  # late import
+    except ModuleNotFoundError:
+        sys.stderr.write(
+            "[visual-verify] playwright not importable. Install: `pip install playwright && playwright install chromium`\n"
+            "  Or run this script via `uv run` — PEP-723 header will fetch deps automatically.\n"
+        )
+        return 3
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch()
+        for width in widths:
+            safe_sel = (args.selector or "fullpage").replace(".", "_").replace(">", "-").replace("#", "_").replace(" ", "_")
+            filename = f"{safe_sel}-{width}.png"
+            out_path = out_dir / filename
+            status = await _capture_one(
+                browser,
+                url=url,
+                width=width,
+                height=args.height,
+                selector=args.selector or None,
+                ready_selector=ready,
+                out_path=out_path,
+                dev_auth_token=dev_auth_token,
+                dev_auth_header_name=dev_auth_header_name,
+                dev_auth_cookie=dev_auth_cookie,
+            )
+            shots.append({"url": url, "width": width, "path": filename, "status": status})
+            if status and status >= 400:
+                exit_code = 1
+        await browser.close()
+
+    # Contact sheet
+    if not args.no_index and shots:
+        _write_index(out_dir, shots)
+        print(f"contact sheet: file://{out_dir}/index.html")
+
+    for s in shots:
+        print(f"  {s['width']:>4}w  status={s['status']:>3}  {s['path']}")
+    return exit_code
+
+
+def _write_index(out_dir: pathlib.Path, shots: list[dict]) -> None:
+    rows = "\n".join(
+        f"""<div class="cell">
+    <div class="meta">{s['width']}w · status {s['status']}</div>
+    <a href="{s['path']}"><img src="{s['path']}" loading="lazy"></a>
+  </div>"""
+        for s in shots
+    )
+    html = f"""<!doctype html>
+<meta charset=utf-8>
+<title>visual-verify contact sheet</title>
+<style>
+  body {{ font: 13px/1.4 -apple-system,BlinkMacSystemFont,sans-serif; margin: 12px; background: #111; color: #ddd; }}
+  h1 {{ font-size: 15px; margin: 0 0 12px; }}
+  .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }}
+  .cell {{ background: #1a1a1a; padding: 8px; border-radius: 6px; }}
+  .cell img {{ width: 100%; height: auto; display: block; border-radius: 4px; }}
+  .meta {{ margin-bottom: 6px; color: #888; }}
+</style>
+<h1>visual-verify · {len(shots)} shots</h1>
+<div class="grid">
+{rows}
+</div>
+"""
+    (out_dir / "index.html").write_text(html, encoding="utf-8")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Capture screenshot(s) at boundary widths with DPR=2, fonts ready, no networkidle. "
+                    "Reads .claude/visual-verify.yml from cwd or any ancestor for project defaults."
+    )
+    ap.add_argument("url", nargs="?", default=None,
+                    help="URL to capture. If omitted, reads app.base_url from project config.")
+    ap.add_argument("--selector", default="", help="CSS selector for element shot (else full page)")
+    ap.add_argument("--widths", type=int, nargs="*", help=f"Widths in px. Default: {DEFAULT_WIDTHS}")
+    ap.add_argument("--height", type=int, default=844, help="Viewport height (default 844)")
+    ap.add_argument("--ready", default=None,
+                    help="Readiness selector. Overrides project config (default: main).")
+    ap.add_argument("--out", default=None,
+                    help="Output dir. Overrides project config (default: /tmp/visual-verify).")
+    ap.add_argument("--dev-auth-token", default=None,
+                    help="Auth-bypass token value. Overrides project config's env-var lookup.")
+    ap.add_argument("--dev-auth-cookie", default=None,
+                    help="'name=value; domain=host' cookie for dev auth.")
+    ap.add_argument("--config", default=None,
+                    help="Explicit path to visual-verify.yml (else discover .claude/visual-verify.yml).")
+    ap.add_argument("--no-index", action="store_true", help="Skip contact-sheet HTML")
+    args = ap.parse_args()
+    return asyncio.run(run(args))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

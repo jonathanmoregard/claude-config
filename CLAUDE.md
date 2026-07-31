@@ -84,3 +84,39 @@ Explicit user instructions always override this.
 ## Git worktrees
 
 - Place new worktrees under `~/worktrees/<repo>-<branch>/`. Don't nest in repo, don't scatter under `~/Repos/`.
+
+## Visual-verify discipline (mandatory for any UI work)
+
+Applies whenever a subagent (or the parent) will edit a rendered-view file:
+- HTML templates / partials: `**/*.{html,htm,htmx}`, `templates/**`, `partials/**`
+- Client rendering: `client/**/*.{ts,tsx,jsx}`, `components/**`, `app/**/*.tsx`
+- Server files returning HTML: Rust (`axum::response::Html`, `askama::Template`,
+  `maud::html!`), Python (`render_template`, `Jinja2Templates`), Ruby (`.erb`),
+  Elixir (`.heex`), Go (`html/template`, `templ.Component`)
+
+Paste this paragraph verbatim into every implementer subagent briefing:
+
+> **Visual-verify discipline (mandatory):** After any Write/Edit against a
+> rendered-view file, invoke the `visual-verify` skill on the touched surface
+> before proceeding to the next file. A bare "looks good" is a failure. Report
+> severity-tagged findings (blocker / should-fix / nit) and either fix or
+> explicitly defer.
+
+Parent, on subagent return, runs:
+```
+git diff --name-only <parent-branch>..HEAD -- '**/*.html' 'templates/**' \
+  'client/**/*.ts' 'client/**/*.tsx' 'app/**/*.tsx' 'partials/**'
+```
+On any hit, invoke `visual-verify` before marking subagent work done. Add
+project-appropriate globs (e.g. `crates/*/templates/**` for Rust workspaces,
+`app/views/**/*.erb` for Rails). Rationale: Claude Code PostToolUse hooks
+don't propagate to subagents (open issues #34692, #21460, #24558, #4500 as of
+July 2026) — trigger has to live in briefing template + parent post-return
+check.
+
+Skill + config:
+- Global skill: `~/.claude/skills/visual-verify/SKILL.md` (4-step rubric)
+- Project config (optional): `<repo>/.claude/visual-verify.yml` — ports,
+  paths, dev-auth env, known-good components dir, screenshot batch file
+- No project config? Follow the 9-step Setup section in SKILL.md to generate
+  one from the repo state.
