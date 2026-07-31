@@ -83,6 +83,49 @@ def _config_defaults(cfg: dict) -> dict:
 DEFAULT_WIDTHS = [390, 767, 768, 1280]  # boundary widths, not representatives
 
 
+# Script that runs in-page to dump the box model + role + name + label of every
+# interactive/landmark/heading element in view. Feeds the DOM-observability
+# emission that grounds VLM critiques in real geometry (not hallucinated pixels).
+_DOM_DUMP_JS = r"""
+(sel) => {
+  const root = sel ? document.querySelector(sel) : document.body;
+  if (!root) return { error: 'no root for selector', selector: sel };
+  // Elements a design critic cares about: landmarks, headings, controls,
+  // links, images, semantic containers. Skip pure text nodes / decorative divs.
+  const q = 'main, nav, header, footer, aside, section, article, ' +
+            'h1, h2, h3, h4, h5, h6, ' +
+            'a, button, input, select, textarea, label, fieldset, legend, ' +
+            'dialog, [role], [aria-label], img, svg';
+  const nodes = Array.from(root.matches(q) ? [root, ...root.querySelectorAll(q)] : root.querySelectorAll(q));
+  return nodes.map((el) => {
+    const r = el.getBoundingClientRect();
+    // Skip 0-size / offscreen (still counted at 0-width; caller can filter).
+    const rect = { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) };
+    const cs = window.getComputedStyle(el);
+    const label = (el.getAttribute('aria-label') || el.getAttribute('title') ||
+                   (el.tagName === 'IMG' ? el.getAttribute('alt') : null) ||
+                   (el.tagName === 'INPUT' ? el.getAttribute('placeholder') : null) ||
+                   (el.innerText || '').trim().slice(0, 80) || null);
+    return {
+      tag: el.tagName.toLowerCase(),
+      role: el.getAttribute('role') || null,
+      id: el.id || null,
+      class: (el.getAttribute('class') || '').trim() || null,
+      rect,
+      font: `${cs.fontWeight} ${cs.fontSize}/${cs.lineHeight} ${cs.fontFamily.split(',')[0].replace(/["']/g,'')}`,
+      color: cs.color,
+      bg: cs.backgroundColor,
+      pad: `${cs.paddingTop} ${cs.paddingRight} ${cs.paddingBottom} ${cs.paddingLeft}`,
+      border: cs.borderTopWidth === '0px' && cs.borderRightWidth === '0px' &&
+              cs.borderBottomWidth === '0px' && cs.borderLeftWidth === '0px'
+              ? null : `${cs.borderTopWidth} ${cs.borderRightWidth} ${cs.borderBottomWidth} ${cs.borderLeftWidth} · ${cs.borderTopColor}`,
+      label,
+    };
+  }).filter((n) => n.rect.w > 0 && n.rect.h > 0);
+}
+"""
+
+
 async def _capture_one(
     browser,
     url: str,
@@ -94,8 +137,10 @@ async def _capture_one(
     dev_auth_token: Optional[str],
     dev_auth_header_name: str,
     dev_auth_cookie: Optional[str],
-) -> int:
-    """Return HTTP status (0 = ok, non-zero = capture at http error or auth wall)."""
+    emit_aria: bool,
+    emit_dom: bool,
+) -> tuple[int, dict]:
+    """Return (HTTP status, artifact_paths). status 0 = ok, non-zero = http error / auth wall."""
     ctx = await browser.new_context(
         viewport={"width": width, "height": height},
         device_scale_factor=2,
@@ -130,6 +175,8 @@ async def _capture_one(
     except Exception as e:
         sys.stderr.write(f"[visual-verify] readiness wait failed: {e}\n")
     await page.evaluate("document.fonts.ready")
+
+    artifacts = {}
     if selector:
         try:
             el = page.locator(selector).first
@@ -139,8 +186,35 @@ async def _capture_one(
             await page.screenshot(path=str(out_path), full_page=True)
     else:
         await page.screenshot(path=str(out_path), full_page=True)
+
+    # ARIA snapshot — accessibility tree, the primary agent-readable signal per
+    # 2026 SOTA (Playwright first-party). Text-YAML from Playwright's own dump.
+    if emit_aria:
+        try:
+            target = page.locator(selector).first if selector else page.locator("body")
+            aria = await target.aria_snapshot()
+            aria_path = out_path.with_suffix(".aria.yaml")
+            aria_path.write_text(aria, encoding="utf-8")
+            artifacts["aria"] = aria_path.name
+        except Exception as e:
+            sys.stderr.write(f"[visual-verify] aria snapshot failed: {e}\n")
+
+    # DOM box-model dump — grounds VLM critiques in real geometry (spacing,
+    # alignment, contrast, hierarchy). Suppresses hallucinated findings that
+    # advisor research flagged as a critic failure mode (docs/reviews/sota-
+    # ai-power-users-cohort-2026-07-30.md).
+    if emit_dom:
+        try:
+            import json as _json
+            dom = await page.evaluate(_DOM_DUMP_JS, selector or None)
+            dom_path = out_path.with_suffix(".dom.json")
+            dom_path.write_text(_json.dumps(dom, indent=2, ensure_ascii=False), encoding="utf-8")
+            artifacts["dom"] = dom_path.name
+        except Exception as e:
+            sys.stderr.write(f"[visual-verify] dom dump failed: {e}\n")
+
     await ctx.close()
-    return status
+    return status, artifacts
 
 
 async def run(args):
@@ -197,7 +271,7 @@ async def run(args):
             safe_sel = (args.selector or "fullpage").replace(".", "_").replace(">", "-").replace("#", "_").replace(" ", "_")
             filename = f"{safe_sel}-{width}.png"
             out_path = out_dir / filename
-            status = await _capture_one(
+            status, artifacts = await _capture_one(
                 browser,
                 url=url,
                 width=width,
@@ -208,8 +282,13 @@ async def run(args):
                 dev_auth_token=dev_auth_token,
                 dev_auth_header_name=dev_auth_header_name,
                 dev_auth_cookie=dev_auth_cookie,
+                emit_aria=not args.no_aria,
+                emit_dom=not args.no_dom,
             )
-            shots.append({"url": url, "width": width, "path": filename, "status": status})
+            shots.append({
+                "url": url, "width": width, "path": filename, "status": status,
+                "aria": artifacts.get("aria"), "dom": artifacts.get("dom"),
+            })
             if status and status >= 400:
                 exit_code = 1
         await browser.close()
@@ -220,14 +299,22 @@ async def run(args):
         print(f"contact sheet: file://{out_dir}/index.html")
 
     for s in shots:
-        print(f"  {s['width']:>4}w  status={s['status']:>3}  {s['path']}")
+        extras = " ".join(f"[{k}]" for k in ("aria", "dom") if s.get(k))
+        print(f"  {s['width']:>4}w  status={s['status']:>3}  {s['path']} {extras}".rstrip())
     return exit_code
 
 
 def _write_index(out_dir: pathlib.Path, shots: list[dict]) -> None:
+    def _links(s):
+        parts = []
+        if s.get("aria"):
+            parts.append(f'<a href="{s["aria"]}">aria.yaml</a>')
+        if s.get("dom"):
+            parts.append(f'<a href="{s["dom"]}">dom.json</a>')
+        return " · ".join(parts)
     rows = "\n".join(
         f"""<div class="cell">
-    <div class="meta">{s['width']}w · status {s['status']}</div>
+    <div class="meta">{s['width']}w · status {s['status']}{('  ·  ' + _links(s)) if _links(s) else ''}</div>
     <a href="{s['path']}"><img src="{s['path']}" loading="lazy"></a>
   </div>"""
         for s in shots
@@ -272,6 +359,10 @@ def main() -> int:
     ap.add_argument("--config", default=None,
                     help="Explicit path to visual-verify.yml (else discover .claude/visual-verify.yml).")
     ap.add_argument("--no-index", action="store_true", help="Skip contact-sheet HTML")
+    ap.add_argument("--no-aria", action="store_true",
+                    help="Skip ARIA snapshot (default: emit <shot>.aria.yaml)")
+    ap.add_argument("--no-dom", action="store_true",
+                    help="Skip DOM box-model dump (default: emit <shot>.dom.json)")
     args = ap.parse_args()
     return asyncio.run(run(args))
 

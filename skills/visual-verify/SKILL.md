@@ -307,6 +307,27 @@ Load the recipes file for the Python Playwright matrix loop (boundary widths,
 DPR=2, fresh context per state, `document.fonts.ready`, readiness selectors
 not `networkidle`). CLI wrapper at `bin/screenshot`.
 
+## Observability artifacts (per shot)
+
+Each capture emits three files (default: all on; opt-out via `--no-aria` / `--no-dom`):
+
+- `<shot>.png` — DPR=2 image, founder-review primary
+- `<shot>.aria.yaml` — Playwright's `page.locator(sel).ariaSnapshot()` output; the
+  accessibility tree the critic reads INSTEAD of guessing structure from pixels.
+  Per 2026 SOTA research (`docs/reviews/sota-ai-design-web-research-2026-07-30.md`
+  recommendation #1): agents drive real browser + read ARIA snapshots as primary
+  signal, not pixels. Cuts hallucinated findings.
+- `<shot>.dom.json` — box-model dump of every landmark/heading/control in view:
+  `{tag, role, id, class, rect{x,y,w,h}, font, color, bg, pad, border, label}`.
+  Grounds VLM critique in real geometry — spacing/alignment/contrast findings
+  can be verified against numeric bboxes, not hallucinated.
+
+Contact-sheet `index.html` links `aria.yaml` + `dom.json` next to each thumbnail.
+
+Critic prompts should include the aria + dom paths and instruct: "cite specific
+`role` and `rect` when flagging alignment / spacing; do not claim misalignment
+without a bbox delta from `dom.json`."
+
 ## What this skill is NOT
 
 - Not a taste critic. That's `advice-refine-test-loop` with taste round (task #23).
