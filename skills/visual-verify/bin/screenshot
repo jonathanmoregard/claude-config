@@ -232,6 +232,11 @@ async def _capture_one(
     if emit_dom:
         try:
             dom = await page.evaluate(_DOM_DUMP_JS, selector or None)
+            # Selector-scoped dump returns {error, selector} when root is
+            # missing — both advisors ([opus]+[gpt5.5]) flagged as response-shape
+            # inconsistency (downstream critics expect a list). Promote to failure.
+            if isinstance(dom, dict) and "error" in dom:
+                raise RuntimeError(f"dom root not found: {dom.get('error')} (selector={dom.get('selector')!r})")
             dom_path = out_path.with_suffix(".dom.json")
             # errors='replace' is a safety net; the JS side already uses
             # Array.from().slice().join() to avoid mid-surrogate truncation,
