@@ -92,6 +92,15 @@ def rotate_if_needed(path: Path) -> None:
             if backup.exists():
                 backup.unlink()
             path.rename(backup)
+            # Backup inherits the file's mode at rename time. If the caller had
+            # not yet chmod'ed the source (e.g. first run against a pre-existing
+            # loose file), the .1 backup would be world-readable. Force 0600
+            # explicitly — this is the same posture the live file will have
+            # after the caller's chmod.
+            try:
+                os.chmod(backup, 0o600)
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -135,12 +144,24 @@ def main() -> None:
         prev_umask = os.umask(0o077)
         try:
             OUT.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            try:
+                os.chmod(OUT.parent, 0o700)
+            except Exception:
+                pass
             rotate_if_needed(OUT)
+            # Lock permissions on any pre-existing loose file BEFORE writing.
+            # Prior order (open → write → chmod) left a window where a reader
+            # racing the hook could read the new line at the pre-fix 0644 mode.
+            if OUT.exists():
+                try:
+                    os.chmod(OUT, 0o600)
+                except Exception:
+                    pass
             with OUT.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            # Chmod again in case the file was created just now by open("a").
             try:
                 os.chmod(OUT, 0o600)
-                os.chmod(OUT.parent, 0o700)
             except Exception:
                 pass
         finally:
