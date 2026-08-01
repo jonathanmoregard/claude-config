@@ -7,14 +7,26 @@ cd ~/.claude
 # frontmatter before anything ships for human review. Nonzero gate exit
 # means the batch is in an unknown state — do not push it half-gated.
 GATE="$HOME/.claude/scripts/proposal-intake-gate.py"
-if [[ -f "$GATE" ]]; then
-  if ! python3 "$GATE"; then
-    echo "proposal-intake-gate failed — push aborted." >&2
-    echo "Inspect the output above, fix (or rerun python3 $GATE), then retry." >&2
+if [[ ! -f "$GATE" ]]; then
+  if [[ "${PROPOSAL_GATE_ALLOW_MISSING:-}" == "1" ]]; then
+    echo "warning: $GATE missing — PROPOSAL_GATE_ALLOW_MISSING=1 set, pushing WITHOUT the intake gate" >&2
+  else
+    echo "error: $GATE is not installed — refusing to push ungated proposals." >&2
+    echo "Install it via the recursive-self-improvement plugin's scripts/install.sh." >&2
+    echo "Emergency bypass (documented in the plugin README): PROPOSAL_GATE_ALLOW_MISSING=1" >&2
     exit 1
   fi
 else
-  echo "warning: $GATE not installed — pushing ungated proposals" >&2
+  gate_rc=0
+  python3 "$GATE" || gate_rc=$?
+  if [[ "$gate_rc" -eq 4 ]]; then
+    echo "proposal-intake-gate: partial batch — rerun the gate; do not bypass." >&2
+    exit 1
+  elif [[ "$gate_rc" -ne 0 ]]; then
+    echo "proposal-intake-gate failed (exit $gate_rc) — push aborted." >&2
+    echo "Inspect the output above, fix (or rerun python3 $GATE), then retry." >&2
+    exit 1
+  fi
 fi
 
 # The spine: legacy RSI dir (rsi/ in the unified folder symlinks to it) plus

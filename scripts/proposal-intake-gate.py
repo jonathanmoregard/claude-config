@@ -34,6 +34,7 @@ Exit codes:
 """
 import argparse
 import datetime
+import fcntl
 import fnmatch
 import json
 import os
@@ -41,8 +42,12 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 DEFAULT_CONFIG_PATH = "~/.claude/proposals/gate-config.json"
+# Overall wall cap for pr-context collection: one hung `gh` (or many repos)
+# must not starve the actual gating run.
+PR_CONTEXT_WALL_CAP = 120
 
 DEFAULTS = {
     # Root of the proposals spine; every proposal subdir lives directly under it.
@@ -77,19 +82,66 @@ DEFAULTS = {
 }
 
 VALID_VERDICTS = ("sharp", "duplicate", "rot")
+VALID_DECISIONS = ("implemented", "rejected", "deferred")
 EVIDENCE_MAX = 200
 REPO_REF_RE = re.compile(r"(?:~|/home/[A-Za-z0-9._-]+)/Repos/([A-Za-z0-9._-]+)")
+# Candidate ids are embedded verbatim in the scorer's instruction text, so
+# both path components are allowlisted: no whitespace, no newlines, nothing
+# that could read as instructions to the scorer.
+FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,200}\.md$")
+SUBDIR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,200}$")
+# Credential-shaped runs (base64/hex/token-ish) never belong in evidence,
+# frontmatter, or logs.
+TOKEN_RUN_RE = re.compile(r"[A-Za-z0-9+/_=-]{32,}")
+# Non-whitespace control characters (whitespace is collapsed separately).
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+# Words that tend to prefix or carry credentials in tool stderr.
+SECRETY_WORD_RE = re.compile(r"(?i)(?<!\S)(?:key|token|secret|bearer)\S*")
+
+
+def sanitize_evidence(text):
+    """Scorer evidence is model output: collapse whitespace, strip control
+    characters, redact credential-shaped token runs, cap the length."""
+    text = re.sub(r"\s+", " ", text)
+    text = CONTROL_RE.sub("", text)
+    text = TOKEN_RUN_RE.sub("[redacted]", text)
+    return text.strip()[:EVIDENCE_MAX]
+
+
+def redact_stderr(text):
+    """Scorer stderr can echo environment/auth details — drop secret-ish
+    words and token runs before any of it reaches our own log output."""
+    text = TOKEN_RUN_RE.sub("[redacted]", text)
+    text = SECRETY_WORD_RE.sub("", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def log(msg):
     print(msg, flush=True)
 
 
+def contained(path, root):
+    """True when `path` realpath-resolves to `root` or below it."""
+    rp = os.path.realpath(path)
+    rr = os.path.realpath(root)
+    return rp == rr or rp.startswith(rr + os.sep)
+
+
+def require_under_home(path, label):
+    home = os.path.expanduser("~")
+    if not contained(path, home):
+        raise ValueError("%s %r resolves outside %s — refusing config"
+                         % (label, path, home))
+
+
 def load_config(path):
     """Merge the user's config file over DEFAULTS (one level of nesting deep).
 
     A missing config file is fine — defaults apply. A present-but-broken one
-    is not: better to stop than to gate against the wrong spine.
+    is not: better to stop than to gate against the wrong spine. Config paths
+    that write or get grepped (spine_root, gate_log, search_paths) must
+    realpath-resolve under $HOME — this script runs unattended and its config
+    file is only as trusted as whatever last wrote it.
     """
     cfg = json.loads(json.dumps(DEFAULTS))  # deep copy
     if os.path.isfile(path):
@@ -106,6 +158,10 @@ def load_config(path):
     pr = cfg["pr_context"]
     pr["repo_roots"] = [os.path.expanduser(p) for p in pr["repo_roots"]]
     pr["extra_repos"] = {k: os.path.expanduser(v) for k, v in pr["extra_repos"].items()}
+    require_under_home(cfg["spine_root"], "spine_root")
+    require_under_home(cfg["gate_log"], "gate_log")
+    for p in cfg["search_paths"]:
+        require_under_home(p, "search_paths entry")
     return cfg
 
 
@@ -137,6 +193,74 @@ def is_ungated_pending(text):
     return True
 
 
+def find_gate_block(lines, closing):
+    """(start, end) line indices of a gate: block inside the frontmatter
+    (end exclusive: the block is `gate:` plus its indented children), or
+    None when the frontmatter has no gate key."""
+    for i in range(1, closing):
+        if re.match(r"^gate:", lines[i]):
+            end = i + 1
+            while end < closing and re.match(r"^[ \t]+\S", lines[end]):
+                end += 1
+            return i, end
+    return None
+
+
+def parse_gate_block(lines, start, end):
+    """(verdict, date) as written in the block — either may be None."""
+    verdict = date = None
+    for line in lines[start + 1:end]:
+        m = re.match(r"^[ \t]+verdict:\s*(\S+)\s*$", line)
+        if m:
+            verdict = m.group(1)
+        m = re.match(r"^[ \t]+date:\s*(\S+)\s*$", line)
+        if m:
+            date = m.group(1)
+    return verdict, date
+
+
+def load_gate_log_index(cfg):
+    """{(qualified_file_id, date, verdict)} for every line this script has
+    written to the gate log. A gate: block in a proposal only counts as real
+    if it reconciles against one of these — producers write frontmatter
+    wholesale, so an unreconciled block is spurious and gets re-scored."""
+    index = set()
+    try:
+        with open(cfg["gate_log"], encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                date = entry.get("date") or str(entry.get("ts", ""))[:10]
+                index.add((entry.get("file"), date, entry.get("verdict")))
+    except OSError:
+        pass
+    return index
+
+
+def atomic_write(path, text):
+    """Atomic same-directory replace, preserving the file's mode."""
+    mode = os.stat(path).st_mode
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".gate-tmp-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.chmod(tmp, mode & 0o7777)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def discover_subdirs(cfg):
     root = cfg["spine_root"]
     if cfg["subdirs"]:
@@ -150,16 +274,36 @@ def discover_subdirs(cfg):
     for name in names:
         if any(fnmatch.fnmatch(name, pat) for pat in cfg["excluded_subdirs"]):
             continue
+        if not SUBDIR_RE.match(name):
+            # Subdir names become half of every candidate id embedded in the
+            # scorer instruction text — same allowlist as basenames.
+            log("warning: skipping subdir with nonconforming name under %s" % root)
+            continue
         full = os.path.join(root, name)
-        if os.path.isdir(full):  # follows symlinks (rsi is one in production)
-            out.append((name, full))
+        if not os.path.isdir(full):  # follows symlinks (rsi is one in production)
+            continue
+        # Symlinked subdirs are legitimate (rsi resolves inside ~/.claude)
+        # but must stay logically rooted: never follow one out of $HOME.
+        if not contained(full, os.path.expanduser("~")):
+            log("warning: skipping subdir %s — resolves outside $HOME" % name)
+            continue
+        out.append((name, full))
     return out
 
 
-def collect_candidates(cfg):
-    """[{id, path, subdir, basename, content}] for every ungated pending
-    proposal. `id` is the basename unless two subdirs collide on it."""
-    candidates = []
+def collect_candidates(cfg, repair=True):
+    """([{id, path, subdir, basename, content}], [exclusion notes]) for every
+    ungated pending proposal. Ids are always subdir-qualified
+    (`<subdir>/<basename>`) — one scheme everywhere, including the gate log.
+
+    A pending file carrying a gate: block is only skipped when that block
+    reconciles against the gate log (qualified id + date + verdict). An
+    unreconciled block is spurious (producers write frontmatter wholesale):
+    it is stripped from the file (when `repair` is true) and the proposal is
+    re-scored this run.
+    """
+    log_index = load_gate_log_index(cfg)
+    candidates, excluded = [], []
     for subdir, dirpath in discover_subdirs(cfg):
         try:
             entries = sorted(os.listdir(dirpath))
@@ -170,6 +314,13 @@ def collect_candidates(cfg):
                 continue
             if any(fnmatch.fnmatch(fname, pat) for pat in cfg["excluded_files"]):
                 continue
+            if not FILENAME_RE.match(fname):
+                excluded.append({
+                    "event": "excluded-nonconforming-filename",
+                    "subdir": subdir,
+                    "file": fname[:200],
+                })
+                continue
             fpath = os.path.join(dirpath, fname)
             if not os.path.isfile(fpath):
                 continue
@@ -178,26 +329,43 @@ def collect_candidates(cfg):
                     content = fh.read()
             except OSError:
                 continue
-            if is_ungated_pending(content):
-                candidates.append({
-                    "path": os.path.abspath(fpath),
-                    "subdir": subdir,
-                    "basename": fname,
-                    "content": content,
-                })
-    seen, collisions = set(), set()
-    for c in candidates:
-        if c["basename"] in seen:
-            collisions.add(c["basename"])
-        seen.add(c["basename"])
-    for c in candidates:
-        c["id"] = (c["subdir"] + "/" + c["basename"]) if c["basename"] in collisions else c["basename"]
-    return candidates
+            parsed = split_frontmatter(content)
+            if parsed is None:
+                continue
+            lines, closing = parsed
+            fm = "".join(lines[1:closing])
+            if not re.search(r"(?m)^status:\s*pending\s*$", fm):
+                continue
+            qid = subdir + "/" + fname
+            block = find_gate_block(lines, closing)
+            if block is not None:
+                verdict, bdate = parse_gate_block(lines, block[0], block[1])
+                if (qid, bdate, verdict) in log_index:
+                    continue  # genuinely gated by a prior run of this script
+                log("warning: %s carries a gate block with no matching "
+                    "gate-log line — stripping it and re-scoring" % qid)
+                content = "".join(lines[:block[0]] + lines[block[1]:])
+                if repair:
+                    atomic_write(fpath, content)
+            candidates.append({
+                "id": qid,
+                "path": os.path.abspath(fpath),
+                "subdir": subdir,
+                "basename": fname,
+                "content": content,
+            })
+    return candidates, excluded
+
+
+def is_git_checkout(path):
+    """gh runs with cwd inside these dirs — only trust real checkouts
+    (a dir containing .git; .git may be a file in worktrees)."""
+    return os.path.isdir(path) and os.path.exists(os.path.join(path, ".git"))
 
 
 def infer_repos(candidates, cfg):
     """name -> checkout path for every ~/Repos/<name> reference that resolves
-    to a real directory, plus configured extra_repos."""
+    to a real git checkout, plus configured extra_repos (same requirement)."""
     pr = cfg["pr_context"]
     names = set()
     for c in candidates:
@@ -206,10 +374,14 @@ def infer_repos(candidates, cfg):
     for name in sorted(names):
         for root in pr["repo_roots"]:
             path = os.path.join(root, name)
-            if os.path.isdir(path):
+            if is_git_checkout(path):
                 repos[name] = path
                 break
-    repos.update(pr["extra_repos"])
+    for name, path in pr["extra_repos"].items():
+        if is_git_checkout(path):
+            repos[name] = path
+        else:
+            log("warning: extra_repos[%r] is not a git checkout — skipped" % name)
     return repos
 
 
@@ -218,6 +390,7 @@ def collect_pr_context(repos, cfg):
     the scorer can Read. gh being down must never block gating — each failure
     becomes a 'pr-context unavailable' note instead."""
     pr = cfg["pr_context"]
+    start = time.monotonic()
     fd, path = tempfile.mkstemp(prefix="proposal-gate-pr-context-", suffix=".md")
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write("# Recently merged PRs for repos referenced by this batch\n\n")
@@ -225,12 +398,17 @@ def collect_pr_context(repos, cfg):
             fh.write("No repo checkouts referenced by this batch; nothing collected.\n")
         for name, repo_path in sorted(repos.items()):
             fh.write("## %s (%s)\n\n" % (name, repo_path))
+            remaining = PR_CONTEXT_WALL_CAP - (time.monotonic() - start)
+            if remaining <= 0:
+                fh.write("pr-context unavailable: %ds wall cap reached\n\n"
+                         % PR_CONTEXT_WALL_CAP)
+                continue
             try:
                 proc = subprocess.run(
                     ["gh", "pr", "list", "--state", "merged",
                      "--limit", str(pr["merged_limit"]), "--json", "title,mergedAt"],
                     cwd=repo_path, capture_output=True, text=True,
-                    timeout=pr["timeout_seconds"],
+                    timeout=min(pr["timeout_seconds"], remaining),
                 )
                 if proc.returncode == 0:
                     fh.write(proc.stdout.strip() + "\n\n")
@@ -303,26 +481,38 @@ def dispatch_scorer(prompt, cfg):
         if proc.returncode == 0:
             return proc.stdout, model
         last_err = "scorer exited %d for %s: %s" % (
-            proc.returncode, model, (proc.stderr or proc.stdout).strip()[:300])
+            proc.returncode, model,
+            redact_stderr((proc.stderr or proc.stdout).strip()[:300]))
         log(last_err)
     log("error: all scorer dispatches failed (%s)" % last_err)
     return None, None
 
 
+def save_raw_scorer_output(stdout):
+    """Preserve unusable scorer output verbatim for diagnosis — 0600, never
+    echoed into our own stdout (cron logs)."""
+    logs_dir = os.path.expanduser("~/.claude/logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(logs_dir, "gate-scorer-raw-%s.txt" % ts)
+    if os.path.exists(path):  # two failures within one second
+        path = os.path.join(logs_dir, "gate-scorer-raw-%s-%d.txt" % (ts, os.getpid()))
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(stdout)
+    os.chmod(path, 0o600)
+    return path
+
+
 def parse_verdicts(stdout, candidates):
-    """Strict parse of the scorer's JSON. Returns id -> (verdict, evidence) or
-    None when the output is unusable (caller exits nonzero, gates nothing)."""
-    text = stdout.strip()
-    payload = None
-    for attempt in (text, text[text.find("{"):text.rfind("}") + 1]
-                    if "{" in text and "}" in text else ""):
-        if not attempt:
-            continue
-        try:
-            payload = json.loads(attempt)
-            break
-        except json.JSONDecodeError:
-            continue
+    """Strict parse of the scorer's JSON — the contract is JSON on stdout and
+    nothing else; no salvage of JSON embedded in prose. Returns
+    id -> (verdict, evidence) or None when the output is unusable (caller
+    exits nonzero, gates nothing)."""
+    try:
+        payload = json.loads(stdout.strip())
+    except json.JSONDecodeError:
+        payload = None
     if not isinstance(payload, dict) or not isinstance(payload.get("verdicts"), list):
         log("error: scorer output is not the required JSON shape")
         return None
@@ -345,14 +535,15 @@ def parse_verdicts(stdout, candidates):
         if not isinstance(evidence, str):
             log("error: evidence for %s is not a string" % fid)
             return None
-        verdicts[fid] = (verdict, evidence[:EVIDENCE_MAX])
+        verdicts[fid] = (verdict, sanitize_evidence(evidence))
     return verdicts
 
 
 def annotate(candidate, verdict, evidence, model, today):
     """Insert the gate: block just before the closing --- of the frontmatter.
-    Atomic write; preserves file mode. Returns the block for logging."""
-    path = candidate["path"]
+    Atomic write; preserves file mode. Operates on the proposal's realpath so
+    a symlinked proposal keeps being a symlink and its target gets replaced."""
+    path = os.path.realpath(candidate["path"])
     with open(path, encoding="utf-8", errors="replace") as fh:
         text = fh.read()
     if not is_ungated_pending(text):
@@ -367,19 +558,7 @@ def annotate(candidate, verdict, evidence, model, today):
         "  date: %s\n" % (verdict, json.dumps(evidence), model, today)
     )
     new_text = "".join(lines[:closing]) + block + "".join(lines[closing:])
-    mode = os.stat(path).st_mode
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".gate-tmp-")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(new_text)
-        os.chmod(tmp, mode & 0o7777)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    atomic_write(path, new_text)
     return True
 
 
@@ -390,6 +569,51 @@ def append_gate_log(cfg, entry):
         fh.write(json.dumps(entry, sort_keys=True) + "\n")
 
 
+def run_callback(cfg, subdir, proposal_path, decision):
+    """Validate and run the on_decision callback configured for `subdir`.
+
+    The config map is the single source of truth, but the executing agent
+    never shells out to an arbitrary configured string: the callback must
+    realpath-resolve under ~/.claude, be a regular file (not itself a
+    symlink), be owned by the current uid, carry no group/other write bits,
+    and be executable. Executed as list argv, shell=False.
+    """
+    if decision not in VALID_DECISIONS:
+        log("error: invalid decision %r (want %s)"
+            % (decision, "|".join(VALID_DECISIONS)))
+        return 1
+    callback = cfg.get("on_decision", {}).get(subdir)
+    if not callback:
+        log("no on_decision callback configured for subdir %r — nothing to run"
+            % subdir)
+        return 0
+    callback = os.path.expanduser(str(callback))
+    claude_root = os.path.expanduser("~/.claude")
+    problems = []
+    if os.path.islink(callback):
+        problems.append("is a symlink")
+    if not os.path.isfile(callback):
+        problems.append("is not a regular file")
+    if not contained(callback, claude_root):
+        problems.append("resolves outside %s" % claude_root)
+    if not problems:
+        st = os.stat(callback)
+        if st.st_uid != os.getuid():
+            problems.append("not owned by the current user")
+        if st.st_mode & 0o022:
+            problems.append("group/other writable")
+        if not os.access(callback, os.X_OK):
+            problems.append("not executable")
+    if problems:
+        log("error: refusing on_decision callback %s for subdir %r: %s"
+            % (callback, subdir, "; ".join(problems)))
+        return 1
+    proposal_path = os.path.realpath(proposal_path)
+    # No shell, no capture: the callback's stdout/stderr surface verbatim.
+    proc = subprocess.run([callback, proposal_path, decision])
+    return proc.returncode
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Annotate pending proposals with independent scorer verdicts.")
     parser.add_argument("--config",
@@ -398,6 +622,11 @@ def main(argv=None):
                         help="gate config JSON (default: %s)" % DEFAULT_CONFIG_PATH)
     parser.add_argument("--list", action="store_true",
                         help="print what would be gated, dispatch nothing")
+    parser.add_argument("--run-callback", nargs=3,
+                        metavar=("SUBDIR", "PROPOSAL_PATH", "DECISION"),
+                        help="validate and run the on_decision callback "
+                             "configured for SUBDIR (decision: %s)"
+                             % "|".join(VALID_DECISIONS))
     args = parser.parse_args(argv)
 
     try:
@@ -406,29 +635,67 @@ def main(argv=None):
         log("error: cannot load gate config %s: %s" % (args.config, exc))
         return 1
 
-    candidates = collect_candidates(cfg)
+    if args.run_callback:
+        return run_callback(cfg, *args.run_callback)
+
+    if not args.list:
+        # Single-instance discipline (R9): the gating run strips/annotates
+        # frontmatter (check-then-replace) and appends to the gate log —
+        # two concurrent runs would interleave both. --list never writes
+        # (repair=False below), so it stays lock-free.
+        lock_path = os.path.join(cfg["spine_root"], ".gate.lock")
+        try:
+            lock_fh = open(lock_path, "w")  # held until process exit
+        except OSError as exc:
+            log("error: cannot open lock file %s: %s" % (lock_path, exc))
+            return 1
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            log("proposal-intake-gate: another instance holds the lock at %s "
+                "— exiting without gating" % lock_path)
+            return 0
+
+    candidates, excluded = collect_candidates(cfg, repair=not args.list)
+
+    if args.list:
+        for note in excluded:
+            log("excluded (nonconforming filename) in subdir: %s" % note["subdir"])
+        for c in candidates:
+            log("would gate: %s" % c["path"])
+        return 0
+
+    now = datetime.datetime.now().isoformat(timespec="seconds")
+    for note in excluded:
+        log("warning: excluded nonconforming filename in subdir %s (noted in gate log)"
+            % note["subdir"])
+        append_gate_log(cfg, dict(note, ts=now))
+
     if not candidates:
         log("proposal-intake-gate: nothing to gate (no ungated pending proposals under %s)"
             % cfg["spine_root"])
-        return 0
-
-    if args.list:
-        for c in candidates:
-            log("would gate: %s" % c["path"])
         return 0
 
     repos = infer_repos(candidates, cfg)
     context_path = collect_pr_context(repos, cfg)
     log("pr-context: %s" % context_path)
 
-    prompt = build_prompt(candidates, repos, context_path, cfg)
-    stdout, model = dispatch_scorer(prompt, cfg)
+    try:
+        prompt = build_prompt(candidates, repos, context_path, cfg)
+        stdout, model = dispatch_scorer(prompt, cfg)
+    finally:
+        # The scorer only needs the context file during dispatch (R6).
+        try:
+            os.unlink(context_path)
+        except OSError:
+            pass
     if stdout is None:
         return 2
 
     verdicts = parse_verdicts(stdout, candidates)
     if verdicts is None:
-        log("head of scorer output was: %r" % stdout.strip()[:300])
+        raw_path = save_raw_scorer_output(stdout)
+        log("scorer output unusable — raw output preserved at %s (0600)" % raw_path)
         log("nothing gated; rerun after fixing the scorer")
         return 3
 
@@ -442,7 +709,8 @@ def main(argv=None):
             gated += 1
             append_gate_log(cfg, {
                 "ts": datetime.datetime.now().isoformat(timespec="seconds"),
-                "file": c["basename"],
+                "date": today,
+                "file": c["id"],
                 "path": c["path"],
                 "subdir": c["subdir"],
                 "verdict": verdict,
