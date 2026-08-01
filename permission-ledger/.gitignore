@@ -1,0 +1,15 @@
+# Ledger data: sampled tool inputs (redacted, but local-only regardless).
+*.jsonl
+hook-errors.log
+digest-latest.json
+digest-prev.json
+decided.json
+.evaluate.lock
+tests/.testhome/
+__pycache__/
+# Test-run artifacts (outputs, not sources)
+tests/crontab.*
+tests/pass*.out
+tests/settings.after*.json
+tests/fake-crontab.txt
+tests/stage/

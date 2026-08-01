@@ -104,9 +104,17 @@ Hard constraints:
   has not rendered yet.
 - **Append-only, `O_APPEND` single `write()`** of one line, so concurrent sessions
   interleave safely. File created `0600`; directory `0700`.
-- **No `CLAUDE_CODE_ENTRYPOINT` guard.** Headless (`--print`) permission walls are
-  a first-class signal — a cron agent silently blocked on a denied tool is exactly
-  the kind of failure this ledger should surface.
+- **No `CLAUDE_CODE_ENTRYPOINT` guard.** The entrypoint is recorded in the record
+  instead of being filtered on, so headless runs are not excluded by design.
+
+  **Corrected after install (2026-08-01):** the design claimed headless (`--print`)
+  permission walls would be captured as a first-class signal. They are not.
+  Empirically, a headless run denied `Read(/etc/hostname)` and produced no ledger
+  record at all — neither `PermissionRequest` nor `PermissionDenied` fired. Without
+  an interactive approver, Claude Code short-circuits to a denial before reaching
+  the ask path that runs these hooks. The ledger therefore covers **interactive
+  sessions only**. A cron agent silently blocked on a denied tool remains
+  invisible to it; that is a separate problem needing a different mechanism.
 
 ### Record schema
 
@@ -197,16 +205,37 @@ already-scanned document instead of raw ledger lines.
 
 ### Stage 3 — evaluate (nightly model call)
 
-`~/.claude/permission-ledger/prompt.md`, run at 17:30 daily:
+**As built, this differs from the first draft.** The draft had the agent run
+`aggregate.py` itself under `--allowedTools "… Bash(python3 …aggregate.py*)"`.
+That can never work: `permissions.deny` contains a blanket `"Bash"`, and deny beats
+allow, so the grant is dead on arrival and the agent would hit its failure branch
+every night. (The same defect exists in the RSI research cron, which allows
+`WebFetch`/`WebSearch` that are globally denied.)
+
+Instead, cron runs a plain shell wrapper, `run-evaluate.sh`, which does the
+deterministic work outside the agent and hands over a finished file:
 
 ```
-30 17 * * * cd ~/.claude && claude --model opus --print \
-  --allowedTools "Read Glob Grep Write(~/.claude/proposals/permissions/*) Bash(python3 ~/.claude/permission-ledger/aggregate.py*)" \
-  -p "$(cat ~/.claude/permission-ledger/prompt.md)" \
-  >> ~/.claude/logs/permission-ledger.log 2>&1 # permission-ledger-evaluate
+30 17 * * * $HOME/.claude/permission-ledger/run-evaluate.sh \
+  >> $HOME/.claude/logs/permission-ledger.log 2>&1 # permission-ledger-evaluate
 ```
 
-The prompt instructs the agent to run `aggregate.py`, wrap its output in
+The wrapper sweeps ledger files older than 6 months, runs `aggregate.py`,
+publishes `digest-latest.json` atomically (keeping `digest-prev.json`), and only
+then invokes:
+
+```
+cd ~/.claude && claude --model opus --print \
+  --allowedTools "Read Glob Grep Write(~/.claude/proposals/permissions/*)" \
+  -p "$(cat ~/.claude/permission-ledger/prompt.md)"
+```
+
+No `Bash` grant, so nothing depends on the deny list. The wrapper exits without
+paying for a model call when aggregation fails, when the digest is unparseable, or
+when there are zero groups. It holds a non-blocking `flock` so a wedged run cannot
+overlap the next tick, and bounds the model call with `timeout 1800`.
+
+The prompt instructs the agent to read `digest-latest.json`, wrap its content in
 `<untrusted_external_content source="permission-ledger">` before reasoning over it,
 and classify each group into exactly one verdict:
 

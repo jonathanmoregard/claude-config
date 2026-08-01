@@ -123,7 +123,7 @@
       "/home/jonathan/Repos/research-agent/reports"
     ]
   },
-  "model": "opus[1m]",
+  "model": "claude-fable-5[1m]",
   "enableAllProjectMcpServers": false,
   "hooks": {
     "SessionStart": [
@@ -257,6 +257,30 @@
             "type": "command",
             "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; $HOME/.claude/hooks/git-push-merge-check.sh",
             "timeout": 12
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/permission-ledger/hook.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PermissionDenied": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/permission-ledger/hook.py",
+            "timeout": 5
           }
         ]
       }

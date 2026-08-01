@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Stand-in for crontab(1) used by the install/uninstall tests.
+# Reads and writes $FAKE_CRONTAB_FILE. Never touches the real crontab.
+set -euo pipefail
+: "${FAKE_CRONTAB_FILE:?FAKE_CRONTAB_FILE must be set}"
+case "${1:-}" in
+  -l) [[ -f "$FAKE_CRONTAB_FILE" ]] && cat "$FAKE_CRONTAB_FILE" || exit 1 ;;
+  -)  cat > "$FAKE_CRONTAB_FILE" ;;
+  *)  echo "fake-crontab: unsupported args: $*" >&2; exit 64 ;;
+esac

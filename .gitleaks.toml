@@ -1,0 +1,23 @@
+# gitleaks config for the ~/.claude config repo.
+#
+# Keeps every default rule (useDefault = true) and adds one narrowly-scoped
+# exemption. Do not widen this file to silence a finding — a finding in any
+# non-test path is a real finding.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = """
+permission-ledger's redaction tests assert that credential-shaped strings are
+replaced with [REDACTED:<kind>] markers. To do that they must contain literal
+credential-shaped strings — an OpenSSH private-key header, AIza…, xoxb-…,
+ghp_…, AKIA…, and a bearer token. Every one is synthetic filler
+(AIzaSyA1234567890abcdefghijklmnopqrstuv, xoxb-123456789012-abcdefghijklmno,
+a BEGIN line with no key material). Scanning them is a guaranteed false
+positive on every commit that touches the file.
+
+Scoped to that one test file by path. Any other file in the repo, including
+the other two test files, is still scanned normally.
+"""
+paths = ['''^permission-ledger/tests/test_hook\.py$''']
