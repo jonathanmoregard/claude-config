@@ -39,8 +39,8 @@ Your ENTIRE response is a single JSON object. No prose before, no prose after, n
 - If a finding needs a "run this to confirm" hint, EMBED it in `rationale` as `... verify: <command>`. Do NOT add a `verify` field — the schema rejects it.
 
 **Verdict semantics:**
-- `PASS` — no findings above LOW. `verdict_reason` = empty string `""`.
-- `PASS_WITH_FIXES` — only MEDIUM and/or LOW findings remain (no BLOCKER, no HIGH). `verdict_reason` = one line summarising the class of remaining MEDIUMs, or `"no findings above LOW"` when there are no MEDIUMs (this matches the schema's own description string — keep the two spec sources word-for-word aligned).
+- `PASS` — zero findings. `findings` array MUST be empty `[]`. `verdict_reason` = empty string `""`. If you have any LOW findings, emit `PASS_WITH_FIXES` — never `PASS` with a non-empty findings array.
+- `PASS_WITH_FIXES` — at least one MEDIUM or LOW finding, no BLOCKER/HIGH. `verdict_reason` = one line summarising the class of remaining MEDIUMs, or `"only LOW findings"` when there are no MEDIUMs.
 - `BLOCKS` — at least one BLOCKER or HIGH. `verdict_reason` MUST be a one-line citation of the single most important BLOCKER or HIGH.
 
 Full JSON schema on disk: `~/.claude/skills/advice-refine-test-loop/verdict-schema.json` (Read it if unsure).

@@ -37,7 +37,9 @@ SIZE_CAP_BYTES = 10 * 1024 * 1024
 #      makes the skip work.
 SECRET_PATTERNS = [
     # --- structured (specific > entropy) ---
-    (re.compile(r"-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]+?-----END [A-Z ]+PRIVATE KEY-----"), "<REDACTED:pem>"),
+    # Matches PKCS#8 (BEGIN PRIVATE KEY), PKCS#1 RSA, OPENSSH, EC, DSA, ENCRYPTED
+    # — the type prefix is optional (`*` not `+`) so bare PKCS#8 doesn't slip past.
+    (re.compile(r"-----BEGIN (?:[A-Z0-9 ]*)PRIVATE KEY-----[\s\S]+?-----END (?:[A-Z0-9 ]*)PRIVATE KEY-----"), "<REDACTED:pem>"),
     (re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"), "<REDACTED:jwt>"),
     # --- named vendors ---
     (re.compile(r"sk-ant-[A-Za-z0-9_\-]{20,}"), "<REDACTED:anthropic>"),

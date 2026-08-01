@@ -7,7 +7,7 @@
   "properties": {
     "verdict": {
       "enum": ["PASS", "PASS_WITH_FIXES", "BLOCKS"],
-      "description": "PASS = no findings above LOW. PASS_WITH_FIXES = only MEDIUM and/or LOW findings remain (consolidator auto-fixes LOWs; parent surfaces MEDIUMs for manual review but does not block advance). BLOCKS = at least one BLOCKER or HIGH that gates shipping."
+      "description": "PASS = zero findings (empty findings array). PASS_WITH_FIXES = at least one MEDIUM or LOW finding but no BLOCKER/HIGH (consolidator auto-fixes LOWs; parent surfaces MEDIUMs for manual review but does not block advance). BLOCKS = at least one BLOCKER or HIGH that gates shipping."
     },
     "verdict_reason": {
       "type": "string",

@@ -61,9 +61,11 @@ Both lanes emit JSON matching `~/.claude/skills/advice-refine-test-loop/verdict-
 }
 ```
 
-- **PASS** = no findings above LOW; ship after consolidator handles any LOWs.
-- **PASS_WITH_FIXES** = only MEDIUM and/or LOW findings remain. Consolidator auto-fixes LOWs; MEDIUMs surface in the round's commit message for the human to triage but do NOT block phase advance. If a MEDIUM ought to block, it should have been a HIGH — trust the advisor's severity.
+- **PASS** = ZERO findings (empty `findings` array). Advance immediately, no consolidator needed.
+- **PASS_WITH_FIXES** = at least one MEDIUM or LOW finding, but no BLOCKER/HIGH. Consolidator runs before phase advance (auto-fixes LOWs; MEDIUMs surface in the round's commit message for the human to triage but do NOT block advance). If a MEDIUM ought to block, it should have been a HIGH — trust the advisor's severity.
 - **BLOCKS** = ≥1 BLOCKER or HIGH; next round required.
+
+The advisor MUST NOT emit `PASS` with a non-empty findings array — that combination is unreachable in the state machine. LOW-only remainders are `PASS_WITH_FIXES`.
 
 Codex enforces the schema via `codex exec --output-schema ~/.claude/skills/advice-refine-test-loop/verdict-schema.json …`. Opus advisor enforces via prompt instruction (advisor.md system prompt requires JSON output).
 
