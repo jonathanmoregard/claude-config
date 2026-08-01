@@ -137,10 +137,11 @@ every digest after it:
 the single re-ask work: a `rejected` pattern returns exactly once, if its count
 later triples. Omit `--count` and the pattern is suppressed permanently.
 
-**Nothing does this for you.** `/review-improvements` walks the proposals folder
-but knows nothing about this feature, so draining a proposal without running
-`record-decision.py` leaves the ledger re-proposing a decision you already made.
-Wiring the two together is the obvious next improvement.
+**Wired (2026-08-01).** `/review-improvements` now runs
+`~/.claude/proposals/permissions/on-decision <proposal> <outcome>` after each
+recorded decision (implemented → `implemented`; rejected and skipped →
+`rejected`, `--count` extracted from the `## Friction` line when present).
+Draining by hand still requires the manual `record-decision.py` call above.
 
 ## Retention
 
