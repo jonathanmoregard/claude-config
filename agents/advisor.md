@@ -40,7 +40,7 @@ Your ENTIRE response is a single JSON object. No prose before, no prose after, n
 
 **Verdict semantics:**
 - `PASS` — no findings above LOW. `verdict_reason` = empty string `""`.
-- `PASS_WITH_FIXES` — only MEDIUM and/or LOW findings remain (no BLOCKER, no HIGH). `verdict_reason` = one line summarising the class of remaining MEDIUMs (or `"only LOW findings"` when there are no MEDIUMs).
+- `PASS_WITH_FIXES` — only MEDIUM and/or LOW findings remain (no BLOCKER, no HIGH). `verdict_reason` = one line summarising the class of remaining MEDIUMs, or `"no findings above LOW"` when there are no MEDIUMs (this matches the schema's own description string — keep the two spec sources word-for-word aligned).
 - `BLOCKS` — at least one BLOCKER or HIGH. `verdict_reason` MUST be a one-line citation of the single most important BLOCKER or HIGH.
 
 Full JSON schema on disk: `~/.claude/skills/advice-refine-test-loop/verdict-schema.json` (Read it if unsure).

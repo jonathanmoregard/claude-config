@@ -1,6 +1,6 @@
 ---
 name: advice-refine-test-loop
-description: Use when shipping non-trivial changes that must land clean — the user says "look through carefully and fix what's off", "ask for advice and repeat", "keep refining until neat", or is going to bed. Runs four sequential phases (Opus + narrow specialists → Codex → adversarial → optional taste) with structured JSON verdicts, empirical repro, prefix-cached prompts, and a bounded consolidator sub-loop for LOW-only remainders.
+description: Use when shipping non-trivial changes that must land clean — the user says "look through carefully and fix what's off", "ask for advice and repeat", "keep refining until neat", or is going to bed. Runs four sequential phases (Opus + narrow specialists → Codex → adversarial → optional taste) with structured JSON verdicts, empirical repro, prefix-cached prompts, and a bounded consolidator sub-loop for LOWs (MEDIUMs surface but do not block).
 ---
 
 # Advice-Refine-Test Loop
@@ -118,7 +118,10 @@ Loop rounds until Codex emits `PASS` (or `PASS_WITH_FIXES`; consolidator handles
 
 ## Phase 3: Adversarial round (single Opus dispatch)
 
-After Phase 2 PASS. One shot; if it emits any findings above LOW, the finding is treated as a genuine BLOCKER and the loop resets to Phase 1 (so both vendors re-review the fix). If it emits PASS or PASS_WITH_FIXES, advance.
+After Phase 2 PASS. One shot; the verdict determines advance:
+
+- `PASS` or `PASS_WITH_FIXES` (findings ≤ MEDIUM) → advance to Phase 4. MEDIUMs and LOWs surface in the exit commit message; consolidator handles LOWs; MEDIUMs are surfaced for the human but do NOT trigger a Phase 1 reset (the whole point of "PASS_WITH_FIXES advances" from earlier phases applies here too — a MEDIUM adversarial finding that would have been BLOCKER-worthy should have been emitted as HIGH by the adversarial prompt).
+- `BLOCKS` (any BLOCKER or HIGH) → loop resets to Phase 1 with the new findings pre-seeded so both vendors re-review the fix.
 
 Dispatch: same `Agent(subagent_type="advisor", …)` as Phase 1, but the prompt is framed adversarially:
 
@@ -168,9 +171,11 @@ IF claim is a race / state issue:
 
 Discard unreproducible claims. Note them so next round's "prior rounds fixed" can include "verified non-issue: <claim>".
 
-## Consolidator sub-loop (LOW-only remainder)
+## Consolidator sub-loop (PASS_WITH_FIXES remainder)
 
-When a phase's final round emits `PASS_WITH_FIXES` (only LOW findings remain), run the consolidator BEFORE advancing to the next phase. LOW findings are nits and small ergonomics — not worth another full advisor round, but worth fixing before shipping.
+When a phase's final round emits `PASS_WITH_FIXES` (MEDIUM and/or LOW findings remain, no BLOCKER/HIGH), run the consolidator BEFORE advancing to the next phase. **Consolidator auto-fixes LOWs only** — MEDIUMs are surfaced in the phase's exit commit message for the human to triage. Auto-fixing MEDIUMs without reproduction is risky (they're "latent bug or future trap", not nits).
+
+Parent MUST filter the JSON findings to LOWs before dispatching. If no LOWs remain (MEDIUMs only), skip the consolidator entirely and go straight to the exit-commit-message surface step.
 
 Dispatch: `Agent(subagent_type="general-purpose", prompt=...)` with the following prompt shape (does NOT use the `advisor` type — consolidator needs Edit access):
 
@@ -180,7 +185,8 @@ granularity. After ALL fixes: re-verify (run the same test/lint/smoke the
 main loop uses). Report per-finding: [fixed | skipped: <reason>].
 
 Findings:
-<JSON dump of the phase's LOW findings from the final advisor verdict>
+<JSON array containing ONLY LOW findings — parent MUST filter MEDIUMs out
+ before dispatching>
 ```
 
 **Bounded to 3 rounds** — if 3 consolidator rounds don't clear the LOW list, exit with what's left in a commit message. Don't infinite-loop trivial fixes; the point of PASS_WITH_FIXES is fast handling, not exhaustive polish.
