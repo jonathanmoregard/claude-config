@@ -26,7 +26,20 @@ SIZE_CAP_BYTES = 10 * 1024 * 1024
 # Common secret shapes. Match, then substitute with a stable marker so the
 # corpus still shows "there was a token here" for clustering purposes
 # without leaking the token itself.
+# Pattern order matters:
+#   1. Multi-part / structured patterns (PEM, JWT) run FIRST so more-specific
+#      markers win over the high-entropy fallback.
+#   2. Named vendor patterns (sk-ant, ghp_, AKIA, etc.) — targeted, low FP.
+#   3. Bearer / kv-secret / URL-userinfo — semi-structured shapes.
+#   4. High-entropy fallback runs LAST so it only catches unlabeled tokens
+#      no earlier pattern claimed. It's also the pattern that's SKIPPED
+#      for cwd redaction (see redact_cwd() slice); this position is what
+#      makes the skip work.
 SECRET_PATTERNS = [
+    # --- structured (specific > entropy) ---
+    (re.compile(r"-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]+?-----END [A-Z ]+PRIVATE KEY-----"), "<REDACTED:pem>"),
+    (re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"), "<REDACTED:jwt>"),
+    # --- named vendors ---
     (re.compile(r"sk-ant-[A-Za-z0-9_\-]{20,}"), "<REDACTED:anthropic>"),
     (re.compile(r"sk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_\-]{20,}"), "<REDACTED:openai>"),
     (re.compile(r"(?:sk|rk|pk|whsec)_(?:live|test)_[A-Za-z0-9]{20,}"), "<REDACTED:stripe>"),
@@ -38,28 +51,31 @@ SECRET_PATTERNS = [
     (re.compile(r"ASIA[0-9A-Z]{16}"), "<REDACTED:aws-sts>"),
     (re.compile(r"AIza[0-9A-Za-z_\-]{35}"), "<REDACTED:google-api-key>"),
     (re.compile(r"xox[baprs]-[A-Za-z0-9\-]{10,}"), "<REDACTED:slack>"),
+    # --- semi-structured ---
     (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{20,}"), "Bearer <REDACTED:bearer>"),
     (re.compile(
-        r"(?i)\b(?:password|passwd|pwd|secret|token|"
+        r"(?i)\b(?:password|passwd|secret|token|"
         r"api[_\-]?key|api[_\-]?secret|"
-        r"access[_\-]?(?:key|token|id|secret)|"
+        r"access[_\-]?(?:key|token|secret)|"
         r"refresh[_\-]?token|"
-        r"client[_\-]?(?:id|secret|key)|"
+        r"client[_\-]?(?:secret|key)|"
         r"secret[_\-]?(?:key|token|id)|"
         r"private[_\-]?key|"
         r"auth[_\-]?(?:token|key)|"
         r"bearer[_\-]?token|"
-        r"session[_\-]?(?:id|token|key)|"
+        r"session[_\-]?(?:token|key)|"
         r"db[_\-]?password|database[_\-]?url|"
-        r"encryption[_\-]?key|signing[_\-]?key|master[_\-]?key"
+        r"encryption[_\-]?key|signing[_\-]?key|master[_\-]?key|"
+        r"shared[_\-]?access[_\-]?key|account[_\-]?key"
         r")['\"]?\s*[:=]\s*(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s]+)"
     ), "<REDACTED:kv-secret>"),
     # URL userinfo: postgres://user:pass@host, mongodb+srv://u:p@..., https://user:pass@github.com/...
     (re.compile(r"\b[a-z][a-z0-9+.\-]*://[^\s/@:]+:[^\s/@]+@[^\s]+"), "<REDACTED:url-userinfo>"),
-    # High-entropy base64/hex runs (32+ chars) — catches inline unlabeled tokens
-    (re.compile(r"\b[A-Za-z0-9+/=_\-]{40,}\b"), "<REDACTED:high-entropy-blob>"),
-    (re.compile(r"-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]+?-----END [A-Z ]+PRIVATE KEY-----"), "<REDACTED:pem>"),
-    (re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"), "<REDACTED:jwt>"),
+    # --- HIGH-ENTROPY FALLBACK — MUST BE LAST ---
+    # Catches inline unlabeled tokens no earlier pattern claimed. Excludes
+    # `/` and `-` so path segments and long branch names don't over-redact.
+    # SKIPPED for cwd via SECRET_PATTERNS[:-1] slice in main().
+    (re.compile(r"\b[A-Za-z0-9+=_]{40,}\b"), "<REDACTED:high-entropy-blob>"),
 ]
 
 
@@ -99,11 +115,18 @@ def main() -> None:
     # the sanitized result to the byte cap.
     redacted = redact(prompt)[:PROMPT_TRUNCATE]
 
+    # Cwd redaction skips the high-entropy fallback (last pattern) — long paths
+    # are structure the /prompt-review-weekly clusterer needs. Vendor + URL +
+    # kv-secret patterns still run in case a secret literally appears in cwd.
     raw_cwd = str(payload.get("cwd") or os.getcwd())
+    redacted_cwd = raw_cwd
+    for pat, marker in SECRET_PATTERNS[:-1]:
+        redacted_cwd = pat.sub(marker, redacted_cwd)
+
     entry = {
         "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "session_id": str(payload.get("session_id") or ""),
-        "cwd": redact(raw_cwd),  # sensitive project/customer names in path also redacted
+        "cwd": redacted_cwd,
         "prompt_len": len(prompt),
         "prompt_head": redacted,
     }

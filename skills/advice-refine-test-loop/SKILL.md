@@ -59,7 +59,7 @@ Both lanes emit JSON matching `~/.claude/skills/advice-refine-test-loop/verdict-
 ```
 
 - **PASS** = no findings above LOW; ship after consolidator handles any LOWs.
-- **PASS_WITH_FIXES** = only LOW findings remain; consolidator auto-fixes.
+- **PASS_WITH_FIXES** = only MEDIUM and/or LOW findings remain. Consolidator auto-fixes LOWs; MEDIUMs surface in the round's commit message for the human to triage but do NOT block phase advance. If a MEDIUM ought to block, it should have been a HIGH — trust the advisor's severity.
 - **BLOCKS** = ≥1 BLOCKER or HIGH; next round required.
 
 Codex enforces the schema via `codex exec --output-schema ~/.claude/skills/advice-refine-test-loop/verdict-schema.json …`. Opus advisor enforces via prompt instruction (advisor.md system prompt requires JSON output).
@@ -102,7 +102,7 @@ Parse: `verdict=$(codex exec … | jq -r '.verdict')`. Values: `PASS`, `PASS_WIT
 **Usage-limit fallback:** if the call returns "usage limit" / "quota exceeded" / HTTP 429, re-run ONCE with `-m gpt-5.4` (lighter tier still on Plus quota). If that also fails, **PAUSE the loop and route to the user**:
 
 - **Interactive session:** print "Phase 2 blocked: Codex quota exhausted at <ts>. Options: (a) wait <T> for reset then resume, (b) ship consciously without cross-vendor coverage, (c) abort." Wait for user decision.
-- **Unattended session** (loop triggered by "going to bed" / cron / no live human): append to `tasks/pending_for_human.md` per the CLAUDE.md format (`## <date>: Codex Phase 2 quota-exhausted / Why blocked / Steps for human / Everything else done`). Do NOT advance and do NOT ship. Exit the whole skill with status `pending-human`.
+- **Unattended session** (loop triggered by "going to bed" / cron / no live human): append to `pending_for_human.md` per the CLAUDE.md format (`## <date>: Codex Phase 2 quota-exhausted / Why blocked / Steps for human / Everything else done`). Do NOT advance and do NOT ship. Exit the whole skill with status `pending-human`.
 
 This is the only Phase 2 exit that is not `PASS` — every other termination advances to Phase 3. Never fall through silently.
 
@@ -190,7 +190,7 @@ Findings:
 **Error handling** — if the consolidator subagent crashes, exceeds quota, or produces partial commits mid-batch:
 - Parent inspects `git status` on return. Uncommitted mutations from a crashed consolidator are `git stash push -u -m "consolidator-crash-<phase>-<round>"`ed (never `git reset --hard` — preserve evidence).
 - Partial commits (some findings fixed, some not) stay in place — subsequent rounds see them as prior-round work and skip the corresponding findings.
-- After 3 crash-outs or a total exceeding the round budget, exit the sub-loop and note "consolidator unavailable: <cause>" in the phase's exit commit message. Remaining LOWs get logged to `tasks/pending_for_human.md` if the run is unattended.
+- After 3 crash-outs or a total exceeding the round budget, exit the sub-loop and note "consolidator unavailable: <cause>" in the phase's exit commit message. Remaining LOWs get logged to `pending_for_human.md` if the run is unattended.
 
 After consolidator exits (clean or bounded), advance to the next phase using the post-consolidator state as the new baseline.
 
