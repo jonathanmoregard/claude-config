@@ -20,9 +20,24 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import aggregate  # noqa: E402
 
-REF_SCAN_SCRIPT = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ref", "scan_content.py"
-)
+def _resolve_ref_scan_script():
+    """A real scan_content.py to exercise the scanner path with, or None.
+
+    The scratchpad this was built in kept a copy at ../ref/; the installed tree
+    does not, so fall back to whatever aggregate resolves from its own candidate
+    list. The two tests that use this assert that a REAL scanner runs without
+    aborting, which is not a testable claim when no scanner exists anywhere —
+    they skip in that case rather than assert something weaker.
+    """
+    local = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ref", "scan_content.py"
+    )
+    if os.path.isfile(local):
+        return local
+    return aggregate.resolve_scan_script()
+
+
+REF_SCAN_SCRIPT = _resolve_ref_scan_script()
 
 
 def iso(dt):
@@ -546,6 +561,7 @@ class AggregateTestCase(unittest.TestCase):
         self.assertTrue(d["scan_status"]["scan_content"].startswith("unavailable"))
         self.assertEqual(len(d["groups"][0]["samples"]), 1)
 
+    @unittest.skipIf(REF_SCAN_SCRIPT is None, "no real scan_content.py on this machine")
     def test_explicit_scan_script_overrides_the_candidate_list(self):
         for _ in range(3):
             self.b.record(self.now)
@@ -563,6 +579,7 @@ class AggregateTestCase(unittest.TestCase):
             "unexpected scan_status: %r" % status,
         )
 
+    @unittest.skipIf(REF_SCAN_SCRIPT is None, "no real scan_content.py on this machine")
     def test_real_scan_script_runs_and_never_aborts(self):
         for _ in range(3):
             self.b.record(self.now)
