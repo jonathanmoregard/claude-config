@@ -41,6 +41,7 @@ import fnmatch
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -57,6 +58,10 @@ GATE_LOCK_PATH = "~/.claude/logs/gate.lock"
 # How long --run-callback waits for the lock before giving up (the gating run
 # itself never waits: contended means another gate is active, exit 0).
 CALLBACK_LOCK_TIMEOUT_SECONDS = 10.0
+# Hard cap on scorer stdout. Enforced by fstat on the stdout tempfile BEFORE
+# any read — capture_output used to buffer the whole pipe in this process
+# first, making the cap decorative (R8).
+SCORER_STDOUT_CAP = 5 * 1024 * 1024
 
 DEFAULTS = {
     # Root of the proposals spine; every proposal subdir lives directly under it.
@@ -65,7 +70,9 @@ DEFAULTS = {
     # under spine_root (symlinked subdirs like rsi -> legacy path are followed).
     "subdirs": [],
     "excluded_subdirs": [".*", "archived"],
-    "excluded_files": ["README*", ".*"],
+    # Must stay identical to references/gate-config.default.json (tested):
+    # omitted config keys are documented to fall back to the same values.
+    "excluded_files": ["README*", ".*", "on-decision", "on-decision.*"],
     "scorer": {
         "model": "claude-fable-5",       # strongest tier first ...
         "fallback_model": "opus",        # ... opus when fable is capped/absent
@@ -446,6 +453,15 @@ def collect_candidates(cfg, repair=True):
             fpath = os.path.join(dirpath, fname)
             if not os.path.isfile(fpath):
                 continue
+            if not contained(fpath, dirpath):
+                # R8: annotate() and the strip-repair below rewrite the
+                # candidate's REALPATH, so a per-file symlink escaping the
+                # subdir (rsi/x.md -> ~/.zshrc) would let the gate prepend
+                # frontmatter to an arbitrary file. Never read it;
+                # collect_push_blockers lists it (exit 4). Containment is
+                # against the subdir with ITS OWN symlink followed, so files
+                # inside the production rsi -> legacy subdir stay candidates.
+                continue
             try:
                 content = read_text_strict(fpath)
             except UnicodeDecodeError:
@@ -544,7 +560,13 @@ def collect_push_blockers(cfg):
                 fpath = os.path.join(full, fname)
                 if any(fnmatch.fnmatch(fname, pat) for pat in cfg["excluded_files"]):
                     continue
-                if os.path.isdir(fpath):
+                if not contained(fpath, full):
+                    # R8: a per-file symlink whose realpath escapes the
+                    # subdir's own realpath is never read or rewritten —
+                    # candidacy skips it, so it must block the push.
+                    note(fpath, "symlink escapes its subdir — the gate "
+                                "never follows it")
+                elif os.path.isdir(fpath):
                     note_tree(fpath, "nested directory — the gate never scans it")
                 elif not fname.endswith(".md"):
                     note(fpath, "non-.md file — push would ship it ungated")
@@ -678,9 +700,20 @@ Exactly one entry per proposal, using the ids exactly as listed above.
        "\n".join("   - " + p for p in search_paths))
 
 
+def unlink_quiet(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 def dispatch_scorer(prompt, cfg):
     """One headless scorer call for the whole batch; fall back once when the
-    primary model is capped or unavailable. Returns (stdout, model_used)."""
+    primary model is capped or unavailable. The scorer's stdout streams into
+    a 0600 tempfile (R8: capture_output buffered an unbounded pipe in this
+    process before the 5MB cap could look at it). Returns
+    (stdout_tempfile_path, model_used) or (None, None); the caller owns the
+    tempfile. stderr stays captured — it is only ever truncated + redacted."""
     scorer = cfg["scorer"]
     models = [scorer["model"]]
     if scorer.get("fallback_model") and scorer["fallback_model"] != scorer["model"]:
@@ -689,36 +722,49 @@ def dispatch_scorer(prompt, cfg):
     for model in models:
         cmd = ["claude", "--model", model, "--print",
                "--allowedTools", scorer["allowed_tools"], "-p", prompt]
+        fd, out_path = tempfile.mkstemp(prefix="gate-scorer-stdout-",
+                                        suffix=".txt")  # mkstemp: mode 0600
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True,
-                                  timeout=scorer["timeout_seconds"])
+            with os.fdopen(fd, "wb") as out_fh:
+                proc = subprocess.run(cmd, stdout=out_fh,
+                                      stderr=subprocess.PIPE, text=True,
+                                      timeout=scorer["timeout_seconds"])
         except (OSError, subprocess.TimeoutExpired) as exc:
+            unlink_quiet(out_path)
             last_err = "dispatch failed for %s: %s" % (model, exc)
             log(last_err)
             continue
         if proc.returncode == 0:
-            return proc.stdout, model
+            return out_path, model
+        snippet = (proc.stderr or "").strip()
+        if not snippet:  # bounded read: first 300 chars of the stdout file
+            with open(out_path, encoding="utf-8", errors="replace") as fh:
+                snippet = fh.read(300).strip()
+        unlink_quiet(out_path)
         last_err = "scorer exited %d for %s: %s" % (
-            proc.returncode, model,
-            redact_stderr((proc.stderr or proc.stdout).strip()[:300]))
+            proc.returncode, model, redact_stderr(snippet[:300]))
         log(last_err)
     log("error: all scorer dispatches failed (%s)" % last_err)
     return None, None
 
 
-def save_raw_scorer_output(stdout):
-    """Preserve unusable scorer output verbatim for diagnosis — 0600, never
-    echoed into our own stdout (cron logs)."""
+def preserve_raw_scorer_output(src_path):
+    """Move unusable scorer stdout (the dispatch tempfile) into the logs dir
+    verbatim for diagnosis — 0600, never echoed into our own stdout (cron
+    logs), and never read into memory (it may be the >5MB overflow case)."""
     logs_dir = os.path.expanduser("~/.claude/logs")
     os.makedirs(logs_dir, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     path = os.path.join(logs_dir, "gate-scorer-raw-%s.txt" % ts)
     if os.path.exists(path):  # two failures within one second
         path = os.path.join(logs_dir, "gate-scorer-raw-%s-%d.txt" % (ts, os.getpid()))
-    fd = os.open(path,
-                 os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(stdout)
+    os.chmod(src_path, 0o600)  # mkstemp already 0600; keep it explicit
+    try:
+        os.replace(src_path, path)
+    except OSError:
+        # TMPDIR on another filesystem: chunked copy (copy2 keeps 0600),
+        # then drop the source — still no full read into memory.
+        shutil.move(src_path, path)
     os.chmod(path, 0o600)
     return path
 
@@ -976,19 +1022,31 @@ def main(argv=None):
                 log("dispatching chunk %d/%d (%d proposal(s))"
                     % (idx, len(chunks), len(chunk)))
             prompt = build_prompt(chunk, repos, context_path, cfg)
-            stdout, model = dispatch_scorer(prompt, cfg)
-            if stdout is None:
+            stdout_path, model = dispatch_scorer(prompt, cfg)
+            if stdout_path is None:
                 dispatch_failures += 1
                 ungated_ids.extend(c["id"] for c in chunk)
                 continue
+            # R8: enforce the cap on the FILE before any read — an
+            # oversized chunk fails without this process ever holding it.
+            if os.stat(stdout_path).st_size > SCORER_STDOUT_CAP:
+                parse_failures += 1
+                raw_path = preserve_raw_scorer_output(stdout_path)
+                log("error: scorer output exceeds 5MB — refusing to parse; "
+                    "raw output preserved at %s (0600)" % raw_path)
+                ungated_ids.extend(c["id"] for c in chunk)
+                continue
+            with open(stdout_path, encoding="utf-8", errors="replace") as fh:
+                stdout = fh.read()
             verdicts = parse_verdicts(stdout, chunk)
             if verdicts is None:
                 parse_failures += 1
-                raw_path = save_raw_scorer_output(stdout)
+                raw_path = preserve_raw_scorer_output(stdout_path)
                 log("scorer output unusable for this chunk — raw output "
                     "preserved at %s (0600)" % raw_path)
                 ungated_ids.extend(c["id"] for c in chunk)
                 continue
+            unlink_quiet(stdout_path)
             for c in chunk:
                 if c["id"] not in verdicts:
                     ungated_ids.append(c["id"])
