@@ -44,7 +44,12 @@
       "Bash(*build('drive'*)",
       "Bash(*documents().batchUpdate*)",
       "Bash(*documents().get*)",
-      "Bash(*documents().create*)"
+      "Bash(*documents().create*)",
+      "Bash(*automation-review*)",
+      "Bash(*prompts.jsonl*)",
+      "Bash(*aut*review*)",
+      "Bash(*review*prompt*)",
+      "Bash(*prompt*review*)"
     ]
   },
   "untrusted_ingress_single": {
