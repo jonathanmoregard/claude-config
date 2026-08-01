@@ -28,7 +28,8 @@ SIZE_CAP_BYTES = 10 * 1024 * 1024
 # without leaking the token itself.
 SECRET_PATTERNS = [
     (re.compile(r"sk-ant-[A-Za-z0-9_\-]{20,}"), "<REDACTED:anthropic>"),
-    (re.compile(r"sk-[A-Za-z0-9]{20,}"), "<REDACTED:openai>"),
+    (re.compile(r"sk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_\-]{20,}"), "<REDACTED:openai>"),
+    (re.compile(r"(?:sk|rk|pk|whsec)_(?:live|test)_[A-Za-z0-9]{20,}"), "<REDACTED:stripe>"),
     (re.compile(r"ghp_[A-Za-z0-9]{20,}"), "<REDACTED:github-pat>"),
     (re.compile(r"gho_[A-Za-z0-9]{20,}"), "<REDACTED:github-oauth>"),
     (re.compile(r"ghs_[A-Za-z0-9]{20,}"), "<REDACTED:github-server>"),
@@ -51,8 +52,12 @@ SECRET_PATTERNS = [
         r"session[_\-]?(?:id|token|key)|"
         r"db[_\-]?password|database[_\-]?url|"
         r"encryption[_\-]?key|signing[_\-]?key|master[_\-]?key"
-        r")\s*[:=]\s*['\"]?[^\s'\"]+"
+        r")['\"]?\s*[:=]\s*(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s]+)"
     ), "<REDACTED:kv-secret>"),
+    # URL userinfo: postgres://user:pass@host, mongodb+srv://u:p@..., https://user:pass@github.com/...
+    (re.compile(r"\b[a-z][a-z0-9+.\-]*://[^\s/@:]+:[^\s/@]+@[^\s]+"), "<REDACTED:url-userinfo>"),
+    # High-entropy base64/hex runs (32+ chars) — catches inline unlabeled tokens
+    (re.compile(r"\b[A-Za-z0-9+/=_\-]{40,}\b"), "<REDACTED:high-entropy-blob>"),
     (re.compile(r"-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]+?-----END [A-Z ]+PRIVATE KEY-----"), "<REDACTED:pem>"),
     (re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"), "<REDACTED:jwt>"),
 ]
@@ -88,13 +93,17 @@ def main() -> None:
     if not isinstance(prompt, str) or not prompt.strip():
         sys.exit(0)
 
-    truncated = prompt[:PROMPT_TRUNCATE]
-    redacted = redact(truncated)
+    # ORDER MATTERS: redact BEFORE truncate. Truncating first can cut the END
+    # marker off a PEM block or the tail of a matched token, defeating the regex
+    # and leaking the head of a secret. Redact the full prompt, then truncate
+    # the sanitized result to the byte cap.
+    redacted = redact(prompt)[:PROMPT_TRUNCATE]
 
+    raw_cwd = str(payload.get("cwd") or os.getcwd())
     entry = {
         "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "session_id": str(payload.get("session_id") or ""),
-        "cwd": str(payload.get("cwd") or os.getcwd()),
+        "cwd": redact(raw_cwd),  # sensitive project/customer names in path also redacted
         "prompt_len": len(prompt),
         "prompt_head": redacted,
     }

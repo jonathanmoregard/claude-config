@@ -99,7 +99,14 @@ codex exec --skip-git-repo-check \
 
 Parse: `verdict=$(codex exec … | jq -r '.verdict')`. Values: `PASS`, `PASS_WITH_FIXES`, `BLOCKS`.
 
-**Usage-limit fallback:** if the call returns "usage limit" / "quota exceeded" / HTTP 429, re-run ONCE with `-m gpt-5.4` (lighter tier still on Plus quota). If that also fails, **PAUSE the loop and surface the situation to the user** — do NOT advance to Phase 3 and do NOT ship. Print: "Phase 2 blocked: Codex quota exhausted at <ts>. Options: (a) wait <T> for reset then resume, (b) ship consciously without cross-vendor coverage, (c) abort." Wait for user decision. This is the only Phase 2 exit that is not `PASS` — every other termination advances to Phase 3.
+**Usage-limit fallback:** if the call returns "usage limit" / "quota exceeded" / HTTP 429, re-run ONCE with `-m gpt-5.4` (lighter tier still on Plus quota). If that also fails, **PAUSE the loop and route to the user**:
+
+- **Interactive session:** print "Phase 2 blocked: Codex quota exhausted at <ts>. Options: (a) wait <T> for reset then resume, (b) ship consciously without cross-vendor coverage, (c) abort." Wait for user decision.
+- **Unattended session** (loop triggered by "going to bed" / cron / no live human): append to `tasks/pending_for_human.md` per the CLAUDE.md format (`## <date>: Codex Phase 2 quota-exhausted / Why blocked / Steps for human / Everything else done`). Do NOT advance and do NOT ship. Exit the whole skill with status `pending-human`.
+
+This is the only Phase 2 exit that is not `PASS` — every other termination advances to Phase 3. Never fall through silently.
+
+**Timeout:** wrap the codex exec call with a wall-clock cap (`timeout 300s codex exec ...`). A model hang or long stall past 5 minutes is treated as connectivity failure → retry once after 30s → if second try also stalls, route to the same PAUSE handler above.
 
 **Connectivity failure:** if codex exits with network error, retry once after 30s. On second failure, pause the phase (same as quota-exhausted).
 
@@ -180,7 +187,12 @@ Findings:
 
 **Consolidator per-finding skip is a first-class outcome** — a nit that turns out to require a design call ("rename this variable" that would ripple through 40 files) gets skipped with a reason, not force-fixed.
 
-After consolidator exits, advance to the next phase using the post-consolidator state as the new baseline.
+**Error handling** — if the consolidator subagent crashes, exceeds quota, or produces partial commits mid-batch:
+- Parent inspects `git status` on return. Uncommitted mutations from a crashed consolidator are `git stash push -u -m "consolidator-crash-<phase>-<round>"`ed (never `git reset --hard` — preserve evidence).
+- Partial commits (some findings fixed, some not) stay in place — subsequent rounds see them as prior-round work and skip the corresponding findings.
+- After 3 crash-outs or a total exceeding the round budget, exit the sub-loop and note "consolidator unavailable: <cause>" in the phase's exit commit message. Remaining LOWs get logged to `tasks/pending_for_human.md` if the run is unattended.
+
+After consolidator exits (clean or bounded), advance to the next phase using the post-consolidator state as the new baseline.
 
 ## Anti-Patterns
 
