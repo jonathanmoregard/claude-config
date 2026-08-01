@@ -208,7 +208,9 @@ async def _capture_body(
     # preceded by `=`, not `/` or start). `\b` treats any word-boundary as
     # anchor, catches all query/fragment/path forms without false positives on
     # `/logout` or `/loginhistory` (verified locally).
-    auth_paths_re = re.compile(r"\b(login|signin|oauth|magic)\b")
+    # `oauth\d*` catches `/oauth2/authorize` (R7 Codex catch); `\b` boundary
+    # still safely skips `/logout` etc.
+    auth_paths_re = re.compile(r"\b(login|signin|oauth\d*|magic)\b")
     _pu = urlparse(page.url)
     for source in (_pu.path, _pu.fragment, _pu.query):
         if source and auth_paths_re.search(source):
