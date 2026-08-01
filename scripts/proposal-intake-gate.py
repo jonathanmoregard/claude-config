@@ -141,7 +141,9 @@ def acquire_gate_lock(timeout=0.0):
     contended. OSError from open/makedirs propagates to the caller."""
     lock_path = os.path.expanduser(GATE_LOCK_PATH)
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
-    lock_fh = open(lock_path, "w")
+    # O_CREAT|O_RDWR, not open(path, "w"): never truncate a lock file another
+    # process may be holding, and create with an explicit 0600 mode.
+    lock_fh = os.fdopen(os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600), "r+")
     deadline = time.monotonic() + timeout
     while True:
         try:
@@ -256,9 +258,9 @@ def load_gate_log_index(cfg):
     """{(file_id, date, verdict)} for every line this script has written to
     the gate log. A gate: block in a proposal only counts as real if it
     reconciles against one of these — producers write frontmatter wholesale,
-    so an unreconciled block is spurious and gets re-scored. Current entries
-    carry subdir-qualified ids; legacy (pre-qualified) entries recorded the
-    bare basename and are matched against candidates' basenames."""
+    so an unreconciled block is spurious and gets re-scored. File ids are
+    always subdir-qualified; a bare-basename entry never reconciles (it
+    would create a cross-subdir acceptance edge)."""
     index = set()
     try:
         with open(cfg["gate_log"], encoding="utf-8") as fh:
@@ -377,11 +379,6 @@ def collect_candidates(cfg, repair=True):
                 verdict, bdate = parse_gate_block(lines, block[0], block[1])
                 if (qid, bdate, verdict) in log_index:
                     continue  # genuinely gated by a prior run of this script
-                if (fname, bdate, verdict) in log_index:
-                    # Legacy gate-log lines (pre-qualified ids) recorded the
-                    # bare basename — still honor them, or an upgrade would
-                    # strip and re-score every previously gated proposal.
-                    continue
                 log("warning: %s carries a gate block with no matching "
                     "gate-log line — stripping it and re-scoring" % qid)
                 content = "".join(lines[:block[0]] + lines[block[1]:])
@@ -552,6 +549,9 @@ def parse_verdicts(stdout, candidates):
     nothing else; no salvage of JSON embedded in prose. Returns
     id -> (verdict, evidence) or None when the output is unusable (caller
     exits nonzero, gates nothing)."""
+    if len(stdout) > 5 * 1024 * 1024:
+        log("error: scorer output exceeds 5MB — refusing to parse")
+        return None
     try:
         payload = json.loads(stdout.strip())
     except json.JSONDecodeError:
