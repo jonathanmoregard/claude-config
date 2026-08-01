@@ -40,7 +40,14 @@ Each Phase 1/2 round follows the same shape:
    verdict=$(jq -r '.verdict' <<<"$out")
    blockers=$(jq '[.findings[] | select(.severity=="BLOCKER" or .severity=="HIGH")] | length' <<<"$out")
    findings_count=$(jq '.findings | length' <<<"$out")
+   bad=0
 
+   # FIRST: verdict must be one of the three enum values. This gate catches
+   # null (missing .verdict), typos, and any string Opus might emit that
+   # advisor.md's prompt-only enforcement failed to constrain.
+   [[ "$verdict" =~ ^(PASS|PASS_WITH_FIXES|BLOCKS)$ ]] || bad=1
+
+   # THEN cross-validate coherence between verdict and findings.
    if [[ "$verdict" == "PASS" && "$findings_count" -gt 0 ]]; then bad=1; fi
    if [[ "$verdict" == "PASS_WITH_FIXES" && "$blockers" -gt 0 ]]; then bad=1; fi
    if [[ "$verdict" == "BLOCKS" && "$blockers" -eq 0 ]]; then bad=1; fi
