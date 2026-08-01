@@ -36,7 +36,10 @@ Each Phase 1/2 round follows the same shape:
 3. ADVISE: dispatch the phase's advisor (Opus in phase 1, Codex in phase 2)
 4. PARSE verdict: `jq -r '.verdict'` on advisor output. If not parseable JSON,
    the round FAILED — re-dispatch once with an explicit "output valid JSON
-   matching verdict-schema.json" reminder. Second failure exits the phase.
+   matching verdict-schema.json" reminder. Second failure PAUSEs the loop
+   (interactive: prompt user; unattended: append to `pending_for_human.md`
+   and exit `pending-human`). NEVER treat unparseable output as advance-
+   worthy — a round that can't emit a verdict has produced zero coverage.
 5. REPRODUCE each BLOCKER/HIGH finding before fixing — advisors hallucinate
 6. FIX by severity, re-verify after each
 7. COMMIT the round (per-round granularity, not a batch)
