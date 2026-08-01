@@ -99,7 +99,7 @@ codex exec --skip-git-repo-check \
 
 Parse: `verdict=$(codex exec … | jq -r '.verdict')`. Values: `PASS`, `PASS_WITH_FIXES`, `BLOCKS`.
 
-**Usage-limit fallback:** if the call returns "usage limit" / "quota exceeded" / HTTP 429, re-run ONCE with `-m gpt-5.4` (lighter tier still on Plus quota). If that also fails, exit the phase with a note in the round's commit message — do NOT ship as "SAFE" without Codex verdict; the whole point of Phase 2 is cross-vendor coverage. Pause and let the user decide (wait for quota reset, or ship consciously without Codex).
+**Usage-limit fallback:** if the call returns "usage limit" / "quota exceeded" / HTTP 429, re-run ONCE with `-m gpt-5.4` (lighter tier still on Plus quota). If that also fails, **PAUSE the loop and surface the situation to the user** — do NOT advance to Phase 3 and do NOT ship. Print: "Phase 2 blocked: Codex quota exhausted at <ts>. Options: (a) wait <T> for reset then resume, (b) ship consciously without cross-vendor coverage, (c) abort." Wait for user decision. This is the only Phase 2 exit that is not `PASS` — every other termination advances to Phase 3.
 
 **Connectivity failure:** if codex exits with network error, retry once after 30s. On second failure, pause the phase (same as quota-exhausted).
 

@@ -22,10 +22,15 @@
         "properties": {
           "severity": { "enum": ["BLOCKER", "HIGH", "MEDIUM", "LOW"] },
           "file": { "type": "string", "description": "Absolute path" },
-          "line": { "type": "integer", "minimum": 1 },
+          "line": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "1-indexed line; use 0 for whole-file findings (module layout, missing header, wrong file entirely)."
+          },
           "rationale": {
             "type": "string",
-            "description": "One paragraph: what breaks, why, what to verify. <=200 chars."
+            "maxLength": 240,
+            "description": "One paragraph: what breaks, why, what to verify. <=200 chars target; schema caps at 240 to allow a small overshoot without hard-reject."
           }
         }
       }
