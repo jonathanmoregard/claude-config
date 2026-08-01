@@ -374,8 +374,12 @@ async def run(args):
                 "ready_failed": artifacts.get("ready_failed"),
                 "shot_failed": artifacts.get("shot_failed"),
             })
-            if args.strict_artifacts and any(
-                artifacts.get(k) for k in ("aria_failed", "dom_failed", "ready_failed", "shot_failed")
+            # R5 (Codex HIGH): ready_failed + shot_failed ALWAYS exit non-zero
+            # (agents / CI must see them). ARIA/DOM stay opt-in via --strict.
+            if artifacts.get("ready_failed") or artifacts.get("shot_failed"):
+                exit_code = 1
+            if args.strict_artifacts and (
+                artifacts.get("aria_failed") or artifacts.get("dom_failed")
             ):
                 exit_code = 1
             if status and status >= 400:
@@ -471,7 +475,8 @@ def main() -> int:
     ap.add_argument("--no-dom", action="store_true",
                     help="Skip DOM box-model dump (default: emit <shot>.dom.json)")
     ap.add_argument("--strict-artifacts", action="store_true",
-                    help="Exit non-zero when any requested artifact (aria/dom) fails to emit")
+                    help="Also exit non-zero on aria/dom failures. "
+                         "ready/shot failures ALWAYS exit non-zero regardless of this flag.")
     args = ap.parse_args()
     return asyncio.run(run(args))
 
