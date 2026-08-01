@@ -139,9 +139,13 @@ later triples. Omit `--count` and the pattern is suppressed permanently.
 
 **Wired (2026-08-01).** `/review-improvements` now runs
 `~/.claude/proposals/permissions/on-decision <proposal> <outcome>` after each
-recorded decision (implemented → `implemented`; rejected and skipped →
-`rejected`, `--count` extracted from the `## Friction` line when present).
-Draining by hand still requires the manual `record-decision.py` call above.
+recorded decision (implemented/accepted → `implemented`; rejected and skipped →
+`rejected`; deferred → nothing recorded, pattern stays live; `--count`
+extracted from the `## Friction` line when present). The mapping lives in
+`~/.claude/proposals/gate-config.json` under `on_decision.permissions` — the
+skill reads that map, so re-pointing or disabling the callback is a config
+edit, not a skill edit. Draining by hand still requires the manual
+`record-decision.py` call above.
 
 ## Retention
 
