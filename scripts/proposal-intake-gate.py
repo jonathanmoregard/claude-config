@@ -48,6 +48,13 @@ DEFAULT_CONFIG_PATH = "~/.claude/proposals/gate-config.json"
 # Overall wall cap for pr-context collection: one hung `gh` (or many repos)
 # must not starve the actual gating run.
 PR_CONTEXT_WALL_CAP = 120
+# Whole-run lock. Lives under ~/.claude/logs, NOT in the spine:
+# push-proposals.sh commits the proposals/ subtree wholesale, so a lock file
+# inside it would land in the pushed git history on every run.
+GATE_LOCK_PATH = "~/.claude/logs/gate.lock"
+# How long --run-callback waits for the lock before giving up (the gating run
+# itself never waits: contended means another gate is active, exit 0).
+CALLBACK_LOCK_TIMEOUT_SECONDS = 10.0
 
 DEFAULTS = {
     # Root of the proposals spine; every proposal subdir lives directly under it.
@@ -127,6 +134,26 @@ def contained(path, root):
     return rp == rr or rp.startswith(rr + os.sep)
 
 
+def acquire_gate_lock(timeout=0.0):
+    """Open GATE_LOCK_PATH and take an exclusive flock, retrying non-blocking
+    attempts until `timeout` seconds have passed. Returns the open file object
+    (keep it referenced until process exit) or None when the lock stayed
+    contended. OSError from open/makedirs propagates to the caller."""
+    lock_path = os.path.expanduser(GATE_LOCK_PATH)
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    lock_fh = open(lock_path, "w")
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return lock_fh
+        except OSError:
+            if time.monotonic() >= deadline:
+                lock_fh.close()
+                return None
+            time.sleep(0.2)
+
+
 def require_under_home(path, label):
     home = os.path.expanduser("~")
     if not contained(path, home):
@@ -135,13 +162,15 @@ def require_under_home(path, label):
 
 
 def load_config(path):
-    """Merge the user's config file over DEFAULTS (one level of nesting deep).
+    """Merge the user's config file over DEFAULTS (one level of nesting deep:
+    dict values merge one level; list values replace wholesale).
 
     A missing config file is fine — defaults apply. A present-but-broken one
     is not: better to stop than to gate against the wrong spine. Config paths
-    that write or get grepped (spine_root, gate_log, search_paths) must
-    realpath-resolve under $HOME — this script runs unattended and its config
-    file is only as trusted as whatever last wrote it.
+    that write or get grepped (spine_root, gate_log, search_paths, and the
+    pr_context repo paths — they set gh's cwd and join the scorer's grep
+    roots) must realpath-resolve under $HOME — this script runs unattended
+    and its config file is only as trusted as whatever last wrote it.
     """
     cfg = json.loads(json.dumps(DEFAULTS))  # deep copy
     if os.path.isfile(path):
@@ -162,6 +191,10 @@ def load_config(path):
     require_under_home(cfg["gate_log"], "gate_log")
     for p in cfg["search_paths"]:
         require_under_home(p, "search_paths entry")
+    for p in pr["repo_roots"]:
+        require_under_home(p, "pr_context.repo_roots entry")
+    for name, p in pr["extra_repos"].items():
+        require_under_home(p, "pr_context.extra_repos[%r]" % name)
     return cfg
 
 
@@ -220,10 +253,12 @@ def parse_gate_block(lines, start, end):
 
 
 def load_gate_log_index(cfg):
-    """{(qualified_file_id, date, verdict)} for every line this script has
-    written to the gate log. A gate: block in a proposal only counts as real
-    if it reconciles against one of these — producers write frontmatter
-    wholesale, so an unreconciled block is spurious and gets re-scored."""
+    """{(file_id, date, verdict)} for every line this script has written to
+    the gate log. A gate: block in a proposal only counts as real if it
+    reconciles against one of these — producers write frontmatter wholesale,
+    so an unreconciled block is spurious and gets re-scored. Current entries
+    carry subdir-qualified ids; legacy (pre-qualified) entries recorded the
+    bare basename and are matched against candidates' basenames."""
     index = set()
     try:
         with open(cfg["gate_log"], encoding="utf-8") as fh:
@@ -342,11 +377,18 @@ def collect_candidates(cfg, repair=True):
                 verdict, bdate = parse_gate_block(lines, block[0], block[1])
                 if (qid, bdate, verdict) in log_index:
                     continue  # genuinely gated by a prior run of this script
+                if (fname, bdate, verdict) in log_index:
+                    # Legacy gate-log lines (pre-qualified ids) recorded the
+                    # bare basename — still honor them, or an upgrade would
+                    # strip and re-score every previously gated proposal.
+                    continue
                 log("warning: %s carries a gate block with no matching "
                     "gate-log line — stripping it and re-scoring" % qid)
                 content = "".join(lines[:block[0]] + lines[block[1]:])
                 if repair:
-                    atomic_write(fpath, content)
+                    # Same realpath semantics as annotate(): a symlinked
+                    # proposal stays a symlink; its target gets rewritten.
+                    atomic_write(os.path.realpath(fpath), content)
             candidates.append({
                 "id": qid,
                 "path": os.path.abspath(fpath),
@@ -497,7 +539,8 @@ def save_raw_scorer_output(stdout):
     path = os.path.join(logs_dir, "gate-scorer-raw-%s.txt" % ts)
     if os.path.exists(path):  # two failures within one second
         path = os.path.join(logs_dir, "gate-scorer-raw-%s-%d.txt" % (ts, os.getpid()))
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fd = os.open(path,
+                 os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(stdout)
     os.chmod(path, 0o600)
@@ -534,6 +577,11 @@ def parse_verdicts(stdout, candidates):
             return None
         if not isinstance(evidence, str):
             log("error: evidence for %s is not a string" % fid)
+            return None
+        if fid in verdicts:
+            # No silent last-write-wins: conflicting entries mean the scorer
+            # did not follow the contract — reject the whole batch.
+            log("error: duplicate verdict for file id %r — batch rejected" % fid)
             return None
         verdicts[fid] = (verdict, sanitize_evidence(evidence))
     return verdicts
@@ -576,17 +624,38 @@ def run_callback(cfg, subdir, proposal_path, decision):
     never shells out to an arbitrary configured string: the callback must
     realpath-resolve under ~/.claude, be a regular file (not itself a
     symlink), be owned by the current uid, carry no group/other write bits,
-    and be executable. Executed as list argv, shell=False.
+    and be executable. The proposal path must realpath-resolve inside the
+    spine subdir the callback was registered for (following the subdir
+    symlink — production rsi resolves outside spine_root's realpath) and
+    under $HOME. Executed as list argv, shell=False.
     """
     if decision not in VALID_DECISIONS:
         log("error: invalid decision %r (want %s)"
             % (decision, "|".join(VALID_DECISIONS)))
+        return 1
+    if not SUBDIR_RE.match(subdir):
+        log("error: nonconforming subdir name %r — refusing callback" % subdir)
         return 1
     callback = cfg.get("on_decision", {}).get(subdir)
     if not callback:
         log("no on_decision callback configured for subdir %r — nothing to run"
             % subdir)
         return 0
+    # Same whole-run lock as gating: callbacks may rewrite or move proposal
+    # files, and racing a concurrent gate's check-then-replace would corrupt
+    # them. Bounded blocking (unlike the gating run's single attempt) because
+    # callbacks are human-invoked and a short wait beats a spurious failure.
+    try:
+        lock_fh = acquire_gate_lock(timeout=CALLBACK_LOCK_TIMEOUT_SECONDS)
+    except OSError as exc:
+        log("error: cannot open lock file %s: %s"
+            % (os.path.expanduser(GATE_LOCK_PATH), exc))
+        return 1
+    if lock_fh is None:  # else: held until process exit
+        log("error: could not acquire the gate lock at %s within %ds — "
+            "another gate run is active; retry shortly"
+            % (os.path.expanduser(GATE_LOCK_PATH), CALLBACK_LOCK_TIMEOUT_SECONDS))
+        return 1
     callback = os.path.expanduser(str(callback))
     claude_root = os.path.expanduser("~/.claude")
     problems = []
@@ -609,6 +678,17 @@ def run_callback(cfg, subdir, proposal_path, decision):
             % (callback, subdir, "; ".join(problems)))
         return 1
     proposal_path = os.path.realpath(proposal_path)
+    # The callback only ever gets a proposal from the subdir it was
+    # registered for. Containment is checked against the subdir dir with its
+    # symlink followed (NOT against spine_root's realpath) precisely so the
+    # production rsi symlink keeps working; the $HOME check mirrors
+    # discover_subdirs' rule for symlinks escaping home.
+    subdir_root = os.path.join(cfg["spine_root"], subdir)
+    if not (contained(proposal_path, subdir_root)
+            and contained(proposal_path, os.path.expanduser("~"))):
+        log("error: proposal path %s does not resolve inside %s — refusing "
+            "callback" % (proposal_path, subdir_root))
+        return 1
     # No shell, no capture: the callback's stdout/stderr surface verbatim.
     proc = subprocess.run([callback, proposal_path, decision])
     return proc.returncode
@@ -642,18 +722,17 @@ def main(argv=None):
         # Single-instance discipline (R9): the gating run strips/annotates
         # frontmatter (check-then-replace) and appends to the gate log —
         # two concurrent runs would interleave both. --list never writes
-        # (repair=False below), so it stays lock-free.
-        lock_path = os.path.join(cfg["spine_root"], ".gate.lock")
+        # (repair=False below), so it stays lock-free. The lock file lives
+        # under ~/.claude/logs (see GATE_LOCK_PATH), never in the spine.
         try:
-            lock_fh = open(lock_path, "w")  # held until process exit
+            lock_fh = acquire_gate_lock()  # held until process exit
         except OSError as exc:
-            log("error: cannot open lock file %s: %s" % (lock_path, exc))
+            log("error: cannot open lock file %s: %s"
+                % (os.path.expanduser(GATE_LOCK_PATH), exc))
             return 1
-        try:
-            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        if lock_fh is None:
             log("proposal-intake-gate: another instance holds the lock at %s "
-                "— exiting without gating" % lock_path)
+                "— exiting without gating" % os.path.expanduser(GATE_LOCK_PATH))
             return 0
 
     candidates, excluded = collect_candidates(cfg, repair=not args.list)

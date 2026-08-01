@@ -30,11 +30,21 @@ else
 fi
 
 # The spine: legacy RSI dir (rsi/ in the unified folder symlinks to it) plus
-# the unified proposals folder (gate annotations, gate-log.jsonl, other subdirs).
-git add recursive-self-improvement/proposals/ proposals/
-if git diff --cached --quiet -- recursive-self-improvement/proposals/ proposals/; then
+# the unified proposals folder (gate annotations, gate-config.json, other
+# subdirs). gate-log.jsonl (per-host forensics) and .gate.lock (retired lock
+# location, pre-2026-08) are local runtime state — excluded so they never
+# land in the pushed history. gate-config.json stays versioned deliberately:
+# it is user config.
+SPINE_PATHS=(
+  recursive-self-improvement/proposals/
+  proposals/
+  ':(exclude)proposals/gate-log.jsonl'
+  ':(exclude)proposals/.gate.lock'
+)
+git add -- "${SPINE_PATHS[@]}"
+if git diff --cached --quiet -- "${SPINE_PATHS[@]}"; then
   echo "No proposal changes to commit"
   exit 0
 fi
-git commit -m "improvement proposals: $(date +%Y-%m-%d)" -- recursive-self-improvement/proposals/ proposals/
+git commit -m "improvement proposals: $(date +%Y-%m-%d)" -- "${SPINE_PATHS[@]}"
 git push
