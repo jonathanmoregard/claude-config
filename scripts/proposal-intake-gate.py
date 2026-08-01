@@ -27,10 +27,10 @@ nothing is compiled in — see DEFAULTS.
 
 Exit codes:
   0  gated everything eligible (or nothing was eligible)
-  2  scorer dispatch failed (primary and fallback)
-  3  scorer output unparseable or invalid — nothing gated
-  4  scorer returned verdicts for only part of the batch — the returned ones
-     are annotated, the rest stay ungated for the next run
+  2  every scorer dispatch failed (primary and fallback) — nothing gated
+  3  scorer output unparseable or invalid and nothing gated
+  4  some proposals gated, the rest deferred to the next run (a failed or
+     partially-answered chunk) — annotated chunks stay annotated
 """
 import argparse
 import datetime
@@ -69,6 +69,9 @@ DEFAULTS = {
         "fallback_model": "opus",        # ... opus when fable is capped/absent
         "allowed_tools": "Read Grep Glob",  # read-only: the scorer never writes
         "timeout_seconds": 600,
+        # Max proposals per scorer dispatch: a 50-file backlog must never land
+        # on the model as one prompt (budget blowout + all-or-nothing parse).
+        "batch_size": 10,
     },
     # Where the scorer should grep for prior art, beyond the repos referenced
     # by the proposals themselves.
@@ -197,6 +200,10 @@ def load_config(path):
         require_under_home(p, "pr_context.repo_roots entry")
     for name, p in pr["extra_repos"].items():
         require_under_home(p, "pr_context.extra_repos[%r]" % name)
+    bs = cfg["scorer"].get("batch_size")
+    if isinstance(bs, bool) or not isinstance(bs, int) or bs < 1:
+        raise ValueError("scorer.batch_size must be a positive integer, got %r"
+                         % (bs,))
     return cfg
 
 
@@ -215,17 +222,35 @@ def split_frontmatter(text):
     return None
 
 
-def is_ungated_pending(text):
+def has_settled_status(fm):
+    """True when the frontmatter carries a status field that is anything
+    other than pending (rejected/implemented/deferred/info/...) — a human or
+    producer already decided, so the file is out of gate scope. A missing
+    status field is NOT settled: producers with their own frontmatter shapes
+    (e.g. the permissions evaluator) still get gated."""
+    return bool(re.search(r"(?m)^status:", fm)
+                and not re.search(r"(?m)^status:\s*pending\s*$", fm))
+
+
+def candidate_state(text):
+    """Gate-eligibility of a proposal's text:
+      "no-frontmatter"  no --- frontmatter block at all: eligible; annotate()
+                        prepends a fresh frontmatter carrying the gate block
+      "pending"         frontmatter with status: pending, or with no status
+                        field (pending-equivalent): eligible
+      "settled"         status is anything other than pending: excluded
+      "gated"           frontmatter already carries a gate: block
+    """
     parsed = split_frontmatter(text)
     if parsed is None:
-        return False
+        return "no-frontmatter"
     lines, closing = parsed
     fm = "".join(lines[1:closing])
-    if not re.search(r"(?m)^status:\s*pending\s*$", fm):
-        return False
     if re.search(r"(?m)^gate:", fm):
-        return False
-    return True
+        return "gated"
+    if has_settled_status(fm):
+        return "settled"
+    return "pending"
 
 
 def find_gate_block(lines, closing):
@@ -330,14 +355,21 @@ def discover_subdirs(cfg):
 
 def collect_candidates(cfg, repair=True):
     """([{id, path, subdir, basename, content}], [exclusion notes]) for every
-    ungated pending proposal. Ids are always subdir-qualified
-    (`<subdir>/<basename>`) — one scheme everywhere, including the gate log.
+    ungated proposal. Ids are always subdir-qualified (`<subdir>/<basename>`)
+    — one scheme everywhere, including the gate log.
 
-    A pending file carrying a gate: block is only skipped when that block
-    reconciles against the gate log (qualified id + date + verdict). An
-    unreconciled block is spurious (producers write frontmatter wholesale):
-    it is stripped from the file (when `repair` is true) and the proposal is
-    re-scored this run.
+    Coverage matches what push-proposals.sh ships: EVERY allowlisted .md in a
+    discovered subdir is a candidate unless it opts out. Files with no
+    frontmatter at all, or frontmatter with no status field (producers with
+    their own formats, e.g. the permissions evaluator), are pending-equivalent
+    and get gated; only an explicit non-pending status (rejected/implemented/
+    deferred/info/...) or a reconciled gate block excludes a file.
+
+    A file carrying a gate: block is only skipped when that block reconciles
+    against the gate log (qualified id + date + verdict). An unreconciled
+    block is spurious (producers write frontmatter wholesale): it is stripped
+    from the file (when `repair` is true) and the proposal is re-scored this
+    run.
     """
     log_index = load_gate_log_index(cfg)
     candidates, excluded = [], []
@@ -366,26 +398,27 @@ def collect_candidates(cfg, repair=True):
                     content = fh.read()
             except OSError:
                 continue
-            parsed = split_frontmatter(content)
-            if parsed is None:
-                continue
-            lines, closing = parsed
-            fm = "".join(lines[1:closing])
-            if not re.search(r"(?m)^status:\s*pending\s*$", fm):
-                continue
             qid = subdir + "/" + fname
-            block = find_gate_block(lines, closing)
-            if block is not None:
-                verdict, bdate = parse_gate_block(lines, block[0], block[1])
-                if (qid, bdate, verdict) in log_index:
-                    continue  # genuinely gated by a prior run of this script
-                log("warning: %s carries a gate block with no matching "
-                    "gate-log line — stripping it and re-scoring" % qid)
-                content = "".join(lines[:block[0]] + lines[block[1]:])
-                if repair:
-                    # Same realpath semantics as annotate(): a symlinked
-                    # proposal stays a symlink; its target gets rewritten.
-                    atomic_write(os.path.realpath(fpath), content)
+            parsed = split_frontmatter(content)
+            if parsed is not None:
+                lines, closing = parsed
+                fm = "".join(lines[1:closing])
+                if has_settled_status(fm):
+                    continue  # human/producer already decided — out of scope
+                block = find_gate_block(lines, closing)
+                if block is not None:
+                    verdict, bdate = parse_gate_block(lines, block[0], block[1])
+                    if (qid, bdate, verdict) in log_index:
+                        continue  # genuinely gated by a prior run of this script
+                    log("warning: %s carries a gate block with no matching "
+                        "gate-log line — stripping it and re-scoring" % qid)
+                    content = "".join(lines[:block[0]] + lines[block[1]:])
+                    if repair:
+                        # Same realpath semantics as annotate(): a symlinked
+                        # proposal stays a symlink; its target gets rewritten.
+                        atomic_write(os.path.realpath(fpath), content)
+            # parsed is None → no frontmatter: still a candidate (annotate()
+            # creates the frontmatter) — push-proposals.sh would ship it.
             candidates.append({
                 "id": qid,
                 "path": os.path.abspath(fpath),
@@ -588,16 +621,18 @@ def parse_verdicts(stdout, candidates):
 
 
 def annotate(candidate, verdict, evidence, model, today):
-    """Insert the gate: block just before the closing --- of the frontmatter.
+    """Write the gate: block into the proposal — inserted just before the
+    closing --- when frontmatter exists, or as a freshly created frontmatter
+    block prepended to the file (body bytes untouched) when it does not.
     Atomic write; preserves file mode. Operates on the proposal's realpath so
     a symlinked proposal keeps being a symlink and its target gets replaced."""
     path = os.path.realpath(candidate["path"])
     with open(path, encoding="utf-8", errors="replace") as fh:
         text = fh.read()
-    if not is_ungated_pending(text):
+    state = candidate_state(text)
+    if state not in ("pending", "no-frontmatter"):
         # Changed underneath us since collection — leave it alone.
         return False
-    lines, closing = split_frontmatter(text)
     block = (
         "gate:\n"
         "  verdict: %s\n"
@@ -605,7 +640,11 @@ def annotate(candidate, verdict, evidence, model, today):
         "  model: %s\n"
         "  date: %s\n" % (verdict, json.dumps(evidence), model, today)
     )
-    new_text = "".join(lines[:closing]) + block + "".join(lines[closing:])
+    if state == "no-frontmatter":
+        new_text = "---\n" + block + "---\n" + text
+    else:
+        lines, closing = split_frontmatter(text)
+        new_text = "".join(lines[:closing]) + block + "".join(lines[closing:])
     atomic_write(path, new_text)
     return True
 
@@ -759,52 +798,72 @@ def main(argv=None):
     context_path = collect_pr_context(repos, cfg)
     log("pr-context: %s" % context_path)
 
+    # Chunked dispatch: at most scorer.batch_size proposals per scorer call,
+    # sequentially. A failed chunk (dispatch or parse) leaves ONLY that chunk
+    # ungated for the next run; chunks already annotated stay annotated.
+    batch_size = cfg["scorer"]["batch_size"]
+    chunks = [candidates[i:i + batch_size]
+              for i in range(0, len(candidates), batch_size)]
+    today = datetime.date.today().isoformat()
+    gated = 0
+    dispatch_failures = parse_failures = 0
+    ungated_ids = []
     try:
-        prompt = build_prompt(candidates, repos, context_path, cfg)
-        stdout, model = dispatch_scorer(prompt, cfg)
+        for idx, chunk in enumerate(chunks, 1):
+            if len(chunks) > 1:
+                log("dispatching chunk %d/%d (%d proposal(s))"
+                    % (idx, len(chunks), len(chunk)))
+            prompt = build_prompt(chunk, repos, context_path, cfg)
+            stdout, model = dispatch_scorer(prompt, cfg)
+            if stdout is None:
+                dispatch_failures += 1
+                ungated_ids.extend(c["id"] for c in chunk)
+                continue
+            verdicts = parse_verdicts(stdout, chunk)
+            if verdicts is None:
+                parse_failures += 1
+                raw_path = save_raw_scorer_output(stdout)
+                log("scorer output unusable for this chunk — raw output "
+                    "preserved at %s (0600)" % raw_path)
+                ungated_ids.extend(c["id"] for c in chunk)
+                continue
+            for c in chunk:
+                if c["id"] not in verdicts:
+                    ungated_ids.append(c["id"])
+                    continue
+                verdict, evidence = verdicts[c["id"]]
+                if annotate(c, verdict, evidence, model, today):
+                    gated += 1
+                    append_gate_log(cfg, {
+                        "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+                        "date": today,
+                        "file": c["id"],
+                        "path": c["path"],
+                        "subdir": c["subdir"],
+                        "verdict": verdict,
+                        "evidence": evidence,
+                        "model": model,
+                    })
+                    log("gated %s: %s" % (c["id"], verdict))
     finally:
         # The scorer only needs the context file during dispatch (R6).
         try:
             os.unlink(context_path)
         except OSError:
             pass
-    if stdout is None:
-        return 2
 
-    verdicts = parse_verdicts(stdout, candidates)
-    if verdicts is None:
-        raw_path = save_raw_scorer_output(stdout)
-        log("scorer output unusable — raw output preserved at %s (0600)" % raw_path)
-        log("nothing gated; rerun after fixing the scorer")
+    if not ungated_ids:
+        log("proposal-intake-gate: gated %d proposal(s)" % gated)
+        return 0
+    log("warning: no verdict applied for: %s" % ", ".join(ungated_ids))
+    log("their annotations are deferred to the next run")
+    if gated:
+        return 4  # partial progress: annotated chunks stay annotated
+    if parse_failures:
         return 3
-
-    today = datetime.date.today().isoformat()
-    gated = 0
-    for c in candidates:
-        if c["id"] not in verdicts:
-            continue
-        verdict, evidence = verdicts[c["id"]]
-        if annotate(c, verdict, evidence, model, today):
-            gated += 1
-            append_gate_log(cfg, {
-                "ts": datetime.datetime.now().isoformat(timespec="seconds"),
-                "date": today,
-                "file": c["id"],
-                "path": c["path"],
-                "subdir": c["subdir"],
-                "verdict": verdict,
-                "evidence": evidence,
-                "model": model,
-            })
-            log("gated %s: %s" % (c["id"], verdict))
-
-    missing = [c["id"] for c in candidates if c["id"] not in verdicts]
-    if missing:
-        log("warning: scorer returned no verdict for: %s" % ", ".join(missing))
-        log("their annotations are deferred to the next run")
-        return 4
-    log("proposal-intake-gate: gated %d proposal(s)" % gated)
-    return 0
+    if dispatch_failures:
+        return 2
+    return 4  # scorer answered but returned no usable verdicts — still partial
 
 
 if __name__ == "__main__":
