@@ -11,7 +11,16 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 S="$(dirname "$HERE")"
 TESTHOME="$S/.testhome"
 STAGE="$HERE/stage"
+# The scratchpad this was built in kept a settings.json copy under ../ref/; the
+# installed tree does not, so fall back to the pristine fixture committed beside
+# this harness. Both are the same file — a copy of the real settings.json taken
+# before the feature was ever installed.
 SNAPSHOT="$S/ref/settings.json.snapshot"
+[[ -f "$SNAPSHOT" ]] || SNAPSHOT="$HERE/settings.pristine.json"
+if [[ ! -f "$SNAPSHOT" ]]; then
+  echo "run-tests.sh: no settings snapshot at $S/ref/settings.json.snapshot or $HERE/settings.pristine.json" >&2
+  exit 1
+fi
 
 export FAKE_CRONTAB_FILE="$HERE/fake-crontab.txt"
 export PL_CRONTAB="$HERE/fake-crontab"
@@ -29,7 +38,8 @@ BEFORE_HASH="$(sha256sum < "$HERE/crontab.before")"
 rm -rf "$TESTHOME" "$STAGE" "$FAKE_CRONTAB_FILE"
 mkdir -p "$TESTHOME/.claude" "$STAGE"
 cp "$SNAPSHOT" "$TESTHOME/.claude/settings.json"
-cp "$SNAPSHOT" "$HERE/settings.pristine.json"
+# No-op (and an error) when the snapshot already IS the pristine fixture.
+[[ "$SNAPSHOT" -ef "$HERE/settings.pristine.json" ]] || cp "$SNAPSHOT" "$HERE/settings.pristine.json"
 
 # A pre-existing crontab in the fake crontab store, so the remove-then-append
 # convention is exercised against real content.
@@ -41,7 +51,7 @@ CRON
 
 cp "$S/install.sh" "$S/uninstall.sh" "$S/run-evaluate.sh" "$S/prompt.md" "$S/README.md" "$STAGE/"
 chmod +x "$STAGE/run-evaluate.sh"
-for f in hook.py aggregate.py; do
+for f in hook.py aggregate.py record-decision.py; do
   if [[ -f "$S/$f" ]]; then
     cp "$S/$f" "$STAGE/$f"
     echo "using real $f from siblings"
@@ -115,7 +125,7 @@ expect $? "run-evaluate.sh was copied into the ledger dir"
 expect $? "run-evaluate.sh is executable at the destination (cron runs it directly)"
 [[ "$(stat -c '%a' "$TESTHOME/.claude/permission-ledger/run-evaluate.sh")" == "700" ]]
 expect $? "run-evaluate.sh is 0700"
-for f in hook.py aggregate.py prompt.md README.md; do
+for f in hook.py aggregate.py record-decision.py prompt.md README.md; do
   [[ -f "$TESTHOME/.claude/permission-ledger/$f" ]]
   expect $? "$f was copied into the ledger dir"
 done
