@@ -20,8 +20,10 @@ import asyncio
 import json
 import os
 import pathlib
+import re
 import sys
 from typing import Optional
+from urllib.parse import urlparse
 
 try:
     import yaml  # type: ignore
@@ -151,6 +153,31 @@ async def _capture_one(
         viewport={"width": width, "height": height},
         device_scale_factor=2,
     )
+    try:
+        return await _capture_body(
+            ctx, url, selector, ready_selector, out_path,
+            dev_auth_token, dev_auth_header_name, dev_auth_cookie,
+            emit_aria, emit_dom,
+        )
+    finally:
+        # R3 fix ([both] HIGH): context MUST close even on exception, else
+        # per-width leaks accumulate until browser tear-down.
+        await ctx.close()
+
+
+async def _capture_body(
+    ctx,
+    url: str,
+    selector: Optional[str],
+    ready_selector: str,
+    out_path: pathlib.Path,
+    dev_auth_token: Optional[str],
+    dev_auth_header_name: str,
+    dev_auth_cookie: Optional[str],
+    emit_aria: bool,
+    emit_dom: bool,
+) -> tuple[int, dict]:
+    """Actual capture logic; caller owns ctx lifecycle."""
     if dev_auth_cookie:
         # Cookie form: `name=value` or `name=value; domain=host`. When no
         # `domain=` part, use the target URL — Playwright requires either
@@ -174,24 +201,30 @@ async def _capture_one(
     status = resp.status if resp else 0
     if status >= 400:
         sys.stderr.write(f"[visual-verify] HTTP {status} for {url}\n")
-    # Detect auth wall — final URL's path matches a login route as a full path
-    # segment (not substring: `/user/loginhistory` and `/docs/oauth-setup` are
-    # not auth walls). Advisor flagged the substring version; fix is regex on
-    # segments.
-    import re as _re
-    auth_paths_re = _re.compile(r"(^|/)(login|signin|oauth|magic)(/|$)")
-    from urllib.parse import urlparse as _urlparse
-    if auth_paths_re.search(_urlparse(page.url).path):
-        sys.stderr.write(f"[visual-verify] auth wall — landed on {page.url}\n")
-        status = 401
+    # Detect auth wall — check path AND fragment AND query for login-ish routes
+    # (hash-router redirects `/#/login` and query-only `/?next=login` were both
+    # advisor-flagged R3 as blind spots). Path-segment regex, not substring.
+    auth_paths_re = re.compile(r"(^|/)(login|signin|oauth|magic)(/|$|=)")
+    _pu = urlparse(page.url)
+    for source in (_pu.path, _pu.fragment, _pu.query):
+        if source and auth_paths_re.search(source):
+            sys.stderr.write(f"[visual-verify] auth wall — landed on {page.url}\n")
+            status = 401
+            break
     # Readiness — replace 'main' with your app's ready selector for accuracy.
+    # R3 sentinel: if the ready selector never appears, mark ready_failed so the
+    # caller sees `[ready!]` and --strict-artifacts exits non-zero (was silent).
+    ready_failed: Optional[str] = None
     try:
         await page.wait_for_selector(ready_selector, state="visible", timeout=8000)
     except Exception as e:
         sys.stderr.write(f"[visual-verify] readiness wait failed: {e}\n")
+        ready_failed = str(e)
     await page.evaluate("document.fonts.ready")
 
     artifacts = {}
+    if ready_failed:
+        artifacts["ready_failed"] = ready_failed
     # Short selector timeout — advisor flagged 30s default hang on bad selectors
     # (multiplied by widths = minutes of silent wait).
     SEL_TIMEOUT_MS = 2000
@@ -201,7 +234,11 @@ async def _capture_one(
             el = page.locator(selector).first
             await el.screenshot(path=str(out_path), timeout=SEL_TIMEOUT_MS)
         except Exception as e:
-            sys.stderr.write(f"[visual-verify] selector capture failed: {e}\n")
+            sys.stderr.write(f"[visual-verify] selector capture failed: {e} — falling back to full-page (marked [shot!])\n")
+            # R3 sentinel: silent fallback to full-page misled callers into
+            # thinking the intended selector rendered. Mark shot_failed so the
+            # PNG filename doesn't lie about what's inside.
+            artifacts["shot_failed"] = str(e)
             await page.screenshot(path=str(out_path), full_page=True)
     else:
         await page.screenshot(path=str(out_path), full_page=True)
@@ -252,7 +289,6 @@ async def _capture_one(
             sys.stderr.write(f"[visual-verify] dom dump failed: {e}\n")
             artifacts["dom_failed"] = str(e)
 
-    await ctx.close()
     return status, artifacts
 
 
@@ -307,7 +343,9 @@ async def run(args):
     async with async_playwright() as p:
         browser = await p.chromium.launch()
         for width in widths:
-            safe_sel = (args.selector or "fullpage").replace(".", "_").replace(">", "-").replace("#", "_").replace(" ", "_")
+            # R3 fix (Codex HIGH): selectors like `a[href="/login"]` had quotes
+            # and slashes that became a bogus nested path. Aggressive sanitize.
+            safe_sel = re.sub(r"[^\w-]", "_", args.selector or "fullpage").strip("_") or "fullpage"
             filename = f"{safe_sel}-{width}.png"
             out_path = out_dir / filename
             status, artifacts = await _capture_one(
@@ -329,8 +367,12 @@ async def run(args):
                 "aria": artifacts.get("aria"), "dom": artifacts.get("dom"),
                 "aria_failed": artifacts.get("aria_failed"),
                 "dom_failed": artifacts.get("dom_failed"),
+                "ready_failed": artifacts.get("ready_failed"),
+                "shot_failed": artifacts.get("shot_failed"),
             })
-            if args.strict_artifacts and (artifacts.get("aria_failed") or artifacts.get("dom_failed")):
+            if args.strict_artifacts and any(
+                artifacts.get(k) for k in ("aria_failed", "dom_failed", "ready_failed", "shot_failed")
+            ):
                 exit_code = 1
             if status and status >= 400:
                 exit_code = 1
@@ -343,6 +385,10 @@ async def run(args):
 
     for s in shots:
         parts = []
+        if s.get("ready_failed"):
+            parts.append("[ready!]")
+        if s.get("shot_failed"):
+            parts.append("[shot!]")
         for k in ("aria", "dom"):
             if s.get(k):
                 parts.append(f"[{k}]")
@@ -356,6 +402,10 @@ async def run(args):
 def _write_index(out_dir: pathlib.Path, shots: list[dict]) -> None:
     def _links(s):
         parts = []
+        if s.get("ready_failed"):
+            parts.append('<span style="color:#f77">ready!</span>')
+        if s.get("shot_failed"):
+            parts.append('<span style="color:#f77">shot!</span>')
         if s.get("aria"):
             parts.append(f'<a href="{s["aria"]}">aria.yaml</a>')
         elif s.get("aria_failed"):
