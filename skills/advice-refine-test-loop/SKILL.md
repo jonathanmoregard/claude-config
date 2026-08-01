@@ -34,12 +34,21 @@ Each Phase 1/2 round follows the same shape:
 1. SELF-REVIEW: read each changed file top-to-bottom (not just diff)
 2. VERIFY: tests + syntax + smoke green before inviting external eyes
 3. ADVISE: dispatch the phase's advisor (Opus in phase 1, Codex in phase 2)
-4. PARSE verdict: `jq -r '.verdict'` on advisor output. If not parseable JSON,
-   the round FAILED — re-dispatch once with an explicit "output valid JSON
-   matching verdict-schema.json" reminder. Second failure PAUSEs the loop
-   (interactive: prompt user; unattended: append to `pending_for_human.md`
-   and exit `pending-human`). NEVER treat unparseable output as advance-
-   worthy — a round that can't emit a verdict has produced zero coverage.
+4. PARSE + CROSS-VALIDATE verdict: `jq -r '.verdict'` on advisor output; if not parseable JSON, the round FAILED. Then **cross-validate verdict against findings** (the JSON schema enum can't enforce this on its own — `codex --output-schema` and jq both accept incoherent combinations):
+
+   ```bash
+   verdict=$(jq -r '.verdict' <<<"$out")
+   blockers=$(jq '[.findings[] | select(.severity=="BLOCKER" or .severity=="HIGH")] | length' <<<"$out")
+   findings_count=$(jq '.findings | length' <<<"$out")
+
+   if [[ "$verdict" == "PASS" && "$findings_count" -gt 0 ]]; then bad=1; fi
+   if [[ "$verdict" == "PASS_WITH_FIXES" && "$blockers" -gt 0 ]]; then bad=1; fi
+   if [[ "$verdict" == "BLOCKS" && "$blockers" -eq 0 ]]; then bad=1; fi
+   ```
+
+   Any of: unparseable JSON, missing `.verdict`, or verdict/findings mismatch → the round FAILED. Re-dispatch once with an explicit "output valid JSON matching verdict-schema.json AND ensure verdict matches findings (PASS = empty findings; PASS_WITH_FIXES = no BLOCKER/HIGH; BLOCKS = ≥1 BLOCKER/HIGH)" reminder.
+
+   Second failure PAUSEs the loop (interactive: prompt user; unattended: append to `pending_for_human.md` and exit `pending-human`). NEVER treat unparseable output or a mismatched verdict as advance-worthy — an incoherent advisor response has produced zero trustworthy coverage.
 5. REPRODUCE each BLOCKER/HIGH finding before fixing — advisors hallucinate
 6. FIX by severity, re-verify after each
 7. COMMIT the round (per-round granularity, not a batch)
