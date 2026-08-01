@@ -12,6 +12,7 @@ Security posture:
 - File is size-capped and rotates once (.1 backup) at 10 MB.
 - Never blocks: any failure exits 0 silently. Instrumentation, not gate.
 """
+import fcntl
 import json
 import os
 import re
@@ -20,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 OUT = Path.home() / ".claude" / "automation-review" / "prompts.jsonl"
+LOCK = Path.home() / ".claude" / "automation-review" / ".rotate.lock"
 PROMPT_TRUNCATE = 500
 SIZE_CAP_BYTES = 10 * 1024 * 1024
 
@@ -88,23 +90,46 @@ def redact(text: str) -> str:
 
 
 def rotate_if_needed(path: Path) -> None:
+    # Serialize concurrent hooks via a lockfile. Without this, two hooks that
+    # both cross SIZE_CAP_BYTES race the .1-unlink + rename sequence and one
+    # rotated backup can be silently destroyed. flock is advisory but every
+    # caller of rotate_if_needed goes through this same function, so it's
+    # enforced in practice. LOCK_NB → if another hook holds it, skip rotation
+    # this invocation (the file grows slightly past cap; next tick rotates).
+    lock_fd = None
     try:
-        if path.exists() and path.stat().st_size >= SIZE_CAP_BYTES:
-            backup = path.with_suffix(path.suffix + ".1")
-            if backup.exists():
-                backup.unlink()
-            path.rename(backup)
-            # Backup inherits the file's mode at rename time. If the caller had
-            # not yet chmod'ed the source (e.g. first run against a pre-existing
-            # loose file), the .1 backup would be world-readable. Force 0600
-            # explicitly — this is the same posture the live file will have
-            # after the caller's chmod.
+        # Open with O_CREAT+0o600 so the lockfile itself isn't world-readable
+        # (it contains no data but its presence still tracks activity).
+        lock_fd = os.open(str(LOCK), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError):
+            return  # another hook is rotating; leave it to them
+        try:
+            if path.exists() and path.stat().st_size >= SIZE_CAP_BYTES:
+                backup = path.with_suffix(path.suffix + ".1")
+                if backup.exists():
+                    backup.unlink()
+                path.rename(backup)
+                # Backup inherits the file's mode at rename time. Force 0600
+                # in case the source was pre-fix (0644) or umask drift.
+                try:
+                    os.chmod(backup, 0o600)
+                except Exception:
+                    pass
+        finally:
             try:
-                os.chmod(backup, 0o600)
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
             except Exception:
                 pass
     except Exception:
         pass
+    finally:
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except Exception:
+                pass
 
 
 def main() -> None:
