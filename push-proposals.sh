@@ -48,6 +48,10 @@ else
   fi
 fi
 
+# R9 item 6: everything below assumes ~/.claude is a git checkout — fail
+# with one clear message instead of whatever git add would emit.
+git -C ~/.claude rev-parse --show-toplevel >/dev/null 2>&1 || { echo "error: ~/.claude is not a git checkout — cannot stage or push proposals." >&2; exit 1; }
+
 # The spine: legacy RSI dir (rsi/ in the unified folder symlinks to it) plus
 # the unified proposals folder (gate annotations, gate-config.json, other
 # subdirs). gate-log.jsonl (per-host forensics) and .gate.lock (retired lock

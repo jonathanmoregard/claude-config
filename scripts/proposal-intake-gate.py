@@ -27,7 +27,9 @@ nothing is compiled in — see DEFAULTS.
 
 Exit codes:
   0  gated everything eligible (or nothing was eligible)
-  2  every scorer dispatch failed (primary and fallback) — nothing gated
+  2  nothing gated: config error (invalid values, or an explicitly given
+     --config/PROPOSAL_GATE_CONFIG path that is missing/unreadable), or
+     every scorer dispatch failed (primary and fallback)
   3  scorer output unparseable or invalid and nothing gated
   4  ungated content present: a failed or partially-answered chunk left
      proposals for the next run (annotated chunks stay annotated), and/or
@@ -102,6 +104,14 @@ DEFAULTS = {
 
 VALID_VERDICTS = ("sharp", "duplicate", "rot")
 VALID_DECISIONS = ("implemented", "rejected", "deferred")
+# The read-only-scorer invariant, enforced STRUCTURALLY (R9 item 1): whatever
+# wrote the config, the scorer's tool set must stay a non-empty subset of
+# these — a Write/Edit/Bash-capable "scorer" is a second unattended writer.
+SCORER_TOOL_ALLOWLIST = frozenset(("Read", "Grep", "Glob"))
+# Model names land in `claude --model <value>` argv and (JSON-quoted) in gate
+# blocks: allowlist the shape early — no whitespace, no '#', no leading dash
+# that argv parsing could read as a flag (R9 item 3).
+MODEL_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,64}$")
 EVIDENCE_MAX = 200
 REPO_REF_RE = re.compile(r"(?:~|/home/[A-Za-z0-9._-]+)/Repos/([A-Za-z0-9._-]+)")
 # Candidate ids are embedded verbatim in the scorer's instruction text, so
@@ -197,16 +207,32 @@ def require_under_home(path, label):
                          % (label, path, home))
 
 
-def load_config(path):
+def validate_model_name(value, label):
+    """Model names must be argv- and YAML-scalar-safe (see MODEL_RE)."""
+    if not isinstance(value, str) or not MODEL_RE.match(value) \
+            or value.startswith("-"):
+        raise ValueError("%s must match %s and not start with '-', got %r"
+                         % (label, MODEL_RE.pattern, value))
+
+
+def load_config(path, explicit=False):
     """Merge the user's config file over DEFAULTS (one level of nesting deep:
     dict values merge one level; list values replace wholesale).
 
-    A missing config file is fine — defaults apply. A present-but-broken one
-    is not: better to stop than to gate against the wrong spine. Config paths
+    A missing config file at the BUILT-IN default path is fine — defaults
+    apply, with one announced log line. A missing/unreadable file at an
+    EXPLICITLY provided path (--config flag or PROPOSAL_GATE_CONFIG env,
+    `explicit=True`) is a hard error: silently gating against DEFAULTS when
+    the caller pointed at a specific file would gate the wrong spine (R9
+    item 2). A present-but-broken file is always an error. Config paths
     that write or get grepped (spine_root, gate_log, search_paths, and the
     pr_context repo paths — they set gh's cwd and join the scorer's grep
     roots) must realpath-resolve under $HOME — this script runs unattended
     and its config file is only as trusted as whatever last wrote it.
+
+    The scorer sub-config is validated here regardless of source (defaults
+    or user config): read-only tool set, argv-safe model names, positive
+    integer timeout and batch size.
     """
     cfg = json.loads(json.dumps(DEFAULTS))  # deep copy
     if os.path.isfile(path):
@@ -217,6 +243,10 @@ def load_config(path):
                 cfg[key].update({k: v for k, v in value.items() if v is not None})
             elif value is not None:
                 cfg[key] = value
+    elif explicit:
+        raise ValueError("explicitly configured path is missing or not a file")
+    else:
+        log("config absent at %s; using built-in defaults" % path)
     cfg["spine_root"] = os.path.expanduser(cfg["spine_root"])
     cfg["gate_log"] = os.path.expanduser(cfg["gate_log"])
     cfg["search_paths"] = [os.path.expanduser(p) for p in cfg["search_paths"]]
@@ -231,7 +261,24 @@ def load_config(path):
         require_under_home(p, "pr_context.repo_roots entry")
     for name, p in pr["extra_repos"].items():
         require_under_home(p, "pr_context.extra_repos[%r]" % name)
-    bs = cfg["scorer"].get("batch_size")
+    scorer = cfg["scorer"]
+    # R9 item 1: the read-only-scorer invariant is structural, not advisory.
+    tools = scorer.get("allowed_tools")
+    tokens = tools.split() if isinstance(tools, str) else []
+    if not tokens or not set(tokens) <= SCORER_TOOL_ALLOWLIST:
+        raise ValueError(
+            "scorer.allowed_tools must be a non-empty subset of %r, got %r"
+            % (" ".join(sorted(SCORER_TOOL_ALLOWLIST)), tools))
+    validate_model_name(scorer.get("model"), "scorer.model")
+    # An unset/empty fallback means "no fallback" (dispatch_scorer skips it);
+    # a non-empty one must be as argv-safe as the primary.
+    if scorer.get("fallback_model"):
+        validate_model_name(scorer["fallback_model"], "scorer.fallback_model")
+    ts = scorer.get("timeout_seconds")
+    if isinstance(ts, bool) or not isinstance(ts, int) or ts < 1:
+        raise ValueError("scorer.timeout_seconds must be a positive integer, "
+                         "got %r" % (ts,))
+    bs = scorer.get("batch_size")
     if isinstance(bs, bool) or not isinstance(bs, int) or bs < 1:
         raise ValueError("scorer.batch_size must be a positive integer, got %r"
                          % (bs,))
@@ -324,6 +371,22 @@ def find_gate_block(lines, closing):
     return None
 
 
+def unquote_json_scalar(value):
+    """Strip the JSON quoting annotate() applies to model/date scalars.
+    Blocks written by THIS version carry `date: "YYYY-MM-DD"`; reconciliation
+    compares against the unquoted gate-log value. Unquoted values (verdicts,
+    plus any hand-shaped block — which never reconciles anyway) pass
+    through untouched."""
+    if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return value
+        if isinstance(parsed, str):
+            return parsed
+    return value
+
+
 def parse_gate_block(lines, start, end):
     """(verdict, date) as written in the block — either may be None."""
     verdict = date = None
@@ -333,7 +396,7 @@ def parse_gate_block(lines, start, end):
             verdict = m.group(1)
         m = re.match(r"^[ \t]+date:\s*(\S+)\s*$", line)
         if m:
-            date = m.group(1)
+            date = unquote_json_scalar(m.group(1))
     return verdict, date
 
 
@@ -832,12 +895,16 @@ def annotate(candidate, verdict, evidence, model, today):
     if state not in ("pending", "no-frontmatter"):
         # Changed underneath us since collection — leave it alone.
         return False
+    # Model and date are JSON-quoted like evidence (R9 item 3): verdict is
+    # allowlisted upstream, but model/date must never be able to splice raw
+    # YAML into the frontmatter. parse_gate_block unquotes them again.
     block = (
         "gate:\n"
         "  verdict: %s\n"
         "  evidence: %s\n"
         "  model: %s\n"
-        "  date: %s\n" % (verdict, json.dumps(evidence), model, today)
+        "  date: %s\n" % (verdict, json.dumps(evidence),
+                          json.dumps(model), json.dumps(today))
     )
     if state == "no-frontmatter":
         new_text = "---\n" + block + "---\n" + text
@@ -911,6 +978,28 @@ def run_callback(cfg, subdir, proposal_path, decision):
             problems.append("group/other writable")
         if not os.access(callback, os.X_OK):
             problems.append("not executable")
+    if not problems:
+        # R9 item 4: the file's own bits are not enough — a group/other-
+        # writable ANCESTOR lets a non-owner swap the callback (or a whole
+        # parent dir) wholesale. Walk the realpath parents up to and
+        # including ~/.claude (containment above guarantees termination).
+        d = os.path.dirname(os.path.realpath(callback))
+        stop = os.path.realpath(claude_root)
+        while True:
+            try:
+                dst = os.stat(d)
+            except OSError as exc:
+                problems.append("cannot stat parent dir %s: %s" % (d, exc))
+                break
+            if dst.st_mode & 0o022:
+                problems.append("parent dir %s is group/other writable" % d)
+                break
+            if d == stop:
+                break
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
     if problems:
         log("error: refusing on_decision callback %s for subdir %r: %s"
             % (callback, subdir, "; ".join(problems)))
@@ -934,10 +1023,9 @@ def run_callback(cfg, subdir, proposal_path, decision):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Annotate pending proposals with independent scorer verdicts.")
-    parser.add_argument("--config",
-                        default=os.environ.get("PROPOSAL_GATE_CONFIG",
-                                               DEFAULT_CONFIG_PATH),
-                        help="gate config JSON (default: %s)" % DEFAULT_CONFIG_PATH)
+    parser.add_argument("--config", default=None,
+                        help="gate config JSON (default: $PROPOSAL_GATE_CONFIG"
+                             " or %s)" % DEFAULT_CONFIG_PATH)
     parser.add_argument("--list", action="store_true",
                         help="print what would be gated, dispatch nothing")
     parser.add_argument("--run-callback", nargs=3,
@@ -947,11 +1035,17 @@ def main(argv=None):
                              % "|".join(VALID_DECISIONS))
     args = parser.parse_args(argv)
 
+    # R9 item 2: an explicitly provided config path (--config flag or
+    # PROPOSAL_GATE_CONFIG env) must exist — only the built-in default path
+    # may silently fall back to DEFAULTS (load_config announces it).
+    env_config = os.environ.get("PROPOSAL_GATE_CONFIG")
+    explicit = args.config is not None or bool(env_config)
+    config_path = args.config if args.config else (env_config or DEFAULT_CONFIG_PATH)
     try:
-        cfg = load_config(os.path.expanduser(args.config))
+        cfg = load_config(os.path.expanduser(config_path), explicit=explicit)
     except (OSError, ValueError) as exc:
-        log("error: cannot load gate config %s: %s" % (args.config, exc))
-        return 1
+        log("error: cannot load gate config %s: %s" % (config_path, exc))
+        return 2
 
     if args.run_callback:
         return run_callback(cfg, *args.run_callback)
