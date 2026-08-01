@@ -29,8 +29,10 @@ Exit codes:
   0  gated everything eligible (or nothing was eligible)
   2  every scorer dispatch failed (primary and fallback) — nothing gated
   3  scorer output unparseable or invalid and nothing gated
-  4  some proposals gated, the rest deferred to the next run (a failed or
-     partially-answered chunk) — annotated chunks stay annotated
+  4  ungated content present: a failed or partially-answered chunk left
+     proposals for the next run (annotated chunks stay annotated), and/or
+     the spine holds push-blocking files the gate cannot cover (bad-named
+     .md, stray non-.md, nonconforming subdir) — push must not proceed
 """
 import argparse
 import datetime
@@ -222,23 +224,50 @@ def split_frontmatter(text):
     return None
 
 
+# The ONLY status values that settle a file (a human or producer already
+# decided). `open` counts as settled here because the pre-round-6 gate never
+# scored it (it was "anything but pending") and live spines carry it;
+# `skipped` is written by review-improvements decision records. Everything
+# else fails CLOSED: quoted pending, unknown strings (`wip`), parse oddities
+# are all pending-equivalent and get gated — empirically, `status: "pending"`
+# used to slip past an exact-match test and ship ungated.
+SETTLED_STATUSES = frozenset((
+    "rejected", "implemented", "deferred", "info", "open", "archived",
+    "skipped"))
+
+
+def normalize_status_value(value):
+    """Normalize a raw frontmatter status value: strip a trailing comment
+    (whitespace + '#'), surrounding whitespace, and one layer of matching
+    quotes. Anything this cannot reduce to a bare word stays as-is and will
+    fail the settled match (fail closed)."""
+    value = re.sub(r"\s#.*$", "", value).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        value = value[1:-1].strip()
+    return value
+
+
 def has_settled_status(fm):
-    """True when the frontmatter carries a status field that is anything
-    other than pending (rejected/implemented/deferred/info/...) — a human or
-    producer already decided, so the file is out of gate scope. A missing
-    status field is NOT settled: producers with their own frontmatter shapes
-    (e.g. the permissions evaluator) still get gated."""
-    return bool(re.search(r"(?m)^status:", fm)
-                and not re.search(r"(?m)^status:\s*pending\s*$", fm))
+    """True ONLY when the frontmatter carries a status field whose value,
+    after normalize_status_value(), exactly matches SETTLED_STATUSES — the
+    file is then out of gate scope. Any other value — `pending`, quoted
+    `"pending"`, `pending  # note`, unknown strings — and a missing status
+    field are pending-equivalent: producers with their own frontmatter
+    shapes (e.g. the permissions evaluator) still get gated."""
+    m = re.search(r"(?m)^status:(.*)$", fm)
+    if not m:
+        return False
+    return normalize_status_value(m.group(1)) in SETTLED_STATUSES
 
 
 def candidate_state(text):
     """Gate-eligibility of a proposal's text:
       "no-frontmatter"  no --- frontmatter block at all: eligible; annotate()
                         prepends a fresh frontmatter carrying the gate block
-      "pending"         frontmatter with status: pending, or with no status
-                        field (pending-equivalent): eligible
-      "settled"         status is anything other than pending: excluded
+      "pending"         frontmatter with a status that does not normalize
+                        into SETTLED_STATUSES, or with no status field
+                        (pending-equivalent, fail closed): eligible
+      "settled"         status normalizes into SETTLED_STATUSES: excluded
       "gated"           frontmatter already carries a gate: block
     """
     parsed = split_frontmatter(text)
@@ -362,8 +391,8 @@ def collect_candidates(cfg, repair=True):
     discovered subdir is a candidate unless it opts out. Files with no
     frontmatter at all, or frontmatter with no status field (producers with
     their own formats, e.g. the permissions evaluator), are pending-equivalent
-    and get gated; only an explicit non-pending status (rejected/implemented/
-    deferred/info/...) or a reconciled gate block excludes a file.
+    and get gated; only a status normalizing into SETTLED_STATUSES or a
+    reconciled gate block excludes a file.
 
     A file carrying a gate: block is only skipped when that block reconciles
     against the gate log (qualified id + date + verdict). An unreconciled
@@ -427,6 +456,85 @@ def collect_candidates(cfg, repair=True):
                 "content": content,
             })
     return candidates, excluded
+
+
+def blocker_display(root, path):
+    """Path as printed in a push-blocker line: relative to the spine root,
+    control characters (an attacker-shaped filename may embed newlines)
+    replaced, length capped."""
+    rel = os.path.relpath(path, root)
+    return CONTROL_RE.sub("?", rel)[:200]
+
+
+def collect_push_blockers(cfg):
+    """[{path, display, reason}] for every file push-proposals.sh would stage
+    from the spine that the gate cannot cover — each one is a fail-open path
+    (it would ship ungated), so its presence must block the push (exit 4).
+
+    Non-blocking exclusions: files matching excluded_files (dotfiles,
+    README*), subdirs matching excluded_subdirs (archived/, dot-dirs),
+    spine-root gate-config.json and gate-log.jsonl (versioned config /
+    push-excluded forensics), and symlinked subdirs escaping $HOME (git
+    stages the symlink object, not the content behind it)."""
+    root = cfg["spine_root"]
+    home = os.path.expanduser("~")
+    covered = {path for _, path in discover_subdirs(cfg)}
+    root_special = ("gate-config.json", "gate-log.jsonl")
+    blockers = []
+
+    def note(path, reason):
+        blockers.append({"path": path,
+                         "display": blocker_display(root, path),
+                         "reason": reason})
+
+    def note_tree(top, reason):
+        for base, _dirs, files in os.walk(top):
+            for f in sorted(files):
+                note(os.path.join(base, f), reason)
+
+    try:
+        entries = sorted(os.listdir(root))
+    except OSError:
+        return blockers
+    for name in entries:
+        full = os.path.join(root, name)
+        if os.path.isdir(full):  # follows symlinks, like discover_subdirs
+            if any(fnmatch.fnmatch(name, pat) for pat in cfg["excluded_subdirs"]):
+                continue
+            if not SUBDIR_RE.match(name):
+                note_tree(full, "inside a subdir with a nonconforming name")
+                continue
+            if not contained(full, home):
+                continue  # skipped by discovery; git stages only the symlink
+            if full not in covered:
+                # e.g. an explicit `subdirs` config narrower than the spine.
+                note_tree(full, "subdir not covered by the gate scan")
+                continue
+            for fname in sorted(os.listdir(full)):
+                fpath = os.path.join(full, fname)
+                if any(fnmatch.fnmatch(fname, pat) for pat in cfg["excluded_files"]):
+                    continue
+                if os.path.isdir(fpath):
+                    note_tree(fpath, "nested directory — the gate never scans it")
+                elif not fname.endswith(".md"):
+                    note(fpath, "non-.md file — push would ship it ungated")
+                elif not FILENAME_RE.match(fname):
+                    note(fpath, "nonconforming .md filename")
+        else:
+            if name in root_special:
+                continue
+            if any(fnmatch.fnmatch(name, pat) for pat in cfg["excluded_files"]):
+                continue
+            note(full, "file at the spine root — the gate never scans it")
+    return blockers
+
+
+def report_push_blockers(blockers):
+    log("error: %d file(s) would be staged by push-proposals.sh but cannot "
+        "be gated:" % len(blockers))
+    for b in blockers:
+        log("  - %s: %s" % (b["display"], b["reason"]))
+    log("rename them to conform (or move them under archived/) and rerun the gate")
 
 
 def is_git_checkout(path):
@@ -775,10 +883,16 @@ def main(argv=None):
             return 0
 
     candidates, excluded = collect_candidates(cfg, repair=not args.list)
+    # Round-6 item 2: push-proposals.sh stages the spine subtree wholesale,
+    # so content the gate cannot cover must BLOCK the push (exit 4), not
+    # slip past it with a log line.
+    blockers = collect_push_blockers(cfg)
 
     if args.list:
         for note in excluded:
             log("excluded (nonconforming filename) in subdir: %s" % note["subdir"])
+        for b in blockers:
+            log("would block push: %s (%s)" % (b["display"], b["reason"]))
         for c in candidates:
             log("would gate: %s" % c["path"])
         return 0
@@ -790,6 +904,9 @@ def main(argv=None):
         append_gate_log(cfg, dict(note, ts=now))
 
     if not candidates:
+        if blockers:
+            report_push_blockers(blockers)
+            return 4  # nothing to dispatch, but the push must not proceed
         log("proposal-intake-gate: nothing to gate (no ungated pending proposals under %s)"
             % cfg["spine_root"])
         return 0
@@ -852,13 +969,15 @@ def main(argv=None):
         except OSError:
             pass
 
+    if blockers:
+        report_push_blockers(blockers)
     if not ungated_ids:
         log("proposal-intake-gate: gated %d proposal(s)" % gated)
-        return 0
+        return 4 if blockers else 0  # blockers: ungated content would ship
     log("warning: no verdict applied for: %s" % ", ".join(ungated_ids))
     log("their annotations are deferred to the next run")
-    if gated:
-        return 4  # partial progress: annotated chunks stay annotated
+    if gated or blockers:
+        return 4  # partial progress and/or push-blocking ungated content
     if parse_failures:
         return 3
     if dispatch_failures:

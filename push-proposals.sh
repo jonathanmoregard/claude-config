@@ -21,6 +21,9 @@ else
   python3 "$GATE" || gate_rc=$?
   if [[ "$gate_rc" -eq 4 ]]; then
     echo "proposal-intake-gate: partial batch — rerun the gate; do not bypass." >&2
+    echo "Exit 4 can also mean push-blocking files with nonconforming names" >&2
+    echo "(listed above): rename them to conform, or move them under" >&2
+    echo "proposals/archived/, then rerun the gate." >&2
     exit 1
   elif [[ "$gate_rc" -ne 0 ]]; then
     echo "proposal-intake-gate failed (exit $gate_rc) — push aborted." >&2
