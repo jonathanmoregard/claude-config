@@ -66,7 +66,7 @@ through you, in `/review-improvements`.
 ├── YYYY-MM.jsonl      the ledger, one month per file, 0600
 ├── digest-latest.json what the nightly agent reads, 0600
 ├── digest-prev.json   the run before that, kept for diffing
-├── decided.json       pattern_key -> your decision, written by /review-improvements
+├── decided.json       pattern_key -> your decision, written by record-decision.py
 └── hook-errors.log    anything the hook swallowed
 ~/.claude/proposals/permissions/
 ├── YYYY-MM-DD-<slug>.md     pending proposals
@@ -125,14 +125,22 @@ mv ~/.claude/proposals/permissions/2026-08-01-read-home-jonathan-claude.md \
    ~/.claude/proposals/permissions/archived/
 ```
 
-Record the outcome in `decided.json` so the pattern is not re-proposed nightly:
+Then record the outcome, or the pattern comes back in tomorrow's digest and
+every digest after it:
 
-```json
-{"Read:/home/jonathan/.claude": {"decision": "implemented", "date": "2026-08-01", "count_at_decision": 47}}
+```sh
+~/.claude/permission-ledger/record-decision.py \
+  'Read:/home/jonathan/.claude' implemented --count 47
 ```
 
-`decision` is `implemented` or `rejected`. A rejected pattern earns exactly one
-re-ask if its count later triples.
+`--count` is the number from the proposal's `## Friction` line. It is what makes
+the single re-ask work: a `rejected` pattern returns exactly once, if its count
+later triples. Omit `--count` and the pattern is suppressed permanently.
+
+**Nothing does this for you.** `/review-improvements` walks the proposals folder
+but knows nothing about this feature, so draining a proposal without running
+`record-decision.py` leaves the ledger re-proposing a decision you already made.
+Wiring the two together is the obvious next improvement.
 
 ## Retention
 
