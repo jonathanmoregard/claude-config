@@ -72,8 +72,10 @@ Codex enforces the schema via `codex exec --output-schema ~/.claude/skills/advic
 
 | Specialist | Trigger — dispatch when diff touches | How to dispatch |
 |---|---|---|
-| `insecure-defaults` skill | secrets loading, auth code, env-var-driven config, module defaults, feature flags | Fresh Opus subagent via `Agent(subagent_type="advisor", prompt="Invoke the insecure-defaults skill on <paths>. Emit findings in verdict-schema.json format.")` |
+| `insecure-defaults` skill | secrets loading, auth code, env-var-driven config, module defaults, feature flags | Fresh Opus subagent via `Agent(subagent_type="advisor", prompt="Invoke the insecure-defaults skill on <paths>. If Skill tool is unavailable in this session (advisor.md was recently edited without a session restart), fall back to applying the skill's checklist manually from your training. Emit findings in verdict-schema.json format.")` |
 | `sharp-edges` skill | new public API surface, config schema, CLI flag design, cryptographic function ergonomics | Same shape as above |
+
+**advisor.md now includes `Skill` in its tool whitelist** — safe because Skill invocation is metadata-only (loads instructions into the subagent's context); any tool the loaded skill prescribes that is not in the whitelist still fails, preserving the read-only invariant. NEW SESSION REQUIRED after editing advisor.md; specialist dispatches in a stale session fall back to manual checklist application (still useful, marginally lower recall).
 
 Dispatch specialists in the SAME tool-use block as the primary Opus advisor (parallel — independent read-only reviews, no shared state). Merge findings by (file, line) dedupe; specialist findings inherit the primary's phase counter but are tagged in commit messages (`[specialist:insecure-defaults]`). If BOTH the primary and a specialist flag the same location, treat as higher-confidence — reproduce first.
 
