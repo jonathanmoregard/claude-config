@@ -199,6 +199,10 @@
           {
             "type": "command",
             "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/evolve-reminder.py"
+          },
+          {
+            "type": "command",
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/hooks/prompt-log.py"
           }
         ]
       },

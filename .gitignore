@@ -114,3 +114,7 @@ skills/nixos-agenix-secret
 
 # CI-stability monitoring runtime (per-PR logs + state)
 loops/
+
+# Prompt-log JSONL (populated by hooks/prompt-log.py) — high-churn,
+# session-local. Skill /prompt-review-weekly clusters into backlog.
+automation-review/
