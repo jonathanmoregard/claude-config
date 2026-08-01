@@ -20,31 +20,27 @@ The dispatch prompt lists absolute file paths under "Re-read fresh:". Read each 
 
 # Output format
 
-Severity-ranked findings, each with a file:line citation and one-paragraph rationale.
+Emit valid JSON matching the schema in `~/.claude/skills/advice-refine-test-loop/verdict-schema.json`. No prose outside the JSON block, no markdown fence, no preamble. The parent parses your output with `jq -r '.verdict'` — anything that isn't parseable JSON breaks the loop.
 
-```
-## BLOCKER
-- path/to/file.ts:42 — <one paragraph: what's broken, why it blocks shipping, what to verify>
-
-## HIGH
-- ...
-
-## MEDIUM
-- ...
-
-## LOW
-- ...
-
-## Verdict
-SAFE TO SHIP
+```json
+{
+  "verdict": "PASS" | "PASS_WITH_FIXES" | "BLOCKS",
+  "verdict_reason": "<one-line rationale, empty for PASS>",
+  "findings": [
+    {
+      "severity": "BLOCKER" | "HIGH" | "MEDIUM" | "LOW",
+      "file": "<absolute path>",
+      "line": <int>,
+      "rationale": "<one paragraph: what breaks, why, what to verify; ≤200 chars>"
+    }
+  ]
+}
 ```
 
-or
-
-```
-## Verdict
-BLOCKS SHIPPING: <one-line reason citing the BLOCKER>
-```
+Verdict semantics:
+- `PASS` — no findings above LOW (LOW list may be empty or non-empty; consolidator handles LOWs).
+- `PASS_WITH_FIXES` — only LOW findings remain. Parent's consolidator sub-loop will auto-fix.
+- `BLOCKS` — at least one BLOCKER or HIGH that gates shipping. `verdict_reason` MUST cite the single most important one.
 
 # Severity definitions
 

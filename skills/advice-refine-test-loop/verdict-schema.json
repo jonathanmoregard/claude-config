@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AdvisorVerdict",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "verdict_reason", "findings"],
+  "properties": {
+    "verdict": {
+      "enum": ["PASS", "PASS_WITH_FIXES", "BLOCKS"],
+      "description": "PASS = no findings above LOW; PASS_WITH_FIXES = only LOWs remain, consolidator can auto-fix; BLOCKS = at least one BLOCKER or HIGH that gates shipping"
+    },
+    "verdict_reason": {
+      "type": "string",
+      "description": "One-line rationale. Cite the single BLOCKER/HIGH driving BLOCKS, or 'no findings above LOW' for PASS_WITH_FIXES, or empty string for PASS."
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "file", "line", "rationale"],
+        "properties": {
+          "severity": { "enum": ["BLOCKER", "HIGH", "MEDIUM", "LOW"] },
+          "file": { "type": "string", "description": "Absolute path" },
+          "line": { "type": "integer", "minimum": 1 },
+          "rationale": {
+            "type": "string",
+            "description": "One paragraph: what breaks, why, what to verify. <=200 chars."
+          }
+        }
+      }
+    }
+  }
+}
