@@ -236,6 +236,13 @@ async def _capture_body(
     if selector:
         try:
             el = page.locator(selector).first
+            # R6: count() short-circuit before screenshot — Playwright's
+            # actionability wait ignores the `timeout` kwarg on missing
+            # elements (waits full 30s regardless). Same fix R1 applied to
+            # aria_snapshot. Discovered when repro of R5's shot_failed took
+            # 30s per width instead of 2s.
+            if await el.count() == 0:
+                raise RuntimeError(f"selector {selector!r} matches nothing")
             await el.screenshot(path=str(out_path), timeout=SEL_TIMEOUT_MS)
         except Exception as e:
             sys.stderr.write(f"[visual-verify] selector capture failed: {e} — falling back to full-page (marked [shot!])\n")
