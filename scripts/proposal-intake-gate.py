@@ -132,6 +132,28 @@ def log(msg):
     print(msg, flush=True)
 
 
+def read_text_strict(path):
+    """Read raw bytes and decode strict UTF-8 — newline='' semantics: no
+    universal-newline translation (a CRLF proposal keeps its \\r\\n bytes) and
+    no errors='replace' mangling. Raises UnicodeDecodeError on non-UTF8
+    content; callers classify such files as nonconforming and NEVER rewrite
+    them (round 7: text-mode reads silently rewrote bytes on annotate)."""
+    with open(path, "rb") as fh:
+        data = fh.read()
+    return data.decode("utf-8")
+
+
+def split_lines_keepends(text):
+    """Split on \\n ONLY, keeping the terminator on each line. Unlike
+    str.splitlines this never splits on \\r, \\x0b, \\u2028 etc., so a CRLF
+    file's lines carry their \\r and re-joining round-trips byte-identically."""
+    parts = text.split("\n")
+    lines = [p + "\n" for p in parts[:-1]]
+    if parts[-1]:
+        lines.append(parts[-1])
+    return lines
+
+
 def contained(path, root):
     """True when `path` realpath-resolves to `root` or below it."""
     rp = os.path.realpath(path)
@@ -215,7 +237,7 @@ def split_frontmatter(text):
     closing --- line."""
     if not text.startswith("---"):
         return None
-    lines = text.splitlines(keepends=True)
+    lines = split_lines_keepends(text)
     if lines[0].strip() != "---":
         return None
     for i in range(1, len(lines)):
@@ -336,11 +358,13 @@ def load_gate_log_index(cfg):
 
 
 def atomic_write(path, text):
-    """Atomic same-directory replace, preserving the file's mode."""
+    """Atomic same-directory replace, preserving the file's mode.
+    newline='' end-to-end: `text` was read without newline translation, so
+    it must be written back without any either."""
     mode = os.stat(path).st_mode
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".gate-tmp-")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
             fh.write(text)
         os.chmod(tmp, mode & 0o7777)
         os.replace(tmp, path)
@@ -423,8 +447,11 @@ def collect_candidates(cfg, repair=True):
             if not os.path.isfile(fpath):
                 continue
             try:
-                with open(fpath, encoding="utf-8", errors="replace") as fh:
-                    content = fh.read()
+                content = read_text_strict(fpath)
+            except UnicodeDecodeError:
+                # Non-UTF8: never a candidate, never rewritten —
+                # collect_push_blockers reports it and forces exit 4.
+                continue
             except OSError:
                 continue
             qid = subdir + "/" + fname
@@ -470,6 +497,9 @@ def collect_push_blockers(cfg):
     """[{path, display, reason}] for every file push-proposals.sh would stage
     from the spine that the gate cannot cover — each one is a fail-open path
     (it would ship ungated), so its presence must block the push (exit 4).
+    Covers bad-named .md, stray non-.md, nonconforming subdirs, and (round 7)
+    .md files that do not strict-decode as UTF-8: the gate must never rewrite
+    such bytes, so it can never annotate them either.
 
     Non-blocking exclusions: files matching excluded_files (dotfiles,
     README*), subdirs matching excluded_subdirs (archived/, dot-dirs),
@@ -520,6 +550,14 @@ def collect_push_blockers(cfg):
                     note(fpath, "non-.md file — push would ship it ungated")
                 elif not FILENAME_RE.match(fname):
                     note(fpath, "nonconforming .md filename")
+                else:
+                    try:
+                        read_text_strict(fpath)
+                    except UnicodeDecodeError:
+                        note(fpath, "not valid UTF-8 — the gate cannot "
+                                    "annotate it")
+                    except OSError:
+                        pass
         else:
             if name in root_special:
                 continue
@@ -733,10 +771,17 @@ def annotate(candidate, verdict, evidence, model, today):
     closing --- when frontmatter exists, or as a freshly created frontmatter
     block prepended to the file (body bytes untouched) when it does not.
     Atomic write; preserves file mode. Operates on the proposal's realpath so
-    a symlinked proposal keeps being a symlink and its target gets replaced."""
+    a symlinked proposal keeps being a symlink and its target gets replaced.
+
+    Byte fidelity (round 7): the file is read strict-UTF-8 with newline=''
+    semantics and written back the same way, so every byte outside the
+    inserted block round-trips identically (CRLF files stay CRLF). The gate
+    block itself ALWAYS uses \\n line endings — documented contract."""
     path = os.path.realpath(candidate["path"])
-    with open(path, encoding="utf-8", errors="replace") as fh:
-        text = fh.read()
+    try:
+        text = read_text_strict(path)
+    except UnicodeDecodeError:
+        return False  # turned non-UTF8 underneath us — never rewrite it
     state = candidate_state(text)
     if state not in ("pending", "no-frontmatter"):
         # Changed underneath us since collection — leave it alone.

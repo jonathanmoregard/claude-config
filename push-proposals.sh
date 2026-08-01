@@ -2,6 +2,22 @@
 set -euo pipefail
 cd ~/.claude
 
+# Symlink-drift guard (round 7): the gate's conformance scan covers the
+# legacy rsi content ONLY through the proposals/rsi symlink, while
+# SPINE_PATHS below stages recursive-self-improvement/proposals/ directly.
+# If install drift removed, retargeted, or replaced that symlink with a real
+# dir, the gate would scan nothing in legacy while the push still ships it —
+# ungated. Fail closed before the gate even runs.
+RSI_LINK="proposals/rsi"
+RSI_LEGACY="recursive-self-improvement/proposals"
+if [[ ! -L "$RSI_LINK" || ! -d "$RSI_LEGACY" \
+      || "$(readlink -f -- "$RSI_LINK" 2>/dev/null)" != "$(readlink -f -- "$RSI_LEGACY" 2>/dev/null)" ]]; then
+  echo "error: $RSI_LINK is not a symlink resolving to $RSI_LEGACY — the gate cannot see the legacy rsi content this push would ship." >&2
+  echo "Remedy: re-run install.sh (restores the rsi symlink)." >&2
+  echo "If $RSI_LINK is a real directory, merge its files into $RSI_LEGACY and remove it first — install.sh never overwrites a hand-curated dir." >&2
+  exit 1
+fi
+
 # Intake gate first: every ungated pending proposal gets an independent
 # scorer verdict (sharp|duplicate|rot + cited evidence) annotated into its
 # frontmatter before anything ships for human review. Nonzero gate exit
