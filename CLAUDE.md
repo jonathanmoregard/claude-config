@@ -52,7 +52,7 @@ Explicit user instructions always override this.
 
 ## Autonomous build+review (default for substantial work)
 
-- For anything you'd branch for — features, migrations, redesigns, "build build build" sessions, multi-chunk reviews — invoke the `autonomous-orchestration` skill and follow it: orchestrate via fresh-context subagents, never implement inline. Not for trivial single-file edits or quick questions.
+- For anything you'd branch for — features, migrations, redesigns, "build build build" sessions, multi-chunk reviews — invoke the `orchestrate` skill (renamed from autonomous-orchestration 2026-08-02 — /auto prefix collided with the /autofix-pr builtin) and follow it: orchestrate via fresh-context subagents, never implement inline. Not for trivial single-file edits or quick questions.
 
 ## Execution style
 
