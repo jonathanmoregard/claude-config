@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Warns if the current Claude model is Fable, at most once per 10 minutes.
+# Warns if the current Claude model is Sonnet, at most once per 10 minutes.
 #
-# Restored 2026-08-02 from opus-warn.sh. The old script read the "model" key from
-# settings.json; that key no longer exists (model is picked per-session via /model),
-# so detection now reads the most recent assistant model from the session transcript
-# handed to the hook on stdin. settings.json remains a fallback for an explicit pin.
+# Restored 2026-08-02 as fable-warn.sh (from opus-warn.sh), rewritten same day as
+# sonnet-warn.sh once Sonnet became the saved default. Reads the newest assistant
+# model from the session transcript handed to the hook on stdin. settings.json
+# remains a fallback for an explicit pin.
 
 set -uo pipefail
 
-STAMP="$HOME/.claude/tmp/.fable-warn-stamp"
+STAMP="$HOME/.claude/tmp/.sonnet-warn-stamp"
 SETTINGS="$HOME/.claude/settings.json"
 
 input=$(cat)
@@ -48,8 +48,8 @@ if [[ -z "$model" ]]; then
   model=$(grep -o '"model"[[:space:]]*:[[:space:]]*"[^"]*"' "$SETTINGS" 2>/dev/null | head -1 | sed 's/.*"model"[[:space:]]*:[[:space:]]*"//;s/"//')
 fi
 
-# Only warn for Fable models
-if [[ "$model" != *fable* ]]; then
+# Only warn for Sonnet models
+if [[ "$model" != *sonnet* ]]; then
   exit 0
 fi
 
@@ -65,4 +65,4 @@ fi
 mkdir -p "$(dirname "$STAMP")"
 date +%s > "$STAMP"
 
-echo "Fable is selected, if working on an easy task, advise the user to switch to Sonnet"
+echo "Sonnet is selected, if working on a hard task (NixOS/infra, complex debugging, git archaeology, harness architecture), advise the user to switch to Opus"

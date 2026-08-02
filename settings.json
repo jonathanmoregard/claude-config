@@ -185,7 +185,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; $HOME/.claude/fable-warn.sh"
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; $HOME/.claude/sonnet-warn.sh"
           },
           {
             "type": "command",
@@ -374,5 +374,6 @@
   },
   "effortLevel": "xhigh",
   "advisorModel": "opus",
-  "voiceEnabled": false
+  "voiceEnabled": false,
+  "model": "sonnet"
 }
