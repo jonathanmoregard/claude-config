@@ -54,15 +54,16 @@ git -C ~/.claude rev-parse --show-toplevel >/dev/null 2>&1 || { echo "error: ~/.
 
 # The spine: legacy RSI dir (rsi/ in the unified folder symlinks to it) plus
 # the unified proposals folder (gate annotations, gate-config.json, other
-# subdirs). gate-log.jsonl (per-host forensics) and .gate.lock (retired lock
-# location, pre-2026-08) are local runtime state — excluded so they never
-# land in the pushed history. gate-config.json stays versioned deliberately:
-# it is user config.
+# subdirs). gate-log.jsonl and .gate.lock stay local via the .gitignore that
+# install.sh manages — dir pathspecs skip ignored files silently. Do NOT
+# re-add :(exclude) pathspecs for them: naming an ignored file in a pathspec
+# makes `git add` exit 1 with the ignored-paths advice hint, and set -e then
+# kills the script between stage and commit (observed live 2026-08-02: run
+# staged the spine, committed nothing, pushed nothing, exit looked clean).
+# gate-config.json stays versioned deliberately: it is user config.
 SPINE_PATHS=(
   recursive-self-improvement/proposals/
   proposals/
-  ':(exclude)proposals/gate-log.jsonl'
-  ':(exclude)proposals/.gate.lock'
 )
 git add -- "${SPINE_PATHS[@]}"
 if git diff --cached --quiet -- "${SPINE_PATHS[@]}"; then
