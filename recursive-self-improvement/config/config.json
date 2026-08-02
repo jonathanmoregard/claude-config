@@ -16,23 +16,23 @@
         "Harness-driven impact app development",
         "Claude Code usage as automatic/frictionless as possible"
       ],
-      "connection": "Multiplying personal capability and automation increases capacity to direct care into the world — becoming a more effective agent for flourishing."
+      "connection": "Multiplying personal capability and automation increases capacity to direct care into the world \u2014 becoming a more effective agent for flourishing."
     },
     {
       "category": "Embodiment & Wellbeing",
       "items": [
         "Mix productive output with being very human: present, mindful, high wellbeing",
         "Mindful forest walks, breaks from screen",
-        "Vajrayana practice and evolving ground — working towards enlightenment",
+        "Vajrayana practice and evolving ground \u2014 working towards enlightenment",
         "Physical: workout, appearance, deep voice"
       ],
-      "connection": "Embodiment is both the foundation to act from and the transformation itself — 'present in my body' is the north star lived daily. Vajrayana and inner work directly serve freedom from old restrictive patterns."
+      "connection": "Embodiment is both the foundation to act from and the transformation itself \u2014 'present in my body' is the north star lived daily. Vajrayana and inner work directly serve freedom from old restrictive patterns."
     },
     {
       "category": "Relationships & Community",
       "items": [
         "Good relationships with friends and partner",
-        "Find the others — people for co-creation of the mission"
+        "Find the others \u2014 people for co-creation of the mission"
       ],
       "connection": "Both intrinsically valuable (flourishing includes connection and joy) and instrumentally necessary (the mission of co-creating a flourishing world needs a team)."
     },
@@ -45,11 +45,16 @@
         "Frameworks for effective action and paradigm shifts",
         "Balance automation with security and integrity"
       ],
-      "connection": "The direct expression of care becoming concrete impact in the world. Intellectual rigor (frameworks, writing, paradigm shifts) ensures care is directed effectively — care without clarity can misfire."
+      "connection": "The direct expression of care becoming concrete impact in the world. Intellectual rigor (frameworks, writing, paradigm shifts) ensures care is directed effectively \u2014 care without clarity can misfire."
     }
   ],
   "schedule": {
     "analysis_cron": "17:00",
     "timezone": "Europe/Stockholm"
+  },
+  "proposals": {
+    "uncapped_subdirs": [
+      "permissions"
+    ]
   }
 }
