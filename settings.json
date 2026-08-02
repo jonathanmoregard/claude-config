@@ -185,7 +185,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; $HOME/.claude/sonnet-warn.sh"
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; $HOME/.claude/fable-warn.sh"
           },
           {
             "type": "command",
@@ -229,6 +229,16 @@
             "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; /home/jonathan/.claude/hooks/router-nudge-hook --queue-root /home/jonathan/.local/state/router/queue --marker /home/jonathan/.local/state/router/audit/nudge-marker || true"
           }
         ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/aggregator-recall-hook.py",
+            "timeout": 5
+          }
+        ]
       }
     ],
     "PostToolUse": [
@@ -269,6 +279,16 @@
             "type": "command",
             "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; $HOME/.claude/hooks/git-push-merge-check.sh",
             "timeout": 12
+          }
+        ]
+      },
+      {
+        "matcher": "Grep|Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/aggregator-transcript-guard.py",
+            "timeout": 5
           }
         ]
       }
@@ -374,6 +394,5 @@
   },
   "effortLevel": "xhigh",
   "advisorModel": "opus",
-  "voiceEnabled": false,
-  "model": "sonnet"
+  "voiceEnabled": false
 }

@@ -95,6 +95,13 @@ Explicit user instructions always override this.
 
 - Never write the name of an external client, employer, requester, or engagement detail into any file in a public repo — README, docs, code comments, commit messages, PR titles/bodies — unless the user explicitly said the attribution is public. Tempted to add "Built for X" / "Requested by Y"? Stop and ask first. Client names mentioned in conversation are confidential by default. Asymmetric: over-attributing is a data leak requiring history rewrite; under-attributing is a one-line fix later.
 
+## Recall (past sessions, decisions, prior work)
+
+- **Any question about the past goes to the aggregator first.** "Do you remember…", "what did we decide about X", "did we ever discuss Y", "last time I…", "find that session/report/PR" → load `mcp__aggregator__aggregator_search_memory` (via ToolSearch if the schema isn't loaded — deferred tools are name-only until then) and query it BEFORE anything else. `mcp__aggregator__aggregator_capabilities` gives the live source list and DSL keys.
+- **It supersedes the two default paths.** It indexes every session transcript and subagent run plus PRs, research reports and chat exports, with ranking. Raw grep of `~/.claude/projects/*.jsonl` is a strict subset with no ranking; the auto-memory directory is a much smaller subset. A `PreToolUse` hook denies Read/Grep of the transcript JSONL and hands back the redirect — treat that as the rule, not an obstacle to route around.
+- **Don't rationalise the skip.** "This is a quick question" / "I'll just grep, it's faster" / "I probably remember" → query first, decide after. One call is cheaper than a wrong answer about your own history.
+- **Writes still go to the memory dir.** The aggregator MCP is read-only by design (`aggregator_ingest` only prints the CLI command a human runs), so saving a new fact remains a `memory/` write. Reads: aggregator. Writes: memory dir.
+
 ## Pull requests
 
 - PRs target the repo's default branch (main/master) — always, by default. Non-default base only when explicitly requested (stacked PR), and then re-target to default before merge.
