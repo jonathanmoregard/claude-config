@@ -288,15 +288,26 @@ this procedure.
 
    mkdir -p tasks && : > tasks/progress.md   # must exist from iteration 1 (doctrine reads it)
    SIGIL='All acceptance criteria in tasks/mission.md are implemented, the verifier is green, and a fresh-context reviewer confirmed the diff.'
-   SETUP=$(ls -d ~/.claude/plugins/cache/claude-plugins-official/ralph-loop/*/scripts/setup-ralph-loop.sh | sort -V | tail -1)
+   case "$SIGIL" in *'"'*|*'$'*|*'`'*|*'\'*)
+     echo 'REFUSE: sigil must not contain " $ ` or \ (setup script YAML-wraps it verbatim; a violation makes the sigil unmatchable and the loop runs to max-iterations)'; exit 1;;
+   esac
+   SETUP=$(ls -d ~/.claude/plugins/cache/claude-plugins-official/ralph-loop/*/scripts/setup-ralph-loop.sh 2>/dev/null | sort -V | tail -1)
+   [[ -f "$SETUP" ]] || { echo "REFUSE: ralph-loop plugin not found in plugin cache — loop would silently never arm"; exit 1; }
    "$SETUP" "Autonomous mission: read tasks/mission.md and tasks/progress.md, then continue from where progress.md left off (empty progress.md = start at the first unchecked acceptance criterion). Orchestrate via subagents; do not implement inline." \
      --completion-promise "$SIGIL" --max-iterations 25
+   [[ -f .claude/ralph-loop.local.md ]] || { echo "ARM FAILED: state file missing — stop gate is NOT live"; exit 1; }
    ```
 
    Caveat: armed via safe-bash, `session_id` in the state file is empty, so
    the stop gate applies to ANY session in this directory — dedicated
    worktrees are the isolation boundary; the preflight guard above enforces
-   the obvious misfires. Never arm in a shared repo dir.
+   the obvious misfires. Never arm in a shared repo dir, and run ONE
+   orchestrator session per worktree (two sessions stopping concurrently
+   race the state file's read-modify-write). Subagents are safe: the plugin
+   registers only the `Stop` event, which fires when the MAIN agent
+   finishes responding — subagent completion is the separate
+   `SubagentStop` event and never triggers the gate (verified against
+   official hooks docs 2026-08-02).
 
 ## Sigil discipline — verifier earns the sigil, sigil earns the stop
 
@@ -312,6 +323,10 @@ this procedure.
 - Deferral vocabulary mid-loop ("Would you like me to…", "should I
   continue?", "next step would be…") is a bug: the loop re-feeds the same
   prompt, so asking costs an iteration and answers nothing. Act instead.
+- Emit the sigil ALONE as the final message, and never quote `<promise>`
+  tags in prose mid-run: the stop hook extracts the FIRST tag in the last
+  text block, so a quoted tag earlier in the message can shadow the real
+  sigil (costs an iteration; self-heals next turn, but don't).
 
 ## Context discipline (parent = orchestrator, not implementer)
 
@@ -547,3 +562,5 @@ git commit -m "docs: Path B plan + project memory (sigil-gated autonomous orches
 - Continue-nudge revival for interactive (non-autonomous) sessions: parked pending sigil-pattern results.
 - Refusing re-injection when `completion_promise: null` + `max_iterations: 0` (advisor suggestion): rejected — our Phase 0 always sets both, and if a user hand-arms that combo, injecting doctrine WITH the stale-loop cancel instructions aids discoverability; silent refusal would hide the trap.
 - Em-dash headings flagged as copy-paste risk: verified non-issue — repo is UTF-8 throughout and the existing SKILL.md already uses em-dashes.
+- "Subagent Task stops trigger the ralph Stop hook and get trapped in the loop" (adversarial round): REFUTED — official hooks docs list `Stop` ("when Claude finishes responding") and `SubagentStop` ("when a subagent finishes") as distinct events; the plugin registers only `Stop`.
+- "Stop hook times out on large transcripts → fail-open" (adversarial round): REFUTED empirically — 227MB compact-JSONL transcript processed in 0.22s (grep streams; jq input capped at last 100 assistant lines). Side-finding: the hook's `grep '"role":"assistant"'` requires compact JSON (no space after colons), which matches real transcript format.
