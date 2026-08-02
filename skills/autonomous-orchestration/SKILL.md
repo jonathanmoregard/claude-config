@@ -15,14 +15,126 @@ this procedure.
 
 ## Composition — don't reimplement these
 
-| Phase | REQUIRED SUB-SKILL |
+| Phase | REQUIRED SUB-SKILL / TOOL |
 |---|---|
 | Design & plan (upstream) | superpowers:brainstorming → superpowers:writing-plans |
+| Autonomy loop (stop gate) | ralph-loop plugin (official) — sigil `<promise>…</promise>` + `--max-iterations`; armed in Phase 0 below |
+| Cross-context persistence | planning-with-files — `tasks/mission.md`, `tasks/progress.md`, `tasks/findings.md` |
 | Per-chunk engine: fresh implementer subagent + two-stage spec→quality review, model tiering, status protocol | superpowers:subagent-driven-development |
 | Per-task discipline inside subagents | superpowers:test-driven-development |
 | Adversarial review rounds (tier-above advisor, reproduce-before-fix, loop to zero BLOCKER/HIGH) | advice-refine-test-loop |
 | Parallel dispatch mechanics | superpowers:dispatching-parallel-agents |
 | Branch completion | superpowers:finishing-a-development-branch |
+
+## Phase 0 — Autonomy contract (REQUIRED, once, before the first subagent)
+
+1. **Stop criteria.** Derive from the plan; ask the user only if underivable:
+   - *Sigil statement* — one sentence TRUE only at genuine completion.
+     Template: `All acceptance criteria in tasks/mission.md are implemented, the verifier is green, and a fresh-context reviewer confirmed the diff.`
+   - *Verifier* — the project's gate command(s): tests + lint + build, exit 0 = green.
+   - *Max iterations* — finite, default 25.
+2. **Dangerous-ops manifest.** Enumerate anticipated permission gates and
+   irreversible ops (pushes, merges, deletions, deploys, network egress).
+   Present ONE upfront approval request to the user. Anything NOT on the
+   approved manifest still stops for the user later. This converts mid-run
+   "should I continue?" permission stalls into a single pre-flight answer.
+3. **Write `tasks/mission.md`** (planning-with-files format): goal,
+   acceptance criteria (checkboxes), verifier command, sigil statement,
+   approved manifest, cancel instructions
+   (`rm .claude/ralph-loop.local.md` or `/cancel-ralph`). Also create an
+   empty `tasks/progress.md` now — doctrine and the loop prompt tell every
+   iteration to read it, so it must exist from iteration 1. Seed
+   `tasks/session-constraints.md` with any durable user directives already
+   given this session (see Constraint pinning below); create it empty if
+   none.
+4. **Arm the loop** — run from the WORKTREE ROOT (state file is CWD-scoped).
+   Set `SIGIL` to the mission-specific statement from mission.md first —
+   NEVER pass a placeholder: an unsubstituted promise can never match, so
+   the loop would only end at max-iterations. Sigil rules: single line, no
+   double quotes (the setup script YAML-wraps it verbatim), TRUE only at
+   genuine completion.
+
+   ```bash
+   # Preflight: only arm inside a dedicated worktree. The state file traps
+   # ALL sessions that stop in this directory (empty session_id fallthrough).
+   case "$PWD" in
+     "$HOME"|"$HOME/.claude"|"$HOME/Repos") echo "REFUSE: arm only from a dedicated worktree root"; exit 1;;
+   esac
+   [[ -e .git ]] || { echo "REFUSE: not a repo/worktree root"; exit 1; }  # .git is a FILE in linked worktrees, a dir in main checkouts; -e covers both
+
+   mkdir -p tasks && : > tasks/progress.md   # must exist from iteration 1 (doctrine reads it)
+   SIGIL='All acceptance criteria in tasks/mission.md are implemented, the verifier is green, and a fresh-context reviewer confirmed the diff.'
+   case "$SIGIL" in *'"'*|*'$'*|*'`'*|*'\'*)
+     echo 'REFUSE: sigil must not contain " $ ` or \ (setup script YAML-wraps it verbatim; a violation makes the sigil unmatchable and the loop runs to max-iterations)'; exit 1;;
+   esac
+   SETUP=$(ls -d ~/.claude/plugins/cache/claude-plugins-official/ralph-loop/*/scripts/setup-ralph-loop.sh 2>/dev/null | sort -V | tail -1)
+   [[ -f "$SETUP" ]] || { echo "REFUSE: ralph-loop plugin not found in plugin cache — loop would silently never arm"; exit 1; }
+   "$SETUP" "Autonomous mission: read tasks/mission.md, tasks/session-constraints.md, and tasks/progress.md, then continue from where progress.md left off (empty progress.md = start at the first unchecked acceptance criterion). Orchestrate via subagents; do not implement inline; paste session-constraints.md verbatim into every subagent briefing." \
+     --completion-promise "$SIGIL" --max-iterations 25
+   [[ -f .claude/ralph-loop.local.md ]] || { echo "ARM FAILED: state file missing — stop gate is NOT live"; exit 1; }
+   ```
+
+   Caveat: armed via safe-bash, `session_id` in the state file is empty, so
+   the stop gate applies to ANY session in this directory — dedicated
+   worktrees are the isolation boundary; the preflight guard above enforces
+   the obvious misfires. Never arm in a shared repo dir, and run ONE
+   orchestrator session per worktree (two sessions stopping concurrently
+   race the state file's read-modify-write). Subagents are safe: the plugin
+   registers only the `Stop` event, which fires when the MAIN agent
+   finishes responding — subagent completion is the separate
+   `SubagentStop` event and never triggers the gate (verified against
+   official hooks docs 2026-08-02).
+
+## Sigil discipline — verifier earns the sigil, sigil earns the stop
+
+- The ONLY legitimate stop is `<promise><sigil statement></promise>`,
+  emitted ONLY when the statement is literally TRUE:
+  1. every acceptance criterion in mission.md checked off;
+  2. verifier freshly run this iteration, exit 0;
+  3. fresh-context reviewer (close-out advice-refine-test-loop) confirms
+     the combined diff, zero BLOCKER/HIGH.
+- Blocked ≥3 iterations on an external dependency (credential, human-only
+  step): log it in `pending_for_human.md`, mark the criterion blocked in
+  mission.md, let the loop hit max-iterations. NEVER emit a false sigil.
+- Deferral vocabulary mid-loop ("Would you like me to…", "should I
+  continue?", "next step would be…") is a bug: the loop re-feeds the same
+  prompt, so asking costs an iteration and answers nothing. Act instead.
+- Emit the sigil ALONE as the final message, and never quote `<promise>`
+  tags in prose mid-run: the stop hook extracts the FIRST tag in the last
+  text block, so a quoted tag earlier in the message can shadow the real
+  sigil (costs an iteration; self-heals next turn, but don't).
+
+## Context discipline (parent = orchestrator, not implementer)
+
+- **Parent holds NO code context.** Never Read source files, never paste
+  diffs or test output into orchestrator context. Hold only: task list,
+  mission.md, progress.md, dispatch decisions, terse subagent reports.
+- **Subagents hold the heavy context and die.** All reads/edits/test runs
+  live in subagents. Report cap ~15 lines: status; files touched; gate
+  result; decisions; next-step recommendation.
+- **progress.md after every subagent return.** Append what completed, gate
+  state, decisions, next. Files — not the transcript — are the resumption
+  source.
+- **Constraint pinning.** Negative/durable directives are the first thing
+  compaction kills: they produce no artifact, no diff, no task — a
+  summarizer preserves the task narrative and drops "don't use X" as a
+  non-event. So: the moment the user states a directive that outlives the
+  current task ("don't X", "always Y", "never Z", "keep it A"), append it
+  datestamped to `tasks/session-constraints.md` IN THAT SAME TURN — at
+  directive-time the directive is the freshest thing in context, so the
+  write itself can't drift. Tasks are not constraints ("fix the typo" is
+  a task). Include the file's contents VERBATIM in every subagent
+  briefing — constraints must propagate mechanically, not via your
+  summary of them.
+- **Recitation.** At each ralph iteration start: re-read mission.md,
+  progress.md, session-constraints.md, and `git log --oneline` since
+  mission start. Trust files and git over transcript memory.
+- **Git ratchet.** Commit per green unit in the worktree. An iteration
+  that ships nothing commits nothing — but still appends to progress.md.
+- **Compact survival.** SessionStart(startup|compact|clear) runs
+  `hooks/compact-reinject.sh`; its stdout is injected into model context —
+  that hook IS the doctrine-persistence channel while a loop is armed. If
+  doctrine feels missing post-compact, re-read this skill.
 
 ## What THIS skill adds (the delta)
 
@@ -32,7 +144,8 @@ this procedure.
 2. **Conflict-aware sequencing.** Parallelize chunks with **disjoint
    files**; **serialize chunks touching the same hot path/function** —
    two edits to one `upsert` collide, and sequencing beats merge-hell on
-   safety-critical paths.
+   safety-critical paths. Rule of thumb: parallelize READS freely,
+   serialize WRITES unless provably disjoint.
 3. **Sad-path e2e, proven non-flaky.** Every chunk ships blackbox tests
    for happy AND sad paths (races, reconnects, rollbacks). Run them
    repeatedly; make chaos deterministic (e.g. scope a
@@ -72,6 +185,13 @@ this procedure.
 - Accepting an advisor BLOCKER without reproducing it (advisors
   hallucinate; the 2026-07-07 egress BLOCKER was refuted empirically)
 - Happy-path-only e2e
+- Emitting the sigil without a fresh verifier run + reviewer confirmation
+- Parent Reading source files "just to check" — dispatch a subagent
+- Asking the user mid-loop anything mission.md or the approved manifest
+  already answers
+- Briefing a subagent with a paraphrase of user constraints instead of
+  pasting `tasks/session-constraints.md` verbatim — paraphrase is how
+  constraints silently die in handoff
 
 ## Scope guard
 
