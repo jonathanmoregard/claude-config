@@ -65,4 +65,4 @@ fi
 mkdir -p "$(dirname "$STAMP")"
 date +%s > "$STAMP"
 
-echo "Fable is selected, if working on hard task, advise the user to switch to Opus"
+echo "Fable is selected, if working on a normal task, advise the user to switch to Opus"
