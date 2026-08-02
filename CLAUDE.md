@@ -34,7 +34,7 @@ Routine externally-visible actions inside an active task — `git push`, opening
 
 **Check after every edit, before moving on.** Run the fastest relevant check for the stack — syntax parse, type-check, linter, or the project's configured verify command — against the file(s) just edited. Do not move to the next file until the current one is clean. Batching errors across many files wastes a later context on re-visits.
 
-**Context checkpoint.** When context gets large, or before a risky long-running step, write current state to `tasks/mission.md`: what's done, what's next, what's blocked, open questions. Write it as a briefing for someone who knows the project but wasn't in the room — not a transcript, not a chat summary. The next session must be able to resume from `tasks/mission.md` without the full history.
+**Context checkpoint.** When context gets large, or before a risky long-running step, write current state to `tasks/mission.md`: what's done, what's next, what's blocked, open questions. Write it as a briefing for someone who knows the project but wasn't in the room — not a transcript, not a chat summary. The next session must be able to resume from `tasks/mission.md` without the full history. Alongside it, maintain `tasks/session-constraints.md` (any project, any session — create the file on first use): the moment the user states a directive that outlives the current task ("don't X", "always Y", "never Z", "keep it A"), append it datestamped in that same turn — directive-time is when drift risk is lowest. Tasks are not constraints ("fix the typo" is a task). Re-read the file after every compact/resume, and whenever you brief a subagent, paste its contents verbatim into the briefing — constraints propagate mechanically, never by paraphrase. Compaction kills zero-artifact directives; disk beats context.
 
 Explicit user instructions always override this.
 
@@ -64,7 +64,12 @@ Explicit user instructions always override this.
 - **Propose A/B/C options with a recommendation** rather than asking open-ended questions.
 - **Fold in mid-flight corrections silently** — don't restart the whole flow when a fix is injected.
 - **Act, don't interrogate.** Only ask when ambiguity would cause wasted work; otherwise pick the most reasonable interpretation and go. But do exactly what was asked — no more. If you think something adjacent would help, mention it in one sentence but don't act on it unless confirmed. When instructions name a specific tool or approach, use that tool — not a workaround. In harness-driven projects, your job is to run the harness, not to implement directly.
+- **Closed question = answer, full stop.** If the message is a closed question ("did/do/does/is/are/what/why/how…", or ends in "?"), the expected reply is the answer — no action, no file edit in the same turn unless the question explicitly requests one. Polite-imperative forms ("can you fix X?") are directives, not questions. Ambiguous → treat as question.
 - **Ask questions one at a time.** If multiple clarifying questions are needed, pick the most important, ask it, wait for the answer, then ask the next. Don't batch separate questions into a list. (A single A/B/C recommendation prompt is fine.)
+
+## Skills
+
+- **Trigger-miss = patch now.** When a skill fails to fire for phrasing that clearly maps to its scope (user points at it, or you notice late), add the missed phrasing to that skill's `description` in the same session — evidence-driven, one line, not a later audit. Store-symlinked skills: route the same fix through the owning repo's PR flow instead.
 
 ## Web access
 

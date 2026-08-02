@@ -69,7 +69,9 @@ this procedure.
    esac
    SETUP=$(ls -d ~/.claude/plugins/cache/claude-plugins-official/ralph-loop/*/scripts/setup-ralph-loop.sh 2>/dev/null | sort -V | tail -1)
    [[ -f "$SETUP" ]] || { echo "REFUSE: ralph-loop plugin not found in plugin cache — loop would silently never arm"; exit 1; }
-   "$SETUP" "Autonomous mission: read tasks/mission.md, tasks/session-constraints.md, and tasks/progress.md, then continue from where progress.md left off (empty progress.md = start at the first unchecked acceptance criterion). Orchestrate via subagents; do not implement inline; paste session-constraints.md verbatim into every subagent briefing." \
+   # `bash "$SETUP"`, never "$SETUP" directly: the plugin's #!/bin/bash shebang
+   # does not resolve on NixOS (no /bin/bash) — direct exec fails exit 126.
+   bash "$SETUP" "Autonomous mission: read tasks/mission.md, tasks/session-constraints.md, and tasks/progress.md, then continue from where progress.md left off (empty progress.md = start at the first unchecked acceptance criterion). Orchestrate via subagents; do not implement inline; paste session-constraints.md verbatim into every subagent briefing." \
      --completion-promise "$SIGIL" --max-iterations 25
    [[ -f .claude/ralph-loop.local.md ]] || { echo "ARM FAILED: state file missing — stop gate is NOT live"; exit 1; }
    ```

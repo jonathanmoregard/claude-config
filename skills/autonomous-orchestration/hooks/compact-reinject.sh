@@ -23,7 +23,7 @@ fi
 
 cat <<EOF
 [autonomous-orchestration] Ralph loop ACTIVE (iteration ${ITER}). Context was just compacted, cleared, or restarted — re-arm the doctrine:
-- Re-read tasks/mission.md and tasks/progress.md NOW. Trust files and git log over any memory of this conversation.
+- Re-read tasks/mission.md, tasks/progress.md, and tasks/session-constraints.md NOW. Constraints are the first thing compaction kills — the file is authoritative. Trust files and git log over any memory of this conversation.
 - You are the orchestrator: dispatch subagents for all reads/edits/tests; hold no code context yourself.
 - Bias to action. Never end a turn with only a plan, a summary, or a question that mission.md or the dangerous-ops manifest already answers.
 - Stop ONLY via the completion sigil recorded in tasks/mission.md, emitted ONLY when literally TRUE: verifier freshly green AND fresh-context reviewer confirmed. Never emit a false sigil. If no sigil is configured, the loop ends only at max-iterations.${AGE_NOTE}
