@@ -286,6 +286,7 @@ this procedure.
    esac
    [[ -e .git ]] || { echo "REFUSE: not a repo/worktree root"; exit 1; }  # .git is a FILE in linked worktrees, a dir in main checkouts; -e covers both
 
+   mkdir -p tasks && : > tasks/progress.md   # must exist from iteration 1 (doctrine reads it)
    SIGIL='All acceptance criteria in tasks/mission.md are implemented, the verifier is green, and a fresh-context reviewer confirmed the diff.'
    SETUP=$(ls -d ~/.claude/plugins/cache/claude-plugins-official/ralph-loop/*/scripts/setup-ralph-loop.sh | sort -V | tail -1)
    "$SETUP" "Autonomous mission: read tasks/mission.md and tasks/progress.md, then continue from where progress.md left off (empty progress.md = start at the first unchecked acceptance criterion). Orchestrate via subagents; do not implement inline." \
@@ -447,9 +448,10 @@ printf '%s\n' '{"role":"assistant","message":{"content":[{"type":"text","text":"
 # documented legacy behavior our worktree-isolation mitigation depends on —
 # do NOT "fix" the fallthrough thinking it's a bug.
 echo "{\"session_id\":\"whatever\",\"transcript_path\":\"$TRANSCRIPT\"}" | bash "$STOPHOOK"
+grep -q '^iteration: 2$' .claude/ralph-loop.local.md && echo ITER-BUMPED || echo FAIL-NO-BUMP
 ```
 
-Expected: JSON with `"decision": "block"` and `"reason"` containing `test mission`; state file now `iteration: 2`.
+Expected: JSON with `"decision": "block"` and `"reason"` containing `test mission`; then `ITER-BUMPED`.
 
 - [ ] **Step 3: Stop WITH sigil → hook releases and removes state**
 
