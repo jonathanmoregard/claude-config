@@ -88,7 +88,8 @@ Explicit user instructions always override this.
 
 ## Git worktrees
 
-- Place new worktrees under `~/worktrees/<repo>-<branch>/`. Don't nest in repo, don't scatter under `~/Repos/`.
+- **Only two cases warrant a worktree:** (a) subagent-driven development where an isolated tree keeps parent + subagent from stepping on each other's staged/uncommitted state, or (b) nixos-config work (bare repo + one-worktree-per-feature is that repo's flow). Every other change edits the checkout in place, branches directly, `git switch`. Worktrees are heavier than they look — extra `~/worktrees` proliferation, easy to lose track of.
+- Place any warranted worktree under `~/worktrees/<repo>-<branch>/`. Don't nest in repo, don't scatter under `~/Repos/`.
 
 ## Confidentiality
 
