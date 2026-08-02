@@ -175,7 +175,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; bash $HOME/.claude/skills/autonomous-orchestration/hooks/compact-reinject.sh"
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; bash $HOME/.claude/skills/orchestrate/hooks/compact-reinject.sh"
           }
         ]
       }
