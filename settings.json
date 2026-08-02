@@ -123,7 +123,6 @@
       "/home/jonathan/Repos/research-agent/reports"
     ]
   },
-  "model": "claude-fable-5[1m]",
   "enableAllProjectMcpServers": false,
   "hooks": {
     "SessionStart": [
@@ -184,6 +183,10 @@
       {
         "matcher": "",
         "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; $HOME/.claude/fable-warn.sh"
+          },
           {
             "type": "command",
             "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/context-baggage.py"

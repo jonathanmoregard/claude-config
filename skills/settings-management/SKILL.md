@@ -8,7 +8,7 @@ user-invocable: false
 
 `~/.claude` is a git repository. All persistent config changes (settings, hooks, skills) should be committed and pushed to keep the backup in sync.
 
-After modifying any tracked file (e.g. `settings.json`, `opus-warn.sh`, skills):
+After modifying any tracked file (e.g. `settings.json`, `fable-warn.sh`, skills):
 
 ```bash
 cd ~/.claude && git add -A && git commit -m "chore: <describe change>" && git push
@@ -17,7 +17,7 @@ cd ~/.claude && git add -A && git commit -m "chore: <describe change>" && git pu
 ## Tracked files
 
 - `settings.json` — model, hooks, global preferences
-- `opus-warn.sh` — hook script for Opus model warning
+- `fable-warn.sh` — hook script for Fable model warning
 - `skills/` — skill definitions
 
 ## Ephemeral files → tmp/
@@ -25,6 +25,6 @@ cd ~/.claude && git add -A && git commit -m "chore: <describe change>" && git pu
 `~/.claude/tmp/` is a gitignored scratch folder for short-lived state.
 
 Use it for:
-- Throttle stamps (e.g. `.opus-warn-stamp`)
+- Throttle stamps (e.g. `.fable-warn-stamp`)
 - Temporary output files
 - Any runtime state that belongs in `~/.claude` but not in git
