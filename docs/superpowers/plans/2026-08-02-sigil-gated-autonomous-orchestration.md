@@ -296,7 +296,7 @@ this procedure.
    esac
    SETUP=$(ls -d ~/.claude/plugins/cache/claude-plugins-official/ralph-loop/*/scripts/setup-ralph-loop.sh 2>/dev/null | sort -V | tail -1)
    [[ -f "$SETUP" ]] || { echo "REFUSE: ralph-loop plugin not found in plugin cache — loop would silently never arm"; exit 1; }
-   "$SETUP" "Autonomous mission: read tasks/mission.md and tasks/progress.md, then continue from where progress.md left off (empty progress.md = start at the first unchecked acceptance criterion). Orchestrate via subagents; do not implement inline." \
+   "$SETUP" "Autonomous mission: read tasks/mission.md, tasks/session-constraints.md, and tasks/progress.md, then continue from where progress.md left off (empty progress.md = start at the first unchecked acceptance criterion). Orchestrate via subagents; do not implement inline; paste session-constraints.md verbatim into every subagent briefing." \
      --completion-promise "$SIGIL" --max-iterations 25
    [[ -f .claude/ralph-loop.local.md ]] || { echo "ARM FAILED: state file missing — stop gate is NOT live"; exit 1; }
    ```
@@ -574,7 +574,7 @@ git commit -m "docs: Path B plan + project memory (sigil-gated autonomous orches
 
 ---
 
-### Task 6: Session-constraints integration (added 2026-08-02 after user review-improvements input; execute after Task 3)
+### Task 6: Session-constraints integration (added 2026-08-02 after user review-improvements input; execute after Task 3 and BEFORE Task 5, so the memory close-out describes machinery that already exists)
 
 Constraints die three ways: compaction drops zero-artifact directives, attention decays over long sessions, and subagent briefings lose whatever slipped the parent's summary. A pinned constraints file fixes all three — disk beats context. This task wires `tasks/session-constraints.md` into the doctrine (hook script) and the global CLAUDE.md checkpoint convention. (The SKILL.md side — Constraint pinning bullet, Phase 0 seeding, recitation, red flag — is already in Task 3's replacement content.)
 
@@ -619,8 +619,10 @@ Run the test. Expected: `PASS`, exit 0. `bash -n` both files.
 In `/home/jonathan/.claude/CLAUDE.md`, the paragraph beginning `**Context checkpoint.**` — append to that paragraph:
 
 ```markdown
-Alongside it, maintain `tasks/session-constraints.md`: the moment the user states a directive that outlives the current task ("don't X", "always Y", "never Z", "keep it A"), append it datestamped in that same turn — directive-time is when drift risk is lowest. Tasks are not constraints. Re-read the file after every compact/resume, and paste its contents verbatim into every subagent briefing — constraints propagate mechanically, never by paraphrase. Compaction kills zero-artifact directives; disk beats context.
+Alongside it, maintain `tasks/session-constraints.md` (any project, any session — create the file on first use): the moment the user states a directive that outlives the current task ("don't X", "always Y", "never Z", "keep it A"), append it datestamped in that same turn — directive-time is when drift risk is lowest. Tasks are not constraints ("fix the typo" is a task). Re-read the file after every compact/resume, and whenever you brief a subagent, paste its contents verbatim into the briefing — constraints propagate mechanically, never by paraphrase. Compaction kills zero-artifact directives; disk beats context.
 ```
+
+(Global placement in CLAUDE.md is user-mandated — the pinning convention applies to all sessions, not just autonomous loops; the wording above is written to be coherent when no subagents or tasks/ dir exist yet.)
 
 - [ ] **Step 6: Commit**
 
