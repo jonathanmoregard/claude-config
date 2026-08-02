@@ -5,7 +5,9 @@ description: >
   during work, (2) the user teaches a best practice worth preserving, or
   (3) — DEFINITELY trigger — the user expresses happiness or excitement about
   an insight Claude surfaced (e.g. "that's a valuable insight", "great find",
-  "exactly what I needed").
+  "exactly what I needed"). Also triggers on: "maybe turn it into a skill?",
+  "capture what you just realized", "this approach seems best practice",
+  "I'd like to collect learnings from" a finished piece of work.
 ---
 
 ## What to do

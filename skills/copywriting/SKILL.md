@@ -1,6 +1,6 @@
 ---
 name: copywriting
-description: Use when asked to write, rewrite, or punch up prose the user will publish or send — blog posts, blurbs, announcements, emails, social copy — especially "in my voice", "make it sound like me", or "don't make it sound like AI".
+description: Use when asked to write, rewrite, or punch up prose the user will publish or send — blog posts, blurbs, announcements, emails, social copy — especially "in my voice", "make it sound like me", or "don't make it sound like AI". Also triggers on reviewing existing publishable copy for AI tells — "verify it doesn't look like AI slop", "check the store listing copy", "does this read as AI-written?".
 ---
 
 # Copywriting — voice registry + pipeline picker

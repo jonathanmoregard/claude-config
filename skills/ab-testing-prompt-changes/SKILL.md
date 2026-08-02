@@ -1,6 +1,6 @@
 ---
 name: ab-testing-prompt-changes
-description: Use when a proposed edit to a skill, rule, system prompt, CLAUDE.md or agent definition is being settled by argument, intuition or a single anecdote — someone asks "does this change actually help?", "prove this prompt edit works", "test whether the agent behaves better with this", or wants to compare two prompt/skill variants empirically.
+description: Use when a proposed edit to a skill, rule, system prompt, CLAUDE.md or agent definition is being settled by argument, intuition or a single anecdote — someone asks "does this change actually help?", "prove this prompt edit works", "test whether the agent behaves better with this", or wants to compare two prompt/skill variants empirically. Also triggers on: "empirically validate" a proposed improvement, "reconstruct the situation it's intended to improve", validating auto-generated proposals before applying them.
 ---
 
 # A/B-testing prompt changes
