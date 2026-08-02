@@ -85,6 +85,10 @@ Explicit user instructions always override this.
 
 - Place new worktrees under `~/worktrees/<repo>-<branch>/`. Don't nest in repo, don't scatter under `~/Repos/`.
 
+## Confidentiality
+
+- Never write the name of an external client, employer, requester, or engagement detail into any file in a public repo — README, docs, code comments, commit messages, PR titles/bodies — unless the user explicitly said the attribution is public. Tempted to add "Built for X" / "Requested by Y"? Stop and ask first. Client names mentioned in conversation are confidential by default. Asymmetric: over-attributing is a data leak requiring history rewrite; under-attributing is a one-line fix later.
+
 ## Pull requests
 
 - PRs target the repo's default branch (main/master) — always, by default. Non-default base only when explicitly requested (stacked PR), and then re-target to default before merge.
