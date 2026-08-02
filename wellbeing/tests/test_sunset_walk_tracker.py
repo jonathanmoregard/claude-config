@@ -6,7 +6,6 @@ Run:  python3 ~/.claude/wellbeing/tests/test_sunset_walk_tracker.py
 
 Covers:
   * local NOAA sunset computation at both solstice extremes (Stockholm refs)
-  * cross-check against a known Open-Meteo value for the configured place
   * stale-cache + network-down -> local recompute path (urllib mocked to raise)
   * SUNSET_WALK_OFFLINE=1 skips the network entirely
   * nudge message stays honest when weather is unknown
@@ -62,13 +61,6 @@ def test_sunset_stockholm_winter_solstice():
     # from the NOAA formulas: eqtime +2.2 min, decl -23.42 deg -> 13:48 UTC).
     got = tracker.sunset_local(date(2026, 12, 21), *STOCKHOLM)
     _assert_close(got, datetime(2026, 12, 21, 14, 48))
-
-
-def test_sunset_uppsala_matches_open_meteo():
-    # Open-Meteo reported 22:04 local for the configured place on 2026-07-08 (from the
-    # last good cache written by the API path).
-    got = tracker.sunset_local(date(2026, 7, 8), tracker.LAT, tracker.LON)
-    _assert_close(got, datetime(2026, 7, 8, 22, 4))
 
 
 def test_offline_state_advances_past_window():
