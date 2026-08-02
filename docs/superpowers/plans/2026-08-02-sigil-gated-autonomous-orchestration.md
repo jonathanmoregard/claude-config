@@ -270,7 +270,10 @@ this procedure.
    approved manifest, cancel instructions
    (`rm .claude/ralph-loop.local.md` or `/cancel-ralph`). Also create an
    empty `tasks/progress.md` now — doctrine and the loop prompt tell every
-   iteration to read it, so it must exist from iteration 1.
+   iteration to read it, so it must exist from iteration 1. Seed
+   `tasks/session-constraints.md` with any durable user directives already
+   given this session (see Constraint pinning below); create it empty if
+   none.
 4. **Arm the loop** — run from the WORKTREE ROOT (state file is CWD-scoped).
    Set `SIGIL` to the mission-specific statement from mission.md first —
    NEVER pass a placeholder: an unsubstituted promise can never match, so
@@ -339,9 +342,20 @@ this procedure.
 - **progress.md after every subagent return.** Append what completed, gate
   state, decisions, next. Files — not the transcript — are the resumption
   source.
+- **Constraint pinning.** Negative/durable directives are the first thing
+  compaction kills: they produce no artifact, no diff, no task — a
+  summarizer preserves the task narrative and drops "don't use X" as a
+  non-event. So: the moment the user states a directive that outlives the
+  current task ("don't X", "always Y", "never Z", "keep it A"), append it
+  datestamped to `tasks/session-constraints.md` IN THAT SAME TURN — at
+  directive-time the directive is the freshest thing in context, so the
+  write itself can't drift. Tasks are not constraints ("fix the typo" is
+  a task). Include the file's contents VERBATIM in every subagent
+  briefing — constraints must propagate mechanically, not via your
+  summary of them.
 - **Recitation.** At each ralph iteration start: re-read mission.md,
-  progress.md, and `git log --oneline` since mission start. Trust files
-  and git over transcript memory.
+  progress.md, session-constraints.md, and `git log --oneline` since
+  mission start. Trust files and git over transcript memory.
 - **Git ratchet.** Commit per green unit in the worktree. An iteration
   that ships nothing commits nothing — but still appends to progress.md.
 - **Compact survival.** SessionStart(startup|compact|clear) runs
@@ -402,6 +416,9 @@ this procedure.
 - Parent Reading source files "just to check" — dispatch a subagent
 - Asking the user mid-loop anything mission.md or the approved manifest
   already answers
+- Briefing a subagent with a paraphrase of user constraints instead of
+  pasting `tasks/session-constraints.md` verbatim — paraphrase is how
+  constraints silently die in handoff
 
 ## Scope guard
 
@@ -525,7 +542,10 @@ metadata:
 Path B shipped 2026-08-02: autonomous-orchestration Phase 0 arms the official
 ralph-loop plugin (sigil `<promise>…</promise>` + max-iterations) with a
 verification-gated sigil; `compact-reinject.sh` (SessionStart
-startup|compact|clear) re-injects doctrine while a loop is armed.
+startup|compact|clear) re-injects doctrine while a loop is armed; durable
+user directives are pinned datestamped to `tasks/session-constraints.md` at
+directive-time and pasted verbatim into every subagent briefing (compaction
+kills zero-artifact constraints; disk beats context).
 
 **Why:** FM1 (voluntary deferral) — deterministic sigil gate beats the LLM
 judge (continue-nudge measured 47% precision); FM2 (context-cap loss) —
@@ -554,12 +574,71 @@ git commit -m "docs: Path B plan + project memory (sigil-gated autonomous orches
 
 ---
 
+### Task 6: Session-constraints integration (added 2026-08-02 after user review-improvements input; execute after Task 3)
+
+Constraints die three ways: compaction drops zero-artifact directives, attention decays over long sessions, and subagent briefings lose whatever slipped the parent's summary. A pinned constraints file fixes all three — disk beats context. This task wires `tasks/session-constraints.md` into the doctrine (hook script) and the global CLAUDE.md checkpoint convention. (The SKILL.md side — Constraint pinning bullet, Phase 0 seeding, recitation, red flag — is already in Task 3's replacement content.)
+
+**Files:**
+- Modify: `/home/jonathan/.claude/skills/autonomous-orchestration/hooks/test-compact-reinject.sh`
+- Modify: `/home/jonathan/.claude/skills/autonomous-orchestration/hooks/compact-reinject.sh`
+- Modify: `/home/jonathan/.claude/CLAUDE.md` (Context checkpoint section)
+
+- [ ] **Step 1: Extend the test (TDD — new assertion first)**
+
+In `test-compact-reinject.sh`, Case 2 block, add after the `tasks/mission.md` assertion:
+
+```bash
+echo "$OUT" | grep -q 'tasks/session-constraints.md'               || { echo "FAIL: missing session-constraints pointer"; exit 1; }
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `bash /home/jonathan/.claude/skills/autonomous-orchestration/hooks/test-compact-reinject.sh`
+Expected: `FAIL: missing session-constraints pointer`, non-zero exit.
+
+- [ ] **Step 3: Update the doctrine line in compact-reinject.sh**
+
+Replace the first doctrine bullet:
+
+```
+- Re-read tasks/mission.md and tasks/progress.md NOW. Trust files and git log over any memory of this conversation.
+```
+
+with:
+
+```
+- Re-read tasks/mission.md, tasks/progress.md, and tasks/session-constraints.md NOW. Constraints are the first thing compaction kills — the file is authoritative. Trust files and git log over any memory of this conversation.
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run the test. Expected: `PASS`, exit 0. `bash -n` both files.
+
+- [ ] **Step 5: Extend CLAUDE.md Context checkpoint section**
+
+In `/home/jonathan/.claude/CLAUDE.md`, the paragraph beginning `**Context checkpoint.**` — append to that paragraph:
+
+```markdown
+Alongside it, maintain `tasks/session-constraints.md`: the moment the user states a directive that outlives the current task ("don't X", "always Y", "never Z", "keep it A"), append it datestamped in that same turn — directive-time is when drift risk is lowest. Tasks are not constraints. Re-read the file after every compact/resume, and paste its contents verbatim into every subagent briefing — constraints propagate mechanically, never by paraphrase. Compaction kills zero-artifact directives; disk beats context.
+```
+
+- [ ] **Step 6: Commit**
+
+```bash
+cd /home/jonathan/.claude
+git add skills/autonomous-orchestration/hooks/compact-reinject.sh skills/autonomous-orchestration/hooks/test-compact-reinject.sh CLAUDE.md
+git commit -m "feat(autonomous-orchestration): session-constraints.md pinning — doctrine re-read + global checkpoint convention"
+```
+
+---
+
 ## Deliberately out of scope (YAGNI, revisit only on demand)
 
 - Custom layered Stop hook (never-nudge regex → deferral regex → sigil): superseded — the official plugin blocks ALL stops while armed, which is strictly stronger; anti-deferral language lives in the loop prompt + re-injected doctrine instead.
 - Anthropic context-editing/memory tool via Agent SDK: different runtime (SDK, not CLI); separate project.
 - Custom OpenHands-style compaction prompt: no supported Claude Code config surface for the compaction prompt; mission.md/progress.md recitation + compact re-injection covers the loss mode.
 - Continue-nudge revival for interactive (non-autonomous) sessions: parked pending sigil-pattern results.
+- Auto-pinning constraints via a hook that regexes user messages for "don't/never/stop": rejected (user's own analysis) — can't distinguish "don't worry about it" from real pins; false constraints poison trust in the file. Precision-first (write at directive-time), recall-backstop-second (corrections loop catches repeat violations).
 - Refusing re-injection when `completion_promise: null` + `max_iterations: 0` (advisor suggestion): rejected — our Phase 0 always sets both, and if a user hand-arms that combo, injecting doctrine WITH the stale-loop cancel instructions aids discoverability; silent refusal would hide the trap.
 - Em-dash headings flagged as copy-paste risk: verified non-issue — repo is UTF-8 throughout and the existing SKILL.md already uses em-dashes.
 - "Subagent Task stops trigger the ralph Stop hook and get trapped in the loop" (adversarial round): REFUTED — official hooks docs list `Stop` ("when Claude finishes responding") and `SubagentStop` ("when a subagent finishes") as distinct events; the plugin registers only `Stop`.
