@@ -205,7 +205,7 @@ cd $(mktemp -d) && mkdir -p .claude && printf -- '---\nactive: true\niteration: 
 sh -c '[ "${CLAUDE_CODE_ENTRYPOINT:-cli}" = "cli" ] || exit 0; bash $HOME/.claude/skills/autonomous-orchestration/hooks/compact-reinject.sh'
 ```
 
-Expected: doctrine block printed, mentions `iteration 3` and `<promise>smoke</promise>`.
+Expected: doctrine block printed, mentions `iteration 3`, references "the completion sigil recorded in tasks/mission.md", and does NOT contain `<promise>smoke</promise>` — the script never prints the literal sigil (that's the round-1 parroting fix; do not "repair" the script to print it).
 
 - [ ] **Step 4: Commit**
 
@@ -268,7 +268,9 @@ this procedure.
 3. **Write `tasks/mission.md`** (planning-with-files format): goal,
    acceptance criteria (checkboxes), verifier command, sigil statement,
    approved manifest, cancel instructions
-   (`rm .claude/ralph-loop.local.md` or `/cancel-ralph`).
+   (`rm .claude/ralph-loop.local.md` or `/cancel-ralph`). Also create an
+   empty `tasks/progress.md` now — doctrine and the loop prompt tell every
+   iteration to read it, so it must exist from iteration 1.
 4. **Arm the loop** — run from the WORKTREE ROOT (state file is CWD-scoped).
    Set `SIGIL` to the mission-specific statement from mission.md first —
    NEVER pass a placeholder: an unsubstituted promise can never match, so
@@ -282,11 +284,11 @@ this procedure.
    case "$PWD" in
      "$HOME"|"$HOME/.claude"|"$HOME/Repos") echo "REFUSE: arm only from a dedicated worktree root"; exit 1;;
    esac
-   [[ -e .git ]] || { echo "REFUSE: not a repo/worktree root"; exit 1; }
+   [[ -e .git ]] || { echo "REFUSE: not a repo/worktree root"; exit 1; }  # .git is a FILE in linked worktrees, a dir in main checkouts; -e covers both
 
    SIGIL='All acceptance criteria in tasks/mission.md are implemented, the verifier is green, and a fresh-context reviewer confirmed the diff.'
    SETUP=$(ls -d ~/.claude/plugins/cache/claude-plugins-official/ralph-loop/*/scripts/setup-ralph-loop.sh | sort -V | tail -1)
-   "$SETUP" "Autonomous mission: read tasks/mission.md and tasks/progress.md, then continue from where progress.md left off. Orchestrate via subagents; do not implement inline." \
+   "$SETUP" "Autonomous mission: read tasks/mission.md and tasks/progress.md, then continue from where progress.md left off (empty progress.md = start at the first unchecked acceptance criterion). Orchestrate via subagents; do not implement inline." \
      --completion-promise "$SIGIL" --max-iterations 25
    ```
 
@@ -415,7 +417,7 @@ git commit -m "feat(autonomous-orchestration): Phase 0 autonomy contract, sigil 
 
 ### Task 4: E2E integration smoke — our contract vs the official plugin
 
-Validates the assumptions Tasks 1-3 bake in: state-file format, empty-session fallthrough, sigil detection, max-iterations stop. Read-only against the plugin; sandboxed in /tmp.
+Validates the assumptions Tasks 1-3 bake in: state-file format, empty-session fallthrough, sigil detection, max-iterations stop. Read-only against the plugin; sandboxed in /tmp. **Run all Task 4 steps in ONE shell session** — the EXIT trap and `$SANDBOX`/`$SETUP`/`$STOPHOOK`/`$TRANSCRIPT` variables from Step 1 carry across steps.
 
 **Files:**
 - None created in repo (throwaway /tmp sandbox). Findings appended to plan doc if surprises.
