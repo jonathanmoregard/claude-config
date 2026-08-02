@@ -296,7 +296,9 @@ this procedure.
    esac
    SETUP=$(ls -d ~/.claude/plugins/cache/claude-plugins-official/ralph-loop/*/scripts/setup-ralph-loop.sh 2>/dev/null | sort -V | tail -1)
    [[ -f "$SETUP" ]] || { echo "REFUSE: ralph-loop plugin not found in plugin cache — loop would silently never arm"; exit 1; }
-   "$SETUP" "Autonomous mission: read tasks/mission.md, tasks/session-constraints.md, and tasks/progress.md, then continue from where progress.md left off (empty progress.md = start at the first unchecked acceptance criterion). Orchestrate via subagents; do not implement inline; paste session-constraints.md verbatim into every subagent briefing." \
+   # `bash "$SETUP"`, never "$SETUP" directly: the plugin's #!/bin/bash shebang
+   # does not resolve on NixOS (no /bin/bash) — direct exec fails exit 126.
+   bash "$SETUP" "Autonomous mission: read tasks/mission.md, tasks/session-constraints.md, and tasks/progress.md, then continue from where progress.md left off (empty progress.md = start at the first unchecked acceptance criterion). Orchestrate via subagents; do not implement inline; paste session-constraints.md verbatim into every subagent briefing." \
      --completion-promise "$SIGIL" --max-iterations 25
    [[ -f .claude/ralph-loop.local.md ]] || { echo "ARM FAILED: state file missing — stop gate is NOT live"; exit 1; }
    ```
@@ -521,6 +523,11 @@ Expected: no block JSON, `exit=0` — removing the state file is a working kill 
 
 If any expectation fails, STOP and fix the corresponding assumption in Task 1/3 before proceeding (they encode this contract). On success, no commit needed.
 
+**Findings (2026-08-02 run — all steps green, three notes):**
+1. *Step-3 sequence artifact:* with `--max-iterations 2`, Step 2 consumes iteration 2, so Step 3 releases via max-iterations before the sigil is evaluated. Sigil path re-verified green with a fresh `--max-iterations 5` arm. Future re-runs: use `--max-iterations 3` in Step 1.
+2. *Exit-condition ordering:* max-iterations wins over a present sigil when both hold; both paths remove the state file, so the loop still ends cleanly — no doctrine change needed (Phase 0's 25 gives ample headroom).
+3. *NixOS shebang:* `/bin/bash` does not exist on NixOS; direct exec of plugin scripts fails exit 126. All invocations must be `bash <script>` — plugin's own hooks.json already does this; the SKILL arm block was fixed to `bash "$SETUP"` (Task 6 Step 0). The post-arm `[[ -f .claude/ralph-loop.local.md ]]` assertion would have caught the failure at arm time.
+
 ---
 
 ### Task 5: Memory + close-out
@@ -581,7 +588,17 @@ Constraints die three ways: compaction drops zero-artifact directives, attention
 **Files:**
 - Modify: `/home/jonathan/.claude/skills/autonomous-orchestration/hooks/test-compact-reinject.sh`
 - Modify: `/home/jonathan/.claude/skills/autonomous-orchestration/hooks/compact-reinject.sh`
+- Modify: `/home/jonathan/.claude/skills/autonomous-orchestration/SKILL.md` (Step 0 shebang fix)
 - Modify: `/home/jonathan/.claude/CLAUDE.md` (Context checkpoint section)
+
+- [ ] **Step 0: NixOS shebang fix in SKILL.md (from Task 4 finding 3)**
+
+In the Phase 0 arm block of `/home/jonathan/.claude/skills/autonomous-orchestration/SKILL.md`, change the line invoking the setup script from `"$SETUP" "Autonomous mission: …"` to `bash "$SETUP" "Autonomous mission: …"`, and add this comment line directly above it:
+
+```
+# `bash "$SETUP"`, never "$SETUP" directly: the plugin's #!/bin/bash shebang
+# does not resolve on NixOS (no /bin/bash) — direct exec fails exit 126.
+```
 
 - [ ] **Step 1: Extend the test (TDD — new assertion first)**
 
@@ -628,8 +645,8 @@ Alongside it, maintain `tasks/session-constraints.md` (any project, any session 
 
 ```bash
 cd /home/jonathan/.claude
-git add skills/autonomous-orchestration/hooks/compact-reinject.sh skills/autonomous-orchestration/hooks/test-compact-reinject.sh CLAUDE.md
-git commit -m "feat(autonomous-orchestration): session-constraints.md pinning — doctrine re-read + global checkpoint convention"
+git add skills/autonomous-orchestration/hooks/compact-reinject.sh skills/autonomous-orchestration/hooks/test-compact-reinject.sh skills/autonomous-orchestration/SKILL.md CLAUDE.md
+git commit -m "feat(autonomous-orchestration): session-constraints.md pinning + NixOS shebang fix for arm block"
 ```
 
 ---
