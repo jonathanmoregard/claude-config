@@ -85,6 +85,10 @@ Explicit user instructions always override this.
 
 - Place new worktrees under `~/worktrees/<repo>-<branch>/`. Don't nest in repo, don't scatter under `~/Repos/`.
 
+## Pull requests
+
+- PRs target the repo's default branch (main/master) — always, by default. Non-default base only when explicitly requested (stacked PR), and then re-target to default before merge.
+
 ## Visual-verify discipline (mandatory for any UI work)
 
 Applies whenever a subagent (or the parent) will edit a rendered-view file:
