@@ -1,0 +1,489 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate" />
+<meta http-equiv="Pragma" content="no-cache" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Playground review</title>
+<link rel="icon" href="data:," />
+<style>
+  :root {
+    --bg: #14161a; --panel: #1c1f26; --ink: #e8e8ea; --muted: #8a8f99;
+    --line: #2a2e37; --accent: #6ea8fe;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--ink);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: grid; grid-template-columns: 240px 1fr; grid-template-rows: 1fr auto;
+    height: 100vh; overflow: hidden;
+  }
+  /* Sidebar */
+  aside {
+    background: var(--panel); border-right: 1px solid var(--line);
+    overflow-y: auto; grid-row: 1 / span 2;
+  }
+  aside h1 { font-size: 12px; padding: 12px; margin: 0; color: var(--muted); font-family: ui-monospace, monospace; }
+  aside ul { list-style: none; margin: 0; padding: 0; }
+  aside li a {
+    display: block; padding: 8px 12px; color: var(--ink); text-decoration: none;
+    border-left: 3px solid transparent; font-size: 13px;
+  }
+  aside li a:hover { background: #232830; }
+  aside li.sel a { border-left-color: var(--accent); background: #232830; font-weight: 600; }
+  aside li a small { color: var(--muted); font-size: 11px; display: block; margin-top: 2px; word-break: break-all; font-family: ui-monospace, monospace; }
+  /* Stage */
+  .stage { position: relative; background: #fff; overflow: hidden; }
+  .stage iframe { width: 100%; height: 100%; border: 0; display: block; }
+  .stage .empty { color: var(--muted); text-align: center; padding: 24px; }
+  .toolbar {
+    position: absolute; top: 8px; right: 8px; z-index: 5;
+    display: flex; gap: 6px;
+  }
+  .toolbar button, .toolbar a {
+    background: rgba(20,22,26,.9); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 6px; padding: 4px 10px; cursor: pointer; font: inherit; text-decoration: none;
+    font-size: 12px;
+  }
+  .toolbar button:hover, .toolbar a:hover { border-color: var(--accent); }
+  /* Element-pin overlay on top of iframe (postMessage-driven).
+     Individual absolute-positioned children of `.stage` — NO full-cover
+     wrapper — so no browser can glitch clicks-through cross-origin iframe. */
+  .hoverbox {
+    position: absolute; z-index: 3; pointer-events: none;
+    border: 2px solid var(--accent);
+    background: rgba(110,168,254,.12); display: none;
+  }
+  .hoverbox .tag {
+    position: absolute; top: -22px; left: -2px; white-space: nowrap;
+    background: var(--accent); color: #10131a; font: 11px/1.6 ui-monospace, monospace;
+    padding: 0 6px; border-radius: 3px 3px 0 0; max-width: 60ch;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+  .badge {
+    position: absolute; z-index: 4; pointer-events: auto;
+    width: 22px; height: 22px;
+    transform: translate(-50%, -50%);
+    background: #ffb84d; color: #10131a; border: 2px solid #10131a;
+    border-radius: 50%; font: 700 12px/18px ui-monospace, monospace;
+    text-align: center; cursor: pointer;
+  }
+  .badge:hover { box-shadow: 0 0 0 3px rgba(255,184,77,.4); }
+  .noteform {
+    position: absolute; pointer-events: auto; z-index: 6; width: 320px;
+    background: var(--panel); border: 1px solid #ffb84d; border-radius: 8px;
+    padding: 8px; box-shadow: 0 6px 24px rgba(0,0,0,.5);
+  }
+  .noteform .el { font: 11px/1.5 ui-monospace, monospace; color: #ffb84d;
+    margin-bottom: 6px; word-break: break-all; max-height: 3em; overflow: hidden; }
+  .noteform textarea { width: 100%; height: 72px; resize: vertical;
+    border: 1px solid var(--line); border-radius: 4px; background: #101216;
+    color: var(--ink); padding: 6px; font: 13px/1.5 inherit; outline: none; }
+  .noteform .row { display: flex; gap: 6px; margin-top: 6px; justify-content: flex-end; }
+  .noteform .row .del { margin-right: auto; border-color: #a33; color: #f88; }
+  .noteform button { background: #262a33; color: var(--ink); border: 1px solid var(--line);
+    border-radius: 6px; padding: 5px 10px; cursor: pointer; font: inherit; font-size: 12px; }
+  /* Editor */
+  .editor { background: var(--panel); border-top: 1px solid var(--line); }
+  .editor .top { display: flex; align-items: center; gap: 8px; padding: 6px 12px; font-size: 12px; }
+  .editor .spacer { flex: 1; }
+  .editor button {
+    background: #262a33; color: var(--ink); border: 1px solid var(--line);
+    border-radius: 6px; padding: 5px 10px; cursor: pointer; font: inherit;
+  }
+  .editor button:hover { border-color: var(--accent); }
+  .saved { color: var(--muted); }
+  textarea {
+    width: 100%; height: 24vh; resize: vertical; border: none; outline: none;
+    background: #101216; color: var(--ink); padding: 12px;
+    font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  kbd { background: #262a33; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 0 5px; font-size: 11px; font-family: ui-monospace, monospace; }
+</style>
+</head>
+<body>
+  <aside>
+    <h1>PLAYGROUNDS</h1>
+    <ul id="list"></ul>
+  </aside>
+  <div class="stage">
+    <div class="toolbar">
+      <button id="pinmode" title="Toggle: when ON, any click on iframe = pin comment; when OFF, clicks interact with playground normally" style="border-color:#ffb84d;color:#ffb84d;">📌 Pin: on</button>
+      <span id="pincount" class="saved" style="align-self:center;"></span>
+      <span id="urlbadge" class="saved" style="align-self:center; font-family:ui-monospace,monospace; font-size:11px;"></span>
+      <a id="openext" target="_blank" title="Open in a new tab">↗ tab</a>
+      <button id="reload" title="Reload iframe">⟲</button>
+    </div>
+    <div class="empty" id="empty">Loading playgrounds…</div>
+    <div id="diag" style="position:absolute; top:44px; left:8px; right:8px; z-index:8; background:#3a1a1a; color:#ffb; border:1px solid #a55; border-radius:6px; padding:8px 12px; font:12px ui-monospace,monospace; display:none;"></div>
+    <iframe id="stage" hidden></iframe>
+    <div class="hoverbox" id="hoverbox"><span class="tag" id="hovertag"></span></div>
+  </div>
+  <div class="editor">
+    <div class="top">
+      <span id="current" style="font-family:ui-monospace,monospace;"></span>
+      <span class="spacer"></span>
+      <span id="saved" class="saved"></span>
+      <button id="copy">Copy all</button>
+      <button id="download">Download .md</button>
+      <button id="clear">Clear text</button>
+    </div>
+    <textarea id="notes" placeholder="Notes for the currently-open playground. Autosaved per-URL. `←`/`→` when notes not focused switches playgrounds."></textarea>
+  </div>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const list = $('list'), empty = $('empty'), notes = $('notes');
+  // Iframe is REPLACED on every nav (not just src-swapped) because
+  // Chromium refuses to navigate away from a `chrome-error://` state
+  // (a prior CSP/CORS failure sticks). Rebuilding the DOM element
+  // gives every load a fresh error-state-free frame.
+  let stage = $('stage');
+  function swapStage(newSrc) {
+    const parent = stage.parentElement;
+    const fresh = document.createElement('iframe');
+    fresh.id = 'stage';
+    fresh.style.width = '100%';
+    fresh.style.height = '100%';
+    fresh.style.border = '0';
+    fresh.style.display = 'block';
+    fresh.src = newSrc;
+    parent.replaceChild(fresh, stage);
+    stage = fresh;
+    return fresh;
+  }
+  const urlbadge = $('urlbadge'), openext = $('openext'), current = $('current'), savedEl = $('saved');
+  // Boot diagnostics — announce build + preemptively kill stale caches
+  // that broke the tool across the last 4 iterations. Advisor round
+  // 2026-08-03: cache-persistence + no in-band diag was the root cause.
+  const BUILD = 'pgr-2026-08-03-g'; // bump on every tool edit
+  console.log('%c[playground-review] build ' + BUILD, 'font-weight:bold;color:#6ea8fe');
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.getRegistrations().then(regs => {
+      regs.forEach(r => { r.unregister(); console.warn('[playground-review] unregistered stale SW', r.scope); });
+    }).catch(() => {});
+  }
+  const diag = document.getElementById('diag');
+  function showDiag(html) {
+    diag.innerHTML = html + ' <button style="float:right;background:none;border:1px solid #a55;color:#ffb;border-radius:4px;padding:0 6px;cursor:pointer;margin-left:8px;" onclick="this.parentElement.style.display=\'none\'">×</button>';
+    diag.style.display = 'block';
+  }
+
+  let entries = []; // [{name, url}]
+  let idx = -1;
+  let folderKey = '';
+  const headed = new Set();
+  const headingFor = (name) => '## ' + name;
+
+  async function load() {
+    try {
+      const res = await fetch('/playgrounds.json', { cache: 'no-store' });
+      if (!res.ok) throw new Error('playgrounds.json ' + res.status);
+      entries = await res.json();
+      if (!Array.isArray(entries) || !entries.length) throw new Error('empty manifest');
+    } catch (e) {
+      empty.textContent = 'Could not load playgrounds.json — ' + e.message;
+      return;
+    }
+    // Canonicalize host so localhost/127.0.0.1 don't split localStorage.
+    const canonicalHost = (u) => new URL(u).host.replace('localhost', '127.0.0.1');
+    folderKey = 'pgreview:' + canonicalHost(location.href) + ':' + canonicalHost(entries[0].url);
+    notes.value = localStorage.getItem(folderKey) || '';
+    for (const e of entries) if (notes.value.includes(headingFor(e.name))) headed.add(e.name);
+    renderList();
+    empty.hidden = true; stage.hidden = false;
+    go(0);
+  }
+
+  function renderList() {
+    list.innerHTML = '';
+    entries.forEach((e, i) => {
+      const li = document.createElement('li');
+      const a = document.createElement('a');
+      a.href = '#' + i;
+      a.innerHTML = e.name.replace(/</g, '&lt;') + '<small>' + (new URL(e.url).pathname + new URL(e.url).search).replace(/</g, '&lt;') + '</small>';
+      a.onclick = (ev) => { ev.preventDefault(); go(i); };
+      li.appendChild(a);
+      list.appendChild(li);
+    });
+  }
+
+  // Cache-buster: browser MUST re-fetch iframe target on every nav so
+  // template + CSP edits land without hard-refresh. Uses BUILD id +
+  // Date.now to also bust reload of the same URL.
+  function bustCache(url) {
+    const u = new URL(url);
+    u.searchParams.set('_pgr', BUILD + '-' + Date.now());
+    return u.toString();
+  }
+
+  // Iframe watchdog: wait for the pg-pin-ready handshake (fired on
+  // DOMContentLoaded inside the iframe). Silence = iframe blank (CSP block)
+  // or pin script never loaded (stale cache / missing tag). NOT the same
+  // as "user hasn't hovered yet" — the old logic false-alarmed on that.
+  let bridgeTimer = null;
+  let bridgeReady = false;
+  function armBridgeWatchdog() {
+    bridgeReady = false;
+    clearTimeout(bridgeTimer);
+    bridgeTimer = setTimeout(() => {
+      if (bridgeReady) return;
+      showDiag('<strong>iframe loaded but pin bridge did not handshake</strong> — likely CSP frame-ancestors block or stale cache. Ctrl+Shift+R to bust cache. Open DevTools Console (F12) for CSP violations.');
+    }, 4000);
+  }
+
+  // Pin mode toggle (menu bar). Default OFF so playground controls work
+  // out-of-box. When ON, any click on iframe = pin comment (playground
+  // interaction suspended). When OFF, clicks pass to playground normally.
+  // Cross-frame protocol: parent sends pg-pin-set-mode; iframe hijacks
+  // clicks only when on. Alt-modifier requirement dropped (Alt binds to
+  // window-manager actions on some desktops).
+  let pinMode = false;
+  const pinBtn = $('pinmode');
+  function updatePinBtn() {
+    pinBtn.textContent = '📌 Pin: ' + (pinMode ? 'on' : 'off');
+    pinBtn.style.borderColor = pinMode ? '#ffb84d' : 'var(--line)';
+    pinBtn.style.color = pinMode ? '#ffb84d' : 'var(--muted)';
+  }
+  function sendPinMode() {
+    try { stage.contentWindow && stage.contentWindow.postMessage({ type: 'pg-pin-set-mode', on: pinMode }, '*'); } catch {}
+  }
+  pinBtn.onclick = () => {
+    pinMode = !pinMode;
+    updatePinBtn();
+    sendPinMode();
+    if (!pinMode) { hoverbox.style.display = 'none'; closeForm(); }
+  };
+  updatePinBtn();
+
+  function go(n) {
+    if (!entries.length) return;
+    idx = Math.max(0, Math.min(entries.length - 1, n));
+    const e = entries[idx];
+    // Update sidebar selection.
+    [...list.children].forEach((li, i) => li.classList.toggle('sel', i === idx));
+    // Rebuild iframe DOM node — src-swap fails when frame is stuck on
+    // chrome-error://chromewebdata/ from a prior failed load.
+    swapStage(bustCache(e.url));
+    armBridgeWatchdog();
+    urlbadge.textContent = e.url;
+    openext.href = e.url;
+    current.textContent = e.name;
+    ensureHeading(e.name);
+    focusSection(e.name);
+  }
+
+  function ensureHeading(name) {
+    if (headed.has(name)) return;
+    const h = headingFor(name);
+    let v = notes.value;
+    if (v && !v.endsWith('\n\n')) v += v.endsWith('\n') ? '\n' : '\n\n';
+    v += h + '\n';
+    notes.value = v;
+    headed.add(name);
+    save();
+  }
+
+  function focusSection(name) {
+    const v = notes.value;
+    const h = headingFor(name);
+    const start = v.indexOf(h);
+    let caret = v.length;
+    if (start !== -1) {
+      const afterH = start + h.length;
+      const nextH = v.indexOf('\n## ', afterH);
+      caret = nextH === -1 ? v.length : nextH;
+    }
+    notes.focus();
+    notes.setSelectionRange(caret, caret);
+    notes.blur(); notes.focus();
+    notes.setSelectionRange(caret, caret);
+  }
+
+  let saveTimer = null;
+  function save() {
+    if (!folderKey) return;
+    localStorage.setItem(folderKey, notes.value);
+    savedEl.textContent = 'saved ' + new Date().toLocaleTimeString();
+  }
+  notes.addEventListener('input', () => {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(save, 250);
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if (!entries.length) return;
+    if (document.activeElement === notes) return; // don't hijack while typing
+    if (e.key === 'ArrowRight') { e.preventDefault(); go(idx + 1); return; }
+    if (e.key === 'ArrowLeft')  { e.preventDefault(); go(idx - 1); return; }
+    if ((e.ctrlKey || e.metaKey) && e.key === 'ArrowRight') { e.preventDefault(); go(idx + 1); return; }
+    if ((e.ctrlKey || e.metaKey) && e.key === 'ArrowLeft')  { e.preventDefault(); go(idx - 1); return; }
+  });
+
+  $('reload').onclick = () => {
+    if (!entries[idx]) return;
+    swapStage(bustCache(entries[idx].url));
+    armBridgeWatchdog();
+  };
+  $('copy').onclick = async () => {
+    try { await navigator.clipboard.writeText(notes.value); flash($('copy'), 'Copied'); }
+    catch { notes.select(); document.execCommand('copy'); flash($('copy'), 'Copied'); }
+  };
+  $('download').onclick = () => {
+    const blob = new Blob([notes.value], { type: 'text/markdown' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'playground-feedback.md';
+    a.click(); URL.revokeObjectURL(a.href);
+  };
+  $('clear').onclick = () => {
+    if (!confirm('Clear all playground notes for this folder?')) return;
+    notes.value = ''; headed.clear(); save();
+    if (entries[idx]) go(idx);
+  };
+
+  function flash(btn, label) {
+    const old = btn.textContent; btn.textContent = label;
+    setTimeout(() => (btn.textContent = old), 1000);
+  }
+
+  load();
+
+  // ---- Cross-frame element pinning (postMessage bridge) ----
+  const hoverbox = $('hoverbox'), hovertag = $('hovertag');
+  const stageContainer = document.querySelector('.stage');
+  const pinsByName = new Map();      // playground name → [{n, rect, desc, label, note}]
+  let openForm = null;
+
+  function currentPins() {
+    if (!entries[idx]) return [];
+    const name = entries[idx].name;
+    if (!pinsByName.has(name)) pinsByName.set(name, []);
+    return pinsByName.get(name);
+  }
+
+  function renderPins() {
+    // Wipe existing badges (siblings of iframe under .stage).
+    Array.from(stageContainer.querySelectorAll('.badge')).forEach(b => b.remove());
+    if (!entries[idx]) return;
+    for (const p of currentPins()) {
+      const b = document.createElement('div');
+      b.className = 'badge';
+      b.textContent = p.n;
+      b.style.left = (p.rect.x + p.rect.w / 2) + 'px';
+      b.style.top = (p.rect.y + p.rect.h / 2) + 'px';
+      b.title = p.desc + ' — ' + p.note;
+      b.onclick = (e) => { e.stopPropagation(); openPin(p); };
+      stageContainer.appendChild(b);
+    }
+  }
+
+  function openPin(existing, incoming) {
+    closeForm();
+    const p = existing || incoming;
+    const form = document.createElement('div');
+    form.className = 'noteform';
+    const desc = (p.desc || '') + (p.label ? ' “' + p.label + '”' : '');
+    form.innerHTML = '<div class="el">' + desc.replace(/</g, '&lt;') + '</div>' +
+      '<textarea placeholder="Note for this element… (Enter saves, Esc cancels)"></textarea>' +
+      '<div class="row">' +
+      (existing ? '<button class="del">Delete</button>' : '') +
+      '<button class="cancel">Cancel</button><button class="save">Save</button></div>';
+    const ta = form.querySelector('textarea');
+    if (existing) ta.value = existing.note;
+    const maxL = Math.max(0, stageContainer.clientWidth - 340);
+    form.style.left = Math.min(p.rect.x + 12, maxL) + 'px';
+    form.style.top = Math.max(0, p.rect.y - 20) + 'px';
+    stageContainer.appendChild(form);
+    openForm = form;
+    ta.focus();
+    const commit = () => {
+      const note = ta.value.trim();
+      if (!note) { closeForm(); return; }
+      if (existing) { existing.note = note; }
+      else {
+        const list = currentPins();
+        list.push({ n: list.length + 1, rect: p.rect, desc: p.desc, label: p.label, note });
+      }
+      closeForm(); syncPins();
+    };
+    form.querySelector('.save').onclick = commit;
+    form.querySelector('.cancel').onclick = closeForm;
+    if (existing) form.querySelector('.del').onclick = () => {
+      const list = currentPins();
+      const i = list.indexOf(existing);
+      if (i !== -1) list.splice(i, 1);
+      list.forEach((pn, j) => (pn.n = j + 1));
+      closeForm(); syncPins();
+    };
+    ta.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); commit(); }
+      if (e.key === 'Escape') { e.preventDefault(); closeForm(); }
+    });
+  }
+  function closeForm() {
+    if (openForm) { openForm.remove(); openForm = null; }
+  }
+
+  function pinLine(p) {
+    return '- 📌#' + p.n + ' [' + p.desc + (p.label ? ' “' + p.label + '”' : '') +
+      '] @(' + Math.round(p.rect.x) + ',' + Math.round(p.rect.y) + '): ' + p.note;
+  }
+  function syncPins() {
+    renderPins();
+    // Mirror pins into the transcript section for the current playground.
+    if (!entries[idx]) return;
+    const name = entries[idx].name;
+    const h = headingFor(name);
+    let v = notes.value;
+    const start = v.indexOf(h);
+    if (start !== -1) {
+      const afterH = start + h.length;
+      const nextH = v.indexOf('\n## ', afterH);
+      const end = nextH === -1 ? v.length : nextH;
+      const section = v.slice(afterH, end);
+      const kept = section.split('\n').filter(l => !l.startsWith('- 📌')).join('\n')
+        .replace(/\n{3,}/g, '\n\n').replace(/\s+$/, '');
+      const pinBlock = currentPins().map(pinLine).join('\n');
+      const merged = kept + (pinBlock ? '\n' + pinBlock : '') + '\n';
+      notes.value = v.slice(0, afterH) + merged + v.slice(end);
+    }
+    save();
+  }
+
+  window.addEventListener('message', (e) => {
+    const d = e.data;
+    if (!d || typeof d !== 'object') return;
+    // Handshake proves the pin script loaded + can talk to parent.
+    if (d.type === 'pg-pin-ready') {
+      bridgeReady = true;
+      clearTimeout(bridgeTimer);
+      // Sync pin mode to the fresh iframe on load.
+      sendPinMode();
+      return;
+    }
+    // Hover overlay shows regardless of pin mode (visual affordance for
+    // element inspection). Only click-to-pin popover is gated below.
+    if (d.type === 'pg-pin-hover' && d.rect) {
+      hoverbox.style.display = 'block';
+      hoverbox.style.left = d.rect.x + 'px';
+      hoverbox.style.top = d.rect.y + 'px';
+      hoverbox.style.width = d.rect.w + 'px';
+      hoverbox.style.height = d.rect.h + 'px';
+      hovertag.textContent = (d.desc || '') + ' ' + (d.label ? '“' + d.label + '”' : '') + (pinMode ? '  [click to pin]' : '  [pin OFF]');
+    } else if (d.type === 'pg-pin-clear') {
+      hoverbox.style.display = 'none';
+    } else if (d.type === 'pg-pin-click' && d.rect && pinMode) {
+      openPin(null, { rect: d.rect, desc: d.desc || '', label: d.label || '' });
+    }
+  });
+
+  // Re-render pins on iframe navigation (each go() flips idx).
+  const _origGo = go;
+  go = function(n) { _origGo(n); closeForm(); hoverbox.style.display = 'none'; setTimeout(renderPins, 100); };
+})();
+</script>
+</body>
+</html>
