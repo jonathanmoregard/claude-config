@@ -1,29 +1,32 @@
 ---
 name: advice-refine-test-loop
-description: Use when shipping non-trivial changes that must land clean — the user says "look through carefully and fix what's off", "ask for advice and repeat", "keep refining until neat", or is going to bed. Runs four sequential phases (Opus + narrow specialists → Codex → adversarial → optional taste) with structured JSON verdicts, empirical repro, prefix-cached prompts, and a bounded consolidator sub-loop for LOWs (MEDIUMs surface but do not block).
+description: Use when shipping non-trivial changes that must land clean — the user says "look through carefully and fix what's off", "ask for advice and repeat", "keep refining until neat", or is going to bed. Runs four sequential phases (Opus + narrow specialists → Codex → adversarial → optional taste incl. Codex vision-taste 4b for UI diffs) with structured JSON verdicts, empirical repro, prefix-cached prompts, and a bounded consolidator sub-loop for LOWs (MEDIUMs surface but do not block).
 ---
 
 # Advice-Refine-Test Loop
 
-Single-pass review reliably misses fail-open paths, silently-swallowed exceptions, resource leaks, schema mismatches. Single-vendor review misses whatever that vendor's model is systematically blind to. Both-vendors-agree still misses what confirmation bias hides.
+Single-pass review reliably misses fail-open paths, silently-swallowed exceptions, resource leaks, schema mismatches. Single-vendor review misses whatever that vendor's model is systematically blind to. Both-vendors-agree still misses what confirmation bias hides. Single-vendor VISUAL review misses geometric defects (radio-dot Y-centering, dot position, width alignment, selected-state color regressions) — the DiffSpot 2026 benchmark shows every frontier VLM misses 60%+ of true single-CSS-property defects, and pixel magnitude doesn't predict detection. Multi-vendor visual taste + a deterministic DOM-geometry oracle is the only combination that closes that gap.
 
-The loop catches all three by staging the review:
+The loop catches all four by staging the review:
 
 - **Phase 1 (Opus + narrow specialists)** does broad correctness review plus targeted passes (secure defaults, footgun APIs) when the diff touches those areas.
 - **Phase 2 (Codex/GPT-5.5)** cross-vendor review runs LAST so it only sees Opus-blessed state — preserves cross-vendor coverage while spending Codex's tighter ChatGPT Plus quota only on what Opus already cleared.
 - **Phase 3 (adversarial)** is a single Opus dispatch framed as "assume the prior PASS was wrong, find why" — catches the confirmation-bias class both prior phases share.
-- **Phase 4 (taste)** applies to UI work only, after all correctness phases pass.
+- **Phase 4 (taste)** applies to UI work only, after all correctness phases pass. Split into 4a (Opus defect + taste critics, existing) and 4b (Codex vision-taste on regenerated shots, second vendor).
 
 Every phase uses a **structured JSON verdict schema** (`verdict-schema.json`) so stop conditions are parseable, not vibes. Between phases, a **consolidator sub-loop** auto-fixes LOW findings without spending another advisor round.
 
 ## The Phases
 
 ```
-PHASE 1: Opus + specialists — loop rounds until verdict PASS
-PHASE 2: Codex (GPT-5.5) — loop rounds until verdict PASS
-PHASE 3: Adversarial — single Opus round with "prove PASS wrong" framing
-         (findings loop back to Phase 1)
-PHASE 4: Taste round (UI-only, ONCE) — see "Taste round" section below
+PHASE 1:  Opus + specialists — loop rounds until verdict PASS
+PHASE 2:  Codex (GPT-5.5) — loop rounds until verdict PASS
+PHASE 3:  Adversarial — single Opus round with "prove PASS wrong" framing
+          (findings loop back to Phase 1)
+PHASE 4a: Taste round (UI-only, ONCE) — Opus defect + taste critics
+PHASE 4b: Codex vision-taste (UI-only, ONCE) — second-vendor VLM on the
+          regenerated shots; combined with geometry-oracle output via
+          union + confidence tiers (see "Phase 4b" section below)
 ```
 
 At end of each phase's PASS, if the final round emitted `PASS_WITH_FIXES`, the **consolidator sub-loop** runs before advancing (see "Consolidator" below).
@@ -240,8 +243,13 @@ After consolidator exits (clean or bounded), advance to the next phase using the
 | Loop adversarial itself when it emits findings | Adversarial is one-shot confirmation, not another main loop. Findings → back to Phase 1. If adversarial fires blocker after blocker across resets, split the diff instead. |
 | Skip verdict JSON validation and trust prose | Prose verdicts drift ("looks fine", "no major issues", "SAFE-ish"). JSON schema is the stop condition; if it's missing, the round FAILED — don't guess intent. |
 | Put "Prior rounds fixed:" at the START of the prompt | Kills prefix caching. Stable content first (goal, re-read paths, output shape), variable delta last. |
+| **Skip Phase 4b when the diff touches component templates or CSS** | **Red flag.** The drift-back class of bugs (dot-above-text, selected-state regression, red-title-on-non-danger, combobox-narrower-than-control) survives Phases 1-4a — every frontier VLM misses 60%+ of true CSS defects (DiffSpot 2026), and a single vendor's blind spot repeats across rounds. A second-vendor visual reviewer (Codex vision-taste) plus the geometry oracle is the only pipeline shape that catches them. Skipping 4b on a UI-touching diff ships the exact regression class the founder has already flagged multiple times. |
+| Auto-fix a singleton VLM finding without oracle backing | Session-constraint violation. Singleton visual claims can be hallucinations (UI-Lens: VLMs invent defects, e.g. flagging intentional spacing). Verify against the geometry oracle first; if the oracle can't arbitrate, surface to the founder as A/B, don't auto-fix. |
+| Auto-block on a singleton VLM finding | Session-constraint violation. `Never singleton-VLM = auto-block.` Bug the ledger, not the ship gate. Only geometry-oracle findings or 2+ reviewer convergence gate the ship. |
+| Sigil on a partial Phase 4b | Session-constraint violation. `Sigil requires reviewer confirmation.` The sigil-ready state needs: oracle green + 4b run to completion + all HIGH resolved. A skipped or half-run 4b is not sigil-ready. |
+| Add Gemini vision without an API key wired | Would silently degrade to skipping phase 4c and calling the pipeline complete. Note as future upgrade in the skill; do not add as a dispatch step until the API dependency is real. |
 
-## Phase 4: Taste round (UI-work only; run ONCE after Phases 1-3 all PASS)
+## Phase 4a: Taste round (UI-work only; run ONCE after Phases 1-3 all PASS)
 
 Phases 1-3 catch correctness. UI-work also needs a TASTE pass — misalignments, generic-AI aesthetic, house-style drift. Runs ONCE after Phase 3 emits PASS, not woven into the earlier phases.
 
@@ -301,6 +309,150 @@ If a second taste round is genuinely needed, that's a signal the design isn't co
 ### When Anthropic frontend-design skill is available
 
 Anthropic ships an official `frontend-design` skill (`npx skills add https://github.com/anthropics/skills --skill frontend-design`). If installed in the project, its rubric replaces Assessment B — it's the maintained upstream version of the taste-critic prompt.
+
+## Phase 4b: Codex vision-taste (UI-work only; run ONCE after Phase 4a)
+
+Founder observation: primary Claude visual review misses geometric defects the founder catches on first look — radio-dot Y-centering, dot position, width alignment, selected-state color regressions. The DiffSpot 2026 benchmark (Tencent WeChat AI, arXiv 2605.29615) confirms this generalizes: every frontier VLM catches ≤40.7% of true single-CSS-property defects, and pixel magnitude does not predict detection (r = −0.08). UI-Lens (CVPR 2026) shows the same pattern for boundary defects (overflow, cropping, overlap) at coin-flip accuracy. A second-vendor VLM + a deterministic DOM-geometry oracle is the only combination that closes the gap; single-vendor visual review is not sufficient regardless of which single vendor.
+
+Phase 4b runs a scripted Codex vision-taste pass on the shots regenerated by Phase-R, then merges its findings with the Opus-taste output from 4a and the geometry-oracle output via union + confidence tiers. Codex is the second vendor because it has vision support and a wired-in quota here; see the "Gemini future upgrade" note below.
+
+### When it fires
+
+- Diff touches HTML templates / view partials / CSS / rendered-view components (same trigger as 4a)
+- AND Phase 4a completed
+- AND regenerated shots exist for the touched surfaces
+- AND the project has a geometry oracle (e.g. `tests/e2e/tests/component-geometry-oracle.spec.ts`) emitting JSON violations — if absent, run Codex vision-taste alone and treat its findings as singleton (no ground-truth arbiter)
+
+Skip for pure backend / infra / docs work.
+
+### Codex vision invocation
+
+Codex CLI supports image input via `--image` (verified: v0.24.0+ scripted; v0.115.0 Mar 2026 for full-resolution, no thumbnail compression). Requires a vision-capable model (`gpt-5-codex` or newer). Approx 1-3k vision tokens per image per turn.
+
+```bash
+# One invocation per surface (component/page). Multiple shots per surface go
+# as a comma-separated list — Codex sees them all in the same turn.
+SHOTS="/abs/path/to/component-radio.png,/abs/path/to/component-radio-selected.png"
+PROMPT="$(cat <<'EOF'
+You are a design defect reviewer. You are the SECOND VENDOR in a multi-model
+taste pipeline — the primary Claude review already ran; your job is to catch
+what it missed. Bias toward reporting; a downstream arbiter suppresses false
+positives.
+
+FIXED visual rules (session constraints — a violation is a HIGH or BLOCKER):
+- Radio dot renders LEFT of text, ALWAYS (never dot-above, never dot-right).
+- Radio dot Y-center aligns with the option box's Y-center (or first-line
+  center on wrapped labels — never middle of the wrapped block).
+- Selected radio state = dark rail-blue background + white text. Light-fill
+  selected states are a regression.
+- Dialog title uses --strike red ONLY for --danger variant. Reopen, Confirm,
+  and other non-danger dialogs use --ink.
+- Combobox has no chevron glyph (native <select> chrome only, if any).
+- Combobox dropdown <li> items fill the full width of the combobox control.
+- Timegrid busy overlay width = column width; cell width = column width.
+
+KNOWN drift-backs (regressed at least once before — flag on sight):
+- Radio dot renders ABOVE text instead of LEFT (segmented-pill / --block
+  variants prone to this).
+- Selected radio reverts to light fill instead of dark rail-blue + white.
+- Dialog title turns red on non-danger dialogs.
+- Combobox items narrower than the control.
+- Timegrid busy overlay narrower than the column.
+
+For EACH image, emit a JSON object matching the verdict-schema.json used
+elsewhere in this pipeline. Findings must include:
+  - severity: BLOCKER | HIGH | MEDIUM
+  - file: image basename
+  - screen_region: rough bbox or region name (e.g. "top-left option in
+    radiogroup", "dialog title")
+  - rule: which fixed-rule or drift-back number the finding violates
+  - rationale: ≤200 chars
+
+If nothing to flag on an image, emit an empty findings array for that shot.
+Do not report LOW / nit — the geometry oracle and 4a already cover polish.
+EOF
+)"
+
+codex exec --skip-git-repo-check \
+  -m gpt-5-codex \
+  --image "$SHOTS" \
+  --output-schema ~/.claude/skills/advice-refine-test-loop/verdict-schema.json \
+  "$PROMPT" > /tmp/codex-vision-taste-<surface>.json
+```
+
+Repeat per surface. Store outputs under a run-scoped dir (e.g.
+`/tmp/design-review-YYYY-MM-DD/vision-taste/`). Do not batch every surface
+into one invocation — Codex vision recall drops sharply past ~4 images per
+turn, per DiffSpot Hard-tier data.
+
+**Failure modes** follow the same PAUSE rules as Phase 2:
+
+- Quota exhausted → retry once with `-m gpt-5.4` (lighter tier still has
+  vision on Plus quota); on second failure, PAUSE per Phase 2 rules
+  (interactive: prompt; unattended: `pending_for_human.md`).
+- Timeout (wrap with `timeout 300s`) → retry once after 30s → PAUSE.
+- Unparseable JSON → re-run once with an explicit schema reminder → PAUSE.
+
+Never silently skip 4b. The whole point of the second vendor is coverage of
+what 4a misses; a skipped 4b is worse than a skipped Phase 2 because the
+drift-back class of defects survives phases 1-4a.
+
+### Combiner algorithm
+
+Three inputs to merge:
+
+1. **Geometry-oracle findings** — JSON from `tests/e2e/tests/component-geometry-oracle.spec.ts` (or project's equivalent). Deterministic pixel/color assertions. **Always take** — this is ground truth, not a taste opinion.
+2. **Opus advisor findings** — output from Phase 4a Assessments A + B.
+3. **Codex vision-taste findings** — the per-surface JSON blobs written above.
+
+Bucket findings by `(surface, element_selector_if_any, rule)`. For each bucket:
+
+| Convergence | Confidence | Action |
+|---|---|---|
+| Geometry-oracle finding (any) | GROUND TRUTH | Always auto-fix. Not a vote; the DOM says the pixels are wrong. |
+| 2+ independent reviewers agree (e.g. Opus + Codex; or oracle + either) | HIGH | Auto-fix without further verification. |
+| Singleton VLM finding (Opus xor Codex, no oracle backing) | LOW | Verify-then-fix. Arbiter: **the geometry oracle**. If the oracle can be extended to numerically check the claim, extend it and re-run; if the oracle confirms, fix; if the oracle contradicts, discard as a hallucinated defect (VLMs invent defects — UI-Lens explicitly documents this: "misinterpreting intentional spacing ... as an abnormal blank space"). If the claim is genuinely subjective (gestalt, "does this look right") and the oracle can't arbitrate, **surface to the founder as an A/B variant fan-out, do NOT auto-fix**. |
+| Singleton VLM finding with no artifact and no reproducible check | LOW | Log to ledger with disposition `singleton-unverifiable`. Do not auto-fix. Do not auto-block. |
+
+**Session constraint (verbatim, load-bearing)**: Never singleton-VLM = auto-block. A single Codex or Opus visual claim without oracle backing does not stop the ship; it goes to the ledger and (if reproducible) the founder.
+
+**Sigil constraint (verbatim, load-bearing)**: Sigil requires reviewer confirmation. The final sigil-ready state must show at minimum the geometry-oracle green + Phase 4b run to completion + all HIGH-tier findings resolved. Do not sigil on a partial 4b.
+
+### Per-model disposition ledger
+
+Every 4b run appends to `docs/reviews/multi-model-taste-ledger.md` (project-local). One row per bucket, so per-model precision can be measured over time (sortie's pattern):
+
+```
+| run-id | date | surface | rule | opus | codex | oracle | disposition | outcome |
+|--------|------|---------|------|------|-------|--------|-------------|---------|
+| r4-... | 2026-08-03 | c-radiogroup | dot-y-center | HIT | HIT | HIT | auto-fix (2+) | fixed |
+| r4-... | 2026-08-03 | c-dialog --danger | red-title | HIT | MISS | n/a | verify-then-fix (singleton-Opus, oracle can't check) | founder-A/B |
+| r4-... | 2026-08-03 | combobox | chevron-present | MISS | HIT | HIT | auto-fix (2+) | fixed |
+```
+
+Columns:
+- `run-id` — links the row to the round (e.g. `r4-2026-08-03`)
+- `opus` / `codex` — `HIT` / `MISS` / `n/a` (n/a = surface not in that reviewer's dispatch)
+- `oracle` — `HIT` / `MISS` / `n/a` (n/a = oracle can't check this rule)
+- `disposition` — one of `auto-fix (2+)`, `auto-fix (oracle)`, `verify-then-fix (…)`, `singleton-unverifiable`, `founder-A/B`
+- `outcome` — `fixed` / `deferred` / `founder-picked-<variant>` / `discarded-as-hallucination` — filled retrospectively after the fix loop
+
+After ~20 runs the ledger surfaces per-model precision; use it to weight reviewers, not before. Until then, treat Opus and Codex as equal-weight peers; the oracle is always arbiter.
+
+### Gemini — future upgrade, not this round
+
+DiffSpot ranks Gemini (2.5 Pro / 3.x Pro) as the strongest visual perceiver (47.2% acc, 40.7% recall — best in class); UI-Lens ranks Gemini 2.5 Pro top-2 on F1 with the highest recall (81.4%) of any tested model. If Gemini API access becomes available in this shop, add as **phase 4c** using the same invocation shape and combiner rules — Gemini's high-recall / low-precision profile is exactly what a second miss-catching reviewer wants, and the arbiter+oracle mechanics already absorb the extra false positives. Do NOT add Gemini this round: no API key is wired, and adding a dependency the loop can't invoke would silently degrade to skipping 4c and calling it done.
+
+## Composition table (skill-facing summary)
+
+| Phase | Vendor | Reviewer role | Combines with | Skip when |
+|---|---|---|---|---|
+| 1 | Anthropic (Opus + specialists) | Broad correctness + narrow security/API passes | Own phase output only | Never; foundation phase |
+| 2 | OpenAI (Codex / GPT-5.5) | Cross-vendor correctness on Opus-clean state | Phase 1 fix history carried in prompt | Never; PAUSE on quota, don't silently skip |
+| 3 | Anthropic (Opus, adversarial) | "Prior PASS was wrong — find why" | Findings loop back to Phase 1 | Never; one shot, cheap |
+| 4a | Anthropic (Opus x2 — defect + taste critics) | UI defect + house-style critique | Own phase output only | Non-UI diffs |
+| 4b | OpenAI (Codex vision-taste) on regenerated shots | Second-vendor VLM catch-what-Opus-missed | Union w/ geometry oracle (ground truth) + Phase 4a Opus taste, per `docs/reviews/multi-model-taste-ledger.md` protocol | Non-UI diffs; NEVER skip on UI-touching diffs — drift-back class survives 1-4a |
+| 4c (future) | Google (Gemini 2.5 Pro / 3.x) | Third-vendor VLM, high-recall miss catcher | Same combiner slot as 4b | No API key wired; not this round |
 
 ## Exit
 
