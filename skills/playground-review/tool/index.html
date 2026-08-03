@@ -142,6 +142,11 @@
   // gives every load a fresh error-state-free frame.
   let stage = $('stage');
   function swapStage(newSrc) {
+    // Ordering per research (Firefox bug 1994668 / whatwg/html #490):
+    // src MUST be set BEFORE insertion, and load listener BEFORE src, or
+    // the initial about:blank load event race fires + real navigation
+    // event may be missed. Rebuilding the DOM element also unsticks any
+    // chrome-error://chromewebdata/ state from a prior failed load.
     const parent = stage.parentElement;
     const fresh = document.createElement('iframe');
     fresh.id = 'stage';
@@ -149,6 +154,10 @@
     fresh.style.height = '100%';
     fresh.style.border = '0';
     fresh.style.display = 'block';
+    // Listener before src.
+    fresh.addEventListener('load', () => console.log('[playground-review] iframe load:', fresh.src));
+    fresh.addEventListener('error', () => console.error('[playground-review] iframe error:', fresh.src));
+    // src before DOM insertion.
     fresh.src = newSrc;
     parent.replaceChild(fresh, stage);
     stage = fresh;
@@ -158,7 +167,7 @@
   // Boot diagnostics — announce build + preemptively kill stale caches
   // that broke the tool across the last 4 iterations. Advisor round
   // 2026-08-03: cache-persistence + no in-band diag was the root cause.
-  const BUILD = 'pgr-2026-08-03-g'; // bump on every tool edit
+  const BUILD = 'pgr-2026-08-03-h'; // bump on every tool edit
   console.log('%c[playground-review] build ' + BUILD, 'font-weight:bold;color:#6ea8fe');
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.getRegistrations().then(regs => {
@@ -219,18 +228,26 @@
     return u.toString();
   }
 
-  // Iframe watchdog: wait for the pg-pin-ready handshake (fired on
-  // DOMContentLoaded inside the iframe). Silence = iframe blank (CSP block)
-  // or pin script never loaded (stale cache / missing tag). NOT the same
-  // as "user hasn't hovered yet" — the old logic false-alarmed on that.
+  // Iframe watchdog: wait for the pg-pin-ready handshake. On timeout,
+  // auto-retry ONCE (rebuild iframe w/ fresh cache-bust); second timeout
+  // shows diag banner. Vite-style liveness pattern applied to iframe
+  // reload (research §2).
   let bridgeTimer = null;
   let bridgeReady = false;
+  let retryCount = 0;
   function armBridgeWatchdog() {
     bridgeReady = false;
     clearTimeout(bridgeTimer);
     bridgeTimer = setTimeout(() => {
       if (bridgeReady) return;
-      showDiag('<strong>iframe loaded but pin bridge did not handshake</strong> — likely CSP frame-ancestors block or stale cache. Ctrl+Shift+R to bust cache. Open DevTools Console (F12) for CSP violations.');
+      if (retryCount < 2 && entries[idx]) {
+        retryCount++;
+        console.warn('[playground-review] no handshake in 4s — auto-retry ' + retryCount + '/2');
+        swapStage(bustCache(entries[idx].url));
+        armBridgeWatchdog();
+        return;
+      }
+      showDiag('<strong>iframe silent after ' + (retryCount + 1) + ' attempts</strong> — kablong dev server may be down on :3737, or a browser extension is blocking. Open DevTools Console (F12).');
     }, 4000);
   }
 
@@ -261,6 +278,7 @@
   function go(n) {
     if (!entries.length) return;
     idx = Math.max(0, Math.min(entries.length - 1, n));
+    retryCount = 0; // fresh nav resets retry budget
     const e = entries[idx];
     // Update sidebar selection.
     [...list.children].forEach((li, i) => li.classList.toggle('sel', i === idx));
@@ -460,6 +478,8 @@
     if (d.type === 'pg-pin-ready') {
       bridgeReady = true;
       clearTimeout(bridgeTimer);
+      retryCount = 0;
+      diag.style.display = 'none';
       // Sync pin mode to the fresh iframe on load.
       sendPinMode();
       return;
