@@ -62,7 +62,7 @@ note() { CHANGES+=("$1"); }
 
 # ---------------------------------------------------------------- preflight --
 
-for f in hook.py aggregate.py run-evaluate.sh record-decision.py prompt.md README.md; do
+for f in hook.py aggregate.py run-evaluate.sh proposal-sink.py record-decision.py prompt.md README.md; do
   if [[ ! -f "$SRC_DIR/$f" ]]; then
     echo "install.sh: missing required file next to the installer: $SRC_DIR/$f" >&2
     exit 1
@@ -103,7 +103,7 @@ note "ensured $LEDGER_DIR (0700), $PROPOSALS_DIR, $ARCHIVE_DIR, $LOG_DIR"
 
 # ------------------------------------------------------------------ payload --
 
-for f in hook.py aggregate.py run-evaluate.sh record-decision.py; do
+for f in hook.py aggregate.py run-evaluate.sh proposal-sink.py record-decision.py; do
   cp -f "$SRC_DIR/$f" "$LEDGER_DIR/$f"
   chmod 0700 "$LEDGER_DIR/$f"   # executable: cron invokes run-evaluate.sh directly
 done
@@ -111,7 +111,7 @@ for f in prompt.md README.md; do
   cp -f "$SRC_DIR/$f" "$LEDGER_DIR/$f"
   chmod 0600 "$LEDGER_DIR/$f"
 done
-note "copied hook.py, aggregate.py, run-evaluate.sh, prompt.md, README.md into $LEDGER_DIR"
+note "copied hook.py, aggregate.py, run-evaluate.sh, proposal-sink.py, prompt.md, README.md into $LEDGER_DIR"
 
 # ----------------------------------------------------------------- backup ----
 

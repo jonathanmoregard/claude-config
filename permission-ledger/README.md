@@ -41,9 +41,10 @@ through you, in `/review-improvements`.
    runs `aggregate.py` itself, publishes `digest-latest.json` atomically
    (keeping the previous run as `digest-prev.json`), sweeps ledger files older
    than 6 months, and only then invokes `claude --print` over `prompt.md`. The
-   agent **reads** the digest file; it gets no `Bash` allowance at all. It
+   agent is **read-only** — `Read Glob Grep`, no `Bash`, no `Write`. It
    classifies each group as `bad-config`, `sensitive`, `wrong-tool` or
-   `rule-bug` and writes at most 5 proposals per run. Its only write target is
+   `rule-bug` and emits at most 5 proposals as delimited stdout blocks.
+   `proposal-sink.py` parses those blocks and writes the files into
    `~/.claude/proposals/permissions/`. Log:
    `~/.claude/logs/permission-ledger.log`.
 
@@ -54,6 +55,33 @@ through you, in `/review-improvements`.
    the aggregate fails or the digest holds zero groups, `run-evaluate.sh` logs
    one line and exits without paying for a model call.
 
+   Why the proposal writing moved out too (**2026-08-03**): the same reasoning
+   one step further. The original design granted
+   `--allowedTools "… Write(~/.claude/proposals/permissions/*)"`, which is dead
+   by construction headless — path-scoped `Write(...)` grants never register
+   under `--print`, and every path under `~/.claude/` is refused by Claude
+   Code's built-in sensitive-path gate regardless. It went unnoticed for two
+   days because the digest held zero groups; the first night it held five, the
+   agent wrote nothing and said so in the log. The sink is the same shape
+   `rsiProposalSink` uses in `home/jonathan-linux.nix`, which is the one path
+   proven to work here: proposer emits, pipeline persists. The sink enforces
+   the `YYYY-MM-DD-<slug>.md` filename shape (no traversal), never overwrites
+   an existing proposal, and caps bodies at 64 KiB and runs at 5 proposals.
+
+## Switching it off
+
+The evaluator reads `components.permission_ledger` from
+`~/.claude/recursive-self-improvement/config/config.json` before it does
+anything else — no digest, no model call, one log line, exit 0 when it is
+`false`. Toggling is a JSON edit; capture (stage 1) keeps running regardless,
+so the ledger stays complete while the nightly evaluation is paused.
+
+A missing file, missing key or unparseable JSON reads as **on**: capture is
+already running and the aggregate is free, so a config typo must not silently
+stop the only stage that surfaces any of this to a human. RSI's `daily_review`
+switch defaults the other way (absent = off) because that one spends an Opus
+pass per night. Cheap-and-visible fails on, expensive fails off.
+
 ## Where things live
 
 ```
@@ -62,6 +90,7 @@ through you, in `/review-improvements`.
 ├── aggregate.py       stage 2
 ├── run-evaluate.sh    the cron entrypoint: stage 2 + stage 3 + retention
 ├── prompt.md          stage 3 — the evaluator prompt
+├── proposal-sink.py   stage 3 — parses the agent's stdout blocks into files
 ├── README.md          this file
 ├── YYYY-MM.jsonl      the ledger, one month per file, 0600
 ├── digest-latest.json what the nightly agent reads, 0600

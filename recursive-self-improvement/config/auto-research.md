@@ -17,6 +17,12 @@ You are the auto-research agent for Recursive Self-Improvement. Your job is to r
 
 Read `~/.claude/recursive-self-improvement/config/config.json`. Note enabled categories.
 
+**Component gate — check this first.** If `components.auto_research` is present
+and false, print `auto-research: disabled in components; nothing to do.` and
+stop immediately. Do not read observations, do not call the research tool, do
+not write briefs. An absent `components` block or an absent `auto_research` key
+means enabled (older configs predate the switch).
+
 Only research observations in `automation` and `productivity`. Skip wellbeing and alignment — those get human-led analysis during review.
 
 ## Step 2: Find Observations Needing Research

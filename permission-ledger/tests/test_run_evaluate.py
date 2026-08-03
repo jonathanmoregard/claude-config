@@ -28,19 +28,44 @@ HOOK = os.path.join(ROOT, "hook.py")
 AGGREGATE = os.path.join(ROOT, "aggregate.py")
 RUN_EVALUATE = os.path.join(ROOT, "run-evaluate.sh")
 PROMPT = os.path.join(ROOT, "prompt.md")
+SINK = os.path.join(ROOT, "proposal-sink.py")
 
-# What run-evaluate.sh must hand the agent. The absence of any Bash(...) entry
-# is the entire point of the fix: permissions.deny carries a blanket "Bash",
-# deny beats allow, so a Bash allowance here could never take effect.
-EXPECTED_ALLOWED_TOOLS = "Read Glob Grep Write(~/.claude/proposals/permissions/*)"
+# What run-evaluate.sh must hand the agent: read-only, nothing else.
+# No Bash(...) — permissions.deny carries a blanket "Bash", deny beats allow,
+# so a Bash allowance here could never take effect; aggregate.py runs outside
+# the agent instead. No Write(...) — path-scoped write grants do not register
+# in headless mode and ~/.claude is behind the sensitive-path gate regardless,
+# so the grant that used to be here wrote exactly zero proposals in its one
+# live night (2026-08-03). proposal-sink.py persists stdout blocks instead.
+EXPECTED_ALLOWED_TOOLS = "Read Glob Grep"
 
 CLAUDE_STUB = """#!/usr/bin/env bash
-# Stand-in for the claude binary. Records argv (NUL-separated) and cwd.
+# Stand-in for the claude binary. Records argv (NUL-separated) and cwd, then
+# emits whatever PL_STUB_STDOUT holds (default: one prose line, no proposals).
 pwd > "$PL_STUB_CWD_FILE"
 printf '%s\\0' "$@" > "$PL_STUB_ARGV_FILE"
-printf '%s\\n' "stub: pretended to evaluate"
+printf '%s\\n' "${PL_STUB_STDOUT:-stub: pretended to evaluate}"
 exit "${PL_STUB_EXIT:-0}"
 """
+
+# A well-formed proposal block, as prompt.md section 5 specifies it.
+def proposal_block(fname, pattern_key="Read:/home/jonathan/.claude"):
+    return "\n".join(
+        [
+            "===PROPOSAL: %s===" % fname,
+            "---",
+            "status: pending",
+            "category: permissions",
+            "verdict: bad-config",
+            'pattern_key: "%s"' % pattern_key,
+            "---",
+            "",
+            "## Friction",
+            "",
+            "3 prompts in 7 days.",
+            "===END PROPOSAL===",
+        ]
+    )
 
 
 def month_name(year, month):
@@ -68,7 +93,7 @@ class RunEvaluateTestCase(unittest.TestCase):
             os.makedirs(d, exist_ok=True)
 
         # The installed layout: the scripts live inside the ledger dir.
-        for src in (HOOK, AGGREGATE, RUN_EVALUATE, PROMPT):
+        for src in (HOOK, AGGREGATE, RUN_EVALUATE, PROMPT, SINK):
             dst = os.path.join(self.ledger, os.path.basename(src))
             shutil.copy2(src, dst)
         self.run_evaluate = os.path.join(self.ledger, "run-evaluate.sh")
@@ -99,8 +124,23 @@ class RunEvaluateTestCase(unittest.TestCase):
             }
         )
         env.pop("PL_STUB_EXIT", None)
+        env.pop("PL_STUB_STDOUT", None)
         env.update(overrides)
         return env
+
+    def write_rsi_config(self, **components):
+        """Drop an RSI config.json into the temp HOME with the given switches."""
+        cfg_dir = os.path.join(self.claude_home, "recursive-self-improvement", "config")
+        os.makedirs(cfg_dir, exist_ok=True)
+        path = os.path.join(cfg_dir, "config.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"components": components}, fh)
+        return path
+
+    def proposal_files(self):
+        return sorted(
+            n for n in os.listdir(self.proposals) if not n.startswith(".")
+        )
 
     def feed_hook(self, payload):
         """Pipe one hook payload through the real hook.py, as Claude Code does."""
@@ -244,6 +284,115 @@ class RunEvaluateTestCase(unittest.TestCase):
         # every log line carries a UTC timestamp prefix
         for line in log.splitlines():
             self.assertRegex(line, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z ")
+
+    # -- the sink: proposals reach disk at all -----------------------------
+
+    def test_emitted_blocks_are_persisted_as_proposal_files(self):
+        self.seed_friction()
+        block = proposal_block("2026-08-03-read-home-jonathan-claude.md")
+        proc = self.run_evaluate_sh(
+            PL_STUB_STDOUT=block
+            + "\n2026-08-03-read-home-jonathan-claude.md — bad-config — Read:/home/jonathan/.claude (3)"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout.decode())
+
+        self.assertEqual(
+            self.proposal_files(), ["2026-08-03-read-home-jonathan-claude.md"]
+        )
+        written = os.path.join(self.proposals, "2026-08-03-read-home-jonathan-claude.md")
+        with open(written, encoding="utf-8") as fh:
+            body = fh.read()
+        self.assertIn('pattern_key: "Read:/home/jonathan/.claude"', body)
+        self.assertNotIn("===PROPOSAL", body, "delimiters must not reach the file")
+        self.assertEqual(
+            stat.S_IMODE(os.stat(written).st_mode),
+            0o600,
+            "proposals quote sampled tool inputs; they must be 0600",
+        )
+
+        log = self.log()
+        self.assertIn("sink: wrote 2026-08-03-read-home-jonathan-claude.md", log)
+        self.assertIn("sink: done, 1 proposal(s) written", log)
+        # the agent's own summary line survives into the log, the block does not
+        self.assertIn("agent: 2026-08-03-read-home-jonathan-claude.md — bad-config", log)
+        self.assertNotIn("===PROPOSAL", log)
+        # nothing left behind in the ledger dir
+        self.assertEqual([n for n in os.listdir(self.ledger) if n.startswith(".agent-raw")], [])
+
+    def test_traversal_filename_is_rejected_and_raw_is_kept(self):
+        self.seed_friction()
+        proc = self.run_evaluate_sh(
+            PL_STUB_STDOUT=proposal_block("../../../settings.json")
+        )
+        # rc 2 from the sink is a bad-model night, not a broken pipeline
+        self.assertEqual(proc.returncode, 0, proc.stdout.decode())
+        self.assertEqual(self.proposal_files(), [])
+        self.assertFalse(
+            os.path.exists(os.path.join(self.claude_home, "settings.json")),
+            "the sink must never write outside its dest dir",
+        )
+        log = self.log()
+        self.assertIn("sink: rejected filename", log)
+        self.assertIn("raw agent output preserved at", log)
+
+    def test_existing_proposal_is_never_overwritten(self):
+        self.seed_friction()
+        fname = "2026-08-03-read-home-jonathan-claude.md"
+        existing = os.path.join(self.proposals, fname)
+        with open(existing, "w", encoding="utf-8") as fh:
+            fh.write("human-edited, do not clobber\n")
+
+        proc = self.run_evaluate_sh(PL_STUB_STDOUT=proposal_block(fname))
+        self.assertEqual(proc.returncode, 0, proc.stdout.decode())
+        with open(existing, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "human-edited, do not clobber\n")
+        self.assertIn("sink: skipped existing %s" % fname, self.log())
+
+    def test_failed_agent_run_persists_nothing(self):
+        self.seed_friction()
+        proc = self.run_evaluate_sh(
+            PL_STUB_STDOUT=proposal_block("2026-08-03-read-home-jonathan-claude.md"),
+            PL_STUB_EXIT="7",
+        )
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(
+            self.proposal_files(), [], "a failed run must not leave proposals behind"
+        )
+
+    # -- the component gate -------------------------------------------------
+
+    def test_component_switched_off_does_no_work_at_all(self):
+        self.seed_friction()
+        self.write_rsi_config(permission_ledger=False)
+        proc = self.run_evaluate_sh()
+        self.assertEqual(proc.returncode, 0, proc.stdout.decode())
+        self.assert_stub_not_called()
+        self.assertFalse(
+            os.path.exists(self.digest), "the gate precedes the aggregate"
+        )
+        self.assertIn("components.permission_ledger is off", self.log())
+
+    def test_component_switched_on_runs_normally(self):
+        self.seed_friction()
+        self.write_rsi_config(permission_ledger=True, daily_review=False)
+        proc = self.run_evaluate_sh()
+        self.assertEqual(proc.returncode, 0, proc.stdout.decode())
+        self.assertTrue(os.path.exists(self.digest))
+        self.assertEqual(self.stub_argv_list()[:2], ["--model", "opus"])
+
+    def test_missing_or_broken_config_leaves_the_ledger_running(self):
+        # Absent config: the default installed state, and the state every other
+        # test in this file runs under. Broken config: a typo must not silently
+        # kill the only stage that surfaces the ledger to a human.
+        self.seed_friction()
+        cfg_dir = os.path.join(self.claude_home, "recursive-self-improvement", "config")
+        os.makedirs(cfg_dir, exist_ok=True)
+        with open(os.path.join(cfg_dir, "config.json"), "w", encoding="utf-8") as fh:
+            fh.write("{ not json at all")
+        proc = self.run_evaluate_sh()
+        self.assertEqual(proc.returncode, 0, proc.stdout.decode())
+        self.assertTrue(os.path.exists(self.digest))
+        self.assertNotIn("components.permission_ledger is off", self.log())
 
     def test_second_run_rotates_the_previous_digest(self):
         self.seed_friction()
