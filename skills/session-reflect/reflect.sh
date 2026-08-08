@@ -52,11 +52,16 @@ Usage: reflect.sh {precompact|sessionend|subagentstop}
        (reads Claude Code hook payload JSON from stdin)
 
 Env:
-  REFLECT_MODEL         Model alias/id (default: haiku)
-  REFLECT_ROOT          Artifact root (default: \$HOME/.claude/reflections)
-  REFLECT_LOG_DIR       Worker logs   (default: \$REFLECT_ROOT/logs)
-  REFLECT_FORCE         1|true|yes|on -> bypass idempotency guard
-  _REFLECT_INTERNAL     Sentinel required to enter --worker re-entry path
+  REFLECT_MODEL                    Model alias/id (default: haiku)
+  REFLECT_ROOT                     Artifact root (default: \$HOME/.claude/reflections)
+  REFLECT_LOG_DIR                  Worker logs   (default: \$REFLECT_ROOT/logs)
+  REFLECT_FORCE                    1|true|yes|on -> bypass idempotency guard
+  REFLECT_STALE_STARTED_SECONDS    Reap stuck status=started manifests older
+                                   than this many seconds (default: 600).
+  CLAUDE_PARENT_SESSION_ID         If set by Claude Code in a SubagentStop
+                                   hook env, nest subagent artifacts under
+                                   this parent. Validated against safe charset.
+  _REFLECT_INTERNAL                Sentinel required to enter --worker re-entry path
 
 Modes:
   precompact    synchronous, 60s budget, numbered checkpoint under checkpoints/
@@ -217,6 +222,10 @@ fi
 # and return without spawning.
 LOCKFILE="${manifest_path}.lock"
 mkdir -p "$(dirname -- "$LOCKFILE")"
+# Lockfile persists intentionally (0-byte, session-scoped); pruning of the
+# session dir by the downstream aggregator cleans it up alongside the
+# artifacts. Explicit unlink here would race with another dispatcher
+# racing for the same lock.
 exec 9>"$LOCKFILE"
 if ! flock -n 9; then
   dup_dir="$session_dir/duplicates"

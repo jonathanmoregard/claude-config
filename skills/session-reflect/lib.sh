@@ -18,6 +18,8 @@ _REFLECT_LIB_SOURCED=1
 # --- Stale-started reaper threshold (seconds) --------------------------------
 # If a manifest is stuck at status=started older than this, treat it as a
 # crashed prior run (host reboot, SIGKILL, orphaned worker) and permit re-run.
+# Default 600s ≈ max reflection budget (90s for sessionend) × safety factor
+# 6-7 to absorb API-latency spikes without prematurely reaping a live worker.
 : "${REFLECT_STALE_STARTED_SECONDS:=600}"
 
 # --- Boolean env normalization (used by REFLECT_FORCE and friends) -----------
@@ -270,8 +272,15 @@ find_parent_session_id() {
     candidate="$(grep -lF -- "$sub_sid" "${jsonl_files[@]}" 2>/dev/null \
       | grep -vF -- "$tp" | head -1 || true)"
     if [[ -n "$candidate" ]]; then
-      basename -- "$candidate" .jsonl
-      return 0
+      # Re-validate: a jsonl filename could in principle bypass the sub_sid
+      # entropy check if the transcript dir was seeded adversarially, so
+      # run the derived parent through is_valid_sid before returning it.
+      local parent_candidate
+      parent_candidate="$(basename -- "$candidate" .jsonl)"
+      if is_valid_sid "$parent_candidate"; then
+        printf '%s' "$parent_candidate"
+        return 0
+      fi
     fi
   fi
   printf ''
