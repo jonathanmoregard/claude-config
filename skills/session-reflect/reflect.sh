@@ -174,7 +174,7 @@ MODE="${MODE:-$ARG1}"
 case "$MODE" in
   precompact|sessionend|subagentstop|mission) ;;
   *)
-    echo "reflect.sh: mode must be one of precompact|sessionend|subagentstop (got: '$MODE')" >&2
+    echo "reflect.sh: mode must be one of precompact|sessionend|subagentstop|mission (got: '$MODE')" >&2
     exit 2
     ;;
 esac
@@ -530,7 +530,12 @@ run_worker() {
 
   local claude_json rc
   set +e
-  claude_json=$(cd "$resume_cwd" && timeout "$budget" env \
+  # `timeout -k 10` ensures a stuck claude gets SIGKILLed 10s after the
+  # SIGTERM. Without -k, a claude with a blocked event loop can ignore
+  # TERM forever, and since this timeout puts claude in a new process
+  # group, any OUTER timeout wrapping this dispatcher (e.g. idle-handoff's
+  # `timeout 90`) cannot reach into the group to kill it. Advisor P1R3.
+  claude_json=$(cd "$resume_cwd" && timeout -k 10 "$budget" env \
     REFLECT_SUBPROCESS=1 \
     REFLECT_PARENT_SID="$SESSION_ID" \
     claude \

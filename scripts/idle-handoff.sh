@@ -217,9 +217,14 @@ scan_live_cwds
 transcript_entrypoint() {
   local transcript="$1"
   local ep
+  # `jq -sr` slurps all records into one array, then `first(.[] | ...)`
+  # returns the first match as a single value. Using `head -1` after
+  # unslurped jq would SIGPIPE jq (rc=1) under pipefail, causing
+  # nondeterministic "unknown" when multiple records have .entrypoint.
+  # Advisor P1R3.
   ep=$(head -100 "$transcript" 2>/dev/null | \
-    jq -r 'select(type=="object" and .entrypoint != null) | .entrypoint' 2>/dev/null | \
-    head -1) || { echo "unknown"; return; }
+    jq -sr 'first(.[] | select(type=="object" and .entrypoint != null) | .entrypoint) // ""' 2>/dev/null) \
+    || { echo "unknown"; return; }
   if [[ -z "$ep" ]]; then
     echo "unknown"
   else
@@ -265,33 +270,35 @@ newest_non_sdk_cli_transcript() {
 # on ls-files ∪ status output).
 is_stale_since_transcript() {
   local cwd="$1" transcript_mtime="$2"
-  # Every git call wrapped in `timeout 30`: a hung git (dead NFS, stuck
-  # fsmonitor, locked index) would otherwise wedge the flock singleton
-  # forever. Any timeout / git error is treated as stale (deny) — the
-  # gate exists to reject uncertain state, so failure-to-check is a skip.
-  ( cd "$cwd" 2>/dev/null && timeout 30 git rev-parse --is-inside-work-tree >/dev/null 2>&1 ) \
-    || return 0   # non-git or git-hung: deny
+  # Each check runs under `timeout 30 sh -c '...'` so BOTH the git command
+  # AND any downstream pipeline (xargs, stat, awk) get killed as a group
+  # when the timeout fires. Prior version only wrapped git itself; a
+  # dead-NFS stat inside xargs would wedge the flock singleton forever
+  # despite the `timeout 30 git ...` prefix. Advisor P1R3.
+  # Any timeout / git error is treated as stale (deny) — the gate exists
+  # to reject uncertain state, so failure-to-check is a skip.
+  timeout 30 sh -c 'cd "$1" && git rev-parse --is-inside-work-tree >/dev/null 2>&1' \
+    _ "$cwd" || return 0   # non-git or git-hung: deny
 
   local last_commit_ts
-  last_commit_ts=$( cd "$cwd" && timeout 30 git log -1 --format=%ct 2>/dev/null || echo 0 )
+  last_commit_ts=$(timeout 30 sh -c 'cd "$1" && git log -1 --format=%ct 2>/dev/null' _ "$cwd" || echo 0)
   if [[ "$last_commit_ts" -gt "$transcript_mtime" ]]; then
     return 0
   fi
 
-  # git status --porcelain catches both dirty and untracked; non-empty
-  # output at all = world moved since a clean baseline.
+  # git status --porcelain catches both dirty and untracked. Any output
+  # at all = world moved since a clean baseline.
   local porcelain
-  porcelain=$( cd "$cwd" && timeout 30 git status --porcelain 2>/dev/null | head -1 )
+  porcelain=$(timeout 30 sh -c 'cd "$1" && git status --porcelain 2>/dev/null | head -c 1' _ "$cwd" || echo "")
   if [[ -n "$porcelain" ]]; then
     return 0
   fi
 
   # Safeguard against a commit that pre-dates the transcript but a manual
-  # `touch` bumped file mtime. Bounded via timeout; ls-files piped through
-  # xargs bounded by pipe backpressure.
-  if ( cd "$cwd" && timeout 30 git ls-files -z 2>/dev/null | \
-       xargs -0 -r stat -c '%Y' 2>/dev/null | \
-       awk -v t=$transcript_mtime '$1 > t {found=1; exit} END {exit !found}' ); then
+  # `touch` bumped file mtime. The whole ls-files | xargs | stat | awk
+  # pipeline runs inside `timeout 30 sh -c`, so xargs and stat are in the
+  # same process group as git and get killed together on timeout.
+  if timeout 30 sh -c 'cd "$1" && git ls-files -z 2>/dev/null | xargs -0 -r stat -c "%Y" 2>/dev/null | awk -v t="$2" '"'"'$1 > t {found=1; exit} END {exit !found}'"'"'' _ "$cwd" "$transcript_mtime"; then
     return 0
   fi
   return 1
@@ -303,10 +310,28 @@ is_stale_since_transcript() {
 # treated rc=0 as "wrote" and proceeded to autofork against stale mission.md.
 # Fix: after the call, read the manifest and require status=="complete".
 mission_manifest_status() {
-  local sid="$1"
+  local sid="$1" call_start="$2"
   local mf="$REFLECT_ROOT/sessions/$sid/manifest.json"
   [[ -f "$mf" ]] || { echo "missing"; return; }
-  jq -r '.modes.mission.status // "missing"' "$mf" 2>/dev/null || echo "missing"
+  # Compare completed_at to the timestamp we captured just before invoking
+  # reflect.sh. If the manifest carries a completion from a PRIOR run (this
+  # run rc=0 but wrote nothing — REFLECT_ROOT unwritable, flock-9 skip,
+  # etc.), the completed_at is older than call_start and we treat as
+  # missing so the caller records a failure and does NOT autofork on
+  # stale mission.md. Advisor P1R3.
+  local status completed_at
+  status=$(jq -r '.modes.mission.status // "missing"' "$mf" 2>/dev/null || echo "missing")
+  completed_at=$(jq -r '.modes.mission.completed_at // ""' "$mf" 2>/dev/null || echo "")
+  if [[ "$status" == "complete" && -n "$completed_at" ]]; then
+    # Convert ISO-8601 completed_at to epoch; compare to call_start (epoch).
+    local completed_epoch
+    completed_epoch=$(date -d "$completed_at" +%s 2>/dev/null || echo 0)
+    if (( completed_epoch < call_start )); then
+      echo "stale_prior_complete"
+      return
+    fi
+  fi
+  echo "$status"
 }
 
 # ---- Main loop --------------------------------------------------------------
@@ -423,17 +448,21 @@ for project_dir in "$PROJECTS_DIR"/*/; do
   # `timeout -k 10 90 …` sends SIGTERM at 90s, SIGKILL 10s later. Without
   # --foreground, timeout runs cmd as leader of a new process group and
   # sends signals to the WHOLE GROUP — so a hung claude descendant of the
-  # bash-c wrapper gets killed too. (Prior version used --foreground which
-  # is TTY-signal handling, not group-kill — orphan claude survived.)
+  # bash-c wrapper gets killed too. reflect.sh also uses `timeout -k 10`
+  # internally around its claude call (redundant kill hardening).
+  # `8>&-` closes the handoff flock fd in the child chain so a leaked
+  # claude descendant can't hold the singleton lock after this run exits.
+  call_start=$(date +%s)
   REFLECT_ROOT="$REFLECT_ROOT" REFLECT_MODEL="$REFLECT_MODEL" \
     timeout -k 10 90 \
       bash -c 'printf "%s" "$1" | env -u MODE bash "$2" mission' \
-      _ "$payload" "$REFLECT_SH" >>"$worker_log" 2>&1
+      _ "$payload" "$REFLECT_SH" >>"$worker_log" 2>&1 8>&-
   rc=$?
 
-  # (HIGH-A) Do NOT trust rc alone — reflect.sh returns 0 on internal error.
-  # Read the manifest and require status=="complete".
-  status=$(mission_manifest_status "$sid")
+  # (HIGH-A + P1R3) Do NOT trust rc alone — reflect.sh returns 0 on internal
+  # error. Read manifest AND compare completed_at to call_start so a prior
+  # run's stale "complete" cannot be confused with a fresh success.
+  status=$(mission_manifest_status "$sid" "$call_start")
   if [[ "$rc" -ne 0 || "$status" != "complete" ]]; then
     record_failure "$sid"
     count_mission_status_error=$((count_mission_status_error + 1))
