@@ -172,7 +172,35 @@ else
   fi
   # Refuse to touch a non-writable REFLECT_ROOT — writing junk to $HOME/tmp
   # or nothing at all is worse than a clear failure into the hook's stderr log.
-  ensure_reflect_root_writable || exit 0
+  #
+  # STEP 2 (HIGH P3.2): silent-drop trap. Previously we exited 0 with no
+  # artifact + no error record; operators had zero forensic trail when
+  # reflection stopped working. Now we drop a structured record to
+  # /tmp/session-reflect-errors.log (world-writable, append-only, robust
+  # against $HOME/.claude being the offender) AND write a tagged stderr
+  # line so Claude Code's hook-output tail surfaces the failure.
+  if ! ensure_reflect_root_writable; then
+    _err_now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    # Best-effort SID/mode extraction — the payload guard hasn't run yet,
+    # so tolerate parse failure. jq is Linux-guaranteed above.
+    _err_sid="$(jq -r '.session_id // "unknown"' <<<"$PAYLOAD" 2>/dev/null || echo unknown)"
+    _err_record="$(jq -cn \
+      --arg ts "$_err_now" \
+      --arg sid "$_err_sid" \
+      --arg mode "$MODE" \
+      --arg root "$REFLECT_ROOT" \
+      --arg err "reflect_root_unwritable" \
+      '{timestamp:$ts,session_id:$sid,mode:$mode,error:$err,root_path:$root}' \
+      2>/dev/null || printf '{"timestamp":"%s","error":"reflect_root_unwritable","root_path":"%s"}' "$_err_now" "$REFLECT_ROOT")"
+    # Append to the fallback log (0644 so operators can grep from any account).
+    # Ignore errors here — /tmp write can fail on tmpfs full etc., but we
+    # already surfaced the primary failure to stderr via ensure_reflect_root_writable.
+    printf '%s\n' "$_err_record" >>/tmp/session-reflect-errors.log 2>/dev/null || true
+    # Belt-and-braces stderr line with a fixed prefix operators can grep.
+    printf '[session-reflect] REFLECT_ROOT unwritable (root=%s mode=%s sid=%s); dropped reflection, see /tmp/session-reflect-errors.log\n' \
+      "$REFLECT_ROOT" "$MODE" "$_err_sid" >&2
+    exit 0
+  fi
 fi
 
 # --- Extract fields (best-effort; missing values handled below) --------------

@@ -800,6 +800,67 @@ STUB
 chmod +x "$STUB_SCRATCH/claude"
 
 # ============================================================================
+# TEST 12: unwritable REFLECT_ROOT writes fallback error record + stderr
+# ============================================================================
+# Regression (Codex P3.2): previously ensure_reflect_root_writable failure
+# caused a silent exit 0 with no artifact and no error trail. Operators had
+# zero forensic evidence when reflection stopped working.
+# Fix: append a structured JSON record to /tmp/session-reflect-errors.log
+# AND emit a tagged '[session-reflect] REFLECT_ROOT unwritable' stderr line.
+echo "TEST 12: unwritable REFLECT_ROOT surfaces error record + stderr"
+
+# Isolate the fallback log so we can inspect exactly what this test wrote.
+# (We can't touch the real /tmp/session-reflect-errors.log because other
+# runs may have data in it.) Snapshot before + diff after.
+FALLBACK_LOG=/tmp/session-reflect-errors.log
+if [[ -f "$FALLBACK_LOG" ]]; then
+  FB_BEFORE_LINES=$(wc -l < "$FALLBACK_LOG")
+else
+  FB_BEFORE_LINES=0
+fi
+
+# Create a REFLECT_ROOT under a read-only parent dir so mkdir fails hard.
+RO_PARENT="$(mktemp -d -t reflect-ro-parent-XXXXXX)"
+chmod 555 "$RO_PARENT"  # r-x r-x r-x — cannot mkdir underneath
+UNWRITABLE_ROOT="$RO_PARENT/reflections-cannot-create"
+
+UNW_SID="test-sid-unwritable"
+UP="$(fake_payload SessionEnd "$UNW_SID")"
+
+# Capture stderr specifically.
+UNW_STDERR="$STUB_SCRATCH/unwritable.stderr"
+set +e
+echo "$UP" | REFLECT_ROOT="$UNWRITABLE_ROOT" bash "$REFLECT_SH" sessionend 2>"$UNW_STDERR"
+rc=$?
+set -e
+(( rc == 0 )) || fail "unwritable REFLECT_ROOT should exit 0 (got rc=$rc)"
+
+# stderr must carry the '[session-reflect] REFLECT_ROOT unwritable' marker.
+grep -q '\[session-reflect\] REFLECT_ROOT unwritable' "$UNW_STDERR" \
+  || fail "expected [session-reflect] REFLECT_ROOT unwritable in stderr; got: $(cat "$UNW_STDERR")"
+
+# Fallback log must have grown by at least 1 line.
+if [[ -f "$FALLBACK_LOG" ]]; then
+  FB_AFTER_LINES=$(wc -l < "$FALLBACK_LOG")
+else
+  FB_AFTER_LINES=0
+fi
+(( FB_AFTER_LINES > FB_BEFORE_LINES )) \
+  || fail "/tmp/session-reflect-errors.log did not grow (before=$FB_BEFORE_LINES after=$FB_AFTER_LINES)"
+
+# Last line must be a valid JSON record with the expected keys + our SID.
+LAST_ERR=$(tail -1 "$FALLBACK_LOG")
+echo "$LAST_ERR" | jq -e --arg sid "$UNW_SID" \
+  '.error == "reflect_root_unwritable" and .session_id == $sid and .mode == "sessionend" and .root_path == "'"$UNWRITABLE_ROOT"'" and (.timestamp | length > 0)' \
+  >/dev/null \
+  || fail "fallback log entry malformed or missing expected fields: $LAST_ERR"
+
+# Cleanup the ro parent (chmod back so we can rm).
+chmod 755 "$RO_PARENT"
+rm -rf "$RO_PARENT" 2>/dev/null || true
+info "unwritable REFLECT_ROOT surfaced as JSON record + stderr line"
+
+# ============================================================================
 if [[ "${REFLECT_DEBUG:-}" != "1" ]]; then
   rm -rf "$REFLECT_ROOT" "$STUB_SCRATCH"
 fi
