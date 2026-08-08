@@ -16,6 +16,7 @@
       "Read(/etc/nixos/**)",
       "Read(/nix/store/**)",
       "Read(/home/jonathan/worktrees/**)",
+      "Read(/home/jonathan/.claude/settings.json)",
       "Edit(/tmp/**)",
       "Edit(/home/jonathan/Repos/nixos-config-worktrees/**)",
       "Edit(/home/jonathan/worktrees/**)",
@@ -23,6 +24,8 @@
       "Edit(/home/jonathan/.claude/skills/**)",
       "Edit(/home/jonathan/.claude/homunculus/**)",
       "Edit(/home/jonathan/.claude/loops/**)",
+      "mcp__aggregator__aggregator_search_memory",
+      "mcp__aggregator__aggregator_capabilities",
       "mcp__research-agent__*",
       "mcp__safe-bash__*"
     ],
@@ -113,6 +116,7 @@
     ],
     "ask": [],
     "additionalDirectories": [
+      "/home/jonathan/Repos",
       "/home/jonathan/Repos/nixos-config-worktrees",
       "/home/jonathan/.claude/projects",
       "/home/jonathan/.claude/skills",

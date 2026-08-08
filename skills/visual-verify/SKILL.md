@@ -190,11 +190,9 @@ known_good:
 can still pass explicit flags to override. Nothing is required — a fresh
 project with no config uses defaults + a `main` readiness selector.
 
-## Trigger mechanism (hooks don't propagate to subagents — issue #34692)
+## Trigger mechanism
 
-Claude Code's PostToolUse hook does NOT reliably fire when a subagent (dispatched
-via Agent/Task tool) makes a Write/Edit tool call, as of July 2026 (open issues
-#34692, #21460, #24558, #4500). Two workarounds; use BOTH:
+Use both:
 
 ### 1. Bake into subagent briefings (primary)
 
