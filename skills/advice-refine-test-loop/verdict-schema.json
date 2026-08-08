@@ -35,6 +35,10 @@
             "type": "string",
             "maxLength": 240,
             "description": "One paragraph: what breaks, why, what to verify. <=200 chars target; schema caps at 240 to allow a small overshoot without hard-reject."
+          },
+          "unverifiable": {
+            "type": "boolean",
+            "description": "true iff confirmation of this finding requires human judgment (taste, style, subjective preference) — no empirical check applies. Stage 4.5 validator uses this tag to keep-with-warning instead of drop-as-unverified."
           }
         }
       }
