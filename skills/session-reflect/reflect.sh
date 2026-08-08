@@ -24,6 +24,14 @@
 set -euo pipefail
 umask 077
 
+# Linux-only guard. Uses GNU date (-d, %s%N), GNU mktemp (suffix-after-X's),
+# GNU stat (-c). BSD/macOS ports would require date fallback + mktemp reshape;
+# out of scope. Fail loud rather than silently misbehave.
+if [[ "$(uname -s)" != "Linux" ]]; then
+  echo "session-reflect: Linux only (uses GNU date/mktemp/stat)" >&2
+  exit 2
+fi
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib.sh"
@@ -495,12 +503,13 @@ fi
 WORKER_STDERR="$REFLECT_LOG_DIR/${SESSION_ID}-${MODE}.worker.stderr.log"
 
 # Detach cleanly: setsid new session, nohup ignores SIGHUP, redirect all fds.
-export _REFLECT_INTERNAL=1
-setsid nohup bash "$SCRIPT_DIR/reflect.sh" --worker "$MODE" \
+# Inline `env _REFLECT_INTERNAL=1` scopes the sentinel to the child only —
+# no export/unset dance, no leak into the parent shell if this script is
+# sourced or into any downstream commands.
+setsid env _REFLECT_INTERNAL=1 nohup bash "$SCRIPT_DIR/reflect.sh" --worker "$MODE" \
   </dev/null \
   >>"$WORKER_STDERR" 2>&1 \
   &
 disown
-unset _REFLECT_INTERNAL
 
 exit 0

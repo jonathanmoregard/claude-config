@@ -235,6 +235,18 @@ set -e
 info "worker sentinel enforced (rc=$rc)"
 
 # ============================================================================
+# TEST 7b: dispatcher must NOT leak _REFLECT_INTERNAL into the parent env
+# ============================================================================
+echo "TEST 7b: _REFLECT_INTERNAL scoping"
+LEAK_SID="test-sid-envleak"
+LP="$(fake_payload SessionEnd "$LEAK_SID")"
+unset _REFLECT_INTERNAL
+echo "$LP" | bash "$REFLECT_SH" sessionend >/dev/null
+[[ -z "${_REFLECT_INTERNAL:-}" ]] \
+  || fail "_REFLECT_INTERNAL leaked into parent shell (=$_REFLECT_INTERNAL)"
+info "_REFLECT_INTERNAL stays scoped to detached child"
+
+# ============================================================================
 # TEST 8: REFLECT_FORCE accepts true / yes / on (not just 1)
 # ============================================================================
 echo "TEST 8: REFLECT_FORCE truthy normalization"
@@ -247,7 +259,7 @@ wait_for_complete "$REFLECT_ROOT/sessions/$FORCE_SID/manifest.json" 10 \
 FORCE_FINAL="$REFLECT_ROOT/sessions/$FORCE_SID/final.json"
 MT1=$(stat -c '%Y' "$FORCE_FINAL")
 sleep 1
-REFLECT_FORCE=true echo "$FP" | REFLECT_FORCE=true bash "$REFLECT_SH" sessionend >/dev/null
+echo "$FP" | REFLECT_FORCE=true bash "$REFLECT_SH" sessionend >/dev/null
 # Wait for detached run to overwrite
 for _ in $(seq 1 20); do
   MT2=$(stat -c '%Y' "$FORCE_FINAL" 2>/dev/null || echo 0)
