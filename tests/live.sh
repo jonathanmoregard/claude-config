@@ -32,7 +32,7 @@ command -v jq >/dev/null     || fail "jq not on PATH"
 # --- Isolated artifact root (do NOT pollute real ~/.claude/reflections) ------
 REFLECT_ROOT="${REFLECT_ROOT:-$(mktemp -d -t reflect-live-XXXXXX)}"
 export REFLECT_ROOT
-export REFLECT_MODEL="${REFLECT_MODEL:-claude-haiku-4-5-20251001}"
+export REFLECT_MODEL="${REFLECT_MODEL:-haiku}"
 info "REFLECT_ROOT=$REFLECT_ROOT"
 info "REFLECT_MODEL=$REFLECT_MODEL"
 

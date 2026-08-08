@@ -18,8 +18,10 @@ info() { echo "  -> $*"; }
 
 # --- Stub claude on PATH -----------------------------------------------------
 # Emits a canonical Claude Code -p JSON envelope regardless of input.
-mkdir -p "$STUBS_DIR"
-cat >"$STUBS_DIR/claude" <<'STUB'
+# We drop the stub into a scratch dir on PATH so we can rewrite it per-test
+# without dirtying the checked-in tests/stubs/claude.
+STUB_SCRATCH="$(mktemp -d -t reflect-stub-XXXXXX)"
+cat >"$STUB_SCRATCH/claude" <<'STUB'
 #!/usr/bin/env bash
 # Test stub: mimics `claude -p --output-format json` output shape.
 # Ignores args + stdin, emits a fixed reflection envelope.
@@ -28,9 +30,14 @@ cat <<'JSON'
 {"type":"result","result":"{\"patterns\":[\"stubbed pattern\"],\"discoveries\":[],\"turning_points\":[],\"digressions\":[],\"obstacles_to_autonomy\":[]}","usage":{"cache_read_input_tokens":100,"cache_creation_input_tokens":10,"input_tokens":5,"output_tokens":50}}
 JSON
 STUB
-chmod +x "$STUBS_DIR/claude"
+chmod +x "$STUB_SCRATCH/claude"
 
-export PATH="$STUBS_DIR:$PATH"
+# Keep the checked-in tests/stubs/claude in sync so repo tree stays clean if
+# someone runs it directly, but tests use the scratch stub for mutation.
+mkdir -p "$STUBS_DIR"
+cp "$STUB_SCRATCH/claude" "$STUBS_DIR/claude"
+
+export PATH="$STUB_SCRATCH:$PATH"
 
 # --- Isolated artifact root --------------------------------------------------
 REFLECT_ROOT="${REFLECT_ROOT:-$(mktemp -d -t reflect-smoke-XXXXXX)}"
@@ -189,8 +196,112 @@ rc=$?
 info "malformed payload handled (exit=0)"
 
 # ============================================================================
+# TEST 6: path traversal in session_id -> rejected, no dir escape
+# ============================================================================
+echo "TEST 6: path-traversal rejection"
+BAD_SIDS=('../evil' '/abs/evil' 'has space' 'a;b' $'nl\nsid' 'sub/dir')
+for bad in "${BAD_SIDS[@]}"; do
+  P="$(jq -cn --arg sid "$bad" --arg tp "$TRANSCRIPT" --arg cwd "$WORKTREE" \
+        '{session_id:$sid, transcript_path:$tp, hook_event_name:"SessionEnd", cwd:$cwd}')"
+  echo "$P" | bash "$REFLECT_SH" sessionend >/dev/null
+  rc=$?
+  (( rc == 0 )) || fail "reflect.sh should not crash on bad sid (rc=$rc, sid=$bad)"
+done
+# Ensure no session dir was created for any of these bad SIDs.
+if find "$REFLECT_ROOT/sessions" -mindepth 1 -maxdepth 1 -type d \
+     ! -name '_malformed' ! -name "$SID" ! -name "$PC_SID" ! -name "$PARENT_SID" \
+     | grep -q .; then
+  fail "path traversal created unexpected session dir(s)"
+fi
+# _malformed bucket must exist and contain at least one error record.
+MALF_COUNT=$(find "$REFLECT_ROOT/sessions/_malformed" -type f -name '*.json' 2>/dev/null | wc -l)
+(( MALF_COUNT >= ${#BAD_SIDS[@]} )) || fail "expected >= ${#BAD_SIDS[@]} malformed records, got $MALF_COUNT"
+# Confirm no raw payload embedded (privacy) — records should carry sha256 only.
+if find "$REFLECT_ROOT/sessions/_malformed" -type f -name '*.json' -print0 \
+     | xargs -0 jq -e '.payload' >/dev/null 2>&1; then
+  fail "malformed record leaks raw payload (should only carry payload_sha256)"
+fi
+info "path-traversal rejection OK (${MALF_COUNT} malformed records, no dir escape, no payload leak)"
+
+# ============================================================================
+# TEST 7: --worker requires _REFLECT_INTERNAL=1 sentinel
+# ============================================================================
+echo "TEST 7: worker sentinel gating"
+set +e
+bash "$REFLECT_SH" --worker sessionend </dev/null >/dev/null 2>&1
+rc=$?
+set -e
+(( rc != 0 )) || fail "--worker without _REFLECT_INTERNAL should be refused"
+info "worker sentinel enforced (rc=$rc)"
+
+# ============================================================================
+# TEST 8: REFLECT_FORCE accepts true / yes / on (not just 1)
+# ============================================================================
+echo "TEST 8: REFLECT_FORCE truthy normalization"
+FORCE_SID="test-sid-force"
+FP="$(fake_payload SessionEnd "$FORCE_SID")"
+echo "$FP" | bash "$REFLECT_SH" sessionend >/dev/null
+wait_for_complete "$REFLECT_ROOT/sessions/$FORCE_SID/manifest.json" 10 \
+  || fail "initial FORCE test run never completed"
+
+FORCE_FINAL="$REFLECT_ROOT/sessions/$FORCE_SID/final.json"
+MT1=$(stat -c '%Y' "$FORCE_FINAL")
+sleep 1
+REFLECT_FORCE=true echo "$FP" | REFLECT_FORCE=true bash "$REFLECT_SH" sessionend >/dev/null
+# Wait for detached run to overwrite
+for _ in $(seq 1 20); do
+  MT2=$(stat -c '%Y' "$FORCE_FINAL" 2>/dev/null || echo 0)
+  [[ "$MT2" != "$MT1" ]] && break
+  sleep 0.5
+done
+[[ "$MT2" != "$MT1" ]] || fail "REFLECT_FORCE=true did not force re-run (mtime unchanged)"
+info "REFLECT_FORCE=true forces re-run"
+
+# ============================================================================
+# TEST 9: malformed reflection JSON -> error manifest, no raw body leak
+# ============================================================================
+echo "TEST 9: unparseable reflection JSON"
+# Swap the scratch stub for one that emits invalid JSON in the .result field.
+# The checked-in tests/stubs/claude is left untouched so the git tree stays clean.
+cat >"$STUB_SCRATCH/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null || true
+# .result is not valid JSON — should trigger unparseable branch.
+printf '%s\n' '{"type":"result","result":"totally not json {{{","usage":{}}'
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+BAD_JSON_SID="test-sid-badjson"
+BP="$(fake_payload SessionEnd "$BAD_JSON_SID")"
+echo "$BP" | bash "$REFLECT_SH" sessionend >/dev/null
+BJ_MAN="$REFLECT_ROOT/sessions/$BAD_JSON_SID/manifest.json"
+# Wait for terminal state
+for _ in $(seq 1 40); do
+  if [[ -f "$BJ_MAN" ]] && jq -e '.status == "error"' "$BJ_MAN" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.25
+done
+jq -e '.status == "error"' "$BJ_MAN" >/dev/null \
+  || fail "bad reflection JSON should produce status=error (got: $(jq -r .status "$BJ_MAN"))"
+jq -e '.reason == "unparseable_reflection_json"' "$BJ_MAN" >/dev/null \
+  || fail "bad reflection JSON should set reason=unparseable_reflection_json"
+# Must NOT embed the full raw body — an excerpt is OK; check it doesn't contain
+# the tail of the poison payload (verifies truncation policy).
+if jq -r '.raw_excerpt // ""' "$BJ_MAN" | grep -q '{{{'; then
+  # Excerpt of first 200 chars may contain the marker; that's OK, but must not be full body.
+  RAW_LEN=$(jq -r '.raw_excerpt // "" | length' "$BJ_MAN")
+  (( RAW_LEN <= 200 )) || fail "raw_excerpt exceeds 200 chars ($RAW_LEN)"
+fi
+# Must NOT have the old .raw field carrying the whole body.
+if jq -e 'has("raw") and (.raw | length > 200)' "$BJ_MAN" >/dev/null 2>&1; then
+  fail "manifest leaks large raw body (.raw > 200 chars)"
+fi
+info "unparseable JSON handled (status=error, no full-body leak)"
+
+# ============================================================================
 if [[ "${REFLECT_DEBUG:-}" != "1" ]]; then
-  rm -rf "$REFLECT_ROOT"
+  rm -rf "$REFLECT_ROOT" "$STUB_SCRATCH"
 fi
 
 echo "OK: all smoke tests passed"

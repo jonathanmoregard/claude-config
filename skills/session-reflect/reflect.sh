@@ -12,38 +12,83 @@
 #   subagentstop  -> same as sessionend but tighter budget + parent-nesting
 #
 # Env:
-#   REFLECT_MODEL    (default: claude-haiku-4-5-20251001)
+#   REFLECT_MODEL    (default: haiku — alias resolves to latest Haiku tier)
 #   REFLECT_ROOT     (default: $HOME/.claude/reflections)
-#   REFLECT_FORCE=1  bypass idempotency guard
+#   REFLECT_FORCE    1|true|yes|on (case-insensitive) -> bypass idempotency
 #   REFLECT_LOG_DIR  (default: $REFLECT_ROOT/logs)
 #
 # Never blocks longer than:
 #   - sessionend/subagentstop: milliseconds (detach immediately)
 #   - precompact:              60 seconds (timeout wrapper)
 
-set -u
+set -euo pipefail
+umask 077
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib.sh"
 
-: "${REFLECT_MODEL:=claude-haiku-4-5-20251001}"
+: "${REFLECT_MODEL:=haiku}"
 : "${REFLECT_ROOT:=$HOME/.claude/reflections}"
 : "${REFLECT_LOG_DIR:=$REFLECT_ROOT/logs}"
 
 ARG1="${1:-}"
 ARG2="${2:-}"
 
+# --- Help --------------------------------------------------------------------
+if [[ "$ARG1" == "--help" || "$ARG1" == "-h" ]]; then
+  cat <<EOF
+reflect.sh — session-reflect hook dispatcher
+
+Usage: reflect.sh {precompact|sessionend|subagentstop}
+       (reads Claude Code hook payload JSON from stdin)
+
+Env:
+  REFLECT_MODEL         Model alias/id (default: haiku)
+  REFLECT_ROOT          Artifact root (default: \$HOME/.claude/reflections)
+  REFLECT_LOG_DIR       Worker logs   (default: \$REFLECT_ROOT/logs)
+  REFLECT_FORCE         1|true|yes|on -> bypass idempotency guard
+  _REFLECT_INTERNAL     Sentinel required to enter --worker re-entry path
+
+Modes:
+  precompact    synchronous, 60s budget, numbered checkpoint under checkpoints/
+  sessionend    detached worker, 90s internal budget, writes final.json
+  subagentstop  detached worker, 40s internal budget, nests under parent/subagents/
+
+See README.md at ~/.claude/skills/session-reflect/README.md
+EOF
+  exit 0
+fi
+
 # --- Detached worker re-entry ------------------------------------------------
 # When the dispatcher backgrounds itself for sessionend/subagentstop, it
 # re-invokes with `--worker <mode>` and relies on env vars exported before
 # detachment. No stdin, no idempotency re-check (parent already checked).
+#
+# _REFLECT_INTERNAL sentinel: only the parent dispatcher sets this before
+# detaching. An outside caller that tries `reflect.sh --worker <mode>` will
+# be refused — the parent-set env vars a worker relies on would not be
+# established, and permitting that path would let an attacker with shell
+# access short-circuit the malformed-payload guard.
 if [[ "$ARG1" == "--worker" ]]; then
+  if [[ "${_REFLECT_INTERNAL:-0}" != "1" ]]; then
+    echo "reflect.sh: --worker is an internal re-entry mode; refuse external invocation" >&2
+    exit 2
+  fi
   MODE="$ARG2"
   # Env-provided state (from parent dispatcher via export):
   : "${SESSION_ID:?worker missing SESSION_ID}"
   : "${TRANSCRIPT_PATH:?worker missing TRANSCRIPT_PATH}"
   : "${manifest_path:?worker missing manifest_path}"
+  # Defense in depth: re-validate the SID we're about to write paths under.
+  if ! is_valid_sid "$SESSION_ID"; then
+    echo "reflect.sh: worker refuses invalid SESSION_ID" >&2
+    exit 2
+  fi
+  if [[ -n "${PARENT_SID:-}" ]] && ! is_valid_sid "$PARENT_SID"; then
+    echo "reflect.sh: worker refuses invalid PARENT_SID" >&2
+    exit 2
+  fi
   # PARENT_SID may be empty; HOOK_EVENT may be empty; that's fine.
 fi
 
@@ -69,11 +114,18 @@ else
     # No payload — nothing we can do, but don't crash the caller.
     exit 0
   fi
+  # Refuse to touch a non-writable REFLECT_ROOT — writing junk to $HOME/tmp
+  # or nothing at all is worse than a clear failure into the hook's stderr log.
+  ensure_reflect_root_writable || exit 0
 fi
 
 # --- Extract fields (best-effort; missing values handled below) --------------
 if (( IS_WORKER == 0 )); then
-extract() { jq -r --arg k "$1" '.[$k] // ""' <<<"$PAYLOAD" 2>/dev/null; }
+# Return empty string when the key is missing or the value is null; malformed
+# JSON causes jq to fail, which the malformed-payload guard below catches.
+# We intentionally do NOT swallow jq stderr — a real parse error should surface
+# through the guard branch, not be lost silently.
+extract() { jq -r --arg k "$1" '.[$k] // empty' <<<"$PAYLOAD" || true; }
 
 SESSION_ID="$(extract session_id)"
 TRANSCRIPT_PATH="$(extract transcript_path)"
@@ -83,21 +135,33 @@ TRIGGER="$(extract trigger)"                # precompact-only
 CUSTOM_INSTR="$(extract custom_instructions)" # precompact-only
 
 # --- Malformed payload guard -------------------------------------------------
-if [[ -z "$SESSION_ID" || -z "$TRANSCRIPT_PATH" ]]; then
-  # Write an error manifest under a "malformed" bucket so operator can debug,
-  # but exit 0 so we never block session shutdown / compaction.
+malformed_manifest() {
+  # $1=reason
+  local reason="$1"
   mkdir -p "$REFLECT_ROOT/sessions/_malformed"
-  err_manifest="$REFLECT_ROOT/sessions/_malformed/$(date -u +%Y%m%dT%H%M%SZ)-$$.json"
+  local err_manifest
+  err_manifest="$(mktemp -p "$REFLECT_ROOT/sessions/_malformed" ".manifest-XXXXXX.json")"
+  local sha len
+  sha="$(printf '%s' "$PAYLOAD" | sha256sum | awk '{print $1}')"
+  len="${#PAYLOAD}"
   jq -n \
     --arg mode "$MODE" \
     --arg event "$HOOK_EVENT" \
-    --arg sid "$SESSION_ID" \
-    --arg tp "$TRANSCRIPT_PATH" \
-    --arg payload "$PAYLOAD" \
+    --arg reason "$reason" \
+    --arg sha "$sha" \
+    --argjson len "$len" \
     --arg now "$(reflect_now)" \
-    '{status:"error",reason:"missing_session_id_or_transcript_path",mode:$mode,hook_event_name:$event,session_id:$sid,transcript_path:$tp,payload:$payload,written_at:$now}' \
-    > "$err_manifest" 2>/dev/null || true
+    '{status:"error",reason:$reason,mode:$mode,hook_event_name:$event,payload_sha256:$sha,payload_len:$len,written_at:$now}' \
+    > "$err_manifest" || true
   exit 0
+}
+
+if [[ -z "$SESSION_ID" || -z "$TRANSCRIPT_PATH" ]]; then
+  malformed_manifest "missing_session_id_or_transcript_path"
+fi
+
+if ! is_valid_sid "$SESSION_ID"; then
+  malformed_manifest "invalid_session_id"
 fi
 
 # --- Resolve parent (subagent mode only) -------------------------------------
@@ -107,6 +171,10 @@ if [[ "$MODE" == "subagentstop" ]]; then
   # If nothing found, treat subagent SID as its own parent for placement,
   # but leave PARENT_SID empty so lib.sh puts artifact at top-level and we
   # can flag "parent_unknown" in the manifest.
+  if [[ -n "$PARENT_SID" ]] && ! is_valid_sid "$PARENT_SID"; then
+    # Reject an untrusted parent id rather than let it into a filesystem path.
+    PARENT_SID=""
+  fi
 fi
 
 # --- Resolve paths ------------------------------------------------------------
@@ -115,17 +183,50 @@ ensure_session_dirs "$SESSION_ID" "$PARENT_SID"
 mkdir -p "$REFLECT_LOG_DIR"
 
 # --- Idempotency guard --------------------------------------------------------
+# NOTE: previously we wrote status=skipped_duplicate then immediately
+# overwrote it back to status=complete so is_already_complete would still
+# return 0. That erased the observable evidence of the duplicate.
+# Now: keep the pre-existing terminal manifest untouched, and drop a small
+# side-record under $session_dir/duplicates/<epoch>-<mode>.json for observers.
 if is_already_complete "$manifest_path"; then
-  # Mark that we saw a duplicate invocation but don't re-run.
-  write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "skipped_duplicate" \
-    "$(jq -cn --arg tp "$TRANSCRIPT_PATH" --arg event "$HOOK_EVENT" '{source_transcript:$tp,hook_event_name:$event}')"
-  # Rewrite as complete again so is_already_complete still returns 0 next time.
-  # (skipped_duplicate is non-terminal for final_complete; we want to preserve
-  # that this session's reflection *is* complete.)
-  tmp="$manifest_path.tmp.$$"
-  jq -c '.status = "complete" | .final_complete = true' "$manifest_path" > "$tmp" && mv "$tmp" "$manifest_path"
+  dup_dir="$session_dir/duplicates"
+  mkdir -p "$dup_dir"
+  dup_file="$(mktemp -p "$dup_dir" "$(date -u +%Y%m%dT%H%M%SZ)-${MODE}-XXXX.json")"
+  jq -n \
+    --arg sid "$SESSION_ID" \
+    --arg mode "$MODE" \
+    --arg tp "$TRANSCRIPT_PATH" \
+    --arg event "$HOOK_EVENT" \
+    --arg now "$(reflect_now)" \
+    '{status:"skipped_duplicate",session_id:$sid,mode:$mode,source_transcript:$tp,hook_event_name:$event,seen_at:$now}' \
+    > "$dup_file" || true
   exit 0
 fi
+
+# --- Concurrency lock: prevent two dispatchers from spawning racing workers ---
+# We take a non-blocking exclusive lock on <manifest>.lock. If we cannot get
+# it, another dispatcher is mid-flight — record the concurrent-skip side event
+# and return without spawning.
+LOCKFILE="${manifest_path}.lock"
+mkdir -p "$(dirname -- "$LOCKFILE")"
+exec 9>"$LOCKFILE"
+if ! flock -n 9; then
+  dup_dir="$session_dir/duplicates"
+  mkdir -p "$dup_dir"
+  conc_file="$(mktemp -p "$dup_dir" "$(date -u +%Y%m%dT%H%M%SZ)-${MODE}-conc-XXXX.json")"
+  jq -n \
+    --arg sid "$SESSION_ID" \
+    --arg mode "$MODE" \
+    --arg tp "$TRANSCRIPT_PATH" \
+    --arg event "$HOOK_EVENT" \
+    --arg now "$(reflect_now)" \
+    '{status:"skipped_concurrent",session_id:$sid,mode:$mode,source_transcript:$tp,hook_event_name:$event,seen_at:$now}' \
+    > "$conc_file" || true
+  exec 9>&-
+  exit 0
+fi
+# fd 9 stays open for the rest of this process; when we detach the worker,
+# we release the lock BEFORE the detach so the worker isn't holding it.
 
 # --- Extra manifest fields ----------------------------------------------------
 extra_json=$(jq -cn \
@@ -186,15 +287,29 @@ run_worker() {
   esac
 
   # Build and run.
-  # --dangerously-skip-permissions: no interactive TTY in detached subprocess;
-  # this is a local trusted invocation so it's safe.
+  #
+  # SECURITY: `--tools ""` disables the entire tool set so the reflection
+  # subprocess cannot invoke Bash/Edit/WebFetch/etc. even if a prompt-injection
+  # payload smuggled through the resumed transcript tries to make it. With
+  # tool use disabled we do NOT need `--dangerously-skip-permissions`
+  # (verified 2026-08-08 that `claude -p --tools "" --output-format json`
+  # returns the JSON reply cleanly). Residual risk: the model can still
+  # emit arbitrary text into the reflection body, but that body is treated
+  # as untrusted data (JSON-parsed, schema-normalized) by every downstream
+  # consumer, and never fed back into an interpreter.
+  #
+  # We keep `--resume ... --fork-session` because prompt-cache reuse
+  # (~77% hit at 12min, 1h ephemeral TTL — verified 2026-08-08) is the whole
+  # cost story for this feature. `--bare` would strip that.
   local claude_json rc
+  set +e
   claude_json=$(timeout "$budget" claude \
     -p --resume "$SESSION_ID" --fork-session \
     --model "$REFLECT_MODEL" \
     --output-format json \
-    --dangerously-skip-permissions <<<"$prompt" 2>>"$worker_log")
+    --tools "" <<<"$prompt" 2>>"$worker_log")
   rc=$?
+  set -e
   printf '%s' "$claude_json" > "$worker_out"
 
   # --- Timeout / error paths ---
@@ -221,7 +336,7 @@ run_worker() {
   # `claude -p --output-format json` returns {type:"result", result:"<string>", usage:{...}}
   # where `result` is itself a JSON string produced by the model.
   local inner
-  inner=$(jq -r '.result // empty' <<<"$claude_json" 2>/dev/null)
+  inner=$(jq -r '.result // empty' <<<"$claude_json" 2>/dev/null || true)
   if [[ -z "$inner" ]]; then
     write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "error" \
       "$(jq -cn --arg tp "$TRANSCRIPT_PATH" --arg event "$HOOK_EVENT" --arg parent "$PARENT_SID" \
@@ -231,37 +346,78 @@ run_worker() {
     return 0
   fi
 
-  # Strip markdown fences the model may add despite instructions.
-  inner="$(sed -e 's/^```json//' -e 's/^```//' -e 's/```$//' <<<"$inner" | sed '/^\s*$/d')"
-
-  # Validate + normalize the reflection JSON.
-  local reflection
-  reflection=$(jq -c '{
+  # Parse JSON out of the model's reply. Strategy:
+  #   1. Try jq directly — the happy path when the model returned bare JSON.
+  #   2. If that fails, only accept the reply if it is *entirely* a fenced
+  #      code block: ^```(json)?\n ... \n```$ (multiline). Strip fences,
+  #      re-try jq. This is stricter than the old inline sed strip, which
+  #      would eat stray backticks anywhere in the body.
+  #   3. If both fail, record a small excerpt (first 200 chars), not the
+  #      full body — the raw reply may contain sensitive content and blowing
+  #      it into a manifest is unnecessary for debugging.
+  local reflection=""
+  local parse_source=""
+  if reflection=$(jq -c '{
     patterns: (.patterns // []),
     discoveries: (.discoveries // []),
     turning_points: (.turning_points // []),
     digressions: (.digressions // []),
     obstacles_to_autonomy: (.obstacles_to_autonomy // [])
-  }' <<<"$inner" 2>/dev/null)
+  }' <<<"$inner" 2>/dev/null); then
+    parse_source="direct"
+  else
+    # Whole-body fence match: leading ```(json)?, trailing ```, with the
+    # rest of the reply between them. Portable check without bash regex
+    # multiline quirks: verify it starts with ``` and ends with ```, then
+    # strip both ends explicitly.
+    local unfenced=""
+    local trimmed
+    # Trim leading/trailing whitespace (single-line-safe; multi-line body
+    # keeps its internal structure).
+    trimmed="$(printf '%s' "$inner" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    if [[ "$trimmed" == '```'* && "$trimmed" == *'```' ]]; then
+      # Drop the opening fence + optional "json" language tag on line 1.
+      unfenced="$(printf '%s\n' "$trimmed" \
+        | sed -e '1s/^```json[[:space:]]*$//' \
+              -e '1s/^```[[:space:]]*$//' \
+              -e '$s/^```[[:space:]]*$//')"
+    fi
+    if [[ -n "$unfenced" ]]; then
+      if reflection=$(jq -c '{
+        patterns: (.patterns // []),
+        discoveries: (.discoveries // []),
+        turning_points: (.turning_points // []),
+        digressions: (.digressions // []),
+        obstacles_to_autonomy: (.obstacles_to_autonomy // [])
+      }' <<<"$unfenced" 2>/dev/null); then
+        parse_source="fenced"
+      fi
+    fi
+  fi
+
   if [[ -z "$reflection" ]]; then
+    local excerpt="${inner:0:200}"
     write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "error" \
       "$(jq -cn --arg tp "$TRANSCRIPT_PATH" --arg event "$HOOK_EVENT" --arg parent "$PARENT_SID" \
-          --arg raw "$inner" \
+          --arg excerpt "$excerpt" \
+          --argjson len "${#inner}" \
           '{source_transcript:$tp,hook_event_name:$event,
             parent_session_id:(if $parent == "" then null else $parent end),
-            reason:"unparseable_reflection_json",raw:$raw}')"
+            reason:"unparseable_reflection_json",
+            raw_excerpt:$excerpt,
+            raw_len:$len}')"
     return 0
   fi
 
   # --- Write artifact ---
   local out_path
   if [[ "$MODE" == "precompact" ]]; then
-    # Numbered checkpoint file: NNNN-precompact.json
-    local n=1
-    while [[ -e "$checkpoint_dir/$(printf '%04d-precompact.json' $n)" ]]; do
-      n=$((n+1))
-    done
-    out_path="$checkpoint_dir/$(printf '%04d-precompact.json' $n)"
+    # mktemp-based checkpoint filename: <epoch_ns>-<rand>-precompact.json.
+    # Sidesteps the NNNN counter race: two concurrent PreCompact hooks would
+    # otherwise both pick the same n before either wrote. lexicographic order
+    # still gives chronological ordering because timestamps prefix.
+    mkdir -p "$checkpoint_dir"
+    out_path="$(mktemp -p "$checkpoint_dir" "$(date -u +%s%N)-XXXX-precompact.json")"
   else
     out_path="$final_path"
   fi
@@ -289,7 +445,8 @@ run_worker() {
       usage: $usage
     }' <<<"$reflection")
 
-  local tmp="$out_path.tmp.$$"
+  local tmp
+  tmp="$(mktemp -p "$(dirname -- "$out_path")" ".artifact-XXXXXX")"
   printf '%s\n' "$wrapped" > "$tmp"
   mv "$tmp" "$out_path"
 
@@ -314,6 +471,11 @@ fi
 # Write "started" manifest first so idempotency check + observers can see us.
 write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "started" "$extra_json"
 
+# Release the concurrency lock now that "started" is on disk. Any concurrent
+# dispatcher will see status=started (fresh, within the reaper window) and
+# treat it as already-in-flight via is_already_complete.
+exec 9>&-
+
 # Export state the worker needs (safe for both sync + detached paths).
 export SESSION_ID PARENT_SID TRANSCRIPT_PATH HOOK_EVENT MODE
 export REFLECT_MODEL REFLECT_ROOT REFLECT_LOG_DIR
@@ -329,13 +491,16 @@ fi
 # sessionend / subagentstop: fire-and-forget.
 # The nested bash re-sources lib.sh and re-runs the worker function via a
 # self-invocation flag. We use a helper `--worker` mode to keep it in one file.
+# _REFLECT_INTERNAL sentinel gates the --worker re-entry path.
 WORKER_STDERR="$REFLECT_LOG_DIR/${SESSION_ID}-${MODE}.worker.stderr.log"
 
 # Detach cleanly: setsid new session, nohup ignores SIGHUP, redirect all fds.
+export _REFLECT_INTERNAL=1
 setsid nohup bash "$SCRIPT_DIR/reflect.sh" --worker "$MODE" \
   </dev/null \
   >>"$WORKER_STDERR" 2>&1 \
   &
 disown
+unset _REFLECT_INTERNAL
 
 exit 0

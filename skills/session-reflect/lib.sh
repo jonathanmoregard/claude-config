@@ -7,11 +7,55 @@
 #   - Manifest writes are atomic: write to .tmp, then mv.
 #   - All paths are absolute.
 
+set -euo pipefail
+
 # Guard against double-source.
 if [[ -n "${_REFLECT_LIB_SOURCED:-}" ]]; then return 0; fi
 _REFLECT_LIB_SOURCED=1
 
 : "${REFLECT_ROOT:=$HOME/.claude/reflections}"
+
+# --- Stale-started reaper threshold (seconds) --------------------------------
+# If a manifest is stuck at status=started older than this, treat it as a
+# crashed prior run (host reboot, SIGKILL, orphaned worker) and permit re-run.
+: "${REFLECT_STALE_STARTED_SECONDS:=600}"
+
+# --- Boolean env normalization (used by REFLECT_FORCE and friends) -----------
+# Truthy: 1, true, yes, on (case-insensitive). Anything else = false.
+reflect_truthy() {
+  local v="${1:-}"
+  # Bash lowercasing works portably via tr — avoid ${v,,} for older bash.
+  case "$(printf '%s' "$v" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# --- Directory writability check (call once per invocation) ------------------
+# ensure_reflect_root_writable — mkdir REFLECT_ROOT if missing; error to stderr
+# and return 1 if we cannot write to it. Callers may choose to exit or degrade.
+ensure_reflect_root_writable() {
+  if ! mkdir -p "$REFLECT_ROOT" 2>/dev/null; then
+    echo "reflect: cannot create REFLECT_ROOT=$REFLECT_ROOT" >&2
+    return 1
+  fi
+  if [[ ! -w "$REFLECT_ROOT" ]]; then
+    echo "reflect: REFLECT_ROOT=$REFLECT_ROOT is not writable" >&2
+    return 1
+  fi
+  return 0
+}
+
+# --- Session ID / parent ID validator ----------------------------------------
+# Accept only [A-Za-z0-9._-]{1,128}. Rejects path traversal (/, ..), NULs,
+# whitespace, and control characters. Returns 0 if valid, 1 otherwise.
+# Empty string is INVALID (call sites must special-case "" for optional PARENT_SID).
+is_valid_sid() {
+  local s="${1:-}"
+  [[ -n "$s" ]] || return 1
+  [[ "$s" =~ ^[A-Za-z0-9._-]{1,128}$ ]] || return 1
+  return 0
+}
 
 # --- ISO-8601 UTC timestamp --------------------------------------------------
 reflect_now() {
@@ -114,21 +158,69 @@ write_manifest() {
            final_complete: $final_complete
          }' <<<"$existing")"
 
-  # Atomic write
-  local tmp="$mpath.tmp.$$"
+  # Atomic write via mktemp — safer than $$ for concurrent workers.
+  local tmp
+  tmp="$(mktemp -p "$base_dir" ".manifest-XXXXXX")"
   printf '%s\n' "$merged" > "$tmp"
   mv "$tmp" "$mpath"
 }
 
 # --- Idempotency guard -------------------------------------------------------
 # is_already_complete <manifest_path>
-# Returns 0 if final_complete==true (skip re-run) unless REFLECT_FORCE=1.
+# Returns 0 if final_complete==true (skip re-run) unless REFLECT_FORCE is
+# truthy (1|true|yes|on, case-insensitive).
+#
+# Stale-started reaper: a manifest stuck at status=started older than
+# REFLECT_STALE_STARTED_SECONDS (default 600s) is treated as a crashed prior
+# run and NOT counted as "already complete" — the caller may proceed.
 is_already_complete() {
   local mpath="$1"
-  [[ "${REFLECT_FORCE:-0}" == "1" ]] && return 1
+  if reflect_truthy "${REFLECT_FORCE:-}"; then
+    return 1
+  fi
   [[ -f "$mpath" ]] || return 1
-  jq -e '.final_complete == true' "$mpath" >/dev/null 2>&1
+  # If terminal-complete, skip.
+  if jq -e '.final_complete == true' "$mpath" >/dev/null 2>&1; then
+    return 0
+  fi
+  # If status=started but ancient, treat as crashed and allow re-run.
+  local status started_at started_epoch now_epoch age
+  status="$(jq -r '.status // ""' "$mpath" 2>/dev/null || echo '')"
+  if [[ "$status" == "started" ]]; then
+    started_at="$(jq -r '.started_at // ""' "$mpath" 2>/dev/null || echo '')"
+    if [[ -n "$started_at" ]]; then
+      # date -d parses ISO-8601 UTC.
+      started_epoch="$(date -d "$started_at" +%s 2>/dev/null || echo 0)"
+      now_epoch="$(date -u +%s)"
+      age=$(( now_epoch - started_epoch ))
+      if (( age > REFLECT_STALE_STARTED_SECONDS )); then
+        return 1  # stale — treat as not-complete, permit re-run
+      fi
+    fi
+    # Fresh started — another worker is likely in-flight; treat as complete
+    # to avoid duplicate spawning.
+    return 0
+  fi
+  return 1
 }
+
+# --- Concurrency: try to claim exclusive right to spawn a worker -------------
+# try_reflect_lock <lockfile>
+# Uses flock -n for a non-blocking exclusive lock. On success prints the fd
+# number (as an integer) held open on the lockfile; caller must keep the fd
+# open for the duration of the critical section.
+#
+# Usage:
+#   exec {LOCKFD}>"$lockfile" || exit 1
+#   if ! flock -n "$LOCKFD"; then
+#     # someone else is already spawning — bail
+#     exec {LOCKFD}>&-
+#     ...
+#   fi
+#
+# We provide the primitives directly; call sites use flock inline for
+# readability.
+
 
 # --- Best-effort parent-SID discovery for subagents --------------------------
 # find_parent_session_id <subagent_sid> <cwd> <transcript_path>
@@ -140,17 +232,39 @@ is_already_complete() {
 find_parent_session_id() {
   local sub_sid="$1" cwd="$2" tp="$3"
   if [[ -n "${CLAUDE_PARENT_SESSION_ID:-}" ]]; then
-    printf '%s' "$CLAUDE_PARENT_SESSION_ID"
+    # Only honor env-provided parent SID if it passes the safe-charset check.
+    if is_valid_sid "$CLAUDE_PARENT_SESSION_ID"; then
+      printf '%s' "$CLAUDE_PARENT_SESSION_ID"
+      return 0
+    fi
+    # Untrusted env value; fall through to scan or return empty.
+  fi
+  # Only scan if sub_sid itself is a safe token (defense in depth).
+  if ! is_valid_sid "$sub_sid"; then
+    printf ''
     return 0
   fi
   local project_dir
   project_dir="$(dirname -- "$tp")"
   if [[ -d "$project_dir" ]]; then
-    # Recent-first: sort by mtime desc, scan for the sub_sid string.
-    # This is best-effort; a false positive is rare given the SID's entropy.
+    # Use nullglob so empty dirs return an empty array (not the literal glob).
+    local -a jsonl_files=()
+    local prev_nullglob
+    prev_nullglob="$(shopt -p nullglob || true)"
+    shopt -s nullglob
+    jsonl_files=( "$project_dir"/*.jsonl )
+    eval "$prev_nullglob"
+
+    if (( ${#jsonl_files[@]} == 0 )); then
+      printf ''
+      return 0
+    fi
+
+    # Recent-first: scan for the sub_sid string. Best-effort; false positive
+    # is rare given the SID's entropy. -- guards against filenames starting -.
     local candidate
-    candidate="$(grep -lF "$sub_sid" "$project_dir"/*.jsonl 2>/dev/null \
-      | grep -vF "$tp" | head -1)"
+    candidate="$(grep -lF -- "$sub_sid" "${jsonl_files[@]}" 2>/dev/null \
+      | grep -vF -- "$tp" | head -1 || true)"
     if [[ -n "$candidate" ]]; then
       basename -- "$candidate" .jsonl
       return 0
