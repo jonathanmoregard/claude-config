@@ -24,11 +24,11 @@ umask 077
 : "${REFLECT_ROOT:=$HOME/.claude/reflections}"
 : "${REFLECT_MODEL:=haiku}"
 : "${IDLE_HANDOFF_MIN_SECONDS:=$((45*60))}"      # 45 min: start writing mission.md
-# Auto-fork: opt-in per-project. When a session is past MIN idle AND has a
-# fresh mission.md AND the project sets .claude/idle-handoff-autofork.enable,
-# spawn a detached `claude -p --resume --fork-session` that reads mission.md
-# and continues Next-item work in a fresh SID. Old session dies naturally.
-# Skipped unless the mission Next section is non-empty ("(none)" -> skip).
+# Auto-fork: fires whenever a session past MIN idle has a fresh mission.md
+# with a non-empty ## Next section. Spawns a detached `claude -p --resume
+# --fork-session` that reads mission.md and continues Next-item work in a
+# fresh SID; old session dies naturally. Skipped when Next is empty or
+# "(none)" — open-ended sessions must not grind on stale directions.
 : "${IDLE_HANDOFF_AUTOFORK_MODEL:=claude-opus-5}"    # more capable than haiku for real work
 : "${IDLE_HANDOFF_AUTOFORK_MAX_TURNS:=15}"           # hard cap; runaway prevention
 # Upper idle bound: sessions idle > MAX are stale-stale (user moved on, days
@@ -188,16 +188,11 @@ for project_dir in "$PROJECTS_DIR"/*/; do
   # The value is the mission.md file on disk, ready when the user chooses
   # to start fresh. Silent operation; grep the log for what fired.
 
-  # ----- auto-fork: opt-in per-project ------------------------------------
-  # Gate: project's .claude/idle-handoff-autofork.enable must exist.
-  # Two extra guards on top of that opt-in:
-  #   1. mission.md must have been successfully written this run (we just did)
-  #   2. mission.md `## Next` section must be non-empty (has an actual next
-  #      item to execute). Open-ended sessions without a queued task should
-  #      NOT auto-continue — they'd grind on stale directions.
-  autofork_flag="$candidate_cwd/.claude/idle-handoff-autofork.enable"
-  [[ -f "$autofork_flag" ]] || continue
-
+  # ----- auto-fork: always on when Next is populated -----------------------
+  # Only guard: mission.md `## Next` must be non-empty and not "(none)".
+  # Open-ended sessions with no queued task should NOT auto-continue —
+  # they'd grind on stale directions. A populated Next means the mission
+  # writer identified a concrete next action; that's the trigger.
   # Extract the ## Next section body. Empty or "(none)" -> nothing to run.
   next_body=$(awk '
     /^## Next/{cap=1; next}
