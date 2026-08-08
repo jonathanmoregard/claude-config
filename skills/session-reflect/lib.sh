@@ -311,8 +311,29 @@ is_already_complete() {
   if [[ "$status" == "started" ]]; then
     started_at="$(jq -r --arg m "$mode" '.modes[$m].started_at // ""' "$mpath" 2>/dev/null || echo '')"
     if [[ -n "$started_at" ]]; then
-      # date -d parses ISO-8601 UTC.
-      started_epoch="$(date -d "$started_at" +%s 2>/dev/null || echo 0)"
+      # STEP 6 (MEDIUM P3.7): date -d parse failure previously ran
+      #   started_epoch="$(date -d "$started_at" +%s 2>/dev/null || echo 0)"
+      # which conflated "corrupt manifest state" with "truly ancient" — an
+      # unparseable timestamp yielded epoch=0, age = now_epoch (~huge) →
+      # crossed the stale threshold → the caller was told the mode was
+      # NOT complete and permitted to spawn a duplicate worker. That's a
+      # phantom stale-reap: the corrupt manifest triggers re-runs on every
+      # subsequent dispatcher fire.
+      #
+      # Fix: distinguish parse failure from truly-old. If date -d fails
+      # OR the parsed epoch is <= 0, log to stderr and KEEP the started
+      # state as-is (return 0 → treat as in-flight, do NOT reap). Corrupt
+      # manifest stays corrupt but doesn't cause phantom double-runs.
+      # Manual repair path: operator deletes the manifest, next fire starts
+      # clean.
+      started_epoch="$(date -d "$started_at" +%s 2>/dev/null || echo '')"
+      # Guard: empty (date failed) OR non-numeric OR <= 0 (epoch fallback
+      # from `|| echo 0` in old code). Use a numeric regex first because
+      # (( )) would treat 'abc' as 0 and mis-classify garbage.
+      if [[ -z "$started_epoch" || ! "$started_epoch" =~ ^[0-9]+$ ]] || (( started_epoch <= 0 )); then
+        echo "reflect: manifest has unparseable started_at='$started_at' (mode=$mode path=$mpath) — refusing to reap; delete manifest.json to reset" >&2
+        return 0
+      fi
       now_epoch="$(date -u +%s)"
       age=$(( now_epoch - started_epoch ))
       if (( age > REFLECT_STALE_STARTED_SECONDS )); then

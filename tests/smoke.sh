@@ -1001,6 +1001,58 @@ STUB
 chmod +x "$STUB_SCRATCH/claude"
 
 # ============================================================================
+# TEST 14: unparseable manifest started_at does NOT trigger phantom reap
+# ============================================================================
+# Regression (Codex P3.7): is_already_complete previously did
+#   started_epoch="$(date -d "$started_at" +%s 2>/dev/null || echo 0)"
+# Unparseable started_at yielded started_epoch=0 → age=now_epoch (huge)
+# → crossed stale threshold → caller was told 'not complete', permitting
+# a duplicate spawn on every subsequent dispatcher fire.
+# Fix: distinguish parse failure from truly-old. Return 0 (treat as
+# in-flight) on unparseable, log to stderr, do NOT permit re-run.
+echo "TEST 14: unparseable started_at is not phantom-reaped"
+
+CORRUPT_SID="test-sid-corrupt-manifest"
+mkdir -p "$REFLECT_ROOT/sessions/$CORRUPT_SID"
+CORRUPT_MANIFEST="$REFLECT_ROOT/sessions/$CORRUPT_SID/manifest.json"
+# Craft a manifest with modes.sessionend.status=started but a garbage
+# timestamp that date -d cannot parse.
+cat >"$CORRUPT_MANIFEST" <<'JSON'
+{
+  "session_id": "test-sid-corrupt-manifest",
+  "modes": {
+    "sessionend": {
+      "status": "started",
+      "started_at": "not-a-real-timestamp-at-all",
+      "final_complete": false
+    }
+  }
+}
+JSON
+
+# Directly exercise is_already_complete via the library — cleaner than
+# firing the dispatcher (which would take other actions).
+CORRUPT_STDERR="$STUB_SCRATCH/corrupt.stderr"
+set +e
+CORRUPT_OUT=$(bash -c "
+  source '$SKILL_DIR/lib.sh'
+  if is_already_complete '$CORRUPT_MANIFEST' sessionend; then
+    echo 'returned-complete'
+  else
+    echo 'returned-not-complete'
+  fi
+" 2>"$CORRUPT_STDERR")
+set -e
+
+[[ "$CORRUPT_OUT" == "returned-complete" ]] \
+  || fail "is_already_complete should return 0 (complete/in-flight) on unparseable started_at; got: $CORRUPT_OUT"
+
+# The stderr line must warn the operator.
+grep -q "unparseable started_at" "$CORRUPT_STDERR" \
+  || fail "expected 'unparseable started_at' stderr; got: $(cat "$CORRUPT_STDERR")"
+info "corrupt started_at keeps in-flight state (no phantom reap), warns to stderr"
+
+# ============================================================================
 if [[ "${REFLECT_DEBUG:-}" != "1" ]]; then
   rm -rf "$REFLECT_ROOT" "$STUB_SCRATCH"
 fi
