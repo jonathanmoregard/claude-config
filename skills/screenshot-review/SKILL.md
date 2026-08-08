@@ -35,6 +35,32 @@ one-command path and works in any browser.
 
 Notes autosave to `localStorage` per folder. Fully local — no upload, no build step.
 
+## Element pinning (Figma-style comment-on-element)
+
+When a `<base>.dom.json` sidecar sits next to `<base>.png` (visual-verify emits
+these), pin mode (default ON, toggle with `a` or the 📌 button) hover-highlights
+the DOM element under the cursor with its `tag.class "label"`. Click → type a
+note → Enter. The pin lands in two places:
+
+1. **Transcript** — a `- 📌#N [button.c-btn "CREATE A POLL"] @(x,y): note` line
+   under the image's `##` heading (survives Copy all / Download .md).
+2. **`annotations.json` in the SOURCE folder** — written via `POST /save`,
+   structured: `{ pins: { "<image-base>": [ {n, x, y, el: {desc, label, rect,
+   role}, note} ] } }`. Coordinates are in the dom.json coordinate space
+   (CSS px at capture width).
+
+Images without a dom.json sidecar still pin at pixel coordinates (`el: null`).
+
+**Agent contract — consuming pins:** read `annotations.json` from the reviewed
+folder. Each pin is a pre-atomized feedback item ALREADY matched to an exact
+element — feed `el.desc` + `el.label` + `note` straight into the feedback ledger
+as one row each; grep templates for the class in `el.desc` to locate the source.
+No interpretation guessing on WHICH element the user meant.
+
+To prep a folder for element-exact review: capture surfaces with visual-verify,
+then copy `fullpage-1280.png` → `<surface>.png` and `fullpage-1280.dom.json` →
+`<surface>.dom.json` into one flat folder; serve it.
+
 ## Requirements
 - `python3` (static server) and `xdg-open` (or open the printed URL yourself).
 - Any modern browser for the launcher's auto-load; the **Load folder…** picker

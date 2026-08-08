@@ -8,7 +8,7 @@
 <style>
   :root {
     --bg: #14161a; --panel: #1c1f26; --ink: #e8e8ea; --muted: #8a8f99;
-    --line: #2a2e37; --accent: #6ea8fe;
+    --line: #2a2e37; --accent: #6ea8fe; --pin: #ffb84d;
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
@@ -33,6 +33,7 @@
   }
   button:hover, label.btn:hover { border-color: var(--accent); }
   button:disabled { opacity: .4; cursor: default; border-color: var(--line); }
+  button.on { border-color: var(--pin); color: var(--pin); }
   .hint { color: var(--muted); font-size: 12px; }
 
   /* Stage — scrollable so zoomed images can be panned */
@@ -41,7 +42,8 @@
     display: flex; align-items: flex-start; justify-content: center;
     background: #0e0f12; overflow: auto;
   }
-  .stage img { display: block; margin: auto; }
+  .canvas { position: relative; margin: auto; line-height: 0; }
+  .canvas img { display: block; }
   .stage .empty { color: var(--muted); text-align: center; padding: 24px; max-width: 46ch; margin: auto; }
   .nav {
     position: fixed; top: 50%; transform: translateY(-50%); z-index: 5;
@@ -55,11 +57,55 @@
   .zoom button { padding: 5px 9px; }
   .zoom #zlabel { min-width: 44px; text-align: center; }
 
+  /* Element-pin overlay */
+  .hoverbox {
+    position: absolute; pointer-events: none; z-index: 3;
+    border: 2px solid var(--accent); background: rgba(110,168,254,.12);
+    display: none;
+  }
+  .hoverbox .tag {
+    position: absolute; top: -22px; left: -2px; white-space: nowrap;
+    background: var(--accent); color: #10131a; font: 11px/1.6 ui-monospace, monospace;
+    padding: 0 6px; border-radius: 3px 3px 0 0; max-width: 60ch;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+  .pinbadge {
+    position: absolute; z-index: 4; width: 22px; height: 22px;
+    transform: translate(-50%, -50%);
+    background: var(--pin); color: #10131a; border: 2px solid #10131a;
+    border-radius: 50%; font: 700 12px/18px ui-monospace, monospace;
+    text-align: center; cursor: pointer; user-select: none;
+  }
+  .pinbadge:hover { box-shadow: 0 0 0 3px rgba(255,184,77,.4); }
+  .pinbadge.sel { box-shadow: 0 0 0 3px rgba(255,184,77,.7); }
+  .pinrect {
+    position: absolute; pointer-events: none; z-index: 2;
+    border: 1.5px dashed var(--pin); display: none;
+  }
+
+  /* Note popover */
+  .noteform {
+    position: absolute; z-index: 6; width: 340px;
+    background: var(--panel); border: 1px solid var(--pin); border-radius: 8px;
+    padding: 8px; box-shadow: 0 6px 24px rgba(0,0,0,.5); line-height: 1.4;
+  }
+  .noteform .el {
+    font: 11px/1.5 ui-monospace, monospace; color: var(--pin);
+    margin-bottom: 6px; word-break: break-all; max-height: 3em; overflow: hidden;
+  }
+  .noteform textarea {
+    width: 100%; height: 72px; resize: vertical; border: 1px solid var(--line);
+    border-radius: 4px; background: #101216; color: var(--ink); padding: 6px;
+    font: 13px/1.5 inherit; outline: none;
+  }
+  .noteform .row { display: flex; gap: 6px; margin-top: 6px; justify-content: flex-end; }
+  .noteform .row .del { margin-right: auto; border-color: #a33; color: #f88; }
+
   /* Editor */
   .editor { flex: 0 0 auto; border-top: 1px solid var(--line); background: var(--panel); }
   .editor .toolbar { display: flex; align-items: center; gap: 8px; padding: 6px 12px; }
-  textarea {
-    width: 100%; height: 30vh; resize: vertical; border: none; outline: none;
+  .editor textarea#notes {
+    width: 100%; height: 22vh; resize: vertical; border: none; outline: none;
     background: #101216; color: var(--ink); padding: 12px;
     font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
   }
@@ -77,6 +123,8 @@
     </label>
     <span id="name" class="name"></span>
     <span id="count" class="count"></span>
+    <button id="pinmode" class="on" title="Toggle element-pin mode (a)">📌 Pin: on</button>
+    <span id="pincount" class="count"></span>
     <span class="spacer"></span>
     <div class="zoom">
       <button id="zfit" title="Fit whole image">Fit</button>
@@ -85,17 +133,23 @@
       <span id="zlabel" class="count">Width</span>
       <button id="zin" title="Zoom in">+</button>
     </div>
-    <span class="hint" style="margin-left:12px">Nav <kbd>Ctrl</kbd>+<kbd>←</kbd>/<kbd>→</kbd> · zoom <kbd>Ctrl</kbd>+scroll</span>
+    <span class="hint" style="margin-left:12px">Pin <kbd>click</kbd> · cycle out <kbd>Alt</kbd>+scroll · nav <kbd>←</kbd>/<kbd>→</kbd> (bare when focus not in notes) · zoom <kbd>Ctrl</kbd>+scroll</span>
   </header>
 
   <div class="stage" id="stage">
     <button class="nav prev" id="prev" title="Previous (Ctrl+←)" disabled>‹</button>
     <div class="empty" id="empty">
-      Click <strong>Load folder…</strong> and choose a directory of screenshots
-      (e.g. <code>docs/brand/screenshots/major</code>).<br /><br />
-      Then: hold your dictation hotkey, describe the image, release, press <kbd>›</kbd> for the next.
+      Click <strong>Load folder…</strong> and choose a directory of screenshots.<br /><br />
+      Element-pin mode: hover highlights the element under the cursor (when a
+      <code>.dom.json</code> sits next to the image); click it, type your note,
+      <kbd>Enter</kbd>. Notes land in the transcript below AND in
+      <code>annotations.json</code> for the agent — element-exact.
     </div>
-    <img id="img" alt="" hidden />
+    <div class="canvas" id="canvas" hidden>
+      <img id="img" alt="" />
+      <div class="hoverbox" id="hoverbox"><span class="tag" id="hovertag"></span></div>
+      <div class="pinrect" id="pinrect"></div>
+    </div>
     <button class="nav next" id="next" title="Next (Ctrl+→)" disabled>›</button>
   </div>
 
@@ -107,7 +161,7 @@
       <span class="spacer" style="flex:1"></span>
       <span class="saved" id="saved"></span>
     </div>
-    <textarea id="notes" placeholder="Your feedback for the current image goes here (voice or type). Headings are inserted automatically as you navigate." spellcheck="true"></textarea>
+    <textarea id="notes" placeholder="Whole-image feedback goes here (voice or type). Element pins insert themselves automatically." spellcheck="true"></textarea>
   </div>
 
 <script>
@@ -115,32 +169,43 @@
   const IMG_RE = /\.(png|jpe?g|gif|webp|avif|svg|bmp)$/i;
   const $ = (id) => document.getElementById(id);
   const picker = $('picker'), img = $('img'), empty = $('empty'), stage = $('stage');
+  const canvas = $('canvas'), hoverbox = $('hoverbox'), hovertag = $('hovertag');
+  const pinrect = $('pinrect');
   const nameEl = $('name'), countEl = $('count'), notes = $('notes'), savedEl = $('saved');
   const prevBtn = $('prev'), nextBtn = $('next'), zlabel = $('zlabel');
+  const pinBtn = $('pinmode'), pincountEl = $('pincount');
 
-  let files = [];          // [{ path, url }]
+  let files = [];          // [{ path, url, base }]
   let idx = -1;
-  let folderKey = '';      // localStorage key for this folder's transcript
-  const headed = new Set(); // paths that already have a heading in the transcript
+  let folderKey = '';
+  let baseUrl = '';        // http base dir when served with ?dir=
+  const headed = new Set();
 
-  // Natural sort so admin-2 < admin-10.
+  // Element-pin state
+  let pinMode = true;
+  let dom = null;          // current image's dom.json elements (or null)
+  let domW = 0;            // dom viewport width, for coord scaling
+  let pins = {};           // { imageBase: [ {n,x,y,el:{tag,id,cls,label,rect},note} ] }
+  let hoverEl = null;      // element currently under cursor (dom coords)
+  let openForm = null;     // active .noteform element
+
   const natCompare = (a, b) =>
     a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
 
-  // Shared: install a list of { path, url } and start reviewing.
-  function mount(list, key) {
-    files.forEach((f) => f.revoke && URL.revokeObjectURL(f.url)); // free only object URLs
+  const baseOf = (path) => path.split('/').pop().replace(IMG_RE, '');
+
+  function mount(list, key, httpBase) {
+    files.forEach((f) => f.revoke && URL.revokeObjectURL(f.url));
     files = list;
     folderKey = key;
+    baseUrl = httpBase || '';
     notes.value = localStorage.getItem(folderKey) || '';
     headed.clear();
-    // Re-derive which images already have a heading (so reloads don't duplicate).
     for (const f of files) if (notes.value.includes(headingFor(f.path))) headed.add(f.path);
-    empty.hidden = true; img.hidden = false;
-    go(0);
+    empty.hidden = true; canvas.hidden = false;
+    loadAnnotations().finally(() => go(0));
   }
 
-  // Manual pick (works everywhere, incl. file://).
   picker.addEventListener('change', () => {
     const picked = [...picker.files]
       .filter((f) => IMG_RE.test(f.name))
@@ -148,14 +213,11 @@
       .sort((a, b) => natCompare(a.path, b.path));
     if (!picked.length) { alert('No image files found in that folder.'); return; }
     const list = picked.map((p) => ({
-      path: p.path, url: URL.createObjectURL(p.file), revoke: true,
+      path: p.path, url: URL.createObjectURL(p.file), revoke: true, base: baseOf(p.path),
     }));
-    // One transcript per top-level folder name, remembered across reloads.
-    mount(list, 'shotreview:' + (list[0].path.split('/')[0] || 'folder'));
+    mount(list, 'shotreview:' + (list[0].path.split('/')[0] || 'folder'), '');
   });
 
-  // Auto-load when served over http with ?dir=<path> (the dir must contain a
-  // manifest.json = a JSON array of image filenames). Heading = parentDir/filename.
   async function loadFromManifest(dir) {
     const base = dir.replace(/\/+$/, '');
     const res = await fetch(base + '/manifest.json', { cache: 'no-store' });
@@ -163,8 +225,10 @@
     const names = (await res.json()).filter((n) => IMG_RE.test(n)).sort(natCompare);
     if (!names.length) throw new Error('manifest lists no images');
     const parent = base.split('/').filter(Boolean).pop() || 'folder';
-    const list = names.map((n) => ({ path: parent + '/' + n, url: base + '/' + n }));
-    mount(list, 'shotreview:' + parent);
+    const list = names.map((n) => ({
+      path: parent + '/' + n, url: base + '/' + n, base: baseOf(n),
+    }));
+    mount(list, 'shotreview:' + parent, base);
   }
 
   const autoDir = new URLSearchParams(location.search).get('dir');
@@ -177,8 +241,22 @@
 
   const headingFor = (path) => '## ' + path;
 
+  async function loadDom(f) {
+    dom = null; domW = 0;
+    if (!baseUrl) return;
+    try {
+      const res = await fetch(baseUrl + '/' + f.base + '.dom.json', { cache: 'no-store' });
+      if (!res.ok) return;
+      const els = await res.json();
+      if (!Array.isArray(els) || !els.length) return;
+      dom = els.filter((e) => e.rect && e.rect.w > 0 && e.rect.h > 0);
+      domW = Math.max(...dom.map((e) => e.rect.x + e.rect.w));
+    } catch { /* no dom sidecar — pixel pins still work */ }
+  }
+
   function go(n) {
     if (!files.length) return;
+    closeForm();
     idx = Math.max(0, Math.min(files.length - 1, n));
     const f = files[idx];
     img.src = f.url; img.alt = f.path;
@@ -186,14 +264,13 @@
     countEl.textContent = `${idx + 1} / ${files.length}`;
     prevBtn.disabled = idx === 0;
     nextBtn.disabled = idx === files.length - 1;
-    stage.scrollTop = 0; stage.scrollLeft = 0; applyZoom(); // keep the chosen zoom, scroll to top
+    stage.scrollTop = 0; stage.scrollLeft = 0; applyZoom();
     ensureHeading(f.path);
-    focusSection(f.path);      // put the cursor at the end of THIS image's section
+    focusSection(f.path);
+    loadDom(f).then(renderPins);
   }
 
-  // ---- zoom / scroll ----
-  // 'fit' = whole image visible; 'width' = fill the stage width (scroll down);
-  // number = scale factor of the image's natural pixels.
+  // ---- zoom ----
   let zoom = 'width';
   const clamp = (v) => Math.min(8, Math.max(0.1, v));
   const currentScale = () => (img.naturalWidth ? img.clientWidth / img.naturalWidth : 1);
@@ -201,7 +278,7 @@
   function applyZoom() {
     if (zoom === 'fit') {
       stage.style.alignItems = 'center';
-      Object.assign(img.style, { maxWidth: '100%', maxHeight: '100%', width: 'auto', height: 'auto' });
+      Object.assign(img.style, { maxWidth: 'calc(100vw - 0px)', maxHeight: 'calc(100vh - 220px)', width: 'auto', height: 'auto' });
       zlabel.textContent = 'Fit';
     } else if (zoom === 'width') {
       stage.style.alignItems = 'flex-start';
@@ -213,13 +290,13 @@
       Object.assign(img.style, { maxWidth: 'none', maxHeight: 'none', width: w + 'px', height: 'auto' });
       zlabel.textContent = Math.round(zoom * 100) + '%';
     }
+    renderPins();
   }
   const setZoom = (z) => { zoom = z; applyZoom(); };
 
-  img.addEventListener('load', applyZoom);        // natural size known → numeric zoom is exact
+  img.addEventListener('load', applyZoom);
   window.addEventListener('resize', () => { if (zoom === 'width') applyZoom(); });
 
-  // Keep focus in the notes box so dictation isn't interrupted by zooming.
   for (const id of ['zfit', 'zwidth', 'zout', 'zin'])
     $(id).addEventListener('mousedown', (e) => e.preventDefault());
   $('zfit').addEventListener('click', () => setZoom('fit'));
@@ -227,12 +304,295 @@
   $('zin').addEventListener('click', () => setZoom(clamp(currentScale() * 1.25)));
   $('zout').addEventListener('click', () => setZoom(clamp(currentScale() / 1.25)));
   stage.addEventListener('wheel', (e) => {
-    if (!e.ctrlKey) return;                        // plain wheel = native scroll/pan
+    if (!e.ctrlKey) return;
     e.preventDefault();
     setZoom(clamp(currentScale() * (e.deltaY < 0 ? 1.15 : 1 / 1.15)));
   }, { passive: false });
 
-  // Insert a heading for an image the first time it's shown (in visit order).
+  // ---- element pinning ----
+  pinBtn.addEventListener('mousedown', (e) => e.preventDefault());
+  pinBtn.addEventListener('click', togglePin);
+  function togglePin() {
+    pinMode = !pinMode;
+    pinBtn.textContent = '📌 Pin: ' + (pinMode ? 'on' : 'off');
+    pinBtn.classList.toggle('on', pinMode);
+    if (!pinMode) { hoverbox.style.display = 'none'; hoverEl = null; }
+  }
+
+  // display px ↔ dom-coordinate px
+  const dispScale = () => img.clientWidth / img.naturalWidth;
+  const domScale = () => (domW ? img.naturalWidth / domW : 1);
+
+  function toDisplay(r) {
+    const s = dispScale() * domScale();
+    return { x: r.x * s, y: r.y * s, w: r.w * s, h: r.h * s };
+  }
+
+  // Deepest-not-ancestor + area penalty, per SOTA research 2026-08-02
+  // (Firefox picker bug 1889500 + browser-use predicate). Also returns the
+  // ancestor chain (deepest→root) so Alt+wheel can cycle outward.
+  let hitChain = [];      // dom-node indices, deepest → shallowest
+  let hitDepth = 0;       // 0 = deepest match; incremented by Alt+wheel
+
+  function hitCandidates(dx, dy) {
+    if (!dom) return [];
+    const cands = [];
+    for (let i = 0; i < dom.length; i++) {
+      const r = dom[i].rect;
+      if (dx >= r.x && dx <= r.x + r.w && dy >= r.y && dy <= r.y + r.h) {
+        cands.push(i);
+      }
+    }
+    return cands;
+  }
+  function buildChain(cands) {
+    if (!cands.length) return [];
+    // Drop candidates that are ancestors of another candidate (via parentIdx).
+    // parentIdx may be -1 (root) or point to an element NOT in the candidate
+    // set (unpainted wrapper) — walk the whole chain either way.
+    const candSet = new Set(cands);
+    const isAncestor = new Set();
+    for (const i of cands) {
+      let p = dom[i].parentIdx;
+      while (p >= 0) {
+        if (candSet.has(p)) isAncestor.add(p);
+        p = dom[p].parentIdx;
+      }
+    }
+    const survivors = cands.filter((i) => !isAncestor.has(i));
+    // Full-width container penalty: multiply area by 3 if wider than 90%
+    // of the capture (headers/main sections lose to any deeper candidate).
+    const imgW = img.naturalWidth || 1;
+    const score = (i) => {
+      const r = dom[i].rect;
+      let a = r.w * r.h;
+      if (r.w / imgW > 0.9) a *= 3;
+      return a;
+    };
+    survivors.sort((a, b) => score(a) - score(b));
+    const deepest = survivors[0];
+    // Ancestor chain for cycle-outward (deepest → root).
+    const chain = [deepest];
+    let p = dom[deepest].parentIdx;
+    while (p >= 0) { chain.push(p); p = dom[p].parentIdx; }
+    return chain;
+  }
+  function hitTest(dx, dy) {
+    if (!dom) return null;
+    hitChain = buildChain(hitCandidates(dx, dy));
+    hitDepth = Math.min(hitDepth, Math.max(0, hitChain.length - 1));
+    return hitChain.length ? dom[hitChain[hitDepth]] : null;
+  }
+  const elDesc = (e) =>
+    e.tag + (e.id ? '#' + e.id : '') + (e.cls || e.class ? '.' + String(e.cls || e.class).trim().split(/\s+/).join('.') : '');
+  const elSnippet = (e) => {
+    const t = (e.label || '').replace(/\s+/g, ' ').trim();
+    return t ? '“' + (t.length > 60 ? t.slice(0, 57) + '…' : t) + '”' : '';
+  };
+
+  let lastHitX = 0, lastHitY = 0;
+  function paintHover() {
+    if (!hoverEl) { hoverbox.style.display = 'none'; return; }
+    const d = toDisplay(hoverEl.rect);
+    Object.assign(hoverbox.style, {
+      display: 'block', left: d.x + 'px', top: d.y + 'px',
+      width: d.w + 'px', height: d.h + 'px',
+    });
+    const cycleHint = hitChain.length > 1
+      ? ' [Alt+wheel: ' + (hitDepth + 1) + '/' + hitChain.length + ']' : '';
+    hovertag.textContent = elDesc(hoverEl) + ' ' + elSnippet(hoverEl) + cycleHint;
+  }
+  img.addEventListener('mousemove', (e) => {
+    if (!pinMode || openForm) return;
+    const box = img.getBoundingClientRect();
+    const s = dispScale() * domScale();
+    const dx = (e.clientX - box.left) / s, dy = (e.clientY - box.top) / s;
+    // If the cursor moved outside the current hoverEl's rect, reset the
+    // cycle depth so the next candidate resolves fresh.
+    if (hoverEl) {
+      const r = hoverEl.rect;
+      if (dx < r.x || dx > r.x + r.w || dy < r.y || dy > r.y + r.h) hitDepth = 0;
+    }
+    lastHitX = dx; lastHitY = dy;
+    hoverEl = hitTest(dx, dy);
+    paintHover();
+  });
+  img.addEventListener('mouseleave', () => { hoverbox.style.display = 'none'; });
+
+  // Alt+wheel cycles the hover through the ancestor chain — deepest → root.
+  // Wheel down = go outward (parent); wheel up = go inward (child).
+  stage.addEventListener('wheel', (e) => {
+    if (!e.altKey || !pinMode || !hitChain.length) return;
+    e.preventDefault();
+    hitDepth = Math.max(0, Math.min(hitChain.length - 1, hitDepth + (e.deltaY > 0 ? 1 : -1)));
+    hoverEl = dom[hitChain[hitDepth]];
+    paintHover();
+  }, { passive: false });
+
+  img.addEventListener('click', (e) => {
+    if (!pinMode) return;
+    e.preventDefault();
+    const box = img.getBoundingClientRect();
+    const s = dispScale() * domScale();
+    const dx = (e.clientX - box.left) / s, dy = (e.clientY - box.top) / s;
+    const el = hitTest(dx, dy);
+    openNoteForm({ x: Math.round(dx), y: Math.round(dy), el }, e.clientX - box.left, e.clientY - box.top);
+  });
+
+  function currentPins() {
+    const f = files[idx];
+    if (!f) return [];
+    return pins[f.base] || (pins[f.base] = []);
+  }
+
+  function openNoteForm(loc, px, py, existing) {
+    closeForm();
+    const form = document.createElement('div');
+    form.className = 'noteform';
+    const desc = loc.el
+      ? elDesc(loc.el) + ' ' + elSnippet(loc.el)
+      : 'pixel @(' + loc.x + ',' + loc.y + ') — no dom.json for this image';
+    form.innerHTML =
+      '<div class="el">' + desc.replace(/</g, '&lt;') + '</div>' +
+      '<textarea placeholder="Note for this element… (Enter saves, Esc cancels)"></textarea>' +
+      '<div class="row">' +
+      (existing ? '<button class="del">Delete</button>' : '') +
+      '<button class="cancel">Cancel</button><button class="save">Save</button></div>';
+    const ta = form.querySelector('textarea');
+    if (existing) ta.value = existing.note;
+    // Position: right of the click, clamped inside the canvas.
+    const maxL = Math.max(0, img.clientWidth - 350);
+    form.style.left = Math.min(px + 12, maxL) + 'px';
+    form.style.top = Math.max(0, py - 20) + 'px';
+    canvas.appendChild(form);
+    openForm = form;
+    ta.focus();
+
+    const commit = () => {
+      const note = ta.value.trim();
+      if (!note) { closeForm(); return; }
+      if (existing) { existing.note = note; }
+      else {
+        const list = currentPins();
+        list.push({
+          n: list.length + 1, x: loc.x, y: loc.y,
+          el: loc.el ? {
+            desc: elDesc(loc.el), label: (loc.el.label || '').slice(0, 120),
+            rect: loc.el.rect, role: loc.el.role || null,
+          } : null,
+          note,
+        });
+      }
+      closeForm(); syncPins();
+    };
+    form.querySelector('.save').addEventListener('click', commit);
+    form.querySelector('.cancel').addEventListener('click', closeForm);
+    if (existing) form.querySelector('.del').addEventListener('click', () => {
+      const list = currentPins();
+      const i = list.indexOf(existing);
+      if (i !== -1) list.splice(i, 1);
+      list.forEach((p, j) => (p.n = j + 1));
+      closeForm(); syncPins();
+    });
+    ta.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); commit(); }
+      if (e.key === 'Escape') { e.preventDefault(); closeForm(); }
+    });
+  }
+
+  function closeForm() {
+    if (openForm) { openForm.remove(); openForm = null; }
+    pinrect.style.display = 'none';
+  }
+
+  function renderPins() {
+    canvas.querySelectorAll('.pinbadge').forEach((b) => b.remove());
+    if (!files[idx] || !img.naturalWidth) return;
+    for (const p of currentPins()) {
+      const b = document.createElement('div');
+      b.className = 'pinbadge';
+      b.textContent = p.n;
+      const s = dispScale() * domScale();
+      b.style.left = p.x * s + 'px';
+      b.style.top = p.y * s + 'px';
+      b.title = (p.el ? p.el.desc + ' — ' : '') + p.note;
+      b.addEventListener('mouseenter', () => {
+        if (!p.el) return;
+        const d = toDisplay(p.el.rect);
+        Object.assign(pinrect.style, {
+          display: 'block', left: d.x + 'px', top: d.y + 'px',
+          width: d.w + 'px', height: d.h + 'px',
+        });
+      });
+      b.addEventListener('mouseleave', () => { pinrect.style.display = 'none'; });
+      b.addEventListener('click', (e) => {
+        e.stopPropagation();
+        openNoteForm({ x: p.x, y: p.y, el: null }, parseFloat(b.style.left), parseFloat(b.style.top), p);
+      });
+      canvas.appendChild(b);
+    }
+    pincountEl.textContent = currentPins().length ? currentPins().length + ' pins' : '';
+  }
+
+  // ---- pin persistence: transcript mirror + annotations.json POST ----
+  function pinLine(p) {
+    const elpart = p.el
+      ? '[' + p.el.desc + (p.el.label ? ' “' + p.el.label.replace(/\s+/g, ' ').trim().slice(0, 60) + '”' : '') + ']'
+      : '[pixel]';
+    return '- 📌#' + p.n + ' ' + elpart + ' @(' + p.x + ',' + p.y + '): ' + p.note;
+  }
+
+  function syncPins() {
+    renderPins();
+    // Mirror pins into the transcript section for the current image: replace
+    // any previous pin lines for this image, keep prose lines untouched.
+    const f = files[idx];
+    const h = headingFor(f.path);
+    let v = notes.value;
+    const start = v.indexOf(h);
+    if (start !== -1) {
+      const afterH = start + h.length;
+      const nextH = v.indexOf('\n## ', afterH);
+      const end = nextH === -1 ? v.length : nextH;
+      const section = v.slice(afterH, end);
+      const kept = section.split('\n').filter((l) => !l.startsWith('- 📌')).join('\n')
+        .replace(/\n{3,}/g, '\n\n').replace(/\s+$/, '');
+      const pinBlock = currentPins().map(pinLine).join('\n');
+      const merged = kept + (pinBlock ? '\n' + pinBlock : '') + '\n';
+      notes.value = v.slice(0, afterH) + merged + v.slice(end);
+    }
+    save();
+    postAnnotations();
+  }
+
+  let postTimer = null;
+  function postAnnotations() {
+    if (!baseUrl) return; // file:// session — pins live in the transcript only
+    clearTimeout(postTimer);
+    postTimer = setTimeout(async () => {
+      try {
+        await fetch('/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ savedAt: new Date().toISOString(), pins }, null, 1),
+        });
+        savedEl.textContent = 'pins saved ' + new Date().toLocaleTimeString();
+      } catch { savedEl.textContent = 'pin save FAILED (server gone?)'; }
+    }, 400);
+  }
+
+  async function loadAnnotations() {
+    if (!baseUrl) return;
+    try {
+      const res = await fetch(baseUrl + '/annotations.json', { cache: 'no-store' });
+      if (res.ok) {
+        const data = await res.json();
+        if (data && typeof data.pins === 'object') pins = data.pins;
+      }
+    } catch { /* none yet */ }
+  }
+
+  // ---- headings / caret ----
   function ensureHeading(path) {
     if (headed.has(path)) return;
     const h = headingFor(path);
@@ -244,9 +604,6 @@
     save();
   }
 
-  // Move the caret to the end of the section under `path`'s heading, and focus,
-  // so dictation/typing always lands under the image you're looking at — even
-  // when you arrow back to an earlier one.
   function focusSection(path) {
     const v = notes.value;
     const h = headingFor(path);
@@ -255,11 +612,10 @@
     if (start !== -1) {
       const afterHeading = start + h.length;
       const nextH = v.indexOf('\n## ', afterHeading);
-      caret = nextH === -1 ? v.length : nextH; // end of this section
+      caret = nextH === -1 ? v.length : nextH;
     }
     notes.focus();
     notes.setSelectionRange(caret, caret);
-    // Keep the caret line in view within the textarea.
     notes.blur(); notes.focus();
     notes.setSelectionRange(caret, caret);
   }
@@ -277,19 +633,27 @@
   });
 
   // ---- navigation ----
-  prevBtn.addEventListener('mousedown', (e) => e.preventDefault()); // don't steal focus
+  prevBtn.addEventListener('mousedown', (e) => e.preventDefault());
   nextBtn.addEventListener('mousedown', (e) => e.preventDefault());
   prevBtn.addEventListener('click', () => go(idx - 1));
   nextBtn.addEventListener('click', () => go(idx + 1));
 
   document.addEventListener('keydown', (e) => {
     if (!files.length) return;
-    // Ctrl/Meta+Left/Right navigate between images.
+    if (openForm) return; // note form owns the keyboard
+    // Ctrl/Meta+arrow always navigates images.
     if ((e.ctrlKey || e.metaKey) && e.key === 'ArrowRight') { e.preventDefault(); go(idx + 1); return; }
     if ((e.ctrlKey || e.metaKey) && e.key === 'ArrowLeft')  { e.preventDefault(); go(idx - 1); return; }
-    // Plain Up/Down (and PageUp/Down) scroll the current image. Dictation types via
-    // the OS, not the arrow keys, so repurposing them for scrolling is safe.
+    if (e.key === 'a' && document.activeElement !== notes) { e.preventDefault(); togglePin(); return; }
     if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+      // Bare Left/Right = nav BUT only when focus isn't the notes textarea
+      // (typing/dictating in the textarea must never yank the image away).
+      // FB-3C1 déjà: user says "I said once before, fix!!!" — bare-arrow is
+      // the natural nav gesture; Ctrl+arrow was extra friction.
+      if (document.activeElement !== notes) {
+        if (e.key === 'ArrowRight') { e.preventDefault(); go(idx + 1); return; }
+        if (e.key === 'ArrowLeft')  { e.preventDefault(); go(idx - 1); return; }
+      }
       const step = stage.clientHeight * 0.85;
       if (e.key === 'ArrowDown')  { e.preventDefault(); stage.scrollBy({ top: 120 }); }
       if (e.key === 'ArrowUp')    { e.preventDefault(); stage.scrollBy({ top: -120 }); }
@@ -311,9 +675,9 @@
     a.click(); URL.revokeObjectURL(a.href);
   });
   $('clear').addEventListener('click', () => {
-    if (!confirm('Clear all feedback text for this folder?')) return;
+    if (!confirm('Clear all feedback text for this folder? (Element pins are kept — delete them individually.)')) return;
     notes.value = ''; headed.clear(); save();
-    if (files[idx]) go(idx); // re-seed the current heading
+    if (files[idx]) go(idx);
   });
 
   function flash(btn, label) {

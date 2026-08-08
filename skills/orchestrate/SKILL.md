@@ -33,21 +33,16 @@ this procedure.
      Template: `All acceptance criteria in tasks/mission.md are implemented, the verifier is green, and a fresh-context reviewer confirmed the diff.`
    - *Verifier* — the project's gate command(s): tests + lint + build, exit 0 = green.
    - *Max iterations* — finite, default 25.
-2. **Dangerous-ops manifest.** Enumerate anticipated permission gates and
-   irreversible ops (pushes, merges, deletions, deploys, network egress).
-   Present ONE upfront approval request to the user. Anything NOT on the
-   approved manifest still stops for the user later. This converts mid-run
-   "should I continue?" permission stalls into a single pre-flight answer.
-3. **Write `tasks/mission.md`** (planning-with-files format): goal,
+2. **Write `tasks/mission.md`** (planning-with-files format): goal,
    acceptance criteria (checkboxes), verifier command, sigil statement,
-   approved manifest, cancel instructions
+   cancel instructions
    (`rm .claude/ralph-loop.local.md` or `/cancel-ralph`). Also create an
    empty `tasks/progress.md` now — doctrine and the loop prompt tell every
    iteration to read it, so it must exist from iteration 1. Seed
    `tasks/session-constraints.md` with any durable user directives already
    given this session (see Constraint pinning below); create it empty if
    none.
-4. **Arm the loop** — run from the WORKTREE ROOT (state file is CWD-scoped).
+3. **Arm the loop** — run from the WORKTREE ROOT (state file is CWD-scoped).
    Set `SIGIL` to the mission-specific statement from mission.md first —
    NEVER pass a placeholder: an unsubstituted promise can never match, so
    the loop would only end at max-iterations. Sigil rules: single line, no
@@ -174,9 +169,49 @@ this procedure.
 7. **Taste calls surface with artifacts.** Design/UX/naming decisions go
    to the user with screenshots/before-afters BEFORE merge; correctness
    work merges on green without asking.
-8. **Fix, don't defer.** Real HIGHs found mid-flight get a focused
-   follow-up subagent now — unless large/risky/out-of-scope, then state
-   the deferral cost explicitly.
+8. **Fix, don't defer — and defer only for a reproducible hard block.**
+   Real HIGHs found mid-flight get a focused follow-up subagent NOW.
+   Legitimate deferrals are limited to three empirical categories:
+   (a) **compile/gate-blocked** by a bug outside the diff that a small
+   fix can't repair inside the current runway; (b) **externally blocked**
+   on a credential, human interactive login, or paid service the loop
+   can't self-serve; (c) **user vetoed** the scope. Everything else
+   ships in this run. Specifically NOT legitimate deferral reasons:
+   "time budget", "audit found existing implementation partially" (the
+   brief spec is authoritative — half-present means ship the other
+   half in the same run), "risky headless" (that's what TDD + subagent
+   sandboxes exist for), "out-of-scope for a visual-fix branch" (if the
+   brief listed it, it's in scope), "wants its own advisor pass"
+   (bundle the advisor pass — see Phase G, not next slice).
+9. **Handover message before sigil.** The sigil emission is preceded (in
+   the SAME text block, tag last) by a founder-facing handover with three
+   fixed sections — reduced or hidden only when a section is empty:
+   1. **Executive summary** — numbered list of what was built and why,
+      including tooling / meta / skill / rule changes (not just product
+      code). One line per item; grouped by mission acceptance criterion
+      when possible. Purpose: the founder scans this to know what
+      changed without re-reading commits.
+   2. **Visual review** — if ANY view file was edited (HTML/templates,
+      client TS rendering, HTML-returning handlers), run
+      `~/.claude/skills/screenshot-review/serve.sh <shots-dir>` on the
+      regenerated shots dir. Include the served URL + kill command in
+      the handover. Do not skip this because "founder can start the
+      server themselves"; the friction of starting it is what defers the
+      review to never. Omit only if the diff is pure backend / infra.
+      **Ordering**: fanouts + component playgrounds go FIRST in the
+      served list — founder picks + component-level fixes cascade into
+      surfaces, so locking them before reviewing surfaces avoids
+      re-reviewing surfaces after every component change. Rename files
+      with numeric prefixes (`1-fanout-*.png`, `2-component-*.png`,
+      `3-surface-*.png`) so the tool's natural sort surfaces the
+      cascade order.
+   3. **Waiting PRs** — if branch is unmerged, list clickable PR URLs
+      (or, if the halt discipline forbids `git push`, the exact push +
+      `gh pr create` commands the founder can paste). One-liner per PR
+      with the branch name, base, commit count.
+   Then, and only then, emit the sigil ALONE at the end of the message.
+   The stop hook reads the FIRST `<promise>` tag; a handover-then-sigil
+   ordering is safe because the handover has no `<promise>` tags.
 
 ## Red flags
 
@@ -189,11 +224,26 @@ this procedure.
 - Happy-path-only e2e
 - Emitting the sigil without a fresh verifier run + reviewer confirmation
 - Parent Reading source files "just to check" — dispatch a subagent
-- Asking the user mid-loop anything mission.md or the approved manifest
-  already answers
+- Asking the user mid-loop anything mission.md already answers
 - Briefing a subagent with a paraphrase of user constraints instead of
   pasting `tasks/session-constraints.md` verbatim — paraphrase is how
   constraints silently die in handoff
+- Writing "Emergency exits" catch-alls in a subagent brief ("if X blows
+  the budget, ship minimum + defer rest"). Emergency-exit sections are
+  loopholes subagents lean on to escape rule 8. Each legitimate exit
+  must name a REPRODUCIBLE hard block (compile error, external auth
+  wall) — not a scope/time/audit judgment
+- Sigil declared without the fresh-context reviewer run (Phase G3 /
+  advice-refine-test-loop) — the sigil requires reviewer confirmation
+  of the combined diff; skipping reviewer = false sigil
+- Subagent report frames "AUDIT" as delivery when the brief said
+  "PORT" / "IMPLEMENT" / "SHIP". Audit-only completes only when the
+  brief explicitly said "audit only". Half-present in existing code
+  means SHIP THE OTHER HALF in the same run
+- Layout/UX enforcement landed at SOFT-WARN when the brief said
+  HARD-FAIL, with a note "will flip after baseline". The baseline is a
+  fixture you write in the same commit; the flip is one line. Don't
+  ship the safety-net-off version
 
 ## Scope guard
 

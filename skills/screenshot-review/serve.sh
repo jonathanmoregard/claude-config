@@ -39,6 +39,13 @@ imgs=("$DIR"/*.png "$DIR"/*.jpg "$DIR"/*.jpeg "$DIR"/*.webp "$DIR"/*.avif "$DIR"
 shopt -u nocaseglob nullglob
 [ "${#imgs[@]}" -gt 0 ] || { echo "no images found in $DIR" >&2; exit 1; }
 for f in "${imgs[@]}"; do ln -s "$f" "$ROOT/$NAME/"; done
+# Element-pin sidecars: <base>.dom.json next to <base>.png enables Figma-style
+# element pinning in the tool (hover-highlight + click-to-comment). Also link
+# annotations.json (may not exist yet — the server writes it into $DIR).
+shopt -s nullglob
+for f in "$DIR"/*.dom.json; do ln -s "$f" "$ROOT/$NAME/"; done
+shopt -u nullglob
+ln -s "$DIR/annotations.json" "$ROOT/$NAME/annotations.json"
 python3 - "$ROOT/$NAME" >"$ROOT/$NAME/manifest.json" <<'PY'
 import json, os, sys
 d = sys.argv[1]
@@ -47,8 +54,36 @@ print(json.dumps(sorted(f for f in os.listdir(d)
                         if f.lower().endswith(exts) and f != 'manifest.json')))
 PY
 
-# Serve in the background and open the tool pointed at the folder.
-( cd "$ROOT" && exec python3 -m http.server "$PORT" --bind 127.0.0.1 ) >"$STATE/log" 2>&1 &
+# Serve in the background: static files + POST /save that writes element-pin
+# annotations back into the SOURCE dir (annotations.json) for the agent to read.
+python3 - "$ROOT" "$DIR" "$PORT" >"$STATE/log" 2>&1 <<'PY' &
+import http.server, json, os, sys
+root, srcdir, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def __init__(self, *a, **kw):
+        super().__init__(*a, directory=root, **kw)
+    def do_POST(self):
+        if self.path.rstrip('/') != '/save':
+            self.send_error(404); return
+        n = int(self.headers.get('Content-Length') or 0)
+        if n <= 0 or n > 5_000_000:
+            self.send_error(413); return
+        data = self.rfile.read(n)
+        try:
+            json.loads(data)
+        except ValueError:
+            self.send_error(400); return
+        tmp = os.path.join(srcdir, '.annotations.json.tmp')
+        with open(tmp, 'wb') as f:
+            f.write(data)
+        os.replace(tmp, os.path.join(srcdir, 'annotations.json'))
+        self.send_response(204); self.end_headers()
+    def log_message(self, *a):
+        pass
+
+http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
+PY
 SRV=$!
 echo "$SRV" >"$STATE/pid"; echo "$ROOT" >"$STATE/root"
 sleep 1

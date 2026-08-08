@@ -93,33 +93,112 @@ _DOM_DUMP_JS = r"""
 (sel) => {
   const root = sel ? document.querySelector(sel) : document.body;
   if (!root) return { error: 'no root for selector', selector: sel };
-  // Elements a design critic cares about: landmarks, headings, controls,
-  // links, images, semantic containers. Skip pure text nodes / decorative divs.
-  const q = 'main, nav, header, footer, aside, section, article, ' +
-            'h1, h2, h3, h4, h5, h6, ' +
-            'a, button, input, select, textarea, label, fieldset, legend, ' +
-            'dialog, [role], [aria-label], img, svg';
-  const nodes = Array.from(root.matches(q) ? [root, ...root.querySelectorAll(q)] : root.querySelectorAll(q));
-  return nodes.map((el) => {
-    const r = el.getBoundingClientRect();
-    // Skip 0-size / offscreen (still counted at 0-width; caller can filter).
-    const rect = { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) };
+
+  // Broadened per SOTA research 2026-08-02 (element annotation pinning):
+  // export interactive elements (browser-use predicate) UNION painted-own-
+  // content elements (own text node / img / svg / canvas / video / own
+  // border|background). Enables Figma-style element pinning on captures —
+  // review tool hit-tests deepest-not-ancestor + area penalty, so a rich
+  // node set lets the user land on the actual span/row they meant.
+  const INTERACTIVE_TAGS = new Set([
+    'a','button','input','select','textarea','details','summary',
+    'option','optgroup','label','dialog','fieldset','legend',
+  ]);
+  const INTERACTIVE_ROLES = new Set([
+    'button','link','menuitem','option','radio','checkbox','tab',
+    'textbox','combobox','slider','spinbutton','searchbox','row',
+    'cell','gridcell','switch','menuitemcheckbox','menuitemradio',
+    'treeitem','listitem',
+  ]);
+  const LANDMARK_TAGS = new Set([
+    'main','nav','header','footer','aside','section','article',
+    'h1','h2','h3','h4','h5','h6','form','ul','ol','li','table',
+    'tr','td','th','figure','figcaption','blockquote','pre',
+  ]);
+  const OWN_PAINTED_TAGS = new Set(['img','svg','video','canvas','picture','iframe']);
+  const MIN_PX = 4;
+  const isTransparent = (c) => !c || c === 'transparent' || /rgba?\([^)]*,\s*0\s*\)/.test(c);
+  const hasOwnText = (el) => {
+    for (const n of el.childNodes) {
+      if (n.nodeType === 3 && n.nodeValue && n.nodeValue.trim()) return true;
+    }
+    return false;
+  };
+  const hasVisibleBorder = (cs) =>
+    ['borderTopWidth','borderRightWidth','borderBottomWidth','borderLeftWidth']
+      .some((k) => parseFloat(cs[k]) >= 1);
+  const hasOwnBg = (cs) =>
+    !isTransparent(cs.backgroundColor) ||
+    (cs.backgroundImage && cs.backgroundImage !== 'none');
+
+  const all = Array.from(root.querySelectorAll('*'));
+  // Include root itself so a captured region has a top-level container.
+  const candidates = root === document.body ? all : [root, ...all];
+  const kept = [];   // parallel to `nodes`
+  const nodes = [];  // exported rows
+  const indexOfEl = new WeakMap();
+
+  for (const el of candidates) {
+    const tag = el.tagName.toLowerCase();
+    if (tag === 'html' || tag === 'body' || tag === 'script' || tag === 'style') continue;
+    if (el.getAttribute('aria-hidden') === 'true') continue;
     const cs = window.getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) === 0) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width < MIN_PX || r.height < MIN_PX) continue;
+
+    const role = el.getAttribute('role');
+    const interactive =
+      INTERACTIVE_TAGS.has(tag) ||
+      (role && INTERACTIVE_ROLES.has(role)) ||
+      el.hasAttribute('onclick') ||
+      el.hasAttribute('tabindex');
+    const landmark = LANDMARK_TAGS.has(tag) || !!role || el.hasAttribute('aria-label');
+    const painted = OWN_PAINTED_TAGS.has(tag) ||
+                    hasOwnText(el) ||
+                    hasVisibleBorder(cs) ||
+                    hasOwnBg(cs);
+    // Skip pure decorative wrappers that neither interact nor paint anything
+    // of their own AND don't sit at a landmark/heading level. This is the
+    // filter that keeps the annotatable set from exploding to every div.
+    if (!interactive && !landmark && !painted) continue;
+
+    // Drop elements that ONLY inherit cursor:pointer from a captured ancestor
+    // (vercel-labs/agent-browser trick): the ancestor is annotatable already.
+    if (!interactive && !landmark && cs.cursor === 'pointer') {
+      const parent = el.parentElement;
+      if (parent && window.getComputedStyle(parent).cursor === 'pointer') continue;
+    }
+
+    // depth + parentIdx let the review tool implement Firefox-style deepest-
+    // not-ancestor hit-testing without a full DOM tree. Walk UP through
+    // ancestors we filtered out so the chain stays connected (e.g. a decor
+    // wrapper .stack that has no own text still routes children to main).
+    let depth = 0;
+    for (let p = el.parentElement; p; p = p.parentElement) depth++;
+    let parentIdx = -1;
+    for (let p = el.parentElement; p; p = p.parentElement) {
+      if (indexOfEl.has(p)) { parentIdx = indexOfEl.get(p); break; }
+    }
+
+    const rect = { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) };
     const label = (el.getAttribute('aria-label') || el.getAttribute('title') ||
-                   (el.tagName === 'IMG' ? el.getAttribute('alt') : null) ||
-                   (el.tagName === 'INPUT' ? el.getAttribute('placeholder') : null) ||
+                   (tag === 'img' ? el.getAttribute('alt') : null) ||
+                   (tag === 'input' ? el.getAttribute('placeholder') : null) ||
                    // Array.from() splits by Unicode codepoint (astral pairs stay
                    // whole). .slice() on the resulting array cannot produce a
                    // lone UTF-16 surrogate at the boundary — otherwise the JSON
                    // downstream fails utf-8 encode with `surrogates not allowed`
                    // (both advisors flagged this; codex reproduced 2026-08-01).
                    Array.from((el.innerText || '').trim()).slice(0, 80).join('') || null);
-    return {
-      tag: el.tagName.toLowerCase(),
-      role: el.getAttribute('role') || null,
+    const node = {
+      tag,
+      role: role || null,
       id: el.id || null,
       class: (el.getAttribute('class') || '').trim() || null,
       rect,
+      depth,
+      parentIdx,
       font: `${cs.fontWeight} ${cs.fontSize}/${cs.lineHeight} ${cs.fontFamily.split(',')[0].replace(/["']/g,'')}`,
       color: cs.color,
       bg: cs.backgroundColor,
@@ -129,7 +208,11 @@ _DOM_DUMP_JS = r"""
               ? null : `${cs.borderTopWidth} ${cs.borderRightWidth} ${cs.borderBottomWidth} ${cs.borderLeftWidth} · ${cs.borderTopColor}`,
       label,
     };
-  }).filter((n) => n.rect.w > 0 && n.rect.h > 0);
+    indexOfEl.set(el, nodes.length);
+    nodes.push(node);
+    kept.push(el);
+  }
+  return nodes;
 }
 """
 
