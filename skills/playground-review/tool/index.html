@@ -167,7 +167,7 @@
   // Boot diagnostics — announce build + preemptively kill stale caches
   // that broke the tool across the last 4 iterations. Advisor round
   // 2026-08-03: cache-persistence + no in-band diag was the root cause.
-  const BUILD = 'pgr-2026-08-03-h'; // bump on every tool edit
+  const BUILD = 'pgr-2026-08-03-j'; // bump on every tool edit
   console.log('%c[playground-review] build ' + BUILD, 'font-weight:bold;color:#6ea8fe');
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.getRegistrations().then(regs => {
@@ -187,17 +187,29 @@
   const headingFor = (name) => '## ' + name;
 
   async function load() {
-    try {
-      const res = await fetch('/playgrounds.json', { cache: 'no-store' });
-      if (!res.ok) throw new Error('playgrounds.json ' + res.status);
-      entries = await res.json();
-      if (!Array.isArray(entries) || !entries.length) throw new Error('empty manifest');
-    } catch (e) {
-      empty.textContent = 'Could not load playgrounds.json — ' + e.message;
-      return;
+    // Prefer inline manifest injected by server (kablong /dev/pgr/) →
+    // same-origin single-server mode; no cross-origin iframe.
+    const inline = document.getElementById('pgr-manifest');
+    if (inline && inline.textContent) {
+      try {
+        entries = JSON.parse(inline.textContent);
+      } catch (e) {
+        empty.textContent = 'Bad inline manifest — ' + e.message; return;
+      }
+    } else {
+      try {
+        const res = await fetch('/playgrounds.json', { cache: 'no-store' });
+        if (!res.ok) throw new Error('playgrounds.json ' + res.status);
+        entries = await res.json();
+      } catch (e) {
+        empty.textContent = 'Could not load playgrounds.json — ' + e.message;
+        return;
+      }
     }
+    if (!Array.isArray(entries) || !entries.length) { empty.textContent = 'empty manifest'; return; }
     // Canonicalize host so localhost/127.0.0.1 don't split localStorage.
-    const canonicalHost = (u) => new URL(u).host.replace('localhost', '127.0.0.1');
+    // Handles relative URLs (same-origin mode) by resolving against tool origin.
+    const canonicalHost = (u) => new URL(u, location.origin).host.replace('localhost', '127.0.0.1');
     folderKey = 'pgreview:' + canonicalHost(location.href) + ':' + canonicalHost(entries[0].url);
     notes.value = localStorage.getItem(folderKey) || '';
     for (const e of entries) if (notes.value.includes(headingFor(e.name))) headed.add(e.name);
@@ -212,7 +224,8 @@
       const li = document.createElement('li');
       const a = document.createElement('a');
       a.href = '#' + i;
-      a.innerHTML = e.name.replace(/</g, '&lt;') + '<small>' + (new URL(e.url).pathname + new URL(e.url).search).replace(/</g, '&lt;') + '</small>';
+      const abs = new URL(e.url, location.origin);
+      a.innerHTML = e.name.replace(/</g, '&lt;') + '<small>' + (abs.pathname + abs.search).replace(/</g, '&lt;') + '</small>';
       a.onclick = (ev) => { ev.preventDefault(); go(i); };
       li.appendChild(a);
       list.appendChild(li);
@@ -223,7 +236,8 @@
   // template + CSP edits land without hard-refresh. Uses BUILD id +
   // Date.now to also bust reload of the same URL.
   function bustCache(url) {
-    const u = new URL(url);
+    // Handles both absolute + relative URLs. Returns absolute string.
+    const u = new URL(url, location.origin);
     u.searchParams.set('_pgr', BUILD + '-' + Date.now());
     return u.toString();
   }
@@ -286,8 +300,10 @@
     // chrome-error://chromewebdata/ from a prior failed load.
     swapStage(bustCache(e.url));
     armBridgeWatchdog();
-    urlbadge.textContent = e.url;
-    openext.href = e.url;
+    // Resolve relative URLs against the tool origin for display.
+    const abs = new URL(e.url, location.origin).toString();
+    urlbadge.textContent = abs;
+    openext.href = abs;
     current.textContent = e.name;
     ensureHeading(e.name);
     focusSection(e.name);
