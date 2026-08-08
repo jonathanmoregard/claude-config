@@ -123,6 +123,7 @@
       "/home/jonathan/Repos/research-agent/reports"
     ]
   },
+  "model": "opus[1m]",
   "enableAllProjectMcpServers": false,
   "hooks": {
     "SessionStart": [
