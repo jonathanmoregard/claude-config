@@ -314,17 +314,58 @@ run_worker() {
   prompt="$(cat "$prompt_template")"
 
   # For sessionend, inject checkpoint listing so the model can incorporate them.
+  #
+  # BYTE BUDGET: cap the inlined checkpoints at ~16 KB. Long sessions with
+  # many PreCompact events, or a maliciously-seeded checkpoint dir, would
+  # otherwise blow the prompt past the 90s timeout and burn tokens for zero
+  # gain (the reflection model can't meaningfully synthesize 200 KB of
+  # nested reflections anyway). Chronological order is preserved by picking
+  # the MOST-RECENT checkpoints first, then re-sorting for display so the
+  # model sees them oldest-first. Truncation is announced in the block so
+  # the model knows history was elided.
   if [[ "$MODE" == "sessionend" ]]; then
     local cp_block=""
+    local -r cp_budget_bytes=16384
     if [[ -d "$checkpoint_dir" ]]; then
-      local cp_files
-      cp_files=$(find "$checkpoint_dir" -type f -name '*.json' 2>/dev/null | sort)
-      if [[ -n "$cp_files" ]]; then
-        cp_block="Saved checkpoints (JSON, chronological):"$'\n'
-        while IFS= read -r f; do
+      # Chronological (oldest first) — same as before.
+      local -a cp_files_arr=()
+      local f
+      while IFS= read -r f; do
+        [[ -n "$f" ]] && cp_files_arr+=( "$f" )
+      done < <(find "$checkpoint_dir" -type f -name '*.json' 2>/dev/null | sort)
+
+      local n_total="${#cp_files_arr[@]}"
+      if (( n_total > 0 )); then
+        # Walk NEWEST-first so a byte-cap elides oldest first (most recent
+        # signal survives). Collect kept indices, then emit oldest-first.
+        local -a kept=()
+        local used=0 kept_count=0 i entry entry_bytes
+        for (( i = n_total - 1; i >= 0; i-- )); do
+          f="${cp_files_arr[$i]}"
+          entry=$'\n'"--- $(basename "$f") ---"$'\n'"$(cat "$f" 2>/dev/null || true)"$'\n'
+          entry_bytes="${#entry}"
+          # Always take at least one, even if it's huge (better one large
+          # checkpoint than none). Otherwise stop when adding would exceed cap.
+          if (( kept_count > 0 && used + entry_bytes > cp_budget_bytes )); then
+            break
+          fi
+          kept=( "$i" "${kept[@]}" )  # prepend to keep chronological order
+          used=$(( used + entry_bytes ))
+          kept_count=$(( kept_count + 1 ))
+        done
+
+        local elided=$(( n_total - kept_count ))
+        if (( elided > 0 )); then
+          cp_block="[Note: showing $kept_count of $n_total most-recent checkpoints (~$used bytes); $elided older elided for prompt budget.]"$'\n\n'
+        else
+          cp_block=""
+        fi
+        cp_block+="Saved checkpoints (JSON, chronological):"$'\n'
+        for i in "${kept[@]}"; do
+          f="${cp_files_arr[$i]}"
           cp_block+=$'\n'"--- $(basename "$f") ---"$'\n'
-          cp_block+="$(cat "$f")"$'\n'
-        done <<<"$cp_files"
+          cp_block+="$(cat "$f" 2>/dev/null || true)"$'\n'
+        done
       else
         cp_block="(no checkpoints — session ran without compaction)"
       fi
