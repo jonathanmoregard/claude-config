@@ -1,45 +1,46 @@
 #!/usr/bin/env bash
-# idle-handoff.sh — proactive mission.md write + optional auto-fork for
-# idle Claude Code sessions.
+# idle-handoff.sh — proactive mission.md write + auto-fork for idle Claude
+# Code sessions. Runs every N minutes via systemd user timer.
 #
-# Runs every N minutes via systemd user timer. For each candidate session:
-#   1. Write tasks/mission.md via reflect.sh mission (warm cache preemption).
-#   2. If mission.md ## Next is populated AND staleness gate passes AND
-#      global bounds allow, spawn a fresh `claude -p tasks/mission.md`
-#      that reads the mission and executes the top Next item.
+# Guard chain (order-sensitive; each check reasoned about in the ARFTL
+# Phase 1 review 2026-08-08, round 2):
+#   1. kill switch flag (-e catches file / dir / symlink)
+#   2. env-var sanity (numeric bounds)
+#   3. reflect.sh executable, projects dir exists
+#   4. flock on lock file (single instance)
+#   5. per-project: newest NON-sdk-cli transcript (skip fork-chain lineage)
+#   6. sdk-cli detection fails CLOSED (empty/error → skip candidate)
+#   7. idle window (MIN..MAX seconds; MIN < MAX enforced)
+#   8. transcript-line threshold
+#   9. failure backoff (per-sid, N in W window)
+#  10. cwd extractable and exists
+#  11. live-project (rescanned just before spawn — see below)
+#  12. ralph collision guard
+#  13. mission.md fresh-dedupe (30 min)
+#  14. mission mode write; VERIFY manifest status=="complete" (not just rc)
+#  15. per-run + per-cwd 24h fork budget
+#  16. ## Next non-empty and not "(none)" / "- (none)"
+#  17. staleness gate: DENY (skip) when uncheckable; non-git cwd = skip
+#  18. RE-scan live cwds; abort spawn if any claude proc entered this cwd
+#  19. spawn detached, closing fd 8 (else lock wedged for fork lifetime)
 #
-# Design constraints derived from architectural review (2026-08-08):
-#   - Never auto-fork an sdk-cli-origin transcript (would chain forever).
-#   - Detect live sessions via `fuser` on the transcript file, not argv.
-#   - Skip ralph-armed cwds; ralph owns its own iteration cadence.
-#   - Global per-run + per-cwd fork budget; no unbounded spawns.
-#   - Staleness gate: skip fork if git HEAD moved OR any tracked file
-#     mtime > transcript mtime since mission was written.
-#   - Auto-fork uses fresh `claude -p` (no --resume of old parent) —
-#     resuming a >55min-idle parent pays the exact cold cache_write cost
-#     this system exists to prevent.
-#
-# Kill switch: touch ~/.claude/idle-handoff.disable
+# Kill switch: touch ~/.claude/idle-handoff.disable  (file, dir, or symlink)
 set -uo pipefail
 umask 077
 
+# ---- Config with numeric validation (advisor MEDIUM: sharp-edges) -----------
 : "${REFLECT_ROOT:=$HOME/.claude/reflections}"
 : "${REFLECT_MODEL:=haiku}"
-: "${IDLE_HANDOFF_MIN_SECONDS:=$((45*60))}"          # 45 min: start writing mission.md
-: "${IDLE_HANDOFF_MAX_SECONDS:=$((24*60*60))}"       # 24h: stale-stale, skip
-: "${IDLE_HANDOFF_MIN_TRANSCRIPT_LINES:=20}"         # skip trivial short sessions
-: "${IDLE_HANDOFF_MISSION_MAX_AGE_SECONDS:=$((30*60))}"  # skip if mission.md is fresh
-
-# Auto-fork execution model + bounds
+: "${IDLE_HANDOFF_MIN_SECONDS:=$((45*60))}"
+: "${IDLE_HANDOFF_MAX_SECONDS:=$((24*60*60))}"
+: "${IDLE_HANDOFF_MIN_TRANSCRIPT_LINES:=20}"
+: "${IDLE_HANDOFF_MISSION_MAX_AGE_SECONDS:=$((30*60))}"
 : "${IDLE_HANDOFF_AUTOFORK_MODEL:=claude-opus-5}"
 : "${IDLE_HANDOFF_AUTOFORK_MAX_TURNS:=15}"
-: "${IDLE_HANDOFF_AUTOFORK_MAX_PER_RUN:=3}"          # per timer fire
-: "${IDLE_HANDOFF_AUTOFORK_MAX_PER_CWD_24H:=5}"      # per project per 24h
-
-# Retry backoff on repeated write failures
+: "${IDLE_HANDOFF_AUTOFORK_MAX_PER_RUN:=3}"
+: "${IDLE_HANDOFF_AUTOFORK_MAX_PER_CWD_24H:=5}"
 : "${IDLE_HANDOFF_MAX_RECENT_FAILURES:=3}"
 : "${IDLE_HANDOFF_FAILURE_WINDOW_SECONDS:=$((6*60*60))}"
-
 : "${IDLE_HANDOFF_LOCK:=$REFLECT_ROOT/idle-handoff.lock}"
 : "${IDLE_HANDOFF_LOG_DIR:=$REFLECT_ROOT/idle-handoff-logs}"
 : "${IDLE_HANDOFF_STATE_DIR:=$REFLECT_ROOT/idle-handoff-state}"
@@ -55,9 +56,28 @@ log() {
   printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$IDLE_HANDOFF_LOG_DIR/handoff.log"
 }
 
-# ---- Kill switch ------------------------------------------------------------
-if [[ -f "$IDLE_HANDOFF_DISABLE_FLAG" ]]; then
-  log "disabled (flag file exists)"
+is_pos_int() {
+  [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -gt 0 ]]
+}
+
+for var in IDLE_HANDOFF_MIN_SECONDS IDLE_HANDOFF_MAX_SECONDS \
+           IDLE_HANDOFF_MIN_TRANSCRIPT_LINES IDLE_HANDOFF_MISSION_MAX_AGE_SECONDS \
+           IDLE_HANDOFF_AUTOFORK_MAX_TURNS IDLE_HANDOFF_AUTOFORK_MAX_PER_RUN \
+           IDLE_HANDOFF_AUTOFORK_MAX_PER_CWD_24H \
+           IDLE_HANDOFF_MAX_RECENT_FAILURES IDLE_HANDOFF_FAILURE_WINDOW_SECONDS; do
+  if ! is_pos_int "${!var}"; then
+    log "config error: $var='${!var}' not a positive integer; aborting run"
+    exit 0
+  fi
+done
+if [[ "$IDLE_HANDOFF_MIN_SECONDS" -ge "$IDLE_HANDOFF_MAX_SECONDS" ]]; then
+  log "config error: IDLE_HANDOFF_MIN_SECONDS ($IDLE_HANDOFF_MIN_SECONDS) >= IDLE_HANDOFF_MAX_SECONDS ($IDLE_HANDOFF_MAX_SECONDS); aborting"
+  exit 0
+fi
+
+# ---- Kill switch: -e catches file, directory, or symlink --------------------
+if [[ -e "$IDLE_HANDOFF_DISABLE_FLAG" ]]; then
+  log "disabled (flag exists at $IDLE_HANDOFF_DISABLE_FLAG)"
   exit 0
 fi
 
@@ -77,64 +97,85 @@ if ! flock -n 8; then
   exit 0
 fi
 
-# ---- Per-cwd counter helpers ------------------------------------------------
-# Fork ledger: one line per successful autofork spawn, "<epoch> <cwd>".
-# Reads for counting, writes on spawn. File truncated when older than 48h.
+# ---- SID validator (advisor LOW: log injection prevention) ------------------
+# Basename-derived sid could contain control chars from a planted filename;
+# validating before interpolation into state paths and logs.
+is_valid_sid() {
+  local s="$1"
+  [[ -n "$s" && "$s" =~ ^[A-Za-z0-9._-]{1,128}$ && ! "$s" =~ ^\. ]]
+}
+
+# ---- Fork ledger: tab-separated to survive cwds with spaces (HIGH-E) --------
 FORK_LEDGER="$IDLE_HANDOFF_STATE_DIR/fork-ledger.log"
 touch "$FORK_LEDGER"
 
-# Prune ledger entries older than 48h (well beyond the 24h counter window)
+# Prune entries older than 48h. Ledger format: <epoch>\t<cwd>\n
+# (was space-separated; awk $2==cwd silently missed cwds containing spaces →
+# per-cwd budget bypassable). Use awk -F'\t' to make field boundaries explicit.
 tmp_ledger="$(mktemp -p "$IDLE_HANDOFF_STATE_DIR" ".fork-ledger-XXXXXX")"
-awk -v cutoff=$((now - 48*3600)) '$1 >= cutoff' "$FORK_LEDGER" > "$tmp_ledger" \
-  && mv -f "$tmp_ledger" "$FORK_LEDGER"
+if awk -F'\t' -v cutoff=$((now - 48*3600)) '$1 >= cutoff' "$FORK_LEDGER" > "$tmp_ledger"; then
+  mv -f "$tmp_ledger" "$FORK_LEDGER"
+else
+  rm -f "$tmp_ledger"
+fi
 
 fork_count_24h_for_cwd() {
   local cwd="$1"
   local cutoff=$((now - 24*3600))
-  awk -v cutoff=$cutoff -v cwd="$cwd" '$1 >= cutoff && $2 == cwd' "$FORK_LEDGER" | wc -l
+  awk -F'\t' -v cutoff=$cutoff -v cwd="$cwd" '$1 >= cutoff && $2 == cwd' "$FORK_LEDGER" | wc -l
 }
 
 record_fork() {
   local cwd="$1"
-  printf '%d %s\n' "$now" "$cwd" >> "$FORK_LEDGER"
+  printf '%d\t%s\n' "$now" "$cwd" >> "$FORK_LEDGER"
 }
 
-# ---- Failure backoff helpers ------------------------------------------------
-# Track per-sid mission-write failures; skip if too many recent failures.
+# ---- Failure backoff --------------------------------------------------------
 record_failure() {
   local sid="$1"
+  is_valid_sid "$sid" || return 0
   printf '%d\n' "$now" >> "$IDLE_HANDOFF_STATE_DIR/${sid}.failures"
 }
 
 recent_failure_count() {
   local sid="$1"
+  is_valid_sid "$sid" || { echo 0; return; }
   local file="$IDLE_HANDOFF_STATE_DIR/${sid}.failures"
   [[ -f "$file" ]] || { echo 0; return; }
   local cutoff=$((now - IDLE_HANDOFF_FAILURE_WINDOW_SECONDS))
   awk -v c=$cutoff '$1 >= c' "$file" | wc -l
 }
 
-# ---- Live-project detection (advisor HIGH-2, revised) -----------------------
-# Advisor originally proposed fuser on the transcript. Empirical: Claude Code
-# does NOT hold its transcript file open — it opens, appends, closes each
-# turn. fuser/lsof/fd-scan all miss live sessions. Correct signal: any
-# `claude` process whose /proc/<pid>/cwd equals the candidate project cwd.
-# That catches:
-#   - `claude --resume <sid>` (previous argv-only guard)
-#   - plain `claude` panes in the project dir (the advisor's specific worry)
-#   - non-standard invocations (`claude --continue`, wrappers, etc.)
-# Scan /proc once, cache the set of live cwds.
+# Prune .failures files older than the failure window (avoid unbounded growth
+# in the state dir; the 5-min timer would otherwise leak one file per
+# rare-idle session forever).
+find "$IDLE_HANDOFF_STATE_DIR" -maxdepth 1 -type f -name '*.failures' \
+     -mmin +$(( IDLE_HANDOFF_FAILURE_WINDOW_SECONDS / 60 )) -delete 2>/dev/null || true
+
+# ---- Live-project detection: rescannable, exe canonicalisation-aware --------
+# Two problems the prior version had:
+#   (1) scan_live_cwds ran once at startup; per-candidate mission write can
+#       burn ~90s, so live-cwd view could be minutes stale by fork time.
+#       Solution: rescan just before spawn.
+#   (2) exe canonicalisation missed 'exe -> /nix/store/.../.claude-wrapped
+#       (deleted)' after Nix GC replaces store paths under a live session.
+#       Solution: match any exe path with the tail token in a set of
+#       plausible names, tolerating a trailing " (deleted)" annotation.
+CLAUDE_EXE_TAILS='claude|claude-code|.claude-wrapped'
+
 declare -A LIVE_CWDS
 scan_live_cwds() {
-  local exe cwd
+  # Reset then repopulate — safe to call repeatedly.
+  LIVE_CWDS=()
+  local exe cwd exe_tail
   for pid_dir in /proc/[0-9]*; do
     [[ -d "$pid_dir" ]] || continue
-    # exe symlink points to the actual binary. Claude Code is a Nix-wrapped
-    # binary named `.claude-wrapped` (upstream); user shims sometimes name
-    # it `claude` or `claude-code`. Match any of those tails.
     exe=$(readlink "$pid_dir/exe" 2>/dev/null) || continue
-    case "$exe" in
-      */claude|*/claude-code|*/.claude-wrapped) ;;
+    # Strip any trailing " (deleted)" annotation Linux appends after unlink.
+    exe="${exe% (deleted)}"
+    exe_tail="${exe##*/}"
+    case "|$CLAUDE_EXE_TAILS|" in
+      *"|$exe_tail|"*) ;;
       *) continue ;;
     esac
     cwd=$(readlink "$pid_dir/cwd" 2>/dev/null) || continue
@@ -151,34 +192,80 @@ is_live_project() {
 
 scan_live_cwds
 
-# ---- sdk-cli origin check (advisor BLOCKER) ---------------------------------
-# Transcripts written by fork/scripted `claude -p` sessions carry
-# entrypoint="sdk-cli" in their first user record. Auto-forking those chains
-# generations of opus-5 spawns. Refuse to touch any sdk-cli transcript.
+# ---- Transcript entrypoint (fails CLOSED — HIGH-F) --------------------------
+# Prior version returned empty on missing/late/malformed entrypoint field, and
+# the caller treated empty as "not sdk-cli, proceed" → chain risk. Fail
+# closed: return "unknown" when we can't determine, and treat unknown as
+# skip-worthy at the call site.
 transcript_entrypoint() {
   local transcript="$1"
-  # First record with a non-null entrypoint. Bounded read.
-  head -50 "$transcript" 2>/dev/null | \
+  local ep
+  ep=$(head -100 "$transcript" 2>/dev/null | \
     jq -r 'select(type=="object" and .entrypoint != null) | .entrypoint' 2>/dev/null | \
-    head -1
+    head -1) || { echo "unknown"; return; }
+  if [[ -z "$ep" ]]; then
+    echo "unknown"
+  else
+    echo "$ep"
+  fi
 }
 
-# ---- Staleness gate (advisor MEDIUM-6) --------------------------------------
-# Deterministic pre-fork check: if the world has moved since the transcript
-# was last written, don't execute the mission's Next — it may be obsolete.
-#   - New commits (HEAD-commit-time > transcript_mtime): stale.
-#   - Any tracked file with mtime > transcript_mtime: stale.
-# Non-git cwds skip the gate (unable to check; auto-fork proceeds anyway).
+is_sdk_cli_or_unknown() {
+  local ep="$1"
+  [[ "$ep" == "sdk-cli" || "$ep" == "unknown" ]]
+}
+
+# ---- Newest non-sdk-cli transcript per project (HIGH-C) ---------------------
+# Prior version took the literal newest transcript per project. After the
+# first autofork, that transcript is sdk-cli-origin → skipped by the origin
+# guard → whole project skipped forever until the next human session. Fix:
+# iterate newest-first, skip sdk-cli AND unknown-origin transcripts, return
+# the first eligible one.
+newest_non_sdk_cli_transcript() {
+  local project_dir="$1"
+  local f ep
+  while IFS= read -r f; do
+    [[ -n "$f" && -f "$f" ]] || continue
+    ep=$(transcript_entrypoint "$f")
+    if ! is_sdk_cli_or_unknown "$ep"; then
+      printf '%s\n' "$f"
+      return 0
+    fi
+  done < <(find "$project_dir" -maxdepth 1 -type f -name '*.jsonl' \
+              -printf '%T@ %p\n' 2>/dev/null | sort -rn | awk '{print $2}')
+  return 1
+}
+
+# ---- Staleness gate: DENY when uncheckable (MEDIUM: insecure-defaults) ------
+# Prior version returned "not stale" for non-git cwds, silently opening the
+# gate everywhere `git rev-parse` fails. Now: non-git cwd → DENY (treat as
+# stale), so autofork is only permitted where world-moved can be verified.
+# Also: staleness = HEAD commit moved OR any tracked/untracked file mtime
+# > transcript mtime (git status --porcelain would cover both; using find
+# on ls-files ∪ status output).
 is_stale_since_transcript() {
   local cwd="$1" transcript_mtime="$2"
-  ( cd "$cwd" 2>/dev/null && git rev-parse --is-inside-work-tree >/dev/null 2>&1 ) || return 1
+  ( cd "$cwd" 2>/dev/null && git rev-parse --is-inside-work-tree >/dev/null 2>&1 ) \
+    || return 0   # non-git: treat as stale (deny)
+
   local last_commit_ts
   last_commit_ts=$( cd "$cwd" && git log -1 --format=%ct 2>/dev/null || echo 0 )
   if [[ "$last_commit_ts" -gt "$transcript_mtime" ]]; then
     return 0
   fi
-  # Any tracked file modified since transcript_mtime? Check via find on
-  # tracked paths; cheap for normal-size repos.
+
+  # Any dirty/untracked file OR tracked-file mtime > transcript_mtime.
+  # `git status --porcelain` catches both dirty and untracked; if the porcelain
+  # output is non-empty at all, treat as stale (the world moved since a clean
+  # baseline). This is conservative — a pre-existing dirty file with mtime
+  # older than the transcript would also trip the gate, which is fine
+  # (autofork against dirty tree is risky regardless).
+  if ( cd "$cwd" && git status --porcelain 2>/dev/null | head -1 ) | grep -q .; then
+    return 0
+  fi
+
+  # And tracked-file mtimes: safeguard against a commit that pre-dates the
+  # transcript but a manual `touch` bumped the mtime. Bounded scan.
   if ( cd "$cwd" && git ls-files -z 2>/dev/null | \
        xargs -0 -r stat -c '%Y' 2>/dev/null | \
        awk -v t=$transcript_mtime '$1 > t {found=1; exit} END {exit !found}' ); then
@@ -187,11 +274,24 @@ is_stale_since_transcript() {
   return 1
 }
 
+# ---- Verify mission write actually completed (HIGH-A) -----------------------
+# reflect.sh mission returns rc=0 on internal errors (missing cwd, mv fail,
+# empty result from claude) with manifest.status=="error". Prior version
+# treated rc=0 as "wrote" and proceeded to autofork against stale mission.md.
+# Fix: after the call, read the manifest and require status=="complete".
+mission_manifest_status() {
+  local sid="$1"
+  local mf="$REFLECT_ROOT/sessions/$sid/manifest.json"
+  [[ -f "$mf" ]] || { echo "missing"; return; }
+  jq -r '.modes.mission.status // "missing"' "$mf" 2>/dev/null || echo "missing"
+}
+
 # ---- Main loop --------------------------------------------------------------
 count_seen=0
 count_wrote=0
 count_forked=0
 count_skipped_live=0
+count_skipped_live_rescan=0
 count_skipped_short=0
 count_skipped_fresh_mission=0
 count_skipped_no_cwd=0
@@ -199,10 +299,12 @@ count_skipped_no_next=0
 count_skipped_stale=0
 count_skipped_observer=0
 count_skipped_sdk_cli=0
+count_skipped_unknown_origin=0
 count_skipped_ralph=0
 count_skipped_git_stale=0
 count_skipped_fork_budget=0
 count_skipped_backoff=0
+count_mission_status_error=0
 forks_this_run=0
 
 for project_dir in "$PROJECTS_DIR"/*/; do
@@ -215,17 +317,18 @@ for project_dir in "$PROJECTS_DIR"/*/; do
       ;;
   esac
 
-  transcript=$(find "$project_dir" -maxdepth 1 -type f -name '*.jsonl' \
-    -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | awk '{print $2}')
-  [[ -n "$transcript" && -f "$transcript" ]] || continue
+  # ---- Newest non-sdk-cli transcript (HIGH-C) ---
+  if ! transcript=$(newest_non_sdk_cli_transcript "$project_dir"); then
+    # Every transcript in this project is sdk-cli or unknown-origin.
+    # Count as sdk-cli skip for observability.
+    count_skipped_sdk_cli=$((count_skipped_sdk_cli + 1))
+    continue
+  fi
   count_seen=$((count_seen + 1))
 
   sid=$(basename "$transcript" .jsonl)
-
-  # ---- Origin guard: never touch sdk-cli/fork transcripts (BLOCKER) ---
-  entrypoint=$(transcript_entrypoint "$transcript")
-  if [[ "$entrypoint" == "sdk-cli" ]]; then
-    count_skipped_sdk_cli=$((count_skipped_sdk_cli + 1))
+  if ! is_valid_sid "$sid"; then
+    log "skipped: sid failed validation (path=$transcript)"
     continue
   fi
 
@@ -262,16 +365,13 @@ for project_dir in "$PROJECTS_DIR"/*/; do
     continue
   fi
 
-  # ---- Live-project guard: any claude process cwd == this cwd? (HIGH-2) ---
+  # ---- Live-project guard: initial scan ---
   if is_live_project "$candidate_cwd"; then
     count_skipped_live=$((count_skipped_live + 1))
     continue
   fi
 
-  # ---- Ralph collision guard (HIGH-3) ---
-  # Ralph owns its own iteration cadence; auto-fork would clobber its
-  # mission.md (losing the completion sigil + doctrine) and race its
-  # own continuation. Ralph and auto-fork are alternative drivers — pick one.
+  # ---- Ralph collision ---
   if [[ -f "$candidate_cwd/.claude/ralph-loop.local.md" ]]; then
     count_skipped_ralph=$((count_skipped_ralph + 1))
     continue
@@ -297,18 +397,29 @@ for project_dir in "$PROJECTS_DIR"/*/; do
 
   worker_log="$IDLE_HANDOFF_LOG_DIR/${sid}.$(date +%s).mission.log"
   log "writing mission.md for sid=$sid idle=${idle}s cwd=$candidate_cwd"
-  if REFLECT_ROOT="$REFLECT_ROOT" REFLECT_MODEL="$REFLECT_MODEL" \
-     timeout 90 bash -c 'printf "%s" "$1" | env -u MODE bash "$2" mission' \
-     _ "$payload" "$REFLECT_SH" >>"$worker_log" 2>&1; then
-    count_wrote=$((count_wrote + 1))
-  else
-    rc=$?
+
+  # `timeout -k 10 90 …` sends SIGTERM at 90s, SIGKILL 10s later. Prior
+  # version's `timeout 90` TERMed the outer bash but not its claude child;
+  # orphaned claude kept burning tokens. -k propagates the kill down the
+  # process group.
+  REFLECT_ROOT="$REFLECT_ROOT" REFLECT_MODEL="$REFLECT_MODEL" \
+    timeout --foreground -k 10 90 \
+      bash -c 'printf "%s" "$1" | env -u MODE bash "$2" mission' \
+      _ "$payload" "$REFLECT_SH" >>"$worker_log" 2>&1
+  rc=$?
+
+  # (HIGH-A) Do NOT trust rc alone — reflect.sh returns 0 on internal error.
+  # Read the manifest and require status=="complete".
+  status=$(mission_manifest_status "$sid")
+  if [[ "$rc" -ne 0 || "$status" != "complete" ]]; then
     record_failure "$sid"
-    log "mission write failed for sid=$sid rc=$rc failures=$((fail_count + 1))/${IDLE_HANDOFF_MAX_RECENT_FAILURES} (see $worker_log)"
+    count_mission_status_error=$((count_mission_status_error + 1))
+    log "mission write failed sid=$sid rc=$rc manifest_status=$status failures=$((fail_count + 1))/${IDLE_HANDOFF_MAX_RECENT_FAILURES}"
     continue
   fi
+  count_wrote=$((count_wrote + 1))
 
-  # ---- Autofork budget: per-run + per-cwd 24h ---
+  # ---- Autofork budget ---
   if [[ "$forks_this_run" -ge "$IDLE_HANDOFF_AUTOFORK_MAX_PER_RUN" ]]; then
     count_skipped_fork_budget=$((count_skipped_fork_budget + 1))
     log "autofork skipped sid=$sid (per-run budget $IDLE_HANDOFF_AUTOFORK_MAX_PER_RUN reached)"
@@ -317,54 +428,68 @@ for project_dir in "$PROJECTS_DIR"/*/; do
   cwd_fork_count=$(fork_count_24h_for_cwd "$candidate_cwd")
   if [[ "$cwd_fork_count" -ge "$IDLE_HANDOFF_AUTOFORK_MAX_PER_CWD_24H" ]]; then
     count_skipped_fork_budget=$((count_skipped_fork_budget + 1))
-    log "autofork skipped sid=$sid cwd=$candidate_cwd (per-cwd 24h budget reached: $cwd_fork_count/$IDLE_HANDOFF_AUTOFORK_MAX_PER_CWD_24H)"
+    log "autofork skipped sid=$sid cwd=$candidate_cwd (per-cwd 24h budget $cwd_fork_count/$IDLE_HANDOFF_AUTOFORK_MAX_PER_CWD_24H)"
     continue
   fi
 
-  # ---- ## Next parse (LOW-11: anchor exactly) ---
+  # ---- ## Next parse ---
   next_body=$(awk '
     /^## Next[[:space:]]*$/ {cap=1; next}
     /^## / {cap=0}
     cap && NF {print}
-  ' "$mission_path" 2>/dev/null | sed 's/^[[:space:]]*//' | grep -v '^$')
+  ' "$mission_path" 2>/dev/null)
 
-  if [[ -z "$next_body" ]] || echo "$next_body" | grep -qxF '(none)'; then
+  # Empty-Next sentinel accepts common variants:
+  #   `(none)`  (bare, per prompt)
+  #   `- (none)` / `* (none)` / `+ (none)` (bullet-prefixed, common model habit)
+  # sed strips leading bullet marker + whitespace before compare.
+  stripped_next=$(printf '%s\n' "$next_body" | \
+    sed -e 's/^[[:space:]]*[-*+][[:space:]]*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | \
+    grep -v '^$')
+
+  if [[ -z "$stripped_next" ]] || echo "$stripped_next" | grep -qxF '(none)'; then
     count_skipped_no_next=$((count_skipped_no_next + 1))
     log "autofork skipped sid=$sid (## Next is empty or (none))"
     continue
   fi
 
-  # ---- Staleness gate (advisor MEDIUM-6) ---
-  # Skip fork if the world has moved since transcript was written. Mission
-  # mode wrote just now against the transcript's frozen view; if git HEAD
-  # or tracked-file mtimes have advanced beyond transcript_mtime, the Next
-  # items may be obsolete. Skip conservatively.
+  # ---- Staleness gate ---
   if is_stale_since_transcript "$candidate_cwd" "$mtime"; then
     count_skipped_git_stale=$((count_skipped_git_stale + 1))
-    log "autofork skipped sid=$sid cwd=$candidate_cwd (stale: git changed since transcript)"
+    log "autofork skipped sid=$sid cwd=$candidate_cwd (world changed / non-git / dirty)"
+    continue
+  fi
+
+  # ---- Rescan live cwds (advisor MEDIUM: initial scan may be minutes stale) ---
+  # Mission-write can burn ~90s; a claude pane opened in this cwd during
+  # that window would race with the autofork spawn. Rescan and re-check.
+  scan_live_cwds
+  if is_live_project "$candidate_cwd"; then
+    count_skipped_live_rescan=$((count_skipped_live_rescan + 1))
+    log "autofork skipped sid=$sid cwd=$candidate_cwd (live pane appeared during mission write)"
     continue
   fi
 
   # ---- Auto-fork execution ---
-  # Fresh `claude -p` reading the mission.md file, NOT --resume of the
-  # >55min-idle parent. Parent's cache is dead by now (1h ephemeral TTL) —
-  # a resume would pay full cache_write on the entire context (~$3-10),
-  # which is the exact event this system exists to prevent.
-  #
-  # Fresh session pays cache_write on the small mission.md prefix only
-  # (~$0.13 for a typical 5-10 KB mission).
+  # Prompt is interpolated with the actual max-turns env var so the CLI --max
+  # bound and the prompt-side "cap yourself at N" instruction can never
+  # silently drift apart (advisor MEDIUM: sharp-edges).
   autofork_log="$IDLE_HANDOFF_LOG_DIR/${sid}.$(date +%s).autofork.log"
-  autofork_prompt=$(cat <<'PROMPT'
+  autofork_prompt=$(cat <<PROMPT
 Read tasks/mission.md and do the top item under ## Next.
 
 Rules for this fork:
-- Cap yourself at 15 turns total. If the top Next item is bigger, do what
-  fits and stop cleanly (no premature deferral, no "shall I continue?").
+- Cap yourself at ${IDLE_HANDOFF_AUTOFORK_MAX_TURNS} turns total. If the top
+  Next item is bigger, do what fits and stop cleanly (no premature deferral,
+  no "shall I continue?").
 - If the top Next item completes cleanly and turns remain, move to the
   second Next item and repeat.
 - Before you stop, update tasks/mission.md so the next resume picks up
   where you left off (move completed items from Next to Done, keep
   remaining Next items, add any Blocked/Open questions you found).
+  Preserve the leading \`<!-- written-against: sha=... ts=... -->\` line
+  if present; do not rewrite it — the outer system uses it for staleness
+  detection.
 - If the mission.md description of ## State on disk is now wrong (files
   that were "clean" are dirty, HEAD has moved, etc.), STOP without
   executing Next items — update mission.md to reflect current state and
@@ -372,18 +497,23 @@ Rules for this fork:
 PROMPT
   )
 
-  log "AUTOFORK sid=$sid cwd=$candidate_cwd model=$IDLE_HANDOFF_AUTOFORK_MODEL cwd_forks_24h=$cwd_fork_count"
+  log "AUTOFORK sid=$sid cwd=$candidate_cwd model=$IDLE_HANDOFF_AUTOFORK_MODEL max_turns=$IDLE_HANDOFF_AUTOFORK_MAX_TURNS cwd_forks_24h=$cwd_fork_count"
+
+  # Detach cleanly. Close fd 8 in the child (`8>&-`) so the flock is NOT
+  # inherited — else the lock is held for the entire opus fork lifetime and
+  # every subsequent timer fire hits "another handoff run in progress".
+  # setsid + nohup daemonizes; </dev/null detaches stdin.
   ( cd "$candidate_cwd" && \
     setsid nohup claude -p \
       --model "$IDLE_HANDOFF_AUTOFORK_MODEL" \
       --max-turns "$IDLE_HANDOFF_AUTOFORK_MAX_TURNS" \
       --permission-mode acceptEdits \
       "$autofork_prompt" \
-      >>"$autofork_log" 2>&1 &
+      >>"$autofork_log" 2>&1 8>&- &
   ) </dev/null
   record_fork "$candidate_cwd"
   forks_this_run=$((forks_this_run + 1))
   count_forked=$((count_forked + 1))
 done
 
-log "seen=$count_seen wrote=$count_wrote forked=$count_forked skipped(live=$count_skipped_live sdk-cli=$count_skipped_sdk_cli short=$count_skipped_short backoff=$count_skipped_backoff fresh=$count_skipped_fresh_mission no_cwd=$count_skipped_no_cwd stale=$count_skipped_stale observer=$count_skipped_observer no_next=$count_skipped_no_next ralph=$count_skipped_ralph git_stale=$count_skipped_git_stale fork_budget=$count_skipped_fork_budget)"
+log "seen=$count_seen wrote=$count_wrote forked=$count_forked skipped(live=$count_skipped_live live_rescan=$count_skipped_live_rescan sdk-cli=$count_skipped_sdk_cli unknown-origin=$count_skipped_unknown_origin short=$count_skipped_short backoff=$count_skipped_backoff fresh=$count_skipped_fresh_mission no_cwd=$count_skipped_no_cwd stale=$count_skipped_stale observer=$count_skipped_observer no_next=$count_skipped_no_next ralph=$count_skipped_ralph git_stale=$count_skipped_git_stale fork_budget=$count_skipped_fork_budget mission_err=$count_mission_status_error)"

@@ -638,13 +638,20 @@ run_worker() {
     fi
     local mission_usage
     mission_usage=$(jq -c '.usage // {}' <<<"$claude_json" 2>/dev/null || echo '{}')
+    # NOTE: intentionally NOT emitting final_complete:true here. Mission
+    # mode is expected to run repeatedly for the same SID (e.g. idle-handoff
+    # timer refreshes mission.md every N minutes over a long-idle session).
+    # is_already_complete keys on final_complete; latching it here would
+    # make the first successful mission run permanently poison all future
+    # mission runs for that SID until SessionEnd cleans state. Advisor
+    # HIGH-B, ARFTL round 1.
     write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "complete" \
       "$(jq -cn --arg tp "$TRANSCRIPT_PATH" --arg event "$HOOK_EVENT" --arg parent "$PARENT_SID" \
           --arg path "$mission_path" --argjson usage "$mission_usage" \
           --argjson bytes "${#inner}" \
           '{source_transcript:$tp,hook_event_name:$event,
             parent_session_id:(if $parent == "" then null else $parent end),
-            artifact:$path,bytes:$bytes,usage:$usage,final_complete:true}')"
+            artifact:$path,bytes:$bytes,usage:$usage}')"
     return 0
   fi
 

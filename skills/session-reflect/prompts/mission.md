@@ -42,18 +42,22 @@ session, so make it good enough to actually rely on.
 
 ## Verifying State on disk
 
-Before writing the ## State on disk section, VERIFY against reality: run
-`git status --porcelain` and `ls-files --others --exclude-standard`, and
-list what you observe now. Do NOT copy state descriptions from earlier
-in the conversation — a lot may have changed since. If you cannot run
-those commands (no shell access in this session), say so explicitly in
-the section rather than fabricating.
+You are being run with tools disabled — no shell, no file reads, no git
+commands. Everything in ## State on disk must be derived from what the
+resumed transcript already contains. Do NOT fabricate: if the transcript
+did not clearly establish that a file is dirty / committed / untracked,
+either (a) omit it from State on disk, or (b) mark it explicitly as
+`(inferred — verify)`. Silence is safer than a wrong claim.
 
 The consumer of this file (auto-fork, human resumer) will refuse to
 execute Next items when State on disk contradicts the current working
 tree. A stale/wrong State section causes safe skips (loss of work
 opportunity); a stale/wrong Done section causes double-execution (loss
 of correctness). Correctness beats coverage — under-report if unsure.
+The outer system also stamps `<!-- written-against: sha=<X> ts=<N> -->`
+at the top of tasks/mission.md; do not remove or modify it. It is what
+the auto-fork gate uses to detect whether the world has moved since this
+mission was written.
 
 ## Rules
 
