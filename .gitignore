@@ -118,3 +118,52 @@ loops/
 # Prompt-log JSONL (populated by hooks/prompt-log.py) — high-churn,
 # session-local. Skill /prompt-review-weekly clusters into backlog.
 automation-review/
+
+# ---------------------------------------------------------------------
+# Bulk data / pre-redaction artefacts — never commit
+# ---------------------------------------------------------------------
+# Everything below is pattern-based on purpose: the goal is to block the
+# NEXT file of this shape, not just the one that prompted the rule. Once
+# bulk or unscrubbed data is pushed, removing it needs a history rewrite.
+#
+# Live backups now sit outside the repo entirely:
+#   ~/.local/share/claude-transcript-backups/
+
+# Pre-redaction / pre-migration copies. `.orig` also catches merge-conflict
+# leftovers; `.pre-*` catches any "snapshot before I mutate this" file.
+*.orig
+*.pre-scrub
+*.pre-*
+!.pre-commit-config.yaml
+
+# Backup directories of any name (transcript-backups/, foo-backups/, ...)
+*-backups/
+*.backup
+
+# SQLite caches/DBs. These are runtime state or bulk corpora, never source.
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# JSONL is the house format for transcripts, observation logs, harvested
+# datasets and label files — all runtime or bulk, none of it source. No
+# .jsonl file has ever been tracked here. If one genuinely belongs in the
+# repo, add it deliberately: git add -f <path>
+*.jsonl
+*.jsonl.gz
+*.ndjson
+
+# Compressed archives — nothing in a config repo should ship as a tarball.
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+
+# Lockfiles are per-run state. Generalises the one-off .settings.lock and
+# scheduled_tasks.lock entries above.
+*.lock
+
+# Auto-sync runtime log (see sync-agent.sh)
+sync.log
