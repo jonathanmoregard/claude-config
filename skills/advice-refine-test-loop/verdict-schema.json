@@ -18,9 +18,13 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["severity", "file", "line", "rationale"],
+        "required": ["severity", "autofix_class", "file", "line", "rationale"],
         "properties": {
           "severity": { "enum": ["BLOCKER", "HIGH", "MEDIUM", "LOW"] },
+          "autofix_class": {
+            "enum": ["safe_auto", "gated_auto", "manual", "advisory"],
+            "description": "Apply-authority — independent of severity. safe_auto = trivially reversible, no design call (e.g. rename an unused var). gated_auto = mechanically safe but wants human ack before applying (e.g. rename that ripples). manual = needs human implementation. advisory = surface only, no action expected."
+          },
           "file": { "type": "string", "description": "Absolute path" },
           "line": {
             "type": "integer",
