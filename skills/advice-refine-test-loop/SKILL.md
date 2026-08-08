@@ -14,7 +14,7 @@ The loop catches all four by staging the review:
 - **Phase 3 (adversarial)** is a single Opus dispatch framed as "assume the prior PASS was wrong, find why" — catches the confirmation-bias class both prior phases share.
 - **Phase 4 (taste)** applies to UI work only, after all correctness phases pass. Split into 4a (Opus defect + taste critics, existing) and 4b (Codex vision-taste on regenerated shots, second vendor).
 
-Every phase uses a **structured JSON verdict schema** (`verdict-schema.json`) so stop conditions are parseable, not vibes. Between phases, a **consolidator sub-loop** auto-fixes LOW findings without spending another advisor round.
+Every phase uses a **structured JSON verdict schema** (`verdict-schema.json`) so stop conditions are parseable, not vibes. Between phases, a **consolidator sub-loop** auto-fixes safe_auto LOW findings (severity × autofix_class AND-gate; see below).
 
 ## The Phases
 
@@ -59,7 +59,12 @@ Each Phase 1/2 round follows the same shape:
    Any of: unparseable JSON, missing `.verdict`, or verdict/findings mismatch → the round FAILED. Re-dispatch once with an explicit "output valid JSON matching verdict-schema.json AND ensure verdict matches findings (PASS = empty findings; PASS_WITH_FIXES = no BLOCKER/HIGH; BLOCKS = ≥1 BLOCKER/HIGH)" reminder.
 
    Second failure PAUSEs the loop (interactive: prompt user; unattended: append to `pending_for_human.md` and exit `pending-human`). NEVER treat unparseable output or a mismatched verdict as advance-worthy — an incoherent advisor response has produced zero trustworthy coverage.
-4.5. VALIDATE: dispatch a fresh Opus subagent (`Agent(subagent_type="advisor", ...)`) with ONLY the findings JSON + absolute paths of files referenced by findings. Prompt: "For each finding, read the file at the given line. Emit `{finding_id, verified, unverifiable, note}`. `verified=true` iff the described condition is empirically present at that location. `unverifiable=true` for subjective findings (taste, 'could be simpler', style preferences) where no empirical check applies. `verified=false` = drop from report; `unverifiable=true` = keep with warning tag." Drop `verified=false` findings before proceeding to step 5. Unverifiable findings continue to step 5 as-is (repro is still attempted; often it will confirm nothing).
+4.5. VALIDATE: dispatch a fresh Opus subagent (`Agent(subagent_type="advisor", ...)`) with ONLY the findings JSON + absolute paths of files referenced by findings. Prompt: "For each finding in the input array, read the file at the given line. Emit a JSON array `[{index, verified, unverifiable_confirmed, note}]` where `index` is the 0-based position of the finding in the input array. `verified=true` iff the described condition is empirically present at that location. `unverifiable_confirmed=true` when the finding was tagged `unverifiable: true` by the parent advisor AND you agree no empirical check applies (subjective — taste, 'could be simpler', style preferences). `verified=false` = parent drops `findings[index]` from the report; `unverifiable_confirmed=true` is informational (parent already knows the tag; you're confirming it can't be checked) and the finding is kept as-is." Parent drops `findings[i]` where the validator returned `verified: false` for that index before proceeding to step 5. Unverifiable findings (whether or not the validator confirmed) continue to step 5 as-is — repro is still attempted; often it will confirm nothing, which is fine.
+
+   **Failure-mode handling (degrade-to-pre-4.5 on any failure).** Step 4.5 is an optimization, not a correctness gate — do NOT retry, do NOT PAUSE the loop:
+   - Wrap the validator dispatch with `timeout 180s` (bounded — validator is a cheap read-only pass).
+   - If the validator returns quota-exhausted, times out, produces malformed JSON, or emits a verdict-missing / unparseable result on the FIRST try: skip step 4.5 for this round entirely, log `"validator unavailable: <cause>"` in the round's commit message, and proceed to step 5 with ALL findings intact (no drops, no tags — parent behaves as if step 4.5 did not exist).
+   - This is safe by construction: the worst case is repro effort in step 5 on findings that might have been hallucinations; the benefit is no PAUSE storm from an ancillary check. Phase 2's PAUSE ladder exists because Codex is the cross-vendor coverage lane — irreplaceable. Step 4.5's validator is one advisor of many; skipping it once is cheaper than pausing the loop.
 5. REPRODUCE each BLOCKER/HIGH finding before fixing — advisors hallucinate
 6. FIX by severity, re-verify after each
 7. COMMIT the round (per-round granularity, not a batch)
@@ -84,7 +89,7 @@ Both lanes emit JSON matching `~/.claude/skills/advice-refine-test-loop/verdict-
 **Severity × autofix_class are orthogonal axes.** `severity` is urgency (how bad if this ships); `autofix_class` is apply-authority (can this be applied without a human call). Conflating them ships wrong fixes: a `severity=LOW` rename that ripples across 40 files is NOT `safe_auto` — it's `gated_auto` (mechanically fine but wants human ack) or `manual` (needs human implementation). Consolidator gates on the AND of both axes (see below); severity alone is not license to auto-apply. `advisory` findings are surface-only and never auto-fixed regardless of severity.
 
 - **PASS** = ZERO findings (empty `findings` array). Advance immediately, no consolidator needed.
-- **PASS_WITH_FIXES** = at least one MEDIUM or LOW finding, but no BLOCKER/HIGH. Consolidator runs before phase advance (auto-fixes LOWs; MEDIUMs surface in the round's commit message for the human to triage but do NOT block advance). If a MEDIUM ought to block, it should have been a HIGH — trust the advisor's severity.
+- **PASS_WITH_FIXES** = at least one MEDIUM or LOW finding, but no BLOCKER/HIGH. Consolidator runs before phase advance (auto-fixes `severity=LOW AND autofix_class=safe_auto` only; other LOWs surface alongside MEDIUMs in the round's commit message for the human to triage but do NOT block advance). If a MEDIUM ought to block, it should have been a HIGH — trust the advisor's severity.
 - **BLOCKS** = ≥1 BLOCKER or HIGH; next round required.
 
 The advisor MUST NOT emit `PASS` with a non-empty findings array — that combination is unreachable in the state machine. LOW-only remainders are `PASS_WITH_FIXES`.
@@ -455,7 +460,7 @@ DiffSpot ranks Gemini (2.5 Pro / 3.x Pro) as the strongest visual perceiver (47.
 | Phase | Vendor | Reviewer role | Combines with | Skip when |
 |---|---|---|---|---|
 | 1 | Anthropic (Opus + specialists) | Broad correctness + narrow security/API passes | Own phase output only | Never; foundation phase |
-| 4.5 (in-round) | Anthropic (Opus, validator) | Re-verify findings against actual file state; drop `verified=false`, tag `unverifiable=true` | Feeds into step 5 (reproduce) | Never; cheap and catches hallucinated findings |
+| 4.5 (in-round) | Anthropic (Opus, validator) | Re-verify findings against actual file state; array-index correlation `[{index, verified, unverifiable_confirmed, note}]`; parent drops `findings[i]` on `verified=false`; `unverifiable_confirmed` informational | Feeds into step 5 (reproduce) | On any validator failure (timeout/quota/malformed JSON) skip this round and degrade to pre-4.5 behavior — never retry, never PAUSE |
 | 2 | OpenAI (Codex / GPT-5.5) | Cross-vendor correctness on Opus-clean state | Phase 1 fix history carried in prompt | Never; PAUSE on quota, don't silently skip |
 | 3 | Anthropic (Opus, adversarial) | "Prior PASS was wrong — find why" | Findings loop back to Phase 1 | Never; one shot, cheap |
 | 4a | Anthropic (Opus x2 — defect + taste critics) | UI defect + house-style critique | Own phase output only | Non-UI diffs |
