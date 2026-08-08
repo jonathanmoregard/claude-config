@@ -1,0 +1,51 @@
+{
+  "_comment": [
+    "Reference patch for ~/.claude/settings.json — session-reflect hook wiring.",
+    "DO NOT overwrite settings.json with this file. Merge the `env` and `hooks`",
+    "keys into your existing settings.json (jq -s '.[0] * .[1]' is safe).",
+    "Orchestrator is responsible for the actual merge; this file is documentation-in-JSON.",
+    "",
+    "Provides:",
+    "  - env.CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS = 90000  (bounded shutdown wait)",
+    "  - hooks.PreCompact   -> reflect.sh precompact   (synchronous, 60s cap)",
+    "  - hooks.SessionEnd   -> reflect.sh sessionend   (detached, non-blocking)",
+    "  - hooks.SubagentStop -> reflect.sh subagentstop (detached, non-blocking)",
+    "",
+    "See skills/session-reflect/README.md for env vars and artifact layout."
+  ],
+  "env": {
+    "CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS": "90000"
+  },
+  "hooks": {
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/skills/session-reflect/reflect.sh precompact"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/skills/session-reflect/reflect.sh sessionend"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/skills/session-reflect/reflect.sh subagentstop"
+          }
+        ]
+      }
+    ]
+  }
+}
