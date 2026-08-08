@@ -1,7 +1,9 @@
 # session-reflect
 
 **Requires:** Linux + GNU coreutils (`date -d`, `mktemp` suffix-after-X's,
-`stat -c`). Dispatcher fails fast with exit 2 on non-Linux.
+`stat -c`, `sha256sum`), plus `jq`, `flock`, `timeout`, `setsid`, and the
+`claude` CLI (Anthropic Claude Code) on `PATH`. Dispatcher fails fast with
+exit 2 on non-Linux.
 
 Session-scoped self-reflection artifacts for Claude Code, produced from the
 `PreCompact`, `SessionEnd`, and `SubagentStop` hooks. Each reflection is

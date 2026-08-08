@@ -70,30 +70,35 @@ reflect_now() {
 
 # --- Path layout -------------------------------------------------------------
 # paths_for_session <sid> [parent_sid]
-# Emits (one per line):
-#   session_dir=<abs>
-#   final_path=<abs>
-#   manifest_path=<abs>
-#   checkpoint_dir=<abs>
-#   subagent_dir=<abs>            (only when parent_sid given)
+# Emits (one per line), values SHELL-QUOTED via printf %q so callers using
+# `eval` are safe against whitespace or shell metacharacters in REFLECT_ROOT:
+#   session_dir=<quoted-abs>
+#   final_path=<quoted-abs>
+#   manifest_path=<quoted-abs>
+#   checkpoint_dir=<quoted-abs>
+#   subagent_dir=<quoted-abs>     (only when parent_sid given)
 #
 # When parent_sid is set, the session is a subagent of that parent and paths
 # nest under sessions/<parent>/subagents/<sid>/. Otherwise paths live at
 # sessions/<sid>/.
+#
+# `sid` and `parent` are validated by is_valid_sid at every call site, so the
+# only path segment that can carry surprise characters is REFLECT_ROOT itself
+# (user-set env). %q makes eval unambiguously safe rather than papering over it.
 paths_for_session() {
   local sid="$1"
   local parent="${2:-}"
   local base
   if [[ -n "$parent" && "$parent" != "$sid" ]]; then
     base="$REFLECT_ROOT/sessions/$parent/subagents/$sid"
-    printf 'subagent_dir=%s\n' "$REFLECT_ROOT/sessions/$parent/subagents"
+    printf 'subagent_dir=%q\n' "$REFLECT_ROOT/sessions/$parent/subagents"
   else
     base="$REFLECT_ROOT/sessions/$sid"
   fi
-  printf 'session_dir=%s\n' "$base"
-  printf 'final_path=%s\n'   "$base/final.json"
-  printf 'manifest_path=%s\n' "$base/manifest.json"
-  printf 'checkpoint_dir=%s\n' "$base/checkpoints"
+  printf 'session_dir=%q\n'    "$base"
+  printf 'final_path=%q\n'     "$base/final.json"
+  printf 'manifest_path=%q\n'  "$base/manifest.json"
+  printf 'checkpoint_dir=%q\n' "$base/checkpoints"
 }
 
 # --- Directory setup ---------------------------------------------------------
