@@ -203,6 +203,72 @@ fi
 info "two sequential PreCompacts wrote 2 checkpoints, final_complete stayed false"
 
 # ============================================================================
+# TEST 3c: single oversized checkpoint gets per-file truncated
+# ============================================================================
+# The sessionend prompt-assembly loop always includes at least one
+# checkpoint. Without a per-file cap, a single 500KB checkpoint would blow
+# the total budget on its own. Fix: each checkpoint truncated at
+# cp_budget_bytes/2 with a "[Note: this checkpoint truncated at N bytes.]"
+# prefix. This test drops a giant checkpoint on disk and asserts the
+# assembled prompt (captured via a recording stub that echoes stdin size to
+# a sidecar) stays under cp_budget_bytes total.
+echo "TEST 3c: single oversized checkpoint truncated to per-file cap"
+BIG_SID="test-sid-bigcp"
+mkdir -p "$REFLECT_ROOT/sessions/$BIG_SID/checkpoints"
+# 40 KB checkpoint (>> cp_per_file_cap of 8 KB). Valid JSON so the prompt
+# still parses if the model sees it; the stub ignores the body anyway.
+python3 -c "
+import json
+big = {'patterns': ['x' * 40000], 'discoveries': [], 'turning_points': [], 'digressions': [], 'obstacles_to_autonomy': []}
+print(json.dumps(big))
+" > "$REFLECT_ROOT/sessions/$BIG_SID/checkpoints/$(date -u +%s%N)-XXXX-precompact.json"
+
+# Swap the stub for a recording one that captures the prompt size + content.
+PROMPT_CAPTURE="$STUB_SCRATCH/last-prompt-bytes"
+PROMPT_BODY="$STUB_SCRATCH/last-prompt-body"
+: > "$PROMPT_CAPTURE"
+: > "$PROMPT_BODY"
+cat >"$STUB_SCRATCH/claude" <<STUB
+#!/usr/bin/env bash
+# Recording stub — writes stdin to disk so the test can inspect it.
+body="\$(cat)"
+printf '%s' "\$body" > "$PROMPT_BODY"
+printf '%s' "\${#body}" > "$PROMPT_CAPTURE"
+cat <<'JSON'
+{"type":"result","result":"{\"patterns\":[\"post-truncation\"],\"discoveries\":[],\"turning_points\":[],\"digressions\":[],\"obstacles_to_autonomy\":[]}","usage":{}}
+JSON
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+BIG_PAYLOAD="$(fake_payload SessionEnd "$BIG_SID")"
+echo "$BIG_PAYLOAD" | bash "$REFLECT_SH" sessionend >/dev/null
+wait_for_complete "$REFLECT_ROOT/sessions/$BIG_SID/manifest.json" 10 \
+  || fail "big-checkpoint sessionend never completed"
+
+# Prompt size must be well under 40KB (the raw checkpoint) — with the
+# 8KB per-file cap plus ~2KB prompt template, we expect ~11KB max.
+PROMPT_BYTES=$(cat "$PROMPT_CAPTURE")
+(( PROMPT_BYTES < 16384 )) \
+  || fail "assembled prompt is ${PROMPT_BYTES} bytes; expected < 16384 (per-file cap not enforced)"
+(( PROMPT_BYTES > 500 )) \
+  || fail "assembled prompt suspiciously small (${PROMPT_BYTES} bytes) — cap likely dropped body entirely"
+
+# Truncation-announcement string must be present in the prompt.
+grep -q 'this checkpoint truncated at' "$PROMPT_BODY" \
+  || fail "expected truncation notice in prompt body"
+info "single oversized checkpoint capped (prompt=${PROMPT_BYTES} bytes, notice present)"
+
+# Restore the canonical stub for downstream tests.
+cat >"$STUB_SCRATCH/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null || true
+cat <<'JSON'
+{"type":"result","result":"{\"patterns\":[\"stubbed pattern\"],\"discoveries\":[],\"turning_points\":[],\"digressions\":[],\"obstacles_to_autonomy\":[]}","usage":{"cache_read_input_tokens":100,"cache_creation_input_tokens":10,"input_tokens":5,"output_tokens":50}}
+JSON
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+# ============================================================================
 # TEST 4: subagentstop lands under parent/subagents/<sid>/
 # ============================================================================
 echo "TEST 4: subagentstop artifact placement"
@@ -261,7 +327,8 @@ for bad in "${BAD_SIDS[@]}"; do
 done
 # Ensure no session dir was created for any of these bad SIDs.
 if find "$REFLECT_ROOT/sessions" -mindepth 1 -maxdepth 1 -type d \
-     ! -name '_malformed' ! -name "$SID" ! -name "$PC_SID" ! -name "$PC2_SID" ! -name "$PARENT_SID" \
+     ! -name '_malformed' ! -name "$SID" ! -name "$PC_SID" ! -name "$PC2_SID" \
+     ! -name "$BIG_SID" ! -name "$PARENT_SID" \
      | grep -q .; then
   fail "path traversal created unexpected session dir(s)"
 fi

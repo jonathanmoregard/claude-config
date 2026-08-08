@@ -342,22 +342,49 @@ run_worker() {
         [[ -n "$f" ]] && cp_files_arr+=( "$f" )
       done < <(find "$checkpoint_dir" -type f -name '*.json' 2>/dev/null | sort)
 
+      # HARD PER-CHECKPOINT CAP: no single checkpoint may exceed
+      # cp_budget_bytes/2. A malformed / seeded / runaway checkpoint would
+      # otherwise blow the total cap on its own (the old "always take at
+      # least one" clause let a single 500KB file through). Anything past
+      # this per-file cap gets truncated with an inline note so the model
+      # knows the tail is missing but still sees the head.
+      local -r cp_per_file_cap=$(( cp_budget_bytes / 2 ))
+      # Read a checkpoint file's contents, truncating with an announcement
+      # if the raw body exceeds cp_per_file_cap. Emits to stdout.
+      _read_checkpoint_capped() {
+        local path="$1" body
+        body="$(cat "$path" 2>/dev/null || true)"
+        local body_bytes="${#body}"
+        if (( body_bytes > cp_per_file_cap )); then
+          printf '[Note: this checkpoint truncated at %d bytes (was %d).]\n' \
+            "$cp_per_file_cap" "$body_bytes"
+          printf '%s' "${body:0:$cp_per_file_cap}"
+        else
+          printf '%s' "$body"
+        fi
+      }
+
       local n_total="${#cp_files_arr[@]}"
       if (( n_total > 0 )); then
         # Walk NEWEST-first so a byte-cap elides oldest first (most recent
         # signal survives). Collect kept indices, then emit oldest-first.
+        # Each checkpoint's contribution is already per-file-capped, so the
+        # entry_bytes measurement can never balloon past cp_per_file_cap +
+        # header — the "always take at least one" clause is therefore safe.
         local -a kept=()
-        local used=0 kept_count=0 i entry entry_bytes
+        local -a kept_bodies=()  # cache truncated bodies to avoid re-read
+        local used=0 kept_count=0 i entry entry_bytes body
         for (( i = n_total - 1; i >= 0; i-- )); do
           f="${cp_files_arr[$i]}"
-          entry=$'\n'"--- $(basename "$f") ---"$'\n'"$(cat "$f" 2>/dev/null || true)"$'\n'
+          body="$(_read_checkpoint_capped "$f")"
+          entry=$'\n'"--- $(basename "$f") ---"$'\n'"$body"$'\n'
           entry_bytes="${#entry}"
-          # Always take at least one, even if it's huge (better one large
-          # checkpoint than none). Otherwise stop when adding would exceed cap.
+          # Always take at least one; per-file cap makes that safe now.
           if (( kept_count > 0 && used + entry_bytes > cp_budget_bytes )); then
             break
           fi
-          kept=( "$i" "${kept[@]}" )  # prepend to keep chronological order
+          kept=( "$i" "${kept[@]}" )               # prepend indices
+          kept_bodies=( "$body" "${kept_bodies[@]}" )
           used=$(( used + entry_bytes ))
           kept_count=$(( kept_count + 1 ))
         done
@@ -369,10 +396,12 @@ run_worker() {
           cp_block=""
         fi
         cp_block+="Saved checkpoints (JSON, chronological):"$'\n'
+        local j=0
         for i in "${kept[@]}"; do
           f="${cp_files_arr[$i]}"
           cp_block+=$'\n'"--- $(basename "$f") ---"$'\n'
-          cp_block+="$(cat "$f" 2>/dev/null || true)"$'\n'
+          cp_block+="${kept_bodies[$j]}"$'\n'
+          j=$(( j + 1 ))
         done
       else
         cp_block="(no checkpoints — session ran without compaction)"
