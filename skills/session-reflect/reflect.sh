@@ -665,7 +665,42 @@ run_worker() {
   local tmp
   tmp="$(mktemp -p "$(dirname -- "$out_path")" ".artifact-XXXXXX")"
   printf '%s\n' "$wrapped" > "$tmp"
+
+  # STEP P3R2.1 (MEDIUM): capture mv rc explicitly.
+  #
+  # Previously: `mv "$tmp" "$out_path"` — if this fails (ENOSPC, EXDEV
+  # across-filesystem, EROFS, EDQUOT, permission-flip, etc.), `set -e`
+  # would exit run_worker BEFORE the complete/error write_manifest calls
+  # run. The manifest is stuck at status=started with no forensic
+  # record; the next dispatcher within REFLECT_STALE_STARTED_SECONDS
+  # (default 600s) treats the session as in-flight and silently skips.
+  # Operators see nothing.
+  #
+  # Fix: don't let set -e swallow the failure. Capture rc, then on
+  # failure write an error manifest with reason=mv_failed +
+  # mv_exit_code + target_path, remove the leftover tmp, and exit
+  # non-zero so any parent that DOES check gets a real signal. On
+  # success proceed to the complete write. write_manifest releases the
+  # write-lock inside its own subshell (fd 8) and fd 9 (per-mode
+  # dispatcher lock) is released on process exit — no fd leak.
+  local mv_rc=0
+  set +e
   mv "$tmp" "$out_path"
+  mv_rc=$?
+  set -e
+  if (( mv_rc != 0 )); then
+    rm -f -- "$tmp" 2>/dev/null || true
+    write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "error" \
+      "$(jq -cn --arg tp "$TRANSCRIPT_PATH" --arg event "$HOOK_EVENT" --arg parent "$PARENT_SID" \
+          --arg target "$out_path" \
+          --argjson rc "$mv_rc" \
+          '{source_transcript:$tp,hook_event_name:$event,
+            parent_session_id:(if $parent == "" then null else $parent end),
+            reason:"mv_failed",
+            mv_exit_code:$rc,
+            target_path:$target}')"
+    return "$mv_rc"
+  fi
 
   write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "complete" \
     "$(jq -cn --arg tp "$TRANSCRIPT_PATH" --arg event "$HOOK_EVENT" --arg parent "$PARENT_SID" \
