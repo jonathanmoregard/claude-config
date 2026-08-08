@@ -24,6 +24,13 @@ umask 077
 : "${REFLECT_ROOT:=$HOME/.claude/reflections}"
 : "${REFLECT_MODEL:=haiku}"
 : "${IDLE_HANDOFF_MIN_SECONDS:=$((45*60))}"      # 45 min: start writing mission.md
+# Auto-fork: opt-in per-project. When a session is past MIN idle AND has a
+# fresh mission.md AND the project sets .claude/idle-handoff-autofork.enable,
+# spawn a detached `claude -p --resume --fork-session` that reads mission.md
+# and continues Next-item work in a fresh SID. Old session dies naturally.
+# Skipped unless the mission Next section is non-empty ("(none)" -> skip).
+: "${IDLE_HANDOFF_AUTOFORK_MODEL:=claude-opus-5}"    # more capable than haiku for real work
+: "${IDLE_HANDOFF_AUTOFORK_MAX_TURNS:=15}"           # hard cap; runaway prevention
 # Upper idle bound: sessions idle > MAX are stale-stale (user moved on, days
 # ago). Handing them off wastes an API call and produces notifications for
 # work nobody's returning to. 24h is the default; the cache TTL preemption
@@ -81,10 +88,12 @@ done < <(pgrep -af 'claude --resume' 2>/dev/null | grep -oE '[a-f0-9-]{36}' | so
 # skip them (session ended, no state to preserve).
 count_seen=0
 count_wrote=0
+count_forked=0
 count_skipped_live=0
 count_skipped_short=0
 count_skipped_fresh_mission=0
 count_skipped_no_cwd=0
+count_skipped_no_next=0
 
 count_skipped_stale=0
 count_skipped_observer=0
@@ -178,6 +187,46 @@ for project_dir in "$PROJECTS_DIR"/*/; do
   # Notifications intentionally omitted (user preference, 2026-08-08).
   # The value is the mission.md file on disk, ready when the user chooses
   # to start fresh. Silent operation; grep the log for what fired.
+
+  # ----- auto-fork: opt-in per-project ------------------------------------
+  # Gate: project's .claude/idle-handoff-autofork.enable must exist.
+  # Two extra guards on top of that opt-in:
+  #   1. mission.md must have been successfully written this run (we just did)
+  #   2. mission.md `## Next` section must be non-empty (has an actual next
+  #      item to execute). Open-ended sessions without a queued task should
+  #      NOT auto-continue — they'd grind on stale directions.
+  autofork_flag="$candidate_cwd/.claude/idle-handoff-autofork.enable"
+  [[ -f "$autofork_flag" ]] || continue
+
+  # Extract the ## Next section body. Empty or "(none)" -> nothing to run.
+  next_body=$(awk '
+    /^## Next/{cap=1; next}
+    /^## /{cap=0}
+    cap && NF{print}
+  ' "$mission_path" 2>/dev/null | sed 's/^[[:space:]]*//' | grep -v '^$')
+
+  if [[ -z "$next_body" ]] || echo "$next_body" | grep -qxF '(none)'; then
+    count_skipped_no_next=$((count_skipped_no_next + 1))
+    log "autofork skipped sid=$sid (## Next is empty or (none))"
+    continue
+  fi
+
+  # Detached, capped, model-configurable. Fresh SID keys the new work stream.
+  # Prompt is minimal: read mission.md, execute the Next section's top item.
+  # The forked session runs under the SAME hook config as normal (so its
+  # SessionEnd will fire reflect.sh sessionend, which is fine — one more
+  # reflection artifact for that new SID).
+  autofork_log="$IDLE_HANDOFF_LOG_DIR/${sid}.$(date +%s).autofork.log"
+  log "AUTOFORK sid=$sid model=$IDLE_HANDOFF_AUTOFORK_MODEL next_lines=$(echo "$next_body" | wc -l)"
+  ( cd "$candidate_cwd" && \
+    setsid nohup claude -p --resume "$sid" --fork-session \
+      --model "$IDLE_HANDOFF_AUTOFORK_MODEL" \
+      --max-turns "$IDLE_HANDOFF_AUTOFORK_MAX_TURNS" \
+      --permission-mode acceptEdits \
+      "Read tasks/mission.md and continue with the top item under ## Next. Work in ${IDLE_HANDOFF_AUTOFORK_MAX_TURNS} turns or fewer. If the top Next item completes cleanly, move to the second. Update tasks/mission.md before you stop so the next resume picks up where you left off. Stop cleanly (no premature deferral)." \
+      >>"$autofork_log" 2>&1 &
+  ) </dev/null
+  count_forked=$((count_forked + 1))
 done
 
-log "seen=$count_seen wrote=$count_wrote skipped(live=$count_skipped_live short=$count_skipped_short fresh=$count_skipped_fresh_mission no_cwd=$count_skipped_no_cwd stale=$count_skipped_stale observer=$count_skipped_observer)"
+log "seen=$count_seen wrote=$count_wrote forked=$count_forked skipped(live=$count_skipped_live short=$count_skipped_short fresh=$count_skipped_fresh_mission no_cwd=$count_skipped_no_cwd stale=$count_skipped_stale observer=$count_skipped_observer no_next=$count_skipped_no_next)"
