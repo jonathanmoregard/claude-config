@@ -1,0 +1,67 @@
+{
+  "_comment": [
+    "Reference patch for ~/.claude/settings.json — session-reflect hook wiring.",
+    "",
+    "DO NOT overwrite settings.json with this file, and DO NOT `jq -s '.[0] * .[1]'`",
+    "it either — the `*` merge operator REPLACES existing arrays rather than",
+    "concatenating them. If you already have PreCompact/SessionEnd/SubagentStop",
+    "entries in settings.json, that merge would drop them.",
+    "",
+    "Correct merge (append-array), keeping any pre-existing hook entries.",
+    "IMPORTANT: env merge is patch-then-user so any pre-existing user env value",
+    "(e.g. a custom CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS) OVERRIDES the patch",
+    "default. Before running this, `jq '.env' ~/.claude/settings.json` to check",
+    "what user env you already have — a stale timeout there will silently keep",
+    "the patch's 90000 out.",
+    "  jq --slurpfile p settings-patch.json '",
+    "    .env = (($p[0].env // {}) + (.env // {})) |",
+    "    .hooks = (($p[0].hooks // {}) as $ph |",
+    "      (.hooks // {}) | to_entries as $existing |",
+    "      ($existing + ($ph | to_entries)) | group_by(.key) | map({key: .[0].key, value: (map(.value) | add)}) | from_entries)",
+    "  ' ~/.claude/settings.json > ~/.claude/settings.json.new",
+    "  # inspect the diff, then: mv ~/.claude/settings.json.new ~/.claude/settings.json",
+    "",
+    "Provides:",
+    "  - env.CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS = 90000  (bounded shutdown wait)",
+    "  - hooks.PreCompact   -> reflect.sh precompact   (synchronous, 60s cap)",
+    "  - hooks.SessionEnd   -> reflect.sh sessionend   (detached, non-blocking)",
+    "  - hooks.SubagentStop -> reflect.sh subagentstop (detached, non-blocking)",
+    "",
+    "See skills/session-reflect/README.md for env vars and artifact layout."
+  ],
+  "env": {
+    "CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS": "90000"
+  },
+  "hooks": {
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/skills/session-reflect/reflect.sh precompact"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/skills/session-reflect/reflect.sh sessionend"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/skills/session-reflect/reflect.sh subagentstop"
+          }
+        ]
+      }
+    ]
+  }
+}

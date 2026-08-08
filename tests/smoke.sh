@@ -1,0 +1,1100 @@
+#!/usr/bin/env bash
+# Offline smoke test for session-reflect. Uses a stub `claude` on PATH; no
+# live API calls, no network. Exit 0 on success, 1 on any assertion failure.
+#
+# Env overrides:
+#   REFLECT_ROOT     - artifact root (default: mktemp)
+#   REFLECT_DEBUG=1  - keep temp dirs and print paths
+set -u
+set -o pipefail
+
+WORKTREE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+SKILL_DIR="$WORKTREE/skills/session-reflect"
+STUBS_DIR="$WORKTREE/tests/stubs"
+REFLECT_SH="$SKILL_DIR/reflect.sh"
+
+fail() { echo "FAIL: $*" >&2; exit 1; }
+info() { echo "  -> $*"; }
+
+# --- Stub claude on PATH -----------------------------------------------------
+# Emits a canonical Claude Code -p JSON envelope regardless of input.
+# We drop the stub into a scratch dir on PATH so we can rewrite it per-test
+# without dirtying the checked-in tests/stubs/claude.
+STUB_SCRATCH="$(mktemp -d -t reflect-stub-XXXXXX)"
+cat >"$STUB_SCRATCH/claude" <<'STUB'
+#!/usr/bin/env bash
+# Test stub: mimics `claude -p --output-format json` output shape.
+# Ignores args + stdin, emits a fixed reflection envelope.
+cat >/dev/null || true  # drain stdin
+cat <<'JSON'
+{"type":"result","result":"{\"patterns\":[\"stubbed pattern\"],\"discoveries\":[],\"turning_points\":[],\"digressions\":[],\"obstacles_to_autonomy\":[]}","usage":{"cache_read_input_tokens":100,"cache_creation_input_tokens":10,"input_tokens":5,"output_tokens":50}}
+JSON
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+# Keep the checked-in tests/stubs/claude in sync so repo tree stays clean if
+# someone runs it directly, but tests use the scratch stub for mutation.
+mkdir -p "$STUBS_DIR"
+cp "$STUB_SCRATCH/claude" "$STUBS_DIR/claude"
+
+export PATH="$STUB_SCRATCH:$PATH"
+
+# --- Isolated artifact root --------------------------------------------------
+REFLECT_ROOT="${REFLECT_ROOT:-$(mktemp -d -t reflect-smoke-XXXXXX)}"
+export REFLECT_ROOT
+export REFLECT_MODEL="stub-model"
+# Force is off; idempotency test relies on it being unset.
+unset REFLECT_FORCE
+
+if [[ "${REFLECT_DEBUG:-}" == "1" ]]; then
+  echo "REFLECT_ROOT=$REFLECT_ROOT" >&2
+fi
+
+# --- Fixtures ----------------------------------------------------------------
+TRANSCRIPT="$REFLECT_ROOT/fake-transcript.jsonl"
+cat >"$TRANSCRIPT" <<'JSONL'
+{"type":"user","message":{"role":"user","content":"hello"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}
+JSONL
+
+fake_payload() {
+  # $1=event, $2=session_id, [$3=parent_session_id (env inject)]
+  local event="$1" sid="$2"
+  jq -cn --arg event "$event" --arg sid "$sid" --arg tp "$TRANSCRIPT" --arg cwd "$WORKTREE" \
+    '{session_id:$sid, transcript_path:$tp, hook_event_name:$event, cwd:$cwd}'
+}
+
+wait_for_complete() {
+  # Per-mode schema: check modes.<mode>.final_complete for the given mode
+  # (default: sessionend, the primary "session done" signal).
+  local mpath="$1" timeout="${2:-10}" mode="${3:-sessionend}"
+  local start=$SECONDS
+  while (( SECONDS - start < timeout )); do
+    if [[ -f "$mpath" ]] && \
+       jq -e --arg m "$mode" '.modes[$m].final_complete == true' "$mpath" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  return 1
+}
+
+# ============================================================================
+# TEST 1: sessionend fires-and-forgets, exits fast, writes final artifact
+# ============================================================================
+echo "TEST 1: sessionend detached run"
+SID="test-sid-abc"
+PAYLOAD="$(fake_payload SessionEnd "$SID")"
+
+t0=$(date +%s%N)
+echo "$PAYLOAD" | bash "$REFLECT_SH" sessionend
+rc=$?
+t1=$(date +%s%N)
+elapsed_ms=$(( (t1 - t0) / 1000000 ))
+
+(( rc == 0 )) || fail "reflect.sh sessionend exit=$rc"
+(( elapsed_ms < 3000 )) || fail "sessionend blocked ${elapsed_ms}ms (>= 3000ms)"
+info "sessionend returned in ${elapsed_ms}ms (rc=$rc)"
+
+MANIFEST="$REFLECT_ROOT/sessions/$SID/manifest.json"
+FINAL="$REFLECT_ROOT/sessions/$SID/final.json"
+
+wait_for_complete "$MANIFEST" 10 \
+  || fail "manifest never reached final_complete=true within 10s (path=$MANIFEST)"
+info "manifest complete"
+
+[[ -f "$FINAL" ]] || fail "final.json missing at $FINAL"
+jq -e '.patterns and .discoveries and .turning_points and .digressions and .obstacles_to_autonomy' "$FINAL" >/dev/null \
+  || fail "final.json missing one of the 5 required keys"
+info "final.json schema OK"
+
+# ============================================================================
+# TEST 2: idempotency - rerun does not overwrite
+# ============================================================================
+echo "TEST 2: sessionend idempotency"
+FINAL_MTIME1=$(stat -c '%Y' "$FINAL")
+sleep 1  # ensure mtime granularity
+
+echo "$PAYLOAD" | bash "$REFLECT_SH" sessionend
+rc=$?
+(( rc == 0 )) || fail "rerun exit=$rc"
+
+# Wait a beat for any detached process to (not) run
+sleep 2
+
+FINAL_MTIME2=$(stat -c '%Y' "$FINAL")
+STATUS=$(jq -r '.modes.sessionend.status // ""' "$MANIFEST")
+
+if [[ "$FINAL_MTIME1" == "$FINAL_MTIME2" || "$STATUS" == "skipped_duplicate" ]]; then
+  info "idempotent (mtime unchanged or modes.sessionend.status=skipped_duplicate)"
+else
+  fail "final.json mtime changed and modes.sessionend.status != skipped_duplicate (status=$STATUS)"
+fi
+
+# ============================================================================
+# TEST 3: precompact runs synchronously and writes a checkpoint
+# ============================================================================
+echo "TEST 3: precompact synchronous checkpoint"
+PC_SID="test-sid-precompact"
+PC_PAYLOAD=$(jq -cn --arg sid "$PC_SID" --arg tp "$TRANSCRIPT" --arg cwd "$WORKTREE" \
+  '{session_id:$sid, transcript_path:$tp, hook_event_name:"PreCompact", cwd:$cwd, trigger:"auto", custom_instructions:""}')
+
+echo "$PC_PAYLOAD" | bash "$REFLECT_SH" precompact
+rc=$?
+(( rc == 0 )) || fail "precompact exit=$rc"
+
+PC_MANIFEST="$REFLECT_ROOT/sessions/$PC_SID/manifest.json"
+[[ -f "$PC_MANIFEST" ]] || fail "precompact manifest missing"
+jq -e '.modes.precompact.status == "complete"' "$PC_MANIFEST" >/dev/null \
+  || fail "precompact modes.precompact.status != complete (got: $(jq -r '.modes.precompact.status' "$PC_MANIFEST"))"
+
+# At least one checkpoint file present
+CP_COUNT=$(find "$REFLECT_ROOT/sessions/$PC_SID/checkpoints" -type f -name '*.json' 2>/dev/null | wc -l)
+(( CP_COUNT >= 1 )) || fail "no checkpoint json under sessions/$PC_SID/checkpoints/"
+info "precompact wrote $CP_COUNT checkpoint(s)"
+
+# ============================================================================
+# TEST 3b: two PreCompacts on the same SID must produce two checkpoints
+# ============================================================================
+# Regression: previously, the first PreCompact's completion set
+# final_complete=true on the session manifest. A second PreCompact fire
+# (long sessions compact multiple times) then hit is_already_complete and
+# short-circuited — data loss. Fix: PreCompact skips the idempotency gate
+# and write_manifest never latches final_complete for precompact.
+echo "TEST 3b: repeated PreCompact appends new checkpoint"
+PC2_SID="test-sid-precompact-double"
+PC2_PAYLOAD=$(jq -cn --arg sid "$PC2_SID" --arg tp "$TRANSCRIPT" --arg cwd "$WORKTREE" \
+  '{session_id:$sid, transcript_path:$tp, hook_event_name:"PreCompact", cwd:$cwd, trigger:"auto", custom_instructions:""}')
+
+echo "$PC2_PAYLOAD" | bash "$REFLECT_SH" precompact
+rc=$?
+(( rc == 0 )) || fail "precompact#1 exit=$rc"
+
+# Ensure epoch-ns granularity distinguishes filenames.
+sleep 0.05
+
+echo "$PC2_PAYLOAD" | bash "$REFLECT_SH" precompact
+rc=$?
+(( rc == 0 )) || fail "precompact#2 exit=$rc"
+
+PC2_MANIFEST="$REFLECT_ROOT/sessions/$PC2_SID/manifest.json"
+[[ -f "$PC2_MANIFEST" ]] || fail "double-precompact manifest missing"
+
+# modes.precompact.final_complete MUST NOT be true for a precompact-only session.
+if jq -e '.modes.precompact.final_complete == true' "$PC2_MANIFEST" >/dev/null 2>&1; then
+  fail "precompact should never latch modes.precompact.final_complete=true"
+fi
+
+# modes.precompact.last_checkpoint_at MUST be populated by the completed precompact.
+jq -e '.modes.precompact.last_checkpoint_at != null' "$PC2_MANIFEST" >/dev/null \
+  || fail "precompact should record modes.precompact.last_checkpoint_at (got null)"
+
+# Two checkpoint files, neither run recorded a skipped_duplicate.
+PC2_CP_COUNT=$(find "$REFLECT_ROOT/sessions/$PC2_SID/checkpoints" -type f -name '*.json' 2>/dev/null | wc -l)
+(( PC2_CP_COUNT == 2 )) \
+  || fail "expected 2 checkpoints after two PreCompacts, got $PC2_CP_COUNT"
+
+# No skipped_duplicate side-records (the flock only fires on concurrent-race,
+# and idempotency gate is now bypassed for precompact).
+PC2_DUP_COUNT=0
+if [[ -d "$REFLECT_ROOT/sessions/$PC2_SID/duplicates" ]]; then
+  PC2_DUP_COUNT=$(find "$REFLECT_ROOT/sessions/$PC2_SID/duplicates" -type f -name '*.json' 2>/dev/null | wc -l)
+fi
+(( PC2_DUP_COUNT == 0 )) \
+  || fail "second PreCompact was wrongly skipped ($PC2_DUP_COUNT duplicate marker(s))"
+
+info "two sequential PreCompacts wrote 2 checkpoints, final_complete stayed false"
+
+# ============================================================================
+# TEST 3d: cross-mode race — PreCompact's transient started state must NOT
+# block a concurrent SessionEnd
+# ============================================================================
+# Regression (Codex R3.1): manifest.json.status was single-mode. PreCompact
+# wrote status=started before spawning its subprocess. If SessionEnd fired
+# within the reaper window (default 600s), is_already_complete saw the fresh
+# "started" and treated SessionEnd as an in-flight duplicate — final.json
+# was never written for that session.
+#
+# Fix: per-mode state map (modes.<mode>.status). PreCompact's state lives
+# under modes.precompact and cannot mask modes.sessionend.
+echo "TEST 3d: cross-mode race — PreCompact 'started' must not block SessionEnd"
+RACE_SID="test-sid-crossmode-race"
+
+# Slow stub: sleep 3s so status=started sticks around long enough for us to
+# race a SessionEnd against it.
+cat >"$STUB_SCRATCH/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null || true
+sleep 3
+cat <<'JSON'
+{"type":"result","result":"{\"patterns\":[\"slow-stub\"],\"discoveries\":[],\"turning_points\":[],\"digressions\":[],\"obstacles_to_autonomy\":[]}","usage":{}}
+JSON
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+RACE_PC_PAYLOAD=$(jq -cn --arg sid "$RACE_SID" --arg tp "$TRANSCRIPT" --arg cwd "$WORKTREE" \
+  '{session_id:$sid, transcript_path:$tp, hook_event_name:"PreCompact", cwd:$cwd, trigger:"auto", custom_instructions:""}')
+RACE_SE_PAYLOAD="$(fake_payload SessionEnd "$RACE_SID")"
+
+# Fire PreCompact asynchronously (it runs synchronously with the slow stub → 3s wall).
+( echo "$RACE_PC_PAYLOAD" | bash "$REFLECT_SH" precompact ) &
+PC_PID=$!
+
+# Wait until the PreCompact "started" state lands on disk (guarantees we race
+# INSIDE the window where the bug would fire).
+RACE_MANIFEST="$REFLECT_ROOT/sessions/$RACE_SID/manifest.json"
+for _ in $(seq 1 40); do
+  if [[ -f "$RACE_MANIFEST" ]] && \
+     jq -e '.modes.precompact.status == "started"' "$RACE_MANIFEST" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.1
+done
+if ! [[ -f "$RACE_MANIFEST" ]]; then
+  wait $PC_PID 2>/dev/null || true
+  fail "PreCompact never wrote a manifest"
+fi
+
+# Now fire SessionEnd. Under the bug it sees status=started (fresh) and skips.
+# Under the fix it proceeds and writes final.json.
+echo "$RACE_SE_PAYLOAD" | bash "$REFLECT_SH" sessionend
+rc=$?
+(( rc == 0 )) || { wait $PC_PID 2>/dev/null || true; fail "sessionend during precompact race: exit=$rc"; }
+
+# Wait for both to finish.
+wait $PC_PID 2>/dev/null || true
+
+RACE_FINAL="$REFLECT_ROOT/sessions/$RACE_SID/final.json"
+# SessionEnd MUST have produced final.json. Under the bug this file is missing.
+# The sessionend worker was detached with the slow stub (sleep 3s) — wait long
+# enough for it AND the completion write to land on disk.
+for _ in $(seq 1 80); do
+  [[ -f "$RACE_FINAL" ]] && \
+    jq -e '.modes.sessionend.final_complete == true' "$RACE_MANIFEST" >/dev/null 2>&1 && break
+  sleep 0.25
+done
+[[ -f "$RACE_FINAL" ]] \
+  || fail "final.json missing after cross-mode race — SessionEnd was wrongly skipped by PreCompact's transient 'started' state"
+
+# SessionEnd must NOT have written a skipped_duplicate side-record.
+RACE_DUP_COUNT=0
+if [[ -d "$REFLECT_ROOT/sessions/$RACE_SID/duplicates" ]]; then
+  # Filter to sessionend-only entries — a concurrent precompact CAN cause a
+  # skipped_concurrent record for other modes, but sessionend itself must
+  # never appear here for this race.
+  RACE_DUP_COUNT=$(find "$REFLECT_ROOT/sessions/$RACE_SID/duplicates" -type f -name '*sessionend*.json' 2>/dev/null | wc -l)
+fi
+(( RACE_DUP_COUNT == 0 )) \
+  || fail "SessionEnd was wrongly recorded as duplicate ($RACE_DUP_COUNT sessionend duplicate marker(s))"
+
+# Modes map: after fix, both modes should have their own state; precompact.complete
+# and sessionend.complete should coexist. Under the bug (single-mode manifest)
+# the last write wins and we'd only see one mode's state.
+jq -e '.modes.precompact.status == "complete" and .modes.sessionend.status == "complete"' "$RACE_MANIFEST" >/dev/null \
+  || fail "expected modes.precompact.status=complete AND modes.sessionend.status=complete after race (got: $(jq -c '.modes' "$RACE_MANIFEST"))"
+
+# SessionEnd's terminal must have latched final_complete on its own mode entry.
+jq -e '.modes.sessionend.final_complete == true' "$RACE_MANIFEST" >/dev/null \
+  || fail "modes.sessionend.final_complete should be true after SessionEnd completion"
+
+# PreCompact must NOT have latched final_complete (it's non-terminal by design).
+jq -e '.modes.precompact.final_complete == false' "$RACE_MANIFEST" >/dev/null \
+  || fail "modes.precompact.final_complete should be false"
+
+info "cross-mode race resolved: both precompact + sessionend completed independently"
+
+# ============================================================================
+# TEST 3e: write_manifest RMW race — concurrent writers on different modes
+# ============================================================================
+# Regression (Codex R4.1): write_manifest reads existing manifest, merges via
+# jq, atomic-mv-writes back. With no lock guarding the read-modify-write, two
+# concurrent workers updating different modes both read the same snapshot,
+# both write their own mode, second mv wins and clobbers the first mode's
+# state. Manifest permanently loses one mode.
+#
+# Repro: source lib.sh and spawn N concurrent write_manifest calls
+# alternating modes. Without the fix, at least one run in a small batch
+# loses a mode (empirically 30-50% failure rate at N=20).
+echo "TEST 3e: write_manifest RMW race under concurrent cross-mode writers"
+RMW_ROOT="$(mktemp -d -t reflect-rmw-XXXXXX)"
+RMW_SID="rmw-race-sid"
+mkdir -p "$RMW_ROOT/sessions/$RMW_SID"
+RMW_MPATH="$RMW_ROOT/sessions/$RMW_SID/manifest.json"
+
+# Run the RMW race in an isolated subshell that sources lib.sh directly —
+# no dispatcher, no stub, just the primitive. Repeat several times because
+# the race is probabilistic; a single clean run is not conclusive.
+RMW_RUNS=8
+RMW_WORKERS=20
+RMW_FAILS=0
+for run_i in $(seq 1 "$RMW_RUNS"); do
+  echo '{}' > "$RMW_MPATH"
+  (
+    # shellcheck disable=SC1091
+    source "$SKILL_DIR/lib.sh"
+    export REFLECT_ROOT="$RMW_ROOT"
+    for i in $(seq 1 "$RMW_WORKERS"); do
+      mode="precompact"
+      (( i % 2 )) && mode="sessionend"
+      write_manifest "$RMW_MPATH" "$RMW_SID" "$mode" "started" \
+        "$(jq -cn --arg tp "/foo" '{source_transcript:$tp}')" &
+    done
+    wait
+  )
+  if ! jq -e '.modes.precompact.status == "started" and .modes.sessionend.status == "started"' \
+       "$RMW_MPATH" >/dev/null 2>&1; then
+    RMW_FAILS=$(( RMW_FAILS + 1 ))
+  fi
+done
+if (( RMW_FAILS > 0 )); then
+  fail "write_manifest RMW race lost a mode in $RMW_FAILS / $RMW_RUNS runs (fix not effective)"
+fi
+find "$RMW_ROOT" -type f -delete 2>/dev/null || true
+find "$RMW_ROOT" -depth -type d -delete 2>/dev/null || true
+info "write_manifest survived $RMW_RUNS x $RMW_WORKERS concurrent cross-mode writes with no lost state"
+
+# ============================================================================
+# TEST 3f: dispatcher lock cross-mode skip — two dispatchers of different
+# modes must not race each other's flock and write skipped_concurrent
+# ============================================================================
+# Regression (Codex R4.2): the dispatcher lock is a single file
+# <manifest>.lock. When PreCompact and SessionEnd dispatchers fire nearly
+# simultaneously, one of them frequently loses `flock -n` on the shared file
+# and writes a skipped_concurrent side-record for its own mode — cross-mode
+# contention causes a legitimate mode to be dropped.
+#
+# Repro: fire PreCompact and SessionEnd concurrently with a slightly-slow
+# stub (0.5s) so their critical sections overlap. Under the bug, the loser
+# writes duplicates/*sessionend-conc*.json or *precompact-conc*.json. Under
+# the fix (per-mode locks), no cross-mode duplicate marker appears and BOTH
+# modes reach status=complete.
+echo "TEST 3f: dispatcher cross-mode lock — no skipped_concurrent for different modes"
+
+# Slow-ish stub (0.5s) — enough to overlap two dispatchers' critical sections.
+cat >"$STUB_SCRATCH/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null || true
+sleep 0.5
+cat <<'JSON'
+{"type":"result","result":"{\"patterns\":[\"cross-mode-stub\"],\"discoveries\":[],\"turning_points\":[],\"digressions\":[],\"obstacles_to_autonomy\":[]}","usage":{}}
+JSON
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+# The bug is probabilistic; run multiple rounds and demand ZERO cross-mode
+# skips across the batch. Empirically pre-fix, ~5 of 8 rounds hit the skip.
+DISP_ROUNDS=6
+DISP_FAILS=0
+for r in $(seq 1 "$DISP_ROUNDS"); do
+  DR_SID="disp-race-sid-$r"
+  DR_PC_PAYLOAD=$(jq -cn --arg sid "$DR_SID" --arg tp "$TRANSCRIPT" --arg cwd "$WORKTREE" \
+    '{session_id:$sid, transcript_path:$tp, hook_event_name:"PreCompact", cwd:$cwd, trigger:"auto"}')
+  DR_SE_PAYLOAD=$(jq -cn --arg sid "$DR_SID" --arg tp "$TRANSCRIPT" --arg cwd "$WORKTREE" \
+    '{session_id:$sid, transcript_path:$tp, hook_event_name:"SessionEnd", cwd:$cwd}')
+
+  # Fire both dispatchers simultaneously.
+  ( echo "$DR_PC_PAYLOAD" | bash "$REFLECT_SH" precompact ) &
+  DR_PC_PID=$!
+  ( echo "$DR_SE_PAYLOAD" | bash "$REFLECT_SH" sessionend ) &
+  DR_SE_PID=$!
+  wait $DR_PC_PID $DR_SE_PID 2>/dev/null || true
+
+  DR_MANIFEST="$REFLECT_ROOT/sessions/$DR_SID/manifest.json"
+  # Wait for both terminal states.
+  for _ in $(seq 1 40); do
+    if [[ -f "$DR_MANIFEST" ]] && jq -e \
+        '.modes.precompact.status == "complete" and .modes.sessionend.final_complete == true' \
+        "$DR_MANIFEST" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.25
+  done
+
+  # Any cross-mode skipped_concurrent record is a failure.
+  DR_DUP_DIR="$REFLECT_ROOT/sessions/$DR_SID/duplicates"
+  DR_SKIPS=0
+  if [[ -d "$DR_DUP_DIR" ]]; then
+    DR_SKIPS=$(find "$DR_DUP_DIR" -type f -name '*conc*.json' 2>/dev/null | wc -l)
+  fi
+  if (( DR_SKIPS > 0 )); then
+    DISP_FAILS=$(( DISP_FAILS + 1 ))
+  fi
+  # BOTH modes must reach terminal-complete.
+  if ! jq -e \
+      '.modes.precompact.status == "complete" and .modes.sessionend.status == "complete"' \
+      "$DR_MANIFEST" >/dev/null 2>&1; then
+    DISP_FAILS=$(( DISP_FAILS + 1 ))
+  fi
+done
+if (( DISP_FAILS > 0 )); then
+  fail "cross-mode dispatcher lock caused $DISP_FAILS / $DISP_ROUNDS failed rounds (skipped_concurrent or missing terminal state)"
+fi
+info "cross-mode dispatcher: $DISP_ROUNDS rounds, 0 skipped_concurrent, both modes complete in all rounds"
+
+# Restore canonical stub for downstream tests.
+cat >"$STUB_SCRATCH/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null || true
+cat <<'JSON'
+{"type":"result","result":"{\"patterns\":[\"stubbed pattern\"],\"discoveries\":[],\"turning_points\":[],\"digressions\":[],\"obstacles_to_autonomy\":[]}","usage":{"cache_read_input_tokens":100,"cache_creation_input_tokens":10,"input_tokens":5,"output_tokens":50}}
+JSON
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+# ============================================================================
+# TEST 3c: single oversized checkpoint gets per-file truncated
+# ============================================================================
+# The sessionend prompt-assembly loop always includes at least one
+# checkpoint. Without a per-file cap, a single 500KB checkpoint would blow
+# the total budget on its own. Fix: each checkpoint truncated at
+# cp_budget_bytes/2 with a "[Note: this checkpoint truncated at N bytes.]"
+# prefix. This test drops a giant checkpoint on disk and asserts the
+# assembled prompt (captured via a recording stub that echoes stdin size to
+# a sidecar) stays under cp_budget_bytes total.
+echo "TEST 3c: single oversized checkpoint truncated to per-file cap"
+BIG_SID="test-sid-bigcp"
+mkdir -p "$REFLECT_ROOT/sessions/$BIG_SID/checkpoints"
+# 40 KB checkpoint (>> cp_per_file_cap of 8 KB). Valid JSON so the prompt
+# still parses if the model sees it; the stub ignores the body anyway.
+python3 -c "
+import json
+big = {'patterns': ['x' * 40000], 'discoveries': [], 'turning_points': [], 'digressions': [], 'obstacles_to_autonomy': []}
+print(json.dumps(big))
+" > "$REFLECT_ROOT/sessions/$BIG_SID/checkpoints/$(date -u +%s%N)-XXXX-precompact.json"
+
+# Swap the stub for a recording one that captures the prompt size + content.
+PROMPT_CAPTURE="$STUB_SCRATCH/last-prompt-bytes"
+PROMPT_BODY="$STUB_SCRATCH/last-prompt-body"
+: > "$PROMPT_CAPTURE"
+: > "$PROMPT_BODY"
+cat >"$STUB_SCRATCH/claude" <<STUB
+#!/usr/bin/env bash
+# Recording stub — writes stdin to disk so the test can inspect it.
+body="\$(cat)"
+printf '%s' "\$body" > "$PROMPT_BODY"
+printf '%s' "\${#body}" > "$PROMPT_CAPTURE"
+cat <<'JSON'
+{"type":"result","result":"{\"patterns\":[\"post-truncation\"],\"discoveries\":[],\"turning_points\":[],\"digressions\":[],\"obstacles_to_autonomy\":[]}","usage":{}}
+JSON
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+BIG_PAYLOAD="$(fake_payload SessionEnd "$BIG_SID")"
+echo "$BIG_PAYLOAD" | bash "$REFLECT_SH" sessionend >/dev/null
+wait_for_complete "$REFLECT_ROOT/sessions/$BIG_SID/manifest.json" 10 \
+  || fail "big-checkpoint sessionend never completed"
+
+# Prompt size must be well under 40KB (the raw checkpoint) — with the
+# 8KB per-file cap plus ~2KB prompt template, we expect ~11KB max.
+PROMPT_BYTES=$(cat "$PROMPT_CAPTURE")
+(( PROMPT_BYTES < 16384 )) \
+  || fail "assembled prompt is ${PROMPT_BYTES} bytes; expected < 16384 (per-file cap not enforced)"
+(( PROMPT_BYTES > 500 )) \
+  || fail "assembled prompt suspiciously small (${PROMPT_BYTES} bytes) — cap likely dropped body entirely"
+
+# Truncation-announcement string must be present in the prompt.
+grep -q 'this checkpoint truncated at' "$PROMPT_BODY" \
+  || fail "expected truncation notice in prompt body"
+info "single oversized checkpoint capped (prompt=${PROMPT_BYTES} bytes, notice present)"
+
+# Restore the canonical stub for downstream tests.
+cat >"$STUB_SCRATCH/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null || true
+cat <<'JSON'
+{"type":"result","result":"{\"patterns\":[\"stubbed pattern\"],\"discoveries\":[],\"turning_points\":[],\"digressions\":[],\"obstacles_to_autonomy\":[]}","usage":{"cache_read_input_tokens":100,"cache_creation_input_tokens":10,"input_tokens":5,"output_tokens":50}}
+JSON
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+# ============================================================================
+# TEST 4: subagentstop lands under parent/subagents/<sid>/
+# ============================================================================
+echo "TEST 4: subagentstop artifact placement"
+PARENT_SID="parent-sid-xyz"
+SUB_SID="sub-sid-123"
+
+# Seed a fake parent session dir so we exercise the parent-lookup path
+mkdir -p "$REFLECT_ROOT/sessions/$PARENT_SID"
+echo '{"session_id":"'"$PARENT_SID"'"}' > "$REFLECT_ROOT/sessions/$PARENT_SID/manifest.json"
+
+export CLAUDE_PARENT_SESSION_ID="$PARENT_SID"
+SUB_PAYLOAD=$(jq -cn --arg sid "$SUB_SID" --arg tp "$TRANSCRIPT" --arg cwd "$WORKTREE" \
+  '{session_id:$sid, transcript_path:$tp, hook_event_name:"SubagentStop", cwd:$cwd, stop_hook_active:false}')
+
+echo "$SUB_PAYLOAD" | bash "$REFLECT_SH" subagentstop
+rc=$?
+(( rc == 0 )) || fail "subagentstop exit=$rc"
+
+SUB_MANIFEST="$REFLECT_ROOT/sessions/$PARENT_SID/subagents/$SUB_SID/manifest.json"
+SUB_FINAL="$REFLECT_ROOT/sessions/$PARENT_SID/subagents/$SUB_SID/final.json"
+
+wait_for_complete "$SUB_MANIFEST" 10 subagentstop \
+  || fail "subagent manifest never modes.subagentstop.final_complete (path=$SUB_MANIFEST)"
+
+[[ -f "$SUB_FINAL" ]] || fail "subagent final.json missing at $SUB_FINAL"
+jq -e '.patterns' "$SUB_FINAL" >/dev/null || fail "subagent final.json invalid"
+
+# Ensure parent linkage recorded
+jq -e --arg p "$PARENT_SID" '.parent_session_id == $p' "$SUB_MANIFEST" >/dev/null \
+  || fail "subagent manifest parent_session_id != $PARENT_SID"
+info "subagent artifact placed correctly and parent linkage recorded"
+
+unset CLAUDE_PARENT_SESSION_ID
+
+# ============================================================================
+# TEST 5: missing session_id -> error manifest, no crash
+# ============================================================================
+echo "TEST 5: malformed payload handling"
+BAD_PAYLOAD='{"hook_event_name":"SessionEnd"}'
+echo "$BAD_PAYLOAD" | bash "$REFLECT_SH" sessionend
+rc=$?
+(( rc == 0 )) || fail "malformed payload should not crash reflect.sh (exit=$rc)"
+info "malformed payload handled (exit=0)"
+
+# ============================================================================
+# TEST 6: path traversal in session_id -> rejected, no dir escape
+# ============================================================================
+echo "TEST 6: path-traversal rejection"
+BAD_SIDS=('../evil' '/abs/evil' 'has space' 'a;b' $'nl\nsid' 'sub/dir' '.' '..' '...' '.hidden')
+for bad in "${BAD_SIDS[@]}"; do
+  P="$(jq -cn --arg sid "$bad" --arg tp "$TRANSCRIPT" --arg cwd "$WORKTREE" \
+        '{session_id:$sid, transcript_path:$tp, hook_event_name:"SessionEnd", cwd:$cwd}')"
+  echo "$P" | bash "$REFLECT_SH" sessionend >/dev/null
+  rc=$?
+  (( rc == 0 )) || fail "reflect.sh should not crash on bad sid (rc=$rc, sid=$bad)"
+done
+# Ensure no session dir was created for any of these bad SIDs.
+# Build allow-list of legit test SIDs including TEST 3f's per-round SIDs.
+ALLOW_SIDS=('_malformed' "$SID" "$PC_SID" "$PC2_SID" "$RACE_SID" "$BIG_SID" "$PARENT_SID")
+for r in $(seq 1 "$DISP_ROUNDS"); do
+  ALLOW_SIDS+=( "disp-race-sid-$r" )
+done
+FIND_EXCL=()
+for a in "${ALLOW_SIDS[@]}"; do
+  FIND_EXCL+=( ! -name "$a" )
+done
+if find "$REFLECT_ROOT/sessions" -mindepth 1 -maxdepth 1 -type d \
+     "${FIND_EXCL[@]}" \
+     | grep -q .; then
+  fail "path traversal created unexpected session dir(s): $(find "$REFLECT_ROOT/sessions" -mindepth 1 -maxdepth 1 -type d "${FIND_EXCL[@]}")"
+fi
+# _malformed bucket must exist and contain at least one error record.
+MALF_COUNT=$(find "$REFLECT_ROOT/sessions/_malformed" -type f -name '*.json' 2>/dev/null | wc -l)
+(( MALF_COUNT >= ${#BAD_SIDS[@]} )) || fail "expected >= ${#BAD_SIDS[@]} malformed records, got $MALF_COUNT"
+# Confirm no raw payload embedded (privacy) — records should carry sha256 only.
+if find "$REFLECT_ROOT/sessions/_malformed" -type f -name '*.json' -print0 \
+     | xargs -0 jq -e '.payload' >/dev/null 2>&1; then
+  fail "malformed record leaks raw payload (should only carry payload_sha256)"
+fi
+info "path-traversal rejection OK (${MALF_COUNT} malformed records, no dir escape, no payload leak)"
+
+# ============================================================================
+# TEST 7: --worker requires _REFLECT_INTERNAL=1 sentinel
+# ============================================================================
+echo "TEST 7: worker sentinel gating"
+set +e
+bash "$REFLECT_SH" --worker sessionend </dev/null >/dev/null 2>&1
+rc=$?
+set -e
+(( rc != 0 )) || fail "--worker without _REFLECT_INTERNAL should be refused"
+info "worker sentinel enforced (rc=$rc)"
+
+# ============================================================================
+# TEST 7b: dispatcher must NOT leak _REFLECT_INTERNAL into the parent env
+# ============================================================================
+echo "TEST 7b: _REFLECT_INTERNAL scoping"
+LEAK_SID="test-sid-envleak"
+LP="$(fake_payload SessionEnd "$LEAK_SID")"
+unset _REFLECT_INTERNAL
+echo "$LP" | bash "$REFLECT_SH" sessionend >/dev/null
+[[ -z "${_REFLECT_INTERNAL:-}" ]] \
+  || fail "_REFLECT_INTERNAL leaked into parent shell (=$_REFLECT_INTERNAL)"
+info "_REFLECT_INTERNAL stays scoped to detached child"
+
+# ============================================================================
+# TEST 8: REFLECT_FORCE accepts true / yes / on (not just 1)
+# ============================================================================
+echo "TEST 8: REFLECT_FORCE truthy normalization"
+FORCE_SID="test-sid-force"
+FP="$(fake_payload SessionEnd "$FORCE_SID")"
+echo "$FP" | bash "$REFLECT_SH" sessionend >/dev/null
+wait_for_complete "$REFLECT_ROOT/sessions/$FORCE_SID/manifest.json" 10 \
+  || fail "initial FORCE test run never completed"
+
+FORCE_FINAL="$REFLECT_ROOT/sessions/$FORCE_SID/final.json"
+MT1=$(stat -c '%Y' "$FORCE_FINAL")
+sleep 1
+echo "$FP" | REFLECT_FORCE=true bash "$REFLECT_SH" sessionend >/dev/null
+# Wait for detached run to overwrite
+for _ in $(seq 1 20); do
+  MT2=$(stat -c '%Y' "$FORCE_FINAL" 2>/dev/null || echo 0)
+  [[ "$MT2" != "$MT1" ]] && break
+  sleep 0.5
+done
+[[ "$MT2" != "$MT1" ]] || fail "REFLECT_FORCE=true did not force re-run (mtime unchanged)"
+info "REFLECT_FORCE=true forces re-run"
+
+# ============================================================================
+# TEST 9: malformed reflection JSON -> error manifest, no raw body leak
+# ============================================================================
+echo "TEST 9: unparseable reflection JSON"
+# Swap the scratch stub for one that emits invalid JSON in the .result field.
+# The checked-in tests/stubs/claude is left untouched so the git tree stays clean.
+cat >"$STUB_SCRATCH/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null || true
+# .result is not valid JSON — should trigger unparseable branch.
+printf '%s\n' '{"type":"result","result":"totally not json {{{","usage":{}}'
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+BAD_JSON_SID="test-sid-badjson"
+BP="$(fake_payload SessionEnd "$BAD_JSON_SID")"
+echo "$BP" | bash "$REFLECT_SH" sessionend >/dev/null
+BJ_MAN="$REFLECT_ROOT/sessions/$BAD_JSON_SID/manifest.json"
+# Wait for terminal state (per-mode schema: modes.sessionend.status).
+for _ in $(seq 1 40); do
+  if [[ -f "$BJ_MAN" ]] && jq -e '.modes.sessionend.status == "error"' "$BJ_MAN" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.25
+done
+jq -e '.modes.sessionend.status == "error"' "$BJ_MAN" >/dev/null \
+  || fail "bad reflection JSON should produce modes.sessionend.status=error (got: $(jq -r '.modes.sessionend.status' "$BJ_MAN"))"
+jq -e '.modes.sessionend.reason == "unparseable_reflection_json"' "$BJ_MAN" >/dev/null \
+  || fail "bad reflection JSON should set modes.sessionend.reason=unparseable_reflection_json"
+# Must NOT embed the full raw body — an excerpt is OK; check it doesn't contain
+# the tail of the poison payload (verifies truncation policy).
+if jq -r '.modes.sessionend.raw_excerpt // ""' "$BJ_MAN" | grep -q '{{{'; then
+  # Excerpt of first 200 chars may contain the marker; that's OK, but must not be full body.
+  RAW_LEN=$(jq -r '.modes.sessionend.raw_excerpt // "" | length' "$BJ_MAN")
+  (( RAW_LEN <= 200 )) || fail "raw_excerpt exceeds 200 chars ($RAW_LEN)"
+fi
+# Must NOT have the old .raw field carrying the whole body (at top level or under mode).
+if jq -e 'has("raw") and (.raw | length > 200)' "$BJ_MAN" >/dev/null 2>&1; then
+  fail "manifest leaks large raw body (.raw > 200 chars at top level)"
+fi
+if jq -e '.modes.sessionend | has("raw") and (.raw | length > 200)' "$BJ_MAN" >/dev/null 2>&1; then
+  fail "manifest leaks large raw body (.modes.sessionend.raw > 200 chars)"
+fi
+info "unparseable JSON handled (modes.sessionend.status=error, no full-body leak)"
+
+# ============================================================================
+# TEST 10: REFLECT_SUBPROCESS sentinel breaks recursion
+# ============================================================================
+# The reflection worker launches `claude -p --resume --fork-session`. That
+# subprocess runs under the same global Claude Code hooks, so its own
+# SessionEnd would re-fire this dispatcher → infinite recursion. The
+# REFLECT_SUBPROCESS=1 env sentinel (injected by the worker into the
+# subprocess env) must cause the dispatcher to no-op — exit 0 without ANY
+# claude call, and drop an observability marker under skipped-recursions/.
+#
+# Belt-and-braces: use a counting stub so we can prove `claude` was NOT
+# invoked at all. If the sentinel branch fell through, the stub would be
+# called and the counter file would be non-empty.
+echo "TEST 10: REFLECT_SUBPROCESS sentinel skip"
+COUNTER="$STUB_SCRATCH/claude-invocation-count"
+: > "$COUNTER"
+cat >"$STUB_SCRATCH/claude" <<STUB
+#!/usr/bin/env bash
+# Counting stub — increments $COUNTER on every call.
+echo x >> "$COUNTER"
+cat >/dev/null || true
+cat <<'JSON'
+{"type":"result","result":"{\"patterns\":[\"never should fire under sentinel\"]}","usage":{}}
+JSON
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+SENT_SID="test-sid-sentinel"
+SP="$(fake_payload SessionEnd "$SENT_SID")"
+
+# Run dispatcher with sentinel set (simulating a nested claude subprocess
+# firing its own SessionEnd hook).
+set +e
+echo "$SP" | env REFLECT_SUBPROCESS=1 REFLECT_PARENT_SID=parent-abc \
+  bash "$REFLECT_SH" sessionend
+rc=$?
+set -e
+(( rc == 0 )) || fail "sentinel-path exit=$rc (should be 0)"
+
+# claude MUST NOT have been called.
+INVOCATIONS=$(wc -l < "$COUNTER" 2>/dev/null || echo 0)
+(( INVOCATIONS == 0 )) \
+  || fail "claude was invoked $INVOCATIONS time(s) under REFLECT_SUBPROCESS=1 (expected 0)"
+
+# A marker file must have been dropped under skipped-recursions/.
+REC_DIR="$REFLECT_ROOT/skipped-recursions"
+[[ -d "$REC_DIR" ]] || fail "skipped-recursions/ dir missing"
+REC_COUNT=$(find "$REC_DIR" -type f -name '*.json' 2>/dev/null | wc -l)
+(( REC_COUNT >= 1 )) || fail "no recursion-skip marker recorded"
+# Marker content: status=skipped_recursion, parent_sid propagated, child_sid
+# extracted from payload.
+REC_FILE=$(find "$REC_DIR" -type f -name '*.json' | head -1)
+jq -e '.status == "skipped_recursion"' "$REC_FILE" >/dev/null \
+  || fail "marker status != skipped_recursion"
+jq -e --arg s "$SENT_SID" '.child_sid == $s' "$REC_FILE" >/dev/null \
+  || fail "marker child_sid != $SENT_SID"
+jq -e '.parent_sid == "parent-abc"' "$REC_FILE" >/dev/null \
+  || fail "marker parent_sid != parent-abc"
+info "sentinel skip verified: 0 claude calls, marker recorded"
+
+# ============================================================================
+# TEST 10b: recursion marker filename sanitises unvalidated SIDs
+# ============================================================================
+# Regression (Codex P3.5): the skipped-recursion marker filename interpolates
+# REFLECT_PARENT_SID (env, attacker-influenceable) and .session_id from the
+# payload directly. Under the old code an evil value like '../../etc/passwd'
+# would escape the skipped-recursions/ directory. Fix: run both through
+# is_valid_sid before interpolation and substitute 'unknown_bad_sid' on fail.
+echo "TEST 10b: recursion marker filename sanitisation"
+
+# Counting stub — must NOT be invoked (sentinel path).
+: > "$COUNTER"
+BAD_PARENT="../../etc/passwd"
+BAD_CHILD_PAYLOAD='{"session_id":"../../../evil","transcript_path":"/tmp/x","hook_event_name":"SessionEnd","cwd":"/tmp"}'
+
+set +e
+echo "$BAD_CHILD_PAYLOAD" | env REFLECT_SUBPROCESS=1 REFLECT_PARENT_SID="$BAD_PARENT" \
+  bash "$REFLECT_SH" sessionend
+rc=$?
+set -e
+(( rc == 0 )) || fail "sentinel-path with bad SIDs exit=$rc (should be 0)"
+
+# claude MUST NOT have been called (sentinel skip).
+INVOCATIONS_BAD=$(wc -l < "$COUNTER" 2>/dev/null || echo 0)
+(( INVOCATIONS_BAD == 0 )) \
+  || fail "claude invoked $INVOCATIONS_BAD time(s) under sentinel with bad SIDs"
+
+# Files under skipped-recursions/ must all reside directly in that dir —
+# NO subdir escape via '..' in the interpolated components.
+REC_DIR_2="$REFLECT_ROOT/skipped-recursions"
+if ! find "$REC_DIR_2" -maxdepth 1 -type f -name '*unknown_bad_sid*' 2>/dev/null | grep -q .; then
+  fail "no marker with sanitised sentinel found under $REC_DIR_2"
+fi
+# No marker should contain a raw '..' path component in its basename.
+if find "$REC_DIR_2" -maxdepth 1 -type f -name '*..*' 2>/dev/null | grep -q .; then
+  fail "marker filename contains raw '..' path traversal component"
+fi
+# No file should have been created outside skipped-recursions/ from the escape attempt.
+if find "$REFLECT_ROOT" -path "$REC_DIR_2" -prune -o -type f -name '*evil*' -print 2>/dev/null | grep -q .; then
+  fail "path traversal via bad child_sid escaped skipped-recursions/"
+fi
+info "recursion marker sanitised bad SIDs to unknown_bad_sid"
+
+# ============================================================================
+# TEST 10c: ARG1 (mode) in recursion marker filename is validated too
+# ============================================================================
+# Regression (R2 MEDIUM, convergent): the sentinel branch runs BEFORE the mode
+# allow-list. ARG1 was interpolated into the marker filename unvalidated. A
+# value like '../evil' or one containing slash/control chars would escape
+# skipped-recursions/. Fix: validate ARG1 against precompact|sessionend|
+# subagentstop and substitute 'nomode_invalid' on mismatch.
+echo "TEST 10c: recursion marker ARG1 (mode) validation"
+
+: > "$COUNTER"
+BAD_MODE_PAYLOAD='{"session_id":"legit-child","transcript_path":"/tmp/x","hook_event_name":"SessionEnd","cwd":"/tmp"}'
+
+set +e
+echo "$BAD_MODE_PAYLOAD" | env REFLECT_SUBPROCESS=1 REFLECT_PARENT_SID=legit-parent \
+  bash "$REFLECT_SH" '../evil' >/dev/null 2>&1
+rc=$?
+set -e
+(( rc == 0 )) || fail "sentinel-path with bad ARG1 exit=$rc (should be 0)"
+
+# claude MUST NOT have been called (sentinel skip).
+INVOCATIONS_BADMODE=$(wc -l < "$COUNTER" 2>/dev/null || echo 0)
+(( INVOCATIONS_BADMODE == 0 )) \
+  || fail "claude invoked $INVOCATIONS_BADMODE time(s) under sentinel with bad ARG1"
+
+# No file with '..' in basename should have been created under skipped-recursions/.
+if find "$REC_DIR_2" -maxdepth 1 -type f -name '*..*' 2>/dev/null | grep -q .; then
+  fail "marker filename contains raw '..' path traversal component from ARG1"
+fi
+# No file should have been created OUTSIDE skipped-recursions/ from the escape attempt.
+if find "$REFLECT_ROOT" -path "$REC_DIR_2" -prune -o -type f -name '*evil*' -print 2>/dev/null | grep -q .; then
+  fail "path traversal via bad ARG1 escaped skipped-recursions/"
+fi
+# The sanitised 'nomode_invalid' sentinel must appear in at least one marker.
+if ! find "$REC_DIR_2" -maxdepth 1 -type f -name '*nomode_invalid*' 2>/dev/null | grep -q .; then
+  fail "no marker with sanitised ARG1 sentinel 'nomode_invalid' found under $REC_DIR_2"
+fi
+info "recursion marker sanitised bad ARG1 to nomode_invalid"
+
+# Restore the canonical stub for any subsequent hypothetical tests.
+cat >"$STUB_SCRATCH/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null || true
+cat <<'JSON'
+{"type":"result","result":"{\"patterns\":[\"stubbed pattern\"],\"discoveries\":[],\"turning_points\":[],\"digressions\":[],\"obstacles_to_autonomy\":[]}","usage":{"cache_read_input_tokens":100,"cache_creation_input_tokens":10,"input_tokens":5,"output_tokens":50}}
+JSON
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+# ============================================================================
+# TEST 11: reflection JSON with wrong-typed keys is coerced to arrays
+# ============================================================================
+# Regression (Codex P3.1): the jq extractor previously used `(.patterns // [])`
+# which returns a non-array VALUE verbatim if .patterns is a string, object,
+# or number. That value then landed in final.json as `.patterns = "some string"`
+# — a schema violation that breaks every downstream consumer expecting an array.
+# Fix: coerce non-arrays to [] with `if type == "array" then . else [] end`.
+echo "TEST 11: reflection JSON type coercion for non-array values"
+cat >"$STUB_SCRATCH/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null || true
+# All 5 keys wrong-typed: string, object, number, bool, null.
+# Sentinel string "SHOULD_BE_DROPPED" must not appear in final.json's patterns.
+printf '%s\n' '{"type":"result","result":"{\"patterns\":\"SHOULD_BE_DROPPED\",\"discoveries\":{\"nested\":\"obj\"},\"turning_points\":42,\"digressions\":true,\"obstacles_to_autonomy\":null}","usage":{}}'
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+COERCE_SID="test-sid-typecoerce"
+CP="$(fake_payload SessionEnd "$COERCE_SID")"
+echo "$CP" | bash "$REFLECT_SH" sessionend >/dev/null
+wait_for_complete "$REFLECT_ROOT/sessions/$COERCE_SID/manifest.json" 10 \
+  || fail "type-coerce sessionend never completed"
+
+COERCE_FINAL="$REFLECT_ROOT/sessions/$COERCE_SID/final.json"
+[[ -f "$COERCE_FINAL" ]] || fail "type-coerce final.json missing"
+
+# Each of the 5 keys MUST be an array in the artifact (regardless of what
+# type the model emitted).
+for k in patterns discoveries turning_points digressions obstacles_to_autonomy; do
+  jq -e --arg k "$k" '.[$k] | type == "array"' "$COERCE_FINAL" >/dev/null \
+    || fail "final.json .$k is not array (got: $(jq -r --arg k "$k" '.[$k] | type' "$COERCE_FINAL"))"
+done
+# The dropped string must NOT appear anywhere in patterns.
+if jq -e '.patterns | index("SHOULD_BE_DROPPED")' "$COERCE_FINAL" >/dev/null 2>&1; then
+  fail "type coercion should drop the malformed string, but it landed in .patterns"
+fi
+info "type coercion: all 5 keys forced to [] when non-array"
+
+# Restore canonical stub.
+cat >"$STUB_SCRATCH/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null || true
+cat <<'JSON'
+{"type":"result","result":"{\"patterns\":[\"stubbed pattern\"],\"discoveries\":[],\"turning_points\":[],\"digressions\":[],\"obstacles_to_autonomy\":[]}","usage":{"cache_read_input_tokens":100,"cache_creation_input_tokens":10,"input_tokens":5,"output_tokens":50}}
+JSON
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+# ============================================================================
+# TEST 12: unwritable REFLECT_ROOT writes fallback error record + stderr
+# ============================================================================
+# Regression (Codex P3.2): previously ensure_reflect_root_writable failure
+# caused a silent exit 0 with no artifact and no error trail. Operators had
+# zero forensic evidence when reflection stopped working.
+# Fix: append a structured JSON record to /tmp/session-reflect-errors.log
+# AND emit a tagged '[session-reflect] REFLECT_ROOT unwritable' stderr line.
+echo "TEST 12: unwritable REFLECT_ROOT surfaces error record + stderr"
+
+# Isolate the fallback log so we can inspect exactly what this test wrote.
+# (We can't touch the real /tmp/session-reflect-errors.log because other
+# runs may have data in it.) Snapshot before + diff after.
+FALLBACK_LOG=/tmp/session-reflect-errors.log
+if [[ -f "$FALLBACK_LOG" ]]; then
+  FB_BEFORE_LINES=$(wc -l < "$FALLBACK_LOG")
+else
+  FB_BEFORE_LINES=0
+fi
+
+# Create a REFLECT_ROOT under a read-only parent dir so mkdir fails hard.
+RO_PARENT="$(mktemp -d -t reflect-ro-parent-XXXXXX)"
+chmod 555 "$RO_PARENT"  # r-x r-x r-x — cannot mkdir underneath
+UNWRITABLE_ROOT="$RO_PARENT/reflections-cannot-create"
+
+UNW_SID="test-sid-unwritable"
+UP="$(fake_payload SessionEnd "$UNW_SID")"
+
+# Capture stderr specifically.
+UNW_STDERR="$STUB_SCRATCH/unwritable.stderr"
+set +e
+echo "$UP" | REFLECT_ROOT="$UNWRITABLE_ROOT" bash "$REFLECT_SH" sessionend 2>"$UNW_STDERR"
+rc=$?
+set -e
+(( rc == 0 )) || fail "unwritable REFLECT_ROOT should exit 0 (got rc=$rc)"
+
+# stderr must carry the '[session-reflect] REFLECT_ROOT unwritable' marker.
+grep -q '\[session-reflect\] REFLECT_ROOT unwritable' "$UNW_STDERR" \
+  || fail "expected [session-reflect] REFLECT_ROOT unwritable in stderr; got: $(cat "$UNW_STDERR")"
+
+# Fallback log must have grown by at least 1 line.
+if [[ -f "$FALLBACK_LOG" ]]; then
+  FB_AFTER_LINES=$(wc -l < "$FALLBACK_LOG")
+else
+  FB_AFTER_LINES=0
+fi
+(( FB_AFTER_LINES > FB_BEFORE_LINES )) \
+  || fail "/tmp/session-reflect-errors.log did not grow (before=$FB_BEFORE_LINES after=$FB_AFTER_LINES)"
+
+# Last line must be a valid JSON record with the expected keys + our SID.
+LAST_ERR=$(tail -1 "$FALLBACK_LOG")
+echo "$LAST_ERR" | jq -e --arg sid "$UNW_SID" \
+  '.error == "reflect_root_unwritable" and .session_id == $sid and .mode == "sessionend" and .root_path == "'"$UNWRITABLE_ROOT"'" and (.timestamp | length > 0)' \
+  >/dev/null \
+  || fail "fallback log entry malformed or missing expected fields: $LAST_ERR"
+
+# Cleanup the ro parent (chmod back so we can rm).
+chmod 755 "$RO_PARENT"
+rm -rf "$RO_PARENT" 2>/dev/null || true
+info "unwritable REFLECT_ROOT surfaced as JSON record + stderr line"
+
+# ============================================================================
+# TEST 13: stale-reaper race on final.json (Codex P3.3)
+# ============================================================================
+# Regression (Codex P3.3): dispatcher used to release the per-mode lock
+# right after writing 'started', then detached the worker. If the reaper
+# window (default 600s, dropped to 2s here) expired while the first worker
+# was still running its claude call, a second dispatcher would permit
+# itself to spawn a second worker, and both workers would race the mv to
+# final.json. Last-write-wins silently discards one reflection.
+#
+# Fix (Approach C): dispatcher no longer closes fd 9 before detach; the
+# detached worker inherits the flock and holds it through the entire
+# claude call + mv. Second dispatcher's flock -n now fails.
+#
+# Repro under fix: force the reaper window low (2s), use a slow stub
+# (4s claude call), fire two SessionEnd dispatchers 3s apart. Under the
+# bug the second dispatcher spawns a second worker → 2 final.json mv's
+# race. Under the fix the second dispatcher's flock -n fails → writes
+# skipped_concurrent and exits, only ONE worker mv's to final.json.
+echo "TEST 13: stale-reaper race — worker holds lock through claude call"
+
+# Slow stub — 4s so the second dispatcher fires while the first worker is mid-call.
+cat >"$STUB_SCRATCH/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null || true
+sleep 4
+cat <<'JSON'
+{"type":"result","result":"{\"patterns\":[\"race-winner\"],\"discoveries\":[],\"turning_points\":[],\"digressions\":[],\"obstacles_to_autonomy\":[]}","usage":{}}
+JSON
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+RACE2_SID="test-sid-reaper-race"
+RP="$(fake_payload SessionEnd "$RACE2_SID")"
+
+# Force reaper window to 2s so the second dispatcher (fired 3s later) would
+# see 'started' as stale and permit itself under the OLD behavior.
+export REFLECT_STALE_STARTED_SECONDS=2
+
+# Dispatcher 1: writes started, detaches worker.
+echo "$RP" | bash "$REFLECT_SH" sessionend >/dev/null
+rc=$?
+(( rc == 0 )) || fail "reaper-race dispatcher 1 exit=$rc"
+
+# Wait 3s so the reaper window expires but the worker is still 1s into its
+# 4s claude call.
+sleep 3
+
+# Dispatcher 2: under the bug, is_already_complete returns false (stale
+# reaper) and dispatcher 2 tries to spawn its own worker. Under the fix
+# it hits the flock -n check and writes skipped_concurrent.
+echo "$RP" | bash "$REFLECT_SH" sessionend >/dev/null
+rc=$?
+(( rc == 0 )) || fail "reaper-race dispatcher 2 exit=$rc"
+
+unset REFLECT_STALE_STARTED_SECONDS
+
+# Wait for whichever worker(s) finish. Under the fix, only worker 1 exists.
+RACE2_MANIFEST="$REFLECT_ROOT/sessions/$RACE2_SID/manifest.json"
+RACE2_FINAL="$REFLECT_ROOT/sessions/$RACE2_SID/final.json"
+for _ in $(seq 1 40); do
+  if [[ -f "$RACE2_FINAL" ]] && \
+     jq -e '.modes.sessionend.final_complete == true' "$RACE2_MANIFEST" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.25
+done
+[[ -f "$RACE2_FINAL" ]] || fail "reaper-race: final.json never appeared"
+
+# Skipped-concurrent side-record MUST exist under duplicates/ — proves the
+# second dispatcher's flock -n was blocked by the first worker's held fd 9.
+RACE2_DUP_DIR="$REFLECT_ROOT/sessions/$RACE2_SID/duplicates"
+RACE2_CONC_COUNT=0
+if [[ -d "$RACE2_DUP_DIR" ]]; then
+  RACE2_CONC_COUNT=$(find "$RACE2_DUP_DIR" -type f -name '*sessionend-conc*.json' 2>/dev/null | wc -l)
+fi
+(( RACE2_CONC_COUNT == 1 )) \
+  || fail "expected exactly 1 skipped_concurrent record for the racing dispatcher (got $RACE2_CONC_COUNT). Fix not effective — second dispatcher was not blocked."
+
+# One extra defensive check: no artifact-tmp files linger under session_dir/
+# (these would indicate a losing worker never won the mv race).
+LINGER=$(find "$REFLECT_ROOT/sessions/$RACE2_SID" -maxdepth 1 -type f -name '.artifact-*' 2>/dev/null | wc -l)
+(( LINGER == 0 )) \
+  || fail "expected 0 leftover .artifact-* tmp files, got $LINGER (indicates racing mv)"
+
+info "stale-reaper race blocked: 1 skipped_concurrent record, 1 clean final.json"
+
+# Restore canonical stub.
+cat >"$STUB_SCRATCH/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null || true
+cat <<'JSON'
+{"type":"result","result":"{\"patterns\":[\"stubbed pattern\"],\"discoveries\":[],\"turning_points\":[],\"digressions\":[],\"obstacles_to_autonomy\":[]}","usage":{"cache_read_input_tokens":100,"cache_creation_input_tokens":10,"input_tokens":5,"output_tokens":50}}
+JSON
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+# ============================================================================
+# TEST 14: unparseable manifest started_at does NOT trigger phantom reap
+# ============================================================================
+# Regression (Codex P3.7): is_already_complete previously did
+#   started_epoch="$(date -d "$started_at" +%s 2>/dev/null || echo 0)"
+# Unparseable started_at yielded started_epoch=0 → age=now_epoch (huge)
+# → crossed stale threshold → caller was told 'not complete', permitting
+# a duplicate spawn on every subsequent dispatcher fire.
+# Fix: distinguish parse failure from truly-old. Return 0 (treat as
+# in-flight) on unparseable, log to stderr, do NOT permit re-run.
+echo "TEST 14: unparseable started_at is not phantom-reaped"
+
+CORRUPT_SID="test-sid-corrupt-manifest"
+mkdir -p "$REFLECT_ROOT/sessions/$CORRUPT_SID"
+CORRUPT_MANIFEST="$REFLECT_ROOT/sessions/$CORRUPT_SID/manifest.json"
+# Craft a manifest with modes.sessionend.status=started but a garbage
+# timestamp that date -d cannot parse.
+cat >"$CORRUPT_MANIFEST" <<'JSON'
+{
+  "session_id": "test-sid-corrupt-manifest",
+  "modes": {
+    "sessionend": {
+      "status": "started",
+      "started_at": "not-a-real-timestamp-at-all",
+      "final_complete": false
+    }
+  }
+}
+JSON
+
+# Directly exercise is_already_complete via the library — cleaner than
+# firing the dispatcher (which would take other actions).
+CORRUPT_STDERR="$STUB_SCRATCH/corrupt.stderr"
+set +e
+CORRUPT_OUT=$(bash -c "
+  source '$SKILL_DIR/lib.sh'
+  if is_already_complete '$CORRUPT_MANIFEST' sessionend; then
+    echo 'returned-complete'
+  else
+    echo 'returned-not-complete'
+  fi
+" 2>"$CORRUPT_STDERR")
+set -e
+
+[[ "$CORRUPT_OUT" == "returned-complete" ]] \
+  || fail "is_already_complete should return 0 (complete/in-flight) on unparseable started_at; got: $CORRUPT_OUT"
+
+# The stderr line must warn the operator.
+grep -q "unparseable started_at" "$CORRUPT_STDERR" \
+  || fail "expected 'unparseable started_at' stderr; got: $(cat "$CORRUPT_STDERR")"
+info "corrupt started_at keeps in-flight state (no phantom reap), warns to stderr"
+
+# ============================================================================
+if [[ "${REFLECT_DEBUG:-}" != "1" ]]; then
+  rm -rf "$REFLECT_ROOT" "$STUB_SCRATCH"
+fi
+
+echo "OK: all smoke tests passed"
+exit 0

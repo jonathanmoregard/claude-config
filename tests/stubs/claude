@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Test stub: mimics `claude -p --output-format json` output shape.
+# Ignores args + stdin, emits a fixed reflection envelope.
+cat >/dev/null || true  # drain stdin
+cat <<'JSON'
+{"type":"result","result":"{\"patterns\":[\"stubbed pattern\"],\"discoveries\":[],\"turning_points\":[],\"digressions\":[],\"obstacles_to_autonomy\":[]}","usage":{"cache_read_input_tokens":100,"cache_creation_input_tokens":10,"input_tokens":5,"output_tokens":50}}
+JSON
