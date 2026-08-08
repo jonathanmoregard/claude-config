@@ -255,6 +255,15 @@
             "command": "~/.claude/skills/continuous-learning-v2/hooks/observe.sh post"
           }
         ]
+      },
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/visual-verify-trigger.sh"
+          }
+        ]
       }
     ],
     "Stop": [
