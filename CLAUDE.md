@@ -78,8 +78,5 @@ User instructions override everything below.
 - Don't skip it because the question seems quick.
 - Reads: aggregator. Writes: memory dir.
 
-## Visual verify
-- Parent or subagent edits a rendered-view file → invoke `visual-verify` on that surface before moving on. "Looks good" alone is a failure. Tag findings blocker / should-fix / nit, then fix or explicitly defer.
-
 ## PRs
 - Target the repo's default branch. Non-default only when asked, then re-target before merge.
