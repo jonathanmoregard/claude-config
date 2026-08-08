@@ -457,8 +457,15 @@ run_worker() {
     prompt="${prompt//\{\{CHECKPOINTS_BLOCK\}\}/$cp_block}"
   fi
 
-  local worker_log="$REFLECT_LOG_DIR/${SESSION_ID}-${MODE}.stderr.log"
-  local worker_out="$REFLECT_LOG_DIR/${SESSION_ID}-${MODE}.stdout.log"
+  # STEP 7 (LOW P3.8): worker_log / worker_out paths used to be fixed per
+  # (SID, MODE), so a REFLECT_FORCE=1 re-run would clobber the prior run's
+  # forensic log. Add an epoch suffix so every re-run keeps its own log
+  # file. Idempotent runs (no re-fire) still see a single file per SID+MODE
+  # in practice because REFLECT_FORCE gates re-entry.
+  local worker_ts
+  worker_ts="$(date +%s)"
+  local worker_log="$REFLECT_LOG_DIR/${SESSION_ID}-${MODE}-${worker_ts}.stderr.log"
+  local worker_out="$REFLECT_LOG_DIR/${SESSION_ID}-${MODE}-${worker_ts}.stdout.log"
 
   # Timeout budget per mode.
   local budget

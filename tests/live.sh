@@ -61,7 +61,15 @@ rc=$?
 # --- Wait for detached worker (up to ~2 min for a real API call) -------------
 MANIFEST="$REFLECT_ROOT/sessions/$SID/manifest.json"
 FINAL="$REFLECT_ROOT/sessions/$SID/final.json"
-WORKER_OUT="$REFLECT_ROOT/logs/${SID}-sessionend.stdout.log"
+# STEP 7 (P3.8): worker logs are now epoch-suffixed to avoid clobbering
+# forensic history across REFLECT_FORCE re-runs. Resolve the most-recent
+# match at read time rather than assuming a fixed filename.
+resolve_worker_out() {
+  # newest ${SID}-sessionend-*.stdout.log by mtime
+  find "$REFLECT_ROOT/logs" -maxdepth 1 -type f -name "${SID}-sessionend-*.stdout.log" \
+       -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | awk '{print $2}'
+}
+WORKER_OUT="$(resolve_worker_out)"
 
 echo "  -> waiting for detached worker (up to 120s)..."
 for i in $(seq 1 120); do
@@ -116,8 +124,12 @@ if (( REFLECT_CACHE_ASSERT_N > 0 )); then
       fi
       sleep 1
     done
+    # Each re-run gets its own epoch-suffixed worker_out. Re-resolve after
+    # detached worker completes.
+    WORKER_OUT="$(resolve_worker_out)"
+    [[ -f "$WORKER_OUT" ]] || fail "run $r: no worker stdout log resolved"
     CR_N=$(jq -r '.usage.cache_read_input_tokens // 0' "$WORKER_OUT")
-    info "  run $r: cache_read=$CR_N"
+    info "  run $r: cache_read=$CR_N (log=$WORKER_OUT)"
     CACHE_READS+=( "$CR_N" )
   done
 fi
