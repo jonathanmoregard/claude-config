@@ -91,7 +91,7 @@ if [[ "${REFLECT_SUBPROCESS:-0}" == "1" ]]; then
   # mismatch substitute 'nomode_invalid' (mirrors the SID sanitization above).
   _rec_mode="${ARG1:-nomode}"
   case "$_rec_mode" in
-    precompact|sessionend|subagentstop) ;;
+    precompact|sessionend|subagentstop|mission) ;;
     *) _rec_mode="nomode_invalid" ;;
   esac
   _rec_file="$_rec_dir/$(date -u +%Y%m%dT%H%M%SZ)-${_parent_sid}-${_child_sid:-unknown}-${_rec_mode}.json"
@@ -131,6 +131,7 @@ Modes:
   precompact    synchronous, 60s budget, numbered checkpoint under checkpoints/
   sessionend    detached worker, 90s internal budget, writes final.json
   subagentstop  detached worker, 40s internal budget, nests under parent/subagents/
+  mission       synchronous, 60s budget, writes <cwd>/tasks/mission.md (markdown)
 
 See README.md at ~/.claude/skills/session-reflect/README.md
 EOF
@@ -171,7 +172,7 @@ fi
 
 MODE="${MODE:-$ARG1}"
 case "$MODE" in
-  precompact|sessionend|subagentstop) ;;
+  precompact|sessionend|subagentstop|mission) ;;
   *)
     echo "reflect.sh: mode must be one of precompact|sessionend|subagentstop (got: '$MODE')" >&2
     exit 2
@@ -488,6 +489,7 @@ run_worker() {
     precompact)   budget=60 ;;
     subagentstop) budget=40 ;;
     sessionend)   budget=90 ;;
+    mission)      budget=60 ;;
   esac
 
   # Build and run.
@@ -571,6 +573,61 @@ run_worker() {
           '{source_transcript:$tp,hook_event_name:$event,
             parent_session_id:(if $parent == "" then null else $parent end),
             reason:"empty_result_from_claude"}')"
+    return 0
+  fi
+
+  # --- Mission mode: raw markdown out, skip the reflection-JSON pipeline ---
+  # Writes <cwd>/tasks/mission.md atomically. No JSON envelope, no schema
+  # normalisation — this file is read by humans and by fresh agents on
+  # resume; the shape lives in prompts/mission.md's instructions to the
+  # model. Manifest still gets a status update so observability holds.
+  if [[ "$MODE" == "mission" ]]; then
+    local mission_cwd="${CWD:-}"
+    if [[ -z "$mission_cwd" || ! -d "$mission_cwd" ]]; then
+      write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "error" \
+        "$(jq -cn --arg tp "$TRANSCRIPT_PATH" --arg event "$HOOK_EVENT" --arg parent "$PARENT_SID" \
+            --arg cwd "$mission_cwd" \
+            '{source_transcript:$tp,hook_event_name:$event,
+              parent_session_id:(if $parent == "" then null else $parent end),
+              reason:"mission_cwd_missing_or_not_dir",
+              cwd:$cwd}')"
+      return 0
+    fi
+    local mission_dir="$mission_cwd/tasks"
+    local mission_path="$mission_dir/mission.md"
+    if ! mkdir -p "$mission_dir" 2>/dev/null; then
+      write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "error" \
+        "$(jq -cn --arg tp "$TRANSCRIPT_PATH" --arg event "$HOOK_EVENT" --arg parent "$PARENT_SID" \
+            --arg dir "$mission_dir" \
+            '{source_transcript:$tp,hook_event_name:$event,
+              parent_session_id:(if $parent == "" then null else $parent end),
+              reason:"mission_dir_mkdir_failed",
+              dir:$dir}')"
+      return 0
+    fi
+    local mission_tmp
+    mission_tmp="$(mktemp -p "$mission_dir" ".mission-XXXXXX.md")"
+    printf '%s\n' "$inner" > "$mission_tmp"
+    if ! mv -f -- "$mission_tmp" "$mission_path"; then
+      rm -f -- "$mission_tmp"
+      write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "error" \
+        "$(jq -cn --arg tp "$TRANSCRIPT_PATH" --arg event "$HOOK_EVENT" --arg parent "$PARENT_SID" \
+            --arg path "$mission_path" \
+            '{source_transcript:$tp,hook_event_name:$event,
+              parent_session_id:(if $parent == "" then null else $parent end),
+              reason:"mission_mv_failed",
+              path:$path}')"
+      return 0
+    fi
+    local mission_usage
+    mission_usage=$(jq -c '.usage // {}' <<<"$claude_json" 2>/dev/null || echo '{}')
+    write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "complete" \
+      "$(jq -cn --arg tp "$TRANSCRIPT_PATH" --arg event "$HOOK_EVENT" --arg parent "$PARENT_SID" \
+          --arg path "$mission_path" --argjson usage "$mission_usage" \
+          --argjson bytes "${#inner}" \
+          '{source_transcript:$tp,hook_event_name:$event,
+            parent_session_id:(if $parent == "" then null else $parent end),
+            artifact:$path,bytes:$bytes,usage:$usage,final_complete:true}')"
     return 0
   fi
 
@@ -775,10 +832,50 @@ export session_dir final_path manifest_path checkpoint_dir
 export SCRIPT_DIR
 
 if [[ "$MODE" == "precompact" ]]; then
-  # Synchronous: precompact runs while session is still alive.
-  # Holds fd 9 the whole time — natural lock retention.
+  # 2nd-compact defence: if this session has already fired a PreCompact,
+  # write mission.md BEFORE this compact runs. Multiple compacts in one
+  # session is the fetching-water-in-a-sieve pathology
+  # (recursive-self-improvement/proposals/2026-08-02-repeat-compact-in-session.md);
+  # the second compact should at least leave durable handoff state on disk.
+  # Count file is per-session; cleaned up on SessionEnd.
+  compact_count_dir="$REFLECT_ROOT/compact-counts"
+  compact_count_file="$compact_count_dir/$SESSION_ID"
+  mkdir -p "$compact_count_dir" 2>/dev/null || true
+  # Atomic-enough for our purpose: PreCompact hooks are serialised per session
+  # by Claude Code (only one compaction runs at a time), so a plain read-then-
+  # write is fine.
+  compact_count=0
+  [[ -f "$compact_count_file" ]] && compact_count=$(cat "$compact_count_file" 2>/dev/null || echo 0)
+  compact_count=$((compact_count + 1))
+  printf '%d\n' "$compact_count" > "$compact_count_file" 2>/dev/null || true
+
+  if (( compact_count > 1 )); then
+    # Pre-fire mission mode with the same payload. Nested reflect.sh call
+    # runs its own dispatch (different MODE) and writes tasks/mission.md
+    # synchronously. Do not fail this dispatcher if mission mode errors —
+    # a stuck mission.md write must not block the actual precompact
+    # reflection, which is more important than the handoff artifact.
+    # `env -u MODE`: parent already exported MODE=precompact for its own worker
+    # (line ~775); without unsetting it the nested bash inherits precompact via
+    # `MODE="${MODE:-$ARG1}"` and silently re-runs precompact (getting flock-
+    # skipped as skipped_concurrent). Unset in child only; parent's MODE unchanged.
+    printf '%s' "$PAYLOAD" | env -u MODE bash "$SCRIPT_DIR/reflect.sh" mission || true
+  fi
+fi
+
+if [[ "$MODE" == "precompact" || "$MODE" == "mission" ]]; then
+  # Synchronous: precompact runs while session is still alive; mission
+  # runs from either the idle-timer (external) or the 2nd-compact defence
+  # (pre-compact synchronous) — either caller wants the write to finish
+  # before proceeding. Holds fd 9 through natural lock retention.
   run_worker
   exit 0
+fi
+
+# sessionend: also clean up the per-session compact counter (Phase C).
+# Session ended → the counter is no longer meaningful. Non-fatal if it fails.
+if [[ "$MODE" == "sessionend" ]]; then
+  rm -f -- "$REFLECT_ROOT/compact-counts/$SESSION_ID" 2>/dev/null || true
 fi
 
 # sessionend / subagentstop: fire-and-forget.
