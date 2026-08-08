@@ -84,7 +84,17 @@ if [[ "${REFLECT_SUBPROCESS:-0}" == "1" ]]; then
   if [[ -n "$_child_sid" ]] && ! is_valid_sid "$_child_sid"; then
     _child_sid="unknown_bad_sid"
   fi
-  _rec_file="$_rec_dir/$(date -u +%Y%m%dT%H%M%SZ)-${_parent_sid}-${_child_sid:-unknown}-${ARG1:-nomode}.json"
+  # R2 fix (MEDIUM, convergent): ARG1 also hits the filesystem path unvalidated
+  # here — this branch runs BEFORE the mode allow-list at line ~163. Values like
+  # '../evil' or ones with slash/control chars would escape skipped-recursions/.
+  # Validate against the same allow-list the dispatcher enforces later; on
+  # mismatch substitute 'nomode_invalid' (mirrors the SID sanitization above).
+  _rec_mode="${ARG1:-nomode}"
+  case "$_rec_mode" in
+    precompact|sessionend|subagentstop) ;;
+    *) _rec_mode="nomode_invalid" ;;
+  esac
+  _rec_file="$_rec_dir/$(date -u +%Y%m%dT%H%M%SZ)-${_parent_sid}-${_child_sid:-unknown}-${_rec_mode}.json"
   # jq -n with defensive defaults; failure here still exits 0.
   jq -n \
     --arg status "skipped_recursion" \

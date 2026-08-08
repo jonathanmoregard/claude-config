@@ -783,6 +783,45 @@ if find "$REFLECT_ROOT" -path "$REC_DIR_2" -prune -o -type f -name '*evil*' -pri
 fi
 info "recursion marker sanitised bad SIDs to unknown_bad_sid"
 
+# ============================================================================
+# TEST 10c: ARG1 (mode) in recursion marker filename is validated too
+# ============================================================================
+# Regression (R2 MEDIUM, convergent): the sentinel branch runs BEFORE the mode
+# allow-list. ARG1 was interpolated into the marker filename unvalidated. A
+# value like '../evil' or one containing slash/control chars would escape
+# skipped-recursions/. Fix: validate ARG1 against precompact|sessionend|
+# subagentstop and substitute 'nomode_invalid' on mismatch.
+echo "TEST 10c: recursion marker ARG1 (mode) validation"
+
+: > "$COUNTER"
+BAD_MODE_PAYLOAD='{"session_id":"legit-child","transcript_path":"/tmp/x","hook_event_name":"SessionEnd","cwd":"/tmp"}'
+
+set +e
+echo "$BAD_MODE_PAYLOAD" | env REFLECT_SUBPROCESS=1 REFLECT_PARENT_SID=legit-parent \
+  bash "$REFLECT_SH" '../evil' >/dev/null 2>&1
+rc=$?
+set -e
+(( rc == 0 )) || fail "sentinel-path with bad ARG1 exit=$rc (should be 0)"
+
+# claude MUST NOT have been called (sentinel skip).
+INVOCATIONS_BADMODE=$(wc -l < "$COUNTER" 2>/dev/null || echo 0)
+(( INVOCATIONS_BADMODE == 0 )) \
+  || fail "claude invoked $INVOCATIONS_BADMODE time(s) under sentinel with bad ARG1"
+
+# No file with '..' in basename should have been created under skipped-recursions/.
+if find "$REC_DIR_2" -maxdepth 1 -type f -name '*..*' 2>/dev/null | grep -q .; then
+  fail "marker filename contains raw '..' path traversal component from ARG1"
+fi
+# No file should have been created OUTSIDE skipped-recursions/ from the escape attempt.
+if find "$REFLECT_ROOT" -path "$REC_DIR_2" -prune -o -type f -name '*evil*' -print 2>/dev/null | grep -q .; then
+  fail "path traversal via bad ARG1 escaped skipped-recursions/"
+fi
+# The sanitised 'nomode_invalid' sentinel must appear in at least one marker.
+if ! find "$REC_DIR_2" -maxdepth 1 -type f -name '*nomode_invalid*' 2>/dev/null | grep -q .; then
+  fail "no marker with sanitised ARG1 sentinel 'nomode_invalid' found under $REC_DIR_2"
+fi
+info "recursion marker sanitised bad ARG1 to nomode_invalid"
+
 # Restore the canonical stub for any subsequent hypothetical tests.
 cat >"$STUB_SCRATCH/claude" <<'STUB'
 #!/usr/bin/env bash
