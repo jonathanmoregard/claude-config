@@ -512,9 +512,23 @@ run_worker() {
   # is threaded through so the recursion-marker file can attribute the skip.
   # Inline `env FOO=bar` scopes to the child only (no export leak into this
   # worker process, no leak into the manifest-writing path).
+  # `claude --resume <sid>` is cwd-scoped: Claude Code looks up conversations
+  # under the current project's transcript dir, so resuming from the wrong
+  # cwd errors with "No conversation found". The hook payload always carries
+  # the originating cwd; use it. Fall back to $HOME if the payload cwd is
+  # missing or no longer exists (project deleted between hook fire and
+  # worker start) — running claude from $HOME with a bad --resume will fail
+  # loud, which we prefer to succeeding against the wrong project. CWD is
+  # exported from the dispatcher into the worker env; ${CWD:-} guards the
+  # case where the payload lacked a cwd field (older hooks, malformed).
+  local resume_cwd="${CWD:-}"
+  if [[ -z "$resume_cwd" || ! -d "$resume_cwd" ]]; then
+    resume_cwd="$HOME"
+  fi
+
   local claude_json rc
   set +e
-  claude_json=$(timeout "$budget" env \
+  claude_json=$(cd "$resume_cwd" && timeout "$budget" env \
     REFLECT_SUBPROCESS=1 \
     REFLECT_PARENT_SID="$SESSION_ID" \
     claude \
@@ -755,7 +769,7 @@ write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "started" "$extra_json"
 # WORKER's inherited copy keeps the flock alive.
 
 # Export state the worker needs (safe for both sync + detached paths).
-export SESSION_ID PARENT_SID TRANSCRIPT_PATH HOOK_EVENT MODE
+export SESSION_ID PARENT_SID TRANSCRIPT_PATH HOOK_EVENT MODE CWD
 export REFLECT_MODEL REFLECT_ROOT REFLECT_LOG_DIR
 export session_dir final_path manifest_path checkpoint_dir
 export SCRIPT_DIR
