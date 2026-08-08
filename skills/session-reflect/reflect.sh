@@ -244,7 +244,15 @@ mkdir -p "$REFLECT_LOG_DIR"
 # return 0. That erased the observable evidence of the duplicate.
 # Now: keep the pre-existing terminal manifest untouched, and drop a small
 # side-record under $session_dir/duplicates/<epoch>-<mode>.json for observers.
-if is_already_complete "$manifest_path"; then
+#
+# PRECOMPACT EXEMPTION: PreCompact fires multiple times per long session
+# (once per compaction event) and is by design NOT terminal. Skipping this
+# gate for precompact lets each PreCompact write its own checkpoint. The
+# per-manifest flock still prevents two concurrent dispatchers from both
+# spawning workers for the SAME fire. write_manifest() ensures a completed
+# precompact does NOT latch final_complete=true, so a later SessionEnd or
+# repeat PreCompact isn't blocked by an earlier PreCompact's completion.
+if [[ "$MODE" != "precompact" ]] && is_already_complete "$manifest_path"; then
   dup_dir="$session_dir/duplicates"
   mkdir -p "$dup_dir"
   dup_file="$(mktemp -p "$dup_dir" "$(date -u +%Y%m%dT%H%M%SZ)-${MODE}-XXXX.json")"

@@ -139,8 +139,23 @@ write_manifest() {
     complete|timeout|error|skipped_duplicate) terminal=true ;;
   esac
 
+  # `final_complete` is the terminal-forever flag consumed by is_already_complete.
+  # PreCompact is NOT terminal: a long session compacts multiple times, and each
+  # PreCompact is its own checkpoint. Only SessionEnd / SubagentStop completions
+  # latch final_complete=true — precompact completions bump last_checkpoint_at
+  # instead so downstream observers can see progress without the idempotency
+  # gate short-circuiting the next PreCompact fire.
   local final_complete=false
-  [[ "$status" == "complete" ]] && final_complete=true
+  if [[ "$status" == "complete" && "$mode" != "precompact" ]]; then
+    final_complete=true
+  fi
+
+  # last_checkpoint_at: only set when a precompact completes; carried forward
+  # from prior manifest otherwise so subsequent status updates don't erase it.
+  local last_checkpoint_at_json='null'
+  if [[ "$status" == "complete" && "$mode" == "precompact" ]]; then
+    last_checkpoint_at_json="\"$now\""
+  fi
 
   local completed_at_json='null'
   if [[ "$terminal" == "true" ]]; then
@@ -155,6 +170,7 @@ write_manifest() {
     --arg now "$now" \
     --argjson completed_at "$completed_at_json" \
     --argjson final_complete "$final_complete" \
+    --argjson last_checkpoint_at "$last_checkpoint_at_json" \
     --argjson extra "$extra" \
     '. as $prev
      | ($prev.started_at // $now) as $started
@@ -166,7 +182,8 @@ write_manifest() {
            status: $status,
            started_at: $started,
            completed_at: (if $completed_at != null then $completed_at else ($prev.completed_at // null) end),
-           final_complete: $final_complete
+           final_complete: ($prev.final_complete // false or $final_complete),
+           last_checkpoint_at: (if $last_checkpoint_at != null then $last_checkpoint_at else ($prev.last_checkpoint_at // null) end)
          }' <<<"$existing")"
 
   # Atomic write via mktemp — safer than $$ for concurrent workers.

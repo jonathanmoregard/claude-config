@@ -151,6 +151,58 @@ CP_COUNT=$(find "$REFLECT_ROOT/sessions/$PC_SID/checkpoints" -type f -name '*.js
 info "precompact wrote $CP_COUNT checkpoint(s)"
 
 # ============================================================================
+# TEST 3b: two PreCompacts on the same SID must produce two checkpoints
+# ============================================================================
+# Regression: previously, the first PreCompact's completion set
+# final_complete=true on the session manifest. A second PreCompact fire
+# (long sessions compact multiple times) then hit is_already_complete and
+# short-circuited — data loss. Fix: PreCompact skips the idempotency gate
+# and write_manifest never latches final_complete for precompact.
+echo "TEST 3b: repeated PreCompact appends new checkpoint"
+PC2_SID="test-sid-precompact-double"
+PC2_PAYLOAD=$(jq -cn --arg sid "$PC2_SID" --arg tp "$TRANSCRIPT" --arg cwd "$WORKTREE" \
+  '{session_id:$sid, transcript_path:$tp, hook_event_name:"PreCompact", cwd:$cwd, trigger:"auto", custom_instructions:""}')
+
+echo "$PC2_PAYLOAD" | bash "$REFLECT_SH" precompact
+rc=$?
+(( rc == 0 )) || fail "precompact#1 exit=$rc"
+
+# Ensure epoch-ns granularity distinguishes filenames.
+sleep 0.05
+
+echo "$PC2_PAYLOAD" | bash "$REFLECT_SH" precompact
+rc=$?
+(( rc == 0 )) || fail "precompact#2 exit=$rc"
+
+PC2_MANIFEST="$REFLECT_ROOT/sessions/$PC2_SID/manifest.json"
+[[ -f "$PC2_MANIFEST" ]] || fail "double-precompact manifest missing"
+
+# final_complete MUST NOT be true for a precompact-only session.
+if jq -e '.final_complete == true' "$PC2_MANIFEST" >/dev/null 2>&1; then
+  fail "precompact should never latch final_complete=true"
+fi
+
+# last_checkpoint_at MUST be populated by the completed precompact.
+jq -e '.last_checkpoint_at != null' "$PC2_MANIFEST" >/dev/null \
+  || fail "precompact should record last_checkpoint_at (got null)"
+
+# Two checkpoint files, neither run recorded a skipped_duplicate.
+PC2_CP_COUNT=$(find "$REFLECT_ROOT/sessions/$PC2_SID/checkpoints" -type f -name '*.json' 2>/dev/null | wc -l)
+(( PC2_CP_COUNT == 2 )) \
+  || fail "expected 2 checkpoints after two PreCompacts, got $PC2_CP_COUNT"
+
+# No skipped_duplicate side-records (the flock only fires on concurrent-race,
+# and idempotency gate is now bypassed for precompact).
+PC2_DUP_COUNT=0
+if [[ -d "$REFLECT_ROOT/sessions/$PC2_SID/duplicates" ]]; then
+  PC2_DUP_COUNT=$(find "$REFLECT_ROOT/sessions/$PC2_SID/duplicates" -type f -name '*.json' 2>/dev/null | wc -l)
+fi
+(( PC2_DUP_COUNT == 0 )) \
+  || fail "second PreCompact was wrongly skipped ($PC2_DUP_COUNT duplicate marker(s))"
+
+info "two sequential PreCompacts wrote 2 checkpoints, final_complete stayed false"
+
+# ============================================================================
 # TEST 4: subagentstop lands under parent/subagents/<sid>/
 # ============================================================================
 echo "TEST 4: subagentstop artifact placement"
@@ -209,7 +261,7 @@ for bad in "${BAD_SIDS[@]}"; do
 done
 # Ensure no session dir was created for any of these bad SIDs.
 if find "$REFLECT_ROOT/sessions" -mindepth 1 -maxdepth 1 -type d \
-     ! -name '_malformed' ! -name "$SID" ! -name "$PC_SID" ! -name "$PARENT_SID" \
+     ! -name '_malformed' ! -name "$SID" ! -name "$PC_SID" ! -name "$PC2_SID" ! -name "$PARENT_SID" \
      | grep -q .; then
   fail "path traversal created unexpected session dir(s)"
 fi
