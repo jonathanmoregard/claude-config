@@ -168,10 +168,19 @@ find ~/.claude/reflections/sessions -mindepth 1 -maxdepth 1 -type d \
 
 # Delete worker logs older than 14 days
 find ~/.claude/reflections/logs -type f -mtime +14 -delete
+
+# Delete skipped-recursion markers older than 14 days
+# In healthy operation this dir stays near-empty (the REFLECT_SUBPROCESS
+# sentinel keeps recursion from firing at all — each marker is one
+# observability record per skipped child hook). It still accumulates one
+# small JSON per skipped fire over time; a periodic prune keeps it tidy.
+find ~/.claude/reflections/skipped-recursions -type f -mtime +14 -delete
 ```
 
-Do not automate deletion until you have an aggregator consuming these
-artifacts and know what "safe to delete" means for your workflow.
+Do not automate deletion of `sessions/` until you have an aggregator
+consuming those artifacts and know what "safe to delete" means for your
+workflow. `logs/` and `skipped-recursions/` are pure observability records
+with no downstream consumer and are safe to prune on a cron.
 
 ## Failure modes
 
