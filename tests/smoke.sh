@@ -203,6 +203,111 @@ fi
 info "two sequential PreCompacts wrote 2 checkpoints, final_complete stayed false"
 
 # ============================================================================
+# TEST 3d: cross-mode race — PreCompact's transient started state must NOT
+# block a concurrent SessionEnd
+# ============================================================================
+# Regression (Codex R3.1): manifest.json.status was single-mode. PreCompact
+# wrote status=started before spawning its subprocess. If SessionEnd fired
+# within the reaper window (default 600s), is_already_complete saw the fresh
+# "started" and treated SessionEnd as an in-flight duplicate — final.json
+# was never written for that session.
+#
+# Fix: per-mode state map (modes.<mode>.status). PreCompact's state lives
+# under modes.precompact and cannot mask modes.sessionend.
+echo "TEST 3d: cross-mode race — PreCompact 'started' must not block SessionEnd"
+RACE_SID="test-sid-crossmode-race"
+
+# Slow stub: sleep 3s so status=started sticks around long enough for us to
+# race a SessionEnd against it.
+cat >"$STUB_SCRATCH/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null || true
+sleep 3
+cat <<'JSON'
+{"type":"result","result":"{\"patterns\":[\"slow-stub\"],\"discoveries\":[],\"turning_points\":[],\"digressions\":[],\"obstacles_to_autonomy\":[]}","usage":{}}
+JSON
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+RACE_PC_PAYLOAD=$(jq -cn --arg sid "$RACE_SID" --arg tp "$TRANSCRIPT" --arg cwd "$WORKTREE" \
+  '{session_id:$sid, transcript_path:$tp, hook_event_name:"PreCompact", cwd:$cwd, trigger:"auto", custom_instructions:""}')
+RACE_SE_PAYLOAD="$(fake_payload SessionEnd "$RACE_SID")"
+
+# Fire PreCompact asynchronously (it runs synchronously with the slow stub → 3s wall).
+( echo "$RACE_PC_PAYLOAD" | bash "$REFLECT_SH" precompact ) &
+PC_PID=$!
+
+# Wait until the PreCompact "started" state lands on disk (guarantees we race
+# INSIDE the window where the bug would fire).
+RACE_MANIFEST="$REFLECT_ROOT/sessions/$RACE_SID/manifest.json"
+for _ in $(seq 1 40); do
+  if [[ -f "$RACE_MANIFEST" ]] && \
+     jq -e '(.modes.precompact.status // .status) == "started"' "$RACE_MANIFEST" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.1
+done
+if ! [[ -f "$RACE_MANIFEST" ]]; then
+  wait $PC_PID 2>/dev/null || true
+  fail "PreCompact never wrote a manifest"
+fi
+
+# Now fire SessionEnd. Under the bug it sees status=started (fresh) and skips.
+# Under the fix it proceeds and writes final.json.
+echo "$RACE_SE_PAYLOAD" | bash "$REFLECT_SH" sessionend
+rc=$?
+(( rc == 0 )) || { wait $PC_PID 2>/dev/null || true; fail "sessionend during precompact race: exit=$rc"; }
+
+# Wait for both to finish.
+wait $PC_PID 2>/dev/null || true
+
+RACE_FINAL="$REFLECT_ROOT/sessions/$RACE_SID/final.json"
+# SessionEnd MUST have produced final.json. Under the bug this file is missing.
+for _ in $(seq 1 40); do
+  [[ -f "$RACE_FINAL" ]] && break
+  sleep 0.25
+done
+[[ -f "$RACE_FINAL" ]] \
+  || fail "final.json missing after cross-mode race — SessionEnd was wrongly skipped by PreCompact's transient 'started' state"
+
+# SessionEnd must NOT have written a skipped_duplicate side-record.
+RACE_DUP_COUNT=0
+if [[ -d "$REFLECT_ROOT/sessions/$RACE_SID/duplicates" ]]; then
+  # Filter to sessionend-only entries — a concurrent precompact CAN cause a
+  # skipped_concurrent record for other modes, but sessionend itself must
+  # never appear here for this race.
+  RACE_DUP_COUNT=$(find "$REFLECT_ROOT/sessions/$RACE_SID/duplicates" -type f -name '*sessionend*.json' 2>/dev/null | wc -l)
+fi
+(( RACE_DUP_COUNT == 0 )) \
+  || fail "SessionEnd was wrongly recorded as duplicate ($RACE_DUP_COUNT sessionend duplicate marker(s))"
+
+# Modes map: after fix, both modes should have their own state; precompact.complete
+# and sessionend.complete should coexist. Under the bug (single-mode manifest)
+# the last write wins and we'd only see one mode's state.
+jq -e '.modes.precompact.status == "complete" and .modes.sessionend.status == "complete"' "$RACE_MANIFEST" >/dev/null \
+  || fail "expected modes.precompact.status=complete AND modes.sessionend.status=complete after race (got: $(jq -c '.modes' "$RACE_MANIFEST"))"
+
+# SessionEnd's terminal must have latched final_complete on its own mode entry.
+jq -e '.modes.sessionend.final_complete == true' "$RACE_MANIFEST" >/dev/null \
+  || fail "modes.sessionend.final_complete should be true after SessionEnd completion"
+
+# PreCompact must NOT have latched final_complete (it's non-terminal by design).
+jq -e '.modes.precompact.final_complete == false' "$RACE_MANIFEST" >/dev/null \
+  || fail "modes.precompact.final_complete should be false"
+
+info "cross-mode race resolved: both precompact + sessionend completed independently"
+
+# Restore canonical stub for downstream tests.
+cat >"$STUB_SCRATCH/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null || true
+cat <<'JSON'
+{"type":"result","result":"{\"patterns\":[\"stubbed pattern\"],\"discoveries\":[],\"turning_points\":[],\"digressions\":[],\"obstacles_to_autonomy\":[]}","usage":{"cache_read_input_tokens":100,"cache_creation_input_tokens":10,"input_tokens":5,"output_tokens":50}}
+JSON
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+# ============================================================================
 # TEST 3c: single oversized checkpoint gets per-file truncated
 # ============================================================================
 # The sessionend prompt-assembly loop always includes at least one
