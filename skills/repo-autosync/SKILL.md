@@ -73,6 +73,36 @@ Use `crontab -e` or `(crontab -l; echo "...") | crontab -`. Add `CRON_TZ=Europe/
 /path/to/repo/sync-agent.sh
 ```
 
+### Guards and failure surfacing
+
+`sync-agent.sh` fails closed and notifies on every abort path — cron has
+nobody watching stdout, so a silent failure is indistinguishable from a
+successful no-op. (Observed: aggregator failed 4 consecutive runs on a
+Claude usage limit and went unnoticed for six days.)
+
+Both guards scan only the files the run would actually commit — tracked
+changes vs `HEAD` plus untracked-not-ignored — never the whole worktree.
+Scanning the tree walks gitignored runtime dirs; on `~/.claude` that meant
+hundreds of MB of session transcripts (>6 min, unfinished) versus 1.8s
+scoped.
+
+Abort paths, each emitting a stderr line plus a critical desktop
+notification via `notify-send`:
+
+| Guard | Trigger |
+|-------|---------|
+| Oversized file | any pending file > 5 MiB (`SYNC_MAX_FILE_BYTES` to override) |
+| Secret scan | `gitleaks` missing, or a finding in a pending file |
+| Agent failure | `claude` exits non-zero — usage limit, expired auth, API down |
+| Incomplete sync | `claude` exits 0 but the worktree is still dirty |
+| Unpushed | commits made but `origin/$BRANCH` still behind |
+
+Success is silent and exits 0. The notifier writes its log line first so
+failures stay diagnosable headless, then attempts the desktop notification
+best-effort — a missing notification daemon must not become a second
+failure. Cron inherits no session bus, so the script points
+`DBUS_SESSION_BUS_ADDRESS` at `/run/user/$(id -u)/bus` when unset.
+
 ## Mode 2: upstream-merge
 
 ### Install
