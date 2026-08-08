@@ -65,16 +65,18 @@ WORKER_OUT="$REFLECT_ROOT/logs/${SID}-sessionend.stdout.log"
 
 echo "  -> waiting for detached worker (up to 120s)..."
 for i in $(seq 1 120); do
-  if [[ -f "$MANIFEST" ]] && jq -e '.status == "complete" or .status == "timeout" or .status == "error"' "$MANIFEST" >/dev/null 2>&1; then
+  if [[ -f "$MANIFEST" ]] && \
+     jq -e '.modes.sessionend.status == "complete" or .modes.sessionend.status == "timeout" or .modes.sessionend.status == "error"' \
+       "$MANIFEST" >/dev/null 2>&1; then
     break
   fi
   sleep 1
 done
 
-STATUS="$(jq -r '.status // "missing"' "$MANIFEST" 2>/dev/null || echo missing)"
+STATUS="$(jq -r '.modes.sessionend.status // "missing"' "$MANIFEST" 2>/dev/null || echo missing)"
 info "final status: $STATUS"
 
-[[ "$STATUS" == "complete" ]] || fail "worker did not complete (status=$STATUS); see $REFLECT_ROOT/logs/"
+[[ "$STATUS" == "complete" ]] || fail "worker did not complete (modes.sessionend.status=$STATUS); see $REFLECT_ROOT/logs/"
 
 # --- Validate artifact schema ------------------------------------------------
 [[ -f "$FINAL" ]] || fail "final.json missing at $FINAL"

@@ -252,7 +252,7 @@ mkdir -p "$REFLECT_LOG_DIR"
 # spawning workers for the SAME fire. write_manifest() ensures a completed
 # precompact does NOT latch final_complete=true, so a later SessionEnd or
 # repeat PreCompact isn't blocked by an earlier PreCompact's completion.
-if [[ "$MODE" != "precompact" ]] && is_already_complete "$manifest_path"; then
+if [[ "$MODE" != "precompact" ]] && is_already_complete "$manifest_path" "$MODE"; then
   dup_dir="$session_dir/duplicates"
   mkdir -p "$dup_dir"
   dup_file="$(mktemp -p "$dup_dir" "$(date -u +%Y%m%dT%H%M%SZ)-${MODE}-XXXX.json")"

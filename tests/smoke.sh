@@ -65,10 +65,13 @@ fake_payload() {
 }
 
 wait_for_complete() {
-  local mpath="$1" timeout="${2:-10}"
+  # Per-mode schema: check modes.<mode>.final_complete for the given mode
+  # (default: sessionend, the primary "session done" signal).
+  local mpath="$1" timeout="${2:-10}" mode="${3:-sessionend}"
   local start=$SECONDS
   while (( SECONDS - start < timeout )); do
-    if [[ -f "$mpath" ]] && jq -e '.final_complete == true' "$mpath" >/dev/null 2>&1; then
+    if [[ -f "$mpath" ]] && \
+       jq -e --arg m "$mode" '.modes[$m].final_complete == true' "$mpath" >/dev/null 2>&1; then
       return 0
     fi
     sleep 0.2
@@ -120,12 +123,12 @@ rc=$?
 sleep 2
 
 FINAL_MTIME2=$(stat -c '%Y' "$FINAL")
-STATUS=$(jq -r '.status' "$MANIFEST")
+STATUS=$(jq -r '.modes.sessionend.status // ""' "$MANIFEST")
 
 if [[ "$FINAL_MTIME1" == "$FINAL_MTIME2" || "$STATUS" == "skipped_duplicate" ]]; then
-  info "idempotent (mtime unchanged or status=skipped_duplicate)"
+  info "idempotent (mtime unchanged or modes.sessionend.status=skipped_duplicate)"
 else
-  fail "final.json mtime changed and status != skipped_duplicate (status=$STATUS)"
+  fail "final.json mtime changed and modes.sessionend.status != skipped_duplicate (status=$STATUS)"
 fi
 
 # ============================================================================
@@ -142,8 +145,8 @@ rc=$?
 
 PC_MANIFEST="$REFLECT_ROOT/sessions/$PC_SID/manifest.json"
 [[ -f "$PC_MANIFEST" ]] || fail "precompact manifest missing"
-jq -e '.status == "complete"' "$PC_MANIFEST" >/dev/null \
-  || fail "precompact manifest status != complete (got: $(jq -r .status "$PC_MANIFEST"))"
+jq -e '.modes.precompact.status == "complete"' "$PC_MANIFEST" >/dev/null \
+  || fail "precompact modes.precompact.status != complete (got: $(jq -r '.modes.precompact.status' "$PC_MANIFEST"))"
 
 # At least one checkpoint file present
 CP_COUNT=$(find "$REFLECT_ROOT/sessions/$PC_SID/checkpoints" -type f -name '*.json' 2>/dev/null | wc -l)
@@ -177,14 +180,14 @@ rc=$?
 PC2_MANIFEST="$REFLECT_ROOT/sessions/$PC2_SID/manifest.json"
 [[ -f "$PC2_MANIFEST" ]] || fail "double-precompact manifest missing"
 
-# final_complete MUST NOT be true for a precompact-only session.
-if jq -e '.final_complete == true' "$PC2_MANIFEST" >/dev/null 2>&1; then
-  fail "precompact should never latch final_complete=true"
+# modes.precompact.final_complete MUST NOT be true for a precompact-only session.
+if jq -e '.modes.precompact.final_complete == true' "$PC2_MANIFEST" >/dev/null 2>&1; then
+  fail "precompact should never latch modes.precompact.final_complete=true"
 fi
 
-# last_checkpoint_at MUST be populated by the completed precompact.
-jq -e '.last_checkpoint_at != null' "$PC2_MANIFEST" >/dev/null \
-  || fail "precompact should record last_checkpoint_at (got null)"
+# modes.precompact.last_checkpoint_at MUST be populated by the completed precompact.
+jq -e '.modes.precompact.last_checkpoint_at != null' "$PC2_MANIFEST" >/dev/null \
+  || fail "precompact should record modes.precompact.last_checkpoint_at (got null)"
 
 # Two checkpoint files, neither run recorded a skipped_duplicate.
 PC2_CP_COUNT=$(find "$REFLECT_ROOT/sessions/$PC2_SID/checkpoints" -type f -name '*.json' 2>/dev/null | wc -l)
@@ -242,7 +245,7 @@ PC_PID=$!
 RACE_MANIFEST="$REFLECT_ROOT/sessions/$RACE_SID/manifest.json"
 for _ in $(seq 1 40); do
   if [[ -f "$RACE_MANIFEST" ]] && \
-     jq -e '(.modes.precompact.status // .status) == "started"' "$RACE_MANIFEST" >/dev/null 2>&1; then
+     jq -e '.modes.precompact.status == "started"' "$RACE_MANIFEST" >/dev/null 2>&1; then
     break
   fi
   sleep 0.1
@@ -263,8 +266,11 @@ wait $PC_PID 2>/dev/null || true
 
 RACE_FINAL="$REFLECT_ROOT/sessions/$RACE_SID/final.json"
 # SessionEnd MUST have produced final.json. Under the bug this file is missing.
-for _ in $(seq 1 40); do
-  [[ -f "$RACE_FINAL" ]] && break
+# The sessionend worker was detached with the slow stub (sleep 3s) — wait long
+# enough for it AND the completion write to land on disk.
+for _ in $(seq 1 80); do
+  [[ -f "$RACE_FINAL" ]] && \
+    jq -e '.modes.sessionend.final_complete == true' "$RACE_MANIFEST" >/dev/null 2>&1 && break
   sleep 0.25
 done
 [[ -f "$RACE_FINAL" ]] \
@@ -395,8 +401,8 @@ rc=$?
 SUB_MANIFEST="$REFLECT_ROOT/sessions/$PARENT_SID/subagents/$SUB_SID/manifest.json"
 SUB_FINAL="$REFLECT_ROOT/sessions/$PARENT_SID/subagents/$SUB_SID/final.json"
 
-wait_for_complete "$SUB_MANIFEST" 10 \
-  || fail "subagent manifest never final_complete (path=$SUB_MANIFEST)"
+wait_for_complete "$SUB_MANIFEST" 10 subagentstop \
+  || fail "subagent manifest never modes.subagentstop.final_complete (path=$SUB_MANIFEST)"
 
 [[ -f "$SUB_FINAL" ]] || fail "subagent final.json missing at $SUB_FINAL"
 jq -e '.patterns' "$SUB_FINAL" >/dev/null || fail "subagent final.json invalid"
@@ -433,6 +439,7 @@ done
 # Ensure no session dir was created for any of these bad SIDs.
 if find "$REFLECT_ROOT/sessions" -mindepth 1 -maxdepth 1 -type d \
      ! -name '_malformed' ! -name "$SID" ! -name "$PC_SID" ! -name "$PC2_SID" \
+     ! -name "$RACE_SID" \
      ! -name "$BIG_SID" ! -name "$PARENT_SID" \
      | grep -q .; then
   fail "path traversal created unexpected session dir(s)"
@@ -511,29 +518,32 @@ BAD_JSON_SID="test-sid-badjson"
 BP="$(fake_payload SessionEnd "$BAD_JSON_SID")"
 echo "$BP" | bash "$REFLECT_SH" sessionend >/dev/null
 BJ_MAN="$REFLECT_ROOT/sessions/$BAD_JSON_SID/manifest.json"
-# Wait for terminal state
+# Wait for terminal state (per-mode schema: modes.sessionend.status).
 for _ in $(seq 1 40); do
-  if [[ -f "$BJ_MAN" ]] && jq -e '.status == "error"' "$BJ_MAN" >/dev/null 2>&1; then
+  if [[ -f "$BJ_MAN" ]] && jq -e '.modes.sessionend.status == "error"' "$BJ_MAN" >/dev/null 2>&1; then
     break
   fi
   sleep 0.25
 done
-jq -e '.status == "error"' "$BJ_MAN" >/dev/null \
-  || fail "bad reflection JSON should produce status=error (got: $(jq -r .status "$BJ_MAN"))"
-jq -e '.reason == "unparseable_reflection_json"' "$BJ_MAN" >/dev/null \
-  || fail "bad reflection JSON should set reason=unparseable_reflection_json"
+jq -e '.modes.sessionend.status == "error"' "$BJ_MAN" >/dev/null \
+  || fail "bad reflection JSON should produce modes.sessionend.status=error (got: $(jq -r '.modes.sessionend.status' "$BJ_MAN"))"
+jq -e '.modes.sessionend.reason == "unparseable_reflection_json"' "$BJ_MAN" >/dev/null \
+  || fail "bad reflection JSON should set modes.sessionend.reason=unparseable_reflection_json"
 # Must NOT embed the full raw body — an excerpt is OK; check it doesn't contain
 # the tail of the poison payload (verifies truncation policy).
-if jq -r '.raw_excerpt // ""' "$BJ_MAN" | grep -q '{{{'; then
+if jq -r '.modes.sessionend.raw_excerpt // ""' "$BJ_MAN" | grep -q '{{{'; then
   # Excerpt of first 200 chars may contain the marker; that's OK, but must not be full body.
-  RAW_LEN=$(jq -r '.raw_excerpt // "" | length' "$BJ_MAN")
+  RAW_LEN=$(jq -r '.modes.sessionend.raw_excerpt // "" | length' "$BJ_MAN")
   (( RAW_LEN <= 200 )) || fail "raw_excerpt exceeds 200 chars ($RAW_LEN)"
 fi
-# Must NOT have the old .raw field carrying the whole body.
+# Must NOT have the old .raw field carrying the whole body (at top level or under mode).
 if jq -e 'has("raw") and (.raw | length > 200)' "$BJ_MAN" >/dev/null 2>&1; then
-  fail "manifest leaks large raw body (.raw > 200 chars)"
+  fail "manifest leaks large raw body (.raw > 200 chars at top level)"
 fi
-info "unparseable JSON handled (status=error, no full-body leak)"
+if jq -e '.modes.sessionend | has("raw") and (.raw | length > 200)' "$BJ_MAN" >/dev/null 2>&1; then
+  fail "manifest leaks large raw body (.modes.sessionend.raw > 200 chars)"
+fi
+info "unparseable JSON handled (modes.sessionend.status=error, no full-body leak)"
 
 # ============================================================================
 # TEST 10: REFLECT_SUBPROCESS sentinel breaks recursion

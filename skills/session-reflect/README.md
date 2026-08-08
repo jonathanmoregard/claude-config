@@ -56,11 +56,33 @@ Every `final.json` and `*-precompact.json` conforms to this schema:
 }
 ```
 
-`manifest.json` mirrors the metadata and adds `status`
+`manifest.json` is a **per-mode state map** (R3.1 fix for cross-mode race):
+
+```json
+{
+  "session_id":        "...",
+  "parent_session_id": null,
+  "hook_event_name":   "...",
+  "source_transcript": "...",
+  "modes": {
+    "precompact":   { "status": "complete", "started_at": "...", "completed_at": "...", "final_complete": false, "last_checkpoint_at": "...", "artifact": "...", "usage": {...} },
+    "sessionend":   { "status": "complete", "started_at": "...", "completed_at": "...", "final_complete": true,  "artifact": "...", "usage": {...} },
+    "subagentstop": { "status": "complete", "started_at": "...", "completed_at": "...", "final_complete": true,  "artifact": "...", "usage": {...} }
+  }
+}
+```
+
+Each mode carries its own `status`
 (`started | complete | timeout | error | skipped_duplicate`),
-`started_at`, `completed_at`, `final_complete`, and (for the terminal
-`skipped_duplicate` case) records that a duplicate invocation was seen but
-skipped.
+`started_at`, `completed_at`, `final_complete`, and mode-specific extras
+(`artifact`, `usage`, `reason`, `raw_excerpt`, `raw_len`, `timeout_seconds`,
+`subprocess_exit_code`, `trigger`, `model`). Nesting per-mode is what
+prevents PreCompact's transient `started` state from blocking a concurrent
+SessionEnd or SubagentStop — each mode's idempotency check reads only
+`modes.<mode>`.
+
+The terminal `skipped_duplicate` case is recorded as a side-file under
+`duplicates/` rather than mutating the manifest, preserving evidence.
 
 ## Hook configuration
 
@@ -113,7 +135,7 @@ is documented inside `settings-patch.json` under `_comment`.
 |-----|---------|---------|
 | `REFLECT_MODEL` | `haiku` | Model alias (or full id) for reflection subprocess. Alias `haiku` resolves to the latest Haiku tier and survives model retirement. Use `sonnet`/`opus` only if you need richer synthesis. |
 | `REFLECT_ROOT` | `$HOME/.claude/reflections` | Artifact root. Override for tests. Must be writable. |
-| `REFLECT_FORCE` | (unset) | Truthy values (`1`, `true`, `yes`, `on`, case-insensitive) bypass the idempotency guard and re-run even if `final_complete: true`. Any other value = falsy. |
+| `REFLECT_FORCE` | (unset) | Truthy values (`1`, `true`, `yes`, `on`, case-insensitive) bypass the idempotency guard and re-run even if `modes.<mode>.final_complete: true`. Any other value = falsy. |
 | `REFLECT_LOG_DIR` | `$REFLECT_ROOT/logs` | Worker stdout / stderr logs. |
 | `REFLECT_STALE_STARTED_SECONDS` | `600` | If a manifest is stuck at `status=started` older than this many seconds, treat as a crashed prior run and permit re-run. |
 | `REFLECT_LIVE_TEST` | (unset) | `1` opts `tests/live.sh` into a real-API smoke. |
@@ -133,9 +155,11 @@ they survive kitty close, `exit`, and the parent Claude Code process
 terminating. `SIGKILL`, hard OS shutdown, and crashes remain out of scope
 (hooks cannot fire in those cases).
 
-Reflection is idempotent: reruns with the same session id and a
-`final_complete: true` manifest exit fast without spawning a new
-subprocess, unless `REFLECT_FORCE=1`.
+Reflection is idempotent per-mode: reruns for the same `(session_id, mode)`
+with `modes.<mode>.final_complete: true` exit fast without spawning a new
+subprocess, unless `REFLECT_FORCE=1`. Different modes for the same session
+never block each other — a PreCompact in flight does not stop SessionEnd
+from producing `final.json`.
 
 ## Inspecting artifacts
 
@@ -193,13 +217,16 @@ with no downstream consumer and are safe to prune on a cron.
 - **Concurrent invocation.** If a second dispatcher can't get the
   per-session `flock`, it records a `skipped_concurrent` marker under
   `<session_dir>/duplicates/` and exits fast without spawning a worker.
-- **Duplicate after completion.** If a session's manifest is already
-  `final_complete: true`, a fresh invocation records a `skipped_duplicate`
-  marker under `<session_dir>/duplicates/` and exits without touching the
-  original manifest or artifacts.
-- **Stale `started` manifest.** If a manifest sits at `status=started`
-  older than `REFLECT_STALE_STARTED_SECONDS` (default 600s), the guard
-  treats it as a crashed prior run and permits a fresh run.
+- **Duplicate after completion (per-mode).** If a session's manifest has
+  `modes.<mode>.final_complete: true` for the invoked mode, a fresh
+  invocation records a `skipped_duplicate` marker under
+  `<session_dir>/duplicates/` and exits without touching the original
+  manifest or artifacts. Other modes are unaffected — SessionEnd can still
+  produce `final.json` even after PreCompact's mode is terminal-complete.
+- **Stale `started` manifest (per-mode).** If `modes.<mode>.status`
+  is `started` and `modes.<mode>.started_at` is older than
+  `REFLECT_STALE_STARTED_SECONDS` (default 600s), the guard treats it as a
+  crashed prior run for that mode and permits a fresh run.
 - **`claude` subprocess exits non-zero.** Manifest status becomes
   `error` with `subprocess_exit_code`. Stderr in
   `logs/<sid>-<mode>.stderr.log`.

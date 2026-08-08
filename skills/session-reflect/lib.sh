@@ -113,11 +113,36 @@ ensure_session_dirs() {
 
 # --- Manifest write (atomic) -------------------------------------------------
 # write_manifest <path> <session_id> <mode> <status> [extra-json]
-# Merges over any pre-existing manifest; sets started_at once (from first
-# write) and completed_at when status is a terminal state.
+# Merges over any pre-existing manifest; sets modes.<mode>.started_at once
+# (from first write for that mode) and modes.<mode>.completed_at when status
+# is a terminal state.
+#
+# Schema (per-mode state map — R3.1 fix for cross-mode race):
+#   {
+#     "session_id":        "...",
+#     "parent_session_id": "..." | null,
+#     "hook_event_name":   "..." | null,
+#     "source_transcript": "..." | null,
+#     "modes": {
+#       "precompact":   { "status":"...", "started_at":"...", "completed_at":..., "final_complete":false, "last_checkpoint_at":"..." },
+#       "sessionend":   { "status":"...", "started_at":"...", "completed_at":..., "final_complete":true },
+#       "subagentstop": { "status":"...", "started_at":"...", "completed_at":..., "final_complete":true }
+#     }
+#   }
+#
+# Rationale: PreCompact's transient `started` state used to sit on the shared
+# top-level `status` field and, within the stale-reaper window, blocked
+# SessionEnd / SubagentStop via is_already_complete. Nesting per-mode ensures
+# one mode's in-flight state cannot mask another mode's completion.
 #
 # Terminal statuses: complete | timeout | error | skipped_duplicate
 # Non-terminal:      started
+#
+# NOTE: no backwards-compat read path. Fresh install; no legacy artifacts
+# on disk. If a legacy top-level `status` manifest is encountered by
+# is_already_complete or write_manifest, it will be transparently replaced
+# by the per-mode shape on the next write (extras + shared fields are
+# preserved via the jq merge).
 write_manifest() {
   local mpath="$1" sid="$2" mode="$3" status="$4" extra="${5:-{\}}"
   local now
@@ -139,19 +164,19 @@ write_manifest() {
     complete|timeout|error|skipped_duplicate) terminal=true ;;
   esac
 
-  # `final_complete` is the terminal-forever flag consumed by is_already_complete.
-  # PreCompact is NOT terminal: a long session compacts multiple times, and each
-  # PreCompact is its own checkpoint. Only SessionEnd / SubagentStop completions
-  # latch final_complete=true — precompact completions bump last_checkpoint_at
-  # instead so downstream observers can see progress without the idempotency
-  # gate short-circuiting the next PreCompact fire.
+  # `final_complete` (per-mode) is the terminal-forever flag consumed by
+  # is_already_complete. PreCompact is NOT terminal: a long session compacts
+  # multiple times, and each PreCompact is its own checkpoint. Only SessionEnd
+  # / SubagentStop completions latch modes.<mode>.final_complete=true —
+  # precompact completions bump modes.precompact.last_checkpoint_at instead
+  # so downstream observers can see progress without the idempotency gate
+  # short-circuiting the next PreCompact fire.
   local final_complete=false
   if [[ "$status" == "complete" && "$mode" != "precompact" ]]; then
     final_complete=true
   fi
 
-  # last_checkpoint_at: only set when a precompact completes; carried forward
-  # from prior manifest otherwise so subsequent status updates don't erase it.
+  # last_checkpoint_at: only set when a precompact completes.
   local last_checkpoint_at_json='null'
   if [[ "$status" == "complete" && "$mode" == "precompact" ]]; then
     last_checkpoint_at_json="\"$now\""
@@ -162,6 +187,19 @@ write_manifest() {
     completed_at_json="\"$now\""
   fi
 
+  # Merge:
+  #   * Session-shared top-level fields: session_id, parent_session_id,
+  #     hook_event_name, source_transcript. These are hoisted out of $extra
+  #     because they're stable per-session and consumers (aggregators)
+  #     shouldn't have to hunt through mode entries for them.
+  #   * modes.<mode> holds this mode's own state (status/started_at/
+  #     completed_at/final_complete/last_checkpoint_at) PLUS any mode-specific
+  #     extras (reason, artifact, usage, timeout_seconds, subprocess_exit_code,
+  #     trigger, model, raw_excerpt, raw_len). Other modes' entries are
+  #     preserved verbatim so a PreCompact write cannot clobber SessionEnd's
+  #     completion (or vice versa).
+  #   * started_at for a mode is set on first write and carried forward.
+  #   * final_complete is OR-latched per-mode: once true, stays true.
   local merged
   merged="$(jq -c \
     --arg sid "$sid" \
@@ -173,18 +211,33 @@ write_manifest() {
     --argjson last_checkpoint_at "$last_checkpoint_at_json" \
     --argjson extra "$extra" \
     '. as $prev
-     | ($prev.started_at // $now) as $started
-     | $prev
-       + $extra
-       + {
-           session_id: $sid,
-           mode: $mode,
-           status: $status,
-           started_at: $started,
-           completed_at: (if $completed_at != null then $completed_at else ($prev.completed_at // null) end),
-           final_complete: ($prev.final_complete // false or $final_complete),
-           last_checkpoint_at: (if $last_checkpoint_at != null then $last_checkpoint_at else ($prev.last_checkpoint_at // null) end)
-         }' <<<"$existing")"
+     | ($prev.modes // {}) as $prev_modes
+     | ($prev_modes[$mode] // {}) as $prev_mode
+     | ($prev_mode.started_at // $now) as $started
+     | ($prev_mode.final_complete // false) as $prev_final_complete
+     | ($prev_mode.last_checkpoint_at // null) as $prev_last_cp
+     # Session-shared fields to hoist out of $extra to top level.
+     | ($extra.source_transcript // $prev.source_transcript // null) as $tp
+     | ($extra.hook_event_name   // $prev.hook_event_name   // null) as $ev
+     | ($extra.parent_session_id // $prev.parent_session_id // null) as $psid
+     # Mode-scoped extras: everything in $extra minus the hoisted keys.
+     | ($extra | del(.source_transcript, .hook_event_name, .parent_session_id)) as $mode_extras
+     | ($prev
+        + {
+            session_id:        $sid,
+            parent_session_id: $psid,
+            hook_event_name:   $ev,
+            source_transcript: $tp,
+            modes: ($prev_modes + {
+              ($mode): ($prev_mode + $mode_extras + {
+                status: $status,
+                started_at: $started,
+                completed_at: (if $completed_at != null then $completed_at else ($prev_mode.completed_at // null) end),
+                final_complete: ($prev_final_complete or $final_complete),
+                last_checkpoint_at: (if $last_checkpoint_at != null then $last_checkpoint_at else $prev_last_cp end)
+              })
+            })
+          })' <<<"$existing")"
 
   # Atomic write via mktemp — safer than $$ for concurrent workers.
   local tmp
@@ -194,28 +247,37 @@ write_manifest() {
 }
 
 # --- Idempotency guard -------------------------------------------------------
-# is_already_complete <manifest_path>
-# Returns 0 if final_complete==true (skip re-run) unless REFLECT_FORCE is
-# truthy (1|true|yes|on, case-insensitive).
+# is_already_complete <manifest_path> <mode>
+# Returns 0 if modes.<mode>.final_complete==true (skip re-run) unless
+# REFLECT_FORCE is truthy (1|true|yes|on, case-insensitive).
 #
-# Stale-started reaper: a manifest stuck at status=started older than
+# The <mode> argument is required (R3.1 fix): the manifest is a per-mode state
+# map, so idempotency is checked per-mode. PreCompact's transient `started`
+# state under modes.precompact does NOT block SessionEnd (modes.sessionend)
+# or SubagentStop (modes.subagentstop), and vice versa.
+#
+# Stale-started reaper: a mode stuck at status=started older than
 # REFLECT_STALE_STARTED_SECONDS (default 600s) is treated as a crashed prior
 # run and NOT counted as "already complete" — the caller may proceed.
 is_already_complete() {
-  local mpath="$1"
+  local mpath="$1" mode="${2:-}"
+  if [[ -z "$mode" ]]; then
+    echo "is_already_complete: mode argument is required" >&2
+    return 2
+  fi
   if reflect_truthy "${REFLECT_FORCE:-}"; then
     return 1
   fi
   [[ -f "$mpath" ]] || return 1
-  # If terminal-complete, skip.
-  if jq -e '.final_complete == true' "$mpath" >/dev/null 2>&1; then
+  # If this mode is terminal-complete, skip.
+  if jq -e --arg m "$mode" '.modes[$m].final_complete == true' "$mpath" >/dev/null 2>&1; then
     return 0
   fi
-  # If status=started but ancient, treat as crashed and allow re-run.
+  # If this mode's status=started but ancient, treat as crashed and allow re-run.
   local status started_at started_epoch now_epoch age
-  status="$(jq -r '.status // ""' "$mpath" 2>/dev/null || echo '')"
+  status="$(jq -r --arg m "$mode" '.modes[$m].status // ""' "$mpath" 2>/dev/null || echo '')"
   if [[ "$status" == "started" ]]; then
-    started_at="$(jq -r '.started_at // ""' "$mpath" 2>/dev/null || echo '')"
+    started_at="$(jq -r --arg m "$mode" '.modes[$m].started_at // ""' "$mpath" 2>/dev/null || echo '')"
     if [[ -n "$started_at" ]]; then
       # date -d parses ISO-8601 UTC.
       started_epoch="$(date -d "$started_at" +%s 2>/dev/null || echo 0)"
@@ -225,8 +287,9 @@ is_already_complete() {
         return 1  # stale — treat as not-complete, permit re-run
       fi
     fi
-    # Fresh started — another worker is likely in-flight; treat as complete
-    # to avoid duplicate spawning.
+    # Fresh started for THIS mode — another worker for this mode is likely
+    # in-flight; treat as complete to avoid duplicate spawning. Other modes
+    # are unaffected because we scoped the check to modes.<mode>.
     return 0
   fi
   return 1
