@@ -655,10 +655,36 @@ fi
 # Write "started" manifest first so idempotency check + observers can see us.
 write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "started" "$extra_json"
 
-# Release the concurrency lock now that "started" is on disk. Any concurrent
-# dispatcher will see status=started (fresh, within the reaper window) and
-# treat it as already-in-flight via is_already_complete.
-exec 9>&-
+# STEP 3 (HIGH P3.3): stale-reaper race on final.json.
+#
+# Previously: after writing 'started' we released fd 9 (the per-mode
+# dispatcher lock), then detached the worker. Downside — if the reaper
+# window (default 600s) expired mid-claude-call, a second dispatcher would
+# permit itself to spawn a second worker, and both workers would race to
+# `mv` their own tmp file to final.json. Last-write-wins silently discards
+# one reflection.
+#
+# Fix (Approach C from Codex briefing): hold the per-mode lock for the
+# ENTIRE claude call, not just up to the `started` write. In our
+# architecture that means letting the detached worker INHERIT fd 9 rather
+# than closing it in the dispatcher. `flock(2)` locks are per-open-file-
+# description; both processes share the parent's `exec 9>` open file, so
+# once the dispatcher's fd is closed (dispatcher exit), the worker still
+# holds a reference and the lock persists until the worker exits.
+#
+# Second dispatcher (fired within the reaper window with a live worker
+# still holding the lock) will `flock -n` on a fresh open file → EAGAIN →
+# writes skipped_concurrent to duplicates/. Correct — the earlier
+# is_already_complete check would have short-circuited it anyway, but the
+# defence-in-depth flock catches the race between is_already_complete's
+# read and the worker's not-yet-latched final_complete.
+#
+# For precompact (synchronous run inline below), the current process
+# retains fd 9 through run_worker naturally — no change needed.
+#
+# fd 9 is NOT closed here for sessionend/subagentstop. It's closed
+# implicitly when the DISPATCHER process exits after detach, but the
+# WORKER's inherited copy keeps the flock alive.
 
 # Export state the worker needs (safe for both sync + detached paths).
 export SESSION_ID PARENT_SID TRANSCRIPT_PATH HOOK_EVENT MODE
@@ -668,6 +694,7 @@ export SCRIPT_DIR
 
 if [[ "$MODE" == "precompact" ]]; then
   # Synchronous: precompact runs while session is still alive.
+  # Holds fd 9 the whole time — natural lock retention.
   run_worker
   exit 0
 fi
@@ -678,10 +705,10 @@ fi
 # _REFLECT_INTERNAL sentinel gates the --worker re-entry path.
 WORKER_STDERR="$REFLECT_LOG_DIR/${SESSION_ID}-${MODE}.worker.stderr.log"
 
-# Detach cleanly: setsid new session, nohup ignores SIGHUP, redirect all fds.
-# Inline `env _REFLECT_INTERNAL=1` scopes the sentinel to the child only —
-# no export/unset dance, no leak into the parent shell if this script is
-# sourced or into any downstream commands.
+# Detach cleanly: setsid new session, nohup ignores SIGHUP, redirect
+# stdin/stdout/stderr but LEAVE fd 9 open so the child inherits the
+# per-mode lock. The child holding fd 9 keeps the flock alive across
+# the entire claude call + mv to final.json (STEP 3).
 setsid env _REFLECT_INTERNAL=1 nohup bash "$SCRIPT_DIR/reflect.sh" --worker "$MODE" \
   </dev/null \
   >>"$WORKER_STDERR" 2>&1 \

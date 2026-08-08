@@ -861,6 +861,103 @@ rm -rf "$RO_PARENT" 2>/dev/null || true
 info "unwritable REFLECT_ROOT surfaced as JSON record + stderr line"
 
 # ============================================================================
+# TEST 13: stale-reaper race on final.json (Codex P3.3)
+# ============================================================================
+# Regression (Codex P3.3): dispatcher used to release the per-mode lock
+# right after writing 'started', then detached the worker. If the reaper
+# window (default 600s, dropped to 2s here) expired while the first worker
+# was still running its claude call, a second dispatcher would permit
+# itself to spawn a second worker, and both workers would race the mv to
+# final.json. Last-write-wins silently discards one reflection.
+#
+# Fix (Approach C): dispatcher no longer closes fd 9 before detach; the
+# detached worker inherits the flock and holds it through the entire
+# claude call + mv. Second dispatcher's flock -n now fails.
+#
+# Repro under fix: force the reaper window low (2s), use a slow stub
+# (4s claude call), fire two SessionEnd dispatchers 3s apart. Under the
+# bug the second dispatcher spawns a second worker → 2 final.json mv's
+# race. Under the fix the second dispatcher's flock -n fails → writes
+# skipped_concurrent and exits, only ONE worker mv's to final.json.
+echo "TEST 13: stale-reaper race — worker holds lock through claude call"
+
+# Slow stub — 4s so the second dispatcher fires while the first worker is mid-call.
+cat >"$STUB_SCRATCH/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null || true
+sleep 4
+cat <<'JSON'
+{"type":"result","result":"{\"patterns\":[\"race-winner\"],\"discoveries\":[],\"turning_points\":[],\"digressions\":[],\"obstacles_to_autonomy\":[]}","usage":{}}
+JSON
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+RACE2_SID="test-sid-reaper-race"
+RP="$(fake_payload SessionEnd "$RACE2_SID")"
+
+# Force reaper window to 2s so the second dispatcher (fired 3s later) would
+# see 'started' as stale and permit itself under the OLD behavior.
+export REFLECT_STALE_STARTED_SECONDS=2
+
+# Dispatcher 1: writes started, detaches worker.
+echo "$RP" | bash "$REFLECT_SH" sessionend >/dev/null
+rc=$?
+(( rc == 0 )) || fail "reaper-race dispatcher 1 exit=$rc"
+
+# Wait 3s so the reaper window expires but the worker is still 1s into its
+# 4s claude call.
+sleep 3
+
+# Dispatcher 2: under the bug, is_already_complete returns false (stale
+# reaper) and dispatcher 2 tries to spawn its own worker. Under the fix
+# it hits the flock -n check and writes skipped_concurrent.
+echo "$RP" | bash "$REFLECT_SH" sessionend >/dev/null
+rc=$?
+(( rc == 0 )) || fail "reaper-race dispatcher 2 exit=$rc"
+
+unset REFLECT_STALE_STARTED_SECONDS
+
+# Wait for whichever worker(s) finish. Under the fix, only worker 1 exists.
+RACE2_MANIFEST="$REFLECT_ROOT/sessions/$RACE2_SID/manifest.json"
+RACE2_FINAL="$REFLECT_ROOT/sessions/$RACE2_SID/final.json"
+for _ in $(seq 1 40); do
+  if [[ -f "$RACE2_FINAL" ]] && \
+     jq -e '.modes.sessionend.final_complete == true' "$RACE2_MANIFEST" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.25
+done
+[[ -f "$RACE2_FINAL" ]] || fail "reaper-race: final.json never appeared"
+
+# Skipped-concurrent side-record MUST exist under duplicates/ — proves the
+# second dispatcher's flock -n was blocked by the first worker's held fd 9.
+RACE2_DUP_DIR="$REFLECT_ROOT/sessions/$RACE2_SID/duplicates"
+RACE2_CONC_COUNT=0
+if [[ -d "$RACE2_DUP_DIR" ]]; then
+  RACE2_CONC_COUNT=$(find "$RACE2_DUP_DIR" -type f -name '*sessionend-conc*.json' 2>/dev/null | wc -l)
+fi
+(( RACE2_CONC_COUNT == 1 )) \
+  || fail "expected exactly 1 skipped_concurrent record for the racing dispatcher (got $RACE2_CONC_COUNT). Fix not effective — second dispatcher was not blocked."
+
+# One extra defensive check: no artifact-tmp files linger under session_dir/
+# (these would indicate a losing worker never won the mv race).
+LINGER=$(find "$REFLECT_ROOT/sessions/$RACE2_SID" -maxdepth 1 -type f -name '.artifact-*' 2>/dev/null | wc -l)
+(( LINGER == 0 )) \
+  || fail "expected 0 leftover .artifact-* tmp files, got $LINGER (indicates racing mv)"
+
+info "stale-reaper race blocked: 1 skipped_concurrent record, 1 clean final.json"
+
+# Restore canonical stub.
+cat >"$STUB_SCRATCH/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null || true
+cat <<'JSON'
+{"type":"result","result":"{\"patterns\":[\"stubbed pattern\"],\"discoveries\":[],\"turning_points\":[],\"digressions\":[],\"obstacles_to_autonomy\":[]}","usage":{"cache_read_input_tokens":100,"cache_creation_input_tokens":10,"input_tokens":5,"output_tokens":50}}
+JSON
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+# ============================================================================
 if [[ "${REFLECT_DEBUG:-}" != "1" ]]; then
   rm -rf "$REFLECT_ROOT" "$STUB_SCRATCH"
 fi
