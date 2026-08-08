@@ -472,8 +472,13 @@ run_worker() {
   # forensic log. Add an epoch suffix so every re-run keeps its own log
   # file. Idempotent runs (no re-fire) still see a single file per SID+MODE
   # in practice because REFLECT_FORCE gates re-entry.
+  #
+  # R2 LOW 1: `date +%s` (per-second) collides on fast forced re-runs within
+  # the same second — second run overwrites first run's forensic log. Switch
+  # to `date +%s%N` (nanoseconds). GNU date is already required (Linux-only
+  # guard at top of script), so the %N specifier is safe.
   local worker_ts
-  worker_ts="$(date +%s)"
+  worker_ts="$(date +%s%N)"
   local worker_log="$REFLECT_LOG_DIR/${SESSION_ID}-${MODE}-${worker_ts}.stderr.log"
   local worker_out="$REFLECT_LOG_DIR/${SESSION_ID}-${MODE}-${worker_ts}.stdout.log"
 
