@@ -59,6 +59,7 @@ Each Phase 1/2 round follows the same shape:
    Any of: unparseable JSON, missing `.verdict`, or verdict/findings mismatch → the round FAILED. Re-dispatch once with an explicit "output valid JSON matching verdict-schema.json AND ensure verdict matches findings (PASS = empty findings; PASS_WITH_FIXES = no BLOCKER/HIGH; BLOCKS = ≥1 BLOCKER/HIGH)" reminder.
 
    Second failure PAUSEs the loop (interactive: prompt user; unattended: append to `pending_for_human.md` and exit `pending-human`). NEVER treat unparseable output or a mismatched verdict as advance-worthy — an incoherent advisor response has produced zero trustworthy coverage.
+4.5. VALIDATE: dispatch a fresh Opus subagent (`Agent(subagent_type="advisor", ...)`) with ONLY the findings JSON + absolute paths of files referenced by findings. Prompt: "For each finding, read the file at the given line. Emit `{finding_id, verified, unverifiable, note}`. `verified=true` iff the described condition is empirically present at that location. `unverifiable=true` for subjective findings (taste, 'could be simpler', style preferences) where no empirical check applies. `verified=false` = drop from report; `unverifiable=true` = keep with warning tag." Drop `verified=false` findings before proceeding to step 5. Unverifiable findings continue to step 5 as-is (repro is still attempted; often it will confirm nothing).
 5. REPRODUCE each BLOCKER/HIGH finding before fixing — advisors hallucinate
 6. FIX by severity, re-verify after each
 7. COMMIT the round (per-round granularity, not a batch)
@@ -76,9 +77,11 @@ Both lanes emit JSON matching `~/.claude/skills/advice-refine-test-loop/verdict-
 {
   "verdict": "PASS" | "PASS_WITH_FIXES" | "BLOCKS",
   "verdict_reason": "<one-line>",
-  "findings": [{"severity": "…", "file": "…", "line": N, "rationale": "…"}]
+  "findings": [{"severity": "…", "autofix_class": "…", "file": "…", "line": N, "rationale": "…"}]
 }
 ```
+
+**Severity × autofix_class are orthogonal axes.** `severity` is urgency (how bad if this ships); `autofix_class` is apply-authority (can this be applied without a human call). Conflating them ships wrong fixes: a `severity=LOW` rename that ripples across 40 files is NOT `safe_auto` — it's `gated_auto` (mechanically fine but wants human ack) or `manual` (needs human implementation). Consolidator gates on the AND of both axes (see below); severity alone is not license to auto-apply. `advisory` findings are surface-only and never auto-fixed regardless of severity.
 
 - **PASS** = ZERO findings (empty `findings` array). Advance immediately, no consolidator needed.
 - **PASS_WITH_FIXES** = at least one MEDIUM or LOW finding, but no BLOCKER/HIGH. Consolidator runs before phase advance (auto-fixes LOWs; MEDIUMs surface in the round's commit message for the human to triage but do NOT block advance). If a MEDIUM ought to block, it should have been a HIGH — trust the advisor's severity.
@@ -174,6 +177,7 @@ Order the prompt for maximum implicit prefix caching (both Anthropic + OpenAI ca
 - **Project goal** (1–2 sentences)
 - **Re-read fresh:** absolute file paths (don't trust advisor memory)
 - **Output shape:** emit JSON matching `~/.claude/skills/advice-refine-test-loop/verdict-schema.json`. No prose outside JSON. (Codex enforces via `--output-schema`; Opus advisor.md system prompt enforces.)
+- For each finding, emit both `severity` (urgency) and `autofix_class` (apply-authority — `safe_auto` / `gated_auto` / `manual` / `advisory`). These are orthogonal; do not conflate. Tag findings whose confirmation requires human judgment (taste, style, "could be simpler") as `unverifiable: true` — Stage 4.5 keeps them but marks them.
 
 **Variable delta (grows each round):**
 - **Prior rounds fixed:** bulleted list — prevents re-flagging resolved issues. Include EVERY prior round in the current phase, plus every prior phase's PASS-time state summary.
@@ -197,9 +201,9 @@ Discard unreproducible claims. Note them so next round's "prior rounds fixed" ca
 
 ## Consolidator sub-loop (PASS_WITH_FIXES remainder)
 
-When a phase's final round emits `PASS_WITH_FIXES` (MEDIUM and/or LOW findings remain, no BLOCKER/HIGH), run the consolidator BEFORE advancing to the next phase. **Consolidator auto-fixes LOWs only** — MEDIUMs are surfaced in the phase's exit commit message for the human to triage. Auto-fixing MEDIUMs without reproduction is risky (they're "latent bug or future trap", not nits).
+When a phase's final round emits `PASS_WITH_FIXES` (MEDIUM and/or LOW findings remain, no BLOCKER/HIGH), run the consolidator BEFORE advancing to the next phase. **Consolidator auto-fixes `severity=LOW AND autofix_class=safe_auto` only.** LOWs with `autofix_class` in `{gated_auto, manual, advisory}` surface in the phase's exit commit message for the human — auto-fixing a rippling rename or a design call is exactly the class of thing that turns a nit into a merge conflict. MEDIUMs (any autofix_class) also surface for human triage; auto-fixing them without reproduction is risky (they're "latent bug or future trap", not nits).
 
-Parent MUST filter the JSON findings to LOWs before dispatching. If no LOWs remain (MEDIUMs only), skip the consolidator entirely and go straight to the exit-commit-message surface step.
+Parent MUST filter the JSON findings to `severity=LOW AND autofix_class=safe_auto` before dispatching (`jq '[.findings[] | select(.severity=="LOW" and .autofix_class=="safe_auto")]'`). If nothing passes the AND filter, skip the consolidator entirely and go straight to the exit-commit-message surface step — the remaining LOWs go to the human alongside the MEDIUMs.
 
 Dispatch: `Agent(subagent_type="general-purpose", prompt=...)` with the following prompt shape (does NOT use the `advisor` type — consolidator needs Edit access):
 
@@ -209,8 +213,9 @@ granularity. After ALL fixes: re-verify (run the same test/lint/smoke the
 main loop uses). Report per-finding: [fixed | skipped: <reason>].
 
 Findings:
-<JSON array containing ONLY LOW findings — parent MUST filter MEDIUMs out
- before dispatching>
+<JSON array containing ONLY findings where severity=LOW AND autofix_class=safe_auto
+ — parent MUST filter out MEDIUMs and any LOW whose autofix_class is
+ gated_auto/manual/advisory before dispatching>
 ```
 
 **Bounded to 3 rounds** — if 3 consolidator rounds don't clear the LOW list, exit with what's left in a commit message. Don't infinite-loop trivial fixes; the point of PASS_WITH_FIXES is fast handling, not exhaustive polish.
@@ -248,6 +253,8 @@ After consolidator exits (clean or bounded), advance to the next phase using the
 | Auto-block on a singleton VLM finding | Session-constraint violation. `Never singleton-VLM = auto-block.` Bug the ledger, not the ship gate. Only geometry-oracle findings or 2+ reviewer convergence gate the ship. |
 | Sigil on a partial Phase 4b | Session-constraint violation. `Sigil requires reviewer confirmation.` The sigil-ready state needs: oracle green + 4b run to completion + all HIGH resolved. A skipped or half-run 4b is not sigil-ready. |
 | Add Gemini vision without an API key wired | Would silently degrade to skipping phase 4c and calling the pipeline complete. Note as future upgrade in the skill; do not add as a dispatch step until the API dependency is real. |
+| Auto-fix based on severity alone | Severity is urgency, not apply-authority. A LOW rename that ripples 40 files is not `safe_auto` — it's `gated_auto` or `manual`. Consolidator MUST AND `severity=LOW` with `autofix_class=safe_auto`; anything else surfaces for the human. |
+| Skip step 4.5 (validate) because "advisor is trustworthy" | Advisors hallucinate file paths, line numbers, and stale-state claims (they read pre-fix state). Validator is cheap (small prompt, file re-read) and catches the class before it becomes a wasted repro round in step 5. |
 
 ## Phase 4a: Taste round (UI-work only; run ONCE after Phases 1-3 all PASS)
 
@@ -448,6 +455,7 @@ DiffSpot ranks Gemini (2.5 Pro / 3.x Pro) as the strongest visual perceiver (47.
 | Phase | Vendor | Reviewer role | Combines with | Skip when |
 |---|---|---|---|---|
 | 1 | Anthropic (Opus + specialists) | Broad correctness + narrow security/API passes | Own phase output only | Never; foundation phase |
+| 4.5 (in-round) | Anthropic (Opus, validator) | Re-verify findings against actual file state; drop `verified=false`, tag `unverifiable=true` | Feeds into step 5 (reproduce) | Never; cheap and catches hallucinated findings |
 | 2 | OpenAI (Codex / GPT-5.5) | Cross-vendor correctness on Opus-clean state | Phase 1 fix history carried in prompt | Never; PAUSE on quota, don't silently skip |
 | 3 | Anthropic (Opus, adversarial) | "Prior PASS was wrong — find why" | Findings loop back to Phase 1 | Never; one shot, cheap |
 | 4a | Anthropic (Opus x2 — defect + taste critics) | UI defect + house-style critique | Own phase output only | Non-UI diffs |
