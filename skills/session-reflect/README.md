@@ -89,18 +89,27 @@ Add to `~/.claude/settings.json`:
 ```
 
 The `settings-patch.json` file in this repo root is the reference
-snippet; do not apply it blindly — merge into your existing settings.
+snippet; do not apply it blindly.
+
+**Do not use `jq -s '.[0] * .[1]'` to merge.** The `*` operator *replaces*
+existing arrays rather than concatenating them, so if you already have any
+`PreCompact` / `SessionEnd` / `SubagentStop` hooks configured, that merge
+silently drops them. Instead, use an array-concat merge, or manually
+append the new entries to the existing arrays. Example append-array merge
+is documented inside `settings-patch.json` under `_comment`.
 
 ## Environment variables
 
 | Var | Default | Purpose |
 |-----|---------|---------|
-| `REFLECT_MODEL` | `claude-haiku-4-5-20251001` | Model for reflection subprocess. Haiku is enough for the JSON extraction; use Sonnet only if you need richer synthesis. |
-| `REFLECT_ROOT` | `$HOME/.claude/reflections` | Artifact root. Override for tests. |
-| `REFLECT_FORCE` | (unset) | If `1`, bypass idempotency guard and re-run even if `final_complete: true`. |
+| `REFLECT_MODEL` | `haiku` | Model alias (or full id) for reflection subprocess. Alias `haiku` resolves to the latest Haiku tier and survives model retirement. Use `sonnet`/`opus` only if you need richer synthesis. |
+| `REFLECT_ROOT` | `$HOME/.claude/reflections` | Artifact root. Override for tests. Must be writable. |
+| `REFLECT_FORCE` | (unset) | Truthy values (`1`, `true`, `yes`, `on`, case-insensitive) bypass the idempotency guard and re-run even if `final_complete: true`. Any other value = falsy. |
 | `REFLECT_LOG_DIR` | `$REFLECT_ROOT/logs` | Worker stdout / stderr logs. |
+| `REFLECT_STALE_STARTED_SECONDS` | `600` | If a manifest is stuck at `status=started` older than this many seconds, treat as a crashed prior run and permit re-run. |
 | `REFLECT_LIVE_TEST` | (unset) | `1` opts `tests/live.sh` into a real-API smoke. |
-| `CLAUDE_PARENT_SESSION_ID` | (unset) | If Claude Code exports this into the SubagentStop env, subagent artifacts nest under the correct parent. Otherwise the dispatcher falls back to scanning sibling transcript JSONLs. |
+| `CLAUDE_PARENT_SESSION_ID` | (unset) | If Claude Code exports this into the SubagentStop env, subagent artifacts nest under the correct parent. Otherwise the dispatcher falls back to scanning sibling transcript JSONLs. Value is validated against `^[A-Za-z0-9._-]{1,128}$`; invalid values are ignored. |
+| `_REFLECT_INTERNAL` | (internal) | Sentinel set by the parent dispatcher to gate the `--worker` re-entry path. Do not set manually. |
 
 ## Behaviour by hook
 
@@ -158,16 +167,44 @@ artifacts and know what "safe to delete" means for your workflow.
 ## Failure modes
 
 - **Missing `session_id` or `transcript_path` in payload.** Writes an
-  error record under `sessions/_malformed/` and exits 0. Never blocks
-  the caller.
+  error record under `sessions/_malformed/` containing only the payload
+  SHA-256 and length (no raw body) and exits 0. Never blocks the caller.
+- **`session_id` fails safe-charset check (`^[A-Za-z0-9._-]{1,128}$`).**
+  Same as above with `reason: "invalid_session_id"`. Rejects path
+  traversal (`../evil`, `/abs/path`), spaces, newlines, control chars.
+- **Concurrent invocation.** If a second dispatcher can't get the
+  per-session `flock`, it records a `skipped_concurrent` marker under
+  `<session_dir>/duplicates/` and exits fast without spawning a worker.
+- **Duplicate after completion.** If a session's manifest is already
+  `final_complete: true`, a fresh invocation records a `skipped_duplicate`
+  marker under `<session_dir>/duplicates/` and exits without touching the
+  original manifest or artifacts.
+- **Stale `started` manifest.** If a manifest sits at `status=started`
+  older than `REFLECT_STALE_STARTED_SECONDS` (default 600s), the guard
+  treats it as a crashed prior run and permits a fresh run.
 - **`claude` subprocess exits non-zero.** Manifest status becomes
   `error` with `subprocess_exit_code`. Stderr in
   `logs/<sid>-<mode>.stderr.log`.
 - **Timeout.** Manifest status becomes `timeout`. Compaction proceeds
   either way.
 - **Model emits non-JSON.** Manifest status becomes `error` with
-  `reason: "unparseable_reflection_json"` and the raw output preserved
-  under `raw` for debugging.
+  `reason: "unparseable_reflection_json"`. Only the first 200 chars of
+  the raw reply are preserved (as `raw_excerpt`); the full body is not
+  written to the manifest to avoid leaking potentially sensitive
+  reflection content.
+
+## Security
+
+- The reflection subprocess runs with `--tools ""`, disabling the entire
+  built-in tool set. Even if a prompt-injection payload smuggled through
+  the resumed transcript tries to make the model invoke `Bash`, `Edit`,
+  `WebFetch`, etc., the CLI refuses. `--dangerously-skip-permissions`
+  is NOT set.
+- `session_id` and `parent_session_id` are validated against a safe
+  charset before use in any filesystem path.
+- The `--worker` re-entry mode requires `_REFLECT_INTERNAL=1` in env;
+  external `reflect.sh --worker <mode>` invocations are refused.
+- Artifacts are written with `umask 077` (owner-only permissions).
 
 ## Tests
 
