@@ -40,6 +40,21 @@ session, so make it good enough to actually rely on.
 - Empty section if working tree is clean.
 ```
 
+## Verifying State on disk
+
+Before writing the ## State on disk section, VERIFY against reality: run
+`git status --porcelain` and `ls-files --others --exclude-standard`, and
+list what you observe now. Do NOT copy state descriptions from earlier
+in the conversation — a lot may have changed since. If you cannot run
+those commands (no shell access in this session), say so explicitly in
+the section rather than fabricating.
+
+The consumer of this file (auto-fork, human resumer) will refuse to
+execute Next items when State on disk contradicts the current working
+tree. A stale/wrong State section causes safe skips (loss of work
+opportunity); a stale/wrong Done section causes double-execution (loss
+of correctness). Correctness beats coverage — under-report if unsure.
+
 ## Rules
 
 - Concrete over abstract. "Added `foo.py:parse_bar()`" beats "worked on parsing".

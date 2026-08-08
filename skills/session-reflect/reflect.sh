@@ -605,9 +605,26 @@ run_worker() {
               dir:$dir}')"
       return 0
     fi
+    # Prepend a freshness stamp so downstream consumers (auto-fork,
+    # human resumers) can gate on "was this mission written against a
+    # world that still exists?" Doing this shell-side avoids asking the
+    # model to emit it — prompts/mission.md forbids metadata blocks, so
+    # a model-emitted stamp would conflict with its own rules. Format:
+    #   <!-- written-against: sha=<git-sha-or-none> ts=<unix-epoch> -->
+    local mission_sha="none"
+    if ( cd "$mission_cwd" 2>/dev/null && \
+         git rev-parse --is-inside-work-tree >/dev/null 2>&1 ); then
+      mission_sha=$(cd "$mission_cwd" && git rev-parse HEAD 2>/dev/null || echo "none")
+    fi
+    local mission_ts
+    mission_ts=$(date -u +%s)
+
     local mission_tmp
     mission_tmp="$(mktemp -p "$mission_dir" ".mission-XXXXXX.md")"
-    printf '%s\n' "$inner" > "$mission_tmp"
+    {
+      printf '<!-- written-against: sha=%s ts=%s -->\n' "$mission_sha" "$mission_ts"
+      printf '%s\n' "$inner"
+    } > "$mission_tmp"
     if ! mv -f -- "$mission_tmp" "$mission_path"; then
       rm -f -- "$mission_tmp"
       write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "error" \
