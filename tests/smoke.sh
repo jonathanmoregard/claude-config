@@ -303,6 +303,134 @@ jq -e '.modes.precompact.final_complete == false' "$RACE_MANIFEST" >/dev/null \
 
 info "cross-mode race resolved: both precompact + sessionend completed independently"
 
+# ============================================================================
+# TEST 3e: write_manifest RMW race — concurrent writers on different modes
+# ============================================================================
+# Regression (Codex R4.1): write_manifest reads existing manifest, merges via
+# jq, atomic-mv-writes back. With no lock guarding the read-modify-write, two
+# concurrent workers updating different modes both read the same snapshot,
+# both write their own mode, second mv wins and clobbers the first mode's
+# state. Manifest permanently loses one mode.
+#
+# Repro: source lib.sh and spawn N concurrent write_manifest calls
+# alternating modes. Without the fix, at least one run in a small batch
+# loses a mode (empirically 30-50% failure rate at N=20).
+echo "TEST 3e: write_manifest RMW race under concurrent cross-mode writers"
+RMW_ROOT="$(mktemp -d -t reflect-rmw-XXXXXX)"
+RMW_SID="rmw-race-sid"
+mkdir -p "$RMW_ROOT/sessions/$RMW_SID"
+RMW_MPATH="$RMW_ROOT/sessions/$RMW_SID/manifest.json"
+
+# Run the RMW race in an isolated subshell that sources lib.sh directly —
+# no dispatcher, no stub, just the primitive. Repeat several times because
+# the race is probabilistic; a single clean run is not conclusive.
+RMW_RUNS=8
+RMW_WORKERS=20
+RMW_FAILS=0
+for run_i in $(seq 1 "$RMW_RUNS"); do
+  echo '{}' > "$RMW_MPATH"
+  (
+    # shellcheck disable=SC1091
+    source "$SKILL_DIR/lib.sh"
+    export REFLECT_ROOT="$RMW_ROOT"
+    for i in $(seq 1 "$RMW_WORKERS"); do
+      mode="precompact"
+      (( i % 2 )) && mode="sessionend"
+      write_manifest "$RMW_MPATH" "$RMW_SID" "$mode" "started" \
+        "$(jq -cn --arg tp "/foo" '{source_transcript:$tp}')" &
+    done
+    wait
+  )
+  if ! jq -e '.modes.precompact.status == "started" and .modes.sessionend.status == "started"' \
+       "$RMW_MPATH" >/dev/null 2>&1; then
+    RMW_FAILS=$(( RMW_FAILS + 1 ))
+  fi
+done
+if (( RMW_FAILS > 0 )); then
+  fail "write_manifest RMW race lost a mode in $RMW_FAILS / $RMW_RUNS runs (fix not effective)"
+fi
+find "$RMW_ROOT" -type f -delete 2>/dev/null || true
+find "$RMW_ROOT" -depth -type d -delete 2>/dev/null || true
+info "write_manifest survived $RMW_RUNS x $RMW_WORKERS concurrent cross-mode writes with no lost state"
+
+# ============================================================================
+# TEST 3f: dispatcher lock cross-mode skip — two dispatchers of different
+# modes must not race each other's flock and write skipped_concurrent
+# ============================================================================
+# Regression (Codex R4.2): the dispatcher lock is a single file
+# <manifest>.lock. When PreCompact and SessionEnd dispatchers fire nearly
+# simultaneously, one of them frequently loses `flock -n` on the shared file
+# and writes a skipped_concurrent side-record for its own mode — cross-mode
+# contention causes a legitimate mode to be dropped.
+#
+# Repro: fire PreCompact and SessionEnd concurrently with a slightly-slow
+# stub (0.5s) so their critical sections overlap. Under the bug, the loser
+# writes duplicates/*sessionend-conc*.json or *precompact-conc*.json. Under
+# the fix (per-mode locks), no cross-mode duplicate marker appears and BOTH
+# modes reach status=complete.
+echo "TEST 3f: dispatcher cross-mode lock — no skipped_concurrent for different modes"
+
+# Slow-ish stub (0.5s) — enough to overlap two dispatchers' critical sections.
+cat >"$STUB_SCRATCH/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null || true
+sleep 0.5
+cat <<'JSON'
+{"type":"result","result":"{\"patterns\":[\"cross-mode-stub\"],\"discoveries\":[],\"turning_points\":[],\"digressions\":[],\"obstacles_to_autonomy\":[]}","usage":{}}
+JSON
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+# The bug is probabilistic; run multiple rounds and demand ZERO cross-mode
+# skips across the batch. Empirically pre-fix, ~5 of 8 rounds hit the skip.
+DISP_ROUNDS=6
+DISP_FAILS=0
+for r in $(seq 1 "$DISP_ROUNDS"); do
+  DR_SID="disp-race-sid-$r"
+  DR_PC_PAYLOAD=$(jq -cn --arg sid "$DR_SID" --arg tp "$TRANSCRIPT" --arg cwd "$WORKTREE" \
+    '{session_id:$sid, transcript_path:$tp, hook_event_name:"PreCompact", cwd:$cwd, trigger:"auto"}')
+  DR_SE_PAYLOAD=$(jq -cn --arg sid "$DR_SID" --arg tp "$TRANSCRIPT" --arg cwd "$WORKTREE" \
+    '{session_id:$sid, transcript_path:$tp, hook_event_name:"SessionEnd", cwd:$cwd}')
+
+  # Fire both dispatchers simultaneously.
+  ( echo "$DR_PC_PAYLOAD" | bash "$REFLECT_SH" precompact ) &
+  DR_PC_PID=$!
+  ( echo "$DR_SE_PAYLOAD" | bash "$REFLECT_SH" sessionend ) &
+  DR_SE_PID=$!
+  wait $DR_PC_PID $DR_SE_PID 2>/dev/null || true
+
+  DR_MANIFEST="$REFLECT_ROOT/sessions/$DR_SID/manifest.json"
+  # Wait for both terminal states.
+  for _ in $(seq 1 40); do
+    if [[ -f "$DR_MANIFEST" ]] && jq -e \
+        '.modes.precompact.status == "complete" and .modes.sessionend.final_complete == true' \
+        "$DR_MANIFEST" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.25
+  done
+
+  # Any cross-mode skipped_concurrent record is a failure.
+  DR_DUP_DIR="$REFLECT_ROOT/sessions/$DR_SID/duplicates"
+  DR_SKIPS=0
+  if [[ -d "$DR_DUP_DIR" ]]; then
+    DR_SKIPS=$(find "$DR_DUP_DIR" -type f -name '*conc*.json' 2>/dev/null | wc -l)
+  fi
+  if (( DR_SKIPS > 0 )); then
+    DISP_FAILS=$(( DISP_FAILS + 1 ))
+  fi
+  # BOTH modes must reach terminal-complete.
+  if ! jq -e \
+      '.modes.precompact.status == "complete" and .modes.sessionend.status == "complete"' \
+      "$DR_MANIFEST" >/dev/null 2>&1; then
+    DISP_FAILS=$(( DISP_FAILS + 1 ))
+  fi
+done
+if (( DISP_FAILS > 0 )); then
+  fail "cross-mode dispatcher lock caused $DISP_FAILS / $DISP_ROUNDS failed rounds (skipped_concurrent or missing terminal state)"
+fi
+info "cross-mode dispatcher: $DISP_ROUNDS rounds, 0 skipped_concurrent, both modes complete in all rounds"
+
 # Restore canonical stub for downstream tests.
 cat >"$STUB_SCRATCH/claude" <<'STUB'
 #!/usr/bin/env bash
@@ -437,12 +565,19 @@ for bad in "${BAD_SIDS[@]}"; do
   (( rc == 0 )) || fail "reflect.sh should not crash on bad sid (rc=$rc, sid=$bad)"
 done
 # Ensure no session dir was created for any of these bad SIDs.
+# Build allow-list of legit test SIDs including TEST 3f's per-round SIDs.
+ALLOW_SIDS=('_malformed' "$SID" "$PC_SID" "$PC2_SID" "$RACE_SID" "$BIG_SID" "$PARENT_SID")
+for r in $(seq 1 "$DISP_ROUNDS"); do
+  ALLOW_SIDS+=( "disp-race-sid-$r" )
+done
+FIND_EXCL=()
+for a in "${ALLOW_SIDS[@]}"; do
+  FIND_EXCL+=( ! -name "$a" )
+done
 if find "$REFLECT_ROOT/sessions" -mindepth 1 -maxdepth 1 -type d \
-     ! -name '_malformed' ! -name "$SID" ! -name "$PC_SID" ! -name "$PC2_SID" \
-     ! -name "$RACE_SID" \
-     ! -name "$BIG_SID" ! -name "$PARENT_SID" \
+     "${FIND_EXCL[@]}" \
      | grep -q .; then
-  fail "path traversal created unexpected session dir(s)"
+  fail "path traversal created unexpected session dir(s): $(find "$REFLECT_ROOT/sessions" -mindepth 1 -maxdepth 1 -type d "${FIND_EXCL[@]}")"
 fi
 # _malformed bucket must exist and contain at least one error record.
 MALF_COUNT=$(find "$REFLECT_ROOT/sessions/_malformed" -type f -name '*.json' 2>/dev/null | wc -l)
