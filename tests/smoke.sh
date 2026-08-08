@@ -312,6 +312,76 @@ fi
 info "unparseable JSON handled (status=error, no full-body leak)"
 
 # ============================================================================
+# TEST 10: REFLECT_SUBPROCESS sentinel breaks recursion
+# ============================================================================
+# The reflection worker launches `claude -p --resume --fork-session`. That
+# subprocess runs under the same global Claude Code hooks, so its own
+# SessionEnd would re-fire this dispatcher → infinite recursion. The
+# REFLECT_SUBPROCESS=1 env sentinel (injected by the worker into the
+# subprocess env) must cause the dispatcher to no-op — exit 0 without ANY
+# claude call, and drop an observability marker under skipped-recursions/.
+#
+# Belt-and-braces: use a counting stub so we can prove `claude` was NOT
+# invoked at all. If the sentinel branch fell through, the stub would be
+# called and the counter file would be non-empty.
+echo "TEST 10: REFLECT_SUBPROCESS sentinel skip"
+COUNTER="$STUB_SCRATCH/claude-invocation-count"
+: > "$COUNTER"
+cat >"$STUB_SCRATCH/claude" <<STUB
+#!/usr/bin/env bash
+# Counting stub — increments $COUNTER on every call.
+echo x >> "$COUNTER"
+cat >/dev/null || true
+cat <<'JSON'
+{"type":"result","result":"{\"patterns\":[\"never should fire under sentinel\"]}","usage":{}}
+JSON
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+SENT_SID="test-sid-sentinel"
+SP="$(fake_payload SessionEnd "$SENT_SID")"
+
+# Run dispatcher with sentinel set (simulating a nested claude subprocess
+# firing its own SessionEnd hook).
+set +e
+echo "$SP" | env REFLECT_SUBPROCESS=1 REFLECT_PARENT_SID=parent-abc \
+  bash "$REFLECT_SH" sessionend
+rc=$?
+set -e
+(( rc == 0 )) || fail "sentinel-path exit=$rc (should be 0)"
+
+# claude MUST NOT have been called.
+INVOCATIONS=$(wc -l < "$COUNTER" 2>/dev/null || echo 0)
+(( INVOCATIONS == 0 )) \
+  || fail "claude was invoked $INVOCATIONS time(s) under REFLECT_SUBPROCESS=1 (expected 0)"
+
+# A marker file must have been dropped under skipped-recursions/.
+REC_DIR="$REFLECT_ROOT/skipped-recursions"
+[[ -d "$REC_DIR" ]] || fail "skipped-recursions/ dir missing"
+REC_COUNT=$(find "$REC_DIR" -type f -name '*.json' 2>/dev/null | wc -l)
+(( REC_COUNT >= 1 )) || fail "no recursion-skip marker recorded"
+# Marker content: status=skipped_recursion, parent_sid propagated, child_sid
+# extracted from payload.
+REC_FILE=$(find "$REC_DIR" -type f -name '*.json' | head -1)
+jq -e '.status == "skipped_recursion"' "$REC_FILE" >/dev/null \
+  || fail "marker status != skipped_recursion"
+jq -e --arg s "$SENT_SID" '.child_sid == $s' "$REC_FILE" >/dev/null \
+  || fail "marker child_sid != $SENT_SID"
+jq -e '.parent_sid == "parent-abc"' "$REC_FILE" >/dev/null \
+  || fail "marker parent_sid != parent-abc"
+info "sentinel skip verified: 0 claude calls, marker recorded"
+
+# Restore the canonical stub for any subsequent hypothetical tests.
+cat >"$STUB_SCRATCH/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null || true
+cat <<'JSON'
+{"type":"result","result":"{\"patterns\":[\"stubbed pattern\"],\"discoveries\":[],\"turning_points\":[],\"digressions\":[],\"obstacles_to_autonomy\":[]}","usage":{"cache_read_input_tokens":100,"cache_creation_input_tokens":10,"input_tokens":5,"output_tokens":50}}
+JSON
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+# ============================================================================
 if [[ "${REFLECT_DEBUG:-}" != "1" ]]; then
   rm -rf "$REFLECT_ROOT" "$STUB_SCRATCH"
 fi

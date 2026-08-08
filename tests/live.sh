@@ -95,5 +95,23 @@ if (( CACHE_READ <= 0 )); then
   # Not fatal — a cold cache is still functional, just expensive.
 fi
 
+# --- Assert no runaway recursion ---------------------------------------------
+# If REFLECT_SUBPROCESS sentinel is broken, the claude subprocess would fire
+# SessionEnd again → new dispatcher → new claude → repeat. We can't directly
+# count spawns, but the marker directory would explode. In a healthy run there
+# should be AT MOST a small handful of recursion-skip markers (one per hook
+# type the child subprocess fires — SessionEnd, maybe SubagentStop). A count
+# > 10 for a single reflection is a strong signal recursion is running away.
+REC_DIR="$REFLECT_ROOT/skipped-recursions"
+if [[ -d "$REC_DIR" ]]; then
+  REC_COUNT=$(find "$REC_DIR" -type f -name '*.json' 2>/dev/null | wc -l)
+  info "recursion-skip markers: $REC_COUNT"
+  if (( REC_COUNT > 10 )); then
+    fail "runaway recursion suspected: $REC_COUNT skipped-recursion markers (expected <= 10)"
+  fi
+else
+  info "recursion-skip markers: 0 (child subprocess did not fire any nested hooks)"
+fi
+
 echo "OK: live smoke passed"
 echo "Artifacts in: $REFLECT_ROOT"

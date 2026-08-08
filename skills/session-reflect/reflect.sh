@@ -43,6 +43,49 @@ source "$SCRIPT_DIR/lib.sh"
 ARG1="${1:-}"
 ARG2="${2:-}"
 
+# --- Recursion break: reflection subprocess itself fires hooks ---------------
+# The reflection worker invokes `claude -p --resume <sid> --fork-session ...`.
+# That subprocess runs under the SAME global Claude Code hook configuration,
+# so its SessionEnd will re-fire this dispatcher with the fork's SID → infinite
+# recursion (spawn → SessionEnd → spawn → ...). `_REFLECT_INTERNAL` is a
+# separate concern (it gates the --worker re-entry inside this script) and
+# does NOT propagate through the claude subprocess, so we use a distinct
+# sentinel here: REFLECT_SUBPROCESS=1, set on the child env when the worker
+# launches claude. Any hook firing inside that claude subprocess sees the
+# sentinel, drops a lightweight observability marker, and exits 0.
+#
+# Check runs BEFORE the mode allow-list so an invalid mode still no-ops
+# (subprocess-triggered hooks must never fail loud into the caller).
+if [[ "${REFLECT_SUBPROCESS:-0}" == "1" ]]; then
+  # Best-effort marker. Use REFLECT_ROOT (defaulted below via lib.sh source)
+  # via the default if unset. Do NOT trust jq or the payload structure here
+  # — we may not have valid stdin, and a broken jq call must not crash us.
+  : "${REFLECT_ROOT:=$HOME/.claude/reflections}"
+  _rec_dir="$REFLECT_ROOT/skipped-recursions"
+  mkdir -p "$_rec_dir" 2>/dev/null || true
+  # Best-effort payload sniff (does not fail script if stdin absent / jq err).
+  _child_sid=""
+  if [[ ! -t 0 ]]; then
+    _rec_payload="$(cat 2>/dev/null || true)"
+    if [[ -n "$_rec_payload" ]]; then
+      _child_sid="$(printf '%s' "$_rec_payload" \
+        | jq -r '.session_id // ""' 2>/dev/null || true)"
+    fi
+  fi
+  _parent_sid="${REFLECT_PARENT_SID:-unknown}"
+  _rec_file="$_rec_dir/$(date -u +%Y%m%dT%H%M%SZ)-${_parent_sid}-${_child_sid:-unknown}-${ARG1:-nomode}.json"
+  # jq -n with defensive defaults; failure here still exits 0.
+  jq -n \
+    --arg status "skipped_recursion" \
+    --arg parent_sid "$_parent_sid" \
+    --arg child_sid "$_child_sid" \
+    --arg hook_event "${ARG1:-}" \
+    --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{status:$status, parent_sid:$parent_sid, child_sid:$child_sid, hook_event:$hook_event, seen_at:$now}' \
+    > "$_rec_file" 2>/dev/null || true
+  exit 0
+fi
+
 # --- Help --------------------------------------------------------------------
 if [[ "$ARG1" == "--help" || "$ARG1" == "-h" ]]; then
   cat <<EOF
@@ -318,9 +361,19 @@ run_worker() {
   # We keep `--resume ... --fork-session` because prompt-cache reuse
   # (~77% hit at 12min, 1h ephemeral TTL — verified 2026-08-08) is the whole
   # cost story for this feature. `--bare` would strip that.
+  #
+  # RECURSION BREAK: inject REFLECT_SUBPROCESS=1 into the subprocess's env so
+  # any Claude Code hooks the child fires (its own SessionEnd, PreCompact,
+  # etc.) can detect they're inside a reflection run and no-op. REFLECT_PARENT_SID
+  # is threaded through so the recursion-marker file can attribute the skip.
+  # Inline `env FOO=bar` scopes to the child only (no export leak into this
+  # worker process, no leak into the manifest-writing path).
   local claude_json rc
   set +e
-  claude_json=$(timeout "$budget" claude \
+  claude_json=$(timeout "$budget" env \
+    REFLECT_SUBPROCESS=1 \
+    REFLECT_PARENT_SID="$SESSION_ID" \
+    claude \
     -p --resume "$SESSION_ID" --fork-session \
     --model "$REFLECT_MODEL" \
     --output-format json \
