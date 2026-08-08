@@ -73,6 +73,17 @@ if [[ "${REFLECT_SUBPROCESS:-0}" == "1" ]]; then
     fi
   fi
   _parent_sid="${REFLECT_PARENT_SID:-unknown}"
+  # STEP 4 (MEDIUM P3.5): both _parent_sid (from env, attacker-influenceable)
+  # and _child_sid (from stdin payload) hit the filesystem path unvalidated
+  # under the old code. An adversarial value like '../../etc/passwd' would
+  # escape skipped-recursions/. Substitute the safe sentinel 'unknown_bad_sid'
+  # for any value that fails is_valid_sid before interpolation.
+  if ! is_valid_sid "$_parent_sid"; then
+    _parent_sid="unknown_bad_sid"
+  fi
+  if [[ -n "$_child_sid" ]] && ! is_valid_sid "$_child_sid"; then
+    _child_sid="unknown_bad_sid"
+  fi
   _rec_file="$_rec_dir/$(date -u +%Y%m%dT%H%M%SZ)-${_parent_sid}-${_child_sid:-unknown}-${ARG1:-nomode}.json"
   # jq -n with defensive defaults; failure here still exits 0.
   jq -n \

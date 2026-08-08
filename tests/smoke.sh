@@ -740,6 +740,49 @@ jq -e '.parent_sid == "parent-abc"' "$REC_FILE" >/dev/null \
   || fail "marker parent_sid != parent-abc"
 info "sentinel skip verified: 0 claude calls, marker recorded"
 
+# ============================================================================
+# TEST 10b: recursion marker filename sanitises unvalidated SIDs
+# ============================================================================
+# Regression (Codex P3.5): the skipped-recursion marker filename interpolates
+# REFLECT_PARENT_SID (env, attacker-influenceable) and .session_id from the
+# payload directly. Under the old code an evil value like '../../etc/passwd'
+# would escape the skipped-recursions/ directory. Fix: run both through
+# is_valid_sid before interpolation and substitute 'unknown_bad_sid' on fail.
+echo "TEST 10b: recursion marker filename sanitisation"
+
+# Counting stub — must NOT be invoked (sentinel path).
+: > "$COUNTER"
+BAD_PARENT="../../etc/passwd"
+BAD_CHILD_PAYLOAD='{"session_id":"../../../evil","transcript_path":"/tmp/x","hook_event_name":"SessionEnd","cwd":"/tmp"}'
+
+set +e
+echo "$BAD_CHILD_PAYLOAD" | env REFLECT_SUBPROCESS=1 REFLECT_PARENT_SID="$BAD_PARENT" \
+  bash "$REFLECT_SH" sessionend
+rc=$?
+set -e
+(( rc == 0 )) || fail "sentinel-path with bad SIDs exit=$rc (should be 0)"
+
+# claude MUST NOT have been called (sentinel skip).
+INVOCATIONS_BAD=$(wc -l < "$COUNTER" 2>/dev/null || echo 0)
+(( INVOCATIONS_BAD == 0 )) \
+  || fail "claude invoked $INVOCATIONS_BAD time(s) under sentinel with bad SIDs"
+
+# Files under skipped-recursions/ must all reside directly in that dir —
+# NO subdir escape via '..' in the interpolated components.
+REC_DIR_2="$REFLECT_ROOT/skipped-recursions"
+if ! find "$REC_DIR_2" -maxdepth 1 -type f -name '*unknown_bad_sid*' 2>/dev/null | grep -q .; then
+  fail "no marker with sanitised sentinel found under $REC_DIR_2"
+fi
+# No marker should contain a raw '..' path component in its basename.
+if find "$REC_DIR_2" -maxdepth 1 -type f -name '*..*' 2>/dev/null | grep -q .; then
+  fail "marker filename contains raw '..' path traversal component"
+fi
+# No file should have been created outside skipped-recursions/ from the escape attempt.
+if find "$REFLECT_ROOT" -path "$REC_DIR_2" -prune -o -type f -name '*evil*' -print 2>/dev/null | grep -q .; then
+  fail "path traversal via bad child_sid escaped skipped-recursions/"
+fi
+info "recursion marker sanitised bad SIDs to unknown_bad_sid"
+
 # Restore the canonical stub for any subsequent hypothetical tests.
 cat >"$STUB_SCRATCH/claude" <<'STUB'
 #!/usr/bin/env bash
