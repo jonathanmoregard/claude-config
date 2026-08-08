@@ -152,98 +152,130 @@ write_manifest() {
   base_dir="$(dirname -- "$mpath")"
   mkdir -p "$base_dir"
 
-  local existing='{}'
-  if [[ -f "$mpath" ]]; then
-    if ! existing="$(jq -c '.' "$mpath" 2>/dev/null)"; then
-      existing='{}'
+  # --- Cross-mode write serialization (R4.1 fix) ----------------------------
+  # Read-modify-write on manifest.json is inherently racy: two workers on
+  # different modes may both read the same snapshot, each merge their own
+  # mode.<X> subtree, then mv-atomically write back — the second mv erases
+  # the first mode's update. A separate write-lock (<manifest>.write.lock)
+  # serializes the ENTIRE read-merge-write critical section across all
+  # modes so cross-mode state additions accumulate rather than clobber.
+  #
+  # We use BLOCKING flock (not -n): writes are milliseconds and workers
+  # must not silently drop state on contention. write_manifest is always
+  # a leaf call — no other locks are acquired inside — so nesting from a
+  # caller that holds a dispatcher/per-mode lock is deadlock-safe.
+  #
+  # We wrap the RMW section in a subshell so `flock <fd>` releases when
+  # the subshell exits (fd is closed by the subshell exit) regardless of
+  # whether the merge succeeded — no trap gymnastics needed, no fd leak
+  # across the caller.
+  local write_lock="${mpath}.write.lock"
+  # Ensure the lockfile exists (touch is a no-op if already there).
+  : > "$write_lock" 2>/dev/null || true
+  (
+    exec 8>"$write_lock" || exit 1
+    # Bound the blocking wait so a stuck holder cannot hang a caller forever.
+    # 30s is > 100x the expected write time and still short enough that a
+    # deadlocked/crashed peer surfaces as a stderr line rather than a hang.
+    if ! flock -w 30 8; then
+      echo "write_manifest: could not acquire $write_lock within 30s" >&2
+      exit 1
     fi
-  fi
 
-  local terminal=false
-  case "$status" in
-    complete|timeout|error|skipped_duplicate) terminal=true ;;
-  esac
+    local existing='{}'
+    if [[ -f "$mpath" ]]; then
+      if ! existing="$(jq -c '.' "$mpath" 2>/dev/null)"; then
+        existing='{}'
+      fi
+    fi
 
-  # `final_complete` (per-mode) is the terminal-forever flag consumed by
-  # is_already_complete. PreCompact is NOT terminal: a long session compacts
-  # multiple times, and each PreCompact is its own checkpoint. Only SessionEnd
-  # / SubagentStop completions latch modes.<mode>.final_complete=true —
-  # precompact completions bump modes.precompact.last_checkpoint_at instead
-  # so downstream observers can see progress without the idempotency gate
-  # short-circuiting the next PreCompact fire.
-  local final_complete=false
-  if [[ "$status" == "complete" && "$mode" != "precompact" ]]; then
-    final_complete=true
-  fi
+    local terminal=false
+    case "$status" in
+      complete|timeout|error|skipped_duplicate) terminal=true ;;
+    esac
 
-  # last_checkpoint_at: only set when a precompact completes.
-  local last_checkpoint_at_json='null'
-  if [[ "$status" == "complete" && "$mode" == "precompact" ]]; then
-    last_checkpoint_at_json="\"$now\""
-  fi
+    # `final_complete` (per-mode) is the terminal-forever flag consumed by
+    # is_already_complete. PreCompact is NOT terminal: a long session compacts
+    # multiple times, and each PreCompact is its own checkpoint. Only SessionEnd
+    # / SubagentStop completions latch modes.<mode>.final_complete=true —
+    # precompact completions bump modes.precompact.last_checkpoint_at instead
+    # so downstream observers can see progress without the idempotency gate
+    # short-circuiting the next PreCompact fire.
+    local final_complete=false
+    if [[ "$status" == "complete" && "$mode" != "precompact" ]]; then
+      final_complete=true
+    fi
 
-  local completed_at_json='null'
-  if [[ "$terminal" == "true" ]]; then
-    completed_at_json="\"$now\""
-  fi
+    # last_checkpoint_at: only set when a precompact completes.
+    local last_checkpoint_at_json='null'
+    if [[ "$status" == "complete" && "$mode" == "precompact" ]]; then
+      last_checkpoint_at_json="\"$now\""
+    fi
 
-  # Merge:
-  #   * Session-shared top-level fields: session_id, parent_session_id,
-  #     hook_event_name, source_transcript. These are hoisted out of $extra
-  #     because they're stable per-session and consumers (aggregators)
-  #     shouldn't have to hunt through mode entries for them.
-  #   * modes.<mode> holds this mode's own state (status/started_at/
-  #     completed_at/final_complete/last_checkpoint_at) PLUS any mode-specific
-  #     extras (reason, artifact, usage, timeout_seconds, subprocess_exit_code,
-  #     trigger, model, raw_excerpt, raw_len). Other modes' entries are
-  #     preserved verbatim so a PreCompact write cannot clobber SessionEnd's
-  #     completion (or vice versa).
-  #   * started_at for a mode is set on first write and carried forward.
-  #   * final_complete is OR-latched per-mode: once true, stays true.
-  local merged
-  merged="$(jq -c \
-    --arg sid "$sid" \
-    --arg mode "$mode" \
-    --arg status "$status" \
-    --arg now "$now" \
-    --argjson completed_at "$completed_at_json" \
-    --argjson final_complete "$final_complete" \
-    --argjson last_checkpoint_at "$last_checkpoint_at_json" \
-    --argjson extra "$extra" \
-    '. as $prev
-     | ($prev.modes // {}) as $prev_modes
-     | ($prev_modes[$mode] // {}) as $prev_mode
-     | ($prev_mode.started_at // $now) as $started
-     | ($prev_mode.final_complete // false) as $prev_final_complete
-     | ($prev_mode.last_checkpoint_at // null) as $prev_last_cp
-     # Session-shared fields to hoist out of $extra to top level.
-     | ($extra.source_transcript // $prev.source_transcript // null) as $tp
-     | ($extra.hook_event_name   // $prev.hook_event_name   // null) as $ev
-     | ($extra.parent_session_id // $prev.parent_session_id // null) as $psid
-     # Mode-scoped extras: everything in $extra minus the hoisted keys.
-     | ($extra | del(.source_transcript, .hook_event_name, .parent_session_id)) as $mode_extras
-     | ($prev
-        + {
-            session_id:        $sid,
-            parent_session_id: $psid,
-            hook_event_name:   $ev,
-            source_transcript: $tp,
-            modes: ($prev_modes + {
-              ($mode): ($prev_mode + $mode_extras + {
-                status: $status,
-                started_at: $started,
-                completed_at: (if $completed_at != null then $completed_at else ($prev_mode.completed_at // null) end),
-                final_complete: ($prev_final_complete or $final_complete),
-                last_checkpoint_at: (if $last_checkpoint_at != null then $last_checkpoint_at else $prev_last_cp end)
+    local completed_at_json='null'
+    if [[ "$terminal" == "true" ]]; then
+      completed_at_json="\"$now\""
+    fi
+
+    # Merge:
+    #   * Session-shared top-level fields: session_id, parent_session_id,
+    #     hook_event_name, source_transcript. These are hoisted out of $extra
+    #     because they're stable per-session and consumers (aggregators)
+    #     shouldn't have to hunt through mode entries for them.
+    #   * modes.<mode> holds this mode's own state (status/started_at/
+    #     completed_at/final_complete/last_checkpoint_at) PLUS any mode-specific
+    #     extras (reason, artifact, usage, timeout_seconds, subprocess_exit_code,
+    #     trigger, model, raw_excerpt, raw_len). Other modes' entries are
+    #     preserved verbatim so a PreCompact write cannot clobber SessionEnd's
+    #     completion (or vice versa).
+    #   * started_at for a mode is set on first write and carried forward.
+    #   * final_complete is OR-latched per-mode: once true, stays true.
+    local merged
+    merged="$(jq -c \
+      --arg sid "$sid" \
+      --arg mode "$mode" \
+      --arg status "$status" \
+      --arg now "$now" \
+      --argjson completed_at "$completed_at_json" \
+      --argjson final_complete "$final_complete" \
+      --argjson last_checkpoint_at "$last_checkpoint_at_json" \
+      --argjson extra "$extra" \
+      '. as $prev
+       | ($prev.modes // {}) as $prev_modes
+       | ($prev_modes[$mode] // {}) as $prev_mode
+       | ($prev_mode.started_at // $now) as $started
+       | ($prev_mode.final_complete // false) as $prev_final_complete
+       | ($prev_mode.last_checkpoint_at // null) as $prev_last_cp
+       # Session-shared fields to hoist out of $extra to top level.
+       | ($extra.source_transcript // $prev.source_transcript // null) as $tp
+       | ($extra.hook_event_name   // $prev.hook_event_name   // null) as $ev
+       | ($extra.parent_session_id // $prev.parent_session_id // null) as $psid
+       # Mode-scoped extras: everything in $extra minus the hoisted keys.
+       | ($extra | del(.source_transcript, .hook_event_name, .parent_session_id)) as $mode_extras
+       | ($prev
+          + {
+              session_id:        $sid,
+              parent_session_id: $psid,
+              hook_event_name:   $ev,
+              source_transcript: $tp,
+              modes: ($prev_modes + {
+                ($mode): ($prev_mode + $mode_extras + {
+                  status: $status,
+                  started_at: $started,
+                  completed_at: (if $completed_at != null then $completed_at else ($prev_mode.completed_at // null) end),
+                  final_complete: ($prev_final_complete or $final_complete),
+                  last_checkpoint_at: (if $last_checkpoint_at != null then $last_checkpoint_at else $prev_last_cp end)
+                })
               })
-            })
-          })' <<<"$existing")"
+            })' <<<"$existing")"
 
-  # Atomic write via mktemp — safer than $$ for concurrent workers.
-  local tmp
-  tmp="$(mktemp -p "$base_dir" ".manifest-XXXXXX")"
-  printf '%s\n' "$merged" > "$tmp"
-  mv "$tmp" "$mpath"
+    # Atomic write via mktemp — safer than $$ for concurrent workers.
+    local tmp
+    tmp="$(mktemp -p "$base_dir" ".manifest-XXXXXX")"
+    printf '%s\n' "$merged" > "$tmp"
+    mv "$tmp" "$mpath"
+    # Subshell exit closes fd 8 → releases the write-lock.
+  ) || return $?
 }
 
 # --- Idempotency guard -------------------------------------------------------

@@ -268,10 +268,15 @@ if [[ "$MODE" != "precompact" ]] && is_already_complete "$manifest_path" "$MODE"
 fi
 
 # --- Concurrency lock: prevent two dispatchers from spawning racing workers ---
-# We take a non-blocking exclusive lock on <manifest>.lock. If we cannot get
-# it, another dispatcher is mid-flight — record the concurrent-skip side event
-# and return without spawning.
-LOCKFILE="${manifest_path}.lock"
+# PER-MODE LOCK (R4.2 fix): the lockfile is scoped to <manifest>.lock.<mode>,
+# not the shared <manifest>.lock. Same-mode contention (two SessionEnds
+# firing back-to-back) still serializes via this lock; DIFFERENT-mode
+# contention (PreCompact + SessionEnd racing) no longer causes one to lose
+# flock -n and write a skipped_concurrent record for its own mode. Cross-mode
+# STATE serialization is handled inside lib.sh:write_manifest via a separate
+# write-lock on <manifest>.write.lock — so per-mode dispatcher locks cannot
+# cause manifest state clobbering even when two modes run concurrently.
+LOCKFILE="${manifest_path}.lock.${MODE}"
 mkdir -p "$(dirname -- "$LOCKFILE")"
 # Lockfile persists intentionally (0-byte, session-scoped); pruning of the
 # session dir by the downstream aggregator cleans it up alongside the
