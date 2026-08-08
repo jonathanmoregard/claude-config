@@ -66,13 +66,17 @@ for var in IDLE_HANDOFF_MIN_SECONDS IDLE_HANDOFF_MAX_SECONDS \
            IDLE_HANDOFF_AUTOFORK_MAX_PER_CWD_24H \
            IDLE_HANDOFF_MAX_RECENT_FAILURES IDLE_HANDOFF_FAILURE_WINDOW_SECONDS; do
   if ! is_pos_int "${!var}"; then
-    log "config error: $var='${!var}' not a positive integer; aborting run"
-    exit 0
+    msg="config error: $var='${!var}' not a positive integer; aborting run"
+    log "$msg"
+    printf '%s\n' "$msg" >&2   # systemd journal sees the failure
+    exit 1
   fi
 done
 if [[ "$IDLE_HANDOFF_MIN_SECONDS" -ge "$IDLE_HANDOFF_MAX_SECONDS" ]]; then
-  log "config error: IDLE_HANDOFF_MIN_SECONDS ($IDLE_HANDOFF_MIN_SECONDS) >= IDLE_HANDOFF_MAX_SECONDS ($IDLE_HANDOFF_MAX_SECONDS); aborting"
-  exit 0
+  msg="config error: IDLE_HANDOFF_MIN_SECONDS ($IDLE_HANDOFF_MIN_SECONDS) >= IDLE_HANDOFF_MAX_SECONDS ($IDLE_HANDOFF_MAX_SECONDS); aborting"
+  log "$msg"
+  printf '%s\n' "$msg" >&2
+  exit 1
 fi
 
 # ---- Kill switch: -e catches file, directory, or symlink --------------------
@@ -187,7 +191,20 @@ is_live_project() {
   local cwd="$1"
   local canonical
   canonical=$(readlink -f "$cwd" 2>/dev/null || echo "$cwd")
-  [[ -n "${LIVE_CWDS[$canonical]:-}" || -n "${LIVE_CWDS[$cwd]:-}" ]]
+  # Exact match on either the raw or canonical form.
+  [[ -n "${LIVE_CWDS[$canonical]:-}" || -n "${LIVE_CWDS[$cwd]:-}" ]] && return 0
+  # Subdir / superdir match: a live claude pane in a MONOREPO PACKAGE
+  # under this repo (or a live pane in the repo when we're targeting a
+  # subdir) means the same working tree is live. Auto-fork with acceptEdits
+  # in that tree while a human session is editing = race.
+  local live
+  for live in "${!LIVE_CWDS[@]}"; do
+    # live is ancestor of cwd, or cwd is ancestor of live
+    case "$cwd" in "$live"/*) return 0 ;; esac
+    case "$canonical" in "$live"/*) return 0 ;; esac
+    case "$live" in "$cwd"/*|"$canonical"/*) return 0 ;; esac
+  done
+  return 1
 }
 
 scan_live_cwds
@@ -224,6 +241,9 @@ is_sdk_cli_or_unknown() {
 newest_non_sdk_cli_transcript() {
   local project_dir="$1"
   local f ep
+  # Tab-separate epoch and path so paths containing whitespace survive.
+  # (`awk '{print $2}'` would truncate at first space — same class of bug
+  # HIGH-E fixed for the fork ledger.)
   while IFS= read -r f; do
     [[ -n "$f" && -f "$f" ]] || continue
     ep=$(transcript_entrypoint "$f")
@@ -232,7 +252,7 @@ newest_non_sdk_cli_transcript() {
       return 0
     fi
   done < <(find "$project_dir" -maxdepth 1 -type f -name '*.jsonl' \
-              -printf '%T@ %p\n' 2>/dev/null | sort -rn | awk '{print $2}')
+              -printf '%T@\t%p\n' 2>/dev/null | sort -rn | cut -f2-)
   return 1
 }
 
@@ -245,28 +265,31 @@ newest_non_sdk_cli_transcript() {
 # on ls-files ∪ status output).
 is_stale_since_transcript() {
   local cwd="$1" transcript_mtime="$2"
-  ( cd "$cwd" 2>/dev/null && git rev-parse --is-inside-work-tree >/dev/null 2>&1 ) \
-    || return 0   # non-git: treat as stale (deny)
+  # Every git call wrapped in `timeout 30`: a hung git (dead NFS, stuck
+  # fsmonitor, locked index) would otherwise wedge the flock singleton
+  # forever. Any timeout / git error is treated as stale (deny) — the
+  # gate exists to reject uncertain state, so failure-to-check is a skip.
+  ( cd "$cwd" 2>/dev/null && timeout 30 git rev-parse --is-inside-work-tree >/dev/null 2>&1 ) \
+    || return 0   # non-git or git-hung: deny
 
   local last_commit_ts
-  last_commit_ts=$( cd "$cwd" && git log -1 --format=%ct 2>/dev/null || echo 0 )
+  last_commit_ts=$( cd "$cwd" && timeout 30 git log -1 --format=%ct 2>/dev/null || echo 0 )
   if [[ "$last_commit_ts" -gt "$transcript_mtime" ]]; then
     return 0
   fi
 
-  # Any dirty/untracked file OR tracked-file mtime > transcript_mtime.
-  # `git status --porcelain` catches both dirty and untracked; if the porcelain
-  # output is non-empty at all, treat as stale (the world moved since a clean
-  # baseline). This is conservative — a pre-existing dirty file with mtime
-  # older than the transcript would also trip the gate, which is fine
-  # (autofork against dirty tree is risky regardless).
-  if ( cd "$cwd" && git status --porcelain 2>/dev/null | head -1 ) | grep -q .; then
+  # git status --porcelain catches both dirty and untracked; non-empty
+  # output at all = world moved since a clean baseline.
+  local porcelain
+  porcelain=$( cd "$cwd" && timeout 30 git status --porcelain 2>/dev/null | head -1 )
+  if [[ -n "$porcelain" ]]; then
     return 0
   fi
 
-  # And tracked-file mtimes: safeguard against a commit that pre-dates the
-  # transcript but a manual `touch` bumped the mtime. Bounded scan.
-  if ( cd "$cwd" && git ls-files -z 2>/dev/null | \
+  # Safeguard against a commit that pre-dates the transcript but a manual
+  # `touch` bumped file mtime. Bounded via timeout; ls-files piped through
+  # xargs bounded by pipe backpressure.
+  if ( cd "$cwd" && timeout 30 git ls-files -z 2>/dev/null | \
        xargs -0 -r stat -c '%Y' 2>/dev/null | \
        awk -v t=$transcript_mtime '$1 > t {found=1; exit} END {exit !found}' ); then
     return 0
@@ -299,7 +322,6 @@ count_skipped_no_next=0
 count_skipped_stale=0
 count_skipped_observer=0
 count_skipped_sdk_cli=0
-count_skipped_unknown_origin=0
 count_skipped_ralph=0
 count_skipped_git_stale=0
 count_skipped_fork_budget=0
@@ -398,12 +420,13 @@ for project_dir in "$PROJECTS_DIR"/*/; do
   worker_log="$IDLE_HANDOFF_LOG_DIR/${sid}.$(date +%s).mission.log"
   log "writing mission.md for sid=$sid idle=${idle}s cwd=$candidate_cwd"
 
-  # `timeout -k 10 90 …` sends SIGTERM at 90s, SIGKILL 10s later. Prior
-  # version's `timeout 90` TERMed the outer bash but not its claude child;
-  # orphaned claude kept burning tokens. -k propagates the kill down the
-  # process group.
+  # `timeout -k 10 90 …` sends SIGTERM at 90s, SIGKILL 10s later. Without
+  # --foreground, timeout runs cmd as leader of a new process group and
+  # sends signals to the WHOLE GROUP — so a hung claude descendant of the
+  # bash-c wrapper gets killed too. (Prior version used --foreground which
+  # is TTY-signal handling, not group-kill — orphan claude survived.)
   REFLECT_ROOT="$REFLECT_ROOT" REFLECT_MODEL="$REFLECT_MODEL" \
-    timeout --foreground -k 10 90 \
+    timeout -k 10 90 \
       bash -c 'printf "%s" "$1" | env -u MODE bash "$2" mission' \
       _ "$payload" "$REFLECT_SH" >>"$worker_log" 2>&1
   rc=$?
@@ -516,4 +539,4 @@ PROMPT
   count_forked=$((count_forked + 1))
 done
 
-log "seen=$count_seen wrote=$count_wrote forked=$count_forked skipped(live=$count_skipped_live live_rescan=$count_skipped_live_rescan sdk-cli=$count_skipped_sdk_cli unknown-origin=$count_skipped_unknown_origin short=$count_skipped_short backoff=$count_skipped_backoff fresh=$count_skipped_fresh_mission no_cwd=$count_skipped_no_cwd stale=$count_skipped_stale observer=$count_skipped_observer no_next=$count_skipped_no_next ralph=$count_skipped_ralph git_stale=$count_skipped_git_stale fork_budget=$count_skipped_fork_budget mission_err=$count_mission_status_error)"
+log "seen=$count_seen wrote=$count_wrote forked=$count_forked skipped(live=$count_skipped_live live_rescan=$count_skipped_live_rescan sdk-cli_or_unknown=$count_skipped_sdk_cli short=$count_skipped_short backoff=$count_skipped_backoff fresh=$count_skipped_fresh_mission no_cwd=$count_skipped_no_cwd stale=$count_skipped_stale observer=$count_skipped_observer no_next=$count_skipped_no_next ralph=$count_skipped_ralph git_stale=$count_skipped_git_stale fork_budget=$count_skipped_fork_budget mission_err=$count_mission_status_error)"

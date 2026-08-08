@@ -195,16 +195,20 @@ write_manifest() {
     esac
 
     # `final_complete` (per-mode) is the terminal-forever flag consumed by
-    # is_already_complete. PreCompact is NOT terminal: a long session compacts
-    # multiple times, and each PreCompact is its own checkpoint. Only SessionEnd
-    # / SubagentStop completions latch modes.<mode>.final_complete=true —
-    # precompact completions bump modes.precompact.last_checkpoint_at instead
-    # so downstream observers can see progress without the idempotency gate
-    # short-circuiting the next PreCompact fire.
+    # is_already_complete. Modes that may re-run for the same SID must NOT
+    # latch it. Terminal modes: sessionend, subagentstop.
+    # Non-terminal (re-runnable): precompact, mission.
+    #   - precompact: long sessions compact multiple times; each PreCompact
+    #     is its own checkpoint (bumps last_checkpoint_at instead).
+    #   - mission: idle-handoff refreshes mission.md every N minutes over a
+    #     long-idle session; latching would poison all future mission runs
+    #     for that SID until SessionEnd cleanup (advisor HIGH-B, ARFTL P1R2).
     local final_complete=false
-    if [[ "$status" == "complete" && "$mode" != "precompact" ]]; then
-      final_complete=true
-    fi
+    case "$status:$mode" in
+      complete:sessionend|complete:subagentstop)
+        final_complete=true
+        ;;
+    esac
 
     # last_checkpoint_at: only set when a precompact completes.
     local last_checkpoint_at_json='null'
