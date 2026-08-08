@@ -327,10 +327,19 @@ is_already_complete() {
       # Manual repair path: operator deletes the manifest, next fire starts
       # clean.
       started_epoch="$(date -d "$started_at" +%s 2>/dev/null || echo '')"
-      # Guard: empty (date failed) OR non-numeric OR <= 0 (epoch fallback
-      # from `|| echo 0` in old code). Use a numeric regex first because
-      # (( )) would treat 'abc' as 0 and mis-classify garbage.
-      if [[ -z "$started_epoch" || ! "$started_epoch" =~ ^[0-9]+$ ]] || (( started_epoch <= 0 )); then
+      # Guard: only reject when date -d itself failed (empty output) OR the
+      # output is non-numeric. Accept negative epochs (pre-1970) and zero —
+      # those are legitimately-parseable old timestamps, not corruption; the
+      # age-based stale reaper below will handle them correctly (huge age →
+      # crosses REFLECT_STALE_STARTED_SECONDS → treated as stale, permits
+      # re-run). Previously we conflated "parseable but very old" with
+      # "corrupt", which meant a manifest with a legitimate pre-1970
+      # started_at would never be reaped.
+      #
+      # Regex allows optional leading '-' so negative epochs pass. Use the
+      # regex FIRST because (( )) treats non-numeric strings as 0 and would
+      # mis-classify garbage as a valid epoch.
+      if [[ -z "$started_epoch" || ! "$started_epoch" =~ ^-?[0-9]+$ ]]; then
         echo "reflect: manifest has unparseable started_at='$started_at' (mode=$mode path=$mpath) — refusing to reap; delete manifest.json to reset" >&2
         return 0
       fi
