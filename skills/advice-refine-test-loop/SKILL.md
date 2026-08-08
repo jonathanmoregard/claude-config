@@ -372,13 +372,13 @@ KNOWN drift-backs (regressed at least once before — flag on sight):
 - Timegrid busy overlay narrower than the column.
 
 For EACH image, emit a JSON object matching the verdict-schema.json used
-elsewhere in this pipeline. Findings must include:
-  - severity: BLOCKER | HIGH | MEDIUM
-  - file: image basename
-  - screen_region: rough bbox or region name (e.g. "top-left option in
-    radiogroup", "dialog title")
-  - rule: which fixed-rule or drift-back number the finding violates
-  - rationale: ≤200 chars
+elsewhere in this pipeline (severity BLOCKER|HIGH|MEDIUM, autofix_class
+per schema, file, line, rationale). Encode region + rule INSIDE rationale
+as a prefix: `[region: <where>] [rule: <fixed-rule# or drift-back#>] <what
+breaks>`. Example: `[region: top-left option in radiogroup] [rule:
+drift-back#1] radio dot renders above text, not to the left`. Keep total
+rationale ≤200 chars. Use `file` for the image basename and `line: 0`
+(schema requires line; visual findings are whole-image).
 
 If nothing to flag on an image, emit an empty findings array for that shot.
 Do not report LOW / nit — the geometry oracle and 4a already cover polish.
