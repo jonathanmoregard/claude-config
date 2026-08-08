@@ -9,7 +9,25 @@
 set -euo pipefail
 
 STATE=".claude/ralph-loop.local.md"
-[[ -f "$STATE" ]] || exit 0
+MISSION="tasks/mission.md"
+
+# Two independent reminders. Neither depends on the other; exit 0 if neither
+# applies. Order: ralph doctrine first (more constraining), mission.md second.
+
+if [[ ! -f "$STATE" && ! -f "$MISSION" ]]; then
+  exit 0
+fi
+
+if [[ ! -f "$STATE" ]]; then
+  # Mission-only reminder: any project with tasks/mission.md gets a re-read
+  # nudge after compact/clear. Compaction is documented to invalidate the
+  # cached prefix that held CLAUDE.md and mission.md context; disk beats
+  # in-context memory once compaction has fired.
+  cat <<EOF
+[context-lifecycle] tasks/mission.md exists in this project. Context was just compacted, cleared, or restarted — re-read it now, plus tasks/session-constraints.md if present. Do not rely on your memory of the pre-compact conversation for state that lives on disk.
+EOF
+  exit 0
+fi
 
 ITER=$(awk '/^iteration:/{sub(/^iteration: */,""); print; exit}' "$STATE")
 [[ "$ITER" =~ ^[0-9]+$ ]] || ITER="?"

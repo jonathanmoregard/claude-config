@@ -17,7 +17,12 @@ import sys
 
 BASE_MAX = 200_000
 ONE_M = 1_000_000
-THRESHOLD = 0.25
+# Raised from 0.25 -> 0.70 on 2026-08-08 after measuring 95.5% cache-hit
+# ratio across 7 days / $3,073 spend (probes/analyze_sessions.py). At that
+# hit ratio, holding baggage is cheap and resetting is expensive
+# (cache_write ~$5-10 per cold event). Nudge should fire when handoff to
+# a fresh session starts to pay off, not on any drift.
+THRESHOLD = 0.70
 MESSAGE_INTERVAL = 5
 
 # Claude Code model IDs that run at 1M context by default. Prefixes, so
@@ -123,10 +128,13 @@ def main():
     message = (
         f"Context is {pct_display}% full ({user_msg_count} messages in this session; "
         f"window: {max_tokens // 1000}k tokens). "
-        "Review the conversation history: identify any content that appears to be leftover "
-        "from a previous task or is no longer relevant to the current task. "
-        "Summarize what seems stale or off-topic, and warn the user clearly if you are "
-        "carrying significant irrelevant baggage."
+        "At this fill, a fresh-session handoff via tasks/mission.md is usually cheaper "
+        "than an in-place /compact: --fork-session on a warm cache measured ~77% hit "
+        "(session-reflect empirical), while /compact invalidates the prefix and forces "
+        "cache_write on subsequent turns. "
+        "Suggest to the user: (a) write tasks/mission.md (done / next / blocked / open "
+        "questions), (b) start a fresh session in the same cwd and load it, OR (c) "
+        "continue here and accept the drift. Ask which."
     )
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": message}}))
 
