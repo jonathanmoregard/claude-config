@@ -508,15 +508,24 @@ run_worker() {
   #   3. If both fail, record a small excerpt (first 200 chars), not the
   #      full body — the raw reply may contain sensitive content and blowing
   #      it into a manifest is unnecessary for debugging.
+  # jq extractor: pass through arrays only. Coerce non-arrays (string,
+  # object, number, bool, null) to []. Without this coercion, a model
+  # reply like {"patterns":"one long string"} would land in final.json
+  # with .patterns = "one long string" — a schema violation that breaks
+  # every downstream consumer expecting an array (aggregators, dashboards,
+  # jq queries like `.patterns | length`). Coercing to [] loses the
+  # malformed string but preserves the SHAPE invariant that final.json
+  # always has 5 array-typed keys.
+  local -r _coerce_arrays='{
+    patterns: ((.patterns // []) | if type == "array" then . else [] end),
+    discoveries: ((.discoveries // []) | if type == "array" then . else [] end),
+    turning_points: ((.turning_points // []) | if type == "array" then . else [] end),
+    digressions: ((.digressions // []) | if type == "array" then . else [] end),
+    obstacles_to_autonomy: ((.obstacles_to_autonomy // []) | if type == "array" then . else [] end)
+  }'
   local reflection=""
   local parse_source=""
-  if reflection=$(jq -c '{
-    patterns: (.patterns // []),
-    discoveries: (.discoveries // []),
-    turning_points: (.turning_points // []),
-    digressions: (.digressions // []),
-    obstacles_to_autonomy: (.obstacles_to_autonomy // [])
-  }' <<<"$inner" 2>/dev/null); then
+  if reflection=$(jq -c "$_coerce_arrays" <<<"$inner" 2>/dev/null); then
     parse_source="direct"
   else
     # Whole-body fence match: leading ```(json)?, trailing ```, with the
@@ -536,13 +545,7 @@ run_worker() {
               -e '$s/^```[[:space:]]*$//')"
     fi
     if [[ -n "$unfenced" ]]; then
-      if reflection=$(jq -c '{
-        patterns: (.patterns // []),
-        discoveries: (.discoveries // []),
-        turning_points: (.turning_points // []),
-        digressions: (.digressions // []),
-        obstacles_to_autonomy: (.obstacles_to_autonomy // [])
-      }' <<<"$unfenced" 2>/dev/null); then
+      if reflection=$(jq -c "$_coerce_arrays" <<<"$unfenced" 2>/dev/null); then
         parse_source="fenced"
       fi
     fi

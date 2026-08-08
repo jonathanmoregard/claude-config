@@ -751,6 +751,55 @@ STUB
 chmod +x "$STUB_SCRATCH/claude"
 
 # ============================================================================
+# TEST 11: reflection JSON with wrong-typed keys is coerced to arrays
+# ============================================================================
+# Regression (Codex P3.1): the jq extractor previously used `(.patterns // [])`
+# which returns a non-array VALUE verbatim if .patterns is a string, object,
+# or number. That value then landed in final.json as `.patterns = "some string"`
+# — a schema violation that breaks every downstream consumer expecting an array.
+# Fix: coerce non-arrays to [] with `if type == "array" then . else [] end`.
+echo "TEST 11: reflection JSON type coercion for non-array values"
+cat >"$STUB_SCRATCH/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null || true
+# All 5 keys wrong-typed: string, object, number, bool, null.
+# Sentinel string "SHOULD_BE_DROPPED" must not appear in final.json's patterns.
+printf '%s\n' '{"type":"result","result":"{\"patterns\":\"SHOULD_BE_DROPPED\",\"discoveries\":{\"nested\":\"obj\"},\"turning_points\":42,\"digressions\":true,\"obstacles_to_autonomy\":null}","usage":{}}'
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+COERCE_SID="test-sid-typecoerce"
+CP="$(fake_payload SessionEnd "$COERCE_SID")"
+echo "$CP" | bash "$REFLECT_SH" sessionend >/dev/null
+wait_for_complete "$REFLECT_ROOT/sessions/$COERCE_SID/manifest.json" 10 \
+  || fail "type-coerce sessionend never completed"
+
+COERCE_FINAL="$REFLECT_ROOT/sessions/$COERCE_SID/final.json"
+[[ -f "$COERCE_FINAL" ]] || fail "type-coerce final.json missing"
+
+# Each of the 5 keys MUST be an array in the artifact (regardless of what
+# type the model emitted).
+for k in patterns discoveries turning_points digressions obstacles_to_autonomy; do
+  jq -e --arg k "$k" '.[$k] | type == "array"' "$COERCE_FINAL" >/dev/null \
+    || fail "final.json .$k is not array (got: $(jq -r --arg k "$k" '.[$k] | type' "$COERCE_FINAL"))"
+done
+# The dropped string must NOT appear anywhere in patterns.
+if jq -e '.patterns | index("SHOULD_BE_DROPPED")' "$COERCE_FINAL" >/dev/null 2>&1; then
+  fail "type coercion should drop the malformed string, but it landed in .patterns"
+fi
+info "type coercion: all 5 keys forced to [] when non-array"
+
+# Restore canonical stub.
+cat >"$STUB_SCRATCH/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null || true
+cat <<'JSON'
+{"type":"result","result":"{\"patterns\":[\"stubbed pattern\"],\"discoveries\":[],\"turning_points\":[],\"digressions\":[],\"obstacles_to_autonomy\":[]}","usage":{"cache_read_input_tokens":100,"cache_creation_input_tokens":10,"input_tokens":5,"output_tokens":50}}
+JSON
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+# ============================================================================
 if [[ "${REFLECT_DEBUG:-}" != "1" ]]; then
   rm -rf "$REFLECT_ROOT" "$STUB_SCRATCH"
 fi
