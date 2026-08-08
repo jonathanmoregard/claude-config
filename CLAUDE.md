@@ -22,6 +22,8 @@ Never ask the user to do what you can do. Run the commands, tests, reads, edits,
 | Same op failed 3×, or advisor 3× without progress | Log in `pending_for_human.md`, switch task |
 | Blocked on credential / browser auth / human step | Log in `pending_for_human.md`, switch task |
 
+Entry format for `pending_for_human.md`: `~/.claude/templates/pending-for-human.md`.
+
 After every edit, run the fastest relevant check on the file just edited — syntax parse, type-check, linter, project verify command. Don't move on until it's clean.
 
 Context large, or before a risky long step → write `tasks/mission.md`: done / next / blocked / open questions. Must be resumable without the full history.
