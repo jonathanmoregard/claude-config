@@ -161,9 +161,16 @@ automation-review/
 *.tgz
 *.zip
 
-# Lockfiles are per-run state. Generalises the one-off .settings.lock and
-# scheduled_tasks.lock entries above.
+# Runtime lockfiles are per-run state. Generalises the one-off .settings.lock
+# and scheduled_tasks.lock entries above. Dependency lockfiles are genuine
+# source and negated back in — flake.lock is already tracked under
+# skills/visual-verify/.
 *.lock
+!flake.lock
+!Cargo.lock
+!poetry.lock
+!uv.lock
+!Gemfile.lock
 
 # Auto-sync runtime log (see sync-agent.sh)
 sync.log
