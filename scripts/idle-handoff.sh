@@ -50,7 +50,14 @@ REFLECT_SH="$HOME/.claude/skills/session-reflect/reflect.sh"
 PROJECTS_DIR="$HOME/.claude/projects"
 
 now=$(date +%s)
-mkdir -p "$IDLE_HANDOFF_LOG_DIR" "$IDLE_HANDOFF_STATE_DIR" 2>/dev/null || exit 0
+if ! mkdir -p "$IDLE_HANDOFF_LOG_DIR" "$IDLE_HANDOFF_STATE_DIR" 2>/dev/null; then
+  # Can't log (log dir is what failed). Systemd journal must see this.
+  # Prior version exit-0'd silently; unit stayed green forever while the
+  # feature was dead. Advisor P3R1 MEDIUM.
+  printf 'idle-handoff: cannot mkdir %s or %s; aborting\n' \
+    "$IDLE_HANDOFF_LOG_DIR" "$IDLE_HANDOFF_STATE_DIR" >&2
+  exit 1
+fi
 
 log() {
   printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$IDLE_HANDOFF_LOG_DIR/handoff.log"
@@ -171,17 +178,29 @@ declare -A LIVE_CWDS
 scan_live_cwds() {
   # Reset then repopulate — safe to call repeatedly.
   LIVE_CWDS=()
-  local exe cwd exe_tail
+  local exe cwd exe_tail cmdline_first
   for pid_dir in /proc/[0-9]*; do
     [[ -d "$pid_dir" ]] || continue
     exe=$(readlink "$pid_dir/exe" 2>/dev/null) || continue
     # Strip any trailing " (deleted)" annotation Linux appends after unlink.
     exe="${exe% (deleted)}"
     exe_tail="${exe##*/}"
+    local matched=0
     case "|$CLAUDE_EXE_TAILS|" in
-      *"|$exe_tail|"*) ;;
-      *) continue ;;
+      *"|$exe_tail|"*) matched=1 ;;
     esac
+    # Fallback: some claude installs shim through node/bun (exe = node),
+    # so exe alone misses them. Check argv[0] via /proc/pid/cmdline
+    # (null-separated). If argv[0]'s basename matches a known claude
+    # name, count it. Advisor P3R1 MEDIUM.
+    if [[ "$matched" -eq 0 ]]; then
+      cmdline_first=$(tr '\0' '\n' < "$pid_dir/cmdline" 2>/dev/null | head -1)
+      local argv0_tail="${cmdline_first##*/}"
+      case "|$CLAUDE_EXE_TAILS|" in
+        *"|$argv0_tail|"*) matched=1 ;;
+      esac
+    fi
+    [[ "$matched" -eq 1 ]] || continue
     cwd=$(readlink "$pid_dir/cwd" 2>/dev/null) || continue
     LIVE_CWDS["$cwd"]=1
   done
@@ -427,10 +446,23 @@ for project_dir in "$PROJECTS_DIR"/*/; do
   mission_path="$candidate_cwd/tasks/mission.md"
 
   # ---- Fresh-mission dedupe ---
+  # Two conditions gate re-writing: (a) age-based freshness (don't rewrite
+  # within N minutes of a prior write); (b) mission_mtime > transcript_mtime
+  # (nothing new in the transcript since last summary — an idle-24h project
+  # with unchanged transcript would otherwise get haiku-rewritten every N
+  # minutes forever, clobbering any autofork's ## Done updates and
+  # resurrecting completed items whose execution left no local git trace,
+  # e.g. `git push`, `gh pr merge`. Advisor P3R1 HIGH-2).
   if [[ -f "$mission_path" ]]; then
-    mission_age=$(( now - $(stat -c '%Y' "$mission_path" 2>/dev/null || echo 0) ))
+    mission_mtime=$(stat -c '%Y' "$mission_path" 2>/dev/null || echo 0)
+    mission_age=$(( now - mission_mtime ))
     if [[ "$mission_age" -lt "$IDLE_HANDOFF_MISSION_MAX_AGE_SECONDS" ]]; then
       count_skipped_fresh_mission=$((count_skipped_fresh_mission + 1))
+      continue
+    fi
+    if [[ "$mission_mtime" -ge "$mtime" ]]; then
+      count_skipped_fresh_mission=$((count_skipped_fresh_mission + 1))
+      log "mission fresher than transcript sid=$sid (mission=$mission_mtime transcript=$mtime); no new state to summarize"
       continue
     fi
   fi
@@ -439,17 +471,21 @@ for project_dir in "$PROJECTS_DIR"/*/; do
   # The gate must fire before we write tasks/mission.md, else our own write
   # (a new untracked file when the tasks/ dir was previously absent) trips
   # `git status --porcelain` and the gate ALWAYS returns stale → autofork
-  # NEVER fires. The gate is about "did the world move since transcript
-  # mtime"; mission-write is a downstream artifact of this run, not evidence
-  # of prior movement.
+  # NEVER fires.
   #
-  # Still, we WRITE mission.md even when the gate trips — the on-disk
-  # artifact is valuable to a human resumer even if autofork won't execute.
-  # So we compute stale flag now, always write, and gate autofork on it later.
+  # We WRITE mission.md even when the gate trips — the on-disk artifact is
+  # valuable to a human resumer even if autofork won't execute. Compute
+  # stale flag now, always write, gate autofork on it later.
+  #
+  # Also snapshot HEAD SHA for a POST-write TOCTOU re-check: mission-write
+  # burns ~90s, and a commit landing during that window would make autofork
+  # act on a world-that-just-moved. Advisor P3R1 MEDIUM.
   if is_stale_since_transcript "$candidate_cwd" "$mtime"; then
     stale_this_iter=1
+    pre_write_head=""
   else
     stale_this_iter=0
+    pre_write_head=$(timeout 5 sh -c 'cd "$1" && git rev-parse HEAD 2>/dev/null' _ "$candidate_cwd" || echo "")
   fi
 
   # ---- Write mission.md (warm cache preemption) ---
@@ -529,6 +565,20 @@ for project_dir in "$PROJECTS_DIR"/*/; do
     continue
   fi
 
+  # ---- Post-write HEAD TOCTOU re-check (advisor P3R1 MEDIUM) ---
+  # If HEAD moved during the ~90s mission-write, autofork would act on a
+  # world that just moved. Cheap SHA compare against the snapshot we took
+  # pre-write. Non-git cwds skipped this section entirely (pre_write_head
+  # would be empty because is_stale_since_transcript already denied non-git).
+  if [[ -n "$pre_write_head" ]]; then
+    post_write_head=$(timeout 5 sh -c 'cd "$1" && git rev-parse HEAD 2>/dev/null' _ "$candidate_cwd" || echo "")
+    if [[ -z "$post_write_head" || "$post_write_head" != "$pre_write_head" ]]; then
+      count_skipped_git_stale=$((count_skipped_git_stale + 1))
+      log "autofork skipped sid=$sid cwd=$candidate_cwd (HEAD moved during mission-write: pre=$pre_write_head post=$post_write_head)"
+      continue
+    fi
+  fi
+
   # ---- Rescan live cwds (advisor MEDIUM: initial scan may be minutes stale) ---
   # Mission-write can burn ~90s; a claude pane opened in this cwd during
   # that window would race with the autofork spawn. Rescan and re-check.
@@ -587,18 +637,51 @@ PROMPT
 
   log "AUTOFORK sid=$sid cwd=$candidate_cwd model=$IDLE_HANDOFF_AUTOFORK_MODEL max_turns=$IDLE_HANDOFF_AUTOFORK_MAX_TURNS cwd_forks_24h=$cwd_fork_count"
 
-  # Detach cleanly. Close fd 8 in the child (`8>&-`) so the flock is NOT
-  # inherited — else the lock is held for the entire opus fork lifetime and
-  # every subsequent timer fire hits "another handoff run in progress".
-  # setsid + nohup daemonizes; </dev/null detaches stdin.
-  ( cd "$candidate_cwd" && \
-    setsid nohup claude -p \
-      --model "$IDLE_HANDOFF_AUTOFORK_MODEL" \
-      --max-turns "$IDLE_HANDOFF_AUTOFORK_MAX_TURNS" \
-      --permission-mode acceptEdits \
-      "$autofork_prompt" \
-      >>"$autofork_log" 2>&1 8>&- &
-  ) </dev/null
+  # Spawn as a TRANSIENT SYSTEMD SERVICE so the fork outlives this oneshot.
+  # This script runs in a oneshot service under our user timer with default
+  # KillMode=control-group. `setsid nohup` doesn't escape the service cgroup
+  # — every descendant gets SIGTERMed when the parent oneshot exits, i.e.
+  # within seconds. Advisor P3R1 HIGH-1, empirically confirmed.
+  #
+  # `systemd-run --user --collect --no-block --unit=...` creates a new
+  # user service (its own cgroup, its own KillMode, its own lifecycle).
+  # --collect removes the unit from the manager on exit so leftover
+  # failed/complete units don't accumulate.
+  # --no-block returns immediately after the service is queued rather than
+  # waiting for it to complete.
+  # WorkingDirectory= sets cwd for the service.
+  # Standard{Output,Error}=append: sends logs to the autofork log.
+  # Empirical (verified 2026-08-08): a sleep-30 launched this way from
+  # inside a `systemd-run --wait` outer service outlives the outer.
+  # Fallback to setsid nohup only when systemd-run is not on PATH.
+  unit_name="claude-autofork-$(echo "$sid" | tr -c 'A-Za-z0-9._-' '_')-$(date +%s)"
+  if command -v systemd-run >/dev/null 2>&1; then
+    systemd-run --user --collect --no-block --unit="$unit_name" \
+      --working-directory="$candidate_cwd" \
+      --property="StandardOutput=append:${autofork_log}" \
+      --property="StandardError=append:${autofork_log}" \
+      -- claude -p \
+        --model "$IDLE_HANDOFF_AUTOFORK_MODEL" \
+        --max-turns "$IDLE_HANDOFF_AUTOFORK_MAX_TURNS" \
+        --permission-mode acceptEdits \
+        "$autofork_prompt" \
+      >>"$autofork_log" 2>&1
+    spawn_rc=$?
+    if [[ "$spawn_rc" -ne 0 ]]; then
+      log "AUTOFORK spawn failed sid=$sid rc=$spawn_rc unit=$unit_name (see $autofork_log)"
+      continue
+    fi
+  else
+    log "WARN sid=$sid: systemd-run unavailable, using setsid nohup (fork may not survive parent exit under systemd)"
+    ( cd "$candidate_cwd" && \
+      setsid nohup claude -p \
+        --model "$IDLE_HANDOFF_AUTOFORK_MODEL" \
+        --max-turns "$IDLE_HANDOFF_AUTOFORK_MAX_TURNS" \
+        --permission-mode acceptEdits \
+        "$autofork_prompt" \
+        >>"$autofork_log" 2>&1 8>&- &
+    ) </dev/null
+  fi
   record_fork "$candidate_cwd"
   forks_this_run=$((forks_this_run + 1))
   count_forked=$((count_forked + 1))
