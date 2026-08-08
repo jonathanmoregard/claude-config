@@ -20,9 +20,11 @@ Every phase uses a **structured JSON verdict schema** (`verdict-schema.json`) so
 
 ```
 PHASE 1:  Opus + specialists — loop rounds until verdict PASS
+                               (bounded: see "Loop bounds")
 PHASE 2:  Codex (GPT-5.5) — loop rounds until verdict PASS
+                               (bounded: see "Loop bounds")
 PHASE 3:  Adversarial — single Opus round with "prove PASS wrong" framing
-          (findings loop back to Phase 1)
+          (findings loop back to Phase 1; at most ONE reset per run)
 PHASE 4a: Taste round (UI-only, ONCE) — Opus defect + taste critics
 PHASE 4b: Codex vision-taste (UI-only, ONCE) — second-vendor VLM on the
           regenerated shots; combined with geometry-oracle output via
@@ -67,12 +69,111 @@ Each Phase 1/2 round follows the same shape:
    - This is safe by construction: the worst case is repro effort in step 5 on findings that might have been hallucinations; the benefit is no PAUSE storm from an ancillary check. Phase 2's PAUSE ladder exists because Codex is the cross-vendor coverage lane — irreplaceable. Step 4.5's validator is one advisor of many; skipping it once is cheaper than pausing the loop.
 5. REPRODUCE each BLOCKER/HIGH finding before fixing — advisors hallucinate
 6. FIX by severity, re-verify after each
-7. COMMIT the round (per-round granularity, not a batch)
+7. COMMIT the round (per-round granularity, not a batch), then WRITE RUN
+   STATE (`tasks/arftl-run.json` — see "Run state" below). Both, every round.
 8. RE-ADVISE with a fresh prompt whose "Prior rounds fixed:" list carries
    the entire phase's fix history
 9. On verdict `PASS` or `PASS_WITH_FIXES` → exit round loop; on `BLOCKS` →
-   next round
+   check the LOOP BOUNDS gate (see below), then next round
 ```
+
+## Loop bounds (non-convergence stop)
+
+Phase 1 and Phase 2 loop "until PASS". Without a bound that is unbounded by
+construction: an advisor that keeps surfacing fresh MEDIUM/LOW findings can
+loop for hours. This skill's own trigger includes "the user is going to bed",
+so the failure mode is an unattended overnight run draining both quota
+buckets with nothing to show. Bound both loops.
+
+**Track per round.** `blockers_r` = the BLOCKER+HIGH count that drove round
+`r`, measured AFTER step 4.5 drops (`verified:false` findings are not real
+work). This is the same `$blockers` computed at step 4, recomputed on the
+post-validator array. Append it to `blockers_per_round[phase]` in the run
+state at step 7.
+
+**Gate, evaluated at step 9 before starting round r+1:**
+
+```bash
+# b = blockers_per_round for the current phase, e.g. (5 3 3)
+n=${#b[@]}
+# 1. Non-convergence: no strict decrease across the last two rounds.
+if (( n >= 3 )) && (( b[n-1] >= b[n-2] )) && (( b[n-2] >= b[n-3] )); then
+  stop="non-convergence"
+fi
+# 2. Nominal cap of 3 rounds, exceeded ONLY while still strictly shrinking.
+if (( n >= 3 )) && ! (( b[n-1] < b[n-2] )); then
+  stop="round-cap"
+fi
+```
+
+In prose: **nominal cap is 3 rounds per phase.** Round 4+ is permitted only
+when the blocker count strictly decreased in the immediately preceding round.
+Independently, if the count fails to strictly decrease across two consecutive
+rounds, stop — regardless of round number. A phase that is still shrinking
+its blocker count is converging and may continue; one that is flat or growing
+is not, and more rounds will not fix that.
+
+**On stop, route to the EXISTING Phase 2 PAUSE handler** — do not invent a
+second escalation path:
+
+- **Interactive:** print `"Phase <P> stopped: <reason> after <n> rounds
+  (blockers per round: <b>). Options: (a) continue N more rounds anyway,
+  (b) ship with the remaining findings surfaced, (c) abort."` Wait for the
+  user.
+- **Unattended:** append to `pending_for_human.md` in the CLAUDE.md format,
+  set run-state `status: pending-human` + `pause_reason`, exit
+  `pending-human`. Do NOT advance to the next phase and do NOT ship — a
+  non-converging phase has not established the coverage the next phase
+  assumes.
+
+**Phase 3 resets are bounded too.** A `BLOCKS` from Phase 3 resets to Phase 1
+at most ONCE per run. A second Phase 3 `BLOCKS` means the diff keeps hiding
+new defects under review — that is the "split the diff" signal already stated
+in Phase 3's Budget note, so stop there and PAUSE rather than resetting again.
+
+**Not covered by this gate** (already bounded elsewhere, left alone):
+consolidator sub-loop (3 rounds), Phase 3 (single shot), Phase 4a fix cap (1
+round).
+
+## Run state
+
+Loop state currently lives only in the parent's context, carried by the
+"Prior rounds fixed:" prompt delta. A compact, crash, or restart mid-Phase-2
+therefore loses which phase and round were live and the entire fix history —
+and the natural recovery is to restart Phase 1, re-burning both quotas on
+work already done. Persist it.
+
+**Write `tasks/arftl-run.json` (repo-local, alongside the `tasks/mission.md`
+that CLAUDE.md already mandates) at every round commit — step 7, same step,
+no exceptions:**
+
+```json
+{
+  "status": "running | pending-human | complete",
+  "phase": "1 | 2 | 3 | 4a | 4b",
+  "round": 3,
+  "blockers_per_round": {"1": [5, 2, 0], "2": [1, 0]},
+  "phase3_resets": 0,
+  "round_commits": ["a1b2c3d", "e4f5g6h"],
+  "fixed_summary": ["<one line per fixed finding, phase-tagged>"],
+  "pause_reason": null,
+  "last_update": "<ISO-8601>"
+}
+```
+
+`fixed_summary` is the durable form of the "Prior rounds fixed:" list — it is
+what makes resume cheap rather than a restart.
+
+**On skill start, before Phase 1:** if `tasks/arftl-run.json` exists with
+`status: running`, do NOT start over. Read it, announce `"Resuming ARFTL at
+phase <P> round <r> (<n> prior rounds, <k> findings fixed)"`, and re-enter at
+the recorded phase with `fixed_summary` seeding the prompt's "Prior rounds
+fixed:" list. `status: pending-human` means a human owes a decision — surface
+`pause_reason` and stop; do not silently resume past a PAUSE. `status:
+complete` is a finished prior run: archive or delete it and start fresh.
+
+Write `status: complete` at Exit. The file is state, not a report — the Exit
+commit message remains the human-facing artifact.
 
 ## Verdict schema
 
@@ -113,9 +214,9 @@ Dispatch specialists in the SAME tool-use block as the primary Opus advisor (par
 
 Skip specialists when the diff is clearly out-of-scope (pure prose docs, VM test fixture changes, cosmetic renames). Rule of thumb: if you'd forward the diff to a security reviewer at your org, dispatch the specialist.
 
-**Usage-limit fallback (primary + specialists):** if any dispatch returns with "usage limit" in the result (Fable/default org-monthly quota exhausted), re-dispatch ONCE with `model="claude-opus-4-7"` — Opus is a separate quota bucket and typically completes. Do this only on limit-hit; other failures (crash, timeout, refusal) get diagnosed, not fallback-masked. Never re-dispatch a third time — if Opus also 429s, the round exits with a note in the round's commit message.
+**Usage-limit fallback (primary + specialists):** if any dispatch returns with "usage limit" in the result (Fable/default org-monthly quota exhausted), re-dispatch ONCE with `model="claude-opus-5"` — Opus is a separate quota bucket and typically completes. Do this only on limit-hit; other failures (crash, timeout, refusal) get diagnosed, not fallback-masked. Never re-dispatch a third time — if Opus also 429s, the round exits with a note in the round's commit message.
 
-Loop rounds until primary AND all dispatched specialists return `PASS` (or `PASS_WITH_FIXES`; consolidator handles). Then move to Phase 2.
+Loop rounds until primary AND all dispatched specialists return `PASS` (or `PASS_WITH_FIXES`; consolidator handles), **subject to the "Loop bounds" gate** — nominal 3 rounds, extended only while the blocker count is strictly shrinking, stopped on two consecutive non-decreasing rounds. Then move to Phase 2. For the merged primary+specialist round, `blockers_r` is the count over the DEDUPED union (a defect both reviewers flag is one blocker, not two — otherwise dropping a duplicate reads as convergence).
 
 ## Phase 2: Codex (GPT-5.5) advisor
 
@@ -144,16 +245,16 @@ Parse: `verdict=$(codex exec … | jq -r '.verdict')`. Values: `PASS`, `PASS_WIT
 
 **Verdict-missing:** if `jq -r '.verdict'` prints `null` or errors, treat the round as failed and re-run once with an explicit "your last output was not valid JSON — emit exactly the verdict-schema.json shape" reminder. On second verdict-missing, PAUSE per above (do NOT silently advance — a Codex round that can't emit a parseable verdict has produced zero coverage).
 
-**Budget expectation:** Phase 2 should usually complete in 1-2 rounds because Opus already caught the bulk. If Codex demands ≥3 rounds, that IS the signal — Codex saw something Opus missed, and the extra rounds are the reason Phase 2 exists.
+**Budget expectation:** Phase 2 should usually complete in 1-2 rounds because Opus already caught the bulk. If Codex demands ≥3 rounds, that IS the signal — Codex saw something Opus missed, and the extra rounds are the reason Phase 2 exists. But "the extra rounds are justified" holds only while Codex is *converging*: the "Loop bounds" gate still applies here unmodified. Round 4+ requires the blocker count to have strictly decreased in round 3. Codex finding genuinely new things each round shrinks its own blocker list as you fix them; Codex re-flagging a flat list across rounds is churn, and churn on the tighter Plus quota is exactly what Phase 2 cannot afford.
 
-Loop rounds until Codex emits `PASS` (or `PASS_WITH_FIXES`; consolidator handles). Then move to Phase 3.
+Loop rounds until Codex emits `PASS` (or `PASS_WITH_FIXES`; consolidator handles), **subject to the "Loop bounds" gate**. A non-convergence stop here routes to the same PAUSE handler as the four failure modes above. Then move to Phase 3.
 
 ## Phase 3: Adversarial round (single Opus dispatch)
 
 After Phase 2 PASS. One shot; the verdict determines advance:
 
 - `PASS` or `PASS_WITH_FIXES` (findings ≤ MEDIUM) → advance to Phase 4. MEDIUMs and LOWs surface in the exit commit message; consolidator handles LOWs; MEDIUMs are surfaced for the human but do NOT trigger a Phase 1 reset (the whole point of "PASS_WITH_FIXES advances" from earlier phases applies here too — a MEDIUM adversarial finding that would have been BLOCKER-worthy should have been emitted as HIGH by the adversarial prompt).
-- `BLOCKS` (any BLOCKER or HIGH) → loop resets to Phase 1 with the new findings pre-seeded so both vendors re-review the fix.
+- `BLOCKS` (any BLOCKER or HIGH) → loop resets to Phase 1 with the new findings pre-seeded so both vendors re-review the fix. **At most ONE such reset per run** (`phase3_resets` in the run state). On a second Phase 3 `BLOCKS`, do not reset again — PAUSE per the Phase 2 handler with reason `phase3-reset-cap`, because a diff that keeps producing fresh BLOCKER/HIGH findings after a full Phase 1→2→3 pass is the "split the diff" case, not a case for another full lap.
 
 Dispatch: same `Agent(subagent_type="advisor", …)` as Phase 1, but the prompt is framed adversarially:
 
@@ -170,9 +271,9 @@ Given the state of these files, what did they miss?
 - If nothing new, emit verdict PASS with empty findings.
 ```
 
-**Budget:** exactly 1 dispatch. If findings emerge → back to Phase 1 with the new findings pre-seeded. Do not loop adversarial itself — the loop lives at the phase-1-to-phase-3 level.
+**Budget:** exactly 1 dispatch per pass. If findings emerge → back to Phase 1 with the new findings pre-seeded, once. Do not loop adversarial itself — the loop lives at the phase-1-to-phase-3 level, and that outer loop is capped at one reset.
 
-**Why one shot:** confidence-check on the loop, not another full loop. If adversarial keeps finding real things across resets, the diff is too big — split it.
+**Why one shot:** confidence-check on the loop, not another full loop. If adversarial keeps finding real things across resets, the diff is too big — split it. The one-reset cap is what turns that observation into an actual stop instead of advice.
 
 ## Advisor Prompt Shape
 
@@ -243,7 +344,11 @@ After consolidator exits (clean or bounded), advance to the next phase using the
 | Same prompt every round | Advisor re-flags fixed issues, wastes findings |
 | Batch all rounds into one commit | Loses bisectable history |
 | Skip re-verification after each fix | Regressions hide in the batch |
-| Stop after round 1 because it "felt thorough" | Most valuable finding often lands in round 3 |
+| Stop after round 1 because it "felt thorough" | Most valuable finding often lands in round 3. Stop on the "Loop bounds" gate, not on a feeling — the gate is what makes "keep going" safe to say. |
+| Keep looping a phase because the advisor "still has notes" | The bound is convergence, not exhaustion. Flat or growing BLOCKER+HIGH across two rounds means more rounds won't help — PAUSE and hand it to the human. Unbounded loops on a "going to bed" trigger drain both quota buckets overnight and ship nothing. |
+| Reset to Phase 1 a second time from Phase 3 | Capped at one reset. A diff still producing fresh BLOCKER/HIGH after a full 1→2→3 pass wants splitting, not another lap through both vendors. |
+| Skip writing `tasks/arftl-run.json` because "the loop is nearly done" | Nearly-done is when a compact is most likely and the fix history is most expensive to lose. Write it at every round commit, same step. |
+| Restart at Phase 1 after a compact or crash | Check `tasks/arftl-run.json` first. Re-running phases that already PASSed re-burns both quotas to reproduce a result you already have on disk. |
 | Skip Phase 2 (Codex) because "Opus already said PASS" | Single-vendor blindness is the whole reason Phase 2 exists. If Codex is out of quota, PAUSE and tell the user — don't ship as PASS on a half-run loop. |
 | Run Phase 2 in parallel with Phase 1 to "save time" | Wastes Codex quota on drafts Opus will reject. Sequential ordering is deliberate: Codex only sees Opus-clean state so its rounds are cheap. |
 | Interleave phases (Opus round, Codex round, Opus round, …) | Same failure mode — Codex burns quota reviewing states you're about to change. Complete Phase 1 first, THEN start Phase 2. |
@@ -470,3 +575,12 @@ DiffSpot ranks Gemini (2.5 Pro / 3.x Pro) as the strongest visual perceiver (47.
 ## Exit
 
 Final commit or chat message: round count + categories of bug caught (fail-open / resource leak / schema mismatch / taste-defect / anti-slop / …) + final verdict. Trains judgment for when future changes deserve the loop.
+
+Also state, so the run is greppable and a stopped run is never mistaken for a clean one:
+
+- per-phase round counts and `blockers_per_round` (the convergence trace)
+- accepted commit SHA + whether the worktree is clean
+- how the run ended: `PASS` / `PASS_WITH_FIXES` / `pending-human` **plus the `pause_reason`** if it stopped on a bound rather than a verdict
+- anything left in `pending_for_human.md`
+
+Then set `tasks/arftl-run.json` to `status: complete`. A run that exits `pending-human` keeps `status: pending-human` and its `pause_reason` — that file is how the next session knows a human decision is outstanding.
