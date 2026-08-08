@@ -3,28 +3,30 @@
 # Code sessions. Runs every N minutes via systemd user timer.
 #
 # Guard chain (order-sensitive; each check reasoned about in the ARFTL
-# Phase 1 review 2026-08-08, round 2):
-#   1. kill switch flag (-e catches file / dir / symlink)
-#   2. env-var sanity (numeric bounds)
-#   3. reflect.sh executable, projects dir exists
-#   4. flock on lock file (single instance)
-#   5. per-project: newest NON-sdk-cli transcript (skip fork-chain lineage)
-#   6. sdk-cli detection fails CLOSED (empty/error → skip candidate)
-#   7. idle window (MIN..MAX seconds; MIN < MAX enforced)
-#   8. transcript-line threshold
-#   9. failure backoff (per-sid, N in W window)
-#  10. cwd extractable and exists
-#  11. live-project (rescanned just before spawn — see below)
-#  12. ralph collision guard
-#  13. mission.md fresh-dedupe (30 min)
-#  14. mission mode write; VERIFY manifest status=="complete" (not just rc)
-#  15. per-run + per-cwd 24h fork budget
-#  16. ## Next non-empty and not "(none)" / "- (none)"
-#  17. staleness gate: DENY (skip) when uncheckable; non-git cwd = skip
-#  18. RE-scan live cwds; abort spawn if any claude proc entered this cwd
-#  19. spawn detached, closing fd 8 (else lock wedged for fork lifetime)
+# review 2026-08-08):
+#   1. env-var sanity (numeric bounds)
+#   2. reflect.sh executable, projects dir exists
+#   3. flock on lock file (single instance)
+#   4. per-project: newest NON-sdk-cli transcript (skip fork-chain lineage)
+#   5. sdk-cli detection fails CLOSED (empty/error → skip candidate)
+#   6. idle window (MIN..MAX seconds; MIN < MAX enforced)
+#   7. transcript-line threshold
+#   8. failure backoff (per-sid, N in W window)
+#   9. cwd extractable and exists
+#  10. live-project (rescanned just before spawn — see below)
+#  11. ralph collision guard
+#  12. mission.md fresh-dedupe (30 min)
+#  13. mission mode write; VERIFY manifest status=="complete" (not just rc)
+#  14. per-run + per-cwd 24h fork budget
+#  15. ## Next non-empty and not "(none)" / "- (none)"
+#  16. staleness gate: DENY (skip) when uncheckable; non-git cwd = skip
+#  17. RE-scan live cwds; abort spawn if any claude proc entered this cwd
+#  18. spawn as transient user service (systemd-run) so fork outlives oneshot
 #
-# Kill switch: touch ~/.claude/idle-handoff.disable  (file, dir, or symlink)
+# Stop mechanisms (in order of blast radius):
+#   pkill -f idle-handoff.sh                            # running instance
+#   systemctl --user stop claude-idle-handoff.timer     # scheduled fires
+#   systemctl --user disable claude-idle-handoff.timer  # persist through reboot
 set -uo pipefail
 umask 077
 
@@ -44,7 +46,9 @@ umask 077
 : "${IDLE_HANDOFF_LOCK:=$REFLECT_ROOT/idle-handoff.lock}"
 : "${IDLE_HANDOFF_LOG_DIR:=$REFLECT_ROOT/idle-handoff-logs}"
 : "${IDLE_HANDOFF_STATE_DIR:=$REFLECT_ROOT/idle-handoff-state}"
-: "${IDLE_HANDOFF_DISABLE_FLAG:=$HOME/.claude/idle-handoff.disable}"
+# Note: no in-script kill flag. Use `systemctl --user stop
+# claude-idle-handoff.timer` to stop scheduled fires, or
+# `pkill -f idle-handoff.sh` to kill a running instance.
 
 REFLECT_SH="$HOME/.claude/skills/session-reflect/reflect.sh"
 PROJECTS_DIR="$HOME/.claude/projects"
@@ -84,12 +88,6 @@ if [[ "$IDLE_HANDOFF_MIN_SECONDS" -ge "$IDLE_HANDOFF_MAX_SECONDS" ]]; then
   log "$msg"
   printf '%s\n' "$msg" >&2
   exit 1
-fi
-
-# ---- Kill switch: -e catches file, directory, or symlink --------------------
-if [[ -e "$IDLE_HANDOFF_DISABLE_FLAG" ]]; then
-  log "disabled (flag exists at $IDLE_HANDOFF_DISABLE_FLAG)"
-  exit 0
 fi
 
 if [[ ! -x "$REFLECT_SH" ]]; then
