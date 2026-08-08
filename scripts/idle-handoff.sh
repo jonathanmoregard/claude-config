@@ -445,26 +445,36 @@ for project_dir in "$PROJECTS_DIR"/*/; do
 
   mission_path="$candidate_cwd/tasks/mission.md"
 
-  # ---- Fresh-mission dedupe ---
-  # Two conditions gate re-writing: (a) age-based freshness (don't rewrite
-  # within N minutes of a prior write); (b) mission_mtime > transcript_mtime
-  # (nothing new in the transcript since last summary — an idle-24h project
-  # with unchanged transcript would otherwise get haiku-rewritten every N
-  # minutes forever, clobbering any autofork's ## Done updates and
-  # resurrecting completed items whose execution left no local git trace,
-  # e.g. `git push`, `gh pr merge`. Advisor P3R1 HIGH-2).
+  # ---- Fresh-mission dedupe (governs WRITE, not the whole iteration) ---
+  # Two conditions gate mission-WRITE, but autofork evaluation still
+  # happens either way (using the existing mission.md):
+  #   (a) mission_age < N: recently written, transcript summary is still
+  #       accurate enough — don't rewrite for cost reasons.
+  #   (b) mission_mtime > transcript_mtime: nothing new in the transcript,
+  #       rewriting would clobber autofork's ## Done updates on unchanged
+  #       source material (advisor P3R1 HIGH-2).
+  # If autofork was budget-blocked or spawn-failed on a prior run, the
+  # per-run budget resets each timer fire — this iteration MUST reach the
+  # autofork evaluation code so those slots can be used. Prior version
+  # `continue`d here → project starved after one attempt. Advisor P1R4 HIGH.
+  skip_mission_write=0
   if [[ -f "$mission_path" ]]; then
     mission_mtime=$(stat -c '%Y' "$mission_path" 2>/dev/null || echo 0)
     mission_age=$(( now - mission_mtime ))
     if [[ "$mission_age" -lt "$IDLE_HANDOFF_MISSION_MAX_AGE_SECONDS" ]]; then
-      count_skipped_fresh_mission=$((count_skipped_fresh_mission + 1))
-      continue
+      skip_mission_write=1
+      log "sid=$sid: mission_age=${mission_age}s < ${IDLE_HANDOFF_MISSION_MAX_AGE_SECONDS}s, skip write (autofork will use existing)"
+    elif [[ "$mission_mtime" -ge "$mtime" ]]; then
+      skip_mission_write=1
+      log "sid=$sid: mission_mtime=$mission_mtime >= transcript_mtime=$mtime, skip write (autofork will use existing)"
     fi
-    if [[ "$mission_mtime" -ge "$mtime" ]]; then
-      count_skipped_fresh_mission=$((count_skipped_fresh_mission + 1))
-      log "mission fresher than transcript sid=$sid (mission=$mission_mtime transcript=$mtime); no new state to summarize"
-      continue
-    fi
+  fi
+
+  # If skipping write AND no existing mission.md, nothing to autofork on:
+  # give up this iteration.
+  if [[ "$skip_mission_write" -eq 1 && ! -f "$mission_path" ]]; then
+    count_skipped_fresh_mission=$((count_skipped_fresh_mission + 1))
+    continue
   fi
 
   # ---- Staleness gate (moved BEFORE mission-write; advisor P2R1 HIGH-2) ---
@@ -489,40 +499,46 @@ for project_dir in "$PROJECTS_DIR"/*/; do
   fi
 
   # ---- Write mission.md (warm cache preemption) ---
-  payload=$(jq -cn \
-    --arg sid "$sid" \
-    --arg tp "$transcript" \
-    --arg cwd "$candidate_cwd" \
-    '{session_id:$sid, transcript_path:$tp, hook_event_name:"IdleHandoff", cwd:$cwd}')
+  if [[ "$skip_mission_write" -eq 0 ]]; then
+    payload=$(jq -cn \
+      --arg sid "$sid" \
+      --arg tp "$transcript" \
+      --arg cwd "$candidate_cwd" \
+      '{session_id:$sid, transcript_path:$tp, hook_event_name:"IdleHandoff", cwd:$cwd}')
 
-  worker_log="$IDLE_HANDOFF_LOG_DIR/${sid}.$(date +%s).mission.log"
-  log "writing mission.md for sid=$sid idle=${idle}s cwd=$candidate_cwd"
+    worker_log="$IDLE_HANDOFF_LOG_DIR/${sid}.$(date +%s).mission.log"
+    log "writing mission.md for sid=$sid idle=${idle}s cwd=$candidate_cwd"
 
-  # `timeout -k 10 90 …` sends SIGTERM at 90s, SIGKILL 10s later. Without
-  # --foreground, timeout runs cmd as leader of a new process group and
-  # sends signals to the WHOLE GROUP — so a hung claude descendant of the
-  # bash-c wrapper gets killed too. reflect.sh also uses `timeout -k 10`
-  # internally around its claude call (redundant kill hardening).
-  # `8>&-` closes the handoff flock fd in the child chain so a leaked
-  # claude descendant can't hold the singleton lock after this run exits.
-  call_start=$(date +%s)
-  REFLECT_ROOT="$REFLECT_ROOT" REFLECT_MODEL="$REFLECT_MODEL" \
-    timeout -k 10 90 \
-      bash -c 'printf "%s" "$1" | env -u MODE bash "$2" mission' \
-      _ "$payload" "$REFLECT_SH" >>"$worker_log" 2>&1 8>&-
-  rc=$?
+    # `timeout -k 10 90 …` sends SIGTERM at 90s, SIGKILL 10s later. Without
+    # --foreground, timeout runs cmd as leader of a new process group and
+    # sends signals to the WHOLE GROUP — so a hung claude descendant of the
+    # bash-c wrapper gets killed too. reflect.sh also uses `timeout -k 10`
+    # internally around its claude call (redundant kill hardening).
+    # `8>&-` closes the handoff flock fd in the child chain so a leaked
+    # claude descendant can't hold the singleton lock after this run exits.
+    call_start=$(date +%s)
+    REFLECT_ROOT="$REFLECT_ROOT" REFLECT_MODEL="$REFLECT_MODEL" \
+      timeout -k 10 90 \
+        bash -c 'printf "%s" "$1" | env -u MODE bash "$2" mission' \
+        _ "$payload" "$REFLECT_SH" >>"$worker_log" 2>&1 8>&-
+    rc=$?
 
-  # (HIGH-A + P1R3) Do NOT trust rc alone — reflect.sh returns 0 on internal
-  # error. Read manifest AND compare completed_at to call_start so a prior
-  # run's stale "complete" cannot be confused with a fresh success.
-  status=$(mission_manifest_status "$sid" "$call_start")
-  if [[ "$rc" -ne 0 || "$status" != "complete" ]]; then
-    record_failure "$sid"
-    count_mission_status_error=$((count_mission_status_error + 1))
-    log "mission write failed sid=$sid rc=$rc manifest_status=$status failures=$((fail_count + 1))/${IDLE_HANDOFF_MAX_RECENT_FAILURES}"
-    continue
+    # Do NOT trust rc alone — reflect.sh returns 0 on internal error.
+    # Read manifest AND compare completed_at to call_start so a prior
+    # run's stale "complete" cannot be confused with a fresh success.
+    status=$(mission_manifest_status "$sid" "$call_start")
+    if [[ "$rc" -ne 0 || "$status" != "complete" ]]; then
+      record_failure "$sid"
+      count_mission_status_error=$((count_mission_status_error + 1))
+      log "mission write failed sid=$sid rc=$rc manifest_status=$status failures=$((fail_count + 1))/${IDLE_HANDOFF_MAX_RECENT_FAILURES}"
+      continue
+    fi
+    count_wrote=$((count_wrote + 1))
+  else
+    # skip_mission_write==1: existing mission.md; autofork evaluation
+    # will use it as-is. No manifest_status check needed.
+    :
   fi
-  count_wrote=$((count_wrote + 1))
 
   # ---- Autofork budget ---
   if [[ "$forks_this_run" -ge "$IDLE_HANDOFF_AUTOFORK_MAX_PER_RUN" ]]; then
@@ -565,16 +581,28 @@ for project_dir in "$PROJECTS_DIR"/*/; do
     continue
   fi
 
-  # ---- Post-write HEAD TOCTOU re-check (advisor P3R1 MEDIUM) ---
-  # If HEAD moved during the ~90s mission-write, autofork would act on a
-  # world that just moved. Cheap SHA compare against the snapshot we took
-  # pre-write. Non-git cwds skipped this section entirely (pre_write_head
-  # would be empty because is_stale_since_transcript already denied non-git).
+  # ---- Post-write TOCTOU re-check (advisor P3R1 MEDIUM + P1R4 MEDIUM) ---
+  # If the world moved during the ~90s mission-write, autofork would act
+  # on a world that just moved. Two checks: (1) HEAD SHA compare against
+  # the pre-write snapshot; (2) porcelain shows anything NEW that wasn't
+  # in the pre-write porcelain (using `-- ':(exclude)tasks/mission.md'`
+  # so we don't count our own write). Non-git cwds skipped this section
+  # entirely (pre_write_head empty because is_stale_since_transcript
+  # denied non-git earlier).
   if [[ -n "$pre_write_head" ]]; then
     post_write_head=$(timeout 5 sh -c 'cd "$1" && git rev-parse HEAD 2>/dev/null' _ "$candidate_cwd" || echo "")
     if [[ -z "$post_write_head" || "$post_write_head" != "$pre_write_head" ]]; then
       count_skipped_git_stale=$((count_skipped_git_stale + 1))
       log "autofork skipped sid=$sid cwd=$candidate_cwd (HEAD moved during mission-write: pre=$pre_write_head post=$post_write_head)"
+      continue
+    fi
+    # Porcelain post-write, excluding tasks/mission.md and its parent dir.
+    # If human editor touched other tracked files during the write window,
+    # we want to skip.
+    post_write_porcelain=$(timeout 5 sh -c 'cd "$1" && git status --porcelain -- ":(exclude)tasks/mission.md" 2>/dev/null | head -c 1' _ "$candidate_cwd" || echo "")
+    if [[ -n "$post_write_porcelain" ]]; then
+      count_skipped_git_stale=$((count_skipped_git_stale + 1))
+      log "autofork skipped sid=$sid cwd=$candidate_cwd (non-mission dirty files after mission-write)"
       continue
     fi
   fi
@@ -638,26 +666,45 @@ PROMPT
   log "AUTOFORK sid=$sid cwd=$candidate_cwd model=$IDLE_HANDOFF_AUTOFORK_MODEL max_turns=$IDLE_HANDOFF_AUTOFORK_MAX_TURNS cwd_forks_24h=$cwd_fork_count"
 
   # Spawn as a TRANSIENT SYSTEMD SERVICE so the fork outlives this oneshot.
-  # This script runs in a oneshot service under our user timer with default
-  # KillMode=control-group. `setsid nohup` doesn't escape the service cgroup
-  # — every descendant gets SIGTERMed when the parent oneshot exits, i.e.
-  # within seconds. Advisor P3R1 HIGH-1, empirically confirmed.
+  # See P3R1 fix commit for full reasoning; briefly: setsid nohup doesn't
+  # escape the systemd oneshot's cgroup (KillMode=control-group default),
+  # so descendants die within seconds of parent exit. systemd-run --user
+  # --collect --no-block creates a new user service in its own cgroup.
   #
-  # `systemd-run --user --collect --no-block --unit=...` creates a new
-  # user service (its own cgroup, its own KillMode, its own lifecycle).
-  # --collect removes the unit from the manager on exit so leftover
-  # failed/complete units don't accumulate.
-  # --no-block returns immediately after the service is queued rather than
-  # waiting for it to complete.
-  # WorkingDirectory= sets cwd for the service.
-  # Standard{Output,Error}=append: sends logs to the autofork log.
-  # Empirical (verified 2026-08-08): a sleep-30 launched this way from
-  # inside a `systemd-run --wait` outer service outlives the outer.
-  # Fallback to setsid nohup only when systemd-run is not on PATH.
-  unit_name="claude-autofork-$(echo "$sid" | tr -c 'A-Za-z0-9._-' '_')-$(date +%s)"
-  if command -v systemd-run >/dev/null 2>&1; then
+  # Env passthrough: transient units do NOT inherit caller env, so the
+  # forked claude would lose ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN,
+  # PATH, HOME (advisor P1R4 MEDIUM). Pass through explicitly.
+  # Fallback: if systemd-run is missing OR the user bus is unavailable
+  # (busless cron / non-login ssh / container without user manager),
+  # use setsid nohup — same limitations as before, but the setsid path is
+  # the only viable option in those contexts anyway.
+  #
+  # LOW fix: printf %s (not echo, which adds trailing \n that tr maps to _).
+  unit_name="claude-autofork-$(printf %s "$sid" | tr -c 'A-Za-z0-9._-' '_')-$(date +%s)"
+  can_systemd_run=0
+  if command -v systemd-run >/dev/null 2>&1 \
+     && systemctl --user is-active default.target >/dev/null 2>&1; then
+    # Probe: does systemd-run --user actually work here?
+    if systemd-run --user --collect --no-block --unit="claude-autofork-probe-$$" \
+         -- true >/dev/null 2>&1; then
+      can_systemd_run=1
+    fi
+  fi
+
+  if [[ "$can_systemd_run" -eq 1 ]]; then
+    # Passthrough: envs the fork needs. Anthropic auth is the load-bearing
+    # one; PATH lets claude find its own binaries; HOME lets it read
+    # ~/.claude configuration.
+    setenv_args=()
+    for var in HOME PATH USER LANG LC_ALL LC_CTYPE \
+               ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN \
+               HTTPS_PROXY HTTP_PROXY NO_PROXY; do
+      val="${!var:-}"
+      [[ -n "$val" ]] && setenv_args+=("--setenv=${var}=${val}")
+    done
     systemd-run --user --collect --no-block --unit="$unit_name" \
       --working-directory="$candidate_cwd" \
+      "${setenv_args[@]}" \
       --property="StandardOutput=append:${autofork_log}" \
       --property="StandardError=append:${autofork_log}" \
       -- claude -p \
@@ -668,11 +715,16 @@ PROMPT
       >>"$autofork_log" 2>&1
     spawn_rc=$?
     if [[ "$spawn_rc" -ne 0 ]]; then
-      log "AUTOFORK spawn failed sid=$sid rc=$spawn_rc unit=$unit_name (see $autofork_log)"
+      log "AUTOFORK queue failed sid=$sid rc=$spawn_rc unit=$unit_name (see $autofork_log)"
       continue
     fi
+    # --no-block returns success on QUEUE, not on START. Async unit failure
+    # is invisible from here. --collect erases the unit on completion so we
+    # can't reliably introspect after the fact either. Log the unit name so
+    # an operator can grep systemctl if they suspect a silent no-start.
+    log "AUTOFORK queued sid=$sid unit=$unit_name (systemd-run rc=0; async start not observed)"
   else
-    log "WARN sid=$sid: systemd-run unavailable, using setsid nohup (fork may not survive parent exit under systemd)"
+    log "WARN sid=$sid: systemd-run unavailable or bus down; falling back to setsid nohup (fork may not survive parent exit under systemd)"
     ( cd "$candidate_cwd" && \
       setsid nohup claude -p \
         --model "$IDLE_HANDOFF_AUTOFORK_MODEL" \
