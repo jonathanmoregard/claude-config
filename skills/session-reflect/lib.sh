@@ -54,6 +54,10 @@ is_valid_sid() {
   local s="${1:-}"
   [[ -n "$s" ]] || return 1
   [[ "$s" =~ ^[A-Za-z0-9._-]{1,128}$ ]] || return 1
+  # Reject leading-dot names (hidden files, and dot-only tokens like . / .. / ...
+  # which the traversal check in path components would otherwise pass since
+  # basename('.') == '.' and Linux treats them as directory references).
+  [[ "$s" =~ ^\. ]] && return 1
   return 0
 }
 

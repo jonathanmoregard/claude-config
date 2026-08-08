@@ -199,7 +199,7 @@ info "malformed payload handled (exit=0)"
 # TEST 6: path traversal in session_id -> rejected, no dir escape
 # ============================================================================
 echo "TEST 6: path-traversal rejection"
-BAD_SIDS=('../evil' '/abs/evil' 'has space' 'a;b' $'nl\nsid' 'sub/dir')
+BAD_SIDS=('../evil' '/abs/evil' 'has space' 'a;b' $'nl\nsid' 'sub/dir' '.' '..' '...' '.hidden')
 for bad in "${BAD_SIDS[@]}"; do
   P="$(jq -cn --arg sid "$bad" --arg tp "$TRANSCRIPT" --arg cwd "$WORKTREE" \
         '{session_id:$sid, transcript_path:$tp, hook_event_name:"SessionEnd", cwd:$cwd}')"
