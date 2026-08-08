@@ -214,13 +214,18 @@ else
       --arg err "reflect_root_unwritable" \
       '{timestamp:$ts,session_id:$sid,mode:$mode,error:$err,root_path:$root}' \
       2>/dev/null || printf '{"timestamp":"%s","error":"reflect_root_unwritable","root_path":"%s"}' "$_err_now" "$REFLECT_ROOT")"
-    # Append to the fallback log (0644 so operators can grep from any account).
-    # Ignore errors here — /tmp write can fail on tmpfs full etc., but we
-    # already surfaced the primary failure to stderr via ensure_reflect_root_writable.
-    printf '%s\n' "$_err_record" >>/tmp/session-reflect-errors.log 2>/dev/null || true
+    # Fallback log path: prefer XDG_RUNTIME_DIR (per-user tmpfs), fall back
+    # to a per-user path in /tmp. Prior version wrote to /tmp/session-
+    # reflect-errors.log (fixed path) which is symlink-race-prone on shared
+    # /tmp when protected_symlinks is off (advisor P2R1 LOW). The per-user
+    # path uses $UID so a hostile local user cannot pre-seed a symlink at
+    # a well-known name and reach a file this user owns.
+    _err_log="${XDG_RUNTIME_DIR:-/tmp}/session-reflect-errors-$(id -u).log"
+    # 0600 via umask 077 (set at script top); append is idempotent-safe.
+    printf '%s\n' "$_err_record" >>"$_err_log" 2>/dev/null || true
     # Belt-and-braces stderr line with a fixed prefix operators can grep.
-    printf '[session-reflect] REFLECT_ROOT unwritable (root=%s mode=%s sid=%s); dropped reflection, see /tmp/session-reflect-errors.log\n' \
-      "$REFLECT_ROOT" "$MODE" "$_err_sid" >&2
+    printf '[session-reflect] REFLECT_ROOT unwritable (root=%s mode=%s sid=%s); dropped reflection, see %s\n' \
+      "$REFLECT_ROOT" "$MODE" "$_err_sid" "$_err_log" >&2
     exit 0
   fi
 fi

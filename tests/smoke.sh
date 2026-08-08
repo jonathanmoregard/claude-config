@@ -887,14 +887,17 @@ chmod +x "$STUB_SCRATCH/claude"
 # Regression (Codex P3.2): previously ensure_reflect_root_writable failure
 # caused a silent exit 0 with no artifact and no error trail. Operators had
 # zero forensic evidence when reflection stopped working.
-# Fix: append a structured JSON record to /tmp/session-reflect-errors.log
-# AND emit a tagged '[session-reflect] REFLECT_ROOT unwritable' stderr line.
+# Fix: append a structured JSON record to
+# ${XDG_RUNTIME_DIR:-/tmp}/session-reflect-errors-<uid>.log AND emit a
+# tagged '[session-reflect] REFLECT_ROOT unwritable' stderr line.
+# Per-user path prevents symlink-race on shared /tmp when
+# protected_symlinks is off (advisor P2R1 LOW, ARFTL 2026-08-08).
 echo "TEST 12: unwritable REFLECT_ROOT surfaces error record + stderr"
 
 # Isolate the fallback log so we can inspect exactly what this test wrote.
-# (We can't touch the real /tmp/session-reflect-errors.log because other
-# runs may have data in it.) Snapshot before + diff after.
-FALLBACK_LOG=/tmp/session-reflect-errors.log
+# (We can't touch the real fallback log because other runs may have
+# data in it.) Snapshot before + diff after.
+FALLBACK_LOG="${XDG_RUNTIME_DIR:-/tmp}/session-reflect-errors-$(id -u).log"
 if [[ -f "$FALLBACK_LOG" ]]; then
   FB_BEFORE_LINES=$(wc -l < "$FALLBACK_LOG")
 else
@@ -928,7 +931,7 @@ else
   FB_AFTER_LINES=0
 fi
 (( FB_AFTER_LINES > FB_BEFORE_LINES )) \
-  || fail "/tmp/session-reflect-errors.log did not grow (before=$FB_BEFORE_LINES after=$FB_AFTER_LINES)"
+  || fail "$FALLBACK_LOG did not grow (before=$FB_BEFORE_LINES after=$FB_AFTER_LINES)"
 
 # Last line must be a valid JSON record with the expected keys + our SID.
 LAST_ERR=$(tail -1 "$FALLBACK_LOG")
