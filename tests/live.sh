@@ -92,9 +92,46 @@ INPUT=$(jq -r '.usage.input_tokens // 0' "$WORKER_OUT")
 OUTPUT=$(jq -r '.usage.output_tokens // 0' "$WORKER_OUT")
 info "usage: cache_read=$CACHE_READ cache_create=$CACHE_CREATE input=$INPUT output=$OUTPUT"
 
-if (( CACHE_READ <= 0 )); then
-  echo "WARN: cache_read_input_tokens = 0 (session may be > 1h old or first-run)" >&2
-  # Not fatal — a cold cache is still functional, just expensive.
+# STEP 5 (MEDIUM P3.6): single cache_read=0 is expected for a cold cache
+# (first run on a new transcript, or session >1h old past the ephemeral
+# TTL) → keep it as a warning. But sustained zero across N runs indicates
+# real prompt-cache prefix drift (the whole cost story for this feature
+# breaks). Repeat N times and fail hard if ALL runs show cache_read=0.
+#
+# Overrides:
+#   REFLECT_CACHE_ASSERT_N — number of extra runs to perform (default 2 more,
+#     total 3 runs; set to 0 to preserve old warning-only behaviour).
+: "${REFLECT_CACHE_ASSERT_N:=2}"
+CACHE_READS=( "$CACHE_READ" )
+if (( REFLECT_CACHE_ASSERT_N > 0 )); then
+  info "cache-drift check: rerunning $REFLECT_CACHE_ASSERT_N more time(s) to confirm cache reuse"
+  for r in $(seq 1 "$REFLECT_CACHE_ASSERT_N"); do
+    # Force re-run so the idempotency guard doesn't short-circuit.
+    echo "$PAYLOAD" | REFLECT_FORCE=1 bash "$REFLECT_SH" sessionend >/dev/null
+    for _ in $(seq 1 120); do
+      if [[ -f "$MANIFEST" ]] && \
+         jq -e '.modes.sessionend.status == "complete" or .modes.sessionend.status == "timeout" or .modes.sessionend.status == "error"' \
+           "$MANIFEST" >/dev/null 2>&1; then
+        break
+      fi
+      sleep 1
+    done
+    CR_N=$(jq -r '.usage.cache_read_input_tokens // 0' "$WORKER_OUT")
+    info "  run $r: cache_read=$CR_N"
+    CACHE_READS+=( "$CR_N" )
+  done
+fi
+
+# Count non-zero cache_read values across the N+1 runs.
+NON_ZERO=0
+for v in "${CACHE_READS[@]}"; do
+  (( v > 0 )) && NON_ZERO=$(( NON_ZERO + 1 ))
+done
+TOTAL_RUNS=${#CACHE_READS[@]}
+if (( NON_ZERO == 0 )); then
+  fail "sustained cache_read=0 across $TOTAL_RUNS runs — prompt-cache prefix has drifted; the caching cost model is broken"
+elif (( NON_ZERO < TOTAL_RUNS )); then
+  echo "WARN: cache_read was zero in $((TOTAL_RUNS - NON_ZERO))/$TOTAL_RUNS runs (cold cache tolerated, watch trend)" >&2
 fi
 
 # --- Assert no runaway recursion ---------------------------------------------
