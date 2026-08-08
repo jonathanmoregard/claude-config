@@ -17,7 +17,7 @@ import sys
 
 BASE_MAX = 200_000
 ONE_M = 1_000_000
-THRESHOLD = 0.40
+THRESHOLD = 0.25
 MESSAGE_INTERVAL = 5
 
 # Claude Code model IDs that run at 1M context by default. Prefixes, so
