@@ -20,11 +20,21 @@ ONE_M = 1_000_000
 THRESHOLD = 0.40
 MESSAGE_INTERVAL = 5
 
-# Claude Code model IDs that run at 1M context by default.
+# Claude Code model IDs that run at 1M context by default. Prefixes, so
+# dated variants (claude-opus-4-1-20250805) match too.
 ONE_M_MODEL_PREFIXES = (
     "claude-opus-4-",
     "claude-sonnet-4-",
+    "claude-opus-5",
+    "claude-sonnet-5",
 )
+
+# Explicit 1M marker in the model ID, e.g. `claude-opus-5[1m]`. Checked
+# before the prefix list so it keeps working across model generations
+# without another edit here — the prefix list going stale is exactly how
+# this hook came to report 89% full during a session that was at 18% of a
+# 1M window (every reading was fullness-of-200k).
+ONE_M_MARKER = "[1m]"
 
 
 def detect_max_tokens(model: str | None, observed_max: int) -> int:
@@ -34,8 +44,11 @@ def detect_max_tokens(model: str | None, observed_max: int) -> int:
             return int(override)
         except ValueError:
             pass
-    if model and any(model.startswith(p) for p in ONE_M_MODEL_PREFIXES):
-        return ONE_M
+    if model:
+        if ONE_M_MARKER in model.lower():
+            return ONE_M
+        if any(model.startswith(p) for p in ONE_M_MODEL_PREFIXES):
+            return ONE_M
     if observed_max > BASE_MAX:
         return ONE_M
     return BASE_MAX
