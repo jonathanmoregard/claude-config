@@ -413,8 +413,13 @@ find_parent_session_id() {
       return 0
     fi
 
-    # Recent-first: scan for the sub_sid string. Best-effort; false positive
-    # is rare given the SID's entropy. -- guards against filenames starting -.
+    # Best-effort: `grep -l` returns matches in readdir order (arbitrary,
+    # NOT mtime-recent). For uniquely-named SIDs (Claude's are UUID-shaped),
+    # a match is deterministic enough — collisions require an attacker
+    # seeding the transcript dir. The earlier "Recent-first" phrasing
+    # implied mtime ordering, which was never true; head -1 just takes
+    # whichever the kernel returned first. -- guards against filenames
+    # starting with -.
     local candidate
     candidate="$(grep -lF -- "$sub_sid" "${jsonl_files[@]}" 2>/dev/null \
       | grep -vF -- "$tp" | head -1 || true)"
