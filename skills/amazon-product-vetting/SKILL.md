@@ -19,6 +19,31 @@ Sweden-based shopper. Give a rigorous vetting pass — not the top Amazon search
 
 ## The flow
 
+### 0. Parse constraints — filter vs verify (30 seconds, do this FIRST)
+
+Before opening a search box, list every constraint (stated + inferred). Sort each into two buckets:
+
+- **Filter** — a marketed, searchable spec that meaningfully narrows the field: dimensions, colour, capacity, material class, cert-required categories, brand, form factor.
+- **Verify** — a property near-universal in the material/category, so the search field can't filter on it. Confirm on the top pick instead — physically, in the returns window if needed.
+
+If a search for a Verify property returns empty pages or forces you to trawl PDFs, you mis-classified it. Flip it back to Verify and drop the filter. **Do not spend research budget hunting a "freezer-safe" or "BPA-free" label — the absence of the marketing claim is not evidence of failure.**
+
+**Common Verify (near-universal, don't filter):**
+- **Freezer-safe** for food-storage plastic (PP, PET, PS, SAN) and glass — standard down to -20 °C for dry contents; brands rarely stamp it because it's assumed.
+- **BPA-free** for post-2015 food-storage plastic — EU banned BPA in food contact 2024; assume unless the listing contradicts.
+- **Dishwasher-safe** for most PP, glass, stainless — same pattern.
+- **Food-safe** for anything sold as a food container.
+- **Airtight** for lids with a silicone gasket.
+- **Microwave-safe** for PP and most glass (not crystal, not metal-rimmed ceramic).
+
+**KEEP as filter (don't flip to Verify) when:**
+- User explicitly required a printed certification (LFGB, FDA, NSF, USP).
+- Material class doesn't guarantee it (acrylic + freezer = brittle; ceramic + microwave = case-by-case; metal + microwave = no).
+- Use case is at the material limit (freezing wet content in acrylic, microwaving fatty content in PP).
+- Ingested / topical / skin-contact category (§1) — cert is the whole point.
+
+Show the parse to the user ONLY if there's real ambiguity. Otherwise proceed silently.
+
 ### 1. Category branch (30 seconds)
 
 Pick the branch. Each branch overrides different parts of the general flow.
@@ -158,6 +183,8 @@ Even if he asked for one option, present three so he can trade off consciously.
 - Do not hand over the top Amazon search result.
 - Do not run the full battery on all candidates — deep on top pick, spot-check rest.
 - Do not launch dozens of fetches. Parallel + budgeted.
+- **Do not use near-universal properties as search filters** (freezer-safe, BPA-free, dishwasher-safe, food-safe, airtight-with-gasket on standard food-storage plastic/glass). They strand you in empty result pages and cause you to *penalise* good products for lacking a marketing claim they didn't need. Flip to Verify — §0.
+- **Do not treat an absent marketing claim as a negative signal** unless the material class actually fails the use case.
 - Do not recommend Fakespot / ReviewMeta — dead.
 - Do not treat "Overall Pick" as endorsement.
 - Do not skip the three-tier format.
