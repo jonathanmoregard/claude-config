@@ -26,7 +26,9 @@ Before opening a search box, list every constraint (stated + inferred). Sort eac
 - **Filter** — a marketed, searchable spec that meaningfully narrows the field: dimensions, colour, capacity, material class, cert-required categories, brand, form factor.
 - **Verify** — a property near-universal in the material/category, so the search field can't filter on it. Confirm on the top pick instead — physically, in the returns window if needed.
 
-If a search for a Verify property returns empty pages or forces you to trawl PDFs, you mis-classified it. Flip it back to Verify and drop the filter. **Do not spend research budget hunting a "freezer-safe" or "BPA-free" label — the absence of the marketing claim is not evidence of failure.**
+If a search for a Verify property returns empty pages or forces you to trawl PDFs, you mis-classified it. Flip it back to Verify and drop the filter.
+
+**Absence rule (constraint-specific, not blanket):** for a Verify property, an absent marketing claim is silence — do not penalise. For a Filter property (USB-C wattage, USP/NSF cert number, load rating, OEKO-TEX cert, IP-rating), an absent claim IS a real defect — demand it. The bucket decides. Do not spend research budget hunting a "freezer-safe" or "BPA-free" label on a container the material class already guarantees.
 
 **Common Verify (near-universal, don't filter):**
 - **Freezer-safe** for food-storage plastic (PP, PET, PS, SAN) and glass — standard down to -20 °C for dry contents; brands rarely stamp it because it's assumed.
@@ -184,7 +186,7 @@ Even if he asked for one option, present three so he can trade off consciously.
 - Do not run the full battery on all candidates — deep on top pick, spot-check rest.
 - Do not launch dozens of fetches. Parallel + budgeted.
 - **Do not use near-universal properties as search filters** (freezer-safe, BPA-free, dishwasher-safe, food-safe, airtight-with-gasket on standard food-storage plastic/glass). They strand you in empty result pages and cause you to *penalise* good products for lacking a marketing claim they didn't need. Flip to Verify — §0.
-- **Do not treat an absent marketing claim as a negative signal** unless the material class actually fails the use case.
+- **Do not apply a blanket rule on absent marketing claims.** Read the bucket §0 assigned: Verify → absence is silence; Filter → absence is a defect (USB-C wattage, cert numbers, load rating, IP-rating, OEKO-TEX #). Sort per constraint, not per rule of thumb.
 - Do not recommend Fakespot / ReviewMeta — dead.
 - Do not treat "Overall Pick" as endorsement.
 - Do not skip the three-tier format.
