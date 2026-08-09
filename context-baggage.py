@@ -125,16 +125,19 @@ def main():
         sys.exit(0)
 
     pct_display = int(fill_pct * 100)
+    # Wording pattern derived from empirical A/B/C/D/E/F run 2026-08-09
+    # (54 trials, 6 variants, 3 domains). V2 Imperative won at 89% LISTEN;
+    # bare-fact V1 (22%) and threat-of-loss V6 (50%) both backfired because
+    # neither foreclosed the "save then continue" escape. Pattern that held:
+    # imperative verb + named artifact + closing negative directive.
+    # Results: ~/Repos/ea-uplift/tasks/context-nudge-empirics-results.md
     message = (
         f"Context is {pct_display}% full ({user_msg_count} messages in this session; "
         f"window: {max_tokens // 1000}k tokens). "
-        "At this fill, a fresh-session handoff via tasks/mission.md is usually cheaper "
-        "than an in-place /compact: --fork-session on a warm cache measured ~77% hit "
-        "(session-reflect empirical), while /compact invalidates the prefix and forces "
-        "cache_write on subsequent turns. "
-        "Suggest to the user: (a) write tasks/mission.md (done / next / blocked / open "
-        "questions), (b) start a fresh session in the same cwd and load it, OR (c) "
-        "continue here and accept the drift. Ask which."
+        "STOP taking new tasks. "
+        "Write handoff to tasks/mission.md (done/next/blocked/open-questions) now. "
+        "Then ask the user which: (a) fork to fresh session, (b) /compact in place, "
+        "(c) continue here. Do not continue until the user answers."
     )
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": message}}))
 
