@@ -18,7 +18,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["severity", "autofix_class", "file", "line", "rationale"],
+        "required": ["severity", "autofix_class", "file", "line", "rationale", "unverifiable"],
         "properties": {
           "severity": { "enum": ["BLOCKER", "HIGH", "MEDIUM", "LOW"] },
           "autofix_class": {
@@ -37,8 +37,8 @@
             "description": "One paragraph: what breaks, why, what to verify. <=200 chars target; schema caps at 240 to allow a small overshoot without hard-reject."
           },
           "unverifiable": {
-            "type": "boolean",
-            "description": "true iff confirmation of this finding requires human judgment (taste, style, subjective preference) — no empirical check applies. Stage 4.5 validator uses this tag to keep-with-warning instead of drop-as-unverified."
+            "type": ["boolean", "null"],
+            "description": "true iff confirmation of this finding requires human judgment (taste, style, subjective preference) — no empirical check applies. Stage 4.5 validator uses this tag to keep-with-warning instead of drop-as-unverified. Emit null when not applicable. Nullable-and-required rather than optional because OpenAI structured outputs (codex exec --output-schema) rejects any schema whose `required` array omits a declared property — Phase 2 hard-fails with invalid_json_schema otherwise."
           }
         }
       }
