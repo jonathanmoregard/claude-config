@@ -1,326 +1,13 @@
 {
-  "advisorModel": "opus",
   "cleanupPeriodDays": 99999,
-  "effortLevel": "xhigh",
-  "enableAllProjectMcpServers": false,
-  "enabledPlugins": {
-    "ask-questions-if-underspecified@trailofbits": true,
-    "caveman@caveman": true,
-    "code-review@claude-plugins-official": true,
-    "code-simplifier@claude-plugins-official": true,
-    "debug-buttercup@trailofbits": false,
-    "differential-review@trailofbits": true,
-    "entry-point-analyzer@trailofbits": false,
-    "insecure-defaults@trailofbits": true,
-    "mutation-testing@trailofbits": false,
-    "nix-search@nix-search-marketplace": true,
-    "nixos@kettleofskills": true,
-    "ralph-loop@claude-plugins-official": true,
-    "recursive-self-improvement@jonathanmoregard": true,
-    "sharp-edges@trailofbits": true,
-    "skill-creator@claude-plugins-official": true,
-    "spec-to-code-compliance@trailofbits": false,
-    "static-analysis@trailofbits": false,
-    "token-optimizer@alexgreensh-token-optimizer": true,
-    "typescript-lsp@claude-plugins-official": true
-  },
+  "skillListingBudgetFraction": 0.03,
   "env": {
     "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
     "CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS": "90000",
     "DISABLE_ERROR_REPORTING": "1",
     "DISABLE_TELEMETRY": "1"
   },
-  "extraKnownMarketplaces": {
-    "alexgreensh-token-optimizer": {
-      "source": {
-        "path": "/home/jonathan/Repos/token-optimizer",
-        "source": "directory"
-      }
-    },
-    "caveman": {
-      "source": {
-        "path": "/home/jonathan/.claude/skills/caveman",
-        "source": "directory"
-      }
-    },
-    "claude-plugins-official": {
-      "source": {
-        "repo": "anthropics/claude-plugins-official",
-        "source": "github"
-      }
-    },
-    "jonathanmoregard": {
-      "source": {
-        "path": "/home/jonathan/.claude/plugins/marketplaces/jonathanmoregard",
-        "source": "directory"
-      }
-    },
-    "kettleofskills": {
-      "source": {
-        "path": "/home/jonathan/.claude/plugins/marketplaces/kettleofskills",
-        "source": "directory"
-      }
-    },
-    "nix-search-marketplace": {
-      "source": {
-        "path": "/home/jonathan/.claude/plugins/marketplaces/nix-search-marketplace",
-        "source": "directory"
-      }
-    },
-    "trailofbits": {
-      "source": {
-        "path": "/home/jonathan/.claude/plugins/marketplaces/trailofbits",
-        "source": "directory"
-      }
-    }
-  },
-  "hooks": {
-    "PermissionDenied": [
-      {
-        "hooks": [
-          {
-            "command": "python3 -S -E $HOME/.claude/permission-ledger/hook.py",
-            "timeout": 5,
-            "type": "command"
-          }
-        ],
-        "matcher": "*"
-      }
-    ],
-    "PermissionRequest": [
-      {
-        "hooks": [
-          {
-            "command": "python3 -S -E $HOME/.claude/permission-ledger/hook.py",
-            "timeout": 5,
-            "type": "command"
-          }
-        ],
-        "matcher": "*"
-      }
-    ],
-    "PostToolUse": [
-      {
-        "hooks": [
-          {
-            "command": "~/.claude/skills/continuous-learning-v2/hooks/observe.sh post",
-            "type": "command"
-          }
-        ],
-        "matcher": "*"
-      },
-      {
-        "hooks": [
-          {
-            "command": "~/.claude/hooks/visual-verify-trigger.sh",
-            "type": "command"
-          }
-        ],
-        "matcher": "Write|Edit|MultiEdit"
-      }
-    ],
-    "PreCompact": [
-      {
-        "hooks": [
-          {
-            "command": "bash ~/.claude/skills/session-reflect/reflect.sh precompact",
-            "type": "command"
-          }
-        ]
-      }
-    ],
-    "PreToolUse": [
-      {
-        "hooks": [
-          {
-            "command": "~/.claude/skills/continuous-learning-v2/hooks/observe.sh pre",
-            "type": "command"
-          }
-        ],
-        "matcher": "*"
-      },
-      {
-        "hooks": [
-          {
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; $HOME/.claude/hooks/git-push-merge-check.sh",
-            "timeout": 12,
-            "type": "command"
-          }
-        ],
-        "matcher": "Bash|mcp__safe-bash__exec"
-      },
-      {
-        "hooks": [
-          {
-            "command": "python3 $HOME/.claude/aggregator-transcript-guard.py",
-            "timeout": 5,
-            "type": "command"
-          }
-        ],
-        "matcher": "Grep|Read"
-      }
-    ],
-    "SessionEnd": [
-      {
-        "hooks": [
-          {
-            "command": "bash ~/.claude/skills/session-reflect/reflect.sh sessionend",
-            "type": "command"
-          }
-        ]
-      }
-    ],
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; f=/home/jonathan/.claude/token-optimizer/.security-alert; [ -f \"$f\" ] && echo \"[token-optimizer] SECURITY ALERT: $(cat $f)\" || true",
-            "type": "command"
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "command": "(CLV2_PYTHON_CMD=python3 ECC_OBSERVER_TIMEOUT_SECONDS=300 ~/.claude/skills/continuous-learning-v2/agents/start-observer.sh start >/dev/null 2>&1 &) || true",
-            "statusMessage": "Launching instinct observer...",
-            "timeout": 3,
-            "type": "command"
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; $HOME/.claude/nixos-reminder-hook.sh",
-            "type": "command"
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; CLAUDE_PLUGIN_ROOT=/home/jonathan/Repos/superpowers /home/jonathan/Repos/superpowers/hooks/session-start",
-            "type": "command"
-          }
-        ],
-        "matcher": "startup|clear|compact"
-      },
-      {
-        "hooks": [
-          {
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; claude-kitty-pane-record || true",
-            "type": "command"
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; bash $HOME/.claude/skills/orchestrate/hooks/compact-reinject.sh",
-            "type": "command"
-          }
-        ],
-        "matcher": "startup|compact|clear"
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/step-back-detector.py",
-            "type": "command"
-          }
-        ]
-      }
-    ],
-    "SubagentStop": [
-      {
-        "hooks": [
-          {
-            "command": "bash ~/.claude/skills/session-reflect/reflect.sh subagentstop",
-            "type": "command"
-          }
-        ]
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; $HOME/.claude/fable-warn.sh",
-            "type": "command"
-          },
-          {
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/context-baggage.py",
-            "type": "command"
-          },
-          {
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/date-reminder-hook.py",
-            "type": "command"
-          },
-          {
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/wellbeing/work-hours-nudge.py",
-            "type": "command"
-          },
-          {
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/wellbeing/habit-nudge.py",
-            "type": "command"
-          },
-          {
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/wellbeing/sunset-walk-nudge.py",
-            "type": "command"
-          },
-          {
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/step-back-nudge.py",
-            "type": "command"
-          },
-          {
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/evolve-reminder.py",
-            "type": "command"
-          },
-          {
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/hooks/prompt-log.py",
-            "type": "command"
-          }
-        ],
-        "matcher": ""
-      },
-      {
-        "hooks": [
-          {
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; /home/jonathan/.claude/hooks/router-nudge-hook --queue-root /home/jonathan/.local/state/router/queue --marker /home/jonathan/.local/state/router/audit/nudge-marker || true",
-            "type": "command"
-          }
-        ],
-        "matcher": "*"
-      },
-      {
-        "hooks": [
-          {
-            "command": "python3 $HOME/.claude/aggregator-recall-hook.py",
-            "timeout": 5,
-            "type": "command"
-          }
-        ],
-        "matcher": "*"
-      }
-    ]
-  },
-  "model": "claude-opus-5",
   "permissions": {
-    "additionalDirectories": [
-      "/home/jonathan/Repos",
-      "/home/jonathan/Repos/nixos-config-worktrees",
-      "/home/jonathan/.claude/projects",
-      "/home/jonathan/.claude/skills",
-      "/home/jonathan/.claude/templates",
-      "/tmp",
-      "/etc/nixos",
-      "/nix/store",
-      "/home/jonathan/worktrees",
-      "/home/jonathan/Repos/research-agent/reports"
-    ],
     "allow": [
       "Glob",
       "Grep",
@@ -344,7 +31,6 @@
       "mcp__research-agent__*",
       "mcp__safe-bash__*"
     ],
-    "ask": [],
     "deny": [
       "WebFetch",
       "WebSearch",
@@ -429,17 +115,330 @@
       "mcp__futuresearch__futuresearch_status",
       "Edit(/etc/nixos/**)",
       "Edit(/nix/store/**)"
+    ],
+    "ask": [],
+    "additionalDirectories": [
+      "/home/jonathan/Repos",
+      "/home/jonathan/Repos/nixos-config-worktrees",
+      "/home/jonathan/.claude/projects",
+      "/home/jonathan/.claude/skills",
+      "/home/jonathan/.claude/templates",
+      "/tmp",
+      "/etc/nixos",
+      "/nix/store",
+      "/home/jonathan/worktrees",
+      "/home/jonathan/Repos/research-agent/reports"
     ]
   },
-  "sandbox": {
-    "allowUnsandboxedCommands": false,
-    "autoAllowBashIfSandboxed": true,
-    "enabled": false
+  "enableAllProjectMcpServers": false,
+  "hooks": {
+    "PermissionDenied": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/permission-ledger/hook.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/permission-ledger/hook.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/skills/continuous-learning-v2/hooks/observe.sh post"
+          }
+        ]
+      },
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/visual-verify-trigger.sh"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/skills/session-reflect/reflect.sh precompact"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/skills/continuous-learning-v2/hooks/observe.sh pre"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash|mcp__safe-bash__exec",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; $HOME/.claude/hooks/git-push-merge-check.sh",
+            "timeout": 12
+          }
+        ]
+      },
+      {
+        "matcher": "Grep|Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/aggregator-transcript-guard.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/skills/session-reflect/reflect.sh sessionend"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; f=/home/jonathan/.claude/token-optimizer/.security-alert; [ -f \"$f\" ] && echo \"[token-optimizer] SECURITY ALERT: $(cat $f)\" || true"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "(CLV2_PYTHON_CMD=python3 ECC_OBSERVER_TIMEOUT_SECONDS=300 ~/.claude/skills/continuous-learning-v2/agents/start-observer.sh start >/dev/null 2>&1 &) || true",
+            "timeout": 3,
+            "statusMessage": "Launching instinct observer..."
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; $HOME/.claude/nixos-reminder-hook.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "startup|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; CLAUDE_PLUGIN_ROOT=/home/jonathan/Repos/superpowers /home/jonathan/Repos/superpowers/hooks/session-start"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; claude-kitty-pane-record || true"
+          }
+        ]
+      },
+      {
+        "matcher": "startup|compact|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; bash $HOME/.claude/skills/orchestrate/hooks/compact-reinject.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/step-back-detector.py"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/skills/session-reflect/reflect.sh subagentstop"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; $HOME/.claude/fable-warn.sh"
+          },
+          {
+            "type": "command",
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/context-baggage.py"
+          },
+          {
+            "type": "command",
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/date-reminder-hook.py"
+          },
+          {
+            "type": "command",
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/wellbeing/work-hours-nudge.py"
+          },
+          {
+            "type": "command",
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/wellbeing/habit-nudge.py"
+          },
+          {
+            "type": "command",
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/wellbeing/sunset-walk-nudge.py"
+          },
+          {
+            "type": "command",
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/step-back-nudge.py"
+          },
+          {
+            "type": "command",
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/evolve-reminder.py"
+          },
+          {
+            "type": "command",
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/hooks/prompt-log.py"
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; /home/jonathan/.claude/hooks/router-nudge-hook --queue-root /home/jonathan/.local/state/router/queue --marker /home/jonathan/.local/state/router/audit/nudge-marker || true"
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/aggregator-recall-hook.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
   },
-  "skillListingBudgetFraction": 0.03,
   "statusLine": {
-    "command": "node '/home/jonathan/Repos/token-optimizer/skills/token-optimizer/scripts/statusline.js'",
-    "type": "command"
+    "type": "command",
+    "command": "node '/home/jonathan/Repos/token-optimizer/skills/token-optimizer/scripts/statusline.js'"
   },
+  "enabledPlugins": {
+    "ask-questions-if-underspecified@trailofbits": true,
+    "caveman@caveman": true,
+    "code-review@claude-plugins-official": true,
+    "code-simplifier@claude-plugins-official": true,
+    "debug-buttercup@trailofbits": false,
+    "differential-review@trailofbits": true,
+    "entry-point-analyzer@trailofbits": false,
+    "insecure-defaults@trailofbits": true,
+    "mutation-testing@trailofbits": false,
+    "nix-search@nix-search-marketplace": true,
+    "nixos@kettleofskills": true,
+    "ralph-loop@claude-plugins-official": true,
+    "recursive-self-improvement@jonathanmoregard": true,
+    "sharp-edges@trailofbits": true,
+    "skill-creator@claude-plugins-official": true,
+    "spec-to-code-compliance@trailofbits": false,
+    "static-analysis@trailofbits": false,
+    "token-optimizer@alexgreensh-token-optimizer": true,
+    "typescript-lsp@claude-plugins-official": true
+  },
+  "extraKnownMarketplaces": {
+    "alexgreensh-token-optimizer": {
+      "source": {
+        "source": "directory",
+        "path": "/home/jonathan/Repos/token-optimizer"
+      }
+    },
+    "caveman": {
+      "source": {
+        "source": "directory",
+        "path": "/home/jonathan/.claude/skills/caveman"
+      }
+    },
+    "claude-plugins-official": {
+      "source": {
+        "source": "github",
+        "repo": "anthropics/claude-plugins-official"
+      }
+    },
+    "jonathanmoregard": {
+      "source": {
+        "source": "directory",
+        "path": "/home/jonathan/.claude/plugins/marketplaces/jonathanmoregard"
+      }
+    },
+    "kettleofskills": {
+      "source": {
+        "source": "directory",
+        "path": "/home/jonathan/.claude/plugins/marketplaces/kettleofskills"
+      }
+    },
+    "nix-search-marketplace": {
+      "source": {
+        "source": "directory",
+        "path": "/home/jonathan/.claude/plugins/marketplaces/nix-search-marketplace"
+      }
+    },
+    "trailofbits": {
+      "source": {
+        "source": "directory",
+        "path": "/home/jonathan/.claude/plugins/marketplaces/trailofbits"
+      }
+    }
+  },
+  "sandbox": {
+    "enabled": false,
+    "autoAllowBashIfSandboxed": true,
+    "allowUnsandboxedCommands": false
+  },
+  "effortLevel": "xhigh",
+  "advisorModel": "opus",
   "voiceEnabled": false
 }
