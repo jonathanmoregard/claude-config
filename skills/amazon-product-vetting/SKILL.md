@@ -25,7 +25,7 @@ Cheap tests first. Never burn research budget on constraints you're not sure how
 
 **0a. Ambiguity check → ASK the user in one message before ANY research call.** Walk each constraint and ask: is there a reading of this that would invalidate the whole search? Common traps:
 
-- **Dimensions** — inside or outside the container? With or without lid? Folded or unfolded? Diagonal or face?
+- **Dimensions** — inside or outside? Applies to BOTH the container being filled AND the item that fills it — ask both. With or without lid? Folded or unfolded? Diagonal or face?
 - **Capacity** — liquid mL, dry cup, packed, level, or heaped? Nominal or usable?
 - **Weight / load** — static or dynamic? Per-anchor or total?
 - **"About X" or a range** — is X a hard ceiling, or is a 10% overshoot acceptable if the rest fits?
@@ -37,6 +37,10 @@ If ANY reading would send the search into a wrong lane, ASK before spending. **R
 Batch questions into one message. Do not ask one at a time. Do not ask questions the user obviously already answered.
 
 **0b. Feasibility spot-check (30 seconds, one fast call max).** If a constraint feels unusual (uncommon dimensions, exotic material, niche form factor), run a 30-second scan to confirm the target exists in the market before committing to full research. If it doesn't, surface that to the user with the closest available alternatives — let them relax the constraint. Do NOT run the full battery on an infeasible spec.
+
+If the feasibility call fails (tool error, quarantine, empty result), fall back on category knowledge: state your suspicion, offer 2–3 relaxed variants (e.g. 7 cm → 8 cm → 10 cm), and ask the user to pick a lane before spending the full battery. Do not silently proceed as if the check succeeded.
+
+**Fit-math sanity check.** If the user gave both container dims AND item dims, compute the grid up front — how many items per layer, how much slack, whether a slightly-different item dim fills the container meaningfully better. Flag that trade before you build the slate.
 
 **0c. Filter vs verify parse.** List every constraint (stated + inferred). Sort each into two buckets:
 
