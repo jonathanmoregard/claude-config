@@ -19,9 +19,26 @@ Sweden-based shopper. Give a rigorous vetting pass — not the top Amazon search
 
 ## The flow
 
-### 0. Parse constraints — filter vs verify (30 seconds, do this FIRST)
+### 0. Sanity-check invariants BEFORE any research spend
 
-Before opening a search box, list every constraint (stated + inferred). Sort each into two buckets:
+Cheap tests first. Never burn research budget on constraints you're not sure how to read.
+
+**0a. Ambiguity check → ASK the user in one message before ANY research call.** Walk each constraint and ask: is there a reading of this that would invalidate the whole search? Common traps:
+
+- **Dimensions** — inside or outside the container? With or without lid? Folded or unfolded? Diagonal or face?
+- **Capacity** — liquid mL, dry cup, packed, level, or heaped? Nominal or usable?
+- **Weight / load** — static or dynamic? Per-anchor or total?
+- **"About X" or a range** — is X a hard ceiling, or is a 10% overshoot acceptable if the rest fits?
+- **Material** — a strict requirement, a preference, or "anything reasonable"?
+- **Vague qualifiers** — "sturdy", "reasonable price", "good enough for daily use" — anchor to numbers before searching.
+
+If ANY reading would send the search into a wrong lane, ASK before spending. **Real failure**: an agent researched jars for 25 minutes, then asked whether the box dimension was inside or outside. That question should have been the first message, not the last. Cost of asking: ~10 seconds. Cost of not asking: whole research run wasted.
+
+Batch questions into one message. Do not ask one at a time. Do not ask questions the user obviously already answered.
+
+**0b. Feasibility spot-check (30 seconds, one fast call max).** If a constraint feels unusual (uncommon dimensions, exotic material, niche form factor), run a 30-second scan to confirm the target exists in the market before committing to full research. If it doesn't, surface that to the user with the closest available alternatives — let them relax the constraint. Do NOT run the full battery on an infeasible spec.
+
+**0c. Filter vs verify parse.** List every constraint (stated + inferred). Sort each into two buckets:
 
 - **Filter** — a marketed, searchable spec that meaningfully narrows the field: dimensions, colour, capacity, material class, cert-required categories, brand, form factor.
 - **Verify** — a property near-universal in the material/category, so the search field can't filter on it. Confirm on the top pick instead — physically, in the returns window if needed.
@@ -187,6 +204,8 @@ Even if he asked for one option, present three so he can trade off consciously.
 - Do not launch dozens of fetches. Parallel + budgeted.
 - **Do not use near-universal properties as search filters** (freezer-safe, BPA-free, dishwasher-safe, food-safe, airtight-with-gasket on standard food-storage plastic/glass). They strand you in empty result pages and cause you to *penalise* good products for lacking a marketing claim they didn't need. Flip to Verify — §0.
 - **Do not apply a blanket rule on absent marketing claims.** Read the bucket §0 assigned: Verify → absence is silence; Filter → absence is a defect (USB-C wattage, cert numbers, load rating, IP-rating, OEKO-TEX #). Sort per constraint, not per rule of thumb.
+- **Do not burn research budget on an ambiguous invariant.** Ask the user in one batched message before any fetch (§0a). Answer cost: seconds. Wrong-read-run cost: whole session. The 25-minute jar-dimensions incident is the canonical failure.
+- **Do not commit to a full research run on an infeasible spec.** Run the 30-second feasibility spot-check first (§0b). If the target dimension / material / form doesn't exist in the market, surface that early and offer the closest available alternatives.
 - Do not recommend Fakespot / ReviewMeta — dead.
 - Do not treat "Overall Pick" as endorsement.
 - Do not skip the three-tier format.
