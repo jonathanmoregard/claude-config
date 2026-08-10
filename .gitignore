@@ -105,6 +105,12 @@ daemon.log
 daemon/
 jobs/
 
+# Session-reflection hook output: per-session stdout/stderr logs, skipped-
+# recursion records, idle-handoff logs and counters. Pure runtime — 1496 files
+# of it were auto-committed once, and handoff.log mutates on every session, so
+# left tracked it turns each autosync run into a churn commit.
+reflections/
+
 # Repo-autosync runtime state (per-repo cache, security alerts, logs)
 repo-autosync-data/
 
