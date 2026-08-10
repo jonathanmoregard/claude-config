@@ -1,0 +1,54 @@
+{
+  "safe-bash": {
+    "type": "stdio",
+    "command": "python3",
+    "args": [
+      "/home/jonathan/.claude/mcps/safe-bash/server.py"
+    ],
+    "env": {}
+  },
+  "research-agent": {
+    "type": "stdio",
+    "command": "research-agent-mcp",
+    "args": [],
+    "env": {}
+  },
+  "futuresearch-gate": {
+    "type": "stdio",
+    "command": "futuresearch-gate-mcp",
+    "args": [],
+    "env": {}
+  },
+  "gdocs-review": {
+    "type": "stdio",
+    "command": "uv",
+    "args": [
+      "run",
+      "--directory",
+      "/home/jonathan/Repos/gdocs-review-mcp",
+      "python",
+      "main.py",
+      "--transport",
+      "stdio",
+      "--single-user",
+      "--tools",
+      "docs",
+      "docs_preview"
+    ],
+    "env": {
+      "USER_GOOGLE_EMAIL": "agent@example.invalid",
+      "WORKSPACE_MCP_CREDENTIALS_DIR": "/home/jonathan/.google_workspace_mcp/credentials"
+    }
+  },
+  "aggregator": {
+    "type": "stdio",
+    "command": "uv",
+    "args": [
+      "run",
+      "--directory",
+      "/home/jonathan/Repos/aggregator",
+      "aggregator-mcp"
+    ],
+    "env": {}
+  }
+}
