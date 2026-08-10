@@ -93,6 +93,18 @@ workers/*/scratch/
 # Credential backups (.credentials.json itself already ignored above; .bak-* variants too)
 .credentials.json.bak-*
 
+# Timestamped backups tooling drops next to the file it rewrites
+# (settings.json.bak-*, mission.md.bak-*). Ephemeral by construction, and
+# nothing ever cleans them up — so left untracked they made every autosync
+# run report a dirty worktree forever.
+*.bak-*
+
+# Background-worker daemon runtime: supervisor log, per-job scratch, and
+# daemon/control.key — a live credential that must never be auto-committed.
+daemon.log
+daemon/
+jobs/
+
 # Repo-autosync runtime state (per-repo cache, security alerts, logs)
 repo-autosync-data/
 
