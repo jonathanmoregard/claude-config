@@ -93,9 +93,63 @@ notification via `notify-send`:
 |-------|---------|
 | Oversized file | any pending file > 5 MiB (`SYNC_MAX_FILE_BYTES` to override) |
 | Secret scan | `gitleaks` missing, or a finding in a pending file |
-| Agent failure | `claude` exits non-zero — usage limit, expired auth, API down |
-| Incomplete sync | `claude` exits 0 but the worktree is still dirty |
+| Agent failure | `claude` exits non-zero, **or** exits 0 having printed a usage-limit / API error |
+| Incomplete sync | `claude` exits 0 but **tracked** changes are still uncommitted |
 | Unpushed | commits made but `origin/$BRANCH` still behind |
+
+The size guard is **per-file, not aggregate** — it cannot catch a thousand
+small files, which is the actual shape of accidental runtime-state capture
+(1496 files / 5.7 MB of reflection logs landed in `~/.claude` in one run,
+every file a few lines). The ignore affordance below is the mitigation.
+
+Claude Code prints `You've hit your org's monthly usage limit` and
+`API Error: ...` to stdout and still **exits 0**, so the exit code alone
+cannot distinguish an API failure from a finished sync. The agent's output is
+captured and matched for those strings, then appended to whichever git-state
+check actually failed. The text only ever *explains* a failure, never
+declares one — a commit message containing "API Error" cannot fake a failure.
+
+Only **tracked** changes count as incomplete. The agent is deliberately given
+judgment over what belongs in the repo, and untracked leftovers are logged,
+not escalated: aggregator's sync succeeded and pushed on every run for days
+while reporting FAILED, because one ephemeral `mission.md.bak-*` sat
+untracked and nothing would ever remove it — a permanently red guard that
+trains you to ignore the notification.
+
+### Agent affordances
+
+The agent runs under `--allowedTools`, not `--dangerously-skip-permissions`:
+
+```
+Read  Bash(git status|diff|add|commit|push|log|rm|check-ignore:*)
+Bash($REPO/.git/sync-agent-ignore:*)
+```
+
+`sync-agent-ignore` is generated into `$REPO/.git/` on every run (so
+improvements propagate with the script, and it can never itself show up as a
+pending change). It exists because the agent otherwise has *no* write
+affordance: every generated file becomes a forced choice between committing
+it and leaving the worktree dirty — and it commits.
+
+```bash
+$REPO/.git/sync-agent-ignore --reason "log output" 'logs/' '*.log'
+```
+
+Deliberately **not** the `Edit` tool: `--allowedTools` cannot path-scope
+`Edit`/`Write` grants (probed 2026-08-01), so "let it edit `.gitignore`"
+means unrestricted edit on an unattended cron agent. This command can only
+append ignore rules to one file in one repo.
+
+It fails the whole call — never a partial apply — on: negations (`!foo`,
+which can expose files an existing rule deliberately hides), repo-swallowing
+patterns (`*`, `**`, `/`, `.`), blank or newline-bearing patterns, and any
+pattern matching an already-tracked file (ignoring a tracked file is a no-op;
+git keeps committing it — the error names the files and points at
+`git rm --cached`). Duplicates are skipped idempotently.
+
+Set `SYNC_IGNORE_TARGET=exclude` to route rules to `.git/info/exclude`
+instead of the tracked `.gitignore` — correct for public forks, where a local
+automation rule must not leak into an upstream PR.
 
 Success is silent and exits 0. The notifier writes its log line first so
 failures stay diagnosable headless, then attempts the desktop notification
@@ -187,5 +241,5 @@ Keep scripts in skill dir; installer pre-renders per-repo settings into the data
 
 ## Notes
 
-- `--dangerously-skip-permissions` is only in push-local's `sync-agent.sh`. upstream-merge uses explicit settings files (scoped deny-lists); no `--dangerously-skip-permissions`.
+- Neither mode uses `--dangerously-skip-permissions`. push-local passes an explicit `--allowedTools` allowlist (see Agent affordances above); upstream-merge uses explicit settings files (scoped deny-lists).
 - Symlink propagation works regardless of mode: if the repo is symlinked into `~/.claude/skills/<name>`, merges land live after `git push origin` returns (the symlink target IS the working tree).
