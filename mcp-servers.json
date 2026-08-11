@@ -50,5 +50,16 @@
       "aggregator-mcp"
     ],
     "env": {}
+  },
+  "reddit": {
+    "command": "/etc/profiles/per-user/jonathan/bin/uvx",
+    "args": [
+      "--with",
+      "mcp<2",
+      "--from",
+      "mcp-server-reddit",
+      "mcp-server-reddit"
+    ],
+    "env": {}
   }
 }
