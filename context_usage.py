@@ -75,7 +75,11 @@ def detect_max_tokens(model: str | None, observed_max: int) -> int:
     override = os.environ.get("CLAUDE_CONTEXT_MAX")
     if override:
         try:
-            return int(override)
+            # Positive only: a 0 or negative override would make every consumer
+            # divide by it.
+            parsed = int(override)
+            if parsed > 0:
+                return parsed
         except ValueError:
             pass
     if model:

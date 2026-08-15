@@ -158,6 +158,7 @@ def load_state(sid: str) -> dict:
 
 
 def write_json_atomic(path: Path, payload: dict) -> bool:
+    tmp: Path | None = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f".{path.name}.tmp{os.getpid()}")
@@ -168,10 +169,11 @@ def write_json_atomic(path: Path, payload: dict) -> bool:
         os.replace(tmp, path)
         return True
     except Exception:
-        try:
-            os.unlink(tmp)  # type: ignore[possibly-undefined]
-        except Exception:
-            pass
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
         return False
 
 
