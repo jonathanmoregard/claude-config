@@ -66,7 +66,15 @@ def main():
         f"Context is {pct_display}% full ({user_msg_count} messages in this session; "
         f"window: {max_tokens // 1000}k tokens). "
         "STOP taking new tasks. "
-        "Write handoff to tasks/mission.md (done/next/blocked/open-questions) now. "
+        # NOT tasks/mission.md. That path is a machine-owned symlink to the
+        # human-readable copy of the out-of-repo handoff
+        # ($REFLECT_ROOT/sessions/<sid>/mission.md), so a write-through here would
+        # clobber the copy — and the next mission run would silently overwrite
+        # whatever the model had written. tasks/handoff.md is human-owned: no
+        # automation reads it, no automation writes it, and it stays visible to
+        # idle-handoff's freshness gate, which is correct — a human handoff IS the
+        # world moving.
+        "Write handoff to tasks/handoff.md (done/next/blocked/open-questions) now. "
         "Then ask the user which: (a) fork to fresh session, (b) /compact in place, "
         "(c) continue here. Do not continue until the user answers."
     )

@@ -1044,8 +1044,15 @@ PROMPT
     # Passthrough: envs the fork needs. Anthropic auth is the load-bearing
     # one; PATH lets claude find its own binaries; HOME lets it read
     # ~/.claude configuration.
+    #
+    # REFLECT_ROOT is in this list and must stay: the fork runs the same hooks we
+    # do, so its OWN handoff writes land under whatever root it inherits. Under a
+    # custom root the fork used to fall back to the DEFAULT ~/.claude/reflections,
+    # so the handoff it wrote for its successor was invisible to the next tick's
+    # resolution — the feature quietly stopped resuming after one hop, with every
+    # component reporting success.
     setenv_args=()
-    for var in HOME PATH USER LANG LC_ALL LC_CTYPE \
+    for var in HOME PATH USER LANG LC_ALL LC_CTYPE REFLECT_ROOT \
                ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN \
                HTTPS_PROXY HTTP_PROXY NO_PROXY; do
       val="${!var:-}"

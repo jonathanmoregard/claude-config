@@ -13,7 +13,7 @@ Also read these reference files:
 - `~/.claude/recursive-self-improvement/config/policy.md` — the proposal tone policy. Follow it when writing proposals.
 - `~/.claude/recursive-self-improvement/config/categories.md` — detailed descriptions of what to flag per category. Use the "What to flag (daily)" sections.
 
-**Component gate — check this before anything else.** If `components.daily_review` is present and false, print `daily-review: disabled in components; nothing to do.` and stop. Read no logs, write no proposals. The `rsi-daily-review` cron wrapper enforces the same switch before it ever starts a model, so reaching this line means you were invoked by hand — the switch still holds. An absent `components` block means enabled.
+**Component gate — check this before anything else.** Proceed ONLY if `components.daily_review` is the boolean `true`. Anything else — `false`, absent, an absent `components` block, an absent or unreadable config file, or a non-boolean value such as the string `"true"` — means print `daily-review: disabled in components; nothing to do.` and stop. Read no logs, write no proposals. This run spends model usage, so it fails OFF; `_components_absent_default.daily_review` in config.json records the same polarity, and the `rsi-daily-review` cron wrapper enforces the same test before it ever starts a model. Reaching this line means you were invoked by hand — the switch still holds.
 
 **Only analyze and propose in enabled categories.** Skip disabled categories entirely.
 

@@ -2184,6 +2184,14 @@ B1_OUT="$(jq -cn --arg tp "$B1_DIR/t70.jsonl" '{transcript_path:$tp}' \
   | python3 "$WORKTREE/context-baggage.py")" || fail "20: context-baggage.py rc!=0"
 grep -q 'Context is 75% full' <<<"$B1_OUT" \
   || fail "20: 70% nudge stopped firing at 75% (out='$B1_OUT')"
+# ...and it must send the human at a HUMAN-owned path. tasks/mission.md is a
+# machine-owned symlink to the copy of the out-of-repo handoff, so a write-through
+# would clobber the copy and the next mission run would overwrite the model's work.
+grep -q 'tasks/handoff.md' <<<"$B1_OUT" \
+  || fail "20: the nudge does not name a human-owned handoff path (out='$B1_OUT')"
+if grep -q 'tasks/mission.md' <<<"$B1_OUT"; then
+  fail "20: the nudge still tells the model to write tasks/mission.md — a machine-owned symlink"
+fi
 B1_OUT31="$(jq -cn --arg tp "$B1_DIR/t1.jsonl" '{transcript_path:$tp}' \
   | python3 "$WORKTREE/context-baggage.py")" || fail "20: context-baggage.py rc!=0 at 31%"
 [[ -z "$B1_OUT31" ]] \
@@ -2430,11 +2438,13 @@ sc_wait_mission "$B7_CWD" "$B7_SID" || fail "24: Stop hook produced no handoff t
 # Both sessions are only ~2 min idle — far under the 45-min idle floor.
 touch -d '2 minutes ago' "$B7_TP" "$B7_CTRL_PROJ/$B7_CTRL_SID.jsonl"
 
-# Stub records the fork's argv so we can assert on how it was launched.
+# Stub records the fork's argv AND the REFLECT_ROOT it was handed, so we can
+# assert both how it was launched and what root its own hooks would write under.
 cat >"$STUB_SCRATCH/claude" <<STUB
 #!/usr/bin/env bash
 cat >/dev/null || true
-{ printf '=== argv ===\n'; for a in "\$@"; do printf '%s\n' "\$a"; done; } >> '$B7_ARGV'
+{ printf '=== argv ===\n'; for a in "\$@"; do printf '%s\n' "\$a"; done
+  printf '=== env REFLECT_ROOT=%s\n' "\${REFLECT_ROOT:-<unset>}"; } >> '$B7_ARGV'
 printf 'ok\n'
 STUB
 chmod +x "$STUB_SCRATCH/claude"
@@ -2464,6 +2474,19 @@ grep -qF -- '--add-dir' "$B7_ARGV" \
 grep -qF "$REFLECT_ROOT/sessions/$B7_SID" "$B7_ARGV" \
   || fail "24: --add-dir does not scope to this session's handoff dir"
 grep -qF '## Next' "$B7_ARGV" || fail "24: fork prompt does not point at ## Next"
+
+# D6: the fork runs the SAME hooks we do, so its own handoff writes land under
+# whatever REFLECT_ROOT it inherits. A transient systemd unit inherits nothing, and
+# REFLECT_ROOT was missing from the --setenv passthrough — so under a custom root
+# the fork wrote its successor's handoff to the DEFAULT ~/.claude/reflections,
+# where the next tick's resolution could not see it. Silent feature death after one
+# hop, with every component reporting success.
+grep -qF "=== env REFLECT_ROOT=$REFLECT_ROOT" "$B7_ARGV" \
+  || fail "24: the fork did not inherit REFLECT_ROOT ($(grep '=== env REFLECT_ROOT=' "$B7_ARGV" | tail -1)) — its own handoffs would land under the default root and never resolve"
+grep -q 'REFLECT_ROOT' "$WORKTREE/scripts/idle-handoff.sh" \
+  || fail "24: REFLECT_ROOT is not in idle-handoff.sh at all"
+grep -qE '^ *for var in HOME PATH USER LANG LC_ALL LC_CTYPE REFLECT_ROOT' "$WORKTREE/scripts/idle-handoff.sh" \
+  || fail "24: REFLECT_ROOT is missing from the systemd-run --setenv passthrough list"
 
 B7_LOG="$REFLECT_ROOT/idle-handoff-logs/handoff.log"
 grep -q "context trigger" "$B7_LOG" || fail "24: widened trigger not logged (audit trail)"
@@ -2969,7 +2992,34 @@ chmod 700 "$F3_RO_DIR"
   || fail "28: the worker RAN WITHOUT THE PER-MODE LOCK — final.json can now lose a peer's write to a last-write-wins mv"
 grep -q 'refusing to run WITHOUT the per-mode lock' "$STUB_SCRATCH/f3-ro.log" \
   || fail "28: the reason was not recorded (log: $(cat "$STUB_SCRATCH/f3-ro.log"))"
-info "unopenable lockfile: worker exits 0, writes nothing, records why; writable lockfile still completes"
+
+# D6: UNSET/EMPTY is the same failure and used to be the same silent fall-through.
+# The whole acquisition sat inside `if [[ -n "${REFLECT_LOCKFILE:-}" ]]`, so
+# omitting one variable ran the worker with no per-mode lock at all — the very mv
+# race the branch above exists to close, reachable without any EACCES.
+for f3_case in empty unset; do
+  F3U_SID="test-sid-f3-lock-$f3_case"
+  F3U_DIR="$REFLECT_ROOT/sessions/$F3U_SID"
+  mkdir -p "$F3U_DIR/checkpoints"
+  if [[ "$f3_case" == "empty" ]]; then
+    f3_worker "$F3U_SID" "" >"$STUB_SCRATCH/f3-$f3_case.log" 2>&1 && rc=0 || rc=$?
+  else
+    # Same env MINUS REFLECT_LOCKFILE entirely.
+    _REFLECT_INTERNAL=1 \
+    SESSION_ID="$F3U_SID" TRANSCRIPT_PATH="$TRANSCRIPT" HOOK_EVENT="SessionEnd" \
+    CWD="$TEST_CWD" MODE=sessionend \
+    session_dir="$F3U_DIR" final_path="$F3U_DIR/final.json" \
+    manifest_path="$F3U_DIR/manifest.json" checkpoint_dir="$F3U_DIR/checkpoints" \
+      bash "$REFLECT_SH" --worker sessionend \
+        >"$STUB_SCRATCH/f3-$f3_case.log" 2>&1 && rc=0 || rc=$?
+  fi
+  (( rc == 0 )) || fail "28/$f3_case: refusing must exit 0 like the other lock branches (exit=$rc)"
+  [[ ! -f "$F3U_DIR/final.json" ]] \
+    || fail "28/$f3_case: the worker RAN WITHOUT THE PER-MODE LOCK because REFLECT_LOCKFILE was $f3_case"
+  grep -q 'refusing to run WITHOUT the per-mode lock' "$STUB_SCRATCH/f3-$f3_case.log" \
+    || fail "28/$f3_case: the reason was not recorded (log: $(cat "$STUB_SCRATCH/f3-$f3_case.log"))"
+done
+info "lockfile unopenable/empty/unset: worker exits 0, writes nothing, records why; writable lockfile still completes"
 
 # ============================================================================
 # TEST 29: F4 — REFLECT_SUBPROCESS means the same thing on both sides
@@ -3317,6 +3367,108 @@ grep -q 'not an absolute path' "$D5_ERR" \
 ( cd "$D5_DIR" && REFLECT_ROOT="$D5_DIR/reflections" bash "$REFLECT_SH" --mission-path "$D5_DIR" >/dev/null 2>&1 ) \
   || fail "34: the ABSOLUTE form of the same root stopped working — the check is too strict"
 info "relative REFLECT_ROOT refused at reflect.sh and idle-handoff.sh; absolute form unaffected"
+
+# ============================================================================
+# TEST 35: D6 — a broken resolver, one config path, and honest polarity docs
+# ============================================================================
+echo "TEST 35: D6 — resolver ERROR != refusal; one config switch; polarity docs agree"
+
+# (a) An authenticator that CRASHED was collapsed into mission_path="" and logged
+#     as `mission_not_ours` — the same line a clean refusal produces. So a
+#     permanently broken resolver looked exactly like a working one that kept
+#     declining, and nothing ever surfaced. Both still fail closed; they must not
+#     read the same.
+#     Fixture: a home whose .claude/skills is a real COPY (not the usual symlink
+#     into the worktree), so reflect.sh can be swapped for a wrapper that breaks
+#     ONLY `--mission-path` and passes everything else — including `mission` —
+#     through to the real script. That is the shape that matters: a resolver that
+#     fails while the WRITER still works is what reaches the post-write
+#     re-resolution, and it does not touch the repo's own files.
+D6_H="$(mktemp -d -t reflect-d6home-XXXXXX)"
+mkdir -p "$D6_H/.claude/recursive-self-improvement/config" "$D6_H/.claude/projects"
+cp -r "$WORKTREE/skills" "$D6_H/.claude/skills"
+ln -s "$WORKTREE/scripts" "$D6_H/.claude/scripts"
+ln -s "$SC_USAGE" "$D6_H/.claude/context_usage.py"
+ln -s "$SC_TRIGGER" "$D6_H/.claude/self-compact-trigger.py"
+sc_write_config "$D6_H" on 0.30
+D6_CWD="$(mktemp -d -t reflect-d6cwd-XXXXXX)"
+assert_isolated_cwd "$D6_CWD"
+mk_candidate_repo "$D6_CWD" || fail "35a: could not build repo"
+D6_SID="test-sid-d6-resolver"
+mk_mission_handoff "$D6_SID" "$D6_CWD" "$(cat "$SC_MISSION_FILE")" >/dev/null
+D6_PROJ="$D6_H/.claude/projects/-tmp-d6"
+mkdir -p "$D6_PROJ"
+D6_TP="$D6_PROJ/$D6_SID.jsonl"
+mk_context_transcript "$D6_TP" "claude-opus-5" 330000 "$D6_CWD" 25
+touch -d '2 minutes ago' "$D6_TP"
+sc_plant_request "$D6_SID" "$D6_CWD" "$D6_TP"
+D6_ARGV="$D6_H/argv.txt"
+combo_stub "$D6_ARGV" "$SC_MISSION_FILE"
+: > "$D6_ARGV"
+D6_REFLECT="$D6_H/.claude/skills/session-reflect/reflect.sh"
+mv "$D6_REFLECT" "$D6_H/.claude/skills/session-reflect/reflect-real.sh"
+cat >"$D6_REFLECT" <<'WRAP'
+#!/usr/bin/env bash
+# Fixture: the resolver crashes; every other mode works.
+if [[ "${1:-}" == "--mission-path" ]]; then
+  echo "fixture: simulated resolver crash" >&2
+  exit 3
+fi
+exec bash "$(dirname -- "${BASH_SOURCE[0]}")/reflect-real.sh" "$@"
+WRAP
+chmod 755 "$D6_REFLECT"
+D6_LINES="$(wc -l < "$REFLECT_ROOT/idle-handoff-logs/handoff.log")"
+HOME="$D6_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
+  >/dev/null 2>&1 && rc=0 || rc=$?
+(( rc == 0 )) || fail "35a: idle-handoff.sh rc=$rc with a crashing resolver"
+sleep 0.5
+if sc_forked "$D6_ARGV"; then
+  fail "35a: forked despite being unable to resolve a mission at all — must fail closed"
+fi
+D6_TAIL="$(tail -n +$((D6_LINES + 1)) "$REFLECT_ROOT/idle-handoff-logs/handoff.log")"
+grep -q 'mission_resolve_error' <<<"$D6_TAIL" \
+  || fail "35a: a broken resolver was reported as something other than an ERROR (log: $(tail -5 <<<"$D6_TAIL"))"
+grep -qE 'mission resolver FAILED rc=3' <<<"$D6_TAIL" \
+  || fail "35a: the resolver's exit code was not recorded (log: $(tail -5 <<<"$D6_TAIL"))"
+if grep -q 'autofork skipped: mission_not_ours' <<<"$D6_TAIL"; then
+  fail "35a: an ERROR was ALSO logged as a clean refusal — the two must be distinguishable"
+fi
+# The per-run summary must count them apart too, or an operator scanning the tail
+# still cannot tell a broken resolver from a quiet one.
+grep -qE 'mission_resolve_err=[1-9]' <<<"$D6_TAIL" \
+  || fail "35a: the run summary does not count resolver errors (line: $(grep -o 'skipped(.*' <<<"$D6_TAIL" | tail -1))"
+grep -qF 'mission_not_ours=0' <<<"$D6_TAIL" \
+  || fail "35a: the run summary counted the ERROR as a refusal (line: $(grep -o 'skipped(.*' <<<"$D6_TAIL" | tail -1))"
+# Control: with the resolver working, the same candidate forks. Proves the refusal
+# above was the resolver and nothing else about this fixture.
+cp "$D6_H/.claude/skills/session-reflect/reflect-real.sh" "$D6_REFLECT"
+touch -d '2 minutes ago' "$D6_TP"
+sc_plant_request "$D6_SID" "$D6_CWD" "$D6_TP"
+: > "$D6_ARGV"
+HOME="$D6_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
+  || fail "35a: idle-handoff.sh rc!=0 (control)"
+for _ in $(seq 1 60); do sc_forked "$D6_ARGV" && break; sleep 0.25; done
+sc_forked "$D6_ARGV" \
+  || fail "35a: control did not fork, so the ERROR case proves nothing (log: $(grep "$D6_SID" "$REFLECT_ROOT/idle-handoff-logs/handoff.log" | tail -3))"
+info "35a: a crashing resolver logs mission_resolve_error + rc, never mission_not_ours; still fails closed"
+
+# (c) Documentation that contradicts the code is a defect: both of these were
+#     read by a human (or a model) deciding whether a paid run is enabled.
+D6_CFG="$WORKTREE/recursive-self-improvement/config/config.json"
+D6_PROMPT="$WORKTREE/recursive-self-improvement/config/prompt.md"
+jq -e '._components_absent_default.daily_review == false' "$D6_CFG" >/dev/null \
+  || fail "35c: fixture assumption broken — daily_review's absent-default is no longer false"
+if grep -qF "jq -r '.components.X // false'" "$D6_CFG"; then
+  fail "35c: config.json still recommends \`jq -r '.components.X // false'\` — -r prints the STRING \"true\", so a mis-typed \"true\" reads as enabled: the exact bug it documents around"
+fi
+grep -qF 'jq -e' "$D6_CFG" \
+  || fail "35c: config.json documents no correct polarity test at all"
+if grep -qi 'absent .components. block means enabled' "$D6_PROMPT"; then
+  fail "35c: prompt.md still says an absent components block means ENABLED, contradicting _components_absent_default.daily_review=false — this run spends usage and must fail OFF"
+fi
+grep -qi 'fails OFF' "$D6_PROMPT" \
+  || fail "35c: prompt.md does not state the fails-off polarity"
+info "35c: the documented jq pattern is the correct one, and prompt.md agrees with the config's polarity"
 
 # ============================================================================
 # FINAL GUARD: prove the whole suite left the live repo alone.

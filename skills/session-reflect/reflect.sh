@@ -294,15 +294,24 @@ if [[ "$ARG1" == "--worker" ]]; then
   # not abort the shell here either (bash only exits on it in POSIX mode), so
   # nothing else caught it. Running unlocked is worse than not running: the
   # reflection we would produce could destroy a peer's.
-  if [[ -n "${REFLECT_LOCKFILE:-}" ]]; then
-    if ! exec 9>"$REFLECT_LOCKFILE"; then
-      echo "reflect.sh: worker could not OPEN REFLECT_LOCKFILE=$REFLECT_LOCKFILE (sid=$SESSION_ID mode=$MODE); refusing to run WITHOUT the per-mode lock — an unlocked worker can lose a peer's final.json to a last-write-wins mv" >&2
-      exit 0
-    fi
-    if ! flock -w 5 9; then
-      echo "reflect.sh: worker could not acquire $REFLECT_LOCKFILE within 5s; another worker owns this mode" >&2
-      exit 0
-    fi
+  # UNSET is the same failure as UNOPENABLE, and used to be the same silent
+  # fall-through: the whole lock acquisition sat inside `if [[ -n
+  # "${REFLECT_LOCKFILE:-}" ]]`, so an empty or missing value ran the worker with
+  # NO per-mode lock at all — exactly the mv race the F3 fix was written to close,
+  # reachable by omitting one variable instead of by an EACCES. Every legitimate
+  # caller is the dispatcher, which always exports it; anything else has no
+  # business running this path.
+  if [[ -z "${REFLECT_LOCKFILE:-}" ]]; then
+    echo "reflect.sh: worker has no REFLECT_LOCKFILE (sid=$SESSION_ID mode=$MODE); refusing to run WITHOUT the per-mode lock — an unlocked worker can lose a peer's final.json to a last-write-wins mv" >&2
+    exit 0
+  fi
+  if ! exec 9>"$REFLECT_LOCKFILE"; then
+    echo "reflect.sh: worker could not OPEN REFLECT_LOCKFILE=$REFLECT_LOCKFILE (sid=$SESSION_ID mode=$MODE); refusing to run WITHOUT the per-mode lock — an unlocked worker can lose a peer's final.json to a last-write-wins mv" >&2
+    exit 0
+  fi
+  if ! flock -w 5 9; then
+    echo "reflect.sh: worker could not acquire $REFLECT_LOCKFILE within 5s; another worker owns this mode" >&2
+    exit 0
   fi
 fi
 
