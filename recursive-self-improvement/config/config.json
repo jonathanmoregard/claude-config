@@ -1,22 +1,15 @@
 {
-  "_components_comment": "Per-part switches for RSI. Flipping one here is the whole toggle — no rebuild, no crontab PR. daily_review gates the nightly headless Opus pass over the transcript corpus (rsi-daily-review checks this before it spends anything; absent or unreadable config reads as OFF, because that run costs usage). permission_ledger gates the 17:30 permission-friction evaluator (run-evaluate.sh; absent config reads as ON, because capture is already running and only this stage turns it into something a human sees). auto_research gates the research pass over selected observations, which runs from /review-improvements rather than cron. self_compact gates the autonomous context lifecycle: the Stop hook self-compact-trigger.py writes a mission handoff once a session crosses self_compact.threshold of its detected context window, and scripts/idle-handoff.sh then resumes the work in a fresh process. Absent, malformed, or any non-boolean value reads as OFF, because the resume runs opus-5. It does NOT auto-invoke /compact or /clear — those are never agent-triggered.",
-  "_components_absent_default_comment": "WHAT EACH READER DOES WHEN ITS KEY (or this whole file) IS MISSING. The polarity is NOT uniform, so it is written down per key instead of living only in prose: anything that SPENDS model usage fails OFF, and the one stage that merely surfaces already-captured data fails ON. Deleting a key is therefore not the same as setting it to false. Verify a reader's polarity by grepping how it tests the key. THE CORRECT TEST, and the only one written here on purpose so it is the one that gets copied: `jq -e '.components.X == true'` for a fails-OFF reader, `jq -e '.components.X != false'` for a fails-ON one. The pattern to avoid is `jq -r` piped into a shell truth test with a `// false` fallback: -r prints the bare STRING true, the // default only fires for null and false, and the shell then treats a mis-typed string value such as \"self_compact\": \"true\" as enabled. Anything that spends usage must be the BOOLEAN true, not a value that merely renders as it.",
+  "_components_comment": "Per-part switches for RSI. Flipping one here is the whole toggle — no rebuild, no crontab PR. daily_review gates the nightly headless Opus pass over the transcript corpus (rsi-daily-review checks this before it spends anything; absent or unreadable config reads as OFF, because that run costs usage). permission_ledger gates the 17:30 permission-friction evaluator (run-evaluate.sh; absent config reads as ON, because capture is already running and only this stage turns it into something a human sees). auto_research gates the research pass over selected observations, which runs from /review-improvements rather than cron. NOT LISTED HERE, on purpose: the autonomous context lifecycle (self-compact-trigger.py + scripts/idle-handoff.sh). USER DECISION 2026-08-16: it has no switch. It runs. Its threshold and per-session fire cap are hardcoded constants in self-compact-trigger.py, and what bounds it is idle-handoff.sh's pre-existing guard chain — fork ledger, per-cwd 24h budget, staleness DENY-when-uncheckable, live-cwd collision abort, ralph collision — not a key in this file. Do not add one back.",
+  "_components_absent_default_comment": "WHAT EACH READER DOES WHEN ITS KEY (or this whole file) IS MISSING. The polarity is NOT uniform, so it is written down per key instead of living only in prose: anything that SPENDS model usage fails OFF, and the one stage that merely surfaces already-captured data fails ON. Deleting a key is therefore not the same as setting it to false. Verify a reader's polarity by grepping how it tests the key. THE CORRECT TEST, and the only one written here on purpose so it is the one that gets copied: `jq -e '.components.X == true'` for a fails-OFF reader, `jq -e '.components.X != false'` for a fails-ON one. The pattern to avoid is `jq -r` piped into a shell truth test with a `// false` fallback: -r prints the bare STRING true, the // default only fires for null and false, and the shell then treats a mis-typed string value such as \"daily_review\": \"true\" as enabled. Anything that spends usage must be the BOOLEAN true, not a value that merely renders as it.",
   "_components_absent_default": {
     "daily_review": false,
     "auto_research": false,
-    "permission_ledger": true,
-    "self_compact": false
+    "permission_ledger": true
   },
   "components": {
     "daily_review": false,
     "auto_research": false,
-    "permission_ledger": true,
-    "self_compact": false
-  },
-  "_self_compact_comment": "threshold is a fraction of the DETECTED window (0.30 = ~300k on a 1M model), deliberately aggressive relative to the 70% advisory nudge in context-baggage.py; both are live and independent. max_fires_per_session caps the once-per-crossing loop bound so a session oscillating around the threshold cannot re-fire indefinitely.",
-  "self_compact": {
-    "threshold": 0.3,
-    "max_fires_per_session": 3
+    "permission_ledger": true
   },
   "categories": {
     "productivity": true,

@@ -345,30 +345,40 @@ from producing `final.json`.
 | `scripts/idle-handoff.sh` | synchronous | it reads `modes.mission.status` immediately after |
 | `~/.claude/self-compact-trigger.py` (`Stop` hook) | `REFLECT_ASYNC=1 REFLECT_FORCE=1` | same hook-cap reason, and a threshold crossing must produce a handoff describing the state *at* the crossing — an earlier `complete` mission for the session would otherwise leave the resume working from something stale |
 
-The self-compact trigger fires once per session per crossing of
-`self_compact.threshold` (default 30% of the detected context window) and is OFF
-unless `components.self_compact` is boolean `true` in
-`~/.claude/recursive-self-improvement/config/config.json`. It only writes the
-handoff and records a request; `scripts/idle-handoff.sh` performs the
-reset+resume under its own guard chain. Nothing here auto-invokes `/compact` or
-`/clear` — neither is agent-triggerable, and "reset" means the *next* process is
-a fresh one seeded from the handoff.
+The self-compact trigger fires once per session per crossing of **30% of the
+detected context window**. It only writes the handoff and records a request;
+`scripts/idle-handoff.sh` performs the reset+resume under its own guard chain.
+Nothing here auto-invokes `/compact` or `/clear` — neither is agent-triggerable,
+and "reset" means the *next* process is a fresh one seeded from the handoff.
 
-**What the switch does and does not gate.** `components.self_compact` gates the
-CONTEXT trigger — the Stop hook and idle-handoff's widening of its idle floor.
-It does **not** gate autofork itself: with the flag `false`, a session idle for
-`IDLE_HANDOFF_MIN_SECONDS` (45 min) is still resumed by an unattended
-`--permission-mode acceptEdits` fork, exactly as it was before self-compact
-existed. That is pre-existing, sanctioned idle-handoff behaviour; to stop
-autoforking entirely, stop the timer
-(`systemctl --user disable --now claude-idle-handoff.timer`).
+**There is no switch.** USER DECISION 2026-08-16: `components.self_compact` (which
+shipped `false`) and the `SELF_COMPACT_CONFIG` path override are both deleted, with
+no replacement key, env var or opt-in. The threshold (0.30) and the per-session
+fire cap (3) are hardcoded constants — `THRESHOLD` and `MAX_FIRES_PER_SESSION` in
+`self-compact-trigger.py`, and the same 0.30 in `scripts/idle-handoff.sh`. They are
+values, not settings; changing one is a code change with a test run behind it. A
+flag shipping `false` protected nothing, and it left the feature untested in the
+only configuration that matters.
 
-**The threshold is validated at both ends, identically.** A `threshold` that is
-present but not a number in (0, 1] — or a `max_fires_per_session` outside [1, 100]
-— turns the feature OFF and logs why, in `self-compact-trigger.py` *and* in
-`scripts/idle-handoff.sh`. Firing at an unconfigured default is worse than not
-firing, and the two ends silently disagreeing is worse still. An absent key is
-still the documented default (0.30 / 3).
+**What now bounds it**, since a switch no longer does:
+
+| bound | value | where |
+|---|---|---|
+| once per threshold crossing, per session | re-arms below the threshold | `self-compact-trigger.py` state file |
+| fires per session | 3 | `MAX_FIRES_PER_SESSION` |
+| forks per idle-handoff run | 3 | `IDLE_HANDOFF_AUTOFORK_MAX_PER_RUN` |
+| forks per cwd per 24h | 5 | `IDLE_HANDOFF_AUTOFORK_MAX_PER_CWD_24H` |
+| world moved since the transcript | DENY, incl. non-git | `is_stale_since_transcript` |
+| a live claude process in that cwd | abort, rescanned pre-spawn | `is_live_project` |
+| an armed ralph loop in that cwd | skip | `.claude/ralph-loop.local.md` |
+| no handoff of ours resolves | skip | `mission_resolve_ours` |
+| kill switch, if one is ever needed | `systemctl --user disable --now claude-idle-handoff.timer` | the deployed timer |
+
+The trigger never gated autofork itself, and still does not: a session idle for
+`IDLE_HANDOFF_MIN_SECONDS` (45 min) has been resumed by an unattended
+`--permission-mode acceptEdits` fork since before self-compact existed. What the
+context path changes is *when* a session becomes fork-eligible — at a threshold
+crossing rather than only after the 45-minute floor.
 
 **A reading with an unknown context window cannot spend money.** `context_usage.py`
 reports `window_known: false` when the model family is in neither of its prefix

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Stop hook: self-compact threshold trigger.
 
-At a configurable fraction of the DETECTED context window (default 30%, i.e.
-~300k on a 1M model) this writes a durable mission handoff and records a
-self-compact *request*. `scripts/idle-handoff.sh` consumes the request and does
-the reset+resume with its existing guard chain (fork ledger, per-cwd 24h budget,
-staleness DENY-when-uncheckable, live-cwd collision abort, ralph collision).
+At 30% of the DETECTED context window (~300k on a 1M model) this writes a durable
+mission handoff and records a self-compact *request*. `scripts/idle-handoff.sh`
+consumes the request and does the reset+resume with its existing guard chain (fork
+ledger, per-cwd 24h budget, staleness DENY-when-uncheckable, live-cwd collision
+abort, ralph collision).
 
 WHY `Stop`
     Stop is the only hook event that recurs WITHOUT a human turn, and autonomy
@@ -34,21 +34,32 @@ WHAT "RESET" MEANS HERE
     never truncated; this hook only makes the handoff exist while the cache is
     still warm, so the resume is cheap whenever it happens.
 
-RUNTIME SWITCH (off by default; expensive fails off)
-    ~/.claude/recursive-self-improvement/config/config.json
-        {"components": {"self_compact": true},
-         "self_compact": {"threshold": 0.30, "max_fires_per_session": 3}}
-    Absent file, malformed JSON, missing key, `false`, or any non-boolean value
-    (including the string "true") all read as OFF. Enabling is a one-key edit;
-    no redeploy, no rebuild.
+NO SWITCH — USER DECISION 2026-08-16
+    This used to be gated on `components.self_compact` in the RSI config, off by
+    default. That key is deleted and there is no replacement: no config key, no
+    env var, no opt-in. Crossing the threshold writes a handoff, full stop.
+
+    What bounds it is not a switch, it is the guard chain that was already there
+    and is enumerated above — plus the loop bound below. A flag that ships `false`
+    protects nothing: it makes the feature untested in the only configuration that
+    matters, and it is the operator, not the code, who then has to be careful. If
+    this is not safe to run unconditionally, the correct fix is to make it safe,
+    not to hide it behind a key. Do not add one back.
+
+    Note what firing does and does not cost. The handoff write is a haiku call
+    (~$0.01-0.03, prefix cached). The expensive part is the opus-5 resume, and that
+    is idle-handoff's pre-existing autofork: this trigger only makes a session
+    fork-ELIGIBLE sooner than the 45-minute idle floor would. The per-run (3) and
+    per-cwd-24h (5) fork budgets, the staleness DENY, and the live-cwd abort all
+    still decide whether anything actually spawns.
 
 LOOP BOUND (B6)
     Once per session per threshold crossing, persisted in
     $REFLECT_ROOT/self-compact-state/<sid>.state.json. A reading below the
-    threshold re-arms; only an armed session can fire; `max_fires_per_session`
-    caps pathological oscillation. State is written BEFORE the model call, and
-    if the state file cannot be written the hook does not fire at all — an
-    unbounded trigger is worse than a missing one.
+    threshold re-arms; only an armed session can fire; MAX_FIRES_PER_SESSION caps
+    pathological oscillation. State is written BEFORE the model call, and if the
+    state file cannot be written the hook does not fire at all — an unbounded
+    trigger is worse than a missing one.
 """
 from __future__ import annotations
 
@@ -63,8 +74,23 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import context_usage  # noqa: E402  (path shim must precede the import)
 
-DEFAULT_THRESHOLD = 0.30
-DEFAULT_MAX_FIRES = 3
+# --- Fixed values, not settings ----------------------------------------------
+# Fire at 30% of the DETECTED context window — ~300k tokens on a 1M model, ~60k on
+# a 200k one. Deliberately aggressive relative to the 70% advisory nudge in
+# context-baggage.py (both are live and independent): the point is to hand off
+# while there is still ample runway, not at the ~92% auto-compact cliff.
+#
+# Hardcoded, and NOT readable from config. It was a config key; that key is gone
+# along with the on/off switch it lived beside. Changing this number is a code
+# change with a test run behind it, which is the correct amount of friction for a
+# value that decides when a machine spends usage.
+THRESHOLD = 0.30
+
+# Ceiling on fires per session, for a session that oscillates across the
+# threshold: each crossing re-arms (see LOOP BOUND above), so without a cap a
+# session hovering at 30% could fire indefinitely. Three is enough for a long
+# session that legitimately crosses, sheds context, and crosses again.
+MAX_FIRES_PER_SESSION = 3
 # Same charset reflect.sh validates: these ids become path components.
 SID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 # Retention for state/request records. ~590 sessions/week would otherwise
@@ -112,71 +138,6 @@ def log(msg: str) -> None:
             f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {msg}\n")
     except Exception:
         pass
-
-
-class Config:
-    __slots__ = ("threshold", "max_fires")
-
-    def __init__(self, threshold: float, max_fires: int):
-        self.threshold = threshold
-        self.max_fires = max_fires
-
-
-def load_config() -> Config | None:
-    """None means OFF. Absent, malformed, or non-boolean-true all mean OFF."""
-    path = claude_dir() / "recursive-self-improvement" / "config" / "config.json"
-    try:
-        cfg = json.loads(path.read_text())
-    except Exception:
-        return None
-    if not isinstance(cfg, dict):
-        return None
-    components = cfg.get("components")
-    if not isinstance(components, dict):
-        return None
-    # `is not True` on purpose: "true", 1 and "on" are NOT an opt-in to
-    # something that spends money.
-    if components.get("self_compact") is not True:
-        return None
-
-    block = cfg.get("self_compact")
-    if not isinstance(block, dict):
-        block = {}
-
-    # An ill-typed or out-of-range threshold used to fall back to 0.30 in
-    # SILENCE, so the trigger fired at a value the operator did not configure
-    # (`"0.5"` as a string, 50 meaning percent, 0, -1). The consumer,
-    # scripts/idle-handoff.sh, substituted its own 0.30 by a different route, so
-    # producer and consumer could disagree with no log line anywhere.
-    #
-    # Both ends now REFUSE: a threshold that is present but unusable turns the
-    # feature OFF and says why. Absent is still the documented default — that is
-    # a choice not to configure it, not a misconfiguration.
-    threshold = DEFAULT_THRESHOLD
-    if "threshold" in block:
-        raw = block["threshold"]
-        if isinstance(raw, (int, float)) and not isinstance(raw, bool) and 0 < raw <= 1:
-            threshold = float(raw)
-        else:
-            log(f"config REFUSED: self_compact.threshold={raw!r} "
-                f"({type(raw).__name__}) is not a number in (0, 1]; "
-                f"self-compact stays OFF rather than firing at an unconfigured "
-                f"{DEFAULT_THRESHOLD}. Fix {path}.")
-            return None
-
-    max_fires = DEFAULT_MAX_FIRES
-    if "max_fires_per_session" in block:
-        raw = block["max_fires_per_session"]
-        if isinstance(raw, int) and not isinstance(raw, bool) and 1 <= raw <= 100:
-            max_fires = raw
-        else:
-            log(f"config REFUSED: self_compact.max_fires_per_session={raw!r} "
-                f"({type(raw).__name__}) is not an int in [1, 100]; "
-                f"self-compact stays OFF rather than firing with an "
-                f"unconfigured loop bound. Fix {path}.")
-            return None
-
-    return Config(threshold, max_fires)
 
 
 def load_state(sid: str) -> dict:
@@ -295,10 +256,6 @@ def main() -> int:
     if not cwd or not os.path.isdir(cwd):
         return 0
 
-    cfg = load_config()
-    if cfg is None:
-        return 0
-
     occ = context_usage.occupancy(transcript)
     if occ is None:
         return 0
@@ -322,7 +279,7 @@ def main() -> int:
 
     state = load_state(sid)
 
-    if occ.fill_pct < cfg.threshold:
+    if occ.fill_pct < THRESHOLD:
         if not state.get("armed"):
             state["armed"] = True
             state["rearmed_at"] = int(time.time())
@@ -331,11 +288,11 @@ def main() -> int:
 
     if not state.get("armed"):
         return 0  # already fired for this crossing
-    if state.get("fires", 0) >= cfg.max_fires:
+    if state.get("fires", 0) >= MAX_FIRES_PER_SESSION:
         if not state.get("capped"):
             state["capped"] = True
             write_json_atomic(state_dir() / f"{sid}.state.json", state)
-            log(f"sid={sid} capped at {cfg.max_fires} fires this session; not firing")
+            log(f"sid={sid} capped at {MAX_FIRES_PER_SESSION} fires this session; not firing")
         return 0
 
     now = int(time.time())
@@ -345,7 +302,7 @@ def main() -> int:
     state["last_fired_at"] = now
     state["last_fill_pct"] = occ.fill_pct
     state["window"] = occ.window
-    state["threshold"] = cfg.threshold
+    state["threshold"] = THRESHOLD
 
     # Persist the bound BEFORE spending anything. If this write fails we do not
     # fire: an unbounded trigger is worse than a missing one.
@@ -360,7 +317,7 @@ def main() -> int:
         "tokens": occ.total_tokens,
         "window": occ.window,
         "fill_pct": occ.fill_pct,
-        "threshold": cfg.threshold,
+        "threshold": THRESHOLD,
         "model": occ.model,
         "crossing": state["crossings"],
         "requested_at_epoch": now,
@@ -375,7 +332,7 @@ def main() -> int:
         result = f"reflect_sh_missing:{reflect_sh}"
     log(f"sid={sid} FIRE crossing={state['crossings']} "
         f"tokens={occ.total_tokens}/{occ.window} "
-        f"fill={occ.fill_pct:.3f} threshold={cfg.threshold} cwd={cwd} mission={result}")
+        f"fill={occ.fill_pct:.3f} threshold={THRESHOLD} cwd={cwd} mission={result}")
     gc_state()
     return 0
 

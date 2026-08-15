@@ -6,10 +6,12 @@
 # TRIGGER (widened 2026-08-15 for self-compact, acceptance criterion B7):
 #   a session is a candidate when it has been idle for IDLE_HANDOFF_MIN_SECONDS
 #   **OR** when self-compact-trigger.py has recorded a verified context request
-#   for it (context >= self_compact.threshold of the detected window). The
-#   context path inherits this script's entire guard chain — fork ledger,
-#   per-cwd 24h budget, staleness DENY-when-uncheckable, live-cwd collision
-#   abort, ralph collision — rather than rebuilding any of it.
+#   for it (context >= 30% of the detected window; the threshold is a hardcoded
+#   constant at both ends, not a setting). The context path inherits this script's
+#   entire guard chain — fork ledger, per-cwd 24h budget, staleness
+#   DENY-when-uncheckable, live-cwd collision abort, ralph collision — rather than
+#   rebuilding any of it. Those guards, not a switch, are what bound it: there is
+#   no on/off key for this path (USER DECISION 2026-08-16).
 #
 #   No nixos change was needed for this: the timer fires unconditionally every
 #   5 min and this SCRIPT decides whether to act (see the unit declaration in
@@ -82,7 +84,6 @@ fi
 # Self-compact (B7). Same REFLECT_ROOT both sides derive from, so the producer
 # (self-compact-trigger.py) and this consumer agree without extra coupling.
 : "${SELF_COMPACT_STATE_DIR:=$REFLECT_ROOT/self-compact-state}"
-: "${SELF_COMPACT_CONFIG:=$HOME/.claude/recursive-self-improvement/config/config.json}"
 : "${SELF_COMPACT_HELPER:=$HOME/.claude/context_usage.py}"
 : "${SELF_COMPACT_REQUEST_MAX_AGE_SECONDS:=$((24*60*60))}"
 # Note: no in-script kill flag. Use `systemctl --user stop
@@ -155,70 +156,20 @@ is_valid_sid() {
 }
 
 # ---- Self-compact context trigger (B7) --------------------------------------
-# The runtime switch is the SAME one the producing hook reads, so turning the
-# feature off makes any markers already on disk inert here too. Absent,
-# malformed, or any non-boolean-true value reads as OFF: the resume runs
-# opus-5, so it must fail off.
-self_compact_enabled() {
-  [[ -f "$SELF_COMPACT_CONFIG" ]] || return 1
-  local v
-  v=$(jq -r 'if (.components.self_compact == true) then "on" else "off" end' \
-        "$SELF_COMPACT_CONFIG" 2>/dev/null) || return 1
-  [[ "$v" == "on" ]]
-}
-
-# Prints the configured threshold, or the sentinel `default` (key absent — a
-# choice not to configure it) or `invalid` (present but unusable).
+# NO SWITCH. USER DECISION 2026-08-16: `components.self_compact` — the config key
+# that gated this whole path, shipped `false` — is deleted, along with the
+# SELF_COMPACT_CONFIG path override. There is no replacement key, env var or
+# opt-in. What bounds this path is the guard chain that was already here: fork
+# ledger, per-run and per-cwd-24h fork budgets, staleness DENY-when-uncheckable,
+# live-cwd collision abort, ralph collision, and the producer's own per-session
+# loop bound. A flag shipping `false` protected nothing; it only meant the feature
+# was never exercised in the configuration that matters.
 #
-# Both sentinels exist because silently substituting 0.30 is what made producer
-# and consumer disagree with no log line. Two separate ways that happened:
-#   * an ill-typed value (`"0.5"`, 50, 0, null) fell back to 0.30 here while
-#     self-compact-trigger.py fell back to 0.30 by its own route — and now
-#     refuses outright, so this side must refuse too;
-#   * jq prints small numbers in EXPONENT form (0.00001 -> `1e-05`), which the
-#     old `^[0-9]*\.?[0-9]+$` regex rejected, silently replacing a configured
-#     threshold with 0.30. awk (which does the comparison) parses `1e-05` fine,
-#     so the exponent form is accepted here rather than discarded.
-# The type/range test mirrors self-compact-trigger.py:load_config exactly.
-self_compact_threshold() {
-  local t
-  t=$(jq -r '
-        if (.self_compact | type) != "object" then "default"
-        elif (.self_compact | has("threshold") | not) then "default"
-        elif ((.self_compact.threshold | type) == "number"
-              and .self_compact.threshold > 0
-              and .self_compact.threshold <= 1) then (.self_compact.threshold | tostring)
-        else "invalid" end' "$SELF_COMPACT_CONFIG" 2>/dev/null) \
-    || { printf 'invalid'; return; }
-  case "$t" in
-    default|invalid) printf '%s' "$t"; return ;;
-  esac
-  if [[ "$t" =~ ^[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?$ ]]; then
-    printf '%s' "$t"
-  else
-    printf 'invalid'
-  fi
-}
-
-SELF_COMPACT_ON=0
+# The threshold is a VALUE, not a setting: hardcoded here and hardcoded in
+# self-compact-trigger.py (THRESHOLD = 0.30), the two deliberately identical.
+# It used to be config-readable at both ends by two different code paths, which is
+# how they came to disagree in silence. One number, changed in code, tested.
 SELF_COMPACT_THRESHOLD="0.30"
-if self_compact_enabled; then
-  sc_thr="$(self_compact_threshold)"
-  case "$sc_thr" in
-    default)
-      SELF_COMPACT_ON=1
-      ;;
-    invalid)
-      msg="config error: self_compact.threshold in $SELF_COMPACT_CONFIG is not a number in (0,1]; self-compact stays OFF here, matching self-compact-trigger.py which refuses to fire on it. Pending request markers are inert until it is fixed."
-      log "$msg"
-      printf '%s\n' "$msg" >&2   # systemd journal sees it
-      ;;
-    *)
-      SELF_COMPACT_ON=1
-      SELF_COMPACT_THRESHOLD="$sc_thr"
-      ;;
-  esac
-fi
 
 # A request marker is a NOTIFICATION, never authority. It says "this session
 # crossed the threshold"; we re-measure the transcript here before widening the
@@ -228,7 +179,6 @@ fi
 # than hand over a byte-count estimate.
 context_request_pending() {
   local sid="$1" transcript="$2"
-  (( SELF_COMPACT_ON == 1 )) || return 1
   is_valid_sid "$sid" || return 1
   local req="$SELF_COMPACT_STATE_DIR/${sid}.request.json"
   [[ -f "$req" ]] || return 1
@@ -1104,4 +1054,4 @@ PROMPT
   count_forked=$((count_forked + 1))
 done
 
-log "seen=$count_seen wrote=$count_wrote forked=$count_forked context_triggered=$count_context_trigger self_compact=$( (( SELF_COMPACT_ON == 1 )) && printf "on(>=%s)" "$SELF_COMPACT_THRESHOLD" || printf off ) skipped(live=$count_skipped_live live_rescan=$count_skipped_live_rescan sdk-cli_or_unknown=$count_skipped_sdk_cli short=$count_skipped_short backoff=$count_skipped_backoff fresh=$count_skipped_fresh_mission no_cwd=$count_skipped_no_cwd stale=$count_skipped_stale observer=$count_skipped_observer no_next=$count_skipped_no_next ralph=$count_skipped_ralph git_stale=$count_skipped_git_stale fork_budget=$count_skipped_fork_budget mission_err=$count_mission_status_error mission_not_ours=$count_skipped_mission_not_ours mission_resolve_err=$count_mission_resolve_error)"
+log "seen=$count_seen wrote=$count_wrote forked=$count_forked context_triggered=$count_context_trigger self_compact=on(>=$SELF_COMPACT_THRESHOLD) skipped(live=$count_skipped_live live_rescan=$count_skipped_live_rescan sdk-cli_or_unknown=$count_skipped_sdk_cli short=$count_skipped_short backoff=$count_skipped_backoff fresh=$count_skipped_fresh_mission no_cwd=$count_skipped_no_cwd stale=$count_skipped_stale observer=$count_skipped_observer no_next=$count_skipped_no_next ralph=$count_skipped_ralph git_stale=$count_skipped_git_stale fork_budget=$count_skipped_fork_budget mission_err=$count_mission_status_error mission_not_ours=$count_skipped_mission_not_ours mission_resolve_err=$count_mission_resolve_error)"

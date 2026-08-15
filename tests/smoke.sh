@@ -2058,20 +2058,21 @@ sc_home() {
   printf '%s' "$h"
 }
 
-sc_write_config() {
-  # $1=home  $2=on|off|absent|malformed|nokey  [$3=threshold] [$4=max_fires]
-  local h="$1" mode="$2" thr="${3:-0.30}" maxf="${4:-3}"
+# There is deliberately NO sc_write_config helper any more. It existed to flip
+# `components.self_compact` and set `self_compact.threshold`; both are deleted
+# (USER DECISION 2026-08-16), so a test that wants the trigger to fire does
+# nothing to enable it — that is the assertion, and TEST 21 pins it.
+sc_write_rsi_config() {
+  # $1=home  $2=absent|malformed|nokey|normal
+  # Shapes the RSI config file WITHOUT any self-compact key, so a test can prove
+  # the trigger does not care what this file says (or whether it exists).
+  local h="$1" mode="${2:-normal}"
   local cfg="$h/.claude/recursive-self-improvement/config/config.json"
   case "$mode" in
     absent)    rm -f "$cfg" ;;
     malformed) printf '{ "components": {' > "$cfg" ;;
     nokey)     printf '{"components":{"daily_review":false}}\n' > "$cfg" ;;
-    *)
-      local on=false
-      [[ "$mode" == "on" ]] && on=true
-      jq -n --argjson on "$on" --argjson t "$thr" --argjson m "$maxf" \
-        '{components:{daily_review:false,self_compact:$on},
-          self_compact:{threshold:$t,max_fires_per_session:$m}}' > "$cfg" ;;
+    *)         printf '{"components":{"daily_review":false,"auto_research":false,"permission_ledger":true}}\n' > "$cfg" ;;
   esac
 }
 
@@ -2199,13 +2200,46 @@ B1_OUT31="$(jq -cn --arg tp "$B1_DIR/t1.jsonl" '{transcript_path:$tp}' \
 info "one occupancy implementation; 1M/[1m]/observed/estimate all correct; 70% nudge intact"
 
 # ============================================================================
-# TEST 21: B5 — ships OFF; absent or malformed config reads as OFF
+# TEST 21: there is NO SWITCH, and no config file can turn the feature off
 # ============================================================================
-echo "TEST 21: B5 — off by default, fails off, one-key enable"
+# Replaces the old "ships OFF behind components.self_compact" test. USER DECISION
+# 2026-08-16: that key and the SELF_COMPACT_CONFIG override are deleted, with no
+# replacement. A flag shipping `false` protected nothing — it meant the only
+# configuration ever exercised was the one nobody runs. What bounds this path is
+# the guard chain (TEST 23 for the loop bound, TEST 24-26 for the fork guards).
+#
+# So the assertion inverts: the trigger must fire with the config ABSENT,
+# MALFORMED, or present-and-saying-nothing-about-it, and no key must be able to
+# stop it. If someone re-adds a switch, every case below goes red.
+echo "TEST 21: no switch — the trigger does not consult any config to decide whether to run"
 [[ -f "$SC_TRIGGER" ]] || fail "21: trigger missing at $SC_TRIGGER"
-jq -e '.components.self_compact == false' \
-  "$WORKTREE/recursive-self-improvement/config/config.json" >/dev/null \
-  || fail "21: shipped config must carry components.self_compact = false"
+
+# Structural: the key is gone from the shipped config, and neither end reads it.
+if jq -e 'has("self_compact") or (.components | has("self_compact"))' \
+     "$WORKTREE/recursive-self-improvement/config/config.json" >/dev/null; then
+  fail "21: the shipped config still carries a self_compact key — the switch is back"
+fi
+# The producer must not open the RSI config at all — that file is where the switch
+# lived, so "does it still read it" is the precise question. (Prose in the module
+# docstring explaining the deleted key is fine and deliberate.)
+if grep -q 'recursive-self-improvement' "$SC_TRIGGER"; then
+  fail "21: self-compact-trigger.py still reads the RSI config file — the switch has a home again"
+fi
+if grep -q 'def load_config' "$SC_TRIGGER"; then
+  fail "21: self-compact-trigger.py still has a load_config()"
+fi
+# The consumer must not carry the config-path override outside comments.
+if grep -nE 'SELF_COMPACT_CONFIG' "$WORKTREE/scripts/idle-handoff.sh" \
+     | grep -qvE '^[0-9]+:[[:space:]]*#'; then
+  fail "21: idle-handoff.sh still uses SELF_COMPACT_CONFIG outside a comment: $(grep -nE 'SELF_COMPACT_CONFIG' "$WORKTREE/scripts/idle-handoff.sh" | grep -vE '^[0-9]+:[[:space:]]*#')"
+fi
+if grep -qE '^[^#]*components\.self_compact' "$WORKTREE/scripts/idle-handoff.sh"; then
+  fail "21: idle-handoff.sh still reads components.self_compact"
+fi
+grep -qE '^THRESHOLD = 0\.30$' "$SC_TRIGGER" \
+  || fail "21: the threshold is not a hardcoded module constant in $SC_TRIGGER"
+grep -qE '^MAX_FIRES_PER_SESSION = [0-9]+$' "$SC_TRIGGER" \
+  || fail "21: the per-session fire cap is not a hardcoded module constant"
 
 B5_H="$(sc_home)"
 B5_CWD="$(mktemp -d -t reflect-b5cwd-XXXXXX)"
@@ -2213,36 +2247,45 @@ assert_isolated_cwd "$B5_CWD"
 mk_context_transcript "$B5_H/t.jsonl" "claude-opus-5" 400000 "$B5_CWD"
 counting_stub "$B5_H/calls" "$SC_MISSION_FILE"
 
-for mode in absent malformed nokey off; do
-  sc_write_config "$B5_H" "$mode"
+# Behavioural: every config shape that used to mean OFF must now fire.
+for mode in absent malformed nokey normal; do
+  sc_write_rsi_config "$B5_H" "$mode"
   B5_SID="test-sid-b5-$mode"
   B5_OUT="$(sc_fire "$B5_H" "$B5_SID" "$B5_CWD" "$B5_H/t.jsonl")"
   rc=$?
   (( rc == 0 )) || fail "21: config=$mode must exit 0 (got $rc)"
-  [[ -z "$B5_OUT" ]] || fail "21: config=$mode produced stdout: $B5_OUT"
-  sleep 0.5
-  [[ ! -e "$SC_STATE_DIR/$B5_SID.request.json" ]] \
-    || fail "21: config=$mode still requested a self-compact"
-  [[ ! -e "$B5_CWD/tasks" ]] \
-    || fail "21: config=$mode still wrote a handoff into the project"
+  [[ -z "$B5_OUT" ]] || fail "21: config=$mode produced stdout: $B5_OUT (a Stop hook must stay silent)"
+  for _ in $(seq 1 40); do
+    [[ -e "$SC_STATE_DIR/$B5_SID.request.json" ]] && break
+    sleep 0.25
+  done
+  [[ -e "$SC_STATE_DIR/$B5_SID.request.json" ]] \
+    || fail "21: config=$mode suppressed the trigger — no config shape may act as an off switch"
+  jq -e '.threshold == 0.30' "$SC_STATE_DIR/$B5_SID.request.json" >/dev/null \
+    || fail "21: config=$mode changed the recorded threshold ($(jq -r .threshold "$SC_STATE_DIR/$B5_SID.request.json"))"
 done
-[[ ! -s "$B5_H/calls" ]] || fail "21: a disabled trigger spent model calls ($(wc -l <"$B5_H/calls"))"
 
-# A non-boolean truthy value must NOT enable it — expensive fails off.
-jq -n '{components:{self_compact:"true"},self_compact:{threshold:0.30}}' \
+# ...including a config that tries to say `false` explicitly. There is nothing to
+# say it to; the key is not read.
+printf '%s\n' '{"components":{"self_compact":false},"self_compact":{"threshold":0.99}}' \
   > "$B5_H/.claude/recursive-self-improvement/config/config.json"
-sc_fire "$B5_H" "test-sid-b5-stringtrue" "$B5_CWD" "$B5_H/t.jsonl" >/dev/null
-sleep 0.5
-[[ ! -e "$SC_STATE_DIR/test-sid-b5-stringtrue.request.json" ]] \
-  || fail "21: components.self_compact=\"true\" (string) enabled the trigger"
-info "absent/malformed/missing-key/false/string-true all read as OFF; no model calls"
+sc_fire "$B5_H" "test-sid-b5-explicit-false" "$B5_CWD" "$B5_H/t.jsonl" >/dev/null \
+  || fail "21: trigger rc!=0 with a stale self_compact key present"
+for _ in $(seq 1 40); do
+  [[ -e "$SC_STATE_DIR/test-sid-b5-explicit-false.request.json" ]] && break
+  sleep 0.25
+done
+[[ -e "$SC_STATE_DIR/test-sid-b5-explicit-false.request.json" ]] \
+  || fail "21: the trigger did not fire with a leftover self_compact block present — something in that block is still being read (the false switch, or the 0.99 threshold)"
+jq -e '.threshold == 0.30' "$SC_STATE_DIR/test-sid-b5-explicit-false.request.json" >/dev/null \
+  || fail "21: a leftover self_compact.threshold=0.99 was honoured — the threshold is still config-readable"
+info "no config shape (absent/malformed/nokey/normal/explicit-false) can disable it or move the threshold"
 
 # ============================================================================
 # TEST 22: B1+B2 — fires at the threshold and leaves a resumable handoff
 # ============================================================================
 echo "TEST 22: B1+B2 — fires at 30%, handoff has done/next/blocked/open questions"
 B2_H="$(sc_home)"
-sc_write_config "$B2_H" on 0.30
 B2_CWD="$(mktemp -d -t reflect-b2cwd-XXXXXX)"
 assert_isolated_cwd "$B2_CWD"
 counting_stub "$B2_H/calls" "$SC_MISSION_FILE"
@@ -2312,7 +2355,6 @@ info "reflection subprocess and sdk-cli entrypoints refuse to fire"
 # ============================================================================
 echo "TEST 23: B6 — once per session per crossing, capped, persisted"
 B6_H="$(sc_home)"
-sc_write_config "$B6_H" on 0.30 2      # max_fires_per_session = 2
 B6_CWD="$(mktemp -d -t reflect-b6cwd-XXXXXX)"
 assert_isolated_cwd "$B6_CWD"
 B6_CALLS="$B6_H/calls"
@@ -2345,24 +2387,33 @@ jq -e '.armed == true and .fires == 1' "$SC_STATE_DIR/$B6_SID.state.json" >/dev/
   || fail "23: a below-threshold reading must re-arm: $(cat "$SC_STATE_DIR/$B6_SID.state.json")"
 (( $(sc_calls) == 1 )) || fail "23: re-arming spent a model call"
 
-# Second crossing fires; then the per-session cap holds.
-mk_context_transcript "$B6_TP" "claude-opus-5" 350000 "$B6_CWD"
-sc_fire "$B6_H" "$B6_SID" "$B6_CWD" "$B6_TP" >/dev/null || fail "23: second crossing rc!=0"
-for _ in $(seq 1 40); do (( $(sc_calls) >= 2 )) && break; sleep 0.25; done
-(( $(sc_calls) == 2 )) || fail "23: second crossing did not fire (calls=$(sc_calls))"
-mk_context_transcript "$B6_TP" "claude-opus-5" 90000 "$B6_CWD"
-sc_fire "$B6_H" "$B6_SID" "$B6_CWD" "$B6_TP" >/dev/null
+# Crossings 2..CAP each fire; the one after that is refused. The cap is read from
+# the SOURCE, not chosen by the test: it used to be settable per-test through
+# `self_compact.max_fires_per_session`, and that config key is deleted along with
+# the switch. The bound is now a constant, so the test tracks the constant.
+B6_CAP="$(grep -oP '^MAX_FIRES_PER_SESSION = \K[0-9]+' "$SC_TRIGGER")"
+[[ "$B6_CAP" =~ ^[0-9]+$ ]] || fail "23: no hardcoded MAX_FIRES_PER_SESSION in $SC_TRIGGER"
+(( B6_CAP >= 2 )) || fail "23: this test needs a cap of at least 2 (got $B6_CAP)"
+for (( b6_n = 2; b6_n <= B6_CAP; b6_n++ )); do
+  mk_context_transcript "$B6_TP" "claude-opus-5" 350000 "$B6_CWD"
+  sc_fire "$B6_H" "$B6_SID" "$B6_CWD" "$B6_TP" >/dev/null || fail "23: crossing $b6_n rc!=0"
+  for _ in $(seq 1 40); do (( $(sc_calls) >= b6_n )) && break; sleep 0.25; done
+  (( $(sc_calls) == b6_n )) || fail "23: crossing $b6_n did not fire exactly once (calls=$(sc_calls))"
+  # Drop below the threshold to re-arm for the next crossing.
+  mk_context_transcript "$B6_TP" "claude-opus-5" 90000 "$B6_CWD"
+  sc_fire "$B6_H" "$B6_SID" "$B6_CWD" "$B6_TP" >/dev/null || fail "23: re-arm $b6_n rc!=0"
+done
 mk_context_transcript "$B6_TP" "claude-opus-5" 360000 "$B6_CWD"
 sc_fire "$B6_H" "$B6_SID" "$B6_CWD" "$B6_TP" >/dev/null || fail "23: capped fire rc!=0"
 sleep 1.5
-(( $(sc_calls) == 2 )) \
-  || fail "23: per-session cap (2) breached — calls=$(sc_calls)"
-jq -e '.capped == true and .fires == 2' "$SC_STATE_DIR/$B6_SID.state.json" >/dev/null \
+(( $(sc_calls) == B6_CAP )) \
+  || fail "23: per-session cap ($B6_CAP) breached — calls=$(sc_calls)"
+jq -e --argjson c "$B6_CAP" '.capped == true and .fires == $c' \
+  "$SC_STATE_DIR/$B6_SID.state.json" >/dev/null \
   || fail "23: cap not recorded: $(cat "$SC_STATE_DIR/$B6_SID.state.json")"
 
 # An unwritable state dir must fail OFF: no marker = no bound = no fire.
 B6_RO_H="$(sc_home)"
-sc_write_config "$B6_RO_H" on 0.30
 B6_RO_ROOT="$(mktemp -d -t reflect-b6ro-XXXXXX)"
 mkdir -p "$B6_RO_ROOT/self-compact-state"
 chmod 500 "$B6_RO_ROOT/self-compact-state"
@@ -2378,7 +2429,7 @@ sleep 0.5
 [[ ! -s "$B6_RO_CALLS" ]] \
   || fail "23: fired without being able to persist the loop bound"
 chmod 700 "$B6_RO_ROOT/self-compact-state"
-info "1 call per crossing, re-arm below threshold, cap at 2, fails off without a marker"
+info "1 call per crossing, re-arm below threshold, cap at $B6_CAP (the constant), fails off without a marker"
 
 # ============================================================================
 # TEST 24: B7+B4 — idle-handoff resumes on context, and starts WORKING
@@ -2389,7 +2440,6 @@ info "1 call per crossing, re-arm below threshold, cap at 2, fails off without a
 # B4: the spawned process must begin executing ## Next, not ask what to do.
 echo "TEST 24: B7+B4 — context-triggered resume through idle-handoff, non-interactive"
 B7_H="$(sc_home)"
-sc_write_config "$B7_H" on 0.30
 B7_ARGV="$B7_H/autofork-argv.txt"
 
 # Candidate project: a clean git repo whose HEAD *and* tracked-file mtimes
@@ -2499,17 +2549,24 @@ grep -q "AUTOFORK sid=$B7_CTRL_SID" "$B7_LOG" \
   || fail "24: consumed request not retained for audit"
 info "context-triggered fork at 2 min idle; control untouched; prompt is non-interactive"
 
-# The consumer honours the same switch: OFF means a marker is inert.
+# What replaced the "switch off makes markers inert" case: the marker is a
+# NOTIFICATION, and the consumer re-measures the transcript before honouring it.
+# That, not a config key, is what makes a stale or planted marker worthless — and
+# it is the bound that still exists now the switch is gone.
 : > "$B7_ARGV"
-sc_write_config "$B7_H" off
 cp "$SC_STATE_DIR/$B7_SID.consumed.json" "$SC_STATE_DIR/$B7_SID.request.json"
+# Rewrite the transcript BELOW the threshold: same marker, same idleness.
+mk_context_transcript "$B7_TP" "claude-opus-5" 90000 "$B7_CWD" 25
 touch -d '2 minutes ago' "$B7_TP"
+B7_LINES="$(wc -l < "$B7_LOG")"
 HOME="$B7_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
-  || fail "24: idle-handoff.sh rc!=0 with the switch off"
+  || fail "24: idle-handoff.sh rc!=0 re-measuring a superseded request"
 sleep 1
 [[ ! -s "$B7_ARGV" ]] \
-  || fail "24: switch OFF but a pending marker still drove a fork ($(cat "$B7_ARGV"))"
-info "switch off: pending request markers are inert at the consumer too"
+  || fail "24: a marker whose transcript no longer crosses the threshold still drove a fork ($(cat "$B7_ARGV"))"
+tail -n +$((B7_LINES + 1)) "$B7_LOG" | grep -q 'request claimed a crossing but transcript now reads' \
+  || fail "24: the superseded marker was not re-verified against the transcript (log: $(tail -n +$((B7_LINES + 1)) "$B7_LOG" | tail -3))"
+info "a marker is a notification: re-measured against the transcript, a superseded one buys nothing"
 
 # Restore canonical stub.
 cat >"$STUB_SCRATCH/claude" <<'STUB'
@@ -2586,7 +2643,6 @@ FOREIGN
 # repo write could rewrite ## Next and keep the old check satisfied. Now the copy's
 # body cannot matter, because nothing opens it.
 B8_H="$(sc_home)"
-sc_write_config "$B8_H" on 0.30
 B8_ARGV="$B8_H/argv.txt"
 B8_CWD="$(mktemp -d -t reflect-b8fgn-XXXXXX)"
 assert_isolated_cwd "$B8_CWD"
@@ -2656,7 +2712,6 @@ bash "$REFLECT_SH" --mission-path "$B8U_CWD" >/dev/null 2>&1 \
 # Integration: foreign pointer, no payload, and the handoff write cannot produce
 # one (model returns nothing) -> no fork, reason on the record.
 B9_H="$(sc_home)"
-sc_write_config "$B9_H" on 0.30
 B9_ARGV="$B9_H/argv.txt"
 B9_CWD="$(mktemp -d -t reflect-b8none-XXXXXX)"
 assert_isolated_cwd "$B9_CWD"
@@ -2703,7 +2758,6 @@ info "no handoff for this project: no fork, reason recorded, foreign file untouc
 # in that project again. Here: five accumulated copies (four of them for sessions
 # that are long gone), tree otherwise clean, must still fork.
 BB_H="$(sc_home)"
-sc_write_config "$BB_H" on 0.30
 BB_ARGV="$BB_H/argv.txt"
 BB_CWD="$(mktemp -d -t reflect-b8accum-XXXXXX)"
 assert_isolated_cwd "$BB_CWD"
@@ -2770,7 +2824,6 @@ echo "TEST 26: D1 — a planted repo file: no fork, and it never reaches a model
 # Committed on purpose: porcelain has nothing to say, so resolution is the only
 # thing between the attacker's `## Next` and an unattended acceptEdits fork.
 F1_H="$(sc_home)"
-sc_write_config "$F1_H" on 0.30
 F1_ARGV="$F1_H/argv.txt"
 F1_CWD="$(mktemp -d -t reflect-f1plant-XXXXXX)"
 assert_isolated_cwd "$F1_CWD"
@@ -2835,7 +2888,6 @@ info "committed planted file: no fork, reason logged, file untouched"
 # attacker must not be able to DoS the feature either — and it must carry our
 # ## Next, never the planted one.
 F1B_H="$(sc_home)"
-sc_write_config "$F1B_H" on 0.30
 F1B_ARGV="$F1B_H/argv.txt"
 F1B_CWD="$(mktemp -d -t reflect-f1hide-XXXXXX)"
 assert_isolated_cwd "$F1B_CWD"
@@ -2930,7 +2982,6 @@ python3 "$SC_USAGE" --fill-pct "$F2_DIR/fable.jsonl" >/dev/null \
 # End to end: the trigger fires on fable-5 and REFUSES on the unknown window,
 # even though 61000/200000 = 30.5% would clear a 30% threshold.
 F2_H="$(sc_home)"
-sc_write_config "$F2_H" on 0.30
 F2_CWD="$(mktemp -d -t reflect-f2cwd-XXXXXX)"
 assert_isolated_cwd "$F2_CWD"
 counting_stub "$F2_H/calls" "$SC_MISSION_FILE"
@@ -3030,7 +3081,6 @@ info "lockfile unopenable/empty/unset: worker exits 0, writes nothing, records w
 # quieter half silently disabled the feature.
 echo "TEST 29: F4 — one truthy semantic for REFLECT_SUBPROCESS across bash and python"
 F4_H="$(sc_home)"
-sc_write_config "$F4_H" on 0.30
 F4_CWD="$(mktemp -d -t reflect-f4cwd-XXXXXX)"
 assert_isolated_cwd "$F4_CWD"
 canonical_stub   # the precompact half parses the reply as reflection JSON
@@ -3122,72 +3172,66 @@ jq -e '.modes.precompact.status == "complete"' \
 info "over-cap override clamped to $(jq -r .max_synchronous_budget_seconds <<<"$F6_OVER")s and logged; garbage resets to 40s; dispatcher still completes"
 
 # ============================================================================
-# TEST 31: F7 — producer and consumer agree about a bad threshold, and about 1e-05
+# TEST 31: ONE threshold, hardcoded at both ends, and they agree
 # ============================================================================
-# Two silent-substitution paths met in the middle: the producer fell back to 0.30
-# for an ill-typed threshold, and the consumer fell back to 0.30 for anything its
-# regex disliked — including jq's EXPONENT form for small numbers (1e-05). Either
-# way the trigger fired at a value the operator never configured, and the two
-# ends could disagree with no log line anywhere.
-echo "TEST 31: F7 — ill-typed threshold refuses at BOTH ends; exponent form is honoured"
+# Replaces the old "an ill-typed config threshold refuses at both ends" test. The
+# threshold was config-readable through two DIFFERENT code paths — a jq expression
+# here, a Python type check there — each with its own silent 0.30 fallback, which
+# is how they came to disagree with no log line anywhere. That whole class is gone
+# with the config key: it is now a constant in both files, and this test pins that
+# they are the SAME constant, and that the number they agree on is the one that
+# actually decides a fire.
+echo "TEST 31: one hardcoded threshold; producer and consumer cannot drift apart"
+F7_PROD_THR="$(grep -oP '^THRESHOLD = \K[0-9.]+' "$SC_TRIGGER")"
+F7_CONS_THR="$(grep -oP '^SELF_COMPACT_THRESHOLD="\K[0-9.]+' "$WORKTREE/scripts/idle-handoff.sh")"
+[[ -n "$F7_PROD_THR" ]] || fail "31: no hardcoded THRESHOLD in $SC_TRIGGER"
+[[ -n "$F7_CONS_THR" ]] || fail "31: no hardcoded SELF_COMPACT_THRESHOLD in idle-handoff.sh"
+awk -v a="$F7_PROD_THR" -v b="$F7_CONS_THR" 'BEGIN{exit !(a+0 == b+0)}' \
+  || fail "31: producer ($F7_PROD_THR) and consumer ($F7_CONS_THR) disagree about the threshold"
+# Neither may read it from a file any more.
+if grep -q 'recursive-self-improvement' "$SC_TRIGGER"; then
+  fail "31: the producer reads the RSI config again — the threshold is config-readable"
+fi
+if grep -qE '^[^#]*jq[^#]*self_compact' "$WORKTREE/scripts/idle-handoff.sh"; then
+  fail "31: the consumer still parses a self_compact config block"
+fi
+
+# Behavioural: the shared number is the one that decides. Just under it -> no
+# request; just over -> a request recording exactly that threshold.
 F7_H="$(sc_home)"
-F7_CFG="$F7_H/.claude/recursive-self-improvement/config/config.json"
 F7_CWD="$(mktemp -d -t reflect-f7cwd-XXXXXX)"
 assert_isolated_cwd "$F7_CWD"
-mk_candidate_repo "$F7_CWD" || fail "31: could not build repo"
-F7_ARGV="$F7_H/argv.txt"
 counting_stub "$F7_H/calls" "$SC_MISSION_FILE"
-F7_SID="test-sid-f7-badthreshold"
-F7_PROJ="$F7_H/.claude/projects/-tmp-f7"
-mkdir -p "$F7_PROJ"
-F7_TP="$F7_PROJ/$F7_SID.jsonl"
-mk_context_transcript "$F7_TP" "claude-opus-5" 330000 "$F7_CWD" 25
-touch -d '2 minutes ago' "$F7_TP"
-mk_mission_handoff "$F7_SID" "$F7_CWD" "$(cat "$SC_MISSION_FILE")" >/dev/null
-sc_plant_request "$F7_SID" "$F7_CWD" "$F7_TP"
-
-# Producer: a string threshold is a misconfiguration, not a default.
-jq -n '{components:{self_compact:true},self_compact:{threshold:"0.5"}}' > "$F7_CFG"
-sc_fire "$F7_H" "test-sid-f7-producer" "$F7_CWD" "$F7_TP" >/dev/null \
-  || fail "31: producer rc!=0 with an ill-typed threshold"
+F7_WINDOW=1000000
+F7_UNDER=$(awk -v t="$F7_PROD_THR" -v w="$F7_WINDOW" 'BEGIN{printf "%d", (t*w)-20000}')
+F7_OVER=$(awk -v t="$F7_PROD_THR" -v w="$F7_WINDOW" 'BEGIN{printf "%d", (t*w)+20000}')
+mk_context_transcript "$F7_H/under.jsonl" "claude-opus-5" "$F7_UNDER" "$F7_CWD" 25
+mk_context_transcript "$F7_H/over.jsonl" "claude-opus-5" "$F7_OVER" "$F7_CWD" 25
+sc_fire "$F7_H" "test-sid-f7-under" "$F7_CWD" "$F7_H/under.jsonl" >/dev/null \
+  || fail "31: producer rc!=0 below the threshold"
 sleep 0.5
-[[ ! -e "$SC_STATE_DIR/test-sid-f7-producer.request.json" ]] \
-  || fail "31: producer fired at an unconfigured 0.30 instead of refusing"
-grep -q 'config REFUSED: self_compact.threshold' "$SC_STATE_DIR/trigger.log" \
-  || fail "31: producer refusal not logged"
-
-# Consumer: same config, same answer — OFF, logged, pending marker inert.
+[[ ! -e "$SC_STATE_DIR/test-sid-f7-under.request.json" ]] \
+  || fail "31: fired at ${F7_UNDER}/${F7_WINDOW}, below the $F7_PROD_THR threshold"
+sc_fire "$F7_H" "test-sid-f7-over" "$F7_CWD" "$F7_H/over.jsonl" >/dev/null \
+  || fail "31: producer rc!=0 above the threshold"
+for _ in $(seq 1 40); do
+  [[ -e "$SC_STATE_DIR/test-sid-f7-over.request.json" ]] && break
+  sleep 0.25
+done
+[[ -e "$SC_STATE_DIR/test-sid-f7-over.request.json" ]] \
+  || fail "31: did not fire at ${F7_OVER}/${F7_WINDOW}, above the $F7_PROD_THR threshold"
+jq -e --argjson t "$F7_PROD_THR" '.threshold == $t' \
+  "$SC_STATE_DIR/test-sid-f7-over.request.json" >/dev/null \
+  || fail "31: the request records a threshold other than the constant ($(jq -r .threshold "$SC_STATE_DIR/test-sid-f7-over.request.json"))"
+# The consumer prints the same number in its run summary, so an operator reading
+# the log sees the threshold actually in force.
 F7_LOG="$REFLECT_ROOT/idle-handoff-logs/handoff.log"
 F7_LINES="$(wc -l < "$F7_LOG")"
-: > "$F7_ARGV"
-combo_stub "$F7_ARGV" "$SC_MISSION_FILE"
 HOME="$F7_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
-  >/dev/null 2>&1 || fail "31: idle-handoff.sh rc!=0 with an ill-typed threshold"
-sleep 0.5
-if sc_forked "$F7_ARGV"; then
-  fail "31: consumer forked using its own substituted 0.30 while the producer refused"
-fi
-F7_TAIL="$(tail -n +$((F7_LINES + 1)) "$F7_LOG")"
-grep -q 'self_compact.threshold' <<<"$F7_TAIL" \
-  || fail "31: consumer did not log the config error (log: $(tail -3 <<<"$F7_TAIL"))"
-grep -q 'self_compact=off' <<<"$F7_TAIL" \
-  || fail "31: consumer stayed ON with an unusable threshold"
-
-# Exponent form: jq renders small numbers in exponent notation (1E-7 on jq 1.8,
-# 1e-07 on jq 1.6), which the old `^[0-9]*\.?[0-9]+$` regex rejected — silently
-# substituting 0.30 for a threshold the operator did configure. awk, which does
-# the actual comparison, parses exponent notation fine.
-jq -n '{components:{self_compact:true},self_compact:{threshold:1e-7}}' > "$F7_CFG"
-F7_EXPECT="$(jq -r '.self_compact.threshold | tostring' "$F7_CFG")"
-[[ "$F7_EXPECT" =~ [eE] ]] \
-  || fail "31: fixture assumption broken — this jq renders the threshold as '$F7_EXPECT', not in exponent form; pick a smaller value so the exponent branch is exercised"
-F7_LINES="$(wc -l < "$F7_LOG")"
-HOME="$F7_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
-  >/dev/null 2>&1 || fail "31: idle-handoff.sh rc!=0 with an exponent threshold"
-F7_TAIL="$(tail -n +$((F7_LINES + 1)) "$F7_LOG")"
-grep -qF "self_compact=on(>=$F7_EXPECT)" <<<"$F7_TAIL" \
-  || fail "31: the configured $F7_EXPECT was replaced by a different threshold (log: $(grep -o 'self_compact=[^ ]*' <<<"$F7_TAIL" | tail -1))"
-info "ill-typed threshold: OFF and logged at producer AND consumer; jq's exponent rendering survives instead of becoming 0.30"
+  >/dev/null 2>&1 || fail "31: idle-handoff.sh rc!=0"
+tail -n +$((F7_LINES + 1)) "$F7_LOG" | grep -qF "self_compact=on(>=$F7_CONS_THR)" \
+  || fail "31: the run summary does not report the threshold in force (line: $(tail -n +$((F7_LINES + 1)) "$F7_LOG" | grep -o 'self_compact=[^ ]*' | tail -1))"
+info "one threshold ($F7_PROD_THR) in code at both ends; ${F7_UNDER} does not fire, ${F7_OVER} does"
 
 # ============================================================================
 # TEST 32: F5 — inherited REFLECT_ASYNC / REFLECT_FORCE cannot kill handoffs
@@ -3198,7 +3242,6 @@ info "ill-typed threshold: OFF and logged at producer AND consumer; jq's exponen
 # those disable handoffs for the sid for the whole backoff window.
 echo "TEST 32: F5 — the synchronous mission call scrubs REFLECT_ASYNC and REFLECT_FORCE"
 F5_H="$(sc_home)"
-sc_write_config "$F5_H" on 0.30
 F5_ARGV="$F5_H/argv.txt"
 F5_CWD="$(mktemp -d -t reflect-f5cwd-XXXXXX)"
 assert_isolated_cwd "$F5_CWD"
@@ -3236,7 +3279,6 @@ echo "TEST 33: F8 — consume failure is loud, fresh= is real, malformed usage c
 #     that persists is re-verified and re-forked on every later 5-min tick until
 #     the per-cwd 24h budget is spent — a silent, self-repeating spend.
 F8_H="$(sc_home)"
-sc_write_config "$F8_H" on 0.30
 F8_ARGV="$F8_H/argv.txt"
 F8_CWD="$(mktemp -d -t reflect-f8cwd-XXXXXX)"
 assert_isolated_cwd "$F8_CWD"
@@ -3356,7 +3398,6 @@ if ( cd "$D5_DIR" && REFLECT_ROOT="./reflections" bash "$REFLECT_SH" --budgets >
 fi
 
 D5_H="$(sc_home)"
-sc_write_config "$D5_H" on 0.30
 if ( cd "$D5_DIR" && HOME="$D5_H" REFLECT_ROOT="reflections" \
        bash "$WORKTREE/scripts/idle-handoff.sh" >/dev/null 2>"$D5_ERR" ); then
   fail "34: idle-handoff.sh ran with a RELATIVE REFLECT_ROOT"
@@ -3390,7 +3431,6 @@ cp -r "$WORKTREE/skills" "$D6_H/.claude/skills"
 ln -s "$WORKTREE/scripts" "$D6_H/.claude/scripts"
 ln -s "$SC_USAGE" "$D6_H/.claude/context_usage.py"
 ln -s "$SC_TRIGGER" "$D6_H/.claude/self-compact-trigger.py"
-sc_write_config "$D6_H" on 0.30
 D6_CWD="$(mktemp -d -t reflect-d6cwd-XXXXXX)"
 assert_isolated_cwd "$D6_CWD"
 mk_candidate_repo "$D6_CWD" || fail "35a: could not build repo"
