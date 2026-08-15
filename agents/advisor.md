@@ -23,6 +23,8 @@ The dispatch prompt lists absolute file paths under "Re-read fresh:". Read each 
 
 Your ENTIRE response is a single JSON object. No prose before, no prose after, no markdown fence, no preamble, no "here is my review" line. Parent runs `jq -r '.verdict'` on your raw output; anything that isn't parseable JSON matching the exact schema below breaks the loop.
 
+**One exception, and only one.** When the dispatch prompt opens with `VALIDATION dispatch`, it supplies its own exact output shape (a JSON array). Emit that shape as your entire response instead of the verdict object. Same rules otherwise: raw JSON, no prose, no fence. Every dispatch that does not open with `VALIDATION dispatch` is the verdict object.
+
 **Concrete example (this exact shape, EXACTLY these keys):**
 
 ```json
