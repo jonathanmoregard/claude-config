@@ -39,7 +39,10 @@ Each Phase 1/2 round follows the same shape:
 1. SELF-REVIEW: read each changed file top-to-bottom (not just diff)
 2. VERIFY: tests + syntax + smoke green before inviting external eyes. RECORD
    this run as the round's BASELINE — `regressed_r` is defined against it
-3. ADVISE: dispatch the phase's advisor (Opus in phase 1, Codex in phase 2)
+3. ADVISE: dispatch the phase's advisor (Opus in phase 1, Codex in phase 2) —
+   exactly ONE advisor dispatch per round. From round 2 on, the prompt's "Prior
+   rounds fixed:" list carries the entire phase's fix history, compressed per
+   the prompt-shape cap
 4. PARSE + CROSS-VALIDATE verdict: `jq -r '.verdict'` on advisor output; if not parseable JSON, the round FAILED. Then **cross-validate verdict against findings** (the JSON schema enum can't enforce this on its own — `codex --output-schema` and jq both accept incoherent combinations):
 
    ```bash
@@ -66,6 +69,8 @@ Each Phase 1/2 round follows the same shape:
 
    **Drop rule, with the `unverifiable` exemption stated so it cannot be read as a collision.** Parent drops `findings[i]` iff `verified == false` AND `findings[i].unverifiable != true`. A finding tagged `unverifiable: true` is NEVER dropped on `verified == false`: no empirical check applies to it, so `verified == false` carries no information about it — it is the expected answer, not a refutation. Unverifiable findings continue to step 5 as-is (whether or not the validator confirmed the tag); repro is still attempted and often confirms nothing, which is fine.
 
+   **A dropped finding is still counted and still logged.** It was already a `new_r` candidate at step 4, it never reaches step 5, so it never reproduces. Append it to `findings_log` at step 7 with this round's `repro: false`, exactly like an unreproducible one — otherwise next round's dedupe cannot see it and re-flags it as new.
+
    **Failure-mode handling (degrade-to-pre-4.5 on any failure).** Step 4.5 is an optimization, not a correctness gate — do NOT retry, do NOT PAUSE the loop:
    - Wrap the validator dispatch with `timeout 180s` (bounded — validator is a cheap read-only pass).
    - If the validator returns quota-exhausted, times out, produces malformed JSON, or emits a verdict-missing / unparseable result on the FIRST try: skip step 4.5 for this round entirely, log `"validator unavailable: <cause>"` in the round's commit message, and proceed to step 5 with ALL findings intact (no drops, no tags — parent behaves as if step 4.5 did not exist).
@@ -75,15 +80,15 @@ Each Phase 1/2 round follows the same shape:
 
    **Validate only PIVOTAL findings.** A finding the primary AND a specialist flagged INDEPENDENTLY at the same location is not pivotal — skip the validator, go straight to step 5. A singleton finding (one reviewer only) IS pivotal — validate it. This trims step 4.5 only; it NEVER skips step 5 repro.
 5. REPRODUCE each BLOCKER/HIGH finding before fixing — advisors hallucinate
-6. FIX by severity, re-verify after each, diffing every re-verification against
-   the step-2 baseline to accumulate `regressed_r`
+6. FIX by severity, re-verify after each. Read `regressed_r` off the round's
+   FINAL re-verification, diffed against the step-2 baseline
 7. COMMIT the round (per-round granularity, not a batch), then WRITE RUN
    STATE (`tasks/arftl-run.json` — counters, baseline, `findings_log`; see
    "Run state" below). Both, every round.
-8. RE-ADVISE with a fresh prompt whose "Prior rounds fixed:" list carries
-   the entire phase's fix history, compressed per the prompt-shape cap
-9. GATE: evaluate the LOOP BOUNDS gate (see below) — every round, whatever the
-   verdict. The gate's routing beats the verdict; see "Gate beats verdict"
+8. GATE: evaluate the LOOP BOUNDS gate (see below) — every round, whatever the
+   verdict. The gate's routing beats the verdict; see "Gate beats verdict". On
+   `continue`, round r+1 opens at step 1 and re-advises at its own step 3; any
+   other routing ends the phase here, with no further dispatch.
 ```
 
 ## Loop bounds (materiality stop)
@@ -104,28 +109,46 @@ they buy. Count that, not findings. **Benefit alone is not the signal — a
 round's fixes can break more than the round found.**
 
 **Capture the BASELINE at step 2, every round.** The step-2 verification run IS
-the baseline. Record it into `rounds[phase][r].baseline` before any fix lands:
-the set of passing test IDs, or — when the runner cannot enumerate — the pass
-count plus the full name of every test that fails later in the round. Without
-that record `regressed_r` is uncomputable and the gate is blind.
+the baseline, and every part of it is recordable at step 2 with no knowledge of
+what the round will later do. Record it into `rounds[phase][r].baseline` before
+any fix lands: the set of passing test IDs, or — when the runner cannot
+enumerate — the pass count plus the full name of every test FAILING IN THAT SAME
+STEP-2 RUN (`named_failures`). Without that record `regressed_r` is uncomputable
+and the gate is blind.
 
 **Track per round**, appended to `rounds[phase]` in the run state at step 7:
 
-- `new_r` — OPEN BLOCKER+HIGH findings this round, measured AFTER step 4.5
-  drops. A finding is open when it is either (a) not reported earlier in this
-  run, deduped by MEANING (see below), or (b) reported earlier, marked fixed,
-  and STILL REPRODUCING at step 5. Rewording and shifted line numbers never
-  make a finding new. A re-flag of a genuinely-fixed finding that no longer
-  reproduces is neither new nor open — it feeds `flips_r`, not `new_r`.
-- `repro_r` — of those `new_r`, how many step 5 EMPIRICALLY REPRODUCED. A
-  finding that could not be reproduced was never real work. Invariant:
+- `new_r` — OPEN BLOCKER+HIGH findings this round. Candidate set: the step-4
+  deduped BLOCKER+HIGH list, BEFORE step 4.5 drops — a step-4.5 drop saves repro
+  effort, it never removes a candidate. A candidate is open when it is either
+  (a) not reported earlier in this run, deduped by MEANING (see below), or
+  (b) reported earlier, marked fixed, and STILL REPRODUCING at step 5. Rewording
+  and shifted line numbers never make a finding new. A re-flag of a fixed
+  finding that no longer reproduces is neither new nor open — it is advisor
+  staleness, and it feeds no counter.
+- `repro_r` — of those `new_r`, how many EMPIRICALLY REPRODUCED at step 5. A
+  candidate dropped at step 4.5 never reaches step 5 and therefore never
+  reproduces. Whether a fix later succeeded is a DIFFERENT fact, recorded as
+  `fixed` in `findings_log`; it never changes `repro_r`. Invariant:
   `0 <= repro_r <= new_r`.
-- `regressed_r` — tests that passed in THIS round's step-2 baseline and failed
-  at any step-6 re-verification during this round, whether or not a later fix
-  in the same round repaired them. Compare step 6 against the recorded
-  baseline, never against the round's own end state. If no fix was attempted
-  this round and step 6 never ran, `regressed_r = 0`.
+- `regressed_r` — tests that passed in THIS round's step-2 baseline and are
+  STILL FAILING at the round's FINAL step-6 re-verification. Measured once, at
+  the end of the round, against the recorded baseline. Breakage introduced and
+  repaired within the round is not damage and counts 0. With only a pass count
+  recorded, a test is regressed iff it fails at that final run and is not in
+  `named_failures`. If no fix was attempted this round and step 6 never ran,
+  `regressed_r = 0`.
 - `flips_r` — evidence-instability count; see "Oscillation" below.
+
+`new_r` and `repro_r` are both FINALISED at the end of step 5 and never revised.
+`regressed_r` is finalised at the end of step 6.
+
+`n` is the number of rounds recorded in `rounds[phase]` for the current phase,
+including the round being gated. `repro_prev` / `new_prev` are the immediately
+preceding round's values in the same phase; at `n == 1` the `n >= 2` clause of
+B4 cannot apply. A Phase 3 reset re-enters Phase 1 WITHOUT resetting any of
+them — `rounds["1"]` keeps accumulating, so the `ceiling` backstop covers the
+run's whole Phase 1 cost rather than handing it a fresh budget.
 
 **Dedupe `new_r` by MEANING, not by `(file, line, claim)`.** The tuple rule is
 insufficient: a reworded repeat at a shifted line passes it and counts as NEW,
@@ -159,6 +182,14 @@ in preference order:
    exceeds 60 entries, split by CANDIDATE into batches of 10 candidates against
    the full prior list; never split the prior list, or a candidate can miss its
    own match.
+
+   **Fallback trigger — the only one.** Wrap the judge dispatch with
+   `timeout 180s`. Fall back to method 2 for this round iff the judge times out,
+   returns quota-exhausted, or emits anything that is not a parseable JSON array
+   carrying exactly one row per candidate. Do not retry, do not PAUSE; a partial
+   or malformed array is not patched, it is discarded whole. Log
+   `"dedupe fallback: <cause>"` in the round's commit message. On a batched
+   dispatch, one failed batch falls back for that batch only.
 2. **Character-trigram Jaccard ≥ 0.8 within the same category (fallback).**
    Cheap, no dispatch. Pinned exactly, so two runs over identical traces
    compute identical `new_r`:
@@ -178,24 +209,27 @@ in preference order:
      early rounds the gate is most sensitive to.
 
 **Oscillation is unstable EVIDENCE, not a repeated complaint.** Count a flip
-only when the SAME semantic finding changes REPRODUCTION OUTCOME across rounds
-of this phase: reproduced in one round and not-reproduced in a later one, or
-the reverse. `flips_r` = the number of findings whose repro outcome changed
-sign since their last recorded outcome in `findings_log`.
+only when a finding's REPRODUCTION OUTCOME changes sign between its last two
+rows in `findings_log` for this phase AND NO FIX WAS ATTEMPTED BETWEEN THEM
+(`fixed: false` on the earlier row). `flips_r` = the number of findings meeting
+that test this round. An intervening fix attempt explains the change of outcome,
+so it is never instability.
 
 These are NOT flips and must never be counted as one:
 
-- A finding re-flagged after a failed fix that STILL REPRODUCES. That is an
-  unfixed defect. It counts in `new_r`, gets fixed again, and the loop keeps
-  working on it.
+- A re-flag after a fix attempt that STILL REPRODUCES. That is a failed fix. It
+  counts in `new_r`, gets fixed again, and the loop keeps working on it.
+- A re-flag after a fix attempt that NO LONGER REPRODUCES. That is advisor
+  staleness reading a compressed "Prior rounds fixed:" list. It feeds no
+  counter.
 - A finding an advisor re-raises because the "Prior rounds fixed:" list claimed
   a resolution that did not hold. Honest re-flagging is mandated advisor
   behaviour and must never trip a stop.
 
-Same finding text is not instability. Only the repro outcome flipping is. Do
+Same finding text is not instability. Only an unexplained repro flip is. Do
 not collapse the two.
 
-**Gate, evaluated at step 9 of EVERY round, including rounds that emitted
+**Gate, evaluated at step 8 of EVERY round, including rounds that emitted
 `PASS`.** Ordered cascade — first match wins, exactly one branch fires:
 
 ```bash
@@ -255,7 +289,7 @@ may state or imply a different routing; where one appears to, this table wins.
 | `accounting-error` | halt-and-pause | Do NOT advance. PAUSE handler with `pause_reason: accounting-error` and the offending `(new_r, repro_r, regressed_r)` triple. |
 | none (`continue_round=1`) | continue | Start round r+1. |
 
-**Gate beats verdict at step 9.** Evaluate the gate first, then:
+**Gate beats verdict at step 8.** Evaluate the gate first, then:
 
 1. A `halt-and-pause` routing wins over ANY verdict, `PASS` included. A round
    that broke previously-passing tests or produced unstable evidence has not
@@ -269,9 +303,10 @@ may state or imply a different routing; where one appears to, this table wins.
 do not invent a second escalation path:
 
 - **Interactive:** print `"Phase <P> stopped: <reason> after <n> rounds
-  (new/repro/regressed per round: <trace>). Options: (a) continue N more rounds anyway,
+  (new/repro/regressed/flips per round: <trace>). Options: (a) continue more rounds anyway,
   (b) ship with the remaining findings surfaced, (c) abort."` Wait for the
-  user.
+  user, then apply that option's run-state edit under "Run state" before acting
+  on it. (a), (b) and (c) are the same three options in both modes.
 - **Unattended:** append to `pending_for_human.md` in the CLAUDE.md format,
   set run-state `status: pending-human` + `pause_reason`, exit
   `pending-human`. Do NOT advance to the next phase and do NOT ship — a
@@ -304,15 +339,15 @@ no exceptions:**
   "status": "running | pending-human | complete",
   "phase": "1 | 2 | 3 | 4a | 4b",
   "round": 3,
-  "rounds": {"1": [{"new": 5, "repro": 5, "regressed": 0,
+  "rounds": {"1": [{"new": 5, "repro": 5, "regressed": 0, "flips": 0,
                     "baseline": {"passing": 412, "named_failures": []}},
-                   {"new": 2, "repro": 2, "regressed": 1,
-                    "baseline": {"passing": 412,
-                                 "named_failures": ["session::drops_line"]}},
-                   {"new": 0, "repro": 0, "regressed": 0,
-                    "baseline": {"passing": 413, "named_failures": []}}],
-             "2": [{"new": 1, "repro": 1, "regressed": 0,
-                    "baseline": {"passing": 413, "named_failures": []}}]},
+                   {"new": 2, "repro": 2, "regressed": 0, "flips": 0,
+                    "baseline": {"passing": 417, "named_failures": []}},
+                   {"new": 0, "repro": 0, "regressed": 0, "flips": 0,
+                    "baseline": {"passing": 419, "named_failures": []}}],
+             "2": [{"new": 1, "repro": 1, "regressed": 0, "flips": 0,
+                    "baseline": {"passing": 419,
+                                 "named_failures": ["e2e::known_flake"]}}]},
   "findings_log": {
     "1": [{"id": "p1-f3",
            "file": "/abs/path/session.rs", "line": 88,
@@ -343,15 +378,28 @@ earlier entry:
   `new_r` inflates, because every finding looks unseen.
 - `history` is the oscillation input: one row per round the finding was
   reported, with that round's `repro` outcome and whether a fix was applied.
-  Without it `flips_r` is permanently 0 and the stop can never fire.
+  Without it `flips_r` is permanently 0 and the stop can never fire. `fixed` is
+  what separates a failed fix from an unexplained flip — record it on every row.
 
 **On skill start, before Phase 1:** if `tasks/arftl-run.json` exists with
 `status: running`, do NOT start over. Read it, announce `"Resuming ARFTL at
 phase <P> round <r> (<n> prior rounds, <k> findings fixed)"`, and re-enter at
 the recorded phase with `fixed_summary` seeding the prompt's "Prior rounds
-fixed:" list. `status: pending-human` means a human owes a decision — surface
-`pause_reason` and stop; do not silently resume past a PAUSE. `status:
-complete` is a finished prior run: archive or delete it and start fresh.
+fixed:" list. `status: complete` is a finished prior run: archive or delete it
+and start fresh.
+
+`status: pending-human` means a human owes a decision — surface `pause_reason`
+and stop; never resume past a PAUSE on your own. The decision is recorded by
+editing this file, and these three edits are the persisted form of the PAUSE
+handler's (a)/(b)/(c):
+
+- **(a) continue** — set `status: running`, `pause_reason: null`. Next resume
+  re-enters at the recorded phase and round and runs another round.
+- **(b) ship with findings surfaced** — set `status: running`,
+  `pause_reason: null`, and write the pause reason into `stop_reasons[<phase>]`.
+  Next resume advances to the next phase without running another round.
+- **(c) abort** — set `status: complete`. Next resume archives the file and
+  starts fresh.
 
 **A resume that cannot reconstruct `findings_log` must SAY SO, not pretend.**
 If the file lacks `findings_log`, or its entries for the current phase are
@@ -359,12 +407,16 @@ missing or truncated:
 
 1. Set `dedupe_status: "unavailable"`.
 2. Announce `"ARFTL resumed WITHOUT dedupe/oscillation history — new_r is
-   inflated and oscillation cannot fire"` in the resume line, in every
-   subsequent round commit message, and in the Exit report.
+   inflated, oscillation cannot fire, and an unreproducible stop may be an
+   artifact"` in the resume line, in every subsequent round commit message, and
+   in the Exit report.
 3. Treat every finding as new (`new_r` counts all of them) and hold
    `flips_r = 0` for the rest of the phase.
-4. Never report a `converged` or `oscillation` stop for that phase without the
-   degradation note attached — both are meaningless while the log is missing.
+4. Never report a `converged`, `unreproducible`, or `oscillation` stop for that
+   phase without the degradation note attached. `unreproducible` needs it most:
+   an inflated `new_r` over an unchanged `repro_r` drives straight at it, and it
+   ADVANCES — so its exit commit message must also say the stop may be an
+   artifact of the missing log.
 
 Silently proceeding as if both mechanisms were live is the failure this rule
 exists to prevent.
@@ -389,7 +441,7 @@ Both lanes emit JSON matching `~/.claude/skills/advice-refine-test-loop/verdict-
 **The enum semantics below are PARENT-SIDE — a dispatch table the parent executes on the returned JSON, not text for an advisor prompt.** Everything after each semicolon is a consequence and must be stripped from anything the advisor reads (see "Elicit risk, not policy" under Advisor Prompt Shape).
 
 All three are subject to the gate: a `halt-and-pause` routing overrides the
-verdict, per "Gate beats verdict at step 9".
+verdict, per "Gate beats verdict at step 8".
 
 - **PASS** = ZERO findings (empty `findings` array); parent advances, no consolidator needed.
 - **PASS_WITH_FIXES** = at least one MEDIUM or LOW finding, but no BLOCKER/HIGH; parent runs the consolidator before phase advance (auto-fixes `severity=LOW AND autofix_class=safe_auto` only; other LOWs surface alongside MEDIUMs in the round's commit message for the human to triage but do NOT block advance). If a MEDIUM ought to block, it should have been a HIGH — trust the advisor's severity.
@@ -511,9 +563,13 @@ Order the prompt for maximum implicit prefix caching (both Anthropic + OpenAI ca
 - "Prior rounds fixed:" list: ≤30 lines, budgeted on its own. Under 30 entries,
   emit all of them verbatim. At 30 or more, keep the 20 most recent verbatim
   and replace everything older with one summary line per prior round:
-  `round <r>: <k> fixed — <area>, <area>`. Every older entry must still be
-  accounted for in some summary line's `<k>`; the counts across all summary
-  lines plus the verbatim entries must equal the total fixed so far.
+  `round <r>: <k> fixed — <id>:<basename>, <id>:<basename>, …`, where `<id>` is
+  the entry's `findings_log` id and `<basename>` is `basename(file)`.
+  Compression drops the RATIONALE, never the IDENTITY: every older entry keeps
+  its own `<id>:<basename>` pair, so a re-flag of a compressed entry is still
+  matchable back to its `findings_log` row and recognisable as staleness rather
+  than a new finding. The pair counts across all summary lines plus the verbatim
+  entries must equal the total fixed so far.
 
 Truncating the fixed-list instead of compressing it makes the advisor re-flag
 resolved issues, which the gate then has to disambiguate from real re-flags.
@@ -559,7 +615,9 @@ IF claim is a race / state issue:
 
 Discard unreproducible claims — do NOT fix them. Discard means "do not act on", never "delete the record". Record every one: next round's "prior rounds fixed" carries `verified non-issue: <claim>`, `findings_log` gets that round's `repro: false`, and an `unreproducible` stop lists them verbatim in the exit commit message.
 
-**A weak repro is worse than no repro** — it manufactures a false approval that the rest of the loop then trusts. Before a repro counts toward `repro_r`: confirm it FAILS against the unfixed code, PASSES after the fix, and exercises the exact path the finding claims. A repro that passes for an unrelated reason is discarded, and the finding goes back to unreproduced.
+**A weak repro is worse than no repro** — it manufactures a false approval that the rest of the loop then trusts. A repro counts toward `repro_r` iff, at step 5 and BEFORE any fix, it FAILS against the current code and exercises the exact path the finding claims. A repro that fails for an unrelated reason is discarded and the finding goes back to unreproduced.
+
+**`repro_r` is decided at step 5 and never revised.** It counts findings whose bad behaviour was empirically DEMONSTRATED, full stop — whether the later fix succeeded is a separate fact, recorded as `fixed` in `findings_log`. A finding that reproduced and is STILL BROKEN at the end of the round counts 1: that is precisely the case the loop must keep working on, and discounting it would advance the phase past a live defect. A fix counts as successful (`fixed: true`) only when the repro passes after it.
 
 ## Consolidator sub-loop (PASS_WITH_FIXES remainder)
 
@@ -597,7 +655,7 @@ Findings:
 **Error handling** — if the consolidator subagent crashes, exceeds quota, or produces partial commits mid-batch:
 - Parent inspects `git status` on return. Uncommitted mutations from a crashed consolidator are `git stash push -u -m "consolidator-crash-<phase>-<round>"`ed (never `git reset --hard` — preserve evidence).
 - Partial commits (some findings fixed, some not) stay in place — subsequent rounds see them as prior-round work and skip the corresponding findings.
-- After 3 crash-outs or a total exceeding the round budget, exit the sub-loop and note "consolidator unavailable: <cause>" in the phase's exit commit message. Remaining LOWs get logged to `pending_for_human.md` if the run is unattended.
+- After 3 crash-outs, exit the sub-loop and note "consolidator unavailable: <cause>" in the phase's exit commit message. Remaining LOWs get logged to `pending_for_human.md` if the run is unattended.
 
 After consolidator exits (clean or bounded), advance to the next phase using the post-consolidator state as the new baseline.
 
@@ -783,9 +841,9 @@ KNOWN drift-backs (regressed at least once before — flag on sight):
 
 Emit ONE JSON object for this whole call, matching the verdict-schema.json
 used elsewhere in this pipeline. Not one object per image — one object,
-whose `findings` array covers every image you were given (severity
-BLOCKER|HIGH|MEDIUM, autofix_class per schema, file, line, rationale,
-unverifiable). Identify the image PER FINDING: `file` = that image's
+whose `findings` array covers every image you were given (severity,
+autofix_class, file, line, rationale, unverifiable — all per schema).
+Identify the image PER FINDING: `file` = that image's
 basename, `line: 0` (schema requires line; visual findings are whole-image).
 Encode region + rule INSIDE rationale as a prefix: `[region: <where>]
 [rule: <fixed-rule# or drift-back#>] <what breaks>`. Example: `[region:
@@ -795,7 +853,6 @@ text, not to the left`. Keep total rationale ≤200 chars.
 If nothing to flag on ANY image in this call, emit verdict PASS with an
 empty findings array. Do not emit per-image empty arrays — the schema
 permits exactly one findings array per call.
-Do not report LOW / nit — the geometry oracle and 4a already cover polish.
 EOF
 )"
 
@@ -819,6 +876,11 @@ per-image object or a per-shot findings array.
 Any returned finding whose `rationale` prefix names a fixed rule or a known
 drift-back is raised to HIGH if the advisor rated it lower. The advisor is told
 which rules to check; the parent decides what a violation is worth.
+
+**LOW filter, applied by the parent AFTER the floor — never in the prompt.**
+Drop 4b findings still rated LOW once the floor has been applied; the geometry
+oracle and 4a cover polish. Never put this in the prompt: a "do not report LOW"
+instruction pushes borderline LOWs up to MEDIUM instead, uncorrectably.
 
 **Failure modes** follow the same PAUSE rules as Phase 2:
 
@@ -897,8 +959,8 @@ Final commit or chat message: round count + categories of bug caught (fail-open 
 Also state, so the run is greppable and a stopped run is never mistaken for a clean one:
 
 - per-phase round counts and `rounds` — the convergence trace: new vs reproduced
-  vs regressed per round, which is what shows whether each round bought more
-  than it broke
+  vs regressed vs flips per round, which is what shows whether each round bought
+  more than it broke
 - the stop reason each phase exited on (`converged` / `unreproducible` /
   `no-marginal-gain` / `oscillation` / `ceiling` / `accounting-error` / verdict
   `PASS` / verdict `PASS_WITH_FIXES`) and its routing per the stop-routing
