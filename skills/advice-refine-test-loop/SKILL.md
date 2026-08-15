@@ -392,18 +392,25 @@ means the runner could not name them — see "Loop bounds".
 `findings_log` is what makes semantic dedupe survive a compact, and it is what
 makes OPEN computable after a resume. **It is APPEND-ONLY, per finding.** At
 step 7: append one entry for each BLOCKER+HIGH finding not already logged, and
-append one `history` row to the matching entry for every logged finding this
-round touched. Appending a row EXTENDS the record and is not a rewrite; what is
-never rewritten is a fact already written — an entry's `id`, `file`, `category`
-and `rationale`, and any `history` row once appended.
+append EXACTLY ONE `history` row — never a second row bearing the same `round` —
+to the matching entry for every logged finding this round touched. Appending a
+row EXTENDS the record and is not a rewrite; what is never rewritten is a fact
+already written — an entry's `id`, `file`, `category` and `rationale`, and any
+`history` row once appended.
 
 - `rationale` verbatim and `category` are the dedupe inputs. Without them
   `new_r` inflates, because every finding looks unseen.
-- `history` is what decides whether a finding is still OPEN: one row per round
-  it was reported, with that round's `repro` outcome and whether a fix was
-  applied and verified. The OPEN definition reads both fields, so record both on
-  every row. A resume computes OPEN by replaying an entry's rows in round order
-  and applying the OPEN definition to the last one.
+- `history` is what decides whether a finding is still OPEN: **AT MOST ONE row
+  per finding per round**, carrying that round's `repro` outcome and whether a
+  fix was applied and verified. The OPEN definition reads both fields, so record
+  both on every row. A resume computes OPEN by replaying an entry's rows in round
+  order and applying the OPEN definition to the last one. If a replay finds two
+  or more rows sharing a `round`, it never picks one and never reads array order:
+  collapse them into a single row — `repro` true if ANY of them is true, `fixed`
+  true only if ALL of them are true — and announce
+  `"findings_log anomaly: <id> round <r>"` in the resume line and in every
+  subsequent round commit message. That collapse is order-independent and never
+  closes a finding that any of the rows leaves open.
 
 **On skill start, before Phase 1:** if `tasks/arftl-run.json` exists with
 `status: running`, do NOT start over. Read it, announce `"Resuming ARFTL at
