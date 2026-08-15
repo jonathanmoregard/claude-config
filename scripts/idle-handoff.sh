@@ -386,6 +386,14 @@ newest_non_sdk_cli_transcript() {
 # on ls-files ∪ status output).
 is_stale_since_transcript() {
   local cwd="$1" transcript_mtime="$2"
+  shift 2
+  # Remaining args are git pathspecs to exclude — the pointer plus the SPECIFIC
+  # payload paths this run authenticated as ours (see mission_exclude_add).
+  # NEVER a `tasks/mission.*.md` glob: a planted payload that failed
+  # authentication must stay VISIBLE to these gates, or a hostile repo could
+  # hide its own tree changes from the freshness check by naming them
+  # mission-something.
+  local -a mission_excludes=( "$@" )
   # Each check runs under `timeout 30 sh -c '...'` so BOTH the git command
   # AND any downstream pipeline (xargs, stat, awk) get killed as a group
   # when the timeout fires. Prior version only wrapped git itself; a
@@ -405,15 +413,16 @@ is_stale_since_transcript() {
   # git status --porcelain catches both dirty and untracked. Any output
   # at all = world moved since a clean baseline.
   #
-  # tasks/mission.md and tasks/mission.*.md are EXCLUDED, same exclusions and
-  # same reason as the post-write re-check below: those files are OUR OWN
-  # writes, not the world moving. This was load-bearing once the self-compact
-  # Stop hook started writing the handoff BEFORE this script runs (B7) — the
-  # untracked payload it leaves behind made every context-triggered candidate
-  # read as "world changed", so the fork could never fire. The exclusion also
-  # covers the pointer symlink, whose stat(2) mtime follows to a fresh payload.
+  # The mission artifacts we AUTHENTICATED are excluded, same exclusions and same
+  # reason as the post-write re-check below: those files are OUR OWN writes, not
+  # the world moving. This was load-bearing once the self-compact Stop hook
+  # started writing the handoff BEFORE this script runs (B7) — the untracked
+  # payload it leaves behind made every context-triggered candidate read as
+  # "world changed", so the fork could never fire. The list also covers the
+  # pointer symlink, whose stat(2) mtime follows to a fresh payload.
   local porcelain
-  porcelain=$(timeout 30 sh -c 'cd "$1" && git status --porcelain -- ":(exclude)tasks/mission.md" ":(exclude)tasks/mission.*.md" 2>/dev/null | head -c 1' _ "$cwd" || echo "")
+  porcelain=$(timeout 30 sh -c 'cd "$1" || exit 1; shift; git status --porcelain -- "$@" 2>/dev/null | head -c 1' \
+                _ "$cwd" ${mission_excludes[@]+"${mission_excludes[@]}"} || echo "")
   if [[ -n "$porcelain" ]]; then
     return 0
   fi
@@ -423,9 +432,18 @@ is_stale_since_transcript() {
   # pipeline runs inside `timeout 30 sh -c`, so xargs and stat are in the
   # same process group as git and get killed together on timeout.
   # Same mission-artifact exclusions as the porcelain check: a TRACKED
-  # tasks/mission.md (this repo has one) would otherwise fail the gate on its
-  # own freshness the moment we rewrote it.
-  if timeout 30 sh -c 'cd "$1" && git ls-files -z -- ":(exclude)tasks/mission.md" ":(exclude)tasks/mission.*.md" 2>/dev/null | xargs -0 -r stat -c "%Y" 2>/dev/null | awk -v t="$2" '"'"'$1 > t {found=1; exit} END {exit !found}'"'"'' _ "$cwd" "$transcript_mtime"; then
+  # payload of ours would otherwise fail the gate on its own freshness the
+  # moment we rewrote it. The awk program is passed as a positional argument
+  # rather than nested in quotes, so the pathspec list can be variadic.
+  local newer_prog='$1 > t {found=1; exit} END {exit !found}'
+  if timeout 30 sh -c '
+        cd "$1" || exit 1
+        t="$2"; prog="$3"; shift 3
+        git ls-files -z -- "$@" 2>/dev/null \
+          | xargs -0 -r stat -c "%Y" 2>/dev/null \
+          | awk -v t="$t" "$prog"
+      ' _ "$cwd" "$transcript_mtime" "$newer_prog" \
+        ${mission_excludes[@]+"${mission_excludes[@]}"}; then
     return 0
   fi
   return 1
@@ -462,14 +480,48 @@ mission_manifest_status() {
 }
 
 # ---- Authoritative mission resolution ---------------------------------------
-# The single seam for "which file IS the mission for this cwd". Delegates to
-# reflect.sh so the ownership rule — a `tasks/mission.<sid>.md` of our own stamp
-# lineage, never the bare `tasks/mission.md` pointer — lives in exactly one
-# place. Prints the path; returns 1 when nothing of ours resolves, which callers
-# must treat as "do not fork", never as "read the pointer instead".
+# The single seam for "which file IS the mission for this project". Delegates to
+# reflect.sh so the ownership rule lives in exactly one place: a
+# `tasks/mission.<sid>.md` that carries our stamp with a MATCHING sid= AND has a
+# session directory at $REFLECT_ROOT/sessions/<sid>/ — never the bare
+# `tasks/mission.md` pointer. Prints the path; returns 1 when nothing of ours
+# resolves, which callers must treat as "do not fork", never as "read the pointer
+# instead".
+#
+# The session-directory half is the load-bearing one: everything else lives
+# inside the repo and can therefore be forged by repo content. A cloned hostile
+# repo can plant `tasks/mission.<sid>.md` with a valid-looking stamp, but it
+# cannot create a reflections session directory on this machine.
+#
+# ARGUMENT UNIT: the PROJECT ROOT (reflect.sh appends /tasks).
+# REFLECT_ROOT is passed EXPLICITLY: it is set with `:` defaulting above, which
+# does not export, and the child's authentication check resolves session
+# directories under it. Letting the child re-derive it from $HOME would silently
+# authenticate against the wrong root.
+# Git pathspecs for mission artifacts that are OURS, so our own writes do not
+# read as "the world moved" in the freshness gates. Deliberately NOT a
+# `tasks/mission.*.md` glob: an unauthenticated payload (planted, forged, or
+# belonging to another machine) must remain VISIBLE to those gates, otherwise a
+# hostile repo could hide arbitrary tree changes behind a mission-shaped name.
+# The list holds the pointer we manage plus every payload path
+# mission_resolve_ours authenticated during THIS candidate's iteration.
+mission_excludes=()
+mission_exclude_reset() {
+  mission_excludes=( ":(exclude)tasks/mission.md" )
+}
+mission_exclude_add() {
+  local p="${1:-}" spec e
+  [[ -n "$p" ]] || return 0
+  spec=":(exclude)tasks/$(basename -- "$p")"
+  for e in ${mission_excludes[@]+"${mission_excludes[@]}"}; do
+    [[ "$e" == "$spec" ]] && return 0
+  done
+  mission_excludes+=( "$spec" )
+}
+
 mission_resolve_ours() {
-  local cwd="$1" out
-  out=$(timeout 30 bash "$REFLECT_SH" --mission-path "$cwd" \
+  local project_cwd="$1" out
+  out=$(REFLECT_ROOT="$REFLECT_ROOT" timeout 30 bash "$REFLECT_SH" --mission-path "$project_cwd" \
           </dev/null 2>>"$IDLE_HANDOFF_LOG_DIR/mission-resolve.log") || return 1
   [[ -n "$out" && -f "$out" ]] || return 1
   printf '%s' "$out"
@@ -593,9 +645,11 @@ for project_dir in "$PROJECTS_DIR"/*/; do
   # can create the payload) so the ## Next gate and the fork prompt can never
   # disagree about which file is the mission.
   mission_path=""
+  mission_exclude_reset
   if ! mission_path="$(mission_resolve_ours "$candidate_cwd")"; then
     mission_path=""
   fi
+  mission_exclude_add "$mission_path"
 
   # ---- Fresh-mission dedupe (governs WRITE, not the whole iteration) ---
   # Two conditions gate mission-WRITE, but autofork evaluation still
@@ -635,7 +689,8 @@ for project_dir in "$PROJECTS_DIR"/*/; do
   # Also snapshot HEAD SHA for a POST-write TOCTOU re-check: mission-write
   # burns ~90s, and a commit landing during that window would make autofork
   # act on a world-that-just-moved. Advisor P3R1 MEDIUM.
-  if is_stale_since_transcript "$candidate_cwd" "$mtime"; then
+  if is_stale_since_transcript "$candidate_cwd" "$mtime" \
+       ${mission_excludes[@]+"${mission_excludes[@]}"}; then
     stale_this_iter=1
     pre_write_head=""
   else
@@ -684,6 +739,10 @@ for project_dir in "$PROJECTS_DIR"/*/; do
     if ! mission_path="$(mission_resolve_ours "$candidate_cwd")"; then
       mission_path=""
     fi
+    # The payload we just produced is also ours; keep the pre-write one on the
+    # list so an older payload of our own lineage does not trip the post-write
+    # porcelain check either.
+    mission_exclude_add "$mission_path"
   else
     # skip_mission_write==1: the payload resolved before the write; autofork
     # evaluation uses that same path. No manifest_status check needed.
@@ -757,16 +816,17 @@ for project_dir in "$PROJECTS_DIR"/*/; do
       log "autofork skipped sid=$sid cwd=$candidate_cwd (HEAD moved during mission-write: pre=$pre_write_head post=$post_write_head)"
       continue
     fi
-    # Porcelain post-write, excluding tasks/mission.md and its parent dir.
-    # If human editor touched other tracked files during the write window,
-    # we want to skip.
+    # Porcelain post-write, excluding the pointer and the payloads we
+    # authenticated (see mission_exclude_add). If a human editor touched other
+    # tracked files during the write window, we want to skip.
     #
-    # `tasks/mission.*.md` is excluded too: mission mode now writes a
-    # unique-suffixed payload (tasks/mission.<sid>.md) with tasks/mission.md as a
-    # symlink to it, so our OWN write leaves a new untracked payload behind. Without
-    # this exclusion the post-write porcelain would always be non-empty and autofork
-    # would never fire again.
-    post_write_porcelain=$(timeout 5 sh -c 'cd "$1" && git status --porcelain -- ":(exclude)tasks/mission.md" ":(exclude)tasks/mission.*.md" 2>/dev/null | head -c 1' _ "$candidate_cwd" || echo "")
+    # Our own write leaves a NEW untracked payload (tasks/mission.<sid>.md)
+    # behind, so without excluding it the post-write porcelain would always be
+    # non-empty and autofork would never fire again. Only paths that resolved as
+    # ours are excluded — a mission-shaped file we did not write still counts as
+    # the world moving.
+    post_write_porcelain=$(timeout 5 sh -c 'cd "$1" || exit 1; shift; git status --porcelain -- "$@" 2>/dev/null | head -c 1' \
+                             _ "$candidate_cwd" ${mission_excludes[@]+"${mission_excludes[@]}"} || echo "")
     if [[ -n "$post_write_porcelain" ]]; then
       count_skipped_git_stale=$((count_skipped_git_stale + 1))
       log "autofork skipped sid=$sid cwd=$candidate_cwd (non-mission dirty files after mission-write)"

@@ -176,13 +176,21 @@ fi
 # That path is a convenience symlink for humans and existence checks; it is not
 # authoritative and can hold a foreign mission (mission mode refuses to move the
 # pointer over one). `tasks/mission.<sid>.md` is the only authoritative artifact.
+#
+# ARGUMENT UNIT: the PROJECT ROOT, not its tasks/ dir — `<project>/tasks` is
+# appended here. (`lib.sh:mission_resolve` takes the tasks dir; the two units are
+# spelled out at both ends because a mismatch fails closed with only a log line.)
+#
+# A returned payload has been AUTHENTICATED against $REFLECT_ROOT/sessions/<sid>/,
+# so this is also where a forged, planted or foreign payload is refused. Refusals
+# go to stderr with their reason.
 if [[ "$ARG1" == "--mission-path" ]]; then
-  _mp_cwd="${ARG2:-}"
-  if [[ -z "$_mp_cwd" || ! -d "$_mp_cwd" ]]; then
-    echo "reflect.sh --mission-path: need an existing project dir (got '$_mp_cwd')" >&2
+  _mp_project_cwd="${ARG2:-}"
+  if [[ -z "$_mp_project_cwd" || ! -d "$_mp_project_cwd" ]]; then
+    echo "reflect.sh --mission-path: need an existing project dir (got '$_mp_project_cwd')" >&2
     exit 2
   fi
-  if _mp_resolved="$(mission_resolve "$_mp_cwd/tasks")"; then
+  if _mp_resolved="$(mission_resolve "$_mp_project_cwd/tasks")"; then
     printf '%s\n' "$_mp_resolved"
     exit 0
   fi
@@ -782,7 +790,9 @@ run_worker() {
         pointer_refused=true
       fi
     elif [[ -f "$mission_pointer" ]]; then
-      if mission_has_our_stamp "$mission_pointer"; then
+      # Machine-lineage (either stamp shape): a pre-pointer payload predates the
+      # mandatory sid= and must still be preserved rather than clobbered.
+      if mission_has_machine_stamp "$mission_pointer"; then
         # Payload written by the pre-pointer code. Preserve it under a suffixed
         # name (never delete it), then install the pointer.
         if legacy_preserved="$(mission_preserve_legacy "$mission_pointer")"; then
