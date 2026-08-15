@@ -400,8 +400,10 @@ newest_non_sdk_cli_transcript() {
 is_stale_since_transcript() {
   local cwd="$1" transcript_mtime="$2"
   shift 2
-  # Remaining args are git pathspecs to exclude: MISSION_EXCLUDES (see its
-  # derivation above the definition).
+  # Remaining args are git pathspecs to exclude: the per-cwd allowlist of our own
+  # writes built by mission_excludes_for (see its derivation above the definition).
+  # An EMPTY list is legitimate and means "exclude nothing" — git treats a pathspec
+  # list of only exclusions as "everything except", and no pathspecs as everything.
   local -a mission_excludes=( "$@" )
   # Each check runs under `timeout 30 sh -c '...'` so BOTH the git command
   # AND any downstream pipeline (xargs, stat, awk) get killed as a group
@@ -422,7 +424,9 @@ is_stale_since_transcript() {
   # git status --porcelain catches both dirty and untracked. Any output
   # at all = world moved since a clean baseline.
   #
-  # MISSION_EXCLUDES keeps our own repo writes from reading as the world moving.
+  # The exclusions keep our OWN repo writes from reading as the world moving. They
+  # are an allowlist of files we can see we wrote, not a name shape — a human's
+  # tasks/mission.notes.md is not ours and must stay visible here.
   local porcelain
   porcelain=$(timeout 30 sh -c 'cd "$1" || exit 1; shift; git status --porcelain -- "$@" 2>/dev/null | head -c 1' \
                 _ "$cwd" ${mission_excludes[@]+"${mission_excludes[@]}"} || echo "")
@@ -434,7 +438,7 @@ is_stale_since_transcript() {
   # `touch` bumped file mtime. The whole ls-files | xargs | stat | awk
   # pipeline runs inside `timeout 30 sh -c`, so xargs and stat are in the
   # same process group as git and get killed together on timeout.
-  # Same MISSION_EXCLUDES as the porcelain check: a TRACKED copy of ours would
+  # Same exclusions as the porcelain check: a TRACKED copy of ours would
   # otherwise fail the gate on its own freshness the moment we rewrote it. The awk
   # program is passed as a positional argument rather than nested in quotes, so
   # the pathspec list can be variadic.
@@ -482,42 +486,68 @@ mission_manifest_status() {
   echo "$status"
 }
 
-# ---- Git-freshness exclusion set, re-derived from first principles -----------
+# ---- Git-freshness exclusions: an ALLOWLIST of our own writes ----------------
 # The freshness gate asks ONE question: has anything OTHER THAN US changed this
 # tree since the transcript was last written? A change we made ourselves is not
-# the world moving, so our own writes are excluded; everything else must stay
+# the world moving, so our own writes are subtracted; everything else must stay
 # visible.
 #
-# After the 2026-08-15 design change the only things this machine writes into a
-# project tree are:
-#     tasks/mission.<sid>.md    the human-readable copy of the handoff
-#     tasks/mission.md          the symlink pointing at it
-# Both are excluded, as a family rather than per-file, for two reasons:
+# "Our own writes" is now enumerated per-cwd from what is actually on disk, via
+# `reflect.sh --mission-copies` (the stamp/name/pointer rules live in exactly one
+# place — see that block). It used to be a shape family:
 #
-#   1. CORRECTNESS. Older copies are RETAINED BY DESIGN (mission_gc collects at
-#      REFLECT_MISSION_RETENTION_DAYS, default 30d). The previous narrow list —
-#      the pointer plus only the copy resolved on this tick — left every older
-#      untracked copy visible, so from the SECOND handoff in a cwd onwards
-#      `git status --porcelain` was never empty, the gate read "world changed",
-#      and autofork could never fire again in that project. The feature went
-#      inert after one use.
+#     :(exclude)tasks/mission.md
+#     :(exclude)tasks/mission.*.md
 #
-#   2. SAFETY. The narrow list existed because a mission-shaped file used to be a
-#      READ SOURCE: hiding one from the gate could hide a planted `## Next` that
-#      an unattended fork would then execute. Nothing reads these paths any more —
-#      the authoritative handoff is $REFLECT_ROOT/sessions/<sid>/mission.md, out
-#      of the tree entirely — so excluding the whole family can only hide edits to
-#      files no consumer ever opens. There is no instruction-injection channel
-#      left to hide.
+# and a shape is not authorship. That glob hid HUMAN-OWNED files from the gate:
+#   * `tasks/mission.notes.md` — `notes` passes is_valid_sid, as mission_gc's own
+#     comment concedes, which is why GC gates on the stamp and not the name;
+#   * a hand-authored REGULAR `tasks/mission.md` — the precise file mission mode
+#     refuses to overwrite. Refusing to write it while hiding it from the gate is
+#     the worst of both readings: we acknowledge it is somebody else's, and then
+#     treat their edits to it as if the world had not moved. That is the file the
+#     2026-08-15 incident destroyed, and the live example
+#     (~/Repos/ea-uplift/tasks/mission.md) holds unrelated in-flight state.
+# Either one meant a human could move the world and autofork would proceed anyway.
 #
-# Note what is NOT excluded, deliberately: the shapes are exact (`mission.md` and
-# `mission.<something>.md` under tasks/), not `tasks/mission*` and not `tasks/`.
-# A human's `tasks/handoff.md`, `tasks/progress.md` or `tasks/missionary.md` still
-# registers as the world moving, because it is.
-MISSION_EXCLUDES=(
-  ":(exclude)tasks/mission.md"
-  ":(exclude)tasks/mission.*.md"
-)
+# What the allowlist must NOT lose (the D3 regression): older copies are RETAINED
+# BY DESIGN (mission_gc collects at REFLECT_MISSION_RETENTION_DAYS, default 30d),
+# so the list has to cover copies of EVERY age, not just the one written this tick.
+# A per-tick list left older untracked copies visible, `git status --porcelain` was
+# never empty from the second handoff onwards, and the feature went inert in that
+# project. `--mission-copies` enumerates the whole directory, so it does not.
+#
+# Still NOT excluded, deliberately: `tasks/handoff.md`, `tasks/progress.md`,
+# `tasks/missionary.md`, `tasks/` itself. A human's edit there IS the world moving.
+#
+# FAILS CONSERVATIVE: if the enumeration itself fails we exclude nothing, so our
+# own copies read as the world moving and the fork is skipped. Logged as an ERROR,
+# because a permanently broken enumeration looks exactly like a quiet tree.
+mission_excludes_for() {
+  local project_cwd="$1"
+  local raw rc=0 line
+  local -a out=()
+  raw=$(REFLECT_ROOT="$REFLECT_ROOT" timeout 15 bash "$REFLECT_SH" --mission-copies "$project_cwd" \
+          </dev/null 2>>"$IDLE_HANDOFF_LOG_DIR/mission-resolve.log") || rc=$?
+  if (( rc != 0 )); then
+    log "ERROR cwd=$project_cwd: could not enumerate our own mission copies (rc=$rc; 124=timeout, 2=bad args); excluding NOTHING, so our own writes will read as the world moving and any fork here will be skipped — see $IDLE_HANDOFF_LOG_DIR/mission-resolve.log"
+    return 0
+  fi
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    # Only the two shapes that accessor is allowed to emit are accepted. A
+    # basename reaching a git pathspec is worth one cheap check: `:(exclude)`
+    # pathspecs are magic strings, and a filename carrying magic of its own must
+    # not widen what we hide.
+    if [[ "$line" != "tasks/mission.md" ]] \
+       && [[ ! "$line" =~ ^tasks/mission\.[A-Za-z0-9._-]+\.md$ ]]; then
+      log "WARN cwd=$project_cwd: ignoring unexpected --mission-copies output '$line'"
+      continue
+    fi
+    out+=( ":(exclude)$line" )
+  done <<< "$raw"
+  printf '%s\n' ${out[@]+"${out[@]}"}
+}
 
 # ---- Authoritative mission resolution ---------------------------------------
 # The single seam for "which file IS the mission for this project". Delegates to
@@ -727,8 +757,10 @@ for project_dir in "$PROJECTS_DIR"/*/; do
   # Also snapshot HEAD SHA for a POST-write TOCTOU re-check: mission-write
   # burns ~90s, and a commit landing during that window would make autofork
   # act on a world-that-just-moved. Advisor P3R1 MEDIUM.
+  # Derived per candidate, from what is on disk in THIS tree right now.
+  mapfile -t mission_excludes < <(mission_excludes_for "$candidate_cwd")
   if is_stale_since_transcript "$candidate_cwd" "$mtime" \
-       "${MISSION_EXCLUDES[@]}"; then
+       ${mission_excludes[@]+"${mission_excludes[@]}"}; then
     stale_this_iter=1
     pre_write_head=""
   else
@@ -871,12 +903,18 @@ for project_dir in "$PROJECTS_DIR"/*/; do
       log "autofork skipped sid=$sid cwd=$candidate_cwd (HEAD moved during mission-write: pre=$pre_write_head post=$post_write_head)"
       continue
     fi
-    # Porcelain post-write, with MISSION_EXCLUDES (derived above). If a human
-    # editor touched other tracked files during the write window, we want to skip.
-    # Our own write leaves a new untracked human copy behind, so without the
-    # exclusions this would always be non-empty and autofork would never fire.
+    # Porcelain post-write. If a human editor touched other tracked files during
+    # the write window, we want to skip. Our own write leaves a new untracked human
+    # copy behind, so without the exclusions this would always be non-empty and
+    # autofork would never fire.
+    #
+    # RE-DERIVED, not reused: the mission write just added `tasks/mission.<sid>.md`
+    # and may have installed or repointed the pointer, and neither existed when the
+    # pre-write list was built. Reusing that list would leave our own fresh copy
+    # visible here and deny every fork.
+    mapfile -t mission_excludes < <(mission_excludes_for "$candidate_cwd")
     post_write_porcelain=$(timeout 5 sh -c 'cd "$1" || exit 1; shift; git status --porcelain -- "$@" 2>/dev/null | head -c 1' \
-                             _ "$candidate_cwd" "${MISSION_EXCLUDES[@]}" || echo "")
+                             _ "$candidate_cwd" ${mission_excludes[@]+"${mission_excludes[@]}"} || echo "")
     if [[ -n "$post_write_porcelain" ]]; then
       count_skipped_git_stale=$((count_skipped_git_stale + 1))
       log "autofork skipped sid=$sid cwd=$candidate_cwd (non-mission dirty files after mission-write)"

@@ -211,6 +211,68 @@ if [[ "$ARG1" == "--mission-path" ]]; then
   exit 1
 fi
 
+# --- What WE wrote into a project tree ---------------------------------------
+# `reflect.sh --mission-copies <project_cwd>` prints, one per line and relative to
+# the project root, every path under <project_cwd>/tasks that THIS CODE WROTE:
+#
+#   tasks/mission.<sid>.md   each human copy whose name is mission.<valid-sid>.md
+#                            AND whose line 1 carries our stamp
+#   tasks/mission.md         only when the pointer is a symlink of ours
+#
+# ONE caller, ONE use: idle-handoff.sh's git-freshness gate asks "has anything OTHER
+# THAN US changed this tree since the transcript?", so it has to subtract our own
+# writes. The output is turned into `:(exclude)<path>` git pathspecs and is NEVER
+# OPENED. This is emphatically not the "accessor for the human copy" the
+# --mission-path comment warns against: it does not answer *what the mission is*, it
+# answers *what we wrote here*, and it is never an input to a decision about what to
+# execute.
+#
+# It replaces a `tasks/mission.*.md` glob, which excluded any file of that SHAPE and
+# therefore hid human-owned files from the gate: `tasks/mission.notes.md` (`notes` is
+# a valid sid — see mission_gc's own note) and a hand-authored regular
+# `tasks/mission.md`, the exact file mission mode refuses to overwrite. Hiding a file
+# we refuse to touch is the worst of both: we acknowledge it is someone else's, and
+# then treat their edits to it as if the world had not moved.
+#
+# The stamp is evidence of OUR authorship, not authentication of content, and this is
+# the honest bound: someone with repo write can forge a stamp and get their file
+# excluded from the gate. All that buys is hiding a file nothing opens — which they
+# could equally achieve by not creating it. It cannot hide a change to any file a
+# consumer reads, because only these two shapes are ever emitted here. Under-report
+# and the gate is merely more conservative (our own copy reads as the world moving →
+# no fork); over-report on these two shapes and nothing downstream changes.
+if [[ "$ARG1" == "--mission-copies" ]]; then
+  _mc_project_cwd="${ARG2:-}"
+  if [[ -z "$_mc_project_cwd" || ! -d "$_mc_project_cwd" ]]; then
+    echo "reflect.sh --mission-copies: need an existing project dir (got '$_mc_project_cwd')" >&2
+    exit 2
+  fi
+  _mc_tasks="$_mc_project_cwd/tasks"
+  # No tasks/ dir means we have written nothing here. An empty list is the answer,
+  # not an error — the caller distinguishes "nothing" from "could not tell" by the
+  # exit code, and only the latter should make it more conservative.
+  [[ -d "$_mc_tasks" ]] || exit 0
+  # The pointer, only when it is a symlink of ours (dangling counts: a pointer whose
+  # copy was garbage-collected is still our write). A regular file, a directory, or a
+  # symlink aimed anywhere else is somebody else's.
+  if mission_pointer_is_ours "$_mc_tasks/mission.md"; then
+    printf '%s\n' 'tasks/mission.md'
+  fi
+  shopt -s nullglob
+  for _mc_f in "$_mc_tasks"/mission.*.md; do
+    # -f after -L: a symlink is never one of our copies (we only ever create the
+    # pointer as a symlink), and this also drops dangling links and directories.
+    [[ -L "$_mc_f" ]] && continue
+    [[ -f "$_mc_f" ]] || continue
+    _mc_b="$(basename -- "$_mc_f")"
+    mission_is_our_copy_name "$_mc_b" || continue
+    mission_has_our_stamp "$_mc_f" || continue
+    printf 'tasks/%s\n' "$_mc_b"
+  done
+  shopt -u nullglob
+  exit 0
+fi
+
 # --- Budget introspection ----------------------------------------------------
 # Machine-readable view of the timeout arithmetic so the test suite can assert
 # the shipped defaults keep the synchronous path under Claude Code's hard,

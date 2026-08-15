@@ -333,27 +333,52 @@ stamp — note that `notes` is a valid sid, so it is the stamp, not the name, th
 keeps a hand-authored `tasks/mission.notes.md` safe. That stamp check is a
 *delete* rail, not authentication.
 
-#### `idle-handoff.sh` git-freshness exclusions, re-derived
+#### `idle-handoff.sh` git-freshness exclusions — an allowlist, not a glob
 
 The gate asks one question: has anything **other than us** changed this tree since
-the transcript? So it excludes exactly the two shapes this machine writes into a
-project, as a family:
+the transcript? So it subtracts our own writes, enumerated per-cwd by
+`reflect.sh --mission-copies <project_cwd>`:
 
-```
-:(exclude)tasks/mission.md
-:(exclude)tasks/mission.*.md
-```
+* `tasks/mission.<sid>.md` — each copy whose name is `mission.<valid-sid>.md`
+  **and** whose line 1 carries our stamp;
+* `tasks/mission.md` — only when the pointer is a symlink of ours (dangling
+  counts; a pointer whose copy was collected is still our write).
 
-Both reasons matter. **Correctness:** older copies are retained by design (GC at
-30 days), so the previous narrow list — the pointer plus only the copy resolved on
-this tick — left every older untracked copy visible, `git status --porcelain` was
-never empty from the second handoff onwards, and autofork went inert in that
-project forever. **Safety:** the narrow list existed because a mission-shaped file
-used to be a read source, so hiding one could hide a planted `## Next`. Nothing
-reads these paths now, so the exclusion can only hide edits to files no consumer
-opens. Not excluded, deliberately: `tasks/handoff.md`, `tasks/progress.md`,
-`tasks/missionary.md`, or `tasks/` itself — a human's edit there still registers
-as the world moving, because it is.
+It used to be the shape family `:(exclude)tasks/mission.md` +
+`:(exclude)tasks/mission.*.md`, and a shape is not authorship. That glob hid
+**human-owned** files: `tasks/mission.notes.md` (`notes` passes `is_valid_sid`,
+which is exactly why GC gates on the stamp rather than the name) and a
+hand-authored regular `tasks/mission.md` — the precise file mission mode refuses to
+overwrite. Refusing to write a file while hiding it from the gate is the worst of
+both readings: we acknowledge it is somebody else's, and then treat their edits to
+it as if the world had not moved.
+
+The list must cover copies of **every age**, not just this tick's: older copies are
+retained by design (GC at 30 days), and a per-tick list left every older untracked
+copy visible, so `git status --porcelain` was never empty from the second handoff
+onwards and autofork went inert in that project. `--mission-copies` enumerates the
+whole directory, so it does not regress that.
+
+It is re-derived **after** the mission write as well as before it, because the write
+adds a copy and may install or repoint the pointer, neither of which existed when
+the pre-write list was built.
+
+**Fails conservative:** if the enumeration fails, nothing is excluded, our own
+copies read as the world moving, and the fork is skipped — logged as an ERROR,
+because a permanently broken enumeration otherwise looks like a quiet tree.
+
+**The honest bound:** the stamp is evidence of our authorship, not authentication.
+Someone with repo write can forge one and get their file excluded from the gate.
+All that buys is hiding a file nothing opens — achievable just as easily by not
+creating it — and it cannot hide a change to any file a consumer reads, because only
+those two shapes are ever emitted. **Consequence in the other direction, accepted:**
+a project holding a mission-shaped file we did not write reads as permanently
+"moved", so autofork stays off there. That is the correct answer for
+`~/Repos/ea-uplift/tasks/mission.md`, which holds unrelated in-flight state.
+
+Not excluded, deliberately: `tasks/handoff.md`, `tasks/progress.md`,
+`tasks/missionary.md`, or `tasks/` itself — a human's edit there registers as the
+world moving, because it is.
 
 **Argument units differ by seam, on purpose:** `--mission-path`,
 `lib.sh:mission_resolve_handoff` and `idle-handoff.sh:mission_resolve_ours` all
