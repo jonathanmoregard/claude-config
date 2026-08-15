@@ -77,7 +77,7 @@ Each Phase 1/2 round follows the same shape:
    check the LOOP BOUNDS gate (see below), then next round
 ```
 
-## Loop bounds (non-convergence stop)
+## Loop bounds (materiality stop)
 
 Phase 1 and Phase 2 loop "until PASS". Without a bound that is unbounded by
 construction: an advisor that keeps surfacing fresh MEDIUM/LOW findings can
@@ -278,7 +278,7 @@ Parse: `verdict=$(codex exec … | jq -r '.verdict')`. Values: `PASS`, `PASS_WIT
 
 **Budget expectation:** Phase 2 should usually complete in 1-2 rounds because Opus already caught the bulk. If Codex demands ≥3 rounds, that IS the signal — Codex saw something Opus missed, and the extra rounds are the reason Phase 2 exists. Do not read a flat blocker COUNT as churn: two new reproducible defects in round 4 is the loop working, and on a large diff the count can sit flat for rounds while every round finds something real. The distinction that matters is novelty and reproducibility, which is what the "Loop bounds" gate measures. Codex re-flagging findings that no longer reproduce is the actual churn signal, and the gate stops on that.
 
-Loop rounds until Codex emits `PASS` (or `PASS_WITH_FIXES`; consolidator handles), **subject to the "Loop bounds" gate**. A non-convergence stop here routes to the same PAUSE handler as the four failure modes above. Then move to Phase 3.
+Loop rounds until Codex emits `PASS` (or `PASS_WITH_FIXES`; consolidator handles), **subject to the "Loop bounds" gate**. A `converged` or `unreproducible` stop advances to Phase 3 without asking; only a `ceiling` or `budget` stop routes to the PAUSE handler alongside the four failure modes above.
 
 ## Phase 3: Adversarial round (single Opus dispatch)
 
