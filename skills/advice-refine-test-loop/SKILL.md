@@ -77,8 +77,8 @@ Each Phase 1/2 round follows the same shape:
    STATE (`tasks/arftl-run.json` — see "Run state" below). Both, every round.
 8. RE-ADVISE with a fresh prompt whose "Prior rounds fixed:" list carries
    the entire phase's fix history
-9. On verdict `PASS` or `PASS_WITH_FIXES` → exit round loop; on `BLOCKS` →
-   check the LOOP BOUNDS gate (see below), then next round
+9. GATE: evaluate the LOOP BOUNDS gate (see below) — every round, whatever the
+   verdict. The gate's routing beats the verdict; see "Gate beats verdict"
 ```
 
 ## Loop bounds (materiality stop)
@@ -98,19 +98,29 @@ are (a) NEW, (b) SURVIVE REPRODUCTION, and (c) cost less fresh breakage than
 they buy. Count that, not findings. **Benefit alone is not the signal — a
 round's fixes can break more than the round found.**
 
+**Capture the BASELINE at step 2, every round.** The step-2 verification run IS
+the baseline. Record it into `rounds[phase][r].baseline` before any fix lands:
+the set of passing test IDs, or — when the runner cannot enumerate — the pass
+count plus the full name of every test that fails later in the round. Without
+that record `regressed_r` is uncomputable and the gate is blind.
+
 **Track per round**, appended to `rounds[phase]` in the run state at step 7:
 
-- `new_r` — BLOCKER+HIGH findings not already reported earlier in this run,
-  deduped by MEANING (see below), measured AFTER step 4.5 drops. A finding
-  re-flagged from a prior round is NOT new, even if worded differently or
-  reported at a shifted line.
-- `repro_r` — of those `new_r`, how many the fix stage EMPIRICALLY REPRODUCED
-  (step 5). A finding that could not be reproduced was never real work.
-- `regressed_r` — previously-passing tests broken by THIS round's fixes.
-  Count a test as regressed if it passed at the round's entry verification
-  (step 2) and failed at any step-6 re-verification during this round, whether
-  or not a later fix in the same round repaired it. Step 6 already re-verifies
-  after every fix, so the data is on hand; record it, don't recompute it.
+- `new_r` — OPEN BLOCKER+HIGH findings this round, measured AFTER step 4.5
+  drops. A finding is open when it is either (a) not reported earlier in this
+  run, deduped by MEANING (see below), or (b) reported earlier, marked fixed,
+  and STILL REPRODUCING at step 5. Rewording and shifted line numbers never
+  make a finding new. A re-flag of a genuinely-fixed finding that no longer
+  reproduces is neither new nor open — it feeds `flips_r`, not `new_r`.
+- `repro_r` — of those `new_r`, how many step 5 EMPIRICALLY REPRODUCED. A
+  finding that could not be reproduced was never real work. Invariant:
+  `0 <= repro_r <= new_r`.
+- `regressed_r` — tests that passed in THIS round's step-2 baseline and failed
+  at any step-6 re-verification during this round, whether or not a later fix
+  in the same round repaired them. Compare step 6 against the recorded
+  baseline, never against the round's own end state. If no fix was attempted
+  this round and step 6 never ran, `regressed_r = 0`.
+- `flips_r` — evidence-instability count; see "Oscillation" below.
 
 **Dedupe `new_r` by MEANING, not by `(file, line, claim)`.** The tuple rule is
 insufficient: a reworded repeat at a shifted line passes it and counts as NEW,
@@ -127,74 +137,96 @@ in preference order:
    dispatch. Apply only once the run has ≥ 5 findings to compare against;
    below that floor treat every finding as new.
 
-**Gate, evaluated at step 9 before starting round r+1.** Continue only while
-MARGINAL GAIN is positive — benefit minus damage, not benefit alone. Defensive
-stops are evaluated last and WIN over the continue flag; rollback and failure
-reporting outrank optimism.
+**Oscillation is unstable EVIDENCE, not a repeated complaint.** Count a flip
+only when the SAME semantic finding changes REPRODUCTION OUTCOME across rounds
+of this phase: reproduced in one round and not-reproduced in a later one, or
+the reverse. `flips_r` = the number of findings whose repro outcome changed
+sign since their last recorded outcome in `findings_log`.
+
+These are NOT flips and must never be counted as one:
+
+- A finding re-flagged after a failed fix that STILL REPRODUCES. That is an
+  unfixed defect. It counts in `new_r`, gets fixed again, and the loop keeps
+  working on it.
+- A finding an advisor re-raises because the "Prior rounds fixed:" list claimed
+  a resolution that did not hold. Honest re-flagging is mandated advisor
+  behaviour and must never trip a stop.
+
+Same finding text is not instability. Only the repro outcome flipping is. Do
+not collapse the two.
+
+**Gate, evaluated at step 9 of EVERY round, including rounds that emitted
+`PASS`.** Ordered cascade — first match wins, exactly one branch fires:
 
 ```bash
-# Marginal gain positive: the round bought more than it broke.
-if (( repro_r > regressed_r )); then
-  continue_round=1            # still finding real defects — do NOT ask, just go
-fi
+# B0. Accounting invariant. A violation means the round's bookkeeping is wrong
+#     and no counter downstream can be trusted.
+if (( repro_r > new_r || new_r < 0 || repro_r < 0 || regressed_r < 0 )); then
+  stop="accounting-error"
 
-# Nothing new, nothing broken: the good exit.
-if (( repro_r == 0 && regressed_r == 0 )); then
-  stop="converged"            # advance to the next phase, no user input needed
-fi
-
-# Fixes cost at least as much as they bought.
-if (( repro_r <= regressed_r )) && (( repro_r > 0 || regressed_r > 0 )); then
+# B1. DAMAGE. This round's fixes cost at least as much as they bought.
+elif (( regressed_r > 0 && repro_r <= regressed_r )); then
   stop="no-marginal-gain"
-fi
 
-# Guessing: findings keep arriving but stop surviving reproduction.
-# Two consecutive rounds where under half of new blockers reproduced.
-if (( n >= 2 )) && (( 2*repro_r < new_r )) && (( 2*repro_prev < new_prev )); then
-  stop="unreproducible"       # the advisor is pattern-matching, not analysing
-fi
+# B2. INSTABILITY. The same finding's evidence keeps changing sign.
+elif (( flips_r >= 1 )); then
+  stop="oscillation"
 
-# Oscillation: the same semantic issue was accepted, then re-flagged (or the
-# reverse). ONE flip is enough — do not wait for a second.
-if (( flips_on_same_issue >= 1 )); then stop="oscillation"; fi
+# B3. Nothing open, nothing broken: the good exit.
+elif (( new_r == 0 && regressed_r == 0 )); then
+  stop="converged"
 
-# COST backstop only. Explicitly NOT a convergence signal — a fixed round
-# ceiling cannot judge whether a round was worth running. Never read a
-# `ceiling` stop as "the phase converged".
-if (( n >= 8 )); then stop="ceiling"; fi
-if [[ -n "$BUDGET_TOTAL" ]] && (( $(budget_remaining) < 60000 )); then
-  stop="budget"
+# B4. Phantoms. Findings arrive but do not survive reproduction. Fires on
+#     round 1 too — a first round of pure hallucinations is not convergence.
+elif (( repro_r == 0 )) \
+  || { (( n >= 2 )) && (( 2*repro_r < new_r )) && (( 2*repro_prev < new_prev )); }; then
+  stop="unreproducible"
+
+# B5. COST backstop only. Explicitly NOT a convergence signal — a fixed round
+#     ceiling cannot judge whether a round was worth running.
+elif (( n >= 8 )); then
+  stop="ceiling"
+
+else
+  continue_round=1
 fi
 ```
 
-`flips_on_same_issue` counts issues (semantic-equivalence matched, same rule as
-`new_r`) that were marked resolved/accepted in an earlier round of this phase
-and re-flagged in this one, or flagged then dropped as non-issues then flagged
-again.
+Reaching B3 guarantees `regressed_r == 0` when `new_r == 0` (B1 already took
+the `new_r == 0 && regressed_r > 0` case), and reaching B4 guarantees
+`new_r > 0`. The cascade is exhaustive over every integer triple.
 
 In prose: **keep going while each round reproduces more new defects than its
 fixes break.** Round count is irrelevant while that holds — round 7 finding a
 real data-loss bug is worth more than stopping at round 3 for tidiness.
 
-| Stop reason | Trigger | Routes to |
+### Stop routing — single source of truth
+
+Every stop reason maps to EXACTLY ONE routing. No other section of this file
+may state or imply a different routing; where one appears to, this table wins.
+
+| Stop | Routing | Parent action |
 |---|---|---|
-| `converged` | `repro_r == 0` and `regressed_r == 0` | Advance silently. The good exit. |
-| `no-marginal-gain` | `repro_r <= regressed_r`, with either nonzero | Advance. List the regressions in the phase's exit commit message. |
-| `unreproducible` | 2 consecutive rounds with under half of `new_r` reproducing | Advance. Surface the unreproduced findings in the exit commit message. |
-| `oscillation` | ≥1 accept→reflag (or reflag→drop→reflag) flip on the same semantic issue | Advance. Name the oscillating issue in the exit commit message. |
-| `ceiling` | `n >= 8` | PAUSE handler. |
-| `budget` | budget floor hit | PAUSE handler. |
+| `converged` | advance | Advance to the next phase. Nothing to surface. |
+| `unreproducible` | advance-with-findings-surfaced | Advance. List every unreproduced finding verbatim in the phase's exit commit message and in the Exit report. |
+| `no-marginal-gain` | halt-and-pause | Do NOT advance, do NOT run another round. The round broke at least as much as it fixed, so continuing and advancing are both wrong. PAUSE handler with `pause_reason: no-marginal-gain` and every regressed test named. |
+| `oscillation` | halt-and-pause | Do NOT advance, do NOT run another round. The evidence is unstable, so neither the findings nor the fixes can be trusted. PAUSE handler with `pause_reason: oscillation`, naming the flipping finding and both outcomes. |
+| `ceiling` | halt-and-pause | Do NOT advance. Cost backstop, never read as convergence. PAUSE handler with `pause_reason: ceiling`. |
+| `accounting-error` | halt-and-pause | Do NOT advance. PAUSE handler with `pause_reason: accounting-error` and the offending `(new_r, repro_r, regressed_r)` triple. |
+| none (`continue_round=1`) | continue | Start round r+1. |
 
-`converged`, `no-marginal-gain`, `unreproducible`, and `oscillation` do NOT
-stop to ask — they are quality judgements the loop can make from its own trace.
-Asking a human to adjudicate unreproducible claims, a flip-flopping advisor, or
-a round that broke as much as it fixed is the wrong use of their attention.
+**Gate beats verdict at step 9.** Evaluate the gate first, then:
 
-**Only `ceiling` and `budget` route to the PAUSE handler**, because those are
-resource limits a human owns, not quality judgements the loop can make.
+1. A `halt-and-pause` routing wins over ANY verdict, `PASS` included. A round
+   that broke previously-passing tests or produced unstable evidence has not
+   earned an advance.
+2. Otherwise `PASS` / `PASS_WITH_FIXES` exits the round loop and advances
+   (consolidator first when `PASS_WITH_FIXES`).
+3. Otherwise (`BLOCKS`): `continue` starts round r+1; any other routing applies
+   this table.
 
-**On a `ceiling` / `budget` stop, route to the EXISTING Phase 2 PAUSE handler**
-— do not invent a second escalation path:
+**Every halt-and-pause stop routes to the EXISTING Phase 2 PAUSE handler** —
+do not invent a second escalation path:
 
 - **Interactive:** print `"Phase <P> stopped: <reason> after <n> rounds
   (new/repro/regressed per round: <trace>). Options: (a) continue N more rounds anyway,
@@ -326,7 +358,7 @@ Parse: `verdict=$(codex exec … | jq -r '.verdict')`. Values: `PASS`, `PASS_WIT
 - **Interactive session:** print "Phase 2 blocked: Codex quota exhausted at <ts>. Options: (a) wait <T> for reset then resume, (b) ship consciously without cross-vendor coverage, (c) abort." Wait for user decision.
 - **Unattended session** (loop triggered by "going to bed" / cron / no live human): append to `pending_for_human.md` per the CLAUDE.md format (`## <date>: Codex Phase 2 quota-exhausted / Why blocked / Steps for human / Everything else done`). Do NOT advance and do NOT ship. Exit the whole skill with status `pending-human`.
 
-**All four failure modes (quota-exhausted / timeout / connectivity / verdict-missing) route to the SAME PAUSE handler on second failure** — the loop stops, unattended runs write to `pending_for_human.md` and exit `pending-human`, interactive runs prompt the user. Never fall through silently. Phase 2 has only two ways to reach Phase 3: an emitted `PASS` or `PASS_WITH_FIXES` verdict. Everything else PAUSEs.
+**All four failure modes (quota-exhausted / timeout / connectivity / verdict-missing) route to the SAME PAUSE handler on second failure** — the loop stops, unattended runs write to `pending_for_human.md` and exit `pending-human`, interactive runs prompt the user. Never fall through silently. A DISPATCH FAILURE never advances Phase 2; only a verdict or a gate stop can, per the stop-routing table in "Loop bounds".
 
 **Timeout:** wrap the codex exec call with a wall-clock cap (`timeout 300s codex exec ...`). A model hang or long stall past 5 minutes is treated as connectivity failure → retry once after 30s → if second try also stalls, PAUSE per above.
 
@@ -348,7 +380,7 @@ Required, non-negotiable:
 
 **Still run it.** Codex rounds after clean Opus rounds reliably surface defect classes Opus rounds miss whole — in particular **inference-by-absence**, where a reviewer treats a coverage gap (no test, no branch, no error path) as evidence that the case is handled. Hunt that class explicitly in Phase 2.
 
-Loop rounds until Codex emits `PASS` (or `PASS_WITH_FIXES`; consolidator handles), **subject to the "Loop bounds" gate**. A `converged`, `no-marginal-gain`, `unreproducible`, or `oscillation` stop advances to Phase 3 without asking; only a `ceiling` or `budget` stop routes to the PAUSE handler alongside the four failure modes above.
+Loop rounds until Codex emits `PASS` (or `PASS_WITH_FIXES`; consolidator handles), **subject to the "Loop bounds" gate**. Which stops advance and which PAUSE is decided by the stop-routing table in "Loop bounds" — read it there, not here.
 
 ## Phase 3: Adversarial round (single Opus dispatch)
 
@@ -490,7 +522,9 @@ After consolidator exits (clean or bounded), advance to the next phase using the
 | Count only what a round FOUND, ignoring what its fixes BROKE | Benefit alone is not progress. Fixes regress previously-passing tests, and a loop that never counts `regressed_r` keeps iterating while it destroys working code — reported acceptance rises the whole time. Continue only while `repro_r > regressed_r`. |
 | Treat the `n >= 8` ceiling as "the phase converged" | It is a COST backstop. A fixed round ceiling carries no information about whether the last round was worth running. `ceiling` routes to the PAUSE handler; `converged` is a different stop with a different meaning. |
 | Dedupe `new_r` by `(file, line, claim)` | A reworded repeat at a shifted line then counts as NEW and inflates the continue signal the gate depends on. Dedupe by MEANING — equivalence-judge subagent, or trigram Jaccard ≥0.8 as fallback. |
-| PAUSE and ask the human on a quality judgement the loop can make itself | Only resource limits (hard round ceiling, token budget) are the human's call. `converged`, `no-marginal-gain`, `unreproducible`, and `oscillation` all advance without asking, with the reason surfaced in the exit commit message. Asking a human to adjudicate unreproducible claims is the wrong use of their attention. |
+| PAUSE and ask the human on a stop the loop can rule on itself | `converged` and `unreproducible` advance without asking, with the reason surfaced in the exit commit message. Asking a human to adjudicate unreproducible claims is the wrong use of their attention. |
+| Advance (or run another round) on a `no-marginal-gain` or `oscillation` stop | Those two mean the loop is DAMAGING or UNSTABLE. Advancing ships the damage; continuing feeds it. Both halt-and-pause. Only the stop-routing table decides this — do not infer routing from a stop's name. |
+| Read `converged` as "the round found nothing" | `converged` requires `new_r == 0` — nothing was even proposed. A round that proposes findings none of which reproduce is `unreproducible`, and it must surface those findings, not exit silently. |
 | Reset to Phase 1 a second time from Phase 3 | Capped at one reset. A diff still producing fresh BLOCKER/HIGH after a full 1→2→3 pass wants splitting, not another lap through both vendors. |
 | Skip writing `tasks/arftl-run.json` because "the loop is nearly done" | Nearly-done is when a compact is most likely and the fix history is most expensive to lose. Write it at every round commit, same step. |
 | Restart at Phase 1 after a compact or crash | Check `tasks/arftl-run.json` first. Re-running phases that already PASSed re-burns both quotas to reproduce a result you already have on disk. |
@@ -737,10 +771,11 @@ Also state, so the run is greppable and a stopped run is never mistaken for a cl
 - per-phase round counts and `rounds` — the convergence trace: new vs reproduced
   vs regressed per round, which is what shows whether each round bought more
   than it broke
-- the stop reason each phase exited on (`converged` / `no-marginal-gain` /
-  `unreproducible` / `oscillation` / `ceiling` / `budget` / verdict `PASS`),
-  plus what was left unfixed for `no-marginal-gain`, `unreproducible`, and
-  `oscillation` exits
+- the stop reason each phase exited on (`converged` / `unreproducible` /
+  `no-marginal-gain` / `oscillation` / `ceiling` / `accounting-error` / verdict
+  `PASS` / verdict `PASS_WITH_FIXES`) and its routing per the stop-routing
+  table, plus every unreproduced finding verbatim on an `unreproducible` exit
+  and every regressed test on a `no-marginal-gain` pause
 - accepted commit SHA + whether the worktree is clean
 - how the run ended: `PASS` / `PASS_WITH_FIXES` / `pending-human` **plus the `pause_reason`** if it stopped on a bound rather than a verdict
 - anything left in `pending_for_human.md`
