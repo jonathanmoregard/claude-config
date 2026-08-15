@@ -1,9 +1,9 @@
 ---
-name: avoiding-unrequested-flags
+name: avoiding-unrequested-feature-flags
 description: Use when about to put a new feature, code path, or scheduled job behind an on/off switch — an enabled/disabled key, a toggle registry entry, a use_*/feature_* switch, or an env-var kill switch. Fires hardest when the feature is expensive, automatic, unattended, or risky and shipping it switched off feels like the responsible move.
 ---
 
-# Avoiding Unrequested Flags
+# Avoiding Unrequested Feature Flags
 
 ## The Rule
 
