@@ -11,7 +11,7 @@
     },
     "verdict_reason": {
       "type": "string",
-      "description": "One-line rationale. Cite the single BLOCKER/HIGH driving BLOCKS, or 'no findings above LOW' for PASS_WITH_FIXES, or empty string for PASS."
+      "description": "One-line rationale. For BLOCKS, cite the single BLOCKER or HIGH driving it. For PASS_WITH_FIXES, summarise the class of remaining MEDIUM findings, or 'only LOW findings' when there are no MEDIUMs. For PASS, the empty string."
     },
     "findings": {
       "type": "array",

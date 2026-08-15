@@ -26,17 +26,21 @@ Your ENTIRE response is a single JSON object. No prose before, no prose after, n
 **Concrete example (this exact shape, EXACTLY these keys):**
 
 ```json
-{"verdict": "BLOCKS", "verdict_reason": "auth middleware fails open when JWT missing", "findings": [{"severity": "BLOCKER", "autofix_class": "manual", "file": "/abs/path/middleware.ts", "line": 42, "rationale": "if (!token) return next() lets unauthenticated requests through; must return 401"}, {"severity": "HIGH", "autofix_class": "gated_auto", "file": "/abs/path/handler.ts", "line": 88, "rationale": "unbounded map grows without eviction — OOM under sustained load"}]}
+{"verdict": "BLOCKS", "verdict_reason": "auth middleware fails open when JWT missing", "findings": [{"severity": "BLOCKER", "autofix_class": "manual", "file": "/abs/path/middleware.ts", "line": 42, "rationale": "if (!token) return next() lets unauthenticated requests through; must return 401", "unverifiable": false}, {"severity": "HIGH", "autofix_class": "gated_auto", "file": "/abs/path/handler.ts", "line": 88, "rationale": "unbounded map grows without eviction — OOM under sustained load", "unverifiable": false}]}
 ```
+
+`unverifiable` is REQUIRED on every finding — the schema rejects a finding
+object without it. Emit `false` (not omission) when an empirical check applies.
 
 **Non-negotiable field names — memorize these exactly:**
 
 - Top-level keys: `verdict`, `verdict_reason`, `findings` (in that order). Nothing else. Never `reason`, never `blockers`, never `summary`.
 - `verdict` value: literally one of `"PASS"`, `"PASS_WITH_FIXES"`, `"BLOCKS"`. **Never** `"SAFE TO SHIP"`, `"BLOCKS SHIPPING"`, `"safe"`, `"fail"`, any other string.
 - `findings` is a flat ARRAY of finding objects, NOT an object grouped by severity. Severity lives on each finding as the `severity` field.
-- Each finding: `severity` (one of `"BLOCKER"`, `"HIGH"`, `"MEDIUM"`, `"LOW"` — **never** `"CRITICAL"`, `"HIGHEST"`, `"BLOCKED"`, `"CRIT"`, or lowercase; when a loaded specialist skill uses different severity names like Critical, map them: Critical→BLOCKER, High→HIGH, Medium→MEDIUM, Low→LOW), `autofix_class` (one of `"safe_auto"`, `"gated_auto"`, `"manual"`, `"advisory"` — see semantics below), `file` (absolute path string; if the finding is whole-file / module-layout, still emit the absolute path), `line` (integer; use `0` for whole-file findings), `rationale` (string ≤200 chars; hard-cap 240 in schema).
-- Each finding must include `autofix_class` (`safe_auto` | `gated_auto` | `manual` | `advisory`) alongside `severity`. Do not conflate the two — `severity` is urgency (how bad if it ships), `autofix_class` is apply-authority (can this be applied without a human call). A LOW-severity finding whose fix ripples across the codebase is `gated_auto`, not `safe_auto`. Semantics: `safe_auto` = trivially reversible, no design call (rename an unused var); `gated_auto` = mechanically safe but wants human ack (rename that ripples); `manual` = needs human implementation; `advisory` = surface only, no action expected. Findings where confirmation needs human judgment (taste, style, subjective preference) also emit `unverifiable: true` — the downstream validator (Stage 4.5) reads this tag to distinguish "drop as unreproducible" from "keep with warning".
-- Never use `cite`, `note`, `location`, `problem`, `issue`, `citation`, `remark`, `description`, `message`, `filepath`, `lineno`, `level`, or any other alternate field names — the parser looks for exactly `severity`, `file`, `line`, `rationale`. Extra fields are rejected by `additionalProperties: false`.
+- Each finding has EXACTLY these six keys: `severity` (one of `"BLOCKER"`, `"HIGH"`, `"MEDIUM"`, `"LOW"` — **never** `"CRITICAL"`, `"HIGHEST"`, `"BLOCKED"`, `"CRIT"`, or lowercase; when a loaded specialist skill uses different severity names like Critical, map them: Critical→BLOCKER, High→HIGH, Medium→MEDIUM, Low→LOW), `autofix_class` (one of `"safe_auto"`, `"gated_auto"`, `"manual"`, `"advisory"` — see semantics below), `file` (absolute path string; if the finding is whole-file / module-layout, still emit the absolute path), `line` (integer; use `0` for whole-file findings), `rationale` (string ≤200 chars; hard-cap 240 in schema), `unverifiable` (boolean or null).
+- Each finding must include `autofix_class` (`safe_auto` | `gated_auto` | `manual` | `advisory`) alongside `severity`. Do not conflate the two — `severity` is the intrinsic risk of the defect itself, `autofix_class` is apply-authority (can this be applied without a human call). A LOW-severity finding whose fix ripples across the codebase is `gated_auto`, not `safe_auto`. Semantics: `safe_auto` = trivially reversible, no design call (rename an unused var); `gated_auto` = mechanically safe but wants human ack (rename that ripples); `manual` = needs human implementation; `advisory` = surface only, no action expected.
+- `unverifiable` is `true` iff confirming the finding requires human judgment — taste, style, subjective preference — so that no empirical check applies to it. `false` when an empirical check does apply. `null` only when neither reading fits. Report what the finding IS; nothing downstream is your concern.
+- Never use `cite`, `note`, `location`, `problem`, `issue`, `citation`, `remark`, `description`, `message`, `filepath`, `lineno`, `level`, or any other alternate field names — the parser looks for exactly `severity`, `autofix_class`, `file`, `line`, `rationale`, `unverifiable`. Extra fields are rejected by `additionalProperties: false`.
 - If a finding needs a "run this to confirm" hint, EMBED it in `rationale` as `... verify: <command>`. Do NOT add a `verify` field — the schema rejects it.
 
 **Verdict semantics:**
@@ -48,10 +52,21 @@ Full JSON schema on disk: `~/.claude/skills/advice-refine-test-loop/verdict-sche
 
 # Severity definitions
 
-- **BLOCKER** — ship breaks production: data loss, security hole, runtime crash on the happy path, schema mismatch, fail-open auth.
-- **HIGH** — wrong behavior under reachable edge cases: silent error swallow, resource leak, race window, missing input validation at a trust boundary.
-- **MEDIUM** — latent bug or future trap: hardcoded value that should be config, missing test for non-obvious branch, unclear contract that will break on refactor.
-- **LOW** — cosmetic: naming, comment wording, formatting. Nothing behaves differently; a reader is mildly worse off.
+One definition, shared with `verdict-schema.json` so both review lanes grade the
+same defect the same way. If this section and the schema ever diverge, the
+schema wins — copy it back to here.
+
+Severity is the INTRINSIC RISK of the defect itself. Judge it on four axes:
+blast radius (how much breaks), reversibility (can the damage be undone),
+silence (does it fail loudly or corrupt quietly), and recoverability (is data
+lost for good).
+
+- **BLOCKER** — wide blast radius, irreversible or silent, data unrecoverable.
+- **HIGH** — real failure in normal operation, recoverable but not silently.
+- **MEDIUM** — latent trap or narrow-condition failure, loud when it fires.
+- **LOW** — contained, obvious, trivially reversible.
+
+Rate on those properties alone. Do not consider what happens next.
 
 # Length cap
 

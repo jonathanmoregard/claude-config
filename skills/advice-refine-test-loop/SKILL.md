@@ -530,7 +530,7 @@ Violations of the radio-dot rule are HIGH.
 ```
 Rate each finding by the risk of the defect itself:
 BLOCKER = wide blast radius, irreversible or silent, data unrecoverable.
-HIGH    = real failure in normal operation, recoverable, not silent.
+HIGH    = real failure in normal operation, recoverable but not silently.
 MEDIUM  = latent trap or narrow-condition failure, loud when it fires.
 LOW     = contained, obvious, trivially reversible.
 Rate on those properties alone. Do not consider what happens next.
