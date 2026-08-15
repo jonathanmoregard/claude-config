@@ -1,17 +1,18 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "AdvisorVerdict",
+  "$comment": "Schema-authoring constraint: every declared property is listed in its `required` array, and optionality is expressed with a nullable type instead. Structured-output backends reject a schema that omits a declared property from `required`.",
   "type": "object",
   "additionalProperties": false,
   "required": ["verdict", "verdict_reason", "findings"],
   "properties": {
     "verdict": {
       "enum": ["PASS", "PASS_WITH_FIXES", "BLOCKS"],
-      "description": "PASS = zero findings (empty findings array). PASS_WITH_FIXES = at least one MEDIUM or LOW finding but no BLOCKER/HIGH (consolidator auto-fixes LOWs; parent surfaces MEDIUMs for manual review but does not block advance). BLOCKS = at least one BLOCKER or HIGH that gates shipping."
+      "description": "Must agree with the findings array. PASS = zero findings (empty findings array). PASS_WITH_FIXES = at least one MEDIUM or LOW finding but no BLOCKER/HIGH. BLOCKS = at least one BLOCKER or HIGH."
     },
     "verdict_reason": {
       "type": "string",
-      "description": "One-line rationale. Cite the single BLOCKER/HIGH driving BLOCKS, or 'no findings above LOW' for PASS_WITH_FIXES, or empty string for PASS."
+      "description": "One-line rationale. For BLOCKS, cite the single BLOCKER or HIGH driving it. For PASS_WITH_FIXES, summarise the class of remaining MEDIUM findings, or 'only LOW findings' when there are no MEDIUMs. For PASS, the empty string."
     },
     "findings": {
       "type": "array",
@@ -20,10 +21,13 @@
         "additionalProperties": false,
         "required": ["severity", "autofix_class", "file", "line", "rationale", "unverifiable"],
         "properties": {
-          "severity": { "enum": ["BLOCKER", "HIGH", "MEDIUM", "LOW"] },
+          "severity": {
+            "enum": ["BLOCKER", "HIGH", "MEDIUM", "LOW"],
+            "description": "Intrinsic risk of the defect itself. Judge on blast radius (how much breaks), reversibility (can the damage be undone), silence (does it fail loudly or corrupt quietly), and recoverability (is data lost for good). BLOCKER = wide blast radius, irreversible or silent, data unrecoverable. HIGH = real failure in normal operation, recoverable but not silently. MEDIUM = latent trap or narrow-condition failure, loud when it fires. LOW = contained, obvious, trivially reversible."
+          },
           "autofix_class": {
             "enum": ["safe_auto", "gated_auto", "manual", "advisory"],
-            "description": "Apply-authority — independent of severity. safe_auto = trivially reversible, no design call (e.g. rename an unused var). gated_auto = mechanically safe but wants human ack before applying (e.g. rename that ripples). manual = needs human implementation. advisory = surface only, no action expected."
+            "description": "A property of the CHANGE the finding calls for, independent of severity. Judge on reversibility, how far the edit reaches beyond the flagged location, and whether choosing the change requires human judgement. safe_auto = fully reversible, mechanical, confined to the flagged location, no design choice (e.g. rename an unused local). gated_auto = mechanical and reversible, but the edit reaches beyond the flagged location — call sites, public names, persisted data, generated output. manual = the correct change is not mechanical; choosing it requires human judgement about design or intent. advisory = an observation about the code with no specific change attached."
           },
           "file": { "type": "string", "description": "Absolute path" },
           "line": {
@@ -38,7 +42,7 @@
           },
           "unverifiable": {
             "type": ["boolean", "null"],
-            "description": "true iff confirmation of this finding requires human judgment (taste, style, subjective preference) — no empirical check applies. Stage 4.5 validator uses this tag to keep-with-warning instead of drop-as-unverified. Emit null when not applicable. Nullable-and-required rather than optional because OpenAI structured outputs (codex exec --output-schema) rejects any schema whose `required` array omits a declared property — Phase 2 hard-fails with invalid_json_schema otherwise."
+            "description": "true iff confirmation of this finding requires human judgment (taste, style, subjective preference) — no empirical check applies. false when an empirical check does apply. null only when neither reading fits."
           }
         }
       }
