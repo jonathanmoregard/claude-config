@@ -12,7 +12,7 @@ The loop catches all four by staging the review:
 - **Phase 1 (Opus + narrow specialists)** does broad correctness review plus targeted passes (secure defaults, footgun APIs) when the diff touches those areas.
 - **Phase 2 (Codex/GPT-5.5)** cross-vendor review runs LAST so it only sees Opus-blessed state — preserves cross-vendor coverage while spending Codex's tighter ChatGPT Plus quota only on what Opus already cleared.
 - **Phase 3 (adversarial)** is a single Opus dispatch framed as "assume the prior PASS was wrong, find why" — catches the confirmation-bias class both prior phases share.
-- **Phase 4 (taste)** applies to UI work only, after all correctness phases pass. Split into 4a (Opus defect + taste critics, existing) and 4b (Codex vision-taste on regenerated shots, second vendor).
+- **Phase 4 (taste)** applies to UI work only, after all correctness phases have ADVANCED. Split into 4a (Opus defect + taste critics, existing) and 4b (Codex vision-taste on regenerated shots, second vendor).
 
 Every phase uses a **structured JSON verdict schema** (`verdict-schema.json`) so stop conditions are parseable, not vibes. Between phases, a **consolidator sub-loop** auto-fixes safe_auto LOW findings (severity × autofix_class AND-gate; see below).
 
@@ -31,7 +31,7 @@ PHASE 4b: Codex vision-taste (UI-only, ONCE) — second-vendor VLM on the
           union + confidence tiers (see "Phase 4b" section below)
 ```
 
-At end of each phase's PASS, if the final round emitted `PASS_WITH_FIXES`, the **consolidator sub-loop** runs before advancing (see "Consolidator" below).
+Whenever a phase ADVANCES, if its final round emitted `PASS_WITH_FIXES`, the **consolidator sub-loop** runs before advancing (see "Consolidator" below).
 
 Each Phase 1/2 round follows the same shape:
 
@@ -459,7 +459,7 @@ Loop rounds until Codex emits `PASS` (or `PASS_WITH_FIXES`; consolidator handles
 
 ## Phase 3: Adversarial round (single Opus dispatch)
 
-After Phase 2 PASS. One shot; the verdict determines advance:
+After Phase 2 ADVANCES (verdict `PASS`/`PASS_WITH_FIXES`, or a gate stop routed to advance / advance-with-findings-surfaced). One shot; the verdict determines advance:
 
 - `PASS` or `PASS_WITH_FIXES` (findings ≤ MEDIUM) → advance to Phase 4. MEDIUMs and LOWs surface in the exit commit message; consolidator handles LOWs; MEDIUMs are surfaced for the human but do NOT trigger a Phase 1 reset (the whole point of "PASS_WITH_FIXES advances" from earlier phases applies here too — a MEDIUM adversarial finding that would have been BLOCKER-worthy should have been rated HIGH on its own risk).
 - `BLOCKS` (any BLOCKER or HIGH) → loop resets to Phase 1 with the new findings pre-seeded so both vendors re-review the fix. **At most ONE such reset per run** (`phase3_resets` in the run state). On a second Phase 3 `BLOCKS`, do not reset again — PAUSE per the Phase 2 handler with reason `phase3-reset-cap`, because a diff that keeps producing fresh BLOCKER/HIGH findings after a full Phase 1→2→3 pass is the "split the diff" case, not a case for another full lap.
@@ -625,17 +625,24 @@ After consolidator exits (clean or bounded), advance to the next phase using the
 | Give the specialists a peek at the primary's findings before they report | One shared cue collapses independent reviewers into one. Same block, no shared state, merge only after all have returned. |
 | Treat Phase 4a's A+B agreement as independent confirmation | Same model with two role labels shares its blind spots. A+B agreement is "look here first". Independence comes from Phase 4b's second vendor and the geometry oracle. |
 
-## Phase 4a: Taste round (UI-work only; run ONCE after Phases 1-3 all PASS)
+## Phase 4a: Taste round (UI-work only; run ONCE after Phases 1-3 all ADVANCE)
 
-Phases 1-3 catch correctness. UI-work also needs a TASTE pass — misalignments, generic-AI aesthetic, house-style drift. Runs ONCE after Phase 3 emits PASS, not woven into the earlier phases.
+Phases 1-3 catch correctness. UI-work also needs a TASTE pass — misalignments, generic-AI aesthetic, house-style drift. Runs ONCE after Phase 3 advances, not woven into the earlier phases.
 
 Adapted from `pbakaus/impeccable`'s critique pattern (two independent assessments → synthesis → bounded fix cap; verified via github.com/pbakaus/impeccable 2026). Impeccable's own rule: **"Verify in bounded passes, not a loop... Open-ended self-QA burns the user's money."** Cap: 1 fix round after taste critique. No more.
 
 ### When it fires
 
 - Diff touches HTML templates / view partials / CSS / rendered-view components (see `~/.claude/skills/visual-verify/SKILL.md` glob list)
-- AND Phases 1-3 all landed `PASS`
+- AND Phases 1-3 all ADVANCED. A phase advances on verdict `PASS`, on verdict
+  `PASS_WITH_FIXES` (after the consolidator), or on a gate stop whose routing is
+  `advance` or `advance-with-findings-surfaced`. A `halt-and-pause` stop never
+  reaches Phase 4 — the run is paused, not advanced.
 - AND regenerated screenshots exist for the touched surfaces
+
+Requiring a literal `PASS` from all three would skip 4a/4b on nearly every real
+UI run, which is the forbidden anti-pattern two rows down. Advance is the
+trigger, not `PASS`.
 
 Skip for pure backend / infra / docs work.
 
@@ -656,10 +663,22 @@ Parent takes both reports. Findings that BOTH assessments flag = high-confidence
 
 ### Severity
 
-Same vocabulary as Phases 1-2 + a taste tier:
-- **blocker**: broken layout / unreadable / house-style violation the founder has explicitly ruled on before
-- **should-fix**: obvious visual defect that the founder would catch in review
-- **nit**: subjective polish; skip unless trivial
+**4a emits verdict-schema.json, same as every other phase — no separate
+vocabulary.** Both critics return one verdict object each, parsed by the same
+`jq` cross-validation in step 4. There is no `blocker` / `should-fix` / `nit`
+enum; those words are not schema-parseable and must not appear in a critic
+prompt or a critic's output.
+
+Give each critic the taste tiers as CRITERIA mapped onto the existing enum:
+
+- `BLOCKER` — broken layout, unreadable content, or a house-style rule the
+  founder has explicitly ruled on before.
+- `HIGH` — obvious visual defect a reviewer catches on first look.
+- `MEDIUM` — visual defect that only shows in a narrow state or viewport.
+- `LOW` — subjective polish. Consolidator territory; skip unless trivial.
+
+Findings whose confirmation is a taste call carry `unverifiable: true`, per the
+schema.
 
 ### Anti-generic-AI-aesthetic guardrails
 
@@ -677,8 +696,8 @@ From Anthropic `frontend-design` skill + practitioner blogs (design-bootcamp, ai
 ### Bounded fix cap
 
 Max ONE fix pass after taste critique:
-1. Fix everything both critics agree on (blocker + should-fix)
-2. Fix single-critic blockers if reproducible against the artifact
+1. Fix everything both critics agree on at `BLOCKER` or `HIGH`
+2. Fix single-critic `BLOCKER`s if reproducible against the artifact
 3. Re-render affected shots
 4. Founder-taste calls (A-xor-B findings) go to the founder as A/B/C variants via the founder-decision loop, NOT auto-fixed
 
@@ -737,16 +756,20 @@ KNOWN drift-backs (regressed at least once before — flag on sight):
 - Combobox items narrower than the control.
 - Timegrid busy overlay narrower than the column.
 
-For EACH image, emit a JSON object matching the verdict-schema.json used
-elsewhere in this pipeline (severity BLOCKER|HIGH|MEDIUM, autofix_class
-per schema, file, line, rationale). Encode region + rule INSIDE rationale
-as a prefix: `[region: <where>] [rule: <fixed-rule# or drift-back#>] <what
-breaks>`. Example: `[region: top-left option in radiogroup] [rule:
-drift-back#1] radio dot renders above text, not to the left`. Keep total
-rationale ≤200 chars. Use `file` for the image basename and `line: 0`
-(schema requires line; visual findings are whole-image).
+Emit ONE JSON object for this whole call, matching the verdict-schema.json
+used elsewhere in this pipeline. Not one object per image — one object,
+whose `findings` array covers every image you were given (severity
+BLOCKER|HIGH|MEDIUM, autofix_class per schema, file, line, rationale,
+unverifiable). Identify the image PER FINDING: `file` = that image's
+basename, `line: 0` (schema requires line; visual findings are whole-image).
+Encode region + rule INSIDE rationale as a prefix: `[region: <where>]
+[rule: <fixed-rule# or drift-back#>] <what breaks>`. Example: `[region:
+top-left option in radiogroup] [rule: drift-back#1] radio dot renders above
+text, not to the left`. Keep total rationale ≤200 chars.
 
-If nothing to flag on an image, emit an empty findings array for that shot.
+If nothing to flag on ANY image in this call, emit verdict PASS with an
+empty findings array. Do not emit per-image empty arrays — the schema
+permits exactly one findings array per call.
 Do not report LOW / nit — the geometry oracle and 4a already cover polish.
 EOF
 )"
@@ -762,6 +785,10 @@ Repeat per surface. Store outputs under a run-scoped dir (e.g.
 `/tmp/design-review-YYYY-MM-DD/vision-taste/`). Do not batch every surface
 into one invocation — Codex vision recall drops sharply past ~4 images per
 turn, per DiffSpot Hard-tier data.
+
+`--output-schema` returns exactly ONE verdict object per invocation. Attribute
+each finding to its shot via the `file` basename; never ask for or expect a
+per-image object or a per-shot findings array.
 
 **Severity floor, applied by the parent AFTER parsing — never in the prompt.**
 Any returned finding whose `rationale` prefix names a fixed rule or a known
