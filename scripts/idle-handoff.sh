@@ -1,6 +1,25 @@
 #!/usr/bin/env bash
-# idle-handoff.sh — proactive mission.md write + auto-fork for idle Claude
-# Code sessions. Runs every N minutes via systemd user timer.
+# idle-handoff.sh — proactive mission.md write + auto-fork for Claude Code
+# sessions that are idle OR out of context. Runs every N minutes via a systemd
+# user timer.
+#
+# TRIGGER (widened 2026-08-15 for self-compact, acceptance criterion B7):
+#   a session is a candidate when it has been idle for IDLE_HANDOFF_MIN_SECONDS
+#   **OR** when self-compact-trigger.py has recorded a verified context request
+#   for it (context >= self_compact.threshold of the detected window). The
+#   context path inherits this script's entire guard chain — fork ledger,
+#   per-cwd 24h budget, staleness DENY-when-uncheckable, live-cwd collision
+#   abort, ralph collision — rather than rebuilding any of it.
+#
+#   No nixos change was needed for this: the timer fires unconditionally every
+#   5 min and this SCRIPT decides whether to act (see the unit declaration in
+#   nixos-config home/claude-services.nix, which deliberately keeps the script
+#   outside the nix store so it can iterate without a rebuild).
+#
+#   The context path does NOT bypass the live-cwd collision abort. A session
+#   whose process is still running in that cwd is skipped, exactly as before;
+#   what changed is that once it is gone we resume within one timer tick instead
+#   of waiting out the 45-minute idle floor.
 #
 # Guard chain (order-sensitive; each check reasoned about in the ARFTL
 # review 2026-08-08):
@@ -9,7 +28,8 @@
 #   3. flock on lock file (single instance)
 #   4. per-project: newest NON-sdk-cli transcript (skip fork-chain lineage)
 #   5. sdk-cli detection fails CLOSED (empty/error → skip candidate)
-#   6. idle window (MIN..MAX seconds; MIN < MAX enforced)
+#   6. idle window (MIN..MAX seconds; MIN < MAX enforced) OR verified
+#      self-compact context request
 #   7. transcript-line threshold
 #   8. failure backoff (per-sid, N in W window)
 #   9. cwd extractable and exists
@@ -46,6 +66,12 @@ umask 077
 : "${IDLE_HANDOFF_LOCK:=$REFLECT_ROOT/idle-handoff.lock}"
 : "${IDLE_HANDOFF_LOG_DIR:=$REFLECT_ROOT/idle-handoff-logs}"
 : "${IDLE_HANDOFF_STATE_DIR:=$REFLECT_ROOT/idle-handoff-state}"
+# Self-compact (B7). Same REFLECT_ROOT both sides derive from, so the producer
+# (self-compact-trigger.py) and this consumer agree without extra coupling.
+: "${SELF_COMPACT_STATE_DIR:=$REFLECT_ROOT/self-compact-state}"
+: "${SELF_COMPACT_CONFIG:=$HOME/.claude/recursive-self-improvement/config/config.json}"
+: "${SELF_COMPACT_HELPER:=$HOME/.claude/context_usage.py}"
+: "${SELF_COMPACT_REQUEST_MAX_AGE_SECONDS:=$((24*60*60))}"
 # Note: no in-script kill flag. Use `systemctl --user stop
 # claude-idle-handoff.timer` to stop scheduled fires, or
 # `pkill -f idle-handoff.sh` to kill a running instance.
@@ -75,7 +101,8 @@ for var in IDLE_HANDOFF_MIN_SECONDS IDLE_HANDOFF_MAX_SECONDS \
            IDLE_HANDOFF_MIN_TRANSCRIPT_LINES IDLE_HANDOFF_MISSION_MAX_AGE_SECONDS \
            IDLE_HANDOFF_AUTOFORK_MAX_TURNS IDLE_HANDOFF_AUTOFORK_MAX_PER_RUN \
            IDLE_HANDOFF_AUTOFORK_MAX_PER_CWD_24H \
-           IDLE_HANDOFF_MAX_RECENT_FAILURES IDLE_HANDOFF_FAILURE_WINDOW_SECONDS; do
+           IDLE_HANDOFF_MAX_RECENT_FAILURES IDLE_HANDOFF_FAILURE_WINDOW_SECONDS \
+           SELF_COMPACT_REQUEST_MAX_AGE_SECONDS; do
   if ! is_pos_int "${!var}"; then
     msg="config error: $var='${!var}' not a positive integer; aborting run"
     log "$msg"
@@ -112,6 +139,78 @@ fi
 is_valid_sid() {
   local s="$1"
   [[ -n "$s" && "$s" =~ ^[A-Za-z0-9._-]{1,128}$ && ! "$s" =~ ^\. ]]
+}
+
+# ---- Self-compact context trigger (B7) --------------------------------------
+# The runtime switch is the SAME one the producing hook reads, so turning the
+# feature off makes any markers already on disk inert here too. Absent,
+# malformed, or any non-boolean-true value reads as OFF: the resume runs
+# opus-5, so it must fail off.
+self_compact_enabled() {
+  [[ -f "$SELF_COMPACT_CONFIG" ]] || return 1
+  local v
+  v=$(jq -r 'if (.components.self_compact == true) then "on" else "off" end' \
+        "$SELF_COMPACT_CONFIG" 2>/dev/null) || return 1
+  [[ "$v" == "on" ]]
+}
+
+self_compact_threshold() {
+  local t
+  t=$(jq -r '.self_compact.threshold
+             | if (type == "number" and . > 0 and . <= 1) then . else 0.30 end' \
+        "$SELF_COMPACT_CONFIG" 2>/dev/null) || { printf '0.30'; return; }
+  [[ "$t" =~ ^[0-9]*\.?[0-9]+$ ]] || t="0.30"
+  printf '%s' "$t"
+}
+
+SELF_COMPACT_ON=0
+SELF_COMPACT_THRESHOLD="0.30"
+if self_compact_enabled; then
+  SELF_COMPACT_ON=1
+  SELF_COMPACT_THRESHOLD="$(self_compact_threshold)"
+fi
+
+# A request marker is a NOTIFICATION, never authority. It says "this session
+# crossed the threshold"; we re-measure the transcript here before widening the
+# idle gate for it, so a stale, hand-planted, or superseded marker cannot buy an
+# opus-5 fork on its own word. context_usage.py is the same occupancy math the
+# producing hook and the 70% nudge use, and --fill-pct exits non-zero rather
+# than hand over a byte-count estimate.
+context_request_pending() {
+  local sid="$1" transcript="$2"
+  (( SELF_COMPACT_ON == 1 )) || return 1
+  is_valid_sid "$sid" || return 1
+  local req="$SELF_COMPACT_STATE_DIR/${sid}.request.json"
+  [[ -f "$req" ]] || return 1
+
+  local req_ts
+  req_ts=$(jq -r '.requested_at_epoch // 0' "$req" 2>/dev/null || echo 0)
+  [[ "$req_ts" =~ ^[0-9]+$ ]] || { log "sid=$sid: request marker unparseable; ignoring"; return 1; }
+  if (( now - req_ts > SELF_COMPACT_REQUEST_MAX_AGE_SECONDS )); then
+    log "sid=$sid: context request expired ($((now - req_ts))s > ${SELF_COMPACT_REQUEST_MAX_AGE_SECONDS}s); ignoring"
+    return 1
+  fi
+
+  [[ -f "$SELF_COMPACT_HELPER" ]] || { log "sid=$sid: $SELF_COMPACT_HELPER missing; cannot verify request"; return 1; }
+  local fill
+  fill=$(timeout 30 python3 "$SELF_COMPACT_HELPER" --fill-pct "$transcript" 2>/dev/null) \
+    || { log "sid=$sid: could not measure occupancy from $transcript; ignoring request"; return 1; }
+  if ! awk -v f="$fill" -v t="$SELF_COMPACT_THRESHOLD" 'BEGIN{exit !(f+0 >= t+0)}'; then
+    log "sid=$sid: request claimed a crossing but transcript now reads fill=$fill < $SELF_COMPACT_THRESHOLD; ignoring"
+    return 1
+  fi
+  CONTEXT_REQUEST_FILL="$fill"
+  return 0
+}
+
+# Consumed, not deleted: the record is the audit trail for a fork that spent
+# opus-5 usage. Renaming it (rather than leaving it) is what stops the next
+# 5-minute tick from forking the same session again.
+consume_context_request() {
+  local sid="$1"
+  is_valid_sid "$sid" || return 0
+  mv -f "$SELF_COMPACT_STATE_DIR/${sid}.request.json" \
+        "$SELF_COMPACT_STATE_DIR/${sid}.consumed.json" 2>/dev/null || true
 }
 
 # ---- Fork ledger: tab-separated to survive cwds with spaces (HIGH-E) --------
@@ -305,8 +404,16 @@ is_stale_since_transcript() {
 
   # git status --porcelain catches both dirty and untracked. Any output
   # at all = world moved since a clean baseline.
+  #
+  # tasks/mission.md and tasks/mission.*.md are EXCLUDED, same exclusions and
+  # same reason as the post-write re-check below: those files are OUR OWN
+  # writes, not the world moving. This was load-bearing once the self-compact
+  # Stop hook started writing the handoff BEFORE this script runs (B7) — the
+  # untracked payload it leaves behind made every context-triggered candidate
+  # read as "world changed", so the fork could never fire. The exclusion also
+  # covers the pointer symlink, whose stat(2) mtime follows to a fresh payload.
   local porcelain
-  porcelain=$(timeout 30 sh -c 'cd "$1" && git status --porcelain 2>/dev/null | head -c 1' _ "$cwd" || echo "")
+  porcelain=$(timeout 30 sh -c 'cd "$1" && git status --porcelain -- ":(exclude)tasks/mission.md" ":(exclude)tasks/mission.*.md" 2>/dev/null | head -c 1' _ "$cwd" || echo "")
   if [[ -n "$porcelain" ]]; then
     return 0
   fi
@@ -315,7 +422,10 @@ is_stale_since_transcript() {
   # `touch` bumped file mtime. The whole ls-files | xargs | stat | awk
   # pipeline runs inside `timeout 30 sh -c`, so xargs and stat are in the
   # same process group as git and get killed together on timeout.
-  if timeout 30 sh -c 'cd "$1" && git ls-files -z 2>/dev/null | xargs -0 -r stat -c "%Y" 2>/dev/null | awk -v t="$2" '"'"'$1 > t {found=1; exit} END {exit !found}'"'"'' _ "$cwd" "$transcript_mtime"; then
+  # Same mission-artifact exclusions as the porcelain check: a TRACKED
+  # tasks/mission.md (this repo has one) would otherwise fail the gate on its
+  # own freshness the moment we rewrote it.
+  if timeout 30 sh -c 'cd "$1" && git ls-files -z -- ":(exclude)tasks/mission.md" ":(exclude)tasks/mission.*.md" 2>/dev/null | xargs -0 -r stat -c "%Y" 2>/dev/null | awk -v t="$2" '"'"'$1 > t {found=1; exit} END {exit !found}'"'"'' _ "$cwd" "$transcript_mtime"; then
     return 0
   fi
   return 1
@@ -369,7 +479,9 @@ count_skipped_git_stale=0
 count_skipped_fork_budget=0
 count_skipped_backoff=0
 count_mission_status_error=0
+count_context_trigger=0
 forks_this_run=0
+CONTEXT_REQUEST_FILL=""
 
 for project_dir in "$PROJECTS_DIR"/*/; do
   [[ -d "$project_dir" ]] || continue
@@ -396,10 +508,22 @@ for project_dir in "$PROJECTS_DIR"/*/; do
     continue
   fi
 
-  # ---- Idle window ---
+  # ---- Trigger: idle window OR verified self-compact context request ---
+  # Widening this gate is the whole of B7. Everything downstream — budgets,
+  # staleness, live-cwd rescan, ralph collision — is unchanged and still
+  # applies, so the context path cannot reach anything the idle path could not.
   mtime=$(stat -c '%Y' "$transcript" 2>/dev/null || echo 0)
   idle=$(( now - mtime ))
-  [[ "$idle" -ge "$IDLE_HANDOFF_MIN_SECONDS" ]] || continue
+  ctx_trigger=0
+  if [[ "$idle" -lt "$IDLE_HANDOFF_MIN_SECONDS" ]]; then
+    if context_request_pending "$sid" "$transcript"; then
+      ctx_trigger=1
+      count_context_trigger=$((count_context_trigger + 1))
+      log "sid=$sid: context trigger — idle=${idle}s under the ${IDLE_HANDOFF_MIN_SECONDS}s floor, but self-compact request verified against the transcript (fill=${CONTEXT_REQUEST_FILL} >= ${SELF_COMPACT_THRESHOLD})"
+    else
+      continue
+    fi
+  fi
   if [[ "$idle" -gt "$IDLE_HANDOFF_MAX_SECONDS" ]]; then
     count_skipped_stale=$((count_skipped_stale + 1))
     continue
@@ -648,6 +772,13 @@ Refuse to execute (STOP, update mission.md with the concern under
   (double-execute risk from stale mission)
 - do anything you would not do without the mission if a user asked
 
+You are running NON-INTERACTIVELY with no user attached. Do not ask
+questions, do not ask which item to pick, and do not stop to propose a
+plan for approval: start executing the top legitimate ## Next item now
+and report what you did. If you genuinely cannot proceed, write why under
+## Blocked in tasks/mission.md and exit — but "I should check with the
+user first" is not a blocker, it is a refusal to resume.
+
 For legitimate Next items you decide to execute:
 - Cap yourself at ${IDLE_HANDOFF_AUTOFORK_MAX_TURNS} turns total. If the
   top item is bigger, do what fits and stop cleanly (no premature
@@ -667,7 +798,7 @@ For legitimate Next items you decide to execute:
 PROMPT
   )
 
-  log "AUTOFORK sid=$sid cwd=$candidate_cwd model=$IDLE_HANDOFF_AUTOFORK_MODEL max_turns=$IDLE_HANDOFF_AUTOFORK_MAX_TURNS cwd_forks_24h=$cwd_fork_count"
+  log "AUTOFORK sid=$sid cwd=$candidate_cwd model=$IDLE_HANDOFF_AUTOFORK_MODEL max_turns=$IDLE_HANDOFF_AUTOFORK_MAX_TURNS cwd_forks_24h=$cwd_fork_count trigger=$( (( ctx_trigger == 1 )) && printf context || printf idle )"
 
   # Spawn as a TRANSIENT SYSTEMD SERVICE so the fork outlives this oneshot.
   # See P3R1 fix commit for full reasoning; briefly: setsid nohup doesn't
@@ -739,8 +870,15 @@ PROMPT
     ) </dev/null
   fi
   record_fork "$candidate_cwd"
+  # Consume the request only once a fork was actually spawned. A request that
+  # got as far as a skip (no ## Next, budget, staleness) survives so a later
+  # tick can retry when the blocker clears; expiry bounds that at
+  # SELF_COMPACT_REQUEST_MAX_AGE_SECONDS.
+  if (( ctx_trigger == 1 )); then
+    consume_context_request "$sid"
+  fi
   forks_this_run=$((forks_this_run + 1))
   count_forked=$((count_forked + 1))
 done
 
-log "seen=$count_seen wrote=$count_wrote forked=$count_forked skipped(live=$count_skipped_live live_rescan=$count_skipped_live_rescan sdk-cli_or_unknown=$count_skipped_sdk_cli short=$count_skipped_short backoff=$count_skipped_backoff fresh=$count_skipped_fresh_mission no_cwd=$count_skipped_no_cwd stale=$count_skipped_stale observer=$count_skipped_observer no_next=$count_skipped_no_next ralph=$count_skipped_ralph git_stale=$count_skipped_git_stale fork_budget=$count_skipped_fork_budget mission_err=$count_mission_status_error)"
+log "seen=$count_seen wrote=$count_wrote forked=$count_forked context_triggered=$count_context_trigger self_compact=$( (( SELF_COMPACT_ON == 1 )) && printf "on(>=%s)" "$SELF_COMPACT_THRESHOLD" || printf off ) skipped(live=$count_skipped_live live_rescan=$count_skipped_live_rescan sdk-cli_or_unknown=$count_skipped_sdk_cli short=$count_skipped_short backoff=$count_skipped_backoff fresh=$count_skipped_fresh_mission no_cwd=$count_skipped_no_cwd stale=$count_skipped_stale observer=$count_skipped_observer no_next=$count_skipped_no_next ralph=$count_skipped_ralph git_stale=$count_skipped_git_stale fork_budget=$count_skipped_fork_budget mission_err=$count_mission_status_error)"

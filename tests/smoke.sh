@@ -2136,12 +2136,21 @@ B7_H="$(sc_home)"
 sc_write_config "$B7_H" on 0.30
 B7_ARGV="$B7_H/autofork-argv.txt"
 
-# Candidate project: a clean git repo whose HEAD predates the transcript.
+# Candidate project: a clean git repo whose HEAD *and* tracked-file mtimes
+# predate the transcript, so the inherited staleness gate reads "world has not
+# moved". (Both halves matter: the gate compares the commit timestamp AND every
+# tracked file's mtime against the transcript.)
+mk_candidate_repo() {
+  local d="$1" old
+  old="@$(date -d '30 minutes ago' +%s)"
+  ( cd "$d" && git init -q . && git config user.email t@example.com \
+    && git config user.name t && echo baseline > src.txt && git add src.txt \
+    && GIT_AUTHOR_DATE="$old" GIT_COMMITTER_DATE="$old" git commit -qm baseline \
+    && touch -d '30 minutes ago' src.txt )
+}
 B7_CWD="$(mktemp -d -t reflect-b7cwd-XXXXXX)"
 assert_isolated_cwd "$B7_CWD"
-( cd "$B7_CWD" && git init -q . && git config user.email t@example.com \
-  && git config user.name t && echo baseline > src.txt && git add src.txt \
-  && git commit -qm baseline ) || fail "24: could not build candidate repo"
+mk_candidate_repo "$B7_CWD" || fail "24: could not build candidate repo"
 
 B7_SID="test-sid-b7-context"
 B7_PROJ="$B7_H/.claude/projects/-tmp-b7"
@@ -2153,9 +2162,7 @@ mk_context_transcript "$B7_TP" "claude-opus-5" 330000 "$B7_CWD" 25
 B7_CTRL_SID="test-sid-b7-control"
 B7_CTRL_CWD="$(mktemp -d -t reflect-b7ctrl-XXXXXX)"
 assert_isolated_cwd "$B7_CTRL_CWD"
-( cd "$B7_CTRL_CWD" && git init -q . && git config user.email t@example.com \
-  && git config user.name t && echo baseline > src.txt && git add src.txt \
-  && git commit -qm baseline ) || fail "24: could not build control repo"
+mk_candidate_repo "$B7_CTRL_CWD" || fail "24: could not build control repo"
 B7_CTRL_PROJ="$B7_H/.claude/projects/-tmp-b7ctrl"
 mkdir -p "$B7_CTRL_PROJ"
 mk_context_transcript "$B7_CTRL_PROJ/$B7_CTRL_SID.jsonl" "claude-opus-5" 330000 "$B7_CTRL_CWD" 25
