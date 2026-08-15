@@ -173,8 +173,18 @@ The internal budget must therefore always win:
 precompact 40 s + kill grace 10 s + reserve 5 s = 55 s worst case  <=  60 s cap
 ```
 
-`bash reflect.sh --budgets` prints the live arithmetic. Only `precompact` is
+`bash reflect.sh --budgets` prints the live arithmetic, including
+`max_synchronous_budget_seconds` (= cap − grace − reserve). Only `precompact` is
 synchronous; the detached modes are off the hook clock.
+
+**The arithmetic is enforced, not just documented.** `REFLECT_BUDGET_PRECOMPACT`
+is an operator-facing override, and 50 would give 50 + 10 + 5 = 65 > 60 — the
+external SIGKILL wins again and the manifest is orphaned at `started`. An
+over-cap override is therefore **clamped** to `max_synchronous_budget_seconds`
+and the clamp is logged to stderr; a non-numeric or non-positive value resets to
+the shipped 40 s and is logged the same way. Clamping rather than refusing keeps
+reflection working when someone mis-sets a variable, and the log line means it is
+never a silent behaviour change. Detached budgets are not clamped.
 
 ### Detached spawn
 
@@ -208,6 +218,19 @@ their own terminal write, demoting any `started` older than
 pre-filters candidates on manifest mtime and `REFLECT_REAP_MAX_PER_RUN` caps
 the batch. It never runs on the synchronous precompact path.
 
+**Known, accepted TOCTOU (LOW).** The reaper decides "stale" and then writes,
+without holding the mode's lock. A worker whose model call outlives
+`REFLECT_STALE_STARTED_SECONDS` (default 600 s — over 6× the longest budget) can
+therefore have its `started` flipped to `error` while it is still alive, and its
+own `complete` write then lands afterwards. The damage is bounded by design: the
+per-mode `final_complete` flag is OR-latched in `write_manifest`, so a real
+completion cannot be un-completed by a reap that raced it — the observable
+residue is a stale `reason: orphaned_started_reaped` alongside a completed mode.
+Left as is deliberately: holding the per-mode lock across the sweep would make
+the reaper contend with the very workers it exists to clean up after, and the
+alternative (a liveness probe per manifest) buys nothing the latch does not
+already guarantee.
+
 ### Mission artifact layout
 
 ```
@@ -219,9 +242,42 @@ tasks/mission.md         convenience symlink for humans and existence checks onl
 symlink; mission mode refuses to move it when a foreign or unstamped regular file
 owns that path, so it can legitimately hold an unrelated mission belonging to a
 human while our handoff sits in the suffixed payload. Every automated consumer
-resolves through `reflect.sh --mission-path`, which returns a payload of our own
-stamp lineage or nothing — and "nothing" means do not act, never "read the
-pointer instead". An existence check may glob `tasks/mission*.md`.
+resolves through `reflect.sh --mission-path`, which returns an **authenticated**
+payload or nothing — and "nothing" means do not act, never "read the pointer
+instead". An existence check may glob `tasks/mission*.md`.
+
+#### Payload authentication — why the stamp alone is not evidence
+
+The stamp is plain text in a file inside a git repo. It carries no secret, so repo
+content can forge it. Four printf lines in a cloned repo were once enough to make
+`--mission-path` resolve an attacker's `## Next` list, which
+`scripts/idle-handoff.sh` would then hand to an unattended
+`claude -p --permission-mode acceptEdits` fork. A guard inside the repo cannot fix
+that — the attacker owns the repo. So a payload must satisfy all four of:
+
+1. basename is `mission.<sid>.md` with a sid passing `is_valid_sid`
+2. line 1 carries our stamp **and that stamp names a `sid=`** (no longer optional)
+3. the stamp's sid equals the filename's sid
+4. `$REFLECT_ROOT/sessions/<sid>/` exists — the directory this machine created
+   when it actually ran that session, and the one thing repo content cannot
+   fabricate
+
+Every refusal is logged with its reason (`reflect: mission payload REFUSED — …`);
+`idle-handoff.sh` collects those in `idle-handoff-logs/mission-resolve.log`.
+
+The sid-less stamp shape survives for exactly two non-authentication decisions:
+preserving a pre-pointer regular `tasks/mission.md` before installing the pointer,
+and the GC safety rail (never delete a file that is not machine-written).
+
+**Consequence in `idle-handoff.sh`, deliberate:** its git freshness gates exclude
+the pointer plus the specific payload paths that authenticated — never a
+`tasks/mission.*.md` glob. A mission-shaped file we did *not* write therefore
+stays visible to `git status --porcelain`, so it reads as "the world moved" and
+autofork denies. That is the intended trade: a payload that cannot be
+authenticated must not be able to hide tree changes from the gate meant to catch
+them, and DENY-when-uncheckable is this script's standing doctrine. Practical
+effect: an untracked payload from another machine parked in a project's `tasks/`
+suppresses autoforks there until it is removed.
 
 The payload name embeds the session id, so a machine write can never land on a
 path a human owns. The pointer keeps `tasks/mission.md` — the path the
@@ -237,8 +293,14 @@ protects the payload; it only decides whether the pointer may move:
 | regular file, foreign or unstamped | payload only; leave it untouched, record the refusal |
 
 `bash reflect.sh --mission-path <project-dir>` resolves the current payload
-(pointer, else newest stamped payload by mtime) and logs how it resolved, so a
-missing or dangling pointer never resolves silently. Payloads are
+(pointer, else newest authenticated payload by mtime) and logs how it resolved, so
+a missing or dangling pointer never resolves silently. **Argument units differ by
+seam, on purpose:** `--mission-path` and `idle-handoff.sh:mission_resolve_ours`
+take the **project root** and append `/tasks` themselves, while
+`lib.sh:mission_resolve` / `mission_newest_payload` / `mission_gc` take the
+**tasks directory**. A mismatch fails closed — it simply finds no payloads — with
+only a stderr line to say so, which is why every one of those parameters is now
+named for its unit (`project_cwd` vs `tasks_dir`) at both ends. Payloads are
 garbage-collected once `reflections/sessions/<sid>/` is gone or they exceed
 `REFLECT_MISSION_RETENTION_DAYS`; the pointer target is always kept, and GC only
 ever touches files that both match `mission.<valid-sid>.md` and carry our stamp.
@@ -265,6 +327,31 @@ handoff and records a request; `scripts/idle-handoff.sh` performs the
 reset+resume under its own guard chain. Nothing here auto-invokes `/compact` or
 `/clear` — neither is agent-triggerable, and "reset" means the *next* process is
 a fresh one seeded from the handoff.
+
+**What the switch does and does not gate.** `components.self_compact` gates the
+CONTEXT trigger — the Stop hook and idle-handoff's widening of its idle floor.
+It does **not** gate autofork itself: with the flag `false`, a session idle for
+`IDLE_HANDOFF_MIN_SECONDS` (45 min) is still resumed by an unattended
+`--permission-mode acceptEdits` fork, exactly as it was before self-compact
+existed. That is pre-existing, sanctioned idle-handoff behaviour; to stop
+autoforking entirely, stop the timer
+(`systemctl --user disable --now claude-idle-handoff.timer`).
+
+**The threshold is validated at both ends, identically.** A `threshold` that is
+present but not a number in (0, 1] — or a `max_fires_per_session` outside [1, 100]
+— turns the feature OFF and logs why, in `self-compact-trigger.py` *and* in
+`scripts/idle-handoff.sh`. Firing at an unconfigured default is worse than not
+firing, and the two ends silently disagreeing is worse still. An absent key is
+still the documented default (0.30 / 3).
+
+**A reading with an unknown context window cannot spend money.** `context_usage.py`
+reports `window_known: false` when the model family is in neither of its prefix
+tables and observed usage has not exceeded the 200k base — the window is then a
+lower bound, and a 1M session measured against it reads ~5× high. `--fill-pct`
+refuses such a reading and the trigger refuses to fire on it, logging loudly, so
+the table gets updated rather than drifting. Adding a model family means editing
+`ONE_M_MODEL_PREFIXES` or `KNOWN_BASE_MODEL_PREFIXES` — leaving it out is a
+disabled feature, not a wrong number.
 
 ## Inspecting artifacts
 
