@@ -1768,6 +1768,468 @@ STUB
 chmod +x "$STUB_SCRATCH/claude"
 
 # ============================================================================
+# GROUP B — self-compact: threshold trigger, handoff, autonomous resume
+# ============================================================================
+# The trigger fires at a configurable fraction of the DETECTED context window
+# (default 30%), writes a mission handoff, and hands reset+resume to the
+# already-deployed idle-handoff subsystem. It must be impossible for it to loop,
+# and it must be OFF unless one key in the RSI config says otherwise.
+#
+# Shared fixtures for the whole group.
+SC_STATE_DIR="$REFLECT_ROOT/self-compact-state"
+SC_TRIGGER="$WORKTREE/self-compact-trigger.py"
+SC_USAGE="$WORKTREE/context_usage.py"
+
+mk_context_transcript() {
+  # $1=path $2=model $3=total_tokens_on_last_assistant_line [$4=cwd] [$5=n_lines]
+  # The LAST assistant line is what occupancy reads; user lines exist so
+  # context-baggage.py's every-5-messages gate can be exercised too.
+  local path="$1" model="$2" tokens="$3" cwd="${4:-}" nlines="${5:-5}"
+  local read_tok=$(( tokens - 1000 ))
+  : > "$path"
+  local i
+  for (( i = 0; i < nlines; i++ )); do
+    jq -cn --arg cwd "$cwd" --argjson ep 1 \
+      '{type:"user",message:{role:"user",content:"work"},cwd:$cwd,entrypoint:"cli"}' >> "$path"
+  done
+  jq -cn --arg m "$model" --argjson r "$read_tok" --arg cwd "$cwd" \
+    '{type:"assistant",cwd:$cwd,message:{role:"assistant",model:$m,
+      content:[{type:"text",text:"ok"}],
+      usage:{input_tokens:500,cache_creation_input_tokens:500,
+             cache_read_input_tokens:$r,output_tokens:10}}}' >> "$path"
+}
+
+sc_home() {
+  # An isolated $HOME wired to THIS worktree, so the hook and idle-handoff.sh
+  # resolve their $HOME-derived paths into the code under test instead of the
+  # live ~/.claude deployment. No test-only env seams needed.
+  local h
+  h="$(mktemp -d -t reflect-schome-XXXXXX)"
+  mkdir -p "$h/.claude/recursive-self-improvement/config" "$h/.claude/projects"
+  ln -s "$WORKTREE/skills" "$h/.claude/skills"
+  ln -s "$WORKTREE/scripts" "$h/.claude/scripts"
+  ln -s "$SC_USAGE" "$h/.claude/context_usage.py"
+  ln -s "$SC_TRIGGER" "$h/.claude/self-compact-trigger.py"
+  printf '%s' "$h"
+}
+
+sc_write_config() {
+  # $1=home  $2=on|off|absent|malformed|nokey  [$3=threshold] [$4=max_fires]
+  local h="$1" mode="$2" thr="${3:-0.30}" maxf="${4:-3}"
+  local cfg="$h/.claude/recursive-self-improvement/config/config.json"
+  case "$mode" in
+    absent)    rm -f "$cfg" ;;
+    malformed) printf '{ "components": {' > "$cfg" ;;
+    nokey)     printf '{"components":{"daily_review":false}}\n' > "$cfg" ;;
+    *)
+      local on=false
+      [[ "$mode" == "on" ]] && on=true
+      jq -n --argjson on "$on" --argjson t "$thr" --argjson m "$maxf" \
+        '{components:{daily_review:false,self_compact:$on},
+          self_compact:{threshold:$t,max_fires_per_session:$m}}' > "$cfg" ;;
+  esac
+}
+
+sc_fire() {
+  # $1=home $2=sid $3=cwd $4=transcript ; prints hook stdout, returns hook rc
+  local h="$1" sid="$2" cwd="$3" tp="$4"
+  jq -cn --arg sid "$sid" --arg tp "$tp" --arg cwd "$cwd" \
+    '{session_id:$sid,transcript_path:$tp,hook_event_name:"Stop",cwd:$cwd,stop_hook_active:false}' \
+    | HOME="$h" CLAUDE_CODE_ENTRYPOINT=cli REFLECT_ROOT="$REFLECT_ROOT" \
+      python3 "$h/.claude/self-compact-trigger.py"
+}
+
+# Mission body lives in a FILE and reaches the stub via `jq --rawfile`: the stub
+# is generated with an expanding heredoc, so a body carrying backticks or $ would
+# otherwise be command-substituted at generation time.
+SC_MISSION_FILE="$REFLECT_ROOT/sc-mission-body.md"
+cat >"$SC_MISSION_FILE" <<'BODY'
+# Mission — self-compact handoff
+
+## Done
+- landed `context_usage.py` (shared occupancy math)
+
+## Next
+- run `bash tests/smoke.sh` and fix the first failure
+
+## Blocked
+- (none)
+
+## Open questions
+- (none)
+
+## State on disk
+- (none)
+BODY
+
+counting_stub() {
+  # $1=absolute counter file, $2=absolute mission-body file. Both are baked in
+  # as literals so the stub also works inside a transient systemd unit, which
+  # inherits no environment.
+  cat >"$STUB_SCRATCH/claude" <<STUB
+#!/usr/bin/env bash
+cat >/dev/null || true
+printf 'call\n' >> '$1'
+jq -cn --rawfile r '$2' '{type:"result",result:\$r,usage:{"input_tokens":9,"cache_creation_input_tokens":2404,"cache_read_input_tokens":60282,"output_tokens":780}}'
+STUB
+  chmod +x "$STUB_SCRATCH/claude"
+}
+
+sc_wait_mission() {
+  # $1=cwd $2=sid  — poll for the detached mission payload + terminal manifest
+  local cwd="$1" sid="$2" mf="$REFLECT_ROOT/sessions/$2/manifest.json" i
+  for (( i = 0; i < 120; i++ )); do
+    [[ -f "$cwd/tasks/mission.$sid.md" ]] && \
+      jq -e '.modes.mission.status == "complete"' "$mf" >/dev/null 2>&1 && return 0
+    sleep 0.25
+  done
+  return 1
+}
+
+# ============================================================================
+# TEST 20: B1 — occupancy math lives in ONE place and keeps the 70% nudge
+# ============================================================================
+echo "TEST 20: B1 — shared context-occupancy module, 70% nudge preserved"
+[[ -f "$SC_USAGE" ]] || fail "20: shared occupancy module missing at $SC_USAGE"
+B1_DIR="$(mktemp -d -t reflect-b1-XXXXXX)"
+
+mk_context_transcript "$B1_DIR/t1.jsonl" "claude-opus-5" 310000
+B1_J="$(python3 "$SC_USAGE" "$B1_DIR/t1.jsonl")" || fail "20: context_usage.py rc!=0"
+jq -e '.window == 1000000' <<<"$B1_J" >/dev/null \
+  || fail "20: opus-5 must detect a 1M window (got $(jq -c .window <<<"$B1_J"))"
+jq -e '.total_tokens == 310000' <<<"$B1_J" >/dev/null \
+  || fail "20: total must sum input+cache_creation+cache_read on the LAST assistant line (got $(jq -c .total_tokens <<<"$B1_J"))"
+jq -e '.fill_pct > 0.3099 and .fill_pct < 0.3101' <<<"$B1_J" >/dev/null \
+  || fail "20: fill_pct wrong (got $(jq -c .fill_pct <<<"$B1_J"))"
+jq -e '.estimated == false' <<<"$B1_J" >/dev/null || fail "20: reading from real usage must not be flagged estimated"
+
+# The `[1m]` marker must win over an unknown model name — that marker going
+# unread is exactly how the nudge once reported 89% during an 18% session.
+mk_context_transcript "$B1_DIR/t2.jsonl" "claude-zeta-9-20991231[1m]" 250000
+jq -e '.window == 1000000' <<<"$(python3 "$SC_USAGE" "$B1_DIR/t2.jsonl")" >/dev/null \
+  || fail "20: [1m] marker not honoured for an unknown model id"
+# 200k model stays 200k...
+mk_context_transcript "$B1_DIR/t3.jsonl" "claude-3-5-haiku-20241022" 100000
+jq -e '.window == 200000' <<<"$(python3 "$SC_USAGE" "$B1_DIR/t3.jsonl")" >/dev/null \
+  || fail "20: unknown/legacy model must default to the 200k base window"
+# ...unless observed usage already exceeded it.
+mk_context_transcript "$B1_DIR/t4.jsonl" "claude-3-5-haiku-20241022" 250000
+jq -e '.window == 1000000' <<<"$(python3 "$SC_USAGE" "$B1_DIR/t4.jsonl")" >/dev/null \
+  || fail "20: observed-usage fallback must promote the window to 1M"
+# No usage at all -> estimate, and the CLI must refuse to hand a number to the
+# trigger (firing an expensive path off a byte-count guess is not acceptable).
+printf '%s\n' '{"type":"user","message":{"role":"user","content":"hi"}}' > "$B1_DIR/t5.jsonl"
+jq -e '.estimated == true' <<<"$(python3 "$SC_USAGE" "$B1_DIR/t5.jsonl")" >/dev/null \
+  || fail "20: a usage-free transcript must be flagged estimated"
+python3 "$SC_USAGE" --fill-pct "$B1_DIR/t5.jsonl" >/dev/null 2>&1 \
+  && fail "20: --fill-pct must FAIL on an estimated reading"
+
+# Structural: context-baggage.py must consume the module, not carry a second copy.
+grep -q 'context_usage' "$WORKTREE/context-baggage.py" \
+  || fail "20: context-baggage.py does not use the shared module"
+[[ "$(grep -c 'ONE_M_MODEL_PREFIXES *= *(' "$WORKTREE/context-baggage.py")" == "0" ]] \
+  || fail "20: context-baggage.py still defines its own window-detection table (copy-paste)"
+
+# Behavioural: the 70% nudge is a separate, still-wanted feature.
+mk_context_transcript "$B1_DIR/t70.jsonl" "claude-opus-5" 750000
+B1_OUT="$(jq -cn --arg tp "$B1_DIR/t70.jsonl" '{transcript_path:$tp}' \
+  | python3 "$WORKTREE/context-baggage.py")" || fail "20: context-baggage.py rc!=0"
+grep -q 'Context is 75% full' <<<"$B1_OUT" \
+  || fail "20: 70% nudge stopped firing at 75% (out='$B1_OUT')"
+B1_OUT31="$(jq -cn --arg tp "$B1_DIR/t1.jsonl" '{transcript_path:$tp}' \
+  | python3 "$WORKTREE/context-baggage.py")" || fail "20: context-baggage.py rc!=0 at 31%"
+[[ -z "$B1_OUT31" ]] \
+  || fail "20: the 30% self-compact threshold leaked into the 70% nudge (out='$B1_OUT31')"
+info "one occupancy implementation; 1M/[1m]/observed/estimate all correct; 70% nudge intact"
+
+# ============================================================================
+# TEST 21: B5 — ships OFF; absent or malformed config reads as OFF
+# ============================================================================
+echo "TEST 21: B5 — off by default, fails off, one-key enable"
+[[ -f "$SC_TRIGGER" ]] || fail "21: trigger missing at $SC_TRIGGER"
+jq -e '.components.self_compact == false' \
+  "$WORKTREE/recursive-self-improvement/config/config.json" >/dev/null \
+  || fail "21: shipped config must carry components.self_compact = false"
+
+B5_H="$(sc_home)"
+B5_CWD="$(mktemp -d -t reflect-b5cwd-XXXXXX)"
+assert_isolated_cwd "$B5_CWD"
+mk_context_transcript "$B5_H/t.jsonl" "claude-opus-5" 400000 "$B5_CWD"
+counting_stub "$B5_H/calls" "$SC_MISSION_FILE"
+
+for mode in absent malformed nokey off; do
+  sc_write_config "$B5_H" "$mode"
+  B5_SID="test-sid-b5-$mode"
+  B5_OUT="$(sc_fire "$B5_H" "$B5_SID" "$B5_CWD" "$B5_H/t.jsonl")"
+  rc=$?
+  (( rc == 0 )) || fail "21: config=$mode must exit 0 (got $rc)"
+  [[ -z "$B5_OUT" ]] || fail "21: config=$mode produced stdout: $B5_OUT"
+  sleep 0.5
+  [[ ! -e "$SC_STATE_DIR/$B5_SID.request.json" ]] \
+    || fail "21: config=$mode still requested a self-compact"
+  [[ ! -e "$B5_CWD/tasks" ]] \
+    || fail "21: config=$mode still wrote a handoff into the project"
+done
+[[ ! -s "$B5_H/calls" ]] || fail "21: a disabled trigger spent model calls ($(wc -l <"$B5_H/calls"))"
+
+# A non-boolean truthy value must NOT enable it — expensive fails off.
+jq -n '{components:{self_compact:"true"},self_compact:{threshold:0.30}}' \
+  > "$B5_H/.claude/recursive-self-improvement/config/config.json"
+sc_fire "$B5_H" "test-sid-b5-stringtrue" "$B5_CWD" "$B5_H/t.jsonl" >/dev/null
+sleep 0.5
+[[ ! -e "$SC_STATE_DIR/test-sid-b5-stringtrue.request.json" ]] \
+  || fail "21: components.self_compact=\"true\" (string) enabled the trigger"
+info "absent/malformed/missing-key/false/string-true all read as OFF; no model calls"
+
+# ============================================================================
+# TEST 22: B1+B2 — fires at the threshold and leaves a resumable handoff
+# ============================================================================
+echo "TEST 22: B1+B2 — fires at 30%, handoff has done/next/blocked/open questions"
+B2_H="$(sc_home)"
+sc_write_config "$B2_H" on 0.30
+B2_CWD="$(mktemp -d -t reflect-b2cwd-XXXXXX)"
+assert_isolated_cwd "$B2_CWD"
+counting_stub "$B2_H/calls" "$SC_MISSION_FILE"
+
+# Below threshold: nothing happens at all.
+B2_UNDER_SID="test-sid-b2-under"
+mk_context_transcript "$B2_H/under.jsonl" "claude-opus-5" 290000 "$B2_CWD"
+sc_fire "$B2_H" "$B2_UNDER_SID" "$B2_CWD" "$B2_H/under.jsonl" >/dev/null \
+  || fail "22: under-threshold fire rc!=0"
+sleep 0.5
+[[ ! -e "$SC_STATE_DIR/$B2_UNDER_SID.request.json" ]] \
+  || fail "22: fired at 29% with a 30% threshold"
+
+# At/over threshold: fire.
+B2_SID="test-sid-b2-fire"
+mk_context_transcript "$B2_H/over.jsonl" "claude-opus-5" 310000 "$B2_CWD"
+t0=$(date +%s%N)
+B2_OUT="$(sc_fire "$B2_H" "$B2_SID" "$B2_CWD" "$B2_H/over.jsonl")"
+rc=$?
+t1=$(date +%s%N)
+b2_ms=$(( (t1 - t0) / 1000000 ))
+(( rc == 0 )) || fail "22: trigger rc=$rc (a Stop hook exiting non-zero BLOCKS the stop)"
+[[ -z "$B2_OUT" ]] \
+  || fail "22: trigger wrote to stdout ('$B2_OUT'); a Stop hook emitting a decision would race ralph-loop"
+(( b2_ms < 20000 )) || fail "22: trigger held the Stop hook for ${b2_ms}ms (60s cap is hard)"
+
+sc_wait_mission "$B2_CWD" "$B2_SID" \
+  || fail "22: no mission handoff at $B2_CWD/tasks/mission.$B2_SID.md (dir: $(ls "$B2_CWD/tasks" 2>&1))"
+B2_MISSION="$B2_CWD/tasks/mission.$B2_SID.md"
+for section in '## Done' '## Next' '## Blocked' '## Open questions'; do
+  grep -qF "$section" "$B2_MISSION" || fail "22: handoff missing '$section' — not resumable without transcript"
+done
+[[ -L "$B2_CWD/tasks/mission.md" ]] || fail "22: discovery pointer tasks/mission.md not installed"
+
+B2_REQ="$SC_STATE_DIR/$B2_SID.request.json"
+[[ -f "$B2_REQ" ]] || fail "22: no persisted self-compact request marker at $B2_REQ"
+jq -e --arg c "$B2_CWD" '.cwd == $c and .window == 1000000 and .tokens == 310000
+                          and .threshold == 0.30 and (.requested_at_epoch|type) == "number"' \
+  "$B2_REQ" >/dev/null || fail "22: request marker incomplete: $(cat "$B2_REQ")"
+jq -e '.fires == 1 and .armed == false' "$SC_STATE_DIR/$B2_SID.state.json" >/dev/null \
+  || fail "22: state after one fire wrong: $(cat "$SC_STATE_DIR/$B2_SID.state.json")"
+assert_repo_tasks_untouched "after TEST 22 (self-compact fire)"
+info "fired at 31% in ${b2_ms}ms, silent stdout, 4-section handoff + pointer written"
+
+# Subprocess / non-cli entrypoints must never fire (fork-chain break).
+B2_SUB_SID="test-sid-b2-subprocess"
+jq -cn --arg sid "$B2_SUB_SID" --arg tp "$B2_H/over.jsonl" --arg cwd "$B2_CWD" \
+  '{session_id:$sid,transcript_path:$tp,hook_event_name:"Stop",cwd:$cwd}' \
+  | HOME="$B2_H" CLAUDE_CODE_ENTRYPOINT=cli REFLECT_SUBPROCESS=1 REFLECT_ROOT="$REFLECT_ROOT" \
+    python3 "$B2_H/.claude/self-compact-trigger.py" >/dev/null \
+  || fail "22: REFLECT_SUBPROCESS fire rc!=0"
+B2_SDK_SID="test-sid-b2-sdkcli"
+jq -cn --arg sid "$B2_SDK_SID" --arg tp "$B2_H/over.jsonl" --arg cwd "$B2_CWD" \
+  '{session_id:$sid,transcript_path:$tp,hook_event_name:"Stop",cwd:$cwd}' \
+  | HOME="$B2_H" CLAUDE_CODE_ENTRYPOINT=sdk-cli REFLECT_ROOT="$REFLECT_ROOT" \
+    python3 "$B2_H/.claude/self-compact-trigger.py" >/dev/null \
+  || fail "22: sdk-cli fire rc!=0"
+sleep 0.5
+[[ ! -e "$SC_STATE_DIR/$B2_SUB_SID.request.json" ]] \
+  || fail "22: fired inside a reflection subprocess — unbounded recursion"
+[[ ! -e "$SC_STATE_DIR/$B2_SDK_SID.request.json" ]] \
+  || fail "22: fired inside a headless sdk-cli run — fork chain"
+info "reflection subprocess and sdk-cli entrypoints refuse to fire"
+
+# ============================================================================
+# TEST 23: B6 — cannot fire in a loop
+# ============================================================================
+echo "TEST 23: B6 — once per session per crossing, capped, persisted"
+B6_H="$(sc_home)"
+sc_write_config "$B6_H" on 0.30 2      # max_fires_per_session = 2
+B6_CWD="$(mktemp -d -t reflect-b6cwd-XXXXXX)"
+assert_isolated_cwd "$B6_CWD"
+B6_CALLS="$B6_H/calls"
+counting_stub "$B6_CALLS" "$SC_MISSION_FILE"
+B6_SID="test-sid-b6-loop"
+B6_TP="$B6_H/t.jsonl"
+
+sc_calls() { [[ -f "$B6_CALLS" ]] && wc -l < "$B6_CALLS" | tr -d ' ' || echo 0; }
+
+mk_context_transcript "$B6_TP" "claude-opus-5" 320000 "$B6_CWD"
+sc_fire "$B6_H" "$B6_SID" "$B6_CWD" "$B6_TP" >/dev/null || fail "23: first fire rc!=0"
+sc_wait_mission "$B6_CWD" "$B6_SID" || fail "23: first fire wrote no handoff"
+(( $(sc_calls) == 1 )) || fail "23: first crossing made $(sc_calls) model calls, expected 1"
+
+# Same crossing, three more Stop events: must be silent.
+for _ in 1 2 3; do
+  mk_context_transcript "$B6_TP" "claude-opus-5" 340000 "$B6_CWD"
+  sc_fire "$B6_H" "$B6_SID" "$B6_CWD" "$B6_TP" >/dev/null || fail "23: repeat fire rc!=0"
+done
+sleep 1.5
+(( $(sc_calls) == 1 )) \
+  || fail "23: LOOP — $(sc_calls) model calls for one threshold crossing"
+jq -e '.fires == 1 and .crossings == 1' "$SC_STATE_DIR/$B6_SID.state.json" >/dev/null \
+  || fail "23: state drifted on repeat Stops: $(cat "$SC_STATE_DIR/$B6_SID.state.json")"
+
+# Drop below threshold -> re-arm (this is what "per crossing" means).
+mk_context_transcript "$B6_TP" "claude-opus-5" 90000 "$B6_CWD"
+sc_fire "$B6_H" "$B6_SID" "$B6_CWD" "$B6_TP" >/dev/null || fail "23: re-arm fire rc!=0"
+jq -e '.armed == true and .fires == 1' "$SC_STATE_DIR/$B6_SID.state.json" >/dev/null \
+  || fail "23: a below-threshold reading must re-arm: $(cat "$SC_STATE_DIR/$B6_SID.state.json")"
+(( $(sc_calls) == 1 )) || fail "23: re-arming spent a model call"
+
+# Second crossing fires; then the per-session cap holds.
+mk_context_transcript "$B6_TP" "claude-opus-5" 350000 "$B6_CWD"
+sc_fire "$B6_H" "$B6_SID" "$B6_CWD" "$B6_TP" >/dev/null || fail "23: second crossing rc!=0"
+for _ in $(seq 1 40); do (( $(sc_calls) >= 2 )) && break; sleep 0.25; done
+(( $(sc_calls) == 2 )) || fail "23: second crossing did not fire (calls=$(sc_calls))"
+mk_context_transcript "$B6_TP" "claude-opus-5" 90000 "$B6_CWD"
+sc_fire "$B6_H" "$B6_SID" "$B6_CWD" "$B6_TP" >/dev/null
+mk_context_transcript "$B6_TP" "claude-opus-5" 360000 "$B6_CWD"
+sc_fire "$B6_H" "$B6_SID" "$B6_CWD" "$B6_TP" >/dev/null || fail "23: capped fire rc!=0"
+sleep 1.5
+(( $(sc_calls) == 2 )) \
+  || fail "23: per-session cap (2) breached — calls=$(sc_calls)"
+jq -e '.capped == true and .fires == 2' "$SC_STATE_DIR/$B6_SID.state.json" >/dev/null \
+  || fail "23: cap not recorded: $(cat "$SC_STATE_DIR/$B6_SID.state.json")"
+
+# An unwritable state dir must fail OFF: no marker = no bound = no fire.
+B6_RO_H="$(sc_home)"
+sc_write_config "$B6_RO_H" on 0.30
+B6_RO_ROOT="$(mktemp -d -t reflect-b6ro-XXXXXX)"
+mkdir -p "$B6_RO_ROOT/self-compact-state"
+chmod 500 "$B6_RO_ROOT/self-compact-state"
+B6_RO_CALLS="$B6_RO_H/calls"
+counting_stub "$B6_RO_CALLS" "$SC_MISSION_FILE"
+jq -cn --arg sid "test-sid-b6-ro" --arg tp "$B6_TP" --arg cwd "$B6_CWD" \
+  '{session_id:$sid,transcript_path:$tp,hook_event_name:"Stop",cwd:$cwd}' \
+  | HOME="$B6_RO_H" CLAUDE_CODE_ENTRYPOINT=cli REFLECT_ROOT="$B6_RO_ROOT" \
+    python3 "$B6_RO_H/.claude/self-compact-trigger.py" >/dev/null
+rc=$?
+(( rc == 0 )) || fail "23: unwritable state dir must not fail the hook (rc=$rc)"
+sleep 0.5
+[[ ! -s "$B6_RO_CALLS" ]] \
+  || fail "23: fired without being able to persist the loop bound"
+chmod 700 "$B6_RO_ROOT/self-compact-state"
+info "1 call per crossing, re-arm below threshold, cap at 2, fails off without a marker"
+
+# ============================================================================
+# TEST 24: B7+B4 — idle-handoff resumes on context, and starts WORKING
+# ============================================================================
+# B7: the deployed idle-handoff timer fires unconditionally every 5 min and the
+# SCRIPT decides whether to act, so widening "idle 45 min" to "idle OR context >=
+# threshold" is a pure ~/.claude edit. This test drives the real script.
+# B4: the spawned process must begin executing ## Next, not ask what to do.
+echo "TEST 24: B7+B4 — context-triggered resume through idle-handoff, non-interactive"
+B7_H="$(sc_home)"
+sc_write_config "$B7_H" on 0.30
+B7_ARGV="$B7_H/autofork-argv.txt"
+
+# Candidate project: a clean git repo whose HEAD predates the transcript.
+B7_CWD="$(mktemp -d -t reflect-b7cwd-XXXXXX)"
+assert_isolated_cwd "$B7_CWD"
+( cd "$B7_CWD" && git init -q . && git config user.email t@example.com \
+  && git config user.name t && echo baseline > src.txt && git add src.txt \
+  && git commit -qm baseline ) || fail "24: could not build candidate repo"
+
+B7_SID="test-sid-b7-context"
+B7_PROJ="$B7_H/.claude/projects/-tmp-b7"
+mkdir -p "$B7_PROJ"
+B7_TP="$B7_PROJ/$B7_SID.jsonl"
+mk_context_transcript "$B7_TP" "claude-opus-5" 330000 "$B7_CWD" 25
+
+# Control: same shape, same idleness, NO self-compact request.
+B7_CTRL_SID="test-sid-b7-control"
+B7_CTRL_CWD="$(mktemp -d -t reflect-b7ctrl-XXXXXX)"
+assert_isolated_cwd "$B7_CTRL_CWD"
+( cd "$B7_CTRL_CWD" && git init -q . && git config user.email t@example.com \
+  && git config user.name t && echo baseline > src.txt && git add src.txt \
+  && git commit -qm baseline ) || fail "24: could not build control repo"
+B7_CTRL_PROJ="$B7_H/.claude/projects/-tmp-b7ctrl"
+mkdir -p "$B7_CTRL_PROJ"
+mk_context_transcript "$B7_CTRL_PROJ/$B7_CTRL_SID.jsonl" "claude-opus-5" 330000 "$B7_CTRL_CWD" 25
+
+# Fire the real Stop hook so the request marker AND the handoff are genuine.
+counting_stub "$B7_H/calls" "$SC_MISSION_FILE"
+sc_fire "$B7_H" "$B7_SID" "$B7_CWD" "$B7_TP" >/dev/null || fail "24: Stop-hook fire rc!=0"
+sc_wait_mission "$B7_CWD" "$B7_SID" || fail "24: Stop hook produced no handoff to resume from"
+[[ -f "$SC_STATE_DIR/$B7_SID.request.json" ]] || fail "24: no request marker to widen the gate with"
+
+# Both sessions are only ~2 min idle — far under the 45-min idle floor.
+touch -d '2 minutes ago' "$B7_TP" "$B7_CTRL_PROJ/$B7_CTRL_SID.jsonl"
+
+# Stub records the fork's argv so we can assert on how it was launched.
+cat >"$STUB_SCRATCH/claude" <<STUB
+#!/usr/bin/env bash
+cat >/dev/null || true
+{ printf '=== argv ===\n'; for a in "\$@"; do printf '%s\n' "\$a"; done; } >> '$B7_ARGV'
+printf 'ok\n'
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+HOME="$B7_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh"
+rc=$?
+(( rc == 0 )) || fail "24: idle-handoff.sh rc=$rc"
+
+for _ in $(seq 1 60); do [[ -s "$B7_ARGV" ]] && break; sleep 0.25; done
+[[ -s "$B7_ARGV" ]] \
+  || fail "24: no fork spawned — the context trigger did not widen the idle gate (log: $(tail -5 "$REFLECT_ROOT/idle-handoff-logs/handoff.log" 2>/dev/null))"
+grep -qF -- '--permission-mode' "$B7_ARGV" || fail "24: fork not launched with a permission mode"
+grep -qF -- 'acceptEdits' "$B7_ARGV" || fail "24: fork not launched with acceptEdits"
+grep -qF -- '-p' "$B7_ARGV" || fail "24: fork not launched headless (-p)"
+# B4: the seed prompt must start work, not ask.
+grep -qi 'no user attached' "$B7_ARGV" \
+  || fail "24: B4 — fork prompt does not tell the resumed process it is unattended"
+grep -qi 'do not ask' "$B7_ARGV" \
+  || fail "24: B4 — fork prompt does not forbid asking the user what to do"
+grep -qF 'tasks/mission.md' "$B7_ARGV" || fail "24: fork prompt does not seed from the handoff"
+grep -qF '## Next' "$B7_ARGV" || fail "24: fork prompt does not point at ## Next"
+
+B7_LOG="$REFLECT_ROOT/idle-handoff-logs/handoff.log"
+grep -q "context trigger" "$B7_LOG" || fail "24: widened trigger not logged (audit trail)"
+grep -q "AUTOFORK sid=$B7_SID" "$B7_LOG" || fail "24: fork not attributed to the requesting sid"
+grep -q "AUTOFORK sid=$B7_CTRL_SID" "$B7_LOG" \
+  && fail "24: control session (2 min idle, no request) was forked — the idle floor was removed, not widened"
+[[ ! -f "$SC_STATE_DIR/$B7_SID.request.json" ]] \
+  || fail "24: request marker not consumed after the fork — next tick would re-fork"
+[[ -f "$SC_STATE_DIR/$B7_SID.consumed.json" ]] \
+  || fail "24: consumed request not retained for audit"
+info "context-triggered fork at 2 min idle; control untouched; prompt is non-interactive"
+
+# The consumer honours the same switch: OFF means a marker is inert.
+: > "$B7_ARGV"
+sc_write_config "$B7_H" off
+cp "$SC_STATE_DIR/$B7_SID.consumed.json" "$SC_STATE_DIR/$B7_SID.request.json"
+touch -d '2 minutes ago' "$B7_TP"
+HOME="$B7_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
+  || fail "24: idle-handoff.sh rc!=0 with the switch off"
+sleep 1
+[[ ! -s "$B7_ARGV" ]] \
+  || fail "24: switch OFF but a pending marker still drove a fork ($(cat "$B7_ARGV"))"
+info "switch off: pending request markers are inert at the consumer too"
+
+# Restore canonical stub.
+cat >"$STUB_SCRATCH/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null || true
+cat <<'JSON'
+{"type":"result","result":"{\"patterns\":[\"stubbed pattern\"],\"discoveries\":[],\"turning_points\":[],\"digressions\":[],\"obstacles_to_autonomy\":[]}","usage":{"cache_read_input_tokens":100,"cache_creation_input_tokens":10,"input_tokens":5,"output_tokens":50}}
+JSON
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+# ============================================================================
 # FINAL GUARD: prove the whole suite left the live repo alone.
 assert_repo_tasks_untouched "end of suite"
 info "live repo tasks/ untouched by the full suite"
