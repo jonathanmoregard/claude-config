@@ -37,7 +37,8 @@ Each Phase 1/2 round follows the same shape:
 
 ```
 1. SELF-REVIEW: read each changed file top-to-bottom (not just diff)
-2. VERIFY: tests + syntax + smoke green before inviting external eyes
+2. VERIFY: tests + syntax + smoke green before inviting external eyes. RECORD
+   this run as the round's BASELINE — `regressed_r` is defined against it
 3. ADVISE: dispatch the phase's advisor (Opus in phase 1, Codex in phase 2)
 4. PARSE + CROSS-VALIDATE verdict: `jq -r '.verdict'` on advisor output; if not parseable JSON, the round FAILED. Then **cross-validate verdict against findings** (the JSON schema enum can't enforce this on its own — `codex --output-schema` and jq both accept incoherent combinations):
 
@@ -61,7 +62,7 @@ Each Phase 1/2 round follows the same shape:
    Any of: unparseable JSON, missing `.verdict`, or verdict/findings mismatch → the round FAILED. Re-dispatch once with an explicit "output valid JSON matching verdict-schema.json AND ensure verdict matches findings (PASS = empty findings; PASS_WITH_FIXES = no BLOCKER/HIGH; BLOCKS = ≥1 BLOCKER/HIGH)" reminder.
 
    Second failure PAUSEs the loop (interactive: prompt user; unattended: append to `pending_for_human.md` and exit `pending-human`). NEVER treat unparseable output or a mismatched verdict as advance-worthy — an incoherent advisor response has produced zero trustworthy coverage.
-4.5. VALIDATE: dispatch a fresh Opus subagent (`Agent(subagent_type="advisor", ...)`) with ONLY the PIVOTAL findings JSON (see "Validate only PIVOTAL findings" below) + absolute paths of files referenced by those findings. `index` is positional within the array you SEND; the parent maps indices back to the full findings list itself. Prompt: "For each finding in the input array, read the file at the given line. Emit a JSON array `[{index, verified, unverifiable_confirmed, note}]` where `index` is the 0-based position of the finding in the input array. `verified=true` iff the described condition is empirically present at that location. `unverifiable_confirmed=true` when the finding was tagged `unverifiable: true` by the parent advisor AND you agree no empirical check applies (subjective — taste, 'could be simpler', style preferences). `verified=false` = parent drops `findings[index]` from the report; `unverifiable_confirmed=true` is informational (parent already knows the tag; you're confirming it can't be checked) and the finding is kept as-is."
+4.5. VALIDATE: dispatch a fresh Opus subagent (`Agent(subagent_type="advisor", ...)`) with ONLY the PIVOTAL findings JSON (see "Validate only PIVOTAL findings" below) + absolute paths of files referenced by those findings. `index` is positional within the array you SEND; the parent maps indices back to the full findings list itself. Prompt: "For each finding in the input array, read the file at the given line. Emit a JSON array `[{index, verified, unverifiable_confirmed, note}]` where `index` is the 0-based position of the finding in the input array. `verified=true` iff the described condition is empirically present at that location, `false` iff it is not. `unverifiable_confirmed=true` when the finding was tagged `unverifiable: true` by the parent advisor AND you agree no empirical check applies (subjective — taste, 'could be simpler', style preferences). Report what you found. What happens to a finding afterwards is not your concern."
 
    **Drop rule, with the `unverifiable` exemption stated so it cannot be read as a collision.** Parent drops `findings[i]` iff `verified == false` AND `findings[i].unverifiable != true`. A finding tagged `unverifiable: true` is NEVER dropped on `verified == false`: no empirical check applies to it, so `verified == false` carries no information about it — it is the expected answer, not a refutation. Unverifiable findings continue to step 5 as-is (whether or not the validator confirmed the tag); repro is still attempted and often confirms nothing, which is fine.
 
@@ -74,11 +75,13 @@ Each Phase 1/2 round follows the same shape:
 
    **Validate only PIVOTAL findings.** A finding the primary AND a specialist flagged INDEPENDENTLY at the same location is not pivotal — skip the validator, go straight to step 5. A singleton finding (one reviewer only) IS pivotal — validate it. This trims step 4.5 only; it NEVER skips step 5 repro.
 5. REPRODUCE each BLOCKER/HIGH finding before fixing — advisors hallucinate
-6. FIX by severity, re-verify after each
+6. FIX by severity, re-verify after each, diffing every re-verification against
+   the step-2 baseline to accumulate `regressed_r`
 7. COMMIT the round (per-round granularity, not a batch), then WRITE RUN
-   STATE (`tasks/arftl-run.json` — see "Run state" below). Both, every round.
+   STATE (`tasks/arftl-run.json` — counters, baseline, `findings_log`; see
+   "Run state" below). Both, every round.
 8. RE-ADVISE with a fresh prompt whose "Prior rounds fixed:" list carries
-   the entire phase's fix history
+   the entire phase's fix history, compressed per the prompt-shape cap
 9. GATE: evaluate the LOOP BOUNDS gate (see below) — every round, whatever the
    verdict. The gate's routing beats the verdict; see "Gate beats verdict"
 ```
@@ -377,7 +380,7 @@ Both lanes emit JSON matching `~/.claude/skills/advice-refine-test-loop/verdict-
 {
   "verdict": "PASS" | "PASS_WITH_FIXES" | "BLOCKS",
   "verdict_reason": "<one-line>",
-  "findings": [{"severity": "…", "autofix_class": "…", "file": "…", "line": N, "rationale": "…"}]
+  "findings": [{"severity": "…", "autofix_class": "…", "file": "…", "line": N, "rationale": "…", "unverifiable": true | false | null}]
 }
 ```
 
@@ -385,9 +388,12 @@ Both lanes emit JSON matching `~/.claude/skills/advice-refine-test-loop/verdict-
 
 **The enum semantics below are PARENT-SIDE — a dispatch table the parent executes on the returned JSON, not text for an advisor prompt.** Everything after each semicolon is a consequence and must be stripped from anything the advisor reads (see "Elicit risk, not policy" under Advisor Prompt Shape).
 
-- **PASS** = ZERO findings (empty `findings` array); parent advances immediately, no consolidator needed.
+All three are subject to the gate: a `halt-and-pause` routing overrides the
+verdict, per "Gate beats verdict at step 9".
+
+- **PASS** = ZERO findings (empty `findings` array); parent advances, no consolidator needed.
 - **PASS_WITH_FIXES** = at least one MEDIUM or LOW finding, but no BLOCKER/HIGH; parent runs the consolidator before phase advance (auto-fixes `severity=LOW AND autofix_class=safe_auto` only; other LOWs surface alongside MEDIUMs in the round's commit message for the human to triage but do NOT block advance). If a MEDIUM ought to block, it should have been a HIGH — trust the advisor's severity.
-- **BLOCKS** = ≥1 BLOCKER or HIGH; parent runs another round.
+- **BLOCKS** = ≥1 BLOCKER or HIGH; parent runs another round when the gate says `continue`, and otherwise applies the gate's routing.
 
 The advisor gets ONE part of this and no more: the COHERENCE rule — which verdict string goes with which findings array (`PASS` = empty; `PASS_WITH_FIXES` = no BLOCKER/HIGH; `BLOCKS` = ≥1 BLOCKER/HIGH). Never what a verdict costs, triggers, or buys. `PASS` with a non-empty findings array is unreachable and must never be emitted; LOW-only remainders are `PASS_WITH_FIXES`. `verdict-schema.json` is written to that boundary: its `verdict` description carries the coherence rule only, and its `severity` description defines each level by blast radius, reversibility, silence, and recoverability. Keep it that way — the schema text ships to the Phase 2 advisor verbatim via `--output-schema`.
 
@@ -536,7 +542,7 @@ LOW     = contained, obvious, trivially reversible.
 Rate on those properties alone. Do not consider what happens next.
 ```
 
-Where the loop needs a severity FLOOR for a known rule class (Phase 4b's fixed visual rules and drift-backs), the parent applies the floor in code after parsing. Give the advisor the rule to check, not the grade to assign.
+Where the loop needs a severity FLOOR for a known rule class (Phase 4a's taste tiers, Phase 4b's fixed visual rules and drift-backs), the parent applies the floor in code after parsing. Give the advisor the rule to check, not the grade to assign.
 
 One lever is deliberately kept and is NOT severity policy: telling a reviewer to bias toward REPORTING when a downstream arbiter suppresses false positives (Phase 4b). That moves the reporting threshold, not the severity label. Do not extend it into "and mark them HIGH".
 
@@ -551,7 +557,7 @@ IF claim is a race / state issue:
   Force the state, verify the failure mode.
 ```
 
-Discard unreproducible claims. Note them so next round's "prior rounds fixed" can include "verified non-issue: <claim>".
+Discard unreproducible claims — do NOT fix them. Discard means "do not act on", never "delete the record". Record every one: next round's "prior rounds fixed" carries `verified non-issue: <claim>`, `findings_log` gets that round's `repro: false`, and an `unreproducible` stop lists them verbatim in the exit commit message.
 
 **A weak repro is worse than no repro** — it manufactures a false approval that the rest of the loop then trusts. Before a repro counts toward `repro_r`: confirm it FAILS against the unfixed code, PASSES after the fix, and exercises the exact path the finding claims. A repro that passes for an unrelated reason is discarded, and the finding goes back to unreproduced.
 
@@ -620,7 +626,7 @@ After consolidator exits (clean or bounded), advance to the next phase using the
 | Skip Phase 2 (Codex) because "Opus already said PASS" | Single-vendor blindness is the whole reason Phase 2 exists. If Codex is out of quota, PAUSE and tell the user — don't ship as PASS on a half-run loop. |
 | Run Phase 2 in parallel with Phase 1 to "save time" | Wastes Codex quota on drafts Opus will reject. The ordering is a QUOTA argument and only a quota argument — do not claim second-vendor-last reviews better; running a second vendor over another vendor's output can net-regress it. Keep the order, and keep the reproduce gate that makes it safe (see "Why Codex still runs last"). |
 | Interleave phases (Opus round, Codex round, Opus round, …) | Same failure mode — Codex burns quota reviewing states you're about to change. Complete Phase 1 first, THEN start Phase 2. |
-| Drop Phase 1's "prior rounds fixed" list when starting Phase 2 | Codex will re-flag everything Opus already caught, wasting its budget. Carry the full fix history forward into Phase 2's first prompt. |
+| Drop Phase 1's "prior rounds fixed" list when starting Phase 2 | Codex will re-flag everything Opus already caught, wasting its budget. Carry the fix history forward into Phase 2's first prompt — compressed per the prompt-shape cap when it is long, never dropped and never truncated. |
 | Skip narrow specialists because "general advisor will catch it" | Empirically wrong (per Gooen RoastMyPost). Narrow specialists surface a distinct class of issues (secure defaults, footgun APIs) at higher precision than broad review. Cost is 1-2 extra parallel subagent calls per Phase 1 round. |
 | Skip Phase 3 (adversarial) because "both vendors already passed" | The whole point of adversarial is confirmation bias — both vendors can agree on a wrong answer. One extra dispatch per invocation. Cheap. |
 | Loop adversarial itself when it emits findings | Adversarial is one-shot confirmation, not another main loop. Findings → back to Phase 1. If adversarial fires blocker after blocker across resets, split the diff instead. |
@@ -682,13 +688,19 @@ vocabulary.** Both critics return one verdict object each, parsed by the same
 enum; those words are not schema-parseable and must not appear in a critic
 prompt or a critic's output.
 
-Give each critic the taste tiers as CRITERIA mapped onto the existing enum:
+The critic prompt carries the schema's intrinsic-risk definitions unchanged —
+blast radius, reversibility, silence, recoverability, read visually (how much of
+the surface is wrong, how obvious it is, whether it survives a reload). Nothing
+about what a grade triggers, and no rule of the form "a violation of X is
+BLOCKER"; see "Elicit risk, not policy".
 
-- `BLOCKER` — broken layout, unreadable content, or a house-style rule the
-  founder has explicitly ruled on before.
-- `HIGH` — obvious visual defect a reviewer catches on first look.
-- `MEDIUM` — visual defect that only shows in a narrow state or viewport.
-- `LOW` — subjective polish. Consolidator territory; skip unless trivial.
+**The taste tiers are a parent-side severity FLOOR, applied AFTER parsing —
+never in the prompt**, same mechanism as Phase 4b's:
+
+- Rationale names a house-style rule the founder has explicitly ruled on before
+  → floor `BLOCKER`.
+- Rationale names broken layout or unreadable content → floor `HIGH`.
+- Everything else keeps the critic's grade.
 
 Findings whose confirmation is a taste call carry `unverifiable: true`, per the
 schema.
