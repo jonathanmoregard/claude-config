@@ -52,6 +52,19 @@ umask 077
 
 # ---- Config with numeric validation (advisor MEDIUM: sharp-edges) -----------
 : "${REFLECT_ROOT:=$HOME/.claude/reflections}"
+# REFLECT_ROOT must be ABSOLUTE (D5). Every path below is derived from it — the
+# lock, the logs, the state dirs, the fork ledger, and the authoritative mission
+# handoff this script resolves and hands to an unattended model. A RELATIVE value
+# re-anchors all of them to this process's cwd; since the whole point of the
+# handoff living under REFLECT_ROOT is that repo content cannot reach it, a
+# relative root run from inside a checkout would hand that property back. Refuse
+# before anything is derived. Reachable only by an explicit relative override;
+# tests use `mktemp -d`, which is absolute.
+if [[ "$REFLECT_ROOT" != /* ]]; then
+  printf 'idle-handoff: config error: REFLECT_ROOT=%s is not an absolute path (cwd=%s); the mission handoff and every state dir derive from it and must be outside any repo. Aborting run.\n' \
+    "$REFLECT_ROOT" "$PWD" >&2
+  exit 1
+fi
 : "${REFLECT_MODEL:=haiku}"
 : "${IDLE_HANDOFF_MIN_SECONDS:=$((45*60))}"
 : "${IDLE_HANDOFF_MAX_SECONDS:=$((24*60*60))}"

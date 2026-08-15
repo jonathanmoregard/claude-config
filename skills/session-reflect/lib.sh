@@ -15,6 +15,26 @@ _REFLECT_LIB_SOURCED=1
 
 : "${REFLECT_ROOT:=$HOME/.claude/reflections}"
 
+# --- REFLECT_ROOT must be ABSOLUTE (D5) --------------------------------------
+# Every out-of-repo path in this system is built from REFLECT_ROOT: the session
+# dirs, the manifests, and — since 2026-08-15 — the authoritative mission handoff
+# itself. A RELATIVE value re-anchors all of them to whatever the PROCESS CWD
+# happens to be, which for the hooks and for idle-handoff is a project checkout.
+# Running from inside a hostile clone would then let repo content fabricate the
+# very state that is supposed to live outside every repo (`./reflections/...`
+# committed to the repo, say).
+#
+# So: enforce a leading `/` at source time and refuse loudly otherwise. This is
+# only reachable by an explicit relative override — the shipped default is
+# absolute — and it stays overridable so hermetic tests can point it at a
+# `mktemp -d`, which is absolute. Exit 2 rather than degrade: a mis-anchored root
+# writes reflections nobody will find and authenticates nothing, and the fix is a
+# one-variable operator change.
+if [[ "$REFLECT_ROOT" != /* ]]; then
+  echo "reflect: REFLECT_ROOT='$REFLECT_ROOT' is not an absolute path. Everything this system trusts lives under it and must be outside every repo; a relative value re-anchors it to the process cwd (here: '$PWD'), which is typically a project checkout. Refusing to run — set an absolute REFLECT_ROOT." >&2
+  exit 2
+fi
+
 # --- Stale-started reaper threshold (seconds) --------------------------------
 # If a manifest is stuck at status=started older than this, treat it as a
 # crashed prior run (host reboot, SIGKILL, orphaned worker) and permit re-run.

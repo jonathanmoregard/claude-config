@@ -51,22 +51,51 @@ assert_isolated_cwd "$TEST_CWD"
 # Snapshot the worktree's own tasks/ dir so we can prove no test touched it.
 # Compare before/after (not emptiness) — an in-flight session legitimately has
 # dirty files here.
+# SCOPE, and why it is not "every file in tasks/":
+#   * The only things this codebase can write into a project's tasks/ dir are
+#     `mission.<sid>.md` (the human copy) and the `mission.md` pointer. Those are
+#     therefore what a leaked write looks like, and they are compared byte for
+#     byte — mission.md is the file the 2026-08-15 incident destroyed.
+#   * tasks/progress.md, tasks/session-constraints.md and tasks/arftl-run.json
+#     belong to the ORCHESTRATOR, which edits them WHILE this suite runs (observed
+#     2026-08-16: a constraint was appended mid-run). Comparing those is a flake
+#     detector, not a leak detector, and a flaky guard gets disabled — so they are
+#     deliberately out of scope. Nothing under test can write them.
+#   * `git status --porcelain -- tasks` is kept for repos where tasks/ IS tracked.
+#     In THIS worktree tasks/ is gitignored, which is exactly why the sha list is
+#     the load-bearing half.
+repo_tasks_mission_shas() {
+  find "$WORKTREE/tasks" -maxdepth 1 \( -type f -o -type l \) -name 'mission*' -print0 2>/dev/null \
+    | xargs -0 -r sha256sum 2>/dev/null | sort || true
+}
+repo_tasks_mission_kinds() {
+  # Type as well as content: replacing a regular mission.md with a symlink of the
+  # same bytes would otherwise pass.
+  find "$WORKTREE/tasks" -maxdepth 1 -name 'mission*' -printf '%y %f\n' 2>/dev/null | sort || true
+}
 REPO_TASKS_BEFORE="$(cd "$WORKTREE" && git status --porcelain -- tasks 2>/dev/null | sort || true)"
-REPO_TASKS_SHAS_BEFORE="$(find "$WORKTREE/tasks" -maxdepth 1 -type f -print0 2>/dev/null \
-  | xargs -0 -r sha256sum 2>/dev/null | sort || true)"
+REPO_TASKS_SHAS_BEFORE="$(repo_tasks_mission_shas)"
+REPO_TASKS_KINDS_BEFORE="$(repo_tasks_mission_kinds)"
 assert_repo_tasks_untouched() {
   local when="${1:-}"
-  local now_status now_shas
+  local now_status now_shas now_kinds
   now_status="$(cd "$WORKTREE" && git status --porcelain -- tasks 2>/dev/null | sort || true)"
-  now_shas="$(find "$WORKTREE/tasks" -maxdepth 1 -type f -print0 2>/dev/null \
-    | xargs -0 -r sha256sum 2>/dev/null | sort || true)"
+  now_shas="$(repo_tasks_mission_shas)"
+  now_kinds="$(repo_tasks_mission_kinds)"
   if [[ "$now_status" != "$REPO_TASKS_BEFORE" ]]; then
     fail "test isolation ($when): \$WORKTREE/tasks git status changed — a test wrote into the live repo
       before: $REPO_TASKS_BEFORE
       after:  $now_status"
   fi
   if [[ "$now_shas" != "$REPO_TASKS_SHAS_BEFORE" ]]; then
-    fail "test isolation ($when): \$WORKTREE/tasks file contents changed — a test wrote into the live repo"
+    fail "test isolation ($when): a \$WORKTREE/tasks/mission* file appeared or changed — a test wrote into the live repo
+      before: $REPO_TASKS_SHAS_BEFORE
+      after:  $now_shas"
+  fi
+  if [[ "$now_kinds" != "$REPO_TASKS_KINDS_BEFORE" ]]; then
+    fail "test isolation ($when): the FILE TYPE of a \$WORKTREE/tasks/mission* entry changed (regular file <-> symlink)
+      before: $REPO_TASKS_KINDS_BEFORE
+      after:  $now_kinds"
   fi
 }
 
@@ -3242,6 +3271,52 @@ assert context_usage.usage_total("nope") == 0
 assert context_usage.usage_total({"input_tokens": 5, "cache_read_input_tokens": None}) == 5
 PY
 info "failed consume logged loudly; fresh= counts real skips; a malformed usage line no longer breaks the nudge hook"
+
+# ============================================================================
+# TEST 34: D5 — a RELATIVE REFLECT_ROOT is refused at both source points
+# ============================================================================
+# Everything this system trusts is derived from REFLECT_ROOT, including the
+# authoritative mission handoff. A relative value re-anchors all of it to the
+# process cwd — so running from inside a hostile clone would let repo content
+# fabricate the state that is supposed to live outside every repo. Both entry
+# points must refuse before deriving anything, and say so.
+echo "TEST 34: D5 — a relative REFLECT_ROOT is refused, loudly, at both seams"
+D5_DIR="$(mktemp -d -t reflect-d5-XXXXXX)"
+assert_isolated_cwd "$D5_DIR"
+mkdir -p "$D5_DIR/reflections/sessions/d5-sid" "$D5_DIR/tasks"
+# A handoff that WOULD resolve if the relative root were honoured from this cwd.
+{
+  printf '<!-- written-against: sha=none ts=1786800000 sid=d5-sid -->\n'
+  printf '%s\n' '# PLANTED via a relative root' '## Next' '1. attacker work'
+} > "$D5_DIR/reflections/sessions/d5-sid/mission.md"
+printf '%s\n' "$D5_DIR" > "$D5_DIR/reflections/sessions/d5-sid/mission.cwd"
+
+D5_ERR="$STUB_SCRATCH/d5.stderr"
+if ( cd "$D5_DIR" && REFLECT_ROOT="reflections" bash "$REFLECT_SH" --mission-path "$D5_DIR" \
+       >"$STUB_SCRATCH/d5.out" 2>"$D5_ERR" ); then
+  fail "34: reflect.sh honoured a RELATIVE REFLECT_ROOT and resolved '$(cat "$STUB_SCRATCH/d5.out")' from the process cwd"
+fi
+[[ ! -s "$STUB_SCRATCH/d5.out" ]] \
+  || fail "34: reflect.sh printed a path resolved under a relative root ('$(cat "$STUB_SCRATCH/d5.out")')"
+grep -q 'not an absolute path' "$D5_ERR" \
+  || fail "34: reflect.sh refused a relative root without saying why (stderr: $(cat "$D5_ERR"))"
+# Relative-with-dot-slash and a bare name are the same class.
+if ( cd "$D5_DIR" && REFLECT_ROOT="./reflections" bash "$REFLECT_SH" --budgets >/dev/null 2>&1 ); then
+  fail "34: './reflections' was accepted as a REFLECT_ROOT"
+fi
+
+D5_H="$(sc_home)"
+sc_write_config "$D5_H" on 0.30
+if ( cd "$D5_DIR" && HOME="$D5_H" REFLECT_ROOT="reflections" \
+       bash "$WORKTREE/scripts/idle-handoff.sh" >/dev/null 2>"$D5_ERR" ); then
+  fail "34: idle-handoff.sh ran with a RELATIVE REFLECT_ROOT"
+fi
+grep -q 'not an absolute path' "$D5_ERR" \
+  || fail "34: idle-handoff.sh refused a relative root without saying why (stderr: $(cat "$D5_ERR"))"
+# Positive control: the same absolute root still works at both seams.
+( cd "$D5_DIR" && REFLECT_ROOT="$D5_DIR/reflections" bash "$REFLECT_SH" --mission-path "$D5_DIR" >/dev/null 2>&1 ) \
+  || fail "34: the ABSOLUTE form of the same root stopped working — the check is too strict"
+info "relative REFLECT_ROOT refused at reflect.sh and idle-handoff.sh; absolute form unaffected"
 
 # ============================================================================
 # FINAL GUARD: prove the whole suite left the live repo alone.
