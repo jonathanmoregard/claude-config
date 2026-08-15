@@ -72,7 +72,7 @@ Each Phase 1/2 round follows the same shape:
 
    **Drop rule, with the `unverifiable` exemption stated so it cannot be read as a collision.** Parent drops `findings[i]` iff `verified == false` AND `findings[i].unverifiable != true`. A finding tagged `unverifiable: true` is NEVER dropped on `verified == false`: no empirical check applies to it, so `verified == false` carries no information about it — it is the expected answer, not a refutation. Unverifiable findings continue to step 5 as-is (whether or not the validator confirmed the tag); repro is still attempted and often confirms nothing, which is fine.
 
-   **A dropped finding is still counted and still logged.** It was already a `new_r` candidate at step 4, it never reaches step 5, so it never reproduces. Append it to `findings_log` at step 7 with this round's `repro: false`, exactly like an unreproducible one — otherwise next round's dedupe cannot see it and re-flags it as new.
+   **A dropped finding is CLOSED, still counted, and still logged.** A drop is not a skip and not a deferral: it closes the finding, and it stays in `new_r`. It never reaches step 5, so it never reproduces. Append it to `findings_log` at step 7 with this round's `repro: false`, exactly like an unreproducible one — otherwise next round's dedupe cannot see it and re-flags it as new.
 
    **Failure-mode handling (degrade-to-pre-4.5 on any failure).** Step 4.5 is an optimization, not a correctness gate:
    - Dispatch the validator ONCE. Never retry it, never PAUSE the loop on it.
@@ -82,7 +82,8 @@ Each Phase 1/2 round follows the same shape:
    **Validator input boundary — findings JSON + absolute paths ONLY.** Never add the advisor's reasoning, exploration trace, or diff context to the validator prompt. The narrower input is the mechanism, not the model choice.
 
    **Validate only PIVOTAL findings.** A finding the primary AND a specialist flagged INDEPENDENTLY at the same location is not pivotal — skip the validator, go straight to step 5. A singleton finding (one reviewer only) IS pivotal — validate it. This trims step 4.5 only; it NEVER skips step 5 repro.
-5. REPRODUCE each BLOCKER/HIGH finding before fixing — advisors hallucinate
+5. REPRODUCE each BLOCKER/HIGH finding before fixing — advisors hallucinate.
+   `new_r` and `repro_r` are both finalised at the END of this step
 6. FIX by severity, re-verify after each. Read `regressed_r` off the round's
    FINAL re-verification, diffed against the PHASE BASELINE
 7. COMMIT the round (per-round granularity, not a batch), then WRITE RUN
@@ -134,32 +135,45 @@ and must not restate it.** A BLOCKER or HIGH finding is OPEN from the moment it
 is first reported until it CLOSES, and exactly two things close it:
 
 - a fix is applied AND its repro passes afterwards (`fixed: true`); or
-- its step-5 repro did not demonstrate the defect (`repro: false`) — a step-4.5
-  drop records the same without reaching step 5.
+- the round produced no demonstration of it (`repro: false`) — either its step-5
+  repro did not demonstrate the defect, or it was dropped at step 4.5 and never
+  reached step 5.
+
+**A step-4.5 drop CLOSES the finding** — not a skip, not a deferral. It records
+`repro: false`, it stays counted in `new_r`, and an `unreproducible` stop prints
+it verbatim to the human.
 
 A failed fix does not close a finding. Neither does the advisor going quiet
-about it. A closed finding reported again reopens only if it reproduces again;
-otherwise it is advisor staleness and feeds no counter.
+about it. A closed finding reported again REOPENS iff this round's step-5 repro
+demonstrates it again; a relapse is then OPEN and counted exactly like a first
+report. Without that demonstration it stays closed — advisor staleness, feeding
+no counter.
 
 **No verdict value advances a phase while any finding is OPEN — no verdict value
 advances a phase at all.** Advancement belongs to the gate below and to nothing
-else; the verdict is one of its inputs. The gate's two advancing stops both
-entail zero OPEN findings: `converged` has nothing carried open and nothing
-proposed, and `unreproducible` closes every candidate with `repro: false`. A
-finding that reproduced and was not fixed is OPEN, so the gate can only
+else; the verdict is one of its inputs. Every finding still OPEN at step 8 was
+demonstrated at step 5 of this round, so it is counted in BOTH `new_r` and
+`repro_r`. Both advancing stops therefore entail zero OPEN findings:
+`converged` requires `new_r == 0` and `unreproducible` requires `repro_r == 0`.
+A finding that reproduced and was not fixed is OPEN, so the gate can only
 `continue` or halt on it.
 
 **Track per round**, appended to `rounds[phase]` in the run state at step 7:
 
-- `new_r` — the round's OPEN BLOCKER+HIGH workload, FIXED at step 4 after dedupe
-  and BEFORE step 4.5 drops: this round's deduped BLOCKER+HIGH candidates, PLUS
-  every finding an earlier round of this phase left open, deduped against the
-  candidates so none is counted twice. A step-4.5 drop CLOSES a finding but
-  never removes it from `new_r`. Identity is by MEANING (see below); rewording
-  and shifted line numbers never make a finding new.
+- `new_r` — the round's BLOCKER+HIGH workload. Candidates are deduped at step 4;
+  the count is FINALISED at the END of step 5, once step-4.5 drops AND step-5
+  repro outcomes are both known. It is: this round's deduped BLOCKER+HIGH
+  candidates, PLUS every finding an earlier round of this phase left open,
+  deduped against the candidates so none is counted twice. A step-4.5 drop
+  closes a finding but never removes it from `new_r`. A candidate matching an
+  already-CLOSED finding counts only when step 5 demonstrates it again (a
+  relapse); a re-report that does not reproduce is staleness and is excluded.
+  Identity is by MEANING (see below); rewording and shifted line numbers never
+  make a finding new.
 - `repro_r` — of those `new_r`, how many EMPIRICALLY REPRODUCED at step 5.
-  Carried-open findings are re-checked at step 5 like any other. A candidate
-  dropped at step 4.5 never reaches step 5 and therefore never reproduces.
+  Carried-open findings and re-reports of closed findings are re-checked at
+  step 5 like any other. A candidate dropped at step 4.5 never reaches step 5
+  and therefore never reproduces.
   Whether a fix later succeeded is a DIFFERENT fact, recorded as `fixed` in
   `findings_log`; it never changes `repro_r`. Invariant: `0 <= repro_r <= new_r`.
 - `regressed_r` — how many tests IN THE PHASE BASELINE SET are FAILING at this
@@ -171,8 +185,8 @@ finding that reproduced and was not fixed is OPEN, so the gate can only
   not damage and counts 0; breakage carried over from an earlier round of the
   same phase still counts, every round, until it is repaired.
 
-`new_r` is FINALISED at step 4, `repro_r` at the end of step 5, `regressed_r` at
-the round's last verification run. None of the three is ever revised.
+`new_r` and `repro_r` are both FINALISED at the end of step 5, `regressed_r` at
+the round's last verification run. None of the three is revised afterwards.
 
 `n` is the number of rounds recorded in `rounds[phase]` for the current phase,
 including the round being gated. A Phase 3 reset re-enters Phase 1 WITHOUT
@@ -182,8 +196,14 @@ fresh budget.
 
 **Dedupe `new_r` by MEANING, not by `(file, line, claim)`.** The tuple rule is
 insufficient: a reworded repeat at a shifted line passes it and counts as NEW,
-which inflates the continue signal that the gate below depends on. Two methods,
-in preference order:
+which inflates the continue signal that the gate below depends on.
+
+**Dedupe assigns IDENTITY, never exclusion.** A candidate that matches a prior
+takes that prior's `findings_log` id and still goes to step 5. Whether it counts
+in `new_r` is decided at the end of step 5, per the `new_r` definition above.
+Never drop a candidate from step 5 because dedupe matched it.
+
+Two methods, in preference order:
 
 1. **Equivalence-judge subagent (preferred). ONE dispatch per round, not one
    per pair.** Pairwise dispatch is O(candidates × priors) — 6 new against 30
@@ -686,7 +706,8 @@ After consolidator exits (clean or bounded), complete the phase transition the g
 | Dedupe `new_r` by `(file, line, claim)` | A reworded repeat at a shifted line then counts as NEW and inflates the continue signal the gate depends on. Dedupe by MEANING — equivalence-judge subagent, or trigram Jaccard ≥0.8 as fallback. |
 | PAUSE and ask the human on a stop the loop can rule on itself | `converged` and `unreproducible` advance without asking, with the reason surfaced in the exit commit message. Asking a human to adjudicate unreproducible claims is the wrong use of their attention. |
 | Advance (or run another round) on a `no-marginal-gain` stop | It means the loop is DAMAGING. Advancing ships the damage; continuing feeds it. halt-and-pause. Only the stop-routing table decides this — do not infer routing from a stop's name. |
-| Read `converged` as "the round found nothing" | `converged` requires `new_r == 0` — nothing proposed AND nothing left open by an earlier round of the phase, per the OPEN definition. A round that proposes findings none of which reproduce is `unreproducible`, and it must surface those findings, not exit silently. |
+| Read `converged` as "the round found nothing" | `converged` requires `new_r == 0` — nothing proposed beyond stale re-reports that did not reproduce, AND nothing left open by an earlier round of the phase, per the OPEN definition. A round that proposes findings none of which reproduce is `unreproducible`, and it must surface those findings, not exit silently. |
+| Freeze `new_r` before step 5 knows what reproduced | A relapse — closed in an earlier round, demonstrated again now — is then deduped out of the count and `converged` can fire over a live defect. Dedupe assigns identity at step 4; the count is finalised at the end of step 5. |
 | Reset to Phase 1 a second time from Phase 3 | Capped at one reset. A diff still REPRODUCING fresh BLOCKER/HIGH after a full 1→2→3 pass wants splitting, not another lap through both vendors. |
 | Skip writing `tasks/arftl-run.json` because "the loop is nearly done" | Nearly-done is when a compact is most likely and the fix history is most expensive to lose. Write it at every round commit, same step. |
 | Restart at Phase 1 after a compact or crash | Check `tasks/arftl-run.json` first. Re-running phases the gate already advanced re-burns both quotas to reproduce a result you already have on disk. |
@@ -958,7 +979,7 @@ DiffSpot ranks Gemini (2.5 Pro / 3.x Pro) as the strongest visual perceiver (47.
 | Phase | Vendor | Reviewer role | Combines with | Skip when |
 |---|---|---|---|---|
 | 1 | Anthropic (Opus + specialists) | Broad correctness + narrow security/API passes | Own phase output only | Never; foundation phase |
-| 4.5 (in-round) | Anthropic (Opus, validator) | Re-verify PIVOTAL (singleton) findings against actual file state; findings + paths only, no advisor context; array-index correlation `[{index, verified, unverifiable_confirmed, note}]`; parent drops `findings[i]` iff `verified=false` AND the finding is not tagged `unverifiable: true`; `unverifiable_confirmed` informational | Feeds into step 5 (reproduce) | Per-finding when two reviewers independently converged on the location (go straight to step 5). Wholesale on any validator failure (quota / malformed JSON / no usable result) — degrade to pre-4.5 behavior, never retry, never PAUSE |
+| 4.5 (in-round) | Anthropic (Opus, validator) | Re-verify PIVOTAL (singleton) findings against actual file state; findings + paths only, no advisor context; array-index correlation `[{index, verified, unverifiable_confirmed, note}]`; parent drops `findings[i]` iff `verified=false` AND the finding is not tagged `unverifiable: true`; a drop CLOSES that finding with `repro: false` and keeps it in `new_r`; `unverifiable_confirmed` informational | Feeds into step 5 (reproduce) | Per-finding when two reviewers independently converged on the location (go straight to step 5). Wholesale on any validator failure (quota / malformed JSON / no usable result) — degrade to pre-4.5 behavior, never retry, never PAUSE |
 | 2 | OpenAI (Codex / GPT-5.5) | Cross-vendor correctness on Opus-clean state | Phase 1 fix history carried in prompt | Never; PAUSE on quota, don't silently skip |
 | 3 | Anthropic (Opus, adversarial) | "Prior phases were wrong — find why" | Same gate at step 8; a `continue` resets to Phase 1 | Never; one shot, cheap |
 | 4a | Anthropic (Opus x2 — defect + taste critics) | UI defect + house-style critique | Own phase output only | Non-UI diffs |
