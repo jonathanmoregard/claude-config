@@ -137,7 +137,13 @@ is documented inside `settings-patch.json` under `_comment`.
 | `REFLECT_ROOT` | `$HOME/.claude/reflections` | Artifact root. Override for tests. Must be writable. |
 | `REFLECT_FORCE` | (unset) | Truthy values (`1`, `true`, `yes`, `on`, case-insensitive) bypass the idempotency guard and re-run even if `modes.<mode>.final_complete: true`. Any other value = falsy. |
 | `REFLECT_LOG_DIR` | `$REFLECT_ROOT/logs` | Worker stdout / stderr logs. |
-| `REFLECT_STALE_STARTED_SECONDS` | `600` | If a manifest is stuck at `status=started` older than this many seconds, treat as a crashed prior run and permit re-run. |
+| `REFLECT_STALE_STARTED_SECONDS` | `600` | If a manifest is stuck at `status=started` older than this many seconds, treat as a crashed prior run: permit re-run, and let the reaper demote it to a terminal `error`. |
+| `REFLECT_ASYNC` | (unset) | `mission` mode only. Truthy detaches the worker instead of running it synchronously. Set by the 2nd-compact pre-fire so the mission model call cannot eat the 60 s hook cap. `scripts/idle-handoff.sh` deliberately leaves it unset — it reads `modes.mission.status` right after the call. |
+| `REFLECT_NO_SYSTEMD_RUN` | (unset) | Truthy forces the `setsid` fallback spawn instead of `systemd-run --user`. Mostly for tests and hosts where you want the old behaviour. |
+| `REFLECT_BUDGET_PRECOMPACT` / `_SESSIONEND` / `_SUBAGENTSTOP` / `_MISSION` | `40` / `90` / `40` / `60` | Per-mode timeout budget in seconds. See "Budgets vs the hook cap". |
+| `REFLECT_KILL_GRACE_SECONDS` | `10` | `timeout -k` grace before SIGKILL. Counts against the hook cap. |
+| `REFLECT_REAP_MAX_PER_RUN` | `200` | Max manifests the orphan reaper examines per detached-worker run. |
+| `REFLECT_MISSION_RETENTION_DAYS` | `30` | Age after which a `tasks/mission.<sid>.md` payload is garbage-collected. |
 | `REFLECT_LIVE_TEST` | (unset) | `1` opts `tests/live.sh` into a real-API smoke. |
 | `CLAUDE_PARENT_SESSION_ID` | (unset) | If Claude Code exports this into the SubagentStop env, subagent artifacts nest under the correct parent. Otherwise the dispatcher falls back to scanning sibling transcript JSONLs. Value is validated against `^[A-Za-z0-9._-]{1,128}$`; invalid values are ignored. |
 | `_REFLECT_INTERNAL` | (internal) | Sentinel set by the parent dispatcher to gate the `--worker` re-entry path. Do not set manually. |
@@ -146,14 +152,88 @@ is documented inside `settings-patch.json` under `_comment`.
 
 | Hook | Blocking? | Timeout | Artifact |
 |------|-----------|---------|----------|
-| `PreCompact` | Yes (session still alive) | 60 s | `checkpoints/NNNN-precompact.json` |
+| `PreCompact` | Yes (session still alive) | 40 s | `checkpoints/<epoch_ns>-XXXX-precompact.json` |
 | `SessionEnd` | No — fire-and-forget detached worker | 90 s wall (worker internal) | `final.json` |
 | `SubagentStop` | No — fire-and-forget detached worker | 40 s wall (worker internal) | `subagents/<sid>/final.json` |
 
-Detached workers use `setsid nohup ... </dev/null >log 2>&1 & disown` so
-they survive kitty close, `exit`, and the parent Claude Code process
-terminating. `SIGKILL`, hard OS shutdown, and crashes remain out of scope
-(hooks cannot fire in those cases).
+On the 2nd-and-later `PreCompact` of a session the dispatcher also pre-fires
+`mission` mode. That pre-fire is **detached** (`REFLECT_ASYNC=1`): it used to run
+synchronously ahead of the precompact worker, which measured 121 s of in-hook
+wall time against a 60 s cap.
+
+### Budgets vs the hook cap
+
+Claude Code caps every `command` hook at **60 s and the cap is not
+configurable** — the bundled `cli.js` computes `timeout ? q.timeout*1000 : 60000`
+and the settings schema clamps `timeout` with `.max(60000)`. When the cap fires
+Claude Code kills the hook's process group, so no terminal status is written.
+The internal budget must therefore always win:
+
+```
+precompact 40 s + kill grace 10 s + reserve 5 s = 55 s worst case  <=  60 s cap
+```
+
+`bash reflect.sh --budgets` prints the live arithmetic. Only `precompact` is
+synchronous; the detached modes are off the hook clock.
+
+### Detached spawn
+
+Detached workers are handed to `systemd-run --user --collect --no-block`, which
+runs them in their **own cgroup**. `setsid nohup … &` escapes SIGHUP and the
+controlling terminal but *not* the parent's cgroup: Claude Code exits seconds
+after `SessionEnd`, and the cgroup teardown that follows (`KillMode=control-group`
+is the systemd default) SIGKILLed the worker before it wrote anything. That was
+the source of the orphaned `status:started` manifests — 0-byte
+`<sid>-<mode>.worker.stderr.log`, no `.stdout.log`, log mtime == `started_at`.
+
+Transient units inherit no environment, so every var the worker needs is passed
+explicitly with `--setenv`, and because a unit cannot inherit fd 9 the per-mode
+flock is acquired by the *worker* from `REFLECT_LOCKFILE` rather than inherited.
+With no user bus (busless cron, container without a user manager) or with
+`REFLECT_NO_SYSTEMD_RUN=1`, the spawn degrades to the old `setsid nohup` path
+rather than losing the reflection. Either way `modes.<mode>.spawn_method`
+(and `spawn_unit`) records which path ran.
+
+`SIGKILL`, hard OS shutdown, and crashes remain out of scope for the worker
+itself; the reaper below is what heals those.
+
+### Orphan reaper
+
+A mode stuck at `status:started` used to stay that way forever:
+`is_already_complete` only ever *permitted a re-run*, and `SessionEnd` /
+`SubagentStop` fire once per session. Detached workers therefore sweep after
+their own terminal write, demoting any `started` older than
+`REFLECT_STALE_STARTED_SECONDS` to a terminal `error` with
+`reason: orphaned_started_reaped` plus the observed age. `find -mmin`
+pre-filters candidates on manifest mtime and `REFLECT_REAP_MAX_PER_RUN` caps
+the batch. It never runs on the synchronous precompact path.
+
+### Mission artifact layout
+
+```
+tasks/mission.<sid>.md   payload, unique per session (never collides)
+tasks/mission.md         symlink to the current payload
+```
+
+The payload name embeds the session id, so a machine write can never land on a
+path a human owns. The pointer keeps `tasks/mission.md` — the path the
+`SessionStart` reinject hook tests and the documented handoff convention —
+working. The `<!-- written-against: sha=… ts=… sid=… -->` stamp no longer
+protects the payload; it only decides whether the pointer may move:
+
+| existing `tasks/mission.md` | action |
+|---|---|
+| absent | write payload, create pointer |
+| symlink we own (incl. dangling) | write payload, repoint / repair |
+| regular file, our stamp | preserve it under its own sid, then repoint |
+| regular file, foreign or unstamped | payload only; leave it untouched, record the refusal |
+
+`bash reflect.sh --mission-path <project-dir>` resolves the current payload
+(pointer, else newest stamped payload by mtime) and logs how it resolved, so a
+missing or dangling pointer never resolves silently. Payloads are
+garbage-collected once `reflections/sessions/<sid>/` is gone or they exceed
+`REFLECT_MISSION_RETENTION_DAYS`; the pointer target is always kept, and GC only
+ever touches files that both match `mission.<valid-sid>.md` and carry our stamp.
 
 Reflection is idempotent per-mode: reruns for the same `(session_id, mode)`
 with `modes.<mode>.final_complete: true` exit fast without spawning a new
