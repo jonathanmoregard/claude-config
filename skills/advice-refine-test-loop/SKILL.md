@@ -264,12 +264,24 @@ no exceptions:**
   "status": "running | pending-human | complete",
   "phase": "1 | 2 | 3 | 4a | 4b",
   "round": 3,
-  "rounds": {"1": [{"new": 5, "repro": 5, "regressed": 0},
-                   {"new": 2, "repro": 2, "regressed": 1},
-                   {"new": 0, "repro": 0, "regressed": 0}],
-             "2": [{"new": 1, "repro": 1, "regressed": 0},
-                   {"new": 0, "repro": 0, "regressed": 0}]},
-  "stop_reasons": {"1": "converged", "2": "no-marginal-gain"},
+  "rounds": {"1": [{"new": 5, "repro": 5, "regressed": 0,
+                    "baseline": {"passing": 412, "named_failures": []}},
+                   {"new": 2, "repro": 2, "regressed": 1,
+                    "baseline": {"passing": 412,
+                                 "named_failures": ["session::drops_line"]}},
+                   {"new": 0, "repro": 0, "regressed": 0,
+                    "baseline": {"passing": 413, "named_failures": []}}],
+             "2": [{"new": 1, "repro": 1, "regressed": 0,
+                    "baseline": {"passing": 413, "named_failures": []}}]},
+  "findings_log": {
+    "1": [{"id": "p1-f3",
+           "file": "/abs/path/session.rs", "line": 88,
+           "category": "session.rs",
+           "rationale": "<verbatim advisor rationale, <=240 chars>",
+           "history": [{"round": 1, "repro": true,  "fixed": true},
+                       {"round": 3, "repro": true,  "fixed": false}]}]},
+  "dedupe_status": "live | unavailable",
+  "stop_reasons": {"1": "converged", "2": "unreproducible"},
   "phase3_resets": 0,
   "round_commits": ["a1b2c3d", "e4f5g6h"],
   "fixed_summary": ["<one line per fixed finding, phase-tagged>"],
@@ -280,8 +292,18 @@ no exceptions:**
 
 `fixed_summary` is the durable form of the "Prior rounds fixed:" list — it is
 what makes resume cheap rather than a restart. `stop_reasons` records how each
-completed phase exited (the Loop-bounds stop table); the Exit report reads it
-from here, so a compact never loses it.
+completed phase exited (the stop-routing table); the Exit report reads it from
+here, so a compact never loses it.
+
+`findings_log` is what makes semantic dedupe and oscillation survive a compact.
+Append one entry per BLOCKER+HIGH finding at step 7 and never rewrite an
+earlier entry:
+
+- `rationale` verbatim and `category` are the dedupe inputs. Without them
+  `new_r` inflates, because every finding looks unseen.
+- `history` is the oscillation input: one row per round the finding was
+  reported, with that round's `repro` outcome and whether a fix was applied.
+  Without it `flips_r` is permanently 0 and the stop can never fire.
 
 **On skill start, before Phase 1:** if `tasks/arftl-run.json` exists with
 `status: running`, do NOT start over. Read it, announce `"Resuming ARFTL at
@@ -290,6 +312,22 @@ the recorded phase with `fixed_summary` seeding the prompt's "Prior rounds
 fixed:" list. `status: pending-human` means a human owes a decision — surface
 `pause_reason` and stop; do not silently resume past a PAUSE. `status:
 complete` is a finished prior run: archive or delete it and start fresh.
+
+**A resume that cannot reconstruct `findings_log` must SAY SO, not pretend.**
+If the file lacks `findings_log`, or its entries for the current phase are
+missing or truncated:
+
+1. Set `dedupe_status: "unavailable"`.
+2. Announce `"ARFTL resumed WITHOUT dedupe/oscillation history — new_r is
+   inflated and oscillation cannot fire"` in the resume line, in every
+   subsequent round commit message, and in the Exit report.
+3. Treat every finding as new (`new_r` counts all of them) and hold
+   `flips_r = 0` for the rest of the phase.
+4. Never report a `converged` or `oscillation` stop for that phase without the
+   degradation note attached — both are meaningless while the log is missing.
+
+Silently proceeding as if both mechanisms were live is the failure this rule
+exists to prevent.
 
 Write `status: complete` at Exit. The file is state, not a report — the Exit
 commit message remains the human-facing artifact.
@@ -528,6 +566,7 @@ After consolidator exits (clean or bounded), advance to the next phase using the
 | Reset to Phase 1 a second time from Phase 3 | Capped at one reset. A diff still producing fresh BLOCKER/HIGH after a full 1→2→3 pass wants splitting, not another lap through both vendors. |
 | Skip writing `tasks/arftl-run.json` because "the loop is nearly done" | Nearly-done is when a compact is most likely and the fix history is most expensive to lose. Write it at every round commit, same step. |
 | Restart at Phase 1 after a compact or crash | Check `tasks/arftl-run.json` first. Re-running phases that already PASSed re-burns both quotas to reproduce a result you already have on disk. |
+| Resume without `findings_log` and keep reporting `new_r` and `flips_r` as if they were live | Dedupe and oscillation both run off that log. Missing it silently inflates `new_r` and pins `flips_r` at 0 — the loop looks healthy while two mechanisms are off. Set `dedupe_status: unavailable` and say so in every round commit and the Exit report. |
 | Skip Phase 2 (Codex) because "Opus already said PASS" | Single-vendor blindness is the whole reason Phase 2 exists. If Codex is out of quota, PAUSE and tell the user — don't ship as PASS on a half-run loop. |
 | Run Phase 2 in parallel with Phase 1 to "save time" | Wastes Codex quota on drafts Opus will reject. The ordering is a QUOTA argument and only a quota argument — do not claim second-vendor-last reviews better; running a second vendor over another vendor's output can net-regress it. Keep the order, and keep the reproduce gate that makes it safe (see "Why Codex still runs last"). |
 | Interleave phases (Opus round, Codex round, Opus round, …) | Same failure mode — Codex burns quota reviewing states you're about to change. Complete Phase 1 first, THEN start Phase 2. |
@@ -778,6 +817,8 @@ Also state, so the run is greppable and a stopped run is never mistaken for a cl
   and every regressed test on a `no-marginal-gain` pause
 - accepted commit SHA + whether the worktree is clean
 - how the run ended: `PASS` / `PASS_WITH_FIXES` / `pending-human` **plus the `pause_reason`** if it stopped on a bound rather than a verdict
+- `dedupe_status`, and — when it is `unavailable` — that `new_r` was inflated
+  and oscillation could not fire for the affected phases
 - anything left in `pending_for_human.md`
 
 Then set `tasks/arftl-run.json` to `status: complete`. A run that exits `pending-human` keeps `status: pending-human` and its `pause_reason` — that file is how the next session knows a human decision is outstanding.
