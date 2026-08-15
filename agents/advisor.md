@@ -51,7 +51,7 @@ Full JSON schema on disk: `~/.claude/skills/advice-refine-test-loop/verdict-sche
 - **BLOCKER** — ship breaks production: data loss, security hole, runtime crash on the happy path, schema mismatch, fail-open auth.
 - **HIGH** — wrong behavior under reachable edge cases: silent error swallow, resource leak, race window, missing input validation at a trust boundary.
 - **MEDIUM** — latent bug or future trap: hardcoded value that should be config, missing test for non-obvious branch, unclear contract that will break on refactor.
-- **LOW** — nit: naming, comment, formatting. Surface but don't gate on these.
+- **LOW** — cosmetic: naming, comment wording, formatting. Nothing behaves differently; a reader is mildly worse off.
 
 # Length cap
 
