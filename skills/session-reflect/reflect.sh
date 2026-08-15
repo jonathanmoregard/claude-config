@@ -148,17 +148,23 @@ Modes:
   sessionend    detached worker, ${REFLECT_BUDGET_SESSIONEND}s internal budget, writes final.json
   subagentstop  detached worker, ${REFLECT_BUDGET_SUBAGENTSTOP}s internal budget, nests under parent/subagents/
   mission       synchronous (detached with REFLECT_ASYNC=1), ${REFLECT_BUDGET_MISSION}s budget,
-                writes \$REFLECT_ROOT/sessions/<sid>/mission.md (markdown)
+                writes \$REFLECT_ROOT/sessions/<sid>/handoff/mission.md (markdown)
 
 Introspection:
   --budgets           print the effective timeout budgets + hook-cap arithmetic
   --mission-path DIR  resolve the AUTHORITATIVE mission handoff for project DIR:
-                      \$REFLECT_ROOT/sessions/<sid>/mission.md, out of repo, or
-                      nothing (exit 1). Never looks inside DIR
+                      \$REFLECT_ROOT/sessions/<sid>/handoff/mission.md, out of
+                      repo, or nothing (exit 1). Never looks inside DIR
 
 Mission artifact layout:
-  \$REFLECT_ROOT/sessions/<sid>/mission.md   AUTHORITATIVE handoff (out of repo)
-  \$REFLECT_ROOT/sessions/<sid>/mission.cwd  which project it is for
+  \$REFLECT_ROOT/sessions/<sid>/handoff/mission.md
+                                            AUTHORITATIVE handoff (out of repo).
+                                            Its directory is the ONLY thing the
+                                            unattended resume fork may write, so
+                                            nothing else is kept in there.
+  \$REFLECT_ROOT/sessions/<sid>/mission.cwd  which project it is for. One level up,
+                                            outside that write grant, because
+                                            resolution reads it.
   tasks/mission.<sid>.md                    human-readable copy; no automation
                                             reads it
   tasks/mission.md                          human convenience symlink to the copy
@@ -175,9 +181,9 @@ fi
 
 # --- Mission resolution ------------------------------------------------------
 # `reflect.sh --mission-path <project_cwd>` prints the AUTHORITATIVE mission
-# handoff for that project: $REFLECT_ROOT/sessions/<sid>/mission.md, OUTSIDE every
-# repo. Exit 1 when there is none. Read-only: it never repairs, so a reader cannot
-# be surprised by a resolution that also mutated something.
+# handoff for that project: $REFLECT_ROOT/sessions/<sid>/handoff/mission.md, OUTSIDE
+# every repo. Exit 1 when there is none. Read-only: it never repairs, so a reader
+# cannot be surprised by a resolution that also mutated something.
 #
 # It does not look at the project tree AT ALL. `tasks/mission.<sid>.md` and
 # `tasks/mission.md` are human-readable copies; no automation reads them, so a
@@ -788,11 +794,20 @@ run_worker() {
     # 1. THE AUTHORITATIVE WRITE. Out of the repo, atomic, and mandatory: if this
     #    fails there is no handoff at all, so it is the only mission-mode write
     #    whose failure is an error.
-    local mission_handoff mission_handoff_cwd mission_handoff_dir_
+    #
+    #    Two directories, deliberately: the handoff body goes in the LEAF
+    #    `sessions/<sid>/handoff/`, which is the only thing the unattended fork is
+    #    granted write access to, and the cwd sidecar goes in `sessions/<sid>/`
+    #    one level up, where the fork cannot reach it. See "Out-of-repo handoff
+    #    paths" in lib.sh for the injected-write-back attack that split them.
+    local mission_handoff mission_handoff_cwd mission_handoff_dir_ mission_session_dir_
     mission_handoff="$(mission_handoff_path "$SESSION_ID")"
     mission_handoff_cwd="$(mission_handoff_cwd_path "$SESSION_ID")"
     mission_handoff_dir_="$(mission_handoff_dir "$SESSION_ID")"
+    mission_session_dir_="$(mission_session_dir "$SESSION_ID")"
     local handoff_ok=1
+    # -p creates the session dir on the way, so the sidecar write below has a
+    # directory to land in.
     if mkdir -p "$mission_handoff_dir_" 2>/dev/null; then
       local handoff_tmp
       if handoff_tmp="$(mktemp -p "$mission_handoff_dir_" ".mission-XXXXXX.md" 2>/dev/null)"; then
@@ -819,8 +834,14 @@ run_worker() {
     # handoff" without ever reading the project tree. Written AFTER the handoff so
     # a resolvable sidecar always has a handoff beside it, and written with a
     # trailing newline so `read -r` gets the whole path.
+    #
+    # It lands in the SESSION dir, one level above the handoff. It is an INPUT to
+    # resolution, and the fork's write grant covers the handoff's own directory, so
+    # a sidecar beside the handoff would be a sidecar the fork can rewrite — and
+    # rewriting it re-points a whole handoff at another project. The tmp file is
+    # created here too, so no part of this write is ever visible inside the grant.
     local cwd_tmp cwd_ok=1
-    if cwd_tmp="$(mktemp -p "$mission_handoff_dir_" ".mission-cwd-XXXXXX" 2>/dev/null)"; then
+    if cwd_tmp="$(mktemp -p "$mission_session_dir_" ".mission-cwd-XXXXXX" 2>/dev/null)"; then
       printf '%s\n' "$mission_cwd" > "$cwd_tmp" 2>/dev/null \
         && mv -f -- "$cwd_tmp" "$mission_handoff_cwd" 2>/dev/null \
         && cwd_ok=0

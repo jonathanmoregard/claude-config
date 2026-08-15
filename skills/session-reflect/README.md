@@ -234,11 +234,46 @@ already guarantee.
 ### Mission handoff layout — the authoritative copy is out of every repo
 
 ```
-$REFLECT_ROOT/sessions/<sid>/mission.md    AUTHORITATIVE handoff (outside every repo)
+$REFLECT_ROOT/sessions/<sid>/handoff/mission.md  AUTHORITATIVE handoff (outside
+                                                 every repo, alone in its dir)
 $REFLECT_ROOT/sessions/<sid>/mission.cwd   which project that handoff is for
+$REFLECT_ROOT/sessions/<sid>/manifest.json what the caller reads to decide the
+                                           write succeeded
 tasks/mission.<sid>.md                     human-readable COPY; no automation reads it
 tasks/mission.md                           human convenience symlink to the copy
 ```
+
+#### Why the handoff has a directory to itself
+
+The resume fork is launched `-p --permission-mode acceptEdits --add-dir <handoff
+dir>`, because the prompt asks it to update the handoff before it stops and a
+headless permission prompt is a denial. So **every file in that directory is
+fork-writable**, by a process executing a `## Next` list a model wrote out of a
+transcript that may have contained anything.
+
+While the handoff was `sessions/<sid>/mission.md`, the grant was the whole session
+directory — including `mission.cwd`, which is the project→handoff mapping
+*resolution reads*. An injected fork could rewrite it to name a **different**
+project; its own sanctioned write-back then made that handoff the newest one for
+the new target, and the next timer tick resolved it there and executed the injected
+`## Next` in someone else's checkout with edits auto-accepted. `manifest.json`,
+`final.json` and `checkpoints/` were in reach too.
+
+The rule that replaces that: **`sessions/<sid>/handoff/` holds the handoff body and
+nothing else, ever; everything any decision reads lives one level up in
+`sessions/<sid>/`.** Adding a second file to the leaf hands it to the fork. The
+grant is derived as `dirname` of the resolved handoff so producer and consumer
+cannot drift, and the value that actually lands on the fork's command line is
+asserted in `tests/smoke.sh` (TEST 24 on the argv, TEST 36 on the layout and the
+resolver).
+
+What the fork can still do inside the grant, and why each is harmless: rewrite its
+own `mission.md` (that is the sanctioned write-back); delete it (nothing resolves →
+no fork, fail closed); create extra files or nested directories (nothing reads
+them, and the candidate search is depth-pinned to `sessions/<sid>/handoff/mission.md`
+so a nested `handoff/mission.md` is not a candidate). It cannot reach
+`mission.cwd`, `manifest.json`, `final.json` or `checkpoints/`, so it cannot change
+which project any handoff belongs to, including its own.
 
 #### Why the handoff left the repo
 
@@ -255,7 +290,7 @@ were each bypassed:
 3. an HMAC over the body would have been guard #3 on the same class.
 
 USER DECISION 2026-08-15: stop asking repo content to be trustworthy. The
-authoritative handoff moved to `$REFLECT_ROOT/sessions/<sid>/mission.md` — outside
+authoritative handoff moved to `$REFLECT_ROOT/sessions/<sid>/handoff/mission.md` — outside
 every checkout, not git-tracked, not writable by repo content. **The unattended
 fork reads only that file.** `reflect.sh --mission-path <project-dir>` returns it
 and never looks inside the project; the `mission.cwd` sidecar (also out of repo)

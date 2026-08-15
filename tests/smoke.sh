@@ -1506,8 +1506,12 @@ info "orphaned started demoted to terminal error; fresh started left alone"
 # sessions/<sid>/ existence -> bypassed via the machine-created `_malformed`
 # bucket; a body HMAC would have been guard #3 on the same class).
 #
-#   $REFLECT_ROOT/sessions/<sid>/mission.md   AUTHORITATIVE, out of every repo
-#   $REFLECT_ROOT/sessions/<sid>/mission.cwd  which project it is for
+#   $REFLECT_ROOT/sessions/<sid>/handoff/mission.md  AUTHORITATIVE, out of every
+#                                             repo AND alone in its directory,
+#                                             because that directory is the only
+#                                             thing the resume fork may write
+#   $REFLECT_ROOT/sessions/<sid>/mission.cwd  which project it is for — one level
+#                                             up, outside that grant
 #   tasks/mission.<sid>.md                    human COPY; no automation reads it
 #   tasks/mission.md                          human symlink; no automation reads it
 #
@@ -1541,14 +1545,16 @@ mk_mission_handoff() {
   # attacker only by already owning the machine. Prints the handoff path.
   local sid="$1" cwd="$2" body="$3" when="${4:-}"
   local d="$REFLECT_ROOT/sessions/$sid"
-  mkdir -p "$d"
+  # The handoff goes in the fork-writable LEAF; the cwd sidecar one level up,
+  # outside that grant. Mirrors mission_handoff_path / mission_handoff_cwd_path.
+  mkdir -p "$d/handoff"
   {
     printf '<!-- written-against: sha=none ts=%s sid=%s -->\n' "$(date -u +%s)" "$sid"
     printf '%s\n' "$body"
-  } > "$d/mission.md"
+  } > "$d/handoff/mission.md"
   printf '%s\n' "$cwd" > "$d/mission.cwd"
-  [[ -n "$when" ]] && touch -d "$when" "$d/mission.md"
-  printf '%s' "$d/mission.md"
+  [[ -n "$when" ]] && touch -d "$when" "$d/handoff/mission.md"
+  printf '%s' "$d/handoff/mission.md"
 }
 
 canonical_stub() {
@@ -1629,7 +1635,7 @@ jq -e '.modes.mission.status == "complete"' "$B3_MANIFEST" >/dev/null \
 
 # D1: the AUTHORITATIVE artifact is out of the repo, and that is what the manifest
 # reports as `artifact` — the repo copy is reported separately.
-B3_HANDOFF="$REFLECT_ROOT/sessions/$B3_SID/mission.md"
+B3_HANDOFF="$REFLECT_ROOT/sessions/$B3_SID/handoff/mission.md"
 [[ -f "$B3_HANDOFF" ]] || fail "no authoritative handoff at $B3_HANDOFF"
 grep -q 'machine written' "$B3_HANDOFF" || fail "handoff lacks the model body"
 grep -q '^<!-- written-against: sha=.* sid=' "$B3_HANDOFF" || fail "handoff missing provenance stamp"
@@ -1695,14 +1701,14 @@ jq -e '.modes.mission.refused_overwrite == false' "$B3B_MANIFEST" >/dev/null \
   || fail "19b: refresh must not record a refusal"
 # Each session keeps its OWN authoritative handoff out of repo; the second run
 # does not overwrite the first session's.
-grep -q 'first pass' "$REFLECT_ROOT/sessions/$B3B_SID1/mission.md" \
+grep -q 'first pass' "$REFLECT_ROOT/sessions/$B3B_SID1/handoff/mission.md" \
   || fail "19b: first session's out-of-repo handoff was clobbered by the second"
-grep -q 'second pass' "$REFLECT_ROOT/sessions/$B3B_SID2/mission.md" \
+grep -q 'second pass' "$REFLECT_ROOT/sessions/$B3B_SID2/handoff/mission.md" \
   || fail "19b: second session wrote no handoff"
 # Resolution for this project follows the NEWEST handoff, which is the second run.
 B3B_RES="$(bash "$REFLECT_SH" --mission-path "$B3B_CWD" 2>/dev/null)" \
   || fail "19b: resolution failed after two runs in one project"
-[[ "$B3B_RES" == "$REFLECT_ROOT/sessions/$B3B_SID2/mission.md" ]] \
+[[ "$B3B_RES" == "$REFLECT_ROOT/sessions/$B3B_SID2/handoff/mission.md" ]] \
   || fail "19b: resolution should follow the newest handoff for the project (got '$B3B_RES')"
 info "pointer repointed across sessions; both handoffs kept; newest resolves"
 
@@ -1743,7 +1749,7 @@ B3C_MANIFEST="$REFLECT_ROOT/sessions/$B3C_SID/manifest.json"
 jq -e '.modes.mission.pointer_action == "refused_foreign_file"' "$B3C_MANIFEST" >/dev/null \
   || fail "19c: expected pointer_action=refused_foreign_file (got $(jq -r '.modes.mission.pointer_action' "$B3C_MANIFEST"))"
 [[ -f "$B3C_CWD/tasks/mission.$B3C_SID.md" ]] || fail "19c: human copy not written beside it"
-[[ -f "$REFLECT_ROOT/sessions/$B3C_SID/mission.md" ]] || fail "19c: no authoritative handoff"
+[[ -f "$REFLECT_ROOT/sessions/$B3C_SID/handoff/mission.md" ]] || fail "19c: no authoritative handoff"
 info "stamped regular mission.md untouched and unmoved; copy + handoff still written"
 
 # ============================================================================
@@ -2126,7 +2132,7 @@ sc_wait_mission() {
   # sidecar, the human copy, and a terminal manifest.
   local cwd="$1" sid="$2" mf="$REFLECT_ROOT/sessions/$2/manifest.json" i
   for (( i = 0; i < 120; i++ )); do
-    [[ -f "$REFLECT_ROOT/sessions/$sid/mission.md" ]] && \
+    [[ -f "$REFLECT_ROOT/sessions/$sid/handoff/mission.md" ]] && \
       [[ -f "$REFLECT_ROOT/sessions/$sid/mission.cwd" ]] && \
       [[ -f "$cwd/tasks/mission.$sid.md" ]] && \
       jq -e '.modes.mission.status == "complete"' "$mf" >/dev/null 2>&1 && return 0
@@ -2515,14 +2521,30 @@ grep -qi 'no user attached' "$B7_ARGV" \
 grep -qi 'do not ask' "$B7_ARGV" \
   || fail "24: B4 — fork prompt does not forbid asking the user what to do"
 # D1: the fork is seeded from the OUT-OF-REPO handoff, by absolute path.
-B7_HANDOFF="$REFLECT_ROOT/sessions/$B7_SID/mission.md"
+B7_HANDOFF="$REFLECT_ROOT/sessions/$B7_SID/handoff/mission.md"
 [[ -f "$B7_HANDOFF" ]] || fail "24: the Stop hook wrote no out-of-repo handoff"
 grep -qF "$B7_HANDOFF" "$B7_ARGV" \
   || fail "24: fork prompt does not name the out-of-repo handoff ($B7_HANDOFF)"
 grep -qF -- '--add-dir' "$B7_ARGV" \
   || fail "24: fork cannot write its own handoff back — the handoff dir is not in the workspace"
-grep -qF "$REFLECT_ROOT/sessions/$B7_SID" "$B7_ARGV" \
-  || fail "24: --add-dir does not scope to this session's handoff dir"
+# R1: the grant is read out of the ACTUAL argv, not inferred. It must be exactly
+# the handoff's own leaf directory — everything in a granted dir is writable by an
+# acceptEdits fork, so a grant one level wider would hand it mission.cwd (which
+# resolution reads), manifest.json, final.json and the checkpoint tree.
+B7_ADDDIR="$(awk '/^--add-dir$/{getline; print; exit}' "$B7_ARGV")"
+[[ -n "$B7_ADDDIR" ]] || fail "24: --add-dir appears in argv with no value"
+[[ "$B7_ADDDIR" == "$(dirname -- "$B7_HANDOFF")" ]] \
+  || fail "24/R1: --add-dir grants '$B7_ADDDIR'; want exactly the handoff's leaf dir '$(dirname -- "$B7_HANDOFF")'"
+for b7_name in mission.cwd manifest.json final.json checkpoints; do
+  [[ ! -e "$B7_ADDDIR/$b7_name" ]] \
+    || fail "24/R1: the granted dir '$B7_ADDDIR' contains $b7_name — the fork could rewrite it under acceptEdits"
+done
+[[ -f "$REFLECT_ROOT/sessions/$B7_SID/mission.cwd" ]] \
+  || fail "24/R1: no cwd sidecar outside the grant, so its placement proves nothing"
+case "$REFLECT_ROOT/sessions/$B7_SID/mission.cwd" in
+  "$B7_ADDDIR"|"$B7_ADDDIR"/*)
+    fail "24/R1: the cwd sidecar lives under the granted dir '$B7_ADDDIR'" ;;
+esac
 grep -qF '## Next' "$B7_ARGV" || fail "24: fork prompt does not point at ## Next"
 
 # D6: the fork runs the SAME hooks we do, so its own handoff writes land under
@@ -2585,7 +2607,7 @@ chmod +x "$STUB_SCRATCH/claude"
 # --permission-mode acceptEdits and a prompt that forbids it to ask which item to
 # pick, executing a `## Next` list that came out of a repo. Every version of "read
 # a repo file but check it first" was bypassed (see TEST 19g), so the read source
-# is now $REFLECT_ROOT/sessions/<sid>/mission.md, outside every checkout.
+# is now $REFLECT_ROOT/sessions/<sid>/handoff/mission.md, outside every checkout.
 #
 # Rule: resolve ONCE through reflect.sh, and if no handoff of ours resolves, do not
 # fork. Expensive-and-wrong fails off.
@@ -3375,12 +3397,12 @@ info "failed consume logged loudly; fresh= counts real skips; a malformed usage 
 echo "TEST 34: D5 — a relative REFLECT_ROOT is refused, loudly, at both seams"
 D5_DIR="$(mktemp -d -t reflect-d5-XXXXXX)"
 assert_isolated_cwd "$D5_DIR"
-mkdir -p "$D5_DIR/reflections/sessions/d5-sid" "$D5_DIR/tasks"
+mkdir -p "$D5_DIR/reflections/sessions/d5-sid/handoff" "$D5_DIR/tasks"
 # A handoff that WOULD resolve if the relative root were honoured from this cwd.
 {
   printf '<!-- written-against: sha=none ts=1786800000 sid=d5-sid -->\n'
   printf '%s\n' '# PLANTED via a relative root' '## Next' '1. attacker work'
-} > "$D5_DIR/reflections/sessions/d5-sid/mission.md"
+} > "$D5_DIR/reflections/sessions/d5-sid/handoff/mission.md"
 printf '%s\n' "$D5_DIR" > "$D5_DIR/reflections/sessions/d5-sid/mission.cwd"
 
 D5_ERR="$STUB_SCRATCH/d5.stderr"
@@ -3509,6 +3531,144 @@ fi
 grep -qi 'fails OFF' "$D6_PROMPT" \
   || fail "35c: prompt.md does not state the fails-off polarity"
 info "35c: the documented jq pattern is the correct one, and prompt.md agrees with the config's polarity"
+
+# ============================================================================
+# TEST 36: R1 — the fork's write grant holds nothing that any decision reads
+# ============================================================================
+# The out-of-repo move (D1) closed "repo content decides what an unattended fork
+# executes". This re-opened it from the other side. idle-handoff.sh launches the
+# fork with `--add-dir "$(dirname "$mission_path")"` so that `acceptEdits` covers
+# the write-back the prompt asks for — which makes EVERY file in that directory
+# fork-writable. While the handoff lived at sessions/<sid>/mission.md, the grant
+# was the whole session dir, so it also covered:
+#     mission.cwd     the project -> handoff mapping RESOLUTION READS
+#     manifest.json   what "did the mission write succeed" is read from
+#     final.json / checkpoints/   the reflection tree
+# A fork prompt-injected through the handoff body could rewrite mission.cwd to
+# name a DIFFERENT project; its own sanctioned write-back then made that handoff
+# the newest for the new target, and the next tick resolved it there and executed
+# the injected `## Next` in someone else's checkout with edits auto-accepted.
+#
+# The fix is structural: the handoff gets its own leaf directory, and every input
+# to the project -> handoff decision stays OUTSIDE it. This test asserts on the
+# RESOLVED GRANT PATH — not on what a model chooses to do with it — because the
+# claim being pinned is about reachability, not behaviour.
+echo "TEST 36: R1 — the fork's write grant is a leaf holding only the handoff"
+R1_CWD="$(mktemp -d -t reflect-r1cwd-XXXXXX)"
+R1_OTHER="$(mktemp -d -t reflect-r1other-XXXXXX)"
+assert_isolated_cwd "$R1_CWD"
+assert_isolated_cwd "$R1_OTHER"
+R1_SID="test-sid-r1-grant"
+
+# A REAL session dir, with the artifacts a live one has: mission mode writes the
+# handoff + sidecar + manifest, precompact adds checkpoints/, sessionend adds
+# final.json. Hand-placed fixtures would prove nothing about where the code puts
+# them.
+mission_stub '# Mission — grant scope
+
+## Done
+- built the fixture
+
+## Next
+- keep going'
+echo "$(jq -cn --arg sid "$R1_SID" --arg tp "$TRANSCRIPT" --arg cwd "$R1_CWD" \
+  '{session_id:$sid,transcript_path:$tp,hook_event_name:"IdleHandoff",cwd:$cwd}')" \
+  | bash "$REFLECT_SH" mission || fail "36: mission run failed"
+canonical_stub
+# cwd is the shared scratch dir, not $R1_CWD: only ONE precompact fires here, so
+# the 2nd-compact mission pre-fire cannot trigger, but the payload cwd is kept
+# isolated anyway (assert_isolated_cwd already vetted TEST_CWD).
+echo "$(jq -cn --arg sid "$R1_SID" --arg tp "$TRANSCRIPT" --arg cwd "$TEST_CWD" \
+  '{session_id:$sid,transcript_path:$tp,hook_event_name:"PreCompact",trigger:"manual",cwd:$cwd}')" \
+  | bash "$REFLECT_SH" precompact >/dev/null 2>&1 || true
+echo "$(jq -cn --arg sid "$R1_SID" --arg tp "$TRANSCRIPT" --arg cwd "$TEST_CWD" \
+  '{session_id:$sid,transcript_path:$tp,hook_event_name:"SessionEnd",reason:"other",cwd:$cwd}')" \
+  | bash "$REFLECT_SH" sessionend >/dev/null 2>&1 || true
+wait_for_complete "$REFLECT_ROOT/sessions/$R1_SID/manifest.json" 20 sessionend \
+  || fail "36: fixture session never completed sessionend, so final.json is missing"
+
+# The grant is DERIVED exactly as idle-handoff.sh derives it: dirname of whatever
+# the resolver returns. No literal path is assumed on this line, so the assertions
+# below follow the code rather than a comment.
+R1_RESOLVED="$(bash "$REFLECT_SH" --mission-path "$R1_CWD" 2>/dev/null)" \
+  || fail "36: --mission-path did not resolve the handoff it just wrote"
+R1_GRANT="$(dirname -- "$R1_RESOLVED")"
+[[ "$R1_RESOLVED" == "$R1_GRANT/mission.md" ]] \
+  || fail "36: resolved handoff '$R1_RESOLVED' is not <grant>/mission.md"
+
+# (a) The grant is a LEAF: exactly one entry, the handoff body.
+R1_CONTENTS="$(find "$R1_GRANT" -mindepth 1 -printf '%P\n' 2>/dev/null | sort | tr '\n' ' ')"
+[[ "$R1_CONTENTS" == "mission.md " ]] \
+  || fail "36a: the fork's write grant ($R1_GRANT) holds more than the handoff: [$R1_CONTENTS]"
+
+# (b) Every input to the project -> handoff decision, and every artifact a later
+#     run trusts, is OUTSIDE the grant — asserted twice over: absent from the
+#     grant, and present at a path that is not under the grant prefix.
+R1_SESSION_DIR="$REFLECT_ROOT/sessions/$R1_SID"
+for r1_name in mission.cwd manifest.json final.json checkpoints; do
+  [[ ! -e "$R1_GRANT/$r1_name" ]] \
+    || fail "36b: $r1_name is INSIDE the fork's write grant ($R1_GRANT) — an acceptEdits fork could rewrite it"
+  [[ -e "$R1_SESSION_DIR/$r1_name" ]] \
+    || fail "36b: fixture assumption broken — no $r1_name under $R1_SESSION_DIR, so its placement proves nothing"
+  case "$R1_SESSION_DIR/$r1_name" in
+    "$R1_GRANT"|"$R1_GRANT"/*)
+      fail "36b: $r1_name resolves under the granted dir ($R1_GRANT)" ;;
+  esac
+done
+
+# (c) THE ATTACK, at the resolver. Writing inside the grant is the whole of what
+#     the fork can do, so that is the only capability worth testing. Two shapes:
+#       * a `mission.cwd` in the grant naming another project — must not be an
+#         input to resolution, because the real sidecar is a level up;
+#       * a NESTED `handoff/mission.md` one level deeper, which would find that
+#         planted sidecar as its own sibling-of-parent — must not be a candidate,
+#         because the candidate search is depth-pinned to
+#         sessions/<sid>/handoff/mission.md.
+printf '%s\n' "$R1_OTHER" > "$R1_GRANT/mission.cwd"
+printf '{"session_id":"%s","modes":{}}\n' "$R1_SID" > "$R1_GRANT/manifest.json"
+mkdir -p "$R1_GRANT/handoff" && printf 'x\n' > "$R1_GRANT/handoff/mission.md"
+if R1_HIJACK="$(bash "$REFLECT_SH" --mission-path "$R1_OTHER" 2>/dev/null)"; then
+  fail "36c: a handoff was hijacked to another project by writing inside the grant (resolved '$R1_HIJACK' for $R1_OTHER)"
+fi
+R1_STILL="$(bash "$REFLECT_SH" --mission-path "$R1_CWD" 2>/dev/null)" \
+  || fail "36c: planting files inside the grant broke resolution for the real project (fail-closed, but it must not be reachable at all)"
+[[ "$R1_STILL" == "$R1_RESOLVED" ]] \
+  || fail "36c: resolution moved to '$R1_STILL' after the grant was written into; want '$R1_RESOLVED'"
+[[ "$(head -1 "$R1_SESSION_DIR/mission.cwd")" == "$R1_CWD" ]] \
+  || fail "36c: the real sidecar changed — it is not outside the grant after all"
+rm -rf "$R1_GRANT/mission.cwd" "$R1_GRANT/manifest.json" "$R1_GRANT/handoff"
+
+# (d) The sanctioned write-back still lands, and is still what resolves.
+printf '%s\n' '- appended by the fork' >> "$R1_RESOLVED"
+R1_AFTER="$(bash "$REFLECT_SH" --mission-path "$R1_CWD" 2>/dev/null)" \
+  || fail "36d: resolution failed after a write-back into the granted dir"
+[[ "$R1_AFTER" == "$R1_RESOLVED" ]] \
+  || fail "36d: a write-back moved resolution to '$R1_AFTER'"
+grep -qF 'appended by the fork' "$R1_AFTER" \
+  || fail "36d: the write-back is not visible through resolution"
+
+# (e) A second mission run for the same sid writes to the same granted path, so
+#     the grant is stable across handoff refreshes.
+mission_stub '# Mission — refreshed
+
+## Done
+- refreshed
+
+## Next
+- keep going'
+echo "$(jq -cn --arg sid "$R1_SID" --arg tp "$TRANSCRIPT" --arg cwd "$R1_CWD" \
+  '{session_id:$sid,transcript_path:$tp,hook_event_name:"IdleHandoff",cwd:$cwd}')" \
+  | REFLECT_FORCE=1 bash "$REFLECT_SH" mission || fail "36e: refresh run failed"
+R1_REFRESH="$(bash "$REFLECT_SH" --mission-path "$R1_CWD" 2>/dev/null)" \
+  || fail "36e: refresh broke resolution"
+[[ "$R1_REFRESH" == "$R1_RESOLVED" ]] \
+  || fail "36e: a refresh moved the handoff to '$R1_REFRESH' (grant would move with it)"
+grep -q 'refreshed' "$R1_REFRESH" || fail "36e: refresh did not rewrite the handoff"
+R1_CONTENTS2="$(find "$R1_GRANT" -mindepth 1 -printf '%P\n' 2>/dev/null | sort | tr '\n' ' ')"
+[[ "$R1_CONTENTS2" == "mission.md " ]] \
+  || fail "36e: a refresh left something else in the grant: [$R1_CONTENTS2]"
+canonical_stub
+info "36: grant is <session>/handoff/ holding only mission.md; sidecar, manifest, final.json and checkpoints/ are outside it and unreachable from inside"
 
 # ============================================================================
 # FINAL GUARD: prove the whole suite left the live repo alone.

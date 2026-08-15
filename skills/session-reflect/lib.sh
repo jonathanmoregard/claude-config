@@ -619,14 +619,19 @@ reap_stale_started() {
 # USER DECISION 2026-08-15: stop trying to make repo content trustworthy. Move the
 # authoritative handoff out of every repo.
 #
-#   $REFLECT_ROOT/sessions/<sid>/mission.md   AUTHORITATIVE. Outside every repo,
+#   $REFLECT_ROOT/sessions/<sid>/handoff/mission.md
+#                                             AUTHORITATIVE. Outside every repo,
 #                                             not git-tracked, not reachable by
 #                                             repo content. The unattended fork
-#                                             reads ONLY this.
+#                                             reads ONLY this — and is granted
+#                                             write access to this directory and
+#                                             nothing else, which is why the
+#                                             directory holds nothing else.
 #   $REFLECT_ROOT/sessions/<sid>/mission.cwd  which project this handoff is for.
-#                                             Also outside the repo, so the
-#                                             cwd -> handoff lookup consults no
-#                                             repo content either.
+#                                             Outside the repo AND outside the
+#                                             fork's write grant, so the
+#                                             cwd -> handoff lookup consults
+#                                             nothing either side can influence.
 #   tasks/mission.<sid>.md                    human-readable COPY. No automation
 #                                             reads it.
 #   tasks/mission.md                          human convenience symlink to the
@@ -683,11 +688,42 @@ mission_has_our_stamp() {
 }
 
 # --- Out-of-repo handoff paths ------------------------------------------------
-# All three are pure path builders over $REFLECT_ROOT, which is required to be
-# absolute (see the REFLECT_ROOT validation at the top of this file) so no
-# process cwd — least of all a hostile checkout's — can re-anchor them.
-mission_handoff_dir()      { printf '%s' "$REFLECT_ROOT/sessions/${1:-}"; }
-mission_handoff_path()     { printf '%s' "$REFLECT_ROOT/sessions/${1:-}/mission.md"; }
+# Pure path builders over $REFLECT_ROOT, which is required to be absolute (see the
+# REFLECT_ROOT validation at the top of this file) so no process cwd — least of all
+# a hostile checkout's — can re-anchor them.
+#
+# THE HANDOFF LIVES IN ITS OWN LEAF DIRECTORY, ALONE. That is not tidiness, it is
+# the unattended fork's WRITE BOUNDARY. `scripts/idle-handoff.sh` launches the fork
+# with `--add-dir "$(dirname "$handoff")"` so `acceptEdits` covers the write-back
+# the prompt asks it to perform — which makes every file in that directory
+# fork-writable.
+#
+# Until 2026-08-16 the handoff was `sessions/<sid>/mission.md`, so the grant was
+# the whole session directory, which also holds `mission.cwd` — the project ->
+# handoff mapping that mission_resolve_handoff READS — plus `manifest.json`,
+# `final.json` and `checkpoints/`. A fork prompt-injected through the handoff body
+# (the body is written by a model from a transcript, and the fork prompt says so)
+# could therefore rewrite `mission.cwd` to name a DIFFERENT project. Its own
+# sanctioned write-back then made that handoff the newest for the new target, the
+# next timer tick resolved it there, and the injected `## Next` executed in someone
+# else's checkout with edits auto-accepted. The out-of-repo move closed the class
+# where repo content decides what a fork runs; the write grant re-opened it.
+#
+#   sessions/<sid>/handoff/mission.md    FORK-WRITABLE, and the ONLY thing in there
+#   sessions/<sid>/mission.cwd           OUTSIDE the grant: an INPUT to resolution
+#   sessions/<sid>/manifest.json         OUTSIDE: "did the write succeed" is read
+#                                        from it, by the process that decides to fork
+#   sessions/<sid>/final.json            OUTSIDE: the reflection tree
+#   sessions/<sid>/checkpoints/          OUTSIDE: ditto
+#
+# RULE for anyone adding a file under a session: it goes in `sessions/<sid>/`.
+# `sessions/<sid>/handoff/` holds the handoff body and nothing else, ever. Adding a
+# second file there hands it to the fork; adding one that any decision reads
+# re-opens this exact hole. tests/smoke.sh TEST 36 asserts the grant's contents,
+# and TEST 24 asserts the grant that is actually passed on the fork's command line.
+mission_session_dir()      { printf '%s' "$REFLECT_ROOT/sessions/${1:-}"; }
+mission_handoff_dir()      { printf '%s' "$REFLECT_ROOT/sessions/${1:-}/handoff"; }
+mission_handoff_path()     { printf '%s' "$REFLECT_ROOT/sessions/${1:-}/handoff/mission.md"; }
 mission_handoff_cwd_path() { printf '%s' "$REFLECT_ROOT/sessions/${1:-}/mission.cwd"; }
 
 # mission_resolve_handoff <project_cwd> — print the AUTHORITATIVE handoff for that
@@ -697,16 +733,21 @@ mission_handoff_cwd_path() { printf '%s' "$REFLECT_ROOT/sessions/${1:-}/mission.
 # (both ends read it from the same place: mission mode records the payload cwd,
 # idle-handoff.sh extracts `.cwd` from the transcript). Compared literally.
 #
-# Newest-by-mtime among $REFLECT_ROOT/sessions/<sid>/mission.md whose sibling
-# mission.cwd names this project. EVERY input to that decision is outside every
-# repo: the candidate set comes from $REFLECT_ROOT, and so does the cwd
-# association. Repo content cannot add a candidate, rename one, or change which
-# project one claims — which is why a planted repo copy is a non-event here rather
-# than a case that has to be caught.
+# Newest-by-mtime among $REFLECT_ROOT/sessions/<sid>/handoff/mission.md whose
+# mission.cwd — one level UP, outside the fork's write grant — names this project.
+# EVERY input to that decision is outside every repo AND outside anything the
+# unattended fork can write: the candidate set comes from $REFLECT_ROOT, and the cwd
+# association comes from a file only the hook process writes. Repo content cannot
+# add a candidate, rename one, or change which project one claims (which is why a
+# planted repo copy is a non-event rather than a case to catch), and neither can the
+# fork whose own handoff is one of the candidates.
 #
-# Depth is pinned to sessions/<sid>/mission.md. Subagent artifacts nest one level
-# deeper (sessions/<parent>/subagents/<sid>/) and mission mode never writes there,
-# so a deeper match would be something we did not produce.
+# Depth is pinned to exactly sessions/<sid>/handoff/mission.md, and the middle
+# component must literally be `handoff`. Both halves matter: the fork CAN create
+# nested directories inside its grant, so an unpinned search would let it mint
+# `handoff/handoff/mission.md` with a planted `handoff/mission.cwd` as that
+# candidate's sidecar. Subagent artifacts nest under
+# sessions/<parent>/subagents/<sid>/ and mission mode never writes there.
 #
 # Read-only, and every decision is logged to stderr so a choice is never silent.
 mission_resolve_handoff() {
@@ -720,13 +761,18 @@ mission_resolve_handoff() {
     echo "reflect: no sessions root at $sessions_root — no mission handoff can exist yet" >&2
     return 1
   fi
-  local f dir sid cwdfile rec seen=0
+  local f grant_dir session_dir_ sid cwdfile rec seen=0
   while IFS= read -r f; do
     [[ -n "$f" && -f "$f" ]] || continue
-    dir="$(dirname -- "$f")"
-    sid="$(basename -- "$dir")"
+    grant_dir="$(dirname -- "$f")"
+    # The fork-writable leaf must be named `handoff` and must sit directly under
+    # the session dir. Belt to the find depth pin's braces.
+    [[ "$(basename -- "$grant_dir")" == "handoff" ]] || continue
+    session_dir_="$(dirname -- "$grant_dir")"
+    sid="$(basename -- "$session_dir_")"
     is_valid_sid "$sid" || continue
-    cwdfile="$dir/mission.cwd"
+    # The sidecar is read from the SESSION dir, never from the grant.
+    cwdfile="$session_dir_/mission.cwd"
     [[ -f "$cwdfile" ]] || continue
     seen=$(( seen + 1 ))
     rec=""
@@ -735,9 +781,10 @@ mission_resolve_handoff() {
     echo "reflect: mission handoff resolved (newest for this project, out of repo) -> $f" >&2
     printf '%s' "$f"
     return 0
-  done < <(find "$sessions_root" -mindepth 2 -maxdepth 2 -type f -name mission.md \
+  done < <(find "$sessions_root" -mindepth 3 -maxdepth 3 -type f -name mission.md \
+             -path '*/handoff/mission.md' \
              -printf '%T@\t%p\n' 2>/dev/null | sort -rn | cut -f2- || true)
-  echo "reflect: no mission handoff under $sessions_root records cwd='$want' ($seen candidate handoff(s) examined). Nothing in the project tree is consulted: tasks/mission*.md are human copies, never a read source." >&2
+  echo "reflect: no mission handoff under $sessions_root/*/handoff/mission.md records cwd='$want' ($seen candidate handoff(s) examined). Nothing in the project tree is consulted: tasks/mission*.md are human copies, never a read source." >&2
   return 1
 }
 

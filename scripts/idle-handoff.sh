@@ -522,7 +522,7 @@ MISSION_EXCLUDES=(
 # ---- Authoritative mission resolution ---------------------------------------
 # The single seam for "which file IS the mission for this project". Delegates to
 # reflect.sh so the rule lives in exactly one place: the AUTHORITATIVE handoff is
-# $REFLECT_ROOT/sessions/<sid>/mission.md, OUTSIDE every repo. Nothing in the
+# $REFLECT_ROOT/sessions/<sid>/handoff/mission.md, OUTSIDE every repo. Nothing in the
 # project tree is read — `tasks/mission.<sid>.md` and `tasks/mission.md` are human
 # copies, so a planted, forged, committed or tampered one cannot influence what a
 # fork executes. Prints the path; a non-zero return means "do not fork", never
@@ -810,7 +810,7 @@ for project_dir in "$PROJECTS_DIR"/*/; do
       log "autofork skipped: mission_resolve_error sid=$sid cwd=$candidate_cwd rc=$mission_resolve_rc (the resolver failed; this is NOT a refusal)"
     else
       count_skipped_mission_not_ours=$((count_skipped_mission_not_ours + 1))
-      log "autofork skipped: mission_not_ours sid=$sid cwd=$candidate_cwd (no handoff under \$REFLECT_ROOT/sessions/*/mission.md records this cwd; nothing in the tree is a read source)"
+      log "autofork skipped: mission_not_ours sid=$sid cwd=$candidate_cwd (no handoff under \$REFLECT_ROOT/sessions/*/handoff/mission.md records this cwd; nothing in the tree is a read source)"
     fi
     continue
   fi
@@ -972,12 +972,27 @@ PROMPT
   #
   # LOW fix: printf %s (not echo, which adds trailing \n that tr maps to _).
   #
-  # `--add-dir <handoff dir>`: the mission handoff now lives OUTSIDE the project,
-  # and the prompt asks the fork to update it before stopping. `acceptEdits`
+  # `--add-dir <handoff dir>`: the mission handoff lives OUTSIDE the project, and
+  # the prompt asks the fork to update it before stopping. `acceptEdits`
   # auto-accepts edits inside the workspace only, so without this the write-back
   # would need a permission prompt — which, in a headless `-p` run with no user
-  # attached, is a denial. Scope is exactly one session directory, not
-  # $REFLECT_ROOT.
+  # attached, is a denial.
+  #
+  # EVERYTHING IN THIS DIRECTORY IS THEREFORE FORK-WRITABLE, and the fork is
+  # executing a `## Next` list that a model wrote out of a transcript. So the grant
+  # is the handoff's own LEAF directory — `sessions/<sid>/handoff/`, which holds
+  # mission.md and nothing else. It is NOT the session dir: that also holds
+  # `mission.cwd` (the project -> handoff mapping mission_resolve_ours reads),
+  # `manifest.json` (how the caller decides the write succeeded), `final.json` and
+  # `checkpoints/`. Granting the session dir let an injected fork re-point its own
+  # handoff at ANOTHER project by rewriting mission.cwd; its sanctioned write-back
+  # then made that handoff the newest one there, and the next tick executed the
+  # injected Next in someone else's checkout. See "Out-of-repo handoff paths" in
+  # skills/session-reflect/lib.sh; asserted by TEST 24 (on this argv) and TEST 36.
+  #
+  # Derived by dirname rather than rebuilt, so producer and consumer cannot drift:
+  # widen the leaf in lib.sh and this widens with it — which is exactly why the
+  # test asserts on the value that lands in argv.
   mission_dir_for_fork="$(dirname -- "$mission_path")"
   unit_name="claude-autofork-$(printf %s "$sid" | tr -c 'A-Za-z0-9._-' '_')-$(date +%s)"
   can_systemd_run=0
