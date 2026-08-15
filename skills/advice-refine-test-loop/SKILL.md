@@ -885,7 +885,8 @@ used elsewhere in this pipeline. Not one object per image — one object,
 whose `findings` array covers every image you were given (severity,
 autofix_class, file, line, rationale, unverifiable — all per schema).
 Identify the image PER FINDING: `file` = that image's
-basename, `line: 0` (schema requires line; visual findings are whole-image).
+ABSOLUTE path, copied exactly as given to you, `line: 0` (schema requires line;
+visual findings are whole-image).
 Encode region + rule INSIDE rationale as a prefix: `[region: <where>]
 [rule: <fixed-rule# or drift-back#>] <what breaks>`. Example: `[region:
 top-left option in radiogroup] [rule: drift-back#1] radio dot renders above
@@ -910,7 +911,8 @@ into one invocation — Codex vision recall drops sharply past ~4 images per
 turn, per DiffSpot Hard-tier data.
 
 `--output-schema` returns exactly ONE verdict object per invocation. Attribute
-each finding to its shot via the `file` basename; never ask for or expect a
+each finding to its shot via its absolute `file` path — the schema's `file` is
+an absolute path in every phase, 4b included; never ask for or expect a
 per-image object or a per-shot findings array.
 
 **Severity floor, applied by the parent AFTER parsing — never in the prompt.**
@@ -943,7 +945,11 @@ Three inputs to merge:
 2. **Opus advisor findings** — output from Phase 4a Assessments A + B.
 3. **Codex vision-taste findings** — the per-surface JSON blobs written above.
 
-Bucket findings by `(surface, element_selector_if_any, rule)`. For each bucket:
+Bucket findings by `(surface, element_selector_if_any, rule)`. `surface` is the
+invocation label the shots were dispatched under — the `<surface>` in the output
+filename, and the same string the ledger's `surface` column carries. The
+finding's absolute `file` path identifies which shot within that surface; it is
+never the bucket key. For each bucket:
 
 | Convergence | Confidence | Action |
 |---|---|---|
