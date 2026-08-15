@@ -1,9 +1,15 @@
 {
-  "_components_comment": "Per-part switches for RSI. Flipping one here is the whole toggle — no rebuild, no crontab PR. daily_review gates the nightly headless Opus pass over the transcript corpus (rsi-daily-review checks this before it spends anything; absent or unreadable config reads as OFF, because that run costs usage). permission_ledger gates the 17:30 permission-friction evaluator (run-evaluate.sh; absent config reads as ON, because capture is already running and only this stage turns it into something a human sees). auto_research gates the research pass over selected observations, which runs from /review-improvements rather than cron.",
+  "_components_comment": "Per-part switches for RSI. Flipping one here is the whole toggle — no rebuild, no crontab PR. daily_review gates the nightly headless Opus pass over the transcript corpus (rsi-daily-review checks this before it spends anything; absent or unreadable config reads as OFF, because that run costs usage). permission_ledger gates the 17:30 permission-friction evaluator (run-evaluate.sh; absent config reads as ON, because capture is already running and only this stage turns it into something a human sees). auto_research gates the research pass over selected observations, which runs from /review-improvements rather than cron. self_compact gates the autonomous context lifecycle: the Stop hook self-compact-trigger.py writes a mission handoff once a session crosses self_compact.threshold of its detected context window, and scripts/idle-handoff.sh then resumes the work in a fresh process. Absent, malformed, or any non-boolean value reads as OFF, because the resume runs opus-5. It does NOT auto-invoke /compact or /clear — those are never agent-triggered.",
   "components": {
     "daily_review": false,
     "auto_research": false,
-    "permission_ledger": true
+    "permission_ledger": true,
+    "self_compact": false
+  },
+  "_self_compact_comment": "threshold is a fraction of the DETECTED window (0.30 = ~300k on a 1M model), deliberately aggressive relative to the 70% advisory nudge in context-baggage.py; both are live and independent. max_fires_per_session caps the once-per-crossing loop bound so a session oscillating around the threshold cannot re-fire indefinitely.",
+  "self_compact": {
+    "threshold": 0.3,
+    "max_fires_per_session": 3
   },
   "categories": {
     "productivity": true,
