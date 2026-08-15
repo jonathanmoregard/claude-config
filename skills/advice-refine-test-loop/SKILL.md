@@ -61,12 +61,16 @@ Each Phase 1/2 round follows the same shape:
    Any of: unparseable JSON, missing `.verdict`, or verdict/findings mismatch → the round FAILED. Re-dispatch once with an explicit "output valid JSON matching verdict-schema.json AND ensure verdict matches findings (PASS = empty findings; PASS_WITH_FIXES = no BLOCKER/HIGH; BLOCKS = ≥1 BLOCKER/HIGH)" reminder.
 
    Second failure PAUSEs the loop (interactive: prompt user; unattended: append to `pending_for_human.md` and exit `pending-human`). NEVER treat unparseable output or a mismatched verdict as advance-worthy — an incoherent advisor response has produced zero trustworthy coverage.
-4.5. VALIDATE: dispatch a fresh Opus subagent (`Agent(subagent_type="advisor", ...)`) with ONLY the findings JSON + absolute paths of files referenced by findings. Prompt: "For each finding in the input array, read the file at the given line. Emit a JSON array `[{index, verified, unverifiable_confirmed, note}]` where `index` is the 0-based position of the finding in the input array. `verified=true` iff the described condition is empirically present at that location. `unverifiable_confirmed=true` when the finding was tagged `unverifiable: true` by the parent advisor AND you agree no empirical check applies (subjective — taste, 'could be simpler', style preferences). `verified=false` = parent drops `findings[index]` from the report; `unverifiable_confirmed=true` is informational (parent already knows the tag; you're confirming it can't be checked) and the finding is kept as-is." Parent drops `findings[i]` where the validator returned `verified: false` for that index before proceeding to step 5. Unverifiable findings (whether or not the validator confirmed) continue to step 5 as-is — repro is still attempted; often it will confirm nothing, which is fine.
+4.5. VALIDATE: dispatch a fresh Opus subagent (`Agent(subagent_type="advisor", ...)`) with ONLY the PIVOTAL findings JSON (see "Validate only PIVOTAL findings" below) + absolute paths of files referenced by those findings. `index` is positional within the array you SEND; the parent maps indices back to the full findings list itself. Prompt: "For each finding in the input array, read the file at the given line. Emit a JSON array `[{index, verified, unverifiable_confirmed, note}]` where `index` is the 0-based position of the finding in the input array. `verified=true` iff the described condition is empirically present at that location. `unverifiable_confirmed=true` when the finding was tagged `unverifiable: true` by the parent advisor AND you agree no empirical check applies (subjective — taste, 'could be simpler', style preferences). `verified=false` = parent drops `findings[index]` from the report; `unverifiable_confirmed=true` is informational (parent already knows the tag; you're confirming it can't be checked) and the finding is kept as-is." Parent drops `findings[i]` where the validator returned `verified: false` for that index before proceeding to step 5. Unverifiable findings (whether or not the validator confirmed) continue to step 5 as-is — repro is still attempted; often it will confirm nothing, which is fine.
 
    **Failure-mode handling (degrade-to-pre-4.5 on any failure).** Step 4.5 is an optimization, not a correctness gate — do NOT retry, do NOT PAUSE the loop:
    - Wrap the validator dispatch with `timeout 180s` (bounded — validator is a cheap read-only pass).
    - If the validator returns quota-exhausted, times out, produces malformed JSON, or emits a verdict-missing / unparseable result on the FIRST try: skip step 4.5 for this round entirely, log `"validator unavailable: <cause>"` in the round's commit message, and proceed to step 5 with ALL findings intact (no drops, no tags — parent behaves as if step 4.5 did not exist).
    - This is safe by construction: the worst case is repro effort in step 5 on findings that might have been hallucinations; the benefit is no PAUSE storm from an ancillary check. Phase 2's PAUSE ladder exists because Codex is the cross-vendor coverage lane — irreplaceable. Step 4.5's validator is one advisor of many; skipping it once is cheaper than pausing the loop.
+
+   **Validator input boundary — findings JSON + absolute paths ONLY.** Never add the advisor's reasoning, exploration trace, or diff context to the validator prompt. The narrower input is the mechanism, not the model choice.
+
+   **Validate only PIVOTAL findings.** A finding the primary AND a specialist flagged INDEPENDENTLY at the same location is not pivotal — skip the validator, go straight to step 5. A singleton finding (one reviewer only) IS pivotal — validate it. This trims step 4.5 only; it NEVER skips step 5 repro.
 5. REPRODUCE each BLOCKER/HIGH finding before fixing — advisors hallucinate
 6. FIX by severity, re-verify after each
 7. COMMIT the round (per-round granularity, not a batch), then WRITE RUN
@@ -90,27 +94,58 @@ a bad proxy for progress: a round that finds two *new, reproducible* defects on
 an 80-commit diff is the loop working, and stopping to ask about it wastes the
 user's attention on a question with an obvious answer. What actually
 distinguishes progress from churn is whether each round surfaces defects that
-are (a) NEW and (b) SURVIVE REPRODUCTION. Count them, not findings.
+are (a) NEW, (b) SURVIVE REPRODUCTION, and (c) cost less fresh breakage than
+they buy. Count that, not findings. **Benefit alone is not the signal — a
+round's fixes can break more than the round found.**
 
 **Track per round**, appended to `rounds[phase]` in the run state at step 7:
 
 - `new_r` — BLOCKER+HIGH findings not already reported earlier in this run,
-  deduped by (file, line, claim), measured AFTER step 4.5 drops. A finding
-  re-flagged from a prior round is NOT new, even if worded differently.
+  deduped by MEANING (see below), measured AFTER step 4.5 drops. A finding
+  re-flagged from a prior round is NOT new, even if worded differently or
+  reported at a shifted line.
 - `repro_r` — of those `new_r`, how many the fix stage EMPIRICALLY REPRODUCED
   (step 5). A finding that could not be reproduced was never real work.
+- `regressed_r` — previously-passing tests broken by THIS round's fixes.
+  Count a test as regressed if it passed at the round's entry verification
+  (step 2) and failed at any step-6 re-verification during this round, whether
+  or not a later fix in the same round repaired it. Step 6 already re-verifies
+  after every fix, so the data is on hand; record it, don't recompute it.
 
-**Gate, evaluated at step 9 before starting round r+1:**
+**Dedupe `new_r` by MEANING, not by `(file, line, claim)`.** The tuple rule is
+insufficient: a reworded repeat at a shifted line passes it and counts as NEW,
+which inflates the continue signal that the gate below depends on. Two methods,
+in preference order:
+
+1. **Equivalence-judge subagent (preferred).** Dispatch a fresh read-only
+   subagent with the candidate finding and the prior-round finding. Ask ONE
+   yes/no question: "do these describe the same underlying defect?" No
+   similarity scores, no numeric thresholds. **Default to "not equivalent"
+   when ambiguous** — the failure direction is then one extra round, never a
+   missed defect.
+2. **Trigram Jaccard ≥ 0.8 within the same category (fallback).** Cheap, no
+   dispatch. Apply only once the run has ≥ 5 findings to compare against;
+   below that floor treat every finding as new.
+
+**Gate, evaluated at step 9 before starting round r+1.** Continue only while
+MARGINAL GAIN is positive — benefit minus damage, not benefit alone. Defensive
+stops are evaluated last and WIN over the continue flag; rollback and failure
+reporting outrank optimism.
 
 ```bash
-# Continue while the round produced at least one new, reproduced blocker.
-if (( repro_r >= 1 )); then
+# Marginal gain positive: the round bought more than it broke.
+if (( repro_r > regressed_r )); then
   continue_round=1            # still finding real defects — do NOT ask, just go
 fi
 
-# Converged: a round that surfaced nothing new and real.
-if (( repro_r == 0 )); then
+# Nothing new, nothing broken: the good exit.
+if (( repro_r == 0 && regressed_r == 0 )); then
   stop="converged"            # advance to the next phase, no user input needed
+fi
+
+# Fixes cost at least as much as they bought.
+if (( repro_r <= regressed_r )) && (( repro_r > 0 || regressed_r > 0 )); then
+  stop="no-marginal-gain"
 fi
 
 # Guessing: findings keep arriving but stop surviving reproduction.
@@ -119,26 +154,41 @@ if (( n >= 2 )) && (( 2*repro_r < new_r )) && (( 2*repro_prev < new_prev )); the
   stop="unreproducible"       # the advisor is pattern-matching, not analysing
 fi
 
-# Hard backstop only. Not a convergence signal — a cost ceiling.
+# Oscillation: the same semantic issue was accepted, then re-flagged (or the
+# reverse). ONE flip is enough — do not wait for a second.
+if (( flips_on_same_issue >= 1 )); then stop="oscillation"; fi
+
+# COST backstop only. Explicitly NOT a convergence signal — a fixed round
+# ceiling cannot judge whether a round was worth running. Never read a
+# `ceiling` stop as "the phase converged".
 if (( n >= 8 )); then stop="ceiling"; fi
 if [[ -n "$BUDGET_TOTAL" ]] && (( $(budget_remaining) < 60000 )); then
   stop="budget"
 fi
 ```
 
-In prose: **keep going while each round yields at least one new defect that
-reproduces.** Round count is irrelevant while that holds — round 7 finding a
-real data-loss bug is worth more than stopping at round 3 for tidiness. Stop
-when a round finds nothing new and real (`converged` — this is the good exit,
-advance to the next phase silently), when findings stop surviving reproduction
-across two consecutive rounds (`unreproducible` — the advisor has run out of
-analysis and is pattern-matching), or at the hard ceiling / budget floor.
+`flips_on_same_issue` counts issues (semantic-equivalence matched, same rule as
+`new_r`) that were marked resolved/accepted in an earlier round of this phase
+and re-flagged in this one, or flagged then dropped as non-issues then flagged
+again.
 
-`converged` and `unreproducible` do NOT stop to ask. `converged` advances.
-`unreproducible` advances too, with the unreproduced findings surfaced in the
-phase's exit commit message — an advisor that can't produce reproducible
-findings has stopped adding coverage, and asking a human to adjudicate a list
-of unreproducible claims is exactly the wrong use of their attention.
+In prose: **keep going while each round reproduces more new defects than its
+fixes break.** Round count is irrelevant while that holds — round 7 finding a
+real data-loss bug is worth more than stopping at round 3 for tidiness.
+
+| Stop reason | Trigger | Routes to |
+|---|---|---|
+| `converged` | `repro_r == 0` and `regressed_r == 0` | Advance silently. The good exit. |
+| `no-marginal-gain` | `repro_r <= regressed_r`, with either nonzero | Advance. List the regressions in the phase's exit commit message. |
+| `unreproducible` | 2 consecutive rounds with under half of `new_r` reproducing | Advance. Surface the unreproduced findings in the exit commit message. |
+| `oscillation` | ≥1 accept→reflag (or reflag→drop→reflag) flip on the same semantic issue | Advance. Name the oscillating issue in the exit commit message. |
+| `ceiling` | `n >= 8` | PAUSE handler. |
+| `budget` | budget floor hit | PAUSE handler. |
+
+`converged`, `no-marginal-gain`, `unreproducible`, and `oscillation` do NOT
+stop to ask — they are quality judgements the loop can make from its own trace.
+Asking a human to adjudicate unreproducible claims, a flip-flopping advisor, or
+a round that broke as much as it fixed is the wrong use of their attention.
 
 **Only `ceiling` and `budget` route to the PAUSE handler**, because those are
 resource limits a human owns, not quality judgements the loop can make.
@@ -147,7 +197,7 @@ resource limits a human owns, not quality judgements the loop can make.
 — do not invent a second escalation path:
 
 - **Interactive:** print `"Phase <P> stopped: <reason> after <n> rounds
-  (blockers per round: <b>). Options: (a) continue N more rounds anyway,
+  (new/repro/regressed per round: <trace>). Options: (a) continue N more rounds anyway,
   (b) ship with the remaining findings surfaced, (c) abort."` Wait for the
   user.
 - **Unattended:** append to `pending_for_human.md` in the CLAUDE.md format,
@@ -182,8 +232,12 @@ no exceptions:**
   "status": "running | pending-human | complete",
   "phase": "1 | 2 | 3 | 4a | 4b",
   "round": 3,
-  "rounds": {"1": [{"new": 5, "repro": 5}, {"new": 2, "repro": 2}, {"new": 0, "repro": 0}],
-             "2": [{"new": 1, "repro": 1}, {"new": 0, "repro": 0}]},
+  "rounds": {"1": [{"new": 5, "repro": 5, "regressed": 0},
+                   {"new": 2, "repro": 2, "regressed": 1},
+                   {"new": 0, "repro": 0, "regressed": 0}],
+             "2": [{"new": 1, "repro": 1, "regressed": 0},
+                   {"new": 0, "repro": 0, "regressed": 0}]},
+  "stop_reasons": {"1": "converged", "2": "no-marginal-gain"},
   "phase3_resets": 0,
   "round_commits": ["a1b2c3d", "e4f5g6h"],
   "fixed_summary": ["<one line per fixed finding, phase-tagged>"],
@@ -193,7 +247,9 @@ no exceptions:**
 ```
 
 `fixed_summary` is the durable form of the "Prior rounds fixed:" list — it is
-what makes resume cheap rather than a restart.
+what makes resume cheap rather than a restart. `stop_reasons` records how each
+completed phase exited (the Loop-bounds stop table); the Exit report reads it
+from here, so a compact never loses it.
 
 **On skill start, before Phase 1:** if `tasks/arftl-run.json` exists with
 `status: running`, do NOT start over. Read it, announce `"Resuming ARFTL at
@@ -218,13 +274,15 @@ Both lanes emit JSON matching `~/.claude/skills/advice-refine-test-loop/verdict-
 }
 ```
 
-**Severity × autofix_class are orthogonal axes.** `severity` is urgency (how bad if this ships); `autofix_class` is apply-authority (can this be applied without a human call). Conflating them ships wrong fixes: a `severity=LOW` rename that ripples across 40 files is NOT `safe_auto` — it's `gated_auto` (mechanically fine but wants human ack) or `manual` (needs human implementation). Consolidator gates on the AND of both axes (see below); severity alone is not license to auto-apply. `advisory` findings are surface-only and never auto-fixed regardless of severity.
+**Severity × autofix_class are orthogonal axes.** `severity` is intrinsic risk (blast radius, reversibility, silence, recoverability — a property of the defect); `autofix_class` is apply-authority (can this be applied without a human call). Conflating them ships wrong fixes: a `severity=LOW` rename that ripples across 40 files is NOT `safe_auto` — it's `gated_auto` (mechanically fine but wants human ack) or `manual` (needs human implementation). Consolidator gates on the AND of both axes (see below); severity alone is not license to auto-apply. `advisory` findings are surface-only and never auto-fixed regardless of severity.
 
-- **PASS** = ZERO findings (empty `findings` array). Advance immediately, no consolidator needed.
-- **PASS_WITH_FIXES** = at least one MEDIUM or LOW finding, but no BLOCKER/HIGH. Consolidator runs before phase advance (auto-fixes `severity=LOW AND autofix_class=safe_auto` only; other LOWs surface alongside MEDIUMs in the round's commit message for the human to triage but do NOT block advance). If a MEDIUM ought to block, it should have been a HIGH — trust the advisor's severity.
-- **BLOCKS** = ≥1 BLOCKER or HIGH; next round required.
+**The enum semantics below are PARENT-SIDE — a dispatch table the parent executes on the returned JSON, not text for an advisor prompt.** Everything after each semicolon is a consequence and must be stripped from anything the advisor reads (see "Elicit risk, not policy" under Advisor Prompt Shape).
 
-The advisor MUST NOT emit `PASS` with a non-empty findings array — that combination is unreachable in the state machine. LOW-only remainders are `PASS_WITH_FIXES`.
+- **PASS** = ZERO findings (empty `findings` array); parent advances immediately, no consolidator needed.
+- **PASS_WITH_FIXES** = at least one MEDIUM or LOW finding, but no BLOCKER/HIGH; parent runs the consolidator before phase advance (auto-fixes `severity=LOW AND autofix_class=safe_auto` only; other LOWs surface alongside MEDIUMs in the round's commit message for the human to triage but do NOT block advance). If a MEDIUM ought to block, it should have been a HIGH — trust the advisor's severity.
+- **BLOCKS** = ≥1 BLOCKER or HIGH; parent runs another round.
+
+The advisor gets ONE part of this and no more: the COHERENCE rule — which verdict string goes with which findings array (`PASS` = empty; `PASS_WITH_FIXES` = no BLOCKER/HIGH; `BLOCKS` = ≥1 BLOCKER/HIGH). Never what a verdict costs, triggers, or buys. `PASS` with a non-empty findings array is unreachable and must never be emitted; LOW-only remainders are `PASS_WITH_FIXES`. `verdict-schema.json` is written to that boundary: its `verdict` description carries the coherence rule only, and its `severity` description defines each level by blast radius, reversibility, silence, and recoverability. Keep it that way — the schema text ships to the Phase 2 advisor verbatim via `--output-schema`.
 
 Codex enforces the schema via `codex exec --output-schema ~/.claude/skills/advice-refine-test-loop/verdict-schema.json …`. Opus advisor enforces via prompt instruction (advisor.md system prompt requires JSON output).
 
@@ -241,13 +299,13 @@ Codex enforces the schema via `codex exec --output-schema ~/.claude/skills/advic
 
 **advisor.md now includes `Skill` in its tool whitelist** — safe because Skill invocation is metadata-only (loads instructions into the subagent's context); any tool the loaded skill prescribes that is not in the whitelist still fails, preserving the read-only invariant. NEW SESSION REQUIRED after editing advisor.md; specialist dispatches in a stale session fall back to manual checklist application (still useful, marginally lower recall).
 
-Dispatch specialists in the SAME tool-use block as the primary Opus advisor (parallel — independent read-only reviews, no shared state). Merge findings by (file, line) dedupe; specialist findings inherit the primary's phase counter but are tagged in commit messages (`[specialist:insecure-defaults]`). If BOTH the primary and a specialist flag the same location, treat as higher-confidence — reproduce first.
+Dispatch specialists in the SAME tool-use block as the primary Opus advisor — parallel, independent, read-only, **NO shared state**. No specialist sees the primary's findings, another specialist's findings, or any hint of what the others are looking at, until all have reported. One shared cue before they report collapses them into one reviewer. Merge afterwards by semantic-equivalence dedupe (same rule as `new_r`), not by `(file, line)`; specialist findings inherit the primary's phase counter but are tagged in commit messages (`[specialist:insecure-defaults]`). If BOTH the primary and a specialist independently flag the same location, that convergence is the confidence signal: skip step 4.5's validator for it and reproduce it first.
 
 Skip specialists when the diff is clearly out-of-scope (pure prose docs, VM test fixture changes, cosmetic renames). Rule of thumb: if you'd forward the diff to a security reviewer at your org, dispatch the specialist.
 
 **Usage-limit fallback (primary + specialists):** if any dispatch returns with "usage limit" in the result (Fable/default org-monthly quota exhausted), re-dispatch ONCE with `model="claude-opus-5"` — Opus is a separate quota bucket and typically completes. Do this only on limit-hit; other failures (crash, timeout, refusal) get diagnosed, not fallback-masked. Never re-dispatch a third time — if Opus also 429s, the round exits with a note in the round's commit message.
 
-Loop rounds until primary AND all dispatched specialists return `PASS` (or `PASS_WITH_FIXES`; consolidator handles), **subject to the "Loop bounds" gate** — keep going while each round yields at least one NEW blocker that REPRODUCES; stop when a round finds nothing new and real. Then move to Phase 2. For the merged primary+specialist round, `new_r` is counted over the DEDUPED union (a defect both reviewers flag is one finding, not two — and a defect two reviewers converge on is higher-confidence, so reproduce it first).
+Loop rounds until primary AND all dispatched specialists return `PASS` (or `PASS_WITH_FIXES`; consolidator handles), **subject to the "Loop bounds" gate** — keep going while each round reproduces more NEW blockers than its fixes break. Then move to Phase 2. For the merged primary+specialist round, `new_r` is counted over the semantically DEDUPED union (a defect both reviewers flag is one finding, not two), and `regressed_r` is counted once for the round, not per reviewer.
 
 ## Phase 2: Codex (GPT-5.5) advisor
 
@@ -276,15 +334,27 @@ Parse: `verdict=$(codex exec … | jq -r '.verdict')`. Values: `PASS`, `PASS_WIT
 
 **Verdict-missing:** if `jq -r '.verdict'` prints `null` or errors, treat the round as failed and re-run once with an explicit "your last output was not valid JSON — emit exactly the verdict-schema.json shape" reminder. On second verdict-missing, PAUSE per above (do NOT silently advance — a Codex round that can't emit a parseable verdict has produced zero coverage).
 
-**Budget expectation:** Phase 2 should usually complete in 1-2 rounds because Opus already caught the bulk. If Codex demands ≥3 rounds, that IS the signal — Codex saw something Opus missed, and the extra rounds are the reason Phase 2 exists. Do not read a flat blocker COUNT as churn: two new reproducible defects in round 4 is the loop working, and on a large diff the count can sit flat for rounds while every round finds something real. The distinction that matters is novelty and reproducibility, which is what the "Loop bounds" gate measures. Codex re-flagging findings that no longer reproduce is the actual churn signal, and the gate stops on that.
+**Budget expectation:** Phase 2 should usually complete in 1-2 rounds because Opus already caught the bulk. If Codex demands ≥3 rounds, that IS the signal — Codex saw something Opus missed, and the extra rounds are the reason Phase 2 exists. Do not read a flat blocker COUNT as churn: two new reproducible defects in round 4 is the loop working, and on a large diff the count can sit flat for rounds while every round finds something real. The distinction that matters is novelty, reproducibility, and marginal gain, which is what the "Loop bounds" gate measures. Codex re-flagging findings that no longer reproduce is the actual churn signal, and the gate stops on that.
 
-Loop rounds until Codex emits `PASS` (or `PASS_WITH_FIXES`; consolidator handles), **subject to the "Loop bounds" gate**. A `converged` or `unreproducible` stop advances to Phase 3 without asking; only a `ceiling` or `budget` stop routes to the PAUSE handler alongside the four failure modes above.
+### Why Codex still runs last, and what that costs
+
+**The ordering is a QUOTA decision. Do not defend it as a quality one.** Second-vendor review of another vendor's output can net-regress the work rather than improve it, and the damage travels through one channel: APPLYING the second vendor's feedback. Close that channel, and keep the order.
+
+Required, non-negotiable:
+
+- Every Codex finding clears parent-side reproduction (step 5) before ANY edit. Confidence is not evidence; a Codex BLOCKER that will not reproduce is discarded, not downgraded into a smaller fix.
+- Codex never edits. `codex exec`, read-only sandbox, no `--dangerously-*` flags. The parent writes every fix.
+- Do not soften a Codex finding into a "safe tidy-up" when repro fails. That is the regression path.
+
+**Still run it.** Codex rounds after clean Opus rounds reliably surface defect classes Opus rounds miss whole — in particular **inference-by-absence**, where a reviewer treats a coverage gap (no test, no branch, no error path) as evidence that the case is handled. Hunt that class explicitly in Phase 2.
+
+Loop rounds until Codex emits `PASS` (or `PASS_WITH_FIXES`; consolidator handles), **subject to the "Loop bounds" gate**. A `converged`, `no-marginal-gain`, `unreproducible`, or `oscillation` stop advances to Phase 3 without asking; only a `ceiling` or `budget` stop routes to the PAUSE handler alongside the four failure modes above.
 
 ## Phase 3: Adversarial round (single Opus dispatch)
 
 After Phase 2 PASS. One shot; the verdict determines advance:
 
-- `PASS` or `PASS_WITH_FIXES` (findings ≤ MEDIUM) → advance to Phase 4. MEDIUMs and LOWs surface in the exit commit message; consolidator handles LOWs; MEDIUMs are surfaced for the human but do NOT trigger a Phase 1 reset (the whole point of "PASS_WITH_FIXES advances" from earlier phases applies here too — a MEDIUM adversarial finding that would have been BLOCKER-worthy should have been emitted as HIGH by the adversarial prompt).
+- `PASS` or `PASS_WITH_FIXES` (findings ≤ MEDIUM) → advance to Phase 4. MEDIUMs and LOWs surface in the exit commit message; consolidator handles LOWs; MEDIUMs are surfaced for the human but do NOT trigger a Phase 1 reset (the whole point of "PASS_WITH_FIXES advances" from earlier phases applies here too — a MEDIUM adversarial finding that would have been BLOCKER-worthy should have been rated HIGH on its own risk).
 - `BLOCKS` (any BLOCKER or HIGH) → loop resets to Phase 1 with the new findings pre-seeded so both vendors re-review the fix. **At most ONE such reset per run** (`phase3_resets` in the run state). On a second Phase 3 `BLOCKS`, do not reset again — PAUSE per the Phase 2 handler with reason `phase3-reset-cap`, because a diff that keeps producing fresh BLOCKER/HIGH findings after a full Phase 1→2→3 pass is the "split the diff" case, not a case for another full lap.
 
 Dispatch: same `Agent(subagent_type="advisor", …)` as Phase 1, but the prompt is framed adversarially:
@@ -314,7 +384,7 @@ Order the prompt for maximum implicit prefix caching (both Anthropic + OpenAI ca
 - **Project goal** (1–2 sentences)
 - **Re-read fresh:** absolute file paths (don't trust advisor memory)
 - **Output shape:** emit JSON matching `~/.claude/skills/advice-refine-test-loop/verdict-schema.json`. No prose outside JSON. (Codex enforces via `--output-schema`; Opus advisor.md system prompt enforces.)
-- For each finding, emit both `severity` (urgency) and `autofix_class` (apply-authority — `safe_auto` / `gated_auto` / `manual` / `advisory`). These are orthogonal; do not conflate. Tag findings whose confirmation requires human judgment (taste, style, "could be simpler") as `unverifiable: true` — Stage 4.5 keeps them but marks them.
+- For each finding, emit both `severity` (intrinsic risk) and `autofix_class` (apply-authority — `safe_auto` / `gated_auto` / `manual` / `advisory`). These are orthogonal; do not conflate. Tag findings whose confirmation requires human judgment (taste, style, "could be simpler") as `unverifiable: true`.
 
 **Variable delta (grows each round):**
 - **Prior rounds fixed:** bulleted list — prevents re-flagging resolved issues. Include EVERY prior round in the current phase, plus every prior phase's PASS-time state summary.
@@ -322,6 +392,33 @@ Order the prompt for maximum implicit prefix caching (both Anthropic + OpenAI ca
 - **Seeded hypotheses:** your own doubts, phrased as "verify X". Advisors follow leads; give them the ones you have.
 
 **Length cap:** ≤500 words total. Rationale strings ≤200 chars each. Advisor's job is triage, not exposition.
+
+### Elicit risk, not policy
+
+**The advisor-facing prompt states what a severity MEANS. It never states what a severity TRIGGERS.** Severity is a property of the defect — blast radius, reversibility, whether the failure is silent, whether the data is unrecoverable. It is not a property of the loop's response to it. Naming the response moves the label the advisor picks, in a direction that differs per advisor, so it cannot be corrected for downstream. Every consequence — next round, consolidator, auto-fix, ship gate, PAUSE — lives in parent-side code and in the parent-side sections of this file. None of it goes in a prompt.
+
+Strip from every advisor prompt (primary, specialist, adversarial, 4a critics, 4b vision): what happens on BLOCKS, what the consolidator does, what auto-fixes, what blocks the ship, how much a round costs, what quota is left, whether the user is asleep, and any rule of the form "a violation of X is HIGH".
+
+**DON'T** — consequence stated, severity contaminated:
+```
+Rate each finding. BLOCKER or HIGH forces another full round and burns
+Codex quota; LOW gets auto-fixed by the consolidator without review.
+Violations of the radio-dot rule are HIGH.
+```
+
+**DO** — intrinsic risk only:
+```
+Rate each finding by the risk of the defect itself:
+BLOCKER = wide blast radius, irreversible or silent, data unrecoverable.
+HIGH    = real failure in normal operation, recoverable, not silent.
+MEDIUM  = latent trap or narrow-condition failure, loud when it fires.
+LOW     = contained, obvious, trivially reversible.
+Rate on those properties alone. Do not consider what happens next.
+```
+
+Where the loop needs a severity FLOOR for a known rule class (Phase 4b's fixed visual rules and drift-backs), the parent applies the floor in code after parsing. Give the advisor the rule to check, not the grade to assign.
+
+One lever is deliberately kept and is NOT severity policy: telling a reviewer to bias toward REPORTING when a downstream arbiter suppresses false positives (Phase 4b). That moves the reporting threshold, not the severity label. Do not extend it into "and mark them HIGH".
 
 ## Reproduce Before Fixing
 
@@ -336,18 +433,30 @@ IF claim is a race / state issue:
 
 Discard unreproducible claims. Note them so next round's "prior rounds fixed" can include "verified non-issue: <claim>".
 
+**A weak repro is worse than no repro** — it manufactures a false approval that the rest of the loop then trusts. Before a repro counts toward `repro_r`: confirm it FAILS against the unfixed code, PASSES after the fix, and exercises the exact path the finding claims. A repro that passes for an unrelated reason is discarded, and the finding goes back to unreproduced.
+
 ## Consolidator sub-loop (PASS_WITH_FIXES remainder)
 
 When a phase's final round emits `PASS_WITH_FIXES` (MEDIUM and/or LOW findings remain, no BLOCKER/HIGH), run the consolidator BEFORE advancing to the next phase. **Consolidator auto-fixes `severity=LOW AND autofix_class=safe_auto` only.** LOWs with `autofix_class` in `{gated_auto, manual, advisory}` surface in the phase's exit commit message for the human — auto-fixing a rippling rename or a design call is exactly the class of thing that turns a nit into a merge conflict. MEDIUMs (any autofix_class) also surface for human triage; auto-fixing them without reproduction is risky (they're "latent bug or future trap", not nits).
 
 Parent MUST filter the JSON findings to `severity=LOW AND autofix_class=safe_auto` before dispatching (`jq '[.findings[] | select(.severity=="LOW" and .autofix_class=="safe_auto")]'`). If nothing passes the AND filter, skip the consolidator entirely and go straight to the exit-commit-message surface step — the remaining LOWs go to the human alongside the MEDIUMs.
 
+**Confirm before fixing — every finding, no exceptions.** The consolidator does NOT get a weaker gate than step 5 just because its findings are smaller. Unverified edits break working code. The gate is lighter in FORM, not in force: read the file at the stated location and confirm the described condition is actually there. No repro script needed — these are nits. Anything that cannot be confirmed against the real file is SKIPPED with a reason, never fixed on the advisor's word.
+
 Dispatch: `Agent(subagent_type="general-purpose", prompt=...)` with the following prompt shape (does NOT use the `advisor` type — consolidator needs Edit access):
 
 ```
-Fix these LOW findings in the listed files. One commit per finding, per-file
-granularity. After ALL fixes: re-verify (run the same test/lint/smoke the
-main loop uses). Report per-finding: [fixed | skipped: <reason>].
+For EACH finding below, in order:
+1. CONFIRM: read the file at the given line. Does the described condition
+   actually exist there? If NO, or if the file/line does not exist, or if
+   the code has already changed — SKIP it and report
+   [skipped: unconfirmed — <what you actually found>]. Do NOT fix it.
+   Do NOT go hunting for a nearby thing it might have meant.
+2. FIX only what you confirmed. One commit per finding, per-file granularity.
+
+After ALL fixes: re-verify (run the same test/lint/smoke the main loop uses).
+Report per-finding: [fixed | skipped: <reason>]. A confirm miss is a normal
+outcome, not a failure — report it plainly.
 
 Findings:
 <JSON array containing ONLY findings where severity=LOW AND autofix_class=safe_auto
@@ -357,7 +466,7 @@ Findings:
 
 **Bounded to 3 rounds** — if 3 consolidator rounds don't clear the LOW list, exit with what's left in a commit message. Don't infinite-loop trivial fixes; the point of PASS_WITH_FIXES is fast handling, not exhaustive polish.
 
-**Consolidator per-finding skip is a first-class outcome** — a nit that turns out to require a design call ("rename this variable" that would ripple through 40 files) gets skipped with a reason, not force-fixed.
+**Consolidator per-finding skip is a first-class outcome** — a nit that turns out to require a design call ("rename this variable" that would ripple through 40 files) gets skipped with a reason, not force-fixed. Same for a confirm miss: `skipped: unconfirmed` is a correct result, and a run where several LOWs come back unconfirmed is information about the advisor, not a consolidator failure.
 
 **Error handling** — if the consolidator subagent crashes, exceeds quota, or produces partial commits mid-batch:
 - Parent inspects `git status` on return. Uncommitted mutations from a crashed consolidator are `git stash push -u -m "consolidator-crash-<phase>-<round>"`ed (never `git reset --hard` — preserve evidence).
@@ -376,14 +485,17 @@ After consolidator exits (clean or bounded), advance to the next phase using the
 | Batch all rounds into one commit | Loses bisectable history |
 | Skip re-verification after each fix | Regressions hide in the batch |
 | Stop after round 1 because it "felt thorough" | Most valuable finding often lands in round 3. Stop on the "Loop bounds" gate, not on a feeling — the gate is what makes "keep going" safe to say. |
-| Keep looping a phase because the advisor "still has notes" | The bound is new-and-reproducible, not exhaustion. Notes that don't reproduce aren't work. Stop when a round finds nothing NEW that SURVIVES REPRO — not when the count stops shrinking. |
-| Stop a phase because the blocker COUNT went flat | Count is a bad proxy. A round that finds two new reproducible defects on a large diff is the loop working, and stopping to ask about it spends the user's attention on a question with an obvious answer. Judge novelty and reproducibility. |
-| PAUSE and ask the human on a quality judgement the loop can make itself | Only resource limits (hard round ceiling, token budget) are the human's call. `converged` advances silently; `unreproducible` advances with findings surfaced. Asking a human to adjudicate unreproducible claims is the wrong use of their attention. |
+| Keep looping a phase because the advisor "still has notes" | The bound is marginal gain, not exhaustion. Notes that don't reproduce aren't work. Stop when a round stops reproducing more NEW defects than its fixes break — not when the count stops shrinking. |
+| Stop a phase because the blocker COUNT went flat | Count is a bad proxy. A round that finds two new reproducible defects on a large diff is the loop working, and stopping to ask about it spends the user's attention on a question with an obvious answer. Judge novelty, reproducibility, and regressions caused. |
+| Count only what a round FOUND, ignoring what its fixes BROKE | Benefit alone is not progress. Fixes regress previously-passing tests, and a loop that never counts `regressed_r` keeps iterating while it destroys working code — reported acceptance rises the whole time. Continue only while `repro_r > regressed_r`. |
+| Treat the `n >= 8` ceiling as "the phase converged" | It is a COST backstop. A fixed round ceiling carries no information about whether the last round was worth running. `ceiling` routes to the PAUSE handler; `converged` is a different stop with a different meaning. |
+| Dedupe `new_r` by `(file, line, claim)` | A reworded repeat at a shifted line then counts as NEW and inflates the continue signal the gate depends on. Dedupe by MEANING — equivalence-judge subagent, or trigram Jaccard ≥0.8 as fallback. |
+| PAUSE and ask the human on a quality judgement the loop can make itself | Only resource limits (hard round ceiling, token budget) are the human's call. `converged`, `no-marginal-gain`, `unreproducible`, and `oscillation` all advance without asking, with the reason surfaced in the exit commit message. Asking a human to adjudicate unreproducible claims is the wrong use of their attention. |
 | Reset to Phase 1 a second time from Phase 3 | Capped at one reset. A diff still producing fresh BLOCKER/HIGH after a full 1→2→3 pass wants splitting, not another lap through both vendors. |
 | Skip writing `tasks/arftl-run.json` because "the loop is nearly done" | Nearly-done is when a compact is most likely and the fix history is most expensive to lose. Write it at every round commit, same step. |
 | Restart at Phase 1 after a compact or crash | Check `tasks/arftl-run.json` first. Re-running phases that already PASSed re-burns both quotas to reproduce a result you already have on disk. |
 | Skip Phase 2 (Codex) because "Opus already said PASS" | Single-vendor blindness is the whole reason Phase 2 exists. If Codex is out of quota, PAUSE and tell the user — don't ship as PASS on a half-run loop. |
-| Run Phase 2 in parallel with Phase 1 to "save time" | Wastes Codex quota on drafts Opus will reject. Sequential ordering is deliberate: Codex only sees Opus-clean state so its rounds are cheap. |
+| Run Phase 2 in parallel with Phase 1 to "save time" | Wastes Codex quota on drafts Opus will reject. The ordering is a QUOTA argument and only a quota argument — do not claim second-vendor-last reviews better; running a second vendor over another vendor's output can net-regress it. Keep the order, and keep the reproduce gate that makes it safe (see "Why Codex still runs last"). |
 | Interleave phases (Opus round, Codex round, Opus round, …) | Same failure mode — Codex burns quota reviewing states you're about to change. Complete Phase 1 first, THEN start Phase 2. |
 | Drop Phase 1's "prior rounds fixed" list when starting Phase 2 | Codex will re-flag everything Opus already caught, wasting its budget. Carry the full fix history forward into Phase 2's first prompt. |
 | Skip narrow specialists because "general advisor will catch it" | Empirically wrong (per Gooen RoastMyPost). Narrow specialists surface a distinct class of issues (secure defaults, footgun APIs) at higher precision than broad review. Cost is 1-2 extra parallel subagent calls per Phase 1 round. |
@@ -396,8 +508,12 @@ After consolidator exits (clean or bounded), advance to the next phase using the
 | Auto-block on a singleton VLM finding | Session-constraint violation. `Never singleton-VLM = auto-block.` Bug the ledger, not the ship gate. Only geometry-oracle findings or 2+ reviewer convergence gate the ship. |
 | Sigil on a partial Phase 4b | Session-constraint violation. `Sigil requires reviewer confirmation.` The sigil-ready state needs: oracle green + 4b run to completion + all HIGH resolved. A skipped or half-run 4b is not sigil-ready. |
 | Add Gemini vision without an API key wired | Would silently degrade to skipping phase 4c and calling the pipeline complete. Note as future upgrade in the skill; do not add as a dispatch step until the API dependency is real. |
-| Auto-fix based on severity alone | Severity is urgency, not apply-authority. A LOW rename that ripples 40 files is not `safe_auto` — it's `gated_auto` or `manual`. Consolidator MUST AND `severity=LOW` with `autofix_class=safe_auto`; anything else surfaces for the human. |
+| Auto-fix based on severity alone | Severity is intrinsic risk, not apply-authority. A LOW rename that ripples 40 files is not `safe_auto` — it's `gated_auto` or `manual`. Consolidator MUST AND `severity=LOW` with `autofix_class=safe_auto`; anything else surfaces for the human. |
 | Skip step 4.5 (validate) because "advisor is trustworthy" | Advisors hallucinate file paths, line numbers, and stale-state claims (they read pre-fix state). Validator is cheap (small prompt, file re-read) and catches the class before it becomes a wasted repro round in step 5. |
+| Tell the advisor what a severity TRIGGERS ("HIGH forces another round", "LOW gets auto-fixed", "a violation of this rule is HIGH") | Consequence text moves the severity the advisor picks, by a different amount and a different direction per advisor, so it cannot be corrected downstream. Describe severity by blast radius / reversibility / silence / recoverability. Consequences live in parent-side code. |
+| Let the consolidator fix a LOW without confirming it against the file | The weakest findings would then get the weakest gate, and unverified edits break working code. Read the stated location, confirm the condition is there, `skipped: unconfirmed` otherwise. |
+| Give the specialists a peek at the primary's findings before they report | One shared cue collapses independent reviewers into one. Same block, no shared state, merge only after all have returned. |
+| Treat Phase 4a's A+B agreement as independent confirmation | Same model with two role labels shares its blind spots. A+B agreement is "look here first". Independence comes from Phase 4b's second vendor and the geometry oracle. |
 
 ## Phase 4a: Taste round (UI-work only; run ONCE after Phases 1-3 all PASS)
 
@@ -421,6 +537,8 @@ Two INDEPENDENT critic passes on the same regenerated shots. Sources kept distin
 - **Assessment B — taste critic**: fresh Opus dispatch with a house-style rubric — pulls from the project's design spec + brand workbook + prior founder taste decisions (e.g. `docs/brand/klaffat-design-spec.md` §Locked variants + `docs/reviews/*` picks). Explicit anti-generic-AI list (see below).
 
 Both use the SAME model + fixed prompt so scores are internally comparable (per SOTA research: cross-model taste-scoring agreement is ~zero; fix the model to compare).
+
+**Comparability is bought with correlated blind spots.** Different role labels on the same model do NOT make two independent reviewers — persona-differentiated same-model agents share the most errors. A+B agreement here means "worth looking at first", never "independently confirmed". Phase 4b's second vendor and the geometry oracle are what actually decorrelate; do not let a strong A+B agreement talk you into skipping either.
 
 ### Synthesis
 
@@ -489,7 +607,7 @@ taste pipeline — the primary Claude review already ran; your job is to catch
 what it missed. Bias toward reporting; a downstream arbiter suppresses false
 positives.
 
-FIXED visual rules (session constraints — a violation is a HIGH or BLOCKER):
+FIXED visual rules — check every one on every image:
 - Radio dot renders LEFT of text, ALWAYS (never dot-above, never dot-right).
 - Radio dot Y-center aligns with the option box's Y-center (or first-line
   center on wrapped labels — never middle of the wrapped block).
@@ -534,6 +652,11 @@ Repeat per surface. Store outputs under a run-scoped dir (e.g.
 `/tmp/design-review-YYYY-MM-DD/vision-taste/`). Do not batch every surface
 into one invocation — Codex vision recall drops sharply past ~4 images per
 turn, per DiffSpot Hard-tier data.
+
+**Severity floor, applied by the parent AFTER parsing — never in the prompt.**
+Any returned finding whose `rationale` prefix names a fixed rule or a known
+drift-back is raised to HIGH if the advisor rated it lower. The advisor is told
+which rules to check; the parent decides what a violation is worth.
 
 **Failure modes** follow the same PAUSE rules as Phase 2:
 
@@ -598,7 +721,7 @@ DiffSpot ranks Gemini (2.5 Pro / 3.x Pro) as the strongest visual perceiver (47.
 | Phase | Vendor | Reviewer role | Combines with | Skip when |
 |---|---|---|---|---|
 | 1 | Anthropic (Opus + specialists) | Broad correctness + narrow security/API passes | Own phase output only | Never; foundation phase |
-| 4.5 (in-round) | Anthropic (Opus, validator) | Re-verify findings against actual file state; array-index correlation `[{index, verified, unverifiable_confirmed, note}]`; parent drops `findings[i]` on `verified=false`; `unverifiable_confirmed` informational | Feeds into step 5 (reproduce) | On any validator failure (timeout/quota/malformed JSON) skip this round and degrade to pre-4.5 behavior — never retry, never PAUSE |
+| 4.5 (in-round) | Anthropic (Opus, validator) | Re-verify PIVOTAL (singleton) findings against actual file state; findings + paths only, no advisor context; array-index correlation `[{index, verified, unverifiable_confirmed, note}]`; parent drops `findings[i]` on `verified=false`; `unverifiable_confirmed` informational | Feeds into step 5 (reproduce) | Per-finding when two reviewers independently converged on the location (go straight to step 5). Wholesale on any validator failure (timeout/quota/malformed JSON) — degrade to pre-4.5 behavior, never retry, never PAUSE |
 | 2 | OpenAI (Codex / GPT-5.5) | Cross-vendor correctness on Opus-clean state | Phase 1 fix history carried in prompt | Never; PAUSE on quota, don't silently skip |
 | 3 | Anthropic (Opus, adversarial) | "Prior PASS was wrong — find why" | Findings loop back to Phase 1 | Never; one shot, cheap |
 | 4a | Anthropic (Opus x2 — defect + taste critics) | UI defect + house-style critique | Own phase output only | Non-UI diffs |
@@ -611,8 +734,13 @@ Final commit or chat message: round count + categories of bug caught (fail-open 
 
 Also state, so the run is greppable and a stopped run is never mistaken for a clean one:
 
-- per-phase round counts and `rounds` (the convergence trace: new vs reproduced
-  blockers per round — the shape that shows whether each round bought anything)
+- per-phase round counts and `rounds` — the convergence trace: new vs reproduced
+  vs regressed per round, which is what shows whether each round bought more
+  than it broke
+- the stop reason each phase exited on (`converged` / `no-marginal-gain` /
+  `unreproducible` / `oscillation` / `ceiling` / `budget` / verdict `PASS`),
+  plus what was left unfixed for `no-marginal-gain`, `unreproducible`, and
+  `oscillation` exits
 - accepted commit SHA + whether the worktree is clean
 - how the run ended: `PASS` / `PASS_WITH_FIXES` / `pending-human` **plus the `pause_reason`** if it stopped on a bound rather than a verdict
 - anything left in `pending_for_human.md`
