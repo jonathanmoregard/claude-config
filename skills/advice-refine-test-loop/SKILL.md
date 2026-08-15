@@ -61,7 +61,9 @@ Each Phase 1/2 round follows the same shape:
    Any of: unparseable JSON, missing `.verdict`, or verdict/findings mismatch → the round FAILED. Re-dispatch once with an explicit "output valid JSON matching verdict-schema.json AND ensure verdict matches findings (PASS = empty findings; PASS_WITH_FIXES = no BLOCKER/HIGH; BLOCKS = ≥1 BLOCKER/HIGH)" reminder.
 
    Second failure PAUSEs the loop (interactive: prompt user; unattended: append to `pending_for_human.md` and exit `pending-human`). NEVER treat unparseable output or a mismatched verdict as advance-worthy — an incoherent advisor response has produced zero trustworthy coverage.
-4.5. VALIDATE: dispatch a fresh Opus subagent (`Agent(subagent_type="advisor", ...)`) with ONLY the PIVOTAL findings JSON (see "Validate only PIVOTAL findings" below) + absolute paths of files referenced by those findings. `index` is positional within the array you SEND; the parent maps indices back to the full findings list itself. Prompt: "For each finding in the input array, read the file at the given line. Emit a JSON array `[{index, verified, unverifiable_confirmed, note}]` where `index` is the 0-based position of the finding in the input array. `verified=true` iff the described condition is empirically present at that location. `unverifiable_confirmed=true` when the finding was tagged `unverifiable: true` by the parent advisor AND you agree no empirical check applies (subjective — taste, 'could be simpler', style preferences). `verified=false` = parent drops `findings[index]` from the report; `unverifiable_confirmed=true` is informational (parent already knows the tag; you're confirming it can't be checked) and the finding is kept as-is." Parent drops `findings[i]` where the validator returned `verified: false` for that index before proceeding to step 5. Unverifiable findings (whether or not the validator confirmed) continue to step 5 as-is — repro is still attempted; often it will confirm nothing, which is fine.
+4.5. VALIDATE: dispatch a fresh Opus subagent (`Agent(subagent_type="advisor", ...)`) with ONLY the PIVOTAL findings JSON (see "Validate only PIVOTAL findings" below) + absolute paths of files referenced by those findings. `index` is positional within the array you SEND; the parent maps indices back to the full findings list itself. Prompt: "For each finding in the input array, read the file at the given line. Emit a JSON array `[{index, verified, unverifiable_confirmed, note}]` where `index` is the 0-based position of the finding in the input array. `verified=true` iff the described condition is empirically present at that location. `unverifiable_confirmed=true` when the finding was tagged `unverifiable: true` by the parent advisor AND you agree no empirical check applies (subjective — taste, 'could be simpler', style preferences). `verified=false` = parent drops `findings[index]` from the report; `unverifiable_confirmed=true` is informational (parent already knows the tag; you're confirming it can't be checked) and the finding is kept as-is."
+
+   **Drop rule, with the `unverifiable` exemption stated so it cannot be read as a collision.** Parent drops `findings[i]` iff `verified == false` AND `findings[i].unverifiable != true`. A finding tagged `unverifiable: true` is NEVER dropped on `verified == false`: no empirical check applies to it, so `verified == false` carries no information about it — it is the expected answer, not a refutation. Unverifiable findings continue to step 5 as-is (whether or not the validator confirmed the tag); repro is still attempted and often confirms nothing, which is fine.
 
    **Failure-mode handling (degrade-to-pre-4.5 on any failure).** Step 4.5 is an optimization, not a correctness gate — do NOT retry, do NOT PAUSE the loop:
    - Wrap the validator dispatch with `timeout 180s` (bounded — validator is a cheap read-only pass).
@@ -127,15 +129,50 @@ insufficient: a reworded repeat at a shifted line passes it and counts as NEW,
 which inflates the continue signal that the gate below depends on. Two methods,
 in preference order:
 
-1. **Equivalence-judge subagent (preferred).** Dispatch a fresh read-only
-   subagent with the candidate finding and the prior-round finding. Ask ONE
-   yes/no question: "do these describe the same underlying defect?" No
-   similarity scores, no numeric thresholds. **Default to "not equivalent"
-   when ambiguous** — the failure direction is then one extra round, never a
-   missed defect.
-2. **Trigram Jaccard ≥ 0.8 within the same category (fallback).** Cheap, no
-   dispatch. Apply only once the run has ≥ 5 findings to compare against;
-   below that floor treat every finding as new.
+1. **Equivalence-judge subagent (preferred). ONE dispatch per round, not one
+   per pair.** Pairwise dispatch is O(candidates × priors) — 6 new against 30
+   priors is 180 subagent calls, which costs more than the round it is
+   bounding. Instead dispatch a single fresh read-only subagent per round with
+   both lists numbered:
+
+   ```
+   PRIOR (this run, already reported):
+     [0] <file> :: <rationale>
+     [1] ...
+   CANDIDATES (this round):
+     [0] <file> :: <rationale>
+     [1] ...
+
+   For each CANDIDATE, answer ONE yes/no question against each PRIOR: "do
+   these describe the same underlying defect?" No similarity scores, no
+   numeric thresholds. Emit ONLY a JSON array
+   [{"candidate": <int>, "match": <prior index or null>}], one row per
+   candidate, in candidate order. If a candidate matches more than one prior,
+   return the lowest matching prior index. If unsure, return null.
+   ```
+
+   **Default to "not equivalent" (`match: null`) when ambiguous** — the failure
+   direction is then one extra round, never a missed defect. If the prior list
+   exceeds 60 entries, split by CANDIDATE into batches of 10 candidates against
+   the full prior list; never split the prior list, or a candidate can miss its
+   own match.
+2. **Character-trigram Jaccard ≥ 0.8 within the same category (fallback).**
+   Cheap, no dispatch. Pinned exactly, so two runs over identical traces
+   compute identical `new_r`:
+   - **Category** = `basename(file)`. Two findings are compared only when their
+     `file` basenames are equal. Different basename ⇒ not equivalent, no
+     further test.
+   - **Text** = the `rationale` string ALONE. Not the file path, not the line,
+     not the severity. Normalise in this order: lowercase → replace every
+     character that is not `[a-z0-9]` with a single space → collapse runs of
+     spaces to one → trim.
+   - **Trigrams** = the SET of distinct 3-character substrings of the
+     normalised string (character trigrams, not word trigrams — rationales are
+     ≤240 chars and word trigrams are too sparse to be stable at that length).
+   - **Score** = `|A ∩ B| / |A ∪ B|`. Equivalent iff `≥ 0.8`.
+   - Applies from the FIRST prior finding onward. There is no minimum-corpus
+     floor: a verbatim repeat must never count as new, least of all in the
+     early rounds the gate is most sensitive to.
 
 **Oscillation is unstable EVIDENCE, not a repeated complaint.** Count a flip
 only when the SAME semantic finding changes REPRODUCTION OUTCOME across rounds
@@ -582,7 +619,7 @@ After consolidator exits (clean or bounded), advance to the next phase using the
 | Sigil on a partial Phase 4b | Session-constraint violation. `Sigil requires reviewer confirmation.` The sigil-ready state needs: oracle green + 4b run to completion + all HIGH resolved. A skipped or half-run 4b is not sigil-ready. |
 | Add Gemini vision without an API key wired | Would silently degrade to skipping phase 4c and calling the pipeline complete. Note as future upgrade in the skill; do not add as a dispatch step until the API dependency is real. |
 | Auto-fix based on severity alone | Severity is intrinsic risk, not apply-authority. A LOW rename that ripples 40 files is not `safe_auto` — it's `gated_auto` or `manual`. Consolidator MUST AND `severity=LOW` with `autofix_class=safe_auto`; anything else surfaces for the human. |
-| Skip step 4.5 (validate) because "advisor is trustworthy" | Advisors hallucinate file paths, line numbers, and stale-state claims (they read pre-fix state). Validator is cheap (small prompt, file re-read) and catches the class before it becomes a wasted repro round in step 5. |
+| Skip step 4.5 (validate) because "advisor is trustworthy" | Advisors hallucinate file paths, line numbers, and stale-state claims (they read pre-fix state). Validator is cheap (small prompt, file re-read) and catches the class before it becomes a wasted repro round in step 5. Exactly TWO skips are sanctioned and neither is this one: per-finding, when the primary and a specialist converged independently on the location; wholesale for the round, when the validator itself fails (timeout / quota / malformed JSON) and the round degrades to pre-4.5 behaviour. Any other skip is the anti-pattern. Neither sanctioned skip ever skips step 5. |
 | Tell the advisor what a severity TRIGGERS ("HIGH forces another round", "LOW gets auto-fixed", "a violation of this rule is HIGH") | Consequence text moves the severity the advisor picks, by a different amount and a different direction per advisor, so it cannot be corrected downstream. Describe severity by blast radius / reversibility / silence / recoverability. Consequences live in parent-side code. |
 | Let the consolidator fix a LOW without confirming it against the file | The weakest findings would then get the weakest gate, and unverified edits break working code. Read the stated location, confirm the condition is there, `skipped: unconfirmed` otherwise. |
 | Give the specialists a peek at the primary's findings before they report | One shared cue collapses independent reviewers into one. Same block, no shared state, merge only after all have returned. |
@@ -794,7 +831,7 @@ DiffSpot ranks Gemini (2.5 Pro / 3.x Pro) as the strongest visual perceiver (47.
 | Phase | Vendor | Reviewer role | Combines with | Skip when |
 |---|---|---|---|---|
 | 1 | Anthropic (Opus + specialists) | Broad correctness + narrow security/API passes | Own phase output only | Never; foundation phase |
-| 4.5 (in-round) | Anthropic (Opus, validator) | Re-verify PIVOTAL (singleton) findings against actual file state; findings + paths only, no advisor context; array-index correlation `[{index, verified, unverifiable_confirmed, note}]`; parent drops `findings[i]` on `verified=false`; `unverifiable_confirmed` informational | Feeds into step 5 (reproduce) | Per-finding when two reviewers independently converged on the location (go straight to step 5). Wholesale on any validator failure (timeout/quota/malformed JSON) — degrade to pre-4.5 behavior, never retry, never PAUSE |
+| 4.5 (in-round) | Anthropic (Opus, validator) | Re-verify PIVOTAL (singleton) findings against actual file state; findings + paths only, no advisor context; array-index correlation `[{index, verified, unverifiable_confirmed, note}]`; parent drops `findings[i]` iff `verified=false` AND the finding is not tagged `unverifiable: true`; `unverifiable_confirmed` informational | Feeds into step 5 (reproduce) | Per-finding when two reviewers independently converged on the location (go straight to step 5). Wholesale on any validator failure (timeout/quota/malformed JSON) — degrade to pre-4.5 behavior, never retry, never PAUSE |
 | 2 | OpenAI (Codex / GPT-5.5) | Cross-vendor correctness on Opus-clean state | Phase 1 fix history carried in prompt | Never; PAUSE on quota, don't silently skip |
 | 3 | Anthropic (Opus, adversarial) | "Prior PASS was wrong — find why" | Findings loop back to Phase 1 | Never; one shot, cheap |
 | 4a | Anthropic (Opus x2 — defect + taste critics) | UI defect + house-style critique | Own phase output only | Non-UI diffs |
