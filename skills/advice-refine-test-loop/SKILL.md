@@ -494,11 +494,24 @@ Order the prompt for maximum implicit prefix caching (both Anthropic + OpenAI ca
 - For each finding, emit both `severity` (intrinsic risk) and `autofix_class` (apply-authority — `safe_auto` / `gated_auto` / `manual` / `advisory`). These are orthogonal; do not conflate. Tag findings whose confirmation requires human judgment (taste, style, "could be simpler") as `unverifiable: true`.
 
 **Variable delta (grows each round):**
-- **Prior rounds fixed:** bulleted list — prevents re-flagging resolved issues. Include EVERY prior round in the current phase, plus every prior phase's PASS-time state summary.
+- **Prior rounds fixed:** bulleted list — prevents re-flagging resolved issues. Covers every prior round in the current phase plus every prior phase's exit-state summary, compressed per the cap below. Never DROP history; compress it.
 - **Verified since last round:** what you empirically confirmed (repros run, tests re-run, docs read).
 - **Seeded hypotheses:** your own doubts, phrased as "verify X". Advisors follow leads; give them the ones you have.
 
-**Length cap:** ≤500 words total. Rationale strings ≤200 chars each. Advisor's job is triage, not exposition.
+**Length caps — two separate budgets, so a long run can satisfy both.**
+
+- Everything EXCEPT the "Prior rounds fixed:" list: ≤500 words. Rationale
+  strings ≤200 chars each. Advisor's job is triage, not exposition.
+- "Prior rounds fixed:" list: ≤30 lines, budgeted on its own. Under 30 entries,
+  emit all of them verbatim. At 30 or more, keep the 20 most recent verbatim
+  and replace everything older with one summary line per prior round:
+  `round <r>: <k> fixed — <area>, <area>`. Every older entry must still be
+  accounted for in some summary line's `<k>`; the counts across all summary
+  lines plus the verbatim entries must equal the total fixed so far.
+
+Truncating the fixed-list instead of compressing it makes the advisor re-flag
+resolved issues, which the gate then has to disambiguate from real re-flags.
+Never silently drop an entry.
 
 ### Elicit risk, not policy
 
