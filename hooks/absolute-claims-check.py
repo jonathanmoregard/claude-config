@@ -6,6 +6,14 @@ Fires when the last assistant message asserts impossibility or certainty
 producing evidence. Blocks the stop and hands the model the reason, so the
 turn continues rather than shipping an unfalsifiable claim.
 
+The guidance gates on whether the claim is LOAD-BEARING — whether getting it
+right or wrong changes the design, the dispatch, or the decision. A
+non-load-bearing absolute gets a one-line acknowledgement and the turn
+continues; only a load-bearing one is worth a probe. This keeps the hook from
+taxing figures of speech, and keeps effort proportional to consequence. The
+pattern list stays deliberately broad because detection is cheap and the
+proportionality judgement now lives in the guidance, not the regex.
+
 Silent on: anything it cannot parse, and any turn where stop_hook_active is
 already set (Claude Code's own loop guard).
 """
@@ -32,20 +40,34 @@ PATTERNS = [
 ]
 
 GUIDANCE = (
-    "You asserted an absolute ({matched}). 0 is usually not on the doability "
-    "scale: if you say something is 0 and it then happens, you are infinitely "
-    "wrong, and there is no Bayesian updating possible from a prior of 0. The "
-    "same holds at 100%.\n\n"
-    "Revert to empirics, using the observability tools available. A deep "
-    "research call is usually a good one, and infinitely better than simply "
-    "claiming impossible.\n\n"
-    "Do one of these before you stop:\n"
+    "You asserted an absolute ({matched}).\n\n"
+    "FIRST, decide whether the claim is LOAD-BEARING: does getting it right or "
+    "wrong change what you or the user actually do — the design chosen, the "
+    "work dispatched, the thing shipped, the decision made? Spend effort in "
+    "proportion to that.\n\n"
+    "If it is NOT load-bearing — an aside, a figure of speech, colour "
+    "commentary, or a claim nothing downstream rests on — then say so to the "
+    "user and continue. Write more if there is more worth saying, but note "
+    "that \"yeah, but who cares, bro?\" is a complete and self-sufficient "
+    "answer to this hook. Do not burn a research call on it.\n\n"
+    "If it IS load-bearing, then it deserves empirics, because 0 is usually "
+    "not on the doability scale: if you say something is 0 and it then "
+    "happens, you are infinitely wrong, and there is no Bayesian updating "
+    "possible from a prior of 0. The same holds at 100%. A claim that is "
+    "load-bearing AND absolute AND unverified is the dangerous combination — "
+    "it propagates into designs, briefs and docs as settled fact.\n\n"
+    "For a load-bearing absolute, do one of these before you stop:\n"
     "1. Run the research or the experiment that would settle it, then report "
-    "what you found.\n"
+    "what you found. Prefer the cheapest sufficient probe — a local "
+    "observation or a `--help` beats a deep research call when it actually "
+    "settles the question.\n"
     "2. Restate the claim as a probability with the evidence behind it, and "
     "name what observation would change it.\n"
     "3. If the absolute is a quoted measurement rather than a prediction "
-    "(\"100% of tests passed\", \"0 errors\"), say so plainly and continue."
+    "(\"100% of tests passed\", \"0 errors\"), say so plainly and continue.\n\n"
+    "Also check provenance: if the absolute came from a source that hedged it "
+    "(a subagent marking something UNVERIFIED, a doc for a different version), "
+    "restore the hedge rather than inheriting a hardened version of it."
 )
 
 
