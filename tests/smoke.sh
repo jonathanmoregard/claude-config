@@ -9,6 +9,7 @@ set -u
 set -o pipefail
 
 WORKTREE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+export WORKTREE   # inline python helpers import the modules under test from here
 SKILL_DIR="$WORKTREE/skills/session-reflect"
 STUBS_DIR="$WORKTREE/tests/stubs"
 REFLECT_SH="$SKILL_DIR/reflect.sh"
@@ -1497,6 +1498,20 @@ mk_mission_payload() {
   mk_mission_payload_orphan "$dir" "$sid" "$body" "$when"
 }
 
+canonical_stub() {
+  # Restore the default reflection-JSON stub. Tests that ran a mission-shaped or
+  # argv-recording stub must call this before exercising a path that PARSES the
+  # reply as reflection JSON (precompact checkpoints, sessionend final.json).
+  cat >"$STUB_SCRATCH/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null || true
+cat <<'JSON'
+{"type":"result","result":"{\"patterns\":[\"stubbed pattern\"],\"discoveries\":[],\"turning_points\":[],\"digressions\":[],\"obstacles_to_autonomy\":[]}","usage":{"cache_read_input_tokens":100,"cache_creation_input_tokens":10,"input_tokens":5,"output_tokens":50}}
+JSON
+STUB
+  chmod +x "$STUB_SCRATCH/claude"
+}
+
 mission_stub() {
   # $1 = body the stub returns as the mission markdown
   cat >"$STUB_SCRATCH/claude" <<STUB
@@ -2691,6 +2706,415 @@ cat <<'JSON'
 JSON
 STUB
 chmod +x "$STUB_SCRATCH/claude"
+
+# ============================================================================
+# TEST 27: F2 — the window table covers this host, and an unknown window refuses
+# ============================================================================
+# `claude-fable-5` — the model the `advisor` agent runs on here — was missing
+# from ONE_M_MODEL_PREFIXES, so a 1M fable session with no `[1m]` transcript
+# marker was measured against 200k and read ~5x HIGH. That is the stale-table
+# failure this module was refactored to prevent, so the table now also names the
+# known-200k families: "known 200k" and "never heard of this model" must not be
+# the same answer.
+echo "TEST 27: F2 — 1M families incl. fable-5; unknown window refuses instead of assuming 200k"
+F2_DIR="$(mktemp -d -t reflect-f2-XXXXXX)"
+
+# Structural: the regression was a missing prefix, so pin the prefix itself.
+grep -q '"claude-fable-5"' "$SC_USAGE" \
+  || fail "27: claude-fable-5 missing from context_usage.py's 1M prefix table"
+
+mk_context_transcript "$F2_DIR/fable.jsonl" "claude-fable-5" 310000
+F2_J="$(python3 "$SC_USAGE" "$F2_DIR/fable.jsonl")" || fail "27: context_usage.py rc!=0"
+jq -e '.window == 1000000 and .window_known == true and .window_source == "prefix_1m"' <<<"$F2_J" >/dev/null \
+  || fail "27: fable-5 must detect a 1M window (got $F2_J)"
+jq -e '.fill_pct > 0.3099 and .fill_pct < 0.3101' <<<"$F2_J" >/dev/null \
+  || fail "27: fable-5 fill against 1M is wrong (got $(jq -c .fill_pct <<<"$F2_J")) — a 200k denominator reads ~5x high"
+
+# Known-200k branch stays known (so the unknown branch below is narrow).
+mk_context_transcript "$F2_DIR/haiku.jsonl" "claude-haiku-4-5" 100000
+jq -e '.window == 200000 and .window_known == true and .window_source == "prefix_base"' \
+  <<<"$(python3 "$SC_USAGE" "$F2_DIR/haiku.jsonl")" >/dev/null \
+  || fail "27: a known-200k family must report window_known=true"
+
+# Unknown branch: the denominator is a guess and says so.
+mk_context_transcript "$F2_DIR/unknown.jsonl" "claude-zeta-9-20991231" 61000
+F2_U="$(python3 "$SC_USAGE" "$F2_DIR/unknown.jsonl")" || fail "27: context_usage.py rc!=0 (unknown model)"
+jq -e '.window_known == false and .window_source == "assumed_base_unknown_model"' <<<"$F2_U" >/dev/null \
+  || fail "27: an unheard-of model must report window_known=false (got $F2_U)"
+# ...and the money-spending CLI refuses it, exactly as it refuses an estimate.
+if python3 "$SC_USAGE" --fill-pct "$F2_DIR/unknown.jsonl" >/dev/null 2>&1; then
+  fail "27: --fill-pct handed out a reading whose denominator is a guess"
+fi
+python3 "$SC_USAGE" --fill-pct "$F2_DIR/fable.jsonl" >/dev/null \
+  || fail "27: --fill-pct must still work for a known window"
+
+# End to end: the trigger fires on fable-5 and REFUSES on the unknown window,
+# even though 61000/200000 = 30.5% would clear a 30% threshold.
+F2_H="$(sc_home)"
+sc_write_config "$F2_H" on 0.30
+F2_CWD="$(mktemp -d -t reflect-f2cwd-XXXXXX)"
+assert_isolated_cwd "$F2_CWD"
+counting_stub "$F2_H/calls" "$SC_MISSION_FILE"
+mk_context_transcript "$F2_H/fable.jsonl" "claude-fable-5" 310000 "$F2_CWD"
+sc_fire "$F2_H" "test-sid-f2-fable" "$F2_CWD" "$F2_H/fable.jsonl" >/dev/null \
+  || fail "27: fable-5 fire rc!=0"
+sc_wait_mission "$F2_CWD" "test-sid-f2-fable" || fail "27: a 1M fable session at 31% did not fire"
+
+mk_context_transcript "$F2_H/unknown.jsonl" "claude-zeta-9-20991231" 61000 "$F2_CWD"
+sc_fire "$F2_H" "test-sid-f2-unknown" "$F2_CWD" "$F2_H/unknown.jsonl" >/dev/null \
+  || fail "27: unknown-model fire rc!=0"
+sleep 0.5
+[[ ! -e "$SC_STATE_DIR/test-sid-f2-unknown.request.json" ]] \
+  || fail "27: fired against an assumed denominator — a 1M model would read 5x high here"
+grep -q 'REFUSING to fire: context window is UNKNOWN' "$SC_STATE_DIR/trigger.log" \
+  || fail "27: the refusal was silent; the table can go stale unnoticed"
+info "fable-5 detected as 1M; known-200k stays known; unknown window refuses loudly at both the CLI and the trigger"
+
+# ============================================================================
+# TEST 28: F3 — the worker lock must fail CLOSED
+# ============================================================================
+# `if exec 9>"$REFLECT_LOCKFILE"; then … fi` with no else: bash does NOT abort on
+# a failed exec redirection (it only exits on one in POSIX mode), so an
+# unopenable lockfile fell straight through and the worker ran with NO per-mode
+# lock — re-enabling the last-write-wins `mv` race on final.json that the lock
+# exists to prevent. Running unlocked is worse than not running.
+echo "TEST 28: F3 — an unopenable lockfile refuses to run rather than running unlocked"
+canonical_stub   # this path parses the reply as reflection JSON
+f3_worker() {
+  # $1=sid $2=lockfile ; runs the worker re-entry path directly
+  local sid="$1" lf="$2" sdir="$REFLECT_ROOT/sessions/$1"
+  mkdir -p "$sdir/checkpoints"
+  _REFLECT_INTERNAL=1 \
+  SESSION_ID="$sid" TRANSCRIPT_PATH="$TRANSCRIPT" HOOK_EVENT="SessionEnd" \
+  CWD="$TEST_CWD" MODE=sessionend REFLECT_LOCKFILE="$lf" \
+  session_dir="$sdir" final_path="$sdir/final.json" \
+  manifest_path="$sdir/manifest.json" checkpoint_dir="$sdir/checkpoints" \
+    bash "$REFLECT_SH" --worker sessionend
+}
+
+# Control first: with a writable lockfile the worker completes, so a missing
+# final.json below can only be the refusal.
+F3_OK_SID="test-sid-f3-lock-ok"
+f3_worker "$F3_OK_SID" "$REFLECT_ROOT/sessions/$F3_OK_SID/manifest.json.lock.sessionend" \
+  >"$STUB_SCRATCH/f3-ok.log" 2>&1 && rc=0 || rc=$?
+(( rc == 0 )) || fail "28: control worker exit=$rc ($(cat "$STUB_SCRATCH/f3-ok.log"))"
+[[ -f "$REFLECT_ROOT/sessions/$F3_OK_SID/final.json" ]] \
+  || fail "28: control worker wrote no final.json, so the negative case proves nothing"
+
+# Lockfile under a read-only directory: open fails with EACCES.
+F3_RO_DIR="$(mktemp -d -t reflect-f3ro-XXXXXX)"
+chmod 500 "$F3_RO_DIR"
+F3_SID="test-sid-f3-lock-unopenable"
+f3_worker "$F3_SID" "$F3_RO_DIR/nope.lock" >"$STUB_SCRATCH/f3-ro.log" 2>&1 && rc=0 || rc=$?
+chmod 700 "$F3_RO_DIR"
+(( rc == 0 )) \
+  || fail "28: refusing must exit 0 like the flock-timeout branch (exit=$rc)"
+[[ ! -f "$REFLECT_ROOT/sessions/$F3_SID/final.json" ]] \
+  || fail "28: the worker RAN WITHOUT THE PER-MODE LOCK — final.json can now lose a peer's write to a last-write-wins mv"
+grep -q 'refusing to run WITHOUT the per-mode lock' "$STUB_SCRATCH/f3-ro.log" \
+  || fail "28: the reason was not recorded (log: $(cat "$STUB_SCRATCH/f3-ro.log"))"
+info "unopenable lockfile: worker exits 0, writes nothing, records why; writable lockfile still completes"
+
+# ============================================================================
+# TEST 29: F4 — REFLECT_SUBPROCESS means the same thing on both sides
+# ============================================================================
+# reflect.sh tested `== "1"` while self-compact-trigger.py tested truthy-if-non-
+# empty. So `REFLECT_SUBPROCESS=0` told the dispatcher "not a subprocess" and the
+# trigger "subprocess — do nothing": one env lever, opposite meanings, and the
+# quieter half silently disabled the feature.
+echo "TEST 29: F4 — one truthy semantic for REFLECT_SUBPROCESS across bash and python"
+F4_H="$(sc_home)"
+sc_write_config "$F4_H" on 0.30
+F4_CWD="$(mktemp -d -t reflect-f4cwd-XXXXXX)"
+assert_isolated_cwd "$F4_CWD"
+canonical_stub   # the precompact half parses the reply as reflection JSON
+mk_context_transcript "$F4_H/t.jsonl" "claude-opus-5" 320000 "$F4_CWD"
+
+f4_fire() {
+  # $1=label $2=sid $3..=env assignments ("" for none)
+  local sid="$2"; shift 2
+  jq -cn --arg sid "$sid" --arg tp "$F4_H/t.jsonl" --arg cwd "$F4_CWD" \
+    '{session_id:$sid,transcript_path:$tp,hook_event_name:"Stop",cwd:$cwd}' \
+    | env "$@" HOME="$F4_H" CLAUDE_CODE_ENTRYPOINT=cli REFLECT_ROOT="$REFLECT_ROOT" \
+      python3 "$F4_H/.claude/self-compact-trigger.py" >/dev/null
+}
+f4_reflect() {
+  # $1=sid $2..=env assignments ; returns the dispatcher rc
+  local sid="$1"; shift
+  jq -cn --arg sid "$sid" --arg tp "$TRANSCRIPT" --arg cwd "$TEST_CWD" \
+    '{session_id:$sid,transcript_path:$tp,hook_event_name:"PreCompact",cwd:$cwd,trigger:"auto"}' \
+    | env "$@" bash "$REFLECT_SH" precompact
+}
+
+# Truthy ("1"): both sides no-op.
+f4_fire truthy test-sid-f4-sub-1 REFLECT_SUBPROCESS=1 || fail "29: rc!=0 with REFLECT_SUBPROCESS=1"
+f4_reflect test-sid-f4-refl-1 REFLECT_SUBPROCESS=1 || fail "29: dispatcher rc!=0 with REFLECT_SUBPROCESS=1"
+sleep 0.4
+[[ ! -e "$SC_STATE_DIR/test-sid-f4-sub-1.request.json" ]] \
+  || fail "29: trigger fired inside a reflection subprocess"
+[[ ! -f "$REFLECT_ROOT/sessions/test-sid-f4-refl-1/manifest.json" ]] \
+  || fail "29: dispatcher ran a real reflection inside a reflection subprocess"
+
+# Falsy ("0", empty, unset): both sides do the work.
+for f4_case in zero empty unset; do
+  case "$f4_case" in
+    zero)  F4_ENV=(REFLECT_SUBPROCESS=0) ;;
+    empty) F4_ENV=(REFLECT_SUBPROCESS=) ;;
+    unset) F4_ENV=(-u REFLECT_SUBPROCESS) ;;
+  esac
+  f4_fire "$f4_case" "test-sid-f4-sub-$f4_case" "${F4_ENV[@]}" \
+    || fail "29: trigger rc!=0 with REFLECT_SUBPROCESS=$f4_case"
+  f4_reflect "test-sid-f4-refl-$f4_case" "${F4_ENV[@]}" \
+    || fail "29: dispatcher rc!=0 with REFLECT_SUBPROCESS=$f4_case"
+  for _ in $(seq 1 40); do
+    [[ -e "$SC_STATE_DIR/test-sid-f4-sub-$f4_case.request.json" ]] && break
+    sleep 0.25
+  done
+  [[ -e "$SC_STATE_DIR/test-sid-f4-sub-$f4_case.request.json" ]] \
+    || fail "29: REFLECT_SUBPROCESS=$f4_case silently DISABLED the trigger (bash reads the same value as not-a-subprocess)"
+  jq -e '.modes.precompact.status == "complete"' \
+    "$REFLECT_ROOT/sessions/test-sid-f4-refl-$f4_case/manifest.json" >/dev/null \
+    || fail "29: dispatcher treated REFLECT_SUBPROCESS=$f4_case as a subprocess"
+done
+info "1 = subprocess on both sides; 0 / empty / unset = not a subprocess on both sides"
+
+# ============================================================================
+# TEST 30: F6 — a budget override cannot re-break the hard 60s hook cap
+# ============================================================================
+# REFLECT_BUDGET_PRECOMPACT was never checked against the cap: 50 gives
+# 50 + 10 grace + 5 reserve = 65 > 60, so the external SIGKILL wins again and the
+# manifest is orphaned at `started` — the exact pathology the budget arithmetic
+# exists to prevent, reachable by one env var.
+echo "TEST 30: F6 — an over-cap budget override is clamped and says so"
+F6_DEFAULT="$(bash "$REFLECT_SH" --budgets 2>/dev/null)"
+jq -e '.budgets.precompact == 40 and .max_synchronous_budget_seconds
+       == (.hook_cap_seconds - .kill_grace_seconds - .reserve_seconds)' <<<"$F6_DEFAULT" >/dev/null \
+  || fail "30: shipped defaults changed unexpectedly ($F6_DEFAULT)"
+
+F6_ERR="$STUB_SCRATCH/f6.stderr"
+F6_OVER="$(REFLECT_BUDGET_PRECOMPACT=50 bash "$REFLECT_SH" --budgets 2>"$F6_ERR")"
+jq -e '.precompact_worst_case_seconds <= .hook_cap_seconds' <<<"$F6_OVER" >/dev/null \
+  || fail "30: budget+grace+reserve still exceeds the cap after an override ($F6_OVER)"
+jq -e '.budgets.precompact == .max_synchronous_budget_seconds' <<<"$F6_OVER" >/dev/null \
+  || fail "30: an over-cap override was not clamped to the maximum synchronous budget"
+grep -q 'CLAMPED' "$F6_ERR" \
+  || fail "30: the clamp was silent (stderr: $(cat "$F6_ERR"))"
+
+F6_BAD="$(REFLECT_BUDGET_PRECOMPACT=notanumber bash "$REFLECT_SH" --budgets 2>"$F6_ERR")"
+jq -e '.budgets.precompact == 40' <<<"$F6_BAD" >/dev/null \
+  || fail "30: a non-numeric override did not fall back to the shipped default"
+grep -q 'not a positive integer' "$F6_ERR" || fail "30: the reset was silent"
+# The enforcement must reach the real dispatcher, not just --budgets.
+F6_SID="test-sid-f6-clamped"
+echo "$(jq -cn --arg sid "$F6_SID" --arg tp "$TRANSCRIPT" --arg cwd "$TEST_CWD" \
+  '{session_id:$sid,transcript_path:$tp,hook_event_name:"PreCompact",cwd:$cwd,trigger:"auto"}')" \
+  | REFLECT_BUDGET_PRECOMPACT=50 bash "$REFLECT_SH" precompact >/dev/null 2>&1 && rc=0 || rc=$?
+(( rc == 0 )) || fail "30: precompact with an over-cap override exit=$rc"
+jq -e '.modes.precompact.status == "complete"' \
+  "$REFLECT_ROOT/sessions/$F6_SID/manifest.json" >/dev/null \
+  || fail "30: clamping broke the synchronous path"
+info "over-cap override clamped to $(jq -r .max_synchronous_budget_seconds <<<"$F6_OVER")s and logged; garbage resets to 40s; dispatcher still completes"
+
+# ============================================================================
+# TEST 31: F7 — producer and consumer agree about a bad threshold, and about 1e-05
+# ============================================================================
+# Two silent-substitution paths met in the middle: the producer fell back to 0.30
+# for an ill-typed threshold, and the consumer fell back to 0.30 for anything its
+# regex disliked — including jq's EXPONENT form for small numbers (1e-05). Either
+# way the trigger fired at a value the operator never configured, and the two
+# ends could disagree with no log line anywhere.
+echo "TEST 31: F7 — ill-typed threshold refuses at BOTH ends; exponent form is honoured"
+F7_H="$(sc_home)"
+F7_CFG="$F7_H/.claude/recursive-self-improvement/config/config.json"
+F7_CWD="$(mktemp -d -t reflect-f7cwd-XXXXXX)"
+assert_isolated_cwd "$F7_CWD"
+mk_candidate_repo "$F7_CWD" || fail "31: could not build repo"
+F7_ARGV="$F7_H/argv.txt"
+counting_stub "$F7_H/calls" "$SC_MISSION_FILE"
+F7_SID="test-sid-f7-badthreshold"
+F7_PROJ="$F7_H/.claude/projects/-tmp-f7"
+mkdir -p "$F7_PROJ"
+F7_TP="$F7_PROJ/$F7_SID.jsonl"
+mk_context_transcript "$F7_TP" "claude-opus-5" 330000 "$F7_CWD" 25
+touch -d '2 minutes ago' "$F7_TP"
+mk_mission_payload "$F7_CWD/tasks" "$F7_SID" "$(cat "$SC_MISSION_FILE")" >/dev/null
+sc_plant_request "$F7_SID" "$F7_CWD" "$F7_TP"
+
+# Producer: a string threshold is a misconfiguration, not a default.
+jq -n '{components:{self_compact:true},self_compact:{threshold:"0.5"}}' > "$F7_CFG"
+sc_fire "$F7_H" "test-sid-f7-producer" "$F7_CWD" "$F7_TP" >/dev/null \
+  || fail "31: producer rc!=0 with an ill-typed threshold"
+sleep 0.5
+[[ ! -e "$SC_STATE_DIR/test-sid-f7-producer.request.json" ]] \
+  || fail "31: producer fired at an unconfigured 0.30 instead of refusing"
+grep -q 'config REFUSED: self_compact.threshold' "$SC_STATE_DIR/trigger.log" \
+  || fail "31: producer refusal not logged"
+
+# Consumer: same config, same answer — OFF, logged, pending marker inert.
+F7_LOG="$REFLECT_ROOT/idle-handoff-logs/handoff.log"
+F7_LINES="$(wc -l < "$F7_LOG")"
+: > "$F7_ARGV"
+combo_stub "$F7_ARGV" "$SC_MISSION_FILE"
+HOME="$F7_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
+  >/dev/null 2>&1 || fail "31: idle-handoff.sh rc!=0 with an ill-typed threshold"
+sleep 0.5
+if sc_forked "$F7_ARGV"; then
+  fail "31: consumer forked using its own substituted 0.30 while the producer refused"
+fi
+F7_TAIL="$(tail -n +$((F7_LINES + 1)) "$F7_LOG")"
+grep -q 'self_compact.threshold' <<<"$F7_TAIL" \
+  || fail "31: consumer did not log the config error (log: $(tail -3 <<<"$F7_TAIL"))"
+grep -q 'self_compact=off' <<<"$F7_TAIL" \
+  || fail "31: consumer stayed ON with an unusable threshold"
+
+# Exponent form: jq renders small numbers in exponent notation (1E-7 on jq 1.8,
+# 1e-07 on jq 1.6), which the old `^[0-9]*\.?[0-9]+$` regex rejected — silently
+# substituting 0.30 for a threshold the operator did configure. awk, which does
+# the actual comparison, parses exponent notation fine.
+jq -n '{components:{self_compact:true},self_compact:{threshold:1e-7}}' > "$F7_CFG"
+F7_EXPECT="$(jq -r '.self_compact.threshold | tostring' "$F7_CFG")"
+[[ "$F7_EXPECT" =~ [eE] ]] \
+  || fail "31: fixture assumption broken — this jq renders the threshold as '$F7_EXPECT', not in exponent form; pick a smaller value so the exponent branch is exercised"
+F7_LINES="$(wc -l < "$F7_LOG")"
+HOME="$F7_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
+  >/dev/null 2>&1 || fail "31: idle-handoff.sh rc!=0 with an exponent threshold"
+F7_TAIL="$(tail -n +$((F7_LINES + 1)) "$F7_LOG")"
+grep -qF "self_compact=on(>=$F7_EXPECT)" <<<"$F7_TAIL" \
+  || fail "31: the configured $F7_EXPECT was replaced by a different threshold (log: $(grep -o 'self_compact=[^ ]*' <<<"$F7_TAIL" | tail -1))"
+info "ill-typed threshold: OFF and logged at producer AND consumer; jq's exponent rendering survives instead of becoming 0.30"
+
+# ============================================================================
+# TEST 32: F5 — inherited REFLECT_ASYNC / REFLECT_FORCE cannot kill handoffs
+# ============================================================================
+# The synchronous mission call scrubbed MODE but not REFLECT_ASYNC. Inherited
+# from the unit's environment it makes the worker detach, so
+# mission_manifest_status reads `started`, record_failure fires, and three of
+# those disable handoffs for the sid for the whole backoff window.
+echo "TEST 32: F5 — the synchronous mission call scrubs REFLECT_ASYNC and REFLECT_FORCE"
+F5_H="$(sc_home)"
+sc_write_config "$F5_H" on 0.30
+F5_ARGV="$F5_H/argv.txt"
+F5_CWD="$(mktemp -d -t reflect-f5cwd-XXXXXX)"
+assert_isolated_cwd "$F5_CWD"
+mk_candidate_repo "$F5_CWD" || fail "32: could not build repo"
+F5_SID="test-sid-f5-asyncenv"
+F5_PROJ="$F5_H/.claude/projects/-tmp-f5"
+mkdir -p "$F5_PROJ"
+F5_TP="$F5_PROJ/$F5_SID.jsonl"
+mk_context_transcript "$F5_TP" "claude-opus-5" 330000 "$F5_CWD" 25
+touch -d '2 minutes ago' "$F5_TP"
+sc_plant_request "$F5_SID" "$F5_CWD" "$F5_TP"
+# No payload on disk, so this candidate must take the mission-WRITE path — the
+# one that reads modes.mission.status straight after the call.
+[[ ! -e "$F5_CWD/tasks" ]] || fail "32: fixture must have no prior handoff"
+combo_stub "$F5_ARGV" "$SC_MISSION_FILE"
+: > "$F5_ARGV"
+
+REFLECT_ASYNC=1 REFLECT_FORCE=1 HOME="$F5_H" REFLECT_ROOT="$REFLECT_ROOT" \
+  bash "$WORKTREE/scripts/idle-handoff.sh" || fail "32: idle-handoff.sh rc!=0"
+for _ in $(seq 1 60); do sc_forked "$F5_ARGV" && break; sleep 0.25; done
+sc_forked "$F5_ARGV" \
+  || fail "32: an inherited REFLECT_ASYNC=1 broke the handoff (log: $(grep "$F5_SID" "$REFLECT_ROOT/idle-handoff-logs/handoff.log" | tail -3))"
+[[ ! -e "$REFLECT_ROOT/idle-handoff-state/$F5_SID.failures" ]] \
+  || fail "32: a failure was recorded — the status read saw 'started', which is the backoff path that silently disables handoffs"
+jq -e '.modes.mission.status == "complete"' "$REFLECT_ROOT/sessions/$F5_SID/manifest.json" >/dev/null \
+  || fail "32: mission write did not complete synchronously"
+info "REFLECT_ASYNC/REFLECT_FORCE inherited from the environment: scrubbed, write stayed synchronous, no backoff"
+
+# ============================================================================
+# TEST 33: F8 — the three quiet ones
+# ============================================================================
+echo "TEST 33: F8 — consume failure is loud, fresh= is real, malformed usage cannot kill the nudge"
+
+# (a) consume_context_request swallowed `mv` failure with `|| true`. A marker
+#     that persists is re-verified and re-forked on every later 5-min tick until
+#     the per-cwd 24h budget is spent — a silent, self-repeating spend.
+F8_H="$(sc_home)"
+sc_write_config "$F8_H" on 0.30
+F8_ARGV="$F8_H/argv.txt"
+F8_CWD="$(mktemp -d -t reflect-f8cwd-XXXXXX)"
+assert_isolated_cwd "$F8_CWD"
+mk_candidate_repo "$F8_CWD" || fail "33a: could not build repo"
+F8_SID="test-sid-f8-consume"
+F8_PAYLOAD="$(mk_mission_payload "$F8_CWD/tasks" "$F8_SID" "$(cat "$SC_MISSION_FILE")")"
+F8_PROJ="$F8_H/.claude/projects/-tmp-f8"
+mkdir -p "$F8_PROJ"
+F8_TP="$F8_PROJ/$F8_SID.jsonl"
+mk_context_transcript "$F8_TP" "claude-opus-5" 330000 "$F8_CWD" 25
+touch -d '2 minutes ago' "$F8_TP"
+sc_plant_request "$F8_SID" "$F8_CWD" "$F8_TP"
+combo_stub "$F8_ARGV" "$SC_MISSION_FILE"
+: > "$F8_ARGV"
+F8_LOG="$REFLECT_ROOT/idle-handoff-logs/handoff.log"
+F8_LINES="$(wc -l < "$F8_LOG")"
+chmod 500 "$SC_STATE_DIR"          # rename fails; reads still work
+HOME="$F8_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
+  >/dev/null 2>&1 && rc=0 || rc=$?
+chmod 700 "$SC_STATE_DIR"
+(( rc == 0 )) || fail "33a: idle-handoff.sh rc=$rc with an unwritable state dir"
+for _ in $(seq 1 40); do sc_forked "$F8_ARGV" && break; sleep 0.25; done
+sc_forked "$F8_ARGV" || fail "33a: control fork did not happen, so the consume path was never reached"
+F8_TAIL="$(tail -n +$((F8_LINES + 1)) "$F8_LOG")"
+grep -q 'could not consume' <<<"$F8_TAIL" \
+  || fail "33a: a failed consume was swallowed — the marker persists and later ticks re-fork the same session"
+[[ -f "$SC_STATE_DIR/$F8_SID.request.json" ]] \
+  || fail "33a: fixture invalid — the marker should still be there, that is why the log line matters"
+rm -f "$SC_STATE_DIR/$F8_SID.request.json"
+
+# (b) count_skipped_fresh_mission was printed as `fresh=` and never incremented,
+#     so the most common skip reason always reported 0.
+F8_LINES="$(wc -l < "$F8_LOG")"
+touch -d '2 minutes ago' "$F8_TP"
+sc_plant_request "$F8_SID" "$F8_CWD" "$F8_TP"
+touch "$F8_PAYLOAD"                 # fresh handoff => skip the write, still evaluate the fork
+HOME="$F8_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
+  >/dev/null 2>&1 || fail "33b: idle-handoff.sh rc!=0"
+F8_TAIL="$(tail -n +$((F8_LINES + 1)) "$F8_LOG")"
+grep -q 'skip write' <<<"$F8_TAIL" \
+  || fail "33b: fixture invalid — expected a fresh-mission write skip (log: $(tail -3 <<<"$F8_TAIL"))"
+if grep -q 'fresh=0' <<<"$F8_TAIL"; then
+  fail "33b: the summary still reports fresh=0 while a fresh-mission skip happened in the same run"
+fi
+grep -qE 'fresh=[1-9]' <<<"$F8_TAIL" \
+  || fail "33b: fresh= counter not incremented (log: $(grep -o 'fresh=[0-9]*' <<<"$F8_TAIL" | tail -1))"
+
+# (c) usage_total raised TypeError on a null/non-numeric usage value, and
+#     context-baggage.py calls occupancy() with no try/except — so ONE malformed
+#     transcript line made the UserPromptSubmit hook traceback and exit 1,
+#     taking the 70% nudge down with it.
+F8_BAD="$(mktemp -d -t reflect-f8bad-XXXXXX)"
+mk_context_transcript "$F8_BAD/t.jsonl" "claude-opus-5" 750000
+# Malformed lines AHEAD of the good one: null, string, list, and a null block.
+{
+  printf '%s\n' '{"type":"assistant","message":{"role":"assistant","model":"claude-opus-5","usage":{"input_tokens":null,"cache_read_input_tokens":"lots","cache_creation_input_tokens":[1,2]}}}'
+  printf '%s\n' '{"type":"assistant","message":{"role":"assistant","model":"claude-opus-5","usage":null}}'
+  cat "$F8_BAD/t.jsonl"
+} > "$F8_BAD/mixed.jsonl"
+python3 - "$F8_BAD/mixed.jsonl" <<'PY' || fail "33c: occupancy() raised on a malformed usage value"
+import sys, os
+sys.path.insert(0, os.environ["WORKTREE"])
+import context_usage
+occ = context_usage.occupancy(sys.argv[1])
+assert occ is not None, "unreadable"
+assert occ.total_tokens == 750000, occ.total_tokens
+PY
+F8_NUDGE="$(jq -cn --arg tp "$F8_BAD/mixed.jsonl" '{transcript_path:$tp}' \
+  | python3 "$WORKTREE/context-baggage.py")" \
+  || fail "33c: the UserPromptSubmit hook exited non-zero on a malformed transcript line"
+grep -q 'Context is 75% full' <<<"$F8_NUDGE" \
+  || fail "33c: the 70% nudge stopped working with a malformed line present (out='$F8_NUDGE')"
+# A usage block that is ENTIRELY non-numeric contributes nothing rather than raising.
+python3 - <<'PY' || fail "33c: usage_total did not coerce a fully non-numeric block"
+import sys, os
+sys.path.insert(0, os.environ["WORKTREE"])
+import context_usage
+assert context_usage.usage_total({"input_tokens": None}) == 0
+assert context_usage.usage_total({"input_tokens": True}) == 0
+assert context_usage.usage_total(None) == 0
+assert context_usage.usage_total("nope") == 0
+assert context_usage.usage_total({"input_tokens": 5, "cache_read_input_tokens": None}) == 5
+PY
+info "failed consume logged loudly; fresh= counts real skips; a malformed usage line no longer breaks the nudge hook"
 
 # ============================================================================
 # FINAL GUARD: prove the whole suite left the live repo alone.
