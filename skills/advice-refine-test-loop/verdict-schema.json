@@ -27,7 +27,7 @@
           },
           "autofix_class": {
             "enum": ["safe_auto", "gated_auto", "manual", "advisory"],
-            "description": "Apply-authority — independent of severity. safe_auto = trivially reversible, no design call (e.g. rename an unused var). gated_auto = mechanically safe but wants human ack before applying (e.g. rename that ripples). manual = needs human implementation. advisory = surface only, no action expected."
+            "description": "A property of the CHANGE the finding calls for, independent of severity. Judge on reversibility, how far the edit reaches beyond the flagged location, and whether choosing the change requires human judgement. safe_auto = fully reversible, mechanical, confined to the flagged location, no design choice (e.g. rename an unused local). gated_auto = mechanical and reversible, but the edit reaches beyond the flagged location — call sites, public names, persisted data, generated output. manual = the correct change is not mechanical; choosing it requires human judgement about design or intent. advisory = an observation about the code with no specific change attached."
           },
           "file": { "type": "string", "description": "Absolute path" },
           "line": {
