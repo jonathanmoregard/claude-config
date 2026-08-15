@@ -38,8 +38,9 @@ Each Phase 1/2 round follows the same shape:
 ```
 1. SELF-REVIEW: read each changed file top-to-bottom (not just diff)
 2. VERIFY: tests + syntax + smoke green before inviting external eyes. On the
-   phase's FIRST round, RECORD this run as the PHASE BASELINE; later rounds
-   reuse it unchanged. `regressed_r` is defined against it
+   phase's FIRST round, RECORD the SET OF PASSING TEST IDS from this run as the
+   PHASE BASELINE; later rounds reuse it unchanged. `regressed_r` is defined
+   against it
 3. ADVISE: dispatch the phase's advisor (Opus in phase 1, Codex in phase 2) —
    exactly ONE advisor dispatch per round. From round 2 on, the prompt's "Prior
    rounds fixed:" list carries the entire phase's fix history, compressed per
@@ -109,38 +110,47 @@ are (a) NEW, (b) SURVIVE REPRODUCTION, and (c) cost less fresh breakage than
 they buy. Count that, not findings. **Benefit alone is not the signal — a
 round's fixes can break more than the round found.**
 
-**Capture the PHASE BASELINE ONCE, at the phase's FIRST step-2 verification.**
-Record it into `baselines[phase]` before any fix lands: the set of passing test
-IDs, or — when the runner cannot enumerate — the pass count plus the full name
-of every test FAILING IN THAT SAME RUN (`named_failures`). Every later round in
-the phase measures `regressed_r` against that same record, never a re-measured
-one, so a test that was green when the phase began and is red now counts as
-regressed however many rounds have passed. Tests ADDED during the phase join
-the baseline the first time they pass. Without this record `regressed_r` is
-uncomputable and the gate is blind.
+**Capture the PHASE BASELINE ONCE, at the phase's FIRST step-2 verification,
+before any fix lands.** It is a SET OF TEST IDENTITIES — the full name of every
+test that PASSED in that run — written to `baselines[phase]` and never rewritten
+while the phase runs. If the runner does not name passing tests by default,
+re-run it once with the flag that makes it (`-v`, `--verbose`,
+`--reporter=json`). Never record a pass COUNT in its place: a count cannot say
+which tests existed, and `regressed_r` is uncomputable without that.
+
+**OPEN finding — the one definition. Every other mention of `new_r` defers here
+and must not restate it.** A BLOCKER or HIGH finding is OPEN from the moment it
+is first reported until it CLOSES, and exactly two things close it:
+
+- a fix is applied AND its repro passes afterwards (`fixed: true`); or
+- its step-5 repro did not demonstrate the defect (`repro: false`) — a step-4.5
+  drop records the same without reaching step 5.
+
+A failed fix does not close a finding. Neither does the advisor going quiet
+about it. A closed finding reported again reopens only if it reproduces again;
+otherwise it is advisor staleness and feeds no counter.
 
 **Track per round**, appended to `rounds[phase]` in the run state at step 7:
 
-- `new_r` — OPEN BLOCKER+HIGH findings this round. Candidate set: the step-4
-  deduped BLOCKER+HIGH list, BEFORE step 4.5 drops — a step-4.5 drop saves repro
-  effort, it never removes a candidate. A candidate is open when it is either
-  (a) not reported earlier in this run, deduped by MEANING (see below), or
-  (b) reported earlier, marked fixed, and STILL REPRODUCING at step 5. Rewording
-  and shifted line numbers never make a finding new. A re-flag of a fixed
-  finding that no longer reproduces is neither new nor open — it is advisor
-  staleness, and it feeds no counter.
-- `repro_r` — of those `new_r`, how many EMPIRICALLY REPRODUCED at step 5. A
-  candidate dropped at step 4.5 never reaches step 5 and therefore never
-  reproduces. Whether a fix later succeeded is a DIFFERENT fact, recorded as
-  `fixed` in `findings_log`; it never changes `repro_r`. Invariant:
-  `0 <= repro_r <= new_r`.
-- `regressed_r` — tests that passed in the PHASE BASELINE and are FAILING at
-  this round's LAST verification run (step 6 when a fix was attempted, else the
-  step-2 run). Measured once, at the end of the round. Breakage introduced and
-  repaired within the round is not damage and counts 0; breakage carried over
-  from an earlier round of the same phase still counts, every round, until it
-  is repaired. With only a pass count recorded, a test is regressed iff it
-  fails at that run and is not in the baseline's `named_failures`.
+- `new_r` — how many findings are OPEN when step 5 begins: this round's step-4
+  deduped BLOCKER+HIGH candidates, PLUS every finding an earlier round of this
+  phase left open, deduped against the candidates so none is counted twice.
+  Candidates enter BEFORE step 4.5 drops — a drop saves repro effort, it never
+  removes a candidate. Identity is by MEANING (see below); rewording and shifted
+  line numbers never make a finding new.
+- `repro_r` — of those `new_r`, how many EMPIRICALLY REPRODUCED at step 5.
+  Carried-open findings are re-checked at step 5 like any other. A candidate
+  dropped at step 4.5 never reaches step 5 and therefore never reproduces.
+  Whether a fix later succeeded is a DIFFERENT fact, recorded as `fixed` in
+  `findings_log`; it never changes `repro_r`. Invariant: `0 <= repro_r <= new_r`.
+- `regressed_r` — how many tests IN THE PHASE BASELINE SET are FAILING at this
+  round's LAST verification run (step 6 when a fix was attempted, else the
+  step-2 run). A test absent from that set can NEVER be regressed: that covers
+  every test added during the phase — including the failing repro tests step 5
+  mandates — and every test already failing when the phase began. Measured once,
+  at the end of the round. Breakage introduced and repaired within the round is
+  not damage and counts 0; breakage carried over from an earlier round of the
+  same phase still counts, every round, until it is repaired.
 
 `new_r` and `repro_r` are both FINALISED at the end of step 5 and never revised.
 `regressed_r` is finalised at the round's last verification run.
@@ -223,7 +233,7 @@ if (( repro_r > new_r || new_r < 0 || repro_r < 0 || regressed_r < 0 )); then
 elif (( regressed_r > 0 && repro_r <= regressed_r )); then
   stop="no-marginal-gain"
 
-# B2. Nothing open, nothing broken: the good exit.
+# B2. Nothing OPEN (per the OPEN definition), nothing broken: the good exit.
 elif (( new_r == 0 && regressed_r == 0 )); then
   stop="converged"
 
@@ -318,9 +328,9 @@ no exceptions:**
                    {"new": 2, "repro": 2, "regressed": 0},
                    {"new": 0, "repro": 0, "regressed": 0}],
              "2": [{"new": 1, "repro": 1, "regressed": 0}]},
-  "baselines": {"1": {"passing": 412, "named_failures": []},
-                "2": {"passing": 419,
-                      "named_failures": ["e2e::known_flake"]}},
+  "baselines": {"1": ["session::drops_line", "cli::exit_code_3"],
+                "2": ["session::drops_line", "cli::exit_code_3",
+                      "ingest::errors_sink"]},
   "findings_log": {
     "1": [{"id": "p1-f3",
            "file": "/abs/path/session.rs", "line": 88,
@@ -343,18 +353,18 @@ what makes resume cheap rather than a restart. `stop_reasons` records how each
 completed phase exited (the stop-routing table); the Exit report reads it from
 here, so a compact never loses it.
 
-`baselines[phase]` is written once, at the phase's first round commit, and is
-never rewritten while the phase runs.
+`baselines[phase]` is the phase's set of passing test IDs, written once at the
+phase's first round commit and never rewritten while the phase runs.
 
 `findings_log` is what makes semantic dedupe survive a compact. Append one entry
 per BLOCKER+HIGH finding at step 7 and never rewrite an earlier entry:
 
 - `rationale` verbatim and `category` are the dedupe inputs. Without them
   `new_r` inflates, because every finding looks unseen.
-- `history` is the open-test input: one row per round the finding was reported,
-  with that round's `repro` outcome and whether a fix was applied. `new_r`'s
-  clause (b) — reported earlier, marked fixed, still reproducing — reads both
-  fields, so record both on every row.
+- `history` is what decides whether a finding is still OPEN: one row per round
+  it was reported, with that round's `repro` outcome and whether a fix was
+  applied and verified. The OPEN definition reads both fields, so record both on
+  every row.
 
 **On skill start, before Phase 1:** if `tasks/arftl-run.json` exists with
 `status: running`, do NOT start over. Read it, announce `"Resuming ARFTL at
@@ -650,7 +660,7 @@ After consolidator exits (clean or bounded), advance to the next phase using the
 | Dedupe `new_r` by `(file, line, claim)` | A reworded repeat at a shifted line then counts as NEW and inflates the continue signal the gate depends on. Dedupe by MEANING — equivalence-judge subagent, or trigram Jaccard ≥0.8 as fallback. |
 | PAUSE and ask the human on a stop the loop can rule on itself | `converged` and `unreproducible` advance without asking, with the reason surfaced in the exit commit message. Asking a human to adjudicate unreproducible claims is the wrong use of their attention. |
 | Advance (or run another round) on a `no-marginal-gain` stop | It means the loop is DAMAGING. Advancing ships the damage; continuing feeds it. halt-and-pause. Only the stop-routing table decides this — do not infer routing from a stop's name. |
-| Read `converged` as "the round found nothing" | `converged` requires `new_r == 0` — nothing was even proposed. A round that proposes findings none of which reproduce is `unreproducible`, and it must surface those findings, not exit silently. |
+| Read `converged` as "the round found nothing" | `converged` requires `new_r == 0` — nothing proposed AND nothing left open by an earlier round of the phase, per the OPEN definition. A round that proposes findings none of which reproduce is `unreproducible`, and it must surface those findings, not exit silently. |
 | Reset to Phase 1 a second time from Phase 3 | Capped at one reset. A diff still producing fresh BLOCKER/HIGH after a full 1→2→3 pass wants splitting, not another lap through both vendors. |
 | Skip writing `tasks/arftl-run.json` because "the loop is nearly done" | Nearly-done is when a compact is most likely and the fix history is most expensive to lose. Write it at every round commit, same step. |
 | Restart at Phase 1 after a compact or crash | Check `tasks/arftl-run.json` first. Re-running phases that already PASSed re-burns both quotas to reproduce a result you already have on disk. |
