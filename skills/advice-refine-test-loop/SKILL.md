@@ -37,8 +37,9 @@ Each Phase 1/2 round follows the same shape:
 
 ```
 1. SELF-REVIEW: read each changed file top-to-bottom (not just diff)
-2. VERIFY: tests + syntax + smoke green before inviting external eyes. RECORD
-   this run as the round's BASELINE — `regressed_r` is defined against it
+2. VERIFY: tests + syntax + smoke green before inviting external eyes. On the
+   phase's FIRST round, RECORD this run as the PHASE BASELINE; later rounds
+   reuse it unchanged. `regressed_r` is defined against it
 3. ADVISE: dispatch the phase's advisor (Opus in phase 1, Codex in phase 2) —
    exactly ONE advisor dispatch per round. From round 2 on, the prompt's "Prior
    rounds fixed:" list carries the entire phase's fix history, compressed per
@@ -81,9 +82,9 @@ Each Phase 1/2 round follows the same shape:
    **Validate only PIVOTAL findings.** A finding the primary AND a specialist flagged INDEPENDENTLY at the same location is not pivotal — skip the validator, go straight to step 5. A singleton finding (one reviewer only) IS pivotal — validate it. This trims step 4.5 only; it NEVER skips step 5 repro.
 5. REPRODUCE each BLOCKER/HIGH finding before fixing — advisors hallucinate
 6. FIX by severity, re-verify after each. Read `regressed_r` off the round's
-   FINAL re-verification, diffed against the step-2 baseline
+   FINAL re-verification, diffed against the PHASE BASELINE
 7. COMMIT the round (per-round granularity, not a batch), then WRITE RUN
-   STATE (`tasks/arftl-run.json` — counters, baseline, `findings_log`; see
+   STATE (`tasks/arftl-run.json` — counters, `baselines`, `findings_log`; see
    "Run state" below). Both, every round.
 8. GATE: evaluate the LOOP BOUNDS gate (see below) — every round, whatever the
    verdict. The gate's routing beats the verdict; see "Gate beats verdict". On
@@ -108,13 +109,15 @@ are (a) NEW, (b) SURVIVE REPRODUCTION, and (c) cost less fresh breakage than
 they buy. Count that, not findings. **Benefit alone is not the signal — a
 round's fixes can break more than the round found.**
 
-**Capture the BASELINE at step 2, every round.** The step-2 verification run IS
-the baseline, and every part of it is recordable at step 2 with no knowledge of
-what the round will later do. Record it into `rounds[phase][r].baseline` before
-any fix lands: the set of passing test IDs, or — when the runner cannot
-enumerate — the pass count plus the full name of every test FAILING IN THAT SAME
-STEP-2 RUN (`named_failures`). Without that record `regressed_r` is uncomputable
-and the gate is blind.
+**Capture the PHASE BASELINE ONCE, at the phase's FIRST step-2 verification.**
+Record it into `baselines[phase]` before any fix lands: the set of passing test
+IDs, or — when the runner cannot enumerate — the pass count plus the full name
+of every test FAILING IN THAT SAME RUN (`named_failures`). Every later round in
+the phase measures `regressed_r` against that same record, never a re-measured
+one, so a test that was green when the phase began and is red now counts as
+regressed however many rounds have passed. Tests ADDED during the phase join
+the baseline the first time they pass. Without this record `regressed_r` is
+uncomputable and the gate is blind.
 
 **Track per round**, appended to `rounds[phase]` in the run state at step 7:
 
@@ -131,21 +134,22 @@ and the gate is blind.
   reproduces. Whether a fix later succeeded is a DIFFERENT fact, recorded as
   `fixed` in `findings_log`; it never changes `repro_r`. Invariant:
   `0 <= repro_r <= new_r`.
-- `regressed_r` — tests that passed in THIS round's step-2 baseline and are
-  STILL FAILING at the round's FINAL step-6 re-verification. Measured once, at
-  the end of the round, against the recorded baseline. Breakage introduced and
-  repaired within the round is not damage and counts 0. With only a pass count
-  recorded, a test is regressed iff it fails at that final run and is not in
-  `named_failures`. If no fix was attempted this round and step 6 never ran,
-  `regressed_r = 0`.
+- `regressed_r` — tests that passed in the PHASE BASELINE and are FAILING at
+  this round's LAST verification run (step 6 when a fix was attempted, else the
+  step-2 run). Measured once, at the end of the round. Breakage introduced and
+  repaired within the round is not damage and counts 0; breakage carried over
+  from an earlier round of the same phase still counts, every round, until it
+  is repaired. With only a pass count recorded, a test is regressed iff it
+  fails at that run and is not in the baseline's `named_failures`.
 
 `new_r` and `repro_r` are both FINALISED at the end of step 5 and never revised.
-`regressed_r` is finalised at the end of step 6.
+`regressed_r` is finalised at the round's last verification run.
 
 `n` is the number of rounds recorded in `rounds[phase]` for the current phase,
 including the round being gated. A Phase 3 reset re-enters Phase 1 WITHOUT
-resetting `n` — `rounds["1"]` keeps accumulating, so the `ceiling` backstop
-covers the run's whole Phase 1 cost rather than handing it a fresh budget.
+resetting `n` or `baselines["1"]` — `rounds["1"]` keeps accumulating, so the
+`ceiling` backstop covers the run's whole Phase 1 cost rather than handing it a
+fresh budget.
 
 **Dedupe `new_r` by MEANING, not by `(file, line, claim)`.** The tuple rule is
 insufficient: a reworded repeat at a shifted line passes it and counts as NEW,
@@ -214,7 +218,8 @@ in preference order:
 if (( repro_r > new_r || new_r < 0 || repro_r < 0 || regressed_r < 0 )); then
   stop="accounting-error"
 
-# B1. DAMAGE. This round's fixes cost at least as much as they bought.
+# B1. DAMAGE. Tests green at phase start are red now, and this round did not
+#     reproduce more than that costs.
 elif (( regressed_r > 0 && repro_r <= regressed_r )); then
   stop="no-marginal-gain"
 
@@ -241,9 +246,10 @@ Reaching B2 guarantees `regressed_r == 0` when `new_r == 0` (B1 already took
 the `new_r == 0 && regressed_r > 0` case), and reaching B3 guarantees
 `new_r > 0`. The cascade is exhaustive over every integer triple.
 
-In prose: **keep going while each round reproduces more new defects than its
-fixes break.** Round count is irrelevant while that holds — round 7 finding a
-real data-loss bug is worth more than stopping at round 3 for tidiness.
+In prose: **keep going while each round reproduces more new defects than the
+phase has broken and left broken.** Round count is irrelevant while that holds —
+round 7 finding a real data-loss bug is worth more than stopping at round 3 for
+tidiness.
 
 ### Stop routing — single source of truth
 
@@ -254,7 +260,7 @@ may state or imply a different routing; where one appears to, this table wins.
 |---|---|---|
 | `converged` | advance | Advance to the next phase. Nothing to surface. |
 | `unreproducible` | advance-with-findings-surfaced | Advance. List every unreproduced finding verbatim in the phase's exit commit message and in the Exit report. |
-| `no-marginal-gain` | halt-and-pause | Do NOT advance, do NOT run another round. The round broke at least as much as it fixed, so continuing and advancing are both wrong. PAUSE handler with `pause_reason: no-marginal-gain` and every regressed test named. |
+| `no-marginal-gain` | halt-and-pause | Do NOT advance, do NOT run another round. The phase's unrepaired breakage costs at least as much as this round bought, so continuing and advancing are both wrong. PAUSE handler with `pause_reason: no-marginal-gain` and every regressed test named. |
 | `ceiling` | halt-and-pause | Do NOT advance. Cost backstop, never read as convergence. PAUSE handler with `pause_reason: ceiling`. |
 | `accounting-error` | halt-and-pause | Do NOT advance. PAUSE handler with `pause_reason: accounting-error` and the offending `(new_r, repro_r, regressed_r)` triple. |
 | none (`continue_round=1`) | continue | Start round r+1. |
@@ -262,7 +268,7 @@ may state or imply a different routing; where one appears to, this table wins.
 **Gate beats verdict at step 8.** Evaluate the gate first, then:
 
 1. A `halt-and-pause` routing wins over ANY verdict, `PASS` included. A round
-   that broke previously-passing tests has not earned an advance.
+   that leaves a previously-passing test broken has not earned an advance.
 2. Otherwise `PASS` / `PASS_WITH_FIXES` exits the round loop and advances
    (consolidator first when `PASS_WITH_FIXES`).
 3. Otherwise (`BLOCKS`): `continue` starts round r+1; any other routing applies
@@ -308,15 +314,13 @@ no exceptions:**
   "status": "running | pending-human | complete",
   "phase": "1 | 2 | 3 | 4a | 4b",
   "round": 3,
-  "rounds": {"1": [{"new": 5, "repro": 5, "regressed": 0,
-                    "baseline": {"passing": 412, "named_failures": []}},
-                   {"new": 2, "repro": 2, "regressed": 0,
-                    "baseline": {"passing": 417, "named_failures": []}},
-                   {"new": 0, "repro": 0, "regressed": 0,
-                    "baseline": {"passing": 419, "named_failures": []}}],
-             "2": [{"new": 1, "repro": 1, "regressed": 0,
-                    "baseline": {"passing": 419,
-                                 "named_failures": ["e2e::known_flake"]}}]},
+  "rounds": {"1": [{"new": 5, "repro": 5, "regressed": 0},
+                   {"new": 2, "repro": 2, "regressed": 0},
+                   {"new": 0, "repro": 0, "regressed": 0}],
+             "2": [{"new": 1, "repro": 1, "regressed": 0}]},
+  "baselines": {"1": {"passing": 412, "named_failures": []},
+                "2": {"passing": 419,
+                      "named_failures": ["e2e::known_flake"]}},
   "findings_log": {
     "1": [{"id": "p1-f3",
            "file": "/abs/path/session.rs", "line": 88,
@@ -338,6 +342,9 @@ no exceptions:**
 what makes resume cheap rather than a restart. `stop_reasons` records how each
 completed phase exited (the stop-routing table); the Exit report reads it from
 here, so a compact never loses it.
+
+`baselines[phase]` is written once, at the phase's first round commit, and is
+never rewritten while the phase runs.
 
 `findings_log` is what makes semantic dedupe survive a compact. Append one entry
 per BLOCKER+HIGH finding at step 7 and never rewrite an earlier entry:
