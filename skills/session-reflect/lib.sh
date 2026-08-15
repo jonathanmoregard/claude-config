@@ -455,6 +455,92 @@ reflect_can_systemd_run() {
   return 0
 }
 
+# --- Orphan reaper (D4) ------------------------------------------------------
+# reap_stale_started [skip_manifest_path]
+# Demote every `status:started` mode older than REFLECT_STALE_STARTED_SECONDS
+# to a TERMINAL `error` (reason=orphaned_started_reaped).
+#
+# WHY: `started` was terminal in practice. is_already_complete only ever
+# *permitted a re-run* for a stale `started`, and the hooks that could re-run it
+# (SessionEnd, SubagentStop) fire exactly once per session — so an orphaned
+# `started` stayed `started` forever. 124 such manifests in the live corpus.
+# D1 makes the worker survive long enough to write its own terminal status; this
+# reaper covers what no worker can (SIGKILL, host reboot, OOM kill).
+#
+# Cost control: candidates are pre-filtered with `find -mmin` (manifest mtime
+# tracks its last state change, so a manifest stuck at `started` has a stale
+# mtime by construction), then capped at REFLECT_REAP_MAX_PER_RUN. Call this
+# ONLY off the hook clock (detached workers) — never from the synchronous
+# precompact path, which is fighting the 60s cap.
+#
+# Prints the number of modes reaped on stdout.
+reap_stale_started() {
+  local skip="${1:-}"
+  local limit="${REFLECT_REAP_MAX_PER_RUN:-200}"
+  local threshold="$REFLECT_STALE_STARTED_SECONDS"
+  local sessions_root="$REFLECT_ROOT/sessions"
+  local reaped=0
+  if [[ ! -d "$sessions_root" ]]; then
+    printf '%s' 0
+    return 0
+  fi
+  # find -mmin takes whole minutes; round the threshold UP so we never reap
+  # something younger than the threshold.
+  local mmin=$(( (threshold + 59) / 60 ))
+  (( mmin < 1 )) && mmin=1
+
+  local now_epoch
+  now_epoch="$(date -u +%s)"
+
+  local seen=0 f
+  while IFS= read -r f; do
+    (( seen >= limit )) && break
+    seen=$(( seen + 1 ))
+    [[ -n "$skip" && "$f" == "$skip" ]] && continue
+    [[ -f "$f" ]] || continue
+
+    local sid
+    sid="$(jq -r '.session_id // ""' "$f" 2>/dev/null || true)"
+    if ! is_valid_sid "$sid"; then
+      sid="$(basename -- "$(dirname -- "$f")")"
+      is_valid_sid "$sid" || continue
+    fi
+
+    local mode started_at
+    while IFS=$'\t' read -r mode started_at; do
+      [[ -n "$mode" ]] || continue
+      # Age source: started_at when parseable, else the manifest mtime (the
+      # find filter already proved the file itself is older than the
+      # threshold, so an unparseable timestamp must not grant immortality —
+      # that was the other half of why `started` was terminal in practice).
+      local age_source="started_at" started_epoch age
+      started_epoch="$(date -d "$started_at" +%s 2>/dev/null || echo '')"
+      if [[ -z "$started_epoch" || ! "$started_epoch" =~ ^-?[0-9]+$ ]]; then
+        started_epoch="$(stat -c '%Y' "$f" 2>/dev/null || echo '')"
+        age_source="manifest_mtime"
+        [[ "$started_epoch" =~ ^-?[0-9]+$ ]] || continue
+      fi
+      age=$(( now_epoch - started_epoch ))
+      (( age > threshold )) || continue
+      write_manifest "$f" "$sid" "$mode" "error" \
+        "$(jq -cn --arg reason "orphaned_started_reaped" \
+             --arg src "$age_source" \
+             --argjson age "$age" \
+             --argjson thr "$threshold" \
+             '{reason:$reason,orphan_age_seconds:$age,
+               orphan_age_source:$src,stale_threshold_seconds:$thr}')" \
+        || continue
+      reaped=$(( reaped + 1 ))
+    done < <(jq -r '(.modes // {}) | to_entries[]
+                    | select(.value.status == "started")
+                    | select((.value.final_complete // false) == false)
+                    | "\(.key)\t\(.value.started_at // "")"' "$f" 2>/dev/null || true)
+  done < <(find "$sessions_root" -mindepth 2 -maxdepth 4 -type f \
+             -name manifest.json -mmin "+$mmin" 2>/dev/null || true)
+
+  printf '%s' "$reaped"
+}
+
 # --- Best-effort parent-SID discovery for subagents --------------------------
 # find_parent_session_id <subagent_sid> <cwd> <transcript_path>
 # Strategy, in order:

@@ -1395,6 +1395,71 @@ STUB
 chmod +x "$STUB_SCRATCH/claude"
 
 # ============================================================================
+# TEST 18: D4 — an orphaned `started` must reach a TERMINAL status
+# ============================================================================
+# `status:started` was terminal in practice. is_already_complete only ever
+# *permitted a re-run* for a stale started, and the hooks that could re-run it
+# (SessionEnd, SubagentStop) fire exactly once per session — so nothing ever
+# demoted an orphan. 124 such manifests in the live corpus, none of which will
+# ever become error/timeout on their own.
+#
+# D1 makes the worker survive long enough to write its own terminal status; this
+# reaper covers what no worker can (SIGKILL, reboot, OOM). It must be INVOKED by
+# something, not merely exist — so this test triggers it the way production does:
+# by firing an ordinary SessionEnd for an unrelated session and letting its
+# detached worker run the sweep.
+echo "TEST 18: D4 — reaper demotes orphaned started manifests to a terminal status"
+
+ORPH_SID="test-sid-orphan-started"
+mkdir -p "$REFLECT_ROOT/sessions/$ORPH_SID"
+ORPH_MANIFEST="$REFLECT_ROOT/sessions/$ORPH_SID/manifest.json"
+ORPH_STARTED_AT="$(date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%SZ)"
+jq -n --arg sid "$ORPH_SID" --arg at "$ORPH_STARTED_AT" \
+  '{session_id:$sid,
+    modes:{sessionend:{status:"started",started_at:$at,completed_at:null,final_complete:false}}}' \
+  > "$ORPH_MANIFEST"
+# mtime is the reaper's cheap pre-filter — a manifest stuck at started has a
+# stale mtime by construction.
+touch -d '2 hours ago' "$ORPH_MANIFEST"
+
+# Control: a FRESH started manifest must be left alone (a live worker owns it).
+FRESH_SID="test-sid-fresh-started"
+mkdir -p "$REFLECT_ROOT/sessions/$FRESH_SID"
+FRESH_MANIFEST="$REFLECT_ROOT/sessions/$FRESH_SID/manifest.json"
+jq -n --arg sid "$FRESH_SID" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  '{session_id:$sid,
+    modes:{sessionend:{status:"started",started_at:$at,completed_at:null,final_complete:false}}}' \
+  > "$FRESH_MANIFEST"
+
+# Trigger: an ordinary, unrelated SessionEnd.
+REAP_SID="test-sid-reaper-trigger"
+REAP_PAYLOAD="$(fake_payload SessionEnd "$REAP_SID")"
+echo "$REAP_PAYLOAD" | bash "$REFLECT_SH" sessionend
+rc=$?
+(( rc == 0 )) || fail "D4: reaper-trigger sessionend exit=$rc"
+wait_for_complete "$REFLECT_ROOT/sessions/$REAP_SID/manifest.json" 20 \
+  || fail "D4: reaper-trigger sessionend never completed"
+
+for _ in $(seq 1 60); do
+  jq -e '.modes.sessionend.status == "error"' "$ORPH_MANIFEST" >/dev/null 2>&1 && break
+  sleep 0.25
+done
+jq -e '.modes.sessionend.status == "error"' "$ORPH_MANIFEST" >/dev/null \
+  || fail "D4: orphaned started was never demoted (still $(jq -r '.modes.sessionend.status' "$ORPH_MANIFEST")) — no reaper ran"
+jq -e '.modes.sessionend.reason == "orphaned_started_reaped"' "$ORPH_MANIFEST" >/dev/null \
+  || fail "D4: demotion must record reason=orphaned_started_reaped"
+jq -e '.modes.sessionend.completed_at != null' "$ORPH_MANIFEST" >/dev/null \
+  || fail "D4: demoted mode must carry completed_at (terminal)"
+jq -e '.modes.sessionend.orphan_age_seconds > 600' "$ORPH_MANIFEST" >/dev/null \
+  || fail "D4: demotion must record the observed orphan age"
+
+# The fresh one must be untouched — reaping a live worker's manifest would be
+# worse than the bug.
+jq -e '.modes.sessionend.status == "started"' "$FRESH_MANIFEST" >/dev/null \
+  || fail "D4: reaper wrongly demoted a FRESH started manifest ($(jq -c '.modes.sessionend' "$FRESH_MANIFEST"))"
+info "orphaned started demoted to terminal error; fresh started left alone"
+
+# ============================================================================
 # FINAL GUARD: prove the whole suite left the live repo alone.
 assert_repo_tasks_untouched "end of suite"
 info "live repo tasks/ untouched by the full suite"

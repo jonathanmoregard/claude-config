@@ -971,8 +971,19 @@ spawn_detached_worker() {
 # DISPATCH
 # ============================================================================
 if (( IS_WORKER == 1 )); then
-  # Detached worker path: run and exit.
+  # Detached worker path: run, then heal orphans, then exit.
   run_worker
+  # D4: the detached worker is OFF the hook clock, so it is the right place to
+  # pay for the orphan sweep. Demotes any stale `status:started` mode left by a
+  # SIGKILLed predecessor (host reboot, OOM, pre-D1 cgroup teardown) to a
+  # terminal `error`. Deliberately NOT called from the synchronous precompact
+  # path, which is fighting the 60s hook cap. Never fatal — the reflection we
+  # just wrote matters more than the sweep.
+  _reaped="$(reap_stale_started "$manifest_path" 2>/dev/null || echo 0)"
+  if [[ "$_reaped" =~ ^[0-9]+$ ]] && (( _reaped > 0 )); then
+    printf '[session-reflect] reaper demoted %s orphaned started mode(s) to error\n' \
+      "$_reaped" >&2
+  fi
   exit 0
 fi
 
