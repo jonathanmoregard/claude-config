@@ -635,7 +635,12 @@ for bad in "${BAD_SIDS[@]}"; do
 done
 # Ensure no session dir was created for any of these bad SIDs.
 # Build allow-list of legit test SIDs including TEST 3f's per-round SIDs.
-ALLOW_SIDS=('_malformed' "$SID" "$PC_SID" "$PC2_SID" "$RACE_SID" "$BIG_SID" "$PARENT_SID")
+# NOTE (D2): `_malformed` is deliberately NOT on this list any more. The
+# malformed-payload bucket used to live at sessions/_malformed — a name that
+# satisfies is_valid_sid, so a malformed hook payload minted a fixed,
+# machine-created "session" that anything could name. Everything under sessions/
+# must be a session Claude Code actually ran.
+ALLOW_SIDS=("$SID" "$PC_SID" "$PC2_SID" "$RACE_SID" "$BIG_SID" "$PARENT_SID")
 for r in $(seq 1 "$DISP_ROUNDS"); do
   ALLOW_SIDS+=( "disp-race-sid-$r" )
 done
@@ -646,17 +651,21 @@ done
 if find "$REFLECT_ROOT/sessions" -mindepth 1 -maxdepth 1 -type d \
      "${FIND_EXCL[@]}" \
      | grep -q .; then
-  fail "path traversal created unexpected session dir(s): $(find "$REFLECT_ROOT/sessions" -mindepth 1 -maxdepth 1 -type d "${FIND_EXCL[@]}")"
+  fail "path traversal (or the malformed bucket) created unexpected session dir(s): $(find "$REFLECT_ROOT/sessions" -mindepth 1 -maxdepth 1 -type d "${FIND_EXCL[@]}")"
 fi
-# _malformed bucket must exist and contain at least one error record.
-MALF_COUNT=$(find "$REFLECT_ROOT/sessions/_malformed" -type f -name '*.json' 2>/dev/null | wc -l)
-(( MALF_COUNT >= ${#BAD_SIDS[@]} )) || fail "expected >= ${#BAD_SIDS[@]} malformed records, got $MALF_COUNT"
+[[ ! -e "$REFLECT_ROOT/sessions/_malformed" ]] \
+  || fail "D2: the malformed bucket is back inside the sessions namespace — '_malformed' is not a session"
+# The bucket lives BESIDE sessions/ and must hold one error record per bad payload.
+MALF_DIR="$REFLECT_ROOT/malformed"
+MALF_COUNT=$(find "$MALF_DIR" -type f -name '*.json' 2>/dev/null | wc -l)
+(( MALF_COUNT >= ${#BAD_SIDS[@]} )) \
+  || fail "expected >= ${#BAD_SIDS[@]} malformed records under $MALF_DIR, got $MALF_COUNT"
 # Confirm no raw payload embedded (privacy) — records should carry sha256 only.
-if find "$REFLECT_ROOT/sessions/_malformed" -type f -name '*.json' -print0 \
+if find "$MALF_DIR" -type f -name '*.json' -print0 \
      | xargs -0 jq -e '.payload' >/dev/null 2>&1; then
   fail "malformed record leaks raw payload (should only carry payload_sha256)"
 fi
-info "path-traversal rejection OK (${MALF_COUNT} malformed records, no dir escape, no payload leak)"
+info "path-traversal rejection OK (${MALF_COUNT} malformed records in $MALF_DIR, outside sessions/, no dir escape, no payload leak)"
 
 # ============================================================================
 # TEST 7: --worker requires _REFLECT_INTERNAL=1 sentinel
@@ -1905,7 +1914,9 @@ rm -f "$B3H_PLANTED"
 #      name (reflect.sh's malformed-payload bucket used to live at
 #      sessions/_malformed) that passes is_valid_sid, so round 2's out-of-repo
 #      anchor was something a planted file could simply name. rc=0 here was the
-#      BLOCKER.
+#      BLOCKER. The bucket has since moved out of the sessions namespace (see
+#      TEST 6), so this fixture has to create the directory by hand — which is
+#      itself the point: the anchor is no longer minted for free.
 mkdir -p "$REFLECT_ROOT/sessions/_malformed"
 printf '%s\n' '<!-- written-against: sha=none ts=1786800000 sid=_malformed -->' \
   '# PLANTED' '## Next' '1. attacker work' > "$B3H_CWD/tasks/mission._malformed.md"

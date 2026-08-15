@@ -427,8 +427,13 @@ with no downstream consumer and are safe to prune on a cron.
 ## Failure modes
 
 - **Missing `session_id` or `transcript_path` in payload.** Writes an
-  error record under `sessions/_malformed/` containing only the payload
-  SHA-256 and length (no raw body) and exits 0. Never blocks the caller.
+  error record under `malformed/` — *beside* `sessions/`, not inside it —
+  containing only the payload SHA-256 and length (no raw body), and exits 0.
+  Never blocks the caller. It used to land in `sessions/_malformed/`, and
+  because `_malformed` satisfies `is_valid_sid` that turned one malformed hook
+  payload into a fixed, machine-created "session" any file could name. Nothing
+  authenticates on session directories now, but everything under `sessions/`
+  should be a session Claude Code actually ran.
 - **`session_id` fails safe-charset check (`^[A-Za-z0-9._-]{1,128}$`).**
   Same as above with `reason: "invalid_session_id"`. Rejects path
   traversal (`../evil`, `/abs/path`), spaces, newlines, control chars.

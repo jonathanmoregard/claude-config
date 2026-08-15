@@ -382,12 +382,31 @@ TRIGGER="$(extract trigger)"                # precompact-only
 CUSTOM_INSTR="$(extract custom_instructions)" # precompact-only
 
 # --- Malformed payload guard -------------------------------------------------
+# BUCKET LOCATION (D2). These records used to land in
+# `$REFLECT_ROOT/sessions/_malformed/`, i.e. INSIDE the per-session namespace
+# under a name that satisfies is_valid_sid. That made `_malformed` a fixed,
+# non-secret, machine-created "session" that anything could name — and the payload
+# authentication of the day treated the existence of `sessions/<sid>/` as proof
+# that this machine had run that session, so one malformed hook payload minted the
+# anchor for a planted `tasks/mission._malformed.md`.
+#
+# `_malformed` is not a session and does not belong in the sessions namespace.
+# It now lives beside it, at `$REFLECT_ROOT/malformed/`. Nothing in the current
+# design authenticates on session directories any more, but the namespace
+# confusion was the enabling half of that bypass and is worth removing on its own
+# terms: everything under `sessions/` is now something Claude Code actually ran.
+#
+# Hardcoded, deliberately NOT an env override. There is one correct location for
+# these records; a knob to move them back inside `sessions/` would only be a knob
+# to reintroduce the bypass, and REFLECT_ROOT already relocates the whole tree for
+# hermetic tests.
 malformed_manifest() {
   # $1=reason
   local reason="$1"
-  mkdir -p "$REFLECT_ROOT/sessions/_malformed"
+  local malformed_dir="$REFLECT_ROOT/malformed"
+  mkdir -p "$malformed_dir"
   local err_manifest
-  err_manifest="$(mktemp -p "$REFLECT_ROOT/sessions/_malformed" ".manifest-XXXXXX.json")"
+  err_manifest="$(mktemp -p "$malformed_dir" ".manifest-XXXXXX.json")"
   local sha len
   sha="$(printf '%s' "$PAYLOAD" | sha256sum | awk '{print $1}')"
   len="${#PAYLOAD}"
