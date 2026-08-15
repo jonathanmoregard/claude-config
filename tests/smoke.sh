@@ -1163,6 +1163,238 @@ grep -q "unparseable started_at" "$CORRUPT_STDERR" \
 info "corrupt started_at keeps in-flight state (no phantom reap), warns to stderr"
 
 # ============================================================================
+# TEST 15: D1 — detached worker survives teardown of the PARENT'S CGROUP
+# ============================================================================
+# Root cause of the 124 orphaned `status:started` manifests. `setsid nohup … &`
+# escapes SIGHUP and the controlling terminal but NOT the parent's cgroup.
+# Claude Code exits within seconds of SessionEnd; the cgroup teardown that
+# follows SIGKILLs everything still inside it, worker included, before it can
+# write any terminal status. Forensic signature in the corpus: 0-byte
+# `<sid>-sessionend.worker.stderr.log`, NO `.stdout.log` at all, log mtime ==
+# manifest started_at.
+#
+# Repro: run the dispatcher inside a transient systemd --user SERVICE (default
+# KillMode=control-group). `--wait` returns when the dispatcher exits, at which
+# point systemd tears the unit's cgroup down. Pre-fix: no final.json, manifest
+# stuck at started, 0-byte log. Post-fix: the worker lives in its own transient
+# unit and completes.
+echo "TEST 15: D1 — detached worker survives parent cgroup teardown"
+if command -v systemd-run >/dev/null 2>&1 \
+   && systemctl --user is-active default.target >/dev/null 2>&1; then
+  # Slow stub: the worker must still be mid-claude-call when the parent's
+  # cgroup is torn down, otherwise the test would pass for the wrong reason.
+  cat >"$STUB_SCRATCH/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null || true
+sleep 4
+cat <<'JSON'
+{"type":"result","result":"{\"patterns\":[\"survived-cgroup-teardown\"],\"discoveries\":[],\"turning_points\":[],\"digressions\":[],\"obstacles_to_autonomy\":[]}","usage":{}}
+JSON
+STUB
+  chmod +x "$STUB_SCRATCH/claude"
+
+  CG_SID="test-sid-cgroup-teardown"
+  CG_PAYLOAD_FILE="$STUB_SCRATCH/cgroup-payload.json"
+  fake_payload SessionEnd "$CG_SID" > "$CG_PAYLOAD_FILE"
+
+  set +e
+  systemd-run --user --wait --collect --quiet --unit="reflect-smoke-cgroup-$$" \
+    --setenv=PATH="$PATH" \
+    --setenv=HOME="$HOME" \
+    --setenv=XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
+    --setenv=DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}" \
+    --setenv=REFLECT_ROOT="$REFLECT_ROOT" \
+    --setenv=REFLECT_MODEL="$REFLECT_MODEL" \
+    -- bash -c "bash '$REFLECT_SH' sessionend < '$CG_PAYLOAD_FILE'" \
+    >/dev/null 2>&1
+  cg_rc=$?
+  set -e
+  (( cg_rc == 0 )) || fail "cgroup-teardown harness unit failed (rc=$cg_rc)"
+
+  CG_MANIFEST="$REFLECT_ROOT/sessions/$CG_SID/manifest.json"
+  CG_FINAL="$REFLECT_ROOT/sessions/$CG_SID/final.json"
+  for _ in $(seq 1 60); do
+    [[ -f "$CG_FINAL" ]] && \
+      jq -e '.modes.sessionend.final_complete == true' "$CG_MANIFEST" >/dev/null 2>&1 && break
+    sleep 0.5
+  done
+  [[ -f "$CG_FINAL" ]] \
+    || fail "D1: worker died with the parent's cgroup — no final.json (manifest: $(jq -c '.modes.sessionend | {status,spawn_method}' "$CG_MANIFEST" 2>/dev/null))"
+  jq -e '.modes.sessionend.status == "complete"' "$CG_MANIFEST" >/dev/null \
+    || fail "D1: expected modes.sessionend.status=complete after cgroup teardown (got $(jq -r '.modes.sessionend.status' "$CG_MANIFEST"))"
+  # The spawn path actually taken must be recorded for forensics.
+  CG_METHOD=$(jq -r '.modes.sessionend.spawn_method // ""' "$CG_MANIFEST")
+  [[ "$CG_METHOD" == "systemd-run" ]] \
+    || fail "D1: expected spawn_method=systemd-run, got '$CG_METHOD'"
+  jq -e '.modes.sessionend.spawn_unit != null' "$CG_MANIFEST" >/dev/null \
+    || fail "D1: spawn_unit not recorded in manifest"
+  info "worker survived cgroup teardown (spawn_method=$CG_METHOD, unit recorded)"
+else
+  info "skipped: no systemd --user session available on this host"
+fi
+
+# ============================================================================
+# TEST 15b: D1 — graceful degradation when systemd-run is unavailable
+# ============================================================================
+# systemd-run --user must not become a hard dependency: on a host with no user
+# bus (busless cron, container without a user manager) the dispatcher has to
+# fall back to the old setsid spawn rather than lose the reflection entirely,
+# and record which path it took.
+echo "TEST 15b: D1 — setsid fallback when systemd-run is disabled"
+cat >"$STUB_SCRATCH/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null || true
+cat <<'JSON'
+{"type":"result","result":"{\"patterns\":[\"setsid-fallback\"],\"discoveries\":[],\"turning_points\":[],\"digressions\":[],\"obstacles_to_autonomy\":[]}","usage":{}}
+JSON
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+FB_SID="test-sid-setsid-fallback"
+FB_PAYLOAD="$(fake_payload SessionEnd "$FB_SID")"
+echo "$FB_PAYLOAD" | REFLECT_NO_SYSTEMD_RUN=1 bash "$REFLECT_SH" sessionend
+rc=$?
+(( rc == 0 )) || fail "fallback-path sessionend exit=$rc"
+
+FB_MANIFEST="$REFLECT_ROOT/sessions/$FB_SID/manifest.json"
+wait_for_complete "$FB_MANIFEST" 15 \
+  || fail "D1 fallback: sessionend never completed with systemd-run disabled"
+[[ -f "$REFLECT_ROOT/sessions/$FB_SID/final.json" ]] \
+  || fail "D1 fallback: final.json missing"
+FB_METHOD=$(jq -r '.modes.sessionend.spawn_method // ""' "$FB_MANIFEST")
+[[ "$FB_METHOD" == "setsid" ]] \
+  || fail "D1 fallback: expected spawn_method=setsid, got '$FB_METHOD'"
+info "setsid fallback completed the reflection and recorded spawn_method=setsid"
+
+# ============================================================================
+# TEST 16: D3 — internal budget must always beat the external 60s hook cap
+# ============================================================================
+# Claude Code's hook timeout is a HARD 60s (cli.js: `timeout ? q.timeout*1000 :
+# 60000`, settings schema `.max(60000)`), and it kills by signal — no terminal
+# status gets written. The internal budget used to be 60s too, i.e. a coin flip:
+# observed both a clean internal `status:timeout` at 61s and external SIGKILLs
+# leaving `status:started` with 0-byte logs.
+echo "TEST 16: D3 — budget arithmetic keeps the synchronous path under the cap"
+BUDGETS_JSON="$(bash "$REFLECT_SH" --budgets)"
+jq -e '.hook_cap_seconds == 60' <<<"$BUDGETS_JSON" >/dev/null \
+  || fail "D3: --budgets should report the hard 60s hook cap"
+jq -e '.budgets.precompact < .hook_cap_seconds' <<<"$BUDGETS_JSON" >/dev/null \
+  || fail "D3: precompact budget must be strictly below the hook cap (got $(jq -c '.budgets' <<<"$BUDGETS_JSON"))"
+# Worst case = budget + SIGKILL grace + dispatcher/manifest reserve.
+jq -e '.precompact_worst_case_seconds ==
+       (.budgets.precompact + .kill_grace_seconds + .reserve_seconds)' <<<"$BUDGETS_JSON" >/dev/null \
+  || fail "D3: worst-case arithmetic inconsistent"
+jq -e '.precompact_worst_case_seconds <= .hook_cap_seconds' <<<"$BUDGETS_JSON" >/dev/null \
+  || fail "D3: worst case $(jq -r '.precompact_worst_case_seconds' <<<"$BUDGETS_JSON")s exceeds the 60s cap — external SIGKILL can still win"
+# Margin must be real, not zero-width.
+jq -e '(.hook_cap_seconds - .precompact_worst_case_seconds) >= 3' <<<"$BUDGETS_JSON" >/dev/null \
+  || fail "D3: margin below the cap is under 3s"
+info "budgets: precompact=$(jq -r '.budgets.precompact' <<<"$BUDGETS_JSON")s worst-case=$(jq -r '.precompact_worst_case_seconds' <<<"$BUDGETS_JSON")s cap=60s"
+
+# ...and empirically: when the model hangs, the INTERNAL timeout fires and a
+# TERMINAL status is written. Budgets are scaled down via env so the assertion
+# costs seconds instead of a minute; the shipped defaults are covered above.
+echo "TEST 16b: D3 — hung model yields a terminal status inside the budget"
+cat >"$STUB_SCRATCH/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null || true
+sleep 120
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+HANG_SID="test-sid-hung-model"
+HANG_PAYLOAD=$(jq -cn --arg sid "$HANG_SID" --arg tp "$TRANSCRIPT" --arg cwd "$TEST_CWD" \
+  '{session_id:$sid,transcript_path:$tp,hook_event_name:"PreCompact",cwd:$cwd,trigger:"auto"}')
+t0=$(date +%s%N)
+echo "$HANG_PAYLOAD" | REFLECT_BUDGET_PRECOMPACT=3 REFLECT_KILL_GRACE_SECONDS=2 \
+  bash "$REFLECT_SH" precompact
+rc=$?
+t1=$(date +%s%N)
+hang_ms=$(( (t1 - t0) / 1000000 ))
+(( rc == 0 )) || fail "D3: hung-model precompact exit=$rc"
+(( hang_ms < 9000 )) \
+  || fail "D3: precompact took ${hang_ms}ms with a 3s budget — internal timeout did not win"
+HANG_MANIFEST="$REFLECT_ROOT/sessions/$HANG_SID/manifest.json"
+jq -e '.modes.precompact.status == "timeout"' "$HANG_MANIFEST" >/dev/null \
+  || fail "D3: expected terminal modes.precompact.status=timeout (got $(jq -r '.modes.precompact.status' "$HANG_MANIFEST"))"
+jq -e '.modes.precompact.completed_at != null' "$HANG_MANIFEST" >/dev/null \
+  || fail "D3: terminal status must carry completed_at"
+info "hung model: internal timeout won in ${hang_ms}ms, terminal status written"
+
+# ============================================================================
+# TEST 17: D2 — the 2nd-compact mission pre-fire must not run in the hook
+# ============================================================================
+# reflect.sh ran `mission` mode SYNCHRONOUSLY inside the PreCompact hook before
+# the precompact worker's own budget: two full model calls back-to-back, measured
+# at 121s of in-hook wall time against the hard 60s cap — a guaranteed kill on
+# every 2nd-and-later compaction of a session. Fix: the pre-fire detaches
+# (REFLECT_ASYNC=1), so the hook pays only for the hand-off while the mission
+# artifact is still produced.
+echo "TEST 17: D2 — mission pre-fire is detached, in-hook time stays bounded"
+# 6s stub: long enough that a SYNCHRONOUS mission call dominates the measurement.
+cat >"$STUB_SCRATCH/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null || true
+sleep 6
+cat <<'JSON'
+{"type":"result","result":"# Mission — stub\n\n## Done\n- nothing\n\n## Next\n- nothing\n","usage":{}}
+JSON
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+D2_SID="test-sid-second-compact"
+D2_CWD="$(mktemp -d -t reflect-d2cwd-XXXXXX)"
+assert_isolated_cwd "$D2_CWD"
+# Pretend one PreCompact already fired this session, so this fire takes the
+# 2nd-compact branch that pre-fires mission mode.
+mkdir -p "$REFLECT_ROOT/compact-counts"
+echo 1 > "$REFLECT_ROOT/compact-counts/$D2_SID"
+D2_PAYLOAD=$(jq -cn --arg sid "$D2_SID" --arg tp "$TRANSCRIPT" --arg cwd "$D2_CWD" \
+  '{session_id:$sid,transcript_path:$tp,hook_event_name:"PreCompact",cwd:$cwd,trigger:"auto"}')
+
+t0=$(date +%s%N)
+echo "$D2_PAYLOAD" | REFLECT_BUDGET_PRECOMPACT=1 REFLECT_KILL_GRACE_SECONDS=1 \
+  bash "$REFLECT_SH" precompact
+rc=$?
+t1=$(date +%s%N)
+d2_ms=$(( (t1 - t0) / 1000000 ))
+(( rc == 0 )) || fail "D2: 2nd-compact precompact exit=$rc"
+# Synchronous pre-fire would add the stub's full 6s call on top of the
+# precompact worker; detached costs only the hand-off.
+(( d2_ms < 5000 )) \
+  || fail "D2: 2nd PreCompact blocked the hook for ${d2_ms}ms — mission pre-fire is still synchronous"
+
+D2_MANIFEST="$REFLECT_ROOT/sessions/$D2_SID/manifest.json"
+D2_METHOD=$(jq -r '.modes.mission.spawn_method // ""' "$D2_MANIFEST")
+[[ "$D2_METHOD" == "systemd-run" || "$D2_METHOD" == "setsid" ]] \
+  || fail "D2: mission pre-fire should be detached, spawn_method='$D2_METHOD'"
+
+# The artifact must STILL be produced — async, not abandoned.
+for _ in $(seq 1 80); do
+  [[ -f "$D2_CWD/tasks/mission.md" ]] && \
+    jq -e '.modes.mission.status == "complete"' "$D2_MANIFEST" >/dev/null 2>&1 && break
+  sleep 0.25
+done
+[[ -f "$D2_CWD/tasks/mission.md" ]] \
+  || fail "D2: detached mission pre-fire never wrote $D2_CWD/tasks/mission.md"
+jq -e '.modes.mission.status == "complete"' "$D2_MANIFEST" >/dev/null \
+  || fail "D2: modes.mission.status != complete (got $(jq -r '.modes.mission.status' "$D2_MANIFEST"))"
+grep -q '^<!-- written-against: sha=' "$D2_CWD/tasks/mission.md" \
+  || fail "D2: mission artifact missing provenance stamp"
+assert_repo_tasks_untouched "after TEST 17 (async mission pre-fire)"
+info "2nd PreCompact returned in ${d2_ms}ms; mission artifact written asynchronously (spawn_method=$D2_METHOD)"
+
+# Restore canonical stub.
+cat >"$STUB_SCRATCH/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null || true
+cat <<'JSON'
+{"type":"result","result":"{\"patterns\":[\"stubbed pattern\"],\"discoveries\":[],\"turning_points\":[],\"digressions\":[],\"obstacles_to_autonomy\":[]}","usage":{"cache_read_input_tokens":100,"cache_creation_input_tokens":10,"input_tokens":5,"output_tokens":50}}
+JSON
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+# ============================================================================
 # FINAL GUARD: prove the whole suite left the live repo alone.
 assert_repo_tasks_untouched "end of suite"
 info "live repo tasks/ untouched by the full suite"

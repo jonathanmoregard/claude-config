@@ -22,6 +22,50 @@ _REFLECT_LIB_SOURCED=1
 # 6-7 to absorb API-latency spikes without prematurely reaping a live worker.
 : "${REFLECT_STALE_STARTED_SECONDS:=600}"
 
+# --- Timeout budgets vs Claude Code's HARD hook cap (D3) ---------------------
+# Claude Code caps every `command` hook at 60s and the cap is NOT configurable
+# from settings.json: the bundled cli.js computes `timeout ? q.timeout*1000 :
+# 60000` and the settings schema clamps `timeout` with `.max(60000)`. When the
+# cap fires, Claude Code SIGKILLs the hook's process group — no terminal status
+# is written, which is how the corpus accumulated orphaned `status:started`
+# manifests.
+#
+# The internal `timeout -k <grace> <budget>` must therefore ALWAYS win the race
+# against the external cap, so every synchronous run ends in a manifest write we
+# control. Margin arithmetic for the only synchronous-in-hook mode (precompact):
+#
+#     budget (40) + kill grace (10) + reserve (5) = 55s  <=  cap (60s)
+#
+#   * kill grace: `timeout -k 10` SIGKILLs 10s after SIGTERM, so worst-case
+#     wall time for the claude call is budget + grace, not budget.
+#   * reserve: dispatcher startup, jq/manifest writes, the async mission
+#     pre-fire hand-off, and the post-timeout write_manifest. Measured at
+#     ~0.3-0.8s on this host; 5s is ~6x headroom for a loaded machine.
+#   * 5s of slack remains between 55s and the cap — enough that the internal
+#     timeout wins even under heavy I/O contention, small enough that we do
+#     not needlessly shorten the model's thinking time.
+#
+# sessionend/subagentstop/async-mission run detached (off the hook clock), so
+# their budgets are bounded only by usefulness, not by the cap.
+: "${REFLECT_HOOK_CAP_SECONDS:=60}"
+: "${REFLECT_KILL_GRACE_SECONDS:=10}"
+: "${REFLECT_BUDGET_RESERVE_SECONDS:=5}"
+: "${REFLECT_BUDGET_PRECOMPACT:=40}"
+: "${REFLECT_BUDGET_SESSIONEND:=90}"
+: "${REFLECT_BUDGET_SUBAGENTSTOP:=40}"
+: "${REFLECT_BUDGET_MISSION:=60}"
+
+# reflect_budget_for <mode> — effective timeout budget in seconds.
+reflect_budget_for() {
+  case "${1:-}" in
+    precompact)   printf '%s' "$REFLECT_BUDGET_PRECOMPACT" ;;
+    sessionend)   printf '%s' "$REFLECT_BUDGET_SESSIONEND" ;;
+    subagentstop) printf '%s' "$REFLECT_BUDGET_SUBAGENTSTOP" ;;
+    mission)      printf '%s' "$REFLECT_BUDGET_MISSION" ;;
+    *)            printf '%s' "$REFLECT_BUDGET_SUBAGENTSTOP" ;;
+  esac
+}
+
 # --- Boolean env normalization (used by REFLECT_FORCE and friends) -----------
 # Truthy: 1, true, yes, on (case-insensitive). Anything else = false.
 reflect_truthy() {
@@ -378,6 +422,38 @@ is_already_complete() {
 # We provide the primitives directly; call sites use flock inline for
 # readability.
 
+# --- Detached-spawn capability probe (D1) ------------------------------------
+# reflect_can_systemd_run — 0 when `systemd-run --user` can actually queue a
+# transient unit here.
+#
+# WHY: `setsid nohup … &` escapes SIGHUP and the controlling terminal but NOT
+# the parent's cgroup. Claude Code exits seconds after SessionEnd; when its
+# cgroup is torn down (KillMode=control-group is the systemd default) every
+# descendant still inside it is SIGKILLed — including a detached reflection
+# worker. Forensic signature in the live corpus: 0-byte
+# `<sid>-<mode>.worker.stderr.log`, no `.stdout.log` at all, and log mtime ==
+# manifest `started_at`. `scripts/idle-handoff.sh` hit the identical bug and
+# solved it with a transient unit; this is that fix back-ported.
+#
+# A transient `systemd-run --user` unit lives in its OWN cgroup under the user
+# manager, so it is unaffected by the caller's teardown.
+#
+# Degrade gracefully: no systemd-run binary, no user bus (busless cron,
+# non-login ssh, container without a user manager) or an explicit
+# REFLECT_NO_SYSTEMD_RUN=1 override all fall back to the old setsid spawn —
+# losing cgroup survival is strictly better than losing the reflection.
+reflect_can_systemd_run() {
+  if reflect_truthy "${REFLECT_NO_SYSTEMD_RUN:-}"; then
+    return 1
+  fi
+  command -v systemd-run >/dev/null 2>&1 || return 1
+  systemctl --user is-active default.target >/dev/null 2>&1 || return 1
+  # Probe rather than infer: `systemd-run --user` can still fail with a live
+  # default.target if the bus socket is unreachable from this process.
+  systemd-run --user --collect --no-block \
+    --unit="reflect-probe-$$-${RANDOM}" -- true >/dev/null 2>&1 || return 1
+  return 0
+}
 
 # --- Best-effort parent-SID discovery for subagents --------------------------
 # find_parent_session_id <subagent_sid> <cwd> <transcript_path>

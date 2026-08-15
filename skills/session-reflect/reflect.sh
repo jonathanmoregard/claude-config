@@ -122,19 +122,56 @@ Env:
   REFLECT_FORCE                    1|true|yes|on -> bypass idempotency guard
   REFLECT_STALE_STARTED_SECONDS    Reap stuck status=started manifests older
                                    than this many seconds (default: 600).
+  REFLECT_ASYNC                    mission mode only: detach the worker instead
+                                   of running it synchronously. Used by the
+                                   2nd-compact pre-fire so the mission model
+                                   call does not eat the 60s hook cap.
+  REFLECT_NO_SYSTEMD_RUN           1|true|yes|on -> never use systemd-run for
+                                   detached workers; force the setsid fallback.
+  REFLECT_BUDGET_<MODE>            Override a mode's timeout budget in seconds
+                                   (PRECOMPACT/SESSIONEND/SUBAGENTSTOP/MISSION).
+  REFLECT_REAP_MAX_PER_RUN         Max manifests the orphan reaper examines per
+                                   detached-worker run (default: 200).
   CLAUDE_PARENT_SESSION_ID         If set by Claude Code in a SubagentStop
                                    hook env, nest subagent artifacts under
                                    this parent. Validated against safe charset.
   _REFLECT_INTERNAL                Sentinel required to enter --worker re-entry path
 
 Modes:
-  precompact    synchronous, 60s budget, numbered checkpoint under checkpoints/
-  sessionend    detached worker, 90s internal budget, writes final.json
-  subagentstop  detached worker, 40s internal budget, nests under parent/subagents/
-  mission       synchronous, 60s budget, writes <cwd>/tasks/mission.md (markdown)
+  precompact    synchronous, ${REFLECT_BUDGET_PRECOMPACT}s budget, numbered checkpoint under checkpoints/
+  sessionend    detached worker, ${REFLECT_BUDGET_SESSIONEND}s internal budget, writes final.json
+  subagentstop  detached worker, ${REFLECT_BUDGET_SUBAGENTSTOP}s internal budget, nests under parent/subagents/
+  mission       synchronous (detached with REFLECT_ASYNC=1), ${REFLECT_BUDGET_MISSION}s budget,
+                writes <cwd>/tasks/mission.md (markdown)
+
+Introspection:
+  --budgets     print the effective timeout budgets + hook-cap arithmetic as JSON
 
 See README.md at ~/.claude/skills/session-reflect/README.md
 EOF
+  exit 0
+fi
+
+# --- Budget introspection ----------------------------------------------------
+# Machine-readable view of the timeout arithmetic so the test suite can assert
+# the shipped defaults keep the synchronous path under Claude Code's hard,
+# unconfigurable 60s hook cap (D3) without waiting out a real timeout.
+if [[ "$ARG1" == "--budgets" ]]; then
+  jq -n \
+    --argjson cap "$REFLECT_HOOK_CAP_SECONDS" \
+    --argjson grace "$REFLECT_KILL_GRACE_SECONDS" \
+    --argjson reserve "$REFLECT_BUDGET_RESERVE_SECONDS" \
+    --argjson precompact "$(reflect_budget_for precompact)" \
+    --argjson sessionend "$(reflect_budget_for sessionend)" \
+    --argjson subagentstop "$(reflect_budget_for subagentstop)" \
+    --argjson mission "$(reflect_budget_for mission)" \
+    '{hook_cap_seconds:$cap,
+      kill_grace_seconds:$grace,
+      reserve_seconds:$reserve,
+      budgets:{precompact:$precompact,sessionend:$sessionend,
+               subagentstop:$subagentstop,mission:$mission},
+      synchronous_modes:["precompact"],
+      precompact_worst_case_seconds:($precompact + $grace + $reserve)}'
   exit 0
 fi
 
@@ -158,6 +195,15 @@ if [[ "$ARG1" == "--worker" ]]; then
   : "${SESSION_ID:?worker missing SESSION_ID}"
   : "${TRANSCRIPT_PATH:?worker missing TRANSCRIPT_PATH}"
   : "${manifest_path:?worker missing manifest_path}"
+  # Optional state. Under the old `setsid` spawn these arrived as exported-but-
+  # empty vars; a transient systemd unit gets an explicitly-built environment, so
+  # default them here or `set -u` kills the worker AFTER it has already paid for
+  # the model call (observed: rc=1 at the first PARENT_SID reference, with the
+  # claude reply already on disk in the .stdout.log).
+  : "${PARENT_SID:=}"
+  : "${HOOK_EVENT:=}"
+  : "${CWD:=}"
+  : "${TRIGGER:=}"
   # Defense in depth: re-validate the SID we're about to write paths under.
   if ! is_valid_sid "$SESSION_ID"; then
     echo "reflect.sh: worker refuses invalid SESSION_ID" >&2
@@ -168,6 +214,30 @@ if [[ "$ARG1" == "--worker" ]]; then
     exit 2
   fi
   # PARENT_SID may be empty; HOOK_EVENT may be empty; that's fine.
+
+  # --- Worker-held per-mode lock (D1 consequence) ----------------------------
+  # Before D1 the worker INHERITED fd 9 from the dispatcher, which kept the
+  # per-mode flock alive across the whole claude call (that is what stops a
+  # second dispatcher from spawning a racing worker once the stale-reaper
+  # window has expired — see TEST 13). A transient systemd unit cannot inherit
+  # file descriptors from its caller, so the worker now acquires the lock
+  # itself on the path the dispatcher hands over in REFLECT_LOCKFILE.
+  #
+  # Blocking-with-timeout, not -n: the dispatcher still holds the lock for the
+  # few milliseconds between queueing this worker and its own exit, so a
+  # non-blocking attempt would lose the race with the dispatcher that spawned
+  # us and drop the reflection entirely. 5s is ~25x that hand-off window.
+  # If the wait times out, some OTHER worker for this mode genuinely owns the
+  # lock — leave it alone and exit quietly (its terminal write is the one that
+  # counts; the reaper covers the pathological case).
+  if [[ -n "${REFLECT_LOCKFILE:-}" ]]; then
+    if exec 9>"$REFLECT_LOCKFILE"; then
+      if ! flock -w 5 9; then
+        echo "reflect.sh: worker could not acquire $REFLECT_LOCKFILE within 5s; another worker owns this mode" >&2
+        exit 0
+      fi
+    fi
+  fi
 fi
 
 MODE="${MODE:-$ARG1}"
@@ -488,14 +558,11 @@ run_worker() {
   local worker_log="$REFLECT_LOG_DIR/${SESSION_ID}-${MODE}-${worker_ts}.stderr.log"
   local worker_out="$REFLECT_LOG_DIR/${SESSION_ID}-${MODE}-${worker_ts}.stdout.log"
 
-  # Timeout budget per mode.
+  # Timeout budget per mode. Values + the hook-cap arithmetic that constrains
+  # the synchronous precompact path live in lib.sh (see "Timeout budgets vs
+  # Claude Code's HARD hook cap"); `reflect.sh --budgets` prints them.
   local budget
-  case "$MODE" in
-    precompact)   budget=60 ;;
-    subagentstop) budget=40 ;;
-    sessionend)   budget=90 ;;
-    mission)      budget=60 ;;
-  esac
+  budget="$(reflect_budget_for "$MODE")"
 
   # Build and run.
   #
@@ -540,7 +607,7 @@ run_worker() {
   # TERM forever, and since this timeout puts claude in a new process
   # group, any OUTER timeout wrapping this dispatcher (e.g. idle-handoff's
   # `timeout 90`) cannot reach into the group to kill it. Advisor P1R3.
-  claude_json=$(cd "$resume_cwd" && timeout -k 10 "$budget" env \
+  claude_json=$(cd "$resume_cwd" && timeout -k "$REFLECT_KILL_GRACE_SECONDS" "$budget" env \
     REFLECT_SUBPROCESS=1 \
     REFLECT_PARENT_SID="$SESSION_ID" \
     claude \
@@ -817,6 +884,90 @@ run_worker() {
 }
 
 # ============================================================================
+# DETACHED SPAWN (D1)
+# ============================================================================
+# spawn_detached_worker — hand the worker off to a process that OUTLIVES this
+# dispatcher's cgroup.
+#
+# The old spawn was `setsid env … nohup bash … &`. setsid detaches the
+# controlling terminal and nohup ignores SIGHUP, but neither escapes the
+# parent's CGROUP. Claude Code exits within seconds of SessionEnd; when its
+# cgroup is torn down the kernel SIGKILLs everything still in it, worker
+# included — before the worker even reaches its first write. That is the source
+# of the 124 orphaned `status:started` manifests (0-byte worker stderr log, no
+# stdout log, log mtime == started_at).
+#
+# `systemd-run --user --collect --no-block` asks the user manager to create a
+# fresh transient unit in its OWN cgroup, so the worker is structurally immune
+# to the caller's teardown. Same fix `scripts/idle-handoff.sh` already carries
+# for its autofork spawn; this back-ports it.
+#
+# Preserved from the old spawn: the _REFLECT_INTERNAL sentinel, every env var
+# the worker reads, the log path, and run_worker's resume-cwd handling.
+# Transient units do NOT inherit the caller's environment, so each var is
+# passed explicitly with --setenv (missing/empty ones are skipped).
+#
+# Reads:  SPAWN_METHOD, SPAWN_UNIT, MODE, WORKER_STDERR, SCRIPT_DIR, CWD
+# Writes: SPAWN_METHOD (set to setsid_fallback if the systemd hand-off fails)
+spawn_detached_worker() {
+  local wd="${CWD:-}"
+  if [[ -z "$wd" || ! -d "$wd" ]]; then
+    wd="$HOME"
+  fi
+
+  if [[ "$SPAWN_METHOD" == "systemd-run" ]]; then
+    local -a setenv_args=( "--setenv=_REFLECT_INTERNAL=1" )
+    local v val
+    for v in SESSION_ID PARENT_SID TRANSCRIPT_PATH HOOK_EVENT MODE CWD \
+             REFLECT_MODEL REFLECT_ROOT REFLECT_LOG_DIR REFLECT_LOCKFILE \
+             REFLECT_STALE_STARTED_SECONDS REFLECT_REAP_MAX_PER_RUN \
+             REFLECT_NO_SYSTEMD_RUN REFLECT_KILL_GRACE_SECONDS \
+             REFLECT_BUDGET_PRECOMPACT REFLECT_BUDGET_SESSIONEND \
+             REFLECT_BUDGET_SUBAGENTSTOP REFLECT_BUDGET_MISSION \
+             session_dir final_path manifest_path checkpoint_dir SCRIPT_DIR \
+             HOME PATH USER LANG LC_ALL LC_CTYPE XDG_RUNTIME_DIR \
+             ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN \
+             HTTPS_PROXY HTTP_PROXY NO_PROXY; do
+      # Pass every var that is SET, including set-but-empty ones: the worker
+      # runs under `set -u` and reads several of these unguarded, so "absent"
+      # and "empty" are not interchangeable. Only genuinely-unset vars (e.g. no
+      # ANTHROPIC_API_KEY on an OAuth host) are skipped.
+      [[ -n "${!v+set}" ]] && setenv_args+=( "--setenv=${v}=${!v}" )
+    done
+    if systemd-run --user --collect --no-block --unit="$SPAWN_UNIT" \
+         --working-directory="$wd" \
+         "${setenv_args[@]}" \
+         --property="StandardOutput=append:${WORKER_STDERR}" \
+         --property="StandardError=append:${WORKER_STDERR}" \
+         -- bash "$SCRIPT_DIR/reflect.sh" --worker "$MODE" \
+         >>"$WORKER_STDERR" 2>&1; then
+      # --no-block returns on QUEUE, not on START: an async start failure is
+      # invisible here and --collect erases the unit afterwards, so the unit
+      # name recorded in the manifest is the operator's only handle.
+      return 0
+    fi
+    SPAWN_METHOD="setsid_fallback"
+    printf '[session-reflect] systemd-run hand-off failed (sid=%s mode=%s unit=%s); falling back to setsid\n' \
+      "$SESSION_ID" "$MODE" "$SPAWN_UNIT" >&2
+  fi
+
+  # Fallback spawn: no systemd user manager reachable (busless cron, container,
+  # REFLECT_NO_SYSTEMD_RUN=1) or the hand-off above failed. Worker may still die
+  # with the parent's cgroup — strictly better than dropping the reflection.
+  #
+  # `9>&-` closes the inherited per-mode lock fd in the child so that BOTH spawn
+  # paths have identical lock semantics: the worker acquires the lock itself from
+  # REFLECT_LOCKFILE (see the worker preamble) rather than inheriting it.
+  setsid env _REFLECT_INTERNAL=1 nohup bash "$SCRIPT_DIR/reflect.sh" --worker "$MODE" \
+    </dev/null \
+    >>"$WORKER_STDERR" 2>&1 \
+    9>&- \
+    &
+  disown
+  return 0
+}
+
+# ============================================================================
 # DISPATCH
 # ============================================================================
 if (( IS_WORKER == 1 )); then
@@ -824,6 +975,40 @@ if (( IS_WORKER == 1 )); then
   run_worker
   exit 0
 fi
+
+# --- Detachment decision (must precede the `started` write) -------------------
+# sessionend/subagentstop always detach. mission detaches only when the caller
+# asks for it (REFLECT_ASYNC=1 — the 2nd-compact pre-fire does; idle-handoff.sh
+# deliberately does NOT, because it reads modes.mission.status straight after
+# the call and needs the write to have landed).
+IS_DETACHED=0
+case "$MODE" in
+  sessionend|subagentstop)
+    IS_DETACHED=1
+    ;;
+  mission)
+    if reflect_truthy "${REFLECT_ASYNC:-}"; then
+      IS_DETACHED=1
+    fi
+    ;;
+esac
+
+# Which spawn path we will take, decided up-front so it lands in the `started`
+# manifest — "record which path was taken" is the only way to tell a
+# cgroup-immune run from a fallback run after the fact.
+SPAWN_METHOD="inline"
+SPAWN_UNIT=""
+if (( IS_DETACHED == 1 )); then
+  if reflect_can_systemd_run; then
+    SPAWN_METHOD="systemd-run"
+    SPAWN_UNIT="reflect-${MODE}-$(printf %s "$SESSION_ID" | tr -c 'A-Za-z0-9._-' '_')-$(date +%s%N)"
+  else
+    SPAWN_METHOD="setsid"
+  fi
+fi
+extra_json="$(jq -c --arg sm "$SPAWN_METHOD" --arg unit "$SPAWN_UNIT" \
+  '. + {spawn_method:$sm, spawn_unit:(if $unit == "" then null else $unit end)}' \
+  <<<"$extra_json")"
 
 # Write "started" manifest first so idempotency check + observers can see us.
 write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "started" "$extra_json"
@@ -838,28 +1023,26 @@ write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "started" "$extra_json"
 # one reflection.
 #
 # Fix (Approach C from Codex briefing): hold the per-mode lock for the
-# ENTIRE claude call, not just up to the `started` write. In our
-# architecture that means letting the detached worker INHERIT fd 9 rather
-# than closing it in the dispatcher. `flock(2)` locks are per-open-file-
-# description; both processes share the parent's `exec 9>` open file, so
-# once the dispatcher's fd is closed (dispatcher exit), the worker still
-# holds a reference and the lock persists until the worker exits.
+# ENTIRE claude call, not just up to the `started` write.
 #
-# Second dispatcher (fired within the reaper window with a live worker
-# still holding the lock) will `flock -n` on a fresh open file → EAGAIN →
-# writes skipped_concurrent to duplicates/. Correct — the earlier
-# is_already_complete check would have short-circuited it anyway, but the
-# defence-in-depth flock catches the race between is_already_complete's
-# read and the worker's not-yet-latched final_complete.
+# D1 UPDATE: the original mechanism was fd-9 INHERITANCE by the detached
+# child. A transient systemd unit cannot inherit fds from its caller, so the
+# mechanism moved one process to the right: the dispatcher exports
+# REFLECT_LOCKFILE and the WORKER acquires the same per-mode lock itself (see
+# the worker preamble near the top of this file), holding it across the whole
+# claude call + mv. Net effect on a second dispatcher is unchanged — its
+# `flock -n` fails while a worker owns the mode, so it writes
+# skipped_concurrent to duplicates/ instead of racing the mv. The only new
+# window is the millisecond hand-off between this dispatcher's exit and the
+# worker's acquisition, which the is_already_complete `started` check already
+# covers for any non-degenerate REFLECT_STALE_STARTED_SECONDS.
 #
 # For precompact (synchronous run inline below), the current process
 # retains fd 9 through run_worker naturally — no change needed.
-#
-# fd 9 is NOT closed here for sessionend/subagentstop. It's closed
-# implicitly when the DISPATCHER process exits after detach, but the
-# WORKER's inherited copy keeps the flock alive.
 
 # Export state the worker needs (safe for both sync + detached paths).
+# REFLECT_LOCKFILE is what lets the detached worker re-acquire this mode's lock.
+export REFLECT_LOCKFILE="$LOCKFILE"
 export SESSION_ID PARENT_SID TRANSCRIPT_PATH HOOK_EVENT MODE CWD
 export REFLECT_MODEL REFLECT_ROOT REFLECT_LOG_DIR
 export session_dir final_path manifest_path checkpoint_dir
@@ -884,24 +1067,37 @@ if [[ "$MODE" == "precompact" ]]; then
   printf '%d\n' "$compact_count" > "$compact_count_file" 2>/dev/null || true
 
   if (( compact_count > 1 )); then
-    # Pre-fire mission mode with the same payload. Nested reflect.sh call
-    # runs its own dispatch (different MODE) and writes tasks/mission.md
-    # synchronously. Do not fail this dispatcher if mission mode errors —
-    # a stuck mission.md write must not block the actual precompact
-    # reflection, which is more important than the handoff artifact.
-    # `env -u MODE`: parent already exported MODE=precompact for its own worker
-    # (line ~775); without unsetting it the nested bash inherits precompact via
+    # Pre-fire mission mode with the same payload. Nested reflect.sh call runs
+    # its own dispatch (different MODE) and writes tasks/mission.md. Do not
+    # fail this dispatcher if mission mode errors — a stuck mission.md write
+    # must not block the actual precompact reflection, which is more important
+    # than the handoff artifact.
+    #
+    # D2: REFLECT_ASYNC=1. This pre-fire used to run the mission model call
+    # SYNCHRONOUSLY inside the PreCompact hook, ahead of the precompact
+    # worker's own budget — measured at 121s of in-hook wall time against
+    # Claude Code's HARD, unconfigurable 60s cap (cli.js:
+    # `timeout ? q.timeout*1000 : 60000`, schema `.max(60000)`), i.e. a
+    # guaranteed SIGKILL on every 2nd-and-later compaction of a session. With
+    # REFLECT_ASYNC=1 the nested dispatcher detaches its worker (same
+    # cgroup-immune spawn as sessionend) and returns in milliseconds, so the
+    # mission artifact is still produced but the hook clock only pays for the
+    # hand-off. Verify with `--budgets`.
+    #
+    # `env -u MODE`: parent already exported MODE=precompact for its own worker;
+    # without unsetting it the nested bash inherits precompact via
     # `MODE="${MODE:-$ARG1}"` and silently re-runs precompact (getting flock-
     # skipped as skipped_concurrent). Unset in child only; parent's MODE unchanged.
-    printf '%s' "$PAYLOAD" | env -u MODE bash "$SCRIPT_DIR/reflect.sh" mission || true
+    printf '%s' "$PAYLOAD" \
+      | env -u MODE REFLECT_ASYNC=1 bash "$SCRIPT_DIR/reflect.sh" mission || true
   fi
 fi
 
-if [[ "$MODE" == "precompact" || "$MODE" == "mission" ]]; then
-  # Synchronous: precompact runs while session is still alive; mission
-  # runs from either the idle-timer (external) or the 2nd-compact defence
-  # (pre-compact synchronous) — either caller wants the write to finish
-  # before proceeding. Holds fd 9 through natural lock retention.
+if (( IS_DETACHED == 0 )); then
+  # Synchronous: precompact runs while the session is still alive; mission runs
+  # this way for the idle-timer caller (scripts/idle-handoff.sh reads
+  # modes.mission.status immediately after the call, so the write must have
+  # landed). Holds fd 9 through natural lock retention.
   run_worker
   exit 0
 fi
@@ -912,20 +1108,24 @@ if [[ "$MODE" == "sessionend" ]]; then
   rm -f -- "$REFLECT_ROOT/compact-counts/$SESSION_ID" 2>/dev/null || true
 fi
 
-# sessionend / subagentstop: fire-and-forget.
-# The nested bash re-sources lib.sh and re-runs the worker function via a
-# self-invocation flag. We use a helper `--worker` mode to keep it in one file.
-# _REFLECT_INTERNAL sentinel gates the --worker re-entry path.
+# Detached modes (sessionend / subagentstop / async mission): fire-and-forget.
+# The spawned process re-enters this script with `--worker <mode>`, re-sources
+# lib.sh and runs the worker function. The _REFLECT_INTERNAL sentinel gates that
+# re-entry path.
 WORKER_STDERR="$REFLECT_LOG_DIR/${SESSION_ID}-${MODE}.worker.stderr.log"
+# Pre-create at umask 077 so the log stays 0600 even when systemd (which would
+# otherwise create it 0644) opens it in append mode. `: >>` never truncates, so
+# a forced re-run keeps the prior run's forensic trail.
+: >>"$WORKER_STDERR" 2>/dev/null || true
 
-# Detach cleanly: setsid new session, nohup ignores SIGHUP, redirect
-# stdin/stdout/stderr but LEAVE fd 9 open so the child inherits the
-# per-mode lock. The child holding fd 9 keeps the flock alive across
-# the entire claude call + mv to final.json (STEP 3).
-setsid env _REFLECT_INTERNAL=1 nohup bash "$SCRIPT_DIR/reflect.sh" --worker "$MODE" \
-  </dev/null \
-  >>"$WORKER_STDERR" 2>&1 \
-  &
-disown
+spawn_detached_worker
+
+# Only re-write the manifest when the spawn path DIVERGED from what we recorded
+# pre-spawn (systemd hand-off failed → setsid fallback). Keeps the happy path at
+# a single manifest write while still leaving an accurate forensic record.
+if [[ "$SPAWN_METHOD" == "setsid_fallback" ]]; then
+  write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "started" \
+    "$(jq -c --arg sm "$SPAWN_METHOD" '. + {spawn_method:$sm}' <<<"$extra_json")"
+fi
 
 exit 0
