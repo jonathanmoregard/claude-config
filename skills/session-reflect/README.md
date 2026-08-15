@@ -231,79 +231,105 @@ the reaper contend with the very workers it exists to clean up after, and the
 alternative (a liveness probe per manifest) buys nothing the latch does not
 already guarantee.
 
-### Mission artifact layout
+### Mission handoff layout — the authoritative copy is out of every repo
 
 ```
-tasks/mission.<sid>.md   payload, unique per session (never collides) — AUTHORITATIVE
-tasks/mission.md         convenience symlink for humans and existence checks only
+$REFLECT_ROOT/sessions/<sid>/mission.md    AUTHORITATIVE handoff (outside every repo)
+$REFLECT_ROOT/sessions/<sid>/mission.cwd   which project that handoff is for
+tasks/mission.<sid>.md                     human-readable COPY; no automation reads it
+tasks/mission.md                           human convenience symlink to the copy
 ```
 
-**`tasks/mission.md` is never a read source for automation.** It is a convenience
-symlink; mission mode refuses to move it when a foreign or unstamped regular file
-owns that path, so it can legitimately hold an unrelated mission belonging to a
-human while our handoff sits in the suffixed payload. Every automated consumer
-resolves through `reflect.sh --mission-path`, which returns an **authenticated**
-payload or nothing — and "nothing" means do not act, never "read the pointer
-instead". An existence check may glob `tasks/mission*.md`.
+#### Why the handoff left the repo
 
-#### Payload authentication — why the stamp alone is not evidence
+Three successive attempts to make a **repo-resident** mission file trustworthy
+were each bypassed:
 
-The stamp is plain text in a file inside a git repo. It carries no secret, so repo
-content can forge it. Four printf lines in a cloned repo were once enough to make
-`--mission-path` resolve an attacker's `## Next` list, which
-`scripts/idle-handoff.sh` would then hand to an unattended
-`claude -p --permission-mode acceptEdits` fork. A guard inside the repo cannot fix
-that — the attacker owns the repo. So a payload must satisfy all four of:
+1. a one-line `written-against` stamp — plain text, no secret, forged by four
+   `printf` lines in any repo;
+2. stamp + filename sid + "`$REFLECT_ROOT/sessions/<sid>/` must exist" — bypassed,
+   because `reflect.sh` created `sessions/_malformed` on **any** malformed hook
+   payload and `_malformed` satisfies `is_valid_sid`, so the supposedly
+   unforgeable out-of-repo anchor was a fixed, non-secret, machine-created name a
+   planted `tasks/mission._malformed.md` could simply claim;
+3. an HMAC over the body would have been guard #3 on the same class.
 
-1. basename is `mission.<sid>.md` with a sid passing `is_valid_sid`
-2. line 1 carries our stamp **and that stamp names a `sid=`** (no longer optional)
-3. the stamp's sid equals the filename's sid
-4. `$REFLECT_ROOT/sessions/<sid>/` exists — the directory this machine created
-   when it actually ran that session, and the one thing repo content cannot
-   fabricate
+USER DECISION 2026-08-15: stop asking repo content to be trustworthy. The
+authoritative handoff moved to `$REFLECT_ROOT/sessions/<sid>/mission.md` — outside
+every checkout, not git-tracked, not writable by repo content. **The unattended
+fork reads only that file.** `reflect.sh --mission-path <project-dir>` returns it
+and never looks inside the project; the `mission.cwd` sidecar (also out of repo)
+is what maps a project to its handoff, so even the *lookup* consults no repo
+content.
 
-Every refusal is logged with its reason (`reflect: mission payload REFUSED — …`);
-`idle-handoff.sh` collects those in `idle-handoff-logs/mission-resolve.log`.
+Consequently there is **no repo-payload authentication left**, by design: a
+planted, forged, committed or tampered `tasks/mission.<sid>.md` is not a guarded
+case, it is a file nothing opens. Keeping the old four-condition check as belt and
+braces would have been dead code inviting someone to re-trust the copy later.
 
-The sid-less stamp shape survives for exactly two non-authentication decisions:
-preserving a pre-pointer regular `tasks/mission.md` before installing the pointer,
-and the GC safety rail (never delete a file that is not machine-written).
+There is deliberately **no accessor for the human copy** — nothing wants one. If a
+caller ever does, it must be a separate, clearly-named flag, never
+`--mission-path`.
 
-**Consequence in `idle-handoff.sh`, deliberate:** its git freshness gates exclude
-the pointer plus the specific payload paths that authenticated — never a
-`tasks/mission.*.md` glob. A mission-shaped file we did *not* write therefore
-stays visible to `git status --porcelain`, so it reads as "the world moved" and
-autofork denies. That is the intended trade: a payload that cannot be
-authenticated must not be able to hide tree changes from the gate meant to catch
-them, and DENY-when-uncheckable is this script's standing doctrine. Practical
-effect: an untracked payload from another machine parked in a project's `tasks/`
-suppresses autoforks there until it is removed.
+#### The human copy and its pointer
 
-The payload name embeds the session id, so a machine write can never land on a
-path a human owns. The pointer keeps `tasks/mission.md` — the path the
-`SessionStart` reinject hook tests and the documented handoff convention —
-working. The `<!-- written-against: sha=… ts=… sid=… -->` stamp no longer
-protects the payload; it only decides whether the pointer may move:
+Written after the authoritative handoff, best-effort: nothing automated reads them,
+so a read-only checkout or a foreign file at the pointer is recorded
+(`human_copy_error`, `refused_overwrite`) and never turns a successful handoff into
+a failure. The copy name embeds the session id, so a machine write can never land
+on a path a human owns; the pointer keeps `tasks/mission.md` — the path the
+`SessionStart` reinject hook tests and the documented handoff convention — working
+for humans.
 
 | existing `tasks/mission.md` | action |
 |---|---|
-| absent | write payload, create pointer |
-| symlink we own (incl. dangling) | write payload, repoint / repair |
-| regular file, our stamp | preserve it under its own sid, then repoint |
-| regular file, foreign or unstamped | payload only; leave it untouched, record the refusal |
+| absent | write copy, create pointer |
+| symlink we own (incl. dangling) | write copy, repoint / repair |
+| anything else (regular file, dir, fifo, foreign symlink) | copy only; leave it byte-identical, record the refusal |
 
-`bash reflect.sh --mission-path <project-dir>` resolves the current payload
-(pointer, else newest authenticated payload by mtime) and logs how it resolved, so
-a missing or dangling pointer never resolves silently. **Argument units differ by
-seam, on purpose:** `--mission-path` and `idle-handoff.sh:mission_resolve_ours`
-take the **project root** and append `/tasks` themselves, while
-`lib.sh:mission_resolve` / `mission_newest_payload` / `mission_gc` take the
-**tasks directory**. A mismatch fails closed — it simply finds no payloads — with
-only a stderr line to say so, which is why every one of those parameters is now
-named for its unit (`project_cwd` vs `tasks_dir`) at both ends. Payloads are
-garbage-collected once `reflections/sessions/<sid>/` is gone or they exceed
-`REFLECT_MISSION_RETENTION_DAYS`; the pointer target is always kept, and GC only
-ever touches files that both match `mission.<valid-sid>.md` and carry our stamp.
+A stamped regular file at the pointer is no longer moved aside: deciding that from
+its *contents* is exactly the repo-content trusting this design removed, and since
+nothing reads the pointer, refusing to install it costs nothing.
+
+Copies are garbage-collected once `reflections/sessions/<sid>/` is gone or they
+exceed `REFLECT_MISSION_RETENTION_DAYS` (30); the pointer target is always kept.
+GC only touches files that both match `mission.<valid-sid>.md` **and** carry our
+stamp — note that `notes` is a valid sid, so it is the stamp, not the name, that
+keeps a hand-authored `tasks/mission.notes.md` safe. That stamp check is a
+*delete* rail, not authentication.
+
+#### `idle-handoff.sh` git-freshness exclusions, re-derived
+
+The gate asks one question: has anything **other than us** changed this tree since
+the transcript? So it excludes exactly the two shapes this machine writes into a
+project, as a family:
+
+```
+:(exclude)tasks/mission.md
+:(exclude)tasks/mission.*.md
+```
+
+Both reasons matter. **Correctness:** older copies are retained by design (GC at
+30 days), so the previous narrow list — the pointer plus only the copy resolved on
+this tick — left every older untracked copy visible, `git status --porcelain` was
+never empty from the second handoff onwards, and autofork went inert in that
+project forever. **Safety:** the narrow list existed because a mission-shaped file
+used to be a read source, so hiding one could hide a planted `## Next`. Nothing
+reads these paths now, so the exclusion can only hide edits to files no consumer
+opens. Not excluded, deliberately: `tasks/handoff.md`, `tasks/progress.md`,
+`tasks/missionary.md`, or `tasks/` itself — a human's edit there still registers
+as the world moving, because it is.
+
+**Argument units differ by seam, on purpose:** `--mission-path`,
+`lib.sh:mission_resolve_handoff` and `idle-handoff.sh:mission_resolve_ours` all
+take the **project root**, while `lib.sh:mission_gc` takes the **tasks
+directory**. A mismatch fails closed with a stderr line, which is why each
+parameter is named for its unit (`project_cwd` vs `tasks_dir`).
+
+`mission_resolve_ours` distinguishes its failures: rc 1 is a clean "no handoff for
+this project", rc 2 is "the resolver itself failed" (timeout, crash, unusable
+output). Both fail closed; only one means something is broken, and they are logged
+differently (`mission_not_ours` vs `mission_resolve_error`).
 
 Reflection is idempotent per-mode: reruns for the same `(session_id, mode)`
 with `modes.<mode>.final_complete: true` exit fast without spawning a new

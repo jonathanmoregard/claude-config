@@ -148,22 +148,24 @@ Modes:
   sessionend    detached worker, ${REFLECT_BUDGET_SESSIONEND}s internal budget, writes final.json
   subagentstop  detached worker, ${REFLECT_BUDGET_SUBAGENTSTOP}s internal budget, nests under parent/subagents/
   mission       synchronous (detached with REFLECT_ASYNC=1), ${REFLECT_BUDGET_MISSION}s budget,
-                writes <cwd>/tasks/mission.md (markdown)
+                writes \$REFLECT_ROOT/sessions/<sid>/mission.md (markdown)
 
 Introspection:
   --budgets           print the effective timeout budgets + hook-cap arithmetic
-  --mission-path DIR  resolve DIR/tasks' current mission payload: a
-                      mission.<sid>.md of OUR stamp lineage, or nothing (exit 1).
-                      tasks/mission.md is a human convenience symlink and is
-                      never a read source; logs how it resolved
+  --mission-path DIR  resolve the AUTHORITATIVE mission handoff for project DIR:
+                      \$REFLECT_ROOT/sessions/<sid>/mission.md, out of repo, or
+                      nothing (exit 1). Never looks inside DIR
 
 Mission artifact layout:
-  tasks/mission.<sid>.md   payload, unique per session (never collides)
-  tasks/mission.md         symlink to the current payload
-  A foreign or unstamped tasks/mission.md is never overwritten — the payload is
-  still written and the refusal is recorded in the manifest.
-  Retention: REFLECT_MISSION_RETENTION_DAYS (default 30); a payload is also
-  collected once reflections/sessions/<sid>/ is gone. The pointer target is
+  \$REFLECT_ROOT/sessions/<sid>/mission.md   AUTHORITATIVE handoff (out of repo)
+  \$REFLECT_ROOT/sessions/<sid>/mission.cwd  which project it is for
+  tasks/mission.<sid>.md                    human-readable copy; no automation
+                                            reads it
+  tasks/mission.md                          human convenience symlink to the copy
+  Anything other than a symlink of ours at tasks/mission.md is left byte-identical
+  and the refusal is recorded in the manifest.
+  Retention (COPIES only): REFLECT_MISSION_RETENTION_DAYS (default 30); a copy is
+  also collected once reflections/sessions/<sid>/ is gone. The pointer target is
   always kept.
 
 See README.md at ~/.claude/skills/session-reflect/README.md
@@ -172,31 +174,31 @@ EOF
 fi
 
 # --- Mission resolution ------------------------------------------------------
-# `reflect.sh --mission-path <cwd>` prints the path of the current mission
-# payload for that project and logs HOW it resolved (pointer / dangling pointer
-# fallback / newest-by-mtime) to stderr. Read-only: it never repairs, so a reader
-# cannot be surprised by a resolution that also mutated the tree. Exit 1 when
-# there is no payload of our lineage.
+# `reflect.sh --mission-path <project_cwd>` prints the AUTHORITATIVE mission
+# handoff for that project: $REFLECT_ROOT/sessions/<sid>/mission.md, OUTSIDE every
+# repo. Exit 1 when there is none. Read-only: it never repairs, so a reader cannot
+# be surprised by a resolution that also mutated something.
 #
-# EVERY automated consumer MUST use this instead of hardcoding tasks/mission.md.
-# That path is a convenience symlink for humans and existence checks; it is not
-# authoritative and can hold a foreign mission (mission mode refuses to move the
-# pointer over one). `tasks/mission.<sid>.md` is the only authoritative artifact.
+# It does not look at the project tree AT ALL. `tasks/mission.<sid>.md` and
+# `tasks/mission.md` are human-readable copies; no automation reads them, so a
+# planted, forged, committed or tampered copy is a non-event here rather than a
+# case that has to be caught. That is the whole point of the 2026-08-15 design
+# change — see "MISSION HANDOFF" in lib.sh for the three guards it replaces.
 #
-# ARGUMENT UNIT: the PROJECT ROOT, not its tasks/ dir — `<project>/tasks` is
-# appended here. (`lib.sh:mission_resolve` takes the tasks dir; the two units are
-# spelled out at both ends because a mismatch fails closed with only a log line.)
+# There is deliberately NO accessor for the human copy: nothing wants one. If a
+# caller ever does, it must be a separate, clearly-named flag, never this one.
 #
-# A returned payload has been AUTHENTICATED against $REFLECT_ROOT/sessions/<sid>/,
-# so this is also where a forged, planted or foreign payload is refused. Refusals
-# go to stderr with their reason.
+# ARGUMENT UNIT: the PROJECT ROOT, exactly as it appeared in the hook payload's
+# `cwd` field. Matched literally against the mission.cwd sidecar mission mode
+# wrote; a mismatch fails closed, with the candidate count on stderr so it is
+# diagnosable.
 if [[ "$ARG1" == "--mission-path" ]]; then
   _mp_project_cwd="${ARG2:-}"
   if [[ -z "$_mp_project_cwd" || ! -d "$_mp_project_cwd" ]]; then
     echo "reflect.sh --mission-path: need an existing project dir (got '$_mp_project_cwd')" >&2
     exit 2
   fi
-  if _mp_resolved="$(mission_resolve "$_mp_project_cwd/tasks")"; then
+  if _mp_resolved="$(mission_resolve_handoff "$_mp_project_cwd")"; then
     printf '%s\n' "$_mp_resolved"
     exit 0
   fi
@@ -718,10 +720,14 @@ run_worker() {
   fi
 
   # --- Mission mode: raw markdown out, skip the reflection-JSON pipeline ---
-  # Writes <cwd>/tasks/mission.md atomically. No JSON envelope, no schema
-  # normalisation — this file is read by humans and by fresh agents on
-  # resume; the shape lives in prompts/mission.md's instructions to the
-  # model. Manifest still gets a status update so observability holds.
+  # The AUTHORITATIVE handoff is $REFLECT_ROOT/sessions/<sid>/mission.md —
+  # outside every repo, so no repo content can plant, forge or tamper with what a
+  # later unattended fork executes. See "MISSION HANDOFF" in lib.sh for why three
+  # earlier attempts to make a repo-resident file trustworthy all failed.
+  #
+  # tasks/mission.<sid>.md + the tasks/mission.md symlink are written afterwards
+  # as a HUMAN-READABLE COPY, best-effort. No automation reads either one, so a
+  # failure to write them is recorded, not fatal.
   if [[ "$MODE" == "mission" ]]; then
     local mission_cwd="${CWD:-}"
     if [[ -z "$mission_cwd" || ! -d "$mission_cwd" ]]; then
@@ -734,32 +740,12 @@ run_worker() {
               cwd:$cwd}')"
       return 0
     fi
-    local mission_dir="$mission_cwd/tasks"
-    # UNIQUE-SUFFIXED PAYLOAD + POINTER (see "MISSION ARTIFACT LAYOUT" in
-    # lib.sh). The payload name embeds the session id, so two sessions writing
-    # the same cwd cannot collide and a machine write can never land on a path a
-    # human owns. tasks/mission.md becomes a symlink to the current payload.
-    local mission_payload_name="mission.$SESSION_ID.md"
-    local mission_path="$mission_dir/$mission_payload_name"
-    local mission_pointer="$mission_dir/mission.md"
-    if ! mkdir -p "$mission_dir" 2>/dev/null; then
-      write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "error" \
-        "$(jq -cn --arg tp "$TRANSCRIPT_PATH" --arg event "$HOOK_EVENT" --arg parent "$PARENT_SID" \
-            --arg dir "$mission_dir" \
-            '{source_transcript:$tp,hook_event_name:$event,
-              parent_session_id:(if $parent == "" then null else $parent end),
-              reason:"mission_dir_mkdir_failed",
-              dir:$dir}')"
-      return 0
-    fi
-    # Prepend a freshness stamp so downstream consumers (auto-fork,
-    # human resumers) can gate on "was this mission written against a
-    # world that still exists?" Doing this shell-side avoids asking the
-    # model to emit it — prompts/mission.md forbids metadata blocks, so
-    # a model-emitted stamp would conflict with its own rules. Format:
+    # Prepend a freshness stamp so downstream consumers (auto-fork, human
+    # resumers) can gate on "was this mission written against a world that still
+    # exists?" Doing this shell-side avoids asking the model to emit it —
+    # prompts/mission.md forbids metadata blocks, so a model-emitted stamp would
+    # conflict with its own rules. Format:
     #   <!-- written-against: sha=<git-sha-or-none> ts=<unix-epoch> sid=<sid> -->
-    # sid was added with the pointer layout: it is what lets a legacy regular
-    # tasks/mission.md be preserved under its own session's payload name.
     local mission_sha="none"
     if ( cd "$mission_cwd" 2>/dev/null && \
          git rev-parse --is-inside-work-tree >/dev/null 2>&1 ); then
@@ -767,121 +753,179 @@ run_worker() {
     fi
     local mission_ts
     mission_ts=$(date -u +%s)
+    local mission_stamp
+    mission_stamp="$(printf '<!-- written-against: sha=%s ts=%s sid=%s -->' \
+      "$mission_sha" "$mission_ts" "$SESSION_ID")"
 
-    # 1. Write the PAYLOAD atomically under its unique name. This can never
-    #    collide with a human-owned path, so it happens unconditionally.
-    local mission_tmp
-    mission_tmp="$(mktemp -p "$mission_dir" ".mission-XXXXXX.md")"
-    {
-      printf '<!-- written-against: sha=%s ts=%s sid=%s -->\n' \
-        "$mission_sha" "$mission_ts" "$SESSION_ID"
-      printf '%s\n' "$inner"
-    } > "$mission_tmp"
-    if ! mv -f -- "$mission_tmp" "$mission_path"; then
-      rm -f -- "$mission_tmp"
+    # 1. THE AUTHORITATIVE WRITE. Out of the repo, atomic, and mandatory: if this
+    #    fails there is no handoff at all, so it is the only mission-mode write
+    #    whose failure is an error.
+    local mission_handoff mission_handoff_cwd mission_handoff_dir_
+    mission_handoff="$(mission_handoff_path "$SESSION_ID")"
+    mission_handoff_cwd="$(mission_handoff_cwd_path "$SESSION_ID")"
+    mission_handoff_dir_="$(mission_handoff_dir "$SESSION_ID")"
+    local handoff_ok=1
+    if mkdir -p "$mission_handoff_dir_" 2>/dev/null; then
+      local handoff_tmp
+      if handoff_tmp="$(mktemp -p "$mission_handoff_dir_" ".mission-XXXXXX.md" 2>/dev/null)"; then
+        {
+          printf '%s\n' "$mission_stamp"
+          printf '%s\n' "$inner"
+        } > "$handoff_tmp" 2>/dev/null \
+          && mv -f -- "$handoff_tmp" "$mission_handoff" 2>/dev/null \
+          && handoff_ok=0
+        (( handoff_ok == 0 )) || rm -f -- "$handoff_tmp" 2>/dev/null || true
+      fi
+    fi
+    if (( handoff_ok != 0 )); then
       write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "error" \
         "$(jq -cn --arg tp "$TRANSCRIPT_PATH" --arg event "$HOOK_EVENT" --arg parent "$PARENT_SID" \
-            --arg path "$mission_path" \
+            --arg path "$mission_handoff" \
             '{source_transcript:$tp,hook_event_name:$event,
               parent_session_id:(if $parent == "" then null else $parent end),
-              reason:"mission_mv_failed",
+              reason:"mission_handoff_write_failed",
+              path:$path}')"
+      return 0
+    fi
+    # The cwd sidecar is what lets a consumer go from "this project" to "this
+    # handoff" without ever reading the project tree. Written AFTER the handoff so
+    # a resolvable sidecar always has a handoff beside it, and written with a
+    # trailing newline so `read -r` gets the whole path.
+    local cwd_tmp cwd_ok=1
+    if cwd_tmp="$(mktemp -p "$mission_handoff_dir_" ".mission-cwd-XXXXXX" 2>/dev/null)"; then
+      printf '%s\n' "$mission_cwd" > "$cwd_tmp" 2>/dev/null \
+        && mv -f -- "$cwd_tmp" "$mission_handoff_cwd" 2>/dev/null \
+        && cwd_ok=0
+      (( cwd_ok == 0 )) || rm -f -- "$cwd_tmp" 2>/dev/null || true
+    fi
+    if (( cwd_ok != 0 )); then
+      # A handoff nothing can find is a handoff that does not exist.
+      write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "error" \
+        "$(jq -cn --arg tp "$TRANSCRIPT_PATH" --arg event "$HOOK_EVENT" --arg parent "$PARENT_SID" \
+            --arg path "$mission_handoff_cwd" \
+            '{source_transcript:$tp,hook_event_name:$event,
+              parent_session_id:(if $parent == "" then null else $parent end),
+              reason:"mission_handoff_cwd_write_failed",
               path:$path}')"
       return 0
     fi
 
-    # 2. Decide whether we may MOVE THE POINTER. Only this step can touch a path
-    #    someone else owns, and it refuses whenever provenance is not ours.
-    local pointer_action="" pointer_refused=false legacy_preserved=""
-    if [[ ! -e "$mission_pointer" && ! -L "$mission_pointer" ]]; then
-      pointer_action="created"
-    elif [[ -L "$mission_pointer" ]]; then
-      # -L before -f: -f follows the link, so a dangling pointer would otherwise
-      # look like "absent" and a pointer-to-file like a regular file.
-      if mission_pointer_is_ours "$mission_pointer"; then
-        if [[ -f "$mission_pointer" ]]; then
-          pointer_action="repointed"
-        else
-          # Target was garbage-collected. Repointing repairs it.
-          pointer_action="repaired_dangling"
-        fi
+    # 2. THE HUMAN COPY. Best-effort from here down: nothing automated reads any
+    #    of it, so a read-only checkout, a full disk, or a foreign file at the
+    #    pointer must not turn a successful handoff into a failure.
+    local mission_dir="$mission_cwd/tasks"
+    local mission_copy_name="mission.$SESSION_ID.md"
+    local mission_copy="$mission_dir/$mission_copy_name"
+    local mission_pointer="$mission_dir/mission.md"
+    local copy_written=false copy_error=""
+    local pointer_action="skipped_no_copy" pointer_refused=true
+    local mission_gc_removed=0
+    if ! mkdir -p "$mission_dir" 2>/dev/null; then
+      copy_error="mission_dir_mkdir_failed"
+    else
+      local mission_tmp
+      if ! mission_tmp="$(mktemp -p "$mission_dir" ".mission-XXXXXX.md" 2>/dev/null)"; then
+        copy_error="copy_mktemp_failed"
       else
-        pointer_action="refused_foreign_symlink"
-        pointer_refused=true
-      fi
-    elif [[ -f "$mission_pointer" ]]; then
-      # Machine-lineage (either stamp shape): a pre-pointer payload predates the
-      # mandatory sid= and must still be preserved rather than clobbered.
-      if mission_has_machine_stamp "$mission_pointer"; then
-        # Payload written by the pre-pointer code. Preserve it under a suffixed
-        # name (never delete it), then install the pointer.
-        if legacy_preserved="$(mission_preserve_legacy "$mission_pointer")"; then
-          pointer_action="repointed_after_preserving_legacy"
+        {
+          printf '%s\n' "$mission_stamp"
+          printf '%s\n' "$inner"
+        } > "$mission_tmp" 2>/dev/null
+        if mv -f -- "$mission_tmp" "$mission_copy" 2>/dev/null; then
+          copy_written=true
         else
-          pointer_action="refused_legacy_preserve_failed"
+          rm -f -- "$mission_tmp" 2>/dev/null || true
+          copy_error="copy_mv_failed"
+        fi
+      fi
+    fi
+
+    if [[ "$copy_written" == "true" ]]; then
+      # 3. Decide whether we may MOVE THE POINTER. This is the only step that can
+      #    touch a path someone else owns, so it refuses on anything that is not a
+      #    symlink of our own making. Nothing reads the pointer, so refusing is
+      #    free; overwriting a human's file is not.
+      pointer_refused=false
+      if [[ ! -e "$mission_pointer" && ! -L "$mission_pointer" ]]; then
+        pointer_action="created"
+      elif [[ -L "$mission_pointer" ]]; then
+        # -L before -f: -f follows the link, so a dangling pointer would otherwise
+        # look like "absent" and a pointer-to-file like a regular file.
+        if mission_pointer_is_ours "$mission_pointer"; then
+          if [[ -f "$mission_pointer" ]]; then
+            pointer_action="repointed"
+          else
+            # Target was garbage-collected. Repointing repairs it.
+            pointer_action="repaired_dangling"
+          fi
+        else
+          pointer_action="refused_foreign_symlink"
           pointer_refused=true
         fi
       else
-        # THE case that clobbered a hand-authored mission file on 2026-08-15.
+        # Regular file (foreign, hand-authored, or written by the pre-pointer
+        # code), directory, fifo, device. THE case that clobbered a hand-authored
+        # mission file on 2026-08-15. Left strictly alone — we no longer move a
+        # stamped regular file aside either, because deciding that from its
+        # contents is exactly the repo-content trusting this design removed.
         pointer_action="refused_foreign_file"
         pointer_refused=true
       fi
-    else
-      # Directory / fifo / device at tasks/mission.md. Not ours, do not touch.
-      pointer_action="refused_not_a_regular_file"
-      pointer_refused=true
-    fi
 
-    if [[ "$pointer_refused" == "false" ]]; then
-      if ! mission_install_pointer "$mission_dir" "$mission_payload_name"; then
-        pointer_action="pointer_install_failed"
-        pointer_refused=true
+      if [[ "$pointer_refused" == "false" ]]; then
+        if ! mission_install_pointer "$mission_dir" "$mission_copy_name"; then
+          pointer_action="pointer_install_failed"
+          pointer_refused=true
+        fi
       fi
-    fi
 
-    # 3. GC stale payloads so a cwd does not collect one file per session.
-    #    Never touches the pointer target or the payload just written. A legacy
-    #    file preserved in step 2 is also kept for THIS run — its session dir is
-    #    long gone, so GC would otherwise collect it in the same breath as the
-    #    migration that was supposed to save it. Later runs may collect it under
-    #    the normal retention rules, which is GC working as documented.
-    local -a mission_gc_keep=( "$mission_payload_name" )
-    [[ -n "$legacy_preserved" ]] && mission_gc_keep+=( "$(basename -- "$legacy_preserved")" )
-    local mission_gc_removed
-    mission_gc_removed="$(mission_gc "$mission_dir" "${mission_gc_keep[@]}" 2>/dev/null || echo 0)"
-    [[ "$mission_gc_removed" =~ ^[0-9]+$ ]] || mission_gc_removed=0
+      # 4. GC stale copies so a cwd does not collect one file per session. Never
+      #    touches the pointer target or the copy just written.
+      mission_gc_removed="$(mission_gc "$mission_dir" "$mission_copy_name" 2>/dev/null || echo 0)"
+      [[ "$mission_gc_removed" =~ ^[0-9]+$ ]] || mission_gc_removed=0
+    fi
 
     local mission_usage
     mission_usage=$(jq -c '.usage // {}' <<<"$claude_json" 2>/dev/null || echo '{}')
     # NOTE: intentionally NOT emitting final_complete:true here. Mission
     # mode is expected to run repeatedly for the same SID (e.g. idle-handoff
-    # timer refreshes mission.md every N minutes over a long-idle session).
+    # timer refreshes the handoff every N minutes over a long-idle session).
     # is_already_complete keys on final_complete; latching it here would
     # make the first successful mission run permanently poison all future
     # mission runs for that SID until SessionEnd cleans state. Advisor
     # HIGH-B, ARFTL round 1.
     #
-    # status stays `complete`: the payload — the thing this mode exists to
-    # produce — was written. A refused pointer is reported alongside it
-    # (refused_overwrite/refused_path) rather than as a failure, so
-    # idle-handoff.sh's status check keeps working while an operator can still
-    # see that tasks/mission.md belongs to someone else.
+    # status stays `complete` once the AUTHORITATIVE handoff landed — that is the
+    # thing this mode exists to produce. A missing human copy or a refused pointer
+    # is reported alongside it (copy_error / refused_overwrite / refused_path)
+    # rather than as a failure.
+    #
+    # `artifact` is the out-of-repo handoff, deliberately: it is the path every
+    # consumer acts on. The repo copy is reported separately as human_copy.
     write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "complete" \
       "$(jq -cn --arg tp "$TRANSCRIPT_PATH" --arg event "$HOOK_EVENT" --arg parent "$PARENT_SID" \
-          --arg path "$mission_path" --argjson usage "$mission_usage" \
+          --arg handoff "$mission_handoff" --argjson usage "$mission_usage" \
           --argjson bytes "${#inner}" \
+          --arg cwdfile "$mission_handoff_cwd" \
+          --arg project "$mission_cwd" \
+          --arg copy "$mission_copy" \
+          --argjson copy_written "$copy_written" \
+          --arg copy_error "$copy_error" \
           --arg pointer "$mission_pointer" \
           --arg action "$pointer_action" \
           --argjson refused "$pointer_refused" \
-          --arg legacy "$legacy_preserved" \
           --argjson gc "$mission_gc_removed" \
           '{source_transcript:$tp,hook_event_name:$event,
             parent_session_id:(if $parent == "" then null else $parent end),
-            artifact:$path,bytes:$bytes,usage:$usage,
+            artifact:$handoff,handoff:$handoff,handoff_cwd_file:$cwdfile,
+            project_cwd:$project,
+            bytes:$bytes,usage:$usage,
+            human_copy:(if $copy_written then $copy else null end),
+            human_copy_error:(if $copy_error == "" then null else $copy_error end),
             pointer:(if $refused then null else $pointer end),
             pointer_action:$action,
             refused_overwrite:$refused,
             refused_path:(if $refused then $pointer else null end),
-            legacy_preserved_as:(if $legacy == "" then null else $legacy end),
             gc_removed:$gc}')"
     return 0
   fi

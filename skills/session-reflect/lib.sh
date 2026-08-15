@@ -583,84 +583,78 @@ reap_stale_started() {
 }
 
 # ============================================================================
-# MISSION ARTIFACT LAYOUT
+# MISSION HANDOFF — the authoritative copy lives OUTSIDE every repo
 # ============================================================================
-# mission mode used to write ONE fixed path, `<cwd>/tasks/mission.md`, and every
-# run clobbered whatever was there. On 2026-08-15 that overwrote a hand-authored
-# mission file. Fix: make collision structurally impossible instead of relying on
-# a guard being correct —
+# Three successive attempts to make a REPO-RESIDENT mission file trustworthy were
+# each bypassed:
+#   1. a one-line `written-against` stamp — plain text, no secret, forgeable by
+#      four printf lines in any repo;
+#   2. stamp + filename sid + "$REFLECT_ROOT/sessions/<sid>/ must exist" —
+#      bypassed, because reflect.sh created `sessions/_malformed` on ANY malformed
+#      hook payload and `_malformed` satisfies is_valid_sid, so the supposedly
+#      unforgeable out-of-repo anchor was a fixed, non-secret, machine-created
+#      name that a planted `tasks/mission._malformed.md` could simply claim;
+#   3. an HMAC over the body would have been guard #3 on the same class.
 #
-#   tasks/mission.<sid>.md   the payload. Unique per session, never collides.
-#                            <sid> ties it to reflections/sessions/<sid>/manifest.json.
-#   tasks/mission.md         a symlink to the current payload.
+# USER DECISION 2026-08-15: stop trying to make repo content trustworthy. Move the
+# authoritative handoff out of every repo.
 #
-# Same naming discipline the rest of this script already uses for checkpoints
-# (<epoch_ns>-XXXX-precompact.json) and duplicates (<UTC>-<mode>-XXXX.json);
-# mission mode was the only artifact writing a fixed path.
+#   $REFLECT_ROOT/sessions/<sid>/mission.md   AUTHORITATIVE. Outside every repo,
+#                                             not git-tracked, not reachable by
+#                                             repo content. The unattended fork
+#                                             reads ONLY this.
+#   $REFLECT_ROOT/sessions/<sid>/mission.cwd  which project this handoff is for.
+#                                             Also outside the repo, so the
+#                                             cwd -> handoff lookup consults no
+#                                             repo content either.
+#   tasks/mission.<sid>.md                    human-readable COPY. No automation
+#                                             reads it.
+#   tasks/mission.md                          human convenience symlink to the
+#                                             copy. No automation reads it.
 #
-# The pointer is MANDATORY, not a nicety: ~/.claude's SessionStart hook tests for
-# the literal path tasks/mission.md and the user's global CLAUDE.md documents that
-# path as the handoff convention. A suffix-only scheme would silently break both.
+# THE POINT: there is no repo-payload authentication left in this file, because
+# there is nothing in a repo left to authenticate. A planted, forged, committed or
+# tampered `tasks/mission.<sid>.md` is not a guarded case — it is a file nothing
+# reads. Keeping the old four-condition check "as belt and braces" would be dead
+# code inviting someone to re-trust the copy later, so it is deleted outright.
 #
-# The provenance stamp survives but is DEMOTED: it no longer protects the payload
-# (unique names do that), it only decides whether we may MOVE THE POINTER — and,
-# together with a session directory outside the repo, whether a payload we find on
-# disk is one WE wrote (mission_payload_is_ours).
+# What survives below is only what writing the human copy needs:
+#   * mission_has_our_stamp / REFLECT_MISSION_STAMP_RE — the DELETE rail for
+#     mission_gc. We may only garbage-collect a file we can see we wrote. This
+#     decides nothing about what we read or act on.
+#   * mission_is_our_copy_name / mission_pointer_is_ours / mission_install_pointer
+#     — pointer hygiene, so a machine write never lands on a path a human owns.
 #
 #   existing tasks/mission.md            action
 #   -----------------------------------  ------------------------------------------
-#   absent                               write suffixed, create pointer
-#   symlink we own                       write suffixed, repoint
-#   regular file, our stamp lineage      write suffixed, preserve it, repoint
-#   regular file, foreign or unstamped   write suffixed ONLY, leave it untouched,
-#                                        record the refusal
+#   absent                               write the copy, create the pointer
+#   symlink we own (incl. dangling)      write the copy, repoint / repair
+#   anything else (regular file, dir,    write the copy ONLY, leave it untouched,
+#   fifo, foreign symlink)               record the refusal
 #
-# Worst case for a bug in the pointer logic is now a stray file, never lost state.
+# A regular file at the pointer is now left strictly alone — the pre-pointer
+# "move the legacy file aside" migration is gone with the rest of the stamp
+# trusting. Nothing reads the pointer, so refusing to install it costs nothing,
+# whereas moving somebody's file is a machine write onto a human-owned path.
 
-# ---------------------------------------------------------------------------
-# PAYLOAD AUTHENTICATION — why the stamp alone is not evidence
-# ---------------------------------------------------------------------------
-# The stamp is plain text in a file that lives INSIDE a git repo. It carries no
-# secret, so any repo content can forge it, and `sid=` used to be optional —
-# `<!-- written-against: sha=none ts=1786800000 -->` on line 1 of
-# `tasks/mission.<anything>.md` was enough to be accepted as our own handoff.
-#
-# Composed with scripts/idle-handoff.sh (which excludes our mission artifacts
-# from its git freshness gates, so they do not read as "the world moved"), a
-# COMMITTED planted payload was invisible end to end: cloning a hostile repo and
-# leaving it idle handed an unattended `claude -p --permission-mode acceptEdits`
-# fork a set of attacker-authored `## Next` instructions.
-#
-# A guard inside the repo cannot fix that — the attacker controls the repo. So a
-# payload is authenticated against state OUTSIDE it, which repo content cannot
-# fabricate: `$REFLECT_ROOT/sessions/<sid>/`, the directory this machine created
-# when it actually ran that session. All four conditions must hold
-# (mission_payload_is_ours), and every refusal is logged with its reason.
-#
-# Line-1 provenance stamp written by mission mode. `sid=` is MANDATORY here: it
-# is half of the authentication (stamp sid must equal the filename's sid).
-# Deliberately strict: the orchestrator's own hand-written mission.md carries a
-# decoy `<!-- written-against: repo=… branch=… base=… ts=… -->` comment which
-# must NOT be mistaken for ours.
+# Line-1 provenance stamp, written on BOTH the authoritative handoff and the human
+# copy. On the handoff it is informational (git sha + timestamp, used for
+# staleness). On the copy it is the GC delete rail. Deliberately strict: the
+# orchestrator's own hand-written mission.md carries a decoy
+# `<!-- written-against: repo=… branch=… base=… ts=… -->` comment which must NOT
+# be mistaken for ours.
 REFLECT_MISSION_STAMP_RE='^<!-- written-against: sha=([A-Za-z0-9]+|none) ts=[0-9]+ sid=([A-Za-z0-9._-]+) -->$'
 
-# The pre-pointer stamp shape, where `sid=` was still absent. Used for exactly
-# two decisions that are NOT authentication:
-#   * whether a REGULAR tasks/mission.md is a machine-written legacy payload
-#     worth preserving before the pointer is installed, and
-#   * the GC safety rail (never delete a file that is not machine-written).
-# Nothing that mission_resolve returns may match only this.
-REFLECT_MISSION_STAMP_ANY_RE='^<!-- written-against: sha=([A-Za-z0-9]+|none) ts=[0-9]+( sid=[A-Za-z0-9._-]+)? -->$'
+# Human-copy basenames look exactly like this.
+REFLECT_MISSION_COPY_RE='^mission\.([A-Za-z0-9._-]+)\.md$'
 
-# Payload basenames look exactly like this.
-REFLECT_MISSION_PAYLOAD_RE='^mission\.([A-Za-z0-9._-]+)\.md$'
-
-# Retention for GC (documented age rule). A payload older than this is collected
-# even if its session dir still exists.
+# Retention for GC (documented age rule). A copy older than this is collected even
+# if its session dir still exists.
 : "${REFLECT_MISSION_RETENTION_DAYS:=30}"
 
 # mission_has_our_stamp <file> — 0 when line 1 is a stamp WE wrote, sid included.
-# NOT sufficient on its own to trust a payload: see mission_payload_is_ours.
+# Used ONLY as the GC delete rail. Never as evidence for a read or act decision;
+# there is no read decision left that looks at a repo file.
 mission_has_our_stamp() {
   local f="${1:-}" first=""
   [[ -f "$f" ]] || return 1
@@ -668,98 +662,77 @@ mission_has_our_stamp() {
   [[ "$first" =~ $REFLECT_MISSION_STAMP_RE ]]
 }
 
-# mission_stamp_sid <file> — prints the sid from a strict (sid-bearing) stamp.
-mission_stamp_sid() {
-  local f="${1:-}" first=""
-  [[ -f "$f" ]] || return 1
-  IFS= read -r first < "$f" 2>/dev/null || true
-  [[ "$first" =~ $REFLECT_MISSION_STAMP_RE ]] || return 1
-  local sid="${BASH_REMATCH[2]}"
-  [[ -n "$sid" ]] || return 1
-  printf '%s' "$sid"
-}
+# --- Out-of-repo handoff paths ------------------------------------------------
+# All three are pure path builders over $REFLECT_ROOT, which is required to be
+# absolute (see the REFLECT_ROOT validation at the top of this file) so no
+# process cwd — least of all a hostile checkout's — can re-anchor them.
+mission_handoff_dir()      { printf '%s' "$REFLECT_ROOT/sessions/${1:-}"; }
+mission_handoff_path()     { printf '%s' "$REFLECT_ROOT/sessions/${1:-}/mission.md"; }
+mission_handoff_cwd_path() { printf '%s' "$REFLECT_ROOT/sessions/${1:-}/mission.cwd"; }
 
-# mission_has_machine_stamp <file> — 0 when line 1 is a stamp of MACHINE lineage,
-# with or without sid. Legacy-migration + GC rail only, never authentication.
-mission_has_machine_stamp() {
-  local f="${1:-}" first=""
-  [[ -f "$f" ]] || return 1
-  IFS= read -r first < "$f" 2>/dev/null || true
-  [[ "$first" =~ $REFLECT_MISSION_STAMP_ANY_RE ]]
-}
-
-# mission_machine_stamp_sid <file> — sid from either stamp shape, if present.
-mission_machine_stamp_sid() {
-  local f="${1:-}" first=""
-  [[ -f "$f" ]] || return 1
-  IFS= read -r first < "$f" 2>/dev/null || true
-  [[ "$first" =~ $REFLECT_MISSION_STAMP_ANY_RE ]] || return 1
-  local sid="${BASH_REMATCH[2]# sid=}"
-  [[ -n "$sid" ]] || return 1
-  printf '%s' "$sid"
-}
-
-# mission_refuse <reason> <path> — single logging point for a rejected payload,
-# so a refusal is never silent. Always returns 1.
-mission_refuse() {
-  echo "reflect: mission payload REFUSED — ${1:-unknown reason}: ${2:-}" >&2
+# mission_resolve_handoff <project_cwd> — print the AUTHORITATIVE handoff for that
+# project, or return 1.
+#
+# ARGUMENT UNIT: the PROJECT ROOT, as it appeared in the hook payload's `cwd`
+# (both ends read it from the same place: mission mode records the payload cwd,
+# idle-handoff.sh extracts `.cwd` from the transcript). Compared literally.
+#
+# Newest-by-mtime among $REFLECT_ROOT/sessions/<sid>/mission.md whose sibling
+# mission.cwd names this project. EVERY input to that decision is outside every
+# repo: the candidate set comes from $REFLECT_ROOT, and so does the cwd
+# association. Repo content cannot add a candidate, rename one, or change which
+# project one claims — which is why a planted repo copy is a non-event here rather
+# than a case that has to be caught.
+#
+# Depth is pinned to sessions/<sid>/mission.md. Subagent artifacts nest one level
+# deeper (sessions/<parent>/subagents/<sid>/) and mission mode never writes there,
+# so a deeper match would be something we did not produce.
+#
+# Read-only, and every decision is logged to stderr so a choice is never silent.
+mission_resolve_handoff() {
+  local want="${1:-}"
+  if [[ -z "$want" ]]; then
+    echo "reflect: mission handoff resolution needs a project cwd" >&2
+    return 1
+  fi
+  local sessions_root="$REFLECT_ROOT/sessions"
+  if [[ ! -d "$sessions_root" ]]; then
+    echo "reflect: no sessions root at $sessions_root — no mission handoff can exist yet" >&2
+    return 1
+  fi
+  local f dir sid cwdfile rec seen=0
+  while IFS= read -r f; do
+    [[ -n "$f" && -f "$f" ]] || continue
+    dir="$(dirname -- "$f")"
+    sid="$(basename -- "$dir")"
+    is_valid_sid "$sid" || continue
+    cwdfile="$dir/mission.cwd"
+    [[ -f "$cwdfile" ]] || continue
+    seen=$(( seen + 1 ))
+    rec=""
+    IFS= read -r rec < "$cwdfile" 2>/dev/null || true
+    [[ "$rec" == "$want" ]] || continue
+    echo "reflect: mission handoff resolved (newest for this project, out of repo) -> $f" >&2
+    printf '%s' "$f"
+    return 0
+  done < <(find "$sessions_root" -mindepth 2 -maxdepth 2 -type f -name mission.md \
+             -printf '%T@\t%p\n' 2>/dev/null | sort -rn | cut -f2- || true)
+  echo "reflect: no mission handoff under $sessions_root records cwd='$want' ($seen candidate handoff(s) examined). Nothing in the project tree is consulted: tasks/mission*.md are human copies, never a read source." >&2
   return 1
 }
 
-# mission_payload_is_ours <file> — 0 only when the payload authenticates.
-#
-# Four conditions, the last of which lives OUTSIDE the repo and therefore cannot
-# be forged by repo content (see "PAYLOAD AUTHENTICATION" above):
-#   1. basename is mission.<sid>.md with a sid that passes is_valid_sid
-#   2. line 1 carries our stamp AND that stamp names a sid (mandatory)
-#   3. the stamp's sid equals the filename's sid — a payload cannot claim to
-#      belong to a session other than the one it is named for
-#   4. $REFLECT_ROOT/sessions/<sid>/ exists: we created that directory when we
-#      ran the session that wrote this handoff. No directory ⇒ not ours ⇒ refuse.
-#
-# REFLECT_ROOT stays overridable so tests are hermetic; production defaults to
-# ~/.claude/reflections, which is outside every project checkout.
-mission_payload_is_ours() {
-  local f="${1:-}" b sid stamp_sid
-  [[ -n "$f" ]] || return 1
-  [[ -f "$f" ]] || { mission_refuse "not a regular file" "$f"; return 1; }
-  b="$(basename -- "$f")"
-  if [[ ! "$b" =~ $REFLECT_MISSION_PAYLOAD_RE ]]; then
-    mission_refuse "basename is not mission.<sid>.md" "$f"
-    return 1
-  fi
-  sid="${BASH_REMATCH[1]}"
-  if ! is_valid_sid "$sid"; then
-    mission_refuse "filename sid '$sid' is not a valid session id" "$f"
-    return 1
-  fi
-  if ! stamp_sid="$(mission_stamp_sid "$f")"; then
-    mission_refuse "line 1 is not our stamp, or the stamp carries no sid= (sid is mandatory)" "$f"
-    return 1
-  fi
-  if [[ "$stamp_sid" != "$sid" ]]; then
-    mission_refuse "stamp sid '$stamp_sid' does not match filename sid '$sid'" "$f"
-    return 1
-  fi
-  if [[ ! -d "$REFLECT_ROOT/sessions/$sid" ]]; then
-    mission_refuse "no session of ours at $REFLECT_ROOT/sessions/$sid — nothing on this machine ran that session, so this payload is not our handoff" "$f"
-    return 1
-  fi
-  return 0
-}
-
-# mission_is_our_payload_name <basename> — 0 when it matches mission.<sid>.md
-# with a sid that passes is_valid_sid.
-mission_is_our_payload_name() {
+# mission_is_our_copy_name <basename> — 0 when it matches mission.<sid>.md with a
+# sid that passes is_valid_sid.
+mission_is_our_copy_name() {
   local b="${1:-}"
-  [[ "$b" =~ $REFLECT_MISSION_PAYLOAD_RE ]] || return 1
+  [[ "$b" =~ $REFLECT_MISSION_COPY_RE ]] || return 1
   is_valid_sid "${BASH_REMATCH[1]}"
 }
 
 # mission_pointer_is_ours <pointer_path> — 0 when the pointer is a symlink whose
-# target is one of OUR payload basenames in the same directory. Works on a
-# DANGLING symlink too (we compare the target string, not the file), which is
-# what lets us repair a pointer whose payload was garbage-collected.
+# target is one of OUR copy basenames in the same directory. Works on a DANGLING
+# symlink too (we compare the target string, not the file), which is what lets us
+# repair a pointer whose copy was garbage-collected.
 mission_pointer_is_ours() {
   local p="${1:-}"
   [[ -L "$p" ]] || return 1
@@ -769,105 +742,21 @@ mission_pointer_is_ours() {
   # Must be a bare basename (no directory part) — a link pointing outside the
   # tasks dir is not something we created and not something we will touch.
   [[ "$target" == "$(basename -- "$target")" ]] || return 1
-  mission_is_our_payload_name "$target"
+  mission_is_our_copy_name "$target"
 }
 
-# mission_newest_payload <tasks_dir> — prints the newest (mtime) payload that
-# AUTHENTICATES as ours. Returns 1 when there is none. `tasks_dir` is the
-# `<project>/tasks` directory itself, not the project root.
-mission_newest_payload() {
-  local tasks_dir="${1:-}"
-  local dir="$tasks_dir"
-  [[ -d "$dir" ]] || return 1
-  local newest="" newest_mt=-1 f mt
-  for f in "$dir"/mission.*.md; do
-    [[ -f "$f" ]] || continue
-    # Authentication, not just shape: a planted file that forges the stamp has
-    # no session directory of ours and is refused here with a logged reason.
-    mission_payload_is_ours "$f" || continue
-    mt="$(stat -c '%Y' "$f" 2>/dev/null || echo -1)"
-    [[ "$mt" =~ ^-?[0-9]+$ ]] || continue
-    if (( mt > newest_mt )); then
-      newest_mt="$mt"
-      newest="$f"
-    fi
-  done
-  [[ -n "$newest" ]] || return 1
-  printf '%s' "$newest"
-}
-
-# mission_resolve <tasks_dir> — print the path of the CURRENT mission payload.
-#
-# ARGUMENT UNIT: `tasks_dir` is the `<project>/tasks` DIRECTORY, not the project
-# root. The public seams take the project root instead (`reflect.sh
-# --mission-path <project_cwd>`, `idle-handoff.sh:mission_resolve_ours
-# <project_cwd>`) and append `/tasks` themselves. Passing a project root here
-# fails closed — it just finds no payloads — with only a stderr line to say so,
-# so the parameter names are spelled out at every call site.
-#
-# `tasks/mission.<sid>.md` is the ONLY authoritative mission artifact.
-# `tasks/mission.md` is a convenience symlink for humans and existence checks and
-# is NEVER a read source for automation — this function will not return it, and
-# neither should any consumer hardcode it.
-#
-# Why: mission mode deliberately REFUSES to move the pointer when a foreign or
-# unstamped regular file owns that path (see the decision table above). So
-# `tasks/mission.md` can legitimately hold somebody else's in-flight mission
-# while our handoff sits in the suffixed payload. A consumer that resolved-and-
-# read the pointer would then hand an unattended model, running with edits
-# accepted, work that nobody asked for — while the handoff we actually wrote went
-# unread. Unique suffixed names exist precisely so that failure class cannot be
-# expressed; resolving to them removes the ambiguity instead of guarding it.
-#
-# Read-only. Resolution order, each step logged to stderr so a choice is never
-# made silently. EVERY returned payload must pass mission_payload_is_ours, which
-# authenticates it against $REFLECT_ROOT/sessions/<sid>/ — state outside the repo:
-#   1. pointer is OUR symlink to a payload that AUTHENTICATES -> that payload
-#   2. anything else at the pointer (absent, dangling, foreign
-#      file, foreign symlink) is a NON-EVENT             -> newest authentic payload
-#   3. no authentic payload                              -> return 1
-mission_resolve() {
-  local tasks_dir="${1:-}"
-  local dir="$tasks_dir"
-  local pointer="$dir/mission.md"
-  if mission_pointer_is_ours "$pointer"; then
-    local target
-    target="$(readlink -- "$pointer" 2>/dev/null || true)"
-    if [[ -f "$dir/$target" ]] && mission_payload_is_ours "$dir/$target"; then
-      echo "reflect: mission resolved via pointer -> $dir/$target" >&2
-      printf '%s' "$dir/$target"
-      return 0
-    fi
-    echo "reflect: mission pointer $pointer is DANGLING or does not authenticate (target '$target'); falling back to newest payload" >&2
-  elif [[ -L "$pointer" ]]; then
-    echo "reflect: mission pointer $pointer is a symlink we do not own (target '$(readlink -- "$pointer" 2>/dev/null)'); not a read source, falling back to newest payload" >&2
-  elif [[ -f "$pointer" ]]; then
-    echo "reflect: mission pointer $pointer is a regular file (foreign or legacy) — never a read source for automation; falling back to newest payload" >&2
-  else
-    echo "reflect: mission pointer $pointer absent; falling back to newest payload" >&2
-  fi
-  local newest
-  if newest="$(mission_newest_payload "$dir")"; then
-    echo "reflect: mission resolved to newest payload by mtime -> $newest" >&2
-    printf '%s' "$newest"
-    return 0
-  fi
-  echo "reflect: no authenticated mission payload found under $dir (a payload must be mission.<sid>.md, carry our stamp with a matching sid=, and have a session dir at $REFLECT_ROOT/sessions/<sid>/)" >&2
-  return 1
-}
-
-# mission_install_pointer <tasks_dir> <payload_basename>
-# Atomically point tasks/mission.md at the payload: build the symlink under a
+# mission_install_pointer <tasks_dir> <copy_basename>
+# Atomically point tasks/mission.md at the human copy: build the symlink under a
 # temp name in the same directory, then rename it over the pointer. rename(2) is
-# atomic, so a concurrent reader sees either the old or the new target, never a
-# missing pointer. `mv -T` keeps a symlink-to-directory from being treated as a
-# destination directory.
+# atomic, so a concurrent HUMAN reader sees either the old or the new target,
+# never a missing pointer. `mv -T` keeps a symlink-to-directory from being treated
+# as a destination directory.
 mission_install_pointer() {
-  local dir="${1:-}" payload="${2:-}"
+  local dir="${1:-}" copy="${2:-}"
   local pointer="$dir/mission.md"
   local tmp
   tmp="$(mktemp -u -p "$dir" ".mission-ptr-XXXXXX")" || return 1
-  ln -sfn -- "$payload" "$tmp" 2>/dev/null || return 1
+  ln -sfn -- "$copy" "$tmp" 2>/dev/null || return 1
   if ! mv -Tf -- "$tmp" "$pointer" 2>/dev/null; then
     rm -f -- "$tmp" 2>/dev/null || true
     return 1
@@ -875,43 +764,20 @@ mission_install_pointer() {
   return 0
 }
 
-# mission_preserve_legacy <pointer_path>
-# A REGULAR tasks/mission.md carrying our stamp is a payload written by the
-# pre-pointer code. Installing the pointer would destroy it, so move it aside to
-# a suffixed name first (sid from its own stamp when present — pre-pointer stamps
-# had none, hence mission_machine_stamp_sid rather than the strict reader).
-# Prints the new path; returns 1 if it could not be preserved (caller refuses).
-mission_preserve_legacy() {
-  local pointer="${1:-}"
-  local dir
-  dir="$(dirname -- "$pointer")"
-  local sid dest
-  if sid="$(mission_machine_stamp_sid "$pointer")" && is_valid_sid "$sid" \
-     && [[ ! -e "$dir/mission.$sid.md" ]]; then
-    dest="$dir/mission.$sid.md"
-  else
-    dest="$dir/mission.legacy-$(date -u +%s%N).md"
-  fi
-  mv -n -- "$pointer" "$dest" 2>/dev/null || return 1
-  [[ -f "$dest" ]] || return 1
-  printf '%s' "$dest"
-}
-
 # mission_gc <tasks_dir> [keep_basename...]
-# Collect stale payloads so a cwd does not accumulate one file per session
-# (~590 sessions/week on this host). A payload is collected when:
+# Collect stale human copies so a cwd does not accumulate one file per session
+# (~590 sessions/week on this host). A copy is collected when:
 #   * its reflections/sessions/<sid>/ directory is gone, OR
 #   * it is older than REFLECT_MISSION_RETENTION_DAYS,
 # and NEVER when it is the current pointer target or listed in keep_basename.
 #
 # Two safety rails, because this function deletes files in a user's repo:
 #   1. the basename must match mission.<valid-sid>.md
-#   2. line 1 must carry a stamp of MACHINE lineage (either shape — a
-#      pre-pointer, sid-less payload is still ours to collect)
-# So a hand-authored `mission.notes.md` is never touched. Deliberately the
-# machine-lineage rail and NOT mission_payload_is_ours: authentication decides
-# what we may ACT on, this decides what we may DELETE, and "its session dir is
-# gone" is a GC trigger here rather than a disqualifier.
+#   2. line 1 must carry OUR stamp
+# So a hand-authored `mission.notes.md` is never touched — note that "notes" is a
+# perfectly valid sid, which is why the stamp rail and not the name alone decides.
+# This is a DELETE rail, not authentication: it governs what we may remove of our
+# own writing, and nothing here or anywhere else reads these files.
 # Prints the number of files removed.
 mission_gc() {
   local dir="${1:-}"
@@ -935,14 +801,14 @@ mission_gc() {
   for f in "$dir"/mission.*.md; do
     [[ -f "$f" ]] || continue
     b="$(basename -- "$f")"
-    mission_is_our_payload_name "$b" || continue
-    mission_has_machine_stamp "$f" || continue
+    mission_is_our_copy_name "$b" || continue
+    mission_has_our_stamp "$f" || continue
     skip=0
     for k in ${keep[@]+"${keep[@]}"}; do
       [[ "$b" == "$k" ]] && { skip=1; break; }
     done
     (( skip )) && continue
-    [[ "$b" =~ $REFLECT_MISSION_PAYLOAD_RE ]] || continue
+    [[ "$b" =~ $REFLECT_MISSION_COPY_RE ]] || continue
     sid="${BASH_REMATCH[1]}"
     mt="$(stat -c '%Y' "$f" 2>/dev/null || echo "$now_epoch")"
     [[ "$mt" =~ ^-?[0-9]+$ ]] || mt="$now_epoch"

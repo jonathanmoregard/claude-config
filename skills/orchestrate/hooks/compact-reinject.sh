@@ -10,17 +10,20 @@ set -euo pipefail
 
 STATE=".claude/ralph-loop.local.md"
 
-# EXISTENCE CHECK ONLY, and deliberately a GLOB. `tasks/mission.<sid>.md` is the
-# authoritative artifact; `tasks/mission.md` is a convenience symlink that may be
-# absent, dangling, or occupied by an unrelated mission belonging to a human, so
-# it is never treated as authoritative here.
+# EXISTENCE CHECK ONLY, and deliberately a GLOB: "does this project use the
+# mission convention at all". The files it matches are human-readable copies —
+# the authoritative handoff lives outside the repo — so this must never be read
+# as content, only counted.
 mission_exists() {
   compgen -G "tasks/mission*.md" >/dev/null 2>&1
 }
 
-# Name the authoritative path when session-reflect can resolve one, so the
-# re-read nudge points at the real handoff rather than at the pointer. Falls back
-# to the human-facing convention when nothing of our lineage resolves.
+# Name the AUTHORITATIVE handoff when session-reflect can resolve one
+# ($REFLECT_ROOT/sessions/<sid>/mission.md, out of repo). Falls back to the
+# human-facing `tasks/mission.md` convention when there is none — acceptable here
+# and nowhere else: this hook only injects a "re-read your handoff" reminder into
+# an interactive session whose human owns this cwd. It never drives an unattended
+# fork, which is why idle-handoff.sh has no such fallback.
 RESOLVE="$HOME/.claude/skills/session-reflect/reflect.sh"
 MISSION="tasks/mission.md"
 if [[ -x "$RESOLVE" || -f "$RESOLVE" ]]; then
