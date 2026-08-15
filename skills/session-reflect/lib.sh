@@ -541,6 +541,246 @@ reap_stale_started() {
   printf '%s' "$reaped"
 }
 
+# ============================================================================
+# MISSION ARTIFACT LAYOUT
+# ============================================================================
+# mission mode used to write ONE fixed path, `<cwd>/tasks/mission.md`, and every
+# run clobbered whatever was there. On 2026-08-15 that overwrote a hand-authored
+# mission file. Fix: make collision structurally impossible instead of relying on
+# a guard being correct —
+#
+#   tasks/mission.<sid>.md   the payload. Unique per session, never collides.
+#                            <sid> ties it to reflections/sessions/<sid>/manifest.json.
+#   tasks/mission.md         a symlink to the current payload.
+#
+# Same naming discipline the rest of this script already uses for checkpoints
+# (<epoch_ns>-XXXX-precompact.json) and duplicates (<UTC>-<mode>-XXXX.json);
+# mission mode was the only artifact writing a fixed path.
+#
+# The pointer is MANDATORY, not a nicety: ~/.claude's SessionStart hook tests for
+# the literal path tasks/mission.md and the user's global CLAUDE.md documents that
+# path as the handoff convention. A suffix-only scheme would silently break both.
+#
+# The provenance stamp survives but is DEMOTED: it no longer protects the payload
+# (unique names do that), it only decides whether we may MOVE THE POINTER.
+#
+#   existing tasks/mission.md            action
+#   -----------------------------------  ------------------------------------------
+#   absent                               write suffixed, create pointer
+#   symlink we own                       write suffixed, repoint
+#   regular file, our stamp lineage      write suffixed, preserve it, repoint
+#   regular file, foreign or unstamped   write suffixed ONLY, leave it untouched,
+#                                        record the refusal
+#
+# Worst case for a bug in the pointer logic is now a stray file, never lost state.
+
+# Line-1 provenance stamp written by mission mode. Deliberately strict: the
+# orchestrator's own hand-written mission.md carries a decoy
+# `<!-- written-against: repo=… branch=… base=… ts=… -->` comment which must NOT
+# be mistaken for ours.
+REFLECT_MISSION_STAMP_RE='^<!-- written-against: sha=([A-Za-z0-9]+|none) ts=[0-9]+( sid=[A-Za-z0-9._-]+)? -->$'
+
+# Payload basenames look exactly like this.
+REFLECT_MISSION_PAYLOAD_RE='^mission\.([A-Za-z0-9._-]+)\.md$'
+
+# Retention for GC (documented age rule). A payload older than this is collected
+# even if its session dir still exists.
+: "${REFLECT_MISSION_RETENTION_DAYS:=30}"
+
+# mission_has_our_stamp <file> — 0 when line 1 is a stamp WE wrote.
+mission_has_our_stamp() {
+  local f="${1:-}" first=""
+  [[ -f "$f" ]] || return 1
+  IFS= read -r first < "$f" 2>/dev/null || true
+  [[ "$first" =~ $REFLECT_MISSION_STAMP_RE ]]
+}
+
+# mission_stamp_sid <file> — prints the sid recorded in the stamp, if any.
+mission_stamp_sid() {
+  local f="${1:-}" first=""
+  [[ -f "$f" ]] || return 1
+  IFS= read -r first < "$f" 2>/dev/null || true
+  [[ "$first" =~ $REFLECT_MISSION_STAMP_RE ]] || return 1
+  local sid="${BASH_REMATCH[2]# sid=}"
+  [[ -n "$sid" ]] || return 1
+  printf '%s' "$sid"
+}
+
+# mission_is_our_payload_name <basename> — 0 when it matches mission.<sid>.md
+# with a sid that passes is_valid_sid.
+mission_is_our_payload_name() {
+  local b="${1:-}"
+  [[ "$b" =~ $REFLECT_MISSION_PAYLOAD_RE ]] || return 1
+  is_valid_sid "${BASH_REMATCH[1]}"
+}
+
+# mission_pointer_is_ours <pointer_path> — 0 when the pointer is a symlink whose
+# target is one of OUR payload basenames in the same directory. Works on a
+# DANGLING symlink too (we compare the target string, not the file), which is
+# what lets us repair a pointer whose payload was garbage-collected.
+mission_pointer_is_ours() {
+  local p="${1:-}"
+  [[ -L "$p" ]] || return 1
+  local target
+  target="$(readlink -- "$p" 2>/dev/null || true)"
+  [[ -n "$target" ]] || return 1
+  # Must be a bare basename (no directory part) — a link pointing outside the
+  # tasks dir is not something we created and not something we will touch.
+  [[ "$target" == "$(basename -- "$target")" ]] || return 1
+  mission_is_our_payload_name "$target"
+}
+
+# mission_newest_payload <tasks_dir> — prints the newest (mtime) payload that
+# carries our stamp. Returns 1 when there is none.
+mission_newest_payload() {
+  local dir="${1:-}"
+  [[ -d "$dir" ]] || return 1
+  local newest="" newest_mt=-1 f b mt
+  for f in "$dir"/mission.*.md; do
+    [[ -f "$f" ]] || continue
+    b="$(basename -- "$f")"
+    mission_is_our_payload_name "$b" || continue
+    mission_has_our_stamp "$f" || continue
+    mt="$(stat -c '%Y' "$f" 2>/dev/null || echo -1)"
+    [[ "$mt" =~ ^-?[0-9]+$ ]] || continue
+    if (( mt > newest_mt )); then
+      newest_mt="$mt"
+      newest="$f"
+    fi
+  done
+  [[ -n "$newest" ]] || return 1
+  printf '%s' "$newest"
+}
+
+# mission_resolve <tasks_dir> — print the path of the CURRENT mission payload.
+# Read-only. Resolution order, each step logged to stderr so a choice is never
+# made silently:
+#   1. tasks/mission.md resolves to a readable file  -> that file
+#   2. pointer absent, dangling, or foreign          -> newest stamped payload
+#   3. nothing                                       -> return 1
+mission_resolve() {
+  local dir="${1:-}"
+  local pointer="$dir/mission.md"
+  if [[ -L "$pointer" ]]; then
+    if [[ -f "$pointer" ]]; then
+      local target
+      target="$(readlink -f -- "$pointer" 2>/dev/null || true)"
+      echo "reflect: mission resolved via pointer -> ${target:-$pointer}" >&2
+      printf '%s' "${target:-$pointer}"
+      return 0
+    fi
+    echo "reflect: mission pointer $pointer is DANGLING (target '$(readlink -- "$pointer" 2>/dev/null)' missing); falling back to newest payload" >&2
+  elif [[ -f "$pointer" ]]; then
+    echo "reflect: mission resolved via regular file $pointer (no pointer indirection)" >&2
+    printf '%s' "$pointer"
+    return 0
+  else
+    echo "reflect: mission pointer $pointer absent; falling back to newest payload" >&2
+  fi
+  local newest
+  if newest="$(mission_newest_payload "$dir")"; then
+    echo "reflect: mission resolved to newest payload by mtime -> $newest" >&2
+    printf '%s' "$newest"
+    return 0
+  fi
+  echo "reflect: no mission payload found under $dir" >&2
+  return 1
+}
+
+# mission_install_pointer <tasks_dir> <payload_basename>
+# Atomically point tasks/mission.md at the payload: build the symlink under a
+# temp name in the same directory, then rename it over the pointer. rename(2) is
+# atomic, so a concurrent reader sees either the old or the new target, never a
+# missing pointer. `mv -T` keeps a symlink-to-directory from being treated as a
+# destination directory.
+mission_install_pointer() {
+  local dir="${1:-}" payload="${2:-}"
+  local pointer="$dir/mission.md"
+  local tmp
+  tmp="$(mktemp -u -p "$dir" ".mission-ptr-XXXXXX")" || return 1
+  ln -sfn -- "$payload" "$tmp" 2>/dev/null || return 1
+  if ! mv -Tf -- "$tmp" "$pointer" 2>/dev/null; then
+    rm -f -- "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  return 0
+}
+
+# mission_preserve_legacy <pointer_path>
+# A REGULAR tasks/mission.md carrying our stamp is a payload written by the
+# pre-pointer code. Installing the pointer would destroy it, so move it aside to
+# a suffixed name first (sid from its own stamp when present). Prints the new
+# path; returns 1 if it could not be preserved (caller then refuses).
+mission_preserve_legacy() {
+  local pointer="${1:-}"
+  local dir
+  dir="$(dirname -- "$pointer")"
+  local sid dest
+  if sid="$(mission_stamp_sid "$pointer")" && is_valid_sid "$sid" \
+     && [[ ! -e "$dir/mission.$sid.md" ]]; then
+    dest="$dir/mission.$sid.md"
+  else
+    dest="$dir/mission.legacy-$(date -u +%s%N).md"
+  fi
+  mv -n -- "$pointer" "$dest" 2>/dev/null || return 1
+  [[ -f "$dest" ]] || return 1
+  printf '%s' "$dest"
+}
+
+# mission_gc <tasks_dir> [keep_basename...]
+# Collect stale payloads so a cwd does not accumulate one file per session
+# (~590 sessions/week on this host). A payload is collected when:
+#   * its reflections/sessions/<sid>/ directory is gone, OR
+#   * it is older than REFLECT_MISSION_RETENTION_DAYS,
+# and NEVER when it is the current pointer target or listed in keep_basename.
+#
+# Two safety rails, because this function deletes files in a user's repo:
+#   1. the basename must match mission.<valid-sid>.md
+#   2. line 1 must carry OUR provenance stamp
+# So a hand-authored `mission.notes.md` is never touched.
+# Prints the number of files removed.
+mission_gc() {
+  local dir="${1:-}"
+  shift || true
+  local -a keep=( "$@" )
+  local removed=0
+  [[ -d "$dir" ]] || { printf '%s' 0; return 0; }
+
+  # Never collect the file the pointer currently resolves to.
+  local pointer="$dir/mission.md"
+  if [[ -L "$pointer" ]]; then
+    local ptgt
+    ptgt="$(readlink -- "$pointer" 2>/dev/null || true)"
+    [[ -n "$ptgt" ]] && keep+=( "$(basename -- "$ptgt")" )
+  fi
+
+  local now_epoch max_age f b sid mt age k skip
+  now_epoch="$(date -u +%s)"
+  max_age=$(( REFLECT_MISSION_RETENTION_DAYS * 86400 ))
+
+  for f in "$dir"/mission.*.md; do
+    [[ -f "$f" ]] || continue
+    b="$(basename -- "$f")"
+    mission_is_our_payload_name "$b" || continue
+    mission_has_our_stamp "$f" || continue
+    skip=0
+    for k in ${keep[@]+"${keep[@]}"}; do
+      [[ "$b" == "$k" ]] && { skip=1; break; }
+    done
+    (( skip )) && continue
+    [[ "$b" =~ $REFLECT_MISSION_PAYLOAD_RE ]] || continue
+    sid="${BASH_REMATCH[1]}"
+    mt="$(stat -c '%Y' "$f" 2>/dev/null || echo "$now_epoch")"
+    [[ "$mt" =~ ^-?[0-9]+$ ]] || mt="$now_epoch"
+    age=$(( now_epoch - mt ))
+    if [[ -d "$REFLECT_ROOT/sessions/$sid" ]] && (( age <= max_age )); then
+      continue
+    fi
+    rm -f -- "$f" 2>/dev/null && removed=$(( removed + 1 ))
+  done
+  printf '%s' "$removed"
+}
+
 # --- Best-effort parent-SID discovery for subagents --------------------------
 # find_parent_session_id <subagent_sid> <cwd> <transcript_path>
 # Strategy, in order:

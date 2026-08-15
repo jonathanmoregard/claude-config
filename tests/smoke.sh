@@ -1460,6 +1460,314 @@ jq -e '.modes.sessionend.status == "started"' "$FRESH_MANIFEST" >/dev/null \
 info "orphaned started demoted to terminal error; fresh started left alone"
 
 # ============================================================================
+# MISSION ARTIFACT LAYOUT — unique-suffixed payload + atomic pointer
+# ============================================================================
+# Evidence for this design: on 2026-08-15 a mission run wrote a stubbed
+# reflection over this worktree's hand-authored tasks/mission.md, because mission
+# mode was the only artifact writing a FIXED path. Collision is now structurally
+# impossible — the payload is tasks/mission.<sid>.md and tasks/mission.md is a
+# symlink to it. The provenance stamp no longer protects the payload; it only
+# decides whether we may move the pointer.
+#
+# A stamped payload fixture helper: the stamp regex is strict on purpose, so
+# tests build fixtures the same shape mission mode writes.
+mk_mission_payload() {
+  # $1=tasks_dir  $2=sid  $3=body  [$4=touch-date]
+  local dir="$1" sid="$2" body="$3" when="${4:-}"
+  mkdir -p "$dir"
+  {
+    printf '<!-- written-against: sha=none ts=%s sid=%s -->\n' "$(date -u +%s)" "$sid"
+    printf '%s\n' "$body"
+  } > "$dir/mission.$sid.md"
+  [[ -n "$when" ]] && touch -d "$when" "$dir/mission.$sid.md"
+  printf '%s' "$dir/mission.$sid.md"
+}
+
+mission_stub() {
+  # $1 = body the stub returns as the mission markdown
+  cat >"$STUB_SCRATCH/claude" <<STUB
+#!/usr/bin/env bash
+cat >/dev/null || true
+jq -cn --arg r '$1' '{type:"result",result:\$r,usage:{}}'
+STUB
+  chmod +x "$STUB_SCRATCH/claude"
+}
+
+# ============================================================================
+# TEST 19: foreign mission.md is left byte-identical; payload still written
+# ============================================================================
+echo "TEST 19: mission — foreign tasks/mission.md untouched, refusal recorded"
+B3_CWD="$(mktemp -d -t reflect-b3cwd-XXXXXX)"
+assert_isolated_cwd "$B3_CWD"
+mkdir -p "$B3_CWD/tasks"
+# Fixture includes a DECOY comment with different keys (repo=/branch=/base=) —
+# the real orchestrator mission file looks like this and must not be mistaken
+# for our stamp.
+cat >"$B3_CWD/tasks/mission.md" <<'FOREIGN'
+<!-- written-against: repo=~/.claude branch=feat/self-compact base=ca78a3c ts=2026-08-15 -->
+# Mission — hand-authored by a human
+
+## Done
+- irreplaceable state that must survive a machine write
+FOREIGN
+B3_FOREIGN_SHA="$(sha256sum "$B3_CWD/tasks/mission.md" | awk '{print $1}')"
+
+mission_stub '# Mission — machine written
+
+## Done
+- stub'
+
+B3_SID="test-sid-foreign-mission"
+echo "$(jq -cn --arg sid "$B3_SID" --arg tp "$TRANSCRIPT" --arg cwd "$B3_CWD" \
+  '{session_id:$sid,transcript_path:$tp,hook_event_name:"IdleHandoff",cwd:$cwd}')" \
+  | bash "$REFLECT_SH" mission
+rc=$?
+(( rc == 0 )) || fail "mission mode exit=$rc"
+
+[[ "$(sha256sum "$B3_CWD/tasks/mission.md" | awk '{print $1}')" == "$B3_FOREIGN_SHA" ]] \
+  || fail "foreign tasks/mission.md was MODIFIED — a machine write reached a human-owned path"
+[[ ! -L "$B3_CWD/tasks/mission.md" ]] \
+  || fail "foreign tasks/mission.md was replaced by a pointer"
+B3_PAYLOAD_FILE="$B3_CWD/tasks/mission.$B3_SID.md"
+[[ -f "$B3_PAYLOAD_FILE" ]] \
+  || fail "payload not written at $B3_PAYLOAD_FILE (dir: $(ls "$B3_CWD/tasks"))"
+grep -q '^<!-- written-against: sha=.* sid=' "$B3_PAYLOAD_FILE" \
+  || fail "payload missing provenance stamp with sid"
+grep -q 'machine written' "$B3_PAYLOAD_FILE" || fail "payload lacks the model body"
+
+B3_MANIFEST="$REFLECT_ROOT/sessions/$B3_SID/manifest.json"
+jq -e '.modes.mission.refused_overwrite == true' "$B3_MANIFEST" >/dev/null \
+  || fail "refusal not recorded (modes.mission.refused_overwrite)"
+jq -e '.modes.mission.pointer_action == "refused_foreign_file"' "$B3_MANIFEST" >/dev/null \
+  || fail "expected pointer_action=refused_foreign_file (got $(jq -r '.modes.mission.pointer_action' "$B3_MANIFEST"))"
+jq -e --arg p "$B3_CWD/tasks/mission.md" '.modes.mission.refused_path == $p' "$B3_MANIFEST" >/dev/null \
+  || fail "refused_path not recorded"
+jq -e --arg p "$B3_PAYLOAD_FILE" '.modes.mission.artifact == $p' "$B3_MANIFEST" >/dev/null \
+  || fail "artifact should be the suffixed payload"
+jq -e '.modes.mission.status == "complete"' "$B3_MANIFEST" >/dev/null \
+  || fail "payload was written, so status should stay complete"
+info "foreign mission.md byte-identical; payload written suffixed; refusal recorded"
+
+# ============================================================================
+# TEST 19b: pointer we own is repointed, and the old payload survives
+# ============================================================================
+echo "TEST 19b: mission — own pointer repointed, previous payload kept"
+B3B_CWD="$(mktemp -d -t reflect-b3bcwd-XXXXXX)"
+assert_isolated_cwd "$B3B_CWD"
+
+mission_stub '# Mission — first pass
+
+## Done
+- first'
+B3B_SID1="test-sid-mission-first"
+echo "$(jq -cn --arg sid "$B3B_SID1" --arg tp "$TRANSCRIPT" --arg cwd "$B3B_CWD" \
+  '{session_id:$sid,transcript_path:$tp,hook_event_name:"IdleHandoff",cwd:$cwd}')" \
+  | bash "$REFLECT_SH" mission
+(( $? == 0 )) || fail "19b: first mission run failed"
+[[ -L "$B3B_CWD/tasks/mission.md" ]] \
+  || fail "19b: tasks/mission.md should be a symlink pointer"
+[[ "$(readlink "$B3B_CWD/tasks/mission.md")" == "mission.$B3B_SID1.md" ]] \
+  || fail "19b: pointer target should be a bare payload basename (got $(readlink "$B3B_CWD/tasks/mission.md"))"
+grep -q 'first pass' "$B3B_CWD/tasks/mission.md" \
+  || fail "19b: reading through the pointer should give the payload"
+
+# Second run, DIFFERENT session id — repoint, keep the old payload on disk.
+mission_stub '# Mission — second pass
+
+## Done
+- second'
+B3B_SID2="test-sid-mission-second"
+echo "$(jq -cn --arg sid "$B3B_SID2" --arg tp "$TRANSCRIPT" --arg cwd "$B3B_CWD" \
+  '{session_id:$sid,transcript_path:$tp,hook_event_name:"IdleHandoff",cwd:$cwd}')" \
+  | bash "$REFLECT_SH" mission
+(( $? == 0 )) || fail "19b: second mission run failed"
+[[ "$(readlink "$B3B_CWD/tasks/mission.md")" == "mission.$B3B_SID2.md" ]] \
+  || fail "19b: pointer was not repointed to the new payload"
+grep -q 'second pass' "$B3B_CWD/tasks/mission.md" \
+  || fail "19b: pointer does not resolve to the new payload"
+[[ -f "$B3B_CWD/tasks/mission.$B3B_SID1.md" ]] \
+  || fail "19b: repointing must not delete the previous payload"
+B3B_MANIFEST="$REFLECT_ROOT/sessions/$B3B_SID2/manifest.json"
+jq -e '.modes.mission.pointer_action == "repointed"' "$B3B_MANIFEST" >/dev/null \
+  || fail "19b: expected pointer_action=repointed (got $(jq -r '.modes.mission.pointer_action' "$B3B_MANIFEST"))"
+jq -e '.modes.mission.refused_overwrite == false' "$B3B_MANIFEST" >/dev/null \
+  || fail "19b: refresh must not record a refusal"
+info "pointer repointed across sessions; previous payload retained"
+
+# ============================================================================
+# TEST 19c: legacy REGULAR mission.md with our stamp is preserved, not deleted
+# ============================================================================
+# Pre-pointer installs have a regular stamped tasks/mission.md. Installing the
+# pointer must not destroy it.
+echo "TEST 19c: mission — legacy stamped regular file preserved, then repointed"
+B3C_CWD="$(mktemp -d -t reflect-b3ccwd-XXXXXX)"
+assert_isolated_cwd "$B3C_CWD"
+mkdir -p "$B3C_CWD/tasks"
+{
+  printf '<!-- written-against: sha=none ts=1700000000 sid=legacy-sid-xyz -->\n'
+  printf '%s\n' '# Mission — written by the pre-pointer code'
+} > "$B3C_CWD/tasks/mission.md"
+B3C_LEGACY_SHA="$(sha256sum "$B3C_CWD/tasks/mission.md" | awk '{print $1}')"
+
+mission_stub '# Mission — post-migration
+
+## Done
+- migrated'
+B3C_SID="test-sid-legacy-migrate"
+echo "$(jq -cn --arg sid "$B3C_SID" --arg tp "$TRANSCRIPT" --arg cwd "$B3C_CWD" \
+  '{session_id:$sid,transcript_path:$tp,hook_event_name:"IdleHandoff",cwd:$cwd}')" \
+  | bash "$REFLECT_SH" mission
+(( $? == 0 )) || fail "19c: mission run failed"
+[[ -L "$B3C_CWD/tasks/mission.md" ]] || fail "19c: pointer not installed"
+B3C_MANIFEST="$REFLECT_ROOT/sessions/$B3C_SID/manifest.json"
+B3C_PRESERVED="$(jq -r '.modes.mission.legacy_preserved_as // ""' "$B3C_MANIFEST")"
+[[ -n "$B3C_PRESERVED" && -f "$B3C_PRESERVED" ]] \
+  || fail "19c: legacy file not preserved (legacy_preserved_as='$B3C_PRESERVED')"
+[[ "$(sha256sum "$B3C_PRESERVED" | awk '{print $1}')" == "$B3C_LEGACY_SHA" ]] \
+  || fail "19c: preserved legacy content differs from the original"
+[[ "$B3C_PRESERVED" == "$B3C_CWD/tasks/mission.legacy-sid-xyz.md" ]] \
+  || fail "19c: legacy file should be preserved under the sid from its own stamp (got $B3C_PRESERVED)"
+info "legacy stamped mission.md preserved as $(basename "$B3C_PRESERVED"), pointer installed"
+
+# ============================================================================
+# TEST 19d: pointer absent -> newest payload by mtime, and the choice is logged
+# ============================================================================
+echo "TEST 19d: mission — resolution picks the newest payload and says so"
+B3D_CWD="$(mktemp -d -t reflect-b3dcwd-XXXXXX)"
+assert_isolated_cwd "$B3D_CWD"
+mk_mission_payload "$B3D_CWD/tasks" "older-sid" "# older" "2 hours ago" >/dev/null
+B3D_NEWEST="$(mk_mission_payload "$B3D_CWD/tasks" "newer-sid" "# newer" "5 minutes ago")"
+[[ ! -e "$B3D_CWD/tasks/mission.md" ]] || fail "19d: fixture should have no pointer"
+
+B3D_STDERR="$STUB_SCRATCH/mission-resolve.stderr"
+B3D_OUT="$(bash "$REFLECT_SH" --mission-path "$B3D_CWD" 2>"$B3D_STDERR")"
+rc=$?
+(( rc == 0 )) || fail "19d: --mission-path exit=$rc (stderr: $(cat "$B3D_STDERR"))"
+[[ "$B3D_OUT" == "$B3D_NEWEST" ]] \
+  || fail "19d: expected newest payload '$B3D_NEWEST', got '$B3D_OUT'"
+grep -q 'newest payload by mtime' "$B3D_STDERR" \
+  || fail "19d: resolution must log that it fell back to newest-by-mtime; got: $(cat "$B3D_STDERR")"
+grep -q "$(basename "$B3D_NEWEST")" "$B3D_STDERR" \
+  || fail "19d: resolution log must name the chosen payload"
+info "no pointer: newest payload chosen and logged, never silently"
+
+# ============================================================================
+# TEST 19e: dangling pointer still resolves, and a mission run repairs it
+# ============================================================================
+echo "TEST 19e: mission — dangling pointer resolves via fallback, then is repaired"
+B3E_CWD="$(mktemp -d -t reflect-b3ecwd-XXXXXX)"
+assert_isolated_cwd "$B3E_CWD"
+B3E_EXISTING="$(mk_mission_payload "$B3E_CWD/tasks" "survivor-sid" "# survivor" "10 minutes ago")"
+# Pointer whose payload was garbage-collected.
+ln -s "mission.collected-sid.md" "$B3E_CWD/tasks/mission.md"
+[[ -L "$B3E_CWD/tasks/mission.md" && ! -f "$B3E_CWD/tasks/mission.md" ]] \
+  || fail "19e: fixture pointer should be dangling"
+
+B3E_STDERR="$STUB_SCRATCH/mission-dangling.stderr"
+B3E_OUT="$(bash "$REFLECT_SH" --mission-path "$B3E_CWD" 2>"$B3E_STDERR")"
+rc=$?
+(( rc == 0 )) || fail "19e: resumption broke on a dangling pointer (exit=$rc)"
+[[ "$B3E_OUT" == "$B3E_EXISTING" ]] \
+  || fail "19e: dangling pointer should fall back to the surviving payload (got '$B3E_OUT')"
+grep -qi 'dangling' "$B3E_STDERR" || fail "19e: dangling pointer must be reported"
+
+mission_stub '# Mission — repaired
+
+## Done
+- repair'
+B3E_SID="test-sid-repair-dangling"
+echo "$(jq -cn --arg sid "$B3E_SID" --arg tp "$TRANSCRIPT" --arg cwd "$B3E_CWD" \
+  '{session_id:$sid,transcript_path:$tp,hook_event_name:"IdleHandoff",cwd:$cwd}')" \
+  | bash "$REFLECT_SH" mission
+(( $? == 0 )) || fail "19e: repair mission run failed"
+[[ -L "$B3E_CWD/tasks/mission.md" && -f "$B3E_CWD/tasks/mission.md" ]] \
+  || fail "19e: pointer still dangling after a mission run"
+grep -q 'repaired' "$B3E_CWD/tasks/mission.md" || fail "19e: repaired pointer resolves to the wrong file"
+B3E_MANIFEST="$REFLECT_ROOT/sessions/$B3E_SID/manifest.json"
+jq -e '.modes.mission.pointer_action == "repaired_dangling"' "$B3E_MANIFEST" >/dev/null \
+  || fail "19e: expected pointer_action=repaired_dangling (got $(jq -r '.modes.mission.pointer_action' "$B3E_MANIFEST"))"
+info "dangling pointer: resolution fell back, mission run repaired it"
+
+# ============================================================================
+# TEST 19f: GC collects orphaned payloads, never the pointed-to one
+# ============================================================================
+# ~590 sessions/week would otherwise leave ~590 mission files per cwd.
+echo "TEST 19f: mission — GC removes orphaned payloads, keeps the pointer target"
+B3F_CWD="$(mktemp -d -t reflect-b3fcwd-XXXXXX)"
+assert_isolated_cwd "$B3F_CWD"
+# Orphan: stamped payload whose reflections/sessions/<sid>/ does not exist.
+B3F_ORPHAN="$(mk_mission_payload "$B3F_CWD/tasks" "gc-orphan-sid" "# orphan")"
+# Pointed-to payload, ALSO with no session dir — must survive because it is the
+# current pointer target.
+B3F_POINTED="$(mk_mission_payload "$B3F_CWD/tasks" "gc-pointed-sid" "# pointed")"
+ln -sfn "mission.gc-pointed-sid.md" "$B3F_CWD/tasks/mission.md"
+# Safety rail: a human-named, unstamped file that merely looks payload-shaped.
+printf '%s\n' '# my own notes, not machine-written' > "$B3F_CWD/tasks/mission.notes.md"
+# And a fresh payload with a live session dir — retained by the session rule.
+mkdir -p "$REFLECT_ROOT/sessions/gc-live-sid"
+B3F_LIVE="$(mk_mission_payload "$B3F_CWD/tasks" "gc-live-sid" "# live")"
+
+B3F_REMOVED="$(
+  cd "$WORKTREE" || exit 1
+  # shellcheck disable=SC1091
+  source "$SKILL_DIR/lib.sh"
+  export REFLECT_ROOT="$REFLECT_ROOT"
+  mission_gc "$B3F_CWD/tasks"
+)"
+[[ "$B3F_REMOVED" == "1" ]] \
+  || fail "19f: expected exactly 1 GC removal, got '$B3F_REMOVED' (dir: $(ls "$B3F_CWD/tasks"))"
+[[ ! -f "$B3F_ORPHAN" ]] || fail "19f: orphaned payload was not collected"
+[[ -f "$B3F_POINTED" ]] || fail "19f: GC removed the CURRENT POINTER TARGET"
+[[ -f "$B3F_CWD/tasks/mission.notes.md" ]] \
+  || fail "19f: GC deleted an unstamped, human-authored file"
+[[ -f "$B3F_LIVE" ]] || fail "19f: GC removed a payload whose session dir still exists"
+
+# Age rule: a payload with a live session dir but older than the retention
+# window is still collected.
+touch -d '90 days ago' "$B3F_LIVE"
+B3F_REMOVED2="$(
+  cd "$WORKTREE" || exit 1
+  # shellcheck disable=SC1091
+  source "$SKILL_DIR/lib.sh"
+  export REFLECT_ROOT="$REFLECT_ROOT"
+  mission_gc "$B3F_CWD/tasks"
+)"
+[[ "$B3F_REMOVED2" == "1" ]] \
+  || fail "19f: expected the over-age payload to be collected, removed='$B3F_REMOVED2'"
+[[ ! -f "$B3F_LIVE" ]] || fail "19f: over-age payload survived GC"
+[[ -f "$B3F_POINTED" ]] || fail "19f: pointer target must survive the age rule too"
+info "GC: orphan + over-age collected; pointer target, live session and unstamped file kept"
+
+# An end-to-end mission run must also GC (proves it is wired, not just present).
+B3G_CWD="$(mktemp -d -t reflect-b3gcwd-XXXXXX)"
+assert_isolated_cwd "$B3G_CWD"
+mk_mission_payload "$B3G_CWD/tasks" "gc-e2e-orphan-sid" "# e2e orphan" >/dev/null
+mission_stub '# Mission — gc e2e
+
+## Done
+- gc'
+B3G_SID="test-sid-gc-e2e"
+echo "$(jq -cn --arg sid "$B3G_SID" --arg tp "$TRANSCRIPT" --arg cwd "$B3G_CWD" \
+  '{session_id:$sid,transcript_path:$tp,hook_event_name:"IdleHandoff",cwd:$cwd}')" \
+  | bash "$REFLECT_SH" mission
+(( $? == 0 )) || fail "19f: e2e gc mission run failed"
+jq -e '.modes.mission.gc_removed >= 1' "$REFLECT_ROOT/sessions/$B3G_SID/manifest.json" >/dev/null \
+  || fail "19f: a mission run did not invoke GC (gc_removed=$(jq -r '.modes.mission.gc_removed' "$REFLECT_ROOT/sessions/$B3G_SID/manifest.json"))"
+[[ ! -f "$B3G_CWD/tasks/mission.gc-e2e-orphan-sid.md" ]] \
+  || fail "19f: e2e orphan not collected"
+info "mission run invokes GC end to end"
+
+# Restore canonical stub.
+cat >"$STUB_SCRATCH/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null || true
+cat <<'JSON'
+{"type":"result","result":"{\"patterns\":[\"stubbed pattern\"],\"discoveries\":[],\"turning_points\":[],\"digressions\":[],\"obstacles_to_autonomy\":[]}","usage":{"cache_read_input_tokens":100,"cache_creation_input_tokens":10,"input_tokens":5,"output_tokens":50}}
+JSON
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+# ============================================================================
 # FINAL GUARD: prove the whole suite left the live repo alone.
 assert_repo_tasks_untouched "end of suite"
 info "live repo tasks/ untouched by the full suite"

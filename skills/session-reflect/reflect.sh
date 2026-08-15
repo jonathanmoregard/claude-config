@@ -145,11 +145,45 @@ Modes:
                 writes <cwd>/tasks/mission.md (markdown)
 
 Introspection:
-  --budgets     print the effective timeout budgets + hook-cap arithmetic as JSON
+  --budgets           print the effective timeout budgets + hook-cap arithmetic
+  --mission-path DIR  resolve DIR/tasks' current mission payload (pointer, then
+                      newest mission.<sid>.md by mtime); logs how it resolved
+
+Mission artifact layout:
+  tasks/mission.<sid>.md   payload, unique per session (never collides)
+  tasks/mission.md         symlink to the current payload
+  A foreign or unstamped tasks/mission.md is never overwritten — the payload is
+  still written and the refusal is recorded in the manifest.
+  Retention: REFLECT_MISSION_RETENTION_DAYS (default 30); a payload is also
+  collected once reflections/sessions/<sid>/ is gone. The pointer target is
+  always kept.
 
 See README.md at ~/.claude/skills/session-reflect/README.md
 EOF
   exit 0
+fi
+
+# --- Mission resolution ------------------------------------------------------
+# `reflect.sh --mission-path <cwd>` prints the path of the current mission
+# payload for that project and logs HOW it resolved (pointer / dangling pointer
+# fallback / newest-by-mtime) to stderr. Read-only: it never repairs, so a reader
+# cannot be surprised by a resolution that also mutated the tree. Exit 1 when
+# there is no payload at all.
+#
+# Consumers should prefer this over hard-coding tasks/mission.md when they care
+# about the dangling-pointer and no-pointer cases; tasks/mission.md remains the
+# documented convention and keeps working.
+if [[ "$ARG1" == "--mission-path" ]]; then
+  _mp_cwd="${ARG2:-}"
+  if [[ -z "$_mp_cwd" || ! -d "$_mp_cwd" ]]; then
+    echo "reflect.sh --mission-path: need an existing project dir (got '$_mp_cwd')" >&2
+    exit 2
+  fi
+  if _mp_resolved="$(mission_resolve "$_mp_cwd/tasks")"; then
+    printf '%s\n' "$_mp_resolved"
+    exit 0
+  fi
+  exit 1
 fi
 
 # --- Budget introspection ----------------------------------------------------
@@ -671,7 +705,13 @@ run_worker() {
       return 0
     fi
     local mission_dir="$mission_cwd/tasks"
-    local mission_path="$mission_dir/mission.md"
+    # UNIQUE-SUFFIXED PAYLOAD + POINTER (see "MISSION ARTIFACT LAYOUT" in
+    # lib.sh). The payload name embeds the session id, so two sessions writing
+    # the same cwd cannot collide and a machine write can never land on a path a
+    # human owns. tasks/mission.md becomes a symlink to the current payload.
+    local mission_payload_name="mission.$SESSION_ID.md"
+    local mission_path="$mission_dir/$mission_payload_name"
+    local mission_pointer="$mission_dir/mission.md"
     if ! mkdir -p "$mission_dir" 2>/dev/null; then
       write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "error" \
         "$(jq -cn --arg tp "$TRANSCRIPT_PATH" --arg event "$HOOK_EVENT" --arg parent "$PARENT_SID" \
@@ -687,7 +727,9 @@ run_worker() {
     # world that still exists?" Doing this shell-side avoids asking the
     # model to emit it — prompts/mission.md forbids metadata blocks, so
     # a model-emitted stamp would conflict with its own rules. Format:
-    #   <!-- written-against: sha=<git-sha-or-none> ts=<unix-epoch> -->
+    #   <!-- written-against: sha=<git-sha-or-none> ts=<unix-epoch> sid=<sid> -->
+    # sid was added with the pointer layout: it is what lets a legacy regular
+    # tasks/mission.md be preserved under its own session's payload name.
     local mission_sha="none"
     if ( cd "$mission_cwd" 2>/dev/null && \
          git rev-parse --is-inside-work-tree >/dev/null 2>&1 ); then
@@ -696,10 +738,13 @@ run_worker() {
     local mission_ts
     mission_ts=$(date -u +%s)
 
+    # 1. Write the PAYLOAD atomically under its unique name. This can never
+    #    collide with a human-owned path, so it happens unconditionally.
     local mission_tmp
     mission_tmp="$(mktemp -p "$mission_dir" ".mission-XXXXXX.md")"
     {
-      printf '<!-- written-against: sha=%s ts=%s -->\n' "$mission_sha" "$mission_ts"
+      printf '<!-- written-against: sha=%s ts=%s sid=%s -->\n' \
+        "$mission_sha" "$mission_ts" "$SESSION_ID"
       printf '%s\n' "$inner"
     } > "$mission_tmp"
     if ! mv -f -- "$mission_tmp" "$mission_path"; then
@@ -713,6 +758,66 @@ run_worker() {
               path:$path}')"
       return 0
     fi
+
+    # 2. Decide whether we may MOVE THE POINTER. Only this step can touch a path
+    #    someone else owns, and it refuses whenever provenance is not ours.
+    local pointer_action="" pointer_refused=false legacy_preserved=""
+    if [[ ! -e "$mission_pointer" && ! -L "$mission_pointer" ]]; then
+      pointer_action="created"
+    elif [[ -L "$mission_pointer" ]]; then
+      # -L before -f: -f follows the link, so a dangling pointer would otherwise
+      # look like "absent" and a pointer-to-file like a regular file.
+      if mission_pointer_is_ours "$mission_pointer"; then
+        if [[ -f "$mission_pointer" ]]; then
+          pointer_action="repointed"
+        else
+          # Target was garbage-collected. Repointing repairs it.
+          pointer_action="repaired_dangling"
+        fi
+      else
+        pointer_action="refused_foreign_symlink"
+        pointer_refused=true
+      fi
+    elif [[ -f "$mission_pointer" ]]; then
+      if mission_has_our_stamp "$mission_pointer"; then
+        # Payload written by the pre-pointer code. Preserve it under a suffixed
+        # name (never delete it), then install the pointer.
+        if legacy_preserved="$(mission_preserve_legacy "$mission_pointer")"; then
+          pointer_action="repointed_after_preserving_legacy"
+        else
+          pointer_action="refused_legacy_preserve_failed"
+          pointer_refused=true
+        fi
+      else
+        # THE case that clobbered a hand-authored mission file on 2026-08-15.
+        pointer_action="refused_foreign_file"
+        pointer_refused=true
+      fi
+    else
+      # Directory / fifo / device at tasks/mission.md. Not ours, do not touch.
+      pointer_action="refused_not_a_regular_file"
+      pointer_refused=true
+    fi
+
+    if [[ "$pointer_refused" == "false" ]]; then
+      if ! mission_install_pointer "$mission_dir" "$mission_payload_name"; then
+        pointer_action="pointer_install_failed"
+        pointer_refused=true
+      fi
+    fi
+
+    # 3. GC stale payloads so a cwd does not collect one file per session.
+    #    Never touches the pointer target or the payload just written. A legacy
+    #    file preserved in step 2 is also kept for THIS run — its session dir is
+    #    long gone, so GC would otherwise collect it in the same breath as the
+    #    migration that was supposed to save it. Later runs may collect it under
+    #    the normal retention rules, which is GC working as documented.
+    local -a mission_gc_keep=( "$mission_payload_name" )
+    [[ -n "$legacy_preserved" ]] && mission_gc_keep+=( "$(basename -- "$legacy_preserved")" )
+    local mission_gc_removed
+    mission_gc_removed="$(mission_gc "$mission_dir" "${mission_gc_keep[@]}" 2>/dev/null || echo 0)"
+    [[ "$mission_gc_removed" =~ ^[0-9]+$ ]] || mission_gc_removed=0
+
     local mission_usage
     mission_usage=$(jq -c '.usage // {}' <<<"$claude_json" 2>/dev/null || echo '{}')
     # NOTE: intentionally NOT emitting final_complete:true here. Mission
@@ -722,13 +827,30 @@ run_worker() {
     # make the first successful mission run permanently poison all future
     # mission runs for that SID until SessionEnd cleans state. Advisor
     # HIGH-B, ARFTL round 1.
+    #
+    # status stays `complete`: the payload — the thing this mode exists to
+    # produce — was written. A refused pointer is reported alongside it
+    # (refused_overwrite/refused_path) rather than as a failure, so
+    # idle-handoff.sh's status check keeps working while an operator can still
+    # see that tasks/mission.md belongs to someone else.
     write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "complete" \
       "$(jq -cn --arg tp "$TRANSCRIPT_PATH" --arg event "$HOOK_EVENT" --arg parent "$PARENT_SID" \
           --arg path "$mission_path" --argjson usage "$mission_usage" \
           --argjson bytes "${#inner}" \
+          --arg pointer "$mission_pointer" \
+          --arg action "$pointer_action" \
+          --argjson refused "$pointer_refused" \
+          --arg legacy "$legacy_preserved" \
+          --argjson gc "$mission_gc_removed" \
           '{source_transcript:$tp,hook_event_name:$event,
             parent_session_id:(if $parent == "" then null else $parent end),
-            artifact:$path,bytes:$bytes,usage:$usage}')"
+            artifact:$path,bytes:$bytes,usage:$usage,
+            pointer:(if $refused then null else $pointer end),
+            pointer_action:$action,
+            refused_overwrite:$refused,
+            refused_path:(if $refused then $pointer else null end),
+            legacy_preserved_as:(if $legacy == "" then null else $legacy end),
+            gc_removed:$gc}')"
     return 0
   fi
 

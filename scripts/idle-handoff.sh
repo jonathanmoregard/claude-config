@@ -597,7 +597,13 @@ for project_dir in "$PROJECTS_DIR"/*/; do
     # Porcelain post-write, excluding tasks/mission.md and its parent dir.
     # If human editor touched other tracked files during the write window,
     # we want to skip.
-    post_write_porcelain=$(timeout 5 sh -c 'cd "$1" && git status --porcelain -- ":(exclude)tasks/mission.md" 2>/dev/null | head -c 1' _ "$candidate_cwd" || echo "")
+    #
+    # `tasks/mission.*.md` is excluded too: mission mode now writes a
+    # unique-suffixed payload (tasks/mission.<sid>.md) with tasks/mission.md as a
+    # symlink to it, so our OWN write leaves a new untracked payload behind. Without
+    # this exclusion the post-write porcelain would always be non-empty and autofork
+    # would never fire again.
+    post_write_porcelain=$(timeout 5 sh -c 'cd "$1" && git status --porcelain -- ":(exclude)tasks/mission.md" ":(exclude)tasks/mission.*.md" 2>/dev/null | head -c 1' _ "$candidate_cwd" || echo "")
     if [[ -n "$post_write_porcelain" ]]; then
       count_skipped_git_stale=$((count_skipped_git_stale + 1))
       log "autofork skipped sid=$sid cwd=$candidate_cwd (non-mission dirty files after mission-write)"
