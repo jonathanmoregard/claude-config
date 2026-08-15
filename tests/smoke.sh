@@ -16,6 +16,59 @@ REFLECT_SH="$SKILL_DIR/reflect.sh"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 info() { echo "  -> $*"; }
 
+# --- Live-repo isolation guard -----------------------------------------------
+# HARD REQUIREMENT: no test may write into a real repo.
+#
+# REFLECT_ROOT isolation is NOT sufficient on its own. `mission` mode resolves
+# its artifact from the PAYLOAD CWD (`<cwd>/tasks/mission.md`), not from
+# REFLECT_ROOT — and PreCompact pre-fires mission mode on the 2nd compact of a
+# session. This suite used to pass `cwd: $WORKTREE`, so TEST 3b's second
+# PreCompact wrote a stubbed reflection over this worktree's real
+# tasks/mission.md (observed 2026-08-15). Every payload cwd now points at a
+# scratch dir, and assert_isolated_cwd refuses anything that could reach a live
+# checkout.
+TEST_CWD="$(mktemp -d -t reflect-cwd-XXXXXX)"
+
+assert_isolated_cwd() {
+  local c="${1:-}"
+  [[ -n "$c" ]] || fail "test isolation: empty payload cwd"
+  [[ -d "$c" ]] || fail "test isolation: payload cwd '$c' does not exist"
+  # Refuse anything inside a real checkout or the live deployment.
+  case "$c" in
+    "$WORKTREE"|"$WORKTREE"/*|"$HOME"/.claude|"$HOME"/.claude/*|"$HOME"/Repos/*|"$HOME"/worktrees/*)
+      fail "test isolation: payload cwd '$c' is inside a live checkout; mission mode would write \$cwd/tasks/mission.md there"
+      ;;
+  esac
+  # Belt-and-braces: must be a tmpfs/scratch path.
+  case "$c" in
+    /tmp/*|/var/tmp/*|/run/*) ;;
+    *) fail "test isolation: payload cwd '$c' is not a scratch dir" ;;
+  esac
+}
+assert_isolated_cwd "$TEST_CWD"
+
+# Snapshot the worktree's own tasks/ dir so we can prove no test touched it.
+# Compare before/after (not emptiness) — an in-flight session legitimately has
+# dirty files here.
+REPO_TASKS_BEFORE="$(cd "$WORKTREE" && git status --porcelain -- tasks 2>/dev/null | sort || true)"
+REPO_TASKS_SHAS_BEFORE="$(find "$WORKTREE/tasks" -maxdepth 1 -type f -print0 2>/dev/null \
+  | xargs -0 -r sha256sum 2>/dev/null | sort || true)"
+assert_repo_tasks_untouched() {
+  local when="${1:-}"
+  local now_status now_shas
+  now_status="$(cd "$WORKTREE" && git status --porcelain -- tasks 2>/dev/null | sort || true)"
+  now_shas="$(find "$WORKTREE/tasks" -maxdepth 1 -type f -print0 2>/dev/null \
+    | xargs -0 -r sha256sum 2>/dev/null | sort || true)"
+  if [[ "$now_status" != "$REPO_TASKS_BEFORE" ]]; then
+    fail "test isolation ($when): \$WORKTREE/tasks git status changed — a test wrote into the live repo
+      before: $REPO_TASKS_BEFORE
+      after:  $now_status"
+  fi
+  if [[ "$now_shas" != "$REPO_TASKS_SHAS_BEFORE" ]]; then
+    fail "test isolation ($when): \$WORKTREE/tasks file contents changed — a test wrote into the live repo"
+  fi
+}
+
 # --- Stub claude on PATH -----------------------------------------------------
 # Emits a canonical Claude Code -p JSON envelope regardless of input.
 # We drop the stub into a scratch dir on PATH so we can rewrite it per-test
@@ -60,7 +113,8 @@ JSONL
 fake_payload() {
   # $1=event, $2=session_id, [$3=parent_session_id (env inject)]
   local event="$1" sid="$2"
-  jq -cn --arg event "$event" --arg sid "$sid" --arg tp "$TRANSCRIPT" --arg cwd "$WORKTREE" \
+  assert_isolated_cwd "$TEST_CWD"
+  jq -cn --arg event "$event" --arg sid "$sid" --arg tp "$TRANSCRIPT" --arg cwd "$TEST_CWD" \
     '{session_id:$sid, transcript_path:$tp, hook_event_name:$event, cwd:$cwd}'
 }
 
@@ -136,7 +190,7 @@ fi
 # ============================================================================
 echo "TEST 3: precompact synchronous checkpoint"
 PC_SID="test-sid-precompact"
-PC_PAYLOAD=$(jq -cn --arg sid "$PC_SID" --arg tp "$TRANSCRIPT" --arg cwd "$WORKTREE" \
+PC_PAYLOAD=$(jq -cn --arg sid "$PC_SID" --arg tp "$TRANSCRIPT" --arg cwd "$TEST_CWD" \
   '{session_id:$sid, transcript_path:$tp, hook_event_name:"PreCompact", cwd:$cwd, trigger:"auto", custom_instructions:""}')
 
 echo "$PC_PAYLOAD" | bash "$REFLECT_SH" precompact
@@ -163,7 +217,7 @@ info "precompact wrote $CP_COUNT checkpoint(s)"
 # and write_manifest never latches final_complete for precompact.
 echo "TEST 3b: repeated PreCompact appends new checkpoint"
 PC2_SID="test-sid-precompact-double"
-PC2_PAYLOAD=$(jq -cn --arg sid "$PC2_SID" --arg tp "$TRANSCRIPT" --arg cwd "$WORKTREE" \
+PC2_PAYLOAD=$(jq -cn --arg sid "$PC2_SID" --arg tp "$TRANSCRIPT" --arg cwd "$TEST_CWD" \
   '{session_id:$sid, transcript_path:$tp, hook_event_name:"PreCompact", cwd:$cwd, trigger:"auto", custom_instructions:""}')
 
 echo "$PC2_PAYLOAD" | bash "$REFLECT_SH" precompact
@@ -205,6 +259,20 @@ fi
 
 info "two sequential PreCompacts wrote 2 checkpoints, final_complete stayed false"
 
+# The 2nd PreCompact pre-fires mission mode, which writes <cwd>/tasks/mission.md.
+# Assert it landed in the scratch cwd and that the live repo was untouched — the
+# exact failure this suite caused on 2026-08-15.
+assert_repo_tasks_untouched "after TEST 3b (2nd-compact mission pre-fire)"
+for _ in $(seq 1 40); do
+  [[ -f "$TEST_CWD/tasks/mission.md" ]] && break
+  sleep 0.25
+done
+[[ -f "$TEST_CWD/tasks/mission.md" ]] \
+  || fail "2nd-compact mission pre-fire produced no $TEST_CWD/tasks/mission.md"
+grep -q '^<!-- written-against: sha=' "$TEST_CWD/tasks/mission.md" \
+  || fail "mission.md missing the written-against provenance stamp"
+info "mission pre-fire artifact isolated to scratch cwd; live repo tasks/ untouched"
+
 # ============================================================================
 # TEST 3d: cross-mode race — PreCompact's transient started state must NOT
 # block a concurrent SessionEnd
@@ -232,7 +300,7 @@ JSON
 STUB
 chmod +x "$STUB_SCRATCH/claude"
 
-RACE_PC_PAYLOAD=$(jq -cn --arg sid "$RACE_SID" --arg tp "$TRANSCRIPT" --arg cwd "$WORKTREE" \
+RACE_PC_PAYLOAD=$(jq -cn --arg sid "$RACE_SID" --arg tp "$TRANSCRIPT" --arg cwd "$TEST_CWD" \
   '{session_id:$sid, transcript_path:$tp, hook_event_name:"PreCompact", cwd:$cwd, trigger:"auto", custom_instructions:""}')
 RACE_SE_PAYLOAD="$(fake_payload SessionEnd "$RACE_SID")"
 
@@ -387,9 +455,9 @@ DISP_ROUNDS=6
 DISP_FAILS=0
 for r in $(seq 1 "$DISP_ROUNDS"); do
   DR_SID="disp-race-sid-$r"
-  DR_PC_PAYLOAD=$(jq -cn --arg sid "$DR_SID" --arg tp "$TRANSCRIPT" --arg cwd "$WORKTREE" \
+  DR_PC_PAYLOAD=$(jq -cn --arg sid "$DR_SID" --arg tp "$TRANSCRIPT" --arg cwd "$TEST_CWD" \
     '{session_id:$sid, transcript_path:$tp, hook_event_name:"PreCompact", cwd:$cwd, trigger:"auto"}')
-  DR_SE_PAYLOAD=$(jq -cn --arg sid "$DR_SID" --arg tp "$TRANSCRIPT" --arg cwd "$WORKTREE" \
+  DR_SE_PAYLOAD=$(jq -cn --arg sid "$DR_SID" --arg tp "$TRANSCRIPT" --arg cwd "$TEST_CWD" \
     '{session_id:$sid, transcript_path:$tp, hook_event_name:"SessionEnd", cwd:$cwd}')
 
   # Fire both dispatchers simultaneously.
@@ -519,7 +587,7 @@ mkdir -p "$REFLECT_ROOT/sessions/$PARENT_SID"
 echo '{"session_id":"'"$PARENT_SID"'"}' > "$REFLECT_ROOT/sessions/$PARENT_SID/manifest.json"
 
 export CLAUDE_PARENT_SESSION_ID="$PARENT_SID"
-SUB_PAYLOAD=$(jq -cn --arg sid "$SUB_SID" --arg tp "$TRANSCRIPT" --arg cwd "$WORKTREE" \
+SUB_PAYLOAD=$(jq -cn --arg sid "$SUB_SID" --arg tp "$TRANSCRIPT" --arg cwd "$TEST_CWD" \
   '{session_id:$sid, transcript_path:$tp, hook_event_name:"SubagentStop", cwd:$cwd, stop_hook_active:false}')
 
 echo "$SUB_PAYLOAD" | bash "$REFLECT_SH" subagentstop
@@ -558,7 +626,7 @@ info "malformed payload handled (exit=0)"
 echo "TEST 6: path-traversal rejection"
 BAD_SIDS=('../evil' '/abs/evil' 'has space' 'a;b' $'nl\nsid' 'sub/dir' '.' '..' '...' '.hidden')
 for bad in "${BAD_SIDS[@]}"; do
-  P="$(jq -cn --arg sid "$bad" --arg tp "$TRANSCRIPT" --arg cwd "$WORKTREE" \
+  P="$(jq -cn --arg sid "$bad" --arg tp "$TRANSCRIPT" --arg cwd "$TEST_CWD" \
         '{session_id:$sid, transcript_path:$tp, hook_event_name:"SessionEnd", cwd:$cwd}')"
   echo "$P" | bash "$REFLECT_SH" sessionend >/dev/null
   rc=$?
@@ -1095,8 +1163,12 @@ grep -q "unparseable started_at" "$CORRUPT_STDERR" \
 info "corrupt started_at keeps in-flight state (no phantom reap), warns to stderr"
 
 # ============================================================================
+# FINAL GUARD: prove the whole suite left the live repo alone.
+assert_repo_tasks_untouched "end of suite"
+info "live repo tasks/ untouched by the full suite"
+
 if [[ "${REFLECT_DEBUG:-}" != "1" ]]; then
-  rm -rf "$REFLECT_ROOT" "$STUB_SCRATCH"
+  rm -rf "$REFLECT_ROOT" "$STUB_SCRATCH" "$TEST_CWD"
 fi
 
 echo "OK: all smoke tests passed"
