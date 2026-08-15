@@ -56,7 +56,13 @@ ARG2="${2:-}"
 #
 # Check runs BEFORE the mode allow-list so an invalid mode still no-ops
 # (subprocess-triggered hooks must never fail loud into the caller).
-if [[ "${REFLECT_SUBPROCESS:-0}" == "1" ]]; then
+#
+# `reflect_truthy` (1|true|yes|on, case-insensitive), NOT `== "1"`, and the
+# same predicate self-compact-trigger.py uses. Previously this side accepted
+# only "1" while the Python side treated any non-empty value as truthy, so
+# `REFLECT_SUBPROCESS=0` disabled the self-compact trigger while telling this
+# dispatcher it was NOT in a subprocess — one env lever, opposite meanings.
+if reflect_truthy "${REFLECT_SUBPROCESS:-}"; then
   # Best-effort marker. Use REFLECT_ROOT (defaulted below via lib.sh source)
   # via the default if unset. Do NOT trust jq or the payload structure here
   # — we may not have valid stdin, and a broken jq call must not crash us.
@@ -206,6 +212,7 @@ if [[ "$ARG1" == "--budgets" ]]; then
     --argjson cap "$REFLECT_HOOK_CAP_SECONDS" \
     --argjson grace "$REFLECT_KILL_GRACE_SECONDS" \
     --argjson reserve "$REFLECT_BUDGET_RESERVE_SECONDS" \
+    --argjson maxsync "$(reflect_max_sync_budget)" \
     --argjson precompact "$(reflect_budget_for precompact)" \
     --argjson sessionend "$(reflect_budget_for sessionend)" \
     --argjson subagentstop "$(reflect_budget_for subagentstop)" \
@@ -213,6 +220,7 @@ if [[ "$ARG1" == "--budgets" ]]; then
     '{hook_cap_seconds:$cap,
       kill_grace_seconds:$grace,
       reserve_seconds:$reserve,
+      max_synchronous_budget_seconds:$maxsync,
       budgets:{precompact:$precompact,sessionend:$sessionend,
                subagentstop:$subagentstop,mission:$mission},
       synchronous_modes:["precompact"],
@@ -275,12 +283,23 @@ if [[ "$ARG1" == "--worker" ]]; then
   # If the wait times out, some OTHER worker for this mode genuinely owns the
   # lock — leave it alone and exit quietly (its terminal write is the one that
   # counts; the reaper covers the pathological case).
+  #
+  # Both failure paths EXIT rather than continue. Opening the lockfile used to
+  # be `if exec 9>…; then … fi` with no else: a failed open (unwritable dir,
+  # EROFS, ENOSPC, EMFILE) fell through and the worker ran with NO per-mode lock
+  # at all — silently re-enabling the exact last-write-wins `mv` race on
+  # final.json that this lock exists to prevent. `exec` redirection failure does
+  # not abort the shell here either (bash only exits on it in POSIX mode), so
+  # nothing else caught it. Running unlocked is worse than not running: the
+  # reflection we would produce could destroy a peer's.
   if [[ -n "${REFLECT_LOCKFILE:-}" ]]; then
-    if exec 9>"$REFLECT_LOCKFILE"; then
-      if ! flock -w 5 9; then
-        echo "reflect.sh: worker could not acquire $REFLECT_LOCKFILE within 5s; another worker owns this mode" >&2
-        exit 0
-      fi
+    if ! exec 9>"$REFLECT_LOCKFILE"; then
+      echo "reflect.sh: worker could not OPEN REFLECT_LOCKFILE=$REFLECT_LOCKFILE (sid=$SESSION_ID mode=$MODE); refusing to run WITHOUT the per-mode lock — an unlocked worker can lose a peer's final.json to a last-write-wins mv" >&2
+      exit 0
+    fi
+    if ! flock -w 5 9; then
+      echo "reflect.sh: worker could not acquire $REFLECT_LOCKFILE within 5s; another worker owns this mode" >&2
+      exit 0
     fi
   fi
 fi

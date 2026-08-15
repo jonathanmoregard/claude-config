@@ -55,6 +55,47 @@ _REFLECT_LIB_SOURCED=1
 : "${REFLECT_BUDGET_SUBAGENTSTOP:=40}"
 : "${REFLECT_BUDGET_MISSION:=60}"
 
+# --- Enforcement of the arithmetic above (not just documentation) ------------
+# REFLECT_BUDGET_PRECOMPACT is an operator-facing override and was never checked
+# against the cap. 50 gives 50 + 10 + 5 = 65 > 60, i.e. the external SIGKILL
+# wins again and the manifest is orphaned at `started` — the pathology the whole
+# budget design exists to prevent, reachable by one env var.
+#
+# So: for the only mode that runs SYNCHRONOUSLY inside a hook (precompact),
+# budget + grace + reserve MUST be <= cap. A violating override is CLAMPED, not
+# refused — refusing would take reflection down entirely for a mis-set variable,
+# whereas clamping keeps it working inside the cap — and the clamp is logged to
+# stderr so it is visible in the hook output rather than being a silent
+# behaviour change. A non-numeric or non-positive value falls back to the
+# shipped default and is logged the same way.
+#
+# Detached modes (sessionend / subagentstop / async mission) are off the hook
+# clock and deliberately not clamped.
+REFLECT_BUDGET_PRECOMPACT_DEFAULT=40
+
+# reflect_max_sync_budget — largest budget a synchronous mode may use.
+reflect_max_sync_budget() {
+  local m=$(( REFLECT_HOOK_CAP_SECONDS - REFLECT_KILL_GRACE_SECONDS - REFLECT_BUDGET_RESERVE_SECONDS ))
+  (( m < 1 )) && m=1
+  printf '%s' "$m"
+}
+
+# reflect_enforce_sync_budget_cap — run at source time, so every consumer
+# (dispatcher, worker, `--budgets`) sees the same enforced value.
+reflect_enforce_sync_budget_cap() {
+  local max
+  max="$(reflect_max_sync_budget)"
+  if [[ ! "$REFLECT_BUDGET_PRECOMPACT" =~ ^[0-9]+$ ]] || (( REFLECT_BUDGET_PRECOMPACT < 1 )); then
+    echo "reflect: REFLECT_BUDGET_PRECOMPACT='$REFLECT_BUDGET_PRECOMPACT' is not a positive integer; RESET to the shipped default ${REFLECT_BUDGET_PRECOMPACT_DEFAULT}s" >&2
+    REFLECT_BUDGET_PRECOMPACT="$REFLECT_BUDGET_PRECOMPACT_DEFAULT"
+  fi
+  if (( REFLECT_BUDGET_PRECOMPACT > max )); then
+    echo "reflect: REFLECT_BUDGET_PRECOMPACT=${REFLECT_BUDGET_PRECOMPACT}s + grace ${REFLECT_KILL_GRACE_SECONDS}s + reserve ${REFLECT_BUDGET_RESERVE_SECONDS}s exceeds the HARD ${REFLECT_HOOK_CAP_SECONDS}s hook cap; CLAMPED to ${max}s so the internal timeout still wins the race against the external SIGKILL" >&2
+    REFLECT_BUDGET_PRECOMPACT="$max"
+  fi
+}
+reflect_enforce_sync_budget_cap
+
 # reflect_budget_for <mode> — effective timeout budget in seconds.
 reflect_budget_for() {
   case "${1:-}" in
