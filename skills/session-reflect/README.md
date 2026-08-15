@@ -241,6 +241,23 @@ subprocess, unless `REFLECT_FORCE=1`. Different modes for the same session
 never block each other — a PreCompact in flight does not stop SessionEnd
 from producing `final.json`.
 
+### Callers of `mission` mode
+
+| caller | how | why that way |
+|---|---|---|
+| `reflect.sh precompact` (2nd+ compact) | `REFLECT_ASYNC=1` | the hook clock cannot afford a model call |
+| `scripts/idle-handoff.sh` | synchronous | it reads `modes.mission.status` immediately after |
+| `~/.claude/self-compact-trigger.py` (`Stop` hook) | `REFLECT_ASYNC=1 REFLECT_FORCE=1` | same hook-cap reason, and a threshold crossing must produce a handoff describing the state *at* the crossing — an earlier `complete` mission for the session would otherwise leave the resume working from something stale |
+
+The self-compact trigger fires once per session per crossing of
+`self_compact.threshold` (default 30% of the detected context window) and is OFF
+unless `components.self_compact` is boolean `true` in
+`~/.claude/recursive-self-improvement/config/config.json`. It only writes the
+handoff and records a request; `scripts/idle-handoff.sh` performs the
+reset+resume under its own guard chain. Nothing here auto-invokes `/compact` or
+`/clear` — neither is agent-triggerable, and "reset" means the *next* process is
+a fresh one seeded from the handoff.
+
 ## Inspecting artifacts
 
 ```bash

@@ -2158,7 +2158,10 @@ mkdir -p "$B7_PROJ"
 B7_TP="$B7_PROJ/$B7_SID.jsonl"
 mk_context_transcript "$B7_TP" "claude-opus-5" 330000 "$B7_CWD" 25
 
-# Control: same shape, same idleness, NO self-compact request.
+# Control: same shape, same idleness, same fresh handoff with a real ## Next —
+# everything EXCEPT a self-compact request. It is deliberately fork-ready, so if
+# the widening degenerated into "remove the idle floor" this session would fork
+# and the assertion below catches it.
 B7_CTRL_SID="test-sid-b7-control"
 B7_CTRL_CWD="$(mktemp -d -t reflect-b7ctrl-XXXXXX)"
 assert_isolated_cwd "$B7_CTRL_CWD"
@@ -2166,6 +2169,8 @@ mk_candidate_repo "$B7_CTRL_CWD" || fail "24: could not build control repo"
 B7_CTRL_PROJ="$B7_H/.claude/projects/-tmp-b7ctrl"
 mkdir -p "$B7_CTRL_PROJ"
 mk_context_transcript "$B7_CTRL_PROJ/$B7_CTRL_SID.jsonl" "claude-opus-5" 330000 "$B7_CTRL_CWD" 25
+mk_mission_payload "$B7_CTRL_CWD/tasks" "$B7_CTRL_SID" "$(cat "$SC_MISSION_FILE")" >/dev/null
+ln -sfn "mission.$B7_CTRL_SID.md" "$B7_CTRL_CWD/tasks/mission.md"
 
 # Fire the real Stop hook so the request marker AND the handoff are genuine.
 counting_stub "$B7_H/calls" "$SC_MISSION_FILE"

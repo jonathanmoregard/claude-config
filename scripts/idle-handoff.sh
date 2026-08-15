@@ -870,13 +870,13 @@ PROMPT
     ) </dev/null
   fi
   record_fork "$candidate_cwd"
-  # Consume the request only once a fork was actually spawned. A request that
-  # got as far as a skip (no ## Next, budget, staleness) survives so a later
-  # tick can retry when the blocker clears; expiry bounds that at
-  # SELF_COMPACT_REQUEST_MAX_AGE_SECONDS.
-  if (( ctx_trigger == 1 )); then
-    consume_context_request "$sid"
-  fi
+  # Consume any pending request once a fork actually spawned — including when
+  # this candidate came in through the idle path, since the resume it asked for
+  # has now happened either way. A request that only got as far as a SKIP (no
+  # ## Next, budget, staleness) is deliberately left in place so a later tick can
+  # retry when the blocker clears; expiry bounds that at
+  # SELF_COMPACT_REQUEST_MAX_AGE_SECONDS. No-op when there is no marker.
+  consume_context_request "$sid"
   forks_this_run=$((forks_this_run + 1))
   count_forked=$((count_forked + 1))
 done
