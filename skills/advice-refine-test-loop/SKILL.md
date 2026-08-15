@@ -85,36 +85,66 @@ loop for hours. This skill's own trigger includes "the user is going to bed",
 so the failure mode is an unattended overnight run draining both quota
 buckets with nothing to show. Bound both loops.
 
-**Track per round.** `blockers_r` = the BLOCKER+HIGH count that drove round
-`r`, measured AFTER step 4.5 drops (`verified:false` findings are not real
-work). This is the same `$blockers` computed at step 4, recomputed on the
-post-validator array. Append it to `blockers_per_round[phase]` in the run
-state at step 7.
+**The gate measures MATERIALITY, not headcount.** A raw BLOCKER+HIGH count is
+a bad proxy for progress: a round that finds two *new, reproducible* defects on
+an 80-commit diff is the loop working, and stopping to ask about it wastes the
+user's attention on a question with an obvious answer. What actually
+distinguishes progress from churn is whether each round surfaces defects that
+are (a) NEW and (b) SURVIVE REPRODUCTION. Count them, not findings.
+
+**Track per round**, appended to `rounds[phase]` in the run state at step 7:
+
+- `new_r` — BLOCKER+HIGH findings not already reported earlier in this run,
+  deduped by (file, line, claim), measured AFTER step 4.5 drops. A finding
+  re-flagged from a prior round is NOT new, even if worded differently.
+- `repro_r` — of those `new_r`, how many the fix stage EMPIRICALLY REPRODUCED
+  (step 5). A finding that could not be reproduced was never real work.
 
 **Gate, evaluated at step 9 before starting round r+1:**
 
 ```bash
-# b = blockers_per_round for the current phase, e.g. (5 3 3)
-n=${#b[@]}
-# 1. Non-convergence: no strict decrease across the last two rounds.
-if (( n >= 3 )) && (( b[n-1] >= b[n-2] )) && (( b[n-2] >= b[n-3] )); then
-  stop="non-convergence"
+# Continue while the round produced at least one new, reproduced blocker.
+if (( repro_r >= 1 )); then
+  continue_round=1            # still finding real defects — do NOT ask, just go
 fi
-# 2. Nominal cap of 3 rounds, exceeded ONLY while still strictly shrinking.
-if (( n >= 3 )) && ! (( b[n-1] < b[n-2] )); then
-  stop="round-cap"
+
+# Converged: a round that surfaced nothing new and real.
+if (( repro_r == 0 )); then
+  stop="converged"            # advance to the next phase, no user input needed
+fi
+
+# Guessing: findings keep arriving but stop surviving reproduction.
+# Two consecutive rounds where under half of new blockers reproduced.
+if (( n >= 2 )) && (( 2*repro_r < new_r )) && (( 2*repro_prev < new_prev )); then
+  stop="unreproducible"       # the advisor is pattern-matching, not analysing
+fi
+
+# Hard backstop only. Not a convergence signal — a cost ceiling.
+if (( n >= 8 )); then stop="ceiling"; fi
+if [[ -n "$BUDGET_TOTAL" ]] && (( $(budget_remaining) < 60000 )); then
+  stop="budget"
 fi
 ```
 
-In prose: **nominal cap is 3 rounds per phase.** Round 4+ is permitted only
-when the blocker count strictly decreased in the immediately preceding round.
-Independently, if the count fails to strictly decrease across two consecutive
-rounds, stop — regardless of round number. A phase that is still shrinking
-its blocker count is converging and may continue; one that is flat or growing
-is not, and more rounds will not fix that.
+In prose: **keep going while each round yields at least one new defect that
+reproduces.** Round count is irrelevant while that holds — round 7 finding a
+real data-loss bug is worth more than stopping at round 3 for tidiness. Stop
+when a round finds nothing new and real (`converged` — this is the good exit,
+advance to the next phase silently), when findings stop surviving reproduction
+across two consecutive rounds (`unreproducible` — the advisor has run out of
+analysis and is pattern-matching), or at the hard ceiling / budget floor.
 
-**On stop, route to the EXISTING Phase 2 PAUSE handler** — do not invent a
-second escalation path:
+`converged` and `unreproducible` do NOT stop to ask. `converged` advances.
+`unreproducible` advances too, with the unreproduced findings surfaced in the
+phase's exit commit message — an advisor that can't produce reproducible
+findings has stopped adding coverage, and asking a human to adjudicate a list
+of unreproducible claims is exactly the wrong use of their attention.
+
+**Only `ceiling` and `budget` route to the PAUSE handler**, because those are
+resource limits a human owns, not quality judgements the loop can make.
+
+**On a `ceiling` / `budget` stop, route to the EXISTING Phase 2 PAUSE handler**
+— do not invent a second escalation path:
 
 - **Interactive:** print `"Phase <P> stopped: <reason> after <n> rounds
   (blockers per round: <b>). Options: (a) continue N more rounds anyway,
@@ -152,7 +182,8 @@ no exceptions:**
   "status": "running | pending-human | complete",
   "phase": "1 | 2 | 3 | 4a | 4b",
   "round": 3,
-  "blockers_per_round": {"1": [5, 2, 0], "2": [1, 0]},
+  "rounds": {"1": [{"new": 5, "repro": 5}, {"new": 2, "repro": 2}, {"new": 0, "repro": 0}],
+             "2": [{"new": 1, "repro": 1}, {"new": 0, "repro": 0}]},
   "phase3_resets": 0,
   "round_commits": ["a1b2c3d", "e4f5g6h"],
   "fixed_summary": ["<one line per fixed finding, phase-tagged>"],
@@ -216,7 +247,7 @@ Skip specialists when the diff is clearly out-of-scope (pure prose docs, VM test
 
 **Usage-limit fallback (primary + specialists):** if any dispatch returns with "usage limit" in the result (Fable/default org-monthly quota exhausted), re-dispatch ONCE with `model="claude-opus-5"` — Opus is a separate quota bucket and typically completes. Do this only on limit-hit; other failures (crash, timeout, refusal) get diagnosed, not fallback-masked. Never re-dispatch a third time — if Opus also 429s, the round exits with a note in the round's commit message.
 
-Loop rounds until primary AND all dispatched specialists return `PASS` (or `PASS_WITH_FIXES`; consolidator handles), **subject to the "Loop bounds" gate** — nominal 3 rounds, extended only while the blocker count is strictly shrinking, stopped on two consecutive non-decreasing rounds. Then move to Phase 2. For the merged primary+specialist round, `blockers_r` is the count over the DEDUPED union (a defect both reviewers flag is one blocker, not two — otherwise dropping a duplicate reads as convergence).
+Loop rounds until primary AND all dispatched specialists return `PASS` (or `PASS_WITH_FIXES`; consolidator handles), **subject to the "Loop bounds" gate** — keep going while each round yields at least one NEW blocker that REPRODUCES; stop when a round finds nothing new and real. Then move to Phase 2. For the merged primary+specialist round, `new_r` is counted over the DEDUPED union (a defect both reviewers flag is one finding, not two — and a defect two reviewers converge on is higher-confidence, so reproduce it first).
 
 ## Phase 2: Codex (GPT-5.5) advisor
 
@@ -245,7 +276,7 @@ Parse: `verdict=$(codex exec … | jq -r '.verdict')`. Values: `PASS`, `PASS_WIT
 
 **Verdict-missing:** if `jq -r '.verdict'` prints `null` or errors, treat the round as failed and re-run once with an explicit "your last output was not valid JSON — emit exactly the verdict-schema.json shape" reminder. On second verdict-missing, PAUSE per above (do NOT silently advance — a Codex round that can't emit a parseable verdict has produced zero coverage).
 
-**Budget expectation:** Phase 2 should usually complete in 1-2 rounds because Opus already caught the bulk. If Codex demands ≥3 rounds, that IS the signal — Codex saw something Opus missed, and the extra rounds are the reason Phase 2 exists. But "the extra rounds are justified" holds only while Codex is *converging*: the "Loop bounds" gate still applies here unmodified. Round 4+ requires the blocker count to have strictly decreased in round 3. Codex finding genuinely new things each round shrinks its own blocker list as you fix them; Codex re-flagging a flat list across rounds is churn, and churn on the tighter Plus quota is exactly what Phase 2 cannot afford.
+**Budget expectation:** Phase 2 should usually complete in 1-2 rounds because Opus already caught the bulk. If Codex demands ≥3 rounds, that IS the signal — Codex saw something Opus missed, and the extra rounds are the reason Phase 2 exists. Do not read a flat blocker COUNT as churn: two new reproducible defects in round 4 is the loop working, and on a large diff the count can sit flat for rounds while every round finds something real. The distinction that matters is novelty and reproducibility, which is what the "Loop bounds" gate measures. Codex re-flagging findings that no longer reproduce is the actual churn signal, and the gate stops on that.
 
 Loop rounds until Codex emits `PASS` (or `PASS_WITH_FIXES`; consolidator handles), **subject to the "Loop bounds" gate**. A non-convergence stop here routes to the same PAUSE handler as the four failure modes above. Then move to Phase 3.
 
@@ -345,7 +376,9 @@ After consolidator exits (clean or bounded), advance to the next phase using the
 | Batch all rounds into one commit | Loses bisectable history |
 | Skip re-verification after each fix | Regressions hide in the batch |
 | Stop after round 1 because it "felt thorough" | Most valuable finding often lands in round 3. Stop on the "Loop bounds" gate, not on a feeling — the gate is what makes "keep going" safe to say. |
-| Keep looping a phase because the advisor "still has notes" | The bound is convergence, not exhaustion. Flat or growing BLOCKER+HIGH across two rounds means more rounds won't help — PAUSE and hand it to the human. Unbounded loops on a "going to bed" trigger drain both quota buckets overnight and ship nothing. |
+| Keep looping a phase because the advisor "still has notes" | The bound is new-and-reproducible, not exhaustion. Notes that don't reproduce aren't work. Stop when a round finds nothing NEW that SURVIVES REPRO — not when the count stops shrinking. |
+| Stop a phase because the blocker COUNT went flat | Count is a bad proxy. A round that finds two new reproducible defects on a large diff is the loop working, and stopping to ask about it spends the user's attention on a question with an obvious answer. Judge novelty and reproducibility. |
+| PAUSE and ask the human on a quality judgement the loop can make itself | Only resource limits (hard round ceiling, token budget) are the human's call. `converged` advances silently; `unreproducible` advances with findings surfaced. Asking a human to adjudicate unreproducible claims is the wrong use of their attention. |
 | Reset to Phase 1 a second time from Phase 3 | Capped at one reset. A diff still producing fresh BLOCKER/HIGH after a full 1→2→3 pass wants splitting, not another lap through both vendors. |
 | Skip writing `tasks/arftl-run.json` because "the loop is nearly done" | Nearly-done is when a compact is most likely and the fix history is most expensive to lose. Write it at every round commit, same step. |
 | Restart at Phase 1 after a compact or crash | Check `tasks/arftl-run.json` first. Re-running phases that already PASSed re-burns both quotas to reproduce a result you already have on disk. |
@@ -578,7 +611,8 @@ Final commit or chat message: round count + categories of bug caught (fail-open 
 
 Also state, so the run is greppable and a stopped run is never mistaken for a clean one:
 
-- per-phase round counts and `blockers_per_round` (the convergence trace)
+- per-phase round counts and `rounds` (the convergence trace: new vs reproduced
+  blockers per round — the shape that shows whether each round bought anything)
 - accepted commit SHA + whether the worktree is clean
 - how the run ended: `PASS` / `PASS_WITH_FIXES` / `pending-human` **plus the `pause_reason`** if it stopped on a bound rather than a verdict
 - anything left in `pending_for_human.md`
