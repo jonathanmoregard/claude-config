@@ -154,20 +154,57 @@ self_compact_enabled() {
   [[ "$v" == "on" ]]
 }
 
+# Prints the configured threshold, or the sentinel `default` (key absent — a
+# choice not to configure it) or `invalid` (present but unusable).
+#
+# Both sentinels exist because silently substituting 0.30 is what made producer
+# and consumer disagree with no log line. Two separate ways that happened:
+#   * an ill-typed value (`"0.5"`, 50, 0, null) fell back to 0.30 here while
+#     self-compact-trigger.py fell back to 0.30 by its own route — and now
+#     refuses outright, so this side must refuse too;
+#   * jq prints small numbers in EXPONENT form (0.00001 -> `1e-05`), which the
+#     old `^[0-9]*\.?[0-9]+$` regex rejected, silently replacing a configured
+#     threshold with 0.30. awk (which does the comparison) parses `1e-05` fine,
+#     so the exponent form is accepted here rather than discarded.
+# The type/range test mirrors self-compact-trigger.py:load_config exactly.
 self_compact_threshold() {
   local t
-  t=$(jq -r '.self_compact.threshold
-             | if (type == "number" and . > 0 and . <= 1) then . else 0.30 end' \
-        "$SELF_COMPACT_CONFIG" 2>/dev/null) || { printf '0.30'; return; }
-  [[ "$t" =~ ^[0-9]*\.?[0-9]+$ ]] || t="0.30"
-  printf '%s' "$t"
+  t=$(jq -r '
+        if (.self_compact | type) != "object" then "default"
+        elif (.self_compact | has("threshold") | not) then "default"
+        elif ((.self_compact.threshold | type) == "number"
+              and .self_compact.threshold > 0
+              and .self_compact.threshold <= 1) then (.self_compact.threshold | tostring)
+        else "invalid" end' "$SELF_COMPACT_CONFIG" 2>/dev/null) \
+    || { printf 'invalid'; return; }
+  case "$t" in
+    default|invalid) printf '%s' "$t"; return ;;
+  esac
+  if [[ "$t" =~ ^[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?$ ]]; then
+    printf '%s' "$t"
+  else
+    printf 'invalid'
+  fi
 }
 
 SELF_COMPACT_ON=0
 SELF_COMPACT_THRESHOLD="0.30"
 if self_compact_enabled; then
-  SELF_COMPACT_ON=1
-  SELF_COMPACT_THRESHOLD="$(self_compact_threshold)"
+  sc_thr="$(self_compact_threshold)"
+  case "$sc_thr" in
+    default)
+      SELF_COMPACT_ON=1
+      ;;
+    invalid)
+      msg="config error: self_compact.threshold in $SELF_COMPACT_CONFIG is not a number in (0,1]; self-compact stays OFF here, matching self-compact-trigger.py which refuses to fire on it. Pending request markers are inert until it is fixed."
+      log "$msg"
+      printf '%s\n' "$msg" >&2   # systemd journal sees it
+      ;;
+    *)
+      SELF_COMPACT_ON=1
+      SELF_COMPACT_THRESHOLD="$sc_thr"
+      ;;
+  esac
 fi
 
 # A request marker is a NOTIFICATION, never authority. It says "this session
@@ -206,11 +243,24 @@ context_request_pending() {
 # Consumed, not deleted: the record is the audit trail for a fork that spent
 # opus-5 usage. Renaming it (rather than leaving it) is what stops the next
 # 5-minute tick from forking the same session again.
+#
+# The rename failing is therefore NOT cosmetic: the marker persists, every later
+# tick re-verifies it against the transcript (still above threshold, since the
+# fork does not shrink the old session's context) and re-forks the same session
+# until the per-cwd 24h budget is spent. That used to be swallowed by
+# `|| true` — a silent, self-repeating spend. Log it at both ends.
 consume_context_request() {
   local sid="$1"
   is_valid_sid "$sid" || return 0
-  mv -f "$SELF_COMPACT_STATE_DIR/${sid}.request.json" \
-        "$SELF_COMPACT_STATE_DIR/${sid}.consumed.json" 2>/dev/null || true
+  local req="$SELF_COMPACT_STATE_DIR/${sid}.request.json"
+  [[ -e "$req" ]] || return 0   # nothing pending: the idle path, normally
+  if ! mv -f "$req" "$SELF_COMPACT_STATE_DIR/${sid}.consumed.json" 2>/dev/null; then
+    local m="ERROR sid=$sid: could not consume $req (rename failed; dir writable?) — the marker PERSISTS, so later ticks may re-fork this session until the per-cwd 24h budget ($IDLE_HANDOFF_AUTOFORK_MAX_PER_CWD_24H) is spent"
+    log "$m"
+    printf 'idle-handoff: %s\n' "$m" >&2   # systemd journal sees it
+    return 1
+  fi
+  return 0
 }
 
 # ---- Fork ledger: tab-separated to survive cwds with spaces (HIGH-E) --------
@@ -674,6 +724,14 @@ for project_dir in "$PROJECTS_DIR"/*/; do
       skip_mission_write=1
       log "sid=$sid: mission_mtime=$mission_mtime >= transcript_mtime=$mtime, skip write (autofork will use $mission_path)"
     fi
+    # The summary line has always printed `fresh=` from this counter and the
+    # counter was never incremented, so every run reported fresh=0 and the most
+    # common skip reason was invisible. Counted here, once per candidate, for
+    # BOTH write-skip conditions (age and mtime) — the iteration deliberately
+    # continues to the autofork evaluation either way.
+    if [[ "$skip_mission_write" -eq 1 ]]; then
+      count_skipped_fresh_mission=$((count_skipped_fresh_mission + 1))
+    fi
   fi
 
   # ---- Staleness gate (moved BEFORE mission-write; advisor P2R1 HIGH-2) ---
@@ -716,10 +774,23 @@ for project_dir in "$PROJECTS_DIR"/*/; do
     # internally around its claude call (redundant kill hardening).
     # `8>&-` closes the handoff flock fd in the child chain so a leaked
     # claude descendant can't hold the singleton lock after this run exits.
+    #
+    # `env -u MODE -u REFLECT_ASYNC -u REFLECT_FORCE`: this call MUST be
+    # synchronous, because mission_manifest_status reads modes.mission.status
+    # immediately afterwards. Any of these three inherited from the environment
+    # silently breaks the run —
+    #   MODE          -> reflect.sh re-runs precompact instead of mission;
+    #   REFLECT_ASYNC -> the worker detaches, the status read sees `started`,
+    #                    record_failure fires, and three of those disable
+    #                    handoffs for this sid for the whole backoff window;
+    #   REFLECT_FORCE -> not fatal, but it makes the idempotency behaviour of a
+    #                    timer run depend on whoever started the timer.
+    # Scrubbed rather than trusted: this script runs from a systemd unit whose
+    # environment we do not fully control.
     call_start=$(date +%s)
     REFLECT_ROOT="$REFLECT_ROOT" REFLECT_MODEL="$REFLECT_MODEL" \
       timeout -k 10 90 \
-        bash -c 'printf "%s" "$1" | env -u MODE bash "$2" mission' \
+        bash -c 'printf "%s" "$1" | env -u MODE -u REFLECT_ASYNC -u REFLECT_FORCE bash "$2" mission' \
         _ "$payload" "$REFLECT_SH" >>"$worker_log" 2>&1 8>&-
     rc=$?
 
