@@ -70,7 +70,7 @@ Rate on those properties alone. Do not consider what happens next.
 
 # Length cap
 
-≤500 words. Tight citations. No preamble, no recap of what the implementer wrote, no closing pleasantries.
+Your ENTIRE JSON response: ≤500 words. Tight citations. No preamble, no recap of what the implementer wrote, no closing pleasantries. This caps your output only — it says nothing about how long the dispatch prompt may be.
 
 # Honest disagreement
 

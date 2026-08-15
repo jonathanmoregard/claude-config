@@ -1,6 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "AdvisorVerdict",
+  "$comment": "Schema-authoring constraint: every declared property is listed in its `required` array, and optionality is expressed with a nullable type instead. Structured-output backends reject a schema that omits a declared property from `required`.",
   "type": "object",
   "additionalProperties": false,
   "required": ["verdict", "verdict_reason", "findings"],
@@ -41,7 +42,7 @@
           },
           "unverifiable": {
             "type": ["boolean", "null"],
-            "description": "true iff confirmation of this finding requires human judgment (taste, style, subjective preference) — no empirical check applies. Emit null when not applicable. Nullable-and-required rather than optional because OpenAI structured outputs (codex exec --output-schema) rejects any schema whose `required` array omits a declared property — Phase 2 hard-fails with invalid_json_schema otherwise."
+            "description": "true iff confirmation of this finding requires human judgment (taste, style, subjective preference) — no empirical check applies. false when an empirical check does apply. null only when neither reading fits."
           }
         }
       }
