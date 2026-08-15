@@ -76,6 +76,20 @@ STATE_RETENTION_DAYS = 30
 SPAWN_TIMEOUT_SECONDS = 25
 
 
+# Truthy set, IDENTICAL to lib.sh:reflect_truthy — `1|true|yes|on`,
+# case-insensitive, everything else false. This used to be
+# `if os.environ.get("REFLECT_SUBPROCESS")`, i.e. truthy-if-non-empty, while
+# reflect.sh:59 tested `== "1"`. So `REFLECT_SUBPROCESS=0` meant "not a
+# subprocess" to reflect.sh and "subprocess, do nothing" here: the same lever
+# silently DISABLED the trigger in one place and enabled the work in the other.
+# One semantic, both sides.
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in _TRUTHY
+
+
 def claude_dir() -> Path:
     return Path.home() / ".claude"
 
@@ -129,15 +143,38 @@ def load_config() -> Config | None:
     if not isinstance(block, dict):
         block = {}
 
+    # An ill-typed or out-of-range threshold used to fall back to 0.30 in
+    # SILENCE, so the trigger fired at a value the operator did not configure
+    # (`"0.5"` as a string, 50 meaning percent, 0, -1). The consumer,
+    # scripts/idle-handoff.sh, substituted its own 0.30 by a different route, so
+    # producer and consumer could disagree with no log line anywhere.
+    #
+    # Both ends now REFUSE: a threshold that is present but unusable turns the
+    # feature OFF and says why. Absent is still the documented default — that is
+    # a choice not to configure it, not a misconfiguration.
     threshold = DEFAULT_THRESHOLD
-    raw = block.get("threshold", DEFAULT_THRESHOLD)
-    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and 0 < raw <= 1:
-        threshold = float(raw)
+    if "threshold" in block:
+        raw = block["threshold"]
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool) and 0 < raw <= 1:
+            threshold = float(raw)
+        else:
+            log(f"config REFUSED: self_compact.threshold={raw!r} "
+                f"({type(raw).__name__}) is not a number in (0, 1]; "
+                f"self-compact stays OFF rather than firing at an unconfigured "
+                f"{DEFAULT_THRESHOLD}. Fix {path}.")
+            return None
 
     max_fires = DEFAULT_MAX_FIRES
-    raw = block.get("max_fires_per_session", DEFAULT_MAX_FIRES)
-    if isinstance(raw, int) and not isinstance(raw, bool) and 1 <= raw <= 100:
-        max_fires = raw
+    if "max_fires_per_session" in block:
+        raw = block["max_fires_per_session"]
+        if isinstance(raw, int) and not isinstance(raw, bool) and 1 <= raw <= 100:
+            max_fires = raw
+        else:
+            log(f"config REFUSED: self_compact.max_fires_per_session={raw!r} "
+                f"({type(raw).__name__}) is not an int in [1, 100]; "
+                f"self-compact stays OFF rather than firing with an "
+                f"unconfigured loop bound. Fix {path}.")
+            return None
 
     return Config(threshold, max_fires)
 
@@ -238,7 +275,7 @@ def main() -> int:
     # REFLECT_SUBPROCESS=1; every headless run (including our own autofork)
     # reports a non-cli entrypoint. Either one firing this trigger would create
     # a self-feeding chain of mission writes.
-    if os.environ.get("REFLECT_SUBPROCESS"):
+    if env_truthy("REFLECT_SUBPROCESS"):
         return 0
     if os.environ.get("CLAUDE_CODE_ENTRYPOINT", "cli") != "cli":
         return 0
@@ -268,6 +305,19 @@ def main() -> int:
     if occ.estimated:
         # No recorded usage: firing an expensive path off a byte-count guess is
         # not acceptable.
+        return 0
+    if not occ.window_known:
+        # The DENOMINATOR is a guess: this model family is in neither of
+        # context_usage.py's prefix tables, so `window` is the 200k base as an
+        # assumption. A 1M session measured against it reads ~5x high and would
+        # fire at ~6% real occupancy — spending an opus-5 resume on a session
+        # with 940k of runway left. Refuse, and say so loudly enough that the
+        # table gets updated rather than silently drifting.
+        log(f"sid={sid} REFUSING to fire: context window is UNKNOWN for "
+            f"model={occ.model!r} (window_source={occ.window_source}, assuming "
+            f"{occ.window} would read ~{occ.fill_pct:.2f} fill). Add the family "
+            f"to context_usage.py ONE_M_MODEL_PREFIXES or "
+            f"KNOWN_BASE_MODEL_PREFIXES.")
         return 0
 
     state = load_state(sid)
