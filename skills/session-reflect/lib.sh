@@ -653,27 +653,43 @@ mission_newest_payload() {
 }
 
 # mission_resolve <tasks_dir> — print the path of the CURRENT mission payload.
+#
+# `tasks/mission.<sid>.md` is the ONLY authoritative mission artifact.
+# `tasks/mission.md` is a convenience symlink for humans and existence checks and
+# is NEVER a read source for automation — this function will not return it, and
+# neither should any consumer hardcode it.
+#
+# Why: mission mode deliberately REFUSES to move the pointer when a foreign or
+# unstamped regular file owns that path (see the decision table above). So
+# `tasks/mission.md` can legitimately hold somebody else's in-flight mission
+# while our handoff sits in the suffixed payload. A consumer that resolved-and-
+# read the pointer would then hand an unattended model, running with edits
+# accepted, work that nobody asked for — while the handoff we actually wrote went
+# unread. Unique suffixed names exist precisely so that failure class cannot be
+# expressed; resolving to them removes the ambiguity instead of guarding it.
+#
 # Read-only. Resolution order, each step logged to stderr so a choice is never
 # made silently:
-#   1. tasks/mission.md resolves to a readable file  -> that file
-#   2. pointer absent, dangling, or foreign          -> newest stamped payload
-#   3. nothing                                       -> return 1
+#   1. pointer is OUR symlink to an existing, stamped payload -> that payload
+#   2. anything else at the pointer (absent, dangling, foreign
+#      file, foreign symlink) is a NON-EVENT             -> newest stamped payload
+#   3. no payload of our lineage                         -> return 1
 mission_resolve() {
   local dir="${1:-}"
   local pointer="$dir/mission.md"
-  if [[ -L "$pointer" ]]; then
-    if [[ -f "$pointer" ]]; then
-      local target
-      target="$(readlink -f -- "$pointer" 2>/dev/null || true)"
-      echo "reflect: mission resolved via pointer -> ${target:-$pointer}" >&2
-      printf '%s' "${target:-$pointer}"
+  if mission_pointer_is_ours "$pointer"; then
+    local target
+    target="$(readlink -- "$pointer" 2>/dev/null || true)"
+    if [[ -f "$dir/$target" ]] && mission_has_our_stamp "$dir/$target"; then
+      echo "reflect: mission resolved via pointer -> $dir/$target" >&2
+      printf '%s' "$dir/$target"
       return 0
     fi
-    echo "reflect: mission pointer $pointer is DANGLING (target '$(readlink -- "$pointer" 2>/dev/null)' missing); falling back to newest payload" >&2
+    echo "reflect: mission pointer $pointer is DANGLING or unstamped (target '$target'); falling back to newest payload" >&2
+  elif [[ -L "$pointer" ]]; then
+    echo "reflect: mission pointer $pointer is a symlink we do not own (target '$(readlink -- "$pointer" 2>/dev/null)'); not a read source, falling back to newest payload" >&2
   elif [[ -f "$pointer" ]]; then
-    echo "reflect: mission resolved via regular file $pointer (no pointer indirection)" >&2
-    printf '%s' "$pointer"
-    return 0
+    echo "reflect: mission pointer $pointer is a regular file (foreign or legacy) — never a read source for automation; falling back to newest payload" >&2
   else
     echo "reflect: mission pointer $pointer absent; falling back to newest payload" >&2
   fi
@@ -683,7 +699,7 @@ mission_resolve() {
     printf '%s' "$newest"
     return 0
   fi
-  echo "reflect: no mission payload found under $dir" >&2
+  echo "reflect: no mission payload of our stamp lineage found under $dir" >&2
   return 1
 }
 

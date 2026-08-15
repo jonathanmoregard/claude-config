@@ -211,9 +211,17 @@ the batch. It never runs on the synchronous precompact path.
 ### Mission artifact layout
 
 ```
-tasks/mission.<sid>.md   payload, unique per session (never collides)
-tasks/mission.md         symlink to the current payload
+tasks/mission.<sid>.md   payload, unique per session (never collides) — AUTHORITATIVE
+tasks/mission.md         convenience symlink for humans and existence checks only
 ```
+
+**`tasks/mission.md` is never a read source for automation.** It is a convenience
+symlink; mission mode refuses to move it when a foreign or unstamped regular file
+owns that path, so it can legitimately hold an unrelated mission belonging to a
+human while our handoff sits in the suffixed payload. Every automated consumer
+resolves through `reflect.sh --mission-path`, which returns a payload of our own
+stamp lineage or nothing — and "nothing" means do not act, never "read the
+pointer instead". An existence check may glob `tasks/mission*.md`.
 
 The payload name embeds the session id, so a machine write can never land on a
 path a human owns. The pointer keeps `tasks/mission.md` — the path the

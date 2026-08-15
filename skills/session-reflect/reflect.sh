@@ -146,8 +146,10 @@ Modes:
 
 Introspection:
   --budgets           print the effective timeout budgets + hook-cap arithmetic
-  --mission-path DIR  resolve DIR/tasks' current mission payload (pointer, then
-                      newest mission.<sid>.md by mtime); logs how it resolved
+  --mission-path DIR  resolve DIR/tasks' current mission payload: a
+                      mission.<sid>.md of OUR stamp lineage, or nothing (exit 1).
+                      tasks/mission.md is a human convenience symlink and is
+                      never a read source; logs how it resolved
 
 Mission artifact layout:
   tasks/mission.<sid>.md   payload, unique per session (never collides)
@@ -168,11 +170,12 @@ fi
 # payload for that project and logs HOW it resolved (pointer / dangling pointer
 # fallback / newest-by-mtime) to stderr. Read-only: it never repairs, so a reader
 # cannot be surprised by a resolution that also mutated the tree. Exit 1 when
-# there is no payload at all.
+# there is no payload of our lineage.
 #
-# Consumers should prefer this over hard-coding tasks/mission.md when they care
-# about the dangling-pointer and no-pointer cases; tasks/mission.md remains the
-# documented convention and keeps working.
+# EVERY automated consumer MUST use this instead of hardcoding tasks/mission.md.
+# That path is a convenience symlink for humans and existence checks; it is not
+# authoritative and can hold a foreign mission (mission mode refuses to move the
+# pointer over one). `tasks/mission.<sid>.md` is the only authoritative artifact.
 if [[ "$ARG1" == "--mission-path" ]]; then
   _mp_cwd="${ARG2:-}"
   if [[ -z "$_mp_cwd" || ! -d "$_mp_cwd" ]]; then

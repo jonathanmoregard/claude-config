@@ -2242,6 +2242,229 @@ STUB
 chmod +x "$STUB_SCRATCH/claude"
 
 # ============================================================================
+# TEST 25: the fork must resume from OUR handoff, or not at all
+# ============================================================================
+# The wrong-work path this closes: when tasks/mission.md is a FOREIGN regular
+# file, `mission` mode deliberately refuses to move the pointer (group A's
+# decision table), so that path keeps holding somebody else's mission while our
+# handoff sits in tasks/mission.<sid>.md. A consumer that hardcodes
+# tasks/mission.md then reads a valid-looking mission and forks an unattended
+# opus-5 with --permission-mode acceptEdits and a prompt that forbids it to ask
+# which item to pick — i.e. it autonomously executes someone else's mission, with
+# edits accepted, while our actual handoff goes unread.
+#
+# Rule: resolve ONCE through reflect.sh, and if the resolved mission is not ours,
+# refuse to fork. Expensive-and-wrong fails off.
+echo "TEST 25: fork resumes from OUR resolved handoff, or refuses"
+
+combo_stub() {
+  # $1=argv log, $2=mission-body file. Serves BOTH calls: it answers the mission
+  # model call with a valid envelope AND records argv, so one stub can show
+  # whether an autofork was launched (only the fork passes acceptEdits).
+  cat >"$STUB_SCRATCH/claude" <<STUB
+#!/usr/bin/env bash
+cat >/dev/null || true
+{ printf '=== argv ===\n'; for a in "\$@"; do printf '%s\n' "\$a"; done; } >> '$1'
+jq -cn --rawfile r '$2' '{type:"result",result:\$r,usage:{}}'
+STUB
+  chmod +x "$STUB_SCRATCH/claude"
+}
+
+sc_forked() { grep -qF 'acceptEdits' "$1" 2>/dev/null; }
+
+# Plants a verified-looking self-compact request straight into the state dir, so
+# a case can set up an exact on-disk mission layout without a Stop-hook fire.
+sc_plant_request() {
+  # $1=sid $2=cwd $3=transcript
+  mkdir -p "$SC_STATE_DIR"
+  jq -n --arg sid "$1" --arg cwd "$2" --arg tp "$3" --argjson now "$(date +%s)" \
+    '{session_id:$sid,cwd:$cwd,transcript_path:$tp,tokens:330000,window:1000000,
+      fill_pct:0.33,threshold:0.30,requested_at_epoch:$now}' \
+    > "$SC_STATE_DIR/$1.request.json"
+}
+
+# A foreign mission.md whose ## Next is `(none)`. This is the DISCRIMINATOR for
+# the whole test: if any consumer reads the bare pointer, the `## Next` gate sees
+# `(none)`, skips as no_next, and no fork happens. A fork happening at all proves
+# the gate read our suffixed payload instead.
+mk_foreign_pointer() {
+  local dir="$1"
+  mkdir -p "$dir"
+  cat >"$dir/mission.md" <<'FOREIGN'
+<!-- written-against: repo=~/Repos/other branch=feat/unrelated base=deadbee ts=2026-08-15 -->
+# Mission — somebody else's in-flight work
+
+## Next
+- (none)
+
+## Blocked
+- do not touch: libvirt passthrough half-applied, host reboot pending
+FOREIGN
+}
+
+# ------------------------------- 25a: foreign pointer + our payload -> payload
+B8_H="$(sc_home)"
+sc_write_config "$B8_H" on 0.30
+B8_ARGV="$B8_H/argv.txt"
+B8_CWD="$(mktemp -d -t reflect-b8fgn-XXXXXX)"
+assert_isolated_cwd "$B8_CWD"
+mk_candidate_repo "$B8_CWD" || fail "25a: could not build repo"
+mk_foreign_pointer "$B8_CWD/tasks"
+B8_FOREIGN_SHA="$(sha256sum "$B8_CWD/tasks/mission.md" | awk '{print $1}')"
+B8_SID="test-sid-b8-foreign"
+B8_PAYLOAD="$(mk_mission_payload "$B8_CWD/tasks" "$B8_SID" "$(cat "$SC_MISSION_FILE")")"
+B8_PROJ="$B8_H/.claude/projects/-tmp-b8"
+mkdir -p "$B8_PROJ"
+B8_TP="$B8_PROJ/$B8_SID.jsonl"
+mk_context_transcript "$B8_TP" "claude-opus-5" 330000 "$B8_CWD" 25
+touch -d '2 minutes ago' "$B8_TP"
+sc_plant_request "$B8_SID" "$B8_CWD" "$B8_TP"
+
+combo_stub "$B8_ARGV" "$SC_MISSION_FILE"
+: > "$B8_ARGV"
+HOME="$B8_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
+  || fail "25a: idle-handoff.sh rc!=0"
+B8_LOG="$REFLECT_ROOT/idle-handoff-logs/handoff.log"
+for _ in $(seq 1 60); do sc_forked "$B8_ARGV" && break; sleep 0.25; done
+sc_forked "$B8_ARGV" \
+  || fail "25a: no fork — a foreign tasks/mission.md must be a NON-EVENT, the suffixed payload is authoritative (log: $(grep "$B8_SID" "$B8_LOG" | tail -3))"
+grep -qF "$B8_PAYLOAD" "$B8_ARGV" \
+  || fail "25a: the fork was not handed the resolved payload ($B8_PAYLOAD)"
+grep -q 'Do NOT read' "$B8_ARGV" \
+  || fail "25a: fork prompt does not warn off the bare pointer"
+[[ "$(sha256sum "$B8_CWD/tasks/mission.md" | awk '{print $1}')" == "$B8_FOREIGN_SHA" ]] \
+  || fail "25a: foreign mission.md was modified"
+[[ ! -L "$B8_CWD/tasks/mission.md" ]] || fail "25a: foreign mission.md replaced by a pointer"
+info "foreign pointer is a non-event: fork resumed the suffixed payload, foreign file byte-identical"
+
+# --------------------------- 25b: nothing of our lineage resolves -> no fork
+# Contract first, at the seam: a dir holding ONLY a foreign mission.md must
+# resolve to NOTHING. `tasks/mission.md` is never a read source.
+B8U_CWD="$(mktemp -d -t reflect-b8unit-XXXXXX)"
+assert_isolated_cwd "$B8U_CWD"
+mk_foreign_pointer "$B8U_CWD/tasks"
+# NB: `set -e` is in force from TEST 15 onward, so a deliberately-failing
+# command must sit in an `if` condition — a bare assignment from a failing
+# command substitution would kill the suite with no message.
+if B8U_OUT="$(bash "$REFLECT_SH" --mission-path "$B8U_CWD" 2>/dev/null)"; then
+  fail "25b: --mission-path resolved a foreign tasks/mission.md (got '$B8U_OUT')"
+fi
+[[ -z "${B8U_OUT:-}" ]] || fail "25b: --mission-path printed a path it must not return ('$B8U_OUT')"
+# ...and an unstamped REGULAR file is equally not ours.
+printf '# plain notes, no stamp\n\n## Next\n- something\n' > "$B8U_CWD/tasks/mission.md"
+bash "$REFLECT_SH" --mission-path "$B8U_CWD" >/dev/null 2>&1 \
+  && fail "25b: --mission-path resolved an unstamped regular mission.md"
+
+# Integration: foreign pointer, no payload, and the handoff write cannot produce
+# one (model returns nothing) -> no fork, reason on the record.
+B9_H="$(sc_home)"
+sc_write_config "$B9_H" on 0.30
+B9_ARGV="$B9_H/argv.txt"
+B9_CWD="$(mktemp -d -t reflect-b8none-XXXXXX)"
+assert_isolated_cwd "$B9_CWD"
+mk_candidate_repo "$B9_CWD" || fail "25b: could not build repo"
+mk_foreign_pointer "$B9_CWD/tasks"
+B9_FOREIGN_SHA="$(sha256sum "$B9_CWD/tasks/mission.md" | awk '{print $1}')"
+B9_SID="test-sid-b8-nopayload"
+B9_PROJ="$B9_H/.claude/projects/-tmp-b9"
+mkdir -p "$B9_PROJ"
+B9_TP="$B9_PROJ/$B9_SID.jsonl"
+mk_context_transcript "$B9_TP" "claude-opus-5" 330000 "$B9_CWD" 25
+touch -d '2 minutes ago' "$B9_TP"
+sc_plant_request "$B9_SID" "$B9_CWD" "$B9_TP"
+# Stub records argv but returns an EMPTY result, so mission mode writes no payload.
+cat >"$STUB_SCRATCH/claude" <<STUB
+#!/usr/bin/env bash
+cat >/dev/null || true
+{ printf '=== argv ===\n'; for a in "\$@"; do printf '%s\n' "\$a"; done; } >> '$B9_ARGV'
+printf '%s\n' '{"type":"result","result":"","usage":{}}'
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+HOME="$B9_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
+  || fail "25b: idle-handoff.sh rc!=0"
+sleep 1
+B9_LOG="$REFLECT_ROOT/idle-handoff-logs/handoff.log"
+sc_forked "$B9_ARGV" \
+  && fail "25b: WRONG-WORK FORK — forked with no mission of ours on disk, so the only readable mission was the foreign one
+      log: $(grep "$B9_SID" "$B9_LOG" | tail -3)"
+# Either recorded reason is acceptable — both mean "we have no mission of our own
+# to resume from, so we are not forking". Order-insensitive: the two log lines put
+# sid= on opposite sides of the reason.
+grep -F "$B9_SID" "$B9_LOG" | grep -qE 'mission_not_ours|mission write failed' \
+  || fail "25b: no fork and no recorded reason (log: $(grep "$B9_SID" "$B9_LOG" | tail -3))"
+[[ "$(sha256sum "$B9_CWD/tasks/mission.md" | awk '{print $1}')" == "$B9_FOREIGN_SHA" ]] \
+  || fail "25b: foreign mission.md was modified"
+info "nothing of our lineage: no fork, reason recorded, foreign file untouched"
+
+# ------------------------------------- 25c: pointer absent, payload present
+BB_H="$(sc_home)"
+sc_write_config "$BB_H" on 0.30
+BB_ARGV="$BB_H/argv.txt"
+BB_CWD="$(mktemp -d -t reflect-b8noptr-XXXXXX)"
+assert_isolated_cwd "$BB_CWD"
+mk_candidate_repo "$BB_CWD" || fail "25c: could not build repo"
+BB_SID="test-sid-b8-noptr"
+BB_PAYLOAD="$(mk_mission_payload "$BB_CWD/tasks" "$BB_SID" "$(cat "$SC_MISSION_FILE")")"
+[[ ! -e "$BB_CWD/tasks/mission.md" ]] || fail "25c: fixture should have no pointer"
+BB_PROJ="$BB_H/.claude/projects/-tmp-bb"
+mkdir -p "$BB_PROJ"
+BB_TP="$BB_PROJ/$BB_SID.jsonl"
+mk_context_transcript "$BB_TP" "claude-opus-5" 330000 "$BB_CWD" 25
+touch -d '2 minutes ago' "$BB_TP"
+sc_plant_request "$BB_SID" "$BB_CWD" "$BB_TP"
+combo_stub "$BB_ARGV" "$SC_MISSION_FILE"
+: > "$BB_ARGV"
+HOME="$BB_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
+  || fail "25c: idle-handoff.sh rc!=0"
+for _ in $(seq 1 60); do sc_forked "$BB_ARGV" && break; sleep 0.25; done
+sc_forked "$BB_ARGV" \
+  || fail "25c: no pointer but a valid payload must still fork (log: $(grep "$BB_SID" "$REFLECT_ROOT/idle-handoff-logs/handoff.log" | tail -3))"
+grep -qF "$BB_PAYLOAD" "$BB_ARGV" || fail "25c: fork not handed the payload path"
+info "no pointer at all: resolution found the payload and the fork used it"
+
+# ----------------------------------------------- 25d: dangling pointer
+BA_H="$(sc_home)"
+sc_write_config "$BA_H" on 0.30
+BA_ARGV="$BA_H/argv.txt"
+BA_CWD="$(mktemp -d -t reflect-b8dang-XXXXXX)"
+assert_isolated_cwd "$BA_CWD"
+mk_candidate_repo "$BA_CWD" || fail "25d: could not build repo"
+BA_SID="test-sid-b8-dangling"
+BA_PAYLOAD="$(mk_mission_payload "$BA_CWD/tasks" "$BA_SID" "$(cat "$SC_MISSION_FILE")")"
+# Pointer to a payload that was garbage-collected: irrelevant to the decision.
+ln -sfn "mission.long-gone-sid.md" "$BA_CWD/tasks/mission.md"
+[[ -L "$BA_CWD/tasks/mission.md" && ! -f "$BA_CWD/tasks/mission.md" ]] \
+  || fail "25d: fixture pointer should be dangling"
+BA_PROJ="$BA_H/.claude/projects/-tmp-ba"
+mkdir -p "$BA_PROJ"
+BA_TP="$BA_PROJ/$BA_SID.jsonl"
+mk_context_transcript "$BA_TP" "claude-opus-5" 330000 "$BA_CWD" 25
+touch -d '2 minutes ago' "$BA_TP"
+sc_plant_request "$BA_SID" "$BA_CWD" "$BA_TP"
+combo_stub "$BA_ARGV" "$SC_MISSION_FILE"
+: > "$BA_ARGV"
+HOME="$BA_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
+  || fail "25d: idle-handoff.sh rc!=0"
+for _ in $(seq 1 60); do sc_forked "$BA_ARGV" && break; sleep 0.25; done
+sc_forked "$BA_ARGV" \
+  || fail "25d: a dangling pointer must not affect the fork decision (log: $(grep "$BA_SID" "$REFLECT_ROOT/idle-handoff-logs/handoff.log" | tail -3))"
+grep -qF "$BA_PAYLOAD" "$BA_ARGV" \
+  || fail "25d: fork resolved to something other than the surviving payload"
+[[ -f "$BA_PAYLOAD" ]] || fail "25d: FORKED AGAINST A MISSING FILE"
+info "dangling pointer: ignored, fork resumed the surviving payload"
+
+# Restore canonical stub.
+cat >"$STUB_SCRATCH/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null || true
+cat <<'JSON'
+{"type":"result","result":"{\"patterns\":[\"stubbed pattern\"],\"discoveries\":[],\"turning_points\":[],\"digressions\":[],\"obstacles_to_autonomy\":[]}","usage":{"cache_read_input_tokens":100,"cache_creation_input_tokens":10,"input_tokens":5,"output_tokens":50}}
+JSON
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+# ============================================================================
 # FINAL GUARD: prove the whole suite left the live repo alone.
 assert_repo_tasks_untouched "end of suite"
 info "live repo tasks/ untouched by the full suite"
