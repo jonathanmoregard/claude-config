@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""Fail when a registered upstream host appears in code instead of its sink URL.
+
+Once a host has a sink, the sink is the only address that should exist in the
+repo. This turns "remember to use the proxy" — a step that gets skipped under
+time pressure, which is when it matters — into a check that fails.
+
+    lint-direct-egress [paths...]
+
+Exit 1 on any hit. Skips the sink config itself, this file, and lockfiles.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from egress_guard.sink import SinkRegistry  # noqa: E402
+
+TEXT_SUFFIXES = {
+    ".py", ".js", ".ts", ".tsx", ".jsx", ".sh", ".bash", ".zsh", ".rs", ".go",
+    ".rb", ".json", ".toml", ".yaml", ".yml", ".md", ".txt", ".ini", ".cfg",
+}
+SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "data", "dist"}
+ALLOW_MARKER = "egress-sink:allow"
+
+
+def iter_files(roots: list[str]):
+    for root in roots:
+        if os.path.isfile(root):
+            yield root
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+            for name in filenames:
+                if os.path.splitext(name)[1].lower() in TEXT_SUFFIXES:
+                    yield os.path.join(dirpath, name)
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("paths", nargs="*", default=["."])
+    ap.add_argument("--config", help="sink config path")
+    args = ap.parse_args(argv)
+
+    registry = SinkRegistry(args.config) if args.config else SinkRegistry()
+    doc = registry.load()
+    hosts = doc["sinks"]
+    if not hosts:
+        print("lint-direct-egress: no sinks registered, nothing to check")
+        return 0
+
+    patterns = {
+        host: re.compile(r"\b" + re.escape(host).replace(r"\.", r"\.") + r"\b", re.I)
+        for host in hosts
+    }
+    config_real = os.path.realpath(registry.path)
+    self_real = os.path.realpath(__file__)
+
+    hits: list[tuple[str, int, str, str]] = []
+    for path in iter_files(args.paths or ["."]):
+        real = os.path.realpath(path)
+        if real in (config_real, self_real):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                for lineno, line in enumerate(fh, 1):
+                    if ALLOW_MARKER in line:
+                        continue
+                    for host, pattern in patterns.items():
+                        if pattern.search(line):
+                            hits.append((path, lineno, host, line.strip()[:110]))
+        except OSError:
+            continue
+
+    if not hits:
+        print(f"lint-direct-egress: clean ({len(hosts)} sink(s) enforced)")
+        return 0
+
+    print("lint-direct-egress: direct upstream references found\n")
+    for path, lineno, host, text in hits:
+        proxy = registry.proxy_url(host, doc)
+        print(f"  {path}:{lineno}")
+        print(f"    {text}")
+        print(f"    -> use {proxy} instead of {host}\n")
+    print(
+        f"{len(hits)} reference(s). The sink carries the cadence; a direct URL "
+        "silently opts out of it.\n"
+        f"If a reference is genuinely not a request (docs, a comment about the "
+        f"host), mark that line with `{ALLOW_MARKER}`."
+    )
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

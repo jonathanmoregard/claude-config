@@ -661,6 +661,29 @@ class EgressGuard:
             self._write_state(resource, state)
         return floor
 
+    def record_extra_cost(self, resource: str, cost: float) -> float:
+        """Charge additional cost to the most recent grant, taking no new slot.
+
+        A proxy only learns a response's size after the request is made, and the
+        cost budget exists precisely for the expensive calls. Charging it to the
+        latest event keeps the request COUNT honest while letting the weight
+        catch up.
+        """
+        cost = _finite(cost, "cost")
+        if cost < 0:
+            raise ValueError("cost must not be negative")
+        now = self._time()
+        with self.locked(resource):
+            state = self._read_state(resource, now)
+            events = state.get("events") or []
+            if events:
+                events[-1][1] = float(events[-1][1]) + cost
+            else:
+                events = [[now, cost]]
+            state["events"] = events
+            self._write_state(resource, state)
+            return float(events[-1][1])
+
     def record_preflight(
         self, resource: str, checks: list, sample_requests: int
     ) -> dict[str, Any]:

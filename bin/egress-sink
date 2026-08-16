@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""Register a debounced sink and get back the URL your code should use.
+
+    egress-sink add https://api.example.com/v1 --interval 5
+    egress-sink list
+    egress-sink serve
+
+`add` prints the local proxy URL and the effective interval. It deliberately
+does NOT print the upstream URL: the output of this command is meant to be
+pasted into code, and the upstream is the one string that must not end up there.
+
+Re-registering a host ratchets to the stricter interval. There is no flag to
+make a sink faster — that is the knob this design exists to remove.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from egress_guard.proxy import serve  # noqa: E402
+from egress_guard.sink import SinkRegistry  # noqa: E402
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    registry = SinkRegistry(args.config) if args.config else SinkRegistry()
+    url, interval, is_new = registry.add(args.upstream, args.interval, args.note or "")
+    action = "registered" if is_new else "already registered"
+    print(f"{action}; effective interval {interval:g}s")
+    print(url)
+    if not is_new and args.interval and args.interval < interval:
+        print(
+            f"note: {args.interval:g}s was IGNORED — intervals only ever get stricter",
+            file=sys.stderr,
+        )
+    print(
+        "\nUse this URL as the default constant in your client code. Do not keep "
+        "the upstream URL anywhere in the repo; `lint-direct-egress` fails on it.",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    registry = SinkRegistry(args.config) if args.config else SinkRegistry()
+    doc = registry.load()
+    if not doc["sinks"]:
+        print("no sinks registered")
+        return 0
+    for host, entry in sorted(doc["sinks"].items()):
+        print(f"{registry.proxy_url(host, doc)}  {entry['interval_s']:g}s  {host}"
+              + (f"  # {entry['note']}" if entry.get("note") else ""))
+    return 0
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    serve(config_path=args.config)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="egress-sink", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--config", help="sink config path (default ~/.claude/egress-sinks.json)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    add = sub.add_parser("add", help="register a sink, print the URL to use")
+    add.add_argument("upstream", help="upstream base URL, e.g. https://api.example.com")
+    add.add_argument("--interval", type=float, default=None,
+                     help="minimum seconds between requests; investigate the host's "
+                          "published limit first. Only ever ratchets stricter.")
+    add.add_argument("--note", default="", help="where the interval came from")
+    add.set_defaults(func=cmd_add)
+
+    lst = sub.add_parser("list", help="show registered sinks")
+    lst.set_defaults(func=cmd_list)
+
+    srv = sub.add_parser("serve", help="run the proxy in the foreground")
+    srv.set_defaults(func=cmd_serve)
+
+    args = ap.parse_args(argv)
+    try:
+        return args.func(args)
+    except (ValueError, RuntimeError) as exc:
+        print(f"egress-sink: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
