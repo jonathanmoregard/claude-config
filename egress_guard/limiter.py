@@ -400,6 +400,35 @@ class EgressGuard:
     def floor_path(self, resource: str) -> str:
         return os.path.join(self.state_dir, self._slug(resource) + ".floor")
 
+    def block_path(self, resource: str) -> str:
+        return os.path.join(self.state_dir, self._slug(resource) + ".block")
+
+    def _sidecar_cooldown(self, resource: str) -> tuple[float, str]:
+        """A recorded block, kept apart from the mutable state file.
+
+        Same reasoning as the floor sidecar: losing history must never make us
+        less careful. A corrupt state file would otherwise turn a recorded
+        24h block into a single floor wait.
+        """
+        try:
+            with open(self.block_path(resource), "r", encoding="utf-8") as fh:
+                doc = json.load(fh)
+            return _as_float(doc.get("cooldown_until"), 0.0), str(doc.get("reason") or "")
+        except (OSError, ValueError, AttributeError):
+            return 0.0, ""
+
+    def _extend_sidecar_cooldown(self, resource: str, until: float, reason: str) -> None:
+        current, _ = self._sidecar_cooldown(resource)
+        if until <= current:
+            return
+        path = self.block_path(resource)
+        tmp = f"{path}.tmp.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"cooldown_until": until, "reason": reason}, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+
     def _sidecar_floor(self, resource: str) -> float:
         """The ratchet, kept apart from the mutable state file.
 
@@ -471,19 +500,18 @@ class EgressGuard:
             with open(path, "r", encoding="utf-8") as fh:
                 raw = json.load(fh)
         except FileNotFoundError:
-            return self._fresh_state(resource)
+            return self._merge_sidecars(resource, self._fresh_state(resource))
         except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError):
             state = self._fresh_state(resource)
             state["last_slot"] = now
-            return state
+            return self._merge_sidecars(resource, state)
         if not isinstance(raw, dict):
             state = self._fresh_state(resource)
             state["last_slot"] = now
-            return state
+            return self._merge_sidecars(resource, state)
 
         state = self._fresh_state(resource)
         state["floor_s"] = _as_float(raw.get("floor_s"), 0.0)
-        state["cooldown_until"] = _as_float(raw.get("cooldown_until"), 0.0)
         reason = raw.get("cooldown_reason")
         state["cooldown_reason"] = reason if isinstance(reason, str) else ""
 
@@ -492,7 +520,7 @@ class EgressGuard:
             state["cooldown_until"] = 0.0
         elif _is_finite_number(cooldown_raw):
             state["cooldown_until"] = float(cooldown_raw)
-        else:
+        else:  # noqa: PLR5501 - the held-closed branch below is the point
             # A cooldown we cannot read is not an absent cooldown. Falling back
             # to 0.0 would forget a recorded block and grant; we cannot prove it
             # expired, so stay closed for the standard retry-tomorrow window.
@@ -539,6 +567,21 @@ class EgressGuard:
             if isinstance(value, dict):
                 state[key] = value
 
+        return self._merge_sidecars(resource, state)
+
+    def _merge_sidecars(self, resource: str, state: dict[str, Any]) -> dict[str, Any]:
+        """Fold in the records that must outlive the state file.
+
+        Both sidecars only ever make the guard MORE careful: the strictest floor
+        and the latest cooldown win. Whole-file corruption therefore cannot turn
+        a recorded block into a single floor wait, nor undo a ratchet.
+        """
+        state["floor_s"] = max(_as_float(state.get("floor_s"), 0.0),
+                               self._sidecar_floor(resource))
+        until, reason = self._sidecar_cooldown(resource)
+        if until > _as_float(state.get("cooldown_until"), 0.0):
+            state["cooldown_until"] = until
+            state["cooldown_reason"] = reason or state.get("cooldown_reason", "")
         return state
 
     def _write_state(self, resource: str, state: dict[str, Any]) -> None:
@@ -674,10 +717,11 @@ class EgressGuard:
         escalating ladder. Cooldowns only ever extend — a later, shorter report
         cannot shorten an earlier, longer one.
         """
-        policy = self.resource_policy(resource)
         if cooldown_s is None:
-            cooldown_s = float(policy["block_cooldown_s"])
-        cooldown_s = float(cooldown_s)
+            # Only consult the policy when we actually need its default: a
+            # malformed policy must not stop us RECORDING pushback we were
+            # explicitly told about.
+            cooldown_s = float(self.resource_policy(resource)["block_cooldown_s"])
         cooldown_s = _finite(cooldown_s, "cooldown_s")
         if cooldown_s <= 0:
             # Zero is not a block. It persists the reason and refuses nobody,
@@ -691,6 +735,8 @@ class EgressGuard:
                 state["cooldown_reason"] = reason
             state["cooldown_until"] = until
             self._write_state(resource, state)
+            # Survives losing the state file entirely.
+            self._extend_sidecar_cooldown(resource, until, state["cooldown_reason"])
         return until
 
     def status(self, resource: str) -> dict[str, Any]:

@@ -163,6 +163,41 @@ def test_nan_last_slot_in_state_does_not_grant_immediately(state_dir, policy_fil
         g.acquire("host.test")
 
 
+def test_recorded_block_survives_whole_file_corruption(state_dir, policy_file):
+    """Losing the state file must not turn a 24h block into one floor wait."""
+    policy = policy_file(defaults={"min_interval_s": 5.0})
+    g = guard(state_dir, policy)
+    g.record_block("host.test", reason="bot challenge", cooldown_s=86400)
+
+    with open(g.state_path("host.test"), "w", encoding="utf-8") as fh:
+        fh.write("{ truncated mid-write")
+
+    with pytest.raises(CooldownActive) as exc:
+        g.acquire("host.test")
+    assert "bot challenge" in str(exc.value)
+
+
+def test_recorded_block_survives_state_deletion(state_dir, policy_file):
+    policy = policy_file(defaults={"min_interval_s": 5.0})
+    g = guard(state_dir, policy)
+    g.record_block("host.test", reason="429 from origin", cooldown_s=3600)
+    os.unlink(g.state_path("host.test"))
+    with pytest.raises(CooldownActive):
+        g.acquire("host.test")
+
+
+def test_shipped_policy_arms_both_gates_for_the_incident_host():
+    """A gate that ships disabled is documentation, not a gate."""
+    path = os.path.join(REPO_ROOT, "mcps", "egress-guard", "egress-policy.json")
+    with open(path, "r", encoding="utf-8") as fh:
+        doc = json.load(fh)
+    assert doc["defaults"]["require_declaration"] is True
+    assert doc["defaults"]["preflight_after_requests"] > 0
+    for name, override in (doc.get("resources") or {}).items():
+        assert override.get("require_declaration", True) is True, name
+        assert override.get("preflight_after_requests", 1) > 0, name
+
+
 @pytest.mark.parametrize("field", ["window_s", "block_cooldown_s"])
 def test_zero_disabling_policy_values_are_refused(state_dir, policy_file, field):
     policy = policy_file(defaults={"min_interval_s": 0.0, field: 0})

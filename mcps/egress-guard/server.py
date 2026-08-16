@@ -551,12 +551,20 @@ def _handle(msg: dict) -> None:
         rec = _InFlight()
         with _in_flight_lock:
             _in_flight[msg_id] = rec
-        threading.Thread(
-            target=_dispatch_tools_call,
-            args=(msg_id, params, rec),
-            daemon=True,
-            name=f"egress-guard-tool-{msg_id}",
-        ).start()
+        try:
+            threading.Thread(
+                target=_dispatch_tools_call,
+                args=(msg_id, params, rec),
+                daemon=True,
+                name=f"egress-guard-tool-{msg_id}",
+            ).start()
+        except (RuntimeError, OSError) as exc:
+            # A thread that never started leaves its in-flight entry behind:
+            # the id is refused as a duplicate forever and the shutdown drain
+            # burns its whole timeout waiting for a worker that does not exist.
+            with _in_flight_lock:
+                _in_flight.pop(msg_id, None)
+            _respond(msg_id, error={"code": -32603, "message": f"dispatch failed: {exc}"})
         return
     if msg_id is not None:
         _respond(msg_id, error={"code": -32601, "message": f"Method not found: {method}"})

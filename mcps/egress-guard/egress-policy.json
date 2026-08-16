@@ -37,30 +37,36 @@
     "sibling .floor file precisely so that losing state cannot make us faster.",
     "Lowering a floor means deleting that .floor file too, deliberately."
   ],
-
   "defaults": {
     "min_interval_s": 5.0,
     "window_s": 3600.0,
     "max_requests": 120,
     "max_cost": 600.0,
     "max_wait_s": 60.0,
-    "block_cooldown_s": 86400.0
+    "block_cooldown_s": 86400.0,
+    "require_declaration": true,
+    "preflight_after_requests": 100
   },
-
   "resources": {
     "forum.effectivealtruism.org": {
       "_note": [
         "robots.txt publishes Crawl-Delay: 2 and documents no per-request",
         "limit for /graphql. 2s is the floor for ONE client; the aggregate is",
         "what tripped the bot challenge, so this is deliberately slower.",
-        "Budget sized for a multi-hour crawl at this cadence, not for a burst."
+        "Budget sized for a multi-hour crawl at this cadence, not for a burst.",
+        "Both gates ON here: this is the host whose bot challenge this guard exists",
+        "for. Declaring the blast radius comes before first contact, and a run wider",
+        "than 50 requests needs bounded-sample invariant checks on record first -",
+        "the silent pagination bug is what turned one crawl into a repair pass."
       ],
       "min_interval_s": 5.0,
       "window_s": 5400.0,
       "max_requests": 600,
       "max_cost": 3000.0,
       "max_wait_s": 60.0,
-      "block_cooldown_s": 86400.0
+      "block_cooldown_s": 86400.0,
+      "require_declaration": true,
+      "preflight_after_requests": 50
     }
   }
 }
