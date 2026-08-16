@@ -1,0 +1,54 @@
+{
+  "_README": [
+    "Limits for the global egress gate (mcps/egress-guard/server.py).",
+    "This file is the ONLY way to widen a limit. There is no override flag,",
+    "no force argument and no bypass environment variable, by design.",
+    "Read fresh on every call, so an edit takes effect without a restart.",
+    "",
+    "defaults      applies to any resource not listed under `resources`;",
+    "              an unknown host auto-registers with these.",
+    "resources     per-resource overrides, keyed by exact resource id.",
+    "",
+    "min_interval_s     hard lower bound on the cadence. The effective floor",
+    "                   is the strictest of this and every interval any",
+    "                   participant has declared. A caller can raise it,",
+    "                   never lower it.",
+    "window_s           rolling budget window.",
+    "max_requests       requests allowed per window. Exhaustion RAISES.",
+    "max_cost           cost units allowed per window. One unit is roughly",
+    "                   50 rows, so a `limit: 5000` query debits ~100.",
+    "max_wait_s         longest a single acquire may block. Deeper queues are",
+    "                   refused without reserving a slot.",
+    "block_cooldown_s   default refusal window after a host pushes back.",
+    "                   86400 = retry tomorrow, not an escalating ladder.",
+    "",
+    "Deleting a resource's file under the state dir resets its ratcheted",
+    "floor and its budget history."
+  ],
+
+  "defaults": {
+    "min_interval_s": 5.0,
+    "window_s": 3600.0,
+    "max_requests": 120,
+    "max_cost": 600.0,
+    "max_wait_s": 60.0,
+    "block_cooldown_s": 86400.0
+  },
+
+  "resources": {
+    "forum.effectivealtruism.org": {
+      "_note": [
+        "robots.txt publishes Crawl-Delay: 2 and documents no per-request",
+        "limit for /graphql. 2s is the floor for ONE client; the aggregate is",
+        "what tripped the bot challenge, so this is deliberately slower.",
+        "Budget sized for a multi-hour crawl at this cadence, not for a burst."
+      ],
+      "min_interval_s": 5.0,
+      "window_s": 5400.0,
+      "max_requests": 600,
+      "max_cost": 3000.0,
+      "max_wait_s": 60.0,
+      "block_cooldown_s": 86400.0
+    }
+  }
+}
