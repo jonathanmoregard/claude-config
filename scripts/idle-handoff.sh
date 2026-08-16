@@ -397,6 +397,38 @@ newest_non_sdk_cli_transcript() {
 # Also: staleness = HEAD commit moved OR any tracked/untracked file mtime
 # > transcript mtime (git status --porcelain would cover both; using find
 # on ls-files ∪ status output).
+#
+# THE VERDICT NAMES ITS CAUSE (S3). Fail-closed is correct here, but until now the
+# only trace of a denial was a generic `git_stale` line that never said which file
+# moved. Any untracked mission-shaped file this code did not write makes a project
+# read as permanently world-moved — an accepted consequence of the R2 allowlist —
+# and from the log a human could not distinguish "that project has nothing to do"
+# from "that project is wedged forever". One is normal; the other needs a `rm`. So
+# every DENY sets STALE_DETAIL to the specific reason, including the offending
+# paths, and the skip log line prints it.
+STALE_DETAIL=""
+
+# stale_paths_summary <porcelain-or-path-list> — compact, bounded, single-line
+# rendering for the log. Bounded at 5 entries on purpose: the job is to NAME the
+# file, not to dump a tree into an append-only log. When one of the names is
+# mission-shaped, say what that specifically means, because that is the case a human
+# will otherwise never find.
+stale_paths_summary() {
+  local raw="$1" line out="" n=0 hint=0
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    n=$(( n + 1 ))
+    if (( n > 5 )); then out="$out [...more]"; break; fi
+    out="$out [$line]"
+    case "$line" in *tasks/mission*) hint=1 ;; esac
+  done <<< "$raw"
+  printf '%s' "$out"
+  if (( hint == 1 )); then
+    printf '%s' " -- one of those is a tasks/mission* path that is NOT ours (reflect.sh --mission-copies did not claim it: no stamp of our lineage, or a foreign pointer). While it sits there untracked this project reads as world-moved on EVERY tick and NO resume will ever fire here. Remove it, commit it, or let mission mode write one of ours."
+  fi
+  return 0
+}
+
 is_stale_since_transcript() {
   local cwd="$1" transcript_mtime="$2"
   shift 2
@@ -405,6 +437,16 @@ is_stale_since_transcript() {
   # An EMPTY list is legitimate and means "exclude nothing" — git treats a pathspec
   # list of only exclusions as "everything except", and no pathspecs as everything.
   local -a mission_excludes=( "$@" )
+  # An EMPTY pathspec is not "match everything", it is a git FATAL (128). Passing one
+  # made every subsequent check answer "clean" — see the note in mission_excludes_for.
+  # Refuse rather than run a gate that cannot fail.
+  local mx
+  for mx in ${mission_excludes[@]+"${mission_excludes[@]}"}; do
+    if [[ -z "$mx" ]]; then
+      STALE_DETAIL="the exclusion pathspec list contains an EMPTY element; git rejects that (exit 128) and every check below would read as clean, so the gate is refused instead"
+      return 0
+    fi
+  done
   # Each check runs under `timeout 30 sh -c '...'` so BOTH the git command
   # AND any downstream pipeline (xargs, stat, awk) get killed as a group
   # when the timeout fires. Prior version only wrapped git itself; a
@@ -412,12 +454,17 @@ is_stale_since_transcript() {
   # despite the `timeout 30 git ...` prefix. Advisor P1R3.
   # Any timeout / git error is treated as stale (deny) — the gate exists
   # to reject uncertain state, so failure-to-check is a skip.
-  timeout 30 sh -c 'cd "$1" && git rev-parse --is-inside-work-tree >/dev/null 2>&1' \
-    _ "$cwd" || return 0   # non-git or git-hung: deny
+  STALE_DETAIL=""
+  if ! timeout 30 sh -c 'cd "$1" && git rev-parse --is-inside-work-tree >/dev/null 2>&1' \
+         _ "$cwd"; then
+    STALE_DETAIL="cwd is not a git work tree, or git did not answer within 30s -- world-moved is uncheckable here, so it is denied by design and always will be"
+    return 0   # non-git or git-hung: deny
+  fi
 
   local last_commit_ts
   last_commit_ts=$(timeout 30 sh -c 'cd "$1" && git log -1 --format=%ct 2>/dev/null' _ "$cwd" || echo 0)
   if [[ "$last_commit_ts" -gt "$transcript_mtime" ]]; then
+    STALE_DETAIL="HEAD commit is newer than the transcript (commit_ts=$last_commit_ts > transcript_mtime=$transcript_mtime) -- somebody committed after the session we would resume"
     return 0
   fi
 
@@ -427,10 +474,30 @@ is_stale_since_transcript() {
   # The exclusions keep our OWN repo writes from reading as the world moving. They
   # are an allowlist of files we can see we wrote, not a name shape — a human's
   # tasks/mission.notes.md is not ours and must stay visible here.
-  local porcelain
-  porcelain=$(timeout 30 sh -c 'cd "$1" || exit 1; shift; git status --porcelain -- "$@" 2>/dev/null | head -c 1' \
-                _ "$cwd" ${mission_excludes[@]+"${mission_excludes[@]}"} || echo "")
+  #
+  # The answer is still just "non-empty means moved", but the bytes are now kept so
+  # the log can NAME the files. Two changes from the older form, both about not
+  # reading a FAILURE as a clean tree:
+  #   * `exec git` and no pipeline inside the `sh`, so the substitution's exit status
+  #     is GIT's (or timeout's 124). The old `... | head -c 1` made the status head's,
+  #     which is 0 whatever git did, and `|| echo ""` then turned any git error into
+  #     "clean".
+  #   * truncation moved into bash, so nothing else can mask the status.
+  #   * `--untracked-files=all`, so a wholly-untracked directory is reported as its
+  #     individual files instead of collapsing to `?? tasks/`. The VERDICT is the same
+  #     either way (non-empty means moved), but the collapsed form cannot name the file
+  #     that caused it, which is the whole point of S3 — and, being a directory, it
+  #     could never be matched by a file-level exclusion either.
+  local porcelain porcelain_rc=0
+  porcelain=$(timeout 30 sh -c 'cd "$1" || exit 1; shift; exec git status --porcelain --untracked-files=all -- "$@"' \
+                _ "$cwd" ${mission_excludes[@]+"${mission_excludes[@]}"} 2>/dev/null) || porcelain_rc=$?
+  if (( porcelain_rc != 0 )); then
+    STALE_DETAIL="git status --porcelain could not be evaluated (rc=$porcelain_rc; 124=timeout, 128=bad pathspec) -- uncheckable, so denied"
+    return 0
+  fi
+  porcelain="${porcelain:0:2000}"
   if [[ -n "$porcelain" ]]; then
+    STALE_DETAIL="dirty or untracked paths that are not writes of ours:$(stale_paths_summary "$porcelain")"
     return 0
   fi
 
@@ -442,15 +509,32 @@ is_stale_since_transcript() {
   # otherwise fail the gate on its own freshness the moment we rewrote it. The awk
   # program is passed as a positional argument rather than nested in quotes, so
   # the pathspec list can be variadic.
-  local newer_prog='$1 > t {found=1; exit} END {exit !found}'
-  if timeout 30 sh -c '
+  #
+  # The awk program now PRINTS the offending paths instead of just exiting 0/1, so
+  # this branch can name them too. `stat -c '%Y %n'` then strip the first field, so a
+  # path containing spaces survives (awk $2 would truncate it). Bounded at 6 lines by
+  # `head`, one more than the log renders, so "[...more]" is honest.
+  local newer newer_rc=0 newer_prog='$1 > t { sub(/^[0-9-]+ /, ""); print }'
+  newer=$(timeout 30 sh -c '
         cd "$1" || exit 1
         t="$2"; prog="$3"; shift 3
         git ls-files -z -- "$@" 2>/dev/null \
-          | xargs -0 -r stat -c "%Y" 2>/dev/null \
-          | awk -v t="$t" "$prog"
+          | xargs -0 -r stat -c "%Y %n" 2>/dev/null \
+          | awk -v t="$t" "$prog" \
+          | head -6
       ' _ "$cwd" "$transcript_mtime" "$newer_prog" \
-        ${mission_excludes[@]+"${mission_excludes[@]}"}; then
+        ${mission_excludes[@]+"${mission_excludes[@]}"}) || newer_rc=$?
+  # A `timeout` kill (124) or a failed `cd` (1) is uncheckable, not clean. Residual,
+  # and stated rather than implied: a failure of git INSIDE that pipeline is still
+  # masked by `head`'s status. The pathspecs are validated by mission_excludes_for and
+  # the work tree was confirmed by rev-parse above, so the realistic failure here is
+  # the timeout, which IS caught.
+  if (( newer_rc != 0 )); then
+    STALE_DETAIL="the tracked-file mtime scan could not be evaluated (rc=$newer_rc; 124=timeout) -- uncheckable, so denied"
+    return 0
+  fi
+  if [[ -n "$newer" ]]; then
+    STALE_DETAIL="tracked files whose mtime is newer than the transcript (mtime > $transcript_mtime):$(stale_paths_summary "$newer")"
     return 0
   fi
   return 1
@@ -546,7 +630,16 @@ mission_excludes_for() {
     fi
     out+=( ":(exclude)$line" )
   done <<< "$raw"
-  printf '%s\n' ${out[@]+"${out[@]}"}
+  # NOTHING when there is nothing. `printf '%s\n'` with no arguments emits ONE EMPTY
+  # LINE, mapfile turned that into a one-element array holding "", and
+  # `git status --porcelain -- ""` exits 128 with "empty string is not a valid
+  # pathspec" — which the gate's `2>/dev/null | head` swallowed and read as a CLEAN
+  # tree. So in every project with no retained copy of ours (a first tick, or any tree
+  # whose copies have been GC'd) the whole freshness gate was a no-op that always
+  # answered "the world has not moved". Found by TEST 41a, 2026-08-16.
+  if (( ${#out[@]} > 0 )); then
+    printf '%s\n' "${out[@]}"
+  fi
 }
 
 # ---- Authoritative mission resolution ---------------------------------------
@@ -762,9 +855,14 @@ for project_dir in "$PROJECTS_DIR"/*/; do
   if is_stale_since_transcript "$candidate_cwd" "$mtime" \
        ${mission_excludes[@]+"${mission_excludes[@]}"}; then
     stale_this_iter=1
+    # Captured now, reported at the skip below: the gate runs BEFORE the mission
+    # write, so by the time the log line is emitted STALE_DETAIL could have been
+    # overwritten by a later call.
+    stale_detail_this_iter="$STALE_DETAIL"
     pre_write_head=""
   else
     stale_this_iter=0
+    stale_detail_this_iter=""
     pre_write_head=$(timeout 5 sh -c 'cd "$1" && git rev-parse HEAD 2>/dev/null' _ "$candidate_cwd" || echo "")
   fi
 
@@ -882,20 +980,28 @@ for project_dir in "$PROJECTS_DIR"/*/; do
   fi
 
   # ---- Staleness gate (evaluated pre-write; see above) ---
+  # The reason is NAMED (S3). A bare `git_stale` cannot be told apart from "quiet
+  # project", and the most common cause of a permanent denial is one specific file
+  # this code can see and a human cannot guess.
   if [[ "$stale_this_iter" -eq 1 ]]; then
     count_skipped_git_stale=$((count_skipped_git_stale + 1))
-    log "autofork skipped sid=$sid cwd=$candidate_cwd (world changed / non-git / dirty at write time)"
+    log "autofork skipped sid=$sid cwd=$candidate_cwd (world changed / non-git / dirty at write time): ${stale_detail_this_iter:-<no detail recorded>}"
     continue
   fi
 
   # ---- Post-write TOCTOU re-check (advisor P3R1 MEDIUM + P1R4 MEDIUM) ---
   # If the world moved during the ~90s mission-write, autofork would act
   # on a world that just moved. Two checks: (1) HEAD SHA compare against
-  # the pre-write snapshot; (2) porcelain shows anything NEW that wasn't
-  # in the pre-write porcelain (using `-- ':(exclude)tasks/mission.md'`
-  # so we don't count our own write). Non-git cwds skipped this section
-  # entirely (pre_write_head empty because is_stale_since_transcript
-  # denied non-git earlier).
+  # the pre-write snapshot; (2) porcelain shows anything that is not a write of
+  # ours. Non-git cwds skipped this section entirely (pre_write_head empty
+  # because is_stale_since_transcript denied non-git earlier).
+  #
+  # The exclusions are the same PER-CWD ALLOWLIST the pre-write gate used, re-derived
+  # from disk by mission_excludes_for. An earlier revision of this comment described
+  # a single hardcoded `-- ':(exclude)tasks/mission.md'` pathspec; that design was
+  # deleted in R2 because one name is not the set of files we wrote (copies of every
+  # age are retained by design) and a name SHAPE is not authorship (a human's
+  # `tasks/mission.notes.md` fits it). Nothing here hardcodes a pathspec any more.
   if [[ -n "$pre_write_head" ]]; then
     post_write_head=$(timeout 5 sh -c 'cd "$1" && git rev-parse HEAD 2>/dev/null' _ "$candidate_cwd" || echo "")
     if [[ -z "$post_write_head" || "$post_write_head" != "$pre_write_head" ]]; then
@@ -913,11 +1019,21 @@ for project_dir in "$PROJECTS_DIR"/*/; do
     # pre-write list was built. Reusing that list would leave our own fresh copy
     # visible here and deny every fork.
     mapfile -t mission_excludes < <(mission_excludes_for "$candidate_cwd")
-    post_write_porcelain=$(timeout 5 sh -c 'cd "$1" || exit 1; shift; git status --porcelain -- "$@" 2>/dev/null | head -c 1' \
-                             _ "$candidate_cwd" ${mission_excludes[@]+"${mission_excludes[@]}"} || echo "")
+    # `exec git`, no pipeline, status checked: same reason as the pre-write check —
+    # `... | head` made the status head's, so any git error read as a clean tree.
+    post_write_rc=0
+    post_write_porcelain=$(timeout 5 sh -c 'cd "$1" || exit 1; shift; exec git status --porcelain --untracked-files=all -- "$@"' \
+                             _ "$candidate_cwd" ${mission_excludes[@]+"${mission_excludes[@]}"} 2>/dev/null) \
+      || post_write_rc=$?
+    if (( post_write_rc != 0 )); then
+      count_skipped_git_stale=$((count_skipped_git_stale + 1))
+      log "autofork skipped sid=$sid cwd=$candidate_cwd (post-write git status could not be evaluated, rc=$post_write_rc; 124=timeout, 128=bad pathspec -- uncheckable, so denied)"
+      continue
+    fi
+    post_write_porcelain="${post_write_porcelain:0:2000}"
     if [[ -n "$post_write_porcelain" ]]; then
       count_skipped_git_stale=$((count_skipped_git_stale + 1))
-      log "autofork skipped sid=$sid cwd=$candidate_cwd (non-mission dirty files after mission-write)"
+      log "autofork skipped sid=$sid cwd=$candidate_cwd (dirty files after mission-write that are not writes of ours):$(stale_paths_summary "$post_write_porcelain")"
       continue
     fi
   fi
