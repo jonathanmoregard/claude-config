@@ -290,6 +290,76 @@ def test_missing_resource_argument_is_an_error(state_dir, policy_file):
     assert "resource" in result_text(responses[3]).lower()
 
 
+def test_undeclared_resource_is_refused_over_the_wire(state_dir, policy_file):
+    policy = policy_file(defaults={"min_interval_s": 0.0, "require_declaration": True})
+    responses, _ = mcp_session(
+        [
+            ("acquire", {"resource": RESOURCE}),
+            ("declare", {
+                "resource": RESOURCE,
+                "min_interval_s": 0.0,
+                "expected_requests": 600,
+                "ceiling_requests": 900,
+                "pushback": "403 interstitial",
+            }),
+            ("acquire", {"resource": RESOURCE}),
+            ("status", {"resource": RESOURCE}),
+        ],
+        state_dir,
+        policy,
+    )
+    assert is_error(responses[3]) is True
+    assert "blast-radius" in result_text(responses[3])
+    assert is_error(responses[5]) is False
+    declared = result_json(responses[6])["declaration"]
+    assert declared["expected_requests"] == 600
+    assert declared["pushback"] == "403 interstitial"
+
+
+def test_preflight_gates_the_wider_run_over_the_wire(state_dir, policy_file):
+    policy = policy_file(
+        defaults={"min_interval_s": 0.0, "preflight_after_requests": 1}
+    )
+    responses, _ = mcp_session(
+        [
+            ("acquire", {"resource": RESOURCE}),
+            ("acquire", {"resource": RESOURCE}),
+            ("record_preflight", {
+                "resource": RESOURCE,
+                "checks": [{"name": "short page is not end-of-data", "passed": True}],
+                "sample_requests": 8,
+            }),
+            ("acquire", {"resource": RESOURCE}),
+        ],
+        state_dir,
+        policy,
+    )
+    assert is_error(responses[3]) is False
+    assert is_error(responses[4]) is True
+    assert "preflight" in result_text(responses[4]).lower()
+    assert is_error(responses[5]) is False
+    assert is_error(responses[6]) is False
+
+
+def test_failing_preflight_is_refused_over_the_wire(state_dir, policy_file):
+    policy = policy_file(defaults={"min_interval_s": 0.0})
+    responses, _ = mcp_session(
+        [
+            ("record_preflight", {
+                "resource": RESOURCE,
+                "checks": [
+                    {"name": "offset cap triggers a split", "passed": False},
+                ],
+                "sample_requests": 4,
+            }),
+        ],
+        state_dir,
+        policy,
+    )
+    assert is_error(responses[3]) is True
+    assert "offset cap" in result_text(responses[3])
+
+
 def test_shipped_policy_file_is_valid_json_and_conservative():
     """The policy that ships with the server must parse and must not be permissive."""
     path = os.path.join(REPO_ROOT, "mcps", "egress-guard", "egress-policy.json")

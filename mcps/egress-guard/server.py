@@ -123,7 +123,20 @@ def _tool_declare(args: dict) -> str:
     min_interval_s = _optional_number(args, "min_interval_s")
     if min_interval_s is None:
         raise ValueError("argument `min_interval_s` is required for declare.")
-    floor = _guard().declare(resource, min_interval_s)
+    expected_requests = _optional_number(args, "expected_requests")
+    expected_cost = _optional_number(args, "expected_cost")
+    ceiling_requests = _optional_number(args, "ceiling_requests")
+    pushback = args.get("pushback")
+    if pushback is not None and not isinstance(pushback, str):
+        raise ValueError("argument `pushback` must be a string if given.")
+    floor = _guard().declare(
+        resource,
+        min_interval_s,
+        expected_requests=None if expected_requests is None else int(expected_requests),
+        expected_cost=expected_cost,
+        ceiling_requests=None if ceiling_requests is None else int(ceiling_requests),
+        pushback=pushback,
+    )
     return json.dumps(
         {
             "resource": resource,
@@ -167,11 +180,39 @@ def _tool_record_block(args: dict) -> str:
     )
 
 
+def _tool_record_preflight(args: dict) -> str:
+    resource = _require_resource(args)
+    checks = args.get("checks")
+    if not isinstance(checks, list) or not checks:
+        raise ValueError(
+            "argument `checks` must be a non-empty list of {name, passed} objects — "
+            "name the invariants you actually proved on the bounded sample."
+        )
+    sample_requests = _optional_number(args, "sample_requests")
+    record = _guard().record_preflight(
+        resource,
+        checks=checks,
+        sample_requests=int(sample_requests or 0),
+    )
+    return json.dumps(
+        {
+            "resource": resource,
+            "preflight": record,
+            "note": (
+                "recorded. A preflight with any failing check is refused rather "
+                "than stored — fix the invariant, then record it."
+            ),
+        },
+        indent=2,
+    )
+
+
 _TOOL_BODIES = {
     "acquire": _tool_acquire,
     "declare": _tool_declare,
     "status": _tool_status,
     "record_block": _tool_record_block,
+    "record_preflight": _tool_record_preflight,
 }
 
 
@@ -256,8 +297,69 @@ TOOLS = [
                     "type": "string",
                     "description": "What this resource is and why we are touching it.",
                 },
+                "expected_requests": {
+                    "type": "integer",
+                    "description": (
+                        "Blast radius: total requests this job expects to make. "
+                        "Estimate it before starting — 'more than I said' is only "
+                        "observable if you said a number."
+                    ),
+                },
+                "expected_cost": {
+                    "type": "number",
+                    "description": (
+                        "Total cost units expected. One unit is roughly 50 rows, so "
+                        "count expensive queries at their real weight."
+                    ),
+                },
+                "ceiling_requests": {
+                    "type": "integer",
+                    "description": "The number this job must not exceed.",
+                },
+                "pushback": {
+                    "type": "string",
+                    "description": (
+                        "What this resource's pushback looks like (403 interstitial, "
+                        "429, quota mail, bounce), so it is recognised rather than "
+                        "retried through."
+                    ),
+                },
             },
             "required": ["resource", "min_interval_s"],
+        },
+    },
+    {
+        "name": "record_preflight",
+        "description": (
+            "Record that bounded-sample invariant checks PASSED for a resource, "
+            "unlocking a wider run. Prove the things that silently corrupt a bulk "
+            "job on a small sample first: a short page mid-run is not end-of-data, "
+            "offset caps, server totals that over-count, empty windows, duplicates "
+            "at boundaries. A preflight containing any failing check is refused "
+            "rather than stored."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "resource": {"type": "string", "description": "Blast-radius unit."},
+                "checks": {
+                    "type": "array",
+                    "description": "The invariants proved, as {name, passed} objects.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "passed": {"type": "boolean"},
+                        },
+                        "required": ["name", "passed"],
+                    },
+                },
+                "sample_requests": {
+                    "type": "integer",
+                    "description": "How many requests the bounded sample cost.",
+                },
+            },
+            "required": ["resource", "checks"],
         },
     },
     {

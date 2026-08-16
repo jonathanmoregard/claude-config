@@ -62,6 +62,8 @@ __all__ = [
     "EgressGuardError",
     "Grant",
     "PolicyError",
+    "PreflightRequired",
+    "Undeclared",
     "WaitTooLong",
 ]
 
@@ -77,6 +79,12 @@ DEFAULT_POLICY: dict[str, Any] = {
         "max_cost": 600.0,
         "max_wait_s": 60.0,
         "block_cooldown_s": 86400.0,
+        # Blast radius must be declared before first contact.
+        "require_declaration": False,
+        # Beyond this many grants in a window, a resource needs a recorded
+        # preflight. A correctness bug that goes unnoticed on a bounded sample
+        # is what turns one run into a repair pass at full scale.
+        "preflight_after_requests": 0,
     },
     "resources": {},
 }
@@ -180,6 +188,30 @@ class WaitTooLong(EgressGuardError):
             f"{resource}: next free slot is {retry_after_s:.1f}s away, over the "
             f"{max_wait_s:.1f}s ceiling for holding a call open. No slot was "
             "reserved; come back later."
+        )
+
+
+class Undeclared(EgressGuardError):
+    """No blast radius on file for a resource whose policy demands one."""
+
+    def __init__(self, resource: str):
+        self.resource = resource
+        super().__init__(
+            f"{resource} has no blast-radius declaration. Declare expected volume, "
+            "cost, ceiling and what pushback looks like before first contact."
+        )
+
+
+class PreflightRequired(EgressGuardError):
+    """Bounded-sample checks have not been recorded for a resource going wide."""
+
+    def __init__(self, resource: str, used: int, threshold: int):
+        self.resource, self.used, self.threshold = resource, used, threshold
+        super().__init__(
+            f"{resource} has had {used} grants (threshold {threshold}) with no recorded "
+            "preflight. Prove the invariants on a bounded sample — short pages, "
+            "offset caps, over-counted totals, empty windows, duplicates — then "
+            "record the result before going wider."
         )
 
 
@@ -383,6 +415,14 @@ class EgressGuard:
                     ts = now
                 events.append([ts, float(item[1])])
         state["events"] = events
+
+        # Declaration and preflight are records, not counters: carry them
+        # through normalisation or every read would silently revoke them.
+        for key in ("declaration", "preflight"):
+            value = raw.get(key)
+            if isinstance(value, dict):
+                state[key] = value
+
         return state
 
     def _write_state(self, resource: str, state: dict[str, Any]) -> None:
@@ -408,11 +448,24 @@ class EgressGuard:
 
     # -- public API -------------------------------------------------------
 
-    def declare(self, resource: str, min_interval_s: float) -> float:
+    def declare(
+        self,
+        resource: str,
+        min_interval_s: float,
+        expected_requests: Optional[int] = None,
+        expected_cost: Optional[float] = None,
+        ceiling_requests: Optional[int] = None,
+        pushback: Optional[str] = None,
+    ) -> float:
         """Register `resource` and ratchet its floor up to `min_interval_s`.
 
         Returns the effective floor, which may be stricter than what was
         declared — a slower participant, or the policy file, always wins.
+
+        The optional arguments record the blast radius: how much traffic this
+        is expected to be, what it may not exceed, and what pushback from this
+        resource looks like. Estimating those before first contact is what
+        makes "this is more than I said" observable rather than discovered.
         """
         min_interval_s = float(min_interval_s)
         if min_interval_s < 0:
@@ -423,8 +476,51 @@ class EgressGuard:
             state = self._read_state(resource, now)
             floor = self._effective_floor(state, policy, min_interval_s)
             state["floor_s"] = floor
+            declaration = dict(state.get("declaration") or {})
+            declaration["declared_at"] = now
+            declaration["min_interval_s"] = min_interval_s
+            for key, value in (
+                ("expected_requests", expected_requests),
+                ("expected_cost", expected_cost),
+                ("ceiling_requests", ceiling_requests),
+                ("pushback", pushback),
+            ):
+                if value is not None:
+                    declaration[key] = value
+            state["declaration"] = declaration
             self._write_state(resource, state)
         return floor
+
+    def record_preflight(
+        self, resource: str, checks: list, sample_requests: int
+    ) -> dict[str, Any]:
+        """Record that bounded-sample invariant checks PASSED for `resource`.
+
+        `checks` is a list of {"name": str, "passed": bool}. A failing check is
+        refused rather than stored: recording a red preflight would turn the
+        gate into paperwork.
+        """
+        if not checks:
+            raise ValueError(
+                "checks must not be empty — name the invariants you actually proved."
+            )
+        failed = [c.get("name", "?") for c in checks if not c.get("passed")]
+        if failed:
+            raise ValueError(
+                "preflight has failing checks and will not be recorded: "
+                + ", ".join(failed)
+            )
+        now = self._time()
+        record = {
+            "at": now,
+            "sample_requests": int(sample_requests),
+            "checks": [str(c.get("name", "?")) for c in checks],
+        }
+        with self.locked(resource):
+            state = self._read_state(resource, now)
+            state["preflight"] = record
+            self._write_state(resource, state)
+        return record
 
     def record_block(
         self,
@@ -480,6 +576,8 @@ class EgressGuard:
             "max_cost": float(policy["max_cost"]),
             "max_wait_s": float(policy["max_wait_s"]),
             "next_slot_s": max(0.0, next_slot - now),
+            "declaration": state.get("declaration") or None,
+            "preflight": state.get("preflight") or None,
             "policy_path": self.policy_path,
             "state_path": self.state_path(resource),
         }
@@ -532,9 +630,23 @@ class EgressGuard:
                     state.get("cooldown_reason", ""),
                 )
 
+            if policy.get("require_declaration") and not state.get("declaration"):
+                self._write_state(resource, state)
+                raise Undeclared(resource)
+
             events = _live_events(state["events"], now, window)
             requests_used = len(events)
             cost_used = sum(e[1] for e in events)
+
+            preflight_after = int(policy.get("preflight_after_requests") or 0)
+            if (
+                preflight_after
+                and requests_used >= preflight_after
+                and not state.get("preflight")
+            ):
+                state["events"] = events
+                self._write_state(resource, state)
+                raise PreflightRequired(resource, requests_used, preflight_after)
 
             if requests_used + 1 > max_requests:
                 state["events"] = events
