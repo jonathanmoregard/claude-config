@@ -1,10 +1,25 @@
 #!/usr/bin/env bash
 # Offline smoke test for session-reflect. Uses a stub `claude` on PATH; no
-# live API calls, no network. Exit 0 on success, 1 on any assertion failure.
+# live API calls, no network.
+#
+# LANES (test selection only — NOT a switch on product behaviour):
+#   fast  (default)  the regression test for every BLOCKER/HIGH fixed in this
+#                    review, plus every cheap unit-level test. Runnable inline.
+#   full             fast + the MEDIUM/LOW integration blocks, which each drive
+#                    several real `idle-handoff.sh` ticks and dominate wall time.
+#   Select with `SMOKE_LANE=full` or `bash tests/smoke.sh --full`.
+#
+# EXIT CODES — a test failing and the suite failing to clean up after itself are
+# different events and no longer share an exit code:
+#   0  every selected test passed AND teardown completed
+#   1  a test failed (temp dirs are kept for inspection)
+#   3  every test passed but TEARDOWN failed — see the TEARDOWN: line
+#   2  bad invocation
 #
 # Env overrides:
 #   REFLECT_ROOT     - artifact root (default: mktemp)
 #   REFLECT_DEBUG=1  - keep temp dirs and print paths
+#   SMOKE_LANE       - fast (default) | full
 set -u
 set -o pipefail
 
@@ -14,7 +29,50 @@ SKILL_DIR="$WORKTREE/skills/session-reflect"
 STUBS_DIR="$WORKTREE/tests/stubs"
 REFLECT_SH="$SKILL_DIR/reflect.sh"
 
-fail() { echo "FAIL: $*" >&2; exit 1; }
+# Fixture git repos must not run the INVOKING USER's global hooks. On this host
+# core.hooksPath points at a gitleaks pre-commit hook, so every `git commit` in a
+# fixture paid for a secret scan — and, worse, a fixture file that tripped it would
+# have failed the suite for a reason that has nothing to do with the code under
+# test. Fixtures are hermetic; identity is set per-repo where it is needed.
+export GIT_CONFIG_NOSYSTEM=1
+export GIT_CONFIG_GLOBAL=/dev/null
+
+SMOKE_LANE="${SMOKE_LANE:-fast}"
+while (( $# > 0 )); do
+  case "$1" in
+    --fast) SMOKE_LANE=fast ;;
+    --full|--all|--slow) SMOKE_LANE=full ;;
+    -h|--help)
+      sed -n '2,22p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    *) echo "smoke.sh: unknown argument '$1' (want --fast | --full)" >&2; exit 2 ;;
+  esac
+  shift
+done
+case "$SMOKE_LANE" in
+  fast|full) ;;
+  *) echo "smoke.sh: SMOKE_LANE='$SMOKE_LANE' is not a lane (want: fast | full)" >&2; exit 2 ;;
+esac
+
+TESTS_RUN=0
+TESTS_SKIPPED=0
+
+# Every named TEST announces itself through here, so the final report can state how
+# many actually ran instead of asserting that they did.
+test_begin() { TESTS_RUN=$(( TESTS_RUN + 1 )); echo "$*"; }
+
+# lane_full — true when the exhaustive lane was asked for. The ONLY thing it
+# selects is which tests run; nothing downstream of it changes product behaviour.
+lane_full() { [[ "$SMOKE_LANE" == "full" ]]; }
+lane_skip() { TESTS_SKIPPED=$(( TESTS_SKIPPED + 1 )); echo "SKIP (lane=$SMOKE_LANE): $*"; }
+
+# A test failed. Teardown is deliberately NOT attempted: the temp state is the
+# evidence. The exit code (1) and the TESTS: line both say "a test", never "cleanup".
+fail() {
+  echo "FAIL: $*" >&2
+  echo "TESTS:    FAILED after $TESTS_RUN named test(s) (lane=$SMOKE_LANE)" >&2
+  echo "TEARDOWN: SKIPPED — temp state kept for inspection: REFLECT_ROOT=${REFLECT_ROOT:-<not created yet>}" >&2
+  exit 1
+}
 info() { echo "  -> $*"; }
 
 # --- Live-repo isolation guard -----------------------------------------------
@@ -218,7 +276,230 @@ STUBBODY
 }
 write_stub_help
 
-export PATH="$STUB_HELP_DIR:$STUB_SCRATCH:$PATH"
+# --- Spawn tracking: the harness knows what it started ------------------------
+# THE DEFECT THIS FIXES (observed 2026-08-16, and the reason a green tree reported
+# red on one machine-state and green on another):
+#
+#   63 named TESTs ran. Zero test-level failures. `OK: all smoke tests passed` was
+#   never printed. The last lines were
+#       rm: cannot remove '/tmp/reflect-smoke-XXXXXX/logs': Directory not empty
+#       SUITE_FAILED
+#   and the file holding the directory open was
+#   `test-sid-t5-marker-ok-mission-<epoch_ns>.stdout.log` — written by a DETACHED
+#   worker spawned during TEST 47c, landing in the temp log dir AFTER the suite's
+#   final assertion had already passed.
+#
+# Round 1's D1 fix deliberately made those workers survive parent teardown
+# (`systemd-run --user --collect --no-block`, so the worker lives in its own cgroup
+# and is immune to the caller's exit). The harness never learned the other half:
+# something that outlives you has to be WAITED FOR. Under load the worker's stdout
+# log lands between `rm -rf`'s readdir and its rmdir, `rm` exits non-zero, `set -e`
+# (in force from TEST 15 onward) kills the script — after every assertion passed.
+#
+# THE FIX IS NOT A QUIETER `rm`. `rm -rf … || true` or `2>/dev/null` would hide the
+# next real teardown bug, and this session already found a defect that existed
+# purely because a redirection was attached to the wrong thing
+# (`exec 8>>"$LOCK" 2>/dev/null` silenced five refusal messages for months). So the
+# harness tracks every process it starts and waits for it to reach a terminal state,
+# with a bound; failing that bound is a LOUD, distinctly-coded failure that names
+# what is still holding the directory.
+#
+# TWO INDEPENDENT TRACKS, because there are two spawn mechanisms:
+#
+#  1. TRANSIENT UNITS. Every detached spawn in this codebase goes through
+#     `systemd-run --user … --unit=<name>`. A transparent shim ahead of the real
+#     binary on PATH records the unit name and execs the real thing, so the suite
+#     holds the same handle systemd does. Waiting on the RECORDED names (rather than
+#     on a `claude-autofork-*` glob) also means the live deployment's own 5-minute
+#     timer, which fires during a full run, is not something we wait for.
+#
+#  2. LIVE PROCESSES NAMING OUR ROOT. The `setsid` fallback spawn has no unit at
+#     all, and a unit's children are not units either. Both are caught by scanning
+#     for live processes whose environment contains this run's REFLECT_ROOT — a
+#     fresh mktemp path, so it cannot match the live deployment's workers. The
+#     suite's own process tree is excluded: the shell is blocked on its synchronous
+#     children by definition, so they are not work to wait for.
+#
+# Anything that can write into $REFLECT_ROOT is in one of those two sets, so
+# "both sets empty" is the real terminal condition, not a duration.
+SPAWN_TRACK_DIR="$(mktemp -d -t reflect-spawntrack-XXXXXX)"
+SPAWN_REGISTRY="$SPAWN_TRACK_DIR/units.log"
+SPAWN_TERMINAL_CACHE="$SPAWN_TRACK_DIR/units-terminal.log"
+SPAWN_SHIM_DIR="$SPAWN_TRACK_DIR/bin"
+SPAWN_SCAN_PY="$SPAWN_TRACK_DIR/live-workers.py"
+SPAWN_HOLDERS=""
+: > "$SPAWN_REGISTRY"
+: > "$SPAWN_TERMINAL_CACHE"
+mkdir -p "$SPAWN_SHIM_DIR"
+
+# Resolve the real binary BEFORE the shim dir goes on PATH, or the shim execs itself.
+SPAWN_REAL_SYSTEMD_RUN="$(command -v systemd-run 2>/dev/null || true)"
+if [[ -n "$SPAWN_REAL_SYSTEMD_RUN" ]]; then
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf '# tests/smoke.sh spawn-tracking shim. Records the transient unit name, then\n'
+    printf '# delegates. Transparent by construction: it appends one line and `exec`s the\n'
+    printf '# real binary, so exit status, stdout, stderr and inherited fds are untouched.\n'
+    printf 'REAL=%q\n' "$SPAWN_REAL_SYSTEMD_RUN"
+    printf 'REG=%q\n' "$SPAWN_REGISTRY"
+    cat <<'SHIM'
+unit="" prev="" seen_dashdash=0
+for a in "$@"; do
+  # Everything after a bare `--` is the PAYLOAD command; a payload argument that
+  # happens to look like --unit= is not this systemd-run's unit name.
+  if (( seen_dashdash )); then break; fi
+  case "$a" in
+    --) seen_dashdash=1; continue ;;
+    --unit=*) unit="${a#--unit=}" ;;
+  esac
+  case "$prev" in --unit|-u) unit="$a" ;; esac
+  case "$a" in -u?*) [[ "$a" == --* ]] || unit="${a#-u}" ;; esac
+  prev="$a"
+done
+printf '%s\n' "${unit:-<unnamed>}" >> "$REG"
+exec "$REAL" "$@"
+SHIM
+  } > "$SPAWN_SHIM_DIR/systemd-run"
+  chmod +x "$SPAWN_SHIM_DIR/systemd-run"
+fi
+
+cat >"$SPAWN_SCAN_PY" <<'PY'
+"""Print `pid<TAB>cmdline` for every live process this suite spawned and is not
+blocked on: outside the suite's own process tree, with this run's REFLECT_ROOT in
+its environment. argv: <reflect_root> <suite_pid>."""
+import os
+import sys
+
+root = sys.argv[1].encode()
+suite_pid = int(sys.argv[2])
+needle = b"REFLECT_ROOT=" + root + b"\0"
+
+ppid = {}
+for entry in os.listdir("/proc"):
+    if not entry.isdigit():
+        continue
+    pid = int(entry)
+    try:
+        with open("/proc/%d/stat" % pid, "rb") as fh:
+            stat = fh.read()
+    except OSError:
+        continue                      # exited between listdir and open
+    # comm can contain spaces and parens; ppid is the field after the last ')'.
+    try:
+        ppid[pid] = int(stat[stat.rfind(b")") + 2:].split()[1])
+    except (IndexError, ValueError):
+        continue
+
+children = {}
+for pid, parent in ppid.items():
+    children.setdefault(parent, []).append(pid)
+own, stack = {suite_pid}, [suite_pid]
+while stack:
+    for kid in children.get(stack.pop(), []):
+        if kid not in own:
+            own.add(kid)
+            stack.append(kid)
+
+out = []
+for pid in sorted(ppid):
+    if pid in own:
+        continue
+    try:
+        with open("/proc/%d/environ" % pid, "rb") as fh:
+            if needle not in fh.read():
+                continue
+        with open("/proc/%d/cmdline" % pid, "rb") as fh:
+            cmd = fh.read().replace(b"\0", b" ").strip().decode("utf-8", "replace")
+    except OSError:
+        continue
+    out.append("%d\t%s" % (pid, cmd or "?"))
+print("\n".join(out))
+PY
+
+# spawn_holders — one line per thing that can still write into $REFLECT_ROOT.
+# Empty output IS the terminal condition. Names of units already observed terminal
+# are cached in a FILE, not a shell array: this function is called from `$(...)`
+# subshells, where an array update would be discarded.
+spawn_holders() {
+  local -a check=()
+  local u state id pending_name
+  while read -r u; do
+    [[ -n "$u" && "$u" != "<unnamed>" ]] || continue
+    grep -qxF -- "$u" "$SPAWN_TERMINAL_CACHE" 2>/dev/null && continue
+    check+=( "$u" )
+  done < <(sort -u -- "$SPAWN_REGISTRY" 2>/dev/null || true)
+
+  if (( ${#check[@]} > 0 )); then
+    # One batched call: `show` emits an Id/ActiveState block per unit, in argv order.
+    id=""
+    while IFS= read -r state; do
+      case "$state" in
+        Id=*)          id="${state#Id=}"; id="${id%.service}" ;;
+        ActiveState=*) pending_name="${state#ActiveState=}"
+          case "$pending_name" in
+            activating|active|deactivating|reloading|refreshing)
+              printf 'unit %s (%s)\n' "$id" "$pending_name" ;;
+            *)
+              # `--collect` erases a finished unit, so "unknown/inactive" is
+              # precisely "it is over". Cache it; unit names do not come back to
+              # life, and re-`show`ing 150 of them every 200ms is not free.
+              [[ -n "$id" ]] && printf '%s\n' "$id" >> "$SPAWN_TERMINAL_CACHE" ;;
+          esac ;;
+      esac
+    done < <(systemctl --user show --property=Id --property=ActiveState -- "${check[@]}" 2>/dev/null || true)
+  fi
+
+  python3 "$SPAWN_SCAN_PY" "$REFLECT_ROOT" "$$" 2>/dev/null \
+    | sed -n 's/^\([0-9]*\)\t\(.*\)$/process \1 (\2)/p' || true
+}
+
+# spawn_wait_quiescent <timeout_seconds> — block until nothing this suite spawned
+# can still write, or the bound expires. Sets SPAWN_HOLDERS to what is left.
+# Bounded, condition-driven: it is not "poll for N seconds", it is "poll UNTIL the
+# condition holds, and give up loudly at N".
+spawn_wait_quiescent() {
+  local timeout="${1:-90}" deadline holders
+  deadline=$(( SECONDS + timeout ))
+  while :; do
+    holders="$(spawn_holders)"
+    if [[ -z "$holders" ]]; then
+      SPAWN_HOLDERS=""
+      return 0
+    fi
+    if (( SECONDS >= deadline )); then
+      SPAWN_HOLDERS="$holders"
+      return 1
+    fi
+    sleep 0.2
+  done
+}
+
+# A spawned fork is a transient systemd unit, so "did it fork?" is not answerable the
+# instant idle-handoff.sh returns — systemd-run returns on QUEUE, not on start.
+#
+# Every fork assertion in this suite used to answer that question with a duration:
+# `poll up to 15s` for a positive, `sleep 3` for a negative, and the shared tick
+# helpers gave their NEGATIVE cases the positive's full 10-15s poll. Both halves were
+# wrong the same way — the verdict depended on how fast the machine was, so a negative
+# could pass merely because the fork had not landed yet. Those waits were also ~2
+# minutes of the suite's wall time.
+#
+# It now waits for the actual terminal condition: every unit and process this suite
+# spawned has reached a terminal state. Once that holds, a fork's stub has exited, so
+# the argv log is FINAL — a positive needs no polling and a negative needs no grace
+# period. One condition, both answers, and neither is decided by timing.
+sc_settle_fork() {
+  # $1=argv log  $2=expect: fork|no-fork — kept for call-site readability only; the
+  #              wait is identical for both, which is exactly the point.
+  local argv="${1:-}" expect="${2:-}"
+  if ! spawn_wait_quiescent 60; then
+    fail "settle (${expect:-either}): spawned work did not reach a terminal state within 60s, so the fork verdict for '$argv' cannot be read as final:
+$SPAWN_HOLDERS"
+  fi
+  return 0
+}
+
+export PATH="$SPAWN_SHIM_DIR:$STUB_HELP_DIR:$STUB_SCRATCH:$PATH"
 
 # --- Isolated artifact root --------------------------------------------------
 REFLECT_ROOT="${REFLECT_ROOT:-$(mktemp -d -t reflect-smoke-XXXXXX)}"
@@ -264,7 +545,7 @@ wait_for_complete() {
 # ============================================================================
 # TEST 1: sessionend fires-and-forgets, exits fast, writes final artifact
 # ============================================================================
-echo "TEST 1: sessionend detached run"
+test_begin "TEST 1: sessionend detached run"
 SID="test-sid-abc"
 PAYLOAD="$(fake_payload SessionEnd "$SID")"
 
@@ -293,7 +574,7 @@ info "final.json schema OK"
 # ============================================================================
 # TEST 2: idempotency - rerun does not overwrite
 # ============================================================================
-echo "TEST 2: sessionend idempotency"
+test_begin "TEST 2: sessionend idempotency"
 FINAL_MTIME1=$(stat -c '%Y' "$FINAL")
 sleep 1  # ensure mtime granularity
 
@@ -301,8 +582,12 @@ echo "$PAYLOAD" | bash "$REFLECT_SH" sessionend
 rc=$?
 (( rc == 0 )) || fail "rerun exit=$rc"
 
-# Wait a beat for any detached process to (not) run
-sleep 2
+# Wait for any detached process to (not) run. This used to be `sleep 2`, i.e. a
+# NEGATIVE assertion decided by a duration: a re-run that wrongly spawned a worker
+# passed as long as the worker was slower than the sleep. Waiting for quiescence
+# makes the same assertion an observation.
+spawn_wait_quiescent 60 \
+  || fail "2: work spawned by the idempotency re-run never finished, so the mtime below is not final: $SPAWN_HOLDERS"
 
 FINAL_MTIME2=$(stat -c '%Y' "$FINAL")
 STATUS=$(jq -r '.modes.sessionend.status // ""' "$MANIFEST")
@@ -316,7 +601,7 @@ fi
 # ============================================================================
 # TEST 3: precompact runs synchronously and writes a checkpoint
 # ============================================================================
-echo "TEST 3: precompact synchronous checkpoint"
+test_begin "TEST 3: precompact synchronous checkpoint"
 PC_SID="test-sid-precompact"
 PC_PAYLOAD=$(jq -cn --arg sid "$PC_SID" --arg tp "$TRANSCRIPT" --arg cwd "$TEST_CWD" \
   '{session_id:$sid, transcript_path:$tp, hook_event_name:"PreCompact", cwd:$cwd, trigger:"auto", custom_instructions:""}')
@@ -343,7 +628,7 @@ info "precompact wrote $CP_COUNT checkpoint(s)"
 # (long sessions compact multiple times) then hit is_already_complete and
 # short-circuited — data loss. Fix: PreCompact skips the idempotency gate
 # and write_manifest never latches final_complete for precompact.
-echo "TEST 3b: repeated PreCompact appends new checkpoint"
+test_begin "TEST 3b: repeated PreCompact appends new checkpoint"
 PC2_SID="test-sid-precompact-double"
 PC2_PAYLOAD=$(jq -cn --arg sid "$PC2_SID" --arg tp "$TRANSCRIPT" --arg cwd "$TEST_CWD" \
   '{session_id:$sid, transcript_path:$tp, hook_event_name:"PreCompact", cwd:$cwd, trigger:"auto", custom_instructions:""}')
@@ -413,7 +698,7 @@ info "mission pre-fire artifact isolated to scratch cwd; live repo tasks/ untouc
 #
 # Fix: per-mode state map (modes.<mode>.status). PreCompact's state lives
 # under modes.precompact and cannot mask modes.sessionend.
-echo "TEST 3d: cross-mode race — PreCompact 'started' must not block SessionEnd"
+test_begin "TEST 3d: cross-mode race — PreCompact 'started' must not block SessionEnd"
 RACE_SID="test-sid-crossmode-race"
 
 # Slow stub: sleep 3s so status=started sticks around long enough for us to
@@ -511,7 +796,7 @@ info "cross-mode race resolved: both precompact + sessionend completed independe
 # Repro: source lib.sh and spawn N concurrent write_manifest calls
 # alternating modes. Without the fix, at least one run in a small batch
 # loses a mode (empirically 30-50% failure rate at N=20).
-echo "TEST 3e: write_manifest RMW race under concurrent cross-mode writers"
+test_begin "TEST 3e: write_manifest RMW race under concurrent cross-mode writers"
 RMW_ROOT="$(mktemp -d -t reflect-rmw-XXXXXX)"
 RMW_SID="rmw-race-sid"
 mkdir -p "$RMW_ROOT/sessions/$RMW_SID"
@@ -564,7 +849,7 @@ info "write_manifest survived $RMW_RUNS x $RMW_WORKERS concurrent cross-mode wri
 # writes duplicates/*sessionend-conc*.json or *precompact-conc*.json. Under
 # the fix (per-mode locks), no cross-mode duplicate marker appears and BOTH
 # modes reach status=complete.
-echo "TEST 3f: dispatcher cross-mode lock — no skipped_concurrent for different modes"
+test_begin "TEST 3f: dispatcher cross-mode lock — no skipped_concurrent for different modes"
 
 # Slow-ish stub (0.5s) — enough to overlap two dispatchers' critical sections.
 cat >"$STUB_SCRATCH/claude" <<'STUB'
@@ -647,7 +932,7 @@ chmod +x "$STUB_SCRATCH/claude"
 # prefix. This test drops a giant checkpoint on disk and asserts the
 # assembled prompt (captured via a recording stub that echoes stdin size to
 # a sidecar) stays under cp_budget_bytes total.
-echo "TEST 3c: single oversized checkpoint truncated to per-file cap"
+test_begin "TEST 3c: single oversized checkpoint truncated to per-file cap"
 BIG_SID="test-sid-bigcp"
 mkdir -p "$REFLECT_ROOT/sessions/$BIG_SID/checkpoints"
 # 40 KB checkpoint (>> cp_per_file_cap of 8 KB). Valid JSON so the prompt
@@ -706,7 +991,7 @@ chmod +x "$STUB_SCRATCH/claude"
 # ============================================================================
 # TEST 4: subagentstop lands under parent/subagents/<sid>/
 # ============================================================================
-echo "TEST 4: subagentstop artifact placement"
+test_begin "TEST 4: subagentstop artifact placement"
 PARENT_SID="parent-sid-xyz"
 SUB_SID="sub-sid-123"
 
@@ -741,7 +1026,7 @@ unset CLAUDE_PARENT_SESSION_ID
 # ============================================================================
 # TEST 5: missing session_id -> error manifest, no crash
 # ============================================================================
-echo "TEST 5: malformed payload handling"
+test_begin "TEST 5: malformed payload handling"
 BAD_PAYLOAD='{"hook_event_name":"SessionEnd"}'
 echo "$BAD_PAYLOAD" | bash "$REFLECT_SH" sessionend
 rc=$?
@@ -751,7 +1036,7 @@ info "malformed payload handled (exit=0)"
 # ============================================================================
 # TEST 6: path traversal in session_id -> rejected, no dir escape
 # ============================================================================
-echo "TEST 6: path-traversal rejection"
+test_begin "TEST 6: path-traversal rejection"
 BAD_SIDS=('../evil' '/abs/evil' 'has space' 'a;b' $'nl\nsid' 'sub/dir' '.' '..' '...' '.hidden')
 for bad in "${BAD_SIDS[@]}"; do
   P="$(jq -cn --arg sid "$bad" --arg tp "$TRANSCRIPT" --arg cwd "$TEST_CWD" \
@@ -797,7 +1082,7 @@ info "path-traversal rejection OK (${MALF_COUNT} malformed records in $MALF_DIR,
 # ============================================================================
 # TEST 7: --worker requires _REFLECT_INTERNAL=1 sentinel
 # ============================================================================
-echo "TEST 7: worker sentinel gating"
+test_begin "TEST 7: worker sentinel gating"
 set +e
 bash "$REFLECT_SH" --worker sessionend </dev/null >/dev/null 2>&1
 rc=$?
@@ -808,7 +1093,7 @@ info "worker sentinel enforced (rc=$rc)"
 # ============================================================================
 # TEST 7b: dispatcher must NOT leak _REFLECT_INTERNAL into the parent env
 # ============================================================================
-echo "TEST 7b: _REFLECT_INTERNAL scoping"
+test_begin "TEST 7b: _REFLECT_INTERNAL scoping"
 LEAK_SID="test-sid-envleak"
 LP="$(fake_payload SessionEnd "$LEAK_SID")"
 unset _REFLECT_INTERNAL
@@ -820,7 +1105,7 @@ info "_REFLECT_INTERNAL stays scoped to detached child"
 # ============================================================================
 # TEST 8: REFLECT_FORCE accepts true / yes / on (not just 1)
 # ============================================================================
-echo "TEST 8: REFLECT_FORCE truthy normalization"
+test_begin "TEST 8: REFLECT_FORCE truthy normalization"
 FORCE_SID="test-sid-force"
 FP="$(fake_payload SessionEnd "$FORCE_SID")"
 echo "$FP" | bash "$REFLECT_SH" sessionend >/dev/null
@@ -843,7 +1128,7 @@ info "REFLECT_FORCE=true forces re-run"
 # ============================================================================
 # TEST 9: malformed reflection JSON -> error manifest, no raw body leak
 # ============================================================================
-echo "TEST 9: unparseable reflection JSON"
+test_begin "TEST 9: unparseable reflection JSON"
 # Swap the scratch stub for one that emits invalid JSON in the .result field.
 # The checked-in tests/stubs/claude is left untouched so the git tree stays clean.
 cat >"$STUB_SCRATCH/claude" <<'STUB'
@@ -898,7 +1183,7 @@ info "unparseable JSON handled (modes.sessionend.status=error, no full-body leak
 # Belt-and-braces: use a counting stub so we can prove `claude` was NOT
 # invoked at all. If the sentinel branch fell through, the stub would be
 # called and the counter file would be non-empty.
-echo "TEST 10: REFLECT_SUBPROCESS sentinel skip"
+test_begin "TEST 10: REFLECT_SUBPROCESS sentinel skip"
 COUNTER="$STUB_SCRATCH/claude-invocation-count"
 : > "$COUNTER"
 cat >"$STUB_SCRATCH/claude" <<STUB
@@ -953,7 +1238,7 @@ info "sentinel skip verified: 0 claude calls, marker recorded"
 # payload directly. Under the old code an evil value like '../../etc/passwd'
 # would escape the skipped-recursions/ directory. Fix: run both through
 # is_valid_sid before interpolation and substitute 'unknown_bad_sid' on fail.
-echo "TEST 10b: recursion marker filename sanitisation"
+test_begin "TEST 10b: recursion marker filename sanitisation"
 
 # Counting stub — must NOT be invoked (sentinel path).
 : > "$COUNTER"
@@ -996,7 +1281,7 @@ info "recursion marker sanitised bad SIDs to unknown_bad_sid"
 # value like '../evil' or one containing slash/control chars would escape
 # skipped-recursions/. Fix: validate ARG1 against precompact|sessionend|
 # subagentstop and substitute 'nomode_invalid' on mismatch.
-echo "TEST 10c: recursion marker ARG1 (mode) validation"
+test_begin "TEST 10c: recursion marker ARG1 (mode) validation"
 
 : > "$COUNTER"
 BAD_MODE_PAYLOAD='{"session_id":"legit-child","transcript_path":"/tmp/x","hook_event_name":"SessionEnd","cwd":"/tmp"}'
@@ -1045,7 +1330,7 @@ chmod +x "$STUB_SCRATCH/claude"
 # or number. That value then landed in final.json as `.patterns = "some string"`
 # — a schema violation that breaks every downstream consumer expecting an array.
 # Fix: coerce non-arrays to [] with `if type == "array" then . else [] end`.
-echo "TEST 11: reflection JSON type coercion for non-array values"
+test_begin "TEST 11: reflection JSON type coercion for non-array values"
 cat >"$STUB_SCRATCH/claude" <<'STUB'
 #!/usr/bin/env bash
 cat >/dev/null || true
@@ -1097,7 +1382,7 @@ chmod +x "$STUB_SCRATCH/claude"
 # tagged '[session-reflect] REFLECT_ROOT unwritable' stderr line.
 # Per-user path prevents symlink-race on shared /tmp when
 # protected_symlinks is off (advisor P2R1 LOW, ARFTL 2026-08-08).
-echo "TEST 12: unwritable REFLECT_ROOT surfaces error record + stderr"
+test_begin "TEST 12: unwritable REFLECT_ROOT surfaces error record + stderr"
 
 # Isolate the fallback log so we can inspect exactly what this test wrote.
 # (We can't touch the real fallback log because other runs may have
@@ -1169,7 +1454,7 @@ info "unwritable REFLECT_ROOT surfaced as JSON record + stderr line"
 # bug the second dispatcher spawns a second worker → 2 final.json mv's
 # race. Under the fix the second dispatcher's flock -n fails → writes
 # skipped_concurrent and exits, only ONE worker mv's to final.json.
-echo "TEST 13: stale-reaper race — worker holds lock through claude call"
+test_begin "TEST 13: stale-reaper race — worker holds lock through claude call"
 
 # Slow stub — 4s so the second dispatcher fires while the first worker is mid-call.
 cat >"$STUB_SCRATCH/claude" <<'STUB'
@@ -1257,7 +1542,7 @@ chmod +x "$STUB_SCRATCH/claude"
 # a duplicate spawn on every subsequent dispatcher fire.
 # Fix: distinguish parse failure from truly-old. Return 0 (treat as
 # in-flight) on unparseable, log to stderr, do NOT permit re-run.
-echo "TEST 14: unparseable started_at is not phantom-reaped"
+test_begin "TEST 14: unparseable started_at is not phantom-reaped"
 
 CORRUPT_SID="test-sid-corrupt-manifest"
 mkdir -p "$REFLECT_ROOT/sessions/$CORRUPT_SID"
@@ -1315,7 +1600,7 @@ info "corrupt started_at keeps in-flight state (no phantom reap), warns to stder
 # point systemd tears the unit's cgroup down. Pre-fix: no final.json, manifest
 # stuck at started, 0-byte log. Post-fix: the worker lives in its own transient
 # unit and completes.
-echo "TEST 15: D1 — detached worker survives parent cgroup teardown"
+test_begin "TEST 15: D1 — detached worker survives parent cgroup teardown"
 if command -v systemd-run >/dev/null 2>&1 \
    && systemctl --user is-active default.target >/dev/null 2>&1; then
   # Slow stub: the worker must still be mid-claude-call when the parent's
@@ -1377,7 +1662,7 @@ fi
 # bus (busless cron, container without a user manager) the dispatcher has to
 # fall back to the old setsid spawn rather than lose the reflection entirely,
 # and record which path it took.
-echo "TEST 15b: D1 — setsid fallback when systemd-run is disabled"
+test_begin "TEST 15b: D1 — setsid fallback when systemd-run is disabled"
 cat >"$STUB_SCRATCH/claude" <<'STUB'
 #!/usr/bin/env bash
 cat >/dev/null || true
@@ -1411,7 +1696,7 @@ info "setsid fallback completed the reflection and recorded spawn_method=setsid"
 # status gets written. The internal budget used to be 60s too, i.e. a coin flip:
 # observed both a clean internal `status:timeout` at 61s and external SIGKILLs
 # leaving `status:started` with 0-byte logs.
-echo "TEST 16: D3 — budget arithmetic keeps the synchronous path under the cap"
+test_begin "TEST 16: D3 — budget arithmetic keeps the synchronous path under the cap"
 BUDGETS_JSON="$(bash "$REFLECT_SH" --budgets)"
 jq -e '.hook_cap_seconds == 60' <<<"$BUDGETS_JSON" >/dev/null \
   || fail "D3: --budgets should report the hard 60s hook cap"
@@ -1431,7 +1716,7 @@ info "budgets: precompact=$(jq -r '.budgets.precompact' <<<"$BUDGETS_JSON")s wor
 # ...and empirically: when the model hangs, the INTERNAL timeout fires and a
 # TERMINAL status is written. Budgets are scaled down via env so the assertion
 # costs seconds instead of a minute; the shipped defaults are covered above.
-echo "TEST 16b: D3 — hung model yields a terminal status inside the budget"
+test_begin "TEST 16b: D3 — hung model yields a terminal status inside the budget"
 cat >"$STUB_SCRATCH/claude" <<'STUB'
 #!/usr/bin/env bash
 cat >/dev/null || true
@@ -1467,7 +1752,7 @@ info "hung model: internal timeout won in ${hang_ms}ms, terminal status written"
 # every 2nd-and-later compaction of a session. Fix: the pre-fire detaches
 # (REFLECT_ASYNC=1), so the hook pays only for the hand-off while the mission
 # artifact is still produced.
-echo "TEST 17: D2 — mission pre-fire is detached, in-hook time stays bounded"
+test_begin "TEST 17: D2 — mission pre-fire is detached, in-hook time stays bounded"
 # 6s stub: long enough that a SYNCHRONOUS mission call dominates the measurement.
 cat >"$STUB_SCRATCH/claude" <<'STUB'
 #!/usr/bin/env bash
@@ -1545,7 +1830,7 @@ chmod +x "$STUB_SCRATCH/claude"
 # something, not merely exist — so this test triggers it the way production does:
 # by firing an ordinary SessionEnd for an unrelated session and letting its
 # detached worker run the sweep.
-echo "TEST 18: D4 — reaper demotes orphaned started manifests to a terminal status"
+test_begin "TEST 18: D4 — reaper demotes orphaned started manifests to a terminal status"
 
 ORPH_SID="test-sid-orphan-started"
 mkdir -p "$REFLECT_ROOT/sessions/$ORPH_SID"
@@ -1682,7 +1967,7 @@ STUB
 # ============================================================================
 # TEST 19: foreign mission.md is left byte-identical; payload still written
 # ============================================================================
-echo "TEST 19: mission — foreign tasks/mission.md untouched, refusal recorded"
+test_begin "TEST 19: mission — foreign tasks/mission.md untouched, refusal recorded"
 B3_CWD="$(mktemp -d -t reflect-b3cwd-XXXXXX)"
 assert_isolated_cwd "$B3_CWD"
 mkdir -p "$B3_CWD/tasks"
@@ -1756,7 +2041,7 @@ info "foreign mission.md byte-identical; authoritative handoff out of repo; huma
 # ============================================================================
 # TEST 19b: pointer we own is repointed, and the old payload survives
 # ============================================================================
-echo "TEST 19b: mission — own pointer repointed, previous payload kept"
+test_begin "TEST 19b: mission — own pointer repointed, previous payload kept"
 B3B_CWD="$(mktemp -d -t reflect-b3bcwd-XXXXXX)"
 assert_isolated_cwd "$B3B_CWD"
 
@@ -1818,7 +2103,7 @@ info "pointer repointed across sessions; both handoffs kept; newest resolves"
 # human-owned path by reading repo content, which is precisely the trusting this
 # design removed. Now: a regular file at the pointer is never touched, whatever it
 # says, and the copy is still written beside it.
-echo "TEST 19c: mission — a stamped regular mission.md is left byte-identical, not moved"
+test_begin "TEST 19c: mission — a stamped regular mission.md is left byte-identical, not moved"
 B3C_CWD="$(mktemp -d -t reflect-b3ccwd-XXXXXX)"
 assert_isolated_cwd "$B3C_CWD"
 mkdir -p "$B3C_CWD/tasks"
@@ -1857,7 +2142,7 @@ info "stamped regular mission.md untouched and unmoved; copy + handoff still wri
 # valid sid, session dir — everything the old four-condition authenticator wanted)
 # resolve to nothing; only an out-of-repo handoff whose sidecar names THIS project
 # resolves; a handoff for a different project does not leak across.
-echo "TEST 19d: D1 — resolution is out-of-repo only; repo copies are non-events"
+test_begin "TEST 19d: D1 — resolution is out-of-repo only; repo copies are non-events"
 B3D_CWD="$(mktemp -d -t reflect-b3dcwd-XXXXXX)"
 B3D_OTHER="$(mktemp -d -t reflect-b3dother-XXXXXX)"
 assert_isolated_cwd "$B3D_CWD"
@@ -1898,7 +2183,7 @@ info "repo copies resolve to nothing; cross-project handoffs do not leak; newest
 # It used to be a resolution input (pointer -> fallback -> newest payload). Now it
 # cannot affect resolution at all — it is a broken symlink in a human's tree, and a
 # mission run repairs it as a courtesy.
-echo "TEST 19e: mission — dangling pointer cannot affect resolution, and is repaired"
+test_begin "TEST 19e: mission — dangling pointer cannot affect resolution, and is repaired"
 B3E_CWD="$(mktemp -d -t reflect-b3ecwd-XXXXXX)"
 assert_isolated_cwd "$B3E_CWD"
 mkdir -p "$REFLECT_ROOT/sessions/survivor-sid"
@@ -1934,7 +2219,7 @@ info "dangling pointer: no effect on resolution, repaired for the human anyway"
 # TEST 19f: GC collects orphaned copies, never the pointed-to one
 # ============================================================================
 # ~590 sessions/week would otherwise leave ~590 mission files per cwd.
-echo "TEST 19f: mission — GC removes orphaned copies, keeps the pointer target"
+test_begin "TEST 19f: mission — GC removes orphaned copies, keeps the pointer target"
 B3F_CWD="$(mktemp -d -t reflect-b3fcwd-XXXXXX)"
 assert_isolated_cwd "$B3F_CWD"
 # Orphan: stamped copy whose reflections/sessions/<sid>/ does not exist.
@@ -2015,7 +2300,7 @@ info "mission run invokes GC end to end"
 # unexpressible: every fixture below must refuse, INCLUDING the one that satisfied
 # all four of round 2's conditions. That last case is the structural proof — if it
 # still resolves, repo content is still being trusted.
-echo "TEST 19g: D1 — no repo file of any shape resolves; the D2 bypass included"
+test_begin "TEST 19g: D1 — no repo file of any shape resolves; the D2 bypass included"
 B3H_CWD="$(mktemp -d -t reflect-b3hcwd-XXXXXX)"
 assert_isolated_cwd "$B3H_CWD"
 mkdir -p "$B3H_CWD/tasks"
@@ -2242,7 +2527,7 @@ sc_wait_mission() {
 # ============================================================================
 # TEST 20: B1 — occupancy math lives in ONE place and keeps the 70% nudge
 # ============================================================================
-echo "TEST 20: B1 — shared context-occupancy module, 70% nudge preserved"
+test_begin "TEST 20: B1 — shared context-occupancy module, 70% nudge preserved"
 [[ -f "$SC_USAGE" ]] || fail "20: shared occupancy module missing at $SC_USAGE"
 B1_DIR="$(mktemp -d -t reflect-b1-XXXXXX)"
 
@@ -2315,7 +2600,7 @@ info "one occupancy implementation; 1M/[1m]/observed/estimate all correct; 70% n
 # So the assertion inverts: the trigger must fire with the config ABSENT,
 # MALFORMED, or present-and-saying-nothing-about-it, and no key must be able to
 # stop it. If someone re-adds a switch, every case below goes red.
-echo "TEST 21: no switch — the trigger does not consult any config to decide whether to run"
+test_begin "TEST 21: no switch — the trigger does not consult any config to decide whether to run"
 [[ -f "$SC_TRIGGER" ]] || fail "21: trigger missing at $SC_TRIGGER"
 
 # Structural: the key is gone from the shipped config, and neither end reads it.
@@ -2388,7 +2673,7 @@ info "no config shape (absent/malformed/nokey/normal/explicit-false) can disable
 # ============================================================================
 # TEST 22: B1+B2 — fires at the threshold and leaves a resumable handoff
 # ============================================================================
-echo "TEST 22: B1+B2 — fires at 30%, handoff has done/next/blocked/open questions"
+test_begin "TEST 22: B1+B2 — fires at 30%, handoff has done/next/blocked/open questions"
 B2_H="$(sc_home)"
 B2_CWD="$(mktemp -d -t reflect-b2cwd-XXXXXX)"
 assert_isolated_cwd "$B2_CWD"
@@ -2399,7 +2684,11 @@ B2_UNDER_SID="test-sid-b2-under"
 mk_context_transcript "$B2_H/under.jsonl" "claude-opus-5" 290000 "$B2_CWD"
 sc_fire "$B2_H" "$B2_UNDER_SID" "$B2_CWD" "$B2_H/under.jsonl" >/dev/null \
   || fail "22: under-threshold fire rc!=0"
-sleep 0.5
+# Was `sleep 0.5`. The marker is written by the hook process itself, which has already
+# returned, so the wait was superstition — but anything the fire detached still has to
+# be terminal before "no marker exists" is a fact rather than a bet.
+spawn_wait_quiescent 60 \
+  || fail "22: work spawned by the under-threshold fire never finished: $SPAWN_HOLDERS"
 [[ ! -e "$SC_STATE_DIR/$B2_UNDER_SID.request.json" ]] \
   || fail "22: fired at 29% with a 30% threshold"
 
@@ -2457,7 +2746,7 @@ info "reflection subprocess and sdk-cli entrypoints refuse to fire"
 # ============================================================================
 # TEST 23: B6 — cannot fire in a loop
 # ============================================================================
-echo "TEST 23: B6 — once per session per crossing, capped, persisted"
+test_begin "TEST 23: B6 — once per session per crossing, capped, persisted"
 B6_H="$(sc_home)"
 B6_CWD="$(mktemp -d -t reflect-b6cwd-XXXXXX)"
 assert_isolated_cwd "$B6_CWD"
@@ -2542,7 +2831,7 @@ info "1 call per crossing, re-arm below threshold, cap at $B6_CAP (the constant)
 # SCRIPT decides whether to act, so widening "idle 45 min" to "idle OR context >=
 # threshold" is a pure ~/.claude edit. This test drives the real script.
 # B4: the spawned process must begin executing ## Next, not ask what to do.
-echo "TEST 24: B7+B4 — context-triggered resume through idle-handoff, non-interactive"
+test_begin "TEST 24: B7+B4 — context-triggered resume through idle-handoff, non-interactive"
 B7_H="$(sc_home)"
 B7_ARGV="$B7_H/autofork-argv.txt"
 
@@ -2607,7 +2896,7 @@ HOME="$B7_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.s
 rc=$?
 (( rc == 0 )) || fail "24: idle-handoff.sh rc=$rc"
 
-for _ in $(seq 1 60); do [[ -s "$B7_ARGV" ]] && break; sleep 0.25; done
+sc_settle_fork "$B7_ARGV" fork
 [[ -s "$B7_ARGV" ]] \
   || fail "24: no fork spawned — the context trigger did not widen the idle gate (log: $(tail -5 "$REFLECT_ROOT/idle-handoff-logs/handoff.log" 2>/dev/null))"
 grep -qF -- '--permission-mode' "$B7_ARGV" || fail "24: fork not launched with a permission mode"
@@ -2777,7 +3066,7 @@ chmod +x "$STUB_SCRATCH/claude"
 #
 # Rule: resolve ONCE through reflect.sh, and if no handoff of ours resolves, do not
 # fork. Expensive-and-wrong fails off.
-echo "TEST 25: fork resumes from the out-of-repo handoff, or refuses"
+test_begin "TEST 25: fork resumes from the out-of-repo handoff, or refuses"
 
 combo_stub() {
   # $1=argv log, $2=mission-body file. Serves BOTH calls: it answers the mission
@@ -2878,7 +3167,7 @@ combo_stub "$B8_ARGV" "$SC_MISSION_FILE"
 HOME="$B8_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
   || fail "25a: idle-handoff.sh rc!=0"
 B8_LOG="$REFLECT_ROOT/idle-handoff-logs/handoff.log"
-for _ in $(seq 1 60); do sc_forked "$B8_ARGV" && break; sleep 0.25; done
+sc_settle_fork "$B8_ARGV" fork
 sc_forked "$B8_ARGV" \
   || fail "25a: no fork — a foreign tasks/mission.md must be a NON-EVENT and the out-of-repo handoff is authoritative (log: $(grep "$B8_SID" "$B8_LOG" | tail -3))"
 grep -qF "$B8_HANDOFF" "$B8_ARGV" \
@@ -2994,7 +3283,7 @@ combo_stub "$BB_ARGV" "$SC_MISSION_FILE"
 : > "$BB_ARGV"
 HOME="$BB_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
   || fail "25c: idle-handoff.sh rc!=0"
-for _ in $(seq 1 60); do sc_forked "$BB_ARGV" && break; sleep 0.25; done
+sc_settle_fork "$BB_ARGV" fork
 sc_forked "$BB_ARGV" \
   || fail "25c/D3: $BB_COPIES accumulated human copies made the feature inert (log: $(grep "$BB_SID" "$REFLECT_ROOT/idle-handoff-logs/handoff.log" | tail -3))"
 grep -qF "$BB_HANDOFF" "$BB_ARGV" || fail "25c: fork not handed the out-of-repo handoff"
@@ -3028,7 +3317,7 @@ info "tasks/handoff.md is NOT excluded: a real tree change still denies the fork
 # and let the timer resume "the mission". Every previous defence was a check on the
 # planted file itself and each was bypassed; now the file is simply never opened,
 # because the read source is outside the tree.
-echo "TEST 26: D1 — a planted repo file: no fork, and it never reaches a model"
+test_begin "TEST 26: D1 — a planted repo file: no fork, and it never reaches a model"
 
 # ------------------- 26a: COMMITTED planted file, tree perfectly clean
 # Committed on purpose: porcelain has nothing to say, so resolution is the only
@@ -3126,7 +3415,7 @@ combo_stub "$F1B_ARGV" "$SC_MISSION_FILE"
 
 HOME="$F1B_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
   || fail "26b: idle-handoff.sh rc!=0"
-for _ in $(seq 1 60); do sc_forked "$F1B_ARGV" && break; sleep 0.25; done
+sc_settle_fork "$F1B_ARGV" fork
 sc_forked "$F1B_ARGV" \
   || fail "26b: a planted copy suppressed a legitimate fork — denial-of-service by dropping a file in tasks/ (log: $(grep "$F1B_SID" "$REFLECT_ROOT/idle-handoff-logs/handoff.log" | tail -3))"
 grep -qF "$F1B_HANDOFF" "$F1B_ARGV" || fail "26b: fork not handed the out-of-repo handoff"
@@ -3157,7 +3446,7 @@ chmod +x "$STUB_SCRATCH/claude"
 # failure this module was refactored to prevent, so the table now also names the
 # known-200k families: "known 200k" and "never heard of this model" must not be
 # the same answer.
-echo "TEST 27: F2 — 1M families incl. fable-5; unknown window refuses instead of assuming 200k"
+test_begin "TEST 27: F2 — 1M families incl. fable-5; unknown window refuses instead of assuming 200k"
 F2_DIR="$(mktemp -d -t reflect-f2-XXXXXX)"
 
 # Structural: the regression was a missing prefix, so pin the prefix itself.
@@ -3218,7 +3507,7 @@ info "fable-5 detected as 1M; known-200k stays known; unknown window refuses lou
 # unopenable lockfile fell straight through and the worker ran with NO per-mode
 # lock — re-enabling the last-write-wins `mv` race on final.json that the lock
 # exists to prevent. Running unlocked is worse than not running.
-echo "TEST 28: F3 — an unopenable lockfile refuses to run rather than running unlocked"
+test_begin "TEST 28: F3 — an unopenable lockfile refuses to run rather than running unlocked"
 canonical_stub   # this path parses the reply as reflection JSON
 f3_worker() {
   # $1=sid $2=lockfile ; runs the worker re-entry path directly
@@ -3289,7 +3578,7 @@ info "lockfile unopenable/empty/unset: worker exits 0, writes nothing, records w
 # empty. So `REFLECT_SUBPROCESS=0` told the dispatcher "not a subprocess" and the
 # trigger "subprocess — do nothing": one env lever, opposite meanings, and the
 # quieter half silently disabled the feature.
-echo "TEST 29: F4 — one truthy semantic for REFLECT_SUBPROCESS across bash and python"
+test_begin "TEST 29: F4 — one truthy semantic for REFLECT_SUBPROCESS across bash and python"
 F4_H="$(sc_home)"
 F4_CWD="$(mktemp -d -t reflect-f4cwd-XXXXXX)"
 assert_isolated_cwd "$F4_CWD"
@@ -3351,7 +3640,7 @@ info "1 = subprocess on both sides; 0 / empty / unset = not a subprocess on both
 # 50 + 10 grace + 5 reserve = 65 > 60, so the external SIGKILL wins again and the
 # manifest is orphaned at `started` — the exact pathology the budget arithmetic
 # exists to prevent, reachable by one env var.
-echo "TEST 30: F6 — an over-cap budget override is clamped and says so"
+test_begin "TEST 30: F6 — an over-cap budget override is clamped and says so"
 F6_DEFAULT="$(bash "$REFLECT_SH" --budgets 2>/dev/null)"
 jq -e '.budgets.precompact == 40 and .max_synchronous_budget_seconds
        == (.hook_cap_seconds - .kill_grace_seconds - .reserve_seconds)' <<<"$F6_DEFAULT" >/dev/null \
@@ -3391,7 +3680,7 @@ info "over-cap override clamped to $(jq -r .max_synchronous_budget_seconds <<<"$
 # with the config key: it is now a constant in both files, and this test pins that
 # they are the SAME constant, and that the number they agree on is the one that
 # actually decides a fire.
-echo "TEST 31: one hardcoded threshold; producer and consumer cannot drift apart"
+test_begin "TEST 31: one hardcoded threshold; producer and consumer cannot drift apart"
 F7_PROD_THR="$(grep -oP '^THRESHOLD = \K[0-9.]+' "$SC_TRIGGER")"
 F7_CONS_THR="$(grep -oP '^SELF_COMPACT_THRESHOLD="\K[0-9.]+' "$WORKTREE/scripts/idle-handoff.sh")"
 [[ -n "$F7_PROD_THR" ]] || fail "31: no hardcoded THRESHOLD in $SC_TRIGGER"
@@ -3450,7 +3739,7 @@ info "one threshold ($F7_PROD_THR) in code at both ends; ${F7_UNDER} does not fi
 # from the unit's environment it makes the worker detach, so
 # mission_manifest_status reads `started`, record_failure fires, and three of
 # those disable handoffs for the sid for the whole backoff window.
-echo "TEST 32: F5 — the synchronous mission call scrubs REFLECT_ASYNC and REFLECT_FORCE"
+test_begin "TEST 32: F5 — the synchronous mission call scrubs REFLECT_ASYNC and REFLECT_FORCE"
 F5_H="$(sc_home)"
 F5_ARGV="$F5_H/argv.txt"
 F5_CWD="$(mktemp -d -t reflect-f5cwd-XXXXXX)"
@@ -3471,7 +3760,7 @@ combo_stub "$F5_ARGV" "$SC_MISSION_FILE"
 
 REFLECT_ASYNC=1 REFLECT_FORCE=1 HOME="$F5_H" REFLECT_ROOT="$REFLECT_ROOT" \
   bash "$WORKTREE/scripts/idle-handoff.sh" || fail "32: idle-handoff.sh rc!=0"
-for _ in $(seq 1 60); do sc_forked "$F5_ARGV" && break; sleep 0.25; done
+sc_settle_fork "$F5_ARGV" fork
 sc_forked "$F5_ARGV" \
   || fail "32: an inherited REFLECT_ASYNC=1 broke the handoff (log: $(grep "$F5_SID" "$REFLECT_ROOT/idle-handoff-logs/handoff.log" | tail -3))"
 [[ ! -e "$REFLECT_ROOT/idle-handoff-state/$F5_SID.failures" ]] \
@@ -3483,7 +3772,8 @@ info "REFLECT_ASYNC/REFLECT_FORCE inherited from the environment: scrubbed, writ
 # ============================================================================
 # TEST 33: F8 — the three quiet ones
 # ============================================================================
-echo "TEST 33: F8 — consume failure is loud, fresh= is real, malformed usage cannot kill the nudge"
+if lane_full; then   # --- slow lane only ---
+test_begin "TEST 33: F8 — consume failure is loud, fresh= is real, malformed usage cannot kill the nudge"
 
 # (a) consume_context_request swallowed `mv` failure with `|| true`. A marker
 #     that persists is re-verified and re-forked on every later 5-min tick until
@@ -3574,6 +3864,9 @@ assert context_usage.usage_total({"input_tokens": 5, "cache_read_input_tokens": 
 PY
 info "failed consume logged loudly; fresh= counts real skips; a malformed usage line no longer breaks the nudge hook"
 
+else
+lane_skip "TEST 33: F8 (LOW) — consume failure loud, fresh= real, malformed usage cannot kill the nudge"
+fi
 # ============================================================================
 # TEST 34: D5 — a RELATIVE REFLECT_ROOT is refused at both source points
 # ============================================================================
@@ -3582,7 +3875,7 @@ info "failed consume logged loudly; fresh= counts real skips; a malformed usage 
 # process cwd — so running from inside a hostile clone would let repo content
 # fabricate the state that is supposed to live outside every repo. Both entry
 # points must refuse before deriving anything, and say so.
-echo "TEST 34: D5 — a relative REFLECT_ROOT is refused, loudly, at both seams"
+test_begin "TEST 34: D5 — a relative REFLECT_ROOT is refused, loudly, at both seams"
 D5_DIR="$(mktemp -d -t reflect-d5-XXXXXX)"
 assert_isolated_cwd "$D5_DIR"
 mkdir -p "$D5_DIR/reflections/sessions/d5-sid/handoff" "$D5_DIR/tasks"
@@ -3622,7 +3915,8 @@ info "relative REFLECT_ROOT refused at reflect.sh and idle-handoff.sh; absolute 
 # ============================================================================
 # TEST 35: D6 — a broken resolver, one config path, and honest polarity docs
 # ============================================================================
-echo "TEST 35: D6 — resolver ERROR != refusal; one config switch; polarity docs agree"
+if lane_full; then   # --- slow lane only ---
+test_begin "TEST 35: D6 — resolver ERROR != refusal; one config switch; polarity docs agree"
 
 # (a) An authenticator that CRASHED was collapsed into mission_path="" and logged
 #     as `mission_not_ours` — the same line a clean refusal produces. So a
@@ -3697,7 +3991,7 @@ sc_plant_request "$D6_SID" "$D6_CWD" "$D6_TP"
 : > "$D6_ARGV"
 HOME="$D6_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
   || fail "35a: idle-handoff.sh rc!=0 (control)"
-for _ in $(seq 1 60); do sc_forked "$D6_ARGV" && break; sleep 0.25; done
+sc_settle_fork "$D6_ARGV" fork
 sc_forked "$D6_ARGV" \
   || fail "35a: control did not fork, so the ERROR case proves nothing (log: $(grep "$D6_SID" "$REFLECT_ROOT/idle-handoff-logs/handoff.log" | tail -3))"
 info "35a: a crashing resolver logs mission_resolve_error + rc, never mission_not_ours; still fails closed"
@@ -3720,6 +4014,9 @@ grep -qi 'fails OFF' "$D6_PROMPT" \
   || fail "35c: prompt.md does not state the fails-off polarity"
 info "35c: the documented jq pattern is the correct one, and prompt.md agrees with the config's polarity"
 
+else
+lane_skip "TEST 35: D6 (LOW batch) — resolver ERROR != refusal; polarity docs agree"
+fi
 # ============================================================================
 # TEST 36: R1 — the fork's write grant holds nothing that any decision reads
 # ============================================================================
@@ -3741,7 +4038,7 @@ info "35c: the documented jq pattern is the correct one, and prompt.md agrees wi
 # to the project -> handoff decision stays OUTSIDE it. This test asserts on the
 # RESOLVED GRANT PATH — not on what a model chooses to do with it — because the
 # claim being pinned is about reachability, not behaviour.
-echo "TEST 36: R1 — the fork's write grant is a leaf holding only the handoff"
+test_begin "TEST 36: R1 — the fork's write grant is a leaf holding only the handoff"
 R1_CWD="$(mktemp -d -t reflect-r1cwd-XXXXXX)"
 R1_OTHER="$(mktemp -d -t reflect-r1other-XXXXXX)"
 assert_isolated_cwd "$R1_CWD"
@@ -3877,7 +4174,8 @@ info "36: grant is <session>/handoff/ holding only mission.md; sidecar, manifest
 # Narrowed to an allowlist of what this code can SEE it wrote: copies whose name is
 # mission.<valid-sid>.md AND whose line 1 carries our stamp, plus the pointer only
 # when it is a symlink of ours.
-echo "TEST 37: R2 — only our own writes are excluded from the freshness gate"
+if lane_full; then   # --- slow lane only ---
+test_begin "TEST 37: R2 — only our own writes are excluded from the freshness gate"
 R2_H="$(sc_home)"
 R2_ARGV="$R2_H/argv.txt"
 R2_CWD="$(mktemp -d -t reflect-r2cwd-XXXXXX)"
@@ -3902,8 +4200,7 @@ r2_run() {
   sc_plant_request "$R2_SID" "$R2_CWD" "$R2_TP"
   HOME="$R2_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
     || fail "37: idle-handoff.sh rc!=0"
-  local i
-  for (( i = 0; i < 40; i++ )); do sc_forked "$R2_ARGV" && break; sleep 0.25; done
+  sc_settle_fork "$R2_ARGV"
   tail -n +$((lines + 1)) "$R2_LOG" | grep -F "$R2_SID" || true
 }
 
@@ -4024,6 +4321,9 @@ R2_LIST3="$(bash "$REFLECT_SH" --mission-copies "$R2_BARE")" \
 [[ -z "$R2_LIST3" ]] || fail "37d: a bare project reported writes of ours ('$R2_LIST3')"
 info "37d: the allowlist names our copies of every age and our pointer, and nothing else"
 
+else
+lane_skip "TEST 37: R2 (MEDIUM) — only our own writes are excluded from the freshness gate"
+fi
 # ============================================================================
 # TEST 38: R3 — the diagnostic directories are bounded
 # ============================================================================
@@ -4039,7 +4339,7 @@ info "37d: the allowlist names our copies of every age and our pointer, and noth
 #
 # These are DIAGNOSTICS. Reflections themselves (sessions/) are the product and are
 # never collected here. The bound is a hardcoded named constant, not a knob.
-echo "TEST 38: R3 — skipped-recursions/, malformed/ and logs/ are age-bounded"
+test_begin "TEST 38: R3 — skipped-recursions/, malformed/ and logs/ are age-bounded"
 canonical_stub
 R3_LOG_DIR="$REFLECT_ROOT/logs"
 R3_DIRS=( "$REFLECT_ROOT/skipped-recursions" "$REFLECT_ROOT/malformed" "$R3_LOG_DIR" )
@@ -4130,7 +4430,7 @@ info "38c: retention is a hardcoded named constant, documented, with no env over
 # ============================================================================
 # TEST 39: R4 — sid validation really is at parity, and the docs do not lie
 # ============================================================================
-echo "TEST 39: R4 — sid parity across bash and python; header, --help and docs current"
+test_begin "TEST 39: R4 — sid parity across bash and python; header, --help and docs current"
 
 # (a) self-compact-trigger.py's SID_RE claimed "same charset reflect.sh validates",
 #     but reflect.sh's is_valid_sid ALSO rejects a leading dot — for `.`, `..` and
@@ -4223,7 +4523,7 @@ info "39c: all four dispatchable modes appear in the header and in --help"
 # rewrite the instructions future sessions load. Skipping costs one deferred resume.
 # So both gates fail CLOSED, and the reason lands in the counters, because a
 # permanently unrestrictable host must be visible rather than quiet.
-echo "TEST 40: S1 — an unrestrictable fork is skipped, never spawned unrestricted"
+test_begin "TEST 40: S1 — an unrestrictable fork is skipped, never spawned unrestricted"
 S1_H="$(sc_home)"
 S1_ARGV="$S1_H/argv.txt"
 S1_CWD="$(mktemp -d -t reflect-s1cwd-XXXXXX)"
@@ -4249,8 +4549,7 @@ s1_run() {
   sc_plant_request "$S1_SID" "$S1_CWD" "$S1_TP"
   HOME="$S1_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
     || fail "40: idle-handoff.sh rc!=0"
-  local i
-  for (( i = 0; i < 40; i++ )); do sc_forked "$S1_ARGV" && break; sleep 0.25; done
+  sc_settle_fork "$S1_ARGV"
   tail -n +$((lines + 1)) "$S1_LOG"
 }
 
@@ -4320,7 +4619,7 @@ info "40d: fork settings files are age-bounded by a hardcoded constant"
 # line. Any untracked mission-shaped file this code did not write makes a project read
 # as permanently world-moved (the accepted R2 consequence), and from the log "nothing
 # to do here" and "wedged forever, needs one rm" looked identical.
-echo "TEST 41: S3 — the staleness denial names the offending path"
+test_begin "TEST 41: S3 — the staleness denial names the offending path"
 S3_H="$(sc_home)"
 S3_ARGV="$S3_H/argv.txt"
 S3_CWD="$(mktemp -d -t reflect-s3cwd-XXXXXX)"
@@ -4416,7 +4715,7 @@ info "41c: an uncheckable (non-git) cwd says it is uncheckable, not just 'stale'
 # who believes the stamp is the staleness signal will "simplify" the git gate away, and
 # a reader who believes one hardcoded pathspec is the exclusion design will not look
 # for the per-cwd allowlist.
-echo "TEST 42: S4 — no doc claims a consumer that does not exist"
+test_begin "TEST 42: S4 — no doc claims a consumer that does not exist"
 S4_IH="$WORKTREE/scripts/idle-handoff.sh"
 S4_LIB="$SKILL_DIR/lib.sh"
 S4_PROMPT="$SKILL_DIR/prompts/mission.md"
@@ -4472,7 +4771,7 @@ info "42: stamp-as-staleness corrected in all three doc sites, sid= shown, stale
 # ledger and every stored handoff as editable material: an injected `## Next` could
 # rewrite the permission object the NEXT fork is spawned with, or the hooks the
 # interactive session loads. The round-4 containment is voided from the inside.
-echo "TEST 43: T1 — a candidate workspace overlapping the control plane refuses to fork"
+test_begin "TEST 43: T1 — a candidate workspace overlapping the control plane refuses to fork"
 T1_LOG="$REFLECT_ROOT/idle-handoff-logs/handoff.log"
 T1_LEDGER="$REFLECT_ROOT/idle-handoff-state/fork-ledger.log"
 # The log exists by now in a full run (TEST 24 created it), but every helper below reads
@@ -4483,24 +4782,6 @@ T1_ARGV=""
 T1_ERR=""
 T1_CWD_USED=""
 T1_TAIL=""
-
-# A spawned fork is a transient systemd unit: it takes a second or two to reach the argv
-# log. So "it forked" polls, and "it did not fork" still waits — a negative asserted with
-# no grace period is a race that passes for the wrong reason. One helper, so the two
-# cases cannot quietly be given different amounts of patience.
-sc_settle_fork() {
-  # $1=argv log  $2=expect: fork|no-fork
-  local argv="$1" expect="$2" i
-  if [[ "$expect" == "fork" ]]; then
-    for (( i = 0; i < 60; i++ )); do          # up to 15s
-      sc_forked "$argv" && return 0
-      sleep 0.25
-    done
-    return 0                                   # caller asserts and prints the log
-  fi
-  sleep 3                                      # generous next to the ~1s a real spawn takes
-  return 0
-}
 
 t1_case() {
   # $1=sid  $2=cwd spec (@home_claude | @home | @symlink_home_claude | absolute path)
@@ -4640,7 +4921,8 @@ info "43: the control-plane list still covers REFLECT_ROOT, both state dirs, for
 # meant "nothing is newer", and the gate OPENED: fail-open in the one gate whose job is
 # to deny when it cannot check. Narrow only because porcelain shares git's index;
 # stat/xargs failures (dead mount, raced unlink, EACCES) are independent of git.
-echo "TEST 44: T2 — the mtime scan fails CLOSED when stat fails"
+if lane_full; then   # --- slow lane only ---
+test_begin "TEST 44: T2 — the mtime scan fails CLOSED when stat fails"
 T2_H="$(sc_home)"
 T2_ARGV="$T2_H/argv.txt"
 T2_CWD="$(mktemp -d -t reflect-t2cwd-XXXXXX)"
@@ -4709,6 +4991,9 @@ if grep -qE 'head( |$)' <<<"$T2_SCAN"; then
 fi
 info "44b: a stat failure is denied as uncheckable, named, and the pipeline keeps every producer's status"
 
+else
+lane_skip "TEST 44: T2 (MEDIUM) — the mtime scan fails CLOSED when stat fails"
+fi
 # ============================================================================
 # TEST 45: T3 — the load-bearing rail is OBSERVED, not assumed
 # ============================================================================
@@ -4722,7 +5007,8 @@ info "44b: a stat failure is denied as uncheckable, named, and the pipeline keep
 # NOTE ON EVIDENCE. The stub below emulates the contract so the fail-closed paths are
 # observable; it is NOT evidence about the installed CLI. That evidence is in
 # tests/live.sh (opt-in, real calls) and was taken by hand on 2.1.222.
-echo "TEST 45: T3 — permissions.deny is probed against the real CLI, and refused when unproven"
+if lane_full; then   # --- slow lane only ---
+test_begin "TEST 45: T3 — permissions.deny is probed against the real CLI, and refused when unproven"
 T3_PROBE_DIR="$REFLECT_ROOT/idle-handoff-state/fork-deny-probe"
 T3_H="$(sc_home)"
 T3_ARGV="$T3_H/argv.txt"
@@ -4919,6 +5205,9 @@ grep -qE 'DENY_PROBE|permissions\.deny' "$WORKTREE/tests/live.sh" \
   || fail "45: tests/live.sh carries no real-CLI deny probe, so the only evidence about the installed binary is a stub"
 info "45: the probe uses the shipped generator and flags, denies a superset, and a live probe exists"
 
+else
+lane_skip "TEST 45: T3 (MEDIUM) — permissions.deny probed against the real CLI"
+fi
 # ============================================================================
 # TEST 46: T4 — a flag with the same PREFIX is not the flag
 # ============================================================================
@@ -4927,7 +5216,8 @@ info "45: the probe uses the shipped generator and flags, denies a superset, and
 # an argv the binary cannot parse; the death was ASYNCHRONOUS, inside a transient unit,
 # AFTER record_fork charged the per-cwd budget and consume_context_request destroyed the
 # marker. Budget spent, marker gone, resume lost, trace in a log nobody reads.
-echo "TEST 46: T4 — a prefix-matching flag does not satisfy the restriction gate"
+if lane_full; then   # --- slow lane only ---
+test_begin "TEST 46: T4 — a prefix-matching flag does not satisfy the restriction gate"
 T4_H="$(sc_home)"
 T4_ARGV="$T4_H/argv.txt"
 T4_CWD="$(mktemp -d -t reflect-t4cwd-XXXXXX)"
@@ -5002,10 +5292,14 @@ if grep -qF '*"$flag"*' <<<"$T4_FN"; then
 fi
 info "46c: --add-dirs is not --add-dir either, and the anchored match is still anchored"
 
+else
+lane_skip "TEST 46: T4 (MEDIUM) — a prefix-matching flag does not satisfy the restriction gate"
+fi
 # ============================================================================
 # TEST 47: T5 — the quiet three
 # ============================================================================
-echo "TEST 47: T5 — ledger escapes, a truncated cwd, and a marker write nobody checked"
+if lane_full; then   # --- slow lane only ---
+test_begin "TEST 47: T5 — ledger escapes, a truncated cwd, and a marker write nobody checked"
 # Its own handle on the shared handoff log, so this block does not depend on an
 # earlier TEST having defined one.
 T5_LOG="$REFLECT_ROOT/idle-handoff-logs/handoff.log"
@@ -5122,14 +5416,135 @@ info "47c: a failed marker write is logged, counted, and named in the FIRE line"
 
 canonical_stub
 
+else
+lane_skip "TEST 47: T5 (LOW batch) — ledger escapes, a truncated cwd, an unchecked marker write"
+fi
+
+# ============================================================================
+# TEST 48: the harness waits for what it spawned before it removes the temp root
+# ============================================================================
+# THE VERIFIER'S OWN REGRESSION TEST. On 2026-08-16 a full run reported
+# `SUITE_FAILED` with 63 TESTs run and ZERO test-level failures: a detached worker
+# from TEST 47c wrote `test-sid-t5-marker-ok-mission-<epoch_ns>.stdout.log` into
+# $REFLECT_ROOT/logs AFTER the final assertion, `rm -rf` lost the race between its
+# readdir and its rmdir, and `set -e` killed the script before the success line. Every
+# green result in that review rested on a verifier that could report red for no reason
+# — and, symmetrically, could have reported green while cleanup was broken.
+#
+# This test pins the contract that replaced the race, using the same spawn mechanism
+# and the same destination directory as the worker that caused it. It is deterministic
+# by construction: the stand-in worker blocks on a sentinel THIS TEST creates, so
+# "it has not written yet" is a fact about the fixture, not a bet on scheduling.
+test_begin "TEST 48: teardown blocks on the workers this suite spawned, and names them when it cannot"
+TD_LOGDIR="$REFLECT_ROOT/logs"          # the exact directory the live failure could not remove
+mkdir -p "$TD_LOGDIR"
+TD_GO="$SPAWN_TRACK_DIR/td-go"
+TD_LATE="$TD_LOGDIR/test-48-late-worker.stdout.log"
+rm -f "$TD_GO" "$TD_LATE"
+TD_UNIT="reflect-smoke-teardown-$$-$RANDOM"
+
+# A stand-in for a detached reflect worker: same spawn call (`systemd-run --user
+# --collect --no-block`, i.e. its own cgroup, immune to our exit), same destination,
+# and it carries this run's REFLECT_ROOT so BOTH tracking rails can see it.
+systemd-run --user --collect --no-block --unit="$TD_UNIT" \
+  --setenv=REFLECT_ROOT="$REFLECT_ROOT" \
+  -- bash -c "while [[ ! -f '$TD_GO' ]]; do sleep 0.05; done; printf 'late write\n' > '$TD_LATE'" \
+  >/dev/null 2>&1 \
+  || fail "48: could not spawn the stand-in detached worker"
+
+# (a) The shim recorded the unit. Without this the wait has nothing to wait ON, and
+#     every assertion below would pass for free.
+grep -qxF "$TD_UNIT" "$SPAWN_REGISTRY" \
+  || fail "48a: the systemd-run shim did not record unit '$TD_UNIT' — spawn tracking is blind (registry tail: $(tail -3 "$SPAWN_REGISTRY"))"
+
+# (b) It has not written yet, and cannot have: its sentinel does not exist.
+[[ ! -e "$TD_LATE" ]] \
+  || fail "48b: the stand-in worker wrote before its sentinel existed; the fixture is not the race it claims to model"
+
+# (c) The bounded wait must FAIL, and must name what is holding the directory — both
+#     rails: the unit by name, and the live process inside it. `rm -rf` used to run
+#     right here, which is exactly how the live failure happened.
+if spawn_wait_quiescent 2; then
+  fail "48c: quiescence was declared while a spawned worker was demonstrably still live — teardown would race it again"
+fi
+grep -qF "unit $TD_UNIT" <<<"$SPAWN_HOLDERS" \
+  || fail "48c: the timeout did not NAME the unit still holding the temp root (holders: $SPAWN_HOLDERS)"
+grep -q '^process [0-9]' <<<"$SPAWN_HOLDERS" \
+  || fail "48c: the process rail saw nothing — the setsid fallback spawn, which has no unit at all, would be invisible (holders: $SPAWN_HOLDERS)"
+
+# (d) Release it. Quiescence must not be declared until the worker is terminal, and
+#     the write that used to land too late must be on disk BEFORE the wait returns.
+: > "$TD_GO"
+spawn_wait_quiescent 60 \
+  || fail "48d: the released worker never reached a terminal state (holders: $SPAWN_HOLDERS)"
+[[ -s "$TD_LATE" ]] \
+  || fail "48d: quiescence was declared before the worker's write landed — this is the exact race the suite used to lose"
+rm -f "$TD_LATE" "$TD_GO"
+info "48: a detached worker is tracked by unit AND by process, blocks teardown, is named while it blocks, and its write lands before quiescence"
+
 # ============================================================================
 # FINAL GUARD: prove the whole suite left the live repo alone.
 assert_repo_tasks_untouched "end of suite"
 info "live repo tasks/ untouched by the full suite"
 
-if [[ "${REFLECT_DEBUG:-}" != "1" ]]; then
-  rm -rf "$REFLECT_ROOT" "$STUB_SCRATCH" "$TEST_CWD"
+# ============================================================================
+# TEARDOWN — deterministic, bounded, and reported separately from the tests.
+# ============================================================================
+# Every assertion has now passed. Whatever happens below is a TEARDOWN outcome and
+# is reported as one: the success line is printed only when both halves are clean,
+# and the exit code distinguishes them (1 = a test, 3 = teardown).
+#
+# The wait is on a CONDITION (nothing we spawned can still write), not on a
+# duration. See the spawn-tracking block near the top for why that is the only
+# sound terminal condition here.
+TEARDOWN_STATUS="ok"
+TEARDOWN_DETAIL=""
+
+# 90s: the longest thing this suite can legitimately still be waiting on is a
+# detached reflect worker against the sessionend budget (40s) plus its kill grace
+# (10s), doubled for a loaded machine. Not an env knob — a documented constant.
+if ! spawn_wait_quiescent 90; then
+  TEARDOWN_STATUS="workers-still-running"
+  TEARDOWN_DETAIL="Still live after 90s — these can still write into the temp root, which is
+why removing it is not safe yet:
+$SPAWN_HOLDERS"
 fi
 
-echo "OK: all smoke tests passed"
-exit 0
+if [[ "$TEARDOWN_STATUS" == "ok" && "${REFLECT_DEBUG:-}" != "1" ]]; then
+  # NO `|| true`, NO `2>/dev/null`. A cleanup that cannot fail cannot tell you the
+  # next teardown bug either — this session already lost five refusal messages to a
+  # redirection attached to the wrong thing.
+  TEARDOWN_RM_ERR="$SPAWN_TRACK_DIR/teardown-rm.err"
+  if ! rm -rf "$REFLECT_ROOT" "$STUB_SCRATCH" "$TEST_CWD" 2>"$TEARDOWN_RM_ERR"; then
+    TEARDOWN_STATUS="rm-failed"
+    TEARDOWN_DETAIL="rm reported:
+$(cat "$TEARDOWN_RM_ERR")
+what is still there:
+$(find "$REFLECT_ROOT" "$STUB_SCRATCH" "$TEST_CWD" -mindepth 1 -printf '  %T@ %p\n' 2>/dev/null | sort -rn | head -20)
+processes/units still tracked (may have appeared after the quiescence check):
+$(spawn_holders)"
+  fi
+  # The tracking dir goes last: TEARDOWN_DETAIL is written inside it.
+  rm -rf "$SPAWN_SHIM_DIR"
+fi
+
+# ============================================================================
+# STATUS — tests and teardown reported distinctly, so a green suite can never
+# look broken again (and a broken teardown can never look green).
+# ============================================================================
+echo "----------------------------------------------------------------------"
+printf 'TESTS:    PASS — %s named test(s) ran, %s skipped, 0 failed (lane=%s)\n' \
+  "$TESTS_RUN" "$TESTS_SKIPPED" "$SMOKE_LANE"
+if [[ "$TEARDOWN_STATUS" == "ok" ]]; then
+  echo "TEARDOWN: OK"
+  echo "OK: all smoke tests passed"
+  rm -rf "$SPAWN_TRACK_DIR"
+  exit 0
+fi
+
+printf 'TEARDOWN: FAILED (%s)\n' "$TEARDOWN_STATUS" >&2
+printf '%s\n' "$TEARDOWN_DETAIL" >&2
+echo "TEARDOWN_FAILED: every selected test passed; the suite could not clean up after itself." >&2
+echo "  Exit 3 means TEARDOWN. Exit 1 means a TEST. Do not read this as a test failure." >&2
+echo "  Kept for inspection: REFLECT_ROOT=$REFLECT_ROOT SPAWN_REGISTRY=$SPAWN_REGISTRY" >&2
+exit 3
