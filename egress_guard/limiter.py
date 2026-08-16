@@ -31,8 +31,16 @@ Three ways a call is refused rather than delayed:
 * `WaitTooLong` — the queue is deeper than `max_wait_s`. No slot is reserved,
   so refusing here can only ever delay traffic, never release it early.
 
-There is no override flag, no force parameter and no bypass environment
-variable. Widening a limit means editing the policy file.
+There is no override flag and no force parameter. Widening a limit means
+editing the policy file.
+
+`EGRESS_GUARD_POLICY` and `EGRESS_GUARD_STATE` select WHICH policy and state
+the guard uses; they cannot widen a limit by themselves. They are not a bypass
+in the sense that matters, because setting them requires the same access as
+editing the policy file itself — but they are the closest thing to one here, so
+the shipped server is registered with an empty `env` and a test enforces that.
+Pointing a live server at a permissive policy is a deliberate act, not a flag
+an impatient caller can reach for mid-run.
 
 State
 -----
@@ -47,6 +55,7 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import tempfile
@@ -314,6 +323,14 @@ class EgressGuard:
                     f"egress policy: {resource!r}.{field} must be a number "
                     f"(got {value!r})."
                 )
+            if math.isnan(value) or math.isinf(value):
+                # `json.load` happily parses the bare tokens NaN and Infinity,
+                # and every comparison against NaN is False — a NaN limit is an
+                # absent limit that still looks configured.
+                raise PolicyError(
+                    f"egress policy: {resource!r}.{field} must be finite "
+                    f"(got {value!r})."
+                )
             if value < 0:
                 raise PolicyError(
                     f"egress policy: {resource!r}.{field} must not be negative."
@@ -333,6 +350,36 @@ class EgressGuard:
 
     def lock_path(self, resource: str) -> str:
         return os.path.join(self.state_dir, self._slug(resource) + ".lock")
+
+    def floor_path(self, resource: str) -> str:
+        return os.path.join(self.state_dir, self._slug(resource) + ".floor")
+
+    def _sidecar_floor(self, resource: str) -> float:
+        """The ratchet, kept apart from the mutable state file.
+
+        Losing history must never make us FASTER. The state file carries
+        counters that are legitimately reset when corrupt; the floor is not one
+        of them, so it lives in its own write-once-per-raise file.
+        """
+        try:
+            with open(self.floor_path(resource), "r", encoding="utf-8") as fh:
+                return _as_float(json.load(fh).get("floor_s"), 0.0)
+        except (OSError, ValueError, AttributeError):
+            return 0.0
+
+    def _raise_sidecar_floor(self, resource: str, floor: float) -> None:
+        if floor <= self._sidecar_floor(resource):
+            return
+        path = self.floor_path(resource)
+        tmp = f"{path}.tmp.{os.getpid()}"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"floor_s": floor}, fh)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        except OSError:
+            pass
 
     @contextlib.contextmanager
     def locked(self, resource: str) -> Iterator[Any]:
@@ -436,12 +483,17 @@ class EgressGuard:
 
     # -- floor ------------------------------------------------------------
 
-    @staticmethod
     def _effective_floor(
-        state: dict[str, Any], policy: dict[str, Any], declared: Optional[float]
+        self,
+        state: dict[str, Any],
+        policy: dict[str, Any],
+        declared: Optional[float],
+        resource: Optional[str] = None,
     ) -> float:
         """Strictest wins. The caller's own interval can only raise the floor."""
         candidates = [float(policy["min_interval_s"]), _as_float(state.get("floor_s"), 0.0)]
+        if resource is not None:
+            candidates.append(self._sidecar_floor(resource))
         if declared is not None:
             candidates.append(float(declared))
         return max(candidates)
@@ -474,8 +526,9 @@ class EgressGuard:
         now = self._time()
         with self.locked(resource):
             state = self._read_state(resource, now)
-            floor = self._effective_floor(state, policy, min_interval_s)
+            floor = self._effective_floor(state, policy, min_interval_s, resource)
             state["floor_s"] = floor
+            self._raise_sidecar_floor(resource, floor)
             declaration = dict(state.get("declaration") or {})
             declaration["declared_at"] = now
             declaration["min_interval_s"] = min_interval_s
@@ -556,7 +609,7 @@ class EgressGuard:
         now = self._time()
         registered = os.path.exists(self.state_path(resource))
         state = self._read_state(resource, now)
-        floor = self._effective_floor(state, policy, None)
+        floor = self._effective_floor(state, policy, None, resource)
         window = float(policy["window_s"])
         events = _live_events(state["events"], now, window)
         cooldown_until = _as_float(state.get("cooldown_until"), 0.0)
@@ -597,11 +650,11 @@ class EgressGuard:
         letting anything through early. Checks run in that order so a blocked
         host is reported as blocked, not as out of budget.
         """
-        cost = float(cost)
+        cost = _finite(cost, "cost")
         if cost < 0:
             raise ValueError("cost must not be negative")
         if min_interval_s is not None:
-            min_interval_s = float(min_interval_s)
+            min_interval_s = _finite(min_interval_s, "min_interval_s")
             if min_interval_s < 0:
                 raise ValueError("min_interval_s must not be negative")
 
@@ -614,11 +667,12 @@ class EgressGuard:
         now = self._time()
         with self.locked(resource):
             state = self._read_state(resource, now)
-            floor = self._effective_floor(state, policy, min_interval_s)
+            floor = self._effective_floor(state, policy, min_interval_s, resource)
             # Persist the ratchet even on the refusal paths below: a caller
             # that declared a stricter interval has raised the floor for
             # everyone, whether or not its own request goes through.
             state["floor_s"] = floor
+            self._raise_sidecar_floor(resource, floor)
 
             cooldown_until = _as_float(state.get("cooldown_until"), 0.0)
             if cooldown_until > now:
@@ -686,6 +740,21 @@ class EgressGuard:
 
         if wait > 0:
             self._sleep_until(slot)
+            # Pushback can land while this call is parked. Without this
+            # re-check the already-reserved slot still fires, so exactly one
+            # request goes out AFTER the resource told us to stop — the
+            # "just one more" class of incident, and silent.
+            with self.locked(resource):
+                state = self._read_state(resource, self._time())
+                cooldown_until = _as_float(state.get("cooldown_until"), 0.0)
+                now_after = self._time()
+                if cooldown_until > now_after:
+                    raise CooldownActive(
+                        resource,
+                        cooldown_until - now_after,
+                        cooldown_until,
+                        state.get("cooldown_reason", ""),
+                    )
         granted_at = self._time()
         return Grant(
             resource=resource,
@@ -710,6 +779,23 @@ class EgressGuard:
             if remaining <= 0:
                 return
             self._sleep(remaining)
+
+
+def _finite(value: Any, name: str) -> float:
+    """Reject NaN and infinity at the door.
+
+    Every comparison against NaN is False, so a NaN slips past `cost > max_cost`,
+    past `wait > max_wait` and into persisted state, where it poisons the running
+    total and disables that ceiling permanently. A limit that silently stops
+    applying is worse than no limit, because nothing reports it.
+    """
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a number") from None
+    if math.isnan(out) or math.isinf(out):
+        raise ValueError(f"{name} must be finite, got {out!r}")
+    return out
 
 
 def _as_float(value: Any, fallback: float) -> float:
