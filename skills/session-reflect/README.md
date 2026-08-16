@@ -231,6 +231,30 @@ the reaper contend with the very workers it exists to clean up after, and the
 alternative (a liveness probe per manifest) buys nothing the latch does not
 already guarantee.
 
+### Retention: what is collected, and what never is
+
+| what | where | bound | who runs it |
+|---|---|---|---|
+| self-compact state + requests | `self-compact-state/*.json` | `STATE_RETENTION_DAYS` = 30 | `self-compact-trigger.py`, on fire |
+| human mission copies | `<project>/tasks/mission.<sid>.md` | `REFLECT_MISSION_RETENTION_DAYS` = 30, or session dir gone | `mission_gc`, on each mission write |
+| recursion markers | `skipped-recursions/` | `REFLECT_ARTIFACT_RETENTION_DAYS` = 14 | `reflect_artifact_gc`, every detached worker |
+| malformed-payload manifests | `malformed/` | same | same |
+| worker logs | `$REFLECT_LOG_DIR` | same | same |
+| **reflections** | `sessions/**` | **never collected** | — |
+
+`REFLECT_ARTIFACT_RETENTION_DAYS` is a **hardcoded constant in `lib.sh`, not an env
+override**: a retention bound for our own debris is a value this code should decide,
+and every knob is one more thing that can be mis-set. Two weeks is long enough to
+diagnose something a human noticed last week, short enough that a month of markers
+cannot accumulate — measured need: 619 markers and 1951 log files eight days after
+deployment, at ~590 sessions/week.
+
+The sweep takes **regular files at depth 1 only**, refuses `$REFLECT_ROOT` itself and
+anything under `sessions/` (the one directory in its list is operator-settable via
+`REFLECT_LOG_DIR`), and runs only in **detached** workers — never on the synchronous
+precompact path, which is fighting the hard 60s hook cap. Same discipline, and the
+same reason, as the orphan reaper.
+
 ### Mission handoff layout — the authoritative copy is out of every repo
 
 ```

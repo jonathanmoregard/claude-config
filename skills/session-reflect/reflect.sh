@@ -174,6 +174,11 @@ Mission artifact layout:
   also collected once reflections/sessions/<sid>/ is gone. The pointer target is
   always kept.
 
+Diagnostic retention (not settable — a constant in lib.sh):
+  skipped-recursions/, malformed/ and \$REFLECT_LOG_DIR are swept by every DETACHED
+  worker; regular files older than REFLECT_ARTIFACT_RETENTION_DAYS
+  (${REFLECT_ARTIFACT_RETENTION_DAYS}) are removed. sessions/ is never swept.
+
 See README.md at ~/.claude/skills/session-reflect/README.md
 EOF
   exit 0
@@ -1292,6 +1297,16 @@ if (( IS_WORKER == 1 )); then
   if [[ "$_reaped" =~ ^[0-9]+$ ]] && (( _reaped > 0 )); then
     printf '[session-reflect] reaper demoted %s orphaned started mode(s) to error\n' \
       "$_reaped" >&2
+  fi
+  # R3: same place, same reason — the detached worker is off the hook clock, so it
+  # is where the diagnostic sweep is paid for. skipped-recursions/, malformed/ and
+  # the worker-log dir gained a file per event and nothing collected them (619 and
+  # 1951 files after eight days on this host). Bounded by
+  # REFLECT_ARTIFACT_RETENTION_DAYS; sessions/ is never touched.
+  _artifact_gc="$(reflect_artifact_gc 2>/dev/null || echo 0)"
+  if [[ "$_artifact_gc" =~ ^[0-9]+$ ]] && (( _artifact_gc > 0 )); then
+    printf '[session-reflect] artifact GC removed %s diagnostic file(s) older than %s days\n' \
+      "$_artifact_gc" "$REFLECT_ARTIFACT_RETENTION_DAYS" >&2
   fi
   exit 0
 fi

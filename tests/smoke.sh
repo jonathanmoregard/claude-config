@@ -3824,6 +3824,109 @@ R2_LIST3="$(bash "$REFLECT_SH" --mission-copies "$R2_BARE")" \
 info "37d: the allowlist names our copies of every age and our pointer, and nothing else"
 
 # ============================================================================
+# TEST 38: R3 — the diagnostic directories are bounded
+# ============================================================================
+# Three directories gained a file per event and nothing ever removed them:
+#   skipped-recursions/  one marker per hook fire inside EVERY reflection
+#                        subprocess (reflect.sh's recursion break)
+#   malformed/           one manifest per malformed hook payload
+#   $REFLECT_LOG_DIR     two worker logs per detached run
+# Live counts on this host, eight days after deployment: 619 markers and 1951 log
+# files. At ~590 sessions/week that is thousands of files a month, silent until
+# inode or quota pain — and only self-compact state and mission copies were ever
+# collected.
+#
+# These are DIAGNOSTICS. Reflections themselves (sessions/) are the product and are
+# never collected here. The bound is a hardcoded named constant, not a knob.
+echo "TEST 38: R3 — skipped-recursions/, malformed/ and logs/ are age-bounded"
+canonical_stub
+R3_LOG_DIR="$REFLECT_ROOT/logs"
+R3_DIRS=( "$REFLECT_ROOT/skipped-recursions" "$REFLECT_ROOT/malformed" "$R3_LOG_DIR" )
+mkdir -p "${R3_DIRS[@]}"
+R3_OLD=()
+R3_KEEP=()
+for r3_d in "${R3_DIRS[@]}"; do
+  printf '{"fixture":"ancient"}\n' > "$r3_d/r3-ancient.json"
+  touch -d '30 days ago' "$r3_d/r3-ancient.json"
+  R3_OLD+=( "$r3_d/r3-ancient.json" )
+  printf '{"fixture":"fresh"}\n' > "$r3_d/r3-fresh.json"
+  R3_KEEP+=( "$r3_d/r3-fresh.json" )
+done
+# The bound itself, either side of it.
+printf '{}\n' > "$REFLECT_ROOT/skipped-recursions/r3-edge-inside.json"
+touch -d '13 days ago' "$REFLECT_ROOT/skipped-recursions/r3-edge-inside.json"
+R3_KEEP+=( "$REFLECT_ROOT/skipped-recursions/r3-edge-inside.json" )
+printf '{}\n' > "$REFLECT_ROOT/skipped-recursions/r3-edge-outside.json"
+touch -d '15 days ago' "$REFLECT_ROOT/skipped-recursions/r3-edge-outside.json"
+R3_OLD+=( "$REFLECT_ROOT/skipped-recursions/r3-edge-outside.json" )
+# PRODUCT, not diagnostics: a reflection far older than the bound must survive, or
+# the GC is deleting the thing the system exists to produce.
+mkdir -p "$REFLECT_ROOT/sessions/r3-ancient-sid/checkpoints"
+printf '{"patterns":[]}\n' > "$REFLECT_ROOT/sessions/r3-ancient-sid/final.json"
+printf '{}\n' > "$REFLECT_ROOT/sessions/r3-ancient-sid/checkpoints/old.json"
+touch -d '400 days ago' "$REFLECT_ROOT/sessions/r3-ancient-sid/final.json" \
+  "$REFLECT_ROOT/sessions/r3-ancient-sid/checkpoints/old.json"
+R3_KEEP+=( "$REFLECT_ROOT/sessions/r3-ancient-sid/final.json"
+           "$REFLECT_ROOT/sessions/r3-ancient-sid/checkpoints/old.json" )
+# A stale SUBDIRECTORY is not a file and must never be removed.
+mkdir -p "$REFLECT_ROOT/skipped-recursions/r3-subdir"
+printf '{}\n' > "$REFLECT_ROOT/skipped-recursions/r3-subdir/nested.json"
+touch -d '90 days ago' "$REFLECT_ROOT/skipped-recursions/r3-subdir/nested.json" \
+  "$REFLECT_ROOT/skipped-recursions/r3-subdir"
+
+# (a) The SYNCHRONOUS precompact path must not pay for the sweep — same discipline
+#     as the orphan reaper, which is off the 60s hook clock for the same reason.
+R3_PC_SID="test-sid-r3-precompact"
+echo "$(jq -cn --arg sid "$R3_PC_SID" --arg tp "$TRANSCRIPT" --arg cwd "$TEST_CWD" \
+  '{session_id:$sid,transcript_path:$tp,hook_event_name:"PreCompact",trigger:"manual",cwd:$cwd}')" \
+  | bash "$REFLECT_SH" precompact >/dev/null 2>&1 || true
+for r3_f in "${R3_OLD[@]}"; do
+  [[ -f "$r3_f" ]] \
+    || fail "38a: the synchronous precompact path ran the artifact GC (removed $r3_f) — that sweep belongs off the hook clock"
+done
+info "38a: the synchronous precompact path does not sweep"
+
+# (b) A DETACHED worker collects, because it is off the hook clock.
+R3_SID="test-sid-r3-artifact-gc"
+echo "$(jq -cn --arg sid "$R3_SID" --arg tp "$TRANSCRIPT" --arg cwd "$TEST_CWD" \
+  '{session_id:$sid,transcript_path:$tp,hook_event_name:"SessionEnd",reason:"other",cwd:$cwd}')" \
+  | bash "$REFLECT_SH" sessionend >/dev/null 2>&1 || true
+wait_for_complete "$REFLECT_ROOT/sessions/$R3_SID/manifest.json" 25 sessionend \
+  || fail "38b: the detached worker never completed, so the GC never ran"
+for r3_f in "${R3_OLD[@]}"; do
+  [[ ! -e "$r3_f" ]] \
+    || fail "38b: $r3_f is older than the retention bound and was not collected"
+done
+for r3_f in "${R3_KEEP[@]}"; do
+  [[ -f "$r3_f" ]] || fail "38b: $r3_f was collected but must be kept"
+done
+[[ -d "$REFLECT_ROOT/skipped-recursions/r3-subdir" ]] \
+  || fail "38b: a stale subdirectory was removed — the sweep must only take regular files at depth 1"
+[[ -f "$REFLECT_ROOT/skipped-recursions/r3-subdir/nested.json" ]] \
+  || fail "38b: the sweep recursed into a subdirectory"
+for r3_d in "${R3_DIRS[@]}"; do
+  [[ -d "$r3_d" ]] || fail "38b: the sweep removed the directory $r3_d itself"
+done
+info "38b: files past the bound collected from all three dirs; fresh, in-bound, product and subdirs kept"
+
+# (c) The bound is a CONSTANT. `: "${X:=14}"` would make it an env knob, and the
+#     standing directive is that a value this code should decide is not a setting.
+R3_LIB="$SKILL_DIR/lib.sh"
+grep -qE '^REFLECT_ARTIFACT_RETENTION_DAYS=[0-9]+$' "$R3_LIB" \
+  || fail "38c: the retention bound is not a plain hardcoded constant in lib.sh"
+if grep -q 'REFLECT_ARTIFACT_RETENTION_DAYS:=' "$R3_LIB"; then
+  fail "38c: the retention bound is env-overridable (\`:=\` form) — that is a knob, not a constant"
+fi
+if grep -q 'REFLECT_ARTIFACT_RETENTION_DAYS' "$REFLECT_SH" \
+   && grep -qE 'REFLECT_ARTIFACT_RETENTION_DAYS +(Override|Retention|Max)' "$REFLECT_SH"; then
+  fail "38c: the retention bound is advertised as an env override in reflect.sh --help"
+fi
+# It must also be documented, since it deletes files a human might go looking for.
+grep -q 'REFLECT_ARTIFACT_RETENTION_DAYS' "$SKILL_DIR/README.md" \
+  || fail "38c: the retention bound is undocumented in README.md"
+info "38c: retention is a hardcoded named constant, documented, with no env override"
+
+# ============================================================================
 # FINAL GUARD: prove the whole suite left the live repo alone.
 assert_repo_tasks_untouched "end of suite"
 info "live repo tasks/ untouched by the full suite"

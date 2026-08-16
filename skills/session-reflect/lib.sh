@@ -602,6 +602,65 @@ reap_stale_started() {
   printf '%s' "$reaped"
 }
 
+# --- Diagnostic-artifact GC --------------------------------------------------
+# Three directories gain a file per event and nothing ever removed them:
+#
+#   $REFLECT_ROOT/skipped-recursions/  one marker per hook fire inside EVERY
+#                                      reflection subprocess (the recursion break
+#                                      in reflect.sh drops one and exits 0)
+#   $REFLECT_ROOT/malformed/           one manifest per malformed hook payload
+#   $REFLECT_LOG_DIR                   two worker logs per detached run
+#
+# Measured on this host eight days after deployment: 619 markers (2.5 MB) and 1951
+# log files (2.4 MB). At ~590 sessions/week that is thousands of files a month,
+# silent until inode or quota pain — and the only GC that existed covered
+# self-compact state and mission copies.
+#
+# These are DIAGNOSTICS. The reflections themselves live under sessions/ and are
+# NEVER touched here: they are the product, they are what the RSI reviewer consumes,
+# and a sweep that deletes them is worse than unbounded growth.
+#
+# THE BOUND IS A CONSTANT, not an env override. Two weeks is long enough to diagnose
+# something a human noticed last week and short enough that a month of markers
+# cannot accumulate; a retention bound for our own debris is a value this code should
+# decide, and every knob is one more thing that can be mis-set. Changing it is a code
+# change with a test run behind it.
+REFLECT_ARTIFACT_RETENTION_DAYS=14
+
+# reflect_artifact_gc — remove diagnostic files older than the bound.
+#
+# Call ONLY off the hook clock (detached workers), like reap_stale_started and for
+# the same reason: the synchronous precompact path is fighting Claude Code's hard
+# 60s cap. Regular files at depth 1 only — a subdirectory is not our debris, and
+# recursing would put sessions/ within reach if REFLECT_LOG_DIR were ever mis-set.
+# Never fatal. Prints the number of files removed.
+reflect_artifact_gc() {
+  local mmin=$(( REFLECT_ARTIFACT_RETENTION_DAYS * 1440 ))
+  local removed=0 d f
+  local -a dirs=(
+    "$REFLECT_ROOT/skipped-recursions"
+    "$REFLECT_ROOT/malformed"
+    "${REFLECT_LOG_DIR:-$REFLECT_ROOT/logs}"
+  )
+  for d in "${dirs[@]}"; do
+    [[ -d "$d" ]] || continue
+    # REFLECT_LOG_DIR is operator-settable, so the one dir in this list that a
+    # human can aim is checked before anything is deleted. REFLECT_ROOT itself and
+    # anything under sessions/ are refused outright.
+    case "$d" in
+      "$REFLECT_ROOT"|"$REFLECT_ROOT/"|"$REFLECT_ROOT/sessions"|"$REFLECT_ROOT/sessions/"*)
+        echo "reflect: refusing to garbage-collect '$d' — that is REFLECT_ROOT itself or inside sessions/, which holds the reflections. Check REFLECT_LOG_DIR." >&2
+        continue
+        ;;
+    esac
+    while IFS= read -r f; do
+      [[ -n "$f" ]] || continue
+      rm -f -- "$f" 2>/dev/null && removed=$(( removed + 1 ))
+    done < <(find "$d" -mindepth 1 -maxdepth 1 -type f -mmin "+$mmin" 2>/dev/null || true)
+  done
+  printf '%s' "$removed"
+}
+
 # ============================================================================
 # MISSION HANDOFF — the authoritative copy lives OUTSIDE every repo
 # ============================================================================
