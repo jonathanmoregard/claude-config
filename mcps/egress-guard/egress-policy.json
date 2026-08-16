@@ -32,8 +32,10 @@
     "                   is not end-of-data, offset caps, server totals that",
     "                   over-count, empty windows, boundary duplicates. 0 = off.",
     "",
-    "Deleting a resource's file under the state dir resets its ratcheted",
-    "floor and its budget history."
+    "Deleting a resource's .json under the state dir clears its budget history",
+    "and cooldown. It does NOT lower the floor: the ratchet is kept in a",
+    "sibling .floor file precisely so that losing state cannot make us faster.",
+    "Lowering a floor means deleting that .floor file too, deliberately."
   ],
 
   "defaults": {

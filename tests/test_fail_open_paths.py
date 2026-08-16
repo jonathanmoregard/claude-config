@@ -48,6 +48,47 @@ def test_non_finite_min_interval_is_refused(state_dir, policy_file):
         guard(state_dir, policy).acquire("host.test", min_interval_s=float("nan"))
 
 
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_non_finite_cooldown_is_refused(state_dir, policy_file, bad):
+    """NaN cooldown recorded silently as NO cooldown: pushback dropped."""
+    policy = policy_file(defaults={"min_interval_s": 0.0})
+    g = guard(state_dir, policy)
+    with pytest.raises(ValueError):
+        g.record_block("host.test", reason="bot challenge", cooldown_s=bad)
+    # A real block still refuses afterwards.
+    g.record_block("host.test", reason="bot challenge", cooldown_s=3600)
+    with pytest.raises(CooldownActive):
+        g.acquire("host.test")
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_non_finite_declared_interval_is_refused(state_dir, policy_file, bad):
+    """An inf floor would wedge the resource forever, and persist in the sidecar."""
+    policy = policy_file(defaults={"min_interval_s": 0.5})
+    g = guard(state_dir, policy)
+    with pytest.raises(ValueError):
+        g.declare("host.test", bad)
+    assert g.status("host.test")["floor_s"] == pytest.approx(0.5)
+    assert not os.path.exists(g.floor_path("host.test"))
+
+
+def test_sidecar_write_failure_is_not_swallowed(state_dir, policy_file, monkeypatch):
+    """A silent sidecar failure means the ratchet backup does not exist."""
+    policy = policy_file(defaults={"min_interval_s": 0.5})
+    g = guard(state_dir, policy)
+
+    real_replace = os.replace
+
+    def boom(src, dst):
+        if str(dst).endswith(".floor"):
+            raise OSError("disk full")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr("egress_guard.limiter.os.replace", boom)
+    with pytest.raises(OSError):
+        g.declare("host.test", 30.0)
+
+
 def test_non_finite_policy_value_fails_closed(state_dir, tmp_path):
     """`json.load` parses the bare token NaN; a NaN limit is an absent limit."""
     path = tmp_path / "policy.json"

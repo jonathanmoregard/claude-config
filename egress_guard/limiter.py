@@ -372,14 +372,15 @@ class EgressGuard:
             return
         path = self.floor_path(resource)
         tmp = f"{path}.tmp.{os.getpid()}"
-        try:
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump({"floor_s": floor}, fh)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, path)
-        except OSError:
-            pass
+        # Deliberately NOT swallowed: if the ratchet backup cannot be written,
+        # a later state corruption drops the floor to the policy minimum — the
+        # exact regression the sidecar exists to prevent. Failing loudly here
+        # beats discovering it as unexplained speed.
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"floor_s": floor}, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
 
     @contextlib.contextmanager
     def locked(self, resource: str) -> Iterator[Any]:
@@ -520,7 +521,7 @@ class EgressGuard:
         resource looks like. Estimating those before first contact is what
         makes "this is more than I said" observable rather than discovered.
         """
-        min_interval_s = float(min_interval_s)
+        min_interval_s = _finite(min_interval_s, "min_interval_s")
         if min_interval_s < 0:
             raise ValueError("min_interval_s must not be negative")
         policy = self.resource_policy(resource)
@@ -593,6 +594,7 @@ class EgressGuard:
         if cooldown_s is None:
             cooldown_s = float(policy["block_cooldown_s"])
         cooldown_s = float(cooldown_s)
+        cooldown_s = _finite(cooldown_s, "cooldown_s")
         if cooldown_s < 0:
             raise ValueError("cooldown_s must not be negative")
         now = self._time()

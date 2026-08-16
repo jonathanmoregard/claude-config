@@ -270,10 +270,6 @@ TOOLS = [
                         "current floor is ignored."
                     ),
                 },
-                "description": {
-                    "type": "string",
-                    "description": "What this request is for. Recorded for humans.",
-                },
             },
             "required": ["resource"],
         },
@@ -558,16 +554,11 @@ def _handle(msg: dict) -> None:
 def _drain_in_flight(timeout_s: float = 900.0) -> None:
     """Wait out parked calls on shutdown.
 
-    Must exceed any legitimate `max_wait_s`: a parked acquire has already
-    debited its slot and its budget event, so killing it at EOF spends the
-    budget on a request that never goes out.
-    """
-    """Let in-flight calls finish after stdin closes.
-
     Workers are daemon threads, so exiting immediately on EOF would strand a
-    caller that writes `init + tools/call` and closes stdin. The cap exceeds
-    the largest sane `max_wait_s` so a legitimately parked `acquire` still
-    gets to answer.
+    caller that writes `init + tools/call` and closes stdin. The cap must also
+    exceed any legitimate `max_wait_s`: a parked acquire has already debited
+    its slot and its budget event, so killing it at EOF spends the budget on a
+    request that never goes out.
     """
     import time as _time
 
