@@ -267,13 +267,52 @@ tasks/mission.<sid>.md                     human-readable COPY; no automation re
 tasks/mission.md                           human convenience symlink to the copy
 ```
 
+#### What the resume fork is allowed to reach
+
+`--add-dir` **adds** to the ambient permission set; it does not restrict it. A fork
+launched with only `--permission-mode acceptEdits --add-dir <handoff dir>` therefore
+inherits the interactive user's whole permission surface from
+`~/.claude/settings.json`. Measured on this host against claude 2.1.222 with exactly
+that argv: it read `/etc/nixos/flake.nix`, ran `id -u` through pre-approved
+`mcp__safe-bash__*`, and saw the connected Google Drive / Calendar / Gmail MCP tools.
+That is arbitrary command execution and egress, on a process executing a `## Next`
+list a model wrote out of a transcript that may have contained anything.
+
+So the fork's authority is now stated rather than inherited. `scripts/idle-handoff.sh`
+launches it with, and only with:
+
+| flag | what it is load-bearing for (each verified by a real `-p` run) |
+|---|---|
+| `--setting-sources ''` | loads no user/project/local settings. **The only flag here that restricts anything.** `--settings` alone MERGES: with it and no `--setting-sources`, `/etc/nixos/flake.nix` still read fine. Also excludes the project's own `.claude/settings.json`, which is repo content |
+| `--settings <file>` | the explicit minimal object: `allow: []` (the field whose inherited value carried `mcp__safe-bash__*`), `deny` naming `Bash`/`WebFetch`/`WebSearch`/`Task`, `additionalDirectories` = the handoff leaf, `hooks: {}` |
+| `--strict-mcp-config` | no MCP servers, so no `mcp__` tools. **Not implied** by `--setting-sources`: with that alone, the account-connected Google servers were still loaded |
+| `--tools Read,Edit,Write,Glob,Grep,TodoWrite` | removes the shell structurally. **Load-bearing**: with the three flags above but no `--tools`, `id -u` still returned 1000. An unknown tool name here is *silently ignored*, which is why `deny` repeats the closure |
+| `--add-dir <handoff leaf>` | so `acceptEdits` covers the write-back the prompt asks for |
+| `--` before the prompt | **mandatory.** `--add-dir` is variadic, so `--add-dir D "$prompt"` consumes the prompt as a second directory and claude exits `Input must be provided either through stdin or as a prompt argument` — the fork was dead on arrival, and a stub that ignores argv cannot see it |
+
+**Afterwards the fork can** read/write inside its project cwd and inside
+`sessions/<sid>/handoff/`. **It cannot** read anything else on disk, run a shell
+command by any route, reach the network or any MCP server, reach its own settings
+file or the fork ledger (both under `$IDLE_HANDOFF_STATE_DIR`, outside the workspace
+and the grant), or touch `mission.cwd` / `manifest.json` / `final.json` /
+`checkpoints/`.
+
+Both gates **fail closed**: if `claude --help` does not advertise every required flag,
+or the settings file cannot be written, the fork is *not spawned* — logged loudly and
+counted as `fork_unrestrictable` in the run summary. There is no unrestricted
+fallback.
+
+Two accepted costs, stated rather than hidden. **No shell**: the fork cannot run
+tests, git or a build; it reads the handoff, edits files, and updates the handoff. A
+process executing instructions this system cannot authenticate does not get a shell to
+do it with. **No hooks**: dropping the user settings source drops the hook config, so
+the fork does not run `session-reflect`. The chain does not depend on it — the prompt
+asks the fork to update the handoff in place, which bumps its mtime, and resolution is
+newest-handoff-per-cwd.
+
 #### Why the handoff has a directory to itself
 
-The resume fork is launched `-p --permission-mode acceptEdits --add-dir <handoff
-dir>`, because the prompt asks it to update the handoff before it stops and a
-headless permission prompt is a denial. So **every file in that directory is
-fork-writable**, by a process executing a `## Next` list a model wrote out of a
-transcript that may have contained anything.
+Everything in a granted directory is fork-writable, by that same process.
 
 While the handoff was `sessions/<sid>/mission.md`, the grant was the whole session
 directory — including `mission.cwd`, which is the project→handoff mapping
@@ -365,8 +404,18 @@ the transcript? So it subtracts our own writes, enumerated per-cwd by
 
 * `tasks/mission.<sid>.md` — each copy whose name is `mission.<valid-sid>.md`
   **and** whose line 1 carries our stamp;
-* `tasks/mission.md` — only when the pointer is a symlink of ours (dangling
-  counts; a pointer whose copy was collected is still our write).
+* `tasks/mission.md` — when the pointer is a write of ours: a symlink of ours
+  (dangling counts; a pointer whose copy was collected is still our write), **or** a
+  regular file carrying a stamp of our lineage, current (`sha= ts= sid=`) or legacy
+  (`sha= ts=`, no sid). The legacy form is what the **pre-pointer writer** produced —
+  its own output was a stamped *regular* `tasks/mission.md`, and three such files
+  still exist on this host, written by the code that is still deployed. A
+  symlink-only rule could never subtract one, so a project holding one read as
+  world-moved on **every tick, forever**, and resume there was permanently inert with
+  nothing in the log naming the file. Unstamped files and the orchestrator's
+  `repo=…/branch=…` decoy stamp are still not admitted, and the admission is for the
+  freshness gate only — it is never a licence to write the file, and `mission_gc`
+  never touches the pointer.
 
 It used to be the shape family `:(exclude)tasks/mission.md` +
 `:(exclude)tasks/mission.*.md`, and a shape is not authorship. That glob hid
@@ -390,6 +439,25 @@ the pre-write list was built.
 **Fails conservative:** if the enumeration fails, nothing is excluded, our own
 copies read as the world moving, and the fork is skipped — logged as an ERROR,
 because a permanently broken enumeration otherwise looks like a quiet tree.
+
+**An empty exclusion list is emitted as nothing, not as an empty line.** `printf
+'%s\n'` with no arguments prints one newline; `mapfile` turned that into a
+one-element array holding `""`, and `git status --porcelain -- ""` exits 128 ("empty
+string is not a valid pathspec"). Swallowed by `2>/dev/null | head`, that read as a
+**clean tree** — so in every project with no retained copy of ours (a first tick, or
+any tree whose copies were collected) the whole freshness gate always answered "the
+world has not moved", whatever the tree looked like. Found 2026-08-16 by TEST 41a.
+Fixed at the producer, plus two consumer rails: an empty pathspec element is refused
+outright, and the `git status` calls now use `exec git` with no pipeline so the exit
+status is git's rather than `head`'s — a check that cannot fail is not a gate.
+
+**Every denial names its cause.** `STALE_DETAIL` records which paths moved (bounded at
+five, `--untracked-files=all` so an untracked directory does not collapse to `?? tasks/`
+and hide the filename), and when one of them is mission-shaped and not ours the line
+says so explicitly: that project will never resume until the file is removed,
+committed, or replaced by one of ours. Before, the only trace was a generic
+`git_stale` line, and "nothing to do here" and "wedged forever, needs one `rm`" looked
+identical.
 
 **The honest bound:** the stamp is evidence of our authorship, not authentication.
 Someone with repo write can forge one and get their file excluded from the gate.
@@ -456,13 +524,17 @@ only configuration that matters.
 | a live claude process in that cwd | abort, rescanned pre-spawn | `is_live_project` |
 | an armed ralph loop in that cwd | skip | `.claude/ralph-loop.local.md` |
 | no handoff of ours resolves | skip | `mission_resolve_ours` |
+| the fork's authority cannot be restricted | skip, loudly, counted | `fork_restriction_available` / `write_fork_settings` |
+| what the fork may reach at all | project cwd + handoff leaf; no shell, no MCP, no network | "What the resume fork is allowed to reach" above |
 | kill switch, if one is ever needed | `systemctl --user disable --now claude-idle-handoff.timer` | the deployed timer |
 
 The trigger never gated autofork itself, and still does not: a session idle for
 `IDLE_HANDOFF_MIN_SECONDS` (45 min) has been resumed by an unattended
 `--permission-mode acceptEdits` fork since before self-compact existed. What the
 context path changes is *when* a session becomes fork-eligible — at a threshold
-crossing rather than only after the 45-minute floor.
+crossing rather than only after the 45-minute floor. That frequency change is why the
+fork's *ambient* authority mattered enough to fix: the leaf write grant was narrow
+while the inherited permission set was the whole machine.
 
 **A reading with an unknown context window cannot spend money.** `context_usage.py`
 reports `window_known: false` when the model family is in neither of its prefix

@@ -120,7 +120,37 @@ chmod +x "$STUB_SCRATCH/claude"
 mkdir -p "$STUBS_DIR"
 cp "$STUB_SCRATCH/claude" "$STUBS_DIR/claude"
 
-export PATH="$STUB_SCRATCH:$PATH"
+# --- Stub CLI front door -----------------------------------------------------
+# `idle-handoff.sh` asks `claude --help` whether the installed binary advertises
+# every flag its fork restriction is built from, and FAILS CLOSED (no fork) if any is
+# missing. That question has to have an honest answer here too: a stub standing in
+# for the CLI must say which flags it honours, or every fork test would go red for
+# the wrong reason.
+#
+# It lives in its own dir AHEAD of $STUB_SCRATCH on PATH and delegates everything
+# that is not --help, so the ~25 per-test stub bodies stay untouched — and a test
+# that wants to simulate an OLDER CLI just rewrites this one file (TEST 40a).
+STUB_HELP_DIR="$(mktemp -d -t reflect-stubhelp-XXXXXX)"
+write_stub_help() {
+  # $@ = the flags this fake CLI claims to support. No args = the real 2.1.222 set.
+  local flags=("$@")
+  (( ${#flags[@]} > 0 )) || flags=(--add-dir --setting-sources --settings \
+                                   --strict-mcp-config --tools --permission-mode \
+                                   --max-turns --model --print)
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'for a in "$@"; do\n'
+    printf '  if [[ "$a" == "--help" ]]; then\n'
+    printf '    printf -- %%s\\\\n'
+    printf " '%s'" "${flags[@]}"
+    printf '\n    exit 0\n  fi\ndone\n'
+    printf 'exec %q "$@"\n' "$STUB_SCRATCH/claude"
+  } > "$STUB_HELP_DIR/claude"
+  chmod +x "$STUB_HELP_DIR/claude"
+}
+write_stub_help
+
+export PATH="$STUB_HELP_DIR:$STUB_SCRATCH:$PATH"
 
 # --- Isolated artifact root --------------------------------------------------
 REFLECT_ROOT="${REFLECT_ROOT:-$(mktemp -d -t reflect-smoke-XXXXXX)}"
@@ -2547,6 +2577,74 @@ case "$REFLECT_ROOT/sessions/$B7_SID/mission.cwd" in
 esac
 grep -qF '## Next' "$B7_ARGV" || fail "24: fork prompt does not point at ## Next"
 
+# ---- S1: the fork must not inherit the interactive user's ambient authority ---
+# `--add-dir` ADDS to the ambient permission set; it does not restrict it. Measured
+# against the installed CLI (2.1.222, real `-p` runs, 2026-08-16) with the argv this
+# script used to emit: the fork read /etc/nixos/flake.nix and ran `id -u` through
+# pre-approved `mcp__safe-bash__*`, i.e. arbitrary shell execution and reads across
+# ten ambient additionalDirectories, on a process executing a `## Next` list a model
+# wrote out of a transcript. Every assertion below reads the ACTUAL argv, because the
+# argv is the only thing that decides.
+b7_argv_has() { grep -qxF -- "$1" "$B7_ARGV"; }
+b7_value_after() { awk -v k="$1" '$0==k{getline; print; exit}' "$B7_ARGV"; }
+
+b7_argv_has '--setting-sources' \
+  || fail "24/S1: the fork does not pass --setting-sources, so it loads ~/.claude/settings.json and inherits permissions.additionalDirectories AND permissions.allow (which carries mcp__safe-bash__*)"
+[[ -z "$(b7_value_after '--setting-sources')" ]] \
+  || fail "24/S1: --setting-sources must be EMPTY — no user, no project, no local source. Got '$(b7_value_after '--setting-sources')'; the project's own .claude/settings.json is repo content and must not govern an unattended fork"
+b7_argv_has '--strict-mcp-config' \
+  || fail "24/S1: the fork does not pass --strict-mcp-config. --setting-sources alone does NOT unload MCP servers (verified: the account-connected Google Calendar/Drive/Gmail tools were still present), so an injected fork keeps MCP reach"
+b7_argv_has '--tools' \
+  || fail "24/S1: the fork does not restrict its tool set, so a shell stays reachable (verified: with the other flags but no --tools, \`id -u\` returned 1000) and its writable set is the whole filesystem"
+B7_TOOLS="$(b7_value_after '--tools')"
+[[ -n "$B7_TOOLS" ]] || fail "24/S1: --tools appears in argv with no value"
+case ",$B7_TOOLS," in
+  *,Bash,*) fail "24/S1: --tools hands Bash to an unattended fork resuming an unauthenticated handoff ('$B7_TOOLS')" ;;
+esac
+case ",$B7_TOOLS," in *,Read,*) ;; *) fail "24/S1: --tools leaves the fork unable to read the handoff ('$B7_TOOLS')" ;; esac
+case ",$B7_TOOLS," in *,Edit,*) ;; *) fail "24/S1: --tools leaves the fork unable to write the handoff back ('$B7_TOOLS')" ;; esac
+
+# The explicit permission object. Its `allow` list is the field whose INHERITED value
+# carried `mcp__safe-bash__*`, so it being empty is the assertion that matters most.
+b7_argv_has '--settings' \
+  || fail "24/S1: the fork gets no explicit settings object, so what it may reach is implicit"
+B7_SETTINGS="$(b7_value_after '--settings')"
+[[ -f "$B7_SETTINGS" ]] || fail "24/S1: --settings names '$B7_SETTINGS', which does not exist"
+jq -e '.permissions.allow == []' "$B7_SETTINGS" >/dev/null \
+  || fail "24/S1: the fork's settings pre-approve something ($(jq -c .permissions.allow "$B7_SETTINGS"))"
+jq -e --arg g "$B7_ADDDIR" '.permissions.additionalDirectories == [$g]' "$B7_SETTINGS" >/dev/null \
+  || fail "24/S1: additionalDirectories must be exactly the handoff leaf [$B7_ADDDIR]; got $(jq -c .permissions.additionalDirectories "$B7_SETTINGS")"
+jq -e '.hooks == {}' "$B7_SETTINGS" >/dev/null \
+  || fail "24/S1: the fork's settings carry hook config ($(jq -c .hooks "$B7_SETTINGS"))"
+jq -e '.permissions.defaultMode == "acceptEdits"' "$B7_SETTINGS" >/dev/null \
+  || fail "24/S1: the fork's settings do not state acceptEdits, so a headless prompt (= denial) is possible"
+# deny repeats what --tools already removes, by a second mechanism: --tools SILENTLY
+# IGNORES an unknown tool name (verified), so a rename would hand the shell back.
+for b7_deny in Bash WebFetch WebSearch Task; do
+  jq -e --arg t "$b7_deny" '.permissions.deny | index($t) != null' "$B7_SETTINGS" >/dev/null \
+    || fail "24/S1: the fork's settings do not deny $b7_deny by name ($(jq -c .permissions.deny "$B7_SETTINGS"))"
+done
+# ...and the fork must not be able to reach that file, or it could widen itself.
+case "$B7_SETTINGS" in
+  "$B7_ADDDIR"|"$B7_ADDDIR"/*|"$B7_CWD"|"$B7_CWD"/*)
+    fail "24/S1: the fork's own settings file '$B7_SETTINGS' is inside its writable set" ;;
+esac
+
+# `--add-dir` is VARIADIC in this CLI (`--add-dir <directories...>`), so
+# `--add-dir DIR "$prompt"` consumed the PROMPT as a second directory and claude
+# exited with "Input must be provided either through stdin or as a prompt argument
+# when using --print". Reproduced directly against 2.1.222: the fork was dead on
+# arrival and did nothing at all. A stub that ignores argv cannot see that, so the
+# `--` terminator is asserted structurally.
+B7_AFTER_GRANT="$(awk '/^--add-dir$/{getline; getline; print; exit}' "$B7_ARGV")"
+[[ "$B7_AFTER_GRANT" == "--" ]] \
+  || fail "24/S1: the argv element after the --add-dir value is '$B7_AFTER_GRANT', not '--'. --add-dir is variadic, so the prompt is consumed as a second directory and the fork exits with a usage error"
+B7_AFTER_SEP="$(awk 'f{print; exit} /^--$/{f=1}' "$B7_ARGV")"
+[[ -n "$B7_AFTER_SEP" ]] || fail "24/S1: nothing follows the -- separator, so the fork gets no prompt"
+grep -qF "$B7_HANDOFF" <<<"$B7_AFTER_SEP" \
+  || fail "24/S1: the element after -- is not the prompt (starts: $(head -c 120 <<<"$B7_AFTER_SEP"))"
+info "fork authority: no ambient settings source, no MCP, no shell, grant = cwd + handoff leaf; prompt survives the variadic --add-dir"
+
 # D6: the fork runs the SAME hooks we do, so its own handoff writes land under
 # whatever REFLECT_ROOT it inherits. A transient systemd unit inherits nothing, and
 # REFLECT_ROOT was missing from the --setenv passthrough — so under a custom root
@@ -3787,6 +3885,41 @@ grep -q 'world changed' <<<"$R2_TAIL" \
   || fail "37c: no staleness denial recorded for the foreign pointer (log: $(tail -3 <<<"$R2_TAIL"))"
 info "37c: a foreign regular tasks/mission.md is not treated as our write"
 
+# (e) S2: a LEGACY stamped REGULAR tasks/mission.md — the PRE-POINTER writer's own
+#     output. Three of those exist on this host, written by the still-deployed old
+#     code, and their stamp has no `sid=` field. They ARE our writing, but the
+#     pointer rule only ever admitted a SYMLINK, so such a file could never be
+#     subtracted from the gate: the project read as world-moved on every tick,
+#     forever, and resume there was permanently inert — visible only as a generic
+#     git_stale line that named nothing.
+rm -f "$R2_CWD/tasks/mission.md"
+printf '%s\n' '<!-- written-against: sha=none ts=1786441913 -->' \
+              '# Mission — written by the pre-pointer writer' \
+              '' '## Next' '- keep going' > "$R2_CWD/tasks/mission.md"
+[[ ! -L "$R2_CWD/tasks/mission.md" ]] || fail "37e: fixture must be a REGULAR file, not a symlink"
+R2_LEGACY_SHA="$(sha256sum "$R2_CWD/tasks/mission.md" | awk '{print $1}')"
+R2_TAIL="$(r2_run)"
+sc_forked "$R2_ARGV" \
+  || fail "37e: a legacy stamped regular tasks/mission.md of OUR OWN lineage still reads as the world moving, so resume in that project is permanently inert (log: $(tail -3 <<<"$R2_TAIL"))"
+[[ "$(sha256sum "$R2_CWD/tasks/mission.md" | awk '{print $1}')" == "$R2_LEGACY_SHA" ]] \
+  || fail "37e: the legacy file was modified — admitting it to the freshness gate must not license writing it"
+R2_LEG_LIST="$(bash "$REFLECT_SH" --mission-copies "$R2_CWD")" \
+  || fail "37e: --mission-copies exited non-zero with a legacy regular pointer"
+grep -qxF 'tasks/mission.md' <<<"$R2_LEG_LIST" \
+  || fail "37e: the legacy stamped regular pointer is missing from the allowlist ($R2_LEG_LIST)"
+# The admission is lineage-gated, not type-gated: an unstamped regular file and the
+# orchestrator's own `repo=…/branch=…` decoy stamp must both stay VISIBLE.
+printf '%s\n' '# a human file that happens to sit here' > "$R2_CWD/tasks/mission.md"
+if bash "$REFLECT_SH" --mission-copies "$R2_CWD" | grep -qxF 'tasks/mission.md'; then
+  fail "37e: an UNSTAMPED regular tasks/mission.md was claimed as our writing"
+fi
+printf '%s\n' '<!-- written-against: repo=~/.claude branch=feat/x base=deadbee ts=2026-08-15 -->' \
+  > "$R2_CWD/tasks/mission.md"
+if bash "$REFLECT_SH" --mission-copies "$R2_CWD" | grep -qxF 'tasks/mission.md'; then
+  fail "37e: the orchestrator's repo=/branch= decoy stamp was claimed as our writing"
+fi
+info "37e: the pre-pointer writer's own stamped regular mission.md counts as ours; unstamped and decoy files do not"
+
 # (d) The accessor's contract, directly at the seam. It must name our copies and
 #     our pointer, and nothing else — including nothing that is merely named right.
 rm -f "$R2_CWD/tasks/mission.md"
@@ -4011,6 +4144,255 @@ for r4_mode in precompact sessionend subagentstop mission; do
     || fail "39c: dispatchable mode '$r4_mode' is missing from the --help usage line"
 done
 info "39c: all four dispatchable modes appear in the header and in --help"
+
+# ============================================================================
+# TEST 40: S1 — if the fork cannot be restricted, it is NOT spawned
+# ============================================================================
+# The failure this exists to prevent is a FALLBACK. An unrestricted fork is an
+# unattended acceptEdits process with the interactive user's whole permission surface
+# — ten ambient additionalDirectories and a pre-approved `mcp__safe-bash__*`, i.e.
+# arbitrary shell across the user's repos including ~/.claude/skills, where it could
+# rewrite the instructions future sessions load. Skipping costs one deferred resume.
+# So both gates fail CLOSED, and the reason lands in the counters, because a
+# permanently unrestrictable host must be visible rather than quiet.
+echo "TEST 40: S1 — an unrestrictable fork is skipped, never spawned unrestricted"
+S1_H="$(sc_home)"
+S1_ARGV="$S1_H/argv.txt"
+S1_CWD="$(mktemp -d -t reflect-s1cwd-XXXXXX)"
+assert_isolated_cwd "$S1_CWD"
+mk_candidate_repo "$S1_CWD" || fail "40: could not build candidate repo"
+S1_SID="test-sid-s1-unrestrictable"
+mk_mission_handoff "$S1_SID" "$S1_CWD" "$(cat "$SC_MISSION_FILE")" >/dev/null
+S1_PROJ="$S1_H/.claude/projects/-tmp-s1"
+mkdir -p "$S1_PROJ"
+S1_TP="$S1_PROJ/$S1_SID.jsonl"
+mk_context_transcript "$S1_TP" "claude-opus-5" 330000 "$S1_CWD" 25
+combo_stub "$S1_ARGV" "$SC_MISSION_FILE"
+S1_LOG="$REFLECT_ROOT/idle-handoff-logs/handoff.log"
+S1_FSDIR="$REFLECT_ROOT/idle-handoff-state/fork-settings"
+
+s1_run() {
+  # One tick. Prints EVERY log line this tick produced (the per-run summary line
+  # carries no sid, and its counters are part of what is asserted).
+  local lines
+  lines="$(wc -l < "$S1_LOG")"
+  : > "$S1_ARGV"
+  touch -d '2 minutes ago' "$S1_TP"
+  sc_plant_request "$S1_SID" "$S1_CWD" "$S1_TP"
+  HOME="$S1_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
+    || fail "40: idle-handoff.sh rc!=0"
+  local i
+  for (( i = 0; i < 40; i++ )); do sc_forked "$S1_ARGV" && break; sleep 0.25; done
+  tail -n +$((lines + 1)) "$S1_LOG"
+}
+
+# (a) CONTROL. Without this a "no fork" below would pass for any reason at all.
+S1_TAIL="$(s1_run)"
+sc_forked "$S1_ARGV" \
+  || fail "40a: control tick did not fork, so the negatives below prove nothing (log: $(tail -4 <<<"$S1_TAIL"))"
+grep -q 'fork_unrestrictable=0' <<<"$S1_TAIL" \
+  || fail "40a: the run summary does not report fork_unrestrictable (line: $(grep -m1 '^.*seen=' <<<"$S1_TAIL"))"
+[[ -n "$(find "$S1_FSDIR" -maxdepth 1 -name '*.settings.json' 2>/dev/null)" ]] \
+  || fail "40a: no fork settings file was written under $S1_FSDIR"
+info "40a: control forks, writes its settings file, and reports fork_unrestrictable=0"
+
+# (b) A CLI that does not advertise one of the required flags. Verified as a real
+#     hazard, not a hypothetical: `--strict-mcp-config` is the ONLY thing that unloads
+#     MCP (with `--setting-sources ''` alone the connected Google servers stayed
+#     loaded), so a build without it cannot be restricted at all.
+write_stub_help --add-dir --setting-sources --settings --tools --permission-mode
+S1_TAIL="$(s1_run)"
+if sc_forked "$S1_ARGV"; then
+  fail "40b: a fork was spawned by a CLI that cannot apply the restriction — it inherited the ambient permission set ($(cat "$S1_ARGV"))"
+fi
+grep -q 'authority cannot be restricted' <<<"$S1_TAIL" \
+  || fail "40b: the skip was not logged loudly (log: $(tail -4 <<<"$S1_TAIL"))"
+grep -q 'strict-mcp-config' <<<"$S1_TAIL" \
+  || fail "40b: the log does not NAME the missing flag, so an operator cannot fix it (log: $(tail -4 <<<"$S1_TAIL"))"
+grep -q 'fork_unrestrictable=1' <<<"$S1_TAIL" \
+  || fail "40b: the refusal is not in the counters (line: $(grep -m1 'seen=' <<<"$S1_TAIL"))"
+write_stub_help   # restore the real 2.1.222 flag set
+info "40b: a CLI missing a restriction flag skips the fork, names the flag, and counts it"
+
+# (c) The settings file cannot be written. Same requirement: no settings object means
+#     no explicit permission set, so there is nothing to spawn with.
+mkdir -p "$S1_FSDIR"
+chmod 500 "$S1_FSDIR" || fail "40c: could not make the settings dir read-only"
+S1_TAIL="$(s1_run)"
+chmod 700 "$S1_FSDIR"
+if sc_forked "$S1_ARGV"; then
+  fail "40c: a fork was spawned although its settings file could not be written ($(cat "$S1_ARGV"))"
+fi
+grep -q 'could not write the fork' <<<"$S1_TAIL" \
+  || fail "40c: the unwritable settings file was not logged loudly (log: $(tail -4 <<<"$S1_TAIL"))"
+grep -q 'fork_unrestrictable=1' <<<"$S1_TAIL" \
+  || fail "40c: the refusal is not in the counters (line: $(grep -m1 'seen=' <<<"$S1_TAIL"))"
+info "40c: an unwritable settings dir skips the fork rather than spawning with ambient authority"
+
+# (d) The bound on the settings files themselves — one per fork, in a dir nothing
+#     was sweeping. Same class R3 fixed for the diagnostic dirs.
+touch -d '3 days ago' "$S1_FSDIR/claude-autofork-ancient.settings.json"
+printf '{}' > "$S1_FSDIR/claude-autofork-fresh.settings.json"
+S1_TAIL="$(s1_run)"
+[[ ! -e "$S1_FSDIR/claude-autofork-ancient.settings.json" ]] \
+  || fail "40d: a 3-day-old fork settings file was not collected"
+[[ -e "$S1_FSDIR/claude-autofork-fresh.settings.json" ]] \
+  || fail "40d: a fresh fork settings file was collected"
+grep -qE 'FORK_SETTINGS_RETENTION_MINUTES=[0-9]+' "$WORKTREE/scripts/idle-handoff.sh" \
+  || fail "40d: the retention bound is not a plain named constant"
+if grep -qE ': *"\$\{FORK_SETTINGS_RETENTION_MINUTES' "$WORKTREE/scripts/idle-handoff.sh"; then
+  fail "40d: the retention bound is env-overridable — that is a knob, not a constant"
+fi
+info "40d: fork settings files are age-bounded by a hardcoded constant"
+
+# ============================================================================
+# TEST 41: S3 — a world-moved verdict NAMES the path that caused it
+# ============================================================================
+# Fail-closed here is correct, but the only trace used to be a generic `git_stale`
+# line. Any untracked mission-shaped file this code did not write makes a project read
+# as permanently world-moved (the accepted R2 consequence), and from the log "nothing
+# to do here" and "wedged forever, needs one rm" looked identical.
+echo "TEST 41: S3 — the staleness denial names the offending path"
+S3_H="$(sc_home)"
+S3_ARGV="$S3_H/argv.txt"
+S3_CWD="$(mktemp -d -t reflect-s3cwd-XXXXXX)"
+assert_isolated_cwd "$S3_CWD"
+mk_candidate_repo "$S3_CWD" || fail "41: could not build candidate repo"
+S3_SID="test-sid-s3-named-verdict"
+mk_mission_handoff "$S3_SID" "$S3_CWD" "$(cat "$SC_MISSION_FILE")" >/dev/null
+S3_PROJ="$S3_H/.claude/projects/-tmp-s3"
+mkdir -p "$S3_PROJ"
+S3_TP="$S3_PROJ/$S3_SID.jsonl"
+mk_context_transcript "$S3_TP" "claude-opus-5" 330000 "$S3_CWD" 25
+combo_stub "$S3_ARGV" "$SC_MISSION_FILE"
+S3_LOG="$REFLECT_ROOT/idle-handoff-logs/handoff.log"
+
+s3_run() {
+  local lines
+  lines="$(wc -l < "$S3_LOG")"
+  : > "$S3_ARGV"
+  touch -d '2 minutes ago' "$S3_TP"
+  sc_plant_request "$S3_SID" "$S3_CWD" "$S3_TP"
+  HOME="$S3_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
+    || fail "41: idle-handoff.sh rc!=0"
+  sleep 0.5
+  tail -n +$((lines + 1)) "$S3_LOG" | grep -F "$S3_SID" || true
+}
+
+# (a) The case a human cannot otherwise diagnose: an untracked mission-shaped file we
+#     did not write. The line must name it AND say that this project will never resume
+#     until it is dealt with.
+mkdir -p "$S3_CWD/tasks"
+printf '%s\n' '# my own notes' '- do not resume' > "$S3_CWD/tasks/mission.notes.md"
+S3_TAIL="$(s3_run)"
+if sc_forked "$S3_ARGV"; then fail "41a: fixture invalid — the fork was not denied"; fi
+grep -q 'world changed' <<<"$S3_TAIL" || fail "41a: no staleness denial recorded"
+grep -qF 'tasks/mission.notes.md' <<<"$S3_TAIL" \
+  || fail "41a: the denial does not NAME the file that caused it (log: $S3_TAIL)"
+grep -q 'NO resume will ever fire here' <<<"$S3_TAIL" \
+  || fail "41a: the denial does not distinguish 'wedged forever' from 'nothing to do' (log: $S3_TAIL)"
+# This cwd holds NO copies of ours, which is how 41a caught a fail-open on the way in:
+# `printf '%s\n'` with no arguments emits ONE EMPTY LINE, mapfile turned that into a
+# one-element array holding "", and `git status --porcelain -- ""` exits 128 ("empty
+# string is not a valid pathspec"). Swallowed by `2>/dev/null | head`, that read as a
+# CLEAN tree — so in EVERY project with no retained copy of ours (a first tick, or any
+# tree whose copies were GC'd) the whole freshness gate always answered "the world has
+# not moved". 41a and 41b are the behavioural regression. This asserts the PRODUCER is
+# clean too: the consumer's empty-element refusal would otherwise mask a regression by
+# denying for the wrong reason.
+if grep -q 'contains an EMPTY element' <<<"$S3_TAIL"; then
+  fail "41a: the exclusion list contained an empty pathspec element — the gate only denied because the consumer caught it (log: $S3_TAIL)"
+fi
+rm -f "$S3_CWD/tasks/mission.notes.md"
+info "41a: an unowned mission-shaped file is named, with what it permanently costs"
+
+# (b) An ordinary dirty file. Named too, but WITHOUT the mission hint — that hint
+#     describes a permanent condition and must not be attached to a transient one.
+printf 'edited\n' >> "$S3_CWD/src.txt"
+S3_TAIL="$(s3_run)"
+if sc_forked "$S3_ARGV"; then fail "41b: a dirty tracked file did not deny the fork"; fi
+grep -qF 'src.txt' <<<"$S3_TAIL" \
+  || fail "41b: the denial does not name the dirty file (log: $S3_TAIL)"
+if grep -q 'NO resume will ever fire here' <<<"$S3_TAIL"; then
+  fail "41b: a transient dirty file was reported as a permanent wedge (log: $S3_TAIL)"
+fi
+( cd "$S3_CWD" && git checkout -- src.txt && touch -d '30 minutes ago' src.txt )
+info "41b: an ordinary dirty path is named without the permanent-wedge hint"
+
+# (c) The uncheckable case: a non-git cwd is denied by design, forever. Saying so is
+#     the difference between an operator reading the log once and reading it weekly.
+S3_NOGIT_SID="test-sid-s3-nogit"
+S3_NOGIT_CWD="$(mktemp -d -t reflect-s3nogit-XXXXXX)"
+assert_isolated_cwd "$S3_NOGIT_CWD"
+mk_mission_handoff "$S3_NOGIT_SID" "$S3_NOGIT_CWD" "$(cat "$SC_MISSION_FILE")" >/dev/null
+S3_NOGIT_PROJ="$S3_H/.claude/projects/-tmp-s3-nogit"
+mkdir -p "$S3_NOGIT_PROJ"
+S3_NOGIT_TP="$S3_NOGIT_PROJ/$S3_NOGIT_SID.jsonl"
+mk_context_transcript "$S3_NOGIT_TP" "claude-opus-5" 330000 "$S3_NOGIT_CWD" 25
+touch -d '2 minutes ago' "$S3_NOGIT_TP"
+sc_plant_request "$S3_NOGIT_SID" "$S3_NOGIT_CWD" "$S3_NOGIT_TP"
+S3_LINES="$(wc -l < "$S3_LOG")"
+: > "$S3_ARGV"
+HOME="$S3_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
+  || fail "41c: idle-handoff.sh rc!=0"
+sleep 0.5
+S3_TAIL="$(tail -n +$((S3_LINES + 1)) "$S3_LOG" | grep -F "$S3_NOGIT_SID" || true)"
+grep -q 'not a git work tree' <<<"$S3_TAIL" \
+  || fail "41c: a non-git cwd is denied without saying so (log: $S3_TAIL)"
+info "41c: an uncheckable (non-git) cwd says it is uncheckable, not just 'stale'"
+
+# ============================================================================
+# TEST 42: S4 — the docs describe the code that exists
+# ============================================================================
+# Two claims had outlived their code. Both are the kind that get RE-TRUSTED: a reader
+# who believes the stamp is the staleness signal will "simplify" the git gate away, and
+# a reader who believes one hardcoded pathspec is the exclusion design will not look
+# for the per-cwd allowlist.
+echo "TEST 42: S4 — no doc claims a consumer that does not exist"
+S4_IH="$WORKTREE/scripts/idle-handoff.sh"
+S4_LIB="$SKILL_DIR/lib.sh"
+S4_PROMPT="$SKILL_DIR/prompts/mission.md"
+
+# (a) Enumeration first, so the doc assertions below rest on a fact rather than a
+#     string. The freshness gate lives in idle-handoff.sh; if it does not read the
+#     stamp, the stamp cannot be its input. The ONE legitimate mention is the fork
+#     prompt telling the model to preserve the line.
+[[ "$(grep -c 'written-against' "$S4_IH")" == "1" ]] \
+  || fail "42a: idle-handoff.sh mentions the stamp $(grep -c 'written-against' "$S4_IH") times; the only legitimate one is the fork prompt. If the gate now reads it, the docs below are wrong again"
+grep -q 'NOT a staleness signal' "$S4_IH" \
+  || fail "42a: the fork prompt does not correct the 'used for staleness detection' claim"
+grep -qF 'sha=... ts=... sid=...' "$S4_IH" \
+  || fail "42a: the fork prompt shows a stamp shape without the sid= field the real stamp carries, so a model asked to 'preserve it' has been shown the wrong line"
+
+# (b) lib.sh, at the definition of the regex itself — the place someone reads before
+#     changing the stamp.
+grep -q 'NOT A STALENESS SIGNAL' "$S4_LIB" \
+  || fail "42b: lib.sh does not state that the stamp is not a staleness signal"
+if grep -qF 'informational (git sha + timestamp, used for' "$S4_LIB"; then
+  fail "42b: lib.sh still describes the handoff stamp as being used for staleness"
+fi
+
+# (c) The mission prompt is read by the MODEL that writes the handoff.
+grep -q 'NOT a staleness signal' "$S4_PROMPT" \
+  || fail "42c: the mission prompt does not correct the staleness claim"
+if grep -q 'gate uses to detect whether the world has moved' "$S4_PROMPT"; then
+  fail "42c: the mission prompt still tells the model the stamp is what the fork gate reads"
+fi
+grep -qF 'sid=<SID>' "$S4_PROMPT" \
+  || fail "42c: the mission prompt shows a stamp shape without the sid= field"
+
+# (d) The single-pathspec exclusion design R2 deleted. The literal pathspec may still
+#     appear — but only as history that is explicitly marked as gone, never as a
+#     description of what the code does.
+if grep -qF "porcelain (using" "$S4_IH"; then
+  fail "42d: idle-handoff.sh still describes the post-write check as using a single hardcoded ':(exclude)tasks/mission.md' pathspec; the code re-derives a per-cwd allowlist via mission_excludes_for"
+fi
+if grep -qF "':(exclude)tasks/mission.md'" "$S4_IH" && ! grep -q 'deleted in R2' "$S4_IH"; then
+  fail "42d: the deleted single-pathspec design is still named without being marked as deleted"
+fi
+grep -q 'RE-DERIVED, not reused' "$S4_IH" \
+  || fail "42d: the post-write check no longer explains why the allowlist is re-derived"
+info "42: stamp-as-staleness corrected in all three doc sites, sid= shown, stale pathspec comment gone"
 
 # ============================================================================
 # FINAL GUARD: prove the whole suite left the live repo alone.
