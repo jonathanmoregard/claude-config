@@ -214,9 +214,39 @@ context_request_pending() {
   fi
 
   [[ -f "$SELF_COMPACT_HELPER" ]] || { log "sid=$sid: $SELF_COMPACT_HELPER missing; cannot verify request"; return 1; }
-  local fill
-  fill=$(timeout 30 python3 "$SELF_COMPACT_HELPER" --fill-pct "$transcript" 2>/dev/null) \
-    || { log "sid=$sid: could not measure occupancy from $transcript; ignoring request"; return 1; }
+
+  # A MANUAL request (`/self-compact`) does not rest on the threshold at all. The
+  # fill gate exists to stop a stale or planted AUTOMATIC marker buying a fork on
+  # its own word -- it re-measures the claim the marker makes. A manual marker
+  # makes no such claim: a human asked for this session to hand off, and "you are
+  # only at 12%" is not a reason to refuse them. Everything else still applies --
+  # the marker must be well-formed, unexpired, and for a valid sid, and every
+  # rail after this point is untouched.
+  local manual fill
+  manual=$(jq -r '.manual // false' "$req" 2>/dev/null || printf false)
+  if [[ "$manual" == "true" ]]; then
+    CONTEXT_REQUEST_INSTRUCTIONS=$(jq -r '.instructions // ""' "$req" 2>/dev/null || printf '')
+  fi
+
+  if ! fill=$(timeout 30 python3 "$SELF_COMPACT_HELPER" --fill-pct "$transcript" 2>/dev/null); then
+    if [[ "$manual" == "true" ]]; then
+      # Occupancy is unmeasurable on a short or estimate-only transcript. That is
+      # fatal for an automatic request, whose entire authority is the measurement,
+      # and irrelevant for a manual one.
+      CONTEXT_REQUEST_FILL="manual(unmeasured)"
+      log "sid=$sid: MANUAL request; occupancy not measurable from $transcript, proceeding because a manual request does not rest on a measurement"
+      return 0
+    fi
+    log "sid=$sid: could not measure occupancy from $transcript; ignoring request"
+    return 1
+  fi
+
+  if [[ "$manual" == "true" ]]; then
+    CONTEXT_REQUEST_FILL="manual(fill=$fill)"
+    log "sid=$sid: MANUAL context request via /self-compact — the >=$SELF_COMPACT_THRESHOLD gate does not apply (measured fill=$fill)"
+    return 0
+  fi
+
   if ! awk -v f="$fill" -v t="$SELF_COMPACT_THRESHOLD" 'BEGIN{exit !(f+0 >= t+0)}'; then
     log "sid=$sid: request claimed a crossing but transcript now reads fill=$fill < $SELF_COMPACT_THRESHOLD; ignoring"
     return 1
@@ -1218,6 +1248,11 @@ count_skipped_control_plane=0
 forks_this_run=0
 mission_resolve_rc=0
 CONTEXT_REQUEST_FILL=""
+# Free text the operator typed after `/self-compact`. Empty for every automatic
+# request. Unlike the mission body, this did not come out of a transcript — a
+# human typed it into their own session this minute — so it is presented to the
+# fork as an operator instruction rather than as untrusted summary data.
+CONTEXT_REQUEST_INSTRUCTIONS=""
 stale_detail_this_iter=""
 
 for project_dir in "$PROJECTS_DIR"/*/; do
@@ -1640,8 +1675,31 @@ for project_dir in "$PROJECTS_DIR"/*/; do
   # bound and the prompt-side "cap yourself at N" instruction can never
   # silently drift apart (advisor MEDIUM: sharp-edges).
   autofork_log="$IDLE_HANDOFF_LOG_DIR/${sid}.$(date +%s).autofork.log"
+  # Operator text from `/self-compact <instructions>`, if any. Kept in its own
+  # clearly-fenced block, ABOVE the untrusted-data framing, because its
+  # provenance is different in kind: a human typed it into their own live
+  # session, it was never summarised, and it is the reason this fork exists.
+  # It steers WHICH of the mission's Next items matter; it does not licence
+  # anything the refusal list below forbids.
+  operator_block=""
+  if [[ -n "$CONTEXT_REQUEST_INSTRUCTIONS" ]]; then
+    operator_block=$(cat <<OPS
+The operator asked for this handoff explicitly and left you instructions.
+They typed this themselves, in the session you are taking over from:
+
+--- operator instructions ---
+${CONTEXT_REQUEST_INSTRUCTIONS}
+--- end operator instructions ---
+
+Treat these as the steer for WHICH work to pick up and in what order. They
+take precedence over the ordering of ## Next. They do NOT expand what you
+are permitted to do: every refusal rule below still applies unchanged.
+
+OPS
+)
+  fi
   autofork_prompt=$(cat <<PROMPT
-Read ${mission_path} — that exact absolute path, resolved for you, is THE
+${operator_block}Read ${mission_path} — that exact absolute path, resolved for you, is THE
 mission. It lives outside this project on purpose, so that nothing in the
 repository can decide what you execute.
 

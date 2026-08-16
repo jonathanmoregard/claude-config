@@ -3192,6 +3192,78 @@ STUB
 chmod +x "$STUB_SCRATCH/claude"
 
 # ============================================================================
+# TEST 24c: /self-compact — a manual request is honoured below the threshold
+# ============================================================================
+# The automatic path's marker asserts "this session measured above 30%", and
+# idle-handoff re-measures that claim before acting on it. A MANUAL request
+# asserts nothing of the kind: a person typed the command. So the fill gate must
+# not apply to it, and the operator's free text must reach the fork that results
+# — otherwise `/self-compact do X first` silently drops the "do X first".
+test_begin "TEST 24c: /self-compact fires below 30% and its instructions reach the fork"
+
+MAN_H="$(sc_home)"
+MAN_ARGV="$MAN_H/argv.txt"
+MAN_CWD="$(mktemp -d -t reflect-manual-XXXXXX)"
+assert_isolated_cwd "$MAN_CWD"
+mk_candidate_repo "$MAN_CWD" || fail "24c: could not build candidate repo"
+MAN_SID="test-sid-manual"
+MAN_PROJ="$MAN_H/.claude/projects/-tmp-manual"
+mkdir -p "$MAN_PROJ"
+MAN_TP="$MAN_PROJ/$MAN_SID.jsonl"
+# 90k of a 1M window = 9%. The automatic trigger refuses this outright.
+mk_context_transcript "$MAN_TP" "claude-opus-5[1m]" 90000 "$MAN_CWD" 25
+
+counting_stub "$MAN_H/calls" "$SC_MISSION_FILE"
+MAN_TEXT="focus on the flaky teardown first, ignore the docs"
+( cd "$MAN_CWD" && HOME="$MAN_H" REFLECT_ROOT="$REFLECT_ROOT" \
+    CLAUDE_CODE_SESSION_ID="$MAN_SID" \
+    python3 "$MAN_H/.claude/self-compact-trigger.py" --manual "$MAN_TEXT" ) >/dev/null \
+  || fail "24c: --manual returned non-zero"
+
+MAN_MARKER="$SC_STATE_DIR/$MAN_SID.request.json"
+[[ -f "$MAN_MARKER" ]] || fail "24c: --manual wrote no request marker"
+jq -e '.manual == true' "$MAN_MARKER" >/dev/null \
+  || fail "24c: the marker is not flagged manual, so idle-handoff will apply the fill gate to it"
+[[ "$(jq -r '.instructions' "$MAN_MARKER")" == "$MAN_TEXT" ]] \
+  || fail "24c: the operator's instructions were not recorded in the marker"
+# The measurement is recorded for the audit trail, and is deliberately BELOW the
+# gate — that is the whole point of the test.
+awk -v f="$(jq -r '.fill_pct' "$MAN_MARKER")" 'BEGIN{exit !(f+0 < 0.30)}' \
+  || fail "24c: fixture is not below the threshold, so it cannot show the gate is bypassed"
+
+sc_wait_mission "$MAN_CWD" "$MAN_SID" || fail "24c: --manual produced no handoff to resume from"
+touch -d '2 minutes ago' "$MAN_TP"
+
+cat >"$STUB_SCRATCH/claude" <<STUB
+#!/usr/bin/env bash
+cat >/dev/null || true
+for a in "\$@"; do printf '%s\n' "\$a"; done >> '$MAN_ARGV'
+printf 'ok\n'
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+HOME="$MAN_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
+  || fail "24c: idle-handoff.sh rc!=0"
+sc_settle_fork "$MAN_ARGV" fork
+[[ -s "$MAN_ARGV" ]] \
+  || fail "24c: no fork from a manual request at 9% fill — the threshold gate is still being applied to a request that never claimed a crossing (log: $(tail -3 "$REFLECT_ROOT/idle-handoff-logs/handoff.log" 2>/dev/null))"
+grep -qF "$MAN_TEXT" "$MAN_ARGV" \
+  || fail "24c: the fork spawned but the operator's instructions never reached its prompt"
+grep -q 'operator instructions' "$MAN_ARGV" \
+  || fail "24c: operator text is in the prompt but not inside its own fenced block, so the fork cannot tell it from summarised transcript data"
+info "manual request honoured at 9% fill; operator instructions fenced and delivered"
+
+# Restore canonical stub.
+cat >"$STUB_SCRATCH/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null || true
+cat <<'JSON'
+{"type":"result","result":"{\"patterns\":[\"stubbed pattern\"],\"discoveries\":[],\"turning_points\":[],\"digressions\":[],\"obstacles_to_autonomy\":[]}","usage":{"cache_read_input_tokens":100,"cache_creation_input_tokens":10,"input_tokens":5,"output_tokens":50}}
+JSON
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+# ============================================================================
 # TEST 25: the fork resumes from the OUT-OF-REPO handoff, or not at all
 # ============================================================================
 # The wrong-work path this closes: an unattended opus-5, launched with

@@ -365,7 +365,94 @@ def main() -> int:
     return 0
 
 
+def manual(instructions: str) -> int:
+    """`--manual [instructions]` — an explicit human handoff, via /self-compact.
+
+    This is a SECOND ENTRY POINT, not a switch on the first. Nothing it does
+    changes how the Stop-hook path behaves, and no configuration selects between
+    them: the hook fires on a measured crossing, a person runs this by typing.
+
+    Two gates the automatic path applies are deliberately absent here, because
+    both exist to police a CLAIM that a manual request does not make:
+
+      * the >= THRESHOLD test. The marker's authority in the automatic path is
+        "this session measured above the threshold", which is re-measured
+        downstream. A human asking to hand off asserts nothing about occupancy,
+        and "you are only at 12%" is not a reason to refuse them.
+      * MAX_FIRES_PER_SESSION. That cap bounds an automatic path that could
+        otherwise re-fire unattended. A person typing the command is the bound.
+        Real spend is still bounded downstream where it is actually incurred:
+        3 forks per run and 5 per cwd per 24h in idle-handoff.
+
+    Unlike the hook, this writes to stdout and returns a non-zero status on
+    failure — it is run by a person who needs to know it did not work.
+    """
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if not SID_RE.match(sid):
+        print("self-compact: CLAUDE_CODE_SESSION_ID is unset or malformed; "
+              "cannot identify this session.", file=sys.stderr)
+        return 2
+
+    cwd = os.getcwd()
+    if not os.path.isdir(cwd):
+        print(f"self-compact: cwd {cwd!r} is not a directory.", file=sys.stderr)
+        return 2
+
+    # Resolve this session's transcript by sid rather than by "newest file",
+    # so a second session in the same project cannot be handed off by mistake.
+    matches = sorted((claude_dir() / "projects").glob(f"*/{sid}.jsonl"))
+    if not matches:
+        print(f"self-compact: no transcript found for session {sid}.", file=sys.stderr)
+        return 2
+    transcript = str(matches[0])
+
+    now = int(time.time())
+    state = load_state(sid)
+    state["manual_requests"] = state.get("manual_requests", 0) + 1
+    state["last_manual_at"] = now
+    write_json_atomic(state_dir() / f"{sid}.state.json", state)
+
+    occ = context_usage.occupancy(transcript)
+    request = {
+        "session_id": sid,
+        "cwd": cwd,
+        "transcript_path": transcript,
+        "manual": True,
+        "instructions": instructions,
+        "requested_at_epoch": now,
+        "requested_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+    }
+    if occ is not None:
+        request.update({"tokens": occ.total_tokens, "window": occ.window,
+                        "fill_pct": occ.fill_pct, "model": occ.model})
+
+    marker_path = state_dir() / f"{sid}.request.json"
+    if not write_json_atomic(marker_path, request):
+        print(f"self-compact: could not write the request marker at {marker_path}; "
+              "nothing will pick this handoff up.", file=sys.stderr)
+        return 1
+
+    reflect_sh = claude_dir() / "skills" / "session-reflect" / "reflect.sh"
+    if not reflect_sh.exists():
+        print(f"self-compact: {reflect_sh} is missing; no handoff can be written.",
+              file=sys.stderr)
+        return 1
+    result = spawn_mission_write(reflect_sh, sid, transcript, cwd)
+
+    fill = f"{occ.fill_pct:.1%}" if occ is not None else "unmeasured"
+    log(f"sid={sid} MANUAL request via /self-compact fill={fill} cwd={cwd} "
+        f"instructions={'yes' if instructions else 'no'} mission={result}")
+    print(f"self-compact: handoff requested for session {sid} (context {fill}).")
+    print(f"  cwd:      {cwd}")
+    print(f"  marker:   {marker_path}")
+    print(f"  mission:  {result}")
+    return 0
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--manual":
+        # Errors here are reported, not swallowed: a person is reading.
+        sys.exit(manual(" ".join(sys.argv[2:]).strip()))
     # A Stop hook that exits non-zero BLOCKS the stop and feeds stderr back to
     # the model. Nothing in here is worth doing that for.
     try:
