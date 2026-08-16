@@ -43,7 +43,9 @@
 #  15. ## Next non-empty and not "(none)" / "- (none)"
 #  16. staleness gate: DENY (skip) when uncheckable; non-git cwd = skip
 #  17. RE-scan live cwds; abort spawn if any claude proc entered this cwd
-#  18. spawn as transient user service (systemd-run) so fork outlives oneshot
+#  18. the fork's authority is restrictable AND its settings file was written;
+#      neither is optional — see "THE FORK'S AUTHORITY" below. Fails CLOSED.
+#  19. spawn as transient user service (systemd-run) so fork outlives oneshot
 #
 # Stop mechanisms (in order of blast radius):
 #   pkill -f idle-handoff.sh                            # running instance
@@ -682,6 +684,199 @@ mission_resolve_ours() {
   return 2
 }
 
+# ============================================================================
+# THE FORK'S AUTHORITY — stated explicitly, never inherited
+# ============================================================================
+# `--add-dir` ADDS to the ambient permission set; it does not restrict it. So an
+# unattended fork launched with `--permission-mode acceptEdits --add-dir <handoff>`
+# and nothing else inherits the INTERACTIVE USER'S entire permission surface from
+# ~/.claude/settings.json. Measured on this host on 2026-08-16 with exactly the argv
+# this script used to emit (claude 2.1.222, one real `-p` run):
+#   * read /etc/nixos/flake.nix                  -> ALLOWED (ambient
+#     permissions.additionalDirectories has ten entries, incl. ~/Repos, ~/worktrees,
+#     ~/.claude/skills, /etc/nixos, /nix/store, /tmp)
+#   * `id -u` via mcp__safe-bash__exec           -> ALLOWED, returned 1000
+#     (permissions.allow carries `mcp__safe-bash__*`: every shell command,
+#     pre-approved, no prompt)
+#   * MCP tools present: safe-bash, research-agent, aggregator, gdocs-review, and
+#     the connected Google Drive / Calendar / Gmail servers -> egress
+# That is pre-approved arbitrary command execution and data egress on a process whose
+# `## Next` list a model wrote out of a transcript that may contain injected text.
+# None of it is in the grant this script means to hand over. The exposure PREDATES
+# the self-compact work — the idle path already forked with acceptEdits — but the
+# context trigger fires on window crossings instead of 45-minute idles, so the
+# frequency changed and the leaf grant (R1) was measuring the wrong boundary all
+# along: the write grant was narrow while the ambient one was the whole machine.
+#
+# THE FLAGS, AND WHAT EACH IS LOAD-BEARING FOR. Names read out of `claude --help` on
+# the installed 2.1.222 binary, not assumed; each isolated by a real `-p` run that
+# tried to cross the line (2026-08-16):
+#
+#   --setting-sources ''  Load NONE of the user/project/local settings sources. THE
+#                         ONLY FLAG HERE THAT RESTRICTS ANYTHING. With it, reading
+#                         /etc/nixos/flake.nix is refused; without it, allowed.
+#                         `--settings` is NOT a substitute: it is documented as
+#                         "additional settings" and it MERGES — with `--settings` and
+#                         no `--setting-sources`, /etc/nixos/flake.nix still read
+#                         fine, so a fork that looked restricted was not. It also
+#                         excludes the PROJECT's own .claude/settings.json, which is
+#                         repo content and the last thing that should govern an
+#                         unattended fork resuming an unauthenticated handoff.
+#   --settings <file>     The explicit minimal permission object (write_fork_settings
+#                         below). Deliberately overlapping with the defaults: it is
+#                         the one auditable artifact that states what the fork may
+#                         reach, and its `deny` list closes the dangerous tool
+#                         classes by a second, independent mechanism.
+#   --strict-mcp-config   No MCP servers loaded, so no mcp__ tools exist. LOAD-BEARING
+#                         and NOT implied by --setting-sources: verified that with
+#                         `--setting-sources ''` ALONE the account-connected servers
+#                         (Google Calendar/Drive/Gmail) were still loaded and their
+#                         tools listed. With this flag and no --mcp-config the fork
+#                         reports it has no mcp__ tools at all.
+#   --tools <list>        Removes the shell STRUCTURALLY instead of gating it.
+#                         LOAD-BEARING: with the three flags above but no --tools,
+#                         `id -u` still ran and returned 1000. A reachable shell makes
+#                         the writable set the whole filesystem, and whether the CLI's
+#                         Bash sandbox contains it is an implementation detail this
+#                         repo cannot pin. NOTE: an unknown tool NAME in this list is
+#                         SILENTLY IGNORED (verified), which is exactly why
+#                         permissions.deny repeats the same closure by name.
+#   --add-dir <dir>       The handoff LEAF, so acceptEdits covers the write-back the
+#                         prompt asks for. Kept as well as additionalDirectories in
+#                         the settings file: `-p` mode silently ignores a settings
+#                         file that fails validation, and losing the grant silently
+#                         would make the write-back fail instead of the fork.
+#   --                    MANDATORY, and a real bug fixed here. `--add-dir` is
+#                         VARIADIC in this CLI (`--add-dir <directories...>`), so
+#                         `--add-dir D "$prompt"` consumed the PROMPT as a second
+#                         directory and claude exited with "Input must be provided
+#                         either through stdin or as a prompt argument when using
+#                         --print". Reproduced directly against 2.1.222: every fork
+#                         on this branch was dead on arrival, and a stub that ignores
+#                         argv cannot see it. `--` terminates the variadic list.
+#
+# WHAT THE FORK CAN REACH AFTERWARDS (all verified by a real `-p` run):
+#   CAN     read/write/edit inside its own project cwd — the workspace, the work
+#   CAN     read/write/edit $REFLECT_ROOT/sessions/<sid>/handoff/, which holds
+#           mission.md and nothing else (R1)
+#   CANNOT  read anything else on disk: /etc/nixos, ~/.claude/settings.json and the
+#           other ambient additionalDirectories are all refused
+#   CANNOT  run a shell command by ANY route — no Bash tool, no mcp__safe-bash__*
+#   CANNOT  reach the network or any MCP server, so it cannot egress
+#   CANNOT  reach its own settings file, the fork ledger, or the request markers:
+#           all live under $IDLE_HANDOFF_STATE_DIR, outside both the workspace and
+#           the grant, so it cannot widen its own authority or re-arm itself
+#   CANNOT  touch mission.cwd / manifest.json / final.json / checkpoints/, so it
+#           cannot change which project any handoff belongs to (R1)
+#   CANNOT  rewrite ~/.claude/skills/** — i.e. it can no longer edit the instructions
+#           future sessions load, which the ambient allow list permitted
+#
+# ACCEPTED COSTS, stated rather than hidden:
+#   1. NO SHELL. The fork cannot run tests, git, or a build. It reads the handoff,
+#      edits files in the project, and updates the handoff — the job as scoped. A
+#      process executing instructions this system cannot authenticate does not get a
+#      shell to execute them with.
+#   2. NO HOOKS. Dropping the user settings source drops the hook config with it, so
+#      the fork does not run session-reflect. The resume chain does not depend on
+#      that: the prompt asks the fork to update the handoff in place, which bumps its
+#      mtime, and resolution is newest-handoff-per-cwd. It also stops the fork from
+#      minting an extra handoff per hop. REFLECT_ROOT is still passed through (see
+#      the --setenv list) because reflect.sh would otherwise resolve against the
+#      wrong root if anything ever does invoke it there.
+FORK_TOOLS="Read,Edit,Write,Glob,Grep,TodoWrite"
+FORK_DENY_TOOLS='["Bash","WebFetch","WebSearch","Task"]'
+FORK_REQUIRED_CLI_FLAGS=(--setting-sources --settings --strict-mcp-config --tools --add-dir)
+FORK_SETTINGS_DIR="$IDLE_HANDOFF_STATE_DIR/fork-settings"
+# A fork needs its settings file for its whole life, and a fork is bounded by
+# --max-turns, so a day is a generous upper bound on "still in use". A plain
+# constant, NOT `: "${X:=1440}"` — that form would be an env knob.
+FORK_SETTINGS_RETENTION_MINUTES=1440
+
+# Same unbounded-growth class R3 fixed for the diagnostic dirs: one file per fork,
+# nothing ever removing them.
+find "$FORK_SETTINGS_DIR" -maxdepth 1 -type f -name '*.settings.json' \
+     -mmin +"$FORK_SETTINGS_RETENTION_MINUTES" -delete 2>/dev/null || true
+
+# ---- Is the restriction applicable at all? FAILS CLOSED ---------------------
+# Memoised once per run. Read from `claude --help`, because the binary on PATH is the
+# only source of truth about which flags it honours. If ANY required flag is missing,
+# we do not fork: an unrestricted fork is worse than no resume, and "the fork would
+# have died on an unknown option anyway" is not an acceptable substitute for not
+# spawning it — that failure is asynchronous, lands in a per-run log nobody reads,
+# and one CLI change away from being a silently-unrestricted fork instead.
+FORK_RESTRICTION_CHECKED=0
+FORK_RESTRICTION_OK=0
+FORK_RESTRICTION_WHY=""
+fork_restriction_available() {
+  if (( FORK_RESTRICTION_CHECKED == 0 )); then
+    FORK_RESTRICTION_CHECKED=1
+    local help="" flag
+    local -a missing=()
+    if ! help="$(timeout 30 claude --help 2>/dev/null)"; then
+      FORK_RESTRICTION_WHY="'claude --help' did not run (binary missing, non-zero exit, or 30s timeout)"
+    elif [[ -z "$help" ]]; then
+      FORK_RESTRICTION_WHY="'claude --help' printed nothing"
+    else
+      for flag in "${FORK_REQUIRED_CLI_FLAGS[@]}"; do
+        case "$help" in
+          *"$flag"*) ;;
+          *) missing+=("$flag") ;;
+        esac
+      done
+      if (( ${#missing[@]} > 0 )); then
+        FORK_RESTRICTION_WHY="the installed claude CLI does not advertise ${missing[*]}"
+      else
+        FORK_RESTRICTION_OK=1
+      fi
+    fi
+  fi
+  (( FORK_RESTRICTION_OK == 1 ))
+}
+
+# ---- write_fork_settings <handoff_leaf_dir> <out_path> -----------------------
+# The fork's whole permission surface, in a file the fork cannot reach (it lives
+# under $IDLE_HANDOFF_STATE_DIR, which is neither the workspace nor the grant).
+#
+#   defaultMode acceptEdits    the fork is headless; a prompt is a denial
+#   allow []                   nothing is pre-approved. This is the field whose
+#                              inherited value carried `mcp__safe-bash__*`
+#   deny [tool names]          the same closure --tools performs, by a second
+#                              mechanism, because --tools silently ignores an
+#                              unknown name and a renamed tool would otherwise
+#                              hand the shell back. Verified independently: with
+#                              this deny list and NO --tools, `id -u` is refused
+#   additionalDirectories      the handoff leaf and nothing else
+#   hooks {}                   no hook config; see "NO HOOKS" above
+#
+# Returns non-zero on ANY failure, and the caller must then skip the fork.
+write_fork_settings() {
+  local grant="$1" out="$2" tmp
+  mkdir -p "$FORK_SETTINGS_DIR" 2>/dev/null || return 1
+  tmp="$(mktemp -p "$FORK_SETTINGS_DIR" ".settings-XXXXXX" 2>/dev/null)" || return 1
+  if ! jq -n --arg dir "$grant" --argjson deny "$FORK_DENY_TOOLS" \
+        '{permissions:{defaultMode:"acceptEdits",
+                       allow:[],
+                       deny:$deny,
+                       additionalDirectories:[$dir]},
+          hooks:{},
+          enableAllProjectMcpServers:false}' >"$tmp" 2>/dev/null; then
+    rm -f -- "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  # `-p` mode SILENTLY IGNORES a settings file that fails validation — its own
+  # --help says so. An unparseable file would therefore hand the fork the DEFAULTS
+  # with no warning anywhere, so prove it parses here and fail closed if it does not.
+  if ! jq -e 'has("permissions") and (.permissions.allow == [])' "$tmp" >/dev/null 2>&1; then
+    rm -f -- "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  if ! mv -f -- "$tmp" "$out" 2>/dev/null; then
+    rm -f -- "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  return 0
+}
+
 # ---- Main loop --------------------------------------------------------------
 count_seen=0
 count_wrote=0
@@ -703,9 +898,11 @@ count_mission_status_error=0
 count_context_trigger=0
 count_skipped_mission_not_ours=0
 count_mission_resolve_error=0
+count_skipped_fork_unrestrictable=0
 forks_this_run=0
 mission_resolve_rc=0
 CONTEXT_REQUEST_FILL=""
+stale_detail_this_iter=""
 
 for project_dir in "$PROJECTS_DIR"/*/; do
   [[ -d "$project_dir" ]] || continue
@@ -1088,6 +1285,14 @@ and report what you did. If you genuinely cannot proceed, write why under
 ## Blocked in ${mission_path} and exit — but "I should check with the
 user first" is not a blocker, it is a refusal to resume.
 
+YOUR AUTHORITY IS DELIBERATELY NARROW, so you know it up front rather than
+discovering it turn by turn. You have file tools only — ${FORK_TOOLS} — and
+you can reach exactly two places: this project directory, and the handoff's
+own directory. There is NO shell, no command execution, no network, and no
+MCP server. Do not plan around running tests, git or a build; you cannot.
+If the top ## Next item cannot be advanced by reading and editing files,
+say so under ## Blocked in ${mission_path} and move to the next item.
+
 For legitimate Next items you decide to execute:
 - Cap yourself at ${IDLE_HANDOFF_AUTOFORK_MAX_TURNS} turns total. If the
   top item is bigger, do what fits and stop cleanly (no premature
@@ -1149,6 +1354,29 @@ PROMPT
   # test asserts on the value that lands in argv.
   mission_dir_for_fork="$(dirname -- "$mission_path")"
   unit_name="claude-autofork-$(printf %s "$sid" | tr -c 'A-Za-z0-9._-' '_')-$(date +%s)"
+
+  # ---- No restriction, no fork. Both gates below FAIL CLOSED ---------------
+  # Falling back to an unrestricted fork is the failure this whole block exists to
+  # prevent: it would spawn an unattended acceptEdits process with pre-approved
+  # arbitrary shell execution across the user's repos, on instructions nothing
+  # authenticated. Skipping costs one deferred resume, and the reason is in the
+  # counters so a permanently-unrestrictable host is visible rather than quiet.
+  if ! fork_restriction_available; then
+    count_skipped_fork_unrestrictable=$((count_skipped_fork_unrestrictable + 1))
+    m="ERROR sid=$sid cwd=$candidate_cwd: NOT forking — the fork's authority cannot be restricted: $FORK_RESTRICTION_WHY. An unrestricted fork inherits the interactive user's whole permission surface (additionalDirectories + allow, which includes pre-approved shell via mcp__safe-bash__*), so this fails closed instead."
+    log "$m"
+    printf 'idle-handoff: %s\n' "$m" >&2   # systemd journal sees it
+    continue
+  fi
+  fork_settings="$FORK_SETTINGS_DIR/${unit_name}.settings.json"
+  if ! write_fork_settings "$mission_dir_for_fork" "$fork_settings"; then
+    count_skipped_fork_unrestrictable=$((count_skipped_fork_unrestrictable + 1))
+    m="ERROR sid=$sid cwd=$candidate_cwd: NOT forking — could not write the fork's settings file at $fork_settings (dir unwritable, mktemp/jq failed, or the result did not validate). Failing closed rather than spawning with ambient authority."
+    log "$m"
+    printf 'idle-handoff: %s\n' "$m" >&2
+    continue
+  fi
+
   can_systemd_run=0
   if command -v systemd-run >/dev/null 2>&1 \
      && systemctl --user is-active default.target >/dev/null 2>&1; then
@@ -1164,12 +1392,15 @@ PROMPT
     # one; PATH lets claude find its own binaries; HOME lets it read
     # ~/.claude configuration.
     #
-    # REFLECT_ROOT is in this list and must stay: the fork runs the same hooks we
-    # do, so its OWN handoff writes land under whatever root it inherits. Under a
-    # custom root the fork used to fall back to the DEFAULT ~/.claude/reflections,
-    # so the handoff it wrote for its successor was invisible to the next tick's
-    # resolution — the feature quietly stopped resuming after one hop, with every
-    # component reporting success.
+    # REFLECT_ROOT is in this list and must stay. It used to be load-bearing because
+    # the fork ran our hooks and its own handoff writes had to land under the same
+    # root (under a custom root they fell back to the DEFAULT ~/.claude/reflections,
+    # invisible to the next tick's resolution — silent feature death after one hop
+    # with every component reporting success). The fork no longer loads the hook
+    # config at all (`--setting-sources ''`), so the write-back is the prompt-driven
+    # edit of the handoff it was given. The passthrough stays anyway: any reflect.sh
+    # invoked in that process must resolve against THIS root, never re-derive one
+    # from $HOME, and a root mismatch is exactly the failure that hid for a week.
     setenv_args=()
     for var in HOME PATH USER LANG LC_ALL LC_CTYPE REFLECT_ROOT \
                ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN \
@@ -1186,8 +1417,12 @@ PROMPT
         --model "$IDLE_HANDOFF_AUTOFORK_MODEL" \
         --max-turns "$IDLE_HANDOFF_AUTOFORK_MAX_TURNS" \
         --permission-mode acceptEdits \
+        --setting-sources '' \
+        --settings "$fork_settings" \
+        --strict-mcp-config \
+        --tools "$FORK_TOOLS" \
         --add-dir "$mission_dir_for_fork" \
-        "$autofork_prompt" \
+        -- "$autofork_prompt" \
       >>"$autofork_log" 2>&1
     spawn_rc=$?
     if [[ "$spawn_rc" -ne 0 ]]; then
@@ -1206,8 +1441,12 @@ PROMPT
         --model "$IDLE_HANDOFF_AUTOFORK_MODEL" \
         --max-turns "$IDLE_HANDOFF_AUTOFORK_MAX_TURNS" \
         --permission-mode acceptEdits \
+        --setting-sources '' \
+        --settings "$fork_settings" \
+        --strict-mcp-config \
+        --tools "$FORK_TOOLS" \
         --add-dir "$mission_dir_for_fork" \
-        "$autofork_prompt" \
+        -- "$autofork_prompt" \
         >>"$autofork_log" 2>&1 8>&- &
     ) </dev/null
   fi
@@ -1223,4 +1462,4 @@ PROMPT
   count_forked=$((count_forked + 1))
 done
 
-log "seen=$count_seen wrote=$count_wrote forked=$count_forked context_triggered=$count_context_trigger self_compact=on(>=$SELF_COMPACT_THRESHOLD) skipped(live=$count_skipped_live live_rescan=$count_skipped_live_rescan sdk-cli_or_unknown=$count_skipped_sdk_cli short=$count_skipped_short backoff=$count_skipped_backoff fresh=$count_skipped_fresh_mission no_cwd=$count_skipped_no_cwd stale=$count_skipped_stale observer=$count_skipped_observer no_next=$count_skipped_no_next ralph=$count_skipped_ralph git_stale=$count_skipped_git_stale fork_budget=$count_skipped_fork_budget mission_err=$count_mission_status_error mission_not_ours=$count_skipped_mission_not_ours mission_resolve_err=$count_mission_resolve_error)"
+log "seen=$count_seen wrote=$count_wrote forked=$count_forked context_triggered=$count_context_trigger self_compact=on(>=$SELF_COMPACT_THRESHOLD) skipped(live=$count_skipped_live live_rescan=$count_skipped_live_rescan sdk-cli_or_unknown=$count_skipped_sdk_cli short=$count_skipped_short backoff=$count_skipped_backoff fresh=$count_skipped_fresh_mission no_cwd=$count_skipped_no_cwd stale=$count_skipped_stale observer=$count_skipped_observer no_next=$count_skipped_no_next ralph=$count_skipped_ralph git_stale=$count_skipped_git_stale fork_budget=$count_skipped_fork_budget mission_err=$count_mission_status_error mission_not_ours=$count_skipped_mission_not_ours mission_resolve_err=$count_mission_resolve_error fork_unrestrictable=$count_skipped_fork_unrestrictable)"
