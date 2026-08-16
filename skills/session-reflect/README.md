@@ -524,9 +524,32 @@ only configuration that matters.
 | a live claude process in that cwd | abort, rescanned pre-spawn | `is_live_project` |
 | an armed ralph loop in that cwd | skip | `.claude/ralph-loop.local.md` |
 | no handoff of ours resolves | skip | `mission_resolve_ours` |
+| the workspace overlaps the control plane | skip, loudly, counted | `candidate_cwd_is_control_plane` |
+| a cwd that cannot round-trip the ledger (control chars) | skip, loudly | cwd extraction |
 | the fork's authority cannot be restricted | skip, loudly, counted | `fork_restriction_available` / `write_fork_settings` |
+| `permissions.deny` not proven enforced by this CLI build | skip, loudly, counted | `fork_deny_enforced` (real two-run probe, cached per `claude --version`) |
 | what the fork may reach at all | project cwd + handoff leaf; no shell, no MCP, no network | "What the resume fork is allowed to reach" above |
 | kill switch, if one is ever needed | `systemctl --user disable --now claude-idle-handoff.timer` | the deployed timer |
+
+**The workspace and the control plane are disjoint, by construction.** A candidate cwd
+that IS, contains, or sits inside `$REFLECT_ROOT`, either idle-handoff state dir, the
+generated fork-settings dir, the self-compact state dir, or `~/.claude` is refused
+outright — not written to, not forked into, and counted as `control_plane_cwd` in the
+run summary. `~/.claude` is a git repo that gets worked in, so this is an ordinary
+candidate rather than an exotic one, and an `acceptEdits` fork there could rewrite the
+permission object the *next* fork is spawned with or the hooks the interactive session
+loads. Comparison is on `realpath`'d paths, so a symlink does not walk through it.
+
+**`permissions.deny` is measured, not assumed.** It is the rail that actually contains
+the fork: `--tools` silently ignores an unknown tool name, so a renamed or split `Bash`
+would leave `deny` as the only closure. Before forking on a CLI build it has not seen,
+idle-handoff runs the real binary twice with a generated settings file — once with the
+tools denied (the sentinel must NOT appear) and once with `deny: []` (it must) — and
+refuses to fork on anything short of `enforced`. The verdict is cached against
+`claude --version`, so the two haiku calls (~$0.06) are paid once per upgrade. An
+unidentifiable build fails closed. The human-runnable form of the same probe is in
+`tests/live.sh`; the offline suite's stub CLI emulates the contract so the fail-closed
+paths are testable, and is not evidence about the installed binary.
 
 The trigger never gated autofork itself, and still does not: a session idle for
 `IDLE_HANDOFF_MIN_SECONDS` (45 min) has been resumed by an unattended
