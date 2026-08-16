@@ -54,10 +54,13 @@ execute Next items when State on disk contradicts the current working
 tree. A stale/wrong State section causes safe skips (loss of work
 opportunity); a stale/wrong Done section causes double-execution (loss
 of correctness). Correctness beats coverage — under-report if unsure.
-The outer system also stamps `<!-- written-against: sha=<X> ts=<N> -->`
-at the top of tasks/mission.md; do not remove or modify it. It is what
-the auto-fork gate uses to detect whether the world has moved since this
-mission was written.
+The outer system also stamps
+`<!-- written-against: sha=<X> ts=<N> sid=<SID> -->` at the top of the
+handoff it writes; do not remove or modify it. It records which commit the
+handoff was written against, for a human reading it later, and it marks the
+file as machine-owned. It is NOT a staleness signal — no consumer reads it
+to decide whether the world moved; the auto-fork gate decides that from git
+itself (HEAD and file mtimes against the transcript).
 
 ## Rules
 

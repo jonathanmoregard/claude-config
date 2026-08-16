@@ -1303,9 +1303,11 @@ For legitimate Next items you decide to execute:
   where you left off (move completed items from Next to Done, keep
   remaining Next items, add any Blocked/Open questions you found). Write
   to THAT path, not to any tasks/mission*.md in the project.
-  Preserve the leading \`<!-- written-against: sha=... ts=... -->\` line
-  if present; do not rewrite it — the outer system uses it for staleness
-  detection, and it is what marks the file as machine-owned.
+  Preserve the leading \`<!-- written-against: sha=... ts=... sid=... -->\`
+  line if present; do not rewrite it. It records which commit the handoff was
+  written against, for a human reading it later, and it marks the file as
+  machine-owned. It is NOT a staleness signal: nothing reads it to decide
+  whether the world moved — the outer system decides that from git itself.
 - If ## State on disk in the mission contradicts what you observe (files
   claimed "clean" are dirty, HEAD has moved, etc.), STOP without
   executing Next items and update ${mission_path} to current state. A
