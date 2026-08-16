@@ -3056,6 +3056,142 @@ STUB
 chmod +x "$STUB_SCRATCH/claude"
 
 # ============================================================================
+# TEST 24b: the live-cwd guard must not refuse the CONTEXT trigger
+# ============================================================================
+# The defect this closes: the live-cwd collision abort was inherited from the
+# idle trigger, where "someone is sitting in this tree" is a good reason not to
+# fork into it. But the context trigger runs under the opposite condition BY
+# CONSTRUCTION — a session that just crossed the threshold is necessarily alive
+# in that cwd — so the inherited rail refused every context-triggered fork,
+# three checks after the idle floor had been widened for it. The feature could
+# not do the one thing it exists for, and the log said only `live=`.
+#
+# Both halves are asserted, because the fix is a RELAXATION of a safety rail and
+# the thing that must not happen is it relaxing for the idle path too.
+test_begin "TEST 24b: a live pane in the candidate cwd blocks an idle fork, not a context fork"
+
+B7L_LOG="$REFLECT_ROOT/idle-handoff-logs/handoff.log"
+
+# A live claude-named process sitting IN a candidate cwd — what the originating
+# session looks like to scan_live_cwds. `bash` is the holder because coreutils is
+# a multi-call binary that exits with "unknown program 'claude'" when argv[0] is
+# renamed, and `bash -c 'sleep N'` alone exec-optimises into sleep and loses the
+# name. Both of those silently produced a holder that was not there at all.
+#
+# Two fixture hazards, both hit on the first run of this test:
+#   * `( ... ) &` inside `$( ... )` keeps the command-substitution pipe open for
+#     the background job's whole lifetime, so the caller blocks until the holder
+#     EXITS — by which point there is no live pane left to test against. Hence
+#     the explicit >/dev/null 2>&1 on the subshell.
+#   * the holder inherits REFLECT_ROOT, and the suite's quiescence rail treats
+#     any process whose environ names this run's REFLECT_ROOT as an outstanding
+#     spawned worker. It would never settle. The holder is a fixture, not a
+#     worker, so it is unset before exec.
+b7l_hold() {
+  ( cd "$1" && unset REFLECT_ROOT && exec -a claude bash -c 'sleep 120; true' ) >/dev/null 2>&1 &
+  local pid=$!
+  local i
+  for (( i = 0; i < 40; i++ )); do
+    [[ "$(readlink "/proc/$pid/cwd" 2>/dev/null)" == "$1" ]] \
+      && [[ "$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | head -1)" == "claude" ]] \
+      && { printf '%s' "$pid"; return 0; }
+    sleep 0.1
+  done
+  return 1
+}
+
+# ---- Half 1: context trigger + live pane -> MUST fork ----
+B7L_H="$(sc_home)"
+B7L_ARGV="$B7L_H/argv.txt"
+B7L_CWD="$(mktemp -d -t reflect-b7live-XXXXXX)"
+assert_isolated_cwd "$B7L_CWD"
+mk_candidate_repo "$B7L_CWD" || fail "24b: could not build candidate repo"
+B7L_SID="test-sid-b7-live"
+B7L_PROJ="$B7L_H/.claude/projects/-tmp-b7live"
+mkdir -p "$B7L_PROJ"
+B7L_TP="$B7L_PROJ/$B7L_SID.jsonl"
+mk_context_transcript "$B7L_TP" "claude-opus-5" 330000 "$B7L_CWD" 25
+
+counting_stub "$B7L_H/calls" "$SC_MISSION_FILE"
+sc_fire "$B7L_H" "$B7L_SID" "$B7L_CWD" "$B7L_TP" >/dev/null || fail "24b: Stop-hook fire rc!=0"
+sc_wait_mission "$B7L_CWD" "$B7L_SID" || fail "24b: Stop hook produced no handoff to resume from"
+touch -d '2 minutes ago' "$B7L_TP"
+
+cat >"$STUB_SCRATCH/claude" <<STUB
+#!/usr/bin/env bash
+cat >/dev/null || true
+for a in "\$@"; do printf '%s\n' "\$a"; done >> '$B7L_ARGV'
+printf 'ok\n'
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+B7L_HOLDER="$(b7l_hold "$B7L_CWD")" \
+  || fail "24b: could not put a live claude-named process in $B7L_CWD, so the guard is not under test"
+info "holder pid=$B7L_HOLDER argv0=claude cwd=$B7L_CWD"
+
+HOME="$B7L_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
+  || { kill "$B7L_HOLDER" 2>/dev/null; fail "24b: idle-handoff.sh rc!=0"; }
+sc_settle_fork "$B7L_ARGV" fork
+if [[ ! -s "$B7L_ARGV" ]]; then
+  kill "$B7L_HOLDER" 2>/dev/null
+  fail "24b: the context trigger did NOT fork with a live pane in the candidate cwd — the inherited live-cwd rail still refuses the trigger it was widened for (log: $(tail -3 "$B7L_LOG" 2>/dev/null))"
+fi
+grep -q 'live-cwd guard EXEMPTED' "$B7L_LOG" \
+  || { kill "$B7L_HOLDER" 2>/dev/null; fail "24b: forked, but the exemption was never logged — a relaxed safety rail must say so in the journal"; }
+kill "$B7L_HOLDER" 2>/dev/null
+info "context trigger forks through a live pane, and logs the exemption"
+
+# ---- Half 2: idle trigger + live pane -> MUST NOT fork ----
+# Same shape, same live pane, no self-compact request. The rail is still load
+# bearing here: this is the case it was actually designed for.
+B7I_H="$(sc_home)"
+B7I_ARGV="$B7I_H/argv.txt"
+B7I_CWD="$(mktemp -d -t reflect-b7idle-XXXXXX)"
+assert_isolated_cwd "$B7I_CWD"
+mk_candidate_repo "$B7I_CWD" || fail "24b: could not build idle candidate repo"
+B7I_SID="test-sid-b7-idle"
+B7I_PROJ="$B7I_H/.claude/projects/-tmp-b7idle"
+mkdir -p "$B7I_PROJ"
+B7I_TP="$B7I_PROJ/$B7I_SID.jsonl"
+mk_context_transcript "$B7I_TP" "claude-opus-5" 90000 "$B7I_CWD" 25
+mk_mission_handoff "$B7I_SID" "$B7I_CWD" "$(cat "$SC_MISSION_FILE")" >/dev/null
+mk_mission_copy "$B7I_CWD/tasks" "$B7I_SID" "$(cat "$SC_MISSION_FILE")" >/dev/null
+# Idle past the 45-min floor but inside the 24h ceiling, so only the live pane
+# can be what stops it.
+touch -d '60 minutes ago' "$B7I_TP"
+
+cat >"$STUB_SCRATCH/claude" <<STUB
+#!/usr/bin/env bash
+cat >/dev/null || true
+for a in "\$@"; do printf '%s\n' "\$a"; done >> '$B7I_ARGV'
+printf 'ok\n'
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+B7I_HOLDER="$(b7l_hold "$B7I_CWD")" \
+  || fail "24b: could not put a live claude-named process in $B7I_CWD"
+
+HOME="$B7I_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
+  || { kill "$B7I_HOLDER" 2>/dev/null; fail "24b: idle-handoff.sh rc!=0 on the idle half"; }
+sc_settle_fork "$B7I_ARGV" no-fork
+if [[ -s "$B7I_ARGV" ]]; then
+  kill "$B7I_HOLDER" 2>/dev/null
+  fail "24b: the IDLE path forked into a cwd with a live pane — the exemption leaked past the context trigger ($(cat "$B7I_ARGV"))"
+fi
+kill "$B7I_HOLDER" 2>/dev/null
+info "idle trigger still refuses a live cwd — the exemption is scoped to the context trigger"
+
+# Restore canonical stub.
+cat >"$STUB_SCRATCH/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null || true
+cat <<'JSON'
+{"type":"result","result":"{\"patterns\":[\"stubbed pattern\"],\"discoveries\":[],\"turning_points\":[],\"digressions\":[],\"obstacles_to_autonomy\":[]}","usage":{"cache_read_input_tokens":100,"cache_creation_input_tokens":10,"input_tokens":5,"output_tokens":50}}
+JSON
+STUB
+chmod +x "$STUB_SCRATCH/claude"
+
+# ============================================================================
 # TEST 25: the fork resumes from the OUT-OF-REPO handoff, or not at all
 # ============================================================================
 # The wrong-work path this closes: an unattended opus-5, launched with
