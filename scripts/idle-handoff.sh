@@ -1814,11 +1814,26 @@ PROMPT
   else
     log "WARN sid=$sid: systemd-run unavailable or bus down; falling back to setsid nohup (fork may not survive parent exit under systemd)"
     # Same ordering rule as the systemd branch: the subshell's status is checked
-    # before the budget is charged. It only proves the launch was attempted (the
-    # background job is `&`), but a missing binary or an unenterable cwd is
-    # synchronous and must not cost a budget slot and a marker.
+    # before the budget is charged, so a synchronous failure does not cost a
+    # budget slot and a consumed request marker.
+    #
+    # THE `&` MUST NOT COVER THE `cd`. It previously read
+    #   ( cd "$dir" && setsid nohup claude ... & ) || fallback_rc=$?
+    # where `&` binds to the whole `cd && setsid` AND-list, so the subshell
+    # forked and returned 0 IMMEDIATELY — `fallback_rc` could never be non-zero.
+    # An unenterable cwd or a missing binary then charged the budget and consumed
+    # the request marker with no process ever started: a silently lost resume,
+    # and the comment above it asserted the opposite. Found by cross-vendor
+    # review, Phase 2; reproduced (`( cd /nonexistent && echo x & )` yields 0,
+    # the same shape without `&` yields 1).
+    #
+    # Now the two synchronous preconditions exit the subshell with distinct
+    # non-zero statuses, and only the spawn itself is backgrounded. A failure
+    # inside setsid's own exec remains asynchronous and invisible here — that is
+    # what $autofork_log is for.
     fallback_rc=0
-    ( cd "$candidate_cwd" && \
+    ( cd "$candidate_cwd" 2>/dev/null || exit 66
+      command -v claude >/dev/null 2>&1 || exit 67
       setsid nohup claude -p \
         --model "$IDLE_HANDOFF_AUTOFORK_MODEL" \
         --max-turns "$IDLE_HANDOFF_AUTOFORK_MAX_TURNS" \
@@ -1830,6 +1845,7 @@ PROMPT
         --add-dir "$mission_dir_for_fork" \
         -- "$autofork_prompt" \
         >>"$autofork_log" 2>&1 8>&- &
+      exit 0
     ) </dev/null || fallback_rc=$?
     if (( fallback_rc != 0 )); then
       log "AUTOFORK setsid launch failed sid=$sid rc=$fallback_rc cwd=$candidate_cwd (see $autofork_log); budget NOT charged, request marker left in place for a later tick"
