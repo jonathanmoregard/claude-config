@@ -114,6 +114,10 @@ reflections/
 # Repo-autosync runtime state (per-repo cache, security alerts, logs)
 repo-autosync-data/
 
+# Ralph-loop state, one file per armed session id. Pure per-session runtime;
+# the gate scripts live in hooks/ + scripts/ and are tracked.
+ralph-loop/
+
 # Scheduled-task lockfile (ephemeral)
 scheduled_tasks.lock
 

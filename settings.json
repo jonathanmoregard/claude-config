@@ -298,6 +298,15 @@
             "statusMessage": "Checking for absolute claims..."
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/hooks/ralph-loop-stop.sh",
+            "statusMessage": "Checking Ralph loop gate..."
+          }
+        ]
       }
     ],
     "SubagentStop": [
@@ -389,7 +398,7 @@
     "mutation-testing@trailofbits": false,
     "nix-search@nix-search-marketplace": true,
     "nixos@kettleofskills": true,
-    "ralph-loop@claude-plugins-official": true,
+    "ralph-loop@claude-plugins-official": false,
     "recursive-self-improvement@jonathanmoregard": true,
     "sharp-edges@trailofbits": true,
     "skill-creator@claude-plugins-official": true,
