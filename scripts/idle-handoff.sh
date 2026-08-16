@@ -940,7 +940,7 @@ fork_restriction_available() {
     FORK_RESTRICTION_CHECKED=1
     local help="" flag
     local -a missing=()
-    if ! help="$(timeout 30 claude --help 2>/dev/null)"; then
+    if ! help="$(timeout 30 claude --help 2>/dev/null 8>&-)"; then
       FORK_RESTRICTION_WHY="'claude --help' did not run (binary missing, non-zero exit, or 30s timeout)"
     elif [[ -z "$help" ]]; then
       FORK_RESTRICTION_WHY="'claude --help' printed nothing"
@@ -1083,8 +1083,11 @@ user attached. Create the file $sentinel containing the single word probe.
 Use the Bash tool (printf probe > $sentinel) if you have it; if you do not have a
 Bash tool, use the Write tool instead. Use no other tool, and then stop. If you have
 neither tool, say so and stop — that is a valid outcome of this self-test."
+  # 60s, not 120: the real runs measure 4-8s, and this runs inside a oneshot whose
+  # TimeoutStartSec is 180 — two 120s probes behind one 90s mission write would be
+  # SIGTERMed mid-probe, which is why the cache record is written BEFORE the runs.
   ( cd "$dir" 2>/dev/null || exit 1
-    timeout 120 claude -p \
+    timeout 60 claude -p \
       --model haiku \
       --max-turns 3 \
       --permission-mode acceptEdits \
@@ -1092,7 +1095,12 @@ neither tool, say so and stop — that is a valid outcome of this self-test."
       --settings "$settings" \
       --strict-mcp-config \
       --add-dir "$dir" \
-      -- "$prompt" ) >"$dir/probe.log" 2>&1 || rc=$?
+      -- "$prompt" ) >"$dir/probe.log" 2>&1 8>&- || rc=$?
+  # `8>&-` closes the singleton flock fd in the child. Without it a probe that outlives
+  # this run — a hang, or a SIGTERM at TimeoutStartSec that kills the script but not its
+  # descendant — keeps holding the lock, and every later tick exits with "another handoff
+  # run in progress". The mission write and the autofork spawn already do this; found by
+  # TEST 45f, which kills a tick mid-probe and then expects the next one to run.
   local outcome="absent"
   if [[ -e "$sentinel" ]]; then
     outcome="created"
@@ -1111,7 +1119,7 @@ FORK_DENY_OK=0
 FORK_DENY_WHY=""
 _fork_deny_evaluate() {
   local ver key cache verdict detail deny_run control_run
-  ver="$(timeout 30 claude --version 2>/dev/null | head -1 | tr -c 'A-Za-z0-9._ ()-' '_')"
+  ver="$(timeout 30 claude --version 2>/dev/null 8>&- | head -1 | tr -c 'A-Za-z0-9._ ()-' '_')"
   if [[ -z "$ver" ]]; then
     FORK_DENY_WHY="'claude --version' did not answer, so the build is UNKNOWN; a verdict cannot be attributed to it and no cached one can be trusted"
     return 0
@@ -1136,6 +1144,18 @@ _fork_deny_evaluate() {
       return 0
     fi
   fi
+  # RECORD THE ATTEMPT BEFORE MAKING IT. This runs inside a oneshot with
+  # TimeoutStartSec=180, behind mission writes that can take 90s each, so the run can be
+  # SIGTERMed mid-probe. Without a record, the next tick five minutes later would pay for
+  # two more calls, and so would the one after that — an unbounded spend on a host where
+  # the probe never fits in the window. An `attempting` record is a non-`enforced`
+  # verdict, so it fails closed AND it is subject to the retry window: at most one probe
+  # attempt per FORK_DENY_PROBE_RETRY_MINUTES no matter how the previous one ended.
+  jq -n --arg ver "$ver" --argjson at "$now" \
+     '{verdict:"attempting",cli_version:$ver,checked_at_epoch:$at,
+       detail:"a probe was started and did not record a verdict -- most likely the tick was killed mid-probe (TimeoutStartSec); it will be retried after the retry window, and until then this fails closed"}' \
+     > "$cache" 2>/dev/null \
+    || log "WARN could not write the deny-probe attempt record at $cache; a killed probe would then be retried every tick"
   deny_run="$(_fork_deny_probe_run "$FORK_PROBE_DENY_TOOLS" deny)"
   control_run="$(_fork_deny_probe_run '[]' control)"
   if [[ "$deny_run" == "absent" && "$control_run" == "created" ]]; then

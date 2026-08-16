@@ -203,6 +203,7 @@ if (( probe == 1 )); then
   case "$DENY_MODE" in
     ignore_deny) denied=0 ;;   # a build that parses `deny` and does nothing with it
     never)       denied=1 ;;   # a model that declines even with everything allowed
+    hang)        sleep 20; exit 0 ;;  # a probe the caller will be killed in the middle of
   esac
   if (( denied == 0 )) && [[ -n "$grant" && -d "$grant" ]]; then
     printf 'probe\n' > "$grant/$SENTINEL_NAME"
@@ -4809,7 +4810,17 @@ if sc_forked "$T3_ARGV"; then
 fi
 grep -q 'verdict=inconclusive' <<<"$T3_TAIL" \
   || fail "45d: a control that never fired was not recorded as inconclusive (log: $T3_TAIL)"
-info "45d: a probe whose control never fires is inconclusive, and inconclusive does not fork"
+# ...and a NEGATIVE verdict must be cached too, or a host where the probe never
+# succeeds pays two model calls every 5 minutes forever. Same record is what bounds a
+# probe KILLED mid-run by the oneshot's TimeoutStartSec, which cannot be simulated here
+# but shares this mechanism exactly.
+[[ "$(t3_probe_calls)" == "2" ]] \
+  || fail "45d: the inconclusive probe made $(t3_probe_calls) calls in one tick; want 2"
+T3_TAIL="$(t3_tick no-fork)"
+if sc_forked "$T3_ARGV"; then fail "45d: an inconclusive verdict forked on the retry tick"; fi
+[[ "$(t3_probe_calls)" == "2" ]] \
+  || fail "45d: a negative verdict was NOT cached — the probe re-ran on the next tick ($(t3_probe_calls) calls total), so an unprovable host bills two calls every 5 minutes"
+info "45d: a probe whose control never fires is inconclusive, does not fork, and is not re-run every tick"
 
 # (e) An unknown build. A verdict cannot be attributed to it, so no cached verdict may
 #     be trusted either.
@@ -4824,6 +4835,60 @@ grep -q 'build is UNKNOWN' <<<"$T3_TAIL" \
 [[ "$(t3_probe_calls)" == "0" ]] \
   || fail "45e: the probe ran against an unidentifiable build, so the result could not be cached and every tick would pay"
 info "45e: an unknown CLI version fails closed, without paying for an unattributable probe"
+
+# (f) The probe KILLED mid-run. It executes inside a oneshot with TimeoutStartSec=180,
+#     behind mission writes that take up to 90s each, so this is the realistic way for a
+#     probe never to record a verdict — and without a record the next tick five minutes
+#     later pays for two more calls, and so does the one after that, forever.
+STUB_CLI_VERSION="9.9.9-t3-killed"; STUB_DENY_MODE="hang"; write_stub_help
+: > "$STUB_PROBE_LOG"
+: > "$T3_ARGV"
+touch -d '2 minutes ago' "$T3_TP"
+sc_plant_request "$T3_SID" "$T3_CWD" "$T3_TP"
+HOME="$T3_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
+  >/dev/null 2>&1 &
+T3_KILL_PID=$!
+for (( t3_i = 0; t3_i < 120; t3_i++ )); do [[ -s "$STUB_PROBE_LOG" ]] && break; sleep 0.25; done
+[[ -s "$STUB_PROBE_LOG" ]] \
+  || fail "45f: the probe never started, so killing the tick proves nothing"
+# Kill the whole PID TREE, because that is what the timeout does: systemd's default
+# KillMode=control-group SIGTERMs every process in the unit's cgroup. Signalling only the
+# script is not the same event — non-interactive bash defers a SIGTERM until the
+# foreground child finishes, so the tick would survive and keep running.
+t3_kill_tree() {
+  local pid="$1" kid
+  for kid in $(pgrep -P "$pid" 2>/dev/null || true); do t3_kill_tree "$kid"; done
+  kill -TERM "$pid" 2>/dev/null || true
+}
+t3_kill_tree "$T3_KILL_PID"
+wait "$T3_KILL_PID" 2>/dev/null || true
+# `wait` returns on the job shell, which can exit before the script it launched has
+# finished dying — so poll the singleton lock instead of assuming. In production the next
+# tick is five minutes later; here it is the next line, and a still-held lock would make
+# that tick exit as "another handoff run in progress" and prove nothing either way.
+for (( t3_i = 0; t3_i < 120; t3_i++ )); do
+  if ( flock -n 9 ) 9>>"$REFLECT_ROOT/idle-handoff.lock"; then break; fi
+  sleep 0.25
+done
+if ! ( flock -n 9 ) 9>>"$REFLECT_ROOT/idle-handoff.lock"; then
+  fail "45f: the killed tick still holds the singleton lock after 30s — a probe that outlives its run wedges every later tick (fd 8 not closed in the probe child?)"
+fi
+T3_ATTEMPT="$(grep -l 'attempting' "$T3_PROBE_DIR"/*.json 2>/dev/null | head -1 || true)"
+[[ -n "$T3_ATTEMPT" ]] \
+  || fail "45f: a probe killed mid-run left NO record, so the next tick — and every tick after it — pays for two more model calls"
+# The next tick, on the same build, with a CLI that would now pass: it must still refuse
+# (an unrecorded verdict is not a verdict) and must NOT re-probe inside the window.
+STUB_DENY_MODE="honest"; write_stub_help
+: > "$STUB_PROBE_LOG"
+T3_TAIL="$(t3_tick no-fork)"
+if sc_forked "$T3_ARGV"; then
+  fail "45f: a probe that never recorded a verdict was treated as enforcement"
+fi
+[[ "$(t3_probe_calls)" == "0" ]] \
+  || fail "45f: the killed probe was retried on the very next tick ($(t3_probe_calls) calls) — that is the unbounded spend the attempt record exists to stop"
+grep -q "cached verdict 'attempting'" <<<"$T3_TAIL" \
+  || fail "45f: the refusal does not say it is honouring an unfinished probe (log: $T3_TAIL)"
+info "45f: a probe killed mid-run records the attempt, fails closed, and is not retried until the window"
 
 # Restore the build the rest of the suite has a cached `enforced` verdict for.
 STUB_CLI_VERSION="2.1.222 (Claude Code stub)"; STUB_DENY_MODE="honest"; write_stub_help
