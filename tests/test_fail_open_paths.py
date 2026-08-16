@@ -7,6 +7,7 @@ still succeeded, and nothing reported that the ceiling had stopped applying.
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -19,6 +20,7 @@ from egress_guard.limiter import (
     CooldownActive,
     EgressGuard,
     PolicyError,
+    WaitTooLong,
 )
 
 
@@ -111,6 +113,59 @@ def test_policy_counts_are_validated(state_dir, policy_file, field, value):
 
 def test_require_declaration_must_be_boolean(state_dir, policy_file):
     policy = policy_file(defaults={"min_interval_s": 0.0, "require_declaration": "yes"})
+    with pytest.raises(PolicyError):
+        guard(state_dir, policy).acquire("host.test")
+
+
+def _poison_state(g, resource, **fields):
+    """Rewrite a resource's state file the way an older version or bad flush might."""
+    path = g.state_path(resource)
+    with open(path, "r", encoding="utf-8") as fh:
+        state = json.load(fh)
+    state.update(fields)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(state, fh)
+
+
+def test_nan_cooldown_in_state_still_refuses(state_dir, policy_file):
+    """State is untrusted input: NaN there would make the cooldown check False."""
+    policy = policy_file(defaults={"min_interval_s": 0.0})
+    g = guard(state_dir, policy)
+    g.record_block("host.test", reason="bot challenge", cooldown_s=3600)
+    _poison_state(g, "host.test", cooldown_until=float("nan"))
+
+    # A cooldown we cannot read is not an absent cooldown: falling back to 0.0
+    # would forget a recorded block and grant.
+    status = g.status("host.test")
+    assert not math.isnan(status["cooldown_until"])
+    with pytest.raises(CooldownActive):
+        g.acquire("host.test")
+
+
+def test_nan_event_cost_in_state_does_not_disable_the_ceiling(state_dir, policy_file):
+    policy = policy_file(defaults={"min_interval_s": 0.0, "max_cost": 1.0})
+    g = guard(state_dir, policy)
+    g.acquire("host.test", cost=0.5)
+    _poison_state(g, "host.test", events=[[g.status("host.test")["window_s"], float("nan")]])
+
+    with pytest.raises(BudgetExhausted):
+        g.acquire("host.test", cost=5.0)
+
+
+def test_nan_last_slot_in_state_does_not_grant_immediately(state_dir, policy_file):
+    """max(now, NaN + floor) == now would hand out a slot with no wait."""
+    policy = policy_file(defaults={"min_interval_s": 30.0, "max_wait_s": 1.0})
+    g = guard(state_dir, policy)
+    g.acquire("host.test")
+    _poison_state(g, "host.test", last_slot=float("nan"))
+
+    with pytest.raises(WaitTooLong):
+        g.acquire("host.test")
+
+
+@pytest.mark.parametrize("field", ["window_s", "block_cooldown_s"])
+def test_zero_disabling_policy_values_are_refused(state_dir, policy_file, field):
+    policy = policy_file(defaults={"min_interval_s": 0.0, field: 0})
     with pytest.raises(PolicyError):
         guard(state_dir, policy).acquire("host.test")
 

@@ -103,6 +103,10 @@ DEFAULT_POLICY: dict[str, Any] = {
 # years. Generous enough that a legitimately deep queue is never discarded.
 SANITY_HORIZON_S = 86400.0
 
+# How long an unreadable cooldown holds the resource closed. Matches the
+# retry-tomorrow default: a block we cannot verify has lapsed has not lapsed.
+CORRUPT_COOLDOWN_S = 86400.0
+
 _NUMERIC_FIELDS = (
     "min_interval_s",
     "window_s",
@@ -118,6 +122,10 @@ _NUMERIC_FIELDS = (
 _INTEGER_FIELDS = ("max_requests", "preflight_after_requests")
 
 _BOOLEAN_FIELDS = ("require_declaration",)
+
+# Zero is not "no limit" for these, it is a disabled limit that still reports
+# itself as configured.
+_POSITIVE_FIELDS = ("window_s", "block_cooldown_s")
 
 # Floor for the server's shutdown drain. The drain must outlast any parked
 # acquire, since a parked call has already debited its slot and budget event,
@@ -347,6 +355,17 @@ class EgressGuard:
                 raise PolicyError(
                     f"egress policy: {resource!r}.{field} must not be negative."
                 )
+        for field in _POSITIVE_FIELDS:
+            # Zero here reads as "configured" but switches the limit off:
+            # window_s=0 prunes every event, so request/cost/preflight ceilings
+            # never fire; block_cooldown_s=0 makes the default block path raise
+            # instead of recording pushback.
+            if merged[field] <= 0:
+                raise PolicyError(
+                    f"egress policy: {resource!r}.{field} must be greater than zero "
+                    f"(got {merged[field]!r}; zero silently disables the limit it "
+                    "appears to configure)."
+                )
         for field in _INTEGER_FIELDS:
             value = merged[field]
             if float(value) != int(value):
@@ -468,22 +487,44 @@ class EgressGuard:
         reason = raw.get("cooldown_reason")
         state["cooldown_reason"] = reason if isinstance(reason, str) else ""
 
+        cooldown_raw = raw.get("cooldown_until")
+        if cooldown_raw is None:
+            state["cooldown_until"] = 0.0
+        elif _is_finite_number(cooldown_raw):
+            state["cooldown_until"] = float(cooldown_raw)
+        else:
+            # A cooldown we cannot read is not an absent cooldown. Falling back
+            # to 0.0 would forget a recorded block and grant; we cannot prove it
+            # expired, so stay closed for the standard retry-tomorrow window.
+            state["cooldown_until"] = now + CORRUPT_COOLDOWN_S
+            state["cooldown_reason"] = (
+                str(raw.get("cooldown_reason") or "unspecified")
+                + " (cooldown timestamp unreadable; held closed)"
+            )
+
         last_slot = raw.get("last_slot")
-        if isinstance(last_slot, (int, float)) and not isinstance(last_slot, bool):
+        if _is_finite_number(last_slot):
             last_slot = float(last_slot)
             # A reservation past the horizon is corruption or a clock jump.
             # Collapse it to "now" — conservative (one more floor of wait)
             # without wedging the resource for years.
             state["last_slot"] = now if last_slot > now + SANITY_HORIZON_S else last_slot
-        else:
+        elif last_slot is None:
             state["last_slot"] = None
+        else:
+            # Junk, including NaN: a NaN here yields max(now, NaN + floor) == now,
+            # handing out an immediate slot with no wait. Assume a request just
+            # went out instead.
+            state["last_slot"] = now
 
         events: list[list[float]] = []
         for item in raw.get("events") or []:
+            # A non-finite cost poisons the running total and switches the cost
+            # ceiling off until it ages out of the window; drop it instead.
             if (
                 isinstance(item, (list, tuple))
                 and len(item) == 2
-                and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in item)
+                and all(_is_finite_number(x) for x in item)
             ):
                 ts = float(item[0])
                 if ts > now + SANITY_HORIZON_S:
@@ -847,9 +888,29 @@ def _finite(value: Any, name: str) -> float:
     return out
 
 
+def _is_finite_number(value: Any) -> bool:
+    """True for a real, finite number — bools and NaN/inf are not numbers here."""
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and not math.isnan(float(value))
+        and not math.isinf(float(value))
+    )
+
+
 def _as_float(value: Any, fallback: float) -> float:
+    """Coerce a value read from STATE, which is untrusted input.
+
+    State is shared across processes, survives crashes, and may have been
+    written by an older version. A NaN reaching a comparison disables that
+    comparison silently — `NaN > limit` is False — so non-finite values fall
+    back rather than propagate.
+    """
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return float(value)
+        out = float(value)
+        if math.isnan(out) or math.isinf(out):
+            return fallback
+        return out
     return fallback
 
 
