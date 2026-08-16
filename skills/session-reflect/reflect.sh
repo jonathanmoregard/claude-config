@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # reflect.sh — session-reflect hook dispatcher.
 #
-# Usage:  reflect.sh {precompact|sessionend|subagentstop}
+# Usage:  reflect.sh {precompact|sessionend|subagentstop|mission}
 # Stdin:  Claude Code hook payload JSON (session_id, transcript_path,
 #         hook_event_name, cwd; PreCompact also has trigger / custom_instructions;
 #         SubagentStop has stop_hook_active).
@@ -10,6 +10,9 @@
 #   precompact    -> synchronous, bounded (60s), writes numbered checkpoint
 #   sessionend    -> fires-and-forgets a detached worker, exits fast
 #   subagentstop  -> same as sessionend but tighter budget + parent-nesting
+#   mission       -> writes the authoritative handoff out of repo; synchronous for
+#                    idle-handoff.sh, detached with REFLECT_ASYNC=1 for the
+#                    2nd-compact pre-fire
 #
 # Env:
 #   REFLECT_MODEL    (default: haiku — alias resolves to latest Haiku tier)
@@ -118,7 +121,7 @@ if [[ "$ARG1" == "--help" || "$ARG1" == "-h" ]]; then
   cat <<EOF
 reflect.sh — session-reflect hook dispatcher
 
-Usage: reflect.sh {precompact|sessionend|subagentstop}
+Usage: reflect.sh {precompact|sessionend|subagentstop|mission}
        (reads Claude Code hook payload JSON from stdin)
 
 Env:

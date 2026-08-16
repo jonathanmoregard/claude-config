@@ -91,8 +91,17 @@ THRESHOLD = 0.30
 # session hovering at 30% could fire indefinitely. Three is enough for a long
 # session that legitimately crosses, sheds context, and crosses again.
 MAX_FIRES_PER_SESSION = 3
-# Same charset reflect.sh validates: these ids become path components.
-SID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+# Same rule reflect.sh validates, ALL of it: these ids become path components.
+#
+# The charset half was already here; the leading-dot rejection was not, so the
+# claimed parity was not real. lib.sh:is_valid_sid rejects a leading dot for two
+# reasons that both apply here: `.`, `..` and `...` are directory references that a
+# charset check happily passes (basename(".") == "."), and hidden names make state
+# files a human listing the dir will not see. `..` and `.hidden` therefore reached
+# `state_dir()/f"{sid}.state.json"` and minted `..state.json` / `.hidden.state.json`.
+# Contained — the paths stay inside the state dir either way — but a validator that
+# says it matches another one has to.
+SID_RE = re.compile(r"^(?!\.)[A-Za-z0-9._-]{1,128}$")
 # Retention for state/request records. ~590 sessions/week would otherwise
 # accumulate two files each, forever.
 STATE_RETENTION_DAYS = 30

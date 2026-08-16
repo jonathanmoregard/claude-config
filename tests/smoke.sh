@@ -3927,6 +3927,92 @@ grep -q 'REFLECT_ARTIFACT_RETENTION_DAYS' "$SKILL_DIR/README.md" \
 info "38c: retention is a hardcoded named constant, documented, with no env override"
 
 # ============================================================================
+# TEST 39: R4 — sid validation really is at parity, and the docs do not lie
+# ============================================================================
+echo "TEST 39: R4 — sid parity across bash and python; header, --help and docs current"
+
+# (a) self-compact-trigger.py's SID_RE claimed "same charset reflect.sh validates",
+#     but reflect.sh's is_valid_sid ALSO rejects a leading dot — for `.`, `..` and
+#     `...` (which the traversal check would pass, since basename('.') == '.') and
+#     for hidden names. So `..` and `.hidden` got through the python side and minted
+#     dot-named files under self-compact-state/. Contained, but not parity.
+R4_SIDS=( 'ok-sid-1' 'UPPER.and_stuff-9' '..' '.' '...' '.hidden' 'a.b.c'
+          'has space' 'has/slash' 'ends.' '-leading-dash' )
+for r4_sid in "${R4_SIDS[@]}"; do
+  r4_bash=0
+  bash -c 'source "$1"/lib.sh >/dev/null 2>&1; is_valid_sid "$2"' _ "$SKILL_DIR" "$r4_sid" \
+    || r4_bash=$?
+  # The python side is asked with SID_RE ALONE, which is what the trigger itself
+  # matches against. A leading-dot check bolted on next to the call site here would
+  # test the test, not the module.
+  r4_py_re=0
+  REFLECT_ROOT="$REFLECT_ROOT" python3 -c '
+import os, sys, importlib.util
+spec = importlib.util.spec_from_file_location("sct", os.path.join(os.environ["WORKTREE"], "self-compact-trigger.py"))
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+sys.exit(0 if m.SID_RE.match(sys.argv[1]) else 1)
+' "$r4_sid" || r4_py_re=$?
+  if (( r4_bash == 0 )); then
+    (( r4_py_re == 0 )) \
+      || fail "39a: sid '$r4_sid' is valid to bash is_valid_sid but rejected by SID_RE"
+  else
+    (( r4_py_re != 0 )) \
+      || fail "39a: sid '$r4_sid' is REJECTED by bash is_valid_sid but accepted by SID_RE — the claimed parity is not real"
+  fi
+done
+
+# Behavioural half: a dot-named sid must mint nothing under the state dir.
+R4_H="$(sc_home)"
+R4_CWD="$(mktemp -d -t reflect-r4cwd-XXXXXX)"
+assert_isolated_cwd "$R4_CWD"
+mk_context_transcript "$R4_H/t.jsonl" "claude-opus-5" 400000 "$R4_CWD"
+counting_stub "$R4_H/calls" "$SC_MISSION_FILE"
+R4_BEFORE="$(find "$SC_STATE_DIR" -maxdepth 1 -name '.*' 2>/dev/null | wc -l)"
+for r4_sid in '..' '.hidden' '.'; do
+  sc_fire "$R4_H" "$r4_sid" "$R4_CWD" "$R4_H/t.jsonl" >/dev/null \
+    || fail "39a: the trigger exited non-zero on sid '$r4_sid' (a Stop hook must not)"
+done
+sleep 0.5
+R4_AFTER="$(find "$SC_STATE_DIR" -maxdepth 1 -name '.*' 2>/dev/null | wc -l)"
+[[ "$R4_AFTER" == "$R4_BEFORE" ]] \
+  || fail "39a: a dot-named sid minted state files under $SC_STATE_DIR ($R4_BEFORE -> $R4_AFTER: $(find "$SC_STATE_DIR" -maxdepth 1 -name '.*'))"
+for r4_sid in '..' '.hidden' '.'; do
+  [[ ! -e "$SC_STATE_DIR/$r4_sid.state.json" ]] \
+    || fail "39a: '$r4_sid.state.json' was created"
+done
+info "39a: bash and python agree on every sid shape, leading dot included"
+
+# (b) context-baggage.py's docstring described the autonomous half as "a separate,
+#     independently switchable feature". The switch was deleted (USER DECISION
+#     2026-08-16). A doc that says a paid automatic path can be switched off is read
+#     by whoever is deciding whether it is safe to leave running.
+R4_BAGGAGE="$WORKTREE/context-baggage.py"
+[[ -f "$R4_BAGGAGE" ]] || fail "39b: $R4_BAGGAGE missing"
+if grep -qi 'switchable' "$R4_BAGGAGE"; then
+  fail "39b: context-baggage.py still calls the autonomous half switchable — that switch is deleted"
+fi
+grep -qiE 'no switch|unconditional' "$R4_BAGGAGE" \
+  || fail "39b: context-baggage.py does not state the live posture (that the autonomous half has no switch)"
+info "39b: the advisory half's docstring states the live posture of the autonomous one"
+
+# (c) `mission` is dispatchable, and has been since the handoff work landed, but the
+#     file header and the --help usage line still listed three modes. A usage string
+#     that omits a real mode is how a caller concludes it must reimplement one.
+R4_HELP="$(bash "$REFLECT_SH" --help)"
+grep -qE 'Usage:.*precompact\|sessionend\|subagentstop\|mission' <<<"$R4_HELP" \
+  || fail "39c: --help usage line does not list mission (got: $(grep -m1 Usage: <<<"$R4_HELP"))"
+grep -qE '^# Usage:.*precompact\|sessionend\|subagentstop\|mission' "$REFLECT_SH" \
+  || fail "39c: the file header usage line does not list mission ($(grep -m1 '^# Usage:' "$REFLECT_SH"))"
+# Every mode the dispatcher accepts must appear in the usage line, so this cannot
+# drift again silently.
+for r4_mode in precompact sessionend subagentstop mission; do
+  grep -qE "Usage:.*$r4_mode" <<<"$R4_HELP" \
+    || fail "39c: dispatchable mode '$r4_mode' is missing from the --help usage line"
+done
+info "39c: all four dispatchable modes appear in the header and in --help"
+
+# ============================================================================
 # FINAL GUARD: prove the whole suite left the live repo alone.
 assert_repo_tasks_untouched "end of suite"
 info "live repo tasks/ untouched by the full suite"

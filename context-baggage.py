@@ -5,9 +5,15 @@ stale/off-topic content. Fires every MESSAGE_INTERVAL user messages once
 threshold is met.
 
 This is the ADVISORY half of the context lifecycle: it nudges a human at 70%.
-The autonomous half (`self-compact-trigger.py`, a Stop hook, default 30%) is a
-separate, independently switchable feature. Both read occupancy from
-`context_usage.py`, which owns the window-detection priority order:
+The autonomous half is `self-compact-trigger.py`, a Stop hook that fires at 30% and
+runs UNCONDITIONALLY — there is no switch and no config key for it (USER DECISION
+2026-08-16; `components.self_compact` and `SELF_COMPACT_CONFIG` were deleted). What
+bounds it is idle-handoff.sh's guard chain, not an on/off setting.
+
+The two halves are independent in the only sense that matters here: separate hooks,
+separate thresholds (0.70 here, 0.30 there), and neither reads the other's state.
+Both read occupancy from `context_usage.py`, which owns the window-detection
+priority order:
     1. CLAUDE_CONTEXT_MAX env var (explicit override, in tokens)
     2. `[1m]` marker in the model ID
     3. Model ID prefix — Opus/Sonnet 4.x run with 1M in this setup
