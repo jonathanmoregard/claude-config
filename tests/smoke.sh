@@ -130,7 +130,31 @@ cp "$STUB_SCRATCH/claude" "$STUBS_DIR/claude"
 # It lives in its own dir AHEAD of $STUB_SCRATCH on PATH and delegates everything
 # that is not --help, so the ~25 per-test stub bodies stay untouched — and a test
 # that wants to simulate an OLDER CLI just rewrites this one file (TEST 40a).
+#
+# It answers THREE questions the real binary is asked about itself, and delegates the
+# rest:
+#   --help      which flags this build advertises (TEST 40b simulates an older build)
+#   --version   the build string the deny probe's cache is keyed on (TEST 45)
+#   the deny    idle-handoff runs a REAL `claude -p` with a generated settings file and
+#   probe       asks it to create a sentinel by any means, to observe whether
+#               `permissions.deny` is honoured. A stub that ignored that request would
+#               make every fork test go red for the wrong reason, so this one EMULATES
+#               the contract — and, because it emulates it, a test can hand it a CLI
+#               that ignores `deny` (STUB_DENY_MODE=ignore_deny) or one that never
+#               writes at all (never), which is what makes the fail-closed paths
+#               observable. The real CLI's behaviour is established separately in
+#               tests/live.sh; nothing here is evidence about the installed binary.
 STUB_HELP_DIR="$(mktemp -d -t reflect-stubhelp-XXXXXX)"
+STUB_PROBE_LOG="$STUB_HELP_DIR/probe-calls.log"
+: > "$STUB_PROBE_LOG"
+STUB_CLI_VERSION="2.1.222 (Claude Code stub)"
+STUB_DENY_MODE="honest"     # honest | ignore_deny | never
+# Read out of the script under test, so the sentinel name cannot drift from the one the
+# probe prompt actually asks for.
+STUB_SENTINEL_NAME="$(grep -oP '^FORK_DENY_PROBE_SENTINEL="\K[^"]+' "$WORKTREE/scripts/idle-handoff.sh" || true)"
+[[ -n "$STUB_SENTINEL_NAME" ]] \
+  || fail "harness: no FORK_DENY_PROBE_SENTINEL constant in scripts/idle-handoff.sh to mirror"
+
 write_stub_help() {
   # $@ = the flags this fake CLI claims to support. No args = the real 2.1.222 set.
   local flags=("$@")
@@ -139,11 +163,54 @@ write_stub_help() {
                                    --max-turns --model --print)
   {
     printf '#!/usr/bin/env bash\n'
-    printf 'for a in "$@"; do\n'
-    printf '  if [[ "$a" == "--help" ]]; then\n'
-    printf '    printf -- %%s\\\\n'
-    printf " '%s'" "${flags[@]}"
-    printf '\n    exit 0\n  fi\ndone\n'
+    printf 'VERSION=%q\n' "$STUB_CLI_VERSION"
+    printf 'DENY_MODE=%q\n' "$STUB_DENY_MODE"
+    printf 'PROBE_LOG=%q\n' "$STUB_PROBE_LOG"
+    printf 'SENTINEL_NAME=%q\n' "$STUB_SENTINEL_NAME"
+    printf 'HELP_FLAGS=('
+    printf ' %q' "${flags[@]}"
+    printf ' )\n'
+    cat <<'STUBBODY'
+for a in "$@"; do
+  if [[ "$a" == "--help" ]]; then
+    printf '%s\n' "${HELP_FLAGS[@]}"
+    exit 0
+  fi
+  if [[ "$a" == "--version" ]]; then
+    [[ -n "$VERSION" ]] && printf '%s\n' "$VERSION"
+    exit 0
+  fi
+done
+# --- deny-probe emulation ----------------------------------------------------
+probe=0 settings="" grant="" prev=""
+for a in "$@"; do
+  case "$prev" in
+    --settings) settings="$a" ;;
+    --add-dir)  grant="$a" ;;
+  esac
+  case "$a" in *IDLE_HANDOFF_DENY_PROBE*) probe=1 ;; esac
+  prev="$a"
+done
+if (( probe == 1 )); then
+  [[ -n "$PROBE_LOG" ]] && \
+    printf 'probe mode=%s settings=%s grant=%s\n' "$DENY_MODE" "$settings" "$grant" >> "$PROBE_LOG"
+  denied=0
+  if [[ -n "$settings" ]] && jq -e \
+       '.permissions.deny | ((index("Bash") != null) or (index("Write") != null))' \
+       "$settings" >/dev/null 2>&1; then
+    denied=1
+  fi
+  case "$DENY_MODE" in
+    ignore_deny) denied=0 ;;   # a build that parses `deny` and does nothing with it
+    never)       denied=1 ;;   # a model that declines even with everything allowed
+  esac
+  if (( denied == 0 )) && [[ -n "$grant" && -d "$grant" ]]; then
+    printf 'probe\n' > "$grant/$SENTINEL_NAME"
+  fi
+  printf '{"type":"result","subtype":"success","is_error":false,"result":"probe done"}\n'
+  exit 0
+fi
+STUBBODY
     printf 'exec %q "$@"\n' "$STUB_SCRATCH/claude"
   } > "$STUB_HELP_DIR/claude"
   chmod +x "$STUB_HELP_DIR/claude"
@@ -4393,6 +4460,602 @@ fi
 grep -q 'RE-DERIVED, not reused' "$S4_IH" \
   || fail "42d: the post-write check no longer explains why the allowlist is re-derived"
 info "42: stamp-as-staleness corrected in all three doc sites, sid= shown, stale pathspec comment gone"
+
+# ============================================================================
+# TEST 43: T1 — the control plane is not a workspace
+# ============================================================================
+# The fork's workspace is `candidate_cwd`, read out of a transcript, and acceptEdits
+# makes all of it writable. Nothing rejected a cwd that IS or CONTAINS this system's own
+# state — and `~/.claude` is a live git repo on this host, so a session working there is
+# an ordinary candidate. That fork would get settings.json, hooks/, skills/, the fork
+# ledger and every stored handoff as editable material: an injected `## Next` could
+# rewrite the permission object the NEXT fork is spawned with, or the hooks the
+# interactive session loads. The round-4 containment is voided from the inside.
+echo "TEST 43: T1 — a candidate workspace overlapping the control plane refuses to fork"
+T1_LOG="$REFLECT_ROOT/idle-handoff-logs/handoff.log"
+T1_LEDGER="$REFLECT_ROOT/idle-handoff-state/fork-ledger.log"
+# The log exists by now in a full run (TEST 24 created it), but every helper below reads
+# `wc -l` on it under `set -e`, so make that independent of test ordering.
+mkdir -p "$(dirname "$T1_LOG")"
+touch "$T1_LOG"
+T1_ARGV=""
+T1_ERR=""
+T1_CWD_USED=""
+T1_TAIL=""
+
+# A spawned fork is a transient systemd unit: it takes a second or two to reach the argv
+# log. So "it forked" polls, and "it did not fork" still waits — a negative asserted with
+# no grace period is a race that passes for the wrong reason. One helper, so the two
+# cases cannot quietly be given different amounts of patience.
+sc_settle_fork() {
+  # $1=argv log  $2=expect: fork|no-fork
+  local argv="$1" expect="$2" i
+  if [[ "$expect" == "fork" ]]; then
+    for (( i = 0; i < 60; i++ )); do          # up to 15s
+      sc_forked "$argv" && return 0
+      sleep 0.25
+    done
+    return 0                                   # caller asserts and prints the log
+  fi
+  sleep 3                                      # generous next to the ~1s a real spawn takes
+  return 0
+}
+
+t1_case() {
+  # $1=sid  $2=cwd spec (@home_claude | @home | @symlink_home_claude | absolute path)
+  # $3=expect: fork|no-fork
+  # A fully fork-READY candidate in its own $HOME: handoff of ours, verified request,
+  # 2-minute-idle transcript, clean tree. Everything except a legitimate workspace, so a
+  # refusal below can only be the control-plane guard.
+  #
+  # Sets T1_ARGV / T1_ERR / T1_CWD_USED / T1_TAIL as globals and prints NOTHING: called
+  # in a `$(...)` substitution it would run in a subshell, the globals would be discarded
+  # and every `sc_forked "$T1_ARGV"` below would grep an empty filename — i.e. pass as
+  # "no fork" for free.
+  local sid="$1" spec="$2" expect="${3:-no-fork}" h proj lines gitify="" old
+  h="$(sc_home)"
+  case "$spec" in
+    @home_claude) T1_CWD_USED="$h/.claude"; gitify="$h/.claude" ;;
+    @home)        T1_CWD_USED="$h";         gitify="$h" ;;
+    @symlink_home_claude)
+      mkdir -p "$h/linkbase"
+      ln -sfn "$h/.claude" "$h/linkbase/live"
+      T1_CWD_USED="$h/linkbase/live"; gitify="$h/.claude" ;;
+    *)            T1_CWD_USED="$spec" ;;
+  esac
+  T1_ARGV="$h/argv.txt"
+  T1_ERR="$h/stderr.txt"
+  combo_stub "$T1_ARGV" "$SC_MISSION_FILE"
+  proj="$h/.claude/projects/-tmp-$sid"
+  mkdir -p "$proj"
+  mk_context_transcript "$proj/$sid.jsonl" "claude-opus-5" 330000 "$T1_CWD_USED" 25
+  mk_mission_handoff "$sid" "$T1_CWD_USED" "$(cat "$SC_MISSION_FILE")" >/dev/null
+  sc_plant_request "$sid" "$T1_CWD_USED" "$proj/$sid.jsonl"
+  # THE FIXTURE HAS TO BE FORK-READY, INCLUDING THE GIT GATE. `~/.claude` is a git repo
+  # on the real host — that is the whole reason this candidate is plausible — and if the
+  # test's copy were NOT one, the staleness DENY would refuse the fork on its own and
+  # removing the control-plane guard would still produce "no fork". The mutation would
+  # then pass and the test would be measuring nothing. So: commit the whole tree with an
+  # old date, age every file past the transcript, and leave the tree clean.
+  if [[ -n "$gitify" ]]; then
+    old="@$(date -d '30 minutes ago' +%s)"
+    ( cd "$gitify" && git init -q . && git config user.email t@example.com \
+      && git config user.name t && git add -A \
+      && GIT_AUTHOR_DATE="$old" GIT_COMMITTER_DATE="$old" git commit -qm baseline ) \
+      || fail "43: could not make $gitify a clean git repo"
+    find "$gitify" -exec touch -h -d '30 minutes ago' {} + 2>/dev/null || true
+  fi
+  touch -d '2 minutes ago' "$proj/$sid.jsonl"
+  lines="$(wc -l < "$T1_LOG")"
+  : > "$T1_ARGV"
+  : > "$T1_ERR"
+  HOME="$h" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
+    2>"$T1_ERR" || fail "43: idle-handoff.sh rc!=0 (sid=$sid)"
+  sc_settle_fork "$T1_ARGV" "$expect"
+  T1_TAIL="$(tail -n +$((lines + 1)) "$T1_LOG")"
+}
+
+t1_refused() {
+  # $1=label $2=sid $3=log tail $4=expected relation word
+  local label="$1" sid="$2" tail_out="$3" want="$4"
+  if sc_forked "$T1_ARGV"; then
+    fail "$label: a fork was spawned with the control plane as its workspace ($T1_CWD_USED): $(cat "$T1_ARGV")"
+  fi
+  grep -q 'REFUSING candidate workspace' <<<"$tail_out" \
+    || fail "$label: the refusal was silent — no log line (log: $tail_out)"
+  grep -q "$want" <<<"$tail_out" \
+    || fail "$label: the refusal does not say the workspace $want a control-plane path (log: $tail_out)"
+  grep -q 'control_plane_cwd=1' <<<"$tail_out" \
+    || fail "$label: the refusal is not in the counters (summary: $(grep -m1 'seen=' <<<"$tail_out"))"
+  grep -q 'REFUSING candidate workspace' "$T1_ERR" \
+    || fail "$label: the refusal never reached stderr, so the systemd journal shows a green unit (stderr: $(cat "$T1_ERR"))"
+  [[ -f "$SC_STATE_DIR/$sid.request.json" ]] \
+    || fail "$label: the request marker was consumed by a refusal — the next tick loses the resume for nothing"
+  if grep -q "writing mission.md for sid=$sid" <<<"$tail_out"; then
+    fail "$label: a mission write was spent on a workspace we refuse to fork into"
+  fi
+}
+
+# (a) CONTROL, first: without it every "no fork" below would pass for any reason.
+T1_OK_CWD="$(mktemp -d -t reflect-t1ok-XXXXXX)"
+assert_isolated_cwd "$T1_OK_CWD"
+mk_candidate_repo "$T1_OK_CWD" || fail "43a: could not build candidate repo"
+t1_case test-sid-t1-ordinary "$T1_OK_CWD" fork
+sc_forked "$T1_ARGV" \
+  || fail "43a: an ORDINARY project cwd did not fork, so the refusals below prove nothing (log: $(tail -4 <<<"$T1_TAIL"))"
+grep -q 'control_plane_cwd=0' <<<"$T1_TAIL" \
+  || fail "43a: the summary does not report control_plane_cwd (summary: $(grep -m1 'seen=' <<<"$T1_TAIL"))"
+info "43a: an ordinary project workspace still forks, and reports control_plane_cwd=0"
+
+# (b) cwd IS ~/.claude — the case that is plausible rather than exotic, because
+#     ~/.claude is a git repo on this host and gets worked in.
+t1_case test-sid-t1-dotclaude @home_claude no-fork
+t1_refused 43b test-sid-t1-dotclaude "$T1_TAIL" 'IS the control-plane path'
+info "43b: cwd == ~/.claude refuses, loudly, without spending a write or the marker"
+
+# (c) cwd is an ANCESTOR of ~/.claude. Equally disqualifying: a writable parent can
+#     replace the child, so "contains" and "is inside" are one hazard.
+t1_case test-sid-t1-parent @home no-fork
+t1_refused 43c test-sid-t1-parent "$T1_TAIL" 'CONTAINS the control-plane path'
+info "43c: a parent of ~/.claude refuses — a writable ancestor can replace the child"
+
+# (d) cwd INSIDE $REFLECT_ROOT: the handoffs, manifests and cwd sidecars that decide
+#     what every fork executes. A real repo there, so the git gate is not what refuses.
+T1_INSIDE_CWD="$REFLECT_ROOT/t1-project-inside-the-root"
+mkdir -p "$T1_INSIDE_CWD"
+mk_candidate_repo "$T1_INSIDE_CWD" || fail "43d: could not build the inside-root repo"
+t1_case test-sid-t1-inside-root "$T1_INSIDE_CWD" no-fork
+t1_refused 43d test-sid-t1-inside-root "$T1_TAIL" 'INSIDE the control-plane path'
+info "43d: a subdir of \$REFLECT_ROOT refuses"
+
+# (e) reached through a SYMLINK. String comparison would miss this one entirely, which
+#     is why both sides are realpath'd.
+t1_case test-sid-t1-symlink @symlink_home_claude no-fork
+t1_refused 43e test-sid-t1-symlink "$T1_TAIL" 'IS the control-plane path'
+info "43e: a symlink into ~/.claude is resolved, not compared as a string"
+
+# The enumerated minimum, at the definition itself: a future edit that drops one of
+# these paths from the list is the regression, and it would be invisible behaviourally
+# until the day it mattered.
+T1_FN="$(awk '/^candidate_cwd_is_control_plane\(\)/,/^}/' "$WORKTREE/scripts/idle-handoff.sh")"
+[[ -n "$T1_FN" ]] || fail "43: candidate_cwd_is_control_plane is gone"
+for t1_p in REFLECT_ROOT IDLE_HANDOFF_STATE_DIR IDLE_HANDOFF_LOG_DIR \
+            FORK_SETTINGS_DIR SELF_COMPACT_STATE_DIR '.claude'; do
+  grep -qF "$t1_p" <<<"$T1_FN" \
+    || fail "43: '$t1_p' is not among the control-plane paths, so a fork could take it as a workspace"
+done
+T1_RESOLVER="$(awk '/^resolve_abs_path\(\)/,/^}/' "$WORKTREE/scripts/idle-handoff.sh")"
+grep -q 'resolve_abs_path' <<<"$T1_FN" \
+  || fail "43: the guard no longer resolves either side, so a symlink or .. walks through it"
+grep -q 'realpath' <<<"$T1_RESOLVER" \
+  || fail "43: resolve_abs_path does not resolve anything (no realpath), so the comparison is on raw strings"
+info "43: the control-plane list still covers REFLECT_ROOT, both state dirs, fork-settings and ~/.claude"
+
+# ============================================================================
+# TEST 44: T2 — a failing `stat` DENIES; it does not read as a clean tree
+# ============================================================================
+# The mtime scan was `sh -c '... | head -6'`, whose exit status is HEAD's — 0 whatever
+# git, xargs or stat did. A stat/xargs failure produced empty output with rc=0, empty
+# meant "nothing is newer", and the gate OPENED: fail-open in the one gate whose job is
+# to deny when it cannot check. Narrow only because porcelain shares git's index;
+# stat/xargs failures (dead mount, raced unlink, EACCES) are independent of git.
+echo "TEST 44: T2 — the mtime scan fails CLOSED when stat fails"
+T2_H="$(sc_home)"
+T2_ARGV="$T2_H/argv.txt"
+T2_CWD="$(mktemp -d -t reflect-t2cwd-XXXXXX)"
+assert_isolated_cwd "$T2_CWD"
+mk_candidate_repo "$T2_CWD" || fail "44: could not build candidate repo"
+T2_SID="test-sid-t2-failing-stat"
+mk_mission_handoff "$T2_SID" "$T2_CWD" "$(cat "$SC_MISSION_FILE")" >/dev/null
+T2_PROJ="$T2_H/.claude/projects/-tmp-t2"
+mkdir -p "$T2_PROJ"
+T2_TP="$T2_PROJ/$T2_SID.jsonl"
+mk_context_transcript "$T2_TP" "claude-opus-5" 330000 "$T2_CWD" 25
+combo_stub "$T2_ARGV" "$SC_MISSION_FILE"
+T2_LOG="$REFLECT_ROOT/idle-handoff-logs/handoff.log"
+
+# A `stat` that fails ONLY for the two-field format the scan uses. idle-handoff's own
+# `stat -c %Y` and lib.sh's must keep working, or the tick would fail for an unrelated
+# reason and the assertion would prove nothing.
+T2_BIN="$(mktemp -d -t reflect-t2bin-XXXXXX)"
+T2_REAL_STAT="$(command -v stat)"
+[[ -n "$T2_REAL_STAT" ]] || fail "44: no real stat on PATH to delegate to"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'if [[ "${1:-}" == "-c" && "${2:-}" == "%%Y %%n" ]]; then\n'
+  printf '  echo "stat: simulated failure" >&2\n  exit 1\nfi\n'
+  printf 'exec %q "$@"\n' "$T2_REAL_STAT"
+} > "$T2_BIN/stat"
+chmod +x "$T2_BIN/stat"
+
+t2_tick() {
+  # $1 = expect: fork|no-fork   $2 = optional PATH prefix
+  local expect="$1" prefix="${2:-}" lines
+  lines="$(wc -l < "$T2_LOG")"
+  : > "$T2_ARGV"
+  touch -d '2 minutes ago' "$T2_TP"
+  sc_plant_request "$T2_SID" "$T2_CWD" "$T2_TP"
+  HOME="$T2_H" REFLECT_ROOT="$REFLECT_ROOT" PATH="${prefix:+$prefix:}$PATH" \
+    bash "$WORKTREE/scripts/idle-handoff.sh" || fail "44: idle-handoff.sh rc!=0"
+  sc_settle_fork "$T2_ARGV" "$expect"
+  tail -n +$((lines + 1)) "$T2_LOG"
+}
+
+T2_TAIL="$(t2_tick fork)"
+sc_forked "$T2_ARGV" \
+  || fail "44a: control tick did not fork, so the denial below proves nothing (log: $(tail -4 <<<"$T2_TAIL"))"
+info "44a: control — a clean tree with a working stat forks"
+
+T2_TAIL="$(t2_tick no-fork "$T2_BIN")"
+if sc_forked "$T2_ARGV"; then
+  fail "44b: a fork was spawned while the mtime scan could not run — empty output read as a clean tree (argv: $(cat "$T2_ARGV"))"
+fi
+grep -q 'the tracked-file mtime scan could not be evaluated' <<<"$T2_TAIL" \
+  || fail "44b: the failed scan was not reported as uncheckable (log: $T2_TAIL)"
+grep -q 'world changed' <<<"$T2_TAIL" \
+  || fail "44b: the failed scan did not deny the fork (log: $T2_TAIL)"
+rm -f "$SC_STATE_DIR/$T2_SID.request.json"
+
+# Structural, because the shape is the bug: no producer's status may be masked, and the
+# `head` that used to mask it must not come back — under pipefail it would SIGPIPE the
+# producers and turn every large repo into a false "uncheckable".
+T2_SCAN="$(awk '/newer=\$\(timeout 30 bash -c/,/newer_rc=\$\?/' "$WORKTREE/scripts/idle-handoff.sh")"
+[[ -n "$T2_SCAN" ]] || fail "44: the mtime scan no longer runs under 'bash -c' (pipefail is unavailable in sh)"
+grep -q 'set -o pipefail' <<<"$T2_SCAN" \
+  || fail "44: the mtime scan pipeline does not set pipefail, so a producer's failure is masked again"
+if grep -qE 'head( |$)' <<<"$T2_SCAN"; then
+  fail "44: 'head' is back inside the scan pipeline — it masks the producers' status, and under pipefail it SIGPIPEs them instead"
+fi
+info "44b: a stat failure is denied as uncheckable, named, and the pipeline keeps every producer's status"
+
+# ============================================================================
+# TEST 45: T3 — the load-bearing rail is OBSERVED, not assumed
+# ============================================================================
+# `permissions.deny` is what actually contains the fork: `--tools` silently ignores an
+# unknown tool name, so a renamed or split `Bash` would quietly hand the shell back and
+# `deny` would be all that was left. Nothing observed that rail — the suite's `claude` is
+# a stub, so a CLI upgrade that changed `deny` semantics under `--setting-sources ''`
+# would have passed every existing TEST. idle-handoff now probes the real binary once per
+# build (cached, keyed on --version) and fails closed on anything short of proof.
+#
+# NOTE ON EVIDENCE. The stub below emulates the contract so the fail-closed paths are
+# observable; it is NOT evidence about the installed CLI. That evidence is in
+# tests/live.sh (opt-in, real calls) and was taken by hand on 2.1.222.
+echo "TEST 45: T3 — permissions.deny is probed against the real CLI, and refused when unproven"
+T3_PROBE_DIR="$REFLECT_ROOT/idle-handoff-state/fork-deny-probe"
+T3_H="$(sc_home)"
+T3_ARGV="$T3_H/argv.txt"
+T3_CWD="$(mktemp -d -t reflect-t3cwd-XXXXXX)"
+assert_isolated_cwd "$T3_CWD"
+mk_candidate_repo "$T3_CWD" || fail "45: could not build candidate repo"
+T3_SID="test-sid-t3-deny-probe"
+mk_mission_handoff "$T3_SID" "$T3_CWD" "$(cat "$SC_MISSION_FILE")" >/dev/null
+T3_PROJ="$T3_H/.claude/projects/-tmp-t3"
+mkdir -p "$T3_PROJ"
+T3_TP="$T3_PROJ/$T3_SID.jsonl"
+mk_context_transcript "$T3_TP" "claude-opus-5" 330000 "$T3_CWD" 25
+combo_stub "$T3_ARGV" "$SC_MISSION_FILE"
+T3_LOG="$REFLECT_ROOT/idle-handoff-logs/handoff.log"
+
+t3_tick() {
+  # $1 = expect: fork|no-fork
+  local expect="$1" lines
+  lines="$(wc -l < "$T3_LOG")"
+  : > "$T3_ARGV"
+  touch -d '2 minutes ago' "$T3_TP"
+  sc_plant_request "$T3_SID" "$T3_CWD" "$T3_TP"
+  HOME="$T3_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
+    || fail "45: idle-handoff.sh rc!=0"
+  sc_settle_fork "$T3_ARGV" "$expect"
+  tail -n +$((lines + 1)) "$T3_LOG"
+}
+t3_probe_calls() { wc -l < "$STUB_PROBE_LOG"; }
+
+# (a) A build never probed before: the probe must RUN (twice — denied and control) and
+#     the verdict must be `enforced` before anything forks.
+STUB_CLI_VERSION="9.9.9-t3-honest"; write_stub_help
+: > "$STUB_PROBE_LOG"
+T3_TAIL="$(t3_tick fork)"
+sc_forked "$T3_ARGV" \
+  || fail "45a: a CLI that enforces deny did not fork (log: $(tail -4 <<<"$T3_TAIL"))"
+[[ "$(t3_probe_calls)" == "2" ]] \
+  || fail "45a: the probe made $(t3_probe_calls) real CLI calls; want exactly 2 (the denied run and its control)"
+grep -q 'fork deny probe: verdict=enforced' <<<"$T3_TAIL" \
+  || fail "45a: the probe verdict is not in the audit trail (log: $T3_TAIL)"
+# The DENIED half must have been handed a settings object denying every route to the
+# sentinel — otherwise a model answering with Write instead of Bash reads as "ignored".
+jq -e '(.permissions.deny | index("Bash")) != null and (.permissions.deny | index("Write")) != null' \
+   "$T3_PROBE_DIR/deny.settings.json" >/dev/null \
+  || fail "45a: the probe's denied run did not deny both Bash and Write ($(jq -c .permissions.deny "$T3_PROBE_DIR/deny.settings.json" 2>/dev/null))"
+jq -e '.permissions.deny == []' "$T3_PROBE_DIR/control.settings.json" >/dev/null \
+  || fail "45a: the probe's CONTROL run also denied something, so a 'no sentinel' verdict would prove nothing"
+[[ -n "$(find "$T3_PROBE_DIR" -maxdepth 1 -name '*.json' -newermt '-10 minutes' \
+          ! -name '*.settings.json' 2>/dev/null)" ]] \
+  || fail "45a: no verdict was cached, so every 5-minute tick would bill two more calls"
+info "45a: an unprobed build is probed (2 calls), verdict enforced, then it forks"
+
+# (b) The cost bound: a second tick on the same build must NOT re-probe.
+T3_TAIL="$(t3_tick fork)"
+sc_forked "$T3_ARGV" || fail "45b: the cached verdict did not permit a fork (log: $(tail -4 <<<"$T3_TAIL"))"
+[[ "$(t3_probe_calls)" == "2" ]] \
+  || fail "45b: the probe ran again on a cached build ($(t3_probe_calls) calls total) — that is two model calls every tick"
+info "45b: the verdict is cached per build; a second tick spends nothing"
+
+# (c) A build that PARSES `deny` and ignores it. This is the upgrade this whole probe
+#     exists for, and every existing TEST would still be green.
+STUB_CLI_VERSION="9.9.9-t3-ignores-deny"; STUB_DENY_MODE="ignore_deny"; write_stub_help
+: > "$STUB_PROBE_LOG"
+T3_TAIL="$(t3_tick no-fork)"
+if sc_forked "$T3_ARGV"; then
+  fail "45c: a fork was spawned by a CLI that ignores permissions.deny — the only rail left after --tools is bypassed (argv: $(cat "$T3_ARGV"))"
+fi
+grep -q 'not shown to enforce permissions.deny' <<<"$T3_TAIL" \
+  || fail "45c: the refusal was not logged loudly (log: $T3_TAIL)"
+grep -q 'verdict=not_enforced' <<<"$T3_TAIL" \
+  || fail "45c: the verdict does not distinguish 'ignored deny' from 'could not tell' (log: $T3_TAIL)"
+grep -q 'deny_unproven=1' <<<"$T3_TAIL" \
+  || fail "45c: the refusal is not in the counters (summary: $(grep -m1 'seen=' <<<"$T3_TAIL"))"
+[[ -f "$SC_STATE_DIR/$T3_SID.request.json" ]] \
+  || fail "45c: the request marker was consumed by a refusal, so the resume is lost for nothing"
+info "45c: a CLI that ignores deny does not get a fork, and the marker survives"
+
+# (d) The probe's own control failing (a model that declines even with nothing denied).
+#     "No sentinel" is then not evidence of enforcement, and must not be read as such.
+STUB_CLI_VERSION="9.9.9-t3-declines"; STUB_DENY_MODE="never"; write_stub_help
+: > "$STUB_PROBE_LOG"
+T3_TAIL="$(t3_tick no-fork)"
+if sc_forked "$T3_ARGV"; then
+  fail "45d: an INCONCLUSIVE probe was read as enforcement (argv: $(cat "$T3_ARGV"))"
+fi
+grep -q 'verdict=inconclusive' <<<"$T3_TAIL" \
+  || fail "45d: a control that never fired was not recorded as inconclusive (log: $T3_TAIL)"
+info "45d: a probe whose control never fires is inconclusive, and inconclusive does not fork"
+
+# (e) An unknown build. A verdict cannot be attributed to it, so no cached verdict may
+#     be trusted either.
+STUB_CLI_VERSION=""; STUB_DENY_MODE="honest"; write_stub_help
+: > "$STUB_PROBE_LOG"
+T3_TAIL="$(t3_tick no-fork)"
+if sc_forked "$T3_ARGV"; then
+  fail "45e: a fork was spawned although the CLI build could not be identified (argv: $(cat "$T3_ARGV"))"
+fi
+grep -q 'build is UNKNOWN' <<<"$T3_TAIL" \
+  || fail "45e: an unidentifiable build was not refused with a reason (log: $T3_TAIL)"
+[[ "$(t3_probe_calls)" == "0" ]] \
+  || fail "45e: the probe ran against an unidentifiable build, so the result could not be cached and every tick would pay"
+info "45e: an unknown CLI version fails closed, without paying for an unattributable probe"
+
+# Restore the build the rest of the suite has a cached `enforced` verdict for.
+STUB_CLI_VERSION="2.1.222 (Claude Code stub)"; STUB_DENY_MODE="honest"; write_stub_help
+
+# Structural: the probe must exercise the shipped settings GENERATOR under the shipped
+# isolation flags, and its deny list must be a superset of the fork's.
+T3_IH="$WORKTREE/scripts/idle-handoff.sh"
+T3_PROBE_FN="$(awk '/^_fork_deny_probe_run\(\)/,/^}/' "$T3_IH")"
+[[ -n "$T3_PROBE_FN" ]] || fail "45: _fork_deny_probe_run is gone"
+grep -q 'write_settings_object' <<<"$T3_PROBE_FN" \
+  || fail "45: the probe does not use the same settings generator the fork gets, so it proves nothing about the fork's file"
+for t3_flag in -- '--setting-sources' '--settings' '--strict-mcp-config'; do
+  [[ "$t3_flag" == "--" ]] && continue
+  grep -qF -- "$t3_flag" <<<"$T3_PROBE_FN" \
+    || fail "45: the probe does not pass $t3_flag, so it is not measuring the fork's configuration"
+done
+if grep -qF -- '--tools' <<<"$T3_PROBE_FN"; then
+  fail "45: the probe passes --tools, which removes the tool STRUCTURALLY — it would pass even if deny were ignored entirely"
+fi
+T3_FORK_DENY="$(grep -oP "^FORK_DENY_TOOLS='\K.*(?='$)" "$T3_IH")"
+T3_PROBE_DENY="$(grep -oP "^FORK_PROBE_DENY_TOOLS='\K.*(?='$)" "$T3_IH")"
+[[ -n "$T3_FORK_DENY" && -n "$T3_PROBE_DENY" ]] || fail "45: could not read the two deny lists out of $T3_IH"
+jq -en --argjson f "$T3_FORK_DENY" --argjson p "$T3_PROBE_DENY" '($f - $p) == []' >/dev/null \
+  || fail "45: the probe's deny list does not cover the fork's ($T3_FORK_DENY vs $T3_PROBE_DENY), so it tests a weaker claim than the fork relies on"
+grep -q 'fork_deny_enforced' "$T3_IH" \
+  || fail "45: nothing calls the probe, so the rail is unobserved again"
+grep -qE 'DENY_PROBE|permissions\.deny' "$WORKTREE/tests/live.sh" \
+  || fail "45: tests/live.sh carries no real-CLI deny probe, so the only evidence about the installed binary is a stub"
+info "45: the probe uses the shipped generator and flags, denies a superset, and a live probe exists"
+
+# ============================================================================
+# TEST 46: T4 — a flag with the same PREFIX is not the flag
+# ============================================================================
+# The gate substring-matched `claude --help`, so a build advertising `--settings-file`
+# (and no `--settings`) or `--add-dirs` (and no `--add-dir`) satisfied it. We then spawned
+# an argv the binary cannot parse; the death was ASYNCHRONOUS, inside a transient unit,
+# AFTER record_fork charged the per-cwd budget and consume_context_request destroyed the
+# marker. Budget spent, marker gone, resume lost, trace in a log nobody reads.
+echo "TEST 46: T4 — a prefix-matching flag does not satisfy the restriction gate"
+T4_H="$(sc_home)"
+T4_ARGV="$T4_H/argv.txt"
+T4_CWD="$(mktemp -d -t reflect-t4cwd-XXXXXX)"
+assert_isolated_cwd "$T4_CWD"
+mk_candidate_repo "$T4_CWD" || fail "46: could not build candidate repo"
+T4_SID="test-sid-t4-prefix-flag"
+mk_mission_handoff "$T4_SID" "$T4_CWD" "$(cat "$SC_MISSION_FILE")" >/dev/null
+T4_PROJ="$T4_H/.claude/projects/-tmp-t4"
+mkdir -p "$T4_PROJ"
+T4_TP="$T4_PROJ/$T4_SID.jsonl"
+mk_context_transcript "$T4_TP" "claude-opus-5" 330000 "$T4_CWD" 25
+combo_stub "$T4_ARGV" "$SC_MISSION_FILE"
+T4_LOG="$REFLECT_ROOT/idle-handoff-logs/handoff.log"
+T4_LEDGER="$REFLECT_ROOT/idle-handoff-state/fork-ledger.log"
+
+t4_ledger_count() { grep -cF -- "$T4_CWD" "$T4_LEDGER" 2>/dev/null || printf '0'; }
+t4_tick() {
+  # $1 = expect: fork|no-fork
+  local expect="$1" lines
+  lines="$(wc -l < "$T4_LOG")"
+  : > "$T4_ARGV"
+  touch -d '2 minutes ago' "$T4_TP"
+  sc_plant_request "$T4_SID" "$T4_CWD" "$T4_TP"
+  HOME="$T4_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
+    || fail "46: idle-handoff.sh rc!=0"
+  sc_settle_fork "$T4_ARGV" "$expect"
+  tail -n +$((lines + 1)) "$T4_LOG"
+}
+
+# (a) CONTROL.
+T4_TAIL="$(t4_tick fork)"
+sc_forked "$T4_ARGV" \
+  || fail "46a: control tick did not fork, so the refusals below prove nothing (log: $(tail -4 <<<"$T4_TAIL"))"
+info "46a: control — the real flag set forks"
+
+# (b) `--settings-file` instead of `--settings`: the substring is there, the flag is not.
+T4_BEFORE="$(t4_ledger_count)"
+write_stub_help --add-dir --setting-sources --settings-file --strict-mcp-config --tools
+T4_TAIL="$(t4_tick no-fork)"
+if sc_forked "$T4_ARGV"; then
+  fail "46b: --settings-file satisfied the gate for --settings; the fork was spawned and would have died on an unparseable argv (argv: $(cat "$T4_ARGV"))"
+fi
+grep -q 'does not advertise' <<<"$T4_TAIL" \
+  || fail "46b: the skip was not logged (log: $T4_TAIL)"
+grep -qF -- '--settings' <<<"$T4_TAIL" \
+  || fail "46b: the log does not NAME the flag that is actually missing (log: $T4_TAIL)"
+grep -q 'fork_unrestrictable=1' <<<"$T4_TAIL" \
+  || fail "46b: the refusal is not in the counters (summary: $(grep -m1 'seen=' <<<"$T4_TAIL"))"
+# The half that used to be silently expensive: a spawn that cannot work must not spend.
+[[ "$(t4_ledger_count)" == "$T4_BEFORE" ]] \
+  || fail "46b: the per-cwd fork budget was charged for a fork that could not run (ledger $T4_BEFORE -> $(t4_ledger_count))"
+[[ -f "$SC_STATE_DIR/$T4_SID.request.json" ]] \
+  || fail "46b: the request marker was consumed for a fork that could not run — the resume is lost with nothing spawned"
+info "46b: --settings-file is not --settings; nothing spawns, nothing is charged, the marker survives"
+
+# (c) The variadic one, from the other direction.
+write_stub_help --add-dirs --setting-sources --settings --strict-mcp-config --tools
+T4_TAIL="$(t4_tick no-fork)"
+if sc_forked "$T4_ARGV"; then
+  fail "46c: --add-dirs satisfied the gate for --add-dir (argv: $(cat "$T4_ARGV"))"
+fi
+grep -qF -- '--add-dir' <<<"$T4_TAIL" \
+  || fail "46c: the log does not name --add-dir as missing (log: $T4_TAIL)"
+write_stub_help   # restore the real 2.1.222 flag set
+rm -f "$SC_STATE_DIR/$T4_SID.request.json"
+# Structural: the substring form must not come back.
+T4_FN="$(awk '/^fork_restriction_available\(\)/,/^}/' "$WORKTREE/scripts/idle-handoff.sh")"
+grep -qF 'A-Za-z0-9_-' <<<"$T4_FN" \
+  || fail "46: the flag match is no longer anchored on a flag boundary"
+if grep -qF '*"$flag"*' <<<"$T4_FN"; then
+  fail "46: the substring match is back — any longer flag with the same prefix satisfies it"
+fi
+info "46c: --add-dirs is not --add-dir either, and the anchored match is still anchored"
+
+# ============================================================================
+# TEST 47: T5 — the quiet three
+# ============================================================================
+echo "TEST 47: T5 — ledger escapes, a truncated cwd, and a marker write nobody checked"
+# Its own handle on the shared handoff log, so this block does not depend on an
+# earlier TEST having defined one.
+T5_LOG="$REFLECT_ROOT/idle-handoff-logs/handoff.log"
+mkdir -p "$(dirname "$T5_LOG")"
+touch "$T5_LOG"
+
+# (a) `awk -v cwd=…` applies BACKSLASH-ESCAPE PROCESSING to the value, so a cwd
+#     containing `\t` never compared equal to the ledger row it wrote: the per-cwd 24h
+#     budget counted 0 forever for exactly those paths and could be spent without limit.
+T5A_PARENT="$(mktemp -d -t reflect-t5a-XXXXXX)"
+T5A_CWD="$T5A_PARENT/we\tird"
+mkdir -p "$T5A_CWD"
+assert_isolated_cwd "$T5A_CWD"
+mk_candidate_repo "$T5A_CWD" || fail "47a: could not build candidate repo"
+T5A_H="$(sc_home)"
+T5A_ARGV="$T5A_H/argv.txt"
+T5A_SID="test-sid-t5-ledger-escapes"
+mk_mission_handoff "$T5A_SID" "$T5A_CWD" "$(cat "$SC_MISSION_FILE")" >/dev/null
+T5A_PROJ="$T5A_H/.claude/projects/-tmp-t5a"
+mkdir -p "$T5A_PROJ"
+T5A_TP="$T5A_PROJ/$T5A_SID.jsonl"
+mk_context_transcript "$T5A_TP" "claude-opus-5" 330000 "$T5A_CWD" 25
+touch -d '2 minutes ago' "$T5A_TP"
+combo_stub "$T5A_ARGV" "$SC_MISSION_FILE"
+sc_plant_request "$T5A_SID" "$T5A_CWD" "$T5A_TP"
+# The budget is already spent for this cwd — written in the ledger's own format.
+T5A_LEDGER="$REFLECT_ROOT/idle-handoff-state/fork-ledger.log"
+mkdir -p "$(dirname "$T5A_LEDGER")"
+for _ in 1 2 3 4 5; do printf '%d\t%s\n' "$(date +%s)" "$T5A_CWD" >> "$T5A_LEDGER"; done
+T5A_LINES="$(wc -l < "$T5_LOG")"
+: > "$T5A_ARGV"
+HOME="$T5A_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
+  || fail "47a: idle-handoff.sh rc!=0"
+sc_settle_fork "$T5A_ARGV" no-fork
+T5A_TAIL="$(tail -n +$((T5A_LINES + 1)) "$T5_LOG")"
+if sc_forked "$T5A_ARGV"; then
+  fail "47a: a cwd containing a backslash escape spent a 6th fork against a 5-fork budget — the per-cwd bound does not see its own ledger rows (argv: $(cat "$T5A_ARGV"))"
+fi
+grep -q 'per-cwd 24h budget 5/5' <<<"$T5A_TAIL" \
+  || fail "47a: the per-cwd budget did not count the existing rows for this cwd (log: $T5A_TAIL)"
+if grep -qE '^ *awk .*-v cwd=' "$WORKTREE/scripts/idle-handoff.sh"; then
+  fail "47a: a cwd is passed with awk -v again, which escape-processes the value"
+fi
+rm -f "$SC_STATE_DIR/$T5A_SID.request.json"
+info "47a: a cwd carrying a backslash escape is matched byte-for-byte, so its 24h budget binds"
+
+# (b) `jq -r … | head -1` truncated a cwd containing a NEWLINE to its first line. If
+#     that prefix exists as a directory, the mission write and the acceptEdits fork
+#     target the WRONG PROJECT. The prefix here exists, and is fork-ready.
+T5B_PARENT="$(mktemp -d -t reflect-t5b-XXXXXX)"
+assert_isolated_cwd "$T5B_PARENT"
+mk_candidate_repo "$T5B_PARENT" || fail "47b: could not build the prefix repo"
+T5B_CWD="$T5B_PARENT"$'\n'"and-then-some"
+T5B_H="$(sc_home)"
+T5B_ARGV="$T5B_H/argv.txt"
+T5B_SID="test-sid-t5-newline-cwd"
+mk_mission_handoff "$T5B_SID" "$T5B_PARENT" "$(cat "$SC_MISSION_FILE")" >/dev/null
+T5B_PROJ="$T5B_H/.claude/projects/-tmp-t5b"
+mkdir -p "$T5B_PROJ"
+T5B_TP="$T5B_PROJ/$T5B_SID.jsonl"
+mk_context_transcript "$T5B_TP" "claude-opus-5" 330000 "$T5B_CWD" 25
+touch -d '2 minutes ago' "$T5B_TP"
+combo_stub "$T5B_ARGV" "$SC_MISSION_FILE"
+sc_plant_request "$T5B_SID" "$T5B_PARENT" "$T5B_TP"
+T5B_LINES="$(wc -l < "$T5_LOG")"
+: > "$T5B_ARGV"
+HOME="$T5B_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
+  || fail "47b: idle-handoff.sh rc!=0"
+sc_settle_fork "$T5B_ARGV" no-fork
+T5B_TAIL="$(tail -n +$((T5B_LINES + 1)) "$T5_LOG")"
+if sc_forked "$T5B_ARGV"; then
+  fail "47b: a cwd with an embedded newline was truncated to its first line and forked into THAT directory (argv: $(cat "$T5B_ARGV"))"
+fi
+grep -q 'REFUSING cwd containing a control character' <<<"$T5B_TAIL" \
+  || fail "47b: the truncatable cwd was not refused explicitly (log: $T5B_TAIL)"
+if grep -q "writing mission.md for sid=$T5B_SID" <<<"$T5B_TAIL"; then
+  fail "47b: a mission write was spent against the truncated (wrong) project"
+fi
+rm -f "$SC_STATE_DIR/$T5B_SID.request.json"
+info "47b: a cwd that cannot survive the ledger or a log line is refused, not truncated"
+
+# (c) The request marker's write status was discarded: fire state persisted (so the
+#     crossing would not retry), FIRE logged success, and NO marker existed — so
+#     idle-handoff never widened the gate and the resume silently degraded to the
+#     45-minute idle floor, indistinguishable from the feature working.
+T5C_H="$(sc_home)"
+T5C_CWD="$(mktemp -d -t reflect-t5ccwd-XXXXXX)"
+assert_isolated_cwd "$T5C_CWD"
+T5C_SID="test-sid-t5-marker-unwritable"
+T5C_TP="$T5C_H/t5c.jsonl"
+mk_context_transcript "$T5C_TP" "claude-opus-5" 330000 "$T5C_CWD" 25
+counting_stub "$T5C_H/calls" "$SC_MISSION_FILE"
+mkdir -p "$SC_STATE_DIR"
+# A DIRECTORY where the marker file must go: os.replace onto it fails, and only for
+# that path — the state file beside it still writes.
+mkdir -p "$SC_STATE_DIR/$T5C_SID.request.json"
+sc_fire "$T5C_H" "$T5C_SID" "$T5C_CWD" "$T5C_TP" >/dev/null || fail "47c: Stop-hook fire rc!=0"
+T5C_TRIGGER_LOG="$SC_STATE_DIR/trigger.log"
+grep -q "sid=$T5C_SID ERROR could not write the request marker" "$T5C_TRIGGER_LOG" \
+  || fail "47c: a failed marker write was swallowed (log: $(tail -3 "$T5C_TRIGGER_LOG"))"
+grep -qE "sid=$T5C_SID FIRE .*marker=FAILED" "$T5C_TRIGGER_LOG" \
+  || fail "47c: the FIRE line still reports success while no marker exists (log: $(grep "$T5C_SID" "$T5C_TRIGGER_LOG" | tail -2))"
+jq -e '.request_write_failures == 1' "$SC_STATE_DIR/$T5C_SID.state.json" >/dev/null \
+  || fail "47c: the failure is not counted in the session state ($(jq -c . "$SC_STATE_DIR/$T5C_SID.state.json" 2>/dev/null))"
+rmdir "$SC_STATE_DIR/$T5C_SID.request.json"
+# Control: with the path writable, the same fire reports a marker and leaves one.
+T5C_SID2="test-sid-t5-marker-ok"
+sc_fire "$T5C_H" "$T5C_SID2" "$T5C_CWD" "$T5C_TP" >/dev/null || fail "47c: control fire rc!=0"
+grep -qE "sid=$T5C_SID2 FIRE .*marker=ok" "$T5C_TRIGGER_LOG" \
+  || fail "47c: control — a successful marker write is not reported as such (log: $(grep "$T5C_SID2" "$T5C_TRIGGER_LOG" | tail -2))"
+[[ -f "$SC_STATE_DIR/$T5C_SID2.request.json" ]] \
+  || fail "47c: control — no marker on disk after a fire that claimed one"
+info "47c: a failed marker write is logged, counted, and named in the FIRE line"
+
+canonical_stub
 
 # ============================================================================
 # FINAL GUARD: prove the whole suite left the live repo alone.
