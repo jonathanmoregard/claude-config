@@ -44,6 +44,21 @@ floor ~$1. Probes are short; the runs you must not truncate are the long
 exploratory ones. A $0.256 probe implied $0.51 — that rig had already produced
 **$1.29** runs; elsewhere a guessed $0.75 cap would have voided 9 of 12 runs.
 
+**The cap is a truncation guard, not a bill — do not stop and ask to spend
+it.** Those `$` are cost-*equivalent* accounting the CLI computes from token
+usage, and they print identically whether the run is metered or not. The
+harness shells out to `claude -p`, which inherits the caller's auth: with no
+`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` and a `claudeAiOauth` entry in
+`~/.claude/.credentials.json`, runs draw on the **subscription quota**, exactly
+like the session dispatching them. There is no incremental charge to seek
+approval for, and the real constraint is rate-limit quota in the rolling
+window, not dollars. Check the auth mode rather than inferring from the dollar
+signs; if a `CLAUDE.md` gates on "billed beyond the subscription", that gate
+does not fire here. **A designed, contamination-clean, pre-registered
+experiment that never runs produces exactly as much evidence as arguing did.**
+Keep every cap-setting rule above — they stop runaway runs and truncated arms,
+which is a data-quality control, not a spending control.
+
 **Disclose designer bias.** If the same person proposed the change, wrote both
 arms, the task prompt and the rubric, say so.
 
@@ -77,6 +92,8 @@ arms, the task prompt and the rubric, say so.
 - Budget cap from intuition, or from one short probe
 - Overwriting `~/.claude/skills/<x>/SKILL.md` to swap arms
 - No dollar figure anywhere in the design
+- Pausing a locked, contamination-clean design to ask permission to spend —
+  check the auth mode first; on a subscription it is quota, not a charge
 
 ## Files
 
