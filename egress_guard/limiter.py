@@ -110,7 +110,19 @@ _NUMERIC_FIELDS = (
     "max_cost",
     "max_wait_s",
     "block_cooldown_s",
+    "preflight_after_requests",
 )
+
+# Counts, not durations: a fractional value silently truncates toward zero, and
+# 0 means "gate off". A policy of 0.5 must be an error, not a disabled gate.
+_INTEGER_FIELDS = ("max_requests", "preflight_after_requests")
+
+_BOOLEAN_FIELDS = ("require_declaration",)
+
+# Floor for the server's shutdown drain. The drain must outlast any parked
+# acquire, since a parked call has already debited its slot and budget event,
+# so the server derives its real timeout from the policy instead of capping it.
+MIN_DRAIN_TIMEOUT_S = 900.0
 
 _SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -335,7 +347,22 @@ class EgressGuard:
                 raise PolicyError(
                     f"egress policy: {resource!r}.{field} must not be negative."
                 )
+        for field in _INTEGER_FIELDS:
+            value = merged[field]
+            if float(value) != int(value):
+                raise PolicyError(
+                    f"egress policy: {resource!r}.{field} is a count and must be a "
+                    f"whole number (got {value!r}; fractions truncate toward zero, "
+                    "which silently disables the limit)."
+                )
+        for field in _BOOLEAN_FIELDS:
+            if field in merged and not isinstance(merged[field], bool):
+                raise PolicyError(
+                    f"egress policy: {resource!r}.{field} must be true or false "
+                    f"(got {merged[field]!r})."
+                )
         merged["max_requests"] = int(merged["max_requests"])
+        merged["preflight_after_requests"] = int(merged["preflight_after_requests"])
         return merged
 
     # -- paths and locking ------------------------------------------------
@@ -538,11 +565,14 @@ class EgressGuard:
                 ("expected_requests", expected_requests),
                 ("expected_cost", expected_cost),
                 ("ceiling_requests", ceiling_requests),
-                ("pushback", pushback),
-                ("description", description),
             ):
                 if value is not None:
-                    declaration[key] = value
+                    # Advisory today, but a NaN here would poison any future
+                    # comparison against it, which is how this class starts.
+                    declaration[key] = _finite(value, key)
+            for key, value in (("pushback", pushback), ("description", description)):
+                if value is not None:
+                    declaration[key] = str(value)
             state["declaration"] = declaration
             self._write_state(resource, state)
         return floor
@@ -560,7 +590,20 @@ class EgressGuard:
             raise ValueError(
                 "checks must not be empty — name the invariants you actually proved."
             )
-        failed = [c.get("name", "?") for c in checks if not c.get("passed")]
+        for c in checks:
+            if not isinstance(c, dict):
+                raise ValueError("each check must be an object with name and passed")
+            # STRICT bool. `not c["passed"]` treats any truthy value as a pass,
+            # so the string "false" records a red preflight as green and unlocks
+            # the wide run. A gate that accepts a near-miss type is not a gate.
+            if not isinstance(c.get("passed"), bool):
+                raise ValueError(
+                    f"check {c.get('name', '?')!r}: `passed` must be a boolean, got "
+                    f"{c.get('passed')!r}"
+                )
+            if not isinstance(c.get("name"), str) or not c["name"].strip():
+                raise ValueError("each check needs a non-empty name")
+        failed = [c["name"] for c in checks if not c["passed"]]
         if failed:
             raise ValueError(
                 "preflight has failing checks and will not be recorded: "
@@ -569,7 +612,7 @@ class EgressGuard:
         now = self._time()
         record = {
             "at": now,
-            "sample_requests": int(sample_requests),
+            "sample_requests": int(_finite(sample_requests, "sample_requests")),
             "checks": [str(c.get("name", "?")) for c in checks],
         }
         with self.locked(resource):
@@ -595,8 +638,10 @@ class EgressGuard:
             cooldown_s = float(policy["block_cooldown_s"])
         cooldown_s = float(cooldown_s)
         cooldown_s = _finite(cooldown_s, "cooldown_s")
-        if cooldown_s < 0:
-            raise ValueError("cooldown_s must not be negative")
+        if cooldown_s <= 0:
+            # Zero is not a block. It persists the reason and refuses nobody,
+            # while the caller is told the resource is now protected.
+            raise ValueError("cooldown_s must be positive — a zero cooldown blocks nothing")
         now = self._time()
         with self.locked(resource):
             state = self._read_state(resource, now)

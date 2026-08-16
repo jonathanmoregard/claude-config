@@ -72,6 +72,58 @@ def test_non_finite_declared_interval_is_refused(state_dir, policy_file, bad):
     assert not os.path.exists(g.floor_path("host.test"))
 
 
+@pytest.mark.parametrize("truthy", ["false", "no", 0.0, 1, [], {}])
+def test_preflight_passed_must_be_a_real_boolean(state_dir, policy_file, truthy):
+    """`not check["passed"]` would read the string "false" as a pass."""
+    policy = policy_file(defaults={"min_interval_s": 0.0, "preflight_after_requests": 1})
+    g = guard(state_dir, policy)
+    with pytest.raises(ValueError):
+        g.record_preflight(
+            "host.test",
+            checks=[{"name": "short page is not end-of-data", "passed": truthy}],
+            sample_requests=1,
+        )
+    assert g.status("host.test")["preflight"] is None
+
+
+def test_zero_cooldown_is_refused(state_dir, policy_file):
+    """A zero cooldown persists a reason and refuses nobody."""
+    policy = policy_file(defaults={"min_interval_s": 0.0})
+    g = guard(state_dir, policy)
+    with pytest.raises(ValueError):
+        g.record_block("host.test", reason="bot challenge", cooldown_s=0)
+    g.acquire("host.test")  # not blocked, and nothing claimed otherwise
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("preflight_after_requests", 0.5),
+        ("max_requests", 10.5),
+    ],
+)
+def test_policy_counts_are_validated(state_dir, policy_file, field, value):
+    """A fractional count truncates toward zero, silently disabling the limit."""
+    policy = policy_file(defaults={"min_interval_s": 0.0, field: value})
+    with pytest.raises(PolicyError):
+        guard(state_dir, policy).acquire("host.test")
+
+
+def test_require_declaration_must_be_boolean(state_dir, policy_file):
+    policy = policy_file(defaults={"min_interval_s": 0.0, "require_declaration": "yes"})
+    with pytest.raises(PolicyError):
+        guard(state_dir, policy).acquire("host.test")
+
+
+def test_package_exports_every_public_name():
+    """`from egress_guard import Undeclared` must not ImportError."""
+    import egress_guard
+    from egress_guard import limiter
+
+    for name in limiter.__all__:
+        assert hasattr(egress_guard, name), f"{name} missing from package exports"
+
+
 def test_sidecar_write_failure_is_not_swallowed(state_dir, policy_file, monkeypatch):
     """A silent sidecar failure means the ratchet backup does not exist."""
     policy = policy_file(defaults={"min_interval_s": 0.5})

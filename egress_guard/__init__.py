@@ -8,21 +8,27 @@ Public surface lives in `egress_guard.limiter`.
 from __future__ import annotations
 
 from .limiter import (  # noqa: F401
+    DEFAULT_POLICY,
     BudgetExhausted,
     CooldownActive,
     EgressGuard,
     EgressGuardError,
     Grant,
     PolicyError,
+    PreflightRequired,
+    Undeclared,
     WaitTooLong,
 )
 
 __all__ = [
     "BudgetExhausted",
     "CooldownActive",
+    "DEFAULT_POLICY",
     "EgressGuard",
     "EgressGuardError",
     "Grant",
     "PolicyError",
+    "PreflightRequired",
+    "Undeclared",
     "WaitTooLong",
 ]

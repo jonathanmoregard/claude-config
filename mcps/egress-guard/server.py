@@ -8,8 +8,10 @@ hold cannot be advisory. Hooks may observe and report the running total; they
 may not be the thing that says no.
 
 Tools:
-  `mcp__egress-guard__acquire(resource, cost?, min_interval_s?, description?)`
-  `mcp__egress-guard__declare(resource, min_interval_s, description?)`
+  `mcp__egress-guard__acquire(resource, cost?, min_interval_s?)`
+  `mcp__egress-guard__declare(resource, min_interval_s, expected_requests?,
+      expected_cost?, ceiling_requests?, pushback?, description?)`
+  `mcp__egress-guard__record_preflight(resource, checks, sample_requests?)`
   `mcp__egress-guard__status(resource)`
   `mcp__egress-guard__record_block(resource, reason, cooldown_s?)`
 
@@ -37,6 +39,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from egress_guard.limiter import (  # noqa: E402
+    MIN_DRAIN_TIMEOUT_S,
     EgressGuard,
     EgressGuardError,
 )
@@ -192,6 +195,14 @@ def _tool_record_preflight(args: dict) -> str:
             "argument `checks` must be a non-empty list of {name, passed} objects — "
             "name the invariants you actually proved on the bounded sample."
         )
+    for check in checks:
+        # Strict boolean at the boundary too: a truthy string like "false" would
+        # otherwise record a failing check as a pass and unlock the wide run.
+        if not isinstance(check, dict) or not isinstance(check.get("passed"), bool):
+            raise ValueError(
+                "each check needs `passed` as a real boolean (true/false), not a "
+                f"string or number: {check!r}"
+            )
     sample_requests = _optional_number(args, "sample_requests")
     record = _guard().record_preflight(
         resource,
@@ -551,7 +562,20 @@ def _handle(msg: dict) -> None:
         _respond(msg_id, error={"code": -32601, "message": f"Method not found: {method}"})
 
 
-def _drain_in_flight(timeout_s: float = 900.0) -> None:
+def _drain_timeout() -> float:
+    """Long enough to outlast the deepest wait this policy actually permits."""
+    try:
+        doc = _guard().load_policy()
+        waits = [float((doc.get("defaults") or {}).get("max_wait_s", 0) or 0)]
+        for override in (doc.get("resources") or {}).values():
+            if isinstance(override, dict) and "max_wait_s" in override:
+                waits.append(float(override["max_wait_s"]))
+        return max(MIN_DRAIN_TIMEOUT_S, max(waits) + 30.0)
+    except Exception:
+        return MIN_DRAIN_TIMEOUT_S
+
+
+def _drain_in_flight(timeout_s: Optional[float] = None) -> None:
     """Wait out parked calls on shutdown.
 
     Workers are daemon threads, so exiting immediately on EOF would strand a
@@ -562,6 +586,8 @@ def _drain_in_flight(timeout_s: float = 900.0) -> None:
     """
     import time as _time
 
+    if timeout_s is None:
+        timeout_s = _drain_timeout()
     deadline = _time.monotonic() + timeout_s
     while _time.monotonic() < deadline:
         with _in_flight_lock:
