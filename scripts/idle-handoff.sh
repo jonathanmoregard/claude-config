@@ -34,7 +34,11 @@
 #      self-compact context request
 #   7. transcript-line threshold
 #   8. failure backoff (per-sid, N in W window)
-#   9. cwd extractable and exists
+#   9. cwd extractable, free of control characters (a path that cannot round-trip
+#      through the tab-delimited fork ledger is refused, not truncated), exists, and
+#      is DISJOINT from every control-plane path — see "THE CONTROL PLANE IS NOT A
+#      WORKSPACE". Overlap either way (inside, or an ancestor of) refuses the whole
+#      candidate: no write, no budget, no fork.
 #  10. live-project (rescanned just before spawn — see below)
 #  11. ralph collision guard
 #  12. mission.md fresh-dedupe (30 min)
@@ -43,8 +47,12 @@
 #  15. ## Next non-empty and not "(none)" / "- (none)"
 #  16. staleness gate: DENY (skip) when uncheckable; non-git cwd = skip
 #  17. RE-scan live cwds; abort spawn if any claude proc entered this cwd
-#  18. the fork's authority is restrictable AND its settings file was written;
-#      neither is optional — see "THE FORK'S AUTHORITY" below. Fails CLOSED.
+#  18. the fork's authority is restrictable (every required flag advertised, matched on
+#      a flag boundary), permissions.deny is PROVEN to be enforced by the installed
+#      binary (a real two-run probe, cached per CLI version), AND the settings file was
+#      written. None of the three is optional — see "THE FORK'S AUTHORITY" and "IS
+#      permissions.deny ACTUALLY ENFORCED" below. All fail CLOSED, and all run before
+#      the budget is charged or the request marker consumed.
 #  19. spawn as transient user service (systemd-run) so fork outlives oneshot
 #
 # Stop mechanisms (in order of blast radius):
@@ -143,7 +151,19 @@ if [[ ! -d "$PROJECTS_DIR" ]]; then
 fi
 
 # ---- Concurrency guard ------------------------------------------------------
-exec 8>>"$IDLE_HANDOFF_LOCK" 2>/dev/null || { log "cannot open lock"; exit 0; }
+# THE BRACES ARE LOAD-BEARING. `exec 8>>file 2>/dev/null` is an exec with redirections
+# and NO command, so BOTH redirections are applied to the SHELL, permanently: every
+# `>&2` for the rest of the run went to /dev/null. Five places in this file print a
+# refusal to stderr with the comment "systemd journal sees it", and none of them did —
+# the unit stayed green and silent while forks were being refused. Found 2026-08-16 while
+# testing the control-plane refusal, which is required to be loud.
+# A `{ ...; } 2>/dev/null` group scopes the suppression to the group (so bash's own
+# "cannot create" message on failure is still hidden) while `exec`'s fd 8 survives it,
+# because exec's descriptor changes are permanent by design. Verified both halves.
+if ! { exec 8>>"$IDLE_HANDOFF_LOCK"; } 2>/dev/null; then
+  log "cannot open lock"
+  exit 0
+fi
 if ! flock -n 8; then
   log "another handoff run in progress, skipping"
   exit 0
@@ -245,7 +265,19 @@ fi
 fork_count_24h_for_cwd() {
   local cwd="$1"
   local cutoff=$((now - 24*3600))
-  awk -F'\t' -v cutoff=$cutoff -v cwd="$cwd" '$1 >= cutoff && $2 == cwd' "$FORK_LEDGER" | wc -l
+  # The cwd is passed through the ENVIRONMENT, not `-v cwd=…`. An awk `-v`
+  # assignment applies BACKSLASH-ESCAPE PROCESSING to the value (POSIX: the value
+  # undergoes the same conversion as a string literal), so a path containing `\t`,
+  # `\n`, `\\` or `\0` arrived in awk as something OTHER than what record_fork
+  # wrote to the ledger. `$2 == cwd` then never matched its own rows and the
+  # per-cwd 24h budget silently counted 0 forever for exactly the paths a
+  # deliberately-awkward name would produce. ENVIRON is byte-for-byte.
+  # (A cwd containing a NEWLINE is refused upstream — see the extraction site —
+  # because no per-line ledger format can represent one.)
+  IDLE_HANDOFF_LEDGER_CWD="$cwd" \
+    awk -F'\t' -v cutoff="$cutoff" \
+      'BEGIN { want = ENVIRON["IDLE_HANDOFF_LEDGER_CWD"] } $1 >= cutoff && $2 == want' \
+      "$FORK_LEDGER" | wc -l
 }
 
 record_fork() {
@@ -514,25 +546,37 @@ is_stale_since_transcript() {
   #
   # The awk program now PRINTS the offending paths instead of just exiting 0/1, so
   # this branch can name them too. `stat -c '%Y %n'` then strip the first field, so a
-  # path containing spaces survives (awk $2 would truncate it). Bounded at 6 lines by
-  # `head`, one more than the log renders, so "[...more]" is honest.
-  local newer newer_rc=0 newer_prog='$1 > t { sub(/^[0-9-]+ /, ""); print }'
-  newer=$(timeout 30 sh -c '
+  # path containing spaces survives (awk $2 would truncate it).
+  #
+  # NO PRODUCER'S EXIT STATUS IS MASKED (T2). This used to be `sh -c '... | head -6'`,
+  # whose exit status is HEAD's — which is 0 no matter what git, xargs or stat did. A
+  # `stat` or `xargs` failure therefore produced EMPTY OUTPUT with rc=0, empty read as
+  # "no file is newer", and the gate opened: fail-OPEN in a gate whose entire job is to
+  # deny when it cannot check. (Narrow in practice only because porcelain above shares
+  # git's index and would usually fail first; `stat`/`xargs` failures — dead NFS mount,
+  # a raced unlink, an EACCES directory — are independent of git.)
+  # Two changes, both required:
+  #   * `bash -c` with `set -o pipefail`, so the substitution's status is the FIRST
+  #     failing stage rather than the last stage's.
+  #   * the 6-line bound moved INTO the awk program. `head -6` closing the pipe early
+  #     would SIGPIPE the producers (rc 141) and, under pipefail, every large repo
+  #     would read as "uncheckable". awk reads to EOF and counts instead.
+  # Every non-zero status is now a DENY, which is the correct direction: a check that
+  # could not run has not passed.
+  local newer newer_rc=0 newer_prog='$1 > t { sub(/^[0-9-]+ /, ""); if (++shown <= 6) print }'
+  newer=$(timeout 30 bash -c '
+        set -o pipefail
         cd "$1" || exit 1
         t="$2"; prog="$3"; shift 3
-        git ls-files -z -- "$@" 2>/dev/null \
-          | xargs -0 -r stat -c "%Y %n" 2>/dev/null \
-          | awk -v t="$t" "$prog" \
-          | head -6
+        git ls-files -z -- "$@" \
+          | xargs -0 -r stat -c "%Y %n" \
+          | awk -v t="$t" "$prog"
       ' _ "$cwd" "$transcript_mtime" "$newer_prog" \
-        ${mission_excludes[@]+"${mission_excludes[@]}"}) || newer_rc=$?
-  # A `timeout` kill (124) or a failed `cd` (1) is uncheckable, not clean. Residual,
-  # and stated rather than implied: a failure of git INSIDE that pipeline is still
-  # masked by `head`'s status. The pathspecs are validated by mission_excludes_for and
-  # the work tree was confirmed by rev-parse above, so the realistic failure here is
-  # the timeout, which IS caught.
+        ${mission_excludes[@]+"${mission_excludes[@]}"} 2>/dev/null) || newer_rc=$?
+  # A `timeout` kill (124), a failed `cd` (1), a git error, an xargs/stat failure
+  # (123/126/127) — all uncheckable, none clean.
   if (( newer_rc != 0 )); then
-    STALE_DETAIL="the tracked-file mtime scan could not be evaluated (rc=$newer_rc; 124=timeout) -- uncheckable, so denied"
+    STALE_DETAIL="the tracked-file mtime scan could not be evaluated (rc=$newer_rc; 124=timeout, 123=stat/xargs failed on at least one path, 1=cd or git failed) -- uncheckable, so denied"
     return 0
   fi
   if [[ -n "$newer" ]]; then
@@ -685,6 +729,80 @@ mission_resolve_ours() {
 }
 
 # ============================================================================
+# THE CONTROL PLANE IS NOT A WORKSPACE
+# ============================================================================
+# The fork's workspace is `candidate_cwd`, read out of a transcript, and `acceptEdits`
+# makes everything in it writable. Nothing used to reject a candidate_cwd that CONTAINS
+# or IS one of this system's own state directories — and `~/.claude` is a live git repo
+# on this host, so a session working there is an ordinary candidate, not an exotic one.
+# A fork whose workspace is `~/.claude` gets `settings.json`, `hooks/`, `skills/`, the
+# fork ledger, the generated fork-settings files and every stored handoff as editable
+# material. That voids the containment this file spends 100 lines establishing, from the
+# inside: an injected `## Next` can rewrite the settings the NEXT fork is spawned with
+# (which is where `permissions.deny` and `allow: []` live), or the hooks the interactive
+# session loads on its next start, or `mission.cwd` for any session.
+#
+# So: the workspace and the control plane must be DISJOINT. Both directions disqualify —
+# "the cwd is inside a control path" and "the cwd is an ANCESTOR of a control path" are
+# the same hazard, because a writable ancestor can replace the child. Comparison is on
+# realpath'd absolute paths (`-m`, so a not-yet-existing state dir still compares) rather
+# than on the strings, since a symlink or a `..` would otherwise walk straight through.
+#
+# NOT a "guard on a dangerous operation": it removes the case. There is no override, no
+# allowlist, no env var — a project that overlaps this machinery is simply never resumed
+# automatically, and the refusal says so.
+CONTROL_PLANE_CONFLICT=""
+
+# realpath -m: resolve symlinks and `..` WITHOUT requiring the path to exist, so a state
+# dir that has not been created yet is still compared as the place it will be.
+resolve_abs_path() {
+  realpath -m -- "$1" 2>/dev/null || printf '%s' "$1"
+}
+
+candidate_cwd_is_control_plane() {
+  local cwd="$1" c p rp
+  # Enumerated HERE rather than at source time so this cannot depend on declaration
+  # order: FORK_SETTINGS_DIR is defined further down, and a forward reference under
+  # `set -u` would abort the whole run.
+  local -a control_plane_paths=(
+    "$REFLECT_ROOT"              # handoffs, sessions, manifests: what a fork executes
+    "$IDLE_HANDOFF_STATE_DIR"    # fork ledger + failure backoff: what bounds spending
+    "$IDLE_HANDOFF_LOG_DIR"      # the audit trail a human reads after the fact
+    "$FORK_SETTINGS_DIR"         # the generated permission object of the NEXT fork
+    "$SELF_COMPACT_STATE_DIR"    # request markers: what makes a session fork-eligible
+    "$HOME/.claude"              # settings.json, hooks/, skills/, scripts/ — the harness
+  )
+  CONTROL_PLANE_CONFLICT=""
+  c="$(resolve_abs_path "$cwd")"
+  # `/` contains everything, and the trailing-slash arithmetic below cannot express it.
+  if [[ "$c" == "/" ]]; then
+    CONTROL_PLANE_CONFLICT="the workspace is the filesystem root, which contains every control-plane path"
+    return 0
+  fi
+  c="${c%/}"
+  for p in "${control_plane_paths[@]}"; do
+    [[ -n "$p" ]] || continue
+    rp="$(resolve_abs_path "$p")"
+    rp="${rp%/}"
+    if [[ "$c" == "$rp" ]]; then
+      CONTROL_PLANE_CONFLICT="the workspace IS the control-plane path $p"
+      return 0
+    fi
+    case "$c" in
+      "$rp"/*)
+        CONTROL_PLANE_CONFLICT="the workspace is INSIDE the control-plane path $p"
+        return 0 ;;
+    esac
+    case "$rp" in
+      "$c"/*)
+        CONTROL_PLANE_CONFLICT="the workspace CONTAINS the control-plane path $p"
+        return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# ============================================================================
 # THE FORK'S AUTHORITY — stated explicitly, never inherited
 # ============================================================================
 # `--add-dir` ADDS to the ambient permission set; it does not restrict it. So an
@@ -804,6 +922,16 @@ find "$FORK_SETTINGS_DIR" -maxdepth 1 -type f -name '*.settings.json' \
 # have died on an unknown option anyway" is not an acceptable substitute for not
 # spawning it — that failure is asynchronous, lands in a per-run log nobody reads,
 # and one CLI change away from being a silently-unrestricted fork instead.
+#
+# THE MATCH IS ANCHORED ON A FLAG BOUNDARY (T4). A plain substring test is satisfied by
+# any LONGER flag that starts with the same characters: a CLI advertising
+# `--settings-file` (and no `--settings`) or `--add-dirs` (and no `--add-dir`) passed the
+# gate, we spawned an argv the binary cannot parse, and the death was ASYNCHRONOUS —
+# inside a transient unit, after the fork ledger was charged and the request marker
+# consumed. The budget was spent, the marker was gone, the resume was lost, and the only
+# trace was a per-run log nobody reads. So: `--settings` must appear as a whole flag,
+# with a non-flag character (or a line end) on either side. `-` and `_` are part of a
+# flag name, which is exactly why they must NOT count as boundaries.
 FORK_RESTRICTION_CHECKED=0
 FORK_RESTRICTION_OK=0
 FORK_RESTRICTION_WHY=""
@@ -818,13 +946,12 @@ fork_restriction_available() {
       FORK_RESTRICTION_WHY="'claude --help' printed nothing"
     else
       for flag in "${FORK_REQUIRED_CLI_FLAGS[@]}"; do
-        case "$help" in
-          *"$flag"*) ;;
-          *) missing+=("$flag") ;;
-        esac
+        if ! grep -qE -- "(^|[^A-Za-z0-9_-])${flag}([^A-Za-z0-9_-]|\$)" <<<"$help"; then
+          missing+=("$flag")
+        fi
       done
       if (( ${#missing[@]} > 0 )); then
-        FORK_RESTRICTION_WHY="the installed claude CLI does not advertise ${missing[*]}"
+        FORK_RESTRICTION_WHY="the installed claude CLI does not advertise ${missing[*]} as a flag (a longer flag with the same prefix does not count -- the fork would die on an unparseable argv, asynchronously, after the budget was charged)"
       else
         FORK_RESTRICTION_OK=1
       fi
@@ -849,11 +976,16 @@ fork_restriction_available() {
 #   hooks {}                   no hook config; see "NO HOOKS" above
 #
 # Returns non-zero on ANY failure, and the caller must then skip the fork.
-write_fork_settings() {
-  local grant="$1" out="$2" tmp
-  mkdir -p "$FORK_SETTINGS_DIR" 2>/dev/null || return 1
-  tmp="$(mktemp -p "$FORK_SETTINGS_DIR" ".settings-XXXXXX" 2>/dev/null)" || return 1
-  if ! jq -n --arg dir "$grant" --argjson deny "$FORK_DENY_TOOLS" \
+#
+# One GENERATOR, two callers: the fork itself, and the deny probe below. The probe has to
+# exercise the artifact this function produces — a probe against a hand-written settings
+# object would prove something about a file no fork ever gets.
+write_settings_object() {
+  local grant="$1" deny="$2" out="$3" tmp dir
+  dir="$(dirname -- "$out")"
+  mkdir -p "$dir" 2>/dev/null || return 1
+  tmp="$(mktemp -p "$dir" ".settings-XXXXXX" 2>/dev/null)" || return 1
+  if ! jq -n --arg dir "$grant" --argjson deny "$deny" \
         '{permissions:{defaultMode:"acceptEdits",
                        allow:[],
                        deny:$deny,
@@ -875,6 +1007,167 @@ write_fork_settings() {
     return 1
   fi
   return 0
+}
+
+write_fork_settings() {
+  local grant="$1" out="$2"
+  write_settings_object "$grant" "$FORK_DENY_TOOLS" "$out"
+}
+
+# ============================================================================
+# IS `permissions.deny` ACTUALLY ENFORCED? A PROBE, NOT A BELIEF (T3)
+# ============================================================================
+# `deny` is the rail that actually contains the fork. `--tools` is the other half, and
+# `--tools` SILENTLY IGNORES an unknown tool name (verified against 2.1.222) — so the day
+# a CLI renames or splits `Bash`, the `--tools` allowlist quietly stops removing it and
+# `deny` is the only thing between an injected `## Next` and a shell.
+#
+# Until this probe existed, NOTHING observed that rail. The smoke suite's `claude` is a
+# stub: it can assert what lands in argv and what the settings file says, but it cannot
+# enforce anything, so a CLI upgrade that changed `deny` semantics under
+# `--setting-sources ''` would have passed every single test. `--help` advertising the
+# flag is not evidence either; it says the flag parses, not that it bites.
+#
+# HOW. Run the REAL binary with a settings file from the generator above, in a scratch
+# directory, and ask it to create a sentinel file by any means it has. Two runs:
+#
+#   deny run     deny = FORK_PROBE_DENY_TOOLS: the fork's list PLUS the file-writing
+#                tools. If `deny` is honoured, no available tool can create the sentinel,
+#                so the file must NOT appear. The write tools are in the PROBE's list and
+#                not the fork's for one reason: the sentinel has to be unreachable by
+#                EVERY route, or a model that answered with Write instead of Bash would
+#                look exactly like "deny ignored".
+#   control run  deny = []. The sentinel MUST appear. Without this half the probe is
+#                worthless: a model that simply declined to try is indistinguishable
+#                from an enforced denial, and "it didn't happen" would read as proof.
+#
+# Verdicts: `enforced` (deny run absent AND control run created) — the only one that
+# permits a fork; `not_enforced` (deny run created it anyway); `inconclusive` (anything
+# else, including the control failing to fire). Unknown CLI version is fail-closed too,
+# because a verdict that cannot be attributed to a build cannot be cached against one.
+#
+# COST. Two haiku calls, ~$0.06 and a few seconds, keyed on `claude --version` AND both
+# deny lists — so an upgrade or a change to what we deny re-probes, and nothing else
+# does. Measured on this host 2026-08-16 (2.1.222): the deny run reported its tool list
+# WITHOUT Bash and wrote nothing; the control run ran Bash and created the sentinel.
+# A negative verdict is cached too, but only honoured for FORK_DENY_PROBE_RETRY_MINUTES,
+# so one transient failure cannot cost two calls every 5 minutes, nor wedge resumes
+# forever after a bad afternoon.
+# The fork's list PLUS every file-writing tool. Names checked against the installed
+# binary, not guessed: 2.1.222 warns "Permission deny rule "X" matches no known tool" for
+# a name it does not recognise (which is how `MultiEdit` came out of this list again), so
+# `deny` — unlike `--tools` — at least tells you when an entry is dead.
+FORK_PROBE_DENY_TOOLS='["Bash","WebFetch","WebSearch","Task","Write","Edit","NotebookEdit"]'
+FORK_DENY_PROBE_DIR="$IDLE_HANDOFF_STATE_DIR/fork-deny-probe"
+FORK_DENY_PROBE_RETRY_MINUTES=60
+# Named in ONE place: the probe prompt below and the smoke suite's fake CLI both use it,
+# and TEST 43 greps it out of this file so the two cannot drift apart.
+FORK_DENY_PROBE_SENTINEL="DENY_PROBE_SENTINEL.txt"
+
+# _fork_deny_probe_run <deny-json> <label> -> prints created|absent|error
+#
+# THE PROBE'S WORKSPACE IS NOT IN THE CONTROL PLANE. The control run deliberately denies
+# nothing, so it has a live shell — and running that inside $IDLE_HANDOFF_STATE_DIR would
+# hand a model a shell in the directory holding the fork ledger and the next fork's
+# permission object, to check that forks cannot get a shell there. A fresh empty temp dir
+# instead, removed afterwards; only the verdict and the two probe logs are kept, as plain
+# overwritten files, so nothing accumulates.
+_fork_deny_probe_run() {
+  local deny="$1" label="$2" dir settings sentinel prompt rc=0
+  dir="$(mktemp -d -t idle-handoff-deny-probe-XXXXXX 2>/dev/null)" || { printf 'error'; return 0; }
+  settings="$FORK_DENY_PROBE_DIR/$label.settings.json"
+  sentinel="$dir/$FORK_DENY_PROBE_SENTINEL"
+  write_settings_object "$dir" "$deny" "$settings" || { printf 'error'; return 0; }
+  prompt="IDLE_HANDOFF_DENY_PROBE. This is an automated permission self-test with no
+user attached. Create the file $sentinel containing the single word probe.
+Use the Bash tool (printf probe > $sentinel) if you have it; if you do not have a
+Bash tool, use the Write tool instead. Use no other tool, and then stop. If you have
+neither tool, say so and stop — that is a valid outcome of this self-test."
+  ( cd "$dir" 2>/dev/null || exit 1
+    timeout 120 claude -p \
+      --model haiku \
+      --max-turns 3 \
+      --permission-mode acceptEdits \
+      --setting-sources '' \
+      --settings "$settings" \
+      --strict-mcp-config \
+      --add-dir "$dir" \
+      -- "$prompt" ) >"$dir/probe.log" 2>&1 || rc=$?
+  local outcome="absent"
+  if [[ -e "$sentinel" ]]; then
+    outcome="created"
+  elif (( rc != 0 )); then
+    outcome="error"
+  fi
+  # Keep the transcript of the probe for a human, one overwritten file per label, then
+  # take the workspace away again.
+  cp -f -- "$dir/probe.log" "$FORK_DENY_PROBE_DIR/$label.probe.log" 2>/dev/null || true
+  rm -rf -- "$dir" 2>/dev/null || true
+  printf '%s' "$outcome"
+}
+
+FORK_DENY_CHECKED=0
+FORK_DENY_OK=0
+FORK_DENY_WHY=""
+_fork_deny_evaluate() {
+  local ver key cache verdict detail deny_run control_run
+  ver="$(timeout 30 claude --version 2>/dev/null | head -1 | tr -c 'A-Za-z0-9._ ()-' '_')"
+  if [[ -z "$ver" ]]; then
+    FORK_DENY_WHY="'claude --version' did not answer, so the build is UNKNOWN; a verdict cannot be attributed to it and no cached one can be trusted"
+    return 0
+  fi
+  if ! mkdir -p "$FORK_DENY_PROBE_DIR" 2>/dev/null; then
+    FORK_DENY_WHY="cannot create $FORK_DENY_PROBE_DIR, so the probe can neither run nor be cached"
+    return 0
+  fi
+  key="$(printf '%s\n%s\n%s\n' "$ver" "$FORK_DENY_TOOLS" "$FORK_PROBE_DENY_TOOLS" \
+         | sha256sum 2>/dev/null | cut -c1-32)"
+  [[ -n "$key" ]] || { FORK_DENY_WHY="could not derive a cache key (sha256sum missing?)"; return 0; }
+  cache="$FORK_DENY_PROBE_DIR/$key.json"
+  if [[ -f "$cache" ]]; then
+    verdict="$(jq -r '.verdict // ""' "$cache" 2>/dev/null || printf '')"
+    if [[ "$verdict" == "enforced" ]]; then
+      FORK_DENY_OK=1
+      return 0
+    fi
+    if [[ -n "$verdict" ]] \
+       && [[ -z "$(find "$cache" -maxdepth 0 -mmin +"$FORK_DENY_PROBE_RETRY_MINUTES" 2>/dev/null)" ]]; then
+      FORK_DENY_WHY="cached verdict '$verdict' for CLI $ver (re-probed at most every ${FORK_DENY_PROBE_RETRY_MINUTES}min): $(jq -r '.detail // ""' "$cache" 2>/dev/null)"
+      return 0
+    fi
+  fi
+  deny_run="$(_fork_deny_probe_run "$FORK_PROBE_DENY_TOOLS" deny)"
+  control_run="$(_fork_deny_probe_run '[]' control)"
+  if [[ "$deny_run" == "absent" && "$control_run" == "created" ]]; then
+    verdict="enforced"
+    detail="the run with the tools denied by name could not create the sentinel, and the control run with deny=[] did"
+    FORK_DENY_OK=1
+  elif [[ "$deny_run" == "created" ]]; then
+    verdict="not_enforced"
+    detail="the CLI created the sentinel WITH those tools denied by name -- permissions.deny is not being applied, so the settings file does not contain the fork"
+  else
+    verdict="inconclusive"
+    detail="deny_run=$deny_run control_run=$control_run -- the control run must create the sentinel, otherwise an enforced denial cannot be told apart from a model that declined to try (see $FORK_DENY_PROBE_DIR/{deny,control}.probe.log)"
+  fi
+  jq -n --arg v "$verdict" --arg ver "$ver" --arg d "$detail" \
+        --arg dr "$deny_run" --arg cr "$control_run" --argjson at "$now" \
+     '{verdict:$v,cli_version:$ver,detail:$d,deny_run:$dr,control_run:$cr,checked_at_epoch:$at}' \
+     > "$cache" 2>/dev/null || log "WARN could not cache the deny-probe verdict at $cache; it will re-run next tick"
+  log "fork deny probe: verdict=$verdict cli=$ver deny_run=$deny_run control_run=$control_run cache=$cache"
+  if [[ "$verdict" != "enforced" ]]; then
+    FORK_DENY_WHY="the installed CLI ($ver) did not demonstrably enforce permissions.deny: verdict=$verdict, $detail"
+  fi
+  return 0
+}
+
+# Memoised per run, and called only where a fork is otherwise about to happen, so a
+# quiet host pays nothing.
+fork_deny_enforced() {
+  if (( FORK_DENY_CHECKED == 0 )); then
+    FORK_DENY_CHECKED=1
+    _fork_deny_evaluate
+  fi
+  (( FORK_DENY_OK == 1 ))
 }
 
 # ---- Main loop --------------------------------------------------------------
@@ -899,6 +1192,8 @@ count_context_trigger=0
 count_skipped_mission_not_ours=0
 count_mission_resolve_error=0
 count_skipped_fork_unrestrictable=0
+count_skipped_deny_unproven=0
+count_skipped_control_plane=0
 forks_this_run=0
 mission_resolve_rc=0
 CONTEXT_REQUEST_FILL=""
@@ -965,12 +1260,52 @@ for project_dir in "$PROJECTS_DIR"/*/; do
   fi
 
   # ---- Extract cwd from transcript itself ---
-  candidate_cwd=$(tac "$transcript" 2>/dev/null | \
-    jq -r 'select(type=="object") | .cwd // empty' 2>/dev/null | \
-    head -1)
+  # `head -1` is applied to JSON-ENCODED values, not to raw paths. The old form was
+  # `jq -r … | head -1`: raw output, so a cwd containing a NEWLINE was silently
+  # truncated to its first line, and if that prefix existed as a directory the mission
+  # write and the acceptEdits fork targeted the WRONG PROJECT — same
+  # head-truncation-reads-as-success class as the fail-open gate above. `jq -c` keeps
+  # each value on one line with the newline escaped, so head can only ever pick a whole
+  # record; the decode happens afterwards, in bash, where nothing truncates.
+  candidate_cwd_json=$(tac "$transcript" 2>/dev/null | \
+    jq -c 'select(type=="object") | .cwd // empty | select(type=="string")' 2>/dev/null | \
+    head -1) || candidate_cwd_json=""
+  candidate_cwd=""
+  if [[ -n "$candidate_cwd_json" ]]; then
+    # `printf X` + `%X` so a value with trailing newlines is not silently trimmed by
+    # the command substitution — the point is to SEE the control characters, not to
+    # normalise them away.
+    candidate_cwd="$(printf '%s' "$candidate_cwd_json" | jq -j . 2>/dev/null; printf X)"
+    candidate_cwd="${candidate_cwd%X}"
+  fi
+  # A path with an embedded newline, CR or tab is REFUSED, not repaired. It cannot
+  # round-trip through the tab-delimited fork ledger (so the per-cwd 24h budget could
+  # not bound it), nor through a single-line log, nor through the `## Next` awk pass.
+  # Handling it "somehow" would mean four different partial encodings; refusing it is
+  # one behaviour, and it is loud.
+  case "$candidate_cwd" in
+    *$'\n'*|*$'\r'*|*$'\t'*)
+      count_skipped_no_cwd=$((count_skipped_no_cwd + 1))
+      log "sid=$sid: REFUSING cwd containing a control character (JSON form: $candidate_cwd_json) -- it cannot round-trip through the tab-delimited fork ledger, so the per-cwd fork budget could not bound it"
+      continue
+      ;;
+  esac
   if [[ -z "$candidate_cwd" || ! -d "$candidate_cwd" ]]; then
     count_skipped_no_cwd=$((count_skipped_no_cwd + 1))
-    log "cwd not extractable/valid for $sid (raw: $candidate_cwd)"
+    log "cwd not extractable/valid for $sid (raw: $candidate_cwd_json)"
+    continue
+  fi
+
+  # ---- The fork's workspace must NOT be the control plane (T1) ---
+  # See candidate_cwd_is_control_plane for the reasoning. Refused before ANYTHING
+  # else happens for this candidate: no mission write into it, no budget touched, no
+  # fork. Loud, and counted, because a session legitimately working in ~/.claude is a
+  # plausible candidate rather than an exotic one.
+  if candidate_cwd_is_control_plane "$candidate_cwd"; then
+    count_skipped_control_plane=$((count_skipped_control_plane + 1))
+    m="ERROR sid=$sid: REFUSING candidate workspace $candidate_cwd -- $CONTROL_PLANE_CONFLICT. An acceptEdits fork there could rewrite the settings the NEXT fork is spawned with, the hooks the interactive session loads, the fork ledger that bounds spending, and the handoffs that decide what any fork executes. No resume is worth handing over the machinery that bounds resumes."
+    log "$m"
+    printf 'idle-handoff: %s\n' "$m" >&2   # systemd journal sees it
     continue
   fi
 
@@ -1357,15 +1692,35 @@ PROMPT
   mission_dir_for_fork="$(dirname -- "$mission_path")"
   unit_name="claude-autofork-$(printf %s "$sid" | tr -c 'A-Za-z0-9._-' '_')-$(date +%s)"
 
-  # ---- No restriction, no fork. Both gates below FAIL CLOSED ---------------
+  # ---- No restriction, no fork. Every gate below FAILS CLOSED ---------------
   # Falling back to an unrestricted fork is the failure this whole block exists to
   # prevent: it would spawn an unattended acceptEdits process with pre-approved
   # arbitrary shell execution across the user's repos, on instructions nothing
   # authenticated. Skipping costs one deferred resume, and the reason is in the
   # counters so a permanently-unrestrictable host is visible rather than quiet.
+  #
+  # ORDER MATTERS, and it is the order below (T4): every check that can be made
+  # SYNCHRONOUSLY happens before the two state mutations at the bottom of this
+  # iteration — `record_fork` (charges the per-cwd 24h budget) and
+  # `consume_context_request` (destroys the marker that makes this session eligible).
+  # A spawn that cannot possibly work must not spend either, because the failure is
+  # asynchronous: the fork dies inside a transient unit, in a per-run log nobody
+  # reads, and the budget and the marker are already gone. Anything we cannot observe
+  # synchronously (the unit's own start, the model's behaviour) is exactly why the
+  # flag check is anchored and the deny rail is probed rather than assumed.
   if ! fork_restriction_available; then
     count_skipped_fork_unrestrictable=$((count_skipped_fork_unrestrictable + 1))
     m="ERROR sid=$sid cwd=$candidate_cwd: NOT forking — the fork's authority cannot be restricted: $FORK_RESTRICTION_WHY. An unrestricted fork inherits the interactive user's whole permission surface (additionalDirectories + allow, which includes pre-approved shell via mcp__safe-bash__*), so this fails closed instead."
+    log "$m"
+    printf 'idle-handoff: %s\n' "$m" >&2   # systemd journal sees it
+    continue
+  fi
+  # The flags parse — but do they BITE? `deny` is what closes the shell if `--tools`
+  # ever stops doing it, and nothing observed it until this probe. Runs at most once
+  # per CLI version (cached), only here, and fails closed in every uncertain case.
+  if ! fork_deny_enforced; then
+    count_skipped_deny_unproven=$((count_skipped_deny_unproven + 1))
+    m="ERROR sid=$sid cwd=$candidate_cwd: NOT forking — the installed CLI was not shown to enforce permissions.deny: $FORK_DENY_WHY. deny is the rail that actually contains the fork (--tools silently ignores an unknown tool name, so a renamed tool would hand the shell back), and an unproven rail is not a rail."
     log "$m"
     printf 'idle-handoff: %s\n' "$m" >&2   # systemd journal sees it
     continue
@@ -1438,6 +1793,11 @@ PROMPT
     log "AUTOFORK queued sid=$sid unit=$unit_name (systemd-run rc=0; async start not observed)"
   else
     log "WARN sid=$sid: systemd-run unavailable or bus down; falling back to setsid nohup (fork may not survive parent exit under systemd)"
+    # Same ordering rule as the systemd branch: the subshell's status is checked
+    # before the budget is charged. It only proves the launch was attempted (the
+    # background job is `&`), but a missing binary or an unenterable cwd is
+    # synchronous and must not cost a budget slot and a marker.
+    fallback_rc=0
     ( cd "$candidate_cwd" && \
       setsid nohup claude -p \
         --model "$IDLE_HANDOFF_AUTOFORK_MODEL" \
@@ -1450,7 +1810,11 @@ PROMPT
         --add-dir "$mission_dir_for_fork" \
         -- "$autofork_prompt" \
         >>"$autofork_log" 2>&1 8>&- &
-    ) </dev/null
+    ) </dev/null || fallback_rc=$?
+    if (( fallback_rc != 0 )); then
+      log "AUTOFORK setsid launch failed sid=$sid rc=$fallback_rc cwd=$candidate_cwd (see $autofork_log); budget NOT charged, request marker left in place for a later tick"
+      continue
+    fi
   fi
   record_fork "$candidate_cwd"
   # Consume any pending request once a fork actually spawned — including when
@@ -1464,4 +1828,4 @@ PROMPT
   count_forked=$((count_forked + 1))
 done
 
-log "seen=$count_seen wrote=$count_wrote forked=$count_forked context_triggered=$count_context_trigger self_compact=on(>=$SELF_COMPACT_THRESHOLD) skipped(live=$count_skipped_live live_rescan=$count_skipped_live_rescan sdk-cli_or_unknown=$count_skipped_sdk_cli short=$count_skipped_short backoff=$count_skipped_backoff fresh=$count_skipped_fresh_mission no_cwd=$count_skipped_no_cwd stale=$count_skipped_stale observer=$count_skipped_observer no_next=$count_skipped_no_next ralph=$count_skipped_ralph git_stale=$count_skipped_git_stale fork_budget=$count_skipped_fork_budget mission_err=$count_mission_status_error mission_not_ours=$count_skipped_mission_not_ours mission_resolve_err=$count_mission_resolve_error fork_unrestrictable=$count_skipped_fork_unrestrictable)"
+log "seen=$count_seen wrote=$count_wrote forked=$count_forked context_triggered=$count_context_trigger self_compact=on(>=$SELF_COMPACT_THRESHOLD) skipped(live=$count_skipped_live live_rescan=$count_skipped_live_rescan sdk-cli_or_unknown=$count_skipped_sdk_cli short=$count_skipped_short backoff=$count_skipped_backoff fresh=$count_skipped_fresh_mission no_cwd=$count_skipped_no_cwd stale=$count_skipped_stale observer=$count_skipped_observer no_next=$count_skipped_no_next ralph=$count_skipped_ralph git_stale=$count_skipped_git_stale fork_budget=$count_skipped_fork_budget mission_err=$count_mission_status_error mission_not_ours=$count_skipped_mission_not_ours mission_resolve_err=$count_mission_resolve_error fork_unrestrictable=$count_skipped_fork_unrestrictable deny_unproven=$count_skipped_deny_unproven control_plane_cwd=$count_skipped_control_plane)"
