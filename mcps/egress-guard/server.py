@@ -123,6 +123,9 @@ def _tool_declare(args: dict) -> str:
     min_interval_s = _optional_number(args, "min_interval_s")
     if min_interval_s is None:
         raise ValueError("argument `min_interval_s` is required for declare.")
+    description = args.get("description")
+    if description is not None and not isinstance(description, str):
+        raise ValueError("argument `description` must be a string if given.")
     expected_requests = _optional_number(args, "expected_requests")
     expected_cost = _optional_number(args, "expected_cost")
     ceiling_requests = _optional_number(args, "ceiling_requests")
@@ -136,6 +139,7 @@ def _tool_declare(args: dict) -> str:
         expected_cost=expected_cost,
         ceiling_requests=None if ceiling_requests is None else int(ceiling_requests),
         pushback=pushback,
+        description=description,
     )
     return json.dumps(
         {
@@ -551,7 +555,13 @@ def _handle(msg: dict) -> None:
         _respond(msg_id, error={"code": -32601, "message": f"Method not found: {method}"})
 
 
-def _drain_in_flight(timeout_s: float = 120.0) -> None:
+def _drain_in_flight(timeout_s: float = 900.0) -> None:
+    """Wait out parked calls on shutdown.
+
+    Must exceed any legitimate `max_wait_s`: a parked acquire has already
+    debited its slot and its budget event, so killing it at EOF spends the
+    budget on a request that never goes out.
+    """
     """Let in-flight calls finish after stdin closes.
 
     Workers are daemon threads, so exiting immediately on EOF would strand a

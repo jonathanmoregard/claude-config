@@ -508,6 +508,7 @@ class EgressGuard:
         expected_cost: Optional[float] = None,
         ceiling_requests: Optional[int] = None,
         pushback: Optional[str] = None,
+        description: Optional[str] = None,
     ) -> float:
         """Register `resource` and ratchet its floor up to `min_interval_s`.
 
@@ -537,6 +538,7 @@ class EgressGuard:
                 ("expected_cost", expected_cost),
                 ("ceiling_requests", ceiling_requests),
                 ("pushback", pushback),
+                ("description", description),
             ):
                 if value is not None:
                     declaration[key] = value

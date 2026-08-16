@@ -398,8 +398,16 @@ def test_budget_is_shared_across_guard_instances(state_dir, policy_file, clock):
 
 
 def test_corrupt_state_file_fails_safe(state_dir, policy_file, clock):
+    """Corrupt history must cost a full floor AND keep a ratcheted floor.
+
+    The declared interval is deliberately well above the policy minimum: if the
+    ratchet were lost with the rest of the state, this waits 4s instead of 12s
+    and the assertion catches it. A version of this test that declared nothing
+    above the policy floor passed even while the ratchet was being dropped.
+    """
     policy = policy_file(defaults={"min_interval_s": 4.0})
     guard = make_guard(state_dir, policy, clock)
+    guard.declare(RESOURCE, 12.0)
     guard.acquire(RESOURCE)
 
     path = guard.state_path(RESOURCE)
@@ -408,8 +416,10 @@ def test_corrupt_state_file_fails_safe(state_dir, policy_file, clock):
 
     before = clock.now
     guard.acquire(RESOURCE)
-    # Unreadable history => assume a request just went out and wait a full floor.
-    assert clock.now - before == pytest.approx(4.0)
+    # Unreadable history => assume a request just went out and wait a full floor,
+    # and that floor is still the declared 12s, not the 4s policy minimum.
+    assert clock.now - before == pytest.approx(12.0)
+    assert guard.status(RESOURCE)["floor_s"] == pytest.approx(12.0)
 
 
 def test_absurd_future_reservation_is_clamped(state_dir, policy_file, clock):
@@ -511,9 +521,22 @@ def _run_child(state_dir, policy, n, declared, resource):
 
 
 def test_concurrent_processes_share_one_cadence(state_dir, policy_file):
-    """Three processes, one at a 'fast' declared interval, one aggregate floor."""
-    floor = 0.05
-    policy = policy_file(defaults={"min_interval_s": floor, "max_wait_s": 30.0})
+    """Three processes, one slow participant, one aggregate floor.
+
+    The policy minimum is 200x smaller than the declared interval, so the
+    cadence asserted below can only come from the DECLARATION propagating
+    across processes. With every child declaring at or below the policy
+    minimum, this test passed even when declarations were ignored entirely.
+
+    The declaration is made BEFORE any child starts, which is the contract: a
+    declaration cannot retroactively slow a request that was already granted,
+    so declare before first contact or the policy floor is the only protection.
+    """
+    floor = 2.0
+    policy = policy_file(defaults={"min_interval_s": 0.01, "max_wait_s": 60.0})
+    EgressGuard(state_dir=state_dir, policy_path=policy).declare(
+        "concurrent.example", floor
+    )
 
     procs = [
         _run_child(state_dir, policy, 4, floor, "concurrent.example"),
