@@ -332,7 +332,25 @@ def main() -> int:
         "requested_at_epoch": now,
         "requested_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
     }
-    write_json_atomic(state_dir() / f"{sid}.request.json", request)
+    # THE MARKER IS THE ONLY THING idle-handoff READS. Its write status used to be
+    # discarded: the fire state persisted (so the session was `armed: false` and would
+    # not retry this crossing), the FIRE line below logged a success, and no marker
+    # existed — so idle-handoff never widened the idle gate and the context resume
+    # silently degraded to the 45-minute idle floor, indistinguishable from the feature
+    # working. Counted in the state file as well as logged: one failed write is a bad
+    # afternoon, a rising count is a broken state dir.
+    marker_path = state_dir() / f"{sid}.request.json"
+    marker_written = write_json_atomic(marker_path, request)
+    if not marker_written:
+        state["request_write_failures"] = state.get("request_write_failures", 0) + 1
+        state["last_request_write_failed_at"] = now
+        # Best effort: if THIS write fails too the state dir is gone, and the log line
+        # below is the whole record.
+        write_json_atomic(state_dir() / f"{sid}.state.json", state)
+        log(f"sid={sid} ERROR could not write the request marker {marker_path} "
+            f"(failures={state['request_write_failures']}); the handoff will still be "
+            f"written, but idle-handoff has nothing to widen its idle gate with, so the "
+            f"resume degrades to the 45-minute idle floor")
 
     reflect_sh = claude_dir() / "skills" / "session-reflect" / "reflect.sh"
     if reflect_sh.exists():
@@ -341,7 +359,8 @@ def main() -> int:
         result = f"reflect_sh_missing:{reflect_sh}"
     log(f"sid={sid} FIRE crossing={state['crossings']} "
         f"tokens={occ.total_tokens}/{occ.window} "
-        f"fill={occ.fill_pct:.3f} threshold={THRESHOLD} cwd={cwd} mission={result}")
+        f"fill={occ.fill_pct:.3f} threshold={THRESHOLD} cwd={cwd} "
+        f"marker={'ok' if marker_written else 'FAILED'} mission={result}")
     gc_state()
     return 0
 
