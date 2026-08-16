@@ -824,7 +824,7 @@ run_worker() {
   fi
 
   # --- Mission mode: raw markdown out, skip the reflection-JSON pipeline ---
-  # The AUTHORITATIVE handoff is $REFLECT_ROOT/sessions/<sid>/mission.md —
+  # The AUTHORITATIVE handoff is $REFLECT_ROOT/sessions/<sid>/handoff/mission.md —
   # outside every repo, so no repo content can plant, forge or tamper with what a
   # later unattended fork executes. See "MISSION HANDOFF" in lib.sh for why three
   # earlier attempts to make a repo-resident file trustworthy all failed.

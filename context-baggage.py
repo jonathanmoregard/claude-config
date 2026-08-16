@@ -74,8 +74,8 @@ def main():
         "STOP taking new tasks. "
         # NOT tasks/mission.md. That path is a machine-owned symlink to the
         # human-readable copy of the out-of-repo handoff
-        # ($REFLECT_ROOT/sessions/<sid>/mission.md), so a write-through here would
-        # clobber the copy — and the next mission run would silently overwrite
+        # ($REFLECT_ROOT/sessions/<sid>/handoff/mission.md), so a write-through here
+        # would clobber the copy — and the next mission run would silently overwrite
         # whatever the model had written. tasks/handoff.md is human-owned: no
         # automation reads it, no automation writes it, and it stays visible to
         # idle-handoff's freshness gate, which is correct — a human handoff IS the

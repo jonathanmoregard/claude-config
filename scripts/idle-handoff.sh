@@ -698,7 +698,7 @@ for project_dir in "$PROJECTS_DIR"/*/; do
 
   # ---- Resolve the AUTHORITATIVE mission handoff ---
   # NOT anything under $candidate_cwd. The handoff lives at
-  # $REFLECT_ROOT/sessions/<sid>/mission.md, outside every repo; the tasks/
+  # $REFLECT_ROOT/sessions/<sid>/handoff/mission.md, outside every repo; the tasks/
   # mission files are human copies that no automation reads. Reading a repo file
   # here is what would let a planted `## Next` drive an unattended acceptEdits
   # fork, so the read source is out of the tree instead of being guarded.

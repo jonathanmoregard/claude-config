@@ -19,7 +19,7 @@ mission_exists() {
 }
 
 # Name the AUTHORITATIVE handoff when session-reflect can resolve one
-# ($REFLECT_ROOT/sessions/<sid>/mission.md, out of repo). Falls back to the
+# ($REFLECT_ROOT/sessions/<sid>/handoff/mission.md, out of repo). Falls back to the
 # human-facing `tasks/mission.md` convention when there is none — acceptable here
 # and nowhere else: this hook only injects a "re-read your handoff" reminder into
 # an interactive session whose human owns this cwd. It never drives an unattended
