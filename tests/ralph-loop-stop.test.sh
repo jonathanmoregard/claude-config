@@ -32,7 +32,9 @@ mk_transcript() {  # $1 = last assistant text
 }
 
 run_hook() {  # $1 = session id
-  jq -cn --arg s "$1" --arg t "$TRANSCRIPT" '{session_id:$s,transcript_path:$t,stop_hook_active:false,cwd:"/tmp"}' | bash "$HOOK" 2>&1
+  # stdout only: the hook's warnings go to stderr, and mixing them into the
+  # capture would corrupt the JSON the assertions parse.
+  jq -cn --arg s "$1" --arg t "$TRANSCRIPT" '{session_id:$s,transcript_path:$t,stop_hook_active:false,cwd:"/tmp"}' | bash "$HOOK" 2>/dev/null
 }
 
 check() {  # $1=name $2=condition-result
@@ -87,11 +89,24 @@ OUT=$(run_hook "$SID")
 DEC=$(echo "$OUT" | jq -r '.decision' 2>/dev/null)
 check "promise=null -> still blocks" "$([[ "$DEC" == "block" ]] && echo pass || echo fail)"
 
-# 8. missing transcript -> stop cleanly
+# 8. missing / unflushed transcript -> keep looping, do NOT treat as completion.
+#    (Reading the transcript once killed loops on iteration 1 about a third of
+#    the time in live headless runs, before the flush had landed.)
 mk_state 1 0 'null'
 TRANSCRIPT="$TMP/nope.jsonl"
 OUT=$(run_hook "$SID")
-check "missing transcript -> state removed" "$([[ ! -f "$STATE" ]] && echo pass || echo fail)"
+DEC=$(echo "$OUT" | jq -r '.decision' 2>/dev/null)
+ITER=$(grep '^iteration:' "$STATE" 2>/dev/null | sed 's/iteration: *//')
+check "unreadable transcript -> state kept" "$([[ -f "$STATE" ]] && echo pass || echo fail)"
+check "unreadable transcript -> still blocks" "$([[ "$DEC" == "block" ]] && echo pass || echo fail)"
+check "unreadable transcript -> iteration bumped" "$([[ "$ITER" == "2" ]] && echo pass || echo fail)"
+check "unreadable transcript -> flagged in systemMessage" "$(echo "$OUT" | jq -r '.systemMessage' | grep -q 'transcript unreadable' && echo pass || echo fail)"
+
+# 8b. unreadable transcript still respects max_iterations
+mk_state 4 4 'null'
+OUT=$(run_hook "$SID")
+check "unreadable transcript + max reached -> stops" "$([[ ! -f "$STATE" ]] && echo pass || echo fail)"
+rm -f "$STATE"
 
 # 9. multi-line promise across tool-call turns
 TRANSCRIPT="$TMP/transcript.jsonl"
