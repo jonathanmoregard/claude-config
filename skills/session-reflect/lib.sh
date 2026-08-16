@@ -722,12 +722,46 @@ reflect_artifact_gc() {
 # whereas moving somebody's file is a machine write onto a human-owned path.
 
 # Line-1 provenance stamp, written on BOTH the authoritative handoff and the human
-# copy. On the handoff it is informational (git sha + timestamp, used for
-# staleness). On the copy it is the GC delete rail. Deliberately strict: the
-# orchestrator's own hand-written mission.md carries a decoy
-# `<!-- written-against: repo=… branch=… base=… ts=… -->` comment which must NOT
-# be mistaken for ours.
+# copy.
+#
+# IT IS NOT A STALENESS SIGNAL, AND NOTHING READS IT AS ONE. Whether the world moved
+# is decided entirely by the git freshness gate in `scripts/idle-handoff.sh`, which
+# compares HEAD and file mtimes against the transcript mtime; the stamp is never
+# consulted there or anywhere else on that path. The stamp has exactly two readers,
+# `mission_has_our_stamp` and `mission_has_our_legacy_stamp` below, and exactly two
+# callers between them: `mission_gc`'s DELETE rail (may we remove this file we
+# appear to have written?) and `reflect.sh --mission-copies`' allowlist (which files
+# in this tree did we write, so the gate can subtract them?). Both are about
+# authorship of a file in a repo. Neither says anything about freshness, and on the
+# authoritative handoff the stamp is purely informational for a human reader.
+# Earlier revisions of this comment and of the fork prompt claimed otherwise; that
+# claim invited someone to re-trust it, so it is stated negatively here on purpose.
+#
+# Deliberately strict: the orchestrator's own hand-written mission.md carries a
+# decoy `<!-- written-against: repo=… branch=… base=… ts=… -->` comment which must
+# NOT be mistaken for ours.
 REFLECT_MISSION_STAMP_RE='^<!-- written-against: sha=([A-Za-z0-9]+|none) ts=[0-9]+ sid=([A-Za-z0-9._-]+) -->$'
+
+# LEGACY form of the same stamp. Before the 2026-08-15 payload+pointer change, the
+# writer's own output WAS a stamped REGULAR `tasks/mission.md`, and its stamp had no
+# `sid=` field:
+#
+#     <!-- written-against: sha=<sha-or-none> ts=<epoch> -->
+#
+# Three such files exist on this host, written by the still-deployed old code. They
+# are OUR writing, and the `--mission-copies` allowlist has to be able to say so:
+# without it, a project holding one reads as "the world moved" on EVERY tick,
+# forever — the pointer rule only admits a symlink, so a regular file of ours can
+# never be subtracted — and where the file is untracked, resume in that project is
+# permanently inert with no trace beyond a generic `git_stale` line.
+#
+# Bounded on purpose. This form is admitted ONLY for the pointer path, ONLY to
+# subtract a file from the freshness gate, and never as evidence about content:
+# nothing opens these files, and it is not a GC delete rail (mission_gc only ever
+# looks at `mission.<sid>.md`, never at the pointer). An unstamped file, or the
+# orchestrator's `repo=…`/`branch=…` decoy, matches neither form and stays visible
+# to the gate — which is the whole point of both regexes being anchored.
+REFLECT_MISSION_STAMP_LEGACY_RE='^<!-- written-against: sha=([A-Za-z0-9]+|none) ts=[0-9]+ -->$'
 
 # Human-copy basenames look exactly like this.
 REFLECT_MISSION_COPY_RE='^mission\.([A-Za-z0-9._-]+)\.md$'
@@ -744,6 +778,16 @@ mission_has_our_stamp() {
   [[ -f "$f" ]] || return 1
   IFS= read -r first < "$f" 2>/dev/null || true
   [[ "$first" =~ $REFLECT_MISSION_STAMP_RE ]]
+}
+
+# mission_has_our_legacy_stamp <file> — 0 when line 1 is the PRE-POINTER stamp we
+# used to write (no sid= field). See REFLECT_MISSION_STAMP_LEGACY_RE for why this
+# exists and for the single, narrow use it is allowed. Never a GC delete rail.
+mission_has_our_legacy_stamp() {
+  local f="${1:-}" first=""
+  [[ -f "$f" ]] || return 1
+  IFS= read -r first < "$f" 2>/dev/null || true
+  [[ "$first" =~ $REFLECT_MISSION_STAMP_LEGACY_RE ]]
 }
 
 # --- Out-of-repo handoff paths ------------------------------------------------
@@ -869,6 +913,29 @@ mission_pointer_is_ours() {
   # tasks dir is not something we created and not something we will touch.
   [[ "$target" == "$(basename -- "$target")" ]] || return 1
   mission_is_our_copy_name "$target"
+}
+
+# mission_pointer_is_our_write <pointer_path> — 0 when `tasks/mission.md` is
+# something THIS CODEBASE put there: either the symlink pointer we install today, or
+# the stamped REGULAR file the pre-pointer writer produced (see
+# REFLECT_MISSION_STAMP_LEGACY_RE).
+#
+# SCOPE: this predicate answers "did we write this?" for the FRESHNESS ALLOWLIST
+# only. It is deliberately NOT used by the pointer-installation decision table
+# above, which still refuses to touch anything that is not a symlink of ours — the
+# two questions are different, and conflating them is how a machine write would land
+# on a human-owned path. Subtracting a file from a git gate costs nothing if we are
+# wrong about a file nothing opens; overwriting one costs somebody's state.
+mission_pointer_is_our_write() {
+  local p="${1:-}"
+  if mission_pointer_is_ours "$p"; then return 0; fi
+  # A symlink that mission_pointer_is_ours already rejected does NOT get a second
+  # chance through the stamp rail — `readlink`-following would let a link aimed at
+  # any stamped file in the tree claim the pointer.
+  if [[ -L "$p" ]]; then return 1; fi
+  [[ -f "$p" ]] || return 1
+  if mission_has_our_stamp "$p"; then return 0; fi
+  mission_has_our_legacy_stamp "$p"
 }
 
 # mission_install_pointer <tasks_dir> <copy_basename>

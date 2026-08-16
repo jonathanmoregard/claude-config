@@ -225,7 +225,16 @@ fi
 #
 #   tasks/mission.<sid>.md   each human copy whose name is mission.<valid-sid>.md
 #                            AND whose line 1 carries our stamp
-#   tasks/mission.md         only when the pointer is a symlink of ours
+#   tasks/mission.md         when the pointer is a symlink of ours, OR when it is a
+#                            REGULAR file carrying a stamp of our lineage — which is
+#                            exactly what the PRE-POINTER writer produced, and what
+#                            three projects on this host still hold. A symlink-only
+#                            rule could never subtract such a file, so a project
+#                            holding one read as world-moved on every tick forever
+#                            and resume there was permanently inert; where the file
+#                            is untracked the only trace was a generic `git_stale`
+#                            line. Unstamped and foreign-stamped files are still NOT
+#                            admitted — see mission_pointer_is_our_write.
 #
 # ONE caller, ONE use: idle-handoff.sh's git-freshness gate asks "has anything OTHER
 # THAN US changed this tree since the transcript?", so it has to subtract our own
@@ -260,10 +269,12 @@ if [[ "$ARG1" == "--mission-copies" ]]; then
   # not an error — the caller distinguishes "nothing" from "could not tell" by the
   # exit code, and only the latter should make it more conservative.
   [[ -d "$_mc_tasks" ]] || exit 0
-  # The pointer, only when it is a symlink of ours (dangling counts: a pointer whose
-  # copy was garbage-collected is still our write). A regular file, a directory, or a
-  # symlink aimed anywhere else is somebody else's.
-  if mission_pointer_is_ours "$_mc_tasks/mission.md"; then
+  # The pointer, when it is a write of OURS: a symlink of ours (dangling counts — a
+  # pointer whose copy was garbage-collected is still our write), or a stamped
+  # regular file of our lineage (the pre-pointer writer's own output). A directory, a
+  # fifo, a symlink aimed anywhere else, and any unstamped or foreign-stamped regular
+  # file are somebody else's and stay VISIBLE to the freshness gate.
+  if mission_pointer_is_our_write "$_mc_tasks/mission.md"; then
     printf '%s\n' 'tasks/mission.md'
   fi
   shopt -s nullglob
