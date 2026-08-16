@@ -196,3 +196,6 @@ automation-review/
 
 # Auto-sync runtime log (see sync-agent.sh)
 sync.log
+
+# runtime log, rewritten each run (repo-autosync, 2026-08-16)
+logs/review-agent.log
