@@ -666,12 +666,74 @@ with no downstream consumer and are safe to prune on a cron.
 ## Tests
 
 ```bash
-# Offline smoke — uses a stub `claude` on PATH. Zero API cost. Default.
+# Offline smoke, FAST lane (default) — uses a stub `claude` on PATH. Zero API cost.
 bash tests/smoke.sh
+
+# Offline smoke, FULL lane — adds the MEDIUM/LOW integration blocks.
+SMOKE_LANE=full bash tests/smoke.sh      # or: bash tests/smoke.sh --full
 
 # Live smoke — opt-in. One real Haiku call, ~few thousand tokens.
 REFLECT_LIVE_TEST=1 bash tests/live.sh
 ```
+
+### Lanes
+
+`SMOKE_LANE` selects **which tests run**. It is test infrastructure, not a switch
+on product behaviour: no code under test reads it, and nothing about the shipped
+system changes with it.
+
+| Lane | What it runs | Measured wall time |
+|---|---|---|
+| `fast` (default) | 57 named TESTs: every cheap unit-level test, plus the regression test for every BLOCKER/HIGH fixed in review — F1 (19/19g/26), R1 (24/36), S1 (40), S3's fail-open staleness gate (41), T1 (43), D1's out-of-repo resolution (19d/25), and the teardown contract (48). | ~3.5 min |
+| `full` | fast + the seven MEDIUM/LOW integration blocks (33 F8, 35 D6, 37 R2, 44 T2, 45 T3, 46 T4, 47 T5). | ~6 min |
+
+The split exists because each of those blocks drives several real
+`idle-handoff.sh` ticks, and a tick costs ~3.5 s of fixed overhead before it does
+any test-specific work — `scan_live_cwds` forks `readlink` plus `tr | head` for
+every PID on the host, twice per candidate. That cost is in the product, not the
+harness; the lanes bound how many times a default run pays it.
+
+### Exit codes: a failed test and a failed teardown are different events
+
+| Code | Meaning |
+|---|---|
+| 0 | every selected test passed **and** teardown completed. `OK: all smoke tests passed` is printed only here. |
+| 1 | a test failed. Temp state is deliberately kept for inspection. |
+| 3 | every test passed, but teardown failed — the `TEARDOWN:` line names what went wrong. |
+| 2 | bad invocation (unknown lane or argument). |
+
+This used to be one code for both, which is how a run with 63 passing TESTs and
+zero failures reported `SUITE_FAILED`: a detached worker wrote its stdout log into
+the temp root after the final assertion, `rm -rf` lost the race between its
+readdir and its rmdir, and `set -e` killed the script before the success line.
+
+### Teardown is deterministic, not patient
+
+The harness tracks every process it starts and waits for all of them to reach a
+terminal state before it removes anything, bounded at 90 s. Two rails, because
+there are two spawn mechanisms:
+
+- **transient units** — a transparent `systemd-run` shim ahead of the real binary
+  on `PATH` records each `--unit=` name and `exec`s the real thing, so the suite
+  holds the same handle systemd does. Waiting on *recorded* names rather than on a
+  `claude-autofork-*` glob also means the live deployment's own 5-minute timer,
+  which fires during a full run, is never something the suite waits for.
+- **live processes naming this run's `REFLECT_ROOT`** — covers the `setsid`
+  fallback spawn, which has no unit at all, and any child of a unit. The suite's
+  own process tree is excluded: the shell is blocked on its synchronous children
+  by definition.
+
+If the bound expires, teardown fails **loudly** and names the units and PIDs still
+holding the directory. There is no `rm -rf … || true` and no `2>/dev/null` on the
+cleanup: swallowing that error is what would hide the next teardown bug. TEST 48
+is the regression — it spawns a detached worker blocked on a sentinel it controls,
+proves the wait refuses to declare quiescence and names the holder, then releases
+it and proves the late write has landed before the wait returns.
+
+The same condition replaced the timing-based fork assertions: `sc_settle_fork`
+used to poll up to 15 s for a positive and `sleep 3` for a negative, so a negative
+could pass merely because the fork had not landed yet. It now waits for quiescence,
+after which the fork's argv log is final for both answers.
 
 ## Empirical basis
 
