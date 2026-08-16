@@ -499,6 +499,26 @@ $SPAWN_HOLDERS"
   return 0
 }
 
+# HARD SAFETY REQUIREMENT, not a convenience stub.
+#
+# The in-place reset path drives the REAL terminal via `kitten @ send-text`, and
+# `kitten` is on the PATH of the machine that develops this. A suite run from
+# inside a live session would resolve its own session by process ancestry and
+# could send `/clear` to the developer's actual window. Shadow the binary for the
+# whole suite so no test can reach a real terminal, and record what would have
+# been sent so the in-place path stays assertable.
+KITTEN_LOG="$STUB_SCRATCH/kitten-calls.log"
+cat >"$STUB_SCRATCH/kitten" <<KITTEN
+#!/usr/bin/env bash
+{ printf '=== call ===\n'; for a in "\$@"; do printf '%s\n' "\$a"; done; } >> '$KITTEN_LOG'
+# `ls` must return WELL-FORMED JSON that matches nothing: the caller has to take
+# the "no window for this pid" refusal branch, not an unparseable-output branch,
+# or the refusal we are testing is not the refusal that would happen live.
+for a in "\$@"; do [[ "\$a" == "ls" ]] && { printf '[]\n'; exit 0; }; done
+exit 0
+KITTEN
+chmod +x "$STUB_SCRATCH/kitten"
+
 export PATH="$SPAWN_SHIM_DIR:$STUB_HELP_DIR:$STUB_SCRATCH:$PATH"
 
 # --- Isolated artifact root --------------------------------------------------
@@ -3058,17 +3078,19 @@ chmod +x "$STUB_SCRATCH/claude"
 # ============================================================================
 # TEST 24b: the live-cwd guard must not refuse the CONTEXT trigger
 # ============================================================================
-# The defect this closes: the live-cwd collision abort was inherited from the
-# idle trigger, where "someone is sitting in this tree" is a good reason not to
-# fork into it. But the context trigger runs under the opposite condition BY
-# CONSTRUCTION — a session that just crossed the threshold is necessarily alive
-# in that cwd — so the inherited rail refused every context-triggered fork,
-# three checks after the idle floor had been widened for it. The feature could
-# not do the one thing it exists for, and the log said only `live=`.
+# A session that crosses the threshold is alive in its own cwd by construction,
+# so this guard means the FORK path can never serve a live session. That is now
+# correct rather than a defect: a live session is reset in place by
+# inplace_reset.py, which drives its terminal, starts no second process and adds
+# no authority. Forking a second unattended acceptEdits process into a tree
+# someone is sitting in is the thing the rail exists to prevent, and it should
+# keep preventing it on BOTH triggers.
 #
-# Both halves are asserted, because the fix is a RELAXATION of a safety rail and
-# the thing that must not happen is it relaxing for the idle path too.
-test_begin "TEST 24b: a live pane in the candidate cwd blocks an idle fork, not a context fork"
+# This test pins that division. It is the regression guard against re-introducing
+# the exemption that briefly lived here: the tempting fix for "the context
+# trigger never forks" is to punch a hole in this rail, and the right fix is to
+# reset the session instead.
+test_begin "TEST 24b: a live pane in the candidate cwd is never forked into, on either trigger"
 
 B7L_LOG="$REFLECT_ROOT/idle-handoff-logs/handoff.log"
 
@@ -3129,17 +3151,20 @@ B7L_HOLDER="$(b7l_hold "$B7L_CWD")" \
   || fail "24b: could not put a live claude-named process in $B7L_CWD, so the guard is not under test"
 info "holder pid=$B7L_HOLDER argv0=claude cwd=$B7L_CWD"
 
+B7L_LINES="$(wc -l < "$B7L_LOG" 2>/dev/null || echo 0)"
 HOME="$B7L_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
   || { kill "$B7L_HOLDER" 2>/dev/null; fail "24b: idle-handoff.sh rc!=0"; }
-sc_settle_fork "$B7L_ARGV" fork
-if [[ ! -s "$B7L_ARGV" ]]; then
+sc_settle_fork "$B7L_ARGV" no-fork
+if [[ -s "$B7L_ARGV" ]]; then
   kill "$B7L_HOLDER" 2>/dev/null
-  fail "24b: the context trigger did NOT fork with a live pane in the candidate cwd — the inherited live-cwd rail still refuses the trigger it was widened for (log: $(tail -3 "$B7L_LOG" 2>/dev/null))"
+  fail "24b: the context trigger forked a second unattended process into a cwd with a live pane. A live session must be reset in place, not forked into ($(cat "$B7L_ARGV"))"
 fi
-grep -q 'live-cwd guard EXEMPTED' "$B7L_LOG" \
-  || { kill "$B7L_HOLDER" 2>/dev/null; fail "24b: forked, but the exemption was never logged — a relaxed safety rail must say so in the journal"; }
+tail -n +$((B7L_LINES + 1)) "$B7L_LOG" | grep -q 'live=1' \
+  || { kill "$B7L_HOLDER" 2>/dev/null; fail "24b: no fork, but the live-cwd guard is not what stopped it — the reason must be recorded, or a silent skip looks identical (log: $(tail -n +$((B7L_LINES + 1)) "$B7L_LOG" | tail -3))"; }
+grep -q 'EXEMPTED' "$B7L_LOG" \
+  && { kill "$B7L_HOLDER" 2>/dev/null; fail "24b: the live-cwd exemption is back. A live session is handled by inplace_reset.py; the fork path must keep refusing it"; }
 kill "$B7L_HOLDER" 2>/dev/null
-info "context trigger forks through a live pane, and logs the exemption"
+info "context trigger does not fork into a live cwd; the guard records why"
 
 # ---- Half 2: idle trigger + live pane -> MUST NOT fork ----
 # Same shape, same live pane, no self-compact request. The rail is still load

@@ -73,6 +73,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import context_usage  # noqa: E402  (path shim must precede the import)
+import inplace_reset  # noqa: E402  (same shim; ships beside this file)
 
 # --- Fixed values, not settings ----------------------------------------------
 # Fire at 30% of the DETECTED context window — ~300k tokens on a 1M model, ~60k on
@@ -240,6 +241,45 @@ def spawn_mission_write(reflect_sh: Path, sid: str, transcript: str, cwd: str) -
     return "queued"
 
 
+def spawn_inplace_reset(sid: str, instructions: str = "") -> str:
+    """Reset THIS session where it stands, if its terminal can be driven.
+
+    Detached, because it has to outlive the hook: it waits for the handoff to
+    land before it clears anything, and the hook must return in well under the
+    60s cap.
+
+    This is tried FIRST and the fork path is the fallback, not the reverse. A
+    live session resetting itself in place keeps the permissions the user
+    already granted interactively and starts no second process, so none of the
+    unattended-fork surface applies. When the terminal cannot be driven -- no
+    remote control, no unique window, no handoff -- this refuses, logs why, and
+    leaves the request marker in place for idle-handoff to pick up once the
+    session exits.
+    """
+    spid = inplace_reset.session_pid()
+    if not spid:
+        return "no_session_pid"
+    handoff = reflect_root() / "sessions" / sid / "handoff" / "mission.md"
+    script = claude_dir() / "inplace_reset.py"
+    if not script.exists():
+        return f"missing:{script}"
+    argv = [sys.executable, str(script), "--sid", sid, "--session-pid", str(spid),
+            "--handoff", str(handoff)]
+    if instructions:
+        argv += ["--instructions", instructions]
+    try:
+        subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,   # survive the hook's exit
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"spawn_error:{type(exc).__name__}"
+    return f"queued(pid_target={spid})"
+
+
 def main() -> int:
     # Fork-chain / recursion breaks. A reflection subprocess carries
     # REFLECT_SUBPROCESS=1; every headless run (including our own autofork)
@@ -357,10 +397,12 @@ def main() -> int:
         result = spawn_mission_write(reflect_sh, sid, transcript, cwd)
     else:
         result = f"reflect_sh_missing:{reflect_sh}"
+    reset = spawn_inplace_reset(sid)
     log(f"sid={sid} FIRE crossing={state['crossings']} "
         f"tokens={occ.total_tokens}/{occ.window} "
         f"fill={occ.fill_pct:.3f} threshold={THRESHOLD} cwd={cwd} "
-        f"marker={'ok' if marker_written else 'FAILED'} mission={result}")
+        f"marker={'ok' if marker_written else 'FAILED'} mission={result} "
+        f"inplace={reset}")
     gc_state()
     return 0
 
@@ -438,14 +480,22 @@ def manual(instructions: str) -> int:
               file=sys.stderr)
         return 1
     result = spawn_mission_write(reflect_sh, sid, transcript, cwd)
+    reset = spawn_inplace_reset(sid, instructions)
 
     fill = f"{occ.fill_pct:.1%}" if occ is not None else "unmeasured"
     log(f"sid={sid} MANUAL request via /self-compact fill={fill} cwd={cwd} "
-        f"instructions={'yes' if instructions else 'no'} mission={result}")
+        f"instructions={'yes' if instructions else 'no'} mission={result} "
+        f"inplace={reset}")
     print(f"self-compact: handoff requested for session {sid} (context {fill}).")
     print(f"  cwd:      {cwd}")
     print(f"  marker:   {marker_path}")
     print(f"  mission:  {result}")
+    print(f"  in-place: {reset}")
+    if reset.startswith("queued"):
+        print("This session will clear itself shortly and resume from the handoff.")
+    else:
+        print("This terminal cannot be driven, so nothing will clear this session; "
+              "the handoff will be picked up after you exit it.")
     return 0
 
 

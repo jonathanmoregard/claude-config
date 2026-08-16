@@ -1226,7 +1226,6 @@ count_wrote=0
 count_forked=0
 count_skipped_live=0
 count_skipped_live_rescan=0
-count_live_exempt=0
 count_skipped_short=0
 count_skipped_fresh_mission=0
 count_skipped_no_cwd=0
@@ -1365,35 +1364,28 @@ for project_dir in "$PROJECTS_DIR"/*/; do
     continue
   fi
 
-  # ---- Live-project guard: initial scan ---
-  # EXEMPT THE CONTEXT TRIGGER. This rail was built for the idle trigger, where
-  # "someone is sitting in this tree" is a good reason not to fork into it. The
-  # context trigger runs under the opposite condition BY CONSTRUCTION: a session
-  # that just crossed the threshold is, necessarily, alive in that cwd. Inheriting
-  # the rail unchanged therefore made the context trigger unable to ever spawn —
-  # it widened the idle FLOOR and was then refused three checks later, every time,
-  # counted only as `live=`. The feature could not do the one thing it exists for.
+  # ---- Live-project guard ---
+  # This rail is CORRECT and unconditional, for both triggers.
   #
-  # The user's requirement is explicit: a live session must auto-reset at the cap
-  # with no human in the loop. So the exemption is unconditional for a verified
-  # context request, not a toggle and not a prompt.
+  # It briefly carried an exemption for the context trigger, on the reasoning
+  # that a session crossing the threshold is alive in its own cwd by
+  # construction, so refusing it here made the trigger unable to ever fork. That
+  # reasoning was right about the symptom and wrong about the cure: the answer to
+  # "this session is alive" is to reset it WHERE IT IS, not to fork a second
+  # unattended process into a tree someone is sitting in.
   #
-  # What still bounds this: the request marker is authenticated against the
-  # transcript before ctx_trigger is set, the fire cap is 3 per session, and the
-  # control-plane refusal, staleness DENY, ralph collision, deny probe, restricted
-  # flag set and all three fork budgets are untouched below. The residual risk is
-  # narrow and stated rather than guarded: the trigger fires from a Stop hook, so
-  # the originating session is idle awaiting its user, not mid-edit — but if the
-  # user returns and types into the old pane while the fork works, they share a
-  # tree. No programmatic reset exists to prevent that.
+  # A live session is now handled by inplace_reset.py, which drives the terminal
+  # to clear the session and re-seed it from the same handoff. That path starts no
+  # new process and adds no authority. This fork path is for sessions whose
+  # process is GONE — exactly the case this guard was written for, where the
+  # 45-minute floor or a recent crossing means nobody is there.
+  #
+  # So a `live=` skip here is no longer a dead end: either the in-place reset
+  # already resumed that session, or it refused and left the marker for the tick
+  # after the session exits.
   if is_live_project "$candidate_cwd"; then
-    if (( ctx_trigger == 1 )); then
-      count_live_exempt=$((count_live_exempt + 1))
-      log "live-cwd guard EXEMPTED sid=$sid cwd=$candidate_cwd (context trigger: the originating session is alive there by construction; every other rail still applies)"
-    else
-      count_skipped_live=$((count_skipped_live + 1))
-      continue
-    fi
+    count_skipped_live=$((count_skipped_live + 1))
+    continue
   fi
 
   # ---- Ralph collision ---
@@ -1654,20 +1646,11 @@ for project_dir in "$PROJECTS_DIR"/*/; do
   # ---- Rescan live cwds (advisor MEDIUM: initial scan may be minutes stale) ---
   # Mission-write can burn ~90s; a claude pane opened in this cwd during
   # that window would race with the autofork spawn. Rescan and re-check.
-  # Same exemption as the initial scan, for the same reason: under the context
-  # trigger the originating session is expected to be live here, so a rescan that
-  # re-finds it is not news. Without this the exemption above would be undone
-  # three lines before the spawn.
   scan_live_cwds
   if is_live_project "$candidate_cwd"; then
-    if (( ctx_trigger == 1 )); then
-      count_live_exempt=$((count_live_exempt + 1))
-      log "live-cwd rescan EXEMPTED sid=$sid cwd=$candidate_cwd (context trigger)"
-    else
-      count_skipped_live_rescan=$((count_skipped_live_rescan + 1))
-      log "autofork skipped sid=$sid cwd=$candidate_cwd (live pane appeared during mission write)"
-      continue
-    fi
+    count_skipped_live_rescan=$((count_skipped_live_rescan + 1))
+    log "autofork skipped sid=$sid cwd=$candidate_cwd (live pane appeared during mission write)"
+    continue
   fi
 
   # ---- Auto-fork execution ---
@@ -1957,4 +1940,4 @@ PROMPT
   count_forked=$((count_forked + 1))
 done
 
-log "seen=$count_seen wrote=$count_wrote forked=$count_forked context_triggered=$count_context_trigger self_compact=on(>=$SELF_COMPACT_THRESHOLD) live_exempt=$count_live_exempt skipped(live=$count_skipped_live live_rescan=$count_skipped_live_rescan sdk-cli_or_unknown=$count_skipped_sdk_cli short=$count_skipped_short backoff=$count_skipped_backoff fresh=$count_skipped_fresh_mission no_cwd=$count_skipped_no_cwd stale=$count_skipped_stale observer=$count_skipped_observer no_next=$count_skipped_no_next ralph=$count_skipped_ralph git_stale=$count_skipped_git_stale fork_budget=$count_skipped_fork_budget mission_err=$count_mission_status_error mission_not_ours=$count_skipped_mission_not_ours mission_resolve_err=$count_mission_resolve_error fork_unrestrictable=$count_skipped_fork_unrestrictable deny_unproven=$count_skipped_deny_unproven control_plane_cwd=$count_skipped_control_plane)"
+log "seen=$count_seen wrote=$count_wrote forked=$count_forked context_triggered=$count_context_trigger self_compact=on(>=$SELF_COMPACT_THRESHOLD) skipped(live=$count_skipped_live live_rescan=$count_skipped_live_rescan sdk-cli_or_unknown=$count_skipped_sdk_cli short=$count_skipped_short backoff=$count_skipped_backoff fresh=$count_skipped_fresh_mission no_cwd=$count_skipped_no_cwd stale=$count_skipped_stale observer=$count_skipped_observer no_next=$count_skipped_no_next ralph=$count_skipped_ralph git_stale=$count_skipped_git_stale fork_budget=$count_skipped_fork_budget mission_err=$count_mission_status_error mission_not_ours=$count_skipped_mission_not_ours mission_resolve_err=$count_mission_resolve_error fork_unrestrictable=$count_skipped_fork_unrestrictable deny_unproven=$count_skipped_deny_unproven control_plane_cwd=$count_skipped_control_plane)"
