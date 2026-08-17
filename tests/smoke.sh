@@ -4669,6 +4669,15 @@ echo "$(jq -cn --arg sid "$R3_SID" --arg tp "$TRANSCRIPT" --arg cwd "$TEST_CWD" 
   | bash "$REFLECT_SH" sessionend >/dev/null 2>&1 || true
 wait_for_complete "$REFLECT_ROOT/sessions/$R3_SID/manifest.json" 25 sessionend \
   || fail "38b: the detached worker never completed, so the GC never ran"
+# THE MANIFEST IS NOT THE SIGNAL FOR THIS ASSERTION. The worker's order is
+# run_worker -> reap_stale_started -> reflect_artifact_gc -> exit, and
+# final_complete is written by run_worker. So wait_for_complete returns while the
+# GC is still to come, and asserting here passes only when the sweep happens to
+# win the race. That is what made TEST 38b fail once and pass on an immediate
+# rerun of an identical tree. Wait for the worker to actually be gone.
+spawn_wait_quiescent 60 \
+  || fail "38b: spawned work did not reach a terminal state, so the artifact GC has not necessarily run:
+$SPAWN_HOLDERS"
 for r3_f in "${R3_OLD[@]}"; do
   [[ ! -e "$r3_f" ]] \
     || fail "38b: $r3_f is older than the retention bound and was not collected"
