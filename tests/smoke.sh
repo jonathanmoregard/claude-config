@@ -2665,8 +2665,8 @@ fi
 if grep -qE '^[^#]*components\.self_compact' "$WORKTREE/scripts/idle-handoff.sh"; then
   fail "21: idle-handoff.sh still reads components.self_compact"
 fi
-grep -qE '^THRESHOLD = 0\.30$' "$SC_TRIGGER" \
-  || fail "21: the threshold is not a hardcoded module constant in $SC_TRIGGER"
+grep -qE '^FIRE_AT_TOKENS = 300_000$' "$SC_TRIGGER" \
+  || fail "21: the fire point is not a hardcoded module constant in $SC_TRIGGER"
 grep -qE '^MAX_FIRES_PER_SESSION = [0-9]+$' "$SC_TRIGGER" \
   || fail "21: the per-session fire cap is not a hardcoded module constant"
 
@@ -2690,8 +2690,8 @@ for mode in absent malformed nokey normal; do
   done
   [[ -e "$SC_STATE_DIR/$B5_SID/request.json" ]] \
     || fail "21: config=$mode suppressed the trigger — no config shape may act as an off switch"
-  jq -e '.threshold == 0.30' "$SC_STATE_DIR/$B5_SID/request.json" >/dev/null \
-    || fail "21: config=$mode changed the recorded threshold ($(jq -r .threshold "$SC_STATE_DIR/$B5_SID/request.json"))"
+  jq -e '.fire_at_tokens == 300000' "$SC_STATE_DIR/$B5_SID/request.json" >/dev/null \
+    || fail "21: config=$mode changed the recorded fire point ($(jq -r .fire_at_tokens "$SC_STATE_DIR/$B5_SID/request.json"))"
 done
 
 # ...including a config that tries to say `false` explicitly. There is nothing to
@@ -2706,8 +2706,8 @@ for _ in $(seq 1 40); do
 done
 [[ -e "$SC_STATE_DIR/test-sid-b5-explicit-false/request.json" ]] \
   || fail "21: the trigger did not fire with a leftover self_compact block present — something in that block is still being read (the false switch, or the 0.99 threshold)"
-jq -e '.threshold == 0.30' "$SC_STATE_DIR/test-sid-b5-explicit-false/request.json" >/dev/null \
-  || fail "21: a leftover self_compact.threshold=0.99 was honoured — the threshold is still config-readable"
+jq -e '.fire_at_tokens == 300000' "$SC_STATE_DIR/test-sid-b5-explicit-false/request.json" >/dev/null \
+  || fail "21: a leftover self_compact.threshold=0.99 was honoured — the fire point is still config-readable"
 info "no config shape (absent/malformed/nokey/normal/explicit-false) can disable it or move the threshold"
 
 # ============================================================================
@@ -2758,7 +2758,7 @@ sc_wait_marker "$B2_SID" || fail "22: the trigger produced no request marker or 
 B2_REQ="$SC_STATE_DIR/$B2_SID/request.json"
 [[ -f "$B2_REQ" ]] || fail "22: no persisted self-compact request marker at $B2_REQ"
 jq -e --arg c "$B2_CWD" '.cwd == $c and .window == 1000000 and .tokens == 310000
-                          and .threshold == 0.30 and (.requested_at_epoch|type) == "number"' \
+                          and .fire_at_tokens == 300000 and (.requested_at_epoch|type) == "number"' \
   "$B2_REQ" >/dev/null || fail "22: request marker incomplete: $(cat "$B2_REQ")"
 jq -e '.fires == 1 and .armed == false' "$SC_STATE_DIR/$B2_SID/state.json" >/dev/null \
   || fail "22: state after one fire wrong: $(cat "$SC_STATE_DIR/$B2_SID/state.json")"
@@ -3282,8 +3282,8 @@ jq -e '.manual == true' "$MAN_MARKER" >/dev/null \
   || fail "24c: the operator's instructions were not recorded in the marker"
 # The measurement is recorded for the audit trail, and is deliberately BELOW the
 # gate — that is the whole point of the test.
-awk -v f="$(jq -r '.fill_pct' "$MAN_MARKER")" 'BEGIN{exit !(f+0 < 0.30)}' \
-  || fail "24c: fixture is not below the threshold, so it cannot show the gate is bypassed"
+awk -v f="$(jq -r '.tokens' "$MAN_MARKER")" 'BEGIN{exit !(f+0 < 300000)}' \
+  || fail "24c: fixture is not below the fire point, so it cannot show the gate is bypassed"
 
 sc_wait_marker "$MAN_SID" || fail "24c: --manual produced no request marker"
 mk_mission_handoff "$MAN_SID" "$MAN_CWD" "$(cat "$SC_MISSION_FILE")" >/dev/null
@@ -3353,7 +3353,7 @@ sc_plant_request() {
   mkdir -p "$SC_STATE_DIR/$1"
   jq -n --arg sid "$1" --arg cwd "$2" --arg tp "$3" --argjson now "$(date +%s)" \
     '{session_id:$sid,cwd:$cwd,transcript_path:$tp,tokens:330000,window:1000000,
-      fill_pct:0.33,threshold:0.30,requested_at_epoch:$now}' \
+      fill_pct:0.33,fire_at_tokens:300000,requested_at_epoch:$now}' \
     > "$SC_STATE_DIR/$1/request.json"
 }
 
@@ -3753,14 +3753,21 @@ sc_fire "$F2_H" "test-sid-f2-fable" "$F2_CWD" "$F2_H/fable.jsonl" >/dev/null \
 sc_wait_marker "test-sid-f2-fable" || fail "27: a 1M fable session at 31% did not fire"
 
 mk_context_transcript "$F2_H/unknown.jsonl" "claude-zeta-9-20991231" 61000 "$F2_CWD"
+mk_context_transcript "$F2_H/unknownbig.jsonl" "claude-zeta-9-20991231" 310000 "$F2_CWD"
 sc_fire "$F2_H" "test-sid-f2-unknown" "$F2_CWD" "$F2_H/unknown.jsonl" >/dev/null \
   || fail "27: unknown-model fire rc!=0"
 sleep 0.5
+# An unfamiliar model name is no longer a reason to refuse. The fire point is an
+# absolute token count, so there is no denominator to guess at and nothing for a
+# stale prefix table to get wrong. 61000 tokens is below 300000, so this one does
+# not fire for the ordinary reason.
 [[ ! -e "$SC_STATE_DIR/test-sid-f2-unknown/request.json" ]] \
-  || fail "27: fired against an assumed denominator — a 1M model would read 5x high here"
-grep -q 'REFUSING to fire: context window is UNKNOWN' "$SC_STATE_DIR/trigger.log" \
-  || fail "27: the refusal was silent; the table can go stale unnoticed"
-info "fable-5 detected as 1M; known-200k stays known; unknown window refuses loudly at both the CLI and the trigger"
+  || fail "27: fired at 61k tokens, under the 300k fire point"
+sc_fire "$F2_H" "test-sid-f2-unknown-big" "$F2_CWD" "$F2_H/unknownbig.jsonl" >/dev/null \
+  || fail "27: unknown-model big fire rc!=0"
+sc_wait_marker "test-sid-f2-unknown-big" \
+  || fail "27: an unfamiliar model name still blocks the fire, but the window is no longer consulted"
+info "fable-5 detected as 1M; known-200k stays known; an unfamiliar model fires on tokens alone"
 
 # ============================================================================
 # TEST 28: F3 — the worker lock must fail CLOSED
@@ -3943,13 +3950,22 @@ info "over-cap override clamped to $(jq -r .max_synchronous_budget_seconds <<<"$
 # with the config key: it is now a constant in both files, and this test pins that
 # they are the SAME constant, and that the number they agree on is the one that
 # actually decides a fire.
-test_begin "TEST 31: one hardcoded threshold; producer and consumer cannot drift apart"
-F7_PROD_THR="$(grep -oP '^THRESHOLD = \K[0-9.]+' "$SC_TRIGGER")"
-F7_CONS_THR="$(grep -oP '^SELF_COMPACT_THRESHOLD="\K[0-9.]+' "$WORKTREE/scripts/idle-handoff.sh")"
-[[ -n "$F7_PROD_THR" ]] || fail "31: no hardcoded THRESHOLD in $SC_TRIGGER"
-[[ -n "$F7_CONS_THR" ]] || fail "31: no hardcoded SELF_COMPACT_THRESHOLD in idle-handoff.sh"
-awk -v a="$F7_PROD_THR" -v b="$F7_CONS_THR" 'BEGIN{exit !(a+0 == b+0)}' \
-  || fail "31: producer ($F7_PROD_THR) and consumer ($F7_CONS_THR) disagree about the threshold"
+test_begin "TEST 31: one hardcoded fire point; producer and consumer cannot drift apart"
+# The fire point is an ABSOLUTE token count now, not a fraction of a detected
+# window. A fraction needed a denominator, and the denominator was the weakest
+# number in the calculation: a model-name prefix table that goes stale, or
+# CLAUDE_CONTEXT_MAX, a display override that could set it to 200000 on a 1M
+# model and fire the whole feature at 10% real occupancy.
+F7_PROD_THR="$(grep -oP '^FIRE_AT_TOKENS = \K[0-9_]+' "$SC_TRIGGER" | tr -d '_')"
+F7_CONS_THR="$(grep -oP '^SELF_COMPACT_FIRE_AT_TOKENS="\K[0-9]+' "$WORKTREE/scripts/idle-handoff.sh")"
+[[ -n "$F7_PROD_THR" ]] || fail "31: no hardcoded FIRE_AT_TOKENS in $SC_TRIGGER"
+[[ -n "$F7_CONS_THR" ]] || fail "31: no hardcoded SELF_COMPACT_FIRE_AT_TOKENS in idle-handoff.sh"
+[[ "$F7_PROD_THR" == "$F7_CONS_THR" ]] \
+  || fail "31: producer fires at $F7_PROD_THR tokens, consumer re-measures against $F7_CONS_THR"
+# 300k is 30% of a 1M window, which is the size this is for. Pinned so a silent
+# retune shows up as a test change.
+[[ "$F7_PROD_THR" == "300000" ]] \
+  || fail "31: the fire point is $F7_PROD_THR, not the intended 300000 (30% of 1M)"
 # Neither may read it from a file any more.
 if grep -q 'recursive-self-improvement' "$SC_TRIGGER"; then
   fail "31: the producer reads the RSI config again — the threshold is config-readable"
@@ -3965,15 +3981,15 @@ F7_CWD="$(mktemp -d -t reflect-f7cwd-XXXXXX)"
 assert_isolated_cwd "$F7_CWD"
 counting_stub "$F7_H/calls" "$SC_MISSION_FILE"
 F7_WINDOW=1000000
-F7_UNDER=$(awk -v t="$F7_PROD_THR" -v w="$F7_WINDOW" 'BEGIN{printf "%d", (t*w)-20000}')
-F7_OVER=$(awk -v t="$F7_PROD_THR" -v w="$F7_WINDOW" 'BEGIN{printf "%d", (t*w)+20000}')
+F7_UNDER=$(( F7_PROD_THR - 20000 ))
+F7_OVER=$(( F7_PROD_THR + 20000 ))
 mk_context_transcript "$F7_H/under.jsonl" "claude-opus-5" "$F7_UNDER" "$F7_CWD" 25
 mk_context_transcript "$F7_H/over.jsonl" "claude-opus-5" "$F7_OVER" "$F7_CWD" 25
 sc_fire "$F7_H" "test-sid-f7-under" "$F7_CWD" "$F7_H/under.jsonl" >/dev/null \
   || fail "31: producer rc!=0 below the threshold"
 sleep 0.5
 [[ ! -e "$SC_STATE_DIR/test-sid-f7-under/request.json" ]] \
-  || fail "31: fired at ${F7_UNDER}/${F7_WINDOW}, below the $F7_PROD_THR threshold"
+  || fail "31: fired at ${F7_UNDER} tokens, below the $F7_PROD_THR fire point"
 sc_fire "$F7_H" "test-sid-f7-over" "$F7_CWD" "$F7_H/over.jsonl" >/dev/null \
   || fail "31: producer rc!=0 above the threshold"
 for _ in $(seq 1 40); do
@@ -3981,17 +3997,24 @@ for _ in $(seq 1 40); do
   sleep 0.25
 done
 [[ -e "$SC_STATE_DIR/test-sid-f7-over/request.json" ]] \
-  || fail "31: did not fire at ${F7_OVER}/${F7_WINDOW}, above the $F7_PROD_THR threshold"
-jq -e --argjson t "$F7_PROD_THR" '.threshold == $t' \
+  || fail "31: did not fire at ${F7_OVER} tokens, above the $F7_PROD_THR fire point"
+jq -e --argjson t "$F7_PROD_THR" '.fire_at_tokens == $t' \
   "$SC_STATE_DIR/test-sid-f7-over/request.json" >/dev/null \
-  || fail "31: the request records a threshold other than the constant ($(jq -r .threshold "$SC_STATE_DIR/test-sid-f7-over/request.json"))"
+  || fail "31: the request records a fire point other than the constant ($(jq -r .fire_at_tokens "$SC_STATE_DIR/test-sid-f7-over/request.json"))"
+# CLAUDE_CONTEXT_MAX must not move it. It is a display override, and it used to
+# set the denominator that decided this -- 200000 on a 1M model fired at 10%.
+CLAUDE_CONTEXT_MAX=200000 sc_fire "$F7_H" "test-sid-f7-envmax" "$F7_CWD" "$F7_H/under.jsonl" >/dev/null \
+  || fail "31: producer rc!=0 with CLAUDE_CONTEXT_MAX set"
+sleep 0.5
+[[ ! -e "$SC_STATE_DIR/test-sid-f7-envmax/request.json" ]] \
+  || fail "31: CLAUDE_CONTEXT_MAX=200000 made a ${F7_UNDER}-token session fire; the env override still decides when a session resets itself"
 # The consumer prints the same number in its run summary, so an operator reading
 # the log sees the threshold actually in force.
 F7_LOG="$REFLECT_ROOT/idle-handoff-logs/handoff.log"
 F7_LINES="$(wc -l < "$F7_LOG")"
 HOME="$F7_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
   >/dev/null 2>&1 || fail "31: idle-handoff.sh rc!=0"
-tail -n +$((F7_LINES + 1)) "$F7_LOG" | grep -qF "self_compact=on(>=$F7_CONS_THR)" \
+tail -n +$((F7_LINES + 1)) "$F7_LOG" | grep -qF "self_compact=on(>=${F7_CONS_THR}tok)" \
   || fail "31: the run summary does not report the threshold in force (line: $(tail -n +$((F7_LINES + 1)) "$F7_LOG" | grep -o 'self_compact=[^ ]*' | tail -1))"
 info "one threshold ($F7_PROD_THR) in code at both ends; ${F7_UNDER} does not fire, ${F7_OVER} does"
 

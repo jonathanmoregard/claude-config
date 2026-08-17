@@ -13,8 +13,7 @@ the context, so it writes the summary itself: no second model call, no
 re-ingestion, no context window ceiling. The previous design handed this to
 session-reflect's `mission` mode, which spawns `claude -p --resume <sid> --model
 haiku`. That replays the entire session, so the prompt IS the session — and the
-trigger fires at 30% of the detected window, ~300k on a 1M model, against
-haiku's 200k. Measured: a 382,543-token session returned HTTP 400
+trigger fires at 300k tokens, against haiku's 200k window. Measured: a 382,543-token session returned HTTP 400
 prompt_too_long after billing $0.23. It was guaranteed to fail for exactly the
 sessions this exists to serve.
 

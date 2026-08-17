@@ -194,7 +194,10 @@ is_valid_sid() {
 # self-compact-trigger.py (THRESHOLD = 0.30), the two deliberately identical.
 # It used to be config-readable at both ends by two different code paths, which is
 # how they came to disagree in silence. One number, changed in code, tested.
-SELF_COMPACT_THRESHOLD="0.30"
+# MUST equal FIRE_AT_TOKENS in self-compact-trigger.py. TEST 21 asserts the two
+# agree, because a consumer that re-measures against a different bar than the
+# producer used is worse than one that does not re-measure at all.
+SELF_COMPACT_FIRE_AT_TOKENS="300000"
 
 # A request marker is a NOTIFICATION, never authority. It says "this session
 # crossed the threshold"; we re-measure the transcript here before widening the
@@ -231,7 +234,7 @@ context_request_pending() {
     CONTEXT_REQUEST_INSTRUCTIONS=$(jq -r '.instructions // ""' "$req" 2>/dev/null || printf '')
   fi
 
-  if ! fill=$(timeout 30 python3 "$SELF_COMPACT_HELPER" --fill-pct "$transcript" 2>/dev/null); then
+  if ! fill=$(timeout 30 python3 "$SELF_COMPACT_HELPER" --tokens "$transcript" 2>/dev/null); then
     if [[ "$manual" == "true" ]]; then
       # Occupancy is unmeasurable on a short or estimate-only transcript. That is
       # fatal for an automatic request, whose entire authority is the measurement,
@@ -245,13 +248,13 @@ context_request_pending() {
   fi
 
   if [[ "$manual" == "true" ]]; then
-    CONTEXT_REQUEST_FILL="manual(fill=$fill)"
-    log "sid=$sid: MANUAL context request via /self-compact — the >=$SELF_COMPACT_THRESHOLD gate does not apply (measured fill=$fill)"
+    CONTEXT_REQUEST_FILL="manual(tokens=$fill)"
+    log "sid=$sid: MANUAL context request via /self-compact — the >=${SELF_COMPACT_FIRE_AT_TOKENS}-token gate does not apply (measured tokens=$fill)"
     return 0
   fi
 
-  if ! awk -v f="$fill" -v t="$SELF_COMPACT_THRESHOLD" 'BEGIN{exit !(f+0 >= t+0)}'; then
-    log "sid=$sid: request claimed a crossing but transcript now reads fill=$fill < $SELF_COMPACT_THRESHOLD; ignoring"
+  if ! awk -v f="$fill" -v t="$SELF_COMPACT_FIRE_AT_TOKENS" 'BEGIN{exit !(f+0 >= t+0)}'; then
+    log "sid=$sid: request claimed a crossing but transcript now reads tokens=$fill < $SELF_COMPACT_FIRE_AT_TOKENS; ignoring"
     return 1
   fi
   CONTEXT_REQUEST_FILL="$fill"
@@ -1293,7 +1296,7 @@ for project_dir in "$PROJECTS_DIR"/*/; do
     if context_request_pending "$sid" "$transcript"; then
       ctx_trigger=1
       count_context_trigger=$((count_context_trigger + 1))
-      log "sid=$sid: context trigger — idle=${idle}s under the ${IDLE_HANDOFF_MIN_SECONDS}s floor, but self-compact request verified against the transcript (fill=${CONTEXT_REQUEST_FILL} >= ${SELF_COMPACT_THRESHOLD})"
+      log "sid=$sid: context trigger — idle=${idle}s under the ${IDLE_HANDOFF_MIN_SECONDS}s floor, but self-compact request verified against the transcript (tokens=${CONTEXT_REQUEST_FILL} >= ${SELF_COMPACT_FIRE_AT_TOKENS})"
     else
       continue
     fi
@@ -1943,4 +1946,4 @@ PROMPT
   count_forked=$((count_forked + 1))
 done
 
-log "seen=$count_seen wrote=$count_wrote forked=$count_forked context_triggered=$count_context_trigger self_compact=on(>=$SELF_COMPACT_THRESHOLD) skipped(live=$count_skipped_live live_rescan=$count_skipped_live_rescan sdk-cli_or_unknown=$count_skipped_sdk_cli short=$count_skipped_short backoff=$count_skipped_backoff fresh=$count_skipped_fresh_mission no_cwd=$count_skipped_no_cwd stale=$count_skipped_stale observer=$count_skipped_observer no_next=$count_skipped_no_next ralph=$count_skipped_ralph git_stale=$count_skipped_git_stale fork_budget=$count_skipped_fork_budget mission_err=$count_mission_status_error mission_not_ours=$count_skipped_mission_not_ours mission_resolve_err=$count_mission_resolve_error fork_unrestrictable=$count_skipped_fork_unrestrictable deny_unproven=$count_skipped_deny_unproven control_plane_cwd=$count_skipped_control_plane)"
+log "seen=$count_seen wrote=$count_wrote forked=$count_forked context_triggered=$count_context_trigger self_compact=on(>=${SELF_COMPACT_FIRE_AT_TOKENS}tok) skipped(live=$count_skipped_live live_rescan=$count_skipped_live_rescan sdk-cli_or_unknown=$count_skipped_sdk_cli short=$count_skipped_short backoff=$count_skipped_backoff fresh=$count_skipped_fresh_mission no_cwd=$count_skipped_no_cwd stale=$count_skipped_stale observer=$count_skipped_observer no_next=$count_skipped_no_next ralph=$count_skipped_ralph git_stale=$count_skipped_git_stale fork_budget=$count_skipped_fork_budget mission_err=$count_mission_status_error mission_not_ours=$count_skipped_mission_not_ours mission_resolve_err=$count_mission_resolve_error fork_unrestrictable=$count_skipped_fork_unrestrictable deny_unproven=$count_skipped_deny_unproven control_plane_cwd=$count_skipped_control_plane)"

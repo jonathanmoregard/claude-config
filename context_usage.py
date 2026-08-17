@@ -285,14 +285,36 @@ def occupancy(path: str) -> Occupancy | None:
 
 
 def main(argv: list[str]) -> int:
-    fill_only = False
-    args = [a for a in argv[1:] if a != "--fill-pct"]
-    if len(args) != len(argv[1:]):
-        fill_only = True
-    if len(args) != 1:
-        print(f"usage: {os.path.basename(argv[0])} [--fill-pct] <transcript.jsonl>",
+    fill_only = "--fill-pct" in argv[1:]
+    tokens_only = "--tokens" in argv[1:]
+    args = [a for a in argv[1:] if a not in ("--fill-pct", "--tokens")]
+    if len(args) != 1 or (fill_only and tokens_only):
+        print(f"usage: {os.path.basename(argv[0])} [--fill-pct|--tokens] <transcript.jsonl>",
               file=sys.stderr)
         return 2
+
+    if tokens_only:
+        # The ABSOLUTE occupancy, with no denominator involved.
+        #
+        # self-compact fires on this rather than on a percentage. A percentage
+        # needs a window to divide by, and the window is the least trustworthy
+        # number here: it comes from a model-name prefix table that goes stale,
+        # or from CLAUDE_CONTEXT_MAX, which is a display override that had no
+        # business deciding when a session resets itself. Tokens are measured
+        # from the transcript's own recorded usage and cannot be talked into
+        # being something else.
+        occ = occupancy(args[0])
+        if occ is None:
+            print(f"context_usage: cannot read transcript {args[0]}", file=sys.stderr)
+            return 1
+        if occ.estimated:
+            # The NUMERATOR is a guess: no recorded usage, only a byte count.
+            # Still refused, because spending on a guess is the thing to avoid.
+            print("context_usage: refusing --tokens for an estimated reading "
+                  "(transcript records no token usage)", file=sys.stderr)
+            return 1
+        print(occ.total_tokens)
+        return 0
 
     occ = occupancy(args[0])
     if occ is None:

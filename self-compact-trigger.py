@@ -86,7 +86,17 @@ import inplace_reset  # noqa: E402  (same shim; ships beside this file)
 # along with the on/off switch it lived beside. Changing this number is a code
 # change with a test run behind it, which is the correct amount of friction for a
 # value that decides when a machine spends usage.
-THRESHOLD = 0.30
+# Fire when the session is holding this many tokens. 300k is 30% of a 1M
+# window, which is the size this is for.
+#
+# ABSOLUTE, not a percentage, and that is the point. A percentage needs a window
+# to divide by, and the window was the least trustworthy number in the whole
+# calculation: it came from a model-name prefix table that goes stale, or from
+# CLAUDE_CONTEXT_MAX -- a DISPLAY override, which had no business deciding when
+# a session resets itself. Set that to 200000 on a 1M model and the old code
+# fired at 10% real occupancy. Tokens are read from the transcript's own
+# recorded usage and cannot be talked into being something else.
+FIRE_AT_TOKENS = 300_000
 
 # Ceiling on fires per session, for a session that oscillates across the
 # threshold: each crossing re-arms (see LOOP BOUND above), so without a cap a
@@ -337,23 +347,14 @@ def main() -> int:
         # No recorded usage: firing an expensive path off a byte-count guess is
         # not acceptable.
         return 0
-    if not occ.window_known:
-        # The DENOMINATOR is a guess: this model family is in neither of
-        # context_usage.py's prefix tables, so `window` is the 200k base as an
-        # assumption. A 1M session measured against it reads ~5x high and would
-        # fire at ~6% real occupancy — spending an opus-5 resume on a session
-        # with 940k of runway left. Refuse, and say so loudly enough that the
-        # table gets updated rather than silently drifting.
-        log(f"sid={sid} REFUSING to fire: context window is UNKNOWN for "
-            f"model={occ.model!r} (window_source={occ.window_source}, assuming "
-            f"{occ.window} would read ~{occ.fill_pct:.2f} fill). Add the family "
-            f"to context_usage.py ONE_M_MODEL_PREFIXES or "
-            f"KNOWN_BASE_MODEL_PREFIXES.")
-        return 0
+    # No window-known check: the window is not consulted. An unfamiliar model
+    # name used to refuse the fire outright, because the denominator would have
+    # been a guess. With an absolute count there is nothing to guess at -- 300k
+    # of measured usage is 300k whatever the model is called.
 
     state = load_state(sid)
 
-    if occ.fill_pct < THRESHOLD:
+    if occ.total_tokens < FIRE_AT_TOKENS:
         if not state.get("armed"):
             state["armed"] = True
             state["rearmed_at"] = int(time.time())
@@ -376,7 +377,7 @@ def main() -> int:
     state["last_fired_at"] = now
     state["last_fill_pct"] = occ.fill_pct
     state["window"] = occ.window
-    state["threshold"] = THRESHOLD
+    state["fire_at_tokens"] = FIRE_AT_TOKENS
 
     # Persist the bound BEFORE spending anything. If this write fails we do not
     # fire: an unbounded trigger is worse than a missing one.
@@ -391,7 +392,7 @@ def main() -> int:
         "tokens": occ.total_tokens,
         "window": occ.window,
         "fill_pct": occ.fill_pct,
-        "threshold": THRESHOLD,
+        "fire_at_tokens": FIRE_AT_TOKENS,
         "model": occ.model,
         "crossing": state["crossings"],
         "requested_at_epoch": now,
@@ -429,7 +430,7 @@ def main() -> int:
     reset = spawn_inplace_reset(sid)
     log(f"sid={sid} FIRE crossing={state['crossings']} "
         f"tokens={occ.total_tokens}/{occ.window} "
-        f"fill={occ.fill_pct:.3f} threshold={THRESHOLD} cwd={cwd} "
+        f"fill={occ.fill_pct:.3f} fire_at={FIRE_AT_TOKENS} cwd={cwd} "
         f"marker={'ok' if marker_written else 'FAILED'} inplace={reset}")
     gc_state()
     return 0
@@ -445,7 +446,7 @@ def manual(instructions: str) -> int:
     Two gates the automatic path applies are deliberately absent here, because
     both exist to police a CLAIM that a manual request does not make:
 
-      * the >= THRESHOLD test. The marker's authority in the automatic path is
+      * the >= FIRE_AT_TOKENS test. The marker's authority in the automatic path is
         "this session measured above the threshold", which is re-measured
         downstream. A human asking to hand off asserts nothing about occupancy,
         and "you are only at 12%" is not a reason to refuse them.
