@@ -29,6 +29,29 @@ info() { echo "  -> $*"; }
 command -v claude >/dev/null || fail "claude CLI not on PATH"
 command -v jq >/dev/null     || fail "jq not on PATH"
 
+# --- One scratch parent for everything this run creates -----------------------
+# `mktemp` resolves its template against $TMPDIR, so pointing TMPDIR at a single
+# per-run directory makes every dir this harness creates removable as ONE path.
+# It also draws the line the cleanup needs: a REFLECT_ROOT this script created
+# lands inside the parent, a caller-supplied one does not, so the trap below can
+# never delete a root it was handed.
+LIVE_TMP_PARENT="$(mktemp -d -t reflect-live-run-XXXXXX)"
+export TMPDIR="$LIVE_TMP_PARENT"
+
+# Artifacts are evidence when something fails, litter when it does not: keep the
+# whole tree on any non-zero exit (fail() included) and under REFLECT_DEBUG=1,
+# remove it on success. Before this there was no cleanup at all and every run
+# left its dirs in /tmp for good.
+cleanup() {
+  local rc=$?
+  if (( rc != 0 )) || [[ "${REFLECT_DEBUG:-}" == "1" ]]; then
+    echo "  -> temp state kept for inspection: $LIVE_TMP_PARENT" >&2
+    return
+  fi
+  rm -rf "$LIVE_TMP_PARENT"
+}
+trap cleanup EXIT
+
 # --- Isolated artifact root (do NOT pollute real ~/.claude/reflections) ------
 REFLECT_ROOT="${REFLECT_ROOT:-$(mktemp -d -t reflect-live-XXXXXX)}"
 export REFLECT_ROOT
@@ -218,4 +241,9 @@ info "deny run: $DENY_RUN    control run: $CONTROL_RUN    (logs under $DENY_PROB
 info "T3: this CLI enforces permissions.deny (denied run wrote nothing; control wrote the sentinel)"
 
 echo "OK: live smoke passed"
-echo "Artifacts in: $REFLECT_ROOT"
+case "$REFLECT_ROOT" in
+  "$LIVE_TMP_PARENT"/*)
+    echo "Artifacts were in: $REFLECT_ROOT (removed on this clean exit — rerun with REFLECT_DEBUG=1 to keep them)" ;;
+  *)
+    echo "Artifacts in: $REFLECT_ROOT (caller-supplied REFLECT_ROOT — left alone)" ;;
+esac
