@@ -1,0 +1,72 @@
+{
+  "_README": [
+    "Limits for the global egress gate (mcps/egress-guard/server.py).",
+    "This file is the ONLY way to widen a limit. There is no override flag,",
+    "no force argument and no bypass environment variable, by design.",
+    "Read fresh on every call, so an edit takes effect without a restart.",
+    "",
+    "defaults      applies to any resource not listed under `resources`;",
+    "              an unknown host auto-registers with these.",
+    "resources     per-resource overrides, keyed by exact resource id.",
+    "",
+    "min_interval_s     hard lower bound on the cadence. The effective floor",
+    "                   is the strictest of this and every interval any",
+    "                   participant has declared. A caller can raise it,",
+    "                   never lower it.",
+    "window_s           rolling budget window.",
+    "max_requests       requests allowed per window. Exhaustion RAISES.",
+    "max_cost           cost units allowed per window. One unit is roughly",
+    "                   50 rows, so a `limit: 5000` query debits ~100.",
+    "max_wait_s         longest a single acquire may block. Deeper queues are",
+    "                   refused without reserving a slot.",
+    "block_cooldown_s   default refusal window after a host pushes back.",
+    "                   86400 = retry tomorrow, not an escalating ladder.",
+    "require_declaration  when true, a resource is refused until someone has",
+    "                   declared its blast radius: expected requests, expected",
+    "                   cost, the ceiling it must not exceed, and what pushback",
+    "                   from this resource looks like.",
+    "preflight_after_requests  once a resource has had this many grants in the",
+    "                   window, further grants are refused until a preflight is",
+    "                   recorded. Prove the invariants that silently corrupt a",
+    "                   bulk job on a bounded sample first: a short page mid-run",
+    "                   is not end-of-data, offset caps, server totals that",
+    "                   over-count, empty windows, boundary duplicates. 0 = off.",
+    "",
+    "Deleting a resource's .json under the state dir clears its budget history",
+    "and cooldown. It does NOT lower the floor: the ratchet is kept in a",
+    "sibling .floor file precisely so that losing state cannot make us faster.",
+    "Lowering a floor means deleting that .floor file too, deliberately."
+  ],
+  "defaults": {
+    "min_interval_s": 5.0,
+    "window_s": 3600.0,
+    "max_requests": 120,
+    "max_cost": 600.0,
+    "max_wait_s": 60.0,
+    "block_cooldown_s": 86400.0,
+    "require_declaration": true,
+    "preflight_after_requests": 100
+  },
+  "resources": {
+    "forum.effectivealtruism.org": {
+      "_note": [
+        "robots.txt publishes Crawl-Delay: 2 and documents no per-request",
+        "limit for /graphql. 2s is the floor for ONE client; the aggregate is",
+        "what tripped the bot challenge, so this is deliberately slower.",
+        "Budget sized for a multi-hour crawl at this cadence, not for a burst.",
+        "Both gates ON here: this is the host whose bot challenge this guard exists",
+        "for. Declaring the blast radius comes before first contact, and a run wider",
+        "than 50 requests needs bounded-sample invariant checks on record first -",
+        "the silent pagination bug is what turned one crawl into a repair pass."
+      ],
+      "min_interval_s": 5.0,
+      "window_s": 5400.0,
+      "max_requests": 600,
+      "max_cost": 3000.0,
+      "max_wait_s": 60.0,
+      "block_cooldown_s": 86400.0,
+      "require_declaration": true,
+      "preflight_after_requests": 50
+    }
+  }
+}

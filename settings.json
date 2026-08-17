@@ -304,6 +304,15 @@
         "hooks": [
           {
             "type": "command",
+            "command": "bash $HOME/.claude/hooks/ralph-loop-stop.sh",
+            "statusMessage": "Checking Ralph loop gate..."
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
             "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/self-compact-trigger.py",
             "timeout": 30
           }
@@ -399,7 +408,7 @@
     "mutation-testing@trailofbits": false,
     "nix-search@nix-search-marketplace": true,
     "nixos@kettleofskills": true,
-    "ralph-loop@claude-plugins-official": true,
+    "ralph-loop@claude-plugins-official": false,
     "recursive-self-improvement@jonathanmoregard": true,
     "sharp-edges@trailofbits": true,
     "skill-creator@claude-plugins-official": true,

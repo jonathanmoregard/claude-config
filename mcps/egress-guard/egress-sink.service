@@ -1,0 +1,20 @@
+[Unit]
+# The debounce proxy must be up whenever anything might make a request. A proxy
+# that is down is the most likely bypass in this whole design: the agent finds
+# connection-refused, calls the upstream "just for now", and the guarantee is
+# gone. Restart=always exists to remove that moment.
+Description=Local egress debounce proxy (egress-sink)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env python3 %h/.claude/bin/egress-sink serve
+Restart=always
+RestartSec=2
+# Survive transient failures without giving up and leaving the socket dead.
+StartLimitIntervalSec=0
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -111,11 +111,16 @@ def main() -> int:
     if payload.get("stop_hook_active"):
         return 0
 
-    transcript = payload.get("transcript_path")
-    if not transcript:
-        return 0
+    # The transcript file is written asynchronously and can lag the live
+    # conversation, so prefer the field Stop hooks are given directly.
+    raw = payload.get("last_assistant_message") or ""
+    if not raw:
+        transcript = payload.get("transcript_path")
+        if not transcript:
+            return 0
+        raw = last_assistant_text(transcript)
 
-    text = strip_code(last_assistant_text(transcript))
+    text = strip_code(raw)
     if not text:
         return 0
 
@@ -128,10 +133,7 @@ def main() -> int:
         return 0
 
     matched = ", ".join(sorted({h.lower() for h in hits})[:3])
-    print(json.dumps({
-        "decision": "block",
-        "reason": GUIDANCE.format(matched=matched),
-    }))
+    print(json.dumps({"systemMessage": GUIDANCE.format(matched=matched)}))
     return 0
 
 
