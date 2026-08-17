@@ -10,12 +10,27 @@ set -euo pipefail
 
 STATE=".claude/ralph-loop.local.md"
 
-# EXISTENCE CHECK ONLY, and deliberately a GLOB: "does this project use the
-# mission convention at all". The files it matches are human-readable copies —
-# the authoritative handoff lives outside the repo — so this must never be read
-# as content, only counted.
+# Working notes live in userspace (`~/.claude/tasks/<repo>/`) per CLAUDE.md, because
+# repo-relative notes get auto-committed and published. A project may symlink
+# `<repo>/tasks` at that dir, in which case both spellings resolve to the same files.
+# BOTH are checked, and the repo-relative one wins: a project that has not been
+# migrated must not lose its reminder, and a reminder naming a path nothing writes
+# to any more is worse than no reminder at all.
+NOTES_USERSPACE="$HOME/.claude/tasks/${PWD##*/}"
+NOTES=""
+for _d in "tasks" "$NOTES_USERSPACE"; do
+  # EXISTENCE CHECK ONLY, and deliberately a GLOB: "does this project use the
+  # mission convention at all". The files it matches are human-readable copies —
+  # the authoritative handoff lives outside the repo — so this must never be read
+  # as content, only counted.
+  if compgen -G "$_d/mission*.md" >/dev/null 2>&1; then NOTES="$_d"; break; fi
+done
+# What the reminders NAME. With no notes anywhere yet, name userspace: that is where
+# this project's notes are supposed to go.
+NOTES_SHOWN="${NOTES:-$NOTES_USERSPACE}"
+
 mission_exists() {
-  compgen -G "tasks/mission*.md" >/dev/null 2>&1
+  [[ -n "$NOTES" ]]
 }
 
 # Name the AUTHORITATIVE handoff when session-reflect can resolve one
@@ -25,7 +40,7 @@ mission_exists() {
 # an interactive session whose human owns this cwd. It never drives an unattended
 # fork, which is why idle-handoff.sh has no such fallback.
 RESOLVE="$HOME/.claude/skills/session-reflect/reflect.sh"
-MISSION="tasks/mission.md"
+MISSION="$NOTES_SHOWN/mission.md"
 if [[ -x "$RESOLVE" || -f "$RESOLVE" ]]; then
   RESOLVED="$(bash "$RESOLVE" --mission-path "$PWD" </dev/null 2>/dev/null || true)"
   [[ -n "$RESOLVED" && -f "$RESOLVED" ]] && MISSION="$RESOLVED"
@@ -44,7 +59,7 @@ if [[ ! -f "$STATE" ]]; then
   # cached prefix that held CLAUDE.md and mission context; disk beats
   # in-context memory once compaction has fired.
   cat <<EOF
-[context-lifecycle] A mission handoff exists in this project ($MISSION). Context was just compacted, cleared, or restarted — re-read that file now, plus tasks/session-constraints.md if present. Do not rely on your memory of the pre-compact conversation for state that lives on disk.
+[context-lifecycle] A mission handoff exists in this project ($MISSION). Context was just compacted, cleared, or restarted — re-read that file now, plus $NOTES_SHOWN/session-constraints.md if present. Do not rely on your memory of the pre-compact conversation for state that lives on disk.
 EOF
   exit 0
 fi
@@ -61,7 +76,7 @@ fi
 
 cat <<EOF
 [autonomous-orchestration] Ralph loop ACTIVE (iteration ${ITER}). Context was just compacted, cleared, or restarted — re-arm the doctrine:
-- Re-read $MISSION, tasks/progress.md, and tasks/session-constraints.md NOW. Constraints are the first thing compaction kills — the file is authoritative. Trust files and git log over any memory of this conversation.
+- Re-read $MISSION, $NOTES_SHOWN/progress.md, and $NOTES_SHOWN/session-constraints.md NOW. Constraints are the first thing compaction kills — the file is authoritative. Trust files and git log over any memory of this conversation.
 - You are the orchestrator: dispatch subagents for all reads/edits/tests; hold no code context yourself.
 - Bias to action. Never end a turn with only a plan, a summary, or a question that mission.md or the dangerous-ops manifest already answers.
 - Stop ONLY via the completion sigil recorded in $MISSION, emitted ONLY when literally TRUE: verifier freshly green AND fresh-context reviewer confirmed. Never emit a false sigil. If no sigil is configured, the loop ends only at max-iterations.${AGE_NOTE}
