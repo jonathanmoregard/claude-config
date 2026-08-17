@@ -521,10 +521,24 @@ chmod +x "$STUB_SCRATCH/kitten"
 
 export PATH="$SPAWN_SHIM_DIR:$STUB_HELP_DIR:$STUB_SCRATCH:$PATH"
 
-# --- Isolated artifact root --------------------------------------------------
+# --- Isolated artifact roots --------------------------------------------------
 REFLECT_ROOT="${REFLECT_ROOT:-$(mktemp -d -t reflect-smoke-XXXXXX)}"
 export REFLECT_ROOT
 export REFLECT_MODEL="stub-model"
+# HARD ISOLATION REQUIREMENT. Self-compact's tree moved out of $REFLECT_ROOT to
+# ~/.claude/sessions, so isolating REFLECT_ROOT alone is no longer sufficient:
+# without this, every test writes handoffs, markers and state into the USER'S
+# REAL session directory, and mission_resolve_handoff would resolve against
+# their live handoffs. It defaults inside REFLECT_ROOT so a single mktemp still
+# covers the whole suite and teardown still collects it.
+CLAUDE_SESSIONS_DIR="${CLAUDE_SESSIONS_DIR:-$REFLECT_ROOT/sessions-home}"
+export CLAUDE_SESSIONS_DIR
+mkdir -p "$CLAUDE_SESSIONS_DIR"
+case "$CLAUDE_SESSIONS_DIR" in
+  "$HOME"/.claude/self-compact|"$HOME"/.claude/self-compact/*)
+    echo "smoke.sh: refusing to run with CLAUDE_SESSIONS_DIR pointing at the real session tree ($CLAUDE_SESSIONS_DIR)" >&2
+    exit 2 ;;
+esac
 # Force is off; idempotency test relies on it being unset.
 unset REFLECT_FORCE
 
@@ -1943,11 +1957,11 @@ mk_mission_copy() {
 mk_mission_handoff() {
   # $1=sid  $2=project_cwd  $3=body  [$4=touch-date]
   # The AUTHORITATIVE handoff plus the cwd sidecar that maps a project to it.
-  # Both live under $REFLECT_ROOT — outside every checkout — which is the whole
-  # point: a test can only create one by reaching outside the repo, and so can an
-  # attacker only by already owning the machine. Prints the handoff path.
+  # Both live under $CLAUDE_SESSIONS_DIR — outside every checkout — which is the
+  # whole point: a test can only create one by reaching outside the repo, and so
+  # can an attacker only by already owning the machine. Prints the handoff path.
   local sid="$1" cwd="$2" body="$3" when="${4:-}"
-  local d="$REFLECT_ROOT/sessions/$sid"
+  local d="$CLAUDE_SESSIONS_DIR/$sid"
   # The handoff goes in the fork-writable LEAF; the cwd sidecar one level up,
   # outside that grant. Mirrors mission_handoff_path / mission_handoff_cwd_path.
   mkdir -p "$d/handoff"
@@ -1955,7 +1969,7 @@ mk_mission_handoff() {
     printf '<!-- written-against: sha=none ts=%s sid=%s -->\n' "$(date -u +%s)" "$sid"
     printf '%s\n' "$body"
   } > "$d/handoff/mission.md"
-  printf '%s\n' "$cwd" > "$d/mission.cwd"
+  printf '%s\n' "$cwd" > "$d/cwd"
   [[ -n "$when" ]] && touch -d "$when" "$d/handoff/mission.md"
   printf '%s' "$d/handoff/mission.md"
 }
@@ -2038,12 +2052,12 @@ jq -e '.modes.mission.status == "complete"' "$B3_MANIFEST" >/dev/null \
 
 # D1: the AUTHORITATIVE artifact is out of the repo, and that is what the manifest
 # reports as `artifact` — the repo copy is reported separately.
-B3_HANDOFF="$REFLECT_ROOT/sessions/$B3_SID/handoff/mission.md"
+B3_HANDOFF="$CLAUDE_SESSIONS_DIR/$B3_SID/handoff/mission.md"
 [[ -f "$B3_HANDOFF" ]] || fail "no authoritative handoff at $B3_HANDOFF"
 grep -q 'machine written' "$B3_HANDOFF" || fail "handoff lacks the model body"
 grep -q '^<!-- written-against: sha=.* sid=' "$B3_HANDOFF" || fail "handoff missing provenance stamp"
-[[ "$(cat "$REFLECT_ROOT/sessions/$B3_SID/mission.cwd")" == "$B3_CWD" ]] \
-  || fail "handoff cwd sidecar does not record the project ($(cat "$REFLECT_ROOT/sessions/$B3_SID/mission.cwd"))"
+[[ "$(cat "$CLAUDE_SESSIONS_DIR/$B3_SID/cwd")" == "$B3_CWD" ]] \
+  || fail "handoff cwd sidecar does not record the project ($(cat "$CLAUDE_SESSIONS_DIR/$B3_SID/cwd"))"
 jq -e --arg p "$B3_HANDOFF" '.modes.mission.artifact == $p' "$B3_MANIFEST" >/dev/null \
   || fail "artifact should be the out-of-repo handoff (got $(jq -r '.modes.mission.artifact' "$B3_MANIFEST"))"
 jq -e --arg p "$B3_HANDOFF" '.modes.mission.handoff == $p' "$B3_MANIFEST" >/dev/null \
@@ -2104,14 +2118,14 @@ jq -e '.modes.mission.refused_overwrite == false' "$B3B_MANIFEST" >/dev/null \
   || fail "19b: refresh must not record a refusal"
 # Each session keeps its OWN authoritative handoff out of repo; the second run
 # does not overwrite the first session's.
-grep -q 'first pass' "$REFLECT_ROOT/sessions/$B3B_SID1/handoff/mission.md" \
+grep -q 'first pass' "$CLAUDE_SESSIONS_DIR/$B3B_SID1/handoff/mission.md" \
   || fail "19b: first session's out-of-repo handoff was clobbered by the second"
-grep -q 'second pass' "$REFLECT_ROOT/sessions/$B3B_SID2/handoff/mission.md" \
+grep -q 'second pass' "$CLAUDE_SESSIONS_DIR/$B3B_SID2/handoff/mission.md" \
   || fail "19b: second session wrote no handoff"
 # Resolution for this project follows the NEWEST handoff, which is the second run.
 B3B_RES="$(bash "$REFLECT_SH" --mission-path "$B3B_CWD" 2>/dev/null)" \
   || fail "19b: resolution failed after two runs in one project"
-[[ "$B3B_RES" == "$REFLECT_ROOT/sessions/$B3B_SID2/handoff/mission.md" ]] \
+[[ "$B3B_RES" == "$CLAUDE_SESSIONS_DIR/$B3B_SID2/handoff/mission.md" ]] \
   || fail "19b: resolution should follow the newest handoff for the project (got '$B3B_RES')"
 info "pointer repointed across sessions; both handoffs kept; newest resolves"
 
@@ -2152,7 +2166,7 @@ B3C_MANIFEST="$REFLECT_ROOT/sessions/$B3C_SID/manifest.json"
 jq -e '.modes.mission.pointer_action == "refused_foreign_file"' "$B3C_MANIFEST" >/dev/null \
   || fail "19c: expected pointer_action=refused_foreign_file (got $(jq -r '.modes.mission.pointer_action' "$B3C_MANIFEST"))"
 [[ -f "$B3C_CWD/tasks/mission.$B3C_SID.md" ]] || fail "19c: human copy not written beside it"
-[[ -f "$REFLECT_ROOT/sessions/$B3C_SID/handoff/mission.md" ]] || fail "19c: no authoritative handoff"
+[[ -f "$CLAUDE_SESSIONS_DIR/$B3C_SID/handoff/mission.md" ]] || fail "19c: no authoritative handoff"
 info "stamped regular mission.md untouched and unmoved; copy + handoff still written"
 
 # ============================================================================
@@ -2430,7 +2444,7 @@ chmod +x "$STUB_SCRATCH/claude"
 # and it must be OFF unless one key in the RSI config says otherwise.
 #
 # Shared fixtures for the whole group.
-SC_STATE_DIR="$REFLECT_ROOT/self-compact-state"
+SC_STATE_DIR="$CLAUDE_SESSIONS_DIR"
 SC_TRIGGER="$WORKTREE/self-compact-trigger.py"
 SC_USAGE="$WORKTREE/context_usage.py"
 
@@ -2535,8 +2549,8 @@ sc_wait_mission() {
   # sidecar, the human copy, and a terminal manifest.
   local cwd="$1" sid="$2" mf="$REFLECT_ROOT/sessions/$2/manifest.json" i
   for (( i = 0; i < 120; i++ )); do
-    [[ -f "$REFLECT_ROOT/sessions/$sid/handoff/mission.md" ]] && \
-      [[ -f "$REFLECT_ROOT/sessions/$sid/mission.cwd" ]] && \
+    [[ -f "$CLAUDE_SESSIONS_DIR/$sid/handoff/mission.md" ]] && \
+      [[ -f "$CLAUDE_SESSIONS_DIR/$sid/cwd" ]] && \
       [[ -f "$cwd/tasks/mission.$sid.md" ]] && \
       jq -e '.modes.mission.status == "complete"' "$mf" >/dev/null 2>&1 && return 0
     sleep 0.25
@@ -2665,13 +2679,13 @@ for mode in absent malformed nokey normal; do
   (( rc == 0 )) || fail "21: config=$mode must exit 0 (got $rc)"
   [[ -z "$B5_OUT" ]] || fail "21: config=$mode produced stdout: $B5_OUT (a Stop hook must stay silent)"
   for _ in $(seq 1 40); do
-    [[ -e "$SC_STATE_DIR/$B5_SID.request.json" ]] && break
+    [[ -e "$SC_STATE_DIR/$B5_SID/request.json" ]] && break
     sleep 0.25
   done
-  [[ -e "$SC_STATE_DIR/$B5_SID.request.json" ]] \
+  [[ -e "$SC_STATE_DIR/$B5_SID/request.json" ]] \
     || fail "21: config=$mode suppressed the trigger — no config shape may act as an off switch"
-  jq -e '.threshold == 0.30' "$SC_STATE_DIR/$B5_SID.request.json" >/dev/null \
-    || fail "21: config=$mode changed the recorded threshold ($(jq -r .threshold "$SC_STATE_DIR/$B5_SID.request.json"))"
+  jq -e '.threshold == 0.30' "$SC_STATE_DIR/$B5_SID/request.json" >/dev/null \
+    || fail "21: config=$mode changed the recorded threshold ($(jq -r .threshold "$SC_STATE_DIR/$B5_SID/request.json"))"
 done
 
 # ...including a config that tries to say `false` explicitly. There is nothing to
@@ -2681,12 +2695,12 @@ printf '%s\n' '{"components":{"self_compact":false},"self_compact":{"threshold":
 sc_fire "$B5_H" "test-sid-b5-explicit-false" "$B5_CWD" "$B5_H/t.jsonl" >/dev/null \
   || fail "21: trigger rc!=0 with a stale self_compact key present"
 for _ in $(seq 1 40); do
-  [[ -e "$SC_STATE_DIR/test-sid-b5-explicit-false.request.json" ]] && break
+  [[ -e "$SC_STATE_DIR/test-sid-b5-explicit-false/request.json" ]] && break
   sleep 0.25
 done
-[[ -e "$SC_STATE_DIR/test-sid-b5-explicit-false.request.json" ]] \
+[[ -e "$SC_STATE_DIR/test-sid-b5-explicit-false/request.json" ]] \
   || fail "21: the trigger did not fire with a leftover self_compact block present — something in that block is still being read (the false switch, or the 0.99 threshold)"
-jq -e '.threshold == 0.30' "$SC_STATE_DIR/test-sid-b5-explicit-false.request.json" >/dev/null \
+jq -e '.threshold == 0.30' "$SC_STATE_DIR/test-sid-b5-explicit-false/request.json" >/dev/null \
   || fail "21: a leftover self_compact.threshold=0.99 was honoured — the threshold is still config-readable"
 info "no config shape (absent/malformed/nokey/normal/explicit-false) can disable it or move the threshold"
 
@@ -2709,7 +2723,7 @@ sc_fire "$B2_H" "$B2_UNDER_SID" "$B2_CWD" "$B2_H/under.jsonl" >/dev/null \
 # be terminal before "no marker exists" is a fact rather than a bet.
 spawn_wait_quiescent 60 \
   || fail "22: work spawned by the under-threshold fire never finished: $SPAWN_HOLDERS"
-[[ ! -e "$SC_STATE_DIR/$B2_UNDER_SID.request.json" ]] \
+[[ ! -e "$SC_STATE_DIR/$B2_UNDER_SID/request.json" ]] \
   || fail "22: fired at 29% with a 30% threshold"
 
 # At/over threshold: fire.
@@ -2733,13 +2747,13 @@ for section in '## Done' '## Next' '## Blocked' '## Open questions'; do
 done
 [[ -L "$B2_CWD/tasks/mission.md" ]] || fail "22: discovery pointer tasks/mission.md not installed"
 
-B2_REQ="$SC_STATE_DIR/$B2_SID.request.json"
+B2_REQ="$SC_STATE_DIR/$B2_SID/request.json"
 [[ -f "$B2_REQ" ]] || fail "22: no persisted self-compact request marker at $B2_REQ"
 jq -e --arg c "$B2_CWD" '.cwd == $c and .window == 1000000 and .tokens == 310000
                           and .threshold == 0.30 and (.requested_at_epoch|type) == "number"' \
   "$B2_REQ" >/dev/null || fail "22: request marker incomplete: $(cat "$B2_REQ")"
-jq -e '.fires == 1 and .armed == false' "$SC_STATE_DIR/$B2_SID.state.json" >/dev/null \
-  || fail "22: state after one fire wrong: $(cat "$SC_STATE_DIR/$B2_SID.state.json")"
+jq -e '.fires == 1 and .armed == false' "$SC_STATE_DIR/$B2_SID/state.json" >/dev/null \
+  || fail "22: state after one fire wrong: $(cat "$SC_STATE_DIR/$B2_SID/state.json")"
 assert_repo_tasks_untouched "after TEST 22 (self-compact fire)"
 info "fired at 31% in ${b2_ms}ms, silent stdout, 4-section handoff + pointer written"
 
@@ -2757,9 +2771,9 @@ jq -cn --arg sid "$B2_SDK_SID" --arg tp "$B2_H/over.jsonl" --arg cwd "$B2_CWD" \
     python3 "$B2_H/.claude/self-compact-trigger.py" >/dev/null \
   || fail "22: sdk-cli fire rc!=0"
 sleep 0.5
-[[ ! -e "$SC_STATE_DIR/$B2_SUB_SID.request.json" ]] \
+[[ ! -e "$SC_STATE_DIR/$B2_SUB_SID/request.json" ]] \
   || fail "22: fired inside a reflection subprocess — unbounded recursion"
-[[ ! -e "$SC_STATE_DIR/$B2_SDK_SID.request.json" ]] \
+[[ ! -e "$SC_STATE_DIR/$B2_SDK_SID/request.json" ]] \
   || fail "22: fired inside a headless sdk-cli run — fork chain"
 info "reflection subprocess and sdk-cli entrypoints refuse to fire"
 
@@ -2790,14 +2804,14 @@ done
 sleep 1.5
 (( $(sc_calls) == 1 )) \
   || fail "23: LOOP — $(sc_calls) model calls for one threshold crossing"
-jq -e '.fires == 1 and .crossings == 1' "$SC_STATE_DIR/$B6_SID.state.json" >/dev/null \
-  || fail "23: state drifted on repeat Stops: $(cat "$SC_STATE_DIR/$B6_SID.state.json")"
+jq -e '.fires == 1 and .crossings == 1' "$SC_STATE_DIR/$B6_SID/state.json" >/dev/null \
+  || fail "23: state drifted on repeat Stops: $(cat "$SC_STATE_DIR/$B6_SID/state.json")"
 
 # Drop below threshold -> re-arm (this is what "per crossing" means).
 mk_context_transcript "$B6_TP" "claude-opus-5" 90000 "$B6_CWD"
 sc_fire "$B6_H" "$B6_SID" "$B6_CWD" "$B6_TP" >/dev/null || fail "23: re-arm fire rc!=0"
-jq -e '.armed == true and .fires == 1' "$SC_STATE_DIR/$B6_SID.state.json" >/dev/null \
-  || fail "23: a below-threshold reading must re-arm: $(cat "$SC_STATE_DIR/$B6_SID.state.json")"
+jq -e '.armed == true and .fires == 1' "$SC_STATE_DIR/$B6_SID/state.json" >/dev/null \
+  || fail "23: a below-threshold reading must re-arm: $(cat "$SC_STATE_DIR/$B6_SID/state.json")"
 (( $(sc_calls) == 1 )) || fail "23: re-arming spent a model call"
 
 # Crossings 2..CAP each fire; the one after that is refused. The cap is read from
@@ -2822,8 +2836,8 @@ sleep 1.5
 (( $(sc_calls) == B6_CAP )) \
   || fail "23: per-session cap ($B6_CAP) breached — calls=$(sc_calls)"
 jq -e --argjson c "$B6_CAP" '.capped == true and .fires == $c' \
-  "$SC_STATE_DIR/$B6_SID.state.json" >/dev/null \
-  || fail "23: cap not recorded: $(cat "$SC_STATE_DIR/$B6_SID.state.json")"
+  "$SC_STATE_DIR/$B6_SID/state.json" >/dev/null \
+  || fail "23: cap not recorded: $(cat "$SC_STATE_DIR/$B6_SID/state.json")"
 
 # An unwritable state dir must fail OFF: no marker = no bound = no fire.
 B6_RO_H="$(sc_home)"
@@ -2896,7 +2910,7 @@ ln -sfn "mission.$B7_CTRL_SID.md" "$B7_CTRL_CWD/tasks/mission.md"
 counting_stub "$B7_H/calls" "$SC_MISSION_FILE"
 sc_fire "$B7_H" "$B7_SID" "$B7_CWD" "$B7_TP" >/dev/null || fail "24: Stop-hook fire rc!=0"
 sc_wait_mission "$B7_CWD" "$B7_SID" || fail "24: Stop hook produced no handoff to resume from"
-[[ -f "$SC_STATE_DIR/$B7_SID.request.json" ]] || fail "24: no request marker to widen the gate with"
+[[ -f "$SC_STATE_DIR/$B7_SID/request.json" ]] || fail "24: no request marker to widen the gate with"
 
 # Both sessions are only ~2 min idle — far under the 45-min idle floor.
 touch -d '2 minutes ago' "$B7_TP" "$B7_CTRL_PROJ/$B7_CTRL_SID.jsonl"
@@ -2928,7 +2942,7 @@ grep -qi 'no user attached' "$B7_ARGV" \
 grep -qi 'do not ask' "$B7_ARGV" \
   || fail "24: B4 — fork prompt does not forbid asking the user what to do"
 # D1: the fork is seeded from the OUT-OF-REPO handoff, by absolute path.
-B7_HANDOFF="$REFLECT_ROOT/sessions/$B7_SID/handoff/mission.md"
+B7_HANDOFF="$CLAUDE_SESSIONS_DIR/$B7_SID/handoff/mission.md"
 [[ -f "$B7_HANDOFF" ]] || fail "24: the Stop hook wrote no out-of-repo handoff"
 grep -qF "$B7_HANDOFF" "$B7_ARGV" \
   || fail "24: fork prompt does not name the out-of-repo handoff ($B7_HANDOFF)"
@@ -2942,13 +2956,13 @@ B7_ADDDIR="$(awk '/^--add-dir$/{getline; print; exit}' "$B7_ARGV")"
 [[ -n "$B7_ADDDIR" ]] || fail "24: --add-dir appears in argv with no value"
 [[ "$B7_ADDDIR" == "$(dirname -- "$B7_HANDOFF")" ]] \
   || fail "24/R1: --add-dir grants '$B7_ADDDIR'; want exactly the handoff's leaf dir '$(dirname -- "$B7_HANDOFF")'"
-for b7_name in mission.cwd manifest.json final.json checkpoints; do
+for b7_name in cwd manifest.json final.json checkpoints; do
   [[ ! -e "$B7_ADDDIR/$b7_name" ]] \
     || fail "24/R1: the granted dir '$B7_ADDDIR' contains $b7_name — the fork could rewrite it under acceptEdits"
 done
-[[ -f "$REFLECT_ROOT/sessions/$B7_SID/mission.cwd" ]] \
+[[ -f "$CLAUDE_SESSIONS_DIR/$B7_SID/cwd" ]] \
   || fail "24/R1: no cwd sidecar outside the grant, so its placement proves nothing"
-case "$REFLECT_ROOT/sessions/$B7_SID/mission.cwd" in
+case "$CLAUDE_SESSIONS_DIR/$B7_SID/cwd" in
   "$B7_ADDDIR"|"$B7_ADDDIR"/*)
     fail "24/R1: the cwd sidecar lives under the granted dir '$B7_ADDDIR'" ;;
 esac
@@ -3040,9 +3054,9 @@ grep -q "context trigger" "$B7_LOG" || fail "24: widened trigger not logged (aud
 grep -q "AUTOFORK sid=$B7_SID" "$B7_LOG" || fail "24: fork not attributed to the requesting sid"
 grep -q "AUTOFORK sid=$B7_CTRL_SID" "$B7_LOG" \
   && fail "24: control session (2 min idle, no request) was forked — the idle floor was removed, not widened"
-[[ ! -f "$SC_STATE_DIR/$B7_SID.request.json" ]] \
+[[ ! -f "$SC_STATE_DIR/$B7_SID/request.json" ]] \
   || fail "24: request marker not consumed after the fork — next tick would re-fork"
-[[ -f "$SC_STATE_DIR/$B7_SID.consumed.json" ]] \
+[[ -f "$SC_STATE_DIR/$B7_SID/consumed.json" ]] \
   || fail "24: consumed request not retained for audit"
 info "context-triggered fork at 2 min idle; control untouched; prompt is non-interactive"
 
@@ -3051,7 +3065,7 @@ info "context-triggered fork at 2 min idle; control untouched; prompt is non-int
 # That, not a config key, is what makes a stale or planted marker worthless — and
 # it is the bound that still exists now the switch is gone.
 : > "$B7_ARGV"
-cp "$SC_STATE_DIR/$B7_SID.consumed.json" "$SC_STATE_DIR/$B7_SID.request.json"
+cp "$SC_STATE_DIR/$B7_SID/consumed.json" "$SC_STATE_DIR/$B7_SID/request.json"
 # Rewrite the transcript BELOW the threshold: same marker, same idleness.
 mk_context_transcript "$B7_TP" "claude-opus-5" 90000 "$B7_CWD" 25
 touch -d '2 minutes ago' "$B7_TP"
@@ -3245,7 +3259,7 @@ MAN_TEXT="focus on the flaky teardown first, ignore the docs"
     python3 "$MAN_H/.claude/self-compact-trigger.py" --manual "$MAN_TEXT" ) >/dev/null \
   || fail "24c: --manual returned non-zero"
 
-MAN_MARKER="$SC_STATE_DIR/$MAN_SID.request.json"
+MAN_MARKER="$SC_STATE_DIR/$MAN_SID/request.json"
 [[ -f "$MAN_MARKER" ]] || fail "24c: --manual wrote no request marker"
 jq -e '.manual == true' "$MAN_MARKER" >/dev/null \
   || fail "24c: the marker is not flagged manual, so idle-handoff will apply the fill gate to it"
@@ -3324,7 +3338,7 @@ sc_plant_request() {
   jq -n --arg sid "$1" --arg cwd "$2" --arg tp "$3" --argjson now "$(date +%s)" \
     '{session_id:$sid,cwd:$cwd,transcript_path:$tp,tokens:330000,window:1000000,
       fill_pct:0.33,threshold:0.30,requested_at_epoch:$now}' \
-    > "$SC_STATE_DIR/$1.request.json"
+    > "$SC_STATE_DIR/$1/request.json"
 }
 
 # A foreign mission.md whose ## Next is `(none)`, plus a TAMPERED repo copy whose
@@ -3726,7 +3740,7 @@ mk_context_transcript "$F2_H/unknown.jsonl" "claude-zeta-9-20991231" 61000 "$F2_
 sc_fire "$F2_H" "test-sid-f2-unknown" "$F2_CWD" "$F2_H/unknown.jsonl" >/dev/null \
   || fail "27: unknown-model fire rc!=0"
 sleep 0.5
-[[ ! -e "$SC_STATE_DIR/test-sid-f2-unknown.request.json" ]] \
+[[ ! -e "$SC_STATE_DIR/test-sid-f2-unknown/request.json" ]] \
   || fail "27: fired against an assumed denominator — a 1M model would read 5x high here"
 grep -q 'REFUSING to fire: context window is UNKNOWN' "$SC_STATE_DIR/trigger.log" \
   || fail "27: the refusal was silent; the table can go stale unnoticed"
@@ -3838,7 +3852,7 @@ f4_reflect() {
 f4_fire truthy test-sid-f4-sub-1 REFLECT_SUBPROCESS=1 || fail "29: rc!=0 with REFLECT_SUBPROCESS=1"
 f4_reflect test-sid-f4-refl-1 REFLECT_SUBPROCESS=1 || fail "29: dispatcher rc!=0 with REFLECT_SUBPROCESS=1"
 sleep 0.4
-[[ ! -e "$SC_STATE_DIR/test-sid-f4-sub-1.request.json" ]] \
+[[ ! -e "$SC_STATE_DIR/test-sid-f4-sub-1/request.json" ]] \
   || fail "29: trigger fired inside a reflection subprocess"
 [[ ! -f "$REFLECT_ROOT/sessions/test-sid-f4-refl-1/manifest.json" ]] \
   || fail "29: dispatcher ran a real reflection inside a reflection subprocess"
@@ -3855,10 +3869,10 @@ for f4_case in zero empty unset; do
   f4_reflect "test-sid-f4-refl-$f4_case" "${F4_ENV[@]}" \
     || fail "29: dispatcher rc!=0 with REFLECT_SUBPROCESS=$f4_case"
   for _ in $(seq 1 40); do
-    [[ -e "$SC_STATE_DIR/test-sid-f4-sub-$f4_case.request.json" ]] && break
+    [[ -e "$SC_STATE_DIR/test-sid-f4-sub-$f4_case/request.json" ]] && break
     sleep 0.25
   done
-  [[ -e "$SC_STATE_DIR/test-sid-f4-sub-$f4_case.request.json" ]] \
+  [[ -e "$SC_STATE_DIR/test-sid-f4-sub-$f4_case/request.json" ]] \
     || fail "29: REFLECT_SUBPROCESS=$f4_case silently DISABLED the trigger (bash reads the same value as not-a-subprocess)"
   jq -e '.modes.precompact.status == "complete"' \
     "$REFLECT_ROOT/sessions/test-sid-f4-refl-$f4_case/manifest.json" >/dev/null \
@@ -3942,19 +3956,19 @@ mk_context_transcript "$F7_H/over.jsonl" "claude-opus-5" "$F7_OVER" "$F7_CWD" 25
 sc_fire "$F7_H" "test-sid-f7-under" "$F7_CWD" "$F7_H/under.jsonl" >/dev/null \
   || fail "31: producer rc!=0 below the threshold"
 sleep 0.5
-[[ ! -e "$SC_STATE_DIR/test-sid-f7-under.request.json" ]] \
+[[ ! -e "$SC_STATE_DIR/test-sid-f7-under/request.json" ]] \
   || fail "31: fired at ${F7_UNDER}/${F7_WINDOW}, below the $F7_PROD_THR threshold"
 sc_fire "$F7_H" "test-sid-f7-over" "$F7_CWD" "$F7_H/over.jsonl" >/dev/null \
   || fail "31: producer rc!=0 above the threshold"
 for _ in $(seq 1 40); do
-  [[ -e "$SC_STATE_DIR/test-sid-f7-over.request.json" ]] && break
+  [[ -e "$SC_STATE_DIR/test-sid-f7-over/request.json" ]] && break
   sleep 0.25
 done
-[[ -e "$SC_STATE_DIR/test-sid-f7-over.request.json" ]] \
+[[ -e "$SC_STATE_DIR/test-sid-f7-over/request.json" ]] \
   || fail "31: did not fire at ${F7_OVER}/${F7_WINDOW}, above the $F7_PROD_THR threshold"
 jq -e --argjson t "$F7_PROD_THR" '.threshold == $t' \
-  "$SC_STATE_DIR/test-sid-f7-over.request.json" >/dev/null \
-  || fail "31: the request records a threshold other than the constant ($(jq -r .threshold "$SC_STATE_DIR/test-sid-f7-over.request.json"))"
+  "$SC_STATE_DIR/test-sid-f7-over/request.json" >/dev/null \
+  || fail "31: the request records a threshold other than the constant ($(jq -r .threshold "$SC_STATE_DIR/test-sid-f7-over/request.json"))"
 # The consumer prints the same number in its run summary, so an operator reading
 # the log sees the threshold actually in force.
 F7_LOG="$REFLECT_ROOT/idle-handoff-logs/handoff.log"
@@ -4038,9 +4052,9 @@ sc_forked "$F8_ARGV" || fail "33a: control fork did not happen, so the consume p
 F8_TAIL="$(tail -n +$((F8_LINES + 1)) "$F8_LOG")"
 grep -q 'could not consume' <<<"$F8_TAIL" \
   || fail "33a: a failed consume was swallowed — the marker persists and later ticks re-fork the same session"
-[[ -f "$SC_STATE_DIR/$F8_SID.request.json" ]] \
+[[ -f "$SC_STATE_DIR/$F8_SID/request.json" ]] \
   || fail "33a: fixture invalid — the marker should still be there, that is why the log line matters"
-rm -f "$SC_STATE_DIR/$F8_SID.request.json"
+rm -f "$SC_STATE_DIR/$F8_SID/request.json"
 
 # (b) count_skipped_fresh_mission was printed as `fresh=` and never incremented,
 #     so the most common skip reason always reported 0.
@@ -4111,13 +4125,13 @@ fi
 test_begin "TEST 34: D5 — a relative REFLECT_ROOT is refused, loudly, at both seams"
 D5_DIR="$(mktemp -d -t reflect-d5-XXXXXX)"
 assert_isolated_cwd "$D5_DIR"
-mkdir -p "$D5_DIR/reflections/sessions/d5-sid/handoff" "$D5_DIR/tasks"
+mkdir -p "$D5_DIR/self-compact/d5-sid/handoff" "$D5_DIR/tasks"
 # A handoff that WOULD resolve if the relative root were honoured from this cwd.
 {
   printf '<!-- written-against: sha=none ts=1786800000 sid=d5-sid -->\n'
   printf '%s\n' '# PLANTED via a relative root' '## Next' '1. attacker work'
-} > "$D5_DIR/reflections/sessions/d5-sid/handoff/mission.md"
-printf '%s\n' "$D5_DIR" > "$D5_DIR/reflections/sessions/d5-sid/mission.cwd"
+} > "$D5_DIR/self-compact/d5-sid/handoff/mission.md"
+printf '%s\n' "$D5_DIR" > "$D5_DIR/self-compact/d5-sid/cwd"
 
 D5_ERR="$STUB_SCRATCH/d5.stderr"
 if ( cd "$D5_DIR" && REFLECT_ROOT="reflections" bash "$REFLECT_SH" --mission-path "$D5_DIR" \
@@ -4141,7 +4155,7 @@ fi
 grep -q 'not an absolute path' "$D5_ERR" \
   || fail "34: idle-handoff.sh refused a relative root without saying why (stderr: $(cat "$D5_ERR"))"
 # Positive control: the same absolute root still works at both seams.
-( cd "$D5_DIR" && REFLECT_ROOT="$D5_DIR/reflections" bash "$REFLECT_SH" --mission-path "$D5_DIR" >/dev/null 2>&1 ) \
+( cd "$D5_DIR" && CLAUDE_SESSIONS_DIR="self-compact" bash "$REFLECT_SH" --mission-path "$D5_DIR" >/dev/null 2>&1 ) \
   || fail "34: the ABSOLUTE form of the same root stopped working — the check is too strict"
 info "relative REFLECT_ROOT refused at reflect.sh and idle-handoff.sh; absolute form unaffected"
 
@@ -4322,8 +4336,8 @@ R1_CONTENTS="$(find "$R1_GRANT" -mindepth 1 -printf '%P\n' 2>/dev/null | sort | 
 # (b) Every input to the project -> handoff decision, and every artifact a later
 #     run trusts, is OUTSIDE the grant — asserted twice over: absent from the
 #     grant, and present at a path that is not under the grant prefix.
-R1_SESSION_DIR="$REFLECT_ROOT/sessions/$R1_SID"
-for r1_name in mission.cwd manifest.json final.json checkpoints; do
+R1_SESSION_DIR="$CLAUDE_SESSIONS_DIR/$R1_SID"
+for r1_name in cwd manifest.json final.json checkpoints; do
   [[ ! -e "$R1_GRANT/$r1_name" ]] \
     || fail "36b: $r1_name is INSIDE the fork's write grant ($R1_GRANT) — an acceptEdits fork could rewrite it"
   [[ -e "$R1_SESSION_DIR/$r1_name" ]] \
@@ -4342,7 +4356,7 @@ done
 #         planted sidecar as its own sibling-of-parent — must not be a candidate,
 #         because the candidate search is depth-pinned to
 #         sessions/<sid>/handoff/mission.md.
-printf '%s\n' "$R1_OTHER" > "$R1_GRANT/mission.cwd"
+printf '%s\n' "$R1_OTHER" > "$R1_GRANT/cwd"
 printf '{"session_id":"%s","modes":{}}\n' "$R1_SID" > "$R1_GRANT/manifest.json"
 mkdir -p "$R1_GRANT/handoff" && printf 'x\n' > "$R1_GRANT/handoff/mission.md"
 if R1_HIJACK="$(bash "$REFLECT_SH" --mission-path "$R1_OTHER" 2>/dev/null)"; then
@@ -4352,9 +4366,9 @@ R1_STILL="$(bash "$REFLECT_SH" --mission-path "$R1_CWD" 2>/dev/null)" \
   || fail "36c: planting files inside the grant broke resolution for the real project (fail-closed, but it must not be reachable at all)"
 [[ "$R1_STILL" == "$R1_RESOLVED" ]] \
   || fail "36c: resolution moved to '$R1_STILL' after the grant was written into; want '$R1_RESOLVED'"
-[[ "$(head -1 "$R1_SESSION_DIR/mission.cwd")" == "$R1_CWD" ]] \
+[[ "$(head -1 "$R1_SESSION_DIR/cwd")" == "$R1_CWD" ]] \
   || fail "36c: the real sidecar changed — it is not outside the grant after all"
-rm -rf "$R1_GRANT/mission.cwd" "$R1_GRANT/manifest.json" "$R1_GRANT/handoff"
+rm -rf "$R1_GRANT/cwd" "$R1_GRANT/manifest.json" "$R1_GRANT/handoff"
 
 # (d) The sanctioned write-back still lands, and is still what resolves.
 printf '%s\n' '- appended by the fork' >> "$R1_RESOLVED"
@@ -4712,7 +4726,7 @@ R4_AFTER="$(find "$SC_STATE_DIR" -maxdepth 1 -name '.*' 2>/dev/null | wc -l)"
 [[ "$R4_AFTER" == "$R4_BEFORE" ]] \
   || fail "39a: a dot-named sid minted state files under $SC_STATE_DIR ($R4_BEFORE -> $R4_AFTER: $(find "$SC_STATE_DIR" -maxdepth 1 -name '.*'))"
 for r4_sid in '..' '.hidden' '.'; do
-  [[ ! -e "$SC_STATE_DIR/$r4_sid.state.json" ]] \
+  [[ ! -e "$SC_STATE_DIR/$r4_sid/state.json" ]] \
     || fail "39a: '$r4_sid.state.json' was created"
 done
 info "39a: bash and python agree on every sid shape, leading dot included"
@@ -5084,7 +5098,7 @@ t1_refused() {
     || fail "$label: the refusal is not in the counters (summary: $(grep -m1 'seen=' <<<"$tail_out"))"
   grep -q 'REFUSING candidate workspace' "$T1_ERR" \
     || fail "$label: the refusal never reached stderr, so the systemd journal shows a green unit (stderr: $(cat "$T1_ERR"))"
-  [[ -f "$SC_STATE_DIR/$sid.request.json" ]] \
+  [[ -f "$SC_STATE_DIR/$sid/request.json" ]] \
     || fail "$label: the request marker was consumed by a refusal — the next tick loses the resume for nothing"
   if grep -q "writing mission.md for sid=$sid" <<<"$tail_out"; then
     fail "$label: a mission write was spent on a workspace we refuse to fork into"
@@ -5210,7 +5224,7 @@ grep -q 'the tracked-file mtime scan could not be evaluated' <<<"$T2_TAIL" \
   || fail "44b: the failed scan was not reported as uncheckable (log: $T2_TAIL)"
 grep -q 'world changed' <<<"$T2_TAIL" \
   || fail "44b: the failed scan did not deny the fork (log: $T2_TAIL)"
-rm -f "$SC_STATE_DIR/$T2_SID.request.json"
+rm -f "$SC_STATE_DIR/$T2_SID/request.json"
 
 # Structural, because the shape is the bug: no producer's status may be masked, and the
 # `head` that used to mask it must not come back — under pipefail it would SIGPIPE the
@@ -5315,7 +5329,7 @@ grep -q 'verdict=not_enforced' <<<"$T3_TAIL" \
   || fail "45c: the verdict does not distinguish 'ignored deny' from 'could not tell' (log: $T3_TAIL)"
 grep -q 'deny_unproven=1' <<<"$T3_TAIL" \
   || fail "45c: the refusal is not in the counters (summary: $(grep -m1 'seen=' <<<"$T3_TAIL"))"
-[[ -f "$SC_STATE_DIR/$T3_SID.request.json" ]] \
+[[ -f "$SC_STATE_DIR/$T3_SID/request.json" ]] \
   || fail "45c: the request marker was consumed by a refusal, so the resume is lost for nothing"
 info "45c: a CLI that ignores deny does not get a fork, and the marker survives"
 
@@ -5502,7 +5516,7 @@ grep -q 'fork_unrestrictable=1' <<<"$T4_TAIL" \
 # The half that used to be silently expensive: a spawn that cannot work must not spend.
 [[ "$(t4_ledger_count)" == "$T4_BEFORE" ]] \
   || fail "46b: the per-cwd fork budget was charged for a fork that could not run (ledger $T4_BEFORE -> $(t4_ledger_count))"
-[[ -f "$SC_STATE_DIR/$T4_SID.request.json" ]] \
+[[ -f "$SC_STATE_DIR/$T4_SID/request.json" ]] \
   || fail "46b: the request marker was consumed for a fork that could not run — the resume is lost with nothing spawned"
 info "46b: --settings-file is not --settings; nothing spawns, nothing is charged, the marker survives"
 
@@ -5515,7 +5529,7 @@ fi
 grep -qF -- '--add-dir' <<<"$T4_TAIL" \
   || fail "46c: the log does not name --add-dir as missing (log: $T4_TAIL)"
 write_stub_help   # restore the real 2.1.222 flag set
-rm -f "$SC_STATE_DIR/$T4_SID.request.json"
+rm -f "$SC_STATE_DIR/$T4_SID/request.json"
 # Structural: the substring form must not come back.
 T4_FN="$(awk '/^fork_restriction_available\(\)/,/^}/' "$WORKTREE/scripts/idle-handoff.sh")"
 grep -qF 'A-Za-z0-9_-' <<<"$T4_FN" \
@@ -5576,7 +5590,7 @@ grep -q 'per-cwd 24h budget 5/5' <<<"$T5A_TAIL" \
 if grep -qE '^ *awk .*-v cwd=' "$WORKTREE/scripts/idle-handoff.sh"; then
   fail "47a: a cwd is passed with awk -v again, which escape-processes the value"
 fi
-rm -f "$SC_STATE_DIR/$T5A_SID.request.json"
+rm -f "$SC_STATE_DIR/$T5A_SID/request.json"
 info "47a: a cwd carrying a backslash escape is matched byte-for-byte, so its 24h budget binds"
 
 # (b) `jq -r … | head -1` truncated a cwd containing a NEWLINE to its first line. If
@@ -5611,7 +5625,7 @@ grep -q 'REFUSING cwd containing a control character' <<<"$T5B_TAIL" \
 if grep -q "writing mission.md for sid=$T5B_SID" <<<"$T5B_TAIL"; then
   fail "47b: a mission write was spent against the truncated (wrong) project"
 fi
-rm -f "$SC_STATE_DIR/$T5B_SID.request.json"
+rm -f "$SC_STATE_DIR/$T5B_SID/request.json"
 info "47b: a cwd that cannot survive the ledger or a log line is refused, not truncated"
 
 # (c) The request marker's write status was discarded: fire state persisted (so the
@@ -5628,22 +5642,22 @@ counting_stub "$T5C_H/calls" "$SC_MISSION_FILE"
 mkdir -p "$SC_STATE_DIR"
 # A DIRECTORY where the marker file must go: os.replace onto it fails, and only for
 # that path — the state file beside it still writes.
-mkdir -p "$SC_STATE_DIR/$T5C_SID.request.json"
+mkdir -p "$SC_STATE_DIR/$T5C_SID/request.json"
 sc_fire "$T5C_H" "$T5C_SID" "$T5C_CWD" "$T5C_TP" >/dev/null || fail "47c: Stop-hook fire rc!=0"
 T5C_TRIGGER_LOG="$SC_STATE_DIR/trigger.log"
 grep -q "sid=$T5C_SID ERROR could not write the request marker" "$T5C_TRIGGER_LOG" \
   || fail "47c: a failed marker write was swallowed (log: $(tail -3 "$T5C_TRIGGER_LOG"))"
 grep -qE "sid=$T5C_SID FIRE .*marker=FAILED" "$T5C_TRIGGER_LOG" \
   || fail "47c: the FIRE line still reports success while no marker exists (log: $(grep "$T5C_SID" "$T5C_TRIGGER_LOG" | tail -2))"
-jq -e '.request_write_failures == 1' "$SC_STATE_DIR/$T5C_SID.state.json" >/dev/null \
-  || fail "47c: the failure is not counted in the session state ($(jq -c . "$SC_STATE_DIR/$T5C_SID.state.json" 2>/dev/null))"
-rmdir "$SC_STATE_DIR/$T5C_SID.request.json"
+jq -e '.request_write_failures == 1' "$SC_STATE_DIR/$T5C_SID/state.json" >/dev/null \
+  || fail "47c: the failure is not counted in the session state ($(jq -c . "$SC_STATE_DIR/$T5C_SID/state.json" 2>/dev/null))"
+rmdir "$SC_STATE_DIR/$T5C_SID/request.json"
 # Control: with the path writable, the same fire reports a marker and leaves one.
 T5C_SID2="test-sid-t5-marker-ok"
 sc_fire "$T5C_H" "$T5C_SID2" "$T5C_CWD" "$T5C_TP" >/dev/null || fail "47c: control fire rc!=0"
 grep -qE "sid=$T5C_SID2 FIRE .*marker=ok" "$T5C_TRIGGER_LOG" \
   || fail "47c: control — a successful marker write is not reported as such (log: $(grep "$T5C_SID2" "$T5C_TRIGGER_LOG" | tail -2))"
-[[ -f "$SC_STATE_DIR/$T5C_SID2.request.json" ]] \
+[[ -f "$SC_STATE_DIR/$T5C_SID2/request.json" ]] \
   || fail "47c: control — no marker on disk after a fire that claimed one"
 info "47c: a failed marker write is logged, counted, and named in the FIRE line"
 

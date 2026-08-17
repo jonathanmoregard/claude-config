@@ -14,6 +14,11 @@ if [[ -n "${_REFLECT_LIB_SOURCED:-}" ]]; then return 0; fi
 _REFLECT_LIB_SOURCED=1
 
 : "${REFLECT_ROOT:=$HOME/.claude/reflections}"
+# Self-compact's tree, deliberately NOT under $REFLECT_ROOT. session-reflect
+# reflects on sessions that have ENDED; self-compact acts on sessions that are
+# ALIVE. Sharing a root made two subsystems with opposite preconditions look
+# like one, which is how a resumed-worker design got applied to a live session.
+: "${CLAUDE_SESSIONS_DIR:=$HOME/.claude/self-compact}"
 
 # --- REFLECT_ROOT must be ABSOLUTE (D5) --------------------------------------
 # Every out-of-repo path in this system is built from REFLECT_ROOT: the session
@@ -824,10 +829,10 @@ mission_has_our_legacy_stamp() {
 # second file there hands it to the fork; adding one that any decision reads
 # re-opens this exact hole. tests/smoke.sh TEST 36 asserts the grant's contents,
 # and TEST 24 asserts the grant that is actually passed on the fork's command line.
-mission_session_dir()      { printf '%s' "$REFLECT_ROOT/sessions/${1:-}"; }
-mission_handoff_dir()      { printf '%s' "$REFLECT_ROOT/sessions/${1:-}/handoff"; }
-mission_handoff_path()     { printf '%s' "$REFLECT_ROOT/sessions/${1:-}/handoff/mission.md"; }
-mission_handoff_cwd_path() { printf '%s' "$REFLECT_ROOT/sessions/${1:-}/mission.cwd"; }
+mission_session_dir()      { printf '%s' "$CLAUDE_SESSIONS_DIR/${1:-}"; }
+mission_handoff_dir()      { printf '%s' "$CLAUDE_SESSIONS_DIR/${1:-}/handoff"; }
+mission_handoff_path()     { printf '%s' "$CLAUDE_SESSIONS_DIR/${1:-}/handoff/mission.md"; }
+mission_handoff_cwd_path() { printf '%s' "$CLAUDE_SESSIONS_DIR/${1:-}/cwd"; }
 
 # mission_resolve_handoff <project_cwd> — print the AUTHORITATIVE handoff for that
 # project, or return 1.
@@ -859,7 +864,7 @@ mission_resolve_handoff() {
     echo "reflect: mission handoff resolution needs a project cwd" >&2
     return 1
   fi
-  local sessions_root="$REFLECT_ROOT/sessions"
+  local sessions_root="$CLAUDE_SESSIONS_DIR"
   if [[ ! -d "$sessions_root" ]]; then
     echo "reflect: no sessions root at $sessions_root — no mission handoff can exist yet" >&2
     return 1
@@ -875,7 +880,7 @@ mission_resolve_handoff() {
     sid="$(basename -- "$session_dir_")"
     is_valid_sid "$sid" || continue
     # The sidecar is read from the SESSION dir, never from the grant.
-    cwdfile="$session_dir_/mission.cwd"
+    cwdfile="$session_dir_/cwd"
     [[ -f "$cwdfile" ]] || continue
     seen=$(( seen + 1 ))
     rec=""

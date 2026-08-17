@@ -55,7 +55,7 @@ NO SWITCH — USER DECISION 2026-08-16
 
 LOOP BOUND (B6)
     Once per session per threshold crossing, persisted in
-    $REFLECT_ROOT/self-compact-state/<sid>.state.json. A reading below the
+    ~/.claude/sessions/<sid>/state.json. A reading below the
     threshold re-arms; only an armed session can fire; MAX_FIRES_PER_SESSION caps
     pathological oscillation. State is written BEFORE the model call, and if the
     state file cannot be written the hook does not fire at all — an unbounded
@@ -66,6 +66,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -99,7 +100,9 @@ MAX_FIRES_PER_SESSION = 3
 # reasons that both apply here: `.`, `..` and `...` are directory references that a
 # charset check happily passes (basename(".") == "."), and hidden names make state
 # files a human listing the dir will not see. `..` and `.hidden` therefore reached
-# `state_dir()/f"{sid}.state.json"` and minted `..state.json` / `.hidden.state.json`.
+# the sid became a DIRECTORY NAME under ~/.claude/sessions, so a sid of `..` or
+# one containing a slash would escape the tree entirely — the validation matters
+# more now than when it only prefixed a filename.
 # Contained — the paths stay inside the state dir either way — but a validator that
 # says it matches another one has to.
 SID_RE = re.compile(r"^(?!\.)[A-Za-z0-9._-]{1,128}$")
@@ -109,7 +112,6 @@ STATE_RETENTION_DAYS = 30
 # Hard ceiling on the hand-off to reflect.sh. It detaches (REFLECT_ASYNC=1) and
 # returns in ~1s; this only exists so a pathological child cannot eat Claude
 # Code's HARD, unconfigurable 60s hook cap.
-SPAWN_TIMEOUT_SECONDS = 25
 
 
 # Truthy set, IDENTICAL to lib.sh:reflect_truthy — `1|true|yes|on`,
@@ -130,13 +132,58 @@ def claude_dir() -> Path:
     return Path.home() / ".claude"
 
 
-def reflect_root() -> Path:
-    env = os.environ.get("REFLECT_ROOT")
-    return Path(env) if env else claude_dir() / "reflections"
+def sessions_root() -> Path:
+    """`~/.claude/sessions` — self-compact's own tree, one directory per session.
+
+    DELIBERATELY NOT UNDER $REFLECT_ROOT. Self-compact used to live inside the
+    session-reflect tree because it reused that subsystem to write its handoff.
+    That reuse was the mistake: session-reflect exists to reflect on sessions
+    that have ENDED, where an external resumed worker is the only way to see the
+    context. Self-compact fires while the session is ALIVE and already holding
+    that context. Sharing a root made two subsystems with opposite preconditions
+    look like one.
+
+    Layout, one uuid-keyed directory per session:
+
+        ~/.claude/sessions/<sid>/
+            cwd            which project this session belongs to. NOT in the
+                           fork's write grant -- it decides where a resume runs,
+                           so a resumed process must not be able to retarget the
+                           next one.
+            request.json   the pending self-compact request
+            state.json     fire counters for this session
+            handoff/
+                mission.md the handoff, and the only thing in that directory,
+                           ever. It IS writable by a resumed process, which is
+                           why nothing else may sit beside it.
+
+    CLAUDE_SESSIONS_DIR exists for test isolation only, exactly as REFLECT_ROOT
+    does for session-reflect. It selects a ROOT, never a behaviour.
+    """
+    env = os.environ.get("CLAUDE_SESSIONS_DIR")
+    return Path(env) if env else claude_dir() / "self-compact"
+
+
+def session_dir(sid: str) -> Path:
+    return sessions_root() / sid
+
+
+def handoff_path(sid: str) -> Path:
+    return session_dir(sid) / "handoff" / "mission.md"
 
 
 def state_dir() -> Path:
-    return reflect_root() / "self-compact-state"
+    """Where cross-session bookkeeping lives (the log). Per-session state does
+    not live here -- it lives in that session's own directory."""
+    return sessions_root()
+
+
+def state_path(sid: str) -> Path:
+    return session_dir(sid) / "state.json"
+
+
+def marker_path_for(sid: str) -> Path:
+    return session_dir(sid) / "request.json"
 
 
 def log(msg: str) -> None:
@@ -151,7 +198,7 @@ def log(msg: str) -> None:
 
 
 def load_state(sid: str) -> dict:
-    path = state_dir() / f"{sid}.state.json"
+    path = state_path(sid)
     try:
         data = json.loads(path.read_text())
         if isinstance(data, dict):
@@ -186,59 +233,32 @@ def write_json_atomic(path: Path, payload: dict) -> bool:
 
 
 def gc_state(retention_days: int = STATE_RETENTION_DAYS) -> None:
-    """Prune old records. Called on fire only — not on every Stop."""
+    """Prune old session directories. Called on fire only — not on every Stop.
+
+    The unit of retention is now the session DIRECTORY, because that is the unit
+    of isolation. Age is taken from the newest thing inside it, so a session
+    whose handoff was updated by a resume is not collected on the strength of a
+    stale state.json written when it first fired.
+    """
     cutoff = time.time() - retention_days * 86400
     try:
-        entries = list(state_dir().iterdir())
+        entries = list(sessions_root().iterdir())
     except Exception:
         return
     for entry in entries:
-        if entry.suffix != ".json":
+        if not entry.is_dir():
             continue
         try:
-            if entry.stat().st_mtime < cutoff:
-                entry.unlink()
+            newest = entry.stat().st_mtime
+            for child in entry.rglob("*"):
+                try:
+                    newest = max(newest, child.stat().st_mtime)
+                except Exception:
+                    pass
+            if newest < cutoff:
+                shutil.rmtree(entry, ignore_errors=True)
         except Exception:
             pass
-
-
-def spawn_mission_write(reflect_sh: Path, sid: str, transcript: str, cwd: str) -> str:
-    """Hand the handoff write to session-reflect's `mission` mode, detached.
-
-    REFLECT_ASYNC=1  -> the dispatcher detaches its worker (cgroup-immune
-                        systemd-run, setsid fallback) and returns in ~1s, so the
-                        model call never runs on the hook clock.
-    REFLECT_FORCE=1  -> bypass the idempotency guard. A crossing must produce a
-                        handoff describing the state AT the crossing; an earlier
-                        `complete` mission for this session would otherwise make
-                        us resume from something stale.
-    """
-    payload = json.dumps({
-        "session_id": sid,
-        "transcript_path": transcript,
-        "hook_event_name": "SelfCompact",
-        "cwd": cwd,
-    })
-    env = os.environ.copy()
-    env["REFLECT_ASYNC"] = "1"
-    env["REFLECT_FORCE"] = "1"
-    try:
-        proc = subprocess.run(
-            ["bash", str(reflect_sh), "mission"],
-            input=payload.encode(),
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=SPAWN_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired:
-        return "timeout"
-    except Exception as exc:  # noqa: BLE001 - never let a Stop hook raise
-        return f"spawn_error:{type(exc).__name__}"
-    if proc.returncode != 0:
-        tail = (proc.stdout or b"")[-400:].decode(errors="replace").replace("\n", " ")
-        return f"rc={proc.returncode} {tail}"
-    return "queued"
 
 
 def spawn_inplace_reset(sid: str, instructions: str = "") -> str:
@@ -259,7 +279,7 @@ def spawn_inplace_reset(sid: str, instructions: str = "") -> str:
     spid = inplace_reset.session_pid()
     if not spid:
         return "no_session_pid"
-    handoff = reflect_root() / "sessions" / sid / "handoff" / "mission.md"
+    handoff = handoff_path(sid)
     script = claude_dir() / "inplace_reset.py"
     if not script.exists():
         return f"missing:{script}"
@@ -332,7 +352,7 @@ def main() -> int:
         if not state.get("armed"):
             state["armed"] = True
             state["rearmed_at"] = int(time.time())
-            write_json_atomic(state_dir() / f"{sid}.state.json", state)
+            write_json_atomic(state_path(sid), state)
         return 0
 
     if not state.get("armed"):
@@ -340,7 +360,7 @@ def main() -> int:
     if state.get("fires", 0) >= MAX_FIRES_PER_SESSION:
         if not state.get("capped"):
             state["capped"] = True
-            write_json_atomic(state_dir() / f"{sid}.state.json", state)
+            write_json_atomic(state_path(sid), state)
             log(f"sid={sid} capped at {MAX_FIRES_PER_SESSION} fires this session; not firing")
         return 0
 
@@ -355,7 +375,7 @@ def main() -> int:
 
     # Persist the bound BEFORE spending anything. If this write fails we do not
     # fire: an unbounded trigger is worse than a missing one.
-    if not write_json_atomic(state_dir() / f"{sid}.state.json", state):
+    if not write_json_atomic(state_path(sid), state):
         log(f"sid={sid} could not persist state under {state_dir()}; refusing to fire")
         return 0
 
@@ -379,30 +399,33 @@ def main() -> int:
     # silently degraded to the 45-minute idle floor, indistinguishable from the feature
     # working. Counted in the state file as well as logged: one failed write is a bad
     # afternoon, a rising count is a broken state dir.
-    marker_path = state_dir() / f"{sid}.request.json"
+    marker_path = marker_path_for(sid)
     marker_written = write_json_atomic(marker_path, request)
     if not marker_written:
         state["request_write_failures"] = state.get("request_write_failures", 0) + 1
         state["last_request_write_failed_at"] = now
         # Best effort: if THIS write fails too the state dir is gone, and the log line
         # below is the whole record.
-        write_json_atomic(state_dir() / f"{sid}.state.json", state)
+        write_json_atomic(state_path(sid), state)
         log(f"sid={sid} ERROR could not write the request marker {marker_path} "
             f"(failures={state['request_write_failures']}); the handoff will still be "
             f"written, but idle-handoff has nothing to widen its idle gate with, so the "
             f"resume degrades to the 45-minute idle floor")
 
-    reflect_sh = claude_dir() / "skills" / "session-reflect" / "reflect.sh"
-    if reflect_sh.exists():
-        result = spawn_mission_write(reflect_sh, sid, transcript, cwd)
-    else:
-        result = f"reflect_sh_missing:{reflect_sh}"
+    # NO SEPARATE WRITER. The session that crossed the threshold is holding the
+    # context, so it writes its own handoff; nothing re-reads the transcript.
+    # This used to call session-reflect's `mission` mode, which spawns
+    # `claude -p --resume <sid> --model haiku`. That replays the whole session,
+    # so the prompt IS the session -- and the trigger fires at 30% of the
+    # detected window, ~300k on a 1M model, against haiku's 200k. Measured: a
+    # 382,543-token session returned HTTP 400 prompt_too_long after billing
+    # $0.23. The write was guaranteed to fail for exactly the sessions this
+    # feature exists to serve.
     reset = spawn_inplace_reset(sid)
     log(f"sid={sid} FIRE crossing={state['crossings']} "
         f"tokens={occ.total_tokens}/{occ.window} "
         f"fill={occ.fill_pct:.3f} threshold={THRESHOLD} cwd={cwd} "
-        f"marker={'ok' if marker_written else 'FAILED'} mission={result} "
-        f"inplace={reset}")
+        f"marker={'ok' if marker_written else 'FAILED'} inplace={reset}")
     gc_state()
     return 0
 
@@ -452,7 +475,7 @@ def manual(instructions: str) -> int:
     state = load_state(sid)
     state["manual_requests"] = state.get("manual_requests", 0) + 1
     state["last_manual_at"] = now
-    write_json_atomic(state_dir() / f"{sid}.state.json", state)
+    write_json_atomic(state_path(sid), state)
 
     occ = context_usage.occupancy(transcript)
     request = {
@@ -468,28 +491,20 @@ def manual(instructions: str) -> int:
         request.update({"tokens": occ.total_tokens, "window": occ.window,
                         "fill_pct": occ.fill_pct, "model": occ.model})
 
-    marker_path = state_dir() / f"{sid}.request.json"
+    marker_path = marker_path_for(sid)
     if not write_json_atomic(marker_path, request):
         print(f"self-compact: could not write the request marker at {marker_path}; "
               "nothing will pick this handoff up.", file=sys.stderr)
         return 1
 
-    reflect_sh = claude_dir() / "skills" / "session-reflect" / "reflect.sh"
-    if not reflect_sh.exists():
-        print(f"self-compact: {reflect_sh} is missing; no handoff can be written.",
-              file=sys.stderr)
-        return 1
-    result = spawn_mission_write(reflect_sh, sid, transcript, cwd)
     reset = spawn_inplace_reset(sid, instructions)
 
     fill = f"{occ.fill_pct:.1%}" if occ is not None else "unmeasured"
     log(f"sid={sid} MANUAL request via /self-compact fill={fill} cwd={cwd} "
-        f"instructions={'yes' if instructions else 'no'} mission={result} "
-        f"inplace={reset}")
+        f"instructions={'yes' if instructions else 'no'} inplace={reset}")
     print(f"self-compact: handoff requested for session {sid} (context {fill}).")
     print(f"  cwd:      {cwd}")
     print(f"  marker:   {marker_path}")
-    print(f"  mission:  {result}")
     print(f"  in-place: {reset}")
     if reset.startswith("queued"):
         print("This session will clear itself shortly and resume from the handoff.")

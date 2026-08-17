@@ -151,21 +151,21 @@ Modes:
   sessionend    detached worker, ${REFLECT_BUDGET_SESSIONEND}s internal budget, writes final.json
   subagentstop  detached worker, ${REFLECT_BUDGET_SUBAGENTSTOP}s internal budget, nests under parent/subagents/
   mission       synchronous (detached with REFLECT_ASYNC=1), ${REFLECT_BUDGET_MISSION}s budget,
-                writes \$REFLECT_ROOT/sessions/<sid>/handoff/mission.md (markdown)
+                writes \$CLAUDE_SESSIONS_DIR/<sid>/handoff/mission.md (markdown)
 
 Introspection:
   --budgets           print the effective timeout budgets + hook-cap arithmetic
   --mission-path DIR  resolve the AUTHORITATIVE mission handoff for project DIR:
-                      \$REFLECT_ROOT/sessions/<sid>/handoff/mission.md, out of
+                      \$CLAUDE_SESSIONS_DIR/<sid>/handoff/mission.md, out of
                       repo, or nothing (exit 1). Never looks inside DIR
 
 Mission artifact layout:
-  \$REFLECT_ROOT/sessions/<sid>/handoff/mission.md
+  \$CLAUDE_SESSIONS_DIR/<sid>/handoff/mission.md
                                             AUTHORITATIVE handoff (out of repo).
                                             Its directory is the ONLY thing the
                                             unattended resume fork may write, so
                                             nothing else is kept in there.
-  \$REFLECT_ROOT/sessions/<sid>/mission.cwd  which project it is for. One level up,
+  \$CLAUDE_SESSIONS_DIR/<sid>/cwd            which project it is for. One level up,
                                             outside that write grant, because
                                             resolution reads it.
   tasks/mission.<sid>.md                    human-readable copy; no automation
@@ -1246,8 +1246,15 @@ spawn_detached_worker() {
   if [[ "$SPAWN_METHOD" == "systemd-run" ]]; then
     local -a setenv_args=( "--setenv=_REFLECT_INTERNAL=1" )
     local v val
+    # CLAUDE_SESSIONS_DIR MUST be here. It selects the root the mission handoff
+    # is written under, and its default is the user's REAL session tree. A
+    # detached worker that does not inherit it silently writes into that real
+    # tree — observed: two `test-sid-*` directories landed in the live
+    # ~/.claude/sessions during a smoke run, because this list was the only
+    # thing standing between an isolated test and the user's own files. Same
+    # shape as the REFLECT_ROOT propagation defect fixed earlier.
     for v in SESSION_ID PARENT_SID TRANSCRIPT_PATH HOOK_EVENT MODE CWD \
-             REFLECT_MODEL REFLECT_ROOT REFLECT_LOG_DIR REFLECT_LOCKFILE \
+             REFLECT_MODEL REFLECT_ROOT CLAUDE_SESSIONS_DIR REFLECT_LOG_DIR REFLECT_LOCKFILE \
              REFLECT_STALE_STARTED_SECONDS REFLECT_REAP_MAX_PER_RUN \
              REFLECT_NO_SYSTEMD_RUN REFLECT_KILL_GRACE_SECONDS \
              REFLECT_BUDGET_PRECOMPACT REFLECT_BUDGET_SESSIONEND \
@@ -1393,7 +1400,7 @@ write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "started" "$extra_json"
 # REFLECT_LOCKFILE is what lets the detached worker re-acquire this mode's lock.
 export REFLECT_LOCKFILE="$LOCKFILE"
 export SESSION_ID PARENT_SID TRANSCRIPT_PATH HOOK_EVENT MODE CWD
-export REFLECT_MODEL REFLECT_ROOT REFLECT_LOG_DIR
+export REFLECT_MODEL REFLECT_ROOT CLAUDE_SESSIONS_DIR REFLECT_LOG_DIR
 export session_dir final_path manifest_path checkpoint_dir
 export SCRIPT_DIR
 

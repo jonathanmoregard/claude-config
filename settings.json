@@ -123,6 +123,7 @@
       "/home/jonathan/.claude/projects",
       "/home/jonathan/.claude/skills",
       "/home/jonathan/.claude/templates",
+      "/home/jonathan/.claude/self-compact",
       "/tmp",
       "/etc/nixos",
       "/nix/store",

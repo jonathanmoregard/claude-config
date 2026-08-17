@@ -64,6 +64,7 @@ umask 077
 
 # ---- Config with numeric validation (advisor MEDIUM: sharp-edges) -----------
 : "${REFLECT_ROOT:=$HOME/.claude/reflections}"
+: "${CLAUDE_SESSIONS_DIR:=$HOME/.claude/self-compact}"
 # REFLECT_ROOT must be ABSOLUTE (D5). Every path below is derived from it — the
 # lock, the logs, the state dirs, the fork ledger, and the authoritative mission
 # handoff this script resolves and hands to an unattended model. A RELATIVE value
@@ -93,7 +94,9 @@ fi
 : "${IDLE_HANDOFF_STATE_DIR:=$REFLECT_ROOT/idle-handoff-state}"
 # Self-compact (B7). Same REFLECT_ROOT both sides derive from, so the producer
 # (self-compact-trigger.py) and this consumer agree without extra coupling.
-: "${SELF_COMPACT_STATE_DIR:=$REFLECT_ROOT/self-compact-state}"
+# One uuid-keyed directory per session, holding that session's marker, state
+# and handoff. There is no flat shared state dir any more.
+: "${SELF_COMPACT_STATE_DIR:=$CLAUDE_SESSIONS_DIR}"
 : "${SELF_COMPACT_HELPER:=$HOME/.claude/context_usage.py}"
 : "${SELF_COMPACT_REQUEST_MAX_AGE_SECONDS:=$((24*60*60))}"
 # Note: no in-script kill flag. Use `systemctl --user stop
@@ -202,7 +205,7 @@ SELF_COMPACT_THRESHOLD="0.30"
 context_request_pending() {
   local sid="$1" transcript="$2"
   is_valid_sid "$sid" || return 1
-  local req="$SELF_COMPACT_STATE_DIR/${sid}.request.json"
+  local req="$SELF_COMPACT_STATE_DIR/${sid}/request.json"
   [[ -f "$req" ]] || return 1
 
   local req_ts
@@ -267,9 +270,9 @@ context_request_pending() {
 consume_context_request() {
   local sid="$1"
   is_valid_sid "$sid" || return 0
-  local req="$SELF_COMPACT_STATE_DIR/${sid}.request.json"
+  local req="$SELF_COMPACT_STATE_DIR/${sid}/request.json"
   [[ -e "$req" ]] || return 0   # nothing pending: the idle path, normally
-  if ! mv -f "$req" "$SELF_COMPACT_STATE_DIR/${sid}.consumed.json" 2>/dev/null; then
+  if ! mv -f "$req" "$SELF_COMPACT_STATE_DIR/${sid}/consumed.json" 2>/dev/null; then
     local m="ERROR sid=$sid: could not consume $req (rename failed; dir writable?) — the marker PERSISTS, so later ticks may re-fork this session until the per-cwd 24h budget ($IDLE_HANDOFF_AUTOFORK_MAX_PER_CWD_24H) is spent"
     log "$m"
     printf 'idle-handoff: %s\n' "$m" >&2   # systemd journal sees it
