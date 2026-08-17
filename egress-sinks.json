@@ -1,0 +1,12 @@
+{
+  "bind": "127.0.0.1",
+  "port": 9464,
+  "sinks": {
+    "forum.effectivealtruism.org": {
+      "slug": "forum-effectivealtruism-org",
+      "upstream_scheme": "https",
+      "interval_s": 5.0,
+      "note": "robots.txt Crawl-Delay: 2; doubled after a bot challenge"
+    }
+  }
+}
