@@ -37,6 +37,19 @@ REFLECT_SH="$SKILL_DIR/reflect.sh"
 export GIT_CONFIG_NOSYSTEM=1
 export GIT_CONFIG_GLOBAL=/dev/null
 
+# --- One scratch parent for everything this run creates -----------------------
+# `mktemp` resolves its template against $TMPDIR, so pointing TMPDIR at a single
+# per-run directory makes the whole run removable as ONE path — including the
+# temp files of every subprocess the suite starts.
+#
+# Why this exists: teardown only ever knew about REFLECT_ROOT, STUB_SCRATCH and
+# TEST_CWD, but the suite has ~60 `mktemp -d` sites, and `sc_home()` runs once
+# per self-compact test. Every one of the others was left behind. On 2026-08-17
+# that had accumulated 8,399 dirs / 492 MB in /tmp. The parent is itself created
+# in the caller's TMPDIR, so an outer TMPDIR is still honoured.
+SMOKE_TMP_PARENT="$(mktemp -d -t reflect-run-XXXXXX)"
+export TMPDIR="$SMOKE_TMP_PARENT"
+
 SMOKE_LANE="${SMOKE_LANE:-fast}"
 while (( $# > 0 )); do
   case "$1" in
@@ -70,7 +83,7 @@ lane_skip() { TESTS_SKIPPED=$(( TESTS_SKIPPED + 1 )); echo "SKIP (lane=$SMOKE_LA
 fail() {
   echo "FAIL: $*" >&2
   echo "TESTS:    FAILED after $TESTS_RUN named test(s) (lane=$SMOKE_LANE)" >&2
-  echo "TEARDOWN: SKIPPED — temp state kept for inspection: REFLECT_ROOT=${REFLECT_ROOT:-<not created yet>}" >&2
+  echo "TEARDOWN: SKIPPED — temp state kept for inspection: REFLECT_ROOT=${REFLECT_ROOT:-<not created yet>} SCRATCH=${SMOKE_TMP_PARENT:-<not created yet>}" >&2
   exit 1
 }
 info() { echo "  -> $*"; }
@@ -5889,7 +5902,23 @@ printf 'TESTS:    PASS — %s named test(s) ran, %s skipped, 0 failed (lane=%s)\
 if [[ "$TEARDOWN_STATUS" == "ok" ]]; then
   echo "TEARDOWN: OK"
   echo "OK: all smoke tests passed"
-  rm -rf "$SPAWN_TRACK_DIR"
+  # The scratch parent goes LAST, and only here. TMPDIR pointed every mktemp in
+  # this run at it — SPAWN_TRACK_DIR, every per-test dir, every subprocess temp —
+  # so this single rm is what actually stops the /tmp litter, and it has to run
+  # after everything that reads from that tree (TEARDOWN_DETAIL, spawn_holders).
+  # Its failure is a TEARDOWN outcome like any other, not a test failure.
+  if [[ "${REFLECT_DEBUG:-}" == "1" ]]; then
+    echo "REFLECT_DEBUG=1 — temp dirs kept: $SMOKE_TMP_PARENT" >&2
+  elif ! SMOKE_PARENT_RM_ERR="$(rm -rf "$SPAWN_TRACK_DIR" "$SMOKE_TMP_PARENT" 2>&1)"; then
+    printf 'TEARDOWN: FAILED (scratch-parent-rm)\n' >&2
+    printf 'rm reported:\n%s\n' "$SMOKE_PARENT_RM_ERR" >&2
+    printf 'what is still there:\n%s\n' \
+      "$(find "$SMOKE_TMP_PARENT" -mindepth 1 -printf '  %T@ %p\n' 2>/dev/null | sort -rn | head -20)" >&2
+    echo "TEARDOWN_FAILED: every selected test passed; the suite could not remove its scratch root." >&2
+    echo "  Exit 3 means TEARDOWN. Exit 1 means a TEST. Do not read this as a test failure." >&2
+    echo "  Kept for inspection: $SMOKE_TMP_PARENT" >&2
+    exit 3
+  fi
   exit 0
 fi
 
@@ -5897,5 +5926,5 @@ printf 'TEARDOWN: FAILED (%s)\n' "$TEARDOWN_STATUS" >&2
 printf '%s\n' "$TEARDOWN_DETAIL" >&2
 echo "TEARDOWN_FAILED: every selected test passed; the suite could not clean up after itself." >&2
 echo "  Exit 3 means TEARDOWN. Exit 1 means a TEST. Do not read this as a test failure." >&2
-echo "  Kept for inspection: REFLECT_ROOT=$REFLECT_ROOT SPAWN_REGISTRY=$SPAWN_REGISTRY" >&2
+echo "  Kept for inspection: REFLECT_ROOT=$REFLECT_ROOT SPAWN_REGISTRY=$SPAWN_REGISTRY SCRATCH=$SMOKE_TMP_PARENT" >&2
 exit 3
