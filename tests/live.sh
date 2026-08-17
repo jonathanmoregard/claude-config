@@ -164,5 +164,58 @@ else
   info "recursion-skip markers: 0 (child subprocess did not fire any nested hooks)"
 fi
 
+# --- T3: does THIS binary actually enforce permissions.deny? -----------------
+# The rail that contains an autofork is `permissions.deny` in the settings file
+# idle-handoff.sh generates. `--tools` is the other half and it SILENTLY IGNORES an
+# unknown tool name, so if a future CLI renames or splits `Bash`, `deny` is all that is
+# left between an injected `## Next` and a shell.
+#
+# The offline suite cannot see that: its `claude` is a stub, which can assert what lands
+# in argv and what the settings file says, but cannot enforce anything. So this is the
+# only place in the repo where the claim "the installed CLI honours deny" is MEASURED.
+# idle-handoff.sh runs the same two-run probe itself before every fork on an unseen CLI
+# version (cached per version, fail-closed); this test is the human-runnable form of it.
+#
+# Cost: two haiku `-p` calls, ~$0.06 total.
+echo "  -> T3: probing whether the installed CLI enforces permissions.deny"
+DENY_PROBE_ROOT="$(mktemp -d -t reflect-denyprobe-XXXXXX)"
+DENY_PROBE_SENTINEL_NAME="$(grep -oP '^FORK_DENY_PROBE_SENTINEL="\K[^"]+' "$WORKTREE/scripts/idle-handoff.sh")"
+[[ -n "$DENY_PROBE_SENTINEL_NAME" ]] || fail "no FORK_DENY_PROBE_SENTINEL constant to mirror"
+PROBE_DENY_LIST="$(grep -oP "^FORK_PROBE_DENY_TOOLS='\K.*(?='\$)" "$WORKTREE/scripts/idle-handoff.sh")"
+[[ -n "$PROBE_DENY_LIST" ]] || fail "no FORK_PROBE_DENY_TOOLS constant to mirror"
+info "CLI under test: $(claude --version 2>/dev/null || echo '<unknown>')"
+
+deny_probe_run() {
+  # $1=label $2=deny JSON -> prints created|absent|error
+  local label="$1" deny="$2" dir settings sentinel prompt rc=0
+  dir="$DENY_PROBE_ROOT/$label"
+  settings="$DENY_PROBE_ROOT/$label.settings.json"
+  mkdir -p "$dir" || { printf 'error'; return 0; }
+  sentinel="$dir/$DENY_PROBE_SENTINEL_NAME"
+  jq -n --arg dir "$dir" --argjson deny "$deny" \
+    '{permissions:{defaultMode:"acceptEdits",allow:[],deny:$deny,additionalDirectories:[$dir]},
+      hooks:{},enableAllProjectMcpServers:false}' > "$settings" || { printf 'error'; return 0; }
+  prompt="IDLE_HANDOFF_DENY_PROBE. This is an automated permission self-test with no
+user attached. Create the file $sentinel containing the single word probe.
+Use the Bash tool (printf probe > $sentinel) if you have it; if you do not have a
+Bash tool, use the Write tool instead. Use no other tool, and then stop. If you have
+neither tool, say so and stop — that is a valid outcome of this self-test."
+  ( cd "$dir" && timeout 180 claude -p --model haiku --max-turns 3 \
+      --permission-mode acceptEdits --setting-sources '' --settings "$settings" \
+      --strict-mcp-config --add-dir "$dir" -- "$prompt" ) >"$dir/probe.log" 2>&1 || rc=$?
+  if [[ -e "$sentinel" ]]; then printf 'created'; return 0; fi
+  if (( rc != 0 )); then printf 'error'; return 0; fi
+  printf 'absent'
+}
+
+DENY_RUN="$(deny_probe_run deny "$PROBE_DENY_LIST")"
+CONTROL_RUN="$(deny_probe_run control '[]')"
+info "deny run: $DENY_RUN    control run: $CONTROL_RUN    (logs under $DENY_PROBE_ROOT)"
+[[ "$CONTROL_RUN" == "created" ]] \
+  || fail "the CONTROL run (deny=[]) did not create the sentinel, so this probe proves nothing about enforcement — an enforced denial and a model that declined look identical. See $DENY_PROBE_ROOT/control/probe.log"
+[[ "$DENY_RUN" == "absent" ]] \
+  || fail "permissions.deny is NOT enforced by this CLI: the denied run still produced the sentinel ($DENY_RUN). Every autofork's containment rests on that list. See $DENY_PROBE_ROOT/deny/probe.log"
+info "T3: this CLI enforces permissions.deny (denied run wrote nothing; control wrote the sentinel)"
+
 echo "OK: live smoke passed"
 echo "Artifacts in: $REFLECT_ROOT"

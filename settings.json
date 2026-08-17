@@ -123,6 +123,7 @@
       "/home/jonathan/.claude/projects",
       "/home/jonathan/.claude/skills",
       "/home/jonathan/.claude/templates",
+      "/home/jonathan/.claude/self-compact",
       "/tmp",
       "/etc/nixos",
       "/nix/store",
@@ -305,6 +306,15 @@
             "type": "command",
             "command": "bash $HOME/.claude/hooks/ralph-loop-stop.sh",
             "statusMessage": "Checking Ralph loop gate..."
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/self-compact-trigger.py",
+            "timeout": 30
           }
         ]
       }

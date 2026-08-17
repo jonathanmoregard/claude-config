@@ -137,7 +137,13 @@ is documented inside `settings-patch.json` under `_comment`.
 | `REFLECT_ROOT` | `$HOME/.claude/reflections` | Artifact root. Override for tests. Must be writable. |
 | `REFLECT_FORCE` | (unset) | Truthy values (`1`, `true`, `yes`, `on`, case-insensitive) bypass the idempotency guard and re-run even if `modes.<mode>.final_complete: true`. Any other value = falsy. |
 | `REFLECT_LOG_DIR` | `$REFLECT_ROOT/logs` | Worker stdout / stderr logs. |
-| `REFLECT_STALE_STARTED_SECONDS` | `600` | If a manifest is stuck at `status=started` older than this many seconds, treat as a crashed prior run and permit re-run. |
+| `REFLECT_STALE_STARTED_SECONDS` | `600` | If a manifest is stuck at `status=started` older than this many seconds, treat as a crashed prior run: permit re-run, and let the reaper demote it to a terminal `error`. |
+| `REFLECT_ASYNC` | (unset) | `mission` mode only. Truthy detaches the worker instead of running it synchronously. Set by the 2nd-compact pre-fire so the mission model call cannot eat the 60 s hook cap. `scripts/idle-handoff.sh` deliberately leaves it unset — it reads `modes.mission.status` right after the call. |
+| `REFLECT_NO_SYSTEMD_RUN` | (unset) | Truthy forces the `setsid` fallback spawn instead of `systemd-run --user`. Mostly for tests and hosts where you want the old behaviour. |
+| `REFLECT_BUDGET_PRECOMPACT` / `_SESSIONEND` / `_SUBAGENTSTOP` / `_MISSION` | `40` / `90` / `40` / `60` | Per-mode timeout budget in seconds. See "Budgets vs the hook cap". |
+| `REFLECT_KILL_GRACE_SECONDS` | `10` | `timeout -k` grace before SIGKILL. Counts against the hook cap. |
+| `REFLECT_REAP_MAX_PER_RUN` | `200` | Max manifests the orphan reaper examines per detached-worker run. |
+| `REFLECT_MISSION_RETENTION_DAYS` | `30` | Age after which a `tasks/mission.<sid>.md` payload is garbage-collected. |
 | `REFLECT_LIVE_TEST` | (unset) | `1` opts `tests/live.sh` into a real-API smoke. |
 | `CLAUDE_PARENT_SESSION_ID` | (unset) | If Claude Code exports this into the SubagentStop env, subagent artifacts nest under the correct parent. Otherwise the dispatcher falls back to scanning sibling transcript JSONLs. Value is validated against `^[A-Za-z0-9._-]{1,128}$`; invalid values are ignored. |
 | `_REFLECT_INTERNAL` | (internal) | Sentinel set by the parent dispatcher to gate the `--worker` re-entry path. Do not set manually. |
@@ -146,20 +152,421 @@ is documented inside `settings-patch.json` under `_comment`.
 
 | Hook | Blocking? | Timeout | Artifact |
 |------|-----------|---------|----------|
-| `PreCompact` | Yes (session still alive) | 60 s | `checkpoints/NNNN-precompact.json` |
+| `PreCompact` | Yes (session still alive) | 40 s | `checkpoints/<epoch_ns>-XXXX-precompact.json` |
 | `SessionEnd` | No — fire-and-forget detached worker | 90 s wall (worker internal) | `final.json` |
 | `SubagentStop` | No — fire-and-forget detached worker | 40 s wall (worker internal) | `subagents/<sid>/final.json` |
 
-Detached workers use `setsid nohup ... </dev/null >log 2>&1 & disown` so
-they survive kitty close, `exit`, and the parent Claude Code process
-terminating. `SIGKILL`, hard OS shutdown, and crashes remain out of scope
-(hooks cannot fire in those cases).
+On the 2nd-and-later `PreCompact` of a session the dispatcher also pre-fires
+`mission` mode. That pre-fire is **detached** (`REFLECT_ASYNC=1`): it used to run
+synchronously ahead of the precompact worker, which measured 121 s of in-hook
+wall time against a 60 s cap.
+
+### Budgets vs the hook cap
+
+Claude Code caps every `command` hook at **60 s and the cap is not
+configurable** — the bundled `cli.js` computes `timeout ? q.timeout*1000 : 60000`
+and the settings schema clamps `timeout` with `.max(60000)`. When the cap fires
+Claude Code kills the hook's process group, so no terminal status is written.
+The internal budget must therefore always win:
+
+```
+precompact 40 s + kill grace 10 s + reserve 5 s = 55 s worst case  <=  60 s cap
+```
+
+`bash reflect.sh --budgets` prints the live arithmetic, including
+`max_synchronous_budget_seconds` (= cap − grace − reserve). Only `precompact` is
+synchronous; the detached modes are off the hook clock.
+
+**The arithmetic is enforced, not just documented.** `REFLECT_BUDGET_PRECOMPACT`
+is an operator-facing override, and 50 would give 50 + 10 + 5 = 65 > 60 — the
+external SIGKILL wins again and the manifest is orphaned at `started`. An
+over-cap override is therefore **clamped** to `max_synchronous_budget_seconds`
+and the clamp is logged to stderr; a non-numeric or non-positive value resets to
+the shipped 40 s and is logged the same way. Clamping rather than refusing keeps
+reflection working when someone mis-sets a variable, and the log line means it is
+never a silent behaviour change. Detached budgets are not clamped.
+
+### Detached spawn
+
+Detached workers are handed to `systemd-run --user --collect --no-block`, which
+runs them in their **own cgroup**. `setsid nohup … &` escapes SIGHUP and the
+controlling terminal but *not* the parent's cgroup: Claude Code exits seconds
+after `SessionEnd`, and the cgroup teardown that follows (`KillMode=control-group`
+is the systemd default) SIGKILLed the worker before it wrote anything. That was
+the source of the orphaned `status:started` manifests — 0-byte
+`<sid>-<mode>.worker.stderr.log`, no `.stdout.log`, log mtime == `started_at`.
+
+Transient units inherit no environment, so every var the worker needs is passed
+explicitly with `--setenv`, and because a unit cannot inherit fd 9 the per-mode
+flock is acquired by the *worker* from `REFLECT_LOCKFILE` rather than inherited.
+With no user bus (busless cron, container without a user manager) or with
+`REFLECT_NO_SYSTEMD_RUN=1`, the spawn degrades to the old `setsid nohup` path
+rather than losing the reflection. Either way `modes.<mode>.spawn_method`
+(and `spawn_unit`) records which path ran.
+
+`SIGKILL`, hard OS shutdown, and crashes remain out of scope for the worker
+itself; the reaper below is what heals those.
+
+### Orphan reaper
+
+A mode stuck at `status:started` used to stay that way forever:
+`is_already_complete` only ever *permitted a re-run*, and `SessionEnd` /
+`SubagentStop` fire once per session. Detached workers therefore sweep after
+their own terminal write, demoting any `started` older than
+`REFLECT_STALE_STARTED_SECONDS` to a terminal `error` with
+`reason: orphaned_started_reaped` plus the observed age. `find -mmin`
+pre-filters candidates on manifest mtime and `REFLECT_REAP_MAX_PER_RUN` caps
+the batch. It never runs on the synchronous precompact path.
+
+**Known, accepted TOCTOU (LOW).** The reaper decides "stale" and then writes,
+without holding the mode's lock. A worker whose model call outlives
+`REFLECT_STALE_STARTED_SECONDS` (default 600 s — over 6× the longest budget) can
+therefore have its `started` flipped to `error` while it is still alive, and its
+own `complete` write then lands afterwards. The damage is bounded by design: the
+per-mode `final_complete` flag is OR-latched in `write_manifest`, so a real
+completion cannot be un-completed by a reap that raced it — the observable
+residue is a stale `reason: orphaned_started_reaped` alongside a completed mode.
+Left as is deliberately: holding the per-mode lock across the sweep would make
+the reaper contend with the very workers it exists to clean up after, and the
+alternative (a liveness probe per manifest) buys nothing the latch does not
+already guarantee.
+
+### Retention: what is collected, and what never is
+
+| what | where | bound | who runs it |
+|---|---|---|---|
+| self-compact state + requests | `self-compact-state/*.json` | `STATE_RETENTION_DAYS` = 30 | `self-compact-trigger.py`, on fire |
+| human mission copies | `<project>/tasks/mission.<sid>.md` | `REFLECT_MISSION_RETENTION_DAYS` = 30, or session dir gone | `mission_gc`, on each mission write |
+| recursion markers | `skipped-recursions/` | `REFLECT_ARTIFACT_RETENTION_DAYS` = 14 | `reflect_artifact_gc`, every detached worker |
+| malformed-payload manifests | `malformed/` | same | same |
+| worker logs | `$REFLECT_LOG_DIR` | same | same |
+| **reflections** | `sessions/**` | **never collected** | — |
+
+`REFLECT_ARTIFACT_RETENTION_DAYS` is a **hardcoded constant in `lib.sh`, not an env
+override**: a retention bound for our own debris is a value this code should decide,
+and every knob is one more thing that can be mis-set. Two weeks is long enough to
+diagnose something a human noticed last week, short enough that a month of markers
+cannot accumulate — measured need: 619 markers and 1951 log files eight days after
+deployment, at ~590 sessions/week.
+
+The sweep takes **regular files at depth 1 only**, refuses `$REFLECT_ROOT` itself and
+anything under `sessions/` (the one directory in its list is operator-settable via
+`REFLECT_LOG_DIR`), and runs only in **detached** workers — never on the synchronous
+precompact path, which is fighting the hard 60s hook cap. Same discipline, and the
+same reason, as the orphan reaper.
+
+### Mission handoff layout — the authoritative copy is out of every repo
+
+```
+$REFLECT_ROOT/sessions/<sid>/handoff/mission.md  AUTHORITATIVE handoff (outside
+                                                 every repo, alone in its dir)
+$REFLECT_ROOT/sessions/<sid>/mission.cwd   which project that handoff is for
+$REFLECT_ROOT/sessions/<sid>/manifest.json what the caller reads to decide the
+                                           write succeeded
+tasks/mission.<sid>.md                     human-readable COPY; no automation reads it
+tasks/mission.md                           human convenience symlink to the copy
+```
+
+#### What the resume fork is allowed to reach
+
+`--add-dir` **adds** to the ambient permission set; it does not restrict it. A fork
+launched with only `--permission-mode acceptEdits --add-dir <handoff dir>` therefore
+inherits the interactive user's whole permission surface from
+`~/.claude/settings.json`. Measured on this host against claude 2.1.222 with exactly
+that argv: it read `/etc/nixos/flake.nix`, ran `id -u` through pre-approved
+`mcp__safe-bash__*`, and saw the connected Google Drive / Calendar / Gmail MCP tools.
+That is arbitrary command execution and egress, on a process executing a `## Next`
+list a model wrote out of a transcript that may have contained anything.
+
+So the fork's authority is now stated rather than inherited. `scripts/idle-handoff.sh`
+launches it with, and only with:
+
+| flag | what it is load-bearing for (each verified by a real `-p` run) |
+|---|---|
+| `--setting-sources ''` | loads no user/project/local settings. **The only flag here that restricts anything.** `--settings` alone MERGES: with it and no `--setting-sources`, `/etc/nixos/flake.nix` still read fine. Also excludes the project's own `.claude/settings.json`, which is repo content |
+| `--settings <file>` | the explicit minimal object: `allow: []` (the field whose inherited value carried `mcp__safe-bash__*`), `deny` naming `Bash`/`WebFetch`/`WebSearch`/`Task`, `additionalDirectories` = the handoff leaf, `hooks: {}` |
+| `--strict-mcp-config` | no MCP servers, so no `mcp__` tools. **Not implied** by `--setting-sources`: with that alone, the account-connected Google servers were still loaded |
+| `--tools Read,Edit,Write,Glob,Grep,TodoWrite` | removes the shell structurally. **Load-bearing**: with the three flags above but no `--tools`, `id -u` still returned 1000. An unknown tool name here is *silently ignored*, which is why `deny` repeats the closure |
+| `--add-dir <handoff leaf>` | so `acceptEdits` covers the write-back the prompt asks for |
+| `--` before the prompt | **mandatory.** `--add-dir` is variadic, so `--add-dir D "$prompt"` consumes the prompt as a second directory and claude exits `Input must be provided either through stdin or as a prompt argument` — the fork was dead on arrival, and a stub that ignores argv cannot see it |
+
+**Afterwards the fork can** read/write inside its project cwd and inside
+`sessions/<sid>/handoff/`. **It cannot** read anything else on disk, run a shell
+command by any route, reach the network or any MCP server, reach its own settings
+file or the fork ledger (both under `$IDLE_HANDOFF_STATE_DIR`, outside the workspace
+and the grant), or touch `mission.cwd` / `manifest.json` / `final.json` /
+`checkpoints/`.
+
+Both gates **fail closed**: if `claude --help` does not advertise every required flag,
+or the settings file cannot be written, the fork is *not spawned* — logged loudly and
+counted as `fork_unrestrictable` in the run summary. There is no unrestricted
+fallback.
+
+Two accepted costs, stated rather than hidden. **No shell**: the fork cannot run
+tests, git or a build; it reads the handoff, edits files, and updates the handoff. A
+process executing instructions this system cannot authenticate does not get a shell to
+do it with. **No hooks**: dropping the user settings source drops the hook config, so
+the fork does not run `session-reflect`. The chain does not depend on it — the prompt
+asks the fork to update the handoff in place, which bumps its mtime, and resolution is
+newest-handoff-per-cwd.
+
+#### Why the handoff has a directory to itself
+
+Everything in a granted directory is fork-writable, by that same process.
+
+While the handoff was `sessions/<sid>/mission.md`, the grant was the whole session
+directory — including `mission.cwd`, which is the project→handoff mapping
+*resolution reads*. An injected fork could rewrite it to name a **different**
+project; its own sanctioned write-back then made that handoff the newest one for
+the new target, and the next timer tick resolved it there and executed the injected
+`## Next` in someone else's checkout with edits auto-accepted. `manifest.json`,
+`final.json` and `checkpoints/` were in reach too.
+
+The rule that replaces that: **`sessions/<sid>/handoff/` holds the handoff body and
+nothing else, ever; everything any decision reads lives one level up in
+`sessions/<sid>/`.** Adding a second file to the leaf hands it to the fork. The
+grant is derived as `dirname` of the resolved handoff so producer and consumer
+cannot drift, and the value that actually lands on the fork's command line is
+asserted in `tests/smoke.sh` (TEST 24 on the argv, TEST 36 on the layout and the
+resolver).
+
+What the fork can still do inside the grant, and why each is harmless: rewrite its
+own `mission.md` (that is the sanctioned write-back); delete it (nothing resolves →
+no fork, fail closed); create extra files or nested directories (nothing reads
+them, and the candidate search is depth-pinned to `sessions/<sid>/handoff/mission.md`
+so a nested `handoff/mission.md` is not a candidate). It cannot reach
+`mission.cwd`, `manifest.json`, `final.json` or `checkpoints/`, so it cannot change
+which project any handoff belongs to, including its own.
+
+#### Why the handoff left the repo
+
+Three successive attempts to make a **repo-resident** mission file trustworthy
+were each bypassed:
+
+1. a one-line `written-against` stamp — plain text, no secret, forged by four
+   `printf` lines in any repo;
+2. stamp + filename sid + "`$REFLECT_ROOT/sessions/<sid>/` must exist" — bypassed,
+   because `reflect.sh` created `sessions/_malformed` on **any** malformed hook
+   payload and `_malformed` satisfies `is_valid_sid`, so the supposedly
+   unforgeable out-of-repo anchor was a fixed, non-secret, machine-created name a
+   planted `tasks/mission._malformed.md` could simply claim;
+3. an HMAC over the body would have been guard #3 on the same class.
+
+USER DECISION 2026-08-15: stop asking repo content to be trustworthy. The
+authoritative handoff moved to `$REFLECT_ROOT/sessions/<sid>/handoff/mission.md` — outside
+every checkout, not git-tracked, not writable by repo content. **The unattended
+fork reads only that file.** `reflect.sh --mission-path <project-dir>` returns it
+and never looks inside the project; the `mission.cwd` sidecar (also out of repo)
+is what maps a project to its handoff, so even the *lookup* consults no repo
+content.
+
+Consequently there is **no repo-payload authentication left**, by design: a
+planted, forged, committed or tampered `tasks/mission.<sid>.md` is not a guarded
+case, it is a file nothing opens. Keeping the old four-condition check as belt and
+braces would have been dead code inviting someone to re-trust the copy later.
+
+There is deliberately **no accessor for the human copy** — nothing wants one. If a
+caller ever does, it must be a separate, clearly-named flag, never
+`--mission-path`.
+
+#### The human copy and its pointer
+
+Written after the authoritative handoff, best-effort: nothing automated reads them,
+so a read-only checkout or a foreign file at the pointer is recorded
+(`human_copy_error`, `refused_overwrite`) and never turns a successful handoff into
+a failure. The copy name embeds the session id, so a machine write can never land
+on a path a human owns; the pointer keeps `tasks/mission.md` — the path the
+`SessionStart` reinject hook tests and the documented handoff convention — working
+for humans.
+
+| existing `tasks/mission.md` | action |
+|---|---|
+| absent | write copy, create pointer |
+| symlink we own (incl. dangling) | write copy, repoint / repair |
+| anything else (regular file, dir, fifo, foreign symlink) | copy only; leave it byte-identical, record the refusal |
+
+A stamped regular file at the pointer is no longer moved aside: deciding that from
+its *contents* is exactly the repo-content trusting this design removed, and since
+nothing reads the pointer, refusing to install it costs nothing.
+
+Copies are garbage-collected once `reflections/sessions/<sid>/` is gone or they
+exceed `REFLECT_MISSION_RETENTION_DAYS` (30); the pointer target is always kept.
+GC only touches files that both match `mission.<valid-sid>.md` **and** carry our
+stamp — note that `notes` is a valid sid, so it is the stamp, not the name, that
+keeps a hand-authored `tasks/mission.notes.md` safe. That stamp check is a
+*delete* rail, not authentication.
+
+#### `idle-handoff.sh` git-freshness exclusions — an allowlist, not a glob
+
+The gate asks one question: has anything **other than us** changed this tree since
+the transcript? So it subtracts our own writes, enumerated per-cwd by
+`reflect.sh --mission-copies <project_cwd>`:
+
+* `tasks/mission.<sid>.md` — each copy whose name is `mission.<valid-sid>.md`
+  **and** whose line 1 carries our stamp;
+* `tasks/mission.md` — when the pointer is a write of ours: a symlink of ours
+  (dangling counts; a pointer whose copy was collected is still our write), **or** a
+  regular file carrying a stamp of our lineage, current (`sha= ts= sid=`) or legacy
+  (`sha= ts=`, no sid). The legacy form is what the **pre-pointer writer** produced —
+  its own output was a stamped *regular* `tasks/mission.md`, and three such files
+  still exist on this host, written by the code that is still deployed. A
+  symlink-only rule could never subtract one, so a project holding one read as
+  world-moved on **every tick, forever**, and resume there was permanently inert with
+  nothing in the log naming the file. Unstamped files and the orchestrator's
+  `repo=…/branch=…` decoy stamp are still not admitted, and the admission is for the
+  freshness gate only — it is never a licence to write the file, and `mission_gc`
+  never touches the pointer.
+
+It used to be the shape family `:(exclude)tasks/mission.md` +
+`:(exclude)tasks/mission.*.md`, and a shape is not authorship. That glob hid
+**human-owned** files: `tasks/mission.notes.md` (`notes` passes `is_valid_sid`,
+which is exactly why GC gates on the stamp rather than the name) and a
+hand-authored regular `tasks/mission.md` — the precise file mission mode refuses to
+overwrite. Refusing to write a file while hiding it from the gate is the worst of
+both readings: we acknowledge it is somebody else's, and then treat their edits to
+it as if the world had not moved.
+
+The list must cover copies of **every age**, not just this tick's: older copies are
+retained by design (GC at 30 days), and a per-tick list left every older untracked
+copy visible, so `git status --porcelain` was never empty from the second handoff
+onwards and autofork went inert in that project. `--mission-copies` enumerates the
+whole directory, so it does not regress that.
+
+It is re-derived **after** the mission write as well as before it, because the write
+adds a copy and may install or repoint the pointer, neither of which existed when
+the pre-write list was built.
+
+**Fails conservative:** if the enumeration fails, nothing is excluded, our own
+copies read as the world moving, and the fork is skipped — logged as an ERROR,
+because a permanently broken enumeration otherwise looks like a quiet tree.
+
+**An empty exclusion list is emitted as nothing, not as an empty line.** `printf
+'%s\n'` with no arguments prints one newline; `mapfile` turned that into a
+one-element array holding `""`, and `git status --porcelain -- ""` exits 128 ("empty
+string is not a valid pathspec"). Swallowed by `2>/dev/null | head`, that read as a
+**clean tree** — so in every project with no retained copy of ours (a first tick, or
+any tree whose copies were collected) the whole freshness gate always answered "the
+world has not moved", whatever the tree looked like. Found 2026-08-16 by TEST 41a.
+Fixed at the producer, plus two consumer rails: an empty pathspec element is refused
+outright, and the `git status` calls now use `exec git` with no pipeline so the exit
+status is git's rather than `head`'s — a check that cannot fail is not a gate.
+
+**Every denial names its cause.** `STALE_DETAIL` records which paths moved (bounded at
+five, `--untracked-files=all` so an untracked directory does not collapse to `?? tasks/`
+and hide the filename), and when one of them is mission-shaped and not ours the line
+says so explicitly: that project will never resume until the file is removed,
+committed, or replaced by one of ours. Before, the only trace was a generic
+`git_stale` line, and "nothing to do here" and "wedged forever, needs one `rm`" looked
+identical.
+
+**The honest bound:** the stamp is evidence of our authorship, not authentication.
+Someone with repo write can forge one and get their file excluded from the gate.
+All that buys is hiding a file nothing opens — achievable just as easily by not
+creating it — and it cannot hide a change to any file a consumer reads, because only
+those two shapes are ever emitted. **Consequence in the other direction, accepted:**
+a project holding a mission-shaped file we did not write reads as permanently
+"moved", so autofork stays off there. That is the correct answer for
+`~/Repos/ea-uplift/tasks/mission.md`, which holds unrelated in-flight state.
+
+Not excluded, deliberately: `tasks/handoff.md`, `tasks/progress.md`,
+`tasks/missionary.md`, or `tasks/` itself — a human's edit there registers as the
+world moving, because it is.
+
+**Argument units differ by seam, on purpose:** `--mission-path`,
+`lib.sh:mission_resolve_handoff` and `idle-handoff.sh:mission_resolve_ours` all
+take the **project root**, while `lib.sh:mission_gc` takes the **tasks
+directory**. A mismatch fails closed with a stderr line, which is why each
+parameter is named for its unit (`project_cwd` vs `tasks_dir`).
+
+`mission_resolve_ours` distinguishes its failures: rc 1 is a clean "no handoff for
+this project", rc 2 is "the resolver itself failed" (timeout, crash, unusable
+output). Both fail closed; only one means something is broken, and they are logged
+differently (`mission_not_ours` vs `mission_resolve_error`).
 
 Reflection is idempotent per-mode: reruns for the same `(session_id, mode)`
 with `modes.<mode>.final_complete: true` exit fast without spawning a new
 subprocess, unless `REFLECT_FORCE=1`. Different modes for the same session
 never block each other — a PreCompact in flight does not stop SessionEnd
 from producing `final.json`.
+
+### Callers of `mission` mode
+
+| caller | how | why that way |
+|---|---|---|
+| `reflect.sh precompact` (2nd+ compact) | `REFLECT_ASYNC=1` | the hook clock cannot afford a model call |
+| `scripts/idle-handoff.sh` | synchronous | it reads `modes.mission.status` immediately after |
+| `~/.claude/self-compact-trigger.py` (`Stop` hook) | `REFLECT_ASYNC=1 REFLECT_FORCE=1` | same hook-cap reason, and a threshold crossing must produce a handoff describing the state *at* the crossing — an earlier `complete` mission for the session would otherwise leave the resume working from something stale |
+
+The self-compact trigger fires once per session per crossing of **30% of the
+detected context window**. It only writes the handoff and records a request;
+`scripts/idle-handoff.sh` performs the reset+resume under its own guard chain.
+Nothing here auto-invokes `/compact` or `/clear` — neither is agent-triggerable,
+and "reset" means the *next* process is a fresh one seeded from the handoff.
+
+**There is no switch.** USER DECISION 2026-08-16: `components.self_compact` (which
+shipped `false`) and the `SELF_COMPACT_CONFIG` path override are both deleted, with
+no replacement key, env var or opt-in. The threshold (0.30) and the per-session
+fire cap (3) are hardcoded constants — `THRESHOLD` and `MAX_FIRES_PER_SESSION` in
+`self-compact-trigger.py`, and the same 0.30 in `scripts/idle-handoff.sh`. They are
+values, not settings; changing one is a code change with a test run behind it. A
+flag shipping `false` protected nothing, and it left the feature untested in the
+only configuration that matters.
+
+**What now bounds it**, since a switch no longer does:
+
+| bound | value | where |
+|---|---|---|
+| once per threshold crossing, per session | re-arms below the threshold | `self-compact-trigger.py` state file |
+| fires per session | 3 | `MAX_FIRES_PER_SESSION` |
+| forks per idle-handoff run | 3 | `IDLE_HANDOFF_AUTOFORK_MAX_PER_RUN` |
+| forks per cwd per 24h | 5 | `IDLE_HANDOFF_AUTOFORK_MAX_PER_CWD_24H` |
+| world moved since the transcript | DENY, incl. non-git | `is_stale_since_transcript` |
+| a live claude process in that cwd | abort, rescanned pre-spawn | `is_live_project` |
+| an armed ralph loop in that cwd | skip | `.claude/ralph-loop.local.md` |
+| no handoff of ours resolves | skip | `mission_resolve_ours` |
+| the workspace overlaps the control plane | skip, loudly, counted | `candidate_cwd_is_control_plane` |
+| a cwd that cannot round-trip the ledger (control chars) | skip, loudly | cwd extraction |
+| the fork's authority cannot be restricted | skip, loudly, counted | `fork_restriction_available` / `write_fork_settings` |
+| `permissions.deny` not proven enforced by this CLI build | skip, loudly, counted | `fork_deny_enforced` (real two-run probe, cached per `claude --version`) |
+| what the fork may reach at all | project cwd + handoff leaf; no shell, no MCP, no network | "What the resume fork is allowed to reach" above |
+| kill switch, if one is ever needed | `systemctl --user disable --now claude-idle-handoff.timer` | the deployed timer |
+
+**The workspace and the control plane are disjoint, by construction.** A candidate cwd
+that IS, contains, or sits inside `$REFLECT_ROOT`, either idle-handoff state dir, the
+generated fork-settings dir, the self-compact state dir, or `~/.claude` is refused
+outright — not written to, not forked into, and counted as `control_plane_cwd` in the
+run summary. `~/.claude` is a git repo that gets worked in, so this is an ordinary
+candidate rather than an exotic one, and an `acceptEdits` fork there could rewrite the
+permission object the *next* fork is spawned with or the hooks the interactive session
+loads. Comparison is on `realpath`'d paths, so a symlink does not walk through it.
+
+**`permissions.deny` is measured, not assumed.** It is the rail that actually contains
+the fork: `--tools` silently ignores an unknown tool name, so a renamed or split `Bash`
+would leave `deny` as the only closure. Before forking on a CLI build it has not seen,
+idle-handoff runs the real binary twice with a generated settings file — once with the
+tools denied (the sentinel must NOT appear) and once with `deny: []` (it must) — and
+refuses to fork on anything short of `enforced`. The verdict is cached against
+`claude --version`, so the two haiku calls (~$0.06) are paid once per upgrade. An
+unidentifiable build fails closed. The human-runnable form of the same probe is in
+`tests/live.sh`; the offline suite's stub CLI emulates the contract so the fail-closed
+paths are testable, and is not evidence about the installed binary.
+
+The trigger never gated autofork itself, and still does not: a session idle for
+`IDLE_HANDOFF_MIN_SECONDS` (45 min) has been resumed by an unattended
+`--permission-mode acceptEdits` fork since before self-compact existed. What the
+context path changes is *when* a session becomes fork-eligible — at a threshold
+crossing rather than only after the 45-minute floor. That frequency change is why the
+fork's *ambient* authority mattered enough to fix: the leaf write grant was narrow
+while the inherited permission set was the whole machine.
+
+**A reading with an unknown context window cannot spend money.** `context_usage.py`
+reports `window_known: false` when the model family is in neither of its prefix
+tables and observed usage has not exceeded the 200k base — the window is then a
+lower bound, and a 1M session measured against it reads ~5× high. `--fill-pct`
+refuses such a reading and the trigger refuses to fire on it, logging loudly, so
+the table gets updated rather than drifting. Adding a model family means editing
+`ONE_M_MODEL_PREFIXES` or `KNOWN_BASE_MODEL_PREFIXES` — leaving it out is a
+disabled feature, not a wrong number.
 
 ## Inspecting artifacts
 
@@ -209,8 +616,13 @@ with no downstream consumer and are safe to prune on a cron.
 ## Failure modes
 
 - **Missing `session_id` or `transcript_path` in payload.** Writes an
-  error record under `sessions/_malformed/` containing only the payload
-  SHA-256 and length (no raw body) and exits 0. Never blocks the caller.
+  error record under `malformed/` — *beside* `sessions/`, not inside it —
+  containing only the payload SHA-256 and length (no raw body), and exits 0.
+  Never blocks the caller. It used to land in `sessions/_malformed/`, and
+  because `_malformed` satisfies `is_valid_sid` that turned one malformed hook
+  payload into a fixed, machine-created "session" any file could name. Nothing
+  authenticates on session directories now, but everything under `sessions/`
+  should be a session Claude Code actually ran.
 - **`session_id` fails safe-charset check (`^[A-Za-z0-9._-]{1,128}$`).**
   Same as above with `reason: "invalid_session_id"`. Rejects path
   traversal (`../evil`, `/abs/path`), spaces, newlines, control chars.
@@ -254,12 +666,74 @@ with no downstream consumer and are safe to prune on a cron.
 ## Tests
 
 ```bash
-# Offline smoke — uses a stub `claude` on PATH. Zero API cost. Default.
+# Offline smoke, FAST lane (default) — uses a stub `claude` on PATH. Zero API cost.
 bash tests/smoke.sh
+
+# Offline smoke, FULL lane — adds the MEDIUM/LOW integration blocks.
+SMOKE_LANE=full bash tests/smoke.sh      # or: bash tests/smoke.sh --full
 
 # Live smoke — opt-in. One real Haiku call, ~few thousand tokens.
 REFLECT_LIVE_TEST=1 bash tests/live.sh
 ```
+
+### Lanes
+
+`SMOKE_LANE` selects **which tests run**. It is test infrastructure, not a switch
+on product behaviour: no code under test reads it, and nothing about the shipped
+system changes with it.
+
+| Lane | What it runs | Measured wall time |
+|---|---|---|
+| `fast` (default) | 57 named TESTs: every cheap unit-level test, plus the regression test for every BLOCKER/HIGH fixed in review — F1 (19/19g/26), R1 (24/36), S1 (40), S3's fail-open staleness gate (41), T1 (43), D1's out-of-repo resolution (19d/25), and the teardown contract (48). | ~3.5 min |
+| `full` | fast + the seven MEDIUM/LOW integration blocks (33 F8, 35 D6, 37 R2, 44 T2, 45 T3, 46 T4, 47 T5). | ~6 min |
+
+The split exists because each of those blocks drives several real
+`idle-handoff.sh` ticks, and a tick costs ~3.5 s of fixed overhead before it does
+any test-specific work — `scan_live_cwds` forks `readlink` plus `tr | head` for
+every PID on the host, twice per candidate. That cost is in the product, not the
+harness; the lanes bound how many times a default run pays it.
+
+### Exit codes: a failed test and a failed teardown are different events
+
+| Code | Meaning |
+|---|---|
+| 0 | every selected test passed **and** teardown completed. `OK: all smoke tests passed` is printed only here. |
+| 1 | a test failed. Temp state is deliberately kept for inspection. |
+| 3 | every test passed, but teardown failed — the `TEARDOWN:` line names what went wrong. |
+| 2 | bad invocation (unknown lane or argument). |
+
+This used to be one code for both, which is how a run with 63 passing TESTs and
+zero failures reported `SUITE_FAILED`: a detached worker wrote its stdout log into
+the temp root after the final assertion, `rm -rf` lost the race between its
+readdir and its rmdir, and `set -e` killed the script before the success line.
+
+### Teardown is deterministic, not patient
+
+The harness tracks every process it starts and waits for all of them to reach a
+terminal state before it removes anything, bounded at 90 s. Two rails, because
+there are two spawn mechanisms:
+
+- **transient units** — a transparent `systemd-run` shim ahead of the real binary
+  on `PATH` records each `--unit=` name and `exec`s the real thing, so the suite
+  holds the same handle systemd does. Waiting on *recorded* names rather than on a
+  `claude-autofork-*` glob also means the live deployment's own 5-minute timer,
+  which fires during a full run, is never something the suite waits for.
+- **live processes naming this run's `REFLECT_ROOT`** — covers the `setsid`
+  fallback spawn, which has no unit at all, and any child of a unit. The suite's
+  own process tree is excluded: the shell is blocked on its synchronous children
+  by definition.
+
+If the bound expires, teardown fails **loudly** and names the units and PIDs still
+holding the directory. There is no `rm -rf … || true` and no `2>/dev/null` on the
+cleanup: swallowing that error is what would hide the next teardown bug. TEST 48
+is the regression — it spawns a detached worker blocked on a sentinel it controls,
+proves the wait refuses to declare quiescence and names the holder, then releases
+it and proves the late write has landed before the wait returns.
+
+The same condition replaced the timing-based fork assertions: `sc_settle_fork`
+used to poll up to 15 s for a positive and `sleep 3` for a negative, so a negative
+could pass merely because the fork had not landed yet. It now waits for quiescence,
+after which the fork's argv log is final for both answers.
 
 ## Empirical basis
 
