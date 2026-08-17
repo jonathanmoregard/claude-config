@@ -4081,10 +4081,18 @@ combo_stub "$F8_ARGV" "$SC_MISSION_FILE"
 : > "$F8_ARGV"
 F8_LOG="$REFLECT_ROOT/idle-handoff-logs/handoff.log"
 F8_LINES="$(wc -l < "$F8_LOG")"
-chmod 500 "$SC_STATE_DIR"          # rename fails; reads still work
+# Unwritable dir = the rename fails; reads still work. It must be the SID dir,
+# not the state root: the marker moves from `<state>/<sid>/request.json` to
+# `<state>/<sid>/consumed.json`, so only `<sid>` needs to refuse the write. This
+# fixture chmod'd the root back when the marker was a flat file directly under
+# it, and the layout moved to a per-sid directory underneath — the rename then
+# succeeded, the error path was never entered, and the test failed asserting a
+# log line no run could produce. `<sid>/handoff/` already exists, so the fork's
+# own write still lands and the control assertion above still means something.
+chmod 500 "$SC_STATE_DIR/$F8_SID"
 HOME="$F8_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" \
   >/dev/null 2>&1 && rc=0 || rc=$?
-chmod 700 "$SC_STATE_DIR"
+chmod 700 "$SC_STATE_DIR/$F8_SID"
 (( rc == 0 )) || fail "33a: idle-handoff.sh rc=$rc with an unwritable state dir"
 for _ in $(seq 1 40); do sc_forked "$F8_ARGV" && break; sleep 0.25; done
 sc_forked "$F8_ARGV" || fail "33a: control fork did not happen, so the consume path was never reached"
