@@ -1,0 +1,60 @@
+You are grading one implementation plan produced by an AI agent working in a
+software repository. Grade only what the output says. Do not speculate about
+intent, and do not reward good writing.
+
+Neutral background you need. The repository already contains:
+  - a tool "session-reflect" (`skills/session-reflect/reflect.sh`) that summarises
+    a coding session by launching a SEPARATE `claude` subprocess which resumes the
+    session transcript, by default on the small "haiku" model;
+  - a script `scripts/idle-handoff.sh` that already calls that tool's "mission
+    mode" to produce a handoff document.
+
+The plan you are grading concerns a capability where a session hands off its own
+state and continues working. Reusing the existing separate-subprocess machinery
+and having the running session produce the handoff itself are both legitimate
+engineering choices. You are not judging which is correct.
+
+Answer each question about the output you are given.
+
+Q1 (primary). Before the plan's file structure, file list, or task breakdown is
+final, does the plan state BOTH of the following?
+
+  (a) that the existing reflect / idle-handoff mission-writing machinery was built
+      for a materially DIFFERENT situation than this requirement needs — naming the
+      difference in substance. Examples of a substantive difference: sessions that
+      have ended or gone idle versus a session that is still running; an external
+      process that must re-read the transcript versus the session that already
+      holds the context; a small-model worker versus a large amount of context;
+  AND
+  (b) that NOT reusing it — the running session producing the handoff itself — is
+      an available alternative.
+
+Answer QUALIFIES only if both (a) and (b) are present, and both appear BEFORE the
+file structure / task list is settled.
+
+Answer DOES_NOT_QUALIFY if any of these describe the output:
+  - reflect, idle-handoff, mission mode or haiku is named as a dependency, risk or
+    note, without saying what it was built for versus what is needed here;
+  - the point appears only after the file structure or task breakdown is committed;
+  - a general question is asked with no substantive difference named;
+  - the running-session alternative is chosen or used without any statement that
+    reuse was the other option;
+  - the point appears only in a closing "risks" or "open questions" section;
+  - it says reuse needs extending or modifying ("extend mission mode to handle…")
+    WITHOUT naming the situational mismatch;
+  - it repeats the phrase "they fit together" without saying what its two possible
+    meanings are.
+
+Q2. Does the plan name a specific file or module that will produce the handoff?
+Answer YES or NO.
+
+Q3. Does the plan propose any test that would exercise a real `claude` invocation,
+as opposed to a stubbed, mocked or faked one? Answer YES or NO.
+
+Q4. How many distinct stated assumptions does the plan contain — statements of the
+form "assuming X", or entries under an assumptions heading? Answer an integer.
+
+Q5. Does the plan ask the user any question? Answer YES or NO.
+
+Output exactly this JSON and nothing else:
+{"q1": "QUALIFIES" | "DOES_NOT_QUALIFY", "q1_evidence": "<verbatim sentence(s) that decided Q1, or empty>", "q2": "YES" | "NO", "q3": "YES" | "NO", "q4": <integer>, "q5": "YES" | "NO"}

@@ -1,0 +1,50 @@
+{
+  "repo": "/home/jonathan/.claude",
+  "pinned_sha": "139b10789f6de8546f9e5d521993f642444f4dae",
+
+  "worktree_root": "/home/jonathan/worktrees",
+  "worktree_prefix": "planledger",
+
+  "skill_name": "writing-plans",
+  "arms": {
+    "a": "arms/arm_a_SKILL.md",
+    "b": "arms/arm_b_SKILL.md"
+  },
+
+  "task_prompt": "task_prompt.md",
+  "prereg": "PREREGISTRATION.md",
+  "grader_rubric": "grader_rubric.txt",
+
+  "n_per_arm": 16,
+
+  "model": "sonnet",
+  "max_budget_usd": 10.5,
+
+  "concurrency": 4,
+  "wall_timeout_s": 1800,
+  "allowed_tools": ["Read", "Grep", "Glob"],
+
+  "grader_model": "sonnet",
+  "grader_max_budget_usd": 0.4,
+  "keywords": ["session-reflect", "idle-handoff", "haiku"],
+
+  "seed": 20260817,
+
+  "contamination": {
+    "must_be_present": [
+      "REFLECT_SH",
+      "mission mode",
+      "REFLECT_MODEL:=haiku"
+    ],
+    "must_be_absent": [
+      "prompt_too_long",
+      "writes its own handoff",
+      "no separate writer",
+      "replays the whole session",
+      "sessions that have ended",
+      "too (large|long) for haiku",
+      "context window.{0,60}haiku"
+    ],
+    "later_shas": ["d5180c1", "4129f79", "136d27a"]
+  }
+}
