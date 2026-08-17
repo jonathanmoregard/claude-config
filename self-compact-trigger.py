@@ -100,9 +100,12 @@ FIRE_AT_TOKENS = 300_000
 
 # Ceiling on fires per session, for a session that oscillates across the
 # threshold: each crossing re-arms (see LOOP BOUND above), so without a cap a
-# session hovering at 30% could fire indefinitely. Three is enough for a long
-# session that legitimately crosses, sheds context, and crosses again.
-MAX_FIRES_PER_SESSION = 3
+# session hovering at 30% could fire indefinitely. The cap exists ONLY to stop a
+# runaway loop, not to ration normal use: a session that works all day
+# legitimately crosses 300k, sheds context, and crosses again many times, and a
+# low cap silently turns the feature off partway through exactly the sessions it
+# is for. 40 is far above any honest day's crossings and far below a loop.
+MAX_FIRES_PER_SESSION = 40
 # Same rule reflect.sh validates, ALL of it: these ids become path components.
 #
 # The charset half was already here; the leading-dot rejection was not, so the

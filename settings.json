@@ -26,6 +26,8 @@
       "Edit(/home/jonathan/.claude/skills/**)",
       "Edit(/home/jonathan/.claude/homunculus/**)",
       "Edit(/home/jonathan/.claude/loops/**)",
+      "Edit(/home/jonathan/.claude/self-compact/**)",
+      "Write(/home/jonathan/.claude/self-compact/**)",
       "mcp__aggregator__aggregator_search_memory",
       "mcp__aggregator__aggregator_capabilities",
       "mcp__research-agent__*",
