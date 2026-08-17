@@ -55,7 +55,7 @@ NO SWITCH — USER DECISION 2026-08-16
 
 LOOP BOUND (B6)
     Once per session per threshold crossing, persisted in
-    ~/.claude/sessions/<sid>/state.json. A reading below the
+    ~/.claude/self-compact/<sid>/state.json. A reading below the
     threshold re-arms; only an armed session can fire; MAX_FIRES_PER_SESSION caps
     pathological oscillation. State is written BEFORE the model call, and if the
     state file cannot be written the hook does not fire at all — an unbounded
@@ -133,7 +133,12 @@ def claude_dir() -> Path:
 
 
 def sessions_root() -> Path:
-    """`~/.claude/sessions` — self-compact's own tree, one directory per session.
+    """`~/.claude/self-compact` — our own tree, one directory per session.
+
+    NOT `~/.claude/sessions`: that is Claude Code's OWN session registry
+    (<pid>.json files carrying sessionId/cwd/status). Writing our tree inside a
+    directory whose format and lifecycle the CLI owns is the foreign-owned
+    location hazard this project has legislated about twice.
 
     DELIBERATELY NOT UNDER $REFLECT_ROOT. Self-compact used to live inside the
     session-reflect tree because it reused that subsystem to write its handoff.
@@ -145,7 +150,7 @@ def sessions_root() -> Path:
 
     Layout, one uuid-keyed directory per session:
 
-        ~/.claude/sessions/<sid>/
+        ~/.claude/self-compact/<sid>/
             cwd            which project this session belongs to. NOT in the
                            fork's write grant -- it decides where a resume runs,
                            so a resumed process must not be able to retarget the

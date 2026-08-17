@@ -3,7 +3,7 @@
 
 THE SEQUENCE, and why it is in this order:
 
-    1. ask the session to write its handoff to ~/.claude/sessions/<sid>/handoff/mission.md
+    1. ask the session to write its handoff to ~/.claude/self-compact/<sid>/handoff/mission.md
     2. wait until that file appears AND is newer than the request
     3. /clear
     4. a pickup message naming only that file
@@ -64,6 +64,8 @@ WRITE_WAIT_SECONDS = 240
 # Gap between `/clear` and the pickup: the TUI has to process the command and
 # return to an empty prompt.
 CLEAR_SETTLE_SECONDS = 2.0
+# How long to wait for the CLI's own evidence that /clear took effect.
+CLEAR_CONFIRM_SECONDS = 30
 
 
 def sessions_root() -> Path:
@@ -73,6 +75,34 @@ def sessions_root() -> Path:
 
 def handoff_path(sid: str) -> Path:
     return sessions_root() / sid / "handoff" / "mission.md"
+
+
+def registry_session_id(spid: int) -> str | None:
+    """The session id Claude Code currently associates with this pid, or None.
+
+    Used ONLY to confirm, after the fact, that a `/clear` we sent took effect: a
+    clear keeps the process and starts a NEW session, so the id changes. It is
+    never consulted to decide whether to send anything.
+
+    CHOSEN ON EVIDENCE over the obvious alternative. Counting transcript files
+    looked equivalent and is not: transcripts are written lazily, so a session
+    that had been prompted once still showed ZERO transcripts, and the next
+    submission made one appear. Measured against a real session, `/clear` into a
+    non-empty prompt: transcript count went 0 -> 1 while no clear had happened,
+    and the registry id correctly stayed UNCHANGED.
+
+    Note this is deliberately NOT the registry's `status` field. That is
+    turn-state, not input-buffer state: a user who has typed but not submitted
+    reads as idle, so gating a destructive send on it would license precisely
+    the case it appears to guard. Reading `sessionId` after the fact carries no
+    such hazard, and an absent or restructured registry degrades to "cannot
+    confirm", which keeps the marker and sends nothing.
+    """
+    try:
+        p = Path.home() / ".claude" / "sessions" / f"{spid}.json"
+        return json.loads(p.read_text()).get("sessionId") or None
+    except Exception:
+        return None
 
 
 def log(msg: str) -> None:
@@ -368,9 +398,34 @@ def main(argv: list[str]) -> int:
             "been typing. Nothing was destroyed.")
         return 1
 
+    # Evidence that the clear ACTUALLY landed, not merely that bytes arrived.
+    # `kitten` returning 0 says the text was delivered to the window; it says
+    # nothing about whether the TUI acted on it. If the user had typed something
+    # first, `/clear` appends to their buffer and submits their text instead --
+    # no clear happens, and without this check we would send the pickup into a
+    # session that still holds its old context and then consume the marker,
+    # logging success. `/clear` starts a NEW transcript, so the CLI's own
+    # bookkeeping is the confirmation.
+    id_before = registry_session_id(spid)
     err = send_text(socket, wid, spid, "/clear", submit=True)
     if err:
         log(f"sid={sid} NOT CLEARING: {err}. The handoff is written at {target}.")
+        return 1
+    cleared = False
+    deadline = time.time() + CLEAR_CONFIRM_SECONDS
+    while time.time() < deadline:
+        now_id = registry_session_id(spid)
+        if id_before is not None and now_id is not None and now_id != id_before:
+            cleared = True
+            break
+        time.sleep(0.5)
+    if not cleared:
+        log(f"sid={sid} NOT CONFIRMED: /clear was delivered to window {wid} but the session "
+            f"id did not change within {CLEAR_CONFIRM_SECONDS}s, so the session was NOT "
+            "cleared. Measured cause: a prompt that already holds typed text swallows the "
+            "command instead of running it. Leaving the request marker in place and sending "
+            f"no pickup, so nothing acts on a session that still has its old context. The "
+            f"handoff is written at {target}.")
         return 1
     time.sleep(CLEAR_SETTLE_SECONDS)
     err = send_text(socket, wid, spid, pickup_message(str(target), instructions), submit=True)
