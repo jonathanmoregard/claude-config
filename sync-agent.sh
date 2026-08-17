@@ -21,6 +21,18 @@ fi
 
 cd "$REPO"
 
+# Shared with scripts/claude-pull.sh, the auto-pull side of the same repo:
+# a fast-forward landing between this script's `git add` and its `git push`
+# would either break the push or fold someone else's commits into a commit
+# this agent believes it authored. Non-blocking — a skipped run is retried
+# on the next tick, and holding the lock behind a multi-minute Claude call
+# would stall the pull timer instead.
+exec {sync_lock_fd}>"$REPO/.git/claude-sync.lock"
+flock -n "$sync_lock_fd" || {
+  echo "sync-agent: another sync/pull run holds the lock in $REPO; skipping"
+  exit 0
+}
+
 # Surface failures. A cron job has nobody watching its output: aggregator's
 # sync failed on 4 consecutive runs (Claude usage limit, then a refused
 # connection) and went unnoticed for six days because the only evidence was a
