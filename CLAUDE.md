@@ -19,16 +19,18 @@ Never ask the user to do what you can do. Run the commands, tests, reads, edits,
 | Approach unclear | Conventional for the stack |
 | Two valid implementations | Simpler |
 | Ambiguous requirement | Most reasonable reading, document the assumption |
-| Same op failed 3×, or advisor 3× without progress | Log in `pending_for_human.md`, switch task |
-| Blocked on credential / browser auth / human step | Log in `pending_for_human.md`, switch task |
+| Same op failed 3×, or advisor 3× without progress | Log in `<notes>/pending_for_human.md`, switch task |
+| Blocked on credential / browser auth / human step | Log in `<notes>/pending_for_human.md`, switch task |
 
 Entry format for `pending_for_human.md`: `~/.claude/templates/pending-for-human.md`.
 
+**`<notes>` = `~/.claude/tasks/<repo-name>/`** — working notes live in userspace, never repo-relative. `<repo-name>` is the basename of the primary working directory; create the dir if absent. Want them visible in the checkout → symlink `<repo>/tasks` → `<notes>` and gitignore it. Repo-relative notes get committed by any auto-commit and published the moment the repo goes public.
+
 After every edit, run the fastest relevant check on the file just edited — syntax parse, type-check, linter, project verify command. Don't move on until it's clean.
 
-Context large, or before a risky long step → write `tasks/mission.md`: done / next / blocked / open questions. Must be resumable without the full history.
+Context large, or before a risky long step → write `<notes>/mission.md`: done / next / blocked / open questions. Must be resumable without the full history.
 
-User states a directive outliving the current task ("don't X", "always Y", "never Z") → append it datestamped to `tasks/session-constraints.md` that same turn. Re-read after every compact/resume. Briefing a subagent → paste its contents verbatim, never paraphrase.
+User states a directive outliving the current task ("don't X", "always Y", "never Z") → append it datestamped to `<notes>/session-constraints.md` that same turn. Re-read after every compact/resume. Briefing a subagent → paste its contents verbatim, never paraphrase.
 
 User instructions override everything below.
 
