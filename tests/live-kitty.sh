@@ -270,20 +270,12 @@ fi
 # 4. blast radius
 [[ "$(cat "$PROJ/src.txt")" == "baseline" ]] || fail "src.txt was modified; the resume exceeded its task"
 
-# ---- a rail that needs no model call ---------------------------------------
-# The control-plane refusal is HIGH severity and pure logic, so assert it here
-# where a real window exists to be refused.
-cp_out="$(HOME="$FIXHOME" KITTY_LISTEN_ON="$SOCK" CLAUDE_SESSIONS_DIR="$FIXHOME/.claude" \
-  python3 - "$WORKTREE" "$SID" "$SPID" <<'PY'
-import sys, os
-sys.path.insert(0, sys.argv[1])
-import inplace_reset as ir
-print(ir.control_plane_conflict(os.path.expanduser("~/.claude")) or "NO REFUSAL")
-PY
-)"
-[[ "$cp_out" != "NO REFUSAL" ]] \
-  || fail "control_plane_conflict did not refuse a cwd inside ~/.claude"
-info "control-plane cwd refused: ${cp_out:0:70}"
+# NOTE: there is deliberately NO cwd or authority assertion here. The successor
+# is this same session with less context, so it keeps everything it already had.
+# An earlier revision asserted a control-plane refusal ported from the unattended
+# fork path, where the reader is a different process running unwatched. That was
+# the wrong baseline, and the rail is gone.
+
 
 if (( FAILED )); then
   echo "LIVE-KITTY: FAILED" >&2

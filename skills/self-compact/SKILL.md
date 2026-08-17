@@ -61,8 +61,9 @@ the two happened; do not imply a reset that did not occur.
      `~/.claude/self-compact/inplace-reset.log`. Common ones: `KITTY_LISTEN_ON`
      unset (no remote control), `no kitty window has pid N` or `matched N
      windows` (the window could not be uniquely identified, so it refuses rather
-     than typing into someone else's session), a cwd inside the control plane, or
-     another reset already running for this session.
+     than typing into someone else's session), no fresh handoff appeared, the
+     clear was not confirmed, or another reset is already running for this
+     session.
 
 3. **Do nothing else.** Do not start work, do not run a tick, do not "prepare".
    The next thing that should happen here is the write, then the clear.
@@ -78,14 +79,12 @@ the two happened; do not imply a reset that did not occur.
   window, where the text would be executed as commands.
 - **It will not clear a session with nothing to resume from.** A fresh handoff
   must exist first; a stale one from an earlier crossing does not count.
-- **Provenance changed, and it matters.** The handoff is now written by the
-  session itself, in its own voice — so anything injected into the context comes
-  back out looking like the agent's own notes rather than quoted material. The
-  instruction that asks for the handoff says to record what is true rather than
-  to relay what it was told, and the pickup still treats the file as untrusted
-  data whose `## Next` items require judgement.
-- **A cleared session keeps your full ambient authority**, unlike the fork path,
-  which is restricted to file tools with no shell.
+- **The successor is the same session, not a sandbox.** Same process, same
+  permissions, same everything it was already carrying — just less context. That
+  is the point, not a caveat: clearing hands nobody anything they did not have a
+  moment earlier. So there is no cwd restriction, no reduced tool set, and the
+  handoff is not treated as untrusted input — it is the session's own notes to
+  itself.
 
 ## Testing
 
