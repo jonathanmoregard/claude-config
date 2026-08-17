@@ -1328,9 +1328,30 @@ for project_dir in "$PROJECTS_DIR"/*/; do
   # head-truncation-reads-as-success class as the fail-open gate above. `jq -c` keeps
   # each value on one line with the newline escaped, so head can only ever pick a whole
   # record; the decode happens afterwards, in bash, where nothing truncates.
-  candidate_cwd_json=$(tac "$transcript" 2>/dev/null | \
-    jq -c 'select(type=="object") | .cwd // empty | select(type=="string")' 2>/dev/null | \
-    head -1) || candidate_cwd_json=""
+  #
+  # THE FIRST VALUE IS TAKEN IN BASH, NOT BY `head -1` IN THE PIPELINE. `head` closing
+  # the pipe kills jq with SIGPIPE; `set -o pipefail` (line 62) then reports the WHOLE
+  # pipeline as failed, and the `|| candidate_cwd_json=""` that used to close this
+  # assignment threw away a cwd that had ALREADY been extracted correctly. The result
+  # was a candidate skipped as "cwd not extractable/valid (raw: )" — fail-closed, so
+  # never dangerous, but a session that qualified in every way was silently passed over.
+  #
+  # It is not a rare race. It fires whenever jq still has output buffered when head
+  # leaves, i.e. once jq's output exceeds the 64 KiB pipe buffer. Measured on this host
+  # against a transcript whose records each carry a 170-char cwd: 48/300 runs at 26
+  # records, 20/20 at 500, 20/20 at 5000 — so ANY real transcript of a few hundred
+  # cwd-bearing records failed EVERY time. Observed in the live log for this host's own
+  # session 735b890d on 2026-08-17 (12:06 and 12:11).
+  #
+  # Reading the first line from a process substitution has neither problem: the value
+  # is captured before the pipe closes, and no pipefail status is consulted. `tac`
+  # still streams, so a huge transcript is not read into a variable.
+  candidate_cwd_json=""
+  while IFS= read -r _cwd_line; do
+    candidate_cwd_json="$_cwd_line"
+    break
+  done < <(tac "$transcript" 2>/dev/null | \
+    jq -c 'select(type=="object") | .cwd // empty | select(type=="string")' 2>/dev/null)
   candidate_cwd=""
   if [[ -n "$candidate_cwd_json" ]]; then
     # `printf X` + `%X` so a value with trailing newlines is not silently trimmed by

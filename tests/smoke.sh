@@ -2455,11 +2455,16 @@ mk_context_transcript() {
   local path="$1" model="$2" tokens="$3" cwd="${4:-}" nlines="${5:-5}"
   local read_tok=$(( tokens - 1000 ))
   : > "$path"
-  local i
+  # ONE jq call to JSON-encode the cwd, then printf the user lines. A jq process per
+  # record is unremarkable at 25 records and unusable at the few thousand TEST 49
+  # needs to fill a pipe buffer deterministically. Output is byte-identical to the
+  # old per-line form, key order included.
+  local i cwd_json
+  cwd_json="$(jq -cn --arg cwd "$cwd" '$cwd')"
   for (( i = 0; i < nlines; i++ )); do
-    jq -cn --arg cwd "$cwd" --argjson ep 1 \
-      '{type:"user",message:{role:"user",content:"work"},cwd:$cwd,entrypoint:"cli"}' >> "$path"
-  done
+    printf '{"type":"user","message":{"role":"user","content":"work"},"cwd":%s,"entrypoint":"cli"}\n' \
+      "$cwd_json"
+  done >> "$path"
   jq -cn --arg m "$model" --argjson r "$read_tok" --arg cwd "$cwd" \
     '{type:"assistant",cwd:$cwd,message:{role:"assistant",model:$m,
       content:[{type:"text",text:"ok"}],
@@ -5109,7 +5114,8 @@ t1_case() {
   # in a `$(...)` substitution it would run in a subshell, the globals would be discarded
   # and every `sc_forked "$T1_ARGV"` below would grep an empty filename — i.e. pass as
   # "no fork" for free.
-  local sid="$1" spec="$2" expect="${3:-no-fork}" h proj lines gitify="" old
+  # $4=transcript user-line count (default 25). TEST 49 raises it to fill a pipe.
+  local sid="$1" spec="$2" expect="${3:-no-fork}" nlines="${4:-25}" h proj lines gitify="" old
   h="$(sc_home)"
   case "$spec" in
     @home_claude) T1_CWD_USED="$h/.claude"; gitify="$h/.claude" ;;
@@ -5125,7 +5131,7 @@ t1_case() {
   combo_stub "$T1_ARGV" "$SC_MISSION_FILE"
   proj="$h/.claude/projects/-tmp-$sid"
   mkdir -p "$proj"
-  mk_context_transcript "$proj/$sid.jsonl" "claude-opus-5" 330000 "$T1_CWD_USED" 25
+  mk_context_transcript "$proj/$sid.jsonl" "claude-opus-5" 330000 "$T1_CWD_USED" "$nlines"
   mk_mission_handoff "$sid" "$T1_CWD_USED" "$(cat "$SC_MISSION_FILE")" >/dev/null
   sc_plant_request "$sid" "$T1_CWD_USED" "$proj/$sid.jsonl"
   # THE FIXTURE HAS TO BE FORK-READY, INCLUDING THE GIT GATE. `~/.claude` is a git repo
@@ -5796,6 +5802,36 @@ spawn_wait_quiescent 60 \
   || fail "48d: quiescence was declared before the worker's write landed — this is the exact race the suite used to lose"
 rm -f "$TD_LATE" "$TD_GO"
 info "48: a detached worker is tracked by unit AND by process, blocks teardown, is named while it blocks, and its write lands before quiescence"
+
+# ============================================================================
+# TEST 49: a transcript bigger than a pipe buffer still yields its cwd
+# ============================================================================
+# idle-handoff.sh read the candidate cwd with `tac | jq | head -1`. `head` closing
+# the pipe kills jq with SIGPIPE; `set -o pipefail` makes that the WHOLE pipeline's
+# status; and the `|| candidate_cwd_json=""` closing that assignment then discarded
+# a cwd it had already read correctly. The candidate was skipped as
+# "cwd not extractable/valid (raw: )" — fail-closed, so never dangerous, but a
+# session that qualified in every way was passed over in silence.
+#
+# This is NOT a rare race, and the test does not treat it as one. It fires once
+# jq's output exceeds the 64 KiB pipe buffer, which is why the fixture is sized to
+# be over it rather than sized to reproduce a flake: measured on this host at
+# 48/300 runs with 26 records, and 20/20 with 500. A few thousand records makes the
+# old code fail EVERY time, so this test is red-or-green, not lucky-or-unlucky.
+#
+# The candidate is ORDINARY in every other respect — same fixture as 43a, which
+# forks — so a failure here can only be the extraction.
+test_begin "TEST 49: a transcript larger than the pipe buffer still yields its cwd"
+T49_CWD="$(mktemp -d -t reflect-t49cwd-XXXXXX)"
+assert_isolated_cwd "$T49_CWD"
+mk_candidate_repo "$T49_CWD" || fail "49: could not build the candidate repo"
+t1_case test-sid-t49-long-transcript "$T49_CWD" fork 3000
+if grep -q 'cwd not extractable' <<<"$T1_TAIL"; then
+  fail "49: the extraction threw away a cwd that is present in the transcript — $(grep -m1 'cwd not extractable' <<<"$T1_TAIL")"
+fi
+sc_forked "$T1_ARGV" \
+  || fail "49: no fork for a candidate whose only unusual property is a long transcript (log: $T1_TAIL)"
+info "49: a 3000-record transcript still yields its cwd — no SIGPIPE-driven skip"
 
 # ============================================================================
 # FINAL GUARD: prove the whole suite left the live repo alone.
