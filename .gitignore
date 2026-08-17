@@ -199,3 +199,7 @@ sync.log
 
 # runtime log, rewritten each run (repo-autosync, 2026-08-16)
 logs/review-agent.log
+
+# experiment run output (transcripts, final outputs, state) (repo-autosync, 2026-08-17)
+experiments/*/runs/
+experiments/*/runs-pilot-discarded/
