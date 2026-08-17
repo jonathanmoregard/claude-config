@@ -1,6 +1,6 @@
 ---
 name: self-compact
-description: Use when the user wants to reset this session's context on demand and keep going — "/self-compact", "self compact", "hand this off", "context is getting full, start over", "carry on in a new session", "reset my context and keep going", "clear and resume". Writes a durable handoff for the CURRENT session, then clears it in place and re-seeds it from that handoff. Optional free text after the command steers what gets picked up first.
+description: Use when the user wants to reset this session's context on demand and keep going — "/self-compact", "self compact", "hand this off", "context is getting full, start over", "carry on in a new session", "reset my context and keep going", "clear and resume". The session writes its own handoff from the context it already holds, clears itself, and resumes from that handoff alone. Optional free text after the command steers what gets picked up first.
 ---
 
 # self-compact
@@ -8,71 +8,89 @@ description: Use when the user wants to reset this session's context on demand a
 Reset this session's context on demand, without losing the thread and without
 you pasting anything.
 
-## How it works, and the one thing it cannot do
+## How it works
 
 An agent cannot clear **itself**: no tool emits slash commands, and hooks only
 inject text. But a session is a process in a terminal, and a terminal with remote
-control can be typed into from outside. So the reset is done *to* the session,
-by a small detached helper:
+control can be typed into. So the reset is done *to* the session by a small
+detached helper, in this order:
 
-1. the handoff is written for the current session,
-2. the helper waits for it to land,
-3. it sends `/clear` to this session's own window, then a pickup message
-   pointing at the handoff.
+1. the session is asked to write its handoff — **from the context it is already
+   holding**, so nothing re-reads anything;
+2. the helper waits for that file to appear and be newer than the request;
+3. `/clear`;
+4. the clear is **confirmed** before anything else happens;
+5. a pickup message naming only the handoff.
 
 Same process, same pane, same permissions — fresh context.
 
-This needs a terminal that can be driven (kitty with `allow_remote_control`).
-**If it can't be, nothing is cleared.** The handoff is still written, and the
-existing fork path picks it up once the session exits. Say which of the two
-happened; do not imply a reset that did not occur.
+Step 1 is why there is no second model call and no context-window ceiling. An
+earlier design had a separate worker resume the whole session into a small model
+to summarise it, which cannot work: the trigger fires at a size larger than that
+model's entire window.
+
+Step 4 matters more than it looks. `kitten` returning success proves bytes were
+delivered, not that the TUI acted. If the prompt already holds typed text,
+`/clear` is appended to it and submitted as an ordinary prompt — no clear
+happens. Measured. So the helper confirms a new session actually began before it
+sends the pickup or consumes the request; if it did not, it stops and keeps
+everything.
+
+If the terminal cannot be driven, **nothing is cleared**. The request is left for
+the existing fork path, which picks it up once the session exits. Say which of
+the two happened; do not imply a reset that did not occur.
 
 ## Steps
 
 1. **Fire it.** Everything after the command name is the operator's
-   instructions — pass it through verbatim, quoted, or omit the argument if they
-   gave none.
+   instructions — pass it through verbatim, quoted, or omit it entirely.
 
    ```bash
    python3 ~/.claude/self-compact-trigger.py --manual "<the user's text>"
    ```
 
-   It prints the session id, the measured context fill, the marker path, the
-   mission result, and an `in-place:` line. A non-zero exit is a real failure —
-   report it and stop.
+   It prints the session id, the measured context fill, the marker path and an
+   `in-place:` line. A non-zero exit is a real failure — report it and stop.
 
-2. **Read the `in-place:` line and tell the user which future they are in.**
+2. **Read the `in-place:` line and say which future they are in.**
 
-   - `queued(...)` — this session will clear itself in a few seconds and come
-     back working from the handoff. Tell them not to type until it does; input
-     sent meanwhile lands in the prompt buffer and collides with the pickup
-     message.
-   - anything else — no reset is coming. The reason is in
-     `$REFLECT_ROOT/idle-handoff-logs/inplace-reset.log`. Common ones:
-     `KITTY_LISTEN_ON is unset` (terminal has no remote control),
-     `no kitty window has pid N` / `matched N windows` (the session's window
-     could not be uniquely identified, so it refuses rather than typing into
-     someone else's), or the handoff never appeared.
+   - `queued(...)` — this session will write its handoff, clear, and come back
+     working. Tell them not to type until it does: text in the prompt is exactly
+     what stops a clear from landing.
+   - anything else — no reset is coming, and the reason is in
+     `~/.claude/self-compact/inplace-reset.log`. Common ones: `KITTY_LISTEN_ON`
+     unset (no remote control), `no kitty window has pid N` or `matched N
+     windows` (the window could not be uniquely identified, so it refuses rather
+     than typing into someone else's session), a cwd inside the control plane, or
+     another reset already running for this session.
 
-3. **Do not do anything else.** Do not start new work, do not run a tick, do not
-   "prepare" for the reset. The next thing that should happen in this session is
-   the clear.
+3. **Do nothing else.** Do not start work, do not run a tick, do not "prepare".
+   The next thing that should happen here is the write, then the clear.
 
 ## Notes
 
-- **The threshold does not apply here.** The automatic path fires at 30% and
-  re-measures that claim before acting. A manual request asserts nothing about
-  occupancy, so it is honoured at any fill.
+- **The threshold does not apply to a manual request.** The automatic path fires
+  at 30% and re-measures that claim before acting. A person asking to hand off
+  asserts nothing about occupancy, so it is honoured at any fill.
 - **It refuses rather than guesses.** The window is matched on the session's own
-  pid, resolved by walking process ancestry. Zero matches or more than one means
-  no reset — typing into the wrong window would inject text into a different live
-  session.
-- **It will not clear a session with nothing to resume from.** The handoff must
-  exist on disk first; otherwise the context would be destroyed for nothing.
-- **A cleared session keeps your full ambient authority** — unlike the fork path,
-  which is deliberately restricted to a fixed toolset with no shell. The pickup
-  message therefore carries the same untrusted-data framing: the handoff was
-  written by a summariser from a transcript, so its `## Next` items are
-  suggestions requiring judgement, not directives.
-- **Operator instructions are not a permission escalation.** They steer which
-  items matter and in what order. Every refusal rule still applies.
+  pid via process ancestry, and re-verified immediately before every send —
+  between resolving and sending, a session can exit and leave a shell owning that
+  window, where the text would be executed as commands.
+- **It will not clear a session with nothing to resume from.** A fresh handoff
+  must exist first; a stale one from an earlier crossing does not count.
+- **Provenance changed, and it matters.** The handoff is now written by the
+  session itself, in its own voice — so anything injected into the context comes
+  back out looking like the agent's own notes rather than quoted material. The
+  instruction that asks for the handoff says to record what is true rather than
+  to relay what it was told, and the pickup still treats the file as untrusted
+  data whose `## Next` items require judgement.
+- **A cleared session keeps your full ambient authority**, unlike the fork path,
+  which is restricted to file tools with no shell.
+
+## Testing
+
+`tests/smoke.sh` stubs `kitten`, so it covers the refusal paths only. The
+mechanism — paste arriving as one prompt, the session being able to write the
+file, the clear landing, the resume working from the handoff alone — is covered
+by `tests/live-kitty.sh`, which drives a real kitty on a private virtual display
+against a real session. Run it with `REFLECT_LIVE_TEST=1`; it bills.

@@ -2544,15 +2544,21 @@ STUB
   chmod +x "$STUB_SCRATCH/claude"
 }
 
-sc_wait_mission() {
-  # $1=cwd $2=sid — poll for the AUTHORITATIVE out-of-repo handoff, its cwd
-  # sidecar, the human copy, and a terminal manifest.
-  local cwd="$1" sid="$2" mf="$REFLECT_ROOT/sessions/$2/manifest.json" i
+sc_wait_marker() {
+  # $1=sid — poll for what the trigger ACTUALLY produces now: a request marker
+  # and the fire state, both in that session's own directory.
+  #
+  # This replaced sc_wait_mission, which waited on a handoff, a cwd sidecar, a
+  # human copy and a session-reflect manifest. The trigger produced none of
+  # those any more: it used to hand the handoff write to session-reflect's
+  # `mission` mode, which resumes the whole session into haiku and therefore
+  # could not work at the size self-compact fires at. The live session writes
+  # its own handoff now, over its terminal, which is not a thing a hermetic
+  # suite can observe — tests/live-kitty.sh owns that, against real kitty.
+  local sid="$1" i
   for (( i = 0; i < 120; i++ )); do
-    [[ -f "$CLAUDE_SESSIONS_DIR/$sid/handoff/mission.md" ]] && \
-      [[ -f "$CLAUDE_SESSIONS_DIR/$sid/cwd" ]] && \
-      [[ -f "$cwd/tasks/mission.$sid.md" ]] && \
-      jq -e '.modes.mission.status == "complete"' "$mf" >/dev/null 2>&1 && return 0
+    [[ -f "$CLAUDE_SESSIONS_DIR/$sid/request.json" ]] && \
+      [[ -f "$CLAUDE_SESSIONS_DIR/$sid/state.json" ]] && return 0
     sleep 0.25
   done
   return 1
@@ -2739,13 +2745,15 @@ b2_ms=$(( (t1 - t0) / 1000000 ))
   || fail "22: trigger wrote to stdout ('$B2_OUT'); a Stop hook emitting a decision would race ralph-loop"
 (( b2_ms < 20000 )) || fail "22: trigger held the Stop hook for ${b2_ms}ms (60s cap is hard)"
 
-sc_wait_mission "$B2_CWD" "$B2_SID" \
-  || fail "22: no mission handoff at $B2_CWD/tasks/mission.$B2_SID.md (dir: $(ls "$B2_CWD/tasks" 2>&1))"
-B2_MISSION="$B2_CWD/tasks/mission.$B2_SID.md"
-for section in '## Done' '## Next' '## Blocked' '## Open questions'; do
-  grep -qF "$section" "$B2_MISSION" || fail "22: handoff missing '$section' — not resumable without transcript"
-done
-[[ -L "$B2_CWD/tasks/mission.md" ]] || fail "22: discovery pointer tasks/mission.md not installed"
+sc_wait_marker "$B2_SID" || fail "22: the trigger produced no request marker or state"
+# The trigger MUST NOT write into the project. It used to spawn a writer that
+# left a human copy and a pointer in <cwd>/tasks/; nothing does that now, and a
+# hook that silently drops files into a repo is exactly what B3 forbade.
+[[ ! -e "$B2_CWD/tasks/mission.$B2_SID.md" ]] \
+  || fail "22: the trigger wrote into the project tree ($B2_CWD/tasks)"
+# The handoff itself is written by the live session over its terminal, so it is
+# asserted in tests/live-kitty.sh against a real one. Section structure is not
+# checkable here without inventing a file and then checking our own invention.
 
 B2_REQ="$SC_STATE_DIR/$B2_SID/request.json"
 [[ -f "$B2_REQ" ]] || fail "22: no persisted self-compact request marker at $B2_REQ"
@@ -2755,7 +2763,7 @@ jq -e --arg c "$B2_CWD" '.cwd == $c and .window == 1000000 and .tokens == 310000
 jq -e '.fires == 1 and .armed == false' "$SC_STATE_DIR/$B2_SID/state.json" >/dev/null \
   || fail "22: state after one fire wrong: $(cat "$SC_STATE_DIR/$B2_SID/state.json")"
 assert_repo_tasks_untouched "after TEST 22 (self-compact fire)"
-info "fired at 31% in ${b2_ms}ms, silent stdout, 4-section handoff + pointer written"
+info "fired at 31% in ${b2_ms}ms, silent stdout, marker + state written, project untouched"
 
 # Subprocess / non-cli entrypoints must never fire (fork-chain break).
 B2_SUB_SID="test-sid-b2-subprocess"
@@ -2789,12 +2797,12 @@ counting_stub "$B6_CALLS" "$SC_MISSION_FILE"
 B6_SID="test-sid-b6-loop"
 B6_TP="$B6_H/t.jsonl"
 
-sc_calls() { [[ -f "$B6_CALLS" ]] && wc -l < "$B6_CALLS" | tr -d ' ' || echo 0; }
+sc_fires() { jq -r '.fires // 0' "$CLAUDE_SESSIONS_DIR/$B6_SID/state.json" 2>/dev/null || echo 0; }
 
 mk_context_transcript "$B6_TP" "claude-opus-5" 320000 "$B6_CWD"
 sc_fire "$B6_H" "$B6_SID" "$B6_CWD" "$B6_TP" >/dev/null || fail "23: first fire rc!=0"
-sc_wait_mission "$B6_CWD" "$B6_SID" || fail "23: first fire wrote no handoff"
-(( $(sc_calls) == 1 )) || fail "23: first crossing made $(sc_calls) model calls, expected 1"
+sc_wait_marker "$B6_SID" || fail "23: first fire produced no marker"
+(( $(sc_fires) == 1 )) || fail "23: first crossing recorded $(sc_fires) fires, expected 1"
 
 # Same crossing, three more Stop events: must be silent.
 for _ in 1 2 3; do
@@ -2802,8 +2810,8 @@ for _ in 1 2 3; do
   sc_fire "$B6_H" "$B6_SID" "$B6_CWD" "$B6_TP" >/dev/null || fail "23: repeat fire rc!=0"
 done
 sleep 1.5
-(( $(sc_calls) == 1 )) \
-  || fail "23: LOOP — $(sc_calls) model calls for one threshold crossing"
+(( $(sc_fires) == 1 )) \
+  || fail "23: LOOP — $(sc_fires) fires for one threshold crossing"
 jq -e '.fires == 1 and .crossings == 1' "$SC_STATE_DIR/$B6_SID/state.json" >/dev/null \
   || fail "23: state drifted on repeat Stops: $(cat "$SC_STATE_DIR/$B6_SID/state.json")"
 
@@ -2812,7 +2820,7 @@ mk_context_transcript "$B6_TP" "claude-opus-5" 90000 "$B6_CWD"
 sc_fire "$B6_H" "$B6_SID" "$B6_CWD" "$B6_TP" >/dev/null || fail "23: re-arm fire rc!=0"
 jq -e '.armed == true and .fires == 1' "$SC_STATE_DIR/$B6_SID/state.json" >/dev/null \
   || fail "23: a below-threshold reading must re-arm: $(cat "$SC_STATE_DIR/$B6_SID/state.json")"
-(( $(sc_calls) == 1 )) || fail "23: re-arming spent a model call"
+(( $(sc_fires) == 1 )) || fail "23: re-arming spent a fire"
 
 # Crossings 2..CAP each fire; the one after that is refused. The cap is read from
 # the SOURCE, not chosen by the test: it used to be settable per-test through
@@ -2824,8 +2832,8 @@ B6_CAP="$(grep -oP '^MAX_FIRES_PER_SESSION = \K[0-9]+' "$SC_TRIGGER")"
 for (( b6_n = 2; b6_n <= B6_CAP; b6_n++ )); do
   mk_context_transcript "$B6_TP" "claude-opus-5" 350000 "$B6_CWD"
   sc_fire "$B6_H" "$B6_SID" "$B6_CWD" "$B6_TP" >/dev/null || fail "23: crossing $b6_n rc!=0"
-  for _ in $(seq 1 40); do (( $(sc_calls) >= b6_n )) && break; sleep 0.25; done
-  (( $(sc_calls) == b6_n )) || fail "23: crossing $b6_n did not fire exactly once (calls=$(sc_calls))"
+  for _ in $(seq 1 40); do (( $(sc_fires) >= b6_n )) && break; sleep 0.25; done
+  (( $(sc_fires) == b6_n )) || fail "23: crossing $b6_n did not fire exactly once (fires=$(sc_fires))"
   # Drop below the threshold to re-arm for the next crossing.
   mk_context_transcript "$B6_TP" "claude-opus-5" 90000 "$B6_CWD"
   sc_fire "$B6_H" "$B6_SID" "$B6_CWD" "$B6_TP" >/dev/null || fail "23: re-arm $b6_n rc!=0"
@@ -2833,30 +2841,32 @@ done
 mk_context_transcript "$B6_TP" "claude-opus-5" 360000 "$B6_CWD"
 sc_fire "$B6_H" "$B6_SID" "$B6_CWD" "$B6_TP" >/dev/null || fail "23: capped fire rc!=0"
 sleep 1.5
-(( $(sc_calls) == B6_CAP )) \
-  || fail "23: per-session cap ($B6_CAP) breached — calls=$(sc_calls)"
+(( $(sc_fires) == B6_CAP )) \
+  || fail "23: per-session cap ($B6_CAP) breached — fires=$(sc_fires)"
 jq -e --argjson c "$B6_CAP" '.capped == true and .fires == $c' \
   "$SC_STATE_DIR/$B6_SID/state.json" >/dev/null \
   || fail "23: cap not recorded: $(cat "$SC_STATE_DIR/$B6_SID/state.json")"
 
 # An unwritable state dir must fail OFF: no marker = no bound = no fire.
 B6_RO_H="$(sc_home)"
-B6_RO_ROOT="$(mktemp -d -t reflect-b6ro-XXXXXX)"
-mkdir -p "$B6_RO_ROOT/self-compact-state"
-chmod 500 "$B6_RO_ROOT/self-compact-state"
-B6_RO_CALLS="$B6_RO_H/calls"
-counting_stub "$B6_RO_CALLS" "$SC_MISSION_FILE"
+B6_RO_SESSIONS="$(mktemp -d -t reflect-b6ro-XXXXXX)"
+chmod 500 "$B6_RO_SESSIONS"
 jq -cn --arg sid "test-sid-b6-ro" --arg tp "$B6_TP" --arg cwd "$B6_CWD" \
   '{session_id:$sid,transcript_path:$tp,hook_event_name:"Stop",cwd:$cwd}' \
-  | HOME="$B6_RO_H" CLAUDE_CODE_ENTRYPOINT=cli REFLECT_ROOT="$B6_RO_ROOT" \
+  | HOME="$B6_RO_H" CLAUDE_CODE_ENTRYPOINT=cli REFLECT_ROOT="$REFLECT_ROOT" \
+    CLAUDE_SESSIONS_DIR="$B6_RO_SESSIONS" \
     python3 "$B6_RO_H/.claude/self-compact-trigger.py" >/dev/null
 rc=$?
 (( rc == 0 )) || fail "23: unwritable state dir must not fail the hook (rc=$rc)"
 sleep 0.5
-[[ ! -s "$B6_RO_CALLS" ]] \
-  || fail "23: fired without being able to persist the loop bound"
-chmod 700 "$B6_RO_ROOT/self-compact-state"
-info "1 call per crossing, re-arm below threshold, cap at $B6_CAP (the constant), fails off without a marker"
+# No state means no bound, and the trigger persists the bound BEFORE it acts. So
+# the observable is that nothing was recorded and nothing was requested.
+[[ ! -e "$B6_RO_SESSIONS/test-sid-b6-ro/state.json" ]] \
+  || fail "23: state was written into a directory that should have refused it"
+[[ ! -e "$B6_RO_SESSIONS/test-sid-b6-ro/request.json" ]] \
+  || fail "23: requested a reset without being able to persist the loop bound"
+chmod 700 "$B6_RO_SESSIONS"
+info "1 fire per crossing, re-arm below threshold, cap at $B6_CAP (the constant), fails off when the bound cannot be persisted"
 
 # ============================================================================
 # TEST 24: B7+B4 — idle-handoff resumes on context, and starts WORKING
@@ -2909,7 +2919,11 @@ ln -sfn "mission.$B7_CTRL_SID.md" "$B7_CTRL_CWD/tasks/mission.md"
 # Fire the real Stop hook so the request marker AND the handoff are genuine.
 counting_stub "$B7_H/calls" "$SC_MISSION_FILE"
 sc_fire "$B7_H" "$B7_SID" "$B7_CWD" "$B7_TP" >/dev/null || fail "24: Stop-hook fire rc!=0"
-sc_wait_mission "$B7_CWD" "$B7_SID" || fail "24: Stop hook produced no handoff to resume from"
+sc_wait_marker "$B7_SID" || fail "24: Stop hook produced no request marker"
+# The fork resumes FROM a handoff. The live session writes its own over the
+# terminal, which a hermetic suite cannot do, so mint one here: this test is
+# about the fork, not about who authored the file.
+mk_mission_handoff "$B7_SID" "$B7_CWD" "$(cat "$SC_MISSION_FILE")" >/dev/null
 [[ -f "$SC_STATE_DIR/$B7_SID/request.json" ]] || fail "24: no request marker to widen the gate with"
 
 # Both sessions are only ~2 min idle — far under the 45-min idle floor.
@@ -3150,7 +3164,8 @@ mk_context_transcript "$B7L_TP" "claude-opus-5" 330000 "$B7L_CWD" 25
 
 counting_stub "$B7L_H/calls" "$SC_MISSION_FILE"
 sc_fire "$B7L_H" "$B7L_SID" "$B7L_CWD" "$B7L_TP" >/dev/null || fail "24b: Stop-hook fire rc!=0"
-sc_wait_mission "$B7L_CWD" "$B7L_SID" || fail "24b: Stop hook produced no handoff to resume from"
+sc_wait_marker "$B7L_SID" || fail "24b: Stop hook produced no request marker"
+mk_mission_handoff "$B7L_SID" "$B7L_CWD" "$(cat "$SC_MISSION_FILE")" >/dev/null
 touch -d '2 minutes ago' "$B7L_TP"
 
 cat >"$STUB_SCRATCH/claude" <<STUB
@@ -3270,7 +3285,8 @@ jq -e '.manual == true' "$MAN_MARKER" >/dev/null \
 awk -v f="$(jq -r '.fill_pct' "$MAN_MARKER")" 'BEGIN{exit !(f+0 < 0.30)}' \
   || fail "24c: fixture is not below the threshold, so it cannot show the gate is bypassed"
 
-sc_wait_mission "$MAN_CWD" "$MAN_SID" || fail "24c: --manual produced no handoff to resume from"
+sc_wait_marker "$MAN_SID" || fail "24c: --manual produced no request marker"
+mk_mission_handoff "$MAN_SID" "$MAN_CWD" "$(cat "$SC_MISSION_FILE")" >/dev/null
 touch -d '2 minutes ago' "$MAN_TP"
 
 cat >"$STUB_SCRATCH/claude" <<STUB
@@ -3334,7 +3350,7 @@ sc_forked() { grep -qF 'acceptEdits' "$1" 2>/dev/null; }
 # a case can set up an exact on-disk mission layout without a Stop-hook fire.
 sc_plant_request() {
   # $1=sid $2=cwd $3=transcript
-  mkdir -p "$SC_STATE_DIR"
+  mkdir -p "$SC_STATE_DIR/$1"
   jq -n --arg sid "$1" --arg cwd "$2" --arg tp "$3" --argjson now "$(date +%s)" \
     '{session_id:$sid,cwd:$cwd,transcript_path:$tp,tokens:330000,window:1000000,
       fill_pct:0.33,threshold:0.30,requested_at_epoch:$now}' \
@@ -3734,7 +3750,7 @@ counting_stub "$F2_H/calls" "$SC_MISSION_FILE"
 mk_context_transcript "$F2_H/fable.jsonl" "claude-fable-5" 310000 "$F2_CWD"
 sc_fire "$F2_H" "test-sid-f2-fable" "$F2_CWD" "$F2_H/fable.jsonl" >/dev/null \
   || fail "27: fable-5 fire rc!=0"
-sc_wait_mission "$F2_CWD" "test-sid-f2-fable" || fail "27: a 1M fable session at 31% did not fire"
+sc_wait_marker "test-sid-f2-fable" || fail "27: a 1M fable session at 31% did not fire"
 
 mk_context_transcript "$F2_H/unknown.jsonl" "claude-zeta-9-20991231" 61000 "$F2_CWD"
 sc_fire "$F2_H" "test-sid-f2-unknown" "$F2_CWD" "$F2_H/unknown.jsonl" >/dev/null \
@@ -4337,7 +4353,19 @@ R1_CONTENTS="$(find "$R1_GRANT" -mindepth 1 -printf '%P\n' 2>/dev/null | sort | 
 #     run trusts, is OUTSIDE the grant — asserted twice over: absent from the
 #     grant, and present at a path that is not under the grant prefix.
 R1_SESSION_DIR="$CLAUDE_SESSIONS_DIR/$R1_SID"
-for r1_name in cwd manifest.json final.json checkpoints; do
+# The neighbours moved with the tree. manifest.json / final.json / checkpoints
+# are session-reflect's artifacts and no longer share a directory with the
+# handoff at all -- self-compact has its own root now, precisely so the two
+# subsystems stop looking like one. What sits beside the grant today, and must
+# stay outside it, is the cwd sidecar (resolution reads it, so a fork that could
+# rewrite it could retarget the next resume) plus this session's request and
+# fire state (the bound on how often a reset may happen).
+# The request marker is a decision input too, so plant a real one rather than
+# asserting on a file this fixture never creates. (state.json is written by the
+# trigger, which this fixture does not run, so it is not asserted here -- TEST 22
+# and 23 cover it.)
+sc_plant_request "$R1_SID" "$R1_CWD" "$TRANSCRIPT"
+for r1_name in cwd request.json; do
   [[ ! -e "$R1_GRANT/$r1_name" ]] \
     || fail "36b: $r1_name is INSIDE the fork's write grant ($R1_GRANT) — an acceptEdits fork could rewrite it"
   [[ -e "$R1_SESSION_DIR/$r1_name" ]] \
