@@ -497,17 +497,19 @@ from producing `final.json`.
 | `scripts/idle-handoff.sh` | synchronous | it reads `modes.mission.status` immediately after |
 | `~/.claude/self-compact-trigger.py` (`Stop` hook) | `REFLECT_ASYNC=1 REFLECT_FORCE=1` | same hook-cap reason, and a threshold crossing must produce a handoff describing the state *at* the crossing — an earlier `complete` mission for the session would otherwise leave the resume working from something stale |
 
-The self-compact trigger fires once per session per crossing of **30% of the
-detected context window**. It only writes the handoff and records a request;
+The self-compact trigger fires once per session per crossing of **300,000
+tokens** — an absolute count, not a fraction of a detected window. It only
+writes the handoff and records a request;
 `scripts/idle-handoff.sh` performs the reset+resume under its own guard chain.
 Nothing here auto-invokes `/compact` or `/clear` — neither is agent-triggerable,
 and "reset" means the *next* process is a fresh one seeded from the handoff.
 
 **There is no switch.** USER DECISION 2026-08-16: `components.self_compact` (which
 shipped `false`) and the `SELF_COMPACT_CONFIG` path override are both deleted, with
-no replacement key, env var or opt-in. The threshold (0.30) and the per-session
-fire cap (3) are hardcoded constants — `THRESHOLD` and `MAX_FIRES_PER_SESSION` in
-`self-compact-trigger.py`, and the same 0.30 in `scripts/idle-handoff.sh`. They are
+no replacement key, env var or opt-in. The fire point (300,000 tokens) and the
+per-session fire cap (40) are hardcoded constants — `FIRE_AT_TOKENS` and
+`MAX_FIRES_PER_SESSION` in `self-compact-trigger.py`, and the same 300000 as
+`SELF_COMPACT_FIRE_AT_TOKENS` in `scripts/idle-handoff.sh`. They are
 values, not settings; changing one is a code change with a test run behind it. A
 flag shipping `false` protected nothing, and it left the feature untested in the
 only configuration that matters.
@@ -517,7 +519,7 @@ only configuration that matters.
 | bound | value | where |
 |---|---|---|
 | once per threshold crossing, per session | re-arms below the threshold | `self-compact-trigger.py` state file |
-| fires per session | 3 | `MAX_FIRES_PER_SESSION` |
+| fires per session | 40 — a loop bound, not a ration | `MAX_FIRES_PER_SESSION` |
 | forks per idle-handoff run | 3 | `IDLE_HANDOFF_AUTOFORK_MAX_PER_RUN` |
 | forks per cwd per 24h | 5 | `IDLE_HANDOFF_AUTOFORK_MAX_PER_CWD_24H` |
 | world moved since the transcript | DENY, incl. non-git | `is_stale_since_transcript` |
