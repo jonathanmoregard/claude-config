@@ -35,6 +35,8 @@
   button:disabled { opacity: .4; cursor: default; border-color: var(--line); }
   button.on { border-color: var(--pin); color: var(--pin); }
   .hint { color: var(--muted); font-size: 12px; }
+  #srclinks a { color: var(--accent); text-decoration: none; }
+  #srclinks a:hover { text-decoration: underline; }
 
   /* Stage — scrollable so zoomed images can be panned */
   .stage {
@@ -125,6 +127,7 @@
     <span id="count" class="count"></span>
     <button id="pinmode" class="on" title="Toggle element-pin mode (a)">📌 Pin: on</button>
     <span id="pincount" class="count"></span>
+    <span id="srclinks" class="hint"></span>
     <span class="spacer"></span>
     <div class="zoom">
       <button id="zfit" title="Fit whole image">Fit</button>
@@ -143,7 +146,12 @@
       Element-pin mode: hover highlights the element under the cursor (when a
       <code>.dom.json</code> sits next to the image); click it, type your note,
       <kbd>Enter</kbd>. Notes land in the transcript below AND in
-      <code>annotations.json</code> for the agent — element-exact.
+      <code>annotations.json</code> for the agent — element-exact.<br /><br />
+      When <code>.source.html</code> / <code>.source.css</code> /
+      <code>.source.js</code> sidecars sit next to an image, per-page
+      <strong>source</strong> links appear in the top bar — the generated markup,
+      applied CSS and shipped JS for that exact page, so the agent can map your
+      feedback onto real structure.
     </div>
     <div class="canvas" id="canvas" hidden>
       <img id="img" alt="" />
@@ -173,7 +181,7 @@
   const pinrect = $('pinrect');
   const nameEl = $('name'), countEl = $('count'), notes = $('notes'), savedEl = $('saved');
   const prevBtn = $('prev'), nextBtn = $('next'), zlabel = $('zlabel');
-  const pinBtn = $('pinmode'), pincountEl = $('pincount');
+  const pinBtn = $('pinmode'), pincountEl = $('pincount'), srcEl = $('srclinks');
 
   let files = [];          // [{ path, url, base }]
   let idx = -1;
@@ -254,6 +262,34 @@
     } catch { /* no dom sidecar — pixel pins still work */ }
   }
 
+  // Generated-source sidecars (<base>.source.html/.css/.js from visual-verify).
+  // Surfaced as links, not inlined: the agent reads the files, the reviewer just
+  // needs to see they exist and be able to peek at the markup behind a surface.
+  const SOURCE_KINDS = [['html', '.source.html'], ['css', '.source.css'], ['js', '.source.js']];
+  async function loadSource(f) {
+    srcEl.textContent = '';
+    if (!baseUrl) return;
+    const found = [];
+    await Promise.all(SOURCE_KINDS.map(async ([label, ext], i) => {
+      const url = baseUrl + '/' + f.base + ext;
+      try {
+        const res = await fetch(url, { method: 'HEAD', cache: 'no-store' });
+        if (res.ok) found.push([i, label, url]);
+      } catch { /* sidecar absent — links just don't show */ }
+    }));
+    if (!found.length) return;
+    found.sort((a, b) => a[0] - b[0]);
+    const frag = document.createDocumentFragment();
+    frag.append('source: ');
+    found.forEach(([, label, url], n) => {
+      if (n) frag.append(' · ');
+      const a = document.createElement('a');
+      a.href = url; a.target = '_blank'; a.rel = 'noopener'; a.textContent = label;
+      frag.append(a);
+    });
+    srcEl.append(frag);
+  }
+
   function go(n) {
     if (!files.length) return;
     closeForm();
@@ -268,6 +304,7 @@
     ensureHeading(f.path);
     focusSection(f.path);
     loadDom(f).then(renderPins);
+    loadSource(f);
   }
 
   // ---- zoom ----

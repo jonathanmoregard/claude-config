@@ -35,8 +35,12 @@ ROOT="$(mktemp -d)"
 ln -s "$TOOL" "$ROOT/index.html"
 ln -s "$MANIFEST" "$ROOT/playgrounds.json"
 
+OUTDIR="$(dirname "$MANIFEST")"
+
 ( cd "$ROOT" && exec python3 -c '
-import http.server, sys
+import http.server, json, os, re, sys
+outdir = sys.argv[2]
+
 class H(http.server.SimpleHTTPRequestHandler):
     def end_headers(self):
         # Force fresh every load — tool HTML + manifest served without
@@ -46,8 +50,44 @@ class H(http.server.SimpleHTTPRequestHandler):
         self.send_header("Pragma", "no-cache")
         self.send_header("Expires", "0")
         super().end_headers()
+
+    def do_POST(self):
+        # Source snapshot write-back: the tool reads the live iframe (same
+        # origin) and posts {name, html, css, js}; we drop the three files
+        # next to playgrounds.json so a review agent can map per-playground
+        # feedback onto real markup.
+        if self.path.rstrip("/") != "/pgr-source":
+            self.send_error(404); return
+        n = int(self.headers.get("Content-Length") or 0)
+        if n <= 0 or n > 20_000_000:
+            self.send_error(413); return
+        try:
+            data = json.loads(self.rfile.read(n))
+        except ValueError:
+            self.send_error(400); return
+        name = re.sub(r"[^\w.-]", "_", str(data.get("name") or "")).strip("._-")
+        if not name:
+            self.send_error(400); return
+        written = []
+        for ext, key in ((".source.html", "html"), (".source.css", "css"), (".source.js", "js")):
+            body = data.get(key)
+            if body is None:
+                continue
+            path = os.path.join(outdir, name + ext)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8", errors="replace") as f:
+                f.write(body)
+            os.replace(tmp, path)
+            written.append(os.path.basename(path))
+        payload = json.dumps({"written": written, "dir": outdir}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
 http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
-' "$PORT" ) >"$STATE/log" 2>&1 &
+' "$PORT" "$OUTDIR" ) >"$STATE/log" 2>&1 &
 SRV=$!
 echo "$SRV" >"$STATE/pid"; echo "$ROOT" >"$STATE/root"
 sleep 1

@@ -7,6 +7,11 @@
 # readiness selectors (not networkidle). Batch mode builds an index.html contact
 # sheet. Exits non-zero on HTTP errors / unresolved auth walls so callers see it.
 #
+# Per shot it also emits sidecars: <shot>.aria.yaml (a11y tree),
+# <shot>.dom.json (box model, drives element pinning in screenshot-review), and
+# <shot>.source.{html,css,js} (generated source — post-render DOM, applied CSS,
+# shipped JS — so review feedback maps onto real markup).
+#
 # Requires: playwright installed (pip / uv / nix devshell).
 # PEP-723 inline deps — run with `uv run` for zero-install:
 #
@@ -217,6 +222,111 @@ _DOM_DUMP_JS = r"""
 """
 
 
+# Script that runs in-page to snapshot the GENERATED source of the surface:
+# post-render serialized DOM, the CSS that actually applied, and the JS that
+# actually shipped. Review feedback ("this button is too tight") is then
+# mappable to real markup by the agent without guessing which template made it.
+# Same-origin dev servers let us read cssRules / fetch script bodies directly.
+_SOURCE_DUMP_JS = r"""
+async (sel) => {
+  const out = { url: location.href, title: document.title, css: [], js: [] };
+
+  // ---- HTML: post-render DOM, not the served template ----
+  if (sel) {
+    const el = document.querySelector(sel);
+    if (!el) return { error: 'no root for selector', selector: sel };
+    out.html = el.outerHTML;
+    out.scoped = sel;
+  } else {
+    out.html = '<!doctype html>\n' + document.documentElement.outerHTML;
+    out.scoped = null;
+  }
+
+  // ---- CSS: every sheet the document actually has, rules as parsed ----
+  for (const sheet of Array.from(document.styleSheets)) {
+    const href = sheet.href || null;
+    let text = null, error = null;
+    try {
+      text = Array.from(sheet.cssRules).map((r) => r.cssText).join('\n');
+    } catch (e) {
+      // Cross-origin sheet — cssRules throws SecurityError. Try the network.
+      error = String((e && e.message) || e);
+    }
+    if (text === null && href) {
+      try {
+        const r = await fetch(href);
+        if (r.ok) { text = await r.text(); error = null; } else { error = 'HTTP ' + r.status; }
+      } catch (e) { error = String((e && e.message) || e); }
+    }
+    out.css.push({ href, inline: !href, media: sheet.media ? sheet.media.mediaText : '', text, error });
+  }
+
+  // ---- JS: inline bodies verbatim, external bodies fetched ----
+  for (const s of Array.from(document.querySelectorAll('script'))) {
+    const src = s.getAttribute('src');
+    const type = s.getAttribute('type') || null;
+    if (!src) { out.js.push({ src: null, inline: true, type, text: s.textContent, error: null }); continue; }
+    let text = null, error = null, abs = src;
+    try {
+      abs = new URL(src, location.href).href;
+      const r = await fetch(abs);
+      if (r.ok) text = await r.text(); else error = 'HTTP ' + r.status;
+    } catch (e) { error = String((e && e.message) || e); }
+    out.js.push({ src: abs, inline: false, type, text, error });
+  }
+  return out;
+}
+"""
+
+
+def _write_source_snapshot(out_path: pathlib.Path, src: dict, url: str, width: int) -> dict:
+    """Write <base>.source.{html,css,js}. Returns the artifact-name mapping.
+
+    Three plain files rather than one bundle: each stays grep-clean for an agent
+    mapping review feedback onto real markup, with no escaping layer in the way.
+    """
+    written = {}
+    banner_html = (
+        f"<!-- visual-verify source snapshot · {url} · {width}w"
+        f"{' · scoped to ' + src['scoped'] if src.get('scoped') else ''}"
+        " · post-render DOM (what the browser had, not the served template) -->\n"
+    )
+    html_path = out_path.with_suffix(".source.html")
+    html_path.write_text(banner_html + (src.get("html") or ""), encoding="utf-8", errors="replace")
+    written["source_html"] = html_path.name
+
+    def _blocks(entries, comment_open, comment_close, label_key, empty_label):
+        parts = []
+        for e in entries or []:
+            label = e.get(label_key) or empty_label
+            extra = f" · media: {e['media']}" if e.get("media") else ""
+            if e.get("type"):
+                extra += f" · type={e['type']}"
+            head = f"{comment_open} ===== {label}{extra} ====={comment_close}"
+            if e.get("text"):
+                parts.append(f"{head}\n{e['text']}")
+            else:
+                parts.append(f"{comment_open} ===== {label} — NOT CAPTURED: {e.get('error')} ====={comment_close}")
+        return "\n\n".join(parts)
+
+    css_path = out_path.with_suffix(".source.css")
+    css_path.write_text(
+        f"/* visual-verify source snapshot · {url} · {width}w */\n\n"
+        + _blocks(src.get("css"), "/*", " */", "href", "<inline <style> block>"),
+        encoding="utf-8", errors="replace",
+    )
+    written["source_css"] = css_path.name
+
+    js_path = out_path.with_suffix(".source.js")
+    js_path.write_text(
+        f"// visual-verify source snapshot · {url} · {width}w\n\n"
+        + _blocks(src.get("js"), "//", "", "src", "<inline <script> block>"),
+        encoding="utf-8", errors="replace",
+    )
+    written["source_js"] = js_path.name
+    return written
+
+
 async def _capture_one(
     browser,
     url: str,
@@ -230,6 +340,7 @@ async def _capture_one(
     dev_auth_cookie: Optional[str],
     emit_aria: bool,
     emit_dom: bool,
+    emit_source: bool,
 ) -> tuple[int, dict]:
     """Return (HTTP status, artifact_paths). status 0 = ok, non-zero = http error / auth wall."""
     ctx = await browser.new_context(
@@ -240,7 +351,7 @@ async def _capture_one(
         return await _capture_body(
             ctx, url, selector, ready_selector, out_path,
             dev_auth_token, dev_auth_header_name, dev_auth_cookie,
-            emit_aria, emit_dom,
+            emit_aria, emit_dom, emit_source, width,
         )
     finally:
         # R3 fix ([both] HIGH): context MUST close even on exception, else
@@ -259,6 +370,8 @@ async def _capture_body(
     dev_auth_cookie: Optional[str],
     emit_aria: bool,
     emit_dom: bool,
+    emit_source: bool,
+    width: int,
 ) -> tuple[int, dict]:
     """Actual capture logic; caller owns ctx lifecycle."""
     if dev_auth_cookie:
@@ -386,6 +499,23 @@ async def _capture_body(
             sys.stderr.write(f"[visual-verify] dom dump failed: {e}\n")
             artifacts["dom_failed"] = str(e)
 
+    # Generated-source snapshot — post-render HTML + applied CSS + shipped JS,
+    # one file each next to the PNG. Lets a review agent map per-page feedback
+    # onto the actual markup instead of inferring which template produced it
+    # (dom.json carries geometry only, which is not enough to locate source).
+    if emit_source:
+        try:
+            src = await page.evaluate(_SOURCE_DUMP_JS, selector or None)
+            if not isinstance(src, dict) or "error" in src:
+                raise RuntimeError(
+                    f"source root not found: {src.get('error') if isinstance(src, dict) else src} "
+                    f"(selector={selector!r})"
+                )
+            artifacts.update(_write_source_snapshot(out_path, src, page.url, width))
+        except Exception as e:
+            sys.stderr.write(f"[visual-verify] source snapshot failed: {e}\n")
+            artifacts["source_failed"] = str(e)
+
     return status, artifacts
 
 
@@ -458,12 +588,17 @@ async def run(args):
                 dev_auth_cookie=dev_auth_cookie,
                 emit_aria=not args.no_aria,
                 emit_dom=not args.no_dom,
+                emit_source=not args.no_source,
             )
             shots.append({
                 "url": url, "width": width, "path": filename, "status": status,
                 "aria": artifacts.get("aria"), "dom": artifacts.get("dom"),
+                "source_html": artifacts.get("source_html"),
+                "source_css": artifacts.get("source_css"),
+                "source_js": artifacts.get("source_js"),
                 "aria_failed": artifacts.get("aria_failed"),
                 "dom_failed": artifacts.get("dom_failed"),
+                "source_failed": artifacts.get("source_failed"),
                 "ready_failed": artifacts.get("ready_failed"),
                 "shot_failed": artifacts.get("shot_failed"),
             })
@@ -473,6 +608,7 @@ async def run(args):
                 exit_code = 1
             if args.strict_artifacts and (
                 artifacts.get("aria_failed") or artifacts.get("dom_failed")
+                or artifacts.get("source_failed")
             ):
                 exit_code = 1
             if status and status >= 400:
@@ -495,6 +631,10 @@ async def run(args):
                 parts.append(f"[{k}]")
             elif s.get(f"{k}_failed"):
                 parts.append(f"[{k}!]")  # visible failure marker
+        if s.get("source_html"):
+            parts.append("[src]")
+        elif s.get("source_failed"):
+            parts.append("[src!]")
         extras = " ".join(parts)
         print(f"  {s['width']:>4}w  status={s['status']:>3}  {s['path']} {extras}".rstrip())
     return exit_code
@@ -515,6 +655,14 @@ def _write_index(out_dir: pathlib.Path, shots: list[dict]) -> None:
             parts.append(f'<a href="{s["dom"]}">dom.json</a>')
         elif s.get("dom_failed"):
             parts.append('<span style="color:#f77">dom!</span>')
+        if s.get("source_html"):
+            parts.append(
+                f'src: <a href="{s["source_html"]}">html</a>'
+                f' <a href="{s["source_css"]}">css</a>'
+                f' <a href="{s["source_js"]}">js</a>'
+            )
+        elif s.get("source_failed"):
+            parts.append('<span style="color:#f77">src!</span>')
         return " · ".join(parts)
     rows = "\n".join(
         f"""<div class="cell">
@@ -567,6 +715,10 @@ def main() -> int:
                     help="Skip ARIA snapshot (default: emit <shot>.aria.yaml)")
     ap.add_argument("--no-dom", action="store_true",
                     help="Skip DOM box-model dump (default: emit <shot>.dom.json)")
+    ap.add_argument("--no-source", action="store_true",
+                    help="Skip generated-source snapshot (default: emit "
+                         "<shot>.source.html/.source.css/.source.js — post-render DOM, "
+                         "applied CSS, shipped JS, for mapping review feedback to markup)")
     ap.add_argument("--strict-artifacts", action="store_true",
                     help="Also exit non-zero on aria/dom failures. "
                          "ready/shot failures ALWAYS exit non-zero regardless of this flag.")

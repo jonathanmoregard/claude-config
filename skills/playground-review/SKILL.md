@@ -43,6 +43,30 @@ The tool prefers this inline manifest over `fetch('/playgrounds.json')` when pre
 4. `←`/`→` (bare, when notes not focused) or click sidebar to switch playgrounds.
 5. Copy all / Download markdown at the end.
 
+## Per-playground source snapshot (html + css + js)
+
+Every playground the reviewer opens is snapshotted automatically ~400 ms after
+its iframe loads: post-render DOM, the CSS that applied, the JS that shipped.
+The `</> source` button in the toolbar re-captures the current one on demand
+(after you've interacted with it, to catch the mutated DOM).
+
+- **Standalone mode** — the three files are written next to `playgrounds.json`
+  as `<name>.source.html` / `.source.css` / `.source.js` (server `POST
+  /pgr-source`). The toolbar's saved-line confirms what landed.
+- **Same-origin embedded mode** — no write-back endpoint, so the button falls
+  back to browser downloads (three files into your download dir). Hosts that
+  want automatic write-back must expose their own `POST /pgr-source`.
+- **Cross-origin fallback** — `contentDocument` is null, so nothing can be
+  read. Capture with `visual-verify` against the same URLs instead; it emits
+  the identical `<shot>.source.*` trio.
+
+**Agent contract:** read `<name>.source.html` for the playground a note was
+written against, locate the element the note describes, then grep templates for
+that markup/class to reach the generating file. `.source.css` shows which rule
+actually produced the spacing/color complained about, cascade order included.
+Never propose a fix from the served template alone — these playgrounds mutate
+their own DOM.
+
 ## When to use
 
 - `/dev/components/<slug>` interactive live previews (kablong Ph-5)
