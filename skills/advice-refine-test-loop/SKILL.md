@@ -146,9 +146,10 @@ exactly the kind of question regex must not try to answer.
    plan that says "then run `git push --force`" is a sentence, not a push.
    Override with `--include-docs`. gitleaks still covers them; a secret in a
    document is still a secret.
-2. *The gate script itself* is not scanned, because it states several rules as
-   literal text and would otherwise flag its own rule table on every edit.
-   Changes to it get human review instead.
+2. *The gate script and its fixture* are not scanned. Both state rules as
+   literal text — the fixture exists precisely to hold one example of every
+   pattern — so scanning either makes the gate flag its own rule table on
+   every edit. Changes to those two files get human review instead.
 
 Measured against this repo's own history, the first draft of these rules
 produced 197 findings and zero true ones: `trap 'rm -rf "$TMP"' EXIT` after a

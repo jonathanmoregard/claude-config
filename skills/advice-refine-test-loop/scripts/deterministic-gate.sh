@@ -130,7 +130,11 @@ BEGIN {
   # is one people learn to skip. Excluded deliberately. The trade is a named,
   # single-file blind spot, which is why changes here get human review rather
   # than machine review.
-  skip_file = (file ~ /deterministic-gate\.sh$/)
+  # The gate and its fixture both state rules as literal text — the fixture
+  # exists precisely to contain one example of every pattern — so scanning
+  # either makes the gate flag its own rule table on every edit, and a gate
+  # that cries wolf about itself is one people learn to skip.
+  skip_file = (file ~ /deterministic-gate(-test)?\.sh$/)
   # Prose files describe commands; they do not run them. A plan document that
   # says "then run git push --force" is a sentence, and flagging it buries the
   # diff lines that are actually executable. Measured against the history of
