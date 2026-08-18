@@ -13,7 +13,7 @@ OUT=$(bash "$SCRIPT")
 # NO literal promise text (doctrine must never print the sigil — parroting footgun,
 # and the plugin's own systemMessage already shows it), NO staleness warning.
 #
-# `tasks/` here is the migrated shape: notes live in ~/.claude/tasks/<repo>/ and the
+# `tasks/` here is the migrated shape: notes live in ~/.local/state/claude-tasks/<repo>/ and the
 # project symlinks tasks/ at them, so the repo-relative spelling still resolves. The
 # assertions below therefore also pin that a repo-local tasks/ wins over userspace.
 mkdir -p .claude tasks
@@ -89,18 +89,18 @@ echo "$OUT" | grep -q 'iteration ?' || { echo "FAIL: corrupted iteration must re
 
 # Case 6: notes in USERSPACE only, no repo-relative tasks/ — the un-migrated shape,
 # and the one this hook used to be blind to. A project whose notes live at
-# ~/.claude/tasks/<repo>/ must still get the reminder, and it must name that path
+# ~/.local/state/claude-tasks/<repo>/ must still get the reminder, and it must name that path
 # rather than a repo-relative one nothing writes to.
 # HOME is redirected for this case only, so the assertion cannot depend on the real
 # home directory's contents.
 rm -rf .claude tasks
 FAKE_HOME="$TMP/home"
-mkdir -p "$FAKE_HOME/.claude/tasks/${TMP##*/}"
-: > "$FAKE_HOME/.claude/tasks/${TMP##*/}/mission.md"
+mkdir -p "$FAKE_HOME/.local/state/claude-tasks/${TMP##*/}"
+: > "$FAKE_HOME/.local/state/claude-tasks/${TMP##*/}/mission.md"
 OUT=$(HOME="$FAKE_HOME" bash "$SCRIPT")
 echo "$OUT" | grep -q 'context-lifecycle' \
   || { echo "FAIL: userspace-only notes produced no reminder"; exit 1; }
-echo "$OUT" | grep -qF "$FAKE_HOME/.claude/tasks/${TMP##*/}/mission.md" \
+echo "$OUT" | grep -qF "$FAKE_HOME/.local/state/claude-tasks/${TMP##*/}/mission.md" \
   || { echo "FAIL: reminder did not name the userspace mission path; got: $OUT"; exit 1; }
 echo "$OUT" | grep -qE '(^| )tasks/(mission|session-constraints)\.md' \
   && { echo "FAIL: reminder named a repo-relative notes path that nothing writes to"; exit 1; }

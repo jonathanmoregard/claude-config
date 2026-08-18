@@ -58,8 +58,8 @@ ERRORS = STATE_DIR / "errors.log"
 MAX_TRAIL_BYTES = 32 * 1024 * 1024
 
 # ConfigChange sources that change what the agent is ALLOWED to do, as opposed
-# to what it knows. These get a desktop notification; everything else is
-# logged silently.
+# to what it knows. Everything is trailed either way; these are the only ones
+# eligible for a desktop notification.
 NOTIFY_SOURCES = {"user_settings", "policy_settings"}
 
 # Cap on hashing a changed file, so a hook never stalls a turn on a huge blob.
@@ -128,6 +128,25 @@ def _rotate_if_needed() -> None:
             TRAIL.replace(TRAIL.with_suffix(".jsonl.1"))
     except Exception as e:
         _log_error(f"rotate failed: {e!r}")
+
+
+def _interactive() -> bool:
+    """True when a human is driving this session.
+
+    A policy edit the operator made themselves, at a keyboard, is not the threat
+    this hook exists to catch — and a critical-urgency popup on every one of them
+    trains the operator to dismiss the popup that DOES matter. So the alert fires
+    only for non-interactive runs (cron, headless, SDK), where a change to the
+    permission surface has no human behind it.
+
+    The trail is unaffected: every ConfigChange is still appended and still
+    chained, so a suppressed alert is never a lost record. Alerting is the
+    channel; the trail is the control.
+
+    Same gate the shell hooks in settings.json use. Absent variable means
+    interactive, matching their `${CLAUDE_CODE_ENTRYPOINT:-cli}` default.
+    """
+    return os.environ.get("CLAUDE_CODE_ENTRYPOINT", "cli") == "cli"
 
 
 def _notify(title: str, body: str) -> None:
@@ -250,9 +269,13 @@ def main() -> int:
         _log_error(f"trail append failed for {event}: {e!r}")
         return 0
 
-    if event == "ConfigChange" and payload.get("source") in NOTIFY_SOURCES:
+    if (
+        event == "ConfigChange"
+        and payload.get("source") in NOTIFY_SOURCES
+        and not _interactive()
+    ):
         _notify(
-            "Claude permission surface changed",
+            "Claude permission surface changed with no human driving",
             f"{payload.get('source')}: {file_path or '(no path reported)'}",
         )
 

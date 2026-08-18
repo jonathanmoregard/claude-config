@@ -56,7 +56,7 @@ The `</> source` button in the toolbar re-captures the current one on demand
 - **Same-origin embedded mode** — the host serves the write-back endpoint.
   Kablong does (`POST /pgr-source`, `dev-playground` feature, handler in
   `crates/kablong-web/src/handlers/dev_pgr.rs`); files land in
-  `~/.claude/tasks/kablong/pgr-source/`, override with
+  `~/.local/state/claude-tasks/kablong/pgr-source/`, override with
   `KABLONG_PGR_SOURCE_DIR`. A host without that route falls back to browser
   downloads (three files into your download dir).
 - **Cross-origin fallback** — `contentDocument` is null, so nothing can be
