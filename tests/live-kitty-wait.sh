@@ -57,11 +57,22 @@ done
   || { echo "FAIL: no ~/.claude/.credentials.json to give the fixture session" >&2; exit 1; }
 
 # --- scaled durations, per scenario ----------------------------------------
-GRACE=40; CAP=300; BUSY=70
+# BUSY is how long the test HOLDS the turn open, in seconds, via a fifo the
+# session blocks reading. Nothing model-dependent decides it.
+#
+# TWO EARLIER ATTEMPTS FAILED, and both failed silently-looking:
+#   * `sleep N` — run with run_in_background:true even when told not to, so the
+#     tool returned at once. Worse, the registry still read busy while the
+#     background task ran, so "busy" did not mean the model was occupied.
+#   * generating N lines — the model cannot delegate its own tokens, but the
+#     duration was not reproducible: 840 lines held 35s, 900 lines held 21s.
+# A fifo has neither problem: open() blocks until this script writes, so the
+# turn lasts exactly as long as the test says.
+GRACE=20; CAP=300; BUSY=60
 case "$SCENARIO" in
-  S4) GRACE=40; CAP=45; BUSY=120 ;;   # still working when the ceiling hits
-  S2) BUSY=0 ;;                        # no session left to work
-  S3) BUSY=0 ;;                        # idle, but the prompt is dirty
+  S4) GRACE=20; CAP=25 ;;   # still blocked when the ceiling hits
+  S2) BUSY=0 ;;             # no session left to work
+  S3) BUSY=0 ;;             # idle, but the prompt is dirty
 esac
 
 XVFB_PID=""; XDISPLAY=""
@@ -85,8 +96,10 @@ FIXHOME="$FIX/home"; SOCK="unix:$FIX/kitty.sock"; PROJ="$FIX/project"
 export CLAUDE_SESSIONS_DIR="$FIX/self-compact"
 mkdir -p "$FIXHOME/.claude" "$PROJ" "$CLAUDE_SESSIONS_DIR"
 
-KITTY_PID=""
+KITTY_PID=""; RELEASER=""; SAMPLER=""
 cleanup() {
+  [[ -n "$RELEASER" ]] && kill "$RELEASER" 2>/dev/null
+  [[ -n "$SAMPLER" ]] && kill "$SAMPLER" 2>/dev/null
   [[ -n "$KITTY_PID" ]] && kill "$KITTY_PID" 2>/dev/null
   [[ -n "$XVFB_PID" ]] && kill "$XVFB_PID" 2>/dev/null
   if (( FAILED )); then echo "  (fixture kept: $FIX)" >&2; else rm -rf -- "$FIX" 2>/dev/null; fi
@@ -123,9 +136,9 @@ jq -n --arg proj "$PROJ" --arg ver "$CLI_VER" '{
 # `sleep` is allowed so a turn can be held open for a known duration; the handoff
 # directory is granted or the session stalls on an approval prompt and the test
 # would prove nothing.
-jq -n --arg d "$CLAUDE_SESSIONS_DIR" '{
+jq -n --arg d "$CLAUDE_SESSIONS_DIR" --arg f "$FIX" '{
   theme: "dark",
-  permissions: { defaultMode: "acceptEdits", allow: ["Bash(sleep:*)"], additionalDirectories: [$d] } }' \
+  permissions: { defaultMode: "acceptEdits", additionalDirectories: [$d, $f] } }' \
   > "$FIXHOME/.claude/settings.json"
 
 ( cd "$PROJ" && git init -q . && git config user.email t@example.com && git config user.name t \
@@ -192,15 +205,22 @@ info "session seeded and idle"
 # --- put the session into the state the scenario is about -------------------
 case "$SCENARIO" in
   S1old|S1new|S4)
-    # MUST BLOCK THE TURN. Measured: `sleep 70` alone gets run with
-    # run_in_background:true, the tool returns at once, and the turn is over in
-    # seconds — the scenario silently does not happen. The turn only stays open
-    # while a FOREGROUND tool call is outstanding.
-    submit "Run this bash command in the FOREGROUND and wait for it to finish before replying. Do NOT use run_in_background, do not background it, do not return until it completes: sleep $BUSY"
+    # MUST BLOCK THE TURN, and must not be delegable to a tool. Measured twice:
+    # `sleep N` gets run with run_in_background:true even when told not to, the
+    # tool returns at once, and the model is free to answer the injected
+    # instruction while the registry still reads busy because a background task
+    # is outstanding. `status: busy` therefore does NOT imply "the model is
+    # occupied" — only long GENERATION does, because the model cannot delegate
+    # its own token production.
+    mkfifo "$FIX/gate"
+    submit "Use the Read tool to read the file $FIX/gate, then reply with what it contained."
     busy=0
     for i in $(seq 1 30); do [[ "$(status)" == "busy" ]] && { busy=1; break; }; sleep 1; done
     (( busy == 1 )) || { fail "session never went busy; the scenario is not reproduced"; exit 1; }
-    info "session is BUSY for ~${BUSY}s — the instruction cannot be read until it ends"
+    # Release the turn after BUSY seconds, from here rather than from the model.
+    ( sleep "$BUSY"; echo "released" > "$FIX/gate" ) >/dev/null 2>&1 &
+    RELEASER=$!
+    info "session is BLOCKED on a fifo for ${BUSY}s — the instruction cannot be read until it ends"
     ;;
   S2)
     kill -9 "$SPID" 2>/dev/null
@@ -257,20 +277,34 @@ info "log: $(tail -1 "$CLAUDE_SESSIONS_DIR/inplace-reset.log" 2>/dev/null | cut 
 
 # The busy scenarios are only meaningful if the session really was mid-turn
 # across the wait. Fail loudly rather than report a green that proves nothing.
+#
+# The sampler only runs WHILE the waiter waits, so busy_span can never exceed
+# elapsed. For the runs that give up (S1old, S4) the question is therefore "was
+# it busy the whole time", not "was it busy longer than the grace" — that second
+# form is unsatisfiable by construction and would fail every correct run.
 case "$SCENARIO" in
-  S1old|S1new|S4)
-    MIN_BUSY=$(( GRACE + 5 ))
-    (( BUSY_SPAN >= MIN_BUSY )) || fail "SCENARIO NOT REPRODUCED: the session was only busy for ${BUSY_SPAN}s, which does not outlast the ${GRACE}s grace. The model probably backgrounded the command instead of blocking on it."
+  S1old|S4)
+    (( BUSY_SPAN >= ELAPSED - 3 )) || fail "SCENARIO NOT REPRODUCED: the session was busy for only ${BUSY_SPAN}s of the ${ELAPSED}s wait, so it was not mid-turn throughout"
+    ;;
+  S1new)
+    (( BUSY_SPAN >= GRACE + 5 )) || fail "SCENARIO NOT REPRODUCED: the session was busy for ${BUSY_SPAN}s, which does not outlast the ${GRACE}s grace, so waiting past the grace was never required"
     ;;
 esac
+
+# THE INVARIANT, checked in every scenario regardless of outcome. Everything
+# else here is about when to be patient; this is the property that makes being
+# wrong survivable.
+[[ "$CLEARED" == "no" || "$HANDOFF_OK" == "yes" ]] \
+  || fail "INVARIANT VIOLATED: the session was cleared without a fresh handoff"
 
 case "$SCENARIO" in
   S1old)
     # RED. The pre-fix code must give up while the session is still working.
     [[ "$CLEARED" == "no" ]] || fail "S1old: pre-fix code CLEARED; the defect is not being reproduced"
     (( RC != 0 )) || fail "S1old: pre-fix code returned 0; expected it to give up"
-    (( ELAPSED < BUSY_SPAN )) || fail "S1old: gave up after ${ELAPSED}s, not while the ${BUSY_SPAN}s turn was still running"
-    [[ "$FAILED" == "0" ]] && info "RED confirmed: gave up at ${ELAPSED}s with the session busy ${BUSY_SPAN}s, nothing cleared"
+    [[ "$HANDOFF_OK" == "no" ]] || fail "S1old: a handoff appeared; the turn cannot have been held"
+    (( ELAPSED < BUSY )) || fail "S1old: gave up after ${ELAPSED}s, which is not before the ${BUSY}s the turn was held open"
+    [[ "$FAILED" == "0" ]] && info "RED confirmed: gave up at ${ELAPSED}s, busy throughout, ${BUSY}s turn still running, nothing cleared"
     ;;
   S1new)
     # GREEN. Same scenario, and it must now wait the turn out and clear.
@@ -288,11 +322,23 @@ case "$SCENARIO" in
     [[ "$FAILED" == "0" ]] && info "bounded: gave up after ${ELAPSED}s without clearing"
     ;;
   S3)
-    # A dirty prompt mangles the instruction, so no handoff appears and nothing
-    # may be destroyed. This is the 2026-08-17T13:28Z production failure.
-    [[ "$CLEARED" == "no" ]] || fail "S3: CLEARED a session whose prompt held typed text — destructive"
-    (( RC != 0 )) || fail "S3: rc=0 despite a dirty prompt"
-    [[ "$FAILED" == "0" ]] && info "safe: dirty prompt did not produce a handoff and nothing was cleared"
+    # BOTH OUTCOMES ARE CORRECT, which is why this asserts the invariant rather
+    # than a refusal. An earlier version of this test demanded a refusal and was
+    # simply wrong about the mechanism: the typed text is consumed by the SAME
+    # submission that carries the instruction, so the prompt is clean again by
+    # the time `/clear` is sent, and a run that writes a handoff and then clears
+    # is a success. The 2026-08-17T13:28Z production shape — where `/clear`
+    # itself is swallowed — is the other branch, and the product catches it by
+    # confirming the session id changed. What must never happen is a clear
+    # without a handoff, and that is asserted above for every scenario.
+    if [[ "$CLEARED" == "yes" ]]; then
+      [[ "$HANDOFF_OK" == "yes" ]] || fail "S3: cleared with no handoff"
+      (( RC == 0 )) || fail "S3: cleared but rc=$RC"
+      info "safe: the dirty text was absorbed by the instruction, a handoff was written, then the clear landed"
+    else
+      (( RC != 0 )) || fail "S3: did not clear yet returned 0"
+      info "safe: the dirty prompt prevented a confirmed clear and nothing was destroyed"
+    fi
     ;;
   S4)
     # Still working when the ceiling hits: give up, destroy nothing.
