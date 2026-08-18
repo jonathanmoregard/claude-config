@@ -203,3 +203,6 @@ logs/review-agent.log
 # experiment run output (transcripts, final outputs, state) (repo-autosync, 2026-08-17)
 experiments/*/runs/
 experiments/*/runs-pilot-discarded/
+
+# runtime dir: UUID session dirs + logs for self-compact feature (repo-autosync, 2026-08-18)
+self-compact/
