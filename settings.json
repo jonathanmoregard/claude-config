@@ -19,15 +19,20 @@
       "Read(/home/jonathan/worktrees/**)",
       "Read(/home/jonathan/.claude/settings.json)",
       "Read(/home/jonathan/.claude/templates/**)",
+      "Read(/home/jonathan/.claude/tasks/**)",
       "Edit(/tmp/**)",
       "Edit(/home/jonathan/Repos/nixos-config-worktrees/**)",
       "Edit(/home/jonathan/worktrees/**)",
+      "Write(/home/jonathan/worktrees/**)",
+      "Write(/home/jonathan/Repos/nixos-config-worktrees/**)",
       "Edit(/home/jonathan/.claude/projects/**)",
       "Edit(/home/jonathan/.claude/skills/**)",
       "Edit(/home/jonathan/.claude/homunculus/**)",
       "Edit(/home/jonathan/.claude/loops/**)",
       "Edit(/home/jonathan/.claude/self-compact/**)",
       "Write(/home/jonathan/.claude/self-compact/**)",
+      "Edit(/home/jonathan/.claude/tasks/**)",
+      "Write(/home/jonathan/.claude/tasks/**)",
       "mcp__aggregator__aggregator_search_memory",
       "mcp__aggregator__aggregator_capabilities",
       "mcp__research-agent__*",
@@ -126,6 +131,7 @@
       "/home/jonathan/.claude/skills",
       "/home/jonathan/.claude/templates",
       "/home/jonathan/.claude/self-compact",
+      "/home/jonathan/.claude/tasks",
       "/tmp",
       "/etc/nixos",
       "/nix/store",
@@ -231,6 +237,16 @@
       }
     ],
     "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/worktree-additional-dirs.py",
+            "timeout": 15,
+            "statusMessage": "Scoping this repo's worktrees..."
+          }
+        ]
+      },
       {
         "hooks": [
           {

@@ -61,13 +61,5 @@
       "mcp-server-reddit"
     ],
     "env": {}
-  },
-  "egress-guard": {
-    "type": "stdio",
-    "command": "python3",
-    "args": [
-      "/home/jonathan/.claude/mcps/egress-guard/server.py"
-    ],
-    "env": {}
   }
 }

@@ -58,8 +58,33 @@ as one row each; grep templates for the class in `el.desc` to locate the source.
 No interpretation guessing on WHICH element the user meant.
 
 To prep a folder for element-exact review: capture surfaces with visual-verify,
-then copy `fullpage-1280.png` → `<surface>.png` and `fullpage-1280.dom.json` →
-`<surface>.dom.json` into one flat folder; serve it.
+then copy `fullpage-1280.png` → `<surface>.png`, `fullpage-1280.dom.json` →
+`<surface>.dom.json`, and the three `fullpage-1280.source.*` files →
+`<surface>.source.*` into one flat folder; serve it. Copy the source sidecars
+every time — a review handover without them cannot be mapped back to markup.
+
+## Per-page source snapshot (html + css + js)
+
+`visual-verify` emits three more sidecars per shot, next to `<base>.png`:
+
+| file | contents |
+|---|---|
+| `<base>.source.html` | post-render serialized DOM — what the browser actually had, not the served template |
+| `<base>.source.css` | every stylesheet that applied, rules as parsed, `/* ===== <href> ===== */` separated |
+| `<base>.source.js` | every script that shipped (inline bodies verbatim, external bodies fetched), `// ===== <src> =====` separated |
+
+When they're present, the tool shows `source: html · css · js` links in the top
+bar for the current image (new tab). Turn the capture off with `--no-source`.
+
+**Agent contract — consuming source:** a review note ("this button is too
+tight", "wrong heading here") is grounded by reading `<base>.source.html` for
+the surface it was written against: find the element (pins already give you
+`el.desc`, e.g. `button.c-btn`), then grep the repo's templates for that exact
+markup / class to reach the file that generates it. `.source.css` tells you
+which rule actually produced the spacing or color being complained about —
+including cascade order — so the fix lands on the real declaration instead of a
+new override. Read the snapshot BEFORE proposing a change; the served template
+alone can mislead when JS mutates the DOM.
 
 ## Requirements
 - `python3` (static server) and `xdg-open` (or open the printed URL yourself).

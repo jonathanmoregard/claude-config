@@ -115,6 +115,7 @@
       <span id="urlbadge" class="saved" style="align-self:center; font-family:ui-monospace,monospace; font-size:11px;"></span>
       <a id="openext" target="_blank" title="Open in a new tab">↗ tab</a>
       <button id="reload" title="Reload iframe">⟲</button>
+      <button id="srcsnap" title="Snapshot this playground's generated HTML + CSS + JS so the agent can map feedback to markup">&lt;/&gt; source</button>
     </div>
     <div class="empty" id="empty">Loading playgrounds…</div>
     <div id="diag" style="position:absolute; top:44px; left:8px; right:8px; z-index:8; background:#3a1a1a; color:#ffb; border:1px solid #a55; border-radius:6px; padding:8px 12px; font:12px ui-monospace,monospace; display:none;"></div>
@@ -167,7 +168,7 @@
   // Boot diagnostics — announce build + preemptively kill stale caches
   // that broke the tool across the last 4 iterations. Advisor round
   // 2026-08-03: cache-persistence + no in-band diag was the root cause.
-  const BUILD = 'pgr-2026-08-03-j'; // bump on every tool edit
+  const BUILD = 'pgr-2026-08-18-k'; // bump on every tool edit
   console.log('%c[playground-review] build ' + BUILD, 'font-weight:bold;color:#6ea8fe');
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.getRegistrations().then(regs => {
@@ -300,6 +301,11 @@
     // chrome-error://chromewebdata/ from a prior failed load.
     swapStage(bustCache(e.url));
     armBridgeWatchdog();
+    // Auto-snapshot the generated source of every playground the reviewer
+    // actually opens, so the handover is never missing the markup behind a
+    // note. Silent + best-effort: cross-origin frames and embedded mode
+    // (no write-back endpoint) just fall through to the manual button.
+    stage.addEventListener('load', () => setTimeout(() => autoSnapshot(e), 400), { once: true });
     // Resolve relative URLs against the tool origin for display.
     const abs = new URL(e.url, location.origin).toString();
     urlbadge.textContent = abs;
@@ -361,6 +367,133 @@
     swapStage(bustCache(entries[idx].url));
     armBridgeWatchdog();
   };
+  // ---- generated-source snapshot (html + css + js) ----
+  // A playground note ("this radio is too tight") is only actionable if the
+  // agent can find the markup that produced it. The iframe is same-origin in
+  // embedded mode (and in standalone mode whenever the dev server and tool
+  // share an origin), so read its post-render DOM, the CSS that applied, and
+  // the JS that shipped — write them next to playgrounds.json via POST when
+  // the standalone server is behind us, else fall back to browser downloads.
+  const SRC_BANNER = (name, url, kind) =>
+    (kind === 'html' ? '<!-- ' : '// ') +
+    'playground-review source snapshot · ' + name + ' · ' + url +
+    ' · post-render DOM (what the browser had, not the served template)' +
+    (kind === 'html' ? ' -->\n' : '\n');
+
+  async function captureSource(entry) {
+    const doc = stage.contentDocument;
+    if (!doc) throw new Error('iframe is cross-origin — same-origin embedded mode required (see SKILL.md), or capture with visual-verify instead');
+    const win = stage.contentWindow;
+    const url = new URL(entry.url, location.origin);
+    url.searchParams.delete('_pgr');
+    const clean = url.toString();
+
+    const html = SRC_BANNER(entry.name, clean, 'html') +
+      '<!doctype html>\n' + doc.documentElement.outerHTML;
+
+    const cssParts = [];
+    for (const sheet of Array.from(doc.styleSheets)) {
+      const label = sheet.href || '<inline <style> block>';
+      let text = null, error = null;
+      try { text = Array.from(sheet.cssRules).map((r) => r.cssText).join('\n'); }
+      catch (e) { error = String((e && e.message) || e); }
+      if (text === null && sheet.href) {
+        try {
+          const r = await fetch(sheet.href);
+          if (r.ok) { text = await r.text(); error = null; } else { error = 'HTTP ' + r.status; }
+        } catch (e) { error = String((e && e.message) || e); }
+      }
+      cssParts.push(text
+        ? '/* ===== ' + label + ' ===== */\n' + text
+        : '/* ===== ' + label + ' — NOT CAPTURED: ' + error + ' ===== */');
+    }
+
+    const jsParts = [];
+    for (const s of Array.from(doc.querySelectorAll('script'))) {
+      const src = s.getAttribute('src');
+      if (!src) { jsParts.push('// ===== <inline <script> block> =====\n' + s.textContent); continue; }
+      let abs = src, text = null, error = null;
+      try {
+        abs = new URL(src, win.location.href).href;
+        const r = await fetch(abs);
+        if (r.ok) text = await r.text(); else error = 'HTTP ' + r.status;
+      } catch (e) { error = String((e && e.message) || e); }
+      jsParts.push(text
+        ? '// ===== ' + abs + ' =====\n' + text
+        : '// ===== ' + abs + ' — NOT CAPTURED: ' + error + ' =====');
+    }
+
+    return {
+      name: entry.name,
+      html,
+      css: SRC_BANNER(entry.name, clean, 'css') + '\n' + cssParts.join('\n\n'),
+      js: SRC_BANNER(entry.name, clean, 'js') + '\n' + jsParts.join('\n\n'),
+    };
+  }
+
+  function downloadSource(snap) {
+    const safe = snap.name.replace(/[^\w.-]/g, '_');
+    for (const [ext, body, mime] of [
+      ['.source.html', snap.html, 'text/plain'],
+      ['.source.css', snap.css, 'text/plain'],
+      ['.source.js', snap.js, 'text/plain'],
+    ]) {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([body], { type: mime }));
+      a.download = safe + ext;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    }
+  }
+
+  const snapped = new Set();
+  async function autoSnapshot(entry) {
+    if (!entry || snapped.has(entry.name)) return;
+    try {
+      const snap = await captureSource(entry);
+      const res = await fetch('/pgr-source', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(snap),
+      });
+      if (!res.ok) return;
+      snapped.add(entry.name);
+      const w = await res.json();
+      savedEl.textContent = 'source → ' + w.written.join(', ');
+    } catch { /* cross-origin frame, or no write-back endpoint — manual button covers it */ }
+  }
+
+  $('srcsnap').onclick = async () => {
+    const entry = entries[idx];
+    if (!entry) return;
+    const btn = $('srcsnap');
+    btn.disabled = true;
+    try {
+      const snap = await captureSource(entry);
+      let written = null;
+      try {
+        const res = await fetch('/pgr-source', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(snap),
+        });
+        if (res.ok) written = await res.json();
+      } catch { /* no write-back endpoint (embedded mode) — fall through */ }
+      if (written) {
+        savedEl.textContent = 'source → ' + written.written.join(', ');
+        flash(btn, '✓ saved');
+      } else {
+        downloadSource(snap);
+        flash(btn, '⇩ downloaded');
+      }
+    } catch (e) {
+      showDiag('<strong>source snapshot failed</strong> — ' + String(e.message || e));
+      btn.textContent = '</> source';
+    } finally {
+      btn.disabled = false;
+    }
+  };
+
   $('copy').onclick = async () => {
     try { await navigator.clipboard.writeText(notes.value); flash($('copy'), 'Copied'); }
     catch { notes.select(); document.execCommand('copy'); flash($('copy'), 'Copied'); }

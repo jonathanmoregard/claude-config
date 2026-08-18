@@ -307,7 +307,8 @@ not `networkidle`). CLI wrapper at `bin/screenshot`.
 
 ## Observability artifacts (per shot)
 
-Each capture emits three files (default: all on; opt-out via `--no-aria` / `--no-dom`):
+Each capture emits six files (default: all on; opt-out via `--no-aria` /
+`--no-dom` / `--no-source`):
 
 - `<shot>.png` — DPR=2 image, founder-review primary
 - `<shot>.aria.yaml` — Playwright's `page.locator(sel).ariaSnapshot()` output; the
@@ -320,7 +321,21 @@ Each capture emits three files (default: all on; opt-out via `--no-aria` / `--no
   Grounds VLM critique in real geometry — spacing/alignment/contrast findings
   can be verified against numeric bboxes, not hallucinated.
 
-Contact-sheet `index.html` links `aria.yaml` + `dom.json` next to each thumbnail.
+- `<shot>.source.html` — post-render serialized DOM (the browser's actual tree,
+  not the served template). With `--selector`, scoped to that element.
+- `<shot>.source.css` — every stylesheet that applied, rules as parsed,
+  `/* ===== <href> ===== */` separated. Cross-origin sheets are re-fetched;
+  anything unreadable is recorded as `NOT CAPTURED: <reason>` instead of
+  silently vanishing.
+- `<shot>.source.js` — every script that shipped: inline bodies verbatim,
+  external bodies fetched, `// ===== <src> =====` separated.
+
+The three `source.*` files are what let a review agent map per-page feedback
+onto real markup — geometry (`dom.json`) says WHERE, source says WHAT TO EDIT.
+Any UI review handed to a human must ship them alongside the images.
+
+Contact-sheet `index.html` links `aria.yaml`, `dom.json` and `src: html/css/js`
+next to each thumbnail. CLI markers: `[aria] [dom] [src]`, failures as `[src!]`.
 
 Critic prompts should include the aria + dom paths and instruct: "cite specific
 `role` and `rect` when flagging alignment / spacing; do not claim misalignment

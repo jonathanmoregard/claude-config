@@ -40,10 +40,14 @@ shopt -u nocaseglob nullglob
 [ "${#imgs[@]}" -gt 0 ] || { echo "no images found in $DIR" >&2; exit 1; }
 for f in "${imgs[@]}"; do ln -s "$f" "$ROOT/$NAME/"; done
 # Element-pin sidecars: <base>.dom.json next to <base>.png enables Figma-style
-# element pinning in the tool (hover-highlight + click-to-comment). Also link
-# annotations.json (may not exist yet — the server writes it into $DIR).
+# element pinning in the tool (hover-highlight + click-to-comment).
+# Source sidecars: <base>.source.{html,css,js} — the generated source of that
+# page, surfaced per image in the tool so feedback maps to real markup.
+# Also link annotations.json (may not exist yet — the server writes it into $DIR).
 shopt -s nullglob
-for f in "$DIR"/*.dom.json; do ln -s "$f" "$ROOT/$NAME/"; done
+for f in "$DIR"/*.dom.json "$DIR"/*.source.html "$DIR"/*.source.css "$DIR"/*.source.js; do
+  ln -s "$f" "$ROOT/$NAME/"
+done
 shopt -u nullglob
 ln -s "$DIR/annotations.json" "$ROOT/$NAME/annotations.json"
 python3 - "$ROOT/$NAME" >"$ROOT/$NAME/manifest.json" <<'PY'

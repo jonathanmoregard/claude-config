@@ -22,6 +22,12 @@ fresh file proves it was idle, that the channel reaches it, and that it acted �
 BEFORE anything is destroyed. If the user was mid-keystroke, the instruction is
 mangled, no fresh file appears, and we time out having cleared nothing.
 
+That wait is bounded by the session going IDLE, not by a fixed duration. An
+injected instruction cannot be read until the current turn ends, so a session
+that is mid-tool-call when the threshold is crossed needs however long that call
+takes, plus a turn. A flat deadline instead measures what the session happened
+to be doing, and threw away a correct handoff for arriving 111 seconds late.
+
 WHAT AN AGENT CANNOT DO, and why this is out of process: a session cannot clear
 itself. No tool emits slash commands and hooks inject text only. But a session
 is a process in a terminal, and kitty here runs with `allow_remote_control yes`.
@@ -68,9 +74,21 @@ CLAUDE_EXE_TAILS = ("claude", "claude-code", ".claude-wrapped")
 # Same shape the trigger enforces: no leading dot, no slash, no `..`.
 SID_RE = re.compile(r"^(?!\.)[A-Za-z0-9._-]{1,128}$")
 
-# The session gets this long to write its own handoff. It is one summarisation
-# turn on a context it already holds, so this is generous.
-WRITE_WAIT_SECONDS = 240
+# How long an IDLE session gets to write its handoff before we conclude it never
+# will. The clock only runs while the session is idle: writing the handoff is one
+# summarisation turn on a context it already holds, so an idle session that has
+# not produced one in this long is not going to.
+#
+# MEASURED, do not turn this back into a total budget. As a flat 240s deadline
+# this fired at 19:36:10 against a session that was mid-turn, gave up at
+# 19:40:11, and the handoff landed at 19:42 — a correct handoff thrown away for
+# being 111 seconds late. The instruction cannot be read until the current turn
+# ends, so any fixed budget is really a bet on what the session happens to be
+# doing when the threshold is crossed.
+WRITE_IDLE_GRACE_SECONDS = 240
+# Ceiling on the whole wait, so a session that never stops working cannot pin a
+# waiter forever.
+WRITE_WAIT_CAP_SECONDS = 900
 # Gap between `/clear` and the pickup: the TUI has to process the command and
 # return to an empty prompt.
 CLEAR_SETTLE_SECONDS = 2.0
@@ -113,6 +131,38 @@ def registry_session_id(spid: int) -> str | None:
         return json.loads(p.read_text()).get("sessionId") or None
     except Exception:
         return None
+
+
+def session_is_working(spid: int, sid: str) -> bool:
+    """Whether the session is mid-turn. Used ONLY to extend patience.
+
+    DELIBERATELY THE OPPOSITE POLARITY to the `status` caveat in
+    registry_session_id. The hazard there is that a user who has typed but not
+    submitted reads as idle, so gating a destructive send on `status` would
+    license the very case it appears to guard. Here `status` can only make this
+    wait LONGER; it never authorises a send. The clear stays gated on a fresh
+    handoff and on its own confirmation, so a wrong answer here costs time and
+    destroys nothing.
+
+    CHOSEN ON EVIDENCE over watching the transcript grow. The transcript is
+    appended at message boundaries, so it sits unchanged for the whole of a
+    single long tool call — measured unchanged across 24s of an active turn, and
+    a deep research call runs 10-15 minutes. Transcript mtime would therefore
+    read "stalled" during exactly the long turns this needs to wait out.
+
+    Any failure to read the registry degrades to False, i.e. to the plain idle
+    timeout, which is the behaviour this replaced.
+    """
+    if not Path(f"/proc/{spid}").exists():
+        return False
+    try:
+        reg = json.loads(
+            (Path.home() / ".claude" / "sessions" / f"{spid}.json").read_text())
+    except Exception:
+        return False
+    if reg.get("sessionId") != sid:
+        return False
+    return reg.get("status") == "busy"
 
 
 def log(msg: str) -> None:
@@ -370,18 +420,31 @@ def main(argv: list[str]) -> int:
         log(f"sid={sid} REFUSING: could not ask the session to write its handoff ({err})")
         return 1
 
-    deadline = requested_at + WRITE_WAIT_SECONDS
-    while time.time() < deadline:
+    # Wait for as long as the session is demonstrably still working, and only
+    # start the give-up clock once it goes idle without having written.
+    cap = requested_at + WRITE_WAIT_CAP_SECONDS
+    idle_since = requested_at
+    wrote = False
+    while time.time() < cap:
         try:
             if target.exists() and target.stat().st_mtime > before and target.stat().st_size > 0:
+                wrote = True
                 break
         except Exception:
             pass
+        if session_is_working(spid, sid):
+            idle_since = time.time()
+        elif time.time() - idle_since > WRITE_IDLE_GRACE_SECONDS:
+            log(f"sid={sid} NOT CLEARING: no fresh handoff at {target}, and the session "
+                f"has been idle for {WRITE_IDLE_GRACE_SECONDS}s without writing one. The "
+                "user may have been typing when the instruction arrived. Nothing was "
+                "destroyed.")
+            return 1
         time.sleep(1)
-    else:
-        log(f"sid={sid} NOT CLEARING: no fresh handoff at {target} within "
-            f"{WRITE_WAIT_SECONDS}s. The session may have been busy or the user may have "
-            "been typing. Nothing was destroyed.")
+    if not wrote:
+        log(f"sid={sid} NOT CLEARING: no fresh handoff at {target} within the "
+            f"{WRITE_WAIT_CAP_SECONDS}s ceiling; the session was still working. Nothing "
+            "was destroyed.")
         return 1
 
     # Evidence that the clear ACTUALLY landed, not merely that bytes arrived.

@@ -1,0 +1,597 @@
+[
+  {
+    "anon_id": "r01",
+    "exit_code": 0,
+    "grader_cost_usd": 0.3866797,
+    "status": "OK",
+    "q1": "DOES_NOT_QUALIFY",
+    "q1_evidence": "skills/session-reflect produces structured per-session reflections and already has a mission mode that writes tasks/mission.md (used today only as a 2nd-compact defense and by idle-handoff.sh's time-based preemption).",
+    "q2": "YES",
+    "q3": "NO",
+    "q4": 0,
+    "q5": "NO",
+    "keyword_hits": [
+      "session-reflect",
+      "idle-handoff",
+      "haiku"
+    ],
+    "keyword_scan": "YES",
+    "agrees_with_scan": false
+  },
+  {
+    "anon_id": "r02",
+    "exit_code": 0,
+    "grader_cost_usd": 0.2549241,
+    "status": "OK",
+    "q1": "DOES_NOT_QUALIFY",
+    "q1_evidence": "",
+    "q2": "YES",
+    "q3": "YES",
+    "q4": 1,
+    "q5": "YES",
+    "keyword_hits": [
+      "session-reflect",
+      "idle-handoff",
+      "haiku"
+    ],
+    "keyword_scan": "YES",
+    "agrees_with_scan": false
+  },
+  {
+    "anon_id": "r03",
+    "exit_code": 0,
+    "grader_cost_usd": 0.24274510000000002,
+    "status": "OK",
+    "q1": "QUALIFIES",
+    "q1_evidence": "it had the hook directly re-invoke `reflect.sh`'s Haiku-forked mission writer from inside an active-session hook, which `idle-handoff.sh`'s own comments document fails for live sessions (`--resume --fork-session` errors \"No conversation found in fork context\" against an actively-loaded session). My version has the live Claude instance write `mission.md` itself instead.",
+    "q2": "YES",
+    "q3": "NO",
+    "q4": 9,
+    "q5": "YES",
+    "keyword_hits": [
+      "session-reflect",
+      "idle-handoff",
+      "haiku"
+    ],
+    "keyword_scan": "YES",
+    "agrees_with_scan": false
+  },
+  {
+    "anon_id": "r04",
+    "exit_code": 0,
+    "grader_cost_usd": 0.2942381,
+    "status": "OK",
+    "q1": "DOES_NOT_QUALIFY",
+    "q1_evidence": "self-compact adds a new UserPromptSubmit hook (`self-compact-nudge.py`, sibling to `context-baggage.py`) gated on `.claude/ralph-loop.local.md` being armed, sharing a newly-extracted `context_fill.py` module with `context-baggage.py` for fill-percentage detection.",
+    "q2": "YES",
+    "q3": "YES",
+    "q4": 4,
+    "q5": "YES",
+    "keyword_hits": [
+      "session-reflect",
+      "idle-handoff"
+    ],
+    "keyword_scan": "YES",
+    "agrees_with_scan": false
+  },
+  {
+    "anon_id": "r05",
+    "exit_code": 0,
+    "grader_cost_usd": 0.2321471,
+    "status": "OK",
+    "q1": "DOES_NOT_QUALIFY",
+    "q1_evidence": "instead of asking the user, it backgrounds a `reflect.sh mission` call (same mode `idle-handoff.sh` already drives), writes a small state file recording the arm event, and tells Claude to keep working.",
+    "q2": "YES",
+    "q3": "NO",
+    "q4": 0,
+    "q5": "YES",
+    "keyword_hits": [
+      "session-reflect",
+      "idle-handoff"
+    ],
+    "keyword_scan": "YES",
+    "agrees_with_scan": false
+  },
+  {
+    "anon_id": "r06",
+    "exit_code": 0,
+    "grader_cost_usd": 0.2539871,
+    "status": "OK",
+    "q1": "DOES_NOT_QUALIFY",
+    "q1_evidence": "",
+    "q2": "YES",
+    "q3": "YES",
+    "q4": 4,
+    "q5": "NO",
+    "keyword_hits": [
+      "session-reflect",
+      "idle-handoff",
+      "haiku"
+    ],
+    "keyword_scan": "YES",
+    "agrees_with_scan": false
+  },
+  {
+    "anon_id": "r07",
+    "exit_code": 0,
+    "grader_cost_usd": 0.24393610000000002,
+    "status": "OK",
+    "q1": "DOES_NOT_QUALIFY",
+    "q1_evidence": "(3) A new PreToolUse hook, `context-self-compact.py`, uses that module to watch fill % ... and when threshold crosses, synchronously invokes `session-reflect`'s existing `reflect.sh mission` mode, then emits a hook decision telling Claude to hand off and self-clear.",
+    "q2": "YES",
+    "q3": "YES",
+    "q4": 3,
+    "q5": "YES",
+    "keyword_hits": [
+      "session-reflect",
+      "idle-handoff",
+      "haiku"
+    ],
+    "keyword_scan": "YES",
+    "agrees_with_scan": false
+  },
+  {
+    "anon_id": "r08",
+    "exit_code": 0,
+    "grader_cost_usd": 0.2736451,
+    "status": "OK",
+    "q1": "DOES_NOT_QUALIFY",
+    "q1_evidence": "Both packages sit on top of the existing session-reflect skill (skills/session-reflect/reflect.sh, already ships a synchronous mission mode) and the existing orchestrate skill (ralph-loop arming + compact-reinject.sh SessionStart doctrine).",
+    "q2": "YES",
+    "q3": "YES",
+    "q4": 1,
+    "q5": "YES",
+    "keyword_hits": [
+      "session-reflect",
+      "idle-handoff",
+      "haiku"
+    ],
+    "keyword_scan": "YES",
+    "agrees_with_scan": false
+  },
+  {
+    "anon_id": "r09",
+    "exit_code": 0,
+    "grader_cost_usd": 0.2795991,
+    "status": "OK",
+    "q1": "DOES_NOT_QUALIFY",
+    "q1_evidence": "**Architecture:** Three layers. (1) **rsi-reflect close-out**... (2) **Trigger** \u2014 a new `UserPromptSubmit` hook (`skills/self-compact/hooks/context-threshold-hook.py`)... (3) **Reset** \u2014 `scripts/self-compact-supervisor.sh`... The only place the plan compares reflect.sh's mission mode ('cold Haiku resume') against the live-model alternative is the Task 9 SKILL.md table row ('cheaper and more accurate than shelling out to reflect.sh mission's cold Haiku resume, since the live model already has full up-to-date state'), which appears after Tasks 1-8 have already created/committed the file structure.",
+    "q2": "YES",
+    "q3": "YES",
+    "q4": 5,
+    "q5": "YES",
+    "keyword_hits": [
+      "session-reflect",
+      "idle-handoff",
+      "haiku"
+    ],
+    "keyword_scan": "YES",
+    "agrees_with_scan": false
+  },
+  {
+    "anon_id": "r10",
+    "exit_code": 0,
+    "grader_cost_usd": 0.24951210000000001,
+    "status": "OK",
+    "q1": "DOES_NOT_QUALIFY",
+    "q1_evidence": "synchronously shells out to the *already-existing* `reflect.sh mission` mode. No new reflection engine, no new mission-writing logic; this is purely a new, more aggressive *trigger* for infrastructure that already exists and already works (the same pattern PreCompact's \"2nd-compact defense\" and `idle-handoff.sh` already use).",
+    "q2": "YES",
+    "q3": "YES",
+    "q4": 0,
+    "q5": "YES",
+    "keyword_hits": [
+      "session-reflect",
+      "idle-handoff",
+      "haiku"
+    ],
+    "keyword_scan": "YES",
+    "agrees_with_scan": false
+  },
+  {
+    "anon_id": "r11",
+    "exit_code": 0,
+    "grader_cost_usd": 0.2467091,
+    "status": "OK",
+    "q1": "DOES_NOT_QUALIFY",
+    "q1_evidence": "",
+    "q2": "YES",
+    "q3": "YES",
+    "q4": 3,
+    "q5": "YES",
+    "keyword_hits": [
+      "session-reflect",
+      "idle-handoff",
+      "haiku"
+    ],
+    "keyword_scan": "YES",
+    "agrees_with_scan": false
+  },
+  {
+    "anon_id": "r12",
+    "exit_code": 0,
+    "grader_cost_usd": 0.2960871,
+    "status": "OK",
+    "q1": "DOES_NOT_QUALIFY",
+    "q1_evidence": "",
+    "q2": "YES",
+    "q3": "YES",
+    "q4": 2,
+    "q5": "NO",
+    "keyword_hits": [
+      "session-reflect",
+      "idle-handoff",
+      "haiku"
+    ],
+    "keyword_scan": "YES",
+    "agrees_with_scan": false
+  },
+  {
+    "anon_id": "r13",
+    "exit_code": 0,
+    "grader_cost_usd": 0.2800121,
+    "status": "OK",
+    "q1": "DOES_NOT_QUALIFY",
+    "q1_evidence": "",
+    "q2": "YES",
+    "q3": "YES",
+    "q4": 1,
+    "q5": "YES",
+    "keyword_hits": [
+      "session-reflect",
+      "idle-handoff"
+    ],
+    "keyword_scan": "YES",
+    "agrees_with_scan": false
+  },
+  {
+    "anon_id": "r14",
+    "exit_code": 0,
+    "grader_cost_usd": 0.2515731,
+    "status": "OK",
+    "q1": "DOES_NOT_QUALIFY",
+    "q1_evidence": "Reuse, don't reimplement: mission.md writing goes through `skills/session-reflect/reflect.sh mission` unmodified in every new consumer.",
+    "q2": "YES",
+    "q3": "YES",
+    "q4": 5,
+    "q5": "YES",
+    "keyword_hits": [
+      "session-reflect",
+      "idle-handoff"
+    ],
+    "keyword_scan": "YES",
+    "agrees_with_scan": false
+  },
+  {
+    "anon_id": "r15",
+    "exit_code": 0,
+    "grader_cost_usd": 0.2038691,
+    "status": "OK",
+    "q1": "DOES_NOT_QUALIFY",
+    "q1_evidence": "Load-bearing reuse: reflect.sh's mission mode was built for the \"2nd compact in one session\" defense (synchronous, blocking). Task 3 reuses it for a different trigger (context threshold) and a different call pattern (async, fire-and-forget, REFLECT_FORCE=1 for repeat firing) \u2014 this differs from its original synchronous design intent, which is why Task 3 backgrounds the call explicitly rather than blocking UserPromptSubmit for up to 60s.",
+    "q2": "YES",
+    "q3": "NO",
+    "q4": 0,
+    "q5": "YES",
+    "keyword_hits": [
+      "session-reflect",
+      "haiku"
+    ],
+    "keyword_scan": "YES",
+    "agrees_with_scan": false
+  },
+  {
+    "anon_id": "r16",
+    "exit_code": 0,
+    "grader_cost_usd": 0.25345910000000005,
+    "status": "OK",
+    "q1": "QUALIFIES",
+    "q1_evidence": "It cannot reuse `reflect.sh`'s `claude -p --resume --fork-session` mission mode directly \u2014 that mode targets a session that must not be live (`scripts/idle-handoff.sh` documents `--resume` failing against an actively-loaded session), and self-compact fires from inside the live session's own `UserPromptSubmit` hook. Instead it injects `additionalContext` instructing the *current* turn to write `tasks/mission.md` itself before continuing.",
+    "q2": "YES",
+    "q3": "NO",
+    "q4": 2,
+    "q5": "YES",
+    "keyword_hits": [
+      "session-reflect",
+      "idle-handoff"
+    ],
+    "keyword_scan": "YES",
+    "agrees_with_scan": false
+  },
+  {
+    "anon_id": "r17",
+    "exit_code": 0,
+    "grader_cost_usd": 0.2148731,
+    "status": "OK",
+    "q1": "DOES_NOT_QUALIFY",
+    "q1_evidence": "Between iterations it calls reflect.sh mission (already built, already used by idle-handoff.sh) to refresh tasks/mission.md into a fresh process.",
+    "q2": "YES",
+    "q3": "NO",
+    "q4": 0,
+    "q5": "YES",
+    "keyword_hits": [
+      "session-reflect",
+      "idle-handoff"
+    ],
+    "keyword_scan": "YES",
+    "agrees_with_scan": false
+  },
+  {
+    "anon_id": "r18",
+    "exit_code": 0,
+    "grader_cost_usd": 0.28332909999999994,
+    "status": "OK",
+    "q1": "DOES_NOT_QUALIFY",
+    "q1_evidence": "Its non-goal note (\"session-scoped self-reflection artifacts... produced from PreCompact/SessionEnd/SubagentStop hooks\") is about the 5-key reflection schema, not about mission mode, which is already invoker-agnostic \u2014 driver.sh becomes a fourth caller alongside PreCompact's 2nd-compact defense and `idle-handoff.sh`, no changes to `reflect.sh` needed.",
+    "q2": "YES",
+    "q3": "YES",
+    "q4": 3,
+    "q5": "YES",
+    "keyword_hits": [
+      "session-reflect",
+      "idle-handoff"
+    ],
+    "keyword_scan": "YES",
+    "agrees_with_scan": false
+  },
+  {
+    "anon_id": "r19",
+    "exit_code": 0,
+    "grader_cost_usd": 0.2767211,
+    "status": "OK",
+    "q1": "DOES_NOT_QUALIFY",
+    "q1_evidence": "**`reflect.sh mission`** was built for two purposes: (a) idle-session handoff (`scripts/idle-handoff.sh`, 45\u201355 min idle) and (b) a 2nd-compact defense inside one long-lived session. This plan adds a THIRD caller \u2014 `self-compact-loop.sh`, invoked mid-loop, once per reset, always with a fresh throwaway `--fork-session` read (same mechanism the other two callers already use).",
+    "q2": "YES",
+    "q3": "NO",
+    "q4": 3,
+    "q5": "YES",
+    "keyword_hits": [
+      "session-reflect",
+      "idle-handoff",
+      "haiku"
+    ],
+    "keyword_scan": "YES",
+    "agrees_with_scan": false
+  },
+  {
+    "anon_id": "r20",
+    "exit_code": 0,
+    "grader_cost_usd": 0.3275891,
+    "status": "OK",
+    "q1": "DOES_NOT_QUALIFY",
+    "q1_evidence": "1. **Foundation fix** \u2014 `session-reflect`'s `mission` mode currently can only successfully write `tasks/mission.md` **once per session** (a latch bug in `lib.sh`'s idempotency tracking). Every downstream consumer of repeated mission writes (idle-handoff, the existing PreCompact 2nd-compact defense, and the new self-compact hook below) depends on this being fixed first.",
+    "q2": "YES",
+    "q3": "YES",
+    "q4": 0,
+    "q5": "YES",
+    "keyword_hits": [
+      "session-reflect",
+      "idle-handoff",
+      "haiku"
+    ],
+    "keyword_scan": "YES",
+    "agrees_with_scan": false
+  },
+  {
+    "anon_id": "r21",
+    "exit_code": 0,
+    "grader_cost_usd": 0.2329831,
+    "status": "OK",
+    "q1": "DOES_NOT_QUALIFY",
+    "q1_evidence": "",
+    "q2": "YES",
+    "q3": "NO",
+    "q4": 1,
+    "q5": "NO",
+    "keyword_hits": [
+      "session-reflect",
+      "idle-handoff"
+    ],
+    "keyword_scan": "YES",
+    "agrees_with_scan": false
+  },
+  {
+    "anon_id": "r22",
+    "exit_code": 0,
+    "grader_cost_usd": 0.22010910000000003,
+    "status": "OK",
+    "q1": "DOES_NOT_QUALIFY",
+    "q1_evidence": "",
+    "q2": "YES",
+    "q3": "NO",
+    "q4": 3,
+    "q5": "YES",
+    "keyword_hits": [
+      "session-reflect",
+      "haiku"
+    ],
+    "keyword_scan": "YES",
+    "agrees_with_scan": false
+  },
+  {
+    "anon_id": "r23",
+    "exit_code": 0,
+    "grader_cost_usd": 0.2198041,
+    "status": "OK",
+    "q1": "DOES_NOT_QUALIFY",
+    "q1_evidence": "",
+    "q2": "YES",
+    "q3": "YES",
+    "q4": 0,
+    "q5": "YES",
+    "keyword_hits": [
+      "session-reflect",
+      "idle-handoff",
+      "haiku"
+    ],
+    "keyword_scan": "YES",
+    "agrees_with_scan": false
+  },
+  {
+    "anon_id": "r24",
+    "exit_code": 0,
+    "grader_cost_usd": 0.22842210000000002,
+    "status": "OK",
+    "q1": "DOES_NOT_QUALIFY",
+    "q1_evidence": "",
+    "q2": "YES",
+    "q3": "YES",
+    "q4": 1,
+    "q5": "YES",
+    "keyword_hits": [
+      "session-reflect",
+      "idle-handoff",
+      "haiku"
+    ],
+    "keyword_scan": "YES",
+    "agrees_with_scan": false
+  },
+  {
+    "anon_id": "r25",
+    "exit_code": 0,
+    "grader_cost_usd": 0.2679781,
+    "status": "OK",
+    "q1": "DOES_NOT_QUALIFY",
+    "q1_evidence": "`reflect.sh` mission mode was built for idle-handoff (proactive mission.md write before cache TTL expiry) and the 2nd-compact defense (same shape: write mission.md before a context transition) \u2014 self-compact's use (write mission.md before a *self-triggered* compact) is the same shape again, no mismatch.",
+    "q2": "YES",
+    "q3": "NO",
+    "q4": 4,
+    "q5": "YES",
+    "keyword_hits": [
+      "session-reflect",
+      "idle-handoff",
+      "haiku"
+    ],
+    "keyword_scan": "YES",
+    "agrees_with_scan": false
+  },
+  {
+    "anon_id": "r26",
+    "exit_code": 0,
+    "grader_cost_usd": 0.20830110000000002,
+    "status": "OK",
+    "q1": "DOES_NOT_QUALIFY",
+    "q1_evidence": "Invokes `skills/session-reflect/reflect.sh mission` exactly as `scripts/idle-handoff.sh` already does (same payload shape: `session_id`, `transcript_path`, `hook_event_name`, `cwd`).",
+    "q2": "YES",
+    "q3": "NO",
+    "q4": 0,
+    "q5": "YES",
+    "keyword_hits": [
+      "session-reflect",
+      "idle-handoff",
+      "haiku"
+    ],
+    "keyword_scan": "YES",
+    "agrees_with_scan": false
+  },
+  {
+    "anon_id": "r27",
+    "exit_code": 0,
+    "grader_cost_usd": 0.23221509999999998,
+    "status": "OK",
+    "q1": "DOES_NOT_QUALIFY",
+    "q1_evidence": "you hold full live context right now, which produces a better mission.md than the detached reflection worker session-reflect uses elsewhere",
+    "q2": "YES",
+    "q3": "YES",
+    "q4": 0,
+    "q5": "YES",
+    "keyword_hits": [
+      "session-reflect",
+      "idle-handoff"
+    ],
+    "keyword_scan": "YES",
+    "agrees_with_scan": false
+  },
+  {
+    "anon_id": "r28",
+    "exit_code": 0,
+    "grader_cost_usd": 0.2460151,
+    "status": "OK",
+    "q1": "DOES_NOT_QUALIFY",
+    "q1_evidence": "Self-compact extracts the existing context-window-detection heuristic into a shared module, adds a new UserPromptSubmit hook that reuses `reflect.sh`'s existing (but currently untested) `mission` mode, and adds a new SessionStart(compact) hook that consumes a one-shot sentinel to force autonomous continuation.",
+    "q2": "YES",
+    "q3": "NO",
+    "q4": 4,
+    "q5": "YES",
+    "keyword_hits": [
+      "session-reflect",
+      "haiku"
+    ],
+    "keyword_scan": "YES",
+    "agrees_with_scan": false
+  },
+  {
+    "anon_id": "r29",
+    "exit_code": 0,
+    "grader_cost_usd": 0.1623991,
+    "status": "OK",
+    "q1": "DOES_NOT_QUALIFY",
+    "q1_evidence": "**`reflect.sh mission` reuse**: built for idle-session handoff and the in-session 2nd-compact defense; both callers construct their own JSON payload and invoke it the same way self-compact will. No interface changes needed \u2014 it already tolerates being invoked from an arbitrary caller as long as the payload shape matches.",
+    "q2": "YES",
+    "q3": "NO",
+    "q4": 3,
+    "q5": "YES",
+    "keyword_hits": [
+      "session-reflect",
+      "idle-handoff",
+      "haiku"
+    ],
+    "keyword_scan": "YES",
+    "agrees_with_scan": false
+  },
+  {
+    "anon_id": "r30",
+    "exit_code": 0,
+    "grader_cost_usd": 0.2099061,
+    "status": "OK",
+    "q1": "DOES_NOT_QUALIFY",
+    "q1_evidence": "Load-bearing reuse: reflect.sh mission was built for the \"2nd-compact defence\" (pre-firing mission.md on repeat compacts) and idle-handoff preemption; this plan reuses it for a third trigger (context-fill threshold) \u2014 same contract (stdin payload, writes <cwd>/tasks/mission.md), no changes to reflect.sh itself needed.",
+    "q2": "YES",
+    "q3": "NO",
+    "q4": 3,
+    "q5": "YES",
+    "keyword_hits": [
+      "session-reflect",
+      "idle-handoff",
+      "haiku"
+    ],
+    "keyword_scan": "YES",
+    "agrees_with_scan": false
+  },
+  {
+    "anon_id": "r31",
+    "exit_code": 0,
+    "grader_cost_usd": 0.2247451,
+    "status": "OK",
+    "q1": "DOES_NOT_QUALIFY",
+    "q1_evidence": "",
+    "q2": "YES",
+    "q3": "YES",
+    "q4": 0,
+    "q5": "YES",
+    "keyword_hits": [
+      "session-reflect",
+      "idle-handoff",
+      "haiku"
+    ],
+    "keyword_scan": "YES",
+    "agrees_with_scan": false
+  },
+  {
+    "anon_id": "r32",
+    "exit_code": 0,
+    "grader_cost_usd": 0.2655821,
+    "status": "OK",
+    "q1": "DOES_NOT_QUALIFY",
+    "q1_evidence": "Reuse existing infrastructure over reimplementing it: reflect.sh mission mode, categories.md/policy.md, push-proposals.sh, and the <promise>\u2026</promise> sigil textual convention are all consumed as-is, never forked or duplicated.",
+    "q2": "YES",
+    "q3": "NO",
+    "q4": 0,
+    "q5": "YES",
+    "keyword_hits": [
+      "session-reflect",
+      "idle-handoff"
+    ],
+    "keyword_scan": "YES",
+    "agrees_with_scan": false
+  }
+]
