@@ -23,6 +23,8 @@
       "Edit(/tmp/**)",
       "Edit(/home/jonathan/Repos/nixos-config-worktrees/**)",
       "Edit(/home/jonathan/worktrees/**)",
+      "Write(/home/jonathan/worktrees/**)",
+      "Write(/home/jonathan/Repos/nixos-config-worktrees/**)",
       "Edit(/home/jonathan/.claude/projects/**)",
       "Edit(/home/jonathan/.claude/skills/**)",
       "Edit(/home/jonathan/.claude/homunculus/**)",
@@ -235,6 +237,16 @@
       }
     ],
     "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/worktree-additional-dirs.py",
+            "timeout": 15,
+            "statusMessage": "Scoping this repo's worktrees..."
+          }
+        ]
+      },
       {
         "hooks": [
           {

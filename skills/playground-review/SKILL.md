@@ -53,9 +53,12 @@ The `</> source` button in the toolbar re-captures the current one on demand
 - **Standalone mode** — the three files are written next to `playgrounds.json`
   as `<name>.source.html` / `.source.css` / `.source.js` (server `POST
   /pgr-source`). The toolbar's saved-line confirms what landed.
-- **Same-origin embedded mode** — no write-back endpoint, so the button falls
-  back to browser downloads (three files into your download dir). Hosts that
-  want automatic write-back must expose their own `POST /pgr-source`.
+- **Same-origin embedded mode** — the host serves the write-back endpoint.
+  Kablong does (`POST /pgr-source`, `dev-playground` feature, handler in
+  `crates/kablong-web/src/handlers/dev_pgr.rs`); files land in
+  `~/.claude/tasks/kablong/pgr-source/`, override with
+  `KABLONG_PGR_SOURCE_DIR`. A host without that route falls back to browser
+  downloads (three files into your download dir).
 - **Cross-origin fallback** — `contentDocument` is null, so nothing can be
   read. Capture with `visual-verify` against the same URLs instead; it emits
   the identical `<shot>.source.*` trio.
