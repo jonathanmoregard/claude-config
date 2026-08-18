@@ -116,7 +116,9 @@
       "mcp__futuresearch__futuresearch_progress",
       "mcp__futuresearch__futuresearch_status",
       "Edit(/etc/nixos/**)",
-      "Edit(/nix/store/**)"
+      "Edit(/nix/store/**)",
+      "Edit(~/.local/state/claude-harness-tripwire/**)",
+      "Write(~/.local/state/claude-harness-tripwire/**)"
     ],
     "ask": [],
     "additionalDirectories": [
@@ -389,6 +391,26 @@
             "type": "command",
             "command": "python3 $HOME/.claude/aggregator-recall-hook.py",
             "timeout": 5
+          }
+        ]
+      }
+    ],
+    "InstructionsLoaded": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/hooks/harness-tripwire.py"
+          }
+        ]
+      }
+    ],
+    "ConfigChange": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/hooks/harness-tripwire.py"
           }
         ]
       }
