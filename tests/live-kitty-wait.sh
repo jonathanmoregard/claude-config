@@ -252,24 +252,33 @@ PY
 SID_AFTER="$(jq -r '.sessionId // ""' "$FIXHOME/.claude/sessions/$SPID.json" 2>/dev/null)"
 CLEARED=no; [[ -n "$SID_AFTER" && "$SID_AFTER" != "$SID_BEFORE" ]] && CLEARED=yes
 HANDOFF_OK=no; [[ -s "$HANDOFF" ]] && HANDOFF_OK=yes
-info "rc=$RC elapsed=${ELAPSED}s handoff=$HANDOFF_OK cleared=$CLEARED"
+info "rc=$RC elapsed=${ELAPSED}s handoff=$HANDOFF_OK cleared=$CLEARED busy_span=${BUSY_SPAN}s"
 info "log: $(tail -1 "$CLAUDE_SESSIONS_DIR/inplace-reset.log" 2>/dev/null | cut -c1-200)"
+
+# The busy scenarios are only meaningful if the session really was mid-turn
+# across the wait. Fail loudly rather than report a green that proves nothing.
+case "$SCENARIO" in
+  S1old|S1new|S4)
+    MIN_BUSY=$(( GRACE + 5 ))
+    (( BUSY_SPAN >= MIN_BUSY )) || fail "SCENARIO NOT REPRODUCED: the session was only busy for ${BUSY_SPAN}s, which does not outlast the ${GRACE}s grace. The model probably backgrounded the command instead of blocking on it."
+    ;;
+esac
 
 case "$SCENARIO" in
   S1old)
     # RED. The pre-fix code must give up while the session is still working.
     [[ "$CLEARED" == "no" ]] || fail "S1old: pre-fix code CLEARED; the defect is not being reproduced"
     (( RC != 0 )) || fail "S1old: pre-fix code returned 0; expected it to give up"
-    (( ELAPSED < BUSY )) || fail "S1old: gave up after ${ELAPSED}s, not before the ${BUSY}s turn ended"
-    [[ "$FAILED" == "0" ]] && info "RED confirmed: gave up at ${ELAPSED}s, ${BUSY}s turn still running, nothing cleared"
+    (( ELAPSED < BUSY_SPAN )) || fail "S1old: gave up after ${ELAPSED}s, not while the ${BUSY_SPAN}s turn was still running"
+    [[ "$FAILED" == "0" ]] && info "RED confirmed: gave up at ${ELAPSED}s with the session busy ${BUSY_SPAN}s, nothing cleared"
     ;;
   S1new)
     # GREEN. Same scenario, and it must now wait the turn out and clear.
     [[ "$HANDOFF_OK" == "yes" ]] || fail "S1new: no handoff was written"
     [[ "$CLEARED" == "yes" ]] || fail "S1new: the session was never cleared"
     (( RC == 0 )) || fail "S1new: rc=$RC"
-    (( ELAPSED > BUSY )) || fail "S1new: finished in ${ELAPSED}s, which is less than the ${BUSY}s busy turn — it cannot have waited it out"
-    [[ "$FAILED" == "0" ]] && info "GREEN: waited ${ELAPSED}s through a ${BUSY}s turn, got the handoff, cleared"
+    (( ELAPSED > GRACE )) || fail "S1new: finished in ${ELAPSED}s, inside the ${GRACE}s grace — it cannot have waited a turn out"
+    [[ "$FAILED" == "0" ]] && info "GREEN: waited ${ELAPSED}s through a ${BUSY_SPAN}s busy turn, got the handoff, cleared"
     ;;
   S2)
     # A dead session must be given up on, not waited on forever.
