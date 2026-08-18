@@ -19,6 +19,9 @@ Every phase uses a **structured JSON verdict schema** (`verdict-schema.json`) so
 ## The Phases
 
 ```
+PHASE 0:  Deterministic rules — scripts/deterministic-gate.sh. Ungated,
+                               non-negotiable, re-run every round. No LLM
+                               phase may overturn it (see "Phase 0")
 PHASE 1:  Opus + specialists — loop rounds until the gate ends the phase
                                (see "Loop bounds")
 PHASE 2:  Codex (GPT-5.5) — loop rounds until the gate ends the phase
@@ -94,6 +97,76 @@ Each Phase 1/2 round follows the same shape:
    `continue`, round r+1 opens at step 1 and re-advises at its own step 3; any
    other routing ends the phase here, with no further dispatch.
 ```
+
+## Phase 0: Deterministic rules (ungated, non-negotiable)
+
+Every other phase of this loop is a model forming a judgement, and a model can
+be argued out of a verdict — by a persuasive comment in the diff, by its own
+rationalisation, or by a later phase's framing. Phases 1-3 already guard
+against *correlated* error by varying vendor and stance. They do not guard
+against the shared property that all three are persuadable.
+
+Regex is not persuadable. That is the whole contribution of this phase, and
+the reason it sits outside the gate rather than inside it.
+
+```bash
+skills/advice-refine-test-loop/scripts/deterministic-gate.sh --json
+# exit 0 = clean · 1 = findings · 2 = the gate could not run
+```
+
+**When it runs.** Once before Phase 1, and again at every round's step 2
+(VERIFY), against the round's current diff. A round whose fixes introduce a
+Phase 0 match is not a passing round, whatever its advisor said.
+
+**Routing — this phase has none, which is the point.** Phase 0 findings do not
+enter `new_r`, do not carry an `autofix_class`, are never validated at step
+4.5, and are never subject to step 5 repro. There is nothing for an advisor to
+dispose of: the pattern either still matches or it does not. While any Phase 0
+finding is outstanding, the run cannot advance a phase and cannot ship,
+regardless of every verdict in the file.
+
+**Exit 2 is a stop, not a pass.** "The scanner did not run" must never be
+indistinguishable from "the scanner found nothing" — a missing `gitleaks`, an
+unreadable range, a non-repo path. Exit 2 halts-and-pauses with
+`pause_reason: deterministic-gate-unavailable`. A gate that fails open is not
+a gate.
+
+**The only escape is an inline waiver**, `arftl-allow: <rule-id>`, on the
+matched line or the line directly above it. Waivers live in the diff, so they
+are reviewable, greppable and attributable to a commit. There is deliberately
+no config file and no global suppression: both are the mechanism by which a
+rules layer quietly stops covering anything. A waiver an agent adds to make
+the gate pass is itself a visible diff line for Phases 1-3 to review — which is
+the correct place for that judgement, since "is this waiver justified" is
+exactly the kind of question regex must not try to answer.
+
+**Two named blind spots, both deliberate, neither silent.**
+
+1. *Prose files* (`.md`, `.txt`, `.rst`, `.adoc`) are not pattern-scanned — a
+   plan that says "then run `git push --force`" is a sentence, not a push.
+   Override with `--include-docs`. gitleaks still covers them; a secret in a
+   document is still a secret.
+2. *The gate script itself* is not scanned, because it states several rules as
+   literal text and would otherwise flag its own rule table on every edit.
+   Changes to it get human review instead.
+
+Measured against this repo's own history, the first draft of these rules
+produced 197 findings and zero true ones: `trap 'rm -rf "$TMP"' EXIT` after a
+`mktemp -d` is correct code, and `kill … 2>/dev/null || true` is ordinary
+cleanup rather than a verification forced green. Tightening the patterns cut
+that to 77; skipping prose took it to 0, with the fixture suite still firing
+all 11 rule classes. Both numbers matter — the second one alone would have
+been precision bought entirely with coverage.
+
+**Rules stay narrow on purpose.** Each one reports something true by pattern
+match — destructive shell, force-push and history rewrites, unscoped SQL
+mutation, curl-piped-to-shell, disabled TLS verification and host-key checking,
+world-writable modes, swallowed exceptions, verification forced green
+(`|| true`, `--exit-zero`, `continue-on-error`), suppression markers, widened
+permission surface — plus gitleaks for secrets by content. Nothing here needs
+to understand intent. Resist adding clever rules: the false-positive rate is
+what decides whether anyone still reads the output, and a rules layer people
+route around has negative value over none.
 
 ## Loop bounds (materiality stop)
 
@@ -338,6 +411,12 @@ no phase among them starts, repeats, or ends any other way. Not covered
 (bounded by their own caps, and neither loops nor advances on a verdict):
 consolidator sub-loop (3 rounds), Phase 4a (one critique + one fix pass),
 Phase 4b (one pass per surface).
+
+**Phase 0 is not gated and never routes through this table.** It is a
+precondition, not a round: it produces no verdict, has no counters, and cannot
+`continue`. An outstanding Phase 0 finding blocks advancement from wherever the
+run currently is; `deterministic-gate-unavailable` (exit 2) is a halt-and-pause
+through the existing PAUSE handler. See "Phase 0".
 
 ## Run state
 
