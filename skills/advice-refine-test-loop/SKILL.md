@@ -88,7 +88,9 @@ Each Phase 1/2 round follows the same shape:
 5. REPRODUCE each BLOCKER/HIGH finding before fixing — advisors hallucinate.
    `new_r` and `repro_r` are both finalised at the END of this step
 6. FIX by severity, re-verify after each. Read `regressed_r` off the round's
-   FINAL re-verification, diffed against the PHASE BASELINE
+   FINAL re-verification, diffed against the PHASE BASELINE — run by the PARENT,
+   on a settled tree, never from an agent's reported count. Every fix agent's
+   brief carries the grep-before-report rule; see "Verification traps" below
 7. COMMIT the round (per-round granularity, not a batch), then WRITE RUN
    STATE (`tasks/arftl-run.json` — counters, `baselines`, `findings_log`; see
    "Run state" below). Both, every round.
@@ -97,6 +99,71 @@ Each Phase 1/2 round follows the same shape:
    `continue`, round r+1 opens at step 1 and re-advises at its own step 3; any
    other routing ends the phase here, with no further dispatch.
 ```
+
+## Verification traps
+
+Each of these has silently produced a WRONG counter — a green report over a red
+suite, or a regression the gate could not see. They are cheap to avoid and
+expensive to miss, because every number the gate reads comes through here.
+
+**The parent runs the gate. An agent's count is never the gate.** Fix agents
+report green on the files they chose to run, and the files they chose are the
+ones they were already thinking about. Measured twice: a store agent reported
+"1019 passed" from a partial run when the real figure was 1528; a later round had
+all THREE fix agents report green while the full suite was red.
+
+**Require every fix agent to grep before it reports.** Selecting test files by
+reasoning about the diff is the failure above. Put this in the brief verbatim:
+
+> Before reporting, grep `tests/` for every symbol you touched and run every file
+> that matches. Do not select test files by reasoning about your diff.
+
+That one command found the missed file instantly in the round where reasoning had
+not. Note the trap is worst for a file whose location breaks the mental pattern —
+the miss was `tests/test_x.py` while the agent was thinking in `tests/core/`.
+
+**Never run the gate while an agent is still editing.** A run against a moving
+tree produces phantom reds: a test that spawns subprocesses re-imports a module
+another agent is mid-commit on. Confirm `git status --porcelain` is clean and all
+agents have returned, THEN run. A phantom red costs a full re-run to disprove.
+
+**A fix can void a prior round's test without failing it.** Watch for this
+explicitly at step 6 — `regressed_r` counts only FAILING baseline tests, so a
+test that still passes while no longer asserting anything is invisible to the
+gate. Three real instances in one round: hardening tests whose fixtures stopped
+reaching the guard they were written for and now passed trivially; a contract
+inverted under a test still asserting the old contract; and a fix landing while
+another agent was still reporting the defect. When a fix changes a parse order, a
+return type, or a refusal, re-read the prior tests that cover it and confirm they
+still fail for the right reason.
+
+**Reading test ids out of a `-v` log.** Use `sed -E 's/ PASSED.*$//'`, never a
+strict `^<id> PASSED` anchor: a parametrized id can contain SPACES
+(`test_every_spelling[ 1 ]`) and the anchor drops it silently. Symptom is an
+off-by-a-few between your extracted count and pytest's own summary — always
+reconcile the two before computing `regressed_r`.
+
+**A renamed test is not a regression.** A baseline id missing because the test was
+deliberately renamed for a contract change is expected. Check the rename landed
+with a successor that still covers the old behaviour before counting it.
+
+**`pytest -q` can suppress the summary entirely.** Where `pyproject.toml` sets
+`addopts = "-q"`, adding `-q` resolves to `-qq` and the run ends at `[100%]` with
+NO count — which reads as success to anything parsing the tail. Always pass
+`-o addopts=` (add `-v` when you need ids).
+
+**Verify a cached check actually ran.** `nix flake check` prints
+`running 0 flake checks` when derivations are already in the store, which looks
+identical to a check that passed. Force it: `nix build --rebuild <check>`.
+
+**Never name a real uncached model in a test.** One round did and pulled 15 GB
+from the HF CDN. Stub the loader and assert on the arguments a resolution is made
+with, never on whether a file appears.
+
+**`arftl-run.json` is merged, never hand-written.** `baselines` holds thousands of
+test ids that a careless rewrite destroys. Merge with `jq`, assert the counts
+before AND after, and `diff` the `baselines` object across the write. Note
+`stop_reasons` is an OBJECT keyed by phase — `+= [...]` fails on it.
 
 ## Phase 0: Deterministic rules (ungated, non-negotiable)
 
