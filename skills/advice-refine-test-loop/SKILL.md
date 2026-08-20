@@ -86,7 +86,11 @@ Each Phase 1/2 round follows the same shape:
 
    **Validate only PIVOTAL findings.** A finding the primary AND a specialist flagged INDEPENDENTLY at the same location is not pivotal — skip the validator, go straight to step 5. A singleton finding (one reviewer only) IS pivotal — validate it. This trims step 4.5 only; it NEVER skips step 5 repro.
 5. REPRODUCE each BLOCKER/HIGH finding before fixing — advisors hallucinate.
-   `new_r` and `repro_r` are both finalised at the END of this step
+   `new_r` and `repro_r` are both finalised at the END of this step, and so is
+   `selfinflicted_r`: for every finding that reproduced, ask whether THIS RUN
+   created it (re-run the repro against the pre-fix commit) or whether it
+   reports an earlier fix that never reaches a production caller. Both are
+   cheap here, where the repro already exists, and unrecoverable later
 6. FIX by severity, re-verify after each. Read `regressed_r` off the round's
    FINAL re-verification, diffed against the PHASE BASELINE — run by the PARENT,
    on a settled tree, never from an agent's reported count. Every fix agent's
@@ -325,9 +329,33 @@ A finding that reproduced and was not fixed is OPEN, so the gate can only
   at the end of the round. Breakage introduced and repaired within the round is
   not damage and counts 0; breakage carried over from an earlier round of the
   same phase still counts, every round, until it is repaired.
+- `selfinflicted_r` — of the findings counted in `repro_r`, how many THIS RUN
+  created. Two qualifying classes, both established EMPIRICALLY, never by
+  judgement:
+  - **regression-by-fix** — run the finding's step-5 repro against the commit
+    immediately before the suspect fix (`git worktree add <tmp> <sha>^`, or
+    `git stash` the tree and check it out). Qualifies iff the repro does NOT
+    demonstrate the defect there and DOES at HEAD. The suspect commits are
+    exactly this run's `round_commits`; nothing outside that list can qualify,
+    which is what keeps a pre-existing defect from being blamed on the loop.
+  - **inert-fix** — an earlier round's fix does not execute on any production
+    path, so the defect it claimed to close is still live. Establish it by
+    finding the fixed symbol's callers (`grep -rn '<symbol>' <src>`) and showing
+    that no non-test caller reaches the guard, stamp or gate that was added.
+    A passing repro test is NOT evidence against this: the round-3 fix that
+    round 4 caught was `migrate(embedder=)`, whose test called it directly while
+    the only production caller never passed the argument.
+
+  Counted once per finding, in the round that DEMONSTRATES the attribution, not
+  the round that caused it. Invariant: `0 <= selfinflicted_r <= repro_r`.
+  When the attribution check cannot run (no clean worktree, unbuildable parent
+  commit), write `selfinflicted_r: null` for that round — never `0` — and say
+  so in the round commit; a null suppresses only the two-consecutive-rounds
+  condition below, never the whole gate.
 
 `new_r` and `repro_r` are both FINALISED at the end of step 5, `regressed_r` at
-the round's last verification run. None of the three is revised afterwards.
+the round's last verification run, `selfinflicted_r` at the end of step 5
+alongside `repro_r`. None of the four is revised afterwards.
 
 `n` is the number of rounds recorded in `rounds[phase]` for the current phase,
 including the round being gated. A Phase 3 reset re-enters Phase 1 WITHOUT
@@ -404,14 +432,28 @@ Two methods, in preference order:
 
 ```bash
 # B0. Accounting invariant. A violation means the round's bookkeeping is wrong
-#     and no counter downstream can be trusted.
+#     and no counter downstream can be trusted. `selfinflicted_r` is checked
+#     only when it is a number; null means the attribution check could not run.
 if (( repro_r > new_r || new_r < 0 || repro_r < 0 || regressed_r < 0 )); then
+  stop="accounting-error"
+elif [[ "$selfinflicted_r" != null ]] && (( selfinflicted_r > repro_r || selfinflicted_r < 0 )); then
   stop="accounting-error"
 
 # B1. DAMAGE. Tests green at phase start are red now, and this round did not
 #     reproduce more than that costs.
 elif (( regressed_r > 0 && repro_r <= regressed_r )); then
   stop="no-marginal-gain"
+
+# B1.5 CHURN. The loop is fixing its own damage. Sits above B2/B3/B4 because a
+#      churning round otherwise looks productive: it reproduces real defects,
+#      breaks no baseline test, and ships green. `regressed_r` cannot see this
+#      — it counts only BASELINE tests that are failing, and a fix that creates
+#      a NEW defect, or that lands on dead code, fails nothing.
+elif [[ "$selfinflicted_r" != null ]] && (( selfinflicted_r >= 2 && 2*selfinflicted_r >= repro_r )); then
+  stop="self-inflicted-churn"
+elif [[ "$selfinflicted_r" != null && "$selfinflicted_prev" != null ]] \
+     && (( selfinflicted_r >= 1 && selfinflicted_prev >= 1 )); then
+  stop="self-inflicted-churn"
 
 # B2. Nothing carried open, nothing proposed, nothing broken: the good exit.
 elif (( new_r == 0 && regressed_r == 0 )); then
@@ -432,9 +474,17 @@ else
 fi
 ```
 
+`selfinflicted_prev` is the previous round's `selfinflicted_r` for the SAME
+phase, read from `rounds[phase]`. On the phase's first round, and across any
+round that recorded `null`, the two-consecutive-rounds branch cannot fire —
+which is deliberate: one self-inflicted defect is ordinary noise in a fix wave,
+and only a majority or a repeat is evidence about the design.
+
 Reaching B2 guarantees `regressed_r == 0` when `new_r == 0` (B1 already took
 the `new_r == 0 && regressed_r > 0` case), and reaching B3 guarantees
-`new_r > 0`. The cascade is exhaustive over every integer triple.
+`new_r > 0`. The cascade is exhaustive over every integer triple; B1.5 narrows
+what reaches B2-B4 but can never leave a triple unmatched, because both of its
+branches require `selfinflicted_r >= 1`, hence `repro_r >= 1`.
 
 In prose: **keep going while each round reproduces more new defects than the
 phase has broken and left broken.** Round count is irrelevant while that holds —
@@ -452,8 +502,9 @@ imply a routing; where one appears to, this table wins.
 | `converged` | advance | Advance to the next phase. Nothing to surface. |
 | `unreproducible` | advance-with-findings-surfaced | Advance. List every unreproduced finding verbatim in the phase's exit commit message and in the Exit report. |
 | `no-marginal-gain` | halt-and-pause | Do NOT advance, do NOT run another round. The phase's unrepaired breakage costs at least as much as this round bought, so continuing and advancing are both wrong. PAUSE handler with `pause_reason: no-marginal-gain` and every regressed test named. |
+| `self-inflicted-churn` | halt-and-pause | Do NOT advance, do NOT run another round. The loop is now generating its own findings, so more rounds converge on nothing. PAUSE handler with `pause_reason: self-inflicted-churn`, naming each self-inflicted finding and the commit that caused it. **On the human's (a) continue, the ADOPT step below runs FIRST — before round r+1's step 1.** |
 | `ceiling` | halt-and-pause | Do NOT advance. Cost backstop, never read as convergence. PAUSE handler with `pause_reason: ceiling`. |
-| `accounting-error` | halt-and-pause | Do NOT advance. PAUSE handler with `pause_reason: accounting-error` and the offending `(new_r, repro_r, regressed_r)` triple. |
+| `accounting-error` | halt-and-pause | Do NOT advance. PAUSE handler with `pause_reason: accounting-error` and the offending `(new_r, repro_r, regressed_r, selfinflicted_r)` tuple. |
 | none (`continue_round=1`) | continue | Start round r+1. |
 
 In Phase 3 only, `continue` means: reset to Phase 1 with the findings
@@ -464,7 +515,7 @@ Phase 3 `continue` halts-and-pauses with `pause_reason: phase3-reset-cap`.
 do not invent a second escalation path:
 
 - **Interactive:** print `"Phase <P> stopped: <reason> after <n> rounds
-  (new/repro/regressed per round: <trace>). Options: (a) continue more rounds anyway,
+  (new/repro/regressed/selfinflicted per round: <trace>). Options: (a) continue more rounds anyway,
   (b) ship with the remaining findings surfaced, (c) abort."` Wait for the
   user, then apply that option's run-state edit under "Run state" before acting
   on it. (a), (b) and (c) are the same three options in both modes.
@@ -486,6 +537,50 @@ precondition, not a round: it produces no verdict, has no counters, and cannot
 run currently is; `deterministic-gate-unavailable` (exit 2) is a halt-and-pause
 through the existing PAUSE handler. See "Phase 0".
 
+## The ADOPT step — stop inventing, go read the reference implementation
+
+**A hand-rolled solution to a well-trodden problem is the root cause of most
+churn, and no number of review rounds converges on it.** Each round finds a
+fresh symptom of the same wrong design, fixes that symptom, and creates the
+next one. The loop cannot detect this from the inside: every round reproduces
+real defects and ships green, which is exactly what progress looks like.
+
+This step is the ONLY response to `self-inflicted-churn`. It also runs
+unprompted, before round 1, whenever the diff contains a hand-rolled
+implementation of a problem with a standard answer. Non-exhaustive list of
+what counts: retrieval and ranking, retry/backoff, pagination and cursors,
+cache invalidation, auth and session handling, rate limiting, ingest
+checkpointing and resume, migration and schema versioning, concurrency
+primitives, date/time and timezone handling, text tokenizing and escaping.
+
+1. **Name the standard problem in ONE line.** "Hybrid lexical + dense retrieval
+   with reranking", not "search is bad". If it cannot be named in one line, the
+   churn is not a design problem — say so explicitly and go back to the gate,
+   because the rest of this step will produce a survey nobody can act on.
+2. **Research it.** `mcp__research-agent__research` at depth `deep`. Ask for
+   REFERENCE IMPLEMENTATIONS, concrete numbers and dated sources — explicitly
+   ask it to be opinionated, and to flag where the common advice is outdated.
+   A neutral survey is a failed call; re-ask rather than proceed on one. Warn
+   the user first: `deep` is ~10-15 minutes of wall time.
+3. **Diff the design against what came back**, in writing, in three buckets:
+   MATCHES / DELIBERATE DEVIATION / ACCIDENTAL DEVIATION. Every deviation lands
+   in exactly one of the last two, and "deliberate" requires a constraint that
+   was known BEFORE the research came back — a constraint discovered by reading
+   the research is a rationalisation, not a reason.
+4. **Replace every accidental deviation. Do not patch it.** One commit per
+   replacement, the reference cited in the message. A replacement that keeps
+   the local design and adds a guard to it is a patch wearing a hat, and it is
+   what the next round will find.
+5. **Only then resume the loop**, at round r+1 step 1. The replacements are part
+   of the diff under review from that point on, exactly like any other commit.
+
+Record the step in the run state: `adopt_steps: [{"round": <r>, "problem":
+"<the one line>", "report_path": "<path>", "replaced": ["<sha>", ...]}]`. A
+second `self-inflicted-churn` stop AFTER an ADOPT step has run is not another
+ADOPT step — it means the diff is too entangled to converge, and it
+halts-and-pauses with the split-the-branch recommendation stated verbatim in
+the pause line.
+
 ## Run state
 
 Loop state currently lives only in the parent's context, carried by the
@@ -503,10 +598,10 @@ no exceptions:**
   "status": "running | pending-human | complete",
   "phase": "1 | 2 | 3 | 4a | 4b",
   "round": 3,
-  "rounds": {"1": [{"new": 5, "repro": 5, "regressed": 0},
-                   {"new": 2, "repro": 2, "regressed": 0},
-                   {"new": 0, "repro": 0, "regressed": 0}],
-             "2": [{"new": 1, "repro": 1, "regressed": 0}]},
+  "rounds": {"1": [{"new": 5, "repro": 5, "regressed": 0, "selfinflicted": 0},
+                   {"new": 2, "repro": 2, "regressed": 0, "selfinflicted": 1},
+                   {"new": 0, "repro": 0, "regressed": 0, "selfinflicted": 0}],
+             "2": [{"new": 1, "repro": 1, "regressed": 0, "selfinflicted": null}]},
   "baselines": {"1": ["session::drops_line", "cli::exit_code_3"],
                 "2": ["session::drops_line", "cli::exit_code_3",
                       "ingest::errors_sink"]},
@@ -520,6 +615,7 @@ no exceptions:**
   "dedupe_status": "live | unavailable",
   "stop_reasons": {"1": "converged", "2": "unreproducible"},
   "phase3_resets": 0,
+  "adopt_steps": [],
   "round_commits": ["a1b2c3d", "e4f5g6h"],
   "fixed_summary": ["<one line per fixed finding, phase-tagged>"],
   "pause_reason": null,
@@ -860,6 +956,9 @@ After consolidator exits (clean or bounded), complete the phase transition the g
 | Dedupe `new_r` by `(file, line, claim)` | A reworded repeat at a shifted line then counts as NEW and inflates the continue signal the gate depends on. Dedupe by MEANING — equivalence-judge subagent, or trigram Jaccard ≥0.8 as fallback. |
 | PAUSE and ask the human on a stop the loop can rule on itself | `converged` and `unreproducible` advance without asking, with the reason surfaced in the exit commit message. Asking a human to adjudicate unreproducible claims is the wrong use of their attention. |
 | Advance (or run another round) on a `no-marginal-gain` stop | It means the loop is DAMAGING. Advancing ships the damage; continuing feeds it. halt-and-pause. Only the stop-routing table decides this — do not infer routing from a stop's name. |
+| Treat a round that finds real defects as proof the loop is working | It is the same picture whether the loop is finding pre-existing defects or the ones it just created. Compute `selfinflicted_r` empirically every round — repro against the pre-fix commit, and check that each earlier fix is reachable from a production caller. A green suite says nothing here: a fix that creates a new defect, or that lands on dead code, fails no baseline test. |
+| Respond to churn with another review round, a bigger reviewer, or a third opinion | More eyes on a wrong design produce more symptoms, not convergence. Churn routes to the ADOPT step: name the standard problem, research it, replace the accidental deviations. |
+| Call a deviation from the reference design "deliberate" after reading the research | A constraint discovered by reading the research is a rationalisation. Deliberate means known BEFORE — otherwise it is an accidental deviation and it gets replaced. |
 | Read `converged` as "the round found nothing" | `converged` requires `new_r == 0` — nothing proposed beyond stale re-reports that did not reproduce, AND nothing left open by an earlier round of the phase, per the OPEN definition. A round that proposes findings none of which reproduce is `unreproducible`, and it must surface those findings, not exit silently. |
 | Freeze `new_r` before step 5 knows what reproduced | A relapse — closed in an earlier round, demonstrated again now — is then deduped out of the count and `converged` can fire over a live defect. Dedupe assigns identity at step 4; the count is finalised at the end of step 5. |
 | Reset to Phase 1 a second time from Phase 3 | Capped at one reset. A diff still REPRODUCING fresh BLOCKER/HIGH after a full 1→2→3 pass wants splitting, not another lap through both vendors. |
