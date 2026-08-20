@@ -15,12 +15,14 @@ inject text. But a session is a process in a terminal, and a terminal with remot
 control can be typed into. So the reset is done *to* the session by a small
 detached helper, in this order:
 
-1. the session is asked to write its handoff — **from the context it is already
+1. **running subagents are drained** — nothing is asked for or cleared while
+   background agents are still working;
+2. the session is asked to write its handoff — **from the context it is already
    holding**, so nothing re-reads anything;
-2. the helper waits for that file to appear and be newer than the request;
-3. `/clear`;
-4. the clear is **confirmed** before anything else happens;
-5. a pickup message naming only the handoff.
+3. the helper waits for that file to appear and be newer than the request;
+4. `/clear`;
+5. the clear is **confirmed** before anything else happens;
+6. a pickup message naming only the handoff.
 
 Same process, same pane, same permissions — fresh context.
 
@@ -35,6 +37,29 @@ delivered, not that the TUI acted. If the prompt already holds typed text,
 happens. Measured. So the helper confirms a new session actually began before it
 sends the pickup or consumes the request; if it did not, it stops and keeps
 everything.
+
+Step 1 exists because a clear ends the *context*, not the *work*. Subagents this
+session dispatched keep running, and the clear interrupts every one of them
+mid-flight — their transcripts end `[Request interrupted by user]`, which is the
+clear and not the operator, so it is easy to misread as a cancellation. They are
+also awkward to recover: `SendMessage` resolves a subagent transcript inside the
+**current** session's directory only, and a clear starts a new session id, so
+resuming one by id fails with `No transcript found` until the files are moved by
+hand. Measured 2026-08-20: three review agents were killed exactly this way, each
+carrying hundreds of KB of reading and reproduction work.
+
+So the helper waits, **up to 3 hours**, for every live subagent to finish before
+it asks for the handoff. Waiting before the *request* rather than before the
+clear is deliberate — the handoff then describes settled state instead of work
+that lands seconds later with nobody left to receive it. Liveness is read from
+each transcript's last entry (an assistant turn ending normally, or an
+interruption, counts as stopped) rather than from file mtime, because a
+transcript sits unchanged for the whole of one long tool call. A transcript that
+is neither finished nor touched for 30 minutes is treated as a dead agent so an
+earlier clear's casualty cannot hold the drain open; an unparseable one is
+treated as finished, so a corrupt file cannot veto every future reset. At the
+3-hour ceiling the reset **refuses rather than clearing anyway** — clearing is
+the thing that destroys the work.
 
 If the terminal cannot be driven, **nothing is cleared**. The request is left for
 the existing fork path, which picks it up once the session exits. Say which of
@@ -61,9 +86,9 @@ the two happened; do not imply a reset that did not occur.
      `~/.local/state/claude-self-compact/inplace-reset.log`. Common ones: `KITTY_LISTEN_ON`
      unset (no remote control), `no kitty window has pid N` or `matched N
      windows` (the window could not be uniquely identified, so it refuses rather
-     than typing into someone else's session), no fresh handoff appeared, the
-     clear was not confirmed, or another reset is already running for this
-     session.
+     than typing into someone else's session), subagents still running at the
+     3-hour drain ceiling, no fresh handoff appeared, the clear was not
+     confirmed, or another reset is already running for this session.
 
 3. **Do nothing else.** Do not start work, do not run a tick, do not "prepare".
    The next thing that should happen here is the write, then the clear.
