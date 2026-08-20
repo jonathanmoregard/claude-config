@@ -92,6 +92,31 @@ WRITE_IDLE_GRACE_SECONDS = 240
 # Ceiling on the whole wait, so a session that never stops working cannot pin a
 # waiter forever.
 WRITE_WAIT_CAP_SECONDS = 900
+# A clear ends the CONTEXT, not the WORK. Subagents this session dispatched keep
+# running, and the clear interrupts every one of them mid-flight -- their
+# transcripts end `[Request interrupted by user]`, which is the clear and not the
+# operator. They are also hard to recover afterwards: `SendMessage` resolves a
+# subagent transcript inside the CURRENT session's directory only, and a clear
+# starts a new session id, so resuming one by id fails with "No transcript found"
+# until the files are moved by hand.
+#
+# MEASURED 2026-08-20: three review agents were killed exactly this way, each
+# carrying hundreds of KB of accumulated reading and reproduction work, none of
+# it recorded anywhere the successor could find. So the reset now DRAINS before
+# it clears.
+INTERRUPTED_MARK = "[Request interrupted by user]"
+# Ceiling on the drain. A subagent that never finishes must not pin a waiter
+# forever -- but the reset REFUSES at the ceiling rather than clearing anyway,
+# because clearing is what destroys the work. THREE HOURS, set by the operator
+# 2026-08-20: a review or fix agent legitimately runs over an hour, and waiting
+# out a slow one costs only time while cutting it short costs the work.
+SUBAGENT_WAIT_CAP_SECONDS = 3 * 60 * 60
+# Backstop only. A transcript neither finished nor appended to in this long is
+# treated as a dead agent, so a previous clear's casualty cannot hold the drain
+# open for the full ceiling. Deliberately generous against the longest observed
+# gap: a single tool call can run 10-15 minutes without appending anything.
+SUBAGENT_STALE_SECONDS = 30 * 60
+SUBAGENT_POLL_SECONDS = 5
 # Gap between `/clear` and the pickup: the TUI has to process the command and
 # return to an empty prompt.
 CLEAR_SETTLE_SECONDS = 2.0
@@ -166,6 +191,79 @@ def session_is_working(spid: int, sid: str) -> bool:
     if reg.get("sessionId") != sid:
         return False
     return reg.get("status") == "busy"
+
+
+def subagent_transcripts(sid: str) -> list[Path]:
+    """Every subagent transcript belonging to this session.
+
+    Globbed across all project directories rather than derived from the session's
+    cwd. The session id is already unique, and reconstructing Claude Code's
+    project-slug convention from a path is one more way to be quietly wrong.
+    """
+    out: list[Path] = []
+    try:
+        for proj in (Path.home() / ".claude" / "projects").iterdir():
+            d = proj / sid / "subagents"
+            if d.is_dir():
+                out.extend(sorted(d.glob("agent-*.jsonl")))
+    except Exception:
+        pass
+    return out
+
+
+def _transcript_finished(path: Path) -> bool:
+    """Whether this subagent has stopped, judged by its own last entry.
+
+    Two terminal states: an assistant turn that ended normally, and an
+    interruption -- an agent some earlier clear already killed must not pin this
+    one forever.
+
+    CHOSEN OVER mtime, for the reason session_is_working already documents: a
+    transcript is appended at message boundaries, so it sits unchanged for the
+    whole of one long tool call. Staleness survives only as the backstop in
+    live_subagents(), never as the primary signal.
+
+    An unreadable or half-written file counts as finished. Refusing to clear on a
+    file we cannot parse would hand any corrupt transcript a permanent veto.
+    """
+    try:
+        last = b""
+        with path.open("rb") as fh:
+            for line in fh:
+                if line.strip():
+                    last = line
+        if not last:
+            return False
+        msg = (json.loads(last) or {}).get("message") or {}
+    except Exception:
+        return True
+    if msg.get("role") == "assistant" and msg.get("stop_reason") == "end_turn":
+        return True
+    content = msg.get("content")
+    if isinstance(content, str):
+        return INTERRUPTED_MARK in content
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and INTERRUPTED_MARK in str(block.get("text") or ""):
+                return True
+    return False
+
+
+def live_subagents(sid: str) -> list[str]:
+    """Ids of this session's subagents that still appear to be running."""
+    live: list[str] = []
+    now = time.time()
+    for p in subagent_transcripts(sid):
+        if _transcript_finished(p):
+            continue
+        try:
+            if now - p.stat().st_mtime > SUBAGENT_STALE_SECONDS:
+                continue
+        except Exception:
+            continue
+        name = p.stem
+        live.append(name[len("agent-"):] if name.startswith("agent-") else name)
+    return live
 
 
 def log(msg: str) -> None:
@@ -405,6 +503,27 @@ def main(argv: list[str]) -> int:
     if wid is None:
         log(f"sid={sid} REFUSING: {why}")
         return 1
+
+    # DRAIN BEFORE CLEARING, and before the handoff is even requested -- so the
+    # handoff describes settled state rather than work that lands seconds later
+    # with nobody left to receive it.
+    live = live_subagents(sid)
+    if live:
+        log(f"sid={sid} waiting for {len(live)} running subagent(s) before clearing: "
+            f"{', '.join(live)}")
+        drain_deadline = time.time() + SUBAGENT_WAIT_CAP_SECONDS
+        while time.time() < drain_deadline:
+            live = live_subagents(sid)
+            if not live:
+                break
+            time.sleep(SUBAGENT_POLL_SECONDS)
+        if live:
+            log(f"sid={sid} NOT CLEARING: {len(live)} subagent(s) still running after the "
+                f"{SUBAGENT_WAIT_CAP_SECONDS // 3600}h drain ceiling ({', '.join(live)}). "
+                "Clearing now would interrupt them mid-flight and orphan their transcripts. "
+                "Nothing was destroyed; re-run once they finish.")
+            return 1
+        log(f"sid={sid} subagents drained; proceeding")
 
     target = handoff_path(sid)
     try:
