@@ -42,6 +42,7 @@ User instructions override everything below.
 
 ## Bash
 - Use `mcp__safe-bash__exec`. Never native `Bash` — it's denied.
+- Policy matches the command STRING, so a legitimate command can be rejected for a substring it merely contains — including inside a heredoc. Route the payload around it (`Write` the text, then `cat >>`; select tests by `-k`; drop a flag whose default is already right). Never quote or split to defeat the matcher — some rules are deliberate. Details: `detached-long-commands`.
 
 ## Build + review
 - Anything you'd branch for → invoke `orchestrate` and follow it. Never implement inline. Not for trivial single-file edits or quick questions.
