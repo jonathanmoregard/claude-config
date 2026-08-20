@@ -10,13 +10,13 @@ set -euo pipefail
 
 STATE=".claude/ralph-loop.local.md"
 
-# Working notes live in userspace (`~/.claude/tasks/<repo>/`) per CLAUDE.md, because
+# Working notes live in userspace (`~/.local/state/claude-tasks/<repo>/`) per CLAUDE.md, because
 # repo-relative notes get auto-committed and published. A project may symlink
 # `<repo>/tasks` at that dir, in which case both spellings resolve to the same files.
 # BOTH are checked, and the repo-relative one wins: a project that has not been
 # migrated must not lose its reminder, and a reminder naming a path nothing writes
 # to any more is worse than no reminder at all.
-NOTES_USERSPACE="$HOME/.claude/tasks/${PWD##*/}"
+NOTES_USERSPACE="$HOME/.local/state/claude-tasks/${PWD##*/}"
 NOTES=""
 for _d in "tasks" "$NOTES_USERSPACE"; do
   # EXISTENCE CHECK ONLY, and deliberately a GLOB: "does this project use the
