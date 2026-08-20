@@ -46,6 +46,7 @@ User instructions override everything below.
 
 ## Build + review
 - Anything you'd branch for → invoke `orchestrate` and follow it. Never implement inline. Not for trivial single-file edits or quick questions.
+- Fixes creating the next round's findings, or a fix that turns out inert → stop fixing. Research SOTA for the problem the code solves, then replace the hand-rolled design instead of patching it. Details: the ADOPT step in `advice-refine-test-loop`.
 
 ## Model
 - NixOS/VM setup, complex multi-step debugging, branch surgery, harness architecture → Opus. On Sonnet with a task that fits → say so upfront.
