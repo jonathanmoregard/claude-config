@@ -3,7 +3,10 @@
 
 THE SEQUENCE, and why it is in this order:
 
-    1. ask the session to write its handoff to ~/.claude/self-compact/<sid>/handoff/mission.md
+    1. ask the session to write its handoff to
+       ~/.local/state/claude-self-compact/<sid>/handoff/mission.md — userspace,
+       NOT under ~/.claude, because that whole tree is Claude Code's own config
+       and state surface and the agent's working state is not the CLI's to own
     2. wait until that file appears AND is newer than the request
     3. /clear
     4. a pickup message naming only that file
@@ -98,7 +101,7 @@ CLEAR_CONFIRM_SECONDS = 30
 
 def sessions_root() -> Path:
     env = os.environ.get("CLAUDE_SESSIONS_DIR")
-    return Path(env) if env else Path.home() / ".claude" / "self-compact"
+    return Path(env) if env else Path.home() / ".local" / "state" / "claude-self-compact"
 
 
 def handoff_path(sid: str) -> Path:

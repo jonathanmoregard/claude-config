@@ -204,5 +204,13 @@ logs/review-agent.log
 experiments/*/runs/
 experiments/*/runs-pilot-discarded/
 
-# runtime dir: UUID session dirs + logs for self-compact feature (repo-autosync, 2026-08-18)
-self-compact/
+# Tombstone. self-compact's runtime state (UUID session dirs + logs) moved to
+# ~/.local/state/claude-self-compact/ on 2026-08-20, so nothing should write
+# here any more. Kept anyway: the old ~/.claude/self-compact/ tree survives on
+# disk until the migration is verified, and repo-autosync auto-commits whatever
+# is untracked in this repo — an unignored leftover gets committed, not merely
+# shown in git status. Now anchored to the repo root, which the unanchored form
+# was not: it also matched skills/self-compact/, so every file added to that
+# skill after 2026-08-18 would have been silently ignored (SKILL.md survived
+# only because it was already tracked).
+/self-compact/
