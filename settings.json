@@ -23,16 +23,12 @@
       "Edit(/tmp/**)",
       "Edit(/home/jonathan/Repos/nixos-config-worktrees/**)",
       "Edit(/home/jonathan/worktrees/**)",
-      "Write(/home/jonathan/worktrees/**)",
-      "Write(/home/jonathan/Repos/nixos-config-worktrees/**)",
       "Edit(/home/jonathan/.claude/projects/**)",
       "Edit(/home/jonathan/.claude/skills/**)",
       "Edit(/home/jonathan/.claude/homunculus/**)",
       "Edit(/home/jonathan/.claude/loops/**)",
       "Edit(/home/jonathan/.claude/self-compact/**)",
-      "Write(/home/jonathan/.claude/self-compact/**)",
       "Edit(/home/jonathan/.local/state/claude-tasks/**)",
-      "Write(/home/jonathan/.local/state/claude-tasks/**)",
       "mcp__aggregator__aggregator_search_memory",
       "mcp__aggregator__aggregator_capabilities",
       "mcp__research-agent__*",
@@ -122,8 +118,7 @@
       "mcp__futuresearch__futuresearch_status",
       "Edit(/etc/nixos/**)",
       "Edit(/nix/store/**)",
-      "Edit(~/.local/state/claude-harness-tripwire/**)",
-      "Write(~/.local/state/claude-harness-tripwire/**)"
+      "Edit(~/.local/state/claude-harness-tripwire/**)"
     ],
     "ask": [],
     "additionalDirectories": [
