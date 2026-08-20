@@ -235,7 +235,7 @@ already guarantee.
 
 | what | where | bound | who runs it |
 |---|---|---|---|
-| self-compact state + requests | `self-compact-state/*.json` | `STATE_RETENTION_DAYS` = 30 | `self-compact-trigger.py`, on fire |
+| self-compact state + requests | `~/.local/state/claude-self-compact/<sid>/` — its own root, not under `$REFLECT_ROOT` | `STATE_RETENTION_DAYS` = 30 | `self-compact-trigger.py`, on fire |
 | human mission copies | `<project>/tasks/mission.<sid>.md` | `REFLECT_MISSION_RETENTION_DAYS` = 30, or session dir gone | `mission_gc`, on each mission write |
 | recursion markers | `skipped-recursions/` | `REFLECT_ARTIFACT_RETENTION_DAYS` = 14 | `reflect_artifact_gc`, every detached worker |
 | malformed-payload manifests | `malformed/` | same | same |

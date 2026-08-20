@@ -58,7 +58,7 @@ the two happened; do not imply a reset that did not occur.
      working. Tell them not to type until it does: text in the prompt is exactly
      what stops a clear from landing.
    - anything else — no reset is coming, and the reason is in
-     `~/.claude/self-compact/inplace-reset.log`. Common ones: `KITTY_LISTEN_ON`
+     `~/.local/state/claude-self-compact/inplace-reset.log`. Common ones: `KITTY_LISTEN_ON`
      unset (no remote control), `no kitty window has pid N` or `matched N
      windows` (the window could not be uniquely identified, so it refuses rather
      than typing into someone else's session), no fresh handoff appeared, the

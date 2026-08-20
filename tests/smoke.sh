@@ -539,17 +539,24 @@ REFLECT_ROOT="${REFLECT_ROOT:-$(mktemp -d -t reflect-smoke-XXXXXX)}"
 export REFLECT_ROOT
 export REFLECT_MODEL="stub-model"
 # HARD ISOLATION REQUIREMENT. Self-compact's tree moved out of $REFLECT_ROOT to
-# ~/.claude/sessions, so isolating REFLECT_ROOT alone is no longer sufficient:
-# without this, every test writes handoffs, markers and state into the USER'S
-# REAL session directory, and mission_resolve_handoff would resolve against
-# their live handoffs. It defaults inside REFLECT_ROOT so a single mktemp still
-# covers the whole suite and teardown still collects it.
+# its own root, ~/.local/state/claude-self-compact, so isolating REFLECT_ROOT
+# alone is no longer sufficient: without this, every test writes handoffs,
+# markers and state into the USER'S REAL session directory, and
+# mission_resolve_handoff would resolve against their live handoffs. It defaults
+# inside REFLECT_ROOT so a single mktemp still covers the whole suite and
+# teardown still collects it.
 CLAUDE_SESSIONS_DIR="${CLAUDE_SESSIONS_DIR:-$REFLECT_ROOT/sessions-home}"
 export CLAUDE_SESSIONS_DIR
 mkdir -p "$CLAUDE_SESSIONS_DIR"
+# BOTH roots are refused, not just the current one. The guard exists to stop a
+# run from clobbering real user state, and the old tree is still real state on
+# any machine or checkout that predates the move — an un-migrated host, a stale
+# worktree, or a bisect. Dropping the old pattern would make this suite the one
+# thing that deletes the state the migration is trying to preserve.
 case "$CLAUDE_SESSIONS_DIR" in
+  "$HOME"/.local/state/claude-self-compact|"$HOME"/.local/state/claude-self-compact/*|\
   "$HOME"/.claude/self-compact|"$HOME"/.claude/self-compact/*)
-    echo "smoke.sh: refusing to run with CLAUDE_SESSIONS_DIR pointing at the real session tree ($CLAUDE_SESSIONS_DIR)" >&2
+    echo "smoke.sh: refusing to run with CLAUDE_SESSIONS_DIR pointing at a real session tree ($CLAUDE_SESSIONS_DIR)" >&2
     exit 2 ;;
 esac
 # Force is off; idempotency test relies on it being unset.
@@ -2727,6 +2734,71 @@ done
 jq -e '.fire_at_tokens == 300000' "$SC_STATE_DIR/test-sid-b5-explicit-false/request.json" >/dev/null \
   || fail "21: a leftover self_compact.threshold=0.99 was honoured — the fire point is still config-readable"
 info "no config shape (absent/malformed/nokey/normal/explicit-false) can disable it or move the threshold"
+
+# ============================================================================
+# TEST 21b: the COMPILED-IN default root, which nothing else here exercises
+# ============================================================================
+# Every other self-compact test drives this code through CLAUDE_SESSIONS_DIR
+# pointed at a mktemp dir. That is deliberate and correct — it is what keeps the
+# suite out of the user's real state — but it also means the value that actually
+# SHIPS is never executed. The default is the only root a live Stop hook ever
+# uses, so it could be reverted to ~/.claude/self-compact and every assertion
+# above would stay green while every handoff, request marker and fire-state file
+# went back inside Claude Code's OWN config and state surface, a tree whose
+# format and lifecycle the CLI owns.
+#
+# Probed at RUNTIME from the three definitions, not grepped: a grep passes on a
+# string in a comment and fails on a whitespace change, and neither of those is
+# the property. A throwaway $HOME makes the probe incapable of creating or
+# reading anything real (verified: it leaves that HOME empty), and makes the
+# expected value exact rather than a prefix match.
+#
+# All three must AGREE, because they are the same handoff seen from three sides:
+# self-compact-trigger.py writes it, inplace_reset.py reads it back, and
+# session-reflect's lib.sh resolves it for a resume. A default that splits
+# between them is a handoff nobody can find.
+test_begin "TEST 21b: with CLAUDE_SESSIONS_DIR unset the root is ~/.local/state/claude-self-compact"
+SCD_HOME="$(mktemp -d -t reflect-defroot-XXXXXX)"
+SCD_WANT="$SCD_HOME/.local/state/claude-self-compact"
+
+scd_probe_py() {
+  # $1=module file. Asks the module for its own answer, exactly as a live hook
+  # would, with the env seam removed from the environment entirely.
+  env -u CLAUDE_SESSIONS_DIR HOME="$SCD_HOME" python3 - "$1" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("scd_probe", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+print(m.sessions_root())
+PY
+}
+
+SCD_TRIGGER_ROOT="$(scd_probe_py "$SC_TRIGGER")" \
+  || fail "21b: self-compact-trigger.py's sessions_root() could not be evaluated with CLAUDE_SESSIONS_DIR unset"
+SCD_RESET_ROOT="$(scd_probe_py "$WORKTREE/inplace_reset.py")" \
+  || fail "21b: inplace_reset.py's sessions_root() could not be evaluated with CLAUDE_SESSIONS_DIR unset"
+SCD_LIB_ROOT="$(env -u CLAUDE_SESSIONS_DIR HOME="$SCD_HOME" REFLECT_ROOT="$SCD_HOME/reflections" \
+  bash -c 'source "$1"/lib.sh; printf "%s\n" "$CLAUDE_SESSIONS_DIR"' _ "$SKILL_DIR")" \
+  || fail "21b: lib.sh could not be sourced with CLAUDE_SESSIONS_DIR unset"
+
+for scd_pair in "self-compact-trigger.py:$SCD_TRIGGER_ROOT" \
+                "inplace_reset.py:$SCD_RESET_ROOT" \
+                "session-reflect/lib.sh:$SCD_LIB_ROOT"; do
+  scd_who="${scd_pair%%:*}"; scd_got="${scd_pair#*:}"
+  [[ "$scd_got" == "$SCD_WANT" ]] \
+    || fail "21b: $scd_who defaults its sessions root to '$scd_got', not '$SCD_WANT'"
+  # The negative half, stated independently of the positive one so it keeps
+  # holding if the userspace path is ever moved WITHIN ~/.local/state: no default
+  # may land anywhere inside the CLI's own tree, at any depth.
+  case "$scd_got" in
+    "$SCD_HOME"/.claude|"$SCD_HOME"/.claude/*)
+      fail "21b: $scd_who's default sessions root is back under ~/.claude ('$scd_got') — that tree is Claude Code's own config and state surface, and agent working state does not belong in it" ;;
+  esac
+done
+# The probe must not have been what created the tree it is asserting about.
+[[ -z "$(find "$SCD_HOME" -mindepth 1 -print -quit 2>/dev/null)" ]] \
+  || fail "21b: resolving the default root wrote into \$HOME ($(find "$SCD_HOME" -mindepth 1 | head -3 | tr '\n' ' ')) — a path resolver must not have side effects"
+info "21b: producer, consumer and resolver all default to \$HOME/.local/state/claude-self-compact; none of them anywhere under ~/.claude"
 
 # ============================================================================
 # TEST 22: B1+B2 — fires at the threshold and leaves a resumable handoff

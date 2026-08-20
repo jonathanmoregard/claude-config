@@ -64,7 +64,7 @@ umask 077
 
 # ---- Config with numeric validation (advisor MEDIUM: sharp-edges) -----------
 : "${REFLECT_ROOT:=$HOME/.claude/reflections}"
-: "${CLAUDE_SESSIONS_DIR:=$HOME/.claude/self-compact}"
+: "${CLAUDE_SESSIONS_DIR:=$HOME/.local/state/claude-self-compact}"
 # REFLECT_ROOT must be ABSOLUTE (D5). Every path below is derived from it — the
 # lock, the logs, the state dirs, the fork ledger, and the authoritative mission
 # handoff this script resolves and hands to an unattended model. A RELATIVE value

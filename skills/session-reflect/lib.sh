@@ -18,7 +18,10 @@ _REFLECT_LIB_SOURCED=1
 # reflects on sessions that have ENDED; self-compact acts on sessions that are
 # ALIVE. Sharing a root made two subsystems with opposite preconditions look
 # like one, which is how a resumed-worker design got applied to a live session.
-: "${CLAUDE_SESSIONS_DIR:=$HOME/.claude/self-compact}"
+# Also deliberately NOT under ~/.claude, where it used to live: that tree is
+# Claude Code's own config and state surface, owned by the CLI, and agent
+# working state belongs in userspace under ~/.local/state.
+: "${CLAUDE_SESSIONS_DIR:=$HOME/.local/state/claude-self-compact}"
 
 # --- REFLECT_ROOT must be ABSOLUTE (D5) --------------------------------------
 # Every out-of-repo path in this system is built from REFLECT_ROOT: the session

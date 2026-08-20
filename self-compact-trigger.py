@@ -55,7 +55,7 @@ NO SWITCH — USER DECISION 2026-08-16
 
 LOOP BOUND (B6)
     Once per session per threshold crossing, persisted in
-    ~/.claude/self-compact/<sid>/state.json. A reading below the
+    ~/.local/state/claude-self-compact/<sid>/state.json. A reading below the
     threshold re-arms; only an armed session can fire; MAX_FIRES_PER_SESSION caps
     pathological oscillation. State is written BEFORE the model call, and if the
     state file cannot be written the hook does not fire at all — an unbounded
@@ -146,12 +146,21 @@ def claude_dir() -> Path:
 
 
 def sessions_root() -> Path:
-    """`~/.claude/self-compact` — our own tree, one directory per session.
+    """`~/.local/state/claude-self-compact` — our own tree, one dir per session.
 
-    NOT `~/.claude/sessions`: that is Claude Code's OWN session registry
+    NOT UNDER `~/.claude` AT ALL, which is where this tree used to live. That
+    whole directory is Claude Code's OWN config and state surface: the CLI owns
+    its format and its lifecycle, and everything the agent writes there is a
+    guest in someone else's house. Agent working state belongs in userspace, so
+    `~/.local/state`, which is what that directory is for.
+
+    The narrower version of the same objection came first and still stands: NOT
+    `~/.claude/sessions`, because that is Claude Code's own session registry
     (<pid>.json files carrying sessionId/cwd/status). Writing our tree inside a
     directory whose format and lifecycle the CLI owns is the foreign-owned
-    location hazard this project has legislated about twice.
+    location hazard this project has legislated about twice — the move out of
+    `~/.claude` entirely is that same lesson applied one level up, to the parent
+    rather than to a single sibling.
 
     DELIBERATELY NOT UNDER $REFLECT_ROOT. Self-compact used to live inside the
     session-reflect tree because it reused that subsystem to write its handoff.
@@ -163,7 +172,7 @@ def sessions_root() -> Path:
 
     Layout, one uuid-keyed directory per session:
 
-        ~/.claude/self-compact/<sid>/
+        ~/.local/state/claude-self-compact/<sid>/
             cwd            which project this session belongs to. NOT in the
                            fork's write grant -- it decides where a resume runs,
                            so a resumed process must not be able to retarget the
@@ -179,7 +188,13 @@ def sessions_root() -> Path:
     does for session-reflect. It selects a ROOT, never a behaviour.
     """
     env = os.environ.get("CLAUDE_SESSIONS_DIR")
-    return Path(env) if env else claude_dir() / "self-compact"
+    if env:
+        return Path(env)
+    # Deliberately NOT built from claude_dir(). That helper resolves the CLI's
+    # own tree, which is precisely what this root must stay outside; its other
+    # callers (the inplace_reset.py script path, the transcript glob) genuinely
+    # do want the CLI tree, so it keeps its meaning and this path is built here.
+    return Path.home() / ".local" / "state" / "claude-self-compact"
 
 
 def session_dir(sid: str) -> Path:
