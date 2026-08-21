@@ -731,8 +731,8 @@ Both lanes emit JSON matching `~/.claude/skills/advice-refine-test-loop/verdict-
 
 **The verdict has exactly two jobs: it carries the findings, and its coherence
 with them is cross-validated at step 4** (an unparseable or incoherent response
-is a FAILED ROUND). It decides nothing. No verdict value advances a phase, ends
-a round loop, or triggers the consolidator — the gate does all three.
+is a FAILED ROUND). It routes nothing — see the stop-routing table in "Loop
+bounds", which is where advancement is decided.
 
 - **PASS** = ZERO findings (empty `findings` array).
 - **PASS_WITH_FIXES** = at least one MEDIUM or LOW finding, no BLOCKER/HIGH.
@@ -793,7 +793,7 @@ Parse: `verdict=$(codex exec … | jq -r '.verdict')`. Values: `PASS`, `PASS_WIT
 
 **Verdict-missing:** if `jq -r '.verdict'` prints `null` or errors, treat the round as failed and re-run once with an explicit "your last output was not valid JSON — emit exactly the verdict-schema.json shape" reminder. On second verdict-missing, PAUSE per above (do NOT silently advance — a Codex round that can't emit a parseable verdict has produced zero coverage).
 
-**Budget expectation:** Phase 2 should usually complete in 1-2 rounds because Opus already caught the bulk. If Codex demands ≥3 rounds, that IS the signal — Codex saw something Opus missed, and the extra rounds are the reason Phase 2 exists. Do not read a flat blocker COUNT as churn: two new reproducible defects in round 4 is the loop working, and on a large diff the count can sit flat for rounds while every round finds something real. The distinction that matters is novelty, reproducibility, and marginal gain, which is what the "Loop bounds" gate measures. Codex re-flagging findings that no longer reproduce is the actual churn signal, and the gate stops on that.
+**Budget expectation:** Phase 2 should usually complete in 1-2 rounds because Opus already caught the bulk. If Codex demands ≥3 rounds, that IS the signal — Codex saw something Opus missed, and the extra rounds are the reason Phase 2 exists. Do not read a flat blocker COUNT as churn (see "Loop bounds"); the actual churn signal is Codex re-flagging findings that no longer reproduce, and the gate stops on that.
 
 ### Why Codex still runs last, and what that costs
 
@@ -815,12 +815,11 @@ After Phase 2 ADVANCES (a gate stop routed `advance` or
 `advance-with-findings-surfaced`).
 
 **Phase 3 is ONE round of the same round shape and evaluates the SAME gate at
-its step 8** — steps 1-8, repro included. It has exactly one difference, already
-stated in the stop-routing table: `continue` means reset to Phase 1 with the
-findings pre-seeded, not another Phase 3 round. Increment `phase3_resets`; on a
-second `continue`, PAUSE with `pause_reason: phase3-reset-cap`. Every other
-routing applies the table unchanged — `converged` and `unreproducible` advance
-to Phase 4, `no-marginal-gain` / `ceiling` / `accounting-error` halt-and-pause.
+its step 8** — steps 1-8, repro included. Its one difference is already in the
+stop-routing table: `continue` means reset to Phase 1 with the findings
+pre-seeded, not another Phase 3 round. Increment `phase3_resets`; on a second
+`continue`, PAUSE with `pause_reason: phase3-reset-cap`. Every other routing
+applies that table unchanged.
 
 Dispatch: same `Agent(subagent_type="advisor", …)` as Phase 1, but the prompt is framed adversarially:
 
@@ -837,7 +836,7 @@ Given the state of these files, what did they miss?
 - If nothing new, emit verdict PASS with empty findings.
 ```
 
-**Budget:** exactly 1 dispatch per pass. Never loop adversarial itself; the only loop is Phase 3 → Phase 1, and the gate's `continue` is the only thing that starts it. A second reset is the "split the diff" signal — PAUSE instead.
+**Budget:** exactly 1 dispatch per pass. Never loop adversarial itself; the only loop is Phase 3 → Phase 1, and the gate's `continue` is the only thing that starts it.
 
 ## Advisor Prompt Shape
 
@@ -915,7 +914,7 @@ Discard unreproducible claims — do NOT fix them. Discard means "do not act on"
 
 **A weak repro is worse than no repro** — it manufactures a false approval that the rest of the loop then trusts. A repro counts toward `repro_r` iff, at step 5 and BEFORE any fix, it FAILS against the current code and exercises the exact path the finding claims. A repro that fails for an unrelated reason is discarded and the finding goes back to unreproduced.
 
-**`repro_r` is decided at step 5 and never revised.** It counts findings whose bad behaviour was empirically DEMONSTRATED, full stop — whether the later fix succeeded is a separate fact, recorded as `fixed` in `findings_log`. A finding that reproduced and is STILL BROKEN at the end of the round counts 1: that is precisely the case the loop must keep working on, and discounting it would advance the phase past a live defect. A fix counts as successful (`fixed: true`) only when the repro passes after it.
+**`repro_r` is decided at step 5 and never revised** — defined in "Loop bounds". The case worth restating at the point of use: a finding that reproduced and is STILL BROKEN at the end of the round counts 1, because that is precisely the case the loop must keep working on and discounting it would advance the phase past a live defect. A fix counts as successful (`fixed: true`) only when the repro passes after it.
 
 ## Consolidator sub-loop (LOW remainder)
 
@@ -968,7 +967,7 @@ After consolidator exits (clean or bounded), complete the phase transition the g
 | Skip re-verification after each fix | Regressions hide in the batch |
 | Stop after round 1 because it "felt thorough" | Most valuable finding often lands in round 3. Stop on the "Loop bounds" gate, not on a feeling — the gate is what makes "keep going" safe to say. |
 | Keep looping a phase because the advisor "still has notes" | The bound is marginal gain, not exhaustion. Notes that don't reproduce aren't work. Stop when a round stops reproducing more NEW defects than its fixes break — not when the count stops shrinking. |
-| Stop a phase because the blocker COUNT went flat | Count is a bad proxy. A round that finds two new reproducible defects on a large diff is the loop working, and stopping to ask about it spends the user's attention on a question with an obvious answer. Judge novelty, reproducibility, and regressions caused. |
+| Stop a phase because the blocker COUNT went flat | Count is a bad proxy — on a large diff it can sit flat while every round finds something real. Judge novelty, reproducibility, and regressions caused; that is what the "Loop bounds" gate measures. |
 | Count only what a round FOUND, ignoring what its fixes BROKE | Benefit alone is not progress. Fixes regress previously-passing tests, and a loop that never counts `regressed_r` keeps iterating while it destroys working code — reported acceptance rises the whole time. Continue only while `repro_r > regressed_r`. |
 | Treat the `n >= 8` ceiling as "the phase converged" | It is a COST backstop. A fixed round ceiling carries no information about whether the last round was worth running. `ceiling` routes to the PAUSE handler; `converged` is a different stop with a different meaning. |
 | Dedupe `new_r` by `(file, line, claim)` | A reworded repeat at a shifted line then counts as NEW and inflates the continue signal the gate depends on. Dedupe by MEANING — equivalence-judge subagent, or trigram Jaccard ≥0.8 as fallback. |
@@ -1049,11 +1048,11 @@ Neither is gated by "Loop bounds": 4a is one critique plus one bounded fix pass,
 | Phase | Vendor | Reviewer role | Combines with | Skip when |
 |---|---|---|---|---|
 | 1 | Anthropic (Opus + specialists) | Broad correctness + narrow security/API passes | Own phase output only | Never; foundation phase |
-| 4.5 (in-round) | Anthropic (Opus, validator) | Re-verify PIVOTAL (singleton) findings against actual file state; findings + paths only, no advisor context; array-index correlation `[{index, verified, unverifiable_confirmed, note}]`; parent drops `findings[i]` iff `verified=false` AND the finding is not tagged `unverifiable: true`; a drop CLOSES that finding with `repro: false` and keeps it in `new_r`; `unverifiable_confirmed` informational | Feeds into step 5 (reproduce) | Per-finding when two reviewers independently converged on the location (go straight to step 5). Wholesale on any validator failure (quota / malformed JSON / no usable result) — degrade to pre-4.5 behavior, never retry, never PAUSE |
+| 4.5 (in-round) | Anthropic (Opus, validator) | Re-verify PIVOTAL (singleton) findings against actual file state — input boundary, drop rule and degrade-on-failure behaviour all defined at step 4.5. A drop CLOSES the finding with `repro: false` and keeps it in `new_r` | Feeds into step 5 (reproduce) | Per-finding on independent two-reviewer convergence; wholesale on any validator failure — see step 4.5 |
 | 2 | OpenAI (Codex / GPT-5.5) | Cross-vendor correctness on Opus-clean state | Phase 1 fix history carried in prompt | Never; PAUSE on quota, don't silently skip |
 | 3 | Anthropic (Opus, adversarial) | "Prior phases were wrong — find why" | Same gate at step 8; a `continue` resets to Phase 1 | Never; one shot, cheap |
-| 4a | Anthropic (Opus x2 — defect + taste critics) | UI defect + house-style critique — protocol in `~/.claude/skills/advice-refine-test-loop/references/ui-taste-phases.md`, read in full | Own phase output only | Non-UI diffs |
-| 4b | OpenAI (Codex vision-taste) on regenerated shots | Second-vendor VLM catch-what-Opus-missed — protocol in `~/.claude/skills/advice-refine-test-loop/references/ui-taste-phases.md`, read in full | Union w/ geometry oracle (ground truth) + Phase 4a Opus taste, per `docs/reviews/multi-model-taste-ledger.md` protocol | Non-UI diffs; NEVER skip on UI-touching diffs — drift-back class survives 1-4a |
+| 4a | Anthropic (Opus x2 — defect + taste critics) | UI defect + house-style critique — protocol per "Phases 4a + 4b" | Own phase output only | Non-UI diffs |
+| 4b | OpenAI (Codex vision-taste) on regenerated shots | Second-vendor VLM catch-what-Opus-missed — protocol per "Phases 4a + 4b" | Union w/ geometry oracle (ground truth) + Phase 4a Opus taste, per `docs/reviews/multi-model-taste-ledger.md` protocol | Non-UI diffs; NEVER skip on UI-touching diffs — drift-back class survives 1-4a |
 | 4c (future) | Google (Gemini 2.5 Pro / 3.x) | Third-vendor VLM, high-recall miss catcher | Same combiner slot as 4b | No API key wired; not this round |
 
 ## Exit
