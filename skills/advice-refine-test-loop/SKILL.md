@@ -1,6 +1,6 @@
 ---
 name: advice-refine-test-loop
-description: Use when shipping non-trivial changes that must land clean — the user says "look through carefully and fix what's off", "ask for advice and repeat", "keep refining until neat", or is going to bed. Runs four sequential phases (Opus + narrow specialists → Codex → adversarial → optional taste incl. Codex vision-taste 4b for UI diffs) with structured JSON verdicts, empirical repro, prefix-cached prompts, and a bounded consolidator sub-loop for LOWs (MEDIUMs surface but do not block).
+description: Use when shipping non-trivial changes that must land clean — the user says "look through carefully and fix what's off", "ask for advice and repeat", "keep refining until neat", or is going to bed. Also use to resume an interrupted run recorded in arftl-run.json. Runs four sequential phases (Opus + narrow specialists → Codex → adversarial → optional taste incl. Codex vision-taste 4b for UI diffs), reproducing every finding before fixing it.
 ---
 
 # Advice-Refine-Test Loop
@@ -595,11 +595,10 @@ the pause line.
 
 ## Run state
 
-Loop state currently lives only in the parent's context, carried by the
-"Prior rounds fixed:" prompt delta. A compact, crash, or restart mid-Phase-2
-therefore loses which phase and round were live and the entire fix history —
-and the natural recovery is to restart Phase 1, re-burning both quotas on
-work already done. Persist it.
+The parent's context is not durable storage. A compact, crash, or restart
+mid-Phase-2 loses which phase and round were live and the entire fix history,
+and the natural recovery — restart Phase 1 — re-burns both quotas on work
+already done. The file below is what makes that recovery cheap instead.
 
 **Write `<notes>/arftl-run.json` at every round commit — step 7, same step, no
 exceptions.** `<notes>` is `~/.local/state/claude-tasks/<repo-name>/` per
@@ -756,7 +755,7 @@ Codex enforces the schema via `codex exec --output-schema ~/.claude/skills/advic
 | `insecure-defaults` skill | secrets loading, auth code, env-var-driven config, module defaults, feature flags | Fresh Opus subagent via `Agent(subagent_type="advisor", prompt="Invoke the insecure-defaults skill on <paths>. If Skill tool is unavailable in this session (advisor.md was recently edited without a session restart), fall back to applying the skill's checklist manually from your training. Emit findings in verdict-schema.json format.")` |
 | `sharp-edges` skill | new public API surface, config schema, CLI flag design, cryptographic function ergonomics | Same shape as above |
 
-**advisor.md now includes `Skill` in its tool whitelist** — safe because Skill invocation is metadata-only (loads instructions into the subagent's context); any tool the loaded skill prescribes that is not in the whitelist still fails, preserving the read-only invariant. NEW SESSION REQUIRED after editing advisor.md; specialist dispatches in a stale session fall back to manual checklist application (still useful, marginally lower recall).
+**`advisor.md` whitelists `Skill`** — safe because Skill invocation is metadata-only (loads instructions into the subagent's context); any tool the loaded skill prescribes that is not in the whitelist still fails, preserving the read-only invariant. NEW SESSION REQUIRED after editing advisor.md; specialist dispatches in a stale session fall back to manual checklist application (still useful, marginally lower recall).
 
 Dispatch specialists in the SAME tool-use block as the primary Opus advisor — parallel, independent, read-only, **NO shared state**. No specialist sees the primary's findings, another specialist's findings, or any hint of what the others are looking at, until all have reported. One shared cue before they report collapses them into one reviewer. Merge afterwards by semantic-equivalence dedupe (same rule as `new_r`), not by `(file, line)`; specialist findings inherit the primary's phase counter but are tagged in commit messages (`[specialist:insecure-defaults]`). If BOTH the primary and a specialist independently flag the same location, that convergence is the confidence signal: skip step 4.5's validator for it and reproduce it first.
 
@@ -1053,7 +1052,7 @@ Neither is gated by "Loop bounds": 4a is one critique plus one bounded fix pass,
 | 3 | Anthropic (Opus, adversarial) | "Prior phases were wrong — find why" | Same gate at step 8; a `continue` resets to Phase 1 | Never; one shot, cheap |
 | 4a | Anthropic (Opus x2 — defect + taste critics) | UI defect + house-style critique — protocol per "Phases 4a + 4b" | Own phase output only | Non-UI diffs |
 | 4b | OpenAI (Codex vision-taste) on regenerated shots | Second-vendor VLM catch-what-Opus-missed — protocol per "Phases 4a + 4b" | Union w/ geometry oracle (ground truth) + Phase 4a Opus taste, per `docs/reviews/multi-model-taste-ledger.md` protocol | Non-UI diffs; NEVER skip on UI-touching diffs — drift-back class survives 1-4a |
-| 4c (future) | Google (Gemini 2.5 Pro / 3.x) | Third-vendor VLM, high-recall miss catcher | Same combiner slot as 4b | No API key wired; not this round |
+| 4c (future) | Google (Gemini 2.5 Pro / 3.x) | Third-vendor VLM, high-recall miss catcher | Same combiner slot as 4b | No API key wired |
 
 ## Exit
 
