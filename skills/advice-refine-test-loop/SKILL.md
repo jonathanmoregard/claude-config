@@ -574,6 +574,26 @@ primitives, date/time and timezone handling, text tokenizing and escaping.
    ask it to be opinionated, and to flag where the common advice is outdated.
    A neutral survey is a failed call; re-ask rather than proceed on one. Warn
    the user first: `deep` is ~10-15 minutes of wall time.
+
+   **When the research call cannot run, PAUSE. Never substitute your own
+   recall for it.** The tool being absent or disconnected, an error return, and
+   a second neutral survey after one re-ask all mean one thing: there is no
+   reference implementation to diff against, and diffing against your own
+   memory of one is precisely the rationalisation this step exists to stop.
+   Halt-and-pause through the existing PAUSE handler with
+   `pause_reason: adopt-research-unavailable`. The generic (a)/(b)/(c) do not
+   map cleanly onto this stop, so spell them out in the pause line:
+
+   - **(a) proceed unresearched** — run steps 3-5 with the comparison drawn
+     from your own knowledge, record `report_path: null` in `adopt_steps`, and
+     name the degradation in the round commit message and the Exit report. An
+     ADOPT step taken this way NEVER counts as having consulted a reference, so
+     a later `self-inflicted-churn` stop is the split-the-branch signal, not
+     grounds for a second ADOPT step.
+   - **(b) skip ADOPT** — resume the loop at round r+1 with the churn
+     unaddressed. This is shipping a known-churning design consciously; say so
+     in the Exit report.
+   - **(c) abort.**
 3. **Diff the design against what came back**, in writing, in three buckets:
    MATCHES / DELIBERATE DEVIATION / ACCIDENTAL DEVIATION. Every deviation lands
    in exactly one of the last two, and "deliberate" requires a constraint that
@@ -742,7 +762,7 @@ message for the human to triage.
 
 The advisor gets ONE part of this and no more: the COHERENCE rule — which verdict string goes with which findings array (`PASS` = empty; `PASS_WITH_FIXES` = no BLOCKER/HIGH; `BLOCKS` = ≥1 BLOCKER/HIGH). Never what a verdict costs, triggers, or buys. `PASS` with a non-empty findings array is unreachable and must never be emitted; LOW-only remainders are `PASS_WITH_FIXES`. `verdict-schema.json` is written to that boundary: its `verdict` description carries the coherence rule only, its `severity` description defines each level by blast radius, reversibility, silence and recoverability, and its `autofix_class` description defines each value by reversibility, how far the edit reaches, and whether human judgement is required. Keep it that way — the schema text ships to the Phase 2 advisor verbatim via `--output-schema`.
 
-Codex enforces the schema via `codex exec --output-schema ~/.claude/skills/advice-refine-test-loop/verdict-schema.json …`. Opus advisor enforces via prompt instruction (advisor.md system prompt requires JSON output).
+Codex enforces the schema structurally: `scripts/codex-advise.sh` pins `--output-schema` to this file on every call, in both Codex phases. Opus advisor enforces via prompt instruction (advisor.md system prompt requires JSON output).
 
 ## Phase 1: Opus + narrow specialists
 
@@ -767,30 +787,27 @@ Loop rounds until the "Loop bounds" gate ends the phase, then apply its routing.
 
 ## Phase 2: Codex (GPT-5.5) advisor
 
-Dispatch:
+Dispatch through the wrapper — never call `codex exec` by hand:
 
 ```bash
-codex exec --skip-git-repo-check \
-  --output-schema ~/.claude/skills/advice-refine-test-loop/verdict-schema.json \
-  "<PROMPT>"
+~/.claude/skills/advice-refine-test-loop/scripts/codex-advise.sh \
+  --prompt-file <path> --out <path>
+# exit 0 = verdict produced · 2 = the script could not run
+#      3 = quota · 4 = timeout/connectivity · 5 = no parseable verdict
 ```
 
-`--output-schema` forces valid JSON matching the shared verdict schema — no regex parsing on prose. Codex CLI runs GPT-5.5 (per ~/.codex/config.toml default, ChatGPT Plus auth). Sandbox is read-only by default; do NOT pass `--dangerously-*` flags. The prompt template is the same "Advisor Prompt Shape" used in Phase 1, but with an updated "Prior rounds fixed:" list covering the entire Phase 1 history (primary + specialists) so Codex doesn't re-flag what was already caught.
+The wrapper owns the flag set both Codex phases share — read-only sandbox, no `--dangerously-*` anything, the wall-clock cap, `--output-schema` forcing JSON so nothing regex-parses prose, and **exactly one retry per failure class, never a third attempt**. It is the single copy of that plumbing; Phase 4b calls the same script. Fixtures: `scripts/codex-advise-test.sh`.
 
-Parse: `verdict=$(codex exec … | jq -r '.verdict')`. Values: `PASS`, `PASS_WITH_FIXES`, `BLOCKS`.
+Codex CLI runs GPT-5.5 (per `~/.codex/config.toml` default, ChatGPT Plus auth), so Phase 2 passes no `--model`. The prompt is the same "Advisor Prompt Shape" used in Phase 1, with an updated "Prior rounds fixed:" list covering the entire Phase 1 history (primary + specialists) so Codex doesn't re-flag what was already caught.
 
-**Usage-limit fallback:** if the call returns "usage limit" / "quota exceeded" / HTTP 429, re-run ONCE with `-m gpt-5.4` (lighter tier still on Plus quota). If that also fails, **PAUSE the loop and route to the user**:
+**Exit 0 is not yet a verdict you may act on.** The script checks that `.verdict` is one of `PASS` / `PASS_WITH_FIXES` / `BLOCKS`; it deliberately does NOT check coherence against the findings array, because that check applies to the Opus lane too and belongs at step 4. Run step 4's cross-validation on the output either way.
 
-- **Interactive session:** print "Phase 2 blocked: Codex quota exhausted at <ts>. Options: (a) wait <T> for reset then resume, (b) ship consciously without cross-vendor coverage, (c) abort." Wait for user decision.
+**Exits 3, 4 and 5 are the PAUSE triggers, and the script has already spent the one sanctioned retry.** Do not re-invoke it hoping for a better roll:
+
+- **Interactive session:** print "Phase 2 blocked: <quota exhausted | no response | no parseable verdict> at <ts>. Options: (a) wait <T> for reset then resume, (b) ship consciously without cross-vendor coverage, (c) abort." Wait for user decision.
 - **Unattended session** (loop triggered by "going to bed" / cron / no live human): append to `pending_for_human.md` per the CLAUDE.md format (`## <date>: Codex Phase 2 quota-exhausted / Why blocked / Steps for human / Everything else done`). Do NOT advance and do NOT ship. Exit the whole skill with status `pending-human`.
 
-**All four failure modes (quota-exhausted / timeout / connectivity / verdict-missing) route to the SAME PAUSE handler on second failure** — the loop stops, unattended runs write to `pending_for_human.md` and exit `pending-human`, interactive runs prompt the user. Never fall through silently. A DISPATCH FAILURE never advances Phase 2; only a gate stop can, per the stop-routing table in "Loop bounds".
-
-**Timeout:** wrap the codex exec call with a wall-clock cap (`timeout 300s codex exec ...`). A model hang or long stall past 5 minutes is treated as connectivity failure → retry once after 30s → if second try also stalls, PAUSE per above.
-
-**Connectivity failure:** if codex exits with network error, retry once after 30s. On second failure, PAUSE per above.
-
-**Verdict-missing:** if `jq -r '.verdict'` prints `null` or errors, treat the round as failed and re-run once with an explicit "your last output was not valid JSON — emit exactly the verdict-schema.json shape" reminder. On second verdict-missing, PAUSE per above (do NOT silently advance — a Codex round that can't emit a parseable verdict has produced zero coverage).
+**All four failure modes (quota-exhausted / timeout / connectivity / verdict-missing) route to the SAME PAUSE handler** — the loop stops, unattended runs write to `pending_for_human.md` and exit `pending-human`, interactive runs prompt the user. Never fall through silently. A DISPATCH FAILURE never advances Phase 2; only a gate stop can, per the stop-routing table in "Loop bounds". **Exit 2 is not a review result either** — the script could not run, which is the Phase 0 lesson applied here: a missing tool must never read as a clean pass.
 
 **Budget expectation:** Phase 2 should usually complete in 1-2 rounds because Opus already caught the bulk. If Codex demands ≥3 rounds, that IS the signal — Codex saw something Opus missed, and the extra rounds are the reason Phase 2 exists. Do not read a flat blocker COUNT as churn (see "Loop bounds"); the actual churn signal is Codex re-flagging findings that no longer reproduce, and the gate stops on that.
 
@@ -801,7 +818,7 @@ Parse: `verdict=$(codex exec … | jq -r '.verdict')`. Values: `PASS`, `PASS_WIT
 Required, non-negotiable:
 
 - Every Codex finding clears parent-side reproduction (step 5) before ANY edit. Confidence is not evidence; a Codex BLOCKER that will not reproduce is discarded, not downgraded into a smaller fix.
-- Codex never edits. `codex exec`, read-only sandbox, no `--dangerously-*` flags. The parent writes every fix.
+- Codex never edits. Read-only sandbox, no `--dangerously-*` flags — `scripts/codex-advise.sh` refuses those flags outright rather than trusting the caller to omit them. The parent writes every fix.
 - Do not soften a Codex finding into a "safe tidy-up" when repro fails. That is the regression path.
 
 **Still run it.** Codex rounds after clean Opus rounds reliably surface defect classes Opus rounds miss whole — in particular **inference-by-absence**, where a reviewer treats a coverage gap (no test, no branch, no error path) as evidence that the case is handled. Hunt that class explicitly in Phase 2.

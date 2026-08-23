@@ -177,19 +177,31 @@ permits exactly one findings array per call.
 EOF
 )"
 
-codex exec --skip-git-repo-check \
-  -m gpt-5-codex \
-  --image "$SHOTS" \
-  --output-schema ~/.claude/skills/advice-refine-test-loop/verdict-schema.json \
-  "$PROMPT" > /tmp/codex-vision-taste-<surface>.json
+printf '%s\n' "$PROMPT" > /tmp/vision-prompt-<surface>.txt
+
+~/.claude/skills/advice-refine-test-loop/scripts/codex-advise.sh \
+  --prompt-file /tmp/vision-prompt-<surface>.txt \
+  --model gpt-5-codex \
+  --images "$SHOTS" \
+  --out /tmp/codex-vision-taste-<surface>.json
+# exit 0 = verdict produced · 2 = the script could not run
+#      3 = quota · 4 = timeout/connectivity · 5 = no parseable verdict
 ```
+
+The wrapper is the same one Phase 2 uses, and it owns the shared plumbing:
+read-only sandbox, no `--dangerously-*` anything, the 300s cap,
+`--output-schema` pinned to `verdict-schema.json`, and exactly one retry per
+failure class. What is 4b-specific stays here — the model, the images, the
+prompt, the severity floor and the LOW filter below. `--images` takes ABSOLUTE
+paths and the script rejects anything else, since the combiner attributes each
+finding to its shot by that exact path.
 
 Repeat per surface. Store outputs under a run-scoped dir (e.g.
 `/tmp/design-review-YYYY-MM-DD/vision-taste/`). Do not batch every surface
 into one invocation — Codex vision recall drops sharply past ~4 images per
 turn, per DiffSpot Hard-tier data.
 
-`--output-schema` returns exactly ONE verdict object per invocation. Attribute
+The schema the wrapper pins returns exactly ONE verdict object per invocation. Attribute
 each finding to its shot via its absolute `file` path — the schema's `file` is
 an absolute path in every phase, 4b included; never ask for or expect a
 per-image object or a per-shot findings array.
@@ -204,13 +216,19 @@ Drop 4b findings still rated LOW once the floor has been applied; the geometry
 oracle and 4a cover polish. Never put this in the prompt: a "do not report LOW"
 instruction pushes borderline LOWs up to MEDIUM instead, uncorrectably.
 
-**Failure modes** follow the same PAUSE rules as Phase 2:
+**Failure modes** follow the same PAUSE rules as Phase 2, and the wrapper has
+already spent the one sanctioned retry by the time it exits non-zero. Never
+re-invoke it hoping for a better roll:
 
-- Quota exhausted → retry once with `-m gpt-5.4` (lighter tier still has
-  vision on Plus quota); on second failure, PAUSE per Phase 2 rules
-  (interactive: prompt; unattended: `pending_for_human.md`).
-- Timeout (wrap with `timeout 300s`) → retry once after 30s → PAUSE.
-- Unparseable JSON → re-run once with an explicit schema reminder → PAUSE.
+- Exit 3 — quota exhausted, including on the lighter fallback tier (which still
+  has vision on Plus quota).
+- Exit 4 — timeout or connectivity, including after the one 30s retry.
+- Exit 5 — no parseable verdict, including after the one schema-reminder re-ask.
+- Exit 2 — the script could not run at all. Not a review result, and never a
+  clean pass.
+
+All five route to the Phase 2 PAUSE handler: interactive prompts the user,
+unattended writes `pending_for_human.md` and exits `pending-human`.
 
 Never silently skip 4b. The whole point of the second vendor is coverage of
 what 4a misses; a skipped 4b is worse than a skipped Phase 2 because the
