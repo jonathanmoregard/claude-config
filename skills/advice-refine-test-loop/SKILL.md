@@ -1,25 +1,26 @@
 ---
 name: advice-refine-test-loop
-description: Use when shipping non-trivial changes that must land clean — the user says "look through carefully and fix what's off", "ask for advice and repeat", "keep refining until neat", or is going to bed. Runs four sequential phases (Opus + narrow specialists → Codex → adversarial → optional taste incl. Codex vision-taste 4b for UI diffs) with structured JSON verdicts, empirical repro, prefix-cached prompts, and a bounded consolidator sub-loop for LOWs (MEDIUMs surface but do not block).
+description: Use when shipping non-trivial changes that must land clean — the user says "look through carefully and fix what's off", "ask for advice and repeat", "keep refining until neat", or is going to bed. Also use to resume an interrupted run recorded in arftl-run.json. Runs four sequential phases (Opus + narrow specialists → Codex → adversarial → optional taste incl. Codex vision-taste 4b for UI diffs), reproducing every finding before fixing it.
 ---
 
 # Advice-Refine-Test Loop
 
-Single-pass review reliably misses fail-open paths, silently-swallowed exceptions, resource leaks, schema mismatches. Single-vendor review misses whatever that vendor's model is systematically blind to. Both-vendors-agree still misses what confirmation bias hides. Single-vendor VISUAL review misses geometric defects (radio-dot Y-centering, dot position, width alignment, selected-state color regressions) — the DiffSpot 2026 benchmark shows every frontier VLM misses 60%+ of true single-CSS-property defects, and pixel magnitude doesn't predict detection. Multi-vendor visual taste + a deterministic DOM-geometry oracle is the only combination that closes that gap.
+Single-pass review reliably misses fail-open paths, silently-swallowed exceptions, resource leaks, schema mismatches. Single-vendor review misses whatever that vendor's model is systematically blind to. Both-vendors-agree still misses what confirmation bias hides. Single-vendor VISUAL review misses geometric defects — radio-dot Y-centering, dot position, width alignment, selected-state color regressions — at a rate no single vendor improves on; multi-vendor visual taste plus a deterministic DOM-geometry oracle is the only combination that closes that gap. Benchmark evidence and the full protocol: `~/.claude/skills/advice-refine-test-loop/references/ui-taste-phases.md`.
 
 The loop catches all four by staging the review:
 
 - **Phase 1 (Opus + narrow specialists)** does broad correctness review plus targeted passes (secure defaults, footgun APIs) when the diff touches those areas.
 - **Phase 2 (Codex/GPT-5.5)** cross-vendor review runs LAST so it only sees Opus-blessed state — preserves cross-vendor coverage while spending Codex's tighter ChatGPT Plus quota only on what Opus already cleared.
 - **Phase 3 (adversarial)** is a single Opus dispatch framed as "assume the prior phases were wrong, find why" — catches the confirmation-bias class both prior phases share.
-- **Phase 4 (taste)** applies to UI work only, after all correctness phases have ADVANCED. Split into 4a (Opus defect + taste critics, existing) and 4b (Codex vision-taste on regenerated shots, second vendor).
+- **Phase 4 (taste)** applies to UI work only, after all correctness phases have ADVANCED. Split into 4a (Opus defect + taste critics) and 4b (Codex vision-taste on regenerated shots, second vendor). The protocol for both lives in `~/.claude/skills/advice-refine-test-loop/references/ui-taste-phases.md` — read it IN FULL when the trigger fires.
 
 Every phase uses a **structured JSON verdict schema** (`verdict-schema.json`) so findings are parseable, not vibes. **The loop-bounds gate is the only authority on advancement; the verdict is one of its inputs and routes nothing.** Between phases, a **consolidator sub-loop** auto-fixes safe_auto LOW findings (severity × autofix_class AND-gate; see below).
 
 ## The Phases
 
 ```
-PHASE 0:  Deterministic rules — scripts/deterministic-gate.sh. Ungated,
+PHASE 0:  Deterministic rules — ~/.claude/skills/advice-refine-test-loop/
+                               scripts/deterministic-gate.sh. Ungated,
                                non-negotiable, re-run every round. No LLM
                                phase may overturn it (see "Phase 0")
 PHASE 1:  Opus + specialists — loop rounds until the gate ends the phase
@@ -31,8 +32,10 @@ PHASE 3:  Adversarial — single Opus round, "the prior phases were wrong"
           per run)
 PHASE 4a: Taste round (UI-only, ONCE) — Opus defect + taste critics
 PHASE 4b: Codex vision-taste (UI-only, ONCE) — second-vendor VLM on the
-          regenerated shots; combined with geometry-oracle output via
-          union + confidence tiers (see "Phase 4b" section below)
+          regenerated shots, combined with geometry-oracle output.
+          BOTH phases: read ~/.claude/skills/advice-refine-test-loop/
+          references/ui-taste-phases.md IN FULL when the trigger fires
+          (see "Phases 4a + 4b" below)
 ```
 
 Whenever the gate advances a phase, the **consolidator sub-loop** runs first if the phase's final round left any `severity=LOW AND autofix_class=safe_auto` finding (see "Consolidator" below).
@@ -96,7 +99,7 @@ Each Phase 1/2 round follows the same shape:
    on a settled tree, never from an agent's reported count. Every fix agent's
    brief carries the grep-before-report rule; see "Verification traps" below
 7. COMMIT the round (per-round granularity, not a batch), then WRITE RUN
-   STATE (`tasks/arftl-run.json` — counters, `baselines`, `findings_log`; see
+   STATE (`<notes>/arftl-run.json` — counters, `baselines`, `findings_log`; see
    "Run state" below). Both, every round.
 8. GATE: evaluate the LOOP BOUNDS gate (see below) — every round, whatever the
    verdict. The gate is the ONLY thing that decides what happens next. On
@@ -181,9 +184,15 @@ Regex is not persuadable. That is the whole contribution of this phase, and
 the reason it sits outside the gate rather than inside it.
 
 ```bash
-skills/advice-refine-test-loop/scripts/deterministic-gate.sh --json
+~/.claude/skills/advice-refine-test-loop/scripts/deterministic-gate.sh --json
 # exit 0 = clean · 1 = findings · 2 = the gate could not run
 ```
+
+**The path is ABSOLUTE, and that is load-bearing.** The loop runs with cwd in
+the repo under review, so a repo-relative path resolves to nothing there. **Any
+exit code other than 0 or 1 is exit 2's case** — 127 (not found), 126 (not
+executable), 130 (interrupted) included. A missing script must never be
+indistinguishable from a clean scan.
 
 **When it runs.** Once before Phase 1, and again at every round's step 2
 (VERIFY), against the round's current diff. A round whose fixes introduce a
@@ -198,8 +207,11 @@ regardless of every verdict in the file.
 
 **Exit 2 is a stop, not a pass.** "The scanner did not run" must never be
 indistinguishable from "the scanner found nothing" — a missing `gitleaks`, an
-unreadable range, a non-repo path. Exit 2 halts-and-pauses with
-`pause_reason: deterministic-gate-unavailable`. A gate that fails open is not
+unreadable range, a non-repo path, a script the shell could not find or
+execute. Exit 2 and every code outside `{0, 1}` halt-and-pause with
+`pause_reason: deterministic-gate-unavailable`. Check the code explicitly;
+never branch on `if gate; then` alone, which reads 127 as failure-to-find and
+sends it down the same path as a real finding. A gate that fails open is not
 a gate.
 
 **The only escape is an inline waiver**, `arftl-allow: <rule-id>`, on the
@@ -562,6 +574,26 @@ primitives, date/time and timezone handling, text tokenizing and escaping.
    ask it to be opinionated, and to flag where the common advice is outdated.
    A neutral survey is a failed call; re-ask rather than proceed on one. Warn
    the user first: `deep` is ~10-15 minutes of wall time.
+
+   **When the research call cannot run, PAUSE. Never substitute your own
+   recall for it.** The tool being absent or disconnected, an error return, and
+   a second neutral survey after one re-ask all mean one thing: there is no
+   reference implementation to diff against, and diffing against your own
+   memory of one is precisely the rationalisation this step exists to stop.
+   Halt-and-pause through the existing PAUSE handler with
+   `pause_reason: adopt-research-unavailable`. The generic (a)/(b)/(c) do not
+   map cleanly onto this stop, so spell them out in the pause line:
+
+   - **(a) proceed unresearched** — run steps 3-5 with the comparison drawn
+     from your own knowledge, record `report_path: null` in `adopt_steps`, and
+     name the degradation in the round commit message and the Exit report. An
+     ADOPT step taken this way NEVER counts as having consulted a reference, so
+     a later `self-inflicted-churn` stop is the split-the-branch signal, not
+     grounds for a second ADOPT step.
+   - **(b) skip ADOPT** — resume the loop at round r+1 with the churn
+     unaddressed. This is shipping a known-churning design consciously; say so
+     in the Exit report.
+   - **(c) abort.**
 3. **Diff the design against what came back**, in writing, in three buckets:
    MATCHES / DELIBERATE DEVIATION / ACCIDENTAL DEVIATION. Every deviation lands
    in exactly one of the last two, and "deliberate" requires a constraint that
@@ -583,15 +615,20 @@ the pause line.
 
 ## Run state
 
-Loop state currently lives only in the parent's context, carried by the
-"Prior rounds fixed:" prompt delta. A compact, crash, or restart mid-Phase-2
-therefore loses which phase and round were live and the entire fix history —
-and the natural recovery is to restart Phase 1, re-burning both quotas on
-work already done. Persist it.
+The parent's context is not durable storage. A compact, crash, or restart
+mid-Phase-2 loses which phase and round were live and the entire fix history,
+and the natural recovery — restart Phase 1 — re-burns both quotas on work
+already done. The file below is what makes that recovery cheap instead.
 
-**Write `tasks/arftl-run.json` (repo-local, alongside the `tasks/mission.md`
-that CLAUDE.md already mandates) at every round commit — step 7, same step,
-no exceptions:**
+**Write `<notes>/arftl-run.json` at every round commit — step 7, same step, no
+exceptions.** `<notes>` is `~/.local/state/claude-tasks/<repo-name>/` per
+CLAUDE.md, where `<repo-name>` is the basename of the repo under review; create
+the dir if absent. **Userspace, never repo-relative.** A repo-local
+`tasks/arftl-run.json` is swept into the round commit that step 7 makes one line
+earlier — and `baselines` holds thousands of test ids and `findings_log` holds
+every defect found in the diff, so that commit publishes the run's full defect
+history the moment the repo does. Want it visible in the checkout: symlink
+`<repo>/tasks` → `<notes>` and gitignore it.
 
 ```json
 {
@@ -655,7 +692,7 @@ already written — an entry's `id`, `file`, `category` and `rationale`, and any
   subsequent round commit message. That collapse is order-independent and never
   closes a finding that any of the rows leaves open.
 
-**On skill start, before Phase 1:** if `tasks/arftl-run.json` exists with
+**On skill start, before Phase 1:** if `<notes>/arftl-run.json` exists with
 `status: running`, do NOT start over. Read it, announce `"Resuming ARFTL at
 phase <P> round <r> (<n> prior rounds, <k> findings fixed)"`, and re-enter at
 the recorded phase with `fixed_summary` seeding the prompt's "Prior rounds
@@ -713,8 +750,8 @@ Both lanes emit JSON matching `~/.claude/skills/advice-refine-test-loop/verdict-
 
 **The verdict has exactly two jobs: it carries the findings, and its coherence
 with them is cross-validated at step 4** (an unparseable or incoherent response
-is a FAILED ROUND). It decides nothing. No verdict value advances a phase, ends
-a round loop, or triggers the consolidator — the gate does all three.
+is a FAILED ROUND). It routes nothing — see the stop-routing table in "Loop
+bounds", which is where advancement is decided.
 
 - **PASS** = ZERO findings (empty `findings` array).
 - **PASS_WITH_FIXES** = at least one MEDIUM or LOW finding, no BLOCKER/HIGH.
@@ -725,7 +762,7 @@ message for the human to triage.
 
 The advisor gets ONE part of this and no more: the COHERENCE rule — which verdict string goes with which findings array (`PASS` = empty; `PASS_WITH_FIXES` = no BLOCKER/HIGH; `BLOCKS` = ≥1 BLOCKER/HIGH). Never what a verdict costs, triggers, or buys. `PASS` with a non-empty findings array is unreachable and must never be emitted; LOW-only remainders are `PASS_WITH_FIXES`. `verdict-schema.json` is written to that boundary: its `verdict` description carries the coherence rule only, its `severity` description defines each level by blast radius, reversibility, silence and recoverability, and its `autofix_class` description defines each value by reversibility, how far the edit reaches, and whether human judgement is required. Keep it that way — the schema text ships to the Phase 2 advisor verbatim via `--output-schema`.
 
-Codex enforces the schema via `codex exec --output-schema ~/.claude/skills/advice-refine-test-loop/verdict-schema.json …`. Opus advisor enforces via prompt instruction (advisor.md system prompt requires JSON output).
+Codex enforces the schema structurally: `scripts/codex-advise.sh` pins `--output-schema` to this file on every call, in both Codex phases. Opus advisor enforces via prompt instruction (advisor.md system prompt requires JSON output).
 
 ## Phase 1: Opus + narrow specialists
 
@@ -738,7 +775,7 @@ Codex enforces the schema via `codex exec --output-schema ~/.claude/skills/advic
 | `insecure-defaults` skill | secrets loading, auth code, env-var-driven config, module defaults, feature flags | Fresh Opus subagent via `Agent(subagent_type="advisor", prompt="Invoke the insecure-defaults skill on <paths>. If Skill tool is unavailable in this session (advisor.md was recently edited without a session restart), fall back to applying the skill's checklist manually from your training. Emit findings in verdict-schema.json format.")` |
 | `sharp-edges` skill | new public API surface, config schema, CLI flag design, cryptographic function ergonomics | Same shape as above |
 
-**advisor.md now includes `Skill` in its tool whitelist** — safe because Skill invocation is metadata-only (loads instructions into the subagent's context); any tool the loaded skill prescribes that is not in the whitelist still fails, preserving the read-only invariant. NEW SESSION REQUIRED after editing advisor.md; specialist dispatches in a stale session fall back to manual checklist application (still useful, marginally lower recall).
+**`advisor.md` whitelists `Skill`** — safe because Skill invocation is metadata-only (loads instructions into the subagent's context); any tool the loaded skill prescribes that is not in the whitelist still fails, preserving the read-only invariant. NEW SESSION REQUIRED after editing advisor.md; specialist dispatches in a stale session fall back to manual checklist application (still useful, marginally lower recall).
 
 Dispatch specialists in the SAME tool-use block as the primary Opus advisor — parallel, independent, read-only, **NO shared state**. No specialist sees the primary's findings, another specialist's findings, or any hint of what the others are looking at, until all have reported. One shared cue before they report collapses them into one reviewer. Merge afterwards by semantic-equivalence dedupe (same rule as `new_r`), not by `(file, line)`; specialist findings inherit the primary's phase counter but are tagged in commit messages (`[specialist:insecure-defaults]`). If BOTH the primary and a specialist independently flag the same location, that convergence is the confidence signal: skip step 4.5's validator for it and reproduce it first.
 
@@ -750,32 +787,29 @@ Loop rounds until the "Loop bounds" gate ends the phase, then apply its routing.
 
 ## Phase 2: Codex (GPT-5.5) advisor
 
-Dispatch:
+Dispatch through the wrapper — never call `codex exec` by hand:
 
 ```bash
-codex exec --skip-git-repo-check \
-  --output-schema ~/.claude/skills/advice-refine-test-loop/verdict-schema.json \
-  "<PROMPT>"
+~/.claude/skills/advice-refine-test-loop/scripts/codex-advise.sh \
+  --prompt-file <path> --out <path>
+# exit 0 = verdict produced · 2 = the script could not run
+#      3 = quota · 4 = timeout/connectivity · 5 = no parseable verdict
 ```
 
-`--output-schema` forces valid JSON matching the shared verdict schema — no regex parsing on prose. Codex CLI runs GPT-5.5 (per ~/.codex/config.toml default, ChatGPT Plus auth). Sandbox is read-only by default; do NOT pass `--dangerously-*` flags. The prompt template is the same "Advisor Prompt Shape" used in Phase 1, but with an updated "Prior rounds fixed:" list covering the entire Phase 1 history (primary + specialists) so Codex doesn't re-flag what was already caught.
+The wrapper owns the flag set both Codex phases share — read-only sandbox, no `--dangerously-*` anything, the wall-clock cap, `--output-schema` forcing JSON so nothing regex-parses prose, and **exactly one retry per failure class, never a third attempt**. It is the single copy of that plumbing; Phase 4b calls the same script. Fixtures: `scripts/codex-advise-test.sh`.
 
-Parse: `verdict=$(codex exec … | jq -r '.verdict')`. Values: `PASS`, `PASS_WITH_FIXES`, `BLOCKS`.
+Codex CLI runs GPT-5.5 (per `~/.codex/config.toml` default, ChatGPT Plus auth), so Phase 2 passes no `--model`. The prompt is the same "Advisor Prompt Shape" used in Phase 1, with an updated "Prior rounds fixed:" list covering the entire Phase 1 history (primary + specialists) so Codex doesn't re-flag what was already caught.
 
-**Usage-limit fallback:** if the call returns "usage limit" / "quota exceeded" / HTTP 429, re-run ONCE with `-m gpt-5.4` (lighter tier still on Plus quota). If that also fails, **PAUSE the loop and route to the user**:
+**Exit 0 is not yet a verdict you may act on.** The script checks that `.verdict` is one of `PASS` / `PASS_WITH_FIXES` / `BLOCKS`; it deliberately does NOT check coherence against the findings array, because that check applies to the Opus lane too and belongs at step 4. Run step 4's cross-validation on the output either way.
 
-- **Interactive session:** print "Phase 2 blocked: Codex quota exhausted at <ts>. Options: (a) wait <T> for reset then resume, (b) ship consciously without cross-vendor coverage, (c) abort." Wait for user decision.
+**Exits 3, 4 and 5 are the PAUSE triggers, and the script has already spent the one sanctioned retry.** Do not re-invoke it hoping for a better roll:
+
+- **Interactive session:** print "Phase 2 blocked: <quota exhausted | no response | no parseable verdict> at <ts>. Options: (a) wait <T> for reset then resume, (b) ship consciously without cross-vendor coverage, (c) abort." Wait for user decision.
 - **Unattended session** (loop triggered by "going to bed" / cron / no live human): append to `pending_for_human.md` per the CLAUDE.md format (`## <date>: Codex Phase 2 quota-exhausted / Why blocked / Steps for human / Everything else done`). Do NOT advance and do NOT ship. Exit the whole skill with status `pending-human`.
 
-**All four failure modes (quota-exhausted / timeout / connectivity / verdict-missing) route to the SAME PAUSE handler on second failure** — the loop stops, unattended runs write to `pending_for_human.md` and exit `pending-human`, interactive runs prompt the user. Never fall through silently. A DISPATCH FAILURE never advances Phase 2; only a gate stop can, per the stop-routing table in "Loop bounds".
+**All four failure modes (quota-exhausted / timeout / connectivity / verdict-missing) route to the SAME PAUSE handler** — the loop stops, unattended runs write to `pending_for_human.md` and exit `pending-human`, interactive runs prompt the user. Never fall through silently. A DISPATCH FAILURE never advances Phase 2; only a gate stop can, per the stop-routing table in "Loop bounds". **Exit 2 is not a review result either** — the script could not run, which is the Phase 0 lesson applied here: a missing tool must never read as a clean pass.
 
-**Timeout:** wrap the codex exec call with a wall-clock cap (`timeout 300s codex exec ...`). A model hang or long stall past 5 minutes is treated as connectivity failure → retry once after 30s → if second try also stalls, PAUSE per above.
-
-**Connectivity failure:** if codex exits with network error, retry once after 30s. On second failure, PAUSE per above.
-
-**Verdict-missing:** if `jq -r '.verdict'` prints `null` or errors, treat the round as failed and re-run once with an explicit "your last output was not valid JSON — emit exactly the verdict-schema.json shape" reminder. On second verdict-missing, PAUSE per above (do NOT silently advance — a Codex round that can't emit a parseable verdict has produced zero coverage).
-
-**Budget expectation:** Phase 2 should usually complete in 1-2 rounds because Opus already caught the bulk. If Codex demands ≥3 rounds, that IS the signal — Codex saw something Opus missed, and the extra rounds are the reason Phase 2 exists. Do not read a flat blocker COUNT as churn: two new reproducible defects in round 4 is the loop working, and on a large diff the count can sit flat for rounds while every round finds something real. The distinction that matters is novelty, reproducibility, and marginal gain, which is what the "Loop bounds" gate measures. Codex re-flagging findings that no longer reproduce is the actual churn signal, and the gate stops on that.
+**Budget expectation:** Phase 2 should usually complete in 1-2 rounds because Opus already caught the bulk. If Codex demands ≥3 rounds, that IS the signal — Codex saw something Opus missed, and the extra rounds are the reason Phase 2 exists. Do not read a flat blocker COUNT as churn (see "Loop bounds"); the actual churn signal is Codex re-flagging findings that no longer reproduce, and the gate stops on that.
 
 ### Why Codex still runs last, and what that costs
 
@@ -784,7 +818,7 @@ Parse: `verdict=$(codex exec … | jq -r '.verdict')`. Values: `PASS`, `PASS_WIT
 Required, non-negotiable:
 
 - Every Codex finding clears parent-side reproduction (step 5) before ANY edit. Confidence is not evidence; a Codex BLOCKER that will not reproduce is discarded, not downgraded into a smaller fix.
-- Codex never edits. `codex exec`, read-only sandbox, no `--dangerously-*` flags. The parent writes every fix.
+- Codex never edits. Read-only sandbox, no `--dangerously-*` flags — `scripts/codex-advise.sh` refuses those flags outright rather than trusting the caller to omit them. The parent writes every fix.
 - Do not soften a Codex finding into a "safe tidy-up" when repro fails. That is the regression path.
 
 **Still run it.** Codex rounds after clean Opus rounds reliably surface defect classes Opus rounds miss whole — in particular **inference-by-absence**, where a reviewer treats a coverage gap (no test, no branch, no error path) as evidence that the case is handled. Hunt that class explicitly in Phase 2.
@@ -797,12 +831,11 @@ After Phase 2 ADVANCES (a gate stop routed `advance` or
 `advance-with-findings-surfaced`).
 
 **Phase 3 is ONE round of the same round shape and evaluates the SAME gate at
-its step 8** — steps 1-8, repro included. It has exactly one difference, already
-stated in the stop-routing table: `continue` means reset to Phase 1 with the
-findings pre-seeded, not another Phase 3 round. Increment `phase3_resets`; on a
-second `continue`, PAUSE with `pause_reason: phase3-reset-cap`. Every other
-routing applies the table unchanged — `converged` and `unreproducible` advance
-to Phase 4, `no-marginal-gain` / `ceiling` / `accounting-error` halt-and-pause.
+its step 8** — steps 1-8, repro included. Its one difference is already in the
+stop-routing table: `continue` means reset to Phase 1 with the findings
+pre-seeded, not another Phase 3 round. Increment `phase3_resets`; on a second
+`continue`, PAUSE with `pause_reason: phase3-reset-cap`. Every other routing
+applies that table unchanged.
 
 Dispatch: same `Agent(subagent_type="advisor", …)` as Phase 1, but the prompt is framed adversarially:
 
@@ -819,7 +852,7 @@ Given the state of these files, what did they miss?
 - If nothing new, emit verdict PASS with empty findings.
 ```
 
-**Budget:** exactly 1 dispatch per pass. Never loop adversarial itself; the only loop is Phase 3 → Phase 1, and the gate's `continue` is the only thing that starts it. A second reset is the "split the diff" signal — PAUSE instead.
+**Budget:** exactly 1 dispatch per pass. Never loop adversarial itself; the only loop is Phase 3 → Phase 1, and the gate's `continue` is the only thing that starts it.
 
 ## Advisor Prompt Shape
 
@@ -897,7 +930,7 @@ Discard unreproducible claims — do NOT fix them. Discard means "do not act on"
 
 **A weak repro is worse than no repro** — it manufactures a false approval that the rest of the loop then trusts. A repro counts toward `repro_r` iff, at step 5 and BEFORE any fix, it FAILS against the current code and exercises the exact path the finding claims. A repro that fails for an unrelated reason is discarded and the finding goes back to unreproduced.
 
-**`repro_r` is decided at step 5 and never revised.** It counts findings whose bad behaviour was empirically DEMONSTRATED, full stop — whether the later fix succeeded is a separate fact, recorded as `fixed` in `findings_log`. A finding that reproduced and is STILL BROKEN at the end of the round counts 1: that is precisely the case the loop must keep working on, and discounting it would advance the phase past a live defect. A fix counts as successful (`fixed: true`) only when the repro passes after it.
+**`repro_r` is decided at step 5 and never revised** — defined in "Loop bounds". The case worth restating at the point of use: a finding that reproduced and is STILL BROKEN at the end of the round counts 1, because that is precisely the case the loop must keep working on and discounting it would advance the phase past a live defect. A fix counts as successful (`fixed: true`) only when the repro passes after it.
 
 ## Consolidator sub-loop (LOW remainder)
 
@@ -950,7 +983,7 @@ After consolidator exits (clean or bounded), complete the phase transition the g
 | Skip re-verification after each fix | Regressions hide in the batch |
 | Stop after round 1 because it "felt thorough" | Most valuable finding often lands in round 3. Stop on the "Loop bounds" gate, not on a feeling — the gate is what makes "keep going" safe to say. |
 | Keep looping a phase because the advisor "still has notes" | The bound is marginal gain, not exhaustion. Notes that don't reproduce aren't work. Stop when a round stops reproducing more NEW defects than its fixes break — not when the count stops shrinking. |
-| Stop a phase because the blocker COUNT went flat | Count is a bad proxy. A round that finds two new reproducible defects on a large diff is the loop working, and stopping to ask about it spends the user's attention on a question with an obvious answer. Judge novelty, reproducibility, and regressions caused. |
+| Stop a phase because the blocker COUNT went flat | Count is a bad proxy — on a large diff it can sit flat while every round finds something real. Judge novelty, reproducibility, and regressions caused; that is what the "Loop bounds" gate measures. |
 | Count only what a round FOUND, ignoring what its fixes BROKE | Benefit alone is not progress. Fixes regress previously-passing tests, and a loop that never counts `regressed_r` keeps iterating while it destroys working code — reported acceptance rises the whole time. Continue only while `repro_r > regressed_r`. |
 | Treat the `n >= 8` ceiling as "the phase converged" | It is a COST backstop. A fixed round ceiling carries no information about whether the last round was worth running. `ceiling` routes to the PAUSE handler; `converged` is a different stop with a different meaning. |
 | Dedupe `new_r` by `(file, line, claim)` | A reworded repeat at a shifted line then counts as NEW and inflates the continue signal the gate depends on. Dedupe by MEANING — equivalence-judge subagent, or trigram Jaccard ≥0.8 as fallback. |
@@ -962,8 +995,8 @@ After consolidator exits (clean or bounded), complete the phase transition the g
 | Read `converged` as "the round found nothing" | `converged` requires `new_r == 0` — nothing proposed beyond stale re-reports that did not reproduce, AND nothing left open by an earlier round of the phase, per the OPEN definition. A round that proposes findings none of which reproduce is `unreproducible`, and it must surface those findings, not exit silently. |
 | Freeze `new_r` before step 5 knows what reproduced | A relapse — closed in an earlier round, demonstrated again now — is then deduped out of the count and `converged` can fire over a live defect. Dedupe assigns identity at step 4; the count is finalised at the end of step 5. |
 | Reset to Phase 1 a second time from Phase 3 | Capped at one reset. A diff still REPRODUCING fresh BLOCKER/HIGH after a full 1→2→3 pass wants splitting, not another lap through both vendors. |
-| Skip writing `tasks/arftl-run.json` because "the loop is nearly done" | Nearly-done is when a compact is most likely and the fix history is most expensive to lose. Write it at every round commit, same step. |
-| Restart at Phase 1 after a compact or crash | Check `tasks/arftl-run.json` first. Re-running phases the gate already advanced re-burns both quotas to reproduce a result you already have on disk. |
+| Skip writing `<notes>/arftl-run.json` because "the loop is nearly done" | Nearly-done is when a compact is most likely and the fix history is most expensive to lose. Write it at every round commit, same step. |
+| Restart at Phase 1 after a compact or crash | Check `<notes>/arftl-run.json` first. Re-running phases the gate already advanced re-burns both quotas to reproduce a result you already have on disk. |
 | Resume without `findings_log` and keep reporting `new_r` as if it were live | Dedupe runs off that log. Missing it silently inflates `new_r` — the loop looks healthy while the mechanism is off. Set `dedupe_status: unavailable` and say so in every round commit and the Exit report. |
 | Skip Phase 2 (Codex) because "Opus already said PASS" | Single-vendor blindness is the whole reason Phase 2 exists. If Codex is out of quota, PAUSE and tell the user — don't ship on a half-run loop. |
 | Run Phase 2 in parallel with Phase 1 to "save time" | Wastes Codex quota on drafts Opus will reject. The ordering is a QUOTA argument and only a quota argument — do not claim second-vendor-last reviews better; running a second vendor over another vendor's output can net-regress it. Keep the order, and keep the reproduce gate that makes it safe (see "Why Codex still runs last"). |
@@ -975,275 +1008,68 @@ After consolidator exits (clean or bounded), complete the phase transition the g
 | Skip verdict JSON validation and trust prose | Prose verdicts drift ("looks fine", "no major issues", "SAFE-ish"). The schema is what makes findings parseable; if the output doesn't match it, the round FAILED — don't guess intent. |
 | Advance, or end a round loop, on a verdict value | The gate is the only authority on advancement. A `PASS` over a finding that reproduced and was not fixed ships a live defect. The verdict carries findings and is cross-validated at step 4; that is all it does. |
 | Put "Prior rounds fixed:" at the START of the prompt | Kills prefix caching. Stable content first (goal, re-read paths, output shape), variable delta last. |
-| **Skip Phase 4b when the diff touches component templates or CSS** | **Red flag.** The drift-back class of bugs (dot-above-text, selected-state regression, red-title-on-non-danger, combobox-narrower-than-control) survives Phases 1-4a — every frontier VLM misses 60%+ of true CSS defects (DiffSpot 2026), and a single vendor's blind spot repeats across rounds. A second-vendor visual reviewer (Codex vision-taste) plus the geometry oracle is the only pipeline shape that catches them. Skipping 4b on a UI-touching diff ships the exact regression class the founder has already flagged multiple times. |
-| Auto-fix a singleton VLM finding without oracle backing | Session-constraint violation. Singleton visual claims can be hallucinations (UI-Lens: VLMs invent defects, e.g. flagging intentional spacing). Verify against the geometry oracle first; if the oracle can't arbitrate, surface to the founder as A/B, don't auto-fix. |
-| Auto-block on a singleton VLM finding | Session-constraint violation. `Never singleton-VLM = auto-block.` Bug the ledger, not the ship gate. Only geometry-oracle findings or 2+ reviewer convergence gate the ship. |
-| Sigil on a partial Phase 4b | Session-constraint violation. `Sigil requires reviewer confirmation.` The sigil-ready state needs: oracle green + 4b run to completion + all HIGH resolved. A skipped or half-run 4b is not sigil-ready. |
-| Add Gemini vision without an API key wired | Would silently degrade to skipping phase 4c and calling the pipeline complete. Note as future upgrade in the skill; do not add as a dispatch step until the API dependency is real. |
 | Auto-fix based on severity alone | Severity is intrinsic risk, not apply-authority. A LOW rename that ripples 40 files is not `safe_auto` — it's `gated_auto` or `manual`. Consolidator MUST AND `severity=LOW` with `autofix_class=safe_auto`; anything else surfaces for the human. |
 | Skip step 4.5 (validate) because "advisor is trustworthy" | Advisors hallucinate file paths, line numbers, and stale-state claims (they read pre-fix state). Validator is cheap (small prompt, file re-read) and catches the class before it becomes a wasted repro round in step 5. Exactly TWO skips are sanctioned and neither is this one: per-finding, when the primary and a specialist converged independently on the location; wholesale for the round, when the validator itself fails (quota / malformed JSON / no usable result) and the round degrades to pre-4.5 behaviour. Any other skip is the anti-pattern. Neither sanctioned skip ever skips step 5. |
 | Tell the advisor what a severity TRIGGERS ("HIGH forces another round", "LOW gets auto-fixed", "a violation of this rule is HIGH") | Consequence text moves the severity the advisor picks, by a different amount and a different direction per advisor, so it cannot be corrected downstream. Describe severity by blast radius / reversibility / silence / recoverability. Consequences live in parent-side code. |
 | Let the consolidator fix a LOW without confirming it against the file | The weakest findings would then get the weakest gate, and unverified edits break working code. Read the stated location, confirm the condition is there, `skipped: unconfirmed` otherwise. |
 | Give the specialists a peek at the primary's findings before they report | One shared cue collapses independent reviewers into one. Same block, no shared state, merge only after all have returned. |
-| Treat Phase 4a's A+B agreement as independent confirmation | Same model with two role labels shares its blind spots. A+B agreement is "look here first". Independence comes from Phase 4b's second vendor and the geometry oracle. |
 
-## Phase 4a: Taste round (UI-work only; run ONCE after Phases 1-3 all ADVANCE)
+## Phases 4a + 4b: UI taste review (UI-work only)
 
-Phases 1-3 catch correctness. UI-work also needs a TASTE pass — misalignments, generic-AI aesthetic, house-style drift. Runs ONCE after Phase 3 advances, not woven into the earlier phases.
+The full protocol lives in
+`~/.claude/skills/advice-refine-test-loop/references/ui-taste-phases.md`.
+**Read that file in full before dispatching 4a** — not in part, and not from
+memory. It is the only place the two-assessment protocol, the Codex vision
+invocation, the combiner table and the disposition ledger are written down.
 
-Adapted from `pbakaus/impeccable`'s critique pattern (two independent assessments → synthesis → bounded fix cap; verified via github.com/pbakaus/impeccable 2026). Impeccable's own rule: **"Verify in bounded passes, not a loop... Open-ended self-QA burns the user's money."** Cap: 1 fix round after taste critique. No more.
+**Trigger — read the reference iff ALL THREE hold:**
 
-### When it fires
-
-- Diff touches HTML templates / view partials / CSS / rendered-view components (see `~/.claude/skills/visual-verify/SKILL.md` glob list)
-- AND Phases 1-3 all ADVANCED — each exited on a gate stop routed `advance` or
+- the diff touches HTML templates / view partials / CSS / rendered-view
+  components (see `~/.claude/skills/visual-verify/SKILL.md` glob list), AND
+- Phases 1-3 ALL ADVANCED — each exited on a gate stop routed `advance` or
   `advance-with-findings-surfaced`. A `halt-and-pause` stop never reaches Phase
-  4; the run is paused, not advanced.
-- AND regenerated screenshots exist for the touched surfaces
+  4; the run is paused, not advanced, AND
+- regenerated shots exist for the touched surfaces.
 
-Skip for pure backend / infra / docs work.
+Pure backend / infra / docs diffs skip both 4a and 4b and go straight to Exit.
 
-### Two-assessment protocol
+**Completion contract — stated here because it must hold whether or not the
+reference file was read.** On a UI-touching diff the phase is 4a AND 4b, both,
+each run to completion. 4b is never silently skipped: the drift-back class of
+defects (dot-above-text, selected-state regression, red-title-on-non-danger,
+combobox-narrower-than-control) survives Phases 1-4a whole, because every
+frontier VLM misses 60%+ of true single-CSS-property defects (DiffSpot 2026,
+arXiv 2605.29615) and a single vendor's blind spot repeats across rounds. A
+skipped 4b is worse than a skipped Phase 2. If 4b cannot run, that is a PAUSE
+per the Phase 2 rules — never a completed phase.
 
-Two INDEPENDENT critic passes on the same regenerated shots. Sources kept distinct so they don't converge on the same blindspot:
+**Two ship-gating constraints, duplicated here verbatim on purpose** — they
+decide whether the run ships, so they must not live only behind a Read:
 
-- **Assessment A — defect critic**: fresh Opus dispatch with the `visual-verify` 4-step rubric (zoom → compare-vs-known-good-in-repo → walk checklist → severity-tagged findings). Anti-slop guardrails from `docs/reviews/component-sota-2026-07-31.md` (if present in project).
-- **Assessment B — taste critic**: fresh Opus dispatch with a house-style rubric — pulls from the project's design spec + brand workbook + prior founder taste decisions (e.g. `docs/brand/klaffat-design-spec.md` §Locked variants + `docs/reviews/*` picks). Explicit anti-generic-AI list (see below).
+- **Never singleton-VLM = auto-block.** A single Codex or Opus visual claim
+  without geometry-oracle backing does not stop the ship; it goes to the ledger
+  and (if reproducible) the founder.
+- **Sigil requires reviewer confirmation.** The sigil-ready state needs
+  geometry-oracle green + Phase 4b run to completion + all HIGH-tier findings
+  resolved. Never sigil on a partial or half-run 4b.
 
-Both use the SAME model + fixed prompt so scores are internally comparable (per SOTA research: cross-model taste-scoring agreement is ~zero; fix the model to compare).
-
-**Comparability is bought with correlated blind spots.** Different role labels on the same model do NOT make two independent reviewers — persona-differentiated same-model agents share the most errors. A+B agreement here means "worth looking at first", never "independently confirmed". Phase 4b's second vendor and the geometry oracle are what actually decorrelate; do not let a strong A+B agreement talk you into skipping either.
-
-### Synthesis
-
-Parent takes both reports. Findings that BOTH assessments flag = high-confidence; investigate first. Findings unique to A xor B = flag for founder decision, don't auto-fix.
-
-### Severity
-
-**4a emits verdict-schema.json, same as every other phase — no separate
-vocabulary.** Both critics return one verdict object each, parsed by the same
-`jq` cross-validation in step 4. There is no `blocker` / `should-fix` / `nit`
-enum; those words are not schema-parseable and must not appear in a critic
-prompt or a critic's output.
-
-The critic prompt carries the schema's intrinsic-risk definitions unchanged —
-blast radius, reversibility, silence, recoverability, read visually (how much of
-the surface is wrong, how obvious it is, whether it survives a reload). Nothing
-about what a grade triggers, and no rule of the form "a violation of X is
-BLOCKER"; see "Elicit risk, not policy".
-
-**The taste tiers are a parent-side severity FLOOR, applied AFTER parsing —
-never in the prompt**, same mechanism as Phase 4b's:
-
-- Rationale names a house-style rule the founder has explicitly ruled on before
-  → floor `BLOCKER`.
-- Rationale names broken layout or unreadable content → floor `HIGH`.
-- Everything else keeps the critic's grade.
-
-Findings whose confirmation is a taste call carry `unverifiable: true`, per the
-schema.
-
-### Anti-generic-AI-aesthetic guardrails
-
-From Anthropic `frontend-design` skill + practitioner blogs (design-bootcamp, aidesigner.ai 2026):
-
-- Generic-blue CTA (`#3B82F6` shadcn/Tailwind default)
-- Purple → blue gradient CTAs or backgrounds
-- Glassmorphism (frosted-glass `backdrop-filter` on cards)
-- Stock illustration (isometric-purple person-with-laptop)
-- Emoji-in-heading substituting for icon
-- Card grid where a list would do
-- "Coming soon" placeholder that isn't
-- Everything-center-aligned (no left-alignment for prose)
-
-### Bounded fix cap
-
-Max ONE fix pass after taste critique:
-1. Fix everything both critics agree on at `BLOCKER` or `HIGH`
-2. Fix single-critic `BLOCKER`s if reproducible against the artifact
-3. Re-render affected shots
-4. Founder-taste calls (A-xor-B findings) go to the founder as A/B/C variants via the founder-decision loop, NOT auto-fixed
-
-If a second taste round is genuinely needed, that's a signal the design isn't converging → escalate to founder with variant fan-out (per SOTA research 2026-07-30), don't loop more times.
-
-### When Anthropic frontend-design skill is available
-
-Anthropic ships an official `frontend-design` skill (`npx skills add https://github.com/anthropics/skills --skill frontend-design`). If installed in the project, its rubric replaces Assessment B — it's the maintained upstream version of the taste-critic prompt.
-
-## Phase 4b: Codex vision-taste (UI-work only; run ONCE after Phase 4a)
-
-Founder observation: primary Claude visual review misses geometric defects the founder catches on first look — radio-dot Y-centering, dot position, width alignment, selected-state color regressions. The DiffSpot 2026 benchmark (Tencent WeChat AI, arXiv 2605.29615) confirms this generalizes: every frontier VLM catches ≤40.7% of true single-CSS-property defects, and pixel magnitude does not predict detection (r = −0.08). UI-Lens (CVPR 2026) shows the same pattern for boundary defects (overflow, cropping, overlap) at coin-flip accuracy. A second-vendor VLM + a deterministic DOM-geometry oracle is the only combination that closes the gap; single-vendor visual review is not sufficient regardless of which single vendor.
-
-Phase 4b runs a scripted Codex vision-taste pass on the shots regenerated by Phase-R, then merges its findings with the Opus-taste output from 4a and the geometry-oracle output via union + confidence tiers. Codex is the second vendor because it has vision support and a wired-in quota here; see the "Gemini future upgrade" note below.
-
-### When it fires
-
-- Diff touches HTML templates / view partials / CSS / rendered-view components (same trigger as 4a)
-- AND Phase 4a completed
-- AND regenerated shots exist for the touched surfaces
-
-A geometry oracle (e.g. `tests/e2e/tests/component-geometry-oracle.spec.ts`
-emitting JSON violations) is NOT a trigger condition. When the project has none,
-run the Codex vision-taste pass anyway; the combiner then runs with two inputs
-instead of three. **Two-vendor agreement auto-fixes with or without an oracle**
-— that row of the combiner table is unchanged. What the missing oracle removes
-is the arbiter for SINGLETON findings: with no oracle to extend, every singleton
-goes to the founder as an A/B or to the ledger, never to an auto-fix.
-
-Skip for pure backend / infra / docs work.
-
-### Codex vision invocation
-
-Codex CLI supports image input via `--image` (verified: v0.24.0+ scripted; v0.115.0 Mar 2026 for full-resolution, no thumbnail compression). Requires a vision-capable model (`gpt-5-codex` or newer). Approx 1-3k vision tokens per image per turn.
-
-```bash
-# One invocation per surface (component/page). Multiple shots per surface go
-# as a comma-separated list — Codex sees them all in the same turn.
-SHOTS="/abs/path/to/component-radio.png,/abs/path/to/component-radio-selected.png"
-PROMPT="$(cat <<'EOF'
-You are a design defect reviewer. You are the SECOND VENDOR in a multi-model
-taste pipeline — the primary Claude review already ran; your job is to catch
-what it missed. Bias toward reporting; a downstream arbiter suppresses false
-positives.
-
-FIXED visual rules — check every one on every image:
-- Radio dot renders LEFT of text, ALWAYS (never dot-above, never dot-right).
-- Radio dot Y-center aligns with the option box's Y-center (or first-line
-  center on wrapped labels — never middle of the wrapped block).
-- Selected radio state = dark rail-blue background + white text. Light-fill
-  selected states are a regression.
-- Dialog title uses --strike red ONLY for --danger variant. Reopen, Confirm,
-  and other non-danger dialogs use --ink.
-- Combobox has no chevron glyph (native <select> chrome only, if any).
-- Combobox dropdown <li> items fill the full width of the combobox control.
-- Timegrid busy overlay width = column width; cell width = column width.
-
-KNOWN drift-backs (regressed at least once before — flag on sight):
-- Radio dot renders ABOVE text instead of LEFT (segmented-pill / --block
-  variants prone to this).
-- Selected radio reverts to light fill instead of dark rail-blue + white.
-- Dialog title turns red on non-danger dialogs.
-- Combobox items narrower than the control.
-- Timegrid busy overlay narrower than the column.
-
-Emit ONE JSON object for this whole call, matching the verdict-schema.json
-used elsewhere in this pipeline. Not one object per image — one object,
-whose `findings` array covers every image you were given (severity,
-autofix_class, file, line, rationale, unverifiable — all per schema).
-Identify the image PER FINDING: `file` = that image's
-ABSOLUTE path, copied exactly as given to you, `line: 0` (schema requires line;
-visual findings are whole-image).
-Encode region + rule INSIDE rationale as a prefix: `[region: <where>]
-[rule: <fixed-rule# or drift-back#>] <what breaks>`. Example: `[region:
-top-left option in radiogroup] [rule: drift-back#1] radio dot renders above
-text, not to the left`. Keep total rationale ≤200 chars.
-
-If nothing to flag on ANY image in this call, emit verdict PASS with an
-empty findings array. Do not emit per-image empty arrays — the schema
-permits exactly one findings array per call.
-EOF
-)"
-
-codex exec --skip-git-repo-check \
-  -m gpt-5-codex \
-  --image "$SHOTS" \
-  --output-schema ~/.claude/skills/advice-refine-test-loop/verdict-schema.json \
-  "$PROMPT" > /tmp/codex-vision-taste-<surface>.json
-```
-
-Repeat per surface. Store outputs under a run-scoped dir (e.g.
-`/tmp/design-review-YYYY-MM-DD/vision-taste/`). Do not batch every surface
-into one invocation — Codex vision recall drops sharply past ~4 images per
-turn, per DiffSpot Hard-tier data.
-
-`--output-schema` returns exactly ONE verdict object per invocation. Attribute
-each finding to its shot via its absolute `file` path — the schema's `file` is
-an absolute path in every phase, 4b included; never ask for or expect a
-per-image object or a per-shot findings array.
-
-**Severity floor, applied by the parent AFTER parsing — never in the prompt.**
-Any returned finding whose `rationale` prefix names a fixed rule or a known
-drift-back is raised to HIGH if the advisor rated it lower. The advisor is told
-which rules to check; the parent decides what a violation is worth.
-
-**LOW filter, applied by the parent AFTER the floor — never in the prompt.**
-Drop 4b findings still rated LOW once the floor has been applied; the geometry
-oracle and 4a cover polish. Never put this in the prompt: a "do not report LOW"
-instruction pushes borderline LOWs up to MEDIUM instead, uncorrectably.
-
-**Failure modes** follow the same PAUSE rules as Phase 2:
-
-- Quota exhausted → retry once with `-m gpt-5.4` (lighter tier still has
-  vision on Plus quota); on second failure, PAUSE per Phase 2 rules
-  (interactive: prompt; unattended: `pending_for_human.md`).
-- Timeout (wrap with `timeout 300s`) → retry once after 30s → PAUSE.
-- Unparseable JSON → re-run once with an explicit schema reminder → PAUSE.
-
-Never silently skip 4b. The whole point of the second vendor is coverage of
-what 4a misses; a skipped 4b is worse than a skipped Phase 2 because the
-drift-back class of defects survives phases 1-4a.
-
-### Combiner algorithm
-
-Three inputs to merge:
-
-1. **Geometry-oracle findings** — JSON from `tests/e2e/tests/component-geometry-oracle.spec.ts` (or project's equivalent). Deterministic pixel/color assertions. **Always take** — this is ground truth, not a taste opinion.
-2. **Opus advisor findings** — output from Phase 4a Assessments A + B.
-3. **Codex vision-taste findings** — the per-surface JSON blobs written above.
-
-Bucket findings by `(surface, element_selector_if_any, rule)`. `surface` is the
-invocation label the shots were dispatched under — the `<surface>` in the output
-filename, and the same string the ledger's `surface` column carries. The
-finding's absolute `file` path identifies which shot within that surface; it is
-never the bucket key. For each bucket:
-
-| Convergence | Confidence | Action |
-|---|---|---|
-| Geometry-oracle finding (any) | GROUND TRUTH | Always auto-fix. Not a vote; the DOM says the pixels are wrong. |
-| 2+ independent reviewers agree (e.g. Opus + Codex; or oracle + either) | HIGH | Auto-fix without further verification. |
-| Singleton VLM finding (Opus xor Codex, no oracle backing) | LOW | Verify-then-fix. Arbiter: **the geometry oracle**. If the oracle can be extended to numerically check the claim, extend it and re-run; if the oracle confirms, fix; if the oracle contradicts, discard as a hallucinated defect (VLMs invent defects — UI-Lens explicitly documents this: "misinterpreting intentional spacing ... as an abnormal blank space"). If the claim is genuinely subjective (gestalt, "does this look right") and the oracle can't arbitrate, **surface to the founder as an A/B variant fan-out, do NOT auto-fix**. |
-| Singleton VLM finding with no artifact and no reproducible check | LOW | Log to ledger with disposition `singleton-unverifiable`. Do not auto-fix. Do not auto-block. |
-
-**Session constraint (verbatim, load-bearing)**: Never singleton-VLM = auto-block. A single Codex or Opus visual claim without oracle backing does not stop the ship; it goes to the ledger and (if reproducible) the founder.
-
-**Sigil constraint (verbatim, load-bearing)**: Sigil requires reviewer confirmation. The final sigil-ready state must show at minimum the geometry-oracle green + Phase 4b run to completion + all HIGH-tier findings resolved. Do not sigil on a partial 4b.
-
-### Per-model disposition ledger
-
-Every 4b run appends to `docs/reviews/multi-model-taste-ledger.md` (project-local). One row per bucket, so per-model precision can be measured over time (sortie's pattern):
-
-```
-| run-id | date | surface | rule | opus | codex | oracle | disposition | outcome |
-|--------|------|---------|------|------|-------|--------|-------------|---------|
-| r4-... | 2026-08-03 | c-radiogroup | dot-y-center | HIT | HIT | HIT | auto-fix (2+) | fixed |
-| r4-... | 2026-08-03 | c-dialog --danger | red-title | HIT | MISS | n/a | verify-then-fix (singleton-Opus, oracle can't check) | founder-A/B |
-| r4-... | 2026-08-03 | combobox | chevron-present | MISS | HIT | HIT | auto-fix (2+) | fixed |
-```
-
-Columns:
-- `run-id` — links the row to the round (e.g. `r4-2026-08-03`)
-- `opus` / `codex` — `HIT` / `MISS` / `n/a` (n/a = surface not in that reviewer's dispatch)
-- `oracle` — `HIT` / `MISS` / `n/a` (n/a = oracle can't check this rule)
-- `disposition` — one of `auto-fix (2+)`, `auto-fix (oracle)`, `verify-then-fix (…)`, `singleton-unverifiable`, `founder-A/B`
-- `outcome` — `fixed` / `deferred` / `founder-picked-<variant>` / `discarded-as-hallucination` — filled retrospectively after the fix loop
-
-After ~20 runs the ledger surfaces per-model precision; use it to weight reviewers, not before. Until then, treat Opus and Codex as equal-weight peers; the oracle is always arbiter.
-
-### Gemini — future upgrade, not this round
-
-DiffSpot ranks Gemini (2.5 Pro / 3.x Pro) as the strongest visual perceiver (47.2% acc, 40.7% recall — best in class); UI-Lens ranks Gemini 2.5 Pro top-2 on F1 with the highest recall (81.4%) of any tested model. If Gemini API access becomes available in this shop, add as **phase 4c** using the same invocation shape and combiner rules — Gemini's high-recall / low-precision profile is exactly what a second miss-catching reviewer wants, and the arbiter+oracle mechanics already absorb the extra false positives. Do NOT add Gemini this round: no API key is wired, and adding a dependency the loop can't invoke would silently degrade to skipping 4c and calling it done.
+Both phases emit `verdict-schema.json` and are parsed by the same step-4 `jq`
+cross-validation as every other phase. Both apply their severity FLOORS
+parent-side, after parsing, never in a prompt (see "Elicit risk, not policy").
+Neither is gated by "Loop bounds": 4a is one critique plus one bounded fix pass,
+4b is one pass per surface.
 
 ## Composition table (skill-facing summary)
 
 | Phase | Vendor | Reviewer role | Combines with | Skip when |
 |---|---|---|---|---|
 | 1 | Anthropic (Opus + specialists) | Broad correctness + narrow security/API passes | Own phase output only | Never; foundation phase |
-| 4.5 (in-round) | Anthropic (Opus, validator) | Re-verify PIVOTAL (singleton) findings against actual file state; findings + paths only, no advisor context; array-index correlation `[{index, verified, unverifiable_confirmed, note}]`; parent drops `findings[i]` iff `verified=false` AND the finding is not tagged `unverifiable: true`; a drop CLOSES that finding with `repro: false` and keeps it in `new_r`; `unverifiable_confirmed` informational | Feeds into step 5 (reproduce) | Per-finding when two reviewers independently converged on the location (go straight to step 5). Wholesale on any validator failure (quota / malformed JSON / no usable result) — degrade to pre-4.5 behavior, never retry, never PAUSE |
+| 4.5 (in-round) | Anthropic (Opus, validator) | Re-verify PIVOTAL (singleton) findings against actual file state — input boundary, drop rule and degrade-on-failure behaviour all defined at step 4.5. A drop CLOSES the finding with `repro: false` and keeps it in `new_r` | Feeds into step 5 (reproduce) | Per-finding on independent two-reviewer convergence; wholesale on any validator failure — see step 4.5 |
 | 2 | OpenAI (Codex / GPT-5.5) | Cross-vendor correctness on Opus-clean state | Phase 1 fix history carried in prompt | Never; PAUSE on quota, don't silently skip |
 | 3 | Anthropic (Opus, adversarial) | "Prior phases were wrong — find why" | Same gate at step 8; a `continue` resets to Phase 1 | Never; one shot, cheap |
-| 4a | Anthropic (Opus x2 — defect + taste critics) | UI defect + house-style critique | Own phase output only | Non-UI diffs |
-| 4b | OpenAI (Codex vision-taste) on regenerated shots | Second-vendor VLM catch-what-Opus-missed | Union w/ geometry oracle (ground truth) + Phase 4a Opus taste, per `docs/reviews/multi-model-taste-ledger.md` protocol | Non-UI diffs; NEVER skip on UI-touching diffs — drift-back class survives 1-4a |
-| 4c (future) | Google (Gemini 2.5 Pro / 3.x) | Third-vendor VLM, high-recall miss catcher | Same combiner slot as 4b | No API key wired; not this round |
+| 4a | Anthropic (Opus x2 — defect + taste critics) | UI defect + house-style critique — protocol per "Phases 4a + 4b" | Own phase output only | Non-UI diffs |
+| 4b | OpenAI (Codex vision-taste) on regenerated shots | Second-vendor VLM catch-what-Opus-missed — protocol per "Phases 4a + 4b" | Union w/ geometry oracle (ground truth) + Phase 4a Opus taste, per `docs/reviews/multi-model-taste-ledger.md` protocol | Non-UI diffs; NEVER skip on UI-touching diffs — drift-back class survives 1-4a |
+| 4c (future) | Google (Gemini 2.5 Pro / 3.x) | Third-vendor VLM, high-recall miss catcher | Same combiner slot as 4b | No API key wired |
 
 ## Exit
 
@@ -1265,4 +1091,4 @@ Also state, so the run is greppable and a stopped run is never mistaken for a cl
   for the affected phases
 - anything left in `pending_for_human.md`
 
-Then set `tasks/arftl-run.json` to `status: complete`. A run that exits `pending-human` keeps `status: pending-human` and its `pause_reason` — that file is how the next session knows a human decision is outstanding.
+Then set `<notes>/arftl-run.json` to `status: complete`. A run that exits `pending-human` keeps `status: pending-human` and its `pause_reason` — that file is how the next session knows a human decision is outstanding.
