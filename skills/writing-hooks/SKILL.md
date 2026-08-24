@@ -24,6 +24,8 @@ interrupts the turn. Choose the channel before writing logic.
 | Stop the turn ending, no error styling | `hookSpecificOutput.additionalContext` on `Stop`/`SubagentStop` | Renders as "Stop hook feedback"; conversation continues |
 | Force a correction with error styling | `{"decision": "block", "reason": "..."}` | Blocks; reason shown as hook feedback |
 | Gate a tool call | `{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow"\|"deny"\|"ask"\|"defer", "permissionDecisionReason": "..."}}` | Fires before permission checks, in every mode |
+| Rewrite the tool's arguments | `hookSpecificOutput.updatedInput` on `PreToolUse` (object) | Replaces `tool_input`; rejected if it fails the tool's input schema |
+| Rewrite the tool's result | `hookSpecificOutput.updatedToolOutput` on `PostToolUse` | "Replaces the tool output before it is sent to the model". `updatedMCPToolOutput` does the same for MCP tools only — prefer `updatedToolOutput`, which covers all tools |
 | Halt Claude entirely | `{"continue": false, "stopReason": "..."}` | Takes precedence over decision fields; `stopReason` shown to user, not Claude |
 | Desktop bell / title | `{"terminalSequence": "..."}` | Works even on events that discard `systemMessage` |
 
@@ -65,6 +67,14 @@ Event-specific: `tool_name`/`tool_input`/`tool_use_id`, `tool_response`,
 
 `transcript_path` is written asynchronously and **may lag** the conversation. On
 `Stop`/`SubagentStop`, read `last_assistant_message` instead of parsing it.
+
+**Hooks fire inside subagents**, so a `PreToolUse` gate covers agent-dispatched
+tool calls too. Measured on 2.1.222 (2026-08-24): a `PreToolUse` deny cancelled a
+subagent's `Read` and the reason came back as `is_error` in the subagent's
+sidechain transcript; a `PostToolUse` `additionalContext` reached the subagent's
+model context verbatim. Note the injected context is **not** persisted in the
+transcript — it exists only in the model's context, so grepping the JSONL for it
+finds nothing. A hook that must skip subagent traffic filters on `agent_id`.
 
 `permission_mode` reports the UI's "Manual" as `default`, never `manual`.
 File-tool paths are always absolute, but arrive backslashed on Windows.
