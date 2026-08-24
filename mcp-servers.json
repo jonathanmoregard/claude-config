@@ -11,8 +11,10 @@
     "type": "stdio",
     "command": "research-agent-mcp",
     "args": [],
-    "env": {},
-    "timeout": 5400000
+    "env": {
+      "RESEARCH_AGENT_TIMEOUT": "5700"
+    },
+    "timeout": 6000000
   },
   "futuresearch-gate": {
     "type": "stdio",
