@@ -62,10 +62,25 @@ So a rule containing an unescaped `*` is matched against individual
 subcommands ONLY, never against the whole compound command.
 
 safe-bash did the opposite: it applied every rule to each subcommand AND to the
-whole trimmed string (`server.py:875-876`). Six ported rules depend on the
-behaviour safe-bash had and the CLI does not, and are therefore INERT. They are
-enumerated in `INERT` below and asserted to be inert, so that "this rule reads
-as protection but stops nothing" is a recorded fact rather than an assumption.
+whole trimmed string (`server.py:875-876`). Six ported rules — the
+`Bash(curl *|bash*)` family — depended on the behaviour safe-bash had and the
+CLI does not, so they stopped nothing.
+
+They are NOT enumerated here and asserted to be inert. That was the earlier
+design, and it was abandoned: a deny rule that provably stops nothing still
+reads as coverage to the next auditor. `e55190c` DELETED all six from
+settings.json and moved their intent to `_check_pipe_to_shell` in
+`hooks/bash-guard.py`, which is handed the whole command string and can see the
+relation between two stages of one pipeline that a string matcher structurally
+cannot; the sink rules the CLI's matcher does enforce (`Bash(bash)`, `Bash(sh)`,
+`Bash(bash -s*)`, `Bash(sh -s*)`) stayed. `4222f8f` deleted the escaped-star
+sentinel on the same grounds. The behavioural cover for the hook half lives in
+`tests/test_bash_guard_pre.py`, not here.
+
+So `INERT` below is `{}`, and that emptiness is an assertion rather than an
+omission: this file re-derives the inert set from the CLI's own matcher on every
+run and fails if it is not empty. "This rule reads as protection but stops
+nothing" is now a state the deny list cannot re-enter unnoticed.
 
 The subcommand splitter used below is `bash_guard._pipeline_subcommands`, not
 the CLI's shell AST. It is an approximation, and it is the one part of the
@@ -232,9 +247,11 @@ check(
     "`yOo = jRo` — the Bash deny path really uses this parser",
     b"yOo=jRo" in BUNDLE,
 )
-# Pass 1 skips wildcard rules. This is the single line the whole INERT section
-# below rests on; if it goes, the six pipe rules stop being inert and this file
-# must be re-reasoned rather than quietly re-passing.
+# Pass 1 skips wildcard rules. This is the single line the retirement of the six
+# `curl *|bash*` rules rests on, and the one the "wildcard rules never see the
+# whole compound command" section below re-demonstrates. If it goes, those rules
+# would have worked after all and both the deletion and the hook layer that
+# replaced them must be re-reasoned rather than quietly re-passing here.
 check(
     "wildcard rules are skipped in the whole-command pass",
     b'case"wildcard":if(r==="exact")return!1' in BUNDLE,
@@ -519,20 +536,26 @@ check(
 )
 for rule in _declared_inert:
     check(f"inert, and known to be: {rule}", not stops.get(rule, True), INERT[rule])
+# The six `curl *|bash*` rules were RETIRED, not kept as inert entries (e55190c).
+# What this asserts is the settings-layer half of what replaced them: the sink
+# rules the CLI's matcher does enforce. The other half — `_check_pipe_to_shell`
+# in hooks/bash-guard.py, which catches the spellings no sink rule can — is
+# behavioural and is covered by tests/test_bash_guard_pre.py, not here.
 check(
-    "every inert pipe rule has a live replacement that does fire",
+    "every retired pipe rule still has a sink rule that fires",
     all(stops[r] for r in ("Bash(bash)", "Bash(sh)", "Bash(bash -s*)", "Bash(sh -s*)")),
     "curl|bash, curl|sh, wget|bash and the -s forms are stopped at the sink",
 )
 check(
-    "the inert escaped-star sentinel has a live replacement",
+    "the retired escaped-star sentinel has a live replacement",
     stops["Bash(*BLOCKED_TEST_ESCAPED\\**)"],
     "a rule needs an UNescaped star somewhere or jRo types it `exact`",
 )
 
 
 # ----------------------------------------------------------------------
-# The regression that makes those six rules inert, stated directly.
+# The dispatch fact that made those six rules inert — and so got them deleted
+# rather than annotated — stated directly.
 # ----------------------------------------------------------------------
 section("wildcard rules never see the whole compound command")
 _probe = cli_evaluate(
