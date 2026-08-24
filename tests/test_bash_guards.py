@@ -675,6 +675,259 @@ if os.path.exists(_bc_path):
 
 
 # ----------------------------------------------------------------------
+# bash-output-guard: secret redaction.
+#
+# _redact_secrets exists because `cat /run/agenix/...` once put a live
+# Anthropic API key into the assistant's context window. safe-bash shipped
+# it with no test coverage at all; these are new.
+#
+# Every fixture is assembled at runtime. Written as a literal, each one is a
+# guaranteed gitleaks false positive on every commit touching this file.
+# ----------------------------------------------------------------------
+section("bash-output-guard: secret redaction")
+
+
+def post_payload(command: str, response) -> dict:
+    return {
+        "session_id": "test-session",
+        "cwd": REPO_ROOT,
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": command},
+        "tool_response": response,
+        "tool_use_id": "toolu_test",
+    }
+
+
+def bash_out(command: str, response, **kw):
+    """Run bash-output-guard; return (parsed_json_or_None, updatedToolOutput)."""
+    rc, parsed, out, err = run_hook("bash-output-guard.py", post_payload(command, response), **kw)
+    updated = None
+    if isinstance(parsed, dict):
+        updated = (parsed.get("hookSpecificOutput") or {}).get("updatedToolOutput")
+    return parsed, updated, out
+
+
+def response_obj(stdout: str, stderr: str = "", **extra) -> dict:
+    # The real Bash tool result shape, from the 2.1.222 zod schema.
+    return dict({"stdout": stdout, "stderr": stderr, "interrupted": False}, **extra)
+
+
+SECRETS = [
+    ("anthropic-api", "sk-" + "ant-" + "api03-" + "A" * 32),
+    ("openai-project", "sk-" + "proj-" + "B" * 32),
+    ("github-token", "gh" + "p_" + "C" * 40),
+    ("github-pat", "github" + "_pat_" + "D" * 82),
+    ("slack-token", "xo" + "xb-" + "1234567890-abcdefghij"),
+    ("aws-access", "AK" + "IA" + "E" * 16),
+    ("jwt", "ey" + "J" + "abcdefghij" + "." + "ey" + "J" + "klmnopqrst" + "." + "uvwxyz1234"),
+    ("tavily-key", "tv" + "ly-" + "F" * 24),
+]
+
+for label, secret in SECRETS:
+    parsed, updated, raw = bash_out("cat /tmp/creds", response_obj(f"KEY={secret}\n"))
+    body = updated.get("stdout") if isinstance(updated, dict) else updated
+    check(f"redacts {label}", isinstance(body, str) and secret not in body, str(body)[:120])
+    check(
+        f"leaves a marker naming {label}",
+        isinstance(body, str) and f"[REDACTED:{label}:" in body,
+        str(body)[:120],
+    )
+    check(
+        f"whole hook stdout is free of the {label} value",
+        secret not in raw,
+        "secret leaked through some other field",
+    )
+
+# stderr is model-visible too, so it is redacted on the same terms.
+_s = "sk-" + "ant-" + "api03-" + "G" * 32
+parsed, updated, raw = bash_out("cat /tmp/x", response_obj("", stderr=f"failed with {_s}"))
+check(
+    "redacts stderr as well as stdout",
+    isinstance(updated, dict) and _s not in (updated.get("stderr") or ""),
+    str(updated)[:160],
+)
+
+# A string-shaped tool_response must survive as a string.
+parsed, updated, raw = bash_out("cat /tmp/x", f"KEY={_s}")
+check("string-shaped response stays a string", isinstance(updated, str), type(updated).__name__)
+check("string-shaped response is redacted", isinstance(updated, str) and _s not in updated,
+      str(updated)[:120])
+
+# Shape preservation: nothing else in the result object may be disturbed.
+parsed, updated, raw = bash_out(
+    "cat /tmp/x",
+    response_obj(f"KEY={_s}", stderr="warn", returnCodeInterpretation="ok", isImage=False),
+)
+check(
+    "preserves the other result fields",
+    isinstance(updated, dict)
+    and updated.get("interrupted") is False
+    and updated.get("returnCodeInterpretation") == "ok"
+    and updated.get("stderr") == "warn",
+    str(updated)[:200],
+)
+
+# Clean output must not be rewritten at all — a needless updatedToolOutput on
+# every command is churn the model has to read past.
+parsed, updated, raw = bash_out("ls -la", response_obj("file-a\nfile-b\n"))
+check("clean, non-ingress output is left alone", raw.strip() == "", raw[:160])
+
+
+# ----------------------------------------------------------------------
+# bash-output-guard: untrusted-ingress wrapping
+# (matrix rehomed from test_safe_bash.py's match_untrusted_ingress section)
+# ----------------------------------------------------------------------
+section("bash-output-guard: untrusted-ingress wrapping")
+
+INGRESS = [
+    ("curl https://example.invalid/x", "curl"),
+    ("curl https://example.invalid/x | jq .", "curl"),
+    ("wget -O - https://example.invalid/x", "wget"),
+    ("npx -y some-pkg", "npx"),
+    ("gh pr view 123", "gh-fetch"),
+    ("gh issue list", "gh-fetch"),
+    ("gh api repos/foo/bar", "gh-api"),
+    ("git clone https://github.invalid/x/y", "git-clone"),
+    ("pip install requests", "pip-install"),
+    ("pip3 install requests", "pip-install"),
+    ("npm install express", "npm-install"),
+    ("npm ci", "npm-install"),
+    ("cargo install ripgrep", "cargo-install"),
+    ("gem install bundler", "gem-install"),
+    ("go get example.invalid/mod", "go-fetch"),
+    ("bundle install", "bundle-install"),
+]
+for cmd, label in INGRESS:
+    parsed, updated, raw = bash_out(cmd, response_obj("remote body\n"))
+    body = updated.get("stdout") if isinstance(updated, dict) else updated
+    check(f"wraps {label}: {cmd!r}", isinstance(body, str) and "<untrusted_external_content" in body,
+          str(body)[:120])
+    check(f"labels the source for {cmd!r}", isinstance(body, str) and f'source="bash:{label}"' in body,
+          str(body)[:120])
+    check(f"closes the tag for {cmd!r}", isinstance(body, str) and "</untrusted_external_content>" in body)
+    check(f"carries the system-reminder for {cmd!r}",
+          isinstance(body, str) and "system-reminder" in body)
+
+for cmd in ("ls", "git status", "echo hello"):
+    parsed, updated, raw = bash_out(cmd, response_obj("plain\n"))
+    check(f"does not wrap non-ingress command {cmd!r}", raw.strip() == "", raw[:120])
+
+# Both layers on one response: an ingress command whose body carries a secret.
+_s2 = "sk-" + "ant-" + "api03-" + "H" * 32
+parsed, updated, raw = bash_out("curl https://example.invalid/x", response_obj(f"tok={_s2}\n"))
+body = updated.get("stdout") if isinstance(updated, dict) else updated
+check("redaction applies inside a wrapped body", isinstance(body, str) and _s2 not in body,
+      str(body)[:160])
+check("wrapping survives redaction", isinstance(body, str) and "<untrusted_external_content" in body)
+
+# The command echoed into the tag attribute must not be able to break out of it.
+parsed, updated, raw = bash_out('curl "https://x/?a=1&b=<2>"', response_obj("body\n"))
+body = updated.get("stdout") if isinstance(updated, dict) else updated
+check(
+    "command attribute is XML-escaped",
+    isinstance(body, str) and "&lt;2&gt;" in body and "&amp;" in body,
+    str(body)[:200],
+)
+
+
+# ----------------------------------------------------------------------
+# bash-output-guard: FAIL-CLOSED.
+#
+# A PostToolUse hook cannot deny; the equivalent of denying is withholding
+# the output rather than passing bytes it failed to inspect.
+# ----------------------------------------------------------------------
+section("bash-output-guard: fail-closed")
+
+_spec2 = importlib.util.spec_from_file_location(
+    "bash_output_guard_under_test", os.path.join(HOOKS, "bash-output-guard.py")
+)
+out_guard = importlib.util.module_from_spec(_spec2)
+_spec2.loader.exec_module(out_guard)
+
+WITHHELD_MARKER = "the output guard is BROKEN"
+
+
+def check_withheld(label: str, parsed, updated) -> None:
+    body = updated.get("stdout") if isinstance(updated, dict) else updated
+    check(f"{label} -> output replaced", updated is not None, f"parsed={str(parsed)[:120]}")
+    check(
+        f"{label} -> replacement says the guard is broken",
+        isinstance(body, str) and WITHHELD_MARKER in body,
+        str(body)[:200],
+    )
+
+
+rc, parsed, raw, err = run_hook("bash-output-guard.py", None, raw_stdin="not json at all")
+updated = (parsed or {}).get("hookSpecificOutput", {}).get("updatedToolOutput")
+check_withheld("unparseable hook stdin", parsed, updated)
+
+_secret_cfg = "sk-" + "ant-" + "api03-" + "J" * 32
+parsed, updated, raw = bash_out(
+    "curl https://example.invalid/x",
+    response_obj(f"tok={_secret_cfg}\n"),
+    env_extra={"BASH_GUARD_CONFIG": os.path.join(SCRATCH, "no-such-config.json")},
+)
+check_withheld("ingress config missing", parsed, updated)
+check(
+    "config missing -> the secret is withheld along with everything else",
+    _secret_cfg not in raw,
+    "secret leaked while the guard was broken",
+)
+
+# Fault-injected stall, to prove the watchdog covers the guard's own work
+# rather than leaning on the harness timeout (which discards output).
+with open(os.path.join(HOOKS, "bash-output-guard.py"), encoding="utf-8") as fh:
+    _out_src = fh.read()
+_stalled_src = _out_src.replace(
+    "payload = json.loads(raw)",
+    '__import__("time").sleep(30); payload = json.loads(raw)',
+)
+check("stall fixture actually patched the source", _stalled_src != _out_src)
+_stalled_path = os.path.join(SCRATCH, "bash-output-guard-stalled.py")
+with open(_stalled_path, "w", encoding="utf-8") as fh:
+    fh.write(_stalled_src)
+
+t0 = time.monotonic()
+rc, parsed, raw, err = run_hook(
+    _stalled_path, post_payload("ls", response_obj("x")), timeout=45.0
+)
+elapsed = time.monotonic() - t0
+updated = (parsed or {}).get("hookSpecificOutput", {}).get("updatedToolOutput")
+check_withheld("guard stalls past its own deadline", parsed, updated)
+check(
+    "stall withholding lands before the harness hook timeout",
+    elapsed < out_guard.HARNESS_HOOK_TIMEOUT_S,
+    f"{elapsed:.1f}s vs harness {out_guard.HARNESS_HOOK_TIMEOUT_S}s",
+)
+
+check(
+    "output guard ladder holds: 0 < GUARD_DEADLINE_S < HARNESS_HOOK_TIMEOUT_S",
+    0 < out_guard.GUARD_DEADLINE_S < out_guard.HARNESS_HOOK_TIMEOUT_S,
+    f"{out_guard.GUARD_DEADLINE_S} / {out_guard.HARNESS_HOOK_TIMEOUT_S}",
+)
+
+_post = SETTINGS.get("hooks", {}).get("PostToolUse", [])
+_out_entries = [
+    (entry, hook)
+    for entry in _post
+    for hook in entry.get("hooks", [])
+    if "bash-output-guard.py" in (hook.get("command") or "")
+]
+check("settings.json registers bash-output-guard.py on PostToolUse",
+      len(_out_entries) == 1, f"found {len(_out_entries)}")
+if _out_entries:
+    entry, hook = _out_entries[0]
+    check(
+        "settings.json declares the timeout the output guard was built against",
+        hook.get("timeout") == out_guard.HARNESS_HOOK_TIMEOUT_S,
+        f"settings.json={hook.get('timeout')!r} hook={out_guard.HARNESS_HOOK_TIMEOUT_S}",
+    )
+    check("output guard matcher targets Bash", entry.get("matcher") == "Bash",
+          f"matcher={entry.get('matcher')!r}")
+
+
+# ----------------------------------------------------------------------
 # Summary
 # ----------------------------------------------------------------------
 section("Summary")

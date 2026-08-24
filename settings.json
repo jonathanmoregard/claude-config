@@ -237,6 +237,16 @@
             "command": "~/.claude/hooks/visual-verify-trigger.sh"
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/hooks/bash-output-guard.py",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "PreCompact": [
