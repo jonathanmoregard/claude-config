@@ -68,7 +68,6 @@
       "Bash(docker cp*research-agent*)",
       "Bash(echo BLOCKED_TEST_STRING*)",
       "Bash(* BLOCKED_TEST_COMPOUND *)",
-      "Bash(echo BLOCKED_TEST_ESCAPED\\*)",
       "Bash(*BLOCKED_TEST_ESCAPED\\**)",
       "Bash(BLOCKED_TEST_SUBCMD*)",
       "Bash(*/run/agenix/*)",

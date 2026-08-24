@@ -546,6 +546,42 @@ check(
 
 
 # ======================================================================
+# E12 — the escaped-star sentinel that could not fire.
+#
+# `Bash(echo BLOCKED_TEST_ESCAPED\*)` is not a security rule; it is a probe,
+# there so a live run can demonstrate that the matcher's escaped-star handling
+# works. It never could. With no UNescaped star anywhere in it, the CLI's own
+# parser types it `exact`, and an exact rule is compared by string EQUALITY —
+# so it matches only a command containing the literal backslash, which no
+# command does.
+#
+# D3 measured that and added `Bash(*BLOCKED_TEST_ESCAPED\**)`: an unescaped
+# star at each end makes it a wildcard rule, the escaped one in the middle
+# still has to match a literal `*`, and it does stop `echo BLOCKED_TEST_
+# ESCAPED*` (lifted matcher, plus two live `claude -p` probes). The intent is
+# therefore fully covered, and what was left behind was a rule in the deny
+# list that stops nothing — the exact shape this chunk exists to end. Deleted
+# rather than kept-and-annotated: the annotation lives in test_deny_globs.py,
+# the deny list is read by people who count entries.
+#
+# No behavioural test accompanies the deletion because there is no behaviour
+# to test: the rule was inert, and its replacement's rows already exist in
+# tests/test_deny_globs.py, measured against the shipped matcher.
+# ======================================================================
+section("settings.json: the inert escaped-star sentinel (parity row E12)")
+
+check(
+    "retired: Bash(echo BLOCKED_TEST_ESCAPED\\*) — typed `exact`, so it could never fire",
+    "Bash(echo BLOCKED_TEST_ESCAPED\\*)" not in _DENY_FOR_PIPE,
+)
+check(
+    "... and its working replacement is still there to be probed",
+    "Bash(*BLOCKED_TEST_ESCAPED\\**)" in _DENY_FOR_PIPE,
+    "a rule needs an UNescaped star somewhere or the CLI's parser types it `exact`",
+)
+
+
+# ======================================================================
 # B11 — which way dcg's stdout is scanned.
 #
 # Measured against the packaged binary (dcg 0.12.5, the rev nixos-config
