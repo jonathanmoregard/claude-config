@@ -33,6 +33,13 @@ from datetime import datetime, timezone
 DEFAULT_LEDGER_DIR = "~/.claude/permission-ledger"
 ERROR_LOG_NAME = "hook-errors.log"
 
+# Tools recorded by nobody: no filesystem, network or execution reach, so no
+# allow/deny decision about them is ever meaningful. Their records are pure
+# noise, and noise here is not free -- the digest ranks friction by group size,
+# so a high-volume no-reach tool crowds out the groups worth acting on.
+# AskUserQuestion reached 106 of 452 records (23%) before being listed.
+IGNORED_TOOLS = frozenset(("AskUserQuestion",))
+
 FILE_TOOLS = ("Read", "Edit", "Write", "Glob", "Grep", "NotebookEdit")
 PATH_KEYS = ("file_path", "path", "notebook_path")
 BASH_TOOLS = ("Bash", "mcp__safe-bash__exec")
@@ -330,6 +337,11 @@ def append_line(directory, filename, line):
 
 
 def emit(payload, now=None):
+    # Checked before build_record so an ignored tool costs no redaction pass
+    # and no digest. Both events are dropped: keeping the denial without its
+    # request would leave an unjoinable half-record.
+    if isinstance(payload, dict) and _as_str(payload.get("tool_name")) in IGNORED_TOOLS:
+        return None
     # One instant for both the record and the month file: taking now() twice
     # could file a 23:59:59.999 record under the next month.
     now = now or datetime.now(timezone.utc)

@@ -73,6 +73,13 @@ class HookRunMixin:
     def setUp(self):
         self.ledger_dir = tempfile.mkdtemp(prefix="permledger-test-")
         self.addCleanup(self._cleanup)
+        # run_hook passes the temp dir to the subprocess explicitly, but a test
+        # calling hook.emit() in-process resolves ledger_dir() from this
+        # process's environment -- and without this line that is the real
+        # ~/.claude/permission-ledger. Defaulting it here rather than per-test
+        # keeps a new direct-emit test from silently writing to live data.
+        os.environ["PERMISSION_LEDGER_DIR"] = self.ledger_dir
+        self.addCleanup(os.environ.pop, "PERMISSION_LEDGER_DIR", None)
 
     def _cleanup(self):
         # tests may leave the dir read-only; restore before removing
@@ -279,6 +286,42 @@ class TestDeniedRecord(HookRunMixin, unittest.TestCase):
         }
         self.assertEqual(expected, set(rec.keys()))
         self.assertEqual(rec["suggestions"], [])
+
+
+class TestIgnoredTools(HookRunMixin, unittest.TestCase):
+    """Tools with no filesystem, network or execution reach are not recorded.
+
+    AskUserQuestion asks the operator a question and returns their answer. It
+    can never be the subject of a useful allow/deny decision, so a record of it
+    is pure noise -- and at 106 of 452 records it was skewing the digest's view
+    of where friction actually is.
+    """
+
+    def test_ignored_tool_request_writes_nothing(self):
+        proc = self.run_hook(make_request(tool_name="AskUserQuestion"))
+        self.assert_silent_success(proc)
+        self.assertEqual(self.read_lines(), [])
+
+    def test_ignored_tool_denial_writes_nothing(self):
+        request = make_request(tool_name="AskUserQuestion")
+        proc = self.run_hook(make_denied(request))
+        self.assert_silent_success(proc)
+        self.assertEqual(self.read_lines(), [])
+
+    def test_ignored_tool_does_not_suppress_the_next_real_record(self):
+        self.assert_silent_success(self.run_hook(make_request(tool_name="AskUserQuestion")))
+        self.assert_silent_success(self.run_hook(make_request()))
+        records = self.read_records()
+        self.assertEqual([r["tool_name"] for r in records], ["Read"])
+
+    def test_emit_returns_none_for_an_ignored_tool(self):
+        self.assertIsNone(hook.emit(make_request(tool_name="AskUserQuestion")))
+        self.assertEqual(self.read_lines(), [])
+
+    def test_a_tool_merely_containing_the_name_is_still_recorded(self):
+        proc = self.run_hook(make_request(tool_name="AskUserQuestionExtra"))
+        self.assert_silent_success(proc)
+        self.assertEqual([r["tool_name"] for r in self.read_records()], ["AskUserQuestionExtra"])
 
 
 class TestInputDigest(unittest.TestCase):
