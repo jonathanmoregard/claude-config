@@ -6,6 +6,43 @@
 [general]
 verbose = false
 
+# DO NOT RE-ENABLE. Upstream defaults this to true, and true means dcg
+# REWRITES ~/.claude/settings.json from inside the hook path.
+#
+# What it does (dcg 0.12.5): on every bare-`dcg` hook invocation — which is
+# how hooks/bash-guard.py consults it, one per Bash tool call — main.rs:1534
+# calls cli::ensure_hook_registered(). That reads $HOME/.claude/settings.json
+# (cli.rs:13262, hardcoded; CLAUDE_CONFIG_DIR is NOT honoured) and looks for a
+# PreToolUse entry with matcher "Bash|PowerShell" whose command is the absolute
+# path of the running dcg binary (cli.rs:13614, :11263, :11368). We register
+# dcg *indirectly*, through bash-guard.py, so that exact entry is never there
+# and the check never passes. dcg then takes the repair branch (cli.rs:13635)
+# and writes the file: it inserts its own hook entry at PreToolUse[0], AHEAD of
+# our matcher-"*" guard entry (cli.rs:11707), and re-serialises the whole file
+# with serde_json::to_string_pretty — reflowing our formatting and dropping the
+# trailing newline.
+#
+# This is not hypothetical. It fired on the live file on 2026-08-24 16:50:40
+# local: `git -C ~/.claude diff settings.json` showed the injected
+# "Bash|PowerShell" entry pointing at the nix store path, and the tripwire
+# logged FOUR ConfigChange/user_settings events at 14:50:41Z for that one
+# write — the permission surface changing underfoot, once per live session.
+#
+# It is idempotent only until the path changes. The entry it writes embeds the
+# absolute executable path, so every nixpkgs rebuild of dcg gives a new
+# /nix/store/... hash, the match fails again, and it rewrites settings.json
+# again. Reverting the entry by hand does not stick either — the next Bash tool
+# call re-adds it.
+#
+# What is lost by disabling: dcg no longer re-registers ITS OWN direct
+# PreToolUse hook if that entry disappears. We never had that entry, and do not
+# want it — bash-guard.py is the registered hook and it invokes dcg itself,
+# fail-closed, with its own health check on this config file. Nothing else
+# depends on self-heal: evaluation, packs, and the deny verdict are unaffected
+# (verified under an isolated HOME — a `rm -fr /` payload still returns the full
+# permissionDecision":"deny" document with self_heal_hook = false).
+self_heal_hook = false
+
 [packs]
 enabled = []
 disabled = []
