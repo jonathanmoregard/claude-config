@@ -1425,6 +1425,475 @@ check(
 
 
 # ----------------------------------------------------------------------
+# SessionStart health check: the THIRD state — armed on the bootstrap
+# fallback config.
+#
+# `tests/test_bash_guards.py` owns the two states this hook already knew:
+# guard unusable (announce) and guard healthy (silent). A third now exists
+# and neither covers it.
+#
+# On NixOS, home-manager links ~/.config/dcg/config.toml to the tracked
+# ~/.claude/dcg.toml. On a host where that file is absent — a fresh machine,
+# since ~/.claude is deliberately never auto-cloned — activation SEEDS
+# nixos-config's home/dcg-fallback.toml at that path and succeeds. The guard
+# then comes up ARMED but on a REDUCED rule set: destructive HTTP verbs via
+# curl only, none of the adb / wget / httpie / requests / httpx / POST rules
+# the tracked file carries.
+#
+# Seeding was the right call — hard-failing a first `nixos-rebuild switch`
+# invites commenting the module out, which is a worse silent-off — but it
+# only works if the operator is TOLD. Activation runs inside
+# home-manager-jonathan.service and nixos-rebuild does not stream unit logs,
+# so the "unmissable" banner reaches journalctl and nobody else.
+#
+# The two config files sit at the SAME PATH in both states, so neither
+# `config_sources[].path` nor `.status` can tell them apart — both report
+# `loaded` at ~/.config/dcg/config.toml. What distinguishes them is the RULE
+# SET dcg resolved, which `dcg config --format json` reports under
+# `.overrides.block[]`. Two independent readings of it are asserted below:
+# the fallback's self-naming reason text (the contract nixos-config's VM lane
+# pins at tests/base.nix, `dcg_assert_denied_by_user_config(..., "BOOTSTRAP
+# FALLBACK")`), and the SHAPE of the rule set, probed by running the loaded
+# patterns against one representative command per rule class.
+# ----------------------------------------------------------------------
+section("bash-guard-health: armed-on-fallback is the third state")
+
+HEALTH_INGRESS = os.path.join(HOOKS, "bash-guard-config.json")
+HEALTH_GOOD_CONFIG = _write_stub(
+    "health/dcg-config.toml", "[general]\nverbose = false\n", executable=False
+)
+# Pointed at a path that does not exist, in every case that is not about the
+# marker. Left unset, these cases would read the host's real
+# ~/.local/state/dcg/fallback-active.json and their result would depend on
+# whether this machine happens to be running the seed.
+NO_MARKER = os.path.join(SCRATCH, "health", "absent-marker.json")
+
+# Copied verbatim from the tracked /home/jonathan/.claude/dcg.toml, so the
+# class probes in the hook are checked against the operator's real patterns
+# rather than against patterns invented to satisfy them.
+FULL_BLOCK = [
+    {"pattern": r"adb\s+uninstall", "reason": "ADB uninstall blocked"},
+    {"pattern": r"adb\s+shell\s+pm\s+clear", "reason": "ADB pm clear blocked"},
+    {"pattern": r"curl.*-X\s+(DELETE|PUT|PATCH)", "reason": "Destructive HTTP method"},
+    {"pattern": r"curl.*--request\s+(DELETE|PUT|PATCH)", "reason": "Destructive HTTP method"},
+    {"pattern": r"wget.*--method[=\s](DELETE|PUT|PATCH)", "reason": "Destructive via wget"},
+    {"pattern": r"\bhttp\s+(DELETE|PUT|PATCH)\s", "reason": "httpie destructive method"},
+    {"pattern": r"requests\.(delete|put|patch)\(", "reason": "requests destructive call"},
+    {"pattern": r"httpx\.(delete|put|patch)\(", "reason": "httpx destructive call"},
+    {"pattern": r"curl.*-X\s+POST", "reason": "POST requires explicit approval"},
+    {"pattern": r"requests\.post\(", "reason": "requests POST requires approval"},
+]
+
+# Copied verbatim from nixos-config home/dcg-fallback.toml @ 24a5902 — the
+# file home-manager installs. Its reason text is the self-announcement the
+# VM lane already asserts on.
+FALLBACK_REASON = (
+    "Destructive HTTP method - deletes or overwrites a remote resource. NOTE: "
+    "dcg is running its BOOTSTRAP FALLBACK config (nixos-config "
+    "home/dcg-fallback.toml) because ~/.claude/dcg.toml was absent at "
+    "home-manager activation. Your real pattern list is NOT loaded. Run it "
+    "yourself with `! <command>` if intentional."
+)
+FALLBACK_BLOCK = [
+    {"pattern": r"curl\b.*\s-X\s*(DELETE|PUT|PATCH)\b", "reason": FALLBACK_REASON},
+    {"pattern": r"curl\b.*\s--request[=\s]*(DELETE|PUT|PATCH)\b", "reason": FALLBACK_REASON},
+]
+
+# The same list with the announcement stripped out. If the nixos side ever
+# rewords that reason the sentinel stops firing, and this fixture is what
+# proves the shape probe catches it anyway — so the two signals are
+# genuinely independent rather than one signal written twice.
+FALLBACK_BLOCK_UNMARKED = [
+    {"pattern": e["pattern"], "reason": "Destructive HTTP method."}
+    for e in FALLBACK_BLOCK
+]
+
+
+def _config_doc(block, user_status="loaded", self_heal=False,
+                user_path="/home/test/.config/dcg/config.toml", detail=None):
+    """The `dcg config --format json` document, field for field.
+
+    Transcribed from the packaged binary
+    (/nix/store/d4zpw04h59mjx17byracpn01m3r2vfww-dcg-0.12.5/bin/dcg), not
+    from upstream docs. The status vocabulary was measured the same way:
+    `missing`, `loaded`, `invalid` (malformed TOML), `rejected` (dangling
+    symlink or unreadable), `skipped` (superseded by DCG_CONFIG).
+    """
+    return {
+        "dcg_version": "0.12.5",
+        "config_sources": [
+            {"level": "system", "label": "system", "path": "/etc/dcg/config.toml",
+             "status": "missing", "authority": "full", "detail": None},
+            {"level": "user", "label": "user", "path": user_path,
+             "status": user_status, "authority": "full", "detail": detail},
+            {"level": "automatic_project", "label": "automatic project",
+             "path": None, "status": "missing", "authority": "enforcement_only",
+             "detail": "current directory is not inside a Git repository"},
+        ],
+        "general": {"color": "auto", "verbose": False, "log_file": None,
+                    "hook_timeout_ms": 1000, "hook_timeout_source": "default",
+                    "self_heal_hook": self_heal, "fail_closed": False},
+        "packs": {"enabled": ["core", "system.disk"], "disabled": []},
+        "heredoc": {"enabled": True, "timeout_ms": 50},
+        "overrides": {"allow": [], "block": block, "removed_keys_present": []},
+        "rules": {},
+        "policy": {"default_mode": None, "packs": {}, "rules": {}},
+        "warnings": [],
+    }
+
+
+def _dcg_json_stub(rel, doc_or_text):
+    """A dcg stub whose `config` subcommand answers in JSON.
+
+    Keyed on argv[1] exactly as the real binary distinguishes `dcg config`
+    from the bare hook path, so the hook path is untouched.
+    """
+    raw = doc_or_text if isinstance(doc_or_text, str) else json.dumps(doc_or_text)
+    return _write_stub(
+        rel,
+        'if [ "$1" = "config" ]; then\n'
+        f"  printf '%s' {shlex.quote(raw)}\n"
+        "  exit 0\n"
+        "fi\n"
+        "cat >/dev/null\nexit 0\n",
+    )
+
+
+def health(dcg, dcg_config=HEALTH_GOOD_CONFIG, ingress=HEALTH_INGRESS,
+           marker=NO_MARKER):
+    rc, parsed, out, err = run_hook(
+        "bash-guard-health.py",
+        {"session_id": "t", "hook_event_name": "SessionStart", "source": "startup"},
+        env_extra={"DCG_PATH": dcg, "DCG_CONFIG": dcg_config,
+                   "BASH_GUARD_CONFIG": ingress,
+                   "DCG_FALLBACK_MARKER": marker},
+    )
+    msg = ""
+    ctx = ""
+    if isinstance(parsed, dict):
+        msg = parsed.get("systemMessage") or ""
+        ctx = (parsed.get("hookSpecificOutput") or {}).get("additionalContext") or ""
+    return rc, msg, ctx, out, parsed
+
+
+# ── State 2 of 3: armed on the FULL config → SILENT ───────────────────────
+# Asserted first, and deliberately: a health check that speaks every session
+# is one nobody reads, so the announcing states below are only worth
+# anything if this one is quiet.
+STUB_FULL = _dcg_json_stub("health/dcg-full", _config_doc(FULL_BLOCK))
+rc, msg, ctx, out, parsed = health(STUB_FULL)
+check("full config: exit 0", rc == 0, f"rc={rc}")
+check("full config: says NOTHING — silence is the whole point",
+      out.strip() == "", out[:300])
+
+# ── State 3 of 3: armed on the FALLBACK → ANNOUNCE ────────────────────────
+STUB_FALLBACK = _dcg_json_stub("health/dcg-fallback", _config_doc(FALLBACK_BLOCK))
+rc, msg, ctx, out, parsed = health(STUB_FALLBACK)
+check("fallback: exit 0 — announce, never block startup", rc == 0, f"rc={rc}")
+check("fallback: something is said at all", out.strip() != "", "silent")
+check("fallback: names the state in the operator's words",
+      "fallback" in msg.lower(), msg[:300])
+check("fallback: says the guard is still ARMED, not down",
+      "armed" in msg.lower(), msg[:300])
+check("fallback: names the seed file so the operator can find it",
+      "dcg-fallback.toml" in msg, msg[:500])
+check("fallback: names the tracked file that is missing",
+      ".claude/dcg.toml" in msg, msg[:500])
+
+# What is actually lost. "dcg is using a fallback config" on its own tells
+# the operator nothing actionable; these are the rule classes the tracked
+# file carries and the fallback does not.
+for _cls in ("adb", "wget", "httpie", "requests", "httpx", "POST"):
+    check(f"fallback: names the lost rule class {_cls!r}",
+          _cls.lower() in msg.lower(), msg[:900])
+
+check("fallback: says what IS still in force, so it is not read as 'the "
+      "guard is off'",
+      "core" in msg.lower() or "built-in" in msg.lower(), msg[:900])
+check("fallback: tells the operator how to fix it (restore the file)",
+      "checkout" in msg or "clone" in msg, msg[:1200])
+check("fallback: tells the operator to re-activate afterwards",
+      "rebuild" in msg.lower() or "home-manager" in msg.lower(), msg[:1200])
+check("fallback: the model is told too, not only the user",
+      "fallback" in ctx.lower(), ctx[:300])
+
+# Announce, do NOT block. This state is armed and working, just reduced;
+# denying on a fresh host would brick it.
+check("fallback: does not claim commands are being denied",
+      "will be denied" not in msg and "are denied" not in msg, msg[:1200])
+check("fallback: does not claim output is being withheld",
+      "withheld" not in msg.lower(), msg[:1200])
+check("fallback: renders no permissionDecision — SessionStart cannot deny, "
+      "and this state must not try",
+      "permissionDecision" not in json.dumps(parsed or {}),
+      json.dumps(parsed or {})[:300])
+
+# ── The two fallback signals are independent ──────────────────────────────
+STUB_FALLBACK_UNMARKED = _dcg_json_stub(
+    "health/dcg-fallback-unmarked", _config_doc(FALLBACK_BLOCK_UNMARKED)
+)
+rc, msg_u, ctx_u, out_u, _ = health(STUB_FALLBACK_UNMARKED)
+check("reworded fallback (sentinel gone): still announced, on rule-set shape "
+      "alone",
+      out_u.strip() != "",
+      "silent — the check leans entirely on the reason wording, so a "
+      "nixos-side reword would disarm it")
+check("reworded fallback: still names the lost classes",
+      "adb" in msg_u.lower() and "httpie" in msg_u.lower(), msg_u[:900])
+
+# And the other way round: a rule set that covers every class but whose
+# reasons carry the sentinel is still the fallback speaking.
+STUB_MARKED_FULL = _dcg_json_stub(
+    "health/dcg-marked-full",
+    _config_doc(FULL_BLOCK + [{"pattern": r"zzz-never", "reason": FALLBACK_REASON}]),
+)
+rc, msg_m, _, out_m, _ = health(STUB_MARKED_FULL)
+check("sentinel present in a full-shaped rule set: still announced",
+      out_m.strip() != "", "silent")
+
+# A config with no [overrides] block at all is not the fallback, but it is
+# not the tracked file either — every destructive-HTTP rule is absent.
+STUB_EMPTY_BLOCK = _dcg_json_stub("health/dcg-empty", _config_doc([]))
+rc, msg_e, _, out_e, _ = health(STUB_EMPTY_BLOCK)
+check("loaded config with an EMPTY block list: announced, not silent",
+      out_e.strip() != "", "silent")
+
+# Narrowness control. The operator edits this file by hand, often. Dropping
+# ONE class must not turn the health check into session-start noise — only a
+# rule set carrying none of them is reported.
+STUB_PARTIAL = _dcg_json_stub(
+    "health/dcg-partial",
+    _config_doc([e for e in FULL_BLOCK if "httpie" not in e["reason"]]),
+)
+rc, msg_p, _, out_p, _ = health(STUB_PARTIAL)
+check("operator dropped one rule class by hand: still SILENT (not the "
+      "fallback, and not the check's business)",
+      out_p.strip() == "", out_p[:300])
+
+# ── Fail-closed applies to the health check's own errors ──────────────────
+# Silence must mean "verified", never "could not tell".
+STUB_CONFIG_GARBAGE = _dcg_json_stub(
+    "health/dcg-garbage", "some other program's idea of help text\n"
+)
+rc, msg_g, _, out_g, _ = health(STUB_CONFIG_GARBAGE)
+check("dcg answers `config` with nothing recognisable: announced, not "
+      "assumed healthy",
+      out_g.strip() != "",
+      "silent — a health check that cannot read the loader must say so")
+check("... and it says it could not tell, rather than naming a state",
+      "could not" in msg_g.lower() or "cannot" in msg_g.lower(), msg_g[:500])
+
+STUB_CONFIG_HANG = _write_stub(
+    "health/dcg-hang-config",
+    'if [ "$1" = "config" ]; then sleep 30; fi\ncat >/dev/null\nexit 0\n',
+)
+_health_t0 = time.time()
+rc, msg_h, _, out_h, _ = health(STUB_CONFIG_HANG)
+_health_elapsed = time.time() - _health_t0
+check("`dcg config` hangs: announced rather than silently giving up",
+      out_h.strip() != "", "silent")
+check("... and the check gives up well inside a session-start budget",
+      _health_elapsed < 20.0, f"{_health_elapsed:.1f}s")
+
+STUB_CONFIG_NOT_LOADED = _dcg_json_stub(
+    "health/dcg-not-loaded",
+    _config_doc(FULL_BLOCK, user_status="rejected",
+                detail="config could not be read safely"),
+)
+rc, msg_n, _, out_n, _ = health(STUB_CONFIG_NOT_LOADED)
+check("dcg reports the user layer NOT loaded: announced",
+      out_n.strip() != "", "silent")
+check("... and the status dcg itself reported is quoted back",
+      "rejected" in msg_n.lower(), msg_n[:500])
+
+# ── self_heal_hook: dcg rewriting the operator's permission surface ───────
+# Measured on 0.12.5 under an isolated HOME: with self_heal_hook at its
+# upstream default of true, ONE bare-`dcg` hook invocation rewrites
+# $HOME/.claude/settings.json — inserting a "Bash|PowerShell" PreToolUse
+# entry at index 0, ahead of the real guard — and re-serialises the file.
+# It fired on the live host on 2026-08-24. `dcg config` itself rewrites
+# nothing (measured: file hash unchanged across three invocations), which is
+# what makes this check safe to run at session start.
+STUB_SELF_HEAL = _dcg_json_stub(
+    "health/dcg-selfheal", _config_doc(FULL_BLOCK, self_heal=True)
+)
+rc, msg_s, _, out_s, _ = health(STUB_SELF_HEAL)
+check("self_heal_hook armed: announced", out_s.strip() != "", "silent")
+check("... and it names the file dcg would rewrite",
+      "settings.json" in msg_s, msg_s[:500])
+check("... and it names the key to set",
+      "self_heal_hook" in msg_s, msg_s[:500])
+
+# ── The guard-unusable state keeps its own, harder wording ────────────────
+# Reduced and down must not collapse into one message: "armed but reduced"
+# and "denying everything" call for different actions.
+HEALTH_MISSING_DCG = os.path.join(SCRATCH, "health", "definitely-not-here", "dcg")
+rc, msg_d, _, out_d, _ = health(HEALTH_MISSING_DCG)
+check("dcg absent: still says every Bash command will be denied",
+      "denied" in msg_d.lower(), msg_d[:500])
+rc, msg_f, _, _, _ = health(STUB_FALLBACK)
+check("the down state and the reduced state do not share a headline",
+      bool(msg_d) and bool(msg_f)
+      and msg_d.splitlines()[0] != msg_f.splitlines()[0],
+      f"{(msg_d.splitlines() or [''])[0][:70]!r} vs "
+      f"{(msg_f.splitlines() or [''])[0][:70]!r}")
+
+# ── Compatibility: a dcg that answers `config` in the plain text format ───
+# The packaged binary always emits JSON for `--format json`; this path
+# covers a build that ignores the flag. The resolved rule set is invisible
+# there, so the loaded config FILE is read for the sentinel instead —
+# corroboration, not a substitute.
+STUB_TEXT_LOADED = _dcg_stub("health/dcg-text", "cat >/dev/null\nexit 0\n",
+                             config="loaded")
+rc, _, _, out_tl, _ = health(STUB_TEXT_LOADED)
+check("text-format loader + a clean config file: silent",
+      out_tl.strip() == "", out_tl[:300])
+
+HEALTH_SEEDED_CONFIG = _write_stub(
+    "health/dcg-seeded.toml",
+    "[overrides]\nblock = [{ pattern = 'curl', reason = '"
+    + FALLBACK_REASON.replace("'", "") + "' }]\n",
+    executable=False,
+)
+rc, msg_ts, _, out_ts, _ = health(STUB_TEXT_LOADED, dcg_config=HEALTH_SEEDED_CONFIG)
+check("text-format loader + a seeded config file: announced from the file's "
+      "own sentinel",
+      out_ts.strip() != "", "silent")
+
+# ── The cross-repo marker file ────────────────────────────────────────────
+# nixos-config home/dcg.nix writes a marker on every activation that finds
+# the fallback in force, and deletes it on the first one that does not. Its
+# header names this hook as the reader and fixes the contract:
+#
+#   PATH    ~/.local/state/dcg/fallback-active.json  (XDG state, and
+#           deliberately not under ~/.claude, which is a protected path)
+#   ABSENT  not the fallback — or activation has never run here
+#   PRESENT as of `observed_at`, `target` was byte-identical to
+#           `fallback_source`
+#   SCHEMA  a reader that does not recognise `schema` must treat the file as
+#           "fallback possibly active" and warn — NEVER as "unparseable,
+#           therefore fine". Same for unreadable or garbled.
+#
+# It is corroboration, not a substitute: it is a snapshot from the last
+# activation, while dcg's loader answers for right now. So the marker can
+# also be STALE — restored file, no rebuild yet — and that transitional
+# state is worth saying out loud, because the declarative state and the
+# running state disagree until the operator re-activates.
+def _marker(rel, doc):
+    path = os.path.join(SCRATCH, "health", rel)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(doc if isinstance(doc, str) else json.dumps(doc))
+    return path
+
+
+MARKER_DOC = {
+    "schema": 1,
+    "component": "dcg",
+    "state": "fallback-active",
+    "target": "/home/jonathan/.claude/dcg.toml",
+    "fallback_source": "/nix/store/xxxx-dcg-fallback.toml",
+    "observed_at": "2026-08-24T09:11:22Z",
+    "remedy": "restore ~/.claude (git clone …, or git -C ~/.claude checkout "
+              "-- dcg.toml) and rebuild",
+}
+
+MARKER_GOOD = _marker("marker-good.json", MARKER_DOC)
+MARKER_FUTURE = _marker("marker-future.json", dict(MARKER_DOC, schema=99))
+MARKER_GARBLED = _marker("marker-garbled.json", "{not json at all")
+MARKER_ODD_STATE = _marker("marker-odd.json", dict(MARKER_DOC, state="who-knows"))
+
+rc, msg_mk, ctx_mk, out_mk, _ = health(STUB_FULL, marker=MARKER_GOOD)
+check("marker present but dcg is loading the full list: announced as a "
+      "STALE marker, not swallowed",
+      out_mk.strip() != "",
+      "silent — the declarative state says fallback and the running state "
+      "says full, and nobody is told they disagree")
+check("stale marker: quotes when the fallback was last observed",
+      "2026-08-24T09:11:22Z" in msg_mk, msg_mk[:600])
+check("stale marker: says to re-activate so the two agree",
+      "activat" in msg_mk.lower() or "rebuild" in msg_mk.lower(), msg_mk[:600])
+
+rc, msg_mb, _, out_mb, _ = health(STUB_FALLBACK, marker=MARKER_GOOD)
+check("marker + loader agree: still one announcement, and the marker is "
+      "named as a signal",
+      "fallback-active.json" in msg_mb or "marker" in msg_mb.lower(),
+      msg_mb[:700])
+
+rc, msg_mf, _, out_mf, _ = health(STUB_FULL, marker=MARKER_FUTURE)
+check("marker with an unrecognised schema: warned, per the contract's own "
+      "'never read as therefore fine'",
+      out_mf.strip() != "", "silent")
+check("... and it names the schema it did not recognise",
+      "99" in msg_mf, msg_mf[:600])
+
+rc, msg_mg, _, out_mg, _ = health(STUB_FULL, marker=MARKER_GARBLED)
+check("garbled marker: warned, never silently skipped",
+      out_mg.strip() != "", "silent")
+
+rc, msg_mo, _, out_mo, _ = health(STUB_FULL, marker=MARKER_ODD_STATE)
+check("marker with an unknown `state`: warned",
+      out_mo.strip() != "", "silent")
+
+rc, _, _, out_mn, _ = health(STUB_FULL, marker=os.path.join(SCRATCH, "health", "no-marker.json"))
+check("no marker + full config: still silent (absence is the healthy case, "
+      "and must not become noise)",
+      out_mn.strip() == "", out_mn[:300])
+
+# The marker can also stand alone. If dcg itself is unusable the loader says
+# nothing, and the marker is then the only thing that knows a fresh host was
+# seeded.
+rc, msg_ma, _, out_ma, _ = health(STUB_CONFIG_GARBAGE, marker=MARKER_GOOD)
+check("loader unreadable + marker present: the fallback is still reported",
+      "fallback" in msg_ma.lower(), msg_ma[:700])
+
+# ── The real binary, when this host has it ────────────────────────────────
+# Everything above is a stub speaking a transcribed protocol. This lane runs
+# the packaged dcg for real, so a change in its `config --format json` shape
+# turns the suite red instead of quietly invalidating the transcription.
+#
+# The full-config fixture is written HERE rather than pointed at the repo's
+# own dcg.toml: that file is edited by hand and by other agents, and a live
+# lane keyed to it would go red for reasons that have nothing to do with
+# this check. TOML literal strings (single quotes) so the backslashes in the
+# patterns survive verbatim.
+REAL_DCG = shutil.which("dcg") or (
+    "/nix/store/d4zpw04h59mjx17byracpn01m3r2vfww-dcg-0.12.5/bin/dcg"
+)
+NIXOS_FALLBACK_TOML = (
+    "/home/jonathan/Repos/nixos-config-worktrees/dcg-package/home/dcg-fallback.toml"
+)
+LIVE_FULL_TOML = _write_stub(
+    "health/live-full.toml",
+    "[general]\nverbose = false\nself_heal_hook = false\n\n[overrides]\nallow = []\nblock = [\n"
+    + "".join(
+        "    {{ pattern = '{0}', reason = '{1}' }},\n".format(
+            e["pattern"], e["reason"]
+        )
+        for e in FULL_BLOCK
+    )
+    + "]\n",
+    executable=False,
+)
+if os.access(REAL_DCG, os.X_OK):
+    rc, msg_r, _, out_r, _ = health(REAL_DCG, dcg_config=LIVE_FULL_TOML)
+    check("LIVE dcg + a full rule set: silent", out_r.strip() == "", out_r[:500])
+    if os.path.exists(NIXOS_FALLBACK_TOML):
+        rc, msg_r2, _, out_r2, _ = health(REAL_DCG, dcg_config=NIXOS_FALLBACK_TOML)
+        check("LIVE dcg + the real nixos-config seed: announced as the fallback",
+              "fallback" in msg_r2.lower(), (out_r2 or "silent")[:500])
+        check("LIVE dcg + the real seed: names the lost adb class",
+              "adb" in msg_r2.lower(), msg_r2[:900])
+    else:
+        check("nixos-config seed not on this host — live seed lane NOT "
+              "exercised (read as 'not checked', never as 'passed')",
+              True, NIXOS_FALLBACK_TOML)
+else:
+    check("no dcg on this host — live lane NOT exercised (read as 'not "
+          "checked', never as 'passed')", True, REAL_DCG)
+
+
+# ----------------------------------------------------------------------
 section("Summary")
 shutil.rmtree(SCRATCH, ignore_errors=True)
 if FAILURES:
