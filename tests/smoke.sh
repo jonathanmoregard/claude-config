@@ -2,6 +2,10 @@
 # Offline smoke test for session-reflect. Uses a stub `claude` on PATH; no
 # live API calls, no network.
 #
+# It also runs the bash-guard test modules (TEST 50), which it DISCOVERS rather
+# than lists, so this script is the single verifier for both. Those modules used
+# to be invoked by nothing at all — see the comment above TEST 50.
+#
 # LANES (test selection only — NOT a switch on product behaviour):
 #   fast  (default)  the regression test for every BLOCKER/HIGH fixed in this
 #                    review, plus every cheap unit-level test. Runnable inline.
@@ -531,6 +535,15 @@ for a in "\$@"; do [[ "\$a" == "ls" ]] && { printf '[]\n'; exit 0; }; done
 exit 0
 KITTEN
 chmod +x "$STUB_SCRATCH/kitten"
+
+# The PATH this script was INVOKED with, captured before the stubs go in front of
+# it. TEST 50 runs the bash-guard test modules with this one, because
+# tests/test_deny_globs.py reads the CLI's own wildcard matcher out of the
+# compiled bundle behind `claude` on PATH. Handed the stub above — a shell script
+# with no bundle inside it — that module dies for a reason that has nothing to do
+# with the guard under test. Nothing ELSE may use this: every test of the
+# session-reflect code wants the stubbed PATH, which is the whole point of it.
+SMOKE_HOST_PATH="$PATH"
 
 export PATH="$SPAWN_SHIM_DIR:$STUB_HELP_DIR:$STUB_SCRATCH:$PATH"
 
@@ -5917,6 +5930,98 @@ fi
 sc_forked "$T1_ARGV" \
   || fail "49: no fork for a candidate whose only unusual property is a long transcript (log: $T1_TAIL)"
 info "49: a 3000-record transcript still yields its cwd — no SIGPIPE-driven skip"
+
+# ============================================================================
+# TEST 50: the bash-guard test modules, run by the repo's own verifier
+# ============================================================================
+# THE DEFECT THIS FIXES (2026-08-24). The fail-closed bash guard is the entire
+# point of the safe-bash retirement, and it was the one thing this script did not
+# check. tests/test_bash_guard*.py and tests/test_deny_globs.py are standalone
+# `python3 tests/<module>.py` scripts, and NOTHING invoked them — not this file,
+# not anything else in the repo. Several agents reported "smoke tests passed" as
+# evidence that their guard work was sound; that evidence was hollow, because a
+# regression in the guard passed this gate untouched. A verifier that skips the
+# safety layer is worse than no verifier: it manufactures confidence.
+#
+# DISCOVERY, NOT A HARDCODED LIST. A list of module names goes stale the first
+# time somebody adds a module and forgets to edit this runner, and the failure
+# mode of a stale list is SILENCE — the new module simply never runs. The set is
+# therefore derived from the tree, in two steps:
+#   1. the guard hooks are whatever `hooks/bash-*guard*.py` matches on disk;
+#   2. a guard test module is any `tests/test_*.py` whose text names one of them.
+# A new test for an existing hook is picked up with no edit here, and so is a new
+# hook together with its test. The rule deliberately errs toward running too
+# much: over-inclusion (a module that only mentions a hook in a comment) costs
+# one extra `python3` invocation, while under-inclusion costs exactly the
+# coverage this block exists to provide.
+#
+# AN EMPTY RESULT IS A FAILURE, NOT A PASS. "found no guard tests" must never
+# print the same thing as "all guard tests passed" — that is the same fail-open
+# shape the migration exists to correct. Both discovery steps assert non-empty
+# BEFORE any module runs, and each says in its message that it is a discovery
+# failure, so it cannot be misread as a clean run.
+#
+# LANE: both. These are unit-level and offline (slowest measured at ~35s), so
+# they run in `fast` as well as `full`. The lane switch selects COST, and a
+# safety layer with no test is not a cost saving.
+# `find -L`, not plain `find`: this repo symlinks files into place routinely, and
+# a bare `-type f` treats a symlink to a module as type `l` and skips it — a
+# silent miss, which is the exact failure this block exists to prevent.
+GUARD_HOOKS=()
+while IFS= read -r -d '' guard_hook_path; do
+  GUARD_HOOKS+=( "$(basename "$guard_hook_path")" )
+done < <(find -L "$WORKTREE/hooks" -maxdepth 1 -type f -name 'bash-*guard*.py' -print0 2>/dev/null | sort -z)
+
+test_begin "TEST 50: bash-guard test modules are discovered"
+(( ${#GUARD_HOOKS[@]} > 0 )) \
+  || fail "50: DISCOVERY FAILED — nothing matches $WORKTREE/hooks/bash-*guard*.py, so no test module can be recognised as a guard test. Read this as 'the runner cannot see the guard', never as 'there is nothing to check'."
+info "50: guard hooks on disk: ${GUARD_HOOKS[*]}"
+
+# grep needs one -e per hook basename; -F because a filename is a literal, not a
+# pattern (the dot in `bash-guard.py` is not a wildcard here).
+GUARD_GREP_ARGS=()
+for guard_hook in "${GUARD_HOOKS[@]}"; do GUARD_GREP_ARGS+=( -e "$guard_hook" ); done
+
+GUARD_MODULES=()
+while IFS= read -r -d '' guard_mod; do
+  if grep -qF "${GUARD_GREP_ARGS[@]}" -- "$guard_mod"; then
+    GUARD_MODULES+=( "$guard_mod" )
+  fi
+done < <(find -L "$WORKTREE/tests" -maxdepth 1 -type f -name 'test_*.py' -print0 2>/dev/null | sort -z)
+
+(( ${#GUARD_MODULES[@]} > 0 )) \
+  || fail "50: DISCOVERY FAILED — no file under $WORKTREE/tests matching test_*.py names any of: ${GUARD_HOOKS[*]}. The guard's own test suite is either gone or renamed past this rule. Read this as 'the runner found no tests', never as 'the guard tests passed'."
+info "50: ${#GUARD_MODULES[@]} guard test module(s) discovered: $(printf '%s ' "${GUARD_MODULES[@]##*/}")"
+
+guard_idx=0
+for guard_mod in "${GUARD_MODULES[@]}"; do
+  guard_idx=$(( guard_idx + 1 ))
+  guard_rel="tests/${guard_mod##*/}"
+  test_begin "TEST 50.$guard_idx: $guard_rel"
+  guard_log="$SMOKE_TMP_PARENT/guard-${guard_mod##*/}.log"
+  # PATH: the host's, see SMOKE_HOST_PATH above.
+  # DENY_GLOBS_LIVE: cleared, not merely left unset. This suite is offline by
+  # contract (see the header), and that variable makes tests/test_deny_globs.py
+  # spend real API calls. An ambient export in the caller's shell must not be
+  # able to turn a smoke run into a billed one.
+  # `|| guard_rc=$?`, NOT a bare command followed by `guard_rc=$?`. `set -e` is in
+  # force from TEST 15 onward (see the note above TEST 15), so a bare failing
+  # module killed the script THERE — exit 1, no FAIL line, no TESTS: line, no
+  # named module, nothing. Measured 2026-08-24 with a deliberately-broken module:
+  # the suite reported a bare exit 1 and the reader had no way to learn which
+  # guard went red. Putting the command in an `||` list suspends errexit for it,
+  # so the failure reaches the report instead of terminating the run in silence.
+  guard_rc=0
+  env -u DENY_GLOBS_LIVE PATH="$SMOKE_HOST_PATH" python3 "$guard_mod" \
+    >"$guard_log" 2>&1 || guard_rc=$?
+  if (( guard_rc != 0 )); then
+    fail "50.$guard_idx: $guard_rel FAILED (exit=$guard_rc). This is the bash guard's own test suite — a red module here means the fail-closed guard is not doing what it claims, and no other result in this run should be read as evidence about it.
+full log: $guard_log
+last 40 lines:
+$(tail -40 "$guard_log" 2>/dev/null)"
+  fi
+  info "50.$guard_idx: $guard_rel green — $(grep -c '\[OK' "$guard_log" 2>/dev/null || echo 0) check(s) reported OK"
+done
 
 # ============================================================================
 # FINAL GUARD: prove the whole suite left the live repo alone.
