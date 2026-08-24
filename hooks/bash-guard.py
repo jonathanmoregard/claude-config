@@ -28,6 +28,10 @@ deny layer sat inert for months without a single symptom. Every way this
 guard can fail to reach a verdict now DENIES:
 
   * dcg binary absent, or present but not executable
+  * dcg present and answering, but its user config did not load — absent
+    or unparseable. dcg falls back to built-in packs, still denies
+    `rm -rf /`, and permits every rule the operator wrote in
+    `[overrides] block`. Present and answering is not guarding.
   * dcg exceeded the guard's own timeout
   * dcg emitted output that could not be parsed
   * dcg exited non-zero without rendering a decision
@@ -219,18 +223,155 @@ def _resolve_dcg() -> str:
     return LEGACY_DCG_PATH
 
 
+# Outcome lines from `dcg config`. Measured shape (dcg 0.12.5):
+#
+#   Config file outcomes (lowest → highest priority):
+#     - system: /etc/dcg/config.toml [missing; full]
+#     - user: /home/jonathan/.config/dcg/config.toml [loaded; full]
+#     - automatic project: /repo/.dcg.toml [missing; enforcement-only]
+#
+# and, when the file will not parse:
+#
+#     - user: /home/…/config.toml [invalid; full] — Invalid TOML: TOML parse
+#       error at line 71, column 3
+_DCG_CONFIG_OUTCOME = re.compile(
+    r"^\s*-\s*(system|user|automatic project)\s*:\s*(.*?)\s*"
+    r"\[\s*([^\];]+?)\s*;[^\]]*\]\s*(.*)$"
+)
+
+# Verified at most once per hook process. There is no cross-invocation
+# cache: a stale "config was fine last time" is the same class of stale
+# belief this whole file exists to stop.
+_DCG_CONFIG_VERIFIED = False
+
+
+def _check_dcg_config(path: str) -> None:
+    """Verify dcg's user config actually LOADED. Never returns on a fault.
+
+    dcg being present and answering does NOT mean dcg is guarding.
+    Measured against dcg 0.12.5, three states:
+
+      * config valid      — `curl -X DELETE …` DENIED, user outcome
+                            `[loaded; full]`.
+      * config ABSENT     — `curl -X DELETE …` PERMITTED. Empty stdout,
+                            exit 0, and zero stderr. `rm -rf /` is still
+                            denied by the built-in `core.filesystem` pack,
+                            so the guard looks completely alive.
+      * config MALFORMED  — same fallback. dcg does warn, but on STDERR,
+                            which Claude Code discards, so it reaches
+                            nobody.
+
+    `curl -X DELETE` is matched by NO built-in pack — only by the
+    `[overrides] block` list in the operator's config. So in two of those
+    three states the entire user override layer is silently gone while
+    every query still gets a confident answer. That is the four-month dcg
+    outage rebuilt one storey up, and it is why "dcg ran and returned no
+    deny" is not sufficient to allow.
+
+    `dcg config` exits 0 in all three states, so — exactly as on the hook
+    path — stdout is the only signal.
+    """
+    global _DCG_CONFIG_VERIFIED
+    if _DCG_CONFIG_VERIFIED:
+        return
+
+    # Own clamp rather than a second watchdog: the whole-hook deadline is
+    # the only clock, and this call draws from what is left of it. Measured
+    # at ~14ms against the real binary, so the cap is for faults only.
+    budget = min(float(DCG_TIMEOUT_S), _remaining_budget())
+    if budget <= 0:
+        _fail_closed(
+            "the guard ran out of its whole-hook budget before dcg could report "
+            "whether its config had loaded"
+        )
+    try:
+        proc = subprocess.run(
+            [path, "config"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=budget,
+        )
+    except subprocess.TimeoutExpired:
+        _fail_closed(
+            f"`dcg config` did not answer within {budget:.1f}s, so the guard could "
+            "not confirm dcg is running with the operator's block rules"
+        )
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        _fail_closed(
+            f"`dcg config` could not be invoked: {type(exc).__name__}: {exc}"
+        )
+
+    outcomes = []
+    for line in (proc.stdout or "").splitlines():
+        m = _DCG_CONFIG_OUTCOME.match(line)
+        if m:
+            outcomes.append(
+                (m.group(1), m.group(2).strip(), m.group(3).strip().lower(), m.group(4).strip())
+            )
+
+    if not outcomes:
+        _fail_closed(
+            "`dcg config` did not report any config-file outcomes, so the guard "
+            "cannot tell whether dcg is running with the operator's block rules "
+            "or with built-in packs alone. Either the binary at "
+            f"{path!r} is not dcg, or its `config` output format changed"
+            + (f" (stdout: {(proc.stdout or '').strip()[:160]!r})" if proc.stdout else
+               " (it printed nothing on stdout)")
+        )
+
+    # A file that will not parse is a typo the operator must fix, and it is
+    # reported separately from an absent one so they know which.
+    for scope, cfg_path, state, detail in outcomes:
+        if state == "invalid":
+            _fail_closed(
+                f"dcg's {scope} config at {cfg_path!r} FAILED TO PARSE, so dcg fell "
+                "back to its built-in packs and every rule in the operator's "
+                "[overrides] block list is inert. dcg does warn about this, but "
+                "only on stderr, which Claude Code discards. "
+                f"Fix the file: {detail[:200] or 'see `dcg config`'}"
+            )
+
+    user = [o for o in outcomes if o[0] == "user"]
+    if not user:
+        _fail_closed(
+            "`dcg config` reported config outcomes but none of them for the USER "
+            "config, so the guard cannot confirm the operator's block rules loaded"
+        )
+    _scope, cfg_path, state, _detail = user[0]
+    if state != "loaded":
+        _fail_closed(
+            f"dcg's user config at {cfg_path!r} is {state.upper()}, so dcg is running "
+            "on built-in packs alone. It still answers every query and still denies "
+            "`rm -rf /`, which is why this cannot be noticed from the outside — but "
+            "every rule in the operator's [overrides] block list is gone, including "
+            "the destructive-HTTP ones (`curl -X DELETE …` is matched by no built-in "
+            "pack). The file is generated from the repo-tracked ~/.claude/dcg.toml"
+        )
+
+    _DCG_CONFIG_VERIFIED = True
+
+
 def _check_dcg(command: str) -> str | None:
     """Ask dcg whether to block. Returns a deny reason, or None to allow.
 
     Never returns None for a failure: every failure mode routes through
     ``_fail_closed`` and exits. This is the exact inversion of safe-bash's
     ``_check_denied_by_dcg``, which returned None (allow) for all of them.
+
+    NOTE the invocation form. Bare ``dcg`` is deliberate and must not be
+    changed to ``dcg hook`` in pursuit of a non-zero exit on deny: measured,
+    ``dcg hook`` answers the same stdin with batch JSONL
+    (``{"index":0,"decision":"deny",…}``) instead of a PreToolUse
+    ``permissionDecision`` document, and prints on allows too. Its own
+    ``--help`` claims the two are identical; they are not.
     """
     path = _resolve_dcg()
     if not os.path.exists(path):
         _fail_closed(f"dcg binary not found at {path!r}")
     if not os.access(path, os.X_OK):
         _fail_closed(f"dcg at {path!r} exists but is not executable")
+
 
     payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
     try:
@@ -313,6 +454,15 @@ def _check_dcg(command: str) -> str | None:
                if saw_allow else "")
             + (f" (stderr: {(proc.stderr or '').strip()[:160]!r})" if proc.stderr else "")
         )
+
+    # dcg declined to block. That answer is only worth acting on if dcg was
+    # loaded with the rules that make it worth anything — see
+    # `_check_dcg_config`. Deliberately checked HERE and not earlier: a dcg
+    # DENY is trustworthy whatever its config state, because the built-in
+    # packs are a strict subset of the loaded rule set and a deny from a
+    # subset is still a valid deny. It is only the ABSENCE of a deny that
+    # depends on the full set having been loaded.
+    _check_dcg_config(path)
     return None
 
 

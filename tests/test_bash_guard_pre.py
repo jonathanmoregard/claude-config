@@ -19,11 +19,13 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
@@ -65,6 +67,58 @@ def _write_stub(rel: str, body: str, executable: bool = True) -> str:
     return path
 
 
+# Every dcg stub must answer `dcg config`, because the guard asks before it
+# trusts a verdict. Measured shape of the real thing (dcg 0.12.5) — dcg is
+# present and answering in ALL of these states, which is the point: only
+# `[loaded; full]` means the operator's block rules are actually in force.
+CONFIG_BLOCK = {
+    "loaded": (
+        "Config file outcomes (lowest → highest priority):\n"
+        "  - system: /etc/dcg/config.toml [missing; full]\n"
+        "  - user: /home/test/.config/dcg/config.toml [loaded; full]\n"
+        "  - automatic project: /repo/.dcg.toml [missing; enforcement-only]\n"
+    ),
+    "missing": (
+        "Config file outcomes (lowest → highest priority):\n"
+        "  - system: /etc/dcg/config.toml [missing; full]\n"
+        "  - user: /home/test/.config/dcg/config.toml [missing; full]\n"
+        "  - automatic project: /repo/.dcg.toml [missing; enforcement-only]\n"
+    ),
+    "invalid": (
+        "Config file outcomes (lowest → highest priority):\n"
+        "  - system: /etc/dcg/config.toml [missing; full]\n"
+        "  - user: /home/test/.config/dcg/config.toml [invalid; full] — "
+        "Invalid TOML: TOML parse error at line 71, column 3\n"
+        "  - automatic project: /repo/.dcg.toml [missing; enforcement-only]\n"
+    ),
+    # A binary that answers `config` with nothing recognisable — the guard
+    # cannot tell loaded from unloaded, so it must not guess.
+    "unrecognised": "some other program's idea of help text\n",
+    "silent": "",
+}
+
+
+def _config_preamble(state: str = "loaded", hang: bool = False) -> str:
+    if hang:
+        return 'if [ "$1" = "config" ]; then sleep 30; fi\n'
+    # `printf` is a bash builtin. Two cases below hand the hook a PATH
+    # containing only the stub itself, where `cat` would not be found and
+    # the stub would answer `config` with silence for a reason the test is
+    # not about.
+    return (
+        'if [ "$1" = "config" ]; then\n'
+        f"  printf '%s' {shlex.quote(CONFIG_BLOCK[state])}\n"
+        "  exit 0\n"
+        "fi\n"
+    )
+
+
+def _dcg_stub(rel: str, body: str, config: str = "loaded", hang_config: bool = False,
+              executable: bool = True) -> str:
+    """A dcg stub that answers `config` first, then the hook payload."""
+    return _write_stub(rel, _config_preamble(config, hang_config) + body, executable)
+
+
 def _deny_line(rule: str = "fs-rm-rf-root", why: str = "rm -rf on root") -> str:
     return json.dumps(
         {
@@ -89,14 +143,14 @@ def _allow_line() -> str:
     )
 
 
-STUB_ALLOW = _write_stub("stubs/dcg-allow", "cat >/dev/null\nexit 0\n")
+STUB_ALLOW = _dcg_stub("stubs/dcg-allow", "cat >/dev/null\nexit 0\n")
 
 # dcg's hook mode exits 0 whether it denies or allows — measured against the
 # packaged binary. `EXIT_DENIED = 1` in upstream's src/exit_codes.rs governs
 # the CLI subcommands, not the stdin hook path. A guard that reads the exit
 # status instead of the stdout payload therefore sees EVERY deny as an
 # allow, which is precisely the fail-open shape this mission exists to end.
-STUB_DENY_EXIT0 = _write_stub(
+STUB_DENY_EXIT0 = _dcg_stub(
     "stubs/dcg-deny-exit0",
     "cat >/dev/null\n"
     f"echo '{_deny_line(rule='core.filesystem:rm-rf-root-home', why='rm -rf on root')}'\n"
@@ -105,18 +159,18 @@ STUB_DENY_EXIT0 = _write_stub(
 # The converse: exit 0 and no payload at all is dcg's documented allow. It
 # must not be readable as a deny either — the verdict is the stdout JSON,
 # in both directions.
-STUB_SILENT_EXIT0 = _write_stub("stubs/dcg-silent-exit0", "cat >/dev/null\nexit 0\n")
+STUB_SILENT_EXIT0 = _dcg_stub("stubs/dcg-silent-exit0", "cat >/dev/null\nexit 0\n")
 # An explicit allow alongside a fault exit. The allow is a decision about
 # dcg's rules; the non-zero exit says dcg fell over on the way out. The
 # guard must not let the former excuse the latter.
-STUB_ALLOW_EXIT_NONZERO = _write_stub(
+STUB_ALLOW_EXIT_NONZERO = _dcg_stub(
     "stubs/dcg-allow-exit-nonzero",
     "cat >/dev/null\n" f"echo '{_allow_line()}'\n" "echo 'late failure' >&2\nexit 7\n",
 )
 
 # Explicit `permissionDecision: "allow"`. Parity row B14: the silent-exit
 # allow is exercised everywhere, the rendered-allow branch by nothing.
-STUB_EXPLICIT_ALLOW = _write_stub(
+STUB_EXPLICIT_ALLOW = _dcg_stub(
     "stubs/dcg-explicit-allow",
     "cat >/dev/null\n" f"echo '{_allow_line()}'\n" "exit 0\n",
 )
@@ -125,14 +179,14 @@ STUB_EXPLICIT_ALLOW = _write_stub(
 # the port scans FORWARD (first wins). These two stubs are the pin: a
 # forward-only scan fails the first, a reverse-only scan fails the second,
 # so neither wrong direction can pass the pair.
-STUB_ALLOW_THEN_DENY = _write_stub(
+STUB_ALLOW_THEN_DENY = _dcg_stub(
     "stubs/dcg-allow-then-deny",
     "cat >/dev/null\n"
     f"echo '{_allow_line()}'\n"
     f"echo '{_deny_line(rule='late-deny', why='second line denies')}'\n"
     "exit 0\n",
 )
-STUB_DENY_THEN_ALLOW = _write_stub(
+STUB_DENY_THEN_ALLOW = _dcg_stub(
     "stubs/dcg-deny-then-allow",
     "cat >/dev/null\n"
     f"echo '{_deny_line(rule='early-deny', why='first line denies')}'\n"
@@ -431,6 +485,147 @@ check("... reported as a broken guard", BROKEN_MARKER in why, why[:220])
 
 
 # ======================================================================
+# Present and answering is NOT guarding.
+#
+# Measured against the packaged binary, three states — dcg answers every
+# query in all three, and denies `rm -rf /` in all three, because that rule
+# lives in the built-in `core.filesystem` pack:
+#
+#   config valid     -> `curl -X DELETE …` DENIED, user outcome [loaded]
+#   config ABSENT    -> `curl -X DELETE …` PERMITTED. Empty stdout, exit 0,
+#                       ZERO stderr. Nothing to notice.
+#   config MALFORMED -> same fallback; dcg warns, but on stderr, which
+#                       Claude Code discards.
+#
+# `curl -X DELETE` is matched by NO built-in pack — only by the operator's
+# `[overrides] block` list. So in two of three states the whole user
+# override layer is silently gone behind a guard that looks alive. That is
+# the four-month dcg outage rebuilt one storey up, and it is why "dcg ran
+# and returned no deny" is not sufficient to allow.
+# ======================================================================
+section("bash-guard: dcg present and answering is not dcg guarding")
+
+STUB_CONFIG_MISSING = _dcg_stub(
+    "stubs/dcg-config-missing", "cat >/dev/null\nexit 0\n", config="missing"
+)
+STUB_CONFIG_INVALID = _dcg_stub(
+    "stubs/dcg-config-invalid", "cat >/dev/null\nexit 0\n", config="invalid"
+)
+STUB_CONFIG_UNRECOGNISED = _dcg_stub(
+    "stubs/dcg-config-unrecognised", "cat >/dev/null\nexit 0\n", config="unrecognised"
+)
+STUB_CONFIG_SILENT = _dcg_stub(
+    "stubs/dcg-config-silent", "cat >/dev/null\nexit 0\n", config="silent"
+)
+STUB_CONFIG_HANG = _dcg_stub(
+    "stubs/dcg-config-hang", "cat >/dev/null\nexit 0\n", hang_config=True
+)
+
+dec, why = guard("ls -la", dcg=STUB_CONFIG_MISSING)
+check("dcg config ABSENT -> deny", dec == "deny", f"decision={dec!r} {why[:200]}")
+check("... reported as a broken guard", BROKEN_MARKER in why, why[:200])
+check(
+    "... names the state as MISSING, so the operator restores a file",
+    "MISSING" in why,
+    why[:300],
+)
+check(
+    "... explains that dcg still answers and still denies rm -rf",
+    "rm -rf /" in why and "built-in" in why,
+    why[:400],
+)
+check(
+    "... names the override layer that is actually gone",
+    "curl -X DELETE" in why or "overrides" in why,
+    why[:400],
+)
+
+dec, why = guard("ls -la", dcg=STUB_CONFIG_INVALID)
+check("dcg config MALFORMED -> deny", dec == "deny", f"decision={dec!r} {why[:200]}")
+check("... reported as a broken guard", BROKEN_MARKER in why, why[:200])
+check(
+    # The two faults have different fixes — restore a file vs fix a typo —
+    # so the reason has to say which one happened.
+    "... says it FAILED TO PARSE rather than that it is missing",
+    "FAILED TO PARSE" in why and "MISSING" not in why,
+    why[:300],
+)
+check(
+    "... relays dcg's own parse error, which only ever went to stderr",
+    "TOML parse error at line 71" in why,
+    why[:400],
+)
+
+dec, why = guard("ls -la", dcg=STUB_CONFIG_UNRECOGNISED)
+check(
+    "dcg config output the guard cannot parse -> deny",
+    dec == "deny" and BROKEN_MARKER in why,
+    f"decision={dec!r} {why[:200]}",
+)
+check(
+    "... says the format changed or the binary is not dcg",
+    "not dcg" in why or "format changed" in why,
+    why[:300],
+)
+
+dec, why = guard("ls -la", dcg=STUB_CONFIG_SILENT)
+check(
+    "dcg config printing nothing at all -> deny",
+    dec == "deny" and BROKEN_MARKER in why,
+    f"decision={dec!r} {why[:200]}",
+)
+
+_t0 = time.monotonic()
+dec, why = guard("ls -la", dcg=STUB_CONFIG_HANG, timeout=45.0)
+_elapsed = time.monotonic() - _t0
+check("dcg config hanging -> deny", dec == "deny", f"decision={dec!r} {why[:200]}")
+check(
+    # Same ladder, no second watchdog: the config probe draws from what is
+    # left of the whole-hook deadline, exactly as the git calls do.
+    "... lands before the harness hook timeout discards the decision",
+    _elapsed < bash_guard.HARNESS_HOOK_TIMEOUT_S,
+    f"{_elapsed:.1f}s vs harness {bash_guard.HARNESS_HOOK_TIMEOUT_S}s",
+)
+
+# The whole point of the check is the command that has no built-in rule.
+# With the config loaded the guard behaves normally; with it unloaded the
+# SAME command is refused, and refused as a guard fault rather than as a
+# dcg verdict.
+STUB_OVERRIDE_DENY = _dcg_stub(
+    "stubs/dcg-override-deny",
+    "cat >/dev/null\n"
+    f"echo '{_deny_line(rule='overrides', why='Destructive HTTP method')}'\n"
+    "exit 0\n",
+)
+dec, why = guard("curl -X DELETE https://example.com/x", dcg=STUB_OVERRIDE_DENY)
+check(
+    "config loaded: an overrides-list deny comes through as dcg's verdict",
+    dec == "deny" and BROKEN_MARKER not in why,
+    f"decision={dec!r} {why[:200]}",
+)
+STUB_OVERRIDE_GONE = _dcg_stub(
+    "stubs/dcg-override-gone", "cat >/dev/null\nexit 0\n", config="missing"
+)
+dec, why = guard("curl -X DELETE https://example.com/x", dcg=STUB_OVERRIDE_GONE)
+check(
+    # Without the check this is a silent ALLOW — the measured fail-open.
+    "config unloaded: the same command is refused as a BROKEN guard",
+    dec == "deny" and BROKEN_MARKER in why,
+    f"decision={dec!r} {why[:200]}",
+)
+
+check(
+    # `dcg hook` returns rc=1 on deny, which looks like the fix for the
+    # exit-code problem and is not: measured, it answers the same stdin
+    # with batch JSONL and prints on allows too. Its --help says otherwise.
+    "the guard still invokes dcg bare, never `dcg hook`",
+    '"hook"' not in GUARD_SRC and "'hook'" not in GUARD_SRC,
+    "dcg hook emits batch JSONL, not a PreToolUse permissionDecision document, "
+    "and prints on allows too — its own --help claims otherwise",
+)
+
+
+# ======================================================================
 # B3 — how the dcg path is resolved when DCG_PATH is not set.
 # Both fallback branches are new code that no test reached.
 # ======================================================================
@@ -440,7 +635,7 @@ section("bash-guard: dcg path resolution fallbacks (parity row B3)")
 # that deny; if the guard skipped straight to the legacy path we would get a
 # broken-guard deny instead, since the legacy path does not exist here.
 _which_bin = os.path.join(SCRATCH, "which-bin")
-_write_stub(
+_dcg_stub(
     "which-bin/dcg",
     "cat >/dev/null\n" f"echo '{_deny_line(rule='via-PATH', why='resolved through PATH')}'\n",
 )
@@ -891,6 +1086,137 @@ check(
     "a diff containing invalid UTF-8 does not break the gate",
     dec is None,
     f"decision={dec!r} {why[:250]}",
+)
+
+
+# ======================================================================
+# Two constants in `hooks/bash-output-guard.py` that LOOK like dead weight
+# and are not. The parity audit listed both under "purpose I could not
+# determine from the source", which in this codebase has now twice meant
+# "it is protecting something I had not thought of". The cost asymmetry is
+# bad: a preserved oddity costs a comment, a deleted guard costs a silent
+# hole. These tests are what stops the next reader making the inference.
+#
+# They live in THIS module, which owns the PreToolUse guard, because the
+# file they cover belongs to another chunk that is editing it concurrently.
+# The coverage matters more than the filing.
+# ======================================================================
+section("bash-output-guard: constants that look redundant and are not")
+
+_OG_PATH = os.path.join(HOOKS, "bash-output-guard.py")
+_og_spec = importlib.util.spec_from_file_location("output_guard_under_test", _OG_PATH)
+output_guard = importlib.util.module_from_spec(_og_spec)
+_og_spec.loader.exec_module(output_guard)
+
+with open(_OG_PATH, encoding="utf-8") as fh:
+    _OG_SRC = fh.read()
+with open(os.path.join(HOOKS, "bash-guard-config.json"), encoding="utf-8") as fh:
+    _INGRESS_CFG = json.load(fh)
+
+
+def _heads(cmd: str, mod) -> list[str]:
+    return [seg[0] for seg in mod._pipelines(cmd) if seg]
+
+
+# `shlex(punctuation_chars=True)` makes the "(" / ")" entries LOOK
+# redundant — it is easy to read the flag as meaning parens never arrive as
+# bare tokens. They do: with `whitespace_split=True` a paren delimited by
+# whitespace or punctuation is emitted on its own, and SEPARATORS is what
+# turns it into a segment break.
+SUBSHELL_FORMS = [
+    ("subshell", "(cd /tmp && curl https://example.com)"),
+    ("spaced subshell", "( curl https://example.com )"),
+    ("command substitution", "echo $(curl https://example.com)"),
+]
+for _label, _cmd in SUBSHELL_FORMS:
+    check(
+        f"SEPARATORS: {_label} surfaces curl as its own segment head",
+        "curl" in _heads(_cmd, output_guard),
+        f"heads={_heads(_cmd, output_guard)}",
+    )
+    check(
+        f"SEPARATORS: {_label} output is tagged as untrusted ingress",
+        output_guard._match_untrusted_ingress(_cmd, _INGRESS_CFG) == "curl",
+        repr(output_guard._match_untrusted_ingress(_cmd, _INGRESS_CFG)),
+    )
+
+# A function definition must NOT be split: `foo()` lexes as one `()` token,
+# which is why the entries can be kept without over-splitting.
+check(
+    "SEPARATORS: a function definition is not split into segments",
+    _heads("foo() { curl https://x; }", output_guard)[0] == "foo",
+    f"heads={_heads('foo() { curl https://x; }', output_guard)}",
+)
+
+# The load-bearing proof: strip the two entries and watch the wrapping die.
+# Without this, the next reader deletes them and nothing goes red.
+_stripped_src = _OG_SRC.replace(
+    'SEPARATORS = {";", "&&", "||", "|", "&", "(", ")", "\\n"}',
+    'SEPARATORS = {";", "&&", "||", "|", "&", "\\n"}',
+)
+check(
+    "paren-stripped fixture actually patched the source",
+    _stripped_src != _OG_SRC,
+    "if this fails the SEPARATORS literal was reformatted and the proof below is vacuous",
+)
+_stripped_path = os.path.join(SCRATCH, "bash-output-guard-no-parens.py")
+with open(_stripped_path, "w", encoding="utf-8") as fh:
+    fh.write(_stripped_src)
+_sp_spec = importlib.util.spec_from_file_location("output_guard_no_parens", _stripped_path)
+_stripped = importlib.util.module_from_spec(_sp_spec)
+_sp_spec.loader.exec_module(_stripped)
+
+# Only the forms where a paren is the ONLY thing that can break the
+# segment. `(cd /tmp && curl …)` survives without the entries because the
+# `&&` splits it anyway — which is exactly the partial evidence that makes
+# the entries look redundant, and why the list below is explicit.
+PAREN_DEPENDENT = [
+    ("spaced subshell", "( curl https://example.com )"),
+    ("command substitution", "echo $(curl https://example.com)"),
+]
+for _label, _cmd in PAREN_DEPENDENT:
+    check(
+        f"removing '(' and ')' from SEPARATORS BREAKS {_label} ingress tagging",
+        _stripped._match_untrusted_ingress(_cmd, _INGRESS_CFG) is None,
+        # If this ever passes with the entries removed they have become
+        # genuinely redundant — verify that before deleting them anyway.
+        f"stripped={_stripped._match_untrusted_ingress(_cmd, _INGRESS_CFG)!r}",
+    )
+check(
+    "the &&-bearing subshell survives without them (why they look redundant)",
+    _stripped._match_untrusted_ingress(
+        "(cd /tmp && curl https://example.com)", _INGRESS_CFG
+    ) == "curl",
+    "recorded so the next reader sees the partial evidence AND its limits",
+)
+
+# `max_tokens=4` is longest-configured-prefix + 1, not a magic number. The
+# cap drops TOKENS rather than the segment, so a prefix longer than the cap
+# stops matching silently — the failure mode has no symptom. Recomputed
+# from the config here so adding a 4-token prefix turns this red instead.
+_cap = output_guard._pipelines.__defaults__[0]
+_prefix_lens = [
+    len(e["prefix"]) for e in (_INGRESS_CFG.get("untrusted_ingress_multi") or [])
+    if isinstance(e, dict) and isinstance(e.get("prefix"), list)
+]
+_longest = max(_prefix_lens) if _prefix_lens else 0
+check(
+    "_pipelines token cap covers the longest configured ingress prefix",
+    _cap >= _longest,
+    f"cap={_cap}, longest prefix={_longest} tokens "
+    f"({len(_prefix_lens)} multi-token entries)",
+)
+check(
+    "... with headroom, so the cap is not sitting exactly on the boundary",
+    _cap > _longest,
+    f"cap={_cap} vs longest={_longest}; the invariant is cap >= longest, "
+    "and the spare token is what absorbs one wrapper word",
+)
+check(
+    "... and the longest prefix is still 3 tokens, as the cap was derived for",
+    _longest == 3,
+    f"longest={_longest}; if this changed, re-derive the cap rather than "
+    "assuming 4 still clears it",
 )
 
 
