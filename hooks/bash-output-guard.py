@@ -17,7 +17,10 @@ Two layers:
      api, git clone and package installs is wrapped in
      ``<untrusted_external_content>`` so it reads as data, not instructions.
      Selective by design: tagging everything desensitises the model to the
-     tag.
+     tag. The question asked of each pipeline segment is "does this INVOKE
+     an ingress command", not "is its first token one" — see
+     ``_segment_ingress`` for why those differ and what it costs when they
+     are confused.
 
 Shape is preserved. The Bash tool result is an object, so the rewrite
 hands back an object with the same keys, and a string-shaped result stays
@@ -112,6 +115,39 @@ CONFIG_PATH = os.environ.get(
 
 SEPARATORS = {";", "&&", "||", "|", "&", "(", ")", "\n"}
 HEREDOC_RE = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?")
+
+# Cap on the tokens kept per pipeline segment.
+#
+# READ THIS BEFORE CHANGING IT. The cap used to be 4 — longest configured
+# prefix + 1 — and it was the matcher's WINDOW: tokens past it were dropped
+# before anything looked at them. `sudo -E env FOO=1 curl <url>` therefore
+# lost its `curl`, and the fetch reached the model with no
+# <untrusted_external_content> marker at all.
+#
+# The window is gone. The matcher now walks the whole segment looking for
+# the command word (`_segment_ingress`), so this number no longer decides
+# what matches; it is a bound on a pathological command string, set far
+# above any real one.
+#
+# TWO INVARIANTS, both checkable by a future reader:
+#   1. every configured ingress prefix is SHORTER than this cap — a longer
+#      one could never be compared in full and would sit in the config
+#      looking alive. `_require_prefixes_fit` withholds if that stops
+#      holding, so the hole announces itself instead of being silent.
+#   2. truncation is never silent: a segment this cap actually cut, whose
+#      command word was still unresolved at the cut, is treated as
+#      UNANALYSABLE and wrapped rather than passed through untagged.
+MAX_SEGMENT_TOKENS = 512
+
+# Label used when the guard cannot rule ingress out. For an output guard,
+# failing closed means WRAPPING when unsure rather than passing through: a
+# wrongly-wrapped local output costs the reader a pair of tags, an
+# unwrapped fetch costs the model's trust boundary.
+UNANALYSED_LABEL = "unanalysed-command"
+
+# How deep a `sh -c "..."` chain is followed before the guard gives up and
+# wraps instead.
+MAX_NESTED_SHELL_DEPTH = 3
 
 # --- The result object. See the module docstring for how this was derived.
 # OUTPUT_FIELDS carry the command's own bytes and are what gets tagged when
@@ -400,52 +436,291 @@ def _split_unquoted_newlines(cmd: str) -> list[str]:
     return [p for p in parts if p.strip()]
 
 
-def _pipelines(cmd: str, max_tokens: int = 4) -> list[list[str]]:
-    out: list[list[str]] = []
+def _segments(
+    cmd: str, max_tokens: int = MAX_SEGMENT_TOKENS
+) -> list[tuple[list[str], bool]]:
+    """Split into pipeline segments: ``(tokens, was_truncated)`` per segment.
+
+    ``was_truncated`` exists because the cap must not be able to hide a
+    command silently — see MAX_SEGMENT_TOKENS. A truncated segment whose
+    command word was never resolved is wrapped rather than passed through.
+    """
+    out: list[tuple[list[str], bool]] = []
     for line in _split_unquoted_newlines(cmd):
         try:
             lex = shlex.shlex(line, posix=True, punctuation_chars=True)
             lex.whitespace_split = True
+            # DEFECT FIX. shlex's default `commenters` ends the line at the
+            # first `#` ANYWHERE, including inside a word, where bash treats
+            # `.#foo` as an ordinary word. Measured:
+            # `nix build .#checks.x86_64-linux.dellan-vm && curl <url>`
+            # lexed to ['nix', 'build', '.'] — the entire `curl` segment
+            # vanished before the matcher saw it, and this repo runs that
+            # exact shape constantly. Comments are handled by the matcher
+            # instead, which stops at a word-INITIAL `#` the way bash does.
+            lex.commenters = ""
         except Exception:
             continue
         current: list[str] = []
+        truncated = False
         try:
             for tok in lex:
                 if tok in SEPARATORS:
                     if current:
-                        out.append(current)
+                        out.append((current, truncated))
                         current = []
+                    truncated = False
                     continue
                 if len(current) < max_tokens:
                     current.append(tok)
+                else:
+                    truncated = True
         except ValueError:
             # An unbalanced quote. Judge what did tokenise: the head is
             # already in hand, and dropping the segment would silently
             # untag the fetch.
             pass
         if current:
-            out.append(current)
+            out.append((current, truncated))
     return out
 
 
-def _match_untrusted_ingress(command: str, config: dict) -> str | None:
-    single = config.get("untrusted_ingress_single") or {}
-    multi = config.get("untrusted_ingress_multi") or []
-    cleaned = _strip_heredocs(command)
-    for tokens in _pipelines(cleaned):
-        if not tokens:
+def _pipelines(cmd: str, max_tokens: int = MAX_SEGMENT_TOKENS) -> list[list[str]]:
+    """The plain token-list view of ``_segments``.
+
+    NOTE the default: it is a resource bound, NOT the matcher's window.
+    Read MAX_SEGMENT_TOKENS before touching it.
+    """
+    return [tokens for tokens, _ in _segments(cmd, max_tokens)]
+
+
+# ---- Command-position analysis ---------------------------------------
+#
+# A wrapper in front of the fetch is all it took to walk past the old
+# head-only rule. Measured against it, none of these was tagged:
+#
+#     sudo -E env FOO=1 curl <url>
+#     nice -n 10 timeout 5 curl <url>
+#     stdbuf -oL curl <url>       xargs -I {} curl -s {}
+#     nohup curl <url> &          sh -c "curl <url>"
+#
+# Every one fetches external content, and untagged external content is
+# content the model may read as instructions — the exact hazard the tag
+# exists to prevent. This is the output-side twin of the `find … -delete`
+# evasions (`/usr/bin/find`, `sh -c "…"`, `$(…)`) closed on the input side:
+# same shape, same cause.
+#
+# Wrappers compose arbitrarily and cannot be enumerated — sudo, env, nice,
+# timeout, stdbuf, nohup, xargs, setsid, ionice, chronic, unbuffer, watch,
+# ssh, docker, the next one nobody has thought of. So this guard carries NO
+# wrapper list. It enumerates the OTHER side: TERMINAL_COMMANDS, the
+# everyday commands whose arguments are data, and treats every word it does
+# not recognise as possibly-a-wrapper, walking through it to look for the
+# command being wrapped.
+#
+# That puts the cost of an incomplete list on the right side. A command
+# missing from TERMINAL_COMMANDS can wrongly tag a local command's output —
+# a pair of tags the reader ignores. A missing wrapper name, under the
+# opposite design, is an untagged fetch.
+_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+# A token that could name a program. Anything carrying whitespace or shell
+# punctuation is a construct this guard does not model — `(`, `{`, `foo()`,
+# a quoted blob — and is NOT walked through: treating it as transparent
+# would make `( curl … )` match through a missing SEPARATORS entry, which
+# tests/test_bash_guard_pre.py pins as the tell that those entries are
+# load-bearing.
+_NOT_A_COMMAND_WORD_RE = re.compile(r"[\s(){}\[\]<>|&;$`\"'\\*?]")
+
+# `>`, `2>`, `>>`, `&>`, `<`, `>&2` — decoration, not a command word, and
+# it can legally precede the command (`> /tmp/out curl <url>`).
+_REDIRECTION_RE = re.compile(r"^\d*(?:>>?|<<?|&>|>&)&?\d*$")
+
+# `$SUDO curl <url>`, `${WRAPPER} curl <url>`. The value is invisible to
+# this guard, so it cannot be ruled out as a wrapper — and an idiom whose
+# whole point is expanding to `sudo` or to nothing is a wrapper more often
+# than not. Walked through rather than stopped at.
+_VARIABLE_RE = re.compile(r"^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$")
+
+# The one predicate family that makes a data command run a command.
+_EXEC_PREDICATES = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
+
+# `for c in node npx uv git; do …` and `case $x in …`. Everything after the
+# `in` is a WORD LIST, not a command — measured as the one false positive
+# this walk produced over 10,229 real commands from this host's
+# transcripts. The loop body is a separate segment (`;` splits it), so
+# stopping here loses no real invocation.
+_WORD_LIST_KEYWORD = "in"
+
+# Interpreters whose argument is another command STRING. `sh -c "curl …"`
+# surfaces that string as a single token, which is re-analysed on its own
+# terms — so `sh -c 'grep curl .'` still does not tag.
+SHELL_INTERPRETERS = frozenset(
+    {"sh", "bash", "zsh", "dash", "ash", "ksh", "mksh", "busybox", "eval"}
+)
+
+# Commands whose arguments are patterns, paths and text — never another
+# command. These STOP the walk, which is what keeps `grep -r curl .` and
+# `echo "use curl for this"` out of the wrapper. Nothing that runs a
+# command it is handed belongs in here: no sudo, env, nice, timeout,
+# xargs, nohup, stdbuf, setsid, watch, time, ssh, docker.
+TERMINAL_COMMANDS = frozenset({
+    # text and data
+    "echo", "printf", "cat", "tac", "head", "tail", "less", "more",
+    "grep", "egrep", "fgrep", "rg", "ag", "ack", "sed", "awk", "gawk", "mawk",
+    "cut", "tr", "sort", "uniq", "wc", "tee", "jq", "yq", "diff", "patch",
+    "cmp", "comm", "join", "paste", "column", "fold", "fmt", "strings",
+    "hexdump", "xxd", "od", "base64", "seq", "yes", "rev",
+    "md5sum", "sha1sum", "sha256sum", "sha512sum", "cksum",
+    # filesystem
+    "ls", "dir", "vdir", "stat", "file", "du", "df", "mkdir", "rmdir", "rm",
+    "cp", "mv", "ln", "touch", "chmod", "chown", "chgrp", "readlink",
+    "realpath", "dirname", "basename", "tree", "pwd", "cd", "mktemp",
+    "truncate", "shred", "find", "locate", "mount", "umount",
+    "tar", "gzip", "gunzip", "zip", "unzip", "bzip2", "xz", "zstd",
+    # lookup — `command -v curl` and `which curl` are a lookup, not a
+    # fetch. `command <cmd>` as an invocation wrapper is given up on
+    # purpose: the lookup form is the one that actually gets typed.
+    "which", "whereis", "type", "command", "man", "apropos", "whatis",
+    "info", "help", "hash", "alias", "unalias",
+    # process and host
+    "ps", "pgrep", "pkill", "killall", "kill", "jobs", "sleep", "wait",
+    "top", "htop", "free", "uptime", "uname", "whoami", "id", "groups",
+    "date", "hostname", "tty", "who", "printenv", "unset", "ulimit", "umask",
+    # shell noise and editors
+    "true", "false", "test", "exit", "return", "break", "continue", "read",
+    "history", "clear", "vim", "vi", "nano", "emacs", "ed", "code",
+})
+
+
+def _resume_after_exec(tokens: list[str], start: int) -> int | None:
+    """Index just past a `-exec`-style predicate, if the segment has one.
+
+    `find` is in TERMINAL_COMMANDS because `find . -name curl` must not
+    tag — but `find . -exec curl -O {} \\;` really does fetch. Rather than
+    make find transparent (which would tag every `-name curl`), the walk
+    stops at find and resumes at the command find was told to run.
+    """
+    for j in range(start, len(tokens)):
+        if tokens[j] in _EXEC_PREDICATES:
+            return j + 1
+    return None
+
+
+def _nested_shell_ingress(
+    rest: list[str], config: dict, depth: int
+) -> tuple[str | None, bool]:
+    """Analyse the command STRING(s) handed to a shell interpreter."""
+    if depth >= MAX_NESTED_SHELL_DEPTH:
+        # Cannot see the bottom of the nesting, so cannot say it is clean.
+        return UNANALYSED_LABEL, True
+    for tok in rest:
+        if not tok or tok.startswith("-") or _ASSIGNMENT_RE.match(tok):
             continue
-        head = tokens[0].rsplit("/", 1)[-1]
-        if head in single:
-            return single[head]
+        label = _match_untrusted_ingress(tok, config, depth + 1)
+        if label:
+            return label, True
+    return None, True
+
+
+def _segment_ingress(
+    tokens: list[str], single: dict, multi: list, config: dict, depth: int
+) -> tuple[str | None, bool]:
+    """Walk one segment for the command it actually invokes.
+
+    Returns ``(label, resolved)``. ``resolved`` false means the walk ran
+    off the end of the segment still looking for the command word, which
+    matters only when the segment was truncated: the caller then wraps
+    rather than pass bytes it could not attribute.
+    """
+    i = 0
+    n = len(tokens)
+    while i < n:
+        tok = tokens[i]
+        if not tok:
+            i += 1
+            continue
+        if tok.startswith("#"):
+            # A word-initial `#` starts a bash comment: nothing after it on
+            # this line runs, so there is nothing left to invoke.
+            return None, True
+        if (
+            _ASSIGNMENT_RE.match(tok)          # FOO=1 curl …
+            or tok in ("--", "{}")             # end-of-options, xargs slot
+            or (tok.startswith("-") and tok != "-")
+            or _REDIRECTION_RE.match(tok)
+            or _VARIABLE_RE.match(tok)
+        ):
+            i += 1
+            continue
+        if _NOT_A_COMMAND_WORD_RE.search(tok):
+            return None, True
+        word = tok.rsplit("/", 1)[-1]  # `/usr/bin/curl` is still curl
+        if word == _WORD_LIST_KEYWORD:
+            return None, True
+        if word in single:
+            return single[word], True
         for entry in multi:
             prefix = entry.get("prefix") or []
-            label = entry.get("label") or ""
-            n = len(prefix)
-            if n == 0 or len(tokens) < n:
+            n_p = len(prefix)
+            if n_p == 0 or word != prefix[0] or i + n_p > n:
                 continue
-            if head == prefix[0] and list(tokens[1:n]) == list(prefix[1:]):
-                return label
+            if list(tokens[i + 1 : i + n_p]) == list(prefix[1:]):
+                return (entry.get("label") or ""), True
+        if word in SHELL_INTERPRETERS:
+            return _nested_shell_ingress(tokens[i + 1 :], config, depth)
+        if word in TERMINAL_COMMANDS:
+            resume = _resume_after_exec(tokens, i + 1)
+            if resume is None:
+                return None, True  # everything after this is data
+            i = resume
+            continue
+        # Unrecognised word. It may be the command, or it may be a wrapper
+        # nobody listed — and only one of those two mistakes leaves a fetch
+        # untagged. Keep looking.
+        i += 1
+    return None, False
+
+
+def _require_prefixes_fit(multi: list) -> None:
+    """A configured prefix at or past the token cap could never match.
+
+    Invariant 1 of MAX_SEGMENT_TOKENS, enforced instead of documented: an
+    entry that can never fire is a hole in the ingress vocabulary that
+    looks like coverage, which is how a guard disappears quietly.
+    """
+    doomed = [
+        f"{entry.get('label') or '?'} ({len(entry['prefix'])} tokens)"
+        for entry in multi
+        if isinstance(entry, dict)
+        and isinstance(entry.get("prefix"), list)
+        and len(entry["prefix"]) >= MAX_SEGMENT_TOKENS
+    ]
+    if doomed:
+        _withhold(
+            "the ingress vocabulary holds prefix(es) at or past the "
+            f"{MAX_SEGMENT_TOKENS}-token segment cap, so they could never be "
+            "compared in full and would sit in the config looking alive: "
+            + ", ".join(doomed)
+        )
+
+
+def _match_untrusted_ingress(command: str, config: dict, depth: int = 0) -> str | None:
+    single = config.get("untrusted_ingress_single") or {}
+    multi = config.get("untrusted_ingress_multi") or []
+    _require_prefixes_fit(multi)
+    cleaned = _strip_heredocs(command)
+    for tokens, truncated in _segments(cleaned):
+        if not tokens:
+            continue
+        label, resolved = _segment_ingress(tokens, single, multi, config, depth)
+        if label:
+            return label
+        if truncated and not resolved:
+            # The cap cut the segment before its command word was found.
+            # Fail closed: wrap rather than hand over bytes nobody could
+            # attribute to a command.
+            return UNANALYSED_LABEL
     return None
 
 

@@ -45,6 +45,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -494,8 +495,10 @@ for entry in MULTI:
         cmd,
     )
 
-# The token cap in _pipelines silently stops matching any prefix at or past
-# its length. Assert the invariant, not the current numbers.
+# The token cap in _pipelines is a RESOURCE bound, not a matcher window —
+# see the comment on `_segments`. A prefix at or past it could still never
+# be compared in full, so the invariant is asserted here, and the guard
+# itself withholds when the config violates it (tested under fail-closed).
 _cap = guard._pipelines.__defaults__[0]
 check(
     "every configured prefix fits inside the _pipelines token cap",
@@ -545,10 +548,21 @@ check(
 )
 
 # G7: token cap and the shlex ValueError branch.
+#
+# The cap used to be 4 — longest-known-prefix + 1 — and it dropped the
+# tokens past it, which is how `sudo -E env FOO=1 curl …` lost its `curl`
+# before the matcher ever saw it. Segments are now kept whole up to a
+# resource bound, and a segment the bound actually truncates is treated as
+# unanalysable (see the wrapper section below).
 check(
-    "_pipelines keeps only the first max_tokens tokens of a segment",
-    guard._pipelines("a b c d e f") == [["a", "b", "c", "d"]],
+    "_pipelines keeps a segment whole, well past the old 4-token window",
+    guard._pipelines("a b c d e f") == [["a", "b", "c", "d", "e", "f"]],
     str(guard._pipelines("a b c d e f")),
+)
+check(
+    "_pipelines still truncates at whatever cap it is given",
+    guard._pipelines("a b c d e f", max_tokens=3) == [["a", "b", "c"]],
+    str(guard._pipelines("a b c d e f", max_tokens=3)),
 )
 check(
     "_pipelines splits on shell operators",
@@ -695,6 +709,158 @@ check(
 
 
 # ----------------------------------------------------------------------
+# G13. Command wrappers.
+#
+# The matcher's question is "does this pipeline segment INVOKE an ingress
+# command", not "is its first token one". The head-only rule with its
+# 4-token window answered the second, so every one of the commands below
+# fetched external content and reached the model with no
+# <untrusted_external_content> marker. Measured against the pre-fix guard,
+# all of them returned no wrapper at all:
+#
+#     sudo -E env FOO=1 curl <url>
+#     nice -n 10 timeout 5 curl <url>
+#     stdbuf/nohup/xargs/sh -c/… and any composition of them
+#
+# This is the output-side twin of the `find … -delete` evasions closed on
+# the input side (`/usr/bin/find`, `sh -c "…"`, `$(…)`): a bounded,
+# prefix-shaped matcher that an ordinary command wrapper walks past.
+#
+# The list below is deliberately not a list of the two reported instances.
+# Wrappers compose arbitrarily and cannot be enumerated, so the guard
+# enumerates the opposite — commands whose arguments are DATA — and treats
+# every unrecognised word as possibly-a-wrapper. `chronic` below is in no
+# vocabulary anywhere in the guard; it must still be walked through.
+# ----------------------------------------------------------------------
+section("bash-output-guard: wrappers in front of an ingress command (G13)")
+
+URL = "https://example.invalid/x"
+
+WRAPPED_EVASIONS = [
+    ("sudo + env + inline assignment", f"sudo -E env FOO=1 curl {URL}", "curl"),
+    ("nice + timeout, both with arguments", f"nice -n 10 timeout 5 curl {URL}", "curl"),
+    ("timeout with a duration suffix", f"timeout 5s curl {URL}", "curl"),
+    ("stdbuf", f"stdbuf -oL curl {URL}", "curl"),
+    ("nohup, backgrounded", f"nohup curl {URL} &", "curl"),
+    ("xargs with a placeholder", "xargs -I {} curl -s {}", "curl"),
+    ("sh -c with the fetch in the quoted string", f"sh -c \"curl {URL}\"", "curl"),
+    ("wrapper nested inside a wrapper's shell", f"sudo sh -c 'curl {URL}'", "curl"),
+    ("a wrapper this guard has never heard of", f"chronic curl {URL}", "curl"),
+    ("a wrapper hidden behind a variable", f"$SUDO curl {URL}", "curl"),
+    ("... in braces", f"${{RUNNER}} curl {URL}", "curl"),
+    ("bare assignment prefix", f"NO_PROXY=1 curl {URL}", "curl"),
+    ("wrapper in front of a multi-token prefix", "sudo gh pr view 12", "gh-fetch"),
+    ("assignment in front of a multi-token prefix",
+     "GIT_SSH_COMMAND=ssh git clone https://example.invalid/r.git dst", "git-clone"),
+    ("env in front of a multi-token prefix", "env -i npm ci", "npm-install"),
+    ("find -exec, the one data command that takes a command",
+     f"find . -maxdepth 1 -exec curl -s {URL} ;", "curl"),
+    # shlex's default `commenters` ends the LINE at the first `#`, even
+    # mid-word, where bash treats `.#foo` as an ordinary word. The whole
+    # `&& curl …` segment vanished before the matcher saw it — measured on
+    # `nix build .#checks…`, which this repo runs constantly.
+    ("a `#` inside a word does not swallow the rest of the line",
+     f"nix build .#checks.x86_64-linux.dellan-vm && curl {URL}", "curl"),
+    # Both taken from this host's own transcripts, where the head-only
+    # rule saw `for` and `if` and stopped.
+    ("a shell keyword in front of the fetch",
+     "for p in 8 9; do gh pr view $p --json state; done", "gh-fetch"),
+    ("a fetch in a poll loop's condition",
+     f"until curl -s {URL} | grep -q ok; do sleep 2; done", "curl"),
+]
+
+for _label, _cmd, _expected in WRAPPED_EVASIONS:
+    check(
+        f"wrapper evasion — {_label} — is tagged as {_expected!r}",
+        wrapped_label(_cmd) == _expected,
+        f"{_cmd!r} -> {wrapped_label(_cmd)!r}",
+    )
+
+# The other edge, and it matters just as much: a literal MENTION of an
+# ingress command in an argument must not turn ordinary local output into
+# a wrapped ingress block. A marker that fires on `grep -r curl .` is a
+# marker every reader learns to skim past, which costs exactly what the
+# marker was bought for.
+NOT_INGRESS = [
+    ("a literal mention in an echo argument", 'echo "use curl for this"'),
+    ("a literal mention as a grep pattern", "grep -r curl ."),
+    ("an ingress word in the first argument slot", "grep curl hooks/bash-guard-config.json"),
+    ("an ingress word as a ripgrep pattern", "rg -n 'curl|wget' hooks"),
+    ("a path argument whose basename is an ingress command", "ls -l /usr/bin/curl"),
+    ("a lookup, not an invocation", "command -v curl"),
+    ("which", "which curl"),
+    ("a man page", "man curl"),
+    ("a git subcommand that fetches nothing", "git grep curl -- hooks"),
+    ("a quoted command string that is only echoed", f'echo "curl {URL}"'),
+    ("a nested shell whose inner command is plain", "sh -c 'grep curl hooks'"),
+    ("an ingress word after a `#` comment", f"ls # curl {URL}"),
+    ("a sed script that rewrites the word", "sed -i s/curl/wget/ notes.txt"),
+    ("an ingress word as a find predicate value", "find . -name curl"),
+    ("an ingress word as a signal target", "pkill curl"),
+    # The one false positive this walk produced over 10,229 real commands
+    # from this host's transcripts: everything after `in` is a word list,
+    # not a command. The loop BODY is a separate segment, so stopping at
+    # `in` loses no invocation — `for p in 8 9; do gh pr view …` above is
+    # still tagged.
+    ("an ingress word inside a for-loop word list",
+     "for c in node npx uv git; do command -v $c; done"),
+]
+
+for _label, _cmd in NOT_INGRESS:
+    parsed, updated, raw = bash_out(_cmd, response_obj("local output\n"))
+    check(
+        f"false-positive control — {_label} — is NOT wrapped",
+        "<untrusted_external_content" not in raw,
+        f"{_cmd!r} -> {str(stdout_of(updated))[:160]}",
+    )
+
+# Fail-closed, in the ingress direction. For an output guard "fail closed"
+# means WRAP when unsure: a wrongly-wrapped local output costs a pair of
+# tags, an unwrapped fetch costs the model's trust boundary. A segment the
+# token cap actually truncates while the command word is still unresolved
+# is such a case.
+_UNANALYSED = getattr(guard, "UNANALYSED_LABEL", "unanalysed-command")
+_over_cap = " ".join(["sudo"] * (_cap + 2)) + f" curl {URL}"
+check(
+    "a segment truncated by the token cap before its command word is wrapped",
+    wrapped_label(_over_cap) == _UNANALYSED,
+    f"{_cap + 2} wrapper tokens -> {wrapped_label(_over_cap)!r}",
+)
+_under_cap = " ".join(["sudo"] * 8) + f" curl {URL}"
+check(
+    "... while a long-but-untruncated wrapper chain is tagged as the real fetch",
+    wrapped_label(_under_cap) == "curl",
+    f"-> {wrapped_label(_under_cap)!r}",
+)
+# The same rule one level up: a `sh -c "sh -c …"` chain deeper than the
+# guard follows is wrapped, not waved through.
+_nest = f"curl {URL}"
+for _ in range(guard.MAX_NESTED_SHELL_DEPTH + 1):
+    _nest = "sh -c " + shlex.quote(_nest)
+check(
+    "a shell nest deeper than the guard follows is wrapped, not passed through",
+    wrapped_label(_nest) == _UNANALYSED,
+    f"-> {wrapped_label(_nest)!r}",
+)
+_shallow = f"curl {URL}"
+for _ in range(guard.MAX_NESTED_SHELL_DEPTH - 1):
+    _shallow = "sh -c " + shlex.quote(_shallow)
+check(
+    "... while a nest within the limit is tagged as the real fetch",
+    wrapped_label(_shallow) == "curl",
+    f"-> {wrapped_label(_shallow)!r}",
+)
+
+check(
+    "a truncated segment whose command word DID resolve is left alone",
+    "<untrusted_external_content"
+    not in bash_out("grep -r curl " + " ".join(f"dir{i}" for i in range(_cap + 4)),
+                    response_obj("local output\n"))[2],
+    "arguments past the cap are still arguments",
+)
+
+
+# ----------------------------------------------------------------------
 # FAIL-CLOSED. Every way the guard can fail to do its job withholds.
 # ----------------------------------------------------------------------
 section("bash-output-guard: fail-closed paths")
@@ -728,6 +894,32 @@ check_withheld("ingress vocabulary key is absent", parsed, updated)
 rc, parsed, raw, err = run_hook(GUARD, None, raw_stdin="[1, 2, 3]")
 updated = (parsed or {}).get("hookSpecificOutput", {}).get("updatedToolOutput")
 check_withheld("hook stdin is JSON but not an object", parsed, updated)
+
+# The token cap is a resource bound, not a matcher window — but a
+# configured prefix longer than the cap still could never be compared in
+# full, and a vocabulary entry that can never fire is a silent hole. That
+# is the invariant a future reader can check, and the guard enforces it at
+# runtime rather than leaving it to a test nobody runs.
+_over_cap_cfg = os.path.join(SCRATCH, "prefix-past-the-cap.json")
+with open(_over_cap_cfg, "w", encoding="utf-8") as fh:
+    json.dump(
+        {
+            "untrusted_ingress_single": {"curl": "curl"},
+            "untrusted_ingress_multi": [
+                {"prefix": ["gh"] * (_cap + 1), "label": "impossible"}
+            ],
+        },
+        fh,
+    )
+parsed, updated, raw = bash_out(
+    "ls", response_obj("x"), env_extra={"BASH_GUARD_CONFIG": _over_cap_cfg}
+)
+check_withheld("a configured prefix longer than the token cap", parsed, updated)
+check(
+    "the over-cap-prefix withhold names the entry that can never match",
+    isinstance(stdout_of(updated), str) and "impossible" in stdout_of(updated),
+    str(stdout_of(updated))[:240],
+)
 
 _inverted = patched_guard(
     "guard-inverted-ladder.py",
