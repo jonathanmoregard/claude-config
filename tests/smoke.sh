@@ -311,7 +311,8 @@ write_stub_help
 # and is immune to the caller's exit). The harness never learned the other half:
 # something that outlives you has to be WAITED FOR. Under load the worker's stdout
 # log lands between `rm -rf`'s readdir and its rmdir, `rm` exits non-zero, `set -e`
-# (in force from TEST 15 onward) kills the script — after every assertion passed.
+# (in force from TEST 7's `set -e` onward) kills the script — after every assertion
+# passed.
 #
 # THE FIX IS NOT A QUIETER `rm`. `rm -rf … || true` or `2>/dev/null` would hide the
 # next real teardown bug, and this session already found a defect that existed
@@ -1149,6 +1150,15 @@ info "path-traversal rejection OK (${MALF_COUNT} malformed records in $MALF_DIR,
 # ============================================================================
 # TEST 7: --worker requires _REFLECT_INTERNAL=1 sentinel
 # ============================================================================
+# ERREXIT STARTS HERE. The header sets only `-u` and `-o pipefail`; the `set -e`
+# below is the first one in the file and it is at top level, so errexit stays on
+# for everything after this point (other blocks suspend it locally with their own
+# `set +e` / `set -e` pair). Comments elsewhere used to say "from TEST 15 onward";
+# that was ~500 lines late and left TEST 13's two dispatcher calls looking safe
+# when they were not. Under errexit a BARE failing command aborts the script at
+# that command: exit 1, no `FAIL:` line, no `TESTS:` line, nothing naming the test
+# that died. Anything whose non-zero exit is a result you want reported has to be
+# in an `||` list (`cmd || rc=$?`) or an `if` condition — see TEST 50's note.
 test_begin "TEST 7: worker sentinel gating"
 set +e
 bash "$REFLECT_SH" --worker sessionend </dev/null >/dev/null 2>&1
@@ -1542,8 +1552,11 @@ RP="$(fake_payload SessionEnd "$RACE2_SID")"
 export REFLECT_STALE_STARTED_SECONDS=2
 
 # Dispatcher 1: writes started, detaches worker.
-echo "$RP" | bash "$REFLECT_SH" sessionend >/dev/null
-rc=$?
+# `|| rc=$?`: errexit has been in force since TEST 7's `set -e` (see the note
+# there), so a bare failing dispatcher killed the script AT this line and the
+# assertion below — written to report exactly this — never ran.
+rc=0
+echo "$RP" | bash "$REFLECT_SH" sessionend >/dev/null || rc=$?
 (( rc == 0 )) || fail "reaper-race dispatcher 1 exit=$rc"
 
 # Wait 3s so the reaper window expires but the worker is still 1s into its
@@ -1553,8 +1566,8 @@ sleep 3
 # Dispatcher 2: under the bug, is_already_complete returns false (stale
 # reaper) and dispatcher 2 tries to spawn its own worker. Under the fix
 # it hits the flock -n check and writes skipped_concurrent.
-echo "$RP" | bash "$REFLECT_SH" sessionend >/dev/null
-rc=$?
+rc=0
+echo "$RP" | bash "$REFLECT_SH" sessionend >/dev/null || rc=$?
 (( rc == 0 )) || fail "reaper-race dispatcher 2 exit=$rc"
 
 unset REFLECT_STALE_STARTED_SECONDS
@@ -1741,8 +1754,8 @@ chmod +x "$STUB_SCRATCH/claude"
 
 FB_SID="test-sid-setsid-fallback"
 FB_PAYLOAD="$(fake_payload SessionEnd "$FB_SID")"
-echo "$FB_PAYLOAD" | REFLECT_NO_SYSTEMD_RUN=1 bash "$REFLECT_SH" sessionend
-rc=$?
+rc=0
+echo "$FB_PAYLOAD" | REFLECT_NO_SYSTEMD_RUN=1 bash "$REFLECT_SH" sessionend || rc=$?
 (( rc == 0 )) || fail "fallback-path sessionend exit=$rc"
 
 FB_MANIFEST="$REFLECT_ROOT/sessions/$FB_SID/manifest.json"
@@ -1764,7 +1777,8 @@ info "setsid fallback completed the reflection and recorded spawn_method=setsid"
 # observed both a clean internal `status:timeout` at 61s and external SIGKILLs
 # leaving `status:started` with 0-byte logs.
 test_begin "TEST 16: D3 — budget arithmetic keeps the synchronous path under the cap"
-BUDGETS_JSON="$(bash "$REFLECT_SH" --budgets)"
+BUDGETS_JSON="$(bash "$REFLECT_SH" --budgets)" \
+  || fail "D3: reflect.sh --budgets exited non-zero, so none of the cap arithmetic below was checked"
 jq -e '.hook_cap_seconds == 60' <<<"$BUDGETS_JSON" >/dev/null \
   || fail "D3: --budgets should report the hard 60s hook cap"
 jq -e '.budgets.precompact < .hook_cap_seconds' <<<"$BUDGETS_JSON" >/dev/null \
@@ -1795,9 +1809,9 @@ HANG_SID="test-sid-hung-model"
 HANG_PAYLOAD=$(jq -cn --arg sid "$HANG_SID" --arg tp "$TRANSCRIPT" --arg cwd "$TEST_CWD" \
   '{session_id:$sid,transcript_path:$tp,hook_event_name:"PreCompact",cwd:$cwd,trigger:"auto"}')
 t0=$(date +%s%N)
+rc=0
 echo "$HANG_PAYLOAD" | REFLECT_BUDGET_PRECOMPACT=3 REFLECT_KILL_GRACE_SECONDS=2 \
-  bash "$REFLECT_SH" precompact
-rc=$?
+  bash "$REFLECT_SH" precompact || rc=$?
 t1=$(date +%s%N)
 hang_ms=$(( (t1 - t0) / 1000000 ))
 (( rc == 0 )) || fail "D3: hung-model precompact exit=$rc"
@@ -1842,9 +1856,9 @@ D2_PAYLOAD=$(jq -cn --arg sid "$D2_SID" --arg tp "$TRANSCRIPT" --arg cwd "$D2_CW
   '{session_id:$sid,transcript_path:$tp,hook_event_name:"PreCompact",cwd:$cwd,trigger:"auto"}')
 
 t0=$(date +%s%N)
+rc=0
 echo "$D2_PAYLOAD" | REFLECT_BUDGET_PRECOMPACT=1 REFLECT_KILL_GRACE_SECONDS=1 \
-  bash "$REFLECT_SH" precompact
-rc=$?
+  bash "$REFLECT_SH" precompact || rc=$?
 t1=$(date +%s%N)
 d2_ms=$(( (t1 - t0) / 1000000 ))
 (( rc == 0 )) || fail "D2: 2nd-compact precompact exit=$rc"
@@ -1923,8 +1937,8 @@ jq -n --arg sid "$FRESH_SID" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 # Trigger: an ordinary, unrelated SessionEnd.
 REAP_SID="test-sid-reaper-trigger"
 REAP_PAYLOAD="$(fake_payload SessionEnd "$REAP_SID")"
-echo "$REAP_PAYLOAD" | bash "$REFLECT_SH" sessionend
-rc=$?
+rc=0
+echo "$REAP_PAYLOAD" | bash "$REFLECT_SH" sessionend || rc=$?
 (( rc == 0 )) || fail "D4: reaper-trigger sessionend exit=$rc"
 wait_for_complete "$REFLECT_ROOT/sessions/$REAP_SID/manifest.json" 20 \
   || fail "D4: reaper-trigger sessionend never completed"
@@ -2056,10 +2070,10 @@ mission_stub '# Mission — machine written
 - stub'
 
 B3_SID="test-sid-foreign-mission"
+rc=0
 echo "$(jq -cn --arg sid "$B3_SID" --arg tp "$TRANSCRIPT" --arg cwd "$B3_CWD" \
   '{session_id:$sid,transcript_path:$tp,hook_event_name:"IdleHandoff",cwd:$cwd}')" \
-  | bash "$REFLECT_SH" mission
-rc=$?
+  | bash "$REFLECT_SH" mission || rc=$?
 (( rc == 0 )) || fail "mission mode exit=$rc"
 
 [[ "$(sha256sum "$B3_CWD/tasks/mission.md" | awk '{print $1}')" == "$B3_FOREIGN_SHA" ]] \
@@ -2117,10 +2131,15 @@ mission_stub '# Mission — first pass
 ## Done
 - first'
 B3B_SID1="test-sid-mission-first"
+# `|| rc=$?`, not a bare pipeline followed by `(( $? == 0 ))`. See TEST 7's note:
+# errexit is in force here, so a bare failing dispatcher killed the script AT the
+# pipeline and the assertion on the next line — the one written to report exactly
+# this — could never run.
+rc=0
 echo "$(jq -cn --arg sid "$B3B_SID1" --arg tp "$TRANSCRIPT" --arg cwd "$B3B_CWD" \
   '{session_id:$sid,transcript_path:$tp,hook_event_name:"IdleHandoff",cwd:$cwd}')" \
-  | bash "$REFLECT_SH" mission
-(( $? == 0 )) || fail "19b: first mission run failed"
+  | bash "$REFLECT_SH" mission || rc=$?
+(( rc == 0 )) || fail "19b: first mission run failed (exit=$rc)"
 [[ -L "$B3B_CWD/tasks/mission.md" ]] \
   || fail "19b: tasks/mission.md should be a symlink pointer"
 [[ "$(readlink "$B3B_CWD/tasks/mission.md")" == "mission.$B3B_SID1.md" ]] \
@@ -2134,10 +2153,11 @@ mission_stub '# Mission — second pass
 ## Done
 - second'
 B3B_SID2="test-sid-mission-second"
+rc=0
 echo "$(jq -cn --arg sid "$B3B_SID2" --arg tp "$TRANSCRIPT" --arg cwd "$B3B_CWD" \
   '{session_id:$sid,transcript_path:$tp,hook_event_name:"IdleHandoff",cwd:$cwd}')" \
-  | bash "$REFLECT_SH" mission
-(( $? == 0 )) || fail "19b: second mission run failed"
+  | bash "$REFLECT_SH" mission || rc=$?
+(( rc == 0 )) || fail "19b: second mission run failed (exit=$rc)"
 [[ "$(readlink "$B3B_CWD/tasks/mission.md")" == "mission.$B3B_SID2.md" ]] \
   || fail "19b: pointer was not repointed to the new payload"
 grep -q 'second pass' "$B3B_CWD/tasks/mission.md" \
@@ -2185,10 +2205,11 @@ mission_stub '# Mission — post-migration
 ## Done
 - migrated'
 B3C_SID="test-sid-legacy-migrate"
+rc=0
 echo "$(jq -cn --arg sid "$B3C_SID" --arg tp "$TRANSCRIPT" --arg cwd "$B3C_CWD" \
   '{session_id:$sid,transcript_path:$tp,hook_event_name:"IdleHandoff",cwd:$cwd}')" \
-  | bash "$REFLECT_SH" mission
-(( $? == 0 )) || fail "19c: mission run failed"
+  | bash "$REFLECT_SH" mission || rc=$?
+(( rc == 0 )) || fail "19c: mission run failed (exit=$rc)"
 [[ ! -L "$B3C_CWD/tasks/mission.md" ]] \
   || fail "19c: a regular mission.md was replaced by a pointer"
 [[ "$(sha256sum "$B3C_CWD/tasks/mission.md" | awk '{print $1}')" == "$B3C_LEGACY_SHA" ]] \
@@ -2270,10 +2291,11 @@ mission_stub '# Mission — repaired
 ## Done
 - repair'
 B3E_SID="test-sid-repair-dangling"
+rc=0
 echo "$(jq -cn --arg sid "$B3E_SID" --arg tp "$TRANSCRIPT" --arg cwd "$B3E_CWD" \
   '{session_id:$sid,transcript_path:$tp,hook_event_name:"IdleHandoff",cwd:$cwd}')" \
-  | bash "$REFLECT_SH" mission
-(( $? == 0 )) || fail "19e: repair mission run failed"
+  | bash "$REFLECT_SH" mission || rc=$?
+(( rc == 0 )) || fail "19e: repair mission run failed (exit=$rc)"
 [[ -L "$B3E_CWD/tasks/mission.md" && -f "$B3E_CWD/tasks/mission.md" ]] \
   || fail "19e: pointer still dangling after a mission run"
 grep -q 'repaired' "$B3E_CWD/tasks/mission.md" || fail "19e: repaired pointer resolves to the wrong file"
@@ -2342,10 +2364,11 @@ mission_stub '# Mission — gc e2e
 ## Done
 - gc'
 B3G_SID="test-sid-gc-e2e"
+rc=0
 echo "$(jq -cn --arg sid "$B3G_SID" --arg tp "$TRANSCRIPT" --arg cwd "$B3G_CWD" \
   '{session_id:$sid,transcript_path:$tp,hook_event_name:"IdleHandoff",cwd:$cwd}')" \
-  | bash "$REFLECT_SH" mission
-(( $? == 0 )) || fail "19f: e2e gc mission run failed"
+  | bash "$REFLECT_SH" mission || rc=$?
+(( rc == 0 )) || fail "19f: e2e gc mission run failed (exit=$rc)"
 jq -e '.modes.mission.gc_removed >= 1' "$REFLECT_ROOT/sessions/$B3G_SID/manifest.json" >/dev/null \
   || fail "19f: a mission run did not invoke GC (gc_removed=$(jq -r '.modes.mission.gc_removed' "$REFLECT_ROOT/sessions/$B3G_SID/manifest.json"))"
 [[ ! -f "$B3G_CWD/tasks/mission.gc-e2e-orphan-sid.md" ]] \
@@ -2718,8 +2741,8 @@ counting_stub "$B5_H/calls" "$SC_MISSION_FILE"
 for mode in absent malformed nokey normal; do
   sc_write_rsi_config "$B5_H" "$mode"
   B5_SID="test-sid-b5-$mode"
-  B5_OUT="$(sc_fire "$B5_H" "$B5_SID" "$B5_CWD" "$B5_H/t.jsonl")"
-  rc=$?
+  rc=0
+  B5_OUT="$(sc_fire "$B5_H" "$B5_SID" "$B5_CWD" "$B5_H/t.jsonl")" || rc=$?
   (( rc == 0 )) || fail "21: config=$mode must exit 0 (got $rc)"
   [[ -z "$B5_OUT" ]] || fail "21: config=$mode produced stdout: $B5_OUT (a Stop hook must stay silent)"
   for _ in $(seq 1 40); do
@@ -2839,8 +2862,8 @@ spawn_wait_quiescent 60 \
 B2_SID="test-sid-b2-fire"
 mk_context_transcript "$B2_H/over.jsonl" "claude-opus-5" 310000 "$B2_CWD"
 t0=$(date +%s%N)
-B2_OUT="$(sc_fire "$B2_H" "$B2_SID" "$B2_CWD" "$B2_H/over.jsonl")"
-rc=$?
+rc=0
+B2_OUT="$(sc_fire "$B2_H" "$B2_SID" "$B2_CWD" "$B2_H/over.jsonl")" || rc=$?
 t1=$(date +%s%N)
 b2_ms=$(( (t1 - t0) / 1000000 ))
 (( rc == 0 )) || fail "22: trigger rc=$rc (a Stop hook exiting non-zero BLOCKS the stop)"
@@ -2954,12 +2977,12 @@ jq -e --argjson c "$B6_CAP" '.capped == true and .fires == $c' \
 B6_RO_H="$(sc_home)"
 B6_RO_SESSIONS="$(mktemp -d -t reflect-b6ro-XXXXXX)"
 chmod 500 "$B6_RO_SESSIONS"
+rc=0
 jq -cn --arg sid "test-sid-b6-ro" --arg tp "$B6_TP" --arg cwd "$B6_CWD" \
   '{session_id:$sid,transcript_path:$tp,hook_event_name:"Stop",cwd:$cwd}' \
   | HOME="$B6_RO_H" CLAUDE_CODE_ENTRYPOINT=cli REFLECT_ROOT="$REFLECT_ROOT" \
     CLAUDE_SESSIONS_DIR="$B6_RO_SESSIONS" \
-    python3 "$B6_RO_H/.claude/self-compact-trigger.py" >/dev/null
-rc=$?
+    python3 "$B6_RO_H/.claude/self-compact-trigger.py" >/dev/null || rc=$?
 (( rc == 0 )) || fail "23: unwritable state dir must not fail the hook (rc=$rc)"
 sleep 0.5
 # No state means no bound, and the trigger persists the bound BEFORE it acts. So
@@ -3043,8 +3066,8 @@ printf 'ok\n'
 STUB
 chmod +x "$STUB_SCRATCH/claude"
 
-HOME="$B7_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh"
-rc=$?
+rc=0
+HOME="$B7_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" || rc=$?
 (( rc == 0 )) || fail "24: idle-handoff.sh rc=$rc"
 
 sc_settle_fork "$B7_ARGV" fork
@@ -3562,7 +3585,7 @@ mk_mission_copy "$B8U_CWD/tasks" "b8u-copy-sid" '# copy
 
 ## Next
 - something' >/dev/null
-# NB: `set -e` is in force from TEST 15 onward, so a deliberately-failing
+# NB: `set -e` is in force from TEST 7's `set -e` onward, so a deliberately-failing
 # command must sit in an `if` condition — a bare assignment from a failing
 # command substitution would kill the suite with no message.
 if B8U_OUT="$(bash "$REFLECT_SH" --mission-path "$B8U_CWD" 2>/dev/null)"; then
@@ -4014,13 +4037,15 @@ info "1 = subprocess on both sides; 0 / empty / unset = not a subprocess on both
 # manifest is orphaned at `started` — the exact pathology the budget arithmetic
 # exists to prevent, reachable by one env var.
 test_begin "TEST 30: F6 — an over-cap budget override is clamped and says so"
-F6_DEFAULT="$(bash "$REFLECT_SH" --budgets 2>/dev/null)"
+F6_DEFAULT="$(bash "$REFLECT_SH" --budgets 2>/dev/null)" \
+  || fail "30: --budgets exited non-zero with no override at all"
 jq -e '.budgets.precompact == 40 and .max_synchronous_budget_seconds
        == (.hook_cap_seconds - .kill_grace_seconds - .reserve_seconds)' <<<"$F6_DEFAULT" >/dev/null \
   || fail "30: shipped defaults changed unexpectedly ($F6_DEFAULT)"
 
 F6_ERR="$STUB_SCRATCH/f6.stderr"
-F6_OVER="$(REFLECT_BUDGET_PRECOMPACT=50 bash "$REFLECT_SH" --budgets 2>"$F6_ERR")"
+F6_OVER="$(REFLECT_BUDGET_PRECOMPACT=50 bash "$REFLECT_SH" --budgets 2>"$F6_ERR")" \
+  || fail "30: --budgets exited non-zero on an over-cap override; it must clamp and keep reporting (stderr: $(cat "$F6_ERR" 2>/dev/null || true))"
 jq -e '.precompact_worst_case_seconds <= .hook_cap_seconds' <<<"$F6_OVER" >/dev/null \
   || fail "30: budget+grace+reserve still exceeds the cap after an override ($F6_OVER)"
 jq -e '.budgets.precompact == .max_synchronous_budget_seconds' <<<"$F6_OVER" >/dev/null \
@@ -4028,7 +4053,8 @@ jq -e '.budgets.precompact == .max_synchronous_budget_seconds' <<<"$F6_OVER" >/d
 grep -q 'CLAMPED' "$F6_ERR" \
   || fail "30: the clamp was silent (stderr: $(cat "$F6_ERR"))"
 
-F6_BAD="$(REFLECT_BUDGET_PRECOMPACT=notanumber bash "$REFLECT_SH" --budgets 2>"$F6_ERR")"
+F6_BAD="$(REFLECT_BUDGET_PRECOMPACT=notanumber bash "$REFLECT_SH" --budgets 2>"$F6_ERR")" \
+  || fail "30: --budgets exited non-zero on a non-numeric override; it must reset to the default and keep reporting (stderr: $(cat "$F6_ERR" 2>/dev/null || true))"
 jq -e '.budgets.precompact == 40' <<<"$F6_BAD" >/dev/null \
   || fail "30: a non-numeric override did not fall back to the shipped default"
 grep -q 'not a positive integer' "$F6_ERR" || fail "30: the reset was silent"
@@ -4918,7 +4944,8 @@ info "39b: the advisory half's docstring states the live posture of the autonomo
 # (c) `mission` is dispatchable, and has been since the handoff work landed, but the
 #     file header and the --help usage line still listed three modes. A usage string
 #     that omits a real mode is how a caller concludes it must reimplement one.
-R4_HELP="$(bash "$REFLECT_SH" --help)"
+R4_HELP="$(bash "$REFLECT_SH" --help)" \
+  || fail "39c: reflect.sh --help exited non-zero, so the usage line below was never checked"
 grep -qE 'Usage:.*precompact\|sessionend\|subagentstop\|mission' <<<"$R4_HELP" \
   || fail "39c: --help usage line does not list mission (got: $(grep -m1 Usage: <<<"$R4_HELP"))"
 grep -qE '^# Usage:.*precompact\|sessionend\|subagentstop\|mission' "$REFLECT_SH" \
@@ -6005,7 +6032,7 @@ for guard_mod in "${GUARD_MODULES[@]}"; do
   # spend real API calls. An ambient export in the caller's shell must not be
   # able to turn a smoke run into a billed one.
   # `|| guard_rc=$?`, NOT a bare command followed by `guard_rc=$?`. `set -e` is in
-  # force from TEST 15 onward (see the note above TEST 15), so a bare failing
+  # force from TEST 7's `set -e` onward (see the note there), so a bare failing
   # module killed the script THERE — exit 1, no FAIL line, no TESTS: line, no
   # named module, nothing. Measured 2026-08-24 with a deliberately-broken module:
   # the suite reported a bare exit 1 and the reader had no way to learn which
@@ -6066,7 +6093,19 @@ processes/units still tracked (may have appeared after the quiescence check):
 $(spawn_holders)"
   fi
   # The tracking dir goes last: TEARDOWN_DETAIL is written inside it.
-  rm -rf "$SPAWN_SHIM_DIR"
+  # `if !`, not a bare `rm -rf`: errexit is in force here, so a bare failure exited
+  # the script AT this line — with status 1, which this file defines as "a test
+  # failed", and with no TEARDOWN: line at all. A cleanup failure that reports
+  # itself as a test failure is worse than one that reports nothing.
+  TEARDOWN_SHIM_ERR="$SPAWN_TRACK_DIR/teardown-shim-rm.err"
+  if ! rm -rf "$SPAWN_SHIM_DIR" 2>"$TEARDOWN_SHIM_ERR"; then
+    if [[ "$TEARDOWN_STATUS" == "ok" ]]; then
+      TEARDOWN_STATUS="shim-rm-failed"
+    fi
+    TEARDOWN_DETAIL="$TEARDOWN_DETAIL
+rm -rf $SPAWN_SHIM_DIR reported:
+$(cat "$TEARDOWN_SHIM_ERR" 2>/dev/null || true)"
+  fi
 fi
 
 # ============================================================================
