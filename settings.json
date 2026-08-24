@@ -348,6 +348,16 @@
         ]
       },
       {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/hooks/bash-guard-health.py",
+            "timeout": 10,
+            "statusMessage": "Checking bash guard health..."
+          }
+        ]
+      },
+      {
         "matcher": "startup|clear|compact",
         "hooks": [
           {

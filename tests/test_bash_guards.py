@@ -928,6 +928,101 @@ if _out_entries:
 
 
 # ----------------------------------------------------------------------
+# SessionStart guard-health check.
+#
+# dcg went missing during the NixOS migration and nothing said so for
+# months. A guard that only announces itself broken on the first denied
+# command is a guard nobody notices is broken.
+# ----------------------------------------------------------------------
+section("bash-guard-health: SessionStart announcement")
+
+HEALTHY_CONFIG = _write_stub("dcg-config.toml", "[general]\nverbose = false\n", executable=False)
+INGRESS_CONFIG = os.path.join(HOOKS, "bash-guard-config.json")
+
+
+def health(dcg: str, dcg_config: str, ingress: str = INGRESS_CONFIG):
+    rc, parsed, out, err = run_hook(
+        "bash-guard-health.py",
+        {"session_id": "t", "hook_event_name": "SessionStart", "source": "startup"},
+        env_extra={
+            "DCG_PATH": dcg,
+            "DCG_CONFIG": dcg_config,
+            "BASH_GUARD_CONFIG": ingress,
+        },
+    )
+    msg = ""
+    ctx = ""
+    event = None
+    if isinstance(parsed, dict):
+        msg = parsed.get("systemMessage") or ""
+        ctx = (parsed.get("hookSpecificOutput") or {}).get("additionalContext") or ""
+        event = (parsed.get("hookSpecificOutput") or {}).get("hookEventName")
+    return rc, msg, ctx, out, event
+
+
+rc, msg, ctx, out, event = health(STUB_ALLOW, HEALTHY_CONFIG)
+check("healthy: exit 0", rc == 0, f"rc={rc}")
+check("healthy: says nothing at all", out.strip() == "", out[:200])
+
+rc, msg, ctx, out, event = health(MISSING_DCG, HEALTHY_CONFIG)
+check("dcg absent: exit 0 (announce, never block startup)", rc == 0, f"rc={rc}")
+check("dcg absent: user-visible systemMessage", "dcg" in msg.lower(), msg[:200])
+check(
+    "dcg absent: says every Bash command will be denied",
+    "deny" in msg.lower() or "denied" in msg.lower(),
+    msg[:200],
+)
+check(
+    "dcg absent: additionalContext tells the model too",
+    "dcg" in ctx.lower(),
+    ctx[:200],
+)
+check(
+    "dcg absent: names the SessionStart event so the output is not dropped",
+    event == "SessionStart",
+    f"hookEventName={event!r}",
+)
+
+rc, msg, ctx, out, event = health(STUB_NOT_EXECUTABLE, HEALTHY_CONFIG)
+check("dcg not executable: announced", "executable" in msg.lower(), msg[:200])
+
+rc, msg, ctx, out, event = health(STUB_ALLOW, os.path.join(SCRATCH, "no-dcg-config.toml"))
+check("dcg config missing: announced", "config" in msg.lower(), msg[:200])
+check(
+    "dcg config missing: names the path the operator must restore",
+    "no-dcg-config.toml" in msg,
+    msg[:200],
+)
+
+rc, msg, ctx, out, event = health(
+    STUB_ALLOW, HEALTHY_CONFIG, ingress=os.path.join(SCRATCH, "no-ingress.json")
+)
+check(
+    "ingress config missing: announced (it withholds ALL bash output)",
+    "ingress" in msg.lower() or "bash-guard-config" in msg,
+    msg[:200],
+)
+
+# Several faults at once must all be reported, not just the first.
+rc, msg, ctx, out, event = health(MISSING_DCG, os.path.join(SCRATCH, "no-dcg-config.toml"))
+check(
+    "multiple faults: all of them are listed",
+    "dcg" in msg.lower() and "config" in msg.lower(),
+    msg[:250],
+)
+
+_ss = SETTINGS.get("hooks", {}).get("SessionStart", [])
+_health_entries = [
+    hook
+    for entry in _ss
+    for hook in entry.get("hooks", [])
+    if "bash-guard-health.py" in (hook.get("command") or "")
+]
+check("settings.json registers bash-guard-health.py on SessionStart",
+      len(_health_entries) == 1, f"found {len(_health_entries)}")
+
+
+# ----------------------------------------------------------------------
 # Summary
 # ----------------------------------------------------------------------
 section("Summary")
