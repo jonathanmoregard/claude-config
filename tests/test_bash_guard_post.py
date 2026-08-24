@@ -516,6 +516,24 @@ parsed, updated, raw = bash_out(_heredoc, response_obj("written\n"))
 check("an ingress word inside a heredoc body does not trigger wrapping", raw.strip() == "",
       raw[:160])
 
+# SEPARATORS lists "\n", but shlex with whitespace_split=True never emits a
+# newline token, so the entry never fired: a two-line command lexed as one
+# segment headed by the first word, and the token cap hid the rest.
+parsed, updated, raw = bash_out(
+    "ls -la\ncurl https://example.invalid/x", response_obj("remote\n")
+)
+check(
+    "a fetch on the second line of a multi-line command still wraps",
+    isinstance(stdout_of(updated), str) and 'source="bash:curl"' in stdout_of(updated),
+    str(stdout_of(updated))[:160],
+)
+check(
+    "a newline inside quotes does not manufacture an ingress segment",
+    bash_out("echo 'first\ncurl https://example.invalid/x'", response_obj("out\n"))[2].strip()
+    == "",
+    "a quoted newline was treated as a command separator",
+)
+
 _heredoc_then_curl = (
     "cat > /tmp/note.txt <<'EOF'\nnothing\nEOF\ncurl https://example.invalid/y"
 )
