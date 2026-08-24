@@ -220,6 +220,16 @@
         ]
       },
       {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/hooks/bash-guard.py",
+            "timeout": 10
+          }
+        ]
+      },
+      {
         "matcher": "Grep|Read",
         "hooks": [
           {

@@ -97,9 +97,11 @@ STUB_DENY_EXIT2 = _write_stub(
     """"ruleId":"exit2-rule"}}'\n"""
     "exit 2\n",
 )
+# 30s outlasts every deadline in the ladder while bounding how long a stray
+# sleep can linger after the guard has walked away from it.
 STUB_HANG = _write_stub(
     "dcg-hang",
-    "#!/usr/bin/env bash\ncat >/dev/null\nsleep 120\n",
+    "#!/usr/bin/env bash\ncat >/dev/null\nsleep 30\n",
 )
 STUB_MALFORMED = _write_stub(
     "dcg-malformed",
@@ -136,8 +138,9 @@ def run_hook(
     env = dict(os.environ)
     env.update(env_extra or {})
     stdin = raw_stdin if raw_stdin is not None else json.dumps(payload)
+    path = script if os.path.isabs(script) else os.path.join(HOOKS, script)
     proc = subprocess.run(
-        [sys.executable, os.path.join(HOOKS, script)],
+        [sys.executable, path],
         input=stdin,
         capture_output=True,
         text=True,
@@ -351,6 +354,145 @@ for label, cmd in FIND_ALLOW:
 # generic find hint when both would fire.
 dec, why = guard("find /tmp -delete", dcg=STUB_DENY)
 check("dcg layer runs before the find layer", "fs-rm-rf-root" in why, why[:160])
+
+
+# ----------------------------------------------------------------------
+# The timeout ladder, and its link to settings.json.
+#
+# The trap: a harness-level hook timeout CANCELS the hook and DISCARDS its
+# output, rendering NO decision — fail-OPEN. So the hook's own deadline has
+# to be strictly shorter than the harness's, and the two numbers live in
+# different files. These tests are the thing that keeps them in step.
+# ----------------------------------------------------------------------
+section("bash-guard: timeout ladder cannot silently invert")
+
+import importlib.util  # noqa: E402
+
+_spec = importlib.util.spec_from_file_location(
+    "bash_guard_under_test", os.path.join(HOOKS, "bash-guard.py")
+)
+bash_guard = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(bash_guard)
+
+check(
+    "ladder holds: 0 < DCG_TIMEOUT_S < GUARD_DEADLINE_S < HARNESS_HOOK_TIMEOUT_S",
+    0
+    < bash_guard.DCG_TIMEOUT_S
+    < bash_guard.GUARD_DEADLINE_S
+    < bash_guard.HARNESS_HOOK_TIMEOUT_S,
+    f"{bash_guard.DCG_TIMEOUT_S} / {bash_guard.GUARD_DEADLINE_S} / "
+    f"{bash_guard.HARNESS_HOOK_TIMEOUT_S}",
+)
+
+with open(os.path.join(REPO_ROOT, "settings.json"), encoding="utf-8") as fh:
+    SETTINGS = json.load(fh)
+
+_pre = SETTINGS.get("hooks", {}).get("PreToolUse", [])
+_guard_entries = [
+    (entry, hook)
+    for entry in _pre
+    for hook in entry.get("hooks", [])
+    if "bash-guard.py" in (hook.get("command") or "")
+]
+check("settings.json registers bash-guard.py on PreToolUse", len(_guard_entries) == 1,
+      f"found {len(_guard_entries)}")
+
+if _guard_entries:
+    entry, hook = _guard_entries[0]
+    check(
+        "settings.json declares the timeout the hook was built against",
+        hook.get("timeout") == bash_guard.HARNESS_HOOK_TIMEOUT_S,
+        f"settings.json timeout={hook.get('timeout')!r}, hook "
+        f"HARNESS_HOOK_TIMEOUT_S={bash_guard.HARNESS_HOOK_TIMEOUT_S}",
+    )
+    check(
+        "matcher targets the native Bash tool",
+        entry.get("matcher") == "Bash",
+        f"matcher={entry.get('matcher')!r}",
+    )
+    check(
+        # A fail-closed guard on safe-bash's tool, while dcg is still absent
+        # from this host, would deny the shell the migration itself runs on.
+        "matcher does NOT cover mcp__safe-bash__exec",
+        "safe-bash" not in (entry.get("matcher") or ""),
+        f"matcher={entry.get('matcher')!r}",
+    )
+
+# Rewrite the constants so the ladder inverts, and confirm the guard notices
+# rather than quietly degrading to a hook the harness will time out.
+with open(os.path.join(HOOKS, "bash-guard.py"), encoding="utf-8") as fh:
+    _src = fh.read()
+_inverted_src = _src.replace(
+    "DCG_TIMEOUT_S = GUARD_DEADLINE_S - 1  # 5",
+    "DCG_TIMEOUT_S = HARNESS_HOOK_TIMEOUT_S + 5  # inverted on purpose",
+)
+check("inversion fixture actually patched the source", _inverted_src != _src)
+_inverted_path = os.path.join(SCRATCH, "bash-guard-inverted.py")
+with open(_inverted_path, "w", encoding="utf-8") as fh:
+    fh.write(_inverted_src)
+
+rc, parsed, out, err = run_hook(
+    _inverted_path, pre_payload("ls -la"), env_extra={"DCG_PATH": STUB_ALLOW}
+)
+check(
+    "inverted ladder -> deny (not a silently fail-open hook)",
+    decision_of(parsed) == "deny",
+    f"decision={decision_of(parsed)!r}",
+)
+check(
+    "inverted ladder -> reason names the ladder",
+    "ladder" in reason_of(parsed),
+    reason_of(parsed)[:200],
+)
+
+# A dcg that leaks its stdout/stderr pipes to a process surviving the kill —
+# the failure mode safe-bash's `_run` docstring describes at length.
+STUB_LEAKS_PIPES = _write_stub(
+    "dcg-leaks-pipes",
+    "#!/usr/bin/env bash\ncat >/dev/null\nsleep 30 &\nsleep 30\n",
+)
+t0 = time.monotonic()
+dec, why = guard("ls -la", dcg=STUB_LEAKS_PIPES, timeout=45.0)
+elapsed = time.monotonic() - t0
+check("dcg leaking pipes to a surviving child -> deny", dec == "deny", f"decision={dec!r}")
+check(
+    "leaked-pipe deny lands before the harness hook timeout",
+    elapsed < bash_guard.HARNESS_HOOK_TIMEOUT_S,
+    f"{elapsed:.1f}s vs harness {bash_guard.HARNESS_HOOK_TIMEOUT_S}s",
+)
+check("leaked-pipe deny names the guard as broken", BROKEN_MARKER in why, why[:160])
+
+# The two cases above are both caught by the dcg subprocess cap, which sits
+# BELOW the whole-hook watchdog in the ladder and therefore always fires
+# first. Proving the watchdog itself works needs the cap removed: inject the
+# fault of an unbounded dcg call and assert a deny still lands in time.
+_no_cap_src = _src.replace("timeout=DCG_TIMEOUT_S,", "timeout=None,  # fault injection")
+check("watchdog fixture actually removed the subprocess cap", _no_cap_src != _src)
+_no_cap_path = os.path.join(SCRATCH, "bash-guard-no-subprocess-cap.py")
+with open(_no_cap_path, "w", encoding="utf-8") as fh:
+    fh.write(_no_cap_src)
+
+t0 = time.monotonic()
+rc, parsed, out, err = run_hook(
+    _no_cap_path, pre_payload("ls -la"), env_extra={"DCG_PATH": STUB_HANG}, timeout=45.0
+)
+elapsed = time.monotonic() - t0
+check(
+    "subprocess cap removed: whole-hook watchdog still denies",
+    decision_of(parsed) == "deny",
+    f"decision={decision_of(parsed)!r}",
+)
+check(
+    "watchdog fires at its own deadline, not the harness's",
+    bash_guard.GUARD_DEADLINE_S - 1 <= elapsed < bash_guard.HARNESS_HOOK_TIMEOUT_S,
+    f"{elapsed:.1f}s (deadline {bash_guard.GUARD_DEADLINE_S}s, "
+    f"harness {bash_guard.HARNESS_HOOK_TIMEOUT_S}s)",
+)
+check(
+    "watchdog deny explains the fail-open trap it is avoiding",
+    "deadline" in reason_of(parsed) and "fail-open" in reason_of(parsed),
+    reason_of(parsed)[:200],
+)
 
 
 # ----------------------------------------------------------------------
