@@ -757,6 +757,9 @@ def response_obj(stdout: str, stderr: str = "", **extra) -> dict:
 SECRETS = [
     ("anthropic-api", "sk-" + "ant-" + "api03-" + "A" * 32),
     ("openai-project", "sk-" + "proj-" + "B" * 32),
+    # Bare sk- prefix: matches only after the two more specific patterns
+    # above have had their turn, which is why pattern order is load-bearing.
+    ("openai-legacy", "sk-" + "K" * 24),
     ("github-token", "gh" + "p_" + "C" * 40),
     ("github-pat", "github" + "_pat_" + "D" * 82),
     ("slack-token", "xo" + "xb-" + "1234567890-abcdefghij"),
@@ -887,6 +890,17 @@ out_guard = importlib.util.module_from_spec(_spec2)
 _spec2.loader.exec_module(out_guard)
 
 WITHHELD_MARKER = "the output guard is BROKEN"
+
+# A redaction pattern with no test row is a pattern nobody has ever watched
+# fire. safe-bash shipped all nine of them with exactly that much evidence.
+_untested_secrets = [
+    label for label, _ in out_guard._SECRET_PATTERNS if label not in {l for l, _ in SECRETS}
+]
+check(
+    "every secret pattern in the guard has a test row",
+    not _untested_secrets,
+    f"untested: {_untested_secrets}",
+)
 
 
 def check_withheld(label: str, parsed, updated) -> None:
