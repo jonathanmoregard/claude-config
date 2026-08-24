@@ -270,7 +270,7 @@
         ]
       },
       {
-        "matcher": "Bash|mcp__safe-bash__exec",
+        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",

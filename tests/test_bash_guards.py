@@ -1521,6 +1521,46 @@ check(
 
 
 # ----------------------------------------------------------------------
+# git-push-merge-check.sh — the advisory sibling of the gate above.
+#
+# It is NOT subsumed by the nixos push gate and the two are not
+# interchangeable; the block comment at the top of the script is where a
+# future reader hits the reasoning, and these assertions are what stop that
+# comment from drifting away from the settings.json it describes.
+# ----------------------------------------------------------------------
+section("git-push-merge-check.sh: matcher no longer names the retired MCP")
+
+_merge_entries = [
+    (entry, hook)
+    for entry in _pre
+    for hook in entry.get("hooks", [])
+    if "git-push-merge-check.sh" in (hook.get("command") or "")
+]
+check("settings.json still registers git-push-merge-check.sh", len(_merge_entries) == 1,
+      f"found {len(_merge_entries)}")
+if _merge_entries:
+    entry, hook = _merge_entries[0]
+    check(
+        "matcher targets the native Bash tool only",
+        entry.get("matcher") == "Bash",
+        f"matcher={entry.get('matcher')!r}",
+    )
+
+with open(os.path.join(HOOKS, "git-push-merge-check.sh"), encoding="utf-8") as fh:
+    _merge_src = fh.read()
+check(
+    "the script itself no longer filters on the retired MCP tool name",
+    "mcp__safe-bash__exec" not in _merge_src,
+    "chunk C deletes mcps/safe-bash/, so the tool name can never arrive again",
+)
+check(
+    "the script records why it survives alongside the hard nixos gate",
+    "bash-guard.py" in _merge_src,
+    "a future reader must be able to tell these two apart without archaeology",
+)
+
+
+# ----------------------------------------------------------------------
 # Summary
 # ----------------------------------------------------------------------
 section("Summary")
