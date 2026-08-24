@@ -603,8 +603,13 @@ def _check_dangerous_find(command: str) -> str | None:
 # the gate still LOOKED present. That is the same silent-disappearance
 # failure as the missing dcg binary. All of those now deny.
 
-NIXOS_WORKTREES_ROOT = "/home/jonathan/Repos/nixos-config-worktrees"
-
+# There is deliberately NO worktree-root path constant in this file, and
+# `tests/test_bash_guard_pre.py` asserts that one never comes back.
+# safe-bash kept one naming the canonical `~/Repos/nixos-config-worktrees`
+# location long after detection had moved to remote-URL matching, and
+# nothing read it. A live-looking constant naming a path the gate never
+# consults is exactly what a future reader trusts.
+#
 # The gate detects a "nixos-config repo" by remote URL, not by filesystem
 # path — so the same gate fires whether the worktree lives at the canonical
 # `~/Repos/nixos-config-worktrees/<slug>/` location or anywhere else

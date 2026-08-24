@@ -473,6 +473,427 @@ check(
     why[:250],
 )
 
+
+# ======================================================================
+# D28 — `NIXOS_WORKTREES_ROOT` must not exist.
+#
+# Dead in safe-bash (detection moved to remote-URL matching years before)
+# and carried into the port verbatim. A live-looking constant naming a path
+# the gate never consults is exactly what a future reader trusts.
+# ======================================================================
+section("bash-guard: dead constants (parity row D28)")
+
+check(
+    "NIXOS_WORKTREES_ROOT is gone from the guard",
+    "NIXOS_WORKTREES_ROOT" not in GUARD_SRC,
+    "dead in safe-bash too; the gate detects nixos-config by remote URL only",
+)
+check(
+    "... and the module does not export it",
+    not hasattr(bash_guard, "NIXOS_WORKTREES_ROOT"),
+)
+
+
+# ======================================================================
+# D — nixos push gate: the sub-cases safe-bash tested and the port did not.
+#
+# Unit-level first (these are safe-bash's own rows, rehomed), then the
+# end-to-end cases against real git repositories.
+# ======================================================================
+section("bash-guard: nixos gate unit predicates (parity rows D3, D4, D6)")
+
+rin = bash_guard._remote_is_nixos_config
+for _label, _url, _want in [
+    ("ssh form", "git@github.com:jonathanmoregard/nixos-config.git", True),
+    ("https form", "https://github.com/jonathanmoregard/nixos-config", True),
+    ("https + .git", "https://github.com/jonathanmoregard/nixos-config.git", True),
+    ("ssh:// form", "ssh://git@github.com/jonathanmoregard/nixos-config.git", True),
+    ("trailing slash", "https://github.com/jonathanmoregard/nixos-config/", True),
+    ("different owner", "git@github.com:someone-else/nixos-config.git", False),
+    ("different repo", "git@github.com:jonathanmoregard/something-else.git", False),
+    # The row the port never carried over. `nixos-config-extras` shares the
+    # whole of `nixos-config` as a prefix; a substring match would gate an
+    # unrelated repo and a future reader would blame the gate, not the match.
+    ("suffix collision: nixos-config-extras",
+     "git@github.com:jonathanmoregard/nixos-config-extras.git", False),
+    ("suffix collision, no .git",
+     "https://github.com/jonathanmoregard/nixos-config-extras", False),
+    ("empty string", "", False),
+]:
+    check(f"remote_is_nixos_config: {_label}", rin(_url) is _want, f"url={_url!r}")
+
+ec = bash_guard._nixos_extract_cd_target
+check("extract_cd: simple chain", ec("cd /a/b && git push") == "/a/b")
+check("extract_cd: last cd wins", ec("cd /a && cd /b && git push") == "/b")
+check("extract_cd: quoted path", ec('cd "/a/b c" && git push') == "/a/b c")
+check(
+    # D3: `_nixos_pipeline_subcommands` strips the subshell parens, or a
+    # `(cd X && git push)` resolves to nothing and the gate never fires.
+    "extract_cd: subshell parens stripped",
+    ec("(cd /a/b && git push)") == "/a/b",
+)
+check("extract_cd: no cd -> None", ec("git push -u origin feat/foo") is None)
+
+cp = bash_guard._nixos_command_pushes
+check("command_pushes: cd chain", cp("cd /x && git push -u origin feat/y") is True)
+check("command_pushes: -C variant", cp("git -C /x push origin feat/y") is True)
+check("command_pushes: flags before push", cp("git --no-pager push origin HEAD") is True)
+check("command_pushes: subshell", cp("(cd /x && git push origin HEAD)") is True)
+check("command_pushes: --dry-run excluded", cp("git push --dry-run origin feat/y") is False)
+check("command_pushes: no push", cp("git status") is False)
+
+pc = bash_guard._nixos_parse_checklist
+_sub_bullet_msg = (
+    "feat: thing\n"
+    "\n"
+    "Pre-push checklist:\n"
+    "- Type: risky\n"
+    "- Rebased on origin/main: yes\n"
+    "- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+    "- Interactive smoke (nixos-agent-testing): yes - exercised path\n"
+    "- Advisor review (advice-refine-test-loop): N/A - small PR\n"
+    "- feature-vm.nix modified: no    # MUST match diff\n"
+    "- Risky markers in diff: sh -c\n"
+    "- Behavioural evidence: ran feature-vm\n"
+    "  - inner cmd: nix run .#feature-vm\n"
+    "  - feature-vm.nix modified: yes\n"
+)
+_parsed = pc(_sub_bullet_msg)
+check("parse_checklist: returns a dict", isinstance(_parsed, dict))
+check(
+    # D12. An indented sub-bullet inside a multi-line value must not
+    # overwrite the parent map, or a `Behavioural evidence` narrative that
+    # happens to quote a field name rewrites the claim being checked.
+    "parse_checklist: indented sub-bullets do NOT overwrite top-level fields",
+    _parsed.get("feature-vm.nix modified") == "no" and "inner cmd" not in _parsed,
+    str(_parsed)[:220],
+)
+check(
+    "parse_checklist: inline '# comment' trimmed from the value",
+    _parsed.get("feature-vm.nix modified") == "no",
+    repr(_parsed.get("feature-vm.nix modified")),
+)
+check("parse_checklist: no header -> None", pc("feat: thing\n\nno trailer here\n") is None)
+
+
+# ----------------------------------------------------------------------
+section("bash-guard: nixos push gate, end-to-end sub-cases")
+
+check("real git is available to build the fixtures", bool(REAL_GIT), f"{REAL_GIT!r}")
+
+
+def _g(repo: str, *args: str) -> str:
+    proc = subprocess.run(
+        ["git", "-C", repo, *args], capture_output=True, text=True, timeout=60
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} in {repo}: {(proc.stderr or '')[:300]}")
+    return proc.stdout
+
+
+def _write_in(repo: str, rel: str, content) -> None:
+    path = os.path.join(repo, rel)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    mode, enc = ("wb", None) if isinstance(content, bytes) else ("w", "utf-8")
+    with open(path, mode, encoding=enc) as fh:
+        fh.write(content)
+
+
+_repo_seq = [0]
+
+
+def make_repo(
+    remote_tail: str = "jonathanmoregard/nixos-config.git",
+    work_subpath: str | None = None,
+) -> str:
+    """A real git clone whose ORIGIN URL tail decides whether the gate fires.
+
+    `work_subpath` places the working tree at a chosen path under the
+    scratch dir, which is how the filesystem-location rows below are staged
+    without going anywhere near the operator's live `~/Repos` tree.
+    """
+    _repo_seq[0] += 1
+    n = str(_repo_seq[0])
+    bare = os.path.join(SCRATCH, "remotes", n, remote_tail)
+    os.makedirs(bare)
+    subprocess.run(
+        ["git", "init", "--bare", "-b", "main", bare], capture_output=True, check=True
+    )
+    work = os.path.join(SCRATCH, work_subpath or os.path.join("work", n))
+    os.makedirs(work, exist_ok=True)
+    _g(work, "init", "-b", "main")
+    _g(work, "config", "user.email", "guard-test@example.invalid")
+    _g(work, "config", "user.name", "guard-test")
+    _g(work, "config", "commit.gpgsign", "false")
+    _g(work, "remote", "add", "origin", bare)
+    _write_in(work, "README.md", "base\n")
+    _g(work, "add", "-A")
+    _g(work, "commit", "-m", "base")
+    _g(work, "push", "-u", "origin", "main")
+    return work
+
+
+def branch_with(work: str, msg: str, files: dict, branch: str = "feature/x") -> str:
+    _g(work, "checkout", "-q", "-b", branch)
+    for rel, content in files.items():
+        _write_in(work, rel, content)
+    _g(work, "add", "-A")
+    _g(work, "commit", "-m", msg)
+    return work
+
+
+def push_guard(
+    work: str,
+    command: str = "git push origin HEAD",
+    dcg: str = STUB_ALLOW,
+    cwd: str | None = None,
+    **kw,
+):
+    env = {"DCG_PATH": dcg}
+    env.update(kw.pop("env_extra", None) or {})
+    _, parsed, _, _ = run_hook(
+        "bash-guard.py",
+        pre_payload(command, cwd=cwd if cwd is not None else work),
+        env_extra=env,
+        **kw,
+    )
+    return decision_of(parsed), reason_of(parsed)
+
+
+CHECKLIST_RISKY = (
+    "feat: a risky change\n"
+    "\n"
+    "Pre-push checklist:\n"
+    "- Type: risky\n"
+    "- Rebased on origin/main: yes\n"
+    "- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+    "- Interactive smoke (nixos-agent-testing): yes - booted the vm, sshd answered\n"
+    "- Advisor review (advice-refine-test-loop): yes - 2 rounds, no blockers\n"
+    "- feature-vm.nix modified: {fv}\n"
+    "- Risky markers in diff: none\n"
+    "- Behavioural evidence: ran the unit, observed it start\n"
+)
+NIX_INERT = "{ }\n"
+
+# --- D6: suffix-collision remote, end to end -------------------------
+w = branch_with(
+    make_repo(remote_tail="jonathanmoregard/nixos-config-extras.git"),
+    "feat: no trailer at all",
+    {"docs/a.md": "x\n"},
+)
+dec, why = push_guard(w)
+check(
+    "suffix-collision remote (nixos-config-extras) is NOT gated",
+    dec is None,
+    f"decision={dec!r} {why[:200]}",
+)
+
+# --- D7: every remote is checked, not just origin --------------------
+w = make_repo(remote_tail="someone-else/unrelated.git")
+_g(w, "remote", "add", "upstream", "git@github.com:jonathanmoregard/nixos-config.git")
+branch_with(w, "feat: no trailer at all", {"docs/a.md": "x\n"})
+dec, why = push_guard(w)
+check(
+    "a nixos-config remote that is NOT origin still gates",
+    dec == "deny" and "Pre-push checklist:" in why,
+    f"decision={dec!r} {why[:200]}",
+)
+
+# --- D8: detection is by remote, never by filesystem path ------------
+w = branch_with(
+    make_repo(work_subpath=os.path.join("somewhere", "entirely", "else")),
+    "feat: no trailer at all",
+    {"docs/a.md": "x\n"},
+)
+dec, why = push_guard(w)
+check(
+    "non-canonical worktree path with a nixos remote -> still gated",
+    dec == "deny" and "Pre-push checklist:" in why,
+    f"decision={dec!r} {why[:200]}",
+)
+
+w = branch_with(
+    make_repo(
+        remote_tail="someone-else/unrelated.git",
+        work_subpath=os.path.join("Repos", "nixos-config-worktrees", "looks-canonical"),
+    ),
+    "feat: no trailer at all",
+    {"docs/a.md": "x\n"},
+)
+dec, why = push_guard(w)
+check(
+    "canonical-LOOKING path with a foreign remote -> NOT gated",
+    dec is None,
+    f"decision={dec!r} {why[:200]}",
+)
+
+# --- D3: subshell form resolves --------------------------------------
+w = branch_with(make_repo(), "feat: no trailer at all", {"docs/a.md": "x\n"})
+dec, why = push_guard(w, command=f"(cd {w} && git push origin HEAD)", cwd=REPO_ROOT)
+check(
+    "`(cd <worktree> && git push)` subshell form -> deny",
+    dec == "deny",
+    f"decision={dec!r} {why[:200]}",
+)
+
+# --- D5: the session cwd on the payload is a probe candidate ---------
+dec, why = push_guard(w, command="git push origin HEAD", cwd=w)
+check(
+    "bare `git push` with the worktree as the payload cwd -> deny",
+    dec == "deny",
+    f"decision={dec!r} {why[:200]}",
+)
+
+# --- D9 complement: `git push origin main` from a feature branch ------
+dec, why = push_guard(w, command="git push origin main", cwd=w)
+check(
+    # safe-bash's case M4. The skip keys off the CURRENT branch, not the
+    # refspec, so a feature branch shoving itself at main is still gated.
+    "`git push origin main` from a feature branch -> still gated",
+    dec == "deny" and "Pre-push checklist:" in why,
+    f"decision={dec!r} {why[:200]}",
+)
+
+# --- D2: flag forms of `git push` -------------------------------------
+dec, why = push_guard(w, command="git --no-pager push origin HEAD", cwd=w)
+check("`git --no-pager push` -> deny", dec == "deny", f"decision={dec!r} {why[:200]}")
+
+# --- D15: every risky marker, not just mkIf ---------------------------
+# The pure-data claim is the cheapest way to make the marker itself the only
+# thing standing between the push and an allow.
+RISKY_MARKERS = [
+    ("mkIf", "{ x = lib.mkIf true 1; }\n"),
+    ("optionals", "{ xs = lib.optionals true [ 1 ]; }\n"),
+    ("ExecStart", "{ serviceConfig.ExecStart = \"/bin/true\"; }\n"),
+    ("writeShellApplication", "{ p = pkgs.writeShellApplication { name = \"x\"; }; }\n"),
+    ("writeShellScriptBin", "{ p = pkgs.writeShellScriptBin \"x\" \"true\"; }\n"),
+    ("pass_selection_to_program", "{ text = \"pass_selection_to_program true\"; }\n"),
+    ("microvm", "{ microvm.vcpu = 2; }\n"),
+    ("virtiofsd", "{ shares = [ { proto = \"virtiofsd\"; } ]; }\n"),
+    ("networking.useDHCP", "{ networking.useDHCP = true; }\n"),
+    ("activationScripts", "{ system.activationScripts.x.text = \"true\"; }\n"),
+    ("systemd.services", "{ systemd.services.x.enable = true; }\n"),
+    ("systemd.timers", "{ systemd.timers.x.enable = true; }\n"),
+    ("systemd.user.services", "{ systemd.user.services.x.enable = true; }\n"),
+    ("sh -c", "{ text = \"sh -c 'true'\"; }\n"),
+    ("bash -c", "{ text = \"bash -c 'true'\"; }\n"),
+]
+_marker_repo = make_repo()
+for _i, (_marker, _body) in enumerate(RISKY_MARKERS):
+    _g(_marker_repo, "checkout", "-q", "main")
+    branch_with(
+        _marker_repo,
+        "chore: bump\n\nPre-push checklist:\n- Type: pure-data\n",
+        {"modules/nixos/thing.nix": _body},
+        branch=f"feature/marker-{_i}",
+    )
+    dec, why = push_guard(_marker_repo)
+    check(
+        f"pure-data claim vs risky marker {_marker!r} -> deny",
+        dec == "deny" and "risky markers" in why,
+        f"decision={dec!r} {why[:220]}",
+    )
+
+# --- D17: pure-data with BOTH problems reports BOTH -------------------
+w = branch_with(
+    make_repo(),
+    "chore: bump\n\nPre-push checklist:\n- Type: pure-data\n",
+    {"modules/nixos/feature-vm.nix": "{ networking.useDHCP = false; }\n"},
+)
+dec, why = push_guard(w)
+check("pure-data with risky markers AND a feature-vm.nix edit -> deny", dec == "deny",
+      f"decision={dec!r}")
+check(
+    # safe-bash's case M1. Reporting only the markers hides the structural
+    # feature-vm.nix signal, which is the PR #61 anti-pattern tell.
+    "... reports BOTH reasons, not just the first",
+    "risky markers" in why and "modules/nixos/feature-vm.nix" in why,
+    why[:300],
+)
+
+# --- D19: each required risky field, one at a time --------------------
+REQUIRED_FIELDS = [
+    ("rebased on origin/main", "- Rebased on origin/main: yes\n"),
+    ("local gate", "- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"),
+    (
+        "interactive smoke (nixos-agent-testing)",
+        "- Interactive smoke (nixos-agent-testing): yes - booted the vm, sshd answered\n",
+    ),
+    (
+        "advisor review (advice-refine-test-loop)",
+        "- Advisor review (advice-refine-test-loop): yes - 2 rounds, no blockers\n",
+    ),
+    ("feature-vm.nix modified", "- feature-vm.nix modified: no\n"),
+    ("risky markers in diff", "- Risky markers in diff: none\n"),
+    ("behavioural evidence", "- Behavioural evidence: ran the unit, observed it start\n"),
+]
+_field_repo = make_repo()
+_full = CHECKLIST_RISKY.format(fv="no")
+for _i, (_key, _line) in enumerate(REQUIRED_FIELDS):
+    _msg = _full.replace(_line, "")
+    _g(_field_repo, "checkout", "-q", "main")
+    branch_with(_field_repo, _msg, {"docs/a.md": f"x{_i}\n"}, branch=f"feature/field-{_i}")
+    dec, why = push_guard(_field_repo)
+    check(
+        f"risky checklist missing {_key!r} -> deny naming it",
+        dec == "deny" and _key in why,
+        f"decision={dec!r} {why[:250]}",
+    )
+
+# --- D21: `N/A - reason` is an acceptable value -----------------------
+# Not every risky PR has a VM path or warrants the advisor loop; a port that
+# rejected N/A would block legitimate hardware-only work, which is a defect
+# in the other direction.
+_na = (
+    "feat: hardware-only touchpad palm rejection\n"
+    "\n"
+    "Pre-push checklist:\n"
+    "- Type: risky\n"
+    "- Rebased on origin/main: yes\n"
+    "- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+    "- Interactive smoke (nixos-agent-testing): N/A - hardware-only, the VM cannot model it\n"
+    "- Advisor review (advice-refine-test-loop): N/A - small contained PR\n"
+    "- feature-vm.nix modified: no\n"
+    "- Risky markers in diff: mkIf\n"
+    "- Behavioural evidence: will verify post-merge with a rollback ready\n"
+)
+w = branch_with(make_repo(), _na, {"modules/nixos/thing.nix": "{ x = lib.mkIf true 1; }\n"})
+dec, why = push_guard(w)
+check("'N/A - reason' for the smoke and advisor fields -> allow", dec is None,
+      f"decision={dec!r} {why[:250]}")
+
+# --- D12 end-to-end: sub-bullets do not rewrite the claim -------------
+_sub = (
+    CHECKLIST_RISKY.format(fv="no").rstrip("\n")
+    + "\n  - inner cmd: nix run .#feature-vm\n"
+    + "  - feature-vm.nix modified: yes\n"
+)
+w = branch_with(make_repo(), _sub, {"modules/nixos/feature-vm.nix": NIX_INERT})
+dec, why = push_guard(w)
+check(
+    "an indented sub-bullet cannot upgrade the 'feature-vm.nix modified' claim",
+    dec == "deny" and "PR #61" in why,
+    f"decision={dec!r} {why[:250]}",
+)
+
+# --- D25: a diff carrying non-UTF-8 bytes must not crash the gate -----
+# `git diff` emits raw bytes for a file it considers text. safe-bash already
+# fixed this once by capturing bytes and decoding with errors="replace";
+# `text=True` would raise UnicodeDecodeError and take the gate down before
+# it could render anything, which the harness reads as no decision at all.
+w = branch_with(
+    make_repo(),
+    "chore: rotate a secret\n\nPre-push checklist:\n- Type: pure-data\n",
+    {"secrets/thing.age": b"-----BEGIN AGE ENCRYPTED FILE-----\n\xff\xfe\xc3\x28 blob\n"},
+)
+dec, why = push_guard(w)
+check(
+    "a diff containing invalid UTF-8 does not break the gate",
+    dec is None,
+    f"decision={dec!r} {why[:250]}",
+)
+
+
 # ----------------------------------------------------------------------
 section("Summary")
 shutil.rmtree(SCRATCH, ignore_errors=True)
