@@ -562,6 +562,47 @@ def matched_by(rule: str, command: str) -> bool:
     return any(oracle_match(content, t) for t in targets)
 
 
+# Rehomed from test_safe_bash.py's matchWildcardPattern section. These now
+# validate the oracle rather than a runtime matcher — an oracle that drifted
+# permissive would let a mangled rule pass the per-rule checks below.
+check("sudo * matches 'sudo rm'", oracle_match("sudo *", "sudo rm"))
+check("sudo * matches bare 'sudo' (trailing ' *' optional)", oracle_match("sudo *", "sudo"))
+check("sudo * does NOT match 'ls -la'", not oracle_match("sudo *", "ls -la"))
+check("exact 'sudo' matches 'sudo'", oracle_match("sudo", "sudo"))
+check("exact 'sudo' does NOT match 'sudo rm'", not oracle_match("sudo", "sudo rm"))
+check(r"'echo \*' matches literal 'echo *'", oracle_match(r"echo \*", "echo *"))
+check(r"'echo \*' does NOT match 'echo foo'", not oracle_match(r"echo \*", "echo foo"))
+check(
+    "'docker inspect*research-agent*' matches compound",
+    oracle_match("docker inspect*research-agent*", "docker inspect abc research-agent 123"),
+)
+check(
+    "'docker inspect*research-agent*' does NOT match bare 'docker inspect'",
+    not oracle_match("docker inspect*research-agent*", "docker inspect"),
+)
+check("'curl *|bash*' matches 'curl url|bash'", oracle_match("curl *|bash*", "curl url|bash"))
+check("'mkfs.*' matches 'mkfs.ext4 /dev/sda'", oracle_match("mkfs.*", "mkfs.ext4 /dev/sda"))
+check(
+    "'* BLOCKED_TEST_COMPOUND *' matches 'x BLOCKED_TEST_COMPOUND y'",
+    oracle_match("* BLOCKED_TEST_COMPOUND *", "x BLOCKED_TEST_COMPOUND y"),
+)
+
+# Rehomed from test_safe_bash.py's pipeline_subcommands section. The find
+# layer in bash-guard.py evaluates each subcommand separately, so a chain
+# like `find /a -name X | ls; find /b -delete` flags only the second find.
+ps = bash_guard._pipeline_subcommands
+check("&& splits", ps("a && b") == ["a", "b"])
+check("|| splits", ps("a || b") == ["a", "b"])
+check("; splits", ps("a;b") == ["a", "b"])
+check("| splits (single-char)", ps("a | b") == ["a", "b"])
+check("& splits", ps("a & b") == ["a", "b"])
+check("newline splits", ps("a\nb") == ["a", "b"])
+check("quoted && stays intact", ps("echo 'a && b'") == ["echo 'a && b'"])
+check("quoted ; stays intact", ps('echo "a;b"') == ['echo "a;b"'])
+check("mixed ops", ps("a && b ; c || d") == ["a", "b", "c", "d"])
+check("escaped & stays intact", ps(r"echo \& x") == [r"echo \& x"])
+
+
 # (rule, the command the rule was written to stop). One row per ported rule.
 PORTED_RULES: list[tuple[str, str]] = [
     ("Bash(sudo)", "sudo"),
