@@ -9,11 +9,13 @@ Layers, in order:
 
   1. ``dcg`` (destructive-command guard, a Rust binary speaking hook JSON)
   2. ``find ... -delete`` with no filter predicate
-  3. the nixos-config push gate (``Pre-push checklist:`` trailer, with its
+  3. a network fetch piped into a shell (``curl ... | bash``) — the intent of
+     six ported deny rules that the CLI's matcher structurally cannot enforce
+  4. the nixos-config push gate (``Pre-push checklist:`` trailer, with its
      claim-vs-diff and merge-base cross-checks)
-  4. allow — by emitting NOTHING
+  5. allow — by emitting NOTHING
 
-Layer 4 is silent on purpose. ``PreToolUse`` fires BEFORE the permission
+Layer 5 is silent on purpose. ``PreToolUse`` fires BEFORE the permission
 system, so returning ``permissionDecision: "allow"`` would bypass every
 ``permissions.deny`` rule in settings.json — including the ``Bash(...)``
 globs this migration ported there. A hook that has nothing to say must say
@@ -37,6 +39,8 @@ guard can fail to reach a verdict now DENIES:
   * dcg exited non-zero without rendering a decision
   * dcg rendered a decision value the guard does not understand
   * hook stdin was unparseable, or carried no command to check
+  * a pipeline stage downstream of a network fetch could not be tokenised, so
+    the guard could not tell whether the fetch feeds a shell
   * the nixos push gate could not run a git command it needed (git absent,
     hung, or refused by the OS), could not read the HEAD commit message,
     could not diff the branch against either origin/main or main, or could
@@ -470,13 +474,15 @@ def _check_dcg(command: str) -> str | None:
 # Layer 2: find ... -delete with no filter predicate
 # (ported verbatim from mcps/safe-bash/server.py, incident text included)
 # ----------------------------------------------------------------------
-def _pipeline_subcommands(cmd: str) -> list[str]:
-    """Split a full command into operator-separated subcommands.
+def _split_operators(cmd: str) -> list[tuple[str, str]]:
+    """`(segment, the operator that terminated it)`, quote-aware.
 
-    Split on `&&`, `||`, `;`, `|`, `&` and newlines, respecting quotes, so
-    each `find` invocation in a chain is evaluated independently.
+    Operators are `&&`, `||`, `;`, `|`, `&` and newline; the last segment
+    carries `""`. The operator matters to layer 3, which has to tell a pipe
+    from an `&&` — `curl … | bash` feeds a shell untrusted bytes, and
+    `curl … && bash x.sh` does not.
     """
-    parts: list[str] = []
+    parts: list[tuple[str, str]] = []
     current: list[str] = []
     i = 0
     s = cmd
@@ -500,20 +506,29 @@ def _pipeline_subcommands(cmd: str) -> list[str]:
             continue
         if not in_single and not in_double:
             if s[i : i + 2] in ("&&", "||"):
-                parts.append("".join(current).strip())
+                parts.append(("".join(current).strip(), s[i : i + 2]))
                 current = []
                 i += 2
                 continue
             if ch in (";", "|", "&", "\n"):
-                parts.append("".join(current).strip())
+                parts.append(("".join(current).strip(), ch))
                 current = []
                 i += 1
                 continue
         current.append(ch)
         i += 1
     if current:
-        parts.append("".join(current).strip())
-    return [p for p in parts if p]
+        parts.append(("".join(current).strip(), ""))
+    return parts
+
+
+def _pipeline_subcommands(cmd: str) -> list[str]:
+    """Split a full command into operator-separated subcommands.
+
+    Split on `&&`, `||`, `;`, `|`, `&` and newlines, respecting quotes, so
+    each `find` invocation in a chain is evaluated independently.
+    """
+    return [seg for seg, _op in _split_operators(cmd) if seg]
 
 
 # The danger isn't `-delete` per se — it's `-delete` without any predicate
@@ -701,7 +716,209 @@ def _check_dangerous_find(command: str) -> str | None:
 
 
 # ----------------------------------------------------------------------
-# Layer 3: the nixos-config push gate
+# Layer 3: a network fetch piped into a shell interpreter
+#
+# This layer is the intent of six ported deny rules — `Bash(curl *|bash*)`,
+# `Bash(curl *| bash*)`, `Bash(curl *|sh*)`, `Bash(curl *| sh*)`,
+# `Bash(wget *|bash*)`, `Bash(wget *| bash*)` — none of which could ever fire.
+# MEASURED against the shipped bundle, not reasoned: Claude Code consults the
+# deny list twice, and the pass that is offered the WHOLE command string
+# returns false for every wildcard rule (`case"wildcard":if(r==="exact")
+# return!1` inside `Fjs`). Wildcard rules therefore only ever see individual
+# subcommands, and no subcommand of `curl … | bash` contains the pipe. The six
+# rules read as protection and stopped nothing.
+# `tests/test_deny_globs.py` lifts that matcher out of the bundle and pins it.
+#
+# D3 re-expressed the family at the SINK (`Bash(bash)`, `Bash(sh)`,
+# `Bash(bash -s*)`, `Bash(sh -s*)`), which the matcher CAN enforce, and those
+# rules stay: they stop the three canonical spellings without this hook. What
+# they cannot reach — measured against the same lifted matcher, all ALLOWED by
+# the complete deny list — is `| bash -`, `| sh -`, `| bash -e`,
+# `| bash /dev/stdin`, `| zsh`, `| dash`, `| ksh`, `| tee x.sh | bash -`.
+# Chasing those with more rules is whack-a-mole, and the one rule that would
+# cover them (`Bash(bash -*)`) refuses `bash -n <script>`, which this repo's
+# own smoke suite runs. A `Bash(...)` rule matches a STRING; the shape here is
+# a relation between two stages of a pipeline, and only something holding the
+# whole command string can see it. The hook holds it.
+#
+# Deliberately NOT done, and why:
+#   * No descent into arbitrary multi-word tokens. The `-delete` layer does
+#     that, because a token containing `-delete` is executable-shaped wherever
+#     it sits. Here it would deny `git commit -m "never run curl url | bash"`,
+#     which is the over-broad-literal defect (`*aut*review*`, retired in D3)
+#     wearing a new costume. `$( )` and backtick bodies ARE descended into:
+#     those are executed by definition.
+#   * Shell sinks only. `curl … | python3 -` is the same threat class, but the
+#     rules being replaced named shells, and widening the policy is the
+#     operator's call, not this port's.
+#   * `curl … > x.sh && bash x.sh` is NOT caught, by anyone. Catching it means
+#     refusing `bash <script>`, and `bash tests/smoke.sh` has to keep working.
+# ----------------------------------------------------------------------
+#
+# The fetch vocabulary is the same set `hooks/bash-output-guard.py` treats as
+# untrusted external content (`untrusted_ingress_single` in
+# hooks/bash-guard-config.json), so "output the model must not trust" and
+# "output that must not reach a shell" cannot drift apart. It is duplicated
+# here rather than read from that file on purpose: making the PreToolUse guard
+# depend on a config file would add a whole new way for it to fail to reach a
+# verdict, and every one of those has to become a deny. The test suite asserts
+# the two sets are equal instead.
+_PIPE_SOURCE_COMMANDS = frozenset({"curl", "wget", "npx"})
+
+# The six rules named `bash` and `sh`. The rest are the same sink under a
+# different spelling — the omission was an inconsistency, not a decision, the
+# same one that let `/usr/bin/find … -delete` past the layer above.
+_PIPE_SHELL_SINKS = frozenset({"sh", "bash", "dash", "zsh", "ksh", "ash", "mksh"})
+
+# Words that stand in front of the program actually being run. Their own flags
+# are skipped with them, so `sudo -E bash` resolves to `bash`.
+_PIPE_WRAPPERS = frozenset(
+    {"sudo", "doas", "env", "command", "exec", "nohup", "time", "nice", "ionice",
+     "setsid", "stdbuf"}
+)
+
+_ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+# A stage whose head cannot be read at all. Distinct from "" (empty stage), so
+# the caller can deny on it rather than treating it as "no shell here".
+_UNREADABLE_HEAD = "\x00unreadable\x00"
+
+_PIPE_TO_SHELL_HINT = (
+    "{src} ... | {sink} denied: this pipes bytes fetched over the network "
+    "straight into a shell interpreter, which executes whatever the far end "
+    "sent. Nothing between the fetch and the execution ever reads it — not the "
+    "agent, not the operator.\n"
+    "This is the intent of six deny rules (`Bash(curl *|bash*)` and its "
+    "spellings) that were MEASURED to stop nothing: Claude Code offers the "
+    "whole command string only to exact- and prefix-type rules, so a wildcard "
+    "pattern spanning a pipe is never matched against it.\n"
+    "Instead: fetch to a file, READ the file, then run it deliberately —\n"
+    "  curl -fsSL URL -o /tmp/install.sh\n"
+    "  # read /tmp/install.sh, then:\n"
+    "  bash /tmp/install.sh\n"
+    "To run it anyway, run it yourself in the prompt with `! <command>`."
+)
+
+_PIPE_UNPARSEABLE_HINT = (
+    "denied: this pipeline starts with a network fetch ({src}) and a later "
+    "stage cannot be tokenised (unbalanced quote, or similar), so the guard "
+    "cannot tell whether the fetched bytes are being piped into a shell.\n"
+    "An unanalysable pipe out of a fetch is refused rather than waved through "
+    "— \"the guard could not look\" must not render the same as \"the guard "
+    "found nothing to object to\".\n"
+    "Balance the quotes so the command parses, or run it yourself in the "
+    "prompt with `! <command>`."
+)
+
+
+def _pipe_stages(command: str) -> list[list[str]]:
+    """Group top-level segments into pipelines.
+
+    `a | b && c | d` -> `[["a", "b"], ["c", "d"]]`. Only `|` continues a
+    pipeline; `&&`, `||`, `;`, `&` and newline end one. `||` is consumed as a
+    single operator by `_split_operators`, so it is never read as a pipe.
+    """
+    pipelines: list[list[str]] = []
+    current: list[str] = []
+    for seg, op in _split_operators(command):
+        current.append(seg)
+        if op != "|":
+            pipelines.append(current)
+            current = []
+    if current:
+        pipelines.append(current)
+    return [[s for s in p if s] for p in pipelines if any(s for s in p)]
+
+
+def _stage_head(stage: str) -> str:
+    """Basename of the program a pipeline stage runs.
+
+    `""` for an empty stage, `_UNREADABLE_HEAD` when the stage will not
+    tokenise. Subshell parens are stripped (`(curl x` -> `curl x`), leading
+    `VAR=value` assignments and wrapper words are skipped, and the result is
+    basenamed so `/bin/bash` reads as `bash`.
+    """
+    s = stage.strip()
+    while s.startswith("("):
+        s = s[1:].lstrip()
+    while s.endswith(")"):
+        s = s[:-1].rstrip()
+    if not s:
+        return ""
+    try:
+        tokens = shlex.split(s)
+    except ValueError:
+        return _UNREADABLE_HEAD
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if _ENV_ASSIGNMENT.match(token):
+            i += 1
+            continue
+        if os.path.basename(token) in _PIPE_WRAPPERS:
+            i += 1
+            while i < len(tokens) and tokens[i].startswith("-"):
+                i += 1
+            continue
+        return os.path.basename(token)
+    return ""
+
+
+def _pipe_fragments(command: str) -> list[str]:
+    """`command`, plus every `$( )` / backtick body nested inside it.
+
+    A substitution body is executed by definition, so `echo $(curl … | bash)`
+    is the same command wearing a hat. Unlike the `-delete` layer this does
+    NOT descend into multi-word tokens — see the header: that would refuse
+    ordinary commit subjects quoting the shape.
+
+    Shares the fragment cap with that layer for the same reason: a command
+    nested deeper than this is not one the guard can reason about, and the
+    whole-hook watchdog is the backstop.
+    """
+    frags: list[str] = []
+    seen: set[str] = set()
+    queue: list[str] = [command]
+    while queue and len(frags) < _MAX_FIND_FRAGMENTS:
+        s = queue.pop(0)
+        if s in seen:
+            continue
+        seen.add(s)
+        frags.append(s)
+        queue.extend(_command_substitutions(s))
+    return frags
+
+
+def _check_pipe_to_shell(command: str) -> str | None:
+    """Detect a network fetch feeding a shell interpreter in one pipeline.
+
+    Denies: `curl … | bash` and every spelling of it, including through a
+    later stage (`| tee x | bash`), a wrapper (`| sudo bash`), an absolute
+    path (`| /bin/bash`), a subshell, or a command substitution.
+    Allows: a fetch that feeds anything else (`| jq`, `| grep bash`), a shell
+    fed from a local file (`cat x.sh | bash` — nothing untrusted arrived), and
+    the shape quoted inside a string, where no shell ever sees the pipe.
+    """
+    for frag in _pipe_fragments(command):
+        for stages in _pipe_stages(frag):
+            if len(stages) < 2:
+                continue
+            heads = [_stage_head(s) for s in stages]
+            for i, head in enumerate(heads):
+                if head not in _PIPE_SOURCE_COMMANDS:
+                    continue
+                for downstream in heads[i + 1 :]:
+                    if downstream in _PIPE_SHELL_SINKS:
+                        return "bash-guard: " + _PIPE_TO_SHELL_HINT.format(
+                            src=head, sink=downstream
+                        )
+                    if downstream == _UNREADABLE_HEAD:
+                        return "bash-guard: " + _PIPE_UNPARSEABLE_HINT.format(src=head)
+    return None
+
+
+# ----------------------------------------------------------------------
+# Layer 4: the nixos-config push gate
 # (ported from `_check_nixos_push` in mcps/safe-bash/server.py, which chunk
 # C deletes; the incident texts below are the behaviour, not decoration)
 # ----------------------------------------------------------------------
@@ -1249,6 +1466,8 @@ def main() -> int:
     reason = _check_dcg(command)
     if reason is None:
         reason = _check_dangerous_find(command)
+    if reason is None:
+        reason = _check_pipe_to_shell(command)
     if reason is None:
         reason = _check_nixos_push(command, cwd if isinstance(cwd, str) else None)
         if reason is not None:
