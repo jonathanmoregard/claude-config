@@ -246,8 +246,27 @@ def _check_dcg(command: str) -> str | None:
     except (OSError, ValueError, UnicodeDecodeError) as exc:
         _fail_closed(f"dcg could not be invoked: {type(exc).__name__}: {exc}")
 
-    # Contract: dcg emits a JSON object on stdout only when it wants to
-    # block, optionally preceded by decorative lines. Silence means allow.
+    # THE VERDICT IS THE STDOUT JSON. NEVER THE EXIT STATUS.
+    #
+    # Measured against the packaged binary (dcg 0.12.5, rev d921fe84, the
+    # rev nixos-config pins):
+    #   * stdout carries exactly ONE line — the JSON decision — and only
+    #     when dcg denies. An allow produces no stdout at all.
+    #   * the decorated BLOCKED banner goes to stderr, not stdout.
+    #   * hook mode exits 0 for a deny AND for an allow. Upstream's
+    #     `EXIT_DENIED = 1` (src/exit_codes.rs) governs the CLI
+    #     subcommands, not the stdin hook path. Anything inferring the
+    #     verdict from the exit code reads every deny as an allow.
+    #
+    # safe-bash's comment claimed the banner preceded the JSON on stdout,
+    # and it scanned in REVERSE so the last `{` line won. This port scanned
+    # FORWARD, so the first won. Both were guesses about a shape neither
+    # had measured, and they fail in opposite directions the moment dcg
+    # emits more than one JSON line. Every `{` line is now inspected and a
+    # deny ANYWHERE wins: direction-independent, and fail-closed whichever
+    # way a future dcg orders its output.
+    deny_reason: str | None = None
+    saw_allow = False
     for line in (proc.stdout or "").splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -262,26 +281,36 @@ def _check_dcg(command: str) -> str | None:
         hook_out = (data.get("hookSpecificOutput") or {}) if isinstance(data, dict) else {}
         verdict = hook_out.get("permissionDecision")
         if verdict == "deny":
-            rule = hook_out.get("ruleId") or "unknown"
-            why = hook_out.get("permissionDecisionReason") or ""
-            return (
-                f"bash-guard: dcg blocked this command (rule: {rule}).\n"
-                f"{why}\n"
-                "This is dcg working as intended, not a broken guard. To run it "
-                "anyway, run it yourself in the prompt with `! <command>`."
-            ).strip()
+            if deny_reason is None:
+                rule = hook_out.get("ruleId") or "unknown"
+                why = hook_out.get("permissionDecisionReason") or ""
+                deny_reason = (
+                    f"bash-guard: dcg blocked this command (rule: {rule}).\n"
+                    f"{why}\n"
+                    "This is dcg working as intended, not a broken guard. To run it "
+                    "anyway, run it yourself in the prompt with `! <command>`."
+                ).strip()
+            continue
         if verdict == "allow":
-            return None
+            saw_allow = True
+            continue
         _fail_closed(
             "dcg rendered a permissionDecision this guard does not understand: "
             f"{verdict!r}"
         )
 
-    # No decision rendered. Exit 0 is dcg's documented "allow"; anything
-    # else means it fell over on the way to an answer.
+    if deny_reason is not None:
+        return deny_reason
+
+    # No deny rendered. Exit 0 is dcg's allow — for a silent run and for an
+    # explicit `"allow"` alike. Any other status means dcg fell over, and a
+    # rendered allow does not excuse that: the allow speaks for dcg's rules,
+    # not for dcg having survived the call.
     if proc.returncode != 0:
         _fail_closed(
-            f"dcg exited {proc.returncode} without rendering a decision"
+            f"dcg exited {proc.returncode} without rendering a deny"
+            + (" (it did render an allow, which does not vouch for the exit status)"
+               if saw_allow else "")
             + (f" (stderr: {(proc.stderr or '').strip()[:160]!r})" if proc.stderr else "")
         )
     return None

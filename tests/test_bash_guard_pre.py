@@ -322,6 +322,157 @@ check(
     f"decision={dec!r} {why[:200]}",
 )
 
+
+# ======================================================================
+# B11 — which way dcg's stdout is scanned.
+#
+# Measured against the packaged binary (dcg 0.12.5, the rev nixos-config
+# pins): stdout carries exactly ONE line, the JSON decision, and only when
+# denying; the decorated banner goes to STDERR; the exit status is 0 either
+# way. safe-bash's comment said the banner preceded the JSON on stdout and
+# it scanned in reverse; this port scans forward. Both are guesses about a
+# shape neither had measured, and they disagree in opposite directions.
+#
+# The pair below is the pin. Forward-only fails the first, reverse-only
+# fails the second.
+# ======================================================================
+section("bash-guard: dcg stdout scan is direction-independent (parity row B11)")
+
+dec, why = guard("rm -rf /", dcg=STUB_ALLOW_THEN_DENY)
+check(
+    "deny rendered AFTER an allow still denies (a forward-only scan misses it)",
+    dec == "deny",
+    f"decision={dec!r} {why[:200]}",
+)
+check("... surfaces the late rule id", "late-deny" in why, why[:200])
+
+dec, why = guard("rm -rf /", dcg=STUB_DENY_THEN_ALLOW)
+check(
+    "deny rendered BEFORE an allow still denies (a reverse-only scan misses it)",
+    dec == "deny",
+    f"decision={dec!r} {why[:200]}",
+)
+check("... surfaces the early rule id", "early-deny" in why, why[:200])
+
+check(
+    "the scan direction is recorded against the MEASURED dcg contract",
+    "stderr" in GUARD_SRC.lower() and "0.12.5" in GUARD_SRC,
+    "a future reader must find the measurement, not another guess",
+)
+
+
+# ======================================================================
+# B14 — dcg rendering an explicit `permissionDecision: "allow"`.
+# Exercised nowhere before: every allow-path stub exits silently.
+# ======================================================================
+section("bash-guard: dcg explicit allow verdict (parity row B14)")
+
+rc, parsed, out, err = run_hook(
+    "bash-guard.py", pre_payload("ls -la"), env_extra={"DCG_PATH": STUB_EXPLICIT_ALLOW}
+)
+check(
+    "explicit allow verdict -> hook stays silent",
+    rc == 0 and out.strip() == "",
+    f"rc={rc} stdout={out[:200]!r}",
+)
+
+# An explicit allow from dcg must not smother the later layers — it is dcg's
+# verdict on dcg's rules, not a verdict on the whole guard.
+dec, why = guard("find /tmp/x -delete", dcg=STUB_EXPLICIT_ALLOW)
+check(
+    "explicit allow from dcg does not short-circuit the find layer",
+    dec == "deny" and FIND_INCIDENT in why,
+    f"decision={dec!r} {why[:200]}",
+)
+
+
+# ======================================================================
+# dcg's verdict is the stdout JSON, never the exit status.
+#
+# Measured against the packaged binary (rev d921fe84, tag v0.12.5): hook
+# mode exits 0 on a deny AND on an allow. Upstream's `EXIT_DENIED = 1`
+# (src/exit_codes.rs) governs the CLI subcommands, not the stdin hook path.
+# A guard that inferred the verdict from the exit code would read every
+# single deny as an allow.
+# ======================================================================
+section("bash-guard: dcg's verdict is stdout, not the exit status")
+
+dec, why = guard("rm -rf /", dcg=STUB_DENY_EXIT0)
+check(
+    "dcg denying while exiting 0 -> deny",
+    dec == "deny",
+    f"decision={dec!r} — exit 0 is dcg's hook-mode status for a DENY too",
+)
+check(
+    "... surfaces dcg's rule id and reason rather than an exit code",
+    "core.filesystem:rm-rf-root-home" in why and "rm -rf on root" in why,
+    why[:220],
+)
+check("... and is not reported as a broken guard", BROKEN_MARKER not in why, why[:160])
+
+rc, parsed, out, err = run_hook(
+    "bash-guard.py", pre_payload("ls -la"), env_extra={"DCG_PATH": STUB_SILENT_EXIT0}
+)
+check(
+    "exit 0 with no payload is dcg's allow -> hook stays silent",
+    rc == 0 and out.strip() == "",
+    f"rc={rc} stdout={out[:200]!r}",
+)
+
+dec, why = guard("ls -la", dcg=STUB_ALLOW_EXIT_NONZERO)
+check(
+    # An exit status the guard cannot interpret must still deny; a rendered
+    # allow speaks for dcg's rules, not for dcg having survived the call.
+    "explicit allow alongside a fault exit -> deny",
+    dec == "deny",
+    f"decision={dec!r} {why[:200]}",
+)
+check("... reported as a broken guard", BROKEN_MARKER in why, why[:220])
+
+
+# ======================================================================
+# B3 — how the dcg path is resolved when DCG_PATH is not set.
+# Both fallback branches are new code that no test reached.
+# ======================================================================
+section("bash-guard: dcg path resolution fallbacks (parity row B3)")
+
+# PATH containing a `dcg` that denies. If `shutil.which` is consulted we get
+# that deny; if the guard skipped straight to the legacy path we would get a
+# broken-guard deny instead, since the legacy path does not exist here.
+_which_bin = os.path.join(SCRATCH, "which-bin")
+_write_stub(
+    "which-bin/dcg",
+    "cat >/dev/null\n" f"echo '{_deny_line(rule='via-PATH', why='resolved through PATH')}'\n",
+)
+dec, why = guard("rm -rf /", env_extra={"DCG_PATH": "", "PATH": _which_bin})
+check(
+    "DCG_PATH unset -> dcg is resolved through PATH",
+    dec == "deny" and "via-PATH" in why,
+    f"decision={dec!r} {why[:200]}",
+)
+check(
+    "... and that is dcg's verdict, not a broken guard",
+    BROKEN_MARKER not in why,
+    why[:160],
+)
+
+# PATH with no `dcg` at all -> the historical install location, which is
+# absent on every host since the NixOS migration. That must be a deny that
+# NAMES the path, which is the symptom the four-month outage never produced.
+_empty_bin = os.path.join(SCRATCH, "empty-bin")
+os.makedirs(_empty_bin, exist_ok=True)
+dec, why = guard("ls -la", env_extra={"DCG_PATH": "", "PATH": _empty_bin})
+check(
+    "DCG_PATH unset and no dcg on PATH -> deny",
+    dec == "deny",
+    f"decision={dec!r} {why[:200]}",
+)
+check(
+    "... names the legacy install path it fell back to",
+    bash_guard.LEGACY_DCG_PATH in why and BROKEN_MARKER in why,
+    why[:250],
+)
+
 # ----------------------------------------------------------------------
 section("Summary")
 shutil.rmtree(SCRATCH, ignore_errors=True)
