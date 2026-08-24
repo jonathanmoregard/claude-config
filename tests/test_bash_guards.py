@@ -157,10 +157,10 @@ def run_hook(
     return proc.returncode, parsed, proc.stdout, proc.stderr
 
 
-def pre_payload(command: str) -> dict:
+def pre_payload(command: str, cwd: str = REPO_ROOT) -> dict:
     return {
         "session_id": "test-session",
-        "cwd": REPO_ROOT,
+        "cwd": cwd,
         "hook_event_name": "PreToolUse",
         "tool_name": "Bash",
         "tool_input": {"command": command},
@@ -383,6 +383,14 @@ check(
     f"{bash_guard.DCG_TIMEOUT_S} / {bash_guard.GUARD_DEADLINE_S} / "
     f"{bash_guard.HARNESS_HOOK_TIMEOUT_S}",
 )
+check(
+    # The nixos push gate shells out to git. Its per-call cap belongs on the
+    # same ladder, or a slow git would run the hook into the harness timeout
+    # and render no decision at all.
+    "ladder holds: 0 < NIXOS_GIT_TIMEOUT_S < GUARD_DEADLINE_S",
+    0 < bash_guard.NIXOS_GIT_TIMEOUT_S < bash_guard.GUARD_DEADLINE_S,
+    f"{bash_guard.NIXOS_GIT_TIMEOUT_S} / {bash_guard.GUARD_DEADLINE_S}",
+)
 
 with open(os.path.join(REPO_ROOT, "settings.json"), encoding="utf-8") as fh:
     SETTINGS = json.load(fh)
@@ -443,6 +451,24 @@ check(
     "inverted ladder -> reason names the ladder",
     "ladder" in reason_of(parsed),
     reason_of(parsed)[:200],
+)
+
+# Same, for the git cap the nixos push gate added to the ladder.
+_git_inverted_src = _src.replace(
+    "NIXOS_GIT_TIMEOUT_S = 4",
+    "NIXOS_GIT_TIMEOUT_S = HARNESS_HOOK_TIMEOUT_S + 5  # inverted on purpose",
+)
+check("git-cap inversion fixture actually patched the source", _git_inverted_src != _src)
+_git_inverted_path = os.path.join(SCRATCH, "bash-guard-git-cap-inverted.py")
+with open(_git_inverted_path, "w", encoding="utf-8") as fh:
+    fh.write(_git_inverted_src)
+rc, parsed, out, err = run_hook(
+    _git_inverted_path, pre_payload("ls -la"), env_extra={"DCG_PATH": STUB_ALLOW}
+)
+check(
+    "inverted git cap -> deny",
+    decision_of(parsed) == "deny",
+    f"decision={decision_of(parsed)!r}",
 )
 
 # A dcg that leaks its stdout/stderr pipes to a process surviving the kill —
@@ -1075,6 +1101,423 @@ _health_entries = [
 ]
 check("settings.json registers bash-guard-health.py on SessionStart",
       len(_health_entries) == 1, f"found {len(_health_entries)}")
+
+
+# ----------------------------------------------------------------------
+# nixos-config push gate.
+#
+# Ported from `_check_nixos_push` in mcps/safe-bash/server.py, which chunk C
+# deletes along with the rest of the MCP. It was written after PR #57 and
+# PR #61 each shipped a broken deploy to dellan despite the SessionStart
+# prose and the nixos-config-dev skills: the agent equated "build green"
+# with "feature works". The gate is the enforcement layer the prose isn't.
+#
+# These run against REAL git repositories built in the scratch dir, with a
+# remote URL that identifies them as nixos-config. Nothing is mocked — the
+# gate's whole job is to read git state, so a mocked git would test nothing.
+# ----------------------------------------------------------------------
+section("bash-guard: nixos-config push gate")
+
+_REAL_GIT = shutil.which("git")
+check("real git is available to build the fixtures", bool(_REAL_GIT), f"{_REAL_GIT!r}")
+
+
+def _g(repo: str, *args: str) -> str:
+    proc = subprocess.run(
+        ["git", "-C", repo, *args], capture_output=True, text=True, timeout=60
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} in {repo}: {(proc.stderr or '')[:300]}")
+    return proc.stdout
+
+
+def _write_in(repo: str, rel: str, content: str) -> None:
+    path = os.path.join(repo, rel)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(content)
+
+
+_repo_seq = [0]
+
+
+def make_repo(remote_tail: str = "jonathanmoregard/nixos-config.git", commit: bool = True) -> str:
+    """A real git clone whose origin URL tail decides whether the gate fires.
+
+    Detection is by remote URL, never by filesystem path — so these live
+    under the scratch dir, nowhere near ~/Repos/nixos-config-worktrees/, and
+    must still gate.
+    """
+    _repo_seq[0] += 1
+    n = str(_repo_seq[0])
+    bare = os.path.join(SCRATCH, "remotes", n, remote_tail)
+    os.makedirs(bare)
+    subprocess.run(
+        ["git", "init", "--bare", "-b", "main", bare], capture_output=True, check=True
+    )
+    work = os.path.join(SCRATCH, "work", n)
+    os.makedirs(work)
+    _g(work, "init", "-b", "main")
+    _g(work, "config", "user.email", "guard-test@example.invalid")
+    _g(work, "config", "user.name", "guard-test")
+    _g(work, "config", "commit.gpgsign", "false")
+    _g(work, "remote", "add", "origin", bare)
+    if commit:
+        _write_in(work, "README.md", "base\n")
+        _g(work, "add", "-A")
+        _g(work, "commit", "-m", "base")
+        _g(work, "push", "-u", "origin", "main")
+    return work
+
+
+def branch_with(work: str, msg: str, files: dict) -> str:
+    _g(work, "checkout", "-q", "-b", "feature/x")
+    for rel, content in files.items():
+        _write_in(work, rel, content)
+    _g(work, "add", "-A")
+    _g(work, "commit", "-m", msg)
+    return work
+
+
+def advance_origin_main(work: str) -> None:
+    """Move origin/main forward so the branch is genuinely behind it."""
+    _g(work, "checkout", "-q", "main")
+    _write_in(work, "later.md", "main moved on\n")
+    _g(work, "add", "-A")
+    _g(work, "commit", "-m", "main moves on")
+    _g(work, "push", "origin", "main")
+    _g(work, "checkout", "-q", "feature/x")
+
+
+def push_guard(
+    work: str,
+    command: str = "git push origin HEAD",
+    dcg: str = STUB_ALLOW,
+    cwd: str | None = None,
+    env_extra: dict | None = None,
+    **kw,
+):
+    env = {"DCG_PATH": dcg}
+    env.update(env_extra or {})
+    rc, parsed, out, err = run_hook(
+        "bash-guard.py",
+        pre_payload(command, cwd=cwd if cwd is not None else work),
+        env_extra=env,
+        **kw,
+    )
+    return decision_of(parsed), reason_of(parsed)
+
+
+# The `Pre-push checklist:` trailer the gate demands, as the template in the
+# help text renders it once filled. `{fv}` is the feature-vm.nix claim, which
+# the gate cross-checks against the real diff.
+CHECKLIST_RISKY = (
+    "feat: a risky change\n"
+    "\n"
+    "Pre-push checklist:\n"
+    "- Type: risky\n"
+    "- Rebased on origin/main: yes\n"
+    "- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+    "- Interactive smoke (nixos-agent-testing): yes - booted the vm, sshd answered\n"
+    "- Advisor review (advice-refine-test-loop): yes - 2 rounds, no blockers\n"
+    "- feature-vm.nix modified: {fv}\n"
+    "- Risky markers in diff: none\n"
+    "- Behavioural evidence: ran the unit, observed it start\n"
+)
+
+NIX_MKIF = "{ config, lib, ... }:\n{\n  services.x.enable = lib.mkIf true true;\n}\n"
+NIX_INERT = "{ }\n"
+
+
+# --- blocked pushes ---------------------------------------------------
+w = branch_with(make_repo(), "feat: no trailer at all", {"docs/a.md": "x\n"})
+dec, why = push_guard(w)
+check("nixos push with no Pre-push checklist -> deny", dec == "deny", f"decision={dec!r}")
+check("... hands back the checklist template", "Pre-push checklist:" in why, why[:200])
+check(
+    "... names the repo it is gating",
+    "nixos-config push gate refused this push" in why,
+    why[:200],
+)
+
+w = branch_with(
+    make_repo(),
+    "chore: bump\n\nPre-push checklist:\n- Type: pure-data\n",
+    {"modules/nixos/thing.nix": NIX_MKIF},
+)
+dec, why = push_guard(w)
+check("pure-data claim vs risky markers in the diff -> deny", dec == "deny", f"decision={dec!r}")
+check("... lists the marker it found", "risky markers" in why and "mkIf" in why, why[:250])
+
+w = branch_with(
+    make_repo(),
+    "chore: bump\n\nPre-push checklist:\n- Type: pure-data\n",
+    {"modules/nixos/feature-vm.nix": NIX_INERT},
+)
+dec, why = push_guard(w)
+check("pure-data claim vs a feature-vm.nix edit -> deny", dec == "deny", f"decision={dec!r}")
+check(
+    "... says feature-vm.nix is always risky",
+    "modules/nixos/feature-vm.nix" in why and "always 'Type: risky'" in why,
+    why[:250],
+)
+
+w = branch_with(
+    make_repo(),
+    "chore: x\n\nPre-push checklist:\n- Type: whatever\n",
+    {"docs/a.md": "x\n"},
+)
+dec, why = push_guard(w)
+check("unrecognised checklist Type -> deny", dec == "deny", f"decision={dec!r}")
+check("... names the two legal values", "'pure-data' or 'risky'" in why, why[:200])
+
+_partial = (
+    "feat: partial\n"
+    "\n"
+    "Pre-push checklist:\n"
+    "- Type: risky\n"
+    "- Rebased on origin/main: yes\n"
+    "- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+    "- Interactive smoke (nixos-agent-testing): <yes - cmd + observed | N/A - reason>\n"
+    "- Advisor review (advice-refine-test-loop): yes - 2 rounds\n"
+    "- feature-vm.nix modified: no\n"
+    "- Risky markers in diff: none\n"
+    "- Behavioural evidence:\n"
+)
+w = branch_with(make_repo(), _partial, {"docs/a.md": "x\n"})
+dec, why = push_guard(w)
+check("risky checklist with holes -> deny", dec == "deny", f"decision={dec!r}")
+check(
+    "... an untouched <template placeholder> counts as empty",
+    "interactive smoke (nixos-agent-testing)" in why and "placeholder" in why,
+    why[:300],
+)
+check("... an outright empty field is listed too", "behavioural evidence" in why, why[:300])
+
+w = branch_with(
+    make_repo(),
+    CHECKLIST_RISKY.format(fv="no"),
+    {"modules/nixos/feature-vm.nix": NIX_INERT},
+)
+dec, why = push_guard(w)
+check(
+    "checklist claims feature-vm.nix untouched while the diff touches it -> deny",
+    dec == "deny",
+    f"decision={dec!r}",
+)
+check(
+    "... keeps the PR #61 incident text (hollow smoke evidence)",
+    "PR #61" in why and "virtiofsd" in why,
+    why[:300],
+)
+
+w = branch_with(make_repo(), CHECKLIST_RISKY.format(fv="no"), {"docs/a.md": "x\n"})
+advance_origin_main(w)
+dec, why = push_guard(w)
+check("checklist claims 'Rebased: yes' while behind origin/main -> deny", dec == "deny",
+      f"decision={dec!r}")
+check(
+    "... shows the merge-base that disproves the claim",
+    "merge-base" in why and "rebase before pushing" in why,
+    why[:300],
+)
+
+# Neither of these denials is the guard reporting itself broken — that
+# distinction is what tells the operator whether to fix the push or the host.
+check("gate denials are not reported as a broken guard", BROKEN_MARKER not in why, why[:200])
+
+
+# --- pushes that must still go through --------------------------------
+w = branch_with(
+    make_repo(),
+    "chore: bump a pin\n\nPre-push checklist:\n- Type: pure-data\n",
+    {"docs/a.md": "just data\n"},
+)
+dec, why = push_guard(w)
+check("pure-data push with a clean diff -> allow", dec is None, f"decision={dec!r} {why[:200]}")
+
+w = branch_with(
+    make_repo(),
+    CHECKLIST_RISKY.format(fv="yes (needed to reach the smoke path)"),
+    {"modules/nixos/feature-vm.nix": NIX_INERT},
+)
+dec, why = push_guard(w)
+check("fully-filled risky checklist, claims agreeing with the diff -> allow", dec is None,
+      f"decision={dec!r} {why[:200]}")
+
+w = branch_with(
+    make_repo(),
+    "fix: emergency\n\nOverride: [skip-vm-gate] hotfix for a down host, smoke impossible\n",
+    {"modules/nixos/feature-vm.nix": NIX_MKIF},
+)
+dec, why = push_guard(w)
+check(
+    # Not an env var and not agent-invisible: it lands in the commit message
+    # and stays readable in `git log` after the merge. Ported as-is.
+    "audited Override: [skip-vm-gate] trailer -> allow",
+    dec is None,
+    f"decision={dec!r} {why[:200]}",
+)
+
+w = make_repo()
+dec, why = push_guard(w, command="git push origin main")
+check("pushing main itself -> allow (branch protection covers it)", dec is None,
+      f"decision={dec!r} {why[:200]}")
+
+w = branch_with(make_repo(remote_tail="someone-else/other-repo.git"),
+                "feat: no trailer", {"docs/a.md": "x\n"})
+dec, why = push_guard(w)
+check("push in a repo with a non-nixos remote -> allow", dec is None,
+      f"decision={dec!r} {why[:200]}")
+
+w = branch_with(make_repo(), "feat: no trailer", {"docs/a.md": "x\n"})
+dec, why = push_guard(w, command="git push --dry-run origin HEAD")
+check("--dry-run push -> allow", dec is None, f"decision={dec!r} {why[:200]}")
+dec, why = push_guard(w, command="git status")
+check("non-push command in a nixos repo -> allow", dec is None, f"decision={dec!r} {why[:200]}")
+
+
+# --- how the gate finds the repo --------------------------------------
+# safe-bash read the MCP server's own cwd. A hook gets the session cwd on
+# the payload instead, and the `cd`/`-C` forms have to keep working or the
+# gate is one `cd` away from being bypassed.
+w = branch_with(make_repo(), "feat: no trailer", {"docs/a.md": "x\n"})
+dec, why = push_guard(w, command=f"cd {w} && git push origin HEAD", cwd=REPO_ROOT)
+check("`cd <worktree> && git push` from an unrelated cwd -> deny", dec == "deny",
+      f"decision={dec!r}")
+dec, why = push_guard(w, command=f"git -C {w} push origin HEAD", cwd=REPO_ROOT)
+check("`git -C <worktree> push` from an unrelated cwd -> deny", dec == "deny",
+      f"decision={dec!r}")
+
+
+# --- fail-closed: the gate must deny when it cannot evaluate -----------
+# safe-bash returned None (allow) for every one of these. A `git diff` that
+# fails silently disables the claim-vs-diff cross-check — the gate would
+# still LOOK present while checking nothing, which is precisely how dcg sat
+# inert for months.
+section("bash-guard: nixos push gate, fail-closed")
+
+# Real repo, real fault: a branch with no `main` and no `origin/main`, so
+# neither diff base resolves and the cross-checks have nothing to run on.
+w = make_repo(commit=False)
+_write_in(w, "README.md", "base\n")
+_g(w, "checkout", "-q", "-b", "feature/x")
+_g(w, "add", "-A")
+_g(w, "commit", "-m", "chore: x\n\nPre-push checklist:\n- Type: pure-data\n")
+dec, why = push_guard(w)
+check("neither origin/main nor main resolves -> deny", dec == "deny", f"decision={dec!r}")
+check("... reported as a broken guard, not a bad push", BROKEN_MARKER in why, why[:250])
+
+# Repo with a nixos remote and no commits at all: HEAD is unborn, so the
+# checklist cannot be read off it. (On a branch other than main, or the gate
+# would step aside before it ever looks for a commit message.)
+w = make_repo(commit=False)
+_g(w, "checkout", "-q", "-b", "feature/x")
+dec, why = push_guard(w)
+check("HEAD commit message unreadable -> deny", dec == "deny", f"decision={dec!r}")
+check("... reported as a broken guard", BROKEN_MARKER in why, why[:250])
+
+# A `git` that faults rather than answering. TimeoutExpired, FileNotFoundError
+# and OSError all land in the same handler in the guard; the hang is the one
+# that can be staged reliably without dismantling PATH for the dcg stub too.
+STUB_BIN = os.path.join(SCRATCH, "stub-bin")
+os.makedirs(STUB_BIN, exist_ok=True)
+_write_stub(
+    os.path.join("stub-bin", "git"),
+    "#!/usr/bin/env bash\n"
+    "# Passthrough wrapper around real git; injects a fault for one subcommand.\n"
+    'for a in "$@"; do\n'
+    '  if [ "$a" = "${GUARD_TEST_GIT_FAULT:-}" ]; then\n'
+    '    case "${GUARD_TEST_GIT_FAULT_MODE:-fail}" in\n'
+    "      hang) sleep 30 ;;\n"
+    '      *) echo "injected git fault" >&2; exit 1 ;;\n'
+    "    esac\n"
+    "  fi\n"
+    "done\n"
+    f'exec {_REAL_GIT} "$@"\n',
+)
+STUB_PATH = STUB_BIN + os.pathsep + os.environ.get("PATH", "")
+
+w = branch_with(make_repo(), CHECKLIST_RISKY.format(fv="no"), {"docs/a.md": "x\n"})
+t0 = time.monotonic()
+dec, why = push_guard(
+    w,
+    env_extra={
+        "PATH": STUB_PATH,
+        "GUARD_TEST_GIT_FAULT": "rev-parse",
+        "GUARD_TEST_GIT_FAULT_MODE": "hang",
+    },
+    timeout=45.0,
+)
+elapsed = time.monotonic() - t0
+check("git hangs while the gate is resolving the repo -> deny", dec == "deny", f"decision={dec!r}")
+check("... reported as a broken guard", BROKEN_MARKER in why, why[:250])
+check(
+    "... and lands before the harness hook timeout discards the decision",
+    elapsed < bash_guard.HARNESS_HOOK_TIMEOUT_S,
+    f"{elapsed:.1f}s vs harness {bash_guard.HARNESS_HOOK_TIMEOUT_S}s",
+)
+
+# The rebase claim is only as good as the two commands that check it.
+w = branch_with(make_repo(), CHECKLIST_RISKY.format(fv="no"), {"docs/a.md": "x\n"})
+dec, why = push_guard(
+    w,
+    env_extra={"PATH": STUB_PATH, "GUARD_TEST_GIT_FAULT": "merge-base"},
+)
+check("merge-base unverifiable while the checklist claims 'Rebased: yes' -> deny",
+      dec == "deny", f"decision={dec!r}")
+check("... reported as a broken guard", BROKEN_MARKER in why, why[:250])
+
+# The guard's own dcg budget eats into the same whole-hook deadline the git
+# calls draw on. A slow dcg plus a hanging git must still produce a deny
+# inside the deadline rather than running past it into the harness timeout.
+STUB_SLOW_ALLOW = _write_stub(
+    "dcg-slow-allow", "#!/usr/bin/env bash\ncat >/dev/null\nsleep 3\nexit 0\n"
+)
+w = branch_with(make_repo(), CHECKLIST_RISKY.format(fv="no"), {"docs/a.md": "x\n"})
+t0 = time.monotonic()
+dec, why = push_guard(
+    w,
+    dcg=STUB_SLOW_ALLOW,
+    env_extra={
+        "PATH": STUB_PATH,
+        "GUARD_TEST_GIT_FAULT": "rev-parse",
+        "GUARD_TEST_GIT_FAULT_MODE": "hang",
+    },
+    timeout=45.0,
+)
+elapsed = time.monotonic() - t0
+check("slow dcg then hanging git -> deny", dec == "deny", f"decision={dec!r}")
+check(
+    "... the git budget is clamped to what is left of the whole-hook deadline",
+    elapsed < bash_guard.HARNESS_HOOK_TIMEOUT_S,
+    f"{elapsed:.1f}s vs harness {bash_guard.HARNESS_HOOK_TIMEOUT_S}s",
+)
+
+# An unhandled exception raised anywhere inside the new layer has to reach
+# the module-level fail-closed handler rather than escaping as a traceback,
+# which the harness would read as "no decision" — fail-open.
+_nixos_fault_src = _src.replace(
+    '    """True if a `git push` is present (excluding --dry-run)."""',
+    '    raise RuntimeError("injected nixos-gate fault")',
+)
+check("nixos-gate fault fixture actually patched the source", _nixos_fault_src != _src)
+_nixos_fault_path = os.path.join(SCRATCH, "bash-guard-nixos-fault.py")
+with open(_nixos_fault_path, "w", encoding="utf-8") as fh:
+    fh.write(_nixos_fault_src)
+rc, parsed, out, err = run_hook(
+    _nixos_fault_path, pre_payload("ls -la"), env_extra={"DCG_PATH": STUB_ALLOW}
+)
+check(
+    "unhandled exception inside the nixos layer -> deny",
+    decision_of(parsed) == "deny",
+    f"decision={decision_of(parsed)!r} stderr={err[:200]}",
+)
+check(
+    "... names the fault instead of leaking a traceback",
+    "injected nixos-gate fault" in reason_of(parsed),
+    reason_of(parsed)[:250],
+)
 
 
 # ----------------------------------------------------------------------

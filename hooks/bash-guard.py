@@ -9,9 +9,11 @@ Layers, in order:
 
   1. ``dcg`` (destructive-command guard, a Rust binary speaking hook JSON)
   2. ``find ... -delete`` with no filter predicate
-  3. allow — by emitting NOTHING
+  3. the nixos-config push gate (``Pre-push checklist:`` trailer, with its
+     claim-vs-diff and merge-base cross-checks)
+  4. allow — by emitting NOTHING
 
-Layer 3 is silent on purpose. ``PreToolUse`` fires BEFORE the permission
+Layer 4 is silent on purpose. ``PreToolUse`` fires BEFORE the permission
 system, so returning ``permissionDecision: "allow"`` would bypass every
 ``permissions.deny`` rule in settings.json — including the ``Bash(...)``
 globs this migration ported there. A hook that has nothing to say must say
@@ -31,6 +33,10 @@ guard can fail to reach a verdict now DENIES:
   * dcg exited non-zero without rendering a decision
   * dcg rendered a decision value the guard does not understand
   * hook stdin was unparseable, or carried no command to check
+  * the nixos push gate could not run a git command it needed (git absent,
+    hung, or refused by the OS), could not read the HEAD commit message,
+    could not diff the branch against either origin/main or main, or could
+    not resolve the refs its `Rebased on origin/main` check compares
   * any unhandled exception anywhere in this file
   * the guard's own timeout constants no longer hold their invariant
 
@@ -56,11 +62,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
 import subprocess
 import sys
+import time
 
 # --- Timeout ladder. Read this as one unit; the invariant below is checked
 # --- at runtime and asserted against settings.json by the test suite.
@@ -72,14 +80,29 @@ import sys
 #   DCG_TIMEOUT_S           cap on the dcg subprocess alone, so the normal
 #                           hang path is handled with a clean kill rather
 #                           than by the watchdog.
+#   NIXOS_GIT_TIMEOUT_S     cap on any ONE git call made by the nixos push
+#                           gate. It is a ceiling, not an allowance: every
+#                           call is additionally clamped to whatever is left
+#                           of GUARD_DEADLINE_S, so the gate cannot spend
+#                           budget the watchdog has already committed. On
+#                           this host the whole gate measures ~0.3s.
 HARNESS_HOOK_TIMEOUT_S = 10
 GUARD_DEADLINE_S = HARNESS_HOOK_TIMEOUT_S - 4  # 6
 DCG_TIMEOUT_S = GUARD_DEADLINE_S - 1  # 5
+NIXOS_GIT_TIMEOUT_S = 4
 
 # Strict ordering. If a future edit inverts it — say by raising
 # DCG_TIMEOUT_S past the harness timeout — the guard denies every command
 # instead of silently degrading to fail-open. Loud beats inert.
-_TIMEOUTS_SANE = 0 < DCG_TIMEOUT_S < GUARD_DEADLINE_S < HARNESS_HOOK_TIMEOUT_S
+_TIMEOUTS_SANE = (
+    0 < DCG_TIMEOUT_S < GUARD_DEADLINE_S < HARNESS_HOOK_TIMEOUT_S
+    and 0 < NIXOS_GIT_TIMEOUT_S < GUARD_DEADLINE_S
+)
+
+# Margin kept between the last subprocess cap and the watchdog, so a stalled
+# child is killed and its deny WRITTEN rather than the watchdog interrupting
+# mid-decision.
+_BUDGET_SLACK_S = 0.5
 
 LEGACY_DCG_PATH = "/home/jonathan/.local/bin/dcg"
 
@@ -138,7 +161,24 @@ def _on_deadline(signum, frame) -> None:  # noqa: ARG001
     )
 
 
+_DEADLINE_AT: float | None = None
+
+
+def _remaining_budget() -> float:
+    """Seconds of whole-hook deadline left, minus the write-out margin.
+
+    Every subprocess the guard starts after dcg draws from this, so that a
+    slow first layer shortens the second rather than the two summing past
+    GUARD_DEADLINE_S and landing in the watchdog.
+    """
+    if _DEADLINE_AT is None:  # watchdog never armed (direct import, tests)
+        return float(NIXOS_GIT_TIMEOUT_S)
+    return _DEADLINE_AT - time.monotonic() - _BUDGET_SLACK_S
+
+
 def _arm_watchdog() -> None:
+    global _DEADLINE_AT
+    _DEADLINE_AT = time.monotonic() + GUARD_DEADLINE_S
     try:
         signal.signal(signal.SIGALRM, _on_deadline)
         signal.setitimer(signal.ITIMER_REAL, GUARD_DEADLINE_S)
@@ -368,12 +408,509 @@ def _check_dangerous_find(command: str) -> str | None:
 
 
 # ----------------------------------------------------------------------
+# Layer 3: the nixos-config push gate
+# (ported from `_check_nixos_push` in mcps/safe-bash/server.py, which chunk
+# C deletes; the incident texts below are the behaviour, not decoration)
+# ----------------------------------------------------------------------
+#
+# Two PRs deployed broken changes to dellan despite the SessionStart hook's
+# HARD RULE and the nixos-config-dev / nixos-agent-testing skills:
+#
+#   PR #61 (research-agent → microvm): the agent ran `nix run .#feature-vm`
+#     and SSH-smoked it, but stubbed `modules/nixos/feature-vm.nix` to make
+#     boot succeed (missing virtiofsd share-source dirs). The smoke ran
+#     against a mutated artefact, not the prod path. Inner microvm
+#     `networking.useDHCP` defaulted false → no resolver → sshd never
+#     started → research-agent unreachable post-deploy.
+#
+#   PR #57 (kitty ctrl+shift+c strip newline): the agent ran only the
+#     automated gate (`nix build .#checks.x86_64-linux.dellan-vm`) whose
+#     assertion was grep-the-rendered-config — never launched kitty, never
+#     pressed the key. `pass_selection_to_program sh -c '… kitten clipboard'`
+#     fails silently at runtime because the child has no controlling tty for
+#     OSC52.
+#
+# The shared failure mode is the agent equating "build green" with "feature
+# works", and the SessionStart prose (which both sessions had in context)
+# did not gate behaviour. This layer is the enforcement the prose isn't.
+#
+# Relationship to hooks/git-push-merge-check.sh — they are NOT redundant and
+# neither subsumes the other. Same event, different jobs:
+#   * this layer   — hard DENY, nixos-config remotes only, enforces that the
+#                    HEAD commit carries a filled `Pre-push checklist:` and
+#                    that its claims survive a mechanical cross-check
+#                    against the real diff.
+#   * merge-check  — advisory only (always exit 0), EVERY repo, and its
+#                    question is "is this branch behind the default branch,
+#                    so the PR would land needing an Update-branch click".
+# The one place they touch is `Rebased on origin/main`, and even there the
+# gate only checks it when the checklist CLAIMS `yes`, whereas merge-check
+# nudges unconditionally and in repos this layer never looks at. Deleting
+# either one loses coverage the other never had.
+#
+# What is deliberately preserved from safe-bash, not tightened:
+#   * `Override: [skip-vm-gate] <reason>` still bypasses. It is not an
+#     agent-reachable env var — it goes in the commit message and stays
+#     readable in `git log` after the merge, which is the point.
+#   * Pushing `main` itself is not gated (branch-protected upstream).
+#
+# What is deliberately INVERTED from safe-bash: every way the gate could
+# fail to reach a verdict used to return "allow" — a failed `git diff` left
+# `diff_touches_fv` False and quietly disabled the PR #61 cross-check while
+# the gate still LOOKED present. That is the same silent-disappearance
+# failure as the missing dcg binary. All of those now deny.
+
+NIXOS_WORKTREES_ROOT = "/home/jonathan/Repos/nixos-config-worktrees"
+
+# The gate detects a "nixos-config repo" by remote URL, not by filesystem
+# path — so the same gate fires whether the worktree lives at the canonical
+# `~/Repos/nixos-config-worktrees/<slug>/` location or anywhere else
+# (scratch clone in `/tmp`, secondary worktree under `~/projects`, etc.).
+# Patterns match the tail `[:/]owner/repo(.git)?` of a remote URL.
+_NIXOS_REPO_REMOTE_PATTERNS: list["re.Pattern[str]"] = [
+    re.compile(r"[:/]jonathanmoregard/nixos-config(?:\.git)?/?$"),
+]
+
+# Heuristic "this diff has branching / runtime / multistep behaviour" markers.
+# Order matters only for the rejection-message hit list (first-match labels).
+_NIXOS_RISKY_MARKERS = re.compile(
+    r"\bmkIf\b"
+    r"|\boptionals\b"
+    r"|\bExecStart"
+    r"|writeShellApplication"
+    r"|writeShellScriptBin"
+    r"|pass_selection_to_program"
+    r"|\bmicrovm\b"
+    r"|\bvirtiofsd\b"
+    r"|networking\.useDHCP"
+    r"|activationScripts?"
+    r"|systemd\.(?:services|timers|user\.services)\."
+    r"|\bsh\s+-c\s+"
+    r"|\bbash\s+-c\s+"
+)
+
+_NIXOS_CHECKLIST_HEADER = re.compile(r"^Pre-push checklist:\s*$", re.MULTILINE)
+# Field lines are top-level only (anchored `^-\s`, NOT `^\s*-\s`). Indented
+# sub-bullets inside a multi-line `Behavioural evidence` value must not
+# overwrite the parent field map.
+_NIXOS_CHECKLIST_FIELD = re.compile(r"^-\s*([^:\n]+?)\s*:\s*(.*)$")
+_NIXOS_OVERRIDE = re.compile(r"^Override:\s*\[skip-vm-gate\]\s*(\S.+)$", re.MULTILINE)
+# `<placeholder>` template hints (`<list, or 'none'>`, `<cmd + output>`) left
+# unfilled by the agent are treated as empty. The angle-brackets are the
+# template's hint marker; real values never start with `<` AND end with `>`.
+_NIXOS_TEMPLATE_PLACEHOLDER = re.compile(r"^<.*>$")
+_NIXOS_FEATURE_VM_FILE_IN_DIFF = re.compile(
+    r"^diff --git .*modules/nixos/feature-vm\.nix\b", re.MULTILINE
+)
+
+_NIXOS_GATE_HELP = (
+    "nixos-config push gate refused this push (remote points at "
+    "jonathanmoregard/nixos-config).\n\n"
+    "HEAD commit message must contain a 'Pre-push checklist:' block.\n"
+    "Template (copy verbatim, then fill values):\n\n"
+    "  Pre-push checklist:\n"
+    "  - Type: pure-data           # OR 'risky' for branching/multistep/runtime\n"
+    "  - Rebased on origin/main: yes\n"
+    "  - Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+    "  - Interactive smoke (nixos-agent-testing): <yes — cmd + observed | N/A — reason>\n"
+    "  - Advisor review (advice-refine-test-loop): <yes — rounds + verdict | N/A — reason>\n"
+    "  - feature-vm.nix modified: no    # MUST match actual diff\n"
+    "  - Risky markers in diff: <list, or 'none'>\n"
+    "  - Behavioural evidence: <what you actually exercised — command + observed output>\n\n"
+    "For 'Type: pure-data' (package add, version bump, comment), only Type +\n"
+    "brief justification are required; diff is verified to have no risky markers.\n\n"
+    "Bypass (audited): add 'Override: [skip-vm-gate] <reason>' to commit message.\n"
+)
+
+
+def _nixos_git(worktree: str, args: list[str]) -> tuple[int, str, str]:
+    """Run one git command for the gate. Faults are FAIL-CLOSED.
+
+    A non-zero exit from git itself is a legitimate ANSWER ("not a git
+    repository", "unknown revision") and is handed back to the caller. A
+    FAULT — git absent, git hung, the OS refusing to start it — means the
+    gate obtained no answer at all, and it denies rather than guessing.
+    safe-bash returned a `-1` sentinel here that every caller then treated
+    as "no", which is how a broken git would have silently switched the
+    whole gate off.
+
+    Capture bytes and decode permissively: `text=True` raises
+    UnicodeDecodeError on `git diff` output for commits that add or modify
+    binary blobs (e.g. `.age` files), which would otherwise crash the gate
+    before it can run.
+    """
+    budget = min(float(NIXOS_GIT_TIMEOUT_S), _remaining_budget())
+    if budget <= 0:
+        _fail_closed(
+            "the nixos push gate ran out of the guard's whole-hook budget before "
+            f"`git {' '.join(args)}` could answer"
+        )
+    try:
+        proc = subprocess.run(
+            ["git", "-C", worktree, *args],
+            capture_output=True,
+            text=False,
+            timeout=budget,
+        )
+    except subprocess.TimeoutExpired:
+        _fail_closed(
+            f"`git {' '.join(args)}` in {worktree!r} did not answer within "
+            f"{budget:.1f}s, so the nixos push gate could not evaluate this push"
+        )
+    except (OSError, ValueError) as exc:
+        _fail_closed(
+            f"`git {' '.join(args)}` could not be invoked for the nixos push gate: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    return (
+        proc.returncode,
+        proc.stdout.decode("utf-8", errors="replace"),
+        proc.stderr.decode("utf-8", errors="replace"),
+    )
+
+
+def _nixos_pipeline_subcommands(command: str) -> list[str]:
+    """Pipeline split that also strips a leading '(' from subshell forms.
+
+    `_pipeline_subcommands` correctly splits on `&&`/`;`/etc. but doesn't
+    strip `(` from `(cd X && git push)`. We need the inside.
+    """
+    out: list[str] = []
+    for sub in _pipeline_subcommands(command):
+        s = sub.strip()
+        while s.startswith("("):
+            s = s[1:].lstrip()
+        while s.endswith(")"):
+            s = s[:-1].rstrip()
+        if s:
+            out.append(s)
+    return out
+
+
+def _nixos_extract_cd_target(command: str) -> str | None:
+    """Last `cd <path>` target encountered in the pipeline chain.
+
+    Returns an absolute path (with ~ expansion) or None. Quotes around the
+    path are stripped. Only `cd` as the leading token of a subcommand counts
+    — a `cd` mid-command (rare) is ignored.
+    """
+    last: str | None = None
+    for sub in _nixos_pipeline_subcommands(command):
+        m = re.match(r"^cd\s+(.+?)\s*$", sub)
+        if not m:
+            continue
+        raw = m.group(1).strip()
+        if (raw.startswith('"') and raw.endswith('"')) or (
+            raw.startswith("'") and raw.endswith("'")
+        ):
+            raw = raw[1:-1]
+        try:
+            last = os.path.abspath(os.path.expanduser(raw))
+        except (ValueError, OSError):
+            continue
+    return last
+
+
+def _remote_is_nixos_config(url: str) -> bool:
+    """True if a git remote URL points at the nixos-config repo.
+
+    Tail-match against `_NIXOS_REPO_REMOTE_PATTERNS` so the same predicate
+    works for `git@github.com:owner/repo.git`, `https://github.com/owner/repo`,
+    `ssh://git@github.com/owner/repo`, etc.
+    """
+    url = (url or "").strip()
+    if not url:
+        return False
+    return any(p.search(url) for p in _NIXOS_REPO_REMOTE_PATTERNS)
+
+
+def _repo_has_nixos_remote(repo_root: str) -> bool:
+    """True if the repo has any remote whose URL matches nixos-config.
+
+    Checks ALL configured remotes (fetch + push entries), not just origin,
+    so forks / mirrors with a different push target still gate correctly.
+    """
+    rc, out, _ = _nixos_git(repo_root, ["remote", "-v"])
+    if rc != 0:
+        return False
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and _remote_is_nixos_config(parts[1]):
+            return True
+    return False
+
+
+def _candidate_repo_paths(command: str, cwd: str | None) -> list[str]:
+    """Candidate working-dir paths to probe for a git repo.
+
+    Order:
+      1. Last `cd <path>` target in the command's pipeline chain
+      2. `git -C <path>` flag
+      3. The session cwd carried on the hook payload
+      4. The hook process's own cwd
+
+    safe-bash had only (1), (2) and the MCP server's `os.getcwd()`. A hook is
+    a fresh process per call, so the session's directory arrives on the
+    payload instead — dropping it would leave the gate unable to see a plain
+    `git push` issued from inside the worktree.
+    """
+    candidates: list[str] = []
+    cd_target = _nixos_extract_cd_target(command)
+    if cd_target:
+        candidates.append(cd_target)
+    m = re.search(r"\bgit\s+(?:[^\n;|&]*?\s+)?-C\s+(\S+)", command)
+    if m:
+        raw = m.group(1).strip("\"'")
+        try:
+            candidates.append(os.path.abspath(os.path.expanduser(raw)))
+        except (ValueError, OSError):
+            pass
+    if isinstance(cwd, str) and cwd.strip():
+        candidates.append(cwd)
+    try:
+        candidates.append(os.getcwd())
+    except OSError:
+        pass
+    # Dedupe while preserving order.
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for p in candidates:
+        if p and p not in seen:
+            seen.add(p)
+            deduped.append(p)
+    return deduped
+
+
+def _nixos_resolve_target_repo(command: str, cwd: str | None) -> str | None:
+    """Working-tree top-level, if any candidate path is a nixos-config clone.
+
+    Detection is by remote URL, NOT by filesystem path — so a worktree at
+    `~/scratch/foo/`, `/tmp/clones/nixos-config/`, or anywhere outside the
+    canonical `~/Repos/nixos-config-worktrees/` tree still gates as long as
+    one of its configured remotes points at jonathanmoregard/nixos-config.
+    """
+    for path in _candidate_repo_paths(command, cwd):
+        rc, toplevel, _ = _nixos_git(path, ["rev-parse", "--show-toplevel"])
+        if rc != 0:
+            continue
+        repo_root = toplevel.strip()
+        if not repo_root:
+            continue
+        if _repo_has_nixos_remote(repo_root):
+            return repo_root
+    return None
+
+
+def _nixos_command_pushes(command: str) -> bool:
+    """True if a `git push` is present (excluding --dry-run)."""
+    for sub in _nixos_pipeline_subcommands(command):
+        if not re.search(r"\bgit\s+(?:-C\s+\S+\s+)?(?:[\w-]+\s+)*push\b", sub):
+            continue
+        if re.search(r"(?:^|\s)--dry-run(?:\s|$)", sub):
+            continue
+        return True
+    return False
+
+
+def _nixos_parse_checklist(commit_msg: str) -> dict[str, str] | None:
+    """Extract the `Pre-push checklist:` field map. None if header missing.
+
+    Block ends at the first non-field, non-blank, non-comment line after the
+    header, or at end-of-message. Keys lowercased + stripped.
+    """
+    if not _NIXOS_CHECKLIST_HEADER.search(commit_msg):
+        return None
+    fields: dict[str, str] = {}
+    in_block = False
+    for line in commit_msg.splitlines():
+        if _NIXOS_CHECKLIST_HEADER.match(line):
+            in_block = True
+            continue
+        if not in_block:
+            continue
+        stripped = line.strip()
+        if stripped == "" or stripped.startswith("#"):
+            continue
+        m = _NIXOS_CHECKLIST_FIELD.match(line)
+        if m:
+            key = m.group(1).strip().lower()
+            val = m.group(2).strip()
+            # Drop inline `# comment` tails so the template's hint text doesn't
+            # poison values when the agent left it untrimmed.
+            val = re.sub(r"\s+#.*$", "", val).strip()
+            fields[key] = val
+            continue
+        # First unrelated line ends the block.
+        break
+    return fields
+
+
+def _check_nixos_push(command: str, cwd: str | None) -> str | None:
+    """Gate `git push` of a nixos-config branch.
+
+    Detection: any candidate path (from `cd` / `-C` / cwd) that resolves to a
+    git working tree whose remotes include a URL matching nixos-config.
+    Worktree location is NOT part of the check.
+
+    Returns rejection text, or None to allow. Pure-data pushes with a minimal
+    trailer are accepted. Risky pushes require the full trailer AND the
+    mechanical cross-checks to agree with the diff. Anything the gate cannot
+    evaluate routes through `_fail_closed`.
+    """
+    if not _nixos_command_pushes(command):
+        return None
+    worktree = _nixos_resolve_target_repo(command, cwd)
+    if not worktree:
+        return None
+    rc, branch, _ = _nixos_git(worktree, ["branch", "--show-current"])
+    if rc == 0 and branch.strip() == "main":
+        return None  # Pushing main is already branch-protected upstream.
+
+    rc, msg, err = _nixos_git(worktree, ["log", "-1", "--format=%B"])
+    if rc != 0:
+        # safe-bash allowed here ("no HEAD — let git itself fail"). It cannot
+        # allow now: an unreadable HEAD message means the checklist was never
+        # inspected, and "the gate ran and found nothing to object to" and
+        # "the gate could not look" must not render identically.
+        _fail_closed(
+            f"the nixos push gate could not read the HEAD commit message of "
+            f"{worktree!r}, so the Pre-push checklist could not be verified "
+            f"(`git log -1` exited {rc}: {err.strip()[:160]!r})"
+        )
+
+    override = _NIXOS_OVERRIDE.search(msg)
+    if override:
+        try:
+            sys.stderr.write(
+                f"[bash-guard] nixos push gate: bypass via Override: [skip-vm-gate] "
+                f"{override.group(1).strip()[:120]!r}\n"
+            )
+        except Exception:  # noqa: BLE001 — an audit line must never decide the push
+            pass
+        return None
+
+    fields = _nixos_parse_checklist(msg)
+    if fields is None:
+        return _NIXOS_GATE_HELP
+
+    # Diff against origin/main, falling back to local main. safe-bash fell
+    # back a third time to "" — an empty diff satisfies every cross-check
+    # below, so a `git diff` that could not resolve either ref silently
+    # switched the gate off. Both refs failing is now a deny.
+    rc1, diff, _ = _nixos_git(worktree, ["diff", "origin/main...HEAD"])
+    if rc1 != 0 or not diff:
+        rc2, diff2, err2 = _nixos_git(worktree, ["diff", "main...HEAD"])
+        if rc2 == 0:
+            diff = diff2
+        elif rc1 != 0:
+            _fail_closed(
+                "the nixos push gate could not diff this branch against either "
+                f"origin/main or main in {worktree!r}, so the checklist's claims "
+                f"could not be cross-checked against the code (`git diff` exited "
+                f"{rc1} then {rc2}: {err2.strip()[:160]!r})"
+            )
+    diff_has_risky = bool(_NIXOS_RISKY_MARKERS.search(diff)) if diff else False
+    diff_touches_fv = bool(_NIXOS_FEATURE_VM_FILE_IN_DIFF.search(diff)) if diff else False
+
+    type_ = fields.get("type", "").lower()
+
+    if type_ == "pure-data":
+        # Report both incompatibilities if they coexist — the markers-only
+        # message hides the structural feature-vm.nix signal which is the
+        # PR #61 anti-pattern tell.
+        reasons: list[str] = []
+        if diff_has_risky:
+            hits = sorted({m.group(0) for m in _NIXOS_RISKY_MARKERS.finditer(diff)})
+            reasons.append("diff contains risky markers: " + ", ".join(hits[:8]))
+        if diff_touches_fv:
+            reasons.append(
+                "diff touches modules/nixos/feature-vm.nix (always 'Type: risky')"
+            )
+        if reasons:
+            return (
+                "nixos push gate: checklist claims 'Type: pure-data' "
+                "but " + "; ".join(reasons) + ".\n"
+                "Update the checklist to 'Type: risky' and fill remaining fields, "
+                "OR remove the runtime/branching change from this PR."
+            )
+        return None
+
+    if type_ != "risky":
+        return (
+            f"nixos push gate: checklist 'Type:' must be "
+            f"'pure-data' or 'risky' (got: {type_!r}).\n\n{_NIXOS_GATE_HELP}"
+        )
+
+    required = [
+        "rebased on origin/main",
+        "local gate",
+        "interactive smoke (nixos-agent-testing)",
+        "advisor review (advice-refine-test-loop)",
+        "feature-vm.nix modified",
+        "risky markers in diff",
+        "behavioural evidence",
+    ]
+
+    # Field counts as empty when blank OR still holding the template
+    # `<...>` placeholder. The latter slips past truthy checks but signals
+    # the agent left the template untouched.
+    def _empty_or_placeholder(v: str) -> bool:
+        return (not v) or bool(_NIXOS_TEMPLATE_PLACEHOLDER.match(v.strip()))
+
+    missing = [k for k in required if _empty_or_placeholder(fields.get(k, ""))]
+    if missing:
+        return (
+            "nixos push gate: missing, empty, or template-placeholder "
+            "checklist fields: " + ", ".join(missing) + ".\n\n" + _NIXOS_GATE_HELP
+        )
+
+    fv_claim = fields["feature-vm.nix modified"].lower()
+    fv_claims_no = fv_claim.startswith("no") or fv_claim in ("n", "false")
+    if fv_claims_no and diff_touches_fv:
+        return (
+            "nixos push gate: checklist claims 'feature-vm.nix "
+            "modified: no' but the diff DOES touch modules/nixos/feature-vm.nix. "
+            "This is the load-bearing tell for hollow smoke evidence (cf. PR #61: "
+            "agent stubbed virtiofsd shares to make boot succeed, smoke ran against "
+            "a mutated artefact, not the prod path).\n"
+            "If the edit was needed to make the smoke test pass, state 'yes' + "
+            "explain why the prod code path was still exercised. If the edit is "
+            "unrelated, state 'yes (unrelated: <reason>)'."
+        )
+
+    rebased_claim = fields["rebased on origin/main"].lower()
+    if rebased_claim.startswith("yes"):
+        rc_mb, merge_base, err_mb = _nixos_git(worktree, ["merge-base", "HEAD", "origin/main"])
+        rc_om, origin_main_sha, err_om = _nixos_git(worktree, ["rev-parse", "origin/main"])
+        if rc_mb != 0 or rc_om != 0:
+            # safe-bash skipped the comparison here, so an unresolvable
+            # origin/main turned the claim into a self-certification.
+            _fail_closed(
+                "the nixos push gate could not verify the checklist's 'Rebased on "
+                f"origin/main: yes' claim in {worktree!r} (`git merge-base` exited "
+                f"{rc_mb}, `git rev-parse origin/main` exited {rc_om}: "
+                f"{(err_mb or err_om).strip()[:160]!r})"
+            )
+        if merge_base.strip() != origin_main_sha.strip():
+            return (
+                "nixos push gate: checklist claims 'Rebased on "
+                "origin/main: yes' but `git merge-base HEAD origin/main` "
+                f"({merge_base.strip()[:12]}) != `origin/main` "
+                f"({origin_main_sha.strip()[:12]}). Branch is behind main; "
+                "rebase before pushing."
+            )
+
+    return None
+
+
+# ----------------------------------------------------------------------
 def main() -> int:
     if not _TIMEOUTS_SANE:
         _fail_closed(
             "the guard's timeout ladder no longer holds "
             f"(0 < DCG_TIMEOUT_S={DCG_TIMEOUT_S} < GUARD_DEADLINE_S={GUARD_DEADLINE_S} "
-            f"< HARNESS_HOOK_TIMEOUT_S={HARNESS_HOOK_TIMEOUT_S} is false). With the "
+            f"< HARNESS_HOOK_TIMEOUT_S={HARNESS_HOOK_TIMEOUT_S}, and "
+            f"0 < NIXOS_GIT_TIMEOUT_S={NIXOS_GIT_TIMEOUT_S} < GUARD_DEADLINE_S is false). With the "
             "ladder inverted the harness would time the hook out and render no "
             "decision at all, so the guard denies instead."
         )
@@ -409,9 +946,15 @@ def main() -> int:
     if not isinstance(command, str) or not command.strip():
         _fail_closed("Bash call carried no command string to inspect")
 
+    cwd = payload.get("cwd")
+
     reason = _check_dcg(command)
     if reason is None:
         reason = _check_dangerous_find(command)
+    if reason is None:
+        reason = _check_nixos_push(command, cwd if isinstance(cwd, str) else None)
+        if reason is not None:
+            reason = "bash-guard: " + reason
 
     _disarm_watchdog()
     if reason is not None:
