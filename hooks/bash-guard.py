@@ -366,44 +366,158 @@ _FIND_DANGEROUS_HINT = (
     "If you genuinely intend to wipe a whole tree, ask the user first."
 )
 
+_FIND_UNPARSEABLE_HINT = (
+    "find ... -delete denied: this command contains `-delete`, but the shell "
+    "string cannot be tokenised (unbalanced quote, or similar), so the guard "
+    "cannot tell whether any filter predicate constrains what would be "
+    "deleted.\n"
+    "An unanalysable delete is refused rather than waved through. safe-bash "
+    "skipped it instead, which made `find PATH -delete \"unbalanced` a "
+    "measured bypass of this layer — dcg has already had its turn by then, "
+    "and no other layer looks at find.\n"
+    "Balance the quotes so the command parses, or run it yourself in the "
+    "prompt with `! <command>`."
+)
+
+# Cap on how many nested strings one command may expand into. A shell
+# command deep enough to exhaust this is not one the guard can reason
+# about anyway, and the whole-hook watchdog is the backstop.
+_MAX_FIND_FRAGMENTS = 64
+
+
+def _is_find_token(token: str) -> bool:
+    """True for `find`, `/usr/bin/find`, `./find` — any path ending in find.
+
+    safe-bash compared against the literal string `find`, so
+    `/usr/bin/find PATH -delete` walked straight through. Its own
+    `_match_untrusted_ingress` already basenamed the head token for exactly
+    this reason; the omission here was an inconsistency, not a decision.
+    """
+    return os.path.basename(token) == "find"
+
+
+def _command_substitutions(s: str) -> list[str]:
+    """Bodies of `$( ... )` and backtick substitutions.
+
+    `shlex` does not look inside either form, so `echo $(find PATH -delete)`
+    tokenises to `$(find`, `PATH`, `-delete)` — no token equals `find` and
+    none equals `-delete`. Both were measured bypasses.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        if s[i] == "$" and i + 1 < n and s[i + 1] == "(":
+            depth = 1
+            j = i + 2
+            while j < n and depth:
+                if s[j] == "(":
+                    depth += 1
+                elif s[j] == ")":
+                    depth -= 1
+                j += 1
+            # Unterminated substitution: take the rest, so a truncated or
+            # malformed string still gets looked at rather than skipped.
+            body = s[i + 2 : j - 1] if depth == 0 else s[i + 2 :]
+            if body.strip():
+                out.append(body)
+            i += 2  # keep scanning inside, so nested $( ) are found too
+            continue
+        if s[i] == "`":
+            j = s.find("`", i + 1)
+            body = s[i + 1 : j] if j != -1 else s[i + 1 :]
+            if body.strip():
+                out.append(body)
+            i = j + 1 if j != -1 else n
+            continue
+        i += 1
+    return out
+
+
+def _find_fragments(command: str) -> list[str]:
+    """`command`, plus every nested string a shell would also execute.
+
+    Covers `sh -c "..."`, `bash -c '...'`, `eval "..."`, `timeout N bash -c
+    "..."`, `xargs sh -c "..."` and anything else shaped like them, without
+    enumerating wrapper names: after shlex, all of them surface the inner
+    command as ONE token containing whitespace. Matching the shape rather
+    than a name list means a wrapper nobody thought of is covered too.
+    """
+    frags: list[str] = []
+    seen: set[str] = set()
+    queue: list[str] = [command]
+    while queue and len(frags) < _MAX_FIND_FRAGMENTS:
+        s = queue.pop(0)
+        if s in seen:
+            continue
+        seen.add(s)
+        frags.append(s)
+        queue.extend(_command_substitutions(s))
+        for sub in _pipeline_subcommands(s):
+            try:
+                tokens = shlex.split(sub)
+            except ValueError:
+                continue  # the caller's strict pass turns this into a deny
+            for t in tokens:
+                if "-delete" in t and (" " in t or "\t" in t or "\n" in t):
+                    queue.append(t)
+    return frags
+
 
 def _check_dangerous_find(command: str) -> str | None:
     """Detect `find ... -delete` invocations with no filter predicate.
 
-    Allows: -delete combined with -name/-type/-mtime/-size/etc.
-    Denies: bare `find PATH -delete`, `find PATH -maxdepth 1 -delete`, etc.
+    Allows: -delete combined with -name/-type/-mtime/-size/etc., including
+    inside a nested shell — the inner command is analysed on its own terms,
+    so a properly filtered delete still runs however it is wrapped.
+    Denies: bare `find PATH -delete`, `find PATH -maxdepth 1 -delete`, the
+    same through any wrapper or substitution, and any `-delete`-bearing
+    subcommand that will not tokenise at all.
 
-    Tokenization via shlex; on parse failure (unbalanced quotes, etc.) we
-    decline to flag — dcg and the settings.json deny globs still get a turn.
+    The tokenisation failure is a DENY, not a skip. safe-bash `continue`d
+    past it, so an unbalanced quote disabled the layer silently.
     """
     if "-delete" not in command:
         return None
-    for sub in _pipeline_subcommands(command) + [command.strip()]:
-        try:
-            tokens = shlex.split(sub)
-        except ValueError:
-            continue
-        if "find" not in tokens or "-delete" not in tokens:
-            continue
-        i = 0
-        while i < len(tokens):
-            if tokens[i] != "find":
-                i += 1
+    for frag in _find_fragments(command):
+        # `strict` marks the entries whose failure to tokenise is a verdict.
+        # The whole-string entry is tolerant: when one subcommand is
+        # unbalanced the whole string necessarily is too, and denying on it
+        # would reject `find PATH -name x -delete ; echo "oops` — where the
+        # delete is fully constrained and the unbalanced part carries no
+        # -delete at all. Over-broad denial is its own defect.
+        candidates = [(s, True) for s in _pipeline_subcommands(frag)]
+        candidates.append((frag.strip(), False))
+        for sub, strict in candidates:
+            if "-delete" not in sub:
                 continue
-            j = i + 1
-            delete_pos = -1
-            has_filter = False
-            while j < len(tokens):
-                t = tokens[j]
-                if t == "-delete":
-                    delete_pos = j
-                    break
-                if t in _FIND_FILTER_PREDICATES:
-                    has_filter = True
-                j += 1
-            if delete_pos != -1 and not has_filter:
-                return "bash-guard: " + _FIND_DANGEROUS_HINT
-            i = j + 1 if delete_pos != -1 else i + 1
+            try:
+                tokens = shlex.split(sub)
+            except ValueError:
+                if strict:
+                    return "bash-guard: " + _FIND_UNPARSEABLE_HINT
+                continue
+            if "-delete" not in tokens or not any(_is_find_token(t) for t in tokens):
+                continue
+            i = 0
+            while i < len(tokens):
+                if not _is_find_token(tokens[i]):
+                    i += 1
+                    continue
+                j = i + 1
+                delete_pos = -1
+                has_filter = False
+                while j < len(tokens):
+                    t = tokens[j]
+                    if t == "-delete":
+                        delete_pos = j
+                        break
+                    if t in _FIND_FILTER_PREDICATES:
+                        has_filter = True
+                    j += 1
+                if delete_pos != -1 and not has_filter:
+                    return "bash-guard: " + _FIND_DANGEROUS_HINT
+                i = j + 1 if delete_pos != -1 else i + 1
     return None
 
 
