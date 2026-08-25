@@ -35,10 +35,10 @@ Pipeline (memorize this; it gates every change):
     │
     ▼
   GitHub Actions on PR (ubuntu-latest, KVM nested-virt):
-    verify-fork-guards, flake-check (eval), build dellan toplevel,
-    vm-minimal (matrix — one job per vm-* check),
-    vm-graphical (path-conditional), classify (risk label),
-    label-gate (merge gate based on risk + reviews)
+    preflight, verify fork-guards, flake check (eval), docs (eval),
+    discover (picks the lanes), build dellan toplevel,
+    vm-minimal (matrix — one job per selected lane),
+    vm-graphical (path-conditional)
     │
     ▼
   Human clicks merge in GitHub UI (gh pr merge is denied at the MCP
