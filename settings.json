@@ -13,6 +13,7 @@
       "Glob",
       "Grep",
       "Skill",
+      "mcp__claude_ai_TickTick__list_projects",
       "Read(//tmp/**)",
       "Read(//home/jonathan/Repos/**)",
       "Read(//etc/nixos/**)",
