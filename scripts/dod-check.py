@@ -121,10 +121,33 @@ def collect_repo(cwd):
     base = default_branch(root)
     if base is None:
         return None, "could not determine the default branch"
-    if branch == base:
-        return None, f"on the default branch ({base})"
+
+    # Being ON the default branch used to be n/a, which meant the whole gate
+    # could be side-stepped by never opening a PR: three commits sitting on an
+    # unpushed main read as "done" because nothing was measured. Where pushing
+    # straight to the default branch is how the work ships, that IS the ladder —
+    # committed, pushed, and the local branch level with origin — so it gets
+    # measured under a shorter ladder rather than waved through.
+    on_default = branch == base
 
     dirty = bool(git(["status", "--porcelain"], root)[1])
+
+    # On the default branch, measure against origin/<base> rather than @{u}.
+    # An upstream ref is a local convenience that a single `git push` without
+    # `-u` never sets, and a branch level with origin then reported as
+    # "never pushed" — wrong, and unfixable by the agent, which would push and
+    # see the same blocker again. origin/<base> is the thing that actually
+    # decides whether the work has left the machine.
+    #
+    # `behind` is the other half: "main is checked out at latest" is part of
+    # done, so commits on origin that are not here are a blocker too.
+    ahead_of_default = behind = None
+    code, count, _ = git(["rev-list", "--count", f"origin/{base}..HEAD"], root, timeout=15)
+    if code == 0 and count.isdigit():
+        ahead_of_default = int(count)
+    code, count, _ = git(["rev-list", "--count", f"HEAD..origin/{base}"], root, timeout=15)
+    if code == 0 and count.isdigit():
+        behind = int(count)
 
     # Unpushed work. No upstream at all counts as unpushed, not as an error:
     # a branch that has never been pushed is exactly the state we want to flag.
@@ -142,9 +165,12 @@ def collect_repo(cwd):
         "root": root,
         "branch": branch,
         "default_branch": base,
+        "on_default": on_default,
         "dirty": dirty,
         "has_upstream": has_upstream,
         "unpushed": unpushed,
+        "ahead_of_default": ahead_of_default,
+        "behind": behind,
     }, None
 
 
@@ -501,15 +527,50 @@ def evaluate(cwd, do_integrity=True):
     if repo["dirty"]:
         b.add("DIRTY_TREE", "uncommitted changes in the working tree",
               "commit or stash them")
-    if not repo["has_upstream"]:
+
+    if repo["on_default"]:
+        # Measured against origin/<base>, not @{u} — see collect_repo.
+        if repo["ahead_of_default"]:
+            b.add("UNPUSHED_COMMITS",
+                  f"{repo['ahead_of_default']} commit(s) on "
+                  f"{repo['branch']} not pushed to origin",
+                  f"git push origin {repo['branch']}")
+        elif repo["ahead_of_default"] is None:
+            b.add("NOT_PUSHED",
+                  f"could not compare against origin/{repo['default_branch']} "
+                  "— is the branch pushed at all?",
+                  f"git push -u origin {repo['branch']}")
+    elif not repo["has_upstream"]:
         b.add("NOT_PUSHED", "branch has no upstream — never pushed",
               f"git push -u origin {repo['branch']}")
     elif repo["unpushed"]:
         b.add("UNPUSHED_COMMITS", f"{repo['unpushed']} commit(s) not pushed",
               "git push")
 
+    # ---- direct-push ladder -------------------------------------------------
+    # On the default branch there is no PR to open and no review to wait for.
+    # Done is: committed, pushed, and level with origin. Stopping here also
+    # keeps the check honest — demanding a PR that cannot exist would make the
+    # gate unsatisfiable on exactly the repos where pushing to main is normal.
+    if repo["on_default"]:
+        if repo["behind"]:
+            b.add("BEHIND_REMOTE",
+                  f"{repo['behind']} commit(s) on origin/{repo['default_branch']} "
+                  "not in the working copy",
+                  f"git pull --ff-only origin {repo['default_branch']}")
+        result["blockers"] = b.as_list()
+        result["done"] = len(b) == 0
+        return result, (0 if result["done"] else 1)
+
     pr, checks, gh_error = collect_pr(repo["root"])
     if gh_error:
+        # A remote that simply is not GitHub is NOT a measurement failure — there
+        # is no PR to find and never will be. Treating it as exit 3 made the gate
+        # unsatisfiable: it blocked every turn until the budget burned.
+        if "known github host" in gh_error.lower():
+            result.update(applicable=False, error=None)
+            result["reason"] = "no GitHub remote — nothing to open a PR against"
+            return result, 2
         result["error"] = gh_error
         result["blockers"] = b.as_list()
         return result, 3
@@ -523,8 +584,20 @@ def evaluate(cwd, do_integrity=True):
     elif (pr.get("state") or "").upper() == "MERGED":
         # Already landed. Every downstream gate is moot, and asking the user to
         # merge it is the specific failure this branch of the logic exists to
-        # prevent: a stale PR link presented as a live request. Merged is done.
+        # prevent: a stale PR link presented as a live request.
         result["merged"] = True
+        # Landed, but the repo is still parked on the merged branch. Putting it
+        # back is the last step of the work, not a chore for Jonathan — leaving
+        # a checkout on a dead branch is exactly the "closing ceremony" this is
+        # meant to remove. The gate SAYS so and the agent does it, visibly; the
+        # predicate never touches the repo itself. That is deliberate: an
+        # automatic checkout from a Stop hook is the failure we watched happen
+        # on 2026-08-27, when another agent switched branches under a live
+        # session and deleted files out from under a running hook.
+        b.add("NOT_ON_DEFAULT",
+              f"PR is merged but the repo is still on {repo['branch']}",
+              f"git switch {repo['default_branch']} && "
+              f"git pull --ff-only origin {repo['default_branch']}")
     elif (pr.get("state") or "").upper() == "CLOSED":
         b.add("PR_CLOSED",
               f"PR #{pr.get('number')} was closed without merging",
@@ -643,7 +716,14 @@ def render(result):
                      "result — treat it as not done and fix the tooling first.")
         return "\n".join(lines)
 
-    lines.append(f"dod-check: NOT DONE — {head}")
+    # Merged-but-not-finished still has to say MERGED loudly. The remaining
+    # work is tidying (get off the dead branch); the one thing that must not
+    # happen is this reading as a live merge request.
+    if result.get("merged"):
+        lines.append(f"dod-check: MERGED, NOT FINISHED — {head}")
+        lines.append("  Already landed. Do NOT ask for a merge — finish the tidy-up:")
+    else:
+        lines.append(f"dod-check: NOT DONE — {head}")
     for item in result["blockers"]:
         lines.append(f"  [{item['code']}] {item['detail']}")
         if item.get("fix"):

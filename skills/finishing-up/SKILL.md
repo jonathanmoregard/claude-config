@@ -30,6 +30,32 @@ Exit codes: `0` done · `1` blockers · `2` not applicable · `3` could not tell
 Run this *in the turn where you make the claim*. Not earlier in the session,
 not "I checked after the last push". Fresh, or it is not evidence.
 
+## Two ladders
+
+Which one applies is decided by the branch, and `dod-check` picks for you.
+
+**Direct-push — you are on the default branch.** Committed → pushed → level with
+`origin`. That is the whole ladder. No PR is demanded, because none can exist.
+This is not a loophole: it used to be `n/a`, which meant the gate could be
+side-stepped entirely by never opening a PR, and commits sat unpushed on `main`
+reading as finished.
+
+**PR flow — you are on a feature branch.** Committed → pushed → PR open →
+checks green (or the repo has no CI) → mergeable → Jonathan's merge click →
+**switch back to the default branch and pull**.
+
+**A session ends on the default branch, clean, at latest.** Leaving a checkout
+parked on a merged feature branch is a closing ceremony, and Jonathan does not
+want one: *"I want Claude to move as close as possible to finishing, so there is
+no closing ceremony for me to do, beyond bare necessities."*
+
+Bare necessities are the merge click on a protected branch, credentials,
+interactive logins, and taste calls. Everything else is yours.
+
+**Several repos is normal.** One session legitimately spans e.g. `nixos-config`
+plus a project. Each repo runs its own ladder and each gets its own line in the
+report, with its own URL.
+
 ## Step 2 — Act on what it says
 
 Work the blockers in the order reported; each has a `fix` field.
@@ -37,7 +63,9 @@ Work the blockers in the order reported; each has a `fix` field.
 | Blocker | What to do |
 |---|---|
 | `DIRTY_TREE` | Commit it. Do not report a state you have uncommitted changes on top of. |
-| `NOT_PUSHED` / `UNPUSHED_COMMITS` | Push. |
+| `NOT_PUSHED` / `UNPUSHED_COMMITS` | Push. On the default branch this is measured against `origin/<base>`, not the upstream ref. |
+| `BEHIND_REMOTE` | `git pull --ff-only`. "At latest" is part of done. |
+| `NOT_ON_DEFAULT` | The PR merged and the repo is still on the dead branch. `git switch <default> && git pull --ff-only`. This is the last step of the work, not a chore for Jonathan. |
 | `NO_PR` | `gh pr create --fill`, then write a real body. |
 | `PR_DRAFT` | `gh pr ready <n>` — a draft is not a merge request. |
 | `CHECKS_PENDING` | **Step 3.** Do not guess the outcome. |
@@ -48,8 +76,10 @@ Work the blockers in the order reported; each has a `fix` field.
 | `INTEGRITY` | You (or the diff) weakened the signal. Revert it. Justify with a `dod-ok` comment only if it is genuinely correct — the comment lands in the diff for Jonathan to disagree with. |
 | `PR_CLOSED` | Closed without merging. Do not report it as pending. |
 
-`MERGED` is not a blocker — it means **done**. Report it as landed. Never ask
-for a merge on a merged PR.
+`MERGED` is never a request for a merge. Report it as landed, and never ask
+Jonathan to click something he already clicked. It is not quite *done* on its
+own, though: a merged PR still leaves the checkout on a dead branch, so
+`NOT_ON_DEFAULT` follows it. Go home, then you are done.
 
 ## Step 3 — Pending checks: schedule, never spin
 

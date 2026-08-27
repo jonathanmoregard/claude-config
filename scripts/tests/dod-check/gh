@@ -95,5 +95,13 @@ case "$DOD_FIXTURE" in
   apierror)
     echo "HTTP 503: upstream unavailable" >&2; exit 1
     ;;
+  notgithub)
+    # Wording copied from the real CLI. This is NOT a measurement failure —
+    # there is no PR to find and never will be — so dod-check must answer n/a
+    # rather than exit 3. As exit 3 it was a blocker, and the gate blocked every
+    # turn until its budget burned on a repo it could never satisfy.
+    echo "none of the git remotes configured for this repository point to a known GitHub host. To tell gh about a new GitHub host, please use \`gh auth login\`" >&2
+    exit 1
+    ;;
 esac
 exit 0

@@ -27,6 +27,46 @@ fi
 
 RALPH_STATE_FILE="$STATE_DIR/$HOOK_SESSION.md"
 
+# ---------------------------------------------------------------------------
+# Ending the loop hands the turn to the definition-of-done gate.
+#
+# The gate stands down while a loop owns the session, so two Stop hooks never
+# block one turn and out-vote the human. That leaves one question: who checks
+# the work on the turn the loop ENDS?
+#
+# It cannot be left to hook ordering. Measured on 2.1.247 with two Stop hooks,
+# one sleeping: the hook declared SECOND started 111ms BEFORE the first, and ran
+# while it slept. Stop hooks are CONCURRENT. So on the final turn the gate may
+# read the state file before this script unlinks it, stand down, and there is no
+# next turn — the loop's last turn escapes the check entirely, which is exactly
+# the turn where "did any of this get pushed?" matters most.
+#
+# So the loop hands over explicitly. Every path that ends the loop calls this,
+# and the GATE's verdict decides whether the turn may end. Its own ownership
+# check passes by itself, because the state file is gone before it runs.
+#
+# The standalone gate later in the Stop list still races us and may reach the
+# same verdict independently, costing a duplicated block message. The opposite
+# failure — no check at all — is the one worth engineering against.
+end_loop() {  # $1 = human-readable message for the transcript
+  local msg="$1" gate="$HOME/.claude/hooks/finishing-up-gate.py" out=""
+  rm -f "$RALPH_STATE_FILE"
+  if [[ -f "$gate" ]]; then
+    out=$(printf '%s' "$HOOK_INPUT" | python3 "$gate" 2>/dev/null) || out=""
+  fi
+  if [[ -n "$out" ]]; then
+    # Exactly one JSON object must reach the harness, so fold our message into
+    # the gate's: a block keeps its reason and the human still learns why the
+    # loop ended.
+    jq -n --argjson g "$out" --arg m "$msg" \
+      '$g + {systemMessage: ([($g.systemMessage // ""), $m] | map(select(. != "")) | join(" | "))}' \
+      2>/dev/null || printf '%s\n' "$out"
+  else
+    jq -n --arg m "$msg" '{systemMessage: $m}'
+  fi
+  exit 0
+}
+
 if [[ ! -f "$RALPH_STATE_FILE" ]]; then
   # This session has no active loop - allow exit
   exit 0
@@ -46,8 +86,7 @@ if [[ ! "$ITERATION" =~ ^[0-9]+$ ]]; then
   echo "   Problem: 'iteration' field is not a valid number (got: '$ITERATION')" >&2
   echo "" >&2
   echo "   Ralph loop is stopping. Run /ralph-loop again to start fresh." >&2
-  rm "$RALPH_STATE_FILE"
-  exit 0
+  end_loop "Ralph loop: stopped - state file corrupted (iteration)."
 fi
 
 if [[ ! "$MAX_ITERATIONS" =~ ^[0-9]+$ ]]; then
@@ -56,15 +95,12 @@ if [[ ! "$MAX_ITERATIONS" =~ ^[0-9]+$ ]]; then
   echo "   Problem: 'max_iterations' field is not a valid number (got: '$MAX_ITERATIONS')" >&2
   echo "" >&2
   echo "   Ralph loop is stopping. Run /ralph-loop again to start fresh." >&2
-  rm "$RALPH_STATE_FILE"
-  exit 0
+  end_loop "Ralph loop: stopped - state file corrupted (max_iterations)."
 fi
 
 # Check if max iterations reached
 if [[ $MAX_ITERATIONS -gt 0 ]] && [[ $ITERATION -ge $MAX_ITERATIONS ]]; then
-  echo "🛑 Ralph loop: Max iterations ($MAX_ITERATIONS) reached."
-  rm "$RALPH_STATE_FILE"
-  exit 0
+  end_loop "Ralph loop: max iterations ($MAX_ITERATIONS) reached."
 fi
 
 TRANSCRIPT_PATH=$(echo "$HOOK_INPUT" | jq -r '.transcript_path')
@@ -114,8 +150,7 @@ else
     echo "⚠️  Ralph loop: Failed to parse assistant message JSON" >&2
     echo "   Error: $LAST_OUTPUT" >&2
     echo "   Ralph loop is stopping." >&2
-    rm "$RALPH_STATE_FILE"
-    exit 0
+    end_loop "Ralph loop: stopped - could not parse the transcript."
   fi
 fi
 
@@ -128,9 +163,7 @@ if [[ "$COMPLETION_PROMISE" != "null" ]] && [[ -n "$COMPLETION_PROMISE" ]]; then
 
   # Use = for literal string comparison ( == in [[ ]] would glob-match )
   if [[ -n "$PROMISE_TEXT" ]] && [[ "$PROMISE_TEXT" = "$COMPLETION_PROMISE" ]]; then
-    echo "✅ Ralph loop: Detected <promise>$COMPLETION_PROMISE</promise>"
-    rm "$RALPH_STATE_FILE"
-    exit 0
+    end_loop "Ralph loop: completion promise met."
   fi
 fi
 
@@ -152,12 +185,10 @@ fi
 if [[ "$LAST_OUTPUT" == *"<halt>"* ]]; then
   HALT_REASON=$(echo "$LAST_OUTPUT" | perl -0777 -pe 's/.*?<halt>(.*?)<\/halt>.*/$1/s; s/^\s+|\s+$//g; s/\s+/ /g' 2>/dev/null || echo "")
   if [[ -n "$HALT_REASON" ]]; then
-    echo "🛑 Ralph loop: halted at iteration $ITERATION WITHOUT claiming completion — $HALT_REASON"
     printf '%s\t%s\titeration=%s\t%s\n' \
       "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$HOOK_SESSION" "$ITERATION" "$HALT_REASON" \
       >> "$STATE_DIR/halts.log" 2>/dev/null || true
-    rm "$RALPH_STATE_FILE"
-    exit 0
+    end_loop "Ralph loop: halted at iteration $ITERATION without claiming completion - $HALT_REASON"
   fi
   # A bare <halt> with no reason is not an exit. Fall through and keep looping.
   echo "⚠️  Ralph loop: <halt> seen with an empty reason; ignoring. A halt must say why." >&2
@@ -174,8 +205,7 @@ if [[ -z "$PROMPT_TEXT" ]]; then
   echo "   File: $RALPH_STATE_FILE" >&2
   echo "   Problem: No prompt text found" >&2
   echo "   Ralph loop is stopping. Run /ralph-loop again to start fresh." >&2
-  rm "$RALPH_STATE_FILE"
-  exit 0
+  end_loop "Ralph loop: stopped - state file has no prompt text."
 fi
 
 # Update iteration in frontmatter (portable across macOS and Linux)

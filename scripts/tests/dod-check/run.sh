@@ -45,10 +45,44 @@ case_run() {
 
 echo "== dod-check test suite =="
 
-# ---- not applicable -------------------------------------------------------
+# ---- the direct-push ladder -----------------------------------------------
+# Being ON the default branch used to be n/a, which made the whole gate
+# opt-out: never open a PR and nothing was ever measured, so commits could sit
+# unpushed on main forever and read as finished. Where pushing straight to the
+# default branch is how work ships, that IS the delivery path — committed,
+# pushed, level with origin — and no PR is demanded, because none can exist.
 fresh_repo
 git switch -q master
-case_run "n/a on default branch" green 2 "on the default branch"
+case_run "clean pushed default branch is DONE" green 0 "DONE"
+
+fresh_repo
+git switch -q master
+echo "straight to main" >> src/a.py; git add -A; git commit -qm "direct"
+case_run "unpushed commits on main block" green 1 "UNPUSHED_COMMITS"
+
+# Upstream tracking is a local convenience `git push` without -u never sets, so
+# the default-branch ladder measures against origin/<base> instead. Before this,
+# a branch level with origin reported "never pushed" and no amount of pushing
+# could clear it.
+fresh_repo
+git switch -q master
+echo "no -u" >> src/a.py; git add -A; git commit -qm direct
+git push -q origin master           # deliberately WITHOUT -u
+case_run "pushed without -u still reads as pushed" green 0 "DONE"
+
+# "main is checked out at latest" is part of done.
+fresh_repo
+git switch -q master
+git clone -q "$HERE/origin.git" "$HERE/clone2"
+git -C "$HERE/clone2" config user.email t@t; git -C "$HERE/clone2" config user.name t
+echo "from elsewhere" >> "$HERE/clone2/src/a.py"
+git -C "$HERE/clone2" add -A; git -C "$HERE/clone2" commit -qm elsewhere
+git -C "$HERE/clone2" push -q origin master
+git fetch -q origin
+case_run "behind origin on main blocks" green 1 "BEHIND_REMOTE"
+rm -rf "$HERE/clone2"
+
+# ---- not applicable -------------------------------------------------------
 
 # Must be outside ANY git repo. $HERE lives inside ~/.claude once this suite is
 # committed, so a notrepo/ beside the tests is emphatically inside a repo — the
@@ -74,8 +108,13 @@ case_run "unpushed commits block" green 1 "UNPUSHED_COMMITS"
 # ---- PR states ------------------------------------------------------------
 fresh_repo; git push -q -u origin feat/x
 case_run "no PR blocks"            no_pr    1 "NO_PR"
-case_run "merged reads as DONE"    merged   0 "MERGED"
-case_run "merged says do not ask"  merged   0 "Do NOT ask for a merge"
+# Merged is no longer the end of the job. The repo is still parked on the dead
+# branch, and putting it back on the default branch at latest is the last step
+# of the work rather than a chore for Jonathan — "no closing ceremony for me to
+# do". What must NOT change is that a merged PR never reads as a live request.
+case_run "merged still says do not ask" merged 1 "Do NOT ask for a merge"
+case_run "merged says MERGED"      merged   1 "MERGED, NOT FINISHED"
+case_run "merged demands going home" merged  1 "NOT_ON_DEFAULT"
 case_run "closed blocks"           closed   1 "PR_CLOSED"
 case_run "pending checks block"    pending  1 "CHECKS_PENDING"
 case_run "failing checks block"    failing  1 "CHECKS_FAILING"
@@ -83,6 +122,7 @@ case_run "unresolved threads"      failing  1 "UNRESOLVED_THREADS"
 case_run "BEHIND blocks"           behind   1 "NOT_MERGEABLE"
 case_run "all green is done"       green    0 "DONE"
 case_run "gh error is exit 3"      apierror 3 ""
+case_run "no GitHub remote is n/a, not a blocker" notgithub 2 "no GitHub remote"
 # Advisory, not blocking: threads that actually gate a merge surface as
 # mergeStateStatus BLOCKED. But the warning must survive into a DONE
 # verdict, or "green" and "green as far as I got" print identically.

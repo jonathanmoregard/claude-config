@@ -40,8 +40,16 @@ case "$root" in
   "$HOME/.local/state/"*|/tmp/*|"$HOME/.cache/"*) exit 0 ;;
 esac
 
-# Never arm on the default branch: there is no PR to drive, and blocking a stop
-# on main would fault every ordinary edit.
+# The default branch USED to be skipped here, on the reasoning that there is no
+# PR to drive. That made the whole gate opt-out: never open a PR and nothing is
+# ever measured, so commits could sit unpushed on main indefinitely and read as
+# finished. Where pushing straight to the default branch is how work ships, that
+# IS the delivery path and it gets the shorter ladder instead — committed,
+# pushed, level with origin. dod-check decides which ladder applies; this hook's
+# only job is to notice that a repo was touched.
+#
+# A default branch must still be resolvable: without one there is no ladder to
+# pick and nothing to compare against.
 default=$(git -C "$root" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
 if [ -z "$default" ]; then
   for c in main master; do
@@ -49,7 +57,6 @@ if [ -z "$default" ]; then
   done
 fi
 [ -n "$default" ] || exit 0
-[ "$branch" = "$default" ] && exit 0
 
 mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
 armfile="$STATE_DIR/$session.arm"
