@@ -214,3 +214,6 @@ experiments/*/runs-pilot-discarded/
 # skill after 2026-08-18 would have been silently ignored (SKILL.md survived
 # only because it was already tracked).
 /self-compact/
+
+# Working notes symlink -> ~/.local/state/claude-tasks/ (userspace, never committed)
+tasks
