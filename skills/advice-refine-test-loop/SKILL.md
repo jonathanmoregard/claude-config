@@ -12,7 +12,7 @@ The loop catches all four by staging the review:
 - **Phase 1 (Opus + narrow specialists)** does broad correctness review plus targeted passes (secure defaults, footgun APIs) when the diff touches those areas.
 - **Phase 2 (Codex/GPT-5.5)** cross-vendor review runs LAST so it only sees Opus-blessed state — preserves cross-vendor coverage while spending Codex's tighter ChatGPT Plus quota only on what Opus already cleared.
 - **Phase 3 (adversarial)** is a single Opus dispatch framed as "assume the prior phases were wrong, find why" — catches the confirmation-bias class both prior phases share.
-- **Phase 4 (taste)** applies to UI work only, after all correctness phases have ADVANCED. Split into 4a (Opus defect + taste critics) and 4b (Codex vision-taste on regenerated shots, second vendor). The protocol for both lives in `~/.claude/skills/advice-refine-test-loop/references/ui-taste-phases.md` — read it IN FULL when the trigger fires.
+- **Phase 4 (taste)** applies to UI work only, after all correctness phases have ADVANCED. It is ONE blind parallel wave — lanes `4a` (two Opus critics), `4b` (Codex vision-taste) and the geometry oracle all dispatch concurrently on byte-identical shots, downstream of a deterministic diff that scopes them and upstream of a single bounded fix pass. No lane ever sees another's output. The protocol lives in `~/.claude/skills/advice-refine-test-loop/references/ui-taste-phases.md` — read it IN FULL when the trigger fires.
 
 Every phase uses a **structured JSON verdict schema** (`verdict-schema.json`) so findings are parseable, not vibes. **The loop-bounds gate is the only authority on advancement; the verdict is one of its inputs and routes nothing.** Between phases, a **consolidator sub-loop** auto-fixes safe_auto LOW findings (severity × autofix_class AND-gate; see below).
 
@@ -30,12 +30,16 @@ PHASE 2:  Codex (GPT-5.5) — loop rounds until the gate ends the phase
 PHASE 3:  Adversarial — single Opus round, "the prior phases were wrong"
           framing (a gate `continue` resets to Phase 1; at most ONE reset
           per run)
-PHASE 4a: Taste round (UI-only, ONCE) — Opus defect + taste critics
-PHASE 4b: Codex vision-taste (UI-only, ONCE) — second-vendor VLM on the
-          regenerated shots, combined with geometry-oracle output.
-          BOTH phases: read ~/.claude/skills/advice-refine-test-loop/
+PHASE 4:  UI taste review (UI-only, ONCE) — one blind parallel wave:
+          stage 0  deterministic diff → changed-region manifest
+          stage 1  lanes 4a (Opus defect + taste critics), 4b (Codex
+                   vision-taste) and ORACLE dispatch CONCURRENTLY on
+                   byte-identical shots; no lane sees another's output
+          stage 2  combiner · stage 3 one bounded fix pass
+          stage 4  post-fix regression gate vs the ORIGINAL baseline
+          Read ~/.claude/skills/advice-refine-test-loop/
           references/ui-taste-phases.md IN FULL when the trigger fires
-          (see "Phases 4a + 4b" below)
+          (see "Phase 4" below)
 ```
 
 Whenever the gate advances a phase, the **consolidator sub-loop** runs first if the phase's final round left any `severity=LOW AND autofix_class=safe_auto` finding (see "Consolidator" below).
@@ -657,8 +661,8 @@ do not invent a second escalation path:
 **Gated phases: 1, 2 and 3.** Every round of all three ends at this gate, and
 no phase among them starts, repeats, or ends any other way. Not covered
 (bounded by their own caps, and neither loops nor advances on a verdict):
-consolidator sub-loop (3 rounds), Phase 4a (one critique + one fix pass),
-Phase 4b (one pass per surface).
+consolidator sub-loop (3 rounds), Phase 4 (one blind wave — one pass per
+surface per lane — plus one fix pass and one post-fix regression gate).
 
 **Phase 0 is not gated and never routes through this table.** It is a
 precondition, not a round: it produces no verdict, has no counters, and cannot
@@ -1030,7 +1034,7 @@ Rate on those properties alone. Do not consider what happens next.
 
 Where the loop needs a severity FLOOR for a known rule class (Phase 4a's taste tiers, Phase 4b's fixed visual rules and drift-backs), the parent applies the floor in code after parsing. Give the advisor the rule to check, not the grade to assign.
 
-One lever is deliberately kept and is NOT severity policy: telling a reviewer to bias toward REPORTING when a downstream arbiter suppresses false positives (Phase 4b). That moves the reporting threshold, not the severity label. Do not extend it into "and mark them HIGH".
+One lever is deliberately kept and is NOT severity policy: telling a reviewer to bias toward REPORTING when a downstream combiner suppresses false positives (lane 4b). That moves the reporting threshold, not the severity label. Do not extend it into "and mark them HIGH".
 
 ## Reproduce Before Fixing
 
@@ -1131,13 +1135,26 @@ After consolidator exits (clean or bounded), complete the phase transition the g
 | Let the consolidator fix a LOW without confirming it against the file | The weakest findings would then get the weakest gate, and unverified edits break working code. Read the stated location, confirm the condition is there, `skipped: unconfirmed` otherwise. |
 | Give the specialists a peek at the primary's findings before they report | One shared cue collapses independent reviewers into one. Same block, no shared state, merge only after all have returned. |
 
-## Phases 4a + 4b: UI taste review (UI-work only)
+## Phase 4: UI taste review (UI-work only)
 
 The full protocol lives in
 `~/.claude/skills/advice-refine-test-loop/references/ui-taste-phases.md`.
-**Read that file in full before dispatching 4a** — not in part, and not from
-memory. It is the only place the two-assessment protocol, the Codex vision
-invocation, the combiner table and the disposition ledger are written down.
+**Read that file in full before dispatching the wave** — not in part, and not
+from memory. It is the only place the stage order, the lane prompts, the Codex
+vision invocation, the combiner table, the hallucination drop rule, the
+degrade-when-absent paths and the disposition ledger are written down.
+
+**Shape, so it cannot be got wrong from memory.** Phase 4 is ONE wave, not a
+relay. A deterministic diff runs first and yields the changed-region manifest;
+then lane `4a` (two Opus critics), lane `4b` (Codex vision-taste) and the
+geometry oracle dispatch CONCURRENTLY, in one tool-use block, on byte-identical
+shots, with no lane receiving another lane's output; then the parent combines,
+runs exactly ONE fix pass, and closes with a post-fix regression gate that
+re-diffs against the ORIGINAL baseline. Quoting one reviewer's judgment into
+another's context moves a VLM judge 19-26 pp (arXiv 2608.07920), and a defect
+fixed between lanes no longer renders for the later lane to vote on — serial
+ordering therefore loses coverage twice over. `4a` and `4b` are lane names and
+run-state labels; they no longer imply an ordering.
 
 **Trigger — read the reference iff ALL THREE hold:**
 
@@ -1148,17 +1165,25 @@ invocation, the combiner table and the disposition ledger are written down.
   4; the run is paused, not advanced, AND
 - regenerated shots exist for the touched surfaces.
 
-Pure backend / infra / docs diffs skip both 4a and 4b and go straight to Exit.
+Pure backend / infra / docs diffs skip Phase 4 entirely and go straight to Exit.
+
+Neither deterministic component is a trigger condition. A project with no
+geometry oracle and no screenshot-diff harness still runs the VLM lanes; what
+changes is which guarantees the run may claim. The reference file states, per
+component, what is lost and what must NOT be claimed — **measured 2026-08-27,
+the one project using this skill has neither on its default branch, so that is
+the normal path, not an edge case.** Recording a missing component as a passing
+check is the fail-open failure this skill exists to name.
 
 **Completion contract — stated here because it must hold whether or not the
-reference file was read.** On a UI-touching diff the phase is 4a AND 4b, both,
-each run to completion. 4b is never silently skipped: the drift-back class of
+reference file was read.** On a UI-touching diff every VLM lane runs, and each
+runs to completion. Lane 4b is never silently skipped: the drift-back class of
 defects (dot-above-text, selected-state regression, red-title-on-non-danger,
-combobox-narrower-than-control) survives Phases 1-4a whole, because every
-frontier VLM misses 60%+ of true single-CSS-property defects (DiffSpot 2026,
-arXiv 2605.29615) and a single vendor's blind spot repeats across rounds. A
-skipped 4b is worse than a skipped Phase 2. If 4b cannot run, that is a PAUSE
-per the Phase 2 rules — never a completed phase.
+combobox-narrower-than-control) survives Phases 1-3 and the Opus lanes whole,
+because every frontier VLM misses 60%+ of true single-CSS-property defects
+(DiffSpot 2026, arXiv 2605.29615) and a single vendor's blind spot repeats across
+rounds. A skipped 4b is worse than a skipped Phase 2. If 4b cannot run, that is a
+PAUSE per the Phase 2 rules — never a completed phase.
 
 **Two ship-gating constraints, duplicated here verbatim on purpose** — they
 decide whether the run ships, so they must not live only behind a Read:
@@ -1167,14 +1192,20 @@ decide whether the run ships, so they must not live only behind a Read:
   without geometry-oracle backing does not stop the ship; it goes to the ledger
   and (if reproducible) the founder.
 - **Sigil requires reviewer confirmation.** The sigil-ready state needs
-  geometry-oracle green + Phase 4b run to completion + all HIGH-tier findings
-  resolved. Never sigil on a partial or half-run 4b.
+  geometry-oracle green + lane 4b run to completion + all HIGH-tier findings
+  resolved. Never sigil on a partial or half-run 4b. "Run to completion" means a
+  parseable verdict for every surface; a lane that exited non-zero is a PAUSE,
+  and concurrent dispatch does not make an incomplete lane complete. When the
+  project has no oracle, "geometry-oracle green" cannot be shown and must not be
+  claimed — the Exit report states that precondition as unmet, not satisfied.
 
-Both phases emit `verdict-schema.json` and are parsed by the same step-4 `jq`
-cross-validation as every other phase. Both apply their severity FLOORS
+Every lane emits `verdict-schema.json` and is parsed by the same step-4 `jq`
+cross-validation as every other phase. Every lane applies its severity FLOORS
 parent-side, after parsing, never in a prompt (see "Elicit risk, not policy").
-Neither is gated by "Loop bounds": 4a is one critique plus one bounded fix pass,
-4b is one pass per surface.
+Phase 4 is not gated by "Loop bounds": one wave, one pass per surface per lane,
+one bounded fix pass, one post-fix regression gate whose fix authority covers
+oracle violations and the contamination it detects — nothing else, or the
+one-fix-pass cap is fiction.
 
 ## Composition table (skill-facing summary)
 
@@ -1184,9 +1215,12 @@ Neither is gated by "Loop bounds": 4a is one critique plus one bounded fix pass,
 | 4.5 (in-round) | Anthropic (Opus, validator) | Re-verify findings against actual file state — sent ALL of the round's findings (the judge that dedupes them is in flight alongside), with only the PIVOTAL (singleton) rows applied. Input boundary, drop rule and degrade-on-failure behaviour all defined at step 4.5. A drop CLOSES the finding with `repro: false` and keeps it in `new_r` | Co-dispatched with step 4's dedupe judge in ONE tool-use block; feeds into step 5 (reproduce) | Per-finding on independent two-reviewer convergence, applied by discarding that row on return; wholesale on any validator failure — see step 4.5 |
 | 2 | OpenAI (Codex / GPT-5.5) | Cross-vendor correctness on Opus-clean state | Phase 1 fix history carried in prompt | Never; PAUSE on quota, don't silently skip |
 | 3 | Anthropic (Opus, adversarial) | "Prior phases were wrong — find why" | Same gate at step 8; a `continue` resets to Phase 1 | Never; one shot, cheap |
-| 4a | Anthropic (Opus x2 — defect + taste critics) | UI defect + house-style critique — protocol per "Phases 4a + 4b" | Own phase output only | Non-UI diffs |
-| 4b | OpenAI (Codex vision-taste) on regenerated shots | Second-vendor VLM catch-what-Opus-missed — protocol per "Phases 4a + 4b" | Union w/ geometry oracle (ground truth) + Phase 4a Opus taste, per `docs/reviews/multi-model-taste-ledger.md` protocol | Non-UI diffs; NEVER skip on UI-touching diffs — drift-back class survives 1-4a |
-| 4c (future) | Google (Gemini 2.5 Pro / 3.x) | Third-vendor VLM, high-recall miss catcher | Same combiner slot as 4b | No API key wired |
+| 4 stage 0 | none (deterministic) | Capture + diff vs baseline → changed-region manifest; scopes every lane. 100% of CSS changes vs 40.7% for the best VLM | Consumed as a filter by the combiner, not as findings | Non-UI diffs; degrades per "Phase 4" when the project has no diff harness |
+| 4 lane 4a | Anthropic (Opus x2 — defect + taste critics) | UI defect + house-style critique — protocol per "Phase 4" | Combiner, after ALL lanes return. Same model twice = ONE vendor | Non-UI diffs |
+| 4 lane 4b | OpenAI (Codex vision-taste) on regenerated shots | Second-vendor VLM catch-what-Opus-missed — protocol per "Phase 4" | Combiner, after ALL lanes return, per `docs/reviews/multi-model-taste-ledger.md` protocol | Non-UI diffs; NEVER skip on UI-touching diffs — drift-back class survives Phases 1-3 and the Opus lanes |
+| 4 lane ORACLE | none (deterministic) | Geometry assertions. Ground truth, not a vote — auto-fixes with no VLM vote required | Combiner. Dispatched in the same block as the VLM lanes; feeds no prompt | Non-UI diffs; degrades per "Phase 4" when the project has no oracle |
+| 4 stage 4 | deterministic + the same VLM lanes | Post-fix regression gate: re-diff vs the ORIGINAL baseline, VLM pass on newly-changed regions only | Catches reflow contamination from the one fix pass | Never on a UI diff that was fixed; no VLM sub-pass when nothing newly changed |
+| 4 lane 4c (future) | Google (Gemini 2.5 Pro / 3.x) | Third-vendor VLM, high-recall miss catcher | A FOURTH lane in the same blind wave, same combiner rules | No API key wired |
 
 ## Exit
 
