@@ -8,8 +8,12 @@ THE SEQUENCE, and why it is in this order:
        NOT under ~/.claude, because that whole tree is Claude Code's own config
        and state surface and the agent's working state is not the CLI's to own
     2. wait until that file appears AND is newer than the request
-    3. /clear
-    4. a pickup message naming only that file
+    3. wait for the turn that wrote it to END. The file lands at the session's
+       Write TOOL CALL, and the turn runs on after it; text arriving mid-turn is
+       queued by the TUI rather than parsed, so a `/clear` sent here is not a
+       command at all
+    4. /clear
+    5. a pickup message naming only that file
 
 Step 1 is the whole point. The session crossing the threshold is ALREADY holding
 the context, so it writes the summary itself: no second model call, no
@@ -58,6 +62,9 @@ session:
   * nothing is cleared unless a FRESH handoff exists. Existence alone is not
     enough: a handoff from an earlier crossing would otherwise pass instantly
     and we would clear a session to resume it from obsolete state.
+  * the clear is not sent until the session is out of its turn, because input
+    arriving mid-turn is queued as ordinary text and never reaches the command
+    parser.
   * the clear is confirmed before the pickup is sent, because `/clear` typed
     into a prompt that already holds text is swallowed rather than run.
   * one reset per session at a time, so two runs cannot interleave.
@@ -117,6 +124,28 @@ SUBAGENT_WAIT_CAP_SECONDS = 3 * 60 * 60
 # gap: a single tool call can run 10-15 minutes without appending anything.
 SUBAGENT_STALE_SECONDS = 30 * 60
 SUBAGENT_POLL_SECONDS = 5
+# THE HANDOFF LANDING IS NOT THE TURN ENDING, and the wait above stops at the
+# landing. The file appears at the session's Write TOOL CALL; the turn runs on
+# afterwards while the model finishes its closing message.
+#
+# MEASURED 2026-08-27, sid f90449b2: Write at 14:26:52, file on disk 14:26:54,
+# `end_turn` at 14:27:03 — an 11-second tail. `/clear` went out at 14:26:55,
+# inside it. Text arriving in a live turn is QUEUED by the TUI rather than
+# parsed, so it was never a command: that session's transcript recorded
+# `queue-operation enqueue` carrying the whole write-instruction with `/clear`
+# stuck on the end (905 chars), then `remove`. The session id never changed, the
+# confirmation below caught it, and the reset refused — correctly, but having
+# spent a whole handoff turn for nothing.
+#
+# So the clear waits for the session to leave its turn. Bounded, because the
+# instruction it is answering says "write the file and then stop": a tail longer
+# than this is not the tail of that turn, and sending into it would only
+# reproduce the failure.
+CLEAR_IDLE_WAIT_SECONDS = 120
+# Between the turn ending and `/clear`: the TUI has to finish rendering the last
+# of the turn and settle on an empty prompt. Same reason as CLEAR_SETTLE_SECONDS
+# below, at the other end of the command.
+TURN_SETTLE_SECONDS = 1.5
 # Gap between `/clear` and the pickup: the TUI has to process the command and
 # return to an empty prompt.
 CLEAR_SETTLE_SECONDS = 2.0
@@ -264,6 +293,28 @@ def live_subagents(sid: str) -> list[str]:
         name = p.stem
         live.append(name[len("agent-"):] if name.startswith("agent-") else name)
     return live
+
+
+def wait_for_turn_to_end(spid: int, sid: str, deadline_seconds: float | None = None) -> bool:
+    """Block until the session is out of its turn. False if it never got there.
+
+    A separate function from the handoff wait because it answers a different
+    question. That one asks "has the session produced the file yet", and breaks
+    at the Write TOOL CALL. This one asks "is the TUI able to read a COMMAND
+    yet", and only the end of the turn answers it — see CLEAR_IDLE_WAIT_SECONDS
+    for the transcript this was measured against.
+
+    Returning False is a refusal, not a fallback: the caller must not clear. The
+    one thing that must NOT happen at the ceiling is sending anyway, which is
+    precisely the failure this exists to stop.
+    """
+    limit = CLEAR_IDLE_WAIT_SECONDS if deadline_seconds is None else deadline_seconds
+    deadline = time.time() + limit
+    while session_is_working(spid, sid):
+        if time.time() >= deadline:
+            return False
+        time.sleep(1)
+    return True
 
 
 def log(msg: str) -> None:
@@ -568,6 +619,24 @@ def main(argv: list[str]) -> int:
             f"{WRITE_WAIT_CAP_SECONDS}s ceiling; the session was still working. Nothing "
             "was destroyed.")
         return 1
+
+    # OUT OF THE TURN BEFORE THE CLEAR. The loop above breaks the moment the file
+    # exists, which is the Write tool call, not the end of the turn — see
+    # CLEAR_IDLE_WAIT_SECONDS. `/clear` sent into a live turn is queued as
+    # ordinary text and never reaches the command parser.
+    #
+    # `session_is_working` degrading to False on an unreadable registry is the
+    # right failure here as well: it puts us back to sending immediately, which
+    # is what this did before, and the confirmation below still refuses if the
+    # clear did not land.
+    if not wait_for_turn_to_end(spid, sid):
+        log(f"sid={sid} NOT CLEARING: the handoff at {target} is written, but the session "
+            f"was still mid-turn {CLEAR_IDLE_WAIT_SECONDS}s after it landed. A `/clear` sent "
+            "into a live turn is queued as ordinary text instead of being run, so it would "
+            "be spent for nothing. Nothing was destroyed; the handoff is on disk and the "
+            "marker is kept.")
+        return 1
+    time.sleep(TURN_SETTLE_SECONDS)
 
     # Evidence that the clear ACTUALLY landed, not merely that bytes arrived.
     # `kitten` returning 0 says the text was delivered to the window; it says
