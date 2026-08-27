@@ -242,8 +242,14 @@ def main():
                 fresh = False
             try:
                 marker.unlink()
-            except OSError:
-                pass
+            except OSError as exc:
+                # Deliberately not swallowed. A marker we cannot consume stands
+                # this session down again on the NEXT turn too, until it ages
+                # past the staleness bound — and from the outside that is
+                # indistinguishable from a gate that simply chose not to block.
+                # Rare, but exactly the kind of silence this tool exists to end.
+                log(session, {"action": "warn",
+                              "why": f"could not consume handover marker: {exc}"})
             if fresh:
                 log(session, {"action": "allow",
                               "why": "ralph handed this turn to its own gate call"})
