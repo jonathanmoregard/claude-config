@@ -62,6 +62,10 @@
 set -uo pipefail
 umask 077
 
+# Ralph state lives in userspace and is keyed by session; `ralph_state_for_dir`
+# is the only sanctioned way to ask "is a loop armed in this cwd".
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ralph-loop-state.sh"
+
 # ---- Config with numeric validation (advisor MEDIUM: sharp-edges) -----------
 : "${REFLECT_ROOT:=$HOME/.claude/reflections}"
 : "${CLAUDE_SESSIONS_DIR:=$HOME/.local/state/claude-self-compact}"
@@ -1416,7 +1420,11 @@ for project_dir in "$PROJECTS_DIR"/*/; do
   fi
 
   # ---- Ralph collision ---
-  if [[ -f "$candidate_cwd/.claude/ralph-loop.local.md" ]]; then
+  # Ralph state is session-keyed in userspace, so this is a lookup on the
+  # `armed_in:` field rather than a file test inside the candidate's tree.
+  # Reading it out of the repo also means a planted file cannot suppress or
+  # trigger the skip.
+  if ralph_state_for_dir "$candidate_cwd" >/dev/null 2>&1; then
     count_skipped_ralph=$((count_skipped_ralph + 1))
     continue
   fi
