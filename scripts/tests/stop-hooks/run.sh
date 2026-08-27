@@ -212,8 +212,11 @@ ck "a nested fence of the other char does not exit" kept "$(probe '~~~
 ~~~')"
 # CRLF: perl -n keeps the trailing CR, so a genuine claim never matched the
 # end-anchor and the loop could only ever end at max_iterations.
-ck "CRLF still lets a real promise exit"  gone "$(probe "$(printf '<promise>ALL DONE</promise>')")"
-   "$(printf '%s' '<promise>ALL DONE</promise>' | sed 's/$/\r/' | xargs -0 -I{} echo {} >/dev/null; probe "$(printf '<promise>ALL DONE</promise>\r')")"
+# (This case previously spilled its second half onto its own line, where the
+#  shell ran "gone" as a command and the assertion passed regardless.)
+CRLF_OUT=$(probe "$(printf '<promise>ALL DONE</promise>
+')")
+ck "CRLF still lets a real promise exit" gone "$CRLF_OUT"
 ck "a QUOTED halt does not exit"        kept \
    "$(probe 'I could emit <halt>give up</halt> here but I will not.')"
 # Discussing the rule and THEN genuinely claiming it must still work.
@@ -269,6 +272,32 @@ printf '{"session_id":"%s","transcript_path":"%s"}' "$CSID" "$RT" \
   | CLAUDE_DOD_STATE_DIR="$SD" bash "$RALPH_HOOK" >/dev/null 2>&1
 ck "a missing frontmatter line ends the loop" "gone" \
    "$([ -e "$CLAUDE_RALPH_STATE_DIR/$CSID.md" ] && echo kept || echo gone)"
+
+echo
+echo "== stand-down fields must be the SHAPE they claim =="
+# Both fields are undocumented — read out of the installed binary — so their
+# shape is precisely the thing not to assume. Trusted by truthiness, ANY truthy
+# value stood the gate down and logged a clean `allow`: a dict, a string,
+# anything at all. Found by the cross-vendor reviewer after four Opus rounds.
+# Its own session id: a spent block budget would read as "did not block".
+SHSID="shape-$RANDOM"
+printf '%s\n' "$BREPO" > "$SD/$SHSID.arm"
+shape_dec() { printf '%s' "$1" \
+  | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE" 2>/dev/null \
+  | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("decision") or "")
+except Exception: print("")'; }
+ck "a dict session_crons does NOT stand it down"   "block" \
+   "$(shape_dec "$(printf '{"session_id":"%s","session_crons":{"oops":1}}' "$SHSID")")"
+ck "a string background_tasks does NOT either"     "block" \
+   "$(shape_dec "$(printf '{"session_id":"%s","background_tasks":"x"}' "$SHSID")")"
+ck "an empty list does NOT stand it down"          "block" \
+   "$(shape_dec "$(printf '{"session_id":"%s","session_crons":[]}' "$SHSID")")"
+ck "a real non-empty list DOES"                    "" \
+   "$(shape_dec "$(printf '{"session_id":"%s","background_tasks":[{"id":"t"}]}' "$SHSID")")"
+ck "and the bad shape is named in the log"         "yes" \
+   "$(grep -q 'unexpected shape' "$SD/gate.log" && echo yes || echo no)"
+rm -f "$SD/$SHSID.arm" "$SD/$SHSID.blocks"
 
 echo
 echo "== reaping abandoned arm state =="
@@ -391,7 +420,11 @@ ck "the gate's blockers reach the agent" "named" "$r"
 case "$HOUT" in *"promise met"*) r=kept ;; *) r="no ralph message" ;; esac
 ck "ralph's own message survives the merge" "kept" "$r"
 
-out=$(end_via 'stopping <halt>user said stop</halt>')
+# Own-line, or this asserts nothing: an inline tag no longer halts, so the
+# loop would take the ordinary block path and the case would stay green
+# even if halt handover stopped working altogether.
+out=$(end_via 'stopping
+<halt>user said stop</halt>')
 ck "halt handover also runs the gate" "block" "$(decision "$out")"
 
 # And when there is nothing to block on, the handover is quiet.
