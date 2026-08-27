@@ -134,6 +134,35 @@ if [[ "$COMPLETION_PROMISE" != "null" ]] && [[ -n "$COMPLETION_PROMISE" ]]; then
   fi
 fi
 
+# Honest exit that does NOT claim completion.
+#
+# Without this the loop had exactly three exits: the sigil, max_iterations, or
+# the user typing /cancel-ralph. So when a human said "write the handoff and
+# then stop, do no other work" on a mission that was genuinely incomplete, the
+# agent's only options were to LIE (emit a false sigil) or to DISOBEY (keep
+# working). Observed 2026-08-27, session ebcdd93d: it held for six turns
+# repeating "Holding.", then broke the instruction and resumed — about two
+# hours and 61k tokens. Six held turns is the loop out-voting the human, and
+# "do not lie to exit" is not a discipline if the only alternative is disobeying.
+#
+# <halt> ends the loop while asserting nothing about completion. The reason is
+# required and recorded, so an exit is auditable rather than silent. It is a
+# weaker claim than the sigil, which is the point: nothing here tempts an agent
+# to overstate what it finished.
+if [[ "$LAST_OUTPUT" == *"<halt>"* ]]; then
+  HALT_REASON=$(echo "$LAST_OUTPUT" | perl -0777 -pe 's/.*?<halt>(.*?)<\/halt>.*/$1/s; s/^\s+|\s+$//g; s/\s+/ /g' 2>/dev/null || echo "")
+  if [[ -n "$HALT_REASON" ]]; then
+    echo "🛑 Ralph loop: halted at iteration $ITERATION WITHOUT claiming completion — $HALT_REASON"
+    printf '%s\t%s\titeration=%s\t%s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$HOOK_SESSION" "$ITERATION" "$HALT_REASON" \
+      >> "$STATE_DIR/halts.log" 2>/dev/null || true
+    rm "$RALPH_STATE_FILE"
+    exit 0
+  fi
+  # A bare <halt> with no reason is not an exit. Fall through and keep looping.
+  echo "⚠️  Ralph loop: <halt> seen with an empty reason; ignoring. A halt must say why." >&2
+fi
+
 # Not complete - continue loop with SAME PROMPT
 NEXT_ITERATION=$((ITERATION + 1))
 
@@ -155,9 +184,9 @@ sed "s/^iteration: .*/iteration: $NEXT_ITERATION/" "$RALPH_STATE_FILE" > "$TEMP_
 mv "$TEMP_FILE" "$RALPH_STATE_FILE"
 
 if [[ "$COMPLETION_PROMISE" != "null" ]] && [[ -n "$COMPLETION_PROMISE" ]]; then
-  SYSTEM_MSG="🔄 Ralph iteration $NEXT_ITERATION | To stop: output <promise>$COMPLETION_PROMISE</promise> (ONLY when statement is TRUE - do not lie to exit!)"
+  SYSTEM_MSG="🔄 Ralph iteration $NEXT_ITERATION | To stop: output <promise>$COMPLETION_PROMISE</promise> (ONLY when statement is TRUE - do not lie to exit!) — or <halt>why</halt> to end the loop WITHOUT claiming completion. If the user told you to stop, halt; do not keep looping and do not fake the promise."
 else
-  SYSTEM_MSG="🔄 Ralph iteration $NEXT_ITERATION | No completion promise set - loop runs infinitely"
+  SYSTEM_MSG="🔄 Ralph iteration $NEXT_ITERATION | No completion promise set - loop runs infinitely. <halt>why</halt> ends it. If the user told you to stop, halt."
 fi
 SYSTEM_MSG="${SYSTEM_MSG}${TRANSCRIPT_NOTE}"
 

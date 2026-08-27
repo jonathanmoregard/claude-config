@@ -11,9 +11,9 @@ Cost model: does nothing unless finishing-up-arm.sh armed this session, so an
 ordinary question / research / read session pays one file-existence check. Only
 a session that actually edited a repo ever runs dod-check.
 
-Modes (CLAUDE_DOD_MODE, default "shadow"):
+Modes (CLAUDE_DOD_MODE, default "active"):
+    active   block  (the default — enforcement is the point)
     shadow   log what it would have blocked; never block
-    active   block
 
 Stand-down guards, in order. Every one of these ENDS the turn rather than
 blocking, because a gate that can never be satisfied protects nothing and just
@@ -57,7 +57,11 @@ DOD = pathlib.Path(
         "CLAUDE_DOD_CHECK", pathlib.Path.home() / ".claude/scripts/dod-check.py"
     )
 )
-MODE = os.environ.get("CLAUDE_DOD_MODE", "shadow").strip().lower()
+# ACTIVE by default. The ask was "programmatically enforced, every time, no
+# exceptions"; a default of shadow means anyone who does not set an env var gets
+# nothing enforced, which is how the last two attempts at this died. Shadow is
+# now the deliberate opt-out (CLAUDE_DOD_MODE=shadow), not the resting state.
+MODE = os.environ.get("CLAUDE_DOD_MODE", "active").strip().lower()
 
 # Own budget, deliberately below the harness's default cap of 8 so this gate
 # stands down on its own terms rather than being overridden.
@@ -141,6 +145,27 @@ def main():
     # A durable follow-up is already booked.
     if payload.get("session_crons"):
         log(session, {"action": "allow", "why": "follow-up already scheduled"})
+        allow()
+
+    # Another loop already owns this session's stop condition. Two Stop hooks
+    # pushing "keep going" at one turn is how a human's explicit instruction
+    # gets out-voted: on 2026-08-27 a user said "write the handoff and then
+    # stop, do no other work", ralph blocked to continue the mission, and this
+    # gate piled on with the same push. The agent held six turns and then broke
+    # the instruction. One driver per turn. The loop that was armed on purpose
+    # wins; this gate is the general-purpose backstop and yields to it.
+    # Path agreed with scripts/ralph-loop-state.sh, which is the single source
+    # of truth and says so. Python cannot source bash, so the two agree via the
+    # env var rather than by copying the literal — that file was written after a
+    # migration moved the writer and left four readers behind.
+    ralph_dir = pathlib.Path(
+        os.environ.get(
+            "CLAUDE_RALPH_STATE_DIR",
+            pathlib.Path.home() / ".local/state/claude-ralph-loop",
+        )
+    )
+    if (ralph_dir / f"{session}.md").exists():
+        log(session, {"action": "allow", "why": "a ralph loop owns this session"})
         allow()
 
     countfile = STATE_DIR / f"{session}.blocks"
