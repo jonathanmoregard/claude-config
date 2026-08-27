@@ -318,6 +318,24 @@ CSID2="badarm-$RANDOM"
 printf '\xff\xfe not utf8\n' > "$SD/$CSID2.arm"
 out=$(gate_run "$CSID2")
 ck "an unreadable armfile BLOCKS, never allows" "block" "$(decision "$out")"
+
+# The last silent allows: payloads this gate cannot identify. It still has to
+# end the turn — no session id means no armfile means nothing to measure — but
+# "we could not read what the harness sent" must not look like "this session had
+# no work". A sweep of all eleven turn-ending paths found these four were the
+# only ones that did not log.
+printf 'not json at all' | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE" >/dev/null 2>&1
+ck "unparseable stdin is logged, not silent" "yes" \
+   "$(grep -q 'stdin was not valid JSON' "$SD/gate.log" && echo yes || echo no)"
+printf '[1,2,3]' | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE" >/dev/null 2>&1
+ck "a non-object payload is logged"          "yes" \
+   "$(grep -q 'not an object' "$SD/gate.log" && echo yes || echo no)"
+printf '{"session_id": 42}' | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE" >/dev/null 2>&1
+ck "a non-string session_id is logged"       "yes" \
+   "$(grep -q 'not a string' "$SD/gate.log" && echo yes || echo no)"
+printf '{"session_id":"../../etc/passwd"}' | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE" >/dev/null 2>&1
+ck "a path-shaped session_id is refused and logged" "yes" \
+   "$(grep -q 'not a plain token' "$SD/gate.log" && echo yes || echo no)"
 ck "and says nothing was checked"              "yes" \
    "$(grep -q 'NOTHING WAS CHECKED' "$SD/gate.log" && echo yes || echo no)"
 rm -f "$SD/$CSID2.arm" "$SD/$CSID2.blocks" "$SD/$MSID2.arm" "$SD/$MSID2.blocks"
