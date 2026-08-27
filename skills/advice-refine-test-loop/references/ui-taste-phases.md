@@ -12,8 +12,11 @@ bounds", the step-4 `jq` cross-validation) live in `../SKILL.md`, which the
 parent already has in context when it reaches this file.
 
 Lane labels `4a` (the two Opus critics) and `4b` (the Codex vision pass) are
-retained — the ledger, the composition table and the run-state `phase` values
-use them. They name lanes, not an order. Nothing in Phase 4 runs after `4a`.
+retained — the ledger and the composition table use them. They name lanes, not
+an order. Nothing in Phase 4 runs after `4a`. The run-state `phase` value is
+plain `4` for the whole wave: a per-lane resume point would let a resumed run
+re-enter "at 4b" with 4a already done, which is the serial relay this
+restructure removed, rebuilt by the recovery path.
 
 ## Why this shape
 
@@ -122,11 +125,12 @@ round after the critique. No more.
 Skip for pure backend / infra / docs work.
 
 **Neither deterministic component is a trigger condition.** A geometry oracle
-(e.g. `tests/e2e/tests/component-geometry-oracle.spec.ts` emitting JSON
-violations) and a screenshot-diff harness are inputs the wave uses when the
-project has them. When the project has neither, the VLM lanes still run — see
-"Degrading when a deterministic component is absent", which is the DEFAULT path
-today, not an edge case.
+(e.g. `tests/e2e/tests/component-geometry-oracle.spec.ts`, whose violations are
+retrievable as JSON — but NOT from disk; see "Getting the violations out") and a
+screenshot-diff harness are inputs the wave uses when the project has them. When
+the project has neither, the VLM lanes still run — see "Degrading when a
+deterministic component is absent", which is the DEFAULT path today, not an edge
+case.
 
 ## Stage 0 — deterministic pre-pass
 
@@ -157,12 +161,50 @@ Never substitute a VLM's opinion of which regions changed for the diff's. That
 would launder a 40.7% guess into the one input the combiner treats as ground
 truth, and every downstream guarantee reads off that input.
 
+### Integration traps — measured, and every one of them fails quietly
+
+**These are facts about ONE integration, not properties of the pipeline.**
+Measured 2026-08-27 against kablong `feat/design-review-round3-2026-08-02`, the
+only project wired to this skill. They are here rather than in a footnote because
+each one produces a run that looks like it worked, and kablong-side details drift
+— when a run behaves oddly, re-check these against the repo rather than trusting
+this list.
+
+- **`vv-shots.sh` exits `rc=1` on complete success.** `login` and `not-found` are
+  intentionally-captured non-200 surfaces, and the driver propagates the last
+  non-zero per-shot exit as its own (`RC=$ec` … `exit $RC`). **Never read its exit
+  code as a success signal — count the PNGs it wrote.** Same measurement, related
+  bug: the underlying screenshot CLI synthesizes `status=401` for any URL matching
+  `\b(login|sign[-_]?in|oauth\d*|magic)\b`, so a deliberately captured login page
+  is ALWAYS mislabeled as an auth wall. Neither is a capture failure, and both
+  look exactly like one.
+- **The server needs `--features test-endpoints,dev-playground`.**
+  `test-endpoints` ALONE is not enough: the oracle's `/dev/components/*` pages sit
+  behind the separate `dev-playground` feature. A server built with only
+  `test-endpoints` serves the app perfectly and 404s every oracle page, which
+  reads as a broken oracle rather than a wrong build. `vv-shots.sh`'s own header
+  comment shows only `test-endpoints` — that comment is the trap.
+- **`PORT=3737` must be set explicitly.** `main.rs` defaults to `3000`, while
+  `playwright.config.ts` and `vv-shots.sh` both target `3737`. Nothing reconciles
+  them; the mismatch surfaces as connection-refused on every shot.
+- **`pg_tmp` and `openssl` exist only inside `nix develop`.** Driving the capture
+  or the oracle from a bare shell fails on a missing binary, not on anything
+  visual.
+
 ## Stage 1 — the blind parallel wave
 
-All four lanes dispatch in ONE tool-use block, on the frozen shots, scoped to the
-changed-region manifest. No lane receives another lane's output, ever — the same
-rule the Phase 1 specialists follow, for the same reason ("Give the specialists a
-peek at the primary's findings before they report" in `../SKILL.md`).
+All four lanes dispatch in ONE tool-use block. No lane receives another lane's
+output, ever — the same rule the Phase 1 specialists follow, for the same reason
+("Give the specialists a peek at the primary's findings before they report" in
+`../SKILL.md`).
+
+**The three VLM lanes and the oracle take different inputs, and conflating them
+writes a spec nothing can execute.** The VLM lanes read the frozen shots and are
+scoped to the changed-region manifest. The oracle reads neither: it drives a live
+browser against the project's component pages and asserts on the DOM, so it takes
+no shot and cannot be scoped to a bounding box (see "What scoping the oracle can
+and cannot mean"). "Byte-identical shots" is a guarantee about the reviewers who
+consume shots; it is not a claim about the oracle.
 
 Merge lane outputs only after all lanes have returned.
 
@@ -337,6 +379,79 @@ an assertion mid-phase to check a fresh VLM claim would re-serialize the wave an
 turn ground truth into a debugging aid for one reviewer's guess. When a singleton
 claim looks numerically checkable, write the assertion as follow-up work so the
 NEXT run has it; do not re-run the wave to consult it.
+
+#### Getting the violations out — the JSON is NOT on disk
+
+**Measured 2026-08-27 against kablong `feat/design-review-round3-2026-08-02`.
+The reference oracle does not write machine-readable output anywhere the
+combiner can glob for it.** This is the single most likely way to wire the
+combiner up wrong, and the failure is silent.
+
+What it actually emits:
+
+- **stdout** — ordinary Playwright reporter output, plus one HUMAN-readable
+  `console.log` per component (`[geometry-oracle] btn: 3 violations` followed by
+  a summary capped at 30 lines, or `[geometry-oracle] btn: clean`).
+- **the JSON** — only via a `test.info().attach()` call naming
+  `<slug>-violations.json` and passing the payload as `body`. A `body`
+  attachment lives in the report, and Playwright **never writes it to disk**:
+  forcing violations produced **zero** `*-violations.json` files under
+  `test-results/`.
+
+So the ONLY retrieval path is the JSON reporter plus a base64 decode of the
+attachment `body`:
+
+```bash
+npx playwright test component-geometry-oracle --reporter=json > /tmp/oracle.json
+# Recursive descent, because the reporter's suite nesting varies by version.
+jq -r '[.. | objects | select(has("name") and has("body"))
+        | select(.name | endswith("-violations.json")) | .body] | .[]' \
+  /tmp/oracle.json | base64 -d | jq -s 'add'
+```
+
+The decoded schema is the one the combiner wants — `component`, `variant`,
+`element`, `selector`, `property`, `actual`, `expected`, `delta`, `note`.
+
+Two consequences, both fail-open if missed:
+
+- **A combiner that globs for `*-violations.json`, or that parses stdout, gets
+  NOTHING and reads it as "oracle clean."** That is the fail-open this skill
+  exists to name, wearing the costume of ground truth. The success signal is a
+  successfully DECODED attachment; an empty glob is never evidence of a clean
+  run.
+- **The oracle hard-fails on any violation** (`expect(violations).toEqual([])`),
+  so a run that has something to report is a FAILING Playwright run. Non-zero
+  exit is the expected shape when the oracle is doing its job, and the exit code
+  alone cannot distinguish "violations found" from "the oracle could not run".
+  Parse the report; never branch on the exit code.
+
+#### What scoping the oracle can and cannot mean
+
+**Measured the same day, same branch: the oracle has component granularity and
+nothing finer, and no changed-region awareness at all.**
+
+The driver loops a hardcoded 5-entry `COMPONENTS` array (`radiogroup`, `btn`,
+`combobox`, `dialog`, `timegrid`) emitting one `test()` per slug, so
+`-g "geometry oracle: timegrid"` runs exactly one test (verified: "Running 1
+test"). That grep on the slug is the ONLY scoping axis that exists. There is:
+
+- **no git or changed-file awareness** — the oracle does not know what the diff
+  touched and cannot find out;
+- **no env-var scoping hook** — nothing to pass a region, a selector or a bounds
+  list to;
+- **no sub-component selection** — the 28 `variant:` fixtures are hardcoded
+  inside the assert functions and are not individually selectable.
+
+So "scope the oracle to changed regions" cannot mean what it sounds like.
+Mapping changed regions to component slugs happens OUTSIDE the oracle, in the
+parent, before dispatch — and below slug granularity there is no scoping at all.
+Do not write a step that implies the oracle can be pointed at a bounding box; it
+cannot, and a spec that says otherwise sends an implementer looking for a flag
+that does not exist.
+
+None of this costs much: running all five slugs is deterministic and cheap, which
+is why Stage 4 re-runs the oracle in full rather than scoping it. Slug mapping is
+an optimisation, never a correctness requirement.
 
 ### Severity
 
@@ -527,9 +642,10 @@ run, and in the Exit report, in the words below.
 
 ### When the screenshot-diff harness is absent
 
-- **What runs:** everything else. All three VLM lanes and the oracle dispatch as
-  normal, on the same frozen, hashed shots. The lanes are given the touched
-  surfaces as scope instead of a region manifest.
+- **What runs:** everything else. All three VLM lanes dispatch as normal on the
+  same frozen, hashed shots, and the oracle dispatches as normal against the live
+  DOM. The VLM lanes are given the touched surfaces as scope instead of a region
+  manifest; the oracle's scope is unaffected, having never been region-based.
 - **Guarantee lost — the drop rule.** With no manifest there is no ground truth
   about where the change landed, so nothing is dropped and no hallucination is
   filtered. The ledger's drop-rate cell for the run is `n/a`, **never `0`** — the
@@ -564,6 +680,26 @@ run, and in the Exit report, in the words below.
   ground-truth layer was available; the oracle precondition is unmet, not
   satisfied.* Recording it as `n/a` and moving on silently is the fail-open
   reading this rule forbids.
+
+### Absent, clean, and unretrieved are THREE states with ONE observable
+
+"The combiner received no oracle findings" is produced by three different
+situations, and only one of them is good:
+
+1. **Absent** — the project has no oracle. Precondition UNMET; say so.
+2. **Clean** — the oracle ran and asserted no violations. Genuinely green.
+3. **Unretrieved** — the oracle ran, found violations, and the parent never got
+   them, because it globbed for `*-violations.json` or read stdout instead of
+   decoding the report attachment (see "Getting the violations out"). Ground
+   truth existed and was thrown away.
+
+State 3 is the dangerous one: it reports as state 2 while behaving like state 1,
+and the sigil's "geometry-oracle green" precondition then passes on a run that
+never read the oracle. **Distinguish them positively, never by absence of
+output.** A green oracle is one whose report was successfully parsed and
+contained zero violations — record the parse, not the silence. A run that cannot
+show which of the three states it was in must state the oracle precondition as
+UNMET, exactly as in state 1.
 
 ### When both are absent
 
@@ -645,4 +781,6 @@ deliberately duplicated, because they gate the ship rather than the phase.
 | Diff Stage 4 against the post-critique render instead of the ORIGINAL baseline | That is exactly the comparison that hides reflow contamination: a fix that moved pixels outside the element it edited is invisible against a baseline captured after the fix. |
 | Let the Stage 4 gate open a new fix round | The ONE-fix-pass cap becomes fiction, and the phase turns into the open-ended self-QA loop impeccable's rule forbids. The gate fixes oracle violations and its own contamination; everything else escalates. |
 | Record a missing oracle or missing diff harness as a passing check | The fail-open failure this skill exists to name. `n/a` and `0` look identical in a ledger and mean opposite things; an unmet precondition is not a satisfied one. State the absence in the Exit report. |
+| Read an empty `*-violations.json` glob, or silent stdout, as an oracle pass | Measured: the reference oracle attaches that JSON with a `body` and Playwright never writes it to disk, so the glob is ALWAYS empty — on clean runs and on violating ones alike. The success signal is a decoded attachment from `--reporter=json`; see "Getting the violations out". A combiner wired to the glob reports ground-truth-clean forever. |
+| Read `vv-shots.sh`'s exit code as the capture result | Measured: it exits `rc=1` on complete success, because `login` and `not-found` are intentional non-200 surfaces and it propagates the last non-zero per-shot exit. Count the PNGs. Treating rc as the signal aborts a healthy capture; the inverse — assuming rc=0 means every shot landed — is the same bug pointed the other way. |
 | Add Gemini vision without an API key wired | Would silently degrade to skipping the lane and calling the pipeline complete. Note as future upgrade in the skill; do not add as a dispatch step until the API dependency is real. |

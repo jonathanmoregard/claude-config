@@ -12,7 +12,7 @@ The loop catches all four by staging the review:
 - **Phase 1 (Opus + narrow specialists)** does broad correctness review plus targeted passes (secure defaults, footgun APIs) when the diff touches those areas.
 - **Phase 2 (Codex/GPT-5.5)** cross-vendor review runs LAST so it only sees Opus-blessed state — preserves cross-vendor coverage while spending Codex's tighter ChatGPT Plus quota only on what Opus already cleared.
 - **Phase 3 (adversarial)** is a single Opus dispatch framed as "assume the prior phases were wrong, find why" — catches the confirmation-bias class both prior phases share.
-- **Phase 4 (taste)** applies to UI work only, after all correctness phases have ADVANCED. It is ONE blind parallel wave — lanes `4a` (two Opus critics), `4b` (Codex vision-taste) and the geometry oracle all dispatch concurrently on byte-identical shots, downstream of a deterministic diff that scopes them and upstream of a single bounded fix pass. No lane ever sees another's output. The protocol lives in `~/.claude/skills/advice-refine-test-loop/references/ui-taste-phases.md` — read it IN FULL when the trigger fires.
+- **Phase 4 (taste)** applies to UI work only, after all correctness phases have ADVANCED. It is ONE blind parallel wave — lanes `4a` (two Opus critics), `4b` (Codex vision-taste) and the geometry oracle all dispatch concurrently, downstream of a deterministic diff and upstream of a single bounded fix pass. The VLM lanes work from byte-identical shots scoped to that diff's changed-region manifest; the oracle asserts against the live DOM and is scoped, at most, to whole components. No lane ever sees another's output. The protocol lives in `~/.claude/skills/advice-refine-test-loop/references/ui-taste-phases.md` — read it IN FULL when the trigger fires.
 
 Every phase uses a **structured JSON verdict schema** (`verdict-schema.json`) so findings are parseable, not vibes. **The loop-bounds gate is the only authority on advancement; the verdict is one of its inputs and routes nothing.** Between phases, a **consolidator sub-loop** auto-fixes safe_auto LOW findings (severity × autofix_class AND-gate; see below).
 
@@ -33,8 +33,9 @@ PHASE 3:  Adversarial — single Opus round, "the prior phases were wrong"
 PHASE 4:  UI taste review (UI-only, ONCE) — one blind parallel wave:
           stage 0  deterministic diff → changed-region manifest
           stage 1  lanes 4a (Opus defect + taste critics), 4b (Codex
-                   vision-taste) and ORACLE dispatch CONCURRENTLY on
-                   byte-identical shots; no lane sees another's output
+                   vision-taste) and ORACLE dispatch CONCURRENTLY — the
+                   VLM lanes on byte-identical shots, the ORACLE on the
+                   live DOM; no lane sees another's output
           stage 2  combiner · stage 3 one bounded fix pass
           stage 4  post-fix regression gate vs the ORIGINAL baseline
           Read ~/.claude/skills/advice-refine-test-loop/
@@ -754,7 +755,7 @@ history the moment the repo does. Want it visible in the checkout: symlink
 ```json
 {
   "status": "running | pending-human | complete",
-  "phase": "1 | 2 | 3 | 4a | 4b",
+  "phase": "1 | 2 | 3 | 4",
   "round": 3,
   "rounds": {"1": [{"new": 5, "repro": 5, "regressed": 0, "selfinflicted": 0},
                    {"new": 2, "repro": 2, "regressed": 0, "selfinflicted": 1},
@@ -785,6 +786,13 @@ history the moment the repo does. Want it visible in the checkout: symlink
 what makes resume cheap rather than a restart. `stop_reasons` records how each
 completed phase exited (the stop-routing table); the Exit report reads it from
 here, so a compact never loses it.
+
+**`phase` is `4` for the whole taste wave — never `4a` or `4b`.** Those are lane
+names, not resume points. A run-state that could re-enter "at 4b" would restart
+one lane with the other's results already in hand, rebuilding the serial relay
+Phase 4 exists to avoid, out of the recovery path. A resume inside Phase 4
+re-runs the WAVE: a partially-returned wave has no valid combiner input, and its
+lanes are cheap relative to shipping on a half-built one.
 
 `baselines[phase]` is the phase's set of passing test IDs, written once at the
 phase's first round commit and never rewritten while the phase runs. `null`
@@ -1142,19 +1150,23 @@ The full protocol lives in
 **Read that file in full before dispatching the wave** — not in part, and not
 from memory. It is the only place the stage order, the lane prompts, the Codex
 vision invocation, the combiner table, the hallucination drop rule, the
-degrade-when-absent paths and the disposition ledger are written down.
+degrade-when-absent paths, the oracle's retrieval path, the measured integration
+traps and the disposition ledger are written down.
 
 **Shape, so it cannot be got wrong from memory.** Phase 4 is ONE wave, not a
 relay. A deterministic diff runs first and yields the changed-region manifest;
 then lane `4a` (two Opus critics), lane `4b` (Codex vision-taste) and the
-geometry oracle dispatch CONCURRENTLY, in one tool-use block, on byte-identical
-shots, with no lane receiving another lane's output; then the parent combines,
-runs exactly ONE fix pass, and closes with a post-fix regression gate that
-re-diffs against the ORIGINAL baseline. Quoting one reviewer's judgment into
-another's context moves a VLM judge 19-26 pp (arXiv 2608.07920), and a defect
-fixed between lanes no longer renders for the later lane to vote on — serial
-ordering therefore loses coverage twice over. `4a` and `4b` are lane names and
-run-state labels; they no longer imply an ordering.
+geometry oracle dispatch CONCURRENTLY, in one tool-use block, with no lane
+receiving another lane's output; then the parent combines, runs exactly ONE fix
+pass, and closes with a post-fix regression gate that re-diffs against the
+ORIGINAL baseline. The three VLM lanes read byte-identical shots scoped to the
+manifest; the oracle reads the live DOM instead, takes no shot, and scopes only
+to whole components. Quoting one reviewer's judgment into another's context moves
+a VLM judge 19-26 pp (arXiv 2608.07920), and a defect fixed between lanes no
+longer renders for the later lane to vote on — serial ordering therefore loses
+coverage twice over. `4a` and `4b` are lane names used by the ledger and the
+composition table; they imply no ordering, and the run state records the whole
+wave as phase `4` so no resume can re-enter at one lane.
 
 **Trigger — read the reference iff ALL THREE hold:**
 
@@ -1215,10 +1227,10 @@ one-fix-pass cap is fiction.
 | 4.5 (in-round) | Anthropic (Opus, validator) | Re-verify findings against actual file state — sent ALL of the round's findings (the judge that dedupes them is in flight alongside), with only the PIVOTAL (singleton) rows applied. Input boundary, drop rule and degrade-on-failure behaviour all defined at step 4.5. A drop CLOSES the finding with `repro: false` and keeps it in `new_r` | Co-dispatched with step 4's dedupe judge in ONE tool-use block; feeds into step 5 (reproduce) | Per-finding on independent two-reviewer convergence, applied by discarding that row on return; wholesale on any validator failure — see step 4.5 |
 | 2 | OpenAI (Codex / GPT-5.5) | Cross-vendor correctness on Opus-clean state | Phase 1 fix history carried in prompt | Never; PAUSE on quota, don't silently skip |
 | 3 | Anthropic (Opus, adversarial) | "Prior phases were wrong — find why" | Same gate at step 8; a `continue` resets to Phase 1 | Never; one shot, cheap |
-| 4 stage 0 | none (deterministic) | Capture + diff vs baseline → changed-region manifest; scopes every lane. 100% of CSS changes vs 40.7% for the best VLM | Consumed as a filter by the combiner, not as findings | Non-UI diffs; degrades per "Phase 4" when the project has no diff harness |
+| 4 stage 0 | none (deterministic) | Capture + diff vs baseline → changed-region manifest; scopes the VLM lanes (the oracle takes no shots and has only component granularity). 100% of CSS changes vs 40.7% for the best VLM | Consumed as a filter by the combiner, not as findings | Non-UI diffs; degrades per "Phase 4" when the project has no diff harness |
 | 4 lane 4a | Anthropic (Opus x2 — defect + taste critics) | UI defect + house-style critique — protocol per "Phase 4" | Combiner, after ALL lanes return. Same model twice = ONE vendor | Non-UI diffs |
 | 4 lane 4b | OpenAI (Codex vision-taste) on regenerated shots | Second-vendor VLM catch-what-Opus-missed — protocol per "Phase 4" | Combiner, after ALL lanes return, per `docs/reviews/multi-model-taste-ledger.md` protocol | Non-UI diffs; NEVER skip on UI-touching diffs — drift-back class survives Phases 1-3 and the Opus lanes |
-| 4 lane ORACLE | none (deterministic) | Geometry assertions. Ground truth, not a vote — auto-fixes with no VLM vote required | Combiner. Dispatched in the same block as the VLM lanes; feeds no prompt | Non-UI diffs; degrades per "Phase 4" when the project has no oracle |
+| 4 lane ORACLE | none (deterministic) | Geometry assertions against the LIVE DOM (no shots, component granularity only). Ground truth, not a vote — auto-fixes with no VLM vote required | Combiner. Dispatched in the same block as the VLM lanes; feeds no prompt. Its JSON is retrievable ONLY via the report — see "Getting the violations out" in the reference | Non-UI diffs; degrades per "Phase 4" when the project has no oracle |
 | 4 stage 4 | deterministic + the same VLM lanes | Post-fix regression gate: re-diff vs the ORIGINAL baseline, VLM pass on newly-changed regions only | Catches reflow contamination from the one fix pass | Never on a UI diff that was fixed; no VLM sub-pass when nothing newly changed |
 | 4 lane 4c (future) | Google (Gemini 2.5 Pro / 3.x) | Third-vendor VLM, high-recall miss catcher | A FOURTH lane in the same blind wave, same combiner rules | No API key wired |
 
@@ -1240,6 +1252,11 @@ Also state, so the run is greppable and a stopped run is never mistaken for a cl
 - whether `regressed_r` was measured or forced to 0 for want of a baseline
 - `dedupe_status`, and — when it is `unavailable` — that `new_r` was inflated
   for the affected phases
+- on a UI diff that reached Phase 4: the per-vendor hallucination DROP RATE with
+  its denominator (`n/a` when no diff harness was available — **never `0`**), and,
+  for each deterministic component the project lacks, that its precondition is
+  UNMET rather than satisfied. "No oracle" is not "oracle green"; the reference
+  file fixes the wording for both cases
 - anything left in `pending_for_human.md`
 
 Then set `<notes>/arftl-run.json` to `status: complete`. A run that exits `pending-human` keeps `status: pending-human` and its `pause_reason` — that file is how the next session knows a human decision is outstanding.
