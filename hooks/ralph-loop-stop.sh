@@ -29,12 +29,22 @@ RALPH_STATE_FILE="$STATE_DIR/$HOOK_SESSION.md"
 
 extract_tag() {  # $1 = tag name; reads $LAST_OUTPUT, prints the claimed text
   printf '%s' "$LAST_OUTPUT" | TAG="$1" perl -ne '
-    BEGIN { $tag = $ENV{TAG}; $fence = 0; @hit = (); }
-    if (/^[ \t]*(```|~~~)/) { $fence = !$fence; next; }
-    next if $fence;
+    BEGIN { $tag = $ENV{TAG}; $fence = ""; @hit = (); }
+    # Track WHICH fence character opened the block: only the same character
+    # closes it. Treating ``` and ~~~ as one state meant a ``` fence displayed
+    # INSIDE a ~~~ fence flipped the state to closed, and the demo tag on the
+    # next line was then read as a genuine completion claim.
+    if (/^[ \t]*(```|~~~)/) {
+      my $mark = $1;
+      if ($fence eq "")       { $fence = $mark; }
+      elsif ($fence eq $mark) { $fence = "";    }
+      next;
+    }
+    next if $fence ne "";
     # Up to three leading spaces: four or more is a markdown code block, which
-    # is a demonstration of the tag rather than an assertion of it.
-    if (/^[ ]{0,3}<\Q$tag\E>(.*?)<\/\Q$tag\E>[ \t]*$/) { push @hit, $1; }
+    # is a demonstration of the tag rather than an assertion of it. \r is
+    # allowed at the end so CRLF transcripts can still exit the loop at all.
+    if (/^[ ]{0,3}<\Q$tag\E>(.*?)<\/\Q$tag\E>[ \t\r]*$/) { push @hit, $1; }
     END { if (@hit) { $t = $hit[-1]; $t =~ s/^\s+|\s+$//g; $t =~ s/\s+/ /g; print $t; } }
   ' 2>/dev/null || true
 }
@@ -279,16 +289,27 @@ if [[ -z "$PROMPT_TEXT" ]]; then
 fi
 
 # Update iteration in frontmatter (portable across macOS and Linux)
+# A failed write (full disk, read-only state dir) used to kill the hook under
+# `set -e` BEFORE it emitted its block JSON. The concurrent gate has already
+# stood down on the live state file by then, so the turn would end with nobody
+# checking at all — the exact fail-open the marker machinery guards elsewhere.
+# Losing an iteration increment is survivable; losing the block is not.
 TEMP_FILE="${RALPH_STATE_FILE}.tmp.$$"
-sed "s/^iteration: .*/iteration: $NEXT_ITERATION/" "$RALPH_STATE_FILE" > "$TEMP_FILE"
-mv "$TEMP_FILE" "$RALPH_STATE_FILE"
+ITER_WRITE_NOTE=""
+if sed "s/^iteration: .*/iteration: $NEXT_ITERATION/" "$RALPH_STATE_FILE" > "$TEMP_FILE" 2>/dev/null \
+   && mv "$TEMP_FILE" "$RALPH_STATE_FILE" 2>/dev/null; then
+  :
+else
+  rm -f "$TEMP_FILE"
+  ITER_WRITE_NOTE=" | ⚠️ could not record iteration $NEXT_ITERATION (state dir unwritable?); the loop continues but the count is stale"
+fi
 
 if [[ "$COMPLETION_PROMISE" != "null" ]] && [[ -n "$COMPLETION_PROMISE" ]]; then
   SYSTEM_MSG="🔄 Ralph iteration $NEXT_ITERATION | To stop, put the tag ON A LINE BY ITSELF (a tag inside a sentence is ignored, so you can discuss these freely): <promise>$COMPLETION_PROMISE</promise> ONLY when that statement is TRUE — do not lie to exit. Or <halt>why</halt> to end the loop WITHOUT claiming completion. If the user told you to stop, halt; do not keep looping and do not fake the promise."
 else
   SYSTEM_MSG="🔄 Ralph iteration $NEXT_ITERATION | No completion promise set - loop runs infinitely. <halt>why</halt> ON A LINE BY ITSELF ends it (a tag inside a sentence is ignored). If the user told you to stop, halt."
 fi
-SYSTEM_MSG="${SYSTEM_MSG}${TRANSCRIPT_NOTE}"
+SYSTEM_MSG="${SYSTEM_MSG}${TRANSCRIPT_NOTE}${ITER_WRITE_NOTE}"
 
 # Block the stop and feed the prompt back
 jq -n \

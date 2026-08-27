@@ -332,7 +332,11 @@ def main():
 
     try:
         repos = [r for r in armfile.read_text().splitlines() if r.strip()]
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
+        # ValueError covers UnicodeDecodeError: a corrupt or non-UTF8 armfile
+        # raised straight past the OSError-only guard and crashed the hook,
+        # ending the turn unguarded. The countfile read one block up already
+        # caught ValueError; this one simply omitted it.
         # Armed, but the list of repos is unreadable. Allowing is the only
         # option — there is nothing to check against — but doing it silently
         # would be indistinguishable from a clean pass, which is the exact
