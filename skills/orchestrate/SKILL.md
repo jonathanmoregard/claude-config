@@ -35,14 +35,14 @@ this procedure.
    - *Max iterations* — finite, default 25.
 2. **Write `tasks/mission.md`** (planning-with-files format): goal,
    acceptance criteria (checkboxes), verifier command, sigil statement,
-   cancel instructions
-   (`rm .claude/ralph-loop.local.md` or `/cancel-ralph`). Also create an
+   cancel instructions (`/cancel-ralph`). Also create an
    empty `tasks/progress.md` now — doctrine and the loop prompt tell every
    iteration to read it, so it must exist from iteration 1. Seed
    `tasks/session-constraints.md` with any durable user directives already
    given this session (see Constraint pinning below); create it empty if
    none.
-3. **Arm the loop** — run from the WORKTREE ROOT (state file is CWD-scoped).
+3. **Arm the loop** — run from the WORKTREE ROOT (the state file records it as
+   `armed_in:`, which is how cwd-shaped consumers find the loop).
    Set `SIGIL` to the mission-specific statement from mission.md first —
    NEVER pass a placeholder: an unsubstituted promise can never match, so
    the loop would only end at max-iterations. Sigil rules: single line, no
@@ -50,8 +50,9 @@ this procedure.
    genuine completion.
 
    ```bash
-   # Preflight: only arm inside a dedicated worktree. The state file traps
-   # ALL sessions that stop in this directory (empty session_id fallthrough).
+   # Preflight: arm from a repo/worktree root. The gate binds THIS session id,
+   # not the directory, but `armed_in:` is recorded from $PWD and the mission
+   # files are read relative to it.
    case "$PWD" in
      "$HOME"|"$HOME/.claude"|"$HOME/Repos") echo "REFUSE: arm only from a dedicated worktree root"; exit 1;;
    esac
@@ -62,25 +63,30 @@ this procedure.
    case "$SIGIL" in *'"'*|*'$'*|*'`'*|*'\'*)
      echo 'REFUSE: sigil must not contain " $ ` or \ (setup script YAML-wraps it verbatim; a violation makes the sigil unmatchable and the loop runs to max-iterations)'; exit 1;;
    esac
-   SETUP=$(ls -d ~/.claude/plugins/cache/claude-plugins-official/ralph-loop/*/scripts/setup-ralph-loop.sh 2>/dev/null | sort -V | tail -1)
-   [[ -f "$SETUP" ]] || { echo "REFUSE: ralph-loop plugin not found in plugin cache — loop would silently never arm"; exit 1; }
-   # `bash "$SETUP"`, never "$SETUP" directly: the plugin's #!/bin/bash shebang
-   # does not resolve on NixOS (no /bin/bash) — direct exec fails exit 126.
+   # The SESSION-BOUND fork, not the upstream plugin's setup-ralph-loop.sh.
+   # Upstream writes a cwd-relative .claude/ralph-loop.local.md with an empty
+   # session_id: that gates every session stopping in the directory, gates the
+   # arming session nowhere else, and drops a file inside the repo — which a
+   # public repo's auto-commit cron then publishes.
+   SETUP=~/.claude/scripts/ralph-loop-setup.sh
+   [[ -f "$SETUP" ]] || { echo "REFUSE: session-bound ralph setup missing — loop would silently never arm"; exit 1; }
+   # `bash "$SETUP"`, never "$SETUP" directly: a #!/bin/bash shebang does not
+   # resolve on NixOS (no /bin/bash) — direct exec fails exit 126.
    bash "$SETUP" "Autonomous mission: read tasks/mission.md, tasks/session-constraints.md, and tasks/progress.md, then continue from where progress.md left off (empty progress.md = start at the first unchecked acceptance criterion). Orchestrate via subagents; do not implement inline; paste session-constraints.md verbatim into every subagent briefing." \
      --completion-promise "$SIGIL" --max-iterations 25
-   [[ -f .claude/ralph-loop.local.md ]] || { echo "ARM FAILED: state file missing — stop gate is NOT live"; exit 1; }
+   source ~/.claude/scripts/ralph-loop-state.sh
+   [[ -f "$(ralph_state_file "$CLAUDE_CODE_SESSION_ID")" ]] || { echo "ARM FAILED: state file missing — stop gate is NOT live"; exit 1; }
+   [[ -e .claude/ralph-loop.local.md ]] && { echo "ARM WRONG: upstream wrote state into the repo — the gate is cwd-bound, not session-bound"; exit 1; }
    ```
 
-   Caveat: armed via safe-bash, `session_id` in the state file is empty, so
-   the stop gate applies to ANY session in this directory — dedicated
-   worktrees are the isolation boundary; the preflight guard above enforces
-   the obvious misfires. Never arm in a shared repo dir, and run ONE
-   orchestrator session per worktree (two sessions stopping concurrently
-   race the state file's read-modify-write). Subagents are safe: the plugin
-   registers only the `Stop` event, which fires when the MAIN agent
-   finishes responding — subagent completion is the separate
-   `SubagentStop` event and never triggers the gate (verified against
-   official hooks docs 2026-08-02).
+   The setup script REFUSES to arm without a valid `CLAUDE_CODE_SESSION_ID`,
+   rather than falling through to a directory-scoped gate — an unbound loop
+   that looks armed is worse than one that refuses. Run ONE orchestrator
+   session per worktree anyway (two sessions racing the same mission files is
+   its own problem). Subagents are safe: only the `Stop` event is registered,
+   which fires when the MAIN agent finishes responding — subagent completion
+   is the separate `SubagentStop` event and never triggers the gate (verified
+   against official hooks docs 2026-08-02).
 
 ## Sigil discipline — verifier earns the sigil, sigil earns the stop
 

@@ -13,7 +13,7 @@ Execute the setup script to arm the loop for this session id:
 ~/.claude/scripts/ralph-loop-setup.sh $ARGUMENTS
 ```
 
-The gate is keyed to this session's id under `~/.claude/ralph-loop/`, not to the
+The gate is keyed to this session's id under `~/.local/state/claude-ralph-loop/`, not to the
 current directory. It fires wherever this session stops — including after a `cd`
 into another repo or worktree — and never fires in a sibling session.
 

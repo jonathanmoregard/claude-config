@@ -8,7 +8,16 @@
 #   interpolation so a corrupted file cannot execute via $(…) expansion.
 set -euo pipefail
 
-STATE=".claude/ralph-loop.local.md"
+# Resolved relative to THIS script, never via $HOME: the tests redirect HOME to
+# a fake home to assert the no-notes-anywhere cases, and a $HOME-anchored source
+# path would vanish under them.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../scripts" && pwd)/ralph-loop-state.sh"
+
+# Ralph state is keyed by SESSION and lives in userspace, so "is a loop armed in
+# this project" is a lookup on the `armed_in:` field, not a file test on a
+# repo-relative path. `|| true` because no armed loop is the common case and
+# `set -e` would otherwise abort the hook before the mission reminder runs.
+STATE="$(ralph_state_for_dir "$PWD" || true)"
 
 # Working notes live in userspace (`~/.local/state/claude-tasks/<repo>/`) per CLAUDE.md, because
 # repo-relative notes get auto-committed and published. A project may symlink
@@ -71,7 +80,7 @@ AGE_NOTE=""
 STARTED=$(awk '/^started_at:/{sub(/^started_at: */,""); gsub(/"/,""); print; exit}' "$STATE")
 START_EPOCH=$(date -d "${STARTED:-invalid}" +%s 2>/dev/null || echo 0)
 if [[ "$START_EPOCH" -gt 0 ]] && (( $(date +%s) - START_EPOCH > 172800 )); then
-  AGE_NOTE=$'\n- WARNING: this loop was armed over 48h ago. If the mission is dead, cancel it: rm .claude/ralph-loop.local.md (or /cancel-ralph). A stale armed loop blocks EVERY session that stops in this directory.'
+  AGE_NOTE=$'\n- WARNING: this loop was armed over 48h ago. If the mission is dead, cancel it: /cancel-ralph (state file: '"$STATE"$'). A stale armed loop blocks the session that armed it, wherever it stops.'
 fi
 
 cat <<EOF

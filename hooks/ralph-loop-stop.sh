@@ -2,16 +2,20 @@
 
 # Ralph Loop Stop Hook (session-bound fork of ralph-loop@claude-plugins-official)
 #
-# Difference from upstream: state lives at ~/.claude/ralph-loop/<session_id>.md
-# instead of a cwd-relative .claude/ralph-loop.local.md. The gate therefore
-# binds the SESSION that armed the loop, no matter what directory that session
-# stops in, and never binds any other session in the same project.
+# Difference from upstream: state lives at
+# ~/.local/state/claude-ralph-loop/<session_id>.md instead of a cwd-relative
+# .claude/ralph-loop.local.md. The gate therefore binds the SESSION that armed
+# the loop, no matter what directory that session stops in, never binds any
+# other session in the same project, and never writes inside a repo.
 
 set -euo pipefail
 
 HOOK_INPUT=$(cat)
 
-STATE_DIR="$HOME/.claude/ralph-loop"
+# Path comes from the shared resolver, never re-spelled here: this hook is one
+# of the readers a previous half-done migration left pointing at the old home.
+source "$HOME/.claude/scripts/ralph-loop-state.sh"
+STATE_DIR="$RALPH_STATE_DIR"
 
 HOOK_SESSION=$(echo "$HOOK_INPUT" | jq -r '.session_id // ""')
 

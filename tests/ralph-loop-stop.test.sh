@@ -3,7 +3,8 @@
 set -uo pipefail
 
 HOOK=~/.claude/hooks/ralph-loop-stop.sh
-STATE_DIR="$HOME/.claude/ralph-loop"
+source ~/.claude/scripts/ralph-loop-state.sh
+STATE_DIR="$RALPH_STATE_DIR"
 SID="test-session-0000"
 STATE="$STATE_DIR/$SID.md"
 TMP=$(mktemp -d)
