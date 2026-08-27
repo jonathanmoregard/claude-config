@@ -106,6 +106,12 @@ MAX_BLOCKS, _MAX_BLOCKS_WARN = _num_env("CLAUDE_DOD_MAX_BLOCKS", 6, int, floor=1
 # session that has done nothing for a fortnight.
 # Floor of 1 day: a tiny positive value (0.001) would reap every other live
 # session's state and silently disarm their gates. 0 still disables reaping.
+# Path agreed with scripts/ralph-loop-state.sh via the env var, never by copying
+# the literal — that file is the single source of truth and says so.
+RALPH_DIR = pathlib.Path(
+    os.environ.get("CLAUDE_RALPH_STATE_DIR",
+                   pathlib.Path.home() / ".local/state/claude-ralph-loop"))
+
 ARM_MAX_AGE_DAYS, _ARM_WARN = _num_env(
     "CLAUDE_DOD_ARM_MAX_AGE_DAYS", 14.0, float)
 if ARM_MAX_AGE_DAYS != 0 and ARM_MAX_AGE_DAYS < 1:
@@ -154,6 +160,15 @@ def reap(session):
         if path.suffix not in (".arm", ".blocks"):
             continue
         if path.stem == session:  # never reap the session doing the reaping
+            continue
+        # Nor a session with a LIVE loop. A long loop can outlive the reap age
+        # while still working, and taking its armfile away means its eventual
+        # handover finds nothing to check and allows — turning a housekeeping
+        # sweep into a silent un-gating of the longest-running sessions.
+        try:
+            if (RALPH_DIR / f"{path.stem}.md").exists():
+                continue
+        except OSError:
             continue
         try:
             if path.stat().st_mtime >= cutoff:
@@ -301,12 +316,7 @@ def main():
     # of truth and says so. Python cannot source bash, so the two agree via the
     # env var rather than by copying the literal — that file was written after a
     # migration moved the writer and left four readers behind.
-    ralph_dir = pathlib.Path(
-        os.environ.get(
-            "CLAUDE_RALPH_STATE_DIR",
-            pathlib.Path.home() / ".local/state/claude-ralph-loop",
-        )
-    )
+    ralph_dir = RALPH_DIR
     if not HANDOVER:
         if (ralph_dir / f"{session}.md").exists():
             # Consume any handover marker on the way out. Without this the
@@ -366,9 +376,19 @@ def main():
         blocks = int(countfile.read_text().strip() or 0)
     except (OSError, ValueError):
         blocks = 0
-    if blocks >= MAX_BLOCKS:
+    if blocks >= MAX_BLOCKS and not HANDOVER:
         log(session, {"action": "allow", "why": f"block budget spent ({blocks})"})
         allow()
+    if blocks >= MAX_BLOCKS and HANDOVER:
+        # The budget exists to stop the gate arguing with a session turn after
+        # turn. A handover is not another turn in that argument: it happens
+        # once, when a loop ends, and it is the last chance anything measures
+        # this work. Honouring the budget here let a loop that had already
+        # spent it end its final turn unmeasured — silently, with the loop
+        # state already deleted so nothing would revisit it.
+        log(session, {"action": "warn",
+                      "why": f"budget spent ({blocks}) but this is the loop's "
+                             "handover; checking anyway"})
 
     try:
         repos = [r for r in armfile.read_text().splitlines() if r.strip()]

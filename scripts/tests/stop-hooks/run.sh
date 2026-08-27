@@ -341,6 +341,46 @@ ck "and says nothing was checked"              "yes" \
 rm -f "$SD/$CSID2.arm" "$SD/$CSID2.blocks" "$SD/$MSID2.arm" "$SD/$MSID2.blocks"
 
 echo
+echo "== the budget does not apply to the handover =="
+# The block budget stops the gate arguing with a session turn after turn. A
+# handover is not another turn in that argument: it happens once, when a loop
+# ends, and it is the LAST chance anything measures the work. Honouring the
+# budget there let a loop that had already spent it end its final turn
+# unmeasured, with the loop state already deleted so nothing would revisit it.
+BSID="budget-$RANDOM"
+printf '%s\n' "$BREPO" > "$SD/$BSID.arm"
+echo 99 > "$SD/$BSID.blocks"
+out=$(gate_run "$BSID")
+ck "a spent budget stands the ordinary turn down" "" "$(decision "$out")"
+out=$(printf '{"session_id":"%s"}' "$BSID" \
+      | CLAUDE_DOD_STATE_DIR="$SD" CLAUDE_DOD_HANDOVER=1 python3 "$GATE" 2>/dev/null)
+ck "but the HANDOVER still checks"               "block" "$(decision "$out")"
+ck "and says why it overrode the budget"         "yes" \
+   "$(grep -q "this is the loop's handover" "$SD/gate.log" && echo yes || echo no)"
+rm -f "$SD/$BSID.arm" "$SD/$BSID.blocks"
+
+# The reaper must not disarm a session whose loop is still running: a long loop
+# can outlive the reap age while still working, and losing its armfile means its
+# eventual handover finds nothing to check.
+LSID="liveloop-$RANDOM"
+printf '%s\n' "$BREPO" > "$SD/$LSID.arm"
+touch -d "@$(( $(date +%s) - 40*86400 ))" "$SD/$LSID.arm"
+printf -- '---\nactive: true\niteration: 9\nmax_iterations: 500\n---\np\n' \
+  > "$CLAUDE_RALPH_STATE_DIR/$LSID.md"
+printf '%s\n' "$BREPO" > "$SD/$SID.arm"   # re-arm the reaping session
+printf '{"session_id":"%s"}' "$SID" | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE" >/dev/null 2>&1
+ck "a live loop's aged armfile is NOT reaped" "kept" \
+   "$([ -e "$SD/$LSID.arm" ] && echo kept || echo gone)"
+rm -f "$CLAUDE_RALPH_STATE_DIR/$LSID.md" "$SD/$LSID.arm"
+# ...but with no live loop, the same aged armfile goes.
+DSID="deadloop-$RANDOM"
+printf '%s\n' "$BREPO" > "$SD/$DSID.arm"
+touch -d "@$(( $(date +%s) - 40*86400 ))" "$SD/$DSID.arm"
+printf '{"session_id":"%s"}' "$SID" | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE" >/dev/null 2>&1
+ck "an aged armfile with no loop IS reaped"   "gone" \
+   "$([ -e "$SD/$DSID.arm" ] && echo kept || echo gone)"
+
+echo
 echo "== stand-down fields must be the SHAPE they claim =="
 # Both fields are undocumented — read out of the installed binary — so their
 # shape is precisely the thing not to assume. Trusted by truthiness, ANY truthy
