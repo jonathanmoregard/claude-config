@@ -274,6 +274,55 @@ ck "a missing frontmatter line ends the loop" "gone" \
    "$([ -e "$CLAUDE_RALPH_STATE_DIR/$CSID.md" ] && echo kept || echo gone)"
 
 echo
+echo "== a checker that could not run has not reported done =="
+# The handover turn is the one the whole marker protocol exists to cover, and
+# the loop state is already deleted by the time the gate is called — so nothing
+# revisits it. The first version of this merely WARNED in a systemMessage and
+# let the turn end. Unmeasurable is not done here for the same reason it is not
+# done anywhere else.
+MSID2="gatefail-$RANDOM"
+MT="$SD/gatefail.jsonl"
+python3 - "$MT" <<'PY'
+import json, sys
+rec = {"role": "assistant", "message": {"content": [
+    {"type": "text", "text": "<promise>ALL DONE</promise>"}]}}
+open(sys.argv[1], "w").write(json.dumps(rec, separators=(",", ":")) + "\n")
+PY
+printf -- '---\nactive: true\niteration: 4\nmax_iterations: 25\ncompletion_promise: "ALL DONE"\n---\np\n' \
+  > "$CLAUDE_RALPH_STATE_DIR/$MSID2.md"
+printf '%s\n' "$BREPO" > "$SD/$MSID2.arm"
+# A gate that is not there at all. The fake HOME still needs ralph's own state
+# resolver: without it the hook dies at `source` under set -e, and this case
+# would measure that instead of the missing gate.
+MISS_HOME="$SD/misshome"; mkdir -p "$MISS_HOME/.claude/hooks" "$MISS_HOME/.claude/scripts"
+cp "$HOME/.claude/scripts/ralph-loop-state.sh" "$MISS_HOME/.claude/scripts/"
+out=$(printf '{"session_id":"%s","transcript_path":"%s"}' "$MSID2" "$MT" \
+      | CLAUDE_DOD_STATE_DIR="$SD" HOME="$MISS_HOME" bash "$RALPH_HOOK" 2>/dev/null)
+ck "a missing gate BLOCKS the handover turn" "block" "$(decision "$out")"
+ck "the loop still ended"                    "gone" \
+   "$([ -e "$CLAUDE_RALPH_STATE_DIR/$MSID2.md" ] && echo kept || echo gone)"
+
+# A gate that crashes.
+MSID3="gatecrash-$RANDOM"
+printf -- '---\nactive: true\niteration: 4\nmax_iterations: 25\ncompletion_promise: "ALL DONE"\n---\np\n' \
+  > "$CLAUDE_RALPH_STATE_DIR/$MSID3.md"
+CRASH_HOME="$SD/crashhome"; mkdir -p "$CRASH_HOME/.claude/hooks" "$CRASH_HOME/.claude/scripts"
+printf 'raise RuntimeError("boom")\n' > "$CRASH_HOME/.claude/hooks/finishing-up-gate.py"
+cp "$HOME/.claude/scripts/ralph-loop-state.sh" "$CRASH_HOME/.claude/scripts/"
+out=$(printf '{"session_id":"%s","transcript_path":"%s"}' "$MSID3" "$MT" \
+      | CLAUDE_DOD_STATE_DIR="$SD" HOME="$CRASH_HOME" bash "$RALPH_HOOK" 2>/dev/null)
+ck "a crashing gate BLOCKS the handover turn" "block" "$(decision "$out")"
+
+# And the same principle for the gate's own corrupt state.
+CSID2="badarm-$RANDOM"
+printf '\xff\xfe not utf8\n' > "$SD/$CSID2.arm"
+out=$(gate_run "$CSID2")
+ck "an unreadable armfile BLOCKS, never allows" "block" "$(decision "$out")"
+ck "and says nothing was checked"              "yes" \
+   "$(grep -q 'NOTHING WAS CHECKED' "$SD/gate.log" && echo yes || echo no)"
+rm -f "$SD/$CSID2.arm" "$SD/$CSID2.blocks" "$SD/$MSID2.arm" "$SD/$MSID2.blocks"
+
+echo
 echo "== stand-down fields must be the SHAPE they claim =="
 # Both fields are undocumented — read out of the installed binary — so their
 # shape is precisely the thing not to assume. Trusted by truthiness, ANY truthy

@@ -89,15 +89,24 @@ end_loop() {  # $1 = human-readable message for the transcript
     gate_err="$STATE_DIR/$HOOK_SESSION.gate-stderr"
     if ! out=$(printf '%s' "$HOOK_INPUT" \
                | CLAUDE_DOD_HANDOVER=1 python3 "$gate" 2>"$gate_err"); then
-      # A crashing gate on the handover turn used to end the loop silently with
-      # only a systemMessage — the exact turn the design says matters most,
-      # unmeasured and untraceable. Say so in the message the human sees.
-      msg="$msg | WARNING: the definition-of-done gate FAILED on this turn ($(head -c 200 "$gate_err" 2>/dev/null | tr '\n' ' ')); this turn was NOT checked"
+      gate_fail="the definition-of-done gate FAILED to run ($(head -c 200 "$gate_err" 2>/dev/null | tr '\n' ' '))"
       out=""
     fi
     rm -f "$gate_err"
   else
-    msg="$msg | WARNING: gate not found at $gate; this turn was NOT checked"
+    gate_fail="the definition-of-done gate is missing at $gate"
+  fi
+
+  # A checker that could not run has NOT reported "done". Saying so in a
+  # systemMessage — which is what this did first — leaves the turn ending
+  # anyway, on the one turn the whole handover exists to cover, with the loop
+  # state already deleted so nothing will revisit it. Unmeasurable is not done
+  # here for the same reason it is not done anywhere else in this system.
+  if [[ -n "${gate_fail:-}" ]]; then
+    jq -n --arg r "The loop ended, but $gate_fail, so this turn's work was never checked. Do not treat that as finished: run \`python3 \$HOME/.claude/scripts/dod-check.py --repo <repo>\` yourself and report what it says, or say plainly that you could not." \
+          --arg m "$msg | ⛔ $gate_fail — turn NOT checked" \
+          '{decision: "block", reason: $r, systemMessage: $m}'
+    exit 0
   fi
   # Delete the marker now the gate has answered. Consuming it on the gate side
   # is NOT enough: the standalone gate runs and finishes in milliseconds, while

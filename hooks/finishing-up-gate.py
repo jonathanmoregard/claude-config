@@ -364,9 +364,16 @@ def main():
         # option — there is nothing to check against — but doing it silently
         # would be indistinguishable from a clean pass, which is the exact
         # confusion this tool exists to remove.
-        log(session, {"action": "allow",
-                      "why": f"armfile unreadable, NOTHING WAS CHECKED: {exc}"})
-        allow()
+        # Armed, and the record of WHAT to check is corrupt. Allowing here
+        # ends a turn nobody measured, which is the definition of the failure
+        # this gate exists to prevent — the fact that the corruption is ours
+        # rather than the repo's does not make the work finished. Block, name
+        # it, and let the budget bound the damage if it persists.
+        block(f"This session is armed, but its record of which repositories to "
+              f"check could not be read ({exc}), so NOTHING was verified. Do "
+              f"not treat that as finished: run `python3 {DOD} --repo <repo>` "
+              f"for the repositories you touched and report what it says.",
+              session, why=f"armfile unreadable, NOTHING WAS CHECKED: {exc}")
 
     problems = []
     for repo in repos:
