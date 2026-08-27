@@ -44,10 +44,34 @@ Each Phase 1/2 round follows the same shape:
 
 ```
 1. SELF-REVIEW: read each changed file top-to-bottom (not just diff)
-2. VERIFY: tests + syntax + smoke green before inviting external eyes. On the
-   phase's FIRST round, RECORD the SET OF PASSING TEST IDS from this run as the
-   PHASE BASELINE; later rounds reuse it unchanged. `regressed_r` is defined
-   against it
+2. VERIFY: tests + syntax + smoke green before inviting external eyes, and the
+   Phase 0 gate against the round's current diff. **Run the two CONCURRENTLY —
+   they share nothing.** The gate `cd`s to the repo and reads `git diff`; it
+   writes no temp file, takes no lock, and mutates nothing, so neither run can
+   observe the other. Serialising them pays the gate's wall time on every round
+   of every gated phase and buys nothing.
+
+   **It has exactly one race, and it is on the INDEX, not the worktree.** The
+   gate's secret rules run `gitleaks git --staged`, which reads the index.
+   Nothing may stage files while the gate is in flight — no `git add`, no
+   commit, no `git stash`. An index mutated mid-scan produces a result
+   attributable to neither the diff under review nor whatever staged over it,
+   and gitleaks reports a hit as a BLOCKER either way. Step 7 is the only step
+   of the round that stages and it is downstream of this one, so the constraint
+   binds everything else that might: a hook, a helper agent, a background job.
+
+   Concurrency changes what runs at the same time, never what has to be green
+   before an advisor is invited. Wait for BOTH before step 3 — a red suite and
+   an outstanding Phase 0 finding are each still a round that does not advise —
+   and read the gate's exit code exactly as "Phase 0" states it: **any code
+   outside `{0, 1}` is halt-and-pause with
+   `pause_reason: deterministic-gate-unavailable`.** Racing the gate alongside
+   the suite must never soften that into a dropped result or a swallowed
+   timeout. An unread exit code is the fail-open this phase exists to prevent.
+
+   On the phase's FIRST round, RECORD the SET OF PASSING TEST IDS from this run
+   as the PHASE BASELINE; later rounds reuse it unchanged. `regressed_r` is
+   defined against it
 3. ADVISE: dispatch the phase's advisor (Opus in phase 1, Codex in phase 2) —
    exactly ONE advisor dispatch per round. From round 2 on, the prompt's "Prior
    rounds fixed:" list carries the entire phase's fix history, compressed per
@@ -74,7 +98,16 @@ Each Phase 1/2 round follows the same shape:
    Any of: unparseable JSON, missing `.verdict`, or verdict/findings mismatch → the round FAILED. Re-dispatch once with an explicit "output valid JSON matching verdict-schema.json AND ensure verdict matches findings (PASS = empty findings; PASS_WITH_FIXES = no BLOCKER/HIGH; BLOCKS = ≥1 BLOCKER/HIGH)" reminder.
 
    Second failure PAUSEs the loop (interactive: prompt user; unattended: append to `pending_for_human.md` and exit `pending-human`). NEVER treat unparseable output or a mismatched verdict as advance-worthy — an incoherent advisor response has produced zero trustworthy coverage.
-4.5. VALIDATE: dispatch a fresh Opus subagent (`Agent(subagent_type="advisor", ...)`) with ONLY the PIVOTAL findings JSON (see "Validate only PIVOTAL findings" below) + absolute paths of files referenced by those findings. `index` is positional within the array you SEND; the parent maps indices back to the full findings list itself. Prompt: "VALIDATION dispatch. For each finding in the input array, read the file at the given line. Emit a JSON array `[{index, verified, unverifiable_confirmed, note}]` where `index` is the 0-based position of the finding in the input array. `verified=true` iff the described condition is empirically present at that location, `false` iff it is not. `unverifiable_confirmed=true` when the finding was tagged `unverifiable: true` by the parent advisor AND you agree no empirical check applies (subjective — taste, 'could be simpler', style preferences). Report what you found. What happens to a finding afterwards is not your concern."
+
+   Then DEDUPE the round's candidates against the priors with the
+   equivalence-judge subagent — ONE dispatch per round, defined under "Dedupe
+   `new_r` by MEANING" in "Loop bounds". **Dispatch it in the SAME tool-use
+   block as step 4.5's validator.** Both read the findings array this step just
+   parsed, neither reads the other's output, and nothing between them needs
+   ordering. Sequencing them spends a full subagent round-trip per round, on
+   every round of every gated phase, for no information. The dependency that
+   makes them LOOK ordered is broken at 4.5 below.
+4.5. VALIDATE: dispatch a fresh Opus subagent (`Agent(subagent_type="advisor", ...)`) with ALL of this round's findings JSON — every finding the phase's reviewers reported, merged into one array, undeduped because the judge that dedupes it is in flight alongside this dispatch (see "Send ALL findings, discard the converged rows" below) — + absolute paths of the files those findings reference. `index` is positional within the array you SEND; the parent maps indices back to the full findings list itself. Prompt: "VALIDATION dispatch. For each finding in the input array, read the file at the given line. Emit a JSON array `[{index, verified, unverifiable_confirmed, note}]` where `index` is the 0-based position of the finding in the input array. `verified=true` iff the described condition is empirically present at that location, `false` iff it is not. `unverifiable_confirmed=true` when the finding was tagged `unverifiable: true` by the parent advisor AND you agree no empirical check applies (subjective — taste, 'could be simpler', style preferences). Report what you found. What happens to a finding afterwards is not your concern."
 
    **Drop rule, with the `unverifiable` exemption stated so it cannot be read as a collision.** Parent drops `findings[i]` iff `verified == false` AND `findings[i].unverifiable != true`. A finding tagged `unverifiable: true` is NEVER dropped on `verified == false`: no empirical check applies to it, so `verified == false` carries no information about it — it is the expected answer, not a refutation. Unverifiable findings continue to step 5 as-is (whether or not the validator confirmed the tag); repro is still attempted and often confirms nothing, which is fine.
 
@@ -87,17 +120,70 @@ Each Phase 1/2 round follows the same shape:
 
    **Validator input boundary — findings JSON + absolute paths ONLY.** Never add the advisor's reasoning, exploration trace, or diff context to the validator prompt. The narrower input is the mechanism, not the model choice.
 
-   **Validate only PIVOTAL findings.** A finding the primary AND a specialist flagged INDEPENDENTLY at the same location is not pivotal — skip the validator, go straight to step 5. A singleton finding (one reviewer only) IS pivotal — validate it. This trims step 4.5 only; it NEVER skips step 5 repro.
+   **Send ALL findings, discard the converged rows.** Only PIVOTAL findings are validated, but the filtering happens on RETURN, not before the dispatch. Pivotal means SINGLETON, and singleton-ness is decided by the equivalence judge's within-round clustering — which is in flight in the same tool-use block. Filtering first would mean waiting for the judge, which reimposes exactly the round-trip the co-dispatch removes. So the parent sends every candidate the round produced and drops rows afterwards: a row for a finding the judge clustered with another reviewer's is DISCARDED UNREAD, never applied to anything. The cost is one extra JSON row and one extra file read per converged finding, inside a dispatch that was going out regardless; the round-trip saved is real and recurs every round.
+
+   The skip itself is unchanged, only its position. A finding the primary AND a specialist flagged INDEPENDENTLY at the same location is not pivotal — the validator's verdict on it is never consulted, and it goes straight to step 5 on the strength of that convergence. A singleton finding (one reviewer only) IS pivotal, and its row is the one the drop rule reads. This trims step 4.5 only; it NEVER skips step 5 repro.
+
+   **The two dispatches fail independently, and co-dispatch does not couple them.** A judge that fails falls back to trigram Jaccard for this round (see "Loop bounds") and leaves the validator's rows entirely usable — the fallback clusters within-round too, so the parent still knows which rows to discard. A validator that fails degrades the round to pre-4.5 behaviour per the failure-mode bullets above and leaves the judge's clustering entirely usable. Neither failure is evidence about the other, and neither is ever retried on the other's account.
 5. REPRODUCE each BLOCKER/HIGH finding before fixing — advisors hallucinate.
-   `new_r` and `repro_r` are both finalised at the END of this step, and so is
-   `selfinflicted_r`: for every finding that reproduced, ask whether THIS RUN
-   created it (re-run the repro against the pre-fix commit) or whether it
-   reports an earlier fix that never reaches a production caller. Both are
-   cheap here, where the repro already exists, and unrecoverable later
-6. FIX by severity, re-verify after each. Read `regressed_r` off the round's
-   FINAL re-verification, diffed against the PHASE BASELINE — run by the PARENT,
-   on a settled tree, never from an agent's reported count. Every fix agent's
-   brief carries the grep-before-report rule; see "Verification traps" below
+   **Fan out one agent per finding, each in its OWN git worktree**
+   (`Agent(subagent_type="general-purpose", …)`, all dispatched in one tool-use
+   block — a repro writes a script, runs a suite and forces a state, so the
+   read-only `advisor` type cannot do it). Findings do not depend on each
+   other; nothing about reproducing one informs reproducing the next.
+
+   **The per-finding worktree is MANDATORY, not hygiene.** Two repros in one
+   tree produce phantom reds by the mechanism "Verification traps" already
+   names below — a test that spawns subprocesses re-imports a module another
+   agent is mid-write on — and the red that follows belongs to neither finding.
+   Here that is worse than the case that section measures. There a phantom red
+   costs a re-run to disprove; at step 5 it is SCORED. It lands in `repro_r`,
+   the gate reads `repro_r` and never revises it, and step 6 then fixes a defect
+   that was never there. Serialising the repros would buy the same guarantee;
+   worktrees buy it cheaper, and the step already uses them — `selfinflicted_r`'s
+   regression-by-fix check is `git worktree add <tmp> <sha>^`, below.
+
+   **A worktree carries COMMITTED state only.** Confirm `git status --porcelain`
+   is clean before fanning out. When it is not — the first round of a run often
+   opens on an uncommitted diff — either commit the work under review first
+   (step 7 commits it anyway) or run this round's repros serially in the main
+   tree and say so in the round commit. A worktree missing the very lines a
+   finding is about reports `repro: false` for a live defect, and `repro_r` is
+   never revised. Create the worktrees OUTSIDE the repo and remove them
+   (`git worktree remove`) before step 6: one left nested inside puts a second
+   copy of every file under step 6's grep-before-report rule, which is how a fix
+   agent "confirms" a test file it never touched.
+
+   Each agent returns a verdict on ONE finding — reproduced or not, plus the
+   repro artifact. The parent tallies; an agent's claim about any finding but
+   its own is not a result. `new_r` and `repro_r` are both finalised at the END
+   of this step, and so is `selfinflicted_r`: for every finding that reproduced,
+   ask whether THIS RUN created it (re-run the repro against the pre-fix commit)
+   or whether it reports an earlier fix that never reaches a production caller.
+   Both are cheap here, where the repro already exists, and unrecoverable later
+6. FIX by severity, re-verify after each. **Fix agents run in parallel over
+   DISJOINT FILE SETS, and the partition is written into each brief**: the
+   absolute paths that agent owns, and the statement that every other file in
+   the repo is read-only to it. Two agents editing one file is a lost edit —
+   the second writes over a copy it read before the first landed — and it
+   reaches the diff as a fix that silently did not apply, which no later phase
+   can distinguish from a fix that was never attempted. Findings touching the
+   same file therefore go to the SAME agent, in severity order, even when they
+   are otherwise unrelated. A finding whose fix cannot be confined to one
+   agent's set is not parallel work: hand the whole set to one agent, or fix it
+   in the parent.
+
+   **The verification stays SINGLE and stays the PARENT's** — one run on the
+   settled tree, not one per agent and not one per file set. Read `regressed_r`
+   off the round's FINAL re-verification, diffed against the PHASE BASELINE —
+   run by the PARENT, on a settled tree, never from an agent's reported count.
+   Wait for every agent to return and for `git status --porcelain` to be clean
+   before starting it. Parallel fix agents make each of the traps below more
+   likely, not less, so read them at full strength before dispatching: "The
+   parent runs the gate. An agent's count is never the gate", "Never run the
+   gate while an agent is still editing", and "A fix can void a prior round's
+   test without failing it". Every fix agent's brief carries the
+   grep-before-report rule; see "Verification traps" below
 7. COMMIT the round (per-round granularity, not a batch), then WRITE RUN
    STATE (`<notes>/arftl-run.json` — counters, `baselines`, `findings_log`; see
    "Run state" below). Both, every round.
@@ -196,7 +282,10 @@ indistinguishable from a clean scan.
 
 **When it runs.** Once before Phase 1, and again at every round's step 2
 (VERIFY), against the round's current diff. A round whose fixes introduce a
-Phase 0 match is not a passing round, whatever its advisor said.
+Phase 0 match is not a passing round, whatever its advisor said. At step 2 it
+runs CONCURRENTLY with the test suite — it is read-only and takes no lock — and
+the single constraint that concurrency imposes is stated there: nothing may
+stage files while `gitleaks git --staged` is in flight.
 
 **Routing — this phase has none, which is the point.** Phase 0 findings do not
 enter `new_r`, do not carry an `autofix_class`, are never validated at step
@@ -397,22 +486,41 @@ Two methods, in preference order:
      [0] <file> :: <rationale>
      [1] ...
    CANDIDATES (this round):
-     [0] <file> :: <rationale>
+     [0] <reviewer> :: <file> :: <rationale>
      [1] ...
 
-   For each CANDIDATE, answer ONE yes/no question against each PRIOR: "do
-   these describe the same underlying defect?" No similarity scores, no
-   numeric thresholds. Emit ONLY a JSON array
-   [{"candidate": <int>, "match": <prior index or null>}], one row per
-   candidate, in candidate order. If a candidate matches more than one prior,
-   return the lowest matching prior index. If unsure, return null.
+   Answer ONE yes/no question — "do these describe the same underlying
+   defect?" — twice over: each CANDIDATE against each PRIOR, then each
+   CANDIDATE against every other CANDIDATE FROM A DIFFERENT REVIEWER. No
+   similarity scores, no numeric thresholds. Emit ONLY a JSON array
+   [{"candidate": <int>, "match": <prior index or null>,
+     "converged_with": [<candidate index>, ...]}],
+   one row per candidate, in candidate order. If a candidate matches more than
+   one prior, return the lowest matching prior index. If unsure, return null
+   and an empty converged_with.
    ```
+
+   **One dispatch, two clusterings.** `match` assigns `findings_log` identity
+   and feeds `new_r`. `converged_with` is how Phase 1 merges the primary's
+   findings with each specialist's, and it is what step 4.5 reads to decide
+   which findings are PIVOTAL — a non-empty `converged_with` means two reviewers
+   reached the same defect independently, so that finding is not a singleton and
+   its validator row is discarded. Both clusterings ride the one call: the cost
+   argument above forbids a second dispatch for the second question as firmly as
+   it forbids pairwise dispatch for the first. In Phases 2 and 3 there is one
+   reviewer, so `converged_with` is always empty and every finding is pivotal —
+   the convergence skip is a Phase 1 mechanism and always was.
 
    **Default to "not equivalent" (`match: null`) when ambiguous** — the failure
    direction is then one extra round, never a missed defect. If the prior list
    exceeds 60 entries, split by CANDIDATE into batches of 10 candidates against
    the full prior list; never split the prior list, or a candidate can miss its
-   own match.
+   own match. **Batching splits the `match` question only.** Every batch still
+   carries the FULL candidate list for the `converged_with` question and emits
+   rows for its own 10 — the candidate list is one round's findings and is
+   small, while the prior list is what grows. Split it and a converged pair
+   landing in different batches reads as two singletons, which inflates `new_r`
+   by one and sends both rows to the validator.
 
    **Fallback trigger — the only one.** Dispatch the judge ONCE. Fall back to
    method 2 for this round iff it returns quota-exhausted, returns no usable
@@ -420,7 +528,16 @@ Two methods, in preference order:
    one row per candidate. Do not retry, do not PAUSE; a partial or malformed
    array is not patched, it is discarded whole. Log
    `"dedupe fallback: <cause>"` in the round's commit message. On a batched
-   dispatch, one failed batch falls back for that batch only.
+   dispatch, one failed batch falls back for that batch only. Method 2 answers
+   BOTH questions — the same category-plus-trigram test applied
+   candidate-to-prior and candidate-to-candidate — so a fallback round still
+   knows which findings converged.
+
+   **The judge is dispatched in the same tool-use block as step 4.5's
+   validator, and that couples nothing.** The two never read each other's
+   output. A fallback here leaves the validator's rows exactly as usable as they
+   were; a validator failure leaves this clustering exactly as usable as it was.
+   Neither is retried on the other's account.
 2. **Character-trigram Jaccard ≥ 0.8 within the same category (fallback).**
    Cheap, no dispatch. Pinned exactly, so two runs over identical traces
    compute identical `new_r`:
@@ -777,7 +894,7 @@ Codex enforces the schema structurally: `scripts/codex-advise.sh` pins `--output
 
 **`advisor.md` whitelists `Skill`** — safe because Skill invocation is metadata-only (loads instructions into the subagent's context); any tool the loaded skill prescribes that is not in the whitelist still fails, preserving the read-only invariant. NEW SESSION REQUIRED after editing advisor.md; specialist dispatches in a stale session fall back to manual checklist application (still useful, marginally lower recall).
 
-Dispatch specialists in the SAME tool-use block as the primary Opus advisor — parallel, independent, read-only, **NO shared state**. No specialist sees the primary's findings, another specialist's findings, or any hint of what the others are looking at, until all have reported. One shared cue before they report collapses them into one reviewer. Merge afterwards by semantic-equivalence dedupe (same rule as `new_r`), not by `(file, line)`; specialist findings inherit the primary's phase counter but are tagged in commit messages (`[specialist:insecure-defaults]`). If BOTH the primary and a specialist independently flag the same location, that convergence is the confidence signal: skip step 4.5's validator for it and reproduce it first.
+Dispatch specialists in the SAME tool-use block as the primary Opus advisor — parallel, independent, read-only, **NO shared state**. No specialist sees the primary's findings, another specialist's findings, or any hint of what the others are looking at, until all have reported. One shared cue before they report collapses them into one reviewer. Merge afterwards by semantic-equivalence dedupe (same rule as `new_r`), not by `(file, line)`; specialist findings inherit the primary's phase counter but are tagged in commit messages (`[specialist:insecure-defaults]`). If BOTH the primary and a specialist independently flag the same location, that convergence is the confidence signal: the validator's verdict on it is never consulted (its row is discarded unread — the validator is sent every finding so it can co-dispatch with the dedupe judge, see step 4.5), and it reproduces first.
 
 Skip specialists when the diff is clearly out-of-scope (pure prose docs, VM test fixture changes, cosmetic renames). Rule of thumb: if you'd forward the diff to a security reviewer at your org, dispatch the specialist.
 
@@ -1009,7 +1126,7 @@ After consolidator exits (clean or bounded), complete the phase transition the g
 | Advance, or end a round loop, on a verdict value | The gate is the only authority on advancement. A `PASS` over a finding that reproduced and was not fixed ships a live defect. The verdict carries findings and is cross-validated at step 4; that is all it does. |
 | Put "Prior rounds fixed:" at the START of the prompt | Kills prefix caching. Stable content first (goal, re-read paths, output shape), variable delta last. |
 | Auto-fix based on severity alone | Severity is intrinsic risk, not apply-authority. A LOW rename that ripples 40 files is not `safe_auto` — it's `gated_auto` or `manual`. Consolidator MUST AND `severity=LOW` with `autofix_class=safe_auto`; anything else surfaces for the human. |
-| Skip step 4.5 (validate) because "advisor is trustworthy" | Advisors hallucinate file paths, line numbers, and stale-state claims (they read pre-fix state). Validator is cheap (small prompt, file re-read) and catches the class before it becomes a wasted repro round in step 5. Exactly TWO skips are sanctioned and neither is this one: per-finding, when the primary and a specialist converged independently on the location; wholesale for the round, when the validator itself fails (quota / malformed JSON / no usable result) and the round degrades to pre-4.5 behaviour. Any other skip is the anti-pattern. Neither sanctioned skip ever skips step 5. |
+| Skip step 4.5 (validate) because "advisor is trustworthy" | Advisors hallucinate file paths, line numbers, and stale-state claims (they read pre-fix state). Validator is cheap (small prompt, file re-read) and catches the class before it becomes a wasted repro round in step 5. Exactly TWO skips are sanctioned and neither is this one: per-finding, when the primary and a specialist converged independently on the location — applied on RETURN, since the validator is sent every finding so it can co-dispatch with the dedupe judge, and a converged finding's row is discarded unread; wholesale for the round, when the validator itself fails (quota / malformed JSON / no usable result) and the round degrades to pre-4.5 behaviour. Any other skip is the anti-pattern. Neither sanctioned skip ever skips step 5. |
 | Tell the advisor what a severity TRIGGERS ("HIGH forces another round", "LOW gets auto-fixed", "a violation of this rule is HIGH") | Consequence text moves the severity the advisor picks, by a different amount and a different direction per advisor, so it cannot be corrected downstream. Describe severity by blast radius / reversibility / silence / recoverability. Consequences live in parent-side code. |
 | Let the consolidator fix a LOW without confirming it against the file | The weakest findings would then get the weakest gate, and unverified edits break working code. Read the stated location, confirm the condition is there, `skipped: unconfirmed` otherwise. |
 | Give the specialists a peek at the primary's findings before they report | One shared cue collapses independent reviewers into one. Same block, no shared state, merge only after all have returned. |
@@ -1064,7 +1181,7 @@ Neither is gated by "Loop bounds": 4a is one critique plus one bounded fix pass,
 | Phase | Vendor | Reviewer role | Combines with | Skip when |
 |---|---|---|---|---|
 | 1 | Anthropic (Opus + specialists) | Broad correctness + narrow security/API passes | Own phase output only | Never; foundation phase |
-| 4.5 (in-round) | Anthropic (Opus, validator) | Re-verify PIVOTAL (singleton) findings against actual file state — input boundary, drop rule and degrade-on-failure behaviour all defined at step 4.5. A drop CLOSES the finding with `repro: false` and keeps it in `new_r` | Feeds into step 5 (reproduce) | Per-finding on independent two-reviewer convergence; wholesale on any validator failure — see step 4.5 |
+| 4.5 (in-round) | Anthropic (Opus, validator) | Re-verify findings against actual file state — sent ALL of the round's findings (the judge that dedupes them is in flight alongside), with only the PIVOTAL (singleton) rows applied. Input boundary, drop rule and degrade-on-failure behaviour all defined at step 4.5. A drop CLOSES the finding with `repro: false` and keeps it in `new_r` | Co-dispatched with step 4's dedupe judge in ONE tool-use block; feeds into step 5 (reproduce) | Per-finding on independent two-reviewer convergence, applied by discarding that row on return; wholesale on any validator failure — see step 4.5 |
 | 2 | OpenAI (Codex / GPT-5.5) | Cross-vendor correctness on Opus-clean state | Phase 1 fix history carried in prompt | Never; PAUSE on quota, don't silently skip |
 | 3 | Anthropic (Opus, adversarial) | "Prior phases were wrong — find why" | Same gate at step 8; a `continue` resets to Phase 1 | Never; one shot, cheap |
 | 4a | Anthropic (Opus x2 — defect + taste critics) | UI defect + house-style critique — protocol per "Phases 4a + 4b" | Own phase output only | Non-UI diffs |
