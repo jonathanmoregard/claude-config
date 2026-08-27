@@ -19,6 +19,7 @@
 set -uo pipefail
 
 SD=$(mktemp -d)
+trap 'rm -rf "$SD"' EXIT  # arftl-allow: destructive-shell — $SD is this run's own mktemp -d
 export CLAUDE_RALPH_STATE_DIR="$SD/ralph"
 mkdir -p "$CLAUDE_RALPH_STATE_DIR"
 GATE="$HOME/.claude/hooks/finishing-up-gate.py"
@@ -82,20 +83,42 @@ open(sys.argv[1], "w").write(json.dumps(rec, separators=(",", ":")) + "\n")
 PY
   printf -- '---\nactive: true\niteration: 4\nmax_iterations: 25\ncompletion_promise: "ALL DONE"\n---\nkeep going\n' \
     > "$CLAUDE_RALPH_STATE_DIR/$S.md"
+  # CLAUDE_DOD_STATE_DIR is load-bearing here: end_loop calls the gate, and
+  # without it that inner call reads the LIVE ~/.local/state/claude-dod — an
+  # isolation gap in a file whose own header claims isolation.
   printf '{"session_id":"%s","transcript_path":"%s"}' "$S" "$T" \
-    | bash "$RALPH_HOOK" >/dev/null 2>&1
+    | CLAUDE_DOD_STATE_DIR="$SD" bash "$RALPH_HOOK" >/dev/null 2>&1
   if [ -f "$CLAUDE_RALPH_STATE_DIR/$S.md" ]; then rm -f "$CLAUDE_RALPH_STATE_DIR/$S.md"; echo kept
   else echo gone; fi
 }
 
-ck "<halt> with a reason ends the loop" gone \
-   "$(probe 'Stopping. <halt>the user told me to stop and the mission is incomplete</halt>')"
+ck "<halt> on its own line ends the loop" gone \
+   "$(probe 'Stopping.
+<halt>the user told me to stop and the mission is incomplete</halt>')"
 # A bare tag is not an escape hatch: an exit has to say why, or the audit trail
 # is worthless and "halt" becomes a cheaper sigil than the sigil.
-ck "bare <halt> does NOT exit"          kept "$(probe 'Stopping. <halt></halt>')"
+ck "bare <halt> does NOT exit"          kept "$(probe 'Stopping.
+<halt></halt>')"
 ck "no tag keeps looping"               kept "$(probe 'Holding.')"
 ck "a true promise still exits"         gone "$(probe '<promise>ALL DONE</promise>')"
 ck "a false promise does not exit"      kept "$(probe '<promise>something else</promise>')"
+
+# The systemMessage injects the literal promise string EVERY iteration, so the
+# model is reading it every turn. Quoting it back while explaining itself is
+# ordinary behaviour, not an edge case. All four of these used to EXIT the loop
+# with a false completion claim — including a model explicitly REFUSING to make
+# one, and one that never used a tag at all.
+ck "a QUOTED promise does not exit"     kept \
+   "$(probe 'I am not done, so I will not output <promise>ALL DONE</promise> yet.')"
+ck "explaining the rule does not exit"  kept \
+   "$(probe 'To stop the loop I must emit <promise>ALL DONE</promise> only when true.')"
+ck "bare promise text does not exit"    kept "$(probe 'ALL DONE')"
+ck "a QUOTED halt does not exit"        kept \
+   "$(probe 'I could emit <halt>give up</halt> here but I will not.')"
+# Discussing the rule and THEN genuinely claiming it must still work.
+ck "discuss-then-claim still exits"     gone \
+   "$(probe 'The rule says emit <promise>ALL DONE</promise> only when true. It is.
+<promise>ALL DONE</promise>')"
 
 if [ -s "$CLAUDE_RALPH_STATE_DIR/halts.log" ]; then
   ck "the halt reason is recorded" "yes" \
@@ -184,6 +207,25 @@ printf '%s\n' "$BREPO" > "$SD/$MSID.arm"
 : > "$CLAUDE_RALPH_STATE_DIR/$MSID.handover"
 out=$(printf '{"session_id":"%s"}' "$MSID" | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE")
 ck "a fresh handover marker silences the standalone gate" "" "$(decision "$out")"
+
+# The orphaned-marker hole, found independently by two reviewers and
+# reproduced. ralph writes the marker only inside end_loop, AFTER a transcript
+# poll that can take ~3s — so the standalone gate almost always reads the state
+# file first and stands down. If it leaves the marker behind, the NEXT Stop
+# inside the staleness window eats it and allows a turn with unfinished work.
+# A live loop makes any marker meaningless, so standing down must consume it.
+OSID="orphan-$RANDOM"
+printf '%s\n' "$BREPO" > "$SD/$OSID.arm"
+printf -- '---\nactive: true\niteration: 2\nmax_iterations: 25\n---\np\n' \
+  > "$CLAUDE_RALPH_STATE_DIR/$OSID.md"
+: > "$CLAUDE_RALPH_STATE_DIR/$OSID.handover"
+out=$(printf '{"session_id":"%s"}' "$OSID" | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE")
+ck "standing down for a live loop consumes the marker" "gone" \
+   "$([ -e "$CLAUDE_RALPH_STATE_DIR/$OSID.handover" ] && echo kept || echo gone)"
+rm -f "$CLAUDE_RALPH_STATE_DIR/$OSID.md"
+out=$(printf '{"session_id":"%s"}' "$OSID" | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE")
+ck "the turn after the loop ends is still gated" "block" "$(decision "$out")"
+rm -f "$SD/$OSID.arm" "$SD/$OSID.blocks"
 ck "the marker is consumed on read" "gone" \
    "$([ -e "$CLAUDE_RALPH_STATE_DIR/$MSID.handover" ] && echo kept || echo gone)"
 # Consumed means the NEXT turn is gated normally again.
