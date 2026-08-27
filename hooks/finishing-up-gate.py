@@ -45,7 +45,18 @@ STATE_DIR = pathlib.Path(
         "CLAUDE_DOD_STATE_DIR", pathlib.Path.home() / ".local/state/claude-dod"
     )
 )
-DOD = pathlib.Path.home() / ".claude/scripts/dod-check.py"
+# Overridable so a harness can point at a copy. ~/.claude is a working checkout
+# that other agents share; a branch switch under a running session deletes every
+# file not present on the target branch, and a hook whose predicate path can
+# vanish measures the branch as much as it measures the work. Observed: the
+# first headless run of the harness died with "can't open file" mid-session and
+# the turn ended UNBLOCKED. Missing still fails closed here (run_dod returns an
+# error, which counts as a problem); this only drops the fixed-path assumption.
+DOD = pathlib.Path(
+    os.environ.get(
+        "CLAUDE_DOD_CHECK", pathlib.Path.home() / ".claude/scripts/dod-check.py"
+    )
+)
 MODE = os.environ.get("CLAUDE_DOD_MODE", "shadow").strip().lower()
 
 # Own budget, deliberately below the harness's default cap of 8 so this gate
@@ -165,6 +176,10 @@ def main():
         f"{body}\n\n"
         "Invoke the `finishing-up` skill and work these blockers. Do not end "
         "the turn by reporting status — drive to green and mergeable.\n\n"
+        f"Re-check with: python3 {DOD} --repo <repo>\n"
+        "That exact command, not a bare `dod-check` — it is not on PATH. "
+        "Reading the conditions yourself and concluding you are done is the "
+        "self-attestation this gate exists to replace.\n\n"
         "If a check is still running, either start `gh pr checks --watch` as a "
         "background task or schedule a durable CronCreate follow-up; either one "
         "satisfies this gate.\n\n"
