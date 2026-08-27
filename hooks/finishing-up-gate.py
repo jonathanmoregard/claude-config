@@ -218,7 +218,11 @@ def main():
     except ValueError:
         allow()
 
+    if not isinstance(payload, dict):
+        allow()  # not a hook payload we understand; nothing to key state on
     session = payload.get("session_id") or ""
+    if not isinstance(session, str):
+        allow()
     if not re.fullmatch(r"[A-Za-z0-9._-]+", session):
         allow()
 
@@ -328,7 +332,13 @@ def main():
 
     try:
         repos = [r for r in armfile.read_text().splitlines() if r.strip()]
-    except OSError:
+    except OSError as exc:
+        # Armed, but the list of repos is unreadable. Allowing is the only
+        # option — there is nothing to check against — but doing it silently
+        # would be indistinguishable from a clean pass, which is the exact
+        # confusion this tool exists to remove.
+        log(session, {"action": "allow",
+                      "why": f"armfile unreadable, NOTHING WAS CHECKED: {exc}"})
         allow()
 
     problems = []
@@ -352,7 +362,20 @@ def main():
             continue
         if not result.get("applicable") or result.get("done"):
             continue
-        lines = [f"  [{b['code']}] {b['detail']}" for b in result.get("blockers", [])]
+        raw_blockers = result.get("blockers")
+        if not isinstance(raw_blockers, list):
+            raw_blockers = []
+        lines = []
+        for b in raw_blockers:
+            # .get with defaults, not indexing: last round validated the top
+            # level of dod-check's JSON, and a malformed ITEM crashed the hook
+            # by exactly the same mechanism one level down.
+            if isinstance(b, dict):
+                lines.append(f"  [{b.get('code', '?')}] {b.get('detail', '(no detail)')}")
+            else:
+                lines.append(f"  [MALFORMED] {str(b)[:120]}")
+        if not lines:
+            lines = ["  (dod-check reported not-done but listed no blockers)"]
         problems.append(f"{repo}:\n" + "\n".join(lines))
 
     if not problems:

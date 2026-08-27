@@ -27,6 +27,18 @@ fi
 
 RALPH_STATE_FILE="$STATE_DIR/$HOOK_SESSION.md"
 
+extract_tag() {  # $1 = tag name; reads $LAST_OUTPUT, prints the claimed text
+  printf '%s' "$LAST_OUTPUT" | TAG="$1" perl -ne '
+    BEGIN { $tag = $ENV{TAG}; $fence = 0; @hit = (); }
+    if (/^[ \t]*(```|~~~)/) { $fence = !$fence; next; }
+    next if $fence;
+    # Up to three leading spaces: four or more is a markdown code block, which
+    # is a demonstration of the tag rather than an assertion of it.
+    if (/^[ ]{0,3}<\Q$tag\E>(.*?)<\/\Q$tag\E>[ \t]*$/) { push @hit, $1; }
+    END { if (@hit) { $t = $hit[-1]; $t =~ s/^\s+|\s+$//g; $t =~ s/\s+/ /g; print $t; } }
+  ' 2>/dev/null || true
+}
+
 # ---------------------------------------------------------------------------
 # Ending the loop hands the turn to the definition-of-done gate.
 #
@@ -64,9 +76,28 @@ end_loop() {  # $1 = human-readable message for the transcript
   if [[ -f "$gate" ]]; then
     # HANDOVER=1 so the gate skips the ownership and marker checks: this call is
     # the handover, and standing down here would mean nobody checked at all.
-    out=$(printf '%s' "$HOOK_INPUT" \
-          | CLAUDE_DOD_HANDOVER=1 python3 "$gate" 2>/dev/null) || out=""
+    gate_err="$STATE_DIR/$HOOK_SESSION.gate-stderr"
+    if ! out=$(printf '%s' "$HOOK_INPUT" \
+               | CLAUDE_DOD_HANDOVER=1 python3 "$gate" 2>"$gate_err"); then
+      # A crashing gate on the handover turn used to end the loop silently with
+      # only a systemMessage — the exact turn the design says matters most,
+      # unmeasured and untraceable. Say so in the message the human sees.
+      msg="$msg | WARNING: the definition-of-done gate FAILED on this turn ($(head -c 200 "$gate_err" 2>/dev/null | tr '\n' ' ')); this turn was NOT checked"
+      out=""
+    fi
+    rm -f "$gate_err"
+  else
+    msg="$msg | WARNING: gate not found at $gate; this turn was NOT checked"
   fi
+  # Delete the marker now the gate has answered. Consuming it on the gate side
+  # is NOT enough: the standalone gate runs and finishes in milliseconds, while
+  # this script polls the transcript for up to ~3s first, so on the real timing
+  # that gate has already stood down before the marker exists and has nothing to
+  # consume. The marker then outlived the turn and the NEXT Stop ate it.
+  # Reproduced. Bounding its life to this function closes every ordering:
+  # a gate that ran early stood down on the state file, and one that runs inside
+  # this window consumes it itself.
+  rm -f "$STATE_DIR/$HOOK_SESSION.handover"
   if [[ -n "$out" ]]; then
     # Exactly one JSON object must reach the harness, so fold our message into
     # the gate's: a block keeps its reason and the human still learns why the
@@ -87,10 +118,10 @@ fi
 
 # Parse markdown frontmatter (YAML between ---) and extract values
 FRONTMATTER=$(sed -n '/^---$/,/^---$/{ /^---$/d; p; }' "$RALPH_STATE_FILE")
-ITERATION=$(echo "$FRONTMATTER" | grep '^iteration:' | sed 's/iteration: *//')
-MAX_ITERATIONS=$(echo "$FRONTMATTER" | grep '^max_iterations:' | sed 's/max_iterations: *//')
+ITERATION=$(echo "$FRONTMATTER" | grep '^iteration:' | sed 's/iteration: *//') || true
+MAX_ITERATIONS=$(echo "$FRONTMATTER" | grep '^max_iterations:' | sed 's/max_iterations: *//') || true
 # Extract completion_promise and strip surrounding quotes if present
-COMPLETION_PROMISE=$(echo "$FRONTMATTER" | grep '^completion_promise:' | sed 's/completion_promise: *//' | sed 's/^"\(.*\)"$/\1/')
+COMPLETION_PROMISE=$(echo "$FRONTMATTER" | grep '^completion_promise:' | sed 's/completion_promise: *//' | sed 's/^"\(.*\)"$/\1/') || true
 
 # Validate numeric fields before arithmetic operations
 if [[ ! "$ITERATION" =~ ^[0-9]+$ ]]; then
@@ -194,10 +225,7 @@ if [[ "$COMPLETION_PROMISE" != "null" ]] && [[ -n "$COMPLETION_PROMISE" ]]; then
   # completion still exits.
   PROMISE_TEXT=""
   if [[ "$LAST_OUTPUT" == *"<promise>"* ]]; then
-    PROMISE_TEXT=$(printf '%s' "$LAST_OUTPUT" | perl -0777 -ne '
-      my @m = /^[ \t]*<promise>(.*?)<\/promise>[ \t]*$/gms;
-      if (@m) { my $t = $m[-1]; $t =~ s/^\s+|\s+$//g; $t =~ s/\s+/ /g; print $t; }
-    ' 2>/dev/null || echo "")
+    PROMISE_TEXT=$(extract_tag promise)
   fi
 
   # Use = for literal string comparison ( == in [[ ]] would glob-match )
@@ -225,10 +253,7 @@ if [[ "$LAST_OUTPUT" == *"<halt>"* ]]; then
   # Own-line anchored for the same reason as <promise> above: the systemMessage
   # advertises this tag every iteration, so the model reads it every turn and
   # quoting it back mid-sentence must not end the loop.
-  HALT_REASON=$(printf '%s' "$LAST_OUTPUT" | perl -0777 -ne '
-    my @m = /^[ \t]*<halt>(.*?)<\/halt>[ \t]*$/gms;
-    if (@m) { my $t = $m[-1]; $t =~ s/^\s+|\s+$//g; $t =~ s/\s+/ /g; print $t; }
-  ' 2>/dev/null || echo "")
+  HALT_REASON=$(extract_tag halt)
   if [[ -n "$HALT_REASON" ]]; then
     printf '%s\t%s\titeration=%s\t%s\n' \
       "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$HOOK_SESSION" "$ITERATION" "$HALT_REASON" \

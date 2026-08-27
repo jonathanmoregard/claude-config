@@ -38,6 +38,21 @@ decision() { printf '%s' "$1" | python3 -c 'import json,sys
 try: print(json.load(sys.stdin).get("decision") or "")
 except Exception: print("")' 2>/dev/null; }
 
+# `decision` alone CANNOT distinguish "allowed the turn" from "crashed": both
+# render as empty. Every allow-assertion in this file was therefore satisfied by
+# the guarded path throwing — the suite would have stayed green over a hook that
+# never ran. `gate_run` captures the exit code too, so an allow must be a
+# deliberate exit 0 and not a traceback.
+GATE_RC=0
+gate_run() {  # $1 = session id; extra args are env assignments -> prints stdout
+  local sid="$1"; shift
+  local out
+  out=$(printf '{"session_id":"%s"}' "$sid" \
+        | env CLAUDE_DOD_STATE_DIR="$SD" "$@" python3 "$GATE" 2>/dev/null)
+  GATE_RC=$?
+  printf '%s' "$out"
+}
+
 echo "== dod gate: one driver per turn =="
 # A purpose-built repo with a known blocker. These cases used to arm the live
 # ~/.claude, which passed only for as long as that checkout happened to be
@@ -59,9 +74,17 @@ ck "blocks by default (active is the default mode)" "block" "$(decision "$out")"
 
 printf -- '---\nactive: true\niteration: 3\nmax_iterations: 25\n---\nprompt\n' \
   > "$CLAUDE_RALPH_STATE_DIR/$SID.md"
-out=$(printf '{"session_id":"%s"}' "$SID" | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE")
+out=$(gate_run "$SID")
 ck "yields to an armed ralph loop" "" "$out"
+ck "  ...by exiting 0, not by crashing" "0" "$GATE_RC"
 rm -f "$CLAUDE_RALPH_STATE_DIR/$SID.md"
+
+# Proof the assertion above can actually fail: a hook that throws produces the
+# same empty stdout an allow does. Without the exit code this suite was blind.
+BROKEN="$SD/broken-gate.py"
+printf 'import sys\nraise SystemExit(1)\n' > "$BROKEN"
+printf '{"session_id":"x"}' | python3 "$BROKEN" >/dev/null 2>&1; rc=$?
+ck "  ...and a crash is distinguishable" "1" "$rc"
 
 out=$(printf '{"session_id":"%s"}' "$SID" | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE")
 ck "blocks again once the loop is gone" "block" "$(decision "$out")"
@@ -153,6 +176,33 @@ ck "a QUOTED promise does not exit"     kept \
 ck "explaining the rule does not exit"  kept \
    "$(probe 'To stop the loop I must emit <promise>ALL DONE</promise> only when true.')"
 ck "bare promise text does not exit"    kept "$(probe 'ALL DONE')"
+# A fenced block is how a model DISPLAYS a literal tag, and the systemMessage
+# invites discussing these freely. Own-line anchoring alone matched inside the
+# fence, so demonstrating the tag exited the loop with a false completion claim.
+ck "a FENCED promise does not exit"     kept "$(probe 'To stop you write:
+
+```
+<promise>ALL DONE</promise>
+```
+
+I am not doing that.')"
+ck "a fenced halt does not exit"        kept "$(probe 'Example:
+
+~~~
+<halt>giving up</halt>
+~~~
+
+Not yet.')"
+ck "an inline-code tag does not exit"   kept "$(probe 'The tag is
+`<promise>ALL DONE</promise>`
+which I will not emit.')"
+ck "a blockquoted tag does not exit"    kept "$(probe '> <promise>ALL DONE</promise>
+
+That is what it would look like.')"
+# Four+ leading spaces is a markdown code block: a demonstration, not a claim.
+ck "an indented tag does not exit"      kept "$(probe 'Like so:
+
+    <promise>ALL DONE</promise>')"
 ck "a QUOTED halt does not exit"        kept \
    "$(probe 'I could emit <halt>give up</halt> here but I will not.')"
 # Discussing the rule and THEN genuinely claiming it must still work.
@@ -166,6 +216,47 @@ if [ -s "$CLAUDE_RALPH_STATE_DIR/halts.log" ]; then
 else
   ck "the halt reason is recorded" "yes" "no halts.log"
 fi
+
+echo
+echo "== a REAL loop end leaves no marker behind =="
+# The orphan, measured against a real end_loop rather than a planted marker.
+# The first attempt at this fix consumed the marker gate-side, which does not
+# work on the actual timing: the standalone gate finishes in milliseconds while
+# ralph polls the transcript for up to ~3s, so the gate stands down BEFORE the
+# marker exists and has nothing to consume. Bounding the marker's life to
+# end_loop is what closes it.
+RSID="realend-$RANDOM"
+printf '%s\n' "$BREPO" > "$SD/$RSID.arm"
+printf -- '---\nactive: true\niteration: 4\nmax_iterations: 25\ncompletion_promise: "ALL DONE"\n---\np\n' \
+  > "$CLAUDE_RALPH_STATE_DIR/$RSID.md"
+RT="$SD/realend.jsonl"
+python3 - "$RT" <<'PY'
+import json, sys
+rec = {"role": "assistant", "message": {"content": [
+    {"type": "text", "text": "<promise>ALL DONE</promise>"}]}}
+open(sys.argv[1], "w").write(json.dumps(rec, separators=(",", ":")) + "\n")
+PY
+# The concurrent gate wins the race, as it does in practice.
+out=$(gate_run "$RSID")
+ck "concurrent gate stands down for the live loop" "" "$(decision "$out")"
+printf '{"session_id":"%s","transcript_path":"%s"}' "$RSID" "$RT" \
+  | CLAUDE_DOD_STATE_DIR="$SD" bash "$RALPH_HOOK" >/dev/null 2>&1
+ck "end_loop leaves no marker"          "gone" \
+   "$([ -e "$CLAUDE_RALPH_STATE_DIR/$RSID.handover" ] && echo kept || echo gone)"
+out=$(gate_run "$RSID")
+ck "the turn after a real loop end is gated" "block" "$(decision "$out")"
+rm -f "$SD/$RSID.arm" "$SD/$RSID.blocks"
+
+# A frontmatter line missing entirely used to kill the hook under
+# `set -euo pipefail` (grep exits 1) BEFORE its own corruption handler ran, so
+# the state file survived and the gate yielded to a dead loop every turn.
+CSID="corrupt-$RANDOM"
+printf -- '---\nactive: true\nmax_iterations: 25\n---\np\n' \
+  > "$CLAUDE_RALPH_STATE_DIR/$CSID.md"
+printf '{"session_id":"%s","transcript_path":"%s"}' "$CSID" "$RT" \
+  | CLAUDE_DOD_STATE_DIR="$SD" bash "$RALPH_HOOK" >/dev/null 2>&1
+ck "a missing frontmatter line ends the loop" "gone" \
+   "$([ -e "$CLAUDE_RALPH_STATE_DIR/$CSID.md" ] && echo kept || echo gone)"
 
 echo
 echo "== reaping abandoned arm state =="
@@ -245,8 +336,9 @@ ck "promise handover blocks on the gate's verdict" "block" "$(decision "$HOUT")"
 MSID="marker-$RANDOM"
 printf '%s\n' "$BREPO" > "$SD/$MSID.arm"
 : > "$CLAUDE_RALPH_STATE_DIR/$MSID.handover"
-out=$(printf '{"session_id":"%s"}' "$MSID" | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE")
+out=$(gate_run "$MSID")
 ck "a fresh handover marker silences the standalone gate" "" "$(decision "$out")"
+ck "  ...by exiting 0, not by crashing" "0" "$GATE_RC"
 
 # The orphaned-marker hole, found independently by two reviewers and
 # reproduced. ralph writes the marker only inside end_loop, AFTER a transcript
@@ -259,7 +351,8 @@ printf '%s\n' "$BREPO" > "$SD/$OSID.arm"
 printf -- '---\nactive: true\niteration: 2\nmax_iterations: 25\n---\np\n' \
   > "$CLAUDE_RALPH_STATE_DIR/$OSID.md"
 : > "$CLAUDE_RALPH_STATE_DIR/$OSID.handover"
-out=$(printf '{"session_id":"%s"}' "$OSID" | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE")
+out=$(gate_run "$OSID")
+ck "  ...standing down exits 0" "0" "$GATE_RC"
 ck "standing down for a live loop consumes the marker" "gone" \
    "$([ -e "$CLAUDE_RALPH_STATE_DIR/$OSID.handover" ] && echo kept || echo gone)"
 rm -f "$CLAUDE_RALPH_STATE_DIR/$OSID.md"
