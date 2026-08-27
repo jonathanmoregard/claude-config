@@ -115,12 +115,29 @@ case_run "no PR blocks"            no_pr    1 "NO_PR"
 case_run "merged still says do not ask" merged 1 "Do NOT ask for a merge"
 case_run "merged says MERGED"      merged   1 "MERGED, NOT FINISHED"
 case_run "merged demands going home" merged  1 "NOT_ON_DEFAULT"
+
+# A PR merges the commits it HAD. Push more to the branch afterwards and they
+# sit on a dead branch while the PR still reads MERGED — green, work nowhere.
+fresh_repo; git push -q -u origin feat/x
+echo "after the merge" >> src/a.py; git add -A; git commit -qm "landed nowhere"
+git push -q
+case_run "commits the merge left behind block" merged 1 "COMMITS_AFTER_MERGE"
+case_run "and it counts them"                  merged 1 "1 commit(s) on feat/x"
 case_run "closed blocks"           closed   1 "PR_CLOSED"
 case_run "pending checks block"    pending  1 "CHECKS_PENDING"
 case_run "failing checks block"    failing  1 "CHECKS_FAILING"
 case_run "unresolved threads"      failing  1 "UNRESOLVED_THREADS"
 case_run "BEHIND blocks"           behind   1 "NOT_MERGEABLE"
 case_run "all green is done"       green    0 "DONE"
+# `gh pr view` picks ONE pr for the branch and never says it chose. A green PR
+# into release must not answer for a blocked one into main.
+case_run "two open PRs on one head blocks" two_prs 1 "MULTIPLE_PRS"
+case_run "the ambiguity names both"        two_prs 1 "#49 → release"
+# Listing failing must not silently read as "only one PR".
+case_run "PR list failure warns, not silent" listerror 0 "could not list PRs"
+# UNKNOWN is not CLEAN. This exact state produced a DONE verdict on a branch
+# that was two commits behind master.
+case_run "UNKNOWN mergeability blocks" unknown_merge 1 "MERGEABLE_UNKNOWN"
 case_run "gh error is exit 3"      apierror 3 ""
 case_run "no GitHub remote is n/a, not a blocker" notgithub 2 "no GitHub remote"
 # Advisory, not blocking: threads that actually gate a merge surface as

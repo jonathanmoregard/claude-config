@@ -17,6 +17,20 @@ if [ "$sub" = "pr view" ]; then
   done
 fi
 
+# Open PRs sharing this head branch. One entry unless a fixture says otherwise:
+# the ambiguity is the exceptional case, not the default.
+if [ "$sub" = "pr list" ]; then
+  case "$DOD_FIXTURE" in
+    two_prs)
+      echo '[{"number":48,"url":"https://github.com/o/r/pull/48","baseRefName":"master"},{"number":49,"url":"https://github.com/o/r/pull/49","baseRefName":"release"}]' ;;
+    listerror)
+      echo "HTTP 502: bad gateway" >&2; exit 1 ;;
+    *)
+      echo '[{"number":48,"url":"https://github.com/o/r/pull/48","baseRefName":"master"}]' ;;
+  esac
+  exit 0
+fi
+
 # owner/repo lookup + the GraphQL review-thread query.
 if [ "$sub" = "repo view" ]; then
   echo '{"owner":{"login":"o"},"name":"r"}'; exit 0
@@ -85,9 +99,18 @@ case "$DOD_FIXTURE" in
     fi
     [ "$sub" = "pr checks" ] && { echo "no checks reported on the 'f' branch" >&2; exit 1; }
     ;;
-  green|threaderror)
+  green|threaderror|two_prs|listerror)
     if [ "$sub" = "pr view" ]; then
       echo '{"number":48,"url":"https://github.com/o/r/pull/48","state":"OPEN","isDraft":false,"mergeStateStatus":"CLEAN","reviewDecision":"APPROVED","reviewThreads":{"nodes":[]},"headRefName":"f","baseRefName":"master","title":"t"}'
+      exit 0
+    fi
+    [ "$sub" = "pr checks" ] && { echo '[{"name":"ci","state":"SUCCESS","bucket":"pass","link":"","workflow":"w"}]'; exit 0; }
+    ;;
+  unknown_merge)
+    # GitHub lazily recomputing. The trap: this is NOT the merged case (state
+    # says OPEN), so it means "not computed yet", never "fine to merge".
+    if [ "$sub" = "pr view" ]; then
+      echo '{"number":50,"url":"https://github.com/o/r/pull/50","state":"OPEN","isDraft":false,"mergeStateStatus":"UNKNOWN","mergeable":"UNKNOWN","reviewDecision":"APPROVED","headRefName":"f","baseRefName":"master","title":"t"}'
       exit 0
     fi
     [ "$sub" = "pr checks" ] && { echo '[{"name":"ci","state":"SUCCESS","bucket":"pass","link":"","workflow":"w"}]'; exit 0; }

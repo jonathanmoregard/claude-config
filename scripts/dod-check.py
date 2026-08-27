@@ -132,6 +132,20 @@ def collect_repo(cwd):
 
     dirty = bool(git(["status", "--porcelain"], root)[1])
 
+    # Refresh the remote-tracking refs first. "Behind origin" and "commits the
+    # merge left behind" are both measured against origin/<base>, and a stale
+    # ref answers both with a confident zero — the failure mode this tool exists
+    # to remove. Only remote-tracking refs are touched: no working tree, no
+    # local branch, no index, so this stays a read as far as the repo is
+    # concerned. Best-effort: offline or slow is a warning, never a verdict.
+    fetch_warning = None
+    code, _, err = git(["fetch", "--quiet", "origin", base], root, timeout=25)
+    if code != 0:
+        fetch_warning = (
+            "could not fetch origin/%s (%s) — 'behind' and 'stranded commit' "
+            "counts may be stale" % (base, (err or "no detail").splitlines()[0][:80])
+        )
+
     # On the default branch, measure against origin/<base> rather than @{u}.
     # An upstream ref is a local convenience that a single `git push` without
     # `-u` never sets, and a branch level with origin then reported as
@@ -171,6 +185,7 @@ def collect_repo(cwd):
         "unpushed": unpushed,
         "ahead_of_default": ahead_of_default,
         "behind": behind,
+        "fetch_warning": fetch_warning,
     }, None
 
 
@@ -359,6 +374,30 @@ def collect_integrity(root, base):
 # -------------------------------------------------------------------- github
 
 
+def open_prs_for_branch(root, branch):
+    """Every open PR whose head is this branch. (list_or_None, error_or_None).
+
+    `gh pr view` with no argument resolves exactly ONE pull request for the
+    current branch and says nothing about having chosen. Two open PRs off one
+    head — the ordinary "same work, one into main and one into release" shape —
+    therefore produced a verdict about whichever came back, so a green PR into
+    release could report DONE while the one into main sat BLOCKED. Asking for
+    the list is the only way to notice the ambiguity exists.
+    """
+    code, out, err = run(
+        ["gh", "pr", "list", "--head", branch, "--state", "open",
+         "--json", "number,url,baseRefName"],
+        cwd=root,
+    )
+    if code != 0:
+        return None, (err or "gh pr list failed").splitlines()[0][:160]
+    try:
+        prs = json.loads(out or "[]")
+    except ValueError:
+        return None, "gh pr list returned unparseable JSON"
+    return (prs if isinstance(prs, list) else None), None
+
+
 def collect_pr(root):
     """PR facts via gh. Returns (pr_or_None, checks_or_None, error_or_None)."""
     if shutil.which("gh") is None:
@@ -521,6 +560,8 @@ def evaluate(cwd, do_integrity=True):
         result["reason"] = na_reason
         return result, 2
     result["repo"] = repo
+    if repo.get("fetch_warning"):
+        result["warnings"].append(repo["fetch_warning"])
 
     b = Blockers()
 
@@ -594,20 +635,59 @@ def evaluate(cwd, do_integrity=True):
         # automatic checkout from a Stop hook is the failure we watched happen
         # on 2026-08-27, when another agent switched branches under a live
         # session and deleted files out from under a running hook.
-        b.add("NOT_ON_DEFAULT",
-              f"PR is merged but the repo is still on {repo['branch']}",
-              f"git switch {repo['default_branch']} && "
-              f"git pull --ff-only origin {repo['default_branch']}")
+        # Commits the merge did not take. A PR merges the commits it had; push
+        # more to the branch afterwards and they sit on a dead branch while the
+        # PR still reads MERGED — green, and the work is nowhere. Measured
+        # against origin/<base>, which collect_repo has just fetched.
+        stranded = repo["ahead_of_default"]
+        if stranded:
+            b.add("COMMITS_AFTER_MERGE",
+                  f"{stranded} commit(s) on {repo['branch']} are not in "
+                  f"{repo['default_branch']} — the merge did not take them",
+                  "open a new PR for them, or cherry-pick them onto "
+                  f"{repo['default_branch']}. Do not delete the branch first.")
+        else:
+            b.add("NOT_ON_DEFAULT",
+                  f"PR is merged but the repo is still on {repo['branch']}",
+                  f"git switch {repo['default_branch']} && "
+                  f"git pull --ff-only origin {repo['default_branch']}")
     elif (pr.get("state") or "").upper() == "CLOSED":
         b.add("PR_CLOSED",
               f"PR #{pr.get('number')} was closed without merging",
               "reopen it, or open a fresh PR — do not report this one as pending")
     else:
+        # Ambiguity beats a confident answer about the wrong PR.
+        others, list_err = open_prs_for_branch(repo["root"], repo["branch"])
+        if list_err:
+            result["warnings"].append(f"could not list PRs for this branch: {list_err}")
+        elif others is not None and len(others) > 1:
+            where = ", ".join(
+                f"#{p.get('number')} → {p.get('baseRefName')}" for p in others[:5]
+            )
+            b.add("MULTIPLE_PRS",
+                  f"{len(others)} open PRs share this head branch ({where}); "
+                  f"this verdict describes only #{pr.get('number')}",
+                  "close the ones that should not exist, or check each "
+                  "explicitly with `gh pr view <n>` — a green PR into one base "
+                  "says nothing about a blocked one into another")
+
         if pr.get("isDraft"):
             b.add("PR_DRAFT", "pull request is a draft",
                   f"gh pr ready {pr.get('number')}")
 
-        msg = NOT_MERGEABLE.get((pr.get("mergeStateStatus") or "").upper())
+        state_status = (pr.get("mergeStateStatus") or "").upper()
+        # UNKNOWN is not CLEAN. GitHub returns it while lazily recomputing, and
+        # treating it as "no blocker" produced a DONE verdict on a branch that
+        # was two commits behind master. Unknown is measured as unknown, exactly
+        # like unreadable check status. (Merged and closed PRs also report
+        # UNKNOWN, but both are handled above and never reach here.)
+        if state_status in ("", "UNKNOWN"):
+            b.add("MERGEABLE_UNKNOWN",
+                  "GitHub has not finished computing mergeability "
+                  f"(mergeStateStatus={state_status or 'missing'})",
+                  "re-run in a few seconds — do not read this as mergeable")
+
+        msg = NOT_MERGEABLE.get(state_status)
         if msg:
             fix = ""
             if (pr.get("mergeStateStatus") or "").upper() == "BEHIND":
