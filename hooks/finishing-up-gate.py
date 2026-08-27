@@ -80,8 +80,19 @@ def allow():
     sys.exit(0)
 
 
-def block(reason, session, why):
-    log(session, {"action": "block" if MODE == "active" else "shadow-block", "why": why})
+def block(reason, session, why, guards=None):
+    # `guards` records what the stand-down fields actually looked like on this
+    # payload. In a headless run the agent booked a durable CronCreate follow-up
+    # and was then blocked twice more anyway, and the log could not say whether
+    # `session_crons` arrived empty or never arrived at all — the field is not in
+    # the public hook docs, so both are live possibilities. Shadow mode is read by
+    # hand before this is ever promoted; a log that cannot distinguish "the guard
+    # is broken" from "the guard correctly saw nothing" cannot support that call.
+    log(session, {
+        "action": "block" if MODE == "active" else "shadow-block",
+        "why": why,
+        **({"guards": guards} if guards else {}),
+    })
     if MODE != "active":
         # Shadow: surface it, never fault the turn.
         print(json.dumps({"systemMessage": f"[dod shadow] would block: {why}"}))
@@ -182,13 +193,24 @@ def main():
         "self-attestation this gate exists to replace.\n\n"
         "If a check is still running, either start `gh pr checks --watch` as a "
         "background task or schedule a durable CronCreate follow-up; either one "
-        "satisfies this gate.\n\n"
+        "satisfies this gate. The follow-up REPORTS — it must not merge, and "
+        "must not push anything Jonathan has not already seen. Merging is his "
+        "click, and being blocked by this gate is not authorisation to take "
+        "it.\n\n"
         "If you are genuinely blocked on Jonathan — a credential, an "
         "interactive login, a taste call, or his merge click — say so "
         "explicitly, with the clickable PR URL and what you actually measured. "
         f"This gate stands down after {MAX_BLOCKS} blocks regardless."
     )
-    block(reason, session, body.replace("\n", " | ")[:400])
+    block(
+        reason,
+        session,
+        body.replace("\n", " | ")[:400],
+        guards={
+            k: ("absent" if k not in payload else len(payload.get(k) or []))
+            for k in ("background_tasks", "session_crons")
+        },
+    )
 
 
 if __name__ == "__main__":
