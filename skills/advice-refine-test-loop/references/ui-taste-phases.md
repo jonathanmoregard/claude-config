@@ -148,18 +148,48 @@ so nothing here can anchor a reviewer.
    drop rule FAILS OPEN: a hallucination landing on that spinner sits inside a
    changed region and survives the filter.
 
-   Both halves are required.
+   **MEASURING is mandatory. SUPPRESSING depends on a capability the reference
+   capture tool does not have, and this file used to mandate it anyway.**
+   Measured 2026-08-27 against `~/.claude/skills/visual-verify/bin/screenshot`:
+   its `--help` lists **no animation or CSS-injection option**, its source
+   contains no `add_style_tag`, `add_init_script` or `reduced-motion` call and
+   never passes Playwright's `animations` argument, and the project config it
+   reads (`.claude/visual-verify.yml`, keys `app` / `dev_auth` / `screenshots`)
+   exposes no hook either. On this integration the freeze half **cannot be
+   performed at all**. A mandatory step no available tool implements is a step
+   that gets silently skipped, and a floor that was never driven to zero then
+   reads as one that could not be. So: do the half that runs, and RECORD the
+   half that does not.
 
-   - **Suppress motion at capture time.** Playwright's `animations: 'disabled'`,
-     or inject `* { animation: none !important; transition: none !important;
-     caret-color: transparent !important }` before the shot. Freeze anything
-     else that moves on its own: video, autoplaying carousels, live clocks.
-   - **Then measure what is left.** Re-shoot the untouched tree once and diff it
-     against itself. That is the run's noise floor; record it per surface, and
-     record it as `0` only when it is measured at 0. Any surface with a non-zero
-     floor has its manifest treated as UNTRUSTWORTHY scope: the drop rate for
-     findings there is `n/a`, never `0`, and Stage 4 subtracts the same floor
-     before calling a region newly-changed.
+   - **Suppress motion at capture time — where the capture tool exposes it.**
+     Playwright's `animations: 'disabled'`, or injecting
+     `* { animation: none !important; transition: none !important;
+     caret-color: transparent !important }` before the shot, is the right
+     mechanism when it is reachable; same for video, autoplaying carousels and
+     live clocks. **It is NOT reachable through the `visual-verify` CLI.**
+     Adding the flag to that tool is follow-up work, not a step of this run.
+     Until it exists, the Exit report states the freeze as UNAVAILABLE — never
+     as done, and never as a floor that "should" be zero.
+   - **MEASURE what is there — always, and this half needs no new capability.**
+     Re-shoot the untouched tree once and diff it against itself. That is the
+     run's noise floor; record it per surface, and record it as `0` only when it
+     is measured at 0. Any surface with a non-zero floor has its manifest
+     treated as UNTRUSTWORTHY scope: the out-of-scope rate for findings there is
+     `n/a`, never `0`, and Stage 4 subtracts the same floor before calling a
+     region newly-changed. **Subtracting a measured floor is what the freeze
+     would have bought, obtained the other way** — it is why the pipeline still
+     works with the freeze missing, and why measuring is the half that cannot be
+     dropped.
+
+   **The floor reproduces, so treat it as a standing property of the surface,
+   not a one-off.** Measured again 2026-08-27 on the second run, same procedure,
+   fresh capture: `btn changed=True regions=4 changed_px=1096` — the same
+   spinner, a different rotation, a different pixel count. `radiogroup`, the
+   surface actually under review that run, measured `regions=0 changed_px=0`, so
+   its per-vendor rates were recordable as numbers rather than `n/a` while
+   `btn`'s Stage 0 "change" sat inside its own floor and was scoped out. Two
+   surfaces, two answers, one run: the floor is per-surface and must be measured
+   per surface.
 
    **What quiescence cannot catch — so a zero floor is never read as a
    guarantee.** A measured floor covers the surfaces you re-shot, at the widths
@@ -195,8 +225,8 @@ so nothing here can anchor a reviewer.
 The changed-region manifest goes into the VLM prompts as SCOPE — the regions to
 review. It never goes in as consequence. Telling a reviewer that findings
 outside the manifest get discarded both violates "Elicit risk, not policy" and
-destroys the drop rate as a measurement, because a reviewer that knows the filter
-optimizes against it.
+destroys the out-of-scope rate as a measurement, because a reviewer that knows
+the filter optimizes against it.
 
 **The manifest is also a HALLUCINATION SOURCE, and must be labelled to stop
 being one. MEASURED 2026-08-27.** The scope text handed to both Opus lanes
@@ -219,6 +249,25 @@ This is the one place the pipeline hands a reviewer raw numbers that look like
 findings, and the "never as consequence" rule above does not cover it: that rule
 governs what the manifest MEANS for a finding's fate, this one governs what its
 digits are.
+
+**The header works, AND it costs coverage. Both halves measured 2026-08-27**,
+on a second run with the same shots, the same manifest and the same lane prompts
+apart from this header. The fabrication did not recur: neither Opus lane
+mentioned a per-width height difference at all. It also took the REAL finding
+with it. Run 1's genuine concern — the option pill measures 39 px against a
+44 px tap-target floor, root-caused to `--s11: 2.75rem` resolving to **38.5 px**
+against a 14 px rem base — was raised by NEITHER lane once the header was in
+place, and that bug is still live in the project. The most plausible reading is
+that the true height concern was entangled with the fabricated "40 vs 48"
+framing, and suppressing the frame suppressed the observation inside it.
+
+**A scope header that stops reviewers fabricating FROM the numbers also narrows
+what they volunteer ABOUT sizes.** That is a real trade, it is named here rather
+than traded away, and it is not fixed: single trial, two lanes, and the
+correctness half is worth more than the coverage half. Two consequences for the
+reader. Keep the header. And never read a quiet lane as a clean surface — the
+absence of a size finding after this header is weaker evidence than it was
+before it.
 
 Never substitute a VLM's opinion of which regions changed for the diff's. That
 would launder a 40.7% guess into the one input the combiner treats as ground
@@ -275,7 +324,50 @@ this list.
   surfaces the oracle asserts on. An empty intersection is an Exit-report line
   ("the oracle and the VLM lanes reviewed disjoint surfaces; the cross-checking
   combiner rows could not fire"), never two rows quietly recorded as "did not
-  fire".
+  fire". **Bypassing the driver is not free — see the next trap for what
+  `vv-shots.sh` was supplying.**
+- **Bypassing `vv-shots.sh` costs you the environment `vv-shots.sh` sets up, and
+  the bare CLI then captures NOTHING.** The trap above tells you to drive the
+  `visual-verify` CLI directly. Measured 2026-08-27: done literally, that
+  produces **0 PNGs** — every surface dies with `chrome-headless-shell: error
+  while loading shared libraries: libglib-2.0.so.0`, rc=1. Two pieces of setup
+  live only inside the driver you were just told not to use, and both must be
+  reproduced by hand:
+  1. **`PLAYWRIGHT_BROWSERS_PATH`, which only `nix develop` sets.** The devshell
+     points it at the nix-provided Chromium and bypasses Playwright's
+     downloader. Outside the devshell, the uv-managed Playwright looks for a
+     browser it never fetched. So the ad-hoc capture runs inside `nix develop`
+     for the same reason the oracle does — one more consequence of the `pg_tmp`
+     / `openssl` rule above.
+  2. **A Playwright CLIENT pin that matches the nix DRIVER.** The CLI's PEP-723
+     header declares an open `playwright>=1.47`, so `uv` resolves the newest
+     release, and every release hard-codes the browser REVISION it looks for
+     under `PLAYWRIGHT_BROWSERS_PATH`. Measured here: 1.61.x wants
+     `chromium-1228`; this flake's `playwright-driver` is 1.60.0 and ships
+     `chromium-1223`; the Python CLI calls a bare `launch()` with no
+     `executablePath` override and no env var that could force one, so the
+     versions must match instead of being reconciled. Pin the client:
+     `uv run --with playwright==1.60.0 --script <cli>`. **`1.60.0` is this
+     flake's number today, not a constant** — read the driver's version
+     (`nix eval` on the flake's `playwright-driver.version`, or the
+     `VV_PLAYWRIGHT_PIN` default inside `vv-shots.sh`) rather than copying the
+     digits out of this file.
+
+  So the executable form of "capture `/dev/components/*` directly" is:
+
+  ```bash
+  nix develop --command \
+    uv run --with "playwright==${VV_PLAYWRIGHT_PIN:-1.60.0}" \
+      --script ~/.claude/skills/visual-verify/bin/screenshot \
+      "http://localhost:3737/dev/components/<slug>" \
+      --ready main --dev-auth-token "$KABLONG_DEV_AUTH_TOKEN" \
+      --out /tmp/<run-id>/<slug>
+  ```
+
+  and the success check is the PNG COUNT, never the exit code — the same rule as
+  the `vv-shots.sh` trap above, and here it is what catches the failure at all:
+  a libglib death is one non-zero exit among many the driver already returns on
+  a healthy run.
 
 ## Stage 1 — the blind parallel wave
 
@@ -403,8 +495,10 @@ used elsewhere in this pipeline. Not one object per image — one object,
 whose `findings` array covers every image you were given (severity,
 autofix_class, file, line, rationale, unverifiable — all per schema).
 Identify the image PER FINDING: `file` = that image's
-ABSOLUTE path, copied exactly as given to you, `line: 0` (schema requires line;
-visual findings are whole-image).
+ABSOLUTE path, copied verbatim from the ATTACHED IMAGES list at the END of this
+prompt — the images were attached in exactly that order, so the Nth path names
+the Nth image. `line: 0` (schema requires line; visual findings are
+whole-image).
 Encode region + rule INSIDE rationale as a prefix: `[region: <where>]
 [rule: <fixed-rule# or drift-back#>] <what breaks>`. Example: `[region:
 top-left option in radiogroup] [rule: drift-back#1] radio dot renders above
@@ -418,6 +512,12 @@ EOF
 
 printf '%s\n' "$PROMPT" > /tmp/vision-prompt-<surface>.txt
 
+# REQUIRED, not decoration. The heredoc above is quoted, so nothing in it
+# expands — the paths have to be appended. Same csv, same order as --images.
+{ printf '\nATTACHED IMAGES, in the order they were attached:\n'
+  printf '%s\n' "${SHOTS//,/$'\n'}"
+} >> /tmp/vision-prompt-<surface>.txt
+
 ~/.claude/skills/advice-refine-test-loop/scripts/codex-advise.sh \
   --prompt-file /tmp/vision-prompt-<surface>.txt \
   --model gpt-5.5 \
@@ -428,6 +528,19 @@ printf '%s\n' "$PROMPT" > /tmp/vision-prompt-<surface>.txt
 #      6 = the request was REJECTED — a 4xx that is not quota, e.g. a model id
 #          this account is not served. Never retried; fix the config.
 ```
+
+**The ATTACHED IMAGES list is load-bearing, and the template used to require a
+path it never supplied.** The shots reach Codex as argv attachments
+(`--image a b -- PROMPT`): the model receives image BYTES and never a filename,
+so a prompt that does not spell the paths out is asking for a `file` value the
+reviewer has no way to know. The combiner attributes every finding to its shot
+by that exact string and by nothing else, so an unsupplied list does not fail
+loudly — it returns findings carrying a plausible invented path that matches no
+shot, and attribution collapses without an error anywhere. **Measured
+2026-08-27:** both empirical runs had to append this list by hand before the
+lane worked; with it, all four findings came back carrying the exact absolute
+paths they were given. If you build the prompt some other way, the list still
+has to be in it.
 
 **The prompt says nothing about the other lanes.** It does not say a Claude
 review already ran, does not say one is running alongside, and does not say which
@@ -724,44 +837,122 @@ never the bucket key. For each bucket, in this order:
 | Convergence | Confidence | Action |
 |---|---|---|
 | Geometry-oracle violation (any) | GROUND TRUTH | Always auto-fix. Not a vote; the DOM says the pixels are wrong, and no VLM needs to have seen it. |
-| VLM finding in a region the diff reports as **never changed** | HALLUCINATION | **Discard, and log it to the vendor's drop rate.** Not deferred, not surfaced, not fixed — the diff says nothing there moved. See "The drop rule" below. |
-| VLM finding contradicted by a green oracle assertion on the SAME rule | HALLUCINATION | Discard, and log to the drop rate. Ground truth checked exactly this and found it clean. |
+| VLM finding in a region the diff reports as **never changed** | OUT OF SCOPE for this diff | **Discard from this review, and log it to the vendor's out-of-scope rate.** Not deferred, not fixed — the diff says nothing there moved. NOT a finding of falsehood: some of these are true defects this diff did not cause. See "The drop rule, and the rate it produces". |
+| VLM finding contradicted by a green oracle assertion on the SAME rule, where the finding disputes the MEASURED VALUE | OUT OF SCOPE for this diff | Discard, and log to the out-of-scope rate. Ground truth measured exactly this element and property, and the pixels are what the assertion says they are. |
+| VLM finding contradicted by a green oracle assertion, where the finding cites a **design-spec rule the assertion's own expectation contradicts** | **SPEC CONFLICT — never discarded** | Two ground-truth sources disagree about POLICY, and the oracle is not the authority on policy. Do not drop, do not auto-fix, do not charge it to any vendor's rate. Log with disposition `oracle-spec-conflict` and escalate; the follow-up is reconciling the oracle fixture with the design spec. See "What the oracle is authoritative over". |
 | 2+ independent vendors agree (Opus lane + Codex lane; or oracle + either) | HIGH | Auto-fix without further verification. 4a-A + 4a-B is ONE vendor and does not reach this tier. |
 | Singleton vendor finding in a changed region, reproducible against the artifact by a check a third party could re-run | LOW | Fix, and record the check in the ledger row. "Reproducible" means the pixels or the DOM show it — not that the reviewer sounded sure. |
 | Singleton vendor finding in a changed region, subjective (gestalt, "does this look right") | LOW | **Surface to the founder as an A/B variant fan-out. Do NOT auto-fix. Do NOT auto-block.** There is no in-phase arbiter for a taste call, and inventing one is how a hallucinated defect gets shipped as a fix. |
 | Singleton vendor finding with no artifact and no reproducible check | LOW | Log to ledger with disposition `singleton-unverifiable`. Do not auto-fix. Do not auto-block. |
 
 The drop rows come BEFORE the convergence rows on purpose: two vendors agreeing
-about a region that never changed is two hallucinations, not a HIGH-confidence
-finding. Filter on ground truth first, count votes second.
+about a region that never changed is two findings about something this diff did
+not touch, not a HIGH-confidence finding about this diff. Filter on ground truth
+first, count votes second. **The SPEC CONFLICT row is not a drop row** and does
+not participate in that ordering — it removes a bucket from the oracle's veto
+rather than from the review.
 
-### The drop rule
+### What the oracle is authoritative over
+
+**The oracle is ground truth about GEOMETRY. It is not ground truth about
+INTENT.** It reads computed values off a live DOM and compares them to
+hand-written fixtures. A green assertion proves the pixels match the FIXTURE —
+it proves nothing about whether the fixture matches the design. Fixtures are
+authored by people, and can be stale, under-qualified, or the exact opposite of
+what the project's design spec locks.
+
+**MEASURED 2026-08-27, second run.** Both Opus lanes reported that the
+`--with-description` variant's selected row renders a full rail invert where the
+project's design spec locks `--wash` for that variant ("with prose, invert reads
+as 'banner' not 'choice'"). They were RIGHT — the stylesheet sets
+`background: var(--rail); color: var(--paper)` there, and the spec text says it
+must not. The geometry oracle asserts on exactly that element and exactly those
+two properties, deliberately variant-agnostic (its own source comment: the base
+`:has(> input:checked)` rule "is not variant-qualified, so segmented-pill AND
+--block AND --with-description all share the same selected treatment") — and it
+was GREEN. Under the old row, that made two correct, document-backed findings
+"hallucinations" and charged them to the vendor's rate.
+
+**A defect whose pixels are internally consistent but which violates a locked
+design decision is exactly what a human-authored spec catches and a geometry
+assertion structurally cannot.** The assertion encodes one of the two positions,
+so it can never referee between them; letting it try resolves every such
+disagreement in favour of whichever side got written into a fixture first, and
+records the reviewer who read the spec as a liar. So the oracle's veto is scoped
+to what it measures: **it can contradict a claim about a VALUE, never a claim
+about a RULE.** When a finding cites a design-spec rule, a green oracle is
+evidence about pixels and not a contradiction, and the bucket escalates as a
+spec conflict.
+
+**Honest limit, measured the same run.** The carve-out would not by itself have
+saved that finding: the changed-region row comes first and had already claimed
+the bucket (those rows sit at DOM y-positions with zero overlap against any
+manifest box, at every width), so it was dropped twice over and undoing one drop
+leaves the other standing. What the carve-out guarantees is narrower and still
+worth having — **the oracle alone can never be the reason a design-spec-backed
+finding is discarded**, and no such finding is ever counted against a vendor.
+
+### The drop rule, and the rate it produces
 
 **Any VLM finding whose region the deterministic diff reports as unchanged is
-discarded as a hallucination, and the per-vendor drop RATE is logged for the
-run.** VLMs invent defects — UI-Lens documents the mechanism directly
-("misinterpreting intentional spacing ... as an abnormal blank space") — and a
-region the diff says never changed cannot have been broken by this diff.
+dropped from THIS diff's review, and the per-vendor OUT-OF-SCOPE RATE is logged
+for the run.** A region the diff says never changed cannot have been broken by
+this diff, so a finding there is not this review's business — whatever else it
+is. VLMs do also invent defects, and UI-Lens documents the mechanism directly
+("misinterpreting intentional spacing ... as an abnormal blank space"); the
+filter catches those too. It just cannot tell you which is which.
 
-The rate is the production analogue of DiffSpot's 500 no-diff control pairs: the
-frequency with which a vendor reports a defect where nothing moved. Two honest
-caveats, both of which must travel with the number:
+**The metric is the OUT-OF-SCOPE RATE. It was called a hallucination rate, and
+that name was wrong.** It measures exactly one thing: the fraction of a vendor's
+findings that landed where this diff did not. It does NOT measure how often a
+vendor invents. "Outside the changed-region manifest" and "imaginary" are
+different properties, and the pipeline observes only the first.
 
-- **It is a calibration metric, not a scoreboard.** It measures a vendor's
-  tendency to invent under this pipeline's prompts and this project's surfaces.
-  It is not a benchmark result, it does not rank vendors in general, and a run
-  or two of it ranks nothing at all.
+**MEASURED 2026-08-27, second run — the counter-example is in the data.** Opus
+dropped 5 of 10 findings. **At least 2 of those 5 are verifiably TRUE**: the
+`--with-description` rail-invert pair, checkable against the design-spec text
+and against the stylesheet, both of which a third party can re-read. A true
+defect in an unchanged region is OUT OF SCOPE for this diff; calling it a
+hallucination mislabels a correct reviewer as a lying one, in the column a
+future reader acts on. Treat the number as an **upper bound on invention and
+nothing more** — every hallucination outside the manifest lands in it, and so
+does every true pre-existing defect the reviewer happened to notice.
+
+**What it would take to measure a real hallucination rate**, since the number is
+worth having and this is not it. Either:
+
+- **Adjudicate each finding against the ARTIFACT, not against the manifest.**
+  True/false decided by the DOM, the stylesheet and the design spec — the same
+  evidence a human would use — and decided independently of whether the diff
+  touched that region. Nothing in the pipeline does this today; it is
+  per-finding work and it is what the ledger's `outcome` column would have to
+  start recording.
+- **Or run DiffSpot's control itself:** dispatch a lane on a pair of shots with
+  NO change between them, where the correct answer is "nothing differs". Every
+  difference-claim returned is then a fabrication by construction. That measures
+  fabrication under a no-change prompt rather than under this pipeline's scoped
+  prompts, so it is a different distribution — but it is a real hallucination
+  number instead of a proxy for one, and it costs one extra dispatch.
+
+Until one of those exists, report the out-of-scope rate under its own name and
+never let it stand in for invention.
+
+Three caveats travel with the number:
+
+- **It is a calibration metric, not a scoreboard.** It measures how much of a
+  vendor's output falls outside the stated scope under this pipeline's prompts
+  and this project's surfaces. It is not a benchmark result, it does not rank
+  vendors in general, and a run or two of it ranks nothing at all.
 - **It is not directly comparable to DiffSpot's control** in absolute terms,
   because Stage 0 hands the reviewer the changed regions as scope. What it
-  measures is out-of-scope invention under a stated scope. Compare it across
+  measures is out-of-scope reporting under a stated scope. Compare it across
   vendors in this pipeline and across runs over time; do not quote it against a
   published control figure.
-
 - **It is only as good as the noise floor underneath it.** The rule reads
   "unchanged" off the diff, so on a surface whose measured floor is non-zero the
-  diff reports regions as changed that nobody touched, and a hallucination
-  landing there is not dropped. The rate for such a surface is `n/a`, never `0`
-  — see Stage 0 step 1.
+  diff reports regions as changed that nobody touched, and a finding landing
+  there is not dropped. The rate for such a surface is `n/a`, never `0` — see
+  Stage 0 step 1.
 
 Log the rate even when it is zero, and log the denominator with it. A bare "0
 dropped" over four findings says nothing.
@@ -877,15 +1068,16 @@ run, and in the Exit report, in the words below.
   DOM. The VLM lanes are given the touched surfaces as scope instead of a region
   manifest; the oracle's scope is unaffected, having never been region-based.
 - **Guarantee lost — the drop rule.** With no manifest there is no ground truth
-  about where the change landed, so nothing is dropped and no hallucination is
-  filtered. The ledger's drop-rate cell for the run is `n/a`, **never `0`** — the
-  two look identical in a table and mean opposite things.
+  about where the change landed, so nothing is dropped and nothing out of scope
+  is filtered. The ledger's out-of-scope-rate cell for the run is `n/a`,
+  **never `0`** — the two look identical in a table and mean opposite things.
 - **Guarantee lost — Stage 4's reflow check.** Steps 2, 3 and 5 of the regression
   gate cannot run. Re-shoot and re-run the oracle anyway; that is the whole of
   the gate that survives, and it checks only what the oracle asserts.
-- **Must NOT be claimed:** that hallucinations were filtered; that the fix pass
-  was checked for reflow contamination; any per-vendor precision or drop-rate
-  figure; that a finding was "confirmed to be in a changed region". The Exit
+- **Must NOT be claimed:** that out-of-scope findings were filtered; that the fix
+  pass was checked for reflow contamination; any per-vendor precision or
+  out-of-scope-rate figure; that a finding was "confirmed to be in a changed
+  region". The Exit
   report says: *the pipeline ran without a deterministic change-region layer.*
 - **Do NOT substitute a VLM** for the missing diff. Asking a model which regions
   changed replaces a 100% measurement with a 40.7% guess, and every guarantee
@@ -1000,12 +1192,22 @@ Columns:
 - `oracle` — `HIT` / `MISS` / `n/a` (n/a = oracle can't check this rule, or the
   project has none — say which)
 - `disposition` — one of `auto-fix (2+)`, `auto-fix (oracle)`,
-  `dropped-unchanged-region`, `founder-A/B`, `singleton-unverifiable`
-- `outcome` — `fixed` / `deferred` / `founder-picked-<variant>` / `discarded-as-hallucination` — filled retrospectively after the fix loop
+  `dropped-unchanged-region`, `oracle-spec-conflict`, `founder-A/B`,
+  `singleton-unverifiable`
+- `outcome` — `fixed` / `deferred` / `founder-picked-<variant>` /
+  `dropped-out-of-scope` — filled retrospectively after the fix loop.
+  **`dropped-out-of-scope` is not a claim that the finding was false**, and this
+  column used to say `discarded-as-hallucination`, which was. The pipeline
+  observes where a finding landed, never whether it was true; measured
+  2026-08-27, at least 2 of 5 dropped Opus findings in one run were verifiably
+  true. Write `discarded-as-false` only where someone actually checked and it
+  was, and say against what.
 
-Alongside the per-bucket rows, record the run's per-vendor **drop rate** with its
-denominator (`n/a` when Stage 0's diff was unavailable, and `n/a` for any surface
-whose measured noise floor was non-zero — in both cases never `0`).
+Alongside the per-bucket rows, record the run's per-vendor **out-of-scope rate**
+with its denominator (`n/a` when Stage 0's diff was unavailable, and `n/a` for
+any surface whose measured noise floor was non-zero — in both cases never `0`).
+It is not a hallucination rate; see "The drop rule, and the rate it produces"
+for what it does and does not license.
 
 After ~20 runs the ledger surfaces per-model precision; use it to weight
 reviewers, not before. Until then, treat Opus and Codex as equal-weight peers;
@@ -1043,7 +1245,9 @@ deliberately duplicated, because they gate the ship rather than the phase.
 | Run the lanes one after another, or let one lane's findings into another's prompt | Quoting a prior judgment into a VLM reviewer's context moves its verdict 19–26 pp (arXiv 2608.07920); a label-only control moves it −0.17 pp, so it is the content that does it. Serial ordering also destroys the agreement signal outright: a defect fixed between lanes no longer renders, so the later lane cannot vote on it. |
 | Fix anything between lanes "since we're waiting anyway" | Same failure, worse: the later lanes then review a different artifact than the earlier ones, and every convergence tier in the combiner silently becomes meaningless. Fixes land in Stage 3, after all lanes have returned. |
 | Run a VLM lane before Stage 0's diff, or scope it by a VLM's guess at what changed | The deterministic diff catches 100% of CSS changes; the best VLM names 40.7%. A VLM-produced region manifest launders a guess into the input the combiner treats as ground truth, and the drop rule then filters against noise. |
-| Put the drop rule (or any consequence) in a reviewer's prompt | "Elicit risk, not policy". A reviewer told that out-of-region findings are discarded optimizes against the filter, which destroys the drop rate as a calibration measurement — the one number that tells you how much a vendor invents. |
+| Put the drop rule (or any consequence) in a reviewer's prompt | "Elicit risk, not policy". A reviewer told that out-of-region findings are discarded optimizes against the filter, which destroys the out-of-scope rate as a calibration measurement — the one number that tells you how much of a vendor's output lands outside the diff. |
+| Report the out-of-scope rate as a hallucination rate | Measured 2026-08-27: at least 2 of 5 dropped Opus findings in one run were verifiably TRUE against the design spec and the stylesheet. "Outside the changed-region manifest" and "imaginary" are different properties and the pipeline observes only the first, so the number is an upper bound on invention. Calling it a hallucination rate records a correct reviewer as a lying one. |
+| Let a green oracle assertion discard a finding that cites a design-spec rule | The oracle is ground truth about GEOMETRY, not about INTENT: its expectations are hand-written fixtures, and a green assertion proves the pixels match the FIXTURE, not that the fixture matches the design. Measured 2026-08-27: a variant-agnostic assertion was green on exactly the element and properties where the design spec locks the opposite, and both Opus lanes were right. That bucket is a SPEC CONFLICT — escalate it, never drop it, never charge it to a vendor's rate. |
 | Auto-fix a singleton VLM finding that is a taste call | Session-constraint violation. Singleton visual claims can be hallucinations (UI-Lens: VLMs invent defects, e.g. flagging intentional spacing). There is no in-phase arbiter for a subjective claim; surface it to the founder as A/B, don't auto-fix. |
 | Auto-block on a singleton VLM finding | Session-constraint violation. `Never singleton-VLM = auto-block.` Bug the ledger, not the ship gate. Only geometry-oracle findings or 2+ vendor convergence gate the ship. |
 | Sigil on a partial lane 4b | Session-constraint violation. `Sigil requires reviewer confirmation.` The sigil-ready state needs: oracle green + 4b run to completion + all HIGH resolved. A skipped or half-run 4b is not sigil-ready, and a concurrent dispatch does not make an incomplete lane complete. |

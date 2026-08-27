@@ -31,8 +31,9 @@ PHASE 3:  Adversarial — single Opus round, "the prior phases were wrong"
           framing (a gate `continue` resets to Phase 1; at most ONE reset
           per run)
 PHASE 4:  UI taste review (UI-only, ONCE) — one blind parallel wave:
-          stage 0  quiesce + measure the noise floor, then deterministic
-                   diff → changed-region manifest
+          stage 0  MEASURE the noise floor (and quiesce first where the
+                   capture tool exposes it — the reference CLI does not),
+                   then deterministic diff → changed-region manifest
           stage 1  lanes 4a (Opus defect + taste critics), 4b (Codex
                    vision-taste) and ORACLE dispatch CONCURRENTLY — the
                    VLM lanes on byte-identical shots, the ORACLE on the
@@ -1155,7 +1156,7 @@ The full protocol lives in
 `~/.claude/skills/advice-refine-test-loop/references/ui-taste-phases.md`.
 **Read that file in full before dispatching the wave** — not in part, and not
 from memory. It is the only place the stage order, the lane prompts, the Codex
-vision invocation, the combiner table, the hallucination drop rule, the
+vision invocation, the combiner table, the out-of-scope drop rule, the
 degrade-when-absent paths, the oracle's retrieval path, the measured integration
 traps and the disposition ledger are written down.
 
@@ -1233,7 +1234,7 @@ one-fix-pass cap is fiction.
 | 4.5 (in-round) | Anthropic (Opus, validator) | Re-verify findings against actual file state — sent ALL of the round's findings (the judge that dedupes them is in flight alongside), with only the PIVOTAL (singleton) rows applied. Input boundary, drop rule and degrade-on-failure behaviour all defined at step 4.5. A drop CLOSES the finding with `repro: false` and keeps it in `new_r` | Co-dispatched with step 4's dedupe judge in ONE tool-use block; feeds into step 5 (reproduce) | Per-finding on independent two-reviewer convergence, applied by discarding that row on return; wholesale on any validator failure — see step 4.5 |
 | 2 | OpenAI (Codex / GPT-5.5) | Cross-vendor correctness on Opus-clean state | Phase 1 fix history carried in prompt | Never; PAUSE on quota, don't silently skip |
 | 3 | Anthropic (Opus, adversarial) | "Prior phases were wrong — find why" | Same gate at step 8; a `continue` resets to Phase 1 | Never; one shot, cheap |
-| 4 stage 0 | none (deterministic) | Quiesce + measure the noise floor, then capture + diff vs baseline → changed-region manifest; scopes the VLM lanes (the oracle takes no shots and has only component granularity). 100% of CSS changes vs 40.7% for the best VLM — but only once an unchanged tree diffs to zero, which by default it does not | Consumed as a filter by the combiner, not as findings. Its boxes are changed PIXEL AREAS and are labelled as such in the scope block, or reviewers read them as element measurements | Non-UI diffs; degrades per "Phase 4" when the project has no diff harness |
+| 4 stage 0 | none (deterministic) | MEASURE the noise floor (quiesce first only where the capture tool exposes it — the reference CLI does not, so record the freeze as UNAVAILABLE and subtract the measured floor instead), then capture + diff vs baseline → changed-region manifest; scopes the VLM lanes (the oracle takes no shots and has only component granularity). 100% of CSS changes vs 40.7% for the best VLM — but only once an unchanged tree diffs to zero, which by default it does not | Consumed as a filter by the combiner, not as findings. Its boxes are changed PIXEL AREAS and are labelled as such in the scope block, or reviewers read them as element measurements | Non-UI diffs; degrades per "Phase 4" when the project has no diff harness |
 | 4 lane 4a | Anthropic (Opus x2 — defect + taste critics) | UI defect + house-style critique — protocol per "Phase 4" | Combiner, after ALL lanes return. Same model twice = ONE vendor | Non-UI diffs |
 | 4 lane 4b | OpenAI (Codex vision-taste) on regenerated shots | Second-vendor VLM catch-what-Opus-missed — protocol per "Phase 4" | Combiner, after ALL lanes return, per `docs/reviews/multi-model-taste-ledger.md` protocol | Non-UI diffs; NEVER skip on UI-touching diffs — drift-back class survives Phases 1-3 and the Opus lanes |
 | 4 lane ORACLE | none (deterministic) | Geometry assertions against the LIVE DOM (no shots, component granularity only). Ground truth, not a vote — auto-fixes with no VLM vote required | Combiner. Dispatched in the same block as the VLM lanes; feeds no prompt. Its JSON is retrievable ONLY via the report — see "Getting the violations out" in the reference | Non-UI diffs; degrades per "Phase 4" when the project has no oracle |
@@ -1258,11 +1259,19 @@ Also state, so the run is greppable and a stopped run is never mistaken for a cl
 - whether `regressed_r` was measured or forced to 0 for want of a baseline
 - `dedupe_status`, and — when it is `unavailable` — that `new_r` was inflated
   for the affected phases
-- on a UI diff that reached Phase 4: the per-vendor hallucination DROP RATE with
+- on a UI diff that reached Phase 4: the per-vendor OUT-OF-SCOPE RATE with
   its denominator (`n/a` when no diff harness was available — **never `0`**), and,
   for each deterministic component the project lacks, that its precondition is
   UNMET rather than satisfied. "No oracle" is not "oracle green"; the reference
-  file fixes the wording for both cases
+  file fixes the wording for both cases. **That rate is not a hallucination
+  rate** — it counts findings that landed outside the changed-region manifest,
+  and measured 2026-08-27 at least 2 of 5 such Opus drops in one run were
+  verifiably true defects this diff simply did not cause. Report it under its
+  own name; the reference file states what it would take to measure invention
+- also on such a diff: whether Stage 0's motion FREEZE was available (the
+  reference capture CLI exposes no animation or CSS-injection option, so it
+  usually is not) and the measured per-surface noise floor, since a floor that
+  was never driven toward zero is not a floor that was measured at zero
 - anything left in `pending_for_human.md`
 
 Then set `<notes>/arftl-run.json` to `status: complete`. A run that exits `pending-human` keeps `status: pending-human` and its `pause_reason` — that file is how the next session knows a human decision is outstanding.
