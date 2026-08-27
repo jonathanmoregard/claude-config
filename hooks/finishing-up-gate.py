@@ -213,18 +213,35 @@ def run_dod(repo):
 
 
 def main():
+    # The four paths below all end the turn without checking anything, because
+    # without a usable session id there is no armfile to look up and therefore
+    # nothing this gate can measure. That is unavoidable — but it was also
+    # SILENT, which made "the harness sent us something we could not read"
+    # indistinguishable from "this session had no work to check". Every other
+    # allow in this file logs; a full sweep of the exit paths found these four
+    # were the last that did not.
+    def allow_unidentified(why):
+        log("(unidentified)", {"action": "allow", "why": why})
+        allow()
+
     try:
         payload = json.load(sys.stdin)
     except ValueError:
-        allow()
+        allow_unidentified("stdin was not valid JSON; NOTHING WAS CHECKED")
 
     if not isinstance(payload, dict):
-        allow()  # not a hook payload we understand; nothing to key state on
+        allow_unidentified(
+            f"payload was {type(payload).__name__}, not an object; "
+            "NOTHING WAS CHECKED")
     session = payload.get("session_id") or ""
     if not isinstance(session, str):
-        allow()
+        allow_unidentified(
+            f"session_id was {type(session).__name__}, not a string; "
+            "NOTHING WAS CHECKED")
     if not re.fullmatch(r"[A-Za-z0-9._-]+", session):
-        allow()
+        allow_unidentified(
+            "session_id is not a plain token, so it cannot become a filename; "
+            "NOTHING WAS CHECKED")
 
     armfile = STATE_DIR / f"{session}.arm"
     if not armfile.exists():
