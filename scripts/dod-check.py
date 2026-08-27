@@ -594,6 +594,21 @@ def evaluate(cwd, do_integrity=True):
     # keeps the check honest — demanding a PR that cannot exist would make the
     # gate unsatisfiable on exactly the repos where pushing to main is normal.
     if repo["on_default"]:
+        # A failed fetch is not a warning here, it is a missing measurement.
+        # The terminal condition of this ladder IS "level with origin", and a
+        # stale remote-tracking ref answers that from memory. Measured: with a
+        # collaborator's commit on origin and the remote made unreachable, this
+        # reported DONE / exit 0 while genuinely behind — "green" and "green as
+        # far as I got" printing identically, which is the exact failure
+        # dod-check's own render() refuses to commit elsewhere. On a feature
+        # branch the gh calls do the measuring and fail loudly on their own, so
+        # this belongs to the direct-push ladder specifically.
+        if repo.get("fetch_warning"):
+            b.add("REMOTE_UNVERIFIED",
+                  "could not reach origin, so 'pushed and level with "
+                  f"{repo['default_branch']}' was never established",
+                  "fix connectivity and re-run — do not read the previous "
+                  "fetch's refs as current")
         if repo["behind"]:
             b.add("BEHIND_REMOTE",
                   f"{repo['behind']} commit(s) on origin/{repo['default_branch']} "
