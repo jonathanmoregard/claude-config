@@ -50,9 +50,22 @@ RALPH_STATE_FILE="$STATE_DIR/$HOOK_SESSION.md"
 # failure — no check at all — is the one worth engineering against.
 end_loop() {  # $1 = human-readable message for the transcript
   local msg="$1" gate="$HOME/.claude/hooks/finishing-up-gate.py" out=""
+  # THE ORDER OF THE NEXT TWO LINES IS THE WHOLE MECHANISM. Stop hooks run
+  # concurrently, so the standalone gate is racing us right now. It stands down
+  # while the state file exists; the moment we unlink it, that gate would
+  # evaluate independently and the turn would get two identical blocks.
+  #
+  # Writing the marker BEFORE the unlink makes it airtight without a lock: any
+  # invocation that finds the state file gone is necessarily reading after the
+  # unlink, hence after the marker was written, so it cannot miss the marker.
+  # It consumes the marker and stands down, leaving this call the only voice.
+  : > "$STATE_DIR/$HOOK_SESSION.handover" 2>/dev/null || true
   rm -f "$RALPH_STATE_FILE"
   if [[ -f "$gate" ]]; then
-    out=$(printf '%s' "$HOOK_INPUT" | python3 "$gate" 2>/dev/null) || out=""
+    # HANDOVER=1 so the gate skips the ownership and marker checks: this call is
+    # the handover, and standing down here would mean nobody checked at all.
+    out=$(printf '%s' "$HOOK_INPUT" \
+          | CLAUDE_DOD_HANDOVER=1 python3 "$gate" 2>/dev/null) || out=""
   fi
   if [[ -n "$out" ]]; then
     # Exactly one JSON object must reach the harness, so fold our message into
