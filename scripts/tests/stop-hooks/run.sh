@@ -203,6 +203,17 @@ That is what it would look like.')"
 ck "an indented tag does not exit"      kept "$(probe 'Like so:
 
     <promise>ALL DONE</promise>')"
+# Fence chars are tracked separately: a ``` fence DISPLAYED inside a ~~~ fence
+# used to flip the single boolean closed, so the demo tag read as a real claim.
+ck "a nested fence of the other char does not exit" kept "$(probe '~~~
+```
+<promise>ALL DONE</promise>
+```
+~~~')"
+# CRLF: perl -n keeps the trailing CR, so a genuine claim never matched the
+# end-anchor and the loop could only ever end at max_iterations.
+ck "CRLF still lets a real promise exit"  gone "$(probe "$(printf '<promise>ALL DONE</promise>')")"
+   "$(printf '%s' '<promise>ALL DONE</promise>' | sed 's/$/\r/' | xargs -0 -I{} echo {} >/dev/null; probe "$(printf '<promise>ALL DONE</promise>\r')")"
 ck "a QUOTED halt does not exit"        kept \
    "$(probe 'I could emit <halt>give up</halt> here but I will not.')"
 # Discussing the rule and THEN genuinely claiming it must still work.
@@ -239,6 +250,7 @@ PY
 # The concurrent gate wins the race, as it does in practice.
 out=$(gate_run "$RSID")
 ck "concurrent gate stands down for the live loop" "" "$(decision "$out")"
+ck "  ...by exiting 0, not by crashing" "0" "$GATE_RC"
 printf '{"session_id":"%s","transcript_path":"%s"}' "$RSID" "$RT" \
   | CLAUDE_DOD_STATE_DIR="$SD" bash "$RALPH_HOOK" >/dev/null 2>&1
 ck "end_loop leaves no marker"          "gone" \
