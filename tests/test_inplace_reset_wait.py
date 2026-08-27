@@ -65,6 +65,64 @@ def test_dead_process_does_not_read_as_working(registry):
     assert ir.session_is_working(2 ** 22 - 1, SID) is False
 
 
+# --- Leaving the turn before the clear ---------------------------------------
+#
+# Regression, sid f90449b2 on 2026-08-27: the handoff wait breaks the moment the
+# file exists, which is the session's Write TOOL CALL, not the end of its turn.
+# `/clear` went out 11 seconds before `end_turn` and the TUI queued it as text —
+# `queue-operation enqueue` carrying the write-instruction with `/clear` on the
+# end, then `remove`. The command never ran and the handoff turn was spent for
+# nothing.
+
+def test_a_session_still_in_its_turn_does_not_get_cleared(registry):
+    registry("busy")
+    assert ir.wait_for_turn_to_end(os.getpid(), SID, deadline_seconds=0) is False
+
+
+def test_the_clear_proceeds_once_the_turn_has_ended(registry):
+    registry("idle")
+    assert ir.wait_for_turn_to_end(os.getpid(), SID, deadline_seconds=0) is True
+
+
+def test_a_turn_that_ends_while_we_wait_is_waited_out(registry, monkeypatch):
+    # The whole point: busy now, idle a moment later, and the clear still lands.
+    registry("busy")
+    calls = {"n": 0}
+    real = ir.session_is_working
+
+    def flips(spid, sid):
+        calls["n"] += 1
+        if calls["n"] >= 3:
+            registry("idle")
+        return real(spid, sid)
+
+    monkeypatch.setattr(ir, "session_is_working", flips)
+    monkeypatch.setattr(ir.time, "sleep", lambda _s: None)
+    assert ir.wait_for_turn_to_end(os.getpid(), SID) is True
+    assert calls["n"] >= 3
+
+
+def test_an_unreadable_registry_does_not_block_the_clear(tmp_path, monkeypatch):
+    # Degrading to "not working" restores the pre-fix behaviour — send now — and
+    # the post-clear confirmation still refuses if the clear did not land. The
+    # alternative, refusing whenever the registry is unreadable, would hand a
+    # missing file a veto over every reset.
+    home = tmp_path / "home"
+    (home / ".claude" / "sessions").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    assert ir.wait_for_turn_to_end(os.getpid(), SID, deadline_seconds=0) is True
+
+
+def test_the_turn_wait_is_bounded_and_settles_before_sending():
+    # Bounded: the instruction it answers says "write the file and then stop", so
+    # a tail longer than this is not that turn's tail.
+    assert 0 < ir.CLEAR_IDLE_WAIT_SECONDS <= 300
+    # ...and it must clear the measured 11s gap between the Write tool call and
+    # `end_turn` with room to spare.
+    assert ir.CLEAR_IDLE_WAIT_SECONDS >= 60
+    assert ir.TURN_SETTLE_SECONDS > 0
+
+
 def test_grace_is_longer_than_a_turn_and_cap_bounds_the_wait():
     assert ir.WRITE_IDLE_GRACE_SECONDS >= 240
     assert ir.WRITE_WAIT_CAP_SECONDS > ir.WRITE_IDLE_GRACE_SECONDS
