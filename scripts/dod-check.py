@@ -156,43 +156,53 @@ def collect_repo(cwd):
 #
 # Deliberately narrow. A false positive here costs the user real trust, so
 # these match syntax that is unambiguous about intent, not merely suspicious.
+# Each entry additionally carries a path scope, because an unscoped scan flags
+# its own source: this file contains the literal `--passWithNoTests` as a regex,
+# and the test harness writes `continue-on-error: true` into a fixture. A
+# detector that fires on every repo containing a linter is a detector nobody
+# leaves switched on.
 ADDED_PATTERNS = [
     (
         "CI_CONTINUE_ON_ERROR",
         "workflow step set to continue-on-error",
-        re.compile(r"continue-on-error\s*:\s*true", re.I),
+        re.compile(r"^\s*continue-on-error\s*:\s*true", re.I),
+        re.compile(r"\.github/workflows/.*\.ya?ml$|\.gitlab-ci\.ya?ml$", re.I),
     ),
     (
         "TEST_PASS_WITH_NO_TESTS",
         "test runner told to pass when no tests match",
         re.compile(r"--passWithNoTests\b"),
+        re.compile(r"(package\.json|Makefile|\.ya?ml|\.toml|\.sh)$", re.I),
     ),
     (
         "TEST_SWALLOWED",
         "test command result discarded with `|| true`",
-        re.compile(r"^\s*.*\b(test|pytest|jest|vitest|cargo\s+test|go\s+test)\b.*\|\|\s*true\s*$"),
+        re.compile(r"\b(pytest|jest|vitest|cargo\s+test|go\s+test|npm\s+test)\b.*\|\|\s*true\s*$"),
+        re.compile(r"(Makefile|\.ya?ml|\.sh|justfile)$", re.I),
     ),
     (
         "TEST_SKIPPED",
         "test skipped or ignored",
         re.compile(
-            r"(\b(it|test|describe|context)\.skip\s*\(|"
-            r"\bx(it|describe)\s*\(|"
-            r"@pytest\.mark\.(skip|xfail)\b|"
-            r"@(unittest\.)?skip\b|"
-            r"#\[ignore\]|"
+            r"(^\s*@pytest\.mark\.(skip|xfail)\b|"
+            r"^\s*@(unittest\.)?skip\b|"
+            r"^\s*#\[ignore\]|"
+            r"\b(it|test|describe|context)\.skip\s*\(|"
+            r"^\s*\bx(it|describe)\s*\(|"
             r"\bt\.Skip\s*\()"
         ),
+        None,  # test files only — enforced below via TEST_PATH
     ),
     (
         "ASSERT_TAUTOLOGY",
         "assertion that cannot fail",
         re.compile(
-            r"(assert\s+True\b|assert\s*\(\s*true\s*\)|"
+            r"^\s*(assert\s+True\s*$|assert\s*\(\s*true\s*\)|"
             r"expect\s*\(\s*true\s*\)\s*\.\s*to\w*\s*(be|equal)\s*\(\s*true\s*\)|"
             r"assertTrue\s*\(\s*True\s*\))",
             re.I,
         ),
+        None,
     ),
 ]
 
@@ -248,7 +258,14 @@ def collect_integrity(root, base):
         added = line[1:]
         if JUSTIFIED.search(added):
             continue
-        for code_name, desc, rx in ADDED_PATTERNS:
+        for code_name, desc, rx, scope in ADDED_PATTERNS:
+            # `scope is None` means "test files only": a skipped test or a
+            # tautological assertion is only meaningful where tests live.
+            if scope is None:
+                if not (current and TEST_PATH.search(current)):
+                    continue
+            elif not (current and scope.search(current)):
+                continue
             if rx.search(added):
                 findings.append(
                     {
@@ -270,9 +287,13 @@ def collect_pr(root):
     if shutil.which("gh") is None:
         return None, None, "gh CLI not found on PATH"
 
+    # Every name here must exist in `gh pr view --json`'s field list. It is NOT
+    # the GraphQL schema: `reviewThreads` is a valid GraphQL connection and an
+    # invalid gh field, and asking for it makes gh reject the whole call. A
+    # contract test pins this list against the installed gh.
     fields = (
         "number,url,state,isDraft,mergeStateStatus,mergeable,"
-        "reviewDecision,reviewThreads,headRefName,baseRefName,title"
+        "reviewDecision,headRefName,baseRefName,title"
     )
     code, out, err = run(["gh", "pr", "view", "--json", fields], cwd=root)
     if code != 0:
@@ -343,12 +364,53 @@ def collect_checks(root):
     }, None
 
 
-def unresolved_threads(pr):
-    threads = (pr.get("reviewThreads") or {})
-    nodes = threads.get("nodes") if isinstance(threads, dict) else threads
-    if not isinstance(nodes, list):
-        return 0
-    return sum(1 for t in nodes if isinstance(t, dict) and not t.get("isResolved"))
+GRAPHQL_THREADS = """
+query($owner:String!, $repo:String!, $num:Int!) {
+  repository(owner:$owner, name:$repo) {
+    pullRequest(number:$num) {
+      reviewThreads(first:100) { nodes { isResolved isOutdated } }
+    }
+  }
+}
+"""
+
+
+def unresolved_threads(root, number):
+    """Count unresolved review threads.
+
+    Only reachable over GraphQL — `gh pr view --json reviewThreads` is not a
+    thing, which is the bug this function was rewritten to fix. Soft-fails: a
+    missing thread count is a warning, never a silent zero, because "0
+    unresolved" and "could not count" must not look the same to the caller.
+    """
+    code, out, err = run(
+        ["gh", "repo", "view", "--json", "owner,name"], cwd=root, timeout=20
+    )
+    if code != 0:
+        return None, f"could not resolve owner/repo: {err[:120]}"
+    try:
+        meta = json.loads(out)
+        owner = meta["owner"]["login"]
+        name = meta["name"]
+    except (ValueError, KeyError, TypeError):
+        return None, "could not parse owner/repo"
+
+    code, out, err = run(
+        ["gh", "api", "graphql", "-f", f"query={GRAPHQL_THREADS}",
+         "-F", f"owner={owner}", "-F", f"repo={name}", "-F", f"num={number}"],
+        cwd=root, timeout=30,
+    )
+    if code != 0:
+        return None, f"review-thread query failed: {err[:120]}"
+    try:
+        nodes = (json.loads(out)["data"]["repository"]["pullRequest"]
+                 ["reviewThreads"]["nodes"])
+    except (ValueError, KeyError, TypeError):
+        return None, "review-thread query returned an unexpected shape"
+
+    # An outdated thread hangs off a superseded diff; it does not gate a merge.
+    return sum(1 for t in nodes
+               if not t.get("isResolved") and not t.get("isOutdated")), None
 
 
 # ------------------------------------------------------------------ evaluate
@@ -429,8 +491,11 @@ def evaluate(cwd, do_integrity=True):
                        f"git merge origin/{repo['default_branch']} && git push")
             b.add("NOT_MERGEABLE", msg, fix)
 
-        n_unresolved = unresolved_threads(pr)
-        if n_unresolved:
+        n_unresolved, thread_err = unresolved_threads(repo["root"], pr.get("number"))
+        if thread_err:
+            # Unknown is not zero. Say so rather than reporting a clean sheet.
+            result["warnings"].append(f"unresolved review threads not counted: {thread_err}")
+        elif n_unresolved:
             b.add("UNRESOLVED_THREADS",
                   f"{n_unresolved} unresolved review thread(s)",
                   "answer and resolve them")
@@ -491,10 +556,25 @@ def render(result):
             lines.append(f"dod-check: DONE — {head}")
         if pr:
             lines.append(f"  {pr.get('url')}")
+        # A DONE verdict must still carry what could not be established.
+        # Dropping warnings here would make "green" and "green as far as I got"
+        # print identically, which is the failure mode this whole tool exists
+        # to remove.
+        for warn in result.get("warnings", []):
+            lines.append(f"  ! {warn}")
         return "\n".join(lines)
 
+    # An error means the GitHub half never ran. Printing the blockers we DID
+    # find underneath it reads as a completed measurement with a short list,
+    # which is worse than printing nothing: it invites "only one blocker left".
+    # Report the failure and stop.
     if result.get("error"):
-        lines.append(f"dod-check: ERROR — {result['error']}")
+        first = result["error"].splitlines()[0]
+        lines.append(f"dod-check: COULD NOT MEASURE — {head}")
+        lines.append(f"  {first}")
+        lines.append("  PR and check state were NOT read. This is not a green "
+                     "result — treat it as not done and fix the tooling first.")
+        return "\n".join(lines)
 
     lines.append(f"dod-check: NOT DONE — {head}")
     for item in result["blockers"]:

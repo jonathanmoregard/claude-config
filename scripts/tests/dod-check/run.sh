@@ -50,8 +50,12 @@ fresh_repo
 git switch -q master
 case_run "n/a on default branch" green 2 "on the default branch"
 
-cd /tmp && rm -rf "$HERE/notrepo" && mkdir -p "$HERE/notrepo"
-out="$(python3 "$DOD" --repo "$HERE/notrepo" 2>&1)"; code=$?
+# Must be outside ANY git repo. $HERE lives inside ~/.claude once this suite is
+# committed, so a notrepo/ beside the tests is emphatically inside a repo — the
+# first run of this case reported exit 3 against ~/.claude itself.
+NOTREPO="$(mktemp -d)"
+out="$(python3 "$DOD" --repo "$NOTREPO" 2>&1)"; code=$?
+rmdir "$NOTREPO" 2>/dev/null
 [ "$code" = 2 ] && ok "n/a outside a repo" || bad "n/a outside a repo" "exit 2" "exit $code — $out"
 
 # ---- branch hygiene -------------------------------------------------------
@@ -80,6 +84,11 @@ case_run "BEHIND blocks"           behind   1 "NOT_MERGEABLE"
 case_run "zero checks blocks"      nochecks 1 "NO_CHECKS"
 case_run "all green is done"       green    0 "DONE"
 case_run "gh error is exit 3"      apierror 3 ""
+# Advisory, not blocking: threads that actually gate a merge surface as
+# mergeStateStatus BLOCKED. But the warning must survive into a DONE
+# verdict, or "green" and "green as far as I got" print identically.
+case_run "thread count failure warns"  threaderror 0 "not counted"
+case_run "measure failure hides verdict" apierror 3 "COULD NOT MEASURE"
 
 # ---- integrity scan -------------------------------------------------------
 fresh_repo; git push -q -u origin feat/x

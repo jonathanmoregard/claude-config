@@ -4,6 +4,35 @@
 
 sub="$1 $2"
 
+# Reject any field the real gh rejects, so the stub cannot answer a question
+# the installed CLI would refuse. contract.sh pins the list; this keeps the
+# behavioural suite honest about the same boundary.
+if [ "$sub" = "pr view" ]; then
+  for f in $(printf '%s' "${3:-}${4:+ $4}" | tr ',' ' '); do
+    case "$f" in
+      --json|"") continue ;;
+      reviewThreads|comments|commits)
+        echo "Unknown JSON field: \"$f\"" >&2; exit 1 ;;
+    esac
+  done
+fi
+
+# owner/repo lookup + the GraphQL review-thread query.
+if [ "$sub" = "repo view" ]; then
+  echo '{"owner":{"login":"o"},"name":"r"}'; exit 0
+fi
+if [ "$sub" = "api graphql" ]; then
+  case "$DOD_FIXTURE" in
+    failing)
+      echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":false,"isOutdated":false},{"isResolved":true,"isOutdated":false}]}}}}}' ;;
+    threaderror)
+      echo "HTTP 502" >&2; exit 1 ;;
+    *)
+      echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}' ;;
+  esac
+  exit 0
+fi
+
 case "$DOD_FIXTURE" in
   no_pr)
     [ "$sub" = "pr view" ] && { echo "no pull requests found for branch" >&2; exit 1; }
@@ -56,7 +85,7 @@ case "$DOD_FIXTURE" in
     fi
     [ "$sub" = "pr checks" ] && { echo "no checks reported on the 'f' branch" >&2; exit 1; }
     ;;
-  green)
+  green|threaderror)
     if [ "$sub" = "pr view" ]; then
       echo '{"number":48,"url":"https://github.com/o/r/pull/48","state":"OPEN","isDraft":false,"mergeStateStatus":"CLEAN","reviewDecision":"APPROVED","reviewThreads":{"nodes":[]},"headRefName":"f","baseRefName":"master","title":"t"}'
       exit 0
