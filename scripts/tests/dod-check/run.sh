@@ -80,6 +80,15 @@ git -C "$HERE/clone2" add -A; git -C "$HERE/clone2" commit -qm elsewhere
 git -C "$HERE/clone2" push -q origin master
 git fetch -q origin
 case_run "behind origin on main blocks" green 1 "BEHIND_REMOTE"
+
+# An unreachable origin is a MISSING MEASUREMENT on this ladder, not a warning:
+# its terminal condition IS "level with origin", and a stale remote-tracking ref
+# answers that from memory. Measured before the fix: DONE / exit 0 while
+# genuinely behind, with the warning printed underneath the green verdict.
+fresh_repo
+git switch -q master
+git remote set-url origin "$HERE/does-not-exist.git"
+case_run "unreachable origin is not DONE on main" green 1 "REMOTE_UNVERIFIED"
 rm -rf "$HERE/clone2"
 
 # ---- not applicable -------------------------------------------------------

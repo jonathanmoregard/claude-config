@@ -326,17 +326,20 @@ def main():
                 fresh = (time.time() - marker.stat().st_mtime) < 300
             except OSError:
                 fresh = False
+            consumed = True
             try:
                 marker.unlink()
             except OSError as exc:
-                # Deliberately not swallowed. A marker we cannot consume stands
-                # this session down again on the NEXT turn too, until it ages
-                # past the staleness bound — and from the outside that is
-                # indistinguishable from a gate that simply chose not to block.
-                # Rare, but exactly the kind of silence this tool exists to end.
+                # A marker we cannot consume will silence this session again on
+                # every later turn until it ages out, so standing down on it now
+                # compounds a fault we already know about. Log it and DO NOT
+                # stand down: one duplicate block is recoverable, a string of
+                # silently unguarded turns is not.
+                consumed = False
                 log(session, {"action": "warn",
-                              "why": f"could not consume handover marker: {exc}"})
-            if fresh:
+                              "why": f"could not consume handover marker, NOT "
+                                     f"standing down on it: {exc}"})
+            if fresh and consumed:
                 log(session, {"action": "allow",
                               "why": "ralph handed this turn to its own gate call"})
                 allow()
