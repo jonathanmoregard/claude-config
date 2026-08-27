@@ -20,9 +20,10 @@ detached helper, in this order:
 2. the session is asked to write its handoff — **from the context it is already
    holding**, so nothing re-reads anything;
 3. the helper waits for that file to appear and be newer than the request;
-4. `/clear`;
-5. the clear is **confirmed** before anything else happens;
-6. a pickup message naming only the handoff.
+4. it then waits for the **turn** that wrote it to end;
+5. `/clear`;
+6. the clear is **confirmed** before anything else happens;
+7. a pickup message naming only the handoff.
 
 Same process, same pane, same permissions — fresh context.
 
@@ -31,7 +32,16 @@ earlier design had a separate worker resume the whole session into a small model
 to summarise it, which cannot work: the trigger fires at a size larger than that
 model's entire window.
 
-Step 4 matters more than it looks. `kitten` returning success proves bytes were
+Step 4 is not the same wait as step 3, and skipping it cost a whole reset.
+The handoff file appears at the session's Write **tool call**, and the turn runs
+on afterwards while the model finishes its closing message — measured 11 seconds
+on 2026-08-27. Text arriving inside a live turn is **queued** by the TUI rather
+than parsed, so a `/clear` sent in that window is never a command: the
+transcript recorded it enqueued as ordinary text with the write-instruction
+still in front of it, then dropped. So the clear now waits for the session to
+leave its turn, and **refuses rather than sending anyway** if it never does.
+
+Step 5 matters more than it looks. `kitten` returning success proves bytes were
 delivered, not that the TUI acted. If the prompt already holds typed text,
 `/clear` is appended to it and submitted as an ordinary prompt — no clear
 happens. Measured. So the helper confirms a new session actually began before it
@@ -87,8 +97,9 @@ the two happened; do not imply a reset that did not occur.
      unset (no remote control), `no kitty window has pid N` or `matched N
      windows` (the window could not be uniquely identified, so it refuses rather
      than typing into someone else's session), subagents still running at the
-     3-hour drain ceiling, no fresh handoff appeared, the clear was not
-     confirmed, or another reset is already running for this session.
+     3-hour drain ceiling, no fresh handoff appeared, the session never left the
+     turn that wrote it, the clear was not confirmed, or another reset is
+     already running for this session.
 
 3. **Do nothing else.** Do not start work, do not run a tick, do not "prepare".
    The next thing that should happen here is the write, then the clear.
