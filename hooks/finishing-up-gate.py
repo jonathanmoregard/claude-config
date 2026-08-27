@@ -221,6 +221,21 @@ def main():
     )
     if not HANDOVER:
         if (ralph_dir / f"{session}.md").exists():
+            # Consume any handover marker on the way out. Without this the
+            # marker ORPHANS on the common path, not a rare one: ralph writes
+            # it only inside end_loop, after a transcript poll that can take
+            # ~3s, so this invocation almost always reads the state file first,
+            # stands down, and leaves the marker behind. The NEXT Stop within
+            # the staleness window then consumes it and allows a turn with
+            # unfinished work — reproduced, and found independently by two
+            # reviewers. A live loop makes any marker meaningless anyway.
+            stale_marker = ralph_dir / f"{session}.handover"
+            if stale_marker.exists():
+                try:
+                    stale_marker.unlink()
+                except OSError as exc:
+                    log(session, {"action": "warn",
+                                  "why": f"could not clear stale marker: {exc}"})
             log(session, {"action": "allow", "why": "a ralph loop owns this session"})
             allow()
 

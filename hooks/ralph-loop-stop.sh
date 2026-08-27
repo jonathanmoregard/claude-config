@@ -172,7 +172,33 @@ if [[ "$COMPLETION_PROMISE" != "null" ]] && [[ -n "$COMPLETION_PROMISE" ]]; then
   # Extract text from <promise> tags using Perl for multiline support
   # -0777 slurps entire input, s flag makes . match newlines
   # .*? is non-greedy (takes FIRST tag), whitespace normalized
-  PROMISE_TEXT=$(echo "$LAST_OUTPUT" | perl -0777 -pe 's/.*?<promise>(.*?)<\/promise>.*/$1/s; s/^\s+|\s+$//g; s/\s+/ /g' 2>/dev/null || echo "")
+  # THE TAG MUST STAND ALONE ON ITS OWN LINE, AND MUST ACTUALLY BE PRESENT.
+  #
+  # The old form was `s/.*?<promise>(.*?)<\/promise>.*/$1/`, which took the
+  # first tag ANYWHERE and, when there was no tag at all, fell through leaving
+  # $_ untouched — so the whole message became the "promise text". Measured,
+  # all three exited the loop with a false completion claim:
+  #
+  #   "I am not done, so I will not output <promise>ALL DONE</promise> yet."
+  #   "To stop the loop I must emit <promise>ALL DONE</promise> only when true."
+  #   "ALL DONE"                        (no tag whatsoever)
+  #
+  # The systemMessage injects the literal promise string every iteration, so
+  # the model is READING that text every turn — quoting it back while
+  # explaining itself is ordinary behaviour, not an edge case. "Do not lie to
+  # exit" is not a discipline if merely discussing the rule satisfies it.
+  #
+  # Own-line anchoring is what separates asserting from quoting: prose wraps a
+  # tag in a sentence, a deliberate claim stands alone. Take the LAST such
+  # line, so a message that discusses the rule and then genuinely claims
+  # completion still exits.
+  PROMISE_TEXT=""
+  if [[ "$LAST_OUTPUT" == *"<promise>"* ]]; then
+    PROMISE_TEXT=$(printf '%s' "$LAST_OUTPUT" | perl -0777 -ne '
+      my @m = /^[ \t]*<promise>(.*?)<\/promise>[ \t]*$/gms;
+      if (@m) { my $t = $m[-1]; $t =~ s/^\s+|\s+$//g; $t =~ s/\s+/ /g; print $t; }
+    ' 2>/dev/null || echo "")
+  fi
 
   # Use = for literal string comparison ( == in [[ ]] would glob-match )
   if [[ -n "$PROMISE_TEXT" ]] && [[ "$PROMISE_TEXT" = "$COMPLETION_PROMISE" ]]; then
@@ -196,7 +222,13 @@ fi
 # weaker claim than the sigil, which is the point: nothing here tempts an agent
 # to overstate what it finished.
 if [[ "$LAST_OUTPUT" == *"<halt>"* ]]; then
-  HALT_REASON=$(echo "$LAST_OUTPUT" | perl -0777 -pe 's/.*?<halt>(.*?)<\/halt>.*/$1/s; s/^\s+|\s+$//g; s/\s+/ /g' 2>/dev/null || echo "")
+  # Own-line anchored for the same reason as <promise> above: the systemMessage
+  # advertises this tag every iteration, so the model reads it every turn and
+  # quoting it back mid-sentence must not end the loop.
+  HALT_REASON=$(printf '%s' "$LAST_OUTPUT" | perl -0777 -ne '
+    my @m = /^[ \t]*<halt>(.*?)<\/halt>[ \t]*$/gms;
+    if (@m) { my $t = $m[-1]; $t =~ s/^\s+|\s+$//g; $t =~ s/\s+/ /g; print $t; }
+  ' 2>/dev/null || echo "")
   if [[ -n "$HALT_REASON" ]]; then
     printf '%s\t%s\titeration=%s\t%s\n' \
       "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$HOOK_SESSION" "$ITERATION" "$HALT_REASON" \
@@ -227,9 +259,9 @@ sed "s/^iteration: .*/iteration: $NEXT_ITERATION/" "$RALPH_STATE_FILE" > "$TEMP_
 mv "$TEMP_FILE" "$RALPH_STATE_FILE"
 
 if [[ "$COMPLETION_PROMISE" != "null" ]] && [[ -n "$COMPLETION_PROMISE" ]]; then
-  SYSTEM_MSG="🔄 Ralph iteration $NEXT_ITERATION | To stop: output <promise>$COMPLETION_PROMISE</promise> (ONLY when statement is TRUE - do not lie to exit!) — or <halt>why</halt> to end the loop WITHOUT claiming completion. If the user told you to stop, halt; do not keep looping and do not fake the promise."
+  SYSTEM_MSG="🔄 Ralph iteration $NEXT_ITERATION | To stop, put the tag ON A LINE BY ITSELF (a tag inside a sentence is ignored, so you can discuss these freely): <promise>$COMPLETION_PROMISE</promise> ONLY when that statement is TRUE — do not lie to exit. Or <halt>why</halt> to end the loop WITHOUT claiming completion. If the user told you to stop, halt; do not keep looping and do not fake the promise."
 else
-  SYSTEM_MSG="🔄 Ralph iteration $NEXT_ITERATION | No completion promise set - loop runs infinitely. <halt>why</halt> ends it. If the user told you to stop, halt."
+  SYSTEM_MSG="🔄 Ralph iteration $NEXT_ITERATION | No completion promise set - loop runs infinitely. <halt>why</halt> ON A LINE BY ITSELF ends it (a tag inside a sentence is ignored). If the user told you to stop, halt."
 fi
 SYSTEM_MSG="${SYSTEM_MSG}${TRANSCRIPT_NOTE}"
 
