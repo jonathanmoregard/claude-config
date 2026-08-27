@@ -38,7 +38,20 @@ try: print(json.load(sys.stdin).get("decision") or "")
 except Exception: print("")' 2>/dev/null; }
 
 echo "== dod gate: one driver per turn =="
-printf '%s\n' "$HOME/.claude" > "$SD/$SID.arm"
+# A purpose-built repo with a known blocker. These cases used to arm the live
+# ~/.claude, which passed only for as long as that checkout happened to be
+# dirty — the moment this branch went green the suite went red and said the gate
+# was broken. A test whose fixture is the machine you are working on measures
+# the machine.
+BREPO="$SD/blocked-repo"
+mkdir -p "$BREPO"; ( cd "$BREPO" || exit 1
+  git init -q -b master .; git config user.email t@t; git config user.name t
+  echo hi > a.txt; git add -A; git commit -qm init
+  git init -q --bare "$SD/blocked-origin.git"; git remote add origin "$SD/blocked-origin.git"
+  git push -q -u origin master
+  git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/master
+  echo unfinished >> a.txt; git add -A; git commit -qm "never pushed" ) >/dev/null 2>&1
+printf '%s\n' "$BREPO" > "$SD/$SID.arm"
 
 out=$(printf '{"session_id":"%s"}' "$SID" | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE")
 ck "blocks by default (active is the default mode)" "block" "$(decision "$out")"
