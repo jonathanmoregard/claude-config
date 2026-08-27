@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""Stop hook: refuse to end a turn on unfinished, unmeasured work.
+
+The guarantee half of the definition-of-done system. The `finishing-up` skill
+holds the procedure; this holds the fact that the procedure runs. A skill fires
+on the model's judgement, which is the mechanism that has been failing — it
+works right up until the model is context-starved and rushing, which is exactly
+when it is needed.
+
+Cost model: does nothing unless finishing-up-arm.sh armed this session, so an
+ordinary question / research / read session pays one file-existence check. Only
+a session that actually edited a repo ever runs dod-check.
+
+Modes (CLAUDE_DOD_MODE, default "shadow"):
+    shadow   log what it would have blocked; never block
+    active   block
+
+Stand-down guards, in order. Every one of these ENDS the turn rather than
+blocking, because a gate that can never be satisfied protects nothing and just
+hangs the session:
+  * not armed
+  * background work still in flight (`background_tasks`) — the turn is pausing
+    on a live CI watch, not finishing
+  * a durable follow-up already scheduled (`session_crons`) — that IS the
+    follow-through
+  * this session's own block budget spent
+
+Protocol note: Stop hooks use TOP-LEVEL `decision`/`reason`, not
+`hookSpecificOutput`. Putting it in the wrong place is the quickest way to
+write a hook that silently does nothing.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import time
+
+STATE_DIR = pathlib.Path(
+    os.environ.get(
+        "CLAUDE_DOD_STATE_DIR", pathlib.Path.home() / ".local/state/claude-dod"
+    )
+)
+DOD = pathlib.Path.home() / ".claude/scripts/dod-check.py"
+MODE = os.environ.get("CLAUDE_DOD_MODE", "shadow").strip().lower()
+
+# Own budget, deliberately below the harness's default cap of 8 so this gate
+# stands down on its own terms rather than being overridden.
+MAX_BLOCKS = int(os.environ.get("CLAUDE_DOD_MAX_BLOCKS", "6"))
+DOD_TIMEOUT = 60
+
+
+def log(session, payload):
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with (STATE_DIR / "gate.log").open("a") as fh:
+            fh.write(
+                json.dumps({"ts": time.time(), "session": session, **payload}) + "\n"
+            )
+    except OSError:
+        pass
+
+
+def allow():
+    sys.exit(0)
+
+
+def block(reason, session, why):
+    log(session, {"action": "block" if MODE == "active" else "shadow-block", "why": why})
+    if MODE != "active":
+        # Shadow: surface it, never fault the turn.
+        print(json.dumps({"systemMessage": f"[dod shadow] would block: {why}"}))
+        sys.exit(0)
+    print(json.dumps({"decision": "block", "reason": reason}))
+    sys.exit(0)
+
+
+def run_dod(repo):
+    try:
+        p = subprocess.run(
+            [sys.executable, str(DOD), "--repo", repo, "--json"],
+            capture_output=True,
+            text=True,
+            timeout=DOD_TIMEOUT,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return None, f"dod-check did not run: {type(exc).__name__}"
+    try:
+        return json.loads(p.stdout), None
+    except ValueError:
+        return None, (p.stderr or "dod-check emitted unparseable JSON")[:200]
+
+
+def main():
+    try:
+        payload = json.load(sys.stdin)
+    except ValueError:
+        allow()
+
+    session = payload.get("session_id") or ""
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", session):
+        allow()
+
+    armfile = STATE_DIR / f"{session}.arm"
+    if not armfile.exists():
+        allow()  # nothing was edited — the overwhelmingly common case
+
+    # A turn pausing for live background work is not a turn that finished.
+    # Faulting it would fight the very CI watch the skill was told to start.
+    if payload.get("background_tasks"):
+        log(session, {"action": "allow", "why": "background work in flight"})
+        allow()
+
+    # A durable follow-up is already booked.
+    if payload.get("session_crons"):
+        log(session, {"action": "allow", "why": "follow-up already scheduled"})
+        allow()
+
+    countfile = STATE_DIR / f"{session}.blocks"
+    try:
+        blocks = int(countfile.read_text().strip() or 0)
+    except (OSError, ValueError):
+        blocks = 0
+    if blocks >= MAX_BLOCKS:
+        log(session, {"action": "allow", "why": f"block budget spent ({blocks})"})
+        allow()
+
+    try:
+        repos = [r for r in armfile.read_text().splitlines() if r.strip()]
+    except OSError:
+        allow()
+
+    problems = []
+    for repo in repos:
+        result, err = run_dod(repo)
+        if err:
+            problems.append(f"{repo}: {err} — treat as NOT done")
+            continue
+        if not result.get("applicable") or result.get("done"):
+            continue
+        lines = [f"  [{b['code']}] {b['detail']}" for b in result.get("blockers", [])]
+        problems.append(f"{repo}:\n" + "\n".join(lines))
+
+    if not problems:
+        for f in (armfile, countfile):
+            try:
+                f.unlink(missing_ok=True)
+            except OSError:
+                pass
+        allow()
+
+    try:
+        countfile.write_text(str(blocks + 1))
+    except OSError:
+        pass
+
+    body = "\n".join(problems)
+    reason = (
+        "Work in this session is not finished. `dod-check` reports:\n\n"
+        f"{body}\n\n"
+        "Invoke the `finishing-up` skill and work these blockers. Do not end "
+        "the turn by reporting status — drive to green and mergeable.\n\n"
+        "If a check is still running, either start `gh pr checks --watch` as a "
+        "background task or schedule a durable CronCreate follow-up; either one "
+        "satisfies this gate.\n\n"
+        "If you are genuinely blocked on Jonathan — a credential, an "
+        "interactive login, a taste call, or his merge click — say so "
+        "explicitly, with the clickable PR URL and what you actually measured. "
+        f"This gate stands down after {MAX_BLOCKS} blocks regardless."
+    )
+    block(reason, session, body.replace("\n", " | ")[:400])
+
+
+if __name__ == "__main__":
+    main()
