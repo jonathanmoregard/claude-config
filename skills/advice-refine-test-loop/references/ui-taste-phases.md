@@ -91,8 +91,9 @@ preventing it.
 ## The phase at a glance
 
 ```
-STAGE 0  Deterministic pre-pass   capture → diff vs baseline → changed-region
-                                  manifest; freeze + hash the shots
+STAGE 0  Deterministic pre-pass   quiesce + measure the noise floor → capture →
+                                  diff vs baseline → changed-region manifest;
+                                  freeze + hash the shots
 STAGE 1  Blind parallel wave      lane 4a-A (Opus defect critic)
          ONE tool-use block       lane 4a-B (Opus taste critic)
          no lane sees another     lane 4b   (Codex vision-taste)
@@ -137,15 +138,55 @@ case.
 Runs to completion before a single lane dispatches. Nothing here is a judgment,
 so nothing here can anchor a reviewer.
 
-1. **Capture.** Regenerate shots for every touched surface. Keep the pre-change
+1. **Quiesce, and MEASURE THE NOISE FLOOR.** The diff is ground truth only if an
+   unchanged tree diffs to zero, and by default it does not. **Measured
+   2026-08-27:** with the working tree COMPLETELY unchanged, a re-shoot of
+   kablong's `btn` surface reported `changed=True regions=4 changed_px=1210` —
+   an animated loading spinner on a "SAVING" button, caught at a different
+   rotation angle in each capture. So the input the combiner treats as
+   deterministic was not. A permanently-"changed" region is precisely where the
+   drop rule FAILS OPEN: a hallucination landing on that spinner sits inside a
+   changed region and survives the filter.
+
+   Both halves are required.
+
+   - **Suppress motion at capture time.** Playwright's `animations: 'disabled'`,
+     or inject `* { animation: none !important; transition: none !important;
+     caret-color: transparent !important }` before the shot. Freeze anything
+     else that moves on its own: video, autoplaying carousels, live clocks.
+   - **Then measure what is left.** Re-shoot the untouched tree once and diff it
+     against itself. That is the run's noise floor; record it per surface, and
+     record it as `0` only when it is measured at 0. Any surface with a non-zero
+     floor has its manifest treated as UNTRUSTWORTHY scope: the drop rate for
+     findings there is `n/a`, never `0`, and Stage 4 subtracts the same floor
+     before calling a region newly-changed.
+
+   **What quiescence cannot catch — so a zero floor is never read as a
+   guarantee.** A measured floor covers the surfaces you re-shot, at the widths
+   you used, on the run you measured. It says nothing about content that varies
+   per RENDER rather than per frame: a rotating quote, a relative timestamp that
+   crosses a minute boundary between captures, a randomised avatar, imagery that
+   lazy-loaded in a different order. Those diff as genuine changes and no
+   animation flag suppresses them. Nor does suppression make a noisy region
+   reviewable — freezing the spinner removes it from the manifest, which puts
+   the spinner's own rendering OUT of scope for every VLM lane, so a real defect
+   there is now looked at by nobody. Quiescence buys a trustworthy filter, and
+   pays for it in coverage; both facts go in the Exit report.
+2. **Capture.** Regenerate shots for every touched surface. Keep the pre-change
    render as the ORIGINAL baseline for the whole phase — Stage 4 diffs against
    it, not against the post-critique render, and a baseline overwritten mid-phase
    destroys the only reflow check the pipeline has.
-2. **Diff.** Run the project's deterministic screenshot diff, baseline vs
+3. **Diff.** Run the project's deterministic screenshot diff, baseline vs
    current, and record per surface a **changed-region manifest**: the bounding
    boxes that actually differ. This is ground truth about WHERE the diff landed;
    it says nothing about whether the change is good.
-3. **Freeze and hash.** Record a `sha256` per shot before dispatch. "Every
+
+   **Label the numbers for what they ARE.** A manifest entry is the bounding box
+   of a changed PIXEL AREA — `x, y, w, h` in the captured image's coordinate
+   space. It is not a measurement of any element, and it never means "an element
+   of this size lives here". That sentence goes INTO the scope block the lanes
+   receive; see the trap below for what happens when it does not.
+4. **Freeze and hash.** Record a `sha256` per shot before dispatch. "Every
    reviewer saw byte-identical shots" is then checkable in the run log rather
    than asserted — and a re-render that sneaks in mid-wave (a stray dev-server
    rebuild, a flaky font load) shows up as a hash mismatch instead of as
@@ -156,6 +197,28 @@ review. It never goes in as consequence. Telling a reviewer that findings
 outside the manifest get discarded both violates "Elicit risk, not policy" and
 destroys the drop rate as a measurement, because a reviewer that knows the filter
 optimizes against it.
+
+**The manifest is also a HALLUCINATION SOURCE, and must be labelled to stop
+being one. MEASURED 2026-08-27.** The scope text handed to both Opus lanes
+listed `h=48` for two regions and `h=40` for a third at width 390. Both lanes
+read those as ELEMENT heights and reported a mobile-breakpoint regression — the
+option pill is *"40px tall at 390 vs 48px at every other width"* — which the DOM
+flatly refutes: option heights are `{39: 24, 56: 3, 57: 4}` at 390, 767 and 1280
+alike, identical at every width. The numbers were bounding boxes of changed
+pixel areas. Nothing in the scope block said so, so two reviewers measured the
+UI with them and invented a bug.
+
+Every scope block therefore carries this header verbatim, above the boxes:
+
+> These are BOUNDING BOXES OF CHANGED PIXEL AREAS in this image's coordinate
+> space — they say WHERE this diff landed. They are not element dimensions and
+> not measurements of anything in the UI. Do not derive sizes, spacing, or
+> breakpoint behaviour from these numbers. Read those off the image.
+
+This is the one place the pipeline hands a reviewer raw numbers that look like
+findings, and the "never as consequence" rule above does not cover it: that rule
+governs what the manifest MEANS for a finding's fate, this one governs what its
+digits are.
 
 Never substitute a VLM's opinion of which regions changed for the diff's. That
 would launder a 40.7% guess into the one input the combiner treats as ground
@@ -189,7 +252,30 @@ this list.
   them; the mismatch surfaces as connection-refused on every shot.
 - **`pg_tmp` and `openssl` exist only inside `nix develop`.** Driving the capture
   or the oracle from a bare shell fails on a missing binary, not on anything
-  visual.
+  visual. Note the second-order cost: that devshell prints a banner to stdout,
+  which is what breaks the oracle's own retrieval command — see "The retrieval
+  must fail LOUD".
+- **The shots and the oracle cover DISJOINT SURFACES here.** Stage 1 assumes the
+  two look at overlapping UI. On this project they do not. `screenshots.yml` has
+  no group covering `/dev/components/*`; its `smoke` group captures
+  `/dashboard`, `/`, `/settings/*`, `/login` and 404. The component partials the
+  oracle asserts on (`radio_group.html`, `combobox.html`, `dialog.html`,
+  `button.html`) are included ONLY by the `/dev/components/*` playground pages —
+  `calendar_settings.html` even notes that it uses inline radios rather than the
+  `radio_group.html` partial. So a run that captures with `vv-shots.sh smoke`
+  and asserts with the geometry oracle hands the combiner two descriptions of
+  DIFFERENT PIXELS, and two of its rows — "oracle + either VLM agree" and
+  "contradicted by a green oracle assertion on the SAME rule" — are
+  **structurally unreachable**, not merely rare. Capture `/dev/components/*`
+  directly with the `visual-verify` CLI when the oracle is in the wave;
+  `vv-shots.sh` hardcodes `$REPO_ROOT/screenshots.yml` with no env override, so
+  it cannot be pointed at an ad-hoc surface list. **This is a fact about one
+  project's configuration, not a property of the pipeline — and any project can
+  have it.** Before dispatching, list the surfaces the shots cover and the
+  surfaces the oracle asserts on. An empty intersection is an Exit-report line
+  ("the oracle and the VLM lanes reviewed disjoint surfaces; the cross-checking
+  combiner rows could not fire"), never two rows quietly recorded as "did not
+  fire".
 
 ## Stage 1 — the blind parallel wave
 
@@ -233,6 +319,18 @@ looking at first", never "independently confirmed", and the combiner counts the
 two of them as ONE vendor. Lane 4b and the oracle are what actually decorrelate;
 do not let a strong A+B agreement talk you into skipping either.
 
+**That is now DEMONSTRATED here, not merely argued from the literature.
+MEASURED 2026-08-27:** across two independent waves on byte-identical shots,
+both Opus lanes reported the SAME fabricated finding — a "40px at 390 vs 48px at
+every other width" breakpoint regression that the DOM refutes outright (39 px at
+every width). Same false claim, both lanes, both waves, each lane arriving at it
+by misreading the same manifest numbers (see Stage 0). Two same-model reviewers
+converged on a hallucination, confidently, twice. Had the combiner counted them
+as two vendors it would have auto-fixed a defect that does not exist. This is
+the negative control the ONE-vendor rule predicts, produced by this pipeline on
+a real run, and it is why the rule is not negotiable on precisely the runs where
+A and B sound most convincing together.
+
 ### Lane 4b — Codex vision-taste
 
 Founder observation: primary Claude visual review misses geometric defects the
@@ -243,20 +341,41 @@ because it has vision support and a wired-in quota here; see the "Gemini future
 upgrade" note below.
 
 Codex CLI supports image input via `--image` (verified: v0.24.0+ scripted;
-v0.115.0 Mar 2026 for full-resolution, no thumbnail compression). Requires a
-vision-capable model (`gpt-5-codex` or newer). Approx 1-3k vision tokens per
-image per turn.
+v0.115.0 Mar 2026 for full-resolution, no thumbnail compression). Approx 1-3k
+vision tokens per image per turn.
+
+**Pick the model from the SERVED catalogue, never from a name that sounds
+right.** This file used to hardcode `gpt-5-codex`, which is NOT served on
+ChatGPT auth: measured 2026-08-27 it returns HTTP 400 (`The 'gpt-5-codex' model
+is not supported when using Codex with a ChatGPT account`) — deterministic and
+permanent under this auth mode, and now exit 6 rather than a false timeout.
+**Use `gpt-5.5`.** It produced this pipeline's first real 4b verdict: exit 0,
+43 s, schema-shaped, naming a planted defect and referencing the baseline.
+
+`codex debug models` is the quota-free way to check, and the served catalogue is
+what decides — not this paragraph. It costs no generation and reads the
+account's actual inventory. Measured 2026-08-27 it listed **8 served models,
+every one of them carrying `input_modalities: ["text","image"]`**, so on this
+account vision is not the scarce property; being served is. Run it before
+blaming the pipeline for a 4b failure, and run it again whenever the catalogue
+moves — a model id written down here is a claim about someone else's inventory
+and goes stale without warning.
 
 ```bash
-# One invocation per surface (component/page). Multiple shots per surface go
-# as a comma-separated list — Codex sees them all in the same turn.
+# One invocation per surface (component/page). Multiple shots per surface go as
+# a comma-separated list TO THE WRAPPER — that csv is the wrapper's own
+# interface and stops there. The CLI is handed one argv slot per file, never the
+# joined string; see "How the shots actually reach Codex" below.
 SHOTS="/abs/path/to/component-radio.png,/abs/path/to/component-radio-selected.png"
 PROMPT="$(cat <<'EOF'
 You are a design defect reviewer working from screenshots. Bias toward
 reporting; a downstream combiner suppresses false positives.
 
 Review ONLY these regions of the images — they are the regions this change
-touched:
+touched. These are BOUNDING BOXES OF CHANGED PIXEL AREAS in the image's
+coordinate space: they say WHERE the diff landed. They are not element
+dimensions and not measurements of anything in the UI. Do not derive sizes,
+spacing or breakpoint behaviour from these numbers — read those off the image.
 <changed-region manifest for this surface, verbatim from Stage 0>
 
 FIXED visual rules — check every one on every image:
@@ -301,11 +420,13 @@ printf '%s\n' "$PROMPT" > /tmp/vision-prompt-<surface>.txt
 
 ~/.claude/skills/advice-refine-test-loop/scripts/codex-advise.sh \
   --prompt-file /tmp/vision-prompt-<surface>.txt \
-  --model gpt-5-codex \
+  --model gpt-5.5 \
   --images "$SHOTS" \
   --out /tmp/codex-vision-taste-<surface>.json
 # exit 0 = verdict produced · 2 = the script could not run
 #      3 = quota · 4 = timeout/connectivity · 5 = no parseable verdict
+#      6 = the request was REJECTED — a 4xx that is not quota, e.g. a model id
+#          this account is not served. Never retried; fix the config.
 ```
 
 **The prompt says nothing about the other lanes.** It does not say a Claude
@@ -316,10 +437,41 @@ class that moves a VLM judge 19–26 pp.
 The wrapper is the same one Phase 2 uses, and it owns the shared plumbing:
 read-only sandbox, no `--dangerously-*` anything, the 300s cap,
 `--output-schema` pinned to `verdict-schema.json`, and exactly one retry per
-failure class. What is 4b-specific stays here — the model, the images, the
+failure class — with the single deliberate exception of a rejected request
+(exit 6), which is deterministic and gets none. What is 4b-specific stays
+here — the model, the images, the
 prompt, the severity floor and the LOW filter below. `--images` takes ABSOLUTE
 paths and the script rejects anything else, since the combiner attributes each
 finding to its shot by that exact path.
+
+#### How the shots actually reach Codex — both halves are load-bearing
+
+**Measured 2026-08-27 against codex-cli 0.146.0, by capturing the actual wire
+payload rather than reading the help text.** The CLI's real contract is
+`--image <FILE> <FILE> … -- <PROMPT>`, and BOTH halves of that are required:
+
+1. **One argv slot per file.** `codex exec` declares `-i, --image <FILE>...`,
+   which is variadic. A comma-joined string is read as ONE filename, and that
+   filename does not exist.
+2. **`--` must close the list.** `--image` is variadic AND sits before the
+   positional prompt, so with nothing to close it the flag swallows the prompt
+   as one more image path. Codex then falls back to stdin — `Reading prompt from
+   stdin... No prompt provided via stdin` — and sends no request at all.
+
+Three forms were tried and all three put **zero images on the wire with the
+prompt swallowed**: `--image a,b PROMPT`, `--image a b PROMPT`, and
+`-i a -i b PROMPT` (repeating the flag does not help — the last one is still
+variadic and still eats the prompt). Only `--image a b -- PROMPT` delivered two
+images and the prompt.
+
+`codex-advise.sh` is the single place that knows this, which is exactly why
+`--images` is a csv at the wrapper boundary and nowhere else: the wrapper splits
+it once and hands the CLI the array plus the separator. **Never hand-roll
+`codex exec` with a comma-joined `--image`.** It fails with the prompt GONE
+rather than with an error, and the old wrapper's misclassification of that
+silence as a connectivity timeout is how lane 4b ran for months without ever
+producing a verdict — the drift-back class it exists to catch surviving every
+round, while the pipeline reported a network problem.
 
 Repeat per surface. Store outputs under a run-scoped dir (e.g.
 `/tmp/design-review-YYYY-MM-DD/vision-taste/`). Do not batch every surface
@@ -350,6 +502,15 @@ re-invoke it hoping for a better roll:
   has vision on Plus quota).
 - Exit 4 — timeout or connectivity, including after the one 30s retry.
 - Exit 5 — no parseable verdict, including after the one schema-reminder re-ask.
+- Exit 6 — the request was REJECTED: a 4xx that is not a quota error — an
+  unserved or unknown model id, a malformed request, refused auth. Deterministic
+  and permanent under the current config, so the wrapper does NOT retry it;
+  re-issuing an identically doomed request only burns wall clock and buries the
+  cause. **It is deliberately not folded into exit 4.** A rejection reported as
+  a timeout sends the operator to look at the network for what is a config
+  error — measured 2026-08-27, `gpt-5-codex` returned HTTP 400 and the old
+  wrapper announced "no response within 300s" after 35.9 s. Fix the config
+  (`codex debug models`); do not re-run.
 - Exit 2 — the script could not run at all. Not a review result, and never a
   clean pass.
 
@@ -402,12 +563,54 @@ So the ONLY retrieval path is the JSON reporter plus a base64 decode of the
 attachment `body`:
 
 ```bash
-npx playwright test component-geometry-oracle --reporter=json > /tmp/oracle.json
+# Stage the report on disk, THEN parse it as a separate, checked step. Both
+# halves matter — see "The retrieval must fail LOUD" below.
+npx playwright test component-geometry-oracle --reporter=json \
+  > /tmp/oracle.raw 2>/tmp/oracle.stderr
+
+# The devshell banner is printed to STDOUT, ahead of the JSON. Strip everything
+# before the first top-level '{'.
+sed -n '/^{/,$p' /tmp/oracle.raw > /tmp/oracle.json
+
+# ASSERT THE PARSE, LOUDLY, BEFORE READING ANYTHING OUT OF IT. Never pipe the
+# reporter straight into jq: a jq that dies mid-pipeline still exits 0 and
+# prints `null`, which the combiner reads as "oracle clean".
+jq -e 'has("stats")' /tmp/oracle.json >/dev/null || {
+  echo "ORACLE UNRETRIEVED — report did not parse as JSON. Precondition UNMET," \
+       "NOT clean. First lines of the raw capture:" >&2
+  head -3 /tmp/oracle.raw >&2
+  exit 1
+}
+
 # Recursive descent, because the reporter's suite nesting varies by version.
 jq -r '[.. | objects | select(has("name") and has("body"))
         | select(.name | endswith("-violations.json")) | .body] | .[]' \
   /tmp/oracle.json | base64 -d | jq -s 'add'
 ```
+
+**The retrieval must fail LOUD, because the obvious form fails silent — and
+this file's own setup rule is what breaks it.** Driving the oracle from inside
+`nix develop` is mandatory (`pg_tmp` and `openssl` live only there). Measured
+2026-08-27: kablong's devshell `shellHook` prints a banner to **stdout**, so a
+bare `--reporter=json > file` captures the banner ahead of the JSON —
+
+```
+kablong dev shell — rust 1.95.0, node v22.22.3, pg
+{
+  "config": { ...
+```
+
+— and every `jq` over that dies with `parse error: Invalid numeric literal at
+line 1, column 8`. Because the death is MID-PIPELINE (`jq | base64 -d | jq -s
+add`), the pipeline still exits **0** and prints `null`. A combiner following
+the previous version of this command verbatim got an empty result and read it as
+"oracle clean" — state 3 below, manufactured by this file's own instructions.
+
+Three fixes are available — redirect the banner, strip to the first `{`, or
+assert the parse — and **the assertion is the one that is mandatory.** Stripping
+alone still yields an empty result silently when the reporter wrote nothing at
+all, which is the same fail-open one layer down. A retrieval that cannot run
+announces itself and exits non-zero. It never presents as clean.
 
 The decoded schema is the one the combiner wants — `component`, `variant`,
 `element`, `selector`, `property`, `actual`, `expected`, `delta`, `note`.
@@ -416,9 +619,11 @@ Two consequences, both fail-open if missed:
 
 - **A combiner that globs for `*-violations.json`, or that parses stdout, gets
   NOTHING and reads it as "oracle clean."** That is the fail-open this skill
-  exists to name, wearing the costume of ground truth. The success signal is a
-  successfully DECODED attachment; an empty glob is never evidence of a clean
-  run.
+  exists to name, wearing the costume of ground truth. An empty glob is never
+  evidence of a clean run. Note carefully what the success signal is NOT: a
+  decoded attachment cannot serve as it, because a genuinely clean run attaches
+  nothing at all. The signal is a PARSED REPORT whose `stats.unexpected` is 0 —
+  see "Absent, clean, and unretrieved are THREE states with ONE observable".
 - **The oracle hard-fails on any violation** (`expect(violations).toEqual([])`),
   so a run that has something to report is a FAILING Playwright run. Non-zero
   exit is the expected shape when the oracle is doing its job, and the exit code
@@ -552,6 +757,12 @@ caveats, both of which must travel with the number:
   vendors in this pipeline and across runs over time; do not quote it against a
   published control figure.
 
+- **It is only as good as the noise floor underneath it.** The rule reads
+  "unchanged" off the diff, so on a surface whose measured floor is non-zero the
+  diff reports regions as changed that nobody touched, and a hallucination
+  landing there is not dropped. The rate for such a surface is `n/a`, never `0`
+  — see Stage 0 step 1.
+
 Log the rate even when it is zero, and log the denominator with it. A bare "0
 dropped" over four findings says nothing.
 
@@ -573,14 +784,27 @@ gate the ship rather than the phase. The two copies must stay identical.
 
 ## Stage 3 — bounded fix pass
 
-Max ONE fix pass after the wave:
+Max ONE fix pass after the wave. **The combiner table above is the authority on
+WHAT gets fixed; this list is its execution order. Where the two ever appear to
+disagree, the table wins** — and this list is written to match it, row for row.
 
 1. Fix every geometry-oracle violation. Ground truth, no vote needed.
 2. Fix everything the Opus lane and the Codex lane agree on at `BLOCKER` or
    `HIGH`.
-3. Fix singleton `BLOCKER`s that reproduce against the artifact by a re-runnable
-   check. A singleton that is a taste call does not qualify no matter how it was
-   graded — it goes to the founder.
+3. Fix every singleton finding **in a changed region that reproduces against the
+   artifact by a check a third party could re-run — at ANY severity, not
+   `BLOCKER`s only.** Record the check in the ledger row. Reproducibility is the
+   test here, never confidence or grade: a singleton that is a taste call has no
+   re-runnable check by definition, so it does not qualify however it was
+   graded, and goes to the founder at step 5.
+
+   **This clause is load-bearing, and the earlier `BLOCKER`-only wording was
+   measured to be wrong.** On the 2026-08-27 run the single reproducible
+   singleton was graded MEDIUM by both lanes. Fixing it is what produced the
+   entire post-fix regression result — 51 newly-changed regions of reflow
+   contamination out of a 5-character CSS change. A run following the old
+   enumeration literally would have skipped it, found an empty collateral
+   footprint, and read that emptiness as the gate passing.
 4. Re-render affected shots.
 5. Founder-taste calls (singleton subjective findings) go to the founder as A/B/C
    variants via the founder-decision loop, NOT auto-fixed.
@@ -611,6 +835,12 @@ result, and must not be quoted as one.
 3. **Compute the newly-changed regions**: regions in the Stage 4 manifest that
    were not in the Stage 0 manifest. That set IS the fix's collateral footprint.
    An empty set is the expected, good outcome and gets recorded as such.
+   **Subtract the Stage 0 noise floor first.** A surface with a non-zero floor
+   produces regions that enter and leave this set for no reason — on the
+   2026-08-27 run the spinner's boxes happened to overlap between captures and
+   `btn` reported `NEWLY_CHANGED=0`, which was luck, not a guarantee. Without the
+   subtraction the gate either invents collateral that no fix caused or, worse,
+   hides real collateral inside a region already written off as noisy.
 4. **Re-run the oracle in full.** It is deterministic and cheap; there is no
    reason to scope it.
 5. **Run the VLM pass ONLY on the newly-changed regions.** Same lanes, same
@@ -689,17 +919,56 @@ situations, and only one of them is good:
 1. **Absent** — the project has no oracle. Precondition UNMET; say so.
 2. **Clean** — the oracle ran and asserted no violations. Genuinely green.
 3. **Unretrieved** — the oracle ran, found violations, and the parent never got
-   them, because it globbed for `*-violations.json` or read stdout instead of
-   decoding the report attachment (see "Getting the violations out"). Ground
-   truth existed and was thrown away.
+   them: it globbed for `*-violations.json`, or parsed stdout, or let `jq` die
+   mid-pipeline on the devshell banner (see "Getting the violations out").
+   Ground truth existed and was thrown away.
 
 State 3 is the dangerous one: it reports as state 2 while behaving like state 1,
 and the sigil's "geometry-oracle green" precondition then passes on a run that
-never read the oracle. **Distinguish them positively, never by absence of
-output.** A green oracle is one whose report was successfully parsed and
-contained zero violations — record the parse, not the silence. A run that cannot
-show which of the three states it was in must state the oracle precondition as
-UNMET, exactly as in state 1.
+never read the oracle.
+
+**Separate them by the REPORT, not by the attachment list.** The attachment
+cannot do this job, and demanding that it does makes the sigil unreachable.
+**Measured 2026-08-27:** `test.info().attach()` sits inside
+`if (violations.length > 0)`, and the clean branch only does a `console.log`. So
+a genuinely clean 5/5 run emits `attachments: []` — byte-identical to a run
+whose report was never parsed. A rule that names a decoded attachment as the
+success signal declares every clean run precondition-UNMET; that is the mirror
+image of a fail-open, and just as wrong.
+
+What DOES differ is the Playwright run's own report:
+
+| Observable | Absent | Clean | Unretrieved |
+|---|---|---|---|
+| oracle spec file present in the repo | no | yes | yes |
+| the report file parses, `.stats` present | — | **yes** | **no** |
+| `.stats.expected` == the slug count dispatched | — | yes | unreadable |
+| `.stats.unexpected` | — | `0` | unreadable |
+| a test title per component slug | — | yes | unreadable |
+| decoded `*-violations.json` attachments | — | none | none |
+
+**Green = a report that PARSED, whose `stats.unexpected` is 0, and whose
+`stats.expected` equals the slug count you dispatched.** Record the parse, not
+the silence — and record those two numbers alongside it, because they are the
+evidence. An empty attachment list is a CONSEQUENCE of green, never the argument
+for it. State 3 fails the parse assertion in "Getting the violations out" and
+exits non-zero there, before any of this is read.
+
+**The residual ambiguity, stated rather than papered over.** This separates "the
+report was retrieved" from "it was not", and that is genuinely all it does. It
+does NOT separate a clean run from a run whose ASSERTIONS have gone vacuous — an
+oracle whose fixtures stopped reaching the elements they were written for
+reports `expected: 5, unexpected: 0` exactly like a real pass, and no observable
+in the report tells them apart. That is the same defect class as "A fix can void
+a prior round's test without failing it" in `../SKILL.md`, and it takes the same
+defence: when the oracle goes green over a change that should have moved it,
+re-read the assertions and confirm they still fail for the right reason.
+Checking `stats.expected` against the slug count is the cheap half — it catches
+an oracle that silently stopped RUNNING tests, never one that runs them without
+asserting anything.
+
+A run that cannot show which of the three states it was in must state the oracle
+precondition as UNMET, exactly as in state 1.
 
 ### When both are absent
 
@@ -735,7 +1004,8 @@ Columns:
 - `outcome` — `fixed` / `deferred` / `founder-picked-<variant>` / `discarded-as-hallucination` — filled retrospectively after the fix loop
 
 Alongside the per-bucket rows, record the run's per-vendor **drop rate** with its
-denominator (or `n/a` when Stage 0's diff was unavailable).
+denominator (`n/a` when Stage 0's diff was unavailable, and `n/a` for any surface
+whose measured noise floor was non-zero — in both cases never `0`).
 
 After ~20 runs the ledger surfaces per-model precision; use it to weight
 reviewers, not before. Until then, treat Opus and Codex as equal-weight peers;
@@ -783,4 +1053,8 @@ deliberately duplicated, because they gate the ship rather than the phase.
 | Record a missing oracle or missing diff harness as a passing check | The fail-open failure this skill exists to name. `n/a` and `0` look identical in a ledger and mean opposite things; an unmet precondition is not a satisfied one. State the absence in the Exit report. |
 | Read an empty `*-violations.json` glob, or silent stdout, as an oracle pass | Measured: the reference oracle attaches that JSON with a `body` and Playwright never writes it to disk, so the glob is ALWAYS empty — on clean runs and on violating ones alike. The success signal is a decoded attachment from `--reporter=json`; see "Getting the violations out". A combiner wired to the glob reports ground-truth-clean forever. |
 | Read `vv-shots.sh`'s exit code as the capture result | Measured: it exits `rc=1` on complete success, because `login` and `not-found` are intentional non-200 surfaces and it propagates the last non-zero per-shot exit. Count the PNGs. Treating rc as the signal aborts a healthy capture; the inverse — assuming rc=0 means every shot landed — is the same bug pointed the other way. |
+| Treat the deterministic diff as deterministic without measuring a noise floor | Measured: an untouched tree re-shot `changed=True regions=4 changed_px=1210` on `btn`, from an animated spinner caught mid-rotation. A permanently-changed region is where the drop rule fails OPEN — a hallucination landing there is inside a changed region and survives the filter. Quiesce, then measure the floor; a floor recorded as `0` must have been measured at 0. |
+| Hand a VLM the manifest's bounding boxes without saying what the numbers ARE | Measured: both Opus lanes read scope-box heights (`h=48`, `h=40`) as ELEMENT heights and invented a breakpoint regression the DOM refutes — same false finding, both lanes, both waves. The scope block carries the "these are bounding boxes of changed pixel areas, not element dimensions" header verbatim; see Stage 0. |
+| Read a clean oracle's empty attachment list as "unretrieved" | The mirror image of the fail-open, and just as wrong. `test.info().attach()` fires only when violations exist, so a genuinely clean run attaches NOTHING. Demanding a decoded attachment as the success signal makes the sigil unreachable on a passing project. Green is a PARSED report with `stats.unexpected == 0`; see "THREE states with ONE observable". |
+| Hand-roll `codex exec` with a comma-joined `--image`, or hardcode a model id without checking the served catalogue | Measured: `--image a,b PROMPT`, `--image a b PROMPT` and `-i a -i b PROMPT` all sent ZERO images with the prompt swallowed — only `--image a b -- PROMPT` works, and only `codex-advise.sh` gets that right. `gpt-5-codex` is not served on ChatGPT auth and 400s. Both failures used to present as a connectivity timeout. Call the wrapper; check `codex debug models`. |
 | Add Gemini vision without an API key wired | Would silently degrade to skipping the lane and calling the pipeline complete. Note as future upgrade in the skill; do not add as a dispatch step until the API dependency is real. |

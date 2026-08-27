@@ -31,7 +31,8 @@ PHASE 3:  Adversarial — single Opus round, "the prior phases were wrong"
           framing (a gate `continue` resets to Phase 1; at most ONE reset
           per run)
 PHASE 4:  UI taste review (UI-only, ONCE) — one blind parallel wave:
-          stage 0  deterministic diff → changed-region manifest
+          stage 0  quiesce + measure the noise floor, then deterministic
+                   diff → changed-region manifest
           stage 1  lanes 4a (Opus defect + taste critics), 4b (Codex
                    vision-taste) and ORACLE dispatch CONCURRENTLY — the
                    VLM lanes on byte-identical shots, the ORACLE on the
@@ -923,6 +924,9 @@ Dispatch through the wrapper — never call `codex exec` by hand:
   --prompt-file <path> --out <path>
 # exit 0 = verdict produced · 2 = the script could not run
 #      3 = quota · 4 = timeout/connectivity · 5 = no parseable verdict
+#      6 = the request was REJECTED — a 4xx that is not quota (unserved or
+#          unknown model id, malformed request, refused auth). Deterministic,
+#          so the wrapper never retries it. Fix the config, don't re-run.
 ```
 
 The wrapper owns the flag set both Codex phases share — read-only sandbox, no `--dangerously-*` anything, the wall-clock cap, `--output-schema` forcing JSON so nothing regex-parses prose, and **exactly one retry per failure class, never a third attempt**. It is the single copy of that plumbing; Phase 4b calls the same script. Fixtures: `scripts/codex-advise-test.sh`.
@@ -931,12 +935,14 @@ Codex CLI runs GPT-5.5 (per `~/.codex/config.toml` default, ChatGPT Plus auth), 
 
 **Exit 0 is not yet a verdict you may act on.** The script checks that `.verdict` is one of `PASS` / `PASS_WITH_FIXES` / `BLOCKS`; it deliberately does NOT check coherence against the findings array, because that check applies to the Opus lane too and belongs at step 4. Run step 4's cross-validation on the output either way.
 
-**Exits 3, 4 and 5 are the PAUSE triggers, and the script has already spent the one sanctioned retry.** Do not re-invoke it hoping for a better roll:
+**Exits 3, 4, 5 and 6 are the PAUSE triggers, and the script has already spent the one sanctioned retry** — except on exit 6, where it deliberately spends none. Do not re-invoke it hoping for a better roll:
 
-- **Interactive session:** print "Phase 2 blocked: <quota exhausted | no response | no parseable verdict> at <ts>. Options: (a) wait <T> for reset then resume, (b) ship consciously without cross-vendor coverage, (c) abort." Wait for user decision.
+- **Interactive session:** print "Phase 2 blocked: <quota exhausted | no response | no parseable verdict | request rejected> at <ts>. Options: (a) wait <T> for reset then resume, (b) ship consciously without cross-vendor coverage, (c) abort." Wait for user decision.
 - **Unattended session** (loop triggered by "going to bed" / cron / no live human): append to `pending_for_human.md` per the CLAUDE.md format (`## <date>: Codex Phase 2 quota-exhausted / Why blocked / Steps for human / Everything else done`). Do NOT advance and do NOT ship. Exit the whole skill with status `pending-human`.
 
-**All four failure modes (quota-exhausted / timeout / connectivity / verdict-missing) route to the SAME PAUSE handler** — the loop stops, unattended runs write to `pending_for_human.md` and exit `pending-human`, interactive runs prompt the user. Never fall through silently. A DISPATCH FAILURE never advances Phase 2; only a gate stop can, per the stop-routing table in "Loop bounds". **Exit 2 is not a review result either** — the script could not run, which is the Phase 0 lesson applied here: a missing tool must never read as a clean pass.
+**All five failure modes (quota-exhausted / timeout / connectivity / verdict-missing / request-rejected) route to the SAME PAUSE handler** — the loop stops, unattended runs write to `pending_for_human.md` and exit `pending-human`, interactive runs prompt the user. Never fall through silently. A DISPATCH FAILURE never advances Phase 2; only a gate stop can, per the stop-routing table in "Loop bounds". **Exit 2 is not a review result either** — the script could not run, which is the Phase 0 lesson applied here: a missing tool must never read as a clean pass.
+
+**Exit 6 is separate from exit 4 on purpose, and the distinction is diagnostic fail-closed.** A rejected request is a 4xx that is not quota — most often a model id this account is not served. It is deterministic and permanent under the current config, so retrying it burns wall clock and buries the cause. Measured 2026-08-27: `gpt-5-codex` returned HTTP 400 on ChatGPT auth and the pre-fix wrapper reported "no response within 300s" after 35.9 s, sending diagnosis at the network for what was a config error. A guard that cannot evaluate must say so in its OWN terms rather than borrow another failure's label. On exit 6, check the served catalogue with `codex debug models` (quota-free) before anything else.
 
 **Budget expectation:** Phase 2 should usually complete in 1-2 rounds because Opus already caught the bulk. If Codex demands ≥3 rounds, that IS the signal — Codex saw something Opus missed, and the extra rounds are the reason Phase 2 exists. Do not read a flat blocker COUNT as churn (see "Loop bounds"); the actual churn signal is Codex re-flagging findings that no longer reproduce, and the gate stops on that.
 
@@ -1227,7 +1233,7 @@ one-fix-pass cap is fiction.
 | 4.5 (in-round) | Anthropic (Opus, validator) | Re-verify findings against actual file state — sent ALL of the round's findings (the judge that dedupes them is in flight alongside), with only the PIVOTAL (singleton) rows applied. Input boundary, drop rule and degrade-on-failure behaviour all defined at step 4.5. A drop CLOSES the finding with `repro: false` and keeps it in `new_r` | Co-dispatched with step 4's dedupe judge in ONE tool-use block; feeds into step 5 (reproduce) | Per-finding on independent two-reviewer convergence, applied by discarding that row on return; wholesale on any validator failure — see step 4.5 |
 | 2 | OpenAI (Codex / GPT-5.5) | Cross-vendor correctness on Opus-clean state | Phase 1 fix history carried in prompt | Never; PAUSE on quota, don't silently skip |
 | 3 | Anthropic (Opus, adversarial) | "Prior phases were wrong — find why" | Same gate at step 8; a `continue` resets to Phase 1 | Never; one shot, cheap |
-| 4 stage 0 | none (deterministic) | Capture + diff vs baseline → changed-region manifest; scopes the VLM lanes (the oracle takes no shots and has only component granularity). 100% of CSS changes vs 40.7% for the best VLM | Consumed as a filter by the combiner, not as findings | Non-UI diffs; degrades per "Phase 4" when the project has no diff harness |
+| 4 stage 0 | none (deterministic) | Quiesce + measure the noise floor, then capture + diff vs baseline → changed-region manifest; scopes the VLM lanes (the oracle takes no shots and has only component granularity). 100% of CSS changes vs 40.7% for the best VLM — but only once an unchanged tree diffs to zero, which by default it does not | Consumed as a filter by the combiner, not as findings. Its boxes are changed PIXEL AREAS and are labelled as such in the scope block, or reviewers read them as element measurements | Non-UI diffs; degrades per "Phase 4" when the project has no diff harness |
 | 4 lane 4a | Anthropic (Opus x2 — defect + taste critics) | UI defect + house-style critique — protocol per "Phase 4" | Combiner, after ALL lanes return. Same model twice = ONE vendor | Non-UI diffs |
 | 4 lane 4b | OpenAI (Codex vision-taste) on regenerated shots | Second-vendor VLM catch-what-Opus-missed — protocol per "Phase 4" | Combiner, after ALL lanes return, per `docs/reviews/multi-model-taste-ledger.md` protocol | Non-UI diffs; NEVER skip on UI-touching diffs — drift-back class survives Phases 1-3 and the Opus lanes |
 | 4 lane ORACLE | none (deterministic) | Geometry assertions against the LIVE DOM (no shots, component granularity only). Ground truth, not a vote — auto-fixes with no VLM vote required | Combiner. Dispatched in the same block as the VLM lanes; feeds no prompt. Its JSON is retrievable ONLY via the report — see "Getting the violations out" in the reference | Non-UI diffs; degrades per "Phase 4" when the project has no oracle |
