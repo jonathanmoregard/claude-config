@@ -1,0 +1,539 @@
+#!/usr/bin/env python3
+"""dod-check — is this branch's work actually done?
+
+The deterministic half of the definition-of-done system. Answers, from
+observable repo and GitHub state alone, whether a branch has reached:
+
+    committed -> pushed -> PR open -> required checks green -> mergeable
+
+...and whether the diff got there honestly (see INTEGRITY below).
+
+It reads evidence, never explanations. Nothing here consults a model, reads
+the transcript, or trusts a claim. That is the whole point: the skill and the
+Stop gate both grade against this script's exit code, so "CI is green" stops
+being something an agent can assert and becomes something it has to earn.
+
+USAGE
+    dod-check.py [--repo PATH] [--json] [--quiet] [--no-integrity]
+
+EXIT CODES
+    0  done         every gate passed
+    1  not done     blockers present (see .blockers)
+    2  n/a          not a git repo, on the default branch, or no remote
+    3  error        could not determine state (treated as NOT done by callers)
+
+Exit 3 matters: an unreachable API or a missing `gh` must never read as
+success. Callers treat 3 like 1.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+TIMEOUT = 45
+
+# ---------------------------------------------------------------- primitives
+
+
+def run(cmd, cwd=None, timeout=TIMEOUT):
+    """Run a command; return (exit_code, stdout, stderr). Never raises."""
+    try:
+        p = subprocess.run(
+            cmd,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return 124, "", f"timeout after {timeout}s: {' '.join(cmd)}"
+    except (OSError, ValueError) as exc:
+        return 127, "", f"{type(exc).__name__}: {exc}"
+
+
+def git(args, cwd, timeout=TIMEOUT):
+    return run(["git", *args], cwd=cwd, timeout=timeout)
+
+
+class Blockers:
+    """Ordered, de-duplicated blocker accumulator."""
+
+    def __init__(self):
+        self._items = []
+        self._seen = set()
+
+    def add(self, code, detail, fix=""):
+        if code in self._seen:
+            return
+        self._seen.add(code)
+        self._items.append({"code": code, "detail": detail, "fix": fix})
+
+    def __len__(self):
+        return len(self._items)
+
+    def as_list(self):
+        return list(self._items)
+
+
+# ------------------------------------------------------------------ git state
+
+
+def default_branch(cwd):
+    """origin/HEAD, falling back to main/master. None if undeterminable."""
+    code, out, _ = git(
+        ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], cwd, timeout=10
+    )
+    if code == 0 and out:
+        return out.split("/", 1)[-1]
+    for candidate in ("main", "master"):
+        code, _, _ = git(
+            ["show-ref", "--verify", "--quiet", f"refs/remotes/origin/{candidate}"],
+            cwd,
+            timeout=10,
+        )
+        if code == 0:
+            return candidate
+    return None
+
+
+def collect_repo(cwd):
+    """Repo facts, or ('n/a', reason) when the DoD does not apply here."""
+    code, root, _ = git(["rev-parse", "--show-toplevel"], cwd, timeout=10)
+    if code != 0:
+        return None, "not a git repository"
+
+    code, branch, _ = git(["rev-parse", "--abbrev-ref", "HEAD"], root, timeout=10)
+    if code != 0 or not branch or branch == "HEAD":
+        return None, "detached HEAD or unreadable branch"
+
+    code, remotes, _ = git(["remote"], root, timeout=10)
+    if code != 0 or not remotes.strip():
+        return None, "no git remote configured"
+
+    base = default_branch(root)
+    if base is None:
+        return None, "could not determine the default branch"
+    if branch == base:
+        return None, f"on the default branch ({base})"
+
+    dirty = bool(git(["status", "--porcelain"], root)[1])
+
+    # Unpushed work. No upstream at all counts as unpushed, not as an error:
+    # a branch that has never been pushed is exactly the state we want to flag.
+    code, upstream, _ = git(
+        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], root, timeout=10
+    )
+    if code != 0 or not upstream:
+        unpushed, has_upstream = None, False
+    else:
+        has_upstream = True
+        code, count, _ = git(["rev-list", "--count", "@{u}..HEAD"], root, timeout=15)
+        unpushed = int(count) if code == 0 and count.isdigit() else None
+
+    return {
+        "root": root,
+        "branch": branch,
+        "default_branch": base,
+        "dirty": dirty,
+        "has_upstream": has_upstream,
+        "unpushed": unpushed,
+    }, None
+
+
+# ----------------------------------------------------------------- integrity
+
+# Patterns that make a red suite green without making the code right.
+# Catalogue adapted from proctor / veredicto (2026). Each entry:
+#   (code, human description, compiled regex applied to ADDED diff lines)
+#
+# Deliberately narrow. A false positive here costs the user real trust, so
+# these match syntax that is unambiguous about intent, not merely suspicious.
+ADDED_PATTERNS = [
+    (
+        "CI_CONTINUE_ON_ERROR",
+        "workflow step set to continue-on-error",
+        re.compile(r"continue-on-error\s*:\s*true", re.I),
+    ),
+    (
+        "TEST_PASS_WITH_NO_TESTS",
+        "test runner told to pass when no tests match",
+        re.compile(r"--passWithNoTests\b"),
+    ),
+    (
+        "TEST_SWALLOWED",
+        "test command result discarded with `|| true`",
+        re.compile(r"^\s*.*\b(test|pytest|jest|vitest|cargo\s+test|go\s+test)\b.*\|\|\s*true\s*$"),
+    ),
+    (
+        "TEST_SKIPPED",
+        "test skipped or ignored",
+        re.compile(
+            r"(\b(it|test|describe|context)\.skip\s*\(|"
+            r"\bx(it|describe)\s*\(|"
+            r"@pytest\.mark\.(skip|xfail)\b|"
+            r"@(unittest\.)?skip\b|"
+            r"#\[ignore\]|"
+            r"\bt\.Skip\s*\()"
+        ),
+    ),
+    (
+        "ASSERT_TAUTOLOGY",
+        "assertion that cannot fail",
+        re.compile(
+            r"(assert\s+True\b|assert\s*\(\s*true\s*\)|"
+            r"expect\s*\(\s*true\s*\)\s*\.\s*to\w*\s*(be|equal)\s*\(\s*true\s*\)|"
+            r"assertTrue\s*\(\s*True\s*\))",
+            re.I,
+        ),
+    ),
+]
+
+# Files whose deletion is a finding in its own right.
+TEST_PATH = re.compile(
+    r"(^|/)(tests?|spec|__tests__|e2e)/|"
+    r"(^|/)test_[^/]+\.py$|"
+    r"[._-](test|spec)\.[a-z]+$|"
+    r"_test\.(go|py|rs)$",
+    re.I,
+)
+
+# proctor's escape hatch: a line carrying a justification comment is exempt.
+# Writing the sentence puts it in the diff where a human can disagree with it.
+JUSTIFIED = re.compile(r"(#|//|<!--)\s*dod-ok\b")
+
+
+def collect_integrity(root, base):
+    """Scan the branch diff for green-by-weakening patterns."""
+    code, mb, _ = git(["merge-base", "HEAD", f"origin/{base}"], root, timeout=20)
+    if code != 0 or not mb:
+        return None, "could not compute merge-base; integrity scan skipped"
+
+    findings = []
+
+    # Deleted or renamed-away test files.
+    code, names, _ = git(
+        ["diff", "--diff-filter=D", "--name-only", f"{mb}...HEAD"], root, timeout=30
+    )
+    if code == 0:
+        for path in (p for p in names.splitlines() if p.strip()):
+            if TEST_PATH.search(path):
+                findings.append(
+                    {
+                        "code": "TEST_FILE_DELETED",
+                        "detail": f"test file deleted: {path}",
+                        "path": path,
+                    }
+                )
+
+    # Added lines matching a weakening pattern.
+    code, diff, _ = git(["diff", "--unified=0", f"{mb}...HEAD"], root, timeout=45)
+    if code != 0:
+        return findings, "could not read the branch diff; pattern scan incomplete"
+
+    current = None
+    for line in diff.splitlines():
+        if line.startswith("+++ b/"):
+            current = line[6:]
+            continue
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        added = line[1:]
+        if JUSTIFIED.search(added):
+            continue
+        for code_name, desc, rx in ADDED_PATTERNS:
+            if rx.search(added):
+                findings.append(
+                    {
+                        "code": code_name,
+                        "detail": f"{desc} — {current or '?'}: {added.strip()[:120]}",
+                        "path": current,
+                    }
+                )
+                break
+
+    return findings, None
+
+
+# -------------------------------------------------------------------- github
+
+
+def collect_pr(root):
+    """PR facts via gh. Returns (pr_or_None, checks_or_None, error_or_None)."""
+    if shutil.which("gh") is None:
+        return None, None, "gh CLI not found on PATH"
+
+    fields = (
+        "number,url,state,isDraft,mergeStateStatus,mergeable,"
+        "reviewDecision,reviewThreads,headRefName,baseRefName,title"
+    )
+    code, out, err = run(["gh", "pr", "view", "--json", fields], cwd=root)
+    if code != 0:
+        low = (err or "").lower()
+        if "no pull requests found" in low or "no default remote" in low:
+            return None, None, None  # genuinely no PR yet — a blocker, not an error
+        return None, None, f"gh pr view failed: {err[:200]}"
+
+    try:
+        pr = json.loads(out)
+    except ValueError:
+        return None, None, "gh pr view returned unparseable JSON"
+
+    checks, cerr = collect_checks(root)
+    return pr, checks, cerr
+
+
+def collect_checks(root):
+    """Check rollup bucketed pass/fail/pending/skipping.
+
+    `gh pr checks` exits 0 (all pass), 1 (some fail), 8 (pending), and errors
+    when the PR has no checks at all. All four are meaningful, so the exit code
+    is never treated as failure on its own.
+    """
+    code, out, err = run(
+        ["gh", "pr", "checks", "--json", "name,state,bucket,link,workflow"], cwd=root
+    )
+
+    if not out:
+        low = (err or "").lower()
+        if "no checks reported" in low or "no checks" in low:
+            return {
+                "total": 0,
+                "pass": 0,
+                "fail": 0,
+                "pending": 0,
+                "skipping": 0,
+                "failing": [],
+            }, None
+        return None, f"gh pr checks failed: {err[:200]}"
+
+    try:
+        rows = json.loads(out)
+    except ValueError:
+        return None, "gh pr checks returned unparseable JSON"
+
+    tally = {"pass": 0, "fail": 0, "pending": 0, "skipping": 0, "cancel": 0}
+    failing = []
+    for row in rows:
+        bucket = (row.get("bucket") or "").lower()
+        tally[bucket] = tally.get(bucket, 0) + 1
+        if bucket in ("fail", "cancel"):
+            failing.append(
+                {
+                    "name": row.get("name") or row.get("workflow") or "?",
+                    "bucket": bucket,
+                    "link": row.get("link") or "",
+                }
+            )
+
+    return {
+        "total": len(rows),
+        "pass": tally.get("pass", 0),
+        "fail": tally.get("fail", 0) + tally.get("cancel", 0),
+        "pending": tally.get("pending", 0),
+        "skipping": tally.get("skipping", 0),
+        "failing": failing,
+    }, None
+
+
+def unresolved_threads(pr):
+    threads = (pr.get("reviewThreads") or {})
+    nodes = threads.get("nodes") if isinstance(threads, dict) else threads
+    if not isinstance(nodes, list):
+        return 0
+    return sum(1 for t in nodes if isinstance(t, dict) and not t.get("isResolved"))
+
+
+# ------------------------------------------------------------------ evaluate
+
+# mergeStateStatus values that mean "a human cannot press merge right now".
+# CLEAN and HAS_HOOKS are fine; UNSTABLE means non-required checks are red,
+# which the required-checks tally already judges, so it is not a blocker here.
+NOT_MERGEABLE = {"DIRTY": "merge conflicts with the base branch",
+                 "BLOCKED": "blocked by branch protection (missing review or required check)",
+                 "BEHIND": "branch is behind the base and must be updated",
+                 "DRAFT": "pull request is still a draft"}
+
+
+def evaluate(cwd, do_integrity=True):
+    result = {
+        "done": False,
+        "applicable": True,
+        "merged": False,
+        "blockers": [],
+        "repo": None,
+        "pr": None,
+        "checks": None,
+        "integrity": [],
+        "warnings": [],
+        "error": None,
+    }
+
+    repo, na_reason = collect_repo(cwd)
+    if repo is None:
+        result.update(applicable=False, done=False, error=None)
+        result["reason"] = na_reason
+        return result, 2
+    result["repo"] = repo
+
+    b = Blockers()
+
+    if repo["dirty"]:
+        b.add("DIRTY_TREE", "uncommitted changes in the working tree",
+              "commit or stash them")
+    if not repo["has_upstream"]:
+        b.add("NOT_PUSHED", "branch has no upstream — never pushed",
+              f"git push -u origin {repo['branch']}")
+    elif repo["unpushed"]:
+        b.add("UNPUSHED_COMMITS", f"{repo['unpushed']} commit(s) not pushed",
+              "git push")
+
+    pr, checks, gh_error = collect_pr(repo["root"])
+    if gh_error:
+        result["error"] = gh_error
+        result["blockers"] = b.as_list()
+        return result, 3
+
+    result["pr"] = pr
+    result["checks"] = checks
+
+    if pr is None:
+        b.add("NO_PR", "no pull request open for this branch",
+              "gh pr create --fill")
+    elif (pr.get("state") or "").upper() == "MERGED":
+        # Already landed. Every downstream gate is moot, and asking the user to
+        # merge it is the specific failure this branch of the logic exists to
+        # prevent: a stale PR link presented as a live request. Merged is done.
+        result["merged"] = True
+    elif (pr.get("state") or "").upper() == "CLOSED":
+        b.add("PR_CLOSED",
+              f"PR #{pr.get('number')} was closed without merging",
+              "reopen it, or open a fresh PR — do not report this one as pending")
+    else:
+        if pr.get("isDraft"):
+            b.add("PR_DRAFT", "pull request is a draft",
+                  f"gh pr ready {pr.get('number')}")
+
+        msg = NOT_MERGEABLE.get((pr.get("mergeStateStatus") or "").upper())
+        if msg:
+            fix = ""
+            if (pr.get("mergeStateStatus") or "").upper() == "BEHIND":
+                fix = (f"git fetch origin {repo['default_branch']} && "
+                       f"git merge origin/{repo['default_branch']} && git push")
+            b.add("NOT_MERGEABLE", msg, fix)
+
+        n_unresolved = unresolved_threads(pr)
+        if n_unresolved:
+            b.add("UNRESOLVED_THREADS",
+                  f"{n_unresolved} unresolved review thread(s)",
+                  "answer and resolve them")
+
+        if checks is None:
+            result["warnings"].append("check status unavailable")
+            b.add("CHECKS_UNKNOWN", "could not read check status", "retry")
+        elif checks["total"] == 0:
+            # "Green because there is no CI" satisfies a naive predicate.
+            b.add("NO_CHECKS", "the PR reports no checks at all",
+                  "confirm CI is wired for this repo, or record why none apply")
+        else:
+            if checks["fail"]:
+                names = ", ".join(c["name"] for c in checks["failing"][:5])
+                b.add("CHECKS_FAILING",
+                      f"{checks['fail']} failing check(s): {names}",
+                      "fix them — check the base commit first to rule out a "
+                      "pre-existing failure (see hardening-flaky-ci)")
+            if checks["pending"]:
+                b.add("CHECKS_PENDING",
+                      f"{checks['pending']} check(s) still running",
+                      "gh pr checks --watch --fail-fast")
+
+    if do_integrity:
+        findings, warn = collect_integrity(repo["root"], repo["default_branch"])
+        if warn:
+            result["warnings"].append(warn)
+        if findings:
+            result["integrity"] = findings
+            codes = ", ".join(sorted({f["code"] for f in findings}))
+            b.add("INTEGRITY", f"diff weakens the test/CI signal: {codes}",
+                  "revert the weakening, or justify the line with a `dod-ok` comment")
+
+    result["blockers"] = b.as_list()
+    result["done"] = len(b) == 0
+    return result, (0 if result["done"] else 1)
+
+
+# --------------------------------------------------------------------- output
+
+
+def render(result):
+    if not result["applicable"]:
+        return f"dod-check: n/a — {result.get('reason', 'unknown')}"
+
+    lines = []
+    repo = result["repo"]
+    head = f"{repo['branch']} → {repo['default_branch']}"
+    pr = result.get("pr")
+    if pr:
+        head += f"  (PR #{pr.get('number')})"
+
+    if result["done"]:
+        if result.get("merged"):
+            lines.append(f"dod-check: MERGED — {head}")
+            lines.append("  Already landed. Do NOT ask for a merge; report it as done.")
+        else:
+            lines.append(f"dod-check: DONE — {head}")
+        if pr:
+            lines.append(f"  {pr.get('url')}")
+        return "\n".join(lines)
+
+    if result.get("error"):
+        lines.append(f"dod-check: ERROR — {result['error']}")
+
+    lines.append(f"dod-check: NOT DONE — {head}")
+    for item in result["blockers"]:
+        lines.append(f"  [{item['code']}] {item['detail']}")
+        if item.get("fix"):
+            lines.append(f"      fix: {item['fix']}")
+    for finding in result.get("integrity", []):
+        lines.append(f"  · {finding['detail']}")
+    for warn in result.get("warnings", []):
+        lines.append(f"  ! {warn}")
+    return "\n".join(lines)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Is this branch's work done?")
+    ap.add_argument("--repo", default=os.getcwd(), help="repo path (default: cwd)")
+    ap.add_argument("--json", action="store_true", help="emit JSON")
+    ap.add_argument("--quiet", action="store_true", help="exit code only")
+    ap.add_argument("--no-integrity", action="store_true",
+                    help="skip the diff integrity scan")
+    args = ap.parse_args()
+
+    try:
+        result, code = evaluate(args.repo, do_integrity=not args.no_integrity)
+    except Exception as exc:  # never let the gate crash open
+        payload = {"done": False, "applicable": True, "blockers": [],
+                   "error": f"dod-check crashed: {type(exc).__name__}: {exc}"}
+        if args.json:
+            print(json.dumps(payload, indent=2))
+        elif not args.quiet:
+            print(payload["error"], file=sys.stderr)
+        return 3
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+    elif not args.quiet:
+        print(render(result))
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

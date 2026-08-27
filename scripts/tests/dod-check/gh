@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Stub `gh` for dod-check tests. Canned responses keyed by $DOD_FIXTURE.
+# Exit codes mirror the real CLI: pr checks → 0 pass / 1 fail / 8 pending.
+
+sub="$1 $2"
+
+case "$DOD_FIXTURE" in
+  no_pr)
+    [ "$sub" = "pr view" ] && { echo "no pull requests found for branch" >&2; exit 1; }
+    ;;
+  merged)
+    if [ "$sub" = "pr view" ]; then
+      echo '{"number":42,"url":"https://github.com/o/r/pull/42","state":"MERGED","isDraft":false,"mergeStateStatus":"UNKNOWN","reviewDecision":"APPROVED","reviewThreads":{"nodes":[]},"headRefName":"f","baseRefName":"master","title":"t"}'
+      exit 0
+    fi
+    [ "$sub" = "pr checks" ] && { echo '[{"name":"ci","state":"SUCCESS","bucket":"pass","link":"","workflow":"w"}]'; exit 0; }
+    ;;
+  closed)
+    if [ "$sub" = "pr view" ]; then
+      echo '{"number":43,"url":"https://github.com/o/r/pull/43","state":"CLOSED","isDraft":false,"mergeStateStatus":"UNKNOWN","reviewDecision":null,"reviewThreads":{"nodes":[]},"headRefName":"f","baseRefName":"master","title":"t"}'
+      exit 0
+    fi
+    [ "$sub" = "pr checks" ] && { echo '[]'; exit 0; }
+    ;;
+  pending)
+    if [ "$sub" = "pr view" ]; then
+      echo '{"number":44,"url":"https://github.com/o/r/pull/44","state":"OPEN","isDraft":false,"mergeStateStatus":"UNSTABLE","reviewDecision":null,"reviewThreads":{"nodes":[]},"headRefName":"f","baseRefName":"master","title":"t"}'
+      exit 0
+    fi
+    if [ "$sub" = "pr checks" ]; then
+      echo '[{"name":"build","state":"SUCCESS","bucket":"pass","link":"","workflow":"w"},{"name":"e2e","state":"PENDING","bucket":"pending","link":"https://x/1","workflow":"w"}]'
+      exit 8
+    fi
+    ;;
+  failing)
+    if [ "$sub" = "pr view" ]; then
+      echo '{"number":45,"url":"https://github.com/o/r/pull/45","state":"OPEN","isDraft":false,"mergeStateStatus":"BLOCKED","reviewDecision":null,"reviewThreads":{"nodes":[{"isResolved":false},{"isResolved":true}]},"headRefName":"f","baseRefName":"master","title":"t"}'
+      exit 0
+    fi
+    if [ "$sub" = "pr checks" ]; then
+      echo '[{"name":"unit","state":"FAILURE","bucket":"fail","link":"https://x/2","workflow":"w"}]'
+      exit 1
+    fi
+    ;;
+  behind)
+    if [ "$sub" = "pr view" ]; then
+      echo '{"number":46,"url":"https://github.com/o/r/pull/46","state":"OPEN","isDraft":false,"mergeStateStatus":"BEHIND","reviewDecision":"APPROVED","reviewThreads":{"nodes":[]},"headRefName":"f","baseRefName":"master","title":"t"}'
+      exit 0
+    fi
+    [ "$sub" = "pr checks" ] && { echo '[{"name":"ci","state":"SUCCESS","bucket":"pass","link":"","workflow":"w"}]'; exit 0; }
+    ;;
+  nochecks)
+    if [ "$sub" = "pr view" ]; then
+      echo '{"number":47,"url":"https://github.com/o/r/pull/47","state":"OPEN","isDraft":false,"mergeStateStatus":"CLEAN","reviewDecision":"APPROVED","reviewThreads":{"nodes":[]},"headRefName":"f","baseRefName":"master","title":"t"}'
+      exit 0
+    fi
+    [ "$sub" = "pr checks" ] && { echo "no checks reported on the 'f' branch" >&2; exit 1; }
+    ;;
+  green)
+    if [ "$sub" = "pr view" ]; then
+      echo '{"number":48,"url":"https://github.com/o/r/pull/48","state":"OPEN","isDraft":false,"mergeStateStatus":"CLEAN","reviewDecision":"APPROVED","reviewThreads":{"nodes":[]},"headRefName":"f","baseRefName":"master","title":"t"}'
+      exit 0
+    fi
+    [ "$sub" = "pr checks" ] && { echo '[{"name":"ci","state":"SUCCESS","bucket":"pass","link":"","workflow":"w"}]'; exit 0; }
+    ;;
+  apierror)
+    echo "HTTP 503: upstream unavailable" >&2; exit 1
+    ;;
+esac
+exit 0
