@@ -303,15 +303,6 @@
             "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; bash $HOME/.claude/skills/orchestrate/hooks/compact-reinject.sh"
           }
         ]
-      },
-      {
-        "matcher": "resume",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/hooks/resume-notice.py"
-          }
-        ]
       }
     ],
     "Stop": [
