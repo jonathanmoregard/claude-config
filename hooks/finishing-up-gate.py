@@ -242,14 +242,34 @@ def main():
 
     reap(session)
 
+    def _standdown(field):
+        """True only for a NON-EMPTY LIST — the documented shape.
+
+        These two fields were trusted by truthiness, so any truthy value stood
+        the gate down: `{"session_crons": {"oops": 1}}` and
+        `{"background_tasks": "x"}` both silently disabled enforcement while
+        logging a clean `allow`. Reproduced. Both fields are undocumented and
+        were read out of the installed binary, so their shape is precisely the
+        thing not to assume. A shape we do not recognise means we have NOT
+        established that work is in flight, and unestablished never means done.
+        """
+        val = payload.get(field)
+        if isinstance(val, list):
+            return len(val) > 0
+        if val is not None:
+            log(session, {"action": "warn",
+                          "why": f"{field} has unexpected shape "
+                                 f"{type(val).__name__}; ignoring it"})
+        return False
+
     # A turn pausing for live background work is not a turn that finished.
     # Faulting it would fight the very CI watch the skill was told to start.
-    if payload.get("background_tasks"):
+    if _standdown("background_tasks"):
         log(session, {"action": "allow", "why": "background work in flight"})
         allow()
 
     # A durable follow-up is already booked.
-    if payload.get("session_crons"):
+    if _standdown("session_crons"):
         log(session, {"action": "allow", "why": "follow-up already scheduled"})
         allow()
 
