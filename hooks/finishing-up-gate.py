@@ -66,6 +66,14 @@ MODE = os.environ.get("CLAUDE_DOD_MODE", "active").strip().lower()
 # Own budget, deliberately below the harness's default cap of 8 so this gate
 # stands down on its own terms rather than being overridden.
 MAX_BLOCKS = int(os.environ.get("CLAUDE_DOD_MAX_BLOCKS", "6"))
+
+# A session that ends while still blocked never reaches the clean pass that
+# deletes its armfile, so the state dir grows without bound. 14 days is chosen
+# to be uninteresting: no real session lives that long, and reaping is
+# SELF-HEALING anyway — the arm hook rewrites the file on the very next edit, so
+# the worst case for a reap that is somehow too eager is one unguarded turn in a
+# session that has done nothing for a fortnight.
+ARM_MAX_AGE_DAYS = float(os.environ.get("CLAUDE_DOD_ARM_MAX_AGE_DAYS", "14"))
 DOD_TIMEOUT = 60
 
 
@@ -82,6 +90,41 @@ def log(session, payload):
 
 def allow():
     sys.exit(0)
+
+
+def reap(session):
+    """Delete arm/blocks state left behind by sessions that ended blocked.
+
+    Runs only for a session that is ALREADY armed, so an ordinary read-only
+    session still pays a single file-existence check and never a directory
+    scan. Touches nothing but `*.arm` and `*.blocks` — gate.log is the audit
+    trail and outlives everything here.
+    """
+    if ARM_MAX_AGE_DAYS <= 0:
+        return
+    cutoff = time.time() - ARM_MAX_AGE_DAYS * 86400
+    removed = []
+    try:
+        entries = list(STATE_DIR.iterdir())
+    except OSError:
+        return
+    for path in entries:
+        if path.suffix not in (".arm", ".blocks"):
+            continue
+        if path.stem == session:  # never reap the session doing the reaping
+            continue
+        try:
+            if path.stat().st_mtime >= cutoff:
+                continue
+            path.unlink()
+            removed.append(path.name)
+        except OSError:
+            continue
+    if removed:
+        log(session, {"action": "reap",
+                      "why": f"{len(removed)} file(s) older than "
+                             f"{ARM_MAX_AGE_DAYS}d",
+                      "files": removed[:20]})
 
 
 def block(reason, session, why, guards=None):
@@ -135,6 +178,8 @@ def main():
     armfile = STATE_DIR / f"{session}.arm"
     if not armfile.exists():
         allow()  # nothing was edited — the overwhelmingly common case
+
+    reap(session)
 
     # A turn pausing for live background work is not a turn that finished.
     # Faulting it would fight the very CI watch the skill was told to start.

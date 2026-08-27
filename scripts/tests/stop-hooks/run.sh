@@ -105,6 +105,38 @@ else
 fi
 
 echo
+echo "== reaping abandoned arm state =="
+# A session that ends while still blocked never reaches the clean pass that
+# deletes its armfile, so the dir grows forever. Reaping is age-based and
+# self-healing: the arm hook rewrites the file on the next edit.
+OLD=$(( $(date +%s) - 30*86400 ))
+touch -d "@$OLD" "$SD/deadsession.arm" "$SD/deadsession.blocks"
+printf '%s\n' "$BREPO" > "$SD/fresh-other.arm"
+LOGSIZE_BEFORE=$(wc -c < "$SD/gate.log" 2>/dev/null || echo 0)
+
+printf '{"session_id":"%s"}' "$SID" | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE" >/dev/null 2>&1
+
+ck "a 30-day-old armfile is reaped"      "gone" "$([ -e "$SD/deadsession.arm" ] && echo kept || echo gone)"
+ck "its orphaned .blocks goes too"       "gone" "$([ -e "$SD/deadsession.blocks" ] && echo kept || echo gone)"
+ck "a fresh armfile survives"            "kept" "$([ -e "$SD/fresh-other.arm" ] && echo kept || echo gone)"
+ck "the reaping session keeps its own"   "kept" "$([ -e "$SD/$SID.arm" ] && echo kept || echo gone)"
+ck "gate.log is never reaped"            "kept" "$([ -e "$SD/gate.log" ] && echo kept || echo gone)"
+ck "the reap is recorded"                "yes"  "$(grep -q '"action": "reap"' "$SD/gate.log" && echo yes || echo no)"
+# The audit trail must only ever grow.
+ck "gate.log was appended, not rewritten" "yes" \
+   "$([ "$(wc -c < "$SD/gate.log")" -ge "$LOGSIZE_BEFORE" ] && echo yes || echo no)"
+
+# Disabling it is one env var, and an unarmed session must never scan at all.
+touch -d "@$OLD" "$SD/deadsession2.arm"
+printf '{"session_id":"%s"}' "$SID" \
+  | CLAUDE_DOD_STATE_DIR="$SD" CLAUDE_DOD_ARM_MAX_AGE_DAYS=0 python3 "$GATE" >/dev/null 2>&1
+ck "age 0 disables reaping" "kept" "$([ -e "$SD/deadsession2.arm" ] && echo kept || echo gone)"
+
+printf '{"session_id":"unarmed-nobody"}' | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE" >/dev/null 2>&1
+ck "an unarmed session reaps nothing" "kept" "$([ -e "$SD/deadsession2.arm" ] && echo kept || echo gone)"
+rm -f "$SD/deadsession2.arm" "$SD/fresh-other.arm"
+
+echo
 echo "== ralph hands the finished turn to the gate =="
 # The point of the handover. Stop hooks run CONCURRENTLY (measured on 2.1.247:
 # the hook declared second started 111ms before the first and ran while it
