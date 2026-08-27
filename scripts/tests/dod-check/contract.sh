@@ -78,6 +78,38 @@ else
   ok "live gh accepts the field set"
 fi
 
+# `gh pr list --json` has its OWN field vocabulary, overlapping but not identical
+# to `pr view`'s. The multiple-PR check is a second call of exactly the shape
+# that was dead on arrival last time, so it gets the same pinning rather than
+# the same trust.
+list_valid=$(gh pr list --json 2>&1 | sed -n 's/^[[:space:]]\{2,\}\([a-zA-Z]\+\)$/\1/p' | LC_ALL=C sort -u)
+if [ -z "$list_valid" ]; then
+  bad "pr list field list readable" "could not parse 'gh pr list --json' output"
+else
+  ok "read $(wc -l <<<"$list_valid") valid fields from 'gh pr list'"
+  list_requested=$(python3 - "$DOD" <<'PY'
+import re, sys
+src = open(sys.argv[1]).read()
+m = re.search(r'"--json",\s*"([^"]*number[^"]*)"\]', src)
+if not m:
+    sys.exit("could not locate the gh pr list field list in dod-check.py")
+print("\n".join(sorted(set(f.strip() for f in m.group(1).split(",") if f.strip()))))
+PY
+)
+  if [ -z "$list_requested" ]; then
+    bad "pr list fields extracted" "regex found no field list"
+  else
+    lbogus=$(LC_ALL=C comm -23 \
+      <(printf '%s\n' "$list_requested" | LC_ALL=C sort -u) \
+      <(printf '%s\n' "$list_valid"     | LC_ALL=C sort -u))
+    if [ -n "$lbogus" ]; then
+      bad "every pr-list field is valid" "gh does not accept: $(tr '\n' ' ' <<<"$lbogus")"
+    else
+      ok "every pr-list field is valid"
+    fi
+  fi
+fi
+
 echo
 echo "== $pass passed, $fail failed =="
 [ "$fail" -eq 0 ]

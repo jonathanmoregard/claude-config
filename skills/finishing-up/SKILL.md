@@ -56,6 +56,10 @@ interactive logins, and taste calls. Everything else is yours.
 plus a project. Each repo runs its own ladder and each gets its own line in the
 report, with its own URL.
 
+**Subagents count as you.** They share the parent's session id (measured against
+2.1.247), so a repo your subagent edited is a repo you have to finish. Dispatch
+does not transfer ownership.
+
 ## Step 2 — Act on what it says
 
 Work the blockers in the order reported; each has a `fix` field.

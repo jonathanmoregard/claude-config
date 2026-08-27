@@ -23,6 +23,19 @@ session=$(jq -r '.session_id // ""' <<<"$input")
 
 # The edited path decides the repo, not the session cwd — a session running in
 # ~/.claude that edits a file in ~/Repos/foo is working on foo.
+#
+# SUBAGENTS SHARE THE PARENT'S session_id. Measured 2026-08-27 against 2.1.247:
+# a parent edited one repo, dispatched a Task subagent that edited a second, and
+# both PostToolUse payloads carried the identical session_id — so the subagent's
+# edit arms the PARENT for the second repo.
+#
+# That is intended, not a leak. Work dispatched to a subagent is still the
+# parent's work, and the parent is the session that will be asked whether it is
+# finished; a fleet that can edit repos the gate never looks at is the same
+# opt-out the default branch used to be. The cost is bounded and known: if a
+# subagent touches a repo the parent cannot finish, the parent blocks up to its
+# budget and then stands down. Scratch dirs are excluded below, so notes and
+# state files do not arm anything.
 path=$(jq -r '.tool_input.file_path // .tool_input.notebook_path // ""' <<<"$input")
 [ -n "$path" ] || exit 0
 
