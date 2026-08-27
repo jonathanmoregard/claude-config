@@ -71,6 +71,46 @@ case "$out" in *'"systemMessage"'*) r=shadow ;; *) r="$out" ;; esac
 ck "shadow is still available as an opt-out" "shadow" "$r"
 
 echo
+echo "== config that cannot be read FAILS CLOSED =="
+# Every one of these used to end the turn UNGUARDED. The numeric vars are parsed
+# at import, so a ValueError there exited non-zero with no output and the
+# harness simply carried on; and MODE compared only against "active", so one
+# typo degraded to shadow permanently and said nothing. A guard disabled by a
+# stray character in a shell profile is not a guard.
+out=$(printf '{"session_id":"%s"}' "$SID" \
+      | CLAUDE_DOD_STATE_DIR="$SD" CLAUDE_DOD_MAX_BLOCKS=x python3 "$GATE")
+ck "garbage MAX_BLOCKS still blocks"     "block" "$(decision "$out")"
+out=$(printf '{"session_id":"%s"}' "$SID" \
+      | CLAUDE_DOD_STATE_DIR="$SD" CLAUDE_DOD_ARM_MAX_AGE_DAYS=abc python3 "$GATE")
+ck "garbage ARM_MAX_AGE_DAYS still blocks" "block" "$(decision "$out")"
+# The one that mattered most: shadow must be asked for BY NAME.
+out=$(printf '{"session_id":"%s"}' "$SID" \
+      | CLAUDE_DOD_STATE_DIR="$SD" CLAUDE_DOD_MODE=activ python3 "$GATE")
+ck "a MODE typo fails closed to active"  "block" "$(decision "$out")"
+ck "and says which value it rejected"    "yes" \
+   "$(grep -q "CLAUDE_DOD_MODE='activ' unrecognised" "$SD/gate.log" && echo yes || echo no)"
+# A tiny positive age would reap every other live session's state.
+touch -d "@$(( $(date +%s) - 7200 ))" "$SD/twohours.arm"
+printf '{"session_id":"%s"}' "$SID" \
+  | CLAUDE_DOD_STATE_DIR="$SD" CLAUDE_DOD_ARM_MAX_AGE_DAYS=0.001 python3 "$GATE" >/dev/null 2>&1
+ck "a sub-day reap age is floored"       "kept" \
+   "$([ -e "$SD/twohours.arm" ] && echo kept || echo gone)"
+rm -f "$SD/twohours.arm"
+# dod-check that emits a non-object must not crash the hook. Its OWN session id:
+# $SID has been blocking all through this section and its 6-block budget is
+# spent, so reusing it here would read "stood down on budget" as "did not block"
+# and quietly assert nothing.
+printf 'print("[]")\n' > "$SD/fake-dod.py"
+NSID="nonobj-$RANDOM"
+printf '%s\n' "$BREPO" > "$SD/$NSID.arm"
+out=$(printf '{"session_id":"%s"}' "$NSID" \
+      | CLAUDE_DOD_STATE_DIR="$SD" CLAUDE_DOD_CHECK="$SD/fake-dod.py" python3 "$GATE")
+ck "non-object dod-check output blocks"  "block" "$(decision "$out")"
+ck "and names the shape it got"          "yes" \
+   "$(grep -q 'emitted list, expected an object' "$SD/gate.log" && echo yes || echo no)"
+rm -f "$SD/$NSID.arm" "$SD/$NSID.blocks"
+
+echo
 echo "== ralph: an exit that does not claim completion =="
 probe() {  # $1 = assistant text -> "gone" (loop ended) | "kept" (still looping)
   local T="$SD/t-$RANDOM.jsonl" S="halt-$RANDOM"

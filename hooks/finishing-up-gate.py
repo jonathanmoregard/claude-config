@@ -66,11 +66,37 @@ DOD = pathlib.Path(
 # exceptions"; a default of shadow means anyone who does not set an env var gets
 # nothing enforced, which is how the last two attempts at this died. Shadow is
 # now the deliberate opt-out (CLAUDE_DOD_MODE=shadow), not the resting state.
-MODE = os.environ.get("CLAUDE_DOD_MODE", "active").strip().lower()
+_MODE_RAW = os.environ.get("CLAUDE_DOD_MODE", "active").strip().lower()
+# An unrecognised value FAILS CLOSED to active. It used to fall through to
+# shadow, so `CLAUDE_DOD_MODE=activ` — one typo — silently disabled enforcement
+# for good, which is precisely the class of failure this gate exists to catch.
+# Shadow must be asked for by its own name.
+MODE = _MODE_RAW if _MODE_RAW in ("active", "shadow") else "active"
+_MODE_UNKNOWN = None if _MODE_RAW in ("active", "shadow") else _MODE_RAW
 
 # Own budget, deliberately below the harness's default cap of 8 so this gate
 # stands down on its own terms rather than being overridden.
-MAX_BLOCKS = int(os.environ.get("CLAUDE_DOD_MAX_BLOCKS", "6"))
+def _num_env(name, default, cast, floor=None):
+    """Parse a numeric env var without ever crashing the hook.
+
+    These are read at import. An uncaught ValueError there exits non-zero with
+    no output, and the harness ends the turn UNGUARDED — a fail-open reachable
+    by one stray character in a shell profile. Bad values fall back to the
+    default and are reported later, once logging is possible.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default, None
+    try:
+        val = cast(raw)
+    except (TypeError, ValueError):
+        return default, f"{name}={raw!r} is not a number; using {default}"
+    if floor is not None and val < floor:
+        return floor, f"{name}={val} below floor {floor}; using {floor}"
+    return val, None
+
+
+MAX_BLOCKS, _MAX_BLOCKS_WARN = _num_env("CLAUDE_DOD_MAX_BLOCKS", 6, int, floor=1)
 
 # A session that ends while still blocked never reaches the clean pass that
 # deletes its armfile, so the state dir grows without bound. 14 days is chosen
@@ -78,7 +104,13 @@ MAX_BLOCKS = int(os.environ.get("CLAUDE_DOD_MAX_BLOCKS", "6"))
 # SELF-HEALING anyway — the arm hook rewrites the file on the very next edit, so
 # the worst case for a reap that is somehow too eager is one unguarded turn in a
 # session that has done nothing for a fortnight.
-ARM_MAX_AGE_DAYS = float(os.environ.get("CLAUDE_DOD_ARM_MAX_AGE_DAYS", "14"))
+# Floor of 1 day: a tiny positive value (0.001) would reap every other live
+# session's state and silently disarm their gates. 0 still disables reaping.
+ARM_MAX_AGE_DAYS, _ARM_WARN = _num_env(
+    "CLAUDE_DOD_ARM_MAX_AGE_DAYS", 14.0, float)
+if ARM_MAX_AGE_DAYS != 0 and ARM_MAX_AGE_DAYS < 1:
+    _ARM_WARN = f"CLAUDE_DOD_ARM_MAX_AGE_DAYS={ARM_MAX_AGE_DAYS} below floor 1; using 1"
+    ARM_MAX_AGE_DAYS = 1.0
 
 # Set by ralph-loop-stop.sh when it calls us as it ends a loop. It has already
 # decided the loop is over and deleted its own state, so the ownership and
@@ -170,9 +202,14 @@ def run_dod(repo):
     except (subprocess.TimeoutExpired, OSError) as exc:
         return None, f"dod-check did not run: {type(exc).__name__}"
     try:
-        return json.loads(p.stdout), None
+        parsed = json.loads(p.stdout)
     except ValueError:
         return None, (p.stderr or "dod-check emitted unparseable JSON")[:200]
+    if not isinstance(parsed, dict):
+        # A list, string or number here would make every result.get() below
+        # raise AttributeError, crash the hook, and end the turn unguarded.
+        return None, f"dod-check emitted {type(parsed).__name__}, expected an object"
+    return parsed, None
 
 
 def main():
@@ -188,6 +225,16 @@ def main():
     armfile = STATE_DIR / f"{session}.arm"
     if not armfile.exists():
         allow()  # nothing was edited — the overwhelmingly common case
+
+    # Report any config value that could not be read, now that logging works.
+    # These are parsed at import, where a crash would end the turn unguarded, so
+    # they degrade to defaults there and are surfaced here instead of silently.
+    for warn in (_MODE_UNKNOWN and
+                 f"CLAUDE_DOD_MODE={_MODE_UNKNOWN!r} unrecognised; "
+                 "failing closed to active",
+                 _MAX_BLOCKS_WARN, _ARM_WARN):
+        if warn:
+            log(session, {"action": "warn", "why": warn})
 
     reap(session)
 
@@ -289,6 +336,19 @@ def main():
         result, err = run_dod(repo)
         if err:
             problems.append(f"{repo}: {err} — treat as NOT done")
+            continue
+        # dod-check reports a failed measurement IN BAND: exit 3 sets `error`
+        # and leaves `blockers` empty, because its own render() refuses to print
+        # a verdict it could not measure. Reading only `blockers` turned that
+        # into a block whose body was just the repo path — the partial-
+        # measurement presentation dod-check deliberately avoids, reproduced one
+        # layer up. Flagged independently by two reviewers.
+        if result.get("error"):
+            problems.append(
+                f"{repo}: COULD NOT MEASURE — {result['error']}\n"
+                "  PR and check state were NOT read. This is not a green "
+                "result; fix the tooling before believing anything here."
+            )
             continue
         if not result.get("applicable") or result.get("done"):
             continue
