@@ -168,10 +168,40 @@ PY
 }
 
 out=$(end_via '<promise>ALL DONE</promise>')
-ck "promise handover blocks on the gate's verdict" "block" "$(decision "$out")"
-case "$out" in *UNPUSHED_COMMITS*) r=named ;; *) r="$out" ;; esac
+# Bound to its own name: the marker cases below reuse $out, and the two
+# assertions further down are about THIS handover's output, not whatever ran
+# last. (They silently were, which is how a passing suite hid it.)
+HOUT="$out"
+ck "promise handover blocks on the gate's verdict" "block" "$(decision "$HOUT")"
+
+# The race the marker closes. Stop hooks run concurrently, so on the turn a loop
+# ends, the standalone gate is running alongside ralph's own call. Simulate the
+# losing interleaving directly: state file already gone, marker present. Without
+# the marker this invocation would evaluate and the turn would carry two
+# identical blocks.
+MSID="marker-$RANDOM"
+printf '%s\n' "$BREPO" > "$SD/$MSID.arm"
+: > "$CLAUDE_RALPH_STATE_DIR/$MSID.handover"
+out=$(printf '{"session_id":"%s"}' "$MSID" | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE")
+ck "a fresh handover marker silences the standalone gate" "" "$(decision "$out")"
+ck "the marker is consumed on read" "gone" \
+   "$([ -e "$CLAUDE_RALPH_STATE_DIR/$MSID.handover" ] && echo kept || echo gone)"
+# Consumed means the NEXT turn is gated normally again.
+out=$(printf '{"session_id":"%s"}' "$MSID" | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE")
+ck "the turn after the handover is gated again" "block" "$(decision "$out")"
+# A marker left behind by a gate that never ran must not gag the session forever.
+touch -d "@$(( $(date +%s) - 3600 ))" "$CLAUDE_RALPH_STATE_DIR/$MSID.handover"
+out=$(printf '{"session_id":"%s"}' "$MSID" | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE")
+ck "a stale marker is ignored, not obeyed" "block" "$(decision "$out")"
+# And ralph's own call must NOT stand down on the marker it just wrote.
+: > "$CLAUDE_RALPH_STATE_DIR/$MSID.handover"
+out=$(printf '{"session_id":"%s"}' "$MSID" \
+      | CLAUDE_DOD_STATE_DIR="$SD" CLAUDE_DOD_HANDOVER=1 python3 "$GATE")
+ck "HANDOVER=1 bypasses the marker" "block" "$(decision "$out")"
+rm -f "$SD/$MSID.arm" "$SD/$MSID.blocks" "$CLAUDE_RALPH_STATE_DIR/$MSID.handover"
+case "$HOUT" in *UNPUSHED_COMMITS*) r=named ;; *) r="$HOUT" ;; esac
 ck "the gate's blockers reach the agent" "named" "$r"
-case "$out" in *"promise met"*) r=kept ;; *) r="no ralph message" ;; esac
+case "$HOUT" in *"promise met"*) r=kept ;; *) r="no ralph message" ;; esac
 ck "ralph's own message survives the merge" "kept" "$r"
 
 out=$(end_via 'stopping <halt>user said stop</halt>')

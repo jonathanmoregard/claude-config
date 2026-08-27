@@ -21,8 +21,13 @@ hangs the session:
   * not armed
   * background work still in flight (`background_tasks`) — the turn is pausing
     on a live CI watch, not finishing
-  * a durable follow-up already scheduled (`session_crons`) — that IS the
-    follow-through
+  * a session-scoped wake already scheduled (`session_crons`) — that IS the
+    follow-through. NOTE, measured 2026-08-27: a `durable: true` CronCreate
+    does NOT appear here. The field is "session-scoped cron tasks that will
+    wake THIS session", and a durable cron by definition outlives it. Confirmed
+    end to end: the agent booked one, verified it with CronList, and the next
+    two Stop payloads still carried `session_crons: []`. The guard is right;
+    the block text used to promise otherwise, which is what actually broke.
   * this session's own block budget spent
 
 Protocol note: Stop hooks use TOP-LEVEL `decision`/`reason`, not
@@ -74,6 +79,11 @@ MAX_BLOCKS = int(os.environ.get("CLAUDE_DOD_MAX_BLOCKS", "6"))
 # the worst case for a reap that is somehow too eager is one unguarded turn in a
 # session that has done nothing for a fortnight.
 ARM_MAX_AGE_DAYS = float(os.environ.get("CLAUDE_DOD_ARM_MAX_AGE_DAYS", "14"))
+
+# Set by ralph-loop-stop.sh when it calls us as it ends a loop. It has already
+# decided the loop is over and deleted its own state, so the ownership and
+# handover checks must not make us stand down — that call IS the handover.
+HANDOVER = os.environ.get("CLAUDE_DOD_HANDOVER") == "1"
 DOD_TIMEOUT = 60
 
 
@@ -209,9 +219,35 @@ def main():
             pathlib.Path.home() / ".local/state/claude-ralph-loop",
         )
     )
-    if (ralph_dir / f"{session}.md").exists():
-        log(session, {"action": "allow", "why": "a ralph loop owns this session"})
-        allow()
+    if not HANDOVER:
+        if (ralph_dir / f"{session}.md").exists():
+            log(session, {"action": "allow", "why": "a ralph loop owns this session"})
+            allow()
+
+        # The handover marker closes the race on the turn a loop ENDS. Stop
+        # hooks run concurrently, so this invocation and ralph's own call to us
+        # overlap; without the marker both could evaluate and the turn got two
+        # identical blocks.
+        #
+        # Airtight by WRITE ORDERING, not by timing. ralph does: write marker,
+        # THEN unlink the state file, THEN call us with CLAUDE_DOD_HANDOVER=1.
+        # So any invocation that finds the state file gone is reading after the
+        # unlink, which is after the marker was written — it cannot miss it.
+        # Consumed on read, so it never affects a later turn.
+        marker = ralph_dir / f"{session}.handover"
+        if marker.exists():
+            try:
+                fresh = (time.time() - marker.stat().st_mtime) < 300
+            except OSError:
+                fresh = False
+            try:
+                marker.unlink()
+            except OSError:
+                pass
+            if fresh:
+                log(session, {"action": "allow",
+                              "why": "ralph handed this turn to its own gate call"})
+                allow()
 
     countfile = STATE_DIR / f"{session}.blocks"
     try:
@@ -261,12 +297,18 @@ def main():
         "That exact command, not a bare `dod-check` — it is not on PATH. "
         "Reading the conditions yourself and concluding you are done is the "
         "self-attestation this gate exists to replace.\n\n"
-        "If a check is still running, either start `gh pr checks --watch` as a "
-        "background task or schedule a durable CronCreate follow-up; either one "
-        "satisfies this gate. The follow-up REPORTS — it must not merge, and "
-        "must not push anything Jonathan has not already seen. Merging is his "
-        "click, and being blocked by this gate is not authorisation to take "
-        "it.\n\n"
+        "If a check is still running: book a durable CronCreate follow-up "
+        "because it is the right thing to leave for Jonathan — but it will NOT "
+        "clear this gate, and pretending otherwise wasted three turns when it "
+        "was measured (2026-08-27). A durable cron outlives the session, so it "
+        "is not session-scoped and never appears in `session_crons`, which is "
+        "one of the two fields this gate stands down for; the other is "
+        "`background_tasks`. So: book the follow-up, then say plainly that you "
+        "are blocked on the check — the URL, and what you actually observed — "
+        "and let this gate stand down at its budget. Do not re-run hoping to "
+        "clear it. The follow-up REPORTS — it must not merge, and must not "
+        "push anything Jonathan has not already seen. Merging is his click, "
+        "and being blocked by this gate is not authorisation to take it.\n\n"
         "If you are genuinely blocked on Jonathan — a credential, an "
         "interactive login, a taste call, or his merge click — say so "
         "explicitly, with the clickable PR URL and what you actually measured. "
