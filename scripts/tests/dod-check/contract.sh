@@ -53,7 +53,14 @@ ok "extracted $(wc -l <<<"$requested") requested fields from dod-check.py"
 # Both sides must use the SAME collation or comm silently mis-reports. The
 # first run of this test claimed `mergeable` was invalid purely because python's
 # sorted() and `sort -u` disagreed on ordering.
-bogus=$(comm -23 \
+#
+# comm needs the C locale too, not just the sorts. Process substitutions are
+# forked by the shell and never see a `VAR=x comm` prefix, so setting it only on
+# comm leaves the sorts under the ambient locale — and setting it only on the
+# sorts (the first fix here) left comm judging C-sorted input by en_US rules and
+# printing "file 1 is not in sorted order" while still reporting PASS. Order
+# warnings on comm mean the result is unreliable, not merely noisy.
+bogus=$(LC_ALL=C comm -23 \
   <(printf '%s\n' "$requested" | LC_ALL=C sort -u) \
   <(printf '%s\n' "$valid"     | LC_ALL=C sort -u))
 if [ -n "$bogus" ]; then

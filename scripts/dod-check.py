@@ -220,6 +220,57 @@ TEST_PATH = re.compile(
 JUSTIFIED = re.compile(r"(#|//|<!--)\s*dod-ok\b")
 
 
+def ci_configured(root, base):
+    """Does this repo actually have CI that a PR should trigger?
+
+    Zero checks means two completely different things, and conflating them is
+    what made this predicate unusable: a repo that DELETED its workflows is
+    green-by-vandalism, while a repo that never had any has simply nothing to
+    wait for. Blocking the second one asks the agent to sit forever on a check
+    that is never coming.
+
+    So this measures the branch, not the verdict: workflow files on the head OR
+    on the base. Base matters as much as head — a branch that removes the only
+    workflow keeps CI "expected", which is exactly the case the NO_CHECKS
+    blocker was written to catch.
+
+    Returns (True | False | None, note). None means undeterminable, and the
+    caller treats that as expected — the safe direction, per COULD NOT MEASURE.
+    """
+    found = []
+    unreadable = []
+    for ref in ("HEAD", f"origin/{base}"):
+        code, names, _ = git(
+            ["ls-tree", "-r", "--name-only", ref, "--", ".github/workflows"],
+            root,
+            timeout=15,
+        )
+        if code != 0:
+            unreadable.append(ref)
+            continue
+        for path in names.splitlines():
+            if path.strip().endswith((".yml", ".yaml")):
+                found.append((ref, path.strip()))
+
+    if not found:
+        if unreadable and len(unreadable) == 2:
+            return None, "could not read either ref for workflow files"
+        return False, ""
+
+    # A workflow file that only runs on a schedule or a manual dispatch produces
+    # no PR checks and must not be held against the branch. Substring scan, not
+    # a YAML parse: any mention of a PR- or push-triggered event counts, so the
+    # error lands on the side of keeping the blocker.
+    for ref, path in found:
+        code, body, _ = git(["show", f"{ref}:{path}"], root, timeout=15)
+        if code != 0:
+            return None, f"could not read {path}"
+        if "pull_request" in body or "push" in body:
+            return True, f"{path} ({'head' if ref == 'HEAD' else 'base'})"
+
+    return False, "workflows exist but none trigger on pull_request or push"
+
+
 def collect_integrity(root, base):
     """Scan the branch diff for green-by-weakening patterns."""
     code, mb, _ = git(["merge-base", "HEAD", f"origin/{base}"], root, timeout=20)
@@ -504,9 +555,25 @@ def evaluate(cwd, do_integrity=True):
             result["warnings"].append("check status unavailable")
             b.add("CHECKS_UNKNOWN", "could not read check status", "retry")
         elif checks["total"] == 0:
-            # "Green because there is no CI" satisfies a naive predicate.
-            b.add("NO_CHECKS", "the PR reports no checks at all",
-                  "confirm CI is wired for this repo, or record why none apply")
+            # "Green because there is no CI" satisfies a naive predicate — but
+            # so does "no CI was ever configured", and only the first is a
+            # defect. Ask the repo which one this is.
+            expected, note = ci_configured(repo["root"], repo["default_branch"])
+            if expected is False:
+                result["warnings"].append(
+                    "no CI configured in this repo — nothing to wait for"
+                    + (f" ({note})" if note else "")
+                )
+            else:
+                if expected is None:
+                    result["warnings"].append(
+                        f"could not confirm CI config: {note} — assuming CI is expected"
+                    )
+                b.add("NO_CHECKS",
+                      "the PR reports no checks, but this repo has CI"
+                      + (f" ({note})" if note else ""),
+                      "find out why none ran — a deleted, disabled or "
+                      "un-triggered workflow is green-by-vandalism")
         else:
             if checks["fail"]:
                 names = ", ".join(c["name"] for c in checks["failing"][:5])

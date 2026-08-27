@@ -44,7 +44,7 @@ Work the blockers in the order reported; each has a `fix` field.
 | `CHECKS_FAILING` | **Step 4.** |
 | `NOT_MERGEABLE` | `BEHIND` → merge the base in and push. `DIRTY` → resolve conflicts. `BLOCKED` → say precisely what protection is unmet. |
 | `UNRESOLVED_THREADS` | Answer each, then resolve it. |
-| `NO_CHECKS` | The PR reports no checks at all. Do not read that as green — confirm CI is wired, or state plainly that this repo has none. |
+| `NO_CHECKS` | Zero checks in a repo that **has** workflows. Something deleted, disabled or un-triggered them; find out what. A repo with no CI at all does not raise this — it reports a warning, because there is nothing to wait for. |
 | `INTEGRITY` | You (or the diff) weakened the signal. Revert it. Justify with a `dod-ok` comment only if it is genuinely correct — the comment lands in the diff for Jonathan to disagree with. |
 | `PR_CLOSED` | Closed without merging. Do not report it as pending. |
 
@@ -123,7 +123,8 @@ you just measured both.
 - "The tests should pass now" — should is not a measurement
 - Rerunning a red check until it goes green without attributing why
 - Treating exit 3 as done
-- Reading `NO_CHECKS` as green
+- Reading `NO_CHECKS` as green — or answering it by adding a workflow to make
+  the blocker go away, which is the same trick from the other end
 - Asking Jonathan to merge something already merged
 
 ## Scope

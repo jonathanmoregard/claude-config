@@ -81,7 +81,6 @@ case_run "pending checks block"    pending  1 "CHECKS_PENDING"
 case_run "failing checks block"    failing  1 "CHECKS_FAILING"
 case_run "unresolved threads"      failing  1 "UNRESOLVED_THREADS"
 case_run "BEHIND blocks"           behind   1 "NOT_MERGEABLE"
-case_run "zero checks blocks"      nochecks 1 "NO_CHECKS"
 case_run "all green is done"       green    0 "DONE"
 case_run "gh error is exit 3"      apierror 3 ""
 # Advisory, not blocking: threads that actually gate a merge surface as
@@ -89,6 +88,42 @@ case_run "gh error is exit 3"      apierror 3 ""
 # verdict, or "green" and "green as far as I got" print identically.
 case_run "thread count failure warns"  threaderror 0 "not counted"
 case_run "measure failure hides verdict" apierror 3 "COULD NOT MEASURE"
+
+# ---- zero checks: vandalism vs. genuinely no CI ---------------------------
+# Zero checks means two opposite things and the predicate has to tell them
+# apart. Blocking a repo that never had CI parks the agent on a check that is
+# never coming; not blocking one that just deleted its workflow is the
+# green-by-vandalism hole the blocker exists to plug.
+WF='on: [pull_request]\njobs:\n  a:\n    steps:\n      - run: pytest\n'
+
+fresh_repo; git push -q -u origin feat/x
+case_run "no CI at all is not a blocker" nochecks 0 "no CI configured"
+
+fresh_repo
+mkdir -p .github/workflows
+printf "$WF" > .github/workflows/ci.yml
+git add -A; git commit -qm ci; git push -q -u origin feat/x
+case_run "zero checks WITH CI blocks" nochecks 1 "NO_CHECKS"
+
+# The vandalism case: CI on the base, removed by the branch. Head alone would
+# read as "no CI here" and wave it through.
+fresh_repo
+git switch -q master
+mkdir -p .github/workflows
+printf "$WF" > .github/workflows/ci.yml
+git add -A; git commit -qm ci; git push -q origin master
+git switch -q -C feat/x master
+git rm -q -r .github/workflows; git commit -qm "drop ci"
+git push -q -u origin feat/x
+case_run "CI deleted by the branch still blocks" nochecks 1 "NO_CHECKS"
+
+# A workflow that only ever runs on a schedule produces no PR checks, so its
+# presence must not be held against the branch.
+fresh_repo
+mkdir -p .github/workflows
+printf 'on:\n  schedule:\n    - cron: "0 3 * * *"\njobs:\n  a:\n    steps:\n      - run: pytest\n' > .github/workflows/nightly.yml
+git add -A; git commit -qm nightly; git push -q -u origin feat/x
+case_run "schedule-only workflow is not CI" nochecks 0 "none trigger on pull_request"
 
 # ---- integrity scan -------------------------------------------------------
 fresh_repo; git push -q -u origin feat/x
