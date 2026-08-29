@@ -72,16 +72,14 @@ extract_tag() {  # $1 = tag name; reads $LAST_OUTPUT, prints the claimed text
 # failure — no check at all — is the one worth engineering against.
 end_loop() {  # $1 = human-readable message for the transcript
   local msg="$1" gate="$HOME/.claude/hooks/finishing-up-gate.py" out=""
-  # THE ORDER OF THE NEXT TWO LINES IS THE WHOLE MECHANISM. Stop hooks run
-  # concurrently, so the standalone gate is racing us right now. It stands down
-  # while the state file exists; the moment we unlink it, that gate would
-  # evaluate independently and the turn would get two identical blocks.
-  #
-  # Writing the marker BEFORE the unlink makes it airtight without a lock: any
-  # invocation that finds the state file gone is necessarily reading after the
-  # unlink, hence after the marker was written, so it cannot miss the marker.
-  # It consumes the marker and stands down, leaving this call the only voice.
-  : > "$STATE_DIR/$HOOK_SESSION.handover" 2>/dev/null || true
+  # No marker. The standalone gate is racing us right now and may reach the
+  # same verdict independently; that costs a duplicated block message, which
+  # the runtime tolerates (measured: 22 blocking responses across 11 firings,
+  # clean exit). A marker used to suppress that duplicate, and its own failure
+  # mode — orphaned, then silently allowing a later turn's unfinished work —
+  # was strictly worse than the duplicate it prevented. Four review rounds of
+  # ordering bugs later, it is gone. The call below is sequential composition,
+  # not coordination: it converts the race into a function call.
   rm -f "$RALPH_STATE_FILE"
   if [[ -f "$gate" ]]; then
     # HANDOVER=1 so the gate skips the ownership and marker checks: this call is
@@ -108,15 +106,6 @@ end_loop() {  # $1 = human-readable message for the transcript
           '{decision: "block", reason: $r, systemMessage: $m}'
     exit 0
   fi
-  # Delete the marker now the gate has answered. Consuming it on the gate side
-  # is NOT enough: the standalone gate runs and finishes in milliseconds, while
-  # this script polls the transcript for up to ~3s first, so on the real timing
-  # that gate has already stood down before the marker exists and has nothing to
-  # consume. The marker then outlived the turn and the NEXT Stop ate it.
-  # Reproduced. Bounding its life to this function closes every ordering:
-  # a gate that ran early stood down on the state file, and one that runs inside
-  # this window consumes it itself.
-  rm -f "$STATE_DIR/$HOOK_SESSION.handover"
   if [[ -n "$out" ]]; then
     # Exactly one JSON object must reach the harness, so fold our message into
     # the gate's: a block keeps its reason and the human still learns why the
