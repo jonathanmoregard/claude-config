@@ -15,6 +15,12 @@
 #   * the dod gate yields when a ralph loop owns the session, so one turn never
 #     has two hooks driving it.
 #
+# The handover-marker protocol that used to sit alongside this was DELETED after
+# the review loop stopped with self-inflicted-churn: a lease with no fencing
+# token, whose orphan failure was worse than the duplicate block it prevented.
+# Duplicate identical blocks are tolerated by the runtime (measured 2026-08-29:
+# 22 blocking responses across 11 firings, clean exit), so nothing replaced it.
+#
 # CLAUDE_RALPH_STATE_DIR keeps all of this out of the live loop directory.
 set -uo pipefail
 
@@ -232,13 +238,10 @@ else
 fi
 
 echo
-echo "== a REAL loop end leaves no marker behind =="
-# The orphan, measured against a real end_loop rather than a planted marker.
-# The first attempt at this fix consumed the marker gate-side, which does not
-# work on the actual timing: the standalone gate finishes in milliseconds while
-# ralph polls the transcript for up to ~3s, so the gate stands down BEFORE the
-# marker exists and has nothing to consume. Bounding the marker's life to
-# end_loop is what closes it.
+echo "== a REAL loop end hands over and leaves nothing behind =="
+# Measured against a real end_loop, not a planted fixture. The marker that used
+# to live here is gone; what must still hold is that ending the loop hands the
+# turn to the gate, removes the loop state, and leaves the next turn gated.
 RSID="realend-$RANDOM"
 printf '%s\n' "$BREPO" > "$SD/$RSID.arm"
 printf -- '---\nactive: true\niteration: 4\nmax_iterations: 25\ncompletion_promise: "ALL DONE"\n---\np\n' \
@@ -256,8 +259,8 @@ ck "concurrent gate stands down for the live loop" "" "$(decision "$out")"
 ck "  ...by exiting 0, not by crashing" "0" "$GATE_RC"
 printf '{"session_id":"%s","transcript_path":"%s"}' "$RSID" "$RT" \
   | CLAUDE_DOD_STATE_DIR="$SD" bash "$RALPH_HOOK" >/dev/null 2>&1
-ck "end_loop leaves no marker"          "gone" \
-   "$([ -e "$CLAUDE_RALPH_STATE_DIR/$RSID.handover" ] && echo kept || echo gone)"
+ck "end_loop leaves no loop state behind" "gone" \
+   "$([ -e "$CLAUDE_RALPH_STATE_DIR/$RSID.md" ] && echo kept || echo gone)"
 out=$(gate_run "$RSID")
 ck "the turn after a real loop end is gated" "block" "$(decision "$out")"
 rm -f "$SD/$RSID.arm" "$SD/$RSID.blocks"
@@ -476,52 +479,29 @@ out=$(end_via '<promise>ALL DONE</promise>')
 HOUT="$out"
 ck "promise handover blocks on the gate's verdict" "block" "$(decision "$HOUT")"
 
-# The race the marker closes. Stop hooks run concurrently, so on the turn a loop
-# ends, the standalone gate is running alongside ralph's own call. Simulate the
-# losing interleaving directly: state file already gone, marker present. Without
-# the marker this invocation would evaluate and the turn would carry two
-# identical blocks.
-MSID="marker-$RANDOM"
-printf '%s\n' "$BREPO" > "$SD/$MSID.arm"
-: > "$CLAUDE_RALPH_STATE_DIR/$MSID.handover"
-out=$(gate_run "$MSID")
-ck "a fresh handover marker silences the standalone gate" "" "$(decision "$out")"
-ck "  ...by exiting 0, not by crashing" "0" "$GATE_RC"
-
-# The orphaned-marker hole, found independently by two reviewers and
-# reproduced. ralph writes the marker only inside end_loop, AFTER a transcript
-# poll that can take ~3s — so the standalone gate almost always reads the state
-# file first and stands down. If it leaves the marker behind, the NEXT Stop
-# inside the staleness window eats it and allows a turn with unfinished work.
-# A live loop makes any marker meaningless, so standing down must consume it.
-OSID="orphan-$RANDOM"
+# The marker protocol these cases used to exercise is GONE — it was a lease with
+# no fencing token, and the review loop stopped with self-inflicted-churn after
+# four rounds of ordering bugs in it. What survives is the requirement it was
+# dressed around, which never needed a marker: once the loop's state file is
+# gone, the next turn is gated normally again.
+OSID="afterloop-$RANDOM"
 printf '%s\n' "$BREPO" > "$SD/$OSID.arm"
 printf -- '---\nactive: true\niteration: 2\nmax_iterations: 25\n---\np\n' \
   > "$CLAUDE_RALPH_STATE_DIR/$OSID.md"
-: > "$CLAUDE_RALPH_STATE_DIR/$OSID.handover"
 out=$(gate_run "$OSID")
-ck "  ...standing down exits 0" "0" "$GATE_RC"
-ck "standing down for a live loop consumes the marker" "gone" \
-   "$([ -e "$CLAUDE_RALPH_STATE_DIR/$OSID.handover" ] && echo kept || echo gone)"
+ck "stands down while the loop owns the session" "" "$(decision "$out")"
+ck "  ...by exiting 0, not by crashing" "0" "$GATE_RC"
 rm -f "$CLAUDE_RALPH_STATE_DIR/$OSID.md"
-out=$(printf '{"session_id":"%s"}' "$OSID" | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE")
+out=$(gate_run "$OSID")
 ck "the turn after the loop ends is still gated" "block" "$(decision "$out")"
+ck "  ...and that is a real block, not a crash" "0" "$GATE_RC"
 rm -f "$SD/$OSID.arm" "$SD/$OSID.blocks"
-ck "the marker is consumed on read" "gone" \
-   "$([ -e "$CLAUDE_RALPH_STATE_DIR/$MSID.handover" ] && echo kept || echo gone)"
-# Consumed means the NEXT turn is gated normally again.
-out=$(printf '{"session_id":"%s"}' "$MSID" | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE")
-ck "the turn after the handover is gated again" "block" "$(decision "$out")"
-# A marker left behind by a gate that never ran must not gag the session forever.
-touch -d "@$(( $(date +%s) - 3600 ))" "$CLAUDE_RALPH_STATE_DIR/$MSID.handover"
-out=$(printf '{"session_id":"%s"}' "$MSID" | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE")
-ck "a stale marker is ignored, not obeyed" "block" "$(decision "$out")"
-# And ralph's own call must NOT stand down on the marker it just wrote.
-: > "$CLAUDE_RALPH_STATE_DIR/$MSID.handover"
-out=$(printf '{"session_id":"%s"}' "$MSID" \
-      | CLAUDE_DOD_STATE_DIR="$SD" CLAUDE_DOD_HANDOVER=1 python3 "$GATE")
-ck "HANDOVER=1 bypasses the marker" "block" "$(decision "$out")"
-rm -f "$SD/$MSID.arm" "$SD/$MSID.blocks" "$CLAUDE_RALPH_STATE_DIR/$MSID.handover"
+
+# No marker file is created by anything, ever. This is the regression guard for
+# the whole deleted mechanism: if a marker reappears, this fails.
+ck "no .handover file exists anywhere" "none" \
+   "$([ -z "$(find "$CLAUDE_RALPH_STATE_DIR" -name '*.handover' -print -quit 2>/dev/null)" ] && echo none || echo FOUND)"
+
 case "$HOUT" in *UNPUSHED_COMMITS*) r=named ;; *) r="$HOUT" ;; esac
 ck "the gate's blockers reach the agent" "named" "$r"
 case "$HOUT" in *"promise met"*) r=kept ;; *) r="no ralph message" ;; esac

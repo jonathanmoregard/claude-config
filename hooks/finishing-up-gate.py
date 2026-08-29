@@ -119,8 +119,9 @@ if ARM_MAX_AGE_DAYS != 0 and ARM_MAX_AGE_DAYS < 1:
     ARM_MAX_AGE_DAYS = 1.0
 
 # Set by ralph-loop-stop.sh when it calls us as it ends a loop. It has already
-# decided the loop is over and deleted its own state, so the ownership and
-# handover checks must not make us stand down — that call IS the handover.
+# decided the loop is over and deleted its own state, so the ownership check
+# must not make us stand down, and the block budget must not silence us: that
+# call is the LAST thing that measures this work.
 HANDOVER = os.environ.get("CLAUDE_DOD_HANDOVER") == "1"
 DOD_TIMEOUT = 60
 
@@ -316,60 +317,48 @@ def main():
     # of truth and says so. Python cannot source bash, so the two agree via the
     # env var rather than by copying the literal — that file was written after a
     # migration moved the writer and left four readers behind.
-    ralph_dir = RALPH_DIR
-    if not HANDOVER:
-        if (ralph_dir / f"{session}.md").exists():
-            # Consume any handover marker on the way out. Without this the
-            # marker ORPHANS on the common path, not a rare one: ralph writes
-            # it only inside end_loop, after a transcript poll that can take
-            # ~3s, so this invocation almost always reads the state file first,
-            # stands down, and leaves the marker behind. The NEXT Stop within
-            # the staleness window then consumes it and allows a turn with
-            # unfinished work — reproduced, and found independently by two
-            # reviewers. A live loop makes any marker meaningless anyway.
-            stale_marker = ralph_dir / f"{session}.handover"
-            if stale_marker.exists():
-                try:
-                    stale_marker.unlink()
-                except OSError as exc:
-                    log(session, {"action": "warn",
-                                  "why": f"could not clear stale marker: {exc}"})
-            log(session, {"action": "allow", "why": "a ralph loop owns this session"})
-            allow()
-
-        # The handover marker closes the race on the turn a loop ENDS. Stop
-        # hooks run concurrently, so this invocation and ralph's own call to us
-        # overlap; without the marker both could evaluate and the turn got two
-        # identical blocks.
-        #
-        # Airtight by WRITE ORDERING, not by timing. ralph does: write marker,
-        # THEN unlink the state file, THEN call us with CLAUDE_DOD_HANDOVER=1.
-        # So any invocation that finds the state file gone is reading after the
-        # unlink, which is after the marker was written — it cannot miss it.
-        # Consumed on read, so it never affects a later turn.
-        marker = ralph_dir / f"{session}.handover"
-        if marker.exists():
-            try:
-                fresh = (time.time() - marker.stat().st_mtime) < 300
-            except OSError:
-                fresh = False
-            consumed = True
-            try:
-                marker.unlink()
-            except OSError as exc:
-                # A marker we cannot consume will silence this session again on
-                # every later turn until it ages out, so standing down on it now
-                # compounds a fault we already know about. Log it and DO NOT
-                # stand down: one duplicate block is recoverable, a string of
-                # silently unguarded turns is not.
-                consumed = False
-                log(session, {"action": "warn",
-                              "why": f"could not consume handover marker, NOT "
-                                     f"standing down on it: {exc}"})
-            if fresh and consumed:
-                log(session, {"action": "allow",
-                              "why": "ralph handed this turn to its own gate call"})
-                allow()
+    #
+    # THERE IS NO HANDOVER MARKER, AND THAT IS THE DESIGN.
+    #
+    # There used to be one: ralph wrote `<session>.handover` before unlinking
+    # its state file, and this gate stood down on a fresh marker, consuming it.
+    # Four consecutive review rounds each found a different ordering it did not
+    # cover, and the review loop stopped with `self-inflicted-churn` — its own
+    # rule for "the design is wrong and more rounds will not converge on it".
+    #
+    # It was a LEASE (Gray & Cheriton 1989) with a 300s term. A lease is safe
+    # only when the protected resource validates a fencing token (Kleppmann,
+    # "How to do distributed locking", 2016). The resource here is the Claude
+    # Code runtime aggregating two hooks' stdout: it validates nothing and
+    # cannot be made to. So no lease built here could have been safe, and
+    # adding a fencing token would not have helped — nothing downstream could
+    # enforce it. The TTL was worse than arbitrary: a TTL reclaims a claim from
+    # a process that died without cleaning up, which is the CROSS-HOST
+    # mitigation used where kill(pid,0) is meaningless from another kernel.
+    # This is one machine. The mitigation was inherited without the constraint.
+    #
+    # Nothing replaces it, because the requirement was weaker than the
+    # mechanism. MEASURED 2026-08-29: two Stop hooks emitting an identical
+    # `decision: block` are tolerated — 22 blocking responses across 11
+    # firings, session ended cleanly. So on the one turn where this gate and
+    # ralph's inline call can both fire, the cost is a duplicated block
+    # message. The marker existed to prevent exactly that, while its own
+    # failure — an orphan silently allowing unfinished work — was strictly
+    # worse than what it prevented.
+    #
+    # The state file survives because its lifetime matches its owner: one
+    # writer, alive exactly as long as the loop. The marker churned because its
+    # lifetime was a sub-turn window read by racing processes. That is the
+    # general lesson, and the reason this is a plain read and not a lock — a
+    # stale read in either direction is harmless.
+    #
+    # (A stable per-firing id, `prompt_id`, IS available and identical across
+    # hooks, so an O_EXCL claim keyed on it would be implementable if duplicate
+    # blocks ever stopped being tolerated. Not needed today; noted so the next
+    # person does not have to re-measure it.)
+    if not HANDOVER and (RALPH_DIR / f"{session}.md").exists():
+        log(session, {"action": "allow", "why": "a ralph loop owns this session"})
+        allow()
 
     countfile = STATE_DIR / f"{session}.blocks"
     try:
