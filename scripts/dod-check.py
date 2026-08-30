@@ -200,13 +200,21 @@ def collect_repo(cwd):
     # local branch, no index, so this stays a read as far as the repo is
     # concerned. Best-effort: offline or slow is a warning, never a verdict.
     # Retried ONCE, because a failed fetch now BLOCKS (REMOTE_UNVERIFIED on both
-    # ladders) and a transient loss must not read as a permanent one. The
-    # realistic transient here is CONTENTION rather than the network: ralph's
-    # inline handover call and the standalone Stop gate both spawn dod-check on
-    # the same repository within one turn, and the loser finds FETCH_HEAD.lock
-    # held by the winner. One retry costs nothing on the happy path and removes
-    # a false block on a perfectly healthy repo — and a gate that blocks healthy
-    # work is a gate somebody switches off.
+    # ladders) and a transient loss must not read as a permanent one. A gate
+    # that blocks healthy work is a gate somebody switches off.
+    #
+    # CORRECTION, measured 2026-08-30 on git 2.55.0: this comment used to blame
+    # FETCH_HEAD.lock contention between the two dod-check runs of one turn.
+    # That does not happen. 400 concurrent fetches on one repo produced ZERO
+    # failures; pre-creating FETCH_HEAD.lock or a ref .lock did not even impede
+    # a fetch; 480 fetches 8-way concurrent against an advancing origin also
+    # produced zero. The reason was wrong, so it is corrected rather than
+    # quietly dropped.
+    #
+    # The retry stays, on the transient that IS real: network transport. Driving
+    # a remote that drops 55% of connections made the two concurrent runs of one
+    # turn disagree on 20 of 40 pairs, purely on fetch outcome — which is the
+    # failure this retry actually removes.
     fetch_warning = None
     for attempt in (1, 2):
         code, _, err = git(["fetch", "--quiet", "origin", base], root, timeout=25)
@@ -492,9 +500,14 @@ def collect_pr(root):
     # the GraphQL schema: `reviewThreads` is a valid GraphQL connection and an
     # invalid gh field, and asking for it makes gh reject the whole call. A
     # contract test pins this list against the installed gh.
+    # headRefOid is THE commit this PR merged, and it is the only
+    # strategy-independent way to tell landed work from stranded work — see
+    # commits_after_merge below. Every name here must exist in
+    # `gh pr view --json`'s field list; contract.sh pins that against the
+    # installed gh.
     fields = (
         "number,url,state,isDraft,mergeStateStatus,mergeable,"
-        "reviewDecision,headRefName,baseRefName,title"
+        "reviewDecision,headRefName,headRefOid,baseRefName,title"
     )
     code, out, err = run(["gh", "pr", "view", "--json", fields], cwd=root)
     if code != 0:
@@ -584,6 +597,42 @@ def collect_checks(root):
         "failing": failing,
         "unrecognised": unrecognised,
     }, None
+
+
+def commits_after_merge(root, pr):
+    """Commits pushed to the branch AFTER the PR merged. (count_or_None, why).
+
+    NOT a reachability count. `ahead_of_default` is `rev-list origin/<base>..HEAD`,
+    and a SQUASH or REBASE merge writes new SHAs — so on a fully merged PR it
+    stays non-zero and the caller raised COMMITS_AFTER_MERGE, telling the agent
+    to cherry-pick work that had already landed. MEASURED 2026-08-30 over 16
+    scenarios: every squash and every rebase merge was wrong, by exactly the
+    branch's commit count. Only a plain --no-ff merge was right, which is the
+    one shape the test suite happened to model.
+
+    `git cherry` is NOT the fix, and finding that out is why the repro existed.
+    It compares patch-ids, and GitHub's squash collapses N commits into ONE
+    whose patch equals no individual commit's: measured correct for a 1-commit
+    squash, WRONG for 2 and for 5 — the ordinary case — and it silently skips
+    merge commits, so a merge commit on the branch can never be reported either
+    way. Tree equality is no better: it breaks the moment anyone else pushes to
+    the base (measured wrong for a rebase onto a moved base, and for a squash
+    followed by another PR landing).
+
+    The PR's own record is exact and strategy-independent. Commits after
+    headRefOid are stranded by definition; everything up to it landed by
+    definition.
+    """
+    head = (pr or {}).get("headRefOid")
+    if not head:
+        return None, "the PR did not report the commit it merged (headRefOid)"
+    code, count, err = git(["rev-list", "--count", f"{head}..HEAD"], root, timeout=15)
+    if code != 0 or not count.isdigit():
+        # A force-push after the merge can leave headRefOid unreachable here.
+        # Unknown, never zero.
+        return None, (err or f"rev-list against {head[:12]} exited {code}"
+                      ).splitlines()[0][:120]
+    return int(count), None
 
 
 GRAPHQL_THREADS = """
@@ -872,22 +921,21 @@ def evaluate(cwd, do_integrity=True):
         # more to the branch afterwards and they sit on a dead branch while the
         # PR still reads MERGED — green, and the work is nowhere. Measured
         # against origin/<base>, which collect_repo has just fetched.
-        stranded = repo["ahead_of_default"]
+        stranded, stranded_err = commits_after_merge(repo["root"], pr)
         if stranded is None:
-            # None is "the rev-list failed", not "nothing was stranded", and
-            # collapsing the two emitted NOT_ON_DEFAULT — a confident, WRONG
-            # blocker telling the agent to go home while commits the merge did
-            # not take may still be sitting on the branch.
+            # Unknown, never zero — and never the confident NOT_ON_DEFAULT that
+            # tells the agent to go home while commits the merge did not take
+            # may still be sitting on the branch.
             b.add("STRANDED_UNKNOWN",
-                  f"PR is merged, but the commits on {repo['branch']} could not "
-                  f"be counted against {repo['default_branch']} — whether the "
-                  "merge took everything is UNKNOWN",
-                  f"git fetch origin {repo['default_branch']} && re-run before "
-                  "deleting or leaving this branch")
+                  f"PR is merged, but commits pushed to {repo['branch']} after "
+                  f"the merge could not be counted ({stranded_err}) — whether "
+                  "the merge took everything is UNKNOWN",
+                  f"git fetch origin && re-run before deleting or leaving this "
+                  "branch")
         elif stranded:
             b.add("COMMITS_AFTER_MERGE",
-                  f"{stranded} commit(s) on {repo['branch']} are not in "
-                  f"{repo['default_branch']} — the merge did not take them",
+                  f"{stranded} commit(s) on {repo['branch']} were pushed AFTER "
+                  f"the merge, so {repo['default_branch']} does not have them",
                   "open a new PR for them, or cherry-pick them onto "
                   f"{repo['default_branch']}. Do not delete the branch first.")
         else:
