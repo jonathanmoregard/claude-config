@@ -14,8 +14,23 @@ HOOK_INPUT=$(cat)
 
 # Path comes from the shared resolver, never re-spelled here: this hook is one
 # of the readers a previous half-done migration left pointing at the old home.
-source "$HOME/.claude/scripts/ralph-loop-state.sh"
+# GUARDED. Bare, under `set -euo pipefail`, a missing resolver kills this hook
+# before any of its handlers — every turn, silently — and the loop's state file
+# then survives, which stands the standalone gate down on it ("a ralph loop owns
+# this session") forever. The fallback is the resolver's own documented default
+# and reads the same env var finishing-up-gate.py reads, so the two readers
+# still agree about where state lives even when one of them cannot load it.
+if ! source "$HOME/.claude/scripts/ralph-loop-state.sh" 2>/dev/null; then
+  RALPH_STATE_DIR="${CLAUDE_RALPH_STATE_DIR:-$HOME/.local/state/claude-ralph-loop}"
+  echo "⚠️  Ralph loop: state resolver missing at $HOME/.claude/scripts/ralph-loop-state.sh; falling back to $RALPH_STATE_DIR" >&2
+fi
 STATE_DIR="$RALPH_STATE_DIR"
+
+# Ceiling for the inline definition-of-done call in end_loop. It must stay under
+# the harness timeout for THIS hook — settings.json gives the ralph entry no
+# `timeout` key, so it runs on the 60s default — minus the transcript poll
+# further down, which can spend ~3s of that on its own.
+GATE_CALL_TIMEOUT="${CLAUDE_RALPH_GATE_TIMEOUT:-45}"
 
 HOOK_SESSION=$(echo "$HOOK_INPUT" | jq -r '.session_id // ""')
 
@@ -72,6 +87,8 @@ extract_tag() {  # $1 = tag name; reads $LAST_OUTPUT, prints the claimed text
 # failure — no check at all — is the one worth engineering against.
 end_loop() {  # $1 = human-readable message for the transcript
   local msg="$1" gate="$HOME/.claude/hooks/finishing-up-gate.py" out=""
+  local gate_fail="" gate_err="" gate_rc=0
+  local -a runner=()
   # No marker. The standalone gate is racing us right now and may reach the
   # same verdict independently; that costs a duplicated block message, which
   # the runtime tolerates (measured: 22 blocking responses across 11 firings,
@@ -80,17 +97,55 @@ end_loop() {  # $1 = human-readable message for the transcript
   # was strictly worse than the duplicate it prevented. Four review rounds of
   # ordering bugs later, it is gone. The call below is sequential composition,
   # not coordination: it converts the race into a function call.
-  rm -f "$RALPH_STATE_FILE"
+  #
+  # The unlink is GUARDED. Bare, under `set -euo pipefail`, it exits the hook
+  # before every JSON emitter below it — and it fails for real: a state
+  # directory at mode 555 gives EACCES, because unlink needs write permission on
+  # the DIRECTORY, not the file. Reproduced 2026-08-29, identically at HEAD and
+  # at master: rc=1, zero bytes on stdout, state file surviving, and the
+  # standalone gate then logging "a ralph loop owns this session" over a repo
+  # with real unpushed work — on that turn and on every later one. A loop whose
+  # state cannot be cleaned up must still end LOUDLY.
+  if ! rm -f "$RALPH_STATE_FILE" 2>/dev/null; then
+    msg="$msg | ⚠️ could not delete the loop state file ($RALPH_STATE_FILE); until it is removed by hand both Stop hooks will read this session as a live loop"
+  fi
   if [[ -f "$gate" ]]; then
-    # HANDOVER=1 so the gate skips the ownership and marker checks: this call is
-    # the handover, and standing down here would mean nobody checked at all.
-    gate_err="$STATE_DIR/$HOOK_SESSION.gate-stderr"
-    if ! out=$(printf '%s' "$HOOK_INPUT" \
-               | CLAUDE_DOD_HANDOVER=1 python3 "$gate" 2>"$gate_err"); then
-      gate_fail="the definition-of-done gate FAILED to run ($(head -c 200 "$gate_err" 2>/dev/null | tr '\n' ' '))"
+    # HANDOVER=1 so the gate skips its ownership check and its block budget:
+    # this call IS the handover, and standing down here would mean nobody
+    # checked at all. The ownership skip is load-bearing exactly when the unlink
+    # above failed — the state file is still there, and without the skip the
+    # gate would yield to it and end the turn unmeasured.
+    #
+    # stderr goes to a TEMP file, never into the state dir: the unlink above may
+    # have just proved that directory unwritable, and a redirect that fails
+    # there under `set -e` kills the hook on the one turn this whole function
+    # exists to cover.
+    gate_err=$(mktemp 2>/dev/null || true)
+    [[ -n "$gate_err" ]] || gate_err=/dev/null
+    # BOUNDED. The gate can legally spend DOD_TIMEOUT (60s) per armed repo while
+    # the harness kills this hook at 60s. MEASURED 2026-08-29: three armed repos
+    # put 120.4s between the unlink above and the first byte on stdout, and a
+    # kill at 60s left EMPTY stdout with the loop state already deleted — the
+    # final turn measured zero times, nothing left to revisit it. In the same
+    # run the gate reached a `block` verdict 0.11s AFTER its reader died: the
+    # measurement happened and was thrown away. The gate now bounds its own
+    # total as well; this is the outer belt, and an expiry here is a gate
+    # failure like any other — it BLOCKS.
+    if command -v timeout >/dev/null 2>&1; then
+      runner=(timeout "$GATE_CALL_TIMEOUT")
+    fi
+    out=$(printf '%s' "$HOOK_INPUT" \
+          | CLAUDE_DOD_HANDOVER=1 "${runner[@]}" python3 "$gate" 2>"$gate_err") \
+      || gate_rc=$?
+    if [[ $gate_rc -ne 0 ]]; then
+      if [[ $gate_rc -eq 124 ]]; then
+        gate_fail="the definition-of-done gate did not finish within ${GATE_CALL_TIMEOUT}s"
+      else
+        gate_fail="the definition-of-done gate FAILED to run ($(head -c 200 "$gate_err" 2>/dev/null | tr '\n' ' '))"
+      fi
       out=""
     fi
-    rm -f "$gate_err"
+    [[ "$gate_err" = /dev/null ]] || rm -f "$gate_err" 2>/dev/null || true
   else
     gate_fail="the definition-of-done gate is missing at $gate"
   fi

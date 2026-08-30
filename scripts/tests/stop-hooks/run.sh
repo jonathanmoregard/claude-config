@@ -522,5 +522,99 @@ case "$out" in *systemMessage*) r=reported ;; *) r="$out" ;; esac
 ck "and still reports why the loop ended" "reported" "$r"
 
 echo
+echo "== a hook that cannot finish in its slot has not passed =="
+# The harness kills a Stop hook at its registered timeout. The gate's budget was
+# spent PER ARMED REPO, so its own fail-closed TimeoutExpired branch sat ABOVE
+# the point the kill lands. Measured 2026-08-29: two armed repos with a 45s
+# dod-check ran 90.08s, and a SIGTERM at 60s left empty stdout, no gate.log line
+# and no .blocks file. The budget is now total, and spending it is a BLOCKER —
+# an unreached repository is an unmeasured one.
+SLOWDOD="$SD/slow-dod.py"
+printf 'import time, json\ntime.sleep(30)\nprint(json.dumps({"done": False, "applicable": True, "blockers": []}))\n' \
+  > "$SLOWDOD"
+TSID="budgetcap-$RANDOM"
+printf '%s\n%s\n' "$BREPO" "$BREPO" > "$SD/$TSID.arm"
+t0=$(date +%s)
+out=$(gate_run "$TSID" CLAUDE_DOD_CHECK="$SLOWDOD" CLAUDE_DOD_TOTAL_BUDGET=5)
+t1=$(date +%s)
+ck "a gate out of budget BLOCKS instead of being killed" "block" "$(decision "$out")"
+ck "  ...returning inside its own budget" "yes" \
+   "$([ $((t1 - t0)) -le 25 ] && echo yes || echo no)"
+case "$out" in *"NOT MEASURED"*) r=named ;; *) r="$out" ;; esac
+ck "  ...and naming the repository it never reached" "named" "$r"
+rm -f "$SD/$TSID.arm" "$SD/$TSID.blocks"
+
+# The outer belt: ralph's inline call is bounded too, so the loop's final turn
+# cannot be killed mid-measurement with its state file already deleted.
+SLOWGATE_HOME="$SD/slowgate"
+mkdir -p "$SLOWGATE_HOME/.claude/hooks" "$SLOWGATE_HOME/.claude/scripts"
+printf 'import time\ntime.sleep(30)\n' > "$SLOWGATE_HOME/.claude/hooks/finishing-up-gate.py"
+cp "$HOME/.claude/scripts/ralph-loop-state.sh" "$SLOWGATE_HOME/.claude/scripts/"
+GSID="slowgate-$RANDOM"
+printf -- '---\nactive: true\niteration: 4\nmax_iterations: 25\ncompletion_promise: "ALL DONE"\n---\np\n' \
+  > "$CLAUDE_RALPH_STATE_DIR/$GSID.md"
+t0=$(date +%s)
+out=$(printf '{"session_id":"%s","transcript_path":"%s"}' "$GSID" "$MT" \
+      | CLAUDE_DOD_STATE_DIR="$SD" HOME="$SLOWGATE_HOME" \
+        CLAUDE_RALPH_GATE_TIMEOUT=2 bash "$RALPH_HOOK" 2>/dev/null)
+t1=$(date +%s)
+ck "a gate that cannot finish BLOCKS the handover turn" "block" "$(decision "$out")"
+ck "  ...bounded, not waited on" "yes" \
+   "$([ $((t1 - t0)) -le 20 ] && echo yes || echo no)"
+
+echo
+echo "== the loop ends loudly when its own state cannot be deleted =="
+# `rm -f` is not safe under set -e: unlink needs write permission on the
+# DIRECTORY, so a state dir at mode 555 returns EACCES and kills the hook before
+# any JSON. Reproduced at HEAD and at master alike — rc=1, zero bytes of stdout,
+# state file surviving — and the survivor then stands the standalone gate down
+# on every later turn.
+RSID="rmfail-$RANDOM"
+RODIR="$SD/ro-ralph"; mkdir -p "$RODIR"
+printf -- '---\nactive: true\niteration: 25\nmax_iterations: 25\n---\np\n' \
+  > "$RODIR/$RSID.md"
+printf '%s\n' "$BREPO" > "$SD/$RSID.arm"
+chmod 555 "$RODIR"
+out=$(printf '{"session_id":"%s","transcript_path":"%s"}' "$RSID" "$MT" \
+      | CLAUDE_DOD_STATE_DIR="$SD" CLAUDE_RALPH_STATE_DIR="$RODIR" \
+        bash "$RALPH_HOOK" 2>/dev/null)
+chmod 755 "$RODIR"
+ck "an undeletable loop state file still BLOCKS" "block" "$(decision "$out")"
+case "$out" in *"could not delete the loop state file"*) r=named ;; *) r="$out" ;; esac
+ck "  ...and says so, naming the file" "named" "$r"
+rm -f "$SD/$RSID.arm" "$SD/$RSID.blocks" "$RODIR/$RSID.md"
+
+# The ownership skip under HANDOVER=1 was exercised by NOTHING: every handover
+# case deletes the state file before calling the gate, so deleting
+# `not HANDOVER and` from the gate left the whole suite green. It is load-bearing
+# exactly when the unlink above fails.
+HSID="handover-owned-$RANDOM"
+printf '%s\n' "$BREPO" > "$SD/$HSID.arm"
+printf -- '---\nactive: true\niteration: 2\nmax_iterations: 25\n---\np\n' \
+  > "$CLAUDE_RALPH_STATE_DIR/$HSID.md"
+out=$(gate_run "$HSID")
+ck "the gate yields to a live loop" "" "$(decision "$out")"
+out=$(gate_run "$HSID" CLAUDE_DOD_HANDOVER=1)
+ck "  ...but the handover checks anyway, state file or not" "block" "$(decision "$out")"
+rm -f "$CLAUDE_RALPH_STATE_DIR/$HSID.md" "$SD/$HSID.arm" "$SD/$HSID.blocks"
+
+# The state resolver is sourced. Unguarded, a checkout that lost the file killed
+# ralph before any handler, every turn, and the orphaned state file then stood
+# the gate down forever.
+NORES_HOME="$SD/nores"
+mkdir -p "$NORES_HOME/.claude/hooks" "$NORES_HOME/.claude/scripts"
+cp "$HOME/.claude/hooks/finishing-up-gate.py" "$NORES_HOME/.claude/hooks/"
+NSID="nores-$RANDOM"
+printf -- '---\nactive: true\niteration: 25\nmax_iterations: 25\n---\np\n' \
+  > "$CLAUDE_RALPH_STATE_DIR/$NSID.md"
+printf '%s\n' "$BREPO" > "$SD/$NSID.arm"
+out=$(printf '{"session_id":"%s","transcript_path":"%s"}' "$NSID" "$MT" \
+      | CLAUDE_DOD_STATE_DIR="$SD" HOME="$NORES_HOME" bash "$RALPH_HOOK" 2>/dev/null)
+ck "a missing state resolver does not kill the hook" "block" "$(decision "$out")"
+ck "  ...and the loop still ended" "gone" \
+   "$([ -e "$CLAUDE_RALPH_STATE_DIR/$NSID.md" ] && echo kept || echo gone)"
+rm -f "$SD/$NSID.arm" "$SD/$NSID.blocks"
+
+echo
 echo "== $pass passed, $fail failed =="
 [ "$fail" -eq 0 ]
