@@ -79,7 +79,7 @@ RALPH_STATE_FILE="$STATE_DIR/$HOOK_SESSION.md"
 
 extract_tag() {  # $1 = tag name; reads $LAST_OUTPUT, prints the claimed text
   printf '%s' "$LAST_OUTPUT" | TAG="$1" perl -ne '
-    BEGIN { $tag = $ENV{TAG}; $fence = ""; @hit = (); }
+    BEGIN { $tag = $ENV{TAG}; $fence = ""; @hit = (); $open = 0; $buf = ""; }
     # Track WHICH fence character opened the block: only the same character
     # closes it. Treating ``` and ~~~ as one state meant a ``` fence displayed
     # INSIDE a ~~~ fence flipped the state to closed, and the demo tag on the
@@ -88,13 +88,33 @@ extract_tag() {  # $1 = tag name; reads $LAST_OUTPUT, prints the claimed text
       my $mark = $1;
       if ($fence eq "")       { $fence = $mark; }
       elsif ($fence eq $mark) { $fence = "";    }
+      # A fence line inside an open tag: whatever that is, it is not one claim.
+      $open = 0; $buf = "";
       next;
     }
     next if $fence ne "";
+    # A tag whose TEXT WRAPPES over several lines is still a tag that opens a
+    # line and closes one. Round 3 of the review loop replaced a `perl -0777`
+    # slurp with this line-at-a-time matcher to get fence tracking, and took
+    # multi-line claims out with the fenced ones: the promise string is injected
+    # into the systemMessage every iteration, so a long one comes back wrapped
+    # as a matter of course, and the loop could then only ever end at
+    # max_iterations. Collect across lines instead, keeping every property
+    # own-line anchoring bought — the OPEN tag must start its line, the CLOSE
+    # tag must end one, and a fence in between abandons the claim.
+    if ($open) {
+      if (/^(.*?)<\/\Q$tag\E>[ \t\r]*$/) { push @hit, $buf . $1; $open = 0; $buf = ""; }
+      else { $buf .= $_; }
+      next;
+    }
     # Up to three leading spaces: four or more is a markdown code block, which
     # is a demonstration of the tag rather than an assertion of it. \r is
     # allowed at the end so CRLF transcripts can still exit the loop at all.
-    if (/^[ ]{0,3}<\Q$tag\E>(.*?)<\/\Q$tag\E>[ \t\r]*$/) { push @hit, $1; }
+    if (/^[ ]{0,3}<\Q$tag\E>(.*?)<\/\Q$tag\E>[ \t\r]*$/) { push @hit, $1; next; }
+    # Opened but not closed on this line: start collecting. An open that never
+    # closes simply never becomes a hit, so an unterminated tag still cannot end
+    # the loop.
+    if (/^[ ]{0,3}<\Q$tag\E>(.*)$/) { $open = 1; $buf = $1 . "\n"; }
     END { if (@hit) { $t = $hit[-1]; $t =~ s/^\s+|\s+$//g; $t =~ s/\s+/ /g; print $t; } }
   ' 2>/dev/null || true
 }

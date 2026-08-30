@@ -468,7 +468,20 @@ def main():
                              "handover; checking anyway"})
 
     try:
-        repos = [r for r in armfile.read_text().splitlines() if r.strip()]
+        # A SET of repositories, order preserved — not a tally of edits. The arm
+        # hook appends after a check-then-append with no lock, and SUBAGENTS
+        # SHARE THE PARENT'S session_id, so one repo can legitimately arrive
+        # twice; measuring it twice spends the budget the tail of the list
+        # needs. finishing-up-arm.sh now locks the armfile, which closes the
+        # race at its source — this is the belt, and it also covers an armfile
+        # hand-edited, concatenated or restored from a backup.
+        seen = set()
+        repos = []
+        for line in armfile.read_text().splitlines():
+            line = line.strip()
+            if line and line not in seen:
+                seen.add(line)
+                repos.append(line)
     except (OSError, ValueError) as exc:
         # ValueError covers UnicodeDecodeError: a corrupt or non-UTF8 armfile
         # raised straight past the OSError-only guard and crashed the hook,
@@ -488,6 +501,17 @@ def main():
               f"not treat that as finished: run `python3 {DOD} --repo <repo>` "
               f"for the repositories you touched and report what it says.",
               session, why=f"armfile unreadable, NOTHING WAS CHECKED: {exc}")
+
+    # Spend the budget in a ROTATED order. Fixed armfile order starves the
+    # same tail every turn: with a slow first repository, the last one is
+    # reported NOT MEASURED turn after turn and has no path to ever being read —
+    # the block text tells the agent to re-run it by hand, which is the closing
+    # ceremony this system exists to remove. `blocks` counts the turns that has
+    # already happened for, so it is exactly the offset that gives every
+    # repository its turn at the front.
+    if repos:
+        start = blocks % len(repos)
+        repos = repos[start:] + repos[:start]
 
     problems = []
     # One budget for the whole hook, not one per repo. The repo that the budget
