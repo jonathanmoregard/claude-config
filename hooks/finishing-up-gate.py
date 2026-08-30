@@ -688,8 +688,16 @@ def main():
         # most one block slot rather than the whole gate.
         try:
             countfile.unlink(missing_ok=True)
-        except OSError:
-            pass
+        except OSError as exc:
+            # Not swallowed. A budget that cannot be reset means the NEXT block
+            # in this session starts from a stale count and the stand-down
+            # arrives early — quietly, on a session that had just passed clean.
+            # Small, but this whole file exists because "could not" and "did
+            # not" must not print the same way.
+            log(session, {"action": "warn",
+                          "why": f"clean pass, but the block budget could not be "
+                                 f"reset ({exc}); the next block in this session "
+                                 "starts from a stale count"})
         if unmeasured:
             # The work is done as far as anything could tell — but something was
             # NOT established, and until now that fact reached only gate.log, a
