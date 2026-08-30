@@ -81,12 +81,35 @@ mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
 armfile="$STATE_DIR/$session.arm"
 
 # One line per repo, de-duplicated. A session may legitimately touch several.
-if [ -f "$armfile" ] && grep -qxF "$root" "$armfile" 2>/dev/null; then
-  # Touch it. The gate's reaper is age-based, and a long session editing ONE
-  # repo would otherwise carry an armfile whose mtime froze at the first edit —
-  # reapable mid-work, which costs an unguarded turn until the next new repo.
-  touch "$armfile" 2>/dev/null || true
-  exit 0
-fi
-printf '%s\n' "$root" >> "$armfile"
+#
+# Check-then-append is a RACE, and this hook is somewhere it actually fires:
+# SUBAGENTS SHARE THE PARENT'S session_id (see above), so two PostToolUse hooks
+# run concurrently against one armfile, both miss the grep, and both append. The
+# gate then spends its single wall-clock budget measuring one repository twice,
+# and the repository at the end of the list is the one reported NOT MEASURED.
+#
+# flock makes the check and the append one operation. It is taken on the armfile
+# itself rather than a sidecar .lock, so the gate's reaper — which only knows
+# *.arm and *.blocks — has nothing new to leak. Where flock is missing the old
+# unserialised path is taken, and the gate de-duplicates what it reads: this is
+# defence at the source, not the only defence.
+#
+# The redirection is on the SUBSHELL, never on `exec`: a failed `exec`
+# redirection exits a non-interactive shell outright, which would turn an
+# unwritable state dir into a hook that reports failure to the user.
+(
+  if command -v flock >/dev/null 2>&1; then
+    # -w so a stuck holder can never hang a tool call; timing out just falls
+    # through to the unserialised path, which is where this started.
+    flock -w 5 9 2>/dev/null || true
+  fi
+  if grep -qxF "$root" "$armfile" 2>/dev/null; then
+    # Touch it. The gate's reaper is age-based, and a long session editing ONE
+    # repo would otherwise carry an armfile whose mtime froze at the first edit —
+    # reapable mid-work, which costs an unguarded turn until the next new repo.
+    touch "$armfile" 2>/dev/null || true
+  else
+    printf '%s\n' "$root" >&9
+  fi
+) 9>>"$armfile" 2>/dev/null
 exit 0

@@ -130,7 +130,17 @@ def collect_repo(cwd):
     # measured under a shorter ladder rather than waved through.
     on_default = branch == base
 
-    dirty = bool(git(["status", "--porcelain"], root)[1])
+    # Read the EXIT CODE, not just stdout. `run()` returns ('', err) with 124 on
+    # timeout and 127 when git cannot be spawned at all, and git itself exits 128
+    # on an unreadable index — every one of which used to render as an empty
+    # porcelain listing, i.e. a clean tree. Reproduced with the index at mode
+    # 000: `git status --porcelain` exits 128 with nothing on stdout while
+    # rev-parse and rev-list still answer, so a tree full of uncommitted work
+    # reported DONE. None means "not established", which is never "clean".
+    code, status_out, status_err = git(["status", "--porcelain"], root)
+    dirty = bool(status_out) if code == 0 else None
+    dirty_error = None if code == 0 else (
+        (status_err or f"git status exited {code}").splitlines()[0][:120])
 
     # Refresh the remote-tracking refs first. "Behind origin" and "commits the
     # merge left behind" are both measured against origin/<base>, and a stale
@@ -181,6 +191,7 @@ def collect_repo(cwd):
         "default_branch": base,
         "on_default": on_default,
         "dirty": dirty,
+        "dirty_error": dirty_error,
         "has_upstream": has_upstream,
         "unpushed": unpushed,
         "ahead_of_default": ahead_of_default,
@@ -448,6 +459,7 @@ def collect_checks(root):
                 "pending": 0,
                 "skipping": 0,
                 "failing": [],
+                "unrecognised": [],
             }, None
         return None, f"gh pr checks failed: {err[:200]}"
 
@@ -458,9 +470,19 @@ def collect_checks(root):
 
     tally = {"pass": 0, "fail": 0, "pending": 0, "skipping": 0, "cancel": 0}
     failing = []
+    # A bucket outside the five gh documents counted toward `total` and toward
+    # nothing else: not fail, not pending, so the caller's all-clear branch fired
+    # over a check whose state was never read. gh has added bucket values before,
+    # and an empty `bucket` is what a partially-populated row gives. Unknown is
+    # tracked by name so it can be reported rather than absorbed.
+    unrecognised = []
     for row in rows:
         bucket = (row.get("bucket") or "").lower()
         tally[bucket] = tally.get(bucket, 0) + 1
+        if bucket not in ("pass", "fail", "pending", "skipping", "cancel"):
+            unrecognised.append(
+                f"{row.get('name') or row.get('workflow') or '?'}"
+                f"={bucket or '(empty)'}")
         if bucket in ("fail", "cancel"):
             failing.append(
                 {
@@ -477,6 +499,7 @@ def collect_checks(root):
         "pending": tally.get("pending", 0),
         "skipping": tally.get("skipping", 0),
         "failing": failing,
+        "unrecognised": unrecognised,
     }, None
 
 
@@ -484,7 +507,10 @@ GRAPHQL_THREADS = """
 query($owner:String!, $repo:String!, $num:Int!) {
   repository(owner:$owner, name:$repo) {
     pullRequest(number:$num) {
-      reviewThreads(first:100) { nodes { isResolved isOutdated } }
+      reviewThreads(first:100) {
+        nodes { isResolved isOutdated }
+        pageInfo { hasNextPage }
+      }
     }
   }
 }
@@ -519,14 +545,30 @@ def unresolved_threads(root, number):
     if code != 0:
         return None, f"review-thread query failed: {err[:120]}"
     try:
-        nodes = (json.loads(out)["data"]["repository"]["pullRequest"]
-                 ["reviewThreads"]["nodes"])
+        conn = (json.loads(out)["data"]["repository"]["pullRequest"]
+                ["reviewThreads"])
+        nodes = conn["nodes"]
     except (ValueError, KeyError, TypeError):
         return None, "review-thread query returned an unexpected shape"
 
     # An outdated thread hangs off a superseded diff; it does not gate a merge.
-    return sum(1 for t in nodes
-               if not t.get("isResolved") and not t.get("isOutdated")), None
+    unresolved = sum(1 for t in nodes
+                     if not t.get("isResolved") and not t.get("isOutdated"))
+
+    # `first:100` is a PAGE, not the set. Threads past the hundredth simply did
+    # not exist as far as this function was concerned, so a truncated page of
+    # resolved threads printed as a clean sheet — the same "could not look"
+    # rendered as "looked and found nothing" that the error path above refuses.
+    # A non-zero count still blocks (the number is then a floor, and the blocker
+    # says the same thing either way); only a zero has to be disowned.
+    try:
+        truncated = bool((conn.get("pageInfo") or {}).get("hasNextPage"))
+    except AttributeError:
+        truncated = False
+    if truncated and not unresolved:
+        return None, ("this PR has more than 100 review threads and only the "
+                      "first 100 were read; unresolved threads were NOT counted")
+    return unresolved, None
 
 
 # ------------------------------------------------------------------ evaluate
@@ -565,10 +607,22 @@ def evaluate(cwd, do_integrity=True):
 
     b = Blockers()
 
-    if repo["dirty"]:
+    if repo["dirty"] is None:
+        b.add("TREE_UNKNOWN",
+              "could not read the working tree state "
+              f"({repo.get('dirty_error') or 'git status failed'}), so "
+              "uncommitted work has NOT been ruled out",
+              "fix whatever stopped `git status` from running and re-check — "
+              "an unreadable tree is not a clean one")
+    elif repo["dirty"]:
         b.add("DIRTY_TREE", "uncommitted changes in the working tree",
               "commit or stash them")
 
+    # Both ladders treat an UNCOUNTABLE commit gap the same way, which they did
+    # not: `None` from a failed rev-list is falsy, so the feature-branch arm
+    # below fell through to no blocker at all while the default-branch arm above
+    # raised one on the identical value. Same failure, opposite verdicts,
+    # decided by which branch the repo happened to be on.
     if repo["on_default"]:
         # Measured against origin/<base>, not @{u} — see collect_repo.
         if repo["ahead_of_default"]:
@@ -577,13 +631,21 @@ def evaluate(cwd, do_integrity=True):
                   f"{repo['branch']} not pushed to origin",
                   f"git push origin {repo['branch']}")
         elif repo["ahead_of_default"] is None:
-            b.add("NOT_PUSHED",
-                  f"could not compare against origin/{repo['default_branch']} "
-                  "— is the branch pushed at all?",
-                  f"git push -u origin {repo['branch']}")
+            b.add("UNPUSHED_UNKNOWN",
+                  f"could not count commits against origin/"
+                  f"{repo['default_branch']} — whether this branch is pushed "
+                  "was NOT established",
+                  f"check the remote-tracking refs, then re-run; "
+                  f"`git push -u origin {repo['branch']}` if it never landed")
     elif not repo["has_upstream"]:
         b.add("NOT_PUSHED", "branch has no upstream — never pushed",
               f"git push -u origin {repo['branch']}")
+    elif repo["unpushed"] is None:
+        b.add("UNPUSHED_UNKNOWN",
+              "could not count commits against the upstream ref, so unpushed "
+              "work has NOT been ruled out",
+              "check the remote-tracking refs (`git fetch origin`), then "
+              "re-run — an uncountable gap is not an empty one")
     elif repo["unpushed"]:
         b.add("UNPUSHED_COMMITS", f"{repo['unpushed']} commit(s) not pushed",
               "git push")
@@ -758,6 +820,17 @@ def evaluate(cwd, do_integrity=True):
                       "find out why none ran — a deleted, disabled or "
                       "un-triggered workflow is green-by-vandalism")
         else:
+            unknown = checks.get("unrecognised") or []
+            if unknown:
+                # Counted in `total`, tallied as neither fail nor pending — so
+                # without this the row fell through to the all-clear branch and
+                # a check nobody read contributed to DONE.
+                b.add("CHECKS_UNRECOGNISED",
+                      f"{len(unknown)} check(s) reported a state this tool does "
+                      f"not recognise ({', '.join(unknown[:5])}); they were "
+                      "counted as neither passing nor pending",
+                      "look at them on the PR — an unread check is not a green "
+                      "one. If gh has grown a new bucket, teach dod-check it.")
             if checks["fail"]:
                 names = ", ".join(c["name"] for c in checks["failing"][:5])
                 b.add("CHECKS_FAILING",
@@ -845,8 +918,24 @@ def render(result):
     return "\n".join(lines)
 
 
+class _Parser(argparse.ArgumentParser):
+    """argparse exits 2 on a usage error, and 2 is this tool's n/a code.
+
+    A mistyped flag therefore told every caller "the definition of done does not
+    apply to this repository" — the Stop gate reads exit 2 as nothing to check
+    here and ends the turn. Usage errors are a failure to measure, so they exit
+    3 like every other one. `--help` and `--version` still exit 0; argparse
+    raises those through SystemExit directly, not through error().
+    """
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        print(f"{self.prog}: error: {message}", file=sys.stderr)
+        raise SystemExit(3)
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Is this branch's work done?")
+    ap = _Parser(description="Is this branch's work done?")
     ap.add_argument("--repo", default=os.getcwd(), help="repo path (default: cwd)")
     ap.add_argument("--json", action="store_true", help="emit JSON")
     ap.add_argument("--quiet", action="store_true", help="exit code only")

@@ -25,7 +25,11 @@
 set -uo pipefail
 
 SD=$(mktemp -d)
-trap 'rm -rf "$SD"' EXIT  # arftl-allow: destructive-shell — $SD is this run's own mktemp -d
+# finishing-up-arm.sh refuses to arm anything under /tmp — scratch dirs are not
+# deliverables — so the arm-hook cases need a repo OUTSIDE $SD, which mktemp
+# puts there. Same lifetime, same trap.
+ARMWORK=$(mktemp -d -p "$HOME" .dod-armtest.XXXXXX)
+trap 'rm -rf "$SD" "$ARMWORK"' EXIT  # arftl-allow: destructive-shell — both are this run's own mktemp -d
 export CLAUDE_RALPH_STATE_DIR="$SD/ralph"
 mkdir -p "$CLAUDE_RALPH_STATE_DIR"
 GATE="$HOME/.claude/hooks/finishing-up-gate.py"
@@ -229,6 +233,20 @@ ck "a QUOTED halt does not exit"        kept \
 ck "discuss-then-claim still exits"     gone \
    "$(probe 'The rule says emit <promise>ALL DONE</promise> only when true. It is.
 <promise>ALL DONE</promise>')"
+# Own-line anchoring is about the tag not being INSIDE A SENTENCE. A promise
+# whose text wraps is still a tag that opens a line and closes one — and the
+# promise string is injected into the systemMessage every iteration, so a long
+# one comes back wrapped as a matter of course. Round 3 of this run replaced a
+# `perl -0777` slurp with a line-at-a-time matcher and took multi-line claims
+# out with the fenced ones; the only test that covered it lives outside these
+# three suites, so nothing here noticed for three rounds.
+ck "a promise wrapped over two lines still exits" gone "$(probe '<promise>ALL
+DONE</promise>')"
+# ...and the sentence case still must not. The closing tag does not end its
+# line, so this is prose about the tag, not a claim.
+ck "a wrapped tag inside prose does not exit" kept "$(probe 'I could write
+<promise>ALL
+DONE</promise> here but it would not be true.')"
 
 if [ -s "$CLAUDE_RALPH_STATE_DIR/halts.log" ]; then
   ck "the halt reason is recorded" "yes" \
@@ -533,7 +551,13 @@ SLOWDOD="$SD/slow-dod.py"
 printf 'import time, json\ntime.sleep(30)\nprint(json.dumps({"done": False, "applicable": True, "blockers": []}))\n' \
   > "$SLOWDOD"
 TSID="budgetcap-$RANDOM"
-printf '%s\n%s\n' "$BREPO" "$BREPO" > "$SD/$TSID.arm"
+# Two DISTINCT repositories. This used to list $BREPO twice, which stopped being
+# two entries the moment the gate started reading its armfile as a set — the
+# case then measured one repo, timed out on it, and never reached the
+# NOT MEASURED path it exists to assert. The stub ignores the path it is handed,
+# so the second one only has to be a different string.
+TSID_SECOND="$SD/never-reached-repo"
+printf '%s\n%s\n' "$BREPO" "$TSID_SECOND" > "$SD/$TSID.arm"
 t0=$(date +%s)
 out=$(gate_run "$TSID" CLAUDE_DOD_CHECK="$SLOWDOD" CLAUDE_DOD_TOTAL_BUDGET=5)
 t1=$(date +%s)
@@ -686,6 +710,104 @@ rm -f "$CLAUDE_RALPH_STATE_DIR/$JSID.md"
 out=$(printf '{"session_id":"%s","transcript_path":"%s"}' "$JSID" "$MT" \
       | PATH="$NOJQ" CLAUDE_DOD_STATE_DIR="$SD" bash "$RALPH_HOOK" 2>/dev/null)
 ck "  ...and is quiet when no loop is armed anywhere" "" "$(decision "$out")"
+
+echo
+echo "== the armfile is a SET of repositories, not a tally of edits =="
+# Two things conspire here. finishing-up-arm.sh does check-then-append with no
+# lock, and SUBAGENTS SHARE THE PARENT'S session_id — so two PostToolUse hooks
+# run concurrently for one session, both miss the grep, and both append. The
+# gate then spends its one budget measuring the same repository twice, which on
+# a slow network is exactly how the last repo in the list goes unmeasured.
+DUPSID="dupes-$RANDOM"
+printf '%s\n%s\n%s\n' "$BREPO" "$BREPO" "$BREPO" > "$SD/$DUPSID.arm"
+DUPCALLS="$SD/dup-calls.txt"; : > "$DUPCALLS"
+DUPDOD="$SD/counting-dod.py"
+cat > "$DUPDOD" <<PY
+import sys, json
+open("$DUPCALLS", "a").write(sys.argv[2] + "\n")
+print(json.dumps({"done": True, "applicable": True, "blockers": []}))
+PY
+out=$(gate_run "$DUPSID" CLAUDE_DOD_CHECK="$DUPDOD")
+ck "a repo listed three times is measured once" "1" "$(wc -l < "$DUPCALLS")"
+ck "  ...and the turn still ends cleanly" "0" "$GATE_RC"
+rm -f "$SD/$DUPSID.arm" "$SD/$DUPSID.blocks"
+
+# ...and the arm hook must not create the duplicates in the first place.
+ARMHOOK="$HOME/.claude/hooks/finishing-up-arm.sh"
+( cd "$ARMWORK" || exit 1
+  git init -q -b master .; git config user.email t@t; git config user.name t
+  echo hi > a.txt; git add -A; git commit -qm init
+  git init -q --bare "$SD/armtest-origin.git"; git remote add origin "$SD/armtest-origin.git"
+  git push -q -u origin master
+  git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/master ) >/dev/null 2>&1
+# Firing twenty of them at once does NOT reproduce this — measured, they
+# serialise on their own git and jq calls and the file comes out with one line
+# either way. A test that green either way asserts nothing, so this drives the
+# race directly: hold the armfile's lock, and assert the hook has not appended
+# while somebody else holds it. That IS the mutual exclusion the concurrent case
+# needs and cannot demonstrate.
+ASID="armrace-$RANDOM"
+: > "$SD/$ASID.arm"
+flock "$SD/$ASID.arm" sleep 4 &
+LOCKPID=$!
+sleep 0.3
+printf '{"session_id":"%s","tool_input":{"file_path":"%s/a.txt"}}' "$ASID" "$ARMWORK" \
+  | CLAUDE_DOD_STATE_DIR="$SD" bash "$ARMHOOK" >/dev/null 2>&1 &
+ARMPID=$!
+sleep 2   # ~10x the hook's own jq+git cost, well inside the 4s the lock is held
+ck "arming waits while another writer holds the armfile" "0" \
+   "$(wc -l < "$SD/$ASID.arm")"
+wait "$LOCKPID" "$ARMPID" 2>/dev/null
+ck "  ...and records the repo once the lock is released" "1" \
+   "$(wc -l < "$SD/$ASID.arm")"
+rm -f "$SD/$ASID.arm"
+
+echo
+echo "== the budget does not starve the same repository every turn =="
+# The budget is spent in armfile order, so a slow first repository starves the
+# same tail on every turn of a session — and the repo that is never reached is
+# the one reported NOT MEASURED, turn after turn, with no path to being read.
+# The block counter already says how many turns this has happened for, so the
+# start index rotates by it.
+ROTSID="rotate-$RANDOM"
+ROTSEEN="$SD/rot-seen.txt"; : > "$ROTSEEN"
+ROTDOD="$SD/slow-record-dod.py"
+cat > "$ROTDOD" <<PY
+import sys, time, json
+open("$ROTSEEN", "a").write(sys.argv[2] + "\n")
+time.sleep(4)
+print(json.dumps({"done": True, "applicable": True, "blockers": []}))
+PY
+printf '%s\n%s\n%s\n' "$SD/r1" "$SD/r2" "$SD/r3" > "$SD/$ROTSID.arm"
+echo 1 > "$SD/$ROTSID.blocks"
+out=$(gate_run "$ROTSID" CLAUDE_DOD_CHECK="$ROTDOD" CLAUDE_DOD_TOTAL_BUDGET=5)
+ck "after one spent budget the next turn starts at the second repo" \
+   "$SD/r2" "$(head -n1 "$ROTSEEN")"
+ck "  ...and the unreached repos still BLOCK" "block" "$(decision "$out")"
+rm -f "$SD/$ROTSID.arm" "$SD/$ROTSID.blocks"
+
+echo
+echo "== a loop is found however its directory is spelled =="
+# `armed_in:` is compared to the caller's cwd by exact string equality, so a
+# trailing slash or a symlinked spelling of the same directory misses — and a
+# miss means compact-reinject and idle-handoff conclude no loop is armed here.
+# ~/worktrees is exactly where symlinked spellings turn up.
+# shellcheck source=/dev/null
+. "$HOME/.claude/scripts/ralph-loop-state.sh"
+WTREAL="$SD/wt-real"; mkdir -p "$WTREAL"
+ln -sfn "$WTREAL" "$SD/wt-link"
+LSID2="spelling-$RANDOM"
+printf -- '---\nactive: true\niteration: 1\nmax_iterations: 25\narmed_in: "%s"\n---\np\n' \
+  "$WTREAL" > "$CLAUDE_RALPH_STATE_DIR/$LSID2.md"
+ck "the exact spelling finds it" "found" \
+   "$(ralph_state_for_dir "$WTREAL" >/dev/null 2>&1 && echo found || echo missed)"
+ck "a trailing slash finds it too" "found" \
+   "$(ralph_state_for_dir "$WTREAL/" >/dev/null 2>&1 && echo found || echo missed)"
+ck "and so does a symlinked spelling" "found" \
+   "$(ralph_state_for_dir "$SD/wt-link" >/dev/null 2>&1 && echo found || echo missed)"
+ck "a genuinely different directory still misses" "missed" \
+   "$(ralph_state_for_dir "$SD/elsewhere" >/dev/null 2>&1 && echo found || echo missed)"
+rm -f "$CLAUDE_RALPH_STATE_DIR/$LSID2.md"
 
 echo
 echo "== $pass passed, $fail failed =="

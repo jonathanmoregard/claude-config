@@ -235,6 +235,56 @@ case_run "  ...and the unpushed half of the ladder"           nongithub 1 "NOT_P
 fresh_repo; git push -q -u origin feat/x
 case_run "non-GitHub remote with nothing to report is n/a" nongithub 2 "n/a"
 
+# ---- a measurement that FAILED is not a measurement that came back clean ---
+# Same defect shape as the exit-2 case above, one layer down: git and gh both
+# report failure in the exit code, and every place that reads only stdout turns
+# "could not look" into "looked, found nothing".
+
+# `dirty` was `bool(git(["status","--porcelain"], root)[1])` — stdout only. A
+# git that cannot run returns ('', err) with rc 124 (timeout) or 127 (OSError),
+# and an unreadable index returns rc 128, so a tree full of uncommitted work
+# read as clean. Reproduced with the index at mode 000: `git status --porcelain`
+# exits 128 with empty stdout while rev-parse, rev-list and fetch all still work.
+fresh_repo; git push -q -u origin feat/x
+echo "uncommitted and invisible" >> src/a.py
+chmod 000 "$WORK/.git/index"
+case_run "an unreadable index is not a clean tree" green 1 "TREE_UNKNOWN"
+chmod 644 "$WORK/.git/index"
+
+# The same asymmetry on the two ladders: a failed `rev-list --count @{u}..HEAD`
+# yields unpushed=None, which is FALSY on the feature-branch path (no blocker at
+# all) while the identical None becomes a blocker on the default-branch path.
+# Reproduced by pointing the remote-tracking ref at an object that is not there:
+# `@{u}` still resolves by name, so has_upstream is true, and only the count
+# fails.
+fresh_repo; git push -q -u origin feat/x
+printf '%s\n' "0123456789012345678901234567890123456789" \
+  > "$WORK/.git/refs/remotes/origin/feat/x"
+case_run "an uncountable upstream is not silently pushed" green 1 "UNPUSHED_UNKNOWN"
+
+# An unrecognised check bucket counts toward `total` but is tallied as neither
+# fail nor pending, so it lands in the all-clear branch and an unmeasured check
+# contributes to DONE.
+fresh_repo; git push -q -u origin feat/x
+case_run "an unrecognised check bucket is not a pass" weirdbucket 1 "CHECKS_UNRECOGNISED"
+case_run "  ...and it names the bucket it did not know" weirdbucket 1 "neutral"
+
+# reviewThreads(first:100) is not paginated. Thread 101 onwards simply did not
+# exist as far as this tool was concerned, and a truncated page of resolved
+# threads printed as a clean sheet.
+fresh_repo; git push -q -u origin feat/x
+case_run "a truncated thread page is not a clean sheet" manythreads 0 "only the first 100"
+
+# argparse exits 2 on a usage error, and 2 is this tool's documented n/a code —
+# so a typo in the flag reads to every caller as "the definition of done does
+# not apply here".
+out="$(python3 "$DOD" --repo "$WORK" --bogus 2>&1)"; code=$?
+[ "$code" = 3 ] && ok "a usage error is exit 3, not the n/a code" \
+  || bad "a usage error is exit 3, not the n/a code" "exit 3" "exit $code — $out"
+out="$(python3 "$DOD" --help 2>&1)"; code=$?
+[ "$code" = 0 ] && ok "  ...and --help is still exit 0" \
+  || bad "  ...and --help is still exit 0" "exit 0" "exit $code — $out"
+
 # ---- JSON contract --------------------------------------------------------
 fresh_repo; git push -q -u origin feat/x
 j="$(DOD_FIXTURE=pending python3 "$DOD" --repo "$WORK" --json 2>&1)"
