@@ -19,11 +19,17 @@ USAGE
 EXIT CODES
     0  done         every gate passed
     1  not done     blockers present (see .blockers)
-    2  n/a          not a git repo, on the default branch, or no remote
+    2  n/a          not a git repo, or no remote / no GitHub remote
     3  error        could not determine state (treated as NOT done by callers)
 
-Exit 3 matters: an unreachable API or a missing `gh` must never read as
-success. Callers treat 3 like 1.
+Exit 3 matters: an unreachable API, a missing `gh`, a missing `git`, or a usage
+error must never read as success. Callers treat 3 like 1. Exit 2 is the one code
+that means "stop looking", so nothing that FAILED may borrow it.
+
+JSON NOTE: `repo.dirty` is TRI-STATE — true (uncommitted work), false (clean),
+or null (`git status` could not be read, which raises TREE_UNKNOWN). A caller
+writing `if repo["dirty"]` gets "clean" for null; test the null explicitly.
+`repo.dirty_error` carries why, when there is a why.
 """
 
 from __future__ import annotations
@@ -86,6 +92,13 @@ class Blockers:
 # ------------------------------------------------------------------ git state
 
 
+# `collect_repo` answers "the DoD does not apply here" and "I could not find out"
+# through one string, and the two must not be confused: n/a is exit 2, which the
+# Stop gate reads as nothing to check. A reason carrying this prefix is the
+# second kind and becomes exit 3.
+GIT_UNAVAILABLE = "git could not run"
+
+
 def default_branch(cwd):
     """origin/HEAD, falling back to main/master. None if undeterminable."""
     code, out, _ = git(
@@ -106,7 +119,16 @@ def default_branch(cwd):
 
 def collect_repo(cwd):
     """Repo facts, or ('n/a', reason) when the DoD does not apply here."""
-    code, root, _ = git(["rev-parse", "--show-toplevel"], cwd, timeout=10)
+    code, root, err = git(["rev-parse", "--show-toplevel"], cwd, timeout=10)
+    # 124 and 127 do not come from git — they are `run()`'s own codes for "timed
+    # out" and "could not be spawned". Folding them into "not a git repository"
+    # made a MISSING git binary answer n/a, and n/a is the code the Stop gate
+    # reads as "nothing to check here": it skipped the repo, unlinked the
+    # armfile and ended the turn. Measured end to end — same gate, same repo,
+    # same real UNPUSHED_COMMITS blocker, and the only variable was whether git
+    # was on PATH.
+    if code in (124, 127):
+        return None, f"{GIT_UNAVAILABLE}: {(err or 'no detail').splitlines()[0][:120]}"
     if code != 0:
         return None, "not a git repository"
 
@@ -305,8 +327,18 @@ def ci_configured(root, base):
                 found.append((ref, path.strip()))
 
     if not found:
-        if unreadable and len(unreadable) == 2:
-            return None, "could not read either ref for workflow files"
+        # ANY unreadable ref means "could not confirm", not "no CI". Requiring
+        # BOTH to fail meant the ordinary case — HEAD readable with no
+        # workflows, origin/<base> missing — returned False, and False here is
+        # the answer that waves the branch through. Reproduced 2026-08-30 by
+        # renaming the base branch upstream while the local origin/HEAD symref
+        # still named the old one: `git fetch origin <base>` then fails, the
+        # remote-tracking ref stays absent, and a branch that had DELETED its
+        # only workflow reported DONE with no NO_CHECKS blocker. No tampering
+        # required — an upstream rename does it.
+        if unreadable:
+            return None, ("could not read %s for workflow files"
+                          % ", ".join(unreadable))
         return False, ""
 
     # A workflow file that only runs on a schedule or a manual dispatch produces
@@ -544,16 +576,20 @@ def unresolved_threads(root, number):
     )
     if code != 0:
         return None, f"review-thread query failed: {err[:120]}"
+    # The sum() belongs INSIDE the try. `nodes: null` and non-dict entries both
+    # pass the lookups above and then raise on iteration, and nothing here
+    # caught that: a designed soft-fail warning escalated into a whole-predicate
+    # crash caught only by main()'s blanket handler, which reports exit 3 with
+    # an empty blockers list.
     try:
         conn = (json.loads(out)["data"]["repository"]["pullRequest"]
                 ["reviewThreads"])
-        nodes = conn["nodes"]
-    except (ValueError, KeyError, TypeError):
+        # An outdated thread hangs off a superseded diff; it does not gate a
+        # merge.
+        unresolved = sum(1 for t in conn["nodes"]
+                         if not t.get("isResolved") and not t.get("isOutdated"))
+    except (ValueError, KeyError, TypeError, AttributeError):
         return None, "review-thread query returned an unexpected shape"
-
-    # An outdated thread hangs off a superseded diff; it does not gate a merge.
-    unresolved = sum(1 for t in nodes
-                     if not t.get("isResolved") and not t.get("isOutdated"))
 
     # `first:100` is a PAGE, not the set. Threads past the hundredth simply did
     # not exist as far as this function was concerned, so a truncated page of
@@ -598,6 +634,11 @@ def evaluate(cwd, do_integrity=True):
 
     repo, na_reason = collect_repo(cwd)
     if repo is None:
+        # "The DoD does not apply here" and "I could not find out" are different
+        # answers and get different exit codes. Only the first is n/a.
+        if na_reason and na_reason.startswith(GIT_UNAVAILABLE):
+            result["error"] = na_reason
+            return result, 3
         result.update(applicable=False, done=False, error=None)
         result["reason"] = na_reason
         return result, 2
@@ -650,27 +691,39 @@ def evaluate(cwd, do_integrity=True):
         b.add("UNPUSHED_COMMITS", f"{repo['unpushed']} commit(s) not pushed",
               "git push")
 
+    # A failed fetch is not a warning, it is a MISSING MEASUREMENT, and it is
+    # missing on BOTH ladders — which is where this used to sit wrong. It was
+    # scoped to the default branch on the reasoning that a feature branch's gh
+    # calls do their own measuring and fail loudly. They do, but they measure
+    # the PULL REQUEST; origin/<base> is what answers "behind", "commits the
+    # merge left behind", "does this repo have CI", and the integrity scan's
+    # merge-base. Measured 2026-08-30: with origin/<base> unreadable, a branch
+    # that had DELETED its only workflow reported DONE — ci_configured saw one
+    # unreadable ref, concluded "no CI in this repo", and the integrity scan
+    # skipped itself in the same breath. Three silent degradations, one cause,
+    # and on the feature-branch ladder none of them blocked.
+    #
+    # This does not newly hang offline sessions: offline, the gh calls below
+    # fail and exit 3 already blocks.
+    if repo.get("fetch_warning"):
+        b.add("REMOTE_UNVERIFIED",
+              f"could not reach origin/{repo['default_branch']}, so nothing "
+              "measured against it was established — 'behind', stranded "
+              "commits, whether this repo has CI, and the integrity scan all "
+              "read from that ref",
+              "fix connectivity and re-run — do not read the previous fetch's "
+              "refs as current")
+
     # ---- direct-push ladder -------------------------------------------------
     # On the default branch there is no PR to open and no review to wait for.
     # Done is: committed, pushed, and level with origin. Stopping here also
     # keeps the check honest — demanding a PR that cannot exist would make the
     # gate unsatisfiable on exactly the repos where pushing to main is normal.
     if repo["on_default"]:
-        # A failed fetch is not a warning here, it is a missing measurement.
-        # The terminal condition of this ladder IS "level with origin", and a
-        # stale remote-tracking ref answers that from memory. Measured: with a
-        # collaborator's commit on origin and the remote made unreachable, this
-        # reported DONE / exit 0 while genuinely behind — "green" and "green as
-        # far as I got" printing identically, which is the exact failure
-        # dod-check's own render() refuses to commit elsewhere. On a feature
-        # branch the gh calls do the measuring and fail loudly on their own, so
-        # this belongs to the direct-push ladder specifically.
-        if repo.get("fetch_warning"):
-            b.add("REMOTE_UNVERIFIED",
-                  "could not reach origin, so 'pushed and level with "
-                  f"{repo['default_branch']}' was never established",
-                  "fix connectivity and re-run — do not read the previous "
-                  "fetch's refs as current")
+        # REMOTE_UNVERIFIED is raised above, for both ladders. It was measured
+        # here first: with a collaborator's commit on origin and the remote made
+        # unreachable, this ladder reported DONE / exit 0 while genuinely
+        # behind — "green" and "green as far as I got" printing identically.
         if repo["behind"]:
             b.add("BEHIND_REMOTE",
                   f"{repo['behind']} commit(s) on origin/{repo['default_branch']} "
@@ -865,7 +918,19 @@ def render(result):
         return f"dod-check: n/a — {result.get('reason', 'unknown')}"
 
     lines = []
-    repo = result["repo"]
+    repo = result.get("repo")
+    if repo is None:
+        # An error raised BEFORE the repo could be read — `git` itself missing
+        # or hung. There is no branch name to head the report with, and reaching
+        # for one crashed the renderer, turning a clean exit 3 into a traceback
+        # and exit 1. Applicable is true here on purpose: the DoD does apply,
+        # we just could not measure it.
+        first = (result.get("error") or "unknown").splitlines()[0]
+        return ("dod-check: COULD NOT MEASURE\n"
+                f"  {first}\n"
+                "  NOTHING about this repository was read — not the branch, not "
+                "the tree, not the remote. This is not a green result; fix the "
+                "tooling first.")
     head = f"{repo['branch']} → {repo['default_branch']}"
     pr = result.get("pr")
     if pr:
