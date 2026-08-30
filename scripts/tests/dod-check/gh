@@ -48,6 +48,14 @@ if [ "$sub" = "api graphql" ]; then
 fi
 
 case "$DOD_FIXTURE" in
+  nongithub)
+    # The real CLI rejects a non-GitHub remote locally, with no network call.
+    # Verbatim from `gh pr view` against a gitlab.com remote, 2026-08-30.
+    if [ "$sub" = "pr view" ]; then
+      echo "none of the git remotes configured for this repository point to a known GitHub host." >&2
+      exit 1
+    fi
+    ;;
   no_pr)
     [ "$sub" = "pr view" ] && { echo "no pull requests found for branch" >&2; exit 1; }
     ;;
