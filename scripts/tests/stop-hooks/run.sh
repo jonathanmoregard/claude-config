@@ -53,13 +53,30 @@ except Exception: print("")' 2>/dev/null; }
 # the guarded path throwing — the suite would have stayed green over a hook that
 # never ran. `gate_run` captures the exit code too, so an allow must be a
 # deliberate exit 0 and not a traceback.
-GATE_RC=0
+# THE EXIT CODE TRAVELS THROUGH THE FILESYSTEM, NOT THROUGH A VARIABLE.
+#
+# `GATE_RC=$?` inside this helper was correct-looking and useless: every call
+# site is `out=$(gate_run ...)`, a command substitution, which runs in a
+# SUBSHELL. The assignment died with it and the parent kept its initial 0, so
+# every "exiting 0, not by crashing" assertion passed unconditionally. Measured
+# 2026-08-30 by pointing the gate at a stub that raises: 26 assertions went red
+# and all 7 rc assertions stayed green — including two sitting directly beneath
+# a FAILING sibling on the same call.
+#
+# That is the exact blindness the comment below describes and this helper was
+# written to remove; the helper was born with it (round 3), and round 6's fix
+# for it reproduced it one helper along. A variable cannot cross a subshell
+# boundary, so the rc goes somewhere that can: a file the parent reads back.
+RCFILE="$SD/.last-gate-rc"
+printf '0' > "$RCFILE"
+gate_rc() { cat "$RCFILE" 2>/dev/null || printf 'no-rc-recorded'; }
 gate_run() {  # $1 = session id; extra args are env assignments -> prints stdout
   local sid="$1"; shift
-  local out
+  local out rc
   out=$(printf '{"session_id":"%s"}' "$sid" \
         | env CLAUDE_DOD_STATE_DIR="$SD" "$@" python3 "$GATE" 2>/dev/null)
-  GATE_RC=$?
+  rc=$?
+  printf '%s' "$rc" > "$RCFILE"
   printf '%s' "$out"
 }
 
@@ -86,7 +103,7 @@ printf -- '---\nactive: true\niteration: 3\nmax_iterations: 25\n---\nprompt\n' \
   > "$CLAUDE_RALPH_STATE_DIR/$SID.md"
 out=$(gate_run "$SID")
 ck "yields to an armed ralph loop" "" "$out"
-ck "  ...by exiting 0, not by crashing" "0" "$GATE_RC"
+ck "  ...by exiting 0, not by crashing" "0" "$(gate_rc)"
 rm -f "$CLAUDE_RALPH_STATE_DIR/$SID.md"
 
 # Proof the assertion above can actually fail: a hook that throws produces the
@@ -274,7 +291,7 @@ PY
 # The concurrent gate wins the race, as it does in practice.
 out=$(gate_run "$RSID")
 ck "concurrent gate stands down for the live loop" "" "$(decision "$out")"
-ck "  ...by exiting 0, not by crashing" "0" "$GATE_RC"
+ck "  ...by exiting 0, not by crashing" "0" "$(gate_rc)"
 printf '{"session_id":"%s","transcript_path":"%s"}' "$RSID" "$RT" \
   | CLAUDE_DOD_STATE_DIR="$SD" bash "$RALPH_HOOK" >/dev/null 2>&1
 ck "end_loop leaves no loop state behind" "gone" \
@@ -415,11 +432,11 @@ printf '%s\n' "$BREPO" > "$SD/$SHSID.arm"
 # empty — so the allow-assertion below was satisfiable by a crash. That is the
 # exact blindness this suite fixed in decision() a round earlier and then
 # reintroduced one helper along.
-SHAPE_RC=0
 shape_dec() {
-  local out
+  local out rc
   out=$(printf '%s' "$1" | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE" 2>/dev/null)
-  SHAPE_RC=$?
+  rc=$?
+  printf '%s' "$rc" > "$RCFILE"   # a variable would not survive $(shape_dec ...)
   decision "$out"
 }
 ck "a dict session_crons does NOT stand it down"   "block" \
@@ -430,7 +447,7 @@ ck "an empty list does NOT stand it down"          "block" \
    "$(shape_dec "$(printf '{"session_id":"%s","session_crons":[]}' "$SHSID")")"
 ck "a real non-empty list DOES"                    "" \
    "$(shape_dec "$(printf '{"session_id":"%s","background_tasks":[{"id":"t"}]}' "$SHSID")")"
-ck "  ...by exiting 0, not by crashing"            "0" "$SHAPE_RC"
+ck "  ...by exiting 0, not by crashing"            "0" "$(gate_rc)"
 ck "and the bad shape is named in the log"         "yes" \
    "$(grep -q 'unexpected shape' "$SD/gate.log" && echo yes || echo no)"
 rm -f "$SD/$SHSID.arm" "$SD/$SHSID.blocks"
@@ -454,8 +471,11 @@ ck "the reaping session keeps its own"   "kept" "$([ -e "$SD/$SID.arm" ] && echo
 ck "gate.log is never reaped"            "kept" "$([ -e "$SD/gate.log" ] && echo kept || echo gone)"
 ck "the reap is recorded"                "yes"  "$(grep -q '"action": "reap"' "$SD/gate.log" && echo yes || echo no)"
 # The audit trail must only ever grow.
+# -gt, not -ge: the preceding gate run always logs, so an unchanged file means
+# the log was NOT appended to. `-ge` was satisfied by a no-op and could only
+# ever have caught an outright truncation.
 ck "gate.log was appended, not rewritten" "yes" \
-   "$([ "$(wc -c < "$SD/gate.log")" -ge "$LOGSIZE_BEFORE" ] && echo yes || echo no)"
+   "$([ "$(wc -c < "$SD/gate.log")" -gt "$LOGSIZE_BEFORE" ] && echo yes || echo no)"
 
 # Disabling it is one env var, and an unarmed session must never scan at all.
 touch -d "@$OLD" "$SD/deadsession2.arm"
@@ -516,17 +536,20 @@ printf -- '---\nactive: true\niteration: 2\nmax_iterations: 25\n---\np\n' \
   > "$CLAUDE_RALPH_STATE_DIR/$OSID.md"
 out=$(gate_run "$OSID")
 ck "stands down while the loop owns the session" "" "$(decision "$out")"
-ck "  ...by exiting 0, not by crashing" "0" "$GATE_RC"
+ck "  ...by exiting 0, not by crashing" "0" "$(gate_rc)"
 rm -f "$CLAUDE_RALPH_STATE_DIR/$OSID.md"
 out=$(gate_run "$OSID")
 ck "the turn after the loop ends is still gated" "block" "$(decision "$out")"
-ck "  ...and that is a real block, not a crash" "0" "$GATE_RC"
+ck "  ...and that is a real block, not a crash" "0" "$(gate_rc)"
 rm -f "$SD/$OSID.arm" "$SD/$OSID.blocks"
 
 # No marker file is created by anything, ever. This is the regression guard for
 # the whole deleted mechanism: if a marker reappears, this fails.
+# BOTH state directories. Searching only the ralph one left the dod state dir —
+# where the gate itself would write — outside the regression guard, so a marker
+# reappearing on the gate's side would have passed it.
 ck "no .handover file exists anywhere" "none" \
-   "$([ -z "$(find "$CLAUDE_RALPH_STATE_DIR" -name '*.handover' -print -quit 2>/dev/null)" ] && echo none || echo FOUND)"
+   "$([ -z "$(find "$CLAUDE_RALPH_STATE_DIR" "$SD" -name '*.handover' -print -quit 2>/dev/null)" ] && echo none || echo FOUND)"
 
 case "$HOUT" in *UNPUSHED_COMMITS*) r=named ;; *) r="$HOUT" ;; esac
 ck "the gate's blockers reach the agent" "named" "$r"
@@ -737,7 +760,7 @@ print(json.dumps({"done": True, "applicable": True, "blockers": []}))
 PY
 out=$(gate_run "$DUPSID" CLAUDE_DOD_CHECK="$DUPDOD")
 ck "a repo listed three times is measured once" "1" "$(wc -l < "$DUPCALLS")"
-ck "  ...and the turn still ends cleanly" "0" "$GATE_RC"
+ck "  ...and the turn still ends cleanly" "0" "$(gate_rc)"
 rm -f "$SD/$DUPSID.arm" "$SD/$DUPSID.blocks"
 
 # ...and the arm hook must not create the duplicates in the first place.
@@ -840,8 +863,11 @@ printf '%s\n' "$BREPO" > "$SD/$SCSID.arm"
 out=$(printf '{"session_id":"%s","session_crons":true}' "$SCSID" \
       | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE" 2>/dev/null)
 ck "session_crons=true still blocks" "block" "$(decision "$out")"
+# Keyed to session_crons SPECIFICALLY. A bare `not-a-list:bool` grep was already
+# satisfied by the background_tasks case in the loop above — block() logs guards
+# for BOTH keys every time — so the assertion could not fail.
 ck "  ...and the shape it got is in the log" "yes" \
-   "$(grep -q 'not-a-list:bool' "$SD/gate.log" && echo yes || echo no)"
+   "$(grep -q '"session_crons": "not-a-list:bool"' "$SD/gate.log" && echo yes || echo no)"
 rm -f "$SD/$SCSID.arm" "$SD/$SCSID.blocks"
 
 echo
@@ -911,7 +937,7 @@ NASID="genuinena-$RANDOM"
 printf '%s\n' "$BREPO" > "$SD/$NASID.arm"
 out=$(gate_run "$NASID" CLAUDE_DOD_CHECK="$NADOD")
 ck "a genuine n/a still allows"        ""    "$(decision "$out")"
-ck "  ...by exiting 0, not by crashing" "0"  "$GATE_RC"
+ck "  ...by exiting 0, not by crashing" "0"  "$(gate_rc)"
 ck "  ...but is recorded, not silent"  "yes" \
    "$(grep -q 'does not apply here' "$SD/gate.log" && echo yes || echo no)"
 rm -f "$SD/$NASID.arm" "$SD/$NASID.blocks"

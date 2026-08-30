@@ -334,6 +334,91 @@ git remote set-url origin "$HERE/gone-away.git"
 case_run "an unreadable base ref still demands CI" nochecks 1 "NO_CHECKS"
 case_run "  ...and says the ref could not be read"  nochecks 1 "REMOTE_UNVERIFIED"
 
+# ---- a git that answers ONCE and then fails ------------------------------
+# The GIT_UNAVAILABLE guard covered only the FIRST git call. A git that answered
+# `rev-parse --show-toplevel` and then failed on `git remote` still produced n/a,
+# and n/a is the code the Stop hook reads as "nothing to check here": measured,
+# it skipped the repo, unlinked the armfile and ended the turn with a real
+# unpushed commit sitting in it. Nine of nine later-call cases were exposed.
+fresh_repo; git push -q -u origin feat/x
+echo "unpushed work" >> src/a.py; git add -A; git commit -qm "real work"
+STUBGIT="$(mktemp -d)"
+REALGIT="$(command -v git)"
+printf '#!/usr/bin/env bash\n[ "$1" = remote ] && [ $# -eq 1 ] && exit 127\nexec %s "$@"\n' \
+  "$REALGIT" > "$STUBGIT/git"
+chmod +x "$STUBGIT/git"
+out="$(cd "$WORK" && env PATH="$STUBGIT:$HERE:$PATH" DOD_FIXTURE=green \
+       python3 "$DOD" --repo "$WORK" 2>&1)"; code=$?
+rm -f "$STUBGIT/git"; rmdir "$STUBGIT" 2>/dev/null
+if [ "$code" = 3 ]; then ok "a git that fails on a LATER call is exit 3 too"
+else bad "a git that fails on a LATER call is exit 3 too" "exit 3" "exit $code — $out"; fi
+if grep -qF "COULD NOT MEASURE" <<<"$out"; then ok "  ...and does not claim there is no remote"
+else bad "  ...and does not claim there is no remote" "COULD NOT MEASURE" "$out"; fi
+
+# ---- checks that were all SKIPPED are not checks that passed --------------
+# `total > 0` skips the NO_CHECKS branch, and `skipping` was tallied and then
+# never read — so a PR whose every job skipped reported DONE. One skipped job
+# away from NO_CHECKS, and the verdict flips from blocked to green.
+fresh_repo; git push -q -u origin feat/x
+case_run "a PR where every check skipped is not DONE" allskip 1 "CHECKS_ALL_SKIPPED"
+# ...but a skipped job ALONGSIDE a real one is ordinary, and must stay green.
+case_run "a skipped job beside a passing one is fine" mixedskip 0 "DONE"
+
+# A shape gh does not return today, reaching `for row in rows`. Exit 3, not a
+# blocker: the check state was never READ, and this tool's exit 3 is exactly
+# "could not measure" — callers treat it like 1. What must not happen is the
+# AttributeError reaching main()'s blanket handler, which reports the same 3
+# with a bare "dod-check crashed" and no idea what was wrong.
+case_run "a non-list check payload is named, not crashed on" dictchecks 3 "expected a list"
+
+# ---- the integrity scan runs on the DIRECT-PUSH ladder too ----------------
+# It sat below the direct-push return, so work pushed straight to the default
+# branch was never scanned for deleted tests, continue-on-error or `|| true`.
+# Reproduced with all three weakenings: DONE on this ladder, INTEGRITY on the
+# PR ladder, same commit. The window where it is measurable is the one before
+# the work ships — committed, not yet pushed — because being level with origin
+# collapses the merge-base onto HEAD and empties the range by construction.
+fresh_repo
+git switch -q master
+git rm -q tests/test_a.py; git commit -qm "drop the test on main"
+case_run "a deleted test on the default branch is flagged" green 1 "TEST_FILE_DELETED"
+case_run "  ...as an integrity blocker, not just a note" green 1 "INTEGRITY"
+
+# ---- an uncountable gap is not a gap of zero, on either ladder ------------
+# `if repo["behind"]:` swallowed None — the fetch worked, the rev-list did not,
+# and "level with origin" was never established while that IS this ladder's
+# terminal condition.
+fresh_repo
+git switch -q master
+STUBGIT2="$(mktemp -d)"
+printf '#!/usr/bin/env bash\nif [ "$1" = rev-list ] && [ "$3" = "HEAD..origin/master" ]; then exit 128; fi\nexec %s "$@"\n' \
+  "$REALGIT" > "$STUBGIT2/git"
+chmod +x "$STUBGIT2/git"
+out="$(cd "$WORK" && env PATH="$STUBGIT2:$HERE:$PATH" DOD_FIXTURE=green \
+       python3 "$DOD" --repo "$WORK" 2>&1)"; code=$?
+rm -f "$STUBGIT2/git"; rmdir "$STUBGIT2" 2>/dev/null
+if [ "$code" = 1 ] && grep -qF "BEHIND_UNKNOWN" <<<"$out"; then
+  ok "an uncountable 'behind' blocks instead of reading as zero"
+else
+  bad "an uncountable 'behind' blocks instead of reading as zero" "exit 1 + BEHIND_UNKNOWN" "exit $code — $out"
+fi
+
+# Same shape after a merge: None became NOT_ON_DEFAULT, a confident and WRONG
+# blocker telling the agent to go home while stranded commits may still exist.
+fresh_repo; git push -q -u origin feat/x
+STUBGIT3="$(mktemp -d)"
+printf '#!/usr/bin/env bash\nif [ "$1" = rev-list ] && [ "$3" = "origin/master..HEAD" ]; then exit 128; fi\nexec %s "$@"\n' \
+  "$REALGIT" > "$STUBGIT3/git"
+chmod +x "$STUBGIT3/git"
+out="$(cd "$WORK" && env PATH="$STUBGIT3:$HERE:$PATH" DOD_FIXTURE=merged \
+       python3 "$DOD" --repo "$WORK" 2>&1)"; code=$?
+rm -f "$STUBGIT3/git"; rmdir "$STUBGIT3" 2>/dev/null
+if grep -qF "STRANDED_UNKNOWN" <<<"$out"; then
+  ok "an uncountable stranded-commit count says so"
+else
+  bad "an uncountable stranded-commit count says so" "STRANDED_UNKNOWN" "exit $code — $out"
+fi
+
 # ---- JSON contract --------------------------------------------------------
 fresh_repo; git push -q -u origin feat/x
 j="$(DOD_FIXTURE=pending python3 "$DOD" --repo "$WORK" --json 2>&1)"
