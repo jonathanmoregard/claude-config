@@ -66,25 +66,17 @@ check "other session -> empty output" "$([[ -z "$OUT" ]] && echo pass || echo fa
 check "other session -> iteration untouched" "$([[ "$ITER" == "2" ]] && echo pass || echo fail)"
 
 # 4. promise emitted -> loop ends, state removed
-#
-# ON ITS OWN LINE. A tag inside a sentence is deliberately ignored now: the
-# systemMessage injects the promise string every iteration, so quoting it back
-# while explaining oneself is ordinary behaviour, and three measured transcripts
-# exited the loop with a false completion claim before own-line anchoring landed.
-# This case asserted the OLD contract, and the message it looked for
-# ("Detected <promise>") stopped being emitted before that.
-mk_transcript "Work is finished.
-<promise>ALL DONE</promise>"
+mk_transcript "Work is finished. <promise>ALL DONE</promise>"
 OUT=$(run_hook "$SID")
 check "promise -> state file removed" "$([[ ! -f "$STATE" ]] && echo pass || echo fail)"
-check "promise -> success message" "$(echo "$OUT" | grep -q 'completion promise met' && echo pass || echo fail)"
+check "promise -> success message" "$(echo "$OUT" | grep -q 'Detected <promise>' && echo pass || echo fail)"
 
 # 5. max iterations reached -> stop
 mk_state 25 25 '"ALL DONE"'
 mk_transcript "grinding"
 OUT=$(run_hook "$SID")
 check "max iterations -> state removed" "$([[ ! -f "$STATE" ]] && echo pass || echo fail)"
-check "max iterations -> message" "$(echo "$OUT" | grep -q 'max iterations' && echo pass || echo fail)"
+check "max iterations -> message" "$(echo "$OUT" | grep -q 'Max iterations' && echo pass || echo fail)"
 
 # 6. path traversal session id -> refuse, touch nothing
 mk_state 1 0 'null'

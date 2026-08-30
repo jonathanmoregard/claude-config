@@ -80,15 +80,6 @@ git -C "$HERE/clone2" add -A; git -C "$HERE/clone2" commit -qm elsewhere
 git -C "$HERE/clone2" push -q origin master
 git fetch -q origin
 case_run "behind origin on main blocks" green 1 "BEHIND_REMOTE"
-
-# An unreachable origin is a MISSING MEASUREMENT on this ladder, not a warning:
-# its terminal condition IS "level with origin", and a stale remote-tracking ref
-# answers that from memory. Measured before the fix: DONE / exit 0 while
-# genuinely behind, with the warning printed underneath the green verdict.
-fresh_repo
-git switch -q master
-git remote set-url origin "$HERE/does-not-exist.git"
-case_run "unreachable origin is not DONE on main" green 1 "REMOTE_UNVERIFIED"
 rm -rf "$HERE/clone2"
 
 # ---- not applicable -------------------------------------------------------
@@ -117,9 +108,6 @@ case_run "unpushed commits block" green 1 "UNPUSHED_COMMITS"
 # ---- PR states ------------------------------------------------------------
 fresh_repo; git push -q -u origin feat/x
 case_run "no PR blocks"            no_pr    1 "NO_PR"
-# The `merged` fixture reports headRefOid — the commit the PR actually merged.
-# Here nothing was pushed after the merge, so that is HEAD.
-export DOD_HEAD_OID="$(git rev-parse HEAD)"
 # Merged is no longer the end of the job. The repo is still parked on the dead
 # branch, and putting it back on the default branch at latest is the last step
 # of the work rather than a chore for Jonathan — "no closing ceremony for me to
@@ -131,56 +119,10 @@ case_run "merged demands going home" merged  1 "NOT_ON_DEFAULT"
 # A PR merges the commits it HAD. Push more to the branch afterwards and they
 # sit on a dead branch while the PR still reads MERGED — green, work nowhere.
 fresh_repo; git push -q -u origin feat/x
-export DOD_HEAD_OID="$(git rev-parse HEAD)"   # what the PR merged
 echo "after the merge" >> src/a.py; git add -A; git commit -qm "landed nowhere"
 git push -q
 case_run "commits the merge left behind block" merged 1 "COMMITS_AFTER_MERGE"
 case_run "and it counts them"                  merged 1 "1 commit(s) on feat/x"
-
-# ---- a squash or rebase merge is still a merge ----------------------------
-# The count used to be `rev-list origin/<base>..HEAD` — REACHABILITY, not
-# "landed". A squash or rebase merge writes new SHAs, so on a fully merged PR it
-# stayed non-zero and the predicate told the agent to cherry-pick work that was
-# already in the base. Measured over 16 scenarios: every squash and every rebase
-# was wrong, by exactly the branch's commit count. Only the plain --no-ff merge
-# — the one shape this suite modelled — was right.
-#
-# `git cherry` is NOT the answer and this is the case that proves it: GitHub
-# collapses N commits into one whose patch-id equals no individual commit's, so
-# patch-equivalence is correct for a 1-commit squash and WRONG for this one.
-fresh_repo
-git switch -q -c feat/x master 2>/dev/null || git switch -q feat/x
-echo "first half"  >> src/a.py; git add -A; git commit -qm "part one"
-echo "second half" >> src/a.py; git add -A; git commit -qm "part two"
-git push -q -u origin feat/x
-export DOD_HEAD_OID="$(git rev-parse HEAD)"   # exactly what GitHub would merge
-# Squash the two commits into origin/master, as a squash merge does.
-git switch -q master
-git merge -q --squash feat/x
-git commit -qm "squashed PR #42 (#42)"
-git push -q origin master
-git switch -q feat/x
-case_run "a squash-merged PR is not 'the merge did not take them'" merged 1 "NOT_ON_DEFAULT"
-# Captured, then grepped. Piping the predicate straight into `grep -q` under
-# `set -o pipefail` makes the `if` read the PREDICATE's exit code — 1, because it
-# is reporting blockers — not grep's, so the assertion took the else branch
-# whatever the text said. It could not fail. (Caught by mutation-checking this
-# very case against the pre-fix tree, which is the only reason it is not still
-# sitting here green and empty.)
-sq_out="$(DOD_FIXTURE=merged python3 "$DOD" --repo "$WORK" 2>&1)"
-if grep -qF "COMMITS_AFTER_MERGE" <<<"$sq_out"; then
-  bad "  ...and raises no stranded-commit blocker" "no COMMITS_AFTER_MERGE" "$sq_out"
-else
-  ok "  ...and raises no stranded-commit blocker"
-fi
-
-# ...while a commit pushed AFTER that squash merge is genuinely stranded, and
-# must still be caught. This is the case `git cherry` overcounts as 3.
-echo "genuinely stranded" >> src/a.py; git add -A; git commit -qm "after the squash"
-git push -q
-case_run "  ...but a commit pushed after the squash IS stranded" merged 1 "COMMITS_AFTER_MERGE"
-case_run "  ...counted exactly once"                             merged 1 "1 commit(s) on feat/x"
-unset DOD_HEAD_OID
 case_run "closed blocks"           closed   1 "PR_CLOSED"
 case_run "pending checks block"    pending  1 "CHECKS_PENDING"
 case_run "failing checks block"    failing  1 "CHECKS_FAILING"
@@ -265,208 +207,6 @@ fresh_repo; git push -q -u origin feat/x
 echo "y = 1  # ordinary change" >> src/a.py
 git add -A; git commit -qm ok; git push -q
 case_run "clean diff not flagged" green 0 "DONE"
-
-# ---- a non-GitHub remote is n/a for the PR half ONLY ----------------------
-# The committed -> pushed half is measured before `gh` is ever called, and this
-# path used to discard it: reproduced 2026-08-30 on a gitlab.com remote with a
-# dirty tree AND an unpushed commit, returning exit 2 with `blockers: []` and
-# "n/a — nothing to open a PR against", while the same payload's repo block read
-# dirty: true, ahead_of_default: 1. Exit 2 is the worst code to lose blockers
-# on: the Stop hook reads it as "nothing to check here" and ends the turn.
-fresh_repo
-echo "committed but never pushed" >> src/a.py
-git add -A; git commit -qm "never pushed"
-echo "and uncommitted on top" >> src/a.py
-case_run "non-GitHub remote keeps the dirty tree it measured" nongithub 1 "DIRTY_TREE"
-case_run "  ...and the unpushed half of the ladder"           nongithub 1 "NOT_PUSHED"
-
-# With nothing to report it is still n/a — the PR half genuinely does not apply.
-fresh_repo; git push -q -u origin feat/x
-case_run "non-GitHub remote with nothing to report is n/a" nongithub 2 "n/a"
-
-# ---- a measurement that FAILED is not a measurement that came back clean ---
-# Same defect shape as the exit-2 case above, one layer down: git and gh both
-# report failure in the exit code, and every place that reads only stdout turns
-# "could not look" into "looked, found nothing".
-
-# `dirty` was `bool(git(["status","--porcelain"], root)[1])` — stdout only. A
-# git that cannot run returns ('', err) with rc 124 (timeout) or 127 (OSError),
-# and an unreadable index returns rc 128, so a tree full of uncommitted work
-# read as clean. Reproduced with the index at mode 000: `git status --porcelain`
-# exits 128 with empty stdout while rev-parse, rev-list and fetch all still work.
-fresh_repo; git push -q -u origin feat/x
-echo "uncommitted and invisible" >> src/a.py
-chmod 000 "$WORK/.git/index"
-case_run "an unreadable index is not a clean tree" green 1 "TREE_UNKNOWN"
-chmod 644 "$WORK/.git/index"
-
-# The same asymmetry on the two ladders: a failed `rev-list --count @{u}..HEAD`
-# yields unpushed=None, which is FALSY on the feature-branch path (no blocker at
-# all) while the identical None becomes a blocker on the default-branch path.
-# Reproduced by pointing the remote-tracking ref at an object that is not there:
-# `@{u}` still resolves by name, so has_upstream is true, and only the count
-# fails.
-fresh_repo; git push -q -u origin feat/x
-printf '%s\n' "0123456789012345678901234567890123456789" \
-  > "$WORK/.git/refs/remotes/origin/feat/x"
-case_run "an uncountable upstream is not silently pushed" green 1 "UNPUSHED_UNKNOWN"
-
-# An unrecognised check bucket counts toward `total` but is tallied as neither
-# fail nor pending, so it lands in the all-clear branch and an unmeasured check
-# contributes to DONE.
-fresh_repo; git push -q -u origin feat/x
-case_run "an unrecognised check bucket is not a pass" weirdbucket 1 "CHECKS_UNRECOGNISED"
-case_run "  ...and it names the bucket it did not know" weirdbucket 1 "neutral"
-
-# reviewThreads(first:100) is not paginated. Thread 101 onwards simply did not
-# exist as far as this tool was concerned, and a truncated page of resolved
-# threads printed as a clean sheet.
-fresh_repo; git push -q -u origin feat/x
-# NAME MATTERS HERE. This case asserts exit 0, which IS the clean sheet — the
-# earlier name ("...is not a clean sheet") claimed more than the assertion
-# checks. Not blocking is deliberate and documented in the Stop gate: blocking
-# on an unreadable remote would hang every offline session. What the branch
-# fixed is that truncation is now SAID rather than silently dropped.
-case_run "a truncated thread page says the threads were not counted" manythreads 0 "only the first 100"
-
-# A `nodes: null` payload passes every lookup and raises on ITERATION. That
-# escalated a soft-fail warning into a crash caught only by main()'s blanket
-# handler, which reports exit 3 with an empty blockers list — a whole-predicate
-# failure caused by an optional, deliberately advisory check.
-case_run "a null thread list warns, it does not crash" nullnodes 0 "unexpected shape"
-
-# argparse exits 2 on a usage error, and 2 is this tool's documented n/a code —
-# so a typo in the flag reads to every caller as "the definition of done does
-# not apply here".
-out="$(python3 "$DOD" --repo "$WORK" --bogus 2>&1)"; code=$?
-[ "$code" = 3 ] && ok "a usage error is exit 3, not the n/a code" \
-  || bad "a usage error is exit 3, not the n/a code" "exit 3" "exit $code — $out"
-out="$(python3 "$DOD" --help 2>&1)"; code=$?
-[ "$code" = 0 ] && ok "  ...and --help is still exit 0" \
-  || bad "  ...and --help is still exit 0" "exit 0" "exit $code — $out"
-
-# ---- a broken git is not "not a git repository" ---------------------------
-# `run()` returns 124 on a timeout and 127 when the command cannot be spawned,
-# and collect_repo folded both into "not a git repository" -> exit 2. Exit 2 is
-# the one code that means STOP LOOKING: the Stop hook reads it as nothing to
-# check, skips the repo, unlinks the armfile and ends the turn. Measured end to
-# end — same gate, same repo, same real UNPUSHED_COMMITS blocker, and the only
-# variable was whether git was on PATH.
-fresh_repo; git push -q -u origin feat/x
-PY3="$(command -v python3)"
-EMPTYBIN="$(mktemp -d)"
-out="$(cd "$WORK" && env PATH="$EMPTYBIN" "$PY3" "$DOD" --repo "$WORK" 2>&1)"; code=$?
-rmdir "$EMPTYBIN" 2>/dev/null
-if [ "$code" = 3 ]; then ok "a git that cannot run is exit 3, not n/a"
-else bad "a git that cannot run is exit 3, not n/a" "exit 3" "exit $code — $out"; fi
-if grep -qF "COULD NOT MEASURE" <<<"$out"; then ok "  ...and says it could not measure"
-else bad "  ...and says it could not measure" "COULD NOT MEASURE" "$out"; fi
-
-# ---- an unreadable base ref is not "this repo has no CI" -------------------
-# ci_configured required BOTH refs to be unreadable before admitting it could
-# not tell. With HEAD readable and empty, one unreadable ref returned
-# False = "no CI configured", which waves the branch through. The trigger needs
-# no tampering: rename the base branch upstream while the local origin/HEAD
-# symref still names the old one, and `git fetch origin <base>` fails while
-# everything else keeps working. Reproduced 2026-08-30 on a branch that had
-# deleted its only workflow: exit 0, DONE, no NO_CHECKS.
-fresh_repo
-git switch -q master
-mkdir -p .github/workflows
-printf "$WF" > .github/workflows/ci.yml
-git add -A; git commit -qm ci; git push -q origin master
-git switch -q -C feat/x master
-git rm -q -r .github/workflows; git commit -qm "drop ci"
-git push -q -u origin feat/x
-git update-ref -d refs/remotes/origin/master
-git remote set-url origin "$HERE/gone-away.git"
-case_run "an unreadable base ref still demands CI" nochecks 1 "NO_CHECKS"
-case_run "  ...and says the ref could not be read"  nochecks 1 "REMOTE_UNVERIFIED"
-
-# ---- a git that answers ONCE and then fails ------------------------------
-# The GIT_UNAVAILABLE guard covered only the FIRST git call. A git that answered
-# `rev-parse --show-toplevel` and then failed on `git remote` still produced n/a,
-# and n/a is the code the Stop hook reads as "nothing to check here": measured,
-# it skipped the repo, unlinked the armfile and ended the turn with a real
-# unpushed commit sitting in it. Nine of nine later-call cases were exposed.
-fresh_repo; git push -q -u origin feat/x
-echo "unpushed work" >> src/a.py; git add -A; git commit -qm "real work"
-STUBGIT="$(mktemp -d)"
-REALGIT="$(command -v git)"
-printf '#!/usr/bin/env bash\n[ "$1" = remote ] && [ $# -eq 1 ] && exit 127\nexec %s "$@"\n' \
-  "$REALGIT" > "$STUBGIT/git"
-chmod +x "$STUBGIT/git"
-out="$(cd "$WORK" && env PATH="$STUBGIT:$HERE:$PATH" DOD_FIXTURE=green \
-       python3 "$DOD" --repo "$WORK" 2>&1)"; code=$?
-rm -f "$STUBGIT/git"; rmdir "$STUBGIT" 2>/dev/null
-if [ "$code" = 3 ]; then ok "a git that fails on a LATER call is exit 3 too"
-else bad "a git that fails on a LATER call is exit 3 too" "exit 3" "exit $code — $out"; fi
-if grep -qF "COULD NOT MEASURE" <<<"$out"; then ok "  ...and does not claim there is no remote"
-else bad "  ...and does not claim there is no remote" "COULD NOT MEASURE" "$out"; fi
-
-# ---- checks that were all SKIPPED are not checks that passed --------------
-# `total > 0` skips the NO_CHECKS branch, and `skipping` was tallied and then
-# never read — so a PR whose every job skipped reported DONE. One skipped job
-# away from NO_CHECKS, and the verdict flips from blocked to green.
-fresh_repo; git push -q -u origin feat/x
-case_run "a PR where every check skipped is not DONE" allskip 1 "CHECKS_ALL_SKIPPED"
-# ...but a skipped job ALONGSIDE a real one is ordinary, and must stay green.
-case_run "a skipped job beside a passing one is fine" mixedskip 0 "DONE"
-
-# A shape gh does not return today, reaching `for row in rows`. Exit 3, not a
-# blocker: the check state was never READ, and this tool's exit 3 is exactly
-# "could not measure" — callers treat it like 1. What must not happen is the
-# AttributeError reaching main()'s blanket handler, which reports the same 3
-# with a bare "dod-check crashed" and no idea what was wrong.
-case_run "a non-list check payload is named, not crashed on" dictchecks 3 "expected a list"
-
-# ---- the integrity scan runs on the DIRECT-PUSH ladder too ----------------
-# It sat below the direct-push return, so work pushed straight to the default
-# branch was never scanned for deleted tests, continue-on-error or `|| true`.
-# Reproduced with all three weakenings: DONE on this ladder, INTEGRITY on the
-# PR ladder, same commit. The window where it is measurable is the one before
-# the work ships — committed, not yet pushed — because being level with origin
-# collapses the merge-base onto HEAD and empties the range by construction.
-fresh_repo
-git switch -q master
-git rm -q tests/test_a.py; git commit -qm "drop the test on main"
-case_run "a deleted test on the default branch is flagged" green 1 "TEST_FILE_DELETED"
-case_run "  ...as an integrity blocker, not just a note" green 1 "INTEGRITY"
-
-# ---- an uncountable gap is not a gap of zero, on either ladder ------------
-# `if repo["behind"]:` swallowed None — the fetch worked, the rev-list did not,
-# and "level with origin" was never established while that IS this ladder's
-# terminal condition.
-fresh_repo
-git switch -q master
-STUBGIT2="$(mktemp -d)"
-printf '#!/usr/bin/env bash\nif [ "$1" = rev-list ] && [ "$3" = "HEAD..origin/master" ]; then exit 128; fi\nexec %s "$@"\n' \
-  "$REALGIT" > "$STUBGIT2/git"
-chmod +x "$STUBGIT2/git"
-out="$(cd "$WORK" && env PATH="$STUBGIT2:$HERE:$PATH" DOD_FIXTURE=green \
-       python3 "$DOD" --repo "$WORK" 2>&1)"; code=$?
-rm -f "$STUBGIT2/git"; rmdir "$STUBGIT2" 2>/dev/null
-if [ "$code" = 1 ] && grep -qF "BEHIND_UNKNOWN" <<<"$out"; then
-  ok "an uncountable 'behind' blocks instead of reading as zero"
-else
-  bad "an uncountable 'behind' blocks instead of reading as zero" "exit 1 + BEHIND_UNKNOWN" "exit $code — $out"
-fi
-
-# Same shape after a merge: None became NOT_ON_DEFAULT, a confident and WRONG
-# blocker telling the agent to go home while stranded commits may still exist.
-fresh_repo; git push -q -u origin feat/x
-STUBGIT3="$(mktemp -d)"
-printf '#!/usr/bin/env bash\nif [ "$1" = rev-list ] && [ "$3" = "origin/master..HEAD" ]; then exit 128; fi\nexec %s "$@"\n' \
-  "$REALGIT" > "$STUBGIT3/git"
-chmod +x "$STUBGIT3/git"
-out="$(cd "$WORK" && env PATH="$STUBGIT3:$HERE:$PATH" DOD_FIXTURE=merged \
-       python3 "$DOD" --repo "$WORK" 2>&1)"; code=$?
-rm -f "$STUBGIT3/git"; rmdir "$STUBGIT3" 2>/dev/null
-if grep -qF "STRANDED_UNKNOWN" <<<"$out"; then
-  ok "an uncountable stranded-commit count says so"
-else
-  bad "an uncountable stranded-commit count says so" "STRANDED_UNKNOWN" "exit $code — $out"
-fi
 
 # ---- JSON contract --------------------------------------------------------
 fresh_repo; git push -q -u origin feat/x

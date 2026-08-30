@@ -19,8 +19,6 @@
       "Read(//etc/nixos/**)",
       "Read(//nix/store/**)",
       "Read(//home/jonathan/worktrees/**)",
-      "Read(//home/jonathan/Downloads)",
-      "Read(//home/jonathan/Downloads/**)",
       "Read(//home/jonathan/.claude/settings.json)",
       "Read(//home/jonathan/.claude/templates/**)",
       "Read(//home/jonathan/.claude/hooks/**)",

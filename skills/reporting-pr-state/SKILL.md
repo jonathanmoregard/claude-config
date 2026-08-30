@@ -69,8 +69,6 @@ Relevance is stated, not implied by listing. If you cannot say in a clause why a
 
 Every PR mentioned in a report carries its **full URL on its own line**. Not the bare number, not `#178`, not a markdown label — the link, so it is one click away.
 
-**Links go at the BOTTOM of the reply.** Not in the opening line, not buried mid-prose. Jonathan scrolls to the end to click, so that is where the clickable thing belongs. Say what happened first, then hand over the link last.
-
 ```
 nixos #178 — MERGED 2026-08-15 21:58 CEST by jonathanmoregard (7d36a8b4)
 https://github.com/jonathanmoregard/nixos-config/pull/178

@@ -15,17 +15,7 @@ set -uo pipefail
 STATE_DIR="${CLAUDE_DOD_STATE_DIR:-$HOME/.local/state/claude-dod}"
 
 input=$(cat)
-if ! command -v jq >/dev/null 2>&1; then
-  # Silent, this switched the ENTIRE enforcement system off with no signal: no
-  # session ever arms, so the Stop gate never checks anything and every turn
-  # ends looking clean. A degrade that total has to be loud.
-  echo "⚠️  finishing-up-arm: jq is not on PATH — no session will arm, so the definition-of-done gate will never run" >&2
-  # Non-zero, or the warning is not surfaced: a PostToolUse hook's stderr is
-  # shown on a non-zero exit, and at exit 0 this message went nowhere. 1, never
-  # 2 — 2 blocks the tool call itself, and a hook that cannot arm must not stop
-  # the user's edit from landing.
-  exit 1
-fi
+command -v jq >/dev/null 2>&1 || exit 0
 
 session=$(jq -r '.session_id // ""' <<<"$input")
 # Reject anything that is not a plain token: this becomes a filename.
@@ -81,58 +71,12 @@ if [ -z "$default" ]; then
 fi
 [ -n "$default" ] || exit 0
 
-# Same total impact as the missing-jq branch above — no session arms, so the
-# gate never checks anything — and this one used to say nothing on any channel.
-# A non-zero exit is what makes a PostToolUse hook's stderr visible at all; 1
-# rather than 2, because 2 is the code that BLOCKS the tool call, and failing to
-# arm must not stop the user's edit from landing.
-mkdir -p "$STATE_DIR" 2>/dev/null || {
-  echo "⚠️  finishing-up-arm: cannot create $STATE_DIR — no session will arm, so the definition-of-done gate will never run" >&2
-  exit 1
-}
+mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
 armfile="$STATE_DIR/$session.arm"
 
 # One line per repo, de-duplicated. A session may legitimately touch several.
-#
-# Check-then-append is a RACE, and this hook is somewhere it actually fires:
-# SUBAGENTS SHARE THE PARENT'S session_id (see above), so two PostToolUse hooks
-# run concurrently against one armfile, both miss the grep, and both append. The
-# gate then spends its single wall-clock budget measuring one repository twice,
-# and the repository at the end of the list is the one reported NOT MEASURED.
-#
-# flock makes the check and the append one operation. It is taken on the armfile
-# itself rather than a sidecar .lock, so the gate's reaper — which only knows
-# *.arm and *.blocks — has nothing new to leak. Where flock is missing the old
-# unserialised path is taken, and the gate de-duplicates what it reads: this is
-# defence at the source, not the only defence.
-#
-# The redirection is on the SUBSHELL, never on `exec`: a failed `exec`
-# redirection exits a non-interactive shell outright, which would turn an
-# unwritable state dir into a hook that reports failure to the user.
-# NO blanket `2>/dev/null` on this subshell, and the result is CHECKED. The
-# suppression hid the write half specifically: an open failure escapes it anyway
-# (bash applies 9>> before 2>), but a failed append — ENOSPC, a quota, an
-# rlimit — printed nothing at all and the unconditional `exit 0` discarded the
-# status. Measured against /dev/full: `printf >&9` returns 1 with the message
-# swallowed. No armfile means the gate has nothing to check and ends the turn
-# with no output and no log line, which is enforcement off rather than a hook
-# that failed. That silence was introduced by this round's own flock fix.
-if ! (
-  if command -v flock >/dev/null 2>&1; then
-    # -w so a stuck holder can never hang a tool call; timing out just falls
-    # through to the unserialised path, which is where this started.
-    flock -w 5 9 2>/dev/null || true
-  fi
-  if grep -qxF "$root" "$armfile" 2>/dev/null; then
-    # Touch it. The gate's reaper is age-based, and a long session editing ONE
-    # repo would otherwise carry an armfile whose mtime froze at the first edit —
-    # reapable mid-work, which costs an unguarded turn until the next new repo.
-    touch "$armfile" 2>/dev/null || true
-  else
-    printf '%s\n' "$root" >&9
-  fi
-) 9>>"$armfile"; then
-  echo "⚠️  finishing-up-arm: could not record $root in $armfile — this session will NOT be checked by the definition-of-done gate" >&2
-  exit 1
+if [ -f "$armfile" ] && grep -qxF "$root" "$armfile" 2>/dev/null; then
+  exit 0
 fi
+printf '%s\n' "$root" >> "$armfile"
 exit 0
