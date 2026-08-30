@@ -135,12 +135,71 @@ DOD_TIMEOUT = 60
 # and a 61s check the gate's own timeout fires at 60.12s and loses that race by
 # 120ms, so the fail-closed path only ever worked when nothing enforced the
 # registered timeout. A budget that outlives its harness slot is not a budget.
-TOTAL_BUDGET, _BUDGET_WARN = _num_env(
-    "CLAUDE_DOD_TOTAL_BUDGET", 45.0, float, floor=2.0)
 # Below this there is no point starting another dod-check: it cannot finish, and
 # a dod-check killed at 1s reports the same "did not run" as a real timeout
 # while costing a second of the budget the remaining repos need.
 MIN_SLICE = 3.0
+
+_SELF = pathlib.Path(__file__).name
+
+
+def _registered_slot():
+    """The timeout the harness will actually enforce on this hook.
+
+    The budget below is meaningless unless it stays UNDER the registered
+    timeout, and two numbers that must agree with nothing keeping them agreeing
+    is the footgun three independent reviewers flagged in one round. MEASURED
+    2026-08-30: CLAUDE_DOD_TOTAL_BUDGET=90 — a plausible operator value once a
+    session arms two repos — ran 80.34s inside a 60s slot and was killed with
+    EMPTY stdout, no gate.log line and no countfile, which is precisely the
+    fail-open the budget was added to remove. Nothing warned, because the only
+    budget message the hook could emit was the floor one.
+
+    So the hook reads its own registration rather than trusting whoever set the
+    env var to have also read settings.json. Every failure path falls back to
+    60s: Claude Code's default for a hook with no `timeout` key, and the value
+    registered here today.
+    """
+    path = pathlib.Path(os.environ.get(
+        "CLAUDE_DOD_SETTINGS", pathlib.Path.home() / ".claude/settings.json"))
+    try:
+        data = json.loads(path.read_text())
+        found = [h.get("timeout", 60)
+                 for group in data.get("hooks", {}).get("Stop", [])
+                 for h in (group.get("hooks") or [])
+                 if _SELF in str(h.get("command", ""))]
+    except (OSError, ValueError, AttributeError, TypeError):
+        return 60.0, "could not read this hook's registered timeout; assuming 60s"
+    if not found:
+        # Not registered as a Stop hook in that file at all: a test harness, a
+        # manual run, or a different settings file. 60s is the harness default.
+        return 60.0, None
+    try:
+        return float(min(found)), None
+    except (TypeError, ValueError):
+        return 60.0, "the registered timeout is not a number; assuming 60s"
+
+
+HARNESS_SLOT, _SLOT_WARN = _registered_slot()
+# Margin for interpreter start-up, the stdin read, the reap sweep and writing
+# the block itself. Measured: the default budget lands its block at 45.06s in a
+# 60s slot, so 5s is comfortable rather than tight.
+SLOT_MARGIN = 5.0
+_CEILING = max(MIN_SLICE, HARNESS_SLOT - SLOT_MARGIN)
+# The floor is MIN_SLICE, not something smaller: a budget below one slice can
+# never measure ANY repository. Reproduced with CLAUDE_DOD_TOTAL_BUDGET=1, which
+# clamped to the old 2.0 floor and returned "NOT MEASURED" for a repo whose
+# dod-check was never even spawned — fail-closed, but on a reason no amount of
+# work could clear, and after MAX_BLOCKS such turns the gate stands down anyway.
+TOTAL_BUDGET, _BUDGET_WARN = _num_env(
+    "CLAUDE_DOD_TOTAL_BUDGET", min(45.0, _CEILING), float, floor=MIN_SLICE)
+if TOTAL_BUDGET > _CEILING:
+    _BUDGET_WARN = (
+        f"CLAUDE_DOD_TOTAL_BUDGET={TOTAL_BUDGET:g} outlives the "
+        f"{HARNESS_SLOT:g}s slot this hook is registered with; using "
+        f"{_CEILING:g}. A budget that outlives its slot is not a budget — the "
+        "harness kills the hook with nothing on stdout and nothing in this log.")
+    TOTAL_BUDGET = _CEILING
 
 
 def log(session, payload):
@@ -286,9 +345,21 @@ def main():
     for warn in (_MODE_UNKNOWN and
                  f"CLAUDE_DOD_MODE={_MODE_UNKNOWN!r} unrecognised; "
                  "failing closed to active",
-                 _MAX_BLOCKS_WARN, _ARM_WARN, _BUDGET_WARN):
+                 _MAX_BLOCKS_WARN, _ARM_WARN, _BUDGET_WARN,
+                 _SLOT_WARN):
         if warn:
             log(session, {"action": "warn", "why": warn})
+
+    if HANDOVER:
+        # In the audit trail on purpose. This flag is the loop's internal call
+        # protocol, but it lives on the same env namespace as the operator
+        # knobs, and a stray persistent export would skip BOTH the ownership
+        # yield and the block budget on every turn — reviving the two-drivers
+        # failure the yield exists to prevent. Nothing here can authenticate the
+        # caller, so being noticeable is the whole mitigation.
+        log(session, {"action": "note",
+                      "why": "CLAUDE_DOD_HANDOVER=1 — ownership check and "
+                             "block budget skipped for this call"})
 
     reap(session)
 
@@ -453,6 +524,18 @@ def main():
                 "result; fix the tooling before believing anything here."
             )
             continue
+        # dod-check demotes several FAILED MEASUREMENTS to warnings while
+        # still reporting done=true — "unresolved review threads not counted",
+        # "could not list PRs for this branch", a stale fetch. This gate reads
+        # only error/done/blockers, so "could not count" and "counted zero"
+        # were identical to it. Blocking on them would hang every offline
+        # session, so they are LOGGED instead: the audit trail is where "green
+        # as far as I got" has to remain visible.
+        warns = result.get("warnings")
+        if isinstance(warns, list) and warns:
+            log(session, {"action": "warn",
+                          "why": f"{repo}: dod-check could not establish: "
+                                 + " | ".join(str(w)[:120] for w in warns[:5])})
         if not result.get("applicable") or result.get("done"):
             continue
         raw_blockers = result.get("blockers")
