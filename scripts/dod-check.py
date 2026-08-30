@@ -41,6 +41,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 
 TIMEOUT = 45
 
@@ -99,50 +100,78 @@ class Blockers:
 GIT_UNAVAILABLE = "git could not run"
 
 
+def _git_unavailable(code):
+    """True for run()'s OWN codes: 124 timed out, 127 could not be spawned.
+
+    These never come from git. EVERY early call has to test them, not just the
+    first — measured 2026-08-30, a stub git that answered `rev-parse
+    --show-toplevel` and then failed on `git remote` still produced n/a, and the
+    gate skipped the repo, unlinked the armfile and ended the turn with a real
+    unpushed commit sitting in it. Nine of nine later-call cases were exposed;
+    the guard covered only the first.
+    """
+    return code in (124, 127)
+
+
+def _unavailable(err, what):
+    return f"{GIT_UNAVAILABLE} ({what}): {(err or 'no detail').splitlines()[0][:100]}"
+
+
 def default_branch(cwd):
-    """origin/HEAD, falling back to main/master. None if undeterminable."""
+    """(name_or_None, git_could_not_run). None means undeterminable."""
     code, out, _ = git(
         ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], cwd, timeout=10
     )
+    if _git_unavailable(code):
+        return None, True
     if code == 0 and out:
-        return out.split("/", 1)[-1]
+        return out.split("/", 1)[-1], False
     for candidate in ("main", "master"):
         code, _, _ = git(
             ["show-ref", "--verify", "--quiet", f"refs/remotes/origin/{candidate}"],
             cwd,
             timeout=10,
         )
+        if _git_unavailable(code):
+            return None, True
         if code == 0:
-            return candidate
-    return None
+            return candidate, False
+    return None, False
 
 
 def collect_repo(cwd):
-    """Repo facts, or ('n/a', reason) when the DoD does not apply here."""
+    """(facts, reason, fatal).
+
+    `facts` is None when there is nothing to measure; `fatal` says that was
+    because git could not RUN, which is exit 3 rather than n/a. That distinction
+    used to ride on a PREFIX in the human-readable reason — reword the sentence
+    and the exit code silently flips to the fail-open one. It is a separate
+    return value now, so no wording can lose it.
+    """
     code, root, err = git(["rev-parse", "--show-toplevel"], cwd, timeout=10)
-    # 124 and 127 do not come from git — they are `run()`'s own codes for "timed
-    # out" and "could not be spawned". Folding them into "not a git repository"
-    # made a MISSING git binary answer n/a, and n/a is the code the Stop gate
-    # reads as "nothing to check here": it skipped the repo, unlinked the
-    # armfile and ended the turn. Measured end to end — same gate, same repo,
-    # same real UNPUSHED_COMMITS blocker, and the only variable was whether git
-    # was on PATH.
-    if code in (124, 127):
-        return None, f"{GIT_UNAVAILABLE}: {(err or 'no detail').splitlines()[0][:120]}"
+    if _git_unavailable(code):
+        return None, _unavailable(err, "rev-parse --show-toplevel"), True
     if code != 0:
-        return None, "not a git repository"
+        # git genuinely exits 128 outside a repository, so this one really is n/a.
+        return None, "not a git repository", False
 
-    code, branch, _ = git(["rev-parse", "--abbrev-ref", "HEAD"], root, timeout=10)
+    code, branch, err = git(["rev-parse", "--abbrev-ref", "HEAD"], root, timeout=10)
+    if _git_unavailable(code):
+        return None, _unavailable(err, "rev-parse --abbrev-ref HEAD"), True
     if code != 0 or not branch or branch == "HEAD":
-        return None, "detached HEAD or unreadable branch"
+        return None, "detached HEAD or unreadable branch", False
 
-    code, remotes, _ = git(["remote"], root, timeout=10)
+    code, remotes, err = git(["remote"], root, timeout=10)
+    if _git_unavailable(code):
+        return None, _unavailable(err, "git remote"), True
     if code != 0 or not remotes.strip():
-        return None, "no git remote configured"
+        return None, "no git remote configured", False
 
-    base = default_branch(root)
+    base, git_gone = default_branch(root)
+    if git_gone:
+        return None, _unavailable(None, "default-branch lookup"), True
     if base is None:
-        return None, "could not determine the default branch"
+        return None, "could not determine the default branch", False
 
     # Being ON the default branch used to be n/a, which meant the whole gate
     # could be side-stepped by never opening a PR: three commits sitting on an
@@ -170,13 +199,26 @@ def collect_repo(cwd):
     # to remove. Only remote-tracking refs are touched: no working tree, no
     # local branch, no index, so this stays a read as far as the repo is
     # concerned. Best-effort: offline or slow is a warning, never a verdict.
+    # Retried ONCE, because a failed fetch now BLOCKS (REMOTE_UNVERIFIED on both
+    # ladders) and a transient loss must not read as a permanent one. The
+    # realistic transient here is CONTENTION rather than the network: ralph's
+    # inline handover call and the standalone Stop gate both spawn dod-check on
+    # the same repository within one turn, and the loser finds FETCH_HEAD.lock
+    # held by the winner. One retry costs nothing on the happy path and removes
+    # a false block on a perfectly healthy repo — and a gate that blocks healthy
+    # work is a gate somebody switches off.
     fetch_warning = None
-    code, _, err = git(["fetch", "--quiet", "origin", base], root, timeout=25)
-    if code != 0:
+    for attempt in (1, 2):
+        code, _, err = git(["fetch", "--quiet", "origin", base], root, timeout=25)
+        if code == 0:
+            fetch_warning = None
+            break
         fetch_warning = (
             "could not fetch origin/%s (%s) — 'behind' and 'stranded commit' "
             "counts may be stale" % (base, (err or "no detail").splitlines()[0][:80])
         )
+        if attempt == 1:
+            time.sleep(1.0)
 
     # On the default branch, measure against origin/<base> rather than @{u}.
     # An upstream ref is a local convenience that a single `git push` without
@@ -219,7 +261,7 @@ def collect_repo(cwd):
         "ahead_of_default": ahead_of_default,
         "behind": behind,
         "fetch_warning": fetch_warning,
-    }, None
+    }, None, False
 
 
 # ----------------------------------------------------------------- integrity
@@ -465,6 +507,12 @@ def collect_pr(root):
         pr = json.loads(out)
     except ValueError:
         return None, None, "gh pr view returned unparseable JSON"
+    # Shape-checked like open_prs_for_branch already was. A list or a string here
+    # reaches `pr.get(...)` and raises past every handler into main()'s blanket
+    # except, which reports exit 3 with an empty blockers list — a whole-predicate
+    # failure presented as a measurement that found nothing.
+    if not isinstance(pr, dict):
+        return None, None, f"gh pr view returned {type(pr).__name__}, expected an object"
 
     checks, cerr = collect_checks(root)
     return pr, checks, cerr
@@ -499,6 +547,9 @@ def collect_checks(root):
         rows = json.loads(out)
     except ValueError:
         return None, "gh pr checks returned unparseable JSON"
+    if not isinstance(rows, list):
+        return None, f"gh pr checks returned {type(rows).__name__}, expected a list"
+    rows = [r for r in rows if isinstance(r, dict)]
 
     tally = {"pass": 0, "fail": 0, "pending": 0, "skipping": 0, "cancel": 0}
     failing = []
@@ -632,11 +683,13 @@ def evaluate(cwd, do_integrity=True):
         "error": None,
     }
 
-    repo, na_reason = collect_repo(cwd)
+    repo, na_reason, fatal = collect_repo(cwd)
     if repo is None:
         # "The DoD does not apply here" and "I could not find out" are different
-        # answers and get different exit codes. Only the first is n/a.
-        if na_reason and na_reason.startswith(GIT_UNAVAILABLE):
+        # answers and get different exit codes. Only the first is n/a, and which
+        # one this is arrives as its own value rather than as a prefix somebody
+        # could reword away.
+        if fatal:
             result["error"] = na_reason
             return result, 3
         result.update(applicable=False, done=False, error=None)
@@ -714,6 +767,31 @@ def evaluate(cwd, do_integrity=True):
               "fix connectivity and re-run — do not read the previous fetch's "
               "refs as current")
 
+    # The integrity scan runs for BOTH ladders, which is why it sits above the
+    # direct-push return rather than at the end of the function. It used to be
+    # below it, so work pushed straight to the default branch was never scanned
+    # for deleted tests, `continue-on-error`, `|| true` or a skipped test —
+    # reproduced 2026-08-30 with all three weakenings: DONE on the direct-push
+    # ladder, INTEGRITY on the PR ladder, same commit.
+    #
+    # ONE HONEST LIMIT, established by the same repro. collect_integrity diffs
+    # merge-base(HEAD, origin/<base>)...HEAD, and reaching DONE on the
+    # direct-push ladder REQUIRES being level with origin — at which point the
+    # merge-base IS head and the range is empty by construction. So this catches
+    # a weakening in the window where it can still be repaired (committed, not
+    # yet pushed — a state the Stop gate measures every turn), not after it has
+    # shipped. Moving the call is necessary and not sufficient; the residue is
+    # recorded here rather than papered over.
+    if do_integrity:
+        findings, warn = collect_integrity(repo["root"], repo["default_branch"])
+        if warn:
+            result["warnings"].append(warn)
+        if findings:
+            result["integrity"] = findings
+            codes = ", ".join(sorted({f["code"] for f in findings}))
+            b.add("INTEGRITY", f"diff weakens the test/CI signal: {codes}",
+                  "revert the weakening, or justify the line with a `dod-ok` comment")
+
     # ---- direct-push ladder -------------------------------------------------
     # On the default branch there is no PR to open and no review to wait for.
     # Done is: committed, pushed, and level with origin. Stopping here also
@@ -724,7 +802,17 @@ def evaluate(cwd, do_integrity=True):
         # here first: with a collaborator's commit on origin and the remote made
         # unreachable, this ladder reported DONE / exit 0 while genuinely
         # behind — "green" and "green as far as I got" printing identically.
-        if repo["behind"]:
+        if repo["behind"] is None:
+            # The uncountable case, which `if repo["behind"]:` swallowed as zero.
+            # A failed FETCH is covered by REMOTE_UNVERIFIED above; this is the
+            # narrower one the reviewer isolated — the fetch worked and the
+            # rev-list did not, so "level with origin" was never established
+            # while the ladder's terminal condition IS being level with origin.
+            b.add("BEHIND_UNKNOWN",
+                  f"could not count commits on origin/{repo['default_branch']} "
+                  "that are missing here, so 'up to date' was NOT established",
+                  f"git fetch origin {repo['default_branch']} && re-run")
+        elif repo["behind"]:
             b.add("BEHIND_REMOTE",
                   f"{repo['behind']} commit(s) on origin/{repo['default_branch']} "
                   "not in the working copy",
@@ -785,7 +873,18 @@ def evaluate(cwd, do_integrity=True):
         # PR still reads MERGED — green, and the work is nowhere. Measured
         # against origin/<base>, which collect_repo has just fetched.
         stranded = repo["ahead_of_default"]
-        if stranded:
+        if stranded is None:
+            # None is "the rev-list failed", not "nothing was stranded", and
+            # collapsing the two emitted NOT_ON_DEFAULT — a confident, WRONG
+            # blocker telling the agent to go home while commits the merge did
+            # not take may still be sitting on the branch.
+            b.add("STRANDED_UNKNOWN",
+                  f"PR is merged, but the commits on {repo['branch']} could not "
+                  f"be counted against {repo['default_branch']} — whether the "
+                  "merge took everything is UNKNOWN",
+                  f"git fetch origin {repo['default_branch']} && re-run before "
+                  "deleting or leaving this branch")
+        elif stranded:
             b.add("COMMITS_AFTER_MERGE",
                   f"{stranded} commit(s) on {repo['branch']} are not in "
                   f"{repo['default_branch']} — the merge did not take them",
@@ -884,6 +983,22 @@ def evaluate(cwd, do_integrity=True):
                       "counted as neither passing nor pending",
                       "look at them on the PR — an unread check is not a green "
                       "one. If gh has grown a new bucket, teach dod-check it.")
+            # NOTHING actually ran. `total > 0` skips the NO_CHECKS branch above,
+            # and the bucket that made the total non-zero is one nobody reads:
+            # `skipping` is tallied and then never consulted, so a PR whose every
+            # job was skipped — `if:` false, a `paths:` filter the diff misses —
+            # reported DONE. Measured 2026-08-30: one skipped job away from the
+            # NO_CHECKS branch, and the verdict flips from BLOCKED to green.
+            # Deliberately narrow: this fires only when NOTHING passed, failed or
+            # is pending. A skipped job alongside real ones is ordinary.
+            if (checks["pass"] == 0 and checks["fail"] == 0
+                    and checks["pending"] == 0 and checks.get("skipping")):
+                b.add("CHECKS_ALL_SKIPPED",
+                      f"all {checks['total']} check(s) were SKIPPED — nothing "
+                      "actually ran, so nothing was verified",
+                      "find out why every job skipped: an `if:` condition or a "
+                      "paths filter that excludes this branch is green-by-"
+                      "not-running, exactly like a deleted workflow")
             if checks["fail"]:
                 names = ", ".join(c["name"] for c in checks["failing"][:5])
                 b.add("CHECKS_FAILING",
@@ -895,15 +1010,7 @@ def evaluate(cwd, do_integrity=True):
                       f"{checks['pending']} check(s) still running",
                       "gh pr checks --watch --fail-fast")
 
-    if do_integrity:
-        findings, warn = collect_integrity(repo["root"], repo["default_branch"])
-        if warn:
-            result["warnings"].append(warn)
-        if findings:
-            result["integrity"] = findings
-            codes = ", ".join(sorted({f["code"] for f in findings}))
-            b.add("INTEGRITY", f"diff weakens the test/CI signal: {codes}",
-                  "revert the weakening, or justify the line with a `dod-ok` comment")
+    # (the integrity scan ran above, for both ladders — see the comment there)
 
     result["blockers"] = b.as_list()
     result["done"] = len(b) == 0
