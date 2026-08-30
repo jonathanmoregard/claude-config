@@ -41,19 +41,48 @@ if [ "$sub" = "api graphql" ]; then
       echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":false,"isOutdated":false},{"isResolved":true,"isOutdated":false}]}}}}}' ;;
     threaderror)
       echo "HTTP 502" >&2; exit 1 ;;
+    nullnodes)
+      # A 200 whose `nodes` is null. Every lookup above it succeeds and the
+      # iteration is what raises — which is how a designed soft-fail became a
+      # whole-predicate crash.
+      echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":null,"pageInfo":{"hasNextPage":false}}}}}}' ;;
+    manythreads)
+      # A full page, every thread resolved, and MORE behind it. Verbatim shape
+      # of a `first:100` connection that has been truncated: the caller cannot
+      # tell "no unresolved threads" from "no unresolved threads in the first
+      # hundred" without reading pageInfo.
+      nodes=""
+      for _ in $(seq 1 100); do
+        nodes="${nodes:+$nodes,}{\"isResolved\":true,\"isOutdated\":false}"
+      done
+      printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[%s],"pageInfo":{"hasNextPage":true,"endCursor":"Y3Vyc29yOjEwMA=="}}}}}}\n' "$nodes" ;;
     *)
-      echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}' ;;
+      echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}' ;;
   esac
   exit 0
 fi
 
 case "$DOD_FIXTURE" in
+  nongithub)
+    # The real CLI rejects a non-GitHub remote locally, with no network call.
+    # Verbatim from `gh pr view` against a gitlab.com remote, 2026-08-30.
+    if [ "$sub" = "pr view" ]; then
+      echo "none of the git remotes configured for this repository point to a known GitHub host." >&2
+      exit 1
+    fi
+    ;;
   no_pr)
     [ "$sub" = "pr view" ] && { echo "no pull requests found for branch" >&2; exit 1; }
     ;;
   merged)
+    # headRefOid is the commit the PR actually merged, and it is what separates
+    # landed work from work pushed afterwards — independently of whether GitHub
+    # squashed, rebased or merged. The caller sets DOD_HEAD_OID to whichever
+    # commit its scenario means; the all-zero default is a SHA no repo has, so a
+    # test that forgets to set it gets STRANDED_UNKNOWN rather than a quiet zero.
     if [ "$sub" = "pr view" ]; then
-      echo '{"number":42,"url":"https://github.com/o/r/pull/42","state":"MERGED","isDraft":false,"mergeStateStatus":"UNKNOWN","reviewDecision":"APPROVED","reviewThreads":{"nodes":[]},"headRefName":"f","baseRefName":"master","title":"t"}'
+      printf '{"number":42,"url":"https://github.com/o/r/pull/42","state":"MERGED","isDraft":false,"mergeStateStatus":"UNKNOWN","reviewDecision":"APPROVED","reviewThreads":{"nodes":[]},"headRefName":"f","headRefOid":"%s","baseRefName":"master","title":"t"}\n' \
+        "${DOD_HEAD_OID:-0000000000000000000000000000000000000000}"
       exit 0
     fi
     [ "$sub" = "pr checks" ] && { echo '[{"name":"ci","state":"SUCCESS","bucket":"pass","link":"","workflow":"w"}]'; exit 0; }
@@ -99,7 +128,45 @@ case "$DOD_FIXTURE" in
     fi
     [ "$sub" = "pr checks" ] && { echo "no checks reported on the 'f' branch" >&2; exit 1; }
     ;;
-  green|threaderror|two_prs|listerror)
+  allskip)
+    # Every job SKIPPED. `total > 0` so the NO_CHECKS branch never fires, and
+    # the bucket that made the total non-zero is the one nobody read. An `if:`
+    # condition or a paths filter that excludes the branch produces exactly this.
+    if [ "$sub" = "pr view" ]; then
+      echo '{"number":52,"url":"https://github.com/o/r/pull/52","state":"OPEN","isDraft":false,"mergeStateStatus":"CLEAN","reviewDecision":"APPROVED","headRefName":"f","baseRefName":"master","title":"t"}'
+      exit 0
+    fi
+    [ "$sub" = "pr checks" ] && { echo '[{"name":"build","state":"SKIPPED","bucket":"skipping","link":"","workflow":"w"},{"name":"test","state":"SKIPPED","bucket":"skipping","link":"","workflow":"w"}]'; exit 0; }
+    ;;
+  mixedskip)
+    # One real pass alongside a skipped job: ORDINARY, and must stay green.
+    if [ "$sub" = "pr view" ]; then
+      echo '{"number":53,"url":"https://github.com/o/r/pull/53","state":"OPEN","isDraft":false,"mergeStateStatus":"CLEAN","reviewDecision":"APPROVED","headRefName":"f","baseRefName":"master","title":"t"}'
+      exit 0
+    fi
+    [ "$sub" = "pr checks" ] && { echo '[{"name":"build","state":"SUCCESS","bucket":"pass","link":"","workflow":"w"},{"name":"lint","state":"SKIPPED","bucket":"skipping","link":"","workflow":"w"}]'; exit 0; }
+    ;;
+  dictchecks)
+    # A shape gh does not return today. Unchecked, it reaches `for row in rows`
+    # and raises past every handler into main()'s blanket except — a
+    # whole-predicate crash presented as a measurement that found nothing.
+    if [ "$sub" = "pr view" ]; then
+      echo '{"number":54,"url":"https://github.com/o/r/pull/54","state":"OPEN","isDraft":false,"mergeStateStatus":"CLEAN","reviewDecision":"APPROVED","headRefName":"f","baseRefName":"master","title":"t"}'
+      exit 0
+    fi
+    [ "$sub" = "pr checks" ] && { echo '{"unexpected":"object"}'; exit 0; }
+    ;;
+  weirdbucket)
+    # A bucket this tool does not know. `gh pr checks` has grown bucket values
+    # before, and an unrecognised one counts toward `total` while being tallied
+    # as neither fail nor pending — so an UNMEASURED check contributes to DONE.
+    if [ "$sub" = "pr view" ]; then
+      echo '{"number":51,"url":"https://github.com/o/r/pull/51","state":"OPEN","isDraft":false,"mergeStateStatus":"CLEAN","reviewDecision":"APPROVED","headRefName":"f","baseRefName":"master","title":"t"}'
+      exit 0
+    fi
+    [ "$sub" = "pr checks" ] && { echo '[{"name":"ci","state":"NEUTRAL","bucket":"neutral","link":"","workflow":"w"}]'; exit 0; }
+    ;;
+  green|threaderror|two_prs|listerror|manythreads|nullnodes)
     if [ "$sub" = "pr view" ]; then
       echo '{"number":48,"url":"https://github.com/o/r/pull/48","state":"OPEN","isDraft":false,"mergeStateStatus":"CLEAN","reviewDecision":"APPROVED","reviewThreads":{"nodes":[]},"headRefName":"f","baseRefName":"master","title":"t"}'
       exit 0

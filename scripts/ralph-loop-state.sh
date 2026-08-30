@@ -52,14 +52,34 @@ ralph_state_field() {  # $1=file $2=field
 # that ralph-loop-setup.sh records — which is why that field exists, and why
 # cwd-shaped consumers (compact-reinject, idle-handoff) must come through here
 # rather than rebuilding the glob themselves.
+# One directory has many spellings, and string equality knows none of them.
+# `armed_in:` is recorded from $PWD at setup; a consumer asking with a trailing
+# slash, or with the symlinked path that ~/worktrees hands out, missed — and a
+# miss reads as "no loop is armed here", which is the answer that silently drops
+# the reinject and lets idle-handoff treat a live loop's checkout as idle.
+# realpath resolves symlinks and normalises the rest; -m so a directory that no
+# longer exists still normalises rather than failing. Without realpath, strip
+# trailing slashes, which is the spelling difference that actually turns up.
+_ralph_canon_dir() {  # $1=directory -> canonical spelling on stdout
+  local d="$1"
+  [[ -n "$d" ]] || return 1
+  if command -v realpath >/dev/null 2>&1 && realpath -m -- "$d" 2>/dev/null; then
+    return 0
+  fi
+  while [[ "$d" == */ && "$d" != "/" ]]; do d="${d%/}"; done
+  printf '%s\n' "$d"
+}
+
 ralph_state_for_dir() {  # $1=directory
-  local dir="$1" f armed
+  local dir f armed
+  dir=$(_ralph_canon_dir "$1") || return 1
   [[ -d "$RALPH_STATE_DIR" ]] || return 1
   for f in "$RALPH_STATE_DIR"/*.md; do
     # An unmatched glob stays literal; -f rejects it without needing nullglob,
     # which is a shell-global setting this function must not leave switched on.
     [[ -f "$f" ]] || continue
     armed=$(ralph_state_field "$f" armed_in)
+    [[ -n "$armed" ]] && armed=$(_ralph_canon_dir "$armed")
     if [[ -n "$armed" && "$armed" == "$dir" ]]; then
       printf '%s\n' "$f"
       return 0
