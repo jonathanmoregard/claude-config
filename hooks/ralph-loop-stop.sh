@@ -30,7 +30,42 @@ STATE_DIR="$RALPH_STATE_DIR"
 # the harness timeout for THIS hook — settings.json gives the ralph entry no
 # `timeout` key, so it runs on the 60s default — minus the transcript poll
 # further down, which can spend ~3s of that on its own.
-GATE_CALL_TIMEOUT="${CLAUDE_RALPH_GATE_TIMEOUT:-45}"
+# VALIDATED AND CLAMPED, like every numeric knob in the gate. Unvalidated it had
+# two silent failures: a non-numeric value makes `timeout` exit 125, so EVERY
+# handover would block with the generic "gate FAILED to run" and the real verdict
+# would never be computed; and `timeout 0` means NO limit to GNU timeout, which
+# removes the belt entirely while looking like a deliberate setting.
+#
+# The default is deliberately ABOVE the gate's own 45s budget and below the 60s
+# slot minus the transcript poll: equal numbers meant a budget-saturated gate
+# lost its detailed verdict to a generic 124 block, which is a worse message for
+# the same event.
+GATE_CALL_TIMEOUT="${CLAUDE_RALPH_GATE_TIMEOUT:-52}"
+if [[ ! "$GATE_CALL_TIMEOUT" =~ ^[0-9]+$ ]] \
+   || (( GATE_CALL_TIMEOUT < 5 )) || (( GATE_CALL_TIMEOUT > 55 )); then
+  echo "⚠️  Ralph loop: CLAUDE_RALPH_GATE_TIMEOUT='$GATE_CALL_TIMEOUT' is not a whole number of seconds in 5..55; using 52" >&2
+  GATE_CALL_TIMEOUT=52
+fi
+
+# jq is this hook's parser AND its output builder, and it was called bare under
+# `set -euo pipefail`: with jq off PATH the hook died on the next line, silently,
+# every turn. That is worse than it sounds. The loop's state file survives, and
+# the standalone gate yields to it ("a ralph loop owns this session") on this
+# turn and on every later one — so the definition-of-done gate is disabled for
+# as long as that file exists. Same shape as the `rm -f` and `source` defects
+# this branch already closed.
+#
+# Blocking is the only response that keeps a human in the loop, but ONLY when
+# some loop state actually exists: a machine without jq and without loops has
+# nothing to say here.
+if ! command -v jq >/dev/null 2>&1; then
+  if compgen -G "$STATE_DIR/*.md" >/dev/null 2>&1; then
+    printf '%s\n' '{"decision":"block","reason":"The ralph loop hook cannot run: jq is not on PATH, so it can neither read the payload nor build its reply. Its loop state file is still in place, and the definition-of-done gate stands down whenever that file exists - so nothing is measuring this session. Install jq, or delete the loop state file under CLAUDE_RALPH_STATE_DIR.","systemMessage":"jq missing, loop state present, dod gate standing down"}'
+  else
+    echo "⚠️  Ralph loop: jq is not on PATH; no loop state present, so nothing to do" >&2
+  fi
+  exit 0
+fi
 
 HOOK_SESSION=$(echo "$HOOK_INPUT" | jq -r '.session_id // ""')
 
@@ -135,7 +170,7 @@ end_loop() {  # $1 = human-readable message for the transcript
       runner=(timeout "$GATE_CALL_TIMEOUT")
     fi
     out=$(printf '%s' "$HOOK_INPUT" \
-          | CLAUDE_DOD_HANDOVER=1 "${runner[@]}" python3 "$gate" 2>"$gate_err") \
+          | CLAUDE_DOD_HANDOVER=1 ${runner[@]+"${runner[@]}"} python3 "$gate" 2>"$gate_err") \
       || gate_rc=$?
     if [[ $gate_rc -ne 0 ]]; then
       if [[ $gate_rc -eq 124 ]]; then

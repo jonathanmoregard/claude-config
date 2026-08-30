@@ -624,8 +624,23 @@ def evaluate(cwd, do_integrity=True):
         # is no PR to find and never will be. Treating it as exit 3 made the gate
         # unsatisfiable: it blocked every turn until the budget burned.
         if "known github host" in gh_error.lower():
+            # ...but only the PULL-REQUEST HALF of the ladder is inapplicable.
+            # The committed -> pushed half was measured above, and this return
+            # used to drop it. Reproduced 2026-08-30 on a GitLab remote with a
+            # dirty tree AND an unpushed commit: exit 2, `blockers: []`, and
+            # "n/a — nothing to open a PR against", while the same payload's
+            # repo block said dirty: true, ahead_of_default: 1. The exit-3
+            # branch below kept its accumulator all along — this was the
+            # asymmetry, and exit 2 is the worse of the two to lose blockers
+            # on, because the Stop hook reads 2 as "nothing to check here" and
+            # ends the turn.
+            result["blockers"] = b.as_list()
+            result["reason"] = ("no GitHub remote — the pull-request half of "
+                                "the ladder does not apply here")
+            if len(b):
+                result["done"] = False
+                return result, 1
             result.update(applicable=False, error=None)
-            result["reason"] = "no GitHub remote — nothing to open a PR against"
             return result, 2
         result["error"] = gh_error
         result["blockers"] = b.as_list()

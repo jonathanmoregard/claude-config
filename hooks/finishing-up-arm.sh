@@ -15,7 +15,13 @@ set -uo pipefail
 STATE_DIR="${CLAUDE_DOD_STATE_DIR:-$HOME/.local/state/claude-dod}"
 
 input=$(cat)
-command -v jq >/dev/null 2>&1 || exit 0
+if ! command -v jq >/dev/null 2>&1; then
+  # Silent, this switched the ENTIRE enforcement system off with no signal: no
+  # session ever arms, so the Stop gate never checks anything and every turn
+  # ends looking clean. A degrade that total has to be loud.
+  echo "⚠️  finishing-up-arm: jq is not on PATH — no session will arm, so the definition-of-done gate will never run" >&2
+  exit 0
+fi
 
 session=$(jq -r '.session_id // ""' <<<"$input")
 # Reject anything that is not a plain token: this becomes a filename.
@@ -76,6 +82,10 @@ armfile="$STATE_DIR/$session.arm"
 
 # One line per repo, de-duplicated. A session may legitimately touch several.
 if [ -f "$armfile" ] && grep -qxF "$root" "$armfile" 2>/dev/null; then
+  # Touch it. The gate's reaper is age-based, and a long session editing ONE
+  # repo would otherwise carry an armfile whose mtime froze at the first edit —
+  # reapable mid-work, which costs an unguarded turn until the next new repo.
+  touch "$armfile" 2>/dev/null || true
   exit 0
 fi
 printf '%s\n' "$root" >> "$armfile"
