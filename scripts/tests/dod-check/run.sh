@@ -217,6 +217,24 @@ echo "y = 1  # ordinary change" >> src/a.py
 git add -A; git commit -qm ok; git push -q
 case_run "clean diff not flagged" green 0 "DONE"
 
+# ---- a non-GitHub remote is n/a for the PR half ONLY ----------------------
+# The committed -> pushed half is measured before `gh` is ever called, and this
+# path used to discard it: reproduced 2026-08-30 on a gitlab.com remote with a
+# dirty tree AND an unpushed commit, returning exit 2 with `blockers: []` and
+# "n/a — nothing to open a PR against", while the same payload's repo block read
+# dirty: true, ahead_of_default: 1. Exit 2 is the worst code to lose blockers
+# on: the Stop hook reads it as "nothing to check here" and ends the turn.
+fresh_repo
+echo "committed but never pushed" >> src/a.py
+git add -A; git commit -qm "never pushed"
+echo "and uncommitted on top" >> src/a.py
+case_run "non-GitHub remote keeps the dirty tree it measured" nongithub 1 "DIRTY_TREE"
+case_run "  ...and the unpushed half of the ladder"           nongithub 1 "NOT_PUSHED"
+
+# With nothing to report it is still n/a — the PR half genuinely does not apply.
+fresh_repo; git push -q -u origin feat/x
+case_run "non-GitHub remote with nothing to report is n/a" nongithub 2 "n/a"
+
 # ---- JSON contract --------------------------------------------------------
 fresh_repo; git push -q -u origin feat/x
 j="$(DOD_FIXTURE=pending python3 "$DOD" --repo "$WORK" --json 2>&1)"

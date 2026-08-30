@@ -548,7 +548,7 @@ rm -f "$SD/$TSID.arm" "$SD/$TSID.blocks"
 # cannot be killed mid-measurement with its state file already deleted.
 SLOWGATE_HOME="$SD/slowgate"
 mkdir -p "$SLOWGATE_HOME/.claude/hooks" "$SLOWGATE_HOME/.claude/scripts"
-printf 'import time\ntime.sleep(30)\n' > "$SLOWGATE_HOME/.claude/hooks/finishing-up-gate.py"
+printf 'import time\ntime.sleep(45)\n' > "$SLOWGATE_HOME/.claude/hooks/finishing-up-gate.py"
 cp "$HOME/.claude/scripts/ralph-loop-state.sh" "$SLOWGATE_HOME/.claude/scripts/"
 GSID="slowgate-$RANDOM"
 printf -- '---\nactive: true\niteration: 4\nmax_iterations: 25\ncompletion_promise: "ALL DONE"\n---\np\n' \
@@ -556,7 +556,7 @@ printf -- '---\nactive: true\niteration: 4\nmax_iterations: 25\ncompletion_promi
 t0=$(date +%s)
 out=$(printf '{"session_id":"%s","transcript_path":"%s"}' "$GSID" "$MT" \
       | CLAUDE_DOD_STATE_DIR="$SD" HOME="$SLOWGATE_HOME" \
-        CLAUDE_RALPH_GATE_TIMEOUT=2 bash "$RALPH_HOOK" 2>/dev/null)
+        CLAUDE_RALPH_GATE_TIMEOUT=5 bash "$RALPH_HOOK" 2>/dev/null)
 t1=$(date +%s)
 ck "a gate that cannot finish BLOCKS the handover turn" "block" "$(decision "$out")"
 ck "  ...bounded, not waited on" "yes" \
@@ -614,6 +614,78 @@ ck "a missing state resolver does not kill the hook" "block" "$(decision "$out")
 ck "  ...and the loop still ended" "gone" \
    "$([ -e "$CLAUDE_RALPH_STATE_DIR/$NSID.md" ] && echo kept || echo gone)"
 rm -f "$SD/$NSID.arm" "$SD/$NSID.blocks"
+
+echo
+echo "== a budget that outlives its slot is not a budget =="
+# CLAUDE_DOD_TOTAL_BUDGET=90 is what an operator plausibly picks once a session
+# arms two repos. Measured 2026-08-30: it ran 80.34s inside the 60s slot the
+# hook is registered with, and the harness kill left empty stdout, no gate.log
+# line and no countfile — the exact fail-open the budget was added to remove.
+# Nothing warned, because the only budget message the hook could emit was the
+# floor one. The ceiling is now READ from the registration rather than trusted
+# to whoever set the variable.
+CAPSID="ceiling-$RANDOM"
+printf '%s\n' "$BREPO" > "$SD/$CAPSID.arm"
+out=$(gate_run "$CAPSID" CLAUDE_DOD_TOTAL_BUDGET=900)
+ck "an over-slot budget still blocks" "block" "$(decision "$out")"
+ck "  ...and the clamp is in the log" "yes" \
+   "$(grep -q 'outlives the' "$SD/gate.log" && echo yes || echo no)"
+rm -f "$SD/$CAPSID.arm" "$SD/$CAPSID.blocks"
+
+# And the ceiling is genuinely derived, not a second constant to keep in sync:
+# register the hook with a smaller timeout and the budget follows it down.
+SLOTSID="slot-$RANDOM"
+printf '%s\n' "$BREPO" > "$SD/$SLOTSID.arm"
+printf '%s' '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"python3 $HOME/.claude/hooks/finishing-up-gate.py","timeout":12}]}]}}' \
+  > "$SD/settings-tiny.json"
+out=$(gate_run "$SLOTSID" CLAUDE_DOD_SETTINGS="$SD/settings-tiny.json" CLAUDE_DOD_TOTAL_BUDGET=40)
+ck "the ceiling follows the registered timeout" "yes" \
+   "$(grep -q '12s slot' "$SD/gate.log" && echo yes || echo no)"
+rm -f "$SD/$SLOTSID.arm" "$SD/$SLOTSID.blocks"
+
+echo
+echo "== the outer belt is validated, not trusted =="
+# Unvalidated, CLAUDE_RALPH_GATE_TIMEOUT had two silent failures: a non-numeric
+# value makes `timeout` exit 125, so EVERY handover blocked with the generic
+# "gate FAILED to run" and the real verdict was never computed; and `timeout 0`
+# means NO limit to GNU timeout, removing the belt while looking deliberate.
+for bad_timeout in abc 0 999; do
+  VSID="timeoutval-$RANDOM"
+  printf -- '---\nactive: true\niteration: 25\nmax_iterations: 25\n---\np\n' \
+    > "$CLAUDE_RALPH_STATE_DIR/$VSID.md"
+  printf '%s\n' "$BREPO" > "$SD/$VSID.arm"
+  out=$(printf '{"session_id":"%s","transcript_path":"%s"}' "$VSID" "$MT" \
+        | CLAUDE_DOD_STATE_DIR="$SD" CLAUDE_RALPH_GATE_TIMEOUT="$bad_timeout" \
+          bash "$RALPH_HOOK" 2>"$SD/tv-$bad_timeout.err")
+  ck "CLAUDE_RALPH_GATE_TIMEOUT=$bad_timeout still reaches a real verdict" \
+     "block" "$(decision "$out")"
+  case "$(cat "$SD/tv-$bad_timeout.err")" in
+    *"using 52"*) r=named ;; *) r="$(cat "$SD/tv-$bad_timeout.err")" ;;
+  esac
+  ck "  ...and says what it used instead" "named" "$r"
+  rm -f "$SD/$VSID.arm" "$SD/$VSID.blocks"
+done
+
+echo
+echo "== a hook without jq must not die quietly =="
+# jq is this hook's parser AND its output builder, called bare under set -e: off
+# PATH, the hook died on the next line, silently, every turn. The loop state
+# file then survives, and the standalone gate yields to it on this turn and
+# every later one — so the whole gate is disabled for as long as it exists.
+NOJQ="$SD/nojq-bin"; mkdir -p "$NOJQ"
+for b in bash env python3 git sed awk grep cat date mktemp rm timeout head tr perl seq sleep; do
+  src=$(command -v "$b" 2>/dev/null) && ln -sf "$src" "$NOJQ/$b"
+done
+JSID="nojq-$RANDOM"
+printf -- '---\nactive: true\niteration: 4\nmax_iterations: 25\n---\np\n' \
+  > "$CLAUDE_RALPH_STATE_DIR/$JSID.md"
+out=$(printf '{"session_id":"%s","transcript_path":"%s"}' "$JSID" "$MT" \
+      | PATH="$NOJQ" CLAUDE_DOD_STATE_DIR="$SD" bash "$RALPH_HOOK" 2>/dev/null)
+ck "a missing jq BLOCKS while loop state exists" "block" "$(decision "$out")"
+rm -f "$CLAUDE_RALPH_STATE_DIR/$JSID.md"
+out=$(printf '{"session_id":"%s","transcript_path":"%s"}' "$JSID" "$MT" \
+      | PATH="$NOJQ" CLAUDE_DOD_STATE_DIR="$SD" bash "$RALPH_HOOK" 2>/dev/null)
+ck "  ...and is quiet when no loop is armed anywhere" "" "$(decision "$out")"
 
 echo
 echo "== $pass passed, $fail failed =="
