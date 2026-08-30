@@ -20,7 +20,11 @@ if ! command -v jq >/dev/null 2>&1; then
   # session ever arms, so the Stop gate never checks anything and every turn
   # ends looking clean. A degrade that total has to be loud.
   echo "⚠️  finishing-up-arm: jq is not on PATH — no session will arm, so the definition-of-done gate will never run" >&2
-  exit 0
+  # Non-zero, or the warning is not surfaced: a PostToolUse hook's stderr is
+  # shown on a non-zero exit, and at exit 0 this message went nowhere. 1, never
+  # 2 — 2 blocks the tool call itself, and a hook that cannot arm must not stop
+  # the user's edit from landing.
+  exit 1
 fi
 
 session=$(jq -r '.session_id // ""' <<<"$input")
@@ -77,7 +81,15 @@ if [ -z "$default" ]; then
 fi
 [ -n "$default" ] || exit 0
 
-mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
+# Same total impact as the missing-jq branch above — no session arms, so the
+# gate never checks anything — and this one used to say nothing on any channel.
+# A non-zero exit is what makes a PostToolUse hook's stderr visible at all; 1
+# rather than 2, because 2 is the code that BLOCKS the tool call, and failing to
+# arm must not stop the user's edit from landing.
+mkdir -p "$STATE_DIR" 2>/dev/null || {
+  echo "⚠️  finishing-up-arm: cannot create $STATE_DIR — no session will arm, so the definition-of-done gate will never run" >&2
+  exit 1
+}
 armfile="$STATE_DIR/$session.arm"
 
 # One line per repo, de-duplicated. A session may legitimately touch several.
@@ -97,7 +109,15 @@ armfile="$STATE_DIR/$session.arm"
 # The redirection is on the SUBSHELL, never on `exec`: a failed `exec`
 # redirection exits a non-interactive shell outright, which would turn an
 # unwritable state dir into a hook that reports failure to the user.
-(
+# NO blanket `2>/dev/null` on this subshell, and the result is CHECKED. The
+# suppression hid the write half specifically: an open failure escapes it anyway
+# (bash applies 9>> before 2>), but a failed append — ENOSPC, a quota, an
+# rlimit — printed nothing at all and the unconditional `exit 0` discarded the
+# status. Measured against /dev/full: `printf >&9` returns 1 with the message
+# swallowed. No armfile means the gate has nothing to check and ends the turn
+# with no output and no log line, which is enforcement off rather than a hook
+# that failed. That silence was introduced by this round's own flock fix.
+if ! (
   if command -v flock >/dev/null 2>&1; then
     # -w so a stuck holder can never hang a tool call; timing out just falls
     # through to the unserialised path, which is where this started.
@@ -111,5 +131,8 @@ armfile="$STATE_DIR/$session.arm"
   else
     printf '%s\n' "$root" >&9
   fi
-) 9>>"$armfile" 2>/dev/null
+) 9>>"$armfile"; then
+  echo "⚠️  finishing-up-arm: could not record $root in $armfile — this session will NOT be checked by the definition-of-done gate" >&2
+  exit 1
+fi
 exit 0
