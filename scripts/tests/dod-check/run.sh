@@ -273,7 +273,18 @@ case_run "  ...and it names the bucket it did not know" weirdbucket 1 "neutral"
 # exist as far as this tool was concerned, and a truncated page of resolved
 # threads printed as a clean sheet.
 fresh_repo; git push -q -u origin feat/x
-case_run "a truncated thread page is not a clean sheet" manythreads 0 "only the first 100"
+# NAME MATTERS HERE. This case asserts exit 0, which IS the clean sheet — the
+# earlier name ("...is not a clean sheet") claimed more than the assertion
+# checks. Not blocking is deliberate and documented in the Stop gate: blocking
+# on an unreadable remote would hang every offline session. What the branch
+# fixed is that truncation is now SAID rather than silently dropped.
+case_run "a truncated thread page says the threads were not counted" manythreads 0 "only the first 100"
+
+# A `nodes: null` payload passes every lookup and raises on ITERATION. That
+# escalated a soft-fail warning into a crash caught only by main()'s blanket
+# handler, which reports exit 3 with an empty blockers list — a whole-predicate
+# failure caused by an optional, deliberately advisory check.
+case_run "a null thread list warns, it does not crash" nullnodes 0 "unexpected shape"
 
 # argparse exits 2 on a usage error, and 2 is this tool's documented n/a code —
 # so a typo in the flag reads to every caller as "the definition of done does
@@ -284,6 +295,44 @@ out="$(python3 "$DOD" --repo "$WORK" --bogus 2>&1)"; code=$?
 out="$(python3 "$DOD" --help 2>&1)"; code=$?
 [ "$code" = 0 ] && ok "  ...and --help is still exit 0" \
   || bad "  ...and --help is still exit 0" "exit 0" "exit $code — $out"
+
+# ---- a broken git is not "not a git repository" ---------------------------
+# `run()` returns 124 on a timeout and 127 when the command cannot be spawned,
+# and collect_repo folded both into "not a git repository" -> exit 2. Exit 2 is
+# the one code that means STOP LOOKING: the Stop hook reads it as nothing to
+# check, skips the repo, unlinks the armfile and ends the turn. Measured end to
+# end — same gate, same repo, same real UNPUSHED_COMMITS blocker, and the only
+# variable was whether git was on PATH.
+fresh_repo; git push -q -u origin feat/x
+PY3="$(command -v python3)"
+EMPTYBIN="$(mktemp -d)"
+out="$(cd "$WORK" && env PATH="$EMPTYBIN" "$PY3" "$DOD" --repo "$WORK" 2>&1)"; code=$?
+rmdir "$EMPTYBIN" 2>/dev/null
+if [ "$code" = 3 ]; then ok "a git that cannot run is exit 3, not n/a"
+else bad "a git that cannot run is exit 3, not n/a" "exit 3" "exit $code — $out"; fi
+if grep -qF "COULD NOT MEASURE" <<<"$out"; then ok "  ...and says it could not measure"
+else bad "  ...and says it could not measure" "COULD NOT MEASURE" "$out"; fi
+
+# ---- an unreadable base ref is not "this repo has no CI" -------------------
+# ci_configured required BOTH refs to be unreadable before admitting it could
+# not tell. With HEAD readable and empty, one unreadable ref returned
+# False = "no CI configured", which waves the branch through. The trigger needs
+# no tampering: rename the base branch upstream while the local origin/HEAD
+# symref still names the old one, and `git fetch origin <base>` fails while
+# everything else keeps working. Reproduced 2026-08-30 on a branch that had
+# deleted its only workflow: exit 0, DONE, no NO_CHECKS.
+fresh_repo
+git switch -q master
+mkdir -p .github/workflows
+printf "$WF" > .github/workflows/ci.yml
+git add -A; git commit -qm ci; git push -q origin master
+git switch -q -C feat/x master
+git rm -q -r .github/workflows; git commit -qm "drop ci"
+git push -q -u origin feat/x
+git update-ref -d refs/remotes/origin/master
+git remote set-url origin "$HERE/gone-away.git"
+case_run "an unreadable base ref still demands CI" nochecks 1 "NO_CHECKS"
+case_run "  ...and says the ref could not be read"  nochecks 1 "REMOTE_UNVERIFIED"
 
 # ---- JSON contract --------------------------------------------------------
 fresh_repo; git push -q -u origin feat/x

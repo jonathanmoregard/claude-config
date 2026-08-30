@@ -41,6 +41,11 @@ if [ "$sub" = "api graphql" ]; then
       echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":false,"isOutdated":false},{"isResolved":true,"isOutdated":false}]}}}}}' ;;
     threaderror)
       echo "HTTP 502" >&2; exit 1 ;;
+    nullnodes)
+      # A 200 whose `nodes` is null. Every lookup above it succeeds and the
+      # iteration is what raises — which is how a designed soft-fail became a
+      # whole-predicate crash.
+      echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":null,"pageInfo":{"hasNextPage":false}}}}}}' ;;
     manythreads)
       # A full page, every thread resolved, and MORE behind it. Verbatim shape
       # of a `first:100` connection that has been truncated: the caller cannot
@@ -127,7 +132,7 @@ case "$DOD_FIXTURE" in
     fi
     [ "$sub" = "pr checks" ] && { echo '[{"name":"ci","state":"NEUTRAL","bucket":"neutral","link":"","workflow":"w"}]'; exit 0; }
     ;;
-  green|threaderror|two_prs|listerror|manythreads)
+  green|threaderror|two_prs|listerror|manythreads|nullnodes)
     if [ "$sub" = "pr view" ]; then
       echo '{"number":48,"url":"https://github.com/o/r/pull/48","state":"OPEN","isDraft":false,"mergeStateStatus":"CLEAN","reviewDecision":"APPROVED","reviewThreads":{"nodes":[]},"headRefName":"f","baseRefName":"master","title":"t"}'
       exit 0
