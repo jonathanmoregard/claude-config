@@ -122,6 +122,34 @@ case "$DOD_FIXTURE" in
     fi
     [ "$sub" = "pr checks" ] && { echo "no checks reported on the 'f' branch" >&2; exit 1; }
     ;;
+  allskip)
+    # Every job SKIPPED. `total > 0` so the NO_CHECKS branch never fires, and
+    # the bucket that made the total non-zero is the one nobody read. An `if:`
+    # condition or a paths filter that excludes the branch produces exactly this.
+    if [ "$sub" = "pr view" ]; then
+      echo '{"number":52,"url":"https://github.com/o/r/pull/52","state":"OPEN","isDraft":false,"mergeStateStatus":"CLEAN","reviewDecision":"APPROVED","headRefName":"f","baseRefName":"master","title":"t"}'
+      exit 0
+    fi
+    [ "$sub" = "pr checks" ] && { echo '[{"name":"build","state":"SKIPPED","bucket":"skipping","link":"","workflow":"w"},{"name":"test","state":"SKIPPED","bucket":"skipping","link":"","workflow":"w"}]'; exit 0; }
+    ;;
+  mixedskip)
+    # One real pass alongside a skipped job: ORDINARY, and must stay green.
+    if [ "$sub" = "pr view" ]; then
+      echo '{"number":53,"url":"https://github.com/o/r/pull/53","state":"OPEN","isDraft":false,"mergeStateStatus":"CLEAN","reviewDecision":"APPROVED","headRefName":"f","baseRefName":"master","title":"t"}'
+      exit 0
+    fi
+    [ "$sub" = "pr checks" ] && { echo '[{"name":"build","state":"SUCCESS","bucket":"pass","link":"","workflow":"w"},{"name":"lint","state":"SKIPPED","bucket":"skipping","link":"","workflow":"w"}]'; exit 0; }
+    ;;
+  dictchecks)
+    # A shape gh does not return today. Unchecked, it reaches `for row in rows`
+    # and raises past every handler into main()'s blanket except — a
+    # whole-predicate crash presented as a measurement that found nothing.
+    if [ "$sub" = "pr view" ]; then
+      echo '{"number":54,"url":"https://github.com/o/r/pull/54","state":"OPEN","isDraft":false,"mergeStateStatus":"CLEAN","reviewDecision":"APPROVED","headRefName":"f","baseRefName":"master","title":"t"}'
+      exit 0
+    fi
+    [ "$sub" = "pr checks" ] && { echo '{"unexpected":"object"}'; exit 0; }
+    ;;
   weirdbucket)
     # A bucket this tool does not know. `gh pr checks` has grown bucket values
     # before, and an unrecognised one counts toward `total` while being tallied
