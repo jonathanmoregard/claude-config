@@ -125,6 +125,23 @@ if ARM_MAX_AGE_DAYS != 0 and ARM_MAX_AGE_DAYS < 1:
 HANDOVER = os.environ.get("CLAUDE_DOD_HANDOVER") == "1"
 DOD_TIMEOUT = 60
 
+# TOTAL wall clock for this hook, bounded BELOW the timeout it is registered
+# with in settings.json (60s today). DOD_TIMEOUT above is spent PER ARMED REPO
+# inside main()'s loop, so the hook could legally run 60s x N while the harness
+# kills it at 60s — which puts its own fail-closed TimeoutExpired branch ABOVE
+# the point the kill lands. MEASURED 2026-08-29: two armed repos with a 45s
+# dod-check ran 90.08s, and a SIGTERM at 60s left EMPTY stdout, no gate.log
+# line and no .blocks file — the turn ended unguarded and silent. With one repo
+# and a 61s check the gate's own timeout fires at 60.12s and loses that race by
+# 120ms, so the fail-closed path only ever worked when nothing enforced the
+# registered timeout. A budget that outlives its harness slot is not a budget.
+TOTAL_BUDGET, _BUDGET_WARN = _num_env(
+    "CLAUDE_DOD_TOTAL_BUDGET", 45.0, float, floor=2.0)
+# Below this there is no point starting another dod-check: it cannot finish, and
+# a dod-check killed at 1s reports the same "did not run" as a real timeout
+# while costing a second of the budget the remaining repos need.
+MIN_SLICE = 3.0
+
 
 def log(session, payload):
     try:
@@ -206,13 +223,13 @@ def block(reason, session, why, guards=None):
     sys.exit(0)
 
 
-def run_dod(repo):
+def run_dod(repo, timeout=DOD_TIMEOUT):
     try:
         p = subprocess.run(
             [sys.executable, str(DOD), "--repo", repo, "--json"],
             capture_output=True,
             text=True,
-            timeout=DOD_TIMEOUT,
+            timeout=timeout,
             check=False,
         )
     except (subprocess.TimeoutExpired, OSError) as exc:
@@ -269,7 +286,7 @@ def main():
     for warn in (_MODE_UNKNOWN and
                  f"CLAUDE_DOD_MODE={_MODE_UNKNOWN!r} unrecognised; "
                  "failing closed to active",
-                 _MAX_BLOCKS_WARN, _ARM_WARN):
+                 _MAX_BLOCKS_WARN, _ARM_WARN, _BUDGET_WARN):
         if warn:
             log(session, {"action": "warn", "why": warn})
 
@@ -402,8 +419,24 @@ def main():
               session, why=f"armfile unreadable, NOTHING WAS CHECKED: {exc}")
 
     problems = []
+    # One budget for the whole hook, not one per repo. The repo that the budget
+    # runs out on is NOT MEASURED, which is a problem like any other — so the
+    # hook blocks, in its own slot, instead of being killed mid-loop with
+    # nothing on stdout and nothing in the log.
+    deadline = time.monotonic() + TOTAL_BUDGET
     for repo in repos:
-        result, err = run_dod(repo)
+        remaining = deadline - time.monotonic()
+        if remaining < MIN_SLICE:
+            problems.append(
+                f"{repo}: NOT MEASURED — this gate's own {TOTAL_BUDGET:g}s "
+                "budget was spent before this repository was reached, so its "
+                "state is unknown.\n"
+                "  That is not a green result. Re-run "
+                f"`python3 {DOD} --repo {repo}` yourself, or arm fewer "
+                "repositories per session."
+            )
+            continue
+        result, err = run_dod(repo, timeout=min(DOD_TIMEOUT, remaining))
         if err:
             problems.append(f"{repo}: {err} — treat as NOT done")
             continue
