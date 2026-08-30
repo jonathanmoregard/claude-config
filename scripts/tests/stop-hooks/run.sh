@@ -986,5 +986,51 @@ ck "  ...and still names the consequence" "yes" \
    "$(grep -q 'definition-of-done gate' "$SD/armjq.err" && echo yes || echo no)"
 
 echo
+echo "== a clean pass must not DISARM the session =="
+# The clean branch used to unlink the armfile, and that is how one gate instance
+# disarmed a session its sibling was still blocking. Once the armfile is gone the
+# gate returns at `if not armfile.exists(): allow()` — before any logging exists
+# — so every later turn ends allowed, silent and unrecorded. Nothing in this
+# suite asserted the deletion, which is why it survived seven rounds.
+CLEANDOD="$SD/clean-dod.py"
+printf 'import json\nprint(json.dumps({"applicable": True, "done": True, "blockers": []}))\n' \
+  > "$CLEANDOD"
+CLEANSID="cleanarm-$RANDOM"
+printf '%s\n' "$BREPO" > "$SD/$CLEANSID.arm"
+echo 3 > "$SD/$CLEANSID.blocks"
+out=$(gate_run "$CLEANSID" CLAUDE_DOD_CHECK="$CLEANDOD")
+ck "a clean pass ends the turn"              ""      "$(decision "$out")"
+ck "  ...by exiting 0, not by crashing"      "0"     "$(gate_rc)"
+ck "  ...and LEAVES the armfile in place"    "kept"  \
+   "$([ -e "$SD/$CLEANSID.arm" ] && echo kept || echo gone)"
+ck "  ...while resetting the block budget"   "gone"  \
+   "$([ -e "$SD/$CLEANSID.blocks" ] && echo kept || echo gone)"
+rm -f "$SD/$CLEANSID.arm"
+
+# The race itself, driven directly. MEASURED 2026-08-30 with both instances
+# running the REAL predicate against one healthy repo and a flaky transport
+# between them: 20 of 40 concurrent pairs reached different verdicts, and EVERY
+# divergence disarmed the session. Here the divergence is forced rather than
+# raced, because a test that only sometimes reproduces is a test that cannot
+# fail on purpose.
+BLOCKDOD="$SD/blocking-dod.py"
+printf 'import json, time\ntime.sleep(1)\nprint(json.dumps({"applicable": True, "done": False, "blockers": [{"code": "STILL_UNFINISHED", "detail": "work is not done"}]}))\n' \
+  > "$BLOCKDOD"
+RACESID="race-$RANDOM"
+printf '%s\n' "$BREPO" > "$SD/$RACESID.arm"
+( printf '{"session_id":"%s"}' "$RACESID" \
+  | env CLAUDE_DOD_STATE_DIR="$SD" CLAUDE_DOD_CHECK="$BLOCKDOD" \
+        CLAUDE_DOD_HANDOVER=1 python3 "$GATE" > "$SD/race-handover.out" 2>/dev/null ) &
+( printf '{"session_id":"%s"}' "$RACESID" \
+  | env CLAUDE_DOD_STATE_DIR="$SD" CLAUDE_DOD_CHECK="$CLEANDOD" \
+        python3 "$GATE" > "$SD/race-standalone.out" 2>/dev/null ) &
+wait
+ck "a clean sibling does not disarm a blocking handover" "kept" \
+   "$([ -e "$SD/$RACESID.arm" ] && echo kept || echo gone)"
+ck "  ...and the handover's block still reaches the agent" "block" \
+   "$(decision "$(cat "$SD/race-handover.out" 2>/dev/null)")"
+rm -f "$SD/$RACESID.arm" "$SD/$RACESID.blocks"
+
+echo
 echo "== $pass passed, $fail failed =="
 [ "$fail" -eq 0 ]

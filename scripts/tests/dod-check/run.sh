@@ -117,6 +117,9 @@ case_run "unpushed commits block" green 1 "UNPUSHED_COMMITS"
 # ---- PR states ------------------------------------------------------------
 fresh_repo; git push -q -u origin feat/x
 case_run "no PR blocks"            no_pr    1 "NO_PR"
+# The `merged` fixture reports headRefOid — the commit the PR actually merged.
+# Here nothing was pushed after the merge, so that is HEAD.
+export DOD_HEAD_OID="$(git rev-parse HEAD)"
 # Merged is no longer the end of the job. The repo is still parked on the dead
 # branch, and putting it back on the default branch at latest is the last step
 # of the work rather than a chore for Jonathan — "no closing ceremony for me to
@@ -128,10 +131,56 @@ case_run "merged demands going home" merged  1 "NOT_ON_DEFAULT"
 # A PR merges the commits it HAD. Push more to the branch afterwards and they
 # sit on a dead branch while the PR still reads MERGED — green, work nowhere.
 fresh_repo; git push -q -u origin feat/x
+export DOD_HEAD_OID="$(git rev-parse HEAD)"   # what the PR merged
 echo "after the merge" >> src/a.py; git add -A; git commit -qm "landed nowhere"
 git push -q
 case_run "commits the merge left behind block" merged 1 "COMMITS_AFTER_MERGE"
 case_run "and it counts them"                  merged 1 "1 commit(s) on feat/x"
+
+# ---- a squash or rebase merge is still a merge ----------------------------
+# The count used to be `rev-list origin/<base>..HEAD` — REACHABILITY, not
+# "landed". A squash or rebase merge writes new SHAs, so on a fully merged PR it
+# stayed non-zero and the predicate told the agent to cherry-pick work that was
+# already in the base. Measured over 16 scenarios: every squash and every rebase
+# was wrong, by exactly the branch's commit count. Only the plain --no-ff merge
+# — the one shape this suite modelled — was right.
+#
+# `git cherry` is NOT the answer and this is the case that proves it: GitHub
+# collapses N commits into one whose patch-id equals no individual commit's, so
+# patch-equivalence is correct for a 1-commit squash and WRONG for this one.
+fresh_repo
+git switch -q -c feat/x master 2>/dev/null || git switch -q feat/x
+echo "first half"  >> src/a.py; git add -A; git commit -qm "part one"
+echo "second half" >> src/a.py; git add -A; git commit -qm "part two"
+git push -q -u origin feat/x
+export DOD_HEAD_OID="$(git rev-parse HEAD)"   # exactly what GitHub would merge
+# Squash the two commits into origin/master, as a squash merge does.
+git switch -q master
+git merge -q --squash feat/x
+git commit -qm "squashed PR #42 (#42)"
+git push -q origin master
+git switch -q feat/x
+case_run "a squash-merged PR is not 'the merge did not take them'" merged 1 "NOT_ON_DEFAULT"
+# Captured, then grepped. Piping the predicate straight into `grep -q` under
+# `set -o pipefail` makes the `if` read the PREDICATE's exit code — 1, because it
+# is reporting blockers — not grep's, so the assertion took the else branch
+# whatever the text said. It could not fail. (Caught by mutation-checking this
+# very case against the pre-fix tree, which is the only reason it is not still
+# sitting here green and empty.)
+sq_out="$(DOD_FIXTURE=merged python3 "$DOD" --repo "$WORK" 2>&1)"
+if grep -qF "COMMITS_AFTER_MERGE" <<<"$sq_out"; then
+  bad "  ...and raises no stranded-commit blocker" "no COMMITS_AFTER_MERGE" "$sq_out"
+else
+  ok "  ...and raises no stranded-commit blocker"
+fi
+
+# ...while a commit pushed AFTER that squash merge is genuinely stranded, and
+# must still be caught. This is the case `git cherry` overcounts as 3.
+echo "genuinely stranded" >> src/a.py; git add -A; git commit -qm "after the squash"
+git push -q
+case_run "  ...but a commit pushed after the squash IS stranded" merged 1 "COMMITS_AFTER_MERGE"
+case_run "  ...counted exactly once"                             merged 1 "1 commit(s) on feat/x"
+unset DOD_HEAD_OID
 case_run "closed blocks"           closed   1 "PR_CLOSED"
 case_run "pending checks block"    pending  1 "CHECKS_PENDING"
 case_run "failing checks block"    failing  1 "CHECKS_FAILING"

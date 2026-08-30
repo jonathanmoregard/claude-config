@@ -37,6 +37,7 @@ write a hook that silently does nothing.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import math
 import os
@@ -654,11 +655,41 @@ def main():
         problems.append(f"{repo}:\n" + "\n".join(lines))
 
     if not problems:
-        for f in (armfile, countfile):
-            try:
-                f.unlink(missing_ok=True)
-            except OSError:
-                pass
+        # THE ARMFILE SURVIVES A CLEAN PASS. It used to be unlinked here, and
+        # that is how a clean instance DISARMED a session its sibling was still
+        # blocking.
+        #
+        # Two gate instances run on the loop's final turn — ralph's inline
+        # handover call and the standalone Stop entry — over the same unlocked
+        # state. MEASURED 2026-08-30: with both running the REAL predicate
+        # against the same healthy repo and only a flaky transport between them,
+        # 20 of 40 concurrent pairs reached DIFFERENT verdicts, and EVERY
+        # divergence disarmed the session. Once the armfile is gone the gate
+        # returns at `if not armfile.exists(): allow()` — before any logging
+        # exists — so every later turn ends allowed, silent, and unrecorded.
+        # The disarm event itself writes no log line either.
+        #
+        # Deleting nothing here removes the whole class without inventing a
+        # protocol between the two instances. That was the alternative, and it
+        # is the shape the ADOPT step already deleted once: a coordination
+        # mechanism whose correctness nothing downstream can enforce. The
+        # runtime still validates nothing, and `prompt_id` would make it
+        # implementable, not safe.
+        #
+        # What replaces the cleanup: the armfile is reaped by AGE (see reap()),
+        # and the arm hook re-touches its mtime on every edit, so a session that
+        # goes quiet is collected on the ordinary schedule. The cost is that a
+        # clean armed session re-measures on each later turn — which is this
+        # gate's job, at ~200ms per clean repo — and the benefit is that no
+        # concurrent verdict can ever leave a session unguarded.
+        #
+        # The COUNTFILE still goes: it is this session's block budget, a clean
+        # pass is exactly when it should reset, and losing that race costs at
+        # most one block slot rather than the whole gate.
+        try:
+            countfile.unlink(missing_ok=True)
+        except OSError:
+            pass
         if unmeasured:
             # The work is done as far as anything could tell — but something was
             # NOT established, and until now that fact reached only gate.log, a
@@ -674,8 +705,26 @@ def main():
                               + " — say so rather than reporting a clean sheet."}))
         allow()
 
+    # Read-modify-write under an exclusive lock. Both instances read the same
+    # `blocks` earlier and both wrote read+1: MEASURED, two blocks 29ms apart
+    # consumed ONE budget slot. The lock is held for a file read and a file
+    # write, so it cannot meaningfully delay either instance — this is not the
+    # gate body being serialised, which would put two full measurements inside
+    # one harness slot.
     try:
-        countfile.write_text(str(blocks + 1))
+        with open(countfile, "a+") as fh:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            except OSError:
+                pass  # no locking on this filesystem: the old lost-update risk
+            fh.seek(0)
+            try:
+                current = int((fh.read() or "0").strip() or 0)
+            except ValueError:
+                current = blocks
+            fh.seek(0)
+            fh.truncate()
+            fh.write(str(current + 1))
     except OSError as exc:
         # Swallowing this froze two things at once: the block budget never
         # advances, so the MAX_BLOCKS stand-down the reason text promises
