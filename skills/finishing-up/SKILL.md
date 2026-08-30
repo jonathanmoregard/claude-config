@@ -72,7 +72,7 @@ Work the blockers in the order reported; each has a `fix` field.
 | `NOT_ON_DEFAULT` | The PR merged and the repo is still on the dead branch. `git switch <default> && git pull --ff-only`. This is the last step of the work, not a chore for Jonathan. |
 | `NO_PR` | `gh pr create --fill`, then write a real body. |
 | `PR_DRAFT` | `gh pr ready <n>` — a draft is not a merge request. |
-| `CHECKS_PENDING` | **Step 3.** Do not guess the outcome. |
+| `CHECKS_PENDING` | **Step 3.** Do not guess the outcome. A durable `CronCreate` is the right follow-up to leave, but it does **not** clear the gate — measured: a durable cron is not session-scoped, so it never lands in `session_crons`. Book it, say you are blocked on the check, and stop. |
 | `CHECKS_FAILING` | **Step 4.** |
 | `NOT_MERGEABLE` | `BEHIND` → merge the base in and push. `DIRTY` → resolve conflicts. `BLOCKED` → say precisely what protection is unmet. |
 | `UNRESOLVED_THREADS` | Answer each, then resolve it. |
