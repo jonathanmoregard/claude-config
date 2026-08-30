@@ -410,11 +410,18 @@ echo "== stand-down fields must be the SHAPE they claim =="
 # Its own session id: a spent block budget would read as "did not block".
 SHSID="shape-$RANDOM"
 printf '%s\n' "$BREPO" > "$SD/$SHSID.arm"
-shape_dec() { printf '%s' "$1" \
-  | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE" 2>/dev/null \
-  | python3 -c 'import json,sys
-try: print(json.load(sys.stdin).get("decision") or "")
-except Exception: print("")'; }
+# Captures the EXIT CODE, like gate_run. Piping the gate straight into the
+# decision reader threw that away, and an allow and a traceback both render as
+# empty — so the allow-assertion below was satisfiable by a crash. That is the
+# exact blindness this suite fixed in decision() a round earlier and then
+# reintroduced one helper along.
+SHAPE_RC=0
+shape_dec() {
+  local out
+  out=$(printf '%s' "$1" | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE" 2>/dev/null)
+  SHAPE_RC=$?
+  decision "$out"
+}
 ck "a dict session_crons does NOT stand it down"   "block" \
    "$(shape_dec "$(printf '{"session_id":"%s","session_crons":{"oops":1}}' "$SHSID")")"
 ck "a string background_tasks does NOT either"     "block" \
@@ -423,6 +430,7 @@ ck "an empty list does NOT stand it down"          "block" \
    "$(shape_dec "$(printf '{"session_id":"%s","session_crons":[]}' "$SHSID")")"
 ck "a real non-empty list DOES"                    "" \
    "$(shape_dec "$(printf '{"session_id":"%s","background_tasks":[{"id":"t"}]}' "$SHSID")")"
+ck "  ...by exiting 0, not by crashing"            "0" "$SHAPE_RC"
 ck "and the bad shape is named in the log"         "yes" \
    "$(grep -q 'unexpected shape' "$SD/gate.log" && echo yes || echo no)"
 rm -f "$SD/$SHSID.arm" "$SD/$SHSID.blocks"
@@ -808,6 +816,148 @@ ck "and so does a symlinked spelling" "found" \
 ck "a genuinely different directory still misses" "missed" \
    "$(ralph_state_for_dir "$SD/elsewhere" >/dev/null 2>&1 && echo found || echo missed)"
 rm -f "$CLAUDE_RALPH_STATE_DIR/$LSID2.md"
+
+echo
+echo "== a stand-down field the payload got WRONG must not crash the gate =="
+# `len(payload.get(k) or [])` inside the guards= comprehension raises TypeError
+# on any truthy scalar, and that comprehension is an ARGUMENT to block() — so it
+# fired BEFORE block() logged anything and before it printed a decision.
+# Measured 2026-08-30: exit 1, EMPTY stdout, no decision line in gate.log, and
+# the block-budget slot spent on a turn that guarded nothing. The two malformed
+# shapes this suite already covered — a string and a dict — are the only bad
+# shapes that HAVE a len(), which is why it stayed green.
+for shape in 'true' '1' '3.5'; do
+  SCSID="scalar-$RANDOM"
+  printf '%s\n' "$BREPO" > "$SD/$SCSID.arm"
+  out=$(printf '{"session_id":"%s","background_tasks":%s}' "$SCSID" "$shape" \
+        | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE" 2>/dev/null); rc=$?
+  ck "background_tasks=$shape still blocks"   "block" "$(decision "$out")"
+  ck "  ...by exiting 0, not by crashing"     "0"     "$rc"
+  rm -f "$SD/$SCSID.arm" "$SD/$SCSID.blocks"
+done
+SCSID="scalarcrons-$RANDOM"
+printf '%s\n' "$BREPO" > "$SD/$SCSID.arm"
+out=$(printf '{"session_id":"%s","session_crons":true}' "$SCSID" \
+      | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE" 2>/dev/null)
+ck "session_crons=true still blocks" "block" "$(decision "$out")"
+ck "  ...and the shape it got is in the log" "yes" \
+   "$(grep -q 'not-a-list:bool' "$SD/gate.log" && echo yes || echo no)"
+rm -f "$SD/$SCSID.arm" "$SD/$SCSID.blocks"
+
+echo
+echo "== a value that clamps to nothing is refused, not used =="
+# NaN parses as a float and then defeats every comparison: `nan < floor` is
+# False, `nan > ceiling` is False. MEASURED 2026-08-30 — ARM_MAX_AGE_DAYS=nan
+# made `st_mtime >= nan` False for EVERY file, and ONE sweep unlinked six other
+# sessions' .arm and .blocks. Those sessions are never told: an unarmed
+# session's Stop hook is the one turn-ending path that deliberately writes no
+# log line, so their gates were disarmed in silence.
+NANSID="nanage-$RANDOM"
+printf '%s\n' "$BREPO" > "$SD/$NANSID.arm"
+printf '%s\n' "$BREPO" > "$SD/victim-alpha.arm"
+: > "$SD/victim-alpha.blocks"
+out=$(gate_run "$NANSID" CLAUDE_DOD_ARM_MAX_AGE_DAYS=nan)
+ck "a NaN reap age does not eat a fresh armfile" "kept" \
+   "$([ -e "$SD/victim-alpha.arm" ] && echo kept || echo gone)"
+ck "  ...nor its countfile"                      "kept" \
+   "$([ -e "$SD/victim-alpha.blocks" ] && echo kept || echo gone)"
+ck "  ...and the gate still blocks"              "block" "$(decision "$out")"
+ck "  ...and says which value it refused"        "yes" \
+   "$(grep -q 'is not a finite number' "$SD/gate.log" && echo yes || echo no)"
+rm -f "$SD/victim-alpha.arm" "$SD/victim-alpha.blocks" "$SD/$NANSID.arm" "$SD/$NANSID.blocks"
+
+NBSID="nanbudget-$RANDOM"
+printf '%s\n' "$BREPO" > "$SD/$NBSID.arm"
+out=$(gate_run "$NBSID" CLAUDE_DOD_TOTAL_BUDGET=nan)
+ck "a NaN budget still blocks" "block" "$(decision "$out")"
+ck "  ...having fallen back to a real number" "yes" \
+   "$(grep -q "CLAUDE_DOD_TOTAL_BUDGET='nan' is not a finite number" "$SD/gate.log" && echo yes || echo no)"
+rm -f "$SD/$NBSID.arm" "$SD/$NBSID.blocks"
+
+echo
+echo "== an armfile that lists nothing is not a clean pass =="
+# Under a write-size limit the arm hook leaves a 0-BYTE armfile behind. The gate
+# read it as zero repositories, took the clean-pass branch, deleted the file and
+# ended the turn with no output and no log line — armed, and measuring nothing.
+# The UNREADABLE armfile already blocks for exactly this reason.
+EMPSID="emptyarm-$RANDOM"
+: > "$SD/$EMPSID.arm"
+out=$(gate_run "$EMPSID")
+ck "an empty armfile BLOCKS" "block" "$(decision "$out")"
+case "$out" in *EMPTY*) r=named ;; *) r="$out" ;; esac
+ck "  ...and says the record was empty" "named" "$r"
+rm -f "$SD/$EMPSID.arm" "$SD/$EMPSID.blocks"
+
+echo
+echo "== a repository the gate skips is never skipped SILENTLY =="
+# `not result.get("applicable")` read a MISSING key as n/a, so a dod-check
+# emitting `{}` was skipped with no log line, the armfile unlinked and the turn
+# allowed. The same silence hid a missing `git`, which answers n/a for every
+# repository on the machine — measured end to end, the only variable being
+# whether git was on PATH.
+EMPTYJSON="$SD/empty-json-dod.py"
+printf 'print("{}")\n' > "$EMPTYJSON"
+BJSID="emptyjson-$RANDOM"
+printf '%s\n' "$BREPO" > "$SD/$BJSID.arm"
+out=$(gate_run "$BJSID" CLAUDE_DOD_CHECK="$EMPTYJSON")
+ck "a verdict with no applicable field BLOCKS" "block" "$(decision "$out")"
+rm -f "$SD/$BJSID.arm" "$SD/$BJSID.blocks"
+
+# ...while a GENUINE n/a still ends the turn — but leaves a record that it did.
+NADOD="$SD/na-dod.py"
+printf 'import json\nprint(json.dumps({"applicable": False, "done": False, "blockers": [], "reason": "not a git repository"}))\n' \
+  > "$NADOD"
+NASID="genuinena-$RANDOM"
+printf '%s\n' "$BREPO" > "$SD/$NASID.arm"
+out=$(gate_run "$NASID" CLAUDE_DOD_CHECK="$NADOD")
+ck "a genuine n/a still allows"        ""    "$(decision "$out")"
+ck "  ...by exiting 0, not by crashing" "0"  "$GATE_RC"
+ck "  ...but is recorded, not silent"  "yes" \
+   "$(grep -q 'does not apply here' "$SD/gate.log" && echo yes || echo no)"
+rm -f "$SD/$NASID.arm" "$SD/$NASID.blocks"
+
+echo
+echo "== what could not be established reaches the AGENT, not just the log =="
+# dod-check demotes several FAILED measurements to warnings and still reports
+# done. Blocking on them would hang every offline session — but until now the
+# fact reached only gate.log, which no agent reads, so "no unresolved threads"
+# and "could not find out" ended the turn identically. A token missing scopes
+# makes that failure PERMANENT, not transient.
+WARNDOD="$SD/warn-dod.py"
+printf 'import json\nprint(json.dumps({"applicable": True, "done": True, "blockers": [], "warnings": ["unresolved review threads not counted: HTTP 403"]}))\n' \
+  > "$WARNDOD"
+WARNSID="warned-$RANDOM"
+printf '%s\n' "$BREPO" > "$SD/$WARNSID.arm"
+out=$(gate_run "$WARNSID" CLAUDE_DOD_CHECK="$WARNDOD")
+ck "a warned-but-done turn is not blocked" "" "$(decision "$out")"
+case "$out" in *"could not establish"*) r=told ;; *) r="$out" ;; esac
+ck "  ...and the agent is told what was not measured" "told" "$r"
+case "$out" in *"HTTP 403"*) r=verbatim ;; *) r="$out" ;; esac
+ck "  ...naming it, not just that there was one" "verbatim" "$r"
+rm -f "$SD/$WARNSID.arm" "$SD/$WARNSID.blocks"
+
+echo
+echo "== the arm hook cannot switch the whole gate off quietly =="
+# No armfile means the gate has nothing to check and ends the turn with no
+# output and no gate.log line at all — that is enforcement OFF, not a hook that
+# failed. So every path that fails to arm exits NON-ZERO, which is what surfaces
+# a PostToolUse hook's stderr, and says what it could not do. Never 2: that code
+# blocks the tool call itself, and failing to arm must not stop an edit landing.
+BADSTATE="$SD/state-is-a-file"
+: > "$BADSTATE"
+printf '{"session_id":"armfail-1","tool_input":{"file_path":"%s/a.txt"}}' "$ARMWORK" \
+  | CLAUDE_DOD_STATE_DIR="$BADSTATE" bash "$ARMHOOK" >/dev/null 2>"$SD/armfail.err"; rc=$?
+ck "an unusable state dir exits non-zero" "yes" "$([ "$rc" -ne 0 ] && echo yes || echo no)"
+ck "  ...but never 2, which would block the edit" "yes" "$([ "$rc" -ne 2 ] && echo yes || echo no)"
+ck "  ...and says the gate will not run" "yes" \
+   "$(grep -q 'definition-of-done gate' "$SD/armfail.err" && echo yes || echo no)"
+
+printf '{"session_id":"armfail-2","tool_input":{"file_path":"%s/a.txt"}}' "$ARMWORK" \
+  | PATH="$NOJQ" CLAUDE_DOD_STATE_DIR="$SD" bash "$ARMHOOK" >/dev/null 2>"$SD/armjq.err"; rc=$?
+ck "a missing jq exits non-zero too" "yes" "$([ "$rc" -ne 0 ] && echo yes || echo no)"
+ck "  ...and never 2"                "yes" "$([ "$rc" -ne 2 ] && echo yes || echo no)"
+ck "  ...and still names the consequence" "yes" \
+   "$(grep -q 'definition-of-done gate' "$SD/armjq.err" && echo yes || echo no)"
 
 echo
 echo "== $pass passed, $fail failed =="

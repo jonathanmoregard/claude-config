@@ -38,6 +38,7 @@ write a hook that silently does nothing.
 from __future__ import annotations
 
 import json
+import math
 import os
 import pathlib
 import re
@@ -91,6 +92,16 @@ def _num_env(name, default, cast, floor=None):
         val = cast(raw)
     except (TypeError, ValueError):
         return default, f"{name}={raw!r} is not a number; using {default}"
+    # NaN and the infinities parse fine and then defeat every comparison that
+    # follows: `nan < floor` is False and `nan > ceiling` is False, so a NaN
+    # clamps to nothing at all. MEASURED 2026-08-30, both halves:
+    # ARM_MAX_AGE_DAYS=nan made `st_mtime >= nan` False for every file, and ONE
+    # sweep unlinked six other sessions' .arm and .blocks — disarming their
+    # gates, and silently, because an unarmed session's Stop hook is the one
+    # turn-ending path that deliberately writes no log line. TOTAL_BUDGET=nan
+    # cleared both the floor and the slot ceiling and ran 32s inside a 20s slot.
+    if isinstance(val, float) and not math.isfinite(val):
+        return default, f"{name}={raw!r} is not a finite number; using {default}"
     if floor is not None and val < floor:
         return floor, f"{name}={val} below floor {floor}; using {floor}"
     return val, None
@@ -200,6 +211,30 @@ if TOTAL_BUDGET > _CEILING:
         f"{_CEILING:g}. A budget that outlives its slot is not a budget — the "
         "harness kills the hook with nothing on stdout and nothing in this log.")
     TOTAL_BUDGET = _CEILING
+
+
+def _guard_shape(payload, key):
+    """What a stand-down field actually looked like, without trusting it.
+
+    This used to be `len(payload.get(k) or [])` inline. It raises TypeError on
+    any truthy scalar — a bool, an int, a float — and it is evaluated as an
+    ARGUMENT to block(), so it fired BEFORE block() logged anything and before
+    it printed the decision. MEASURED 2026-08-30 with `background_tasks: true`:
+    exit 1, EMPTY stdout, no decision line in gate.log, and a block-budget slot
+    spent on a turn that guarded nothing.
+
+    It was unreachable on master, where a truthy scalar stood the gate down by
+    bare truthiness at the guard itself. Hardening _standdown() to demand a real
+    list is what made the latent crash reachable — the line was never touched.
+    The suite missed it because its two malformed shapes, a string and a dict,
+    are the only bad shapes that HAVE a len().
+    """
+    if key not in payload:
+        return "absent"
+    val = payload.get(key)
+    if isinstance(val, list):
+        return len(val)
+    return f"not-a-list:{type(val).__name__}"
 
 
 def log(session, payload):
@@ -513,7 +548,25 @@ def main():
         start = blocks % len(repos)
         repos = repos[start:] + repos[:start]
 
+    # An armfile that exists but lists NOTHING is armed-with-no-record, which
+    # is the unreadable-armfile case wearing a different hat — and it already
+    # blocks. MEASURED 2026-08-30: under a write-size limit the arm hook leaves
+    # a 0-byte armfile behind, and the gate read it as zero repositories, took
+    # the clean-pass branch, deleted the file and ended the turn with no output
+    # and no log line.
+    if not repos:
+        block(f"This session is armed, but its record of which repositories to "
+              f"check is EMPTY, so NOTHING was verified. That is not a clean "
+              f"pass — the arm hook writes that file, and an empty one means it "
+              f"failed. Run `python3 {DOD} --repo <repo>` for the repositories "
+              f"you touched and report what it says.",
+              session, why="armfile empty, NOTHING WAS CHECKED")
+
     problems = []
+    # What dod-check could not ESTABLISH, as opposed to what it found wrong.
+    # These never block — blocking on them would hang every offline session —
+    # but they must not live only in gate.log, which no agent ever reads.
+    unmeasured = []
     # One budget for the whole hook, not one per repo. The repo that the budget
     # runs out on is NOT MEASURED, which is a problem like any other — so the
     # hook blocks, in its own slot, instead of being killed mid-loop with
@@ -560,7 +613,29 @@ def main():
             log(session, {"action": "warn",
                           "why": f"{repo}: dod-check could not establish: "
                                  + " | ".join(str(w)[:120] for w in warns[:5])})
-        if not result.get("applicable") or result.get("done"):
+            unmeasured.append(f"{repo}: " + " | ".join(
+                str(w)[:160] for w in warns[:5]))
+        # `applicable` must be an explicit False, and a skip is never silent.
+        # Two failures met here. A dod-check emitting `{}` passes the dict check
+        # in run_dod, and `not {}.get("applicable")` is True — so a malformed
+        # payload read as "the definition of done does not apply here", the repo
+        # was skipped with no log line, and the armfile was unlinked and the
+        # turn allowed. The same silence hid a MISSING GIT, which answers n/a
+        # for every repository on the machine: measured end to end, the only
+        # variable being whether git was on PATH, and the turn went from
+        # blocked-and-named to allowed-and-silent.
+        if result.get("applicable") is False:
+            log(session, {"action": "note",
+                          "why": f"{repo}: dod-check says the definition of done "
+                                 "does not apply here — "
+                                 f"{result.get('reason') or 'no reason given'}"})
+            continue
+        if "applicable" not in result:
+            problems.append(
+                f"{repo}: dod-check emitted no `applicable` field, so its "
+                "verdict could not be read — treat as NOT done")
+            continue
+        if result.get("done"):
             continue
         raw_blockers = result.get("blockers")
         if not isinstance(raw_blockers, list):
@@ -584,12 +659,34 @@ def main():
                 f.unlink(missing_ok=True)
             except OSError:
                 pass
+        if unmeasured:
+            # The work is done as far as anything could tell — but something was
+            # NOT established, and until now that fact reached only gate.log, a
+            # file no agent reads. Blocking on it would hang every offline
+            # session, which is why this is a systemMessage and not a decision:
+            # the turn ends, and the agent is told what nobody measured.
+            # Reproduced 2026-08-30: a token missing scopes makes the
+            # review-thread read fail PERMANENTLY, so "no unresolved threads"
+            # and "could not find out" printed the same green verdict forever.
+            print(json.dumps({"systemMessage":
+                              "[dod] the turn is not blocked, but dod-check "
+                              "could not establish: " + " ; ".join(unmeasured)
+                              + " — say so rather than reporting a clean sheet."}))
         allow()
 
     try:
         countfile.write_text(str(blocks + 1))
-    except OSError:
-        pass
+    except OSError as exc:
+        # Swallowing this froze two things at once: the block budget never
+        # advances, so the MAX_BLOCKS stand-down the reason text promises
+        # "regardless" never arrives and the session is blocked forever; and the
+        # rotation offset is derived from the same counter, so the tail of the
+        # armfile is re-starved every turn. Reaching here means STATE_DIR is
+        # readable but not writable — plausible, and previously undetectable.
+        log(session, {"action": "warn",
+                      "why": f"could not record this block ({exc}); the budget "
+                             "cannot advance, so this gate will keep blocking "
+                             "and the rotation offset is frozen"})
 
     body = "\n".join(problems)
     reason = (
@@ -622,10 +719,8 @@ def main():
         reason,
         session,
         body.replace("\n", " | ")[:400],
-        guards={
-            k: ("absent" if k not in payload else len(payload.get(k) or []))
-            for k in ("background_tasks", "session_crons")
-        },
+        guards={k: _guard_shape(payload, k)
+                for k in ("background_tasks", "session_crons")},
     )
 
 
