@@ -70,11 +70,9 @@ and `upload-*.png`. Exits non-zero if any variant is flagged.
 
 **Landmark fractions never transfer between source files, even when the
 dimensions are nearly identical.** A file 3 px taller can be a different edit
-with the people in different places.
-
-To tell: align the two frames over ±6 row offsets and compare. If the best case
-is not near-zero mean absolute difference, it is a different picture — re-read
-everything.
+with the people in different places. To tell, align the two frames over ±6 row
+offsets; if the best case is not near-zero mean absolute difference, it is a
+different picture — re-read everything.
 
 These exports also carry a few rows of **black letterbox** baked into the top
 and bottom edges. `cover.py` refuses a crop that reaches into one.
@@ -82,29 +80,22 @@ and bottom edges. `cover.py` refuses a crop that reaches into one.
 ## Legibility
 
 **Blur destroys detail, not tone.** Blurring the background does not make a
-warm mid-toned mark legible on a warm mid-toned room. Do not reach for it as a
+warm mid-toned mark legible on a warm mid-toned room. Never reach for it as a
 contrast fix.
 
-Use the **deepened outline** (`#331b05` stroke). It separates from a room
-everywhere with no other treatment. The untouched stock mark needs the ground
-pulled ~70% toward `#4a2708`, which turns the photo murky.
+Use the **deepened outline** (`#331b05` stroke) — it separates from a room
+everywhere with no other treatment.
 
-Measure contrast as **`max(fill, stroke)` per pixel** against the pixel
-underneath — a mean is the whole truth on a flat ground and a lie on a
-photograph. Targets: mean ≥ 5, worst-5% ≥ 3, under 5% of mark pixels below 3:1.
+Measure contrast **per pixel, never against a mean**: a mean is the whole truth
+on a flat ground and a lie on a photograph. `cover.py build` does this and
+flags failures; method and thresholds in `reference.md`.
 
 ## Never retry these
 
-- Invented decorative devices — cards, arches, frames, plates. Use forms from
-  research or existing resources; invented ones look silly.
-- Masthead overlap (heads occluding the type). Needs a per-pixel cutout the
-  photo will not give — a pale shirt matches the wall.
-- Tucking the mark behind a panel edge. Cuts the knot mid-lobe, reads as
-  truncation.
-- A single-colour mark. Fills the Celtic knot into a blob; the weave is drawn
-  fill-against-stroke.
-- Flush-left placement. Reads as off-centre by mistake and leaves the
-  guaranteed square.
+**No invented decorative devices — no cards, arches, frames, or plates behind
+the mark.** Use forms from research or existing resources; invented ones look
+silly. Four more approaches are already ruled out with reasons: see
+`reference.md`.
 
 ## Common mistakes
 
@@ -119,14 +110,8 @@ photograph. Targets: mean ≥ 5, worst-5% ≥ 3, under 5% of mark pixels below 3
 
 ## Presenting variants
 
-Build a **scroll page**, not the arrow-key review tool. Include a 1:1 **detail
-crop** per variant — a halo is a few dozen pixels and a full-canvas thumbnail
-throws it away. Show desktop, the mobile square, and the 560 px feed card.
+Build a **scroll page**, not the arrow-key review tool, with a 1:1 detail crop
+per variant. Rules in `reference.md`.
 
-Read the variant list from `report.txt`, never a directory glob; a glob picks up
-stale renders from superseded builds.
-
-When a trade is genuinely unavoidable, present it as a ladder with the numbers,
-not as several different "designs".
-
-**Details, constants, and the full contrast/halo method:** see `reference.md`.
+**Constants, layout arithmetic, contrast and halo methods, tooling paths:**
+`reference.md`.

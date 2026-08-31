@@ -13,5 +13,5 @@
   "headroom": "auto",
   "sigma": 8.0,
   "treatments": ["glow", "pad"],
-  "logo_svg": "/home/jonathan/Downloads/väven-invite-fb.svg"
+  "logo_svg": "vaven-mark.svg"
 }

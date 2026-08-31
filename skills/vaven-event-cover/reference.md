@@ -11,10 +11,12 @@
 | Mark's bottom limit | **796** (820 − 24) |
 | Format | flatten to RGB, hand over a quality-95 JPEG (no chroma subsampling) alongside the PNG |
 
-Meta publishes no formal spec; 1920 × 1005 is the community-validated size and
-was re-confirmed current. The uploader always shows a crop/reposition step even
-for a correctly-sized file — it derives several crops and needs a focal point.
-That is a UI artifact, not a wrong file.
+Meta publishes no formal spec; 1920 × 1005 is the community-validated size.
+Re-confirm it before a new cover — search for the current event-cover size, and
+treat a source that only quotes page-cover sizes (820 × 360, 1200 × 628) as
+stale. The uploader always shows a crop/reposition step even for a
+correctly-sized file: it derives several crops and needs a focal point. That is
+a UI artifact, not a wrong file.
 
 ## The logo
 
@@ -79,8 +81,9 @@ mark's own pixels.
 - Report mean, 5th percentile, and % under 3:1.
 
 **Never score stroke pixels alone against the ground.** The stroke's job is to
-fence the fill off, not to out-contrast the ground. That mistake floors every
-candidate near 49% and reads as a design failure when it is a metric failure.
+fence the fill off, not to out-contrast the ground. Scoring it alone measures
+the wrong thing, understates every candidate, and reads as a design failure
+when it is a metric failure.
 
 Targets: mean ≥ 5, p05 ≥ 3, under 5% of mark pixels below 3:1.
 
@@ -106,19 +109,44 @@ Thickness ladder (sigma → measured reach past the artwork): 8 → 11 px,
 thickness as halo band area ÷ mark perimeter, not nominal sigma.
 
 **Take knot symmetry from the alpha render, not the diff.** On a dark glow the
-near-black stroke nearly matches the halo, diff-based recovery loses those
-pixels, and the check reports a bogus ~84%.
+near-black stroke nearly matches the halo behind it, so diff-based recovery
+loses those pixels and badly understates the symmetry — a property of the
+treatment reported as a placement fault.
 
 ## Tooling
+
+`cover.py` needs Inkscape plus a python carrying **numpy and PIL**. The system
+python3 has neither.
+
+Durable recipe — get both from nixpkgs, no pinned hashes:
+
+```bash
+nix shell nixpkgs#inkscape -c inkscape --version
+nix shell nixpkgs#python3Packages.numpy nixpkgs#python3Packages.pillow \
+  -c python3 -c "import numpy, PIL; print(numpy.__version__, PIL.__version__)"
+```
+
+Or run the whole thing inside one shell:
+
+```bash
+nix shell nixpkgs#inkscape nixpkgs#python3Packages.numpy nixpkgs#python3Packages.pillow \
+  -c python3 cover.py check --photo P --config C --out D
+```
+
+`cover.py` finds Inkscape via `$INKSCAPE` or `PATH`, so
+`export INKSCAPE=$(command -v inkscape)` is enough.
+
+These `/nix/store` paths worked at time of writing and are a fast path **only
+while they exist** — after a GC they dangle, so fall back to the recipe above:
 
 ```
 inkscape  /nix/store/30xl2hk1k441jryb4pni78xihkn5kksp-inkscape-1.4.4/bin/inkscape
 python    /nix/store/a68sj1q3b4x85zd7sl3ahpbyiarnclxy-python3-3.14.6-env/bin/python3
 ```
 
-That python is Inkscape's bundled environment and is the one with **numpy and
-PIL**; the system python3 has neither. Do not try
-`nix shell "nixpkgs#python3.withPackages(...)"` — not valid installable syntax.
+That python is Inkscape's own bundled environment, which happens to carry numpy
+and PIL. Do not try `nix shell "nixpkgs#python3.withPackages(...)"` — not a
+valid installable, nix reads it as a path and fails.
 
 Serve a review page with `systemd-run --user --unit=… --collect
 --working-directory=…`; backgrounding with `setsid nohup … &` returns exit 124
@@ -126,6 +154,31 @@ because the child holds the pipe, and the server is running anyway.
 
 Never delete build outputs. `shutil.copytree(..., dirs_exist_ok=True)`, not
 `rmtree`.
+
+## Ruled out — do not retry
+
+- **Invented decorative devices** — cards, arches, frames, plates. Use forms
+  from research or existing resources; invented ones look silly.
+- **Masthead overlap** (heads occluding the type). Needs a per-pixel cutout the
+  photo will not give — a pale shirt matches the wall.
+- **Tucking the mark behind a panel edge.** Cuts the knot mid-lobe and reads as
+  truncation.
+- **A single-colour mark.** Fills the Celtic knot into a blob; the weave is
+  drawn fill-against-stroke.
+- **Flush-left placement.** Reads as off-centre by mistake and leaves the
+  guaranteed mobile square.
+
+## Presenting variants
+
+Build a **scroll page**, not the arrow-key review tool. Include a 1:1 **detail
+crop** per variant — a halo is a few dozen pixels and a full-canvas thumbnail
+throws it away. Show desktop, the mobile square, and the 560 px feed card.
+
+Read the variant list from `report.txt`, never a directory glob; a glob picks up
+stale renders from superseded builds.
+
+When a trade is genuinely unavoidable, present it as a ladder with the numbers,
+not as several different "designs".
 
 ## Photo requirements to ask for
 

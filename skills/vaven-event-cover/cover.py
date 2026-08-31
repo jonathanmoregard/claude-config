@@ -20,8 +20,12 @@ Config is JSON, all landmarks as fractions of the source:
       "axis": 0.599, "face_l": 0.445, "face_r": 0.765,
       "heads": 0.265, "top": 0.190, "chin": 0.450,
       "treatments": ["glow", "pad"], "sigma": 8.0,
-      "headroom": "auto", "logo_svg": "/path/to/vaven-invite-fb.svg"
+      "headroom": "auto", "logo_svg": "vaven-mark.svg"
     }
+
+`logo_svg` resolves relative to the config file, and the mark ships with the
+skill, so a config stays valid wherever the skill is checked out. `headroom` may
+also be a LIST of rungs; each gets its own named output.
 
 `top` is the topmost point the GROUP owns -- raised arms and tools, not heads.
 `headroom: "auto"` clears that point by 38 px; a number overrides it, and a
@@ -88,6 +92,23 @@ def load_logo(svg_path):
     if p is None:
         raise SystemExit(f"no <path> found in {svg_path}")
     return p.get("d")
+
+
+def read_config(path):
+    """Load the config, resolving `logo_svg` relative to the config file.
+
+    The mark ships inside the skill as `vaven-mark.svg` so a config can point at
+    it relatively and keep working wherever the skill is checked out. An
+    absolute path still works, for a one-off.
+    """
+    cfg = json.load(open(path))
+    logo = cfg.get("logo_svg", "vaven-mark.svg")
+    if not os.path.isabs(logo):
+        logo = os.path.join(os.path.dirname(os.path.abspath(path)), logo)
+    if not os.path.exists(logo):
+        raise SystemExit(f"logo_svg not found: {logo}")
+    cfg["logo_svg"] = logo
+    return cfg
 
 
 def letterbox_rows(im, thresh=24.0):
@@ -173,13 +194,20 @@ class Frame:
         self.hr = headroom
         self.x0 = self.gx - self.wpx / 2
         self.ytop = self.heads - headroom / self.s
+        # Which way to move headroom is not obvious and is easy to state
+        # backwards: MORE headroom lowers ytop (the crop starts higher up the
+        # photo); LESS headroom raises it (the crop starts further down).
         if self.ytop < 0:
-            raise SystemExit(f"headroom {headroom:.0f} runs off the top of the photo")
+            raise SystemExit(
+                f"headroom {headroom:.0f} runs off the top of the photo; "
+                f"REDUCE it below {self.heads * self.s:.0f}")
         if self.ytop + self.src_h > self.SH + 1:
             raise SystemExit(
                 f"photo runs past its bottom edge "
                 f"({(self.ytop + self.src_h) / self.SH * 100:.1f}% of source); "
-                f"reduce headroom or use a taller photo")
+                f"INCREASE headroom by at least "
+                f"{(self.ytop + self.src_h - self.SH) * self.s:.0f}, "
+                f"or use a taller photo")
 
         # These exports arrive with a few rows of black letterbox baked into the
         # top and bottom edges. They are invisible at a glance and fatal in the
@@ -188,12 +216,13 @@ class Frame:
         if self.ytop < t:
             raise SystemExit(
                 f"crop starts at row {self.ytop:.0f} but the photo has {t} rows "
-                f"of black letterbox at the top; increase headroom past "
+                f"of black letterbox at the top; REDUCE headroom below "
                 f"{(self.heads - t) * self.s:.0f}")
         if self.ytop + self.src_h > self.SH - b:
             raise SystemExit(
                 f"crop ends at row {self.ytop + self.src_h:.0f} but the photo has "
-                f"{b} rows of black letterbox at the bottom; reduce headroom")
+                f"{b} rows of black letterbox at the bottom; INCREASE headroom by "
+                f"at least {(self.ytop + self.src_h - (self.SH - b)) * self.s:.0f}")
 
     def ox(self, sx):
         return (sx - self.x0) * self.s
@@ -329,11 +358,14 @@ def cmd_grid(a):
     g.save(f"{a.out}/grid.png")
     print(f"{a.out}/grid.png")
 
-    # Thirds of the frame at 1% gridlines: full-frame eyeball reads run ~2%
-    # out, and 2% of a 1090 px source is ~28 output px of logo height.
-    for i, (fx0, fx1) in enumerate(((0.35, 0.60), (0.48, 0.72), (0.60, 0.85)), 1):
+    # Overlapping thirds at 1% gridlines. Full-frame eyeball reads run ~2% out,
+    # and 2% of source height is ~28 output px of logo height, so the landmarks
+    # have to be read off these. The windows span the WHOLE frame rather than
+    # the region a particular group happened to occupy -- a group standing
+    # somewhere else must not silently end up with no zoom covering it.
+    for i, (fx0, fx1) in enumerate(((0.00, 0.40), (0.30, 0.70), (0.60, 1.00)), 1):
         x0, x1 = int(W * fx0), int(W * fx1)
-        y0, y1 = int(H * 0.18), int(H * 0.52)
+        y0, y1 = int(H * 0.05), int(H * 0.65)
         crop = im.crop((x0, y0, x1, y1))
         k = 1500 / crop.width
         crop = crop.resize((1500, int(crop.height * k)), Image.LANCZOS)
@@ -344,7 +376,7 @@ def cmd_grid(a):
             d.line([(x, 0), (x, crop.height)], fill="#ff2d55" if hv else "#00d0ff",
                    width=3 if hv else 1)
             d.text((x + 3, 4), f"{p}", fill="#ff2d55" if hv else "#00d0ff")
-        for q in range(18, 53):
+        for q in range(5, 66):
             y = (H * q / 100 - y0) * k
             hv = q % 5 == 0
             d.line([(0, y), (crop.width, y)], fill="#ff2d55" if hv else "#00d0ff",
@@ -359,12 +391,13 @@ def cmd_grid(a):
 
 def cmd_check(a):
     """The gate. Nothing gets built until this passes and you have LOOKED at
-    check.png. It answers three questions in order: is the axis trustworthy,
+    check-landmarks.png and check-placement.png. It answers three questions in
+    order: is the axis trustworthy,
     is the mark's own symmetry intact where it is about to be placed, and is
     that placement any good."""
     os.makedirs(a.out, exist_ok=True)
     ink = find_inkscape()
-    cfg = json.load(open(a.config))
+    cfg = read_config(a.config)
     axis_frac, disagree = resolve_axis(cfg)
     hr = cfg.get("headroom", "auto")
     hr = auto_headroom(a.photo, cfg) if hr in ("auto", None) else float(
@@ -460,13 +493,22 @@ def cmd_check(a):
 def cmd_build(a):
     os.makedirs(a.out, exist_ok=True)
     ink = find_inkscape()
-    cfg = json.load(open(a.config))
+    cfg = read_config(a.config)
     path_d = load_logo(cfg["logo_svg"])
     sigma = float(cfg.get("sigma", 8.0))
     treatments = cfg.get("treatments", ["glow", "pad"])
     hrs = cfg.get("headroom", "auto")
-    hrs = [auto_headroom(a.photo, cfg)] if hrs == "auto" else (
+    hrs = [auto_headroom(a.photo, cfg)] if hrs in ("auto", None) else (
         [float(x) for x in (hrs if isinstance(hrs, list) else [hrs])])
+
+    # build must not be a way around the axis cross-check: check only gates the
+    # first rung, and build can be run without check at all.
+    _, disagree = resolve_axis(cfg)
+    if disagree is not None and disagree > 0.015:
+        raise SystemExit(
+            f"axis estimators disagree by {disagree * 100:.1f}% of width "
+            f"(limit 1.5) -- one of your reads is wrong. Re-read them, then "
+            f"run check.")
 
     rows = []
     for hr in hrs:
@@ -486,7 +528,12 @@ def cmd_build(a):
                 out = A * (1 - hm) + BL * hm
             else:
                 raise SystemExit(f"unknown treatment {t!r}; use glow or pad")
-            name = f"{t}-{tag}"
+            # The headroom goes in the name whenever there is more than one
+            # rung. Without it two rungs that both keep (or both crop) the
+            # group's topmost point collide on one filename, the second render
+            # overwrites the first, and the first row's chin/gap/box get
+            # reported against the second's pixels. Silently.
+            name = f"{t}-{tag}" if len(hrs) == 1 else f"{t}-{tag}-hr{int(round(hr))}"
             href = f"bg-{name}.png"
             Image.fromarray(np.clip(out, 0, 255).astype(np.uint8)).save(f"{a.out}/{href}")
             layer, box = logo_layer(path_d, h, top)
@@ -552,7 +599,12 @@ def cmd_build(a):
         im = Image.open(f"{a.out}/{name}.png")
         al = np.asarray(im.convert("RGBA"))[..., 3]
         if al.min() != 255:
-            print(f"  ! {name}: not fully opaque, leaving alpha alone")
+            # Never hand over a cover with an alpha channel: re-encoders
+            # flatten it to black. A transparent pixel here means the photo
+            # did not cover the canvas, which is a real fault, not a warning.
+            print(f"  ! {name}: NOT fully opaque (alpha min {al.min()}); "
+                  f"no upload file written")
+            ok = False
             continue
         rgb = im.convert("RGB")
         rgb.save(f"{a.out}/upload-{name}.png", optimize=True)
