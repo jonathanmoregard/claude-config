@@ -20,12 +20,20 @@ Config is JSON, all landmarks as fractions of the source:
       "axis": 0.599, "face_l": 0.445, "face_r": 0.765,
       "heads": 0.265, "top": 0.190, "chin": 0.450,
       "treatments": ["glow", "pad"], "sigma": 8.0,
-      "headroom": "auto", "logo_svg": "vaven-mark.svg"
+      "headroom": "auto", "widths": [0.20, 0.24, 0.28, 0.33],
+      "logo_svg": "vaven-mark.svg"
     }
 
 `logo_svg` resolves relative to the config file, and the mark ships with the
 skill, so a config stays valid wherever the skill is checked out. `headroom` may
 also be a LIST of rungs; each gets its own named output.
+
+`widths` is the mark's size ladder, as fractions of CANVAS WIDTH -- the unit the
+client judges in. Size is an INPUT here; the chin gap that falls out is measured
+and reported, not the other way round. Every rung sits on one baseline just above
+Facebook's furniture, so a fan-out varies size and nothing else; a rung taller
+than the chin-to-furniture band overlaps the group deliberately. The two ladders
+multiply: headroom changes the CROP, widths change the MARK inside a fixed crop.
 
 `top` is the topmost point the GROUP owns -- raised arms and tools, not heads.
 `headroom: "auto"` clears that point by 38 px; a number overrides it, and a
@@ -48,9 +56,19 @@ from PIL import Image, ImageDraw, ImageFilter
 # --- output spec ------------------------------------------------------------
 CW, CH = 1920, 1005          # Facebook event cover, 1.91:1
 AXIS = CW / 2
-UI_TOP = 820.0               # FB title/date/RSVP furniture starts eating here
-BOTTOM = UI_TOP - 24.0
-GAP_FRAC = 0.16              # mark clears the chin by this share of its height
+UI_TOP = 900.0               # Where the mark's baseline sits. NOT an occlusion
+                             # line — observed 2026-08-31, desktop web does not
+                             # overlap the cover at all and mobile fades the
+                             # bottom out. 900 is the rung that shipped; the old
+                             # 820 was community folklore reserving 185px for
+                             # furniture that is not drawn there. Override per
+                             # photo, and see reference.md before "restoring" 820.
+UI_CLEAR = 24.0              # deliberate air between the mark and that line
+CHIN_MARGIN = 16.0           # a chin this close to the mark's edge counts as
+                             # under it; covers the halo's ~11px reach
+GRAZE_FRAC = 0.08            # dead zone either side of the chin, as a share of
+                             # mark height: closer than this to touching, in
+                             # either direction, reads as an accident
 
 # --- logo, measured once off the artwork; do not re-derive ------------------
 L_AX = 150.7778              # TRUE mirror axis, solved on the knot alone
@@ -188,6 +206,24 @@ class Frame:
         self.face_l = cfg["face_l"] * self.SW
         self.face_r = cfg["face_r"] * self.SW
 
+        # The biggest single lever on mark size, and a taste call rather than a
+        # hard limit: nothing occludes the cover on desktop, and mobile fades
+        # the bottom instead of covering it. Override per photo and render the
+        # ladder — what it costs is visible in one look, never worth assuming.
+        self.ui_top = float(cfg.get("ui_top", UI_TOP))
+        self.bottom = self.ui_top - UI_CLEAR
+
+        # Per-person chins. `chin` alone is the lowest chin ANYWHERE in the
+        # photo, which over-constrains every mark that does not actually reach
+        # that person: on image-EDIT (2) the lowest chin sits 274px off the
+        # axis and only enters a mark's span past 27% of canvas width, yet it
+        # was capping every width below that too. Give `chins` and the binding
+        # chin becomes the lowest one the mark really passes under.
+        ch = cfg.get("chins")
+        self.chins = ([(c.get("label", f"chin{i}"), float(c["x"]), float(c["y"]))
+                       for i, c in enumerate(ch)] if ch else
+                      [("lowest chin", None, cfg["chin"])])
+
         self.maxw = 2 * min(self.gx, self.SW - self.gx)
         self.s = CW / self.maxw
         self.wpx, self.src_h = CW / self.s, CH / self.s
@@ -237,15 +273,127 @@ class Frame:
         box = (self.x0, self.ytop, self.x0 + self.wpx, self.ytop + self.src_h)
         return self.im.resize((CW, CH), Image.LANCZOS, box=box)
 
-    def layout(self):
-        """Biggest mark that clears the chin by GAP_FRAC of its own height and
-        still ends above Facebook's furniture."""
-        chin = self.oy(self.chin)
-        h = (BOTTOM - chin) / (1.0 + GAP_FRAC)
-        if h <= 0:
+    def chins_under(self, width_px):
+        """Every chin the mark of this width actually passes under.
+
+        A chin with x=None always binds -- that is the single-`chin` fallback,
+        which has no x and so cannot be excluded. If a width reaches nobody,
+        fall back to all of them rather than to nothing: an unconstrained mark
+        is never the right answer, it is a missing measurement.
+        """
+        half = width_px / 2 + CHIN_MARGIN
+        got = [(l, self.oy(y * self.SH)) for l, x, y in self.chins
+               if x is None or abs(self.ox(x * self.SW) - AXIS) <= half]
+        return got or [(l, self.oy(y * self.SH)) for l, x, y in self.chins]
+
+    def band(self, width_px=None):
+        """Clear room between the binding chin and Facebook's furniture.
+
+        With no width, uses every chin -- the conservative reading, and the one
+        to quote as "the band" before a width has been chosen.
+        """
+        pts = self.chins_under(width_px) if width_px is not None else [
+            (l, self.oy(y * self.SH)) for l, x, y in self.chins]
+        label, chin = max(pts, key=lambda t: t[1])
+        return chin, self.bottom - chin, label
+
+    def gaps(self, h, top):
+        """(label, gap%) for every chin under the mark. The worst one decides.
+
+        Checking only the LOWEST chin is not enough once overlap is allowed: a
+        mark that clears the lowest chin by a committed margin can still land a
+        few pixels off a higher one, which is the same amateur tell.
+        """
+        return [(l, (top - c) / h * 100)
+                for l, c in self.chins_under(h * RATIO)]
+
+    def layout(self, width_frac):
+        """Place a mark `width_frac` of canvas width. Returns (height, top).
+
+        SIZE IS AN INPUT, NOT A DERIVED QUANTITY. An earlier version solved the
+        height from "clear the chin by GAP_FRAC of the mark's own height", which
+        made one fitted constant set the size, the position, and the ceiling all
+        at once -- and quietly capped this photo at 24.8% of canvas width when
+        29.1% fits. The gap is now an OUTCOME that gets measured and reported.
+
+        Vertical rule: the mark's BOTTOM sits on BOTTOM, always. That line is a
+        hard external fact (Facebook starts drawing over the image at UI_TOP),
+        so it is the one anchor that is not a taste call, and pinning to it
+        aligns every rung of a size ladder on one baseline -- the fan-out then
+        varies size and nothing else. A mark taller than the band grows up
+        across the chin line, which is a committed overlap and a real option.
+
+        Centring the mark in the band was tried and dropped: it makes the gap
+        (band - h)/2, which crawls through zero, so EVERY width from 24% to 35%
+        of canvas landed in the grazing dead zone on this photo.
+        """
+        if width_frac <= 0:
+            raise SystemExit(f"width fraction must be positive, got {width_frac}")
+        h = width_frac * CW / RATIO
+        if self.band(h * RATIO)[1] <= 0:
             raise SystemExit("no room for the mark: chin is already below "
-                             f"{BOTTOM:.0f}px. Reduce headroom.")
-        return h, chin + GAP_FRAC * h
+                             f"{self.bottom:.0f}px. Reduce headroom.")
+        return h, self.bottom - h
+
+
+def ceiling_width(f, lo=0.05, hi=0.60, step=0.001, clear=1.5 * GRAZE_FRAC):
+    """Widest mark that stays clear of EVERY chin it passes under.
+
+    `clear` is the gap it must actually leave, and it is deliberately LARGER
+    than GRAZE_FRAC. Scanning down to the gate's own 8% threshold returns the
+    width whose gap is 8.0% -- passing by a rounding error, and sitting exactly
+    on the boundary the "commit to a gap or an overlap, never between" rule
+    exists to keep marks away from. A ceiling wants margin, not a photo finish.
+
+    Scanned, not solved. The binding chin depends on the width (a chin off to
+    the side only counts once the mark grows out to it) and the width depends
+    on the binding chin, so the relationship is not monotone: it has a cliff
+    where an off-axis chin enters the span and the usable band collapses.
+    Iterating to a fixed point oscillates across that cliff and lands below the
+    real ceiling; a descending scan finds it directly.
+
+    Deliberately restricted to the GAP regime -- every gap positive. Overlap is
+    a real option but never a silent default; ask for it with an explicit width.
+    """
+    n = int(round((hi - lo) / step))
+    for i in range(n, -1, -1):
+        wf = lo + i * step
+        h = wf * CW / RATIO
+        if all(g >= clear * 100 for _, g in f.gaps(h, f.bottom - h)):
+            return wf
+    raise SystemExit("no width clears the chins; the crop leaves no usable band")
+
+
+def read_widths(cfg, photo):
+    """The size ladder: mark widths as fractions of CANVAS width.
+
+    Stated in the one unit the client actually judges in -- how much of the
+    cover the mark occupies -- rather than as a scale of some internally
+    derived maximum, which moves whenever the crop moves and makes two rungs
+    from different photos incomparable.
+
+    Default: the widest mark that still clears the grazing dead zone. NOT the
+    width that fills the band exactly -- that lands the mark's top on the chin
+    line, gap 0.0%, which fails the grazing gate every time and makes the
+    zero-config path useless. The 1.5x margin on GRAZE_FRAC is a default's
+    safety factor, not a design rule; pass `widths` and it never applies.
+    """
+    w = cfg.get("widths")
+    if w is None:
+        return [ceiling_width(Frame(photo, cfg, read_headrooms(cfg, photo)[0]))]
+    w = [float(x) for x in (w if isinstance(w, list) else [w])]
+    if not w:
+        raise SystemExit("widths is empty")
+    if any(x <= 0 or x > 1 for x in w):
+        raise SystemExit(f"widths are fractions of canvas width in (0,1]: {w}")
+    return w
+
+
+def read_headrooms(cfg, photo):
+    hrs = cfg.get("headroom", "auto")
+    if hrs in ("auto", None):
+        return [auto_headroom(photo, cfg)]
+    return [float(x) for x in (hrs if isinstance(hrs, list) else [hrs])]
 
 
 def auto_headroom(photo, cfg, clearance=38.0):
@@ -399,11 +547,13 @@ def cmd_check(a):
     ink = find_inkscape()
     cfg = read_config(a.config)
     axis_frac, disagree = resolve_axis(cfg)
-    hr = cfg.get("headroom", "auto")
-    hr = auto_headroom(a.photo, cfg) if hr in ("auto", None) else float(
-        hr[0] if isinstance(hr, list) else hr)
+    hr = read_headrooms(cfg, a.photo)[0]
     f = Frame(a.photo, cfg, hr)
-    h, top = f.layout()
+    # Gate the LARGEST rung: it is the one that can reach Facebook's furniture,
+    # the one that can break the mobile square, and the one whose chin gap is
+    # smallest, so it is the first to graze.
+    widths = read_widths(cfg, a.photo)
+    h, top = f.layout(max(widths))
     path_d = load_logo(cfg["logo_svg"])
     alpha = mark_alpha(path_d, h, top, a.out, ink)
     _, box = logo_layer(path_d, h, top)
@@ -435,18 +585,34 @@ def cmd_check(a):
     prev = f.base()
     pd = ImageDraw.Draw(prev)
     pd.line([(AXIS, 0), (AXIS, CH)], fill="#ff2d55", width=3)
-    pd.rectangle([box[0], box[1], box[0] + box[2], box[1] + box[3]],
-                 outline="#00ff6a", width=4)
-    pd.line([(0, f.oy(f.chin)), (CW, f.oy(f.chin))], fill="#00d0ff", width=3)
-    pd.line([(0, UI_TOP), (CW, UI_TOP)], fill="#ff2d55", width=3)
-    pd.text((10, UI_TOP + 6), "Facebook furniture starts here", fill="#ff2d55")
+    # Every rung of the size ladder, so the fan-out is judged before it is
+    # rendered. The largest is drawn heavy -- it is the one under the gates.
+    for wf in sorted(widths, reverse=True):
+        sh, stop = f.layout(wf)
+        _, sbox = logo_layer(path_d, sh, stop)
+        heavy = wf == max(widths)
+        pd.rectangle([sbox[0], sbox[1], sbox[0] + sbox[2], sbox[1] + sbox[3]],
+                     outline="#00ff6a" if heavy else "#7cffb0", width=4 if heavy else 2)
+        pd.text((sbox[0] + 6, sbox[1] + 6), f"{wf * 100:.0f}% wide",
+                fill="#00ff6a" if heavy else "#7cffb0")
+    for label, x, y in f.chins:
+        cy = f.oy(y * f.SH)
+        pd.line([(0, cy), (CW, cy)], fill="#00d0ff", width=2)
+        pd.text((10, cy - 18), f"{label} chin {cy:.0f}", fill="#00d0ff")
+        if x is not None:
+            cx = f.ox(x * f.SW)
+            pd.ellipse([cx - 8, cy - 8, cx + 8, cy + 8], outline="#00d0ff", width=4)
+    pd.line([(0, f.ui_top), (CW, f.ui_top)], fill="#ff2d55", width=3)
+    pd.text((10, f.ui_top + 6), f"mark baseline / mobile fade ({f.ui_top:.0f})",
+            fill="#ff2d55")
     sq = (CW - CH) // 2
     pd.rectangle([sq, 0, sq + CH - 1, CH - 1], outline="#ffd400", width=4)
     pd.text((sq + 10, 10), "guaranteed mobile square", fill="#ffd400")
     prev.save(f"{a.out}/check-placement.png")
 
     # --- the gates ----------------------------------------------------------
-    gap_pct = (top - f.oy(f.chin)) / h * 100
+    worst = min(f.gaps(h, top), key=lambda t: abs(t[1]))
+    gap_pct = worst[1]
     crop_faces = 2 * max(AXIS - f.ox(f.face_l), f.ox(f.face_r) - AXIS) / CH
     crop_logo = box[2] / CH
     fails = []
@@ -460,12 +626,15 @@ def cmd_check(a):
         fails.append(f"KNOT SYMMETRY {iou * 100:.2f}% against the artwork's "
                      f"{KNOT_CEILING * 100:.2f}% ceiling -- the mark is off its "
                      f"own mirror axis.")
-    if gap_pct < 8.0:
-        fails.append(f"GRAZING: mark clears the chin by {gap_pct:.1f}% of its "
-                     f"height. Commit to a gap or an overlap, never between.")
-    if top + h > UI_TOP:
-        fails.append(f"mark ends at {top + h:.0f}, under Facebook's furniture "
-                     f"({UI_TOP:.0f}).")
+    if abs(gap_pct) < GRAZE_FRAC * 100:
+        # Two-sided now that a mark may deliberately overlap: a clear gap and a
+        # committed overlap are both fine, the dead zone around zero is not.
+        fails.append(f"GRAZING: mark sits {gap_pct:+.1f}% of its height from the "
+                     f"{worst[0]}'s chin. Commit to a gap or an overlap, never "
+                     f"between.")
+    if top + h > f.ui_top:
+        fails.append(f"mark ends at {top + h:.0f}, past its baseline "
+                     f"({f.ui_top:.0f}) and into the mobile bottom fade.")
     if max(crop_faces, crop_logo) > 1.0:
         fails.append(f"does not survive the mobile square crop "
                      f"({max(crop_faces, crop_logo):.3f} > 1.0).")
@@ -478,8 +647,21 @@ def cmd_check(a):
           f"the crowns; headroom {hr:.0f} -> {'kept' if f.keeps_top() else 'CROPPED'}")
     print(f"knot mirror IoU {iou * 100:.2f}% (ceiling {KNOT_CEILING * 100:.2f})")
     print(f"mark {h * RATIO:.0f}px wide = {h * RATIO / CW * 100:.1f}% of canvas, "
-          f"chin gap {gap_pct:.1f}% of logo height, bottom at {top + h:.0f}")
+          f"gap {gap_pct:+.1f}% of logo height off the {worst[0]}'s chin, "
+          f"bottom at {top + h:.0f}")
     print(f"mobile square margin {max(crop_faces, crop_logo):.3f} (under 1.0 survives)")
+    chin_y, band, who = f.band(h * RATIO)
+    print(f"binding chin: {who} at {chin_y:.0f}; furniture reserves "
+          f"{CH - f.ui_top:.0f}px, mark bottom limit {f.bottom:.0f} -> band "
+          f"{band:.0f}px, fits a mark up to {band * RATIO / CW * 100:.1f}% "
+          f"of canvas width whole")
+    print("size ladder (gap is an outcome; negative = deliberate overlap; the "
+          "gap shown is the WORST chin under that width):")
+    for wf in sorted(widths, reverse=True):
+        sh, stop = f.layout(wf)
+        wl, wg = min(f.gaps(sh, stop), key=lambda t: abs(t[1]))
+        print(f"  {wf * 100:5.1f}% wide  wordmark {sh * WORD_FRAC / CH * 100:4.1f}% "
+              f"of canvas height  gap {wg:+6.1f}% ({wl})  bottom {stop + sh:.0f}")
     print(f"\n{a.out}/check-landmarks.png   <-- are the lines on the right features?")
     print(f"{a.out}/check-placement.png   <-- is this a good place for the mark?")
     if fails:
@@ -497,9 +679,7 @@ def cmd_build(a):
     path_d = load_logo(cfg["logo_svg"])
     sigma = float(cfg.get("sigma", 8.0))
     treatments = cfg.get("treatments", ["glow", "pad"])
-    hrs = cfg.get("headroom", "auto")
-    hrs = [auto_headroom(a.photo, cfg)] if hrs in ("auto", None) else (
-        [float(x) for x in (hrs if isinstance(hrs, list) else [hrs])])
+    hrs = read_headrooms(cfg, a.photo)
 
     # build must not be a way around the axis cross-check: check only gates the
     # first rung, and build can be run without check at all.
@@ -511,36 +691,46 @@ def cmd_build(a):
             f"run check.")
 
     rows = []
+    widths = read_widths(cfg, a.photo)
     for hr in hrs:
         f = Frame(a.photo, cfg, hr)
-        h, top = f.layout()
-        alpha = mark_alpha(path_d, h, top, a.out, ink)
         base = f.base()
         A = np.asarray(base, np.float32)
         BL = np.asarray(base.filter(ImageFilter.GaussianBlur(PHOTO_BLUR)), np.float32)
-        hm = halo(alpha, sigma)[..., None]
-        thick = halo_thickness(alpha, hm[..., 0])
         tag = "keep" if f.keeps_top() else "cut"
-        for t in treatments:
-            if t == "glow":
-                out = A * (1 - hm * GLOW_OPACITY) + np.array(DEEP, np.float32) * (hm * GLOW_OPACITY)
-            elif t == "pad":
-                out = A * (1 - hm) + BL * hm
-            else:
-                raise SystemExit(f"unknown treatment {t!r}; use glow or pad")
-            # The headroom goes in the name whenever there is more than one
-            # rung. Without it two rungs that both keep (or both crop) the
-            # group's topmost point collide on one filename, the second render
-            # overwrites the first, and the first row's chin/gap/box get
-            # reported against the second's pixels. Silently.
-            name = f"{t}-{tag}" if len(hrs) == 1 else f"{t}-{tag}-hr{int(round(hr))}"
-            href = f"bg-{name}.png"
-            Image.fromarray(np.clip(out, 0, 255).astype(np.uint8)).save(f"{a.out}/{href}")
-            layer, box = logo_layer(path_d, h, top)
-            for suf, ls in (("", [bg_layer(href), layer]), ("-nologo", [bg_layer(href)])):
-                with open(f"{a.out}/{name}{suf}.svg", "w") as fh:
-                    fh.write(canvas(ls, name))
-            rows.append((name, f, h, top, box, alpha, thick, tag))
+        for wf in widths:
+            h, top = f.layout(wf)
+            # Halo and its thickness are per SIZE, not per crop: the blur is a
+            # fixed sigma against a mark whose perimeter changes with the rung,
+            # so a smaller mark carries a proportionally fatter aura.
+            alpha = mark_alpha(path_d, h, top, a.out, ink)
+            hm = halo(alpha, sigma)[..., None]
+            thick = halo_thickness(alpha, hm[..., 0])
+            for t in treatments:
+                if t == "glow":
+                    out = A * (1 - hm * GLOW_OPACITY) + np.array(DEEP, np.float32) * (hm * GLOW_OPACITY)
+                elif t == "pad":
+                    out = A * (1 - hm) + BL * hm
+                else:
+                    raise SystemExit(f"unknown treatment {t!r}; use glow or pad")
+                # Headroom and size scale go in the name whenever there is more
+                # than one rung of that kind. Without it two rungs that both
+                # keep (or both crop) the group's topmost point collide on one
+                # filename, the second render overwrites the first, and the
+                # first row's chin/gap/box get reported against the second's
+                # pixels. Silently.
+                name = f"{t}-{tag}"
+                if len(hrs) > 1:
+                    name += f"-hr{int(round(hr))}"
+                if len(widths) > 1:
+                    name += f"-w{int(round(wf * 1000)):03d}"
+                href = f"bg-{name}.png"
+                Image.fromarray(np.clip(out, 0, 255).astype(np.uint8)).save(f"{a.out}/{href}")
+                layer, box = logo_layer(path_d, h, top)
+                for suf, ls in (("", [bg_layer(href), layer]), ("-nologo", [bg_layer(href)])):
+                    with open(f"{a.out}/{name}{suf}.svg", "w") as fh:
+                        fh.write(canvas(ls, name))
+                rows.append((name, f, h, top, box, alpha, thick, tag))
 
     svgs = []
     for r in rows:
@@ -559,8 +749,8 @@ def cmd_build(a):
         plain = np.asarray(Image.open(f"{a.out}/{name}-nologo.png").convert("RGB"))
         c_mean, c_p05, below3 = contrast_stats(rend, plain, OUTLINE)
         iou = knot_iou(alpha, box)
-        chin = f.oy(f.chin)
-        gap_pct = (top - chin) / h * 100
+        who, gap_pct = min(f.gaps(h, top), key=lambda t: abs(t[1]))
+        chin = f.band(h * RATIO)[0]
         lg_bot = top + h
         crop_faces = 2 * max(AXIS - f.ox(f.face_l), f.ox(f.face_r) - AXIS) / CH
         crop_logo = max(AXIS - box[0], box[0] + box[2] - AXIS) * 2 / CH
@@ -574,10 +764,10 @@ def cmd_build(a):
             flags.append(f"MEAN-CONTRAST<5({c_mean:.2f})")
         if iou < KNOT_CEILING - 0.03:
             flags.append(f"OFF-AXIS({iou * 100:.1f}%)")
-        if lg_bot > UI_TOP:
+        if lg_bot > f.ui_top:
             flags.append(f"MARK-UNDER-FB-UI({lg_bot:.0f})")
-        if gap_pct < 8.0:
-            flags.append(f"GRAZING-CHINS({gap_pct:.1f}%)")
+        if abs(gap_pct) < GRAZE_FRAC * 100:
+            flags.append(f"GRAZING-{who.upper().replace(' ', '-')}({gap_pct:+.1f}%)")
         if max(crop_faces, crop_logo) > 1.0:
             flags.append("CROPPED-ON-MOBILE")
         ok &= not flags
