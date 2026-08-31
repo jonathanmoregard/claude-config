@@ -1,17 +1,30 @@
 #!/usr/bin/env bash
-# Offline smoke test for session-reflect. Uses a stub `claude` on PATH; no
-# live API calls, no network.
+# Smoke test for session-reflect. The session-reflect half is offline: it drives
+# a stub `claude` on PATH and touches no network.
 #
 # It also runs the bash-guard test modules (TEST 50), which it DISCOVERS rather
 # than lists, so this script is the single verifier for both. Those modules used
 # to be invoked by nothing at all — see the comment above TEST 50.
 #
+# NOT OFFLINE ANY MORE, and deliberately so. tests/test_deny_globs.py drives a
+# REAL headless `claude -p` to prove the `Bash(...)` deny globs actually deny —
+# so a run of this script spends real API calls (fast lane ~$0.10, full lane
+# ~$0.70, measured 2026-08-31) and needs working auth. That was previously an
+# opt-in behind DENY_GLOBS_LIVE=1, and the opt-in was the bug: the gate ran its
+# offline half only, reported PASS, and proved nothing about the CLI's
+# permission surface. A safety gate ships enforcing; the lane switch selects how
+# MUCH is swept, never whether anything real is checked. See TEST 50a and 50.N.
+#
 # LANES (test selection only — NOT a switch on product behaviour):
 #   fast  (default)  the regression test for every BLOCKER/HIGH fixed in this
 #                    review, plus every cheap unit-level test. Runnable inline.
 #   full             fast + the MEDIUM/LOW integration blocks, which each drive
-#                    several real `idle-handoff.sh` ticks and dominate wall time.
+#                    several real `idle-handoff.sh` ticks and dominate wall time,
+#                    and the whole-rule-set live deny-glob sweep (DENY_GLOBS_SCOPE
+#                    =full: every ported rule, every benign command, ~83 probes).
 #   Select with `SMOKE_LANE=full` or `bash tests/smoke.sh --full`.
+#   The fast lane still runs the live deny-glob CONTROLS (DENY_GLOBS_SCOPE=core,
+#   12 probes). Neither lane runs zero live probes — there is no "offline" value.
 #
 # EXIT CODES — a test failing and the suite failing to clean up after itself are
 # different events and no longer share an exit code:
@@ -24,6 +37,11 @@
 #   REFLECT_ROOT     - artifact root (default: mktemp)
 #   REFLECT_DEBUG=1  - keep temp dirs and print paths
 #   SMOKE_LANE       - fast (default) | full
+#   CLAUDE_CLI       - absolute path to the Claude Code CLI to test the deny
+#                      globs against. Default: ~/.local/bin/claude, i.e. the
+#                      binary an interactive session runs — NOT `claude` on
+#                      PATH, which under systemd resolves a different build.
+#                      See TEST 50a.
 set -u
 set -o pipefail
 
@@ -86,7 +104,10 @@ lane_skip() { TESTS_SKIPPED=$(( TESTS_SKIPPED + 1 )); echo "SKIP (lane=$SMOKE_LA
 # evidence. The exit code (1) and the TESTS: line both say "a test", never "cleanup".
 fail() {
   echo "FAIL: $*" >&2
-  echo "TESTS:    FAILED after $TESTS_RUN named test(s) (lane=$SMOKE_LANE)" >&2
+  # cli= is part of the verdict, not decoration. A run that cannot say which
+  # Claude Code build its deny-glob gate exercised is not reporting a result —
+  # see TEST 50a. `unresolved` means the failure happened before resolution.
+  echo "TESTS:    FAILED after $TESTS_RUN named test(s) (lane=$SMOKE_LANE, cli=${SMOKE_CLI_VERSION:-unresolved})" >&2
   echo "TEARDOWN: SKIPPED — temp state kept for inspection: REFLECT_ROOT=${REFLECT_ROOT:-<not created yet>} SCRATCH=${SMOKE_TMP_PARENT:-<not created yet>}" >&2
   exit 1
 }
@@ -5959,6 +5980,67 @@ sc_forked "$T1_ARGV" \
 info "49: a 3000-record transcript still yields its cwd — no SIGPIPE-driven skip"
 
 # ============================================================================
+# TEST 50a: the CLI under test — resolved explicitly, named, version-pinned
+# ============================================================================
+# THE DEFECT THIS FIXES (2026-08-31). This host carries two Claude Code installs:
+#
+#   ~/.local/bin/claude                        2.1.251  <- what a session runs
+#   /etc/profiles/per-user/$USER/bin/claude    2.1.222  <- Nix-packaged
+#   /run/current-system/sw/bin/claude          2.1.222
+#
+# `tests/test_deny_globs.py` located its CLI with `shutil.which("claude")`, i.e.
+# from PATH. TEST 50 hands the guard modules $SMOKE_HOST_PATH — and a
+# `systemd-run --user` unit, which is how the full lane is driven detached, has
+# the SYSTEM PATH, so `claude` resolved to 2.1.222. The lane therefore validated
+# the CLI that is not running. It printed
+#   TESTS: PASS — 73 named test(s) ran, 0 skipped, 0 failed (lane=full)
+# which was true, and was about the wrong binary. Nothing in that line, and
+# nothing in the modules' output, named a version — so the mistake had no
+# surface to be noticed on. A gate that cannot name what it tested is not a gate.
+#
+# THE CHOICE: PIN TO THE INTERACTIVE CLI, do not test both.
+# The `Bash(...)` deny globs exist to constrain the CLI a human session actually
+# runs. 2.1.222 is a stale copy that nothing interactive executes; sweeping the
+# whole rule set against it as well would double a bill measured in real API
+# calls to characterise verdicts nobody is exposed to, and invites the failure
+# mode where the second half goes red and gets muted. What the divergence
+# deserves is VISIBILITY: every install found is listed below with its version,
+# and the one under test is stated in the info line, in each module's output,
+# and in the final TESTS: line. Point CLAUDE_CLI at the other build to sweep it.
+#
+# RESOLUTION ORDER: $CLAUDE_CLI, then ~/.local/bin/claude, then $SMOKE_HOST_PATH.
+# NOT the suite's own PATH — that has the stub `claude` in front of it (see
+# STUB_SCRATCH), and a shell script with no bundle inside it is not a CLI.
+test_begin "TEST 50a: the CLI under test is resolved, named and version-pinned"
+SMOKE_CLI="${CLAUDE_CLI:-}"
+if [[ -z "$SMOKE_CLI" ]]; then
+  if [[ -x "$HOME/.local/bin/claude" ]]; then
+    SMOKE_CLI="$HOME/.local/bin/claude"
+  else
+    SMOKE_CLI="$(PATH="$SMOKE_HOST_PATH" command -v claude 2>/dev/null || true)"
+  fi
+fi
+[[ -n "$SMOKE_CLI" && -x "$SMOKE_CLI" ]] \
+  || fail "50a: no Claude Code CLI resolved (CLAUDE_CLI unset, ~/.local/bin/claude absent, none on the host PATH). tests/test_deny_globs.py drives a real CLI; without one the deny globs have NO proof and this run must not report a verdict about them."
+# `|| true` inside the substitution: errexit and pipefail are both in force here
+# (see TEST 7), so a version line that does not match would abort the whole
+# script at this assignment — exit 1, no FAIL line, no explanation. The empty
+# check below is what must report it.
+SMOKE_CLI_VERSION="$("$SMOKE_CLI" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+[[ -n "$SMOKE_CLI_VERSION" ]] \
+  || fail "50a: '$SMOKE_CLI --version' reported no parseable version, so this run cannot name the CLI it is about to test."
+info "50a: CLI under test: $SMOKE_CLI = $SMOKE_CLI_VERSION"
+for smoke_other in "$HOME/.local/bin/claude" "/etc/profiles/per-user/${USER:-}/bin/claude" "/run/current-system/sw/bin/claude"; do
+  [[ -x "$smoke_other" ]] || continue
+  smoke_other_v="$("$smoke_other" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+  if [[ "$smoke_other" -ef "$SMOKE_CLI" ]]; then
+    info "50a: install on this host: $smoke_other = ${smoke_other_v:-unreadable}  <-- under test"
+  else
+    info "50a: install on this host: $smoke_other = ${smoke_other_v:-unreadable}  (NOT under test; set CLAUDE_CLI to sweep it)"
+  fi
+done
+
+# ============================================================================
 # TEST 50: the bash-guard test modules, run by the repo's own verifier
 # ============================================================================
 # THE DEFECT THIS FIXES (2026-08-24). The fail-closed bash guard is the entire
@@ -6027,10 +6109,17 @@ for guard_mod in "${GUARD_MODULES[@]}"; do
   test_begin "TEST 50.$guard_idx: $guard_rel"
   guard_log="$SMOKE_TMP_PARENT/guard-${guard_mod##*/}.log"
   # PATH: the host's, see SMOKE_HOST_PATH above.
-  # DENY_GLOBS_LIVE: cleared, not merely left unset. This suite is offline by
-  # contract (see the header), and that variable makes tests/test_deny_globs.py
-  # spend real API calls. An ambient export in the caller's shell must not be
-  # able to turn a smoke run into a billed one.
+  # CLAUDE_CLI / CLAUDE_CLI_EXPECT_VERSION: the binary TEST 50a resolved, and the
+  # version it reported. A module that reads CLAUDE_CLI re-measures the version
+  # itself and refuses to print results if the two disagree, so "the lane picked
+  # one build and the module ran another" cannot pass silently. Passed per-module
+  # rather than exported: nothing else in this suite may see a real CLI, because
+  # every session-reflect test wants the stub.
+  # DENY_GLOBS_SCOPE: set explicitly, so an ambient value in the caller's shell
+  # cannot change the sweep. `core` is the controls only (~12 live probes);
+  # `full` is the whole rule set (~83). It selects HOW MUCH is swept — never
+  # whether the live sweep happens, which is what the retired DENY_GLOBS_LIVE=1
+  # opt-in got wrong.
   # `|| guard_rc=$?`, NOT a bare command followed by `guard_rc=$?`. `set -e` is in
   # force from TEST 7's `set -e` onward (see the note there), so a bare failing
   # module killed the script THERE — exit 1, no FAIL line, no TESTS: line, no
@@ -6038,14 +6127,36 @@ for guard_mod in "${GUARD_MODULES[@]}"; do
   # the suite reported a bare exit 1 and the reader had no way to learn which
   # guard went red. Putting the command in an `||` list suspends errexit for it,
   # so the failure reaches the report instead of terminating the run in silence.
+  # `if`, not `lane_full && guard_scope=full`: errexit applies to the LAST
+  # command of an AND-OR list, so on the fast lane that one-liner returns 1 and
+  # kills the script here with no FAIL line at all.
+  if lane_full; then guard_scope=full; else guard_scope=core; fi
   guard_rc=0
-  env -u DENY_GLOBS_LIVE PATH="$SMOKE_HOST_PATH" python3 "$guard_mod" \
-    >"$guard_log" 2>&1 || guard_rc=$?
+  env PATH="$SMOKE_HOST_PATH" \
+      CLAUDE_CLI="$SMOKE_CLI" \
+      CLAUDE_CLI_EXPECT_VERSION="$SMOKE_CLI_VERSION" \
+      DENY_GLOBS_SCOPE="$guard_scope" \
+      python3 "$guard_mod" >"$guard_log" 2>&1 || guard_rc=$?
   if (( guard_rc != 0 )); then
-    fail "50.$guard_idx: $guard_rel FAILED (exit=$guard_rc). This is the bash guard's own test suite — a red module here means the fail-closed guard is not doing what it claims, and no other result in this run should be read as evidence about it.
+    fail "50.$guard_idx: $guard_rel FAILED (exit=$guard_rc) against Claude Code $SMOKE_CLI_VERSION ($SMOKE_CLI). This is the bash guard's own test suite — a red module here means the fail-closed guard is not doing what it claims, and no other result in this run should be read as evidence about it.
 full log: $guard_log
 last 40 lines:
 $(tail -40 "$guard_log" 2>/dev/null)"
+  fi
+  # A module that drives the real CLI must SAY which one it drove. Discovered,
+  # not listed: a module is CLI-dependent iff its own text names CLAUDE_CLI, the
+  # same tree-derived rule the module discovery above uses, so a new CLI-driving
+  # module is covered with no edit here. Silence is a failure — that silence is
+  # exactly what let the lane validate 2.1.222 for weeks while reporting PASS.
+  if grep -qF 'CLAUDE_CLI' -- "$guard_mod"; then
+    guard_named="$(grep -m1 '^CLI UNDER TEST: ' "$guard_log" 2>/dev/null || true)"
+    [[ -n "$guard_named" ]] \
+      || fail "50.$guard_idx: $guard_rel names CLAUDE_CLI but printed no 'CLI UNDER TEST:' line, so it cannot be shown to have tested $SMOKE_CLI_VERSION. Read this as 'the module did not report what it tested', never as 'the module passed'.
+full log: $guard_log"
+    [[ "$guard_named" == "CLI UNDER TEST: $SMOKE_CLI_VERSION @ "* ]] \
+      || fail "50.$guard_idx: VERSION MISMATCH — this lane resolved Claude Code $SMOKE_CLI_VERSION ($SMOKE_CLI), but $guard_rel reported '$guard_named'. Its results are about a different binary and must not be counted.
+full log: $guard_log"
+    info "50.$guard_idx: $guard_rel tested $guard_named (scope=$guard_scope)"
   fi
   info "50.$guard_idx: $guard_rel green — $(grep -c '\[OK' "$guard_log" 2>/dev/null || echo 0) check(s) reported OK"
 done
@@ -6113,8 +6224,9 @@ fi
 # look broken again (and a broken teardown can never look green).
 # ============================================================================
 echo "----------------------------------------------------------------------"
-printf 'TESTS:    PASS — %s named test(s) ran, %s skipped, 0 failed (lane=%s)\n' \
-  "$TESTS_RUN" "$TESTS_SKIPPED" "$SMOKE_LANE"
+printf 'TESTS:    PASS — %s named test(s) ran, %s skipped, 0 failed (lane=%s, cli=%s @ %s)\n' \
+  "$TESTS_RUN" "$TESTS_SKIPPED" "$SMOKE_LANE" \
+  "${SMOKE_CLI_VERSION:-unresolved}" "${SMOKE_CLI:-unresolved}"
 if [[ "$TEARDOWN_STATUS" == "ok" ]]; then
   echo "TEARDOWN: OK"
   echo "OK: all smoke tests passed"
