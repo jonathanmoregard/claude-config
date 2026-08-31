@@ -20,7 +20,13 @@ from importlib import import_module  # noqa: E402
 
 classifier = import_module("continue-nudge-classifier")
 
-STATE_DIR = Path.home() / ".claude" / "continue-nudge"
+# Runtime state only — classifier.log and one cooldown-<session> stamp per
+# session. NOT ~/.claude/continue-nudge/: that is a live git checkout holding
+# this experiment's tracked corpus (labels.jsonl, backtest-round-*.txt), and
+# neither of the shapes written here is covered by an ignore rule, so every
+# classified turn would leave the config repo dirty. The corpus keeps its
+# place; the runtime does not live in a repo.
+STATE_DIR = Path.home() / ".local" / "state" / "continue-nudge"
 COOLDOWN_SECONDS = 20
 COOLDOWN_TTL_SECONDS = 24 * 60 * 60
 LOG = STATE_DIR / "classifier.log"
@@ -131,8 +137,8 @@ def main():
         sys.exit(0)
 
     # Guard: skip our OWN classifier subprocesses (they run `claude -p` from
-    # ~/.claude/continue-nudge/, which triggers Stop hooks on the inner
-    # session — recursion risk). Match by resolved path equality, NOT a
+    # STATE_DIR, which triggers Stop hooks on the inner session — recursion
+    # risk). Match by resolved path equality, NOT a
     # "/continue-nudge" substring check that would false-positive on any
     # unrelated project directory containing the phrase.
     try:

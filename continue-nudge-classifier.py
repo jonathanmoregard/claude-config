@@ -13,7 +13,11 @@ import sys
 import time
 from pathlib import Path
 
-STATE_DIR = Path.home() / ".claude" / "continue-nudge"
+# Must stay identical to continue-nudge-detector.py's STATE_DIR: the detector
+# recognises its own sandbox subprocess by comparing cwd against it, and this
+# module is what sets that cwd. Runtime state deliberately lives outside
+# ~/.claude — see the note beside the detector's copy.
+STATE_DIR = Path.home() / ".local" / "state" / "continue-nudge"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 LOG = STATE_DIR / "classifier.log"
 

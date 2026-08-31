@@ -54,6 +54,14 @@ LEDGER_DIR="${LEDGER_DIR/#\~/$HOME}"
 LOG_DIR="$CLAUDE_HOME/logs"
 LOG_FILE="$LOG_DIR/permission-ledger.log"
 
+# Raw agent output on a failed run is forensics, not a log line, and it does
+# NOT go in $LOG_DIR. That directory lives inside the live config git repo,
+# whose .gitignore covers `logs/*.log` and nothing else — so a `.txt` sibling
+# left an UNTRACKED file in ~/.claude on every failure night. Beyond the
+# dirtying: this content is raw model output derived from untrusted transcript
+# samples and has no business inside the config the harness reads. State dir.
+RAW_KEEP_DIR="$HOME/.local/state/permission-ledger"
+
 AGGREGATE="$LEDGER_DIR/aggregate.py"
 PROMPT_FILE="$LEDGER_DIR/prompt.md"
 SINK="$LEDGER_DIR/proposal-sink.py"
@@ -290,8 +298,10 @@ fi
 # ------------------------------------------------------------------ sink ----
 
 if [[ ! -x "$SINK" && ! -f "$SINK" ]]; then
-  keep="$LOG_DIR/permission-ledger-raw-$(date -u +%Y%m%dT%H%M%SZ).txt"
-  cp -- "$raw" "$keep" 2>/dev/null && log "raw agent output preserved at $keep"
+  keep="$RAW_KEEP_DIR/permission-ledger-raw-$(date -u +%Y%m%dT%H%M%SZ).txt"
+  mkdir -p "$RAW_KEEP_DIR" 2>/dev/null \
+    && cp -- "$raw" "$keep" 2>/dev/null \
+    && log "raw agent output preserved at $keep"
   log "proposal-sink.py not found at $SINK; nothing persisted"
   exit 3
 fi
@@ -303,8 +313,8 @@ while IFS= read -r line; do
 done <<< "$sink_out"
 
 if [[ $sink_rc -ne 0 ]]; then
-  keep="$LOG_DIR/permission-ledger-raw-$(date -u +%Y%m%dT%H%M%SZ).txt"
-  if cp -- "$raw" "$keep" 2>/dev/null; then
+  keep="$RAW_KEEP_DIR/permission-ledger-raw-$(date -u +%Y%m%dT%H%M%SZ).txt"
+  if mkdir -p "$RAW_KEEP_DIR" 2>/dev/null && cp -- "$raw" "$keep" 2>/dev/null; then
     log "raw agent output preserved at $keep"
   else
     log "warning: could not preserve raw agent output to $keep"
