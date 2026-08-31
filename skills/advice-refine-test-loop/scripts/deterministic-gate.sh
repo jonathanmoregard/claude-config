@@ -29,6 +29,10 @@
 # they are reviewable, greppable, and attributable to a commit. There is no
 # config file and no global suppression, because both are the mechanisms by
 # which a rules layer quietly stops covering anything.
+#
+# One structural exemption exists alongside waivers: a JSON string under
+# `permissions.deny` or `permissions.ask` is data, not a command. See the
+# "Permission tables are data" block below for why it is not a waiver.
 
 set -uo pipefail
 
@@ -43,7 +47,7 @@ while [[ $# -gt 0 ]]; do
     --json)  JSON=1; shift ;;
     --repo)  REPO="${2:-}"; shift 2 ;;
     --include-docs) INCLUDE_DOCS=1; shift ;;
-    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,34p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -79,6 +83,12 @@ else
   DIFF=$(git diff --unified=0 HEAD 2>/dev/null)
   RANGE="(working tree vs HEAD)"
 fi
+
+# Right-hand side of the range — the post-image whose structure a finding's
+# line number addresses. Empty means the working tree, which is what the
+# fallback above diffs against.
+RANGE_TIP=""
+[[ "$RANGE" == *".."* ]] && RANGE_TIP="${RANGE##*..}"
 
 # ── Rules ────────────────────────────────────────────────────────────────────
 # Each rule is `id<TAB>severity<TAB>ERE`. Matched against ADDED lines only:
@@ -194,6 +204,134 @@ WAIVED=$(printf '%s\n' "$FINDINGS" | awk -F'\t' '$1=="__WAIVED__"{print $2}')
 WAIVED=${WAIVED:-0}
 FINDINGS=$(printf '%s\n' "$FINDINGS" | grep -v '^__WAIVED__' | sed '/^$/d')
 
+# ── Permission tables are data, not commands ─────────────────────────────────
+# A string under `permissions.deny` or `permissions.ask` NAMES a command in
+# order to forbid or gate it. Matching one is the rule working, not a hazard
+# introduced. This is the same reason the scan already exempts this file and
+# its fixture: a rule table that states hazards as literal text will flag
+# itself on every edit, and a gate that cries wolf about itself is one people
+# learn to skip. A permissions block is another rule table.
+#
+# It is an exemption rather than a waiver because the waiver mechanism cannot
+# reach here: `arftl-allow:` must appear in a comment, and JSON has no comment
+# syntax. Measured, and worth stating because the workaround is worse than the
+# problem — with a `//` comment in a settings file the CLI silently voids the
+# WHOLE permissions block, so waiving this way would disable every deny rule in
+# it.
+#
+# Scoped by JSON path, never by filename. A string under `permissions.allow` is
+# NOT exempt: that one auto-approves the command it names, which is the whole
+# hazard. Anything the resolver cannot fetch or parse keeps its finding — the
+# exemption fails closed.
+read -r -d '' PERMISSION_DATA_PY <<'PY'
+import json, os, subprocess, sys
+
+TIP = os.environ.get("RANGE_TIP", "")
+DATA_PATHS = (("permissions", "deny"), ("permissions", "ask"))
+_src_cache = {}
+_line_cache = {}
+
+
+def source(path):
+    """Post-image text of `path`, or None when it cannot be resolved."""
+    if path in _src_cache:
+        return _src_cache[path]
+    text = None
+    if TIP:
+        p = subprocess.run(["git", "show", "%s:%s" % (TIP, path)],
+                           capture_output=True, text=True)
+        if p.returncode == 0:
+            text = p.stdout
+    if text is None:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+        except (OSError, UnicodeDecodeError):
+            text = None
+    _src_cache[path] = text
+    return text
+
+
+def data_lines(path):
+    """Line numbers occupied by strings under a DATA_PATHS array.
+
+    Hand-rolled rather than json.load, because a parsed object carries no line
+    numbers and findings are addressed by line. Unresolvable or unparseable
+    input yields the empty set, so the finding stands.
+    """
+    src = source(path)
+    if src is None:
+        return set()
+    try:
+        json.loads(src)
+    except ValueError:
+        return set()
+    exempt, stack, i, n = set(), [], 0, len(src)
+    while i < n:
+        c = src[i]
+        if c == '"':
+            j = i + 1
+            while j < n:
+                if src[j] == "\\":
+                    j += 2
+                    continue
+                if src[j] == '"':
+                    break
+                j += 1
+            k = j + 1
+            while k < n and src[k] in " \t\r\n":
+                k += 1
+            if k < n and src[k] == ":":
+                # A key names the slot we are about to descend into.
+                if stack and stack[-1][0] == "{":
+                    stack[-1][1] = json.loads(src[i:j + 1])
+            elif stack and stack[-1][0] == "[":
+                keys = tuple(f[1] for f in stack if f[0] == "{")
+                if keys in DATA_PATHS:
+                    exempt.update(range(src.count("\n", 0, i) + 1,
+                                        src.count("\n", 0, j) + 2))
+            i = j + 1
+            continue
+        if c in "{[":
+            stack.append([c, None])
+        elif c in "}]" and stack:
+            stack.pop()
+        i += 1
+    return exempt
+
+
+dropped = 0
+for line in sys.stdin:
+    line = line.rstrip("\n")
+    if not line:
+        continue
+    parts = line.split("\t")
+    if len(parts) < 5 or not parts[2].endswith(".json"):
+        print(line)
+        continue
+    f = parts[2]
+    if f not in _line_cache:
+        _line_cache[f] = data_lines(f)
+    if int(parts[3]) in _line_cache[f]:
+        dropped += 1
+    else:
+        print(line)
+if dropped:
+    print("__DATA_EXEMPT__\t%d" % dropped)
+PY
+
+DATA_EXEMPT=0
+if [[ -n "$FINDINGS" ]]; then
+  FINDINGS=$(printf '%s\n' "$FINDINGS" | RANGE_TIP="$RANGE_TIP" python3 -c "$PERMISSION_DATA_PY")
+  if [[ $? -ne 0 ]]; then
+    echo "gate: the permission-data resolver failed — refusing to report" >&2
+    exit 2
+  fi
+  DATA_EXEMPT=$(printf '%s\n' "$FINDINGS" | awk -F'\t' '$1=="__DATA_EXEMPT__"{print $2}')
+  DATA_EXEMPT=${DATA_EXEMPT:-0}
+  FINDINGS=$(printf '%s\n' "$FINDINGS" | grep -v '^__DATA_EXEMPT__' | sed '/^$/d')
+fi
+
 # ── gitleaks ─────────────────────────────────────────────────────────────────
 # Content-based secret detection, complementing the filename-shaped coverage in
 # the global gitignore. Absence of gitleaks is exit 2, not a silent pass.
@@ -215,9 +353,10 @@ count=0
 [[ -n "$FINDINGS" ]] && count=$(printf '%s\n' "$FINDINGS" | wc -l | tr -d ' ')
 
 if [[ $JSON -eq 1 ]]; then
-  printf '{"range":%s,"waived":%d,"gitleaks_clean":%s,"findings":[' \
+  printf '{"range":%s,"waived":%d,"data_exempt":%d,"gitleaks_clean":%s,"findings":[' \
     "$(printf '%s' "$RANGE" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')" \
     "$WAIVED" \
+    "$DATA_EXEMPT" \
     "$([[ $LEAKS -eq 0 ]] && echo true || echo false)"
   first=1
   if [[ -n "$FINDINGS" ]]; then
@@ -243,6 +382,7 @@ else
   fi
   [[ $LEAKS -eq 1 ]] && { echo "  BLOCKER  gitleaks"; printf '%s\n' "$LEAK_DETAIL" | sed 's/^/      /'; }
   [[ $WAIVED -gt 0 ]] && echo "  ($WAIVED match(es) waived inline)"
+  [[ $DATA_EXEMPT -gt 0 ]] && echo "  ($DATA_EXEMPT permission-rule string(s) exempt: data, not commands)"
   if [[ $count -eq 0 && $LEAKS -eq 0 ]]; then
     echo "  clean"
   fi

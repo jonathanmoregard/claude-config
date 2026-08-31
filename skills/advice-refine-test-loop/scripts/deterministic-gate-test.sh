@@ -91,6 +91,40 @@ mkdir -p src docs
   echo '        pass'
 } > src/bare_pass.py
 
+# Permission tables are DATA. A string under `permissions.deny` NAMES a command
+# in order to forbid it, so matching it is the rule working, not a hazard found.
+# A string under `permissions.allow` is the opposite — it auto-approves the
+# command it names — so that one must still flag. The exemption is scoped by
+# JSON path, which is what makes the two distinguishable.
+{
+  echo '{'
+  echo '  "permissions": {'
+  echo '    "deny": ['
+  printf '      "Bash(rm %s *)",\n' '-rf'
+  echo '      "Bash(git push *-f *)",'
+  echo '      "Bash(git reset --hard*)",'
+  echo '      "Bash(chmod 777 *)"'
+  echo '    ],'
+  echo '    "ask": ['
+  echo '      "Bash(curl * | sh)"'
+  echo '    ],'
+  echo '    "allow": ['
+  printf '      "Bash(rm %s /tmp/scratch)"\n' '-rf'
+  echo '    ]'
+  echo '  }'
+  echo '}'
+} > settings.json
+
+# Control: the exemption is by JSON PATH, not by file extension. A command
+# string in an ordinary .json field must still flag.
+{
+  echo '{'
+  echo '  "scripts": {'
+  printf '    "clean": "rm %s /var/lib/cache"\n' '-rf'
+  echo '  }'
+  echo '}'
+} > config.json
+
 # Clean file: must produce nothing.
 {
   echo 'def add(a, b):'
@@ -131,6 +165,25 @@ print("TWO-LINE DETECTION (both must be True):")
 for name in ("twoline.py", "twoline.js"):
     print(f"  {name} flagged? ", any(name in f and x["rule"]=="swallowed-exception"
                                      for x in d["findings"] for f in [x["file"]]))
+print()
+print("PERMISSION-DATA EXEMPTION:")
+sj = [x for x in d["findings"] if x["file"].endswith("settings.json")]
+print("  settings.json findings:", sorted((x["rule"], x["text"].strip()) for x in sj))
+print("  data_exempt:", d.get("data_exempt"))
+denied_rules = {"destructive-rm","force-push","history-rewrite",
+                "world-writable","curl-pipe-shell"}
+leaked = [x for x in sj if x["rule"] in denied_rules and "/tmp/scratch" not in x["text"]]
+print("  deny/ask entries exempt? (must be True) ", not leaked)
+if leaked:
+    print("    LEAKED:", [(x["rule"], x["text"].strip()) for x in leaked])
+allow_flagged = any(x["rule"] == "destructive-rm" and "/tmp/scratch" in x["text"] for x in sj)
+print("  allow entry still flagged? (must be True) ", allow_flagged)
+widened = any(x["rule"] == "permission-widened" for x in sj)
+print("  permission-widened still fires? (must be True) ", widened)
+cfg = [x for x in d["findings"] if x["file"].endswith("config.json")]
+print("  non-permissions .json still flagged? (must be True) ",
+      any(x["rule"] == "destructive-rm" for x in cfg))
+print("  data_exempt == 5? (must be True) ", d.get("data_exempt") == 5)
 '
 echo
 echo "=== clean-repo case (should exit 0) ==="
