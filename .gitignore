@@ -217,3 +217,25 @@ experiments/*/runs-pilot-discarded/
 
 # Working notes symlink -> ~/.local/state/claude-tasks/ (userspace, never committed)
 tasks
+
+# The proposals spine. Moved out of this repo on 2026-08-31 to
+# ~/.local/state/claude-proposals/, which is a git repo of its own so a
+# rejected proposal stays findable with `git log -S` — see
+# recursive-self-improvement/config/config.json -> proposals.folder, the single
+# source of truth. Both names below survive as ABSOLUTE symlinks into that sink
+# (scripts/cutover-proposals.sh creates them), kept as a compatibility shim for
+# readers; every writer resolves the sink directly.
+#
+# These rules have to live here, at the repo root, and not in
+# proposals/.gitignore where the permissions/ precedent lives: once `proposals`
+# is a symlink, git sees one untracked symlink OBJECT and never descends into
+# it, so no .gitignore inside can ignore it. Both are written unanchored-to-a-
+# trailing-slash on purpose — the path is a real directory before the cutover
+# and a symlink after, and one rule has to cover both. Anchored with a leading
+# slash so `/proposals` cannot also swallow an unrelated nested directory of
+# that name (the /self-compact/ entry above records the same lesson).
+#
+# Why ignored rather than merely untracked: repo-autosync auto-commits whatever
+# is untracked here, so an unignored spine would be committed straight back in.
+/proposals
+/recursive-self-improvement/proposals
