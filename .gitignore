@@ -149,12 +149,14 @@ jobs/
 #
 # Two registry entries are DELIBERATELY absent: `keybindings.json` and
 # `CLAUDE.md` are real user config that belongs in this repo.
+#
+# The registry's five daemon* names (daemon.json, daemon.status.json,
+# daemon.scheduled.status.json, daemon-auth-status.json, daemon-auth-cooldown)
+# are NOT relisted here: the `daemon.*` / `daemon-*` globs above already cover
+# them. Two rules for one file means two comments that can disagree, and the
+# next reader cannot tell which is authoritative. The globs own the daemon
+# subsystem; this block owns the rest of the registry, which no glob catches.
 active-time.json
-daemon-auth-cooldown
-daemon-auth-status.json
-daemon.json
-daemon.scheduled.status.json
-daemon.status.json
 .deep-link-register-failed
 gh-pr-status-cache.json
 hfi-auth.json
