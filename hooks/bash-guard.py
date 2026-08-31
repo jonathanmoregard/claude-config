@@ -278,7 +278,10 @@ def _disarm_watchdog() -> None:
     # was armed and really can be cancelled. Nothing to recover, and no
     # permissive outcome either way: the verdict is already decided, and a
     # watchdog that fired anyway calls _fail_closed, which denies.
-    try: signal.setitimer(signal.ITIMER_REAL, 0)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+    # arftl-allow: swallowed-exception — cannot fail where arming succeeded,
+    # and no permissive outcome is reachable either way. Reasoning above.
     except (ValueError, OSError, AttributeError): pass
 
 
@@ -968,8 +971,8 @@ def _pipe_fragments(command: str) -> list[str]:
 def _check_pipe_to_shell(command: str) -> str | None:
     """Detect a network fetch feeding a shell interpreter in one pipeline.
 
-    [arftl-allow: curl-pipe-shell — the Denies/Allows list below quotes the
-    shapes this function decides about; they are prose, not commands.]
+    The Denies/Allows list below quotes the shapes this function decides
+    about. [arftl-allow: curl-pipe-shell — prose, not commands.]
     Denies: `curl … | bash` and every spelling of it, including through a
     later stage (`| tee x | bash`), a wrapper (`| sudo bash`), an absolute
     path (`| /bin/bash`), a subshell, or a command substitution.

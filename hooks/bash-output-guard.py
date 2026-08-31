@@ -578,7 +578,10 @@ def _disarm_watchdog() -> None:
     # withholds instead of returning, so reaching here means a timer was
     # armed and can be cancelled. No permissive outcome either way: a
     # watchdog that fires anyway calls _withhold, which holds the bytes back.
-    try: signal.setitimer(signal.ITIMER_REAL, 0)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+    # arftl-allow: swallowed-exception — cannot fail where arming succeeded,
+    # and no permissive outcome is reachable either way. Reasoning above.
     except (ValueError, OSError, AttributeError): pass
 
 
@@ -682,7 +685,10 @@ def _scrub_persisted(path: str) -> tuple[bool, str, int]:
         # regardless, so the pointer is withheld and the model never sees a
         # path to bytes this guard could not rewrite. A leftover tmp holds the
         # SCRUBBED text, so failing to remove it leaks nothing either.
-        try: os.unlink(tmp)
+        try:
+            os.unlink(tmp)
+        # arftl-allow: swallowed-exception — cleanup only; ok=False is returned
+        # regardless, so the pointer is withheld. Reasoning above.
         except OSError: pass
         return False, (
             f"it holds a secret this guard could not rewrite ({type(exc).__name__})"

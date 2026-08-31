@@ -175,11 +175,11 @@ def _build_candidate(path: str) -> dict:
     # arftl-allow: permission-widened — this WIDENS nothing. It copies the
     # repo's own settings.json permissions block verbatim into a scratch
     # candidate file so the live probes drive exactly the surface this diff
-    # ships; no key is added, relaxed or reordered. The rule fires on the
-    # literal token `"permissions":`, which a verbatim copy necessarily
-    # contains. `hooks` beside it is filtered down to the three guards and
-    # repointed at this worktree, so the probe cannot exercise the installed
-    # copy by accident.
+    # ships; no key is added, relaxed or reordered. The rule fires on a token
+    # a verbatim copy necessarily contains. `hooks` beside it is filtered down
+    # to the three guards and repointed at this worktree, so the probe cannot
+    # exercise the installed copy by accident.
+    # arftl-allow: permission-widened — verbatim copy into a scratch file.
     cand = {"permissions": SETTINGS["permissions"], "hooks": hooks}
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(cand, fh, indent=2)

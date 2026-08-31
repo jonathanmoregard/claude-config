@@ -468,11 +468,12 @@ def _dcg_rule_set_faults(dcg_path: str, cfg_path: str, marker_path: str,
         # seed names itself in its reason strings, which survive a plain
         # read. Corroboration only — the packaged binary always answers in
         # JSON, so this branch is for older builds and test stubs.
-        # arftl-allow: suppression-marker — narrowing only, not a silenced
-        # error. `_run_dcg_config` returns ("text", outcomes) exclusively from
-        # the branch that built `outcomes` as a non-empty list of 4-tuples;
-        # the checker cannot see that through the declared `object`. A crash
-        # here would now be REPORTED by the crash handler, not swallowed.
+        # `_run_dcg_config` returns ("text", outcomes) exclusively from the
+        # branch that built `outcomes` as a non-empty list of 4-tuples; the
+        # checker cannot see that through the declared `object`. A crash here
+        # would now be REPORTED by the crash handler, not swallowed.
+        # arftl-allow: suppression-marker — narrowing only, guaranteed by the
+        # producer; no error is being silenced.
         outcomes = [o for o in payload if o[0] == "user"]  # type: ignore[union-attr]
         if not outcomes:
             return [(DOWN, (
@@ -514,10 +515,11 @@ def _dcg_rule_set_faults(dcg_path: str, cfg_path: str, marker_path: str,
         return []
 
     doc = payload  # JSON
-    # arftl-allow: suppression-marker — narrowing only. `_run_dcg_config`
-    # returns ("json", doc) solely from the branch guarded by
-    # `isinstance(doc, dict) and isinstance(doc.get("config_sources"), list)`,
-    # so both the .get and the list are guaranteed by the producer.
+    # `_run_dcg_config` returns ("json", doc) solely from the branch guarded
+    # by `isinstance(doc, dict) and isinstance(doc.get("config_sources"),
+    # list)`, so both the .get and the list are guaranteed by the producer.
+    # arftl-allow: suppression-marker — narrowing only, guaranteed by the
+    # producer; no error is being silenced.
     sources = doc.get("config_sources") or []  # type: ignore[union-attr]
     loaded = [
         s for s in sources
@@ -548,10 +550,12 @@ def _dcg_rule_set_faults(dcg_path: str, cfg_path: str, marker_path: str,
 
     faults: list[tuple[str, str]] = []
 
-    # arftl-allow: suppression-marker — narrowing only; `doc` is the same
-    # producer-guaranteed dict as above. The `or {}` already handles a missing
-    # or null `overrides`, and `_covered_classes` handles a `block` of any
-    # shape, so no value reaches here that the code does not expect.
+    # `doc` is the same producer-guaranteed dict as above. The `or {}` already
+    # handles a missing or null `overrides`, and `_covered_classes` handles a
+    # `block` of any shape, so no value reaches here that the code does not
+    # expect.
+    # arftl-allow: suppression-marker — narrowing only, guaranteed by the
+    # producer; no error is being silenced.
     block = (doc.get("overrides") or {}).get("block")  # type: ignore[union-attr]
     covered, uninspectable = _covered_classes(block)
     missing = [label for label, _ in FULL_ONLY_CLASSES if label not in covered]
@@ -604,9 +608,11 @@ def _dcg_rule_set_faults(dcg_path: str, cfg_path: str, marker_path: str,
     # re-triggers it and hand-reverting does not stick. It fired on the live
     # host on 2026-08-24. Announced, not denied: the guard still evaluates
     # correctly, it is the settings file that is at risk.
-    # arftl-allow: suppression-marker — narrowing only; same producer-
-    # guaranteed dict. `is True` is deliberate: any other value, including a
-    # non-dict `general`, leaves the announcement unmade rather than guessed.
+    # Same producer-guaranteed dict. `is True` is deliberate: any other value,
+    # including a non-dict `general`, leaves the announcement unmade rather
+    # than guessed.
+    # arftl-allow: suppression-marker — narrowing only, guaranteed by the
+    # producer; no error is being silenced.
     if (doc.get("general") or {}).get("self_heal_hook") is True:  # type: ignore[union-attr]
         faults.append((REDUCED, (
             "dcg's `self_heal_hook` is ENABLED (upstream's default). In that "
@@ -714,7 +720,10 @@ def main() -> int:
     # the payload, so failing to read it cannot change a verdict. The read
     # exists only to spare the harness a broken pipe, and a broken pipe is the
     # very thing this would be reporting.
-    try: sys.stdin.read()
+    try:
+        sys.stdin.read()
+    # arftl-allow: swallowed-exception — the payload is discarded; no verdict
+    # in this file reads it. Reasoning above.
     except (OSError, ValueError): pass
 
     try:
