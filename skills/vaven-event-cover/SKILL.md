@@ -94,6 +94,26 @@ gap each rung produces. The gap is measured, never targeted.
 grazing on another needs **two configs and two output dirs**, not one config
 with a cross product that renders combinations you would never show.
 
+The same trap sits in the chin. `chin` is the lowest chin **anywhere in the
+photo**; a mark that never reaches that person should not be constrained by
+them. Give `chins` — one `{label, x, y}` per face — and the binding chin becomes
+span-local. Measured on `image-EDIT (2).jpg`: 26.0% → 26.9% of canvas width, and
+more importantly the *reason* for the ceiling changes from a number to a person
+you can point at.
+
+## When the client says there's empty space at the bottom
+
+They are looking at the **`ui_top` reservation** — 185px of an 1005px canvas that
+Facebook draws its title, date and RSVP button over. It is the biggest lever on
+mark size and the shakiest constant here: Meta publishes no spec, 820 is
+community-derived, and a `fast` web search returns page-cover sizes (820×312,
+851×315) that are not this.
+
+Do not re-explain the constant. Override `ui_top` and render the diagnostic — on
+`image-EDIT (2).jpg` the ceiling runs 26.9% → 32.0% → 39.1% of canvas width as
+`ui_top` goes 820 → 900 → 1005. Two images settle in one look what a paragraph
+does not.
+
 ## Re-measure for every photo
 
 **Landmark fractions never transfer between source files, even when the

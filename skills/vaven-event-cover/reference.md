@@ -85,6 +85,37 @@ with the bottom pinned, heights in `[band/1.08, band/0.92]` are unusable. Those
 map to a width range you compute once per crop and then step around; `check`
 prints the band and the ceiling for you.
 
+### The binding chin is span-local
+
+`chin` alone is the lowest chin **anywhere in the photo**, and it over-constrains
+every mark that never reaches that person. On `image-EDIT (2).jpg` the lowest
+chin sits 274px off the axis; it only enters a mark's span past 26.9% of canvas
+width, yet it was capping every width below that too. Give `chins` — one
+`{label, x, y}` per face — and the engine binds on the lowest chin the mark
+actually passes under, plus a 16px margin for the halo's reach.
+
+Grazing is then checked against **every** chin in the span, not just the lowest.
+Once overlap is allowed, a mark can clear the lowest chin by a committed margin
+and still land a few pixels off a higher one — same amateur tell.
+
+**The ceiling is scanned, not solved.** The binding chin depends on the width and
+the width depends on the binding chin, and the relationship is not monotone:
+there is a cliff where an off-axis chin enters the span and the band collapses.
+Iterating to a fixed point oscillates across it and settles below the real
+ceiling — measured, 25.6% against a true 26.9%. `ceiling_width` scans down.
+
+### `ui_top` — the number to distrust
+
+`ui_top` (default 820) is where Facebook starts drawing over the cover, and it is
+the **shakiest constant in this skill**: Meta publishes no spec and 820 is
+community-derived. It is also the single biggest lever on mark size, because it
+reserves 185px of an 1005px canvas. On `image-EDIT (2).jpg` the ceiling goes
+26.9% → 32.0% → 39.1% as `ui_top` goes 820 → 900 → 1005.
+
+When a client says "there's plenty of empty space at the bottom", that space is
+this reservation. Override `ui_top` and render the diagnostic rather than
+re-explaining the constant — the pair of images settles it in one look.
+
 Headroom must clear the group's topmost point (arms/tools) by ~38 px or it
 grazes the canvas edge. Cropping that point out is the lever that buys a bigger
 mark — offer it as an explicit rung rather than taking it silently. `headroom`

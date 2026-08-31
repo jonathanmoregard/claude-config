@@ -57,7 +57,9 @@ from PIL import Image, ImageDraw, ImageFilter
 CW, CH = 1920, 1005          # Facebook event cover, 1.91:1
 AXIS = CW / 2
 UI_TOP = 820.0               # FB title/date/RSVP furniture starts eating here
-BOTTOM = UI_TOP - 24.0
+UI_CLEAR = 24.0              # deliberate air between the mark and that line
+CHIN_MARGIN = 16.0           # a chin this close to the mark's edge counts as
+                             # under it; covers the halo's ~11px reach
 GRAZE_FRAC = 0.08            # dead zone either side of the chin, as a share of
                              # mark height: closer than this to touching, in
                              # either direction, reads as an accident
@@ -198,6 +200,23 @@ class Frame:
         self.face_l = cfg["face_l"] * self.SW
         self.face_r = cfg["face_r"] * self.SW
 
+        # Facebook's furniture line is the shakiest number in this skill: Meta
+        # publishes no spec and 820 is community-derived. Override it to see
+        # what the reservation actually costs, rather than assuming it.
+        self.ui_top = float(cfg.get("ui_top", UI_TOP))
+        self.bottom = self.ui_top - UI_CLEAR
+
+        # Per-person chins. `chin` alone is the lowest chin ANYWHERE in the
+        # photo, which over-constrains every mark that does not actually reach
+        # that person: on image-EDIT (2) the lowest chin sits 274px off the
+        # axis and only enters a mark's span past 27% of canvas width, yet it
+        # was capping every width below that too. Give `chins` and the binding
+        # chin becomes the lowest one the mark really passes under.
+        ch = cfg.get("chins")
+        self.chins = ([(c.get("label", f"chin{i}"), float(c["x"]), float(c["y"]))
+                       for i, c in enumerate(ch)] if ch else
+                      [("lowest chin", None, cfg["chin"])])
+
         self.maxw = 2 * min(self.gx, self.SW - self.gx)
         self.s = CW / self.maxw
         self.wpx, self.src_h = CW / self.s, CH / self.s
@@ -247,10 +266,39 @@ class Frame:
         box = (self.x0, self.ytop, self.x0 + self.wpx, self.ytop + self.src_h)
         return self.im.resize((CW, CH), Image.LANCZOS, box=box)
 
-    def band(self):
-        """Clear vertical room between the lowest chin and Facebook's furniture."""
-        chin = self.oy(self.chin)
-        return chin, BOTTOM - chin
+    def chins_under(self, width_px):
+        """Every chin the mark of this width actually passes under.
+
+        A chin with x=None always binds -- that is the single-`chin` fallback,
+        which has no x and so cannot be excluded. If a width reaches nobody,
+        fall back to all of them rather than to nothing: an unconstrained mark
+        is never the right answer, it is a missing measurement.
+        """
+        half = width_px / 2 + CHIN_MARGIN
+        got = [(l, self.oy(y * self.SH)) for l, x, y in self.chins
+               if x is None or abs(self.ox(x * self.SW) - AXIS) <= half]
+        return got or [(l, self.oy(y * self.SH)) for l, x, y in self.chins]
+
+    def band(self, width_px=None):
+        """Clear room between the binding chin and Facebook's furniture.
+
+        With no width, uses every chin -- the conservative reading, and the one
+        to quote as "the band" before a width has been chosen.
+        """
+        pts = self.chins_under(width_px) if width_px is not None else [
+            (l, self.oy(y * self.SH)) for l, x, y in self.chins]
+        label, chin = max(pts, key=lambda t: t[1])
+        return chin, self.bottom - chin, label
+
+    def gaps(self, h, top):
+        """(label, gap%) for every chin under the mark. The worst one decides.
+
+        Checking only the LOWEST chin is not enough once overlap is allowed: a
+        mark that clears the lowest chin by a committed margin can still land a
+        few pixels off a higher one, which is the same amateur tell.
+        """
+        return [(l, (top - c) / h * 100)
+                for l, c in self.chins_under(h * RATIO)]
 
     def layout(self, width_frac):
         """Place a mark `width_frac` of canvas width. Returns (height, top).
@@ -274,12 +322,33 @@ class Frame:
         """
         if width_frac <= 0:
             raise SystemExit(f"width fraction must be positive, got {width_frac}")
-        _, band = self.band()
-        if band <= 0:
-            raise SystemExit("no room for the mark: chin is already below "
-                             f"{BOTTOM:.0f}px. Reduce headroom.")
         h = width_frac * CW / RATIO
-        return h, BOTTOM - h
+        if self.band(h * RATIO)[1] <= 0:
+            raise SystemExit("no room for the mark: chin is already below "
+                             f"{self.bottom:.0f}px. Reduce headroom.")
+        return h, self.bottom - h
+
+
+def ceiling_width(f, lo=0.05, hi=0.60, step=0.001):
+    """Widest mark that stays clear of EVERY chin it passes under.
+
+    Scanned, not solved. The binding chin depends on the width (a chin off to
+    the side only counts once the mark grows out to it) and the width depends
+    on the binding chin, so the relationship is not monotone: it has a cliff
+    where an off-axis chin enters the span and the usable band collapses.
+    Iterating to a fixed point oscillates across that cliff and lands below the
+    real ceiling; a descending scan finds it directly.
+
+    Deliberately restricted to the GAP regime -- every gap positive. Overlap is
+    a real option but never a silent default; ask for it with an explicit width.
+    """
+    n = int(round((hi - lo) / step))
+    for i in range(n, -1, -1):
+        wf = lo + i * step
+        h = wf * CW / RATIO
+        if all(g >= GRAZE_FRAC * 100 for _, g in f.gaps(h, f.bottom - h)):
+            return wf
+    raise SystemExit("no width clears the chins; the crop leaves no usable band")
 
 
 def read_widths(cfg, photo):
@@ -298,8 +367,7 @@ def read_widths(cfg, photo):
     """
     w = cfg.get("widths")
     if w is None:
-        f = Frame(photo, cfg, read_headrooms(cfg, photo)[0])
-        return [f.band()[1] / (1.0 + 1.5 * GRAZE_FRAC) * RATIO / CW]
+        return [ceiling_width(Frame(photo, cfg, read_headrooms(cfg, photo)[0]))]
     w = [float(x) for x in (w if isinstance(w, list) else [w])]
     if not w:
         raise SystemExit("widths is empty")
@@ -514,16 +582,24 @@ def cmd_check(a):
                      outline="#00ff6a" if heavy else "#7cffb0", width=4 if heavy else 2)
         pd.text((sbox[0] + 6, sbox[1] + 6), f"{wf * 100:.0f}% wide",
                 fill="#00ff6a" if heavy else "#7cffb0")
-    pd.line([(0, f.oy(f.chin)), (CW, f.oy(f.chin))], fill="#00d0ff", width=3)
-    pd.line([(0, UI_TOP), (CW, UI_TOP)], fill="#ff2d55", width=3)
-    pd.text((10, UI_TOP + 6), "Facebook furniture starts here", fill="#ff2d55")
+    for label, x, y in f.chins:
+        cy = f.oy(y * f.SH)
+        pd.line([(0, cy), (CW, cy)], fill="#00d0ff", width=2)
+        pd.text((10, cy - 18), f"{label} chin {cy:.0f}", fill="#00d0ff")
+        if x is not None:
+            cx = f.ox(x * f.SW)
+            pd.ellipse([cx - 8, cy - 8, cx + 8, cy + 8], outline="#00d0ff", width=4)
+    pd.line([(0, f.ui_top), (CW, f.ui_top)], fill="#ff2d55", width=3)
+    pd.text((10, f.ui_top + 6), f"Facebook furniture starts here ({f.ui_top:.0f})",
+            fill="#ff2d55")
     sq = (CW - CH) // 2
     pd.rectangle([sq, 0, sq + CH - 1, CH - 1], outline="#ffd400", width=4)
     pd.text((sq + 10, 10), "guaranteed mobile square", fill="#ffd400")
     prev.save(f"{a.out}/check-placement.png")
 
     # --- the gates ----------------------------------------------------------
-    gap_pct = (top - f.oy(f.chin)) / h * 100
+    worst = min(f.gaps(h, top), key=lambda t: abs(t[1]))
+    gap_pct = worst[1]
     crop_faces = 2 * max(AXIS - f.ox(f.face_l), f.ox(f.face_r) - AXIS) / CH
     crop_logo = box[2] / CH
     fails = []
@@ -541,10 +617,11 @@ def cmd_check(a):
         # Two-sided now that a mark may deliberately overlap: a clear gap and a
         # committed overlap are both fine, the dead zone around zero is not.
         fails.append(f"GRAZING: mark sits {gap_pct:+.1f}% of its height from the "
-                     f"chin. Commit to a gap or an overlap, never between.")
-    if top + h > UI_TOP:
+                     f"{worst[0]}'s chin. Commit to a gap or an overlap, never "
+                     f"between.")
+    if top + h > f.ui_top:
         fails.append(f"mark ends at {top + h:.0f}, under Facebook's furniture "
-                     f"({UI_TOP:.0f}).")
+                     f"({f.ui_top:.0f}).")
     if max(crop_faces, crop_logo) > 1.0:
         fails.append(f"does not survive the mobile square crop "
                      f"({max(crop_faces, crop_logo):.3f} > 1.0).")
@@ -557,17 +634,21 @@ def cmd_check(a):
           f"the crowns; headroom {hr:.0f} -> {'kept' if f.keeps_top() else 'CROPPED'}")
     print(f"knot mirror IoU {iou * 100:.2f}% (ceiling {KNOT_CEILING * 100:.2f})")
     print(f"mark {h * RATIO:.0f}px wide = {h * RATIO / CW * 100:.1f}% of canvas, "
-          f"chin gap {gap_pct:+.1f}% of logo height, bottom at {top + h:.0f}")
+          f"gap {gap_pct:+.1f}% of logo height off the {worst[0]}'s chin, "
+          f"bottom at {top + h:.0f}")
     print(f"mobile square margin {max(crop_faces, crop_logo):.3f} (under 1.0 survives)")
-    chin_y, band = f.band()
-    print(f"chin at {chin_y:.0f}, furniture at {BOTTOM:.0f} -> band {band:.0f}px, "
-          f"fits a mark up to {band * RATIO / CW * 100:.1f}% of canvas width whole")
-    print("size ladder (gap is an outcome; negative = deliberate overlap):")
+    chin_y, band, who = f.band(h * RATIO)
+    print(f"binding chin: {who} at {chin_y:.0f}; furniture reserves "
+          f"{CH - f.ui_top:.0f}px, mark bottom limit {f.bottom:.0f} -> band "
+          f"{band:.0f}px, fits a mark up to {band * RATIO / CW * 100:.1f}% "
+          f"of canvas width whole")
+    print("size ladder (gap is an outcome; negative = deliberate overlap; the "
+          "gap shown is the WORST chin under that width):")
     for wf in sorted(widths, reverse=True):
         sh, stop = f.layout(wf)
+        wl, wg = min(f.gaps(sh, stop), key=lambda t: abs(t[1]))
         print(f"  {wf * 100:5.1f}% wide  wordmark {sh * WORD_FRAC / CH * 100:4.1f}% "
-              f"of canvas height  gap {(stop - chin_y) / sh * 100:+6.1f}%  "
-              f"bottom {stop + sh:.0f}")
+              f"of canvas height  gap {wg:+6.1f}% ({wl})  bottom {stop + sh:.0f}")
     print(f"\n{a.out}/check-landmarks.png   <-- are the lines on the right features?")
     print(f"{a.out}/check-placement.png   <-- is this a good place for the mark?")
     if fails:
@@ -655,8 +736,8 @@ def cmd_build(a):
         plain = np.asarray(Image.open(f"{a.out}/{name}-nologo.png").convert("RGB"))
         c_mean, c_p05, below3 = contrast_stats(rend, plain, OUTLINE)
         iou = knot_iou(alpha, box)
-        chin = f.oy(f.chin)
-        gap_pct = (top - chin) / h * 100
+        who, gap_pct = min(f.gaps(h, top), key=lambda t: abs(t[1]))
+        chin = f.band(h * RATIO)[0]
         lg_bot = top + h
         crop_faces = 2 * max(AXIS - f.ox(f.face_l), f.ox(f.face_r) - AXIS) / CH
         crop_logo = max(AXIS - box[0], box[0] + box[2] - AXIS) * 2 / CH
@@ -670,10 +751,10 @@ def cmd_build(a):
             flags.append(f"MEAN-CONTRAST<5({c_mean:.2f})")
         if iou < KNOT_CEILING - 0.03:
             flags.append(f"OFF-AXIS({iou * 100:.1f}%)")
-        if lg_bot > UI_TOP:
+        if lg_bot > f.ui_top:
             flags.append(f"MARK-UNDER-FB-UI({lg_bot:.0f})")
         if abs(gap_pct) < GRAZE_FRAC * 100:
-            flags.append(f"GRAZING-CHINS({gap_pct:+.1f}%)")
+            flags.append(f"GRAZING-{who.upper().replace(' ', '-')}({gap_pct:+.1f}%)")
         if max(crop_faces, crop_logo) > 1.0:
             flags.append("CROPPED-ON-MOBILE")
         ok &= not flags
