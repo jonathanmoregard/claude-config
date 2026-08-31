@@ -1,6 +1,6 @@
 ---
 name: writing-hooks
-description: Use when creating or editing a Claude Code hook (PreToolUse, PostToolUse, PermissionRequest, UserPromptSubmit, Stop, SubagentStop, SessionStart, SessionEnd, PreCompact and the rest), or when a hook interrupts the user's chat instead of notifying quietly, blocks a turn it should not, fires in a loop, never fires, or needs to hand context to Claude.
+description: Use when creating or editing a Claude Code hook (PreToolUse, PostToolUse, PermissionRequest, UserPromptSubmit, Stop, SubagentStop, SessionStart, SessionEnd, PreCompact and the rest), or when a hook interrupts the user's chat instead of notifying quietly, blocks a turn it should not, fires in a loop, never fires, or needs to hand context to Claude. Hooks live under read-only ~/.claude, so the edit belongs in a worktree.
 ---
 
 # Writing Hooks
@@ -8,6 +8,22 @@ description: Use when creating or editing a Claude Code hook (PreToolUse, PostTo
 Source of truth: https://code.claude.com/docs/en/hooks (31 events; the page
 carries no date, latest internal marker v2.1.218). Check it before trusting any
 blog — most community references are stale on exit codes and event count.
+
+## Before you write the file
+
+The hook script and its `settings.json` registration both live under
+`~/.claude`, which is read-only and pinned to `master`. The harness reads that
+working tree live, so a hook dropped there is active — and unreviewed — at once.
+
+```bash
+git -C ~/.claude fetch origin master
+git -C ~/.claude worktree add ~/worktrees/claude-<slug> -b feat/<slug> origin/master
+cd ~/worktrees/claude-<slug>
+```
+
+Write `hooks/<name>` and edit `settings.json` **in the worktree**, then commit,
+push and `gh pr create`. The merge click is Jonathan's. Never commit to a branch
+this session did not create. One-line hook edits included.
 
 ## Overview
 
@@ -118,11 +134,12 @@ prompt-injection defenses may surface imperative text to the user instead.
 
 ```bash
 echo '{"session_id":"t","hook_event_name":"Stop","last_assistant_message":"sample"}' \
-  | python3 ~/.claude/hooks/my-hook.py; echo "exit=$?"
+  | python3 ~/worktrees/claude-<slug>/hooks/my-hook.py; echo "exit=$?"
 ```
 
 Verify the intended field appears, the exit code is what you meant, and the
-no-match case prints nothing. `~/.claude` is git-tracked — commit after changes.
+no-match case prints nothing. Run it against the copy in your worktree, not the
+live one in `~/.claude`; the PR is what puts it there.
 
 ## Common mistakes
 
