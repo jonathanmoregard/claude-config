@@ -305,16 +305,17 @@ def default_sink_root():
 
 
 def read_ledger(path):
-    """(raw text, {id: row}, unparseable line count).
+    """({id: row}, unparseable line count).
 
-    The raw text is kept verbatim so republishing preserves every existing
-    line exactly, including ones this script cannot parse — a hand-edited
-    or torn line is data, not litter.
+    Existing lines are never returned, and never rewritten: `publish()`
+    appends in place, so every line already in the file — including ones
+    this script cannot parse, which are data rather than litter — stays
+    exactly where the previous writer put it.
     """
     try:
         raw = _read(path)
     except FileNotFoundError:
-        return "", {}, 0
+        return {}, 0
     known, bad = {}, 0
     for line in raw.splitlines():
         if not line.strip():
@@ -326,7 +327,7 @@ def read_ledger(path):
             continue
         if isinstance(row, dict) and row.get("id"):
             known[row["id"]] = row
-    return raw, known, bad
+    return known, bad
 
 
 def filename_date(fname):
@@ -360,51 +361,58 @@ def build_record(category, fname, text):
     }
 
 
-def publish(path, raw, new_lines):
-    """Replace the ledger with `raw` + `new_lines`, atomically.
+def publish(path, new_lines):
+    """Append `new_lines` to the ledger IN PLACE, never swapping its inode.
 
-    tmp beside the destination, fsynced, then `rename(2)`. Unlike the
-    sink's per-proposal publish there is nothing here to protect against
-    clobbering — this rewrites a file it has just read — so `os.replace`
-    is right where the sink needs `link(2)`. The pre-publish re-read is an
-    optimistic concurrency check: if a nightly run appended while this was
-    working, its rows would be silently dropped by the rename, so bail
-    instead.
+    THIS MUST NOT BECOME A REWRITE AGAIN. The shipped `rsi-proposal-sink`
+    opens this file with O_APPEND exactly once, at the top of its run, and
+    holds that fd while it writes proposals. A publish that renames a fresh
+    file over the ledger hands that fd an orphaned inode: every row the
+    sink writes afterwards lands on a file with no name, `os.write` returns
+    the byte count, and nothing anywhere errors — the proposals those rows
+    recorded regenerate the next night, which is the one failure this
+    ledger exists to prevent. The optimistic re-read that used to guard the
+    rename could not see it: it only catches a writer that has ALREADY
+    appended, never one that is about to.
+
+    O_APPEND is the mutual exclusion. The kernel makes "seek to end, then
+    write" one step, so two appenders interleave whole lines rather than
+    halves — the same property the sink relies on, and the reason neither
+    side needs a lock file (a stale lock would silently disable dedup).
+
+    The residue this accepts, deliberately: a short write (ENOSPC, a signal
+    mid-transfer) can leave one torn line. Both readers count and skip an
+    unparseable line, and the next run re-derives the id and appends it
+    again, so it is self-healing. Losing another writer's rows is not.
     """
-    body = raw
-    if body and not body.endswith("\n"):
-        body += "\n"
-    body += "".join(line + "\n" for line in new_lines)
-    mode = 0o600
+    payload = "".join(line + "\n" for line in new_lines)
+    if not payload:
+        return
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
-        mode = os.stat(path).st_mode & 0o777
-    except OSError:
-        pass
-    directory = os.path.dirname(path) or "."
-    fd, tmp = tempfile.mkstemp(prefix=LEDGER_NAME + ".tmp-", dir=directory)
-    try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(body.encode("utf-8"))
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.chmod(tmp, mode)
-        current = ""
-        try:
-            current = _read(path)
-        except FileNotFoundError:
-            pass
-        if current != raw:
-            raise RuntimeError(
-                "%s changed while the backfill was running; nothing written. "
-                "Re-run when the nightly sink is idle." % path)
-        os.replace(tmp, path)
-        tmp = None
+        # A ledger whose last line was torn must not have the next row
+        # welded onto it. Read the tail rather than trusting the `raw` this
+        # process read earlier — a concurrent appender may have moved it.
+        if _ends_without_newline(path):
+            payload = "\n" + payload
+        data = payload.encode("utf-8")
+        while data:
+            data = data[os.write(fd, data):]
+        os.fsync(fd)
     finally:
-        if tmp is not None:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+        os.close(fd)
+
+
+def _ends_without_newline(path):
+    try:
+        with open(path, "rb") as fh:
+            size = os.fstat(fh.fileno()).st_size
+            if size == 0:
+                return False
+            fh.seek(-1, os.SEEK_END)
+            return fh.read(1) != b"\n"
+    except OSError:
+        return False
 
 
 def scan(root, categories):
@@ -477,7 +485,7 @@ def main(argv=None):
                   if args.categories else list(INDEXED_CATEGORIES))
 
     ledger = os.path.join(root, LEDGER_NAME)
-    raw, known, unparseable = read_ledger(ledger)
+    known, unparseable = read_ledger(ledger)
     if unparseable:
         print("backfill: %d unparseable ledger line(s) left untouched"
               % unparseable)
@@ -511,7 +519,7 @@ def main(argv=None):
 
     lines = [json.dumps(r, ensure_ascii=False, sort_keys=True) for r in added]
     if lines and not args.dry_run:
-        publish(ledger, raw, lines)
+        publish(ledger, lines)
     if args.dry_run:
         print("backfill: dry run, nothing written")
 

@@ -12,6 +12,14 @@
 # WHAT IT GUARANTEES.
 #   * It never deletes proposal content. The live directories are MOVED to a
 #     timestamped backup outside ~/.claude, never removed.
+#   * It never destroys work the sink's git history does not already hold.
+#     Every check that can refuse runs BEFORE the first mutation: the sink
+#     must be a repo of its own, outside ~/.claude, with a clean worktree, and
+#     no file may exist in both trees with different bytes. (Until 2026-08-31
+#     the clean-worktree check sat after the sync AND after the commit, and the
+#     sync resolved a difference by overwriting the sink with the ~/.claude
+#     copy — so an uncommitted sink edit was destroyed and landed in no commit
+#     anywhere. Do not move these checks back down.)
 #   * It never swaps anything it has not first proven is safe: every file in
 #     the live tree must exist in the sink, byte-identical. Content the sink
 #     lacks is copied in and committed there BEFORE the swap; if anything is
@@ -60,8 +68,31 @@ LINKS=(
 # ------------------------------------------------------------- preflight ----
 
 [[ -d "$SINK" ]] || die "the proposals sink $SINK does not exist — build it before cutting over."
-git -C "$SINK" rev-parse --show-toplevel >/dev/null 2>&1 \
+
+SINK_REAL="$(cd "$SINK" && pwd -P)"
+CLAUDE_REAL="$(cd "$CLAUDE_HOME" 2>/dev/null && pwd -P || printf '%s' "$CLAUDE_HOME")"
+
+# CONTAINMENT. The whole point of the sink is that it is NOT inside the live
+# config checkout. Nothing downstream asserted that, so a `proposals.folder`
+# still carrying the pre-move `~/.claude/proposals` sailed through preflight —
+# it is, after all, inside *a* git repo. What followed was `git -C $SINK add
+# -A && commit` sweeping unrelated WIP into a commit on the live config repo,
+# and a `proposals -> proposals` symlink loop with the content in the backup.
+if [[ "$SINK_REAL" == "$CLAUDE_REAL" || "$SINK_REAL" == "$CLAUDE_REAL"/* ]]; then
+  die "the proposals sink $SINK resolves INSIDE the live config checkout $CLAUDE_HOME. That is the layout this script exists to undo, not one it can cut over to: committing there dirties the tree the harness reads, and the swap would point the link at itself. Fix recursive-self-improvement/config/config.json -> proposals.folder (it should name a path outside ~/.claude, canonically $SINK_DEFAULT). Nothing was changed."
+fi
+
+# The sink must BE a git repo, not merely sit inside one. `rev-parse
+# --show-toplevel` answers about the ENCLOSING repo, so this is the check that
+# actually holds: every `git add -A` below is aimed at $SINK, and staging a
+# repo whose root is somewhere else stages that repo's entire worktree.
+SINK_TOP="$(git -C "$SINK" rev-parse --show-toplevel 2>/dev/null || true)"
+[[ -n "$SINK_TOP" ]] \
   || die "the proposals sink $SINK is not a git repo. Content copied into it could not be committed, and rejected proposals would stop being greppable with 'git log -S'. Refusing to swap anything."
+if [[ "$(cd "$SINK_TOP" && pwd -P)" != "$SINK_REAL" ]]; then
+  die "the proposals sink $SINK is not a git repo of its own — it sits inside the repo rooted at $SINK_TOP. 'git add -A' here would stage that repo's whole worktree, not the sink's. Run 'git -C $SINK init' (or repoint proposals.folder). Nothing was changed."
+fi
+
 [[ -d "$SINK/rsi" ]] || die "$SINK/rsi is missing — the sink is not laid out for the cutover."
 
 # Already done? Idempotence is checked before anything else so a re-run is
@@ -91,11 +122,31 @@ if git -C "$CLAUDE_HOME" rev-parse --show-toplevel >/dev/null 2>&1; then
   fi
 fi
 
+# ------------------------------------------------------- clean sink gate ----
+# THIS RUNS BEFORE THE FIRST MUTATION, AND MUST STAY HERE. The sync below is
+# only safe because everything it can touch is already in the sink's git
+# history; an uncommitted edit is not, and until 2026-08-31 this check sat
+# after the sync and after the commit, i.e. exactly where it could no longer
+# help. Measured: a sink-only edit showing ` M` in git status came back as the
+# ~/.claude version, and `git log -S` found the edit in no commit anywhere.
+if [[ -n "$(git -C "$SINK" status --porcelain)" ]]; then
+  echo "error: the sink $SINK has uncommitted changes:" >&2
+  git -C "$SINK" status --porcelain >&2
+  echo "Commit them before the cutover. Nothing this script retires is recoverable unless the sink's history holds it, and nothing was changed." >&2
+  exit 1
+fi
+
 # ------------------------------------------------- sync live -> sink first ---
 # Never delete a file the sink does not already hold. Anything present live and
-# missing (or different) in the sink is copied in and committed there, so the
-# swap can only ever remove a directory whose every byte already lives in the
-# sink's history.
+# missing from the sink is copied in and committed there, so the swap can only
+# ever remove a directory whose every byte already lives in the sink's history.
+#
+# A file present in BOTH with different bytes is NOT resolved. It used to be:
+# the ~/.claude copy won, on the reasoning that the sink's version stayed in
+# git history — true only while the sink is clean, and false in the one case
+# that mattered. Two versions of the same proposal is a fact about the world
+# that a relocation script has no standing to adjudicate, so it prints the
+# diff and stops.
 
 # `.gitignore` is repo plumbing, not proposal content, and the sink's own
 # ignore policy is deliberately the OPPOSITE of the legacy one: out here
@@ -177,6 +228,49 @@ else:
 PY
 }
 
+# `-xtype f` rather than `-type f`. `-type` lstats, so a symlinked .md in the
+# live tree matched nothing: it was neither copied into the sink nor looked at
+# by the verify pass, and it simply stopped existing in the spine at the swap,
+# with no log line and the content surviving only in the backup directory.
+# `-xtype f` matches regular files AND symlinks resolving to regular files,
+# while still not matching the `proposals/rsi` directory symlink (find does not
+# descend into it either, which is what keeps rsi/rsi out of the sink).
+live_files() {  # <live dir> -> NUL-separated paths
+  find "$1" -xtype f -print0
+}
+
+DIV_REL=(); DIV_SRC=(); DIV_DST=(); ESCAPED=()
+
+# Pass 1. Look at everything and decide, mutating nothing — a half-copied sink
+# plus an abort is a worse state than either outcome on its own.
+scan_conflicts() {  # <live dir> <sink dir>
+  local live="$1" dest="$2" rel src dst real
+  [[ -d "$live" && ! -L "$live" ]] || return 0
+  while IFS= read -r -d '' src; do
+    if skip_path "$src"; then
+      continue
+    fi
+    if [[ -L "$src" ]]; then
+      # Proposals are written by unattended agents. Following a link out of
+      # $HOME would copy whatever it names into a git repo and commit it.
+      real="$(readlink -f -- "$src" 2>/dev/null || true)"
+      case "$real" in
+        "$HOME"/*) ;;
+        *) ESCAPED+=("$src -> ${real:-<unresolvable>}"); continue ;;
+      esac
+    fi
+    rel="${src#"$live"/}"
+    dst="$dest/$rel"
+    if [[ ! -e "$dst" ]] || cmp -s -- "$src" "$dst"; then
+      continue
+    fi
+    DIV_REL+=("$rel"); DIV_SRC+=("$src"); DIV_DST+=("$dst")
+  done < <(live_files "$live")
+  while IFS= read -r -d '' src; do
+    echo "cutover: note — $src is a broken symlink; it has no content to preserve and will not be recreated in the sink" >&2
+  done < <(find "$live" -xtype l -print0)
+}
+
 sync_into_sink() {  # <live dir> <sink dir>
   local live="$1" dest="$2" rel src dst
   [[ -d "$live" && ! -L "$live" ]] || return 0
@@ -187,21 +281,40 @@ sync_into_sink() {  # <live dir> <sink dir>
     fi
     rel="${src#"$live"/}"
     dst="$dest/$rel"
-    if [[ -f "$dst" ]] && cmp -s -- "$src" "$dst"; then
+    # Additions only. Pass 1 proved nothing here diverges, and an escaping
+    # symlink was refused there.
+    if [[ -e "$dst" ]]; then
       continue
     fi
-    # The live copy wins on a conflict, and that is safe rather than
-    # destructive: the sink is a git repo whose current version is committed
-    # (verified below), so the overwritten bytes stay in its history.
-    if [[ -e "$dst" ]]; then
-      echo "cutover: sink copy of $rel differs — taking the ~/.claude version (the previous one stays in the sink's git history)"
-    else
-      echo "cutover: copied into the sink: ${dst#"$SINK"/}"
-    fi
+    echo "cutover: copied into the sink: ${dst#"$SINK"/}"
     mkdir -p -- "$(dirname -- "$dst")"
-    cp -p -- "$src" "$dst"
-  done < <(find "$live" -type f -print0)
+    # -L: a symlinked proposal lands in the sink as its content. A copy of the
+    # pointer would break the day the backup directory is deleted.
+    cp -p -L -- "$src" "$dst"
+  done < <(live_files "$live")
 }
+
+for pair in "${LINKS[@]}"; do
+  scan_conflicts "${pair%%:*}" "${pair#*:}"
+done
+
+if [[ "${#ESCAPED[@]}" -gt 0 ]]; then
+  echo "error: these live proposal entries are symlinks resolving outside $HOME:" >&2
+  for e in "${ESCAPED[@]}"; do printf '  %s\n' "$e" >&2; done
+  echo "Absorbing them would copy content the spine never owned into a git repo. Remove or repoint them, then re-run. Nothing was changed." >&2
+  exit 1
+fi
+
+if [[ "${#DIV_REL[@]}" -gt 0 ]]; then
+  echo "error: these files exist in BOTH trees with different bytes, and this script does not get to choose between them:" >&2
+  for i in "${!DIV_REL[@]}"; do
+    printf '\n  %s\n' "${DIV_REL[$i]}" >&2
+    diff -u -- "${DIV_DST[$i]}" "${DIV_SRC[$i]}" >&2 || true
+  done
+  echo "" >&2
+  echo "Reconcile them by hand (the sink copy is the '---' side, the ~/.claude copy the '+++' side), commit the result in $SINK, then re-run. Nothing was changed." >&2
+  exit 1
+fi
 
 for pair in "${LINKS[@]}"; do
   sync_into_sink "${pair%%:*}" "${pair#*:}"
@@ -234,7 +347,7 @@ verify() {  # <live dir> <sink dir>
     elif ! cmp -s -- "$src" "$dst"; then
       echo "  differs from the sink: $rel" >&2; rc=1
     fi
-  done < <(find "$live" -type f -print0)
+  done < <(live_files "$live")
   return "$rc"
 }
 
@@ -247,10 +360,12 @@ if [[ "$verify_failed" == 1 ]]; then
   exit 1
 fi
 
-# Uncommitted content in the sink would not be recoverable by git after the
-# live copy is retired, which is the whole point of the sink being a repo.
+# The clean-sink gate is UPSTREAM of the sync now (see the top of this file),
+# so by here the only thing that could have dirtied the sink is this script's
+# own commit above. Belt and braces: a residual difference means something
+# outside this script wrote to the sink mid-run.
 if [[ -n "$(git -C "$SINK" status --porcelain)" ]]; then
-  die "the sink $SINK has uncommitted changes — commit them before the cutover so nothing retired here is unrecoverable. Nothing was changed."
+  die "the sink $SINK went dirty during the cutover — another writer is active. Nothing was moved, nothing was removed."
 fi
 
 # ------------------------------------------------------------- the swap -----

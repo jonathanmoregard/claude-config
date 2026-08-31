@@ -61,10 +61,16 @@ if [[ ! -d "$SINK/rsi" ]]; then
 fi
 
 # The two legacy names are a compatibility shim for READERS. They are allowed
-# to be absent (pre-cutover, or a machine that never had them) and allowed to
-# be real directories in the window before the cutover runs — but a symlink
-# that points somewhere OTHER than the sink is real drift, and silently gating
-# one tree while committing another is exactly what this guard exists to stop.
+# to be absent (pre-cutover, or a machine that never had them) — but anything
+# else is a second tree, and silently gating one tree while committing another
+# is exactly what this guard exists to stop.
+#
+# A real directory here used to print a note and continue "regardless". It was
+# not gating and committing the same thing: the gate reads gate-config.json
+# from inside the sink, and pre-cutover that file still described
+# ~/.claude/proposals — so the gate scored the live tree, found nothing wrong
+# with the sink because it never looked at it, and the sink shipped ungated.
+# The cutover is a precondition, not a suggestion, so it is enforced here.
 check_shim() {  # <path> <expected target>
   local link="$1" want="$2"
   [[ -e "$link" || -L "$link" ]] || return 0
@@ -78,7 +84,10 @@ check_shim() {  # <path> <expected target>
       return 1
     fi
   else
-    echo "note: $link is still a real directory — the cutover has not run yet. Gating and committing $SINK regardless; run ~/.claude/scripts/cutover-proposals.sh to finish the move." >&2
+    echo "error: $link is still a real directory — the cutover has not run yet." >&2
+    echo "Cause: two proposal trees exist at once, and the gate config that ships inside $SINK still describes the ~/.claude one. Gating would score that tree while this script commits the sink, so the sink would ship ungated." >&2
+    echo "Remedy: run ~/.claude/scripts/cutover-proposals.sh — it absorbs the live content into the sink and never deletes anything — then re-run this." >&2
+    return 1
   fi
   return 0
 }

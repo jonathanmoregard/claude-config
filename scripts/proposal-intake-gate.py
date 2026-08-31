@@ -237,6 +237,50 @@ def require_under_home(path, label):
                          % (label, path, home))
 
 
+SPINE_MISMATCH_REMEDY = (
+    "The gate config lives inside the spine it configures, and "
+    "push-proposals.sh commits that same directory. A %(key)s pointing "
+    "elsewhere means the gate scores one tree while the commit ships another, "
+    "and the shipped one goes out ungated with nothing saying so. This is the "
+    "pre-move value: run ~/.claude/scripts/cutover-proposals.sh, which absorbs "
+    "the live content into the sink and rewrites spine_root, gate_log and "
+    "on_decision.permissions in one place. Do not hand-edit one key past this "
+    "check — the other two are stale too."
+)
+
+
+def require_config_describes_its_own_spine(config_path, cfg):
+    """The config file must describe the tree it sits in.
+
+    Reproduced 2026-08-31 on the real box: the sink's own gate-config.json
+    still carried the pre-move `spine_root: ~/.claude/proposals`, so
+    `--list` printed 15 candidates out of the live config repo while
+    push-proposals.sh committed ~/.local/state/claude-proposals. Nothing
+    anywhere noticed, and push-proposals.sh explicitly said it was
+    "Gating and committing $SINK regardless" — which it was not.
+
+    Compared by REALPATH on purpose: after the cutover
+    `~/.claude/proposals` is a symlink into the sink, and a config still
+    naming it resolves to the same tree. That is the compatibility shim
+    working as intended, not drift, so it stays accepted.
+    """
+    config_dir = os.path.dirname(os.path.abspath(os.path.expanduser(config_path)))
+    if not os.path.isdir(config_dir):
+        # No file on disk (built-in defaults). DEFAULTS is self-consistent.
+        return
+    spine = cfg["spine_root"]
+    if not os.path.isdir(spine) or os.path.realpath(spine) != os.path.realpath(config_dir):
+        raise ValueError(
+            "spine_root %r does not resolve to %s, the directory this config "
+            "file lives in. %s"
+            % (spine, config_dir, SPINE_MISMATCH_REMEDY % {"key": "spine_root"}))
+    if not contained(cfg["gate_log"], spine):
+        raise ValueError(
+            "gate_log %r resolves outside the spine %s. %s"
+            % (cfg["gate_log"], spine,
+               SPINE_MISMATCH_REMEDY % {"key": "gate_log"}))
+
+
 def validate_model_name(value, label):
     """Model names must be argv- and YAML-scalar-safe (see MODEL_RE)."""
     if not isinstance(value, str) or not MODEL_RE.match(value) \
@@ -285,6 +329,7 @@ def load_config(path, explicit=False):
     pr["extra_repos"] = {k: os.path.expanduser(v) for k, v in pr["extra_repos"].items()}
     require_under_home(cfg["spine_root"], "spine_root")
     require_under_home(cfg["gate_log"], "gate_log")
+    require_config_describes_its_own_spine(path, cfg)
     for p in cfg["search_paths"]:
         require_under_home(p, "search_paths entry")
     for p in pr["repo_roots"]:

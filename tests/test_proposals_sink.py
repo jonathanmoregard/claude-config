@@ -365,6 +365,71 @@ class TestGateSpineResolution(FixtureCase):
             self.assertIn(expected, names)
         self.assertNotIn("archived", names)  # excluded_subdirs
 
+    def test_gate_refuses_a_config_that_points_away_from_its_own_spine(self):
+        """gate-config.json ships INSIDE the sink, and push-proposals.sh
+        commits that sink. A spine_root pointing anywhere else means the gate
+        scores one tree while the commit ships another — the sink goes out
+        ungated and nothing says so.
+
+        Reproduced against the real box on 2026-08-31: the sink's own
+        gate-config still carried the pre-move `~/.claude/proposals`, so
+        `proposal-intake-gate.py --list` printed 15 `would gate:` lines under
+        /home/jonathan/.claude/proposals while push-proposals.sh committed
+        ~/.local/state/claude-proposals.
+        """
+        self.fx.build()
+        cfg_path = os.path.join(self.fx.sink, "gate-config.json")
+        cfg = json.loads(read(cfg_path))
+        cfg["spine_root"] = os.path.join(self.fx.claude, "proposals")
+        with open(cfg_path, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh, indent=2)
+
+        proc = subprocess.run([sys.executable, GATE_PATH, "--list"],
+                              env=self.fx.env(), capture_output=True, text=True)
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 2,
+                         "a spine mismatch must be a config error, not a "
+                         "silent walk of the wrong tree:\n%s" % out)
+        self.assertNotIn("would gate:", out,
+                         "nothing may be gated against the wrong spine")
+        self.assertIn("cutover-proposals.sh", out,
+                      "the refusal must name the step that fixes it:\n%s" % out)
+
+    def test_gate_refuses_a_gate_log_outside_the_spine(self):
+        """Same class: a gate_log still under ~/.claude writes the gate's own
+        audit trail into the live config checkout every run."""
+        self.fx.build()
+        cfg_path = os.path.join(self.fx.sink, "gate-config.json")
+        cfg = json.loads(read(cfg_path))
+        cfg["gate_log"] = os.path.join(self.fx.claude, "proposals",
+                                       "gate-log.jsonl")
+        with open(cfg_path, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh, indent=2)
+
+        proc = subprocess.run([sys.executable, GATE_PATH, "--list"],
+                              env=self.fx.env(), capture_output=True, text=True)
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 2, out)
+        self.assertIn("cutover-proposals.sh", out, out)
+
+    def test_the_shim_spine_root_is_still_accepted_after_the_cutover(self):
+        """The check compares realpaths, so a config that names the legacy
+        `~/.claude/proposals` keeps working once that name is a symlink into
+        the sink. Refusing it would break readers the shim exists for."""
+        self.fx.build()
+        self.run_script(CUTOVER_SCRIPT, expect=0)
+        cfg_path = os.path.join(self.fx.sink, "gate-config.json")
+        cfg = json.loads(read(cfg_path))
+        cfg["spine_root"] = os.path.join(self.fx.claude, "proposals")
+        cfg["gate_log"] = os.path.join(self.fx.claude, "proposals",
+                                       "gate-log.jsonl")
+        with open(cfg_path, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh, indent=2)
+
+        proc = subprocess.run([sys.executable, GATE_PATH, "--list"],
+                              env=self.fx.env(), capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
     def test_gate_annotates_and_logs_inside_the_sink(self):
         """--list must see a sink proposal and the gate log must be sink-side."""
         self.fx.build()
@@ -713,6 +778,36 @@ class TestPushProposals(FixtureCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn(self.fx.sink, proc.stdout + proc.stderr)
 
+    def test_refuses_to_ship_before_the_cutover_has_run(self):
+        """The ordering dependency, enforced rather than documented.
+
+        Before the cutover, `~/.claude/proposals` is a real directory holding
+        a DIFFERENT tree from the sink, and the sink's own gate-config still
+        describes that live tree. The old guard printed a note and said it was
+        "Gating and committing $SINK regardless" — it was not: the gate scored
+        ~/.claude/proposals and the sink shipped ungated.
+        """
+        self.fx.build()
+        env = self.fx.env()
+        before = git("rev-parse", "HEAD", cwd=self.fx.sink, env=env).strip()
+        # Settled on purpose: with nothing eligible the gate exits 0, so the
+        # only thing that can fail this run is the ordering guard itself.
+        self.fx.write_proposal("rsi", "2026-08-30-settled-two.md",
+                               "---\nstatus: implemented\n---\n\nbody\n")
+
+        proc = self.run_script(PUSH_SCRIPT)
+
+        out = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0,
+                            "shipping an ungated sink must fail closed:\n%s" % out)
+        self.assertIn("error:", out,
+                      "a note is not a refusal; the run must stop:\n%s" % out)
+        self.assertIn("cutover-proposals.sh", out,
+                      "the refusal must name the step that fixes it:\n%s" % out)
+        self.assertEqual(git("rev-parse", "HEAD", cwd=self.fx.sink,
+                             env=env).strip(), before,
+                         "nothing may be committed while the trees disagree")
+
 
 # --------------------------------------------------------------------------
 # 8. The cutover script.
@@ -793,6 +888,9 @@ class TestCutoverScript(FixtureCase):
         }
         with open(cfg_path, "w", encoding="utf-8") as fh:
             json.dump(legacy, fh, indent=2)
+        # Committed, because that is what the production sink looks like — and
+        # because the cutover now refuses to run against a dirty sink at all.
+        self._commit_sink("legacy gate config")
 
         self.run_script(CUTOVER_SCRIPT, expect=0)
 
@@ -872,6 +970,214 @@ class TestCutoverScript(FixtureCase):
         out = proc.stdout + proc.stderr
         self.assertIn(self.fx.sink, out)
         self.assertIn("proposals", out)
+
+    # -- never destroy work the sink's git history does not hold -------------
+
+    def _commit_sink(self, message="sink baseline"):
+        env = self.fx.env()
+        git("add", "-A", cwd=self.fx.sink, env=env)
+        git("commit", "-q", "-m", message, "--allow-empty", cwd=self.fx.sink,
+            env=env)
+
+    def _put_live(self, rel, text):
+        path = os.path.join(self.fx.claude, "proposals", rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return path
+
+    def test_uncommitted_sink_content_is_never_destroyed(self):
+        """The sync leaned on the sink's git history as its safety net, and an
+        uncommitted edit is not in it. The clean-sink guard that would have
+        caught this sat AFTER the overwrite and after the commit.
+
+        Reproduced 2026-08-31: a sink-only edit to a `manual/` proposal showing
+        ` M` in `git status` came back reverted to the ~/.claude version, and
+        `git log -S '<the edit>' --all` in the sink returned zero commits.
+        """
+        self.fx.build()
+        sink_file = self.fx.write_proposal("manual", "2026-08-05-shared.md",
+                                           "committed body\n")
+        self._commit_sink()
+        with open(sink_file, "w", encoding="utf-8") as fh:
+            fh.write("EDITED IN THE SINK, NOT YET COMMITTED\n")
+        self._put_live("manual/2026-08-05-shared.md", "committed body\n")
+
+        proc = self.run_script(CUTOVER_SCRIPT)
+
+        out = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0,
+                            "a dirty sink must abort BEFORE anything is "
+                            "written:\n%s" % out)
+        self.assertEqual(read(sink_file),
+                         "EDITED IN THE SINK, NOT YET COMMITTED\n",
+                         "the uncommitted edit was destroyed and it is in no "
+                         "commit anywhere")
+        self.assertIn("uncommitted", out.lower(),
+                      "the refusal must name what it found:\n%s" % out)
+        self.assertFalse(
+            os.path.islink(os.path.join(self.fx.claude, "proposals")),
+            "nothing may be swapped after an abort")
+
+    def test_a_dirty_sink_aborts_before_copying_anything_in(self):
+        """Ordering, asserted directly: the guard has to run before the first
+        mutation, not after the commit."""
+        self.fx.build()
+        self.fx.write_proposal("manual", "2026-08-05-dirty.md", "v1\n")
+        self._commit_sink()
+        with open(os.path.join(self.fx.sink, "manual",
+                               "2026-08-05-dirty.md"), "w",
+                  encoding="utf-8") as fh:
+            fh.write("v2 uncommitted\n")
+        self._put_live("manual/2026-08-05-liveonly.md", "live only\n")
+        env = self.fx.env()
+        head_before = git("rev-parse", "HEAD", cwd=self.fx.sink, env=env).strip()
+
+        self.run_script(CUTOVER_SCRIPT)
+
+        self.assertFalse(
+            os.path.exists(os.path.join(self.fx.sink, "manual",
+                                        "2026-08-05-liveonly.md")),
+            "the sync ran anyway; the guard is still downstream of it")
+        self.assertEqual(git("rev-parse", "HEAD", cwd=self.fx.sink,
+                             env=env).strip(), head_before,
+                         "nothing may be committed on an abort")
+
+    def test_diverging_content_aborts_with_the_diff(self):
+        """A live file and a sink file of the same name with different bytes
+        is a fact the script cannot resolve. Preferring the ~/.claude copy was
+        only ever defensible on the claim that the sink's version stays in git
+        history — which is exactly what the case above disproves. Divergence
+        is a stop, and the operator gets the diff."""
+        self.fx.build()
+        self.fx.write_proposal("manual", "2026-08-06-both.md", "SINK VERSION\n")
+        self._commit_sink()
+        self._put_live("manual/2026-08-06-both.md", "LIVE VERSION\n")
+
+        proc = self.run_script(CUTOVER_SCRIPT)
+
+        out = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0, out)
+        self.assertIn("2026-08-06-both.md", out,
+                      "the refusal must name the file:\n%s" % out)
+        self.assertIn("LIVE VERSION", out,
+                      "the refusal must show the diff, not just assert one:\n%s"
+                      % out)
+        self.assertIn("SINK VERSION", out, out)
+        self.assertEqual(read(os.path.join(self.fx.sink, "manual",
+                                           "2026-08-06-both.md")),
+                         "SINK VERSION\n",
+                         "neither side may be picked automatically")
+        self.assertFalse(
+            os.path.islink(os.path.join(self.fx.claude, "proposals")))
+
+    # -- the sink has to actually be outside ~/.claude -----------------------
+
+    def test_refuses_a_sink_that_lives_inside_the_live_config_repo(self):
+        """`proposals.folder` still naming `~/.claude/proposals` passed
+        preflight, because preflight only asked "is it *a* git repo" — and git
+        answers that about the ENCLOSING repo.
+
+        Reproduced 2026-08-31, exit 0 with no warning: `git -C <sink> add -A &&
+        commit` swept an unrelated WIP settings.json and an untracked file into
+        a commit on the live config repo, and the swap left `proposals` a
+        symlink to itself with all content moved to the backup dir.
+        """
+        self.fx.build()
+        inside = os.path.join(self.fx.claude, "proposals")
+        os.makedirs(os.path.join(inside, "rsi"), exist_ok=True)
+        cfg_path = os.path.join(self.fx.claude, "recursive-self-improvement",
+                                "config", "config.json")
+        doc = json.loads(read(cfg_path))
+        doc["proposals"]["folder"] = inside
+        with open(cfg_path, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, indent=2)
+        wip = os.path.join(self.fx.claude, "settings.json")
+        with open(wip, "w", encoding="utf-8") as fh:
+            fh.write('{"unrelated": "work in progress"}\n')
+        env = self.fx.env()
+        head_before = git("rev-parse", "HEAD", cwd=self.fx.claude,
+                          env=env).strip()
+
+        proc = self.run_script(CUTOVER_SCRIPT)
+
+        out = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0,
+                            "a sink inside ~/.claude must be refused:\n%s" % out)
+        self.assertEqual(git("rev-parse", "HEAD", cwd=self.fx.claude,
+                             env=env).strip(), head_before,
+                         "the cutover committed to the LIVE config repo")
+        self.assertIn("settings.json",
+                      git("status", "--porcelain", cwd=self.fx.claude, env=env),
+                      "unrelated WIP was swept into a commit")
+        self.assertFalse(os.path.islink(inside),
+                         "the swap created a self-referential symlink")
+
+    def test_refuses_a_sink_that_is_merely_inside_some_other_git_repo(self):
+        """`git rev-parse --show-toplevel` succeeding says nothing about the
+        sink being a repo — only about it being inside one. `git add -A` there
+        stages the enclosing repo's whole worktree."""
+        self.fx.build()
+        outer = os.path.join(self.fx.home, "outer-repo")
+        nested = os.path.join(outer, "claude-proposals")
+        os.makedirs(os.path.join(nested, "rsi"))
+        self.fx.init_git(outer)
+        cfg_path = os.path.join(self.fx.claude, "recursive-self-improvement",
+                                "config", "config.json")
+        doc = json.loads(read(cfg_path))
+        doc["proposals"]["folder"] = nested
+        with open(cfg_path, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, indent=2)
+
+        proc = self.run_script(CUTOVER_SCRIPT)
+        out = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0, out)
+        self.assertIn(nested, out, out)
+
+    # -- symlinked proposal files ------------------------------------------
+
+    def test_symlinked_proposal_files_are_synced_and_verified(self):
+        """`find -type f` lstats, so a symlinked .md in the live tree was
+        neither copied into the sink nor looked at by the verify pass. It just
+        stopped existing in the spine at the swap, with no log line — the
+        content surviving only in the backup directory."""
+        self.fx.build()
+        target = os.path.join(self.fx.home, "elsewhere-note.md")
+        body = "---\nstatus: rejected\n---\n\nlinked body\n"
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        link = os.path.join(self.fx.claude, "recursive-self-improvement",
+                            "proposals", "2026-08-07-linked.md")
+        os.symlink(target, link)
+
+        self.run_script(CUTOVER_SCRIPT, expect=0)
+
+        landed = os.path.join(self.fx.sink, "rsi", "2026-08-07-linked.md")
+        self.assertTrue(os.path.isfile(landed),
+                        "a symlinked proposal vanished from the spine")
+        self.assertFalse(os.path.islink(landed),
+                         "the sink must hold the content, not a pointer that "
+                         "breaks the moment the backup is deleted")
+        self.assertEqual(read(landed), body)
+        self.assertIn("rsi/2026-08-07-linked.md",
+                      git("ls-files", cwd=self.fx.sink, env=self.fx.env()),
+                      "and it must be committed like every other proposal")
+
+    def test_a_symlink_escaping_home_is_refused_rather_than_absorbed(self):
+        """Proposals are written by unattended agents. Following a symlink out
+        of $HOME would copy whatever it names into a git repo."""
+        self.fx.build()
+        link = os.path.join(self.fx.claude, "recursive-self-improvement",
+                            "proposals", "2026-08-08-escape.md")
+        os.symlink("/etc/hostname", link)
+
+        proc = self.run_script(CUTOVER_SCRIPT)
+        out = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0, out)
+        self.assertIn("2026-08-08-escape.md", out, out)
+        self.assertFalse(
+            os.path.exists(os.path.join(self.fx.sink, "rsi",
+                                        "2026-08-08-escape.md")))
 
 
 
@@ -1154,34 +1460,75 @@ class TestBackfillLedger(BackfillCase):
         self.assertEqual(snapshot(), before,
                          "the backfill adds a ledger; it never edits history")
 
-    def test_publishes_the_ledger_atomically(self):
-        """A crash during publish must leave the previous ledger intact and
-        no half-written one in its place."""
+    def test_a_concurrent_appenders_rows_survive(self):
+        """The one failure the ledger exists to prevent.
+
+        `rsi-proposal-sink` opens `.index.jsonl` with O_APPEND ONCE, at the
+        top of its run, and holds that fd while it writes proposals. A
+        backfill that republishes the ledger by renaming a fresh file over it
+        gives that fd an orphaned inode: every row the sink writes afterwards
+        goes to a file with no name, `os.write` returns the byte count, and
+        nothing anywhere errors. The proposals those rows were meant to
+        protect then regenerate the next night.
+
+        The pre-publish re-read cannot catch this — it only sees a writer that
+        has ALREADY appended, never one that is about to.
+        """
+        self.seed()
+        held = os.open(self.ledger,
+                       os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            self.run_backfill()
+            row = json.dumps({"id": "0123456789abcdef",
+                              "file": "2026-09-01-nightly.md",
+                              "status": "pending"}) + "\n"
+            os.write(held, row.encode("utf-8"))
+        finally:
+            os.close(held)
+        ids = [r["id"] for r in self.rows()]
+        self.assertIn(
+            "0123456789abcdef", ids,
+            "the nightly sink's row went to an orphaned inode and vanished; "
+            "the proposal it recorded will regenerate. Ledger now holds: %r"
+            % (ids,))
+        self.assertEqual(len(ids), 4, "and the backfill's own rows must "
+                                      "still be there: %r" % (ids,))
+
+    def test_the_ledger_is_appended_to_never_republished(self):
+        """The structural property behind the test above, asserted directly so
+        a future 'atomic rewrite' cannot come back without turning this red:
+        the ledger keeps its inode, its existing bytes are never rewritten,
+        and no tmp file is left beside it."""
         self.seed()
         self.run_backfill()
-        good = read(self.ledger)
+        before = read(self.ledger)
+        before_inode = os.stat(self.ledger).st_ino
         self.put("rsi", "2026-08-03-extra.md",
                  "---\nstatus: pending\n---\n\n## Problem\nExtra.\n")
-        # In-process, so the crash is injected without a test-only seam in
-        # the script itself.
-        real_replace = os.replace
+        self.run_backfill()
 
-        def boom(src, dst):
-            raise OSError("simulated crash during publish")
-
-        os.replace = boom
-        old_stdout, sys.stdout = sys.stdout, io.StringIO()
-        try:
-            with self.assertRaises(OSError):
-                backfill.main(["--sink", self.sink])
-        finally:
-            os.replace = real_replace
-            sys.stdout = old_stdout
-        self.assertEqual(read(self.ledger), good,
-                         "the ledger must still be the pre-crash one, whole")
+        self.assertEqual(
+            os.stat(self.ledger).st_ino, before_inode,
+            "the ledger's inode was replaced; any fd another writer holds now "
+            "points at an orphan")
+        self.assertTrue(
+            read(self.ledger).startswith(before),
+            "existing ledger rows must be left byte-for-byte where they were")
+        self.assertEqual(len(self.rows()), 4)
         leftovers = [f for f in os.listdir(self.sink)
                      if f.startswith(".index.jsonl.tmp")]
-        self.assertEqual(leftovers, [], "the tmp file must not be left behind")
+        self.assertEqual(leftovers, [], "no tmp file may be left behind")
+
+    def test_a_ledger_with_no_trailing_newline_is_not_glued_to(self):
+        """A torn last line must not have the next row welded onto it."""
+        self.seed()
+        with open(self.ledger, "w", encoding="utf-8") as fh:
+            fh.write('{"id": "aaaaaaaaaaaaaaaa", "status": "rejected"}')
+        self.run_backfill()
+        lines = [ln for ln in read(self.ledger).splitlines() if ln.strip()]
+        self.assertEqual(len(lines), 4, "rows: %r" % (lines,))
+        self.assertEqual(len(self.rows()), 4,
+                         "a row was glued onto the unterminated line")
 
     def test_tolerates_an_unparseable_ledger_line(self):
         self.seed()
