@@ -798,13 +798,6 @@ PORTED_RULES: list[tuple[str, str]] = [
     ("Bash(*discovery/v1/apis/docs*)", "curl https://host.invalid/discovery/v1/apis/docs/v1/rest"),
     ("Bash(*googleapiclient*)", "python3 -c 'import googleapiclient'"),
     ("Bash(*from googleapiclient*)", "python3 -c 'from googleapiclient import discovery'"),
-    ('Bash(*build("docs"*)', 'python3 -c \'svc = build("docs", "v1")\''),
-    ("Bash(*build('docs'*)", "python3 -c \"svc = build('docs', 'v1')\""),
-    ('Bash(*build("drive"*)', 'python3 -c \'svc = build("drive", "v3")\''),
-    ("Bash(*build('drive'*)", "python3 -c \"svc = build('drive', 'v3')\""),
-    ("Bash(*documents().batchUpdate*)", "python3 -c 'svc.documents().batchUpdate(x)'"),
-    ("Bash(*documents().get*)", "python3 -c 'svc.documents().get(x)'"),
-    ("Bash(*documents().create*)", "python3 -c 'svc.documents().create(x)'"),
     ("Bash(*automation-review*)", "ls /home/jonathan/.claude/automation-review"),
     ("Bash(*prompts.jsonl*)", "cat /home/jonathan/.claude/logs/prompts.jsonl"),
 ]
@@ -852,6 +845,32 @@ RETIRED_RULES: dict[str, str] = {
         "inert: no unescaped star, so the CLI types it `exact`; replaced by "
         "Bash(*BLOCKED_TEST_ESCAPED\\**)"
     ),
+    # --- the Google Docs / Drive block. MEASURED inert in settings.json: a
+    # rule whose CONTENT contains `(` or `)` cannot be carried through the
+    # CLI's `Tool(content)` delimiters, so it loads and then matches nothing
+    # (tests/test_deny_globs.py drives the real CLI and proves this with a
+    # control pair). safe-bash's own matcher parsed them fine, which is why
+    # they looked alive for as long as safe-bash was the thing enforcing.
+    #
+    # REWRITTEN, not dropped: the intent — keep direct google-api-python-client
+    # use out of a shell so Docs/Drive work goes through the gdocs-review MCP —
+    # is live in the replacement named on each row. The naive repair (swap `(`
+    # for `*`) is measured to refuse ordinary commit subjects and dict lookups,
+    # so each replacement keeps a structural token instead: the argument
+    # separator for `build(...)`, the leading dot for `.documents`.
+    'Bash(*build("docs"*)': "inert: paren in rule content; replaced by Bash(*build*\"docs\",*)",
+    "Bash(*build('docs'*)": "inert: paren in rule content; replaced by Bash(*build*'docs',*)",
+    'Bash(*build("drive"*)': "inert: paren in rule content; replaced by Bash(*build*\"drive\",*)",
+    "Bash(*build('drive'*)": "inert: paren in rule content; replaced by Bash(*build*'drive',*)",
+    "Bash(*documents().batchUpdate*)": (
+        "inert: paren in rule content; replaced by Bash(*.documents*.batchUpdate*)"
+    ),
+    "Bash(*documents().get*)": (
+        "inert: paren in rule content; replaced by Bash(*.documents*.get*)"
+    ),
+    "Bash(*documents().create*)": (
+        "inert: paren in rule content; replaced by Bash(*.documents*.create*)"
+    ),
 }
 
 # A retirement is only honest if the intent survived it. One row per family,
@@ -860,7 +879,32 @@ RETIREMENT_REPLACEMENTS: dict[str, tuple[str, ...]] = {
     "over-broad literals": ("Bash(*.claude/aut*)", "Bash(*prompt*.jsonl*)"),
     "the six pipe rules": ("Bash(bash)", "Bash(sh)", "Bash(bash -s*)", "Bash(sh -s*)"),
     "the escaped-star sentinel": ("Bash(*BLOCKED_TEST_ESCAPED\\**)",),
+    "the seven paren rules": (
+        'Bash(*build*"docs",*)',
+        "Bash(*build*'docs',*)",
+        'Bash(*build*"drive",*)',
+        "Bash(*build*'drive',*)",
+        "Bash(*.documents*.batchUpdate*)",
+        "Bash(*.documents*.get*)",
+        "Bash(*.documents*.create*)",
+    ),
 }
+
+# The seven rewrites, each against the command its dead predecessor was written
+# to stop. PORTED_RULES cannot hold them — its completeness pins are keyed to
+# rule text carried over VERBATIM from bash-config.json — but a replacement that
+# is merely present, and does not actually stop the thing, is a retirement
+# dressed up as a port. The live proof is tests/test_deny_globs.py; this is the
+# offline half, and it costs nothing.
+PAREN_REWRITES: list[tuple[str, str]] = [
+    ('Bash(*build*"docs",*)', 'python3 -c \'svc = build("docs", "v1")\''),
+    ("Bash(*build*'docs',*)", "python3 -c \"svc = build('docs', 'v1')\""),
+    ('Bash(*build*"drive",*)', 'python3 -c \'svc = build("drive", "v3")\''),
+    ("Bash(*build*'drive',*)", "python3 -c \"svc = build('drive', 'v3')\""),
+    ("Bash(*.documents*.batchUpdate*)", "python3 -c 'svc.documents().batchUpdate(x)'"),
+    ("Bash(*.documents*.get*)", "python3 -c 'svc.documents().get(x)'"),
+    ("Bash(*.documents*.create*)", "python3 -c 'svc.documents().create(x)'"),
+]
 
 DENY = SETTINGS.get("permissions", {}).get("deny", [])
 check(
@@ -874,6 +918,35 @@ for rule, target in PORTED_RULES:
         matched_by(rule, target),
     )
 
+for rule, target in PAREN_REWRITES:
+    check(f"present: {rule}", rule in DENY)
+    check(
+        f"the rewrite stops what its dead predecessor was written to stop: "
+        f"{rule} vs {target!r}",
+        matched_by(rule, target),
+    )
+
+# A rule whose CONTENT contains `(` or `)` is dead on arrival: the CLI's
+# settings-rule parser cannot carry a parenthesis through the `Tool(content)`
+# delimiters, so the rule loads and then matches nothing. MEASURED against the
+# real CLI in tests/test_deny_globs.py (a `Bash(*XYZ(*)` control denies nothing
+# while `Bash(*XYZ*)` denies). The oracle above cannot see this — it evaluates
+# rule TEXT, and paren rules match perfectly well as globs, which is exactly how
+# the whole Google Docs/Drive block passed this file while stopping nothing. So
+# the shape is banned outright, here as well as in the live suite, because this
+# file is the one a rule author is most likely to run.
+section("settings.json: no deny rule content contains a parenthesis")
+_paren_content = [
+    r for r in DENY
+    if _re.match(r"^[A-Za-z_][A-Za-z0-9_]*\(.*\)$", r, _re.S)
+    and ("(" in r[r.index("(") + 1 : -1] or ")" in r[r.index("(") + 1 : -1])
+]
+check(
+    "no rule content contains `(` or `)`",
+    not _paren_content,
+    f"dead on arrival: {_paren_content}",
+)
+
 # Every surviving rule must actually FIRE, under the CLI's real dispatch and
 # not under safe-bash's. Seven rules once passed the row above while stopping
 # nothing, because the model applied every rule to the whole command string;
@@ -883,7 +956,9 @@ for rule, target in PORTED_RULES:
 # a rule whose pattern spans a pipe and this goes red instead of reading as
 # protection.
 section("settings.json: no surviving deny rule is inert")
-_observed_inert = sorted(r for r, t in PORTED_RULES if not matched_by(r, t))
+_observed_inert = sorted(
+    r for r, t in (PORTED_RULES + PAREN_REWRITES) if not matched_by(r, t)
+)
 check(
     "no ported rule stops nothing",
     not _observed_inert,
@@ -903,6 +978,14 @@ BENIGN = [
     # Quoting keeps the word inside a string, and the pipeline split keeps
     # the string whole, so this is not a `sudo *` invocation.
     "echo 'the sudo command is denied'",
+    # The four lookalikes the rewritten Google Docs/Drive rules must not
+    # swallow. The naive `(`->`*` repair refuses all four (measured live in
+    # tests/test_deny_globs.py); the rules in settings.json release them
+    # because they require the argument separator and the leading dot.
+    "git commit -m 'chore: rebuild \"docs\" from the template'",
+    "git commit -m \"chore: rebuild 'docs' and 'drive' pages\"",
+    "python3 -c \"print(cfg['documents'].get('title'))\"",
+    'git commit -m "docs: documents.create returns an id"',
 ]
 _bash_deny_rules = [r for r in DENY if r.startswith("Bash(")]
 for cmd in BENIGN:

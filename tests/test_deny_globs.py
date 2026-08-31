@@ -46,7 +46,7 @@ suite that proved nothing:
   The lifted method had a third, quieter limitation that turned out to matter
   most. It fed `jRo` a rule content computed by THIS FILE (`rule[5:-1]`), so it
   exercised the matcher while bypassing the CLI's own settings-rule parser. That
-  parser is where seven of the ported rules die — see the paren section below.
+  parser is where seven of the ported rules died — see the paren section below.
   Executing the product finds that; modelling it never could.
 
 METHOD: LIVE, AND PRIMARY
@@ -132,13 +132,29 @@ Both were re-measured live against 2.1.251 on 2026-08-31.
   neighbours — the rest of the deny list keeps working — which is exactly why
   this was invisible: the list looks alive because most of it is.
 
-  Seven ported rules are hit by this and stop nothing. They are NOT recorded
-  here as accepted-inert, and this file does NOT go green in their presence. The
-  standing doctrine in this repo is that a deny rule which provably stops
-  nothing gets DELETED, because it reads as coverage to the next auditor; that
-  is what `e55190c` and `4222f8f` did to the previous batch. Fixing them means
-  editing settings.json, which is out of this file's scope — so the suite
-  reports them, names the cause, and stays RED until they are gone or rewritten.
+  Seven ported rules were hit by this and stopped nothing: the whole Google
+  Docs / Drive block (`Bash(*build("docs"*)` and its three siblings,
+  `Bash(*documents().batchUpdate*)`, `.get`, `.create`), whose intent is to keep
+  direct `google-api-python-client` use out of a shell so that Docs work goes
+  through the sanctioned `gdocs-review` MCP. They were REWRITTEN, not deleted —
+  deleting them would have lost the protection, and the doctrine only licences
+  deleting a rule whose intent is already carried elsewhere.
+
+  The rewrite had to dodge a second trap. The obvious repair is to swap the `(`
+  for a `*`, and that manufactures the E11 defect again: `Bash(*build*"docs"*)`
+  refuses `git commit -m 'chore: rebuild "docs" from the template'`, and
+  `Bash(*documents*.get*)` refuses `python3 -c "print(cfg['documents'].get(...))"`
+  — both MEASURED, and both pinned as CORE rows below so the tightening is
+  evidence rather than assertion. What replaces the `(` is the structure it used
+  to supply: the argument separator for the `build(...)` family
+  (`*build*"docs",*` — a two-argument call, not a phrase), and the leading dot
+  for the `documents()` family (`*.documents*.get*` — an attribute on a
+  discovery service object, not a dict key). Every one of the seven is proved in
+  BOTH directions on every full run: its target refused in ROWS, its legitimate
+  lookalike released in BENIGN.
+
+  The offline check below therefore stays: any NEW paren rule is dead on arrival
+  and the suite goes red for it.
 
 Run:  python3 tests/test_deny_globs.py
       DENY_GLOBS_SCOPE=core python3 tests/test_deny_globs.py   (reduced sweep)
@@ -402,13 +418,23 @@ ROWS: list[tuple[str, str]] = [
     ("Bash(*discovery/v1/apis/docs*)", "curl https://host.invalid/discovery/v1/apis/docs/v1/rest"),
     ("Bash(*googleapiclient*)", "python3 -c 'import googleapiclient'"),
     ("Bash(*from googleapiclient*)", "python3 -c 'from googleapiclient import discovery'"),
-    ('Bash(*build("docs"*)', 'python3 -c \'svc = build("docs", "v1")\''),
-    ("Bash(*build('docs'*)", "python3 -c \"svc = build('docs', 'v1')\""),
-    ('Bash(*build("drive"*)', 'python3 -c \'svc = build("drive", "v3")\''),
-    ("Bash(*build('drive'*)", "python3 -c \"svc = build('drive', 'v3')\""),
-    ("Bash(*documents().batchUpdate*)", "python3 -c 'svc.documents().batchUpdate(x)'"),
-    ("Bash(*documents().get*)", "python3 -c 'svc.documents().get(x)'"),
-    ("Bash(*documents().create*)", "python3 -c 'svc.documents().create(x)'"),
+    # The seven paren-free rewrites of the Google Docs/Drive block. The rules
+    # they replace could not fire at all (see PARENTHESES in the docstring), and
+    # the naive repair — swap `(` for `*` — is measured harmful in the CORE rows
+    # below. Each of these keeps a structural token the `(` used to supply:
+    #   * the `build(...)` family keeps the ARGUMENT SEPARATOR. `build("docs",`
+    #     is a two-argument call; `rebuild "docs" section` is a commit subject.
+    #     Dropping the comma is exactly the `*aut*review*` mistake again.
+    #   * the `documents()` family keeps the LEADING DOT. `.documents` is an
+    #     attribute on a discovery service object; `cfg['documents'].get(...)`
+    #     and `documents.create` in prose are not, and stay allowed.
+    ('Bash(*build*"docs",*)', 'python3 -c \'svc = build("docs", "v1")\''),
+    ("Bash(*build*'docs',*)", "python3 -c \"svc = build('docs', 'v1')\""),
+    ('Bash(*build*"drive",*)', 'python3 -c \'svc = build("drive", "v3")\''),
+    ("Bash(*build*'drive',*)", "python3 -c \"svc = build('drive', 'v3')\""),
+    ("Bash(*.documents*.batchUpdate*)", "python3 -c 'svc.documents().batchUpdate(x)'"),
+    ("Bash(*.documents*.get*)", "python3 -c 'svc.documents().get(x)'"),
+    ("Bash(*.documents*.create*)", "python3 -c 'svc.documents().create(x)'"),
     ("Bash(*automation-review*)", "ls /home/jonathan/.claude/automation-review"),
     ("Bash(*prompts.jsonl*)", "cat /home/jonathan/.claude/automation-review/prompts.jsonl"),
     # The two narrowed replacements for `*aut*review*`, `*review*prompt*` and
@@ -458,6 +484,22 @@ BENIGN: list[str] = [
     "cat /home/jonathan/.claude/settings.json",
     "ls /home/jonathan/.claude/agents",
     "git -C /home/jonathan/.claude log --author=jonathan --grep=review -3",
+    # --- the false positives the seven rewritten googleapi rules must NOT
+    # create. Each one is refused by the naive `(`->`*` repair and allowed by
+    # the rule actually in settings.json; the CORE rows above measure the
+    # refusing half, and these keep the released half pinned forever. Losing
+    # any of these would be the `*aut*review*` defect a second time.
+    #
+    # `build` + `"docs"` with no argument separator: an ordinary commit subject.
+    "git commit -m 'chore: rebuild \"docs\" from the template'",
+    # the single-quoted twin, covering the 'docs' and 'drive' rules together.
+    "git commit -m \"chore: rebuild 'docs' and 'drive' pages\"",
+    # `documents` + `.get` with no leading dot: a dict lookup, not a Docs
+    # resource. `.documents` is what a discovery service object exposes.
+    "python3 -c \"print(cfg['documents'].get('title'))\"",
+    # `documents.create` named in prose — the gdocs-review MCP's own surface is
+    # a normal thing to write commit messages about.
+    'git commit -m "docs: documents.create returns an id"',
 ]
 
 # The retired rules' stated purpose, from the commit that added them
@@ -730,6 +772,40 @@ CORE: list[tuple[str, str, list[str] | None, bool, str]] = [
         False,
         "the fix, measured against the live rule list",
     ),
+    # ---- the naive repair of the seven paren rules, reproduced ------------
+    # Swapping the dead `(` for a `*` is the obvious fix and it manufactures
+    # the E11 defect again: two English-ish tokens, unanchored, refusing
+    # ordinary work for a substring it merely contains. These two rows measure
+    # that, so the tightening in ROWS is justified by evidence rather than by
+    # assertion — and so nobody "simplifies" the rules back later.
+    (
+        'the naive repair, reproduced: Bash(*build*"docs"*) refuses a commit subject',
+        "git commit -m 'chore: rebuild \"docs\" from the template'",
+        ['Bash(*build*"docs"*)'],
+        True,
+        "why the rewrite keeps the argument separator instead",
+    ),
+    (
+        "and released by the rule actually in settings.json, which requires the comma",
+        "git commit -m 'chore: rebuild \"docs\" from the template'",
+        ['Bash(*build*"docs",*)'],
+        False,
+        "the tightening, isolated to the one rule it belongs to",
+    ),
+    (
+        "the naive repair, reproduced: Bash(*documents*.get*) refuses a dict lookup",
+        "python3 -c \"print(cfg['documents'].get('title'))\"",
+        ["Bash(*documents*.get*)"],
+        True,
+        "why the rewrite keeps the leading dot instead",
+    ),
+    (
+        "and released by the rule actually in settings.json, which requires `.documents`",
+        "python3 -c \"print(cfg['documents'].get('title'))\"",
+        ["Bash(*.documents*.get*)"],
+        False,
+        "the tightening, isolated to the one rule it belongs to",
+    ),
 ]
 
 SPECS: list[tuple[str, str, list[str] | None, bool, str]] = list(CORE)
@@ -810,7 +886,13 @@ for (label, command, rules, expect_denied, why), res in zip(SPECS, _results):
         continue
     denied = command in (res.denied or [])
     check(f"live, {verb}: {label}", denied == expect_denied, f"{why}; denials={res.denied!r}")
-    if rules is not None and len(rules) == 1 and rules[0] in dict(ROWS):
+    # Only the per-rule sweep feeds the inert derivation, and it is keyed on the
+    # (rule, its own target) PAIR rather than on the rule alone. A CORE row may
+    # legitimately isolate a live rule against a command it must NOT stop — the
+    # released half of the naive-repair pairs does exactly that — and keying on
+    # the rule alone would let such a row record `inert` for a rule that works,
+    # with only SPECS ordering deciding which write survived.
+    if rules is not None and len(rules) == 1 and (rules[0], command) in set(ROWS):
         _ROW_RESULTS[rules[0]] = denied
 
 
