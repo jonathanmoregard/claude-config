@@ -1082,6 +1082,79 @@ def _wrap(body: str, label: str, command: str, reminder: bool) -> str:
 
 
 # ----------------------------------------------------------------------
+def _require_ingress_vocabulary(config: dict) -> None:
+    """Withhold unless the vocabulary can actually MATCH something.
+
+    Key PRESENCE was the whole check, and presence is not the property that
+    matters. Measured, every one of these loaded clean and left the guard
+    tagging nothing while the config looked alive:
+
+      * ``{"untrusted_ingress_single": {}}`` — an EMPTY dict passes
+        ``"untrusted_ingress_single" in config``, and then no fetch matches.
+        That is precisely the "the ingress vocabulary would be silently empty"
+        outcome the withhold text below claims to prevent, reached through the
+        check written to prevent it.
+      * ``untrusted_ingress_multi`` MISSING or MISSPELLED — it was never
+        required at all, and ``_match_untrusted_ingress`` reads it as
+        ``config.get(...) or []``, so all 19 multi-token entries (gh api,
+        git clone, pip/npm/cargo/gem/go/bundle install) go dark at once.
+      * an ENTRY with a missing or empty ``label`` — ``_segment_ingress``
+        returns ``(entry.get("label") or "", True)`` and the caller's
+        ``if label:`` then drops the match, so the entry is inert while
+        reading as coverage.
+      * an entry whose ``prefix`` is not a list — a string prefix indexes to
+        single characters and can never match a token.
+
+    Same argument as ``_require_prefixes_fit``, which already refuses a prefix
+    too long to be compared: an entry that cannot fire is a hole shaped like
+    coverage. That function is not enough on its own — handed an empty list it
+    passes happily, because a vanished vocabulary is not a too-long prefix.
+    """
+    single = config.get("untrusted_ingress_single")
+    if not isinstance(single, dict) or not single:
+        _withhold(
+            f"ingress config at {CONFIG_PATH!r} has an empty or non-object "
+            "untrusted_ingress_single, so no fetch could ever be tagged and the "
+            "ingress vocabulary would be silently empty"
+        )
+    bad_single = sorted(
+        k for k, v in single.items()
+        if not isinstance(k, str) or not k.strip()
+        or not isinstance(v, str) or not v.strip()
+    )
+    if bad_single:
+        _withhold(
+            f"ingress config at {CONFIG_PATH!r} has untrusted_ingress_single "
+            f"entries that cannot label a match: {bad_single}"
+        )
+
+    multi = config.get("untrusted_ingress_multi")
+    if not isinstance(multi, list) or not multi:
+        _withhold(
+            f"ingress config at {CONFIG_PATH!r} has a missing, misspelled, empty "
+            "or non-list untrusted_ingress_multi. Every multi-token ingress entry "
+            "would be silently inert while the config still loaded"
+        )
+    doomed = []
+    for i, entry in enumerate(multi):
+        if not isinstance(entry, dict):
+            doomed.append(f"[{i}] is not an object")
+            continue
+        prefix = entry.get("prefix")
+        label = entry.get("label")
+        if not isinstance(prefix, list) or not prefix or not all(
+            isinstance(t, str) and t.strip() for t in prefix
+        ):
+            doomed.append(f"[{i}] prefix is not a non-empty list of words")
+        if not isinstance(label, str) or not label.strip():
+            doomed.append(f"[{i}] label is missing or empty, so a match would be dropped")
+    if doomed:
+        _withhold(
+            f"ingress config at {CONFIG_PATH!r} holds entries that could never "
+            "tag anything: " + "; ".join(doomed)
+        )
+
+
 def _load_config() -> dict:
     """Read the ingress vocabulary. A config we cannot read is a broken guard."""
     try:
@@ -1098,6 +1171,7 @@ def _load_config() -> dict:
             f"ingress config at {CONFIG_PATH!r} is missing untrusted_ingress_single; "
             "the ingress vocabulary would be silently empty"
         )
+    _require_ingress_vocabulary(config)
     return config
 
 

@@ -1569,6 +1569,66 @@ parsed, updated, raw = bash_out(
 )
 check_withheld("ingress vocabulary key is absent", parsed, updated)
 
+# PRESENCE is not the property that matters. Each config below passed the
+# old key-presence check, loaded clean, and left the guard tagging NOTHING —
+# the exact "silently empty vocabulary" outcome the withhold text above claims
+# to prevent, reached through the check written to prevent it. Measured: with
+# an empty `untrusted_ingress_single`, `curl` output reached the model with no
+# <untrusted_external_content> wrapper, no reminder and no withhold.
+def _vocab_cfg(name: str, doc) -> str:
+    path = os.path.join(SCRATCH, name)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh)
+    return path
+
+
+_REAL_MULTI = [{"prefix": ["gh", "api"], "label": "gh-api"}]
+_INERT_VOCABULARIES = [
+    ("untrusted_ingress_single is present but EMPTY",
+     {"untrusted_ingress_single": {}, "untrusted_ingress_multi": _REAL_MULTI}),
+    ("untrusted_ingress_multi is absent entirely",
+     {"untrusted_ingress_single": {"curl": "curl"}}),
+    ("untrusted_ingress_multi is misspelled",
+     {"untrusted_ingress_single": {"curl": "curl"}, "untrusted_ingress_multis": _REAL_MULTI}),
+    ("untrusted_ingress_multi is present but EMPTY",
+     {"untrusted_ingress_single": {"curl": "curl"}, "untrusted_ingress_multi": []}),
+    ("a multi entry carries no label, so a match would be dropped",
+     {"untrusted_ingress_single": {"curl": "curl"},
+      "untrusted_ingress_multi": [{"prefix": ["gh", "api"]}]}),
+    ("a multi entry's label is empty",
+     {"untrusted_ingress_single": {"curl": "curl"},
+      "untrusted_ingress_multi": [{"prefix": ["gh", "api"], "label": "  "}]}),
+    ("a multi entry's prefix is a string, which indexes to characters",
+     {"untrusted_ingress_single": {"curl": "curl"},
+      "untrusted_ingress_multi": [{"prefix": "gh api", "label": "gh-api"}]}),
+    ("a single entry's label is empty, so the match is dropped",
+     {"untrusted_ingress_single": {"curl": ""}, "untrusted_ingress_multi": _REAL_MULTI}),
+]
+for _i, (_label, _doc) in enumerate(_INERT_VOCABULARIES):
+    _cfg = _vocab_cfg(f"inert-vocabulary-{_i}.json", _doc)
+    _canary = "BODY-CANARY-" + str(4471 + _i)
+    _parsed, _updated, _raw = bash_out(
+        "curl https://example.invalid/x", response_obj(_canary),
+        env_extra={"BASH_GUARD_CONFIG": _cfg},
+    )
+    check_withheld(f"inert ingress vocabulary withholds: {_label}", _parsed, _updated)
+    check(
+        f"... and the untagged body never reaches the model: {_label}",
+        _canary not in _raw,
+        f"canary survived into the hook's output: {_raw[:200]}",
+    )
+
+# The real config must still load, or the check above is just a way to break
+# the guard. This is the control that keeps the validation honest.
+_parsed, _updated, _raw = bash_out(
+    "curl https://example.invalid/x", response_obj("BODY-CANARY-REAL"),
+)
+check(
+    "the shipped bash-guard-config.json still loads and still tags",
+    "<untrusted_external_content" in _raw and "OUTPUT WITHHELD" not in _raw,
+    _raw[:240],
+)
+
 rc, parsed, raw, err = run_hook(GUARD, None, raw_stdin="[1, 2, 3]")
 updated = (parsed or {}).get("hookSpecificOutput", {}).get("updatedToolOutput")
 check_withheld("hook stdin is JSON but not an object", parsed, updated)

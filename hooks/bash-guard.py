@@ -845,13 +845,34 @@ _PIPE_SOURCE_COMMANDS = frozenset({"curl", "wget", "npx"})
 # The six rules named `bash` and `sh`. The rest are the same sink under a
 # different spelling — the omission was an inconsistency, not a decision, the
 # same one that let `/usr/bin/find … -delete` past the layer above.
-_PIPE_SHELL_SINKS = frozenset({"sh", "bash", "dash", "zsh", "ksh", "ash", "mksh"})
+#
+# `eval` is here for SET PARITY with the output guard's SHELL_INTERPRETERS, not
+# because it is an exploit: `| eval` with no argument does not read stdin, so
+# nothing runs. It is listed so the two vocabularies can be compared as equal
+# sets — see the parity assertion in tests/test_bash_guard_pre.py, which is
+# what stops them drifting apart again.
+_PIPE_SHELL_SINKS = frozenset(
+    {"sh", "bash", "dash", "zsh", "ksh", "ash", "mksh", "eval"}
+)
 
 # Words that stand in front of the program actually being run. Their own flags
 # are skipped with them, so `sudo -E bash` resolves to `bash`.
+#
+# `busybox` is a MULTIPLEXER, so it belongs here and not in the sink set: it
+# runs whatever applet argv[1] names, and only some of those are shells.
+# Treating it as a wrapper resolves `busybox sh` and `busybox ash` to the real
+# sink while leaving `busybox cat` alone; treating it as a sink would deny
+# every applet.
+#
+# MEASURED, and worse than the set-parity gap that pointed at it:
+# `curl … | busybox ash` walked past EVERY layer, dcg included — empty stdout,
+# exit 0, nothing objected. `ash` with no script operand executes what it reads
+# on stdin, so that is a live fetch-to-execution path. dcg's own rule happens
+# to catch `busybox sh` and not `busybox ash`, which made this layer's omission
+# load-bearing and unbacked for the spelling that mattered.
 _PIPE_WRAPPERS = frozenset(
     {"sudo", "doas", "env", "command", "exec", "nohup", "time", "nice", "ionice",
-     "setsid", "stdbuf"}
+     "setsid", "stdbuf", "busybox"}
 )
 
 _ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
