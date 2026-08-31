@@ -244,8 +244,9 @@ with Sandbox() as sb:
     mkt = claude_home / "plugins" / "marketplaces" / "jonathanmoregard"
     (mkt / ".git").mkdir(parents=True)
     write_status(sb.state_root, claude_home)  # the config repo itself is fine
+    write_status(sb.state_root, mkt, state="alert", reason="local changes in the way")
     msg = announcement(run_hook(sb.state_root, None, claude_home)).get("systemMessage", "")
-    check("an unpulled marketplace clone is discovered without being listed",
+    check("a broken marketplace clone is discovered without being listed",
           str(mkt) in msg, detail=msg[:250])
 
 with Sandbox() as sb:
@@ -257,6 +258,34 @@ with Sandbox() as sb:
     proc = run_hook(sb.state_root, None, claude_home)
     check("a healthy discovered marketplace clone stays silent", proc.stdout == "",
           detail=repr(proc.stdout))
+
+# A clone the puller has been POINTED at but that never reached a verdict is a
+# finding: the unit exists and is producing nothing.
+with Sandbox() as sb:
+    claude_home = sb.repo("dot-claude")
+    mkt = claude_home / "plugins" / "marketplaces" / "jonathanmoregard"
+    (mkt / ".git").mkdir(parents=True)
+    write_status(sb.state_root, claude_home)
+    # claude-pull.sh mkdir -p's the state dir at the top of every run, before it
+    # can fail at anything — so the bare directory means "pointed at, no verdict".
+    (sb.state_root / str(mkt).replace("/", "%")).mkdir(parents=True)
+    msg = announcement(run_hook(sb.state_root, None, claude_home)).get("systemMessage", "")
+    check("a covered clone with no verdict is announced", str(mkt) in msg,
+          detail=msg[:250])
+
+# The coverage filter. Measured 2026-08-31: this machine has six marketplace
+# clones, five of them third-party and pinned on purpose. Nothing auto-pulls
+# third-party plugin code here and a health check must not make that decision by
+# implication — nor spend five permanent lines of the attention budget saying so
+# every session.
+with Sandbox() as sb:
+    claude_home = sb.repo("dot-claude")
+    third_party = claude_home / "plugins" / "marketplaces" / "trailofbits"
+    (third_party / ".git").mkdir(parents=True)
+    write_status(sb.state_root, claude_home)
+    proc = run_hook(sb.state_root, None, claude_home)
+    check("a pinned third-party clone nothing pulls stays silent",
+          proc.stdout == "", detail=repr(proc.stdout))
 
 with Sandbox() as sb:
     claude_home = sb.repo("dot-claude")

@@ -39,12 +39,20 @@ never "could not tell", or it stops carrying information.
 TARGETS FIND THEMSELVES
 
 The expected set is ``~/.claude`` plus every git checkout under
-``~/.claude/plugins/marketplaces/``, because that is exactly the set of trees
-the harness reads from. Deriving it rather than listing it is the whole point:
-the failure being fixed is a checkout nobody was watching, so a hook that only
-watches the checkouts someone remembered to name reproduces it. A target with
-no status record is therefore a finding, not a blank — "nothing is pulling
-this" is the marketplace clone's entire story.
+``~/.claude/plugins/marketplaces/`` that the puller has been pointed at.
+Deriving it rather than listing it is the whole point: the failure being fixed
+is a checkout nobody was watching, so a hook that only watches the checkouts
+someone remembered to name reproduces it, and the next marketplace to get a
+puller is covered without editing this file. Within that set a missing status
+record is a finding, not a blank.
+
+The coverage filter is not incidental. This machine has six marketplace
+clones, five of them third-party and pinned on purpose; nothing auto-pulls
+third-party plugin code here, and a health check must not make that decision by
+implication. Five permanent "uncovered" lines would also spend the entire
+attention budget below. A repo that WAS covered keeps its state directory, so
+it still goes stale and still speaks — losing a puller is noticed, which is the
+direction that matters.
 
 FAIL-OPEN ON ITS OWN ERRORS, EXCEPT THE ONE THAT MATTERS
 
@@ -98,8 +106,42 @@ def _claude_home() -> Path:
     return Path(override).expanduser() if override else Path.home() / ".claude"
 
 
-def _targets() -> list[Path]:
-    """Every checkout the harness reads from, derived rather than listed."""
+def _covered(state_root: Path, repo: Path) -> bool:
+    """Has anything ever pointed the puller at this repo?
+
+    claude-pull.sh creates the state directory at the top of every run, before
+    it can fail at anything, so the directory's existence is the puller's own
+    declaration of "this repo is mine" — recorded by the producer rather than
+    guessed at by the reader.
+    """
+    return (state_root / str(repo).replace("/", "%")).is_dir()
+
+
+def _targets(state_root: Path) -> list[Path]:
+    """Every checkout whose freshness this machine claims to maintain.
+
+    ``~/.claude`` is unconditional: it is the config repo, a timer has pulled
+    it since 2026-04, and if that ever stops the session needs to hear so.
+
+    Marketplace clones are discovered rather than listed, because the failure
+    being fixed is a checkout nobody was watching — a hook that only watches
+    the ones someone remembered to name reproduces it, and the next marketplace
+    to get a puller should be covered without editing this file.
+
+    But discovery is filtered by coverage, and that filter is load-bearing.
+    Measured 2026-08-31: this machine has SIX marketplace clones, five of them
+    third-party (kettleofskills, nix-search-marketplace, skills-curated,
+    trailofbits, zach-source-plugins). Those are pinned on purpose — nothing
+    auto-pulls third-party plugin code onto this host, and nothing should start
+    doing so as a side effect of a health check. Announcing them as "uncovered"
+    every session would be five permanent lines of noise, which spends exactly
+    the attention budget this hook depends on having.
+
+    So: a clone is a target once the puller has been pointed at it. A repo that
+    was covered and then stopped being pulled keeps its state directory, so it
+    still goes stale and still speaks — removing a puller is noticed, which is
+    the direction that matters.
+    """
     override = os.environ.get("CLAUDE_PULL_HEALTH_TARGETS")
     if override:
         return [Path(p).expanduser() for p in override.split(os.pathsep) if p]
@@ -113,9 +155,9 @@ def _targets() -> list[Path]:
         children = []
     for child in children:
         # `.git` is a directory in a clone and a file in a linked worktree;
-        # either means "git resolves this tree", which is the property that
-        # makes it pullable.
-        if (child / ".git").exists():
+        # either means "git resolves this tree", which is what makes it
+        # pullable at all.
+        if (child / ".git").exists() and _covered(state_root, child):
             found.append(child)
     return found
 
@@ -126,6 +168,15 @@ def _record(state_root: Path, repo: Path):
     try:
         raw = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
+        # The state DIRECTORY is created at the top of every run, before the
+        # puller can fail at anything. Its presence without a status.json is
+        # therefore a different fact from its absence: "pointed at, never
+        # reached a verdict" versus "nothing pulls this at all".
+        if _covered(state_root, repo):
+            return None, (
+                "the puller has been pointed at it but has never reached a "
+                "verdict, so it may not have run since it was set up"
+            )
         return None, "no status record exists"
     try:
         doc = json.loads(raw)
@@ -236,7 +287,7 @@ def main() -> int:
     state_root = _state_root()
     findings: list[str] = []
     blocked = False
-    for repo in _targets():
+    for repo in _targets(state_root):
         verdict = _verdict(state_root, repo)
         if verdict:
             findings.append(verdict)
