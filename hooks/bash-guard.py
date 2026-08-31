@@ -280,8 +280,8 @@ def _disarm_watchdog() -> None:
     # watchdog that fired anyway calls _fail_closed, which denies.
     try:
         signal.setitimer(signal.ITIMER_REAL, 0)
-    # arftl-allow: swallowed-exception — cannot fail where arming succeeded,
     # and no permissive outcome is reachable either way. Reasoning above.
+    # arftl-allow: swallowed-exception — cannot fail where arming succeeded,
     except (ValueError, OSError, AttributeError): pass
 
 
