@@ -24,11 +24,21 @@ Run all three. Do not skip to `build`.
 ```bash
 export INKSCAPE=/nix/store/…/bin/inkscape     # see reference.md for both paths
 PY=/nix/store/…-python3-…-env/bin/python3     # needs numpy + PIL
+D=/tmp/claude-tmp-data/vaven-<slug>           # working dir; see below
+mkdir -p "$D"
 
-$PY cover.py grid  --photo P --out D                    # 1. read landmarks
-$PY cover.py check --photo P --config C --out D         # 2. GATE
-$PY cover.py build --photo P --config C --out D         # 3. render + verify
+$PY cover.py grid  --photo P --out "$D"                 # 1. read landmarks
+$PY cover.py check --photo P --config C --out "$D"      # 2. GATE
+$PY cover.py build --photo P --config C --out "$D"      # 3. render + verify
 ```
+
+**Work under `/tmp/claude-tmp-data/`, not `~/Downloads`.** A run leaves dozens of
+grids, zooms, band strips, per-variant backgrounds and no-logo renders; that is
+scratch, and it does not belong in the user's downloads folder. `/tmp` is already
+an additional working directory, so Claude can read and write there without a
+permission prompt, and the dir is Claude's to manage. It is also **ephemeral** —
+copy the chosen `upload-*.jpg` / `upload-*.png` somewhere durable and hand over
+that path, along with the review page.
 
 **1. Measure.** `grid` writes a percentage overlay and 1%-gridline zooms. Read
 every landmark off the zooms. Full-frame eyeball reads run ~2% out, and 2% of
@@ -61,10 +71,28 @@ and `upload-*.png`. Exits non-zero if any variant is flagged.
 |---|---|
 | Mark on the **canvas centre line** | Mobile crops the **sides**; only the centred 1005×1005 square is guaranteed. Off-centre placement is destroyed there. |
 | Photo **full-bleed and whole** | Giving the mark its own coloured field caps it near 18% of canvas width and spends half the canvas. |
-| Mark clears the chin by **16% of its own height** | Fixed as a fraction, never pixels. Grazing contact is the universal amateur tell — commit to a gap or to an overlap, never land between. |
+| Mark's bottom sits on **y = 796**, always | The one anchor that is not a taste call. It also aligns every rung of a size ladder on one baseline, so a fan-out varies size and nothing else. |
+| Never land within **8% of the mark's height** of the chin | Either way — a clear gap and a committed overlap are both fine, grazing contact is the universal amateur tell. Pick rungs around the dead zone, don't tune into it. |
 | Nothing load-bearing below **y = 820** | Facebook's title/date/RSVP furniture. |
 | Any softening **follows the artwork's silhouette** | A rectangle, plate, or feathered box reads as a smudge floating in the frame. |
-| Size comes from the arithmetic | Do not shrink the mark "so it doesn't compete with the faces". Undersizing is the standing complaint. |
+| Size is an **input**, in % of canvas width | Do not shrink the mark "so it doesn't compete with the faces". Undersizing is the standing complaint. And do not let a gap rule solve the size for you — see below. |
+
+## Don't let a fitted constant solve the layout
+
+The first version of this skill derived the mark's height from "clear the chin
+by 16% of its own height". One constant then set the size, the position and the
+ceiling at once — and capped a photo at 24.8% of canvas width when 28.7% fitted.
+**That is overfitting, and it is invisible** because the number it produces
+still passes every gate.
+
+Give `widths` — a list of fractions of **canvas width**, the unit the client
+judges in and the only one comparable between photos. `check` prints the
+chin-to-furniture band, the width that fills it, and the whole ladder with the
+gap each rung produces. The gap is measured, never targeted.
+
+`headroom` and `widths` cross-multiply, so a width that is safe on one crop and
+grazing on another needs **two configs and two output dirs**, not one config
+with a cross product that renders combinations you would never show.
 
 ## Re-measure for every photo
 

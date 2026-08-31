@@ -61,14 +61,35 @@ With no type field, the photo full-bleed:
 MAXW  = 2 · min(GX, SW − GX)      widest crop still centred on the group
 SBASE = 1920 / MAXW               smallest usable scale; wider stops being centred
 chin_output = (CHIN − HEADS) · SBASE + headroom
-h     = (796 − chin_output) / (1 + 0.16)      logo height
-top   = chin_output + 0.16 · h
-w     = h · 1.4041
+band  = 796 − chin_output         clear room between the lowest chin and the UI
+w     = width_frac · 1920         SIZE IS AN INPUT — see below
+h     = w / 1.4041
+top   = 796 − h                   bottom pinned to the furniture line, always
+gap   = (top − chin_output) / h   an OUTCOME, measured and reported
 ```
+
+**Size is chosen, not solved.** An earlier version derived the height from
+"clear the chin by 16% of the mark's own height", which let one fitted constant
+set the size, the position and the ceiling at once — and capped a photo at 24.8%
+of canvas width when 28.7% fitted. Give `widths` as fractions of **canvas
+width**, the unit the client judges in and the only one comparable between
+photos. Omit it and you get the widest mark that fits the band whole.
+
+Pinning the **bottom** is what makes a ladder legible: every rung shares one
+baseline, so the fan-out varies size and nothing else. Centring in the band was
+tried and dropped — it makes the gap `(band − h)/2`, which crawls through zero,
+so every width from 24% to 35% of canvas landed in the grazing dead zone.
+
+**Pick rungs outside the dead zone.** Grazing is `|gap| < 8%` of mark height, so
+with the bottom pinned, heights in `[band/1.08, band/0.92]` are unusable. Those
+map to a width range you compute once per crop and then step around; `check`
+prints the band and the ceiling for you.
 
 Headroom must clear the group's topmost point (arms/tools) by ~38 px or it
 grazes the canvas edge. Cropping that point out is the lever that buys a bigger
-mark — offer it as an explicit rung rather than taking it silently.
+mark — offer it as an explicit rung rather than taking it silently. `headroom`
+and `widths` cross-multiply, so a width that is safe on one crop and grazing on
+another needs **two configs and two output dirs**, not one cross product.
 
 ## Contrast method
 
@@ -154,6 +175,24 @@ because the child holds the pipe, and the server is running anyway.
 
 Never delete build outputs. `shutil.copytree(..., dirs_exist_ok=True)`, not
 `rmtree`.
+
+## Where the files go
+
+| | |
+|---|---|
+| Working dir | `/tmp/claude-tmp-data/vaven-<slug>/`, one subdir per crop |
+| Review page | `/tmp/claude-tmp-data/vaven-<slug>-review/index.html` |
+| Handover | copy the chosen `upload-*.jpg` / `.png` somewhere durable, name the path |
+
+`/tmp` is in `permissions.additionalDirectories`, so Claude reads and writes
+under `/tmp/claude-tmp-data/` with no prompt and no `.claude`-protected-path
+friction. Nothing else needs configuring — do **not** add a narrower rule for a
+subdirectory of a directory that is already granted.
+
+A build writes `grid.png`, three zooms, the band strips, `check-*.png`, and for
+every variant a background, an SVG, a no-logo SVG, two renders and two upload
+files. That is scratch. It does not go in `~/Downloads`, which is the user's,
+not Claude's.
 
 ## Ruled out — do not retry
 
