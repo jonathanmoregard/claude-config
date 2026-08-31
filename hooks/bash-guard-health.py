@@ -472,8 +472,7 @@ def _dcg_rule_set_faults(dcg_path: str, cfg_path: str, marker_path: str,
         # branch that built `outcomes` as a non-empty list of 4-tuples; the
         # checker cannot see that through the declared `object`. A crash here
         # would now be REPORTED by the crash handler, not swallowed.
-        # producer; no error is being silenced.
-        # arftl-allow: suppression-marker — narrowing only, guaranteed by the
+        # arftl-allow: suppression-marker — reasoning directly above.
         outcomes = [o for o in payload if o[0] == "user"]  # type: ignore[union-attr]
         if not outcomes:
             return [(DOWN, (
@@ -518,8 +517,7 @@ def _dcg_rule_set_faults(dcg_path: str, cfg_path: str, marker_path: str,
     # `_run_dcg_config` returns ("json", doc) solely from the branch guarded
     # by `isinstance(doc, dict) and isinstance(doc.get("config_sources"),
     # list)`, so both the .get and the list are guaranteed by the producer.
-    # producer; no error is being silenced.
-    # arftl-allow: suppression-marker — narrowing only, guaranteed by the
+    # arftl-allow: suppression-marker — reasoning directly above.
     sources = doc.get("config_sources") or []  # type: ignore[union-attr]
     loaded = [
         s for s in sources
@@ -554,8 +552,7 @@ def _dcg_rule_set_faults(dcg_path: str, cfg_path: str, marker_path: str,
     # handles a missing or null `overrides`, and `_covered_classes` handles a
     # `block` of any shape, so no value reaches here that the code does not
     # expect.
-    # producer; no error is being silenced.
-    # arftl-allow: suppression-marker — narrowing only, guaranteed by the
+    # arftl-allow: suppression-marker — reasoning directly above.
     block = (doc.get("overrides") or {}).get("block")  # type: ignore[union-attr]
     covered, uninspectable = _covered_classes(block)
     missing = [label for label, _ in FULL_ONLY_CLASSES if label not in covered]
@@ -611,8 +608,7 @@ def _dcg_rule_set_faults(dcg_path: str, cfg_path: str, marker_path: str,
     # Same producer-guaranteed dict. `is True` is deliberate: any other value,
     # including a non-dict `general`, leaves the announcement unmade rather
     # than guessed.
-    # producer; no error is being silenced.
-    # arftl-allow: suppression-marker — narrowing only, guaranteed by the
+    # arftl-allow: suppression-marker — reasoning directly above.
     if (doc.get("general") or {}).get("self_heal_hook") is True:  # type: ignore[union-attr]
         faults.append((REDUCED, (
             "dcg's `self_heal_hook` is ENABLED (upstream's default). In that "
@@ -722,8 +718,7 @@ def main() -> int:
     # very thing this would be reporting.
     try:
         sys.stdin.read()
-    # in this file reads it. Reasoning above.
-    # arftl-allow: swallowed-exception — the payload is discarded; no verdict
+    # arftl-allow: swallowed-exception — reasoning directly above.
     except (OSError, ValueError): pass
 
     try:
