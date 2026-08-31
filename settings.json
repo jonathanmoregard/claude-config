@@ -268,6 +268,16 @@
         "hooks": [
           {
             "type": "command",
+            "command": "python3 $HOME/.claude/hooks/claude-pull-health.py",
+            "timeout": 10,
+            "statusMessage": "Checking checkout freshness..."
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
             "command": "python3 $HOME/.claude/worktree-additional-dirs.py",
             "timeout": 15,
             "statusMessage": "Scoping this repo's worktrees..."
