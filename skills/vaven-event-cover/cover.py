@@ -329,8 +329,14 @@ class Frame:
         return h, self.bottom - h
 
 
-def ceiling_width(f, lo=0.05, hi=0.60, step=0.001):
+def ceiling_width(f, lo=0.05, hi=0.60, step=0.001, clear=1.5 * GRAZE_FRAC):
     """Widest mark that stays clear of EVERY chin it passes under.
+
+    `clear` is the gap it must actually leave, and it is deliberately LARGER
+    than GRAZE_FRAC. Scanning down to the gate's own 8% threshold returns the
+    width whose gap is 8.0% -- passing by a rounding error, and sitting exactly
+    on the boundary the "commit to a gap or an overlap, never between" rule
+    exists to keep marks away from. A ceiling wants margin, not a photo finish.
 
     Scanned, not solved. The binding chin depends on the width (a chin off to
     the side only counts once the mark grows out to it) and the width depends
@@ -346,7 +352,7 @@ def ceiling_width(f, lo=0.05, hi=0.60, step=0.001):
     for i in range(n, -1, -1):
         wf = lo + i * step
         h = wf * CW / RATIO
-        if all(g >= GRAZE_FRAC * 100 for _, g in f.gaps(h, f.bottom - h)):
+        if all(g >= clear * 100 for _, g in f.gaps(h, f.bottom - h)):
             return wf
     raise SystemExit("no width clears the chins; the crop leaves no usable band")
 
