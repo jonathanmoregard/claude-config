@@ -56,7 +56,13 @@ from PIL import Image, ImageDraw, ImageFilter
 # --- output spec ------------------------------------------------------------
 CW, CH = 1920, 1005          # Facebook event cover, 1.91:1
 AXIS = CW / 2
-UI_TOP = 820.0               # FB title/date/RSVP furniture starts eating here
+UI_TOP = 900.0               # Where the mark's baseline sits. NOT an occlusion
+                             # line — observed 2026-08-31, desktop web does not
+                             # overlap the cover at all and mobile fades the
+                             # bottom out. 900 is the rung that shipped; the old
+                             # 820 was community folklore reserving 185px for
+                             # furniture that is not drawn there. Override per
+                             # photo, and see reference.md before "restoring" 820.
 UI_CLEAR = 24.0              # deliberate air between the mark and that line
 CHIN_MARGIN = 16.0           # a chin this close to the mark's edge counts as
                              # under it; covers the halo's ~11px reach
@@ -200,9 +206,10 @@ class Frame:
         self.face_l = cfg["face_l"] * self.SW
         self.face_r = cfg["face_r"] * self.SW
 
-        # Facebook's furniture line is the shakiest number in this skill: Meta
-        # publishes no spec and 820 is community-derived. Override it to see
-        # what the reservation actually costs, rather than assuming it.
+        # The biggest single lever on mark size, and a taste call rather than a
+        # hard limit: nothing occludes the cover on desktop, and mobile fades
+        # the bottom instead of covering it. Override per photo and render the
+        # ladder — what it costs is visible in one look, never worth assuming.
         self.ui_top = float(cfg.get("ui_top", UI_TOP))
         self.bottom = self.ui_top - UI_CLEAR
 
@@ -596,7 +603,7 @@ def cmd_check(a):
             cx = f.ox(x * f.SW)
             pd.ellipse([cx - 8, cy - 8, cx + 8, cy + 8], outline="#00d0ff", width=4)
     pd.line([(0, f.ui_top), (CW, f.ui_top)], fill="#ff2d55", width=3)
-    pd.text((10, f.ui_top + 6), f"Facebook furniture starts here ({f.ui_top:.0f})",
+    pd.text((10, f.ui_top + 6), f"mark baseline / mobile fade ({f.ui_top:.0f})",
             fill="#ff2d55")
     sq = (CW - CH) // 2
     pd.rectangle([sq, 0, sq + CH - 1, CH - 1], outline="#ffd400", width=4)
@@ -626,8 +633,8 @@ def cmd_check(a):
                      f"{worst[0]}'s chin. Commit to a gap or an overlap, never "
                      f"between.")
     if top + h > f.ui_top:
-        fails.append(f"mark ends at {top + h:.0f}, under Facebook's furniture "
-                     f"({f.ui_top:.0f}).")
+        fails.append(f"mark ends at {top + h:.0f}, past its baseline "
+                     f"({f.ui_top:.0f}) and into the mobile bottom fade.")
     if max(crop_faces, crop_logo) > 1.0:
         fails.append(f"does not survive the mobile square crop "
                      f"({max(crop_faces, crop_logo):.3f} > 1.0).")

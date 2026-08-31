@@ -7,8 +7,8 @@
 | Upload size | **1920 × 1005** (1.91:1) |
 | Guaranteed on mobile | the centred **1005 × 1005** square — mobile crops the **sides** |
 | Feed card | renders ~**560 px** wide; judge legibility there |
-| Facebook furniture | starts eating the image at **y = 820** |
-| Mark's bottom limit | **796** (820 − 24) |
+| Facebook furniture | **soft** — see below. Desktop does not overlap at all; mobile fades the bottom |
+| Mark's bottom limit | a judgement, not a line. `ui_top` **900** shipped (mark bottom 876) |
 | Format | flatten to RGB, hand over a quality-95 JPEG (no chroma subsampling) alongside the PNG |
 
 Meta publishes no formal spec; 1920 × 1005 is the community-validated size.
@@ -61,10 +61,11 @@ With no type field, the photo full-bleed:
 MAXW  = 2 · min(GX, SW − GX)      widest crop still centred on the group
 SBASE = 1920 / MAXW               smallest usable scale; wider stops being centred
 chin_output = (CHIN − HEADS) · SBASE + headroom
-band  = 796 − chin_output         clear room between the lowest chin and the UI
+bottom = ui_top − 24              the mark's baseline (876 at the 900 default)
+band  = bottom − chin_output      clear room between the lowest chin and the UI
 w     = width_frac · 1920         SIZE IS AN INPUT — see below
 h     = w / 1.4041
-top   = 796 − h                   bottom pinned to the furniture line, always
+top   = bottom − h                bottom pinned to that baseline, always
 gap   = (top − chin_output) / h   an OUTCOME, measured and reported
 ```
 
@@ -104,17 +105,38 @@ there is a cliff where an off-axis chin enters the span and the band collapses.
 Iterating to a fixed point oscillates across it and settles below the real
 ceiling — measured, 25.6% against a true 26.9%. `ceiling_width` scans down.
 
-### `ui_top` — the number to distrust
+### `ui_top` — a soft zone, not a line
 
-`ui_top` (default 820) is where Facebook starts drawing over the cover, and it is
-the **shakiest constant in this skill**: Meta publishes no spec and 820 is
-community-derived. It is also the single biggest lever on mark size, because it
+`ui_top` is the single biggest lever on mark size: at the old default of 820 it
 reserves 185px of an 1005px canvas. On `image-EDIT (2).jpg` the ceiling goes
-26.9% → 32.0% → 39.1% as `ui_top` goes 820 → 900 → 1005.
+26.9% → 30.8% → 37.7% as `ui_top` goes 820 → 900 → 1005.
 
-When a client says "there's plenty of empty space at the bottom", that space is
-this reservation. Override `ui_top` and render the diagnostic rather than
-re-explaining the constant — the pair of images settles it in one look.
+**What was actually observed (Jonathan, 2026-08-31, live event pages):**
+
+| surface | what the furniture does to the cover |
+|---|---|
+| desktop web | **nothing** — title/date/RSVP sit in a block *below* the photo, which renders in full |
+| mobile | the image **fades out** toward the bottom — a gradient, not an opaque bar and not a crop |
+
+So there is no occlusion line, and 820 was never one. The bottom of the canvas
+is a *softening* zone: content there loses contrast rather than disappearing.
+That changes the question from "does it clear the furniture" to "can it afford
+to be dimmed", which is a taste call on the specific artwork.
+
+Shipped on that basis: `ui_top = 900`, mark width 30.8%, bottom at 876. The
+knot's lower lobes do reach the fade and that was judged fine — the wordmark,
+which is the top 38.1% of the mark, is nowhere near it. The 37.7% rung was
+rejected for leaving only 24px under the mark, which reads as an accident
+independently of anything Facebook draws.
+
+Do not restore 820 as a default on the strength of a web search. It is
+community-derived folklore, Meta publishes no spec, and the two claims this file
+used to carry — "mobile crops the sides" and "furniture starts at y=820" — were
+never reconciled with each other. Six research runs on this question were
+rejected by the scanner; the observation above cost one look at a phone.
+
+When a client says "there's plenty of empty space at the bottom", render the
+`ui_top` ladder rather than re-explaining the constant — the images settle it.
 
 Headroom must clear the group's topmost point (arms/tools) by ~38 px or it
 grazes the canvas edge. Cropping that point out is the lever that buys a bigger

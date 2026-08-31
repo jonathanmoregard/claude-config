@@ -71,9 +71,9 @@ and `upload-*.png`. Exits non-zero if any variant is flagged.
 |---|---|
 | Mark on the **canvas centre line** | Mobile crops the **sides**; only the centred 1005×1005 square is guaranteed. Off-centre placement is destroyed there. |
 | Photo **full-bleed and whole** | Giving the mark its own coloured field caps it near 18% of canvas width and spends half the canvas. |
-| Mark's bottom sits on **y = 796**, always | The one anchor that is not a taste call. It also aligns every rung of a size ladder on one baseline, so a fan-out varies size and nothing else. |
+| Mark's bottom pinned to **`ui_top` − 24**, always | Not a taste call *given* a `ui_top`. It aligns every rung of a size ladder on one baseline, so a fan-out varies size and nothing else. |
 | Never land within **8% of the mark's height** of the chin | Either way — a clear gap and a committed overlap are both fine, grazing contact is the universal amateur tell. Pick rungs around the dead zone, don't tune into it. |
-| Nothing load-bearing below **y = 820** | Facebook's title/date/RSVP furniture. |
+| Keep the **wordmark** clear of the bottom fade | Mobile fades the bottom of the cover (observed, see below). The knot's lower lobes can afford to be dimmed; "VÄVEN" cannot. |
 | Any softening **follows the artwork's silhouette** | A rectangle, plate, or feathered box reads as a smudge floating in the frame. |
 | Size is an **input**, in % of canvas width | Do not shrink the mark "so it doesn't compete with the faces". Undersizing is the standing complaint. And do not let a gap rule solve the size for you — see below. |
 
@@ -103,16 +103,24 @@ you can point at.
 
 ## When the client says there's empty space at the bottom
 
-They are looking at the **`ui_top` reservation** — 185px of an 1005px canvas that
-Facebook draws its title, date and RSVP button over. It is the biggest lever on
-mark size and the shakiest constant here: Meta publishes no spec, 820 is
-community-derived, and a `fast` web search returns page-cover sizes (820×312,
-851×315) that are not this.
+They are looking at the **`ui_top` reservation**, and they are usually right to.
+It is the biggest lever on mark size — 185px of an 1005px canvas at the old
+default of 820 — and it was never measured. **Observed 2026-08-31 on live event
+pages: desktop web does not overlap the cover at all, and mobile fades the
+bottom out rather than drawing a bar over it.** No occlusion line exists. The
+bottom is a zone where content loses contrast, so the question is whether the
+artwork can afford to be dimmed there, not whether it clears anything.
 
-Do not re-explain the constant. Override `ui_top` and render the diagnostic — on
-`image-EDIT (2).jpg` the ceiling runs 26.9% → 32.0% → 39.1% of canvas width as
-`ui_top` goes 820 → 900 → 1005. Two images settle in one look what a paragraph
-does not.
+Do not re-explain the constant, and do not go looking for a better one — six
+research runs on this were rejected by the scanner, and a `fast` search returns
+page-cover sizes (820×312, 851×315) that are not this. Override `ui_top` and
+render the ladder: on `image-EDIT (2).jpg` the ceiling runs 26.9% → 30.8% →
+37.7% of canvas width as `ui_top` goes 820 → 900 → 1005. Two images settle in
+one look what a paragraph does not.
+
+**Shipped: the 900 rung** — 30.8%, bottom at 876, knot lobes reaching the fade
+and the wordmark well clear. The 37.7% rung was rejected for leaving 24px under
+the mark, which reads as an accident whatever Facebook draws.
 
 ## Re-measure for every photo
 
@@ -153,7 +161,7 @@ silly. Four more approaches are already ruled out with reasons: see
 | Sampling one background colour and running WCAG on it | Per-pixel, then read the 5th percentile. |
 | Treating the logo SVG as wordmark-plus-ornament | One `<path>` is the entire lockup. The `<image>` in that file is an old photo — ignore it. |
 | Centring the mark's visual bounding box | Its true mirror axis is 50.115% across the bbox. Bbox centring is 1.9 px off. |
-| Guessing Facebook's safe margins | 820. |
+| Guessing Facebook's safe margins, or searching for them | Open an event and look. Desktop doesn't overlap; mobile fades the bottom. |
 | Assuming the crop step in the uploader means the file is wrong | It always asks. Leave it centred, pull to full width. |
 
 ## Presenting variants
