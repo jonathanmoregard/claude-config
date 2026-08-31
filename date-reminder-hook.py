@@ -46,6 +46,10 @@ def main():
     config = load_json(CONFIG_FILE, {})
     partner = config.get("partner_name", "your partner")
     idea = suggestion.get("idea", "a date")
+    try:
+        target = int(config.get("dates_per_month", 1))
+    except (TypeError, ValueError):
+        target = 1
 
     from datetime import datetime
     created = suggestion.get("created_at", "")
@@ -57,7 +61,8 @@ def main():
     days_str = f" (pending {days_pending}d)" if days_pending is not None else ""
 
     context = (
-        f"Date reminder: fewer than 2 dates with {partner} are planned in the next 31 days. "
+        f"Date reminder: fewer than {target} date{'s' if target != 1 else ''} with {partner} "
+        f"{'are' if target != 1 else 'is'} planned in the next 31 days. "
         f"Suggested idea: {idea}{days_str}. "
         f"Bring this up at a natural moment — when the user completes a task, starts a new one, "
         f"or there's a lull. Keep it brief and casual, one sentence. "

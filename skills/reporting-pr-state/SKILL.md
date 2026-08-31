@@ -48,9 +48,28 @@ gh pr list --repo <owner>/<repo> --state all \
 
 Treating `UNKNOWN` as "GitHub is being slow" is the specific failure this skill exists to prevent. It is a prompt to query `.state`, never a prompt to retry.
 
+## Scope: only the work's own PRs
+
+**A status report covers the PRs belonging to the work being reported on.** Not every PR open on the machine, not the ones another session is driving, not ones noticed in passing while doing something else.
+
+The Iron Law says query before reporting a PR as open. It does not say report every PR you can find. A sweep that enumerates unrelated work buries the one PR that needs a click under things the reader has to triage — and it silently claims ownership of work another session is mid-flight on.
+
+| Situation | Report it? |
+|---|---|
+| The PR this work produced | Yes — always, with its URL |
+| A PR this work depends on, conflicts with, or is blocked by | Yes, **and say which** in the same breath |
+| A PR another session is driving, noticed via `gh pr list` or a shared state dir | No |
+| An unrelated PR that happens to be time-sensitive | One line, marked as an aside |
+
+Relevance is stated, not implied by listing. If you cannot say in a clause why a PR belongs in this report, it does not.
+
+`gh pr list` across a repo answers "what exists", never "what is mine to report". Scope by the branch the work is on.
+
 ## Report Format
 
 Every PR mentioned in a report carries its **full URL on its own line**. Not the bare number, not `#178`, not a markdown label — the link, so it is one click away.
+
+**Links go at the BOTTOM of the reply.** Not in the opening line, not buried mid-prose. Jonathan scrolls to the end to click, so that is where the clickable thing belongs. Say what happened first, then hand over the link last.
 
 ```
 nixos #178 — MERGED 2026-08-15 21:58 CEST by jonathanmoregard (7d36a8b4)

@@ -5,14 +5,18 @@
     "args": [
       "/home/jonathan/.claude/mcps/safe-bash/server.py"
     ],
-    "env": {}
+    "env": {
+      "DCG_PATH": "/etc/profiles/per-user/jonathan/bin/dcg"
+    }
   },
   "research-agent": {
     "type": "stdio",
     "command": "research-agent-mcp",
     "args": [],
-    "env": {},
-    "timeout": 5400000
+    "env": {
+      "RESEARCH_AGENT_TIMEOUT": "5700"
+    },
+    "timeout": 6000000
   },
   "futuresearch-gate": {
     "type": "stdio",
@@ -43,13 +47,8 @@
   },
   "aggregator": {
     "type": "stdio",
-    "command": "uv",
-    "args": [
-      "run",
-      "--directory",
-      "/home/jonathan/Repos/aggregator",
-      "aggregator-mcp"
-    ],
+    "command": "/etc/profiles/per-user/jonathan/bin/aggregator-mcp",
+    "args": [],
     "env": {}
   },
   "reddit": {

@@ -5,7 +5,8 @@
 
 set -euo pipefail
 
-STATE_DIR="$HOME/.claude/ralph-loop"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ralph-loop-state.sh"
+STATE_DIR="$RALPH_STATE_DIR"
 TARGET="${1:-${CLAUDE_CODE_SESSION_ID:-}}"
 
 shopt -s nullglob

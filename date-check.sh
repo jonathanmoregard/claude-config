@@ -106,14 +106,14 @@ $GCAL_RESULT
 
 The calendar result starts with DATE_COUNT: N where N is the number of upcoming dates with $PARTNER in the next 31 days.
 
-**Case A — DATE_COUNT is 2 or more (or GCAL_ERROR and you want to be safe):**
+**Case A — DATE_COUNT is $DATES_PER_MONTH or more (or GCAL_ERROR and you want to be safe):**
 Enough dates are planned. Clear any pending suggestion and write:
 {
   \"last_checked\": \"$TODAY\",
   \"pending_suggestion\": null
 }
 
-**Case B — DATE_COUNT is 0 or 1, and no pending suggestion exists:**
+**Case B — DATE_COUNT is less than $DATES_PER_MONTH, and no pending suggestion exists:**
 Pick ONE idea from ideas.md that fits the current season ($SEASON).
 Prefer outdoor ideas when the next few days look clear; indoor otherwise. Vary picks over time.
 Write:
@@ -127,7 +127,7 @@ Write:
   }
 }
 
-**Case C — DATE_COUNT is 0 or 1, and a pending suggestion already exists:**
+**Case C — DATE_COUNT is less than $DATES_PER_MONTH, and a pending suggestion already exists:**
 Only update last_checked. Leave pending_suggestion completely unchanged.
 Do NOT touch the todo_created flag — the shell script owns escalation.
 

@@ -1,0 +1,17 @@
+{
+  "_comment": "Landmarks for image-EDIT (1).jpg, as fractions of the source. Re-read these for every new photo; they do not transfer between files even when the dimensions look identical.",
+
+  "faces_centroid": 0.592,
+  "head_span_centre": 0.605,
+
+  "face_l": 0.445,
+  "face_r": 0.765,
+  "heads": 0.265,
+  "top": 0.190,
+  "chin": 0.450,
+
+  "headroom": "auto",
+  "sigma": 8.0,
+  "treatments": ["glow", "pad"],
+  "logo_svg": "vaven-mark.svg"
+}

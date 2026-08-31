@@ -2,13 +2,15 @@
 
 # Ralph Loop Setup (session-bound fork of ralph-loop@claude-plugins-official)
 #
-# Writes state to ~/.claude/ralph-loop/<session_id>.md so the Stop gate binds
-# the session that armed it, regardless of which directory that session is
-# working in, and binds no other session.
+# Writes state to ~/.local/state/claude-ralph-loop/<session_id>.md so the Stop
+# gate binds the session that armed it, regardless of which directory that
+# session is working in, and binds no other session. Never inside a repo: see
+# scripts/ralph-loop-state.sh for why both earlier homes were wrong.
 
 set -euo pipefail
 
-STATE_DIR="$HOME/.claude/ralph-loop"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ralph-loop-state.sh"
+STATE_DIR="$RALPH_STATE_DIR"
 
 PROMPT_PARTS=()
 MAX_ITERATIONS=0
@@ -35,8 +37,9 @@ DESCRIPTION:
   Starts a Ralph Loop bound to THIS session id. The stop hook prevents exit
   and feeds your output back as input until completion or iteration limit.
 
-  State lives at ~/.claude/ralph-loop/<session_id>.md, so the gate follows
-  the session (any cwd, any worktree) and never fires in a sibling session.
+  State lives at ~/.local/state/claude-ralph-loop/<session_id>.md, so the gate
+  follows the session (any cwd, any worktree), never fires in a sibling
+  session, and never lands inside the repo you are working in.
 
   To signal completion, you must output: <promise>YOUR_PHRASE</promise>
 
@@ -49,7 +52,7 @@ STOPPING:
   /cancel-ralph, reaching --max-iterations, or emitting --completion-promise.
 
 MONITORING:
-  head -10 ~/.claude/ralph-loop/$CLAUDE_CODE_SESSION_ID.md
+  head -10 ~/.local/state/claude-ralph-loop/$CLAUDE_CODE_SESSION_ID.md
 HELP_EOF
       exit 0
       ;;

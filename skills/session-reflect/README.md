@@ -524,7 +524,7 @@ only configuration that matters.
 | forks per cwd per 24h | 5 | `IDLE_HANDOFF_AUTOFORK_MAX_PER_CWD_24H` |
 | world moved since the transcript | DENY, incl. non-git | `is_stale_since_transcript` |
 | a live claude process in that cwd | abort, rescanned pre-spawn | `is_live_project` |
-| an armed ralph loop in that cwd | skip | `.claude/ralph-loop.local.md` |
+| an armed ralph loop in that cwd | skip | `ralph_state_for_dir` (matches `armed_in:` under `~/.local/state/claude-ralph-loop/`) |
 | no handoff of ours resolves | skip | `mission_resolve_ours` |
 | the workspace overlaps the control plane | skip, loudly, counted | `candidate_cwd_is_control_plane` |
 | a cwd that cannot round-trip the ledger (control chars) | skip, loudly | cwd extraction |

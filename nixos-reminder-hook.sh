@@ -25,17 +25,20 @@ Pipeline (memorize this; it gates every change):
     ├─ edit flake / module / home file
     ├─ test locally:
     │    nixos-automated-testing skill → e2e gate
-    │      `nix build .#checks.x86_64-linux.dellan-vm`
+    │      `nix build .#checks.x86_64-linux.<lane>` — per-feature
+    │      lanes (vm-base, vm-microvm, vm-desktop, …); list them
+    │      with `nix eval .#checks.x86_64-linux --apply
+    │      builtins.attrNames`. There is no aggregate check.
     │    nixos-agent-testing skill → interactive smoke
     │      `nix run .#feature-vm` + SSH/QMP/screencap
     ├─ git add -A; git commit; git push -u origin feat/<slug>
     │
     ▼
   GitHub Actions on PR (ubuntu-latest, KVM nested-virt):
-    verify-fork-guards, flake-check (eval), build dellan toplevel,
-    vm-minimal (the same .#checks.x86_64-linux.dellan-vm),
-    vm-graphical (path-conditional), classify (risk label),
-    label-gate (merge gate based on risk + reviews)
+    preflight, verify fork-guards, flake check (eval), docs (eval),
+    discover (picks the lanes), build dellan toplevel,
+    vm-minimal (matrix — one job per selected lane),
+    vm-graphical (path-conditional)
     │
     ▼
   Human clicks merge in GitHub UI (gh pr merge is denied at the MCP
@@ -61,7 +64,7 @@ Best practices:
 - Non-systemd / user-launched processes: wrap with `pkgs.writeShellApplication` that reads the secret at exec time, expose on PATH.
 - Prefer declarative modules (modules/nixos/*.nix imported from hosts/<host>/default.nix) over imperative tweaks.
 - BEFORE rebuilding the flake locally for debug, `git add -A` (or `git add <new-file>`) inside the worktree. Flakes evaluate only git-tracked files; new/untracked files are invisible and rebuild fails with `Path '<file>' in the repository "/etc/nixos" is not tracked by Git`. Staging is enough — no commit required.
-- VM e2e tests are the DEFAULT gate before any merge. CI runs them automatically; for local debug invoke the nixos-automated-testing skill. When adding HM units / scripts / timers, also add an assertion in `tests/dellan-vm.nix`. Skip only for hardware-specific config the VM can't model (real touchpad, GPU, LUKS).
+- VM e2e tests are the DEFAULT gate before any merge. CI runs them automatically; for local debug invoke the nixos-automated-testing skill. When adding HM units / scripts / timers, also add an assertion in the matching `tests/<lane>.nix`. Skip only for hardware-specific config the VM can't model (real touchpad, GPU, LUKS).
 - For interactive smoke-testing pre-merge (e.g. "does the actual login screen come up", "does this systemd unit start when I poke it"), invoke the nixos-agent-testing skill — it covers `nix run .#feature-vm` plus the QMP / screencap / sendkey / serial control channels.
 - FHS-assuming binaries: wrap in `buildFHSEnv` or use `pkgs.steam-run`, don't try to recreate /lib paths.
 EOF
