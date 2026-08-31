@@ -22,6 +22,10 @@ This suite covers the five things the relocation can break silently:
     rejected corpus so it does not regenerate what was already turned down;
   * atomic write — a crashed run must never leave a truncated proposal that
     triage reads as evidence.
+  * ledger backfill — the dedup guarantee is only as strong as
+    `.index.jsonl`, and every proposal predating the ledger has to be
+    recorded in it with the SHIPPED sink's own id algorithm, or a drained
+    rejection regenerates the next night under a fresh date prefix.
 
 Everything runs against throwaway fixture trees. Nothing here touches the real
 `~/.claude`, the real sink, or the real permission ledger.
@@ -853,6 +857,392 @@ class TestCutoverScript(FixtureCase):
         self.assertIn(self.fx.sink, out)
         self.assertIn("proposals", out)
 
+
+
+# --------------------------------------------------------------------------
+# 9. Backfilling the dedup ledger for proposals that predate it.
+#
+# The sink refuses any proposal whose content id is already in
+# `.index.jsonl`, at ANY status. That guarantee is only as good as the
+# ledger: the 34 rsi proposals (plus the archived/manual/research corpus)
+# predate the ledger entirely, so until they are recorded a rejected
+# proposal that gets drained and deleted regenerates the next night under a
+# fresh YYYY-MM-DD- prefix, filename dedup misses it because the name
+# differs, and id dedup misses it because the id was never written down.
+#
+# The backfill is therefore only worth anything if its id algorithm is
+# BYTE-IDENTICAL to the shipped sink's. These tests pin that two ways: a
+# textual comparison of the shared functions against the real
+# `rsi-proposal-sink` script, and golden vectors captured by running that
+# binary.
+# --------------------------------------------------------------------------
+BACKFILL_PATH = os.path.join(REPO_ROOT, "scripts", "backfill-proposal-index.py")
+backfill = load_module("backfill_proposal_index", BACKFILL_PATH)
+
+
+# (filename, file text, id) — every id below was produced by running the
+# shipped `rsi-proposal-sink` binary, not by this repo's code. They cover
+# the normalization corners that can silently move an id: frontmatter
+# dropped whole, the YYYY-MM-DD- prefix stripped from the title, markdown
+# punctuation and whitespace runs collapsed, non-ASCII prose, a body that
+# is empty once the frontmatter goes.
+GOLDEN_IDS = [
+    ("2026-08-30-plain-pending.md",
+     "---\nstatus: pending\ndate: 2026-08-30\n---\n\n## Problem\n"
+     "The nightly reviewer regenerates rejected proposals.\n",
+     "3e90c126b9f96dbb"),
+    ("markdown-noise.md",
+     "---\nstatus: implemented\n---\n\n## Problem\n\n"
+     "  **Bold**, _em_ --- and\ta tab;   runs   of   spaces!\n\n- list item\n",
+     "c637ca22ec3da975"),
+    ("no-frontmatter.md",
+     "# A proposal with no frontmatter at all\n\nBody text here.\n",
+     "3be715d46b280ed3"),
+    ("2026-07-31-unicode-prose.md",
+     "---\nstatus: pending\n---\n\n## Problem\n"
+     "Att göra rätt — café naïve åäö.\n",
+     "9012c9a8bd243bd8"),
+    ("2026-08-02-empty-body.md",
+     "---\nstatus: pending\n---\n",
+     "698444024e4ce260"),
+]
+
+
+def shipped_sink():
+    """Path to the real `rsi-proposal-sink`, or None.
+
+    It is a nix `writePython3Bin`, so on a deployed box it is on PATH and
+    otherwise it is a built store path. Located, never reimplemented — the
+    whole point of these tests is to compare against the thing that ships.
+    """
+    return backfill.find_shipped_sink()
+
+
+class BackfillCase(unittest.TestCase):
+    """A throwaway sink root with category subdirs and an empty ledger."""
+
+    CATEGORIES = ("rsi", "archived", "manual", "research", "permissions",
+                  "clv2", "from-research", "router")
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="proposals-backfill-test-")
+        self.sink = os.path.join(self._tmp, "claude-proposals")
+        for name in self.CATEGORIES:
+            os.makedirs(os.path.join(self.sink, name))
+        self.ledger = os.path.join(self.sink, ".index.jsonl")
+        with open(self.ledger, "w", encoding="utf-8"):
+            pass
+
+    def tearDown(self):
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def put(self, category, name, text):
+        path = os.path.join(self.sink, category, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return path
+
+    def run_backfill(self, *args, expect=0):
+        proc = subprocess.run(
+            [sys.executable, BACKFILL_PATH, "--sink", self.sink, *args],
+            capture_output=True, text=True)
+        if proc.returncode != expect:
+            self.fail("backfill exited %d (want %d)\nSTDOUT:\n%s\nSTDERR:\n%s"
+                      % (proc.returncode, expect, proc.stdout, proc.stderr))
+        return proc
+
+    def rows(self):
+        out = []
+        for ln in read(self.ledger).splitlines():
+            if not ln.strip():
+                continue
+            try:
+                out.append(json.loads(ln))
+            except ValueError:
+                continue
+        return out
+
+
+class TestBackfillIdAgreement(unittest.TestCase):
+    def test_golden_ids_match_the_shipped_sink(self):
+        for fname, text, want in GOLDEN_IDS:
+            self.assertEqual(backfill.content_id(fname, text), want,
+                             "content id for %s drifted from the shipped "
+                             "sink's; a backfill whose hashes differ by one "
+                             "whitespace rule protects nothing" % fname)
+
+    def test_algorithm_is_textually_identical_to_the_shipped_sink(self):
+        path = shipped_sink()
+        if not path:
+            self.skipTest("rsi-proposal-sink is not built or on PATH here")
+        diffs = backfill.algorithm_drift(read(path))
+        self.assertEqual(diffs, [], "the id algorithm has drifted from "
+                                    "%s: %s" % (path, diffs))
+
+    def test_shipped_sink_agrees_on_freshly_generated_ids(self):
+        """The end-to-end proof: feed proposal bodies through the real
+        binary and compare the ids IT writes with the ones the backfill
+        computes."""
+        path = shipped_sink()
+        if not path:
+            self.skipTest("rsi-proposal-sink is not built or on PATH here")
+        root = tempfile.mkdtemp(prefix="shipped-sink-")
+        try:
+            blocks = "".join("===PROPOSAL: %s===\n%s===END PROPOSAL===\n"
+                             % (n, t) for n, t, _ in GOLDEN_IDS)
+            proc = subprocess.run([path, os.path.join(root, "rsi")],
+                                  input=blocks, capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            written = {}
+            with open(os.path.join(root, ".index.jsonl"),
+                      encoding="utf-8") as fh:
+                for ln in fh:
+                    row = json.loads(ln)
+                    written[row["file"]] = row["id"]
+            self.assertTrue(written, "the shipped sink wrote no ledger rows")
+            for fname, text, _ in GOLDEN_IDS:
+                self.assertEqual(written.get(fname),
+                                 backfill.content_id(fname, text),
+                                 "id disagreement on %s" % fname)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+
+class TestBackfillLedger(BackfillCase):
+    PENDING = ("---\nstatus: pending\ndate: 2026-08-02\n"
+               "source_sessions:\n  - abc-123\n  - def-456\n---\n\n"
+               "## Problem\nSessions drift.\n")
+    IMPLEMENTED = ("---\nstatus: implemented\ndate: 2026-04-12\n---\n\n"
+                   "## Problem\nMeta work ratio.\n")
+    REJECTED = ("---\nstatus: rejected\ndate: 2026-08-01\n"
+                "rejection_reason: \"not a real problem\"\n---\n\n"
+                "## Problem\nThe scanner reinstall loop is manual.\n")
+
+    def seed(self):
+        self.put("rsi", "2026-08-02-drift.md", self.PENDING)
+        self.put("rsi", "2026-04-12-meta.md", self.IMPLEMENTED)
+        self.put("rsi", "2026-08-01-scanner.md", self.REJECTED)
+
+    def test_records_every_status_including_rejected(self):
+        self.seed()
+        self.run_backfill()
+        by_file = {r["file"]: r for r in self.rows()}
+        self.assertEqual(
+            {f: by_file[f]["status"] for f in by_file},
+            {"2026-08-02-drift.md": "pending",
+             "2026-04-12-meta.md": "implemented",
+             "2026-08-01-scanner.md": "rejected"})
+
+    def test_records_the_same_fields_the_live_sink_records(self):
+        self.seed()
+        self.run_backfill()
+        row = {r["file"]: r for r in self.rows()}["2026-08-02-drift.md"]
+        for key in ("id", "file", "date", "status", "session", "evidence"):
+            self.assertIn(key, row, "the ledger row must carry the same "
+                                    "fields the live sink writes")
+        self.assertEqual(row["date"], "2026-08-02")
+        self.assertEqual(row["session"], "abc-123")
+        self.assertEqual(row["evidence"], "Sessions drift.")
+        self.assertEqual(row["id"],
+                         backfill.content_id("2026-08-02-drift.md",
+                                             self.PENDING))
+
+    def test_unrecoverable_fields_are_explicitly_null_not_invented(self):
+        self.put("archived", "em-dash-gate.md", "# Proposal: em-dash gate\n")
+        self.run_backfill()
+        row = self.rows()[0]
+        self.assertIsNone(row["status"], "a proposal with no frontmatter has "
+                                         "no status; recording a made-up one "
+                                         "is worse than recording none")
+        self.assertIsNone(row["session"])
+        self.assertIsNone(row["date"], "no frontmatter date and no date "
+                                       "prefix in the filename means the date "
+                                       "is unrecoverable — today's date would "
+                                       "be a fabrication")
+
+    def test_date_falls_back_to_the_filename_prefix(self):
+        self.put("rsi", "2026-04-27-chat-history-backup.md", "# backup\n")
+        self.run_backfill()
+        self.assertEqual(self.rows()[0]["date"], "2026-04-27")
+
+    def test_is_idempotent(self):
+        self.seed()
+        first = self.run_backfill()
+        self.assertIn("added 3", first.stdout)
+        before = read(self.ledger)
+        second = self.run_backfill()
+        self.assertIn("added 0", second.stdout)
+        self.assertIn("already present 3", second.stdout)
+        self.assertEqual(read(self.ledger), before,
+                         "a second run must not append a single byte")
+
+    def test_reconciles_against_existing_ledger_rows_by_id(self):
+        self.seed()
+        cid = backfill.content_id("2026-08-01-scanner.md", self.REJECTED)
+        # A pre-existing row written under a DIFFERENT filename: matching on
+        # the id is the whole point, filenames move between nights.
+        with open(self.ledger, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"id": cid, "file": "2026-01-01-other.md",
+                                 "status": "rejected"}) + "\n")
+        proc = self.run_backfill()
+        ids = [r["id"] for r in self.rows()]
+        self.assertEqual(ids.count(cid), 1, "the id was already in the "
+                                            "ledger; a second row for it is a "
+                                            "duplicate")
+        self.assertIn("already present 1", proc.stdout)
+
+    def test_skips_the_permissions_category_with_a_stated_reason(self):
+        self.put("permissions", "2026-08-24-askuserquestion.md",
+                 "---\nstatus: pending\n---\n\nbody\n")
+        proc = self.run_backfill()
+        self.assertEqual(self.rows(), [],
+                         "permission proposals have their own writer and "
+                         "their own lifecycle — a recurring permission "
+                         "pattern is a fresh signal, not a duplicate")
+        self.assertIn("permissions", proc.stdout)
+        self.assertRegex(proc.stdout, r"skipped .*permissions")
+
+    def test_walks_every_indexed_category(self):
+        self.put("rsi", "2026-08-02-a.md", "---\nstatus: pending\n---\n\nA\n")
+        self.put("archived", "2026-07-07-b.md", "# B\n")
+        self.put("manual", "2026-08-09-c.md", "---\nstatus: pending\n---\n\nC\n")
+        self.put("research", "2026-07-30-d.md", "---\nstatus: open\n---\n\nD\n")
+        self.run_backfill()
+        self.assertEqual(len(self.rows()), 4)
+
+    def test_prints_a_summary_of_scanned_added_present_and_skipped(self):
+        self.seed()
+        out = self.run_backfill().stdout
+        for token in ("scanned", "added", "already present", "skipped"):
+            self.assertIn(token, out, "summary must report %r" % token)
+
+    def test_dry_run_touches_nothing(self):
+        self.seed()
+        before = read(self.ledger)
+        proc = self.run_backfill("--dry-run")
+        self.assertEqual(read(self.ledger), before)
+        self.assertIn("added 3", proc.stdout)
+
+    def test_never_modifies_a_proposal_file(self):
+        self.seed()
+        def snapshot():
+            out = {}
+            for base, _dirs, files in os.walk(self.sink):
+                for f in files:
+                    if f.endswith(".md"):
+                        p = os.path.join(base, f)
+                        out[p] = read(p)
+            return out
+        before = snapshot()
+        self.run_backfill()
+        self.assertEqual(snapshot(), before,
+                         "the backfill adds a ledger; it never edits history")
+
+    def test_publishes_the_ledger_atomically(self):
+        """A crash during publish must leave the previous ledger intact and
+        no half-written one in its place."""
+        self.seed()
+        self.run_backfill()
+        good = read(self.ledger)
+        self.put("rsi", "2026-08-03-extra.md",
+                 "---\nstatus: pending\n---\n\n## Problem\nExtra.\n")
+        # In-process, so the crash is injected without a test-only seam in
+        # the script itself.
+        real_replace = os.replace
+
+        def boom(src, dst):
+            raise OSError("simulated crash during publish")
+
+        os.replace = boom
+        old_stdout, sys.stdout = sys.stdout, io.StringIO()
+        try:
+            with self.assertRaises(OSError):
+                backfill.main(["--sink", self.sink])
+        finally:
+            os.replace = real_replace
+            sys.stdout = old_stdout
+        self.assertEqual(read(self.ledger), good,
+                         "the ledger must still be the pre-crash one, whole")
+        leftovers = [f for f in os.listdir(self.sink)
+                     if f.startswith(".index.jsonl.tmp")]
+        self.assertEqual(leftovers, [], "the tmp file must not be left behind")
+
+    def test_tolerates_an_unparseable_ledger_line(self):
+        self.seed()
+        with open(self.ledger, "w", encoding="utf-8") as fh:
+            fh.write("{not json\n")
+        proc = self.run_backfill()
+        self.assertIn("{not json", read(self.ledger),
+                      "a line the backfill cannot parse is preserved, never "
+                      "silently dropped")
+        self.assertEqual(len([r for r in self.rows()]), 3)
+        self.assertIn("unparseable", proc.stdout)
+
+
+class TestRegeneratedRejectedProposalIsSkipped(BackfillCase):
+    """A10, end to end and against the binary that actually ships.
+
+    A rejected proposal is drained and its file deleted. The reviewer
+    re-derives the same observation the next night under a fresh
+    YYYY-MM-DD- prefix. Filename dedup cannot see it (the name differs) and
+    the file is gone, so the backfilled ledger row is the ONLY thing left
+    that can stop it.
+    """
+
+    BODY = ("---\nstatus: rejected\ndate: 2026-08-01\n"
+            "rejection_reason: \"investment phase, not drift\"\n---\n\n"
+            "## Problem\nThe research agent hits its cap with no fallback.\n")
+
+    def test_deleted_rejected_proposal_still_collides_by_id(self):
+        path = shipped_sink()
+        if not path:
+            self.skipTest("rsi-proposal-sink is not built or on PATH here")
+        original = "2026-08-01-research-agent-cap-hit-no-fallback.md"
+        self.put("rsi", original, self.BODY)
+        self.run_backfill()
+        self.assertEqual(len(self.rows()), 1)
+
+        # Drained: the human rejected it and the file was removed.
+        os.unlink(os.path.join(self.sink, "rsi", original))
+
+        # Tonight's run re-derives it under a new date prefix, and the
+        # frontmatter the model emits is `pending`, not `rejected`.
+        regenerated = "2026-09-01-research-agent-cap-hit-no-fallback.md"
+        body = self.BODY.replace("status: rejected", "status: pending") \
+                        .replace("date: 2026-08-01", "date: 2026-09-01")
+        proc = subprocess.run(
+            [path, os.path.join(self.sink, "rsi")],
+            input="===PROPOSAL: %s===\n%s===END PROPOSAL===\n"
+                  % (regenerated, body),
+            capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("skipped duplicate", proc.stdout,
+                      "the regenerated proposal must collide with the "
+                      "backfilled ledger row:\n%s" % proc.stdout)
+        self.assertFalse(
+            os.path.exists(os.path.join(self.sink, "rsi", regenerated)),
+            "a rejected proposal came back — this is exactly the failure "
+            "the backfill exists to prevent")
+        self.assertEqual(len(self.rows()), 1,
+                         "the skip must not add a ledger row either")
+
+    def test_without_the_backfill_the_proposal_does_come_back(self):
+        """The control. Without a ledger row nothing stops it — this is what
+        the sink looked like before the backfill, and it is why an empty
+        `.index.jsonl` made the guarantee hollow."""
+        path = shipped_sink()
+        if not path:
+            self.skipTest("rsi-proposal-sink is not built or on PATH here")
+        regenerated = "2026-09-01-research-agent-cap-hit-no-fallback.md"
+        proc = subprocess.run(
+            [path, os.path.join(self.sink, "rsi")],
+            input="===PROPOSAL: %s===\n%s===END PROPOSAL===\n"
+                  % (regenerated, self.BODY),
+            capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertTrue(
+            os.path.exists(os.path.join(self.sink, "rsi", regenerated)),
+            "with an empty ledger the sink has nothing to dedup against")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
