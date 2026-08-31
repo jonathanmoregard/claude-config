@@ -319,9 +319,25 @@ class TestGateSpineResolution(FixtureCase):
                          SINK_LITERAL + "/gate-config.json")
 
     def test_gate_lock_stays_outside_the_spine(self):
-        # Deliberate: push-proposals.sh commits the sink wholesale, so a lock
-        # inside it would land in the pushed history every run.
-        self.assertEqual(gate.GATE_LOCK_PATH, "~/.claude/logs/gate.lock")
+        # Two independent properties, asserted as properties rather than as one
+        # literal path. Pinning the literal is what made this test break when
+        # the lock moved out of ~/.claude/logs into the state dir: the path was
+        # incidental, the guarantees are not.
+        #
+        #   1. Not in the spine — push-proposals.sh commits the sink wholesale,
+        #      so a lock inside it would land in the pushed history every run.
+        #   2. Not in ~/.claude either — that is the live config repo, and
+        #      runtime state there dirties the checkout. It survived under
+        #      logs/ only because a `*.lock` catch-all happened to cover it.
+        lock = os.path.expanduser(gate.GATE_LOCK_PATH)
+        self.assertFalse(
+            gate.contained(lock, os.path.expanduser(SINK_LITERAL)),
+            f"gate lock {lock} is inside the spine; it would be committed",
+        )
+        self.assertFalse(
+            gate.contained(lock, os.path.expanduser("~/.claude")),
+            f"gate lock {lock} is inside the live config repo",
+        )
 
     def test_sink_path_survives_require_under_home(self):
         # ~/.local/state/... is under $HOME, so the config guard must accept
