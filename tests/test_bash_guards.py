@@ -1064,10 +1064,20 @@ check(
     str(updated)[:160],
 )
 
-# A string-shaped tool_response must survive as a string.
+# A string-shaped tool_response must be PROMOTED to the object shape, not handed
+# back as a string. This assertion used to read "stays a string", which pinned a
+# fail-open: the CLI applies updatedToolOutput only if it satisfies the Bash
+# outputSchema, and that schema is an object with a REQUIRED `interrupted`. A bare
+# string fails the check and is discarded silently — so the redaction was dropped
+# and the model received the ORIGINAL, un-redacted output. Measured live on 2.1.251:
+# bare string and {stdout,stderr} both lose; {stdout,stderr,interrupted} applies.
 parsed, updated, raw = bash_out("cat /tmp/x", f"KEY={_s}")
-check("string-shaped response stays a string", isinstance(updated, str), type(updated).__name__)
-check("string-shaped response is redacted", isinstance(updated, str) and _s not in updated,
+check("string-shaped response is promoted to a conforming object",
+      isinstance(updated, dict) and updated.get("interrupted") is False
+      and updated.get("stderr") == "",
+      f"{type(updated).__name__}: {str(updated)[:120]}")
+check("string-shaped response is redacted",
+      isinstance(updated, dict) and _s not in (updated.get("stdout") or ""),
       str(updated)[:120])
 
 # Shape preservation: nothing else in the result object may be disturbed.

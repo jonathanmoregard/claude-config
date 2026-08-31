@@ -89,6 +89,124 @@ WITHHELD_MARKER = "the output guard is BROKEN"
 
 
 # ----------------------------------------------------------------------
+# THE SHAPE THE CLI WILL ACTUALLY APPLY
+#
+# `updatedToolOutput` is not handed to the model as written. The CLI parses
+# it against the TOOL'S OWN output schema first, and on a mismatch it throws
+# the rewrite away and uses the ORIGINAL result (2.1.251 bundle, offset
+# 182502178, in the main tool-use path):
+#
+#     let rr = e.outputSchema?.safeParse(Yn),
+#         Er = (po) => { n(`PostToolUse hook returned updatedToolOutput that
+#                          does not match ${e.name}'s output shape: ${po}`,
+#                          {level:"error"}),
+#                        Yn = _n.data,          // <- the ORIGINAL, uninspected
+#                        Dr = !0; … };
+#     if (rr && !rr.success) Er(rr.error.message);
+#
+# For a redaction guard that is fail-OPEN: the rewrite is dropped and the
+# unredacted bytes reach the model anyway. An error is surfaced, which makes
+# it loud, but loud is not closed.
+#
+# MEASURED end-to-end against the shipped 2.1.251 CLI driving the native
+# Bash tool, with a PostToolUse hook replacing the output of
+# `echo ORIGINALCANARY9184` with a fixed marker:
+#
+#   emitted updatedToolOutput                        the model received
+#   ----------------------------------------------   ---------------------
+#   "REWRITTEN_BY_HOOK_5521"          (bare string)  ORIGINALCANARY9184
+#   {"stdout":…, "stderr":""}                        ORIGINALCANARY9184
+#   {"stdout":…, "stderr":"", "interrupted":false}   REWRITTEN_BY_HOOK_5521
+#   {…, "interrupted":false, "someFutureField":"x"}  REWRITTEN_BY_HOOK_5521
+#
+# Two things fall out of that table and both are load-bearing here:
+#   * `interrupted` is REQUIRED. An object carrying only stdout and stderr
+#     is rejected exactly like a bare string.
+#   * unknown keys are tolerated, so preserving a field this guard has never
+#     heard of does not cost the rewrite.
+#
+# The gate string is byte-identical in 2.1.247 and 2.1.248, so this is not a
+# 2.1.251 regression — a non-conforming rewrite has never been applied.
+#
+# The map below is transcribed from the CLI's own Bash `outputSchema` in the
+# 2.1.251 bundle (offset 183851760): required = no `.optional()`.
+# ----------------------------------------------------------------------
+REQUIRED_RESULT_FIELDS = {"stdout": str, "stderr": str, "interrupted": bool}
+
+OPTIONAL_RESULT_FIELDS = {
+    "rawOutputPath": str,
+    "isImage": bool,
+    "backgroundTaskId": str,
+    "backgroundedByUser": bool,
+    "backgroundedByTurnAbort": bool,
+    "backgroundedToDeliverMessage": bool,
+    "timedOutAfterMs": (int, float),
+    "backgroundCwdHint": str,
+    "backgroundEndsWithFinalResponse": bool,
+    "dangerouslyDisableSandbox": bool,
+    "returnCodeInterpretation": str,
+    "noOutputExpected": bool,
+    "structuredContent": list,
+    "persistedOutputPath": str,
+    "persistedOutputSize": (int, float),
+    "staleReadFileStateHint": str,
+    "ghRateLimitHint": str,
+    "gitOperation": dict,
+}
+
+
+def _typed(value, expected) -> bool:
+    # zod tells a boolean from a number; Python's isinstance does not.
+    if expected is bool:
+        return isinstance(value, bool)
+    if isinstance(value, bool):
+        return False
+    return isinstance(value, expected)
+
+
+def schema_rejection(updated) -> str | None:
+    """Why the CLI would REJECT this rewrite, or ``None`` if it applies.
+
+    A rejected rewrite is not a no-op: the CLI falls back to the ORIGINAL,
+    un-inspected tool result. So "the guard emitted something" is never the
+    question worth asking — "would the emitted value survive the consumer"
+    is. That distinction is the entire bug this section exists for.
+    """
+    if not isinstance(updated, dict):
+        return (
+            f"a bare {type(updated).__name__} — the Bash outputSchema is an "
+            "object, so this is discarded and the original output is used"
+        )
+    for key, typ in REQUIRED_RESULT_FIELDS.items():
+        if key not in updated:
+            return f"required field {key!r} is missing"
+        if not _typed(updated[key], typ):
+            got = type(updated[key]).__name__
+            return f"required field {key!r} is a {got}, not {typ.__name__}"
+    for key, typ in OPTIONAL_RESULT_FIELDS.items():
+        if key in updated and updated[key] is not None and not _typed(updated[key], typ):
+            got = type(updated[key]).__name__
+            want = typ if isinstance(typ, type) else typ[0]
+            return f"field {key!r} is a {got}, not {getattr(want, '__name__', want)}"
+    return None
+
+
+def check_applied(label: str, updated) -> None:
+    """The emitted rewrite must be a value the CLI will actually apply."""
+    why = schema_rejection(updated)
+    check(
+        f"{label} -> the rewrite is a value the CLI will APPLY",
+        why is None,
+        f"{why}; the original un-inspected output would reach the model instead",
+    )
+
+
+# Every rewrite this suite makes the guard emit, so no path can quietly grow
+# a shape the consumer rejects. Filled by run_hook.
+EMITTED: list[tuple[str, object]] = []
+
+
+# ----------------------------------------------------------------------
 # Harness
 # ----------------------------------------------------------------------
 def run_hook(
@@ -117,6 +235,13 @@ def run_hook(
             parsed = json.loads(body)
         except json.JSONDecodeError:
             parsed = None
+    if isinstance(parsed, dict):
+        hso = parsed.get("hookSpecificOutput")
+        if isinstance(hso, dict) and "updatedToolOutput" in hso:
+            EMITTED.append(
+                (str(payload if raw_stdin is None else raw_stdin)[:120],
+                 hso["updatedToolOutput"])
+            )
     return proc.returncode, parsed, proc.stdout, proc.stderr
 
 
@@ -185,6 +310,128 @@ def check_withheld(label: str, parsed, updated, raw: str = "") -> None:
 
 
 # ----------------------------------------------------------------------
+# THE FAIL-OPEN. Every emit site must survive the consumer.
+#
+# The guard had one job on these paths — fail CLOSED — and the one branch
+# whose entire purpose is withholding emitted a bare string, which the CLI
+# discards in favour of the original, un-inspected output. The original work
+# proved `updatedToolOutput` EXISTS by reading the schema and never
+# exercised what the consumer does with a bad value; a test that asserts
+# only "a withhold happened" is the test that missed it, so every check here
+# asserts the emitted value would actually be APPLIED.
+# ----------------------------------------------------------------------
+section("bash-output-guard: every rewrite must be one the CLI applies")
+
+# The predicate itself, against the two values measured end-to-end above.
+check(
+    "schema_rejection rejects a bare string, as the CLI did",
+    schema_rejection("just some text") is not None,
+    str(schema_rejection("just some text")),
+)
+check(
+    "schema_rejection rejects stdout+stderr with no `interrupted`, as the CLI did",
+    schema_rejection({"stdout": "x", "stderr": ""}) is not None,
+    str(schema_rejection({"stdout": "x", "stderr": ""})),
+)
+check(
+    "schema_rejection accepts the shape the CLI applied",
+    schema_rejection({"stdout": "x", "stderr": "", "interrupted": False}) is None,
+)
+check(
+    "schema_rejection tolerates an unknown key, as the CLI did",
+    schema_rejection(
+        {"stdout": "x", "stderr": "", "interrupted": False, "someFutureField": "x"}
+    )
+    is None,
+)
+
+# _withhold's `_SHAPE is None` branch. Reached whenever the guard fails
+# before it has read an object-shaped tool_response — a string result, a
+# list result, unparseable stdin — which is most of the fail-closed ladder.
+_s = secret("Q")
+parsed, updated, raw = bash_out(
+    "cat /run/agenix/some-key",
+    f"KEY={_s}",
+    env_extra={"BASH_GUARD_CONFIG": os.path.join(SCRATCH, "no-such-config.json")},
+)
+check_withheld("withhold with no object shape to copy", parsed, updated)
+check_applied("withhold with no object shape to copy", updated)
+check(
+    "a withhold the CLI rejects would hand back the secret it withheld",
+    _s not in raw,
+    "secret leaked in the withheld replacement",
+)
+
+# The same branch by a different road: stdin that is JSON but not an object.
+rc, parsed, raw, err = run_hook(GUARD, None, raw_stdin="[1, 2, 3]")
+updated = (parsed or {}).get("hookSpecificOutput", {}).get("updatedToolOutput")
+check_applied("withhold after non-object stdin", updated)
+
+# ... and a third: a result nested deeper than the guard walks. _SHAPE is an
+# object here, but it holds no scalars at all, so the replacement is built
+# from nothing and `interrupted` has to come from somewhere.
+_deep_probe: object = f"KEY={secret('R')}"
+for _ in range(14):
+    _deep_probe = {"inner": _deep_probe}
+parsed, updated, raw = bash_out("cat /tmp/x", _deep_probe)
+check_applied("withhold from a shape carrying no scalars", updated)
+
+# A shape that DOES carry `interrupted` must keep the real value, not a
+# manufactured False: the model reads it to decide whether the command ran.
+parsed, updated, raw = bash_out(
+    "cat /tmp/x",
+    response_obj(f"KEY={secret('S')}", interrupted=True),
+    env_extra={"BASH_GUARD_CONFIG": os.path.join(SCRATCH, "no-such-config.json")},
+)
+check_applied("withhold from a shape that carries interrupted", updated)
+check(
+    "a withhold preserves the real `interrupted` rather than inventing one",
+    isinstance(updated, dict) and updated.get("interrupted") is True,
+    str(updated)[:200],
+)
+
+# The string-response emit site. safe-bash returned one composed string, so
+# a string-shaped result is a shape this guard accepts — but the Bash tool's
+# schema is an OBJECT, so handing the string back unchanged is a rewrite the
+# CLI drops, and the unredacted string goes to the model.
+_s = secret("T")
+parsed, updated, raw = bash_out("cat /run/agenix/k", f"KEY={_s}")
+check_applied("a redacted string-shaped result", updated)
+check(
+    "a string-shaped result really is redacted, not merely emitted",
+    _s not in raw,
+    raw[:200],
+)
+
+# Same site, ingress: the wrapper is worth nothing if the wrapped value is
+# thrown away and the raw fetch is shown instead.
+parsed, updated, raw = bash_out("curl https://example.invalid/x", "remote body\n")
+check_applied("a wrapped string-shaped ingress result", updated)
+check(
+    "the string-shaped ingress result is wrapped",
+    isinstance(stdout_of(updated), str)
+    and "<untrusted_external_content" in stdout_of(updated),
+    str(stdout_of(updated))[:200],
+)
+
+# The list-response emit site. A list cannot satisfy an object schema at
+# all, so the scrubbed list is discarded and the list WITH the secret is
+# what the model reads.
+_s = secret("U")
+parsed, updated, raw = bash_out("cat /tmp/x", [{"type": "text", "text": f"KEY={_s}"}])
+check_applied("a redacted list-shaped result", updated)
+check(
+    "a secret in a list-shaped result does not survive",
+    _s not in raw,
+    raw[:200],
+)
+
+# The ordinary path, for completeness: the common case must conform too.
+parsed, updated, raw = bash_out("cat /tmp/x", response_obj(f"KEY={secret('V')}"))
+check_applied("the ordinary object rewrite", updated)
+
+
+# ----------------------------------------------------------------------
 # F10. What a Bash tool result can actually contain.
 #
 # Derived by scanning every `toolUseResult` with a `stdout` key across all
@@ -205,8 +452,21 @@ def check_withheld(label: str, parsed, updated, raw: str = "") -> None:
 # ----------------------------------------------------------------------
 section("bash-output-guard: the Bash result field inventory (F10)")
 
-FIELDS_SEEN_STR = {"stdout", "stderr", "backgroundTaskId", "returnCodeInterpretation",
-                   "persistedOutputPath"}
+# A transcript scan can only see fields a past result happened to carry, and
+# a field the harness sets on a rare condition never shows up in one. Six of
+# these are invisible to the scan above and every one of them was
+# unclassified, which withheld the output of ordinary ingress commands —
+# `ghRateLimitHint` rides along with `gh api`, which is ingress by
+# definition. The set below is the CLI's own Bash `outputSchema` instead
+# (2.1.251 bundle, offset 183851760), so a field can no longer hide behind
+# never having been logged.
+FIELDS_SEEN_STR = {
+    "stdout", "stderr", "backgroundTaskId", "returnCodeInterpretation",
+    "persistedOutputPath",
+    # string-typed, in the schema, absent from 10,027 sampled results
+    "rawOutputPath", "backgroundCwdHint", "staleReadFileStateHint",
+    "ghRateLimitHint",
+}
 
 classified = set(getattr(guard, "OUTPUT_FIELDS", ())) | set(
     getattr(guard, "METADATA_STRING_FIELDS", ())
@@ -215,6 +475,35 @@ check(
     "every string-typed field the Bash tool really returns is classified",
     FIELDS_SEEN_STR <= classified,
     f"unclassified: {sorted(FIELDS_SEEN_STR - classified)}",
+)
+
+# The non-string ones the walk still has to have an answer for.
+check(
+    "gitOperation is classified as never reaching the model",
+    "gitOperation" in getattr(guard, "NON_MODEL_FACING_FIELDS", frozenset()),
+)
+check(
+    "structuredContent is classified as content-REPLACING, not content-adjacent",
+    getattr(guard, "CONTENT_REPLACING_FIELD", None) == "structuredContent",
+)
+
+# The guard and this file each transcribe the CLI's Bash outputSchema. They
+# are independent copies on purpose — the test must be able to fail the
+# guard — so they are compared here rather than shared, and a drift in
+# either one is loud.
+check(
+    "the guard's required-field table matches this file's transcription",
+    getattr(guard, "REQUIRED_RESULT_FIELDS", None) == REQUIRED_RESULT_FIELDS,
+    str(getattr(guard, "REQUIRED_RESULT_FIELDS", None)),
+)
+check(
+    "the guard's optional-field table matches this file's transcription",
+    getattr(guard, "OPTIONAL_RESULT_FIELDS", None) == OPTIONAL_RESULT_FIELDS,
+    "differs: "
+    + str(
+        set(getattr(guard, "OPTIONAL_RESULT_FIELDS", {}).items())
+        ^ set(OPTIONAL_RESULT_FIELDS.items())
+    )[:200],
 )
 
 def check_scrubbed(label: str, updated, raw: str, value: str) -> None:
@@ -425,6 +714,394 @@ check(
     "a persisted path outside the tool-results tree has its pointer withheld",
     isinstance(updated, dict) and "persistedOutputPath" not in updated,
     str(updated)[:220],
+)
+
+
+# ----------------------------------------------------------------------
+# F13. The fields the walk had never heard of.
+#
+# Every one of these is in the CLI's Bash outputSchema in 2.1.247, 2.1.248
+# AND 2.1.251 (`backgroundedToDeliverMessage` excepted — that one really is
+# new in .251), so none of it is a fresh regression; the guard simply never
+# knew the names. Unclassified, each forced a WITHHOLD the moment the
+# command was untrusted ingress, and `ghRateLimitHint` arrives on `gh`
+# calls, which are ingress by definition. Routine output was being held back.
+#
+# Each disposition below is measured against the builder, not inferred from
+# the field name: a hint that interpolated the command's own bytes would
+# need the ingress tag, not a metadata classification.
+# ----------------------------------------------------------------------
+section("bash-output-guard: result fields the walk had never heard of (F13)")
+
+INGRESS_CMD = "gh api /rate_limit"
+
+# The three model-facing hints. All harness prose (builders read at 2.1.251
+# offsets 181248504 and 183866300); none carries command bytes.
+HARNESS_HINTS = [
+    (
+        "ghRateLimitHint",
+        "<system-reminder>GitHub API rate limit exceeded (5,000/hr shared across "
+        "all tools and agents).</system-reminder>",
+    ),
+    (
+        "staleReadFileStateHint",
+        "[This command modified 2 files you've previously read: a.py, b.py. "
+        "Call Read before editing.]",
+    ),
+    (
+        "backgroundCwdHint",
+        "Session cwd remains /home/u/repo; directory changes made by the "
+        "backgrounded command do not apply to subsequent commands.",
+    ),
+]
+
+for _field, _value in HARNESS_HINTS:
+    parsed, updated, raw = bash_out(
+        INGRESS_CMD, response_obj("remote body\n", **{_field: _value})
+    )
+    _body = stdout_of(updated)
+    check(
+        f"an ingress result carrying {_field} is NOT withheld",
+        isinstance(_body, str) and WITHHELD_MARKER not in _body,
+        str(_body)[:200],
+    )
+    check(
+        f"... and its output is still wrapped as untrusted ingress ({_field})",
+        isinstance(_body, str) and 'source="bash:gh-api"' in _body,
+        str(_body)[:200],
+    )
+    check(
+        f"... and {_field} survives the rewrite",
+        isinstance(updated, dict) and updated.get(_field) == _value,
+        str(updated)[:240],
+    )
+
+# The harness hints are still redacted — everything is — even though they
+# need no tag.
+_s = secret("W")
+parsed, updated, raw = bash_out(
+    "cat /tmp/x", response_obj("clean\n", ghRateLimitHint=f"note {_s}")
+)
+check_scrubbed("a secret planted in a harness hint field", updated, raw, _s)
+
+# gitOperation: a structured object the Bash mapper never renders. Nothing
+# there can reach the model, so it needs no tag — but it must not withhold.
+_git_op = {"kind": "push", "branch": "feat/x", "remote": "origin"}
+parsed, updated, raw = bash_out(
+    INGRESS_CMD, response_obj("remote body\n", gitOperation=_git_op)
+)
+_body = stdout_of(updated)
+check(
+    "an ingress result carrying gitOperation is NOT withheld",
+    isinstance(_body, str) and WITHHELD_MARKER not in _body,
+    str(_body)[:200],
+)
+check(
+    "... and gitOperation survives the rewrite intact",
+    isinstance(updated, dict) and updated.get("gitOperation") == _git_op,
+    str(updated)[:240],
+)
+_s = secret("X")
+parsed, updated, raw = bash_out(
+    "git push", response_obj("clean\n", gitOperation={"kind": "push", "note": _s})
+)
+check_scrubbed("a secret nested inside gitOperation", updated, raw, _s)
+
+# backgroundedToDeliverMessage: genuinely new in 2.1.251 (0 occurrences in
+# the 2.1.247 and 2.1.248 bundles, 17 in .251). A boolean the harness wrote:
+# no bytes, nothing to tag, nothing to redact. What it needs is to survive
+# both a rewrite and a withhold, and to never be mistaken for text.
+parsed, updated, raw = bash_out(
+    INGRESS_CMD,
+    response_obj("remote body\n", backgroundTaskId="bg_1",
+                 backgroundedToDeliverMessage=True),
+)
+check(
+    "an ingress result carrying backgroundedToDeliverMessage is NOT withheld",
+    isinstance(stdout_of(updated), str) and WITHHELD_MARKER not in stdout_of(updated),
+    str(stdout_of(updated))[:200],
+)
+check(
+    "... and the flag survives the rewrite",
+    isinstance(updated, dict) and updated.get("backgroundedToDeliverMessage") is True,
+    str(updated)[:240],
+)
+parsed, updated, raw = bash_out(
+    "cat /tmp/x",
+    response_obj(f"KEY={secret('Y')}", backgroundedToDeliverMessage=True),
+    env_extra={"BASH_GUARD_CONFIG": os.path.join(SCRATCH, "no-such-config.json")},
+)
+check(
+    "... and it survives a withhold, which keeps scalars so the result renders",
+    isinstance(updated, dict) and updated.get("backgroundedToDeliverMessage") is True,
+    str(updated)[:240],
+)
+
+# rawOutputPath. In the schema and in the harness's own path-remap table
+# (`Bash:{responseMembers:["rawOutputPath","persistedOutputPath"]}`), and
+# scrubbed by NOBODY: the guard redacted the path STRING and handed the
+# model a pointer to a file full of unredacted bytes.
+_s = secret("Z")
+_raw_p = persisted("raw-output.txt", f"header\nKEY={_s}\ntail\n")
+parsed, updated, raw = bash_out(
+    "cat /run/agenix/some-key",
+    # The in-band body carries the secret too, so a rewrite is forced and the
+    # pointer's survival is actually observable. rawOutputPath has no size
+    # field to re-state, so a clean stdout would mean no rewrite at all and
+    # the assertion below would have nothing to look at.
+    response_obj(f"header\nKEY={_s}\n", rawOutputPath=_raw_p),
+    env_extra=PERSIST_ENV,
+)
+with open(_raw_p, encoding="utf-8") as fh:
+    _raw_after = fh.read()
+check(
+    "the file behind rawOutputPath is redacted in place",
+    _s not in _raw_after,
+    _raw_after[:160],
+)
+check(
+    "... and keeps a redaction marker",
+    "[REDACTED:anthropic-api:" in _raw_after,
+    _raw_after[:160],
+)
+check(
+    "a scrubbed rawOutputPath keeps its pointer",
+    isinstance(updated, dict) and updated.get("rawOutputPath") == _raw_p,
+    str(updated)[:240],
+)
+
+_raw_outside = os.path.join(SCRATCH, "raw-not-a-tool-result.txt")
+with open(_raw_outside, "w", encoding="utf-8") as fh:
+    fh.write(f"KEY={secret('a')}\n")
+_raw_before = open(_raw_outside, encoding="utf-8").read()
+parsed, updated, raw = bash_out(
+    "cat /tmp/x",
+    response_obj("head\n", rawOutputPath=_raw_outside),
+    env_extra=PERSIST_ENV,
+)
+check(
+    "a rawOutputPath outside the CLI tool-results tree is not written to",
+    open(_raw_outside, encoding="utf-8").read() == _raw_before,
+    "the guard rewrote a file the harness did not own",
+)
+check(
+    "... and has its pointer withheld",
+    isinstance(updated, dict) and "rawOutputPath" not in updated,
+    str(updated)[:240],
+)
+check(
+    "... and the dropped pointer is explained, naming the field",
+    isinstance(stdout_of(updated), str) and "rawOutputPath" in stdout_of(updated),
+    str(stdout_of(updated))[:280],
+)
+
+# Both pointer fields at once: neither may shadow the other's notice.
+_p_both = persisted("both-persisted.txt", f"KEY={secret('b')}\n")
+_r_both = os.path.join(SCRATCH, "both-raw-outside.txt")
+with open(_r_both, "w", encoding="utf-8") as fh:
+    fh.write("no secret here\n")
+parsed, updated, raw = bash_out(
+    "cat /tmp/x",
+    response_obj("head\n", persistedOutputPath=_p_both,
+                 persistedOutputSize=os.path.getsize(_p_both),
+                 rawOutputPath=_r_both),
+    env_extra=PERSIST_ENV,
+)
+check(
+    "a scrubbable persistedOutputPath keeps its pointer while rawOutputPath drops",
+    isinstance(updated, dict)
+    and updated.get("persistedOutputPath") == _p_both
+    and "rawOutputPath" not in updated,
+    str(updated)[:280],
+)
+
+# structuredContent. Not a redaction hole — `_redact_tree` walks it like
+# everything else — but a TAGGING hole: the Bash mapper's first line is
+# `if (O && O.length > 0) return {..., content: O}`, so it REPLACES the
+# whole result and any wrapper on stdout is never rendered. Teaching the
+# walk to tag stdout cannot close that, so it stays fail-closed, with a
+# reason that says which of the two problems it actually is.
+_s = secret("c")
+parsed, updated, raw = bash_out(
+    "cat /tmp/x",
+    response_obj("clean\n", structuredContent=[{"type": "text", "text": f"KEY={_s}"}]),
+)
+check_scrubbed("a secret inside structuredContent", updated, raw, _s)
+check(
+    "a non-ingress result carrying structuredContent is not withheld",
+    isinstance(stdout_of(updated), str) and WITHHELD_MARKER not in stdout_of(updated),
+    str(stdout_of(updated))[:200],
+)
+
+parsed, updated, raw = bash_out(
+    INGRESS_CMD,
+    response_obj("remote body\n",
+                 structuredContent=[{"type": "text", "text": "remote prose"}]),
+)
+check_withheld("ingress result carrying structuredContent", parsed, updated)
+check(
+    "the structuredContent withhold says it REPLACES the result, not that it is untagged",
+    isinstance(stdout_of(updated), str)
+    and "structuredContent" in stdout_of(updated)
+    and "REPLACES" in stdout_of(updated),
+    str(stdout_of(updated))[:320],
+)
+parsed, updated, raw = bash_out(
+    INGRESS_CMD, response_obj("remote body\n", structuredContent=[])
+)
+check(
+    "an EMPTY structuredContent replaces nothing, so it does not withhold",
+    isinstance(stdout_of(updated), str) and WITHHELD_MARKER not in stdout_of(updated),
+    str(stdout_of(updated))[:200],
+)
+
+# The whole set at once, on the command that actually triggers them: a
+# routine `gh api` call whose result carries every field the walk learned.
+parsed, updated, raw = bash_out(
+    INGRESS_CMD,
+    response_obj(
+        "remote body\n",
+        ghRateLimitHint="<system-reminder>rate limited</system-reminder>",
+        staleReadFileStateHint="[This command modified 1 file…]",
+        backgroundCwdHint="Session cwd remains /x;…",
+        gitOperation={"kind": "pr_view"},
+        backgroundedToDeliverMessage=False,
+        noOutputExpected=False,
+    ),
+)
+check(
+    "a routine gh api result carrying every learned field is not withheld",
+    isinstance(stdout_of(updated), str) and WITHHELD_MARKER not in stdout_of(updated),
+    str(stdout_of(updated))[:240],
+)
+check(
+    "... and is still wrapped as untrusted ingress",
+    isinstance(stdout_of(updated), str)
+    and 'source="bash:gh-api"' in stdout_of(updated),
+    str(stdout_of(updated))[:240],
+)
+
+
+# ----------------------------------------------------------------------
+# F14. Redaction, proven end to end.
+#
+# The pattern set was compared against safe-bash's and found byte-identical,
+# nine patterns each side — and that is a statement about two lists, not
+# about a pipeline. Nothing had ever put a secret through THIS hook and
+# looked at what came out. Every pattern here is planted in the real stdout
+# of a real command and asserted gone from what the guard emits, driven off
+# the guard's own pattern list so a tenth pattern cannot arrive untested.
+#
+# No fixture is a real credential; each is assembled by concatenation at
+# runtime so the file is not a standing gitleaks hit.
+# ----------------------------------------------------------------------
+section("bash-output-guard: every redaction pattern fires end-to-end (F14)")
+
+E2E_SECRETS = {
+    "anthropic-api": "sk-" + "ant-" + "api03-" + ("A" * 95),
+    "openai-project": "sk-" + "proj-" + ("B" * 48),
+    "openai-legacy": "sk-" + ("C" * 48),
+    "github-token": "ghp" + "_" + ("D" * 36),
+    "github-pat": "github" + "_pat_" + ("E" * 82),
+    "slack-token": "xoxb" + "-" + "1234567890-0987654321-abcdefghij",
+    "aws-access": "AKIA" + "IOSFODNN7EXAMPLE",
+    "jwt": (
+        "eyJ" + "hbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+        + "." + "eyJ" + "zdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkEifQ"
+        + "." + "dBjftJeZ4CVP" + "mB92K27uhbUJU1p1r-wW1gFWFOEjXk"
+    ),
+    "tavily-key": "tvly" + "-" + ("F" * 28),
+}
+
+check(
+    "every configured redaction pattern has an end-to-end fixture",
+    {label for label, _ in guard._SECRET_PATTERNS} == set(E2E_SECRETS),
+    "untested: "
+    + str(sorted({label for label, _ in guard._SECRET_PATTERNS} - set(E2E_SECRETS))),
+)
+
+E2E_DIR = os.path.join(SCRATCH, "e2e-secrets")
+os.makedirs(E2E_DIR, exist_ok=True)
+
+
+def real_command_output(label: str, value: str) -> tuple[str, str]:
+    """Actually run a command whose output carries the secret.
+
+    Hand-built strings would prove the regex compiles. Running `cat` over a
+    file on disk and taking its real stdout proves the value survives the
+    round trip a real command makes — encoding, trailing newline and all.
+    """
+    path = os.path.join(E2E_DIR, f"{label}.env")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(
+            f"# fixture for {label}\n"
+            f"export {label.upper().replace('-', '_')}={value}\n"
+            "OTHER=not-a-secret\n"
+        )
+    proc = subprocess.run(["cat", path], capture_output=True, text=True, timeout=30)
+    return proc.stdout, proc.stderr
+
+
+_missed: list[str] = []
+for _label, _value in sorted(E2E_SECRETS.items()):
+    _out, _err = real_command_output(_label, _value)
+    check(
+        f"the {_label} fixture really is in the command's own stdout",
+        _value in _out,
+        "the fixture never reached the pipeline, so the next check is vacuous",
+    )
+    parsed, updated, raw = bash_out(f"cat {E2E_DIR}/{_label}.env",
+                                    response_obj(_out, stderr=_err))
+    _body = stdout_of(updated)
+    check(
+        f"end-to-end: a real {_label} secret does not survive the guard",
+        updated is not None and _value not in raw,
+        "PATTERN DID NOT FIRE IN THE REAL PIPELINE" if updated is None
+        else str(_body)[:160],
+    )
+    check(
+        f"end-to-end: the {_label} redaction is marked, not silently dropped",
+        isinstance(_body, str) and f"[REDACTED:{_label}:" in _body,
+        str(_body)[:200],
+    )
+    if updated is None or _value in raw:
+        _missed.append(_label)
+
+check(
+    "no configured pattern fails to fire in the real pipeline",
+    not _missed,
+    f"patterns present in the set but inert end-to-end: {_missed}",
+)
+
+# The same nine, through the overflow file rather than in band: the pointer
+# path has only ever been exercised with one pattern.
+for _label, _value in sorted(E2E_SECRETS.items()):
+    _p = persisted(f"e2e-{_label}.txt", f"line one\nKEY={_value}\nline three\n")
+    parsed, updated, raw = bash_out(
+        "cat /run/agenix/k",
+        response_obj("line one\n", persistedOutputPath=_p,
+                     persistedOutputSize=os.path.getsize(_p)),
+        env_extra=PERSIST_ENV,
+    )
+    check(
+        f"end-to-end: a real {_label} secret in the overflow file is scrubbed",
+        _value not in open(_p, encoding="utf-8").read(),
+        open(_p, encoding="utf-8").read()[:160],
+    )
+
+# An ingress command is the one case where the body is rewritten twice
+# (redact, then wrap). The redaction must not be undone by the wrapper.
+_s = E2E_SECRETS["anthropic-api"]
+parsed, updated, raw = bash_out(
+    "curl https://example.invalid/x", response_obj(f"token: {_s}\n")
+)
+check(
+    "a secret in wrapped ingress output is redacted inside the wrapper",
+    _s not in raw
+    and isinstance(stdout_of(updated), str)
+    and "<untrusted_external_content" in stdout_of(updated)
+    and "[REDACTED:anthropic-api:" in stdout_of(updated),
+    str(stdout_of(updated))[:240],
 )
 
 
@@ -967,6 +1644,23 @@ rc, parsed, raw, err = run_hook(
 )
 check("a non-Bash tool result is left completely alone", raw.strip() == "", raw[:160])
 check("a non-Bash tool result exits clean", rc == 0, f"rc={rc}")
+
+
+# ----------------------------------------------------------------------
+# The same rule over the WHOLE suite, not just the cases someone thought to
+# list. Every rewrite any test above made the guard emit is replayed against
+# the consumer's schema, so a future path that grows a shape the CLI rejects
+# fails here even if nobody wrote a case for it.
+# ----------------------------------------------------------------------
+section("bash-output-guard: no emitted rewrite anywhere is one the CLI drops")
+
+_bad = [(src, why) for src, val in EMITTED
+        if (why := schema_rejection(val)) is not None]
+check(
+    f"all {len(EMITTED)} rewrites emitted by this suite would be applied",
+    not _bad,
+    "; ".join(f"{src[:70]} :: {why}" for src, why in _bad[:6]),
+)
 
 
 # ----------------------------------------------------------------------

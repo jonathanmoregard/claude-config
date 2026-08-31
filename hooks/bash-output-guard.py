@@ -22,28 +22,39 @@ Two layers:
      ``_segment_ingress`` for why those differ and what it costs when they
      are confused.
 
-Shape is preserved. The Bash tool result is an object, so the rewrite
-hands back an object with the same keys, and a string-shaped result stays
-a string.
+EMITTING A REWRITE IS NOT LANDING ONE
+-------------------------------------
+``updatedToolOutput`` is validated against the TOOL'S OWN output schema
+before it is used, and a value that does not conform is thrown away in
+favour of the ORIGINAL, un-inspected result. For a redactor that is the
+worst outcome there is: every redaction goes with the rejected rewrite.
+So the invariant this file cannot lose is that NOTHING LEAVES HERE THAT
+THE CLI WOULD REFUSE — see ``_schema_violation`` for the bundle offsets
+and the end-to-end measurement, and ``_emit_rewrite`` for the choke point.
+
+Shape is therefore NOT preserved for its own sake. The Bash result is an
+object, the Bash output schema requires an object, and so every rewrite
+this guard emits is an object — including the ones built from a string- or
+list-shaped result, and including the withheld-output notice.
 
 WHAT A BASH TOOL RESULT CAN CONTAIN
 -----------------------------------
-Enumerated by scanning every ``toolUseResult`` carrying a ``stdout`` key
-across all 9,486 transcripts under ``~/.claude/projects`` — 10,027 real
-Bash results on CLI 2.1.222. Not from the schema docstring, and not from
-memory::
+First enumerated by scanning every ``toolUseResult`` carrying a ``stdout``
+key across all transcripts under ``~/.claude/projects`` — 10,027 real Bash
+results. That scan is a floor, not a census: it can only see fields a past
+result happened to carry, and a field the harness sets on a rare condition
+never appears in it. Six such fields were missing, every one of them in the
+2.1.247, 2.1.248 AND 2.1.251 schemas, and each forced a WITHHOLD as soon as
+the command was untrusted ingress — ``ghRateLimitHint`` rides along with
+``gh``, which is ingress by definition, so routine output was held back.
 
-    stdout                    str   10027   command output
-    stderr                    str   10027   command output
-    interrupted               bool  10027
-    isImage                   bool  10027
-    noOutputExpected          bool  10027
-    backgroundTaskId          str     295   harness id
-    returnCodeInterpretation  str     135   harness prose, e.g. "No matches found"
-    assistantAutoBackgrounded bool    107
-    persistedOutputPath       str      76   FILE holding the untruncated output
-    persistedOutputSize       int      76
-    dangerouslyDisableSandbox bool      68
+The field list is now read out of the CLI's own Bash ``outputSchema``
+(2.1.251 bundle, offset 183851760) and transcribed into
+``REQUIRED_RESULT_FIELDS`` / ``OPTIONAL_RESULT_FIELDS``, which serve double
+duty as the conformance check above. ``OUTPUT_FIELDS``,
+``METADATA_STRING_FIELDS``, ``NON_MODEL_FACING_FIELDS``,
+``CONTENT_REPLACING_FIELD`` and ``OUTPUT_POINTER_FIELDS`` carry the
+disposition of each, with the measurement that decided it.
 
 The first cut of this guard inspected ``stdout`` and ``stderr`` only.
 safe-bash redacted one composed string, so every byte it returned passed
@@ -53,12 +64,13 @@ context window. So:
 
   * every string anywhere in the result is redacted, recursively, whatever
     field it arrives in and whether or not this file has heard of it;
-  * ``persistedOutputPath`` names a file holding the FULL, untruncated
-    output — the bytes truncation removed from ``stdout``. It is redacted
-    in place. Where it cannot be (unreadable, past the scan limit, outside
-    the harness's own tool-results tree) the pointer is withheld, because
-    handing the model a path to bytes this guard could not inspect is the
-    same leak with one extra step;
+  * ``persistedOutputPath`` and ``rawOutputPath`` name FILES rather than
+    bytes — the untruncated output, and the raw output of a host-served
+    call. Both are redacted in place. Where that cannot be done
+    (unreadable, past the scan limit, outside the harness's own
+    tool-results tree) the pointer is withheld, because handing the model a
+    path to bytes this guard could not inspect is the same leak with one
+    extra step;
   * a result nested deeper than ``MAX_RESULT_DEPTH`` is a result this guard
     did not fully inspect, so it is withheld rather than passed on.
 
@@ -83,6 +95,15 @@ guard's own deadline, and any unhandled exception all withhold.
 That is deliberately blunt. A redactor that crashes and lets a live key
 through is the exact incident this file exists to prevent, and a blanked
 output is loud, recoverable, and re-runnable.
+
+A withhold only counts if the CLI applies it. It used to emit a BARE
+STRING whenever it had not yet read an object-shaped response — the
+watchdog firing during ``sys.stdin.read()``, a stdin read error, an
+unparseable payload, a string- or list-shaped result — and a bare string is
+refused, which restores the original un-inspected output. The one branch
+whose whole job was failing closed was the one that failed open, and it had
+been that way since it was written: the gate is byte-identical in 2.1.247
+and 2.1.248. ``_withhold`` now builds a conforming object every time.
 
 The same harness-timeout trap applies as in bash-guard.py: a harness-level
 timeout cancels the hook and DISCARDS its output, so no rewrite happens at
@@ -156,8 +177,83 @@ MAX_NESTED_SHELL_DEPTH = 3
 # but they need no ingress tag. A string field in neither set is output
 # this guard does not know how to tag.
 OUTPUT_FIELDS = ("stdout", "stderr")
+
+# The last three arrived with the transcript scan's blind spot: it counted
+# what 10,027 PAST results happened to carry, and a field only set on a rare
+# condition never showed up. Read out of the CLI's own Bash `outputSchema`
+# instead (2.1.251 bundle, offset 183851760), and each one's BUILDER read
+# too, because "harness prose" has to be verified, not assumed — a hint that
+# interpolated the command's own bytes would need the ingress tag:
+#
+#   ghRateLimitHint        a CONSTANT string. `qtt()` at offset 181248504
+#                          returns one fixed <system-reminder> about the
+#                          5,000/hr GitHub limit; nothing from the command
+#                          is interpolated. It fires on ordinary `gh` calls,
+#                          which are ingress, so leaving it unclassified
+#                          withheld routine `gh api` output.
+#   staleReadFileStateHint `[This command modified N files you've previously
+#                          read: <paths>. Call Read before editing.]` —
+#                          harness prose over the harness's own
+#                          readFileState, not command output.
+#   backgroundCwdHint      `Session cwd remains <cwd>; directory changes made
+#                          by the backgrounded command do not apply…` —
+#                          harness prose over the harness's own cwd.
+#
+# rawOutputPath is a pointer, not prose; see OUTPUT_POINTER_FIELDS.
 METADATA_STRING_FIELDS = frozenset(
-    {"backgroundTaskId", "returnCodeInterpretation", "persistedOutputPath"}
+    {
+        "backgroundTaskId",
+        "returnCodeInterpretation",
+        "persistedOutputPath",
+        "rawOutputPath",
+        "ghRateLimitHint",
+        "staleReadFileStateHint",
+        "backgroundCwdHint",
+    }
+)
+
+# Fields the harness fills for its own UI and never shows the model, so
+# there is nothing there for an ingress tag to protect. `gitOperation` is
+# not even destructured by the Bash tool's
+# `mapToolResultToToolResultBlockParam` (2.1.251, offset 183860436), and its
+# own schema note says "Client-facing — lets clients render git activity
+# without re-parsing stdout; not surfaced to the model". It is still
+# redacted: everything is.
+NON_MODEL_FACING_FIELDS = frozenset({"gitOperation"})
+
+# `structuredContent` does not sit beside stdout. It REPLACES the entire
+# tool result the model reads — the first line of the same mapper is
+#
+#     if (O && O.length > 0) return {tool_use_id: V, type: "tool_result",
+#                                    content: O};
+#
+# so stdout, stderr and any <untrusted_external_content> wrapper this guard
+# put on them are never rendered at all. Its text IS redacted (`_redact_tree`
+# walks the whole result), so it is not a redaction hole — it is a TAGGING
+# hole, and tagging stdout cannot close it. The Bash tool's own result
+# builder (offset 183867600) never sets the field, so no real command hits
+# this; if that changes, the withhold below says so out loud.
+CONTENT_REPLACING_FIELD = "structuredContent"
+
+# Result fields that hand over a PATH to bytes instead of the bytes. Each
+# names a file that has to be redacted in place or refused, because a
+# pointer to output nobody inspected is the same leak with one extra step.
+#
+#   persistedOutputPath  the harness's overflow file, paired with
+#                        persistedOutputSize, which is re-stated after a
+#                        rewrite changes the file's length.
+#   rawOutputPath        "Path to raw output file for large MCP tool
+#                        outputs", in the Bash outputSchema and in the
+#                        harness's own path-remap table, which lists it as a
+#                        Bash response member:
+#                        `Bash:{responseMembers:["rawOutputPath",
+#                        "persistedOutputPath"]}` (offset 195313780). The
+#                        local result builder never sets it; a host-served
+#                        call can. It had NO handling of any kind — the file
+#                        it points at was scrubbed by nobody.
+OUTPUT_POINTER_FIELDS = (
+    ("persistedOutputPath", "persistedOutputSize"),
+    ("rawOutputPath", None),
 )
 
 # A real Bash result is flat. Anything deeper is a shape this guard was not
@@ -207,6 +303,149 @@ def _emit(updated) -> None:
         pass
 
 
+# ----------------------------------------------------------------------
+# THE SHAPE THE CONSUMER WILL ACTUALLY APPLY
+# ----------------------------------------------------------------------
+# Emitting a rewrite is not the same as landing one. The CLI parses
+# ``updatedToolOutput`` against the TOOL'S OWN output schema and, on a
+# mismatch, uses the ORIGINAL result instead (2.1.251 bundle, offset
+# 182502178, main tool-use path)::
+#
+#     let rr = e.outputSchema?.safeParse(Yn),
+#         Er = (po) => { n(`PostToolUse hook returned updatedToolOutput that
+#                          does not match ${e.name}'s output shape: ${po}`,
+#                          {level:"error"}),
+#                        Yn = _n.data,        // <- the ORIGINAL, uninspected
+#                        … };
+#     if (rr && !rr.success) Er(rr.error.message);
+#
+# For a guard that exists to redact, a rejected rewrite is the worst
+# possible outcome: every redaction is dropped and the raw bytes go to the
+# model. An error is surfaced with it, so it is loud — but loud is not
+# closed. Measured end-to-end against the shipped 2.1.251 CLI driving the
+# native Bash tool, a hook replacing the output of `echo ORIGINALCANARY9184`
+# with a fixed marker::
+#
+#   emitted updatedToolOutput                        the model received
+#   ----------------------------------------------   ---------------------
+#   "REWRITTEN_BY_HOOK_5521"          (bare string)  ORIGINALCANARY9184
+#   {"stdout":…, "stderr":""}                        ORIGINALCANARY9184
+#   {"stdout":…, "stderr":"", "interrupted":false}   REWRITTEN_BY_HOOK_5521
+#   {…, "interrupted":false, "someFutureField":"x"}  REWRITTEN_BY_HOOK_5521
+#
+# So ``interrupted`` is REQUIRED — stdout and stderr alone are rejected just
+# like a bare string — and unknown keys are tolerated, which is what lets
+# this guard preserve fields it has never heard of. The gate is
+# byte-identical in 2.1.247 and 2.1.248: a non-conforming rewrite has never
+# been applied, so this was never a 2.1.251 regression.
+#
+# Transcribed from the CLI's Bash ``outputSchema`` (offset 183851760);
+# required means the field carries no ``.optional()`` there.
+REQUIRED_RESULT_FIELDS = {"stdout": str, "stderr": str, "interrupted": bool}
+
+OPTIONAL_RESULT_FIELDS = {
+    "rawOutputPath": str,
+    "isImage": bool,
+    "backgroundTaskId": str,
+    "backgroundedByUser": bool,
+    "backgroundedByTurnAbort": bool,
+    # New in 2.1.251 (absent from the 2.1.247 and 2.1.248 bundles): the
+    # command was moved to the background so a queued message could reach
+    # the model. A boolean the harness wrote — no bytes, nothing to tag,
+    # nothing to redact — so it needs no handling beyond being preserved
+    # across a rewrite and known to be well-typed here.
+    "backgroundedToDeliverMessage": bool,
+    "timedOutAfterMs": (int, float),
+    "backgroundCwdHint": str,
+    "backgroundEndsWithFinalResponse": bool,
+    "dangerouslyDisableSandbox": bool,
+    "returnCodeInterpretation": str,
+    "noOutputExpected": bool,
+    "structuredContent": list,
+    "persistedOutputPath": str,
+    "persistedOutputSize": (int, float),
+    "staleReadFileStateHint": str,
+    "ghRateLimitHint": str,
+    "gitOperation": dict,
+}
+
+
+def _typed(value, expected) -> bool:
+    # zod tells a boolean from a number; Python's isinstance does not, so
+    # `True` would sail through an int check and be rejected downstream.
+    if expected is bool:
+        return isinstance(value, bool)
+    if isinstance(value, bool):
+        return False
+    return isinstance(value, expected)
+
+
+def _schema_violation(updated) -> str | None:
+    """Why the CLI would REFUSE this rewrite, or ``None`` if it applies."""
+    if not isinstance(updated, dict):
+        return (
+            f"it is a bare {type(updated).__name__} and the Bash output schema "
+            "is an object"
+        )
+    for key, typ in REQUIRED_RESULT_FIELDS.items():
+        if key not in updated:
+            return f"the required field {key!r} is missing"
+        if not _typed(updated[key], typ):
+            return (
+                f"the required field {key!r} is a {type(updated[key]).__name__}, "
+                f"not {typ.__name__}"
+            )
+    for key, typ in OPTIONAL_RESULT_FIELDS.items():
+        if key in updated and not _typed(updated[key], typ):
+            want = typ if isinstance(typ, type) else typ[0]
+            return (
+                f"the field {key!r} is a {type(updated[key]).__name__}, not "
+                f"{getattr(want, '__name__', want)}"
+            )
+    return None
+
+
+def _minimal_result(text: str, interrupted: bool = False) -> dict:
+    """The smallest object the Bash output schema accepts."""
+    return {"stdout": text, "stderr": "", "interrupted": bool(interrupted)}
+
+
+def _drop_null_optionals(result: dict) -> dict:
+    """A JSON ``null`` is not ``undefined``, and zod's ``.optional()`` takes
+    only the second. The harness never emits one — ``JSON.stringify`` drops
+    an ``undefined`` field rather than nulling it — but a null arriving in a
+    known optional field would make the whole rewrite non-conforming, and
+    removing the key is exactly what the absent field already meant.
+    """
+    return {
+        k: v
+        for k, v in result.items()
+        if not (v is None and k in OPTIONAL_RESULT_FIELDS)
+    }
+
+
+def _emit_rewrite(updated) -> None:
+    """Emit a rewrite, or withhold if the consumer would refuse it.
+
+    The one invariant this file cannot afford to lose: nothing leaves the
+    guard that the CLI would drop, because dropping the rewrite restores the
+    original un-inspected output. A replacement that does not conform is
+    therefore a guard fault, and the guard's answer to its own faults is to
+    withhold — which builds a conforming object by construction.
+    """
+    if isinstance(updated, dict):
+        updated = _drop_null_optionals(updated)
+    why = _schema_violation(updated)
+    if why is not None:
+        _withhold(
+            "the guard built a replacement the CLI would refuse to apply "
+            f"({why}). A refused rewrite is not a no-op: the CLI falls back to "
+            "the ORIGINAL, un-inspected output, so every redaction would be "
+            "dropped with it"
+        )
+    _emit(updated)
+
+
 # Shape of the last response we managed to read, so a withhold can hand back
 # something the model renders the same way as a real result. Set as early as
 # parsing allows; ``None`` means we never got that far.
@@ -220,24 +459,43 @@ def _withhold(detail: str) -> None:
     just ``stdout``/``stderr``: a withhold that copies the rest of the
     result verbatim hands back the very bytes it is withholding. Scalars
     (``interrupted``, ``isImage``, ...) are kept so the result still
-    renders. ``persistedOutputPath`` goes with the strings, so the model is
-    not left a path to output nobody inspected.
+    renders. The pointer fields go with the strings, so the model is not
+    left a path to output nobody inspected.
+
+    THE REPLACEMENT IS BUILT TO CONFORM, ALWAYS. This branch used to emit a
+    bare string whenever ``_SHAPE`` was ``None`` — every fail-closed path
+    reached before an object-shaped response had been read: unparseable
+    stdin, a missing or broken config, a string- or list-shaped result. The
+    CLI refuses a bare string and shows the ORIGINAL output instead, so the
+    one code path whose entire job is to fail closed was the one that failed
+    open. See ``_schema_violation`` for the measurement. A shape carrying no
+    usable scalars is another road to the same place: ``interrupted`` is
+    required, and copying zero scalars leaves it absent.
 
     ``os._exit`` skips interpreter shutdown on purpose — this is also the
     watchdog's exit path.
     """
     text = _withheld_text(detail)
+    replacement: dict = {}
     if isinstance(_SHAPE, dict):
+        sizes = {size for _, size in OUTPUT_POINTER_FIELDS if size}
         replacement = {
             k: v
             for k, v in _SHAPE.items()
-            if not isinstance(v, (str, dict, list)) and k != "persistedOutputSize"
+            if v is not None
+            and not isinstance(v, (str, dict, list))
+            and k not in sizes
         }
-        replacement["stdout"] = text
-        replacement["stderr"] = ""
-        _emit(replacement)
-    else:
-        _emit(text)
+    replacement["stdout"] = text
+    replacement["stderr"] = ""
+    if not isinstance(replacement.get("interrupted"), bool):
+        replacement["interrupted"] = False
+    if _schema_violation(replacement) is not None:
+        # The shape we copied from is itself something the CLI would refuse.
+        # Hand back the smallest result it does accept: a withhold that gets
+        # dropped is a withhold that showed the output anyway.
+        replacement = _minimal_result(text, replacement["interrupted"])
+    _emit(replacement)
     os._exit(0)
 
 
@@ -821,18 +1079,26 @@ def main() -> int:
     label = _match_untrusted_ingress(command, config) if command else None
 
     if isinstance(response, str):
+        # Not the shape the Bash tool returns, but a shape this guard used to
+        # preserve: safe-bash returned one composed string, so handing a
+        # string back felt like symmetry. It is not. The Bash output schema
+        # is an OBJECT, so a string rewrite is refused and the unredacted
+        # original is shown instead. The redaction only survives as a result
+        # object, so that is what goes back.
         new_body = _redact_secrets(response)
         if label:
             new_body = _wrap(new_body, label, command, reminder=True)
         _disarm_watchdog()
         if new_body != response:
-            _emit(new_body)
+            _emit_rewrite(_minimal_result(new_body))
         return 0
 
     if isinstance(response, list):
-        # Not the shape the Bash tool returns. Redact it anyway — a leak is
-        # unrecoverable — but there is no field to hang an ingress tag on,
-        # so untrusted content here would reach the model unmarked.
+        # Not the shape the Bash tool returns, and — unlike a string — not a
+        # shape that can be handed back at all: a list cannot satisfy an
+        # object schema, so a redacted copy is refused and the ORIGINAL list,
+        # secrets and all, is what the model reads. Redaction cannot be
+        # DELIVERED here, so finding something to redact is itself the fault.
         scrubbed = _redact_tree(response)
         if label:
             _withhold(
@@ -840,9 +1106,15 @@ def main() -> int:
                 f"the command is untrusted ingress ({label}). Its body would have "
                 "reached the model without an <untrusted_external_content> marker"
             )
-        _disarm_watchdog()
         if scrubbed != response:
-            _emit(scrubbed)
+            _withhold(
+                "the result arrived as a list and carried a secret-shaped value. "
+                "The Bash output schema is an object, so a redacted list would be "
+                "refused and the ORIGINAL list shown in its place — the redaction "
+                "cannot be delivered in this shape, so the output is held back "
+                "instead"
+            )
+        _disarm_watchdog()
         return 0
 
     if not isinstance(response, dict):
@@ -859,8 +1131,28 @@ def main() -> int:
     # key — but the tag is skipped.
     is_image = bool(response.get("isImage"))
 
+    # `structuredContent` is checked before the generic unknown-field sweep so
+    # its withhold says the thing that is actually true about it: it does not
+    # need a tag added, it makes the tag unreachable.
+    structured = response.get(CONTENT_REPLACING_FIELD)
+    if label and isinstance(structured, list) and structured:
+        _withhold(
+            f"the result carries {CONTENT_REPLACING_FIELD}, which does not sit "
+            "beside stdout — it REPLACES the whole tool result the model reads "
+            "(the Bash mapper's first line is `if (O && O.length > 0) return "
+            "{...content: O}`), and the command is untrusted ingress "
+            f"({label}). The <untrusted_external_content> wrapper this guard "
+            "puts on stdout would never be rendered. The Bash tool's own result "
+            "builder does not set this field; if that has changed, teach "
+            "hooks/bash-output-guard.py to wrap the blocks themselves"
+        )
+
     def _untaggable(key: str, value) -> bool:
-        if key in OUTPUT_FIELDS or key in METADATA_STRING_FIELDS:
+        if (
+            key in OUTPUT_FIELDS
+            or key in METADATA_STRING_FIELDS
+            or key in NON_MODEL_FACING_FIELDS
+        ):
             return False
         if isinstance(value, str):
             return bool(value.strip())
@@ -876,24 +1168,31 @@ def main() -> int:
             "wrote it"
         )
 
-    # The overflow file holds the bytes truncation took out of stdout.
-    note = ""
-    persisted = response.get("persistedOutputPath")
-    if isinstance(persisted, str) and persisted:
-        ok, why_not, size = _scrub_persisted(persisted)
+    # Every field that hands over a PATH instead of bytes. The overflow file
+    # holds what truncation took out of stdout; rawOutputPath had no handling
+    # at all until now, which left a file nobody had scrubbed at the end of a
+    # pointer the guard had just passed on.
+    notes: list[str] = []
+    for path_field, size_field in OUTPUT_POINTER_FIELDS:
+        pointer = response.get(path_field)
+        if not (isinstance(pointer, str) and pointer):
+            continue
+        ok, why_not, size = _scrub_persisted(pointer)
         if ok:
-            if "persistedOutputSize" in updated:
-                updated["persistedOutputSize"] = size
+            if size_field and size_field in updated:
+                updated[size_field] = size
         else:
-            updated.pop("persistedOutputPath", None)
-            updated.pop("persistedOutputSize", None)
-            note = (
-                "[bash-output-guard: the harness persisted this command's full output "
-                f"to a file and the path has been withheld, because {why_not}. Those "
-                "bytes were never inspected for secrets, so the model does not get a "
-                "pointer to them. Re-run the command narrowed down if you need more "
-                "than the output above.]"
+            updated.pop(path_field, None)
+            if size_field:
+                updated.pop(size_field, None)
+            notes.append(
+                "[bash-output-guard: the harness wrote this command's full output "
+                f"to a file and the {path_field} pointer has been withheld, because "
+                f"{why_not}. Those bytes were never inspected for secrets, so the "
+                "model does not get a pointer to them. Re-run the command narrowed "
+                "down if you need more than the output above.]"
             )
+    note = "\n".join(notes)
 
     stdout_v = updated.get("stdout") if isinstance(updated.get("stdout"), str) else ""
     stderr_v = updated.get("stderr") if isinstance(updated.get("stderr"), str) else ""
@@ -912,7 +1211,7 @@ def main() -> int:
 
     _disarm_watchdog()
     if updated != response:
-        _emit(updated)
+        _emit_rewrite(updated)
     return 0
 
 
