@@ -149,8 +149,9 @@ and PIL. Do not try `nix shell "nixpkgs#python3.withPackages(...)"` — not a
 valid installable, nix reads it as a path and fails.
 
 Serve a review page with `systemd-run --user --unit=… --collect
---working-directory=…`; backgrounding with `setsid nohup … &` returns exit 124
-because the child holds the pipe, and the server is running anyway.
+--working-directory=…`; backgrounding with `setsid nohup … &` comes back
+`Command timed out after …` at exit 143 because the child holds the pipe, and
+the server is running anyway.
 
 Never delete build outputs. `shutil.copytree(..., dirs_exist_ok=True)`, not
 `rmtree`.

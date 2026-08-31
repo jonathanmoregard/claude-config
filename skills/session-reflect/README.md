@@ -273,8 +273,10 @@ tasks/mission.md                           human convenience symlink to the copy
 launched with only `--permission-mode acceptEdits --add-dir <handoff dir>` therefore
 inherits the interactive user's whole permission surface from
 `~/.claude/settings.json`. Measured on this host against claude 2.1.222 with exactly
-that argv: it read `/etc/nixos/flake.nix`, ran `id -u` through pre-approved
-`mcp__safe-bash__*`, and saw the connected Google Drive / Calendar / Gmail MCP tools.
+that argv: it read `/etc/nixos/flake.nix`, ran `id -u` through the operator's
+pre-approved shell surface (an MCP shell tool at the time of that measurement,
+native `Bash` since the switchover — the name changed, the hazard did not), and
+saw the connected Google Drive / Calendar / Gmail MCP tools.
 That is arbitrary command execution and egress, on a process executing a `## Next`
 list a model wrote out of a transcript that may have contained anything.
 
@@ -284,7 +286,7 @@ launches it with, and only with:
 | flag | what it is load-bearing for (each verified by a real `-p` run) |
 |---|---|
 | `--setting-sources ''` | loads no user/project/local settings. **The only flag here that restricts anything.** `--settings` alone MERGES: with it and no `--setting-sources`, `/etc/nixos/flake.nix` still read fine. Also excludes the project's own `.claude/settings.json`, which is repo content |
-| `--settings <file>` | the explicit minimal object: `allow: []` (the field whose inherited value carried `mcp__safe-bash__*`), `deny` naming `Bash`/`WebFetch`/`WebSearch`/`Task`, `additionalDirectories` = the handoff leaf, `hooks: {}` |
+| `--settings <file>` | the explicit minimal object: `allow: []` (the field whose inherited value carried the operator's pre-approved shell surface), `deny` naming `Bash`/`WebFetch`/`WebSearch`/`Task`, `additionalDirectories` = the handoff leaf, `hooks: {}` |
 | `--strict-mcp-config` | no MCP servers, so no `mcp__` tools. **Not implied** by `--setting-sources`: with that alone, the account-connected Google servers were still loaded |
 | `--tools Read,Edit,Write,Glob,Grep,TodoWrite` | removes the shell structurally. **Load-bearing**: with the three flags above but no `--tools`, `id -u` still returned 1000. An unknown tool name here is *silently ignored*, which is why `deny` repeats the closure |
 | `--add-dir <handoff leaf>` | so `acceptEdits` covers the write-back the prompt asks for |
