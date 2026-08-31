@@ -20,7 +20,13 @@ decided.json
 # *.tmp — the scratch has to sit beside its target for the atomic publish.
 .digest-*.*
 .agent-raw.*
-tests/.testhome/
+# run-tests.sh builds its fake HOME at `$S/.testhome`, where $S is THIS
+# directory — not `tests/`. The rule here read `tests/.testhome/` and so matched
+# nothing; the suite clears the dir at setup rather than teardown (deliberately,
+# so a failed run's state survives for inspection), which means it is always
+# left behind and was always untracked-and-visible. Unrooted so it holds
+# wherever the suite is run from.
+.testhome/
 __pycache__/
 # Test-run artifacts (outputs, not sources)
 tests/crontab.*
