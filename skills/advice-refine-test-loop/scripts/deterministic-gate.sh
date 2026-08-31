@@ -335,14 +335,40 @@ fi
 # ── gitleaks ─────────────────────────────────────────────────────────────────
 # Content-based secret detection, complementing the filename-shaped coverage in
 # the global gitignore. Absence of gitleaks is exit 2, not a silent pass.
+#
+# IT MUST SCAN THE RANGE THE REST OF THE GATE JUDGES. This lane used to run
+# `--staged` only, which reads the INDEX — while every pattern rule above reads
+# the COMMIT RANGE. The two therefore never saw the same bytes, and the loop
+# that calls this gate commits at every round's step 7, so from the second
+# round on the index was empty: the lane scanned nothing, found nothing, and
+# the gate reported `gitleaks_clean: true` over a committed secret sitting in
+# the very range it had just pattern-scanned. Measured, both arms, in
+# deterministic-gate-test.sh.
+#
+# Both are scanned now — the range for what is committed, the index for what is
+# staged and not yet committed. A hit in either is a BLOCKER.
 LEAKS=0
 LEAK_DETAIL=""
 if command -v gitleaks >/dev/null 2>&1; then
-  leak_out=$(gitleaks git --staged --redact --no-banner 2>&1)
+  leak_out=""
+  # `git diff A...B` compares B against the merge base of A and B; the
+  # commit-range spelling of that same set is `A..B`, which is what
+  # `--log-opts` takes. A range with no `..` at all (a bare ref) leaves this
+  # empty and only the index is scanned — stated so the gap is named rather
+  # than discovered.
+  if [[ "$RANGE" == *".."* ]]; then
+    range_out=$(gitleaks git --redact --no-banner --log-opts="${RANGE/.../..}" 2>&1)
+    if [[ $? -ne 0 ]]; then
+      LEAKS=1
+      leak_out="$range_out"
+    fi
+  fi
+  staged_out=$(gitleaks git --staged --redact --no-banner 2>&1)
   if [[ $? -ne 0 ]]; then
     LEAKS=1
-    LEAK_DETAIL=$(printf '%s' "$leak_out" | head -40)
+    leak_out="${leak_out}${leak_out:+$'\n'}$staged_out"
   fi
+  [[ $LEAKS -eq 1 ]] && LEAK_DETAIL=$(printf '%s' "$leak_out" | head -40)
 else
   echo "gate: gitleaks not on PATH — cannot run the secret rules" >&2
   exit 2

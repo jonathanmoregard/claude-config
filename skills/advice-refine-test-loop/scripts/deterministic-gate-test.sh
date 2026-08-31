@@ -2,9 +2,23 @@
 # Fixture harness for deterministic-gate.sh
 set -uo pipefail
 GATE="$1"
+
+# Fixture repos must not run the INVOKING USER's global git config or hooks.
+# On this host core.hooksPath points at a gitleaks pre-commit hook, which
+# REFUSES a commit carrying a secret — so the secret-lane fixtures below could
+# never commit their fixture credential, silently left it staged, and turned
+# the committed-range arm into a duplicate of the staged arm that passed
+# whether or not the gate scanned the range at all. Same reasoning, and the
+# same two variables, as tests/smoke.sh.
+export GIT_CONFIG_NOSYSTEM=1
+export GIT_CONFIG_GLOBAL=/dev/null
 F=$(mktemp -d)
 cd "$F" || exit 2
 git init -q .
+# Identity is set per-repo because GIT_CONFIG_GLOBAL=/dev/null above takes the
+# user's global one away with the hooks it came for.
+git config user.email t@example.invalid
+git config user.name t
 git commit -q --allow-empty -m base
 
 mkdir -p src docs
@@ -187,6 +201,71 @@ print("  data_exempt == 5? (must be True) ", d.get("data_exempt") == 5)
 '
 echo
 echo "=== clean-repo case (should exit 0) ==="
-C=$(mktemp -d); cd "$C"; git init -q .; git commit -q --allow-empty -m base
+C=$(mktemp -d); cd "$C"; git init -q .
+git config user.email t@example.invalid; git config user.name t
+git commit -q --allow-empty -m base
 echo 'print("hello")' > ok.py; git add -A
 bash "$GATE" --repo "$C"; echo "rc=$?"
+
+echo
+echo "=== secret lane scans the RANGE it reports on ==="
+# The pattern rules scan `origin/main...HEAD`; the secret lane must scan the
+# same commits. It used to scan the INDEX (`gitleaks git --staged`) instead,
+# and the loop commits at every round's step 7 — so by the time any round
+# after the first ran the gate, the index was empty, the lane scanned nothing,
+# and the run reported `gitleaks_clean: true` over a committed secret.
+#
+# Fixture token: GitHub PAT shape, body drawn from urandom so no literal
+# credential is ever written into this file and the value is certainly invalid.
+SECRET_FIXTURE="ghp_$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 36)"
+
+mk_range_repo() {   # mk_range_repo <dir>; leaves it on feat/x with an origin
+  local d="$1"
+  git init -q -b main "$d"
+  git -C "$d" config user.email t@example.invalid
+  git -C "$d" config user.name t
+  echo base > "$d/base.txt"
+  git -C "$d" add -A
+  git -C "$d" commit -q -m base
+  git clone -q "$d" "$d.origin" >/dev/null 2>&1
+  git -C "$d" remote add origin "$d.origin"
+  git -C "$d" fetch -q origin
+  git -C "$d" checkout -q -b feat/x
+}
+
+# (a) secret COMMITTED in range, index clean — the shape every round after the
+#     first presents. Must be caught.
+LEAKED=$(mktemp -d)/repo; mk_range_repo "$LEAKED"
+printf 'token = "%s"\n' "$SECRET_FIXTURE" > "$LEAKED/creds.txt"
+git -C "$LEAKED" add creds.txt
+git -C "$LEAKED" commit -q -m "add fixture credential"
+echo "  (a) committed secret, $(git -C "$LEAKED" diff --cached --name-only | wc -l) file(s) staged"
+out_a=$(bash "$GATE" --repo "$LEAKED" --range origin/main...HEAD --json); rc_a=$?
+echo "      gate: $out_a"
+echo "      rc=$rc_a"
+printf '      caught? (must be True)  %s\n' \
+  "$(printf '%s' "$out_a" | python3 -c 'import json,sys; print(json.load(sys.stdin)["gitleaks_clean"] is False)')"
+printf '      exit 1? (must be True)  %s\n' "$([[ $rc_a -eq 1 ]] && echo True || echo False)"
+
+# (b) same range, no secret — must stay clean, or the lane is just noise.
+CLEAN=$(mktemp -d)/repo; mk_range_repo "$CLEAN"
+echo 'ordinary = "value"' > "$CLEAN/ok.txt"
+git -C "$CLEAN" add ok.txt
+git -C "$CLEAN" commit -q -m "add ordinary file"
+out_b=$(bash "$GATE" --repo "$CLEAN" --range origin/main...HEAD --json); rc_b=$?
+echo "  (b) clean committed range"
+echo "      gate: $out_b"
+printf '      clean? (must be True)   %s\n' \
+  "$(printf '%s' "$out_b" | python3 -c 'import json,sys; print(json.load(sys.stdin)["gitleaks_clean"] is True)')"
+printf '      exit 0? (must be True)  %s\n' "$([[ $rc_b -eq 0 ]] && echo True || echo False)"
+
+# (c) secret STAGED but uncommitted — the case the old lane did cover, kept so
+#     the fix cannot trade one blind spot for the other.
+STAGED=$(mktemp -d)/repo; mk_range_repo "$STAGED"
+printf 'token = "%s"\n' "$SECRET_FIXTURE" > "$STAGED/creds.txt"
+git -C "$STAGED" add creds.txt
+out_c=$(bash "$GATE" --repo "$STAGED" --range origin/main...HEAD --json); rc_c=$?
+echo "  (c) staged-but-uncommitted secret"
+echo "      gate: $out_c"
+printf '      caught? (must be True)  %s\n' \
+  "$(printf '%s' "$out_c" | python3 -c 'import json,sys; print(json.load(sys.stdin)["gitleaks_clean"] is False)')"
