@@ -21,6 +21,11 @@ security boundary, not tidiness: basename-only filenames matching the exact
 shape the prompt mandates, no overwrite of an existing proposal, 64 KiB per
 body, 5 proposals per run, 2 MiB of stdin.
 
+Writes are atomic (2026-08-31): O_EXCL reserves the name race-safely, the body
+lands in a same-directory temp file and arrives by rename(2). A crashed nightly
+run therefore cannot leave a truncated proposal that triage reads as evidence
+and every later run skips as "already there".
+
 Usage:
     proposal-sink.py <dest-dir> < raw-agent-output
 
@@ -34,6 +39,7 @@ Exit codes:
 import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 MAX_PROPOSALS = 5           # the prompt caps the agent at 5; enforce it here too
@@ -47,6 +53,51 @@ END = "===END PROPOSAL==="
 # YYYY-MM-DD-<slug>.md, slug lowercase kebab. Rejects traversal, absolute
 # paths, dotfiles and squat-bait like CLAUDE.md as a side effect.
 NAME_OK = re.compile(r"^\d{4}-\d{2}-\d{2}-[a-z0-9][a-z0-9-]{0,100}\.md$")
+
+
+def write_proposal_atomically(final, body):
+    """Create `final` with `body`, or leave the filesystem exactly as it was.
+
+    Two properties, both load-bearing, and the original only had the first:
+
+      * create-or-skip, race-safe. The O_EXCL open reserves the name against a
+        concurrent run in one syscall — no exists()/write TOCTOU window.
+        Returns False when the name is already taken.
+      * crash-safe. The body goes to a temp file in the SAME directory and
+        arrives at `final` by rename(2), so a crash, a kill, or ENOSPC part-way
+        through can never leave a truncated proposal at the destination for
+        triage to read as evidence. The original wrote the body straight into
+        the O_EXCL'd file, so an interrupted run left an empty or half-written
+        proposal that every later run then skipped as "already there".
+
+    Raises whatever the write raised, after removing both the reservation and
+    the temp file — the caller reports it as an anomaly.
+    """
+    # 0600 because proposals quote tool inputs sampled from real sessions.
+    try:
+        fd = os.open(final, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return False
+    os.close(fd)
+    tmp = None
+    try:
+        tfd, tmp = tempfile.mkstemp(dir=os.path.dirname(final) or ".",
+                                    prefix=".sink-tmp-")  # mkstemp: mode 0600
+        with os.fdopen(tfd, "wb") as fh:
+            fh.write(body)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, final)
+        tmp = None
+    except BaseException:
+        for path in (tmp, final):
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+        raise
+    return True
 
 
 def main():
@@ -115,15 +166,17 @@ def main():
             print("sink: rejected oversized body for %s" % fname)
             anomalies += 1
             continue
-        # O_EXCL: atomic create-or-skip, no exists()/write TOCTOU window. 0600
-        # because proposals quote tool inputs sampled from real sessions.
+        # Atomic create-or-skip AND crash-safe body write — see the helper.
         try:
-            fd = os.open(dest / fname, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
+            created = write_proposal_atomically(str(dest / fname), body)
+        except (OSError, ValueError) as exc:
+            print("sink: FAILED to write %s (%s); nothing left at the "
+                  "destination" % (fname, exc))
+            anomalies += 1
+            continue
+        if not created:
             print("sink: skipped existing %s" % fname)
             continue
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(body)
         written += 1
         print("sink: wrote %s" % fname)
 

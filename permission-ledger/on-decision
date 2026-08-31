@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# on-decision adapter for the permissions proposals subdir.
+#
+# Called by /review-improvements (Section 3.5 of the review-improvements
+# skill) after a decision is recorded, BEFORE any archive move:
+#
+#   on-decision <absolute-proposal-path> <implemented|accepted|skipped|rejected|deferred>
+#
+# Wires the drain flow into the permission-ledger: records the outcome via
+# record-decision.py so a drained pattern doesn't come back in tomorrow's
+# digest and every digest after it. Mapping: implemented -> implemented,
+# rejected|skipped -> rejected. --count is taken from the proposal's
+# "## Friction" line when present (enables the ledger's one re-ask when
+# friction later triples); omitted otherwise (permanent suppression).
+#
+# WHY IT LIVES HERE, not in proposals/permissions/ where it used to.
+# proposal-intake-gate.py's run_callback refuses any on_decision callback whose
+# realpath escapes ~/.claude, and it is right to: proposals are written by
+# unattended agents, so a callback path is an executable that a data file gets
+# to name. The proposals spine moved to ~/.local/state/claude-proposals on
+# 2026-08-31 and ~/.claude/proposals became a symlink to it — so the old
+# location resolved outside ~/.claude and the drain died with a bare exit 1.
+# The forward fix is to move the code out of the data directory rather than
+# weaken the check. It now sits beside record-decision.py, which it calls.
+#
+# Not every proposals file is a ledger pattern — no pattern_key in the
+# frontmatter means there is nothing to record; note it and exit 0.
+set -euo pipefail
+
+PROPOSAL="${1:?usage: on-decision <proposal-path> <implemented|skipped|rejected>}"
+OUTCOME="${2:?usage: on-decision <proposal-path> <implemented|skipped|rejected>}"
+
+# Resolve record-decision.py beside this script rather than through $HOME:
+# the two ship and move together, and the gate has already proven that the
+# callback's own realpath is what matters.
+LEDGER_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+IFS=$'\t' read -r PATTERN_KEY COUNT < <(python3 - "$PROPOSAL" <<'PY'
+import re
+import sys
+text = open(sys.argv[1], encoding="utf-8", errors="replace").read(16384)
+m = re.search(r'^pattern_key:\s*(.+?)\s*$', text, re.M)
+key = m.group(1).strip().strip('"').strip("'") if m else ""
+c = re.search(r'^##\s*Friction\s*\n+\s*(\d+)\s+prompts', text, re.M)
+# Tab-separated, "-" sentinels: pattern_key may contain spaces
+# (e.g. "Bash:git status") but never tabs.
+print((key or "-") + "\t" + (c.group(1) if c else "-"))
+PY
+)
+
+if [ "$PATTERN_KEY" = "-" ]; then
+  echo "on-decision: no pattern_key in $(basename "$PROPOSAL") — not a ledger pattern, nothing to record"
+  exit 0
+fi
+
+case "$OUTCOME" in
+  implemented|accepted) MAPPED=implemented ;;
+  rejected|skipped) MAPPED=rejected ;;
+  deferred)
+    # Deferred = no decision yet: record nothing so the pattern stays live
+    # in the digest instead of being suppressed.
+    echo "on-decision: deferred — nothing recorded, pattern stays in the digest"
+    exit 0 ;;
+  *) echo "on-decision: unknown outcome '$OUTCOME' (want implemented|accepted|skipped|rejected|deferred)" >&2; exit 1 ;;
+esac
+
+if [ "$COUNT" != "-" ]; then
+  exec python3 "$LEDGER_DIR/record-decision.py" "$PATTERN_KEY" "$MAPPED" --count "$COUNT"
+else
+  exec python3 "$LEDGER_DIR/record-decision.py" "$PATTERN_KEY" "$MAPPED"
+fi
