@@ -24,11 +24,21 @@ Run all three. Do not skip to `build`.
 ```bash
 export INKSCAPE=/nix/store/…/bin/inkscape     # see reference.md for both paths
 PY=/nix/store/…-python3-…-env/bin/python3     # needs numpy + PIL
+D=/tmp/claude-tmp-data/vaven-<slug>           # working dir; see below
+mkdir -p "$D"
 
-$PY cover.py grid  --photo P --out D                    # 1. read landmarks
-$PY cover.py check --photo P --config C --out D         # 2. GATE
-$PY cover.py build --photo P --config C --out D         # 3. render + verify
+$PY cover.py grid  --photo P --out "$D"                 # 1. read landmarks
+$PY cover.py check --photo P --config C --out "$D"      # 2. GATE
+$PY cover.py build --photo P --config C --out "$D"      # 3. render + verify
 ```
+
+**Work under `/tmp/claude-tmp-data/`, not `~/Downloads`.** A run leaves dozens of
+grids, zooms, band strips, per-variant backgrounds and no-logo renders; that is
+scratch, and it does not belong in the user's downloads folder. `/tmp` is already
+an additional working directory, so Claude can read and write there without a
+permission prompt, and the dir is Claude's to manage. It is also **ephemeral** —
+copy the chosen `upload-*.jpg` / `upload-*.png` somewhere durable and hand over
+that path, along with the review page.
 
 **1. Measure.** `grid` writes a percentage overlay and 1%-gridline zooms. Read
 every landmark off the zooms. Full-frame eyeball reads run ~2% out, and 2% of
@@ -61,10 +71,56 @@ and `upload-*.png`. Exits non-zero if any variant is flagged.
 |---|---|
 | Mark on the **canvas centre line** | Mobile crops the **sides**; only the centred 1005×1005 square is guaranteed. Off-centre placement is destroyed there. |
 | Photo **full-bleed and whole** | Giving the mark its own coloured field caps it near 18% of canvas width and spends half the canvas. |
-| Mark clears the chin by **16% of its own height** | Fixed as a fraction, never pixels. Grazing contact is the universal amateur tell — commit to a gap or to an overlap, never land between. |
-| Nothing load-bearing below **y = 820** | Facebook's title/date/RSVP furniture. |
+| Mark's bottom pinned to **`ui_top` − 24**, always | Not a taste call *given* a `ui_top`. It aligns every rung of a size ladder on one baseline, so a fan-out varies size and nothing else. |
+| Never land within **8% of the mark's height** of the chin | Either way — a clear gap and a committed overlap are both fine, grazing contact is the universal amateur tell. Pick rungs around the dead zone, don't tune into it. |
+| Keep the **wordmark** clear of the bottom fade | Mobile fades the bottom of the cover (observed, see below). The knot's lower lobes can afford to be dimmed; "VÄVEN" cannot. |
 | Any softening **follows the artwork's silhouette** | A rectangle, plate, or feathered box reads as a smudge floating in the frame. |
-| Size comes from the arithmetic | Do not shrink the mark "so it doesn't compete with the faces". Undersizing is the standing complaint. |
+| Size is an **input**, in % of canvas width | Do not shrink the mark "so it doesn't compete with the faces". Undersizing is the standing complaint. And do not let a gap rule solve the size for you — see below. |
+
+## Don't let a fitted constant solve the layout
+
+The first version of this skill derived the mark's height from "clear the chin
+by 16% of its own height". One constant then set the size, the position and the
+ceiling at once — and capped a photo at 24.8% of canvas width when 28.7% fitted.
+**That is overfitting, and it is invisible** because the number it produces
+still passes every gate.
+
+Give `widths` — a list of fractions of **canvas width**, the unit the client
+judges in and the only one comparable between photos. `check` prints the
+chin-to-furniture band, the width that fills it, and the whole ladder with the
+gap each rung produces. The gap is measured, never targeted.
+
+`headroom` and `widths` cross-multiply, so a width that is safe on one crop and
+grazing on another needs **two configs and two output dirs**, not one config
+with a cross product that renders combinations you would never show.
+
+The same trap sits in the chin. `chin` is the lowest chin **anywhere in the
+photo**; a mark that never reaches that person should not be constrained by
+them. Give `chins` — one `{label, x, y}` per face — and the binding chin becomes
+span-local. Measured on `image-EDIT (2).jpg`: 26.0% → 26.9% of canvas width, and
+more importantly the *reason* for the ceiling changes from a number to a person
+you can point at.
+
+## When the client says there's empty space at the bottom
+
+They are looking at the **`ui_top` reservation**, and they are usually right to.
+It is the biggest lever on mark size — 185px of an 1005px canvas at the old
+default of 820 — and it was never measured. **Observed 2026-08-31 on live event
+pages: desktop web does not overlap the cover at all, and mobile fades the
+bottom out rather than drawing a bar over it.** No occlusion line exists. The
+bottom is a zone where content loses contrast, so the question is whether the
+artwork can afford to be dimmed there, not whether it clears anything.
+
+Do not re-explain the constant, and do not go looking for a better one — six
+research runs on this were rejected by the scanner, and a `fast` search returns
+page-cover sizes (820×312, 851×315) that are not this. Override `ui_top` and
+render the ladder: on `image-EDIT (2).jpg` the ceiling runs 26.9% → 30.8% →
+37.7% of canvas width as `ui_top` goes 820 → 900 → 1005. Two images settle in
+one look what a paragraph does not.
+
+**Shipped: the 900 rung** — 30.8%, bottom at 876, knot lobes reaching the fade
+and the wordmark well clear. The 37.7% rung was rejected for leaving 24px under
+the mark, which reads as an accident whatever Facebook draws.
 
 ## Re-measure for every photo
 
@@ -105,7 +161,7 @@ silly. Four more approaches are already ruled out with reasons: see
 | Sampling one background colour and running WCAG on it | Per-pixel, then read the 5th percentile. |
 | Treating the logo SVG as wordmark-plus-ornament | One `<path>` is the entire lockup. The `<image>` in that file is an old photo — ignore it. |
 | Centring the mark's visual bounding box | Its true mirror axis is 50.115% across the bbox. Bbox centring is 1.9 px off. |
-| Guessing Facebook's safe margins | 820. |
+| Guessing Facebook's safe margins, or searching for them | Open an event and look. Desktop doesn't overlap; mobile fades the bottom. |
 | Assuming the crop step in the uploader means the file is wrong | It always asks. Leave it centred, pull to full width. |
 
 ## Presenting variants
