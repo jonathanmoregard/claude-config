@@ -5,6 +5,21 @@ digest-latest.json
 digest-prev.json
 decided.json
 .evaluate.lock
+# Same-directory scratch of an atomic rename (record-decision.py writes
+# `decided.json.tmp` then renames it over `decided.json`). It cannot move to
+# ~/.local/state like the other runtime output here — rename(2) needs both
+# names on one filesystem, in one directory — so this is the one case in this
+# repo where an ignore rule IS the fix rather than a cover-up. Kept as a
+# pattern, not `decided.json.tmp`: pinning the rule to the single filename
+# that exists today is precisely the bug this change was opened to fix.
+*.tmp
+# run-evaluate.sh's per-process scratch (`.digest-latest.json.$$`,
+# `.digest-prev.json.$$`, `.digest-latest.err.$$`, `.agent-raw.$$`). A trap on
+# EXIT removes them, which covers every ordinary path and none of the ones
+# that matter: SIGKILL, an OOM kill, a reboot mid-run. Same reasoning as
+# *.tmp — the scratch has to sit beside its target for the atomic publish.
+.digest-*.*
+.agent-raw.*
 tests/.testhome/
 __pycache__/
 # Test-run artifacts (outputs, not sources)

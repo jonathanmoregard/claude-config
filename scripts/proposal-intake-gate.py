@@ -60,10 +60,13 @@ DEFAULT_CONFIG_PATH = PROPOSALS_SINK + "/gate-config.json"
 # Overall wall cap for pr-context collection: one hung `gh` (or many repos)
 # must not starve the actual gating run.
 PR_CONTEXT_WALL_CAP = 120
-# Whole-run lock. Lives under ~/.claude/logs, NOT in the spine:
-# push-proposals.sh commits the whole sink tree, so a lock file inside it
-# would land in the committed history on every run.
-GATE_LOCK_PATH = "~/.claude/logs/gate.lock"
+# Whole-run lock. NOT in the spine: push-proposals.sh commits the whole sink
+# tree, so a lock file inside it would land in the committed history on every
+# run. And not in ~/.claude/logs either — that is inside the live config repo,
+# where it survived only because a `*.lock` catch-all happened to cover it.
+# Runtime state belongs in the state dir.
+RAW_KEEP_DIR = "~/.local/state/proposal-intake-gate"
+GATE_LOCK_PATH = RAW_KEEP_DIR + "/gate.lock"
 # How long --run-callback waits for the lock before giving up (the gating run
 # itself never waits: contended means another gate is active, exit 0).
 CALLBACK_LOCK_TIMEOUT_SECONDS = 10.0
@@ -839,10 +842,16 @@ def dispatch_scorer(prompt, cfg):
 
 
 def preserve_raw_scorer_output(src_path):
-    """Move unusable scorer stdout (the dispatch tempfile) into the logs dir
+    """Move unusable scorer stdout (the dispatch tempfile) into the state dir
     verbatim for diagnosis — 0600, never echoed into our own stdout (cron
-    logs), and never read into memory (it may be the >5MB overflow case)."""
-    logs_dir = os.path.expanduser("~/.claude/logs")
+    logs), and never read into memory (it may be the >5MB overflow case).
+
+    NOT ~/.claude/logs: that lives inside the live config git repo, whose
+    .gitignore covers `logs/*.log` and nothing else, so every unusable-scorer
+    night would leave an untracked `.txt` behind and dirty the checkout. The
+    content is raw model output over untrusted proposal text besides — it
+    belongs outside the config the harness reads."""
+    logs_dir = os.path.expanduser(RAW_KEEP_DIR)
     os.makedirs(logs_dir, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     path = os.path.join(logs_dir, "gate-scorer-raw-%s.txt" % ts)
@@ -1083,7 +1092,7 @@ def main(argv=None):
         # frontmatter (check-then-replace) and appends to the gate log —
         # two concurrent runs would interleave both. --list never writes
         # (repair=False below), so it stays lock-free. The lock file lives
-        # under ~/.claude/logs (see GATE_LOCK_PATH), never in the spine.
+        # under ~/.local/state (see GATE_LOCK_PATH), never in the spine.
         try:
             lock_fh = acquire_gate_lock()  # held until process exit
         except OSError as exc:

@@ -368,6 +368,18 @@ class RunEvaluateTestCase(unittest.TestCase):
         log = self.log()
         self.assertIn("sink: rejected filename", log)
         self.assertIn("raw agent output preserved at", log)
+        # ...and it lands OUTSIDE ~/.claude. That directory is a live git
+        # checkout whose .gitignore covers `logs/*.log` and nothing else, so
+        # this `.txt` used to leave an untracked file behind on every anomaly
+        # night — the same defect nixos PR #203 fixed for the RSI reviewer.
+        keep_dir = os.path.join(self.home, ".local", "state", "permission-ledger")
+        kept = [n for n in os.listdir(keep_dir)
+                if n.startswith("permission-ledger-raw-") and n.endswith(".txt")]
+        self.assertEqual(len(kept), 1, "raw output not preserved in %s" % keep_dir)
+        self.assertEqual(
+            [n for n in os.listdir(self.logs) if not n.endswith(".log")], [],
+            "nothing but .log files may be written into ~/.claude/logs",
+        )
 
     def test_existing_proposal_is_never_overwritten(self):
         self.seed_friction()
