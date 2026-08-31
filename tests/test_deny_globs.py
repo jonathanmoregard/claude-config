@@ -166,6 +166,7 @@ Exit: 0 = all green, 1 = at least one failure.
 """
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
@@ -678,6 +679,55 @@ check(
 
 
 # ----------------------------------------------------------------------
+# `--safe-mode` is sound HERE and nowhere near a hook. MEASURED 2026-08-31
+# against 2.1.251, two runs differing only in that flag, driving
+# `find <scratch> -delete` under a candidate that DID register the PreToolUse
+# guard:
+#
+#   with    --safe-mode: no hook events in the stream at all, denials=[],
+#                        the command RAN and the directory was DELETED.
+#   without --safe-mode: PreToolUse denied it, denials named the call, the
+#                        directory survived.
+#
+# The CLI's own help says why: *"--safe-mode  Start with all customizations
+# (CLAUDE.md, skills, plugins, hooks, MCP servers, ...) disabled"*. This file
+# is asking only about `permissions.deny`, which `--safe-mode` leaves alone —
+# every denial below is proof of that — so the flag is right here: it strips
+# the operator's ambient customisations out of the probe.
+#
+# But it makes this module a trap for the next person. A row added here that
+# expects a HOOK to fire would read green while proving nothing, and the flag
+# is easy to copy into a new module along with the rest of the argv. So the
+# candidate's shape is asserted rather than assumed: the moment this module
+# starts registering hooks, `--safe-mode` has to go, and this goes red first.
+# The hook-driven end-to-end proof lives in tests/test_switchover_live.py,
+# which passes no such flag and asserts that it does not.
+# ----------------------------------------------------------------------
+section("this module registers no hooks, so --safe-mode cannot mislead it")
+_probe_settings_src = inspect.getsource(_run_probe_once)
+check(
+    "the candidate settings this module writes carry `permissions` only",
+    '"permissions"' in _probe_settings_src or "'permissions'" in _probe_settings_src,
+    "the candidate builder no longer looks like the one this row was written for",
+)
+check(
+    "the candidate settings register NO hooks",
+    '"hooks"' not in _probe_settings_src and "'hooks'" not in _probe_settings_src,
+    "this module passes --safe-mode, which disables every hook (measured "
+    "2026-08-31, see the block comment above). A hook registered here would "
+    "never run, and its row would pass for the wrong reason. Drop --safe-mode "
+    "from the argv before adding one — or put the row in "
+    "tests/test_switchover_live.py, which is built for it.",
+)
+check(
+    "the argv really does pass --safe-mode, so the rows above are about it",
+    "--safe-mode" in _probe_settings_src,
+    "if the flag has been dropped, delete this section rather than leaving a "
+    "green row describing a flag nobody passes",
+)
+
+
+# ----------------------------------------------------------------------
 # Live: build the probe set.
 # ----------------------------------------------------------------------
 # (label, command, rules|None, expect_denied, why). `None` means the full ported
@@ -922,13 +972,36 @@ if _SCOPE == "full":
     )
 
     section("safe-bash's lost behaviour, for the record")
-    check(
-        "safe-bash offered the whole trimmed string as well as each subcommand",
-        "_pipeline_subcommands" in open(
-            os.path.join(REPO_ROOT, "mcps", "safe-bash", "server.py"), encoding="utf-8"
-        ).read(),
-        "server.py:875-876 — the behaviour the E8 rows above show the CLI does not have",
+    # This row used to `open()` `mcps/safe-bash/server.py`. The migration
+    # DELETES that file, so the row would have started raising FileNotFoundError
+    # on the completing commit — in `full` scope only, i.e. exactly the lane an
+    # operator reaches for when they want the thorough answer. The two lines are
+    # therefore QUOTED here, and cross-checked against git, which still holds the
+    # deleted blob. A future reader tempted to "fix" the E8 rows above by
+    # widening a rule needs to be able to read what was actually lost.
+    _E8_SOURCE = (
+        "    subcommands = _pipeline_subcommands(command)\n"
+        "    subcommands.append(command.strip())\n"
     )
+    _E8_BLOB = "c1332dd3fc5a3ffcb7bd8de2ccc66bd2914bfc48"
+    _e8_proc = subprocess.run(
+        ["git", "cat-file", "blob", _E8_BLOB],
+        cwd=REPO_ROOT, capture_output=True, text=True, timeout=20,
+    )
+    if _e8_proc.returncode != 0:
+        print(
+            f"  [ -- ] the quoted safe-bash lines were NOT cross-checked against "
+            f"git blob {_E8_BLOB[:12]} (git could not read it here)"
+        )
+    else:
+        check(
+            f"safe-bash offered the whole trimmed string as well as each "
+            f"subcommand (quoted from deleted blob {_E8_BLOB[:12]})",
+            _E8_SOURCE in _e8_proc.stdout,
+            "server.py:875-876 — the behaviour the E8 rows above show the CLI "
+            "does not have. If this row goes red the quote has drifted from what "
+            "safe-bash actually did, and the E8 regression note is unsourced.",
+        )
 else:
     section("scope=core — the per-rule live sweep did not run")
     print(f"  [ -- ] {len(ROWS)} rule rows, {len(BENIGN)} benign commands and "

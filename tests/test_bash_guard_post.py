@@ -45,6 +45,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shlex
 import shutil
 import stat
@@ -1644,6 +1645,102 @@ rc, parsed, raw, err = run_hook(
 )
 check("a non-Bash tool result is left completely alone", raw.strip() == "", raw[:160])
 check("a non-Bash tool result exits clean", rc == 0, f"rc={rc}")
+
+
+# ----------------------------------------------------------------------
+# G16 — the sibling-hook clobber, closed by measurement instead of left open.
+#
+# 2.1.251's own zod description for `updatedToolOutput`: *"hooks run in
+# parallel on the ORIGINAL output, so an identity rewrite competes last-write-
+# wins with sibling rewrites and can clobber a real redaction."* This hook is
+# not the only PostToolUse hook that sees `Bash`: `settings.json` registers a
+# matcher-`*` entry as well, and matcher `*` matches every tool. If any of
+# those siblings ever returns `updatedToolOutput`, a secret this guard redacted
+# can be restored by a hook that never looked at it — and nothing would print.
+#
+# So the set is DERIVED FROM settings.json rather than listed here. A hook
+# added under a matcher that covers Bash is picked up with no edit to this
+# file, which is the only way this stays true.
+# ----------------------------------------------------------------------
+section("bash-output-guard: no sibling PostToolUse hook can clobber the rewrite")
+
+with open(os.path.join(REPO_ROOT, "settings.json"), encoding="utf-8") as _fh:
+    _SETTINGS = json.load(_fh)
+
+
+def _matcher_sees_bash(matcher) -> bool:
+    """True if a PostToolUse matcher string would be offered a Bash result.
+
+    Claude Code matches a hook entry's `matcher` against the tool name as a
+    regex, with `*` (and an absent/empty matcher) meaning every tool. An
+    alternation like `Write|Edit` is therefore a regex, not a list.
+    """
+    if matcher in (None, "", "*"):
+        return True
+    try:
+        return re.search(matcher, "Bash") is not None
+    except re.error:
+        # An unparseable matcher is not evidence of safety.
+        return True
+
+
+_post_entries = _SETTINGS.get("hooks", {}).get("PostToolUse", [])
+_bash_seeing: list[tuple[str, str]] = []
+for _entry in _post_entries:
+    if not _matcher_sees_bash(_entry.get("matcher")):
+        continue
+    for _hook in _entry.get("hooks", []):
+        _bash_seeing.append((_entry.get("matcher") or "*", _hook.get("command") or ""))
+
+check(
+    "settings.json actually registers PostToolUse hooks that see Bash",
+    _bash_seeing,
+    "an empty set would make every row below vacuously true — including the "
+    "one that is supposed to notice this guard's own registration",
+)
+check(
+    "this guard is one of them",
+    any("bash-output-guard.py" in cmd for _, cmd in _bash_seeing),
+    f"{[c for _, c in _bash_seeing]}",
+)
+
+# Resolve each sibling's command line to a script on disk and read it. A
+# command we cannot resolve is reported as unresolved, never as clean.
+_TOKEN_RE = re.compile(r"[^\s'\"]+")
+
+
+def _resolve_hook_script(command: str) -> str | None:
+    """The first token in `command` that names an existing file, expanded."""
+    for tok in _TOKEN_RE.findall(command):
+        cand = os.path.expandvars(os.path.expanduser(tok))
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+_siblings = [(m, c) for m, c in _bash_seeing if "bash-output-guard.py" not in c]
+check(
+    "there is at least one sibling to check",
+    _siblings,
+    "if this goes red the clobber question is moot, but say so rather than "
+    "printing a green row about a set with nothing in it",
+)
+for _matcher, _cmd in _siblings:
+    _script = _resolve_hook_script(_cmd)
+    _label = f"sibling PostToolUse hook (matcher={_matcher!r}): {_cmd[:70]}"
+    if _script is None:
+        check(f"{_label} -> resolved to a file on disk", False,
+              "could not resolve the command to a script, so it cannot be "
+              "shown NOT to emit updatedToolOutput")
+        continue
+    with open(_script, "r", encoding="utf-8", errors="replace") as _fh:
+        _sib_src = _fh.read()
+    check(
+        f"{_label} -> never returns updatedToolOutput",
+        "updatedToolOutput" not in _sib_src,
+        f"{_script} names updatedToolOutput; under last-write-wins it can "
+        f"restore bytes this guard redacted",
+    )
 
 
 # ----------------------------------------------------------------------

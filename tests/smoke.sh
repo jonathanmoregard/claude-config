@@ -3132,8 +3132,10 @@ grep -qF '## Next' "$B7_ARGV" || fail "24: fork prompt does not point at ## Next
 # ---- S1: the fork must not inherit the interactive user's ambient authority ---
 # `--add-dir` ADDS to the ambient permission set; it does not restrict it. Measured
 # against the installed CLI (2.1.222, real `-p` runs, 2026-08-16) with the argv this
-# script used to emit: the fork read /etc/nixos/flake.nix and ran `id -u` through
-# pre-approved `mcp__safe-bash__*`, i.e. arbitrary shell execution and reads across
+# script used to emit: the fork read /etc/nixos/flake.nix and ran `id -u` through the
+# pre-approved shell entry then sitting in `permissions.allow` (`mcp__safe-bash__*` at
+# the time; the safe-bash retirement replaced it with a plain `Bash`, which is the same
+# authority under a shorter name), i.e. arbitrary shell execution and reads across
 # ten ambient additionalDirectories, on a process executing a `## Next` list a model
 # wrote out of a transcript. Every assertion below reads the ACTUAL argv, because the
 # argv is the only thing that decides.
@@ -3141,7 +3143,7 @@ b7_argv_has() { grep -qxF -- "$1" "$B7_ARGV"; }
 b7_value_after() { awk -v k="$1" '$0==k{getline; print; exit}' "$B7_ARGV"; }
 
 b7_argv_has '--setting-sources' \
-  || fail "24/S1: the fork does not pass --setting-sources, so it loads ~/.claude/settings.json and inherits permissions.additionalDirectories AND permissions.allow (which carries mcp__safe-bash__*)"
+  || fail "24/S1: the fork does not pass --setting-sources, so it loads ~/.claude/settings.json and inherits permissions.additionalDirectories AND permissions.allow (which carries Bash — a pre-approved shell)"
 [[ -z "$(b7_value_after '--setting-sources')" ]] \
   || fail "24/S1: --setting-sources must be EMPTY — no user, no project, no local source. Got '$(b7_value_after '--setting-sources')'; the project's own .claude/settings.json is repo content and must not govern an unattended fork"
 b7_argv_has '--strict-mcp-config' \
@@ -3157,7 +3159,8 @@ case ",$B7_TOOLS," in *,Read,*) ;; *) fail "24/S1: --tools leaves the fork unabl
 case ",$B7_TOOLS," in *,Edit,*) ;; *) fail "24/S1: --tools leaves the fork unable to write the handoff back ('$B7_TOOLS')" ;; esac
 
 # The explicit permission object. Its `allow` list is the field whose INHERITED value
-# carried `mcp__safe-bash__*`, so it being empty is the assertion that matters most.
+# carried a pre-approved shell — `mcp__safe-bash__*` before the retirement, plain `Bash`
+# after it — so it being empty is the assertion that matters most.
 b7_argv_has '--settings' \
   || fail "24/S1: the fork gets no explicit settings object, so what it may reach is implicit"
 B7_SETTINGS="$(b7_value_after '--settings')"
@@ -4984,7 +4987,8 @@ info "39c: all four dispatchable modes appear in the header and in --help"
 # ============================================================================
 # The failure this exists to prevent is a FALLBACK. An unrestricted fork is an
 # unattended acceptEdits process with the interactive user's whole permission surface
-# — ten ambient additionalDirectories and a pre-approved `mcp__safe-bash__*`, i.e.
+# — ten ambient additionalDirectories and a pre-approved shell in `permissions.allow`
+# (`mcp__safe-bash__*` before the retirement, plain `Bash` after it), i.e.
 # arbitrary shell across the user's repos including ~/.claude/skills, where it could
 # rewrite the instructions future sessions load. Skipping costs one deferred resume.
 # So both gates fail CLOSED, and the reason lands in the counters, because a

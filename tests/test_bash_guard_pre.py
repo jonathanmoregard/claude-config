@@ -872,6 +872,78 @@ check(
     why[:250],
 )
 
+# W21 / switchover. The rows above set `DCG_PATH=""`. That is the same
+# falsy branch as *absent*, but only because `os.environ.get` returns None
+# for one and "" for the other — an implementation detail, and the
+# switchover turns it load-bearing: `mcp-servers.json` was the ONLY place
+# `DCG_PATH` was ever exported to this guard's process, and deleting the
+# server registration deletes the export. From the next session on, the
+# variable is genuinely absent, not empty. So the absent case gets its own
+# row, driven by removing the key from the child's environment outright.
+def _guard_without_dcg_path(command: str, path: str) -> tuple[str | None, str]:
+    env = dict(os.environ)
+    env.pop("DCG_PATH", None)
+    env["PATH"] = path
+    proc = subprocess.run(
+        [sys.executable, os.path.join(HOOKS, "bash-guard.py")],
+        input=json.dumps(pre_payload(command)),
+        capture_output=True, text=True, timeout=60.0, env=env,
+    )
+    body = proc.stdout.strip()
+    parsed = None
+    if body.startswith("{"):
+        try:
+            parsed = json.loads(body)
+        except json.JSONDecodeError:
+            parsed = None
+    return decision_of(parsed), reason_of(parsed)
+
+
+_dec_abs, _why_abs = _guard_without_dcg_path("rm -rf /", _which_bin)
+check(
+    "DCG_PATH ABSENT from the environment (not merely empty) -> resolved through PATH",
+    _dec_abs == "deny" and "via-PATH" in _why_abs,
+    f"decision={_dec_abs!r} {_why_abs[:200]}",
+)
+check(
+    "... and that is dcg's verdict, not a broken guard",
+    BROKEN_MARKER not in _why_abs,
+    _why_abs[:160],
+)
+
+_dec_abs2, _why_abs2 = _guard_without_dcg_path("ls -la", _empty_bin)
+check(
+    "DCG_PATH ABSENT and no dcg on PATH -> deny, naming the legacy path",
+    _dec_abs2 == "deny"
+    and bash_guard.LEGACY_DCG_PATH in _why_abs2
+    and BROKEN_MARKER in _why_abs2,
+    f"decision={_dec_abs2!r} {_why_abs2[:250]}",
+)
+
+# And on THIS host, with the real dcg. `mcp-servers.json` exported
+# DCG_PATH=/etc/profiles/per-user/jonathan/bin/dcg; the claim that removing
+# it is safe rests entirely on `dcg` being resolvable from PATH instead. That
+# is a claim about this machine, so it is measured on this machine — and when
+# dcg is absent the row says NOT CHECKED rather than passing.
+_real_dcg_on_path = shutil.which("dcg")
+if _real_dcg_on_path:
+    _dec_live, _why_live = _guard_without_dcg_path("ls -la", os.environ.get("PATH", ""))
+    check(
+        "with DCG_PATH gone, the REAL dcg is still found on PATH "
+        f"({_real_dcg_on_path})",
+        _dec_live is None or BROKEN_MARKER not in _why_live,
+        f"decision={_dec_live!r} {_why_live[:250]} — if this is a broken-guard "
+        f"deny, removing the DCG_PATH export from mcp-servers.json would deny "
+        f"every Bash command from the next session on",
+    )
+else:
+    check(
+        "no dcg on PATH on this host — the DCG_PATH-removal lane is NOT "
+        "exercised (read as 'not checked', never as 'passed')",
+        True,
+        "install dcg, or keep the DCG_PATH export until it is packaged here",
+    )
+
 
 # ======================================================================
 # D28 — `NIXOS_WORKTREES_ROOT` must not exist.
@@ -1891,6 +1963,80 @@ if os.access(REAL_DCG, os.X_OK):
 else:
     check("no dcg on this host — live lane NOT exercised (read as 'not "
           "checked', never as 'passed')", True, REAL_DCG)
+
+
+# ----------------------------------------------------------------------
+# K8 — the health check's own BaseException guard, which had no test.
+#
+# This is the SessionStart hook. The two hooks it reports on fail CLOSED on
+# their own faults, and rightly; this one must not, because its failure mode
+# is a different thing entirely. A SessionStart hook that raises prints a
+# traceback on stdout, and stdout on SessionStart is parsed as hook output —
+# so a crash here does not merely lose the announcement, it feeds the harness
+# garbage at the one moment a session cannot recover from it.
+#
+# Hence `except BaseException: sys.exit(0)` around `main()`. Same shape as
+# F12 (the redactor's exception path) and A11 (dcg's UnicodeDecodeError),
+# both of which were closed by tests; this one was carried as a claim. The
+# fixture is a source patch, not a mock, so it exercises the real module
+# entry point the harness invokes.
+# ----------------------------------------------------------------------
+section("bash-guard-health: a broken health check never breaks startup (K8)")
+
+with open(os.path.join(HOOKS, "bash-guard-health.py"), encoding="utf-8") as fh:
+    _health_src = fh.read()
+
+check(
+    "the module-level BaseException guard is still there",
+    "except BaseException:" in _health_src,
+    "without it a raise inside _faults() reaches stdout as a traceback",
+)
+
+# Three raise shapes, on purpose. OSError is the one `main()` catches and
+# converts into a DOWN fault; the other two are what the module-level guard
+# is actually for, and they are the ones that had no coverage.
+for _exc_expr, _label, _expect_message in (
+    ("OSError('injected health fault: filesystem')",
+     "OSError (the one main() converts into a reported fault)", True),
+    ("RuntimeError('injected health fault: logic')",
+     "RuntimeError (falls through to the module-level guard)", False),
+    ("BaseException('injected health fault: base')",
+     "a bare BaseException (SystemExit's own family)", False),
+):
+    _patched = _health_src.replace(
+        "def _faults() -> list[tuple[str, str]]:\n    out: list[tuple[str, str]] = []",
+        f"def _faults() -> list[tuple[str, str]]:\n    raise {_exc_expr}\n"
+        f"    out: list[tuple[str, str]] = []",
+    )
+    check(f"fault fixture actually patched the source: {_label}",
+          _patched != _health_src)
+    _patched_path = os.path.join(SCRATCH, f"health-fault-{abs(hash(_exc_expr))}.py")
+    with open(_patched_path, "w", encoding="utf-8") as fh:
+        fh.write(_patched)
+    rc, parsed, out, err = run_hook(
+        _patched_path,
+        {"session_id": "t", "hook_event_name": "SessionStart", "source": "startup"},
+        env_extra={"DCG_PATH": STUB_FULL, "DCG_CONFIG": HEALTH_GOOD_CONFIG,
+                   "BASH_GUARD_CONFIG": HEALTH_INGRESS,
+                   "DCG_FALLBACK_MARKER": NO_MARKER},
+    )
+    check(f"{_label}: exit 0 — startup is never blocked by this check",
+          rc == 0, f"rc={rc} stderr={err[:200]}")
+    check(f"{_label}: no traceback reaches stdout",
+          "Traceback" not in out, out[:300])
+    if _expect_message:
+        # main() catches OSError itself, so this one still gets to speak.
+        check(f"{_label}: the fault is reported rather than swallowed",
+              "injected health fault: filesystem" in out, (out or "silent")[:300])
+        check(f"{_label}: reported as a DOWN-severity fault",
+              "not fully armed" in out, (out or "silent")[:300])
+    else:
+        # The module-level guard cannot know what a caller would do with a
+        # half-built message, so it says nothing at all. Silence here is the
+        # deliberate outcome, and asserting it is what stops a future edit
+        # from turning a crash into malformed SessionStart output.
+        check(f"{_label}: stdout is EMPTY, not malformed",
+              out.strip() == "", out[:300])
 
 
 # ----------------------------------------------------------------------
