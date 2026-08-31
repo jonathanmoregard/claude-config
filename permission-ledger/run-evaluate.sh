@@ -59,8 +59,35 @@ PROMPT_FILE="$LEDGER_DIR/prompt.md"
 SINK="$LEDGER_DIR/proposal-sink.py"
 DIGEST="$LEDGER_DIR/digest-latest.json"
 DIGEST_PREV="$LEDGER_DIR/digest-prev.json"
-PROPOSALS_DIR="$CLAUDE_HOME/proposals/permissions"
 RSI_CONFIG="$CLAUDE_HOME/recursive-self-improvement/config/config.json"
+
+# Where proposals live. They moved out of ~/.claude on 2026-08-31 (the nightly
+# runs dirtied the live config checkout the harness reads); the sink is a git
+# repo of its own. ~/.claude/proposals survives as a symlink to it, but this is
+# a WRITER, so it resolves the real path — a writer that depends on a symlink
+# existing is a writer that fails silently the day the symlink does not.
+# Source of truth: recursive-self-improvement/config/config.json ->
+# proposals.folder, with the canonical literal as the fallback.
+PROPOSALS_SINK_DEFAULT="$HOME/.local/state/claude-proposals"
+resolve_proposals_sink() {
+  python3 -S -E - "$RSI_CONFIG" "$PROPOSALS_SINK_DEFAULT" <<'PY' 2>/dev/null \
+    || printf '%s\n' "$PROPOSALS_SINK_DEFAULT"
+import json
+import os
+import sys
+
+fallback = sys.argv[2]
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        value = json.load(fh).get("proposals", {}).get("folder") or fallback
+except Exception:                                             # noqa: BLE001
+    value = fallback
+value = os.path.expanduser(str(value))
+print(value if os.path.isabs(value) else fallback)
+PY
+}
+PROPOSALS_SINK="$(resolve_proposals_sink)"
+PROPOSALS_DIR="$PROPOSALS_SINK/permissions"
 
 CLAUDE_CMD="${PL_CLAUDE_CMD:-claude}"
 

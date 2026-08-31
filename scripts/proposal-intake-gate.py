@@ -3,7 +3,8 @@
 
 Every unattended agent on this machine (RSI daily reviewer, permission-ledger
 evaluator, router, clv2, ...) drops proposal files into subdirs of one spine
-(default ~/.claude/proposals). Empirically (2026-08-01), proposers score their
+(default ~/.local/state/claude-proposals — its own git repo, moved out of the
+live ~/.claude checkout on 2026-08-31). Empirically (2026-08-01), proposers score their
 own homework badly: the 03:00 RSI run produced two proposals that duplicated
 code ALREADY SHIPPED — a model fallback merged in research-agent PR #19 and a
 scanner auto-updater that had existed for weeks. Root cause: no grep-before-
@@ -49,13 +50,19 @@ import sys
 import tempfile
 import time
 
-DEFAULT_CONFIG_PATH = "~/.claude/proposals/gate-config.json"
+# The spine lives in its own git repo outside the live config checkout (moved
+# 2026-08-31; `recursive-self-improvement/config/config.json` -> proposals.folder
+# is the single source of truth). Resolved DIRECTLY, never via the
+# ~/.claude/proposals compatibility symlink: a consumer that depends on a
+# symlink existing is a consumer that fails silently when it does not.
+PROPOSALS_SINK = "~/.local/state/claude-proposals"
+DEFAULT_CONFIG_PATH = PROPOSALS_SINK + "/gate-config.json"
 # Overall wall cap for pr-context collection: one hung `gh` (or many repos)
 # must not starve the actual gating run.
 PR_CONTEXT_WALL_CAP = 120
 # Whole-run lock. Lives under ~/.claude/logs, NOT in the spine:
-# push-proposals.sh commits the proposals/ subtree wholesale, so a lock file
-# inside it would land in the pushed git history on every run.
+# push-proposals.sh commits the whole sink tree, so a lock file inside it
+# would land in the committed history on every run.
 GATE_LOCK_PATH = "~/.claude/logs/gate.lock"
 # How long --run-callback waits for the lock before giving up (the gating run
 # itself never waits: contended means another gate is active, exit 0).
@@ -67,9 +74,10 @@ SCORER_STDOUT_CAP = 5 * 1024 * 1024
 
 DEFAULTS = {
     # Root of the proposals spine; every proposal subdir lives directly under it.
-    "spine_root": "~/.claude/proposals",
+    "spine_root": PROPOSALS_SINK,
     # Explicit subdir names to walk. Empty list = auto-discover every subdir
-    # under spine_root (symlinked subdirs like rsi -> legacy path are followed).
+    # under spine_root (symlinked subdirs are followed, so a spine_root aimed
+    # at the ~/.claude compatibility symlink still resolves).
     "subdirs": [],
     "excluded_subdirs": [".*", "archived"],
     # Must stay identical to references/gate-config.default.json (tested):
@@ -99,8 +107,27 @@ DEFAULTS = {
     # Read by the review-improvements skill, not by this script: after a
     # decision on a proposal in <subdir>, run `<callback> <path> <decision>`.
     "on_decision": {},
-    "gate_log": "~/.claude/proposals/gate-log.jsonl",
+    "gate_log": PROPOSALS_SINK + "/gate-log.jsonl",
 }
+
+# Printed verbatim whenever run_callback refuses. The rule is a security
+# boundary — a proposal file must never be able to nominate an arbitrary
+# executable — so the remedy is always "move the callback", never "relax the
+# check". Spelled out because the failure it guards is otherwise a bare exit 1
+# in the middle of a /review-improvements drain.
+CALLBACK_CONTAINMENT_RULE = (
+    "containment rule: an on_decision callback must realpath-resolve under "
+    "%(root)s, be a regular file (not a symlink), be owned by you, carry no "
+    "group/other write bit (itself or any parent dir up to %(root)s), and be "
+    "executable. This is a security boundary: proposals are written by "
+    "unattended agents, and a callback path is an executable a data file gets "
+    "to name. Do NOT widen the check — move the callback instead. Callbacks "
+    "belong in ~/.claude/permission-ledger/ (beside record-decision.py), not "
+    "under the proposals spine: the spine now lives in "
+    "~/.local/state/claude-proposals and ~/.claude/proposals is only a "
+    "symlink to it, so anything there resolves outside %(root)s. Repoint "
+    "gate-config.json's on_decision entry at the moved file."
+)
 
 VALID_VERDICTS = ("sharp", "duplicate", "rot")
 VALID_DECISIONS = ("implemented", "rejected", "deferred")
@@ -1003,6 +1030,7 @@ def run_callback(cfg, subdir, proposal_path, decision):
     if problems:
         log("error: refusing on_decision callback %s for subdir %r: %s"
             % (callback, subdir, "; ".join(problems)))
+        log(CALLBACK_CONTAINMENT_RULE % {"root": claude_root})
         return 1
     proposal_path = os.path.realpath(proposal_path)
     # The callback only ever gets a proposal from the subdir it was

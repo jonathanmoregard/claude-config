@@ -64,7 +64,9 @@
     "analysis_cron": "17:00",
     "timezone": "Europe/Stockholm"
   },
+  "_proposals_folder_comment": "SINGLE SOURCE OF TRUTH for where proposals live. They moved out of ~/.claude on 2026-08-31 because every nightly run dirtied the live config checkout the harness reads; the sink is a git repo of its own so a rejected proposal stays findable with `git log -S`. rsi/ sits directly under it. The two old names (~/.claude/proposals and ~/.claude/recursive-self-improvement/proposals) survive as absolute symlinks, but they are a COMPATIBILITY SHIM FOR READERS ONLY: every writer resolves this key (falling back to the literal below), never the symlink, because a writer that depends on a symlink existing is a writer that fails silently when it does not.",
   "proposals": {
+    "folder": "~/.local/state/claude-proposals",
     "uncapped_subdirs": [
       "permissions"
     ]

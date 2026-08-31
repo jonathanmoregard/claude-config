@@ -45,8 +45,20 @@ through you, in `/review-improvements`.
    classifies each group as `bad-config`, `sensitive`, `wrong-tool` or
    `rule-bug` and emits at most 5 proposals as delimited stdout blocks.
    `proposal-sink.py` parses those blocks and writes the files into
-   `~/.claude/proposals/permissions/`. Log:
-   `~/.claude/logs/permission-ledger.log`.
+   `~/.local/state/claude-proposals/permissions/` — atomically (tmp file +
+   `rename(2)`), so a crashed run cannot leave a truncated proposal that triage
+   reads as evidence. Log: `~/.claude/logs/permission-ledger.log`.
+
+   **The proposals spine moved out of `~/.claude` on 2026-08-31.** It lives in
+   a git repo of its own at `~/.local/state/claude-proposals/` so a rejected
+   proposal stays findable with `git log -S` without every nightly run dirtying
+   the live config checkout the harness reads. The old names
+   (`~/.claude/proposals`, `~/.claude/recursive-self-improvement/proposals`)
+   survive as absolute symlinks, but those are a compatibility shim **for
+   readers**: `run-evaluate.sh` resolves the real path from
+   `recursive-self-improvement/config/config.json` → `proposals.folder`,
+   because a writer that depends on a symlink existing is a writer that fails
+   silently the day it does not.
 
    Why the aggregation moved out of the agent: `permissions.deny` contains a
    blanket `"Bash"`, and deny beats allow, so the old
@@ -96,8 +108,10 @@ pass per night. Cheap-and-visible fails on, expensive fails off.
 ├── digest-latest.json what the nightly agent reads, 0600
 ├── digest-prev.json   the run before that, kept for diffing
 ├── decided.json       pattern_key -> your decision, written by record-decision.py
+├── record-decision.py records a drained pattern so it stops coming back
+├── on-decision        the /review-improvements callback; calls record-decision.py
 └── hook-errors.log    anything the hook swallowed
-~/.claude/proposals/permissions/
+~/.local/state/claude-proposals/permissions/   (the sink; ~/.claude/proposals is a symlink to its parent)
 ├── YYYY-MM-DD-<slug>.md     pending proposals
 └── archived/                drained proposals
 ~/.claude/_backups/settings.json.<timestamp>.bak
@@ -150,8 +164,8 @@ outright rather than the rule.
 Drain by moving the file:
 
 ```sh
-mv ~/.claude/proposals/permissions/2026-08-01-read-home-jonathan-claude.md \
-   ~/.claude/proposals/permissions/archived/
+mv ~/.local/state/claude-proposals/permissions/2026-08-01-read-home-jonathan-claude.md \
+   ~/.local/state/claude-proposals/permissions/archived/
 ```
 
 Then record the outcome, or the pattern comes back in tomorrow's digest and
@@ -167,14 +181,25 @@ the single re-ask work: a `rejected` pattern returns exactly once, if its count
 later triples. Omit `--count` and the pattern is suppressed permanently.
 
 **Wired (2026-08-01).** `/review-improvements` now runs
-`~/.claude/proposals/permissions/on-decision <proposal> <outcome>` after each
+`~/.claude/permission-ledger/on-decision <proposal> <outcome>` after each
 recorded decision (implemented/accepted → `implemented`; rejected and skipped →
 `rejected`; deferred → nothing recorded, pattern stays live; `--count`
-extracted from the `## Friction` line when present). The mapping lives in
-`~/.claude/proposals/gate-config.json` under `on_decision.permissions` — the
-skill reads that map, so re-pointing or disabling the callback is a config
-edit, not a skill edit. Draining by hand still requires the manual
-`record-decision.py` call above.
+extracted from the `## Friction` line when present). The mapping lives in the
+spine's `gate-config.json` (`~/.local/state/claude-proposals/gate-config.json`)
+under `on_decision.permissions` — the skill reads that map, so re-pointing or
+disabling the callback is a config edit, not a skill edit. Draining by hand
+still requires the manual `record-decision.py` call above.
+
+**Moved 2026-08-31.** The callback used to live at
+`~/.claude/proposals/permissions/on-decision`. `proposal-intake-gate.py`'s
+`run_callback` refuses any callback whose realpath escapes `~/.claude` — a
+security boundary, since proposals are written by unattended agents and a
+callback path is an executable that a data file gets to name — so once
+`proposals/` became a symlink into the sink, that path resolved outside
+`~/.claude` and the drain died on a bare exit 1. The fix was to move the code
+out of the data directory, not to weaken the check; it now sits beside
+`record-decision.py`, which it calls. The refusal path also prints the
+containment rule and the remedy now, so the next occurrence is not a silent 1.
 
 ## Retention
 
