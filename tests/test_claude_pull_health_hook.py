@@ -221,6 +221,29 @@ with Sandbox() as sb:
     check("an unparseable record is announced, not swallowed", str(repo) in msg,
           detail=msg[:200])
 
+# 'This record carries no timestamp' and 'this record is 55 years old' are
+# different facts, and only one of them is true. `float(doc.get(key) or 0)`
+# turned a null/absent `checked_at_epoch` into epoch zero, so the hook reported
+# "last checked 490000h ago - the puller appears to have stopped running" about
+# a record that had simply never carried a timestamp. Right alarm, wrong text,
+# and the wrong text sends the reader to journalctl for a unit that is fine.
+for label, fields in (("null", {"checked_at_epoch": None}),
+                      ("absent", {"checked_at_epoch": "__DELETE__"}),
+                      ("empty", {"checked_at_epoch": ""})):
+    with Sandbox() as sb:
+        repo = sb.repo()
+        p = write_status(sb.state_root, repo, **fields)
+        if fields["checked_at_epoch"] == "__DELETE__":
+            doc = json.loads(p.read_text(encoding="utf-8"))
+            doc.pop("checked_at_epoch")
+            p.write_text(json.dumps(doc) + "\n", encoding="utf-8")
+        msg = announcement(run_hook(sb.state_root, [repo])).get("systemMessage", "")
+        check(f"a {label} timestamp is announced", str(repo) in msg, detail=msg[:200])
+        check(f"a {label} timestamp says so rather than inventing an age",
+              "no readable timestamp" in msg, detail=msg[:300])
+        check(f"a {label} timestamp does not claim the puller stopped",
+              "appears to have stopped" not in msg, detail=msg[:300])
+
 # Per-target verdicts, not one aggregate — the message has to say WHICH.
 with Sandbox() as sb:
     healthy, sick = sb.repo("healthy"), sb.repo("sick")

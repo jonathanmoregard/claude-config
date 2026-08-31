@@ -189,8 +189,19 @@ def _record(state_root: Path, repo: Path):
 
 
 def _age(doc: dict, key: str) -> float | None:
+    """Seconds since `key`, or None when the record does not carry one.
+
+    `float(doc.get(key) or 0)` used to fold "absent", "null" and "empty" into
+    epoch zero, so a record that had never carried a timestamp was reported as
+    "last checked 496722h ago — the puller appears to have stopped running".
+    Right alarm, wrong text: it sends the reader to journalctl for a unit that
+    is working. A missing value is its own verdict, so it gets its own branch.
+    """
+    raw = doc.get(key)
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None
     try:
-        return time.time() - float(doc.get(key) or 0)
+        return time.time() - float(raw)
     except (TypeError, ValueError):
         return None
 
