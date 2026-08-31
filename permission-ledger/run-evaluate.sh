@@ -12,14 +12,31 @@
 #   5. otherwise run `claude --print` over prompt.md, READ-ONLY, and hand its
 #      stdout to proposal-sink.py, which writes the proposal files
 #
-# Why the aggregation is here and not inside the agent: the agent is launched with
-# an explicit positive `--allowedTools` list (see ALLOWED_TOOLS below) that names
-# only Read/Glob/Grep, so it has no shell no matter what settings.json says. It
-# Reads the digest file. This used to be argued from a blanket "Bash" in
-# `permissions.deny` beating any allow; that deny was removed when safe-bash was
-# retired and `Bash` moved into `permissions.allow`, so the allowlist — which was
-# always the real mechanism — is now the only thing keeping the agent read-only.
-# Do not add a Bash(...) entry to ALLOWED_TOOLS expecting the deny to catch it.
+# Why the aggregation is here and not inside the agent: the agent must not have a
+# shell, and keeping it shell-less is the job of DISALLOWED_TOOLS below, NOT of
+# the positive `--allowedTools` list.
+#
+# That distinction cost a real hole and is worth stating flatly:
+# `--allowedTools` PRE-APPROVES the tools it names. It does not REMOVE the ones
+# it omits. The original argument here was a blanket `"Bash"` in
+# `permissions.deny` beating any allow — which was true, and was the only thing
+# actually holding the line. When safe-bash was retired, `Bash` moved into
+# `permissions.allow`, that deny went away, and the allowlist was left holding a
+# line it never held.
+#
+# MEASURED against CLI 2.1.251 with this branch's settings.json:
+# `--allowedTools 'Read Glob Grep'` still offered Bash, Write, Edit,
+# NotebookEdit, Task, Cron* and the MCP tools, and the agent ran `id -u` -> 1000
+# unsandboxed and wrote a file outside its working directory. This agent's input
+# is untrusted session material, so that is the worst possible place for a shell.
+#
+# Two dead ends, both measured, so nobody re-walks them:
+#   * `--setting-sources ''` does NOT fix it — Bash is still offered and still
+#     executes, and dropping the settings file drops `permissions.deny` with it,
+#     so WebFetch/WebSearch come BACK.
+#   * `--disallowedTools` is the flag that actually removes a tool, but it
+#     removes only what it names. Hence an explicit list, pinned by
+#     tests/test_bash_guards.py so a new tool cannot quietly join the offer.
 #
 # Why the proposal writing is here and not inside the agent either: the same
 # reasoning one step further. This script used to pass
@@ -68,10 +85,18 @@ RSI_CONFIG="$CLAUDE_HOME/recursive-self-improvement/config/config.json"
 
 CLAUDE_CMD="${PL_CLAUDE_CMD:-claude}"
 
-# Read-only, and no Bash(...) entry. Running aggregate.py out here is what buys
-# the first; proposal-sink.py persisting the output is what buys the second.
-# Any Write(...)/Bash(...) grant added back here is a silent no-op headless.
+# What the agent legitimately needs. This is the POSITIVE half and it is not a
+# security boundary on its own — see the header. Running aggregate.py out here
+# is what lets the list stay this short; proposal-sink.py persisting the output
+# is what keeps Write off it.
 ALLOWED_TOOLS='Read Glob Grep'
+
+# The half that actually removes tools. Everything that mutates the filesystem,
+# delegates to another agent, schedules future work, or reaches the network —
+# for an agent whose entire input is untrusted permission-denial records.
+# Read/Glob/Grep are deliberately absent so the two lists cannot contradict.
+# tests/test_bash_guards.py pins the load-bearing names.
+DISALLOWED_TOOLS='Bash Write Edit MultiEdit NotebookEdit Task Agent Workflow SendMessage RemoteTrigger CronCreate CronDelete CronList ScheduleWakeup EnterWorktree ExitWorktree DesignSync Artifact TaskStop TaskOutput WebFetch WebSearch'
 
 RETENTION_MONTHS=6
 
@@ -273,6 +298,8 @@ umask 077
   --model opus \
   --print \
   --allowedTools "$ALLOWED_TOOLS" \
+  --disallowedTools "$DISALLOWED_TOOLS" \
+  --strict-mcp-config \
   -p "$(cat "$PROMPT_FILE")" ) > "$raw" 2>&1
 status=$?
 umask "$old_umask"

@@ -2255,6 +2255,93 @@ check(
 
 
 # ----------------------------------------------------------------------
+# permission-ledger/run-evaluate.sh — the nightly agent's tool surface.
+#
+# This lives in THIS suite because this migration is what broke it. Under
+# safe-bash, `permissions.deny` carried a blanket `"Bash"`, deny beat allow,
+# and the nightly digest agent genuinely had no shell. Moving `"Bash"` into
+# `permissions.allow` removed the thing that was actually holding the line,
+# and left `--allowedTools` holding it alone — which it cannot do.
+#
+# MEASURED against the shipped CLI 2.1.251, with the branch's settings.json and
+# a mirrored HOME: `--allowedTools 'Read Glob Grep'` PRE-APPROVES three tools,
+# it does not REMOVE the other twenty-odd. Bash was offered and the agent ran
+# `id -u` -> `1000`, is_error=False, unsandboxed, and wrote a file outside its
+# working directory. `Write`, `Edit`, `NotebookEdit`, `Task`, `Cron*` and the
+# MCP tools were all offered too.
+#
+# Two dead ends, both measured, recorded so nobody re-walks them:
+#   * `--setting-sources ''` does NOT fix it. Bash is still offered and still
+#     executes; and dropping the settings file drops `permissions.deny` with
+#     it, so WebFetch/WebSearch reappear for an agent whose input is untrusted
+#     permission-denial records.
+#   * `--disallowedTools` DOES remove a tool, but only the ones it names, so
+#     the list has to be explicit and the assertions below pin it.
+# ----------------------------------------------------------------------
+section("permission-ledger: the nightly agent cannot reach a shell")
+
+_LEDGER = os.path.join(REPO_ROOT, "permission-ledger")
+with open(os.path.join(_LEDGER, "run-evaluate.sh"), encoding="utf-8") as fh:
+    _RUNEVAL_SRC = fh.read()
+
+# The precondition. If a future change puts a blanket `Bash` deny back, the
+# allowlist argument becomes true again and these assertions can be revisited —
+# but until then they are load-bearing.
+_perms = SETTINGS.get("permissions", {})
+check(
+    "precondition: settings.json allows bare Bash and does not deny it",
+    "Bash" in _perms.get("allow", []) and "Bash" not in _perms.get("deny", []),
+    f"allow_has_bash={'Bash' in _perms.get('allow', [])} "
+    f"deny_has_bash={'Bash' in _perms.get('deny', [])}",
+)
+
+check(
+    "the nightly agent is invoked with --disallowedTools, not an allowlist alone",
+    "--disallowedTools" in _RUNEVAL_SRC,
+    "--allowedTools pre-approves; it does not remove. Measured: Bash executed.",
+)
+
+# Everything that mutates, delegates, or reaches the network. Read/Glob/Grep
+# are what the agent legitimately needs and are deliberately absent from this
+# list.
+_disallow_line = next(
+    (ln for ln in _RUNEVAL_SRC.splitlines() if ln.strip().startswith("DISALLOWED_TOOLS=")),
+    "",
+)
+_disallowed = set(
+    _disallow_line.partition("=")[2].strip().strip("'\"").split()
+)
+for _tool in ("Bash", "Write", "Edit", "NotebookEdit", "Task", "WebFetch", "WebSearch"):
+    check(
+        f"the nightly agent's disallow list names {_tool}",
+        _tool in _disallowed,
+        f"{_tool} was offered to the agent in the measured run; "
+        f"disallowed={sorted(_disallowed)}",
+    )
+
+check(
+    "MCP servers are not loaded for the nightly agent",
+    "--strict-mcp-config" in _RUNEVAL_SRC,
+    "the measured run was offered mcp__claude_ai_Google_Drive__* among others",
+)
+
+check(
+    "the script no longer claims the allowlist alone keeps the agent read-only",
+    "no shell no matter what settings.json says" not in _RUNEVAL_SRC,
+    "that claim was measured false; the header must not restate it",
+)
+
+with open(os.path.join(_LEDGER, "prompt.md"), encoding="utf-8") as fh:
+    _PROMPT_SRC = fh.read()
+check(
+    "prompt.md does not tell the model it has no Bash on the strength of a deny",
+    "permissions.deny" not in _PROMPT_SRC
+    or "blanket" not in _PROMPT_SRC,
+    "the blanket Bash deny was removed when safe-bash was retired",
+)
+
+
+# ----------------------------------------------------------------------
 # Summary
 # ----------------------------------------------------------------------
 section("Summary")
