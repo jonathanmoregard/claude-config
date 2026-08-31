@@ -64,6 +64,11 @@ usage-data/
 logs/*.log
 !logs/review-agent.log
 
+# Permission-ledger raw dumps: timestamped runtime output, a new file per run.
+# Deliberately NOT `logs/*.txt` — the crontab-backup-*.txt files in here are
+# hand-made safety copies and are tracked on purpose.
+logs/permission-ledger-raw-*.txt
+
 # Externally cloned skill repos (each has its own .git; track upstream
 # as submodules later if pinning becomes useful)
 skills/caveman/
@@ -104,7 +109,16 @@ workers/*/scratch/
 
 # Background-worker daemon runtime: supervisor log, per-job scratch, and
 # daemon/control.key — a live credential that must never be auto-committed.
+# Patterned rather than listed: the daemon keeps growing new status/cooldown
+# stamps beside its log (daemon.status.json, daemon-auth-status.json,
+# daemon-auth-cooldown all appeared after the literal entries below), each
+# holding PIDs and timestamps that churn on every write. repo-autosync commits
+# whatever is untracked here, so an unignored stamp becomes a churn commit
+# rather than merely showing up in git status. Nothing named daemon* has ever
+# been tracked; add deliberately with `git add -f` if that changes.
 daemon.log
+daemon.*
+daemon-*
 daemon/
 jobs/
 

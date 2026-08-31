@@ -1,17 +1,20 @@
 {
-  "_comment": "Landmarks for image-EDIT (1).jpg, as fractions of the source. Re-read these for every new photo; they do not transfer between files even when the dimensions look identical.",
+  "_comment": "Landmarks for image-EDIT (2).jpg (1919 x 1101), as fractions of the source. Re-read these for every new photo; they do not transfer between files even when the dimensions look identical.",
 
-  "faces_centroid": 0.592,
-  "head_span_centre": 0.605,
+  "faces_centroid": 0.602,
+  "head_span_centre": 0.614,
 
-  "face_l": 0.445,
-  "face_r": 0.765,
-  "heads": 0.265,
-  "top": 0.190,
-  "chin": 0.450,
+  "face_l": 0.450,
+  "face_r": 0.778,
+  "heads": 0.262,
+  "top": 0.193,
+  "chin": 0.453,
+
+  "_widths": "Fractions of CANVAS width. Size is an input; the chin gap it produces is an output. `check` prints the band, the width that fills it, and the grazing dead zone to step around.",
+  "widths": [0.18, 0.22, 0.26],
 
   "headroom": "auto",
   "sigma": 8.0,
-  "treatments": ["glow", "pad"],
+  "treatments": ["glow"],
   "logo_svg": "vaven-mark.svg"
 }

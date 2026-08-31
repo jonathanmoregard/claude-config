@@ -7,8 +7,8 @@
 | Upload size | **1920 × 1005** (1.91:1) |
 | Guaranteed on mobile | the centred **1005 × 1005** square — mobile crops the **sides** |
 | Feed card | renders ~**560 px** wide; judge legibility there |
-| Facebook furniture | starts eating the image at **y = 820** |
-| Mark's bottom limit | **796** (820 − 24) |
+| Facebook furniture | **soft** — see below. Desktop does not overlap at all; mobile fades the bottom |
+| Mark's bottom limit | a judgement, not a line. `ui_top` **900** shipped (mark bottom 876) |
 | Format | flatten to RGB, hand over a quality-95 JPEG (no chroma subsampling) alongside the PNG |
 
 Meta publishes no formal spec; 1920 × 1005 is the community-validated size.
@@ -61,14 +61,88 @@ With no type field, the photo full-bleed:
 MAXW  = 2 · min(GX, SW − GX)      widest crop still centred on the group
 SBASE = 1920 / MAXW               smallest usable scale; wider stops being centred
 chin_output = (CHIN − HEADS) · SBASE + headroom
-h     = (796 − chin_output) / (1 + 0.16)      logo height
-top   = chin_output + 0.16 · h
-w     = h · 1.4041
+bottom = ui_top − 24              the mark's baseline (876 at the 900 default)
+band  = bottom − chin_output      clear room between the lowest chin and the UI
+w     = width_frac · 1920         SIZE IS AN INPUT — see below
+h     = w / 1.4041
+top   = bottom − h                bottom pinned to that baseline, always
+gap   = (top − chin_output) / h   an OUTCOME, measured and reported
 ```
+
+**Size is chosen, not solved.** An earlier version derived the height from
+"clear the chin by 16% of the mark's own height", which let one fitted constant
+set the size, the position and the ceiling at once — and capped a photo at 24.8%
+of canvas width when 28.7% fitted. Give `widths` as fractions of **canvas
+width**, the unit the client judges in and the only one comparable between
+photos. Omit it and you get the widest mark that fits the band whole.
+
+Pinning the **bottom** is what makes a ladder legible: every rung shares one
+baseline, so the fan-out varies size and nothing else. Centring in the band was
+tried and dropped — it makes the gap `(band − h)/2`, which crawls through zero,
+so every width from 24% to 35% of canvas landed in the grazing dead zone.
+
+**Pick rungs outside the dead zone.** Grazing is `|gap| < 8%` of mark height, so
+with the bottom pinned, heights in `[band/1.08, band/0.92]` are unusable. Those
+map to a width range you compute once per crop and then step around; `check`
+prints the band and the ceiling for you.
+
+### The binding chin is span-local
+
+`chin` alone is the lowest chin **anywhere in the photo**, and it over-constrains
+every mark that never reaches that person. On `image-EDIT (2).jpg` the lowest
+chin sits 274px off the axis; it only enters a mark's span past 26.9% of canvas
+width, yet it was capping every width below that too. Give `chins` — one
+`{label, x, y}` per face — and the engine binds on the lowest chin the mark
+actually passes under, plus a 16px margin for the halo's reach.
+
+Grazing is then checked against **every** chin in the span, not just the lowest.
+Once overlap is allowed, a mark can clear the lowest chin by a committed margin
+and still land a few pixels off a higher one — same amateur tell.
+
+**The ceiling is scanned, not solved.** The binding chin depends on the width and
+the width depends on the binding chin, and the relationship is not monotone:
+there is a cliff where an off-axis chin enters the span and the band collapses.
+Iterating to a fixed point oscillates across it and settles below the real
+ceiling — measured, 25.6% against a true 26.9%. `ceiling_width` scans down.
+
+### `ui_top` — a soft zone, not a line
+
+`ui_top` is the single biggest lever on mark size: at the old default of 820 it
+reserves 185px of an 1005px canvas. On `image-EDIT (2).jpg` the ceiling goes
+26.9% → 30.8% → 37.7% as `ui_top` goes 820 → 900 → 1005.
+
+**What was actually observed (Jonathan, 2026-08-31, live event pages):**
+
+| surface | what the furniture does to the cover |
+|---|---|
+| desktop web | **nothing** — title/date/RSVP sit in a block *below* the photo, which renders in full |
+| mobile | the image **fades out** toward the bottom — a gradient, not an opaque bar and not a crop |
+
+So there is no occlusion line, and 820 was never one. The bottom of the canvas
+is a *softening* zone: content there loses contrast rather than disappearing.
+That changes the question from "does it clear the furniture" to "can it afford
+to be dimmed", which is a taste call on the specific artwork.
+
+Shipped on that basis: `ui_top = 900`, mark width 30.8%, bottom at 876. The
+knot's lower lobes do reach the fade and that was judged fine — the wordmark,
+which is the top 38.1% of the mark, is nowhere near it. The 37.7% rung was
+rejected for leaving only 24px under the mark, which reads as an accident
+independently of anything Facebook draws.
+
+Do not restore 820 as a default on the strength of a web search. It is
+community-derived folklore, Meta publishes no spec, and the two claims this file
+used to carry — "mobile crops the sides" and "furniture starts at y=820" — were
+never reconciled with each other. Six research runs on this question were
+rejected by the scanner; the observation above cost one look at a phone.
+
+When a client says "there's plenty of empty space at the bottom", render the
+`ui_top` ladder rather than re-explaining the constant — the images settle it.
 
 Headroom must clear the group's topmost point (arms/tools) by ~38 px or it
 grazes the canvas edge. Cropping that point out is the lever that buys a bigger
-mark — offer it as an explicit rung rather than taking it silently.
+mark — offer it as an explicit rung rather than taking it silently. `headroom`
+and `widths` cross-multiply, so a width that is safe on one crop and grazing on
+another needs **two configs and two output dirs**, not one cross product.
 
 ## Contrast method
 
@@ -155,6 +229,24 @@ the server is running anyway.
 
 Never delete build outputs. `shutil.copytree(..., dirs_exist_ok=True)`, not
 `rmtree`.
+
+## Where the files go
+
+| | |
+|---|---|
+| Working dir | `/tmp/claude-tmp-data/vaven-<slug>/`, one subdir per crop |
+| Review page | `/tmp/claude-tmp-data/vaven-<slug>-review/index.html` |
+| Handover | copy the chosen `upload-*.jpg` / `.png` somewhere durable, name the path |
+
+`/tmp` is in `permissions.additionalDirectories`, so Claude reads and writes
+under `/tmp/claude-tmp-data/` with no prompt and no `.claude`-protected-path
+friction. Nothing else needs configuring — do **not** add a narrower rule for a
+subdirectory of a directory that is already granted.
+
+A build writes `grid.png`, three zooms, the band strips, `check-*.png`, and for
+every variant a background, an SVG, a no-logo SVG, two renders and two upload
+files. That is scratch. It does not go in `~/Downloads`, which is the user's,
+not Claude's.
 
 ## Ruled out — do not retry
 
