@@ -6217,8 +6217,11 @@ $(spawn_holders)"
     if [[ "$TEARDOWN_STATUS" == "ok" ]]; then
       TEARDOWN_STATUS="shim-rm-failed"
     fi
+    # The quoting matches the real command on the `if !` line above. It read
+    # `rm -rf $SPAWN_SHIM_DIR` — an unquoted form this script never ran, and
+    # the one shape a reader might copy back out of a diagnostic.
     TEARDOWN_DETAIL="$TEARDOWN_DETAIL
-rm -rf $SPAWN_SHIM_DIR reported:
+rm -rf \"$SPAWN_SHIM_DIR\" reported:
 $(cat "$TEARDOWN_SHIM_ERR" 2>/dev/null || true)"
   fi
 fi

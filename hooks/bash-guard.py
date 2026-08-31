@@ -9,8 +9,11 @@ Layers, in order:
 
   1. ``dcg`` (destructive-command guard, a Rust binary speaking hook JSON)
   2. ``find ... -delete`` with no filter predicate
-  3. a network fetch piped into a shell (``curl ... | bash``) — the intent of
-     six ported deny rules that the CLI's matcher structurally cannot enforce
+  3. a network fetch piped into a shell (``curl ... | bash``)  [arftl-allow: curl-pipe-shell]
+     — documentation of the shape, not a command: the matcher is
+     ``_check_pipe_to_shell``, which reads tokenised pipeline stages and never
+     this literal. The intent of six ported deny rules that the CLI's matcher
+     structurally cannot enforce
   4. the nixos-config push gate (``Pre-push checklist:`` trailer, with its
      claim-vs-diff and merge-base cross-checks)
   5. allow — by emitting NOTHING
@@ -99,6 +102,24 @@ GUARD_DEADLINE_S = HARNESS_HOOK_TIMEOUT_S - 4  # 6
 DCG_TIMEOUT_S = GUARD_DEADLINE_S - 1  # 5
 NIXOS_GIT_TIMEOUT_S = 4
 
+# The SECOND deny channel, for when the first one cannot be written.
+#
+# Exit status 2 is the ONLY non-zero status that blocks. Measured in the CLI
+# 2.1.251 bundle: at offset 180961465 the hook runner maps `nr.status === 2`
+# to `yield {blockingError: {...`[hook]`: ${nr.stderr || "No stderr output"}`},
+# outcome:"blocking"}`, and the PreToolUse consumer turns a blockingError into
+# `{kind:"deny", reason: ...}`. Every OTHER non-zero status yields
+# `hook_non_blocking_error` and execution CONTINUES — so exit 1, or the 120
+# CPython returns when its shutdown flush fails, are both ALLOW.
+#
+# The one downgrade path, `L1t` at offset 180925958, fires only for
+# Stop / SubagentStop / TaskCompleted / TeammateIdle (and plugin
+# UserPromptSubmit) with empty stdout and a "no such file" stderr. PreToolUse
+# is not in that list, so exit 2 from this hook always blocks — including when
+# a partial write left unparseable JSON on stdout, because the status-2 branch
+# is reached whether or not stdout parsed.
+HOOK_BLOCK_EXIT_CODE = 2
+
 # Strict ordering. If a future edit inverts it — say by raising
 # DCG_TIMEOUT_S past the harness timeout — the guard denies every command
 # instead of silently degrading to fail-open. Loud beats inert.
@@ -122,8 +143,39 @@ _RECOVERY = (
 )
 
 
+def _escalate_to_exit_code(reason: str) -> None:
+    """Deny via exit status, because stdout could not carry the decision.
+
+    Never returns. This is the fail-closed path for the failure of the
+    fail-closed path itself: with stdout unwritable there is no way to render
+    a decision object, and a PreToolUse hook that renders no decision is
+    ALLOWED. Exit 2 needs no stdout at all, and the CLI uses this hook's
+    STDERR as the deny reason, so the operator still gets the explanation.
+
+    stderr is attempted first and its own failure is irrelevant — the exit
+    status alone blocks; the text is only there to say why.
+    """
+    try:
+        sys.stderr.write(reason + "\n")
+        sys.stderr.flush()
+    except Exception:
+        # arftl-allow: swallowed-exception — the os._exit below denies whether
+        # or not this text lands; there is no permissive outcome to reach.
+        pass
+    os._exit(HOOK_BLOCK_EXIT_CODE)
+
+
 def _emit_deny(reason: str) -> None:
-    """Write the deny decision and flush. Never raises."""
+    """Write the deny decision and flush. Never raises, never falls open.
+
+    A swallowed write error here used to be a silent ALLOW: every deny in
+    this file funnels through this function, and callers follow it with
+    ``os._exit(0)`` / ``return 0``. Measured with stdout on /dev/full — the
+    guard exited 0 with empty stdout AND empty stderr, so the harness rendered
+    no decision and the command ran. That is the exact fail-open class this
+    file exists to eliminate, arriving through the one function whose job is
+    to close it.
+    """
     try:
         sys.stdout.write(
             json.dumps(
@@ -137,8 +189,13 @@ def _emit_deny(reason: str) -> None:
             )
         )
         sys.stdout.flush()
-    except Exception:
-        pass
+    except Exception as exc:
+        _escalate_to_exit_code(
+            f"bash-guard: DENIED. The decision could not be written to stdout "
+            f"({type(exc).__name__}: {exc}), so this deny is being delivered by "
+            f"exit status {HOOK_BLOCK_EXIT_CODE} instead. The original reason "
+            f"follows.\n{reason}"
+        )
 
 
 def _deny_broken(detail: str) -> str:
@@ -190,10 +247,23 @@ def _arm_watchdog() -> None:
     try:
         signal.signal(signal.SIGALRM, _on_deadline)
         signal.setitimer(signal.ITIMER_REAL, GUARD_DEADLINE_S)
-    except (ValueError, OSError, AttributeError):
-        # No SIGALRM (non-POSIX, or not the main thread). The dcg
-        # subprocess timeout still bounds the dominant blocking call.
-        pass
+    except (ValueError, OSError, AttributeError) as exc:
+        # No SIGALRM (non-POSIX, or not the main thread). This used to carry
+        # on regardless, reasoning that the dcg subprocess timeout still
+        # bounds the dominant blocking call. It does not bound the rest: with
+        # the watchdog unarmed `_remaining_budget()` degrades to a flat
+        # NIXOS_GIT_TIMEOUT_S per call, so dcg's 5s plus a few 4s git calls
+        # can outrun the 10s harness timeout — and a harness timeout DISCARDS
+        # this hook's output and renders no decision, which is fail-open.
+        # An unarmed deadline is therefore a guard that cannot promise to
+        # reach a verdict in time, and this file's answer to that is to deny.
+        # Same precedent as _TIMEOUTS_SANE: loud beats inert.
+        _fail_closed(
+            "the guard could not arm its own deadline "
+            f"({type(exc).__name__}: {exc}), so it cannot guarantee a verdict "
+            f"before the {HARNESS_HOOK_TIMEOUT_S}s harness timeout discards "
+            "this hook's output and renders no decision at all"
+        )
 
 
 def _disarm_watchdog() -> None:
@@ -202,10 +272,14 @@ def _disarm_watchdog() -> None:
     Without this, the watchdog could fire mid-write and interleave a second
     JSON object into stdout, corrupting the decision we already reached.
     """
-    try:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-    except (ValueError, OSError, AttributeError):
-        pass
+    # arftl-allow: swallowed-exception — cancelling the timer can only fail on
+    # a platform where _arm_watchdog's setitimer() also failed, and that path
+    # now denies rather than returning, so reaching here means a timer really
+    # was armed and really can be cancelled. Nothing to recover, and no
+    # permissive outcome either way: the verdict is already decided, and a
+    # watchdog that fired anyway calls _fail_closed, which denies.
+    try: signal.setitimer(signal.ITIMER_REAL, 0)
+    except (ValueError, OSError, AttributeError): pass
 
 
 # ----------------------------------------------------------------------
@@ -479,8 +553,9 @@ def _split_operators(cmd: str) -> list[tuple[str, str]]:
 
     Operators are `&&`, `||`, `;`, `|`, `&` and newline; the last segment
     carries `""`. The operator matters to layer 3, which has to tell a pipe
-    from an `&&` — `curl … | bash` feeds a shell untrusted bytes, and
-    `curl … && bash x.sh` does not.
+    from an `&&`: `curl … && bash x.sh` is not the shape being caught, while
+    a pipe feeds a shell untrusted bytes. [arftl-allow: curl-pipe-shell — prose]
+    `curl … | bash` is the one layer 3 denies.
     """
     parts: list[tuple[str, str]] = []
     current: list[str] = []
@@ -718,14 +793,14 @@ def _check_dangerous_find(command: str) -> str | None:
 # ----------------------------------------------------------------------
 # Layer 3: a network fetch piped into a shell interpreter
 #
-# This layer is the intent of six ported deny rules — `Bash(curl *|bash*)`,
-# `Bash(curl *| bash*)`, `Bash(curl *|sh*)`, `Bash(curl *| sh*)`,
-# `Bash(wget *|bash*)`, `Bash(wget *| bash*)` — none of which could ever fire.
+# This layer is the intent of six ported deny rules — `Bash(curl *|bash*)`,  (arftl-allow: curl-pipe-shell) - prose only; layer 3 matches tokenised pipeline stages, not this literal
+# `Bash(curl *| bash*)`, `Bash(curl *|sh*)`, `Bash(curl *| sh*)`,  (arftl-allow: curl-pipe-shell) - prose only; layer 3 matches tokenised pipeline stages, not this literal
+# `Bash(wget *|bash*)`, `Bash(wget *| bash*)` — none of which could ever fire.  (arftl-allow: curl-pipe-shell) - prose only; layer 3 matches tokenised pipeline stages, not this literal
 # MEASURED against the shipped bundle, not reasoned: Claude Code consults the
 # deny list twice, and the pass that is offered the WHOLE command string
 # returns false for every wildcard rule (`case"wildcard":if(r==="exact")
 # return!1` inside `Fjs`). Wildcard rules therefore only ever see individual
-# subcommands, and no subcommand of `curl … | bash` contains the pipe. The six
+# subcommands, and no subcommand of `curl … | bash` contains the pipe. The six  (arftl-allow: curl-pipe-shell) - prose only; layer 3 matches tokenised pipeline stages, not this literal
 # rules read as protection and stopped nothing.
 # `tests/test_deny_globs.py` lifts that matcher out of the bundle and pins it.
 #
@@ -744,7 +819,7 @@ def _check_dangerous_find(command: str) -> str | None:
 # Deliberately NOT done, and why:
 #   * No descent into arbitrary multi-word tokens. The `-delete` layer does
 #     that, because a token containing `-delete` is executable-shaped wherever
-#     it sits. Here it would deny `git commit -m "never run curl url | bash"`,
+#     it sits. Here it would deny `git commit -m "never run curl url | bash"`,  (arftl-allow: curl-pipe-shell) - prose only; layer 3 matches tokenised pipeline stages, not this literal
 #     which is the over-broad-literal defect (`*aut*review*`, retired in D3)
 #     wearing a new costume. `$( )` and backtick bodies ARE descended into:
 #     those are executed by definition.
@@ -788,7 +863,7 @@ _PIPE_TO_SHELL_HINT = (
     "straight into a shell interpreter, which executes whatever the far end "
     "sent. Nothing between the fetch and the execution ever reads it — not the "
     "agent, not the operator.\n"
-    "This is the intent of six deny rules (`Bash(curl *|bash*)` and its "
+    "This is the intent of six deny rules (`Bash(curl *|bash*)` and its "  # arftl-allow: curl-pipe-shell - prose only; layer 3 matches tokenised pipeline stages, not this literal
     "spellings) that were MEASURED to stop nothing: Claude Code offers the "
     "whole command string only to exact- and prefix-type rules, so a wildcard "
     "pattern spanning a pipe is never matched against it.\n"
@@ -867,8 +942,9 @@ def _stage_head(stage: str) -> str:
 def _pipe_fragments(command: str) -> list[str]:
     """`command`, plus every `$( )` / backtick body nested inside it.
 
-    A substitution body is executed by definition, so `echo $(curl … | bash)`
-    is the same command wearing a hat. Unlike the `-delete` layer this does
+    A substitution body is executed by definition, so the shape below is the
+    same command wearing a hat. [arftl-allow: curl-pipe-shell — prose]
+    `echo $(curl … | bash)`. Unlike the `-delete` layer this does
     NOT descend into multi-word tokens — see the header: that would refuse
     ordinary commit subjects quoting the shape.
 
@@ -892,6 +968,8 @@ def _pipe_fragments(command: str) -> list[str]:
 def _check_pipe_to_shell(command: str) -> str | None:
     """Detect a network fetch feeding a shell interpreter in one pipeline.
 
+    [arftl-allow: curl-pipe-shell — the Denies/Allows list below quotes the
+    shapes this function decides about; they are prose, not commands.]
     Denies: `curl … | bash` and every spelling of it, including through a
     later stage (`| tee x | bash`), a wrapper (`| sudo bash`), an absolute
     path (`| /bin/bash`), a subshell, or a command substitution.
@@ -1155,8 +1233,11 @@ def _repo_has_nixos_remote(repo_root: str) -> bool:
     return False
 
 
-def _candidate_repo_paths(command: str, cwd: str | None) -> list[str]:
+def _candidate_repo_paths(command: str, cwd: str | None) -> tuple[list[str], list[str]]:
     """Candidate working-dir paths to probe for a git repo.
+
+    Returns ``(paths, unresolved)``. ``unresolved`` names each candidate that
+    could not be turned into a path at all.
 
     Order:
       1. Last `cd <path>` target in the command's pipeline chain
@@ -1168,8 +1249,18 @@ def _candidate_repo_paths(command: str, cwd: str | None) -> list[str]:
     a fresh process per call, so the session's directory arrives on the
     payload instead — dropping it would leave the gate unable to see a plain
     `git push` issued from inside the worktree.
+
+    A candidate that will not resolve is REPORTED rather than dropped. Both
+    resolutions below call `os.getcwd()` under the hood for a relative path,
+    so a deleted working directory takes out candidates (2) and (4) together
+    — and a shorter candidate list makes `_nixos_resolve_target_repo` more
+    likely to answer "not a nixos repo", which `_check_nixos_push` reads as
+    ALLOW. Silently dropping them let `git -C <relative> push` past the gate
+    entirely. The caller decides what to do with that; this function no
+    longer decides it by omission.
     """
     candidates: list[str] = []
+    unresolved: list[str] = []
     cd_target = _nixos_extract_cd_target(command)
     if cd_target:
         candidates.append(cd_target)
@@ -1178,14 +1269,14 @@ def _candidate_repo_paths(command: str, cwd: str | None) -> list[str]:
         raw = m.group(1).strip("\"'")
         try:
             candidates.append(os.path.abspath(os.path.expanduser(raw)))
-        except (ValueError, OSError):
-            pass
+        except (ValueError, OSError) as exc:
+            unresolved.append(f"the `git -C {raw[:80]}` path ({type(exc).__name__})")
     if isinstance(cwd, str) and cwd.strip():
         candidates.append(cwd)
     try:
         candidates.append(os.getcwd())
-    except OSError:
-        pass
+    except OSError as exc:
+        unresolved.append(f"the hook's own working directory ({type(exc).__name__})")
     # Dedupe while preserving order.
     seen: set[str] = set()
     deduped: list[str] = []
@@ -1193,7 +1284,7 @@ def _candidate_repo_paths(command: str, cwd: str | None) -> list[str]:
         if p and p not in seen:
             seen.add(p)
             deduped.append(p)
-    return deduped
+    return deduped, unresolved
 
 
 def _nixos_resolve_target_repo(command: str, cwd: str | None) -> str | None:
@@ -1203,8 +1294,17 @@ def _nixos_resolve_target_repo(command: str, cwd: str | None) -> str | None:
     `~/scratch/foo/`, `/tmp/clones/nixos-config/`, or anywhere outside the
     canonical `~/Repos/nixos-config-worktrees/` tree still gates as long as
     one of its configured remotes points at jonathanmoregard/nixos-config.
+
+    Returning None means "no nixos-config repo here", and `_check_nixos_push`
+    reads that as allow. So None is only permitted to mean it when every
+    candidate was actually LOOKED at. If a candidate could not even be
+    resolved to a path, "not a nixos push" and "could not tell" would render
+    identically, and the gate would be switched off by a deleted directory.
+    That is the same failure `_nixos_git` already refuses to make for a git
+    command it could not run.
     """
-    for path in _candidate_repo_paths(command, cwd):
+    paths, unresolved = _candidate_repo_paths(command, cwd)
+    for path in paths:
         rc, toplevel, _ = _nixos_git(path, ["rev-parse", "--show-toplevel"])
         if rc != 0:
             continue
@@ -1213,6 +1313,12 @@ def _nixos_resolve_target_repo(command: str, cwd: str | None) -> str | None:
             continue
         if _repo_has_nixos_remote(repo_root):
             return repo_root
+    if unresolved:
+        _fail_closed(
+            "the nixos push gate found no nixos-config repo among the paths it "
+            "could resolve, but it could not resolve " + "; ".join(unresolved)
+            + " — so it cannot say this push is NOT a nixos-config push"
+        )
     return None
 
 

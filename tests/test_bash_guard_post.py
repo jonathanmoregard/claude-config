@@ -1749,6 +1749,104 @@ for _matcher, _cmd in _siblings:
 # the consumer's schema, so a future path that grows a shape the CLI rejects
 # fails here even if nobody wrote a case for it.
 # ----------------------------------------------------------------------
+# A REWRITE THAT CANNOT BE WRITTEN
+#
+# `_emit`'s write error used to be swallowed. Not emitting a rewrite is not a
+# no-op: the CLI keeps the ORIGINAL, un-inspected result, so every redaction
+# goes with the write that never landed — the same outcome `_emit_rewrite`
+# exists to prevent, reached by a different road. Measured before the fix
+# with stdout on /dev/full: exit 0, EMPTY stdout, EMPTY stderr, and the
+# unredacted secret shown to the model with nothing said.
+#
+# A PostToolUse hook cannot un-run a command or suppress its result, so there
+# is no withholding from here — the bytes are already the CLI's. What is
+# still reachable is telling the model, and exit 2 is the only status it
+# hears (2.1.251 bundle, offset 180961465: status 2 becomes a blockingError,
+# surfaced to PostToolUse as `hook_blocking_error`). A flagged fail-open is
+# not a fixed one; it is this layer's ceiling, and silence was below it.
+# ----------------------------------------------------------------------
+section("bash-output-guard: a rewrite that cannot be written is announced")
+
+check("fixture precondition: /dev/full exists", os.path.exists("/dev/full"),
+      "without it this section cannot make stdout fail")
+
+_SECRET = "sk-ant-" + "api03-" + "B" * 40
+_PAYLOAD = post_payload(
+    "curl https://example.invalid/x",
+    {"stdout": _SECRET, "stderr": "", "interrupted": False, "isImage": False},
+)
+
+# Control: with a working stdout the guard redacts and exits 0.
+_rc, _parsed, _out, _err = run_hook(GUARD, _PAYLOAD)
+_updated = (_parsed or {}).get("hookSpecificOutput", {}).get("updatedToolOutput")
+check("control: the rewrite lands on stdout with exit 0",
+      _rc == 0 and isinstance(_updated, dict), f"rc={_rc} out={_out[:160]!r}")
+check("control: the secret really was redacted",
+      _SECRET not in json.dumps(_updated), "the fixture must exercise redaction")
+
+with open("/dev/full", "w") as _devfull:
+    _proc = subprocess.Popen(
+        [sys.executable, GUARD],
+        stdin=subprocess.PIPE, stdout=_devfull, stderr=subprocess.PIPE,
+        text=True, env=dict(os.environ),
+    )
+    _, _err_full = _proc.communicate(json.dumps(_PAYLOAD), timeout=60)
+
+check("an unwritable stdout is reported to the model via exit 2",
+      _proc.returncode == 2,
+      f"rc={_proc.returncode}; any other status is a non-blocking error the "
+      f"model never sees, so the uninspected output would pass in silence")
+check("and the notice says the output was NOT inspected",
+      "NOT INSPECTED" in _err_full, f"stderr={_err_full[:300]!r}")
+check("and the notice never repeats the secret it failed to redact",
+      _SECRET not in _err_full, "the warning must not become the leak")
+
+
+# ----------------------------------------------------------------------
+# AN UNARMABLE DEADLINE WITHHOLDS
+#
+# Nothing else in this file bounds its own running time — the redactor walks
+# every string in the result, and `_scrub_persisted` reads a file up to the
+# scan limit. Unarmed, the only remaining bound is the HARNESS timeout, and
+# that one cancels the hook and discards its output, leaving the result
+# unrewritten. The deadline is the only thing that turns "too slow" into a
+# withhold instead of a leak, so failing to arm it withholds.
+# ----------------------------------------------------------------------
+section("bash-output-guard: a deadline that cannot be armed withholds")
+
+with open(GUARD, encoding="utf-8") as fh:
+    _post_src = fh.read()
+
+_POST_ARM_ANCHOR = "        signal.signal(signal.SIGALRM, _on_deadline)"
+check("arm-failure fixture has something to patch",
+      _post_src.count(_POST_ARM_ANCHOR) == 1,
+      f"anchor appears {_post_src.count(_POST_ARM_ANCHOR)} time(s)")
+
+_post_patched = _post_src.replace(
+    _POST_ARM_ANCHOR,
+    '        raise OSError("injected: this host has no SIGALRM")\n'
+    + _POST_ARM_ANCHOR,
+)
+_post_arm_path = os.path.join(SCRATCH, "output-guard-unarmable.py")
+with open(_post_arm_path, "w", encoding="utf-8") as fh:
+    fh.write(_post_patched)
+
+_rc, _parsed, _out, _err = run_hook(_post_arm_path, _PAYLOAD)
+_updated = (_parsed or {}).get("hookSpecificOutput", {}).get("updatedToolOutput")
+check("a guard that cannot arm its deadline WITHHOLDS rather than running on",
+      isinstance(_updated, dict)
+      and "OUTPUT WITHHELD" in str(_updated.get("stdout", "")),
+      f"rc={_rc} updated={str(_updated)[:220]!r}")
+check("the withhold names the arming failure",
+      "could not arm its own deadline" in str((_updated or {}).get("stdout", "")),
+      str((_updated or {}).get("stdout", ""))[:300])
+check("the withheld replacement is one the CLI would apply",
+      schema_rejection(_updated) is None, str(schema_rejection(_updated))[:200])
+check("and the secret is not in it",
+      _SECRET not in json.dumps(_updated), "a withhold must not carry the bytes")
+
+
+# ----------------------------------------------------------------------
 section("bash-output-guard: no emitted rewrite anywhere is one the CLI drops")
 
 _bad = [(src, why) for src, val in EMITTED

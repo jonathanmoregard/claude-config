@@ -468,6 +468,11 @@ def _dcg_rule_set_faults(dcg_path: str, cfg_path: str, marker_path: str,
         # seed names itself in its reason strings, which survive a plain
         # read. Corroboration only — the packaged binary always answers in
         # JSON, so this branch is for older builds and test stubs.
+        # arftl-allow: suppression-marker — narrowing only, not a silenced
+        # error. `_run_dcg_config` returns ("text", outcomes) exclusively from
+        # the branch that built `outcomes` as a non-empty list of 4-tuples;
+        # the checker cannot see that through the declared `object`. A crash
+        # here would now be REPORTED by the crash handler, not swallowed.
         outcomes = [o for o in payload if o[0] == "user"]  # type: ignore[union-attr]
         if not outcomes:
             return [(DOWN, (
@@ -509,6 +514,10 @@ def _dcg_rule_set_faults(dcg_path: str, cfg_path: str, marker_path: str,
         return []
 
     doc = payload  # JSON
+    # arftl-allow: suppression-marker — narrowing only. `_run_dcg_config`
+    # returns ("json", doc) solely from the branch guarded by
+    # `isinstance(doc, dict) and isinstance(doc.get("config_sources"), list)`,
+    # so both the .get and the list are guaranteed by the producer.
     sources = doc.get("config_sources") or []  # type: ignore[union-attr]
     loaded = [
         s for s in sources
@@ -539,6 +548,10 @@ def _dcg_rule_set_faults(dcg_path: str, cfg_path: str, marker_path: str,
 
     faults: list[tuple[str, str]] = []
 
+    # arftl-allow: suppression-marker — narrowing only; `doc` is the same
+    # producer-guaranteed dict as above. The `or {}` already handles a missing
+    # or null `overrides`, and `_covered_classes` handles a `block` of any
+    # shape, so no value reaches here that the code does not expect.
     block = (doc.get("overrides") or {}).get("block")  # type: ignore[union-attr]
     covered, uninspectable = _covered_classes(block)
     missing = [label for label, _ in FULL_ONLY_CLASSES if label not in covered]
@@ -591,6 +604,9 @@ def _dcg_rule_set_faults(dcg_path: str, cfg_path: str, marker_path: str,
     # re-triggers it and hand-reverting does not stick. It fired on the live
     # host on 2026-08-24. Announced, not denied: the guard still evaluates
     # correctly, it is the settings file that is at risk.
+    # arftl-allow: suppression-marker — narrowing only; same producer-
+    # guaranteed dict. `is True` is deliberate: any other value, including a
+    # non-dict `general`, leaves the announcement unmade rather than guessed.
     if (doc.get("general") or {}).get("self_heal_hook") is True:  # type: ignore[union-attr]
         faults.append((REDUCED, (
             "dcg's `self_heal_hook` is ENABLED (upstream's default). In that "
@@ -669,14 +685,37 @@ def _faults() -> list[tuple[str, str]]:
     return out
 
 
+# True once a report has been written to stdout. The crash handler checks it
+# so a late failure cannot append a second JSON object to a report already
+# sent — two objects on stdout parse as neither.
+_EMITTED = False
+
+
+def _report(message: str, context: str) -> None:
+    """Write the SessionStart report. Marks stdout as spoken for."""
+    global _EMITTED
+    _EMITTED = True
+    json.dump(
+        {
+            "systemMessage": message,
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": context,
+            },
+        },
+        sys.stdout,
+    )
+    sys.stdout.flush()
+
+
 def main() -> int:
-    try:
-        # Payload is read and discarded: this check depends on the guard's
-        # own state, not on anything the session tells us. Draining stdin
-        # keeps the harness from seeing a broken pipe.
-        sys.stdin.read()
-    except (OSError, ValueError):
-        pass
+    # arftl-allow: swallowed-exception — stdin is drained and DISCARDED; every
+    # fault this check reports is read from dcg and the filesystem, never from
+    # the payload, so failing to read it cannot change a verdict. The read
+    # exists only to spare the harness a broken pipe, and a broken pipe is the
+    # very thing this would be reporting.
+    try: sys.stdin.read()
+    except (OSError, ValueError): pass
 
     try:
         faults = _faults()
@@ -710,21 +749,11 @@ def main() -> int:
         )
 
     bullets = "\n".join(f"  - {text}" for _sev, text in faults)
-    message = f"{head}\n{bullets}\n{foot}"
-    json.dump(
-        {
-            "systemMessage": message,
-            "hookSpecificOutput": {
-                "hookEventName": "SessionStart",
-                "additionalContext": (
-                    "Guard health at session start: "
-                    + " ".join(text for _sev, text in faults)
-                ),
-            },
-        },
-        sys.stdout,
+    _report(
+        f"{head}\n{bullets}\n{foot}",
+        "Guard health at session start: "
+        + " ".join(text for _sev, text in faults),
     )
-    sys.stdout.flush()
     return 0
 
 
@@ -733,6 +762,31 @@ if __name__ == "__main__":
         sys.exit(main())
     except SystemExit:
         raise
-    except BaseException:
-        # A broken health check must not be the thing that breaks startup.
+    except BaseException as _exc:
+        # A broken health check must not be the thing that breaks startup —
+        # but it must not be silent either. Exiting 0 with nothing on stdout
+        # was indistinguishable from "the guards are healthy", which is the
+        # precise failure mode this whole file exists to report on: the last
+        # outage lasted four months because a dead layer produced no symptom.
+        # A check that dies now SAYS it died, and says the health of the
+        # guards is therefore unknown rather than good.
+        if not _EMITTED:
+            try:
+                _report(
+                    "BASH GUARD HEALTH: the health check itself CRASHED "
+                    f"({type(_exc).__name__}: {str(_exc)[:200]}), so the state "
+                    "of the bash guards at this session's start is UNKNOWN — "
+                    "not confirmed good. Run "
+                    "`python3 ~/.claude/hooks/bash-guard-health.py </dev/null` "
+                    "to see the failure, and `dcg config --format json` to "
+                    "check the guard directly.",
+                    "The bash-guard health check crashed; guard health is "
+                    "unknown, not verified.",
+                )
+            except BaseException:
+                # arftl-allow: swallowed-exception — the reporting of a crash
+                # must not itself break session startup. stdout is already
+                # unwritable in this branch, so there is no channel left and
+                # nothing a raise could reach.
+                pass
         sys.exit(0)
