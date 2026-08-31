@@ -1,6 +1,6 @@
 ---
 name: claude-code-permissions
-description: Use when a permission prompt fires that a rule should have covered, when writing or auditing permissions.allow/ask/deny in settings.json, when a rule "does nothing", or when deciding a permission-ledger proposal. Also for questions about rule syntax, // vs / vs ~/ anchoring, glob and dotfile matching, Write() vs Edit() rules, protected paths, permission modes, additionalDirectories, settings precedence, subagent inheritance, or mcp__server__* rule naming.
+description: Use when a permission prompt fires that a rule should have covered, when writing or auditing permissions.allow/ask/deny in settings.json, when a rule "does nothing", or when deciding a permission-ledger proposal. Also for questions about rule syntax, // vs / vs ~/ anchoring, glob and dotfile matching, Write() vs Edit() rules, protected paths, permission modes, additionalDirectories, settings precedence, subagent inheritance, or mcp__server__* rule naming. User-scope rules live in read-only ~/.claude, so the edit belongs in a worktree.
 ---
 
 # How Claude Code permissions actually work
@@ -8,6 +8,22 @@ description: Use when a permission prompt fires that a rule should have covered,
 Written 2026-08-24 from the official docs plus controlled probes on this machine.
 Claims are tagged **[docs]**, **[measured]** (probe on dellan), or **[unverified]**.
 When a section is tagged **[measured]**, that measurement beats any reasoning.
+
+## Changing a user-scope rule
+
+`~/.claude/settings.json` is read-only and pinned to `master`; the harness reads
+it live, so an edited rule is in force before anyone has reviewed it.
+
+```bash
+git -C ~/.claude fetch origin master
+git -C ~/.claude worktree add ~/worktrees/claude-<slug> -b feat/<slug> origin/master
+cd ~/worktrees/claude-<slug>
+```
+
+Edit `settings.json` there, commit, push, `gh pr create`; the merge click is
+Jonathan's. Never commit to a branch this session did not create. Diagnosing is
+free — reading the ledger, probing a matcher, reasoning about anchoring all
+happen anywhere. Only the write needs the worktree.
 
 ## The first four things to check
 
