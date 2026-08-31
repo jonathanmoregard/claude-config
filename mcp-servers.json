@@ -47,13 +47,8 @@
   },
   "aggregator": {
     "type": "stdio",
-    "command": "uv",
-    "args": [
-      "run",
-      "--directory",
-      "/home/jonathan/Repos/aggregator",
-      "aggregator-mcp"
-    ],
+    "command": "/etc/profiles/per-user/jonathan/bin/aggregator-mcp",
+    "args": [],
     "env": {}
   },
   "reddit": {
