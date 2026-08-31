@@ -241,7 +241,7 @@ class TestRecordSchema(HookRunMixin, unittest.TestCase):
 class TestDeniedRecord(HookRunMixin, unittest.TestCase):
     def test_denied_adds_fields_and_shares_digest_with_the_request(self):
         req = make_request(
-            tool_name="mcp__safe-bash__exec",
+            tool_name="Bash",
             tool_input={"command": "rm -rf /home/jonathan/tmp/scratch"},
         )
         den = make_denied(req, tool_use_id="toolu_01XYZ", reason="user said no")
@@ -403,16 +403,16 @@ class TestPatternKeyFileTools(unittest.TestCase):
 
 
 class TestPatternKeyCommandTools(unittest.TestCase):
-    SAFE = "mcp__safe-bash__exec"
+    TOOL = "Bash"
 
     def key(self, command, tool=None):
-        return hook.pattern_key(tool or self.SAFE, {"command": command})
+        return hook.pattern_key(tool or self.TOOL, {"command": command})
 
     def test_subcommand_taking_tool_keeps_two_tokens(self):
-        self.assertEqual(self.key("git log --oneline"), self.SAFE + ":git log")
+        self.assertEqual(self.key("git log --oneline"), self.TOOL + ":git log")
 
     def test_plain_command_keeps_one_token(self):
-        self.assertEqual(self.key("ls -la"), self.SAFE + ":ls")
+        self.assertEqual(self.key("ls -la"), self.TOOL + ":ls")
 
     def test_every_documented_subcommand_tool(self):
         for prog, sub in [
@@ -429,49 +429,56 @@ class TestPatternKeyCommandTools(unittest.TestCase):
             with self.subTest(prog=prog):
                 self.assertEqual(
                     self.key("%s %s --flag x" % (prog, sub)),
-                    "%s:%s %s" % (self.SAFE, prog, sub),
+                    "%s:%s %s" % (self.TOOL, prog, sub),
                 )
 
     def test_subcommand_tool_with_no_second_token_stays_one_token(self):
-        self.assertEqual(self.key("git"), self.SAFE + ":git")
+        self.assertEqual(self.key("git"), self.TOOL + ":git")
 
-    def test_native_bash_tool_uses_the_same_rule(self):
-        self.assertEqual(self.key("git diff HEAD", tool="Bash"), "Bash:git diff")
-        self.assertEqual(self.key("pwd", tool="Bash"), "Bash:pwd")
+    def test_retired_safe_bash_tool_name_still_classifies(self):
+        # `Bash` is the standing shell tool; the safe-bash MCP is retired. Its
+        # name stays in hook.py's BASH_TOOLS because ledger files written before
+        # the switchover recorded calls under it, and aggregate.py still has to
+        # group those historical records as commands rather than as opaque
+        # tool names. Drop the tuple entry and six months of retained ledger
+        # data regroups wrongly.
+        legacy = "mcp__safe-bash__exec"
+        self.assertEqual(self.key("git diff HEAD", tool=legacy), legacy + ":git diff")
+        self.assertEqual(self.key("pwd", tool=legacy), legacy + ":pwd")
 
     def test_sudo_prefix_is_stripped(self):
         self.assertEqual(self.key("sudo systemctl restart nginx"),
-                         self.SAFE + ":systemctl restart")
-        self.assertEqual(self.key("sudo ls -la /root"), self.SAFE + ":ls")
+                         self.TOOL + ":systemctl restart")
+        self.assertEqual(self.key("sudo ls -la /root"), self.TOOL + ":ls")
 
     def test_timeout_prefix_is_stripped(self):
-        self.assertEqual(self.key("timeout 30 git fetch"), self.SAFE + ":git fetch")
-        self.assertEqual(self.key("timeout 5s ls"), self.SAFE + ":ls")
-        self.assertEqual(self.key("timeout --signal=KILL 30 ls"), self.SAFE + ":ls")
+        self.assertEqual(self.key("timeout 30 git fetch"), self.TOOL + ":git fetch")
+        self.assertEqual(self.key("timeout 5s ls"), self.TOOL + ":ls")
+        self.assertEqual(self.key("timeout --signal=KILL 30 ls"), self.TOOL + ":ls")
 
     def test_env_assignment_prefixes_are_stripped(self):
-        self.assertEqual(self.key("FOO=bar ls -la"), self.SAFE + ":ls")
-        self.assertEqual(self.key("FOO=bar BAZ=qux git push"), self.SAFE + ":git push")
-        self.assertEqual(self.key("env FOO=bar cargo test"), self.SAFE + ":cargo test")
+        self.assertEqual(self.key("FOO=bar ls -la"), self.TOOL + ":ls")
+        self.assertEqual(self.key("FOO=bar BAZ=qux git push"), self.TOOL + ":git push")
+        self.assertEqual(self.key("env FOO=bar cargo test"), self.TOOL + ":cargo test")
 
     def test_stacked_prefixes_are_all_stripped(self):
         self.assertEqual(
             self.key("sudo timeout 30 FOO=bar git gc --aggressive"),
-            self.SAFE + ":git gc",
+            self.TOOL + ":git gc",
         )
 
     def test_absolute_program_path_is_reduced_to_its_basename(self):
-        self.assertEqual(self.key("/usr/bin/git log"), self.SAFE + ":git log")
+        self.assertEqual(self.key("/usr/bin/git log"), self.TOOL + ":git log")
 
     def test_prefix_only_command_falls_back_to_tool_name(self):
-        self.assertEqual(self.key("sudo"), self.SAFE)
-        self.assertEqual(self.key(""), self.SAFE)
-        self.assertEqual(hook.pattern_key(self.SAFE, {}), self.SAFE)
-        self.assertEqual(hook.pattern_key(self.SAFE, {"command": 42}), self.SAFE)
+        self.assertEqual(self.key("sudo"), self.TOOL)
+        self.assertEqual(self.key(""), self.TOOL)
+        self.assertEqual(hook.pattern_key(self.TOOL, {}), self.TOOL)
+        self.assertEqual(hook.pattern_key(self.TOOL, {"command": 42}), self.TOOL)
 
     def test_huge_command_string_is_handled_without_reading_it_all(self):
         huge = "git log " + ("x" * (1024 * 1024))
-        self.assertEqual(self.key(huge), self.SAFE + ":git log")
+        self.assertEqual(self.key(huge), self.TOOL + ":git log")
 
 
 class TestPatternKeyOtherTools(unittest.TestCase):
@@ -624,7 +631,7 @@ class TestRedactionEndToEnd(HookRunMixin, unittest.TestCase):
     def test_secret_never_reaches_the_ledger_line(self):
         secret = "sk-proj-abc123DEF456ghi789JKL012"
         payload = make_request(
-            tool_name="mcp__safe-bash__exec",
+            tool_name="Bash",
             tool_input={
                 "command": "curl -H 'Authorization: Bearer %s' https://api" % secret,
                 "meta": {"list": ["AKIAIOSFODNN7EXAMPLE"]},
@@ -640,7 +647,7 @@ class TestRedactionEndToEnd(HookRunMixin, unittest.TestCase):
         self.assertEqual(rec["tool_input"]["meta"]["list"], ["[REDACTED:aws-key]"])
         # digest is over the unredacted input, so it still joins with a denial
         self.assertEqual(rec["input_digest"], hook.input_digest(payload["tool_input"]))
-        self.assertEqual(rec["pattern_key"], "mcp__safe-bash__exec:curl")
+        self.assertEqual(rec["pattern_key"], "Bash:curl")
 
     def test_secret_in_a_suggestion_rule_is_redacted(self):
         payload = make_request(
@@ -819,7 +826,7 @@ class TestFaultInjection(HookRunMixin, unittest.TestCase):
     def test_one_megabyte_command_string(self):
         huge = "git log " + ("A" * (1024 * 1024))
         payload = make_request(
-            tool_name="mcp__safe-bash__exec", tool_input={"command": huge}
+            tool_name="Bash", tool_input={"command": huge}
         )
         proc = self.run_hook(payload)
         self.assert_silent_success(proc)
@@ -827,7 +834,7 @@ class TestFaultInjection(HookRunMixin, unittest.TestCase):
         lines = self.read_lines()
         self.assertEqual(len(lines), 1)
         rec = json.loads(lines[0])
-        self.assertEqual(rec["pattern_key"], "mcp__safe-bash__exec:git log")
+        self.assertEqual(rec["pattern_key"], "Bash:git log")
         # digest is over the full, untruncated input so the denial still joins
         self.assertEqual(rec["input_digest"], hook.input_digest({"command": huge}))
         self.assertLess(len(lines[0]), 32 * 1024, "ledger line was not bounded")
@@ -914,7 +921,7 @@ class TestConcurrency(HookRunMixin, unittest.TestCase):
             payloads.append(
                 make_request(
                     session_id="session-%02d" % i,
-                    tool_name="mcp__safe-bash__exec",
+                    tool_name="Bash",
                     tool_input={
                         "command": "git log --grep %s" % ("q%02d " % i * 400),
                         # Push each line past PIPE_BUF (4096) so a non-atomic
@@ -956,7 +963,7 @@ class TestConcurrency(HookRunMixin, unittest.TestCase):
                 len(line.encode("utf-8")), 4096, "line no longer stresses PIPE_BUF"
             )
             rec = json.loads(line)  # a torn line raises here
-            self.assertEqual(rec["pattern_key"], "mcp__safe-bash__exec:git log")
+            self.assertEqual(rec["pattern_key"], "Bash:git log")
             seen.add(rec["session_id"])
         self.assertEqual(seen, {"session-%02d" % i for i in range(n)})
 
@@ -1009,7 +1016,7 @@ class TestSpeed(HookRunMixin, unittest.TestCase):
         os.environ["PERMISSION_LEDGER_DIR"] = self.ledger_dir
         self.addCleanup(os.environ.pop, "PERMISSION_LEDGER_DIR", None)
         payload = make_request(
-            tool_name="mcp__safe-bash__exec",
+            tool_name="Bash",
             tool_input={"command": "git log --oneline -n 20 " + "x" * 2000},
         )
         hook.emit(payload)  # warm the regex cache
@@ -1038,7 +1045,7 @@ class TestSpeed(HookRunMixin, unittest.TestCase):
         os.environ["PERMISSION_LEDGER_DIR"] = self.ledger_dir
         self.addCleanup(os.environ.pop, "PERMISSION_LEDGER_DIR", None)
         payload = make_request(
-            tool_name="mcp__safe-bash__exec",
+            tool_name="Bash",
             tool_input={"command": "git log " + "A" * (1024 * 1024)},
         )
         hook.emit(payload)

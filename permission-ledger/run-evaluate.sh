@@ -12,10 +12,14 @@
 #   5. otherwise run `claude --print` over prompt.md, READ-ONLY, and hand its
 #      stdout to proposal-sink.py, which writes the proposal files
 #
-# Why the aggregation is here and not inside the agent: `permissions.deny` in
-# ~/.claude/settings.json contains a blanket "Bash", and deny beats allow, so a
-# `--allowedTools "Bash(python3 .../aggregate.py*)"` grant can never take
-# effect. The agent therefore gets no Bash at all — it Reads the digest file.
+# Why the aggregation is here and not inside the agent: the agent is launched with
+# an explicit positive `--allowedTools` list (see ALLOWED_TOOLS below) that names
+# only Read/Glob/Grep, so it has no shell no matter what settings.json says. It
+# Reads the digest file. This used to be argued from a blanket "Bash" in
+# `permissions.deny` beating any allow; that deny was removed when safe-bash was
+# retired and `Bash` moved into `permissions.allow`, so the allowlist — which was
+# always the real mechanism — is now the only thing keeping the agent read-only.
+# Do not add a Bash(...) entry to ALLOWED_TOOLS expecting the deny to catch it.
 #
 # Why the proposal writing is here and not inside the agent either: the same
 # reasoning one step further. This script used to pass

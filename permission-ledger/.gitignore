@@ -5,7 +5,10 @@ digest-latest.json
 digest-prev.json
 decided.json
 .evaluate.lock
-tests/.testhome/
+# run-tests.sh builds this at permission-ledger/.testhome (TESTHOME="$S/.testhome",
+# where S is this directory), not under tests/ — the old `tests/.testhome/` path
+# never matched, so every harness run left the throwaway HOME untracked.
+.testhome/
 __pycache__/
 # Test-run artifacts (outputs, not sources)
 tests/crontab.*

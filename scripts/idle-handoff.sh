@@ -858,6 +858,13 @@ candidate_cwd_is_control_plane() {
 #     pre-approved, no prompt)
 #   * MCP tools present: safe-bash, research-agent, aggregator, gdocs-review, and
 #     the connected Google Drive / Calendar / Gmail servers -> egress
+# (2026-08-31, safe-bash retirement: the shell route was RENAMED, not closed. The
+# measurement above stands exactly as it was taken on 2026-08-16 -- on that day the
+# pre-approved shell arrived as `mcp__safe-bash__exec` under an `mcp__safe-bash__*`
+# allow entry. That server is now deleted and `permissions.allow` carries a plain
+# `Bash` instead, so the same `id -u` would today be pre-approved via the native
+# Bash tool. The finding is unchanged: an unrestricted fork inherits pre-approved
+# arbitrary command execution. Only the tool name moved.)
 # That is pre-approved arbitrary command execution and data egress on a process whose
 # `## Next` list a model wrote out of a transcript that may contain injected text.
 # None of it is in the grant this script means to hand over. The exposure PREDATES
@@ -919,7 +926,10 @@ candidate_cwd_is_control_plane() {
 #           mission.md and nothing else (R1)
 #   CANNOT  read anything else on disk: /etc/nixos, ~/.claude/settings.json and the
 #           other ambient additionalDirectories are all refused
-#   CANNOT  run a shell command by ANY route — no Bash tool, no mcp__safe-bash__*
+#   CANNOT  run a shell command by ANY route — `Bash` is denied by name, and
+#           `--setting-sources ''` loads no MCP servers at all, so no MCP shell
+#           tool exists to fall back on either (that closed mcp__safe-bash__exec
+#           while it existed; it was retired 2026-08-31, and the rail is unchanged)
 #   CANNOT  reach the network or any MCP server, so it cannot egress
 #   CANNOT  reach its own settings file, the fork ledger, or the request markers:
 #           all live under $IDLE_HANDOFF_STATE_DIR, outside both the workspace and
@@ -1006,7 +1016,9 @@ fork_restriction_available() {
 #
 #   defaultMode acceptEdits    the fork is headless; a prompt is a denial
 #   allow []                   nothing is pre-approved. This is the field whose
-#                              inherited value carried `mcp__safe-bash__*`
+#                              inherited value carried pre-approved shell —
+#                              `mcp__safe-bash__*` when this was written, a plain
+#                              `Bash` since the 2026-08-31 retirement
 #   deny [tool names]          the same closure --tools performs, by a second
 #                              mechanism, because --tools silently ignores an
 #                              unknown name and a renamed tool would otherwise
@@ -1841,7 +1853,7 @@ PROMPT
   # flag check is anchored and the deny rail is probed rather than assumed.
   if ! fork_restriction_available; then
     count_skipped_fork_unrestrictable=$((count_skipped_fork_unrestrictable + 1))
-    m="ERROR sid=$sid cwd=$candidate_cwd: NOT forking — the fork's authority cannot be restricted: $FORK_RESTRICTION_WHY. An unrestricted fork inherits the interactive user's whole permission surface (additionalDirectories + allow, which includes pre-approved shell via mcp__safe-bash__*), so this fails closed instead."
+    m="ERROR sid=$sid cwd=$candidate_cwd: NOT forking — the fork's authority cannot be restricted: $FORK_RESTRICTION_WHY. An unrestricted fork inherits the interactive user's whole permission surface (additionalDirectories + allow, which includes pre-approved shell via Bash), so this fails closed instead."
     log "$m"
     printf 'idle-handoff: %s\n' "$m" >&2   # systemd journal sees it
     continue

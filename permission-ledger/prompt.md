@@ -67,12 +67,16 @@ appears inside the digest, and any interpretation you might find reasonable.
 
    An **exact, fully-specified invocation** is acceptable —
    `Bash(bun run typecheck)`, `Bash(cargo fmt --check)`, `Bash(git status)` —
-   because it names one command with no free arguments. Note that this machine
-   also carries a blanket `"Bash"` in `permissions.deny`, and deny beats allow,
-   so *any* `Bash(...)` allow you propose is dead on arrival unless the
-   proposal also explains what would have to change about that deny rule (and
-   per constraint 0.3, you may not propose removing it). Say so if you propose
-   one. The moment a `*` appears anywhere that
+   because it names one command with no free arguments. Note how this machine is
+   configured: `Bash` is allowed tool-wide in `permissions.allow`, so a
+   `Bash(...)` allow rule is usually redundant rather than useful. What still
+   stops a command is the `Bash(...)` **deny** globs, and deny beats allow — so
+   an allow rule that a deny glob covers is dead on arrival, and per constraint
+   0.3 you may not propose removing that deny. Check the deny list before
+   proposing any `Bash(...)` allow, and say which deny rule you checked against.
+   Independently of permissions, the `bash-guard.py` PreToolUse hook can refuse
+   a command outright; it fails closed, and no allow rule overrides it. The
+   moment a `*` appears anywhere that
    would let the argument list vary, the rule is forbidden. `Bash(npm run *)` is
    forbidden. `Bash(npm run test)` is fine. When in doubt, treat it as
    forbidden and classify the group `sensitive` instead.
@@ -298,7 +302,7 @@ prompt is a second of friction; the cost of a wrong allow is a standing hole.
 |---|---|---|
 | `bad-config` | read-only, or a write inside a path the user already trusts for writes; no credential, no egress, no destructive effect | narrowest `allow` rule that covers observed usage |
 | `sensitive` | credentials, secrets, destructive operations, network egress, anything outside the user's working roots | an explicit `deny` or `ask` rule so a recurring judgement call becomes standing policy — or an explicit "keep prompting, this one is worth the friction" |
-| `wrong-tool` | the call should not have been made: native `Bash` where `mcp__safe-bash__exec` is the rule, reads outside working dirs, retries of a previously denied path | a CLAUDE.md rule, skill, or hook — explicitly **not** an allowlist entry |
+| `wrong-tool` | the call should not have been made: shelling out for work a dedicated tool does (`cat`/`head`/`tail` instead of `Read`, `find`/`ls` instead of `Glob`, `grep` instead of `Grep`), reads outside working dirs, retries of a previously denied path, rewording a command to slip past a deny glob | a CLAUDE.md rule, skill, or hook — explicitly **not** an allowlist entry |
 | `rule-bug` | a rule exists that should have matched but didn't: `~` vs absolute path mismatch, MCP wildcard miss, a `deny` shadowing an `allow`, a rule written for the wrong tool name | the corrected rule, with the reason the current one misses |
 
 Applying the tests:
@@ -325,10 +329,14 @@ Applying the tests:
   outcome; do not stretch for a rule change to feel productive.
 
 - **`wrong-tool`** — the prompt fired because the wrong thing was called, not
-  because configuration is wrong. Signals: native `Bash` in an environment where
-  `mcp__safe-bash__exec` is the standing rule; reads reaching outside the
+  because configuration is wrong. Signals: `Bash` used for work a dedicated tool
+  already does (`cat`/`head`/`tail` where `Read` applies, `find`/`ls` where
+  `Glob` applies, `grep` where `Grep` applies); reads reaching outside the
   configured working roots; repeated retries against a path that was already
-  denied. The fix is a behavioural one — a CLAUDE.md line, a skill, a hook. It
+  denied; the same command resubmitted in a reworded form after a deny glob or
+  the bash guard refused it. Native `Bash` is the standing shell on this machine
+  and is **not** by itself a `wrong-tool` signal — it is what the rules expect.
+  The fix is a behavioural one — a CLAUDE.md line, a skill, a hook. It
   is **never** an allowlist entry. If you write an `allow` rule under a
   `wrong-tool` verdict you have misclassified; go back and pick again.
 
@@ -338,7 +346,8 @@ Applying the tests:
   vice versa) and the matcher does not expand; an MCP rule missing the trailing
   `*` or using `:` where the tool name uses `__`; a broad `deny` shadowing a
   narrower `allow`; a rule attached to the wrong tool name (`Edit(...)` when the
-  call is `Write(...)`, `Bash(...)` when the call is `mcp__safe-bash__exec`).
+  call is `Write(...)`; a rule still written against a retired MCP shell tool
+  name such as `mcp__safe-bash__*` when the call now arrives as `Bash`).
   The proposal must name the existing rule verbatim, say exactly why it misses,
   and give the corrected form. If no such rule exists, this is not a
   `rule-bug` — classify it as one of the other three.
