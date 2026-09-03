@@ -321,6 +321,83 @@ with Sandbox() as sb:
 
 
 # ----------------------------------------------------------------------
+section("Direction — the same channel, both ways")
+# ----------------------------------------------------------------------
+
+# The proposals sink (~/.local/state/claude-proposals) is pushed to a private
+# GitHub remote by claude-proposals-push.timer. Its failure is the same SHAPE as
+# a failed pull — an unattended git operation that stops and tells nobody — but
+# the consequence is the opposite: nothing is going stale, something is not
+# being backed up. Two notification systems for one class of failure would be
+# its own bug, so it writes the same record with direction="push" and this hook
+# reads both.
+with Sandbox() as sb:
+    sink = sb.repo("claude-proposals")
+    write_status(sb.state_root, sink, direction="push", state="alert",
+                 reason="gitleaks refused the 3 commit(s) this push would ship")
+    msg = announcement(run_hook(sb.state_root, [sink])).get("systemMessage", "")
+    check("a push-direction alert is announced", str(sink) in msg, detail=msg[:200])
+    check("a push-direction alert says auto-push, not auto-pull",
+          "auto-push" in msg.lower() and "auto-pull is blocked" not in msg.lower(),
+          detail=msg[:300])
+    check("a push-direction alert carries its reason", "gitleaks" in msg,
+          detail=msg[:300])
+
+with Sandbox() as sb:
+    sink = sb.repo("claude-proposals")
+    write_status(sb.state_root, sink, direction="push")
+    proc = run_hook(sb.state_root, [sink])
+    check("a healthy push record stays silent", proc.stdout == "",
+          detail=repr(proc.stdout))
+
+with Sandbox() as sb:
+    sink = sb.repo("claude-proposals")
+    write_status(sb.state_root, sink, direction="push", state="unverified",
+                 reason="git fetch failed 2 time(s) in a row")
+    msg = announcement(run_hook(sb.state_root, [sink])).get("systemMessage", "")
+    check("an unverified push record is announced in push terms",
+          "auto-push" in msg.lower() and "auto-pull" not in msg.lower(),
+          detail=msg[:300])
+
+# Back-compat. claude-pull.sh's records predate the field; an absent direction
+# has to keep meaning "pull" rather than turning every existing record into an
+# unrecognised one.
+with Sandbox() as sb:
+    repo = sb.repo()
+    p = write_status(sb.state_root, repo, state="alert", reason="diverged")
+    doc = json.loads(p.read_text(encoding="utf-8"))
+    doc.pop("direction", None)
+    p.write_text(json.dumps(doc) + "\n", encoding="utf-8")
+    msg = announcement(run_hook(sb.state_root, [repo])).get("systemMessage", "")
+    check("a record with no direction still reads as a pull",
+          "auto-pull" in msg.lower(), detail=msg[:250])
+
+# Discovery has to reach a repo that is not under ~/.claude at all. The sink
+# lives in ~/.local/state, so a hook that only walks the config tree would never
+# see it — and hardcoding it would mean the NEXT repo to get a sync unit is
+# silently uncovered, which is the bug rather than the fix. The producer's own
+# state directory is the declaration of coverage, for either direction.
+with Sandbox() as sb:
+    claude_home = sb.repo("dot-claude")
+    sink = sb.repo("elsewhere/claude-proposals")
+    write_status(sb.state_root, claude_home)
+    write_status(sb.state_root, sink, direction="push", state="alert",
+                 reason="the sink has no git remote")
+    msg = announcement(run_hook(sb.state_root, None, claude_home)).get("systemMessage", "")
+    check("a covered repo outside ~/.claude is discovered without being listed",
+          str(sink) in msg, detail=msg[:300])
+
+with Sandbox() as sb:
+    claude_home = sb.repo("dot-claude")
+    sink = sb.repo("elsewhere/claude-proposals")
+    write_status(sb.state_root, claude_home)
+    write_status(sb.state_root, sink, direction="push")
+    proc = run_hook(sb.state_root, None, claude_home)
+    check("a healthy discovered repo outside ~/.claude stays silent",
+          proc.stdout == "", detail=repr(proc.stdout))
+
+
+# ----------------------------------------------------------------------
 section("Shape and safety")
 # ----------------------------------------------------------------------
 

@@ -133,19 +133,38 @@ fi
 git -C "$SINK" add -A
 if git -C "$SINK" diff --cached --quiet; then
   echo "No proposal changes to commit"
-  exit 0
-fi
-git -C "$SINK" commit -q -m "improvement proposals: $(date +%Y-%m-%d)"
-echo "committed proposal changes in $SINK"
-
-# Pushing is conditional ON PURPOSE. These are private RSI proposals; the sink
-# has no remote today, and creating one is a decision about where Jonathan's
-# proposals get uploaded — not this script's to make. A missing remote is the
-# expected steady state, so it prints a notice and exits 0. It must never fail
-# closed here: failing would abort the nightly reviewer after it had already
-# written and gated its work.
-if [[ -n "$(git -C "$SINK" remote)" ]]; then
-  git -C "$SINK" push
 else
-  echo "note: the proposals sink $SINK has no git remote — committed locally, nothing pushed."
+  git -C "$SINK" commit -q -m "improvement proposals: $(date +%Y-%m-%d)"
+  echo "committed proposal changes in $SINK"
 fi
+
+# ---------------------------------------------------------------- the push ---
+# This script no longer pushes. It gates and commits; pushing is delegated to
+# scripts/claude-proposals-push.sh, which is also what the claude-proposals-push
+# systemd timer runs.
+#
+# WHY, given that `git -C "$SINK" push` worked fine. Because on 2026-09-03 the
+# sink acquired a private GitHub remote, and from that moment two independent
+# paths were uploading it: this one, and the timer. Two pushers means two places
+# a secret can escape, and this one had no leak scan — a proposal is generated
+# by a model reading session transcripts, so it can quote a credential that was
+# on screen. One pusher, one mandatory gitleaks gate, no way round it.
+#
+# It also fixes a blind spot this script had on its own: it used to RETURN on
+# "no proposal changes to commit" and never reach a push, so a commit made by
+# hand — or by a run whose push failed — sat unpushed indefinitely. The
+# delegation is therefore unconditional: it runs whether or not this run
+# committed anything, because the question "is the sink backed up?" is not the
+# same question as "did this run produce a proposal?".
+#
+# Failure is reported and propagated, but the gating work above is already
+# committed and therefore not lost. The delegate refusing (a leak, a diverged
+# remote, no scanner) is a state a human has to see, so it is not swallowed.
+PUSHER="$CLAUDE_HOME/scripts/claude-proposals-push.sh"
+if [[ ! -x "$PUSHER" ]]; then
+  echo "error: $PUSHER is missing or not executable — the proposal changes are COMMITTED in $SINK but nothing was pushed." >&2
+  echo "Cause: the sink's only leak-scanned push path lives there; this script deliberately has no fallback that pushes without a secret scan." >&2
+  echo "Remedy: restore it from the ~/.claude repo (scripts/claude-proposals-push.sh), or push by hand after scanning: gitleaks git --redact $SINK && git -C $SINK push" >&2
+  exit 1
+fi
+exec "$PUSHER"
