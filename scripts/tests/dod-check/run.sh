@@ -3,8 +3,15 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-DOD="$HOME/.claude/scripts/dod-check.py"
+# The script under test is THIS CHECKOUT's, resolved relative to the harness —
+# never a hardcoded $HOME/.claude path. That path always verified the INSTALLED
+# copy, so in a worktree the suite ran the wrong script and a fix under
+# development failed its own brand-new tests: the exact stale-binary-under-test
+# failure tests/smoke.sh's TEST 50a exists to prevent, one repo over.
+# DOD_SCRIPT stays as an override for deliberately sweeping another copy.
+DOD="${DOD_SCRIPT:-$(cd "$HERE/../.." && pwd)/dod-check.py}"
 WORK="$HERE/work"
+echo "SCRIPT UNDER TEST: $DOD"
 export PATH="$HERE:$PATH"          # stub gh wins
 export GIT_CONFIG_GLOBAL=/dev/null # no user config bleed
 
@@ -244,6 +251,36 @@ case_run "schedule-only workflow is not CI" nochecks 0 "none trigger on pull_req
 fresh_repo; git push -q -u origin feat/x
 git rm -q tests/test_a.py; git commit -qm "drop tests"; git push -q
 case_run "deleted test file flagged" green 1 "TEST_FILE_DELETED"
+
+# RETIREMENT IS NOT WEAKENING. Deleting a test while the code it covers lives
+# on removes coverage — that is the case above, and it stays flagged. Deleting
+# a module and its tests TOGETHER removes the subject too, so there is no
+# coverage left to lose.
+#
+# This distinction had no way to be expressed: the `dod-ok` escape is only
+# consulted for ADDED lines, and a deletion has no line to carry a comment.
+# Retiring a whole module therefore pinned the gate red with no honest way to
+# clear it, which is the state that gets a gate routed around.
+# The module has to exist at the MERGE BASE, or adding and deleting it inside
+# the range nets to nothing and `--diff-filter=D` never sees a deletion at all.
+add_module_on_master() {
+  git switch -q master
+  mkdir -p mod/tests
+  echo "def g(): return 2" > mod/impl.py
+  echo "def test_g(): assert g() == 2" > mod/tests/test_g.py
+  git add -A; git commit -qm "add module"; git push -q origin master
+  git switch -q -C feat/x master
+}
+
+fresh_repo; add_module_on_master
+git rm -q -r mod; git commit -qm "retire the whole module"; git push -q -u origin feat/x
+case_run "a test retired WITH its module is not flagged" green 0 "DONE"
+
+# The narrowness that makes the above safe: one surviving sibling means the
+# subject is still there, so the deletion is a real loss of coverage again.
+fresh_repo; add_module_on_master
+git rm -q mod/tests/test_g.py; git commit -qm "drop only the test"; git push -q -u origin feat/x
+case_run "a test deleted while its module survives is still flagged" green 1 "TEST_FILE_DELETED"
 
 fresh_repo; git push -q -u origin feat/x
 mkdir -p .github/workflows

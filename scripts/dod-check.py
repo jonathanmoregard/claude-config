@@ -405,6 +405,49 @@ def ci_configured(root, base):
     return False, "workflows exist but none trigger on pull_request or push"
 
 
+def retired_subtrees(root, mb, deleted):
+    """Directories whose ENTIRE contents were deleted, subject included.
+
+    Deleting a test while the code it covers lives on removes coverage, and
+    that is what TEST_FILE_DELETED is for. Deleting a module and its tests
+    TOGETHER removes the subject too, so there is no coverage left to lose —
+    retiring `mcps/safe-bash/` is not the same act as dropping its tests and
+    keeping the server.
+
+    Nothing else could express that. The `dod-ok` escape is only consulted for
+    ADDED lines, and a deletion has no line to carry a comment, so retiring a
+    module pinned the gate red with no honest way to clear it — which is how a
+    gate gets routed around instead of read.
+
+    Narrow on purpose. A directory qualifies only when every file it held at
+    the merge base is gone AND at least one of them was a NON-test file. The
+    second half is what keeps this from swallowing the real case: a lone
+    `tests/` directory emptied of its tests is entirely deleted too, but it
+    never held a subject, so it does not qualify and its tests are still
+    flagged.
+    """
+    code, listing, _ = git(
+        ["ls-tree", "-r", "--name-only", mb], root, timeout=30
+    )
+    if code != 0:
+        return set()  # cannot tell; every deleted test stays flagged
+
+    at_base = [p for p in listing.splitlines() if p.strip()]
+    dirs = {p.rsplit("/", 1)[0] for p in at_base if "/" in p}
+
+    retired = set()
+    for d in dirs:
+        held = [p for p in at_base if p.startswith(d + "/")]
+        if not held:
+            continue
+        if not all(p in deleted for p in held):
+            continue
+        if not any(not TEST_PATH.search(p) for p in held):
+            continue  # only ever held tests — no subject went with them
+        retired.add(d)
+    return retired
+
+
 def collect_integrity(root, base):
     """Scan the branch diff for green-by-weakening patterns."""
     code, mb, _ = git(["merge-base", "HEAD", f"origin/{base}"], root, timeout=20)
@@ -418,15 +461,21 @@ def collect_integrity(root, base):
         ["diff", "--diff-filter=D", "--name-only", f"{mb}...HEAD"], root, timeout=30
     )
     if code == 0:
-        for path in (p for p in names.splitlines() if p.strip()):
-            if TEST_PATH.search(path):
-                findings.append(
-                    {
-                        "code": "TEST_FILE_DELETED",
-                        "detail": f"test file deleted: {path}",
-                        "path": path,
-                    }
-                )
+        deleted = {p for p in names.splitlines() if p.strip()}
+        retired = retired_subtrees(root, mb, deleted)
+        for path in sorted(deleted):
+            if not TEST_PATH.search(path):
+                continue
+            if any(path.startswith(a + "/") for a in retired):
+                # Retirement, not weakening — see retired_subtrees.
+                continue
+            findings.append(
+                {
+                    "code": "TEST_FILE_DELETED",
+                    "detail": f"test file deleted: {path}",
+                    "path": path,
+                }
+            )
 
     # Added lines matching a weakening pattern.
     code, diff, _ = git(["diff", "--unified=0", f"{mb}...HEAD"], root, timeout=45)
