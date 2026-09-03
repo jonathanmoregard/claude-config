@@ -1140,9 +1140,18 @@ class TestCutoverScript(FixtureCase):
         """`find -type f` lstats, so a symlinked .md in the live tree was
         neither copied into the sink nor looked at by the verify pass. It just
         stopped existing in the spine at the swap, with no log line — the
-        content surviving only in the backup directory."""
+        content surviving only in the backup directory.
+
+        The target is inside the proposal tree. It used to be an arbitrary
+        `$HOME` path, which is the same shape as a symlink to `~/.ssh/id_*` —
+        see `test_a_symlink_to_a_credential_in_home_is_refused` for why a
+        target outside the two proposal trees is now a refusal. What is under
+        test here is the ENUMERATION: a symlink is not a `-type f` and was
+        therefore invisible to all three passes at once.
+        """
         self.fx.build()
-        target = os.path.join(self.fx.home, "elsewhere-note.md")
+        target = os.path.join(self.fx.claude, "recursive-self-improvement",
+                              "proposals", "elsewhere-note.md")
         body = "---\nstatus: rejected\n---\n\nlinked body\n"
         with open(target, "w", encoding="utf-8") as fh:
             fh.write(body)
@@ -1179,6 +1188,555 @@ class TestCutoverScript(FixtureCase):
             os.path.exists(os.path.join(self.fx.sink, "rsi",
                                         "2026-08-08-escape.md")))
 
+
+# --------------------------------------------------------------------------
+# 8b. Node classification: the cutover enumerates EVERY node and refuses the
+#     ones it cannot place.
+#
+# Every defect below has the same shape. The script enumerated with `find`
+# predicates that SELECT (`-xtype f` for content, `-xtype l` for broken links)
+# and it checked properties on one side of a src/dst pair but not the other.
+# A node matching neither predicate is invisible to all three passes at once —
+# never copied, never verified, never logged — so it simply stops existing in
+# the spine at the swap, at exit 0. A collision whose *sink* side is a symlink
+# passes `-e` and `cmp` for reasons that have nothing to do with the content
+# being safe.
+#
+# The fix is not another predicate. The enumeration no longer selects: it
+# yields every node and classifies each into one of a closed set, with a final
+# arm that refuses. These tests pin the refusals — and, just as importantly,
+# pin the shapes that must keep working, because a fail-closed enumeration is
+# only as good as its accept list.
+# --------------------------------------------------------------------------
+class TestCutoverNodeClassification(FixtureCase):
+    def setUp(self):
+        super().setUp()
+        self.fx.build()
+        self.live = os.path.join(self.fx.claude, "proposals")
+        self.rsi_live = os.path.join(self.fx.claude,
+                                     "recursive-self-improvement", "proposals")
+
+    # -- helpers ---------------------------------------------------------
+    def commit_sink(self, message="sink baseline"):
+        env = self.fx.env()
+        git("add", "-A", cwd=self.fx.sink, env=env)
+        git("commit", "-q", "-m", message, "--allow-empty", cwd=self.fx.sink,
+            env=env)
+
+    def sink_status(self):
+        return git("status", "--porcelain", cwd=self.fx.sink,
+                   env=self.fx.env()).strip()
+
+    def sink_head(self):
+        return git("rev-parse", "HEAD", cwd=self.fx.sink,
+                   env=self.fx.env()).strip()
+
+    def put_live(self, rel, text, root=None):
+        path = os.path.join(root or self.live, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return path
+
+    def assert_nothing_happened(self, proc):
+        """The refusal contract: no swap, no copy, no commit.
+
+        "no copy" is the ordering assertion. Every refusal below is knowable
+        without touching anything, so it has to land in the pass that mutates
+        nothing — a refusal raised halfway through the sync is the wedge, not
+        the fix."""
+        out = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0, out)
+        self.assertTrue(os.path.isdir(self.live)
+                        and not os.path.islink(self.live),
+                        "the live tree was swapped despite the refusal")
+        self.assertNotIn("copied into the sink", out,
+                         "the refusal came after the sync had already started "
+                         "writing:\n%s" % out)
+        self.assertEqual(self.sink_status(), "",
+                         "a half-written sink wedges every later run behind "
+                         "the clean-sink gate — the worst outcome there is")
+        return out
+
+    def shim(self, name, body, **fields):
+        """Put `name` on PATH ahead of the real one, and return an env for it.
+
+        The shims here are fault/timing injection, not stubs: each one falls
+        through to the real binary via $REAL_PATH."""
+        d = os.path.join(self.fx.home, "shim")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        os.chmod(path, 0o755)
+        return self.fx.env(PATH=d + os.pathsep + os.environ["PATH"],
+                           REAL_PATH=os.environ["PATH"], **fields)
+
+    def date_shim(self, **fields):
+        """A `date` on PATH that fires once, at the one moment the script
+        calls it: immediately before the swap loop, after verify has passed.
+        That is the window this suite needs to write into."""
+        return self.shim(
+            "date",
+            "#!/usr/bin/env bash\n"
+            'if [[ -n "${RACE_FILE:-}" && ! -e "$RACE_FLAG" ]]; then\n'
+            '  : > "$RACE_FLAG"\n'
+            '  printf \'RACED PROPOSAL BODY\\n\' > "$RACE_FILE"\n'
+            "fi\n"
+            'if [[ -n "${FIXED_STAMP:-}" ]]; then\n'
+            '  printf \'%s\\n\' "$FIXED_STAMP"; exit 0\n'
+            "fi\n"
+            'PATH="$REAL_PATH" exec date "$@"\n',
+            RACE_FLAG=os.path.join(self.fx.home, ".raced"), **fields)
+
+    # -- 1. a symlink to a DIRECTORY -------------------------------------
+    def test_a_symlinked_directory_is_refused_not_silently_dropped(self):
+        """`-xtype f` does not match a symlink to a directory, `-xtype l` does
+        not match it, and find does not descend into it. Measured before the
+        fix: exit 0, "cutover: done", the archived body in neither the sink nor
+        its git history, `~/.claude/proposals/oldarchive` a 404, and the backup
+        holding nothing but the pointer."""
+        archive = os.path.join(self.fx.home, "proposal-archive-2025")
+        os.makedirs(archive)
+        with open(os.path.join(archive, "2025-11-old.md"), "w",
+                  encoding="utf-8") as fh:
+            fh.write("ARCHIVED PROPOSAL BODY\n")
+        os.symlink(archive, os.path.join(self.live, "oldarchive"))
+        head = self.sink_head()
+
+        out = self.assert_nothing_happened(self.run_script(CUTOVER_SCRIPT))
+
+        self.assertIn("oldarchive", out, out)
+        self.assertIn(archive, out,
+                      "the refusal must name the resolved target, not just "
+                      "the link:\n%s" % out)
+        self.assertEqual(self.sink_head(), head)
+        self.assertFalse(os.path.exists(os.path.join(self.fx.sink,
+                                                     "oldarchive")))
+        self.assertTrue(os.path.isfile(os.path.join(archive, "2025-11-old.md")))
+
+    def test_a_symlinked_directory_inside_the_trees_is_accepted(self):
+        """The production layout depends on exactly this: `proposals/rsi` is a
+        directory symlink pointing back at the OTHER live proposal tree. A
+        fail-closed enumeration that refused it would refuse the real cutover,
+        so the accept case is pinned as hard as the refusal."""
+        self.put_live("manual/inner.md", "inner body\n")
+        os.symlink(os.path.join(self.live, "manual"),
+                   os.path.join(self.live, "alias"))
+
+        proc = self.run_script(CUTOVER_SCRIPT, expect=0)
+
+        self.assertIn("alias", proc.stdout + proc.stderr,
+                      "an accepted-but-not-recreated node must still be "
+                      "logged; silence is what made this class of bug "
+                      "invisible")
+        self.assertEqual(read(os.path.join(self.fx.sink, "manual",
+                                           "inner.md")), "inner body\n")
+        self.assertFalse(os.path.exists(os.path.join(self.fx.sink, "alias",
+                                                     "inner.md")),
+                         "the target is absorbed in its own right; absorbing "
+                         "it twice under the alias would duplicate proposals")
+
+    # -- 2. the SINK side of a collision ---------------------------------
+    def test_a_dangling_symlink_on_the_sink_side_is_refused(self):
+        """`[[ -e $dst ]]` is false for a dangling link, so the sync tried to
+        `cp` through it: coreutils refused, `set -e` aborted mid-sync, and the
+        sink was left dirty — which the clean-sink gate then turned into a
+        permanent block on every later run."""
+        self.put_live("manual/newthing.md", "SECRET PROPOSAL A\n")
+        outside = os.path.join(self.fx.home, "outside-the-sink")
+        os.makedirs(outside)
+        os.makedirs(os.path.join(self.fx.sink, "manual"), exist_ok=True)
+        os.symlink(os.path.join(outside, "leaked.md"),
+                   os.path.join(self.fx.sink, "manual", "newthing.md"))
+        self.commit_sink("sink holds a dangling link")
+        head = self.sink_head()
+
+        out = self.assert_nothing_happened(self.run_script(CUTOVER_SCRIPT))
+
+        self.assertIn("newthing.md", out, out)
+        self.assertEqual(self.sink_head(), head)
+        self.assertFalse(os.path.exists(os.path.join(outside, "leaked.md")),
+                         "the copy was written straight through the sink and "
+                         "landed outside it")
+
+    def test_a_sink_symlink_into_the_live_tree_is_refused(self):
+        """`-e` is true so the sync skips it; verify's `-f` and `cmp` follow
+        the link and compare the live file with ITSELF, so verify passes and
+        the run exits 0. After the swap the path gives ELOOP, the committed
+        blob is the link text, and the only real copy is in the backup the
+        script's last line invites the user to delete."""
+        live_file = self.put_live("manual/b.md", "PROPOSAL B BODY\n")
+        os.makedirs(os.path.join(self.fx.sink, "manual"), exist_ok=True)
+        os.symlink(live_file, os.path.join(self.fx.sink, "manual", "b.md"))
+        self.commit_sink("sink links into the live tree")
+
+        out = self.assert_nothing_happened(self.run_script(CUTOVER_SCRIPT))
+
+        self.assertIn("b.md", out, out)
+        self.assertEqual(read(live_file), "PROPOSAL B BODY\n")
+
+    # -- 3. a pre-existing symlink AT a target path ----------------------
+    def test_a_target_path_symlinked_over_real_content_is_refused(self):
+        """`[[ -d $live && ! -L $live ]]` made scan, sync and verify all
+        `return 0`, and the swap then `rm`'d the pointer: the content behind it
+        reached neither the sink nor the backup, at exit 0. Reachable
+        operationally by re-running after `proposals.folder` is repointed."""
+        orphan = os.path.join(self.fx.home, "orphan-proposals")
+        os.makedirs(os.path.join(orphan, "manual"))
+        with open(os.path.join(orphan, "manual", "orphan.md"), "w",
+                  encoding="utf-8") as fh:
+            fh.write("ORPHANED PROPOSAL BODY\n")
+        shutil.rmtree(self.live)
+        os.symlink(orphan, self.live)
+
+        proc = self.run_script(CUTOVER_SCRIPT)
+        out = proc.stdout + proc.stderr
+
+        self.assertNotEqual(proc.returncode, 0, out)
+        self.assertIn(orphan, out, out)
+        self.assertEqual(os.readlink(self.live), orphan,
+                         "the pointer was removed and the content behind it "
+                         "was never absorbed")
+        self.assertTrue(os.path.isfile(os.path.join(orphan, "manual",
+                                                    "orphan.md")))
+        self.assertEqual(self.sink_status(), "")
+
+    def test_a_dangling_target_path_is_replaced(self):
+        """A pointer with no content behind it loses nothing when replaced —
+        this must NOT be swept up by the refusal above."""
+        shutil.rmtree(self.live)
+        os.symlink(os.path.join(self.fx.home, "does-not-exist"), self.live)
+        self.run_script(CUTOVER_SCRIPT, expect=0)
+        self.assertEqual(os.readlink(self.live), self.fx.sink)
+
+    def test_a_self_looping_target_path_is_replaced(self):
+        shutil.rmtree(self.live)
+        os.symlink(self.live, self.live)
+        self.run_script(CUTOVER_SCRIPT, expect=0)
+        self.assertEqual(os.readlink(self.live), self.fx.sink)
+
+    # -- 4. a failure inside the sync must not wedge the tool ------------
+    def test_a_failed_copy_rolls_back_so_the_next_run_is_not_blocked(self):
+        """Any failure inside the sync aborted under `set -e` with a raw
+        coreutils message and left the sink dirty; the clean-sink gate then
+        refused every re-run until a human intervened. The script's own comment
+        calls that the worst outcome, so the sync now unwinds itself.
+
+        The fault is injected rather than contrived: `cp` fails on its second
+        call, so the first copy has already landed in the sink when the abort
+        happens. ENOSPC, EIO and a writer removing a live file between pass 1
+        and the copy all arrive exactly like this, and no amount of preflight
+        rules them out — which is why the recovery has to be structural."""
+        self.put_live("manual/one.md", "first\n")
+        self.put_live("manual/two.md", "second\n")
+        env = self.shim(
+            "cp",
+            "#!/usr/bin/env bash\n"
+            'n=0; [[ -f "$CP_COUNT" ]] && n=$(cat "$CP_COUNT")\n'
+            'n=$((n+1)); printf %s "$n" > "$CP_COUNT"\n'
+            'if [[ "$n" == "$CP_FAIL_AT" ]]; then\n'
+            '  echo "cp: injected failure on call $n" >&2; exit 1\n'
+            "fi\n"
+            'PATH="$REAL_PATH" exec cp "$@"\n',
+            CP_COUNT=os.path.join(self.fx.home, ".cpcount"), CP_FAIL_AT="2")
+
+        proc = self.run_script(CUTOVER_SCRIPT, env=env)
+        out = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0, out)
+        self.assertIn("copied into the sink", out,
+                      "the fault has to land mid-sync for this to test "
+                      "anything:\n%s" % out)
+        self.assertEqual(self.sink_status(), "",
+                         "the partial sync was left behind; the next run dies "
+                         "on the clean-sink gate and only a human gets it "
+                         "moving again")
+
+        self.run_script(CUTOVER_SCRIPT, expect=0)
+        for name, body in (("one.md", "first\n"), ("two.md", "second\n")):
+            self.assertEqual(read(os.path.join(self.fx.sink, "manual", name)),
+                             body)
+
+    def test_a_failed_commit_rolls_back_so_the_next_run_is_not_blocked(self):
+        """The same unwind, one step later, where it is easy to get wrong.
+
+        By the time the commit runs, `git add -A` has already staged every
+        copy. Removing those files from the worktree without unstaging them
+        leaves the sink dirty as `AD` — the exact block the unwind exists to
+        prevent, so an unwind that only deletes files is no unwind at all. The
+        index is reset (MIXED, never --hard; the clean-sink gate already proved
+        nothing else was staged) before the worktree is touched."""
+        self.put_live("manual/one.md", "first\n")
+        env = self.shim(
+            "git",
+            "#!/usr/bin/env bash\n"
+            'for a in "$@"; do\n'
+            '  if [[ "$a" == commit ]]; then\n'
+            '    echo "git: injected commit failure" >&2; exit 1\n'
+            "  fi\n"
+            "done\n"
+            'PATH="$REAL_PATH" exec git "$@"\n')
+
+        proc = self.run_script(CUTOVER_SCRIPT, env=env)
+
+        out = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0, out)
+        self.assertEqual(self.sink_status(), "",
+                         "the staged index outlived the unwind, so the next "
+                         "run dies on the clean-sink gate and only a human "
+                         "gets it moving again")
+        self.assertTrue(os.path.isdir(self.live)
+                        and not os.path.islink(self.live))
+
+        self.run_script(CUTOVER_SCRIPT, expect=0)
+        self.assertEqual(read(os.path.join(self.fx.sink, "manual", "one.md")),
+                         "first\n")
+
+    def test_an_unreadable_live_file_is_refused_before_anything_is_copied(self):
+        path = self.put_live("manual/locked.md", "unreadable body\n")
+        os.chmod(path, 0o000)
+        try:
+            out = self.assert_nothing_happened(self.run_script(CUTOVER_SCRIPT))
+            self.assertIn("locked.md", out, out)
+        finally:
+            os.chmod(path, 0o644)
+        self.run_script(CUTOVER_SCRIPT, expect=0)
+
+    def test_a_live_directory_over_a_sink_file_is_refused_before_the_sync(self):
+        """`mkdir` blew up mid-sync with a raw "File exists" and left the sink
+        dirty. The collision is knowable in pass 1."""
+        with open(os.path.join(self.fx.sink, "newdir"), "w",
+                  encoding="utf-8") as fh:
+            fh.write("file not dir\n")
+        self.commit_sink()
+        self.put_live("newdir/deep.md", "deep\n")
+
+        out = self.assert_nothing_happened(self.run_script(CUTOVER_SCRIPT))
+        self.assertIn("newdir", out, out)
+
+    # -- 5. containment: a worktree is not a repo of its own -------------
+    def test_a_git_worktree_of_the_live_config_repo_is_refused_as_a_sink(self):
+        """A worktree resolves OUTSIDE ~/.claude and `rev-parse
+        --show-toplevel` returns the worktree root, so both containment gates
+        passed. `git add -A` then swept the whole checkout and committed
+        proposal content into the PUBLIC config repo's history."""
+        env = self.fx.env()
+        wt = os.path.join(self.fx.home, ".local", "state", "wt-sink")
+        git("worktree", "add", "-q", "-b", "sinkbranch", wt,
+            cwd=self.fx.claude, env=env)
+        os.makedirs(os.path.join(wt, "rsi"), exist_ok=True)
+        cfg_path = os.path.join(self.fx.claude, "recursive-self-improvement",
+                                "config", "config.json")
+        doc = json.loads(read(cfg_path))
+        doc["proposals"]["folder"] = wt
+        with open(cfg_path, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, indent=2)
+        git("add", "-A", cwd=self.fx.claude, env=env)
+        git("commit", "-q", "-m", "cfg", cwd=self.fx.claude, env=env)
+        head = git("rev-parse", "HEAD", cwd=self.fx.claude, env=env).strip()
+        self.put_live("manual/secret-proposal.md", "PROPOSAL BODY\n")
+
+        proc = self.run_script(CUTOVER_SCRIPT)
+        out = proc.stdout + proc.stderr
+
+        self.assertNotEqual(proc.returncode, 0, out)
+        self.assertIn(wt, out, out)
+        self.assertEqual(git("rev-parse", "HEAD", cwd=self.fx.claude,
+                             env=env).strip(), head,
+                         "proposal content was committed into the live config "
+                         "repo's history")
+        self.assertNotIn("cutover:", git("log", "--all", "--oneline",
+                                         cwd=self.fx.claude, env=env))
+
+    # -- 6. the verify -> mv window --------------------------------------
+    def test_a_proposal_written_between_verify_and_the_swap_is_absorbed(self):
+        """No lock is taken and the RSI writers are unattended cron agents, so
+        a proposal can land after verify has passed and before the `mv`. It
+        went to the backup and the run still said "done".
+
+        A lock the writers do not take is theatre, so the fix does not depend
+        on their cooperation: after the swap the retired directory is at a path
+        no writer knows, and everything in it that the sink lacks is absorbed
+        and committed."""
+        os.makedirs(os.path.join(self.live, "manual"), exist_ok=True)
+        env = self.date_shim(RACE_FILE=os.path.join(self.live, "manual",
+                                                    "raced.md"))
+
+        self.run_script(CUTOVER_SCRIPT, env=env, expect=0)
+
+        landed = os.path.join(self.fx.sink, "manual", "raced.md")
+        self.assertTrue(os.path.isfile(landed),
+                        "the raced proposal exists only in the backup the "
+                        "script invites the user to delete")
+        self.assertEqual(read(landed), "RACED PROPOSAL BODY\n")
+        self.assertIn("manual/raced.md", git("ls-files", cwd=self.fx.sink,
+                                             env=self.fx.env()))
+        self.assertEqual(self.sink_status(), "")
+
+    # -- 7. what a symlink is allowed to name ----------------------------
+    def test_a_symlink_to_a_credential_in_home_is_refused(self):
+        """The escape check admitted every path under `$HOME`, and `$HOME` is
+        exactly where the credentials live. Measured before the fix: exit 0
+        with the private key copied by content and committed into the sink."""
+        ssh = os.path.join(self.fx.home, ".ssh")
+        os.makedirs(ssh)
+        key = os.path.join(ssh, "id_ed25519")
+        with open(key, "w", encoding="utf-8") as fh:
+            fh.write("-----BEGIN OPENSSH PRIVATE KEY-----\nZZZFAKEKEY\n")
+        os.makedirs(os.path.join(self.live, "manual"), exist_ok=True)
+        os.symlink(key, os.path.join(self.live, "manual", "key-note.md"))
+
+        out = self.assert_nothing_happened(self.run_script(CUTOVER_SCRIPT))
+
+        self.assertIn("key-note.md", out, out)
+        self.assertIn(key, out,
+                      "the refusal must name what the link actually resolves "
+                      "to; the link's own name said '.md':\n%s" % out)
+        self.assertFalse(os.path.exists(os.path.join(self.fx.sink, "manual",
+                                                     "key-note.md")))
+
+    def test_a_symlink_chain_is_judged_by_its_final_target(self):
+        """A chain that hops outside the trees and lands back inside them is
+        accepted; the same chain landing outside is refused. What is pinned is
+        that the WHOLE chain is resolved — judging the first hop is how an
+        escape gets in, and how a legitimate proposal gets refused."""
+        inside = self.put_live("archived/real-note.md", "chain body\n")
+        hop = os.path.join(self.fx.home, "hop")
+        os.symlink(inside, hop)
+        os.makedirs(os.path.join(self.live, "manual"), exist_ok=True)
+        os.symlink(hop, os.path.join(self.live, "manual", "chain.md"))
+
+        self.run_script(CUTOVER_SCRIPT, expect=0)
+        landed = os.path.join(self.fx.sink, "manual", "chain.md")
+        self.assertEqual(read(landed), "chain body\n")
+        self.assertFalse(os.path.islink(landed))
+
+    def test_a_symlink_chain_ending_outside_the_trees_is_refused(self):
+        outside = os.path.join(self.fx.home, "note-outside.md")
+        with open(outside, "w", encoding="utf-8") as fh:
+            fh.write("outside body\n")
+        hop = os.path.join(self.rsi_live, "hop")
+        os.symlink(outside, hop)
+        os.makedirs(os.path.join(self.live, "manual"), exist_ok=True)
+        os.symlink(hop, os.path.join(self.live, "manual", "chain.md"))
+
+        out = self.assert_nothing_happened(self.run_script(CUTOVER_SCRIPT))
+        self.assertIn(outside, out,
+                      "the refusal must name the final target, not the hop "
+                      "inside the tree:\n%s" % out)
+
+    def test_a_relative_symlink_inside_the_tree_is_absorbed_as_content(self):
+        self.put_live("archived/x.md", "relative body\n")
+        os.makedirs(os.path.join(self.live, "manual"), exist_ok=True)
+        os.symlink(os.path.join("..", "archived", "x.md"),
+                   os.path.join(self.live, "manual", "rel.md"))
+
+        self.run_script(CUTOVER_SCRIPT, expect=0)
+        landed = os.path.join(self.fx.sink, "manual", "rel.md")
+        self.assertFalse(os.path.islink(landed))
+        self.assertEqual(read(landed), "relative body\n")
+
+    # -- 8. the backup is the last copy; it gets the same rigour ---------
+    def test_the_backup_never_lands_inside_an_existing_stamp_directory(self):
+        """`mv` into a colliding stamp NESTS rather than clobbers, so the
+        retired tree ended up one level deeper than the script's own message
+        claims. Reachable through concurrency; forced here with a fixed
+        stamp."""
+        stamp = "20260101T000000Z"
+        prior = os.path.join(self.fx.backup, stamp, "claude-proposals",
+                             "manual")
+        os.makedirs(prior)
+        with open(os.path.join(prior, "prior.md"), "w",
+                  encoding="utf-8") as fh:
+            fh.write("PRIOR BACKUP CONTENT\n")
+        env = self.date_shim(FIXED_STAMP=stamp)
+
+        self.run_script(CUTOVER_SCRIPT, env=env, expect=0)
+
+        self.assertEqual(read(os.path.join(prior, "prior.md")),
+                         "PRIOR BACKUP CONTENT\n")
+        self.assertFalse(
+            os.path.exists(os.path.join(self.fx.backup, stamp,
+                                        "claude-proposals", "proposals")),
+            "the retired tree was nested inside the earlier backup")
+        siblings = [d for d in os.listdir(self.fx.backup) if d != stamp]
+        self.assertTrue(siblings,
+                        "the backup must go somewhere of its own: %r"
+                        % os.listdir(self.fx.backup))
+
+    def test_a_symlinked_backup_root_is_refused(self):
+        """The backup is the last copy of the content being retired. Writing
+        it silently through a symlink to somewhere the user did not name is
+        the same class of bug as everything else here."""
+        elsewhere = os.path.join(self.fx.home, "somewhere-else")
+        os.makedirs(elsewhere)
+        os.symlink(elsewhere, self.fx.backup)
+
+        out = self.assert_nothing_happened(self.run_script(CUTOVER_SCRIPT))
+        self.assertIn(self.fx.backup, out, out)
+        self.assertEqual(os.listdir(elsewhere), [])
+
+    def test_an_unwritable_backup_root_is_refused_before_the_commit(self):
+        """It used to abort AFTER the commit, with a raw `mkdir` error."""
+        os.makedirs(self.fx.backup)
+        os.chmod(self.fx.backup, 0o500)
+        head = self.sink_head()
+        try:
+            out = self.assert_nothing_happened(self.run_script(CUTOVER_SCRIPT))
+            self.assertIn(self.fx.backup, out, out)
+            self.assertEqual(self.sink_head(), head,
+                             "the sink was committed before the backup root "
+                             "was ever checked")
+        finally:
+            os.chmod(self.fx.backup, 0o700)
+
+    def test_a_fifo_in_the_proposal_tree_is_refused_not_silently_dropped(self):
+        os.makedirs(os.path.join(self.live, "manual"), exist_ok=True)
+        os.mkfifo(os.path.join(self.live, "manual", "apipe"))
+
+        out = self.assert_nothing_happened(self.run_script(CUTOVER_SCRIPT))
+        self.assertIn("apipe", out, out)
+
+    def test_awkward_filenames_still_survive_the_cutover(self):
+        """The accept list, pinned: a fail-closed enumeration that also
+        refused a filename with a newline in it would be useless."""
+        names = ["a file with spaces.md", "-leading-dash.md", "new\nline.md",
+                 "ångström-π.md", "it's \"quoted\".md", "star*glob?.md"]
+        os.makedirs(os.path.join(self.live, "manual"), exist_ok=True)
+        for name in names:
+            self.put_live(os.path.join("manual", name), "body of %r\n" % name)
+
+        self.run_script(CUTOVER_SCRIPT, expect=0)
+
+        tracked = git("ls-files", "-z", cwd=self.fx.sink,
+                      env=self.fx.env()).split("\0")
+        for name in names:
+            landed = os.path.join(self.fx.sink, "manual", name)
+            self.assertEqual(read(landed), "body of %r\n" % name)
+            self.assertIn("manual/" + name, tracked)
+
+    def test_two_concurrent_cutovers_do_not_lose_content(self):
+        self.put_live("manual/only-live.md", "live only\n")
+        self.put_live("keepme.md", "keep me\n", root=self.rsi_live)
+        env = self.fx.env()
+        procs = [subprocess.Popen(["bash", CUTOVER_SCRIPT], env=env,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, text=True)
+                 for _ in range(2)]
+        outs = [p.communicate()[0] for p in procs]
+
+        for proc, out in zip(procs, outs):
+            self.assertEqual(proc.returncode, 0,
+                             "a serialised re-run must be a clean no-op:\n%s"
+                             % out)
+        self.assertEqual(os.readlink(self.live), self.fx.sink)
+        self.assertEqual(os.readlink(self.rsi_live),
+                         os.path.join(self.fx.sink, "rsi"))
+        self.assertEqual(read(os.path.join(self.fx.sink, "manual",
+                                           "only-live.md")), "live only\n")
+        self.assertEqual(read(os.path.join(self.fx.sink, "rsi", "keepme.md")),
+                         "keep me\n")
+        self.assertEqual(self.sink_status(), "")
 
 
 # --------------------------------------------------------------------------
