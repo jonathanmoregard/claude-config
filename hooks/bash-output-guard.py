@@ -590,33 +590,6 @@ def _disarm_watchdog() -> None:
 # High-entropy secret prefixes. Prefixes only — generic high-entropy
 # matching is too false-positive prone (hashes, nix store paths, base64).
 _SECRET_PATTERNS: list[tuple[str, "re.Pattern[str]"]] = [
-    # Private keys come FIRST, and both spellings are deliberate.
-    #
-    # safe-bash carried the nine prefix patterns below and NO key rule, so
-    # this is a parity-preserving gap closed rather than a regression fixed.
-    # The donors are already trusted in this repo: hooks/prompt-log.py:44 and
-    # permission-ledger/hook.py:85,90.
-    #
-    # Ordering: first so a whole block is replaced before a prefix pattern can
-    # nibble at its interior — a partly-rewritten key would still be a key,
-    # and `[REDACTED:...]` inside the body would corrupt the length report.
-    #
-    # The TERMINATED form is tried before the unterminated one so that text
-    # following an END marker stays ordinary output; the catcher below is
-    # greedy to end-of-string and would otherwise eat it.
-    (
-        "private-key",
-        re.compile(
-            r"-----BEGIN (?:[A-Z0-9 ]*)PRIVATE KEY-----[\s\S]+?"
-            r"-----END (?:[A-Z0-9 ]*)PRIVATE KEY-----"
-        ),
-    ),
-    # The UNTERMINATED catcher is LOAD-BEARING, not thoroughness. Redaction
-    # runs AFTER the harness truncates (see F11 in tests/test_bash_guard_post.py),
-    # so a key whose END marker was cut off matches neither the pattern above
-    # nor any prefix pattern, and every base64 body line would reach the
-    # transcript. Anything from BEGIN to end-of-string goes.
-    ("private-key", re.compile(r"-----BEGIN (?:[A-Z0-9 ]*)PRIVATE KEY-----[\s\S]*")),
     ("anthropic-api", re.compile(r"sk-ant-(?:api|oat)\d{2}-[A-Za-z0-9_\-]{20,}")),
     ("openai-project", re.compile(r"sk-proj-[A-Za-z0-9_\-]{20,}")),
     ("openai-legacy", re.compile(r"sk-[A-Za-z0-9]{20,}")),
@@ -629,8 +602,70 @@ _SECRET_PATTERNS: list[tuple[str, "re.Pattern[str]"]] = [
 ]
 
 
+# ---- armored private keys: MARKERS matched, bodies never spanned ----------
+#
+# WHY THIS IS NOT A REGEX. The first version of this was the obvious pair —
+# `BEGIN...-----[\s\S]+?-----END...` plus a greedy `[\s\S]*` catcher for the
+# truncated case — and it was QUADRATIC. Each BEGIN with no END behind it makes
+# the engine scan to end-of-string before failing, so cost grows with
+# (BEGIN count x body length). MEASURED on this host, terminated pattern alone:
+#
+#   154 KB / 2000 BEGINs ->  2.6 s
+#   308 KB / 4000 BEGINs -> 11.9 s
+#   616 KB / 8000 BEGINs -> 44.2 s
+#
+# Doubling the input quadruples the time, and 308 KB already exceeds the
+# HARNESS_HOOK_TIMEOUT_S cap. That matters more than a slow hook: the harness
+# CANCELS a hook that overruns and DISCARDS its output, so the result reaches
+# the model unrewritten — and `_arm_watchdog`'s SIGALRM cannot save it, because
+# CPython runs a Python-level signal handler only when the interpreter regains
+# control and `re` does not return to it mid-match. A body shaped like this is
+# therefore a fail-OPEN, reachable by any command whose output an attacker
+# influences. The bound must come from the algorithm, not from a timer.
+#
+# So: find MARKERS (bounded, no body spanning, linear), then slice between
+# them with str.find. One pass, no backtracking, no dependency.
+#
+# The marker vocabulary also fixes a false negative the regex had: PGP armor is
+# `-----BEGIN PGP PRIVATE KEY BLOCK-----`, which ends in `KEY BLOCK-----` and
+# not `KEY-----`, so `gpg --export-secret-keys` output passed through WHOLE.
+# `(?: BLOCK)?` covers it; `[A-Z0-9 ]*` covers PKCS#8 (`BEGIN PRIVATE KEY`),
+# ENCRYPTED, RSA, DSA, EC, OPENSSH and SSH2.
+#
+# KNOWN, DELIBERATE SCOPE: the 4-dash spaced SSH2 form
+# (`---- BEGIN SSH2 ENCRYPTED PRIVATE KEY ----`) and PuTTY's
+# `PuTTY-User-Key-File-2:` header are different shapes and are NOT matched. Both
+# are rare in tool output on this host; add them here rather than by widening
+# the marker regex into prose-matching territory.
+_KEY_BEGIN_RE = re.compile(r"-----BEGIN (?:[A-Z0-9 ]*)PRIVATE KEY(?: BLOCK)?-----")
+_KEY_END_RE = re.compile(r"-----END (?:[A-Z0-9 ]*)PRIVATE KEY(?: BLOCK)?-----")
+
+
+def _redact_private_keys(body: str) -> str:
+    """Replace every armored private-key block, terminated or not, in ONE pass."""
+    out: list[str] = []
+    pos = 0
+    while True:
+        begin = _KEY_BEGIN_RE.search(body, pos)
+        if begin is None:
+            out.append(body[pos:])
+            return "".join(out)
+        out.append(body[pos : begin.start()])
+        end = _KEY_END_RE.search(body, begin.end())
+        # No END means truncation cut it off (F11: redaction runs AFTER the
+        # harness truncates). Everything from BEGIN onward goes — an END that
+        # was never emitted must not leave the body behind.
+        stop = end.end() if end else len(body)
+        out.append(f"[REDACTED:private-key:{stop - begin.start()}chars]")
+        pos = stop
+
+
 def _redact_secrets(body: str) -> str:
     """Replace known-shape secret values with `[REDACTED:<label>:<len>chars]`."""
+    # Keys first: a block is replaced whole before any prefix pattern can
+    # nibble at its interior. A partly-rewritten key is still a key, and a
+    # `[REDACTED:...]` marker inside the body would corrupt the length report.
+    body = _redact_private_keys(body)
     for label, pat in _SECRET_PATTERNS:
         body = pat.sub(
             lambda m, _label=label: f"[REDACTED:{_label}:{len(m.group(0))}chars]",

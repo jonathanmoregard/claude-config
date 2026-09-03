@@ -145,6 +145,9 @@ BEGIN {
   # either makes the gate flag its own rule table on every edit, and a gate
   # that cries wolf about itself is one people learn to skip.
   skip_file = (file ~ /deterministic-gate(-test)?\.sh$/)
+  # Same reset as the hunk header, for the same reason: nothing in the previous
+  # FILE is the line above anything in this one.
+  prevtext = ""; prevline = -1
   # Prose files describe commands; they do not run them. A plan document that
   # says "then run git push --force" is a sentence, and flagging it buries the
   # diff lines that are actually executable. Measured against the history of
@@ -159,16 +162,29 @@ BEGIN {
   # @@ -a,b +c,d @@ — take c as the first new-file line of the hunk.
   match($0, /\+[0-9]+/)
   newline = substr($0, RSTART + 1, RLENGTH - 1) + 0
+  # A new hunk means the previous added line is no longer ABOVE anything here.
+  # Without this reset the waiver on the last added line of the previous hunk
+  # reached the first added line of this one, silently suppressing a BLOCKER
+  # across a gap of any size. See the waiver-scope lane in the test fixture.
+  prevtext = ""; prevline = -1
   next
 }
 /^\+/ {
   if (skip_file) next
   text = substr($0, 2)
   # Keep the previous added line so a waiver can sit directly above the match.
+  #
+  # The `prevline == newline - 1` guard is what confines "directly above" to
+  # the line PHYSICALLY above. Without it the previous added line waived a
+  # match at any distance — across a gap inside one hunk, across hunks, and
+  # across files — which is silent BLOCKER suppression, the one failure mode a
+  # rules layer must not have. Same guard, same reason, as the
+  # swallowed-exception pairing below; that one had it from the start and this
+  # one did not.
   for (i = 1; i <= nr; i++) {
     if (text ~ rpat[i]) {
       tag = "arftl-allow:[ ]*" rid[i]
-      if (text ~ tag || prevtext ~ tag) { waived++ ; continue }
+      if (text ~ tag || (prevline == newline - 1 && prevtext ~ tag)) { waived++ ; continue }
       emit(rid[i], rsev[i], file, newline, text)
     }
   }

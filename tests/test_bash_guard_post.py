@@ -1012,16 +1012,6 @@ E2E_SECRETS = {
         + "." + "dBjftJeZ4CVP" + "mB92K27uhbUJU1p1r-wW1gFWFOEjXk"
     ),
     "tavily-key": "tvly" + "-" + ("F" * 28),
-    # TERMINATED on purpose: the fixture file carries `OTHER=not-a-secret`
-    # after the value, and the unterminated catcher is greedy to end-of-string.
-    # A terminated block proves the pattern fires while leaving the trailing
-    # line for the harness to compare — the unterminated spelling has its own
-    # fixtures in F12 above.
-    "private-key": (
-        "-----BEGIN " + "OPENSSH PRIVATE KEY" + "-----\n"
-        + ("b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAA\n" * 3)
-        + "-----END " + "OPENSSH PRIVATE KEY" + "-----"
-    ),
 }
 
 check(
@@ -1030,6 +1020,23 @@ check(
     "untested: "
     + str(sorted({label for label, _ in guard._SECRET_PATTERNS} - set(E2E_SECRETS))),
 )
+
+# Private keys are NOT in _SECRET_PATTERNS — they are a marker scan, because a
+# BEGIN..END regex was quadratic (F12). The equality check above therefore
+# cannot see them, so the second mechanism gets its own coverage rather than
+# quietly falling outside the drift guard that exists to stop exactly that.
+check(
+    "the private-key scanner is wired into the redactor",
+    "_redact_private_keys" in guard._redact_secrets.__code__.co_names,
+    "keys are a separate mechanism; if it is not called, nothing redacts them",
+)
+for _marker_re, _which in ((guard._KEY_BEGIN_RE, "BEGIN"), (guard._KEY_END_RE, "END")):
+    check(
+        f"the {_which} marker regex spans no body",
+        r"[\s\S]" not in _marker_re.pattern,
+        f"a body-spanning quantifier here is what made the old version "
+        f"quadratic: {_marker_re.pattern}",
+    )
 
 E2E_DIR = os.path.join(SCRATCH, "e2e-secrets")
 os.makedirs(E2E_DIR, exist_ok=True)
@@ -1100,6 +1107,33 @@ for _label, _value in sorted(E2E_SECRETS.items()):
         open(_p, encoding="utf-8").read()[:160],
     )
 
+# Private keys end-to-end, by the same method as the loop above: a real file,
+# a real `cat`, its real stdout. Every armor spelling the scanner claims.
+for _kind in ("OPENSSH", "RSA", "PGP", ""):
+    _blk = "-----BEGIN " + (f"{_kind} " if _kind else "") + "PRIVATE KEY" + (
+        " BLOCK" if _kind == "PGP" else ""
+    ) + "-----\n" + ("b3BlbnNzaC1rZXktdjEAAAAABG5vbmVFQUtF\n" * 3) + "-----END " + (
+        f"{_kind} " if _kind else ""
+    ) + "PRIVATE KEY" + (" BLOCK" if _kind == "PGP" else "") + "-----"
+    _kp = os.path.join(E2E_DIR, f"key-{_kind or 'pkcs8'}.pem")
+    with open(_kp, "w", encoding="utf-8") as fh:
+        fh.write(_blk + "\nOTHER=not-a-secret\n")
+    _real = subprocess.run(["cat", _kp], capture_output=True, text=True, timeout=30)
+    parsed, updated, raw = bash_out(f"cat {_kp}", response_obj(_real.stdout))
+    _b = stdout_of(updated)
+    check(
+        f"end-to-end: a real {_kind or 'PKCS#8'} key block in command output is redacted",
+        isinstance(_b, str)
+        and "[REDACTED:private-key:" in _b
+        and "b3BlbnNzaC1rZXktdjEAAAAABG5vbmVFQUtF" not in raw,
+        str(_b)[:200],
+    )
+    check(
+        f"end-to-end: the line after the {_kind or 'PKCS#8'} block survives",
+        isinstance(_b, str) and "OTHER=not-a-secret" in _b,
+        str(_b)[:200],
+    )
+
 # An ingress command is the one case where the body is rewritten twice
 # (redact, then wrap). The redaction must not be undone by the wrapper.
 _s = E2E_SECRETS["anthropic-api"]
@@ -1167,14 +1201,26 @@ _PEM_BODY = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmU" + "AAAAEbm9uZQAAAAA" * 3
 _TRACER = "TRACERLINEfakekeymaterial0123456789"
 
 
+def _armor(kind: str, marker: str = "BEGIN") -> str:
+    """The armor line for a key type. PGP's ends in `KEY BLOCK-----`.
+
+    That difference is not cosmetic: the regex this section replaced required
+    `PRIVATE KEY-----` and so passed `gpg --export-secret-keys` output through
+    WHOLE. `kind=""` is PKCS#8, whose header is bare `BEGIN PRIVATE KEY`.
+    """
+    words = f"{kind} " if kind else ""
+    block = " BLOCK" if kind == "PGP" else ""
+    return f"-----{marker} {words}PRIVATE KEY{block}-----"
+
+
 def _fake_key(kind: str = "OPENSSH", terminated: bool = True) -> str:
-    block = f"-----BEGIN {kind} PRIVATE KEY-----\n{_PEM_BODY}\n{_TRACER}\n{_PEM_BODY}\n"
+    block = f"{_armor(kind)}\n{_PEM_BODY}\n{_TRACER}\n{_PEM_BODY}\n"
     if terminated:
-        block += f"-----END {kind} PRIVATE KEY-----\n"
+        block += f"{_armor(kind, 'END')}\n"
     return block
 
 
-for _kind in ("OPENSSH", "RSA", "EC"):
+for _kind in ("OPENSSH", "RSA", "EC", "DSA", "ENCRYPTED", "", "PGP"):
     _key = _fake_key(_kind)
     parsed, updated, raw = bash_out("cat /tmp/synthetic-key", response_obj(_key))
     _body = stdout_of(updated)
@@ -1234,6 +1280,53 @@ check(
     and isinstance(stdout_of(updated), str)
     and "[REDACTED:anthropic-api:" in stdout_of(updated),
     str(stdout_of(updated))[:200],
+)
+
+# Several blocks in one body, each replaced independently, prose between kept.
+_multi = (
+    "before\n" + _fake_key("RSA") + "middle\n" + _fake_key("PGP") + "after\n"
+)
+_red = guard._redact_secrets(_multi)
+check(
+    "every block in a multi-key body is redacted and the prose between survives",
+    _red.count("[REDACTED:private-key:") == 2
+    and _TRACER not in _red
+    and "before" in _red and "middle" in _red and "after" in _red,
+    _red[:240],
+)
+
+# ---- the quadratic blowup this section's first implementation shipped -----
+#
+# The original was `BEGIN...-----[\s\S]+?-----END...` plus a greedy catcher.
+# Every BEGIN with no END behind it made the engine scan to end-of-string
+# before failing, so cost grew with (BEGIN count x length): MEASURED 2.6s at
+# 154KB, 11.9s at 308KB, 44.2s at 616KB. That is past HARNESS_HOOK_TIMEOUT_S,
+# and an overrun hook is CANCELLED with its output DISCARDED — the result then
+# reaches the model unrewritten. SIGALRM cannot catch it either: CPython defers
+# a Python-level handler until the interpreter regains control, which `re` does
+# not do mid-match. So the bound has to come from the algorithm.
+#
+# Asserted as WALL TIME on the adversarial shape, because that is the property
+# that failed. A timing assertion is a blunt instrument, so the budget is set
+# ~50x above the measured linear cost rather than near it.
+# The marker is split like _blk's above, and for the same reason: the fixture
+# is synthetic, and the repo's gitleaks scan must stay meaningful for this file.
+_ADVERSARIAL = (
+    "-----BEGIN " + "OPENSSH PRIVATE KEY" + "-----\n" + "A" * 40 + "\n"
+) * 8000
+_t0 = time.perf_counter()
+_out_adv = guard._redact_secrets(_ADVERSARIAL)
+_elapsed = time.perf_counter() - _t0
+check(
+    "an adversarial BEGIN-without-END body redacts in linear time",
+    _elapsed < 2.0,
+    f"{len(_ADVERSARIAL)} bytes took {_elapsed:.3f}s "
+    f"(the regex implementation took 44.2s on this shape)",
+)
+check(
+    "and that body is actually redacted, not merely fast",
+    ("-----BEGIN " + "OPENSSH PRIVATE KEY" + "-----") not in _out_adv,
+    _out_adv[:160],
 )
 
 

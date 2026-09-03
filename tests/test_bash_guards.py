@@ -2405,10 +2405,21 @@ check(
     not (_agent_tools & _disallowed),
     f"granted and denied at once: {sorted(_agent_tools & _disallowed)}",
 )
+# This assertion was VACUOUS as first written: its second disjunct was
+# `"--tools" in _RUNEVAL_SRC`, which the check above already guarantees, so it
+# could never fail whatever the header said. Rewritten to name the stale claim
+# it is actually about — the header once said keeping the agent shell-less was
+# the job of DISALLOWED_TOOLS, and the measured 2.1.259 offer refuted that.
 check(
-    "the header does not claim the disallow list alone closes the offer",
-    "only the ones it names" in _RUNEVAL_SRC or "--tools" in _RUNEVAL_SRC,
-    "the measured 2.1.259 offer contradicts any such claim",
+    "the header does not credit the disallow list alone with closing the offer",
+    "shell-less is the job of `--tools`" in _RUNEVAL_SRC
+    and "shell-less is the job of DISALLOWED_TOOLS" not in _RUNEVAL_SRC,
+    "the deny list removes only what it names; --tools is what closes the set",
+)
+check(
+    "the header records the measured offer that justifies the closure",
+    "2.1.259" in _RUNEVAL_SRC and "ToolSearch" in _RUNEVAL_SRC,
+    "a future reader must be able to see why both rails ship without re-probing",
 )
 
 

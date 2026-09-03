@@ -269,3 +269,61 @@ echo "  (c) staged-but-uncommitted secret"
 echo "      gate: $out_c"
 printf '      caught? (must be True)  %s\n' \
   "$(printf '%s' "$out_c" | python3 -c 'import json,sys; print(json.load(sys.stdin)["gitleaks_clean"] is False)')"
+
+echo
+echo "=== a waiver reaches ONE line, not the whole diff ==="
+# The documented escape is `arftl-allow: <rule-id>` "on the matched line or the
+# line directly above it". `prevtext` implemented the second half with no
+# adjacency test and was never reset between hunks or files, so the tag on the
+# LAST added line of one hunk silently waived a BLOCKER on the FIRST added line
+# of the next — measured: `rm -rf /tmp/victim` 23 lines and one hunk away from
+# an `arftl-allow: destructive-rm` was reported as waived, with no finding.
+# Silent suppression of a BLOCKER is the worst failure this gate has, since the
+# whole point of the rules layer is that it cannot be talked out of a verdict.
+WV=$(mktemp -d)/repo; mk_range_repo "$WV"
+{ echo "line1"; for i in $(seq 2 40); do echo "filler$i"; done; } > "$WV/a.sh"
+echo "base" > "$WV/b.sh"
+git -C "$WV" add -A; git -C "$WV" commit -q -m fillers
+python3 - "$WV/a.sh" <<'PY'
+import sys
+lines = open(sys.argv[1]).read().splitlines()
+lines.insert(2, 'echo safe  # arftl-allow: destructive-rm')   # hunk 1, waived
+lines.insert(25, 'rm -rf /tmp/gate-waiver-victim')            # hunk 2, MUST flag
+open(sys.argv[1], 'w').write("\n".join(lines) + "\n")
+PY
+# Same shape again, but with the waiver as the last added line of the PREVIOUS
+# FILE, so the reset is asserted across the +++ boundary too.
+printf 'echo tail  # arftl-allow: destructive-rm\n' >> "$WV/a.sh"
+printf 'rm -fr /tmp/gate-waiver-victim-2\n' >> "$WV/b.sh"
+git -C "$WV" add -A; git -C "$WV" commit -q -m "waiver scope fixture"
+out_w=$(bash "$GATE" --repo "$WV" --range HEAD~1...HEAD --json)
+echo "      gate: $out_w"
+printf '%s' "$out_w" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+rm = [f for f in d["findings"] if f["rule"] == "destructive-rm"]
+files = {f["file"] for f in rm}
+print("      cross-HUNK match flagged? (must be True) ", "a.sh" in files)
+print("      cross-FILE match flagged? (must be True) ", "b.sh" in files)
+print("      both, i.e. no silent waive? (must be True) ", len(rm) == 2)
+'
+
+echo
+echo "=== ...and the documented adjacent waiver still works ==="
+# The fix must not buy correctness by breaking the escape hatch: a tag on the
+# matched line, and on the line physically above it, both still waive.
+AD=$(mktemp -d)/repo; mk_range_repo "$AD"
+printf 'rm -rf /tmp/on-the-line  # arftl-allow: destructive-rm\n' > "$AD/same.sh"
+printf '# arftl-allow: destructive-rm\nrm -rf /tmp/line-above\n' > "$AD/above.sh"
+git -C "$AD" add -A; git -C "$AD" commit -q -m "adjacent waivers"
+out_ad=$(bash "$GATE" --repo "$AD" --range origin/main...HEAD --json); rc_ad=$?
+echo "      gate: $out_ad"
+printf '%s' "$out_ad" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+rm = [f for f in d["findings"] if f["rule"] == "destructive-rm"]
+print("      same-line waiver honoured? (must be True)  ", not any(f["file"].endswith("same.sh") for f in rm))
+print("      line-above waiver honoured? (must be True) ", not any(f["file"].endswith("above.sh") for f in rm))
+print("      waived count == 2? (must be True)          ", d.get("waived") == 2)
+'
+printf '      exit 0? (must be True)  %s\n' "$([[ $rc_ad -eq 0 ]] && echo True || echo False)"
