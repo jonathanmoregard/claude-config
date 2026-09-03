@@ -3,7 +3,8 @@
 
 Every unattended agent on this machine (RSI daily reviewer, permission-ledger
 evaluator, router, clv2, ...) drops proposal files into subdirs of one spine
-(default ~/.claude/proposals). Empirically (2026-08-01), proposers score their
+(default ~/.local/state/claude-proposals — its own git repo, moved out of the
+live ~/.claude checkout on 2026-08-31). Empirically (2026-08-01), proposers score their
 own homework badly: the 03:00 RSI run produced two proposals that duplicated
 code ALREADY SHIPPED — a model fallback merged in research-agent PR #19 and a
 scanner auto-updater that had existed for weeks. Root cause: no grep-before-
@@ -49,14 +50,23 @@ import sys
 import tempfile
 import time
 
-DEFAULT_CONFIG_PATH = "~/.claude/proposals/gate-config.json"
+# The spine lives in its own git repo outside the live config checkout (moved
+# 2026-08-31; `recursive-self-improvement/config/config.json` -> proposals.folder
+# is the single source of truth). Resolved DIRECTLY, never via the
+# ~/.claude/proposals compatibility symlink: a consumer that depends on a
+# symlink existing is a consumer that fails silently when it does not.
+PROPOSALS_SINK = "~/.local/state/claude-proposals"
+DEFAULT_CONFIG_PATH = PROPOSALS_SINK + "/gate-config.json"
 # Overall wall cap for pr-context collection: one hung `gh` (or many repos)
 # must not starve the actual gating run.
 PR_CONTEXT_WALL_CAP = 120
-# Whole-run lock. Lives under ~/.claude/logs, NOT in the spine:
-# push-proposals.sh commits the proposals/ subtree wholesale, so a lock file
-# inside it would land in the pushed git history on every run.
-GATE_LOCK_PATH = "~/.claude/logs/gate.lock"
+# Whole-run lock. NOT in the spine: push-proposals.sh commits the whole sink
+# tree, so a lock file inside it would land in the committed history on every
+# run. And not in ~/.claude/logs either — that is inside the live config repo,
+# where it survived only because a `*.lock` catch-all happened to cover it.
+# Runtime state belongs in the state dir.
+RAW_KEEP_DIR = "~/.local/state/proposal-intake-gate"
+GATE_LOCK_PATH = RAW_KEEP_DIR + "/gate.lock"
 # How long --run-callback waits for the lock before giving up (the gating run
 # itself never waits: contended means another gate is active, exit 0).
 CALLBACK_LOCK_TIMEOUT_SECONDS = 10.0
@@ -67,9 +77,10 @@ SCORER_STDOUT_CAP = 5 * 1024 * 1024
 
 DEFAULTS = {
     # Root of the proposals spine; every proposal subdir lives directly under it.
-    "spine_root": "~/.claude/proposals",
+    "spine_root": PROPOSALS_SINK,
     # Explicit subdir names to walk. Empty list = auto-discover every subdir
-    # under spine_root (symlinked subdirs like rsi -> legacy path are followed).
+    # under spine_root (symlinked subdirs are followed, so a spine_root aimed
+    # at the ~/.claude compatibility symlink still resolves).
     "subdirs": [],
     "excluded_subdirs": [".*", "archived"],
     # Must stay identical to references/gate-config.default.json (tested):
@@ -99,8 +110,27 @@ DEFAULTS = {
     # Read by the review-improvements skill, not by this script: after a
     # decision on a proposal in <subdir>, run `<callback> <path> <decision>`.
     "on_decision": {},
-    "gate_log": "~/.claude/proposals/gate-log.jsonl",
+    "gate_log": PROPOSALS_SINK + "/gate-log.jsonl",
 }
+
+# Printed verbatim whenever run_callback refuses. The rule is a security
+# boundary — a proposal file must never be able to nominate an arbitrary
+# executable — so the remedy is always "move the callback", never "relax the
+# check". Spelled out because the failure it guards is otherwise a bare exit 1
+# in the middle of a /review-improvements drain.
+CALLBACK_CONTAINMENT_RULE = (
+    "containment rule: an on_decision callback must realpath-resolve under "
+    "%(root)s, be a regular file (not a symlink), be owned by you, carry no "
+    "group/other write bit (itself or any parent dir up to %(root)s), and be "
+    "executable. This is a security boundary: proposals are written by "
+    "unattended agents, and a callback path is an executable a data file gets "
+    "to name. Do NOT widen the check — move the callback instead. Callbacks "
+    "belong in ~/.claude/permission-ledger/ (beside record-decision.py), not "
+    "under the proposals spine: the spine now lives in "
+    "~/.local/state/claude-proposals and ~/.claude/proposals is only a "
+    "symlink to it, so anything there resolves outside %(root)s. Repoint "
+    "gate-config.json's on_decision entry at the moved file."
+)
 
 VALID_VERDICTS = ("sharp", "duplicate", "rot")
 VALID_DECISIONS = ("implemented", "rejected", "deferred")
@@ -207,6 +237,50 @@ def require_under_home(path, label):
                          % (label, path, home))
 
 
+SPINE_MISMATCH_REMEDY = (
+    "The gate config lives inside the spine it configures, and "
+    "push-proposals.sh commits that same directory. A %(key)s pointing "
+    "elsewhere means the gate scores one tree while the commit ships another, "
+    "and the shipped one goes out ungated with nothing saying so. This is the "
+    "pre-move value: run ~/.claude/scripts/cutover-proposals.sh, which absorbs "
+    "the live content into the sink and rewrites spine_root, gate_log and "
+    "on_decision.permissions in one place. Do not hand-edit one key past this "
+    "check — the other two are stale too."
+)
+
+
+def require_config_describes_its_own_spine(config_path, cfg):
+    """The config file must describe the tree it sits in.
+
+    Reproduced 2026-08-31 on the real box: the sink's own gate-config.json
+    still carried the pre-move `spine_root: ~/.claude/proposals`, so
+    `--list` printed 15 candidates out of the live config repo while
+    push-proposals.sh committed ~/.local/state/claude-proposals. Nothing
+    anywhere noticed, and push-proposals.sh explicitly said it was
+    "Gating and committing $SINK regardless" — which it was not.
+
+    Compared by REALPATH on purpose: after the cutover
+    `~/.claude/proposals` is a symlink into the sink, and a config still
+    naming it resolves to the same tree. That is the compatibility shim
+    working as intended, not drift, so it stays accepted.
+    """
+    config_dir = os.path.dirname(os.path.abspath(os.path.expanduser(config_path)))
+    if not os.path.isdir(config_dir):
+        # No file on disk (built-in defaults). DEFAULTS is self-consistent.
+        return
+    spine = cfg["spine_root"]
+    if not os.path.isdir(spine) or os.path.realpath(spine) != os.path.realpath(config_dir):
+        raise ValueError(
+            "spine_root %r does not resolve to %s, the directory this config "
+            "file lives in. %s"
+            % (spine, config_dir, SPINE_MISMATCH_REMEDY % {"key": "spine_root"}))
+    if not contained(cfg["gate_log"], spine):
+        raise ValueError(
+            "gate_log %r resolves outside the spine %s. %s"
+            % (cfg["gate_log"], spine,
+               SPINE_MISMATCH_REMEDY % {"key": "gate_log"}))
+
+
 def validate_model_name(value, label):
     """Model names must be argv- and YAML-scalar-safe (see MODEL_RE)."""
     if not isinstance(value, str) or not MODEL_RE.match(value) \
@@ -255,6 +329,7 @@ def load_config(path, explicit=False):
     pr["extra_repos"] = {k: os.path.expanduser(v) for k, v in pr["extra_repos"].items()}
     require_under_home(cfg["spine_root"], "spine_root")
     require_under_home(cfg["gate_log"], "gate_log")
+    require_config_describes_its_own_spine(path, cfg)
     for p in cfg["search_paths"]:
         require_under_home(p, "search_paths entry")
     for p in pr["repo_roots"]:
@@ -812,10 +887,16 @@ def dispatch_scorer(prompt, cfg):
 
 
 def preserve_raw_scorer_output(src_path):
-    """Move unusable scorer stdout (the dispatch tempfile) into the logs dir
+    """Move unusable scorer stdout (the dispatch tempfile) into the state dir
     verbatim for diagnosis — 0600, never echoed into our own stdout (cron
-    logs), and never read into memory (it may be the >5MB overflow case)."""
-    logs_dir = os.path.expanduser("~/.claude/logs")
+    logs), and never read into memory (it may be the >5MB overflow case).
+
+    NOT ~/.claude/logs: that lives inside the live config git repo, whose
+    .gitignore covers `logs/*.log` and nothing else, so every unusable-scorer
+    night would leave an untracked `.txt` behind and dirty the checkout. The
+    content is raw model output over untrusted proposal text besides — it
+    belongs outside the config the harness reads."""
+    logs_dir = os.path.expanduser(RAW_KEEP_DIR)
     os.makedirs(logs_dir, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     path = os.path.join(logs_dir, "gate-scorer-raw-%s.txt" % ts)
@@ -1003,6 +1084,7 @@ def run_callback(cfg, subdir, proposal_path, decision):
     if problems:
         log("error: refusing on_decision callback %s for subdir %r: %s"
             % (callback, subdir, "; ".join(problems)))
+        log(CALLBACK_CONTAINMENT_RULE % {"root": claude_root})
         return 1
     proposal_path = os.path.realpath(proposal_path)
     # The callback only ever gets a proposal from the subdir it was
@@ -1055,7 +1137,7 @@ def main(argv=None):
         # frontmatter (check-then-replace) and appends to the gate log —
         # two concurrent runs would interleave both. --list never writes
         # (repair=False below), so it stays lock-free. The lock file lives
-        # under ~/.claude/logs (see GATE_LOCK_PATH), never in the spine.
+        # under ~/.local/state (see GATE_LOCK_PATH), never in the spine.
         try:
             lock_fh = acquire_gate_lock()  # held until process exit
         except OSError as exc:

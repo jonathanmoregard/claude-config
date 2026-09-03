@@ -22,6 +22,14 @@ homunculus/
 # Scratch/tmp folder
 tmp/
 
+# Dev-container staging tree, written by the claude-cl-sync systemd unit.
+# That unit declares three ReadWritePaths under ~/.claude — homunculus/,
+# container-staging/ and dev-container/.venv/ — and only two of them had a
+# rule. This one stayed invisible purely by luck: everything staged so far
+# happens to be named `homunculus/` or `*quarantine*`, which other rules
+# catch. The first differently-named artefact would have dirtied the tree.
+container-staging/
+
 # Step-back detector runtime state (per-session flags + classifier log)
 step-back/
 
@@ -121,6 +129,50 @@ daemon.*
 daemon-*
 daemon/
 jobs/
+
+# ---------------------------------------------------------------------
+# Claude Code harness state files — the complete registry, not a sample
+# ---------------------------------------------------------------------
+# These are written by the `claude` binary itself into its config home, so
+# there is no writer of ours to relocate: gitignore is the only lever. The
+# list below is not guesswork and not "what happened to show up in git
+# status" — it is the harness's own state-name registry, read out of the
+# ELF at ~/.local/share/claude/versions/2.1.251:
+#
+#   L = new Map([["daemon-status","daemon.status.json"],
+#                ["active-time-ledger","active-time.json"], ...])
+#
+# Every id in that map resolves to a file directly in ~/.claude. Ignoring
+# only the ones currently on disk is how we got here: `daemon.log` and
+# `daemon/` were ignored while `daemon.status.json`, `daemon-auth-status.json`
+# and `daemon-auth-cooldown` — same subsystem, same directory — were not, and
+# they dirtied the checkout the moment a background worker ran and the login
+# expired. Enumerate the registry once so the NEXT one is covered before it
+# appears.
+#
+# Two registry entries are DELIBERATELY absent: `keybindings.json` and
+# `CLAUDE.md` are real user config that belongs in this repo.
+#
+# The registry's five daemon* names (daemon.json, daemon.status.json,
+# daemon.scheduled.status.json, daemon-auth-status.json, daemon-auth-cooldown)
+# are NOT relisted here: the `daemon.*` / `daemon-*` globs above already cover
+# them. Two rules for one file means two comments that can disagree, and the
+# next reader cannot tell which is authoritative. The globs own the daemon
+# subsystem; this block owns the rest of the registry, which no glob catches.
+active-time.json
+.deep-link-register-failed
+gh-pr-status-cache.json
+hfi-auth.json
+loop.md
+.npm-cache-cleanup
+policy-limits.json
+remote-settings-consent.json
+remote-settings-helper-consent
+remote-settings.json
+server-sessions.json
+.session-log-cleanup
+stats-cache.json
+.version-cleanup
 
 # Session-reflection hook output: per-session stdout/stderr logs, skipped-
 # recursion records, idle-handoff logs and counters. Pure runtime — 1496 files
@@ -234,3 +286,25 @@ experiments/*/runs-pilot-discarded/
 
 # Working notes symlink -> ~/.local/state/claude-tasks/ (userspace, never committed)
 tasks
+
+# The proposals spine. Moved out of this repo on 2026-08-31 to
+# ~/.local/state/claude-proposals/, which is a git repo of its own so a
+# rejected proposal stays findable with `git log -S` — see
+# recursive-self-improvement/config/config.json -> proposals.folder, the single
+# source of truth. Both names below survive as ABSOLUTE symlinks into that sink
+# (scripts/cutover-proposals.sh creates them), kept as a compatibility shim for
+# readers; every writer resolves the sink directly.
+#
+# These rules have to live here, at the repo root, and not in
+# proposals/.gitignore where the permissions/ precedent lives: once `proposals`
+# is a symlink, git sees one untracked symlink OBJECT and never descends into
+# it, so no .gitignore inside can ignore it. Both are written unanchored-to-a-
+# trailing-slash on purpose — the path is a real directory before the cutover
+# and a symlink after, and one rule has to cover both. Anchored with a leading
+# slash so `/proposals` cannot also swallow an unrelated nested directory of
+# that name (the /self-compact/ entry above records the same lesson).
+#
+# Why ignored rather than merely untracked: repo-autosync auto-commits whatever
+# is untracked here, so an unignored spine would be committed straight back in.
+/proposals
+/recursive-self-improvement/proposals

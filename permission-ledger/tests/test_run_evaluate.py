@@ -88,7 +88,14 @@ class RunEvaluateTestCase(unittest.TestCase):
         self.claude_home = os.path.join(self.home, ".claude")
         self.ledger = os.path.join(self.claude_home, "permission-ledger")
         self.logs = os.path.join(self.claude_home, "logs")
-        self.proposals = os.path.join(self.claude_home, "proposals", "permissions")
+        # The proposals spine moved out of ~/.claude on 2026-08-31 (every run
+        # dirtied the live config checkout the harness reads). run-evaluate.sh
+        # is a WRITER, so it resolves the sink directly rather than through the
+        # ~/.claude/proposals compatibility symlink — which is exactly why this
+        # fixture no longer creates that symlink for it to lean on.
+        self.sink = os.path.join(self.home, ".local", "state",
+                                 "claude-proposals")
+        self.proposals = os.path.join(self.sink, "permissions")
         for d in (self.ledger, self.logs, self.proposals):
             os.makedirs(d, exist_ok=True)
 
@@ -318,6 +325,33 @@ class RunEvaluateTestCase(unittest.TestCase):
         self.assertNotIn("===PROPOSAL", log)
         # nothing left behind in the ledger dir
         self.assertEqual([n for n in os.listdir(self.ledger) if n.startswith(".agent-raw")], [])
+        # ... and nothing under ~/.claude: the whole point of the relocation is
+        # that a nightly run leaves the live config checkout untouched.
+        self.assertFalse(
+            os.path.exists(os.path.join(self.claude_home, "proposals")),
+            "run-evaluate.sh must not write into ~/.claude any more",
+        )
+
+    def test_proposals_folder_from_config_redirects_the_writes(self):
+        """config.json -> proposals.folder is the single source of truth for
+        the sink path; every writer resolves it, nobody hardcodes."""
+        elsewhere = os.path.join(self.tmp, "other-sink")
+        cfg_dir = os.path.join(self.claude_home, "recursive-self-improvement",
+                               "config")
+        os.makedirs(cfg_dir, exist_ok=True)
+        with open(os.path.join(cfg_dir, "config.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump({"proposals": {"folder": elsewhere}}, fh)
+
+        self.seed_friction()
+        fname = "2026-08-03-read-home-jonathan-claude.md"
+        proc = self.run_evaluate_sh(PL_STUB_STDOUT=proposal_block(fname))
+        self.assertEqual(proc.returncode, 0, proc.stdout.decode())
+        self.assertTrue(
+            os.path.isfile(os.path.join(elsewhere, "permissions", fname)),
+            "the configured folder was ignored; log:\n%s" % self.log(),
+        )
+        self.assertEqual(self.proposal_files(), [])
 
     def test_traversal_filename_is_rejected_and_raw_is_kept(self):
         self.seed_friction()
@@ -334,6 +368,18 @@ class RunEvaluateTestCase(unittest.TestCase):
         log = self.log()
         self.assertIn("sink: rejected filename", log)
         self.assertIn("raw agent output preserved at", log)
+        # ...and it lands OUTSIDE ~/.claude. That directory is a live git
+        # checkout whose .gitignore covers `logs/*.log` and nothing else, so
+        # this `.txt` used to leave an untracked file behind on every anomaly
+        # night — the same defect nixos PR #203 fixed for the RSI reviewer.
+        keep_dir = os.path.join(self.home, ".local", "state", "permission-ledger")
+        kept = [n for n in os.listdir(keep_dir)
+                if n.startswith("permission-ledger-raw-") and n.endswith(".txt")]
+        self.assertEqual(len(kept), 1, "raw output not preserved in %s" % keep_dir)
+        self.assertEqual(
+            [n for n in os.listdir(self.logs) if not n.endswith(".log")], [],
+            "nothing but .log files may be written into ~/.claude/logs",
+        )
 
     def test_existing_proposal_is_never_overwritten(self):
         self.seed_friction()

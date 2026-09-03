@@ -28,7 +28,7 @@ Before analyzing any logs, read all of these to understand what's already in pla
 5. `~/.claude/CLAUDE.md` — global instructions
 6. All per-project CLAUDE.md files (glob for `~/*/CLAUDE.md` and `~/Repos/*/CLAUDE.md`)
 7. `~/.claude/skills/` — installed custom skills (list directory, read skill files)
-8. All files in `~/.claude/recursive-self-improvement/proposals/` — existing proposals of ALL statuses (pending, accepted, rejected, implemented, deferred). You must not duplicate these.
+8. All files in `~/.local/state/claude-proposals/rsi/` — the proposals sink. Existing proposals of ALL statuses (pending, accepted, rejected, implemented, deferred). You must not duplicate these. **Read the rejected ones too**: a proposal that was turned down is a decision, and re-proposing it every night is the failure mode this read exists to prevent. The sink is the real location — resolve it directly. `~/.claude/recursive-self-improvement/proposals` is only a compatibility symlink pointing here, and it may not exist. Glob the sibling category dirs under `~/.local/state/claude-proposals/` too (`manual/`, `research/`, `from-research/`, `router/`, `clv2/`, `permissions/`, `archived/`) — a finding already covered there is also a duplicate.
 9. Memory files in `~/.claude/projects/*/memory/` — **especially** memories about user preferences on proposal types, what they accept vs reject, and why. Use these to calibrate your proposals.
 
 ## Step 2: Read Today's Chat Logs
@@ -57,7 +57,7 @@ Refer to `categories.md` for the detailed "What to flag (daily)" rules per enabl
 
 ## Step 4: Write Proposals
 
-For each finding, write a proposal to `~/.claude/recursive-self-improvement/proposals/YYYY-MM-DD-<slug>.md`.
+For each finding, write a proposal to `~/.local/state/claude-proposals/rsi/YYYY-MM-DD-<slug>.md` — the sink, resolved directly. Never write through the `~/.claude/...` compatibility symlinks: they are there for readers, and a writer that depends on a symlink existing is a writer that fails silently the day it does not.
 
 Group related findings — if the same problem shows up across sessions, that's one proposal with multiple source references.
 
@@ -98,6 +98,8 @@ If you wrote any proposals, run:
 ```bash
 ~/.claude/push-proposals.sh
 ```
+
+The script lives in `~/.claude` but does its work in the sink: it runs the intake gate over `~/.local/state/claude-proposals/`, then commits there. It pushes only if the sink has a git remote configured; if it has none it says so in one line and exits 0 — that is the normal, expected outcome today, not a failure.
 
 If the push fails due to detect-secrets finding something, rewrite the flagged proposal to remove the sensitive content, then retry.
 

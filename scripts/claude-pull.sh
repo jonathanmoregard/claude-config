@@ -14,33 +14,103 @@
 # silently destroy in-flight work. Everything here is fast-forward-only and
 # fails loudly instead of resolving anything by force.
 #
+# Not ~/.claude-only any more: the same script drives every git checkout the
+# harness reads from, one systemd unit per repo, selected with
+# CLAUDE_PULL_REPO. The marketplace clone under
+# ~/.claude/plugins/marketplaces/ is the second such target — it is an
+# independent nested checkout (`plugins/` is gitignored in ~/.claude), it is
+# where the harness actually resolves plugins from, and until it got its own
+# unit it went 35 commits stale while every session served old skills.
+#
 # Run from a systemd user timer (see /etc/nixos/home/claude-services.nix);
 # stdout/stderr land in the journal: journalctl --user -u claude-pull
 
 set -euo pipefail
 
 # Normally derived from the script's own location, so the copy that ships in
-# the repo always operates on that repo. CLAUDE_PULL_REPO overrides it for
-# tests against a throwaway clone.
+# the repo always operates on that repo. CLAUDE_PULL_REPO selects a different
+# target — a sibling systemd unit in production, a throwaway clone in tests.
 REPO="${CLAUDE_PULL_REPO:-$(git -C "$(dirname "$(readlink -f "$0")")" rev-parse --show-toplevel)}"
-cd "$REPO"
+case "$REPO" in /*) ;; *) REPO="$PWD/$REPO" ;; esac
+REPO="${REPO%/}"
 
-# `.git` is a FILE, not a directory, in a linked worktree — ask git for the
-# real path rather than assuming. In the main checkout this resolves to
-# $REPO/.git, which is the same lock file sync-agent.sh opens.
-GIT_DIR_PATH="$(git rev-parse --absolute-git-dir)"
-STATE="$GIT_DIR_PATH/claude-pull"
+# State lives in userspace keyed by the repo it describes, NOT inside that
+# repo's $GIT_DIR. Two reasons, and the second one is load-bearing:
+#
+#   * the health record below is read at SessionStart by
+#     hooks/claude-pull-health.py. A reader that has to reach into a .git
+#     directory to learn whether a checkout is healthy trips Claude Code's
+#     protected-path gate every session;
+#   * a puller that can only report THROUGH the repo it is reporting on goes
+#     silent exactly when the repo is the broken thing. `cd` into a deleted
+#     directory or `rev-parse` inside a corrupt one, and there is nowhere left
+#     to write "this repo is broken".
+#
+# Slug is the absolute path with '/' -> '%', the shape `systemd-escape -p`
+# produces, so the directory says which repo it belongs to without a lookup.
+STATE_ROOT="${CLAUDE_PULL_STATE_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-pull}"
+STATE="$STATE_ROOT/${REPO//\//%}"
 mkdir -p "$STATE"
 
 log() { printf '%s claude-pull: %s\n' "$(date -Is)" "$*"; }
 
+# Reasons are assembled from git's stderr, which carries quotes and newlines.
+# Emitting them raw would produce a record that json.load rejects — and a
+# health channel whose payload cannot be parsed is a health channel that
+# reports nothing, which is the failure being fixed, one level up.
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  # Nothing else below 0x20 belongs in a JSON string literal, or in a reason a
+  # human is meant to read.
+  printf '%s' "$s" | tr -d '\000-\010\013\014\016-\037'
+}
+
+# The Claude-visible half of the alerting. notify-send reaches Jonathan's
+# desktop and no Claude session, so before this record existed a checkout that
+# had been unpullable for a week looked, from inside a session, exactly like
+# one that fast-forwarded a minute ago. Same shape as the aggregator-embed
+# incident: failed every 30 minutes for ~5 hours behind a 24h notification
+# debounce, and no session knew.
+#
+# Three states, and the middle one is the point. `unverified` is what a failed
+# fetch records: the tick could not establish whether the repo is current, and
+# calling that `ok` would be precisely the lie the channel exists to prevent.
+# `checked_at_epoch` is refreshed on every verdict INCLUDING a repeated alert,
+# so "stale" means the puller stopped running rather than "the puller has been
+# complaining for a while". A tick that skipped without checking anything —
+# lock contention — writes nothing at all and leaves the last real verdict
+# standing.
+write_status() { # write_status <ok|unverified|alert> [reason]
+  local state="$1" reason="${2:-}" now last_ok tmp
+  now="$(date +%s)"
+  last_ok="$(cat "$STATE/last-ok-epoch" 2>/dev/null || true)"
+  case "$last_ok" in ''|*[!0-9]*) last_ok=0 ;; esac
+  if [ "$state" = ok ]; then
+    last_ok="$now"
+    printf '%s' "$now" > "$STATE/last-ok-epoch"
+  fi
+  tmp="$STATE/.status.json.$$"
+  printf '{"repo":"%s","state":"%s","reason":"%s","checked_at_epoch":%s,"checked_at":"%s","last_ok_epoch":%s}\n' \
+    "$(json_escape "$REPO")" "$state" "$(json_escape "$reason")" \
+    "$now" "$(date -Is -d "@$now")" "$last_ok" > "$tmp"
+  # rename(2), so a reader never sees a half-written verdict.
+  mv -f "$tmp" "$STATE/status.json"
+}
+
 # Only states a human has to act on raise a notification, and only on the
 # transition into them: these run every 10 minutes, and a condition like
 # "diverged from origin" persists until someone fixes it. Re-notifying each
-# tick would train the notification away.
+# tick would train the notification away. The status record is written on every
+# tick regardless — the debounce is a property of the toast, not of the truth.
 alert() {
   local reason="$1"
   log "ALERT: $reason"
+  write_status alert "$reason"
 
   if [ -f "$STATE/last-alert" ] && [ "$(cat "$STATE/last-alert")" = "$reason" ]; then
     return 0
@@ -60,7 +130,26 @@ Log:  journalctl --user -u claude-pull" ||
     log "notify-send failed (no notification daemon?) — alert in journal only"
 }
 
-clear_alert() { rm -f "$STATE/last-alert"; }
+# A tick that reached a verdict of "nothing to act on": clear the toast
+# debounce so the next distinct problem speaks, and stamp the record so the
+# SessionStart hook can tell "checked and healthy" from "nobody has checked".
+clear_alert() { rm -f "$STATE/last-alert"; write_status ok ""; }
+
+# Everything above this line works on a path, not on a repository, so a target
+# that has been deleted or corrupted is still reportable. From here down it has
+# to be a real checkout.
+if ! cd "$REPO" 2>/dev/null; then
+  alert "$REPO cannot be entered — the checkout is missing or unreadable, so auto-pull is off for it."
+  exit 1
+fi
+
+# `.git` is a FILE, not a directory, in a linked worktree — ask git for the
+# real path rather than assuming. In the main checkout this resolves to
+# $REPO/.git, which is the same lock file sync-agent.sh opens.
+if ! GIT_DIR_PATH="$(git rev-parse --absolute-git-dir 2>/dev/null)"; then
+  alert "$REPO is not a git checkout — auto-pull has nothing to fast-forward there."
+  exit 1
+fi
 
 # Shared with sync-agent.sh so a pull can never land halfway through the
 # commit-and-push agent's run (or vice versa). Non-blocking: skipping a tick
@@ -93,6 +182,12 @@ if ! timeout 60 git fetch --quiet --prune origin "$BRANCH"; then
   log "fetch failed or timed out (60s) — consecutive failures: $fails"
   if [ "$fails" -ge 6 ]; then
     alert "git fetch has failed $fails times in a row — check network, SSH key, or the origin remote."
+  else
+    # Below the notification threshold this is not yet a human's problem, but
+    # it is emphatically not a clean bill of health either: the tick never
+    # learned what origin holds. A session that reads `ok` here would conclude
+    # its checkout is current on the strength of a fetch that did not happen.
+    write_status unverified "git fetch failed $fails time(s) in a row; this checkout has not been compared against origin since the last successful tick."
   fi
   exit 1
 fi

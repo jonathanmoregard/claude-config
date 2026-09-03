@@ -40,6 +40,21 @@ about the user or project* — a preference, a name, a constraint.
 
 If unsure, ask.
 
-## Step 3: Hand off to superpowers:writing-skills
+## Step 3: Open a worktree, then hand off to superpowers:writing-skills
 
-Invoke `superpowers:writing-skills` and use it to write the SKILL.md.
+A new skill is a file under `~/.claude/skills/`, and `~/.claude` is read-only
+and pinned to `master`. Cut the worktree **before** invoking the writer — that
+skill does not know this rule and will otherwise write to the live checkout:
+
+```bash
+git -C ~/.claude fetch origin master
+git -C ~/.claude worktree add ~/worktrees/claude-<slug> -b feat/<slug> origin/master
+cd ~/worktrees/claude-<slug>
+```
+
+Then invoke `superpowers:writing-skills` and use it to write
+`skills/<name>/SKILL.md` **in the worktree**. Commit, push, `gh pr create`; the
+merge click is Jonathan's. Never commit to a branch this session did not create.
+
+Memory writes need none of this — `~/.claude/projects/.../memory/` is untracked
+runtime state.

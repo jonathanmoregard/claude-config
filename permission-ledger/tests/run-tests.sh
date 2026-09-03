@@ -51,7 +51,12 @@ CRON
 
 cp "$S/install.sh" "$S/uninstall.sh" "$S/run-evaluate.sh" "$S/prompt.md" "$S/README.md" "$STAGE/"
 chmod +x "$STAGE/run-evaluate.sh"
-for f in hook.py aggregate.py record-decision.py; do
+# Must cover every file install.sh's preflight requires, or the installer aborts
+# and all 40-odd downstream assertions cascade into failures that look like
+# regressions. proposal-sink.py was missing here, so this suite was red on a
+# clean checkout of master — only passing in a worktree that happened to hold an
+# untracked leftover from an earlier run.
+for f in hook.py aggregate.py record-decision.py proposal-sink.py; do
   if [[ -f "$S/$f" ]]; then
     cp "$S/$f" "$STAGE/$f"
     echo "using real $f from siblings"

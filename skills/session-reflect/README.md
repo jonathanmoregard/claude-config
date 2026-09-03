@@ -86,7 +86,17 @@ The terminal `skipped_duplicate` case is recorded as a side-file under
 
 ## Hook configuration
 
-Add to `~/.claude/settings.json`:
+`~/.claude` is read-only and pinned to `master`. Make this edit in a worktree,
+not the live checkout:
+
+```bash
+git -C ~/.claude fetch origin master
+git -C ~/.claude worktree add ~/worktrees/claude-<slug> -b feat/<slug> origin/master
+cd ~/worktrees/claude-<slug>
+```
+
+Then add to `settings.json` **there**, commit, push and `gh pr create`; the merge
+click is Jonathan's. Never commit to a branch this session did not create.
 
 ```json
 {
