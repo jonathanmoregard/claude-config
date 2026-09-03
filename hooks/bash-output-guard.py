@@ -590,6 +590,33 @@ def _disarm_watchdog() -> None:
 # High-entropy secret prefixes. Prefixes only — generic high-entropy
 # matching is too false-positive prone (hashes, nix store paths, base64).
 _SECRET_PATTERNS: list[tuple[str, "re.Pattern[str]"]] = [
+    # Private keys come FIRST, and both spellings are deliberate.
+    #
+    # safe-bash carried the nine prefix patterns below and NO key rule, so
+    # this is a parity-preserving gap closed rather than a regression fixed.
+    # The donors are already trusted in this repo: hooks/prompt-log.py:44 and
+    # permission-ledger/hook.py:85,90.
+    #
+    # Ordering: first so a whole block is replaced before a prefix pattern can
+    # nibble at its interior — a partly-rewritten key would still be a key,
+    # and `[REDACTED:...]` inside the body would corrupt the length report.
+    #
+    # The TERMINATED form is tried before the unterminated one so that text
+    # following an END marker stays ordinary output; the catcher below is
+    # greedy to end-of-string and would otherwise eat it.
+    (
+        "private-key",
+        re.compile(
+            r"-----BEGIN (?:[A-Z0-9 ]*)PRIVATE KEY-----[\s\S]+?"
+            r"-----END (?:[A-Z0-9 ]*)PRIVATE KEY-----"
+        ),
+    ),
+    # The UNTERMINATED catcher is LOAD-BEARING, not thoroughness. Redaction
+    # runs AFTER the harness truncates (see F11 in tests/test_bash_guard_post.py),
+    # so a key whose END marker was cut off matches neither the pattern above
+    # nor any prefix pattern, and every base64 body line would reach the
+    # transcript. Anything from BEGIN to end-of-string goes.
+    ("private-key", re.compile(r"-----BEGIN (?:[A-Z0-9 ]*)PRIVATE KEY-----[\s\S]*")),
     ("anthropic-api", re.compile(r"sk-ant-(?:api|oat)\d{2}-[A-Za-z0-9_\-]{20,}")),
     ("openai-project", re.compile(r"sk-proj-[A-Za-z0-9_\-]{20,}")),
     ("openai-legacy", re.compile(r"sk-[A-Za-z0-9]{20,}")),

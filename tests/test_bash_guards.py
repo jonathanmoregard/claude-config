@@ -1476,6 +1476,16 @@ SECRETS = [
     ("aws-access", "AK" + "IA" + "E" * 16),
     ("jwt", "ey" + "J" + "abcdefghij" + "." + "ey" + "J" + "klmnopqrst" + "." + "uvwxyz1234"),
     ("tavily-key", "tv" + "ly-" + "F" * 24),
+    # Private keys, the class safe-bash omitted. Terminated here because the
+    # row below plants the value in `KEY=<secret>\n` and asserts on what
+    # follows; the unterminated spelling (the one truncation produces) has
+    # dedicated fixtures in tests/test_bash_guard_post.py's F12 section.
+    (
+        "private-key",
+        "-----BEGIN " + "RSA PRIVATE KEY" + "-----\n"
+        + ("MIIEowIBAAKCAQEAfakefakefakefakefakefakefake\n" * 2)
+        + "-----END " + "RSA PRIVATE KEY" + "-----",
+    ),
 ]
 
 for label, secret in SECRETS:
@@ -2338,6 +2348,67 @@ check(
     "permissions.deny" not in _PROMPT_SRC
     or "blanket" not in _PROMPT_SRC,
     "the blanket Bash deny was removed when safe-bash was retired",
+)
+
+# ---- the denylist is not a closure -----------------------------------------
+# A name-list only removes what it NAMES, so the containment above was exactly
+# as complete as the CLI's tool roster was on the day it was measured. It then
+# aged: the host CLI auto-updated 2.1.251 -> 2.1.259 mid-review, and a live
+# probe of THIS invocation shape on 2.1.259 came back
+#   ["Glob","Grep","ListAgents","LSP","Read","ReportFindings","Skill","ToolSearch"]
+# Subtract the disallow list and Read/Glob/Grep and `Skill` remains — which
+# DELEGATES (skills may run in a subagent, and the roster carries schedule,
+# loop, run-at and orchestrate; a dispatched subagent gets its own tool set and
+# so transitively reaches Bash/Write/network), as does `ToolSearch`, whose whole
+# purpose is to make deferred tools callable. That is the delegation `Task` and
+# `Agent` were removed for, reached by a name nobody had written down.
+# `SlashCommand` is NOT in the 2.1.259 offer; it is disallowed defensively.
+#
+# So `--tools` is the load-bearing rail: it CLOSES the set to the built-in names
+# it lists, and a tool a future CLI adds is never offered. It is not sufficient
+# alone — scripts/idle-handoff.sh records, verified, that an unknown NAME in
+# `--tools` is SILENTLY IGNORED — which is why both rails ship and both are
+# pinned here.
+_tools_line = next(
+    (ln for ln in _RUNEVAL_SRC.splitlines() if ln.strip().startswith("AGENT_TOOLS=")),
+    "",
+)
+_agent_tools = set(_tools_line.partition("=")[2].strip().strip("'\"").split())
+
+check(
+    "the nightly agent's tool set is CLOSED with --tools, not merely filtered",
+    "--tools" in _RUNEVAL_SRC,
+    "a denylist only removes what it names; --tools is what makes an "
+    "unnamed future tool unreachable",
+)
+for _tool in ("Read", "Glob", "Grep"):
+    check(
+        f"the closed tool set still grants {_tool}",
+        _tool in _agent_tools,
+        f"the agent reads a digest file; tools={sorted(_agent_tools)}",
+    )
+for _tool in ("Bash", "Write", "Edit", "Task", "Agent", "Skill", "ToolSearch"):
+    check(
+        f"the closed tool set does not name {_tool}",
+        _tool not in _agent_tools,
+        f"tools={sorted(_agent_tools)}",
+    )
+for _tool in ("Skill", "ToolSearch", "SlashCommand"):
+    check(
+        f"the disallow list also names {_tool}",
+        _tool in _disallowed,
+        f"--tools silently ignores an unknown name, so the deny list repeats "
+        f"the closure; disallowed={sorted(_disallowed)}",
+    )
+check(
+    "the two lists cannot contradict each other",
+    not (_agent_tools & _disallowed),
+    f"granted and denied at once: {sorted(_agent_tools & _disallowed)}",
+)
+check(
+    "the header does not claim the disallow list alone closes the offer",
+    "only the ones it names" in _RUNEVAL_SRC or "--tools" in _RUNEVAL_SRC,
+    "the measured 2.1.259 offer contradicts any such claim",
 )
 
 

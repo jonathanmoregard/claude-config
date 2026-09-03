@@ -13,8 +13,30 @@
 #      stdout to proposal-sink.py, which writes the proposal files
 #
 # Why the aggregation is here and not inside the agent: the agent must not have a
-# shell, and keeping it shell-less is the job of DISALLOWED_TOOLS below, NOT of
-# the positive `--allowedTools` list.
+# shell, and keeping it shell-less is the job of `--tools` (AGENT_TOOLS) plus
+# DISALLOWED_TOOLS below, NOT of the positive `--allowedTools` list.
+#
+# THIRD MEASUREMENT, 2026-09-03, CLI 2.1.259 — a deny list is not a closure.
+# The host CLI auto-updated 2.1.251 -> 2.1.259, and `--disallowedTools` removes
+# only the tools it NAMES, so this containment was exactly as complete as the
+# roster on the day it was written. A live probe of this invocation shape on
+# 2.1.259 returned the offer
+#   ["Glob","Grep","ListAgents","LSP","Read","ReportFindings","Skill","ToolSearch"]
+# Subtract the deny list and Read/Glob/Grep and `Skill` survives — and a skill
+# may run in a SUBAGENT, which gets its own tool set and so transitively reaches
+# Bash, Write and the network. That is precisely the delegation `Task`/`Agent`
+# were denied for, arriving under a name nobody had written down. `ToolSearch`
+# survived too, and its purpose is to make deferred tools callable.
+#
+# Hence `--tools`: it CLOSES the offer to the names it lists, so a tool the NEXT
+# CLI adds is not offered at all. Both rails ship, because `--tools` silently
+# ignores an unknown name and would fail open on a typo.
+#
+# The fix, measured the same way on the same CLI — the offer for the invocation
+# BELOW is exactly
+#   ["Glob","Grep","Read"]
+# with mcp_servers []. Nothing remains after subtracting what the agent needs,
+# so `Skill` and `ToolSearch` are gone by closure and not merely by name.
 #
 # That distinction cost a real hole and is worth stating flatly:
 # `--allowedTools` PRE-APPROVES the tools it names. It does not REMOVE the ones
@@ -91,12 +113,33 @@ CLAUDE_CMD="${PL_CLAUDE_CMD:-claude}"
 # is what keeps Write off it.
 ALLOWED_TOOLS='Read Glob Grep'
 
-# The half that actually removes tools. Everything that mutates the filesystem,
-# delegates to another agent, schedules future work, or reaches the network —
-# for an agent whose entire input is untrusted permission-denial records.
+# The CLOSURE, and the rail that actually bounds this agent. `--tools` limits
+# the offer to the built-in names listed here, so a tool a FUTURE CLI adds is
+# never offered at all — which is the difference between this and the deny list
+# below. Measured 2026-09-03 against 2.1.259: with the deny list alone the live
+# offer still carried `Skill` and `ToolSearch` (see the header).
+#
+# Not sufficient on its own: an unknown tool NAME in `--tools` is SILENTLY
+# IGNORED (verified against 2.1.222, recorded in scripts/idle-handoff.sh), so a
+# typo here fails open and the deny list has to repeat the closure by name.
+AGENT_TOOLS='Read Glob Grep'
+
+# The half that removes NAMED tools, and the second copy of the closure above.
+# Everything that mutates the filesystem, delegates to another agent, schedules
+# future work, or reaches the network — for an agent whose entire input is
+# untrusted permission-denial records.
+#
+# `Skill` and `ToolSearch` are here because the 2.1.259 probe found them in the
+# live offer: a skill may run in a SUBAGENT (the roster carries schedule, loop,
+# run-at, orchestrate), and a subagent gets its own tool set, so `Skill` is the
+# same delegation `Task` and `Agent` are denied for. `ToolSearch` exists to make
+# deferred tools callable, which widens whatever this list misses. `SlashCommand`
+# is NOT in the 2.1.259 offer and is named defensively.
+#
 # Read/Glob/Grep are deliberately absent so the two lists cannot contradict.
-# tests/test_bash_guards.py pins the load-bearing names.
-DISALLOWED_TOOLS='Bash Write Edit MultiEdit NotebookEdit Task Agent Workflow SendMessage RemoteTrigger CronCreate CronDelete CronList ScheduleWakeup EnterWorktree ExitWorktree DesignSync Artifact TaskStop TaskOutput WebFetch WebSearch'
+# tests/test_bash_guards.py pins the load-bearing names and asserts the two
+# lists stay disjoint.
+DISALLOWED_TOOLS='Bash Write Edit MultiEdit NotebookEdit Task Agent Skill SlashCommand ToolSearch Workflow SendMessage RemoteTrigger CronCreate CronDelete CronList ScheduleWakeup EnterWorktree ExitWorktree DesignSync Artifact TaskStop TaskOutput WebFetch WebSearch'
 
 RETENTION_MONTHS=6
 
@@ -297,6 +340,7 @@ umask 077
 ( cd "$CLAUDE_HOME" 2>/dev/null && "${run_agent[@]}" \
   --model opus \
   --print \
+  --tools "$AGENT_TOOLS" \
   --allowedTools "$ALLOWED_TOOLS" \
   --disallowedTools "$DISALLOWED_TOOLS" \
   --strict-mcp-config \

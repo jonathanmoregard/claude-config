@@ -1012,6 +1012,16 @@ E2E_SECRETS = {
         + "." + "dBjftJeZ4CVP" + "mB92K27uhbUJU1p1r-wW1gFWFOEjXk"
     ),
     "tavily-key": "tvly" + "-" + ("F" * 28),
+    # TERMINATED on purpose: the fixture file carries `OTHER=not-a-secret`
+    # after the value, and the unterminated catcher is greedy to end-of-string.
+    # A terminated block proves the pattern fires while leaving the trailing
+    # line for the harness to compare — the unterminated spelling has its own
+    # fixtures in F12 above.
+    "private-key": (
+        "-----BEGIN " + "OPENSSH PRIVATE KEY" + "-----\n"
+        + ("b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAA\n" * 3)
+        + "-----END " + "OPENSSH PRIVATE KEY" + "-----"
+    ),
 }
 
 check(
@@ -1131,6 +1141,99 @@ check(
     "a secret cut short by truncation is below every pattern's minimum length",
     guard._redact_secrets(_fragment) == _fragment,
     "a fragment that still matches would mean the full value also matched",
+)
+
+
+# ----------------------------------------------------------------------
+# F12. Private keys — the one secret class the ported patterns omitted.
+#
+# safe-bash carried the same nine prefix patterns and no PEM rule, so this
+# is a parity-preserving GAP rather than a regression. It is closed here
+# because a private key is the highest-consequence value on the list and
+# the operator named secret redaction as a feature that must survive the
+# switchover. Donors, both already trusted in this repo: hooks/prompt-log.py
+# and permission-ledger/hook.py.
+#
+# The UNTERMINATED form is load-bearing, not thoroughness. Redaction runs
+# AFTER the harness truncates (F11 above), so a key whose END marker was cut
+# off would otherwise leave every base64 body line in the transcript — the
+# terminated pattern cannot match, and the prefix patterns never could.
+# Every key below is synthetic: invented base64-looking filler, never read
+# from disk and never a real key.
+# ----------------------------------------------------------------------
+section("bash-output-guard: private keys are redacted (F12)")
+
+_PEM_BODY = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmU" + "AAAAEbm9uZQAAAAA" * 3
+_TRACER = "TRACERLINEfakekeymaterial0123456789"
+
+
+def _fake_key(kind: str = "OPENSSH", terminated: bool = True) -> str:
+    block = f"-----BEGIN {kind} PRIVATE KEY-----\n{_PEM_BODY}\n{_TRACER}\n{_PEM_BODY}\n"
+    if terminated:
+        block += f"-----END {kind} PRIVATE KEY-----\n"
+    return block
+
+
+for _kind in ("OPENSSH", "RSA", "EC"):
+    _key = _fake_key(_kind)
+    parsed, updated, raw = bash_out("cat /tmp/synthetic-key", response_obj(_key))
+    _body = stdout_of(updated)
+    check(
+        f"a terminated {_kind} private key is redacted",
+        isinstance(_body, str) and "[REDACTED:private-key:" in _body,
+        str(_body)[:200],
+    )
+    check(
+        f"the {_kind} key body does not survive anywhere in the guard's output",
+        _TRACER not in raw and _PEM_BODY not in raw,
+        raw[:240],
+    )
+
+# Truncation ate the END marker. The body after BEGIN must still go.
+_cut = _fake_key("OPENSSH", terminated=False) + "\n[output truncated]"
+parsed, updated, raw = bash_out("cat /tmp/synthetic-key", response_obj(_cut))
+_body = stdout_of(updated)
+check(
+    "an UNTERMINATED private key block is redacted from BEGIN onward",
+    isinstance(_body, str) and "[REDACTED:private-key:" in _body,
+    str(_body)[:200],
+)
+check(
+    "the unterminated key's body does not survive truncation",
+    _TRACER not in raw and _PEM_BODY not in raw,
+    raw[:240],
+)
+
+# A terminated block must not be swallowed by the unterminated catcher: text
+# after END is ordinary output and has to stay.
+_after = "ordinary trailing output line\n"
+parsed, updated, raw = bash_out(
+    "cat /tmp/synthetic-key", response_obj(_fake_key("RSA") + _after)
+)
+_body = stdout_of(updated)
+check(
+    "output after a terminated key's END marker is preserved",
+    isinstance(_body, str) and _after.strip() in _body,
+    str(_body)[:240],
+)
+
+# No false positives: prose about keys is not a key.
+_prose = "Rotate the private key in the vault; -----BEGIN is not a header here.\n"
+check(
+    "prose mentioning a private key is not redacted",
+    guard._redact_secrets(_prose) == _prose,
+    guard._redact_secrets(_prose)[:200],
+)
+
+# The siblings still work — a pattern list is easy to break while adding to.
+_s = secret("P")
+parsed, updated, raw = bash_out("cat /tmp/creds", response_obj(f"KEY={_s}\n"))
+check(
+    "adding the private-key patterns did not break prefix redaction",
+    _s not in raw
+    and isinstance(stdout_of(updated), str)
+    and "[REDACTED:anthropic-api:" in stdout_of(updated),
+    str(stdout_of(updated))[:200],
 )
 
 
