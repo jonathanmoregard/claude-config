@@ -626,6 +626,23 @@ _SECRET_PATTERNS: list[tuple[str, "re.Pattern[str]"]] = [
 # So: find MARKERS (bounded, no body spanning, linear), then slice between
 # them with str.find. One pass, no backtracking, no dependency.
 #
+# TRUNCATION IS SYMMETRIC, AND SO IS THE CONTRACT. Redaction runs AFTER the
+# harness truncates (F11), and a cut can land on either side of a block:
+#
+#   * orphan BEGIN — the END was truncated away — redact from the BEGIN
+#     marker to end-of-string;
+#   * orphan END — the BEGIN is not in view: the tail of a key file,
+#     `grep -A`, head-side truncation — redact from the start of the
+#     current unredacted segment through the END marker.
+#
+# The first version anchored on BEGIN alone, so an END-only tail passed
+# byte-identical: key-body bytes and the END marker, zero redaction, silent.
+# Both orphan rules OVER-redact — the orphan-END rule swallows any prose
+# sitting between the segment start and the marker. That is the accepted
+# direction, per the bar at the top of this file: a false positive costs the
+# reader a visible [REDACTED] marker and a re-run, a false negative is a
+# leaked key.
+#
 # The marker vocabulary also fixes a false negative the regex had: PGP armor is
 # `-----BEGIN PGP PRIVATE KEY BLOCK-----`, which ends in `KEY BLOCK-----` and
 # not `KEY-----`, so `gpg --export-secret-keys` output passed through WHOLE.
@@ -642,22 +659,50 @@ _KEY_END_RE = re.compile(r"-----END (?:[A-Z0-9 ]*)PRIVATE KEY(?: BLOCK)?-----")
 
 
 def _redact_private_keys(body: str) -> str:
-    """Replace every armored private-key block, terminated or not, in ONE pass."""
+    """Replace every armored private-key block, terminated or not, in ONE pass.
+
+    Symmetric truncation contract (see the comment block above): an orphan
+    BEGIN redacts to end-of-string, an orphan END redacts from the segment
+    start through the marker. Over-redaction is the accepted direction.
+
+    LINEARITY is load-bearing — the quadratic regex this replaced was a
+    fail-open (see above). The invariant that keeps it: ``pos`` only moves
+    forward, and the next BEGIN is CACHED and re-searched only once the scan
+    has consumed it, so no position is scanned more than a constant number of
+    times. An ENDs-only body must not make the BEGIN search restart from
+    every marker.
+    """
     out: list[str] = []
     pos = 0
+    begin = _KEY_BEGIN_RE.search(body, pos)
     while True:
-        begin = _KEY_BEGIN_RE.search(body, pos)
+        end = _KEY_END_RE.search(body, pos)
+        if end is not None and (begin is None or end.start() < begin.start()):
+            # Orphaned END: no BEGIN in view before it, so the bytes in front
+            # of the marker are the tail of a key whose head is not in this
+            # body (head-side truncation semantics). Everything from the
+            # segment start through the marker goes as one block.
+            out.append(f"[REDACTED:private-key:{end.end() - pos}chars]")
+            pos = end.end()
+            if begin is not None and begin.start() < pos:
+                begin = _KEY_BEGIN_RE.search(body, pos)
+            continue
         if begin is None:
             out.append(body[pos:])
             return "".join(out)
         out.append(body[pos : begin.start()])
-        end = _KEY_END_RE.search(body, begin.end())
+        if end is not None and end.start() < begin.end():
+            # The cached END starts inside the BEGIN marker itself (only
+            # possible when the two share trailing/leading dashes). BEGIN
+            # pairs with the next END past its own marker, as always.
+            end = _KEY_END_RE.search(body, begin.end())
         # No END means truncation cut it off (F11: redaction runs AFTER the
         # harness truncates). Everything from BEGIN onward goes — an END that
         # was never emitted must not leave the body behind.
         stop = end.end() if end else len(body)
         out.append(f"[REDACTED:private-key:{stop - begin.start()}chars]")
         pos = stop
+        begin = _KEY_BEGIN_RE.search(body, pos)
 
 
 def _redact_secrets(body: str) -> str:

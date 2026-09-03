@@ -1263,6 +1263,85 @@ check(
     str(_body)[:240],
 )
 
+# ---- orphaned END markers: head-side truncation (r4-A) --------------------
+#
+# The scanner used to anchor on BEGIN alone, so output carrying key-body
+# bytes followed by an END marker with NO BEGIN in view — the tail of a key
+# file, `grep -A`, head-side truncation — passed byte-identical. The
+# contract is now symmetric: an orphan BEGIN redacts to end-of-string, an
+# orphan END redacts from the segment start through the marker. Both
+# over-redact on purpose; a false negative here is a leaked key.
+_end_only = f"{_PEM_BODY}\n{_TRACER}\n{_armor('RSA', 'END')}\nafter the marker\n"
+for _fn_name in ("_redact_private_keys", "_redact_secrets"):
+    _got = getattr(guard, _fn_name)(_end_only)
+    check(
+        f"an END-only RSA key tail is redacted by {_fn_name}",
+        _TRACER not in _got
+        and _PEM_BODY not in _got
+        and _armor("RSA", "END") not in _got
+        and "[REDACTED:private-key:" in _got,
+        _got[:200],
+    )
+    check(
+        f"text after the orphan END survives {_fn_name}",
+        _got.endswith("\nafter the marker\n"),
+        _got[-60:],
+    )
+
+# The PGP spelling ends in `KEY BLOCK-----`; an orphan-END rule that only
+# knew `KEY-----` would pass a gpg export's tail through whole.
+_pgp_end_only = f"{_PEM_BODY}\n{_TRACER}\n{_armor('PGP', 'END')}\n"
+for _fn_name in ("_redact_private_keys", "_redact_secrets"):
+    _got = getattr(guard, _fn_name)(_pgp_end_only)
+    check(
+        f"an END-only PGP KEY BLOCK tail is redacted by {_fn_name}",
+        _TRACER not in _got
+        and _PEM_BODY not in _got
+        and _armor("PGP", "END") not in _got
+        and "[REDACTED:private-key:" in _got,
+        _got[:200],
+    )
+
+# A full block, prose, then a lone END. The contract: the full block is one
+# redaction, and the orphan END swallows everything from the segment start —
+# the prose included — as a second. Bytes past the lone END's end() are not
+# touched.
+_mixed = (
+    _fake_key("RSA")
+    + "prose between blocks\n"
+    + _armor("EC", "END")
+    + "\nuntouched tail\n"
+)
+_got = guard._redact_private_keys(_mixed)
+check(
+    "a full block followed by a lone END yields two redactions, no survivors",
+    _got.count("[REDACTED:private-key:") == 2
+    and _TRACER not in _got
+    and _PEM_BODY not in _got
+    and _armor("EC", "END") not in _got,
+    _got[:240],
+)
+check(
+    "the prose before the orphan END is swallowed into its redaction (the stated contract: over-redact toward the marker)",
+    "prose between blocks" not in _got,
+    _got[:240],
+)
+check(
+    "nothing after the lone END's end() is touched",
+    _got.endswith("\nuntouched tail\n"),
+    _got[-60:],
+)
+
+# Control: prose with no markers at all passes unchanged through both entry
+# points — the orphan-END rule must not turn the scanner into a shredder.
+_plain = "no armor markers here; keys are discussed but never printed.\n"
+check(
+    "control: prose with no markers passes unchanged",
+    guard._redact_private_keys(_plain) == _plain
+    and guard._redact_secrets(_plain) == _plain,
+    guard._redact_private_keys(_plain)[:120],
+)
+
 # No false positives: prose about keys is not a key.
 _prose = "Rotate the private key in the vault; -----BEGIN is not a header here.\n"
 check(
@@ -1327,6 +1406,30 @@ check(
     "and that body is actually redacted, not merely fast",
     ("-----BEGIN " + "OPENSSH PRIVATE KEY" + "-----") not in _out_adv,
     _out_adv[:160],
+)
+
+# The orphan-END rule (r4-A) adds a second worst-case shape: ENDs with no
+# BEGIN anywhere. A naive implementation re-runs the BEGIN search from every
+# marker — (END count x length), the same quadratic through the other door.
+# The scanner caches the next BEGIN instead, so this must fit the SAME
+# budget as the BEGINs-only shape above.
+_ADVERSARIAL_ENDS = (
+    "A" * 40 + "\n" + "-----END " + "OPENSSH PRIVATE KEY" + "-----\n"
+) * 8000
+_t0 = time.perf_counter()
+_out_adv_ends = guard._redact_secrets(_ADVERSARIAL_ENDS)
+_elapsed_ends = time.perf_counter() - _t0
+check(
+    "an adversarial END-without-BEGIN body redacts in linear time",
+    _elapsed_ends < 2.0,
+    f"{len(_ADVERSARIAL_ENDS)} bytes took {_elapsed_ends:.3f}s "
+    "(re-searching BEGIN from every END would be quadratic here)",
+)
+check(
+    "and the ENDs-only body is actually redacted, not merely fast",
+    ("-----END " + "OPENSSH PRIVATE KEY" + "-----") not in _out_adv_ends
+    and ("A" * 40) not in _out_adv_ends,
+    _out_adv_ends[:160],
 )
 
 

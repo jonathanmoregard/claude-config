@@ -130,46 +130,37 @@ BEGIN {
     nr++
     rid[nr] = f[1]; rsev[nr] = f[2]; rpat[nr] = f[3]
   }
+  old_left = 0; new_left = 0   # no hunk extent open until the first @@ header
 }
-/^\+\+\+ / {
-  file = substr($0, 7)          # strip "+++ b/"
-  if (file == "/dev/null") file = ""
-  # This file states several rules as literal text (`eslint-disable`,
-  # `bypassPermissions`, `--dangerously`), so scanning it makes the gate flag
-  # its own rule table on every edit — and a gate that cries wolf about itself
-  # is one people learn to skip. Excluded deliberately. The trade is a named,
-  # single-file blind spot, which is why changes here get human review rather
-  # than machine review.
-  # The gate and its fixture both state rules as literal text — the fixture
-  # exists precisely to contain one example of every pattern — so scanning
-  # either makes the gate flag its own rule table on every edit, and a gate
-  # that cries wolf about itself is one people learn to skip.
-  skip_file = (file ~ /deterministic-gate(-test)?\.sh$/)
-  # Same reset as the hunk header, for the same reason: nothing in the previous
-  # FILE is the line above anything in this one.
-  prevtext = ""; prevline = -1
-  # Prose files describe commands; they do not run them. A plan document that
-  # says "then run git push --force" is a sentence, and flagging it buries the
-  # diff lines that are actually executable. Measured against the history of
-  # this repo, docs produced the overwhelming majority of all matches and none
-  # of the true ones. gitleaks still covers these files, because a secret in a
-  # document is still a secret.
-  if (!skip_file && !include_docs)
-    skip_file = (file ~ /\.(md|markdown|txt|rst|adoc)$/)
-  next
-}
-/^@@ / {
-  # @@ -a,b +c,d @@ — take c as the first new-file line of the hunk.
-  match($0, /\+[0-9]+/)
-  newline = substr($0, RSTART + 1, RLENGTH - 1) + 0
-  # A new hunk means the previous added line is no longer ABOVE anything here.
-  # Without this reset the waiver on the last added line of the previous hunk
-  # reached the first added line of this one, silently suppressing a BLOCKER
-  # across a gap of any size. See the waiver-scope lane in the test fixture.
-  prevtext = ""; prevline = -1
-  next
-}
-/^\+/ {
+# ── Hunk extents ──────────────────────────────────────────────────────────────
+# Structure, not pattern-guessing, decides what is a header. A hunk header
+# declares exactly how many old and new lines the hunk contains, and while
+# those extents are unconsumed EVERY line is diff content: an added line whose
+# content starts `++ ` renders as `+++ ...`, and before this block existed the
+# header rule below matched it — reattributing the file (a `.md` tail set the
+# prose skip and silently suppressed every later BLOCKER in the hunk), never
+# scanning the forged line itself, and freezing the line counter so later
+# findings landed one line low. A removed line whose content starts `-- `
+# renders `--- ...`, so a `-- a/x` / `++ b/x` pair forged the full two-line
+# header. Measured: a forged diff returned findings:[] where the control
+# flagged destructive-rm. Nothing inside a hunk can forge `@@ ` — content
+# renders with a +/-/space prefix first — so the counts are trustworthy.
+old_left > 0 || new_left > 0 {
+  if ($0 ~ /^\\/) next          # "\ No newline at end of file": consumes nothing
+  mark = substr($0, 1, 1)
+  if (mark == "-") { old_left--; next }   # removed line: not scanned, no new-file line
+  if (mark != "+") {
+    # Context line: occupies one line of both images. Unreachable with the
+    # --unified=0 diffs this gate produces, handled so the extents stay exact
+    # if that ever changes. prev* is reset, not carried: a context line is not
+    # an ADDED line, so it must neither extend waiver reach nor pair into a
+    # two-line finding.
+    old_left--; new_left--
+    newline++
+    prevtext = ""; prevline = -1
+    next
+  }
+  new_left--
   if (skip_file) next
   text = substr($0, 2)
   # Keep the previous added line so a waiver can sit directly above the match.
@@ -210,6 +201,52 @@ BEGIN {
   prevtext = text
   prevline = newline
   newline++
+  next
+}
+# The extent block above consumes every line while a hunk is open, so this
+# rule can only fire OUTSIDE hunks — on a real `+++ b/…` emitted by git,
+# never on forged added content.
+/^\+\+\+ / {
+  file = substr($0, 7)          # strip "+++ b/"
+  if (file == "/dev/null") file = ""
+  # This file states several rules as literal text (`eslint-disable`,
+  # `bypassPermissions`, `--dangerously`), so scanning it makes the gate flag
+  # its own rule table on every edit — and a gate that cries wolf about itself
+  # is one people learn to skip. Excluded deliberately. The trade is a named,
+  # single-file blind spot, which is why changes here get human review rather
+  # than machine review.
+  # The gate and its fixture both state rules as literal text — the fixture
+  # exists precisely to contain one example of every pattern — so scanning
+  # either makes the gate flag its own rule table on every edit, and a gate
+  # that cries wolf about itself is one people learn to skip.
+  skip_file = (file ~ /deterministic-gate(-test)?\.sh$/)
+  # Same reset as the hunk header, for the same reason: nothing in the previous
+  # FILE is the line above anything in this one.
+  prevtext = ""; prevline = -1
+  # Prose files describe commands; they do not run them. A plan document that
+  # says "then run git push --force" is a sentence, and flagging it buries the
+  # diff lines that are actually executable. Measured against the history of
+  # this repo, docs produced the overwhelming majority of all matches and none
+  # of the true ones. gitleaks still covers these files, because a secret in a
+  # document is still a secret.
+  if (!skip_file && !include_docs)
+    skip_file = (file ~ /\.(md|markdown|txt|rst|adoc)$/)
+  next
+}
+/^@@ / {
+  # @@ -a,b +c,d @@ — c is the first new-file line of the hunk; b and d are
+  # the old/new extents the block above consumes (each defaults to 1 when its
+  # `,len` part is omitted, and 0 is legal for a pure add or delete).
+  no = split($2, ofld, ",")             # $2 = "-a,b" or "-a"
+  old_left = (no > 1) ? ofld[2] + 0 : 1
+  nn = split($3, nfld, ",")             # $3 = "+c,d" or "+c"
+  newline  = substr(nfld[1], 2) + 0
+  new_left = (nn > 1) ? nfld[2] + 0 : 1
+  # A new hunk means the previous added line is no longer ABOVE anything here.
+  # Without this reset the waiver on the last added line of the previous hunk
+  # reached the first added line of this one, silently suppressing a BLOCKER
+  # across a gap of any size. See the waiver-scope lane in the test fixture.
+  prevtext = ""; prevline = -1
   next
 }
 { next }

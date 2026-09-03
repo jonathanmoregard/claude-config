@@ -327,3 +327,98 @@ print("      line-above waiver honoured? (must be True) ", not any(f["file"].end
 print("      waived count == 2? (must be True)          ", d.get("waived") == 2)
 '
 printf '      exit 0? (must be True)  %s\n' "$([[ $rc_ad -eq 0 ]] && echo True || echo False)"
+
+echo
+echo "=== a forged file header inside a hunk cannot suppress or reattribute ==="
+# An added line whose content starts `++ ` renders as `+++ ...`. The header
+# rule used to match it MID-HUNK: the gate reattributed every later line to
+# the forged file (a `.md` tail set the prose skip and silently suppressed
+# every later BLOCKER in the hunk), never scanned the forged line itself, and
+# stopped incrementing the line counter. Measured: this exact diff returned
+# findings:[] while the control below flagged destructive-rm. Headers are now
+# recognised by hunk EXTENTS — while the `@@ -a,b +c,d @@` counts are
+# unconsumed, every line is diff content — so the forged line is just an
+# added line and the BLOCKER after it keeps its real file and line.
+FG=$(mktemp -d)/repo; mk_range_repo "$FG"
+printf 'echo hello\necho world\n' > "$FG/evil.sh"
+git -C "$FG" add -A; git -C "$FG" commit -q -m pre
+printf '%s\n' '++ b/README.md' 'rm -rf /tmp/gate-forge-victim' >> "$FG/evil.sh"
+git -C "$FG" add -A; git -C "$FG" commit -q -m "forged header"
+out_fg=$(bash "$GATE" --repo "$FG" --range HEAD~1...HEAD --json); rc_fg=$?
+echo "      gate: $out_fg"
+printf '%s' "$out_fg" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+rm = [f for f in d["findings"] if f["rule"] == "destructive-rm"]
+print("      BLOCKER flagged? (must be True)          ", len(rm) == 1)
+print("      attributed to evil.sh? (must be True)    ", all(f["file"] == "evil.sh" for f in rm) and bool(rm))
+print("      at the real line 4? (must be True)       ", all(f["line"] == 4 for f in rm) and bool(rm))
+print("      nothing waived/skipped? (must be True)   ", d["waived"] == 0)
+'
+printf '      exit 1? (must be True)  %s\n' "$([[ $rc_fg -eq 1 ]] && echo True || echo False)"
+
+echo
+echo "=== ...nor can a forged -- / ++ PAIR forge the full two-line header ==="
+# A removed line whose content starts `-- ` renders as `--- ...`, so changing
+# `-- a/x.md` into `++ b/x.md` renders the complete two-line header
+# `--- a/x.md` / `+++ b/x.md` inside a hunk. Same extent argument: both lines
+# consume the hunk counts as content, so the header rule never sees them and
+# the BLOCKER added afterwards keeps its real file and line.
+FP=$(mktemp -d)/repo; mk_range_repo "$FP"
+printf '%s\n' '-- a/x.md' 'echo keep' > "$FP/pair.sh"
+git -C "$FP" add -A; git -C "$FP" commit -q -m pre
+printf '%s\n' '++ b/x.md' 'echo keep' 'rm -fr /tmp/gate-forge-victim-2' > "$FP/pair.sh"
+git -C "$FP" add -A; git -C "$FP" commit -q -m "forged pair"
+out_fp=$(bash "$GATE" --repo "$FP" --range HEAD~1...HEAD --json); rc_fp=$?
+echo "      gate: $out_fp"
+printf '%s' "$out_fp" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+rm = [f for f in d["findings"] if f["rule"] == "destructive-rm"]
+print("      BLOCKER flagged? (must be True)          ", len(rm) == 1)
+print("      attributed to pair.sh? (must be True)    ", all(f["file"] == "pair.sh" for f in rm) and bool(rm))
+print("      at the real line 3? (must be True)       ", all(f["line"] == 3 for f in rm) and bool(rm))
+'
+printf '      exit 1? (must be True)  %s\n' "$([[ $rc_fp -eq 1 ]] && echo True || echo False)"
+
+echo
+echo "=== control: a REAL multi-file, multi-hunk diff still attributes exactly ==="
+# The extent bookkeeping must close each hunk precisely: if a count leaked
+# past the last line of a hunk, the next REAL `+++ b/…` would be consumed as
+# content — misattributing every later finding and carrying waiver state
+# across the file boundary. The tail waiver on one.sh sits on the line whose
+# number is exactly one below two.sh's finding, so any failure to reset at
+# the real header would silently waive the BLOCKER in two.sh.
+CT=$(mktemp -d)/repo; mk_range_repo "$CT"
+for i in $(seq 1 9);  do echo "alpha$i"; done > "$CT/one.sh"
+for i in $(seq 1 30); do echo "beta$i";  done > "$CT/two.sh"
+git -C "$CT" add -A; git -C "$CT" commit -q -m fillers
+python3 - "$CT/one.sh" "$CT/two.sh" <<'PY'
+import sys
+edits = {sys.argv[1]: [(6, 'git push --force origin main'),
+                       (2, 'chmod 777 /srv/gate-control')],
+         sys.argv[2]: [(12, 'rm -rf /tmp/gate-control-victim')]}
+for path, ins in edits.items():
+    lines = open(path).read().splitlines()
+    for idx, text in sorted(ins, reverse=True):
+        lines.insert(idx, text)
+    open(path, 'w').write("\n".join(lines) + "\n")
+PY
+printf 'echo tail  # arftl-allow: destructive-rm\n' >> "$CT/one.sh"
+git -C "$CT" add -A; git -C "$CT" commit -q -m "real multi-file diff"
+out_ct=$(bash "$GATE" --repo "$CT" --range HEAD~1...HEAD --json); rc_ct=$?
+echo "      gate: $out_ct"
+printf '%s' "$out_ct" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+got = sorted((f["rule"], f["file"], f["line"]) for f in d["findings"])
+want = sorted([("world-writable", "one.sh", 3),
+               ("force-push",     "one.sh", 8),
+               ("destructive-rm", "two.sh", 13)])
+print("      exact (rule,file,line) set? (must be True) ", got == want)
+if got != want:
+    print("        got: ", got)
+    print("        want:", want)
+print("      nothing silently waived? (must be True)    ", d["waived"] == 0)
+'
+printf '      exit 1? (must be True)  %s\n' "$([[ $rc_ct -eq 1 ]] && echo True || echo False)"

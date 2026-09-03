@@ -1279,6 +1279,12 @@ stale_detail_this_iter=""
 for project_dir in "$PROJECTS_DIR"/*/; do
   [[ -d "$project_dir" ]] || continue
 
+  # Reset per candidate: context_request_pending only ever SETS these, so
+  # candidate N's manual /self-compact operator text (and fill) would otherwise
+  # leak into candidate N+1's fork prompt as operator-typed instructions.
+  CONTEXT_REQUEST_FILL=""
+  CONTEXT_REQUEST_INSTRUCTIONS=""
+
   case "$project_dir" in
     *homunculus*|*observer*|*step-back*)
       count_skipped_observer=$((count_skipped_observer + 1))
