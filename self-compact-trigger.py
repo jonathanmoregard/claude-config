@@ -99,8 +99,11 @@ LOOP BOUND (B6)
     dip re-arm (a dip is a new crossing). A MANUAL reset's abort feeds this
     channel too (/self-compact spawns the same inplace_reset.py, which writes
     the same outcome record) — intended: the same four bounds apply, and the
-    re-arm only ever acts while the session measures above the threshold. The
-    env vars select BOUNDS, never on/off — see NO SWITCH.
+    re-arm only ever acts while the session measures above the threshold. Such
+    a retry ANSWERS the operator's request, so it inherits its `manual` marker
+    and `instructions` rather than overwriting them with a plain automatic
+    request (pending_manual_steer). The env vars select BOUNDS, never on/off —
+    see NO SWITCH.
 """
 from __future__ import annotations
 
@@ -532,6 +535,38 @@ def spawn_inplace_reset(sid: str, instructions: str = "") -> str:
     return f"queued(pid_target={spid})"
 
 
+def pending_manual_steer(sid: str) -> dict:
+    """The operator's fields from an UNCONSUMED `/self-compact` marker, or {}.
+
+    A manual request stays in request.json until a reset LANDS, which renames it
+    to consumed.json; an abort deliberately keeps it. The automatic fire below
+    overwrites that file, and the automatic shape carries neither field — so a
+    fire (or an abort-driven retry) that lands on top of a steered request used
+    to silently downgrade it: `instructions`, the text a human typed into this
+    session, vanished from the fork prompt, and `manual` gone meant
+    idle-handoff.sh re-applied the >= FIRE_AT_TOKENS gate that a manual request
+    does not rest on.
+
+    Both fields are carried, `manual` included. The claim stays true — a person
+    did ask this session to hand off, and the retry ANSWERS that request rather
+    than replacing it — and it concedes nothing downstream: this marker is
+    freshly written by a fire that measured a real crossing, so the gate
+    `manual` skips is one it would pass. Scope is the sid and the rename: a
+    landed reset discharges the steer, and nothing carries into another session.
+    """
+    try:
+        req = json.loads(marker_path_for(sid).read_text())
+    except Exception:
+        return {}
+    if not isinstance(req, dict) or not req.get("manual"):
+        return {}
+    steer = {"manual": True}
+    instructions = req.get("instructions")
+    if isinstance(instructions, str) and instructions:
+        steer["instructions"] = instructions
+    return steer
+
+
 def main() -> int:
     # Fork-chain / recursion breaks. A reflection subprocess carries
     # REFLECT_SUBPROCESS=1; every headless run (including our own autofork)
@@ -621,6 +656,9 @@ def main() -> int:
         log(f"sid={sid} could not persist state under {state_dir()}; refusing to fire")
         return 0
 
+    # Read BEFORE the marker below is overwritten — that write is what would
+    # otherwise drop it. See pending_manual_steer.
+    steer = pending_manual_steer(sid)
     request = {
         "session_id": sid,
         "cwd": cwd,
@@ -634,6 +672,9 @@ def main() -> int:
         "requested_at_epoch": now,
         "requested_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
     }
+    # Last, so the measured fields above stay this fire's own and only the
+    # operator's two survive the overwrite.
+    request.update(steer)
     # THE MARKER IS THE ONLY THING idle-handoff READS. Its write status used to be
     # discarded: the fire state persisted (so the session was `armed: false` and would
     # not retry this crossing), the FIRE line below logged a success, and no marker
@@ -663,11 +704,12 @@ def main() -> int:
     # 382,543-token session returned HTTP 400 prompt_too_long after billing
     # $0.23. The write was guaranteed to fail for exactly the sessions this
     # feature exists to serve.
-    reset = spawn_inplace_reset(sid)
+    reset = spawn_inplace_reset(sid, steer.get("instructions", ""))
     log(f"sid={sid} FIRE crossing={state['crossings']} "
         f"tokens={occ.total_tokens}/{occ.window} "
         f"fill={occ.fill_pct:.3f} fire_at={FIRE_AT_TOKENS} cwd={cwd} "
-        f"marker={'ok' if marker_written else 'FAILED'} inplace={reset}")
+        f"marker={'ok' if marker_written else 'FAILED'} "
+        f"steer={'manual' if steer else 'none'} inplace={reset}")
     gc_state()
     return 0
 

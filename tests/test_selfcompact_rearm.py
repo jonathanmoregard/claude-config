@@ -53,7 +53,8 @@ def harness(tmp_path, monkeypatch):
     spawned = []
     monkeypatch.setattr(
         sct, "spawn_inplace_reset",
-        lambda sid, instructions="": (spawned.append(sid), "stubbed")[1])
+        lambda sid, instructions="": (
+            spawned.append((sid, instructions)), "stubbed")[1])
 
     def run(tokens):
         payload = {"session_id": SID, "transcript_path": str(transcript),
@@ -82,9 +83,23 @@ def harness(tmp_path, monkeypatch):
             {"status": status, "reason": reason,
              "at": int(at if at is not None else time.time())}))
 
+    def write_manual_request(instructions):
+        """What `--manual` (i.e. /self-compact) leaves on disk. It stays there
+        until a reset LANDS, which renames it to consumed.json."""
+        d = sessions / SID
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "request.json").write_text(json.dumps(
+            {"session_id": SID, "cwd": str(cwd), "transcript_path": str(transcript),
+             "manual": True, "instructions": instructions,
+             "requested_at_epoch": int(time.time())}))
+
+    def request():
+        return json.loads((sessions / SID / "request.json").read_text())
+
     return types.SimpleNamespace(
         sessions=sessions, run=run, spawned=spawned, state=state,
-        patch_state=patch_state, write_outcome=write_outcome)
+        patch_state=patch_state, write_outcome=write_outcome,
+        write_manual_request=write_manual_request, request=request)
 
 
 def test_abort_outcome_rearms_and_fires_again(harness):
@@ -289,6 +304,50 @@ def test_no_outcome_means_no_rearm(harness):
     assert harness.run(360_000) == 0
     assert harness.state()["fires"] == 1
     assert len(harness.spawned) == 1
+
+
+STEER = "land the migration branch first, then read tasks/mission.md"
+
+
+def test_an_automatic_fire_does_not_downgrade_a_pending_manual_request(harness):
+    # /self-compact wrote a steered marker and its reset aborted, so the marker
+    # is still pending (only a reset that LANDS renames it to consumed.json).
+    # The automatic fire overwrites that file: without carrying the fields it
+    # would silently convert the operator's steered handoff into a plain one —
+    # the fork prompt loses the text a human typed this session, and
+    # idle-handoff.sh re-applies the fill gate a manual request does not rest on.
+    harness.write_manual_request(STEER)
+    assert harness.run(350_000) == 0
+
+    req = harness.request()
+    assert req["manual"] is True
+    assert req["instructions"] == STEER
+    assert req["tokens"] == 350_000          # still the automatic fire's own claim
+    assert harness.spawned == [(SID, STEER)]
+
+
+def test_an_abort_retry_carries_the_manual_steer_forward(harness):
+    # The re-arm path answers the SAME operator request, so it inherits it too.
+    harness.write_manual_request(STEER)
+    assert harness.run(350_000) == 0
+    now = int(time.time())
+    harness.patch_state(last_fired_at=now - 205)
+    harness.write_outcome("aborted", at=now - 5)
+    assert harness.run(360_000) == 0
+
+    assert harness.state()["fires"] == 2
+    assert harness.request()["instructions"] == STEER
+    assert harness.spawned[-1] == (SID, STEER)
+
+
+def test_an_automatic_request_never_claims_to_be_manual(harness):
+    # Control: with nothing pending, the marker makes only the claim it can
+    # support — a measured crossing. `manual` relaxes a downstream gate and is
+    # never invented here.
+    assert harness.run(350_000) == 0
+    req = harness.request()
+    assert "manual" not in req and "instructions" not in req
+    assert harness.spawned == [(SID, "")]
 
 
 def test_dip_below_threshold_still_rearms_and_resets_retries(harness):
