@@ -587,7 +587,13 @@ def main(argv: list[str]) -> int:
         lock_dir.mkdir(parents=True, exist_ok=True)
         lock_fd = os.open(str(lock_dir / "reset.lock"), os.O_CREAT | os.O_RDWR, 0o600)
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    # ONLY a held lock (LOCK_NB flock, EWOULDBLOCK → BlockingIOError) reads as
+    # "lock_held" — the trigger consumes that reason to refire, which is right
+    # against a live holder but a wall against a broken state dir. Any other
+    # OSError here (mkdir/open: permissions, sessions root not a dir)
+    # propagates to the __main__ crash handler, which logs the real error and
+    # records 'crash' best-effort.
+    except BlockingIOError:
         log(f"sid={sid} REFUSING: another in-place reset is already running for this "
             "session. Two waiters on one window would interleave their clear and pickup.")
         # A re-arm+refire off this record while the holder is live is refused
