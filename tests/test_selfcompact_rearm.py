@@ -223,6 +223,9 @@ def test_an_outcome_older_than_the_fire_is_stale(harness):
     json.dumps({"status": "aborted", "reason": "x"}),      # no `at` at all
     json.dumps({"status": "aborted", "reason": "x",
                 "at": "soon"}),                            # non-int `at`
+    json.dumps({"status": "aborted", "reason": "x",
+                "at": True}),                              # bool `at` (isinstance
+                                                           # int is True; not an epoch)
 ])
 def test_a_corrupt_outcome_record_never_rearms(harness, raw):
     # outcome.json is the one Stop-hook read of a file ANOTHER process writes;
@@ -237,6 +240,26 @@ def test_a_corrupt_outcome_record_never_rearms(harness, raw):
     assert st["fires"] == 1
     assert st["armed"] is False
     assert st.get("rearm_retries", 0) == 0
+    assert len(harness.spawned) == 1
+
+
+def test_a_bool_at_never_buys_a_rearm_even_with_no_usable_last_fired(harness):
+    # The one shape where the bool guard is load-bearing. MEASURED against the
+    # pre-fix `not isinstance(at, int)`: with last_fired_at backdated (the
+    # parametrization above) `at:true` -> 1 is refused as stale either way, but
+    # with last_fired_at absent or corrupt (int_field defaults it to 0) the old
+    # guard returned True and spent a retry on a record that is not a timestamp.
+    # Bools are ints in Python; int_field refuses them on the state side and the
+    # outcome side must agree.
+    assert harness.run(350_000) == 0
+    harness.patch_state(last_fired_at="2026-09-04T13:04:59Z")  # -> int_field 0
+    (harness.sessions / SID / "outcome.json").write_text(json.dumps(
+        {"status": "aborted", "reason": "x", "at": True}))
+    assert harness.run(360_000) == 0
+    st = harness.state()
+    assert st["fires"] == 1
+    assert st.get("rearm_retries", 0) == 0
+    assert "last_abort_consumed_at" not in st
     assert len(harness.spawned) == 1
 
 

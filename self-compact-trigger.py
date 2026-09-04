@@ -409,7 +409,13 @@ def consume_abort_for_rearm(sid: str, state: dict) -> bool:
     if not isinstance(outcome, dict):
         return False
     at = outcome.get("at")
-    if not isinstance(at, int):
+    # Bools are ints in Python, so a bare isinstance(at, int) ACCEPTS `true` and
+    # carries 1 into the comparisons below. Refused here for the same reason
+    # int_field refuses it on the state side: `true` in a timestamp field is not
+    # "one second past the epoch". Currently inert (at=1 loses every `at <
+    # last_fired` check), but the two reads harden against one corruption class
+    # and must not disagree about what an `at` is.
+    if isinstance(at, bool) or not isinstance(at, int):
         return False
     status = outcome.get("status")
     if status == "ok":
