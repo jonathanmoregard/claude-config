@@ -181,6 +181,18 @@ rows = [
         {"type": "tool_result", "tool_use_id": "t1", "content": long_body}]}},
     {"type": "assistant", "message": {"role": "assistant", "content": [
         {"type": "text", "text": "FIXTURE-MARKER-AGENT-CONCLUSION loader is fine"}]}},
+    # F1 — the patsub_replacement hazard, spelled out in transcript text.
+    # Since bash 5.2 an UNQUOTED `&` in a `${x//pat/repl}` replacement expands to
+    # the MATCHED PATTERN. These three shapes are what that does to real text:
+    #   AMP-A  a&b   -> a{{AGENT_TRANSCRIPT_BLOCK}}b   (placeholder re-injected)
+    #   AMP-B  c\&d  -> c&d                            (the backslash is eaten)
+    #   AMP-C  PAT&{{...}} -> PAT{{AGENT_TRANSCRIPT_BLOCK}}{{...}}
+    # The literal in AMP-C is deliberately NOT a real placeholder name: a real one
+    # would make the "no placeholder survives" assertion below unfalsifiable.
+    {"type": "assistant", "message": {"role": "assistant", "content": [
+        {"type": "text", "text":
+         "FIXTURE-AMP-A a&b | FIXTURE-AMP-B c\\&d | "
+         "FIXTURE-AMP-C PAT&{{NOT_A_REAL_PLACEHOLDER}}"}]}},
 ]
 with open(path, "w") as fh:
     for r in rows:
@@ -289,6 +301,28 @@ fi
 # The parent must NOT be reflected by a SubagentStop (D1's headline defect).
 [[ ! -f "$REFLECT_ROOT/sessions/$PARENT_SID/final.json" ]]; assert $? "the PARENT session was not reflected"
 [[ ! -d "$REFLECT_ROOT/sessions/$AGENT_ID" ]]; assert $? "no top-level session dir minted for the agent id"
+
+# ===========================================================================
+# F1 — `&` in substituted text survives literally (bash 5.2 patsub_replacement).
+# Rides on the prompt log the A1/A3 run just produced: no reset_logs, no second
+# dispatcher call. Pre-fix every assertion below fails.
+# ===========================================================================
+t_begin "F1: an ampersand in transcript text is not expanded into the placeholder"
+grep -qF 'FIXTURE-AMP-A a&b' "$STUB_PROMPT_LOG"; assert $? "a bare & reaches the prompt literally"
+grep -qF 'FIXTURE-AMP-B c\&d' "$STUB_PROMPT_LOG"; assert $? "a backslash-escaped \\& is not unescaped"
+grep -qF 'FIXTURE-AMP-C PAT&{{NOT_A_REAL_PLACEHOLDER}}' "$STUB_PROMPT_LOG"; assert $? "& next to a brace literal is left alone"
+# The headline symptom: patsub re-injects the placeholder NAME into the body it
+# was supposed to be replacing. A correctly-substituted prompt has none left.
+if grep -qF '{{AGENT_TRANSCRIPT_BLOCK}}' "$STUB_PROMPT_LOG"; then
+  bad "the {{AGENT_TRANSCRIPT_BLOCK}} literal survived into the prompt (& expanded to the match?)"
+else
+  ok "no {{AGENT_TRANSCRIPT_BLOCK}} literal anywhere in the prompt"
+fi
+if grep -qF '{{AGENT_TYPE}}' "$STUB_PROMPT_LOG"; then
+  bad "the {{AGENT_TYPE}} literal survived into the prompt"
+else
+  ok "no {{AGENT_TYPE}} literal anywhere in the prompt"
+fi
 
 # ===========================================================================
 # A1 control — a SECOND subagent of the same parent must not be latched out by

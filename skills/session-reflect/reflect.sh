@@ -894,7 +894,18 @@ run_worker() {
       cp_block="(no checkpoint directory)"
     fi
     # Portable substitution: replace {{CHECKPOINTS_BLOCK}} with cp_block.
-    prompt="${prompt//\{\{CHECKPOINTS_BLOCK\}\}/$cp_block}"
+    #
+    # THE REPLACEMENT MUST BE QUOTED INSIDE THE EXPANSION. Since bash 5.2 the
+    # `patsub_replacement` option is ON by default, and it makes an UNQUOTED `&`
+    # in the replacement expand to the whole matched pattern — so a block
+    # containing `p&q` substitutes as `p{{CHECKPOINTS_BLOCK}}q`, re-injecting
+    # the placeholder literal into the prompt and mangling the text around it.
+    # Every body substituted here is untrusted transcript/checkpoint content, so
+    # `&` is ordinary text that arrives on its own. `"$var"` inside `${x//p/…}`
+    # suppresses the expansion (verified on bash 5.3.15) and is a no-op on the
+    # pre-5.2 bash where the option does not exist. Same at every other
+    # placeholder site below.
+    prompt="${prompt//\{\{CHECKPOINTS_BLOCK\}\}/"$cp_block"}"
   fi
 
   # For subagentstop, inline the AGENT's own transcript (A3).
@@ -925,8 +936,11 @@ run_worker() {
       agent_block="(this agent transcript held no legible message content)"
     fi
     agent_type_label="${AGENT_TYPE:-unknown}"
-    prompt="${prompt//\{\{AGENT_TRANSCRIPT_BLOCK\}\}/$agent_block}"
-    prompt="${prompt//\{\{AGENT_TYPE\}\}/$agent_type_label}"
+    # Quoted replacements — see the patsub_replacement note at the checkpoints
+    # substitution above. This block is the most exposed of the lot: it is raw
+    # agent transcript text.
+    prompt="${prompt//\{\{AGENT_TRANSCRIPT_BLOCK\}\}/"$agent_block"}"
+    prompt="${prompt//\{\{AGENT_TYPE\}\}/"$agent_type_label"}"
   fi
 
   # STEP 7 (LOW P3.8): worker_log / worker_out paths used to be fixed per
@@ -1072,9 +1086,11 @@ run_worker() {
       [[ -n "$fb_handoff" ]] || fb_handoff="(no self-compact handoff for this session)"
       fb_cp="${cp_block:-}"
       [[ -n "$fb_cp" ]] || fb_cp="(no checkpoints)"
-      fb_prompt="${fb_prompt//\{\{CHECKPOINTS_BLOCK\}\}/$fb_cp}"
-      fb_prompt="${fb_prompt//\{\{TRANSCRIPT_TAIL_BLOCK\}\}/$fb_tail}"
-      fb_prompt="${fb_prompt//\{\{HANDOFF_BLOCK\}\}/$fb_handoff}"
+      # Quoted replacements — see the patsub_replacement note at the checkpoints
+      # substitution above.
+      fb_prompt="${fb_prompt//\{\{CHECKPOINTS_BLOCK\}\}/"$fb_cp"}"
+      fb_prompt="${fb_prompt//\{\{TRANSCRIPT_TAIL_BLOCK\}\}/"$fb_tail"}"
+      fb_prompt="${fb_prompt//\{\{HANDOFF_BLOCK\}\}/"$fb_handoff"}"
 
       # Its own stdout log. Overwriting the primary's would destroy the very
       # envelope that explains why the fallback had to run.
