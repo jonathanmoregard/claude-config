@@ -57,6 +57,14 @@ guard can fail to reach a verdict now DENIES:
 There is deliberately NO agent-reachable bypass environment variable. The
 operator's escape is to run the command themselves with ``! <cmd>``.
 
+One bypass DOES exist and it is not an environment variable: the nixos push
+gate honours ``Override: [skip-vm-gate] <reason>`` in the HEAD commit
+message, which the agent writes. That is deliberate and documented in the
+gate's own help text as "Bypass (audited)" — but note what "audited" buys
+today: the audit line goes to STDERR, which this file measures elsewhere as
+discarded by the CLI. The commit message itself is the durable record, since
+the override has to be written into it and survives in the history.
+
 ``DCG_PATH`` is an operator/test seam, not a bypass: it is read from the
 hook process's environment, which is the harness environment, and a Bash
 tool call cannot set it — each call gets a fresh shell whose exports die
@@ -588,6 +596,25 @@ def _check_dcg(command: str) -> str | None:
     # is why this comes second.
     if ask_reason is not None:
         return ask_reason
+
+    # dcg SAID something on stdout and none of it was a decision this guard
+    # could read. Measured, dcg 0.12.5 writes exactly one JSON line for a deny
+    # and NOTHING AT ALL for an allow — the decorated banner goes to stderr —
+    # so any other stdout is a shape this guard has never seen.
+    #
+    # The loop above skips every line that does not open with `{`. That made
+    # "dcg printed a deny in a format we do not parse" render as ALLOW, which
+    # the file's own fail-closed list (line 41: "dcg emitted output that could
+    # not be parsed") already promises it does not do. The promise only held
+    # for a line that LOOKED like JSON and then failed to parse; a future dcg
+    # that prefixes or reformats its decision would have walked straight past
+    # it. Silence is the allow. Noise we cannot read is not.
+    if (proc.stdout or "").strip() and not saw_allow:
+        _fail_closed(
+            "dcg wrote output this guard could not read as a decision, so its "
+            "verdict is unknown (stdout began: "
+            f"{(proc.stdout or '').strip()[:160]!r})"
+        )
 
     # No deny rendered. Exit 0 is dcg's allow — for a silent run and for an
     # explicit `"allow"` alike. Any other status means dcg fell over, and a
@@ -1427,13 +1454,31 @@ def _candidate_repo_paths(command: str, cwd: str | None) -> tuple[list[str], lis
     return deduped, unresolved
 
 
-# git's stderr for the two failures that are ANSWERS rather than faults —
-# see `_nixos_resolve_target_repo`, which is the only reader. Matched
-# case-insensitively as substrings, because git's wording carries a path and
-# a mount point around them.
-_NIXOS_GIT_ANSWERED_NOT_A_REPO = (
+# git's stderr for the failures that are ANSWERS rather than faults — see
+# `_nixos_resolve_target_repo`, the only reader. Matched case-insensitively
+# as substrings, because git's wording carries a path and a mount point
+# around them.
+#
+# The membership test is NOT "does this mean the path is not a repo". It is:
+# does it mean GIT ITSELF WILL NOT OPERATE ON THIS PATH FOR THIS USER? The
+# guard runs as the user whose push it is gating, so any path git refuses
+# here is a path the push cannot succeed from either — and a gate cannot be
+# evaded through a door that does not open.
+#
+#   not a git repository       — no repo here.
+#   cannot change to           — the directory does not exist.
+#   detected dubious ownership — git refuses the repo outright (root-owned
+#                                /etc/nixos, from a user session) until a
+#                                `safe.directory` exception is added.
+#
+# That last one was added after the fail-closed branch below denied EVERY
+# `git push` from a session sitting in /etc/nixos — measured, not predicted.
+# Failing closed there bought nothing: git will not push from that path
+# either, so the deny only refused work that could not have happened.
+_NIXOS_GIT_UNUSABLE_PATH = (
     "not a git repository",
     "cannot change to",
+    "detected dubious ownership",
 )
 
 
@@ -1457,11 +1502,10 @@ def _nixos_resolve_target_repo(command: str, cwd: str | None) -> str | None:
     for path in paths:
         rc, toplevel, err = _nixos_git(path, ["rev-parse", "--show-toplevel"])
         if rc != 0:
-            # Two of git's non-zero exits are ANSWERS about the candidate, and
-            # most candidates get one of them: `not a git repository` (this
-            # path is not a repo) and `cannot change to <path>` (it does not
-            # exist — and a `git -C <missing> push` cannot push anything
-            # either, so it is not the repo under the gate).
+            # Some of git's non-zero exits are ANSWERS about the candidate —
+            # paths git will not operate on for this user at all, so no push
+            # can succeed from them either. `_NIXOS_GIT_UNUSABLE_PATH` lists
+            # them and states the membership rule.
             #
             # Every other non-zero exit is git failing to answer: a
             # `.git/config` it cannot parse (`fatal: bad config line 1`, exit
@@ -1470,8 +1514,27 @@ def _nixos_resolve_target_repo(command: str, cwd: str | None) -> str | None:
             # off for a real nixos-config clone. Reproduced: corrupting
             # `.git/config` in a clone whose remote IS nixos-config let
             # `git push` past the checklist entirely.
-            if any(m in err.lower() for m in _NIXOS_GIT_ANSWERED_NOT_A_REPO):
+            if any(m in err.lower() for m in _NIXOS_GIT_UNUSABLE_PATH):
                 continue
+            if "must be run in a work tree" in err.lower():
+                # A bare repo, or a `.git` directory as the cwd. There is no
+                # working tree to name, but there IS a repository, and a push
+                # from a bare clone is a real push — so this must neither
+                # deny (it would refuse every routine push from such a cwd)
+                # nor allow blind. Ask git for the repository instead.
+                rc_gd, gitdir, err_gd = _nixos_git(
+                    path, ["rev-parse", "--absolute-git-dir"]
+                )
+                if rc_gd == 0 and gitdir.strip():
+                    if _repo_has_nixos_remote(gitdir.strip()):
+                        return gitdir.strip()
+                    continue
+                _fail_closed(
+                    f"the nixos push gate found a git repository at {path!r} with "
+                    "no working tree and could not resolve its git directory "
+                    f"either (`git rev-parse --absolute-git-dir` exited {rc_gd}: "
+                    f"{err_gd.strip()[:160]!r})"
+                )
             _fail_closed(
                 f"the nixos push gate could not determine whether {path!r} is a "
                 "git working tree, so it cannot say this push is NOT a "
@@ -1504,7 +1567,14 @@ def _nixos_command_pushes(command: str) -> bool:
     for sub in _nixos_pipeline_subcommands(command):
         if not re.search(r"\bgit\s+(?:-C\s+\S+\s+)?(?:[\w.-]+(?:=\S+)?\s+)*push\b", sub):
             continue
-        if re.search(r"(?:^|\s)--dry-run(?:\s|$)", sub):
+        # `--dry-run` switches the gate off, so it must be a real flag on the
+        # real command and not merely present in the line. A trailing shell
+        # COMMENT is not part of the command: `git push origin feat #
+        # --dry-run` pushes for real, and reading the comment let the whole of
+        # layer 4 be skipped by a string the gated agent writes itself.
+        # Reproduced against this predicate.
+        effective = re.split(r"(?:^|\s)#", sub, maxsplit=1)[0]
+        if re.search(r"(?:^|\s)--dry-run(?:\s|$)", effective):
             continue
         return True
     return False
@@ -1768,9 +1838,25 @@ def _check_nixos_push(command: str, cwd: str | None) -> str | None:
 
     missing = [k for k in required if _empty_or_placeholder(fields.get(k, ""))]
     if missing:
+        # Where the block ended on something, say so even when the wrap
+        # diagnosis above did not fire — a blank line before the terminator
+        # suppresses that diagnosis (it is what tells a wrap from the commit
+        # body resuming), and without this line the message reverts to the
+        # bare "missing fields" list that sent the last reader looking at the
+        # wrong lines for twenty minutes.
+        tail = ""
+        if fields.terminator:
+            tail = (
+                "\n\nNote: the checklist block ended at this line, so nothing "
+                "below it was read:\n\n"
+                f"    {fields.terminator[:200]}\n\n"
+                "If a value wrapped there, indent the continuation by two "
+                "spaces or put the value on one line."
+            )
         return (
             "nixos push gate: missing, empty, or template-placeholder "
-            "checklist fields: " + ", ".join(missing) + ".\n\n" + _NIXOS_GATE_HELP
+            "checklist fields: " + ", ".join(missing) + "." + tail
+            + "\n\n" + _NIXOS_GATE_HELP
         )
 
     fv_claim = fields["feature-vm.nix modified"].lower()

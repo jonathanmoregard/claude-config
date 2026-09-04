@@ -1780,6 +1780,109 @@ check(
     f"decision={push_guard(SCRATCH, cwd=SCRATCH)[0]!r}",
 )
 
+# --- D32: round 2 of the review, including two the round-1 fix caused ---
+
+# D32a — a `--dry-run` inside a trailing shell COMMENT is not a dry run. The
+# push is real, and reading the comment let the whole of layer 4 be skipped
+# by a string the gated agent writes itself.
+check(
+    "`git push ... # --dry-run` is still a push",
+    bash_guard._nixos_command_pushes("git push origin feat # --dry-run") is True,
+    "a comment is not part of the command",
+)
+check(
+    "a real --dry-run still exempts",
+    bash_guard._nixos_command_pushes("git push --dry-run origin feat") is False,
+    "the flag itself must still turn the gate off",
+)
+
+# D32b — a path git refuses to this user is not a fault. Round 1 made every
+# non-zero `rev-parse` fail closed, and measured against the live box that
+# denied EVERY `git push` from a session sitting in root-owned /etc/nixos.
+# git will not push from there either, so the deny refused work that could
+# not have happened.
+_GIT_STUB_DIR = os.path.join(SCRATCH, "gitstub-dubious")
+os.makedirs(_GIT_STUB_DIR, exist_ok=True)
+_write_stub(
+    "gitstub-dubious/git",
+    "if [ \"$3\" = 'rev-parse' ] || [ \"$1\" = 'rev-parse' ]; then\n"
+    "  echo \"fatal: detected dubious ownership in repository at '/etc/nixos'\" >&2\n"
+    "  exit 128\n"
+    "fi\n"
+    "exit 128\n",
+)
+dec, why = push_guard(
+    REPO_ROOT, cwd=REPO_ROOT,
+    env_extra={"PATH": _GIT_STUB_DIR + os.pathsep + os.environ.get("PATH", "")},
+)
+check(
+    "a repo git refuses for dubious ownership does NOT deny the push",
+    dec is None,
+    f"decision={dec!r} {why[:200]}",
+)
+
+# D32c — a `.git` directory (or bare repo) as the cwd. `--show-toplevel`
+# exits 128 there, which round 1 turned into a deny of every routine push.
+# The repository is still resolvable, so the gate resolves it instead.
+w = branch_with(make_repo(), "feat: no trailer at all", {"docs/a.md": "x\n"})
+dec, why = push_guard(w, cwd=os.path.join(w, ".git"))
+check(
+    "a .git dir as cwd still gates the nixos repo it belongs to",
+    dec == "deny" and "Pre-push checklist:" in why,
+    f"decision={dec!r} {why[:200]}",
+)
+_plain = make_repo(remote_tail="someone-else/unrelated.git")
+branch_with(_plain, "feat: whatever", {"docs/a.md": "x\n"})
+dec, why = push_guard(_plain, cwd=os.path.join(_plain, ".git"))
+check(
+    "... and a NON-nixos repo reached the same way is still allowed",
+    dec is None,
+    f"decision={dec!r} {why[:200]}",
+)
+
+# D32d — dcg stdout that carries no decision this guard can read must DENY.
+# The scan skips every line that does not open with `{`, so a future dcg that
+# prefixed or reformatted its deny would have rendered as an ALLOW — the one
+# outcome the file's fail-closed list already promises it never produces.
+STUB_UNREADABLE_STDOUT = _dcg_stub(
+    "stubs/dcg-unreadable-stdout",
+    "cat >/dev/null\necho 'DENIED: a format this guard does not parse'\nexit 0\n",
+)
+dec, why = guard("ls -la", dcg=STUB_UNREADABLE_STDOUT)
+check(
+    "unreadable dcg stdout denies instead of allowing",
+    dec == "deny" and BROKEN_MARKER in why and "could not read as a decision" in why,
+    f"decision={dec!r} {why[:220]}",
+)
+
+# D32e — the wrap hint survives a blank line. `blank_since_field` correctly
+# suppresses the wrap DENY there (that blank is what tells a wrap from the
+# body resuming), but the operator still gets told where the block ended
+# rather than a bare list of fields that are sitting right there.
+_blank_wrap = (
+    "feat: a risky change\n"
+    "\n"
+    "Pre-push checklist:\n"
+    "- Type: risky\n"
+    "- Rebased on origin/main: yes\n"
+    "- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+    "- Interactive smoke (nixos-agent-testing): yes - booted the vm\n"
+    "\n"
+    "and it answered on the serial console\n"
+    "- Advisor review (advice-refine-test-loop): yes - 2 rounds\n"
+    "- feature-vm.nix modified: no\n"
+    "- Risky markers in diff: none\n"
+    "- Behavioural evidence: ran the unit\n"
+)
+w = branch_with(make_repo(), _blank_wrap, {"docs/a.md": "x\n"})
+dec, why = push_guard(w)
+check(
+    "a blank-line-separated truncation still names where the block ended",
+    dec == "deny" and "the checklist block ended at this line" in why
+    and "and it answered on the serial console" in why,
+    f"decision={dec!r} {why[:300]}",
+)
+
 # --- D25: a diff carrying non-UTF-8 bytes must not crash the gate -----
 # `git diff` emits raw bytes for a file it considers text. safe-bash already
 # fixed this once by capturing bytes and decoding with errors="replace";
