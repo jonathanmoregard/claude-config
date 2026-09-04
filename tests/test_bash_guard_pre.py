@@ -194,6 +194,63 @@ STUB_DENY_THEN_ALLOW = _dcg_stub(
     "exit 0\n",
 )
 
+def _ask_line(reason: str, rule: str | None = None) -> str:
+    out = {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "ask",
+        "permissionDecisionReason": reason,
+    }
+    if rule is not None:
+        out["ruleId"] = rule
+    return json.dumps({"hookSpecificOutput": out})
+
+
+# dcg's THIRD decision. Measured against the packaged binary (0.12.5):
+# `write_indeterminate_to` (src/hook.rs) renders `permissionDecision: "ask"`
+# whenever dcg did not finish proving the command safe — the evaluation
+# deadline (`general.hook_timeout_ms`, 1000ms by default) elapsed, or the
+# command was larger than `general.max_command_bytes`. Reproduced on this
+# host by handing the real binary a 70KB command; it answers
+#   {"permissionDecision":"ask","permissionDecisionReason":"Command is 70005
+#    bytes and exceeds limit 65536 bytes; DCG did not evaluate it…"}
+# The same value also arrives from a rule whose `[policy]` mode is `ask`.
+ASK_INDETERMINATE_REASON = (
+    "DCG could not complete safety evaluation within 1000ms "
+    "(stage: evaluation); command was not verified. "
+    "Review manually or increase hook_timeout_ms."
+)
+STUB_ASK = _dcg_stub(
+    "stubs/dcg-ask",
+    "cat >/dev/null\n" f"echo '{_ask_line(ASK_INDETERMINATE_REASON)}'\n" "exit 0\n",
+)
+_ASK_RULE_LINE = _ask_line("operator review required", rule="core.git:reset-hard")
+STUB_ASK_WITH_RULE = _dcg_stub(
+    "stubs/dcg-ask-with-rule",
+    "cat >/dev/null\n" f"echo '{_ASK_RULE_LINE}'\n" "exit 0\n",
+)
+STUB_ASK_THEN_DENY = _dcg_stub(
+    "stubs/dcg-ask-then-deny",
+    "cat >/dev/null\n"
+    f"echo '{_ask_line(ASK_INDETERMINATE_REASON)}'\n"
+    f"echo '{_deny_line(rule='late-deny', why='second line denies')}'\n"
+    "exit 0\n",
+)
+STUB_UNKNOWN_DECISION = _dcg_stub(
+    "stubs/dcg-unknown-decision",
+    "cat >/dev/null\n"
+    + "echo '"
+    + json.dumps(
+        {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "maybe",
+            }
+        }
+    )
+    + "'\n"
+    "exit 0\n",
+)
+
 MISSING_DCG = os.path.join(SCRATCH, "definitely-not-here", "dcg")
 BROKEN_MARKER = "the safety guard is BROKEN"
 # Load-bearing phrase from _FIND_DANGEROUS_HINT. Asserting on it proves the
@@ -655,6 +712,106 @@ check(
 
 
 # ======================================================================
+# dcg's `ask` decision — the one it renders when it did NOT evaluate.
+#
+# Measured 2026-09-04: eight legitimate commands were refused in one
+# morning with `dcg rendered a permissionDecision this guard does not
+# understand: 'ask'`, whose recovery text told the operator to install a dcg
+# that was installed and answering the whole time. The blame was wrong, so
+# the fix went looking in the wrong place.
+#
+# `ask` is not a broken dcg. src/hook.rs `write_indeterminate_to` renders it
+# when dcg ran out of its own evaluation budget (`general.hook_timeout_ms`,
+# 1000ms by default — the morning in question had a runaway embedding
+# service saturating the CPU) or when the command exceeded
+# `general.max_command_bytes`; `write_review_request_to` renders it for a
+# rule whose policy mode is `ask`. Both mean "no verdict — a human decides".
+#
+# So the guard must still BLOCK (an unevaluated command is not a cleared
+# one), and must say so as dcg's answer rather than as its own fault. It
+# must NOT forward the `ask` to Claude Code: a PreToolUse decision pre-empts
+# the permission system, so an `ask` this guard emitted would put a prompt
+# in front of commands that settings.json denies outright.
+# ======================================================================
+section("bash-guard: dcg's `ask` is a blocking answer, not a broken guard")
+
+dec, why = guard("ls -la", dcg=STUB_ASK)
+check("dcg `ask` -> deny", dec == "deny", f"decision={dec!r} {why[:200]}")
+check(
+    "... is NOT reported as a broken guard",
+    BROKEN_MARKER not in why,
+    why[:240],
+)
+check(
+    "... does not tell the operator to install the dcg that just answered",
+    "install dcg" not in why,
+    why[:240],
+)
+check(
+    "... does not claim the decision value was unrecognised",
+    "does not understand" not in why,
+    why[:240],
+)
+check(
+    "... relays dcg's own reason, so the real cause is named",
+    "could not complete safety evaluation within 1000ms" in why,
+    why[:300],
+)
+check(
+    "... names the escape hatch",
+    "! <command>" in why,
+    why[:300],
+)
+
+# The command is a STRING handed to the guard under test, never executed —
+# it names a destructive operation so the rule id in the stub's answer reads
+# true. [arftl-allow: history-rewrite — test fixture, not a command]
+dec, why = guard("git reset --hard HEAD", dcg=STUB_ASK_WITH_RULE)
+check(
+    "a policy-mode `ask` names the rule that wants review",
+    dec == "deny" and "core.git:reset-hard" in why,
+    f"decision={dec!r} {why[:240]}",
+)
+check(
+    # A named rule means dcg DID evaluate; "re-running normally clears" is
+    # true only of the deadline and size cases, and telling the agent to
+    # retry a policy ask sends it round a loop the retry cannot break.
+    "... and does NOT promise that re-running will clear it",
+    "normally clears" not in why,
+    why[:240],
+)
+
+dec, why = guard("rm -rf /", dcg=STUB_ASK_THEN_DENY)
+check(
+    # dcg's own precedence: a proven Deny outranks an unevaluated Ask.
+    "a deny anywhere in dcg's stdout outranks an ask",
+    dec == "deny" and "second line denies" in why,
+    f"decision={dec!r} {why[:240]}",
+)
+
+dec, why = guard("ls -la", dcg=STUB_UNKNOWN_DECISION)
+check(
+    # The fail-closed branch that `ask` used to fall into must still exist
+    # for a value that really is unknown — handling `ask` is not the same as
+    # trusting whatever dcg says next.
+    "a genuinely unknown decision value still denies as a broken guard",
+    dec == "deny" and BROKEN_MARKER in why and "does not understand" in why,
+    f"decision={dec!r} {why[:240]}",
+)
+
+# An ask is dcg's answer about dcg's rules — it must not smother the later
+# layers any more than an explicit allow does. (It cannot: the guard returns
+# the ask as its deny reason. This pins the ordering so a future refactor
+# that made `ask` non-blocking would have to face the find layer too.)
+dec, why = guard("find /tmp/x -delete", dcg=STUB_ASK)
+check(
+    "an ask on a command the find layer also refuses still denies",
+    dec == "deny",
+    f"decision={dec!r} {why[:200]}",
+)
+
+
+# ======================================================================
 # dcg's verdict is the stdout JSON, never the exit status.
 #
 # Measured against the packaged binary (rev d921fe84, tag v0.12.5): hook
@@ -1056,6 +1213,104 @@ check(
 )
 check("parse_checklist: no header -> None", pc("feat: thing\n\nno trailer here\n") is None)
 
+# D30 — a WRAPPED value. Reproduced twice on 2026-09-04 (PR #207, ~20
+# minutes lost): the block was read line by line, so the continuation line of
+# a long value was "the first unrelated line", ended the block, and every
+# field BELOW it vanished from the map. The gate then reported those fields
+# as `missing, empty, or template-placeholder` — three of them single-line
+# and verbatim correct. The strictness was never the defect; being told the
+# wrong cause was.
+_wrapped_indented = (
+    "feat: thing\n"
+    "\n"
+    "Pre-push checklist:\n"
+    "- Type: risky\n"
+    "- Rebased on origin/main: yes\n"
+    "- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+    "- Interactive smoke (nixos-agent-testing): yes - booted the vm, sshd\n"
+    "  answered, systemctl status claude-proposals-push.timer showed active\n"
+    "- Advisor review (advice-refine-test-loop): yes - 2 rounds, no blockers\n"
+    "- feature-vm.nix modified: no\n"
+    "- Risky markers in diff: none\n"
+    "- Behavioural evidence: ran the unit, observed it start\n"
+)
+_p = pc(_wrapped_indented)
+check(
+    "parse_checklist: an indented continuation JOINS its field",
+    _p.get("interactive smoke (nixos-agent-testing)")
+    == "yes - booted the vm, sshd answered, systemctl status "
+    "claude-proposals-push.timer showed active",
+    repr(_p.get("interactive smoke (nixos-agent-testing)")),
+)
+check(
+    "parse_checklist: fields BELOW a wrapped value are still read",
+    all(
+        _p.get(k)
+        for k in (
+            "advisor review (advice-refine-test-loop)",
+            "feature-vm.nix modified",
+            "risky markers in diff",
+            "behavioural evidence",
+        )
+    ),
+    str(dict(_p))[:300],
+)
+check(
+    "parse_checklist: an indented continuation is not mistaken for the end",
+    getattr(_p, "terminator", "sentinel") is None,
+    repr(getattr(_p, "terminator", "sentinel")),
+)
+
+# The other wrap shape: the continuation is NOT indented, so it is
+# indistinguishable from the commit body resuming. The block still ends
+# there — but the parser now records WHAT ended it and which checklist
+# fields were written below, so the gate can name the wrap instead of
+# accusing those fields of being absent.
+_wrapped_flush = _wrapped_indented.replace(
+    "  answered, systemctl", "answered, systemctl"
+)
+_pf = pc(_wrapped_flush)
+check(
+    "parse_checklist: an unindented continuation still ends the block",
+    "advisor review (advice-refine-test-loop)" not in _pf,
+    str(dict(_pf))[:300],
+)
+check(
+    "parse_checklist: ... and the terminating line is recorded verbatim",
+    getattr(_pf, "terminator", None)
+    == "answered, systemctl status claude-proposals-push.timer showed active",
+    repr(getattr(_pf, "terminator", None)),
+)
+check(
+    "parse_checklist: ... along with the field names written below it",
+    set(getattr(_pf, "fields_after", ()))
+    >= {
+        "advisor review (advice-refine-test-loop)",
+        "feature-vm.nix modified",
+        "risky markers in diff",
+        "behavioural evidence",
+    },
+    str(getattr(_pf, "fields_after", ()))[:300],
+)
+check(
+    # A commit body that resumes after the checklist is the NORMAL case and
+    # must not be reported as a wrap: nothing below it is a checklist field.
+    "parse_checklist: an ordinary trailer below the block records no fields_after",
+    getattr(
+        pc(_wrapped_indented + "\nCo-Authored-By: Someone <s@example.invalid>\n"),
+        "fields_after",
+        ("sentinel",),
+    )
+    == (),
+    repr(
+        getattr(
+            pc(_wrapped_indented + "\nCo-Authored-By: Someone <s@example.invalid>\n"),
+            "fields_after",
+            ("sentinel",),
+        )
+    ),
+)
+
 
 # ----------------------------------------------------------------------
 section("bash-guard: nixos push gate, end-to-end sub-cases")
@@ -1355,6 +1610,277 @@ check(
     "an indented sub-bullet cannot upgrade the 'feature-vm.nix modified' claim",
     dec == "deny" and "PR #61" in why,
     f"decision={dec!r} {why[:250]}",
+)
+
+# --- D30 end-to-end: a wrapped value ---------------------------------
+# The regression this chunk exists for. Both halves ran against the live
+# gate on 2026-09-04 and produced the same wrong answer: a list of fields
+# that were present, correct, and single-line.
+_wrapped_ok = (
+    "feat: a risky change\n"
+    "\n"
+    "Pre-push checklist:\n"
+    "- Type: risky\n"
+    "- Rebased on origin/main: yes\n"
+    "- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+    "- Interactive smoke (nixos-agent-testing): yes - booted the vm, sshd\n"
+    "  answered, and the timer showed active after a manual start\n"
+    "- Advisor review (advice-refine-test-loop): yes - 2 rounds, no blockers\n"
+    "- feature-vm.nix modified: no\n"
+    "- Risky markers in diff: none\n"
+    "- Behavioural evidence: ran the unit, observed it start\n"
+)
+w = branch_with(make_repo(), _wrapped_ok, {"docs/a.md": "x\n"})
+dec, why = push_guard(w)
+check(
+    "an INDENTED continuation line joins its field -> allow",
+    dec is None,
+    f"decision={dec!r} {why[:300]}",
+)
+
+_wrapped_bad = _wrapped_ok.replace("  answered, and", "answered, and")
+w = branch_with(make_repo(), _wrapped_bad, {"docs/a.md": "x\n"})
+dec, why = push_guard(w)
+check("an UNINDENTED continuation line -> deny", dec == "deny", f"decision={dec!r}")
+check(
+    "... names the wrap as the cause",
+    "wrapped" in why.lower() and "answered, and the timer showed active" in why,
+    why[:400],
+)
+check(
+    "... and does NOT accuse the fields below it of being missing",
+    "missing, empty, or template-placeholder" not in why,
+    why[:400],
+)
+
+# --- D31: the fixes the ARFTL review's repros forced ------------------
+# Five findings, each reproduced against this file before it was touched.
+
+# D31a — the gate's OWN printed template, copied verbatim, must parse. It
+# used to be printed indented two spaces under the words "copy verbatim",
+# and both regexes anchor at column 0, so a verbatim copy parsed as NO
+# checklist and the gate answered it with the identical refusal. A loop with
+# no exit, in the message whose only job is to end one.
+# Take the block the way a copier would: the header LINE and everything
+# under it, not the prose mention of the same words further up.
+_tmpl_start = bash_guard._NIXOS_GATE_HELP.index("\nPre-push checklist:\n") + 1
+_tmpl = bash_guard._NIXOS_GATE_HELP[
+    _tmpl_start : bash_guard._NIXOS_GATE_HELP.index("\n\n", _tmpl_start)
+]
+_tp = pc(_tmpl)
+check(
+    "the printed template parses as a checklist when copied verbatim",
+    isinstance(_tp, dict) and _tp.get("type", "").startswith("pure-data"),
+    repr(_tmpl[:60]),
+)
+check(
+    "... and every required field survives that copy",
+    all(k in _tp for k in bash_guard._NIXOS_REQUIRED_FIELDS),
+    str(sorted(set(bash_guard._NIXOS_REQUIRED_FIELDS) - set(_tp)))[:200],
+)
+
+# D31b — an INDENTED block is named as indented, not reported as absent.
+w = branch_with(
+    make_repo(),
+    "feat: x\n\n  Pre-push checklist:\n  - Type: pure-data\n",
+    {"docs/a.md": "x\n"},
+)
+dec, why = push_guard(w)
+check(
+    "an indented checklist block is diagnosed as indented",
+    dec == "deny" and "INDENTED" in why and "flush left" in why,
+    f"decision={dec!r} {why[:220]}",
+)
+
+# D31c — an untouched `<template hint>` must stay a placeholder even once a
+# continuation line is joined onto it. The end-anchored `^<.*>$` stopped
+# matching the moment the join appended text, so the indent-join feature
+# turned an unfilled template into a filled field.
+_ph = (
+    CHECKLIST_RISKY.format(fv="no").replace(
+        "- Risky markers in diff: none\n",
+        "- Risky markers in diff: <list, or 'none'>\n  (hint left in place)\n",
+    )
+)
+w = branch_with(make_repo(), _ph, {"docs/a.md": "x\n"})
+dec, why = push_guard(w)
+check(
+    "a wrapped-but-unfilled template placeholder is still refused",
+    dec == "deny" and "risky markers in diff" in why,
+    f"decision={dec!r} {why[:250]}",
+)
+
+# D31d — the wrap diagnosis must not fire on a commit BODY that bullets a
+# field name. Scanning to end-of-message made a legitimate pure-data push
+# read as a wrap: the same misdiagnosis, pointed the other way.
+_body = (
+    "chore: bump a package\n"
+    "\n"
+    "Pre-push checklist:\n"
+    "- Type: pure-data\n"
+    "\n"
+    "Context for the reviewer:\n"
+    "- Risky markers in diff: none, this is a version string only\n"
+)
+w = branch_with(make_repo(), _body, {"docs/a.md": "x\n"})
+dec, why = push_guard(w)
+check(
+    "a body bullet naming a checklist field is NOT a wrap",
+    dec is None,
+    f"decision={dec!r} {why[:250]}",
+)
+
+# D31e — the terminating line is echoed CAPPED. Every other echo in this
+# file truncates; an uncapped one lets a single commit line flood the deny.
+_flood = (
+    CHECKLIST_RISKY.format(fv="no").replace(
+        "- Rebased on origin/main: yes\n",
+        "- Rebased on origin/main: yes\n" + ("z" * 3000) + "\n",
+    )
+)
+w = branch_with(make_repo(), _flood, {"docs/a.md": "x\n"})
+dec, why = push_guard(w)
+check(
+    "the echoed terminator is truncated",
+    dec == "deny" and "z" * 3000 not in why and "z" * 100 in why,
+    f"decision={dec!r} len={len(why)}",
+)
+
+# D31f — `git -c k=v push`. The flag run before `push` could not span an
+# `=`, so one documented git flag skipped the whole gate.
+for _cmd in (
+    "git -c foo=bar push origin HEAD",
+    "git -c protocol.version=2 push",
+    "git --git-dir=/x/.git push origin HEAD",
+):
+    check(
+        f"command_pushes sees {_cmd!r}",
+        bash_guard._nixos_command_pushes(_cmd) is True,
+        f"got {bash_guard._nixos_command_pushes(_cmd)!r}",
+    )
+
+# D31g — a repo whose remotes git cannot list must DENY, not fall through to
+# "not a nixos repo". Reproduced with a `.git/config` git refuses to parse
+# (`fatal: bad config line 1`, exit 128): a real nixos-config clone answered
+# "not a nixos repo" and the push sailed past the gate.
+w = branch_with(make_repo(), "feat: no trailer at all", {"docs/a.md": "x\n"})
+with open(os.path.join(w, ".git", "config"), "w", encoding="utf-8") as fh:
+    fh.write("[core\nthis is not valid ini\n")
+dec, why = push_guard(w)
+check(
+    "a repo git cannot read DENIES rather than reading as 'not a nixos repo'",
+    dec == "deny" and BROKEN_MARKER in why and "bad config line" in why,
+    f"decision={dec!r} {why[:250]}",
+)
+check(
+    # The control: git ANSWERING "not a git repository" is not a fault, and
+    # must stay an allow — most candidate paths the gate probes are not repos.
+    "a candidate path that is simply not a repo is still allowed",
+    push_guard(SCRATCH, cwd=SCRATCH)[0] is None,
+    f"decision={push_guard(SCRATCH, cwd=SCRATCH)[0]!r}",
+)
+
+# --- D32: round 2 of the review, including two the round-1 fix caused ---
+
+# D32a — a `--dry-run` inside a trailing shell COMMENT is not a dry run. The
+# push is real, and reading the comment let the whole of layer 4 be skipped
+# by a string the gated agent writes itself.
+check(
+    "`git push ... # --dry-run` is still a push",
+    bash_guard._nixos_command_pushes("git push origin feat # --dry-run") is True,
+    "a comment is not part of the command",
+)
+check(
+    "a real --dry-run still exempts",
+    bash_guard._nixos_command_pushes("git push --dry-run origin feat") is False,
+    "the flag itself must still turn the gate off",
+)
+
+# D32b — a path git refuses to this user is not a fault. Round 1 made every
+# non-zero `rev-parse` fail closed, and measured against the live box that
+# denied EVERY `git push` from a session sitting in root-owned /etc/nixos.
+# git will not push from there either, so the deny refused work that could
+# not have happened.
+_GIT_STUB_DIR = os.path.join(SCRATCH, "gitstub-dubious")
+os.makedirs(_GIT_STUB_DIR, exist_ok=True)
+_write_stub(
+    "gitstub-dubious/git",
+    "if [ \"$3\" = 'rev-parse' ] || [ \"$1\" = 'rev-parse' ]; then\n"
+    "  echo \"fatal: detected dubious ownership in repository at '/etc/nixos'\" >&2\n"
+    "  exit 128\n"
+    "fi\n"
+    "exit 128\n",
+)
+dec, why = push_guard(
+    REPO_ROOT, cwd=REPO_ROOT,
+    env_extra={"PATH": _GIT_STUB_DIR + os.pathsep + os.environ.get("PATH", "")},
+)
+check(
+    "a repo git refuses for dubious ownership does NOT deny the push",
+    dec is None,
+    f"decision={dec!r} {why[:200]}",
+)
+
+# D32c — a `.git` directory (or bare repo) as the cwd. `--show-toplevel`
+# exits 128 there, which round 1 turned into a deny of every routine push.
+# The repository is still resolvable, so the gate resolves it instead.
+w = branch_with(make_repo(), "feat: no trailer at all", {"docs/a.md": "x\n"})
+dec, why = push_guard(w, cwd=os.path.join(w, ".git"))
+check(
+    "a .git dir as cwd still gates the nixos repo it belongs to",
+    dec == "deny" and "Pre-push checklist:" in why,
+    f"decision={dec!r} {why[:200]}",
+)
+_plain = make_repo(remote_tail="someone-else/unrelated.git")
+branch_with(_plain, "feat: whatever", {"docs/a.md": "x\n"})
+dec, why = push_guard(_plain, cwd=os.path.join(_plain, ".git"))
+check(
+    "... and a NON-nixos repo reached the same way is still allowed",
+    dec is None,
+    f"decision={dec!r} {why[:200]}",
+)
+
+# D32d — dcg stdout that carries no decision this guard can read must DENY.
+# The scan skips every line that does not open with `{`, so a future dcg that
+# prefixed or reformatted its deny would have rendered as an ALLOW — the one
+# outcome the file's fail-closed list already promises it never produces.
+STUB_UNREADABLE_STDOUT = _dcg_stub(
+    "stubs/dcg-unreadable-stdout",
+    "cat >/dev/null\necho 'DENIED: a format this guard does not parse'\nexit 0\n",
+)
+dec, why = guard("ls -la", dcg=STUB_UNREADABLE_STDOUT)
+check(
+    "unreadable dcg stdout denies instead of allowing",
+    dec == "deny" and BROKEN_MARKER in why and "could not read as a decision" in why,
+    f"decision={dec!r} {why[:220]}",
+)
+
+# D32e — the wrap hint survives a blank line. `blank_since_field` correctly
+# suppresses the wrap DENY there (that blank is what tells a wrap from the
+# body resuming), but the operator still gets told where the block ended
+# rather than a bare list of fields that are sitting right there.
+_blank_wrap = (
+    "feat: a risky change\n"
+    "\n"
+    "Pre-push checklist:\n"
+    "- Type: risky\n"
+    "- Rebased on origin/main: yes\n"
+    "- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+    "- Interactive smoke (nixos-agent-testing): yes - booted the vm\n"
+    "\n"
+    "and it answered on the serial console\n"
+    "- Advisor review (advice-refine-test-loop): yes - 2 rounds\n"
+    "- feature-vm.nix modified: no\n"
+    "- Risky markers in diff: none\n"
+    "- Behavioural evidence: ran the unit\n"
+)
+w = branch_with(make_repo(), _blank_wrap, {"docs/a.md": "x\n"})
+dec, why = push_guard(w)
+check(
+    "a blank-line-separated truncation still names where the block ended",
+    dec == "deny" and "the checklist block ended at this line" in why
+    and "and it answered on the serial console" in why,
+    f"decision={dec!r} {why[:300]}",
 )
 
 # --- D25: a diff carrying non-UTF-8 bytes must not crash the gate -----
