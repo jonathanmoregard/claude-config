@@ -647,6 +647,20 @@ else
   ok "no raw-excerpt note on a transcript that parses"
 fi
 
+# ===========================================================================
+# F4 — REFLECT_MISSION_RETENTION_DAYS reaches the detached worker.
+# It is read inside mission_gc, which DELETES; a worker that does not inherit the
+# override collects at the shipped 30 days regardless of what the operator set.
+# Asserted on the propagation lists themselves rather than by aging a fixture out
+# — the defect was a missing name in those lists, and that is what regresses.
+# ===========================================================================
+t_begin "F4: the mission retention knob is propagated to detached workers"
+grep -q 'REFLECT_MISSION_RETENTION_DAYS' <<<"$(sed -n '/for v in SESSION_ID/,/^[[:space:]]*done$/p' "$REFLECT_SH")"
+assert $? "listed in spawn_detached_worker's systemd-run --setenv loop"
+grep -qE '^export .*REFLECT_MISSION_RETENTION_DAYS' "$REFLECT_SH"
+assert $? "exported for the setsid spawn path"
+
+# ===========================================================================
 # T2 — syntax + lint
 # ===========================================================================
 t_begin "T2: bash -n and shellcheck"

@@ -1597,6 +1597,7 @@ spawn_detached_worker() {
              REFLECT_TRANSCRIPT_BYTES_PER_TOKEN REFLECT_AGENT_TRANSCRIPT_CAP_BYTES \
              REFLECT_FALLBACK_TAIL_CAP_BYTES REFLECT_HANDOFF_CAP_BYTES \
              REFLECT_HANDOFF_MAX_AGE_SECONDS REFLECT_EXCERPT_BYTES \
+             REFLECT_MISSION_RETENTION_DAYS \
              session_dir final_path manifest_path checkpoint_dir SCRIPT_DIR \
              HOME PATH USER LANG LC_ALL LC_CTYPE XDG_RUNTIME_DIR \
              ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN \
@@ -1747,6 +1748,11 @@ export REFLECT_MODEL REFLECT_ROOT CLAUDE_SESSIONS_DIR REFLECT_LOG_DIR
 export REFLECT_BUDGET_SESSIONEND_FALLBACK REFLECT_RESUME_MAX_TRANSCRIPT_BYTES
 export REFLECT_AGENT_TRANSCRIPT_CAP_BYTES REFLECT_FALLBACK_TAIL_CAP_BYTES
 export REFLECT_HANDOFF_CAP_BYTES REFLECT_HANDOFF_MAX_AGE_SECONDS REFLECT_EXCERPT_BYTES
+# Mission mode runs mission_gc in the DETACHED worker, and gc is a delete. Left
+# unpropagated, an operator who raised the retention window still had copies
+# collected at the shipped 30 days, because the process doing the deleting never
+# saw the override. Same defect class as the caps above, with a destructive edge.
+export REFLECT_MISSION_RETENTION_DAYS
 export session_dir final_path manifest_path checkpoint_dir
 export SCRIPT_DIR
 
