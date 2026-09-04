@@ -100,7 +100,8 @@ Two things, neither of which needs the matcher's internals:
 
 THE DISPATCH FACTS THIS FILE PINS
 ----------------------------------
-Both were re-measured live against 2.1.251 on 2026-08-31.
+E8 was re-measured live against 2.1.251 on 2026-08-31. The parenthesis fact
+flipped in the release stream since — its version ledger is below.
 
   E8 — a wildcard rule never sees a whole compound command. `permissions.deny`
   is consulted twice: pass 1 offers the entire command string but returns false
@@ -126,15 +127,23 @@ Both were re-measured live against 2.1.251 on 2026-08-31.
     being run at all — which is the same fail-open shape the whole migration
     exists to correct.)
 
-  PARENTHESES — a rule whose CONTENT contains `(` or `)` never fires. Measured:
-  `Bash(*XYZ*)` denies `echo XYZhere`, while `Bash(*XYZ(*)`, `Bash(*XYZ)*)` and
-  even the balanced `Bash(*XYZ()*)` deny nothing. The CLI's settings-rule parser
-  cannot carry a parenthesis through the `Tool(content)` delimiters, so the rule
-  is loaded and then matches nothing. A malformed rule does NOT poison its
-  neighbours — the rest of the deny list keeps working — which is exactly why
-  this was invisible: the list looks alive because most of it is.
+  PARENTHESES — version-split across the release stream, so settings.json must
+  not carry one either way. The ledger, each line measured live by this file on
+  this host:
+    2.1.251 (2026-08-31) — a rule whose CONTENT contains `(` or `)` never
+      fired: `Bash(*XYZ*)` denied `echo XYZhere`, while `Bash(*XYZ(*)`,
+      `Bash(*XYZ)*)` and even the balanced `Bash(*XYZ()*)` denied nothing. The
+      settings-rule parser could not carry a parenthesis through the
+      `Tool(content)` delimiters, so the rule was loaded and then matched
+      nothing. A malformed rule did NOT poison its neighbours — the rest of the
+      deny list kept working — which is exactly why this was invisible: the
+      list looked alive because most of it was.
+    2.1.260 (2026-09-04) — `Bash(*XYZ(*)` and the balanced `Bash(*XYZ()*)` DO
+      fire, and the `(` is matched LITERALLY: the same `Bash(*XYZ(*)` leaves
+      the paren-free `echo XYZZ` alone (the flip landed in 2.1.252-2.1.260). A
+      close-paren is still dead: `Bash(*XYZ)*)` denies nothing.
 
-  Seven ported rules were hit by this and stopped nothing: the whole Google
+  Seven ported rules were hit by the 2.1.251 behaviour and stopped nothing: the whole Google
   Docs / Drive block (`Bash(*build("docs"*)` and its three siblings,
   `Bash(*documents().batchUpdate*)`, `.get`, `.create`), whose intent is to keep
   direct `google-api-python-client` use out of a shell so that Docs work goes
@@ -155,8 +164,12 @@ Both were re-measured live against 2.1.251 on 2026-08-31.
   BOTH directions on every full run: its target refused in ROWS, its legitimate
   lookalike released in BENIGN.
 
-  The offline check below therefore stays: any NEW paren rule is dead on arrival
-  and the suite goes red for it.
+  The offline check below therefore stays, on a different footing: a paren rule
+  is no longer uniformly dead, it is UNRELIABLE — dead through 2.1.251 and on
+  the pre-flip Nix install this host still carries (2.1.222), dead on 2.1.260
+  for `)`, live there for `(` — and a deny rule that fires on some installs and
+  not others is not a deny rule. The seven rewrites stand under both
+  behaviours: a paren-free rule fires on every version measured.
 
 Run:  python3 tests/test_deny_globs.py
       DENY_GLOBS_SCOPE=core python3 tests/test_deny_globs.py   (reduced sweep)
@@ -673,17 +686,20 @@ for _rule in _RETIRED:
 
 # The offline half of the parenthesis finding. It costs nothing, so it fires in
 # every scope — a `core` run still catches a newly-added paren rule even though
-# it does not sweep all 51 rules live. The behavioural half (the control pair in
-# the live section) is what proves the CAUSE rather than asserting it.
-section("no rule content contains a parenthesis (the CLI cannot parse one)")
+# it does not sweep all 51 rules live. The behavioural half (the paren pair in
+# the live section) proves the CLI-under-test's side of the version split
+# rather than asserting it.
+section("no rule content contains a parenthesis (version-split matching)")
 _paren_rules = [r for r in BASH_RULES if "(" in rule_content(r) or ")" in rule_content(r)]
 check(
     "no Bash(...) rule content contains `(` or `)`",
     not _paren_rules,
     (
-        f"{len(_paren_rules)} rule(s) are DEAD ON ARRIVAL — the settings-rule "
-        f"parser cannot carry a parenthesis through the Tool(content) "
-        f"delimiters, so these load and then match nothing: {_paren_rules}. "
+        f"{len(_paren_rules)} rule(s) are UNRELIABLE — parenthesis matching is "
+        f"version-split (dead through 2.1.251 and on this host's Nix install; "
+        f"`(` matched literally from 2.1.260; `)` still dead there — see "
+        f"PARENTHESES in the docstring), so these fire on some installs and "
+        f"not others: {_paren_rules}. "
         f"Fix in settings.json (rewrite without parens, or delete); do not "
         f"record them as accepted-inert."
     ) if _paren_rules else "",
@@ -782,19 +798,28 @@ CORE: list[tuple[str, str, list[str] | None, bool, str]] = [
         True,
         "so the E8 row above is dispatch, not a mis-written pattern",
     ),
+    # PAREN ROWS — the live half of the version split ledgered under
+    # PARENTHESES in the docstring. Until 2026-09-04 the first row asserted
+    # the opposite polarity ("fires against nothing" — the measured cause of
+    # the seven dead googleapi rules on 2.1.251); 2.1.260 flipped it, so the
+    # row now pins the enforcing side, which is the direction a deny list
+    # needs proved, and the control pins that the `(` is matched literally
+    # rather than dropped. The still-dead `)` half is ledgered, not asserted
+    # live: its polarity tests the CLI's release stream, not this repo's rule
+    # set — the same reasoning that retired the pipe row below.
     (
-        "paren: a rule content with `(` fires against nothing",
+        "paren: a rule content with `(` fires, and matches the `(` literally",
         "echo DENY_GLOBS_PAREN(x",
         ["Bash(*DENY_GLOBS_PAREN(*)"],
-        False,
-        "the measured cause of the seven dead googleapi rules",
+        True,
+        "flipped in 2.1.252-2.1.260; dead through 2.1.251 — see PARENTHESES in the docstring",
     ),
     (
-        "paren control: the same rule without the paren DOES fire",
-        "echo DENY_GLOBS_PAREN(x",
-        ["Bash(*DENY_GLOBS_PAREN*)"],
-        True,
-        "so it is the parenthesis, not the pattern",
+        "paren control: the same rule does NOT fire without the `(`",
+        "echo DENY_GLOBS_PARENZ",
+        ["Bash(*DENY_GLOBS_PAREN(*)"],
+        False,
+        "so the row above is the literal `(` matching, not an over-broad parse",
     ),
     # RETIRED ROW (live until 2026-09-03): "the six retired pipe rules, alone,
     # stop nothing" — isolated Bash(curl *|bash*) et al. against  # arftl-allow: curl-pipe-shell — comment quoting the retired rule text; no command here
