@@ -1056,6 +1056,104 @@ check(
 )
 check("parse_checklist: no header -> None", pc("feat: thing\n\nno trailer here\n") is None)
 
+# D30 — a WRAPPED value. Reproduced twice on 2026-09-04 (PR #207, ~20
+# minutes lost): the block was read line by line, so the continuation line of
+# a long value was "the first unrelated line", ended the block, and every
+# field BELOW it vanished from the map. The gate then reported those fields
+# as `missing, empty, or template-placeholder` — three of them single-line
+# and verbatim correct. The strictness was never the defect; being told the
+# wrong cause was.
+_wrapped_indented = (
+    "feat: thing\n"
+    "\n"
+    "Pre-push checklist:\n"
+    "- Type: risky\n"
+    "- Rebased on origin/main: yes\n"
+    "- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+    "- Interactive smoke (nixos-agent-testing): yes - booted the vm, sshd\n"
+    "  answered, systemctl status claude-proposals-push.timer showed active\n"
+    "- Advisor review (advice-refine-test-loop): yes - 2 rounds, no blockers\n"
+    "- feature-vm.nix modified: no\n"
+    "- Risky markers in diff: none\n"
+    "- Behavioural evidence: ran the unit, observed it start\n"
+)
+_p = pc(_wrapped_indented)
+check(
+    "parse_checklist: an indented continuation JOINS its field",
+    _p.get("interactive smoke (nixos-agent-testing)")
+    == "yes - booted the vm, sshd answered, systemctl status "
+    "claude-proposals-push.timer showed active",
+    repr(_p.get("interactive smoke (nixos-agent-testing)")),
+)
+check(
+    "parse_checklist: fields BELOW a wrapped value are still read",
+    all(
+        _p.get(k)
+        for k in (
+            "advisor review (advice-refine-test-loop)",
+            "feature-vm.nix modified",
+            "risky markers in diff",
+            "behavioural evidence",
+        )
+    ),
+    str(dict(_p))[:300],
+)
+check(
+    "parse_checklist: an indented continuation is not mistaken for the end",
+    getattr(_p, "terminator", "sentinel") is None,
+    repr(getattr(_p, "terminator", "sentinel")),
+)
+
+# The other wrap shape: the continuation is NOT indented, so it is
+# indistinguishable from the commit body resuming. The block still ends
+# there — but the parser now records WHAT ended it and which checklist
+# fields were written below, so the gate can name the wrap instead of
+# accusing those fields of being absent.
+_wrapped_flush = _wrapped_indented.replace(
+    "  answered, systemctl", "answered, systemctl"
+)
+_pf = pc(_wrapped_flush)
+check(
+    "parse_checklist: an unindented continuation still ends the block",
+    "advisor review (advice-refine-test-loop)" not in _pf,
+    str(dict(_pf))[:300],
+)
+check(
+    "parse_checklist: ... and the terminating line is recorded verbatim",
+    getattr(_pf, "terminator", None)
+    == "answered, systemctl status claude-proposals-push.timer showed active",
+    repr(getattr(_pf, "terminator", None)),
+)
+check(
+    "parse_checklist: ... along with the field names written below it",
+    set(getattr(_pf, "fields_after", ()))
+    >= {
+        "advisor review (advice-refine-test-loop)",
+        "feature-vm.nix modified",
+        "risky markers in diff",
+        "behavioural evidence",
+    },
+    str(getattr(_pf, "fields_after", ()))[:300],
+)
+check(
+    # A commit body that resumes after the checklist is the NORMAL case and
+    # must not be reported as a wrap: nothing below it is a checklist field.
+    "parse_checklist: an ordinary trailer below the block records no fields_after",
+    getattr(
+        pc(_wrapped_indented + "\nCo-Authored-By: Someone <s@example.invalid>\n"),
+        "fields_after",
+        ("sentinel",),
+    )
+    == (),
+    repr(
+        getattr(
+            pc(_wrapped_indented + "\nCo-Authored-By: Someone <s@example.invalid>\n"),
+            "fields_after",
+            ("sentinel",),
+        )
+    ),
+)
+
 
 # ----------------------------------------------------------------------
 section("bash-guard: nixos push gate, end-to-end sub-cases")
@@ -1355,6 +1453,47 @@ check(
     "an indented sub-bullet cannot upgrade the 'feature-vm.nix modified' claim",
     dec == "deny" and "PR #61" in why,
     f"decision={dec!r} {why[:250]}",
+)
+
+# --- D30 end-to-end: a wrapped value ---------------------------------
+# The regression this chunk exists for. Both halves ran against the live
+# gate on 2026-09-04 and produced the same wrong answer: a list of fields
+# that were present, correct, and single-line.
+_wrapped_ok = (
+    "feat: a risky change\n"
+    "\n"
+    "Pre-push checklist:\n"
+    "- Type: risky\n"
+    "- Rebased on origin/main: yes\n"
+    "- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+    "- Interactive smoke (nixos-agent-testing): yes - booted the vm, sshd\n"
+    "  answered, and the timer showed active after a manual start\n"
+    "- Advisor review (advice-refine-test-loop): yes - 2 rounds, no blockers\n"
+    "- feature-vm.nix modified: no\n"
+    "- Risky markers in diff: none\n"
+    "- Behavioural evidence: ran the unit, observed it start\n"
+)
+w = branch_with(make_repo(), _wrapped_ok, {"docs/a.md": "x\n"})
+dec, why = push_guard(w)
+check(
+    "an INDENTED continuation line joins its field -> allow",
+    dec is None,
+    f"decision={dec!r} {why[:300]}",
+)
+
+_wrapped_bad = _wrapped_ok.replace("  answered, and", "answered, and")
+w = branch_with(make_repo(), _wrapped_bad, {"docs/a.md": "x\n"})
+dec, why = push_guard(w)
+check("an UNINDENTED continuation line -> deny", dec == "deny", f"decision={dec!r}")
+check(
+    "... names the wrap as the cause",
+    "wrapped" in why.lower() and "answered, and the timer showed active" in why,
+    why[:400],
+)
+check(
+    "... and does NOT accuse the fields below it of being missing",
+    "missing, empty, or template-placeholder" not in why,
+    why[:400],
 )
 
 # --- D25: a diff carrying non-UTF-8 bytes must not crash the gate -----

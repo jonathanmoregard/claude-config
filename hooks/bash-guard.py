@@ -522,7 +522,6 @@ def _check_dcg(command: str) -> str | None:
 
     if deny_reason is not None:
         return deny_reason
-
     # No deny rendered. Exit 0 is dcg's allow — for a silent run and for an
     # explicit `"allow"` alike. Any other status means dcg fell over, and a
     # rendered allow does not excuse that: the allow speaks for dcg's rules,
@@ -1108,7 +1107,9 @@ _NIXOS_RISKY_MARKERS = re.compile(
 _NIXOS_CHECKLIST_HEADER = re.compile(r"^Pre-push checklist:\s*$", re.MULTILINE)
 # Field lines are top-level only (anchored `^-\s`, NOT `^\s*-\s`). Indented
 # sub-bullets inside a multi-line `Behavioural evidence` value must not
-# overwrite the parent field map.
+# overwrite the parent field map — they are joined onto the value above
+# instead (see `_nixos_parse_checklist`), which is also what stops them
+# truncating the block.
 _NIXOS_CHECKLIST_FIELD = re.compile(r"^-\s*([^:\n]+?)\s*:\s*(.*)$")
 _NIXOS_OVERRIDE = re.compile(r"^Override:\s*\[skip-vm-gate\]\s*(\S.+)$", re.MULTILINE)
 # `<placeholder>` template hints (`<list, or 'none'>`, `<cmd + output>`) left
@@ -1118,6 +1119,21 @@ _NIXOS_TEMPLATE_PLACEHOLDER = re.compile(r"^<.*>$")
 _NIXOS_FEATURE_VM_FILE_IN_DIFF = re.compile(
     r"^diff --git .*modules/nixos/feature-vm\.nix\b", re.MULTILINE
 )
+
+# The `Type: risky` fields the gate insists on, in template order. Module
+# level because the wrap diagnosis needs them BEFORE `Type:` is dispatched on
+# — a wrap early enough to hide `Type:` itself must be reported as a wrap,
+# not as a missing/invalid Type.
+_NIXOS_REQUIRED_FIELDS = (
+    "rebased on origin/main",
+    "local gate",
+    "interactive smoke (nixos-agent-testing)",
+    "advisor review (advice-refine-test-loop)",
+    "feature-vm.nix modified",
+    "risky markers in diff",
+    "behavioural evidence",
+)
+_NIXOS_CHECKLIST_KNOWN_FIELDS = ("type",) + _NIXOS_REQUIRED_FIELDS
 
 _NIXOS_GATE_HELP = (
     "nixos-config push gate refused this push (remote points at "
@@ -1356,19 +1372,62 @@ def _nixos_command_pushes(command: str) -> bool:
     return False
 
 
-def _nixos_parse_checklist(commit_msg: str) -> dict[str, str] | None:
+class _ChecklistParse(dict):
+    """The field map, plus what ended the block and what was written below it.
+
+    A plain `dict` subclass so every existing caller — `fields.get(...)`,
+    `fields is None`, `isinstance(..., dict)` — keeps working unchanged. The
+    two extra attributes exist only so the gate can tell a WRAPPED value
+    from a genuinely absent field; see `_nixos_parse_checklist`.
+    """
+
+    #: The line that ended the block, stripped, or None if nothing did.
+    terminator: str | None = None
+    #: Top-level `- Field:` keys that appear BELOW the terminator, in order.
+    fields_after: tuple[str, ...] = ()
+
+
+def _nixos_parse_checklist(commit_msg: str) -> _ChecklistParse | None:
     """Extract the `Pre-push checklist:` field map. None if header missing.
 
-    Block ends at the first non-field, non-blank, non-comment line after the
-    header, or at end-of-message. Keys lowercased + stripped.
+    Block ends at the first non-field, non-blank, non-comment, NON-INDENTED
+    line after the header, or at end-of-message. Keys lowercased + stripped.
+
+    WRAPPED VALUES, and why the end-of-block rule is not enough on its own
+    ---------------------------------------------------------------------
+    A long value that continues on the next line used to be "the first
+    unrelated line", which ended the block — so every field written BELOW it
+    disappeared from the map and the gate reported them as
+    `missing, empty, or template-placeholder`. Measured twice on 2026-09-04
+    (PR #207): four fields were named, three of them single-line and
+    verbatim correct, and the real cause — a wrap two fields earlier — was
+    not mentioned. The strictness was never the defect; the misattribution
+    was, and it cost ~20 minutes of looking at the wrong lines.
+
+    Two shapes, two answers:
+
+      * INDENTED continuation (`  more text`) — unambiguous, so it is joined
+        onto the value above and parsing continues. This also subsumes the
+        indented sub-bullets of a multi-line `Behavioural evidence` value:
+        they become part of that value instead of truncating the block, and
+        they still cannot overwrite a top-level field, because
+        `_NIXOS_CHECKLIST_FIELD` is anchored at column 0.
+      * UNINDENTED continuation — indistinguishable from the commit body
+        resuming, so the block still ends there. But the terminating line
+        and any checklist fields written below it are recorded, which is
+        what lets `_check_nixos_push` name the wrap instead of accusing
+        those fields of being absent.
     """
     if not _NIXOS_CHECKLIST_HEADER.search(commit_msg):
         return None
-    fields: dict[str, str] = {}
+    fields = _ChecklistParse()
     in_block = False
-    for line in commit_msg.splitlines():
+    last_key: str | None = None
+    lines = commit_msg.splitlines()
+    for i, line in enumerate(lines):
         if _NIXOS_CHECKLIST_HEADER.match(line):
             in_block = True
+            last_key = None
             continue
         if not in_block:
             continue
@@ -1383,8 +1442,24 @@ def _nixos_parse_checklist(commit_msg: str) -> dict[str, str] | None:
             # poison values when the agent left it untrimmed.
             val = re.sub(r"\s+#.*$", "", val).strip()
             fields[key] = val
+            last_key = key
             continue
-        # First unrelated line ends the block.
+        if line[:1].isspace() and last_key is not None:
+            # Indented continuation of the value above.
+            tail = re.sub(r"\s+#.*$", "", stripped).strip()
+            if tail:
+                fields[last_key] = (fields[last_key] + " " + tail).strip()
+            continue
+        # First unrelated line ends the block. Record it, and everything
+        # below it that LOOKS like a checklist field, so a wrap can be
+        # diagnosed as a wrap.
+        fields.terminator = stripped
+        after: list[str] = []
+        for later in lines[i:]:
+            m2 = _NIXOS_CHECKLIST_FIELD.match(later)
+            if m2:
+                after.append(m2.group(1).strip().lower())
+        fields.fields_after = tuple(after)
         break
     return fields
 
@@ -1437,6 +1512,35 @@ def _check_nixos_push(command: str, cwd: str | None) -> str | None:
     if fields is None:
         return _NIXOS_GATE_HELP
 
+    # A checklist field written BELOW the line that ended the block is a
+    # field the gate can see but cannot attribute. Report THAT, before any
+    # check that would otherwise blame the fields themselves.
+    # `not in fields` keeps this to the wrap case only: a commit body that
+    # quotes the template — a commit ABOUT this gate, say — repeats field
+    # names below the block while the block itself parsed fine, and must not
+    # be refused for it.
+    hidden = [
+        k
+        for k in fields.fields_after
+        if k in _NIXOS_CHECKLIST_KNOWN_FIELDS and k not in fields
+    ]
+    if hidden:
+        return (
+            "nixos push gate: the 'Pre-push checklist:' block ends early. This "
+            "line is neither `- Field: value` nor blank, so it closes the "
+            "block:\n\n"
+            f"    {fields.terminator}\n\n"
+            "These checklist fields are written BELOW it and were therefore "
+            "never read: " + ", ".join(dict.fromkeys(hidden)) + ".\n\n"
+            "That shape is almost always a WRAPPED value — a long value "
+            "continued on the next line. Fix it either way:\n"
+            "  - keep each value on ONE line, or\n"
+            "  - indent continuation lines by two spaces, which attaches them "
+            "to the field above.\n\n"
+            "The fields above are not missing; the gate just cannot tell which "
+            "field they belong to."
+        )
+
     # Diff against origin/main, falling back to local main. safe-bash fell
     # back a third time to "" — an empty diff satisfies every cross-check
     # below, so a `git diff` that could not resolve either ref silently
@@ -1485,15 +1589,7 @@ def _check_nixos_push(command: str, cwd: str | None) -> str | None:
             f"'pure-data' or 'risky' (got: {type_!r}).\n\n{_NIXOS_GATE_HELP}"
         )
 
-    required = [
-        "rebased on origin/main",
-        "local gate",
-        "interactive smoke (nixos-agent-testing)",
-        "advisor review (advice-refine-test-loop)",
-        "feature-vm.nix modified",
-        "risky markers in diff",
-        "behavioural evidence",
-    ]
+    required = list(_NIXOS_REQUIRED_FIELDS)
 
     # Field counts as empty when blank OR still holding the template
     # `<...>` placeholder. The latter slips past truthy checks but signals
