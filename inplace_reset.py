@@ -372,8 +372,11 @@ def write_outcome(sid: str, status: str, reason: str) -> None:
         if tmp is not None:
             try:
                 os.unlink(tmp)
+            # tmp cleanup inside a best-effort write whose contract
+            # (docstring above) is that it never fails a completed reset
+            # nor blocks an abort path.
             except Exception:
-                pass
+                pass  # arftl-allow: swallowed-exception
 
 
 def _ppid(pid: int):
