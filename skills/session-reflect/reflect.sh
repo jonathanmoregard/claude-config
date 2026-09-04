@@ -147,15 +147,35 @@ Env:
                                    (PRECOMPACT/SESSIONEND/SUBAGENTSTOP/MISSION).
   REFLECT_REAP_MAX_PER_RUN         Max manifests the orphan reaper examines per
                                    detached-worker run (default: 200).
-  CLAUDE_PARENT_SESSION_ID         If set by Claude Code in a SubagentStop
-                                   hook env, nest subagent artifacts under
-                                   this parent. Validated against safe charset.
+  REFLECT_BUDGET_SESSIONEND_FALLBACK
+                                   Budget for the no-resume sessionend fallback
+                                   (default: ${REFLECT_BUDGET_SESSIONEND_FALLBACK}s). Its own, not carved
+                                   out of the primary's.
+  REFLECT_RESUME_MAX_TRANSCRIPT_BYTES
+                                   Transcript size above which the fork-resume is
+                                   skipped as doomed and sessionend goes straight
+                                   to the fallback (default: ${REFLECT_RESUME_MAX_TRANSCRIPT_BYTES},
+                                   derived from REFLECT_RESUME_MODEL_WINDOW_TOKENS
+                                   x REFLECT_TRANSCRIPT_BYTES_PER_TOKEN).
+  REFLECT_AGENT_TRANSCRIPT_CAP_BYTES
+                                   Cap on the agent-transcript extract inlined into
+                                   a subagentstop prompt (default: ${REFLECT_AGENT_TRANSCRIPT_CAP_BYTES}).
+  REFLECT_FALLBACK_TAIL_CAP_BYTES  Cap on the transcript tail inlined into a
+                                   sessionend fallback prompt (default: ${REFLECT_FALLBACK_TAIL_CAP_BYTES}).
+  REFLECT_HANDOFF_CAP_BYTES        Cap on the self-compact handoff inlined into a
+                                   fallback prompt (default: ${REFLECT_HANDOFF_CAP_BYTES}).
+  REFLECT_HANDOFF_MAX_AGE_SECONDS  Age past which that handoff is not offered to the
+                                   model as this session's state (default: ${REFLECT_HANDOFF_MAX_AGE_SECONDS}).
+  REFLECT_EXCERPT_BYTES            Length of every quoted excerpt: tool_result
+                                   bodies, envelope \`result\`, unparseable replies
+                                   (default: ${REFLECT_EXCERPT_BYTES}).
   _REFLECT_INTERNAL                Sentinel required to enter --worker re-entry path
 
 Modes:
   precompact    synchronous, ${REFLECT_BUDGET_PRECOMPACT}s budget, numbered checkpoint under checkpoints/
   sessionend    detached worker, ${REFLECT_BUDGET_SESSIONEND}s internal budget, writes final.json
-  subagentstop  detached worker, ${REFLECT_BUDGET_SUBAGENTSTOP}s internal budget, nests under parent/subagents/
+  subagentstop  detached worker, ${REFLECT_BUDGET_SUBAGENTSTOP}s internal budget, nests under
+                sessions/<payload session_id>/subagents/<payload agent_id>/
   mission       synchronous (detached with REFLECT_ASYNC=1), ${REFLECT_BUDGET_MISSION}s budget,
                 writes \$CLAUDE_SESSIONS_DIR/<sid>/handoff/mission.md (markdown)
 
@@ -873,6 +893,38 @@ run_worker() {
     prompt="${prompt//\{\{CHECKPOINTS_BLOCK\}\}/$cp_block}"
   fi
 
+  # For subagentstop, inline the AGENT's own transcript (A3).
+  #
+  # There is nothing to resume here and never was. `agent_transcript_path` names a
+  # transcript, not a conversation Claude Code will re-open: `--resume` takes a
+  # session id, and the subagent does not have one. The old code resumed the
+  # payload's `session_id` instead, which is the PARENT — so a SubagentStop
+  # reflected a live session mid-flight and never once opened the file it was
+  # supposed to be reflecting on.
+  #
+  # UNTRUSTED DATA. The block is transcript text — user turns, model turns, and
+  # tool output that may have come off the open internet. It is prompt CONTENT for
+  # a `--tools ""` subprocess: summarised, never executed, never interpolated into
+  # a shell command, and the reply it produces is JSON-parsed and schema-normalised
+  # before any consumer sees it. prompts/subagentstop.md says as much to the model.
+  # The extract itself drops thinking blocks and tool_use inputs and cuts
+  # tool_result bodies to an excerpt (see reflect_jsonl_to_text in lib.sh), so the
+  # bulk of what an injection would ride in on is gone before the cap even applies.
+  if [[ "$MODE" == "subagentstop" ]]; then
+    local agent_block agent_type_label
+    agent_block="$(reflect_transcript_extract \
+      "$TRANSCRIPT_PATH" "$REFLECT_AGENT_TRANSCRIPT_CAP_BYTES" tail)"
+    # A transcript of pure tool traffic extracts to nothing. Say so rather than
+    # sending the model a prompt with a hole in it — an empty block reads as "the
+    # run was empty", which is a different and wrong claim.
+    if [[ -z "$agent_block" ]]; then
+      agent_block="(this agent transcript held no legible message content)"
+    fi
+    agent_type_label="${AGENT_TYPE:-unknown}"
+    prompt="${prompt//\{\{AGENT_TRANSCRIPT_BLOCK\}\}/$agent_block}"
+    prompt="${prompt//\{\{AGENT_TYPE\}\}/$agent_type_label}"
+  fi
+
   # STEP 7 (LOW P3.8): worker_log / worker_out paths used to be fixed per
   # (SID, MODE), so a REFLECT_FORCE=1 re-run would clobber the prior run's
   # forensic log. Add an epoch suffix so every re-run keeps its own log
@@ -894,92 +946,197 @@ run_worker() {
   local budget
   budget="$(reflect_budget_for "$MODE")"
 
-  # Build and run.
-  #
-  # SECURITY: `--tools ""` disables the entire tool set so the reflection
-  # subprocess cannot invoke Bash/Edit/WebFetch/etc. even if a prompt-injection
-  # payload smuggled through the resumed transcript tries to make it. With
-  # tool use disabled we do NOT need `--dangerously-skip-permissions`
-  # (verified 2026-08-08 that `claude -p --tools "" --output-format json`
-  # returns the JSON reply cleanly). Residual risk: the model can still
-  # emit arbitrary text into the reflection body, but that body is treated
-  # as untrusted data (JSON-parsed, schema-normalized) by every downstream
-  # consumer, and never fed back into an interpreter.
-  #
-  # We keep `--resume ... --fork-session` because prompt-cache reuse
-  # (~77% hit at 12min, 1h ephemeral TTL — verified 2026-08-08) is the whole
-  # cost story for this feature. `--bare` would strip that.
-  #
-  # RECURSION BREAK: inject REFLECT_SUBPROCESS=1 into the subprocess's env so
-  # any Claude Code hooks the child fires (its own SessionEnd, PreCompact,
-  # etc.) can detect they're inside a reflection run and no-op. REFLECT_PARENT_SID
-  # is threaded through so the recursion-marker file can attribute the skip.
-  # Inline `env FOO=bar` scopes to the child only (no export leak into this
-  # worker process, no leak into the manifest-writing path).
-  # `claude --resume <sid>` is cwd-scoped: Claude Code looks up conversations
-  # under the current project's transcript dir, so resuming from the wrong
-  # cwd errors with "No conversation found". The hook payload always carries
-  # the originating cwd; use it. Fall back to $HOME if the payload cwd is
-  # missing or no longer exists (project deleted between hook fire and
-  # worker start) — running claude from $HOME with a bad --resume will fail
-  # loud, which we prefer to succeeding against the wrong project. CWD is
-  # exported from the dispatcher into the worker env; ${CWD:-} guards the
-  # case where the payload lacked a cwd field (older hooks, malformed).
-  local resume_cwd="${CWD:-}"
-  if [[ -z "$resume_cwd" || ! -d "$resume_cwd" ]]; then
-    resume_cwd="$HOME"
+  # --- Attempt bookkeeping ---------------------------------------------------
+  # What the strategy below did, as JSON, for the manifest. Always a valid object
+  # so every `--argjson` that consumes it is safe, and it is merged into EVERY
+  # terminal write (see _worker_extra) — `fallback_used` present on a complete
+  # manifest but absent on the error manifest for the same run would be exactly
+  # the half-record D3 is about.
+  local attempt_extra='{}'
+
+  # _worker_extra [own-json] — the standing manifest fields + the attempt
+  # bookkeeping + this call site's own keys, as one object.
+  _worker_extra() {
+    jq -cn \
+      --arg tp "$TRANSCRIPT_PATH" \
+      --arg event "$HOOK_EVENT" \
+      --arg parent "$PARENT_SID" \
+      --argjson attempt "$attempt_extra" \
+      --argjson own "${1:-{\}}" \
+      '{source_transcript:$tp,hook_event_name:$event,
+        parent_session_id:(if $parent == "" then null else $parent end)}
+       + $attempt + $own'
+  }
+
+  # --- Attempt strategy ------------------------------------------------------
+  # precompact / mission  one resumed call, unchanged.
+  # subagentstop          one INLINE call. There is no session to resume; the
+  #                       agent transcript is already in the prompt.
+  # sessionend            resumed primary, then the B1 no-resume fallback if it
+  #                       cannot land — or straight to the fallback when the B2
+  #                       pre-check says the resume is doomed before it starts.
+  local claude_json="" rc=0 inner=""
+  # The budget that was actually in force for the call whose result we end up
+  # reporting. Diverges from `budget` the moment the fallback runs.
+  local effective_budget="$budget"
+
+  if [[ "$MODE" != "sessionend" ]]; then
+    local primary_resume="$SESSION_ID"
+    [[ "$MODE" == "subagentstop" ]] && primary_resume=""
+    reflect_claude_call "$prompt" "$budget" "$primary_resume" "$worker_out" "$worker_log"
+    claude_json="$REFLECT_CALL_ENVELOPE"
+    rc="$REFLECT_CALL_RC"
+    inner="$(jq -r '.result // empty' <<<"$claude_json" 2>/dev/null || true)"
+  else
+    # B2 — the cheap pre-check, paid in one stat(2).
+    #
+    # `--resume` replays the WHOLE session into the reflection model's window. A
+    # session bigger than that window cannot survive the replay: measured
+    # 2026-09-04 on sid 40fbb4a9, a 305k-token session (1.86 MB of transcript
+    # JSONL) made the fork auto-compact mid-reflection, blow the 90s budget, and
+    # leave status=timeout with NO final.json. None of that is recoverable at the
+    # 89th second, and all of it is knowable from the file size beforehand.
+    #
+    # The threshold is derived from two operator-settable inputs — the model's
+    # window and the measured bytes-per-token ratio — never a fitted constant; see
+    # "Resume pre-check" in lib.sh. Both the measurement and the threshold go into
+    # the manifest, so the ratio stays a reported outcome that can be re-derived
+    # from the corpus rather than a number buried in a comparison.
+    local transcript_bytes primary_skipped=false
+    transcript_bytes="$(reflect_file_size "$TRANSCRIPT_PATH")"
+    if (( transcript_bytes > REFLECT_RESUME_MAX_TRANSCRIPT_BYTES )); then
+      primary_skipped=true
+    fi
+
+    local primary_failure="" primary_detail='{}'
+    if [[ "$primary_skipped" == "false" ]]; then
+      reflect_claude_call "$prompt" "$budget" "$SESSION_ID" "$worker_out" "$worker_log"
+      claude_json="$REFLECT_CALL_ENVELOPE"
+      rc="$REFLECT_CALL_RC"
+      inner="$(jq -r '.result // empty' <<<"$claude_json" 2>/dev/null || true)"
+      # Three distinct ways the primary fails to produce a reflection, and all
+      # three used to end the worker. A 124 is the D2 shape; a nonzero rc with a
+      # populated envelope is the D3 shape (25 of those were spend-limit 429s); an
+      # rc of 0 with no `result` is a well-formed envelope carrying nothing.
+      if (( rc == 124 )); then
+        primary_failure="timeout"
+      elif (( rc != 0 )); then
+        primary_failure="error"
+      elif [[ -z "$inner" ]]; then
+        primary_failure="empty_result"
+      fi
+      if [[ -n "$primary_failure" ]]; then
+        primary_detail="$(reflect_envelope_failure_json "$claude_json")"
+      fi
+    fi
+
+    if [[ "$primary_skipped" == "true" || -n "$primary_failure" ]]; then
+      # B1 — the fallback. Same job, same model, no `--resume`: the context the
+      # resume would have replayed is assembled as DATA instead, bounded by the
+      # caps in lib.sh. It costs the prompt cache (the primary is still tried
+      # first precisely because that cache is the cost story) and buys the thing
+      # that was missing: final.json lands.
+      #
+      # Three sources, cheapest signal first:
+      #   checkpoints  what PreCompact already distilled, reused verbatim from the
+      #                block built above. Empty on exactly the sessions that need
+      #                this most — a 1M-window session never auto-compacts — which
+      #                is why it is not the only source.
+      #   tail slice   the NEWEST end of the transcript. Newest, not oldest: how a
+      #                session finished is what a reflection is mostly about, and
+      #                the head is the part checkpoints already cover.
+      #   handoff      the self-compact handoff for this sid, when there is one and
+      #                it is fresh. Optional by construction — self-compact is a
+      #                separate subsystem and nothing here may require it to have
+      #                run.
+      #
+      # UNTRUSTED DATA, same as the subagent block above: prompt content for a
+      # `--tools ""` subprocess, summarised and never executed.
+      local fb_prompt fb_tail fb_handoff fb_cp fb_out
+      fb_prompt="$(cat "$SCRIPT_DIR/prompts/sessionend-fallback.md" 2>/dev/null || true)"
+      if [[ -z "$fb_prompt" ]]; then
+        # Packaging fault, not a session fault. Degrade to the sessionend template
+        # already in hand (checkpoints substituted, no transcript) rather than
+        # abandoning the run — a thinner reflection beats the silent timeout this
+        # whole path exists to remove.
+        fb_prompt="$prompt"
+      fi
+      fb_tail="$(reflect_transcript_extract \
+        "$TRANSCRIPT_PATH" "$REFLECT_FALLBACK_TAIL_CAP_BYTES" tail)"
+      [[ -n "$fb_tail" ]] || fb_tail="(the session transcript could not be read)"
+      fb_handoff="$(reflect_handoff_block "$SESSION_ID")"
+      [[ -n "$fb_handoff" ]] || fb_handoff="(no self-compact handoff for this session)"
+      fb_cp="${cp_block:-}"
+      [[ -n "$fb_cp" ]] || fb_cp="(no checkpoints)"
+      fb_prompt="${fb_prompt//\{\{CHECKPOINTS_BLOCK\}\}/$fb_cp}"
+      fb_prompt="${fb_prompt//\{\{TRANSCRIPT_TAIL_BLOCK\}\}/$fb_tail}"
+      fb_prompt="${fb_prompt//\{\{HANDOFF_BLOCK\}\}/$fb_handoff}"
+
+      # Its own stdout log. Overwriting the primary's would destroy the very
+      # envelope that explains why the fallback had to run.
+      fb_out="$REFLECT_LOG_DIR/${SESSION_ID}-${MODE}-${worker_ts}.fallback.stdout.log"
+      effective_budget="$REFLECT_BUDGET_SESSIONEND_FALLBACK"
+      reflect_claude_call "$fb_prompt" "$effective_budget" "" "$fb_out" "$worker_log"
+      claude_json="$REFLECT_CALL_ENVELOPE"
+      rc="$REFLECT_CALL_RC"
+      inner="$(jq -r '.result // empty' <<<"$claude_json" 2>/dev/null || true)"
+
+      attempt_extra="$(jq -cn \
+        --argjson bytes "$transcript_bytes" \
+        --argjson maxbytes "$REFLECT_RESUME_MAX_TRANSCRIPT_BYTES" \
+        --argjson skipped "$primary_skipped" \
+        --arg failure "$primary_failure" \
+        --argjson detail "$primary_detail" \
+        '{transcript_bytes:$bytes,
+          resume_max_transcript_bytes:$maxbytes,
+          primary_skipped_oversize:$skipped,
+          fallback_used:true,
+          primary_failure:(if $failure == "" then null else $failure end)}
+         + ($detail | with_entries(.key |= "primary_" + .))')"
+    else
+      attempt_extra="$(jq -cn \
+        --argjson bytes "$transcript_bytes" \
+        --argjson maxbytes "$REFLECT_RESUME_MAX_TRANSCRIPT_BYTES" \
+        '{transcript_bytes:$bytes,
+          resume_max_transcript_bytes:$maxbytes,
+          primary_skipped_oversize:false,
+          fallback_used:false}')"
+    fi
   fi
 
-  local claude_json rc
-  set +e
-  # `timeout -k 10` ensures a stuck claude gets SIGKILLed 10s after the
-  # SIGTERM. Without -k, a claude with a blocked event loop can ignore
-  # TERM forever, and since this timeout puts claude in a new process
-  # group, any OUTER timeout wrapping this dispatcher (e.g. idle-handoff's
-  # `timeout 90`) cannot reach into the group to kill it. Advisor P1R3.
-  claude_json=$(cd "$resume_cwd" && timeout -k "$REFLECT_KILL_GRACE_SECONDS" "$budget" env \
-    REFLECT_SUBPROCESS=1 \
-    REFLECT_PARENT_SID="$SESSION_ID" \
-    claude \
-    -p --resume "$SESSION_ID" --fork-session \
-    --model "$REFLECT_MODEL" \
-    --output-format json \
-    --tools "" <<<"$prompt" 2>>"$worker_log")
-  rc=$?
-  set -e
-  printf '%s' "$claude_json" > "$worker_out"
+  # --- Terminal failure paths ---
+  # C1: the envelope is asked what went wrong, and the answer goes in the
+  # manifest. 25 sessionend errors in the live corpus were monthly-spend-limit
+  # 429s and every one of their manifests said only `subprocess_exit_code: 1` —
+  # diagnosing them meant reading raw worker stdout logs, which the artifact GC
+  # collects after REFLECT_ARTIFACT_RETENTION_DAYS. The envelope named the limit
+  # the whole time; nothing read it. Every access inside
+  # reflect_envelope_failure_json is guarded, because the failure path is exactly
+  # where the envelope is empty (SIGKILLed timeout), truncated (broken pipe) or
+  # not JSON at all.
+  local envelope_detail
+  envelope_detail="$(reflect_envelope_failure_json "$claude_json")"
 
-  # --- Timeout / error paths ---
   if (( rc == 124 )); then
     write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "timeout" \
-      "$(jq -cn --arg tp "$TRANSCRIPT_PATH" --arg event "$HOOK_EVENT" --arg parent "$PARENT_SID" \
-          --argjson budget "$budget" \
-          '{source_transcript:$tp,hook_event_name:$event,
-            parent_session_id:(if $parent == "" then null else $parent end),
-            timeout_seconds:$budget}')"
+      "$(_worker_extra "$(jq -cn --argjson budget "$effective_budget" --argjson d "$envelope_detail" \
+          '$d + {reason:"model_call_timeout",timeout_seconds:$budget}')")"
     return 0
   fi
   if (( rc != 0 )); then
     write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "error" \
-      "$(jq -cn --arg tp "$TRANSCRIPT_PATH" --arg event "$HOOK_EVENT" --arg parent "$PARENT_SID" \
-          --argjson exit "$rc" \
-          '{source_transcript:$tp,hook_event_name:$event,
-            parent_session_id:(if $parent == "" then null else $parent end),
-            subprocess_exit_code:$exit}')"
+      "$(_worker_extra "$(jq -cn --argjson exit "$rc" --argjson d "$envelope_detail" \
+          '$d + {reason:"model_call_nonzero_exit",subprocess_exit_code:$exit}')")"
     return 0
   fi
 
   # --- Extract reflection payload from envelope ---
   # `claude -p --output-format json` returns {type:"result", result:"<string>", usage:{...}}
   # where `result` is itself a JSON string produced by the model.
-  local inner
-  inner=$(jq -r '.result // empty' <<<"$claude_json" 2>/dev/null || true)
   if [[ -z "$inner" ]]; then
     write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "error" \
-      "$(jq -cn --arg tp "$TRANSCRIPT_PATH" --arg event "$HOOK_EVENT" --arg parent "$PARENT_SID" \
-          '{source_transcript:$tp,hook_event_name:$event,
-            parent_session_id:(if $parent == "" then null else $parent end),
-            reason:"empty_result_from_claude"}')"
+      "$(_worker_extra "$(jq -cn --argjson d "$envelope_detail" \
+          '$d + {reason:"empty_result_from_claude"}')")"
     return 0
   fi
 

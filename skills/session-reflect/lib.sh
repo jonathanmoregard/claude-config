@@ -83,6 +83,15 @@ fi
 : "${REFLECT_BUDGET_SUBAGENTSTOP:=40}"
 : "${REFLECT_BUDGET_MISSION:=60}"
 
+# The sessionend FALLBACK's own budget (B1). It is a second model call, made
+# after the primary has already spent up to REFLECT_BUDGET_SESSIONEND, so it is
+# deliberately NOT carved out of the primary's budget: both run detached, off
+# the hook clock, and the thing we are buying is that final.json lands at all.
+# Same 90s as the primary because it is the same job — one reflection over one
+# session — against a prompt that is bounded by REFLECT_FALLBACK_TAIL_CAP_BYTES
+# rather than by a whole replayed transcript, so 90s is if anything generous.
+: "${REFLECT_BUDGET_SESSIONEND_FALLBACK:=90}"
+
 # --- Enforcement of the arithmetic above (not just documentation) ------------
 # REFLECT_BUDGET_PRECOMPACT is an operator-facing override and was never checked
 # against the cap. 50 gives 50 + 10 + 5 = 65 > 60, i.e. the external SIGKILL
@@ -134,6 +143,114 @@ reflect_budget_for() {
     *)            printf '%s' "$REFLECT_BUDGET_SUBAGENTSTOP" ;;
   esac
 }
+
+# --- Numeric env normalization -----------------------------------------------
+# reflect_clamp_positive_int <VAR_NAME> <shipped_default>
+# Every size/threshold below is an operator-facing INPUT, and a mis-set one is
+# worse than a wrong default: an empty or non-numeric value makes `(( ))` read
+# it as 0, which would silently turn "cap the prompt" into "send nothing" and
+# "skip the doomed resume" into "skip every resume". Reset + a stderr line, the
+# same posture reflect_enforce_sync_budget_cap takes for the budgets, so the
+# correction is visible in the hook output instead of being a quiet behaviour
+# change. `printf -v` rather than a nameref: bash 3.1 has it, and the rest of
+# this file already avoids 4.3-only syntax.
+reflect_clamp_positive_int() {
+  local name="${1:-}" def="${2:-}" cur="${!1:-}"
+  if [[ ! "$cur" =~ ^[0-9]+$ ]] || (( cur < 1 )); then
+    echo "reflect: $name='$cur' is not a positive integer; RESET to the shipped default $def" >&2
+    printf -v "$name" '%s' "$def"
+  fi
+}
+
+# --- Resume pre-check: when the fork is doomed before it starts (B2) ---------
+# `claude -p --resume <sid> --fork-session` replays the WHOLE session into the
+# reflection model's window. Measured 2026-09-04 on sid 40fbb4a9: a 305k-token
+# session (1.86 MB of transcript JSONL) replayed into haiku's 200k window made
+# the fork auto-compact mid-reflection, blow the 90s budget, and leave
+# status=timeout with no final.json. Nothing about that is recoverable at the
+# 89th second — it is knowable from the file size before the call is made.
+#
+# THE THRESHOLD IS DERIVED FROM TWO INPUTS, NOT FITTED. Both are env-settable,
+# and the threshold itself can be set directly to override the derivation:
+#
+#   REFLECT_RESUME_MODEL_WINDOW_TOKENS   a property of the model (haiku: 200k).
+#                                        Raise it when REFLECT_MODEL is a
+#                                        1M-window build; the pre-check then
+#                                        stops firing, which is correct.
+#   REFLECT_TRANSCRIPT_BYTES_PER_TOKEN   the measured ratio on this host:
+#                                        1.86 MB / 305k tokens = 6.1 bytes per
+#                                        token of replayed context. Rounded DOWN
+#                                        to 6 so the threshold errs toward
+#                                        attempting the resume rather than
+#                                        skipping a session that would have fit.
+#
+#   default threshold = 200000 * 6 = 1,200,000 bytes
+#
+# The observed dead session (1.86 MB) is above it and would now go straight to
+# the fallback; a transcript under it is still resumed, which is where the ~77%
+# prompt-cache hit lives and why the pre-check is a bound and not a policy.
+# When it fires, the measured size AND the threshold both land in the manifest,
+# so the ratio is a reported outcome rather than a hidden constant.
+REFLECT_RESUME_MODEL_WINDOW_TOKENS_DEFAULT=200000
+REFLECT_TRANSCRIPT_BYTES_PER_TOKEN_DEFAULT=6
+: "${REFLECT_RESUME_MODEL_WINDOW_TOKENS:=$REFLECT_RESUME_MODEL_WINDOW_TOKENS_DEFAULT}"
+: "${REFLECT_TRANSCRIPT_BYTES_PER_TOKEN:=$REFLECT_TRANSCRIPT_BYTES_PER_TOKEN_DEFAULT}"
+reflect_clamp_positive_int REFLECT_RESUME_MODEL_WINDOW_TOKENS "$REFLECT_RESUME_MODEL_WINDOW_TOKENS_DEFAULT"
+reflect_clamp_positive_int REFLECT_TRANSCRIPT_BYTES_PER_TOKEN "$REFLECT_TRANSCRIPT_BYTES_PER_TOKEN_DEFAULT"
+: "${REFLECT_RESUME_MAX_TRANSCRIPT_BYTES:=$(( REFLECT_RESUME_MODEL_WINDOW_TOKENS * REFLECT_TRANSCRIPT_BYTES_PER_TOKEN ))}"
+reflect_clamp_positive_int REFLECT_RESUME_MAX_TRANSCRIPT_BYTES \
+  "$(( REFLECT_RESUME_MODEL_WINDOW_TOKENS * REFLECT_TRANSCRIPT_BYTES_PER_TOKEN ))"
+
+# --- Byte caps on everything inlined into a prompt ---------------------------
+# Three different bodies now reach a prompt as DATA rather than as a resumed
+# session, and each gets its own bound. They sit beside the pre-existing 16 KB
+# checkpoints cap in reflect.sh and are sized in the same units for the same
+# reason: a prompt the model cannot finish reading inside the budget produces
+# nothing, and an unbounded one is also the cheapest denial-of-service against
+# this subsystem (a seeded transcript is attacker-influenceable content).
+#
+#   AGENT_TRANSCRIPT  24 KB (~4k tokens). One subagent run is one task's worth
+#                     of text, and the subagentstop budget is 40s with no cache
+#                     to reuse. Deliberately the same order as the 16 KB
+#                     checkpoints block, which summarises a whole session.
+#   FALLBACK_TAIL     48 KB (~8k tokens). The fallback's only view of the
+#                     session, on the longer 90s budget, so it gets twice the
+#                     subagent's allowance — still two orders of magnitude
+#                     below the 1.86 MB transcript that killed the resume.
+#   HANDOFF           8 KB. prompts/mission.md produces a page of markdown by
+#                     construction, so this admits a whole handoff and refuses
+#                     a runaway one.
+#   EXCERPT           200 chars, the length the unparseable-reply path already
+#                     used for raw_excerpt. Now one named input rather than the
+#                     same literal in three places: quoted tool_result bodies,
+#                     the envelope's `result` in an error manifest, and that
+#                     pre-existing raw_excerpt.
+#
+# Caps are applied in CHARACTERS, exactly as the checkpoints cap already is.
+# The bound is a prompt-budget guard, not a security boundary, so a multi-byte
+# body landing slightly over its byte figure changes nothing that matters.
+REFLECT_AGENT_TRANSCRIPT_CAP_BYTES_DEFAULT=24576
+REFLECT_FALLBACK_TAIL_CAP_BYTES_DEFAULT=49152
+REFLECT_HANDOFF_CAP_BYTES_DEFAULT=8192
+REFLECT_EXCERPT_BYTES_DEFAULT=200
+: "${REFLECT_AGENT_TRANSCRIPT_CAP_BYTES:=$REFLECT_AGENT_TRANSCRIPT_CAP_BYTES_DEFAULT}"
+: "${REFLECT_FALLBACK_TAIL_CAP_BYTES:=$REFLECT_FALLBACK_TAIL_CAP_BYTES_DEFAULT}"
+: "${REFLECT_HANDOFF_CAP_BYTES:=$REFLECT_HANDOFF_CAP_BYTES_DEFAULT}"
+: "${REFLECT_EXCERPT_BYTES:=$REFLECT_EXCERPT_BYTES_DEFAULT}"
+reflect_clamp_positive_int REFLECT_AGENT_TRANSCRIPT_CAP_BYTES "$REFLECT_AGENT_TRANSCRIPT_CAP_BYTES_DEFAULT"
+reflect_clamp_positive_int REFLECT_FALLBACK_TAIL_CAP_BYTES "$REFLECT_FALLBACK_TAIL_CAP_BYTES_DEFAULT"
+reflect_clamp_positive_int REFLECT_HANDOFF_CAP_BYTES "$REFLECT_HANDOFF_CAP_BYTES_DEFAULT"
+reflect_clamp_positive_int REFLECT_EXCERPT_BYTES "$REFLECT_EXCERPT_BYTES_DEFAULT"
+
+# A self-compact handoff is written for the sid it belongs to, so a stale one is
+# not really reachable — but "present" and "describes this session's work" are
+# different claims, and a resumed sid could carry a handoff from a much earlier
+# stretch of work. One day is long enough that no live session's own handoff is
+# ever excluded and short enough that nothing archaeological is presented to the
+# model as if it were this session's state.
+REFLECT_HANDOFF_MAX_AGE_SECONDS_DEFAULT=86400
+: "${REFLECT_HANDOFF_MAX_AGE_SECONDS:=$REFLECT_HANDOFF_MAX_AGE_SECONDS_DEFAULT}"
+reflect_clamp_positive_int REFLECT_HANDOFF_MAX_AGE_SECONDS "$REFLECT_HANDOFF_MAX_AGE_SECONDS_DEFAULT"
 
 # --- Boolean env normalization (used by REFLECT_FORCE and friends) -----------
 # Truthy: 1, true, yes, on (case-insensitive). Anything else = false.
