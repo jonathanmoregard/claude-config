@@ -68,6 +68,18 @@ session:
   * the clear is confirmed before the pickup is sent, because `/clear` typed
     into a prompt that already holds text is swallowed rather than run.
   * one reset per session at a time, so two runs cannot interleave.
+
+EVERY TERMINAL PATH REPORTS BACK, machine-readably, in <sid>/outcome.json
+(write_outcome). The trigger disarms a session when it fires, and an abort here
+destroys nothing — but with no machine channel the trigger could not tell an
+abort from a success, so `armed:false` was final and the session never retried:
+sid 6f11dbf0, 2026-09-04, fired once at 409k tokens, aborted still-mid-turn,
+and self-compact was silently gone for the rest of the session. The log above
+stays human-forensic (its wording changes freely); outcome.json is the one
+record self-compact-trigger.py's bounded re-arm reads. It is a THIRD channel
+beside the request marker and the handoff, and it must not disturb either:
+success still renames request.json -> consumed.json, an abort still KEEPS the
+marker for idle-handoff.
 """
 from __future__ import annotations
 
@@ -328,6 +340,42 @@ def log(msg: str) -> None:
         pass
 
 
+def write_outcome(sid: str, status: str, reason: str) -> None:
+    """Machine-readable terminal record: <sessions_root>/<sid>/outcome.json.
+
+    THE TRIGGER'S RE-ARM CHANNEL. self-compact-trigger.py consumes an
+    `aborted` record (bounded, once per record) to re-arm a session it
+    disarmed at fire time; an `ok` record ends that crossing's retry story.
+    The log above is deliberately NOT that channel: it is a human forensic
+    record whose wording changes freely, and a trigger parsing prose would
+    break on the first reword.
+
+    Best-effort, like log(): an unwritable outcome must never turn a completed
+    reset into a failure, nor block an abort path that destroyed nothing.
+    Atomic (tmp + rename, mirroring the trigger's write_json_atomic — copied,
+    not imported: the trigger imports this module, so importing back would be
+    a cycle, and both files are deliberately self-contained), so the trigger
+    can never read a half-written record.
+    """
+    tmp: Path | None = None
+    try:
+        d = sessions_root() / sid
+        d.mkdir(parents=True, exist_ok=True)
+        tmp = d / f".outcome.json.tmp{os.getpid()}"
+        with open(tmp, "w") as f:
+            json.dump({"status": status, "reason": reason,
+                       "at": int(time.time())}, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, d / "outcome.json")
+    except Exception:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+
+
 def _ppid(pid: int):
     try:
         with open(f"/proc/{pid}/status") as f:
@@ -509,6 +557,10 @@ def main(argv: list[str]) -> int:
             args[a[2:]] = next(it, "")
     sid = args.get("sid", "")
     if not SID_RE.match(sid):
+        # No outcome record on this path: the sid IS the path component the
+        # record would be filed under, so an invalid one has no valid session
+        # dir to write into. The trigger validated the sid before spawning us,
+        # so nothing upstream is waiting on an outcome it will never get.
         log(f"REFUSING: sid {sid!r} is not a valid session id; it becomes a path "
             "component under the sessions root and `..` or a slash would escape it")
         return 1
@@ -518,6 +570,7 @@ def main(argv: list[str]) -> int:
     spid = int(spid_arg) if spid_arg.isdigit() else session_pid()
     if not spid:
         log(f"sid={sid} REFUSING: could not resolve the session pid")
+        write_outcome(sid, "aborted", "no_session_pid")
         return 1
 
     # ONE RESET PER SESSION AT A TIME. `/self-compact` run twice, or a manual run
@@ -534,6 +587,11 @@ def main(argv: list[str]) -> int:
     except OSError:
         log(f"sid={sid} REFUSING: another in-place reset is already running for this "
             "session. Two waiters on one window would interleave their clear and pickup.")
+        # A re-arm+refire off this record while the holder is live is refused
+        # by this same lock, which is correct and harmless — and the trigger's
+        # retry spacing bounds it anyway. The holder overwrites this record
+        # with its own terminal outcome when it finishes.
+        write_outcome(sid, "aborted", "lock_held")
         return 1
 
     # cwd is read for the log only. There is deliberately no cwd restriction: the
@@ -548,11 +606,13 @@ def main(argv: list[str]) -> int:
     if not socket:
         log(f"sid={sid} no in-place reset: KITTY_LISTEN_ON unset for pid {spid}; this "
             "terminal has no remote control")
+        write_outcome(sid, "aborted", "no_socket")
         return 1
 
     wid, why = resolve_window(socket, spid)
     if wid is None:
         log(f"sid={sid} REFUSING: {why}")
+        write_outcome(sid, "aborted", "window_unresolved")
         return 1
 
     # DRAIN BEFORE CLEARING, and before the handoff is even requested -- so the
@@ -573,6 +633,7 @@ def main(argv: list[str]) -> int:
                 f"{SUBAGENT_WAIT_CAP_SECONDS // 3600}h drain ceiling ({', '.join(live)}). "
                 "Clearing now would interrupt them mid-flight and orphan their transcripts. "
                 "Nothing was destroyed; re-run once they finish.")
+            write_outcome(sid, "aborted", "subagent_drain_ceiling")
             return 1
         log(f"sid={sid} subagents drained; proceeding")
 
@@ -581,6 +642,7 @@ def main(argv: list[str]) -> int:
         target.parent.mkdir(parents=True, exist_ok=True)
     except Exception as e:
         log(f"sid={sid} REFUSING: cannot create {target.parent} ({e})")
+        write_outcome(sid, "aborted", "handoff_dir_unwritable")
         return 1
     # FRESHNESS BASELINE. Existence is not enough: a handoff from an earlier
     # crossing would pass instantly and we would clear the session to resume it
@@ -591,6 +653,7 @@ def main(argv: list[str]) -> int:
     err = send_text(socket, wid, spid, write_instruction(str(target), instructions), submit=True)
     if err:
         log(f"sid={sid} REFUSING: could not ask the session to write its handoff ({err})")
+        write_outcome(sid, "aborted", "handoff_request_send_failed")
         return 1
 
     # Wait for as long as the session is demonstrably still working, and only
@@ -612,12 +675,14 @@ def main(argv: list[str]) -> int:
                 f"has been idle for {WRITE_IDLE_GRACE_SECONDS}s without writing one. The "
                 "user may have been typing when the instruction arrived. Nothing was "
                 "destroyed.")
+            write_outcome(sid, "aborted", "no_fresh_handoff_idle")
             return 1
         time.sleep(1)
     if not wrote:
         log(f"sid={sid} NOT CLEARING: no fresh handoff at {target} within the "
             f"{WRITE_WAIT_CAP_SECONDS}s ceiling; the session was still working. Nothing "
             "was destroyed.")
+        write_outcome(sid, "aborted", "write_wait_ceiling")
         return 1
 
     # OUT OF THE TURN BEFORE THE CLEAR. The loop above breaks the moment the file
@@ -635,6 +700,11 @@ def main(argv: list[str]) -> int:
             "into a live turn is queued as ordinary text instead of being run, so it would "
             "be spent for nothing. Nothing was destroyed; the handoff is on disk and the "
             "marker is kept.")
+        # The dominant abort shape (7 of ~21 in the corpus, 2026-08-16..09-04).
+        # The trigger's re-arm answers it with a FRESH handoff on a later Stop —
+        # a turn boundary — which is why CLEAR_IDLE_WAIT_SECONDS stays at 120s
+        # instead of stretching over a handoff that only goes staler.
+        write_outcome(sid, "aborted", "mid_turn_timeout")
         return 1
     time.sleep(TURN_SETTLE_SECONDS)
 
@@ -650,6 +720,7 @@ def main(argv: list[str]) -> int:
     err = send_text(socket, wid, spid, "/clear", submit=True)
     if err:
         log(f"sid={sid} NOT CLEARING: {err}. The handoff is written at {target}.")
+        write_outcome(sid, "aborted", "clear_send_failed")
         return 1
     cleared = False
     deadline = time.time() + CLEAR_CONFIRM_SECONDS
@@ -666,12 +737,17 @@ def main(argv: list[str]) -> int:
             "command instead of running it. Leaving the request marker in place and sending "
             f"no pickup, so nothing acts on a session that still has its old context. The "
             f"handoff is written at {target}.")
+        write_outcome(sid, "aborted", "clear_not_confirmed")
         return 1
     time.sleep(CLEAR_SETTLE_SECONDS)
     err = send_text(socket, wid, spid, pickup_message(str(target), instructions), submit=True)
     if err:
         log(f"sid={sid} HALF-DONE: cleared window {wid} but the pickup did not send "
             f"({err}). The session is cleared and idle; the handoff is at {target}.")
+        # `aborted` even though the clear landed: the reset did not deliver a
+        # resume, so it did not succeed. The re-arm channel cannot loop on it —
+        # the clear started a NEW session id, and this sid emits no more Stops.
+        write_outcome(sid, "aborted", "pickup_send_failed")
         return 1
 
     # Consume the marker: the in-place reset IS the resume, so the fork path must
@@ -686,6 +762,7 @@ def main(argv: list[str]) -> int:
 
     log(f"sid={sid} in-place reset OK: window={wid} pid={spid} cwd={cwd} handoff={target} "
         f"instructions={'yes' if instructions else 'no'}")
+    write_outcome(sid, "ok", "reset_complete")
     return 0
 
 
@@ -694,4 +771,14 @@ if __name__ == "__main__":
         sys.exit(main(sys.argv[1:]))
     except Exception as e:
         log(f"in-place reset crashed: {e}")
+        # A crash is a terminal path too; without a record the trigger reads it
+        # as "reset still running" forever. The sid comes from argv because the
+        # crash may predate main()'s parse — validated, since it is about to
+        # become a path component (same rule main() applies).
+        crash_sid = ""
+        for _i, _a in enumerate(sys.argv[1:-1]):
+            if _a == "--sid":
+                crash_sid = sys.argv[1:][_i + 1]
+        if SID_RE.match(crash_sid):
+            write_outcome(crash_sid, "aborted", "crash")
         sys.exit(1)
