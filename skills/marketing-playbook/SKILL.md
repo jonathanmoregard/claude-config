@@ -69,4 +69,4 @@ One-off posts/campaigns in an already-established voice → use brand-voice / co
   `mcp__research-agent__research` (WebFetch may be denied — route via
   research-agent regardless); don't run from memory.
 - Worked end-to-end example (rant → locked brand + design spec):
-  `~/Repos/kablong/docs/brand/klaffat-brand-workbook.md`
+  `~/Repos/klaffat/docs/brand/klaffat-brand-workbook.md`

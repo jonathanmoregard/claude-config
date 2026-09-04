@@ -360,7 +360,7 @@ this list.
     uv run --with "playwright==${VV_PLAYWRIGHT_PIN:-1.60.0}" \
       --script ~/.claude/skills/visual-verify/bin/screenshot \
       "http://localhost:3737/dev/components/<slug>" \
-      --ready main --dev-auth-token "$KABLONG_DEV_AUTH_TOKEN" \
+      --ready main --dev-auth-token "$KLAFFAT_DEV_AUTH_TOKEN" \
       --out /tmp/<run-id>/<slug>
   ```
 

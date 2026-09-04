@@ -1,21 +1,22 @@
 ---
-name: kablong-components
+name: klaffat-components
 description: >
-  Reusable UI partials + tokens for the kablong / Klaffat web app. Use when
-  working in the kablong repo on templates, tokens, or component partials —
-  authoring or editing a radio group, button, dialog, form field, or empty
-  state; when a template lint warning points at a raw <input type="radio">,
-  <button>, or <dialog>; or when writing/adjusting CSS custom properties in
-  tokens.css. Also applies for destructive-POST dialogs and any migration
-  from an inline control to a component include. Files live under
-  crates/kablong-web/templates/_components/ and crates/kablong-web/static/
-  tokens.css (typical paths: ~/Repos/kablong, ~/worktrees/kablong-*).
+  Reusable UI partials + tokens for the Klaffat web app (formerly
+  kablong-components). Use when working in the klaffat repo on templates,
+  tokens, or component partials — authoring or editing a radio group, button,
+  dialog, form field, or empty state; when a template lint warning points at
+  a raw <input type="radio">, <button>, or <dialog>; or when writing/adjusting
+  CSS custom properties in tokens.css. Also applies for destructive-POST
+  dialogs and any migration from an inline control to a component include.
+  Files live under crates/klaffat-web/templates/_components/ and
+  crates/klaffat-web/static/tokens.css (typical paths: ~/Repos/klaffat,
+  ~/worktrees/klaffat-*).
 ---
 
-# kablong-components — the design-system partial library
+# klaffat-components — the design-system partial library
 
-The askama partials under `crates/kablong-web/templates/_components/` plus
-the token file at `crates/kablong-web/static/tokens.css`. One place per
+The askama partials under `crates/klaffat-web/templates/_components/` plus
+the token file at `crates/klaffat-web/static/tokens.css`. One place per
 component; ARIA rules and subtle details cited in the per-component SOTA
 review: `docs/reviews/component-sota-2026-07-31.md` (read that first for the
 "why" — this file is the "when + how").
@@ -43,7 +44,7 @@ distinction, not a filesystem one.
 ## Discover the partials from a fresh session
 
 ```
-ls crates/kablong-web/templates/_components/
+ls crates/klaffat-web/templates/_components/
 ```
 
 Contract for each partial lives at the top of its file in `{# ... #}`. Every
@@ -200,7 +201,7 @@ pattern.
 
 ## Tokens — one file, every scale value declared
 
-`crates/kablong-web/static/tokens.css` holds every custom property the app
+`crates/klaffat-web/static/tokens.css` holds every custom property the app
 consumes. Imported at the top of `styles.css` so downstream rules resolve
 `var(--…)`.
 
@@ -229,7 +230,7 @@ these in review, don't ship them:
 
 ## The soft-warning lint
 
-`crates/kablong-web/tests/template_lint.rs` has two checks:
+`crates/klaffat-web/tests/template_lint.rs` has two checks:
 
 - **hard fail** — `no_fixed_choice_select_ships_in_a_template`: a `<select>`
   with ≤3 static `<option>`s blocks the suite. Fix by converting to
@@ -284,5 +285,5 @@ so the field gets ESCAPED rendering instead.
   component ARIA APG rules + which established design systems each subtle
   detail is copied from).
 - **Design spec §4.12** — component library index.
-- **The tokens** — `crates/kablong-web/static/tokens.css`.
-- **The lint** — `crates/kablong-web/tests/template_lint.rs`.
+- **The tokens** — `crates/klaffat-web/static/tokens.css`.
+- **The lint** — `crates/klaffat-web/tests/template_lint.rs`.

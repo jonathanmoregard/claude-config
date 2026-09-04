@@ -188,7 +188,7 @@
   const headingFor = (name) => '## ' + name;
 
   async function load() {
-    // Prefer inline manifest injected by server (kablong /dev/pgr/) →
+    // Prefer inline manifest injected by server (klaffat /dev/pgr/) →
     // same-origin single-server mode; no cross-origin iframe.
     const inline = document.getElementById('pgr-manifest');
     if (inline && inline.textContent) {
@@ -262,7 +262,7 @@
         armBridgeWatchdog();
         return;
       }
-      showDiag('<strong>iframe silent after ' + (retryCount + 1) + ' attempts</strong> — kablong dev server may be down on :3737, or a browser extension is blocking. Open DevTools Console (F12).');
+      showDiag('<strong>iframe silent after ' + (retryCount + 1) + ' attempts</strong> — klaffat dev server may be down on :3737, or a browser extension is blocking. Open DevTools Console (F12).');
     }, 4000);
   }
 
