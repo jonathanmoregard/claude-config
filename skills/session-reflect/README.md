@@ -189,11 +189,32 @@ is documented inside `settings-patch.json` under `_comment`.
 | `_REFLECT_INTERNAL` | (internal) | Sentinel set by the parent dispatcher to gate the `--worker` re-entry path. Do not set manually. |
 
 Every size and threshold above is an **input**, not a tuned constant: each has its
-default derived in a comment beside where it is defined, each is clamped back to
-that default with a stderr line if set to something that is not a positive
-integer, and when the oversize pre-check fires it records both the measurement
-and the threshold in the manifest — so the ratio stays a reported outcome that
-can be re-derived from the corpus.
+default derived in a comment beside where it is defined, and when the oversize
+pre-check fires it records both the measurement and the threshold in the
+manifest — so the ratio stays a reported outcome that can be re-derived from the
+corpus.
+
+Two different validators guard these, and they are not interchangeable:
+
+* **`reflect_clamp_positive_int`** — a value that is not a positive integer is
+  reset to the shipped default with a line on stderr, and a valid one is
+  normalized to base 10 (so `08` becomes `8` rather than blowing up the first
+  `(( ))` that reads it as octal). Applied to:
+  `REFLECT_STALE_STARTED_SECONDS`, `REFLECT_REAP_MAX_PER_RUN`,
+  `REFLECT_RESUME_MODEL_WINDOW_TOKENS`, `REFLECT_TRANSCRIPT_BYTES_PER_TOKEN`,
+  `REFLECT_RESUME_MAX_TRANSCRIPT_BYTES`, `REFLECT_AGENT_TRANSCRIPT_CAP_BYTES`,
+  `REFLECT_FALLBACK_TAIL_CAP_BYTES`, `REFLECT_HANDOFF_CAP_BYTES`,
+  `REFLECT_EXCERPT_BYTES`, `REFLECT_HANDOFF_MAX_AGE_SECONDS` and
+  `REFLECT_MISSION_RETENTION_DAYS`.
+* **the budgets** (`REFLECT_BUDGET_*`) are validated separately, by
+  `reflect_enforce_sync_budget_cap` — a different rule for a different reason
+  (the hard 60 s hook cap, see [Budgets vs the hook cap](#budgets-vs-the-hook-cap)),
+  and detached budgets are deliberately not clamped.
+
+Not covered by either: `REFLECT_KILL_GRACE_SECONDS` and
+`REFLECT_BUDGET_RESERVE_SECONDS`, which feed the hook-cap arithmetic directly.
+Set them to something that is not a positive integer and you get a shell
+arithmetic error, not a reset — so set them as integers or leave them alone.
 
 ## Behaviour by hook
 
@@ -393,10 +414,15 @@ same reason, as the orphan reaper.
 
 ### Mission handoff layout — the authoritative copy is out of every repo
 
+Two different roots are in play, and the split is deliberate: the handoff and its
+sidecar live under **`$CLAUDE_SESSIONS_DIR`** (default
+`~/.local/state/claude-self-compact`), the reflection artifacts under
+`$REFLECT_ROOT`.
+
 ```
-$REFLECT_ROOT/sessions/<sid>/handoff/mission.md  AUTHORITATIVE handoff (outside
-                                                 every repo, alone in its dir)
-$REFLECT_ROOT/sessions/<sid>/mission.cwd   which project that handoff is for
+$CLAUDE_SESSIONS_DIR/<sid>/handoff/mission.md  AUTHORITATIVE handoff (outside
+                                               every repo, alone in its dir)
+$CLAUDE_SESSIONS_DIR/<sid>/cwd             which project that handoff is for
 $REFLECT_ROOT/sessions/<sid>/manifest.json what the caller reads to decide the
                                            write succeeded
 tasks/mission.<sid>.md                     human-readable COPY; no automation reads it
@@ -427,10 +453,10 @@ launches it with, and only with:
 | `--` before the prompt | **mandatory.** `--add-dir` is variadic, so `--add-dir D "$prompt"` consumes the prompt as a second directory and claude exits `Input must be provided either through stdin or as a prompt argument` — the fork was dead on arrival, and a stub that ignores argv cannot see it |
 
 **Afterwards the fork can** read/write inside its project cwd and inside
-`sessions/<sid>/handoff/`. **It cannot** read anything else on disk, run a shell
+`$CLAUDE_SESSIONS_DIR/<sid>/handoff/`. **It cannot** read anything else on disk, run a shell
 command by any route, reach the network or any MCP server, reach its own settings
 file or the fork ledger (both under `$IDLE_HANDOFF_STATE_DIR`, outside the workspace
-and the grant), or touch `mission.cwd` / `manifest.json` / `final.json` /
+and the grant), or touch the `cwd` sidecar / `manifest.json` / `final.json` /
 `checkpoints/`.
 
 Both gates **fail closed**: if `claude --help` does not advertise every required flag,
@@ -450,17 +476,17 @@ newest-handoff-per-cwd.
 
 Everything in a granted directory is fork-writable, by that same process.
 
-While the handoff was `sessions/<sid>/mission.md`, the grant was the whole session
-directory — including `mission.cwd`, which is the project→handoff mapping
+While the handoff was `<sid>/mission.md`, the grant was the whole session
+directory — including the `cwd` sidecar, which is the project→handoff mapping
 *resolution reads*. An injected fork could rewrite it to name a **different**
 project; its own sanctioned write-back then made that handoff the newest one for
 the new target, and the next timer tick resolved it there and executed the injected
 `## Next` in someone else's checkout with edits auto-accepted. `manifest.json`,
 `final.json` and `checkpoints/` were in reach too.
 
-The rule that replaces that: **`sessions/<sid>/handoff/` holds the handoff body and
+The rule that replaces that: **`$CLAUDE_SESSIONS_DIR/<sid>/handoff/` holds the handoff body and
 nothing else, ever; everything any decision reads lives one level up in
-`sessions/<sid>/`.** Adding a second file to the leaf hands it to the fork. The
+`$CLAUDE_SESSIONS_DIR/<sid>/`.** Adding a second file to the leaf hands it to the fork. The
 grant is derived as `dirname` of the resolved handoff so producer and consumer
 cannot drift, and the value that actually lands on the fork's command line is
 asserted in `tests/smoke.sh` (TEST 24 on the argv, TEST 36 on the layout and the
@@ -469,9 +495,9 @@ resolver).
 What the fork can still do inside the grant, and why each is harmless: rewrite its
 own `mission.md` (that is the sanctioned write-back); delete it (nothing resolves →
 no fork, fail closed); create extra files or nested directories (nothing reads
-them, and the candidate search is depth-pinned to `sessions/<sid>/handoff/mission.md`
-so a nested `handoff/mission.md` is not a candidate). It cannot reach
-`mission.cwd`, `manifest.json`, `final.json` or `checkpoints/`, so it cannot change
+them, and the candidate search is depth-pinned to `<sid>/handoff/mission.md`
+so a nested `handoff/mission.md` is not a candidate). It cannot reach the
+`cwd` sidecar, `manifest.json`, `final.json` or `checkpoints/`, so it cannot change
 which project any handoff belongs to, including its own.
 
 #### Why the handoff left the repo
@@ -489,10 +515,10 @@ were each bypassed:
 3. an HMAC over the body would have been guard #3 on the same class.
 
 USER DECISION 2026-08-15: stop asking repo content to be trustworthy. The
-authoritative handoff moved to `$REFLECT_ROOT/sessions/<sid>/handoff/mission.md` — outside
+authoritative handoff moved to `$CLAUDE_SESSIONS_DIR/<sid>/handoff/mission.md` — outside
 every checkout, not git-tracked, not writable by repo content. **The unattended
 fork reads only that file.** `reflect.sh --mission-path <project-dir>` returns it
-and never looks inside the project; the `mission.cwd` sidecar (also out of repo)
+and never looks inside the project; the `cwd` sidecar (also out of repo)
 is what maps a project to its handoff, so even the *lookup* consults no repo
 content.
 

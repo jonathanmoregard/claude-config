@@ -851,7 +851,12 @@ reflect_artifact_gc() {
 # USER DECISION 2026-08-15: stop trying to make repo content trustworthy. Move the
 # authoritative handoff out of every repo.
 #
-#   $REFLECT_ROOT/sessions/<sid>/handoff/mission.md
+#   NOTE THE ROOT: the handoff and its sidecar live under $CLAUDE_SESSIONS_DIR
+#   (default ~/.local/state/claude-self-compact), NOT under $REFLECT_ROOT. The
+#   reflection artifacts (manifest.json, final.json) are the ones under
+#   $REFLECT_ROOT/sessions/<sid>/. See mission_handoff_path / mission_handoff_cwd_path.
+#
+#   $CLAUDE_SESSIONS_DIR/<sid>/handoff/mission.md
 #                                             AUTHORITATIVE. Outside every repo,
 #                                             not git-tracked, not reachable by
 #                                             repo content. The unattended fork
@@ -859,7 +864,7 @@ reflect_artifact_gc() {
 #                                             write access to this directory and
 #                                             nothing else, which is why the
 #                                             directory holds nothing else.
-#   $REFLECT_ROOT/sessions/<sid>/mission.cwd  which project this handoff is for.
+#   $CLAUDE_SESSIONS_DIR/<sid>/cwd            which project this handoff is for.
 #                                             Outside the repo AND outside the
 #                                             fork's write grant, so the
 #                                             cwd -> handoff lookup consults
@@ -989,15 +994,22 @@ mission_has_our_legacy_stamp() {
 # else's checkout with edits auto-accepted. The out-of-repo move closed the class
 # where repo content decides what a fork runs; the write grant re-opened it.
 #
-#   sessions/<sid>/handoff/mission.md    FORK-WRITABLE, and the ONLY thing in there
-#   sessions/<sid>/mission.cwd           OUTSIDE the grant: an INPUT to resolution
-#   sessions/<sid>/manifest.json         OUTSIDE: "did the write succeed" is read
-#                                        from it, by the process that decides to fork
-#   sessions/<sid>/final.json            OUTSIDE: the reflection tree
-#   sessions/<sid>/checkpoints/          OUTSIDE: ditto
+# CURRENT LAYOUT — note that TWO roots are involved. The handoff and the sidecar
+# resolution reads are under $CLAUDE_SESSIONS_DIR; the reflection artifacts are
+# under $REFLECT_ROOT. Only the first line is inside the fork's write grant:
 #
-# RULE for anyone adding a file under a session: it goes in `sessions/<sid>/`.
-# `sessions/<sid>/handoff/` holds the handoff body and nothing else, ever. Adding a
+#   $CLAUDE_SESSIONS_DIR/<sid>/handoff/mission.md
+#                                        FORK-WRITABLE, and the ONLY thing in there
+#   $CLAUDE_SESSIONS_DIR/<sid>/cwd       OUTSIDE the grant: an INPUT to resolution
+#   $REFLECT_ROOT/sessions/<sid>/manifest.json
+#                                        OUTSIDE: "did the write succeed" is read
+#                                        from it, by the process that decides to fork
+#   $REFLECT_ROOT/sessions/<sid>/final.json      OUTSIDE: the reflection tree
+#   $REFLECT_ROOT/sessions/<sid>/checkpoints/    OUTSIDE: ditto
+#
+# RULE for anyone adding a file under a session: it goes in the session dir, one
+# level UP from the grant.
+# `$CLAUDE_SESSIONS_DIR/<sid>/handoff/` holds the handoff body and nothing else, ever. Adding a
 # second file there hands it to the fork; adding one that any decision reads
 # re-opens this exact hole. tests/smoke.sh TEST 36 asserts the grant's contents,
 # and TEST 24 asserts the grant that is actually passed on the fork's command line.
@@ -1013,19 +1025,19 @@ mission_handoff_cwd_path() { printf '%s' "$CLAUDE_SESSIONS_DIR/${1:-}/cwd"; }
 # (both ends read it from the same place: mission mode records the payload cwd,
 # idle-handoff.sh extracts `.cwd` from the transcript). Compared literally.
 #
-# Newest-by-mtime among $REFLECT_ROOT/sessions/<sid>/handoff/mission.md whose
-# mission.cwd — one level UP, outside the fork's write grant — names this project.
+# Newest-by-mtime among $CLAUDE_SESSIONS_DIR/<sid>/handoff/mission.md whose
+# `cwd` file — one level UP, outside the fork's write grant — names this project.
 # EVERY input to that decision is outside every repo AND outside anything the
-# unattended fork can write: the candidate set comes from $REFLECT_ROOT, and the cwd
+# unattended fork can write: the candidate set comes from $CLAUDE_SESSIONS_DIR, and the cwd
 # association comes from a file only the hook process writes. Repo content cannot
 # add a candidate, rename one, or change which project one claims (which is why a
 # planted repo copy is a non-event rather than a case to catch), and neither can the
 # fork whose own handoff is one of the candidates.
 #
-# Depth is pinned to exactly sessions/<sid>/handoff/mission.md, and the middle
-# component must literally be `handoff`. Both halves matter: the fork CAN create
-# nested directories inside its grant, so an unpinned search would let it mint
-# `handoff/handoff/mission.md` with a planted `handoff/mission.cwd` as that
+# Depth is pinned to exactly <sid>/handoff/mission.md under $CLAUDE_SESSIONS_DIR,
+# and the middle component must literally be `handoff`. Both halves matter: the
+# fork CAN create nested directories inside its grant, so an unpinned search would
+# let it mint `handoff/handoff/mission.md` with a planted `handoff/cwd` as that
 # candidate's sidecar. Subagent artifacts nest under
 # sessions/<parent>/subagents/<sid>/ and mission mode never writes there.
 #
@@ -1300,6 +1312,10 @@ reflect_transcript_extract() {
   if [[ -f "$path" && -r "$path" ]] && [[ "$cap" =~ ^[0-9]+$ ]] && (( cap > 0 )); then
     size="$(reflect_file_size "$path")"
     raw_cap=$(( cap * 4 ))
+    # `raw_slice` is the window BEFORE the broken edge line is dropped, kept
+    # because the drop can empty the window outright — see the raw-excerpt
+    # degradation below. Sliced from the in-memory copy rather than re-reading
+    # the file, so this is still one read of a possibly-multi-megabyte transcript.
     if (( size > raw_cap )); then
       if [[ "$side" == "head" ]]; then
         raw_slice="$(head -c "$raw_cap" -- "$path" 2>/dev/null || true)"
@@ -1315,22 +1331,6 @@ reflect_transcript_extract() {
     if [[ -n "$sliced" ]]; then
       out="$(printf '%s\n' "$sliced" | reflect_jsonl_to_text || true)"
     fi
-    # `raw_slice` is the window BEFORE the broken edge line is dropped, kept
-    # because the drop can empty the window outright — see the raw-excerpt
-    # degradation below. Sliced from the in-memory copy rather than re-reading
-    # the file, so this is still one read of a possibly-multi-megabyte transcript.
-    if (( ${#out} > cap )); then
-      if [[ "$side" == "head" ]]; then
-        out="${out:0:$cap}"$'\n'"[Note: extract truncated at $cap characters; the rest of the run is not shown.]"
-      else
-        out="[Note: showing only the NEWEST $cap characters of this transcript; earlier turns are elided.]"$'\n'"${out: -$cap}"
-      fi
-    fi
-  fi
-  printf '%s' "$out"
-}
-
-# reflect_handoff_block <sid> — the self-compact handoff for this session, when
     # THE SLICE CAN HOLD NO COMPLETE JSONL LINE. Both slice paths drop the edge
     # line they cut in half — and when a single line is itself bigger than
     # cap x4 (one 200 KB tool_result, one pasted file), that edge line is the
@@ -1369,6 +1369,18 @@ reflect_transcript_extract() {
       printf '%s' "$out"
       return 0
     fi
+    if (( ${#out} > cap )); then
+      if [[ "$side" == "head" ]]; then
+        out="${out:0:$cap}"$'\n'"[Note: extract truncated at $cap characters; the rest of the run is not shown.]"
+      else
+        out="[Note: showing only the NEWEST $cap characters of this transcript; earlier turns are elided.]"$'\n'"${out: -$cap}"
+      fi
+    fi
+  fi
+  printf '%s' "$out"
+}
+
+# reflect_handoff_block <sid> — the self-compact handoff for this session, when
 # there is one and it is fresh, capped. Empty string otherwise.
 #
 # OPTIONAL BY CONSTRUCTION. The fallback exists because a session was too big to

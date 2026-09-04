@@ -215,7 +215,7 @@ fi
 
 # --- Mission resolution ------------------------------------------------------
 # `reflect.sh --mission-path <project_cwd>` prints the AUTHORITATIVE mission
-# handoff for that project: $REFLECT_ROOT/sessions/<sid>/handoff/mission.md, OUTSIDE
+# handoff for that project: $CLAUDE_SESSIONS_DIR/<sid>/handoff/mission.md, OUTSIDE
 # every repo. Exit 1 when there is none. Read-only: it never repairs, so a reader
 # cannot be surprised by a resolution that also mutated something.
 #
@@ -229,7 +229,7 @@ fi
 # caller ever does, it must be a separate, clearly-named flag, never this one.
 #
 # ARGUMENT UNIT: the PROJECT ROOT, exactly as it appeared in the hook payload's
-# `cwd` field. Matched literally against the mission.cwd sidecar mission mode
+# `cwd` field. Matched literally against the `cwd` sidecar mission mode
 # wrote; a mismatch fails closed, with the candidate count on stderr so it is
 # diagnosable.
 if [[ "$ARG1" == "--mission-path" ]]; then
@@ -1161,7 +1161,7 @@ run_worker() {
   fi
 
   # --- Mission mode: raw markdown out, skip the reflection-JSON pipeline ---
-  # The AUTHORITATIVE handoff is $REFLECT_ROOT/sessions/<sid>/handoff/mission.md —
+  # The AUTHORITATIVE handoff is $CLAUDE_SESSIONS_DIR/<sid>/handoff/mission.md —
   # outside every repo, so no repo content can plant, forge or tamper with what a
   # later unattended fork executes. See "MISSION HANDOFF" in lib.sh for why three
   # earlier attempts to make a repo-resident file trustworthy all failed.
