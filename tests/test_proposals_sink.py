@@ -64,6 +64,7 @@ RSI_CONFIG_PATH = os.path.join(
 RSI_PROMPT_PATH = os.path.join(
     REPO_ROOT, "recursive-self-improvement", "config", "prompt.md")
 PUSH_SCRIPT = os.path.join(REPO_ROOT, "push-proposals.sh")
+PUSHER_PATH = os.path.join(REPO_ROOT, "scripts", "claude-proposals-push.sh")
 CUTOVER_SCRIPT = os.path.join(REPO_ROOT, "scripts", "cutover-proposals.sh")
 ON_DECISION = os.path.join(REPO_ROOT, "permission-ledger", "on-decision")
 RUN_EVALUATE = os.path.join(REPO_ROOT, "permission-ledger", "run-evaluate.sh")
@@ -120,9 +121,15 @@ class FixtureHome:
                                  "claude-proposals")
         self.backup = os.path.join(self.home, ".local", "state",
                                    "claude-proposals-backup")
+        # The sink's throwaway origin, and an empty directory that stands in
+        # for this machine's global git hooks. Both live OUTSIDE $HOME so no
+        # tree-cleanliness assertion has to know about them.
+        self.sink_origin = os.path.join(root, "sink-origin.git")
+        self.nohooks = os.path.join(root, "nohooks")
 
     # -- construction ----------------------------------------------------
     def build(self, legacy_dirs=True, rsi_config=True):
+        os.makedirs(self.nohooks, exist_ok=True)
         for d in (self.claude,
                   os.path.join(self.claude, "scripts"),
                   os.path.join(self.claude, "logs"),
@@ -150,6 +157,12 @@ class FixtureHome:
 
         shutil.copy2(GATE_PATH, os.path.join(self.claude, "scripts",
                                              "proposal-intake-gate.py"))
+        # push-proposals.sh delegates its push here, so the fixture has to
+        # carry it or every push test measures a missing file rather than the
+        # behaviour it names.
+        pusher = os.path.join(self.claude, "scripts", "claude-proposals-push.sh")
+        shutil.copy2(PUSHER_PATH, pusher)
+        os.chmod(pusher, 0o755)
         # The repo's REAL ignore rules, so "the live checkout stays clean
         # after the cutover" is tested against what actually ships.
         shutil.copy2(os.path.join(REPO_ROOT, ".gitignore"),
@@ -170,14 +183,36 @@ class FixtureHome:
 
         self.init_git(self.sink)
         self.init_git(self.claude)
+        self.give_sink_a_remote()
         return self
 
     def init_git(self, path):
         env = dict(os.environ, **GIT_IDENTITY)
         git("init", "-q", "-b", "main", cwd=path, env=env)
+        # Neutralise this machine's GLOBAL hooks (core.hooksPath in
+        # nixos-config home/jonathan.nix runs gitleaks on every commit). The
+        # fixture must measure the scripts, not the host's ambient config, and
+        # a per-commit scan makes the suite crawl.
+        git("config", "core.hooksPath", self.nohooks, cwd=path, env=env)
         git("add", "-A", cwd=path, env=env)
         git("commit", "-q", "-m", "fixture", "--allow-empty", cwd=path,
             env=env)
+
+    def give_sink_a_remote(self):
+        """A throwaway bare origin for the sink.
+
+        The sink acquired a private GitHub remote on 2026-09-03, and
+        push-proposals.sh now delegates its push to
+        scripts/claude-proposals-push.sh. A remote-less fixture would therefore
+        exercise only the refusal path and never the push itself — and would
+        keep asserting a "no remote is fine" contract that stopped being true
+        the day the sink got one.
+        """
+        env = dict(os.environ, **GIT_IDENTITY)
+        git("init", "-q", "--bare", "-b", "main", self.sink_origin,
+            cwd=self.root, env=env)
+        git("remote", "add", "origin", self.sink_origin, cwd=self.sink, env=env)
+        git("push", "-q", "-u", "origin", "main", cwd=self.sink, env=env)
 
     # -- content helpers -------------------------------------------------
     def write_gate_config(self, on_decision=None):
@@ -738,17 +773,84 @@ class TestPushProposals(FixtureCase):
         self.assertEqual(git("status", "--porcelain", cwd=self.fx.claude,
                              env=self.fx.env()).strip(), "")
 
-    def test_missing_remote_is_a_notice_not_a_failure(self):
+    def test_the_commit_reaches_the_remote(self):
+        """Committing locally is half the job; the sink exists off-machine too.
+
+        push-proposals.sh no longer pushes itself — it delegates to
+        scripts/claude-proposals-push.sh so there is exactly one pusher and
+        therefore exactly one mandatory gitleaks gate. This asserts the
+        delegation actually happens end to end, at the only place it is
+        falsifiable: the origin's tip.
+        """
         self.fx.build()
         self.run_script(CUTOVER_SCRIPT, expect=0)
+        self.fx.write_proposal("rsi", "2026-08-30-new.md",
+                               "---\nstatus: implemented\n---\n\nfresh\n")
+
+        proc = self.run_script(PUSH_SCRIPT, expect=0)
+
+        local = git("rev-parse", "HEAD", cwd=self.fx.sink,
+                    env=self.fx.env()).strip()
+        remote = git("--git-dir", self.fx.sink_origin, "rev-parse", "main",
+                     cwd=self.fx.root, env=self.fx.env()).strip()
+        self.assertEqual(local, remote,
+                         "the sink's commit did not reach its remote\n%s\n%s"
+                         % (proc.stdout, proc.stderr))
+
+    def test_unpushed_commits_are_pushed_even_with_nothing_new_to_commit(self):
+        """The blind spot the delegation closes.
+
+        This script used to RETURN on "no proposal changes to commit" and never
+        reach a push, so a commit made by hand — or by a run whose push failed
+        — sat unpushed indefinitely. "Is the sink backed up?" is not the same
+        question as "did this run produce a proposal?".
+        """
+        self.fx.build()
+        self.run_script(CUTOVER_SCRIPT, expect=0)
+        self.fx.write_proposal("rsi", "2026-08-30-byhand.md",
+                               "---\nstatus: implemented\n---\n\nx\n")
+        env = self.fx.env()
+        git("add", "-A", cwd=self.fx.sink, env=env)
+        git("commit", "-q", "-m", "committed by hand", cwd=self.fx.sink, env=env)
+        local = git("rev-parse", "HEAD", cwd=self.fx.sink, env=env).strip()
+
+        proc = self.run_script(PUSH_SCRIPT, expect=0)
+
+        remote = git("--git-dir", self.fx.sink_origin, "rev-parse", "main",
+                     cwd=self.fx.root, env=env).strip()
+        self.assertEqual(local, remote,
+                         "a clean tree with unpushed commits must still be "
+                         "pushed\n%s\n%s" % (proc.stdout, proc.stderr))
+
+    def test_missing_remote_is_a_hard_failure(self):
+        """Inverted on 2026-09-03, deliberately.
+
+        This used to assert "a sink with no remote is a plain notice, not a
+        failure", on the reasoning that having no remote was the expected
+        steady state and creating one was a decision nobody had made. That
+        decision has now been made: the sink has a private GitHub origin and a
+        timer that keeps it pushed. A sink with no remote is therefore not a
+        steady state any more, it is a sink whose contents exist on one disk —
+        which is precisely the failure the push path exists to end, and it has
+        to be loud.
+        """
+        self.fx.build()
+        self.run_script(CUTOVER_SCRIPT, expect=0)
+        git("remote", "remove", "origin", cwd=self.fx.sink, env=self.fx.env())
         self.fx.write_proposal("rsi", "2026-08-30-noremote.md",
                                "---\nstatus: implemented\n---\n\nx\n")
-        proc = self.run_script(PUSH_SCRIPT, expect=0)
-        out = (proc.stdout + proc.stderr).lower()
-        self.assertIn("no", out)
-        self.assertIn("remote", out,
-                      "a sink with no remote must produce a plain one-line "
-                      "notice, not a failure:\n%s%s" % (proc.stdout, proc.stderr))
+
+        proc = self.run_script(PUSH_SCRIPT)
+
+        self.assertNotEqual(proc.returncode, 0,
+                            "a sink with nowhere to push must fail loudly:\n%s%s"
+                            % (proc.stdout, proc.stderr))
+        self.assertIn("remote", (proc.stdout + proc.stderr).lower())
+        # The gating work still committed — the refusal is about the push.
+        self.assertEqual(
+            git("ls-files", "rsi/2026-08-30-noremote.md", cwd=self.fx.sink,
+                env=self.fx.env()).strip(),
+            "rsi/2026-08-30-noremote.md")
 
     def test_no_changes_is_a_clean_no_op(self):
         self.fx.build()

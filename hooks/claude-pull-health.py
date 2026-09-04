@@ -38,13 +38,15 @@ never "could not tell", or it stops carrying information.
 
 TARGETS FIND THEMSELVES
 
-The expected set is ``~/.claude`` plus every git checkout under
-``~/.claude/plugins/marketplaces/`` that the puller has been pointed at.
-Deriving it rather than listing it is the whole point: the failure being fixed
-is a checkout nobody was watching, so a hook that only watches the checkouts
-someone remembered to name reproduces it, and the next marketplace to get a
-puller is covered without editing this file. Within that set a missing status
-record is a finding, not a blank.
+The expected set is ``~/.claude`` plus every repository some sync unit has
+declared itself responsible for, read off the state root: the producers
+``mkdir -p`` their state directory at the top of every run, before they can
+fail at anything, so that directory IS the declaration of coverage — recorded
+by the producer rather than guessed at by the reader. Deriving the set rather
+than listing it is the whole point: the failure being fixed is a checkout
+nobody was watching, so a hook that only watches the ones someone remembered to
+name reproduces it. Within that set a missing status record is a finding, not a
+blank.
 
 The coverage filter is not incidental. This machine has six marketplace
 clones, five of them third-party and pinned on purpose; nothing auto-pulls
@@ -53,6 +55,22 @@ implication. Five permanent "uncovered" lines would also spend the entire
 attention budget below. A repo that WAS covered keeps its state directory, so
 it still goes stale and still speaks — losing a puller is noticed, which is the
 direction that matters.
+
+BOTH DIRECTIONS, ONE CHANNEL
+
+``scripts/claude-proposals-push.sh`` keeps the proposals sink
+(``~/.local/state/claude-proposals``) backed up to a private GitHub remote. Its
+failure has the same SHAPE as a failed pull — an unattended git operation that
+stops and tells nobody — and the opposite consequence: nothing is going stale,
+something is not being backed up. Two notification systems for one class of
+failure would be its own bug, so it writes the same record with
+``direction="push"`` and this hook reads both, wording each finding for what it
+actually costs. A record with no ``direction`` is a pull: that is what every
+record claude-pull.sh has ever written looks like.
+
+Note also that the sink lives in ``~/.local/state``, not under ``~/.claude`` —
+which is why discovery reads the state root rather than walking the config
+tree.
 
 FAIL-OPEN ON ITS OWN ERRORS, EXCEPT THE ONE THAT MATTERS
 
@@ -91,6 +109,19 @@ OK = "ok"
 ALERT = "alert"
 UNVERIFIED = "unverified"
 
+# Which way the repo is meant to move. Absent means PULL — every record
+# claude-pull.sh wrote before the field existed, and the field must not turn
+# those into unrecognised ones.
+PULL = "pull"
+PUSH = "push"
+
+# Journal to send the reader to, per direction. Both pullers (claude-pull,
+# claude-marketplace-pull) share one script and one unit prefix.
+JOURNAL = {
+    PULL: "journalctl --user -u claude-pull",
+    PUSH: "journalctl --user -u claude-proposals-push",
+}
+
 
 def _state_root() -> Path:
     override = os.environ.get("CLAUDE_PULL_STATE_ROOT")
@@ -118,17 +149,21 @@ def _covered(state_root: Path, repo: Path) -> bool:
 
 
 def _targets(state_root: Path) -> list[Path]:
-    """Every checkout whose freshness this machine claims to maintain.
+    """Every repository whose sync this machine claims to maintain.
 
     ``~/.claude`` is unconditional: it is the config repo, a timer has pulled
     it since 2026-04, and if that ever stops the session needs to hear so.
 
-    Marketplace clones are discovered rather than listed, because the failure
+    Everything else is discovered from the state root, because the failure
     being fixed is a checkout nobody was watching — a hook that only watches
-    the ones someone remembered to name reproduces it, and the next marketplace
-    to get a puller should be covered without editing this file.
+    the ones someone remembered to name reproduces it, and the next repo to get
+    a sync unit should be covered without editing this file. That has since
+    stopped being hypothetical twice over: the marketplace clone under
+    ``~/.claude/plugins/marketplaces/``, and the proposals sink under
+    ``~/.local/state/claude-proposals``, which a walk of the config tree could
+    never have found at all.
 
-    But discovery is filtered by coverage, and that filter is load-bearing.
+    Discovery is filtered by coverage, and that filter is load-bearing.
     Measured 2026-08-31: this machine has SIX marketplace clones, five of them
     third-party (kettleofskills, nix-search-marketplace, skills-curated,
     trailofbits, zach-source-plugins). Those are pinned on purpose — nothing
@@ -137,10 +172,10 @@ def _targets(state_root: Path) -> list[Path]:
     every session would be five permanent lines of noise, which spends exactly
     the attention budget this hook depends on having.
 
-    So: a clone is a target once the puller has been pointed at it. A repo that
-    was covered and then stopped being pulled keeps its state directory, so it
-    still goes stale and still speaks — removing a puller is noticed, which is
-    the direction that matters.
+    So: a repo is a target once a sync unit has been pointed at it, which it
+    declares by creating its state directory. A repo that was covered and then
+    stopped being synced keeps that directory, so it still goes stale and still
+    speaks — removing a puller is noticed, which is the direction that matters.
     """
     override = os.environ.get("CLAUDE_PULL_HEALTH_TARGETS")
     if override:
@@ -148,18 +183,30 @@ def _targets(state_root: Path) -> list[Path]:
 
     home = _claude_home()
     found = [home]
-    marketplaces = home / "plugins" / "marketplaces"
     try:
-        children = sorted(marketplaces.iterdir())
+        children = sorted(state_root.iterdir())
     except OSError:
         children = []
     for child in children:
-        # `.git` is a directory in a clone and a file in a linked worktree;
-        # either means "git resolves this tree", which is what makes it
-        # pullable at all.
-        if (child / ".git").exists() and _covered(state_root, child):
-            found.append(child)
+        if not child.is_dir():
+            continue
+        # The slug is the absolute path with '/' -> '%', which is what both
+        # producers write and what _covered() reads back. Anything that does
+        # not decode to an absolute path was not written by them.
+        repo = Path(child.name.replace("%", "/"))
+        if not repo.is_absolute() or repo == home or repo in found:
+            continue
+        found.append(repo)
     return found
+
+
+def _direction(doc) -> str:
+    """Which way this repo is meant to move. Absent reads as a pull."""
+    if isinstance(doc, dict):
+        value = str(doc.get("direction") or PULL).strip().lower()
+        if value in (PULL, PUSH):
+            return value
+    return PULL
 
 
 def _record(state_root: Path, repo: Path):
@@ -213,25 +260,46 @@ def _clip(text: str) -> str:
     return text
 
 
-def _verdict(state_root: Path, repo: Path) -> str | None:
-    """One line of finding for a target, or None when it is healthy."""
+def _verdict(state_root: Path, repo: Path) -> tuple[str, str] | None:
+    """(direction, one line of finding) for a target, or None when healthy.
+
+    Every branch below is worded for what the failure actually COSTS, which is
+    the opposite thing in each direction: a stalled pull serves stale code to
+    the session, a stalled push leaves finished work on one disk. Saying "the
+    checkout is not being updated" about a repo nothing reads would send the
+    reader looking for a problem that is not there.
+    """
     state, doc = _record(state_root, repo)
 
     if state is None:
-        # doc is the diagnostic string in this branch.
-        return (
+        # doc is the diagnostic string in this branch, and there is no record
+        # to read a direction out of.
+        return PULL, (
             f"{repo}: {doc} — nothing is auto-pulling it, so how far behind "
             "origin it has drifted is unknown."
         )
 
+    direction = _direction(doc)
+
     if state == ALERT:
-        return (
+        if direction == PUSH:
+            return direction, (
+                f"{repo}: auto-push is BLOCKED and its commits are not reaching "
+                f"origin. Reported cause: \"{_clip(doc.get('reason', ''))}\""
+            )
+        return direction, (
             f"{repo}: auto-pull is BLOCKED and the checkout is not being "
             f"updated. Reported cause: \"{_clip(doc.get('reason', ''))}\""
         )
 
     if state == UNVERIFIED:
-        return (
+        if direction == PUSH:
+            return direction, (
+                f"{repo}: the last auto-push tick could not reach origin, so it "
+                "is unknown whether its commits have been backed up. Reported "
+                f"cause: \"{_clip(doc.get('reason', ''))}\""
+            )
+        return direction, (
             f"{repo}: the last auto-pull tick could not reach origin, so it is "
             "unknown whether this checkout is current. Reported cause: "
             f"\"{_clip(doc.get('reason', ''))}\""
@@ -239,34 +307,67 @@ def _verdict(state_root: Path, repo: Path) -> str | None:
 
     age = _age(doc, "checked_at_epoch")
     if age is None:
-        return f"{repo}: its status record carries no readable timestamp."
+        return direction, f"{repo}: its status record carries no readable timestamp."
     if age > STALE_S:
-        return (
+        tail = (
+            "the pusher appears to have stopped running, so anything written "
+            "since exists on this disk only."
+            if direction == PUSH
+            else "the puller appears to have stopped running, so this checkout "
+            "may be behind origin."
+        )
+        return direction, (
             f"{repo}: last checked {age / 3600:.0f}h ago (threshold "
-            f"{STALE_S // 3600}h) — the puller appears to have stopped running, "
-            "so this checkout may be behind origin."
+            f"{STALE_S // 3600}h) — {tail}"
         )
 
     if state != OK:
-        return f"{repo}: its status record reports an unrecognised state {state!r}."
+        return direction, (
+            f"{repo}: its status record reports an unrecognised state {state!r}."
+        )
 
     return None
 
 
-def _announce(findings: list[str], any_blocked: bool) -> None:
-    if any_blocked:
-        headline = (
-            "CLAUDE CHECKOUT AUTO-PULL IS BLOCKED — at least one tree this "
-            "session reads from is not being updated."
-        )
+def _announce(findings: list[str], any_blocked: bool, directions: set[str]) -> None:
+    pulling = PULL in directions
+    pushing = PUSH in directions
+    if pulling and pushing:
+        subject = "CLAUDE REPO SYNC"
+        blocked_tail = "at least one repo this machine keeps in sync is stuck."
+    elif pushing:
+        subject = "CLAUDE REPO AUTO-PUSH"
+        blocked_tail = "at least one repo this machine backs up is not reaching its remote."
     else:
-        headline = "CLAUDE CHECKOUT AUTO-PULL: freshness UNVERIFIED."
+        subject = "CLAUDE CHECKOUT AUTO-PULL"
+        blocked_tail = "at least one tree this session reads from is not being updated."
+
+    if any_blocked:
+        headline = f"{subject} IS BLOCKED — {blocked_tail}"
+    else:
+        headline = f"{subject}: freshness UNVERIFIED."
 
     body = "\n".join(f"  - {f}" for f in findings)
+    # Only the consequences that apply. Telling a reader their skills may be
+    # stale when the finding is an unpushed backup sends them to the wrong
+    # place, and a consequence line nobody trusts is one nobody reads.
+    parts = []
+    if pulling:
+        parts.append(
+            "skills, hooks, commands and plugins may be served from a stale "
+            "tree, and a new worktree cut from origin/master may be based on an "
+            "old commit"
+        )
+    if pushing:
+        parts.append(
+            "work written since the last successful push exists on this disk "
+            "only, so a disk failure or a bad rm loses it"
+        )
+    journals = " · ".join(
+        JOURNAL[d] for d in (PULL, PUSH) if d in directions
+    )
     consequence = (
-        "Consequences while this holds: skills, hooks, commands and plugins may "
-        "be served from a stale tree, and a new worktree cut from origin/master "
-        "may be based on an old commit. Journal: journalctl --user -u claude-pull"
+        f"Consequences while this holds: {'; '.join(parts)}. Journal: {journals}"
     )
     message = f"{headline}\n{body}\n{consequence}"
     json.dump(
@@ -278,7 +379,7 @@ def _announce(findings: list[str], any_blocked: bool) -> None:
             # follows from knowing it is stale.
             "hookSpecificOutput": {
                 "hookEventName": "SessionStart",
-                "additionalContext": "Checkout auto-pull health at session start:\n" + message,
+                "additionalContext": "Repo sync health at session start:\n" + message,
             },
         },
         sys.stdout,
@@ -297,19 +398,22 @@ def main() -> int:
 
     state_root = _state_root()
     findings: list[str] = []
+    directions: set[str] = set()
     blocked = False
     for repo in _targets(state_root):
         verdict = _verdict(state_root, repo)
         if verdict:
-            findings.append(verdict)
-            if "BLOCKED" in verdict:
+            direction, text = verdict
+            findings.append(text)
+            directions.add(direction)
+            if "BLOCKED" in text:
                 blocked = True
 
     if not findings:
         # The earned silence. Nothing printed, nothing injected.
         return 0
 
-    _announce(findings, blocked)
+    _announce(findings, blocked, directions)
     return 0
 
 
