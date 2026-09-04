@@ -109,16 +109,32 @@ if reflect_truthy "${REFLECT_SUBPROCESS:-}"; then
     precompact|sessionend|subagentstop|mission) ;;
     *) _rec_mode="nomode_invalid" ;;
   esac
-  _rec_file="$_rec_dir/$(date -u +%Y%m%dT%H%M%SZ)-${_parent_sid}-${_child_sid:-unknown}-${_rec_mode}.json"
-  # jq -n with defensive defaults; failure here still exits 0.
-  jq -n \
-    --arg status "skipped_recursion" \
-    --arg parent_sid "$_parent_sid" \
-    --arg child_sid "$_child_sid" \
-    --arg hook_event "${ARG1:-}" \
-    --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    '{status:$status, parent_sid:$parent_sid, child_sid:$child_sid, hook_event:$hook_event, seen_at:$now}' \
-    > "$_rec_file" 2>/dev/null || true
+  # G3 fix (LOW): the name used to be timestamp+identity ONLY, written with `>`.
+  # Its resolution is one second and every component is identical across the
+  # fires of a single burst, so two child hooks firing in the same second for the
+  # same (parent, child, mode) — which is the NORMAL shape here, one claude
+  # subprocess emitting several hook events as it exits — silently overwrote each
+  # other. A counter that undercounts exactly the bursts it exists to measure is
+  # worse than no counter. mktemp makes the name unique the same way the
+  # duplicates/ and malformed/ records do; the timestamp stays a PREFIX so `ls`
+  # order is still chronological. Every path component was validated above, so
+  # nothing here can carry an X-run that would steal mktemp's placeholder.
+  _rec_file="$(mktemp -p "$_rec_dir" \
+    "$(date -u +%Y%m%dT%H%M%SZ)-${_parent_sid}-${_child_sid:-unknown}-${_rec_mode}-XXXX.json" \
+    2>/dev/null || true)"
+  # jq -n with defensive defaults; failure here still exits 0. An unusable
+  # _rec_file (mktemp failed on an unwritable dir) skips the write rather than
+  # redirecting to the empty path — the marker is best-effort, the exit 0 is not.
+  if [[ -n "$_rec_file" ]]; then
+    jq -n \
+      --arg status "skipped_recursion" \
+      --arg parent_sid "$_parent_sid" \
+      --arg child_sid "$_child_sid" \
+      --arg hook_event "${ARG1:-}" \
+      --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      '{status:$status, parent_sid:$parent_sid, child_sid:$child_sid, hook_event:$hook_event, seen_at:$now}' \
+      > "$_rec_file" 2>/dev/null || true
+  fi
   exit 0
 fi
 

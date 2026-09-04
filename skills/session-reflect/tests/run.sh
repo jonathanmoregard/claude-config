@@ -749,6 +749,47 @@ fi
 [[ ! -d "$REFLECT_ROOT/sessions/unknown" ]]; assert $? "no session dir minted for a payload that named none"
 
 # ===========================================================================
+# G3 — two same-second recursion skips leave TWO markers.
+# The marker name was timestamp + (parent, child, mode) written with `>`, and
+# every one of those is identical across the fires of a single burst — which is
+# the normal shape, one claude subprocess emitting several hook events as it
+# exits. So the counter undercounted exactly the bursts it exists to measure.
+# ===========================================================================
+t_begin "G3: two recursion skips in the same second leave two markers"
+reset_logs
+REC_DIR="$REFLECT_ROOT/skipped-recursions"
+REC_SID="8ea0c109-1a2b-4c3d-9e8f-00000000000e"
+REC_BEFORE=$(find "$REC_DIR" -type f -name '*.json' 2>/dev/null | wc -l)
+# Fire both near the START of a second so the pair cannot straddle a boundary
+# and pass for the wrong reason (two seconds => two names even pre-fix). Bounded
+# so a busy machine cannot hang the suite here.
+for _ in $(seq 1 40); do
+  (( 10#$(date -u +%N) < 300000000 )) && break
+  sleep 0.05
+done
+REFLECT_SUBPROCESS=1 REFLECT_PARENT_SID="$PARENT_SID" \
+  bash "$REFLECT_SH" sessionend <<<"$(sessionend_payload "$REC_SID")"
+rc1=$?
+REFLECT_SUBPROCESS=1 REFLECT_PARENT_SID="$PARENT_SID" \
+  bash "$REFLECT_SH" sessionend <<<"$(sessionend_payload "$REC_SID")"
+rc2=$?
+assert "$(( rc1 == 0 && rc2 == 0 ? 0 : 1 ))" "both recursion-skip fires exit 0 (rc=$rc1,$rc2)"
+REC_AFTER=$(find "$REC_DIR" -type f -name '*.json' 2>/dev/null | wc -l)
+(( REC_AFTER - REC_BEFORE == 2 )); assert $? "two markers written, not one ($(( REC_AFTER - REC_BEFORE )) seen)"
+(( $(call_count) == 0 )); assert $? "the recursion break made no model call"
+[[ ! -d "$REFLECT_ROOT/sessions/$REC_SID" ]]; assert $? "the recursed child was not reflected"
+# Chronology: the timestamp must remain a PREFIX, or `ls` stops being ordered.
+REC_NAMES=$(find "$REC_DIR" -type f -name "*-${REC_SID}-sessionend-*.json" -printf '%f\n' 2>/dev/null | sort)
+(( $(printf '%s\n' "$REC_NAMES" | grep -cE '^[0-9]{8}T[0-9]{6}Z-') == 2 )); assert $? "both names still start with the UTC second stamp"
+REC_P1=$(printf '%s\n' "$REC_NAMES" | sed -n '1s/^\([0-9]\{8\}T[0-9]\{6\}Z\).*/\1/p')
+REC_P2=$(printf '%s\n' "$REC_NAMES" | sed -n '2s/^\([0-9]\{8\}T[0-9]\{6\}Z\).*/\1/p')
+if [[ -n "$REC_P1" && "$REC_P1" == "$REC_P2" ]]; then
+  ok "both markers carry the SAME second stamp — the colliding case was reproduced"
+else
+  note "the two fires straddled a second boundary ($REC_P1 vs $REC_P2); the count above is a weaker check this run"
+fi
+
+# ===========================================================================
 # T2 — syntax + lint
 # ===========================================================================
 t_begin "T2: bash -n and shellcheck"
