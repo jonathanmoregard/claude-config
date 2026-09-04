@@ -742,6 +742,7 @@ fi  # end IS_WORKER == 0 setup block
 # reflection subprocess cannot invoke Bash/Edit/WebFetch even if a prompt-injection
 # payload rides in — through the resumed transcript before, through the inlined
 # extract now. With tool use disabled we do NOT need
+# arftl-allow: permission-widened
 # `--dangerously-skip-permissions` (verified 2026-08-08 that `claude -p --tools ""
 # --output-format json` returns the JSON reply cleanly). The residual risk is
 # unchanged by inlining: the model can emit arbitrary text into the reflection
