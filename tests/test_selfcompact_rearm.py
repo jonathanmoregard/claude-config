@@ -251,3 +251,12 @@ def test_garbage_env_bounds_fall_back_to_defaults(harness, monkeypatch):
     harness.write_outcome("aborted")  # inside the default 900s spacing
     assert harness.run(360_000) == 0
     assert harness.state()["fires"] == 1
+    # fires==1 alone cannot tell the fallback from a raw -3: the cap check runs
+    # BEFORE the spacing check, so 0 >= -3 would refuse via the cap branch and
+    # leave the same fire count. The fallback (3) must leave the cap untouched
+    assert "re-arm capped" not in (harness.sessions / "trigger.log").read_text()
+    assert "rearm_capped" not in harness.state()
+    # and leave the budget spendable once the default spacing has elapsed.
+    harness.patch_state(last_fired_at=int(time.time()) - 1000)
+    assert harness.run(360_000) == 0
+    assert harness.state()["fires"] == 2
