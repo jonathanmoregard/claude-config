@@ -5,15 +5,39 @@
 # push is never forced — the recommendation just gives Claude the
 # info to decide.
 #
-# Triggered on Bash / mcp__safe-bash__exec tool calls. Filters to
-# git-push commands in-script (the matcher only screens by tool name).
+# Triggered on Bash tool calls. Filters to git-push commands in-script
+# (the matcher only screens by tool name). The matcher and this case arm
+# used to accept the safe-bash MCP's exec tool as well; that MCP is being
+# retired, so its tool name can never arrive again and keeping it would only
+# mislead the next reader into thinking there are two live shells.
+#
+# WHY THIS STILL EXISTS ALONGSIDE hooks/bash-guard.py's nixos push gate
+# -------------------------------------------------------------------
+# Both fire on PreToolUse for `git push`, and neither subsumes the other:
+#
+#   this script          hooks/bash-guard.py, layer 3
+#   -----------          ----------------------------
+#   advisory; always     hard DENY
+#   exits 0
+#   EVERY repo           only remotes matching jonathanmoregard/nixos-config
+#   asks "is the branch  asks "does the HEAD commit carry a filled
+#   behind the default   `Pre-push checklist:`, and do its claims survive a
+#   branch, so the PR    cross-check against the real diff" (written after
+#   would land needing   PR #57 and PR #61 shipped broken deploys)
+#   an Update-branch
+#   click"
+#
+# They graze each other only at `Rebased on origin/main`, and even there the
+# gate checks it solely when the checklist CLAIMS `yes`, while this script
+# nudges unconditionally — and in repos the gate never looks at. Deleting
+# either one loses coverage the other never had.
 set -euo pipefail
 
 input=$(cat)
 
 tool_name=$(jq -r '.tool_name // empty' <<<"$input")
 case "$tool_name" in
-  Bash|mcp__safe-bash__exec) ;;
+  Bash) ;;
   *) exit 0 ;;
 esac
 

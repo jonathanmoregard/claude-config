@@ -310,14 +310,30 @@ never branch on `if gate; then` alone, which reads 127 as failure-to-find and
 sends it down the same path as a real finding. A gate that fails open is not
 a gate.
 
-**The only escape is an inline waiver**, `arftl-allow: <rule-id>`, on the
-matched line or the line directly above it. Waivers live in the diff, so they
-are reviewable, greppable and attributable to a commit. There is deliberately
-no config file and no global suppression: both are the mechanism by which a
-rules layer quietly stops covering anything. A waiver an agent adds to make
-the gate pass is itself a visible diff line for Phases 1-3 to review — which is
-the correct place for that judgement, since "is this waiver justified" is
-exactly the kind of question regex must not try to answer.
+**The escape for a judged case is an inline waiver**, `arftl-allow: <rule-id>`,
+on the matched line or the line directly above it. Waivers live in the diff, so
+they are reviewable, greppable and attributable to a commit. There is
+deliberately no config file and no global suppression: both are the mechanism by
+which a rules layer quietly stops covering anything. A waiver an agent adds to
+make the gate pass is itself a visible diff line for Phases 1-3 to review —
+which is the correct place for that judgement, since "is this waiver justified"
+is exactly the kind of question regex must not try to answer.
+
+**Permission tables are exempt structurally, and are not a waiver.** A JSON
+string under `permissions.deny` or `permissions.ask` names a command in order to
+forbid or gate it, so matching it is the rule working rather than a hazard
+introduced — the same reason the gate already skips its own rule table. It
+cannot be handled as a waiver because `arftl-allow:` must sit in a comment and
+JSON has no comment syntax; the workaround is worse than the problem, since a
+`//` comment in a Claude Code settings file makes the CLI silently void the
+*whole* permissions block (measured: a deny probe flipped to allowed), so
+waiving that way would disable every deny rule in the file.
+
+The exemption is scoped by JSON path, never by filename, and the scoping is the
+security-relevant half: a string under `permissions.allow` still flags, because
+that one *auto-approves* the command it names. Anything the resolver cannot
+fetch or parse keeps its finding — it fails closed. The count is announced in
+both output modes (`data_exempt` in JSON), so it is never silent.
 
 **Two named blind spots, both deliberate, neither silent.**
 

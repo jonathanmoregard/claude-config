@@ -51,7 +51,10 @@ powerline/usage/pricing.json
 projects/
 
 # Tasks & plans (session-specific) — anchored to root so dev-container/plans/ tracks
-/tasks/
+# `/tasks` carries no trailing slash on purpose: `tasks` here is a SYMLINK into
+# ~/.local/state/claude-tasks/, and a trailing slash matches directories only, so
+# `/tasks/` left the symlink unignored and `git status` reported it as `?? tasks`.
+/tasks
 /plans/
 **/__pycache__/
 

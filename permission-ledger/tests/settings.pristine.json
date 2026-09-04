@@ -24,12 +24,11 @@
       "Edit(/home/jonathan/.claude/homunculus/**)",
       "Edit(/home/jonathan/.claude/loops/**)",
       "mcp__research-agent__*",
-      "mcp__safe-bash__*"
+      "Bash"
     ],
     "deny": [
       "WebFetch",
       "WebSearch",
-      "Bash",
       "Read(**/.git/**)",
       "Edit(**/.git/**)",
       "Edit(/home/jonathan/.claude/settings.local.json)",
@@ -244,7 +243,7 @@
         ]
       },
       {
-        "matcher": "Bash|mcp__safe-bash__exec",
+        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",

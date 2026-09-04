@@ -1,13 +1,30 @@
 #!/usr/bin/env bash
-# Offline smoke test for session-reflect. Uses a stub `claude` on PATH; no
-# live API calls, no network.
+# Smoke test for session-reflect. The session-reflect half is offline: it drives
+# a stub `claude` on PATH and touches no network.
+#
+# It also runs the bash-guard test modules (TEST 50), which it DISCOVERS rather
+# than lists, so this script is the single verifier for both. Those modules used
+# to be invoked by nothing at all — see the comment above TEST 50.
+#
+# NOT OFFLINE ANY MORE, and deliberately so. tests/test_deny_globs.py drives a
+# REAL headless `claude -p` to prove the `Bash(...)` deny globs actually deny —
+# so a run of this script spends real API calls (fast lane ~$0.10, full lane
+# ~$0.70, measured 2026-08-31) and needs working auth. That was previously an
+# opt-in behind DENY_GLOBS_LIVE=1, and the opt-in was the bug: the gate ran its
+# offline half only, reported PASS, and proved nothing about the CLI's
+# permission surface. A safety gate ships enforcing; the lane switch selects how
+# MUCH is swept, never whether anything real is checked. See TEST 50a and 50.N.
 #
 # LANES (test selection only — NOT a switch on product behaviour):
 #   fast  (default)  the regression test for every BLOCKER/HIGH fixed in this
 #                    review, plus every cheap unit-level test. Runnable inline.
 #   full             fast + the MEDIUM/LOW integration blocks, which each drive
-#                    several real `idle-handoff.sh` ticks and dominate wall time.
+#                    several real `idle-handoff.sh` ticks and dominate wall time,
+#                    and the whole-rule-set live deny-glob sweep (DENY_GLOBS_SCOPE
+#                    =full: every ported rule, every benign command, ~83 probes).
 #   Select with `SMOKE_LANE=full` or `bash tests/smoke.sh --full`.
+#   The fast lane still runs the live deny-glob CONTROLS (DENY_GLOBS_SCOPE=core,
+#   12 probes). Neither lane runs zero live probes — there is no "offline" value.
 #
 # EXIT CODES — a test failing and the suite failing to clean up after itself are
 # different events and no longer share an exit code:
@@ -20,6 +37,11 @@
 #   REFLECT_ROOT     - artifact root (default: mktemp)
 #   REFLECT_DEBUG=1  - keep temp dirs and print paths
 #   SMOKE_LANE       - fast (default) | full
+#   CLAUDE_CLI       - absolute path to the Claude Code CLI to test the deny
+#                      globs against. Default: ~/.local/bin/claude, i.e. the
+#                      binary an interactive session runs — NOT `claude` on
+#                      PATH, which under systemd resolves a different build.
+#                      See TEST 50a.
 set -u
 set -o pipefail
 
@@ -82,7 +104,10 @@ lane_skip() { TESTS_SKIPPED=$(( TESTS_SKIPPED + 1 )); echo "SKIP (lane=$SMOKE_LA
 # evidence. The exit code (1) and the TESTS: line both say "a test", never "cleanup".
 fail() {
   echo "FAIL: $*" >&2
-  echo "TESTS:    FAILED after $TESTS_RUN named test(s) (lane=$SMOKE_LANE)" >&2
+  # cli= is part of the verdict, not decoration. A run that cannot say which
+  # Claude Code build its deny-glob gate exercised is not reporting a result —
+  # see TEST 50a. `unresolved` means the failure happened before resolution.
+  echo "TESTS:    FAILED after $TESTS_RUN named test(s) (lane=$SMOKE_LANE, cli=${SMOKE_CLI_VERSION:-unresolved})" >&2
   echo "TEARDOWN: SKIPPED — temp state kept for inspection: REFLECT_ROOT=${REFLECT_ROOT:-<not created yet>} SCRATCH=${SMOKE_TMP_PARENT:-<not created yet>}" >&2
   exit 1
 }
@@ -307,7 +332,8 @@ write_stub_help
 # and is immune to the caller's exit). The harness never learned the other half:
 # something that outlives you has to be WAITED FOR. Under load the worker's stdout
 # log lands between `rm -rf`'s readdir and its rmdir, `rm` exits non-zero, `set -e`
-# (in force from TEST 15 onward) kills the script — after every assertion passed.
+# (in force from TEST 7's `set -e` onward) kills the script — after every assertion
+# passed.
 #
 # THE FIX IS NOT A QUIETER `rm`. `rm -rf … || true` or `2>/dev/null` would hide the
 # next real teardown bug, and this session already found a defect that existed
@@ -531,6 +557,15 @@ for a in "\$@"; do [[ "\$a" == "ls" ]] && { printf '[]\n'; exit 0; }; done
 exit 0
 KITTEN
 chmod +x "$STUB_SCRATCH/kitten"
+
+# The PATH this script was INVOKED with, captured before the stubs go in front of
+# it. TEST 50 runs the bash-guard test modules with this one, because
+# tests/test_deny_globs.py reads the CLI's own wildcard matcher out of the
+# compiled bundle behind `claude` on PATH. Handed the stub above — a shell script
+# with no bundle inside it — that module dies for a reason that has nothing to do
+# with the guard under test. Nothing ELSE may use this: every test of the
+# session-reflect code wants the stubbed PATH, which is the whole point of it.
+SMOKE_HOST_PATH="$PATH"
 
 export PATH="$SPAWN_SHIM_DIR:$STUB_HELP_DIR:$STUB_SCRATCH:$PATH"
 
@@ -1136,6 +1171,15 @@ info "path-traversal rejection OK (${MALF_COUNT} malformed records in $MALF_DIR,
 # ============================================================================
 # TEST 7: --worker requires _REFLECT_INTERNAL=1 sentinel
 # ============================================================================
+# ERREXIT STARTS HERE. The header sets only `-u` and `-o pipefail`; the `set -e`
+# below is the first one in the file and it is at top level, so errexit stays on
+# for everything after this point (other blocks suspend it locally with their own
+# `set +e` / `set -e` pair). Comments elsewhere used to say "from TEST 15 onward";
+# that was ~500 lines late and left TEST 13's two dispatcher calls looking safe
+# when they were not. Under errexit a BARE failing command aborts the script at
+# that command: exit 1, no `FAIL:` line, no `TESTS:` line, nothing naming the test
+# that died. Anything whose non-zero exit is a result you want reported has to be
+# in an `||` list (`cmd || rc=$?`) or an `if` condition — see TEST 50's note.
 test_begin "TEST 7: worker sentinel gating"
 set +e
 bash "$REFLECT_SH" --worker sessionend </dev/null >/dev/null 2>&1
@@ -1529,8 +1573,11 @@ RP="$(fake_payload SessionEnd "$RACE2_SID")"
 export REFLECT_STALE_STARTED_SECONDS=2
 
 # Dispatcher 1: writes started, detaches worker.
-echo "$RP" | bash "$REFLECT_SH" sessionend >/dev/null
-rc=$?
+# `|| rc=$?`: errexit has been in force since TEST 7's `set -e` (see the note
+# there), so a bare failing dispatcher killed the script AT this line and the
+# assertion below — written to report exactly this — never ran.
+rc=0
+echo "$RP" | bash "$REFLECT_SH" sessionend >/dev/null || rc=$?
 (( rc == 0 )) || fail "reaper-race dispatcher 1 exit=$rc"
 
 # Wait 3s so the reaper window expires but the worker is still 1s into its
@@ -1540,8 +1587,8 @@ sleep 3
 # Dispatcher 2: under the bug, is_already_complete returns false (stale
 # reaper) and dispatcher 2 tries to spawn its own worker. Under the fix
 # it hits the flock -n check and writes skipped_concurrent.
-echo "$RP" | bash "$REFLECT_SH" sessionend >/dev/null
-rc=$?
+rc=0
+echo "$RP" | bash "$REFLECT_SH" sessionend >/dev/null || rc=$?
 (( rc == 0 )) || fail "reaper-race dispatcher 2 exit=$rc"
 
 unset REFLECT_STALE_STARTED_SECONDS
@@ -1728,8 +1775,8 @@ chmod +x "$STUB_SCRATCH/claude"
 
 FB_SID="test-sid-setsid-fallback"
 FB_PAYLOAD="$(fake_payload SessionEnd "$FB_SID")"
-echo "$FB_PAYLOAD" | REFLECT_NO_SYSTEMD_RUN=1 bash "$REFLECT_SH" sessionend
-rc=$?
+rc=0
+echo "$FB_PAYLOAD" | REFLECT_NO_SYSTEMD_RUN=1 bash "$REFLECT_SH" sessionend || rc=$?
 (( rc == 0 )) || fail "fallback-path sessionend exit=$rc"
 
 FB_MANIFEST="$REFLECT_ROOT/sessions/$FB_SID/manifest.json"
@@ -1751,7 +1798,8 @@ info "setsid fallback completed the reflection and recorded spawn_method=setsid"
 # observed both a clean internal `status:timeout` at 61s and external SIGKILLs
 # leaving `status:started` with 0-byte logs.
 test_begin "TEST 16: D3 — budget arithmetic keeps the synchronous path under the cap"
-BUDGETS_JSON="$(bash "$REFLECT_SH" --budgets)"
+BUDGETS_JSON="$(bash "$REFLECT_SH" --budgets)" \
+  || fail "D3: reflect.sh --budgets exited non-zero, so none of the cap arithmetic below was checked"
 jq -e '.hook_cap_seconds == 60' <<<"$BUDGETS_JSON" >/dev/null \
   || fail "D3: --budgets should report the hard 60s hook cap"
 jq -e '.budgets.precompact < .hook_cap_seconds' <<<"$BUDGETS_JSON" >/dev/null \
@@ -1782,9 +1830,9 @@ HANG_SID="test-sid-hung-model"
 HANG_PAYLOAD=$(jq -cn --arg sid "$HANG_SID" --arg tp "$TRANSCRIPT" --arg cwd "$TEST_CWD" \
   '{session_id:$sid,transcript_path:$tp,hook_event_name:"PreCompact",cwd:$cwd,trigger:"auto"}')
 t0=$(date +%s%N)
+rc=0
 echo "$HANG_PAYLOAD" | REFLECT_BUDGET_PRECOMPACT=3 REFLECT_KILL_GRACE_SECONDS=2 \
-  bash "$REFLECT_SH" precompact
-rc=$?
+  bash "$REFLECT_SH" precompact || rc=$?
 t1=$(date +%s%N)
 hang_ms=$(( (t1 - t0) / 1000000 ))
 (( rc == 0 )) || fail "D3: hung-model precompact exit=$rc"
@@ -1829,9 +1877,9 @@ D2_PAYLOAD=$(jq -cn --arg sid "$D2_SID" --arg tp "$TRANSCRIPT" --arg cwd "$D2_CW
   '{session_id:$sid,transcript_path:$tp,hook_event_name:"PreCompact",cwd:$cwd,trigger:"auto"}')
 
 t0=$(date +%s%N)
+rc=0
 echo "$D2_PAYLOAD" | REFLECT_BUDGET_PRECOMPACT=1 REFLECT_KILL_GRACE_SECONDS=1 \
-  bash "$REFLECT_SH" precompact
-rc=$?
+  bash "$REFLECT_SH" precompact || rc=$?
 t1=$(date +%s%N)
 d2_ms=$(( (t1 - t0) / 1000000 ))
 (( rc == 0 )) || fail "D2: 2nd-compact precompact exit=$rc"
@@ -1910,8 +1958,8 @@ jq -n --arg sid "$FRESH_SID" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 # Trigger: an ordinary, unrelated SessionEnd.
 REAP_SID="test-sid-reaper-trigger"
 REAP_PAYLOAD="$(fake_payload SessionEnd "$REAP_SID")"
-echo "$REAP_PAYLOAD" | bash "$REFLECT_SH" sessionend
-rc=$?
+rc=0
+echo "$REAP_PAYLOAD" | bash "$REFLECT_SH" sessionend || rc=$?
 (( rc == 0 )) || fail "D4: reaper-trigger sessionend exit=$rc"
 wait_for_complete "$REFLECT_ROOT/sessions/$REAP_SID/manifest.json" 20 \
   || fail "D4: reaper-trigger sessionend never completed"
@@ -2043,10 +2091,10 @@ mission_stub '# Mission — machine written
 - stub'
 
 B3_SID="test-sid-foreign-mission"
+rc=0
 echo "$(jq -cn --arg sid "$B3_SID" --arg tp "$TRANSCRIPT" --arg cwd "$B3_CWD" \
   '{session_id:$sid,transcript_path:$tp,hook_event_name:"IdleHandoff",cwd:$cwd}')" \
-  | bash "$REFLECT_SH" mission
-rc=$?
+  | bash "$REFLECT_SH" mission || rc=$?
 (( rc == 0 )) || fail "mission mode exit=$rc"
 
 [[ "$(sha256sum "$B3_CWD/tasks/mission.md" | awk '{print $1}')" == "$B3_FOREIGN_SHA" ]] \
@@ -2104,10 +2152,15 @@ mission_stub '# Mission — first pass
 ## Done
 - first'
 B3B_SID1="test-sid-mission-first"
+# `|| rc=$?`, not a bare pipeline followed by `(( $? == 0 ))`. See TEST 7's note:
+# errexit is in force here, so a bare failing dispatcher killed the script AT the
+# pipeline and the assertion on the next line — the one written to report exactly
+# this — could never run.
+rc=0
 echo "$(jq -cn --arg sid "$B3B_SID1" --arg tp "$TRANSCRIPT" --arg cwd "$B3B_CWD" \
   '{session_id:$sid,transcript_path:$tp,hook_event_name:"IdleHandoff",cwd:$cwd}')" \
-  | bash "$REFLECT_SH" mission
-(( $? == 0 )) || fail "19b: first mission run failed"
+  | bash "$REFLECT_SH" mission || rc=$?
+(( rc == 0 )) || fail "19b: first mission run failed (exit=$rc)"
 [[ -L "$B3B_CWD/tasks/mission.md" ]] \
   || fail "19b: tasks/mission.md should be a symlink pointer"
 [[ "$(readlink "$B3B_CWD/tasks/mission.md")" == "mission.$B3B_SID1.md" ]] \
@@ -2121,10 +2174,11 @@ mission_stub '# Mission — second pass
 ## Done
 - second'
 B3B_SID2="test-sid-mission-second"
+rc=0
 echo "$(jq -cn --arg sid "$B3B_SID2" --arg tp "$TRANSCRIPT" --arg cwd "$B3B_CWD" \
   '{session_id:$sid,transcript_path:$tp,hook_event_name:"IdleHandoff",cwd:$cwd}')" \
-  | bash "$REFLECT_SH" mission
-(( $? == 0 )) || fail "19b: second mission run failed"
+  | bash "$REFLECT_SH" mission || rc=$?
+(( rc == 0 )) || fail "19b: second mission run failed (exit=$rc)"
 [[ "$(readlink "$B3B_CWD/tasks/mission.md")" == "mission.$B3B_SID2.md" ]] \
   || fail "19b: pointer was not repointed to the new payload"
 grep -q 'second pass' "$B3B_CWD/tasks/mission.md" \
@@ -2172,10 +2226,11 @@ mission_stub '# Mission — post-migration
 ## Done
 - migrated'
 B3C_SID="test-sid-legacy-migrate"
+rc=0
 echo "$(jq -cn --arg sid "$B3C_SID" --arg tp "$TRANSCRIPT" --arg cwd "$B3C_CWD" \
   '{session_id:$sid,transcript_path:$tp,hook_event_name:"IdleHandoff",cwd:$cwd}')" \
-  | bash "$REFLECT_SH" mission
-(( $? == 0 )) || fail "19c: mission run failed"
+  | bash "$REFLECT_SH" mission || rc=$?
+(( rc == 0 )) || fail "19c: mission run failed (exit=$rc)"
 [[ ! -L "$B3C_CWD/tasks/mission.md" ]] \
   || fail "19c: a regular mission.md was replaced by a pointer"
 [[ "$(sha256sum "$B3C_CWD/tasks/mission.md" | awk '{print $1}')" == "$B3C_LEGACY_SHA" ]] \
@@ -2257,10 +2312,11 @@ mission_stub '# Mission — repaired
 ## Done
 - repair'
 B3E_SID="test-sid-repair-dangling"
+rc=0
 echo "$(jq -cn --arg sid "$B3E_SID" --arg tp "$TRANSCRIPT" --arg cwd "$B3E_CWD" \
   '{session_id:$sid,transcript_path:$tp,hook_event_name:"IdleHandoff",cwd:$cwd}')" \
-  | bash "$REFLECT_SH" mission
-(( $? == 0 )) || fail "19e: repair mission run failed"
+  | bash "$REFLECT_SH" mission || rc=$?
+(( rc == 0 )) || fail "19e: repair mission run failed (exit=$rc)"
 [[ -L "$B3E_CWD/tasks/mission.md" && -f "$B3E_CWD/tasks/mission.md" ]] \
   || fail "19e: pointer still dangling after a mission run"
 grep -q 'repaired' "$B3E_CWD/tasks/mission.md" || fail "19e: repaired pointer resolves to the wrong file"
@@ -2329,10 +2385,11 @@ mission_stub '# Mission — gc e2e
 ## Done
 - gc'
 B3G_SID="test-sid-gc-e2e"
+rc=0
 echo "$(jq -cn --arg sid "$B3G_SID" --arg tp "$TRANSCRIPT" --arg cwd "$B3G_CWD" \
   '{session_id:$sid,transcript_path:$tp,hook_event_name:"IdleHandoff",cwd:$cwd}')" \
-  | bash "$REFLECT_SH" mission
-(( $? == 0 )) || fail "19f: e2e gc mission run failed"
+  | bash "$REFLECT_SH" mission || rc=$?
+(( rc == 0 )) || fail "19f: e2e gc mission run failed (exit=$rc)"
 jq -e '.modes.mission.gc_removed >= 1' "$REFLECT_ROOT/sessions/$B3G_SID/manifest.json" >/dev/null \
   || fail "19f: a mission run did not invoke GC (gc_removed=$(jq -r '.modes.mission.gc_removed' "$REFLECT_ROOT/sessions/$B3G_SID/manifest.json"))"
 [[ ! -f "$B3G_CWD/tasks/mission.gc-e2e-orphan-sid.md" ]] \
@@ -2705,8 +2762,8 @@ counting_stub "$B5_H/calls" "$SC_MISSION_FILE"
 for mode in absent malformed nokey normal; do
   sc_write_rsi_config "$B5_H" "$mode"
   B5_SID="test-sid-b5-$mode"
-  B5_OUT="$(sc_fire "$B5_H" "$B5_SID" "$B5_CWD" "$B5_H/t.jsonl")"
-  rc=$?
+  rc=0
+  B5_OUT="$(sc_fire "$B5_H" "$B5_SID" "$B5_CWD" "$B5_H/t.jsonl")" || rc=$?
   (( rc == 0 )) || fail "21: config=$mode must exit 0 (got $rc)"
   [[ -z "$B5_OUT" ]] || fail "21: config=$mode produced stdout: $B5_OUT (a Stop hook must stay silent)"
   for _ in $(seq 1 40); do
@@ -2826,8 +2883,8 @@ spawn_wait_quiescent 60 \
 B2_SID="test-sid-b2-fire"
 mk_context_transcript "$B2_H/over.jsonl" "claude-opus-5" 310000 "$B2_CWD"
 t0=$(date +%s%N)
-B2_OUT="$(sc_fire "$B2_H" "$B2_SID" "$B2_CWD" "$B2_H/over.jsonl")"
-rc=$?
+rc=0
+B2_OUT="$(sc_fire "$B2_H" "$B2_SID" "$B2_CWD" "$B2_H/over.jsonl")" || rc=$?
 t1=$(date +%s%N)
 b2_ms=$(( (t1 - t0) / 1000000 ))
 (( rc == 0 )) || fail "22: trigger rc=$rc (a Stop hook exiting non-zero BLOCKS the stop)"
@@ -2941,12 +2998,12 @@ jq -e --argjson c "$B6_CAP" '.capped == true and .fires == $c' \
 B6_RO_H="$(sc_home)"
 B6_RO_SESSIONS="$(mktemp -d -t reflect-b6ro-XXXXXX)"
 chmod 500 "$B6_RO_SESSIONS"
+rc=0
 jq -cn --arg sid "test-sid-b6-ro" --arg tp "$B6_TP" --arg cwd "$B6_CWD" \
   '{session_id:$sid,transcript_path:$tp,hook_event_name:"Stop",cwd:$cwd}' \
   | HOME="$B6_RO_H" CLAUDE_CODE_ENTRYPOINT=cli REFLECT_ROOT="$REFLECT_ROOT" \
     CLAUDE_SESSIONS_DIR="$B6_RO_SESSIONS" \
-    python3 "$B6_RO_H/.claude/self-compact-trigger.py" >/dev/null
-rc=$?
+    python3 "$B6_RO_H/.claude/self-compact-trigger.py" >/dev/null || rc=$?
 (( rc == 0 )) || fail "23: unwritable state dir must not fail the hook (rc=$rc)"
 sleep 0.5
 # No state means no bound, and the trigger persists the bound BEFORE it acts. So
@@ -3030,8 +3087,8 @@ printf 'ok\n'
 STUB
 chmod +x "$STUB_SCRATCH/claude"
 
-HOME="$B7_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh"
-rc=$?
+rc=0
+HOME="$B7_H" REFLECT_ROOT="$REFLECT_ROOT" bash "$WORKTREE/scripts/idle-handoff.sh" || rc=$?
 (( rc == 0 )) || fail "24: idle-handoff.sh rc=$rc"
 
 sc_settle_fork "$B7_ARGV" fork
@@ -3075,8 +3132,10 @@ grep -qF '## Next' "$B7_ARGV" || fail "24: fork prompt does not point at ## Next
 # ---- S1: the fork must not inherit the interactive user's ambient authority ---
 # `--add-dir` ADDS to the ambient permission set; it does not restrict it. Measured
 # against the installed CLI (2.1.222, real `-p` runs, 2026-08-16) with the argv this
-# script used to emit: the fork read /etc/nixos/flake.nix and ran `id -u` through
-# pre-approved `mcp__safe-bash__*`, i.e. arbitrary shell execution and reads across
+# script used to emit: the fork read /etc/nixos/flake.nix and ran `id -u` through the
+# pre-approved shell entry then sitting in `permissions.allow` (`mcp__safe-bash__*` at
+# the time; the safe-bash retirement replaced it with a plain `Bash`, which is the same
+# authority under a shorter name), i.e. arbitrary shell execution and reads across
 # ten ambient additionalDirectories, on a process executing a `## Next` list a model
 # wrote out of a transcript. Every assertion below reads the ACTUAL argv, because the
 # argv is the only thing that decides.
@@ -3084,7 +3143,7 @@ b7_argv_has() { grep -qxF -- "$1" "$B7_ARGV"; }
 b7_value_after() { awk -v k="$1" '$0==k{getline; print; exit}' "$B7_ARGV"; }
 
 b7_argv_has '--setting-sources' \
-  || fail "24/S1: the fork does not pass --setting-sources, so it loads ~/.claude/settings.json and inherits permissions.additionalDirectories AND permissions.allow (which carries mcp__safe-bash__*)"
+  || fail "24/S1: the fork does not pass --setting-sources, so it loads ~/.claude/settings.json and inherits permissions.additionalDirectories AND permissions.allow (which carries Bash — a pre-approved shell)"
 [[ -z "$(b7_value_after '--setting-sources')" ]] \
   || fail "24/S1: --setting-sources must be EMPTY — no user, no project, no local source. Got '$(b7_value_after '--setting-sources')'; the project's own .claude/settings.json is repo content and must not govern an unattended fork"
 b7_argv_has '--strict-mcp-config' \
@@ -3100,7 +3159,8 @@ case ",$B7_TOOLS," in *,Read,*) ;; *) fail "24/S1: --tools leaves the fork unabl
 case ",$B7_TOOLS," in *,Edit,*) ;; *) fail "24/S1: --tools leaves the fork unable to write the handoff back ('$B7_TOOLS')" ;; esac
 
 # The explicit permission object. Its `allow` list is the field whose INHERITED value
-# carried `mcp__safe-bash__*`, so it being empty is the assertion that matters most.
+# carried a pre-approved shell — `mcp__safe-bash__*` before the retirement, plain `Bash`
+# after it — so it being empty is the assertion that matters most.
 b7_argv_has '--settings' \
   || fail "24/S1: the fork gets no explicit settings object, so what it may reach is implicit"
 B7_SETTINGS="$(b7_value_after '--settings')"
@@ -3549,7 +3609,7 @@ mk_mission_copy "$B8U_CWD/tasks" "b8u-copy-sid" '# copy
 
 ## Next
 - something' >/dev/null
-# NB: `set -e` is in force from TEST 15 onward, so a deliberately-failing
+# NB: `set -e` is in force from TEST 7's `set -e` onward, so a deliberately-failing
 # command must sit in an `if` condition — a bare assignment from a failing
 # command substitution would kill the suite with no message.
 if B8U_OUT="$(bash "$REFLECT_SH" --mission-path "$B8U_CWD" 2>/dev/null)"; then
@@ -4001,13 +4061,15 @@ info "1 = subprocess on both sides; 0 / empty / unset = not a subprocess on both
 # manifest is orphaned at `started` — the exact pathology the budget arithmetic
 # exists to prevent, reachable by one env var.
 test_begin "TEST 30: F6 — an over-cap budget override is clamped and says so"
-F6_DEFAULT="$(bash "$REFLECT_SH" --budgets 2>/dev/null)"
+F6_DEFAULT="$(bash "$REFLECT_SH" --budgets 2>/dev/null)" \
+  || fail "30: --budgets exited non-zero with no override at all"
 jq -e '.budgets.precompact == 40 and .max_synchronous_budget_seconds
        == (.hook_cap_seconds - .kill_grace_seconds - .reserve_seconds)' <<<"$F6_DEFAULT" >/dev/null \
   || fail "30: shipped defaults changed unexpectedly ($F6_DEFAULT)"
 
 F6_ERR="$STUB_SCRATCH/f6.stderr"
-F6_OVER="$(REFLECT_BUDGET_PRECOMPACT=50 bash "$REFLECT_SH" --budgets 2>"$F6_ERR")"
+F6_OVER="$(REFLECT_BUDGET_PRECOMPACT=50 bash "$REFLECT_SH" --budgets 2>"$F6_ERR")" \
+  || fail "30: --budgets exited non-zero on an over-cap override; it must clamp and keep reporting (stderr: $(cat "$F6_ERR" 2>/dev/null || true))"
 jq -e '.precompact_worst_case_seconds <= .hook_cap_seconds' <<<"$F6_OVER" >/dev/null \
   || fail "30: budget+grace+reserve still exceeds the cap after an override ($F6_OVER)"
 jq -e '.budgets.precompact == .max_synchronous_budget_seconds' <<<"$F6_OVER" >/dev/null \
@@ -4015,7 +4077,8 @@ jq -e '.budgets.precompact == .max_synchronous_budget_seconds' <<<"$F6_OVER" >/d
 grep -q 'CLAMPED' "$F6_ERR" \
   || fail "30: the clamp was silent (stderr: $(cat "$F6_ERR"))"
 
-F6_BAD="$(REFLECT_BUDGET_PRECOMPACT=notanumber bash "$REFLECT_SH" --budgets 2>"$F6_ERR")"
+F6_BAD="$(REFLECT_BUDGET_PRECOMPACT=notanumber bash "$REFLECT_SH" --budgets 2>"$F6_ERR")" \
+  || fail "30: --budgets exited non-zero on a non-numeric override; it must reset to the default and keep reporting (stderr: $(cat "$F6_ERR" 2>/dev/null || true))"
 jq -e '.budgets.precompact == 40' <<<"$F6_BAD" >/dev/null \
   || fail "30: a non-numeric override did not fall back to the shipped default"
 grep -q 'not a positive integer' "$F6_ERR" || fail "30: the reset was silent"
@@ -4905,7 +4968,8 @@ info "39b: the advisory half's docstring states the live posture of the autonomo
 # (c) `mission` is dispatchable, and has been since the handoff work landed, but the
 #     file header and the --help usage line still listed three modes. A usage string
 #     that omits a real mode is how a caller concludes it must reimplement one.
-R4_HELP="$(bash "$REFLECT_SH" --help)"
+R4_HELP="$(bash "$REFLECT_SH" --help)" \
+  || fail "39c: reflect.sh --help exited non-zero, so the usage line below was never checked"
 grep -qE 'Usage:.*precompact\|sessionend\|subagentstop\|mission' <<<"$R4_HELP" \
   || fail "39c: --help usage line does not list mission (got: $(grep -m1 Usage: <<<"$R4_HELP"))"
 grep -qE '^# Usage:.*precompact\|sessionend\|subagentstop\|mission' "$REFLECT_SH" \
@@ -4923,7 +4987,8 @@ info "39c: all four dispatchable modes appear in the header and in --help"
 # ============================================================================
 # The failure this exists to prevent is a FALLBACK. An unrestricted fork is an
 # unattended acceptEdits process with the interactive user's whole permission surface
-# — ten ambient additionalDirectories and a pre-approved `mcp__safe-bash__*`, i.e.
+# — ten ambient additionalDirectories and a pre-approved shell in `permissions.allow`
+# (`mcp__safe-bash__*` before the retirement, plain `Bash` after it), i.e.
 # arbitrary shell across the user's repos including ~/.claude/skills, where it could
 # rewrite the instructions future sessions load. Skipping costs one deferred resume.
 # So both gates fail CLOSED, and the reason lands in the counters, because a
@@ -5919,6 +5984,188 @@ sc_forked "$T1_ARGV" \
 info "49: a 3000-record transcript still yields its cwd — no SIGPIPE-driven skip"
 
 # ============================================================================
+# TEST 50a: the CLI under test — resolved explicitly, named, version-pinned
+# ============================================================================
+# THE DEFECT THIS FIXES (2026-08-31). This host carries two Claude Code installs:
+#
+#   ~/.local/bin/claude                        2.1.251  <- what a session runs
+#   /etc/profiles/per-user/$USER/bin/claude    2.1.222  <- Nix-packaged
+#   /run/current-system/sw/bin/claude          2.1.222
+#
+# `tests/test_deny_globs.py` located its CLI with `shutil.which("claude")`, i.e.
+# from PATH. TEST 50 hands the guard modules $SMOKE_HOST_PATH — and a
+# `systemd-run --user` unit, which is how the full lane is driven detached, has
+# the SYSTEM PATH, so `claude` resolved to 2.1.222. The lane therefore validated
+# the CLI that is not running. It printed
+#   TESTS: PASS — 73 named test(s) ran, 0 skipped, 0 failed (lane=full)
+# which was true, and was about the wrong binary. Nothing in that line, and
+# nothing in the modules' output, named a version — so the mistake had no
+# surface to be noticed on. A gate that cannot name what it tested is not a gate.
+#
+# THE CHOICE: PIN TO THE INTERACTIVE CLI, do not test both.
+# The `Bash(...)` deny globs exist to constrain the CLI a human session actually
+# runs. 2.1.222 is a stale copy that nothing interactive executes; sweeping the
+# whole rule set against it as well would double a bill measured in real API
+# calls to characterise verdicts nobody is exposed to, and invites the failure
+# mode where the second half goes red and gets muted. What the divergence
+# deserves is VISIBILITY: every install found is listed below with its version,
+# and the one under test is stated in the info line, in each module's output,
+# and in the final TESTS: line. Point CLAUDE_CLI at the other build to sweep it.
+#
+# RESOLUTION ORDER: $CLAUDE_CLI, then ~/.local/bin/claude, then $SMOKE_HOST_PATH.
+# NOT the suite's own PATH — that has the stub `claude` in front of it (see
+# STUB_SCRATCH), and a shell script with no bundle inside it is not a CLI.
+test_begin "TEST 50a: the CLI under test is resolved, named and version-pinned"
+SMOKE_CLI="${CLAUDE_CLI:-}"
+if [[ -z "$SMOKE_CLI" ]]; then
+  if [[ -x "$HOME/.local/bin/claude" ]]; then
+    SMOKE_CLI="$HOME/.local/bin/claude"
+  else
+    SMOKE_CLI="$(PATH="$SMOKE_HOST_PATH" command -v claude 2>/dev/null || true)"
+  fi
+fi
+[[ -n "$SMOKE_CLI" && -x "$SMOKE_CLI" ]] \
+  || fail "50a: no Claude Code CLI resolved (CLAUDE_CLI unset, ~/.local/bin/claude absent, none on the host PATH). tests/test_deny_globs.py drives a real CLI; without one the deny globs have NO proof and this run must not report a verdict about them."
+# `|| true` inside the substitution: errexit and pipefail are both in force here
+# (see TEST 7), so a version line that does not match would abort the whole
+# script at this assignment — exit 1, no FAIL line, no explanation. The empty
+# check below is what must report it.
+SMOKE_CLI_VERSION="$("$SMOKE_CLI" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+[[ -n "$SMOKE_CLI_VERSION" ]] \
+  || fail "50a: '$SMOKE_CLI --version' reported no parseable version, so this run cannot name the CLI it is about to test."
+info "50a: CLI under test: $SMOKE_CLI = $SMOKE_CLI_VERSION"
+for smoke_other in "$HOME/.local/bin/claude" "/etc/profiles/per-user/${USER:-}/bin/claude" "/run/current-system/sw/bin/claude"; do
+  [[ -x "$smoke_other" ]] || continue
+  smoke_other_v="$("$smoke_other" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+  if [[ "$smoke_other" -ef "$SMOKE_CLI" ]]; then
+    info "50a: install on this host: $smoke_other = ${smoke_other_v:-unreadable}  <-- under test"
+  else
+    info "50a: install on this host: $smoke_other = ${smoke_other_v:-unreadable}  (NOT under test; set CLAUDE_CLI to sweep it)"
+  fi
+done
+
+# ============================================================================
+# TEST 50: the bash-guard test modules, run by the repo's own verifier
+# ============================================================================
+# THE DEFECT THIS FIXES (2026-08-24). The fail-closed bash guard is the entire
+# point of the safe-bash retirement, and it was the one thing this script did not
+# check. tests/test_bash_guard*.py and tests/test_deny_globs.py are standalone
+# `python3 tests/<module>.py` scripts, and NOTHING invoked them — not this file,
+# not anything else in the repo. Several agents reported "smoke tests passed" as
+# evidence that their guard work was sound; that evidence was hollow, because a
+# regression in the guard passed this gate untouched. A verifier that skips the
+# safety layer is worse than no verifier: it manufactures confidence.
+#
+# DISCOVERY, NOT A HARDCODED LIST. A list of module names goes stale the first
+# time somebody adds a module and forgets to edit this runner, and the failure
+# mode of a stale list is SILENCE — the new module simply never runs. The set is
+# therefore derived from the tree, in two steps:
+#   1. the guard hooks are whatever `hooks/bash-*guard*.py` matches on disk;
+#   2. a guard test module is any `tests/test_*.py` whose text names one of them.
+# A new test for an existing hook is picked up with no edit here, and so is a new
+# hook together with its test. The rule deliberately errs toward running too
+# much: over-inclusion (a module that only mentions a hook in a comment) costs
+# one extra `python3` invocation, while under-inclusion costs exactly the
+# coverage this block exists to provide.
+#
+# AN EMPTY RESULT IS A FAILURE, NOT A PASS. "found no guard tests" must never
+# print the same thing as "all guard tests passed" — that is the same fail-open
+# shape the migration exists to correct. Both discovery steps assert non-empty
+# BEFORE any module runs, and each says in its message that it is a discovery
+# failure, so it cannot be misread as a clean run.
+#
+# LANE: both. These are unit-level and offline (slowest measured at ~35s), so
+# they run in `fast` as well as `full`. The lane switch selects COST, and a
+# safety layer with no test is not a cost saving.
+# `find -L`, not plain `find`: this repo symlinks files into place routinely, and
+# a bare `-type f` treats a symlink to a module as type `l` and skips it — a
+# silent miss, which is the exact failure this block exists to prevent.
+GUARD_HOOKS=()
+while IFS= read -r -d '' guard_hook_path; do
+  GUARD_HOOKS+=( "$(basename "$guard_hook_path")" )
+done < <(find -L "$WORKTREE/hooks" -maxdepth 1 -type f -name 'bash-*guard*.py' -print0 2>/dev/null | sort -z)
+
+test_begin "TEST 50: bash-guard test modules are discovered"
+(( ${#GUARD_HOOKS[@]} > 0 )) \
+  || fail "50: DISCOVERY FAILED — nothing matches $WORKTREE/hooks/bash-*guard*.py, so no test module can be recognised as a guard test. Read this as 'the runner cannot see the guard', never as 'there is nothing to check'."
+info "50: guard hooks on disk: ${GUARD_HOOKS[*]}"
+
+# grep needs one -e per hook basename; -F because a filename is a literal, not a
+# pattern (the dot in `bash-guard.py` is not a wildcard here).
+GUARD_GREP_ARGS=()
+for guard_hook in "${GUARD_HOOKS[@]}"; do GUARD_GREP_ARGS+=( -e "$guard_hook" ); done
+
+GUARD_MODULES=()
+while IFS= read -r -d '' guard_mod; do
+  if grep -qF "${GUARD_GREP_ARGS[@]}" -- "$guard_mod"; then
+    GUARD_MODULES+=( "$guard_mod" )
+  fi
+done < <(find -L "$WORKTREE/tests" -maxdepth 1 -type f -name 'test_*.py' -print0 2>/dev/null | sort -z)
+
+(( ${#GUARD_MODULES[@]} > 0 )) \
+  || fail "50: DISCOVERY FAILED — no file under $WORKTREE/tests matching test_*.py names any of: ${GUARD_HOOKS[*]}. The guard's own test suite is either gone or renamed past this rule. Read this as 'the runner found no tests', never as 'the guard tests passed'."
+info "50: ${#GUARD_MODULES[@]} guard test module(s) discovered: $(printf '%s ' "${GUARD_MODULES[@]##*/}")"
+
+guard_idx=0
+for guard_mod in "${GUARD_MODULES[@]}"; do
+  guard_idx=$(( guard_idx + 1 ))
+  guard_rel="tests/${guard_mod##*/}"
+  test_begin "TEST 50.$guard_idx: $guard_rel"
+  guard_log="$SMOKE_TMP_PARENT/guard-${guard_mod##*/}.log"
+  # PATH: the host's, see SMOKE_HOST_PATH above.
+  # CLAUDE_CLI / CLAUDE_CLI_EXPECT_VERSION: the binary TEST 50a resolved, and the
+  # version it reported. A module that reads CLAUDE_CLI re-measures the version
+  # itself and refuses to print results if the two disagree, so "the lane picked
+  # one build and the module ran another" cannot pass silently. Passed per-module
+  # rather than exported: nothing else in this suite may see a real CLI, because
+  # every session-reflect test wants the stub.
+  # DENY_GLOBS_SCOPE: set explicitly, so an ambient value in the caller's shell
+  # cannot change the sweep. `core` is the controls only (~12 live probes);
+  # `full` is the whole rule set (~83). It selects HOW MUCH is swept — never
+  # whether the live sweep happens, which is what the retired DENY_GLOBS_LIVE=1
+  # opt-in got wrong.
+  # `|| guard_rc=$?`, NOT a bare command followed by `guard_rc=$?`. `set -e` is in
+  # force from TEST 7's `set -e` onward (see the note there), so a bare failing
+  # module killed the script THERE — exit 1, no FAIL line, no TESTS: line, no
+  # named module, nothing. Measured 2026-08-24 with a deliberately-broken module:
+  # the suite reported a bare exit 1 and the reader had no way to learn which
+  # guard went red. Putting the command in an `||` list suspends errexit for it,
+  # so the failure reaches the report instead of terminating the run in silence.
+  # `if`, not `lane_full && guard_scope=full`: errexit applies to the LAST
+  # command of an AND-OR list, so on the fast lane that one-liner returns 1 and
+  # kills the script here with no FAIL line at all.
+  if lane_full; then guard_scope=full; else guard_scope=core; fi
+  guard_rc=0
+  env PATH="$SMOKE_HOST_PATH" \
+      CLAUDE_CLI="$SMOKE_CLI" \
+      CLAUDE_CLI_EXPECT_VERSION="$SMOKE_CLI_VERSION" \
+      DENY_GLOBS_SCOPE="$guard_scope" \
+      python3 "$guard_mod" >"$guard_log" 2>&1 || guard_rc=$?
+  if (( guard_rc != 0 )); then
+    fail "50.$guard_idx: $guard_rel FAILED (exit=$guard_rc) against Claude Code $SMOKE_CLI_VERSION ($SMOKE_CLI). This is the bash guard's own test suite — a red module here means the fail-closed guard is not doing what it claims, and no other result in this run should be read as evidence about it.
+full log: $guard_log
+last 40 lines:
+$(tail -40 "$guard_log" 2>/dev/null)"
+  fi
+  # A module that drives the real CLI must SAY which one it drove. Discovered,
+  # not listed: a module is CLI-dependent iff its own text names CLAUDE_CLI, the
+  # same tree-derived rule the module discovery above uses, so a new CLI-driving
+  # module is covered with no edit here. Silence is a failure — that silence is
+  # exactly what let the lane validate 2.1.222 for weeks while reporting PASS.
+  if grep -qF 'CLAUDE_CLI' -- "$guard_mod"; then
+    guard_named="$(grep -m1 '^CLI UNDER TEST: ' "$guard_log" 2>/dev/null || true)"
+    [[ -n "$guard_named" ]] \
+      || fail "50.$guard_idx: $guard_rel names CLAUDE_CLI but printed no 'CLI UNDER TEST:' line, so it cannot be shown to have tested $SMOKE_CLI_VERSION. Read this as 'the module did not report what it tested', never as 'the module passed'.
+full log: $guard_log"
+    [[ "$guard_named" == "CLI UNDER TEST: $SMOKE_CLI_VERSION @ "* ]] \
+      || fail "50.$guard_idx: VERSION MISMATCH — this lane resolved Claude Code $SMOKE_CLI_VERSION ($SMOKE_CLI), but $guard_rel reported '$guard_named'. Its results are about a different binary and must not be counted.
+full log: $guard_log"
+    info "50.$guard_idx: $guard_rel tested $guard_named (scope=$guard_scope)"
+  fi
+  info "50.$guard_idx: $guard_rel green — $(grep -c '\[OK' "$guard_log" 2>/dev/null || echo 0) check(s) reported OK"
+done
+
+# ============================================================================
 # FINAL GUARD: prove the whole suite left the live repo alone.
 assert_repo_tasks_untouched "end of suite"
 info "live repo tasks/ untouched by the full suite"
@@ -5961,7 +6208,22 @@ processes/units still tracked (may have appeared after the quiescence check):
 $(spawn_holders)"
   fi
   # The tracking dir goes last: TEARDOWN_DETAIL is written inside it.
-  rm -rf "$SPAWN_SHIM_DIR"
+  # `if !`, not a bare `rm -rf`: errexit is in force here, so a bare failure exited
+  # the script AT this line — with status 1, which this file defines as "a test
+  # failed", and with no TEARDOWN: line at all. A cleanup failure that reports
+  # itself as a test failure is worse than one that reports nothing.
+  TEARDOWN_SHIM_ERR="$SPAWN_TRACK_DIR/teardown-shim-rm.err"
+  if ! rm -rf "$SPAWN_SHIM_DIR" 2>"$TEARDOWN_SHIM_ERR"; then
+    if [[ "$TEARDOWN_STATUS" == "ok" ]]; then
+      TEARDOWN_STATUS="shim-rm-failed"
+    fi
+    # The quoting matches the real command on the `if !` line above. This
+    # message used to name the directory unquoted — a form this script never
+    # ran, and the one shape a reader might copy back out of a diagnostic.
+    TEARDOWN_DETAIL="$TEARDOWN_DETAIL
+rm -rf \"$SPAWN_SHIM_DIR\" reported:
+$(cat "$TEARDOWN_SHIM_ERR" 2>/dev/null || true)"
+  fi
 fi
 
 # ============================================================================
@@ -5969,8 +6231,9 @@ fi
 # look broken again (and a broken teardown can never look green).
 # ============================================================================
 echo "----------------------------------------------------------------------"
-printf 'TESTS:    PASS — %s named test(s) ran, %s skipped, 0 failed (lane=%s)\n' \
-  "$TESTS_RUN" "$TESTS_SKIPPED" "$SMOKE_LANE"
+printf 'TESTS:    PASS — %s named test(s) ran, %s skipped, 0 failed (lane=%s, cli=%s @ %s)\n' \
+  "$TESTS_RUN" "$TESTS_SKIPPED" "$SMOKE_LANE" \
+  "${SMOKE_CLI_VERSION:-unresolved}" "${SMOKE_CLI:-unresolved}"
 if [[ "$TEARDOWN_STATUS" == "ok" ]]; then
   echo "TEARDOWN: OK"
   echo "OK: all smoke tests passed"

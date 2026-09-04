@@ -29,6 +29,10 @@
 # they are reviewable, greppable, and attributable to a commit. There is no
 # config file and no global suppression, because both are the mechanisms by
 # which a rules layer quietly stops covering anything.
+#
+# One structural exemption exists alongside waivers: a JSON string under
+# `permissions.deny` or `permissions.ask` is data, not a command. See the
+# "Permission tables are data" block below for why it is not a waiver.
 
 set -uo pipefail
 
@@ -43,7 +47,7 @@ while [[ $# -gt 0 ]]; do
     --json)  JSON=1; shift ;;
     --repo)  REPO="${2:-}"; shift 2 ;;
     --include-docs) INCLUDE_DOCS=1; shift ;;
-    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,34p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -79,6 +83,12 @@ else
   DIFF=$(git diff --unified=0 HEAD 2>/dev/null)
   RANGE="(working tree vs HEAD)"
 fi
+
+# Right-hand side of the range — the post-image whose structure a finding's
+# line number addresses. Empty means the working tree, which is what the
+# fallback above diffs against.
+RANGE_TIP=""
+[[ "$RANGE" == *".."* ]] && RANGE_TIP="${RANGE##*..}"
 
 # ── Rules ────────────────────────────────────────────────────────────────────
 # Each rule is `id<TAB>severity<TAB>ERE`. Matched against ADDED lines only:
@@ -120,45 +130,52 @@ BEGIN {
     nr++
     rid[nr] = f[1]; rsev[nr] = f[2]; rpat[nr] = f[3]
   }
+  old_left = 0; new_left = 0   # no hunk extent open until the first @@ header
 }
-/^\+\+\+ / {
-  file = substr($0, 7)          # strip "+++ b/"
-  if (file == "/dev/null") file = ""
-  # This file states several rules as literal text (`eslint-disable`,
-  # `bypassPermissions`, `--dangerously`), so scanning it makes the gate flag
-  # its own rule table on every edit — and a gate that cries wolf about itself
-  # is one people learn to skip. Excluded deliberately. The trade is a named,
-  # single-file blind spot, which is why changes here get human review rather
-  # than machine review.
-  # The gate and its fixture both state rules as literal text — the fixture
-  # exists precisely to contain one example of every pattern — so scanning
-  # either makes the gate flag its own rule table on every edit, and a gate
-  # that cries wolf about itself is one people learn to skip.
-  skip_file = (file ~ /deterministic-gate(-test)?\.sh$/)
-  # Prose files describe commands; they do not run them. A plan document that
-  # says "then run git push --force" is a sentence, and flagging it buries the
-  # diff lines that are actually executable. Measured against the history of
-  # this repo, docs produced the overwhelming majority of all matches and none
-  # of the true ones. gitleaks still covers these files, because a secret in a
-  # document is still a secret.
-  if (!skip_file && !include_docs)
-    skip_file = (file ~ /\.(md|markdown|txt|rst|adoc)$/)
-  next
-}
-/^@@ / {
-  # @@ -a,b +c,d @@ — take c as the first new-file line of the hunk.
-  match($0, /\+[0-9]+/)
-  newline = substr($0, RSTART + 1, RLENGTH - 1) + 0
-  next
-}
-/^\+/ {
+# ── Hunk extents ──────────────────────────────────────────────────────────────
+# Structure, not pattern-guessing, decides what is a header. A hunk header
+# declares exactly how many old and new lines the hunk contains, and while
+# those extents are unconsumed EVERY line is diff content: an added line whose
+# content starts `++ ` renders as `+++ ...`, and before this block existed the
+# header rule below matched it — reattributing the file (a `.md` tail set the
+# prose skip and silently suppressed every later BLOCKER in the hunk), never
+# scanning the forged line itself, and freezing the line counter so later
+# findings landed one line low. A removed line whose content starts `-- `
+# renders `--- ...`, so a `-- a/x` / `++ b/x` pair forged the full two-line
+# header. Measured: a forged diff returned findings:[] where the control
+# flagged destructive-rm. Nothing inside a hunk can forge `@@ ` — content
+# renders with a +/-/space prefix first — so the counts are trustworthy.
+old_left > 0 || new_left > 0 {
+  if ($0 ~ /^\\/) next          # "\ No newline at end of file": consumes nothing
+  mark = substr($0, 1, 1)
+  if (mark == "-") { old_left--; next }   # removed line: not scanned, no new-file line
+  if (mark != "+") {
+    # Context line: occupies one line of both images. Unreachable with the
+    # --unified=0 diffs this gate produces, handled so the extents stay exact
+    # if that ever changes. prev* is reset, not carried: a context line is not
+    # an ADDED line, so it must neither extend waiver reach nor pair into a
+    # two-line finding.
+    old_left--; new_left--
+    newline++
+    prevtext = ""; prevline = -1
+    next
+  }
+  new_left--
   if (skip_file) next
   text = substr($0, 2)
   # Keep the previous added line so a waiver can sit directly above the match.
+  #
+  # The `prevline == newline - 1` guard is what confines "directly above" to
+  # the line PHYSICALLY above. Without it the previous added line waived a
+  # match at any distance — across a gap inside one hunk, across hunks, and
+  # across files — which is silent BLOCKER suppression, the one failure mode a
+  # rules layer must not have. Same guard, same reason, as the
+  # swallowed-exception pairing below; that one had it from the start and this
+  # one did not.
   for (i = 1; i <= nr; i++) {
     if (text ~ rpat[i]) {
       tag = "arftl-allow:[ ]*" rid[i]
-      if (text ~ tag || prevtext ~ tag) { waived++ ; continue }
+      if (text ~ tag || (prevline == newline - 1 && prevtext ~ tag)) { waived++ ; continue }
       emit(rid[i], rsev[i], file, newline, text)
     }
   }
@@ -186,6 +203,52 @@ BEGIN {
   newline++
   next
 }
+# The extent block above consumes every line while a hunk is open, so this
+# rule can only fire OUTSIDE hunks — on a real `+++ b/…` emitted by git,
+# never on forged added content.
+/^\+\+\+ / {
+  file = substr($0, 7)          # strip "+++ b/"
+  if (file == "/dev/null") file = ""
+  # This file states several rules as literal text (`eslint-disable`,
+  # `bypassPermissions`, `--dangerously`), so scanning it makes the gate flag
+  # its own rule table on every edit — and a gate that cries wolf about itself
+  # is one people learn to skip. Excluded deliberately. The trade is a named,
+  # single-file blind spot, which is why changes here get human review rather
+  # than machine review.
+  # The gate and its fixture both state rules as literal text — the fixture
+  # exists precisely to contain one example of every pattern — so scanning
+  # either makes the gate flag its own rule table on every edit, and a gate
+  # that cries wolf about itself is one people learn to skip.
+  skip_file = (file ~ /deterministic-gate(-test)?\.sh$/)
+  # Same reset as the hunk header, for the same reason: nothing in the previous
+  # FILE is the line above anything in this one.
+  prevtext = ""; prevline = -1
+  # Prose files describe commands; they do not run them. A plan document that
+  # says "then run git push --force" is a sentence, and flagging it buries the
+  # diff lines that are actually executable. Measured against the history of
+  # this repo, docs produced the overwhelming majority of all matches and none
+  # of the true ones. gitleaks still covers these files, because a secret in a
+  # document is still a secret.
+  if (!skip_file && !include_docs)
+    skip_file = (file ~ /\.(md|markdown|txt|rst|adoc)$/)
+  next
+}
+/^@@ / {
+  # @@ -a,b +c,d @@ — c is the first new-file line of the hunk; b and d are
+  # the old/new extents the block above consumes (each defaults to 1 when its
+  # `,len` part is omitted, and 0 is legal for a pure add or delete).
+  no = split($2, ofld, ",")             # $2 = "-a,b" or "-a"
+  old_left = (no > 1) ? ofld[2] + 0 : 1
+  nn = split($3, nfld, ",")             # $3 = "+c,d" or "+c"
+  newline  = substr(nfld[1], 2) + 0
+  new_left = (nn > 1) ? nfld[2] + 0 : 1
+  # A new hunk means the previous added line is no longer ABOVE anything here.
+  # Without this reset the waiver on the last added line of the previous hunk
+  # reached the first added line of this one, silently suppressing a BLOCKER
+  # across a gap of any size. See the waiver-scope lane in the test fixture.
+  prevtext = ""; prevline = -1
+  next
+}
 { next }
 END { if (waived > 0) printf "__WAIVED__\t%d\n", waived }
 ')
@@ -194,17 +257,171 @@ WAIVED=$(printf '%s\n' "$FINDINGS" | awk -F'\t' '$1=="__WAIVED__"{print $2}')
 WAIVED=${WAIVED:-0}
 FINDINGS=$(printf '%s\n' "$FINDINGS" | grep -v '^__WAIVED__' | sed '/^$/d')
 
+# ── Permission tables are data, not commands ─────────────────────────────────
+# A string under `permissions.deny` or `permissions.ask` NAMES a command in
+# order to forbid or gate it. Matching one is the rule working, not a hazard
+# introduced. This is the same reason the scan already exempts this file and
+# its fixture: a rule table that states hazards as literal text will flag
+# itself on every edit, and a gate that cries wolf about itself is one people
+# learn to skip. A permissions block is another rule table.
+#
+# It is an exemption rather than a waiver because the waiver mechanism cannot
+# reach here: `arftl-allow:` must appear in a comment, and JSON has no comment
+# syntax. Measured, and worth stating because the workaround is worse than the
+# problem — with a `//` comment in a settings file the CLI silently voids the
+# WHOLE permissions block, so waiving this way would disable every deny rule in
+# it.
+#
+# Scoped by JSON path, never by filename. A string under `permissions.allow` is
+# NOT exempt: that one auto-approves the command it names, which is the whole
+# hazard. Anything the resolver cannot fetch or parse keeps its finding — the
+# exemption fails closed.
+read -r -d '' PERMISSION_DATA_PY <<'PY'
+import json, os, subprocess, sys
+
+TIP = os.environ.get("RANGE_TIP", "")
+DATA_PATHS = (("permissions", "deny"), ("permissions", "ask"))
+_src_cache = {}
+_line_cache = {}
+
+
+def source(path):
+    """Post-image text of `path`, or None when it cannot be resolved."""
+    if path in _src_cache:
+        return _src_cache[path]
+    text = None
+    if TIP:
+        p = subprocess.run(["git", "show", "%s:%s" % (TIP, path)],
+                           capture_output=True, text=True)
+        if p.returncode == 0:
+            text = p.stdout
+    if text is None:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+        except (OSError, UnicodeDecodeError):
+            text = None
+    _src_cache[path] = text
+    return text
+
+
+def data_lines(path):
+    """Line numbers occupied by strings under a DATA_PATHS array.
+
+    Hand-rolled rather than json.load, because a parsed object carries no line
+    numbers and findings are addressed by line. Unresolvable or unparseable
+    input yields the empty set, so the finding stands.
+    """
+    src = source(path)
+    if src is None:
+        return set()
+    try:
+        json.loads(src)
+    except ValueError:
+        return set()
+    exempt, stack, i, n = set(), [], 0, len(src)
+    while i < n:
+        c = src[i]
+        if c == '"':
+            j = i + 1
+            while j < n:
+                if src[j] == "\\":
+                    j += 2
+                    continue
+                if src[j] == '"':
+                    break
+                j += 1
+            k = j + 1
+            while k < n and src[k] in " \t\r\n":
+                k += 1
+            if k < n and src[k] == ":":
+                # A key names the slot we are about to descend into.
+                if stack and stack[-1][0] == "{":
+                    stack[-1][1] = json.loads(src[i:j + 1])
+            elif stack and stack[-1][0] == "[":
+                keys = tuple(f[1] for f in stack if f[0] == "{")
+                if keys in DATA_PATHS:
+                    exempt.update(range(src.count("\n", 0, i) + 1,
+                                        src.count("\n", 0, j) + 2))
+            i = j + 1
+            continue
+        if c in "{[":
+            stack.append([c, None])
+        elif c in "}]" and stack:
+            stack.pop()
+        i += 1
+    return exempt
+
+
+dropped = 0
+for line in sys.stdin:
+    line = line.rstrip("\n")
+    if not line:
+        continue
+    parts = line.split("\t")
+    if len(parts) < 5 or not parts[2].endswith(".json"):
+        print(line)
+        continue
+    f = parts[2]
+    if f not in _line_cache:
+        _line_cache[f] = data_lines(f)
+    if int(parts[3]) in _line_cache[f]:
+        dropped += 1
+    else:
+        print(line)
+if dropped:
+    print("__DATA_EXEMPT__\t%d" % dropped)
+PY
+
+DATA_EXEMPT=0
+if [[ -n "$FINDINGS" ]]; then
+  FINDINGS=$(printf '%s\n' "$FINDINGS" | RANGE_TIP="$RANGE_TIP" python3 -c "$PERMISSION_DATA_PY")
+  if [[ $? -ne 0 ]]; then
+    echo "gate: the permission-data resolver failed — refusing to report" >&2
+    exit 2
+  fi
+  DATA_EXEMPT=$(printf '%s\n' "$FINDINGS" | awk -F'\t' '$1=="__DATA_EXEMPT__"{print $2}')
+  DATA_EXEMPT=${DATA_EXEMPT:-0}
+  FINDINGS=$(printf '%s\n' "$FINDINGS" | grep -v '^__DATA_EXEMPT__' | sed '/^$/d')
+fi
+
 # ── gitleaks ─────────────────────────────────────────────────────────────────
 # Content-based secret detection, complementing the filename-shaped coverage in
 # the global gitignore. Absence of gitleaks is exit 2, not a silent pass.
+#
+# IT MUST SCAN THE RANGE THE REST OF THE GATE JUDGES. This lane used to run
+# `--staged` only, which reads the INDEX — while every pattern rule above reads
+# the COMMIT RANGE. The two therefore never saw the same bytes, and the loop
+# that calls this gate commits at every round's step 7, so from the second
+# round on the index was empty: the lane scanned nothing, found nothing, and
+# the gate reported `gitleaks_clean: true` over a committed secret sitting in
+# the very range it had just pattern-scanned. Measured, both arms, in
+# deterministic-gate-test.sh.
+#
+# Both are scanned now — the range for what is committed, the index for what is
+# staged and not yet committed. A hit in either is a BLOCKER.
 LEAKS=0
 LEAK_DETAIL=""
 if command -v gitleaks >/dev/null 2>&1; then
-  leak_out=$(gitleaks git --staged --redact --no-banner 2>&1)
+  leak_out=""
+  # `git diff A...B` compares B against the merge base of A and B; the
+  # commit-range spelling of that same set is `A..B`, which is what
+  # `--log-opts` takes. A range with no `..` at all (a bare ref) leaves this
+  # empty and only the index is scanned — stated so the gap is named rather
+  # than discovered.
+  if [[ "$RANGE" == *".."* ]]; then
+    range_out=$(gitleaks git --redact --no-banner --log-opts="${RANGE/.../..}" 2>&1)
+    if [[ $? -ne 0 ]]; then
+      LEAKS=1
+      leak_out="$range_out"
+    fi
+  fi
+  staged_out=$(gitleaks git --staged --redact --no-banner 2>&1)
   if [[ $? -ne 0 ]]; then
     LEAKS=1
-    LEAK_DETAIL=$(printf '%s' "$leak_out" | head -40)
+    leak_out="${leak_out}${leak_out:+$'\n'}$staged_out"
   fi
+  [[ $LEAKS -eq 1 ]] && LEAK_DETAIL=$(printf '%s' "$leak_out" | head -40)
 else
   echo "gate: gitleaks not on PATH — cannot run the secret rules" >&2
   exit 2
@@ -215,9 +432,10 @@ count=0
 [[ -n "$FINDINGS" ]] && count=$(printf '%s\n' "$FINDINGS" | wc -l | tr -d ' ')
 
 if [[ $JSON -eq 1 ]]; then
-  printf '{"range":%s,"waived":%d,"gitleaks_clean":%s,"findings":[' \
+  printf '{"range":%s,"waived":%d,"data_exempt":%d,"gitleaks_clean":%s,"findings":[' \
     "$(printf '%s' "$RANGE" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')" \
     "$WAIVED" \
+    "$DATA_EXEMPT" \
     "$([[ $LEAKS -eq 0 ]] && echo true || echo false)"
   first=1
   if [[ -n "$FINDINGS" ]]; then
@@ -243,6 +461,7 @@ else
   fi
   [[ $LEAKS -eq 1 ]] && { echo "  BLOCKER  gitleaks"; printf '%s\n' "$LEAK_DETAIL" | sed 's/^/      /'; }
   [[ $WAIVED -gt 0 ]] && echo "  ($WAIVED match(es) waived inline)"
+  [[ $DATA_EXEMPT -gt 0 ]] && echo "  ($DATA_EXEMPT permission-rule string(s) exempt: data, not commands)"
   if [[ $count -eq 0 && $LEAKS -eq 0 ]]; then
     echo "  clean"
   fi
