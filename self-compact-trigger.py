@@ -46,6 +46,12 @@ NO SWITCH — USER DECISION 2026-08-16
     this is not safe to run unconditionally, the correct fix is to make it safe,
     not to hide it behind a key. Do not add one back.
 
+    The abort-retry bounds (SELF_COMPACT_MAX_RETRIES,
+    SELF_COMPACT_RETRY_SPACING_SECONDS — see LOOP BOUND below) are not a
+    regression of this decision: they tune how hard an already-armed feature
+    retries a FAILED reset, and no value of either stops a threshold crossing
+    from firing. They are inputs, not gates — do not grow them into one.
+
     Note what firing does and does not cost. The handoff write is a haiku call
     (~$0.01-0.03, prefix cached). The expensive part is the opus-5 resume, and that
     is idle-handoff's pre-existing autofork: this trigger only makes a session
@@ -60,6 +66,31 @@ LOOP BOUND (B6)
     pathological oscillation. State is written BEFORE the model call, and if the
     state file cannot be written the hook does not fire at all — an unbounded
     trigger is worse than a missing one.
+
+    ABORT RE-ARM — the second re-arm channel (2026-09-04). inplace_reset.py now
+    records every terminal result in <sid>/outcome.json (its log stays
+    human-forensic; the outcome file is the one machine channel). An aborted
+    reset destroys nothing, so the session is still holding 300k+ — but
+    `armed:false` used to be final until a dip below the threshold, and a 400k
+    session never dips. MEASURED, sid 6f11dbf0: fired 13:04:59Z at 409k tokens,
+    reset aborted 13:08:19Z still-mid-turn, fires:1/armed:false, no retry —
+    self-compact silently gone for the rest of the session. Now an abort
+    outcome re-arms the session and it fires again in the SAME Stop invocation
+    (a Stop event IS a turn boundary — the one moment the dominant abort shape,
+    still-mid-turn, is guaranteed to have just ended), writing a FRESH handoff
+    rather than stretching inplace_reset's CLEAR_IDLE_WAIT_SECONDS over one
+    that only goes staler. Bounded four ways, each checked in
+    consume_abort_for_rearm:
+      * the outcome must be newer than the fire it answers, and each outcome
+        buys at most ONE re-arm (last_abort_consumed_at);
+      * at most SELF_COMPACT_MAX_RETRIES re-arms per crossing (default 3),
+        counted in rearm_retries and logged once at the cap;
+      * at least SELF_COMPACT_RETRY_SPACING_SECONDS between attempts
+        (default 900), enforced against last_fired_at;
+      * retry fires still count toward MAX_FIRES_PER_SESSION.
+    A success outcome never re-arms and returns the retry budget; so does the
+    dip re-arm (a dip is a new crossing). The env vars select BOUNDS, never
+    on/off — see NO SWITCH.
 """
 from __future__ import annotations
 
@@ -106,6 +137,20 @@ FIRE_AT_TOKENS = 300_000
 # low cap silently turns the feature off partway through exactly the sessions it
 # is for. 40 is far above any honest day's crossings and far below a loop.
 MAX_FIRES_PER_SESSION = 40
+# Bounds for the abort re-arm channel (LOOP BOUND in the module docstring).
+# Env-overridable INPUTS with documented defaults — operator directive
+# 2026-09-04: no fitted constants driving design. They select HOW MUCH retrying
+# a crossing gets, never WHETHER the feature runs (NO SWITCH stands).
+#
+# 3 retries: the dominant abort shape is "handoff written, still mid-turn 120s
+# after" (7 of ~21 aborts in inplace-reset.log, 2026-08-16..09-04), which a
+# single later turn boundary usually resolves; 3 keeps worst-case spend at 4
+# handoff turns per crossing. 900s spacing equals inplace_reset.py's
+# WRITE_WAIT_CAP_SECONDS: a retry inside that window could race a previous
+# attempt that is still legitimately waiting (reset.lock would refuse it, but
+# the refusal would burn a retry for nothing).
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_RETRY_SPACING_SECONDS = 900
 # Same rule reflect.sh validates, ALL of it: these ids become path components.
 #
 # The charset half was already here; the leading-dot rejection was not, so the
@@ -219,6 +264,12 @@ def marker_path_for(sid: str) -> Path:
     return session_dir(sid) / "request.json"
 
 
+def outcome_path(sid: str) -> Path:
+    """inplace_reset.py's terminal record for this session — the one machine
+    channel out of a reset (its log is human-forensic and never parsed here)."""
+    return session_dir(sid) / "outcome.json"
+
+
 def log(msg: str) -> None:
     """Best-effort audit line. Never raises; never touches stdout."""
     try:
@@ -238,11 +289,13 @@ def load_state(sid: str) -> dict:
             data.setdefault("armed", True)
             data.setdefault("fires", 0)
             data.setdefault("crossings", 0)
+            data.setdefault("rearm_retries", 0)
             return data
     except Exception:
         pass
     # No state yet: a fresh session is armed, so the first crossing fires.
-    return {"session_id": sid, "armed": True, "fires": 0, "crossings": 0}
+    return {"session_id": sid, "armed": True, "fires": 0, "crossings": 0,
+            "rearm_retries": 0}
 
 
 def write_json_atomic(path: Path, payload: dict) -> bool:
@@ -263,6 +316,88 @@ def write_json_atomic(path: Path, payload: dict) -> bool:
             except Exception:
                 pass
         return False
+
+
+def retry_bound(name: str, default: int) -> int:
+    """An env-overridable retry BOUND, read at call time. Never a switch.
+
+    Invalid or non-integer values fall back to the default: this runs inside a
+    Stop hook on every turn boundary, and a typo'd env var must degrade to the
+    documented behaviour, never take the trigger down. Negative values are as
+    meaningless as garbage and get the same treatment.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        return default
+    return value if value >= 0 else default
+
+
+def consume_abort_for_rearm(sid: str, state: dict) -> bool:
+    """Whether a fired-but-aborted crossing may fire again NOW.
+
+    Called only when `armed` is false and the session is above the threshold —
+    the state that used to be terminal. See ABORT RE-ARM in the module
+    docstring for the incident (sid 6f11dbf0) and the bound design.
+
+    True means: the abort outcome is consumed (recorded on `state` in memory)
+    and the caller falls through to the normal fire logic. Nothing is persisted
+    here on the consume path — the fire's own state write is the single atomic
+    record, so a fire that refuses to persist also leaves the outcome
+    consumable for the next Stop, which is the correct accounting: no fire
+    happened, no retry was spent.
+    """
+    try:
+        outcome = json.loads(outcome_path(sid).read_text())
+    except Exception:
+        return False  # no reset has reported back (or the record is unreadable)
+    if not isinstance(outcome, dict):
+        return False
+    at = outcome.get("at")
+    if not isinstance(at, int):
+        return False
+    status = outcome.get("status")
+    if status == "ok":
+        # The reset landed; this crossing's retry story is over. (In practice a
+        # successful reset changes the session id, so this state goes dormant —
+        # the reset matters for the accounting invariant, not for a live path.)
+        if state.get("rearm_retries") or state.get("rearm_capped"):
+            state["rearm_retries"] = 0
+            state.pop("rearm_capped", None)
+            write_json_atomic(state_path(sid), state)
+        return False
+    if status != "aborted":
+        return False
+    last_fired = state.get("last_fired_at", 0)
+    if at < last_fired:
+        # Left over from an earlier crossing: it answers a fire that already
+        # had its retry story, not the one this session is stuck on.
+        return False
+    if at <= state.get("last_abort_consumed_at", 0):
+        return False  # this record already bought its one re-arm
+    max_retries = retry_bound("SELF_COMPACT_MAX_RETRIES", DEFAULT_MAX_RETRIES)
+    if state.get("rearm_retries", 0) >= max_retries:
+        # Log ONCE, mirroring the `capped` pattern on MAX_FIRES_PER_SESSION.
+        if not state.get("rearm_capped"):
+            state["rearm_capped"] = True
+            write_json_atomic(state_path(sid), state)
+            log(f"sid={sid} abort re-arm capped at {max_retries} retr"
+                f"{'y' if max_retries == 1 else 'ies'} this crossing; not re-arming")
+        return False
+    spacing = retry_bound("SELF_COMPACT_RETRY_SPACING_SECONDS",
+                          DEFAULT_RETRY_SPACING_SECONDS)
+    if int(time.time()) - last_fired < spacing:
+        # Quiet: outcome stays unconsumed, so a later Stop past the spacing
+        # window retries. Logging here would emit a line per Stop event.
+        return False
+    state["rearm_retries"] = state.get("rearm_retries", 0) + 1
+    state["last_abort_consumed_at"] = at
+    log(f"sid={sid} RE-ARM after aborted reset (reason={outcome.get('reason')!r} "
+        f"at={at}) retry {state['rearm_retries']}/{max_retries}; firing again this Stop")
+    return True
 
 
 def gc_state(retention_days: int = STATE_RETENTION_DAYS) -> None:
@@ -376,17 +511,31 @@ def main() -> int:
         if not state.get("armed"):
             state["armed"] = True
             state["rearmed_at"] = int(time.time())
+            # A dip is a NEW crossing, and the retry budget is per crossing.
+            state["rearm_retries"] = 0
+            state.pop("rearm_capped", None)
             write_json_atomic(state_path(sid), state)
         return 0
 
-    if not state.get("armed"):
-        return 0  # already fired for this crossing
+    # The session cap is checked BEFORE the abort re-arm channel, not only on
+    # the armed path it used to guard: a fire-capped session must never consume
+    # an abort outcome (or log a RE-ARM line per Stop) for a fire it can never
+    # have. Abort-driven fires count toward this cap like any other.
     if state.get("fires", 0) >= MAX_FIRES_PER_SESSION:
         if not state.get("capped"):
             state["capped"] = True
             write_json_atomic(state_path(sid), state)
             log(f"sid={sid} capped at {MAX_FIRES_PER_SESSION} fires this session; not firing")
         return 0
+
+    if not state.get("armed"):
+        # Already fired for this crossing — final, unless the reset that fire
+        # spawned ABORTED (nothing destroyed, session still above threshold).
+        # This Stop event is a turn boundary, the best retry moment there is,
+        # so a consumable abort outcome re-arms and falls through to the fire
+        # logic below in the same invocation. See ABORT RE-ARM in the docstring.
+        if not consume_abort_for_rearm(sid, state):
+            return 0
 
     now = int(time.time())
     state["armed"] = False
