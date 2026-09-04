@@ -247,6 +247,40 @@ def test_a_lock_held_abort_never_buys_a_rearm(harness):
     assert harness.state()["fires"] == 2
 
 
+@pytest.mark.parametrize("field", ["last_fired_at", "last_abort_consumed_at"])
+@pytest.mark.parametrize("bad", ["2026-09-04T13:04:59Z", None, True, {"at": 1}])
+def test_a_malformed_state_field_cannot_kill_the_hook(harness, field, bad):
+    # state.json is read on every Stop and hand-edited during incidents. A str
+    # where an int belongs used to raise TypeError in the `at < last_fired`
+    # comparison, and __main__'s blanket except turned that into a silently
+    # dead trigger — indistinguishable from a session that never crossed.
+    assert harness.run(350_000) == 0
+    now = int(time.time())
+    harness.patch_state(last_fired_at=now - 1000)   # the fire, then corrupt one field
+    harness.patch_state(last_fired_at=now - 1000)   # the fire, then corrupt one field
+    harness.patch_state(**{field: bad})
+    harness.write_outcome("aborted", at=now - 5)
+    assert harness.run(360_000) == 0
+    # Coerce-or-default, so the re-arm still works off the outcome record.
+    st = harness.state()
+    assert st["fires"] == 2
+    assert st["rearm_retries"] == 1
+    assert st["last_abort_consumed_at"] == now - 5
+
+
+@pytest.mark.parametrize("counter", ["fires", "crossings", "rearm_retries"])
+def test_a_malformed_counter_does_not_crash_the_fire_path(harness, counter):
+    # Same class, on the fields the fire path does arithmetic with.
+    assert harness.run(350_000) == 0
+    harness.patch_state(**{counter: "many"})
+    harness.patch_state(last_fired_at=int(time.time()) - 1000)
+    harness.write_outcome("aborted", at=int(time.time()) - 5)
+    assert harness.run(360_000) == 0
+    st = harness.state()
+    assert isinstance(st[counter], int)
+    assert st["fires"] >= 1 and len(harness.spawned) == 2
+
+
 def test_no_outcome_means_no_rearm(harness):
     # The pre-existing silence on repeat Stops (smoke TEST 23) is unchanged
     # when no reset ever reported back.

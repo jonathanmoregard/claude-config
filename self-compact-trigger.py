@@ -307,15 +307,38 @@ def log(msg: str) -> None:
         pass
 
 
+def int_field(data: dict, key: str, default: int = 0) -> int:
+    """A state.json number, coerced or defaulted — never raising.
+
+    state.json is read on EVERY Stop, is hand-edited during incidents, and its
+    field shapes are whatever the version that last wrote it used. A str where
+    an int belongs made `at < last_fired` raise TypeError inside the hook, and
+    __main__'s blanket except turned that into a silently dead trigger — the
+    same corruption class the outcome.json reads are already hardened against,
+    on the file we write ourselves. Bools are ints in Python and are refused
+    here on purpose: `true` in a timestamp field is not "one second past the
+    epoch".
+    """
+    value = data.get(key, default)
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    return default
+
+
 def load_state(sid: str) -> dict:
     path = state_path(sid)
     try:
         data = json.loads(path.read_text())
         if isinstance(data, dict):
             data.setdefault("armed", True)
-            data.setdefault("fires", 0)
-            data.setdefault("crossings", 0)
-            data.setdefault("rearm_retries", 0)
+            # Counters, not just defaults: each one is an arithmetic and a
+            # comparison operand on every Stop (see int_field).
+            for key in ("fires", "crossings", "rearm_retries"):
+                data[key] = int_field(data, key)
             return data
     except Exception:
         pass
@@ -409,15 +432,15 @@ def consume_abort_for_rearm(sid: str, state: dict) -> bool:
         # overwrites this record with its own terminal outcome"), and THAT
         # record is the one that buys the retry.
         return False
-    last_fired = state.get("last_fired_at", 0)
+    last_fired = int_field(state, "last_fired_at")
     if at < last_fired:
         # Left over from an earlier crossing: it answers a fire that already
         # had its retry story, not the one this session is stuck on.
         return False
-    if at <= state.get("last_abort_consumed_at", 0):
+    if at <= int_field(state, "last_abort_consumed_at"):
         return False  # this record already bought its one re-arm
     max_retries = retry_bound("SELF_COMPACT_MAX_RETRIES", DEFAULT_MAX_RETRIES)
-    if state.get("rearm_retries", 0) >= max_retries:
+    if int_field(state, "rearm_retries") >= max_retries:
         # Log ONCE, mirroring the `capped` pattern on MAX_FIRES_PER_SESSION.
         if not state.get("rearm_capped"):
             state["rearm_capped"] = True
@@ -434,7 +457,7 @@ def consume_abort_for_rearm(sid: str, state: dict) -> bool:
         # Quiet: outcome stays unconsumed, so a later Stop past the spacing
         # window retries. Logging here would emit a line per Stop event.
         return False
-    state["rearm_retries"] = state.get("rearm_retries", 0) + 1
+    state["rearm_retries"] = int_field(state, "rearm_retries") + 1
     state["last_abort_consumed_at"] = at
     log(f"sid={sid} RE-ARM after aborted reset (reason={outcome.get('reason')!r} "
         f"at={at}) retry {state['rearm_retries']}/{max_retries}; firing again this Stop")
