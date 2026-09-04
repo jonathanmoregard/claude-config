@@ -6,6 +6,30 @@
 [general]
 verbose = false
 
+# dcg's own evaluation deadline. Upstream default is 1000ms, and a command
+# that misses it does NOT get evaluated: dcg renders `permissionDecision:
+# "ask"` (src/hook.rs `write_indeterminate_to`), meaning "no verdict, a human
+# decides". hooks/bash-guard.py blocks on that, correctly — but a block for
+# "the box was busy" is a false refusal of legitimate work.
+#
+# Measured on this host 2026-09-04. Eight ordinary commands were refused that
+# way in one morning while a runaway embedding service saturated the CPU: a
+# heredoc'd python probe, a `for` loop, a `sleep`-then-`git log` poll. The
+# same commands re-measured at 45-170ms once the box was idle, so the 1000ms
+# budget was never close to binding on the WORK — only on the load.
+#
+# 2000ms is ~12x the slowest idle measurement, and it stays inside the
+# guard's own ladder: bash-guard.py caps a dcg call at DCG_TIMEOUT_S=5 and
+# arms its whole-hook watchdog at GUARD_DEADLINE_S=6, so the hook call plus
+# the `dcg config` health check still fit with room left. Raising this much
+# past 2000 would start trading dcg's deadline for the guard's, which turns a
+# clear "dcg did not finish" into a broken-guard deny.
+#
+# Verified: `dcg config` reports `Hook timeout (ms): 2000 (configured)` with
+# this key present (dcg 0.12.5 honours it with a floor and no ceiling —
+# src/config.rs `effective_hook_timeout_ms`).
+hook_timeout_ms = 2000
+
 # DO NOT RE-ENABLE. Upstream defaults this to true, and true means dcg
 # REWRITES ~/.claude/settings.json from inside the hook path.
 #

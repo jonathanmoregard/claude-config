@@ -2201,8 +2201,16 @@ check(
 # An unhandled exception raised anywhere inside the new layer has to reach
 # the module-level fail-closed handler rather than escaping as a traceback,
 # which the harness would read as "no decision" — fail-open.
+# Anchored on the SIGNATURE, not on a docstring line. The first version of
+# this fixture matched the one-line docstring of `_nixos_command_pushes`;
+# when that docstring grew a second paragraph the match stopped applying, the
+# fixture silently no-opped, and three checks went red at once — which is the
+# loud version of a fixture that keeps passing while it asserts nothing. The
+# `raise` lands above the docstring, which then evaluates as a dead
+# expression, and the assertion below still proves the patch took.
 _nixos_fault_src = _src.replace(
-    '    """True if a `git push` is present (excluding --dry-run)."""',
+    "def _nixos_command_pushes(command: str) -> bool:",
+    "def _nixos_command_pushes(command: str) -> bool:\n"
     '    raise RuntimeError("injected nixos-gate fault")',
 )
 check("nixos-gate fault fixture actually patched the source", _nixos_fault_src != _src)
