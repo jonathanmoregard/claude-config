@@ -43,12 +43,25 @@ if [[ "$REFLECT_ROOT" != /* ]]; then
   exit 2
 fi
 
-# --- Stale-started reaper threshold (seconds) --------------------------------
-# If a manifest is stuck at status=started older than this, treat it as a
-# crashed prior run (host reboot, SIGKILL, orphaned worker) and permit re-run.
-# Default 600s ≈ max reflection budget (90s for sessionend) × safety factor
-# 6-7 to absorb API-latency spikes without prematurely reaping a live worker.
-: "${REFLECT_STALE_STARTED_SECONDS:=600}"
+# --- Stale-started reaper thresholds -----------------------------------------
+# REFLECT_STALE_STARTED_SECONDS: if a manifest is stuck at status=started older
+# than this, treat it as a crashed prior run (host reboot, SIGKILL, orphaned
+# worker) and permit re-run. Default 600s ≈ max reflection budget (90s for
+# sessionend) × safety factor 6-7 to absorb API-latency spikes without
+# prematurely reaping a live worker.
+#
+# REFLECT_REAP_MAX_PER_RUN: how many manifests the orphan reaper examines per
+# run, so one dispatcher never walks an unbounded tree (see reflect_reap_orphans).
+#
+# Both are read inside `(( ))`, so both are CLAMPED — but the clamp lives further
+# down this file (see "Numeric env normalization") and a function cannot be
+# called before it is defined. The `:=` defaults stay here beside the prose that
+# explains them; the clamp calls sit immediately after the function, and the
+# `_DEFAULT` constants are what keep the two halves from drifting apart.
+REFLECT_STALE_STARTED_SECONDS_DEFAULT=600
+REFLECT_REAP_MAX_PER_RUN_DEFAULT=200
+: "${REFLECT_STALE_STARTED_SECONDS:=$REFLECT_STALE_STARTED_SECONDS_DEFAULT}"
+: "${REFLECT_REAP_MAX_PER_RUN:=$REFLECT_REAP_MAX_PER_RUN_DEFAULT}"
 
 # --- Timeout budgets vs Claude Code's HARD hook cap (D3) ---------------------
 # Claude Code caps every `command` hook at 60s and the cap is NOT configurable
@@ -154,13 +167,44 @@ reflect_budget_for() {
 # correction is visible in the hook output instead of being a quiet behaviour
 # change. `printf -v` rather than a nameref: bash 3.1 has it, and the rest of
 # this file already avoids 4.3-only syntax.
+#
+# LEADING ZEROS ARE THE TRAP. `(( 08 < 1 ))` does not evaluate false — it ABORTS
+# with "value too great for base", because bash reads a 0-prefixed literal as
+# octal and 8 is not an octal digit. The clamp whose job is to make a bad value
+# safe was itself the thing that died on one, at SOURCE time, before any caller
+# could guard it. So: match the regex FIRST and return early on a non-numeric
+# value (no arithmetic ever runs on a string that is not all digits), then force
+# base-10 with `10#` before the range comparison.
+#
+# The normalized value is written back even when it was IN range: `08` is a
+# perfectly valid positive integer to this function, but it is still poison to
+# every downstream consumer that does arithmetic on it or hands it to `jq
+# --argjson` (where `08` is a JSON parse error). Normalizing to `8` here is what
+# makes "accepted" and "usable" the same thing.
 reflect_clamp_positive_int() {
   local name="${1:-}" def="${2:-}" cur="${!1:-}"
-  if [[ ! "$cur" =~ ^[0-9]+$ ]] || (( cur < 1 )); then
+  if [[ ! "$cur" =~ ^[0-9]+$ ]]; then
     echo "reflect: $name='$cur' is not a positive integer; RESET to the shipped default $def" >&2
     printf -v "$name" '%s' "$def"
+    return 0
   fi
+  # All-digits from here, so `10#` cannot fail and the comparison is safe.
+  cur=$(( 10#$cur ))
+  if (( cur < 1 )); then
+    echo "reflect: $name='${!1}' is not a positive integer; RESET to the shipped default $def" >&2
+    printf -v "$name" '%s' "$def"
+    return 0
+  fi
+  # In range: write the base-10 normalization back so `08` becomes `8` for every
+  # consumer, not just for this check.
+  printf -v "$name" '%s' "$cur"
 }
+
+# The reaper pair, declared near the top of this file with the prose that derives
+# their defaults, clamped here at the first point where the clamp exists. Both
+# feed `(( ))` in reflect_reap_orphans and is_already_complete.
+reflect_clamp_positive_int REFLECT_STALE_STARTED_SECONDS "$REFLECT_STALE_STARTED_SECONDS_DEFAULT"
+reflect_clamp_positive_int REFLECT_REAP_MAX_PER_RUN "$REFLECT_REAP_MAX_PER_RUN_DEFAULT"
 
 # --- Resume pre-check: when the fork is doomed before it starts (B2) ---------
 # `claude -p --resume <sid> --fork-session` replays the WHOLE session into the
@@ -896,8 +940,12 @@ REFLECT_MISSION_STAMP_LEGACY_RE='^<!-- written-against: sha=([A-Za-z0-9]+|none) 
 REFLECT_MISSION_COPY_RE='^mission\.([A-Za-z0-9._-]+)\.md$'
 
 # Retention for GC (documented age rule). A copy older than this is collected even
-# if its session dir still exists.
-: "${REFLECT_MISSION_RETENTION_DAYS:=30}"
+# if its session dir still exists. Clamped: mission_gc multiplies it out into a
+# `max_age` inside `(( ))`, and this one governs a DELETE — an empty or
+# non-numeric value would read as 0 and make every copy instantly stale.
+REFLECT_MISSION_RETENTION_DAYS_DEFAULT=30
+: "${REFLECT_MISSION_RETENTION_DAYS:=$REFLECT_MISSION_RETENTION_DAYS_DEFAULT}"
+reflect_clamp_positive_int REFLECT_MISSION_RETENTION_DAYS "$REFLECT_MISSION_RETENTION_DAYS_DEFAULT"
 
 # mission_has_our_stamp <file> — 0 when line 1 is a stamp WE wrote, sid included.
 # Used ONLY as the GC delete rail. Never as evidence for a read or act decision;

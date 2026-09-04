@@ -531,6 +531,70 @@ else
 fi
 
 # ===========================================================================
+# F2 — a leading-zero knob is normalized, not fatal.
+# `(( 08 < 1 ))` aborts with "value too great for base" (bash reads 0-prefixed
+# literals as octal), and the clamp whose job is to make a bad value safe was
+# doing that arithmetic itself, at SOURCE time. Because the failing `(( ))` sat
+# in an `if A || B` condition it did not kill the shell — it just returned false,
+# so the value was never reset and `08` travelled on to every consumer. Which
+# consumer breaks depends on the knob: an assignment like
+# `raw_cap=$(( cap * 4 ))` dies outright, an `if (( ... ))` silently takes the
+# wrong branch. So the assertions below are on the NORMALIZED VALUE itself,
+# which is the one thing every consumer depends on.
+# ===========================================================================
+t_begin "F2: a leading-zero knob is normalized, and the clamp survives it"
+# Unit leg. `f2_val` prints what a fresh source of lib.sh normalizes a knob to;
+# `f2_err` captures what that source said on stderr. Sourcing in a child keeps
+# the harness's own environment out of it.
+f2_val() { env "$1=$2" bash -c 'source "$0" >/dev/null 2>&1; printf "%s" "${!1}"' "$LIB_SH" "$1"; }
+# Only stdout is discarded inside the child — stderr is the whole point here, so
+# it stays open and the OUTER 2>&1 is what captures it.
+f2_err() { env "$1=$2" bash -c 'source "$0" >/dev/null' "$LIB_SH" 2>&1; }
+
+[[ "$(f2_val REFLECT_EXCERPT_BYTES 08)" == "8" ]]; assert $? "REFLECT_EXCERPT_BYTES=08 normalizes to 8 (got '$(f2_val REFLECT_EXCERPT_BYTES 08)')"
+# The clamp used to do `(( 08 < 1 ))` itself and abort on it. Nothing may say so.
+if grep -qF 'value too great for base' <<<"$(f2_err REFLECT_EXCERPT_BYTES 08)"; then
+  bad "the clamp still evaluates the raw value as octal arithmetic"
+else
+  ok "no octal arithmetic error from sourcing lib.sh with a leading-zero knob"
+fi
+# The three knobs F2 adds to the clamp family. Unclamped, each stays '08'.
+[[ "$(f2_val REFLECT_STALE_STARTED_SECONDS 08)" == "8" ]]; assert $? "REFLECT_STALE_STARTED_SECONDS is clamped (got '$(f2_val REFLECT_STALE_STARTED_SECONDS 08)')"
+[[ "$(f2_val REFLECT_REAP_MAX_PER_RUN 08)" == "8" ]]; assert $? "REFLECT_REAP_MAX_PER_RUN is clamped (got '$(f2_val REFLECT_REAP_MAX_PER_RUN 08)')"
+[[ "$(f2_val REFLECT_MISSION_RETENTION_DAYS 08)" == "8" ]]; assert $? "REFLECT_MISSION_RETENTION_DAYS is clamped (got '$(f2_val REFLECT_MISSION_RETENTION_DAYS 08)')"
+# Control: the reset path still fires for genuinely bad values, and a good value
+# is passed through untouched.
+[[ "$(f2_val REFLECT_MISSION_RETENTION_DAYS abc)" == "30" ]]; assert $? "a non-numeric value still resets to the shipped default"
+[[ "$(f2_val REFLECT_MISSION_RETENTION_DAYS 0)" == "30" ]]; assert $? "zero still resets to the shipped default"
+[[ "$(f2_val REFLECT_MISSION_RETENTION_DAYS 45)" == "45" ]]; assert $? "a valid override is left alone"
+
+# Integration leg: the dispatcher still produces a reflection with such a knob set.
+reset_logs
+ZERO_AGENT_ID="d4fe958152f9bfb44"
+ZERO_TRANSCRIPT="$PROJECTS_DIR/$PARENT_SID/subagents/agent-$ZERO_AGENT_ID.jsonl"
+cp -- "$AGENT_TRANSCRIPT" "$ZERO_TRANSCRIPT"
+STUB_MODE=ok REFLECT_EXCERPT_BYTES=08 \
+  bash "$REFLECT_SH" subagentstop <<<"$(subagent_payload "$PARENT_SID" "$ZERO_AGENT_ID" "$ZERO_TRANSCRIPT")"
+rc=$?
+assert "$(( rc == 0 ? 0 : 1 ))" "dispatcher exits 0 with a leading-zero knob (rc=$rc)"
+ZERO_MANIFEST="$REFLECT_ROOT/sessions/$PARENT_SID/subagents/$ZERO_AGENT_ID/manifest.json"
+if wait_terminal "$ZERO_MANIFEST" subagentstop; then
+  jqe '.modes.subagentstop.status == "complete"' "$ZERO_MANIFEST"; assert $? "a reflection still lands"
+else
+  bad "no terminal manifest at $ZERO_MANIFEST"
+fi
+[[ -f "$REFLECT_ROOT/sessions/$PARENT_SID/subagents/$ZERO_AGENT_ID/final.json" ]]; assert $? "final.json written"
+# Regression guards, not discriminators: `jq --argjson` happens to accept `08`
+# and coerce it to 8, so this leg passed even before the clamp was fixed. It is
+# here because the finding asks that a dispatcher fire with such a knob set still
+# produce a reflection — which is the thing an operator would notice going away.
+grep -qF 'FIXTURE-MARKER-AGENT-REPLY' "$STUB_PROMPT_LOG"; assert $? "the transcript extract still ran"
+if grep -qF 'held no legible message content' "$STUB_PROMPT_LOG"; then
+  bad "the extract collapsed to the empty-block placeholder"
+else
+  ok "the extract did not collapse to the empty-block placeholder"
+fi
+
 # T2 — syntax + lint
 # ===========================================================================
 t_begin "T2: bash -n and shellcheck"
