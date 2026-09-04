@@ -43,12 +43,25 @@ if [[ "$REFLECT_ROOT" != /* ]]; then
   exit 2
 fi
 
-# --- Stale-started reaper threshold (seconds) --------------------------------
-# If a manifest is stuck at status=started older than this, treat it as a
-# crashed prior run (host reboot, SIGKILL, orphaned worker) and permit re-run.
-# Default 600s ≈ max reflection budget (90s for sessionend) × safety factor
-# 6-7 to absorb API-latency spikes without prematurely reaping a live worker.
-: "${REFLECT_STALE_STARTED_SECONDS:=600}"
+# --- Stale-started reaper thresholds -----------------------------------------
+# REFLECT_STALE_STARTED_SECONDS: if a manifest is stuck at status=started older
+# than this, treat it as a crashed prior run (host reboot, SIGKILL, orphaned
+# worker) and permit re-run. Default 600s ≈ max reflection budget (90s for
+# sessionend) × safety factor 6-7 to absorb API-latency spikes without
+# prematurely reaping a live worker.
+#
+# REFLECT_REAP_MAX_PER_RUN: how many manifests the orphan reaper examines per
+# run, so one dispatcher never walks an unbounded tree (see reflect_reap_orphans).
+#
+# Both are read inside `(( ))`, so both are CLAMPED — but the clamp lives further
+# down this file (see "Numeric env normalization") and a function cannot be
+# called before it is defined. The `:=` defaults stay here beside the prose that
+# explains them; the clamp calls sit immediately after the function, and the
+# `_DEFAULT` constants are what keep the two halves from drifting apart.
+REFLECT_STALE_STARTED_SECONDS_DEFAULT=600
+REFLECT_REAP_MAX_PER_RUN_DEFAULT=200
+: "${REFLECT_STALE_STARTED_SECONDS:=$REFLECT_STALE_STARTED_SECONDS_DEFAULT}"
+: "${REFLECT_REAP_MAX_PER_RUN:=$REFLECT_REAP_MAX_PER_RUN_DEFAULT}"
 
 # --- Timeout budgets vs Claude Code's HARD hook cap (D3) ---------------------
 # Claude Code caps every `command` hook at 60s and the cap is NOT configurable
@@ -82,6 +95,15 @@ fi
 : "${REFLECT_BUDGET_SESSIONEND:=90}"
 : "${REFLECT_BUDGET_SUBAGENTSTOP:=40}"
 : "${REFLECT_BUDGET_MISSION:=60}"
+
+# The sessionend FALLBACK's own budget (B1). It is a second model call, made
+# after the primary has already spent up to REFLECT_BUDGET_SESSIONEND, so it is
+# deliberately NOT carved out of the primary's budget: both run detached, off
+# the hook clock, and the thing we are buying is that final.json lands at all.
+# Same 90s as the primary because it is the same job — one reflection over one
+# session — against a prompt that is bounded by REFLECT_FALLBACK_TAIL_CAP_BYTES
+# rather than by a whole replayed transcript, so 90s is if anything generous.
+: "${REFLECT_BUDGET_SESSIONEND_FALLBACK:=90}"
 
 # --- Enforcement of the arithmetic above (not just documentation) ------------
 # REFLECT_BUDGET_PRECOMPACT is an operator-facing override and was never checked
@@ -134,6 +156,145 @@ reflect_budget_for() {
     *)            printf '%s' "$REFLECT_BUDGET_SUBAGENTSTOP" ;;
   esac
 }
+
+# --- Numeric env normalization -----------------------------------------------
+# reflect_clamp_positive_int <VAR_NAME> <shipped_default>
+# Every size/threshold below is an operator-facing INPUT, and a mis-set one is
+# worse than a wrong default: an empty or non-numeric value makes `(( ))` read
+# it as 0, which would silently turn "cap the prompt" into "send nothing" and
+# "skip the doomed resume" into "skip every resume". Reset + a stderr line, the
+# same posture reflect_enforce_sync_budget_cap takes for the budgets, so the
+# correction is visible in the hook output instead of being a quiet behaviour
+# change. `printf -v` rather than a nameref: bash 3.1 has it, and the rest of
+# this file already avoids 4.3-only syntax.
+#
+# LEADING ZEROS ARE THE TRAP. `(( 08 < 1 ))` does not evaluate false — it ABORTS
+# with "value too great for base", because bash reads a 0-prefixed literal as
+# octal and 8 is not an octal digit. The clamp whose job is to make a bad value
+# safe was itself the thing that died on one, at SOURCE time, before any caller
+# could guard it. So: match the regex FIRST and return early on a non-numeric
+# value (no arithmetic ever runs on a string that is not all digits), then force
+# base-10 with `10#` before the range comparison.
+#
+# The normalized value is written back even when it was IN range: `08` is a
+# perfectly valid positive integer to this function, but it is still poison to
+# every downstream consumer that does arithmetic on it or hands it to `jq
+# --argjson` (where `08` is a JSON parse error). Normalizing to `8` here is what
+# makes "accepted" and "usable" the same thing.
+reflect_clamp_positive_int() {
+  local name="${1:-}" def="${2:-}" cur="${!1:-}"
+  if [[ ! "$cur" =~ ^[0-9]+$ ]]; then
+    echo "reflect: $name='$cur' is not a positive integer; RESET to the shipped default $def" >&2
+    printf -v "$name" '%s' "$def"
+    return 0
+  fi
+  # All-digits from here, so `10#` cannot fail and the comparison is safe.
+  cur=$(( 10#$cur ))
+  if (( cur < 1 )); then
+    echo "reflect: $name='${!1}' is not a positive integer; RESET to the shipped default $def" >&2
+    printf -v "$name" '%s' "$def"
+    return 0
+  fi
+  # In range: write the base-10 normalization back so `08` becomes `8` for every
+  # consumer, not just for this check.
+  printf -v "$name" '%s' "$cur"
+}
+
+# The reaper pair, declared near the top of this file with the prose that derives
+# their defaults, clamped here at the first point where the clamp exists. Both
+# feed `(( ))` in reflect_reap_orphans and is_already_complete.
+reflect_clamp_positive_int REFLECT_STALE_STARTED_SECONDS "$REFLECT_STALE_STARTED_SECONDS_DEFAULT"
+reflect_clamp_positive_int REFLECT_REAP_MAX_PER_RUN "$REFLECT_REAP_MAX_PER_RUN_DEFAULT"
+
+# --- Resume pre-check: when the fork is doomed before it starts (B2) ---------
+# `claude -p --resume <sid> --fork-session` replays the WHOLE session into the
+# reflection model's window. Measured 2026-09-04 on sid 40fbb4a9: a 305k-token
+# session (1.86 MB of transcript JSONL) replayed into haiku's 200k window made
+# the fork auto-compact mid-reflection, blow the 90s budget, and leave
+# status=timeout with no final.json. Nothing about that is recoverable at the
+# 89th second — it is knowable from the file size before the call is made.
+#
+# THE THRESHOLD IS DERIVED FROM TWO INPUTS, NOT FITTED. Both are env-settable,
+# and the threshold itself can be set directly to override the derivation:
+#
+#   REFLECT_RESUME_MODEL_WINDOW_TOKENS   a property of the model (haiku: 200k).
+#                                        Raise it when REFLECT_MODEL is a
+#                                        1M-window build; the pre-check then
+#                                        stops firing, which is correct.
+#   REFLECT_TRANSCRIPT_BYTES_PER_TOKEN   the measured ratio on this host:
+#                                        1.86 MB / 305k tokens = 6.1 bytes per
+#                                        token of replayed context. Rounded DOWN
+#                                        to 6 so the threshold errs toward
+#                                        attempting the resume rather than
+#                                        skipping a session that would have fit.
+#
+#   default threshold = 200000 * 6 = 1,200,000 bytes
+#
+# The observed dead session (1.86 MB) is above it and would now go straight to
+# the fallback; a transcript under it is still resumed, which is where the ~77%
+# prompt-cache hit lives and why the pre-check is a bound and not a policy.
+# When it fires, the measured size AND the threshold both land in the manifest,
+# so the ratio is a reported outcome rather than a hidden constant.
+REFLECT_RESUME_MODEL_WINDOW_TOKENS_DEFAULT=200000
+REFLECT_TRANSCRIPT_BYTES_PER_TOKEN_DEFAULT=6
+: "${REFLECT_RESUME_MODEL_WINDOW_TOKENS:=$REFLECT_RESUME_MODEL_WINDOW_TOKENS_DEFAULT}"
+: "${REFLECT_TRANSCRIPT_BYTES_PER_TOKEN:=$REFLECT_TRANSCRIPT_BYTES_PER_TOKEN_DEFAULT}"
+reflect_clamp_positive_int REFLECT_RESUME_MODEL_WINDOW_TOKENS "$REFLECT_RESUME_MODEL_WINDOW_TOKENS_DEFAULT"
+reflect_clamp_positive_int REFLECT_TRANSCRIPT_BYTES_PER_TOKEN "$REFLECT_TRANSCRIPT_BYTES_PER_TOKEN_DEFAULT"
+: "${REFLECT_RESUME_MAX_TRANSCRIPT_BYTES:=$(( REFLECT_RESUME_MODEL_WINDOW_TOKENS * REFLECT_TRANSCRIPT_BYTES_PER_TOKEN ))}"
+reflect_clamp_positive_int REFLECT_RESUME_MAX_TRANSCRIPT_BYTES \
+  "$(( REFLECT_RESUME_MODEL_WINDOW_TOKENS * REFLECT_TRANSCRIPT_BYTES_PER_TOKEN ))"
+
+# --- Byte caps on everything inlined into a prompt ---------------------------
+# Three different bodies now reach a prompt as DATA rather than as a resumed
+# session, and each gets its own bound. They sit beside the pre-existing 16 KB
+# checkpoints cap in reflect.sh and are sized in the same units for the same
+# reason: a prompt the model cannot finish reading inside the budget produces
+# nothing, and an unbounded one is also the cheapest denial-of-service against
+# this subsystem (a seeded transcript is attacker-influenceable content).
+#
+#   AGENT_TRANSCRIPT  24 KB (~4k tokens). One subagent run is one task's worth
+#                     of text, and the subagentstop budget is 40s with no cache
+#                     to reuse. Deliberately the same order as the 16 KB
+#                     checkpoints block, which summarises a whole session.
+#   FALLBACK_TAIL     48 KB (~8k tokens). The fallback's only view of the
+#                     session, on the longer 90s budget, so it gets twice the
+#                     subagent's allowance — still two orders of magnitude
+#                     below the 1.86 MB transcript that killed the resume.
+#   HANDOFF           8 KB. prompts/mission.md produces a page of markdown by
+#                     construction, so this admits a whole handoff and refuses
+#                     a runaway one.
+#   EXCERPT           200 chars, the length the unparseable-reply path already
+#                     used for raw_excerpt. Now one named input rather than the
+#                     same literal in three places: quoted tool_result bodies,
+#                     the envelope's `result` in an error manifest, and that
+#                     pre-existing raw_excerpt.
+#
+# Caps are applied in CHARACTERS, exactly as the checkpoints cap already is.
+# The bound is a prompt-budget guard, not a security boundary, so a multi-byte
+# body landing slightly over its byte figure changes nothing that matters.
+REFLECT_AGENT_TRANSCRIPT_CAP_BYTES_DEFAULT=24576
+REFLECT_FALLBACK_TAIL_CAP_BYTES_DEFAULT=49152
+REFLECT_HANDOFF_CAP_BYTES_DEFAULT=8192
+REFLECT_EXCERPT_BYTES_DEFAULT=200
+: "${REFLECT_AGENT_TRANSCRIPT_CAP_BYTES:=$REFLECT_AGENT_TRANSCRIPT_CAP_BYTES_DEFAULT}"
+: "${REFLECT_FALLBACK_TAIL_CAP_BYTES:=$REFLECT_FALLBACK_TAIL_CAP_BYTES_DEFAULT}"
+: "${REFLECT_HANDOFF_CAP_BYTES:=$REFLECT_HANDOFF_CAP_BYTES_DEFAULT}"
+: "${REFLECT_EXCERPT_BYTES:=$REFLECT_EXCERPT_BYTES_DEFAULT}"
+reflect_clamp_positive_int REFLECT_AGENT_TRANSCRIPT_CAP_BYTES "$REFLECT_AGENT_TRANSCRIPT_CAP_BYTES_DEFAULT"
+reflect_clamp_positive_int REFLECT_FALLBACK_TAIL_CAP_BYTES "$REFLECT_FALLBACK_TAIL_CAP_BYTES_DEFAULT"
+reflect_clamp_positive_int REFLECT_HANDOFF_CAP_BYTES "$REFLECT_HANDOFF_CAP_BYTES_DEFAULT"
+reflect_clamp_positive_int REFLECT_EXCERPT_BYTES "$REFLECT_EXCERPT_BYTES_DEFAULT"
+
+# A self-compact handoff is written for the sid it belongs to, so a stale one is
+# not really reachable — but "present" and "describes this session's work" are
+# different claims, and a resumed sid could carry a handoff from a much earlier
+# stretch of work. One day is long enough that no live session's own handoff is
+# ever excluded and short enough that nothing archaeological is presented to the
+# model as if it were this session's state.
+REFLECT_HANDOFF_MAX_AGE_SECONDS_DEFAULT=86400
+: "${REFLECT_HANDOFF_MAX_AGE_SECONDS:=$REFLECT_HANDOFF_MAX_AGE_SECONDS_DEFAULT}"
+reflect_clamp_positive_int REFLECT_HANDOFF_MAX_AGE_SECONDS "$REFLECT_HANDOFF_MAX_AGE_SECONDS_DEFAULT"
 
 # --- Boolean env normalization (used by REFLECT_FORCE and friends) -----------
 # Truthy: 1, true, yes, on (case-insensitive). Anything else = false.
@@ -219,6 +380,10 @@ paths_for_session() {
 # Creates the session dir + checkpoint dir (+ subagent parent chain).
 ensure_session_dirs() {
   local sid="$1" parent="${2:-}"
+  # shellcheck disable=SC2034  # these are not unused, they are the CONTAINER for
+  # the eval below. paths_for_session emits assignments to all five names; every
+  # one must already be `local` here or eval writes it into the caller's scope —
+  # and the caller is the dispatcher, which holds its own manifest_path.
   local session_dir final_path manifest_path checkpoint_dir subagent_dir
   eval "$(paths_for_session "$sid" "$parent")"
   mkdir -p "$session_dir" "$checkpoint_dir"
@@ -686,7 +851,12 @@ reflect_artifact_gc() {
 # USER DECISION 2026-08-15: stop trying to make repo content trustworthy. Move the
 # authoritative handoff out of every repo.
 #
-#   $REFLECT_ROOT/sessions/<sid>/handoff/mission.md
+#   NOTE THE ROOT: the handoff and its sidecar live under $CLAUDE_SESSIONS_DIR
+#   (default ~/.local/state/claude-self-compact), NOT under $REFLECT_ROOT. The
+#   reflection artifacts (manifest.json, final.json) are the ones under
+#   $REFLECT_ROOT/sessions/<sid>/. See mission_handoff_path / mission_handoff_cwd_path.
+#
+#   $CLAUDE_SESSIONS_DIR/<sid>/handoff/mission.md
 #                                             AUTHORITATIVE. Outside every repo,
 #                                             not git-tracked, not reachable by
 #                                             repo content. The unattended fork
@@ -694,7 +864,7 @@ reflect_artifact_gc() {
 #                                             write access to this directory and
 #                                             nothing else, which is why the
 #                                             directory holds nothing else.
-#   $REFLECT_ROOT/sessions/<sid>/mission.cwd  which project this handoff is for.
+#   $CLAUDE_SESSIONS_DIR/<sid>/cwd            which project this handoff is for.
 #                                             Outside the repo AND outside the
 #                                             fork's write grant, so the
 #                                             cwd -> handoff lookup consults
@@ -775,8 +945,12 @@ REFLECT_MISSION_STAMP_LEGACY_RE='^<!-- written-against: sha=([A-Za-z0-9]+|none) 
 REFLECT_MISSION_COPY_RE='^mission\.([A-Za-z0-9._-]+)\.md$'
 
 # Retention for GC (documented age rule). A copy older than this is collected even
-# if its session dir still exists.
-: "${REFLECT_MISSION_RETENTION_DAYS:=30}"
+# if its session dir still exists. Clamped: mission_gc multiplies it out into a
+# `max_age` inside `(( ))`, and this one governs a DELETE — an empty or
+# non-numeric value would read as 0 and make every copy instantly stale.
+REFLECT_MISSION_RETENTION_DAYS_DEFAULT=30
+: "${REFLECT_MISSION_RETENTION_DAYS:=$REFLECT_MISSION_RETENTION_DAYS_DEFAULT}"
+reflect_clamp_positive_int REFLECT_MISSION_RETENTION_DAYS "$REFLECT_MISSION_RETENTION_DAYS_DEFAULT"
 
 # mission_has_our_stamp <file> — 0 when line 1 is a stamp WE wrote, sid included.
 # Used ONLY as the GC delete rail. Never as evidence for a read or act decision;
@@ -820,15 +994,22 @@ mission_has_our_legacy_stamp() {
 # else's checkout with edits auto-accepted. The out-of-repo move closed the class
 # where repo content decides what a fork runs; the write grant re-opened it.
 #
-#   sessions/<sid>/handoff/mission.md    FORK-WRITABLE, and the ONLY thing in there
-#   sessions/<sid>/mission.cwd           OUTSIDE the grant: an INPUT to resolution
-#   sessions/<sid>/manifest.json         OUTSIDE: "did the write succeed" is read
-#                                        from it, by the process that decides to fork
-#   sessions/<sid>/final.json            OUTSIDE: the reflection tree
-#   sessions/<sid>/checkpoints/          OUTSIDE: ditto
+# CURRENT LAYOUT — note that TWO roots are involved. The handoff and the sidecar
+# resolution reads are under $CLAUDE_SESSIONS_DIR; the reflection artifacts are
+# under $REFLECT_ROOT. Only the first line is inside the fork's write grant:
 #
-# RULE for anyone adding a file under a session: it goes in `sessions/<sid>/`.
-# `sessions/<sid>/handoff/` holds the handoff body and nothing else, ever. Adding a
+#   $CLAUDE_SESSIONS_DIR/<sid>/handoff/mission.md
+#                                        FORK-WRITABLE, and the ONLY thing in there
+#   $CLAUDE_SESSIONS_DIR/<sid>/cwd       OUTSIDE the grant: an INPUT to resolution
+#   $REFLECT_ROOT/sessions/<sid>/manifest.json
+#                                        OUTSIDE: "did the write succeed" is read
+#                                        from it, by the process that decides to fork
+#   $REFLECT_ROOT/sessions/<sid>/final.json      OUTSIDE: the reflection tree
+#   $REFLECT_ROOT/sessions/<sid>/checkpoints/    OUTSIDE: ditto
+#
+# RULE for anyone adding a file under a session: it goes in the session dir, one
+# level UP from the grant.
+# `$CLAUDE_SESSIONS_DIR/<sid>/handoff/` holds the handoff body and nothing else, ever. Adding a
 # second file there hands it to the fork; adding one that any decision reads
 # re-opens this exact hole. tests/smoke.sh TEST 36 asserts the grant's contents,
 # and TEST 24 asserts the grant that is actually passed on the fork's command line.
@@ -844,19 +1025,19 @@ mission_handoff_cwd_path() { printf '%s' "$CLAUDE_SESSIONS_DIR/${1:-}/cwd"; }
 # (both ends read it from the same place: mission mode records the payload cwd,
 # idle-handoff.sh extracts `.cwd` from the transcript). Compared literally.
 #
-# Newest-by-mtime among $REFLECT_ROOT/sessions/<sid>/handoff/mission.md whose
-# mission.cwd — one level UP, outside the fork's write grant — names this project.
+# Newest-by-mtime among $CLAUDE_SESSIONS_DIR/<sid>/handoff/mission.md whose
+# `cwd` file — one level UP, outside the fork's write grant — names this project.
 # EVERY input to that decision is outside every repo AND outside anything the
-# unattended fork can write: the candidate set comes from $REFLECT_ROOT, and the cwd
+# unattended fork can write: the candidate set comes from $CLAUDE_SESSIONS_DIR, and the cwd
 # association comes from a file only the hook process writes. Repo content cannot
 # add a candidate, rename one, or change which project one claims (which is why a
 # planted repo copy is a non-event rather than a case to catch), and neither can the
 # fork whose own handoff is one of the candidates.
 #
-# Depth is pinned to exactly sessions/<sid>/handoff/mission.md, and the middle
-# component must literally be `handoff`. Both halves matter: the fork CAN create
-# nested directories inside its grant, so an unpinned search would let it mint
-# `handoff/handoff/mission.md` with a planted `handoff/mission.cwd` as that
+# Depth is pinned to exactly <sid>/handoff/mission.md under $CLAUDE_SESSIONS_DIR,
+# and the middle component must literally be `handoff`. Both halves matter: the
+# fork CAN create nested directories inside its grant, so an unpinned search would
+# let it mint `handoff/handoff/mission.md` with a planted `handoff/cwd` as that
 # candidate's sidecar. Subagent artifacts nest under
 # sessions/<parent>/subagents/<sid>/ and mission mode never writes there.
 #
@@ -1022,65 +1203,244 @@ mission_gc() {
   printf '%s' "$removed"
 }
 
-# --- Best-effort parent-SID discovery for subagents --------------------------
-# find_parent_session_id <subagent_sid> <cwd> <transcript_path>
-# Strategy, in order:
-#   1. $CLAUDE_PARENT_SESSION_ID env (set explicitly)
-#   2. Scan sibling transcript JSONLs in the same project dir for a Task
-#      tool_use referencing this subagent's sid (best-effort, cheap grep).
-#   3. Empty string -> caller treats subagent SID as its own parent.
-find_parent_session_id() {
-  local sub_sid="$1" cwd="$2" tp="$3"
-  if [[ -n "${CLAUDE_PARENT_SESSION_ID:-}" ]]; then
-    # Only honor env-provided parent SID if it passes the safe-charset check.
-    if is_valid_sid "$CLAUDE_PARENT_SESSION_ID"; then
-      printf '%s' "$CLAUDE_PARENT_SESSION_ID"
+# ============================================================================
+# PARENT LINKAGE — the payload says it; nothing infers it
+# ============================================================================
+# There used to be a `find_parent_session_id` here: env `CLAUDE_PARENT_SESSION_ID`
+# first, then a `grep -lF <sid>` scan across every sibling transcript JSONL in the
+# project dir, taking whichever the kernel returned first.
+#
+# BOTH HALVES WERE WRONG, and the scan actively harmful (verified 2026-09-04
+# against Claude Code 2.1.260):
+#   * 2.1.260 sets no CLAUDE_PARENT_SESSION_ID at all, so strategy 1 never fired.
+#   * The scan matched any transcript that merely MENTIONED the sid — a sid
+#     appears in the transcripts of sessions that only talked about it — and
+#     readdir order is not mtime order, so the SAME session was observed nested
+#     under two different "parents" on two runs.
+#   * The sid being scanned for was the PARENT's own (the payload's `session_id`
+#     is the parent session, not the subagent), so the whole search was for the
+#     parent of the parent.
+#
+# The 2.1.260 SubagentStop payload states the linkage outright: `session_id` is
+# the parent, `agent_id` names the subagent, `agent_transcript_path` points at
+# its transcript. reflect.sh reads those three fields and nests at
+# sessions/<session_id>/subagents/<agent_id>/. When they are absent (an older
+# harness) it writes a structured record and stops — deliberately NOT falling
+# back to a scan, and NOT treating the parent as a subagent, which is what
+# produced the misnested artifacts and the mid-session reflections of live
+# parent sessions in the corpus.
+#
+# Nothing replaces this function. A guess about which session owns an artifact
+# is worse than no artifact: the artifact is filed somewhere a consumer will
+# read it as fact.
+
+# --- Inlined transcript extracts (A3 / B1) -----------------------------------
+# Two paths now feed transcript CONTENT to a model instead of resuming a
+# session: the subagent reflection (an agent transcript is not a resumable
+# session) and the sessionend fallback (the resume is what failed).
+#
+# UNTRUSTED DATA, ALWAYS. Everything these produce is transcript text: user
+# turns, model turns, and tool output from the open internet. It is passed as
+# prompt content to a `--tools ""` subprocess, is never executed, never
+# interpolated into a shell command, and the reply it produces is JSON-parsed
+# and schema-normalised before anything downstream sees it. The prompts that
+# carry these blocks say so to the model as well; see prompts/subagentstop.md
+# and prompts/sessionend-fallback.md.
+
+# reflect_file_size <path> — size in bytes, or 0 for anything unreadable.
+reflect_file_size() {
+  local f="${1:-}" n=""
+  [[ -f "$f" ]] || { printf '0'; return 0; }
+  n="$(stat -c '%s' "$f" 2>/dev/null || echo '')"
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  printf '%s' "$n"
+}
+
+# reflect_jsonl_to_text — stdin: Claude Code transcript JSONL. stdout: one
+# `role: body` paragraph per message that has human-legible content.
+#
+# What survives: text blocks and plain-string content — the actual conversation.
+# What does not: thinking blocks (internal, and the bulkiest thing in a modern
+# transcript), tool_use INPUTS (the call is named, its arguments are not), and
+# tool_result BODIES beyond REFLECT_EXCERPT_BYTES. That is the whole point of
+# extracting rather than inlining: a transcript is mostly tool payloads, and a
+# reflection is about what happened, not about the bytes that passed through.
+#
+# Every jq access is defensive. This is the one place where a MALFORMED line is
+# expected rather than exceptional: transcripts are appended to live and the
+# last line of a file being written is routinely half-flushed, and the tail
+# slice below cuts a line in half by construction. `fromjson?` drops those
+# silently; a non-object content element is stringified rather than dereferenced,
+# because `.type` on a string aborts the whole jq program and would cost us the
+# entire extract for one odd line.
+reflect_jsonl_to_text() {
+  jq -R -r --argjson excerpt "$REFLECT_EXCERPT_BYTES" '
+    (fromjson? // empty) as $e
+    | ($e.message // {}) as $m
+    | ((($m | if type == "object" then .role else null end) // $e.type // "?") | tostring) as $role
+    | ($m | if type == "object" then .content else null end) as $c
+    | ( if ($c | type) == "string" then [$c]
+        elif ($c | type) == "array" then
+          [ $c[]
+            | if type == "object" then
+                ( if .type == "text" then ((.text // "") | tostring)
+                  elif .type == "tool_use" then ("[tool_use " + ((.name // "?") | tostring) + "]")
+                  elif .type == "tool_result" then
+                    ("[tool_result " + (((.content // "") | tostring)[0:$excerpt]) + "]")
+                  else "" end )
+              else tostring end ]
+        else [] end ) as $parts
+    | ($parts | map(select(. != null and . != "")) | join("\n")) as $body
+    | select($body != "")
+    | $role + ": " + $body
+  ' 2>/dev/null || true
+}
+
+# reflect_transcript_extract <path> <cap_chars> [head|tail]
+# Human-legible extract of a transcript, capped, newest-first for `tail`.
+#
+# The raw file is sliced BEFORE jq sees it (cap x4, since the extract discards
+# most of a transcript's bytes) so the cost is bounded by the cap rather than by
+# the transcript: the sessions this exists for are the multi-megabyte ones. The
+# slice's own broken edge line is dropped, and truncation is ANNOUNCED in the
+# body so the model knows it is looking at a window and not at the whole run.
+# Always exits 0 with possibly-empty output: a failed extract must degrade the
+# prompt, never take down the worker that was about to write a manifest.
+reflect_transcript_extract() {
+  local path="${1:-}" cap="${2:-0}" side="${3:-tail}"
+  local out="" sliced="" raw_slice="" size raw_cap
+  if [[ -f "$path" && -r "$path" ]] && [[ "$cap" =~ ^[0-9]+$ ]] && (( cap > 0 )); then
+    size="$(reflect_file_size "$path")"
+    raw_cap=$(( cap * 4 ))
+    # `raw_slice` is the window BEFORE the broken edge line is dropped, kept
+    # because the drop can empty the window outright — see the raw-excerpt
+    # degradation below. Sliced from the in-memory copy rather than re-reading
+    # the file, so this is still one read of a possibly-multi-megabyte transcript.
+    if (( size > raw_cap )); then
+      if [[ "$side" == "head" ]]; then
+        raw_slice="$(head -c "$raw_cap" -- "$path" 2>/dev/null || true)"
+        sliced="$(printf '%s' "$raw_slice" | head -n -1 || true)"
+      else
+        raw_slice="$(tail -c "$raw_cap" -- "$path" 2>/dev/null || true)"
+        sliced="$(printf '%s' "$raw_slice" | tail -n +2 || true)"
+      fi
+    else
+      raw_slice="$(cat -- "$path" 2>/dev/null || true)"
+      sliced="$raw_slice"
+    fi
+    if [[ -n "$sliced" ]]; then
+      out="$(printf '%s\n' "$sliced" | reflect_jsonl_to_text || true)"
+    fi
+    # THE SLICE CAN HOLD NO COMPLETE JSONL LINE. Both slice paths drop the edge
+    # line they cut in half — and when a single line is itself bigger than
+    # cap x4 (one 200 KB tool_result, one pasted file), that edge line is the
+    # ONLY line in the window. Dropping it leaves `sliced` empty, jq gets
+    # nothing, `out` comes back empty, and the caller then tells the model "the
+    # session transcript could not be read" about a transcript that is sitting
+    # right there and merely unparseable at this window size. Degrade to the raw
+    # bytes instead: a verbatim excerpt is a worse read than the extract, and a
+    # far better one than a false claim of an unreadable file.
+    #
+    # Keyed on `raw_slice`, not on `sliced`, precisely because the headline case
+    # is the one where the edge-line drop emptied `sliced`. It also catches the
+    # milder shape — a window that survived the drop but parsed to nothing.
+    #
+    # UNTRUSTED DATA, and MORE so than the extract above: reflect_jsonl_to_text
+    # is what normally drops thinking blocks and tool_use inputs and cuts
+    # tool_result bodies to an excerpt, and none of that filtering has run on
+    # these bytes. Same handling as every other block here — prompt CONTENT for a
+    # `--tools ""` subprocess, summarised, never executed, never interpolated
+    # into a shell command. The cap is what bounds it.
+    if [[ -z "$out" && -n "$raw_slice" ]]; then
+      local raw
+      if (( ${#raw_slice} > cap )); then
+        if [[ "$side" == "head" ]]; then
+          raw="${raw_slice:0:$cap}"
+        else
+          raw="${raw_slice: -$cap}"
+        fi
+      else
+        raw="$raw_slice"
+      fi
+      out="[Note: transcript lines too large to parse as JSONL; raw excerpt follows.]"$'\n'"$raw"
+      # Return here: `out` is already capped by construction and carries its own
+      # note, so the truncation-note branch below must not fire a SECOND note on
+      # it (the prefix alone would push it past `cap` and earn one).
+      printf '%s' "$out"
       return 0
     fi
-    # Untrusted env value; fall through to scan or return empty.
-  fi
-  # Only scan if sub_sid itself is a safe token (defense in depth).
-  if ! is_valid_sid "$sub_sid"; then
-    printf ''
-    return 0
-  fi
-  local project_dir
-  project_dir="$(dirname -- "$tp")"
-  if [[ -d "$project_dir" ]]; then
-    # Use nullglob so empty dirs return an empty array (not the literal glob).
-    local -a jsonl_files=()
-    local prev_nullglob
-    prev_nullglob="$(shopt -p nullglob || true)"
-    shopt -s nullglob
-    jsonl_files=( "$project_dir"/*.jsonl )
-    eval "$prev_nullglob"
-
-    if (( ${#jsonl_files[@]} == 0 )); then
-      printf ''
-      return 0
-    fi
-
-    # Best-effort: `grep -l` returns matches in readdir order (arbitrary,
-    # NOT mtime-recent). For uniquely-named SIDs (Claude's are UUID-shaped),
-    # a match is deterministic enough — collisions require an attacker
-    # seeding the transcript dir. The earlier "Recent-first" phrasing
-    # implied mtime ordering, which was never true; head -1 just takes
-    # whichever the kernel returned first. -- guards against filenames
-    # starting with -.
-    local candidate
-    candidate="$(grep -lF -- "$sub_sid" "${jsonl_files[@]}" 2>/dev/null \
-      | grep -vF -- "$tp" | head -1 || true)"
-    if [[ -n "$candidate" ]]; then
-      # Re-validate: a jsonl filename could in principle bypass the sub_sid
-      # entropy check if the transcript dir was seeded adversarially, so
-      # run the derived parent through is_valid_sid before returning it.
-      local parent_candidate
-      parent_candidate="$(basename -- "$candidate" .jsonl)"
-      if is_valid_sid "$parent_candidate"; then
-        printf '%s' "$parent_candidate"
-        return 0
+    if (( ${#out} > cap )); then
+      if [[ "$side" == "head" ]]; then
+        out="${out:0:$cap}"$'\n'"[Note: extract truncated at $cap characters; the rest of the run is not shown.]"
+      else
+        out="[Note: showing only the NEWEST $cap characters of this transcript; earlier turns are elided.]"$'\n'"${out: -$cap}"
       fi
     fi
   fi
-  printf ''
+  printf '%s' "$out"
+}
+
+# reflect_handoff_block <sid> — the self-compact handoff for this session, when
+# there is one and it is fresh, capped. Empty string otherwise.
+#
+# OPTIONAL BY CONSTRUCTION. The fallback exists because a session was too big to
+# resume, and a self-compact handoff is exactly the artifact such a session
+# leaves behind — but self-compact is a separate subsystem with its own root,
+# and nothing here may depend on it having run. Missing, stale, unreadable and
+# empty all produce the same empty block.
+reflect_handoff_block() {
+  local sid="${1:-}" f body mt age now
+  is_valid_sid "$sid" || { printf ''; return 0; }
+  f="$(mission_handoff_path "$sid")"
+  [[ -f "$f" && -r "$f" ]] || { printf ''; return 0; }
+  mt="$(stat -c '%Y' "$f" 2>/dev/null || echo '')"
+  [[ "$mt" =~ ^-?[0-9]+$ ]] || { printf ''; return 0; }
+  now="$(date -u +%s)"
+  age=$(( now - mt ))
+  (( age <= REFLECT_HANDOFF_MAX_AGE_SECONDS )) || { printf ''; return 0; }
+  body="$(cat -- "$f" 2>/dev/null || true)"
+  [[ -n "$body" ]] || { printf ''; return 0; }
+  if (( ${#body} > REFLECT_HANDOFF_CAP_BYTES )); then
+    body="${body:0:$REFLECT_HANDOFF_CAP_BYTES}"$'\n'"[Note: handoff truncated at $REFLECT_HANDOFF_CAP_BYTES characters.]"
+  fi
+  printf '%s' "$body"
+}
+
+# --- Structured failure detail from a claude envelope (C1) -------------------
+# reflect_envelope_failure_json <envelope> — compact JSON of whatever the
+# `--output-format json` envelope says about its own failure.
+#
+# WHY THIS EXISTS: 25 sessionend errors in the live corpus were monthly
+# spend-limit 429s, and every one of their manifests said only
+# `subprocess_exit_code: 1`. Diagnosing them meant reading raw worker stdout
+# logs — which the artifact GC collects after 14 days. The envelope carries the
+# answer (`is_error`, `api_error_status`, and a `result` that names the limit);
+# it was simply never read.
+#
+# Every access is guarded because the envelope is exactly what is NOT
+# trustworthy on a failure path: empty on a SIGKILLed timeout, truncated on a
+# broken pipe, or not JSON at all. Unparseable input still yields something
+# useful — an excerpt of whatever did come back — and never a non-zero return.
+reflect_envelope_failure_json() {
+  local env_json="${1:-}" out=""
+  if [[ -z "$env_json" ]]; then
+    printf '%s' '{}'
+    return 0
+  fi
+  out="$(jq -c --argjson n "$REFLECT_EXCERPT_BYTES" '
+      if type == "object" then
+        { is_error:          (.is_error // null),
+          api_error_status:  (.api_error_status // null),
+          envelope_subtype:  (.subtype // null),
+          result_excerpt:    (if (.result | type) == "string" then (.result[0:$n]) else null end) }
+        | with_entries(select(.value != null))
+      else {} end' <<<"$env_json" 2>/dev/null || true)"
+  if [[ -z "$out" ]]; then
+    # Not JSON at all. Quote what came back instead of dropping it: "the CLI
+    # printed a usage error" and "the CLI printed nothing" are different
+    # diagnoses and used to be indistinguishable in the manifest.
+    out="$(jq -cn --arg x "${env_json:0:$REFLECT_EXCERPT_BYTES}" \
+            '{envelope_unparseable:true, envelope_excerpt:$x}' 2>/dev/null || printf '{}')"
+  fi
+  printf '%s' "$out"
 }

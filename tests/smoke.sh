@@ -1078,26 +1078,45 @@ STUB
 chmod +x "$STUB_SCRATCH/claude"
 
 # ============================================================================
-# TEST 4: subagentstop lands under parent/subagents/<sid>/
+# TEST 4: subagentstop lands under parent/subagents/<agent_id>/
 # ============================================================================
+# Rewritten for the Claude Code 2.1.260 SubagentStop payload (captured live
+# 2026-09-04). This test used to export CLAUDE_PARENT_SESSION_ID and send a
+# payload whose `session_id` was the SUBAGENT's — a shape the harness has never
+# actually emitted. 2.1.260 sends `session_id` = the PARENT session, and names
+# the subagent with `agent_id` + `agent_transcript_path`. See "PARENT LINKAGE"
+# in lib.sh for what the old inference did to the live corpus.
 test_begin "TEST 4: subagentstop artifact placement"
 PARENT_SID="parent-sid-xyz"
-SUB_SID="sub-sid-123"
+# Deliberately NOT uuid-shaped: the observed agent_id is a 17-char hex token, and
+# the dispatcher must validate it by charset alone.
+AGENT_ID="a1cb625829c68ce11"
 
-# Seed a fake parent session dir so we exercise the parent-lookup path
+# The parent session dir exists because the parent is a real session; the
+# subagent nests under it.
 mkdir -p "$REFLECT_ROOT/sessions/$PARENT_SID"
 echo '{"session_id":"'"$PARENT_SID"'"}' > "$REFLECT_ROOT/sessions/$PARENT_SID/manifest.json"
 
-export CLAUDE_PARENT_SESSION_ID="$PARENT_SID"
-SUB_PAYLOAD=$(jq -cn --arg sid "$SUB_SID" --arg tp "$TRANSCRIPT" --arg cwd "$TEST_CWD" \
-  '{session_id:$sid, transcript_path:$tp, hook_event_name:"SubagentStop", cwd:$cwd, stop_hook_active:false}')
+# The agent's OWN transcript — the thing that actually gets reflected on. It is
+# read and inlined, never resumed.
+AGENT_TRANSCRIPT="$REFLECT_ROOT/agent-$AGENT_ID.jsonl"
+cat >"$AGENT_TRANSCRIPT" <<'JSONL'
+{"type":"user","message":{"role":"user","content":"audit the widget loader"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"loader is fine"}]}}
+JSONL
+
+SUB_PAYLOAD=$(jq -cn --arg sid "$PARENT_SID" --arg tp "$TRANSCRIPT" --arg cwd "$TEST_CWD" \
+  --arg aid "$AGENT_ID" --arg atp "$AGENT_TRANSCRIPT" \
+  '{session_id:$sid, transcript_path:$tp, hook_event_name:"SubagentStop", cwd:$cwd,
+    stop_hook_active:false, agent_id:$aid, agent_type:"general-purpose",
+    agent_transcript_path:$atp, last_assistant_message:"done"}')
 
 echo "$SUB_PAYLOAD" | bash "$REFLECT_SH" subagentstop
 rc=$?
 (( rc == 0 )) || fail "subagentstop exit=$rc"
 
-SUB_MANIFEST="$REFLECT_ROOT/sessions/$PARENT_SID/subagents/$SUB_SID/manifest.json"
-SUB_FINAL="$REFLECT_ROOT/sessions/$PARENT_SID/subagents/$SUB_SID/final.json"
+SUB_MANIFEST="$REFLECT_ROOT/sessions/$PARENT_SID/subagents/$AGENT_ID/manifest.json"
+SUB_FINAL="$REFLECT_ROOT/sessions/$PARENT_SID/subagents/$AGENT_ID/final.json"
 
 wait_for_complete "$SUB_MANIFEST" 10 subagentstop \
   || fail "subagent manifest never modes.subagentstop.final_complete (path=$SUB_MANIFEST)"
@@ -1105,12 +1124,36 @@ wait_for_complete "$SUB_MANIFEST" 10 subagentstop \
 [[ -f "$SUB_FINAL" ]] || fail "subagent final.json missing at $SUB_FINAL"
 jq -e '.patterns' "$SUB_FINAL" >/dev/null || fail "subagent final.json invalid"
 
-# Ensure parent linkage recorded
+# Parent linkage comes from the payload, not from a scan.
 jq -e --arg p "$PARENT_SID" '.parent_session_id == $p' "$SUB_MANIFEST" >/dev/null \
   || fail "subagent manifest parent_session_id != $PARENT_SID"
-info "subagent artifact placed correctly and parent linkage recorded"
+jq -e --arg a "$AGENT_ID" '.session_id == $a' "$SUB_MANIFEST" >/dev/null \
+  || fail "subagent manifest session_id != agent_id"
+# source_transcript is the AGENT's, not the parent's. Getting this backwards is
+# what made the old corpus's subagent artifacts reflections of live sessions.
+jq -e --arg t "$AGENT_TRANSCRIPT" '.source_transcript == $t' "$SUB_MANIFEST" >/dev/null \
+  || fail "subagent manifest source_transcript is not the agent transcript"
+# The PARENT must not have been reflected by a SubagentStop.
+[[ ! -f "$REFLECT_ROOT/sessions/$PARENT_SID/final.json" ]] \
+  || fail "SubagentStop reflected the PARENT session"
+info "subagent artifact placed under <parent>/subagents/<agent_id> from the payload"
 
-unset CLAUDE_PARENT_SESSION_ID
+# TEST 4b: an older harness's payload (no agent fields) is refused outright —
+# no scan, no parent-as-subagent, no model call, no session dir.
+test_begin "TEST 4b: subagentstop without agent fields is refused"
+OLD_SHAPE_SID="parent-sid-oldshape"
+OLD_PAYLOAD=$(jq -cn --arg sid "$OLD_SHAPE_SID" --arg tp "$TRANSCRIPT" --arg cwd "$TEST_CWD" \
+  '{session_id:$sid, transcript_path:$tp, hook_event_name:"SubagentStop", cwd:$cwd,
+    stop_hook_active:false}')
+echo "$OLD_PAYLOAD" | bash "$REFLECT_SH" subagentstop
+rc=$?
+(( rc == 0 )) || fail "subagentstop on the old payload shape exit=$rc (must be 0)"
+[[ ! -d "$REFLECT_ROOT/sessions/$OLD_SHAPE_SID" ]] \
+  || fail "the parent sid was reflected as a subagent"
+find "$REFLECT_ROOT/malformed" -type f -name '*.json' -print0 2>/dev/null \
+  | xargs -0 -r jq -e 'select(.reason == "subagentstop_missing_agent_fields")' >/dev/null 2>&1 \
+  || fail "no structured record with reason=subagentstop_missing_agent_fields"
+info "old-shape SubagentStop payload refused with a structured record"
 
 # ============================================================================
 # TEST 5: missing session_id -> error manifest, no crash

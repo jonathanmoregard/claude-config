@@ -4,12 +4,18 @@
 # Usage:  reflect.sh {precompact|sessionend|subagentstop|mission}
 # Stdin:  Claude Code hook payload JSON (session_id, transcript_path,
 #         hook_event_name, cwd; PreCompact also has trigger / custom_instructions;
-#         SubagentStop has stop_hook_active).
+#         SubagentStop additionally has agent_id, agent_type and
+#         agent_transcript_path — and its `session_id` is the PARENT session, not
+#         the subagent's, which is the whole point of the 2.1.260 rework below).
 #
 # Behavior:
 #   precompact    -> synchronous, bounded (60s), writes numbered checkpoint
-#   sessionend    -> fires-and-forgets a detached worker, exits fast
-#   subagentstop  -> same as sessionend but tighter budget + parent-nesting
+#   sessionend    -> fires-and-forgets a detached worker, exits fast; falls back to
+#                    a no-resume reflection when the fork-resume cannot land (B1/B2)
+#   subagentstop  -> same detachment, tighter budget; nests under
+#                    sessions/<parent session_id>/subagents/<agent_id>/ and reflects
+#                    the AGENT transcript inline (an agent transcript is not a
+#                    resumable session)
 #   mission       -> writes the authoritative handoff out of repo; synchronous for
 #                    idle-handoff.sh, detached with REFLECT_ASYNC=1 for the
 #                    2nd-compact pre-fire
@@ -103,20 +109,40 @@ if reflect_truthy "${REFLECT_SUBPROCESS:-}"; then
     precompact|sessionend|subagentstop|mission) ;;
     *) _rec_mode="nomode_invalid" ;;
   esac
-  _rec_file="$_rec_dir/$(date -u +%Y%m%dT%H%M%SZ)-${_parent_sid}-${_child_sid:-unknown}-${_rec_mode}.json"
-  # jq -n with defensive defaults; failure here still exits 0.
-  jq -n \
-    --arg status "skipped_recursion" \
-    --arg parent_sid "$_parent_sid" \
-    --arg child_sid "$_child_sid" \
-    --arg hook_event "${ARG1:-}" \
-    --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    '{status:$status, parent_sid:$parent_sid, child_sid:$child_sid, hook_event:$hook_event, seen_at:$now}' \
-    > "$_rec_file" 2>/dev/null || true
+  # G3 fix (LOW): the name used to be timestamp+identity ONLY, written with `>`.
+  # Its resolution is one second and every component is identical across the
+  # fires of a single burst, so two child hooks firing in the same second for the
+  # same (parent, child, mode) — which is the NORMAL shape here, one claude
+  # subprocess emitting several hook events as it exits — silently overwrote each
+  # other. A counter that undercounts exactly the bursts it exists to measure is
+  # worse than no counter. mktemp makes the name unique the same way the
+  # duplicates/ and malformed/ records do; the timestamp stays a PREFIX so `ls`
+  # order is still chronological. Every path component was validated above, so
+  # nothing here can carry an X-run that would steal mktemp's placeholder.
+  _rec_file="$(mktemp -p "$_rec_dir" \
+    "$(date -u +%Y%m%dT%H%M%SZ)-${_parent_sid}-${_child_sid:-unknown}-${_rec_mode}-XXXX.json" \
+    2>/dev/null || true)"
+  # jq -n with defensive defaults; failure here still exits 0. An unusable
+  # _rec_file (mktemp failed on an unwritable dir) skips the write rather than
+  # redirecting to the empty path — the marker is best-effort, the exit 0 is not.
+  if [[ -n "$_rec_file" ]]; then
+    jq -n \
+      --arg status "skipped_recursion" \
+      --arg parent_sid "$_parent_sid" \
+      --arg child_sid "$_child_sid" \
+      --arg hook_event "${ARG1:-}" \
+      --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      '{status:$status, parent_sid:$parent_sid, child_sid:$child_sid, hook_event:$hook_event, seen_at:$now}' \
+      > "$_rec_file" 2>/dev/null || true
+  fi
   exit 0
 fi
 
 # --- Help --------------------------------------------------------------------
+# "(default: …)" lines must quote the *_DEFAULT constants from lib.sh, never
+# the live vars — with an operator override exported, the live var would label
+# the override as the shipped default. Knobs without a *_DEFAULT constant keep
+# their hand-written values.
 if [[ "$ARG1" == "--help" || "$ARG1" == "-h" ]]; then
   cat <<EOF
 reflect.sh — session-reflect hook dispatcher
@@ -141,15 +167,35 @@ Env:
                                    (PRECOMPACT/SESSIONEND/SUBAGENTSTOP/MISSION).
   REFLECT_REAP_MAX_PER_RUN         Max manifests the orphan reaper examines per
                                    detached-worker run (default: 200).
-  CLAUDE_PARENT_SESSION_ID         If set by Claude Code in a SubagentStop
-                                   hook env, nest subagent artifacts under
-                                   this parent. Validated against safe charset.
+  REFLECT_BUDGET_SESSIONEND_FALLBACK
+                                   Budget for the no-resume sessionend fallback
+                                   (default: ${REFLECT_BUDGET_SESSIONEND_FALLBACK}s). Its own, not carved
+                                   out of the primary's.
+  REFLECT_RESUME_MAX_TRANSCRIPT_BYTES
+                                   Transcript size above which the fork-resume is
+                                   skipped as doomed and sessionend goes straight
+                                   to the fallback (default: $(( REFLECT_RESUME_MODEL_WINDOW_TOKENS_DEFAULT * REFLECT_TRANSCRIPT_BYTES_PER_TOKEN_DEFAULT )),
+                                   derived from REFLECT_RESUME_MODEL_WINDOW_TOKENS
+                                   x REFLECT_TRANSCRIPT_BYTES_PER_TOKEN).
+  REFLECT_AGENT_TRANSCRIPT_CAP_BYTES
+                                   Cap on the agent-transcript extract inlined into
+                                   a subagentstop prompt (default: ${REFLECT_AGENT_TRANSCRIPT_CAP_BYTES_DEFAULT}).
+  REFLECT_FALLBACK_TAIL_CAP_BYTES  Cap on the transcript tail inlined into a
+                                   sessionend fallback prompt (default: ${REFLECT_FALLBACK_TAIL_CAP_BYTES_DEFAULT}).
+  REFLECT_HANDOFF_CAP_BYTES        Cap on the self-compact handoff inlined into a
+                                   fallback prompt (default: ${REFLECT_HANDOFF_CAP_BYTES_DEFAULT}).
+  REFLECT_HANDOFF_MAX_AGE_SECONDS  Age past which that handoff is not offered to the
+                                   model as this session's state (default: ${REFLECT_HANDOFF_MAX_AGE_SECONDS_DEFAULT}).
+  REFLECT_EXCERPT_BYTES            Length of every quoted excerpt: tool_result
+                                   bodies, envelope \`result\`, unparseable replies
+                                   (default: ${REFLECT_EXCERPT_BYTES_DEFAULT}).
   _REFLECT_INTERNAL                Sentinel required to enter --worker re-entry path
 
 Modes:
   precompact    synchronous, ${REFLECT_BUDGET_PRECOMPACT}s budget, numbered checkpoint under checkpoints/
   sessionend    detached worker, ${REFLECT_BUDGET_SESSIONEND}s internal budget, writes final.json
-  subagentstop  detached worker, ${REFLECT_BUDGET_SUBAGENTSTOP}s internal budget, nests under parent/subagents/
+  subagentstop  detached worker, ${REFLECT_BUDGET_SUBAGENTSTOP}s internal budget, nests under
+                sessions/<payload session_id>/subagents/<payload agent_id>/
   mission       synchronous (detached with REFLECT_ASYNC=1), ${REFLECT_BUDGET_MISSION}s budget,
                 writes \$CLAUDE_SESSIONS_DIR/<sid>/handoff/mission.md (markdown)
 
@@ -189,7 +235,7 @@ fi
 
 # --- Mission resolution ------------------------------------------------------
 # `reflect.sh --mission-path <project_cwd>` prints the AUTHORITATIVE mission
-# handoff for that project: $REFLECT_ROOT/sessions/<sid>/handoff/mission.md, OUTSIDE
+# handoff for that project: $CLAUDE_SESSIONS_DIR/<sid>/handoff/mission.md, OUTSIDE
 # every repo. Exit 1 when there is none. Read-only: it never repairs, so a reader
 # cannot be surprised by a resolution that also mutated something.
 #
@@ -203,7 +249,7 @@ fi
 # caller ever does, it must be a separate, clearly-named flag, never this one.
 #
 # ARGUMENT UNIT: the PROJECT ROOT, exactly as it appeared in the hook payload's
-# `cwd` field. Matched literally against the mission.cwd sidecar mission mode
+# `cwd` field. Matched literally against the `cwd` sidecar mission mode
 # wrote; a mismatch fails closed, with the candidate count on stderr so it is
 # diagnosable.
 if [[ "$ARG1" == "--mission-path" ]]; then
@@ -346,6 +392,13 @@ if [[ "$ARG1" == "--worker" ]]; then
   : "${HOOK_EVENT:=}"
   : "${CWD:=}"
   : "${TRIGGER:=}"
+  # subagentstop-only, and empty for every other mode. Same reason as above: the
+  # worker reads them unguarded under `set -u`, and a transient unit hands over an
+  # explicitly-built environment in which "never exported" and "exported empty"
+  # are indistinguishable.
+  : "${AGENT_ID:=}"
+  : "${AGENT_TYPE:=}"
+  : "${PARENT_TRANSCRIPT:=}"
   # Defense in depth: re-validate the SID we're about to write paths under.
   if ! is_valid_sid "$SESSION_ID"; then
     echo "reflect.sh: worker refuses invalid SESSION_ID" >&2
@@ -422,6 +475,37 @@ else
   PAYLOAD="$(cat)"
   if [[ -z "$PAYLOAD" ]]; then
     # No payload — nothing we can do, but don't crash the caller.
+    #
+    # G2 fix (LOW): this was the ONE bad input that left no forensic trail at
+    # all. Every other one — unparseable JSON, missing session_id, invalid sid,
+    # missing agent fields — lands a structured record under malformed/, so a
+    # hook that has been mis-wired to feed us nothing (wrong stdin plumbing, a
+    # wrapper that swallows the payload, a hook fired with no stdin) looked
+    # EXACTLY like a hook that never fired. Same shape malformed_manifest
+    # writes, so one query over malformed/ still sees every rejected input.
+    #
+    # Written inline rather than through malformed_manifest: that function is
+    # defined ~90 lines below and reads $PAYLOAD/$HOOK_EVENT, neither of which
+    # is established here (HOOK_EVENT comes out of the payload we do not have).
+    # Best-effort throughout, and gated on a writable root: the contract of this
+    # branch is `exit 0`, and a diagnostic may never turn a no-op into a failure.
+    if ensure_reflect_root_writable 2>/dev/null; then
+      _empty_dir="$REFLECT_ROOT/malformed"
+      if mkdir -p "$_empty_dir" 2>/dev/null && \
+         _empty_manifest="$(mktemp -p "$_empty_dir" ".manifest-XXXXXX.json" 2>/dev/null)"; then
+        # sha256 of the empty string + payload_len 0 — the honest values, and
+        # they keep the record schema-identical to every other malformed one.
+        jq -n \
+          --arg mode "$MODE" \
+          --arg event "" \
+          --arg reason "empty_payload" \
+          --arg sha "$(printf '%s' "$PAYLOAD" | sha256sum | awk '{print $1}')" \
+          --argjson len 0 \
+          --arg now "$(reflect_now)" \
+          '{status:"error",reason:$reason,mode:$mode,hook_event_name:$event,payload_sha256:$sha,payload_len:$len,written_at:$now}' \
+          > "$_empty_manifest" 2>/dev/null || true
+      fi
+    fi
     exit 0
   fi
   # Refuse to touch a non-writable REFLECT_ROOT — writing junk to $HOME/tmp
@@ -475,7 +559,22 @@ TRANSCRIPT_PATH="$(extract transcript_path)"
 HOOK_EVENT="$(extract hook_event_name)"
 CWD="$(extract cwd)"
 TRIGGER="$(extract trigger)"                # precompact-only
+# shellcheck disable=SC2034  # extracted to document the payload surface; the
+# precompact prompt is a fixed template and deliberately does not splice the
+# user's custom_instructions into it.
 CUSTOM_INSTR="$(extract custom_instructions)" # precompact-only
+
+# SubagentStop-only. Present since Claude Code 2.1.260 (captured live 2026-09-04);
+# absent on anything older, which is a case A2 handles explicitly rather than by
+# inference. `agent_id` is NOT uuid-shaped — the observed value is a 17-char hex
+# token like `a1cb625829c68ce11` — so it is validated by charset (is_valid_sid,
+# `[A-Za-z0-9._-]{1,128}`, no leading dot) and never by shape.
+AGENT_ID="$(extract agent_id)"
+AGENT_TYPE="$(extract agent_type)"
+AGENT_TRANSCRIPT="$(extract agent_transcript_path)"
+# The parent's own transcript, kept under its own name once TRANSCRIPT_PATH has
+# been re-pointed at the agent's below. Empty outside subagentstop.
+PARENT_TRANSCRIPT=""
 
 # --- Malformed payload guard -------------------------------------------------
 # BUCKET LOCATION (D2). These records used to land in
@@ -526,17 +625,52 @@ if ! is_valid_sid "$SESSION_ID"; then
   malformed_manifest "invalid_session_id"
 fi
 
-# --- Resolve parent (subagent mode only) -------------------------------------
+# --- Subagent identity: taken from the payload, never inferred (A1/A2) -------
+# The 2.1.260 SubagentStop payload is not what this dispatcher used to assume.
+# `session_id` is the PARENT session — the live one the user is still in — and
+# `transcript_path` is the PARENT's transcript. The subagent is named by
+# `agent_id`, and its own transcript is `agent_transcript_path`.
+#
+# Reading the payload as if `session_id` were the subagent's produced all three
+# halves of D1 at once: the PARENT got reflected mid-session (a 126k-token model
+# call), the artifact was nested under whatever the retired sibling-transcript
+# scan happened to return first, and modes.subagentstop.final_complete latched on
+# the PARENT's manifest — so every later SubagentStop in that session became
+# `skipped_duplicate`. 52 of 100 recent nested subagent manifests were timeouts,
+# the rest misnested. The real agent transcript was never opened at all.
+#
+# So: rebind, then keep going with the subagent as THE session.
+#   SESSION_ID       <- agent_id           (the artifact's identity + idempotency key)
+#   PARENT_SID       <- payload session_id (the nesting key)
+#   TRANSCRIPT_PATH  <- agent_transcript_path (what gets reflected on)
+#   PARENT_TRANSCRIPT<- payload transcript_path (recorded, never reflected on)
+#
+# ABSENT FIELDS ARE A DEAD END, DELIBERATELY. An older harness sends no agent
+# fields; a race or a GC can leave the path pointing at nothing. Both write a
+# structured record under malformed/ and exit 0. There is no scan to fall back on
+# any more and the parent is NOT reflected as a stand-in — a reflection filed
+# under a guessed identity is worse than no reflection, because a consumer reads
+# the filing as fact. See "PARENT LINKAGE" in lib.sh.
+#
+# These checks run BEFORE paths_for_session, so a refused payload also mints no
+# session directory.
 PARENT_SID=""
 if [[ "$MODE" == "subagentstop" ]]; then
-  PARENT_SID="$(find_parent_session_id "$SESSION_ID" "$CWD" "$TRANSCRIPT_PATH")"
-  # If nothing found, treat subagent SID as its own parent for placement,
-  # but leave PARENT_SID empty so lib.sh puts artifact at top-level and we
-  # can flag "parent_unknown" in the manifest.
-  if [[ -n "$PARENT_SID" ]] && ! is_valid_sid "$PARENT_SID"; then
-    # Reject an untrusted parent id rather than let it into a filesystem path.
-    PARENT_SID=""
+  if [[ -z "$AGENT_ID" || -z "$AGENT_TRANSCRIPT" ]]; then
+    malformed_manifest "subagentstop_missing_agent_fields"
   fi
+  if ! is_valid_sid "$AGENT_ID"; then
+    malformed_manifest "subagentstop_invalid_agent_id"
+  fi
+  # -r, not just -f: an unreadable transcript gives the worker nothing to inline
+  # and would spend a model call on an empty prompt.
+  if [[ ! -f "$AGENT_TRANSCRIPT" || ! -r "$AGENT_TRANSCRIPT" ]]; then
+    malformed_manifest "subagentstop_agent_transcript_unreadable"
+  fi
+  PARENT_SID="$SESSION_ID"
+  SESSION_ID="$AGENT_ID"
+  PARENT_TRANSCRIPT="$TRANSCRIPT_PATH"
+  TRANSCRIPT_PATH="$AGENT_TRANSCRIPT"
 fi
 
 # --- Resolve paths ------------------------------------------------------------
@@ -608,18 +742,108 @@ fi
 # we release the lock BEFORE the detach so the worker isn't holding it.
 
 # --- Extra manifest fields ----------------------------------------------------
+#
+# `source_transcript` is whatever this mode actually reflects on, which for
+# subagentstop is the AGENT's transcript. The parent's is recorded beside it as
+# `parent_transcript` rather than replacing it: a consumer asking "what was this
+# reflection derived from" and one asking "which session ran it" want different
+# answers, and conflating them is how the misnested corpus reads today.
 extra_json=$(jq -cn \
   --arg tp "$TRANSCRIPT_PATH" \
   --arg event "$HOOK_EVENT" \
   --arg parent "$PARENT_SID" \
   --arg trigger "$TRIGGER" \
   --arg model "$REFLECT_MODEL" \
+  --arg agent_id "$AGENT_ID" \
+  --arg agent_type "$AGENT_TYPE" \
+  --arg parent_tp "$PARENT_TRANSCRIPT" \
   '{source_transcript:$tp,
     hook_event_name:$event,
     parent_session_id:(if $parent == "" then null else $parent end),
     trigger:(if $trigger == "" then null else $trigger end),
-    model:$model}')
+    model:$model}
+   | (if $agent_id   != "" then .agent_id          = $agent_id   else . end)
+   | (if $agent_type != "" then .agent_type        = $agent_type else . end)
+   | (if $parent_tp  != "" then .parent_transcript = $parent_tp  else . end)')
 fi  # end IS_WORKER == 0 setup block
+
+# ============================================================================
+# ONE MODEL CALL
+# ============================================================================
+# reflect_claude_call <prompt> <budget_s> <resume_sid|""> <stdout_log> <stderr_log>
+# Runs exactly one `claude -p`, leaving the raw envelope in REFLECT_CALL_ENVELOPE
+# and the subprocess status in REFLECT_CALL_RC. ALWAYS returns 0: every caller
+# branches on the rc, and a `set -e` abort here would skip the manifest write that
+# is the entire point of the worker.
+#
+# Two shapes, one function, and the difference is only `--resume`:
+#
+#   resume_sid NON-EMPTY -> `--resume <sid> --fork-session`. Replays the session
+#     into the model's window, which is what buys the prompt-cache reuse (~77% hit
+#     at 12 min, 1h ephemeral TTL — verified 2026-08-08) that is the whole cost
+#     story for this feature. `--bare` would strip it. It is also what dies on a
+#     session larger than the window (D2), and what cannot work at all for a
+#     subagent: an agent transcript is not a resumable conversation, so there is
+#     no sid to hand it.
+#
+#   resume_sid EMPTY -> a plain `-p` over a prompt that already carries its context
+#     as data. No cache reuse; bounded instead by the byte caps in lib.sh.
+#
+# SECURITY, both shapes: `--tools ""` disables the entire tool set, so the
+# reflection subprocess cannot invoke Bash/Edit/WebFetch even if a prompt-injection
+# payload rides in — through the resumed transcript before, through the inlined
+# extract now. With tool use disabled we do NOT need
+# arftl-allow: permission-widened
+# `--dangerously-skip-permissions` (verified 2026-08-08 that `claude -p --tools ""
+# --output-format json` returns the JSON reply cleanly). The residual risk is
+# unchanged by inlining: the model can emit arbitrary text into the reflection
+# body, and that body is untrusted data to every downstream consumer —
+# JSON-parsed, schema-normalised, never fed back into an interpreter.
+#
+# RECURSION BREAK: REFLECT_SUBPROCESS=1 in the child env so any Claude Code hook
+# the child fires (its own SessionEnd, PreCompact) detects it is inside a
+# reflection run and no-ops instead of spawning another one. REFLECT_PARENT_SID
+# attributes the resulting skip marker. Inline `env FOO=bar` scopes both to the
+# child — no export leak into this worker or into the manifest-writing path.
+#
+# CWD: `claude --resume <sid>` is cwd-scoped — Claude Code looks conversations up
+# under the current project's transcript dir, so resuming from the wrong cwd errors
+# with "No conversation found". The hook payload always carries the originating
+# cwd; use it, falling back to $HOME when the project is gone (deleted between hook
+# fire and worker start). A bad --resume from $HOME fails loud, which beats
+# succeeding against the wrong project. The no-resume shape does not care where it
+# runs, and runs in the same place for one less thing to reason about.
+REFLECT_CALL_ENVELOPE=""
+REFLECT_CALL_RC=0
+reflect_claude_call() {
+  local _prompt="$1" _budget="$2" _resume="$3" _out="$4" _err="$5"
+
+  local -a _args=( -p )
+  if [[ -n "$_resume" ]]; then
+    _args+=( --resume "$_resume" --fork-session )
+  fi
+  _args+=( --model "$REFLECT_MODEL" --output-format json --tools "" )
+
+  local _cwd="${CWD:-}"
+  if [[ -z "$_cwd" || ! -d "$_cwd" ]]; then
+    _cwd="$HOME"
+  fi
+
+  set +e
+  # `timeout -k` ensures a stuck claude gets SIGKILLed after the SIGTERM. Without
+  # -k, a claude with a blocked event loop can ignore TERM forever, and since this
+  # timeout puts claude in a new process group, any OUTER timeout wrapping this
+  # dispatcher (e.g. idle-handoff's `timeout 90`) cannot reach into the group to
+  # kill it. Advisor P1R3.
+  REFLECT_CALL_ENVELOPE=$(cd "$_cwd" && timeout -k "$REFLECT_KILL_GRACE_SECONDS" "$_budget" env \
+    REFLECT_SUBPROCESS=1 \
+    REFLECT_PARENT_SID="$SESSION_ID" \
+    claude "${_args[@]}" <<<"$_prompt" 2>>"$_err")
+  REFLECT_CALL_RC=$?
+  set -e
+  printf '%s' "$REFLECT_CALL_ENVELOPE" > "$_out"
+  return 0
+}
 
 # ============================================================================
 # WORKER — invoked either synchronously (precompact) or detached (others).
@@ -721,7 +945,53 @@ run_worker() {
       cp_block="(no checkpoint directory)"
     fi
     # Portable substitution: replace {{CHECKPOINTS_BLOCK}} with cp_block.
-    prompt="${prompt//\{\{CHECKPOINTS_BLOCK\}\}/$cp_block}"
+    #
+    # THE REPLACEMENT MUST BE QUOTED INSIDE THE EXPANSION. Since bash 5.2 the
+    # `patsub_replacement` option is ON by default, and it makes an UNQUOTED `&`
+    # in the replacement expand to the whole matched pattern — so a block
+    # containing `p&q` substitutes as `p{{CHECKPOINTS_BLOCK}}q`, re-injecting
+    # the placeholder literal into the prompt and mangling the text around it.
+    # Every body substituted here is untrusted transcript/checkpoint content, so
+    # `&` is ordinary text that arrives on its own. `"$var"` inside `${x//p/…}`
+    # suppresses the expansion (verified on bash 5.3.15) and is a no-op on the
+    # pre-5.2 bash where the option does not exist. Same at every other
+    # placeholder site below.
+    prompt="${prompt//\{\{CHECKPOINTS_BLOCK\}\}/"$cp_block"}"
+  fi
+
+  # For subagentstop, inline the AGENT's own transcript (A3).
+  #
+  # There is nothing to resume here and never was. `agent_transcript_path` names a
+  # transcript, not a conversation Claude Code will re-open: `--resume` takes a
+  # session id, and the subagent does not have one. The old code resumed the
+  # payload's `session_id` instead, which is the PARENT — so a SubagentStop
+  # reflected a live session mid-flight and never once opened the file it was
+  # supposed to be reflecting on.
+  #
+  # UNTRUSTED DATA. The block is transcript text — user turns, model turns, and
+  # tool output that may have come off the open internet. It is prompt CONTENT for
+  # a `--tools ""` subprocess: summarised, never executed, never interpolated into
+  # a shell command, and the reply it produces is JSON-parsed and schema-normalised
+  # before any consumer sees it. prompts/subagentstop.md says as much to the model.
+  # The extract itself drops thinking blocks and tool_use inputs and cuts
+  # tool_result bodies to an excerpt (see reflect_jsonl_to_text in lib.sh), so the
+  # bulk of what an injection would ride in on is gone before the cap even applies.
+  if [[ "$MODE" == "subagentstop" ]]; then
+    local agent_block agent_type_label
+    agent_block="$(reflect_transcript_extract \
+      "$TRANSCRIPT_PATH" "$REFLECT_AGENT_TRANSCRIPT_CAP_BYTES" tail)"
+    # A transcript of pure tool traffic extracts to nothing. Say so rather than
+    # sending the model a prompt with a hole in it — an empty block reads as "the
+    # run was empty", which is a different and wrong claim.
+    if [[ -z "$agent_block" ]]; then
+      agent_block="(this agent transcript held no legible message content)"
+    fi
+    agent_type_label="${AGENT_TYPE:-unknown}"
+    # Quoted replacements — see the patsub_replacement note at the checkpoints
+    # substitution above. This block is the most exposed of the lot: it is raw
+    # agent transcript text.
+    prompt="${prompt//\{\{AGENT_TRANSCRIPT_BLOCK\}\}/"$agent_block"}"
+    prompt="${prompt//\{\{AGENT_TYPE\}\}/"$agent_type_label"}"
   fi
 
   # STEP 7 (LOW P3.8): worker_log / worker_out paths used to be fixed per
@@ -745,97 +1015,255 @@ run_worker() {
   local budget
   budget="$(reflect_budget_for "$MODE")"
 
-  # Build and run.
-  #
-  # SECURITY: `--tools ""` disables the entire tool set so the reflection
-  # subprocess cannot invoke Bash/Edit/WebFetch/etc. even if a prompt-injection
-  # payload smuggled through the resumed transcript tries to make it. With
-  # tool use disabled we do NOT need `--dangerously-skip-permissions`
-  # (verified 2026-08-08 that `claude -p --tools "" --output-format json`
-  # returns the JSON reply cleanly). Residual risk: the model can still
-  # emit arbitrary text into the reflection body, but that body is treated
-  # as untrusted data (JSON-parsed, schema-normalized) by every downstream
-  # consumer, and never fed back into an interpreter.
-  #
-  # We keep `--resume ... --fork-session` because prompt-cache reuse
-  # (~77% hit at 12min, 1h ephemeral TTL — verified 2026-08-08) is the whole
-  # cost story for this feature. `--bare` would strip that.
-  #
-  # RECURSION BREAK: inject REFLECT_SUBPROCESS=1 into the subprocess's env so
-  # any Claude Code hooks the child fires (its own SessionEnd, PreCompact,
-  # etc.) can detect they're inside a reflection run and no-op. REFLECT_PARENT_SID
-  # is threaded through so the recursion-marker file can attribute the skip.
-  # Inline `env FOO=bar` scopes to the child only (no export leak into this
-  # worker process, no leak into the manifest-writing path).
-  # `claude --resume <sid>` is cwd-scoped: Claude Code looks up conversations
-  # under the current project's transcript dir, so resuming from the wrong
-  # cwd errors with "No conversation found". The hook payload always carries
-  # the originating cwd; use it. Fall back to $HOME if the payload cwd is
-  # missing or no longer exists (project deleted between hook fire and
-  # worker start) — running claude from $HOME with a bad --resume will fail
-  # loud, which we prefer to succeeding against the wrong project. CWD is
-  # exported from the dispatcher into the worker env; ${CWD:-} guards the
-  # case where the payload lacked a cwd field (older hooks, malformed).
-  local resume_cwd="${CWD:-}"
-  if [[ -z "$resume_cwd" || ! -d "$resume_cwd" ]]; then
-    resume_cwd="$HOME"
+  # --- Attempt bookkeeping ---------------------------------------------------
+  # What the strategy below did, as JSON, for the manifest. Always a valid object
+  # so every `--argjson` that consumes it is safe, and it is merged into EVERY
+  # terminal write (see _worker_extra) — `fallback_used` present on a complete
+  # manifest but absent on the error manifest for the same run would be exactly
+  # the half-record D3 is about.
+  local attempt_extra='{}'
+
+  # _worker_extra [own-json] — the standing manifest fields + the attempt
+  # bookkeeping + this call site's own keys, as one object.
+  _worker_extra() {
+    jq -cn \
+      --arg tp "$TRANSCRIPT_PATH" \
+      --arg event "$HOOK_EVENT" \
+      --arg parent "$PARENT_SID" \
+      --argjson attempt "$attempt_extra" \
+      --argjson own "${1:-{\}}" \
+      '{source_transcript:$tp,hook_event_name:$event,
+        parent_session_id:(if $parent == "" then null else $parent end)}
+       + $attempt + $own'
+  }
+
+  # --- Attempt strategy ------------------------------------------------------
+  # precompact / mission  one resumed call, unchanged.
+  # subagentstop          one INLINE call. There is no session to resume; the
+  #                       agent transcript is already in the prompt.
+  # sessionend            resumed primary, then the B1 no-resume fallback if it
+  #                       cannot land — or straight to the fallback when the B2
+  #                       pre-check says the resume is doomed before it starts,
+  #                       or straight to the error manifest with NO fallback when
+  #                       the primary came back 429 (G1: spend cap, so the second
+  #                       call is doomed on the same account in the same minute).
+  local claude_json="" rc=0 inner=""
+  # The budget that was actually in force for the call whose result we end up
+  # reporting. Diverges from `budget` the moment the fallback runs.
+  local effective_budget="$budget"
+
+  if [[ "$MODE" != "sessionend" ]]; then
+    local primary_resume="$SESSION_ID"
+    [[ "$MODE" == "subagentstop" ]] && primary_resume=""
+    reflect_claude_call "$prompt" "$budget" "$primary_resume" "$worker_out" "$worker_log"
+    claude_json="$REFLECT_CALL_ENVELOPE"
+    rc="$REFLECT_CALL_RC"
+    inner="$(jq -r '.result // empty' <<<"$claude_json" 2>/dev/null || true)"
+  else
+    # B2 — the cheap pre-check, paid in one stat(2).
+    #
+    # `--resume` replays the WHOLE session into the reflection model's window. A
+    # session bigger than that window cannot survive the replay: measured
+    # 2026-09-04 on sid 40fbb4a9, a 305k-token session (1.86 MB of transcript
+    # JSONL) made the fork auto-compact mid-reflection, blow the 90s budget, and
+    # leave status=timeout with NO final.json. None of that is recoverable at the
+    # 89th second, and all of it is knowable from the file size beforehand.
+    #
+    # The threshold is derived from two operator-settable inputs — the model's
+    # window and the measured bytes-per-token ratio — never a fitted constant; see
+    # "Resume pre-check" in lib.sh. Both the measurement and the threshold go into
+    # the manifest, so the ratio stays a reported outcome that can be re-derived
+    # from the corpus rather than a number buried in a comparison.
+    local transcript_bytes primary_skipped=false
+    transcript_bytes="$(reflect_file_size "$TRANSCRIPT_PATH")"
+    if (( transcript_bytes > REFLECT_RESUME_MAX_TRANSCRIPT_BYTES )); then
+      primary_skipped=true
+    fi
+
+    local primary_failure="" primary_detail='{}' primary_api_status=""
+    if [[ "$primary_skipped" == "false" ]]; then
+      reflect_claude_call "$prompt" "$budget" "$SESSION_ID" "$worker_out" "$worker_log"
+      claude_json="$REFLECT_CALL_ENVELOPE"
+      rc="$REFLECT_CALL_RC"
+      inner="$(jq -r '.result // empty' <<<"$claude_json" 2>/dev/null || true)"
+      # Three distinct ways the primary fails to produce a reflection, and all
+      # three used to end the worker. A 124 is the D2 shape; a nonzero rc with a
+      # populated envelope is the D3 shape (25 of those were spend-limit 429s); an
+      # rc of 0 with no `result` is a well-formed envelope carrying nothing.
+      if (( rc == 124 )); then
+        primary_failure="timeout"
+      elif (( rc != 0 )); then
+        primary_failure="error"
+      elif [[ -z "$inner" ]]; then
+        primary_failure="empty_result"
+      fi
+      if [[ -n "$primary_failure" ]]; then
+        primary_detail="$(reflect_envelope_failure_json "$claude_json")"
+        # Read the status off the detail object we just built, not off the raw
+        # envelope: one parse idiom for one fact, and this one is already
+        # guarded against the empty / truncated / non-JSON envelopes that the
+        # failure path is made of.
+        primary_api_status="$(jq -r '.api_error_status // empty' <<<"$primary_detail" 2>/dev/null || true)"
+      fi
+    fi
+
+    # G1 (MEDIUM): a 429 on the primary is the API SPEND CAP — the monthly /
+    # weekly limit on this account, which is what all 25 sessionend errors in the
+    # live corpus were. It is not a per-request condition: dropping `--resume`
+    # changes nothing about which account is paying, and the fallback would fire
+    # within the same minute on the same credentials, so it is a call that is
+    # known to fail before it is made. The economy is per SESSION, not per call —
+    # a capped account otherwise re-dials once for every session that ends, all
+    # day, and gets a 429 every time. So: 429 => no fallback, straight to the
+    # terminal error manifest built from the primary's own envelope below (rc and
+    # claude_json are still the primary's, which is exactly what we want reported).
+    #
+    # ONLY 429, and only when the primary actually ran and failed. Timeouts,
+    # transient errors and empty results are per-request failures that a fresh
+    # no-resume call genuinely can survive — those are what B1 exists for and
+    # they keep the fallback. `primary_skipped` (B2 oversize) never reaches here
+    # with a failure, so an oversize transcript still gets its fallback too.
+    local fallback_skipped_quota=false
+    if [[ -n "$primary_failure" && "$primary_api_status" == "429" ]]; then
+      fallback_skipped_quota=true
+    fi
+
+    if [[ "$fallback_skipped_quota" == "true" ]]; then
+      # Same bookkeeping the fallback branch writes, minus the fallback: the
+      # corpus can count these directly (`fallback_skipped_quota`) instead of
+      # inferring a skip from a call that is absent. primary_* keys are carried
+      # even though the terminal write's own envelope_detail describes the same
+      # envelope here — a query for "which primaries 429'd" must not need to know
+      # whether the fallback ran.
+      attempt_extra="$(jq -cn \
+        --argjson bytes "$transcript_bytes" \
+        --argjson maxbytes "$REFLECT_RESUME_MAX_TRANSCRIPT_BYTES" \
+        --argjson skipped "$primary_skipped" \
+        --arg failure "$primary_failure" \
+        --argjson detail "$primary_detail" \
+        '{transcript_bytes:$bytes,
+          resume_max_transcript_bytes:$maxbytes,
+          primary_skipped_oversize:$skipped,
+          fallback_used:false,
+          fallback_skipped_quota:true,
+          primary_failure:(if $failure == "" then null else $failure end)}
+         + ($detail | with_entries(.key |= "primary_" + .))')"
+    elif [[ "$primary_skipped" == "true" || -n "$primary_failure" ]]; then
+      # B1 — the fallback. Same job, same model, no `--resume`: the context the
+      # resume would have replayed is assembled as DATA instead, bounded by the
+      # caps in lib.sh. It costs the prompt cache (the primary is still tried
+      # first precisely because that cache is the cost story) and buys the thing
+      # that was missing: final.json lands.
+      #
+      # Three sources, cheapest signal first:
+      #   checkpoints  what PreCompact already distilled, reused verbatim from the
+      #                block built above. Empty on exactly the sessions that need
+      #                this most — a 1M-window session never auto-compacts — which
+      #                is why it is not the only source.
+      #   tail slice   the NEWEST end of the transcript. Newest, not oldest: how a
+      #                session finished is what a reflection is mostly about, and
+      #                the head is the part checkpoints already cover.
+      #   handoff      the self-compact handoff for this sid, when there is one and
+      #                it is fresh. Optional by construction — self-compact is a
+      #                separate subsystem and nothing here may require it to have
+      #                run.
+      #
+      # UNTRUSTED DATA, same as the subagent block above: prompt content for a
+      # `--tools ""` subprocess, summarised and never executed.
+      local fb_prompt fb_tail fb_handoff fb_cp fb_out
+      fb_prompt="$(cat "$SCRIPT_DIR/prompts/sessionend-fallback.md" 2>/dev/null || true)"
+      if [[ -z "$fb_prompt" ]]; then
+        # Packaging fault, not a session fault. Degrade to the sessionend template
+        # already in hand (checkpoints substituted, no transcript) rather than
+        # abandoning the run — a thinner reflection beats the silent timeout this
+        # whole path exists to remove.
+        fb_prompt="$prompt"
+      fi
+      fb_tail="$(reflect_transcript_extract \
+        "$TRANSCRIPT_PATH" "$REFLECT_FALLBACK_TAIL_CAP_BYTES" tail)"
+      [[ -n "$fb_tail" ]] || fb_tail="(the session transcript could not be read)"
+      fb_handoff="$(reflect_handoff_block "$SESSION_ID")"
+      [[ -n "$fb_handoff" ]] || fb_handoff="(no self-compact handoff for this session)"
+      fb_cp="${cp_block:-}"
+      [[ -n "$fb_cp" ]] || fb_cp="(no checkpoints)"
+      # Quoted replacements — see the patsub_replacement note at the checkpoints
+      # substitution above.
+      fb_prompt="${fb_prompt//\{\{CHECKPOINTS_BLOCK\}\}/"$fb_cp"}"
+      fb_prompt="${fb_prompt//\{\{TRANSCRIPT_TAIL_BLOCK\}\}/"$fb_tail"}"
+      fb_prompt="${fb_prompt//\{\{HANDOFF_BLOCK\}\}/"$fb_handoff"}"
+
+      # Its own stdout log. Overwriting the primary's would destroy the very
+      # envelope that explains why the fallback had to run.
+      fb_out="$REFLECT_LOG_DIR/${SESSION_ID}-${MODE}-${worker_ts}.fallback.stdout.log"
+      effective_budget="$REFLECT_BUDGET_SESSIONEND_FALLBACK"
+      reflect_claude_call "$fb_prompt" "$effective_budget" "" "$fb_out" "$worker_log"
+      claude_json="$REFLECT_CALL_ENVELOPE"
+      rc="$REFLECT_CALL_RC"
+      inner="$(jq -r '.result // empty' <<<"$claude_json" 2>/dev/null || true)"
+
+      attempt_extra="$(jq -cn \
+        --argjson bytes "$transcript_bytes" \
+        --argjson maxbytes "$REFLECT_RESUME_MAX_TRANSCRIPT_BYTES" \
+        --argjson skipped "$primary_skipped" \
+        --arg failure "$primary_failure" \
+        --argjson detail "$primary_detail" \
+        '{transcript_bytes:$bytes,
+          resume_max_transcript_bytes:$maxbytes,
+          primary_skipped_oversize:$skipped,
+          fallback_used:true,
+          fallback_skipped_quota:false,
+          primary_failure:(if $failure == "" then null else $failure end)}
+         + ($detail | with_entries(.key |= "primary_" + .))')"
+    else
+      attempt_extra="$(jq -cn \
+        --argjson bytes "$transcript_bytes" \
+        --argjson maxbytes "$REFLECT_RESUME_MAX_TRANSCRIPT_BYTES" \
+        '{transcript_bytes:$bytes,
+          resume_max_transcript_bytes:$maxbytes,
+          primary_skipped_oversize:false,
+          fallback_used:false,
+          fallback_skipped_quota:false}')"
+    fi
   fi
 
-  local claude_json rc
-  set +e
-  # `timeout -k 10` ensures a stuck claude gets SIGKILLed 10s after the
-  # SIGTERM. Without -k, a claude with a blocked event loop can ignore
-  # TERM forever, and since this timeout puts claude in a new process
-  # group, any OUTER timeout wrapping this dispatcher (e.g. idle-handoff's
-  # `timeout 90`) cannot reach into the group to kill it. Advisor P1R3.
-  claude_json=$(cd "$resume_cwd" && timeout -k "$REFLECT_KILL_GRACE_SECONDS" "$budget" env \
-    REFLECT_SUBPROCESS=1 \
-    REFLECT_PARENT_SID="$SESSION_ID" \
-    claude \
-    -p --resume "$SESSION_ID" --fork-session \
-    --model "$REFLECT_MODEL" \
-    --output-format json \
-    --tools "" <<<"$prompt" 2>>"$worker_log")
-  rc=$?
-  set -e
-  printf '%s' "$claude_json" > "$worker_out"
+  # --- Terminal failure paths ---
+  # C1: the envelope is asked what went wrong, and the answer goes in the
+  # manifest. 25 sessionend errors in the live corpus were monthly-spend-limit
+  # 429s and every one of their manifests said only `subprocess_exit_code: 1` —
+  # diagnosing them meant reading raw worker stdout logs, which the artifact GC
+  # collects after REFLECT_ARTIFACT_RETENTION_DAYS. The envelope named the limit
+  # the whole time; nothing read it. Every access inside
+  # reflect_envelope_failure_json is guarded, because the failure path is exactly
+  # where the envelope is empty (SIGKILLed timeout), truncated (broken pipe) or
+  # not JSON at all.
+  local envelope_detail
+  envelope_detail="$(reflect_envelope_failure_json "$claude_json")"
 
-  # --- Timeout / error paths ---
   if (( rc == 124 )); then
     write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "timeout" \
-      "$(jq -cn --arg tp "$TRANSCRIPT_PATH" --arg event "$HOOK_EVENT" --arg parent "$PARENT_SID" \
-          --argjson budget "$budget" \
-          '{source_transcript:$tp,hook_event_name:$event,
-            parent_session_id:(if $parent == "" then null else $parent end),
-            timeout_seconds:$budget}')"
+      "$(_worker_extra "$(jq -cn --argjson budget "$effective_budget" --argjson d "$envelope_detail" \
+          '$d + {reason:"model_call_timeout",timeout_seconds:$budget}')")"
     return 0
   fi
   if (( rc != 0 )); then
     write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "error" \
-      "$(jq -cn --arg tp "$TRANSCRIPT_PATH" --arg event "$HOOK_EVENT" --arg parent "$PARENT_SID" \
-          --argjson exit "$rc" \
-          '{source_transcript:$tp,hook_event_name:$event,
-            parent_session_id:(if $parent == "" then null else $parent end),
-            subprocess_exit_code:$exit}')"
+      "$(_worker_extra "$(jq -cn --argjson exit "$rc" --argjson d "$envelope_detail" \
+          '$d + {reason:"model_call_nonzero_exit",subprocess_exit_code:$exit}')")"
     return 0
   fi
 
   # --- Extract reflection payload from envelope ---
   # `claude -p --output-format json` returns {type:"result", result:"<string>", usage:{...}}
   # where `result` is itself a JSON string produced by the model.
-  local inner
-  inner=$(jq -r '.result // empty' <<<"$claude_json" 2>/dev/null || true)
   if [[ -z "$inner" ]]; then
     write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "error" \
-      "$(jq -cn --arg tp "$TRANSCRIPT_PATH" --arg event "$HOOK_EVENT" --arg parent "$PARENT_SID" \
-          '{source_transcript:$tp,hook_event_name:$event,
-            parent_session_id:(if $parent == "" then null else $parent end),
-            reason:"empty_result_from_claude"}')"
+      "$(_worker_extra "$(jq -cn --argjson d "$envelope_detail" \
+          '$d + {reason:"empty_result_from_claude"}')")"
     return 0
   fi
 
   # --- Mission mode: raw markdown out, skip the reflection-JSON pipeline ---
-  # The AUTHORITATIVE handoff is $REFLECT_ROOT/sessions/<sid>/handoff/mission.md —
+  # The AUTHORITATIVE handoff is $CLAUDE_SESSIONS_DIR/<sid>/handoff/mission.md —
   # outside every repo, so no repo content can plant, forge or tamper with what a
   # later unattended fork executes. See "MISSION HANDOFF" in lib.sh for why three
   # earlier attempts to make a repo-resident file trustworthy all failed.
@@ -1085,6 +1513,10 @@ run_worker() {
     obstacles_to_autonomy: ((.obstacles_to_autonomy // []) | if type == "array" then . else [] end)
   }'
   local reflection=""
+  # shellcheck disable=SC2034  # which of the two parse strategies won is a
+  # breadcrumb for anyone stepping through this with `bash -x`; it is
+  # deliberately not in the manifest, where it would invite a consumer to branch
+  # on how the JSON was recovered rather than on whether it was.
   local parse_source=""
   if reflection=$(jq -c "$_coerce_arrays" <<<"$inner" 2>/dev/null); then
     parse_source="direct"
@@ -1107,22 +1539,27 @@ run_worker() {
     fi
     if [[ -n "$unfenced" ]]; then
       if reflection=$(jq -c "$_coerce_arrays" <<<"$unfenced" 2>/dev/null); then
+        # shellcheck disable=SC2034  # see the declaration: a `bash -x` breadcrumb.
         parse_source="fenced"
       fi
     fi
   fi
 
   if [[ -z "$reflection" ]]; then
-    local excerpt="${inner:0:200}"
+    # REFLECT_EXCERPT_BYTES, not a third copy of the literal 200: the same figure
+    # bounds this excerpt, the envelope's `result` in an error manifest, and the
+    # quoted tool_result bodies in an inlined transcript. One named input, so
+    # raising it raises all three together (see "Byte caps" in lib.sh).
+    local excerpt="${inner:0:$REFLECT_EXCERPT_BYTES}"
+    # No envelope_detail here, deliberately: the call SUCCEEDED and the envelope
+    # has nothing to confess. raw_excerpt already quotes the same bytes its
+    # `result` would, and a `result_excerpt` beside it would only invite a reader
+    # to look for two different failures where there is one.
     write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "error" \
-      "$(jq -cn --arg tp "$TRANSCRIPT_PATH" --arg event "$HOOK_EVENT" --arg parent "$PARENT_SID" \
-          --arg excerpt "$excerpt" \
-          --argjson len "${#inner}" \
-          '{source_transcript:$tp,hook_event_name:$event,
-            parent_session_id:(if $parent == "" then null else $parent end),
-            reason:"unparseable_reflection_json",
+      "$(_worker_extra "$(jq -cn --arg excerpt "$excerpt" --argjson len "${#inner}" \
+          '{reason:"unparseable_reflection_json",
             raw_excerpt:$excerpt,
-            raw_len:$len}')"
+            raw_len:$len}')")"
     return 0
   fi
 
@@ -1191,24 +1628,21 @@ run_worker() {
   if (( mv_rc != 0 )); then
     rm -f -- "$tmp" 2>/dev/null || true
     write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "error" \
-      "$(jq -cn --arg tp "$TRANSCRIPT_PATH" --arg event "$HOOK_EVENT" --arg parent "$PARENT_SID" \
-          --arg target "$out_path" \
-          --argjson rc "$mv_rc" \
-          '{source_transcript:$tp,hook_event_name:$event,
-            parent_session_id:(if $parent == "" then null else $parent end),
-            reason:"mv_failed",
+      "$(_worker_extra "$(jq -cn --arg target "$out_path" --argjson rc "$mv_rc" \
+          '{reason:"mv_failed",
             mv_exit_code:$rc,
-            target_path:$target}')"
+            target_path:$target}')")"
     return "$mv_rc"
   fi
 
+  # The complete write carries the attempt bookkeeping too. B1's whole claim is
+  # that final.json lands; `fallback_used:true` on a status=complete manifest is
+  # how an operator tells a reflection that came the cheap way from one that had
+  # to be rebuilt from a tail slice — and how the corpus can be re-measured later
+  # without re-reading worker logs.
   write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "complete" \
-    "$(jq -cn --arg tp "$TRANSCRIPT_PATH" --arg event "$HOOK_EVENT" --arg parent "$PARENT_SID" \
-        --arg out "$out_path" \
-        --argjson usage "$usage" \
-        '{source_transcript:$tp,hook_event_name:$event,
-          parent_session_id:(if $parent == "" then null else $parent end),
-          artifact:$out,usage:$usage}')"
+    "$(_worker_extra "$(jq -cn --arg out "$out_path" --argjson usage "$usage" \
+        '{artifact:$out,usage:$usage}')")"
 }
 
 # ============================================================================
@@ -1245,7 +1679,7 @@ spawn_detached_worker() {
 
   if [[ "$SPAWN_METHOD" == "systemd-run" ]]; then
     local -a setenv_args=( "--setenv=_REFLECT_INTERNAL=1" )
-    local v val
+    local v
     # CLAUDE_SESSIONS_DIR MUST be here. It selects the root the mission handoff
     # is written under, and its default is the user's REAL session tree. A
     # detached worker that does not inherit it silently writes into that real
@@ -1254,11 +1688,18 @@ spawn_detached_worker() {
     # thing standing between an isolated test and the user's own files. Same
     # shape as the REFLECT_ROOT propagation defect fixed earlier.
     for v in SESSION_ID PARENT_SID TRANSCRIPT_PATH HOOK_EVENT MODE CWD \
+             AGENT_ID AGENT_TYPE PARENT_TRANSCRIPT \
              REFLECT_MODEL REFLECT_ROOT CLAUDE_SESSIONS_DIR REFLECT_LOG_DIR REFLECT_LOCKFILE \
              REFLECT_STALE_STARTED_SECONDS REFLECT_REAP_MAX_PER_RUN \
              REFLECT_NO_SYSTEMD_RUN REFLECT_KILL_GRACE_SECONDS \
              REFLECT_BUDGET_PRECOMPACT REFLECT_BUDGET_SESSIONEND \
              REFLECT_BUDGET_SUBAGENTSTOP REFLECT_BUDGET_MISSION \
+             REFLECT_BUDGET_SESSIONEND_FALLBACK \
+             REFLECT_RESUME_MAX_TRANSCRIPT_BYTES REFLECT_RESUME_MODEL_WINDOW_TOKENS \
+             REFLECT_TRANSCRIPT_BYTES_PER_TOKEN REFLECT_AGENT_TRANSCRIPT_CAP_BYTES \
+             REFLECT_FALLBACK_TAIL_CAP_BYTES REFLECT_HANDOFF_CAP_BYTES \
+             REFLECT_HANDOFF_MAX_AGE_SECONDS REFLECT_EXCERPT_BYTES \
+             REFLECT_MISSION_RETENTION_DAYS \
              session_dir final_path manifest_path checkpoint_dir SCRIPT_DIR \
              HOME PATH USER LANG LC_ALL LC_CTYPE XDG_RUNTIME_DIR \
              ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN \
@@ -1400,7 +1841,20 @@ write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "started" "$extra_json"
 # REFLECT_LOCKFILE is what lets the detached worker re-acquire this mode's lock.
 export REFLECT_LOCKFILE="$LOCKFILE"
 export SESSION_ID PARENT_SID TRANSCRIPT_PATH HOOK_EVENT MODE CWD
+export AGENT_ID AGENT_TYPE PARENT_TRANSCRIPT
 export REFLECT_MODEL REFLECT_ROOT CLAUDE_SESSIONS_DIR REFLECT_LOG_DIR
+# The caps and thresholds live in lib.sh with `: "${VAR:=default}"`, i.e. SET but
+# not exported. The setsid spawn inherits only the exported environment, so an
+# operator override made at the hook would silently revert to the shipped default
+# inside the worker — which is the process that actually applies them.
+export REFLECT_BUDGET_SESSIONEND_FALLBACK REFLECT_RESUME_MAX_TRANSCRIPT_BYTES
+export REFLECT_AGENT_TRANSCRIPT_CAP_BYTES REFLECT_FALLBACK_TAIL_CAP_BYTES
+export REFLECT_HANDOFF_CAP_BYTES REFLECT_HANDOFF_MAX_AGE_SECONDS REFLECT_EXCERPT_BYTES
+# Mission mode runs mission_gc in the DETACHED worker, and gc is a delete. Left
+# unpropagated, an operator who raised the retention window still had copies
+# collected at the shipped 30 days, because the process doing the deleting never
+# saw the override. Same defect class as the caps above, with a destructive edge.
+export REFLECT_MISSION_RETENTION_DAYS
 export session_dir final_path manifest_path checkpoint_dir
 export SCRIPT_DIR
 
