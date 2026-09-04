@@ -11,7 +11,8 @@ The fix is a second, bounded re-arm channel: inplace_reset.py records every
 terminal result in <sid>/outcome.json, and the trigger consumes an abort
 outcome (once) to re-arm and fire again in the same Stop invocation. Bounds are
 env-overridable INPUTS (SELF_COMPACT_MAX_RETRIES, default 3;
-SELF_COMPACT_RETRY_SPACING_SECONDS, default 900) — never an on/off switch.
+SELF_COMPACT_RETRY_SPACING_SECONDS, default 0, measured from the previous
+attempt's TERMINAL time) — never an on/off switch.
 """
 import importlib.util
 import io
@@ -92,7 +93,7 @@ def test_abort_outcome_rearms_and_fires_again(harness):
     assert st["fires"] == 1 and st["armed"] is False
 
     now = int(time.time())
-    harness.patch_state(last_fired_at=now - 1000)   # spacing (900s) elapsed
+    harness.patch_state(last_fired_at=now - 1000)
     harness.write_outcome("aborted", at=now - 500)  # abort AFTER the fire
     assert harness.run(360_000) == 0
 
@@ -104,13 +105,41 @@ def test_abort_outcome_rearms_and_fires_again(harness):
     assert len(harness.spawned) == 2
 
 
-def test_retry_before_spacing_elapsed_does_not_rearm(harness):
+def test_the_measured_timeline_retries_on_the_next_stop(harness):
+    """The incident's OWN timing, replayed: fire T, abort T+200, Stop T+205.
+
+    MEASURED sid 6f11dbf0: fired 13:04:59Z, aborted 13:08:19Z — an abort lands
+    seconds to minutes after the fire, never at the fire. The re-arm promises
+    the retry rides the next turn boundary ("a Stop event IS a turn boundary —
+    the one moment the dominant abort shape, still-mid-turn, is guaranteed to
+    have just ended"), so the Stop right after that abort must refire.
+    """
     assert harness.run(350_000) == 0
-    harness.write_outcome("aborted")  # at=now; last_fired_at=now; 900s not elapsed
+    now = int(time.time())
+    harness.patch_state(last_fired_at=now - 205)                    # fire, T
+    harness.write_outcome("aborted", at=now - 5)                    # abort, T+200
+    assert harness.run(360_000) == 0                                # Stop, T+205
+
+    st = harness.state()
+    assert st["fires"] == 2
+    assert st["rearm_retries"] == 1
+    assert len(harness.spawned) == 2
+
+
+def test_spacing_is_measured_from_the_terminal_time_not_the_fire(harness, monkeypatch):
+    # THE ANCHOR, pinned in the direction that distinguishes it: the fire is
+    # long past (1000s) and the abort is fresh (10s), so a last_fired_at-anchored
+    # bound would allow this retry and a terminal-anchored one refuses it.
+    monkeypatch.setenv("SELF_COMPACT_RETRY_SPACING_SECONDS", "600")
+    assert harness.run(350_000) == 0
+    now = int(time.time())
+    harness.patch_state(last_fired_at=now - 1000)
+    harness.write_outcome("aborted", at=now - 10)
     assert harness.run(360_000) == 0
     st = harness.state()
     assert st["fires"] == 1
     assert st.get("rearm_retries", 0) == 0
+    assert "last_abort_consumed_at" not in st  # unconsumed: a later Stop retries
     assert len(harness.spawned) == 1
 
 
@@ -196,6 +225,28 @@ def test_a_corrupt_outcome_record_never_rearms(harness, raw):
     assert len(harness.spawned) == 1
 
 
+def test_a_lock_held_abort_never_buys_a_rearm(harness):
+    # lock_held is written by a SECOND process saying the FIRST still holds
+    # reset.lock and is still waiting (up to 900s). It is not the terminal
+    # state of the attempt this crossing is stuck on, so consuming it would
+    # drain the retry budget against a live holder — every refire hits the same
+    # lock — and leave nothing for the holder's real outcome.
+    assert harness.run(350_000) == 0
+    now = int(time.time())
+    harness.patch_state(last_fired_at=now - 1000)
+    harness.write_outcome("aborted", reason="lock_held", at=now - 10)
+    assert harness.run(360_000) == 0
+    st = harness.state()
+    assert st["fires"] == 1
+    assert st.get("rearm_retries", 0) == 0
+    assert "last_abort_consumed_at" not in st
+
+    # The holder finishing overwrites that record, and THAT one buys the retry.
+    harness.write_outcome("aborted", reason="mid_turn_timeout", at=now - 5)
+    assert harness.run(360_000) == 0
+    assert harness.state()["fires"] == 2
+
+
 def test_no_outcome_means_no_rearm(harness):
     # The pre-existing silence on repeat Stops (smoke TEST 23) is unchanged
     # when no reset ever reported back.
@@ -235,9 +286,22 @@ def test_abort_rearm_cannot_breach_max_fires_per_session(harness):
 
 
 def test_spacing_bound_is_an_env_input(harness, monkeypatch):
-    monkeypatch.setenv("SELF_COMPACT_RETRY_SPACING_SECONDS", "0")
+    # The same 600s bound the anchor test refuses under, now satisfied: an
+    # operator-set clock delays the retry, it never cancels it.
+    monkeypatch.setenv("SELF_COMPACT_RETRY_SPACING_SECONDS", "600")
     assert harness.run(350_000) == 0
-    harness.write_outcome("aborted")  # at=now; spacing 0 allows an instant retry
+    now = int(time.time())
+    harness.patch_state(last_fired_at=now - 1000)
+    harness.write_outcome("aborted", at=now - 700)
+    assert harness.run(360_000) == 0
+    assert harness.state()["fires"] == 2
+
+
+def test_the_default_spacing_lets_the_next_stop_retry(harness):
+    # Default 0: the outcome record IS the wait, so the turn boundary that
+    # follows an abort carries the retry. Spend stays bounded by MAX_RETRIES.
+    assert harness.run(350_000) == 0
+    harness.write_outcome("aborted")  # at=now, i.e. the abort just landed
     assert harness.run(360_000) == 0
     assert harness.state()["fires"] == 2
 
@@ -248,15 +312,12 @@ def test_garbage_env_bounds_fall_back_to_defaults(harness, monkeypatch):
     monkeypatch.setenv("SELF_COMPACT_RETRY_SPACING_SECONDS", "soon")
     monkeypatch.setenv("SELF_COMPACT_MAX_RETRIES", "-3")
     assert harness.run(350_000) == 0
-    harness.write_outcome("aborted")  # inside the default 900s spacing
+    harness.write_outcome("aborted")
     assert harness.run(360_000) == 0
-    assert harness.state()["fires"] == 1
-    # fires==1 alone cannot tell the fallback from a raw -3: the cap check runs
-    # BEFORE the spacing check, so 0 >= -3 would refuse via the cap branch and
-    # leave the same fire count. The fallback (3) must leave the cap untouched
+    # A raw -3 would cap this crossing on the spot (0 >= -3) and log it; the
+    # documented fallback (3) leaves the budget spendable. That is what tells
+    # the fallback from the garbage, and it is the only thing that can.
     assert "re-arm capped" not in (harness.sessions / "trigger.log").read_text()
     assert "rearm_capped" not in harness.state()
-    # and leave the budget spendable once the default spacing has elapsed.
-    harness.patch_state(last_fired_at=int(time.time()) - 1000)
-    assert harness.run(360_000) == 0
     assert harness.state()["fires"] == 2
+    assert harness.state()["rearm_retries"] == 1

@@ -82,11 +82,18 @@ LOOP BOUND (B6)
     that only goes staler. Bounded four ways, each checked in
     consume_abort_for_rearm:
       * the outcome must be newer than the fire it answers, and each outcome
-        buys at most ONE re-arm (last_abort_consumed_at);
+        buys at most ONE re-arm (last_abort_consumed_at). A `lock_held` abort
+        buys none at all: it is a second process reporting that the first is
+        still running, not a terminal state of the attempt being waited on;
       * at most SELF_COMPACT_MAX_RETRIES re-arms per crossing (default 3),
         counted in rearm_retries and logged once at the cap;
-      * at least SELF_COMPACT_RETRY_SPACING_SECONDS between attempts
-        (default 900), enforced against last_fired_at;
+      * at least SELF_COMPACT_RETRY_SPACING_SECONDS between the previous
+        attempt's TERMINAL time (the outcome's `at`) and the retry — default
+        0, because that record exists only once the attempt exited, so there
+        is nothing left to wait out. NOT measured from last_fired_at: aborts
+        land seconds to minutes after the fire (200s in the incident below),
+        so a fire-anchored window spends itself on the abort's own latency and
+        refuses the very turn boundary this channel aims at;
       * retry fires still count toward MAX_FIRES_PER_SESSION.
     A success outcome never re-arms and returns the retry budget; so does the
     dip re-arm (a dip is a new crossing). A MANUAL reset's abort feeds this
@@ -148,12 +155,28 @@ MAX_FIRES_PER_SESSION = 40
 # 3 retries: the dominant abort shape is "handoff written, still mid-turn 120s
 # after" (7 of ~21 aborts in inplace-reset.log, 2026-08-16..09-04), which a
 # single later turn boundary usually resolves; 3 keeps worst-case spend at 4
-# handoff turns per crossing. 900s spacing equals inplace_reset.py's
-# WRITE_WAIT_CAP_SECONDS: a retry inside that window could race a previous
-# attempt that is still legitimately waiting (reset.lock would refuse it, but
-# the refusal would burn a retry for nothing).
+# handoff turns per crossing.
+#
+# The spacing is measured from the previous attempt's TERMINAL time — the
+# outcome record's `at` — NOT from last_fired_at. An abort lands seconds to
+# minutes after the fire it answers (MEASURED sid 6f11dbf0: fired 13:04:59Z,
+# aborted 13:08:19Z, 200s later), so a fire-anchored window silently ate that
+# whole delay: at 900s every Stop for ~700s after the abort was refused, and a
+# session that went quiet inside that window never retried at all — the exact
+# silence the re-arm exists to end.
+#
+# 0 by default, deliberately. The bound had two jobs and the re-anchoring
+# discharges one of them outright: "do not race an attempt that is still
+# waiting" is enforced by the outcome record's own existence (inplace_reset
+# writes it on the way out of every terminal path), not by a clock. What is
+# left is spend, and spend is bounded by DEFAULT_MAX_RETRIES — 3 handoff turns
+# per crossing, each one cached-haiku-scale — not by an interval. A nonzero
+# default would postpone the retry past the one turn boundary the design aims
+# it at: the dominant abort is "still mid-turn", and the Stop carrying the
+# retry IS that turn ending. Operators who want a clock set the env var; the
+# value selects HOW LONG to wait, never WHETHER to retry (NO SWITCH).
 DEFAULT_MAX_RETRIES = 3
-DEFAULT_RETRY_SPACING_SECONDS = 900
+DEFAULT_RETRY_SPACING_SECONDS = 0
 # Same rule reflect.sh validates, ALL of it: these ids become path components.
 #
 # The charset half was already here; the leading-dot rejection was not, so the
@@ -374,6 +397,18 @@ def consume_abort_for_rearm(sid: str, state: dict) -> bool:
         return False
     if status != "aborted":
         return False
+    if outcome.get("reason") == "lock_held":
+        # NOT a terminal state of the attempt this crossing is waiting on. A
+        # lock_held record is written by a SECOND process reporting that the
+        # first one still holds reset.lock and is still running (it waits up
+        # to WRITE_WAIT_CAP_SECONDS). Consuming it would spend the crossing's
+        # retries against a live holder — every refire hits the same lock and
+        # writes another lock_held record — and the budget would be capped by
+        # the time the holder wrote its real outcome. The holder overwrites
+        # this record when it finishes (inplace_reset.py, "the holder
+        # overwrites this record with its own terminal outcome"), and THAT
+        # record is the one that buys the retry.
+        return False
     last_fired = state.get("last_fired_at", 0)
     if at < last_fired:
         # Left over from an earlier crossing: it answers a fire that already
@@ -392,7 +427,10 @@ def consume_abort_for_rearm(sid: str, state: dict) -> bool:
         return False
     spacing = retry_bound("SELF_COMPACT_RETRY_SPACING_SECONDS",
                           DEFAULT_RETRY_SPACING_SECONDS)
-    if int(time.time()) - last_fired < spacing:
+    # Measured from `at`, the previous attempt's TERMINAL time, never from
+    # last_fired_at — see the constants comment for the incident that anchor
+    # produced.
+    if int(time.time()) - at < spacing:
         # Quiet: outcome stays unconsumed, so a later Stop past the spacing
         # window retries. Logging here would emit a line per Stop event.
         return False
