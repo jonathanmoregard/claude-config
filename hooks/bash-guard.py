@@ -558,12 +558,21 @@ def _check_dcg(command: str) -> str | None:
                     + "The guard blocks rather than forwarding the question, "
                     "because a PreToolUse decision pre-empts settings.json "
                     "permission rules. To run it anyway, run it yourself in "
-                    "the prompt with `! <command>`.\n"
-                    "When no rule is named, dcg did not evaluate the command "
-                    "at all: its deadline (general.hook_timeout_ms) elapsed, "
-                    "or the command exceeded general.max_command_bytes. "
-                    "Neither is a verdict about the command — re-running it, "
-                    "or splitting it, normally clears."
+                    "the prompt with `! <command>`."
+                    # Only the no-rule case is an unevaluated command. A named
+                    # rule means dcg DID evaluate and its policy asks for a
+                    # human; telling the agent to re-run that would send it
+                    # round a loop the retry can never break.
+                    + (
+                        ""
+                        if rule
+                        else "\nNo rule is named, so dcg did not evaluate the "
+                        "command at all: its deadline "
+                        "(general.hook_timeout_ms) elapsed, or the command "
+                        "exceeded general.max_command_bytes. Neither is a "
+                        "verdict about the command — re-running it, or "
+                        "splitting it, normally clears."
+                    )
                 )
             continue
         _fail_closed(
@@ -1163,6 +1172,11 @@ _NIXOS_RISKY_MARKERS = re.compile(
 )
 
 _NIXOS_CHECKLIST_HEADER = re.compile(r"^Pre-push checklist:\s*$", re.MULTILINE)
+# The same header with leading whitespace, which the anchored one CANNOT
+# match. Recognised only to name the cause: an indented block parses as no
+# checklist, and answering that with the generic "there is no checklist here"
+# help sends the writer looking for a block they can see in front of them.
+_NIXOS_INDENTED_HEADER = re.compile(r"^[ \t]+Pre-push checklist:\s*$", re.MULTILINE)
 # Field lines are top-level only (anchored `^-\s`, NOT `^\s*-\s`). Indented
 # sub-bullets inside a multi-line `Behavioural evidence` value must not
 # overwrite the parent field map — they are joined onto the value above
@@ -1172,8 +1186,15 @@ _NIXOS_CHECKLIST_FIELD = re.compile(r"^-\s*([^:\n]+?)\s*:\s*(.*)$")
 _NIXOS_OVERRIDE = re.compile(r"^Override:\s*\[skip-vm-gate\]\s*(\S.+)$", re.MULTILINE)
 # `<placeholder>` template hints (`<list, or 'none'>`, `<cmd + output>`) left
 # unfilled by the agent are treated as empty. The angle-brackets are the
-# template's hint marker; real values never start with `<` AND end with `>`.
-_NIXOS_TEMPLATE_PLACEHOLDER = re.compile(r"^<.*>$")
+# template's hint marker; a real value never OPENS with one.
+#
+# Anchored at the start only, not `^<.*>$`. The end-anchored form was defeated
+# the moment values could wrap: `- Risky markers in diff: <list, or 'none'>`
+# with any continuation line joined onto it no longer ends in `>`, so an
+# untouched template hint read as a filled field. Prefix-matching keeps the
+# check honest for both shapes, and costs nothing real — a value that opens
+# with a bracketed phrase is the template hint whatever follows it.
+_NIXOS_TEMPLATE_PLACEHOLDER = re.compile(r"^<[^>]*>")
 _NIXOS_FEATURE_VM_FILE_IN_DIFF = re.compile(
     r"^diff --git .*modules/nixos/feature-vm\.nix\b", re.MULTILINE
 )
@@ -1197,16 +1218,26 @@ _NIXOS_GATE_HELP = (
     "nixos-config push gate refused this push (remote points at "
     "jonathanmoregard/nixos-config).\n\n"
     "HEAD commit message must contain a 'Pre-push checklist:' block.\n"
-    "Template (copy verbatim, then fill values):\n\n"
-    "  Pre-push checklist:\n"
-    "  - Type: pure-data           # OR 'risky' for branching/multistep/runtime\n"
-    "  - Rebased on origin/main: yes\n"
-    "  - Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
-    "  - Interactive smoke (nixos-agent-testing): <yes — cmd + observed | N/A — reason>\n"
-    "  - Advisor review (advice-refine-test-loop): <yes — rounds + verdict | N/A — reason>\n"
-    "  - feature-vm.nix modified: no    # MUST match actual diff\n"
-    "  - Risky markers in diff: <list, or 'none'>\n"
-    "  - Behavioural evidence: <what you actually exercised — command + observed output>\n\n"
+    # The template is printed FLUSH LEFT, and that is load-bearing rather than
+    # cosmetic. The header regex and the field regex are both anchored at
+    # column 0, so an indented copy of this block parses as no checklist at
+    # all — and the gate answers a verbatim copy of its own template with the
+    # identical refusal, which is a loop with no exit. It used to print two
+    # spaces of indentation under the words "copy verbatim".
+    "Template — copy it FLUSH LEFT (leading spaces void the block), then "
+    "fill the values:\n\n"
+    "Pre-push checklist:\n"
+    "- Type: pure-data           # OR 'risky' for branching/multistep/runtime\n"
+    "- Rebased on origin/main: yes\n"
+    "- Local gate: nix build .#checks.x86_64-linux.dellan-vm rc=0\n"
+    "- Interactive smoke (nixos-agent-testing): <yes — cmd + observed | N/A — reason>\n"
+    "- Advisor review (advice-refine-test-loop): <yes — rounds + verdict | N/A — reason>\n"
+    "- feature-vm.nix modified: no    # MUST match actual diff\n"
+    "- Risky markers in diff: <list, or 'none'>\n"
+    "- Behavioural evidence: <what you actually exercised — command + observed output>\n\n"
+    "A value too long for one line continues on the NEXT line indented by two "
+    "spaces; that attaches it to the field above. An unindented continuation "
+    "ends the block.\n\n"
     "For 'Type: pure-data' (package add, version bump, comment), only Type +\n"
     "brief justification are required; diff is verified to have no risky markers.\n\n"
     "Bypass (audited): add 'Override: [skip-vm-gate] <reason>' to commit message.\n"
@@ -1320,9 +1351,21 @@ def _repo_has_nixos_remote(repo_root: str) -> bool:
     Checks ALL configured remotes (fetch + push entries), not just origin,
     so forks / mirrors with a different push target still gate correctly.
     """
-    rc, out, _ = _nixos_git(repo_root, ["remote", "-v"])
+    rc, out, err = _nixos_git(repo_root, ["remote", "-v"])
     if rc != 0:
-        return False
+        # The caller only reaches here for a path `git rev-parse
+        # --show-toplevel` already answered for, so this IS a working tree and
+        # `git remote -v` failing means git could not tell us its remotes —
+        # not that it has none. Returning False rendered those two
+        # identically, and False switches the whole gate off.
+        # Reproduced: a `.git/config` git cannot parse (`fatal: bad config
+        # line 1`, exit 128) made a real nixos-config clone answer "not a
+        # nixos repo", and `git push` sailed past the checklist gate.
+        _fail_closed(
+            f"the nixos push gate could not list the remotes of {repo_root!r}, "
+            "so it cannot tell whether this is a nixos-config push "
+            f"(`git remote -v` exited {rc}: {err.strip()[:160]!r})"
+        )
     for line in out.splitlines():
         parts = line.split()
         if len(parts) >= 2 and _remote_is_nixos_config(parts[1]):
@@ -1384,6 +1427,16 @@ def _candidate_repo_paths(command: str, cwd: str | None) -> tuple[list[str], lis
     return deduped, unresolved
 
 
+# git's stderr for the two failures that are ANSWERS rather than faults —
+# see `_nixos_resolve_target_repo`, which is the only reader. Matched
+# case-insensitively as substrings, because git's wording carries a path and
+# a mount point around them.
+_NIXOS_GIT_ANSWERED_NOT_A_REPO = (
+    "not a git repository",
+    "cannot change to",
+)
+
+
 def _nixos_resolve_target_repo(command: str, cwd: str | None) -> str | None:
     """Working-tree top-level, if any candidate path is a nixos-config clone.
 
@@ -1402,9 +1455,29 @@ def _nixos_resolve_target_repo(command: str, cwd: str | None) -> str | None:
     """
     paths, unresolved = _candidate_repo_paths(command, cwd)
     for path in paths:
-        rc, toplevel, _ = _nixos_git(path, ["rev-parse", "--show-toplevel"])
+        rc, toplevel, err = _nixos_git(path, ["rev-parse", "--show-toplevel"])
         if rc != 0:
-            continue
+            # Two of git's non-zero exits are ANSWERS about the candidate, and
+            # most candidates get one of them: `not a git repository` (this
+            # path is not a repo) and `cannot change to <path>` (it does not
+            # exist — and a `git -C <missing> push` cannot push anything
+            # either, so it is not the repo under the gate).
+            #
+            # Every other non-zero exit is git failing to answer: a
+            # `.git/config` it cannot parse (`fatal: bad config line 1`, exit
+            # 128), a dubious-ownership refusal, an unreadable object store.
+            # Those used to take the same `continue`, which switched the gate
+            # off for a real nixos-config clone. Reproduced: corrupting
+            # `.git/config` in a clone whose remote IS nixos-config let
+            # `git push` past the checklist entirely.
+            if any(m in err.lower() for m in _NIXOS_GIT_ANSWERED_NOT_A_REPO):
+                continue
+            _fail_closed(
+                f"the nixos push gate could not determine whether {path!r} is a "
+                "git working tree, so it cannot say this push is NOT a "
+                f"nixos-config push (`git rev-parse --show-toplevel` exited "
+                f"{rc}: {err.strip()[:160]!r})"
+            )
         repo_root = toplevel.strip()
         if not repo_root:
             continue
@@ -1420,9 +1493,16 @@ def _nixos_resolve_target_repo(command: str, cwd: str | None) -> str | None:
 
 
 def _nixos_command_pushes(command: str) -> bool:
-    """True if a `git push` is present (excluding --dry-run)."""
+    """True if a `git push` is present (excluding --dry-run).
+
+    The flag run before `push` accepts `k=v` tokens. `[\\w-]+` alone cannot
+    span an `=`, so `git -c foo=bar push` and `git -c protocol.version=2 push`
+    matched nothing, the gate never fired, and the whole checklist check was
+    one documented git flag away from being skipped. Reproduced against this
+    predicate directly.
+    """
     for sub in _nixos_pipeline_subcommands(command):
-        if not re.search(r"\bgit\s+(?:-C\s+\S+\s+)?(?:[\w-]+\s+)*push\b", sub):
+        if not re.search(r"\bgit\s+(?:-C\s+\S+\s+)?(?:[\w.-]+(?:=\S+)?\s+)*push\b", sub):
             continue
         if re.search(r"(?:^|\s)--dry-run(?:\s|$)", sub):
             continue
@@ -1481,16 +1561,23 @@ def _nixos_parse_checklist(commit_msg: str) -> _ChecklistParse | None:
     fields = _ChecklistParse()
     in_block = False
     last_key: str | None = None
+    blank_since_field = False
     lines = commit_msg.splitlines()
     for i, line in enumerate(lines):
         if _NIXOS_CHECKLIST_HEADER.match(line):
             in_block = True
             last_key = None
+            blank_since_field = False
             continue
         if not in_block:
             continue
         stripped = line.strip()
         if stripped == "" or stripped.startswith("#"):
+            # A blank line is not a terminator, but it does mean anything
+            # after it is no longer CONTIGUOUS with the last field — which is
+            # what tells a wrapped value apart from the commit body resuming.
+            if stripped == "":
+                blank_since_field = True
             continue
         m = _NIXOS_CHECKLIST_FIELD.match(line)
         if m:
@@ -1501,6 +1588,7 @@ def _nixos_parse_checklist(commit_msg: str) -> _ChecklistParse | None:
             val = re.sub(r"\s+#.*$", "", val).strip()
             fields[key] = val
             last_key = key
+            blank_since_field = False
             continue
         if line[:1].isspace() and last_key is not None:
             # Indented continuation of the value above.
@@ -1508,15 +1596,28 @@ def _nixos_parse_checklist(commit_msg: str) -> _ChecklistParse | None:
             if tail:
                 fields[last_key] = (fields[last_key] + " " + tail).strip()
             continue
-        # First unrelated line ends the block. Record it, and everything
-        # below it that LOOKS like a checklist field, so a wrap can be
-        # diagnosed as a wrap.
+        # First unrelated line ends the block. Record it, and the fields
+        # written in the RUN that follows it, so a wrap can be diagnosed as a
+        # wrap.
+        #
+        # CONTIGUITY is what tells the two apart, and it is checked on both
+        # sides of the terminating line. A wrapped value and the fields it
+        # swallowed run together: no blank line before the terminator (it is
+        # the continuation of the field above it) and none between it and the
+        # fields below. A commit BODY that happens to bullet a field name
+        # ("Context for the reviewer:" then "- Risky markers in diff: none")
+        # is separated from the block by a blank line, and reporting that as
+        # a wrap is a false deny on a legitimate push — the same
+        # misdiagnosis this parser exists to end, pointed the other way.
         fields.terminator = stripped
         after: list[str] = []
-        for later in lines[i:]:
-            m2 = _NIXOS_CHECKLIST_FIELD.match(later)
-            if m2:
-                after.append(m2.group(1).strip().lower())
+        if not blank_since_field:
+            for later in lines[i:]:
+                if later.strip() == "":
+                    break
+                m2 = _NIXOS_CHECKLIST_FIELD.match(later)
+                if m2:
+                    after.append(m2.group(1).strip().lower())
         fields.fields_after = tuple(after)
         break
     return fields
@@ -1568,6 +1669,15 @@ def _check_nixos_push(command: str, cwd: str | None) -> str | None:
 
     fields = _nixos_parse_checklist(msg)
     if fields is None:
+        if _NIXOS_INDENTED_HEADER.search(msg):
+            return (
+                "nixos push gate: this commit message HAS a 'Pre-push "
+                "checklist:' line, but it is INDENTED, and the gate anchors "
+                "both the header and every `- Field:` line at column 0 — so "
+                "the block it can see is not one it can read.\n"
+                "Move the whole block flush left. Nothing else about it needs "
+                "to change.\n\n" + _NIXOS_GATE_HELP
+            )
         return _NIXOS_GATE_HELP
 
     # A checklist field written BELOW the line that ended the block is a
@@ -1587,7 +1697,7 @@ def _check_nixos_push(command: str, cwd: str | None) -> str | None:
             "nixos push gate: the 'Pre-push checklist:' block ends early. This "
             "line is neither `- Field: value` nor blank, so it closes the "
             "block:\n\n"
-            f"    {fields.terminator}\n\n"
+            f"    {(fields.terminator or '')[:200]}\n\n"
             "These checklist fields are written BELOW it and were therefore "
             "never read: " + ", ".join(dict.fromkeys(hidden)) + ".\n\n"
             "That shape is almost always a WRAPPED value — a long value "
@@ -1595,8 +1705,9 @@ def _check_nixos_push(command: str, cwd: str | None) -> str | None:
             "  - keep each value on ONE line, or\n"
             "  - indent continuation lines by two spaces, which attaches them "
             "to the field above.\n\n"
-            "The fields above are not missing; the gate just cannot tell which "
-            "field they belong to."
+            "This is NOT a report that those fields are absent. They are in "
+            "the commit message; the gate can see them but cannot tell which "
+            "field each one belongs to, because the block ended above them."
         )
 
     # Diff against origin/main, falling back to local main. safe-bash fell

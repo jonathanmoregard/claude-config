@@ -772,6 +772,14 @@ check(
     dec == "deny" and "core.git:reset-hard" in why,
     f"decision={dec!r} {why[:240]}",
 )
+check(
+    # A named rule means dcg DID evaluate; "re-running normally clears" is
+    # true only of the deadline and size cases, and telling the agent to
+    # retry a policy ask sends it round a loop the retry cannot break.
+    "... and does NOT promise that re-running will clear it",
+    "normally clears" not in why,
+    why[:240],
+)
 
 dec, why = guard("rm -rf /", dcg=STUB_ASK_THEN_DENY)
 check(
@@ -1643,6 +1651,133 @@ check(
     "... and does NOT accuse the fields below it of being missing",
     "missing, empty, or template-placeholder" not in why,
     why[:400],
+)
+
+# --- D31: the fixes the ARFTL review's repros forced ------------------
+# Five findings, each reproduced against this file before it was touched.
+
+# D31a — the gate's OWN printed template, copied verbatim, must parse. It
+# used to be printed indented two spaces under the words "copy verbatim",
+# and both regexes anchor at column 0, so a verbatim copy parsed as NO
+# checklist and the gate answered it with the identical refusal. A loop with
+# no exit, in the message whose only job is to end one.
+# Take the block the way a copier would: the header LINE and everything
+# under it, not the prose mention of the same words further up.
+_tmpl_start = bash_guard._NIXOS_GATE_HELP.index("\nPre-push checklist:\n") + 1
+_tmpl = bash_guard._NIXOS_GATE_HELP[
+    _tmpl_start : bash_guard._NIXOS_GATE_HELP.index("\n\n", _tmpl_start)
+]
+_tp = pc(_tmpl)
+check(
+    "the printed template parses as a checklist when copied verbatim",
+    isinstance(_tp, dict) and _tp.get("type", "").startswith("pure-data"),
+    repr(_tmpl[:60]),
+)
+check(
+    "... and every required field survives that copy",
+    all(k in _tp for k in bash_guard._NIXOS_REQUIRED_FIELDS),
+    str(sorted(set(bash_guard._NIXOS_REQUIRED_FIELDS) - set(_tp)))[:200],
+)
+
+# D31b — an INDENTED block is named as indented, not reported as absent.
+w = branch_with(
+    make_repo(),
+    "feat: x\n\n  Pre-push checklist:\n  - Type: pure-data\n",
+    {"docs/a.md": "x\n"},
+)
+dec, why = push_guard(w)
+check(
+    "an indented checklist block is diagnosed as indented",
+    dec == "deny" and "INDENTED" in why and "flush left" in why,
+    f"decision={dec!r} {why[:220]}",
+)
+
+# D31c — an untouched `<template hint>` must stay a placeholder even once a
+# continuation line is joined onto it. The end-anchored `^<.*>$` stopped
+# matching the moment the join appended text, so the indent-join feature
+# turned an unfilled template into a filled field.
+_ph = (
+    CHECKLIST_RISKY.format(fv="no").replace(
+        "- Risky markers in diff: none\n",
+        "- Risky markers in diff: <list, or 'none'>\n  (hint left in place)\n",
+    )
+)
+w = branch_with(make_repo(), _ph, {"docs/a.md": "x\n"})
+dec, why = push_guard(w)
+check(
+    "a wrapped-but-unfilled template placeholder is still refused",
+    dec == "deny" and "risky markers in diff" in why,
+    f"decision={dec!r} {why[:250]}",
+)
+
+# D31d — the wrap diagnosis must not fire on a commit BODY that bullets a
+# field name. Scanning to end-of-message made a legitimate pure-data push
+# read as a wrap: the same misdiagnosis, pointed the other way.
+_body = (
+    "chore: bump a package\n"
+    "\n"
+    "Pre-push checklist:\n"
+    "- Type: pure-data\n"
+    "\n"
+    "Context for the reviewer:\n"
+    "- Risky markers in diff: none, this is a version string only\n"
+)
+w = branch_with(make_repo(), _body, {"docs/a.md": "x\n"})
+dec, why = push_guard(w)
+check(
+    "a body bullet naming a checklist field is NOT a wrap",
+    dec is None,
+    f"decision={dec!r} {why[:250]}",
+)
+
+# D31e — the terminating line is echoed CAPPED. Every other echo in this
+# file truncates; an uncapped one lets a single commit line flood the deny.
+_flood = (
+    CHECKLIST_RISKY.format(fv="no").replace(
+        "- Rebased on origin/main: yes\n",
+        "- Rebased on origin/main: yes\n" + ("z" * 3000) + "\n",
+    )
+)
+w = branch_with(make_repo(), _flood, {"docs/a.md": "x\n"})
+dec, why = push_guard(w)
+check(
+    "the echoed terminator is truncated",
+    dec == "deny" and "z" * 3000 not in why and "z" * 100 in why,
+    f"decision={dec!r} len={len(why)}",
+)
+
+# D31f — `git -c k=v push`. The flag run before `push` could not span an
+# `=`, so one documented git flag skipped the whole gate.
+for _cmd in (
+    "git -c foo=bar push origin HEAD",
+    "git -c protocol.version=2 push",
+    "git --git-dir=/x/.git push origin HEAD",
+):
+    check(
+        f"command_pushes sees {_cmd!r}",
+        bash_guard._nixos_command_pushes(_cmd) is True,
+        f"got {bash_guard._nixos_command_pushes(_cmd)!r}",
+    )
+
+# D31g — a repo whose remotes git cannot list must DENY, not fall through to
+# "not a nixos repo". Reproduced with a `.git/config` git refuses to parse
+# (`fatal: bad config line 1`, exit 128): a real nixos-config clone answered
+# "not a nixos repo" and the push sailed past the gate.
+w = branch_with(make_repo(), "feat: no trailer at all", {"docs/a.md": "x\n"})
+with open(os.path.join(w, ".git", "config"), "w", encoding="utf-8") as fh:
+    fh.write("[core\nthis is not valid ini\n")
+dec, why = push_guard(w)
+check(
+    "a repo git cannot read DENIES rather than reading as 'not a nixos repo'",
+    dec == "deny" and BROKEN_MARKER in why and "bad config line" in why,
+    f"decision={dec!r} {why[:250]}",
+)
+check(
+    # The control: git ANSWERING "not a git repository" is not a fault, and
+    # must stay an allow — most candidate paths the gate probes are not repos.
+    "a candidate path that is simply not a repo is still allowed",
+    push_guard(SCRATCH, cwd=SCRATCH)[0] is None,
+    f"decision={push_guard(SCRATCH, cwd=SCRATCH)[0]!r}",
 )
 
 # --- D25: a diff carrying non-UTF-8 bytes must not crash the gate -----
