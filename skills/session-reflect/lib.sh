@@ -1296,22 +1296,29 @@ reflect_jsonl_to_text() {
 # prompt, never take down the worker that was about to write a manifest.
 reflect_transcript_extract() {
   local path="${1:-}" cap="${2:-0}" side="${3:-tail}"
-  local out="" sliced="" size raw_cap
+  local out="" sliced="" raw_slice="" size raw_cap
   if [[ -f "$path" && -r "$path" ]] && [[ "$cap" =~ ^[0-9]+$ ]] && (( cap > 0 )); then
     size="$(reflect_file_size "$path")"
     raw_cap=$(( cap * 4 ))
     if (( size > raw_cap )); then
       if [[ "$side" == "head" ]]; then
-        sliced="$(head -c "$raw_cap" -- "$path" 2>/dev/null | head -n -1 || true)"
+        raw_slice="$(head -c "$raw_cap" -- "$path" 2>/dev/null || true)"
+        sliced="$(printf '%s' "$raw_slice" | head -n -1 || true)"
       else
-        sliced="$(tail -c "$raw_cap" -- "$path" 2>/dev/null | tail -n +2 || true)"
+        raw_slice="$(tail -c "$raw_cap" -- "$path" 2>/dev/null || true)"
+        sliced="$(printf '%s' "$raw_slice" | tail -n +2 || true)"
       fi
     else
-      sliced="$(cat -- "$path" 2>/dev/null || true)"
+      raw_slice="$(cat -- "$path" 2>/dev/null || true)"
+      sliced="$raw_slice"
     fi
     if [[ -n "$sliced" ]]; then
       out="$(printf '%s\n' "$sliced" | reflect_jsonl_to_text || true)"
     fi
+    # `raw_slice` is the window BEFORE the broken edge line is dropped, kept
+    # because the drop can empty the window outright — see the raw-excerpt
+    # degradation below. Sliced from the in-memory copy rather than re-reading
+    # the file, so this is still one read of a possibly-multi-megabyte transcript.
     if (( ${#out} > cap )); then
       if [[ "$side" == "head" ]]; then
         out="${out:0:$cap}"$'\n'"[Note: extract truncated at $cap characters; the rest of the run is not shown.]"
@@ -1324,6 +1331,44 @@ reflect_transcript_extract() {
 }
 
 # reflect_handoff_block <sid> — the self-compact handoff for this session, when
+    # THE SLICE CAN HOLD NO COMPLETE JSONL LINE. Both slice paths drop the edge
+    # line they cut in half — and when a single line is itself bigger than
+    # cap x4 (one 200 KB tool_result, one pasted file), that edge line is the
+    # ONLY line in the window. Dropping it leaves `sliced` empty, jq gets
+    # nothing, `out` comes back empty, and the caller then tells the model "the
+    # session transcript could not be read" about a transcript that is sitting
+    # right there and merely unparseable at this window size. Degrade to the raw
+    # bytes instead: a verbatim excerpt is a worse read than the extract, and a
+    # far better one than a false claim of an unreadable file.
+    #
+    # Keyed on `raw_slice`, not on `sliced`, precisely because the headline case
+    # is the one where the edge-line drop emptied `sliced`. It also catches the
+    # milder shape — a window that survived the drop but parsed to nothing.
+    #
+    # UNTRUSTED DATA, and MORE so than the extract above: reflect_jsonl_to_text
+    # is what normally drops thinking blocks and tool_use inputs and cuts
+    # tool_result bodies to an excerpt, and none of that filtering has run on
+    # these bytes. Same handling as every other block here — prompt CONTENT for a
+    # `--tools ""` subprocess, summarised, never executed, never interpolated
+    # into a shell command. The cap is what bounds it.
+    if [[ -z "$out" && -n "$raw_slice" ]]; then
+      local raw
+      if (( ${#raw_slice} > cap )); then
+        if [[ "$side" == "head" ]]; then
+          raw="${raw_slice:0:$cap}"
+        else
+          raw="${raw_slice: -$cap}"
+        fi
+      else
+        raw="$raw_slice"
+      fi
+      out="[Note: transcript lines too large to parse as JSONL; raw excerpt follows.]"$'\n'"$raw"
+      # Return here: `out` is already capped by construction and carries its own
+      # note, so the truncation-note branch below must not fire a SECOND note on
+      # it (the prefix alone would push it past `cap` and earn one).
+      printf '%s' "$out"
+      return 0
+    fi
 # there is one and it is fresh, capped. Empty string otherwise.
 #
 # OPTIONAL BY CONSTRUCTION. The fallback exists because a session was too big to

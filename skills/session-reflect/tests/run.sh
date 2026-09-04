@@ -595,6 +595,58 @@ else
   ok "the extract did not collapse to the empty-block placeholder"
 fi
 
+# ===========================================================================
+# F3 — a transcript whose newest line alone exceeds the raw slice window.
+# The slice paths drop the half-cut edge line; when that line is the ONLY one in
+# the window, the slice empties, jq gets nothing, and the caller used to tell the
+# model the transcript "could not be read" about a file sitting right there.
+# The caps are shrunk via env so the fixture stays small and the case stays
+# sub-second — the shape is what matters, not the byte count.
+# ===========================================================================
+t_begin "F3: an unparseable-at-this-window transcript degrades to a raw excerpt"
+reset_logs
+RAW_SID="40fbb4a9-1a2b-4c3d-9e8f-00000000000b"
+RAW_TRANSCRIPT="$PROJECTS_DIR/$RAW_SID.jsonl"
+# ONE line, body well past the 1024-char cap x4 = 4096-byte raw window below.
+python3 - "$RAW_TRANSCRIPT" <<'PY'
+import json, sys
+body = "Z" * 8000 + "FIXTURE-RAW-TAIL-MARKER"
+with open(sys.argv[1], "w") as fh:
+    fh.write(json.dumps({"type": "user",
+                         "message": {"role": "user", "content": body}}) + "\n")
+PY
+RAW_BYTES=$(stat -c '%s' "$RAW_TRANSCRIPT")
+# Force the fallback (oversize pre-check) so the tail block is what gets inlined.
+STUB_MODE=ok REFLECT_FALLBACK_TAIL_CAP_BYTES=1024 \
+  REFLECT_RESUME_MAX_TRANSCRIPT_BYTES=$(( RAW_BYTES / 2 )) \
+  bash "$REFLECT_SH" sessionend <<<"$(sessionend_payload "$RAW_SID" "$RAW_TRANSCRIPT")"
+RAW_MANIFEST="$REFLECT_ROOT/sessions/$RAW_SID/manifest.json"
+if wait_terminal "$RAW_MANIFEST" sessionend; then
+  jqe '.modes.sessionend.status == "complete"' "$RAW_MANIFEST"; assert $? "status=complete"
+else
+  bad "no terminal manifest at $RAW_MANIFEST"
+fi
+grep -qF 'raw excerpt follows' "$STUB_PROMPT_LOG"; assert $? "the fallback prompt announces the raw excerpt"
+grep -qF 'FIXTURE-RAW-TAIL-MARKER' "$STUB_PROMPT_LOG"; assert $? "the raw excerpt carries real content from the newest end"
+if grep -qF 'the session transcript could not be read' "$STUB_PROMPT_LOG"; then
+  bad "the prompt still claims the transcript could not be read"
+else
+  ok "the prompt does NOT claim the transcript was unreadable"
+fi
+
+t_begin "F3 control: a parseable transcript gets the extract, never the raw note"
+reset_logs
+RAWC_SID="40fbb4a9-1a2b-4c3d-9e8f-00000000000c"
+STUB_MODE=fail_resume bash "$REFLECT_SH" sessionend <<<"$(sessionend_payload "$RAWC_SID")"
+RAWC_MANIFEST="$REFLECT_ROOT/sessions/$RAWC_SID/manifest.json"
+wait_terminal "$RAWC_MANIFEST" sessionend; assert $? "fallback reached a terminal status"
+grep -qF 'FIXTURE-PARENT-TAIL-MARKER' "$STUB_PROMPT_LOG"; assert $? "the normal extract still reaches the prompt"
+if grep -qF 'raw excerpt follows' "$STUB_PROMPT_LOG"; then
+  bad "a parseable transcript was degraded to a raw excerpt"
+else
+  ok "no raw-excerpt note on a transcript that parses"
+fi
+
 # T2 — syntax + lint
 # ===========================================================================
 t_begin "T2: bash -n and shellcheck"
