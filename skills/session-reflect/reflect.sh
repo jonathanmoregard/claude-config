@@ -459,6 +459,37 @@ else
   PAYLOAD="$(cat)"
   if [[ -z "$PAYLOAD" ]]; then
     # No payload — nothing we can do, but don't crash the caller.
+    #
+    # G2 fix (LOW): this was the ONE bad input that left no forensic trail at
+    # all. Every other one — unparseable JSON, missing session_id, invalid sid,
+    # missing agent fields — lands a structured record under malformed/, so a
+    # hook that has been mis-wired to feed us nothing (wrong stdin plumbing, a
+    # wrapper that swallows the payload, a hook fired with no stdin) looked
+    # EXACTLY like a hook that never fired. Same shape malformed_manifest
+    # writes, so one query over malformed/ still sees every rejected input.
+    #
+    # Written inline rather than through malformed_manifest: that function is
+    # defined ~90 lines below and reads $PAYLOAD/$HOOK_EVENT, neither of which
+    # is established here (HOOK_EVENT comes out of the payload we do not have).
+    # Best-effort throughout, and gated on a writable root: the contract of this
+    # branch is `exit 0`, and a diagnostic may never turn a no-op into a failure.
+    if ensure_reflect_root_writable 2>/dev/null; then
+      _empty_dir="$REFLECT_ROOT/malformed"
+      if mkdir -p "$_empty_dir" 2>/dev/null && \
+         _empty_manifest="$(mktemp -p "$_empty_dir" ".manifest-XXXXXX.json" 2>/dev/null)"; then
+        # sha256 of the empty string + payload_len 0 — the honest values, and
+        # they keep the record schema-identical to every other malformed one.
+        jq -n \
+          --arg mode "$MODE" \
+          --arg event "" \
+          --arg reason "empty_payload" \
+          --arg sha "$(printf '%s' "$PAYLOAD" | sha256sum | awk '{print $1}')" \
+          --argjson len 0 \
+          --arg now "$(reflect_now)" \
+          '{status:"error",reason:$reason,mode:$mode,hook_event_name:$event,payload_sha256:$sha,payload_len:$len,written_at:$now}' \
+          > "$_empty_manifest" 2>/dev/null || true
+      fi
+    fi
     exit 0
   fi
   # Refuse to touch a non-writable REFLECT_ROOT — writing junk to $HOME/tmp

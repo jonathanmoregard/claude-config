@@ -715,6 +715,40 @@ grep -qE '^export .*REFLECT_MISSION_RETENTION_DAYS' "$REFLECT_SH"
 assert $? "exported for the setsid spawn path"
 
 # ===========================================================================
+# G2 — empty stdin is a bad input like any other, and leaves a record.
+# It used to be the ONE that did not: `exit 0` with nothing written, so a hook
+# mis-wired to feed the dispatcher nothing was indistinguishable from a hook
+# that never fired. The exit status is part of the contract and is asserted
+# alongside — a diagnostic that turned the no-op into a failure would be worse
+# than the missing record.
+# ===========================================================================
+t_begin "G2: empty stdin leaves a structured record, and still exits 0"
+reset_logs
+EMPTY_BEFORE=$(find "$REFLECT_ROOT/malformed" -type f -name '*.json' 2>/dev/null | wc -l)
+bash "$REFLECT_SH" sessionend </dev/null
+rc=$?
+assert "$(( rc == 0 ? 0 : 1 ))" "dispatcher exits 0 on empty stdin (rc=$rc)"
+EMPTY_AFTER=$(find "$REFLECT_ROOT/malformed" -type f -name '*.json' 2>/dev/null | wc -l)
+(( EMPTY_AFTER > EMPTY_BEFORE )); assert $? "a record was written under malformed/"
+if find "$REFLECT_ROOT/malformed" -type f -name '*.json' -print0 2>/dev/null \
+     | xargs -0 -r jq -e 'select(.reason == "empty_payload")' >/dev/null 2>&1; then
+  ok "record carries reason=empty_payload"
+else
+  bad "no record with reason=empty_payload"
+fi
+# Same schema as every other malformed record, so one query sees them all.
+if find "$REFLECT_ROOT/malformed" -type f -name '*.json' -print0 2>/dev/null \
+     | xargs -0 -r jq -e 'select(.reason == "empty_payload" and .status == "error"
+                                 and .payload_len == 0 and .mode == "sessionend"
+                                 and .written_at != null)' >/dev/null 2>&1; then
+  ok "record mirrors the malformed_manifest shape (status/mode/payload_len/written_at)"
+else
+  bad "the empty-payload record does not mirror the malformed_manifest shape"
+fi
+(( $(call_count) == 0 )); assert $? "no model call was made ($(call_count) seen)"
+[[ ! -d "$REFLECT_ROOT/sessions/unknown" ]]; assert $? "no session dir minted for a payload that named none"
+
+# ===========================================================================
 # T2 — syntax + lint
 # ===========================================================================
 t_begin "T2: bash -n and shellcheck"
