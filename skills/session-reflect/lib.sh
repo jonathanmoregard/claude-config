@@ -1022,65 +1022,199 @@ mission_gc() {
   printf '%s' "$removed"
 }
 
-# --- Best-effort parent-SID discovery for subagents --------------------------
-# find_parent_session_id <subagent_sid> <cwd> <transcript_path>
-# Strategy, in order:
-#   1. $CLAUDE_PARENT_SESSION_ID env (set explicitly)
-#   2. Scan sibling transcript JSONLs in the same project dir for a Task
-#      tool_use referencing this subagent's sid (best-effort, cheap grep).
-#   3. Empty string -> caller treats subagent SID as its own parent.
-find_parent_session_id() {
-  local sub_sid="$1" cwd="$2" tp="$3"
-  if [[ -n "${CLAUDE_PARENT_SESSION_ID:-}" ]]; then
-    # Only honor env-provided parent SID if it passes the safe-charset check.
-    if is_valid_sid "$CLAUDE_PARENT_SESSION_ID"; then
-      printf '%s' "$CLAUDE_PARENT_SESSION_ID"
-      return 0
-    fi
-    # Untrusted env value; fall through to scan or return empty.
-  fi
-  # Only scan if sub_sid itself is a safe token (defense in depth).
-  if ! is_valid_sid "$sub_sid"; then
-    printf ''
-    return 0
-  fi
-  local project_dir
-  project_dir="$(dirname -- "$tp")"
-  if [[ -d "$project_dir" ]]; then
-    # Use nullglob so empty dirs return an empty array (not the literal glob).
-    local -a jsonl_files=()
-    local prev_nullglob
-    prev_nullglob="$(shopt -p nullglob || true)"
-    shopt -s nullglob
-    jsonl_files=( "$project_dir"/*.jsonl )
-    eval "$prev_nullglob"
+# ============================================================================
+# PARENT LINKAGE — the payload says it; nothing infers it
+# ============================================================================
+# There used to be a `find_parent_session_id` here: env `CLAUDE_PARENT_SESSION_ID`
+# first, then a `grep -lF <sid>` scan across every sibling transcript JSONL in the
+# project dir, taking whichever the kernel returned first.
+#
+# BOTH HALVES WERE WRONG, and the scan actively harmful (verified 2026-09-04
+# against Claude Code 2.1.260):
+#   * 2.1.260 sets no CLAUDE_PARENT_SESSION_ID at all, so strategy 1 never fired.
+#   * The scan matched any transcript that merely MENTIONED the sid — a sid
+#     appears in the transcripts of sessions that only talked about it — and
+#     readdir order is not mtime order, so the SAME session was observed nested
+#     under two different "parents" on two runs.
+#   * The sid being scanned for was the PARENT's own (the payload's `session_id`
+#     is the parent session, not the subagent), so the whole search was for the
+#     parent of the parent.
+#
+# The 2.1.260 SubagentStop payload states the linkage outright: `session_id` is
+# the parent, `agent_id` names the subagent, `agent_transcript_path` points at
+# its transcript. reflect.sh reads those three fields and nests at
+# sessions/<session_id>/subagents/<agent_id>/. When they are absent (an older
+# harness) it writes a structured record and stops — deliberately NOT falling
+# back to a scan, and NOT treating the parent as a subagent, which is what
+# produced the misnested artifacts and the mid-session reflections of live
+# parent sessions in the corpus.
+#
+# Nothing replaces this function. A guess about which session owns an artifact
+# is worse than no artifact: the artifact is filed somewhere a consumer will
+# read it as fact.
 
-    if (( ${#jsonl_files[@]} == 0 )); then
-      printf ''
-      return 0
-    fi
+# --- Inlined transcript extracts (A3 / B1) -----------------------------------
+# Two paths now feed transcript CONTENT to a model instead of resuming a
+# session: the subagent reflection (an agent transcript is not a resumable
+# session) and the sessionend fallback (the resume is what failed).
+#
+# UNTRUSTED DATA, ALWAYS. Everything these produce is transcript text: user
+# turns, model turns, and tool output from the open internet. It is passed as
+# prompt content to a `--tools ""` subprocess, is never executed, never
+# interpolated into a shell command, and the reply it produces is JSON-parsed
+# and schema-normalised before anything downstream sees it. The prompts that
+# carry these blocks say so to the model as well; see prompts/subagentstop.md
+# and prompts/sessionend-fallback.md.
 
-    # Best-effort: `grep -l` returns matches in readdir order (arbitrary,
-    # NOT mtime-recent). For uniquely-named SIDs (Claude's are UUID-shaped),
-    # a match is deterministic enough — collisions require an attacker
-    # seeding the transcript dir. The earlier "Recent-first" phrasing
-    # implied mtime ordering, which was never true; head -1 just takes
-    # whichever the kernel returned first. -- guards against filenames
-    # starting with -.
-    local candidate
-    candidate="$(grep -lF -- "$sub_sid" "${jsonl_files[@]}" 2>/dev/null \
-      | grep -vF -- "$tp" | head -1 || true)"
-    if [[ -n "$candidate" ]]; then
-      # Re-validate: a jsonl filename could in principle bypass the sub_sid
-      # entropy check if the transcript dir was seeded adversarially, so
-      # run the derived parent through is_valid_sid before returning it.
-      local parent_candidate
-      parent_candidate="$(basename -- "$candidate" .jsonl)"
-      if is_valid_sid "$parent_candidate"; then
-        printf '%s' "$parent_candidate"
-        return 0
+# reflect_file_size <path> — size in bytes, or 0 for anything unreadable.
+reflect_file_size() {
+  local f="${1:-}" n=""
+  [[ -f "$f" ]] || { printf '0'; return 0; }
+  n="$(stat -c '%s' "$f" 2>/dev/null || echo '')"
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  printf '%s' "$n"
+}
+
+# reflect_jsonl_to_text — stdin: Claude Code transcript JSONL. stdout: one
+# `role: body` paragraph per message that has human-legible content.
+#
+# What survives: text blocks and plain-string content — the actual conversation.
+# What does not: thinking blocks (internal, and the bulkiest thing in a modern
+# transcript), tool_use INPUTS (the call is named, its arguments are not), and
+# tool_result BODIES beyond REFLECT_EXCERPT_BYTES. That is the whole point of
+# extracting rather than inlining: a transcript is mostly tool payloads, and a
+# reflection is about what happened, not about the bytes that passed through.
+#
+# Every jq access is defensive. This is the one place where a MALFORMED line is
+# expected rather than exceptional: transcripts are appended to live and the
+# last line of a file being written is routinely half-flushed, and the tail
+# slice below cuts a line in half by construction. `fromjson?` drops those
+# silently; a non-object content element is stringified rather than dereferenced,
+# because `.type` on a string aborts the whole jq program and would cost us the
+# entire extract for one odd line.
+reflect_jsonl_to_text() {
+  jq -R -r --argjson excerpt "$REFLECT_EXCERPT_BYTES" '
+    (fromjson? // empty) as $e
+    | ($e.message // {}) as $m
+    | ((($m | if type == "object" then .role else null end) // $e.type // "?") | tostring) as $role
+    | ($m | if type == "object" then .content else null end) as $c
+    | ( if ($c | type) == "string" then [$c]
+        elif ($c | type) == "array" then
+          [ $c[]
+            | if type == "object" then
+                ( if .type == "text" then ((.text // "") | tostring)
+                  elif .type == "tool_use" then ("[tool_use " + ((.name // "?") | tostring) + "]")
+                  elif .type == "tool_result" then
+                    ("[tool_result " + (((.content // "") | tostring)[0:$excerpt]) + "]")
+                  else "" end )
+              else tostring end ]
+        else [] end ) as $parts
+    | ($parts | map(select(. != null and . != "")) | join("\n")) as $body
+    | select($body != "")
+    | $role + ": " + $body
+  ' 2>/dev/null || true
+}
+
+# reflect_transcript_extract <path> <cap_chars> [head|tail]
+# Human-legible extract of a transcript, capped, newest-first for `tail`.
+#
+# The raw file is sliced BEFORE jq sees it (cap x4, since the extract discards
+# most of a transcript's bytes) so the cost is bounded by the cap rather than by
+# the transcript: the sessions this exists for are the multi-megabyte ones. The
+# slice's own broken edge line is dropped, and truncation is ANNOUNCED in the
+# body so the model knows it is looking at a window and not at the whole run.
+# Always exits 0 with possibly-empty output: a failed extract must degrade the
+# prompt, never take down the worker that was about to write a manifest.
+reflect_transcript_extract() {
+  local path="${1:-}" cap="${2:-0}" side="${3:-tail}"
+  local out="" sliced="" size raw_cap
+  if [[ -f "$path" && -r "$path" ]] && [[ "$cap" =~ ^[0-9]+$ ]] && (( cap > 0 )); then
+    size="$(reflect_file_size "$path")"
+    raw_cap=$(( cap * 4 ))
+    if (( size > raw_cap )); then
+      if [[ "$side" == "head" ]]; then
+        sliced="$(head -c "$raw_cap" -- "$path" 2>/dev/null | head -n -1 || true)"
+      else
+        sliced="$(tail -c "$raw_cap" -- "$path" 2>/dev/null | tail -n +2 || true)"
+      fi
+    else
+      sliced="$(cat -- "$path" 2>/dev/null || true)"
+    fi
+    if [[ -n "$sliced" ]]; then
+      out="$(printf '%s\n' "$sliced" | reflect_jsonl_to_text || true)"
+    fi
+    if (( ${#out} > cap )); then
+      if [[ "$side" == "head" ]]; then
+        out="${out:0:$cap}"$'\n'"[Note: extract truncated at $cap characters; the rest of the run is not shown.]"
+      else
+        out="[Note: showing only the NEWEST $cap characters of this transcript; earlier turns are elided.]"$'\n'"${out: -$cap}"
       fi
     fi
   fi
-  printf ''
+  printf '%s' "$out"
+}
+
+# reflect_handoff_block <sid> — the self-compact handoff for this session, when
+# there is one and it is fresh, capped. Empty string otherwise.
+#
+# OPTIONAL BY CONSTRUCTION. The fallback exists because a session was too big to
+# resume, and a self-compact handoff is exactly the artifact such a session
+# leaves behind — but self-compact is a separate subsystem with its own root,
+# and nothing here may depend on it having run. Missing, stale, unreadable and
+# empty all produce the same empty block.
+reflect_handoff_block() {
+  local sid="${1:-}" f body mt age now
+  is_valid_sid "$sid" || { printf ''; return 0; }
+  f="$(mission_handoff_path "$sid")"
+  [[ -f "$f" && -r "$f" ]] || { printf ''; return 0; }
+  mt="$(stat -c '%Y' "$f" 2>/dev/null || echo '')"
+  [[ "$mt" =~ ^-?[0-9]+$ ]] || { printf ''; return 0; }
+  now="$(date -u +%s)"
+  age=$(( now - mt ))
+  (( age <= REFLECT_HANDOFF_MAX_AGE_SECONDS )) || { printf ''; return 0; }
+  body="$(cat -- "$f" 2>/dev/null || true)"
+  [[ -n "$body" ]] || { printf ''; return 0; }
+  if (( ${#body} > REFLECT_HANDOFF_CAP_BYTES )); then
+    body="${body:0:$REFLECT_HANDOFF_CAP_BYTES}"$'\n'"[Note: handoff truncated at $REFLECT_HANDOFF_CAP_BYTES characters.]"
+  fi
+  printf '%s' "$body"
+}
+
+# --- Structured failure detail from a claude envelope (C1) -------------------
+# reflect_envelope_failure_json <envelope> — compact JSON of whatever the
+# `--output-format json` envelope says about its own failure.
+#
+# WHY THIS EXISTS: 25 sessionend errors in the live corpus were monthly
+# spend-limit 429s, and every one of their manifests said only
+# `subprocess_exit_code: 1`. Diagnosing them meant reading raw worker stdout
+# logs — which the artifact GC collects after 14 days. The envelope carries the
+# answer (`is_error`, `api_error_status`, and a `result` that names the limit);
+# it was simply never read.
+#
+# Every access is guarded because the envelope is exactly what is NOT
+# trustworthy on a failure path: empty on a SIGKILLed timeout, truncated on a
+# broken pipe, or not JSON at all. Unparseable input still yields something
+# useful — an excerpt of whatever did come back — and never a non-zero return.
+reflect_envelope_failure_json() {
+  local env_json="${1:-}" out=""
+  if [[ -z "$env_json" ]]; then
+    printf '%s' '{}'
+    return 0
+  fi
+  out="$(jq -c --argjson n "$REFLECT_EXCERPT_BYTES" '
+      if type == "object" then
+        { is_error:          (.is_error // null),
+          api_error_status:  (.api_error_status // null),
+          envelope_subtype:  (.subtype // null),
+          result_excerpt:    (if (.result | type) == "string" then (.result[0:$n]) else null end) }
+        | with_entries(select(.value != null))
+      else {} end' <<<"$env_json" 2>/dev/null || true)"
+  if [[ -z "$out" ]]; then
+    # Not JSON at all. Quote what came back instead of dropping it: "the CLI
+    # printed a usage error" and "the CLI printed nothing" are different
+    # diagnoses and used to be indistinguishable in the manifest.
+    out="$(jq -cn --arg x "${env_json:0:$REFLECT_EXCERPT_BYTES}" \
+            '{envelope_unparseable:true, envelope_excerpt:$x}' 2>/dev/null || printf '{}')"
+  fi
+  printf '%s' "$out"
 }

@@ -4,12 +4,18 @@
 # Usage:  reflect.sh {precompact|sessionend|subagentstop|mission}
 # Stdin:  Claude Code hook payload JSON (session_id, transcript_path,
 #         hook_event_name, cwd; PreCompact also has trigger / custom_instructions;
-#         SubagentStop has stop_hook_active).
+#         SubagentStop additionally has agent_id, agent_type and
+#         agent_transcript_path — and its `session_id` is the PARENT session, not
+#         the subagent's, which is the whole point of the 2.1.260 rework below).
 #
 # Behavior:
 #   precompact    -> synchronous, bounded (60s), writes numbered checkpoint
-#   sessionend    -> fires-and-forgets a detached worker, exits fast
-#   subagentstop  -> same as sessionend but tighter budget + parent-nesting
+#   sessionend    -> fires-and-forgets a detached worker, exits fast; falls back to
+#                    a no-resume reflection when the fork-resume cannot land (B1/B2)
+#   subagentstop  -> same detachment, tighter budget; nests under
+#                    sessions/<parent session_id>/subagents/<agent_id>/ and reflects
+#                    the AGENT transcript inline (an agent transcript is not a
+#                    resumable session)
 #   mission       -> writes the authoritative handoff out of repo; synchronous for
 #                    idle-handoff.sh, detached with REFLECT_ASYNC=1 for the
 #                    2nd-compact pre-fire
@@ -346,6 +352,13 @@ if [[ "$ARG1" == "--worker" ]]; then
   : "${HOOK_EVENT:=}"
   : "${CWD:=}"
   : "${TRIGGER:=}"
+  # subagentstop-only, and empty for every other mode. Same reason as above: the
+  # worker reads them unguarded under `set -u`, and a transient unit hands over an
+  # explicitly-built environment in which "never exported" and "exported empty"
+  # are indistinguishable.
+  : "${AGENT_ID:=}"
+  : "${AGENT_TYPE:=}"
+  : "${PARENT_TRANSCRIPT:=}"
   # Defense in depth: re-validate the SID we're about to write paths under.
   if ! is_valid_sid "$SESSION_ID"; then
     echo "reflect.sh: worker refuses invalid SESSION_ID" >&2
@@ -477,6 +490,18 @@ CWD="$(extract cwd)"
 TRIGGER="$(extract trigger)"                # precompact-only
 CUSTOM_INSTR="$(extract custom_instructions)" # precompact-only
 
+# SubagentStop-only. Present since Claude Code 2.1.260 (captured live 2026-09-04);
+# absent on anything older, which is a case A2 handles explicitly rather than by
+# inference. `agent_id` is NOT uuid-shaped — the observed value is a 17-char hex
+# token like `a1cb625829c68ce11` — so it is validated by charset (is_valid_sid,
+# `[A-Za-z0-9._-]{1,128}`, no leading dot) and never by shape.
+AGENT_ID="$(extract agent_id)"
+AGENT_TYPE="$(extract agent_type)"
+AGENT_TRANSCRIPT="$(extract agent_transcript_path)"
+# The parent's own transcript, kept under its own name once TRANSCRIPT_PATH has
+# been re-pointed at the agent's below. Empty outside subagentstop.
+PARENT_TRANSCRIPT=""
+
 # --- Malformed payload guard -------------------------------------------------
 # BUCKET LOCATION (D2). These records used to land in
 # `$REFLECT_ROOT/sessions/_malformed/`, i.e. INSIDE the per-session namespace
@@ -526,17 +551,52 @@ if ! is_valid_sid "$SESSION_ID"; then
   malformed_manifest "invalid_session_id"
 fi
 
-# --- Resolve parent (subagent mode only) -------------------------------------
+# --- Subagent identity: taken from the payload, never inferred (A1/A2) -------
+# The 2.1.260 SubagentStop payload is not what this dispatcher used to assume.
+# `session_id` is the PARENT session — the live one the user is still in — and
+# `transcript_path` is the PARENT's transcript. The subagent is named by
+# `agent_id`, and its own transcript is `agent_transcript_path`.
+#
+# Reading the payload as if `session_id` were the subagent's produced all three
+# halves of D1 at once: the PARENT got reflected mid-session (a 126k-token model
+# call), the artifact was nested under whatever the retired sibling-transcript
+# scan happened to return first, and modes.subagentstop.final_complete latched on
+# the PARENT's manifest — so every later SubagentStop in that session became
+# `skipped_duplicate`. 52 of 100 recent nested subagent manifests were timeouts,
+# the rest misnested. The real agent transcript was never opened at all.
+#
+# So: rebind, then keep going with the subagent as THE session.
+#   SESSION_ID       <- agent_id           (the artifact's identity + idempotency key)
+#   PARENT_SID       <- payload session_id (the nesting key)
+#   TRANSCRIPT_PATH  <- agent_transcript_path (what gets reflected on)
+#   PARENT_TRANSCRIPT<- payload transcript_path (recorded, never reflected on)
+#
+# ABSENT FIELDS ARE A DEAD END, DELIBERATELY. An older harness sends no agent
+# fields; a race or a GC can leave the path pointing at nothing. Both write a
+# structured record under malformed/ and exit 0. There is no scan to fall back on
+# any more and the parent is NOT reflected as a stand-in — a reflection filed
+# under a guessed identity is worse than no reflection, because a consumer reads
+# the filing as fact. See "PARENT LINKAGE" in lib.sh.
+#
+# These checks run BEFORE paths_for_session, so a refused payload also mints no
+# session directory.
 PARENT_SID=""
 if [[ "$MODE" == "subagentstop" ]]; then
-  PARENT_SID="$(find_parent_session_id "$SESSION_ID" "$CWD" "$TRANSCRIPT_PATH")"
-  # If nothing found, treat subagent SID as its own parent for placement,
-  # but leave PARENT_SID empty so lib.sh puts artifact at top-level and we
-  # can flag "parent_unknown" in the manifest.
-  if [[ -n "$PARENT_SID" ]] && ! is_valid_sid "$PARENT_SID"; then
-    # Reject an untrusted parent id rather than let it into a filesystem path.
-    PARENT_SID=""
+  if [[ -z "$AGENT_ID" || -z "$AGENT_TRANSCRIPT" ]]; then
+    malformed_manifest "subagentstop_missing_agent_fields"
   fi
+  if ! is_valid_sid "$AGENT_ID"; then
+    malformed_manifest "subagentstop_invalid_agent_id"
+  fi
+  # -r, not just -f: an unreadable transcript gives the worker nothing to inline
+  # and would spend a model call on an empty prompt.
+  if [[ ! -f "$AGENT_TRANSCRIPT" || ! -r "$AGENT_TRANSCRIPT" ]]; then
+    malformed_manifest "subagentstop_agent_transcript_unreadable"
+  fi
+  PARENT_SID="$SESSION_ID"
+  SESSION_ID="$AGENT_ID"
+  PARENT_TRANSCRIPT="$TRANSCRIPT_PATH"
+  TRANSCRIPT_PATH="$AGENT_TRANSCRIPT"
 fi
 
 # --- Resolve paths ------------------------------------------------------------
@@ -608,18 +668,107 @@ fi
 # we release the lock BEFORE the detach so the worker isn't holding it.
 
 # --- Extra manifest fields ----------------------------------------------------
+#
+# `source_transcript` is whatever this mode actually reflects on, which for
+# subagentstop is the AGENT's transcript. The parent's is recorded beside it as
+# `parent_transcript` rather than replacing it: a consumer asking "what was this
+# reflection derived from" and one asking "which session ran it" want different
+# answers, and conflating them is how the misnested corpus reads today.
 extra_json=$(jq -cn \
   --arg tp "$TRANSCRIPT_PATH" \
   --arg event "$HOOK_EVENT" \
   --arg parent "$PARENT_SID" \
   --arg trigger "$TRIGGER" \
   --arg model "$REFLECT_MODEL" \
+  --arg agent_id "$AGENT_ID" \
+  --arg agent_type "$AGENT_TYPE" \
+  --arg parent_tp "$PARENT_TRANSCRIPT" \
   '{source_transcript:$tp,
     hook_event_name:$event,
     parent_session_id:(if $parent == "" then null else $parent end),
     trigger:(if $trigger == "" then null else $trigger end),
-    model:$model}')
+    model:$model}
+   | (if $agent_id   != "" then .agent_id          = $agent_id   else . end)
+   | (if $agent_type != "" then .agent_type        = $agent_type else . end)
+   | (if $parent_tp  != "" then .parent_transcript = $parent_tp  else . end)')
 fi  # end IS_WORKER == 0 setup block
+
+# ============================================================================
+# ONE MODEL CALL
+# ============================================================================
+# reflect_claude_call <prompt> <budget_s> <resume_sid|""> <stdout_log> <stderr_log>
+# Runs exactly one `claude -p`, leaving the raw envelope in REFLECT_CALL_ENVELOPE
+# and the subprocess status in REFLECT_CALL_RC. ALWAYS returns 0: every caller
+# branches on the rc, and a `set -e` abort here would skip the manifest write that
+# is the entire point of the worker.
+#
+# Two shapes, one function, and the difference is only `--resume`:
+#
+#   resume_sid NON-EMPTY -> `--resume <sid> --fork-session`. Replays the session
+#     into the model's window, which is what buys the prompt-cache reuse (~77% hit
+#     at 12 min, 1h ephemeral TTL — verified 2026-08-08) that is the whole cost
+#     story for this feature. `--bare` would strip it. It is also what dies on a
+#     session larger than the window (D2), and what cannot work at all for a
+#     subagent: an agent transcript is not a resumable conversation, so there is
+#     no sid to hand it.
+#
+#   resume_sid EMPTY -> a plain `-p` over a prompt that already carries its context
+#     as data. No cache reuse; bounded instead by the byte caps in lib.sh.
+#
+# SECURITY, both shapes: `--tools ""` disables the entire tool set, so the
+# reflection subprocess cannot invoke Bash/Edit/WebFetch even if a prompt-injection
+# payload rides in — through the resumed transcript before, through the inlined
+# extract now. With tool use disabled we do NOT need
+# `--dangerously-skip-permissions` (verified 2026-08-08 that `claude -p --tools ""
+# --output-format json` returns the JSON reply cleanly). The residual risk is
+# unchanged by inlining: the model can emit arbitrary text into the reflection
+# body, and that body is untrusted data to every downstream consumer —
+# JSON-parsed, schema-normalised, never fed back into an interpreter.
+#
+# RECURSION BREAK: REFLECT_SUBPROCESS=1 in the child env so any Claude Code hook
+# the child fires (its own SessionEnd, PreCompact) detects it is inside a
+# reflection run and no-ops instead of spawning another one. REFLECT_PARENT_SID
+# attributes the resulting skip marker. Inline `env FOO=bar` scopes both to the
+# child — no export leak into this worker or into the manifest-writing path.
+#
+# CWD: `claude --resume <sid>` is cwd-scoped — Claude Code looks conversations up
+# under the current project's transcript dir, so resuming from the wrong cwd errors
+# with "No conversation found". The hook payload always carries the originating
+# cwd; use it, falling back to $HOME when the project is gone (deleted between hook
+# fire and worker start). A bad --resume from $HOME fails loud, which beats
+# succeeding against the wrong project. The no-resume shape does not care where it
+# runs, and runs in the same place for one less thing to reason about.
+REFLECT_CALL_ENVELOPE=""
+REFLECT_CALL_RC=0
+reflect_claude_call() {
+  local _prompt="$1" _budget="$2" _resume="$3" _out="$4" _err="$5"
+
+  local -a _args=( -p )
+  if [[ -n "$_resume" ]]; then
+    _args+=( --resume "$_resume" --fork-session )
+  fi
+  _args+=( --model "$REFLECT_MODEL" --output-format json --tools "" )
+
+  local _cwd="${CWD:-}"
+  if [[ -z "$_cwd" || ! -d "$_cwd" ]]; then
+    _cwd="$HOME"
+  fi
+
+  set +e
+  # `timeout -k` ensures a stuck claude gets SIGKILLed after the SIGTERM. Without
+  # -k, a claude with a blocked event loop can ignore TERM forever, and since this
+  # timeout puts claude in a new process group, any OUTER timeout wrapping this
+  # dispatcher (e.g. idle-handoff's `timeout 90`) cannot reach into the group to
+  # kill it. Advisor P1R3.
+  REFLECT_CALL_ENVELOPE=$(cd "$_cwd" && timeout -k "$REFLECT_KILL_GRACE_SECONDS" "$_budget" env \
+    REFLECT_SUBPROCESS=1 \
+    REFLECT_PARENT_SID="$SESSION_ID" \
+    claude "${_args[@]}" <<<"$_prompt" 2>>"$_err")
+  REFLECT_CALL_RC=$?
+  set -e
+  printf '%s' "$REFLECT_CALL_ENVELOPE" > "$_out"
+  return 0
+}
 
 # ============================================================================
 # WORKER — invoked either synchronously (precompact) or detached (others).
@@ -1254,11 +1403,17 @@ spawn_detached_worker() {
     # thing standing between an isolated test and the user's own files. Same
     # shape as the REFLECT_ROOT propagation defect fixed earlier.
     for v in SESSION_ID PARENT_SID TRANSCRIPT_PATH HOOK_EVENT MODE CWD \
+             AGENT_ID AGENT_TYPE PARENT_TRANSCRIPT \
              REFLECT_MODEL REFLECT_ROOT CLAUDE_SESSIONS_DIR REFLECT_LOG_DIR REFLECT_LOCKFILE \
              REFLECT_STALE_STARTED_SECONDS REFLECT_REAP_MAX_PER_RUN \
              REFLECT_NO_SYSTEMD_RUN REFLECT_KILL_GRACE_SECONDS \
              REFLECT_BUDGET_PRECOMPACT REFLECT_BUDGET_SESSIONEND \
              REFLECT_BUDGET_SUBAGENTSTOP REFLECT_BUDGET_MISSION \
+             REFLECT_BUDGET_SESSIONEND_FALLBACK \
+             REFLECT_RESUME_MAX_TRANSCRIPT_BYTES REFLECT_RESUME_MODEL_WINDOW_TOKENS \
+             REFLECT_TRANSCRIPT_BYTES_PER_TOKEN REFLECT_AGENT_TRANSCRIPT_CAP_BYTES \
+             REFLECT_FALLBACK_TAIL_CAP_BYTES REFLECT_HANDOFF_CAP_BYTES \
+             REFLECT_HANDOFF_MAX_AGE_SECONDS REFLECT_EXCERPT_BYTES \
              session_dir final_path manifest_path checkpoint_dir SCRIPT_DIR \
              HOME PATH USER LANG LC_ALL LC_CTYPE XDG_RUNTIME_DIR \
              ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN \
@@ -1400,7 +1555,15 @@ write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "started" "$extra_json"
 # REFLECT_LOCKFILE is what lets the detached worker re-acquire this mode's lock.
 export REFLECT_LOCKFILE="$LOCKFILE"
 export SESSION_ID PARENT_SID TRANSCRIPT_PATH HOOK_EVENT MODE CWD
+export AGENT_ID AGENT_TYPE PARENT_TRANSCRIPT
 export REFLECT_MODEL REFLECT_ROOT CLAUDE_SESSIONS_DIR REFLECT_LOG_DIR
+# The caps and thresholds live in lib.sh with `: "${VAR:=default}"`, i.e. SET but
+# not exported. The setsid spawn inherits only the exported environment, so an
+# operator override made at the hook would silently revert to the shipped default
+# inside the worker — which is the process that actually applies them.
+export REFLECT_BUDGET_SESSIONEND_FALLBACK REFLECT_RESUME_MAX_TRANSCRIPT_BYTES
+export REFLECT_AGENT_TRANSCRIPT_CAP_BYTES REFLECT_FALLBACK_TAIL_CAP_BYTES
+export REFLECT_HANDOFF_CAP_BYTES REFLECT_HANDOFF_MAX_AGE_SECONDS REFLECT_EXCERPT_BYTES
 export session_dir final_path manifest_path checkpoint_dir
 export SCRIPT_DIR
 
