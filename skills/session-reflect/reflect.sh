@@ -1419,16 +1419,20 @@ run_worker() {
   fi
 
   if [[ -z "$reflection" ]]; then
-    local excerpt="${inner:0:200}"
+    # REFLECT_EXCERPT_BYTES, not a third copy of the literal 200: the same figure
+    # bounds this excerpt, the envelope's `result` in an error manifest, and the
+    # quoted tool_result bodies in an inlined transcript. One named input, so
+    # raising it raises all three together (see "Byte caps" in lib.sh).
+    local excerpt="${inner:0:$REFLECT_EXCERPT_BYTES}"
+    # No envelope_detail here, deliberately: the call SUCCEEDED and the envelope
+    # has nothing to confess. raw_excerpt already quotes the same bytes its
+    # `result` would, and a `result_excerpt` beside it would only invite a reader
+    # to look for two different failures where there is one.
     write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "error" \
-      "$(jq -cn --arg tp "$TRANSCRIPT_PATH" --arg event "$HOOK_EVENT" --arg parent "$PARENT_SID" \
-          --arg excerpt "$excerpt" \
-          --argjson len "${#inner}" \
-          '{source_transcript:$tp,hook_event_name:$event,
-            parent_session_id:(if $parent == "" then null else $parent end),
-            reason:"unparseable_reflection_json",
+      "$(_worker_extra "$(jq -cn --arg excerpt "$excerpt" --argjson len "${#inner}" \
+          '{reason:"unparseable_reflection_json",
             raw_excerpt:$excerpt,
-            raw_len:$len}')"
+            raw_len:$len}')")"
     return 0
   fi
 
@@ -1497,24 +1501,21 @@ run_worker() {
   if (( mv_rc != 0 )); then
     rm -f -- "$tmp" 2>/dev/null || true
     write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "error" \
-      "$(jq -cn --arg tp "$TRANSCRIPT_PATH" --arg event "$HOOK_EVENT" --arg parent "$PARENT_SID" \
-          --arg target "$out_path" \
-          --argjson rc "$mv_rc" \
-          '{source_transcript:$tp,hook_event_name:$event,
-            parent_session_id:(if $parent == "" then null else $parent end),
-            reason:"mv_failed",
+      "$(_worker_extra "$(jq -cn --arg target "$out_path" --argjson rc "$mv_rc" \
+          '{reason:"mv_failed",
             mv_exit_code:$rc,
-            target_path:$target}')"
+            target_path:$target}')")"
     return "$mv_rc"
   fi
 
+  # The complete write carries the attempt bookkeeping too. B1's whole claim is
+  # that final.json lands; `fallback_used:true` on a status=complete manifest is
+  # how an operator tells a reflection that came the cheap way from one that had
+  # to be rebuilt from a tail slice — and how the corpus can be re-measured later
+  # without re-reading worker logs.
   write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "complete" \
-    "$(jq -cn --arg tp "$TRANSCRIPT_PATH" --arg event "$HOOK_EVENT" --arg parent "$PARENT_SID" \
-        --arg out "$out_path" \
-        --argjson usage "$usage" \
-        '{source_transcript:$tp,hook_event_name:$event,
-          parent_session_id:(if $parent == "" then null else $parent end),
-          artifact:$out,usage:$usage}')"
+    "$(_worker_extra "$(jq -cn --arg out "$out_path" --argjson usage "$usage" \
+        '{artifact:$out,usage:$usage}')")"
 }
 
 # ============================================================================
