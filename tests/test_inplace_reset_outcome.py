@@ -1,4 +1,5 @@
-"""Every terminal path of an in-place reset leaves a machine-readable outcome.
+"""Every terminal path of an in-place reset ATTEMPT leaves a machine-readable
+outcome — and the two paths that are not an attempt leave none.
 
 Regression, sid 6f11dbf0 on 2026-09-04: the reset aborted ("still mid-turn 120s
 after the handoff landed"), the trigger's state stayed armed:false, and the
@@ -96,14 +97,38 @@ def test_invalid_sid_writes_no_outcome_anywhere(sessions):
     assert list(sessions.rglob("outcome.json")) == []
 
 
-def test_lock_held_abort_records_lock_held(sessions):
+def test_a_lock_bounce_refuses_loudly_but_writes_no_outcome(sessions):
+    # Losing the flock is not an attempt, it is a bounce off someone else's, so
+    # it leaves no machine record — only the human-forensic REFUSING line. The
+    # refusal itself is unchanged: non-zero, and nothing touched.
     d = sessions / SID
     d.mkdir(parents=True)
     fd = os.open(str(d / "reset.lock"), os.O_CREAT | os.O_RDWR, 0o600)
     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     try:
         assert ir.main(["--sid", SID, "--session-pid", str(os.getpid())]) == 1
-        assert read_outcome(sessions)["reason"] == "lock_held"
+        assert not (d / "outcome.json").exists()
+        assert "REFUSING" in (sessions / "inplace-reset.log").read_text()
+    finally:
+        os.close(fd)
+
+
+def test_a_lock_bounce_cannot_clobber_the_holders_outcome(sessions):
+    # THE RACE THIS PATH EXISTS TO AVOID. flock and the old write_outcome call
+    # were milliseconds apart; a holder finishing inside that gap had its real
+    # terminal record replaced by the bouncer's "lock_held" — and since 8bbdb9b
+    # a lock_held record buys NO re-arm, so the crossing silently lost the retry
+    # the holder's abort had earned. Here the holder's record is already on disk
+    # (the same ordering, at its worst) and must survive untouched.
+    d = sessions / SID
+    d.mkdir(parents=True)
+    fd = os.open(str(d / "reset.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        ir.write_outcome(SID, "aborted", "mid_turn_timeout")   # the holder finishes
+        holder = read_outcome(sessions)
+        assert ir.main(["--sid", SID, "--session-pid", str(os.getpid())]) == 1
+        assert read_outcome(sessions) == holder
     finally:
         os.close(fd)
 

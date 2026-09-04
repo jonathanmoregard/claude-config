@@ -587,20 +587,24 @@ def main(argv: list[str]) -> int:
         lock_dir.mkdir(parents=True, exist_ok=True)
         lock_fd = os.open(str(lock_dir / "reset.lock"), os.O_CREAT | os.O_RDWR, 0o600)
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    # ONLY a held lock (LOCK_NB flock, EWOULDBLOCK → BlockingIOError) reads as
-    # "lock_held" — the trigger consumes that reason to refire, which is right
-    # against a live holder but a wall against a broken state dir. Any other
-    # OSError here (mkdir/open: permissions, sessions root not a dir)
-    # propagates to the __main__ crash handler, which logs the real error and
-    # records 'crash' best-effort.
+    # ONLY a held lock (LOCK_NB flock, EWOULDBLOCK → BlockingIOError) is a
+    # refusal in favour of a live holder. Any other OSError here (mkdir/open:
+    # permissions, sessions root not a dir) propagates to the __main__ crash
+    # handler, which logs the real error and records 'crash' best-effort — a
+    # broken state dir must not be mistaken for a busy one.
     except BlockingIOError:
         log(f"sid={sid} REFUSING: another in-place reset is already running for this "
             "session. Two waiters on one window would interleave their clear and pickup.")
-        # A re-arm+refire off this record while the holder is live is refused
-        # by this same lock, which is correct and harmless — and the trigger's
-        # retry spacing bounds it anyway. The holder overwrites this record
-        # with its own terminal outcome when it finishes.
-        write_outcome(sid, "aborted", "lock_held")
+        # THE ONE TERMINAL PATH THAT DELIBERATELY WRITES NO OUTCOME RECORD.
+        # This process is not an attempt, it is a bounce off someone else's; the
+        # holder's own terminal record is the truth about this session, and it is
+        # the record the trigger is waiting on. Writing "lock_held" here can only
+        # destroy that truth: the flock and this write are milliseconds apart, and
+        # the holder can finish and os.replace its real outcome inside that gap —
+        # our later write then clobbers it. Since 8bbdb9b a `lock_held` record
+        # buys NO re-arm (self-compact-trigger.py, ABORT RE-ARM), so the crossing
+        # would silently lose the retry the holder's abort had earned. No upside,
+        # exactly that downside. The REFUSING line above is the forensic record.
         return 1
 
     # cwd is read for the log only. There is deliberately no cwd restriction: the

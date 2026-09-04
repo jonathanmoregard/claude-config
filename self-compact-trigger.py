@@ -68,8 +68,10 @@ LOOP BOUND (B6)
     trigger is worse than a missing one.
 
     ABORT RE-ARM — the second re-arm channel (2026-09-04). inplace_reset.py now
-    records every terminal result in <sid>/outcome.json (its log stays
-    human-forensic; the outcome file is the one machine channel). An aborted
+    records every terminal result of an ATTEMPT in <sid>/outcome.json (its log
+    stays human-forensic; the outcome file is the one machine channel). A
+    process that never became the attempt — an invalid sid, or a bounce off
+    another process's reset.lock — writes no record. An aborted
     reset destroys nothing, so the session is still holding 300k+ — but
     `armed:false` used to be final until a dip below the threshold, and a 400k
     session never dips. MEASURED, sid 6f11dbf0: fired 13:04:59Z at 409k tokens,
@@ -84,7 +86,11 @@ LOOP BOUND (B6)
       * the outcome must be newer than the fire it answers, and each outcome
         buys at most ONE re-arm (last_abort_consumed_at). A `lock_held` abort
         buys none at all: it is a second process reporting that the first is
-        still running, not a terminal state of the attempt being waited on;
+        still running, not a terminal state of the attempt being waited on.
+        inplace_reset.py no longer writes that reason — a process that loses
+        the flock now records nothing, because its write raced the holder's
+        real outcome and could clobber it — so this exclusion survives only
+        for records an older version left in a state dir (retention 30d);
       * at most SELF_COMPACT_MAX_RETRIES re-arms per crossing (default 3),
         counted in rearm_retries and logged once at the cap;
       * at least SELF_COMPACT_RETRY_SPACING_SECONDS between the previous
@@ -430,16 +436,19 @@ def consume_abort_for_rearm(sid: str, state: dict) -> bool:
     if status != "aborted":
         return False
     if outcome.get("reason") == "lock_held":
-        # NOT a terminal state of the attempt this crossing is waiting on. A
-        # lock_held record is written by a SECOND process reporting that the
-        # first one still holds reset.lock and is still running (it waits up
-        # to WRITE_WAIT_CAP_SECONDS). Consuming it would spend the crossing's
-        # retries against a live holder — every refire hits the same lock and
-        # writes another lock_held record — and the budget would be capped by
-        # the time the holder wrote its real outcome. The holder overwrites
-        # this record when it finishes (inplace_reset.py, "the holder
-        # overwrites this record with its own terminal outcome"), and THAT
-        # record is the one that buys the retry.
+        # NOT a terminal state of the attempt this crossing is waiting on. It
+        # was written by a SECOND process reporting that the first still holds
+        # reset.lock and is still running, so consuming it would spend the
+        # crossing's retries against a live holder — every refire hits the same
+        # lock. Only the holder's own record answers the fire.
+        #
+        # KEPT even though inplace_reset.py no longer writes this reason (it
+        # bounces off the lock silently, because writing here raced the holder's
+        # real outcome and clobbered it). State dirs outlive the code that wrote
+        # them — STATE_RETENTION_DAYS is 30 — so a record left by an older
+        # inplace_reset.py can still be on disk after an upgrade, and it must
+        # keep reading as "no answer yet", not buy a fire. Delete this branch
+        # only once no such record can survive.
         return False
     last_fired = int_field(state, "last_fired_at")
     if at < last_fired:
