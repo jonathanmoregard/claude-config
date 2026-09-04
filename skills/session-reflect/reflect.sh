@@ -996,7 +996,10 @@ run_worker() {
   #                       agent transcript is already in the prompt.
   # sessionend            resumed primary, then the B1 no-resume fallback if it
   #                       cannot land — or straight to the fallback when the B2
-  #                       pre-check says the resume is doomed before it starts.
+  #                       pre-check says the resume is doomed before it starts,
+  #                       or straight to the error manifest with NO fallback when
+  #                       the primary came back 429 (G1: spend cap, so the second
+  #                       call is doomed on the same account in the same minute).
   local claude_json="" rc=0 inner=""
   # The budget that was actually in force for the call whose result we end up
   # reporting. Diverges from `budget` the moment the fallback runs.
@@ -1030,7 +1033,7 @@ run_worker() {
       primary_skipped=true
     fi
 
-    local primary_failure="" primary_detail='{}'
+    local primary_failure="" primary_detail='{}' primary_api_status=""
     if [[ "$primary_skipped" == "false" ]]; then
       reflect_claude_call "$prompt" "$budget" "$SESSION_ID" "$worker_out" "$worker_log"
       claude_json="$REFLECT_CALL_ENVELOPE"
@@ -1049,10 +1052,56 @@ run_worker() {
       fi
       if [[ -n "$primary_failure" ]]; then
         primary_detail="$(reflect_envelope_failure_json "$claude_json")"
+        # Read the status off the detail object we just built, not off the raw
+        # envelope: one parse idiom for one fact, and this one is already
+        # guarded against the empty / truncated / non-JSON envelopes that the
+        # failure path is made of.
+        primary_api_status="$(jq -r '.api_error_status // empty' <<<"$primary_detail" 2>/dev/null || true)"
       fi
     fi
 
-    if [[ "$primary_skipped" == "true" || -n "$primary_failure" ]]; then
+    # G1 (MEDIUM): a 429 on the primary is the API SPEND CAP — the monthly /
+    # weekly limit on this account, which is what all 25 sessionend errors in the
+    # live corpus were. It is not a per-request condition: dropping `--resume`
+    # changes nothing about which account is paying, and the fallback would fire
+    # within the same minute on the same credentials, so it is a call that is
+    # known to fail before it is made. The economy is per SESSION, not per call —
+    # a capped account otherwise re-dials once for every session that ends, all
+    # day, and gets a 429 every time. So: 429 => no fallback, straight to the
+    # terminal error manifest built from the primary's own envelope below (rc and
+    # claude_json are still the primary's, which is exactly what we want reported).
+    #
+    # ONLY 429, and only when the primary actually ran and failed. Timeouts,
+    # transient errors and empty results are per-request failures that a fresh
+    # no-resume call genuinely can survive — those are what B1 exists for and
+    # they keep the fallback. `primary_skipped` (B2 oversize) never reaches here
+    # with a failure, so an oversize transcript still gets its fallback too.
+    local fallback_skipped_quota=false
+    if [[ -n "$primary_failure" && "$primary_api_status" == "429" ]]; then
+      fallback_skipped_quota=true
+    fi
+
+    if [[ "$fallback_skipped_quota" == "true" ]]; then
+      # Same bookkeeping the fallback branch writes, minus the fallback: the
+      # corpus can count these directly (`fallback_skipped_quota`) instead of
+      # inferring a skip from a call that is absent. primary_* keys are carried
+      # even though the terminal write's own envelope_detail describes the same
+      # envelope here — a query for "which primaries 429'd" must not need to know
+      # whether the fallback ran.
+      attempt_extra="$(jq -cn \
+        --argjson bytes "$transcript_bytes" \
+        --argjson maxbytes "$REFLECT_RESUME_MAX_TRANSCRIPT_BYTES" \
+        --argjson skipped "$primary_skipped" \
+        --arg failure "$primary_failure" \
+        --argjson detail "$primary_detail" \
+        '{transcript_bytes:$bytes,
+          resume_max_transcript_bytes:$maxbytes,
+          primary_skipped_oversize:$skipped,
+          fallback_used:false,
+          fallback_skipped_quota:true,
+          primary_failure:(if $failure == "" then null else $failure end)}
+         + ($detail | with_entries(.key |= "primary_" + .))')"
+    elif [[ "$primary_skipped" == "true" || -n "$primary_failure" ]]; then
       # B1 — the fallback. Same job, same model, no `--resume`: the context the
       # resume would have replayed is assembled as DATA instead, bounded by the
       # caps in lib.sh. It costs the prompt cache (the primary is still tried
@@ -1115,6 +1164,7 @@ run_worker() {
           resume_max_transcript_bytes:$maxbytes,
           primary_skipped_oversize:$skipped,
           fallback_used:true,
+          fallback_skipped_quota:false,
           primary_failure:(if $failure == "" then null else $failure end)}
          + ($detail | with_entries(.key |= "primary_" + .))')"
     else
@@ -1124,7 +1174,8 @@ run_worker() {
         '{transcript_bytes:$bytes,
           resume_max_transcript_bytes:$maxbytes,
           primary_skipped_oversize:false,
-          fallback_used:false}')"
+          fallback_used:false,
+          fallback_skipped_quota:false}')"
     fi
   fi
 

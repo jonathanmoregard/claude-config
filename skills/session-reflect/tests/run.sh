@@ -88,12 +88,18 @@ unset REFLECT_FORCE
 # ---------------------------------------------------------------------------
 # Stub `claude`. One script, steered by STUB_MODE at CALL time so a single
 # fixture drives the whole matrix:
-#   ok           a well-formed envelope for every call
-#   fail_resume  fail ONLY the call that carries --resume (the D2 shape: the
-#                fork-resume dies, a fresh -p would have worked)
-#   error429     fail every call with the observed monthly-spend-limit envelope
-#   garbage      exit 0 with a body that is not an envelope at all
-#   timeout      block past any budget the caller set
+#   ok             a well-formed envelope for every call
+#   fail_resume    fail ONLY the call that carries --resume, with the SPEND-CAP
+#                  429 envelope. A fresh -p would have succeeded here, which is
+#                  what makes it the sharp G1 case: the dispatcher must decline
+#                  the second call anyway, because on a real capped account that
+#                  stub's optimism is a lie the API does not tell.
+#   fail_transient fail ONLY the --resume call with a NON-quota error envelope
+#                  (is_error, no api_error_status). The D2 shape, and the one the
+#                  B1 fallback exists for: the account is fine, the fork is not.
+#   error429       fail every call with the observed monthly-spend-limit envelope
+#   garbage        exit 0 with a body that is not an envelope at all
+#   timeout        block past any budget the caller set
 # It records argv and the piped prompt so the assertions can be about what was
 # actually sent (--resume present? transcript inlined?) rather than about
 # timing.
@@ -127,17 +133,25 @@ emit_429() {
   # was never enough to diagnose them.
   printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"api_error_status":429,"result":"Claude AI usage limit reached: monthly spend cap exhausted, resets 2026-10-01"}'
 }
+emit_transient() {
+  # A per-REQUEST failure: well-formed error envelope, NO api_error_status. The
+  # account is not capped, so a second call on the same credentials is a
+  # different bet than the first — this is the shape the B1 fallback is for, and
+  # the control that keeps the G1 quota-skip from swallowing it.
+  printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"stub: the fork-resume died before it produced a reflection"}'
+}
 
 resume=0
 for a in "$@"; do [[ "$a" == "--resume" ]] && resume=1; done
 
 case "${STUB_MODE:-ok}" in
-  ok)          emit_ok ;;
-  fail_resume) if (( resume )); then emit_429; exit 1; else emit_ok; fi ;;
-  error429)    emit_429; exit 1 ;;
-  garbage)     printf 'this is not an envelope\n' ;;
-  timeout)     sleep 120 ;;
-  *)           emit_ok ;;
+  ok)             emit_ok ;;
+  fail_resume)    if (( resume )); then emit_429; exit 1; else emit_ok; fi ;;
+  fail_transient) if (( resume )); then emit_transient; exit 1; else emit_ok; fi ;;
+  error429)       emit_429; exit 1 ;;
+  garbage)        printf 'this is not an envelope\n' ;;
+  timeout)        sleep 120 ;;
+  *)              emit_ok ;;
 esac
 exit 0
 STUB
@@ -408,12 +422,18 @@ else
 fi
 
 # ===========================================================================
-# B1 — sessionend primary failure falls back to a no-resume reflection
+# B1 — sessionend primary failure falls back to a no-resume reflection.
+#
+# Driven by `fail_transient`, NOT `fail_resume`: since G1 a 429 primary is a
+# spend cap and deliberately gets no second call, so a 429-shaped stub would
+# make this case prove the opposite of what it is for. B1's job is unchanged —
+# a per-request primary failure must still buy the fallback and land final.json
+# — and a non-quota envelope is the shape that actually asks that question.
 # ===========================================================================
 t_begin "B1: primary fork-resume fails => fallback reflection still lands"
 reset_logs
 FB_SID="40fbb4a9-1a2b-4c3d-9e8f-000000000003"
-STUB_MODE=fail_resume bash "$REFLECT_SH" sessionend <<<"$(sessionend_payload "$FB_SID")"
+STUB_MODE=fail_transient bash "$REFLECT_SH" sessionend <<<"$(sessionend_payload "$FB_SID")"
 FB_MANIFEST="$REFLECT_ROOT/sessions/$FB_SID/manifest.json"
 if wait_terminal "$FB_MANIFEST" sessionend; then
   jqe '.modes.sessionend.status == "complete"' "$FB_MANIFEST"; assert $? "status=complete via fallback"
@@ -422,8 +442,10 @@ else
 fi
 [[ -f "$REFLECT_ROOT/sessions/$FB_SID/final.json" ]]; assert $? "final.json ALWAYS lands"
 jqe '.modes.sessionend.fallback_used == true' "$FB_MANIFEST"; assert $? "manifest records fallback_used:true"
+jqe '.modes.sessionend.fallback_skipped_quota == false' "$FB_MANIFEST"; assert $? "a non-quota failure is NOT recorded as a quota skip"
 jqe '.modes.sessionend.primary_failure == "error"' "$FB_MANIFEST"; assert $? "manifest records the primary failure kind"
-jqe '.modes.sessionend.primary_api_error_status == 429' "$FB_MANIFEST"; assert $? "primary failure detail carries api_error_status"
+jqe '.modes.sessionend.primary_is_error == true' "$FB_MANIFEST"; assert $? "primary failure detail is carried under primary_*"
+jqe '.modes.sessionend.primary_api_error_status == null' "$FB_MANIFEST"; assert $? "no api_error_status on a non-quota primary"
 (( $(call_count) == 2 )); assert $? "exactly two model calls ($(call_count) seen)"
 (( $(resume_calls) == 1 )); assert $? "only the PRIMARY call used --resume"
 grep -qF 'FIXTURE-PARENT-TAIL-MARKER' "$STUB_PROMPT_LOG"; assert $? "fallback prompt carries the transcript tail"
@@ -486,9 +508,15 @@ fi
 (( $(resume_calls) == 1 )); assert $? "the resumed path was used"
 
 # ===========================================================================
-# B1 worst case + C1 — both attempts fail => error manifest WITH a reason
+# C1 + G1 — a 429 primary ends the run: error manifest WITH a reason, and no
+# second call. The old contract here was "the fallback was attempted before
+# giving up"; that assertion is retired because attempting it was the defect.
+# A 429 is the account's spend cap, so the fallback re-dialed the same capped
+# account in the same minute and 429'd too — a doomed call per ended session,
+# every session, all day. What must still hold is everything C1 was actually
+# about: the envelope's own account of the failure reaches the manifest.
 # ===========================================================================
-t_begin "C1: an error manifest carries the failure reason, not just an exit code"
+t_begin "C1/G1: a 429 primary yields a reasoned error manifest and NO fallback call"
 reset_logs
 ERR_SID="40fbb4a9-1a2b-4c3d-9e8f-000000000007"
 STUB_MODE=error429 bash "$REFLECT_SH" sessionend <<<"$(sessionend_payload "$ERR_SID")"
@@ -499,12 +527,36 @@ else
   bad "no terminal manifest at $ERR_MANIFEST"
 fi
 jqe '.modes.sessionend.completed_at != null' "$ERR_MANIFEST"; assert $? "terminal write carries completed_at"
-jqe '.modes.sessionend.reason != null' "$ERR_MANIFEST"; assert $? "reason is recorded"
+jqe '.modes.sessionend.reason == "model_call_nonzero_exit"' "$ERR_MANIFEST"; assert $? "reason names the primary's own failure"
 jqe '.modes.sessionend.api_error_status == 429' "$ERR_MANIFEST"; assert $? "api_error_status extracted from the envelope"
 jqe '.modes.sessionend.is_error == true' "$ERR_MANIFEST"; assert $? "is_error extracted from the envelope"
 jqe '(.modes.sessionend.result_excerpt // "") | test("usage limit")' "$ERR_MANIFEST"; assert $? "result excerpt names the actual failure"
 jqe '((.modes.sessionend.result_excerpt // "") | length) <= 200' "$ERR_MANIFEST"; assert $? "result excerpt is capped at 200 chars"
-jqe '.modes.sessionend.fallback_used == true' "$ERR_MANIFEST"; assert $? "the fallback was attempted before giving up"
+jqe '.modes.sessionend.fallback_used == false' "$ERR_MANIFEST"; assert $? "fallback_used:false — the doomed second call was not made"
+jqe '.modes.sessionend.fallback_skipped_quota == true' "$ERR_MANIFEST"; assert $? "the skip is countable in the corpus (fallback_skipped_quota:true)"
+jqe '.modes.sessionend.primary_api_error_status == 429' "$ERR_MANIFEST"; assert $? "the primary's status is queryable under primary_* too"
+(( $(call_count) == 1 )); assert $? "exactly ONE model call ($(call_count) seen)"
+
+# The sharper half of G1: the stub would have ANSWERED the fallback here
+# (fail_resume 429s only the --resume call). Pre-fix this session ended
+# `complete` on a second call; post-fix the dispatcher declines to place it,
+# because on a genuinely capped account that success is not available — the
+# 429 is about the account, not about `--resume`.
+t_begin "G1 control: 429 on the resumed call alone still buys no second call"
+reset_logs
+Q_SID="40fbb4a9-1a2b-4c3d-9e8f-00000000000d"
+STUB_MODE=fail_resume bash "$REFLECT_SH" sessionend <<<"$(sessionend_payload "$Q_SID")"
+Q_MANIFEST="$REFLECT_ROOT/sessions/$Q_SID/manifest.json"
+if wait_terminal "$Q_MANIFEST" sessionend; then
+  jqe '.modes.sessionend.status == "error"' "$Q_MANIFEST"; assert $? "status=error, not a fallback-rescued complete"
+else
+  bad "no terminal manifest at $Q_MANIFEST"
+fi
+jqe '.modes.sessionend.fallback_skipped_quota == true' "$Q_MANIFEST"; assert $? "recorded as a quota skip"
+jqe '.modes.sessionend.primary_failure == "error"' "$Q_MANIFEST"; assert $? "the primary failure kind is still recorded"
+(( $(call_count) == 1 )); assert $? "exactly ONE model call ($(call_count) seen)"
+(( $(resume_calls) == 1 )); assert $? "and it was the resumed primary"
+[[ ! -f "$REFLECT_ROOT/sessions/$Q_SID/final.json" ]]; assert $? "no final.json invented from a call that was never made"
 
 t_begin "C1 control: a healthy run carries no failure fields"
 if jqe '.modes.sessionend.api_error_status != null' "$OK_MANIFEST"; then
@@ -637,7 +689,9 @@ fi
 t_begin "F3 control: a parseable transcript gets the extract, never the raw note"
 reset_logs
 RAWC_SID="40fbb4a9-1a2b-4c3d-9e8f-00000000000c"
-STUB_MODE=fail_resume bash "$REFLECT_SH" sessionend <<<"$(sessionend_payload "$RAWC_SID")"
+# fail_transient, not fail_resume: this control needs the FALLBACK prompt to
+# exist, and since G1 a 429 primary produces no fallback prompt at all.
+STUB_MODE=fail_transient bash "$REFLECT_SH" sessionend <<<"$(sessionend_payload "$RAWC_SID")"
 RAWC_MANIFEST="$REFLECT_ROOT/sessions/$RAWC_SID/manifest.json"
 wait_terminal "$RAWC_MANIFEST" sessionend; assert $? "fallback reached a terminal status"
 grep -qF 'FIXTURE-PARENT-TAIL-MARKER' "$STUB_PROMPT_LOG"; assert $? "the normal extract still reaches the prompt"
