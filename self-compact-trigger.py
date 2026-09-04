@@ -89,8 +89,11 @@ LOOP BOUND (B6)
         (default 900), enforced against last_fired_at;
       * retry fires still count toward MAX_FIRES_PER_SESSION.
     A success outcome never re-arms and returns the retry budget; so does the
-    dip re-arm (a dip is a new crossing). The env vars select BOUNDS, never
-    on/off — see NO SWITCH.
+    dip re-arm (a dip is a new crossing). A MANUAL reset's abort feeds this
+    channel too (/self-compact spawns the same inplace_reset.py, which writes
+    the same outcome record) — intended: the same four bounds apply, and the
+    re-arm only ever acts while the session measures above the threshold. The
+    env vars select BOUNDS, never on/off — see NO SWITCH.
 """
 from __future__ import annotations
 
@@ -540,6 +543,11 @@ def main() -> int:
     now = int(time.time())
     state["armed"] = False
     state["fires"] = state.get("fires", 0) + 1
+    # A retry fire (abort re-arm fall-through) bumps this too, so `crossings`
+    # reads "fires attempted" rather than distinct threshold crossings. Known
+    # vocabulary drift, tolerated: the retry budget keeps its own counter
+    # (rearm_retries), and nothing consumes `crossings` beyond the request
+    # record and logs.
     state["crossings"] = state.get("crossings", 0) + 1
     state["last_fired_at"] = now
     state["last_fill_pct"] = occ.fill_pct

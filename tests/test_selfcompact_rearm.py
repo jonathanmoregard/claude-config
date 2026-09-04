@@ -172,6 +172,30 @@ def test_an_outcome_older_than_the_fire_is_stale(harness):
     assert harness.state()["fires"] == 1
 
 
+@pytest.mark.parametrize("raw", [
+    "{ not json",                                          # garbage bytes
+    json.dumps([]),                                        # non-dict JSON
+    json.dumps("aborted"),                                 # non-dict JSON (string)
+    json.dumps({"status": "aborted", "reason": "x"}),      # no `at` at all
+    json.dumps({"status": "aborted", "reason": "x",
+                "at": "soon"}),                            # non-int `at`
+])
+def test_a_corrupt_outcome_record_never_rearms(harness, raw):
+    # outcome.json is the one Stop-hook read of a file ANOTHER process writes;
+    # a corrupt or half-shaped record must read as "no reset has reported
+    # back" — it must never crash the hook and never buy a fire.
+    assert harness.run(350_000) == 0
+    # Backdate the fire so ONLY the record's shape can refuse the re-arm.
+    harness.patch_state(last_fired_at=int(time.time()) - 1000)
+    (harness.sessions / SID / "outcome.json").write_text(raw)
+    assert harness.run(360_000) == 0
+    st = harness.state()
+    assert st["fires"] == 1
+    assert st["armed"] is False
+    assert st.get("rearm_retries", 0) == 0
+    assert len(harness.spawned) == 1
+
+
 def test_no_outcome_means_no_rearm(harness):
     # The pre-existing silence on repeat Stops (smoke TEST 23) is unchanged
     # when no reset ever reported back.
