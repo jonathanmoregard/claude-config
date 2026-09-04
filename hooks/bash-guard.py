@@ -40,7 +40,10 @@ guard can fail to reach a verdict now DENIES:
   * dcg exceeded the guard's own timeout
   * dcg emitted output that could not be parsed
   * dcg exited non-zero without rendering a decision
-  * dcg rendered a decision value the guard does not understand
+  * dcg rendered a decision value the guard does not understand. NOT
+    ``ask``, which is a value it does understand: dcg's own "I reached no
+    verdict" answer. That one blocks as dcg's answer, with dcg's reason,
+    rather than as a broken guard — see ``_check_dcg``.
   * hook stdin was unparseable, or carried no command to check
   * a pipeline stage downstream of a network fetch could not be tokenised, so
     the guard could not tell whether the fetch feeds a shell
@@ -439,6 +442,11 @@ def _check_dcg(command: str) -> str | None:
     ``_fail_closed`` and exits. This is the exact inversion of safe-bash's
     ``_check_denied_by_dcg``, which returned None (allow) for all of them.
 
+    Three decision values, three outcomes: ``deny`` blocks with dcg's rule
+    and reason, ``allow`` falls through to the later layers, and ``ask``
+    blocks too — it is dcg's "I did not reach a verdict" answer, not a
+    fault and not a clearance. See the ``ask`` branch below.
+
     NOTE the invocation form. Bare ``dcg`` is deliberate and must not be
     changed to ``dcg hook`` in pursuit of a non-zero exit on deny: measured,
     ``dcg hook`` answers the same stdin with batch JSONL
@@ -487,6 +495,7 @@ def _check_dcg(command: str) -> str | None:
     # deny ANYWHERE wins: direction-independent, and fail-closed whichever
     # way a future dcg orders its output.
     deny_reason: str | None = None
+    ask_reason: str | None = None
     saw_allow = False
     for line in (proc.stdout or "").splitlines():
         line = line.strip()
@@ -515,6 +524,48 @@ def _check_dcg(command: str) -> str | None:
         if verdict == "allow":
             saw_allow = True
             continue
+        if verdict == "ask":
+            # dcg's THIRD decision, and the one this guard used to call a
+            # fault. It is not: `ask` is what dcg renders when it reached no
+            # verdict — `write_indeterminate_to` (src/hook.rs) for a command
+            # it did not finish evaluating inside `general.hook_timeout_ms`
+            # (1000ms by default) or one larger than
+            # `general.max_command_bytes`, and `write_review_request_to` for
+            # a rule whose `[policy]` mode is `ask`.
+            #
+            # Measured 2026-09-04: eight legitimate commands were refused in
+            # one morning with "a permissionDecision this guard does not
+            # understand", whose recovery text told the operator to install a
+            # dcg that was installed and answering throughout. dcg's own
+            # evaluation deadline had been elapsing under load — the same
+            # commands re-measured at 45-170ms on an idle box.
+            #
+            # Still a BLOCK: an unevaluated command is not a cleared one. But
+            # the guard does not forward the `ask` to Claude Code either. A
+            # PreToolUse decision pre-empts the permission system, so an
+            # `ask` emitted here would put an approval prompt in front of
+            # commands `permissions.deny` refuses outright — the same
+            # bypass an "allow" would be, one click away.
+            if ask_reason is None:
+                rule = hook_out.get("ruleId") or hook_out.get("packId")
+                why = (hook_out.get("permissionDecisionReason") or "").strip()
+                ask_reason = (
+                    "bash-guard: dcg did not clear this command. It answered "
+                    "`ask` — its \"no verdict, a human decides\" decision"
+                    + (f" (rule: {rule})" if rule else "")
+                    + ", which is not an allow.\n"
+                    + (why + "\n" if why else "")
+                    + "The guard blocks rather than forwarding the question, "
+                    "because a PreToolUse decision pre-empts settings.json "
+                    "permission rules. To run it anyway, run it yourself in "
+                    "the prompt with `! <command>`.\n"
+                    "When no rule is named, dcg did not evaluate the command "
+                    "at all: its deadline (general.hook_timeout_ms) elapsed, "
+                    "or the command exceeded general.max_command_bytes. "
+                    "Neither is a verdict about the command — re-running it, "
+                    "or splitting it, normally clears."
+                )
+            continue
         _fail_closed(
             "dcg rendered a permissionDecision this guard does not understand: "
             f"{verdict!r}"
@@ -522,6 +573,13 @@ def _check_dcg(command: str) -> str | None:
 
     if deny_reason is not None:
         return deny_reason
+    # An ask is a blocking answer, so — exactly as for a deny — dcg's exit
+    # status and config state cannot change the outcome and are not checked.
+    # dcg's own precedence puts a proven Deny above an unevaluated Ask, which
+    # is why this comes second.
+    if ask_reason is not None:
+        return ask_reason
+
     # No deny rendered. Exit 0 is dcg's allow — for a silent run and for an
     # explicit `"allow"` alike. Any other status means dcg fell over, and a
     # rendered allow does not excuse that: the allow speaks for dcg's rules,

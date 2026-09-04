@@ -194,6 +194,63 @@ STUB_DENY_THEN_ALLOW = _dcg_stub(
     "exit 0\n",
 )
 
+def _ask_line(reason: str, rule: str | None = None) -> str:
+    out = {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "ask",
+        "permissionDecisionReason": reason,
+    }
+    if rule is not None:
+        out["ruleId"] = rule
+    return json.dumps({"hookSpecificOutput": out})
+
+
+# dcg's THIRD decision. Measured against the packaged binary (0.12.5):
+# `write_indeterminate_to` (src/hook.rs) renders `permissionDecision: "ask"`
+# whenever dcg did not finish proving the command safe — the evaluation
+# deadline (`general.hook_timeout_ms`, 1000ms by default) elapsed, or the
+# command was larger than `general.max_command_bytes`. Reproduced on this
+# host by handing the real binary a 70KB command; it answers
+#   {"permissionDecision":"ask","permissionDecisionReason":"Command is 70005
+#    bytes and exceeds limit 65536 bytes; DCG did not evaluate it…"}
+# The same value also arrives from a rule whose `[policy]` mode is `ask`.
+ASK_INDETERMINATE_REASON = (
+    "DCG could not complete safety evaluation within 1000ms "
+    "(stage: evaluation); command was not verified. "
+    "Review manually or increase hook_timeout_ms."
+)
+STUB_ASK = _dcg_stub(
+    "stubs/dcg-ask",
+    "cat >/dev/null\n" f"echo '{_ask_line(ASK_INDETERMINATE_REASON)}'\n" "exit 0\n",
+)
+_ASK_RULE_LINE = _ask_line("operator review required", rule="core.git:reset-hard")
+STUB_ASK_WITH_RULE = _dcg_stub(
+    "stubs/dcg-ask-with-rule",
+    "cat >/dev/null\n" f"echo '{_ASK_RULE_LINE}'\n" "exit 0\n",
+)
+STUB_ASK_THEN_DENY = _dcg_stub(
+    "stubs/dcg-ask-then-deny",
+    "cat >/dev/null\n"
+    f"echo '{_ask_line(ASK_INDETERMINATE_REASON)}'\n"
+    f"echo '{_deny_line(rule='late-deny', why='second line denies')}'\n"
+    "exit 0\n",
+)
+STUB_UNKNOWN_DECISION = _dcg_stub(
+    "stubs/dcg-unknown-decision",
+    "cat >/dev/null\n"
+    + "echo '"
+    + json.dumps(
+        {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "maybe",
+            }
+        }
+    )
+    + "'\n"
+    "exit 0\n",
+)
+
 MISSING_DCG = os.path.join(SCRATCH, "definitely-not-here", "dcg")
 BROKEN_MARKER = "the safety guard is BROKEN"
 # Load-bearing phrase from _FIND_DANGEROUS_HINT. Asserting on it proves the
@@ -650,6 +707,95 @@ dec, why = guard("find /tmp/x -delete", dcg=STUB_EXPLICIT_ALLOW)
 check(
     "explicit allow from dcg does not short-circuit the find layer",
     dec == "deny" and FIND_INCIDENT in why,
+    f"decision={dec!r} {why[:200]}",
+)
+
+
+# ======================================================================
+# dcg's `ask` decision — the one it renders when it did NOT evaluate.
+#
+# Measured 2026-09-04: eight legitimate commands were refused in one
+# morning with `dcg rendered a permissionDecision this guard does not
+# understand: 'ask'`, whose recovery text told the operator to install a dcg
+# that was installed and answering the whole time. The blame was wrong, so
+# the fix went looking in the wrong place.
+#
+# `ask` is not a broken dcg. src/hook.rs `write_indeterminate_to` renders it
+# when dcg ran out of its own evaluation budget (`general.hook_timeout_ms`,
+# 1000ms by default — the morning in question had a runaway embedding
+# service saturating the CPU) or when the command exceeded
+# `general.max_command_bytes`; `write_review_request_to` renders it for a
+# rule whose policy mode is `ask`. Both mean "no verdict — a human decides".
+#
+# So the guard must still BLOCK (an unevaluated command is not a cleared
+# one), and must say so as dcg's answer rather than as its own fault. It
+# must NOT forward the `ask` to Claude Code: a PreToolUse decision pre-empts
+# the permission system, so an `ask` this guard emitted would put a prompt
+# in front of commands that settings.json denies outright.
+# ======================================================================
+section("bash-guard: dcg's `ask` is a blocking answer, not a broken guard")
+
+dec, why = guard("ls -la", dcg=STUB_ASK)
+check("dcg `ask` -> deny", dec == "deny", f"decision={dec!r} {why[:200]}")
+check(
+    "... is NOT reported as a broken guard",
+    BROKEN_MARKER not in why,
+    why[:240],
+)
+check(
+    "... does not tell the operator to install the dcg that just answered",
+    "install dcg" not in why,
+    why[:240],
+)
+check(
+    "... does not claim the decision value was unrecognised",
+    "does not understand" not in why,
+    why[:240],
+)
+check(
+    "... relays dcg's own reason, so the real cause is named",
+    "could not complete safety evaluation within 1000ms" in why,
+    why[:300],
+)
+check(
+    "... names the escape hatch",
+    "! <command>" in why,
+    why[:300],
+)
+
+dec, why = guard("git reset --hard HEAD", dcg=STUB_ASK_WITH_RULE)
+check(
+    "a policy-mode `ask` names the rule that wants review",
+    dec == "deny" and "core.git:reset-hard" in why,
+    f"decision={dec!r} {why[:240]}",
+)
+
+dec, why = guard("rm -rf /", dcg=STUB_ASK_THEN_DENY)
+check(
+    # dcg's own precedence: a proven Deny outranks an unevaluated Ask.
+    "a deny anywhere in dcg's stdout outranks an ask",
+    dec == "deny" and "second line denies" in why,
+    f"decision={dec!r} {why[:240]}",
+)
+
+dec, why = guard("ls -la", dcg=STUB_UNKNOWN_DECISION)
+check(
+    # The fail-closed branch that `ask` used to fall into must still exist
+    # for a value that really is unknown — handling `ask` is not the same as
+    # trusting whatever dcg says next.
+    "a genuinely unknown decision value still denies as a broken guard",
+    dec == "deny" and BROKEN_MARKER in why and "does not understand" in why,
+    f"decision={dec!r} {why[:240]}",
+)
+
+# An ask is dcg's answer about dcg's rules — it must not smother the later
+# layers any more than an explicit allow does. (It cannot: the guard returns
+# the ask as its deny reason. This pins the ordering so a future refactor
+# that made `ask` non-blocking would have to face the find layer too.)
+dec, why = guard("find /tmp/x -delete", dcg=STUB_ASK)
+check(
+    "an ask on a command the find layer also refuses still denies",
+    dec == "deny",
     f"decision={dec!r} {why[:200]}",
 )
 
