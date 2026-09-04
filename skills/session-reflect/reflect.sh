@@ -123,6 +123,10 @@ if reflect_truthy "${REFLECT_SUBPROCESS:-}"; then
 fi
 
 # --- Help --------------------------------------------------------------------
+# "(default: …)" lines must quote the *_DEFAULT constants from lib.sh, never
+# the live vars — with an operator override exported, the live var would label
+# the override as the shipped default. Knobs without a *_DEFAULT constant keep
+# their hand-written values.
 if [[ "$ARG1" == "--help" || "$ARG1" == "-h" ]]; then
   cat <<EOF
 reflect.sh — session-reflect hook dispatcher
@@ -154,21 +158,21 @@ Env:
   REFLECT_RESUME_MAX_TRANSCRIPT_BYTES
                                    Transcript size above which the fork-resume is
                                    skipped as doomed and sessionend goes straight
-                                   to the fallback (default: ${REFLECT_RESUME_MAX_TRANSCRIPT_BYTES},
+                                   to the fallback (default: $(( REFLECT_RESUME_MODEL_WINDOW_TOKENS_DEFAULT * REFLECT_TRANSCRIPT_BYTES_PER_TOKEN_DEFAULT )),
                                    derived from REFLECT_RESUME_MODEL_WINDOW_TOKENS
                                    x REFLECT_TRANSCRIPT_BYTES_PER_TOKEN).
   REFLECT_AGENT_TRANSCRIPT_CAP_BYTES
                                    Cap on the agent-transcript extract inlined into
-                                   a subagentstop prompt (default: ${REFLECT_AGENT_TRANSCRIPT_CAP_BYTES}).
+                                   a subagentstop prompt (default: ${REFLECT_AGENT_TRANSCRIPT_CAP_BYTES_DEFAULT}).
   REFLECT_FALLBACK_TAIL_CAP_BYTES  Cap on the transcript tail inlined into a
-                                   sessionend fallback prompt (default: ${REFLECT_FALLBACK_TAIL_CAP_BYTES}).
+                                   sessionend fallback prompt (default: ${REFLECT_FALLBACK_TAIL_CAP_BYTES_DEFAULT}).
   REFLECT_HANDOFF_CAP_BYTES        Cap on the self-compact handoff inlined into a
-                                   fallback prompt (default: ${REFLECT_HANDOFF_CAP_BYTES}).
+                                   fallback prompt (default: ${REFLECT_HANDOFF_CAP_BYTES_DEFAULT}).
   REFLECT_HANDOFF_MAX_AGE_SECONDS  Age past which that handoff is not offered to the
-                                   model as this session's state (default: ${REFLECT_HANDOFF_MAX_AGE_SECONDS}).
+                                   model as this session's state (default: ${REFLECT_HANDOFF_MAX_AGE_SECONDS_DEFAULT}).
   REFLECT_EXCERPT_BYTES            Length of every quoted excerpt: tool_result
                                    bodies, envelope \`result\`, unparseable replies
-                                   (default: ${REFLECT_EXCERPT_BYTES}).
+                                   (default: ${REFLECT_EXCERPT_BYTES_DEFAULT}).
   _REFLECT_INTERNAL                Sentinel required to enter --worker re-entry path
 
 Modes:
