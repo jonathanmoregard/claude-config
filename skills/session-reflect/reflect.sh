@@ -508,6 +508,9 @@ TRANSCRIPT_PATH="$(extract transcript_path)"
 HOOK_EVENT="$(extract hook_event_name)"
 CWD="$(extract cwd)"
 TRIGGER="$(extract trigger)"                # precompact-only
+# shellcheck disable=SC2034  # extracted to document the payload surface; the
+# precompact prompt is a fixed template and deliberately does not splice the
+# user's custom_instructions into it.
 CUSTOM_INSTR="$(extract custom_instructions)" # precompact-only
 
 # SubagentStop-only. Present since Claude Code 2.1.260 (captured live 2026-09-04);
@@ -1391,6 +1394,10 @@ run_worker() {
     obstacles_to_autonomy: ((.obstacles_to_autonomy // []) | if type == "array" then . else [] end)
   }'
   local reflection=""
+  # shellcheck disable=SC2034  # which of the two parse strategies won is a
+  # breadcrumb for anyone stepping through this with `bash -x`; it is
+  # deliberately not in the manifest, where it would invite a consumer to branch
+  # on how the JSON was recovered rather than on whether it was.
   local parse_source=""
   if reflection=$(jq -c "$_coerce_arrays" <<<"$inner" 2>/dev/null); then
     parse_source="direct"
@@ -1413,6 +1420,7 @@ run_worker() {
     fi
     if [[ -n "$unfenced" ]]; then
       if reflection=$(jq -c "$_coerce_arrays" <<<"$unfenced" 2>/dev/null); then
+        # shellcheck disable=SC2034  # see the declaration: a `bash -x` breadcrumb.
         parse_source="fenced"
       fi
     fi
@@ -1552,7 +1560,7 @@ spawn_detached_worker() {
 
   if [[ "$SPAWN_METHOD" == "systemd-run" ]]; then
     local -a setenv_args=( "--setenv=_REFLECT_INTERNAL=1" )
-    local v val
+    local v
     # CLAUDE_SESSIONS_DIR MUST be here. It selects the root the mission handoff
     # is written under, and its default is the user's REAL session tree. A
     # detached worker that does not inherit it silently writes into that real

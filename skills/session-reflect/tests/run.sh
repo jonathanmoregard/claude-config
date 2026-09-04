@@ -21,6 +21,15 @@
 # stable if a slower lane is ever added.
 #
 # Exit: 0 all cases passed · 1 a case failed · 2 bad invocation.
+#
+# shellcheck disable=SC2319
+# `[[ -f x ]]; assert $?` is the house idiom here and the $? IS the condition's
+# status — that is precisely what is being asserted. SC2319 warns because that
+# pattern usually means someone lost a command's status to an intervening test;
+# here there is no intervening command, and spelling each one out as
+# `if [[ ... ]]; then ok ...; else bad ...; fi` would triple the file for no
+# added signal. Cases that DO need a command's status capture it explicitly
+# (`rc=$?` right after the dispatcher call).
 set -u
 set -o pipefail
 

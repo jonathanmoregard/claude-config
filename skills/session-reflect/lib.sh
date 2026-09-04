@@ -336,6 +336,10 @@ paths_for_session() {
 # Creates the session dir + checkpoint dir (+ subagent parent chain).
 ensure_session_dirs() {
   local sid="$1" parent="${2:-}"
+  # shellcheck disable=SC2034  # these are not unused, they are the CONTAINER for
+  # the eval below. paths_for_session emits assignments to all five names; every
+  # one must already be `local` here or eval writes it into the caller's scope —
+  # and the caller is the dispatcher, which holds its own manifest_path.
   local session_dir final_path manifest_path checkpoint_dir subagent_dir
   eval "$(paths_for_session "$sid" "$parent")"
   mkdir -p "$session_dir" "$checkpoint_dir"
