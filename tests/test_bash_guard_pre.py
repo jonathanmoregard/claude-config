@@ -763,6 +763,9 @@ check(
     why[:300],
 )
 
+# The command is a STRING handed to the guard under test, never executed —
+# it names a destructive operation so the rule id in the stub's answer reads
+# true. [arftl-allow: history-rewrite — test fixture, not a command]
 dec, why = guard("git reset --hard HEAD", dcg=STUB_ASK_WITH_RULE)
 check(
     "a policy-mode `ask` names the rule that wants review",
