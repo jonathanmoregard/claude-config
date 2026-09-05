@@ -989,3 +989,49 @@ def test_an_absent_claude_json_is_not_reported_as_a_broken_one(tmp_path):
 
     assert "could not be read" not in message
     assert "JSONDecodeError" not in message and "PermissionError" not in message
+
+
+def test_a_probe_that_could_not_measure_is_not_called_an_outage(tmp_path):
+    """``unknown`` carries severity ``down``. It does not mean recall is down.
+
+    The probe maps UNKNOWN to the DOWN severity on purpose — its rule is
+    "unknown means warn, never fine", and severity is how loudly to speak. The
+    hook then keyed its HEADLINE off severity and told the operator
+    "aggregator_search_memory is refusing every call this session" about a
+    probe that had just said it could not read one of its three quantities.
+
+    That is a fabricated fact in the loudest sentence on the screen, and it
+    burns the same credibility the false-alarm fixes on this branch were spent
+    buying back. The verdict still gets announced; it just says what it knows.
+    """
+    proc = _run(_write_probe(
+        tmp_path,
+        {"state": "unknown", "severity": "down",
+         "summary": "the writer binary could not be resolved", "findings": []},
+        20,
+    ))
+
+    message = json.loads(proc.stdout)["systemMessage"]
+    assert "the writer binary could not be resolved" in message
+    assert "REFUSING" not in message.upper(), (
+        "a probe that could not measure was announced as a live outage"
+    )
+    assert "UNVERIFIED" in message
+
+
+def test_a_state_this_hook_does_not_know_still_speaks(tmp_path):
+    """Forward compatibility, in the direction that matters.
+
+    A state string added to the probe later must not fall through to silence.
+    Silence means "checked and healthy" here, and a hook that goes quiet on a
+    verdict it does not recognise reproduces the original incident exactly.
+    """
+    proc = _run(_write_probe(
+        tmp_path,
+        {"state": "corrupt", "severity": "down", "summary": "cache is not a db",
+         "findings": []},
+        20,
+    ))
+
+    assert proc.stdout, "the hook went silent on a state it did not recognise"
+    assert "cache is not a db" in json.loads(proc.stdout)["systemMessage"]

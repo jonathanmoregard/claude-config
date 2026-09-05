@@ -137,10 +137,19 @@ DEFAULT_READER_DIR = Path.home() / "Repos" / "aggregator"
 # rather than a discarded one.
 PROBE_TIMEOUT_S = 5.0
 
-# States, mirrored from the probe. Compared as strings rather than imported,
-# because importing across repos is exactly the coupling this hook avoids.
+# The probe's four STATES, mirrored as strings rather than imported, because
+# importing across repos is exactly the coupling this hook avoids.
+#
+# States are not severities and this comment used to blur them: the probe also
+# emits a `severity` (down / reduced / silent) which is how LOUDLY to speak,
+# and it maps UNKNOWN to `down` deliberately — its rule is "unknown means warn,
+# never fine". So `severity == down` answers "should this be shouted?" and
+# never "is recall refusing calls?". Every headline below keys off STATE, and
+# the previous version keying off severity is why an unmeasurable probe was
+# announced as a live outage.
 FINE = "fine"
-DOWN = "down"
+DEAD = "dead"
+WILL_ROT = "will-rot"
 
 
 # How the probe was chosen, in the announcement's own words. The tiers are not
@@ -585,16 +594,23 @@ def main() -> int:
         # The earned silence. Nothing printed, nothing injected.
         return 0
 
-    if verdict.get("severity") == DOWN:
+    if state == DEAD:
         headline = (
             "AGGREGATOR RECALL IS DOWN — aggregator_search_memory is refusing "
             "every call this session."
         )
-    else:
+    elif state == WILL_ROT:
         headline = (
             "AGGREGATOR RECALL is working now but will break on the next "
             "ingest tick."
         )
+    else:
+        # `unknown`, or a state added to the probe after this hook was
+        # written. Announced, never silent — silence here means "checked and
+        # healthy", and going quiet on an unrecognised verdict reproduces the
+        # original incident. But not asserted as an outage either: the probe
+        # said it could not measure, not that recall is refusing.
+        headline = "AGGREGATOR RECALL: health UNVERIFIED."
     _announce(summary, headline, _provenance(probe, measured=True))
     return 0
 
