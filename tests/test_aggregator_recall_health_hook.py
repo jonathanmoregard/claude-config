@@ -1429,6 +1429,78 @@ def test_a_healthy_verdict_under_a_non_object_mcp_entry_is_not_silence(tmp_path)
     assert "not verified" in json.loads(proc.stdout)["systemMessage"]
 
 
+# ---------------------------------------------------------------------------
+# H4: a relative `command` names nothing for the packaged tier to sit beside
+# ---------------------------------------------------------------------------
+# The override and the two tree tiers already refuse a relative path, for a
+# reason that applies just as hard here: this hook inherits the SESSION's
+# working directory. A `command` of `./bin/aggregator-mcp` — or a bare name
+# resolved through a RELATIVE PATH entry — yields a relative parent, so the
+# packaged tier stats `<cwd>/bin/aggregator-schema-probe` and, finding
+# something, EXECUTES it. Whatever project the operator happened to open would
+# get to run code and dictate the session's recall verdict.
+
+
+def test_a_relative_command_does_not_run_a_sibling_out_of_the_session_cwd(
+    tmp_path, monkeypatch
+):
+    """A `command` with a relative directory on it is refused, loudly.
+
+    The candidate the packaged tier builds from it is `<cwd>/bin/...`, and the
+    tier's whole claim — "this is the binary Claude Code launches" — is false
+    of a path that means something different in every project directory.
+    """
+    bindir = tmp_path / "bin"
+    _make_exec(bindir / "aggregator-mcp")
+    planted = _make_exec(bindir / "aggregator-schema-probe")
+    home = _fake_home(tmp_path, {"command": "./bin/aggregator-mcp", "args": []})
+    _isolate(monkeypatch, home, tmp_path / "empty-bin")
+    monkeypatch.chdir(tmp_path)
+
+    probe = _load_hook()._probe_invocation()
+
+    expected = home / "Repos" / "aggregator" / "aggregator" / "health" / "schema_probe.py"
+    assert probe.path == expected, (
+        f"the hook selected {probe.path} out of the session's working directory"
+    )
+    assert probe.argv == [sys.executable, str(expected), "--json"]
+    assert str(planted) not in " ".join(probe.argv)
+    assert "not an absolute path" in probe.looked, (
+        "the relative command was dropped without saying so"
+    )
+    assert "./bin/aggregator-mcp" in probe.looked
+
+
+def test_a_bare_command_found_on_a_relative_path_entry_is_refused(
+    tmp_path, monkeypatch
+):
+    """The same defect through the other door: `PATH=bin` resolves relatively.
+
+    ``shutil.which`` joins the PATH entry to the name, so a relative entry
+    hands back a relative path and the sibling search inherits it. Nothing
+    about the config looks wrong here — the fault is one entry in an
+    environment variable, which is exactly why it has to be named rather than
+    quietly obeyed.
+    """
+    bindir = tmp_path / "bin"
+    _make_exec(bindir / "aggregator-mcp")
+    planted = _make_exec(bindir / "aggregator-schema-probe")
+    home = _fake_home(tmp_path, {"command": "aggregator-mcp"})
+    _isolate(monkeypatch, home, tmp_path / "empty-bin")
+    monkeypatch.setenv("PATH", "bin")
+    monkeypatch.chdir(tmp_path)
+
+    probe = _load_hook()._probe_invocation()
+
+    expected = home / "Repos" / "aggregator" / "aggregator" / "health" / "schema_probe.py"
+    assert probe.path == expected, (
+        f"the hook selected {probe.path} out of the session's working directory"
+    )
+    assert str(planted) not in " ".join(probe.argv)
+    assert "not an absolute path" in probe.looked
+    assert "aggregator-mcp" in probe.looked
+
+
 def test_a_refused_reader_dir_still_lets_the_directory_argument_through(tmp_path):
     """L3. The two named-tree sources were tried as an either/or, so a typo in
     the environment override silently disqualified a perfectly good

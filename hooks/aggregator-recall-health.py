@@ -303,20 +303,43 @@ def _named_tree(entry: dict) -> tuple[tuple[Path, str] | None, str | None]:
     return None, ("; ".join(problems) or None)
 
 
-def _reader_command(raw: str) -> Path | None:
-    """The reader binary named by ``command``, as a path with a directory.
+def _reader_command(raw: str) -> tuple[Path | None, str | None]:
+    """The reader binary named by ``command``, and why it yielded nothing.
 
     Bare names are looked up on PATH exactly as Claude Code looks them up, so
     a healthy ``{"command": "aggregator-mcp"}`` config is not reported as
     unverifiable for the sake of a missing slash.
+
+    ABSOLUTE, OR IT NAMES NOTHING TO SIT BESIDE — the same rule the override
+    and the tree tiers already carry, and here it is the sharpest of the three.
+    This hook inherits the SESSION's working directory, so ``command`` of
+    ``./bin/aggregator-mcp`` — or a bare name resolved through a RELATIVE PATH
+    entry, which ``shutil.which`` hands back as a relative path — gives the
+    packaged tier a relative parent. It would then stat, and on a hit EXECUTE,
+    ``<cwd>/bin/aggregator-schema-probe`` out of whatever project the operator
+    happened to open, and report that project's answer as the health of the
+    reader Claude Code runs. Refused, with the reason, rather than returned:
+    the second element says which of the two failures happened, because "no
+    such program" and "a program whose location depends on where you were
+    standing" need different repairs.
     """
     try:
         if os.path.dirname(raw):
-            return Path(raw).expanduser()
-        found = shutil.which(raw)
-        return Path(found) if found else None
+            command = Path(raw).expanduser()
+        else:
+            found = shutil.which(raw)
+            if not found:
+                return None, None
+            command = Path(found)
     except (OSError, ValueError, TypeError):
-        return None
+        return None, None
+    if not command.is_absolute():
+        return None, (
+            f"resolved to {str(command)!r}, which is not an absolute path — it "
+            "would be searched, and then executed, relative to whatever "
+            "directory the session was started in"
+        )
+    return command, None
 
 
 def _packaged_probe(entry: dict, config_problem: str | None = None) -> tuple[Path | None, str]:
@@ -351,8 +374,15 @@ def _packaged_probe(entry: dict, config_problem: str | None = None) -> tuple[Pat
             f"look for {PACKAGED_PROBE_NAME} beside"
         )
 
-    command = _reader_command(raw)
+    command, relative = _reader_command(raw)
     if command is None:
+        if relative:
+            # Skipped, not obeyed, and named — the operator believes that
+            # command is aiming the check at an installed binary.
+            return None, (
+                f"nowhere beside a reader binary — mcpServers.aggregator's "
+                f"command {raw!r} {relative}, so it was ignored"
+            )
         # Says which name failed. "names no command" would send the reader to
         # inspect an entry that is present and populated.
         return None, (
