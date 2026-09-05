@@ -1129,3 +1129,60 @@ def test_a_healthy_verdict_from_a_named_tree_stays_silent(tmp_path):
     proc = _run_hook(home, tmp_path / "empty-bin")
 
     assert proc.stdout == "", f"the hook spoke on a verified pass: {proc.stdout!r}"
+
+
+def test_the_override_can_point_at_the_packaged_probe(tmp_path):
+    """"Run exactly this file" was true of .py files only.
+
+    The override is the documented escape hatch and the natural way to aim the
+    hook at the packaged console script — which is a bash wrapper, not Python.
+    Dispatching it through sys.executable made the interpreter choke on the
+    shebang, and the operator got UNVERIFIED noise from an override that was
+    working perfectly.
+    """
+    probe = _plant_sh_probe(tmp_path / "aggregator-schema-probe")
+    home = _fake_home(tmp_path, {})
+
+    proc = _run_hook(home, tmp_path / "empty-bin",
+                     AGGREGATOR_SCHEMA_PROBE=str(probe))
+
+    assert proc.returncode == 0, proc.stderr
+    message = json.loads(proc.stdout)["systemMessage"]
+    assert "cache 5, reader 6" in message
+    assert "cannot read" not in message
+
+
+def test_a_python_override_is_still_run_through_this_interpreter(tmp_path):
+    """The other shape, pinned. A .py probe has no shebang and no exec bit.
+
+    Every stub in this file is one, and the systemd sibling runs the source
+    probe the same way, so switching wholesale to direct exec would break the
+    documented dev workflow instead of extending it.
+    """
+    probe = _write_probe(tmp_path, _payload("dead", "down", "cache 5, reader 6"), 20)
+    os.chmod(probe, 0o644)
+    home = _fake_home(tmp_path, {})
+
+    proc = _run_hook(home, tmp_path / "empty-bin",
+                     AGGREGATOR_SCHEMA_PROBE=str(probe))
+
+    assert "cache 5, reader 6" in json.loads(proc.stdout)["systemMessage"]
+
+
+def test_a_non_python_override_that_cannot_execute_says_so(tmp_path):
+    """A wrapper without its exec bit is a chmod, and the hook should say which.
+
+    Left unnamed it surfaces as a bare OSError from the spawn, which reads as
+    "the probe is broken" rather than "this one file needs +x".
+    """
+    probe = tmp_path / "aggregator-schema-probe"
+    probe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    probe.chmod(0o644)
+    home = _fake_home(tmp_path, {})
+
+    proc = _run_hook(home, tmp_path / "empty-bin",
+                     AGGREGATOR_SCHEMA_PROBE=str(probe))
+
+    assert proc.returncode == 0, proc.stderr
+    message = json.loads(proc.stdout)["systemMessage"]
+    assert "not executable" in message

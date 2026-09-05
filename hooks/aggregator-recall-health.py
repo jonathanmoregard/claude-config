@@ -82,7 +82,9 @@ executed directly.
 
 The precedence, strongest STATEMENT first — not most convenient source:
 
-1. ``AGGREGATOR_SCHEMA_PROBE`` — run exactly this file. The escape hatch.
+1. ``AGGREGATOR_SCHEMA_PROBE`` — run exactly this file. The escape hatch. A
+   ``.py`` path goes through this interpreter, anything else is executed as a
+   program, so it accepts the packaged console script as well as a source file.
 2. A tree somebody named on purpose: ``AGGREGATOR_READER_DIR``, or the config's
    own ``uv run --directory <tree> aggregator-mcp``.
 3. The packaged ``aggregator-schema-probe`` beside the reader binary.
@@ -384,7 +386,9 @@ def _probe_invocation() -> Probe:
     """Pick the probe, most authoritative statement first.
 
     1. ``AGGREGATOR_SCHEMA_PROBE`` — an explicit instruction outranks anything
-       discovered, and it is how a probe under development gets exercised.
+       discovered, and it is how a probe under development gets exercised. A
+       ``.py`` path runs through this interpreter; anything else is run as a
+       program, so the hatch also accepts the packaged console script.
     2. An explicitly named tree: ``AGGREGATOR_READER_DIR``, or the config's own
        ``--directory``. See ``_named_tree`` for why this sits above the
        packaged probe rather than below it.
@@ -395,11 +399,35 @@ def _probe_invocation() -> Probe:
     override = os.environ.get("AGGREGATOR_SCHEMA_PROBE")
     if override:
         path = Path(override).expanduser()
+        note = None
+        if path.suffix == ".py":
+            # The source probe, and every stub in the test suite: a plain
+            # module with no shebang and no exec bit. The systemd sibling runs
+            # it this way too.
+            argv = [sys.executable, str(path), "--json"]
+        else:
+            # Anything else is a program. "Run exactly this file" was only ever
+            # true of .py paths — pointing the documented escape hatch at the
+            # PACKAGED probe, which is a bash wrapper, fed a shebang to Python
+            # and produced UNVERIFIED noise from an override that was working.
+            argv = [str(path), "--json"]
+            try:
+                is_regular = stat.S_ISREG(os.stat(path).st_mode)
+            except OSError:
+                # Absent or unreachable. main() diagnoses that properly; do not
+                # pre-empt it with a guess about the exec bit.
+                is_regular = False
+            if is_regular and not os.access(path, os.X_OK):
+                note = (
+                    f"{path} is not a .py file, so it is run as a program — "
+                    "but it is not executable"
+                )
         return Probe(
             path,
-            [sys.executable, str(path), "--json"],
+            argv,
             f"where AGGREGATOR_SCHEMA_PROBE points, {path}",
             TIER_OVERRIDE,
+            note,
         )
 
     entry, config_problem = _server_entry()
