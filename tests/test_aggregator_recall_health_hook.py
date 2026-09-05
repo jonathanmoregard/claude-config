@@ -745,3 +745,131 @@ def test_a_bin_directory_it_cannot_read_is_named_with_the_reason(tmp_path):
     assert str(bindir / "aggregator-schema-probe") in message
     assert "could not be resolved" in message
     assert "PermissionError" in message
+
+
+# ---------------------------------------------------------------------------
+# Provenance: which probe spoke, and how much the answer is worth
+# ---------------------------------------------------------------------------
+# THE DEFECT THIS FIXES. The tiers are not equally trustworthy — the packaged
+# sibling IS the reader under test, while ``~/Repos/aggregator`` is a guess
+# about a tree nobody named — and until now only the MISSING announcement said
+# where it had been. A DEAD verdict looked identical whichever tier produced
+# it, so the 2026-09-05 false alarm, read off a guessed checkout sitting on a
+# feature branch, arrived with the same authority as a measurement of the real
+# thing. The module docstring even claimed the guess tier "says so"; it did
+# not.
+
+DEAD_VERDICT = {
+    "state": "dead", "severity": "down", "summary": "cache 5, reader 6",
+    "findings": [],
+}
+
+
+def _plant_py_probe(path: Path, payload: dict | None = None) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        PROBE_STUB % (json.dumps(payload or DEAD_VERDICT), 20), encoding="utf-8"
+    )
+    return path
+
+
+def _plant_sh_probe(path: Path) -> Path:
+    return _make_exec(
+        path,
+        "#!/bin/sh\n"
+        "printf '%s\\n' '" + json.dumps(DEAD_VERDICT) + "'\nexit 20\n",
+    )
+
+
+def _run_hook(home: Path, path_dir: Path, **extra_env: str):
+    env = dict(os.environ)
+    env.pop("AGGREGATOR_SCHEMA_PROBE", None)
+    env.pop("AGGREGATOR_READER_DIR", None)
+    env["HOME"] = str(home)
+    env["PATH"] = str(path_dir)
+    env.update(extra_env)
+    return subprocess.run(
+        [sys.executable, str(HOOK)], input="{}", capture_output=True, text=True,
+        env=env, timeout=30,
+    )
+
+
+def _tier_override(tmp_path):
+    probe = _plant_py_probe(tmp_path / "explicit" / "probe.py")
+    home = _fake_home(tmp_path, {"command": "aggregator-mcp"})
+    return home, {"AGGREGATOR_SCHEMA_PROBE": str(probe)}, probe, "override"
+
+
+def _tier_packaged(tmp_path):
+    mcp = _make_exec(tmp_path / "bin" / "aggregator-mcp")
+    probe = _plant_sh_probe(tmp_path / "bin" / "aggregator-schema-probe")
+    home = _fake_home(tmp_path, {"command": str(mcp), "args": []})
+    return home, {}, probe, "packaged sibling"
+
+
+def _tier_directory(tmp_path):
+    tree = tmp_path / "checkout"
+    probe = _plant_py_probe(tree / "aggregator" / "health" / "schema_probe.py")
+    home = _fake_home(tmp_path, {
+        "command": "uv",
+        "args": ["run", "--directory", str(tree), "aggregator-mcp"],
+    })
+    return home, {}, probe, "--directory"
+
+
+def _tier_reader_dir(tmp_path):
+    tree = tmp_path / "aimed-at"
+    probe = _plant_py_probe(tree / "aggregator" / "health" / "schema_probe.py")
+    home = _fake_home(tmp_path, {"command": "aggregator-mcp"})
+    return home, {"AGGREGATOR_READER_DIR": str(tree)}, probe, "AGGREGATOR_READER_DIR"
+
+
+def _tier_guess(tmp_path):
+    home = _fake_home(tmp_path, {})
+    probe = _plant_py_probe(
+        home / "Repos" / "aggregator" / "aggregator" / "health" / "schema_probe.py"
+    )
+    return home, {}, probe, "GUESS"
+
+
+@pytest.mark.parametrize(
+    "fixture",
+    [_tier_override, _tier_packaged, _tier_directory, _tier_reader_dir, _tier_guess],
+    ids=["override", "packaged", "directory", "reader-dir", "guess"],
+)
+def test_every_verdict_names_the_probe_that_produced_it(tmp_path, fixture):
+    """A verdict without its provenance is an assertion without a source.
+
+    All five tiers are made to return the same DEAD verdict, so the only thing
+    that can distinguish the announcements is the line naming what was actually
+    run. Without it the operator cannot tell a measurement of the shipped
+    reader from a reading of whatever branch a checkout happens to be on.
+    """
+    home, extra_env, probe, label = fixture(tmp_path)
+
+    proc = _run_hook(home, tmp_path / "empty-bin", **extra_env)
+
+    assert proc.returncode == 0, proc.stderr
+    doc = json.loads(proc.stdout)
+    message = doc["systemMessage"]
+    assert "cache 5, reader 6" in message
+    assert str(probe) in message, f"the {label} tier did not name its probe"
+    assert label in message, f"the {label} tier did not name itself"
+
+
+def test_a_verdict_read_off_the_guessed_checkout_says_it_may_be_wrong(tmp_path):
+    """The 2026-09-05 false alarm, and the sentence that would have defused it.
+
+    Nothing in ~/.claude.json named ``~/Repos/aggregator``. The hook went there
+    because it had nowhere else to go, read a feature branch, and announced an
+    outage in the same words it would use for a measured one. Every other tier
+    is a statement by somebody; this one is the hook's own guess, and it has to
+    admit that in the announcement rather than only in the source.
+    """
+    home, extra_env, probe, _ = _tier_guess(tmp_path)
+
+    doc = json.loads(_run_hook(home, tmp_path / "empty-bin", **extra_env).stdout)
+
+    for reader in (doc["systemMessage"], doc["hookSpecificOutput"]["additionalContext"]):
+        assert "GUESS" in reader
+        assert "may not describe the reader" in reader

@@ -143,17 +143,40 @@ FINE = "fine"
 DOWN = "down"
 
 
+# How the probe was chosen, in the announcement's own words. The tiers are not
+# equally trustworthy and the difference is the whole point: the packaged
+# sibling IS the reader under test, while TIER_GUESS is this hook's own
+# assumption about a tree nobody named. A verdict that does not say which one
+# spoke is an assertion with no source attached.
+TIER_OVERRIDE = "AGGREGATOR_SCHEMA_PROBE override"
+TIER_PACKAGED = "packaged sibling of the reader"
+TIER_GUESS = "default checkout GUESS"
+
+# Said out loud on every announcement from TIER_GUESS, because this is exactly
+# what went wrong on 2026-09-05: a guessed checkout on a feature branch
+# produced AGGREGATOR RECALL IS DEAD in the same words a real measurement uses.
+GUESS_CAVEAT = (
+    "nothing in ~/.claude.json named this tree, so this verdict may not "
+    "describe the reader Claude Code actually runs"
+)
+
+
 class Probe(NamedTuple):
-    """Which probe to run, how to run it, and where the search went.
+    """Which probe to run, how to run it, where the search went, and its rank.
 
     ``looked`` exists so the MISSING announcement can name every candidate. A
     check that says only "not found" hands the reader the wrong thing to fix
     half the time, and this one now has two plausible homes.
+
+    ``tier`` travels with EVERY announcement, not just the failures. Silence is
+    this hook's budget and a verdict is what it spends the budget on, so the
+    verdict has to carry how much it is worth.
     """
 
     path: Path
     argv: list[str]
     looked: str
+    tier: str
 
 
 def _server_entry() -> dict:
@@ -334,7 +357,7 @@ def _probe_invocation() -> Probe:
        packaged probe rather than below it.
     3. The packaged ``aggregator-schema-probe`` beside the reader binary the
        config names. Same build as the reader it reports on.
-    4. ``DEFAULT_READER_DIR``. A guess, and labelled as one in ``looked``.
+    4. ``DEFAULT_READER_DIR``. A guess, and every announcement says so.
     """
     override = os.environ.get("AGGREGATOR_SCHEMA_PROBE")
     if override:
@@ -343,6 +366,7 @@ def _probe_invocation() -> Probe:
             path,
             [sys.executable, str(path), "--json"],
             f"where AGGREGATOR_SCHEMA_PROBE points, {path}",
+            TIER_OVERRIDE,
         )
 
     entry = _server_entry()
@@ -355,13 +379,14 @@ def _probe_invocation() -> Probe:
             checkout,
             [sys.executable, str(checkout), "--json"],
             f"in the tree named by {said_by}, at {checkout}",
+            f"tree named by {said_by}",
         )
 
     packaged, where = _packaged_probe(entry)
     if packaged is not None:
         # As a program. It is a wrapper script with its own interpreter, and
         # feeding it to this hook's Python would fail on its first line.
-        return Probe(packaged, [str(packaged), "--json"], where)
+        return Probe(packaged, [str(packaged), "--json"], where, TIER_PACKAGED)
 
     # Nobody named a tree — `_named_tree` returned None above — so this is the
     # default and nothing else. Routing it through a helper that re-asked the
@@ -371,11 +396,26 @@ def _probe_invocation() -> Probe:
         checkout,
         [sys.executable, str(checkout), "--json"],
         f"{where}; then in the default checkout at {checkout}",
+        TIER_GUESS,
     )
 
 
-def _announce(summary: str, headline: str) -> None:
-    message = f"{headline}\n  - {summary}"
+def _provenance(probe: Probe, *, measured: bool) -> str:
+    """The one line that says what spoke, and how far to trust it.
+
+    ``measured`` distinguishes "this verdict came out of that file" from "that
+    file is the one I went looking for" — the second is all a MISSING, timed
+    out or unrunnable probe can honestly claim.
+    """
+    verb = "measured by" if measured else "probe selected"
+    line = f"{verb}: {probe.path} ({probe.tier})"
+    if probe.tier == TIER_GUESS:
+        line += f" — {GUESS_CAVEAT}"
+    return line
+
+
+def _announce(summary: str, headline: str, provenance: str) -> None:
+    message = f"{headline}\n  - {summary}\n  - {provenance}"
     json.dump(
         {
             "systemMessage": message,
@@ -385,8 +425,16 @@ def _announce(summary: str, headline: str) -> None:
             # follows from knowing it is dead.
             "hookSpecificOutput": {
                 "hookEventName": "SessionStart",
+                # The provenance reaches the AGENT as well as the operator.
+                # The agent is the party deciding whether to trust an empty
+                # recall result, and "this verdict may be about the wrong tree"
+                # changes that decision.
                 "additionalContext": (
-                    "Aggregator recall health at session start: " + summary
+                    "Aggregator recall health at session start: "
+                    + summary
+                    + " ["
+                    + provenance
+                    + "]"
                 ),
             },
         },
@@ -415,6 +463,7 @@ def main() -> int:
             "aggregator-mcp binary, and as a source file in the aggregator "
             f"repo at {PROBE_RELPATH}.",
             "AGGREGATOR RECALL: health UNVERIFIED.",
+            _provenance(probe, measured=False),
         )
         return 0
 
@@ -433,6 +482,7 @@ def main() -> int:
             "session. It normally answers in under a second; a hang points at "
             "the cache file itself.",
             "AGGREGATOR RECALL: health UNVERIFIED.",
+            _provenance(probe, measured=False),
         )
         return 0
     except (OSError, ValueError) as exc:
@@ -441,6 +491,7 @@ def main() -> int:
             f"({type(exc).__name__}: {exc}), so recall health is unverified "
             "this session.",
             "AGGREGATOR RECALL: health UNVERIFIED.",
+            _provenance(probe, measured=False),
         )
         return 0
 
@@ -462,6 +513,7 @@ def main() -> int:
             f"{proc.stdout[:120]!r}; stderr starts {proc.stderr[:200]!r}), so "
             "recall health is unverified this session.",
             "AGGREGATOR RECALL: health UNVERIFIED.",
+            _provenance(probe, measured=False),
         )
         return 0
 
@@ -479,7 +531,7 @@ def main() -> int:
             "AGGREGATOR RECALL is working now but will break on the next "
             "ingest tick."
         )
-    _announce(summary, headline)
+    _announce(summary, headline, _provenance(probe, measured=True))
     return 0
 
 
