@@ -1352,6 +1352,57 @@ def test_a_crash_inside_the_announcement_still_produces_one_announcement(
     assert doc["hookSpecificOutput"]["hookEventName"] == "SessionStart"
 
 
+class _FlushFailsOnce:
+    """A stdout that takes the bytes and then fails to flush them, once.
+
+    The shape of a full pipe or a disk giving out mid-write: the payload has
+    already reached the stream, and only the flush says so.
+    """
+
+    def __init__(self) -> None:
+        self.chunks: list[str] = []
+        self.flushes = 0
+
+    def write(self, text: str) -> int:
+        self.chunks.append(text)
+        return len(text)
+
+    def flush(self) -> None:
+        self.flushes += 1
+        if self.flushes == 1:
+            raise OSError("stdout flush failed")
+
+
+def test_a_failing_flush_does_not_append_a_second_announcement(
+    tmp_path, monkeypatch
+):
+    """L6. ``_ANNOUNCED`` was set AFTER the write and the flush.
+
+    So a write that landed and a flush that then raised left the flag False,
+    the exception reached main's handler, and ``_last_resort`` — whose entire
+    job is to speak when nothing else did — appended a SECOND JSON object to a
+    stdout that already carried one. Two objects parse as neither, and the
+    harness drops an unparseable payload in silence: the announcement is lost
+    precisely because the hook made two of them.
+
+    The flag has to mean "bytes may already be on stdout", which is true from
+    the moment the write is attempted.
+    """
+    probe = _write_probe(tmp_path, _payload("dead", "down", "cache 5, reader 6"), 20)
+    monkeypatch.setenv("AGGREGATOR_SCHEMA_PROBE", str(probe))
+    hook = _load_hook()
+    fake = _FlushFailsOnce()
+    monkeypatch.setattr(sys, "stdout", fake)
+
+    assert hook.main() == 0
+
+    out = "".join(fake.chunks)
+    assert out.count('"systemMessage"') == 1, (
+        f"the failed flush produced a second announcement: {out!r}"
+    )
+    assert "cache 5, reader 6" in json.loads(out)["systemMessage"]
+
+
 def test_a_closed_stdin_does_not_turn_the_whole_check_into_silence(
     tmp_path, monkeypatch, capsys
 ):

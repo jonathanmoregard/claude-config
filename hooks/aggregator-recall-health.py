@@ -648,9 +648,18 @@ def _announce(summary: str, headline: str, provenance: str) -> None:
     # Serialised in full BEFORE anything is written: a half-written object on
     # stdout is worse than none, and `json.dump` streams.
     text = json.dumps(payload)
+    # Set BEFORE the write, because the flag's real meaning is "bytes may
+    # already be on stdout" — and that becomes true the instant the write is
+    # attempted, not when the flush returns. Set afterwards, a landed write
+    # followed by a failing flush (a full pipe, a disk giving out) left it
+    # False, so `_last_resort` appended a SECOND object to a stdout that
+    # already carried one. Two objects parse as neither and the harness drops
+    # an unparseable payload in silence — the announcement lost precisely
+    # because the hook made two of them. A truncated object is at worst as bad
+    # as that, and this way it stays at one.
+    _ANNOUNCED = True
     sys.stdout.write(text)
     sys.stdout.flush()
-    _ANNOUNCED = True
 
 
 def _last_resort(exc: BaseException, probe: Probe | None) -> None:
