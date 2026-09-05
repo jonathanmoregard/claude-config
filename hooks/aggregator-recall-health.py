@@ -362,6 +362,7 @@ def _packaged_probe(entry: dict, config_problem: str | None = None) -> tuple[Pat
 
     tried: list[Path] = []
     rejected: list[Path] = []
+    irregular: list[Path] = []
     for d in dirs:
         candidate = d / PACKAGED_PROBE_NAME
         tried.append(candidate)
@@ -386,6 +387,10 @@ def _packaged_probe(entry: dict, config_problem: str | None = None) -> tuple[Pat
             )
             continue
         if not stat.S_ISREG(mode):
+            # A directory or socket standing exactly where the console script
+            # belongs. Skipping it in silence left MISSING pointing away from
+            # the one thing in the way.
+            irregular.append(candidate)
             continue
         if os.access(candidate, os.X_OK):
             return candidate, f"beside the reader binary, at {candidate}"
@@ -404,6 +409,11 @@ def _packaged_probe(entry: dict, config_problem: str | None = None) -> tuple[Pat
         notes.append(
             " and ".join(str(r) for r in rejected)
             + " exists but is not executable, so it was rejected"
+        )
+    if irregular:
+        notes.append(
+            " and ".join(str(i) for i in irregular)
+            + " exists but is not a regular file, so it was rejected"
         )
     notes.extend(unreadable)
     if notes:

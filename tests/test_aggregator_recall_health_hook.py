@@ -1251,3 +1251,23 @@ def test_a_tilde_prefixed_tree_is_expanded_and_accepted(tmp_path):
     assert "cache 5, reader 6" in message
     assert str(home / "trees" / "reader") in message
     assert "GUESS" not in message
+
+
+def test_a_candidate_that_is_not_a_regular_file_is_named(tmp_path):
+    """A DIRECTORY called ``aggregator-schema-probe`` is a broken install.
+
+    It was skipped in silence, so MISSING never mentioned the thing standing
+    exactly where the console script belongs — the same misdirection the
+    non-executable case already gets named for.
+    """
+    mcp = _make_exec(tmp_path / "bin" / "aggregator-mcp")
+    (tmp_path / "bin" / "aggregator-schema-probe").mkdir()
+    home = _fake_home(tmp_path, {"command": str(mcp), "args": []})
+
+    proc = _run_hook(home, tmp_path / "empty-bin")
+
+    assert proc.returncode == 0, proc.stderr
+    message = json.loads(proc.stdout)["systemMessage"]
+    assert "MISSING" in message
+    assert str(tmp_path / "bin" / "aggregator-schema-probe") in message
+    assert "not a regular file" in message
