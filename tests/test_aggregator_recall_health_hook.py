@@ -45,9 +45,13 @@ HOOK = Path(REPO_ROOT) / "hooks" / "aggregator-recall-health.py"
 # "run this file, read its JSON", and stubbing is the only way to exercise the
 # branches where that file is missing, hangs, or answers rubbish — which are
 # three of the hook's five paths and the three that used to be untested.
+# `%r` on the JSON TEXT, not `%s` on the object. Interpolating the object into
+# Python source made `null`, `true` and `false` NameErrors, so a stub built to
+# emit a null field crashed instead — and the test that wanted a null-summary
+# verdict was quietly exercising the empty-stdout path.
 PROBE_STUB = """\
-import json, sys
-print(json.dumps(%s))
+import sys
+sys.stdout.write(%r)
 sys.exit(%d)
 """
 
@@ -1271,3 +1275,78 @@ def test_a_candidate_that_is_not_a_regular_file_is_named(tmp_path):
     assert "MISSING" in message
     assert str(tmp_path / "bin" / "aggregator-schema-probe") in message
     assert "not a regular file" in message
+
+
+# ---------------------------------------------------------------------------
+# H3: the hook's own crashes must not become its silence
+# ---------------------------------------------------------------------------
+# ``except BaseException: sys.exit(0)`` at the bottom of this file keeps a
+# broken health check from breaking session startup, which is right. But it
+# also converts every internal fault into the one output this hook may never
+# produce: nothing. A verdict whose ``summary`` is null or a number passed the
+# KeyError guard and then blew up building the announcement, and the session
+# was told exactly as much as if recall had been checked and found healthy.
+
+
+@pytest.mark.parametrize(
+    "summary", [None, 7, ["a"], {"b": 1}],
+    ids=["null", "int", "list", "object"],
+)
+def test_a_verdict_whose_summary_is_not_text_is_announced_not_swallowed(
+    tmp_path, summary
+):
+    """Well-formed JSON, present keys, wrong types — and the guard let it past.
+
+    ``verdict["summary"]`` only proves the key exists. Everything downstream
+    concatenates it as text, so a null or a number reached string arithmetic
+    and raised, and the raise reached the fail-open handler.
+    """
+    proc = _run(_write_probe(
+        tmp_path, {"state": "dead", "severity": "down", "summary": summary}, 20
+    ))
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout, "the hook went silent on a verdict it could not use"
+    message = json.loads(proc.stdout)["systemMessage"]
+    assert "UNVERIFIED" in message and "cannot read" in message
+
+
+def test_a_state_that_is_not_text_is_announced_not_swallowed(tmp_path):
+    """The same hole on the other key. ``state`` is compared, not concatenated,
+    so it fails later and less visibly — which is worse, not better."""
+    proc = _run(_write_probe(
+        tmp_path, {"state": 5, "severity": "down", "summary": "cache 5"}, 20
+    ))
+
+    assert proc.stdout, "the hook went silent on a verdict it could not use"
+    assert "cannot read" in json.loads(proc.stdout)["systemMessage"]
+
+
+def test_a_crash_inside_the_announcement_still_produces_one_announcement(
+    tmp_path, monkeypatch, capsys
+):
+    """The fail-open floor has to speak on its way down.
+
+    An exception raised after the probe was chosen used to exit 0 with an empty
+    stdout — indistinguishable from a healthy machine. It must instead say that
+    the check itself failed, name the exception class and the probe it had
+    selected, and emit exactly ONE well-formed payload: a second appended
+    object would make the whole thing unparseable to the harness, which drops
+    it silently and puts us back where we started.
+    """
+    probe = _write_probe(tmp_path, _payload("dead", "down"), 20)
+    monkeypatch.setenv("AGGREGATOR_SCHEMA_PROBE", str(probe))
+    hook = _load_hook()
+
+    def _boom(*a, **k):
+        raise RuntimeError("injected")
+
+    monkeypatch.setattr(hook, "_provenance", _boom)
+    assert hook.main() == 0
+
+    out = capsys.readouterr().out
+    doc = json.loads(out)
+    assert "UNVERIFIED" in doc["systemMessage"]
+    assert "RuntimeError" in doc["systemMessage"]
+    assert str(probe) in doc["systemMessage"]
+    assert doc["hookSpecificOutput"]["hookEventName"] == "SessionStart"

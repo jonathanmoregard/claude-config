@@ -526,10 +526,19 @@ def _provenance(probe: Probe, *, measured: bool) -> str:
     return line
 
 
+# Set once an announcement has actually reached stdout, so the fail-open floor
+# can tell "nothing was said" from "something was said and then this broke".
+# Two JSON objects on stdout parse as neither, and the harness drops an
+# unparseable payload in silence — the exact outcome being defended against.
+_ANNOUNCED = False
+
+
 def _announce(summary: str, headline: str, provenance: str) -> None:
+    global _ANNOUNCED
+    if _ANNOUNCED:
+        return
     message = f"{headline}\n  - {summary}\n  - {provenance}"
-    json.dump(
-        {
+    payload = {
             "systemMessage": message,
             # Factual, not imperative. Prompt-injection defenses can surface
             # imperative hook text to the user instead of acting on it, and
@@ -549,9 +558,47 @@ def _announce(summary: str, headline: str, provenance: str) -> None:
                     + "]"
                 ),
             },
-        },
-        sys.stdout,
+    }
+    # Serialised in full BEFORE anything is written: a half-written object on
+    # stdout is worse than none, and `json.dump` streams.
+    text = json.dumps(payload)
+    sys.stdout.write(text)
+    sys.stdout.flush()
+    _ANNOUNCED = True
+
+
+def _last_resort(exc: BaseException, probe: Probe | None) -> None:
+    """Speak on the way down. The fail-open floor may not be a silent one.
+
+    Every path in this hook exits 0 — a broken health check must not break
+    session startup — but an internal fault that exits 0 with an empty stdout
+    is byte-for-byte the healthy machine. Built from literals, the exception's
+    class name and the selected probe, so it has nothing left to fail on.
+    """
+    if _ANNOUNCED:
+        return
+    where = (
+        f"{probe.path} ({probe.tier})" if probe is not None
+        else "no probe had been selected yet"
     )
+    payload = {
+        "systemMessage": (
+            "AGGREGATOR RECALL: health UNVERIFIED.\n"
+            f"  - this check itself failed with {type(exc).__name__}, so "
+            "recall health is unverified this session. An empty recall result "
+            "is not evidence that nothing was found.\n"
+            f"  - probe selected: {where}"
+        ),
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": (
+                "Aggregator recall health at session start: the check itself "
+                f"failed with {type(exc).__name__}, so health is unverified. "
+                f"Probe selected: {where}."
+            ),
+        },
+    }
+    sys.stdout.write(json.dumps(payload))
     sys.stdout.flush()
 
 
@@ -564,7 +611,18 @@ def main() -> int:
     except (OSError, ValueError):
         pass
 
-    probe = _probe_invocation()
+    probe = None
+    try:
+        probe = _probe_invocation()
+        return _check(probe)
+    except BaseException as exc:
+        # Announced, not swallowed. The bare floor in __main__ stays underneath
+        # as the last-ditch guarantee that startup is never broken.
+        _last_resort(exc, probe)
+        return 0
+
+
+def _check(probe: Probe) -> int:
     # os.stat, not Path.is_file(), for the reason spelled out in
     # `_packaged_probe`: pathlib maps EVERY OSError to False, so an unreadable
     # path arrives indistinguishable from an absent one. Announcing MISSING for
@@ -641,6 +699,12 @@ def main() -> int:
         verdict = json.loads(proc.stdout)
         state = verdict["state"]
         summary = verdict["summary"]
+        if not isinstance(state, str) or not isinstance(summary, str):
+            # The key existing proves nothing about its type. Everything
+            # downstream concatenates `summary` as text and compares `state`
+            # as text, so a null or a number reached string arithmetic and
+            # raised — into the fail-open floor, i.e. into silence.
+            raise TypeError("state and summary must both be strings")
     except (ValueError, KeyError, TypeError):
         _announce(
             # stderr as well as stdout. A packaged probe whose Nix wrapper
