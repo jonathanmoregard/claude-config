@@ -82,18 +82,65 @@ of truth: `docs/brand/klaffat-design-spec.md` §4.12 "Locked variants
   title, not the chrome. When a `--danger` dialog has no `c-dialog__title`
   (e.g. inline delete-account exception), communicate danger via the
   destructive button, not chrome.
-- **c-radiogroup = gallery-v4 Variant A** — segmented-pill row. Structure:
+- **c-radiogroup = gallery-v4 Variant A** — ONE pill treatment, TWO flow
+  directions. Structure:
   `fieldset > legend > (hint) > .c-radiogroup__segmented > label*`. Each
   label = a pill with a hidden `<input type="radio">`, a presentational
   12px `.c-radiogroup__dot` circle, and a `.c-radiogroup__label` span with
-  mono uppercase text. Segmented rail = 1.5px `--rail` border around the
-  row + a 1.5px `--rail` left border on each option (except the first).
+  mono uppercase text.
+
+  **THE RULE (founder, standing, 2026-09-05 — told 4+ times): the circle is
+  ALWAYS on the LEFT of its label, on ONE line, vertically centred on the
+  label's FIRST line. Never above it, never a column for the control
+  itself. A stacked radio is a defect, not a style choice.** It holds in
+  both directions and in every variant.
+
+  Which direction is chosen by a CONTAINER QUERY on the fieldset
+  (`container-type: inline-size`), not a media query and not JS — the
+  deciding width is the width available to THIS group, so a group in a
+  narrow panel stacks even on a wide screen:
+  - `>= 38rem` → pills flow in a ROW: the segmented rail, 1.5px `--rail`
+    border around it plus a 1.5px `--rail` LEFT border on each option
+    (except the first).
+  - below that → the SAME pills stacked in a COLUMN, full width, with the
+    hairline on the TOP edge instead. Typography, borders, colours and the
+    circle are identical; only the flow direction and the border edge
+    change. (An earlier attempt at a separate GOV.UK-style plain list for
+    the narrow case was rejected: "it's subtly different atm, in ways that
+    make it worse.")
+
   Zero radius. Selected pill inverts (`--rail` bg, `--paper` text) and the
   circle inverts (`--paper` ring around a solid `--paper` dot via
-  `radial-gradient`). Focus ring matches c-btn v2C (inset paper+rail).
+  `radial-gradient`). Focus ring matches c-btn v2C (inset paper+rail) and
+  covers the WHOLE pill — circle and label together, never the circle
+  alone. Every pill is >= 44px tall: the whole pill is the hit area, so the
+  PILL is the WCAG 2.2 SC 2.5.8 target, not the 12px circle.
+
+  **Nothing ever wraps.** The rail is `flex-wrap: nowrap` and pill labels
+  are `white-space: nowrap`, so a group whose labels do not fit would
+  OVERFLOW rather than wrap. The 38rem threshold is therefore chosen
+  against the widest TRANSLATED rail of any row-eligible group (Swedish
+  runs ~17% wider than English — measure before adding one). A group that
+  cannot fit takes `rg_layout = "block"`, which pins the stacked column at
+  every width; that is also the right call for long, consequential choices
+  saved on submit, like create-poll's "Times that can't work".
+  `--with-description` never flows into a row: the description sits under
+  the label inside the label column, and the circle still centres on the
+  label's first line.
+
+  **The oracle enforces all of it.**
+  `tests/e2e/tests/component-geometry-oracle.spec.ts` (`assertRadiogroup`)
+  measures every option at both container widths and hard-fails on: circle
+  and label not sharing a row; circle not before the label by the token
+  gap; circle centre off the label's first-line centre by >1px; a row that
+  wrapped or overflowed its group; a stacked pill under 44px or overflowed
+  by its label. Change the layout and you must satisfy that spec — do not
+  relax it.
+
   Real radio input stays a11y-focusable via `opacity: 0` (NEVER
-  `display: none`). Test cost: Playwright's `.check()` on a hidden radio
-  fails the actionability visibility gate — target the enclosing
+  `display: none`) and is absolutely positioned across the pill so the
+  whole pill is clickable. Test cost: Playwright's `.check()` on a hidden
+  radio fails the actionability visibility gate — target the enclosing
   `label.c-radiogroup__option` instead.
 - **c-field = gallery-v8 D1×W1** — 1px solid `--ink` border (warm
   off-black `#1C1B18`, NOT pure `#000`), zero radius, `--paper` bg
@@ -191,7 +238,7 @@ pattern.
 
 | Partial | Use when | Anti-slop rules |
 |---|---|---|
-| `radio_group.html` | A fixed-choice set of ≤3 options (design spec §4.11). Two options for a boolean-ish either/or, three for a small enum. | ≥4 fixed options → use a `<select>` (dropdown) instead. Never a segmented control. |
+| `radio_group.html` | A fixed-choice set of ≤3 options (design spec §4.11). Two options for a boolean-ish either/or, three for a small enum. Renders as a segmented pill ROW when the group has ≥38rem, and as the same pills STACKED below that — circle left of the label on one line in both. | ≥4 fixed options → use a `<select>` (dropdown) instead. Never hand-roll a segmented control: this component IS one when it has room. Long labels or a consequential saved-on-submit choice → `rg_layout = "block"` (needs a `radio-block-ok:` marker). |
 | `button.html` | Any tap/click affordance that submits, opens a dialog, or triggers a client action. Variants: primary / secondary / destructive / ghost. | Never `<div role="button">`. Never a bare `<a>` styled to look like a button. Always `type="button"` unless inside a form where you actually want submit. |
 | `dialog.html` | JS-only confirm/cancel modal with no server action (uses `<form method="dialog">`). | Never a JS modal library — native `<dialog>` gives us focus containment + ESC + `aria-modal` free. |
 | `dialog_form.html` | Destructive server-POST modal (delete a resource, revoke a token). Wraps `<form method="post" action="…">` inside `<dialog class="c-dialog c-dialog--danger">`. Params include `dlg_action`, `dlg_method`, `dlg_confirm_variant` (usually `"destructive"`), and `dlg_extra` for hidden inputs / phrase-confirm markup. | `dlg_extra` is rendered `|safe` — it MUST be a compile-time string literal (enforced by the `safe_marked_partial_vars_bind_string_literals_only` test in `tests/template_lint.rs`). If the extra markup needs LOCALIZED text (`loc.t(…)` calls), `dlg_extra` won't work — see the account-settings exception below. |
