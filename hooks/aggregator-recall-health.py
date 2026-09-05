@@ -192,6 +192,16 @@ class Probe(NamedTuple):
     # today, that ~/.claude.json could not be read, which demotes the search
     # to its guess without anything else saying so.
     note: str | None = None
+    # What the search could not carry out on its way to a probe it DID find.
+    # Kept apart from ``note`` deliberately: ``note`` records a fault in how
+    # the tier was chosen and rightly costs the hook its silence, while this
+    # records only that the search got narrower before it succeeded. The probe
+    # it settled on is still a real sibling of the reader binary, so a healthy
+    # verdict here is a genuine measurement and stays silent — but every
+    # announcement that does get made says the search was incomplete, because
+    # a search that quietly narrows is the shape of failure this hook exists
+    # to make loud.
+    search_note: str | None = None
 
 
 def _server_entry() -> tuple[dict, str | None]:
@@ -350,8 +360,10 @@ def _reader_command(raw: str) -> tuple[Path | None, str | None]:
     return command, None
 
 
-def _packaged_probe(entry: dict, config_problem: str | None = None) -> tuple[Path | None, str]:
-    """The console script beside the reader binary, and where the search went.
+def _packaged_probe(
+    entry: dict, config_problem: str | None = None
+) -> tuple[Path | None, str, str | None]:
+    """The console script beside the reader binary, where it looked, what it could not.
 
     UNRESOLVED DIRECTORY FIRST. ``/etc/profiles/per-user/<u>/bin/aggregator-mcp``
     is a symlink into the Nix store, and the profile ``bin/`` — the directory
@@ -365,6 +377,14 @@ def _packaged_probe(entry: dict, config_problem: str | None = None) -> tuple[Pat
     function knows WHY it came back empty, and the three reasons need three
     different repairs: no ``command`` in the config, a ``command`` that did not
     resolve, or a console script that is present but not executable.
+
+    The third element is the same honesty applied to the search that
+    SUCCEEDED. A candidate it could not even stat used to be recorded and then
+    dropped the moment another directory answered, so an announcement built on
+    a search that had silently got narrower said nothing about it — with the
+    file standing in the way sitting in the profile ``bin/`` the console script
+    is supposed to come from. It rides on every announcement the chosen probe
+    goes on to produce.
     """
     raw = entry.get("command")
     raw = raw.strip() if isinstance(raw, str) else ""
@@ -375,12 +395,12 @@ def _packaged_probe(entry: dict, config_problem: str | None = None) -> tuple[Pat
             return None, (
                 "nowhere beside a reader binary — ~/.claude.json could not be "
                 "read, so no reader binary was named"
-            )
+            ), None
         return None, (
             "nowhere beside a reader binary — ~/.claude.json's "
             "mcpServers.aggregator names no command, so there was nothing to "
             f"look for {PACKAGED_PROBE_NAME} beside"
-        )
+        ), None
 
     command, problem = _reader_command(raw)
     if command is None:
@@ -390,13 +410,13 @@ def _packaged_probe(entry: dict, config_problem: str | None = None) -> tuple[Pat
             return None, (
                 f"nowhere beside a reader binary — mcpServers.aggregator's "
                 f"command {raw!r} {problem}, so it was ignored"
-            )
+            ), None
         # Says which name failed. "names no command" would send the reader to
         # inspect an entry that is present and populated.
         return None, (
             f"nowhere beside a reader binary — mcpServers.aggregator's command "
             f"{raw!r} did not resolve on PATH"
-        )
+        ), None
 
     # Everything this search could not carry out, in the operator's words
     # rather than in silence. See the OSError arm of the stat below.
@@ -452,7 +472,13 @@ def _packaged_probe(entry: dict, config_problem: str | None = None) -> tuple[Pat
             irregular.append(candidate)
             continue
         if os.access(candidate, os.X_OK):
-            return candidate, f"beside the reader binary, at {candidate}"
+            # Found — and whatever this search could NOT look at travels with
+            # it, instead of being dropped because a later directory answered.
+            return (
+                candidate,
+                f"beside the reader binary, at {candidate}",
+                ("; ".join(unreadable) or None),
+            )
         # Present and unusable. Named, because "MISSING" about a file the
         # operator can see on disk costs an afternoon, and the fix is one chmod.
         rejected.append(candidate)
@@ -477,7 +503,7 @@ def _packaged_probe(entry: dict, config_problem: str | None = None) -> tuple[Pat
     notes.extend(unreadable)
     if notes:
         where += " — " + "; ".join(notes)
-    return None, where
+    return None, where, None
 
 
 def _probe_invocation() -> Probe:
@@ -572,12 +598,13 @@ def _probe_invocation() -> Probe:
             note,
         )
 
-    packaged, where = _packaged_probe(entry, config_problem)
+    packaged, where, search_note = _packaged_probe(entry, config_problem)
     if packaged is not None:
         # As a program. It is a wrapper script with its own interpreter, and
         # feeding it to this hook's Python would fail on its first line.
         return Probe(
             packaged, [str(packaged), "--json"], where, TIER_PACKAGED, note,
+            search_note,
         )
 
     # Nobody named a tree — `_named_tree` returned None above — so this is the
@@ -607,6 +634,8 @@ def _provenance(probe: Probe, *, measured: bool) -> str:
         clauses.append(GUESS_CAVEAT)
     if probe.note:
         clauses.append(probe.note)
+    if probe.search_note:
+        clauses.append(probe.search_note)
     if clauses:
         line += " — " + "; ".join(clauses)
     return line

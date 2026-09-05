@@ -1581,6 +1581,86 @@ def test_a_bare_command_found_on_a_relative_path_entry_is_refused(
     assert "aggregator-mcp" in probe.looked
 
 
+def test_a_narrowed_sibling_search_is_named_even_when_it_then_succeeds(tmp_path):
+    """L7. The unreadable-candidate notes were dropped on a hit in dir two.
+
+    The profile ``bin/`` is searched first because that is where the console
+    script installs; the store directory the symlink points at is searched
+    second. When the first candidate could not be stat'd at all — a symlink
+    loop here, EACCES on the real host — and the second one answered, the hook
+    returned the probe and threw the reason away. Every announcement it then
+    made was built on a search that had quietly got narrower, which is the
+    exact shape of failure this whole hook exists to make loud: the operator
+    has a broken file sitting in the directory the console script is supposed
+    to come from, and nothing said so.
+
+    The verdict still comes from a real sibling of the reader binary, so this
+    is a caveat carried ON announcements, not a reason to manufacture one.
+    """
+    store = tmp_path / "store" / "bin"
+    profile = tmp_path / "profile" / "bin"
+    target = _make_exec(store / "aggregator-mcp")
+    profile.mkdir(parents=True)
+    link = profile / "aggregator-mcp"
+    link.symlink_to(target)
+
+    # A symlink loop, so os.stat raises an OSError that is NOT
+    # FileNotFoundError — "I could not look", the case the search must not
+    # swallow. A dangling link would be the ordinary not-found instead.
+    blocked = profile / "aggregator-schema-probe"
+    decoy = profile / "aggregator-schema-probe.loop"
+    blocked.symlink_to(decoy)
+    decoy.symlink_to(blocked)
+    _plant_sh_probe(store / "aggregator-schema-probe")
+
+    home = _fake_home(tmp_path, {"command": str(link), "args": []})
+
+    proc = _run_hook(home, tmp_path / "empty-bin")
+
+    assert proc.returncode == 0, proc.stderr
+    message = json.loads(proc.stdout)["systemMessage"]
+    assert "cache 5, reader 6" in message, "the store sibling was not used"
+    assert str(blocked) in message, (
+        "the candidate it could not look at went unmentioned once another "
+        "directory answered"
+    )
+    assert "could not be resolved" in message
+
+
+def test_a_narrowed_search_that_measured_the_real_sibling_still_stays_silent(
+    tmp_path,
+):
+    """The other half of L7, pinned so the caveat cannot become a false alarm.
+
+    The note says the SEARCH was incomplete, not that the measurement was. The
+    probe it found is a real sibling of the reader binary in the directory the
+    symlink points at, so a ``fine`` from it is a genuine verified pass and the
+    budget stays intact. Routing this through ``note`` instead would spend the
+    silence AND print "it did not measure the reader Claude Code runs" about a
+    run that did exactly that.
+    """
+    store = tmp_path / "store" / "bin"
+    profile = tmp_path / "profile" / "bin"
+    target = _make_exec(store / "aggregator-mcp")
+    profile.mkdir(parents=True)
+    link = profile / "aggregator-mcp"
+    link.symlink_to(target)
+    blocked = profile / "aggregator-schema-probe"
+    decoy = profile / "aggregator-schema-probe.loop"
+    blocked.symlink_to(decoy)
+    decoy.symlink_to(blocked)
+    _plant_sh_probe(store / "aggregator-schema-probe", FINE_VERDICT)
+
+    home = _fake_home(tmp_path, {"command": str(link), "args": []})
+
+    proc = _run_hook(home, tmp_path / "empty-bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "", (
+        f"an incomplete search turned a verified pass into noise: {proc.stdout!r}"
+    )
+
+
 def test_a_command_naming_an_unknown_user_falls_through_instead_of_crashing(
     tmp_path,
 ):
