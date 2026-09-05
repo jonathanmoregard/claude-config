@@ -171,6 +171,8 @@
       "Edit(//**/_quarantine)",
       "Grep(//**/_quarantine/**)",
       "Grep(//**/_quarantine)",
+      "mcp__futuresearch",
+      "mcp__futuresearch__*",
       "mcp__futuresearch__futuresearch_results",
       "mcp__futuresearch__futuresearch_progress",
       "mcp__futuresearch__futuresearch_status",
