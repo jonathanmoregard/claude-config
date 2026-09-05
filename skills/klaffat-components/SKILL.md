@@ -125,15 +125,21 @@ of truth: `docs/brand/klaffat-design-spec.md` §4.12 "Locked variants
     `align-self: center`. NO `align-items: flex-start`, NO `margin-top` on
     the dot. Every offset-based version of this drifted the moment a
     font-size, a line-height or the dot size moved on its own.
-  - the label's box must equal its INK, or centring the box still leaves
-    the glyphs high: `line-height: 1` plus `text-box-trim: trim-both;
-    text-box-edge: cap alphabetic`. Pill labels are mono UPPERCASE with no
-    descenders, so cap-height-to-baseline IS the visible glyph; centring
-    the full line box reserves descender space nothing occupies. The
-    `line-height: 1` fallback alone is already centred to within 0.5px, so
-    the trim is a pure progressive enhancement.
-  Measured result, every pill and every state: 16.0px of air above and
-  16.0px below; circle centre and label text centre identical to 0.00px.
+  - `line-height: 1` on the label, so its box is its font-size and sits
+    centred on the font box. Do NOT add `text-box-trim` here. Trimming the
+    box to the ink is the textbook answer for centring uppercase and it was
+    tried; measured against IBM Plex Mono SemiBold's real metrics (ascent
+    1025, descent 275, cap height 703, round overshoot 16, per 1000 em) it
+    buys 31/1000 em — 0.375px at the 12px label — and in the harmless
+    direction, the ink sitting slightly LOW rather than high. It also
+    changes the box Chromium's print path hands to the PDF, where the Plex
+    faces embed as Type 3 glyphs; a viewer clipped label bottoms after it
+    landed. Under half a pixel is not worth an unverifiable PDF risk. If
+    sub-pixel centring ever outweighs that, the derived correction is
+    `padding-block-start: 0.0625em` (centring halves it) — computed once
+    from those metrics, never a per-instance nudge.
+  Measured result, every pill and every state: 14.31px of air above and
+  14.69px below (Δ 0.38px); circle centre vs label text centre 0.19px.
   If you change any of this, measure the two numbers again — the oracle's
   `content-centerY` rule is what holds it.
 
