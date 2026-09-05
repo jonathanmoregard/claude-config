@@ -115,6 +115,17 @@ this procedure.
 - **Subagents hold the heavy context and die.** All reads/edits/test runs
   live in subagents. Report cap ~15 lines: status; files touched; gate
   result; decisions; next-step recommendation.
+- **Model tiering by task difficulty.** When dispatching a subagent, weigh
+  the task's difficulty and pass the Agent tool's `model` param
+  accordingly: the top-tier default (Fable-class, scarce monthly quota)
+  only for the hardest reasoning — adversarial review, subtle-defect
+  hunting, design-critical implementation; `model="claude-opus-5"`
+  (separate quota bucket) for routine implementation, mechanical fixes,
+  repro/validation runs, test truthing, exploration. Burning the scarce
+  bucket on routine work buys no quality and has killed a mid-run agent on
+  a spend limit (2026-09-04); when the default bucket 429s mid-mission,
+  re-dispatch the dead agent's brief on opus rather than waiting for the
+  window.
 - **progress.md after every subagent return.** Append what completed, gate
   state, decisions, next. Files — not the transcript — are the resumption
   source.
