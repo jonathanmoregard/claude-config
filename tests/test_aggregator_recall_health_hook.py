@@ -701,3 +701,47 @@ def test_a_probe_that_only_speaks_on_stderr_has_its_words_relayed(tmp_path):
 
     assert "cannot open shared object file" in doc["systemMessage"]
     assert "UNVERIFIED" in doc["systemMessage"]
+
+
+def test_a_bin_directory_it_cannot_read_is_named_with_the_reason(tmp_path):
+    """"I looked and it was not there" versus "I could not look" need one word.
+
+    An unreadable profile ``bin/`` and an empty one produce the same
+    not-found, and the repairs are opposite: chmod versus reinstall. The
+    operator gets a MISSING announcement either way, so the reason has to
+    travel with it or the announcement sends them to the wrong end of the
+    problem.
+
+    Note the fixture is a permission error, not a missing file: ``Path.is_file``
+    turns EVERY OSError into ``False``, and CPython 3.13 widened that swallow
+    to cover EACCES, which 3.12 still re-raised. A check whose diagnosis
+    depends on the interpreter's minor version is not a diagnosis, so the hook
+    stats the candidate itself.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root traverses a 0o000 directory, so nothing raises")
+
+    bindir = tmp_path / "bin"
+    mcp = _make_exec(bindir / "aggregator-mcp")
+    home = _fake_home(tmp_path, {"command": str(mcp), "args": []})
+    env = dict(os.environ)
+    env.pop("AGGREGATOR_SCHEMA_PROBE", None)
+    env.pop("AGGREGATOR_READER_DIR", None)
+    env["HOME"] = str(home)
+
+    bindir.chmod(0o000)
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(HOOK)], input="{}", capture_output=True,
+            text=True, env=env, timeout=30,
+        )
+    finally:
+        bindir.chmod(0o755)
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout, "the hook went silent on a directory it could not read"
+    message = json.loads(proc.stdout)["systemMessage"]
+    assert "UNVERIFIED" in message and "MISSING" in message
+    assert str(bindir / "aggregator-schema-probe") in message
+    assert "could not be resolved" in message
+    assert "PermissionError" in message

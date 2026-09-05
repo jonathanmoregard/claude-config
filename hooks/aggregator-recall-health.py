@@ -104,6 +104,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -261,19 +262,37 @@ def _packaged_probe(entry: dict) -> tuple[Path | None, str]:
 
     tried: list[Path] = []
     rejected: list[Path] = []
+    unreadable: list[str] = []
     for d in dirs:
         candidate = d / PACKAGED_PROBE_NAME
         tried.append(candidate)
+        # os.stat, not Path.is_file(). pathlib turns EVERY OSError into False,
+        # so an unreadable directory arrives here indistinguishable from an
+        # empty one — and which of the two it is decides whether the operator
+        # runs chmod or reinstalls. (CPython 3.13 widened that swallow to cover
+        # EACCES, which 3.12 re-raised. A diagnosis that changes with the
+        # interpreter's minor version is not a diagnosis.)
         try:
-            if candidate.is_file():
-                if os.access(candidate, os.X_OK):
-                    return candidate, f"beside the reader binary, at {candidate}"
-                # Present and unusable. Named, because "MISSING" about a file
-                # the operator can see on disk costs an afternoon, and the fix
-                # is one chmod.
-                rejected.append(candidate)
-        except OSError:
-            pass
+            mode = os.stat(candidate).st_mode
+        except FileNotFoundError:
+            # The ordinary case: no console script installed here. Already
+            # reported by naming the directory in `tried`.
+            continue
+        except OSError as exc:
+            # Not swallowed. "I looked and it was not there" and "I could not
+            # look" are different facts, and only one of them is true.
+            unreadable.append(
+                f"{candidate} could not be resolved "
+                f"({type(exc).__name__}: {exc})"
+            )
+            continue
+        if not stat.S_ISREG(mode):
+            continue
+        if os.access(candidate, os.X_OK):
+            return candidate, f"beside the reader binary, at {candidate}"
+        # Present and unusable. Named, because "MISSING" about a file the
+        # operator can see on disk costs an afternoon, and the fix is one chmod.
+        rejected.append(candidate)
 
     where = (
         "beside the reader binary named by ~/.claude.json's "
@@ -281,11 +300,15 @@ def _packaged_probe(entry: dict) -> tuple[Path | None, str]:
         + " and ".join(str(t) for t in tried)
         + ")"
     )
+    notes: list[str] = []
     if rejected:
-        where += (
-            " — " + " and ".join(str(r) for r in rejected) + " exists but is "
-            "not executable, so it was rejected"
+        notes.append(
+            " and ".join(str(r) for r in rejected)
+            + " exists but is not executable, so it was rejected"
         )
+    notes.extend(unreadable)
+    if notes:
+        where += " — " + "; ".join(notes)
     return None, where
 
 
