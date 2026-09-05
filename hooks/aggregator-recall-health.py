@@ -319,9 +319,17 @@ def _reader_command(raw: str) -> tuple[Path | None, str | None]:
     ``<cwd>/bin/aggregator-schema-probe`` out of whatever project the operator
     happened to open, and report that project's answer as the health of the
     reader Claude Code runs. Refused, with the reason, rather than returned:
-    the second element says which of the two failures happened, because "no
-    such program" and "a program whose location depends on where you were
-    standing" need different repairs.
+    the second element says which failure happened, because "no such program",
+    "a name that will not expand" and "a program whose location depends on
+    where you were standing" need three different repairs.
+
+    ``RuntimeError`` is in the except tuple because ``Path.expanduser()`` is
+    where it comes from — ``~nouser/aggregator-mcp`` raises it, exactly as the
+    override and the named trees already guard against. Missing here, one typo
+    in ``command`` did not merely skip this tier, it aborted the whole
+    selection into the fail-open floor, which then reported that no probe had
+    been selected at all. A bad ``command`` disqualifies the tier that reads
+    it, and nothing more.
     """
     try:
         if os.path.dirname(raw):
@@ -331,8 +339,8 @@ def _reader_command(raw: str) -> tuple[Path | None, str | None]:
             if not found:
                 return None, None
             command = Path(found)
-    except (OSError, ValueError, TypeError):
-        return None, None
+    except (RuntimeError, OSError, ValueError, TypeError) as exc:
+        return None, f"could not be expanded ({type(exc).__name__}: {exc})"
     if not command.is_absolute():
         return None, (
             f"resolved to {str(command)!r}, which is not an absolute path — it "
@@ -374,14 +382,14 @@ def _packaged_probe(entry: dict, config_problem: str | None = None) -> tuple[Pat
             f"look for {PACKAGED_PROBE_NAME} beside"
         )
 
-    command, relative = _reader_command(raw)
+    command, problem = _reader_command(raw)
     if command is None:
-        if relative:
+        if problem:
             # Skipped, not obeyed, and named — the operator believes that
             # command is aiming the check at an installed binary.
             return None, (
                 f"nowhere beside a reader binary — mcpServers.aggregator's "
-                f"command {raw!r} {relative}, so it was ignored"
+                f"command {raw!r} {problem}, so it was ignored"
             )
         # Says which name failed. "names no command" would send the reader to
         # inspect an entry that is present and populated.

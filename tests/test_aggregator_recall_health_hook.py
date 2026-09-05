@@ -1501,6 +1501,37 @@ def test_a_bare_command_found_on_a_relative_path_entry_is_refused(
     assert "aggregator-mcp" in probe.looked
 
 
+def test_a_command_naming_an_unknown_user_falls_through_instead_of_crashing(
+    tmp_path,
+):
+    """M7. ``Path.expanduser()`` RAISES on ``~nouser/...``, and it raises
+    ``RuntimeError`` — which the reader-command lookup did not catch, while its
+    two peers (the override and the named trees) both do.
+
+    A single typo in ``command`` therefore aborted probe selection outright:
+    the exception travelled past every tier into the fail-open floor, which
+    announces "the check itself failed" and "no probe had been selected yet".
+    The guess tier was never reached, so a machine with a perfectly good
+    checkout was told nothing about it. A bad ``command`` is a reason to skip
+    the tier that depends on it, not a reason to stop looking.
+    """
+    home = _fake_home(tmp_path, {"command": "~nouser/aggregator-mcp", "args": []})
+
+    proc = _run_hook(home, tmp_path / "empty-bin")
+
+    assert proc.returncode == 0, proc.stderr
+    message = json.loads(proc.stdout)["systemMessage"]
+    assert "no probe had been selected yet" not in message, (
+        "a typo'd command aborted probe selection instead of skipping a tier"
+    )
+    assert "could not be expanded" in message
+    assert "~nouser/aggregator-mcp" in message
+    assert "GUESS" in message, "it did not fall through to the next tier"
+    assert str(
+        home / "Repos" / "aggregator" / "aggregator" / "health" / "schema_probe.py"
+    ) in message
+
+
 def test_a_refused_reader_dir_still_lets_the_directory_argument_through(tmp_path):
     """L3. The two named-tree sources were tried as an either/or, so a typo in
     the environment override silently disqualified a perfectly good
