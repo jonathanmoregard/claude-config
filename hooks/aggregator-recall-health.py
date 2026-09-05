@@ -212,7 +212,20 @@ def _server_entry() -> tuple[dict, str | None]:
         with open(path, "rb") as fh:
             doc = json.loads(fh.read().decode("utf-8", "replace"))
         entry = (doc.get("mcpServers") or {}).get("aggregator")
-        return (entry if isinstance(entry, dict) else {}), None
+        if entry is None:
+            return {}, None
+        if not isinstance(entry, dict):
+            # An entry someone wrote and got wrong. Collapsing it to {} made
+            # the hook report that the config "names no command" about a line
+            # sitting right there — and, since silence is gated on there being
+            # no config problem, let a healthy verdict from an unrelated tier
+            # pass as verified.
+            return {}, (
+                f"{path}'s mcpServers.aggregator is a "
+                f"{type(entry).__name__}, not an object, so no reader could "
+                "be resolved from it"
+            )
+        return entry, None
     except FileNotFoundError:
         return {}, None
     except (OSError, ValueError, AttributeError, TypeError) as exc:
@@ -222,7 +235,7 @@ def _server_entry() -> tuple[dict, str | None]:
         )
 
 
-def _named_tree(entry: dict) -> tuple[Path, str] | None:
+def _named_tree(entry: dict) -> tuple[tuple[Path, str] | None, str | None]:
     """A tree somebody named ON PURPOSE, and which statement named it.
 
     The value must be absolute (after ``~`` expansion) or it is refused with a
