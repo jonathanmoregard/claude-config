@@ -457,9 +457,19 @@ def _packaged_probe(
             # The ordinary case: no console script installed here. Already
             # reported by naming the directory in `tried`.
             continue
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             # Not swallowed. "I looked and it was not there" and "I could not
             # look" are different facts, and only one of them is true.
+            #
+            # ValueError is in here because `os.stat` raises it, not OSError,
+            # for a path the filesystem layer cannot even express: a NUL byte
+            # or a lone surrogate, both of which ~/.claude.json can hold — a
+            # \u0000 or a \ud800 escape is a legal JSON string. Left
+            # uncaught, one bad character in `command` did not skip this
+            # tier, it aborted probe selection outright into the fail-open
+            # floor, which then reported that no probe had been selected at
+            # all. The tier that reads the bad path is the only thing that
+            # may die of it.
             unreadable.append(
                 f"{candidate} could not be resolved "
                 f"({type(exc).__name__}: {exc})"
@@ -773,7 +783,14 @@ def _check(probe: Probe) -> int:
         unreachable = None
     except FileNotFoundError:
         present, irregular, unreachable = False, False, None
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
+        # ValueError alongside OSError for the reason given at the sibling
+        # stat: a NUL byte or a lone surrogate in a config-derived path — a
+        # `--directory` argument reaches here — makes `os.stat` raise
+        # ValueError, not OSError. Uncaught it went straight past this
+        # announcement into the fail-open floor, which says "this check itself
+        # failed" and nothing about which path or why. The path is unusable
+        # either way; that is a fact to state, not one to crash on.
         present = irregular = False
         unreachable = (
             f"{probe.path} could not be resolved "

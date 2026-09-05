@@ -1692,6 +1692,72 @@ def test_a_command_naming_an_unknown_user_falls_through_instead_of_crashing(
     ) in message
 
 
+# ---------------------------------------------------------------------------
+# C1: a path JSON can express and the filesystem cannot
+# ---------------------------------------------------------------------------
+# `os.stat` raises ValueError — not OSError — on a path carrying a NUL byte or
+# a lone surrogate, and ~/.claude.json can hold both: a \u0000 escape and a
+# \ud800 one are both legal JSON strings. Only FileNotFoundError and OSError were
+# caught, so a single bad character in `command` or `--directory` travelled
+# past every tier into the fail-open floor. That floor announces "the check
+# itself failed" and, from the packaged tier, "no probe had been selected yet"
+# — about a machine whose default checkout was sitting there the whole time.
+# A path that cannot be stat'd disqualifies the tier that reads it, exactly as
+# a typo'd `command` does, and nothing more.
+
+NUL = "\x00"
+
+
+def test_a_command_the_filesystem_cannot_express_skips_one_tier(tmp_path):
+    """The packaged tier is the one that reads it, so it is the only casualty.
+
+    The candidate still has to be NAMED: the operator has a NUL in their config
+    and the announcement is the only place that fact surfaces.
+    """
+    home = _fake_home(
+        tmp_path, {"command": "/no/such" + NUL + "dir/aggregator-mcp", "args": []}
+    )
+
+    proc = _run_hook(home, tmp_path / "empty-bin")
+
+    assert proc.returncode == 0, proc.stderr
+    message = json.loads(proc.stdout)["systemMessage"]
+    assert "no probe had been selected yet" not in message, (
+        "a NUL byte in `command` aborted probe selection instead of skipping "
+        "the one tier that reads it"
+    )
+    assert "/no/such" + NUL + "dir/aggregator-schema-probe" in message, (
+        "the candidate it could not stat went unnamed"
+    )
+    assert "ValueError" in message, "the reason it could not look was dropped"
+    assert "GUESS" in message, "it did not fall through to the next tier"
+
+
+def test_a_tree_the_filesystem_cannot_express_is_announced_not_crashed(tmp_path):
+    """Same character, one tier down: the probe path the hook settled on.
+
+    ``_check`` stats the chosen probe with the same two excepts, so a
+    ``--directory`` carrying a NUL produced the fail-open floor's generic "this
+    check itself failed" instead of the UNVERIFIED line that names the path and
+    the reason — which is the difference between a diagnosis and a shrug.
+    """
+    home = _fake_home(tmp_path, {
+        "command": "uv",
+        "args": ["run", "--directory", "/no/such" + NUL + "tree", "aggregator-mcp"],
+    })
+
+    proc = _run_hook(home, tmp_path / "empty-bin")
+
+    assert proc.returncode == 0, proc.stderr
+    message = json.loads(proc.stdout)["systemMessage"]
+    assert "this check itself failed" not in message, (
+        "the chosen probe's stat raised past its own announcement"
+    )
+    assert "could not be examined" in message
+    assert "ValueError" in message
+    assert "--directory" in message, "the tier that supplied the bad path went unnamed"
+
+
 def test_a_refused_reader_dir_still_lets_the_directory_argument_through(tmp_path):
     """L3. The two named-tree sources were tried as an either/or, so a typo in
     the environment override silently disqualified a perfectly good
