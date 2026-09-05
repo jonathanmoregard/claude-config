@@ -75,7 +75,9 @@ MODEL=""
 IMAGES=""
 TIMEOUT=300
 OUT=""
-FALLBACK_MODEL="gpt-5.4"
+# Must be an id the account is actually served; check `codex debug models` when
+# this rots. gpt-5.4 stopped being served ~2026-09-04 (400 on every request).
+FALLBACK_MODEL="gpt-5.4-mini"
 
 # Refuse sandbox-escaping flags outright. The loop's guarantee that Codex never
 # edits rests on this; a caller that wants it has misread the skill.
