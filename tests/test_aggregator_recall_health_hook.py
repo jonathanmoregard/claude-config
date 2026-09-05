@@ -1352,6 +1352,35 @@ def test_a_crash_inside_the_announcement_still_produces_one_announcement(
     assert doc["hookSpecificOutput"]["hookEventName"] == "SessionStart"
 
 
+def test_a_closed_stdin_does_not_turn_the_whole_check_into_silence(
+    tmp_path, monkeypatch, capsys
+):
+    """M8. The stdin drain sat OUTSIDE main's announcing try.
+
+    Python sets ``sys.stdin`` to ``None`` when fd 0 is closed at startup — a
+    perfectly ordinary way for a hook to be launched by something that is not a
+    terminal. ``None.read()`` is an ``AttributeError``, which
+    ``(OSError, ValueError)`` does not catch and which the drain's position put
+    beyond the reach of ``_last_resort``. It fell straight to the bare floor in
+    ``__main__``: exit 0, empty stdout — byte for byte the healthy machine.
+
+    Draining stdin is housekeeping. It must not be able to decide what the
+    session is told about its memory.
+    """
+    probe = _write_probe(tmp_path, _payload("dead", "down", "cache 5, reader 6"), 20)
+    monkeypatch.setenv("AGGREGATOR_SCHEMA_PROBE", str(probe))
+    hook = _load_hook()
+    monkeypatch.setattr(sys, "stdin", None)
+
+    assert hook.main() == 0
+
+    out = capsys.readouterr().out
+    assert out, "a closed stdin silenced a hook that had a live outage to report"
+    doc = json.loads(out)
+    assert "cache 5, reader 6" in doc["systemMessage"]
+    assert doc["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+
+
 @pytest.mark.parametrize(
     "value,expect",
     [

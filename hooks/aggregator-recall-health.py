@@ -689,16 +689,27 @@ def _last_resort(exc: BaseException, probe: Probe | None) -> None:
 
 
 def main() -> int:
-    try:
-        # Read and discard. This check depends on the machine's state, not on
-        # anything the session says; draining stdin keeps the harness from
-        # seeing a broken pipe.
-        sys.stdin.read()
-    except (OSError, ValueError):
-        pass
-
     probe = None
     try:
+        # INSIDE the announcing try, deliberately. Draining stdin is
+        # housekeeping — this check depends on the machine's state, not on
+        # anything the session says — but out here it was the one statement
+        # whose faults could not be announced, and it has one that
+        # `(OSError, ValueError)` does not cover: Python sets `sys.stdin` to
+        # None when fd 0 is closed, so `None.read()` raised AttributeError,
+        # sailed past every announcement and landed on the bare floor in
+        # __main__. Exit 0, empty stdout: byte for byte the healthy machine.
+        try:
+            # `is None`, not a wider except: a closed fd 0 is an ordinary way
+            # to be launched, not a fault, and it must still produce the
+            # session's verdict rather than an UNVERIFIED line about stdin.
+            if sys.stdin is not None:
+                sys.stdin.read()
+        except (OSError, ValueError):
+            # A broken pipe or a closed stream. Nothing here needs what it
+            # would have said.
+            pass
+
         probe = _probe_invocation()
         return _check(probe)
     except BaseException as exc:
