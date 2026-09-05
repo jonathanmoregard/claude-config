@@ -62,14 +62,35 @@ must not be the thing that breaks session startup. But "the probe would not
 run" is not an internal error to swallow — it is reported, because a health
 check that goes quiet when its own machinery breaks is indistinguishable from
 one reporting good news.
+
+IT MEASURES THE READER CLAUDE CODE ACTUALLY RUNS, NOT A CHECKOUT
+
+The reader is whatever ``~/.claude.json``'s ``mcpServers.aggregator`` launches,
+and that is usually a PACKAGED BINARY — on this host
+``/etc/profiles/per-user/jonathan/bin/aggregator-mcp``, with empty ``args``.
+This hook originally understood one config shape only, ``uv run --directory
+<dir> aggregator-mcp``, and fell back to ``~/Repos/aggregator`` whenever it saw
+anything else. So on 2026-09-05 it read a working tree that happened to sit on
+a feature branch at schema 7, compared it against a cache at 6, and announced
+AGGREGATOR RECALL IS DOWN about a reader nobody runs. Everything was fine.
+
+A false alarm is not a milder failure than a missed one; it is what turns the
+next true alarm into noise, and silence is this check's entire budget. So the
+probe is preferred in production form: ``aggregator-schema-probe``, the console
+script installed as a sibling of the very ``aggregator-mcp`` the config names,
+executed directly. A developer config that really does launch the reader out of
+a checkout still gets the checkout — that statement is explicit and specific,
+where the old fallback was neither.
 """
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 # The probe is the ONE implementation of the predicate. It lives in the
 # aggregator repo beside the schema it describes, so that a future schema bump
@@ -78,10 +99,16 @@ from pathlib import Path
 # silently, which is the whole failure mode being fixed.
 PROBE_RELPATH = Path("aggregator") / "health" / "schema_probe.py"
 
-# Where the MCP reader is checked out, when ~/.claude.json cannot be read.
-# Only a fallback: the authoritative answer is whatever `--directory` that file
-# hands `aggregator-mcp`, because that is the checkout Claude Code actually
-# executes.
+# The same predicate, packaged: a console script that the aggregator's own
+# build installs beside `aggregator-mcp`. Preferred over the source file above
+# because it is the artifact that ships with the reader under test — same
+# revision, same environment, no branch to be on. Runs as a program, never
+# through this hook's interpreter: it is a wrapper script, not a .py file.
+PACKAGED_PROBE_NAME = "aggregator-schema-probe"
+
+# Where the MCP reader is checked out, when ~/.claude.json names no reader and
+# no packaged probe can be found beside one. Last resort, and the weakest
+# statement available: a working tree is whatever branch someone left it on.
 DEFAULT_READER_DIR = Path.home() / "Repos" / "aggregator"
 
 # Measured on this host against the live 1.5 GB cache.db: 0.17 s wall,
@@ -98,33 +125,156 @@ FINE = "fine"
 DOWN = "down"
 
 
-def _reader_dir() -> Path:
-    """The checkout the MCP reader runs from, per ~/.claude.json.
+class Probe(NamedTuple):
+    """Which probe to run, how to run it, and where the search went.
 
-    Asked rather than assumed: the reader is launched as
-    ``uv run --directory <dir> aggregator-mcp``, so that argument is the only
-    statement of which tree is under test that cannot itself be stale.
+    ``looked`` exists so the MISSING announcement can name every candidate. A
+    check that says only "not found" hands the reader the wrong thing to fix
+    half the time, and this one now has two plausible homes.
+    """
+
+    path: Path
+    argv: list[str]
+    looked: str
+
+
+def _server_entry() -> dict:
+    """``mcpServers.aggregator`` from ~/.claude.json, or ``{}``.
+
+    Read once and passed down: the file is the single statement of what Claude
+    Code launches, and two independent reads could disagree mid-session.
+    """
+    try:
+        with open(Path.home() / ".claude.json", "rb") as fh:
+            doc = json.loads(fh.read().decode("utf-8", "replace"))
+        entry = (doc.get("mcpServers") or {}).get("aggregator")
+        return entry if isinstance(entry, dict) else {}
+    except (OSError, ValueError, AttributeError, TypeError):
+        return {}
+
+
+def _reader_dir(entry: dict) -> Path:
+    """The CHECKOUT the MCP reader runs from, when it runs from one at all.
+
+    Only ``uv run --directory <dir> aggregator-mcp`` states this, and only a
+    developer config says it. A packaged reader has no checkout — for that one
+    the answer is the packaged probe, not this — so ``DEFAULT_READER_DIR`` here
+    is a guess of last resort rather than the authoritative answer it was
+    written as.
     """
     override = os.environ.get("AGGREGATOR_READER_DIR")
     if override:
         return Path(override).expanduser()
+    args = entry.get("args") or []
     try:
-        with open(Path.home() / ".claude.json", "rb") as fh:
-            doc = json.loads(fh.read().decode("utf-8", "replace"))
-        args = (((doc.get("mcpServers") or {}).get("aggregator") or {}).get("args")) or []
         for i, a in enumerate(args):
             if a == "--directory" and i + 1 < len(args):
                 return Path(str(args[i + 1])).expanduser()
-    except (OSError, ValueError, AttributeError, TypeError):
+    except (ValueError, AttributeError, TypeError):
         pass
     return DEFAULT_READER_DIR
 
 
-def _probe_path() -> Path:
+def _reader_command(entry: dict) -> Path | None:
+    """The reader binary named by ``command``, as an absolute path.
+
+    Bare names are looked up on PATH exactly as Claude Code looks them up, so
+    a healthy ``{"command": "aggregator-mcp"}`` config is not reported as
+    unverifiable for the sake of a missing slash.
+    """
+    raw = entry.get("command")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    raw = raw.strip()
+    try:
+        if os.path.dirname(raw):
+            return Path(raw).expanduser()
+        found = shutil.which(raw)
+        return Path(found) if found else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _packaged_probe(entry: dict) -> tuple[Path | None, list[Path]]:
+    """The console script beside the reader binary, plus every path tried.
+
+    UNRESOLVED DIRECTORY FIRST. ``/etc/profiles/per-user/<u>/bin/aggregator-mcp``
+    is a symlink into the Nix store, and the profile ``bin/`` — the directory
+    the link sits in, not the one it points at — is where the sibling console
+    script is installed. Resolving first and looking only in the store
+    directory would miss it on precisely the host this exists for. The resolved
+    directory is searched second, because a config may name a store path
+    outright.
+    """
+    command = _reader_command(entry)
+    if command is None:
+        return None, []
+
+    dirs: list[Path] = [command.parent]
+    try:
+        resolved_parent = command.resolve().parent
+        if resolved_parent != dirs[0]:
+            dirs.append(resolved_parent)
+    except (OSError, ValueError, RuntimeError):
+        pass
+
+    tried: list[Path] = []
+    for d in dirs:
+        candidate = d / PACKAGED_PROBE_NAME
+        tried.append(candidate)
+        try:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return candidate, tried
+        except OSError:
+            pass
+    return None, tried
+
+
+def _probe_invocation() -> Probe:
+    """Pick the probe, most authoritative source first.
+
+    1. ``AGGREGATOR_SCHEMA_PROBE`` — an explicit instruction outranks anything
+       discovered, and it is how a probe under development gets exercised.
+    2. The packaged ``aggregator-schema-probe`` beside the reader binary the
+       config names. Same build as the reader it reports on.
+    3. A checkout: the ``--directory`` a developer config states, else the
+       default tree. Weakest, because a tree is whatever branch it is on.
+    """
     override = os.environ.get("AGGREGATOR_SCHEMA_PROBE")
     if override:
-        return Path(override).expanduser()
-    return _reader_dir() / PROBE_RELPATH
+        path = Path(override).expanduser()
+        return Probe(
+            path,
+            [sys.executable, str(path), "--json"],
+            f"where AGGREGATOR_SCHEMA_PROBE points, {path}",
+        )
+
+    entry = _server_entry()
+    packaged, tried = _packaged_probe(entry)
+    if packaged is not None:
+        # As a program. It is a wrapper script with its own interpreter, and
+        # feeding it to this hook's Python would fail on its first line.
+        return Probe(
+            packaged,
+            [str(packaged), "--json"],
+            f"beside the reader binary, at {packaged}",
+        )
+
+    checkout = _reader_dir(entry) / PROBE_RELPATH
+    if tried:
+        looked = (
+            "beside the reader binary named by ~/.claude.json's "
+            "mcpServers.aggregator.command ("
+            + " and ".join(str(t) for t in tried)
+            + f"), then in a checkout at {checkout}"
+        )
+    else:
+        looked = (
+            f"in a checkout at {checkout} — ~/.claude.json's "
+            "mcpServers.aggregator names no command, so there was no reader "
+            f"binary to look for {PACKAGED_PROBE_NAME} beside"
+        )
+    return Probe(checkout, [sys.executable, str(checkout), "--json"], looked)
 
 
 def _announce(summary: str, headline: str) -> None:
@@ -157,23 +307,23 @@ def main() -> int:
     except (OSError, ValueError):
         pass
 
-    probe = _probe_path()
-    if not probe.is_file():
+    probe = _probe_invocation()
+    if not probe.path.is_file():
         _announce(
-            f"the aggregator schema-health probe is MISSING at {probe}, so "
-            "whether aggregator_search_memory works could not be checked. An "
-            "empty recall result this session is not evidence that nothing "
-            "was found. The probe ships in the aggregator repo at "
-            f"{PROBE_RELPATH}; check that the checkout named by "
-            "~/.claude.json's mcpServers.aggregator --directory argument is "
-            "present and current.",
+            f"the aggregator schema-health probe is MISSING at {probe.path}, "
+            "so whether aggregator_search_memory works could not be checked. "
+            "An empty recall result this session is not evidence that nothing "
+            f"was found. Looked {probe.looked}. The probe ships two ways: as "
+            f"the {PACKAGED_PROBE_NAME} console script installed next to the "
+            "aggregator-mcp binary, and as a source file in the aggregator "
+            f"repo at {PROBE_RELPATH}.",
             "AGGREGATOR RECALL: health UNVERIFIED.",
         )
         return 0
 
     try:
         proc = subprocess.run(
-            [sys.executable, str(probe), "--json"],
+            probe.argv,
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,

@@ -24,9 +24,11 @@ against variants that always spoke and always stayed quiet.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import sqlite3
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -330,3 +332,258 @@ def _locate_real_probe() -> Path | None:
         if p.is_file():
             return p
     return None
+
+
+# ---------------------------------------------------------------------------
+# WHICH probe: the packaged sibling, or a developer checkout
+# ---------------------------------------------------------------------------
+# THE DEFECT THIS FIXES (2026-09-05). ``_reader_dir`` understood exactly one
+# shape of ``mcpServers.aggregator`` — ``args: [..., "--directory", <dir>, ...]``
+# — and the live entry has been ``{"command": ".../bin/aggregator-mcp",
+# "args": []}`` for weeks. So the hook fell through to its ``~/Repos/aggregator``
+# fallback and measured a WORKING TREE: a tree sitting on a feature branch at
+# schema 7 while the packaged reader, the writer and the cache all agreed on 6.
+# The hook announced "AGGREGATOR RECALL IS DOWN" at session start about a
+# reader that Claude Code does not run and never ran.
+#
+# A false alarm is not a smaller version of a missed alarm — it is the thing
+# that turns the next true one into noise, and this check's entire budget is
+# its silence. So the hook now prefers the PRODUCTION artifact: the
+# ``aggregator-schema-probe`` console script installed next to the very
+# ``aggregator-mcp`` binary named by ``~/.claude.json``. The checkout logic
+# stays for developer configs that really do launch the reader with
+# ``--directory``.
+#
+# Every test below monkeypatches ``HOME`` before importing the hook, because
+# ``DEFAULT_READER_DIR`` is computed at import time; a test that imported first
+# would silently measure the operator's real checkout.
+
+PROBE_STUB_SH = """\
+#!/bin/sh
+printf '%s\\n' '{"state": "dead", "severity": "down", "summary": "cache 5, reader 6"}'
+exit 20
+"""
+
+
+def _load_hook():
+    """Import the hook as a module so its resolution can be asserted directly.
+
+    The argv is the thing under test — ``[<sibling>, "--json"]`` versus
+    ``[sys.executable, <file>, "--json"]`` — and a subprocess cannot show it.
+    """
+    spec = importlib.util.spec_from_file_location("recall_health_hook", HOOK)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _make_exec(path: Path, body: str = "#!/bin/sh\nexit 0\n") -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return path
+
+
+def _fake_home(tmp_path: Path, entry: dict | None) -> Path:
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    doc = {"mcpServers": {"aggregator": entry}} if entry is not None else {}
+    (home / ".claude.json").write_text(json.dumps(doc), encoding="utf-8")
+    return home
+
+
+def _isolate(monkeypatch, home: Path, path_dir: Path) -> None:
+    """A hermetic environment: no real HOME, no real PATH, no ambient overrides.
+
+    ``PATH`` matters as much as ``HOME`` here. Once the packaged probe ships,
+    it lands in the same profile ``bin/`` as ``uv``, so a test that left the
+    host PATH in place would start resolving a real sibling and stop testing
+    what it says it tests.
+    """
+    path_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", str(path_dir))
+    monkeypatch.delenv("AGGREGATOR_SCHEMA_PROBE", raising=False)
+    monkeypatch.delenv("AGGREGATOR_READER_DIR", raising=False)
+
+
+def test_the_packaged_probe_beside_the_reader_binary_wins(tmp_path, monkeypatch):
+    """The live shape: an absolute ``command``, empty ``args``, a real sibling.
+
+    This is the case that was reported as an outage every session. There is no
+    ``--directory`` anywhere in the config, and the right answer is not a
+    checkout at all.
+    """
+    mcp = _make_exec(tmp_path / "bin" / "aggregator-mcp")
+    sibling = _make_exec(tmp_path / "bin" / "aggregator-schema-probe")
+    _isolate(monkeypatch, _fake_home(tmp_path, {"command": str(mcp), "args": []}),
+             tmp_path / "empty-bin")
+
+    probe = _load_hook()._probe_invocation()
+
+    assert probe.path == sibling
+    assert probe.argv == [str(sibling), "--json"], (
+        "the packaged probe is a console script, not a .py file: running it "
+        "through sys.executable executes the wrong interpreter against a "
+        "wrapper it cannot parse"
+    )
+    assert sys.executable not in probe.argv
+
+
+def test_the_packaged_probe_is_run_as_a_program_not_fed_to_python(tmp_path):
+    """End to end, with a sibling that is deliberately not valid Python.
+
+    ``[sys.executable, <sibling>, "--json"]`` would die on the shebang line and
+    surface as "answered in a shape this hook cannot read" — the same
+    UNVERIFIED noise, one layer down. The only way to pass is to exec it.
+    """
+    _make_exec(tmp_path / "bin" / "aggregator-mcp")
+    _make_exec(tmp_path / "bin" / "aggregator-schema-probe", PROBE_STUB_SH)
+    home = _fake_home(tmp_path, {"command": str(tmp_path / "bin" / "aggregator-mcp"),
+                                 "args": []})
+
+    env = dict(os.environ)
+    env.pop("AGGREGATOR_SCHEMA_PROBE", None)
+    env.pop("AGGREGATOR_READER_DIR", None)
+    env["HOME"] = str(home)
+    proc = subprocess.run(
+        [sys.executable, str(HOOK)], input="{}", capture_output=True, text=True,
+        env=env, timeout=30,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    doc = json.loads(proc.stdout)
+    assert "cache 5, reader 6" in doc["systemMessage"]
+
+
+@pytest.mark.parametrize("sibling_beside_the_symlink", [True, False], ids=["link-dir", "target-dir"])
+def test_a_symlinked_command_is_searched_both_sides_of_the_link(
+    tmp_path, monkeypatch, sibling_beside_the_symlink
+):
+    """``/etc/profiles/per-user/<u>/bin/aggregator-mcp`` is a symlink into the store.
+
+    The console script is installed beside the LINK, in the profile — resolving
+    the command first and looking only in the store directory would miss it.
+    The store directory is still searched second, because a config may name the
+    store path directly.
+    """
+    store = tmp_path / "store" / "bin"
+    profile = tmp_path / "profile" / "bin"
+    target = _make_exec(store / "aggregator-mcp")
+    profile.mkdir(parents=True)
+    link = profile / "aggregator-mcp"
+    link.symlink_to(target)
+    sibling = _make_exec(
+        (profile if sibling_beside_the_symlink else store) / "aggregator-schema-probe"
+    )
+    _isolate(monkeypatch, _fake_home(tmp_path, {"command": str(link), "args": []}),
+             tmp_path / "empty-bin")
+
+    assert _load_hook()._probe_invocation().path == sibling
+
+
+def test_a_bare_command_name_is_resolved_on_the_path(tmp_path, monkeypatch):
+    """``command`` need not be absolute; Claude Code looks it up on PATH.
+
+    So does the hook, or a perfectly healthy bare-name config would be reported
+    as unverifiable.
+    """
+    bindir = tmp_path / "bin"
+    _make_exec(bindir / "aggregator-mcp")
+    sibling = _make_exec(bindir / "aggregator-schema-probe")
+    _isolate(monkeypatch, _fake_home(tmp_path, {"command": "aggregator-mcp"}), bindir)
+
+    probe = _load_hook()._probe_invocation()
+
+    assert probe.path == sibling
+    assert probe.argv == [str(sibling), "--json"]
+
+
+def test_a_command_with_no_packaged_sibling_falls_back_to_the_checkout(
+    tmp_path, monkeypatch
+):
+    """The state of this host until the packaged probe actually deploys.
+
+    A reader binary with no ``aggregator-schema-probe`` next to it is not an
+    error — it is every install predating the console script. The hook must
+    keep working exactly as it does today rather than start announcing that it
+    cannot find anything.
+    """
+    mcp = _make_exec(tmp_path / "bin" / "aggregator-mcp")
+    home = _fake_home(tmp_path, {"command": str(mcp), "args": []})
+    _isolate(monkeypatch, home, tmp_path / "empty-bin")
+
+    probe = _load_hook()._probe_invocation()
+
+    expected = home / "Repos" / "aggregator" / "aggregator" / "health" / "schema_probe.py"
+    assert probe.path == expected
+    assert probe.argv == [sys.executable, str(expected), "--json"]
+
+
+def test_a_directory_argument_still_selects_its_own_checkout(tmp_path, monkeypatch):
+    """Today's developer shape, unchanged.
+
+    ``uv run --directory <dir> aggregator-mcp`` states which tree is under
+    test, and nothing about preferring a packaged artifact may override an
+    explicit statement of the tree Claude Code is actually launching.
+    """
+    reader = tmp_path / "checkout"
+    entry = {"command": "uv",
+             "args": ["run", "--directory", str(reader), "aggregator-mcp"]}
+    _isolate(monkeypatch, _fake_home(tmp_path, entry), tmp_path / "empty-bin")
+
+    probe = _load_hook()._probe_invocation()
+
+    expected = reader / "aggregator" / "health" / "schema_probe.py"
+    assert probe.path == expected
+    assert probe.argv == [sys.executable, str(expected), "--json"]
+
+
+def test_the_env_override_outranks_a_packaged_sibling(tmp_path, monkeypatch):
+    """``AGGREGATOR_SCHEMA_PROBE`` is the escape hatch and stays on top.
+
+    It is how this suite drives the hook at all, and how an operator points it
+    at a probe under development. Discovery must never quietly win over an
+    explicit instruction.
+    """
+    mcp = _make_exec(tmp_path / "bin" / "aggregator-mcp")
+    _make_exec(tmp_path / "bin" / "aggregator-schema-probe")
+    _isolate(monkeypatch, _fake_home(tmp_path, {"command": str(mcp), "args": []}),
+             tmp_path / "empty-bin")
+    override = tmp_path / "my_probe.py"
+    override.write_text("", encoding="utf-8")
+    monkeypatch.setenv("AGGREGATOR_SCHEMA_PROBE", str(override))
+
+    probe = _load_hook()._probe_invocation()
+
+    assert probe.path == override
+    assert probe.argv == [sys.executable, str(override), "--json"]
+
+
+def test_the_missing_message_names_both_places_it_looked(tmp_path):
+    """"MISSING" has to be actionable, and there are now two candidate homes.
+
+    A message naming only the checkout sends the reader to fix the wrong thing
+    on a host where the packaged probe is the one that should have been there,
+    and vice versa. Both paths, in full, or the announcement costs its budget
+    and buys nothing.
+    """
+    mcp = _make_exec(tmp_path / "bin" / "aggregator-mcp")
+    home = _fake_home(tmp_path, {"command": str(mcp), "args": []})
+
+    env = dict(os.environ)
+    env.pop("AGGREGATOR_SCHEMA_PROBE", None)
+    env.pop("AGGREGATOR_READER_DIR", None)
+    env["HOME"] = str(home)
+    proc = subprocess.run(
+        [sys.executable, str(HOOK)], input="{}", capture_output=True, text=True,
+        env=env, timeout=30,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    message = json.loads(proc.stdout)["systemMessage"]
+    assert "UNVERIFIED" in message and "MISSING" in message
+    assert str(tmp_path / "bin" / "aggregator-schema-probe") in message
+    assert str(
+        home / "Repos" / "aggregator" / "aggregator" / "health" / "schema_probe.py"
+    ) in message
