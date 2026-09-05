@@ -116,6 +116,27 @@ of truth: `docs/brand/klaffat-design-spec.md` §4.12 "Locked variants
   alone. Every pill is >= 44px tall: the whole pill is the hit area, so the
   PILL is the WCAG 2.2 SC 2.5.8 target, not the 12px circle.
 
+  **Vertical centring — the pill is a CENTRING BOX, and never a nudge.**
+  Founder, 2026-09-05, on a build where the group sat 11px from the top and
+  18px from the bottom: "both the ring and the text is a bit too high."
+  Two things must both hold, and neither is a magic number:
+  - `.c-radiogroup__option` is `align-items: center` with its height from
+    `min-height` and SYMMETRIC `padding-block`. The circle is
+    `align-self: center`. NO `align-items: flex-start`, NO `margin-top` on
+    the dot. Every offset-based version of this drifted the moment a
+    font-size, a line-height or the dot size moved on its own.
+  - the label's box must equal its INK, or centring the box still leaves
+    the glyphs high: `line-height: 1` plus `text-box-trim: trim-both;
+    text-box-edge: cap alphabetic`. Pill labels are mono UPPERCASE with no
+    descenders, so cap-height-to-baseline IS the visible glyph; centring
+    the full line box reserves descender space nothing occupies. The
+    `line-height: 1` fallback alone is already centred to within 0.5px, so
+    the trim is a pure progressive enhancement.
+  Measured result, every pill and every state: 16.0px of air above and
+  16.0px below; circle centre and label text centre identical to 0.00px.
+  If you change any of this, measure the two numbers again — the oracle's
+  `content-centerY` rule is what holds it.
+
   **Nothing ever wraps.** The rail is `flex-wrap: nowrap` and pill labels
   are `white-space: nowrap`, so a group whose labels do not fit would
   OVERFLOW rather than wrap. The 38rem threshold is therefore chosen
@@ -132,9 +153,11 @@ of truth: `docs/brand/klaffat-design-spec.md` §4.12 "Locked variants
   `tests/e2e/tests/component-geometry-oracle.spec.ts` (`assertRadiogroup`)
   measures every option at both container widths and hard-fails on: circle
   and label not sharing a row; circle not before the label by the token
-  gap; circle centre off the label's first-line centre by >1px; a row that
-  wrapped or overflowed its group; a stacked pill under 44px or overflowed
-  by its label. Change the layout and you must satisfy that spec — do not
+  gap; circle centre off the label's first-line centre by >1px; the centre
+  of (circle box union label INK box) off the pill's own centre by >1px —
+  the rule that catches a correctly-paired group sitting too high in an
+  over-tall pill; a row that wrapped or overflowed its group; a stacked
+  pill under 44px or overflowed by its label. Change the layout and you must satisfy that spec — do not
   relax it.
 
   Real radio input stays a11y-focusable via `opacity: 0` (NEVER
