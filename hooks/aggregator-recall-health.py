@@ -225,6 +225,9 @@ def _server_entry() -> tuple[dict, str | None]:
 def _named_tree(entry: dict) -> tuple[Path, str] | None:
     """A tree somebody named ON PURPOSE, and which statement named it.
 
+    The value must be absolute (after ``~`` expansion) or it is refused with a
+    reason — see the comment on the check itself.
+
     Two things say "measure THIS tree" and both are deliberate: the operator
     setting ``AGGREGATOR_READER_DIR``, and a config launching the reader as
     ``uv run --directory <tree> aggregator-mcp``. Neither may be outranked by
@@ -235,22 +238,48 @@ def _named_tree(entry: dict) -> tuple[Path, str] | None:
     adjacency above an explicit statement would therefore stop measuring the
     named tree on every developer config at once, silently, on deploy day.
     """
+    raw: str | None = None
+    said_by = ""
     override = os.environ.get("AGGREGATOR_READER_DIR")
     if override:
-        return Path(override).expanduser(), "AGGREGATOR_READER_DIR"
+        raw, said_by = override, "AGGREGATOR_READER_DIR"
     args = entry.get("args")
     # Normalised, not guarded after the fact: a hand-edited ~/.claude.json can
     # put any JSON type here, and `enumerate(5)` inside this hook raises past
     # every announcement into the top-level `except BaseException`, i.e. exits
     # silently — the one outcome this check may never produce.
     args = args if isinstance(args, list) else []
-    for i, a in enumerate(args):
-        if a == "--directory" and i + 1 < len(args):
-            return (
-                Path(str(args[i + 1])).expanduser(),
-                "mcpServers.aggregator's --directory argument",
-            )
-    return None
+    if raw is None:
+        for i, a in enumerate(args):
+            if a == "--directory" and i + 1 < len(args):
+                raw = str(args[i + 1])
+                said_by = "mcpServers.aggregator's --directory argument"
+                break
+    if raw is None:
+        return None, None
+
+    # ABSOLUTE, OR IT IS NOT A TREE. This hook inherits the SESSION's working
+    # directory — whatever project the operator happened to open — so a
+    # relative or empty value would make it stat, and then EXECUTE,
+    # ./aggregator/health/schema_probe.py out of an unrelated repository. Both
+    # the verdict and the code producing it would belong to something nobody
+    # asked about. Refused and named rather than silently dropped, because the
+    # shape of this mistake is a typo in a config the operator believes is
+    # aiming the check somewhere.
+    try:
+        tree = Path(raw).expanduser()
+    except (RuntimeError, OSError, ValueError) as exc:
+        return None, (
+            f"{said_by} is {raw!r}, which could not be expanded "
+            f"({type(exc).__name__}: {exc}), so it was ignored"
+        )
+    if not tree.is_absolute():
+        return None, (
+            f"{said_by} is {raw!r}, which is not an absolute path — it would "
+            "resolve against whatever directory the session was started in, "
+            "so it was ignored"
+        )
+    return (tree, said_by), None
 
 
 def _reader_command(raw: str) -> Path | None:
@@ -432,7 +461,10 @@ def _probe_invocation() -> Probe:
 
     entry, config_problem = _server_entry()
 
-    named = _named_tree(entry)
+    named, tree_problem = _named_tree(entry)
+    # Both faults describe how the tier was chosen, so both ride the same line.
+    note = "; ".join(n for n in (config_problem, tree_problem) if n) or None
+
     if named is not None:
         tree, said_by = named
         checkout = tree / PROBE_RELPATH
@@ -441,7 +473,7 @@ def _probe_invocation() -> Probe:
             [sys.executable, str(checkout), "--json"],
             f"in the tree named by {said_by}, at {checkout}",
             f"tree named by {said_by}",
-            config_problem,
+            note,
         )
 
     packaged, where = _packaged_probe(entry, config_problem)
@@ -449,8 +481,7 @@ def _probe_invocation() -> Probe:
         # As a program. It is a wrapper script with its own interpreter, and
         # feeding it to this hook's Python would fail on its first line.
         return Probe(
-            packaged, [str(packaged), "--json"], where, TIER_PACKAGED,
-            config_problem,
+            packaged, [str(packaged), "--json"], where, TIER_PACKAGED, note,
         )
 
     # Nobody named a tree — `_named_tree` returned None above — so this is the
@@ -462,7 +493,7 @@ def _probe_invocation() -> Probe:
         [sys.executable, str(checkout), "--json"],
         f"{where}; then in the default checkout at {checkout}",
         TIER_GUESS,
-        config_problem,
+        note,
     )
 
 

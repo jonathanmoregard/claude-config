@@ -1186,3 +1186,68 @@ def test_a_non_python_override_that_cannot_execute_says_so(tmp_path):
     assert proc.returncode == 0, proc.stderr
     message = json.loads(proc.stdout)["systemMessage"]
     assert "not executable" in message
+
+
+# ---------------------------------------------------------------------------
+# M4: a tree that is not an absolute path is not a tree
+# ---------------------------------------------------------------------------
+# The hook runs with the SESSION's working directory, which is whatever project
+# the operator happened to open. A relative or empty --directory therefore
+# resolved against that: the check would stat, and then EXECUTE,
+# ./aggregator/health/schema_probe.py out of an unrelated repository. Both the
+# verdict and the code that produced it would belong to something nobody was
+# asking about.
+
+
+@pytest.mark.parametrize(
+    "value,reason", [("some/tree", "relative"), ("", "empty")],
+    ids=["relative", "empty"],
+)
+def test_a_directory_that_is_not_absolute_is_refused_and_named(
+    tmp_path, value, reason
+):
+    """Refused, then fallen through — and said out loud, because it is a typo.
+
+    Silently dropping to the next tier would leave the operator with a config
+    they believe is aiming the check somewhere it is not.
+    """
+    home = _fake_home(tmp_path, {
+        "command": "uv",
+        "args": ["run", "--directory", value, "aggregator-mcp"],
+    })
+
+    proc = _run_hook(home, tmp_path / "empty-bin")
+
+    assert proc.returncode == 0, proc.stderr
+    message = json.loads(proc.stdout)["systemMessage"]
+    assert "not an absolute path" in message, f"the {reason} value was accepted"
+    assert "GUESS" in message, "it did not fall through to the next tier"
+    assert str(Path.cwd() / "aggregator") not in message
+
+
+def test_a_reader_dir_that_is_not_absolute_is_refused(tmp_path):
+    """Same rule for the environment override; same reason."""
+    home = _fake_home(tmp_path, {})
+
+    proc = _run_hook(home, tmp_path / "empty-bin",
+                     AGGREGATOR_READER_DIR="relative/tree")
+
+    message = json.loads(proc.stdout)["systemMessage"]
+    assert "not an absolute path" in message
+    assert "GUESS" in message
+
+
+def test_a_tilde_prefixed_tree_is_expanded_and_accepted(tmp_path):
+    """``~`` is absolute once expanded, and configs are written with it."""
+    home = _fake_home(tmp_path, {})
+    _plant_py_probe(
+        home / "trees" / "reader" / "aggregator" / "health" / "schema_probe.py"
+    )
+
+    proc = _run_hook(home, tmp_path / "empty-bin",
+                     AGGREGATOR_READER_DIR="~/trees/reader")
+
+    message = json.loads(proc.stdout)["systemMessage"]
+    assert "cache 5, reader 6" in message
+    assert str(home / "trees" / "reader") in message
+    assert "GUESS" not in message
