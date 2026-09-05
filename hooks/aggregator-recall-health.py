@@ -252,17 +252,29 @@ def _packaged_probe(entry: dict) -> tuple[Path | None, str]:
             f"{raw!r} did not resolve on PATH"
         )
 
+    # Everything this search could not carry out, in the operator's words
+    # rather than in silence. See the OSError arm of the stat below.
+    unreadable: list[str] = []
+
     dirs: list[Path] = [command.parent]
     try:
         resolved_parent = command.resolve().parent
         if resolved_parent != dirs[0]:
             dirs.append(resolved_parent)
-    except (OSError, ValueError, RuntimeError):
-        pass
+    except (OSError, ValueError, RuntimeError) as exc:
+        # Defensive: `resolve(strict=False)` absorbs symlink loops, unreadable
+        # parents and over-long paths and returns a best effort, so no test
+        # here drives this arm — but the store half of the search is skipped
+        # when it does fire, and a search that quietly got narrower is the
+        # shape of failure this whole hook exists to make loud.
+        unreadable.append(
+            f"the target of {command} could not be resolved "
+            f"({type(exc).__name__}: {exc}), so only its own directory was "
+            "searched"
+        )
 
     tried: list[Path] = []
     rejected: list[Path] = []
-    unreadable: list[str] = []
     for d in dirs:
         candidate = d / PACKAGED_PROBE_NAME
         tried.append(candidate)
