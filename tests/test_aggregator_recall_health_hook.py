@@ -1776,3 +1776,73 @@ def test_a_refused_reader_dir_still_lets_the_directory_argument_through(tmp_path
     assert "cache 5, reader 6" in message, "the --directory tree was not used"
     assert "not an absolute path" in message, "the refused override went unmentioned"
     assert "GUESS" not in message
+
+
+# ---------------------------------------------------------------------------
+# C2: "it did not measure the reader" is a claim, and it has to be true
+# ---------------------------------------------------------------------------
+# The FINE-with-a-note line said the probe "did not measure the reader Claude
+# Code runs" whenever `note` was set — but `note` also carries faults that cost
+# the hook nothing except a knob it declined to obey. A refused
+# AGGREGATOR_SCHEMA_PROBE, with the packaged sibling of the reader binary then
+# measuring and finding everything in agreement, is a VERIFIED pass reported as
+# an unverified one: the same manufactured doubt this branch exists to prevent,
+# pointed the other way. The note still has to be said — the operator believes
+# that value is aiming the check somewhere — but the sentence around it may not
+# invent a reader that went unmeasured.
+
+
+def test_a_refused_override_does_not_fake_an_unmeasured_reader(tmp_path):
+    """The packaged sibling IS the reader, whatever the override was doing.
+
+    The override never got as far as naming a probe, so it cost the search
+    nothing. Reporting that as "this did not measure the reader Claude Code
+    runs" is false about a tier that measured exactly that.
+    """
+    mcp = _make_exec(tmp_path / "bin" / "aggregator-mcp")
+    _plant_sh_probe(tmp_path / "bin" / "aggregator-schema-probe", FINE_VERDICT)
+    home = _fake_home(tmp_path, {"command": str(mcp), "args": []})
+
+    proc = _run_hook(home, tmp_path / "empty-bin",
+                     AGGREGATOR_SCHEMA_PROBE="relative/probe.py")
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout, "the refused override went unmentioned entirely"
+    doc = json.loads(proc.stdout)
+    for reader in (doc["systemMessage"],
+                   doc["hookSpecificOutput"]["additionalContext"]):
+        assert "did not measure the reader" not in reader, (
+            "a verified pass from the packaged sibling was announced as an "
+            "unmeasured one because an unrelated knob was refused"
+        )
+        assert "not an absolute path" in reader, "the refusal went unreported"
+        assert "relative/probe.py" in reader
+        assert "packaged sibling" in reader
+
+
+def test_a_refused_directory_argument_still_says_the_reader_went_unmeasured(
+    tmp_path,
+):
+    """The other side of the same line, and the reason it is not just cosmetic.
+
+    In the ``--directory`` shape the ``command`` is ``uv``, whose sibling in
+    the profile is the packaged probe — so a refused ``--directory`` leaves the
+    packaged tier measuring something that is NOT the reader Claude Code
+    launches. The config named a tree; the tier that ran is not it. That claim
+    stays.
+    """
+    bindir = tmp_path / "bin"
+    _make_exec(bindir / "uv")
+    _plant_sh_probe(bindir / "aggregator-schema-probe", FINE_VERDICT)
+    home = _fake_home(tmp_path, {
+        "command": "uv",
+        "args": ["run", "--directory", "some/tree", "aggregator-mcp"],
+    })
+
+    proc = _run_hook(home, bindir)
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout, "a config-named tree was refused in silence"
+    message = json.loads(proc.stdout)["systemMessage"]
+    assert "did not measure the reader" in message
+    assert "not an absolute path" in message

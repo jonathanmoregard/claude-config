@@ -202,6 +202,16 @@ class Probe(NamedTuple):
     # a search that quietly narrows is the shape of failure this hook exists
     # to make loud.
     search_note: str | None = None
+    # Whether anything in ``note`` leaves it UNKNOWN that the tier which ran is
+    # the reader Claude Code launches. Not every fault does, and the difference
+    # is a sentence the hook may not fabricate: a refused AGGREGATOR_SCHEMA_PROBE
+    # or AGGREGATOR_READER_DIR costs the search a knob it declined to obey,
+    # while the packaged sibling of the configured `command` goes on being the
+    # reader. An unreadable ~/.claude.json is the other kind — the hook no
+    # longer knows what Claude Code launches — and so is a refused
+    # `--directory`, because in that shape the `command` is `uv` and the
+    # sibling beside it is emphatically not the tree the config named.
+    reader_in_doubt: bool = False
 
 
 def _server_entry() -> tuple[dict, str | None]:
@@ -245,8 +255,8 @@ def _server_entry() -> tuple[dict, str | None]:
         )
 
 
-def _named_tree(entry: dict) -> tuple[tuple[Path, str] | None, str | None]:
-    """A tree somebody named ON PURPOSE, and which statement named it.
+def _named_tree(entry: dict) -> tuple[tuple[Path, str] | None, str | None, bool]:
+    """A tree somebody named ON PURPOSE, which statement named it, and the cost.
 
     The value must be absolute (after ``~`` expansion) or it is refused with a
     reason — see the comment on the check itself.
@@ -260,15 +270,23 @@ def _named_tree(entry: dict) -> tuple[tuple[Path, str] | None, str | None]:
     ``aggregator-schema-probe`` the moment the console script deploys. Ranking
     adjacency above an explicit statement would therefore stop measuring the
     named tree on every developer config at once, silently, on deploy day.
+
+    The third element says whether a tree THE CONFIG named was refused. That is
+    not merely a knob declined: ``uv run --directory <tree> aggregator-mcp`` is
+    what Claude Code launches, so refusing it leaves every lower tier measuring
+    something else — the packaged sibling of ``uv``, of all things. A refused
+    ``AGGREGATOR_READER_DIR`` costs nothing of the kind, because the config was
+    read and the tier chosen from it still describes the reader. The
+    announcement may not blur the two.
     """
     # BOTH sources, in preference order — not an either/or. Trying only the
     # first one present meant a typo in AGGREGATOR_READER_DIR disqualified a
     # perfectly good `--directory` alongside it and dropped the check two whole
     # tiers, on the strength of a mistake in an unrelated place.
-    candidates: list[tuple[str, str]] = []
+    candidates: list[tuple[str, str, bool]] = []
     override = os.environ.get("AGGREGATOR_READER_DIR")
     if override:
-        candidates.append((override, "AGGREGATOR_READER_DIR"))
+        candidates.append((override, "AGGREGATOR_READER_DIR", False))
     args = entry.get("args")
     # Normalised, not guarded after the fact: a hand-edited ~/.claude.json can
     # put any JSON type here, and `enumerate(5)` inside this hook raises past
@@ -278,7 +296,9 @@ def _named_tree(entry: dict) -> tuple[tuple[Path, str] | None, str | None]:
     for i, a in enumerate(args):
         if a == "--directory" and i + 1 < len(args):
             candidates.append(
-                (str(args[i + 1]), "mcpServers.aggregator's --directory argument")
+                (str(args[i + 1]),
+                 "mcpServers.aggregator's --directory argument",
+                 True)
             )
             break
 
@@ -291,7 +311,8 @@ def _named_tree(entry: dict) -> tuple[tuple[Path, str] | None, str | None]:
     # shape of this mistake is a typo in a config the operator believes is
     # aiming the check somewhere.
     problems: list[str] = []
-    for raw, said_by in candidates:
+    refused_config_tree = False
+    for raw, said_by, from_config in candidates:
         try:
             tree = Path(raw).expanduser()
         except (RuntimeError, OSError, ValueError) as exc:
@@ -299,6 +320,7 @@ def _named_tree(entry: dict) -> tuple[tuple[Path, str] | None, str | None]:
                 f"{said_by} is {raw!r}, which could not be expanded "
                 f"({type(exc).__name__}: {exc}), so it was ignored"
             )
+            refused_config_tree = refused_config_tree or from_config
             continue
         if not tree.is_absolute():
             problems.append(
@@ -306,11 +328,12 @@ def _named_tree(entry: dict) -> tuple[tuple[Path, str] | None, str | None]:
                 "would resolve against whatever directory the session was "
                 "started in, so it was ignored"
             )
+            refused_config_tree = refused_config_tree or from_config
             continue
         # A refusal further up still gets reported: the operator believes that
         # value is doing something.
-        return (tree, said_by), ("; ".join(problems) or None)
-    return None, ("; ".join(problems) or None)
+        return (tree, said_by), ("; ".join(problems) or None), refused_config_tree
+    return None, ("; ".join(problems) or None), refused_config_tree
 
 
 def _reader_command(raw: str) -> tuple[Path | None, str | None]:
@@ -591,11 +614,19 @@ def _probe_invocation() -> Probe:
 
     entry, config_problem = _server_entry()
 
-    named, tree_problem = _named_tree(entry)
+    named, tree_problem, refused_config_tree = _named_tree(entry)
     # Every fault describes how the tier was chosen, so they ride one line.
     note = "; ".join(
         n for n in (override_problem, config_problem, tree_problem) if n
     ) or None
+    # ...but they do not all cost the same thing, and the FINE announcement
+    # says out loud which it is. A refused AGGREGATOR_SCHEMA_PROBE or
+    # AGGREGATOR_READER_DIR is a knob this hook declined to obey; whatever tier
+    # then ran was still chosen from the config, so it does describe the reader
+    # Claude Code launches. A config that could not be read, or a `--directory`
+    # that had to be refused, is the other kind: the hook no longer knows what
+    # is being launched, or knows and could not go there.
+    reader_in_doubt = bool(config_problem) or refused_config_tree
 
     if named is not None:
         tree, said_by = named
@@ -606,6 +637,8 @@ def _probe_invocation() -> Probe:
             f"in the tree named by {said_by}, at {checkout}",
             f"tree named by {said_by}",
             note,
+            None,
+            reader_in_doubt,
         )
 
     packaged, where, search_note = _packaged_probe(entry, config_problem)
@@ -614,7 +647,7 @@ def _probe_invocation() -> Probe:
         # feeding it to this hook's Python would fail on its first line.
         return Probe(
             packaged, [str(packaged), "--json"], where, TIER_PACKAGED, note,
-            search_note,
+            search_note, reader_in_doubt,
         )
 
     # Nobody named a tree — `_named_tree` returned None above — so this is the
@@ -627,6 +660,8 @@ def _probe_invocation() -> Probe:
         f"{where}; then in the default checkout at {checkout}",
         TIER_GUESS,
         note,
+        None,
+        reader_in_doubt,
     )
 
 
@@ -905,15 +940,33 @@ def _check(probe: Probe) -> int:
         if probe.tier != TIER_GUESS and probe.note is None:
             # The earned silence. Nothing printed, nothing injected.
             return 0
-        # One calm line. NOT the outage headline — announcing an unverified
-        # pass as a failure would be its own false alarm, and this branch
-        # exists to stop manufacturing those.
+        if probe.tier == TIER_GUESS or probe.reader_in_doubt:
+            # One calm line. NOT the outage headline — announcing an unverified
+            # pass as a failure would be its own false alarm, and this branch
+            # exists to stop manufacturing those.
+            _announce(
+                "the schema probe found nothing wrong, but it did not measure "
+                "the reader Claude Code runs, so this is 'not checked' rather "
+                "than 'checked and healthy'. Recall may well be fine — nothing "
+                "here verified it.",
+                "AGGREGATOR RECALL: looked healthy, but not verified.",
+                _provenance(probe, measured=True),
+            )
+            return 0
+        # A fault that cost the hook a knob, not its measurement. The tier that
+        # ran was chosen from ~/.claude.json and does name the reader Claude
+        # Code launches, so "it did not measure the reader" would be a
+        # fabrication — the same manufactured doubt the branch above exists to
+        # avoid, pointed the other way. The note is still said out loud: the
+        # operator believes that value is aiming this check somewhere, and a
+        # setting that is being ignored has to be told it is being ignored.
         _announce(
-            "the schema probe found nothing wrong, but it did not measure the "
-            "reader Claude Code runs, so this is 'not checked' rather than "
-            "'checked and healthy'. Recall may well be fine — nothing here "
-            "verified it.",
-            "AGGREGATOR RECALL: looked healthy, but not verified.",
+            "recall is verified healthy — the probe that ran does name the "
+            "reader Claude Code launches, and it found nothing wrong. This "
+            "line is spent only because a setting pointing the check elsewhere "
+            "was refused; the reason is below, and nothing else here is wrong.",
+            "AGGREGATOR RECALL: healthy — but a setting aimed at this check "
+            "was refused.",
             _provenance(probe, measured=True),
         )
         return 0
