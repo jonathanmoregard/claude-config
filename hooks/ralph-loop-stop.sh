@@ -265,54 +265,77 @@ if [[ $MAX_ITERATIONS -gt 0 ]] && [[ $ITERATION -ge $MAX_ITERATIONS ]]; then
   end_loop "Ralph loop: max iterations ($MAX_ITERATIONS) reached."
 fi
 
-TRANSCRIPT_PATH=$(echo "$HOOK_INPUT" | jq -r '.transcript_path')
-
-# Read the assistant lines from the transcript (JSONL - one JSON per line).
+# The turn's final text comes from the PAYLOAD, not the transcript file. The
+# harness puts it there for exactly this reason: the transcript is written
+# asynchronously and lags the conversation, while last_assistant_message
+# arrives synchronously on stdin and cannot be stale.
 #
-# The Stop hook can fire before Claude Code has flushed the turn's assistant
-# message, so poll briefly instead of reading once. Measured on headless runs:
-# reading once killed the loop on iteration 1 roughly a third of the time,
-# because an unflushed transcript looked identical to "session produced no
-# output". Absence of assistant text is NOT evidence the task is finished.
-LAST_LINES=""
-for _ in $(seq 1 10); do
-  if [[ -f "$TRANSCRIPT_PATH" ]]; then
-    LAST_LINES=$(grep '"role":"assistant"' "$TRANSCRIPT_PATH" 2>/dev/null | tail -n 100 || true)
-    [[ -n "$LAST_LINES" ]] && break
-  fi
-  sleep 0.3
-done
-
-# Extract the most recent assistant text block. Claude Code writes each content
-# block (text/tool_use/thinking) as its own JSONL line, all with
-# role=assistant, so flatten the last 100 to text blocks and take the last one.
-# The 100-line cap keeps jq's input bounded for long-running sessions.
+# The transcript poll below used to be the only source, and it lost a flush
+# race in long sessions: it waited for ANY assistant line, which protected the
+# headless iteration-1 case (empty transcript) it was written for, but in a
+# session already holding hundreds of assistant lines it broke on the FIRST
+# read — ~0.3s after end_turn, before the final message landed — and compared
+# the PREVIOUS message. Measured 2026-09-04, session 6f11dbf0: two byte-perfect
+# own-line <promise> emissions rejected, iterations 2→4 burned, loop ended only
+# by /cancel-ralph. Replayed offline: the same hook, same state, same emission
+# ends the loop against the flushed transcript and blocks against a view one
+# line shorter.
 #
-# `last // ""` yields empty string when no text blocks exist (e.g. a turn that
-# is all tool calls). Empty text means no <promise> tag, so the loop continues.
-LAST_OUTPUT=""
+# The field is optional in the harness schema (verified against the 2.1.261
+# binary), so the poll survives as the fallback for a harness that omits it —
+# and for a final message with no text at all, which arrives as "". When the
+# field is non-empty it is authoritative: anything else in the transcript is an
+# older message by definition, so no sigil found there may end the loop.
+LAST_OUTPUT=$(echo "$HOOK_INPUT" | jq -r '.last_assistant_message // ""')
 TRANSCRIPT_NOTE=""
 
-if [[ -z "$LAST_LINES" ]]; then
-  # Still nothing after ~3s. Continue the loop rather than ending it: ending
-  # here would let a slow flush masquerade as completion.
-  TRANSCRIPT_NOTE=" | ⚠️ transcript unreadable this turn ($TRANSCRIPT_PATH) - promise not checked"
-  echo "⚠️  Ralph loop: no assistant output readable in transcript; continuing loop" >&2
-  echo "   Transcript: $TRANSCRIPT_PATH" >&2
-else
-  set +e
-  LAST_OUTPUT=$(echo "$LAST_LINES" | jq -rs '
-    map(.message.content[]? | select(.type == "text") | .text) | last // ""
-  ' 2>&1)
-  JQ_EXIT=$?
-  set -e
+if [[ -z "$LAST_OUTPUT" ]]; then
+  TRANSCRIPT_PATH=$(echo "$HOOK_INPUT" | jq -r '.transcript_path')
 
-  # A parse failure is a real corruption signal, not a timing artefact: stop.
-  if [[ $JQ_EXIT -ne 0 ]]; then
-    echo "⚠️  Ralph loop: Failed to parse assistant message JSON" >&2
-    echo "   Error: $LAST_OUTPUT" >&2
-    echo "   Ralph loop is stopping." >&2
-    end_loop "Ralph loop: stopped - could not parse the transcript."
+  # Read the assistant lines from the transcript (JSONL - one JSON per line).
+  #
+  # The Stop hook can fire before Claude Code has flushed the turn's assistant
+  # message, so poll briefly instead of reading once. Measured on headless runs:
+  # reading once killed the loop on iteration 1 roughly a third of the time,
+  # because an unflushed transcript looked identical to "session produced no
+  # output". Absence of assistant text is NOT evidence the task is finished.
+  LAST_LINES=""
+  for _ in $(seq 1 10); do
+    if [[ -f "$TRANSCRIPT_PATH" ]]; then
+      LAST_LINES=$(grep '"role":"assistant"' "$TRANSCRIPT_PATH" 2>/dev/null | tail -n 100 || true)
+      [[ -n "$LAST_LINES" ]] && break
+    fi
+    sleep 0.3
+  done
+
+  # Extract the most recent assistant text block. Claude Code writes each content
+  # block (text/tool_use/thinking) as its own JSONL line, all with
+  # role=assistant, so flatten the last 100 to text blocks and take the last one.
+  # The 100-line cap keeps jq's input bounded for long-running sessions.
+  #
+  # `last // ""` yields empty string when no text blocks exist (e.g. a turn that
+  # is all tool calls). Empty text means no <promise> tag, so the loop continues.
+  if [[ -z "$LAST_LINES" ]]; then
+    # Still nothing after ~3s. Continue the loop rather than ending it: ending
+    # here would let a slow flush masquerade as completion.
+    TRANSCRIPT_NOTE=" | ⚠️ transcript unreadable this turn ($TRANSCRIPT_PATH) - promise not checked"
+    echo "⚠️  Ralph loop: no assistant output readable in transcript; continuing loop" >&2
+    echo "   Transcript: $TRANSCRIPT_PATH" >&2
+  else
+    set +e
+    LAST_OUTPUT=$(echo "$LAST_LINES" | jq -rs '
+      map(.message.content[]? | select(.type == "text") | .text) | last // ""
+    ' 2>&1)
+    JQ_EXIT=$?
+    set -e
+
+    # A parse failure is a real corruption signal, not a timing artefact: stop.
+    if [[ $JQ_EXIT -ne 0 ]]; then
+      echo "⚠️  Ralph loop: Failed to parse assistant message JSON" >&2
+      echo "   Error: $LAST_OUTPUT" >&2
+      echo "   Ralph loop is stopping." >&2
+      end_loop "Ralph loop: stopped - could not parse the transcript."
+    fi
   fi
 fi
 
