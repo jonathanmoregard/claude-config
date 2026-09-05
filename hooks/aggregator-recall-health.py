@@ -78,9 +78,26 @@ A false alarm is not a milder failure than a missed one; it is what turns the
 next true alarm into noise, and silence is this check's entire budget. So the
 probe is preferred in production form: ``aggregator-schema-probe``, the console
 script installed as a sibling of the very ``aggregator-mcp`` the config names,
-executed directly. A developer config that really does launch the reader out of
-a checkout still gets the checkout — that statement is explicit and specific,
-where the old fallback was neither.
+executed directly.
+
+The precedence, strongest STATEMENT first — not most convenient source:
+
+1. ``AGGREGATOR_SCHEMA_PROBE`` — run exactly this file. The escape hatch.
+2. A tree somebody named on purpose: ``AGGREGATOR_READER_DIR``, or the config's
+   own ``uv run --directory <tree> aggregator-mcp``.
+3. The packaged ``aggregator-schema-probe`` beside the reader binary.
+4. ``DEFAULT_READER_DIR``, ``~/Repos/aggregator``. A guess, and the announcement
+   says so.
+
+2 SITS ABOVE 3 FOR A CONCRETE REASON. The packaged tier keys off ADJACENCY, and
+in the ``--directory`` shape the ``command`` is ``uv`` — whose sibling in the
+Nix profile becomes ``aggregator-schema-probe`` the day the console script
+deploys. Ranking adjacency above an explicit statement would silently stop
+measuring the named tree on every developer config at once, and the symptom
+would be a check that looks like it is working. Same for
+``AGGREGATOR_READER_DIR``: below the packaged tier it would go inert on deploy
+day while still reading like a live knob, which is the worst state a control
+can be in.
 """
 from __future__ import annotations
 
@@ -153,39 +170,61 @@ def _server_entry() -> dict:
         return {}
 
 
-def _reader_dir(entry: dict) -> Path:
-    """The CHECKOUT the MCP reader runs from, when it runs from one at all.
+def _named_tree(entry: dict) -> tuple[Path, str] | None:
+    """A tree somebody named ON PURPOSE, and which statement named it.
 
-    Only ``uv run --directory <dir> aggregator-mcp`` states this, and only a
-    developer config says it. A packaged reader has no checkout — for that one
-    the answer is the packaged probe, not this — so ``DEFAULT_READER_DIR`` here
-    is a guess of last resort rather than the authoritative answer it was
-    written as.
+    Two things say "measure THIS tree" and both are deliberate: the operator
+    setting ``AGGREGATOR_READER_DIR``, and a config launching the reader as
+    ``uv run --directory <tree> aggregator-mcp``. Neither may be outranked by
+    the packaged probe, and the reason is not politeness about intent — it is
+    that the packaged tier keys off ADJACENCY. In the ``--directory`` shape
+    ``command`` is ``uv``, whose sibling in the Nix profile is
+    ``aggregator-schema-probe`` the moment the console script deploys. Ranking
+    adjacency above an explicit statement would therefore stop measuring the
+    named tree on every developer config at once, silently, on deploy day.
     """
     override = os.environ.get("AGGREGATOR_READER_DIR")
     if override:
-        return Path(override).expanduser()
-    args = entry.get("args") or []
-    try:
-        for i, a in enumerate(args):
-            if a == "--directory" and i + 1 < len(args):
-                return Path(str(args[i + 1])).expanduser()
-    except (ValueError, AttributeError, TypeError):
-        pass
-    return DEFAULT_READER_DIR
+        return Path(override).expanduser(), "AGGREGATOR_READER_DIR"
+    args = entry.get("args")
+    # Normalised, not guarded after the fact: a hand-edited ~/.claude.json can
+    # put any JSON type here, and `enumerate(5)` inside this hook raises past
+    # every announcement into the top-level `except BaseException`, i.e. exits
+    # silently — the one outcome this check may never produce.
+    args = args if isinstance(args, list) else []
+    for i, a in enumerate(args):
+        if a == "--directory" and i + 1 < len(args):
+            return (
+                Path(str(args[i + 1])).expanduser(),
+                "mcpServers.aggregator's --directory argument",
+            )
+    return None
 
 
-def _reader_command(entry: dict) -> Path | None:
-    """The reader binary named by ``command``, as an absolute path.
+def _reader_dir(entry: dict) -> Path:
+    """The CHECKOUT to probe, when a checkout is what gets probed.
+
+    Full precedence for the hook, of which this is the tail:
+
+    1. ``AGGREGATOR_SCHEMA_PROBE`` — run exactly that file.
+    2. An explicitly named tree — ``AGGREGATOR_READER_DIR``, or the config's
+       ``--directory`` argument. Handled here.
+    3. The packaged ``aggregator-schema-probe`` beside the reader binary.
+    4. ``DEFAULT_READER_DIR``. Handled here too, and the weakest answer there
+       is: nobody said this tree is the reader, and a tree is whatever branch
+       someone left it on.
+    """
+    named = _named_tree(entry)
+    return named[0] if named else DEFAULT_READER_DIR
+
+
+def _reader_command(raw: str) -> Path | None:
+    """The reader binary named by ``command``, as a path with a directory.
 
     Bare names are looked up on PATH exactly as Claude Code looks them up, so
     a healthy ``{"command": "aggregator-mcp"}`` config is not reported as
     unverifiable for the sake of a missing slash.
     """
-    raw = entry.get("command")
-    if not isinstance(raw, str) or not raw.strip():
-        return None
-    raw = raw.strip()
     try:
         if os.path.dirname(raw):
             return Path(raw).expanduser()
@@ -195,8 +234,8 @@ def _reader_command(entry: dict) -> Path | None:
         return None
 
 
-def _packaged_probe(entry: dict) -> tuple[Path | None, list[Path]]:
-    """The console script beside the reader binary, plus every path tried.
+def _packaged_probe(entry: dict) -> tuple[Path | None, str]:
+    """The console script beside the reader binary, and where the search went.
 
     UNRESOLVED DIRECTORY FIRST. ``/etc/profiles/per-user/<u>/bin/aggregator-mcp``
     is a symlink into the Nix store, and the profile ``bin/`` — the directory
@@ -205,10 +244,29 @@ def _packaged_probe(entry: dict) -> tuple[Path | None, list[Path]]:
     directory would miss it on precisely the host this exists for. The resolved
     directory is searched second, because a config may name a store path
     outright.
+
+    The prose half is built here rather than by the caller because only this
+    function knows WHY it came back empty, and the three reasons need three
+    different repairs: no ``command`` in the config, a ``command`` that did not
+    resolve, or a console script that is present but not executable.
     """
-    command = _reader_command(entry)
+    raw = entry.get("command")
+    raw = raw.strip() if isinstance(raw, str) else ""
+    if not raw:
+        return None, (
+            "nowhere beside a reader binary — ~/.claude.json's "
+            "mcpServers.aggregator names no command, so there was nothing to "
+            f"look for {PACKAGED_PROBE_NAME} beside"
+        )
+
+    command = _reader_command(raw)
     if command is None:
-        return None, []
+        # Says which name failed. "names no command" would send the reader to
+        # inspect an entry that is present and populated.
+        return None, (
+            f"nowhere beside a reader binary — mcpServers.aggregator's command "
+            f"{raw!r} did not resolve on PATH"
+        )
 
     dirs: list[Path] = [command.parent]
     try:
@@ -219,26 +277,46 @@ def _packaged_probe(entry: dict) -> tuple[Path | None, list[Path]]:
         pass
 
     tried: list[Path] = []
+    rejected: list[Path] = []
     for d in dirs:
         candidate = d / PACKAGED_PROBE_NAME
         tried.append(candidate)
         try:
-            if candidate.is_file() and os.access(candidate, os.X_OK):
-                return candidate, tried
+            if candidate.is_file():
+                if os.access(candidate, os.X_OK):
+                    return candidate, f"beside the reader binary, at {candidate}"
+                # Present and unusable. Named, because "MISSING" about a file
+                # the operator can see on disk costs an afternoon, and the fix
+                # is one chmod.
+                rejected.append(candidate)
         except OSError:
             pass
-    return None, tried
+
+    where = (
+        "beside the reader binary named by ~/.claude.json's "
+        "mcpServers.aggregator.command ("
+        + " and ".join(str(t) for t in tried)
+        + ")"
+    )
+    if rejected:
+        where += (
+            " — " + " and ".join(str(r) for r in rejected) + " exists but is "
+            "not executable, so it was rejected"
+        )
+    return None, where
 
 
 def _probe_invocation() -> Probe:
-    """Pick the probe, most authoritative source first.
+    """Pick the probe, most authoritative statement first.
 
     1. ``AGGREGATOR_SCHEMA_PROBE`` — an explicit instruction outranks anything
        discovered, and it is how a probe under development gets exercised.
-    2. The packaged ``aggregator-schema-probe`` beside the reader binary the
+    2. An explicitly named tree: ``AGGREGATOR_READER_DIR``, or the config's own
+       ``--directory``. See ``_named_tree`` for why this sits above the
+       packaged probe rather than below it.
+    3. The packaged ``aggregator-schema-probe`` beside the reader binary the
        config names. Same build as the reader it reports on.
-    3. A checkout: the ``--directory`` a developer config states, else the
-       default tree. Weakest, because a tree is whatever branch it is on.
+    4. ``DEFAULT_READER_DIR``. A guess, and labelled as one in ``looked``.
     """
     override = os.environ.get("AGGREGATOR_SCHEMA_PROBE")
     if override:
@@ -250,31 +328,29 @@ def _probe_invocation() -> Probe:
         )
 
     entry = _server_entry()
-    packaged, tried = _packaged_probe(entry)
+
+    named = _named_tree(entry)
+    if named is not None:
+        tree, said_by = named
+        checkout = tree / PROBE_RELPATH
+        return Probe(
+            checkout,
+            [sys.executable, str(checkout), "--json"],
+            f"in the tree named by {said_by}, at {checkout}",
+        )
+
+    packaged, where = _packaged_probe(entry)
     if packaged is not None:
         # As a program. It is a wrapper script with its own interpreter, and
         # feeding it to this hook's Python would fail on its first line.
-        return Probe(
-            packaged,
-            [str(packaged), "--json"],
-            f"beside the reader binary, at {packaged}",
-        )
+        return Probe(packaged, [str(packaged), "--json"], where)
 
     checkout = _reader_dir(entry) / PROBE_RELPATH
-    if tried:
-        looked = (
-            "beside the reader binary named by ~/.claude.json's "
-            "mcpServers.aggregator.command ("
-            + " and ".join(str(t) for t in tried)
-            + f"), then in a checkout at {checkout}"
-        )
-    else:
-        looked = (
-            f"in a checkout at {checkout} — ~/.claude.json's "
-            "mcpServers.aggregator names no command, so there was no reader "
-            f"binary to look for {PACKAGED_PROBE_NAME} beside"
-        )
-    return Probe(checkout, [sys.executable, str(checkout), "--json"], looked)
+    return Probe(
+        checkout,
+        [sys.executable, str(checkout), "--json"],
+        f"{where}; then in the default checkout at {checkout}",
+    )
 
 
 def _announce(summary: str, headline: str) -> None:
@@ -353,10 +429,17 @@ def main() -> int:
         summary = verdict["summary"]
     except (ValueError, KeyError, TypeError):
         _announce(
+            # stderr as well as stdout. A packaged probe whose Nix wrapper
+            # cannot start exits non-zero with an EMPTY stdout and puts the
+            # whole diagnosis — the missing shared object, the interpreter that
+            # is not there — on stderr. Quoting only stdout rendered that as
+            # "answered in a shape this hook cannot read (stdout starts '')",
+            # which blames the probe for saying nothing when it said exactly
+            # what was wrong and this hook discarded it.
             "the aggregator schema-health probe answered in a shape this hook "
             f"cannot read (exit {proc.returncode}; stdout starts "
-            f"{proc.stdout[:120]!r}), so recall health is unverified this "
-            "session.",
+            f"{proc.stdout[:120]!r}; stderr starts {proc.stderr[:200]!r}), so "
+            "recall health is unverified this session.",
             "AGGREGATOR RECALL: health UNVERIFIED.",
         )
         return 0

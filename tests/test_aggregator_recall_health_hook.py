@@ -520,21 +520,58 @@ def test_a_command_with_no_packaged_sibling_falls_back_to_the_checkout(
     assert probe.argv == [sys.executable, str(expected), "--json"]
 
 
-def test_a_directory_argument_still_selects_its_own_checkout(tmp_path, monkeypatch):
-    """Today's developer shape, unchanged.
+def test_a_directory_argument_outranks_a_packaged_sibling_on_the_path(
+    tmp_path, monkeypatch
+):
+    """Today's developer shape, and the sibling rule must not eat it.
 
-    ``uv run --directory <dir> aggregator-mcp`` states which tree is under
-    test, and nothing about preferring a packaged artifact may override an
-    explicit statement of the tree Claude Code is actually launching.
+    ``uv run --directory <tree> aggregator-mcp`` states which tree Claude Code
+    is launching. But ``command`` there is ``uv``, which resolves to the Nix
+    profile — and once the console script deploys, ``aggregator-schema-probe``
+    is that binary's SIBLING. Preferring the packaged probe on the strength of
+    that adjacency would silently stop measuring the tree the config named, on
+    every developer config, the day the deploy landed.
+
+    So the fixture puts a real ``uv`` and a real sibling on PATH: an empty PATH
+    made the earlier version of this test pass while proving nothing about the
+    host it was written for.
     """
-    reader = tmp_path / "checkout"
+    tree = tmp_path / "checkout"
+    bindir = tmp_path / "bin"
+    _make_exec(bindir / "uv")
+    _make_exec(bindir / "aggregator-schema-probe")
     entry = {"command": "uv",
-             "args": ["run", "--directory", str(reader), "aggregator-mcp"]}
-    _isolate(monkeypatch, _fake_home(tmp_path, entry), tmp_path / "empty-bin")
+             "args": ["run", "--directory", str(tree), "aggregator-mcp"]}
+    _isolate(monkeypatch, _fake_home(tmp_path, entry), bindir)
 
     probe = _load_hook()._probe_invocation()
 
-    expected = reader / "aggregator" / "health" / "schema_probe.py"
+    expected = tree / "aggregator" / "health" / "schema_probe.py"
+    assert probe.path == expected, (
+        "a packaged probe that merely sits next to `uv` displaced the tree the "
+        "config explicitly named"
+    )
+    assert probe.argv == [sys.executable, str(expected), "--json"]
+
+
+def test_the_reader_dir_override_outranks_a_packaged_sibling(tmp_path, monkeypatch):
+    """``AGGREGATOR_READER_DIR`` is an instruction, not a hint.
+
+    It exists so an operator can aim the check at a specific tree. Left below
+    the packaged tier it would keep looking like a working knob while doing
+    nothing at all from the deploy onward — the worst state for a control to be
+    in, because nothing reports that it stopped mattering.
+    """
+    mcp = _make_exec(tmp_path / "bin" / "aggregator-mcp")
+    _make_exec(tmp_path / "bin" / "aggregator-schema-probe")
+    tree = tmp_path / "under-test"
+    _isolate(monkeypatch, _fake_home(tmp_path, {"command": str(mcp), "args": []}),
+             tmp_path / "empty-bin")
+    monkeypatch.setenv("AGGREGATOR_READER_DIR", str(tree))
+
+    probe = _load_hook()._probe_invocation()
+
+    expected = tree / "aggregator" / "health" / "schema_probe.py"
     assert probe.path == expected
     assert probe.argv == [sys.executable, str(expected), "--json"]
 
@@ -587,3 +624,80 @@ def test_the_missing_message_names_both_places_it_looked(tmp_path):
     assert str(
         home / "Repos" / "aggregator" / "aggregator" / "health" / "schema_probe.py"
     ) in message
+
+
+def test_a_command_that_does_not_resolve_says_so_instead_of_denying_it_exists(
+    tmp_path, monkeypatch
+):
+    """"names no command" is a lie when the config names one that is missing.
+
+    The two conditions need opposite fixes — write the entry versus repair the
+    install or the PATH — and a reader who is told the entry is empty will go
+    and look at an entry that is not. The name it failed to resolve is the
+    whole content of the message.
+    """
+    _isolate(monkeypatch, _fake_home(tmp_path, {"command": "aggregator-mcp"}),
+             tmp_path / "empty-bin")
+
+    looked = _load_hook()._probe_invocation().looked
+
+    assert "aggregator-mcp" in looked and "did not resolve on PATH" in looked
+    assert "names no command" not in looked
+
+
+def test_an_absent_mcp_entry_still_says_the_config_names_no_command(
+    tmp_path, monkeypatch
+):
+    """The other half of the pair, so the two messages cannot collapse into one."""
+    _isolate(monkeypatch, _fake_home(tmp_path, None), tmp_path / "empty-bin")
+
+    looked = _load_hook()._probe_invocation().looked
+
+    assert "names no command" in looked
+    assert "did not resolve" not in looked
+
+
+def test_a_sibling_that_is_not_executable_is_named_not_silently_skipped(
+    tmp_path, monkeypatch
+):
+    """A present-but-chmod-644 console script is a broken install, not an absent one.
+
+    Falling through to the checkout without a word turns a one-line fix into an
+    afternoon: the operator can see the file sitting right there and has been
+    told the probe is MISSING.
+    """
+    mcp = _make_exec(tmp_path / "bin" / "aggregator-mcp")
+    dud = tmp_path / "bin" / "aggregator-schema-probe"
+    dud.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    dud.chmod(0o644)
+    home = _fake_home(tmp_path, {"command": str(mcp), "args": []})
+    _isolate(monkeypatch, home, tmp_path / "empty-bin")
+
+    probe = _load_hook()._probe_invocation()
+
+    assert probe.path == (
+        home / "Repos" / "aggregator" / "aggregator" / "health" / "schema_probe.py"
+    )
+    assert str(dud) in probe.looked and "not executable" in probe.looked
+
+
+def test_a_probe_that_only_speaks_on_stderr_has_its_words_relayed(tmp_path):
+    """A Nix wrapper that cannot start exits non-zero with an empty stdout.
+
+    Everything it knows — the missing library, the broken interpreter path — is
+    on stderr, and the announcement used to quote only ``stdout[:120]``, i.e.
+    ``''``. That reads as "the probe said something unparseable" when the probe
+    said something perfectly clear and this hook threw it away, which is a
+    strictly worse outcome than not checking.
+    """
+    p = _write_bad(
+        tmp_path,
+        "import sys\n"
+        "sys.stderr.write('libtorch_cpu.so: cannot open shared object file')\n"
+        "sys.exit(127)\n",
+    )
+
+    doc = json.loads(_run(p).stdout)
+
+    assert "cannot open shared object file" in doc["systemMessage"]
+    assert "UNVERIFIED" in doc["systemMessage"]
