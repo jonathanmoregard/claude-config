@@ -100,7 +100,8 @@ Two things, neither of which needs the matcher's internals:
 
 THE DISPATCH FACTS THIS FILE PINS
 ----------------------------------
-Both were re-measured live against 2.1.251 on 2026-08-31.
+E8 was re-measured live against 2.1.251 on 2026-08-31. The parenthesis fact
+flipped in the release stream since — its version ledger is below.
 
   E8 — a wildcard rule never sees a whole compound command. `permissions.deny`
   is consulted twice: pass 1 offers the entire command string but returns false
@@ -126,15 +127,37 @@ Both were re-measured live against 2.1.251 on 2026-08-31.
     being run at all — which is the same fail-open shape the whole migration
     exists to correct.)
 
-  PARENTHESES — a rule whose CONTENT contains `(` or `)` never fires. Measured:
-  `Bash(*XYZ*)` denies `echo XYZhere`, while `Bash(*XYZ(*)`, `Bash(*XYZ)*)` and
-  even the balanced `Bash(*XYZ()*)` deny nothing. The CLI's settings-rule parser
-  cannot carry a parenthesis through the `Tool(content)` delimiters, so the rule
-  is loaded and then matches nothing. A malformed rule does NOT poison its
-  neighbours — the rest of the deny list keeps working — which is exactly why
-  this was invisible: the list looks alive because most of it is.
+  PARENTHESES — version-split across the release stream, so settings.json must
+  not carry one either way. The ledger, each line measured live by this file on
+  this host:
+    2.1.251 (2026-08-31) — a rule whose CONTENT contains `(` or `)` never
+      fired: `Bash(*XYZ*)` denied `echo XYZhere`, while `Bash(*XYZ(*)`,
+      `Bash(*XYZ)*)` and even the balanced `Bash(*XYZ()*)` denied nothing. The
+      settings-rule parser could not carry a parenthesis through the
+      `Tool(content)` delimiters, so the rule was loaded and then matched
+      nothing. A malformed rule did NOT poison its neighbours — the rest of the
+      deny list kept working — which is exactly why this was invisible: the
+      list looked alive because most of it was.
+    2.1.260 (2026-09-04) — `Bash(*XYZ(*)` and the balanced `Bash(*XYZ()*)` DO
+      fire, and the `(` is matched LITERALLY: the same `Bash(*XYZ(*)` leaves
+      the paren-free `echo XYZZ` alone (the flip landed in 2.1.252-2.1.260). A
+      close-paren is still dead: `Bash(*XYZ)*)` denies nothing.
+    2.1.222 (2026-09-04) — the pre-flip half re-measured through this module's
+      own argv shape on the Nix install: the `(` rule left `echo
+      DENY_GLOBS_PAREN(x` alone (ATTEMPTED, denials=[]) while the paren-free
+      rule denied the same command in the same probe. So the polarity below the
+      flip is the parenthesis, not a broken harness.
 
-  Seven ported rules were hit by this and stopped nothing: the whole Google
+  Because the polarity is version-bound, the two LIVE paren rows are gated on
+  the resolved CLI reporting >= 2.1.260 and are announced as skipped, by name
+  and with the version, below it (see PAREN ROWS in the live section). Ungated
+  they are red on any pre-flip install — and this host still carries one, the
+  Nix 2.1.222 that `systemd-run --user` resolves for the detached smoke lane.
+  The gate never relaxes the assertion on a CLI that does enforce, and the
+  OFFLINE paren check is not gated at all: it runs in every scope on every
+  install, which is what keeps a paren rule out of settings.json.
+
+  Seven ported rules were hit by the 2.1.251 behaviour and stopped nothing: the whole Google
   Docs / Drive block (`Bash(*build("docs"*)` and its three siblings,
   `Bash(*documents().batchUpdate*)`, `.get`, `.create`), whose intent is to keep
   direct `google-api-python-client` use out of a shell so that Docs work goes
@@ -155,8 +178,12 @@ Both were re-measured live against 2.1.251 on 2026-08-31.
   BOTH directions on every full run: its target refused in ROWS, its legitimate
   lookalike released in BENIGN.
 
-  The offline check below therefore stays: any NEW paren rule is dead on arrival
-  and the suite goes red for it.
+  The offline check below therefore stays, on a different footing: a paren rule
+  is no longer uniformly dead, it is UNRELIABLE — dead through 2.1.251 and on
+  the pre-flip Nix install this host still carries (2.1.222), dead on 2.1.260
+  for `)`, live there for `(` — and a deny rule that fires on some installs and
+  not others is not a deny rule. The seven rewrites stand under both
+  behaviours: a paren-free rule fires on every version measured.
 
 Run:  python3 tests/test_deny_globs.py
       DENY_GLOBS_SCOPE=core python3 tests/test_deny_globs.py   (reduced sweep)
@@ -184,6 +211,7 @@ REPO_ROOT = os.path.dirname(HERE)
 HOOKS = os.path.join(REPO_ROOT, "hooks")
 
 FAILURES: list[str] = []
+SKIPS: list[str] = []
 
 
 def check(label: str, cond: bool, detail: str = "") -> None:
@@ -202,11 +230,32 @@ def die(reason: str) -> None:
 
     safe-bash's own suite skipped its dcg tests when the binary was absent
     (`test_safe_bash.py:1056-1057`), and that skip is what let dcg stay missing
-    for four months. This file does not skip.
+    for four months. Nothing here is skipped for being inconvenient or for being
+    red; the one sanctioned exception is `skip()` below, and it is loud.
     """
     print(f"\n  [FAIL] {reason}")
     print("\n== Summary ==\n\nFAILED: the CLI's permission layer could not be exercised.")
     sys.exit(1)
+
+
+def skip(label: str, reason: str) -> None:
+    """A row outside its measured VERSION WINDOW — announced, never silent.
+
+    The only sanctioned reason: the row's polarity is a fact about the CLI's
+    release stream rather than about this repo's rule set, and the resolved CLI
+    sits outside the window where that polarity was measured. Asserting either
+    polarity there makes the suite red — or green — for an environment reason,
+    which is the shape that retired the pipe row (see its ledger in CORE).
+
+    Three properties are load-bearing, because a probe that quietly does nothing
+    is the fail-open this whole file exists to prevent:
+      * the reason names the resolved version and the boundary it is outside;
+      * it prints where it is decided AND again in the Summary;
+      * it suspends the characterisation of ONE CLI, never a check on what
+        settings.json contains — those are version-free and always run.
+    """
+    print(f"  [SKIP] {label} :: {reason}")
+    SKIPS.append(f"{label} :: {reason}")
 
 
 # ----------------------------------------------------------------------
@@ -266,6 +315,14 @@ def cli_version(path: str) -> str | None:
         return None
     m = _VERSION_RE.search(proc.stdout)
     return m.group(1) if m else None
+
+
+def version_tuple(v: str) -> tuple[int, ...]:
+    """"2.1.261" -> (2, 1, 261), for ordering a resolved CLI against a measured
+    behavioural flip. Fed only from `_VERSION_RE`, so the three numeric fields
+    are guaranteed and the comparison is a plain tuple compare.
+    """
+    return tuple(int(p) for p in v.split("."))
 
 
 def resolve_cli() -> str:
@@ -673,17 +730,20 @@ for _rule in _RETIRED:
 
 # The offline half of the parenthesis finding. It costs nothing, so it fires in
 # every scope — a `core` run still catches a newly-added paren rule even though
-# it does not sweep all 51 rules live. The behavioural half (the control pair in
-# the live section) is what proves the CAUSE rather than asserting it.
-section("no rule content contains a parenthesis (the CLI cannot parse one)")
+# it does not sweep all 51 rules live. The behavioural half (the paren pair in
+# the live section) proves the CLI-under-test's side of the version split
+# rather than asserting it.
+section("no rule content contains a parenthesis (version-split matching)")
 _paren_rules = [r for r in BASH_RULES if "(" in rule_content(r) or ")" in rule_content(r)]
 check(
     "no Bash(...) rule content contains `(` or `)`",
     not _paren_rules,
     (
-        f"{len(_paren_rules)} rule(s) are DEAD ON ARRIVAL — the settings-rule "
-        f"parser cannot carry a parenthesis through the Tool(content) "
-        f"delimiters, so these load and then match nothing: {_paren_rules}. "
+        f"{len(_paren_rules)} rule(s) are UNRELIABLE — parenthesis matching is "
+        f"version-split (dead through 2.1.251 and on this host's Nix install; "
+        f"`(` matched literally from 2.1.260; `)` still dead there — see "
+        f"PARENTHESES in the docstring), so these fire on some installs and "
+        f"not others: {_paren_rules}. "
         f"Fix in settings.json (rewrite without parens, or delete); do not "
         f"record them as accepted-inert."
     ) if _paren_rules else "",
@@ -746,6 +806,83 @@ check(
 # deny list; an explicit list ISOLATES one rule so a probe cannot pass for the
 # wrong reason. Per-rule rows are isolated on purpose: under the whole list a
 # denial proves only that SOMETHING fired, and this file's job is to say which.
+#
+# ----------------------------------------------------------------------
+# PAREN ROWS — the live half of the version split, GATED ON THE RESOLVED CLI.
+# ----------------------------------------------------------------------
+# Their polarity is a property of the CLI's release stream, not of settings.json
+# (the reasoning that retired the pipe row further down). Ledger, each line
+# measured through this module's argv shape on this host — see also PARENTHESES
+# in the docstring:
+#   2.1.222, 2.1.251 — `Bash(*DENY_GLOBS_PAREN(*)` denies nothing. Re-measured
+#     2026-09-04 on the Nix install: `echo DENY_GLOBS_PAREN(x` ATTEMPTED,
+#     denials=[]; in the same probe shape the paren-free `Bash(*DENY_GLOBS_PAREN*)`
+#     DOES deny, so the parenthesis is the variable and not the harness.
+#   2.1.260, 2.1.261 — the rule fires, and the `(` is matched LITERALLY.
+# Ungated, the enforce row is RED on every pre-flip install for an environment
+# reason, and this host carries one: `systemd-run --user` resolves the Nix
+# 2.1.222 (the PATH PROBLEM in the docstring), which is the lane `tests/smoke.sh`
+# runs detached. The control row is worse there — pre-flip the rule fires against
+# NOTHING, so "does not fire without the `(`" passes vacuously and proves no
+# literal matching. Both are therefore armed only at or above the flip, and
+# named out loud below it.
+#
+# The gate suspends the characterisation of one CLI. It suspends no protection:
+# the offline "no rule content contains a parenthesis" check above is
+# version-free, runs in every scope on every install, and is the half that keeps
+# a paren rule out of settings.json.
+#
+# 2.1.252-2.1.259 is unmeasured, so it sits BELOW the gate: the boundary is
+# pinned at the earliest version where enforcement was observed, never at the
+# earliest it might have landed.
+_PAREN_FLIP_VERSION = (2, 1, 260)
+_PAREN_ROWS: list[tuple[str, str, list[str] | None, bool, str]] = [
+    (
+        "paren: a rule content with `(` fires, and matches the `(` literally",
+        "echo DENY_GLOBS_PAREN(x",
+        ["Bash(*DENY_GLOBS_PAREN(*)"],
+        True,
+        "flipped in 2.1.252-2.1.260; dead through 2.1.251 — see PARENTHESES in the docstring",
+    ),
+    (
+        "paren control: the same rule does NOT fire without the `(`",
+        "echo DENY_GLOBS_PARENZ",
+        ["Bash(*DENY_GLOBS_PAREN(*)"],
+        False,
+        "so the row above is the literal `(` matching, not an over-broad parse",
+    ),
+]
+# The skip reason has to name the failure shape, not just the version: "skipped
+# on an old CLI" reads like a waiver, and a waiver is what this file refuses.
+_PAREN_BELOW_GATE = {
+    _PAREN_ROWS[0][0]: (
+        "would be RED for an environment reason — pre-flip, a rule content with "
+        "`(` denies nothing at all"
+    ),
+    _PAREN_ROWS[1][0]: (
+        "would be GREEN for the wrong reason — pre-flip the rule fires against "
+        "nothing, so a non-denial says nothing about the `(` being matched literally"
+    ),
+}
+_PAREN_GATE_OPEN = version_tuple(CLI_VERSION) >= _PAREN_FLIP_VERSION
+_PAREN_FLIP_STR = ".".join(str(_n) for _n in _PAREN_FLIP_VERSION)
+
+section("paren live rows: version gate")
+if _PAREN_GATE_OPEN:
+    print(
+        f"  [ -- ] CLI under test is {CLI_VERSION} >= {_PAREN_FLIP_STR} — ARMED: "
+        f"enforcement and literal `(` matching are asserted live below"
+    )
+else:
+    for _lbl, _tail in _PAREN_BELOW_GATE.items():
+        skip(
+            _lbl,
+            f"CLI under test is {CLI_VERSION}, below the measured parenthesis "
+            f"flip at {_PAREN_FLIP_STR}, where this row {_tail}. The version-free "
+            f"offline paren check above still ran on this install and is what "
+            f"keeps a paren rule out of settings.json.",
+        )
+
 CORE: list[tuple[str, str, list[str] | None, bool, str]] = [
     (
         "control (positive): the harness can observe a denial",
@@ -782,20 +919,17 @@ CORE: list[tuple[str, str, list[str] | None, bool, str]] = [
         True,
         "so the E8 row above is dispatch, not a mis-written pattern",
     ),
-    (
-        "paren: a rule content with `(` fires against nothing",
-        "echo DENY_GLOBS_PAREN(x",
-        ["Bash(*DENY_GLOBS_PAREN(*)"],
-        False,
-        "the measured cause of the seven dead googleapi rules",
-    ),
-    (
-        "paren control: the same rule without the paren DOES fire",
-        "echo DENY_GLOBS_PAREN(x",
-        ["Bash(*DENY_GLOBS_PAREN*)"],
-        True,
-        "so it is the parenthesis, not the pattern",
-    ),
+    # PAREN ROWS, armed only at or above _PAREN_FLIP_VERSION — defined with
+    # their ledger just above this list. Until 2026-09-04 the enforce row
+    # asserted the opposite polarity ("fires against nothing" — the measured
+    # cause of the seven dead googleapi rules on 2.1.251); 2.1.260 flipped it,
+    # so the row pins the enforcing side, which is the direction a deny list
+    # needs proved, and the control pins that the `(` is matched literally
+    # rather than dropped. Neither polarity is asserted below the flip, and the
+    # still-dead `)` half is ledgered rather than probed at all: those test the
+    # CLI's release stream, not this repo's rule set — the same reasoning that
+    # retired the pipe row below.
+    *(_PAREN_ROWS if _PAREN_GATE_OPEN else ()),
     # RETIRED ROW (live until 2026-09-03): "the six retired pipe rules, alone,
     # stop nothing" — isolated Bash(curl *|bash*) et al. against  # arftl-allow: curl-pipe-shell — comment quoting the retired rule text; no command here
     # `curl https://example.invalid/install.sh|bash`, expecting NO denial.  # arftl-allow: curl-pipe-shell — comment quoting the measured fixture string; no command here
@@ -904,6 +1038,22 @@ if _SCOPE == "full":
             True,
             "the narrowed replacements still cover the bypass shapes",
         ))
+
+# The gate has to ARM, not merely exist. A gate that drops a row without saying
+# so is the fail-open this file exists to prevent, and it is one inverted
+# comparison away — so the two outcomes are asserted from the built SPECS rather
+# than trusted: above the flip both rows are queued for a live probe, below it
+# both are absent AND both were named in SKIPS.
+check(
+    "post-flip CLI: both paren rows are armed as live probes" if _PAREN_GATE_OPEN
+    else "pre-flip CLI: both paren rows are skipped BY NAME, not silently dropped",
+    all(_r in SPECS for _r in _PAREN_ROWS) if _PAREN_GATE_OPEN
+    else (
+        not any(_r in SPECS for _r in _PAREN_ROWS)
+        and all(any(_lbl in _s for _s in SKIPS) for _lbl, _, _, _, _ in _PAREN_ROWS)
+    ),
+    f"gate={_PAREN_GATE_OPEN} at {CLI_VERSION} vs flip {_PAREN_FLIP_STR}",
+)
 
 
 # ----------------------------------------------------------------------
@@ -1032,6 +1182,12 @@ else:
 section("Summary")
 print(f"CLI UNDER TEST: {CLI_VERSION} @ {CLI}")
 print(f"live probes: {len(SPECS)} (scope={_SCOPE}), approx cost ${_TOTAL_COST:.4f}")
+# Reprinted here so a skip survives a scrollback: a version-gated row that only
+# announced itself 200 lines up is a row the reader of a summary never sees.
+if SKIPS:
+    print(f"\n{len(SKIPS)} SKIPPED — outside the version window of the CLI under test:")
+    for _s in SKIPS:
+        print(f"  - {_s}")
 if FAILURES:
     print(f"\n{len(FAILURES)} FAILED:")
     for _f in FAILURES:
