@@ -591,7 +591,29 @@ def main() -> int:
         return 0
 
     if state == FINE:
-        # The earned silence. Nothing printed, nothing injected.
+        # SILENCE IS A CLAIM, AND ONLY SOME TIERS CAN MAKE IT. Nothing printed
+        # means "checked and healthy" — that contract is why this hook gets a
+        # SessionStart slot. A `fine` from the GUESS tier measured a tree
+        # nobody named, and a `fine` reached after ~/.claude.json could not be
+        # read was produced by a hook that does not know what Claude Code
+        # launches. Both are "not checked". Returning silently for either is
+        # the original incident with the sign flipped: recall could be dead
+        # while an unrelated tree agreed with itself, and the session would be
+        # told exactly as much as if the check had passed.
+        if probe.tier != TIER_GUESS and probe.note is None:
+            # The earned silence. Nothing printed, nothing injected.
+            return 0
+        # One calm line. NOT the outage headline — announcing an unverified
+        # pass as a failure would be its own false alarm, and this branch
+        # exists to stop manufacturing those.
+        _announce(
+            "the schema probe found nothing wrong, but it did not measure the "
+            "reader Claude Code runs, so this is 'not checked' rather than "
+            "'checked and healthy'. Recall may well be fine — nothing here "
+            "verified it.",
+            "AGGREGATOR RECALL: looked healthy, but not verified.",
+            _provenance(probe, measured=True),
+        )
         return 0
 
     if state == DEAD:

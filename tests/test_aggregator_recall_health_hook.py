@@ -773,12 +773,18 @@ def _plant_py_probe(path: Path, payload: dict | None = None) -> Path:
     return path
 
 
-def _plant_sh_probe(path: Path) -> Path:
+def _plant_sh_probe(path: Path, payload: dict | None = None) -> Path:
     return _make_exec(
         path,
         "#!/bin/sh\n"
-        "printf '%s\\n' '" + json.dumps(DEAD_VERDICT) + "'\nexit 20\n",
+        "printf '%s\\n' '" + json.dumps(payload or DEAD_VERDICT) + "'\nexit 20\n",
     )
+
+
+FINE_VERDICT = {
+    "state": "fine", "severity": "silent", "summary": "all three agree at 7",
+    "findings": [],
+}
 
 
 def _run_hook(home: Path, path_dir: Path, **extra_env: str):
@@ -1035,3 +1041,91 @@ def test_a_state_this_hook_does_not_know_still_speaks(tmp_path):
 
     assert proc.stdout, "the hook went silent on a state it did not recognise"
     assert "cache is not a db" in json.loads(proc.stdout)["systemMessage"]
+
+
+# ---------------------------------------------------------------------------
+# H2: silence is a claim, and only some tiers have standing to make it
+# ---------------------------------------------------------------------------
+# Silence means "checked and healthy" — that is the contract this hook is built
+# on and the reason it competes for a SessionStart slot at all. But `fine`
+# returned silently at ANY tier, so a guessed checkout that happened to agree
+# with the cache, or a run that never managed to read ~/.claude.json, produced
+# the identical nothing. That is the original incident with the sign flipped:
+# recall could be dead while a tree nobody named said everything agreed, and
+# the session would be told exactly as much as if the check had passed.
+
+
+def test_a_healthy_verdict_from_the_guessed_checkout_is_not_silence(tmp_path):
+    """The guess tier has no standing to say "checked and healthy".
+
+    It measured a tree nobody named. Agreement there is evidence about that
+    tree and nothing else, so it gets one calm line — not the outage headline,
+    which would be its own false alarm.
+    """
+    home = _fake_home(tmp_path, {})
+    _plant_py_probe(
+        home / "Repos" / "aggregator" / "aggregator" / "health" / "schema_probe.py",
+        FINE_VERDICT,
+    )
+
+    proc = _run_hook(home, tmp_path / "empty-bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout, "a healthy-looking guess was reported as a verified pass"
+    message = json.loads(proc.stdout)["systemMessage"]
+    assert "not verified" in message
+    assert "GUESS" in message
+    assert "REFUSING" not in message.upper() and "IS DOWN" not in message
+
+
+def test_a_healthy_verdict_after_an_unreadable_config_is_not_silence(tmp_path):
+    """Same standing problem, different cause, and a NAMED tier this time.
+
+    AGGREGATOR_READER_DIR still resolves when ~/.claude.json cannot be parsed,
+    so the tier looks authoritative while the hook has no idea what Claude Code
+    is actually launching. The config fault has to survive into the verdict
+    rather than being reported only when something else also goes wrong.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".claude.json").write_text('{"mcpServers":', encoding="utf-8")
+    tree = tmp_path / "aimed-at"
+    _plant_py_probe(tree / "aggregator" / "health" / "schema_probe.py", FINE_VERDICT)
+
+    proc = _run_hook(home, tmp_path / "empty-bin", AGGREGATOR_READER_DIR=str(tree))
+
+    assert proc.stdout, "a healthy verdict hid a config the hook could not read"
+    message = json.loads(proc.stdout)["systemMessage"]
+    assert "not verified" in message
+    assert "could not be read" in message and "JSONDecodeError" in message
+
+
+def test_a_healthy_verdict_from_the_packaged_sibling_stays_silent(tmp_path):
+    """The other half, and the one that keeps the budget worth having.
+
+    The sibling IS the reader under test. When it says everything agrees, the
+    check has done its job and must print nothing at all — a hook that speaks
+    on a good day is one nobody reads on a bad one.
+    """
+    mcp = _make_exec(tmp_path / "bin" / "aggregator-mcp")
+    _plant_sh_probe(tmp_path / "bin" / "aggregator-schema-probe", FINE_VERDICT)
+    home = _fake_home(tmp_path, {"command": str(mcp), "args": []})
+
+    proc = _run_hook(home, tmp_path / "empty-bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "", f"the hook spoke on a verified pass: {proc.stdout!r}"
+
+
+def test_a_healthy_verdict_from_a_named_tree_stays_silent(tmp_path):
+    """A tree the config named is a statement about the reader, so it counts."""
+    tree = tmp_path / "checkout"
+    _plant_py_probe(tree / "aggregator" / "health" / "schema_probe.py", FINE_VERDICT)
+    home = _fake_home(tmp_path, {
+        "command": "uv",
+        "args": ["run", "--directory", str(tree), "aggregator-mcp"],
+    })
+
+    proc = _run_hook(home, tmp_path / "empty-bin")
+
+    assert proc.stdout == "", f"the hook spoke on a verified pass: {proc.stdout!r}"
