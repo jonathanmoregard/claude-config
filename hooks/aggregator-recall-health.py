@@ -201,23 +201,6 @@ def _named_tree(entry: dict) -> tuple[Path, str] | None:
     return None
 
 
-def _reader_dir(entry: dict) -> Path:
-    """The CHECKOUT to probe, when a checkout is what gets probed.
-
-    Full precedence for the hook, of which this is the tail:
-
-    1. ``AGGREGATOR_SCHEMA_PROBE`` — run exactly that file.
-    2. An explicitly named tree — ``AGGREGATOR_READER_DIR``, or the config's
-       ``--directory`` argument. Handled here.
-    3. The packaged ``aggregator-schema-probe`` beside the reader binary.
-    4. ``DEFAULT_READER_DIR``. Handled here too, and the weakest answer there
-       is: nobody said this tree is the reader, and a tree is whatever branch
-       someone left it on.
-    """
-    named = _named_tree(entry)
-    return named[0] if named else DEFAULT_READER_DIR
-
-
 def _reader_command(raw: str) -> Path | None:
     """The reader binary named by ``command``, as a path with a directory.
 
@@ -345,7 +328,10 @@ def _probe_invocation() -> Probe:
         # feeding it to this hook's Python would fail on its first line.
         return Probe(packaged, [str(packaged), "--json"], where)
 
-    checkout = _reader_dir(entry) / PROBE_RELPATH
+    # Nobody named a tree — `_named_tree` returned None above — so this is the
+    # default and nothing else. Routing it through a helper that re-asked the
+    # same question could only ever get the same answer.
+    checkout = DEFAULT_READER_DIR / PROBE_RELPATH
     return Probe(
         checkout,
         [sys.executable, str(checkout), "--json"],
