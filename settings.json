@@ -5,7 +5,8 @@
     "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
     "CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS": "90000",
     "DISABLE_ERROR_REPORTING": "1",
-    "DISABLE_TELEMETRY": "1"
+    "DISABLE_TELEMETRY": "1",
+    "MCP_TIMEOUT": "120000"
   },
   "permissions": {
     "defaultMode": "acceptEdits",
