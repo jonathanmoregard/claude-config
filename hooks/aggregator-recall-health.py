@@ -435,9 +435,34 @@ def _probe_invocation() -> Probe:
        config names. Same build as the reader it reports on.
     4. ``DEFAULT_READER_DIR``. A guess, and every announcement says so.
     """
+    override_problem = None
+    path = None
     override = os.environ.get("AGGREGATOR_SCHEMA_PROBE")
     if override:
-        path = Path(override).expanduser()
+        # ABSOLUTE, OR IT IS NOT A PROBE — the same rule the tree tiers get,
+        # for the same reason: this hook inherits the SESSION's working
+        # directory, so a relative value is stat'd and then EXECUTED out of
+        # whatever project the operator happened to open. And `expanduser`
+        # RAISES on `~nouser/...`, which travelled past every announcement
+        # into the fail-open floor.
+        try:
+            candidate = Path(override).expanduser()
+        except (RuntimeError, OSError, ValueError) as exc:
+            override_problem = (
+                f"AGGREGATOR_SCHEMA_PROBE is {override!r}, which could not be "
+                f"expanded ({type(exc).__name__}: {exc}), so it was ignored"
+            )
+        else:
+            if candidate.is_absolute():
+                path = candidate
+            else:
+                override_problem = (
+                    f"AGGREGATOR_SCHEMA_PROBE is {override!r}, which is not an "
+                    "absolute path — it would resolve against whatever "
+                    "directory the session was started in, so it was ignored"
+                )
+
+    if path is not None:
         note = None
         if path.suffix == ".py":
             # The source probe, and every stub in the test suite: a plain
@@ -472,8 +497,10 @@ def _probe_invocation() -> Probe:
     entry, config_problem = _server_entry()
 
     named, tree_problem = _named_tree(entry)
-    # Both faults describe how the tier was chosen, so both ride the same line.
-    note = "; ".join(n for n in (config_problem, tree_problem) if n) or None
+    # Every fault describes how the tier was chosen, so they ride one line.
+    note = "; ".join(
+        n for n in (override_problem, config_problem, tree_problem) if n
+    ) or None
 
     if named is not None:
         tree, said_by = named

@@ -1350,3 +1350,100 @@ def test_a_crash_inside_the_announcement_still_produces_one_announcement(
     assert "RuntimeError" in doc["systemMessage"]
     assert str(probe) in doc["systemMessage"]
     assert doc["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+
+
+@pytest.mark.parametrize(
+    "value,expect",
+    [
+        ("relative/probe.py", "not an absolute path"),
+        ("~nouser/probe.py", "could not be expanded"),
+    ],
+    ids=["relative", "no-such-user"],
+)
+def test_an_override_that_is_not_an_absolute_path_is_refused(
+    tmp_path, value, expect
+):
+    """M5. The escape hatch gets the same rule as the tree tiers, for the same
+    reason: this hook inherits the SESSION's working directory, so a relative
+    override is stat'd and then EXECUTED out of whatever project the operator
+    happened to open. ``~nouser/x`` is worse — ``expanduser`` raises there, and
+    the raise used to travel past every announcement into the fail-open floor.
+    """
+    home = _fake_home(tmp_path, {})
+
+    proc = _run_hook(home, tmp_path / "empty-bin", AGGREGATOR_SCHEMA_PROBE=value)
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout, "the hook went silent on an unusable override"
+    message = json.loads(proc.stdout)["systemMessage"]
+    assert expect in message
+    assert "GUESS" in message, "it did not fall through to the next tier"
+
+
+def test_an_override_pointing_at_a_directory_is_not_called_missing(tmp_path):
+    """L4. A directory standing where the probe should be is a broken install,
+    not an absent one — the packaged tier already says so and this did not."""
+    probe = tmp_path / "aggregator-schema-probe"
+    probe.mkdir()
+    home = _fake_home(tmp_path, {})
+
+    proc = _run_hook(home, tmp_path / "empty-bin", AGGREGATOR_SCHEMA_PROBE=str(probe))
+
+    message = json.loads(proc.stdout)["systemMessage"]
+    assert "not a regular file" in message
+    assert "MISSING" not in message
+
+
+def test_a_non_object_mcp_entry_is_reported_as_a_config_fault(tmp_path):
+    """M6. ``"aggregator": "aggregator-mcp"`` is a config someone wrote and got
+    wrong. Collapsing it to ``{}`` made the hook say the entry "names no
+    command" about an entry that is right there, and — worse — let a healthy
+    verdict from an unrelated tier go silent, since silence is now gated on
+    there being no config problem."""
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".claude.json").write_text(
+        json.dumps({"mcpServers": {"aggregator": "aggregator-mcp"}}), encoding="utf-8"
+    )
+
+    proc = _run_hook(home, tmp_path / "empty-bin")
+
+    message = json.loads(proc.stdout)["systemMessage"]
+    assert "not an object" in message and "str" in message
+    assert "names no command" not in message
+
+
+def test_a_healthy_verdict_under_a_non_object_mcp_entry_is_not_silence(tmp_path):
+    """The consequence that makes M6 more than cosmetic."""
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".claude.json").write_text(
+        json.dumps({"mcpServers": {"aggregator": 7}}), encoding="utf-8"
+    )
+    tree = tmp_path / "aimed-at"
+    _plant_py_probe(tree / "aggregator" / "health" / "schema_probe.py", FINE_VERDICT)
+
+    proc = _run_hook(home, tmp_path / "empty-bin", AGGREGATOR_READER_DIR=str(tree))
+
+    assert proc.stdout, "a healthy verdict hid a config entry of the wrong type"
+    assert "not verified" in json.loads(proc.stdout)["systemMessage"]
+
+
+def test_a_refused_reader_dir_still_lets_the_directory_argument_through(tmp_path):
+    """L3. The two named-tree sources were tried as an either/or, so a typo in
+    the environment override silently disqualified a perfectly good
+    ``--directory`` as well and dropped the check two tiers."""
+    tree = tmp_path / "checkout"
+    _plant_py_probe(tree / "aggregator" / "health" / "schema_probe.py")
+    home = _fake_home(tmp_path, {
+        "command": "uv",
+        "args": ["run", "--directory", str(tree), "aggregator-mcp"],
+    })
+
+    proc = _run_hook(home, tmp_path / "empty-bin",
+                     AGGREGATOR_READER_DIR="relative/tree")
+
+    message = json.loads(proc.stdout)["systemMessage"]
+    assert "cache 5, reader 6" in message, "the --directory tree was not used"
+    assert "not an absolute path" in message, "the refused override went unmentioned"
+    assert "GUESS" not in message
