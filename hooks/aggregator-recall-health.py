@@ -177,21 +177,38 @@ class Probe(NamedTuple):
     argv: list[str]
     looked: str
     tier: str
+    # A fact about how the tier was chosen that the tier name cannot carry —
+    # today, that ~/.claude.json could not be read, which demotes the search
+    # to its guess without anything else saying so.
+    note: str | None = None
 
 
-def _server_entry() -> dict:
-    """``mcpServers.aggregator`` from ~/.claude.json, or ``{}``.
+def _server_entry() -> tuple[dict, str | None]:
+    """``mcpServers.aggregator`` from ~/.claude.json, and why it is empty.
 
     Read once and passed down: the file is the single statement of what Claude
     Code launches, and two independent reads could disagree mid-session.
+
+    ABSENT AND UNREADABLE ARE DIFFERENT FACTS. Both used to collapse into
+    ``{}``, so a truncated or half-written config produced "mcpServers.
+    aggregator names no command" — a claim about a file this hook never got
+    inside. It also demotes the whole search to its guess tier, quietly, which
+    is the shape of failure the rest of this module exists to make loud. A
+    missing file is the ordinary case and stays silent; anything else is named.
     """
+    path = Path.home() / ".claude.json"
     try:
-        with open(Path.home() / ".claude.json", "rb") as fh:
+        with open(path, "rb") as fh:
             doc = json.loads(fh.read().decode("utf-8", "replace"))
         entry = (doc.get("mcpServers") or {}).get("aggregator")
-        return entry if isinstance(entry, dict) else {}
-    except (OSError, ValueError, AttributeError, TypeError):
-        return {}
+        return (entry if isinstance(entry, dict) else {}), None
+    except FileNotFoundError:
+        return {}, None
+    except (OSError, ValueError, AttributeError, TypeError) as exc:
+        return {}, (
+            f"{path} could not be read ({type(exc).__name__}: {exc}), so no "
+            "reader could be resolved from it"
+        )
 
 
 def _named_tree(entry: dict) -> tuple[Path, str] | None:
@@ -241,7 +258,7 @@ def _reader_command(raw: str) -> Path | None:
         return None
 
 
-def _packaged_probe(entry: dict) -> tuple[Path | None, str]:
+def _packaged_probe(entry: dict, config_problem: str | None = None) -> tuple[Path | None, str]:
     """The console script beside the reader binary, and where the search went.
 
     UNRESOLVED DIRECTORY FIRST. ``/etc/profiles/per-user/<u>/bin/aggregator-mcp``
@@ -260,6 +277,13 @@ def _packaged_probe(entry: dict) -> tuple[Path | None, str]:
     raw = entry.get("command")
     raw = raw.strip() if isinstance(raw, str) else ""
     if not raw:
+        if config_problem:
+            # Not "names no command": the file was never read, so it said
+            # nothing either way. The detail rides on the provenance line.
+            return None, (
+                "nowhere beside a reader binary — ~/.claude.json could not be "
+                "read, so no reader binary was named"
+            )
         return None, (
             "nowhere beside a reader binary — ~/.claude.json's "
             "mcpServers.aggregator names no command, so there was nothing to "
@@ -369,7 +393,7 @@ def _probe_invocation() -> Probe:
             TIER_OVERRIDE,
         )
 
-    entry = _server_entry()
+    entry, config_problem = _server_entry()
 
     named = _named_tree(entry)
     if named is not None:
@@ -380,13 +404,17 @@ def _probe_invocation() -> Probe:
             [sys.executable, str(checkout), "--json"],
             f"in the tree named by {said_by}, at {checkout}",
             f"tree named by {said_by}",
+            config_problem,
         )
 
-    packaged, where = _packaged_probe(entry)
+    packaged, where = _packaged_probe(entry, config_problem)
     if packaged is not None:
         # As a program. It is a wrapper script with its own interpreter, and
         # feeding it to this hook's Python would fail on its first line.
-        return Probe(packaged, [str(packaged), "--json"], where, TIER_PACKAGED)
+        return Probe(
+            packaged, [str(packaged), "--json"], where, TIER_PACKAGED,
+            config_problem,
+        )
 
     # Nobody named a tree — `_named_tree` returned None above — so this is the
     # default and nothing else. Routing it through a helper that re-asked the
@@ -397,6 +425,7 @@ def _probe_invocation() -> Probe:
         [sys.executable, str(checkout), "--json"],
         f"{where}; then in the default checkout at {checkout}",
         TIER_GUESS,
+        config_problem,
     )
 
 
@@ -409,8 +438,13 @@ def _provenance(probe: Probe, *, measured: bool) -> str:
     """
     verb = "measured by" if measured else "probe selected"
     line = f"{verb}: {probe.path} ({probe.tier})"
+    clauses = []
     if probe.tier == TIER_GUESS:
-        line += f" — {GUESS_CAVEAT}"
+        clauses.append(GUESS_CAVEAT)
+    if probe.note:
+        clauses.append(probe.note)
+    if clauses:
+        line += " — " + "; ".join(clauses)
     return line
 
 

@@ -932,3 +932,60 @@ def test_a_probe_file_with_no_permissions_is_still_found_and_reported_on(tmp_pat
     message = json.loads(proc.stdout)["systemMessage"]
     assert "MISSING" not in message and "could not be resolved" not in message
     assert "Permission denied" in message
+
+
+def test_an_unparseable_claude_json_is_reported_not_read_as_empty(tmp_path):
+    """A config the hook could not parse is not a config that says nothing.
+
+    ``_server_entry`` collapsed both into ``{}``, so a truncated or
+    half-written ``~/.claude.json`` produced "mcpServers.aggregator names no
+    command" — a claim about a file the hook never managed to look inside. The
+    repairs differ completely: write the entry, versus repair the file. And
+    the second silently demotes the check to its guess tier, which is the
+    failure mode this whole branch exists to make loud.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".claude.json").write_text('{"mcpServers": {"aggregator": ', encoding="utf-8")
+
+    message = json.loads(_run_hook(home, tmp_path / "empty-bin").stdout)["systemMessage"]
+
+    assert str(home / ".claude.json") in message
+    assert "JSONDecodeError" in message
+    assert "names no command" not in message
+
+
+def test_an_unreadable_claude_json_names_the_permission_error(tmp_path):
+    """Same distinction, the other cause: present, parseable, not readable."""
+    if os.geteuid() == 0:
+        pytest.skip("root reads a 0o000 file, so nothing is refused")
+
+    home = tmp_path / "home"
+    home.mkdir()
+    cfg = home / ".claude.json"
+    cfg.write_text("{}", encoding="utf-8")
+    cfg.chmod(0o000)
+    try:
+        message = json.loads(
+            _run_hook(home, tmp_path / "empty-bin").stdout
+        )["systemMessage"]
+    finally:
+        cfg.chmod(0o644)
+
+    assert str(cfg) in message
+    assert "PermissionError" in message
+
+
+def test_an_absent_claude_json_is_not_reported_as_a_broken_one(tmp_path):
+    """The control. No file is the ordinary case on a fresh machine.
+
+    It must not acquire an error message, or the distinction above is worth
+    nothing — a warning that fires for everybody says nothing about anybody.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+
+    message = json.loads(_run_hook(home, tmp_path / "empty-bin").stdout)["systemMessage"]
+
+    assert "could not be read" not in message
+    assert "JSONDecodeError" not in message and "PermissionError" not in message
