@@ -453,7 +453,37 @@ def main() -> int:
         pass
 
     probe = _probe_invocation()
-    if not probe.path.is_file():
+    # os.stat, not Path.is_file(), for the reason spelled out in
+    # `_packaged_probe`: pathlib maps EVERY OSError to False, so an unreadable
+    # path arrives indistinguishable from an absent one. Announcing MISSING for
+    # a probe that is sitting right there sends the operator to reinstall a
+    # file they can see.
+    try:
+        present = stat.S_ISREG(os.stat(probe.path).st_mode)
+        unreachable = None
+    except FileNotFoundError:
+        present, unreachable = False, None
+    except OSError as exc:
+        present = False
+        unreachable = (
+            f"{probe.path} could not be resolved "
+            f"({type(exc).__name__}: {exc})"
+        )
+
+    if unreachable is not None:
+        _announce(
+            f"the aggregator schema-health probe could not be examined — "
+            f"{unreachable} — so whether aggregator_search_memory works could "
+            "not be checked. An empty recall result this session is not "
+            "evidence that nothing was found. The file may well be present: "
+            "this is a permissions or filesystem fault on the path, not a "
+            "missing install.",
+            "AGGREGATOR RECALL: health UNVERIFIED.",
+            _provenance(probe, measured=False),
+        )
+        return 0
+
+    if not present:
         _announce(
             f"the aggregator schema-health probe is MISSING at {probe.path}, "
             "so whether aggregator_search_memory works could not be checked. "

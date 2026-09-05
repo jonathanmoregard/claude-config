@@ -873,3 +873,62 @@ def test_a_verdict_read_off_the_guessed_checkout_says_it_may_be_wrong(tmp_path):
     for reader in (doc["systemMessage"], doc["hookSpecificOutput"]["additionalContext"]):
         assert "GUESS" in reader
         assert "may not describe the reader" in reader
+
+
+def test_a_probe_it_cannot_stat_is_not_reported_as_absent(tmp_path):
+    """The sibling fix, applied to the probe the hook finally settled on.
+
+    ``main`` still gated the chosen probe with ``Path.is_file()``, which maps
+    every OSError to ``False`` — so an unreadable path was announced as MISSING
+    and the operator was sent to install a file that is already there. Same
+    misdiagnosis, same fix, one tier down.
+
+    The trigger is an unreadable PARENT, not a ``0o000`` probe file: ``stat``
+    needs no permission on the file itself, so a mode-000 probe is found
+    correctly and fails later, loudly, when it is run.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root traverses a 0o000 directory, so nothing raises")
+
+    holder = tmp_path / "holder"
+    probe = _plant_py_probe(holder / "schema_probe.py")
+    home = _fake_home(tmp_path, {})
+
+    holder.chmod(0o000)
+    try:
+        proc = _run_hook(home, tmp_path / "empty-bin",
+                         AGGREGATOR_SCHEMA_PROBE=str(probe))
+    finally:
+        holder.chmod(0o755)
+
+    assert proc.returncode == 0, proc.stderr
+    message = json.loads(proc.stdout)["systemMessage"]
+    assert "MISSING" not in message, (
+        "an unreadable probe was reported as absent, which is the wrong repair"
+    )
+    assert "could not be resolved" in message
+    assert "PermissionError" in message
+
+
+def test_a_probe_file_with_no_permissions_is_still_found_and_reported_on(tmp_path):
+    """The neighbouring case, pinned so the fix above cannot over-reach.
+
+    A ``0o000`` probe file is present and stat-able. It must NOT be called
+    missing or unresolvable — the interpreter refuses it at exec time, and that
+    lands in the unreadable-verdict announcement, which since the stderr fix
+    relays the reason verbatim.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root reads a 0o000 file, so nothing is refused")
+
+    probe = _plant_py_probe(tmp_path / "holder" / "schema_probe.py")
+    probe.chmod(0o000)
+    home = _fake_home(tmp_path, {})
+
+    proc = _run_hook(home, tmp_path / "empty-bin",
+                     AGGREGATOR_SCHEMA_PROBE=str(probe))
+
+    assert proc.returncode == 0, proc.stderr
+    message = json.loads(proc.stdout)["systemMessage"]
+    assert "MISSING" not in message and "could not be resolved" not in message
+    assert "Permission denied" in message
