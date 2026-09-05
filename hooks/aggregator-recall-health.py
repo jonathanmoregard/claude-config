@@ -251,25 +251,26 @@ def _named_tree(entry: dict) -> tuple[tuple[Path, str] | None, str | None]:
     adjacency above an explicit statement would therefore stop measuring the
     named tree on every developer config at once, silently, on deploy day.
     """
-    raw: str | None = None
-    said_by = ""
+    # BOTH sources, in preference order — not an either/or. Trying only the
+    # first one present meant a typo in AGGREGATOR_READER_DIR disqualified a
+    # perfectly good `--directory` alongside it and dropped the check two whole
+    # tiers, on the strength of a mistake in an unrelated place.
+    candidates: list[tuple[str, str]] = []
     override = os.environ.get("AGGREGATOR_READER_DIR")
     if override:
-        raw, said_by = override, "AGGREGATOR_READER_DIR"
+        candidates.append((override, "AGGREGATOR_READER_DIR"))
     args = entry.get("args")
     # Normalised, not guarded after the fact: a hand-edited ~/.claude.json can
     # put any JSON type here, and `enumerate(5)` inside this hook raises past
     # every announcement into the top-level `except BaseException`, i.e. exits
     # silently — the one outcome this check may never produce.
     args = args if isinstance(args, list) else []
-    if raw is None:
-        for i, a in enumerate(args):
-            if a == "--directory" and i + 1 < len(args):
-                raw = str(args[i + 1])
-                said_by = "mcpServers.aggregator's --directory argument"
-                break
-    if raw is None:
-        return None, None
+    for i, a in enumerate(args):
+        if a == "--directory" and i + 1 < len(args):
+            candidates.append(
+                (str(args[i + 1]), "mcpServers.aggregator's --directory argument")
+            )
+            break
 
     # ABSOLUTE, OR IT IS NOT A TREE. This hook inherits the SESSION's working
     # directory — whatever project the operator happened to open — so a
@@ -279,20 +280,27 @@ def _named_tree(entry: dict) -> tuple[tuple[Path, str] | None, str | None]:
     # asked about. Refused and named rather than silently dropped, because the
     # shape of this mistake is a typo in a config the operator believes is
     # aiming the check somewhere.
-    try:
-        tree = Path(raw).expanduser()
-    except (RuntimeError, OSError, ValueError) as exc:
-        return None, (
-            f"{said_by} is {raw!r}, which could not be expanded "
-            f"({type(exc).__name__}: {exc}), so it was ignored"
-        )
-    if not tree.is_absolute():
-        return None, (
-            f"{said_by} is {raw!r}, which is not an absolute path — it would "
-            "resolve against whatever directory the session was started in, "
-            "so it was ignored"
-        )
-    return (tree, said_by), None
+    problems: list[str] = []
+    for raw, said_by in candidates:
+        try:
+            tree = Path(raw).expanduser()
+        except (RuntimeError, OSError, ValueError) as exc:
+            problems.append(
+                f"{said_by} is {raw!r}, which could not be expanded "
+                f"({type(exc).__name__}: {exc}), so it was ignored"
+            )
+            continue
+        if not tree.is_absolute():
+            problems.append(
+                f"{said_by} is {raw!r}, which is not an absolute path — it "
+                "would resolve against whatever directory the session was "
+                "started in, so it was ignored"
+            )
+            continue
+        # A refusal further up still gets reported: the operator believes that
+        # value is doing something.
+        return (tree, said_by), ("; ".join(problems) or None)
+    return None, ("; ".join(problems) or None)
 
 
 def _reader_command(raw: str) -> Path | None:
