@@ -678,11 +678,16 @@ def _check(probe: Probe) -> int:
     # file they can see.
     try:
         present = stat.S_ISREG(os.stat(probe.path).st_mode)
+        # Something is there, it just is not a file — a directory or a socket
+        # standing exactly where the probe belongs. The packaged tier already
+        # names that case; announcing MISSING about a path with a directory
+        # sitting on it sends the operator to install what is in the way.
+        irregular = not present
         unreachable = None
     except FileNotFoundError:
-        present, unreachable = False, None
+        present, irregular, unreachable = False, False, None
     except OSError as exc:
-        present = False
+        present = irregular = False
         unreachable = (
             f"{probe.path} could not be resolved "
             f"({type(exc).__name__}: {exc})"
@@ -696,6 +701,18 @@ def _check(probe: Probe) -> int:
             "evidence that nothing was found. The file may well be present: "
             "this is a permissions or filesystem fault on the path, not a "
             "missing install.",
+            "AGGREGATOR RECALL: health UNVERIFIED.",
+            _provenance(probe, measured=False),
+        )
+        return 0
+
+    if irregular:
+        _announce(
+            f"the aggregator schema-health probe path {probe.path} exists but "
+            "is not a regular file — a directory or socket is standing where "
+            "the probe belongs — so whether aggregator_search_memory works "
+            "could not be checked. An empty recall result this session is not "
+            "evidence that nothing was found.",
             "AGGREGATOR RECALL: health UNVERIFIED.",
             _provenance(probe, measured=False),
         )
