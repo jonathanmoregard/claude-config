@@ -1,21 +1,22 @@
 ---
-name: kablong-components
+name: klaffat-components
 description: >
-  Reusable UI partials + tokens for the kablong / Klaffat web app. Use when
-  working in the kablong repo on templates, tokens, or component partials —
-  authoring or editing a radio group, button, dialog, form field, or empty
-  state; when a template lint warning points at a raw <input type="radio">,
-  <button>, or <dialog>; or when writing/adjusting CSS custom properties in
-  tokens.css. Also applies for destructive-POST dialogs and any migration
-  from an inline control to a component include. Files live under
-  crates/kablong-web/templates/_components/ and crates/kablong-web/static/
-  tokens.css (typical paths: ~/Repos/kablong, ~/worktrees/kablong-*).
+  Reusable UI partials + tokens for the Klaffat web app (formerly
+  kablong-components). Use when working in the klaffat repo on templates,
+  tokens, or component partials — authoring or editing a radio group, button,
+  dialog, form field, or empty state; when a template lint warning points at
+  a raw <input type="radio">, <button>, or <dialog>; or when writing/adjusting
+  CSS custom properties in tokens.css. Also applies for destructive-POST
+  dialogs and any migration from an inline control to a component include.
+  Files live under crates/klaffat-web/templates/_components/ and
+  crates/klaffat-web/static/tokens.css (typical paths: ~/Repos/klaffat,
+  ~/worktrees/klaffat-*).
 ---
 
-# kablong-components — the design-system partial library
+# klaffat-components — the design-system partial library
 
-The askama partials under `crates/kablong-web/templates/_components/` plus
-the token file at `crates/kablong-web/static/tokens.css`. One place per
+The askama partials under `crates/klaffat-web/templates/_components/` plus
+the token file at `crates/klaffat-web/static/tokens.css`. One place per
 component; ARIA rules and subtle details cited in the per-component SOTA
 review: `docs/reviews/component-sota-2026-07-31.md` (read that first for the
 "why" — this file is the "when + how").
@@ -43,7 +44,7 @@ distinction, not a filesystem one.
 ## Discover the partials from a fresh session
 
 ```
-ls crates/kablong-web/templates/_components/
+ls crates/klaffat-web/templates/_components/
 ```
 
 Contract for each partial lives at the top of its file in `{# ... #}`. Every
@@ -81,18 +82,94 @@ of truth: `docs/brand/klaffat-design-spec.md` §4.12 "Locked variants
   title, not the chrome. When a `--danger` dialog has no `c-dialog__title`
   (e.g. inline delete-account exception), communicate danger via the
   destructive button, not chrome.
-- **c-radiogroup = gallery-v4 Variant A** — segmented-pill row. Structure:
+- **c-radiogroup = gallery-v4 Variant A** — ONE pill treatment, TWO flow
+  directions. Structure:
   `fieldset > legend > (hint) > .c-radiogroup__segmented > label*`. Each
   label = a pill with a hidden `<input type="radio">`, a presentational
   12px `.c-radiogroup__dot` circle, and a `.c-radiogroup__label` span with
-  mono uppercase text. Segmented rail = 1.5px `--rail` border around the
-  row + a 1.5px `--rail` left border on each option (except the first).
+  mono uppercase text.
+
+  **THE RULE (founder, standing, 2026-09-05 — told 4+ times): the circle is
+  ALWAYS on the LEFT of its label, on ONE line, vertically centred on the
+  label's FIRST line. Never above it, never a column for the control
+  itself. A stacked radio is a defect, not a style choice.** It holds in
+  both directions and in every variant.
+
+  Which direction is chosen by a CONTAINER QUERY on the fieldset
+  (`container-type: inline-size`), not a media query and not JS — the
+  deciding width is the width available to THIS group, so a group in a
+  narrow panel stacks even on a wide screen:
+  - `>= 38rem` → pills flow in a ROW: the segmented rail, 1.5px `--rail`
+    border around it plus a 1.5px `--rail` LEFT border on each option
+    (except the first).
+  - below that → the SAME pills stacked in a COLUMN, full width, with the
+    hairline on the TOP edge instead. Typography, borders, colours and the
+    circle are identical; only the flow direction and the border edge
+    change. (An earlier attempt at a separate GOV.UK-style plain list for
+    the narrow case was rejected: "it's subtly different atm, in ways that
+    make it worse.")
+
   Zero radius. Selected pill inverts (`--rail` bg, `--paper` text) and the
   circle inverts (`--paper` ring around a solid `--paper` dot via
-  `radial-gradient`). Focus ring matches c-btn v2C (inset paper+rail).
+  `radial-gradient`). Focus ring matches c-btn v2C (inset paper+rail) and
+  covers the WHOLE pill — circle and label together, never the circle
+  alone. Every pill is >= 44px tall: the whole pill is the hit area, so the
+  PILL is the WCAG 2.2 SC 2.5.8 target, not the 12px circle.
+
+  **Vertical centring — the pill is a CENTRING BOX, and never a nudge.**
+  Founder, 2026-09-05, on a build where the group sat 11px from the top and
+  18px from the bottom: "both the ring and the text is a bit too high."
+  Two things must both hold, and neither is a magic number:
+  - `.c-radiogroup__option` is `align-items: center` with its height from
+    `min-height` and SYMMETRIC `padding-block`. The circle is
+    `align-self: center`. NO `align-items: flex-start`, NO `margin-top` on
+    the dot. Every offset-based version of this drifted the moment a
+    font-size, a line-height or the dot size moved on its own.
+  - `line-height: 1` on the label, so its box is its font-size and sits
+    centred on the font box. Do NOT add `text-box-trim` here. Trimming the
+    box to the ink is the textbook answer for centring uppercase and it was
+    tried; measured against IBM Plex Mono SemiBold's real metrics (ascent
+    1025, descent 275, cap height 703, round overshoot 16, per 1000 em) it
+    buys 31/1000 em — 0.375px at the 12px label — and in the harmless
+    direction, the ink sitting slightly LOW rather than high. It also
+    changes the box Chromium's print path hands to the PDF, where the Plex
+    faces embed as Type 3 glyphs; a viewer clipped label bottoms after it
+    landed. Under half a pixel is not worth an unverifiable PDF risk. If
+    sub-pixel centring ever outweighs that, the derived correction is
+    `padding-block-start: 0.0625em` (centring halves it) — computed once
+    from those metrics, never a per-instance nudge.
+  Measured result, every pill and every state: 14.31px of air above and
+  14.69px below (Δ 0.38px); circle centre vs label text centre 0.19px.
+  If you change any of this, measure the two numbers again — the oracle's
+  `content-centerY` rule is what holds it.
+
+  **Nothing ever wraps.** The rail is `flex-wrap: nowrap` and pill labels
+  are `white-space: nowrap`, so a group whose labels do not fit would
+  OVERFLOW rather than wrap. The 38rem threshold is therefore chosen
+  against the widest TRANSLATED rail of any row-eligible group (Swedish
+  runs ~17% wider than English — measure before adding one). A group that
+  cannot fit takes `rg_layout = "block"`, which pins the stacked column at
+  every width; that is also the right call for long, consequential choices
+  saved on submit, like create-poll's "Times that can't work".
+  `--with-description` never flows into a row: the description sits under
+  the label inside the label column, and the circle still centres on the
+  label's first line.
+
+  **The oracle enforces all of it.**
+  `tests/e2e/tests/component-geometry-oracle.spec.ts` (`assertRadiogroup`)
+  measures every option at both container widths and hard-fails on: circle
+  and label not sharing a row; circle not before the label by the token
+  gap; circle centre off the label's first-line centre by >1px; the centre
+  of (circle box union label INK box) off the pill's own centre by >1px —
+  the rule that catches a correctly-paired group sitting too high in an
+  over-tall pill; a row that wrapped or overflowed its group; a stacked
+  pill under 44px or overflowed by its label. Change the layout and you must satisfy that spec — do not
+  relax it.
+
   Real radio input stays a11y-focusable via `opacity: 0` (NEVER
-  `display: none`). Test cost: Playwright's `.check()` on a hidden radio
-  fails the actionability visibility gate — target the enclosing
+  `display: none`) and is absolutely positioned across the pill so the
+  whole pill is clickable. Test cost: Playwright's `.check()` on a hidden
+  radio fails the actionability visibility gate — target the enclosing
   `label.c-radiogroup__option` instead.
 - **c-field = gallery-v8 D1×W1** — 1px solid `--ink` border (warm
   off-black `#1C1B18`, NOT pure `#000`), zero radius, `--paper` bg
@@ -190,7 +267,7 @@ pattern.
 
 | Partial | Use when | Anti-slop rules |
 |---|---|---|
-| `radio_group.html` | A fixed-choice set of ≤3 options (design spec §4.11). Two options for a boolean-ish either/or, three for a small enum. | ≥4 fixed options → use a `<select>` (dropdown) instead. Never a segmented control. |
+| `radio_group.html` | A fixed-choice set of ≤3 options (design spec §4.11). Two options for a boolean-ish either/or, three for a small enum. Renders as a segmented pill ROW when the group has ≥38rem, and as the same pills STACKED below that — circle left of the label on one line in both. | ≥4 fixed options → use a `<select>` (dropdown) instead. Never hand-roll a segmented control: this component IS one when it has room. Long labels or a consequential saved-on-submit choice → `rg_layout = "block"` (needs a `radio-block-ok:` marker). |
 | `button.html` | Any tap/click affordance that submits, opens a dialog, or triggers a client action. Variants: primary / secondary / destructive / ghost. | Never `<div role="button">`. Never a bare `<a>` styled to look like a button. Always `type="button"` unless inside a form where you actually want submit. |
 | `dialog.html` | JS-only confirm/cancel modal with no server action (uses `<form method="dialog">`). | Never a JS modal library — native `<dialog>` gives us focus containment + ESC + `aria-modal` free. |
 | `dialog_form.html` | Destructive server-POST modal (delete a resource, revoke a token). Wraps `<form method="post" action="…">` inside `<dialog class="c-dialog c-dialog--danger">`. Params include `dlg_action`, `dlg_method`, `dlg_confirm_variant` (usually `"destructive"`), and `dlg_extra` for hidden inputs / phrase-confirm markup. | `dlg_extra` is rendered `|safe` — it MUST be a compile-time string literal (enforced by the `safe_marked_partial_vars_bind_string_literals_only` test in `tests/template_lint.rs`). If the extra markup needs LOCALIZED text (`loc.t(…)` calls), `dlg_extra` won't work — see the account-settings exception below. |
@@ -200,7 +277,7 @@ pattern.
 
 ## Tokens — one file, every scale value declared
 
-`crates/kablong-web/static/tokens.css` holds every custom property the app
+`crates/klaffat-web/static/tokens.css` holds every custom property the app
 consumes. Imported at the top of `styles.css` so downstream rules resolve
 `var(--…)`.
 
@@ -229,7 +306,7 @@ these in review, don't ship them:
 
 ## The soft-warning lint
 
-`crates/kablong-web/tests/template_lint.rs` has two checks:
+`crates/klaffat-web/tests/template_lint.rs` has two checks:
 
 - **hard fail** — `no_fixed_choice_select_ships_in_a_template`: a `<select>`
   with ≤3 static `<option>`s blocks the suite. Fix by converting to
@@ -284,5 +361,5 @@ so the field gets ESCAPED rendering instead.
   component ARIA APG rules + which established design systems each subtle
   detail is copied from).
 - **Design spec §4.12** — component library index.
-- **The tokens** — `crates/kablong-web/static/tokens.css`.
-- **The lint** — `crates/kablong-web/tests/template_lint.rs`.
+- **The tokens** — `crates/klaffat-web/static/tokens.css`.
+- **The lint** — `crates/klaffat-web/tests/template_lint.rs`.

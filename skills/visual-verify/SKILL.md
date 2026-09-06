@@ -174,7 +174,7 @@ app:
     - "src/**/*.rs"                       # e.g. Rust HTML-returning handlers
 dev_auth:
   header: X-Dev-Auth                      # or `cookie: name=value`
-  token_env: KABLONG_DEV_AUTH_TOKEN       # env var the CLI + wrapper read
+  token_env: KLAFFAT_DEV_AUTH_TOKEN       # env var the CLI + wrapper read
 free_ports:                               # ports to kill before capture (surgical, never pkill)
   - 3737
   - 13737
@@ -182,7 +182,7 @@ screenshots:
   batch_file: screenshots.yml             # relative to repo root; drives batch groups
   out_dir: docs/brand/screenshots/vv      # where captures land
 known_good:
-  components_dir: crates/kablong-web/templates/_components
+  components_dir: crates/klaffat-web/templates/_components
   reference_doc: docs/reviews/component-sota-2026-07-31.md
 ```
 

@@ -33,7 +33,7 @@ Cross-origin iframing is fragile: CSP `frame-ancestors`, sticky `chrome-error://
 
    URLs may be relative — the tool normalises against `location.origin`.
 
-The tool prefers this inline manifest over `fetch('/playgrounds.json')` when present. No `serve.sh`, no separate port. Kablong wires this at `crates/kablong-web/src/handlers/dev_pgr.rs` and mounts it under the `dev-playground` feature.
+The tool prefers this inline manifest over `fetch('/playgrounds.json')` when present. No `serve.sh`, no separate port. Klaffat wires this at `crates/klaffat-web/src/handlers/dev_pgr.rs` and mounts it under the `dev-playground` feature.
 
 ## Workflow
 
@@ -54,10 +54,10 @@ The `</> source` button in the toolbar re-captures the current one on demand
   as `<name>.source.html` / `.source.css` / `.source.js` (server `POST
   /pgr-source`). The toolbar's saved-line confirms what landed.
 - **Same-origin embedded mode** — the host serves the write-back endpoint.
-  Kablong does (`POST /pgr-source`, `dev-playground` feature, handler in
-  `crates/kablong-web/src/handlers/dev_pgr.rs`); files land in
-  `~/.local/state/claude-tasks/kablong/pgr-source/`, override with
-  `KABLONG_PGR_SOURCE_DIR`. A host without that route falls back to browser
+  Klaffat does (`POST /pgr-source`, `dev-playground` feature, handler in
+  `crates/klaffat-web/src/handlers/dev_pgr.rs`); files land in
+  `~/.local/state/claude-tasks/klaffat/pgr-source/`, override with
+  `KLAFFAT_PGR_SOURCE_DIR`. A host without that route falls back to browser
   downloads (three files into your download dir).
 - **Cross-origin fallback** — `contentDocument` is null, so nothing can be
   read. Capture with `visual-verify` against the same URLs instead; it emits
@@ -72,7 +72,7 @@ their own DOM.
 
 ## When to use
 
-- `/dev/components/<slug>` interactive live previews (kablong Ph-5)
+- `/dev/components/<slug>` interactive live previews (klaffat Ph-5)
 - `/dev/pages/<slug>` page-pattern playgrounds
 - Any dev-server surface where the review is about HOW IT FEELS to interact, not just how it looks
 
@@ -86,4 +86,4 @@ their own DOM.
 - Standalone mode: `python3` (static server), `xdg-open` (or open the printed URL yourself)
 - Same-origin embedded mode: the host server serves `tool/index.html` with the inline `<script id="pgr-manifest">` block (see above)
 - The dev server hosting the playgrounds must already be running (this tool doesn't boot it)
-- Element-pin (📌) requires the iframed pages to load `dev-playground-pin.js` (kablong does; other hosts must opt in)
+- Element-pin (📌) requires the iframed pages to load `dev-playground-pin.js` (klaffat does; other hosts must opt in)
