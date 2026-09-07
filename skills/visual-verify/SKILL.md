@@ -15,7 +15,8 @@ looking, not inability to notice.**
 This skill is the **review discipline**: a matrix that guarantees coverage,
 a checklist applied to every capture, a coverage ledger that proves it. It
 is not a capture tool alone. It handles the *looking* — defect detection,
-not taste. For opinionated design/taste, hand off to `advice-refine-test-loop`
+not taste. For opinionated design/taste, request a dedicated UI review;
+`advice-refine-test-loop` only consumes this skill's empirical evidence at close-out.
 (taste-critic round).
 
 Adapted from HartreeWorks/skill--visual-review and mickzijdel/vischeck.
@@ -343,7 +344,7 @@ without a bbox delta from `dom.json`."
 
 ## What this skill is NOT
 
-- Not a taste critic. That's `advice-refine-test-loop` with taste round (task #23).
+- Not a taste critic. Request a dedicated UI review when taste judgment is required.
 - Not a pixel-baseline visual regression tool. We don't run those (see
   `docs/reviews/sota-ai-power-users-cohort-2026-07-30.md` gap analysis).
 - Not an a11y auditor. `axe-core` optional; run it separately if you want

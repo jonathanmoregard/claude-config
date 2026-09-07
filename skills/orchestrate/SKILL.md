@@ -22,7 +22,7 @@ this procedure.
 | Cross-context persistence | planning-with-files — `tasks/mission.md`, `tasks/progress.md`, `tasks/findings.md` |
 | Per-chunk engine: fresh implementer subagent + two-stage spec→quality review, model tiering, status protocol | superpowers:subagent-driven-development |
 | Per-task discipline inside subagents | superpowers:test-driven-development |
-| Adversarial review rounds (tier-above advisor, reproduce-before-fix, loop to zero BLOCKER/HIGH) | advice-refine-test-loop |
+| Empirical close-out review (one bounded fresh reviewer, reproduce-before-fix) | advice-refine-test-loop |
 | Parallel dispatch mechanics | superpowers:dispatching-parallel-agents |
 | Branch completion | superpowers:finishing-a-development-branch |
 
@@ -94,7 +94,7 @@ this procedure.
   emitted ONLY when the statement is literally TRUE:
   1. every acceptance criterion in mission.md checked off;
   2. verifier freshly run this iteration, exit 0;
-  3. fresh-context reviewer (close-out advice-refine-test-loop) confirms
+  3. fresh-context reviewer (compact close-out advice-refine-test-loop) confirms
      the combined diff, zero BLOCKER/HIGH.
 - Blocked ≥3 iterations on an external dependency (credential, human-only
   step): log it in `pending_for_human.md`, mark the criterion blocked in
@@ -166,23 +166,16 @@ this procedure.
    `pg_terminate_backend` kill by `application_name`).
 4. **Gate green continuously**, not as a phase — the project's configured
    gate after every edit.
-5. **Close-out sweep** (on "ship this" / before merge), beyond what
-   per-chunk review sees:
-   - advice-refine-test-loop over the finished diff;
-   - security scan + self-red-team;
-   - **operational-readiness lens** (the class diff-review is blind to):
-     unbounded maps/rows, rate-limiting on TCP peer vs XFF, backups over
-     a live WAL DB, missing PRAGMAs/session settings, the N>1 scale-out
-     ledger;
-   - **multi-lens parallel reviewers** (race/concurrency, security+crypto,
-     domain completeness, perf+scaling, coverage+leaks+ops). Findings
-     multiple reviewers **converge** on are high-confidence; reproduce
-     every BLOCKER/HIGH before acting.
+5. **Close-out sweep** (on "ship this" / before merge): invoke
+   advice-refine-test-loop once over the finished, integrated diff. It owns
+   bounded context selection, risk routing, independent review and empirical
+   reproduction. Do not add default security, operations or multi-reviewer
+   fan-out beside it; escalate only under that skill's explicit conditions.
 6. **Integration ritual.** Fold branches into ONE integration branch →
    run the full gate ONCE on the combined result (catches cross-branch
-   semantic conflicts per-branch gates miss) → consolidated adversarial
-   re-review seeded with your specific worries → merge on green → clean
-   up worktrees/branches.
+   semantic conflicts per-branch gates miss) → run the close-out sweep once →
+   merge on green → clean up worktrees/branches. Do not review again unless
+   the close-out fix added production surface outside its original capsule.
 7. **Taste calls surface with artifacts.** Design/UX/naming decisions go
    to the user with screenshots/before-afters BEFORE merge; correctness
    work merges on green without asking.
@@ -250,8 +243,8 @@ this procedure.
   loopholes subagents lean on to escape rule 8. Each legitimate exit
   must name a REPRODUCIBLE hard block (compile error, external auth
   wall) — not a scope/time/audit judgment
-- Sigil declared without the fresh-context reviewer run (Phase G3 /
-  advice-refine-test-loop) — the sigil requires reviewer confirmation
+- Sigil declared without the fresh-context `advice-refine-test-loop` run —
+  the sigil requires reviewer confirmation
   of the combined diff; skipping reviewer = false sigil
 - Subagent report frames "AUDIT" as delivery when the brief said
   "PORT" / "IMPLEMENT" / "SHIP". Audit-only completes only when the
