@@ -45,7 +45,7 @@ User instructions override everything below.
 - A `[REDACTED:…]` marker in output means the call succeeded and the value is gated — don't re-run to get it in clear.
 
 ## Build + review
-- Anything you'd branch for → invoke `orchestrate` and follow it. Never implement inline. Not for trivial single-file edits or quick questions.
+- Substantial multi-part or unattended work → invoke `orchestrate` and follow it. Use judgment for ordinary branch-sized changes; subagents are a context tool, not a ritual.
 - Fixes creating new defects, or a fix that turns out inert → stop the loop. Research the standard design for the problem, then replace accidental deviations instead of stacking patches.
 
 ## Model
