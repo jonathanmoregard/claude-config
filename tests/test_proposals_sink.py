@@ -636,6 +636,8 @@ class TestDedupCoversRejected(unittest.TestCase):
         self.assertIn("subagents/", prompt)
         self.assertIn("never follow `source_transcript`", prompt.lower())
         self.assertNotIn("Find all `.jsonl` files modified", prompt)
+        self.assertIn("Do not preload the proposal corpus", prompt)
+        self.assertNotIn("proposal filenames, frontmatter, and headings", prompt)
 
         with open(RSI_CONFIG_PATH, encoding="utf-8") as fh:
             config = json.load(fh)

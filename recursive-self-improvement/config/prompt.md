@@ -27,7 +27,7 @@ Before analyzing reflections, read these core files:
 4. `~/.claude/settings.json` — hooks, permissions, enabled plugins
 5. `~/.claude/CLAUDE.md` — global instructions
 6. List `~/.claude/skills/` names, but do not bulk-read every skill. After you have candidate findings, read at most five directly relevant skill files to distinguish missing behavior from a trigger failure.
-7. List proposal filenames, frontmatter, and headings under `~/.local/state/claude-proposals/`, including sibling category directories (`rsi/`, `manual/`, `research/`, `from-research/`, `router/`, `clv2/`, `permissions/`, `archived/`). Do not bulk-load every proposal body. After candidate findings exist, search this whole corpus for their concrete terms and read every matching proposal, including **rejected** proposals. A rejection is a decision and must not be regenerated. The sink is the real location; never depend on a `~/.claude/...` compatibility symlink.
+7. Do not preload the proposal corpus. After candidate findings exist, search every category under `~/.local/state/claude-proposals/` (`rsi/`, `manual/`, `research/`, `from-research/`, `router/`, `clv2/`, `permissions/`, `archived/`) for each finding's concrete terms. Read every matching proposal, including **rejected** proposals, but do not read unrelated bodies or build a bulk frontmatter/heading dump. A rejection is a decision and must not be regenerated. The sink is the real location; never depend on a `~/.claude/...` compatibility symlink.
 8. Read at most five memory files directly relevant to the candidate findings, especially memories about proposal preferences and prior acceptance/rejection reasons.
 
 These limits are resource boundaries. Do not replace selective reads with a recursive dump of skills, memories, project instructions, or proposals.
@@ -64,7 +64,7 @@ For each finding, write a proposal to `~/.local/state/claude-proposals/rsi/YYYY-
 
 Group related findings — if the same problem shows up across sessions, that's one proposal with multiple source references.
 
-Check EVERY existing proposal (any status) before writing. Do not re-propose something already covered.
+Search across every existing proposal category before writing, then read every concrete match. Do not re-propose something already covered; do not bulk-read unrelated proposals to prove the search happened.
 
 ### Proposal format:
 

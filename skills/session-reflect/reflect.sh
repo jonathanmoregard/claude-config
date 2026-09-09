@@ -898,7 +898,7 @@ reflect_codex_cleanup() {
 reflect_codex_call() {
   local _prompt="$1" _budget="$2" _out="$3" _err="$4"
   local _live_home="${CODEX_HOME:-$HOME/.codex}"
-  local _sessions_real="" _source_real="" _relative="" _meta='{}'
+  local _sessions_real="" _source_real="" _relative=""
   local _source_sid="" _source_model="" _tmp_parent="" _scratch=""
   local _scratch_home="" _copy="" _events="" _inner="" _usage='{}'
   local _failure="" _setup_error="" _rc=1
@@ -913,12 +913,21 @@ reflect_codex_call() {
 
   if [[ -z "$_setup_error" ]]; then
     _relative="${_source_real#"$_sessions_real"/}"
-    _meta="$(head -n 64 -- "$_source_real" 2>/dev/null \
-      | jq -Rsc '[split("\n")[] | fromjson?
-          | select(type == "object" and .type == "session_meta")
-          | .payload][0] // {}' 2>/dev/null || printf '{}')"
-    _source_sid="$(jq -r '.id // empty' <<<"$_meta" 2>/dev/null || true)"
-    _source_model="$(jq -r '.model // empty' <<<"$_meta" 2>/dev/null || true)"
+    # Current Codex rollouts keep the id in session_meta and the active model in
+    # turn_context. The id lookup stops at its first typed record. The model
+    # lookup streams to the last typed record so an in-session model switch is
+    # preserved without accumulating the transcript in memory. Real hook
+    # preambles have pushed the first turn_context past line 400.
+    _source_sid="$(jq -Rnr '
+      first(inputs | fromjson?
+        | select(type == "object" and .type == "session_meta")
+        | .payload.id // empty)
+    ' "$_source_real" 2>/dev/null || true)"
+    _source_model="$(jq -Rnr '
+      (last(inputs | fromjson?
+        | select(type == "object" and .type == "turn_context")
+        | .payload.model // empty)) // empty
+    ' "$_source_real" 2>/dev/null || true)"
     if [[ "$_source_sid" != "$SESSION_ID" ]]; then
       _setup_error="codex_session_id_mismatch"
     elif [[ ! "$_source_model" =~ ^[A-Za-z0-9._:-]{1,128}$ ]]; then
@@ -979,6 +988,11 @@ reflect_codex_call() {
         --disable tool_suggest \
         --disable multi_agent \
         --disable standalone_web_search \
+        --disable goals \
+        --disable plugins \
+        --disable remote_plugin \
+        --disable skill_search \
+        --disable auth_elicitation \
         --ephemeral \
         --all \
         --skip-git-repo-check \

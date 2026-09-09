@@ -1302,7 +1302,8 @@ reflect_jsonl_to_text() {
     | if $client == "codex" then
         select($e.type == "response_item")
         | ($e.payload // {}) as $p
-        | if $p.type == "message" then
+        | if $p.type == "message" and
+             ($p.role == "user" or $p.role == "assistant") then
             (($p.role // "?") | tostring) as $role
             | (($p.content | codex_text_parts)
                | map(select(. != "")) | join("\n")) as $body

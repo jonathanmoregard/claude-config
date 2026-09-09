@@ -787,7 +787,14 @@ import json
 import sys
 
 rows = [
-    {"type": "session_meta", "payload": {"id": "01a087b7-6be9-70a0-83a5-30ca54f394a9", "model": "gpt-5.6-sol"}},
+    {"type": "session_meta", "payload": {"id": "01a087b7-6be9-70a0-83a5-30ca54f394a9"}},
+    {"type": "turn_context", "payload": {"model": "gpt-5.6-terra"}},
+    {"type": "response_item", "payload": {"type": "message", "role": "developer", "content": [
+        {"type": "input_text", "text": "CODEX-DEVELOPER-MARKER hidden control text"}
+    ]}},
+    {"type": "response_item", "payload": {"type": "message", "role": "system", "content": [
+        {"type": "input_text", "text": "CODEX-SYSTEM-MARKER hidden control text"}
+    ]}},
     {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [
         {"type": "input_text", "text": "CODEX-USER-MARKER inspect the queue"}
     ]}},
@@ -800,6 +807,7 @@ rows = [
     {"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [
         {"type": "output_text", "text": "CODEX-ASSISTANT-MARKER queue inspected"}
     ]}},
+    {"type": "turn_context", "payload": {"model": "gpt-5.6-sol"}},
 ]
 with open(sys.argv[1], "w", encoding="utf-8") as fh:
     for row in rows:
@@ -820,6 +828,11 @@ if grep -qE 'CODEX-ENCRYPTED-SECRET-MARKER|CODEX-TOOL-ARGUMENT-SECRET|CODEX-TELE
   bad "encrypted reasoning, tool arguments, or telemetry leaked into extract"
 else
   ok "encrypted reasoning, tool arguments, and telemetry are excluded"
+fi
+if grep -qE 'CODEX-DEVELOPER-MARKER|CODEX-SYSTEM-MARKER' <<<"$CODEX_EXTRACT"; then
+  bad "developer/system message leaked into Codex extract"
+else
+  ok "Codex extraction keeps only user/assistant message roles"
 fi
 if grep -qF 'raw excerpt follows' <<<"$CODEX_EXTRACT"; then
   bad "Codex extraction degraded to unsafe raw JSON"
@@ -867,7 +880,8 @@ grep -qE '^=== call === exec resume .*--ephemeral' "$STUB_CODEX_ARGV_LOG"; asser
 grep -qF -- '--model gpt-5.6-sol' "$STUB_CODEX_ARGV_LOG"; assert $? "Codex reflection keeps source model"
 grep -qF -- '--ignore-user-config' "$STUB_CODEX_ARGV_LOG"; assert $? "ambient Codex config is ignored"
 grep -qF -- '--output-schema' "$STUB_CODEX_ARGV_LOG"; assert $? "bounded output schema is enforced by CLI"
-for disabled in hooks shell_tool unified_exec apps browser_use computer_use image_generation; do
+for disabled in hooks shell_tool unified_exec apps browser_use computer_use image_generation \
+                goals plugins remote_plugin skill_search auth_elicitation; do
   grep -qF -- "--disable $disabled" "$STUB_CODEX_ARGV_LOG"
   assert $? "Codex feature disabled: $disabled"
 done
