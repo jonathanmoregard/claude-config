@@ -47,6 +47,12 @@ and Codex subagents already appear in the parent session outcome. This avoids a
 call multiplier: recent evidence showed 37 subagent reflection attempts versus
 12 top-level session-end attempts.
 
+These are session-reflect modes, not Codex's native compaction or mirrored
+self-compact system. Existing `PreCompact`, `PostCompact`, and `Stop` hook
+fanout remains active and unchanged. All persistent config continues to flow
+from the Claude source through `ai-client-config`; no direct Codex config edit
+is part of this design.
+
 ## RSI input and resource bounds
 
 Nightly RSI will read normalized top-level `sessionend` `final.json` artifacts,

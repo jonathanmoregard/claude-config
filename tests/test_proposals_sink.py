@@ -626,6 +626,23 @@ class TestDedupCoversRejected(unittest.TestCase):
     def test_reviewer_push_step_still_names_the_push_script(self):
         self.assertIn("push-proposals.sh", read(RSI_PROMPT_PATH))
 
+    def test_daily_review_uses_bounded_completed_reflections(self):
+        prompt = read(RSI_PROMPT_PATH)
+        self.assertIn("~/.claude/reflections/sessions/*/final.json", prompt)
+        self.assertIn("last 24 hours", prompt)
+        self.assertIn("12 newest", prompt)
+        self.assertIn("32 KiB", prompt)
+        self.assertIn('modes.sessionend.status == "complete"', prompt)
+        self.assertIn("subagents/", prompt)
+        self.assertIn("never follow `source_transcript`", prompt.lower())
+        self.assertNotIn("Find all `.jsonl` files modified", prompt)
+
+        with open(RSI_CONFIG_PATH, encoding="utf-8") as fh:
+            config = json.load(fh)
+        self.assertIs(config["components"]["daily_review"], True,
+                      "bounded reflection input is required before enabling "
+                      "the scheduled daily review")
+
 
 # --------------------------------------------------------------------------
 # 6. Atomic proposal write in the permission-ledger sink.

@@ -63,6 +63,7 @@ assert() { if (( $1 == 0 )); then ok "$2"; else bad "$2"; fi; }
 # ---------------------------------------------------------------------------
 SCRATCH="$(mktemp -d -t reflect-lastmile-XXXXXX)"
 export TMPDIR="$SCRATCH"            # every mktemp below (ours and the code's)
+export XDG_RUNTIME_DIR="$SCRATCH"    # Codex scratch homes stay hermetic too
 REFLECT_ROOT="$SCRATCH/reflections"
 CLAUDE_SESSIONS_DIR="$SCRATCH/self-compact"
 PAYLOAD_CWD="$SCRATCH/project"
@@ -108,8 +109,14 @@ STUB_DIR="$SCRATCH/bin"
 mkdir -p "$STUB_DIR"
 export STUB_ARGV_LOG="$SCRATCH/stub-argv.log"
 export STUB_PROMPT_LOG="$SCRATCH/stub-prompt.log"
+export STUB_CODEX_ARGV_LOG="$SCRATCH/stub-codex-argv.log"
+export STUB_CODEX_PROMPT_LOG="$SCRATCH/stub-codex-prompt.log"
+export STUB_CODEX_STATE_LOG="$SCRATCH/stub-codex-state.log"
 : > "$STUB_ARGV_LOG"
 : > "$STUB_PROMPT_LOG"
+: > "$STUB_CODEX_ARGV_LOG"
+: > "$STUB_CODEX_PROMPT_LOG"
+: > "$STUB_CODEX_STATE_LOG"
 
 cat > "$STUB_DIR/claude" <<'STUB'
 #!/usr/bin/env bash
@@ -156,14 +163,65 @@ esac
 exit 0
 STUB
 chmod +x "$STUB_DIR/claude"
+
+cat > "$STUB_DIR/codex" <<'STUB'
+#!/usr/bin/env bash
+# Test stub for `codex exec resume`. Never touches network. It mutates only the
+# rollout visible through CODEX_HOME, making source-copy isolation observable.
+{
+  printf '=== call ==='
+  for a in "$@"; do printf ' %s' "$a"; done
+  printf '\n'
+} >> "${STUB_CODEX_ARGV_LOG:-/dev/null}"
+prompt="$(cat || true)"
+printf '=== prompt ===\n%s\n' "$prompt" >> "${STUB_CODEX_PROMPT_LOG:-/dev/null}"
+
+rollout="$(find "${CODEX_HOME:?}"/sessions -type f -name '*.jsonl' -print -quit 2>/dev/null || true)"
+{
+  printf 'CODEX_HOME=%s\n' "$CODEX_HOME"
+  printf 'ROLLOUT=%s\n' "$rollout"
+  if [[ -f "$CODEX_HOME/auth.json" ]]; then printf 'AUTH_PRESENT=yes\n'; else printf 'AUTH_PRESENT=no\n'; fi
+  printf 'HOME_MODE=%s\n' "$(stat -c '%a' "$CODEX_HOME")"
+  printf 'AUTH_MODE=%s\n' "$(stat -c '%a' "$CODEX_HOME/auth.json" 2>/dev/null || true)"
+  printf 'ROLLOUT_MODE=%s\n' "$(stat -c '%a' "$rollout" 2>/dev/null || true)"
+} >> "${STUB_CODEX_STATE_LOG:-/dev/null}"
+[[ -n "$rollout" ]] && printf '%s\n' '{"type":"stub_mutation"}' >> "$rollout"
+
+reflection='{"patterns":["codex cached reflection"],"discoveries":[],"turning_points":[],"digressions":[],"obstacles_to_autonomy":[]}'
+if [[ "${STUB_MODE:-}" == "codex_error" ]]; then
+  printf '%s\n' '{"type":"thread.started","thread_id":"stub-reflection-thread"}'
+  printf '%s\n' '{"type":"turn.failed","error":{"message":"stub native reflection failure"}}'
+  exit 1
+fi
+if [[ "${STUB_MODE:-}" == "codex_oversized" ]]; then
+  long="$(printf 'L%.0s' $(seq 1 600))"
+  reflection="$(jq -cn --arg long "$long" '
+    {patterns:([$long, 42, {bad:true}] + [range(0;12) | "pattern-\(.)"]),
+     discoveries:[null,true,"kept discovery"],
+     turning_points:[],digressions:[],obstacles_to_autonomy:[]}
+  ')"
+fi
+printf '%s\n' '{"type":"thread.started","thread_id":"stub-reflection-thread"}'
+jq -cn --arg text "$reflection" '{type:"item.completed",item:{type:"agent_message",text:$text}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":20,"cached_input_tokens":18,"output_tokens":2}}'
+exit 0
+STUB
+chmod +x "$STUB_DIR/codex"
 export PATH="$STUB_DIR:$PATH"
 
-reset_logs() { : > "$STUB_ARGV_LOG"; : > "$STUB_PROMPT_LOG"; }
+reset_logs() {
+  : > "$STUB_ARGV_LOG"
+  : > "$STUB_PROMPT_LOG"
+  : > "$STUB_CODEX_ARGV_LOG"
+  : > "$STUB_CODEX_PROMPT_LOG"
+  : > "$STUB_CODEX_STATE_LOG"
+}
 # `grep -c` already prints 0 when it finds nothing; the `|| true` is only there
 # so its exit-1-on-no-match does not become the function's failure. An `|| echo 0`
 # would print a SECOND zero and turn `(( $(call_count) == 0 ))` into a syntax error.
 call_count() { grep -c '^=== call ===' "$STUB_ARGV_LOG" 2>/dev/null || true; }
 resume_calls() { grep -c -- '--resume' "$STUB_ARGV_LOG" 2>/dev/null || true; }
+codex_call_count() { grep -c '^=== call ===' "$STUB_CODEX_ARGV_LOG" 2>/dev/null || true; }
 
 # ---------------------------------------------------------------------------
 # Fixtures — the REAL 2.1.260 payload shapes (tasks/mission.md "Ground truth").
@@ -713,6 +771,207 @@ grep -q 'REFLECT_MISSION_RETENTION_DAYS' <<<"$(sed -n '/for v in SESSION_ID/,/^[
 assert $? "listed in spawn_detached_worker's systemd-run --setenv loop"
 grep -qE '^export .*REFLECT_MISSION_RETENTION_DAYS' "$REFLECT_SH"
 assert $? "exported for the setsid spawn path"
+
+# ===========================================================================
+# H1 — Codex rollouts use a different JSONL envelope from Claude transcripts.
+# Reflection may keep human-visible messages and bounded tool outcomes, but it
+# must never degrade to raw JSON: Codex reasoning records carry encrypted model
+# state and token telemetry carries large irrelevant counters.
+# ===========================================================================
+t_begin "H1: Codex transcript detection and safe extraction"
+CODEX_HOME_FIXTURE="$SCRATCH/codex-home"
+CODEX_TRANSCRIPT="$CODEX_HOME_FIXTURE/sessions/2026/09/09/rollout-2026-09-09T12-00-00-01a087b7-6be9-70a0-83a5-30ca54f394a9.jsonl"
+mkdir -p "$(dirname -- "$CODEX_TRANSCRIPT")"
+python3 - "$CODEX_TRANSCRIPT" <<'PY'
+import json
+import sys
+
+rows = [
+    {"type": "session_meta", "payload": {"id": "01a087b7-6be9-70a0-83a5-30ca54f394a9", "model": "gpt-5.6-sol"}},
+    {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [
+        {"type": "input_text", "text": "CODEX-USER-MARKER inspect the queue"}
+    ]}},
+    {"type": "response_item", "payload": {"type": "reasoning", "encrypted_content": "CODEX-ENCRYPTED-SECRET-MARKER"}},
+    {"type": "response_item", "payload": {"type": "function_call", "name": "exec", "arguments": "CODEX-TOOL-ARGUMENT-SECRET"}},
+    {"type": "response_item", "payload": {"type": "function_call_output", "output": [
+        {"type": "input_text", "text": "CODEX-TOOL-RESULT-MARKER"}
+    ]}},
+    {"type": "event_msg", "payload": {"type": "token_count", "info": {"total_tokens": "CODEX-TELEMETRY-MARKER"}}},
+    {"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [
+        {"type": "output_text", "text": "CODEX-ASSISTANT-MARKER queue inspected"}
+    ]}},
+]
+with open(sys.argv[1], "w", encoding="utf-8") as fh:
+    for row in rows:
+        fh.write(json.dumps(row) + "\n")
+PY
+
+CODEX_CLIENT=$(CODEX_HOME="$CODEX_HOME_FIXTURE" bash -c \
+  'source "$1"; reflect_transcript_client "$2"' _ "$LIB_SH" "$CODEX_TRANSCRIPT" 2>/dev/null || true)
+[[ "$CODEX_CLIENT" == "codex" ]]; assert $? "path beneath CODEX_HOME/sessions is classified as codex"
+
+CODEX_EXTRACT=$(CODEX_HOME="$CODEX_HOME_FIXTURE" bash -c \
+  'source "$1"; reflect_transcript_extract "$2" 8192 tail' _ "$LIB_SH" "$CODEX_TRANSCRIPT")
+grep -qF 'user: CODEX-USER-MARKER inspect the queue' <<<"$CODEX_EXTRACT"; assert $? "Codex user message survives"
+grep -qF 'assistant: CODEX-ASSISTANT-MARKER queue inspected' <<<"$CODEX_EXTRACT"; assert $? "Codex assistant message survives"
+grep -qF '[tool_use exec]' <<<"$CODEX_EXTRACT"; assert $? "Codex tool name survives"
+grep -qF 'CODEX-TOOL-RESULT-MARKER' <<<"$CODEX_EXTRACT"; assert $? "bounded Codex tool result survives"
+if grep -qE 'CODEX-ENCRYPTED-SECRET-MARKER|CODEX-TOOL-ARGUMENT-SECRET|CODEX-TELEMETRY-MARKER' <<<"$CODEX_EXTRACT"; then
+  bad "encrypted reasoning, tool arguments, or telemetry leaked into extract"
+else
+  ok "encrypted reasoning, tool arguments, and telemetry are excluded"
+fi
+if grep -qF 'raw excerpt follows' <<<"$CODEX_EXTRACT"; then
+  bad "Codex extraction degraded to unsafe raw JSON"
+else
+  ok "Codex extraction never uses raw-JSON degradation"
+fi
+
+SCHEMA="$SKILL_DIR/reflection.schema.json"
+[[ -f "$SCHEMA" ]]; assert $? "Codex reflection output schema exists"
+if [[ -f "$SCHEMA" ]]; then
+  jq -e '
+    .additionalProperties == false
+    and ([.required[]] | sort) == (["digressions","discoveries","obstacles_to_autonomy","patterns","turning_points"] | sort)
+    and ([.properties[] | select(.type == "array" and .maxItems == 10 and .items.type == "string" and .items.maxLength == 500)] | length) == 5
+  ' "$SCHEMA" >/dev/null
+  assert $? "schema hard-bounds all five reflection arrays"
+else
+  bad "schema hard-bound assertions could not run"
+fi
+
+# ===========================================================================
+# H2 — Codex SessionEnd resumes a private rollout COPY. `codex exec resume
+# --ephemeral` still appends to the resumed rollout, so pointing it at the live
+# transcript would corrupt immutable session history. Copying preserves exact
+# cache-eligible prefix while containing that mutation.
+# ===========================================================================
+t_begin "H2: Codex SessionEnd resumes a secure copy without touching source"
+reset_logs
+printf '%s\n' '{"auth_mode":"fixture"}' > "$CODEX_HOME_FIXTURE/auth.json"
+CODEX_SOURCE_SHA="$(sha256sum "$CODEX_TRANSCRIPT" | awk '{print $1}')"
+CODEX_SID="01a087b7-6be9-70a0-83a5-30ca54f394a9"
+LIVE_CODEX_HOME="$CODEX_HOME_FIXTURE" CODEX_HOME="$CODEX_HOME_FIXTURE" \
+  bash "$REFLECT_SH" sessionend <<<"$(sessionend_payload "$CODEX_SID" "$CODEX_TRANSCRIPT")"
+CODEX_MANIFEST="$REFLECT_ROOT/sessions/$CODEX_SID/manifest.json"
+CODEX_FINAL="$REFLECT_ROOT/sessions/$CODEX_SID/final.json"
+if wait_terminal "$CODEX_MANIFEST" sessionend; then
+  jqe '.modes.sessionend.status == "complete"' "$CODEX_MANIFEST"; assert $? "Codex reflection reaches complete"
+else
+  bad "no terminal Codex manifest at $CODEX_MANIFEST"
+fi
+[[ "$(sha256sum "$CODEX_TRANSCRIPT" | awk '{print $1}')" == "$CODEX_SOURCE_SHA" ]]; assert $? "live Codex rollout stays byte-identical"
+(( $(codex_call_count) == 1 )); assert $? "exactly one native Codex model call ($(codex_call_count) seen)"
+(( $(call_count) == 0 )); assert $? "Codex transcript never crosses into Claude ($(call_count) calls)"
+grep -qE '^=== call === exec resume .*--ephemeral' "$STUB_CODEX_ARGV_LOG"; assert $? "Codex call uses ephemeral resume"
+grep -qF -- '--model gpt-5.6-sol' "$STUB_CODEX_ARGV_LOG"; assert $? "Codex reflection keeps source model"
+grep -qF -- '--ignore-user-config' "$STUB_CODEX_ARGV_LOG"; assert $? "ambient Codex config is ignored"
+grep -qF -- '--output-schema' "$STUB_CODEX_ARGV_LOG"; assert $? "bounded output schema is enforced by CLI"
+for disabled in hooks shell_tool unified_exec apps browser_use computer_use image_generation; do
+  grep -qF -- "--disable $disabled" "$STUB_CODEX_ARGV_LOG"
+  assert $? "Codex feature disabled: $disabled"
+done
+grep -qF 'AUTH_PRESENT=yes' "$STUB_CODEX_STATE_LOG"; assert $? "scratch Codex home receives auth material"
+grep -qF 'HOME_MODE=700' "$STUB_CODEX_STATE_LOG"; assert $? "scratch Codex home is mode 0700"
+grep -qF 'AUTH_MODE=600' "$STUB_CODEX_STATE_LOG"; assert $? "scratch auth copy is mode 0600"
+grep -qF 'ROLLOUT_MODE=600' "$STUB_CODEX_STATE_LOG"; assert $? "scratch rollout copy is mode 0600"
+if grep -qF "CODEX_HOME=$CODEX_HOME_FIXTURE" "$STUB_CODEX_STATE_LOG"; then
+  bad "native resume pointed at live CODEX_HOME"
+else
+  ok "native resume pointed at isolated CODEX_HOME"
+fi
+grep -qF 'This session is ending.' "$STUB_CODEX_PROMPT_LOG"; assert $? "session-end reflection prompt reaches Codex"
+jqe '.source_client == "codex" and .usage.cached_input_tokens == 18' "$CODEX_FINAL"; assert $? "artifact records Codex source and cache usage"
+jqe '.modes.sessionend.source_client == "codex" and .modes.sessionend.native_resume == true and .modes.sessionend.source_copy == true' "$CODEX_MANIFEST"; assert $? "manifest records native copied resume"
+if find "$SCRATCH" -maxdepth 1 -type d -name 'codex-reflect.*' -print -quit | grep -q .; then
+  bad "Codex scratch home survived completed reflection"
+else
+  ok "Codex scratch home removed after reflection"
+fi
+
+t_begin "H3: Codex non-session-end modes stop before any model call"
+reset_logs
+CODEX_AGENT_ID="codex-agent-fixture"
+CODEX_HOME="$CODEX_HOME_FIXTURE" bash "$REFLECT_SH" precompact \
+  <<<"$(sessionend_payload "$CODEX_SID" "$CODEX_TRANSCRIPT")"
+CODEX_HOME="$CODEX_HOME_FIXTURE" bash "$REFLECT_SH" mission \
+  <<<"$(sessionend_payload "$CODEX_SID" "$CODEX_TRANSCRIPT")"
+CODEX_HOME="$CODEX_HOME_FIXTURE" bash "$REFLECT_SH" subagentstop \
+  <<<"$(subagent_payload "$CODEX_SID" "$CODEX_AGENT_ID" "$CODEX_TRANSCRIPT")"
+(( $(codex_call_count) == 0 && $(call_count) == 0 )); assert $? "precompact, mission, and subagentstop make zero model calls"
+jqe '.modes.precompact.status == "skipped" and .modes.precompact.reason == "codex_non_sessionend_disabled"' "$CODEX_MANIFEST"; assert $? "Codex precompact records bounded skip"
+jqe '.modes.mission.status == "skipped" and .modes.mission.reason == "codex_non_sessionend_disabled"' "$CODEX_MANIFEST"; assert $? "Codex mission records bounded skip"
+CODEX_AGENT_MANIFEST="$REFLECT_ROOT/sessions/$CODEX_SID/subagents/$CODEX_AGENT_ID/manifest.json"
+jqe '.modes.subagentstop.status == "skipped" and .modes.subagentstop.reason == "codex_non_sessionend_disabled"' "$CODEX_AGENT_MANIFEST"; assert $? "Codex subagent stop records bounded skip"
+
+t_begin "H4: persisted reflection arrays have hard count, type, and length caps"
+reset_logs
+BOUNDS_SID="01a087b7-6be9-70a0-83a5-30ca54f394aa"
+BOUNDS_TRANSCRIPT="$CODEX_HOME_FIXTURE/sessions/2026/09/09/rollout-bounds-$BOUNDS_SID.jsonl"
+python3 - "$CODEX_TRANSCRIPT" "$BOUNDS_TRANSCRIPT" "$BOUNDS_SID" <<'PY'
+import json
+import sys
+
+source, target, sid = sys.argv[1:]
+with open(source, encoding="utf-8") as src, open(target, "w", encoding="utf-8") as dst:
+    for line in src:
+        row = json.loads(line)
+        if row.get("type") == "session_meta":
+            row["payload"]["id"] = sid
+        dst.write(json.dumps(row) + "\n")
+PY
+STUB_MODE=codex_oversized CODEX_HOME="$CODEX_HOME_FIXTURE" \
+  bash "$REFLECT_SH" sessionend <<<"$(sessionend_payload "$BOUNDS_SID" "$BOUNDS_TRANSCRIPT")"
+BOUNDS_MANIFEST="$REFLECT_ROOT/sessions/$BOUNDS_SID/manifest.json"
+BOUNDS_FINAL="$REFLECT_ROOT/sessions/$BOUNDS_SID/final.json"
+if wait_terminal "$BOUNDS_MANIFEST" sessionend; then
+  jqe '.modes.sessionend.status == "complete"' "$BOUNDS_MANIFEST"; assert $? "bounded fixture reaches complete"
+else
+  bad "no terminal bounded manifest at $BOUNDS_MANIFEST"
+fi
+jq -e '
+  [.patterns,.discoveries,.turning_points,.digressions,.obstacles_to_autonomy]
+  | all(.[]; length <= 10 and all(.[]; type == "string" and length <= 500))
+' "$BOUNDS_FINAL" >/dev/null
+assert $? "all arrays hold at most ten strings of at most 500 characters"
+jqe '(.patterns | length == 10) and (.patterns[0] | length == 500)' "$BOUNDS_FINAL"; assert $? "oversized string truncates and excess entries drop"
+jqe '.discoveries == ["kept discovery"]' "$BOUNDS_FINAL"; assert $? "non-string entries are removed"
+jqe '.source_client == "codex" and .modes == null' "$BOUNDS_FINAL"; assert $? "normalized artifact records source client without manifest state"
+
+t_begin "H5: failed Codex reflection records terminal error and removes scratch"
+reset_logs
+ERROR_SID="01a087b7-6be9-70a0-83a5-30ca54f394ab"
+ERROR_TRANSCRIPT="$CODEX_HOME_FIXTURE/sessions/2026/09/09/rollout-error-$ERROR_SID.jsonl"
+python3 - "$CODEX_TRANSCRIPT" "$ERROR_TRANSCRIPT" "$ERROR_SID" <<'PY'
+import json
+import sys
+
+source, target, sid = sys.argv[1:]
+with open(source, encoding="utf-8") as src, open(target, "w", encoding="utf-8") as dst:
+    for line in src:
+        row = json.loads(line)
+        if row.get("type") == "session_meta":
+            row["payload"]["id"] = sid
+        dst.write(json.dumps(row) + "\n")
+PY
+STUB_MODE=codex_error CODEX_HOME="$CODEX_HOME_FIXTURE" \
+  bash "$REFLECT_SH" sessionend <<<"$(sessionend_payload "$ERROR_SID" "$ERROR_TRANSCRIPT")"
+ERROR_MANIFEST="$REFLECT_ROOT/sessions/$ERROR_SID/manifest.json"
+if wait_terminal "$ERROR_MANIFEST" sessionend; then
+  jqe '.modes.sessionend.status == "error"
+       and .modes.sessionend.reason == "model_call_nonzero_exit"
+       and .modes.sessionend.subprocess_exit_code == 1
+       and .modes.sessionend.result_excerpt == "stub native reflection failure"' "$ERROR_MANIFEST"
+  assert $? "failed native reflection leaves diagnostic terminal error"
+else
+  bad "no terminal failed-Codex manifest at $ERROR_MANIFEST"
+fi
+[[ ! -e "$REFLECT_ROOT/sessions/$ERROR_SID/final.json" ]]; assert $? "failed native reflection writes no final artifact"
+if find "$SCRATCH" -maxdepth 1 -type d -name 'codex-reflect.*' -print -quit | grep -q .; then
+  bad "Codex scratch home survived failed reflection"
+else
+  ok "Codex scratch home removed after failed reflection"
+fi
 
 # ===========================================================================
 # G2 — empty stdin is a bad input like any other, and leaves a record.
