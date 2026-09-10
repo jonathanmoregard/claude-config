@@ -1,0 +1,4 @@
+interface:
+  display_name: "Repository Worktree Policy"
+  short_description: "Protect primary checkouts and route work to worktrees"
+  default_prompt: "Use $repo-worktree-policy to keep this repository primary checkout clean and current while routing development into worktrees."
