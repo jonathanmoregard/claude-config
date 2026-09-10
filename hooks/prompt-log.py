@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""UserPromptSubmit hook — append one JSONL line per user prompt.
+"""UserPromptSubmit hook — append one JSONL line per interactive user prompt.
 
 Feeds /prompt-review-weekly skill: cluster repetitive prompt shapes into
 an automation backlog. Adapted from Zijdel dev-hooks `prompt-log.sh`.
@@ -10,6 +10,7 @@ Security posture:
   (Anthropic, OpenAI, GitHub, AWS, Slack, GCP, Bearer, PEM, password=).
 - Truncation to first 500 chars is length control, NOT security.
 - File is size-capped and rotates once (.1 backup) at 10 MB.
+- Machine-generated prompt sources are ignored; source-less legacy payloads stay.
 - Never blocks: any failure exits 0 silently. Instrumentation, not gate.
 """
 import fcntl
@@ -139,6 +140,15 @@ def main() -> None:
         sys.exit(0)
 
     if not isinstance(payload, dict):
+        sys.exit(0)
+
+    # Claude identifies the author of UserPromptSubmit events. Only prompts
+    # submitted from the interactive composer represent the user's automation
+    # demand; SDK calls, task notifications, wakeups, and poll events are
+    # machine-generated. Older clients omit `source`, so keep source-less
+    # payloads for backward compatibility.
+    source = payload.get("source")
+    if source is not None and source != "user":
         sys.exit(0)
 
     prompt = payload.get("prompt") or ""
