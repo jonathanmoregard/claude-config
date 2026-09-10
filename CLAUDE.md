@@ -71,6 +71,10 @@ User instructions override everything below.
 - `skills/<name>` is a symlink → it belongs to another repo. Edit it there, via that repo's PR.
 - Untracked runtime state (`tmp/`, `projects/`, `homunculus/`, `reflections/`) needs no worktree.
 
+## Generated Codex state (`~/.codex`)
+- Never edit anything under `~/.codex` manually. Shared config/behavior changes belong in `~/.claude` via its worktree/PR flow; Codex-only rendering or mapping changes belong in the `ai-client-config` repo. Let `ai-client-config-codex-sync.service` publish generated output.
+- Codex owns runtime files there (auth, sessions, history, caches, logs). Do not hand-edit those either.
+
 ## Web
 - No web access. `WebFetch`, `WebSearch`, `curl`, `wget` denied. HTTP clients via python/node are denied too.
 - Use `mcp__research-agent__research(prompt, depth, model?)`. Default model `claude-opus-5`. `model` valid on `normal`/`deep` only.

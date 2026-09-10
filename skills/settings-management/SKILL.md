@@ -1,10 +1,18 @@
 ---
 name: settings-management
-description: Use when about to change anything under ~/.claude — settings.json, a hook, a skill, an agent, a command, a script, a permission rule — or when asked to "commit my config", "push .claude", "sync my settings", or to place ephemeral state there. ~/.claude is read-only; the edit belongs in a worktree.
+description: Use when about to change anything under ~/.claude or ~/.codex — settings, hooks, skills, agents, commands, scripts, permission rules — or when asked to "commit my config", "push .claude", "sync my settings", or edit generated Codex config. ~/.claude changes belong in a worktree; ~/.codex is sync-owned and never hand-edited.
 user-invocable: false
 ---
 
 # Managing `~/.claude`
+
+## Never edit `~/.codex`
+
+`~/.codex` is downstream output and Codex runtime state. Never hand-edit it.
+For shared configuration, change `~/.claude` through the worktree/PR flow
+below. For Codex-specific rendering or mappings, change the
+`ai-client-config` repository. Let `ai-client-config-codex-sync.service`
+publish the result.
 
 ## Edit in a worktree, never in `~/.claude`
 
