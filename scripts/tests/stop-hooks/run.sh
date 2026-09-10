@@ -327,6 +327,8 @@ ck "block guidance names Question" "yes" "$(has_text "$message" "Question")"
 ck "block guidance names Blocked" "yes" "$(has_text "$message" "Blocked")"
 ck "block guidance gives exact explanatory-exit syntax" "yes" \
    "$(has_text "$message" "DOD-EXIT:")"
+ck "block guidance requires uppercase outcome values" "yes" \
+   "$(has_text "$message" "exact uppercase outcome values")"
 ck "Abandon never grants deletion authority" "yes" \
    "$(has_text "$message" "Abandon does not authorize deletion")"
 ck "an exit is scoped to the current Stop chain" "yes" \
