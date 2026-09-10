@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PreToolUse gate: refuse agent file-tool writes to live AI config roots.
+"""PreToolUse gate: refuse agent file-tool writes to protected live paths.
 
 The safe-bash `.claude` worktree lock and the `.githooks/reference-transaction`
 hook guard git verbs and ref moves. Neither sees a Write/Edit/NotebookEdit call,

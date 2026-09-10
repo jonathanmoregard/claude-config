@@ -316,7 +316,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -S -E $HOME/.claude/hooks/dot-claude-config-write-guard.py",
+            "command": "python3 -S -E $HOME/.claude/hooks/path-edit-guard.py",
             "timeout": 10
           }
         ]
