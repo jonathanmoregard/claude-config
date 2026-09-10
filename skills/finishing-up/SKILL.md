@@ -26,6 +26,31 @@ Abandon is authorized, ask one focused outcome question.
 Preserve is an intentional handoff, not a claim that shipping is complete.
 Abandon ends by measuring the remaining/default checkout, not the deleted path.
 
+### When the DoD Stop hook asks for an explanation
+
+Ship has no override: clear its measured blockers. For another terminal outcome,
+explain it normally, then end with these two lines:
+
+```text
+DOD-EXIT: {"outcomes":[<one record per blocked repo>]}
+<state marker>
+```
+
+Use exact uppercase outcome values and exact fields:
+
+| Outcome | Record fields | Final marker |
+|---|---|---|
+| `QUESTION` | `repo,outcome,question` | `QUESTION` |
+| `BLOCKED` | `repo,outcome,blocker,needed` | `BLOCKED` |
+| `PRESERVE` | `repo,outcome,reason,owner,next` | `DONE` |
+| `ABANDON` | `repo,outcome,reason,remaining_work` | `DONE` |
+
+JSON stays on one line; all values are non-empty strings; `repo` is the exact
+absolute path from the nudge; a question ends in `?`. Cover every blocked repo
+exactly once. `ABANDON` explains why work should not ship but never authorizes
+deletion. This ends only the current Stop chain; a later user turn measures
+again.
+
 ## Step 2 — Measure
 
 Run fresh in every repo this work touched:
