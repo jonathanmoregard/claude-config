@@ -413,7 +413,7 @@ ensure_session_dirs() {
 # SessionEnd / SubagentStop via is_already_complete. Nesting per-mode ensures
 # one mode's in-flight state cannot mask another mode's completion.
 #
-# Terminal statuses: complete | timeout | error | skipped_duplicate
+# Terminal statuses: complete | timeout | error | skipped | skipped_duplicate
 # Non-terminal:      started
 #
 # NOTE: no backwards-compat read path. Fresh install; no legacy artifacts
@@ -469,7 +469,7 @@ write_manifest() {
 
     local terminal=false
     case "$status" in
-      complete|timeout|error|skipped_duplicate) terminal=true ;;
+      complete|timeout|error|skipped|skipped_duplicate) terminal=true ;;
     esac
 
     # `final_complete` (per-mode) is the terminal-forever flag consumed by
@@ -1273,26 +1273,69 @@ reflect_file_size() {
 # silently; a non-object content element is stringified rather than dereferenced,
 # because `.type` on a string aborts the whole jq program and would cost us the
 # entire extract for one odd line.
+reflect_transcript_client() {
+  local path="${1:-}" codex_sessions path_real root_real
+  codex_sessions="${CODEX_HOME:-$HOME/.codex}/sessions"
+  path_real="$(realpath -- "$path" 2>/dev/null || true)"
+  root_real="$(realpath -m -- "$codex_sessions" 2>/dev/null || true)"
+  if [[ -n "$path_real" && -n "$root_real" && "$path_real" == "$root_real"/* ]]; then
+    printf 'codex'
+  else
+    printf 'claude'
+  fi
+}
+
 reflect_jsonl_to_text() {
-  jq -R -r --argjson excerpt "$REFLECT_EXCERPT_BYTES" '
+  local client="${1:-claude}"
+  jq -R -r --arg client "$client" --argjson excerpt "$REFLECT_EXCERPT_BYTES" '
+    def codex_text_parts:
+      if type == "string" then [.]
+      elif type == "array" then
+        [ .[]
+          | if type == "string" then .
+            elif type == "object" and
+                 (.type == "input_text" or .type == "output_text" or .type == "text")
+            then ((.text // "") | tostring)
+            else empty end ]
+      else [] end;
     (fromjson? // empty) as $e
-    | ($e.message // {}) as $m
-    | ((($m | if type == "object" then .role else null end) // $e.type // "?") | tostring) as $role
-    | ($m | if type == "object" then .content else null end) as $c
-    | ( if ($c | type) == "string" then [$c]
-        elif ($c | type) == "array" then
-          [ $c[]
-            | if type == "object" then
-                ( if .type == "text" then ((.text // "") | tostring)
-                  elif .type == "tool_use" then ("[tool_use " + ((.name // "?") | tostring) + "]")
-                  elif .type == "tool_result" then
-                    ("[tool_result " + (((.content // "") | tostring)[0:$excerpt]) + "]")
-                  else "" end )
-              else tostring end ]
-        else [] end ) as $parts
-    | ($parts | map(select(. != null and . != "")) | join("\n")) as $body
-    | select($body != "")
-    | $role + ": " + $body
+    | if $client == "codex" then
+        select($e.type == "response_item")
+        | ($e.payload // {}) as $p
+        | if $p.type == "message" and
+             ($p.role == "user" or $p.role == "assistant") then
+            (($p.role // "?") | tostring) as $role
+            | (($p.content | codex_text_parts)
+               | map(select(. != "")) | join("\n")) as $body
+            | select($body != "")
+            | $role + ": " + $body
+          elif $p.type == "function_call" then
+            "assistant: [tool_use " + (($p.name // "?") | tostring) + "]"
+          elif $p.type == "function_call_output" then
+            (($p.output | codex_text_parts)
+               | map(select(. != "")) | join("\n") | .[0:$excerpt]) as $body
+            | select($body != "")
+            | "tool: [tool_result " + $body + "]"
+          else empty end
+      else
+        ($e.message // {}) as $m
+        | ((($m | if type == "object" then .role else null end) // $e.type // "?") | tostring) as $role
+        | ($m | if type == "object" then .content else null end) as $c
+        | ( if ($c | type) == "string" then [$c]
+            elif ($c | type) == "array" then
+              [ $c[]
+                | if type == "object" then
+                    ( if .type == "text" then ((.text // "") | tostring)
+                      elif .type == "tool_use" then ("[tool_use " + ((.name // "?") | tostring) + "]")
+                      elif .type == "tool_result" then
+                        ("[tool_result " + (((.content // "") | tostring)[0:$excerpt]) + "]")
+                      else "" end )
+                  else tostring end ]
+            else [] end ) as $parts
+        | ($parts | map(select(. != null and . != "")) | join("\n")) as $body
+        | select($body != "")
+        | $role + ": " + $body
+      end
   ' 2>/dev/null || true
 }
 
@@ -1308,8 +1351,9 @@ reflect_jsonl_to_text() {
 # prompt, never take down the worker that was about to write a manifest.
 reflect_transcript_extract() {
   local path="${1:-}" cap="${2:-0}" side="${3:-tail}"
-  local out="" sliced="" raw_slice="" size raw_cap
+  local out="" sliced="" raw_slice="" size raw_cap client
   if [[ -f "$path" && -r "$path" ]] && [[ "$cap" =~ ^[0-9]+$ ]] && (( cap > 0 )); then
+    client="$(reflect_transcript_client "$path")"
     size="$(reflect_file_size "$path")"
     raw_cap=$(( cap * 4 ))
     # `raw_slice` is the window BEFORE the broken edge line is dropped, kept
@@ -1329,7 +1373,7 @@ reflect_transcript_extract() {
       sliced="$raw_slice"
     fi
     if [[ -n "$sliced" ]]; then
-      out="$(printf '%s\n' "$sliced" | reflect_jsonl_to_text || true)"
+      out="$(printf '%s\n' "$sliced" | reflect_jsonl_to_text "$client" || true)"
     fi
     # THE SLICE CAN HOLD NO COMPLETE JSONL LINE. Both slice paths drop the edge
     # line they cut in half — and when a single line is itself bigger than
@@ -1351,7 +1395,7 @@ reflect_transcript_extract() {
     # these bytes. Same handling as every other block here — prompt CONTENT for a
     # `--tools ""` subprocess, summarised, never executed, never interpolated
     # into a shell command. The cap is what bounds it.
-    if [[ -z "$out" && -n "$raw_slice" ]]; then
+    if [[ "$client" != "codex" && -z "$out" && -n "$raw_slice" ]]; then
       local raw
       if (( ${#raw_slice} > cap )); then
         if [[ "$side" == "head" ]]; then

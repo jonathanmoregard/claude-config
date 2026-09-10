@@ -392,6 +392,7 @@ if [[ "$ARG1" == "--worker" ]]; then
   : "${HOOK_EVENT:=}"
   : "${CWD:=}"
   : "${TRIGGER:=}"
+  : "${TRANSCRIPT_CLIENT:=claude}"
   # subagentstop-only, and empty for every other mode. Same reason as above: the
   # worker reads them unguarded under `set -u`, and a transient unit hands over an
   # explicitly-built environment in which "never exported" and "exported empty"
@@ -673,10 +674,37 @@ if [[ "$MODE" == "subagentstop" ]]; then
   TRANSCRIPT_PATH="$AGENT_TRANSCRIPT"
 fi
 
+# The Claude-to-Codex mirror sends both clients through this dispatcher. Their
+# rollout formats and safe resume mechanisms differ, so classify from a
+# canonical path beneath Codex's session root rather than from hook-owned labels.
+TRANSCRIPT_CLIENT="$(reflect_transcript_client "$TRANSCRIPT_PATH")"
+
 # --- Resolve paths ------------------------------------------------------------
 eval "$(paths_for_session "$SESSION_ID" "$PARENT_SID")"
 ensure_session_dirs "$SESSION_ID" "$PARENT_SID"
 mkdir -p "$REFLECT_LOG_DIR"
+
+# Codex only has one safe, cache-efficient boundary here: top-level SessionEnd.
+# Other modes would either mutate a live rollout or multiply model calls for
+# subagents whose outcome is already present in the parent. Record the decision
+# without starting, locking, or spawning a worker.
+if [[ "$TRANSCRIPT_CLIENT" == "codex" && "$MODE" != "sessionend" ]]; then
+  write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "skipped" \
+    "$(jq -cn \
+      --arg tp "$TRANSCRIPT_PATH" \
+      --arg event "$HOOK_EVENT" \
+      --arg parent "$PARENT_SID" \
+      --arg agent_id "$AGENT_ID" \
+      --arg agent_type "$AGENT_TYPE" \
+      '{source_transcript:$tp,
+        source_client:"codex",
+        hook_event_name:$event,
+        parent_session_id:(if $parent == "" then null else $parent end),
+        reason:"codex_non_sessionend_disabled"}
+       | (if $agent_id != "" then .agent_id = $agent_id else . end)
+       | (if $agent_type != "" then .agent_type = $agent_type else . end)')"
+  exit 0
+fi
 
 # --- Idempotency guard --------------------------------------------------------
 # NOTE: previously we wrote status=skipped_duplicate then immediately
@@ -750,6 +778,7 @@ fi
 # answers, and conflating them is how the misnested corpus reads today.
 extra_json=$(jq -cn \
   --arg tp "$TRANSCRIPT_PATH" \
+  --arg client "$TRANSCRIPT_CLIENT" \
   --arg event "$HOOK_EVENT" \
   --arg parent "$PARENT_SID" \
   --arg trigger "$TRIGGER" \
@@ -758,6 +787,7 @@ extra_json=$(jq -cn \
   --arg agent_type "$AGENT_TYPE" \
   --arg parent_tp "$PARENT_TRANSCRIPT" \
   '{source_transcript:$tp,
+    source_client:$client,
     hook_event_name:$event,
     parent_session_id:(if $parent == "" then null else $parent end),
     trigger:(if $trigger == "" then null else $trigger end),
@@ -842,6 +872,178 @@ reflect_claude_call() {
   REFLECT_CALL_RC=$?
   set -e
   printf '%s' "$REFLECT_CALL_ENVELOPE" > "$_out"
+  return 0
+}
+
+# Remove only a scratch directory created by reflect_codex_call. The parent +
+# basename checks make both the normal cleanup and signal trap fail closed if a
+# variable is ever clobbered; auth and copied rollout must never become a broad
+# recursive-delete target.
+reflect_codex_cleanup() {
+  local _scratch="${1:-}" _parent="${2:-}"
+  [[ -n "$_scratch" && -n "$_parent" && -d "$_scratch" && ! -L "$_scratch" ]] || return 0
+  [[ "$(dirname -- "$_scratch")" == "$_parent" ]] || return 0
+  [[ "$(basename -- "$_scratch")" == codex-reflect.* ]] || return 0
+  # arftl-allow: destructive-rm — exact mktemp dir, parent + basename validated above.
+  rm -rf -- "$_scratch"
+}
+
+# reflect_codex_call <prompt> <budget_s> <stdout_log> <stderr_log>
+#
+# Codex resume is native so source tokens remain prompt-cache eligible, but it
+# cannot point at the live rollout: even --ephemeral appends to the resumed
+# file. Resume an exact copy inside a mode-0700 CODEX_HOME instead. Ambient
+# config, project rules, hooks, network-capable tools, and execution tools are
+# disabled; only model text can leave the subprocess.
+reflect_codex_call() {
+  local _prompt="$1" _budget="$2" _out="$3" _err="$4"
+  local _live_home="${CODEX_HOME:-$HOME/.codex}"
+  local _sessions_real="" _source_real="" _relative=""
+  local _source_sid="" _source_model="" _tmp_parent="" _scratch=""
+  local _scratch_home="" _copy="" _events="" _inner="" _usage='{}'
+  local _failure="" _setup_error="" _rc=1
+
+  _sessions_real="$(realpath -m -- "$_live_home/sessions" 2>/dev/null || true)"
+  _source_real="$(realpath -- "$TRANSCRIPT_PATH" 2>/dev/null || true)"
+  if [[ -z "$_sessions_real" || -z "$_source_real" ||
+        "$_source_real" != "$_sessions_real"/* ||
+        ! -f "$_source_real" || ! -r "$_source_real" ]]; then
+    _setup_error="codex_source_outside_sessions_root"
+  fi
+
+  if [[ -z "$_setup_error" ]]; then
+    _relative="${_source_real#"$_sessions_real"/}"
+    # Current Codex rollouts keep the id in session_meta and the active model in
+    # turn_context. The id lookup stops at its first typed record. The model
+    # lookup streams to the last typed record so an in-session model switch is
+    # preserved without accumulating the transcript in memory. Real hook
+    # preambles have pushed the first turn_context past line 400.
+    _source_sid="$(jq -Rnr '
+      first(inputs | fromjson?
+        | select(type == "object" and .type == "session_meta")
+        | .payload.id // empty)
+    ' "$_source_real" 2>/dev/null || true)"
+    _source_model="$(jq -Rnr '
+      (last(inputs | fromjson?
+        | select(type == "object" and .type == "turn_context")
+        | .payload.model // empty)) // empty
+    ' "$_source_real" 2>/dev/null || true)"
+    if [[ "$_source_sid" != "$SESSION_ID" ]]; then
+      _setup_error="codex_session_id_mismatch"
+    elif [[ ! "$_source_model" =~ ^[A-Za-z0-9._:-]{1,128}$ ]]; then
+      _setup_error="codex_source_model_missing_or_invalid"
+    elif [[ ! -f "$_live_home/auth.json" || ! -r "$_live_home/auth.json" ]]; then
+      _setup_error="codex_auth_unavailable"
+    fi
+  fi
+
+  if [[ -z "$_setup_error" ]]; then
+    _tmp_parent="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
+    _tmp_parent="$(realpath -m -- "$_tmp_parent" 2>/dev/null || true)"
+    if [[ -z "$_tmp_parent" || ! -d "$_tmp_parent" || ! -w "$_tmp_parent" ]]; then
+      _setup_error="codex_scratch_parent_unavailable"
+    elif ! _scratch="$(mktemp -d -p "$_tmp_parent" 'codex-reflect.XXXXXX' 2>/dev/null)"; then
+      _setup_error="codex_scratch_create_failed"
+    fi
+  fi
+
+  if [[ -z "$_setup_error" ]]; then
+    chmod 0700 -- "$_scratch" || _setup_error="codex_scratch_chmod_failed"
+    _scratch_home="$_scratch/home"
+    _copy="$_scratch_home/sessions/$_relative"
+  fi
+  if [[ -z "$_setup_error" ]]; then
+    if ! mkdir -p -- "$(dirname -- "$_copy")"; then
+      _setup_error="codex_scratch_layout_failed"
+    elif ! install -m 0600 -- "$_live_home/auth.json" "$_scratch_home/auth.json"; then
+      _setup_error="codex_auth_copy_failed"
+    elif ! install -m 0600 -- "$_source_real" "$_copy"; then
+      _setup_error="codex_rollout_copy_failed"
+    fi
+  fi
+
+  if [[ -n "$_scratch" ]]; then
+    export REFLECT_CODEX_SCRATCH="$_scratch"
+    export REFLECT_CODEX_SCRATCH_PARENT="$_tmp_parent"
+    trap 'reflect_codex_cleanup "${REFLECT_CODEX_SCRATCH:-}" "${REFLECT_CODEX_SCRATCH_PARENT:-}"' EXIT
+  fi
+
+  if [[ -z "$_setup_error" ]]; then
+    set +e
+    _events=$(cd "$_scratch" && timeout -k "$REFLECT_KILL_GRACE_SECONDS" "$_budget" env \
+      CODEX_HOME="$_scratch_home" \
+      REFLECT_SUBPROCESS=1 \
+      REFLECT_PARENT_SID="$SESSION_ID" \
+      codex exec resume \
+        --ignore-user-config \
+        --ignore-rules \
+        --disable hooks \
+        --disable shell_tool \
+        --disable unified_exec \
+        --disable apps \
+        --disable browser_use \
+        --disable computer_use \
+        --disable image_generation \
+        --disable code_mode_host \
+        --disable tool_suggest \
+        --disable multi_agent \
+        --disable standalone_web_search \
+        --disable goals \
+        --disable plugins \
+        --disable remote_plugin \
+        --disable skill_search \
+        --disable auth_elicitation \
+        --ephemeral \
+        --all \
+        --skip-git-repo-check \
+        --json \
+        --output-schema "$SCRIPT_DIR/reflection.schema.json" \
+        --model "$_source_model" \
+        -c 'model_reasoning_effort="low"' \
+        -c 'sandbox_mode="read-only"' \
+        -c 'approval_policy="never"' \
+        -c 'web_search="disabled"' \
+        "$SESSION_ID" - <<<"$_prompt" 2>>"$_err")
+    _rc=$?
+    set -e
+
+    _inner="$(jq -Rsr '
+      [split("\n")[] | fromjson?
+       | select(.type == "item.completed" and .item.type == "agent_message")
+       | (.item.text // empty)] | last // ""
+    ' <<<"$_events" 2>/dev/null || true)"
+    _usage="$(jq -Rsc '
+      [split("\n")[] | fromjson?
+       | select(.type == "turn.completed")
+       | (.usage // {})] | last // {}
+    ' <<<"$_events" 2>/dev/null || printf '{}')"
+
+    if (( _rc == 0 )); then
+      REFLECT_CALL_ENVELOPE="$(jq -cn --arg result "$_inner" --argjson usage "$_usage" \
+        '{type:"result",subtype:"success",is_error:false,result:$result,usage:$usage}')"
+    else
+      _failure="$(jq -Rsr '
+        [split("\n")[] | fromjson?
+         | select(.type == "turn.failed")
+         | (.error.message // .error // empty | tostring)]
+        | (last // "codex reflection subprocess failed") | .[0:200]
+      ' <<<"$_events" 2>/dev/null || printf 'codex reflection subprocess failed')"
+      REFLECT_CALL_ENVELOPE="$(jq -cn --arg result "$_failure" \
+        '{type:"result",subtype:"error_during_execution",is_error:true,result:$result}')"
+    fi
+  else
+    _rc=1
+    REFLECT_CALL_ENVELOPE="$(jq -cn --arg result "$_setup_error" \
+      '{type:"result",subtype:"error_during_execution",is_error:true,result:$result}')"
+  fi
+
+  REFLECT_CALL_RC="$_rc"
+  printf '%s' "$REFLECT_CALL_ENVELOPE" > "$_out"
+  if [[ -n "$_scratch" ]]; then
+    reflect_codex_cleanup "$_scratch" "$_tmp_parent"
+    unset REFLECT_CODEX_SCRATCH REFLECT_CODEX_SCRATCH_PARENT
+    trap - EXIT HUP INT TERM
+  fi
   return 0
 }
 
@@ -1028,11 +1230,12 @@ run_worker() {
   _worker_extra() {
     jq -cn \
       --arg tp "$TRANSCRIPT_PATH" \
+      --arg client "$TRANSCRIPT_CLIENT" \
       --arg event "$HOOK_EVENT" \
       --arg parent "$PARENT_SID" \
       --argjson attempt "$attempt_extra" \
       --argjson own "${1:-{\}}" \
-      '{source_transcript:$tp,hook_event_name:$event,
+      '{source_transcript:$tp,source_client:$client,hook_event_name:$event,
         parent_session_id:(if $parent == "" then null else $parent end)}
        + $attempt + $own'
   }
@@ -1052,7 +1255,13 @@ run_worker() {
   # reporting. Diverges from `budget` the moment the fallback runs.
   local effective_budget="$budget"
 
-  if [[ "$MODE" != "sessionend" ]]; then
+  if [[ "$TRANSCRIPT_CLIENT" == "codex" && "$MODE" == "sessionend" ]]; then
+    reflect_codex_call "$prompt" "$budget" "$worker_out" "$worker_log"
+    claude_json="$REFLECT_CALL_ENVELOPE"
+    rc="$REFLECT_CALL_RC"
+    inner="$(jq -r '.result // empty' <<<"$claude_json" 2>/dev/null || true)"
+    attempt_extra='{"native_resume":true,"source_copy":true,"fallback_used":false,"fallback_skipped_quota":false}'
+  elif [[ "$MODE" != "sessionend" ]]; then
     local primary_resume="$SESSION_ID"
     [[ "$MODE" == "subagentstop" ]] && primary_resume=""
     reflect_claude_call "$prompt" "$budget" "$primary_resume" "$worker_out" "$worker_log"
@@ -1505,13 +1714,18 @@ run_worker() {
   # jq queries like `.patterns | length`). Coercing to [] loses the
   # malformed string but preserves the SHAPE invariant that final.json
   # always has 5 array-typed keys.
-  local -r _coerce_arrays='{
-    patterns: ((.patterns // []) | if type == "array" then . else [] end),
-    discoveries: ((.discoveries // []) | if type == "array" then . else [] end),
-    turning_points: ((.turning_points // []) | if type == "array" then . else [] end),
-    digressions: ((.digressions // []) | if type == "array" then . else [] end),
-    obstacles_to_autonomy: ((.obstacles_to_autonomy // []) | if type == "array" then . else [] end)
-  }'
+  local -r _coerce_arrays='
+    def bounded_strings:
+      if type == "array" then
+        [ .[] | select(type == "string") | .[0:500] ][0:10]
+      else [] end;
+    {
+      patterns: ((.patterns // []) | bounded_strings),
+      discoveries: ((.discoveries // []) | bounded_strings),
+      turning_points: ((.turning_points // []) | bounded_strings),
+      digressions: ((.digressions // []) | bounded_strings),
+      obstacles_to_autonomy: ((.obstacles_to_autonomy // []) | bounded_strings)
+    }'
   local reflection=""
   # shellcheck disable=SC2034  # which of the two parse strategies won is a
   # breadcrumb for anyone stepping through this with `bash -x`; it is
@@ -1584,6 +1798,7 @@ run_worker() {
   wrapped=$(jq -c \
     --arg sid "$SESSION_ID" \
     --arg parent "$PARENT_SID" \
+    --arg client "$TRANSCRIPT_CLIENT" \
     --arg mode "$MODE" \
     --arg event "$HOOK_EVENT" \
     --arg now "$(reflect_now)" \
@@ -1592,6 +1807,7 @@ run_worker() {
     '. + {
       session_id: $sid,
       parent_session_id: (if $parent == "" then null else $parent end),
+      source_client: $client,
       mode: $mode,
       hook_event_name: $event,
       generated_at: $now,
@@ -1687,7 +1903,7 @@ spawn_detached_worker() {
     # ~/.claude/sessions during a smoke run, because this list was the only
     # thing standing between an isolated test and the user's own files. Same
     # shape as the REFLECT_ROOT propagation defect fixed earlier.
-    for v in SESSION_ID PARENT_SID TRANSCRIPT_PATH HOOK_EVENT MODE CWD \
+    for v in SESSION_ID PARENT_SID TRANSCRIPT_PATH TRANSCRIPT_CLIENT HOOK_EVENT MODE CWD \
              AGENT_ID AGENT_TYPE PARENT_TRANSCRIPT \
              REFLECT_MODEL REFLECT_ROOT CLAUDE_SESSIONS_DIR REFLECT_LOG_DIR REFLECT_LOCKFILE \
              REFLECT_STALE_STARTED_SECONDS REFLECT_REAP_MAX_PER_RUN \
@@ -1701,7 +1917,7 @@ spawn_detached_worker() {
              REFLECT_HANDOFF_MAX_AGE_SECONDS REFLECT_EXCERPT_BYTES \
              REFLECT_MISSION_RETENTION_DAYS \
              session_dir final_path manifest_path checkpoint_dir SCRIPT_DIR \
-             HOME PATH USER LANG LC_ALL LC_CTYPE XDG_RUNTIME_DIR \
+             HOME CODEX_HOME PATH USER LANG LC_ALL LC_CTYPE XDG_RUNTIME_DIR \
              ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN \
              HTTPS_PROXY HTTP_PROXY NO_PROXY; do
       # Pass every var that is SET, including set-but-empty ones: the worker
@@ -1840,7 +2056,7 @@ write_manifest "$manifest_path" "$SESSION_ID" "$MODE" "started" "$extra_json"
 # Export state the worker needs (safe for both sync + detached paths).
 # REFLECT_LOCKFILE is what lets the detached worker re-acquire this mode's lock.
 export REFLECT_LOCKFILE="$LOCKFILE"
-export SESSION_ID PARENT_SID TRANSCRIPT_PATH HOOK_EVENT MODE CWD
+export SESSION_ID PARENT_SID TRANSCRIPT_PATH TRANSCRIPT_CLIENT HOOK_EVENT MODE CWD
 export AGENT_ID AGENT_TYPE PARENT_TRANSCRIPT
 export REFLECT_MODEL REFLECT_ROOT CLAUDE_SESSIONS_DIR REFLECT_LOG_DIR
 # The caps and thresholds live in lib.sh with `: "${VAR:=default}"`, i.e. SET but

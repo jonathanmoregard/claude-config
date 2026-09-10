@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "patterns",
+    "discoveries",
+    "obstacles_to_autonomy",
+    "turning_points",
+    "digressions"
+  ],
+  "properties": {
+    "patterns": {
+      "type": "array",
+      "maxItems": 10,
+      "items": { "type": "string", "maxLength": 500 }
+    },
+    "discoveries": {
+      "type": "array",
+      "maxItems": 10,
+      "items": { "type": "string", "maxLength": 500 }
+    },
+    "obstacles_to_autonomy": {
+      "type": "array",
+      "maxItems": 10,
+      "items": { "type": "string", "maxLength": 500 }
+    },
+    "turning_points": {
+      "type": "array",
+      "maxItems": 10,
+      "items": { "type": "string", "maxLength": 500 }
+    },
+    "digressions": {
+      "type": "array",
+      "maxItems": 10,
+      "items": { "type": "string", "maxLength": 500 }
+    }
+  }
+}
