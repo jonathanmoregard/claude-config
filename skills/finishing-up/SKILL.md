@@ -47,7 +47,8 @@ Use exact uppercase outcome values and exact fields:
 
 JSON stays on one line; all values are non-empty strings; `repo` is the exact
 absolute path from the nudge; a question ends in `?`. Cover every blocked repo
-exactly once. `ABANDON` explains why work should not ship but never authorizes
+exactly once. With mixed outcomes, `QUESTION` wins over `BLOCKED`; otherwise
+use `DONE`. `ABANDON` explains why work should not ship but never authorizes
 deletion. This ends only the current Stop chain; a later user turn measures
 again.
 

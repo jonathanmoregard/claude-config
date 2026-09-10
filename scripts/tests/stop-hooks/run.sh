@@ -205,6 +205,9 @@ badjson=$(jq -cn --arg repo "$BREPO" \
   '{outcomes:[{repo:$repo,outcome:"ABANDON",reason:"Assumption disproven",remaining_work:"None",extra:true}]}')
 reject_reentry "extra outcome fields keep nudging" \
   "$(exit_message "$badjson" DONE)"
+badjson=$(printf '{"outcomes":[{"repo":"%s","outcome":"ABANDON","outcome":"PRESERVE","reason":"Keep this evidence","owner":"Jonathan","next":"Resume later"}]}' "$BREPO")
+reject_reentry "duplicate JSON keys keep nudging" \
+  "$(exit_message "$badjson" DONE)"
 badjson=$(jq -cn --arg repo "$BREPO" \
   '{outcomes:[{repo:$repo,outcome:"QUESTION",question:42}]}')
 reject_reentry "wrong-typed outcome fields keep nudging" \
@@ -249,6 +252,13 @@ completejson=$(jq -cn --arg a "$BREPO" --arg b "$BREPO2" \
   ]}')
 out=$(multi_run "$completejson" BLOCKED)
 ck "complete multi-repo coverage exits with aggregate BLOCKED" "" "$(decision "$out")"
+mixedjson=$(jq -cn --arg a "$BREPO" --arg b "$BREPO2" \
+  '{outcomes:[
+    {repo:$a,outcome:"BLOCKED",blocker:"Remote access is unavailable",needed:"Jonathan must restore credentials"},
+    {repo:$b,outcome:"QUESTION",question:"Should this second branch be preserved?"}
+  ]}')
+out=$(multi_run "$mixedjson" QUESTION)
+ck "QUESTION wins over BLOCKED in a mixed exit" "" "$(decision "$out")"
 
 missingjson=$(jq -cn --arg a "$BREPO" \
   '{outcomes:[{repo:$a,outcome:"PRESERVE",reason:"User requested a later handoff",owner:"Jonathan",next:"Resume from this exact branch"}]}')
@@ -329,6 +339,8 @@ ck "block guidance gives exact explanatory-exit syntax" "yes" \
    "$(has_text "$message" "DOD-EXIT:")"
 ck "block guidance requires uppercase outcome values" "yes" \
    "$(has_text "$message" "exact uppercase outcome values")"
+ck "block guidance defines aggregate precedence" "yes" \
+   "$(has_text "$message" "QUESTION wins over BLOCKED")"
 ck "Abandon never grants deletion authority" "yes" \
    "$(has_text "$message" "Abandon does not authorize deletion")"
 ck "an exit is scoped to the current Stop chain" "yes" \

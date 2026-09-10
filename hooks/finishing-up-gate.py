@@ -173,10 +173,19 @@ def parse_exit_envelope(raw):
     prefix = "DOD-EXIT: "
     if not marker.startswith(prefix):
         return None, "the penultimate non-empty line is not DOD-EXIT"
+
+    def unique_object(pairs):
+        obj = {}
+        for key, value in pairs:
+            if key in obj:
+                raise ValueError(f"duplicate JSON key {key!r}")
+            obj[key] = value
+        return obj
+
     try:
-        data = json.loads(marker[len(prefix):])
-    except (TypeError, ValueError):
-        return None, "DOD-EXIT is not valid one-line JSON"
+        data = json.loads(marker[len(prefix):], object_pairs_hook=unique_object)
+    except (TypeError, ValueError) as exc:
+        return None, f"DOD-EXIT is not valid one-line JSON ({exc})"
     if not isinstance(data, dict) or set(data) != {"outcomes"}:
         return None, "DOD-EXIT must contain only an outcomes array"
     records = data["outcomes"]
@@ -907,7 +916,9 @@ def main():
         "{repo,outcome,reason,owner,next} + DONE; Abandon uses "
         "{repo,outcome,reason,remaining_work} + DONE. Use exact uppercase "
         "outcome values QUESTION, BLOCKED, PRESERVE, or ABANDON. Values are "
-        "strings; repo is the absolute path above. Abandon does not authorize deletion. The "
+        "strings; repo is the absolute path above. For mixed outcomes, "
+        "QUESTION wins over BLOCKED, otherwise use DONE. Abandon does not "
+        "authorize deletion. The "
         "exit applies only to this current Stop chain; the next user turn is "
         "measured again. "
         f"This gate stands down after {MAX_BLOCKS} blocks regardless."
