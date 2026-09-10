@@ -20,8 +20,9 @@ single-outcome prompt with a concise three-outcome contract, and teach
 **Files:**
 - Modify: `scripts/tests/stop-hooks/run.sh`
 
-- [ ] Add a `GATE_UNDER_TEST` override and run this branch's hook explicitly;
-  never let a green result come from live `~/.claude`.
+- [ ] Add a `GATE_UNDER_TEST` override and isolated fake home that routes both
+  direct and Ralph-integrated calls through this branch's hook/scripts; never
+  let a green result come from live `~/.claude`.
 - [ ] Add an armed-session test proving boolean `stop_hook_active: true`
   returns no decision, exits zero, and does not spend the block budget.
 - [ ] Prove false, absent, and wrong-shaped values do not bypass measurement.

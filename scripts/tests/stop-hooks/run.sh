@@ -33,7 +33,16 @@ trap 'rm -rf "$SD" "$ARMWORK"' EXIT  # arftl-allow: destructive-shell — both a
 export CLAUDE_RALPH_STATE_DIR="$SD/ralph"
 mkdir -p "$CLAUDE_RALPH_STATE_DIR"
 GATE="${GATE_UNDER_TEST:-$HOME/.claude/hooks/finishing-up-gate.py}"
-RALPH_HOOK="$HOME/.claude/hooks/ralph-loop-stop.sh"
+UNDER_TEST_ROOT=$(cd "$(dirname "$GATE")/.." && pwd -P)
+RALPH_HOOK="$UNDER_TEST_ROOT/hooks/ralph-loop-stop.sh"
+RALPH_TEST_HOME="$SD/ralph-home"
+mkdir -p "$RALPH_TEST_HOME/.claude/hooks" "$RALPH_TEST_HOME/.claude/scripts"
+ln -s "$(realpath "$GATE")" \
+  "$RALPH_TEST_HOME/.claude/hooks/finishing-up-gate.py"
+ln -s "$UNDER_TEST_ROOT/scripts/ralph-loop-state.sh" \
+  "$RALPH_TEST_HOME/.claude/scripts/ralph-loop-state.sh"
+ln -s "$UNDER_TEST_ROOT/scripts/dod-check.py" \
+  "$RALPH_TEST_HOME/.claude/scripts/dod-check.py"
 SID="guardtest-$$"
 
 pass=0; fail=0
@@ -91,6 +100,9 @@ payload_run() {  # $1 = complete JSON payload; extra args are env assignments
   rc=$?
   printf '%s' "$rc" > "$RCFILE"
   printf '%s' "$out"
+}
+ralph_under_test() {
+  HOME="$RALPH_TEST_HOME" bash "$RALPH_HOOK"
 }
 
 echo "== dod gate: one driver per turn =="
@@ -230,7 +242,7 @@ PY
   # without it that inner call reads the LIVE ~/.local/state/claude-dod — an
   # isolation gap in a file whose own header claims isolation.
   printf '{"session_id":"%s","transcript_path":"%s"}' "$S" "$T" \
-    | CLAUDE_DOD_STATE_DIR="$SD" bash "$RALPH_HOOK" >/dev/null 2>&1
+    | CLAUDE_DOD_STATE_DIR="$SD" ralph_under_test >/dev/null 2>&1
   if [ -f "$CLAUDE_RALPH_STATE_DIR/$S.md" ]; then rm -f "$CLAUDE_RALPH_STATE_DIR/$S.md"; echo kept
   else echo gone; fi
 }
@@ -346,7 +358,7 @@ out=$(gate_run "$RSID")
 ck "concurrent gate stands down for the live loop" "" "$(decision "$out")"
 ck "  ...by exiting 0, not by crashing" "0" "$(gate_rc)"
 printf '{"session_id":"%s","transcript_path":"%s"}' "$RSID" "$RT" \
-  | CLAUDE_DOD_STATE_DIR="$SD" bash "$RALPH_HOOK" >/dev/null 2>&1
+  | CLAUDE_DOD_STATE_DIR="$SD" ralph_under_test >/dev/null 2>&1
 ck "end_loop leaves no loop state behind" "gone" \
    "$([ -e "$CLAUDE_RALPH_STATE_DIR/$RSID.md" ] && echo kept || echo gone)"
 out=$(gate_run "$RSID")
@@ -360,7 +372,7 @@ CSID="corrupt-$RANDOM"
 printf -- '---\nactive: true\nmax_iterations: 25\n---\np\n' \
   > "$CLAUDE_RALPH_STATE_DIR/$CSID.md"
 printf '{"session_id":"%s","transcript_path":"%s"}' "$CSID" "$RT" \
-  | CLAUDE_DOD_STATE_DIR="$SD" bash "$RALPH_HOOK" >/dev/null 2>&1
+  | CLAUDE_DOD_STATE_DIR="$SD" ralph_under_test >/dev/null 2>&1
 ck "a missing frontmatter line ends the loop" "gone" \
    "$([ -e "$CLAUDE_RALPH_STATE_DIR/$CSID.md" ] && echo kept || echo gone)"
 
@@ -386,7 +398,7 @@ printf '%s\n' "$BREPO" > "$SD/$MSID2.arm"
 # resolver: without it the hook dies at `source` under set -e, and this case
 # would measure that instead of the missing gate.
 MISS_HOME="$SD/misshome"; mkdir -p "$MISS_HOME/.claude/hooks" "$MISS_HOME/.claude/scripts"
-cp "$HOME/.claude/scripts/ralph-loop-state.sh" "$MISS_HOME/.claude/scripts/"
+cp "$UNDER_TEST_ROOT/scripts/ralph-loop-state.sh" "$MISS_HOME/.claude/scripts/"
 out=$(printf '{"session_id":"%s","transcript_path":"%s"}' "$MSID2" "$MT" \
       | CLAUDE_DOD_STATE_DIR="$SD" HOME="$MISS_HOME" bash "$RALPH_HOOK" 2>/dev/null)
 ck "a missing gate BLOCKS the handover turn" "block" "$(decision "$out")"
@@ -399,7 +411,7 @@ printf -- '---\nactive: true\niteration: 4\nmax_iterations: 25\ncompletion_promi
   > "$CLAUDE_RALPH_STATE_DIR/$MSID3.md"
 CRASH_HOME="$SD/crashhome"; mkdir -p "$CRASH_HOME/.claude/hooks" "$CRASH_HOME/.claude/scripts"
 printf 'raise RuntimeError("boom")\n' > "$CRASH_HOME/.claude/hooks/finishing-up-gate.py"
-cp "$HOME/.claude/scripts/ralph-loop-state.sh" "$CRASH_HOME/.claude/scripts/"
+cp "$UNDER_TEST_ROOT/scripts/ralph-loop-state.sh" "$CRASH_HOME/.claude/scripts/"
 out=$(printf '{"session_id":"%s","transcript_path":"%s"}' "$MSID3" "$MT" \
       | CLAUDE_DOD_STATE_DIR="$SD" HOME="$CRASH_HOME" bash "$RALPH_HOOK" 2>/dev/null)
 ck "a crashing gate BLOCKS the handover turn" "block" "$(decision "$out")"
@@ -566,8 +578,10 @@ PY
   printf -- '---\nactive: true\niteration: 4\nmax_iterations: 25\ncompletion_promise: "ALL DONE"\n---\nkeep going\n' \
     > "$CLAUDE_RALPH_STATE_DIR/$S.md"
   printf '%s\n' "$HREPO" > "$SD/$S.arm"
-  printf '{"session_id":"%s","transcript_path":"%s"}' "$S" "$T" \
-    | CLAUDE_DOD_STATE_DIR="$SD" bash "$RALPH_HOOK" 2>/dev/null
+  # Exercise branch gate's HANDOVER exception through ralph, not only through
+  # a direct gate call: ordinary re-entry stands down, handover must not.
+  printf '{"session_id":"%s","transcript_path":"%s","stop_hook_active":true}' "$S" "$T" \
+    | CLAUDE_DOD_STATE_DIR="$SD" ralph_under_test 2>/dev/null
   rm -f "$CLAUDE_RALPH_STATE_DIR/$S.md"
 }
 
@@ -576,7 +590,7 @@ out=$(end_via '<promise>ALL DONE</promise>')
 # assertions further down are about THIS handover's output, not whatever ran
 # last. (They silently were, which is how a passing suite hid it.)
 HOUT="$out"
-ck "promise handover blocks on the gate's verdict" "block" "$(decision "$HOUT")"
+ck "promise handover still blocks after a Stop continuation" "block" "$(decision "$HOUT")"
 
 # The marker protocol these cases used to exercise is GONE — it was a lease with
 # no fencing token, and the review loop stopped with self-inflicted-churn after
@@ -657,7 +671,7 @@ rm -f "$SD/$TSID.arm" "$SD/$TSID.blocks"
 SLOWGATE_HOME="$SD/slowgate"
 mkdir -p "$SLOWGATE_HOME/.claude/hooks" "$SLOWGATE_HOME/.claude/scripts"
 printf 'import time\ntime.sleep(45)\n' > "$SLOWGATE_HOME/.claude/hooks/finishing-up-gate.py"
-cp "$HOME/.claude/scripts/ralph-loop-state.sh" "$SLOWGATE_HOME/.claude/scripts/"
+cp "$UNDER_TEST_ROOT/scripts/ralph-loop-state.sh" "$SLOWGATE_HOME/.claude/scripts/"
 GSID="slowgate-$RANDOM"
 printf -- '---\nactive: true\niteration: 4\nmax_iterations: 25\ncompletion_promise: "ALL DONE"\n---\np\n' \
   > "$CLAUDE_RALPH_STATE_DIR/$GSID.md"
@@ -685,7 +699,7 @@ printf '%s\n' "$BREPO" > "$SD/$RSID.arm"
 chmod 555 "$RODIR"
 out=$(printf '{"session_id":"%s","transcript_path":"%s"}' "$RSID" "$MT" \
       | CLAUDE_DOD_STATE_DIR="$SD" CLAUDE_RALPH_STATE_DIR="$RODIR" \
-        bash "$RALPH_HOOK" 2>/dev/null)
+        ralph_under_test 2>/dev/null)
 chmod 755 "$RODIR"
 ck "an undeletable loop state file still BLOCKS" "block" "$(decision "$out")"
 case "$out" in *"could not delete the loop state file"*) r=named ;; *) r="$out" ;; esac
@@ -711,7 +725,7 @@ rm -f "$CLAUDE_RALPH_STATE_DIR/$HSID.md" "$SD/$HSID.arm" "$SD/$HSID.blocks"
 # the gate down forever.
 NORES_HOME="$SD/nores"
 mkdir -p "$NORES_HOME/.claude/hooks" "$NORES_HOME/.claude/scripts"
-cp "$HOME/.claude/hooks/finishing-up-gate.py" "$NORES_HOME/.claude/hooks/"
+cp "$GATE" "$NORES_HOME/.claude/hooks/"
 NSID="nores-$RANDOM"
 printf -- '---\nactive: true\niteration: 25\nmax_iterations: 25\n---\np\n' \
   > "$CLAUDE_RALPH_STATE_DIR/$NSID.md"
@@ -764,7 +778,7 @@ for bad_timeout in abc 0 999; do
   printf '%s\n' "$BREPO" > "$SD/$VSID.arm"
   out=$(printf '{"session_id":"%s","transcript_path":"%s"}' "$VSID" "$MT" \
         | CLAUDE_DOD_STATE_DIR="$SD" CLAUDE_RALPH_GATE_TIMEOUT="$bad_timeout" \
-          bash "$RALPH_HOOK" 2>"$SD/tv-$bad_timeout.err")
+          ralph_under_test 2>"$SD/tv-$bad_timeout.err")
   ck "CLAUDE_RALPH_GATE_TIMEOUT=$bad_timeout still reaches a real verdict" \
      "block" "$(decision "$out")"
   case "$(cat "$SD/tv-$bad_timeout.err")" in
@@ -788,11 +802,11 @@ JSID="nojq-$RANDOM"
 printf -- '---\nactive: true\niteration: 4\nmax_iterations: 25\n---\np\n' \
   > "$CLAUDE_RALPH_STATE_DIR/$JSID.md"
 out=$(printf '{"session_id":"%s","transcript_path":"%s"}' "$JSID" "$MT" \
-      | PATH="$NOJQ" CLAUDE_DOD_STATE_DIR="$SD" bash "$RALPH_HOOK" 2>/dev/null)
+      | PATH="$NOJQ" CLAUDE_DOD_STATE_DIR="$SD" ralph_under_test 2>/dev/null)
 ck "a missing jq BLOCKS while loop state exists" "block" "$(decision "$out")"
 rm -f "$CLAUDE_RALPH_STATE_DIR/$JSID.md"
 out=$(printf '{"session_id":"%s","transcript_path":"%s"}' "$JSID" "$MT" \
-      | PATH="$NOJQ" CLAUDE_DOD_STATE_DIR="$SD" bash "$RALPH_HOOK" 2>/dev/null)
+      | PATH="$NOJQ" CLAUDE_DOD_STATE_DIR="$SD" ralph_under_test 2>/dev/null)
 ck "  ...and is quiet when no loop is armed anywhere" "" "$(decision "$out")"
 
 echo

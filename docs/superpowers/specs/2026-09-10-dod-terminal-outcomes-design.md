@@ -81,8 +81,9 @@ The change lives in Claude source and reaches Codex through existing sync.
 
 - RED/GREEN tests for `stop_hook_active: true`, false, absent, and wrong-shaped
   values, plus a handover case that must still measure.
-- Test harness explicitly targets the worktree hook, never the live installed
-  copy.
+- Test harness supplies the worktree gate, Ralph hook, state resolver, and
+  checker through an isolated fake home; handover integration never reaches
+  the live installed copy.
 - Message-contract tests for all three outcomes and safety wording.
 - Full Stop-hook interaction suite and Python syntax check.
 - Baseline pressure scenario rerun against updated skill.
