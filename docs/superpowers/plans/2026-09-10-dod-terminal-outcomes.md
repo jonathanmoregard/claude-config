@@ -20,9 +20,13 @@ single-outcome prompt with a concise three-outcome contract, and teach
 **Files:**
 - Modify: `scripts/tests/stop-hooks/run.sh`
 
+- [ ] Add a `GATE_UNDER_TEST` override and run this branch's hook explicitly;
+  never let a green result come from live `~/.claude`.
 - [ ] Add an armed-session test proving boolean `stop_hook_active: true`
   returns no decision, exits zero, and does not spend the block budget.
 - [ ] Prove false, absent, and wrong-shaped values do not bypass measurement.
+- [ ] Prove explicit Ralph handover still measures even when the re-entry flag
+  is true.
 - [ ] Capture an ordinary block reason and require Ship, Preserve, Abandon,
   PR-only-for-delivery, explicit deletion approval, conditional PR URL, and a
   single reporting follow-up.
@@ -37,8 +41,9 @@ single-outcome prompt with a concise three-outcome contract, and teach
 - Modify: `hooks/finishing-up-gate.py`
 - Test: `scripts/tests/stop-hooks/run.sh`
 
-- [ ] After valid session/arm lookup, allow only when
-  `payload.get("stop_hook_active") is True`; log the re-entry stand-down.
+- [ ] After valid session/arm lookup, allow only an ordinary Stop when
+  `payload.get("stop_hook_active") is True`; log the re-entry stand-down and
+  preserve explicit handover measurement.
 - [ ] Replace blocker prose with concise Ship/Preserve/Abandon guidance.
 - [ ] Keep exact checker command, one durable follow-up rule, no-unseen-push
   rule, merge authority, actual evidence, and bounded fallback.
@@ -74,4 +79,3 @@ single-outcome prompt with a concise three-outcome contract, and teach
   `python3 ~/.claude/scripts/dod-check.py --repo <worktree>`.
 - [ ] If checks remain pending, create one durable reporting follow-up; never
   merge automatically.
-

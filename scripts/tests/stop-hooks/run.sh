@@ -32,7 +32,7 @@ ARMWORK=$(mktemp -d -p "$HOME" .dod-armtest.XXXXXX)
 trap 'rm -rf "$SD" "$ARMWORK"' EXIT  # arftl-allow: destructive-shell — both are this run's own mktemp -d
 export CLAUDE_RALPH_STATE_DIR="$SD/ralph"
 mkdir -p "$CLAUDE_RALPH_STATE_DIR"
-GATE="$HOME/.claude/hooks/finishing-up-gate.py"
+GATE="${GATE_UNDER_TEST:-$HOME/.claude/hooks/finishing-up-gate.py}"
 RALPH_HOOK="$HOME/.claude/hooks/ralph-loop-stop.sh"
 SID="guardtest-$$"
 
@@ -47,6 +47,10 @@ ck() {
 decision() { printf '%s' "$1" | python3 -c 'import json,sys
 try: print(json.load(sys.stdin).get("decision") or "")
 except Exception: print("")' 2>/dev/null; }
+reason() { printf '%s' "$1" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("reason") or "")
+except Exception: print("")' 2>/dev/null; }
+has_text() { grep -Fq -- "$2" <<<"$1" && echo yes || echo no; }
 
 # `decision` alone CANNOT distinguish "allowed the turn" from "crashed": both
 # render as empty. Every allow-assertion in this file was therefore satisfied by
@@ -74,6 +78,15 @@ gate_run() {  # $1 = session id; extra args are env assignments -> prints stdout
   local sid="$1"; shift
   local out rc
   out=$(printf '{"session_id":"%s"}' "$sid" \
+        | env CLAUDE_DOD_STATE_DIR="$SD" "$@" python3 "$GATE" 2>/dev/null)
+  rc=$?
+  printf '%s' "$rc" > "$RCFILE"
+  printf '%s' "$out"
+}
+payload_run() {  # $1 = complete JSON payload; extra args are env assignments
+  local payload="$1"; shift
+  local out rc
+  out=$(printf '%s' "$payload" \
         | env CLAUDE_DOD_STATE_DIR="$SD" "$@" python3 "$GATE" 2>/dev/null)
   rc=$?
   printf '%s' "$rc" > "$RCFILE"
@@ -115,6 +128,46 @@ ck "  ...and a crash is distinguishable" "1" "$rc"
 
 out=$(printf '{"session_id":"%s"}' "$SID" | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE")
 ck "blocks again once the loop is gone" "block" "$(decision "$out")"
+
+echo
+echo "== dod gate: one continuation per Stop attempt =="
+REENTRYSID="reentry-$RANDOM"
+printf '%s\n' "$BREPO" > "$SD/$REENTRYSID.arm"
+
+out=$(payload_run "$(printf '{"session_id":"%s","stop_hook_active":true}' "$REENTRYSID")")
+ck "a runtime-authenticated Stop re-entry stands down" "" "$(decision "$out")"
+ck "  ...by exiting 0, not by crashing" "0" "$(gate_rc)"
+ck "  ...without spending the block budget" "gone" \
+   "$([ -e "$SD/$REENTRYSID.blocks" ] && echo kept || echo gone)"
+
+out=$(payload_run "$(printf '{"session_id":"%s","stop_hook_active":false}' "$REENTRYSID")")
+ck "boolean false still measures and blocks" "block" "$(decision "$out")"
+message=$(reason "$out")
+out=$(payload_run "$(printf '{"session_id":"%s","stop_hook_active":"true"}' "$REENTRYSID")")
+ck "a truthy string cannot spoof Stop re-entry" "block" "$(decision "$out")"
+out=$(payload_run "$(printf '{"session_id":"%s"}' "$REENTRYSID")")
+ck "an absent re-entry field keeps compatibility" "block" "$(decision "$out")"
+out=$(payload_run \
+  "$(printf '{"session_id":"%s","stop_hook_active":true}' "$REENTRYSID")" \
+  CLAUDE_DOD_HANDOVER=1)
+ck "an explicit ralph handover still measures" "block" "$(decision "$out")"
+
+ck "block guidance names Ship" "yes" "$(has_text "$message" "Ship")"
+ck "block guidance names Preserve" "yes" "$(has_text "$message" "Preserve")"
+ck "block guidance names Abandon" "yes" "$(has_text "$message" "Abandon")"
+ck "a PR is never opened only to clear the gate" "yes" \
+   "$(has_text "$message" "Never push or open a PR solely to clear this gate.")"
+ck "deletion requires explicit user approval" "yes" \
+   "$(has_text "$message" "Never delete work without explicit user approval.")"
+ck "PR URLs are conditional on an existing PR" "yes" \
+   "$(has_text "$message" "Include a PR URL only when one exists.")"
+ck "in-flight checks get one reporting follow-up" "yes" \
+   "$(has_text "$message" "one durable reporting follow-up")"
+ck "old single-outcome instruction is gone" "no" \
+   "$(has_text "$message" "drive to green and mergeable")"
+ck "old unconditional PR-link demand is gone" "no" \
+   "$(has_text "$message" "with the clickable PR URL")"
+rm -f "$SD/$REENTRYSID.arm" "$SD/$REENTRYSID.blocks"
 
 out=$(printf '{"session_id":"%s"}' "$SID" | CLAUDE_DOD_STATE_DIR="$SD" CLAUDE_DOD_MODE=shadow python3 "$GATE")
 case "$out" in *'"systemMessage"'*) r=shadow ;; *) r="$out" ;; esac

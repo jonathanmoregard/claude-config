@@ -48,8 +48,10 @@ or accidental work, ask one focused outcome question.
 2. If unfinished, issue one concise continuation that names Ship, Preserve,
    and Abandon, forbids PR creation solely to clear the gate, and forbids
    deletion without user approval.
-3. On runtime-authenticated re-entry (`stop_hook_active is True`), allow
-   immediately and log why. Do not trust truthy strings or objects.
+3. On runtime-authenticated ordinary re-entry (`stop_hook_active is True`),
+   allow immediately and log why. Do not trust truthy strings or objects. An
+   explicit Ralph handover still measures: it is the loop's last delivery
+   check, not a recursive continuation.
 4. Retain the current block budget as a compatibility fallback for runtimes
    that omit the field and for new, independently initiated Stop attempts.
 5. Keep background-task, scheduled-follow-up, Ralph handover, objective checker,
@@ -78,9 +80,10 @@ The change lives in Claude source and reaches Codex through existing sync.
 ## Verification
 
 - RED/GREEN tests for `stop_hook_active: true`, false, absent, and wrong-shaped
-  values.
+  values, plus a handover case that must still measure.
+- Test harness explicitly targets the worktree hook, never the live installed
+  copy.
 - Message-contract tests for all three outcomes and safety wording.
 - Full Stop-hook interaction suite and Python syntax check.
 - Baseline pressure scenario rerun against updated skill.
 - Fresh-context adversarial review of integrated diff.
-
