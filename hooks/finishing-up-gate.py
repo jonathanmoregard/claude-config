@@ -399,6 +399,21 @@ def main():
 
     reap(session)
 
+    # Both Claude Code and Codex set this boolean after a Stop hook has already
+    # continued the current turn. Blocking again would inject the same
+    # continuation repeatedly; the runtime-owned flag is the re-entry guard.
+    # Keep the explicit Ralph handover exempt: that call is the loop's final
+    # delivery measurement, not an ordinary recursive Stop.
+    stop_hook_active = payload.get("stop_hook_active")
+    if stop_hook_active is True and not HANDOVER:
+        log(session, {"action": "allow",
+                      "why": "Stop hook already continued this turn"})
+        allow()
+    if stop_hook_active is not None and not isinstance(stop_hook_active, bool):
+        log(session, {"action": "warn",
+                      "why": "stop_hook_active has unexpected shape "
+                             f"{type(stop_hook_active).__name__}; ignoring it"})
+
     def _standdown(field):
         """True only for a NON-EMPTY LIST — the documented shape.
 
@@ -749,27 +764,29 @@ def main():
     reason = (
         "Work in this session is not finished. `dod-check` reports:\n\n"
         f"{body}\n\n"
-        "Invoke the `finishing-up` skill and work these blockers. Do not end "
-        "the turn by reporting status — drive to green and mergeable.\n\n"
+        "Invoke the `finishing-up` skill and choose the correct terminal "
+        "outcome before acting on checker codes:\n"
+        "- Ship: deliver this work upstream, then work its blockers to green "
+        "and mergeable.\n"
+        "- Preserve: retain it only when Jonathan explicitly wants it kept; "
+        "report the exact branch, worktree, commit, and measured blockers.\n"
+        "- Abandon: discard it only after Jonathan explicitly approves "
+        "deletion; resolve the exact targets first.\n"
+        "Never push or open a PR solely to clear this gate. Never delete work "
+        "without explicit user approval. Act now when the outcome is already "
+        "authorized; otherwise ask one focused outcome question.\n\n"
         f"Re-check with: python3 {DOD} --repo <repo>\n"
         "That exact command, not a bare `dod-check` — it is not on PATH. "
         "Reading the conditions yourself and concluding you are done is the "
         "self-attestation this gate exists to replace.\n\n"
-        "If a check is still running: book a durable CronCreate follow-up "
-        "because it is the right thing to leave for Jonathan — but it will NOT "
-        "clear this gate, and pretending otherwise wasted three turns when it "
-        "was measured (2026-08-27). A durable cron outlives the session, so it "
-        "is not session-scoped and never appears in `session_crons`, which is "
-        "one of the two fields this gate stands down for; the other is "
-        "`background_tasks`. So: book the follow-up, then say plainly that you "
-        "are blocked on the check — the URL, and what you actually observed — "
-        "and let this gate stand down at its budget. Do not re-run hoping to "
-        "clear it. The follow-up REPORTS — it must not merge, and must not "
-        "push anything Jonathan has not already seen. Merging is his click, "
-        "and being blocked by this gate is not authorisation to take it.\n\n"
-        "If you are genuinely blocked on Jonathan — a credential, an "
-        "interactive login, a taste call, or his merge click — say so "
-        "explicitly, with the clickable PR URL and what you actually measured. "
+        "If an external check is still running, create one durable reporting "
+        "follow-up, then report its URL/state and what you observed. That "
+        "follow-up must only report: it must not merge or push unseen work, "
+        "and it does not clear this session gate.\n\n"
+        "For a credential, interactive login, outcome choice, taste call, or "
+        "merge click, state once what you measured and the human action needed. "
+        "Include a PR URL only when one exists. Do not rerun unchanged checks "
+        "or repeat the same question. "
         f"This gate stands down after {MAX_BLOCKS} blocks regardless."
     )
     block(
