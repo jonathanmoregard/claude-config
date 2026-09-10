@@ -20,6 +20,7 @@ import pytest
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HOOK = os.path.join(REPO_ROOT, "hooks", "dot-claude-config-write-guard.py")
 LIVE = os.path.join(os.path.expanduser("~"), ".claude")
+CODEX = os.path.join(os.path.expanduser("~"), ".codex")
 
 
 def run(payload, home=None):
@@ -62,6 +63,20 @@ def assert_denied(payload):
     # The refusal has to carry the route out, not just the refusal.
     assert "worktree add" in reason
     assert "origin/master" in reason
+    return reason
+
+
+def assert_codex_denied(payload):
+    code, out = run(payload)
+    assert code == 0, "the hook decides via JSON, never via exit code"
+    assert out is not None, "expected a decision, got nothing"
+    hso = out["hookSpecificOutput"]
+    assert hso["hookEventName"] == "PreToolUse"
+    assert hso["permissionDecision"] == "deny"
+    reason = hso["permissionDecisionReason"]
+    assert "~/.claude" in reason
+    assert "ai-client-config" in reason
+    assert "ai-client-config-codex-sync.service" in reason
     return reason
 
 
@@ -110,6 +125,50 @@ def test_symlinked_skill_entry_is_refused_and_redirected():
     """A skills/ entry symlinked into another repo must go through that repo."""
     reason = assert_denied(write_payload(os.path.join(LIVE, "skills/writing-skills/SKILL.md")))
     assert "symlink" in reason
+
+
+# --- live Codex tree is sync/runtime-owned, never agent-edited --------------
+
+
+@pytest.mark.parametrize("tool", ["Write", "Edit", "MultiEdit", "NotebookEdit"])
+def test_every_file_tool_refuses_codex_tree(tool):
+    assert_codex_denied(
+        write_payload(os.path.join(CODEX, "config.toml"), tool=tool)
+    )
+
+
+@pytest.mark.parametrize(
+    "rel",
+    [
+        "config.toml",
+        "AGENTS.md",
+        "skills/x/SKILL.md",
+        "auth.json",
+        "sessions/x.jsonl",
+    ],
+)
+def test_all_live_codex_paths_are_agent_read_only(rel):
+    reason = assert_codex_denied(write_payload(os.path.join(CODEX, rel)))
+    assert rel in reason
+
+
+def test_codex_tilde_spelling_is_refused():
+    assert_codex_denied(write_payload("~/.codex/config.toml"))
+
+
+def test_codex_root_tracks_fake_home(tmp_path):
+    target = tmp_path / ".codex" / "config.toml"
+    code, out = run(write_payload(str(target)), home=tmp_path)
+    assert code == 0
+    assert out is not None
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_codex_lookalike_and_traversal_are_allowed():
+    assert_allowed(
+        write_payload(os.path.expanduser("~/.codex-backup/config.toml"))
+    )
+    assert_allowed(write_payload(os.path.join(CODEX, "..", "notes", "x.md")))
 
 
 # --- everything else is left alone ------------------------------------------
