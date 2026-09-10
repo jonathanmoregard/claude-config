@@ -142,15 +142,150 @@ out=$(printf '{"session_id":"%s"}' "$SID" | CLAUDE_DOD_STATE_DIR="$SD" python3 "
 ck "blocks again once the loop is gone" "block" "$(decision "$out")"
 
 echo
-echo "== dod gate: one continuation per Stop attempt =="
+echo "== dod gate: bounded explanatory exits =="
 REENTRYSID="reentry-$RANDOM"
 printf '%s\n' "$BREPO" > "$SD/$REENTRYSID.arm"
 
-out=$(payload_run "$(printf '{"session_id":"%s","stop_hook_active":true}' "$REENTRYSID")")
-ck "a runtime-authenticated Stop re-entry stands down" "" "$(decision "$out")"
+exit_message() { # $1 = one-line JSON envelope; $2 = aggregate state marker
+  printf 'Visible explanation for the user.\nDOD-EXIT: %s\n%s' "$1" "$2"
+}
+run_reentry() { # $1 = session; $2 = last_assistant_message
+  local payload
+  payload=$(jq -cn --arg sid "$1" --arg msg "$2" \
+    '{session_id:$sid,stop_hook_active:true,last_assistant_message:$msg}')
+  payload_run "$payload"
+}
+reject_reentry() { # $1 = assertion; $2 = last_assistant_message
+  local out
+  rm -f "$SD/$REENTRYSID.blocks"
+  out=$(run_reentry "$REENTRYSID" "$2")
+  ck "$1" "block" "$(decision "$out")"
+}
+
+qjson=$(jq -cn --arg repo "$BREPO" \
+  '{outcomes:[{repo:$repo,outcome:"QUESTION",question:"Should this work be preserved?"}]}')
+qmsg=$(exit_message "$qjson" QUESTION)
+echo 3 > "$SD/$REENTRYSID.blocks"
+out=$(run_reentry "$REENTRYSID" "$qmsg")
+ck "QUESTION explanation ends the current nudge chain" "" "$(decision "$out")"
 ck "  ...by exiting 0, not by crashing" "0" "$(gate_rc)"
-ck "  ...without spending the block budget" "gone" \
+ck "  ...resets the current block budget" "gone" \
    "$([ -e "$SD/$REENTRYSID.blocks" ] && echo kept || echo gone)"
+ck "  ...without deleting the armfile" "kept" \
+   "$([ -e "$SD/$REENTRYSID.arm" ] && echo kept || echo gone)"
+
+bjson=$(jq -cn --arg repo "$BREPO" \
+  '{outcomes:[{repo:$repo,outcome:"BLOCKED",blocker:"GitHub login expired",needed:"Jonathan must authenticate"}]}')
+out=$(run_reentry "$REENTRYSID" "$(exit_message "$bjson" BLOCKED)")
+ck "BLOCKED explanation ends the current nudge chain" "" "$(decision "$out")"
+
+pjson=$(jq -cn --arg repo "$BREPO" \
+  '{outcomes:[{repo:$repo,outcome:"PRESERVE",reason:"User requested a later handoff",owner:"Jonathan",next:"Resume from this exact branch"}]}')
+out=$(run_reentry "$REENTRYSID" "$(exit_message "$pjson" DONE)")
+ck "PRESERVE explanation ends the current nudge chain" "" "$(decision "$out")"
+
+ajson=$(jq -cn --arg repo "$BREPO" \
+  '{outcomes:[{repo:$repo,outcome:"ABANDON",reason:"The motivating assumption was disproven",remaining_work:"Unpublished branch remains untouched"}]}')
+out=$(run_reentry "$REENTRYSID" "$(exit_message "$ajson" DONE)")
+ck "ABANDON explanation ends the current nudge chain" "" "$(decision "$out")"
+
+reject_reentry "re-entry without an explainer keeps nudging" \
+  $'I have nothing more to add.\nDONE'
+reject_reentry "malformed JSON keeps nudging" \
+  $'Explanation.\nDOD-EXIT: {oops}\nDONE'
+badjson=$(jq -cn --arg repo "$BREPO" \
+  '{outcomes:[{repo:$repo,outcome:"PAUSE",reason:"Unknown outcome"}]}')
+reject_reentry "an unknown outcome keeps nudging" \
+  "$(exit_message "$badjson" DONE)"
+badjson=$(jq -cn --arg repo "$BREPO" \
+  '{outcomes:[{repo:$repo,outcome:"BLOCKED",blocker:"GitHub login expired"}]}')
+reject_reentry "missing required outcome fields keep nudging" \
+  "$(exit_message "$badjson" BLOCKED)"
+badjson=$(jq -cn --arg repo "$BREPO" \
+  '{outcomes:[{repo:$repo,outcome:"ABANDON",reason:"Assumption disproven",remaining_work:"None",extra:true}]}')
+reject_reentry "extra outcome fields keep nudging" \
+  "$(exit_message "$badjson" DONE)"
+badjson=$(jq -cn --arg repo "$BREPO" \
+  '{outcomes:[{repo:$repo,outcome:"QUESTION",question:42}]}')
+reject_reentry "wrong-typed outcome fields keep nudging" \
+  "$(exit_message "$badjson" QUESTION)"
+badjson=$(jq -cn --arg repo "$BREPO" \
+  '{outcomes:[{repo:$repo,outcome:"QUESTION",question:"Choose an outcome"}]}')
+reject_reentry "QUESTION must contain an actual question" \
+  "$(exit_message "$badjson" QUESTION)"
+reject_reentry "aggregate state must match outcomes" \
+  "$(exit_message "$qjson" DONE)"
+reject_reentry "a quoted marker is not an exit" \
+  "$(printf 'Explanation.\n> DOD-EXIT: %s\nQUESTION' "$qjson")"
+reject_reentry "a non-final envelope is not an exit" \
+  "$(printf 'DOD-EXIT: %s\nextra line\nQUESTION' "$qjson")"
+
+rm -f "$SD/$REENTRYSID.blocks"
+payload=$(jq -cn --arg sid "$REENTRYSID" \
+  '{session_id:$sid,stop_hook_active:true,last_assistant_message:{text:"not a string"}}')
+out=$(payload_run "$payload")
+ck "a non-string final message keeps nudging" "block" "$(decision "$out")"
+
+# Exit coverage is per measured blocker, not per session. A clean armed repo
+# needs no record; adding one is rejected because stale paths cannot widen the
+# envelope.
+BREPO2="$SD/blocked-repo-2"
+git clone -q "$SD/blocked-origin.git" "$BREPO2" >/dev/null 2>&1
+( cd "$BREPO2" || exit 1
+  git config user.email t@t; git config user.name t
+  echo unfinished >> a.txt; git add -A; git commit -qm "second never pushed" )
+CREPO="$SD/clean-repo"
+git clone -q "$SD/blocked-origin.git" "$CREPO" >/dev/null 2>&1
+MULTISID="multi-exit-$RANDOM"
+printf '%s\n%s\n%s\n' "$BREPO" "$BREPO2" "$CREPO" > "$SD/$MULTISID.arm"
+multi_run() { # $1 = envelope JSON; $2 = aggregate marker
+  rm -f "$SD/$MULTISID.blocks"
+  run_reentry "$MULTISID" "$(exit_message "$1" "$2")"
+}
+completejson=$(jq -cn --arg a "$BREPO" --arg b "$BREPO2" \
+  '{outcomes:[
+    {repo:$a,outcome:"PRESERVE",reason:"User requested a later handoff",owner:"Jonathan",next:"Resume from this exact branch"},
+    {repo:$b,outcome:"BLOCKED",blocker:"Remote access is unavailable",needed:"Jonathan must restore credentials"}
+  ]}')
+out=$(multi_run "$completejson" BLOCKED)
+ck "complete multi-repo coverage exits with aggregate BLOCKED" "" "$(decision "$out")"
+
+missingjson=$(jq -cn --arg a "$BREPO" \
+  '{outcomes:[{repo:$a,outcome:"PRESERVE",reason:"User requested a later handoff",owner:"Jonathan",next:"Resume from this exact branch"}]}')
+out=$(multi_run "$missingjson" DONE)
+ck "one explained repo cannot hide another blocker" "block" "$(decision "$out")"
+duplicatejson=$(jq -cn --arg a "$BREPO" --arg b "$BREPO2" \
+  '{outcomes:[
+    {repo:$a,outcome:"PRESERVE",reason:"User requested a later handoff",owner:"Jonathan",next:"Resume from this exact branch"},
+    {repo:$a,outcome:"ABANDON",reason:"Assumption was disproven",remaining_work:"Unpublished branch remains untouched"},
+    {repo:$b,outcome:"BLOCKED",blocker:"Remote access is unavailable",needed:"Jonathan must restore credentials"}
+  ]}')
+out=$(multi_run "$duplicatejson" BLOCKED)
+ck "duplicate repo records reject the whole exit" "block" "$(decision "$out")"
+unknownjson=$(jq -cn --arg a "$BREPO" --arg b "$BREPO2" \
+  '{outcomes:[
+    {repo:$a,outcome:"PRESERVE",reason:"User requested a later handoff",owner:"Jonathan",next:"Resume from this exact branch"},
+    {repo:$b,outcome:"BLOCKED",blocker:"Remote access is unavailable",needed:"Jonathan must restore credentials"},
+    {repo:"/unknown/repository",outcome:"ABANDON",reason:"Assumption was disproven",remaining_work:"No local work exists"}
+  ]}')
+out=$(multi_run "$unknownjson" BLOCKED)
+ck "unknown repo records reject the whole exit" "block" "$(decision "$out")"
+cleanjson=$(jq -cn --arg a "$BREPO" --arg b "$BREPO2" --arg c "$CREPO" \
+  '{outcomes:[
+    {repo:$a,outcome:"PRESERVE",reason:"User requested a later handoff",owner:"Jonathan",next:"Resume from this exact branch"},
+    {repo:$b,outcome:"BLOCKED",blocker:"Remote access is unavailable",needed:"Jonathan must restore credentials"},
+    {repo:$c,outcome:"PRESERVE",reason:"Clean repo needs no exit",owner:"Jonathan",next:"No action is required"}
+  ]}')
+out=$(multi_run "$cleanjson" BLOCKED)
+ck "already-clean repo records reject the whole exit" "block" "$(decision "$out")"
+
+# The envelope is scoped to this runtime continuation. Replaying the same final
+# text on a later independent Stop must measure again.
+rm -f "$SD/$REENTRYSID.blocks"
+payload=$(jq -cn --arg sid "$REENTRYSID" --arg msg "$qmsg" \
+  '{session_id:$sid,stop_hook_active:false,last_assistant_message:$msg}')
+out=$(payload_run "$payload")
+ck "a later Stop cannot replay the prior exit" "block" "$(decision "$out")"
 
 out=$(payload_run "$(printf '{"session_id":"%s","stop_hook_active":false}' "$REENTRYSID")")
 ck "boolean false still measures and blocks" "block" "$(decision "$out")"
@@ -160,13 +295,42 @@ ck "a truthy string cannot spoof Stop re-entry" "block" "$(decision "$out")"
 out=$(payload_run "$(printf '{"session_id":"%s"}' "$REENTRYSID")")
 ck "an absent re-entry field keeps compatibility" "block" "$(decision "$out")"
 out=$(payload_run \
-  "$(printf '{"session_id":"%s","stop_hook_active":true}' "$REENTRYSID")" \
+  "$(jq -cn --arg sid "$REENTRYSID" --arg msg "$qmsg" \
+      '{session_id:$sid,stop_hook_active:true,last_assistant_message:$msg}')" \
   CLAUDE_DOD_HANDOVER=1)
 ck "an explicit ralph handover still measures" "block" "$(decision "$out")"
+
+# An accepted exit is not allowed to strand the next turn at a spent budget.
+# Make the state directory non-writable so unlinking the countfile fails.
+RESETSD="$SD/reset-failure"
+mkdir -p "$RESETSD"
+RESETSID="reset-failure-$RANDOM"
+printf '%s\n' "$BREPO" > "$RESETSD/$RESETSID.arm"
+echo 6 > "$RESETSD/$RESETSID.blocks"
+resetmsg=$(exit_message \
+  "$(jq -cn --arg repo "$BREPO" \
+    '{outcomes:[{repo:$repo,outcome:"PRESERVE",reason:"User requested a later handoff",owner:"Jonathan",next:"Resume from this exact branch"}]}')" \
+  DONE)
+payload=$(jq -cn --arg sid "$RESETSID" --arg msg "$resetmsg" \
+  '{session_id:$sid,stop_hook_active:true,last_assistant_message:$msg}')
+chmod 500 "$RESETSD"
+out=$(payload_run "$payload" CLAUDE_DOD_STATE_DIR="$RESETSD")
+chmod 700 "$RESETSD"
+ck "a failed budget reset rejects the exit" "block" "$(decision "$out")"
+ck "  ...and names the reset failure" "yes" \
+  "$(has_text "$(reason "$out")" "block budget could not be reset")"
 
 ck "block guidance names Ship" "yes" "$(has_text "$message" "Ship")"
 ck "block guidance names Preserve" "yes" "$(has_text "$message" "Preserve")"
 ck "block guidance names Abandon" "yes" "$(has_text "$message" "Abandon")"
+ck "block guidance names Question" "yes" "$(has_text "$message" "Question")"
+ck "block guidance names Blocked" "yes" "$(has_text "$message" "Blocked")"
+ck "block guidance gives exact explanatory-exit syntax" "yes" \
+   "$(has_text "$message" "DOD-EXIT:")"
+ck "Abandon never grants deletion authority" "yes" \
+   "$(has_text "$message" "Abandon does not authorize deletion")"
+ck "an exit is scoped to the current Stop chain" "yes" \
+   "$(has_text "$message" "current Stop chain")"
 ck "a PR is never opened only to clear the gate" "yes" \
    "$(has_text "$message" "Never push or open a PR solely to clear this gate.")"
 ck "deletion requires explicit user approval" "yes" \
@@ -179,7 +343,8 @@ ck "old single-outcome instruction is gone" "no" \
    "$(has_text "$message" "drive to green and mergeable")"
 ck "old unconditional PR-link demand is gone" "no" \
    "$(has_text "$message" "with the clickable PR URL")"
-rm -f "$SD/$REENTRYSID.arm" "$SD/$REENTRYSID.blocks"
+rm -f "$SD/$REENTRYSID.arm" "$SD/$REENTRYSID.blocks" \
+      "$SD/$MULTISID.arm" "$SD/$MULTISID.blocks"
 
 out=$(printf '{"session_id":"%s"}' "$SID" | CLAUDE_DOD_STATE_DIR="$SD" CLAUDE_DOD_MODE=shadow python3 "$GATE")
 case "$out" in *'"systemMessage"'*) r=shadow ;; *) r="$out" ;; esac
