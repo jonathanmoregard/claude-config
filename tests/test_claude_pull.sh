@@ -92,6 +92,15 @@ expect_status() { # expect_status <name> <key> <expected>
   fi
 }
 
+expect_equal() { # expect_equal <name> <expected> <actual>
+  local name="$1" want="$2" got="$3"
+  if [ "$got" = "$want" ]; then
+    echo "PASS $name"; pass=$((pass+1))
+  else
+    echo "FAIL $name: got ${got@Q}, expected ${want@Q}"; fail=$((fail+1))
+  fi
+}
+
 # 1. up to date -> silent no-op
 fresh uptodate; run
 check "up-to-date is a silent no-op" 0 "$rc" "" "$out"
@@ -107,6 +116,107 @@ fresh ffdirty; advance_origin new.txt hello
 echo "local scratch" > "$CLONE/untracked.txt"; echo "edited" > "$CLONE/file.txt"; run
 check "dirty-but-unrelated tree still fast-forwards" 0 "$rc" "fast-forwarded master" "$out"
 grep -q edited "$CLONE/file.txt" || { echo "FAIL ffdirty: local edit lost"; fail=$((fail+1)); }
+
+# 3a. an explicit branch expectation is a pre-fetch guard. A mismatch must
+#    alert without updating even the remote-tracking ref.
+fresh expectbranch; advance_origin new.txt hello
+git -C "$CLONE" checkout --quiet -b topic
+before_head="$(git -C "$CLONE" rev-parse HEAD)"
+before_remote="$(git -C "$CLONE" rev-parse refs/remotes/origin/master)"
+before_tree="$(git -C "$CLONE" status --porcelain=v1 --untracked-files=all)"
+export CLAUDE_PULL_EXPECT_BRANCH=master
+run
+unset CLAUDE_PULL_EXPECT_BRANCH
+check "expected branch mismatch alerts" 1 "$rc" "expected branch 'master'.*checked out 'topic'" "$out"
+expect_status "expected branch mismatch records alert status" state alert
+expect_equal "expected branch mismatch leaves HEAD untouched" "$before_head" "$(git -C "$CLONE" rev-parse HEAD)"
+expect_equal "expected branch mismatch does not fetch" "$before_remote" "$(git -C "$CLONE" rev-parse refs/remotes/origin/master)"
+expect_equal "expected branch mismatch leaves the tree untouched" "$before_tree" "$(git -C "$CLONE" status --porcelain=v1 --untracked-files=all)"
+
+# 3b. detached HEAD gets the expectation-specific alert and is likewise
+#    rejected before origin is fetched.
+fresh expectdetached; advance_origin new.txt hello
+git -C "$CLONE" checkout --quiet --detach HEAD
+before_head="$(git -C "$CLONE" rev-parse HEAD)"
+before_remote="$(git -C "$CLONE" rev-parse refs/remotes/origin/master)"
+export CLAUDE_PULL_EXPECT_BRANCH=master
+run
+unset CLAUDE_PULL_EXPECT_BRANCH
+check "expected branch rejects detached HEAD" 1 "$rc" "expected branch 'master'.*HEAD is detached" "$out"
+expect_status "expected branch detached rejection records alert status" state alert
+expect_equal "expected branch detached rejection leaves HEAD untouched" "$before_head" "$(git -C "$CLONE" rev-parse HEAD)"
+expect_equal "expected branch detached rejection does not fetch" "$before_remote" "$(git -C "$CLONE" rev-parse refs/remotes/origin/master)"
+
+# 3c. strict-clean mode rejects tracked dirt before fetching or merging.
+fresh stricttracked; advance_origin new.txt hello
+echo "local tracked edit" > "$CLONE/file.txt"
+before_head="$(git -C "$CLONE" rev-parse HEAD)"
+before_remote="$(git -C "$CLONE" rev-parse refs/remotes/origin/master)"
+before_tree="$(git -C "$CLONE" diff --binary)"
+export CLAUDE_PULL_REQUIRE_CLEAN=1
+run
+unset CLAUDE_PULL_REQUIRE_CLEAN
+check "strict-clean rejects tracked dirt" 1 "$rc" "requires a clean working tree" "$out"
+expect_status "strict-clean tracked rejection records alert status" state alert
+expect_equal "strict-clean tracked rejection leaves HEAD untouched" "$before_head" "$(git -C "$CLONE" rev-parse HEAD)"
+expect_equal "strict-clean tracked rejection does not fetch" "$before_remote" "$(git -C "$CLONE" rev-parse refs/remotes/origin/master)"
+expect_equal "strict-clean tracked rejection leaves the edit untouched" "$before_tree" "$(git -C "$CLONE" diff --binary)"
+
+# 3d. untracked files count as dirt too.
+fresh strictuntracked; advance_origin new.txt hello
+echo "local untracked file" > "$CLONE/scratch.txt"
+before_head="$(git -C "$CLONE" rev-parse HEAD)"
+before_remote="$(git -C "$CLONE" rev-parse refs/remotes/origin/master)"
+before_tree="$(git -C "$CLONE" status --porcelain=v1 --untracked-files=all)"
+export CLAUDE_PULL_REQUIRE_CLEAN=1
+run
+unset CLAUDE_PULL_REQUIRE_CLEAN
+check "strict-clean rejects untracked dirt" 1 "$rc" "requires a clean working tree" "$out"
+expect_status "strict-clean untracked rejection records alert status" state alert
+expect_equal "strict-clean untracked rejection leaves HEAD untouched" "$before_head" "$(git -C "$CLONE" rev-parse HEAD)"
+expect_equal "strict-clean untracked rejection does not fetch" "$before_remote" "$(git -C "$CLONE" rev-parse refs/remotes/origin/master)"
+expect_equal "strict-clean untracked rejection leaves the file untouched" "$before_tree" "$(git -C "$CLONE" status --porcelain=v1 --untracked-files=all)"
+
+# 3e. zero explicitly preserves the permissive default, while any other value
+#    is a configuration error rather than silently disabling the guard.
+fresh cleanoff; advance_origin new.txt hello
+echo "local scratch" > "$CLONE/scratch.txt"
+export CLAUDE_PULL_REQUIRE_CLEAN=0
+run
+unset CLAUDE_PULL_REQUIRE_CLEAN
+check "strict-clean zero preserves default behavior" 0 "$rc" "fast-forwarded master" "$out"
+
+fresh cleaninvalid; advance_origin new.txt hello
+before_head="$(git -C "$CLONE" rev-parse HEAD)"
+before_remote="$(git -C "$CLONE" rev-parse refs/remotes/origin/master)"
+before_tree="$(git -C "$CLONE" status --porcelain=v1 --untracked-files=all)"
+export CLAUDE_PULL_REQUIRE_CLEAN=yes
+run
+unset CLAUDE_PULL_REQUIRE_CLEAN
+check "strict-clean rejects invalid values" 1 "$rc" "CLAUDE_PULL_REQUIRE_CLEAN.*0 or 1" "$out"
+expect_status "strict-clean invalid value records alert status" state alert
+expect_equal "strict-clean invalid value leaves HEAD untouched" "$before_head" "$(git -C "$CLONE" rev-parse HEAD)"
+expect_equal "strict-clean invalid value does not fetch" "$before_remote" "$(git -C "$CLONE" rev-parse refs/remotes/origin/master)"
+expect_equal "strict-clean invalid value leaves the tree untouched" "$before_tree" "$(git -C "$CLONE" status --porcelain=v1 --untracked-files=all)"
+
+# 3f. an explicit upstream expectation rejects a misconfigured tracker before
+#    fetching origin. Branch name alone is insufficient: master could follow a
+#    different remote or remote branch.
+fresh expectupstream
+git -C "$CLONE" branch other
+git -C "$CLONE" push --quiet origin other
+git -C "$CLONE" branch --set-upstream-to=origin/other master >/dev/null
+advance_origin new.txt hello
+before_head="$(git -C "$CLONE" rev-parse HEAD)"
+before_remote="$(git -C "$CLONE" rev-parse refs/remotes/origin/master)"
+export CLAUDE_PULL_EXPECT_BRANCH=master
+export CLAUDE_PULL_EXPECT_UPSTREAM=origin/master
+run
+unset CLAUDE_PULL_EXPECT_BRANCH CLAUDE_PULL_EXPECT_UPSTREAM
+check "expected upstream mismatch alerts" 1 "$rc" "expected upstream 'origin/master'.*configured 'origin/other'" "$out"
+expect_status "expected upstream mismatch records alert status" state alert
+expect_equal "expected upstream mismatch leaves HEAD untouched" "$before_head" "$(git -C "$CLONE" rev-parse HEAD)"
+expect_equal "expected upstream mismatch does not fetch" "$before_remote" "$(git -C "$CLONE" rev-parse refs/remotes/origin/master)"
 
 # 4. remote ahead, CONFLICTING local edit -> refuses, changes nothing
 fresh blocked; advance_origin file.txt "remote version"
@@ -161,10 +271,17 @@ check "fetch failure exits 1" 1 "$rc" "consecutive failures: 5" "$out"
 notif_mid=$(wc -l < "$ROOT/notifications" 2>/dev/null || echo 0)
 [ "$notif_before" = "$notif_mid" ] && { echo "PASS 5 fetch failures stay quiet"; pass=$((pass+1)); } \
   || { echo "FAIL fetch failure notified too early"; fail=$((fail+1)); }
+export CLAUDE_PULL_UNIT=widget-pull
 run
+unset CLAUDE_PULL_UNIT
 notif_after=$(wc -l < "$ROOT/notifications" 2>/dev/null || echo 0)
 [ "$notif_after" -gt "$notif_mid" ] && { echo "PASS 6th consecutive fetch failure notifies"; pass=$((pass+1)); } \
   || { echo "FAIL 6th fetch failure did not notify"; fail=$((fail+1)); }
+if tail -1 "$ROOT/notifications" | grep -q 'journalctl --user -u widget-pull'; then
+  echo "PASS notification names dedicated systemd unit"; pass=$((pass+1))
+else
+  echo "FAIL notification did not name dedicated systemd unit"; fail=$((fail+1))
+fi
 
 # 11. recovery clears the alert state so the next problem notifies again
 fresh recover; advance_origin file.txt "remote version"

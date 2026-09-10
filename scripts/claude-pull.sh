@@ -33,6 +33,7 @@ set -euo pipefail
 REPO="${CLAUDE_PULL_REPO:-$(git -C "$(dirname "$(readlink -f "$0")")" rev-parse --show-toplevel)}"
 case "$REPO" in /*) ;; *) REPO="$PWD/$REPO" ;; esac
 REPO="${REPO%/}"
+PULL_UNIT="${CLAUDE_PULL_UNIT:-claude-pull}"
 
 # State lives in userspace keyed by the repo it describes, NOT inside that
 # repo's $GIT_DIR. Two reasons, and the second one is load-bearing:
@@ -103,7 +104,7 @@ write_status() { # write_status <ok|unverified|alert> [reason]
 }
 
 # Only states a human has to act on raise a notification, and only on the
-# transition into them: these run every 10 minutes, and a condition like
+# transition into them: these run on a timer, and a condition like
 # "diverged from origin" persists until someone fixes it. Re-notifying each
 # tick would train the notification away. The status record is written on every
 # tick regardless — the debounce is a property of the toast, not of the truth.
@@ -126,7 +127,7 @@ alert() {
     "$reason
 
 Repo: $REPO
-Log:  journalctl --user -u claude-pull" ||
+Log:  journalctl --user -u $PULL_UNIT" ||
     log "notify-send failed (no notification daemon?) — alert in journal only"
 }
 
@@ -157,14 +158,50 @@ fi
 exec {lock_fd}>"$GIT_DIR_PATH/claude-sync.lock"
 flock -n "$lock_fd" || { log "another sync/pull run holds the lock; skipping tick"; exit 0; }
 
+require_clean="${CLAUDE_PULL_REQUIRE_CLEAN:-0}"
+case "$require_clean" in
+  0|1) ;;
+  *)
+    alert "CLAUDE_PULL_REQUIRE_CLEAN must be 0 or 1, not '$require_clean'."
+    exit 1
+    ;;
+esac
+
 BRANCH="$(git symbolic-ref --short HEAD 2>/dev/null || true)"
+if [ -n "${CLAUDE_PULL_EXPECT_BRANCH:-}" ]; then
+  if [ -z "$BRANCH" ]; then
+    alert "The expected branch '$CLAUDE_PULL_EXPECT_BRANCH' cannot be verified because HEAD is detached."
+    exit 1
+  fi
+  if [ "$BRANCH" != "$CLAUDE_PULL_EXPECT_BRANCH" ]; then
+    alert "The expected branch '$CLAUDE_PULL_EXPECT_BRANCH' is not checked out; checked out '$BRANCH'."
+    exit 1
+  fi
+fi
+
 if [ -z "$BRANCH" ]; then
   alert "HEAD is detached — auto-pull is off until a branch is checked out."
   exit 1
 fi
 
+if [ "$require_clean" = 1 ]; then
+  if ! tree_status="$(git status --porcelain=v1 --untracked-files=all 2>&1)"; then
+    alert "CLAUDE_PULL_REQUIRE_CLEAN=1 could not inspect the working tree: $tree_status"
+    exit 1
+  fi
+  if [ -n "$tree_status" ]; then
+    alert "CLAUDE_PULL_REQUIRE_CLEAN=1 requires a clean working tree, but tracked or untracked changes are present."
+    exit 1
+  fi
+fi
+
 if ! UPSTREAM="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)"; then
   alert "Branch '$BRANCH' has no upstream — nothing to pull from."
+  exit 1
+fi
+if [ -n "${CLAUDE_PULL_EXPECT_UPSTREAM:-}" ] \
+  && [ "$UPSTREAM" != "$CLAUDE_PULL_EXPECT_UPSTREAM" ]; then
+  alert "The expected upstream '$CLAUDE_PULL_EXPECT_UPSTREAM' is not configured; configured '$UPSTREAM'."
   exit 1
 fi
 
@@ -176,7 +213,7 @@ export GIT_SSH_COMMAND="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new
 if ! timeout 60 git fetch --quiet --prune origin "$BRANCH"; then
   # A laptop is offline often enough that one failed fetch is noise. Only a
   # run of them means something is actually broken (expired key, bad remote),
-  # so count consecutive failures and speak up after an hour of them.
+  # so count consecutive failures and speak up after six failed ticks.
   fails=$(( $(cat "$STATE/fetch-failures" 2>/dev/null || echo 0) + 1 ))
   printf '%s' "$fails" > "$STATE/fetch-failures"
   log "fetch failed or timed out (60s) — consecutive failures: $fails"

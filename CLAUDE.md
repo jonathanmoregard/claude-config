@@ -82,8 +82,9 @@ User instructions override everything below.
 - `agent refused: provider usage-policy block` → rephrase defensively. Don't retry verbatim.
 
 ## Worktrees
-- Only for (a) subagent-driven dev needing isolation, (b) nixos-config. Everything else branches in place with `git switch`. See `using-git-worktrees`.
+- Required for (a) subagent-driven dev needing isolation, (b) nixos-config, and (c) all Klaffat development. Everything else branches in place with `git switch`. See `using-git-worktrees`.
 - Path: `~/worktrees/<repo>-<branch>/`.
+- Klaffat primary checkout `~/Repos/klaffat` stays clean on `main`. Never edit, switch, commit, merge, rebase, or cherry-pick there. Start work with `~/Repos/klaffat/scripts/klaffat-worktree.sh <slug>` and continue in `~/worktrees/klaffat-<slug>/`. If primary is dirty or off `main`, report exact state; do not stash, reset, clean, or move unknown work. Use `repo-worktree-policy` when applying this pattern to another repository.
 
 ## Confidentiality
 - Never write an external client, employer, or requester name — or engagement detail — into a public repo, including commit messages and PR bodies, unless the user said the attribution is public. Tempted → ask first.
