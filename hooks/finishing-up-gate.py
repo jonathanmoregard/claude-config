@@ -154,6 +154,92 @@ MIN_SLICE = 3.0
 
 _SELF = pathlib.Path(__file__).name
 
+_EXIT_FIELDS = {
+    "QUESTION": {"repo", "outcome", "question"},
+    "BLOCKED": {"repo", "outcome", "blocker", "needed"},
+    "PRESERVE": {"repo", "outcome", "reason", "owner", "next"},
+    "ABANDON": {"repo", "outcome", "reason", "remaining_work"},
+}
+
+
+def parse_exit_envelope(raw):
+    """Parse one visible, runtime-scoped explanation of unfinished work."""
+    if not isinstance(raw, str):
+        return None, "last_assistant_message is not a string"
+    lines = [line.rstrip() for line in raw.splitlines() if line.strip()]
+    if len(lines) < 3:
+        return None, "missing a visible explanation and closing DOD-EXIT envelope"
+    marker = lines[-2]
+    prefix = "DOD-EXIT: "
+    if not marker.startswith(prefix):
+        return None, "the penultimate non-empty line is not DOD-EXIT"
+
+    def unique_object(pairs):
+        obj = {}
+        for key, value in pairs:
+            if key in obj:
+                raise ValueError(f"duplicate JSON key {key!r}")
+            obj[key] = value
+        return obj
+
+    try:
+        data = json.loads(marker[len(prefix):], object_pairs_hook=unique_object)
+    except (TypeError, ValueError) as exc:
+        return None, f"DOD-EXIT is not valid one-line JSON ({exc})"
+    if not isinstance(data, dict) or set(data) != {"outcomes"}:
+        return None, "DOD-EXIT must contain only an outcomes array"
+    records = data["outcomes"]
+    if not isinstance(records, list) or not records:
+        return None, "DOD-EXIT outcomes must be a non-empty array"
+
+    seen = set()
+    kinds = []
+    for index, record in enumerate(records):
+        where = f"DOD-EXIT outcome {index + 1}"
+        if not isinstance(record, dict):
+            return None, f"{where} is not an object"
+        kind = record.get("outcome")
+        if kind not in _EXIT_FIELDS:
+            return None, f"{where} has unknown outcome {kind!r}"
+        if set(record) != _EXIT_FIELDS[kind]:
+            return None, f"{where} does not have the exact {kind} fields"
+        for key, value in record.items():
+            if not isinstance(value, str) or not value.strip():
+                return None, f"{where}.{key} must be a non-empty string"
+        repo = record["repo"]
+        if not pathlib.Path(repo).is_absolute():
+            return None, f"{where}.repo must be an absolute path"
+        if repo in seen:
+            return None, f"DOD-EXIT repeats repository {repo}"
+        seen.add(repo)
+        if kind == "QUESTION" and not record["question"].rstrip().endswith("?"):
+            return None, f"{where}.question must end with ?"
+        kinds.append(kind)
+
+    expected_state = (
+        "QUESTION" if "QUESTION" in kinds
+        else "BLOCKED" if "BLOCKED" in kinds
+        else "DONE"
+    )
+    if lines[-1] != expected_state:
+        return None, f"DOD-EXIT requires final state marker {expected_state}"
+    return records, None
+
+
+def validate_exit_coverage(records, blocked_repos):
+    explained = {record["repo"] for record in records}
+    blocked = set(blocked_repos)
+    missing = sorted(blocked - explained)
+    extra = sorted(explained - blocked)
+    if not missing and not extra:
+        return None
+    parts = []
+    if missing:
+        parts.append("missing blocked repo(s): " + ", ".join(missing))
+    if extra:
+        parts.append("repo(s) not currently blocked: " + ", ".join(extra))
+    return "; ".join(parts)
+
 
 def _registered_slot():
     """The timeout the harness will actually enforce on this hook.
@@ -399,6 +485,23 @@ def main():
 
     reap(session)
 
+    # Both Claude Code and Codex set this boolean after a Stop hook has already
+    # continued the current turn. It authenticates which Stop chain the final
+    # assistant text belongs to; it does NOT establish that the agent resolved
+    # or explained the unfinished state. A valid DOD-EXIT is checked against the
+    # repositories that remain blocked below. Keep Ralph handover exempt: that
+    # is the loop's final delivery measurement, not an ordinary recursive Stop.
+    stop_hook_active = payload.get("stop_hook_active")
+    exit_records = None
+    exit_error = None
+    if stop_hook_active is True and not HANDOVER:
+        exit_records, exit_error = parse_exit_envelope(
+            payload.get("last_assistant_message"))
+    if stop_hook_active is not None and not isinstance(stop_hook_active, bool):
+        log(session, {"action": "warn",
+                      "why": "stop_hook_active has unexpected shape "
+                             f"{type(stop_hook_active).__name__}; ignoring it"})
+
     def _standdown(field):
         """True only for a NON-EMPTY LIST — the documented shape.
 
@@ -489,7 +592,10 @@ def main():
         blocks = int(countfile.read_text().strip() or 0)
     except (OSError, ValueError):
         blocks = 0
-    if blocks >= MAX_BLOCKS and not HANDOVER:
+    # A syntactically valid exit still needs objective per-repo coverage below,
+    # even when the ordinary retry budget is spent. Invalid or absent exits use
+    # the existing bounded stand-down and cannot make the hook loop forever.
+    if blocks >= MAX_BLOCKS and not HANDOVER and exit_records is None:
         log(session, {"action": "allow", "why": f"block budget spent ({blocks})"})
         allow()
     if blocks >= MAX_BLOCKS and HANDOVER:
@@ -564,6 +670,7 @@ def main():
               session, why="armfile empty, NOTHING WAS CHECKED")
 
     problems = []
+    problem_repos = []
     # What dod-check could not ESTABLISH, as opposed to what it found wrong.
     # These never block — blocking on them would hang every offline session —
     # but they must not live only in gate.log, which no agent ever reads.
@@ -576,6 +683,7 @@ def main():
     for repo in repos:
         remaining = deadline - time.monotonic()
         if remaining < MIN_SLICE:
+            problem_repos.append(repo)
             problems.append(
                 f"{repo}: NOT MEASURED — this gate's own {TOTAL_BUDGET:g}s "
                 "budget was spent before this repository was reached, so its "
@@ -587,6 +695,7 @@ def main():
             continue
         result, err = run_dod(repo, timeout=min(DOD_TIMEOUT, remaining))
         if err:
+            problem_repos.append(repo)
             problems.append(f"{repo}: {err} — treat as NOT done")
             continue
         # dod-check reports a failed measurement IN BAND: exit 3 sets `error`
@@ -596,6 +705,7 @@ def main():
         # measurement presentation dod-check deliberately avoids, reproduced one
         # layer up. Flagged independently by two reviewers.
         if result.get("error"):
+            problem_repos.append(repo)
             problems.append(
                 f"{repo}: COULD NOT MEASURE — {result['error']}\n"
                 "  PR and check state were NOT read. This is not a green "
@@ -632,6 +742,7 @@ def main():
                                  f"{result.get('reason') or 'no reason given'}"})
             continue
         if "applicable" not in result:
+            problem_repos.append(repo)
             problems.append(
                 f"{repo}: dod-check emitted no `applicable` field, so its "
                 "verdict could not be read — treat as NOT done")
@@ -652,6 +763,7 @@ def main():
                 lines.append(f"  [MALFORMED] {str(b)[:120]}")
         if not lines:
             lines = ["  (dod-check reported not-done but listed no blockers)"]
+        problem_repos.append(repo)
         problems.append(f"{repo}:\n" + "\n".join(lines))
 
     if not problems:
@@ -713,6 +825,30 @@ def main():
                               + " — say so rather than reporting a clean sheet."}))
         allow()
 
+    if exit_records is not None and not HANDOVER:
+        exit_error = validate_exit_coverage(exit_records, problem_repos)
+        if exit_error is None:
+            try:
+                countfile.unlink(missing_ok=True)
+            except OSError as exc:
+                exit_error = f"block budget could not be reset ({exc})"
+            else:
+                log(session, {
+                    "action": "allow",
+                    "why": "explicit terminal explanation for current Stop chain",
+                    "outcomes": sorted({r["outcome"] for r in exit_records}),
+                    "repos": sorted(r["repo"] for r in exit_records),
+                })
+                allow()
+
+    if blocks >= MAX_BLOCKS and not HANDOVER and not (
+            exit_error and exit_error.startswith("block budget could not be reset")):
+        log(session, {"action": "allow", "why": f"block budget spent ({blocks})"})
+        allow()
+
+    if stop_hook_active is True and not HANDOVER and exit_error:
+        problems.append(f"DOD-EXIT rejected: {exit_error}")
+
     # Read-modify-write under an exclusive lock. Both instances read the same
     # `blocks` earlier and both wrote read+1: MEASURED, two blocks 29ms apart
     # consumed ONE budget slot. The lock is held for a file read and a file
@@ -749,27 +885,42 @@ def main():
     reason = (
         "Work in this session is not finished. `dod-check` reports:\n\n"
         f"{body}\n\n"
-        "Invoke the `finishing-up` skill and work these blockers. Do not end "
-        "the turn by reporting status — drive to green and mergeable.\n\n"
+        "Invoke the `finishing-up` skill and choose the correct terminal "
+        "outcome before acting on checker codes:\n"
+        "- Ship: deliver this work upstream, then work its blockers to green "
+        "and mergeable.\n"
+        "- Preserve: retain it only when Jonathan explicitly wants it kept; "
+        "report the exact branch, worktree, commit, and measured blockers.\n"
+        "- Abandon: discard it only after Jonathan explicitly approves "
+        "deletion; resolve the exact targets first.\n"
+        "Never push or open a PR solely to clear this gate. Never delete work "
+        "without explicit user approval. Act now when the outcome is already "
+        "authorized; otherwise ask one focused outcome question.\n\n"
         f"Re-check with: python3 {DOD} --repo <repo>\n"
         "That exact command, not a bare `dod-check` — it is not on PATH. "
         "Reading the conditions yourself and concluding you are done is the "
         "self-attestation this gate exists to replace.\n\n"
-        "If a check is still running: book a durable CronCreate follow-up "
-        "because it is the right thing to leave for Jonathan — but it will NOT "
-        "clear this gate, and pretending otherwise wasted three turns when it "
-        "was measured (2026-08-27). A durable cron outlives the session, so it "
-        "is not session-scoped and never appears in `session_crons`, which is "
-        "one of the two fields this gate stands down for; the other is "
-        "`background_tasks`. So: book the follow-up, then say plainly that you "
-        "are blocked on the check — the URL, and what you actually observed — "
-        "and let this gate stand down at its budget. Do not re-run hoping to "
-        "clear it. The follow-up REPORTS — it must not merge, and must not "
-        "push anything Jonathan has not already seen. Merging is his click, "
-        "and being blocked by this gate is not authorisation to take it.\n\n"
-        "If you are genuinely blocked on Jonathan — a credential, an "
-        "interactive login, a taste call, or his merge click — say so "
-        "explicitly, with the clickable PR URL and what you actually measured. "
+        "If an external check is still running, create one durable reporting "
+        "follow-up, then report its URL/state and what you observed. That "
+        "follow-up must only report: it must not merge or push unseen work, "
+        "and it does not clear this session gate.\n\n"
+        "For a credential, interactive login, outcome choice, taste call, or "
+        "merge click, state once what you measured and the human action needed. "
+        "Include a PR URL only when one exists. Do not rerun unchanged checks "
+        "or repeat the same question.\n\n"
+        "To end the current Stop chain without shipping, first explain the "
+        "outcome to Jonathan, then end with one-line JSON and its state marker:\n"
+        "DOD-EXIT: {\"outcomes\":[<one exact record per blocked repo>]}\n"
+        "Question uses {repo,outcome,question} + QUESTION; Blocked uses "
+        "{repo,outcome,blocker,needed} + BLOCKED; Preserve uses "
+        "{repo,outcome,reason,owner,next} + DONE; Abandon uses "
+        "{repo,outcome,reason,remaining_work} + DONE. Use exact uppercase "
+        "outcome values QUESTION, BLOCKED, PRESERVE, or ABANDON. Values are "
+        "strings; repo is the absolute path above. For mixed outcomes, "
+        "QUESTION wins over BLOCKED, otherwise use DONE. Abandon does not "
+        "authorize deletion. The "
+        "exit applies only to this current Stop chain; the next user turn is "
+        "measured again. "
         f"This gate stands down after {MAX_BLOCKS} blocks regardless."
     )
     block(

@@ -32,8 +32,17 @@ ARMWORK=$(mktemp -d -p "$HOME" .dod-armtest.XXXXXX)
 trap 'rm -rf "$SD" "$ARMWORK"' EXIT  # arftl-allow: destructive-shell — both are this run's own mktemp -d
 export CLAUDE_RALPH_STATE_DIR="$SD/ralph"
 mkdir -p "$CLAUDE_RALPH_STATE_DIR"
-GATE="$HOME/.claude/hooks/finishing-up-gate.py"
-RALPH_HOOK="$HOME/.claude/hooks/ralph-loop-stop.sh"
+GATE="${GATE_UNDER_TEST:-$HOME/.claude/hooks/finishing-up-gate.py}"
+UNDER_TEST_ROOT=$(cd "$(dirname "$GATE")/.." && pwd -P)
+RALPH_HOOK="$UNDER_TEST_ROOT/hooks/ralph-loop-stop.sh"
+RALPH_TEST_HOME="$SD/ralph-home"
+mkdir -p "$RALPH_TEST_HOME/.claude/hooks" "$RALPH_TEST_HOME/.claude/scripts"
+ln -s "$(realpath "$GATE")" \
+  "$RALPH_TEST_HOME/.claude/hooks/finishing-up-gate.py"
+ln -s "$UNDER_TEST_ROOT/scripts/ralph-loop-state.sh" \
+  "$RALPH_TEST_HOME/.claude/scripts/ralph-loop-state.sh"
+ln -s "$UNDER_TEST_ROOT/scripts/dod-check.py" \
+  "$RALPH_TEST_HOME/.claude/scripts/dod-check.py"
 SID="guardtest-$$"
 
 pass=0; fail=0
@@ -47,6 +56,10 @@ ck() {
 decision() { printf '%s' "$1" | python3 -c 'import json,sys
 try: print(json.load(sys.stdin).get("decision") or "")
 except Exception: print("")' 2>/dev/null; }
+reason() { printf '%s' "$1" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("reason") or "")
+except Exception: print("")' 2>/dev/null; }
+has_text() { grep -Fq -- "$2" <<<"$1" && echo yes || echo no; }
 
 # `decision` alone CANNOT distinguish "allowed the turn" from "crashed": both
 # render as empty. Every allow-assertion in this file was therefore satisfied by
@@ -78,6 +91,18 @@ gate_run() {  # $1 = session id; extra args are env assignments -> prints stdout
   rc=$?
   printf '%s' "$rc" > "$RCFILE"
   printf '%s' "$out"
+}
+payload_run() {  # $1 = complete JSON payload; extra args are env assignments
+  local payload="$1"; shift
+  local out rc
+  out=$(printf '%s' "$payload" \
+        | env CLAUDE_DOD_STATE_DIR="$SD" "$@" python3 "$GATE" 2>/dev/null)
+  rc=$?
+  printf '%s' "$rc" > "$RCFILE"
+  printf '%s' "$out"
+}
+ralph_under_test() {
+  HOME="$RALPH_TEST_HOME" bash "$RALPH_HOOK"
 }
 
 echo "== dod gate: one driver per turn =="
@@ -115,6 +140,225 @@ ck "  ...and a crash is distinguishable" "1" "$rc"
 
 out=$(printf '{"session_id":"%s"}' "$SID" | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE")
 ck "blocks again once the loop is gone" "block" "$(decision "$out")"
+
+echo
+echo "== dod gate: bounded explanatory exits =="
+REENTRYSID="reentry-$RANDOM"
+printf '%s\n' "$BREPO" > "$SD/$REENTRYSID.arm"
+
+exit_message() { # $1 = one-line JSON envelope; $2 = aggregate state marker
+  printf 'Visible explanation for the user.\nDOD-EXIT: %s\n%s' "$1" "$2"
+}
+run_reentry() { # $1 = session; $2 = last_assistant_message
+  local payload
+  payload=$(jq -cn --arg sid "$1" --arg msg "$2" \
+    '{session_id:$sid,stop_hook_active:true,last_assistant_message:$msg}')
+  payload_run "$payload"
+}
+reject_reentry() { # $1 = assertion; $2 = last_assistant_message
+  local out
+  rm -f "$SD/$REENTRYSID.blocks"
+  out=$(run_reentry "$REENTRYSID" "$2")
+  ck "$1" "block" "$(decision "$out")"
+}
+
+qjson=$(jq -cn --arg repo "$BREPO" \
+  '{outcomes:[{repo:$repo,outcome:"QUESTION",question:"Should this work be preserved?"}]}')
+qmsg=$(exit_message "$qjson" QUESTION)
+echo 3 > "$SD/$REENTRYSID.blocks"
+out=$(run_reentry "$REENTRYSID" "$qmsg")
+ck "QUESTION explanation ends the current nudge chain" "" "$(decision "$out")"
+ck "  ...by exiting 0, not by crashing" "0" "$(gate_rc)"
+ck "  ...resets the current block budget" "gone" \
+   "$([ -e "$SD/$REENTRYSID.blocks" ] && echo kept || echo gone)"
+ck "  ...without deleting the armfile" "kept" \
+   "$([ -e "$SD/$REENTRYSID.arm" ] && echo kept || echo gone)"
+
+bjson=$(jq -cn --arg repo "$BREPO" \
+  '{outcomes:[{repo:$repo,outcome:"BLOCKED",blocker:"GitHub login expired",needed:"Jonathan must authenticate"}]}')
+out=$(run_reentry "$REENTRYSID" "$(exit_message "$bjson" BLOCKED)")
+ck "BLOCKED explanation ends the current nudge chain" "" "$(decision "$out")"
+
+pjson=$(jq -cn --arg repo "$BREPO" \
+  '{outcomes:[{repo:$repo,outcome:"PRESERVE",reason:"User requested a later handoff",owner:"Jonathan",next:"Resume from this exact branch"}]}')
+out=$(run_reentry "$REENTRYSID" "$(exit_message "$pjson" DONE)")
+ck "PRESERVE explanation ends the current nudge chain" "" "$(decision "$out")"
+
+ajson=$(jq -cn --arg repo "$BREPO" \
+  '{outcomes:[{repo:$repo,outcome:"ABANDON",reason:"The motivating assumption was disproven",remaining_work:"Unpublished branch remains untouched"}]}')
+out=$(run_reentry "$REENTRYSID" "$(exit_message "$ajson" DONE)")
+ck "ABANDON explanation ends the current nudge chain" "" "$(decision "$out")"
+
+reject_reentry "re-entry without an explainer keeps nudging" \
+  $'I have nothing more to add.\nDONE'
+reject_reentry "malformed JSON keeps nudging" \
+  $'Explanation.\nDOD-EXIT: {oops}\nDONE'
+badjson=$(jq -cn --arg repo "$BREPO" \
+  '{outcomes:[{repo:$repo,outcome:"PAUSE",reason:"Unknown outcome"}]}')
+reject_reentry "an unknown outcome keeps nudging" \
+  "$(exit_message "$badjson" DONE)"
+badjson=$(jq -cn --arg repo "$BREPO" \
+  '{outcomes:[{repo:$repo,outcome:"BLOCKED",blocker:"GitHub login expired"}]}')
+reject_reentry "missing required outcome fields keep nudging" \
+  "$(exit_message "$badjson" BLOCKED)"
+badjson=$(jq -cn --arg repo "$BREPO" \
+  '{outcomes:[{repo:$repo,outcome:"ABANDON",reason:"Assumption disproven",remaining_work:"None",extra:true}]}')
+reject_reentry "extra outcome fields keep nudging" \
+  "$(exit_message "$badjson" DONE)"
+badjson=$(printf '{"outcomes":[{"repo":"%s","outcome":"ABANDON","outcome":"PRESERVE","reason":"Keep this evidence","owner":"Jonathan","next":"Resume later"}]}' "$BREPO")
+reject_reentry "duplicate JSON keys keep nudging" \
+  "$(exit_message "$badjson" DONE)"
+badjson=$(jq -cn --arg repo "$BREPO" \
+  '{outcomes:[{repo:$repo,outcome:"QUESTION",question:42}]}')
+reject_reentry "wrong-typed outcome fields keep nudging" \
+  "$(exit_message "$badjson" QUESTION)"
+badjson=$(jq -cn --arg repo "$BREPO" \
+  '{outcomes:[{repo:$repo,outcome:"QUESTION",question:"Choose an outcome"}]}')
+reject_reentry "QUESTION must contain an actual question" \
+  "$(exit_message "$badjson" QUESTION)"
+reject_reentry "aggregate state must match outcomes" \
+  "$(exit_message "$qjson" DONE)"
+reject_reentry "a quoted marker is not an exit" \
+  "$(printf 'Explanation.\n> DOD-EXIT: %s\nQUESTION' "$qjson")"
+reject_reentry "a non-final envelope is not an exit" \
+  "$(printf 'DOD-EXIT: %s\nextra line\nQUESTION' "$qjson")"
+
+rm -f "$SD/$REENTRYSID.blocks"
+payload=$(jq -cn --arg sid "$REENTRYSID" \
+  '{session_id:$sid,stop_hook_active:true,last_assistant_message:{text:"not a string"}}')
+out=$(payload_run "$payload")
+ck "a non-string final message keeps nudging" "block" "$(decision "$out")"
+
+# Exit coverage is per measured blocker, not per session. A clean armed repo
+# needs no record; adding one is rejected because stale paths cannot widen the
+# envelope.
+BREPO2="$SD/blocked-repo-2"
+git clone -q "$SD/blocked-origin.git" "$BREPO2" >/dev/null 2>&1
+( cd "$BREPO2" || exit 1
+  git config user.email t@t; git config user.name t
+  echo unfinished >> a.txt; git add -A; git commit -qm "second never pushed" )
+CREPO="$SD/clean-repo"
+git clone -q "$SD/blocked-origin.git" "$CREPO" >/dev/null 2>&1
+MULTISID="multi-exit-$RANDOM"
+printf '%s\n%s\n%s\n' "$BREPO" "$BREPO2" "$CREPO" > "$SD/$MULTISID.arm"
+multi_run() { # $1 = envelope JSON; $2 = aggregate marker
+  rm -f "$SD/$MULTISID.blocks"
+  run_reentry "$MULTISID" "$(exit_message "$1" "$2")"
+}
+completejson=$(jq -cn --arg a "$BREPO" --arg b "$BREPO2" \
+  '{outcomes:[
+    {repo:$a,outcome:"PRESERVE",reason:"User requested a later handoff",owner:"Jonathan",next:"Resume from this exact branch"},
+    {repo:$b,outcome:"BLOCKED",blocker:"Remote access is unavailable",needed:"Jonathan must restore credentials"}
+  ]}')
+out=$(multi_run "$completejson" BLOCKED)
+ck "complete multi-repo coverage exits with aggregate BLOCKED" "" "$(decision "$out")"
+mixedjson=$(jq -cn --arg a "$BREPO" --arg b "$BREPO2" \
+  '{outcomes:[
+    {repo:$a,outcome:"BLOCKED",blocker:"Remote access is unavailable",needed:"Jonathan must restore credentials"},
+    {repo:$b,outcome:"QUESTION",question:"Should this second branch be preserved?"}
+  ]}')
+out=$(multi_run "$mixedjson" QUESTION)
+ck "QUESTION wins over BLOCKED in a mixed exit" "" "$(decision "$out")"
+
+missingjson=$(jq -cn --arg a "$BREPO" \
+  '{outcomes:[{repo:$a,outcome:"PRESERVE",reason:"User requested a later handoff",owner:"Jonathan",next:"Resume from this exact branch"}]}')
+out=$(multi_run "$missingjson" DONE)
+ck "one explained repo cannot hide another blocker" "block" "$(decision "$out")"
+duplicatejson=$(jq -cn --arg a "$BREPO" --arg b "$BREPO2" \
+  '{outcomes:[
+    {repo:$a,outcome:"PRESERVE",reason:"User requested a later handoff",owner:"Jonathan",next:"Resume from this exact branch"},
+    {repo:$a,outcome:"ABANDON",reason:"Assumption was disproven",remaining_work:"Unpublished branch remains untouched"},
+    {repo:$b,outcome:"BLOCKED",blocker:"Remote access is unavailable",needed:"Jonathan must restore credentials"}
+  ]}')
+out=$(multi_run "$duplicatejson" BLOCKED)
+ck "duplicate repo records reject the whole exit" "block" "$(decision "$out")"
+unknownjson=$(jq -cn --arg a "$BREPO" --arg b "$BREPO2" \
+  '{outcomes:[
+    {repo:$a,outcome:"PRESERVE",reason:"User requested a later handoff",owner:"Jonathan",next:"Resume from this exact branch"},
+    {repo:$b,outcome:"BLOCKED",blocker:"Remote access is unavailable",needed:"Jonathan must restore credentials"},
+    {repo:"/unknown/repository",outcome:"ABANDON",reason:"Assumption was disproven",remaining_work:"No local work exists"}
+  ]}')
+out=$(multi_run "$unknownjson" BLOCKED)
+ck "unknown repo records reject the whole exit" "block" "$(decision "$out")"
+cleanjson=$(jq -cn --arg a "$BREPO" --arg b "$BREPO2" --arg c "$CREPO" \
+  '{outcomes:[
+    {repo:$a,outcome:"PRESERVE",reason:"User requested a later handoff",owner:"Jonathan",next:"Resume from this exact branch"},
+    {repo:$b,outcome:"BLOCKED",blocker:"Remote access is unavailable",needed:"Jonathan must restore credentials"},
+    {repo:$c,outcome:"PRESERVE",reason:"Clean repo needs no exit",owner:"Jonathan",next:"No action is required"}
+  ]}')
+out=$(multi_run "$cleanjson" BLOCKED)
+ck "already-clean repo records reject the whole exit" "block" "$(decision "$out")"
+
+# The envelope is scoped to this runtime continuation. Replaying the same final
+# text on a later independent Stop must measure again.
+rm -f "$SD/$REENTRYSID.blocks"
+payload=$(jq -cn --arg sid "$REENTRYSID" --arg msg "$qmsg" \
+  '{session_id:$sid,stop_hook_active:false,last_assistant_message:$msg}')
+out=$(payload_run "$payload")
+ck "a later Stop cannot replay the prior exit" "block" "$(decision "$out")"
+
+out=$(payload_run "$(printf '{"session_id":"%s","stop_hook_active":false}' "$REENTRYSID")")
+ck "boolean false still measures and blocks" "block" "$(decision "$out")"
+message=$(reason "$out")
+out=$(payload_run "$(printf '{"session_id":"%s","stop_hook_active":"true"}' "$REENTRYSID")")
+ck "a truthy string cannot spoof Stop re-entry" "block" "$(decision "$out")"
+out=$(payload_run "$(printf '{"session_id":"%s"}' "$REENTRYSID")")
+ck "an absent re-entry field keeps compatibility" "block" "$(decision "$out")"
+out=$(payload_run \
+  "$(jq -cn --arg sid "$REENTRYSID" --arg msg "$qmsg" \
+      '{session_id:$sid,stop_hook_active:true,last_assistant_message:$msg}')" \
+  CLAUDE_DOD_HANDOVER=1)
+ck "an explicit ralph handover still measures" "block" "$(decision "$out")"
+
+# An accepted exit is not allowed to strand the next turn at a spent budget.
+# Make the state directory non-writable so unlinking the countfile fails.
+RESETSD="$SD/reset-failure"
+mkdir -p "$RESETSD"
+RESETSID="reset-failure-$RANDOM"
+printf '%s\n' "$BREPO" > "$RESETSD/$RESETSID.arm"
+echo 6 > "$RESETSD/$RESETSID.blocks"
+resetmsg=$(exit_message \
+  "$(jq -cn --arg repo "$BREPO" \
+    '{outcomes:[{repo:$repo,outcome:"PRESERVE",reason:"User requested a later handoff",owner:"Jonathan",next:"Resume from this exact branch"}]}')" \
+  DONE)
+payload=$(jq -cn --arg sid "$RESETSID" --arg msg "$resetmsg" \
+  '{session_id:$sid,stop_hook_active:true,last_assistant_message:$msg}')
+chmod 500 "$RESETSD"
+out=$(payload_run "$payload" CLAUDE_DOD_STATE_DIR="$RESETSD")
+chmod 700 "$RESETSD"
+ck "a failed budget reset rejects the exit" "block" "$(decision "$out")"
+ck "  ...and names the reset failure" "yes" \
+  "$(has_text "$(reason "$out")" "block budget could not be reset")"
+
+ck "block guidance names Ship" "yes" "$(has_text "$message" "Ship")"
+ck "block guidance names Preserve" "yes" "$(has_text "$message" "Preserve")"
+ck "block guidance names Abandon" "yes" "$(has_text "$message" "Abandon")"
+ck "block guidance names Question" "yes" "$(has_text "$message" "Question")"
+ck "block guidance names Blocked" "yes" "$(has_text "$message" "Blocked")"
+ck "block guidance gives exact explanatory-exit syntax" "yes" \
+   "$(has_text "$message" "DOD-EXIT:")"
+ck "block guidance requires uppercase outcome values" "yes" \
+   "$(has_text "$message" "exact uppercase outcome values")"
+ck "block guidance defines aggregate precedence" "yes" \
+   "$(has_text "$message" "QUESTION wins over BLOCKED")"
+ck "Abandon never grants deletion authority" "yes" \
+   "$(has_text "$message" "Abandon does not authorize deletion")"
+ck "an exit is scoped to the current Stop chain" "yes" \
+   "$(has_text "$message" "current Stop chain")"
+ck "a PR is never opened only to clear the gate" "yes" \
+   "$(has_text "$message" "Never push or open a PR solely to clear this gate.")"
+ck "deletion requires explicit user approval" "yes" \
+   "$(has_text "$message" "Never delete work without explicit user approval.")"
+ck "PR URLs are conditional on an existing PR" "yes" \
+   "$(has_text "$message" "Include a PR URL only when one exists.")"
+ck "in-flight checks get one reporting follow-up" "yes" \
+   "$(has_text "$message" "one durable reporting follow-up")"
+ck "old single-outcome instruction is gone" "no" \
+   "$(has_text "$message" "drive to green and mergeable")"
+ck "old unconditional PR-link demand is gone" "no" \
+   "$(has_text "$message" "with the clickable PR URL")"
+rm -f "$SD/$REENTRYSID.arm" "$SD/$REENTRYSID.blocks" \
+      "$SD/$MULTISID.arm" "$SD/$MULTISID.blocks"
 
 out=$(printf '{"session_id":"%s"}' "$SID" | CLAUDE_DOD_STATE_DIR="$SD" CLAUDE_DOD_MODE=shadow python3 "$GATE")
 case "$out" in *'"systemMessage"'*) r=shadow ;; *) r="$out" ;; esac
@@ -177,7 +421,7 @@ PY
   # without it that inner call reads the LIVE ~/.local/state/claude-dod — an
   # isolation gap in a file whose own header claims isolation.
   printf '{"session_id":"%s","transcript_path":"%s"}' "$S" "$T" \
-    | CLAUDE_DOD_STATE_DIR="$SD" bash "$RALPH_HOOK" >/dev/null 2>&1
+    | CLAUDE_DOD_STATE_DIR="$SD" ralph_under_test >/dev/null 2>&1
   if [ -f "$CLAUDE_RALPH_STATE_DIR/$S.md" ]; then rm -f "$CLAUDE_RALPH_STATE_DIR/$S.md"; echo kept
   else echo gone; fi
 }
@@ -293,7 +537,7 @@ out=$(gate_run "$RSID")
 ck "concurrent gate stands down for the live loop" "" "$(decision "$out")"
 ck "  ...by exiting 0, not by crashing" "0" "$(gate_rc)"
 printf '{"session_id":"%s","transcript_path":"%s"}' "$RSID" "$RT" \
-  | CLAUDE_DOD_STATE_DIR="$SD" bash "$RALPH_HOOK" >/dev/null 2>&1
+  | CLAUDE_DOD_STATE_DIR="$SD" ralph_under_test >/dev/null 2>&1
 ck "end_loop leaves no loop state behind" "gone" \
    "$([ -e "$CLAUDE_RALPH_STATE_DIR/$RSID.md" ] && echo kept || echo gone)"
 out=$(gate_run "$RSID")
@@ -307,7 +551,7 @@ CSID="corrupt-$RANDOM"
 printf -- '---\nactive: true\nmax_iterations: 25\n---\np\n' \
   > "$CLAUDE_RALPH_STATE_DIR/$CSID.md"
 printf '{"session_id":"%s","transcript_path":"%s"}' "$CSID" "$RT" \
-  | CLAUDE_DOD_STATE_DIR="$SD" bash "$RALPH_HOOK" >/dev/null 2>&1
+  | CLAUDE_DOD_STATE_DIR="$SD" ralph_under_test >/dev/null 2>&1
 ck "a missing frontmatter line ends the loop" "gone" \
    "$([ -e "$CLAUDE_RALPH_STATE_DIR/$CSID.md" ] && echo kept || echo gone)"
 
@@ -333,7 +577,7 @@ printf '%s\n' "$BREPO" > "$SD/$MSID2.arm"
 # resolver: without it the hook dies at `source` under set -e, and this case
 # would measure that instead of the missing gate.
 MISS_HOME="$SD/misshome"; mkdir -p "$MISS_HOME/.claude/hooks" "$MISS_HOME/.claude/scripts"
-cp "$HOME/.claude/scripts/ralph-loop-state.sh" "$MISS_HOME/.claude/scripts/"
+cp "$UNDER_TEST_ROOT/scripts/ralph-loop-state.sh" "$MISS_HOME/.claude/scripts/"
 out=$(printf '{"session_id":"%s","transcript_path":"%s"}' "$MSID2" "$MT" \
       | CLAUDE_DOD_STATE_DIR="$SD" HOME="$MISS_HOME" bash "$RALPH_HOOK" 2>/dev/null)
 ck "a missing gate BLOCKS the handover turn" "block" "$(decision "$out")"
@@ -346,7 +590,7 @@ printf -- '---\nactive: true\niteration: 4\nmax_iterations: 25\ncompletion_promi
   > "$CLAUDE_RALPH_STATE_DIR/$MSID3.md"
 CRASH_HOME="$SD/crashhome"; mkdir -p "$CRASH_HOME/.claude/hooks" "$CRASH_HOME/.claude/scripts"
 printf 'raise RuntimeError("boom")\n' > "$CRASH_HOME/.claude/hooks/finishing-up-gate.py"
-cp "$HOME/.claude/scripts/ralph-loop-state.sh" "$CRASH_HOME/.claude/scripts/"
+cp "$UNDER_TEST_ROOT/scripts/ralph-loop-state.sh" "$CRASH_HOME/.claude/scripts/"
 out=$(printf '{"session_id":"%s","transcript_path":"%s"}' "$MSID3" "$MT" \
       | CLAUDE_DOD_STATE_DIR="$SD" HOME="$CRASH_HOME" bash "$RALPH_HOOK" 2>/dev/null)
 ck "a crashing gate BLOCKS the handover turn" "block" "$(decision "$out")"
@@ -513,8 +757,10 @@ PY
   printf -- '---\nactive: true\niteration: 4\nmax_iterations: 25\ncompletion_promise: "ALL DONE"\n---\nkeep going\n' \
     > "$CLAUDE_RALPH_STATE_DIR/$S.md"
   printf '%s\n' "$HREPO" > "$SD/$S.arm"
-  printf '{"session_id":"%s","transcript_path":"%s"}' "$S" "$T" \
-    | CLAUDE_DOD_STATE_DIR="$SD" bash "$RALPH_HOOK" 2>/dev/null
+  # Exercise branch gate's HANDOVER exception through ralph, not only through
+  # a direct gate call: ordinary re-entry stands down, handover must not.
+  printf '{"session_id":"%s","transcript_path":"%s","stop_hook_active":true}' "$S" "$T" \
+    | CLAUDE_DOD_STATE_DIR="$SD" ralph_under_test 2>/dev/null
   rm -f "$CLAUDE_RALPH_STATE_DIR/$S.md"
 }
 
@@ -523,7 +769,7 @@ out=$(end_via '<promise>ALL DONE</promise>')
 # assertions further down are about THIS handover's output, not whatever ran
 # last. (They silently were, which is how a passing suite hid it.)
 HOUT="$out"
-ck "promise handover blocks on the gate's verdict" "block" "$(decision "$HOUT")"
+ck "promise handover still blocks after a Stop continuation" "block" "$(decision "$HOUT")"
 
 # The marker protocol these cases used to exercise is GONE — it was a lease with
 # no fencing token, and the review loop stopped with self-inflicted-churn after
@@ -604,7 +850,7 @@ rm -f "$SD/$TSID.arm" "$SD/$TSID.blocks"
 SLOWGATE_HOME="$SD/slowgate"
 mkdir -p "$SLOWGATE_HOME/.claude/hooks" "$SLOWGATE_HOME/.claude/scripts"
 printf 'import time\ntime.sleep(45)\n' > "$SLOWGATE_HOME/.claude/hooks/finishing-up-gate.py"
-cp "$HOME/.claude/scripts/ralph-loop-state.sh" "$SLOWGATE_HOME/.claude/scripts/"
+cp "$UNDER_TEST_ROOT/scripts/ralph-loop-state.sh" "$SLOWGATE_HOME/.claude/scripts/"
 GSID="slowgate-$RANDOM"
 printf -- '---\nactive: true\niteration: 4\nmax_iterations: 25\ncompletion_promise: "ALL DONE"\n---\np\n' \
   > "$CLAUDE_RALPH_STATE_DIR/$GSID.md"
@@ -632,7 +878,7 @@ printf '%s\n' "$BREPO" > "$SD/$RSID.arm"
 chmod 555 "$RODIR"
 out=$(printf '{"session_id":"%s","transcript_path":"%s"}' "$RSID" "$MT" \
       | CLAUDE_DOD_STATE_DIR="$SD" CLAUDE_RALPH_STATE_DIR="$RODIR" \
-        bash "$RALPH_HOOK" 2>/dev/null)
+        ralph_under_test 2>/dev/null)
 chmod 755 "$RODIR"
 ck "an undeletable loop state file still BLOCKS" "block" "$(decision "$out")"
 case "$out" in *"could not delete the loop state file"*) r=named ;; *) r="$out" ;; esac
@@ -658,7 +904,7 @@ rm -f "$CLAUDE_RALPH_STATE_DIR/$HSID.md" "$SD/$HSID.arm" "$SD/$HSID.blocks"
 # the gate down forever.
 NORES_HOME="$SD/nores"
 mkdir -p "$NORES_HOME/.claude/hooks" "$NORES_HOME/.claude/scripts"
-cp "$HOME/.claude/hooks/finishing-up-gate.py" "$NORES_HOME/.claude/hooks/"
+cp "$GATE" "$NORES_HOME/.claude/hooks/"
 NSID="nores-$RANDOM"
 printf -- '---\nactive: true\niteration: 25\nmax_iterations: 25\n---\np\n' \
   > "$CLAUDE_RALPH_STATE_DIR/$NSID.md"
@@ -711,7 +957,7 @@ for bad_timeout in abc 0 999; do
   printf '%s\n' "$BREPO" > "$SD/$VSID.arm"
   out=$(printf '{"session_id":"%s","transcript_path":"%s"}' "$VSID" "$MT" \
         | CLAUDE_DOD_STATE_DIR="$SD" CLAUDE_RALPH_GATE_TIMEOUT="$bad_timeout" \
-          bash "$RALPH_HOOK" 2>"$SD/tv-$bad_timeout.err")
+          ralph_under_test 2>"$SD/tv-$bad_timeout.err")
   ck "CLAUDE_RALPH_GATE_TIMEOUT=$bad_timeout still reaches a real verdict" \
      "block" "$(decision "$out")"
   case "$(cat "$SD/tv-$bad_timeout.err")" in
@@ -735,11 +981,11 @@ JSID="nojq-$RANDOM"
 printf -- '---\nactive: true\niteration: 4\nmax_iterations: 25\n---\np\n' \
   > "$CLAUDE_RALPH_STATE_DIR/$JSID.md"
 out=$(printf '{"session_id":"%s","transcript_path":"%s"}' "$JSID" "$MT" \
-      | PATH="$NOJQ" CLAUDE_DOD_STATE_DIR="$SD" bash "$RALPH_HOOK" 2>/dev/null)
+      | PATH="$NOJQ" CLAUDE_DOD_STATE_DIR="$SD" ralph_under_test 2>/dev/null)
 ck "a missing jq BLOCKS while loop state exists" "block" "$(decision "$out")"
 rm -f "$CLAUDE_RALPH_STATE_DIR/$JSID.md"
 out=$(printf '{"session_id":"%s","transcript_path":"%s"}' "$JSID" "$MT" \
-      | PATH="$NOJQ" CLAUDE_DOD_STATE_DIR="$SD" bash "$RALPH_HOOK" 2>/dev/null)
+      | PATH="$NOJQ" CLAUDE_DOD_STATE_DIR="$SD" ralph_under_test 2>/dev/null)
 ck "  ...and is quiet when no loop is armed anywhere" "" "$(decision "$out")"
 
 echo
