@@ -1,167 +1,132 @@
 ---
 name: finishing-up
-description: Use when wrapping up work that produced a diff, and ALWAYS before asking the user to merge, review, or click anything on a PR — including "this is ready to merge", "waiting on your merge", "I'm blocked on you merging", "PR is up", or any status report that mentions a branch or pull request. Also when CI is running, a check is red, a PR won't merge, or a turn is about to end with unpushed or unmerged work. Drives to green-and-mergeable, then hands over with clickable links.
+description: Use when wrapping up work that produced a diff; before asking the user to merge, review, or click a PR; when deciding whether unfinished work should ship, be preserved, or be abandoned; or when CI, checks, mergeability, or unpushed work block completion.
 ---
 
 # Finishing Up
 
-Work is not done when the code is written. It is done when CI is green, the
-PR is genuinely mergeable, and Jonathan has a clickable link plus an
-executive summary in front of him.
+Choose the terminal outcome before acting on Git blockers. `dod-check` measures
+shipping readiness; it does not decide whether work should ship.
 
-**The Iron Law: never report PR state you have not just measured.**
+**Iron law: never report repository or PR state you have not just measured.**
 
-`gh` is the measurement. Your memory of a PR is not — PRs get merged, closed,
-and broken by other pushes while you are not looking. The specific failure
-this skill exists to prevent: linking a PR, saying "blocked on your merge",
-and being told it merged two hours ago.
+## Step 1 — Select the outcome
 
-## Step 1 — Measure, always
+| Outcome | Use when | Action |
+|---|---|---|
+| **Ship** | Work belongs upstream and no contrary user intent exists. | Complete the delivery ladder below. |
+| **Preserve** | The user explicitly wants work retained for later, or another session owns it. | Do not publish or alter it. Record exact worktree, branch, HEAD, measured blockers, reason, and next owner/action. |
+| **Abandon** | The user explicitly says the work has no value or authorizes discard. | Resolve exact targets and ownership, then remove only the authorized work. Report what was removed and whether recovery is possible. |
+
+Never push or open a PR solely to satisfy the gate. Never delete work without
+explicit user approval. Existing approval such as “discard that worktree” is
+sufficient; do not ask twice. If Ship is doubtful and neither Preserve nor
+Abandon is authorized, ask one focused outcome question.
+
+Preserve is an intentional handoff, not a claim that shipping is complete.
+Abandon ends by measuring the remaining/default checkout, not the deleted path.
+
+## Step 2 — Measure
+
+Run fresh in every repo this work touched:
 
 ```bash
-python3 ~/.claude/scripts/dod-check.py          # human-readable
-python3 ~/.claude/scripts/dod-check.py --json   # for parsing
+python3 ~/.claude/scripts/dod-check.py --repo <repo>
+python3 ~/.claude/scripts/dod-check.py --repo <repo> --json
 ```
 
-Exit codes: `0` done · `1` blockers · `2` not applicable · `3` could not tell.
+Exit codes: `0` done · `1` blockers · `2` not applicable · `3` unknown.
+Treat `3` as not done. Use `gh` for current PR state; memory is not evidence.
 
-**Treat 3 as not done.** An unreachable API is not a green check.
+For Preserve, report the measured blockers without applying Ship fixes. For
+Abandon, measure before resolving targets and again after authorized cleanup.
+Only Ship interprets delivery blockers as commands to publish.
 
-Run this *in the turn where you make the claim*. Not earlier in the session,
-not "I checked after the last push". Fresh, or it is not evidence.
+## Step 3 — Ship
 
-## Two ladders
+`dod-check` selects the ladder:
 
-Which one applies is decided by the branch, and `dod-check` picks for you.
+- **Default branch:** committed → pushed → level with `origin`.
+- **Feature branch:** committed → pushed → PR open → checks green (or repo has
+  no CI) → mergeable → Jonathan's merge click → switch the checkout to the
+  default branch and pull.
 
-**Direct-push — you are on the default branch.** Committed → pushed → level with
-`origin`. That is the whole ladder. No PR is demanded, because none can exist.
-This is not a loophole: it used to be `n/a`, which meant the gate could be
-side-stepped entirely by never opening a PR, and commits sat unpushed on `main`
-reading as finished.
+The merge click, credentials, interactive logins, and taste decisions are human
+actions. Everything else is yours. Work blockers in reported order:
 
-**PR flow — you are on a feature branch.** Committed → pushed → PR open →
-checks green (or the repo has no CI) → mergeable → Jonathan's merge click →
-**switch back to the default branch and pull**.
-
-**A session ends on the default branch, clean, at latest.** Leaving a checkout
-parked on a merged feature branch is a closing ceremony, and Jonathan does not
-want one: *"I want Claude to move as close as possible to finishing, so there is
-no closing ceremony for me to do, beyond bare necessities."*
-
-Bare necessities are the merge click on a protected branch, credentials,
-interactive logins, and taste calls. Everything else is yours.
-
-**Several repos is normal.** One session legitimately spans e.g. `nixos-config`
-plus a project. Each repo runs its own ladder and each gets its own line in the
-report, with its own URL.
-
-**Subagents count as you.** They share the parent's session id (measured against
-2.1.247), so a repo your subagent edited is a repo you have to finish. Dispatch
-does not transfer ownership.
-
-## Step 2 — Act on what it says
-
-Work the blockers in the order reported; each has a `fix` field.
-
-| Blocker | What to do |
+| Blocker | Action |
 |---|---|
-| `DIRTY_TREE` | Commit it. Do not report a state you have uncommitted changes on top of. |
-| `NOT_PUSHED` / `UNPUSHED_COMMITS` | Push. On the default branch this is measured against `origin/<base>`, not the upstream ref. |
-| `BEHIND_REMOTE` | `git pull --ff-only`. "At latest" is part of done. |
-| `NOT_ON_DEFAULT` | The PR merged and the repo is still on the dead branch. `git switch <default> && git pull --ff-only`. This is the last step of the work, not a chore for Jonathan. |
-| `NO_PR` | `gh pr create --fill`, then write a real body. |
-| `PR_DRAFT` | `gh pr ready <n>` — a draft is not a merge request. |
-| `CHECKS_PENDING` | **Step 3.** Do not guess the outcome. A durable `CronCreate` is the right follow-up to leave, but it does **not** clear the gate — measured: a durable cron is not session-scoped, so it never lands in `session_crons`. Book it, say you are blocked on the check, and stop. |
-| `CHECKS_FAILING` | **Step 4.** |
-| `NOT_MERGEABLE` | `BEHIND` → merge the base in and push. `DIRTY` → resolve conflicts. `BLOCKED` → say precisely what protection is unmet. |
-| `UNRESOLVED_THREADS` | Answer each, then resolve it. |
-| `NO_CHECKS` | Zero checks in a repo that **has** workflows. Something deleted, disabled or un-triggered them; find out what. A repo with no CI at all does not raise this — it reports a warning, because there is nothing to wait for. |
-| `INTEGRITY` | You (or the diff) weakened the signal. Revert it. Justify with a `dod-ok` comment only if it is genuinely correct — the comment lands in the diff for Jonathan to disagree with. |
-| `PR_CLOSED` | Closed without merging. Do not report it as pending. |
+| `DIRTY_TREE` | Commit the intended work. |
+| `NOT_PUSHED` / `UNPUSHED_COMMITS` | Push. On default branch compare with `origin/<base>`. |
+| `BEHIND_REMOTE` | `git pull --ff-only`. |
+| `NO_PR` | Create a PR and write an accurate body. |
+| `PR_DRAFT` | Mark it ready. |
+| `CHECKS_PENDING` | Schedule one durable reporting follow-up or keep one background watch. Never spin. |
+| `CHECKS_FAILING` | Attribute against base; fix only branch-caused failures. Invoke `hardening-flaky-ci` for proven flakes. |
+| `NOT_MERGEABLE` | Update from base, resolve conflicts, or name the unmet protection. |
+| `UNRESOLVED_THREADS` | Answer and resolve each thread. |
+| `NO_CHECKS` | If workflows exist, find why none ran. No CI at all is only a warning. |
+| `INTEGRITY` | Restore weakened signal; use `dod-ok` only when genuinely correct and reviewable in the diff. |
+| `PR_CLOSED` | Do not report it as pending. |
+| `NOT_ON_DEFAULT` | Switch to default and pull after merge. |
 
-`MERGED` is never a request for a merge. Report it as landed, and never ask
-Jonathan to click something he already clicked. It is not quite *done* on its
-own, though: a merged PR still leaves the checkout on a dead branch, so
-`NOT_ON_DEFAULT` follows it. Go home, then you are done.
+`MERGED` never means ask for another click. Several repos get separate
+measurements and separate outcome decisions. Subagent edits remain parent-owned.
 
-## Step 3 — Pending checks: schedule, never spin
+### Pending checks
 
-CI takes minutes. You cannot wait inside a turn, and ending the turn with
-"I'll report when it lands" drops the work.
+Create one durable, one-shot follow-up, delayed to the pipeline's normal
+duration and scheduled off-minute. Its self-contained prompt includes repo,
+branch, PR, a fresh `dod-check`, and actions for green/red/still-pending.
+It reports only: it must not merge or push work the user has not seen. A durable
+follow-up does not clear the current Stop gate.
 
-```
-CronCreate(cron: "<M> <H> <DoM> <Mon> *", recurring: false, durable: true, prompt: <self-contained>)
-```
+### Red checks
 
-- **`durable: true`** — survives `/clear`, restart, crash.
-- **Delay matched to the run.** An 8-minute pipeline gets one ~10-minute
-  check, not six 90-second ones. Add slack; firing early wastes the wake.
-- **Off-minute** (not :00 or :30).
+Test the same failure on the base commit:
 
-The scheduled prompt is written for an agent with no memory of this turn:
-the repo path, the branch, the PR number, that it should run `dod-check`
-first, what to do on green / red / still-pending, and what not to do without
-Jonathan.
+- Base fails too: pre-existing; report it, do not mutate this diff.
+- Branch only: inspect failed logs and fix the cause.
+- Identical code passes on rerun: treat as flaky and harden it.
 
-Alternative when the wait is short and you have more to do anyway: run
-`gh pr checks --watch --fail-fast` as a background task. The Stop hook reads
-`background_tasks` and will not fault the turn for pausing on live work.
+Never weaken a check. Stop after three identical failed attempts and report the
+retry evidence.
 
-## Step 4 — Red checks: attribute before you fix
+## Step 4 — Handover
 
-**Ask first: does this fail on the base commit too?** One rerun against the
-base converts an ambiguous red into a definitive answer, and it is the single
-highest-value signal available.
+### Ship
 
-- **Fails on base too** → pre-existing, not yours. Say so. Do not mutate your
-  diff to chase it.
-- **Fails only on your branch** → yours. Read the actual log
-  (`gh run view <id> --log-failed`), fix the cause.
-- **Passes on rerun, identical code** → flaky. Invoke `hardening-flaky-ci`.
-  Record the attribution; do not just rerun until green.
+Require fresh `dod-check` exit `0`. Give:
 
-Never make a check pass by weakening it. `dod-check`'s integrity scan will
-catch the obvious forms, and Jonathan reads the diff.
+1. Executive summary of behavior and tooling/config changes.
+2. Visual-review URL and stop command when rendered output changed.
+3. Full clickable PR URLs from the fresh checker, with branch, base, and commit
+   count. Put PR links at the bottom.
 
-**Same failure three times running → stop.** Escalate with the full retry
-history rather than trying a fourth variation. Three identical failures means
-the approach is wrong, not that the next tweak is the one.
+State the only remaining human action. If it is the merge click, also state the
+measured green and mergeable status.
 
-## Step 5 — The handover
+### Preserve
 
-Only once `dod-check` exits 0. Three sections; drop any that is empty.
+Give exact worktree, branch, HEAD, measured blockers, why it is retained, and
+who/what resumes it. Include a PR URL only when one exists. Do not describe the
+work as ready or done.
 
-1. **Executive summary** — numbered list of what changed and why, including
-   tooling / skill / config changes, not just product code. One line each.
-   Jonathan should be able to scan it instead of reading commits.
-2. **Visual review** — if any rendered view changed (HTML, templates, client
-   TS, HTML-returning handlers), serve the shots:
-   `~/.claude/skills/screenshot-review/serve.sh <shots-dir>`. Include the URL
-   and the kill command. Omit only for pure backend/infra diffs.
-3. **PRs** — **clickable full URLs**, one line each with branch, base, and
-   commit count. `https://github.com/owner/repo/pull/N`, never `#123`, never
-   a bare branch name. The URL comes from `dod-check`'s `pr.url`, which came
-   from `gh` this turn.
+### Abandon
 
-State explicitly what is left and why. If the only thing left is Jonathan's
-click, say that — and say that CI is green and the PR is mergeable, because
-you just measured both.
+Give exact removed worktree/branch, recovery status, and fresh state of the
+remaining/default checkout. Include no PR section unless a PR actually exists.
 
 ## Red flags
 
-- "Ready to merge" without a `dod-check` run in this turn
-- "Blocked on you merging" without re-checking the PR is still open
-- Reporting `#123` instead of a URL — it is not clickable
-- Ending a turn with pending CI and no `CronCreate`
-- "The tests should pass now" — should is not a measurement
-- Rerunning a red check until it goes green without attributing why
-- Treating exit 3 as done
-- Reading `NO_CHECKS` as green — or answering it by adding a workflow to make
-  the blocker go away, which is the same trick from the other end
-- Asking Jonathan to merge something already merged
+- Choosing Ship because `NO_PR` exists rather than because work belongs upstream
+- Pushing rejected, exploratory, or accidental work to silence the gate
+- Deleting without explicit approval or touching another session's branch
+- Claiming ready/merged/blocked from stale PR state
+- Rerunning unchanged pending checks instead of scheduling one follow-up
+- Treating exit `3`, `NO_CHECKS`, or a hook timeout as green
 
 ## Scope
 
-Any work that produced a diff. Not for questions, research, or reading —
-those never touch a file, so there is nothing to merge and nothing to check.
+Any work that produced a diff. Not for read-only questions or research with no
+repository change.
