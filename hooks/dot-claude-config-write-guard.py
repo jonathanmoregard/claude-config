@@ -137,8 +137,14 @@ def relpaths_under(path, root):
 
 
 def relpath_under(path, root):
-    """Return one path relative to root, or None when target is outside it."""
+    """Return one lexical or resolved path under root, else None."""
     candidates = relpaths_under(path, root)
+    if candidates:
+        return candidates[0]
+    if not path:
+        return None
+    resolved = os.path.realpath(os.path.abspath(os.path.expanduser(str(path))))
+    candidates = relpaths_under(resolved, root)
     return candidates[0] if candidates else None
 
 

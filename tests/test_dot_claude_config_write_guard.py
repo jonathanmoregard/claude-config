@@ -164,6 +164,20 @@ def test_codex_root_tracks_fake_home(tmp_path):
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
+def test_external_symlink_into_codex_tree_is_refused(tmp_path):
+    home = tmp_path / "home"
+    codex = home / ".codex"
+    codex.mkdir(parents=True)
+    alias = tmp_path / "codex-alias"
+    alias.symlink_to(codex, target_is_directory=True)
+
+    code, out = run(write_payload(str(alias / "config.toml")), home=home)
+
+    assert code == 0
+    assert out is not None
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
 def test_codex_lookalike_and_traversal_are_allowed():
     assert_allowed(
         write_payload(os.path.expanduser("~/.codex-backup/config.toml"))
