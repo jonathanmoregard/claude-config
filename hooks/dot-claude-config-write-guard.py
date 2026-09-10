@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PreToolUse gate: refuse file-tool writes to the live ~/.claude config surface.
+"""PreToolUse gate: refuse agent file-tool writes to live AI config roots.
 
 The safe-bash `.claude` worktree lock and the `.githooks/reference-transaction`
 hook guard git verbs and ref moves. Neither sees a Write/Edit/NotebookEdit call,
@@ -23,6 +23,11 @@ Untracked runtime state under ~/.claude (tmp/, projects/, homunculus/,
 reflections/, logs/, the permission ledger's own queue and decision files) is
 left alone, and so is the proposal spine even where git still tracks it — that
 is sibling-owned data the nightly reviewer writes by design.
+
+Everything under live ~/.codex is refused to agent file tools. Shared config
+comes from ~/.claude; Codex-specific mappings come from ai-client-config; the
+sync service publishes them. Codex's own runtime writes do not pass through
+agent file tools and remain unaffected.
 
 Emits a PreToolUse deny naming the worktree flow. Fails open on anything it
 cannot parse, per the house rule for hook input handling.
@@ -97,9 +102,44 @@ REASON = (
     "and route it through that repo's own PR flow."
 )
 
+CODEX_REASON = (
+    "Refused: {rel} is under live ~/.codex. Agents must not hand-edit Codex "
+    "configuration or runtime state. Change shared configuration through the "
+    "~/.claude worktree/PR flow; change Codex-specific rendering in the "
+    "ai-client-config repository. Let ai-client-config-codex-sync.service "
+    "publish generated output."
+)
+
 
 def config_root():
     return os.path.join(os.path.expanduser("~"), ".claude")
+
+
+def codex_root():
+    return os.path.join(os.path.expanduser("~"), ".codex")
+
+
+def relpaths_under(path, root):
+    """Return lexical paths under root, including a symlink-resolved root."""
+    if not path:
+        return []
+    abs_path = os.path.abspath(os.path.expanduser(str(path)))
+    candidates = []
+    for base in {root, os.path.realpath(root)}:
+        try:
+            rel = os.path.relpath(abs_path, base)
+        except ValueError:  # different drive on Windows
+            continue
+        if rel == os.pardir or rel.startswith(os.pardir + os.sep):
+            continue
+        candidates.append(rel)
+    return candidates
+
+
+def relpath_under(path, root):
+    """Return one path relative to root, or None when target is outside it."""
+    candidates = relpaths_under(path, root)
+    return candidates[0] if candidates else None
 
 
 def tracked_paths(root):
@@ -128,23 +168,11 @@ def tracked_paths(root):
 
 def guarded_relpath(path, root):
     """Return the path relative to ~/.claude if it is guarded, else None."""
-    if not path:
-        return None
-    abs_path = os.path.abspath(os.path.expanduser(str(path)))
-
     # Compare against both the literal and the symlink-resolved config root, so
     # a symlinked $HOME does not open a bypass. The target path itself is NOT
     # resolved: a write aimed at ~/.claude/skills/<symlinked-skill>/SKILL.md is
     # exactly the case that must be refused and redirected to the owning repo.
-    candidates = []
-    for base in {root, os.path.realpath(root)}:
-        try:
-            rel = os.path.relpath(abs_path, base)
-        except ValueError:  # different drive on Windows
-            continue
-        if rel == os.pardir or rel.startswith(os.pardir + os.sep):
-            continue
-        candidates.append(rel)
+    candidates = relpaths_under(path, root)
     if not candidates:
         return None
 
@@ -187,16 +215,21 @@ def main():
         return 0
 
     target = tool_input.get("file_path") or tool_input.get("notebook_path")
-    rel = guarded_relpath(target, config_root())
-    if rel is None:
-        return 0
+    codex_rel = relpath_under(target, codex_root())
+    if codex_rel is not None:
+        reason = CODEX_REASON.format(rel=codex_rel)
+    else:
+        rel = guarded_relpath(target, config_root())
+        if rel is None:
+            return 0
+        reason = REASON.format(rel=rel)
 
     json.dump(
         {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",
-                "permissionDecisionReason": REASON.format(rel=rel),
+                "permissionDecisionReason": reason,
             }
         },
         sys.stdout,
