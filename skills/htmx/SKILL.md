@@ -25,7 +25,7 @@ Keep local/browser JavaScript accessible and idempotent after swaps; never repla
 - Autoescape (`{{ value }}`, never `{{ value|safe }}`); user content only as text.
 - Authenticate/authorize; keep CSRF/Origin/rate limits. `HX-Request` only selects rendering; use `Vary: HX-Request`.
 - Return `text/html`. `hx-disable` never sanitizes.
-- Set `selfRequestsOnly:true`, `allowEval:false`, `allowScriptTags:false`, `historyCacheSize:0`.
+- Set `selfRequestsOnly:true`, `allowEval:false`, `allowScriptTags:false`, `includeIndicatorStyles:false`, `historyCacheSize:0`.
 - Strict CSP; cookies `Secure`, `HttpOnly`, `SameSite=Lax`.
 
 Test hostile content/attributes, no-JavaScript fallback, content type/Vary, auth/CSRF, CSP/cookies, swap/focus/loading recovery, SSE isolation/rate/reconnect, and local keyboard/status behavior.
