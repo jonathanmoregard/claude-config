@@ -21,7 +21,7 @@ only GitHub CLI metadata plus the user-bus socket, and use the host-specific
 `gh auth git-credential` helper. CI is green; merge remains the required human
 gesture.
 
-Claude already runs `dot-claude-config-write-guard.py` before file-tool writes.
+Claude already runs `path-edit-guard.py` before file-tool writes.
 The Codex renderer mirrors that hook and adapts Codex `apply_patch` calls into
 Claude-shaped Write/Edit events. Extending this existing guard therefore gives
 both clients the same refusal without making Codex runtime storage read-only.

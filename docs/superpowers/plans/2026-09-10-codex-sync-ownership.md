@@ -13,7 +13,7 @@
 ### Task 1: Specify `~/.codex` refusal behavior
 
 **Files:**
-- Modify: `tests/test_dot_claude_config_write_guard.py`
+- Modify: `tests/test_path_edit_guard.py`
 
 - [ ] **Step 1: Add Codex-root fixtures and actionable-reason helper**
 
@@ -70,7 +70,7 @@ def test_codex_lookalike_and_traversal_are_allowed():
 Run:
 
 ```bash
-python3 -m pytest tests/test_dot_claude_config_write_guard.py -q
+python3 -m pytest tests/test_path_edit_guard.py -q
 ```
 
 Expected: new Codex tests fail with `expected a decision, got nothing`; existing
@@ -79,15 +79,15 @@ Claude tests pass.
 - [ ] **Step 4: Commit test contract**
 
 ```bash
-git add tests/test_dot_claude_config_write_guard.py
+git add tests/test_path_edit_guard.py
 git commit -m "test: require agents to leave Codex state sync-owned"
 ```
 
 ### Task 2: Extend shared file-write guard
 
 **Files:**
-- Modify: `hooks/dot-claude-config-write-guard.py`
-- Test: `tests/test_dot_claude_config_write_guard.py`
+- Modify: `hooks/path-edit-guard.py`
+- Test: `tests/test_path_edit_guard.py`
 
 - [ ] **Step 1: Add Codex root and precise containment helper**
 
@@ -148,8 +148,8 @@ file tools.
 Run:
 
 ```bash
-python3 -m py_compile hooks/dot-claude-config-write-guard.py
-python3 -m pytest tests/test_dot_claude_config_write_guard.py -q
+python3 -m py_compile hooks/path-edit-guard.py
+python3 -m pytest tests/test_path_edit_guard.py -q
 ```
 
 Expected: all focused tests pass with no warnings.
@@ -157,7 +157,7 @@ Expected: all focused tests pass with no warnings.
 - [ ] **Step 4: Commit implementation**
 
 ```bash
-git add hooks/dot-claude-config-write-guard.py
+git add hooks/path-edit-guard.py
 git commit -m "fix: keep Codex tree sync-owned"
 ```
 
@@ -198,7 +198,7 @@ Run:
 ```bash
 git diff --check
 rg -n 'Never edit anything under `~/.codex`|ai-client-config-codex-sync.service' CLAUDE.md skills/settings-management/SKILL.md
-python3 -m pytest tests/test_dot_claude_config_write_guard.py -q
+python3 -m pytest tests/test_path_edit_guard.py -q
 ```
 
 Expected: no whitespace errors; directive appears in both files; guard suite
@@ -214,8 +214,8 @@ git commit -m "docs: route Codex config changes through sync sources"
 ### Task 4: Verify mirrored Codex behavior and deliver
 
 **Files:**
-- Verify: `hooks/dot-claude-config-write-guard.py`
-- Verify: `tests/test_dot_claude_config_write_guard.py`
+- Verify: `hooks/path-edit-guard.py`
+- Verify: `tests/test_path_edit_guard.py`
 - Verify: `CLAUDE.md`
 - Verify: `skills/settings-management/SKILL.md`
 
@@ -224,8 +224,8 @@ git commit -m "docs: route Codex config changes through sync sources"
 Run:
 
 ```bash
-python3 -m pytest tests/test_dot_claude_config_write_guard.py tests/test_skill_matches_tools.py -q
-python3 -m py_compile hooks/dot-claude-config-write-guard.py
+python3 -m pytest tests/test_path_edit_guard.py tests/test_skill_matches_tools.py -q
+python3 -m py_compile hooks/path-edit-guard.py
 git diff origin/master...HEAD --check
 ```
 
@@ -253,7 +253,7 @@ Run:
 ```bash
 git status --short --branch
 git diff origin/master...HEAD --stat
-git diff origin/master...HEAD -- CLAUDE.md skills/settings-management/SKILL.md hooks/dot-claude-config-write-guard.py tests/test_dot_claude_config_write_guard.py
+git diff origin/master...HEAD -- CLAUDE.md skills/settings-management/SKILL.md hooks/path-edit-guard.py tests/test_path_edit_guard.py
 ```
 
 Expected: only design, plan, test, hook, global instruction, and skill files

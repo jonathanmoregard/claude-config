@@ -1,4 +1,4 @@
-"""Contract for hooks/dot-claude-config-write-guard.py.
+"""Contract for hooks/path-edit-guard.py.
 
 The guard refuses Write/Edit/NotebookEdit calls aimed at the versioned config
 surface of the LIVE ~/.claude checkout, and stays out of the way everywhere
@@ -18,9 +18,24 @@ import sys
 import pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-HOOK = os.path.join(REPO_ROOT, "hooks", "dot-claude-config-write-guard.py")
+HOOK = os.path.join(REPO_ROOT, "hooks", "path-edit-guard.py")
 LIVE = os.path.join(os.path.expanduser("~"), ".claude")
 CODEX = os.path.join(os.path.expanduser("~"), ".codex")
+
+
+def test_guard_has_general_path_edit_name():
+    general_hook = os.path.join(REPO_ROOT, "hooks", "path-edit-guard.py")
+    legacy_hook = os.path.join(
+        REPO_ROOT, "hooks", "dot-claude-config-write-guard.py"
+    )
+    settings_path = os.path.join(REPO_ROOT, "settings.json")
+
+    assert os.path.isfile(general_hook)
+    assert not os.path.exists(legacy_hook)
+    with open(settings_path, encoding="utf-8") as settings_file:
+        settings = settings_file.read()
+    assert "$HOME/.claude/hooks/path-edit-guard.py" in settings
+    assert "dot-claude-config-write-guard" not in settings
 
 
 def run(payload, home=None):
