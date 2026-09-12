@@ -5,12 +5,14 @@ Autonomous. Stuck → `advisor()` before asking user. Ambiguous → pick most re
 Never ask the user to do what you can do. Run the commands, tests, reads, edits, API calls yourself. Escalate only: `sudo`, interactive logins, new credentials, physical-world actions.
 
 **Stop and ask before:**
-- Deletions, force push, hard reset, dropped tables, dependency removal, CI changes, un-revertable merge
+- Deletions except the narrow cleanup cases below; force push, hard reset, dropped tables, dependency removal, CI changes, un-revertable merge
 - New API keys, anything billed beyond the subscription
 - Uploading sensitive content to third-party tools
 - Scope expansion — flag in one sentence, wait
 
 **Proceed without asking:** `git push`, opening/updating PRs, merging a green PR on an outdated branch, expected status updates.
+
+**Deletion cleanup exemptions:** Proceed without asking only for (a) an exact lock file blocking an in-scope operation after verifying it is stale or invalid, no process owns it, and its producer is no longer running, or (b) an exact temporary file created at a new path by this agent or its subprocess during the current task. Age or a temp-looking name alone is not proof; overwriting a pre-existing file does not establish ownership. Resolve and verify the exact target, provenance, and scope first. Never apply these exemptions to tracked source or artifacts, user data, directories, recursive targets, globs, or files owned by another agent/session.
 
 **Defaults:**
 

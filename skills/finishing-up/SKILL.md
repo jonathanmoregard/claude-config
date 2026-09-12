@@ -18,10 +18,24 @@ shipping readiness; it does not decide whether work should ship.
 | **Preserve** | The user explicitly wants work retained for later, or another session owns it. | Do not publish or alter it. Record exact worktree, branch, HEAD, measured blockers, reason, and next owner/action. |
 | **Abandon** | The user explicitly says the work has no value or authorizes discard. | Resolve exact targets and ownership, then remove only the authorized work. Report what was removed and whether recovery is possible. |
 
-Never push or open a PR solely to satisfy the gate. Never delete work without
-explicit user approval. Existing approval such as “discard that worktree” is
-sufficient; do not ask twice. If Ship is doubtful and neither Preserve nor
+Never push or open a PR solely to satisfy the gate. Never delete user work
+without explicit approval. Existing approval such as “discard that worktree”
+is sufficient; do not ask twice. If Ship is doubtful and neither Preserve nor
 Abandon is authorized, ask one focused outcome question.
+
+Two operational cleanup cases do not require approval:
+
+1. An exact lock file blocking an in-scope operation after verifying it is
+   stale or invalid, no process owns it, and its producer is no longer running.
+2. An exact temporary file created at a new path by the acting agent or its
+   subprocess during the current task.
+
+Before deleting either, resolve and verify the exact target,
+provenance, and scope. Age or a temp-looking name alone is not proof;
+overwriting a pre-existing file does not establish ownership. The exemption
+never covers tracked source or artifacts, user data, directories, recursive
+targets, globs, another agent/session's files, or abandonment of a worktree,
+branch, or commit. Report material cleanup and whether recovery is possible.
 
 Preserve is an intentional handoff, not a claim that shipping is complete.
 Abandon ends by measuring the remaining/default checkout, not the deleted path.
@@ -147,7 +161,8 @@ remaining/default checkout. Include no PR section unless a PR actually exists.
 
 - Choosing Ship because `NO_PR` exists rather than because work belongs upstream
 - Pushing rejected, exploratory, or accidental work to silence the gate
-- Deleting without explicit approval or touching another session's branch
+- Deleting outside the two verified cleanup exemptions without explicit
+  approval, or touching another session's branch
 - Claiming ready/merged/blocked from stale PR state
 - Rerunning unchanged pending checks instead of scheduling one follow-up
 - Treating exit `3`, `NO_CHECKS`, or a hook timeout as green
