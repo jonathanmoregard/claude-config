@@ -25,13 +25,13 @@ Abandon is authorized, ask one focused outcome question.
 
 Two operational cleanup cases do not require approval:
 
-1. An exact lock file blocking an in-scope operation after verifying it is
-   stale or invalid, no process owns it, and its producer is no longer running.
-2. An exact temporary file created at a new path by the acting agent or its
-   subprocess during the current task.
+1. An exact temporary file created by the acting agent/session during the
+   current task.
+2. An exact stale or stuck lock file created by the acting agent/session during
+   the current task, after verifying that no live process owns or uses it.
 
-Before deleting either, resolve and verify the exact target,
-provenance, and scope. Age or a temp-looking name alone is not proof;
+Before deleting either, resolve and verify the exact target, ownership, and
+scope. Age or a temp-looking name alone is not proof;
 overwriting a pre-existing file does not establish ownership. The exemption
 never covers tracked source or artifacts, user data, directories, recursive
 targets, globs, another agent/session's files, or abandonment of a worktree,

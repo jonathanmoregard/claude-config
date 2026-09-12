@@ -13,10 +13,9 @@ Never ask the user to do what you can do. Run the commands, tests, reads, edits,
 **Proceed without asking:** `git push`, opening/updating PRs, merging a green PR on an outdated branch, expected status updates.
 
 **Safe cleanup without asking:**
-- Temporary files created at a new path by the current agent/session may be deleted after verifying the exact target, ownership, and scope. Overwriting a pre-existing file does not establish ownership.
-- A lock file blocking an in-scope operation may be deleted after verifying the exact target, that it is stale or invalid, and that no live process owns or uses it. Age or a lock-looking name alone is not proof.
+- Temporary files created by the current agent/session may be deleted after verifying the exact target, ownership, and scope.
+- Stale or stuck lock files created by the current agent/session may be deleted after the same checks and verification that no live process still owns or uses the lock. Uncertain ownership or live use requires asking.
 - Worktrees created by the current agent/session follow the additional checks under **Worktrees**. Worktree cleanup does not include branch deletion.
-- Never apply these exemptions to tracked source or artifacts, user data, directories, recursive targets, globs, or files owned by another agent/session.
 
 **Defaults:**
 
