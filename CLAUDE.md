@@ -5,14 +5,18 @@ Autonomous. Stuck → `advisor()` before asking user. Ambiguous → pick most re
 Never ask the user to do what you can do. Run the commands, tests, reads, edits, API calls yourself. Escalate only: `sudo`, interactive logins, new credentials, physical-world actions.
 
 **Stop and ask before:**
-- Deletions except the narrow cleanup cases below; force push, hard reset, dropped tables, dependency removal, CI changes, un-revertable merge
+- Deletions (except the cases under **Safe cleanup without asking**), force push, hard reset, dropped tables, dependency removal, CI changes, un-revertable merge
 - New API keys, anything billed beyond the subscription
 - Uploading sensitive content to third-party tools
 - Scope expansion — flag in one sentence, wait
 
 **Proceed without asking:** `git push`, opening/updating PRs, merging a green PR on an outdated branch, expected status updates.
 
-**Deletion cleanup exemptions:** Proceed without asking only for (a) an exact lock file blocking an in-scope operation after verifying it is stale or invalid, no process owns it, and its producer is no longer running, or (b) an exact temporary file created at a new path by this agent or its subprocess during the current task. Age or a temp-looking name alone is not proof; overwriting a pre-existing file does not establish ownership. Resolve and verify the exact target, provenance, and scope first. Never apply these exemptions to tracked source or artifacts, user data, directories, recursive targets, globs, or files owned by another agent/session.
+**Safe cleanup without asking:**
+- Temporary files created at a new path by the current agent/session may be deleted after verifying the exact target, ownership, and scope. Overwriting a pre-existing file does not establish ownership.
+- A lock file blocking an in-scope operation may be deleted after verifying the exact target, that it is stale or invalid, and that no live process owns or uses it. Age or a lock-looking name alone is not proof.
+- Worktrees created by the current agent/session follow the additional checks under **Worktrees**. Worktree cleanup does not include branch deletion.
+- Never apply these exemptions to tracked source or artifacts, user data, directories, recursive targets, globs, or files owned by another agent/session.
 
 **Defaults:**
 
@@ -86,6 +90,7 @@ User instructions override everything below.
 ## Worktrees
 - Required for (a) subagent-driven dev needing isolation, (b) nixos-config, and (c) all Klaffat development. Everything else branches in place with `git switch`. See `using-git-worktrees`.
 - Path: `~/worktrees/<repo>-<branch>/`.
+- A worktree created by the current agent/session may be removed without asking after verifying its exact path and ownership, a clean tree, and that all valuable commits are merged or otherwise recoverable. Cleanup removes the worktree only: keep local and remote branch refs unless the user explicitly requests branch deletion; refs use negligible space and preserve convenient recovery. Never remove another session's worktree or branch.
 - Klaffat primary checkout `~/Repos/klaffat` stays clean on `main`. Never edit, switch, commit, merge, rebase, or cherry-pick there. Start work with `~/Repos/klaffat/scripts/klaffat-worktree.sh <slug>` and continue in `~/worktrees/klaffat-<slug>/`. If primary is dirty or off `main`, report exact state; do not stash, reset, clean, or move unknown work. Use `repo-worktree-policy` when applying this pattern to another repository.
 
 ## Confidentiality
