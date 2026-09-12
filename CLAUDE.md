@@ -84,7 +84,7 @@ User instructions override everything below.
 ## Worktrees
 - Required for (a) subagent-driven dev needing isolation, (b) nixos-config, and (c) all Klaffat development. Everything else branches in place with `git switch`. See `using-git-worktrees`.
 - Path: `~/worktrees/<repo>-<branch>/`.
-- A worktree created by the current agent/session may be removed without asking after verifying its exact path and ownership, a clean tree, and that all valuable commits are merged or otherwise recoverable. Never remove another session's worktree or branch.
+- A worktree created by the current agent/session may be removed without asking after verifying its exact path and ownership, a clean tree, and that all valuable commits are merged or otherwise recoverable. Cleanup removes the worktree only: keep local and remote branch refs unless the user explicitly requests branch deletion; refs use negligible space and preserve convenient recovery. Never remove another session's worktree or branch.
 - Klaffat primary checkout `~/Repos/klaffat` stays clean on `main`. Never edit, switch, commit, merge, rebase, or cherry-pick there. Start work with `~/Repos/klaffat/scripts/klaffat-worktree.sh <slug>` and continue in `~/worktrees/klaffat-<slug>/`. If primary is dirty or off `main`, report exact state; do not stash, reset, clean, or move unknown work. Use `repo-worktree-policy` when applying this pattern to another repository.
 
 ## Confidentiality
