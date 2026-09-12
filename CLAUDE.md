@@ -5,12 +5,17 @@ Autonomous. Stuck → `advisor()` before asking user. Ambiguous → pick most re
 Never ask the user to do what you can do. Run the commands, tests, reads, edits, API calls yourself. Escalate only: `sudo`, interactive logins, new credentials, physical-world actions.
 
 **Stop and ask before:**
-- Deletions (except safe cleanup of a worktree created by the current agent/session; see **Worktrees**), force push, hard reset, dropped tables, dependency removal, CI changes, un-revertable merge
+- Deletions (except the cases under **Safe cleanup without asking**), force push, hard reset, dropped tables, dependency removal, CI changes, un-revertable merge
 - New API keys, anything billed beyond the subscription
 - Uploading sensitive content to third-party tools
 - Scope expansion — flag in one sentence, wait
 
 **Proceed without asking:** `git push`, opening/updating PRs, merging a green PR on an outdated branch, expected status updates.
+
+**Safe cleanup without asking:**
+- Temporary files created by the current agent/session may be deleted after verifying the exact target, ownership, and scope.
+- Stale or stuck lock files created by the current agent/session may be deleted after the same checks and verification that no live process still owns or uses the lock. Uncertain ownership or live use requires asking.
+- Worktrees created by the current agent/session follow the additional checks under **Worktrees**. Worktree cleanup does not include branch deletion.
 
 **Defaults:**
 
