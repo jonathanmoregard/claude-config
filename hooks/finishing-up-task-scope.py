@@ -221,10 +221,8 @@ def main() -> int:
         )
         return 0
     finally:
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
+        # Closing releases flock. Do not hide a close failure: a hook that may
+        # still hold the task-state lock must fail visibly.
         os.close(lock_fd)
 
 
