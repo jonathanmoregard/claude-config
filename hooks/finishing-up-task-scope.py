@@ -29,10 +29,13 @@ RALPH_DIR = pathlib.Path(
         pathlib.Path.home() / ".local/state/claude-ralph-loop",
     )
 )
-LOCK_TIMEOUT = 4.0
+LOCK_TIMEOUT = 3.5
+AUTH_TIMEOUT = 0.75
+AUTH_RETRY_INTERVAL = 0.05
 MAX_TRANSCRIPT_TAIL = 2 * 1024 * 1024
 MAX_CLAIM_BYTES = 1024 * 1024
 SESSION_TOKEN = re.compile(r"^[A-Za-z0-9._-]+$")
+INTERACTIVE_PROMPT_SOURCES = frozenset({"typed", "queued", "suggestion_accepted"})
 RESET_PROMPT = re.compile(
     r"^\s*reset\s+dod(?:\s+skill)?\s+to\s+(?:a\s+)?new\s+task\s*:\s*\S[\s\S]*$",
     re.IGNORECASE,
@@ -149,7 +152,7 @@ def claude_prompt_matches(
         message = item.get("message")
         if (
             item.get("type") == "user"
-            and item.get("promptSource") == "typed"
+            and item.get("promptSource") in INTERACTIVE_PROMPT_SOURCES
             and item.get("userType") == "external"
             and item.get("isSidechain") is False
             and isinstance(message, dict)
@@ -238,6 +241,19 @@ def prompt_is_transcript_authenticated(
         return False
 
 
+def wait_for_transcript_authentication(
+    payload: dict[str, object], session: str, prompt_id: str, prompt: str
+) -> bool:
+    """Allow the asynchronously-written runtime transcript a bounded catch-up."""
+    deadline = time.monotonic() + AUTH_TIMEOUT
+    while True:
+        if prompt_is_transcript_authenticated(payload, session, prompt_id, prompt):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(AUTH_RETRY_INTERVAL)
+
+
 def claim_prompt_once(path: pathlib.Path, prompt_id: str) -> bool:
     """Consume one authenticated reset event while task-scope lock is held."""
     try:
@@ -292,7 +308,7 @@ def main() -> int:
     if not isinstance(prompt_id, str) or SESSION_TOKEN.fullmatch(prompt_id) is None:
         context("[dod] Task scope reset refused: prompt id is missing or unsafe.")
         return 0
-    if not prompt_is_transcript_authenticated(payload, session, prompt_id, prompt):
+    if not wait_for_transcript_authentication(payload, session, prompt_id, prompt):
         context(
             "[dod] Task scope reset refused: this event does not match the latest "
             "typed user prompt in a trusted transcript; current scope stays enforced."

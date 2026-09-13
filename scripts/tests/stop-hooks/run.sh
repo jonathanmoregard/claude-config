@@ -120,10 +120,10 @@ scope_run() {  # $1 = complete JSON payload; extra args are env assignments
   printf '%s' "$rc" > "$SCOPE_RCFILE"
   printf '%s' "$out"
 }
-scope_payload() {  # $1 = sid; $2 = prompt; $3 = source
+scope_payload() {  # $1 = sid; $2 = prompt; $3 = source; $4 = promptSource (optional)
   local transcript="$SCOPE_HOME/.claude/projects/test/$1.jsonl"
-  jq -cn --arg sid "$1" --arg prompt "$2" \
-    '{type:"user",sessionId:$sid,promptId:"prompt-test",promptSource:"typed",userType:"external",isSidechain:false,message:{role:"user",content:$prompt}}' \
+  jq -cn --arg sid "$1" --arg prompt "$2" --arg prompt_source "${4:-typed}" \
+    '{type:"user",sessionId:$sid,promptId:"prompt-test",promptSource:$prompt_source,userType:"external",isSidechain:false,message:{role:"user",content:$prompt}}' \
     > "$transcript"
   jq -cn --arg sid "$1" --arg prompt "$2" --arg source "$3" --arg tp "$transcript" \
     '{session_id:$sid,prompt_id:"prompt-test",source:$source,prompt:$prompt,transcript_path:$tp}'
@@ -253,6 +253,32 @@ out=$(scope_run "$(scope_payload "$NATURALSID" \
   'Reset dod skill to new task: investigate task ownership' user)")
 ck "the motivating natural directive resets too" "gone" \
   "$([ -e "$SD/$NATURALSID.arm" ] && echo kept || echo gone)"
+
+QUEUEDSID="scope-queued-$RANDOM"
+printf '%s\n' "$BREPO" > "$SD/$QUEUEDSID.arm"
+out=$(scope_run "$(scope_payload "$QUEUEDSID" \
+  'Reset DoD to new task: queued human boundary' user queued)")
+ck "a queued external user directive resets too" "gone" \
+  "$([ -e "$SD/$QUEUEDSID.arm" ] && echo kept || echo gone)"
+
+LAGSID="scope-lag-$RANDOM"
+printf '%s\n' "$BREPO" > "$SD/$LAGSID.arm"
+lag_prompt='Reset DoD to new task: transcript catches up'
+lag_transcript="$SCOPE_HOME/.claude/projects/test/$LAGSID.jsonl"
+lag_payload=$(jq -cn --arg sid "$LAGSID" --arg prompt "$lag_prompt" \
+  --arg tp "$lag_transcript" \
+  '{session_id:$sid,prompt_id:"prompt-lag",source:"user",prompt:$prompt,transcript_path:$tp}')
+(
+  sleep 0.2
+  jq -cn --arg sid "$LAGSID" --arg prompt "$lag_prompt" \
+    '{type:"user",sessionId:$sid,promptId:"prompt-lag",promptSource:"typed",userType:"external",isSidechain:false,message:{role:"user",content:$prompt}}' \
+    > "$lag_transcript"
+) &
+lag_writer=$!
+out=$(scope_run "$lag_payload")
+wait "$lag_writer"
+ck "a briefly lagging runtime transcript still authenticates" "gone" \
+  "$([ -e "$SD/$LAGSID.arm" ] && echo kept || echo gone)"
 
 no_reset() {  # $1 label; $2 prompt; $3 source
   local label="$1" prompt="$2" source="$3" sid out
@@ -895,6 +921,10 @@ OLD=$(( $(date +%s) - 30*86400 ))
 : > "$SD/deadsession.resets"
 touch -d "@$OLD" "$SD/deadsession.arm" "$SD/deadsession.blocks" \
   "$SD/deadsession.resets"
+LIVECLAIMSID="live-claim-$RANDOM"
+printf '%s\n' "$BREPO" > "$SD/$LIVECLAIMSID.arm"
+: > "$SD/$LIVECLAIMSID.resets"
+touch -d "@$OLD" "$SD/$LIVECLAIMSID.resets"
 printf '%s\n' "$BREPO" > "$SD/fresh-other.arm"
 LOGSIZE_BEFORE=$(wc -c < "$SD/gate.log" 2>/dev/null || echo 0)
 
@@ -902,7 +932,9 @@ printf '{"session_id":"%s"}' "$SID" | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE"
 
 ck "a 30-day-old armfile is reaped"      "gone" "$([ -e "$SD/deadsession.arm" ] && echo kept || echo gone)"
 ck "its orphaned .blocks goes too"       "gone" "$([ -e "$SD/deadsession.blocks" ] && echo kept || echo gone)"
-ck "its consumed reset ids go too"       "gone" "$([ -e "$SD/deadsession.resets" ] && echo kept || echo gone)"
+ck "consumed reset ids remain durable"   "kept" "$([ -e "$SD/deadsession.resets" ] && echo kept || echo gone)"
+ck "an old reset claim beside a fresh arm survives" "kept" \
+  "$([ -e "$SD/$LIVECLAIMSID.resets" ] && echo kept || echo gone)"
 ck "a fresh armfile survives"            "kept" "$([ -e "$SD/fresh-other.arm" ] && echo kept || echo gone)"
 ck "the reaping session keeps its own"   "kept" "$([ -e "$SD/$SID.arm" ] && echo kept || echo gone)"
 ck "gate.log is never reaped"            "kept" "$([ -e "$SD/gate.log" ] && echo kept || echo gone)"

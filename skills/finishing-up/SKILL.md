@@ -28,15 +28,16 @@ abandon, or delete repository work.
 Never invoke the task-scope hook yourself or edit its runtime state to escape a
 checker result. Generic “new task”, “next”, continuation, correction, status,
 compaction, and quota-pause prompts remain inside the existing scope. Only a
-runtime user event whose session id, prompt id, and text match the latest typed
-prompt in a trusted Claude or Codex transcript can reset it. Each event is
+runtime user event whose session id, prompt id, and text match the latest
+interactive prompt in a trusted Claude or Codex transcript can reset it. Typed,
+queued, and accepted-suggestion input are interactive. Each event is
 consumed once; synthetic, source-less, untrusted-path, mismatch, and replay
 events fail closed. Other sessions are unaffected.
 
 Reset is refused while Ralph owns the session. `UserPromptSubmit` does not
-expose generic background-task ownership, so typed user authority defines that
-boundary. Any repository edit that lands after a successful reset arms the new
-task normally, including edits from a worker that outlives the boundary.
+expose generic background-task ownership, so interactive user authority defines
+that boundary. Any repository edit that lands after a successful reset arms the
+new task normally, including edits from a worker that outlives the boundary.
 
 ## Step 1 — Select the outcome
 

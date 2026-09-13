@@ -38,8 +38,9 @@ terminal outcomes unchanged.
   non-user sources leave state untouched.
 - [ ] Prove another session's arm/count state remains untouched.
 - [ ] Prove a live Ralph owner refuses reset and leaves state untouched.
-- [ ] Prove untrusted transcripts, transcript mismatches, and prompt-id replays
-  leave state untouched; prove both Claude and Codex transcript shapes.
+- [ ] Prove typed and queued user prompts plus both Claude and Codex transcript
+  shapes; prove untrusted transcripts, mismatches, and prompt-id replays leave
+  state untouched, and bounded retry tolerates asynchronous transcript writes.
 - [ ] Prove reset waits on `.task-scope.lock` rather than racing through it.
 - [ ] Prove arm hook also waits on the stable lock, then records its repo.
 - [ ] Run focused suite and record expected RED failures from missing hook and
@@ -56,17 +57,19 @@ terminal outcomes unchanged.
 - [ ] Parse JSON defensively; allow only a plain session token and exact
   beginning-anchored reset syntax with non-empty task description.
 - [ ] Accept only exact `source: user`, then authenticate session, prompt id,
-  and prompt text against the latest typed user event in a trusted runtime
-  transcript; source-less, known non-user, mismatch, and replay payloads fail
-  closed.
+  and prompt text against the latest interactive user event in a trusted
+  runtime transcript; accept Claude's typed, queued, and accepted-suggestion
+  inputs, tolerate bounded transcript lag, and fail closed on source-less,
+  known non-user, mismatch, and replay payloads.
 - [ ] Refuse a live Ralph state file. Do not claim generic background-task
   detection because `UserPromptSubmit` does not expose that Stop-only field.
 - [ ] Create state directory safely and acquire `.task-scope.lock` with a
   bounded wait.
 - [ ] Read/de-duplicate current arm repositories and append a bounded,
   prompt-free audit record using one `O_APPEND` write.
-- [ ] Consume authenticated prompt ids once under the stable lock, and age-reap
-  those claims with other abandoned per-session DoD state.
+- [ ] Consume authenticated prompt ids once under the stable lock. Keep this
+  bounded claim ledger durable because the source transcript outlives arm state
+  and deleting a claim would reopen replay.
 - [ ] Reset `.blocks` before `.arm`; keep old arm active on any failure and emit
   visible `UserPromptSubmit` context.
 - [ ] Emit concise success context; do not create an armfile for a read-only new

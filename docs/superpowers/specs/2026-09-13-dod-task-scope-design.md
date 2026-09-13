@@ -54,8 +54,10 @@ description. Generic phrases such as “new task”, “what is next?”, and
 
 The hook acts only on `UserPromptSubmit` and requires exact `source: user`, but
 does not treat that caller-supplied field as authentication. It also requires
-the session id, prompt id, and prompt text to match the latest typed external
-user event in a transcript under the Claude or Codex runtime transcript root.
+the session id, prompt id, and prompt text to match the latest interactive
+external user event in a transcript under the Claude or Codex runtime
+transcript root. Claude's `typed`, `queued`, and `suggestion_accepted` sources
+all represent runtime-confirmed interactive input.
 Known synthetic sources, source-less legacy payloads, untrusted transcript
 paths, mismatches, and replays are ignored. Logging hooks may accept
 source-less events for compatibility; an enforcement reset fails closed when
@@ -67,8 +69,9 @@ Add `hooks/finishing-up-task-scope.py` as a `UserPromptSubmit` hook. On an
 accepted directive it:
 
 1. validates the session token, prompt token, and task description;
-2. proves the exact prompt is the latest typed user event in the calling
-   session's trusted Claude or Codex transcript;
+2. proves the exact prompt is the latest interactive user event in the calling
+   session's trusted Claude or Codex transcript, with a bounded retry because
+   transcript writes are asynchronous;
 3. refuses the transition if Ralph's live `<session>.md` ownership record
    exists;
 4. takes a stable `$CLAUDE_DOD_STATE_DIR/.task-scope.lock` advisory lock;
@@ -83,7 +86,8 @@ Resetting the counter first is fail-closed. If counter removal fails, active
 scope remains untouched. If arm removal then fails, old scope remains active
 with a fresh retry budget. Any failure emits additional context and leaves the
 agent aware that the task boundary did not take effect. Consumed reset ids are
-age-reaped with the session's other DoD state.
+a bounded durable enforcement ledger and are not age-reaped: deleting one
+would make its still-present transcript event replayable.
 
 `finishing-up-arm.sh` takes the same stable lock around its existing locked
 set append. Thus an edit is wholly before or after reset, never erased by a
@@ -102,7 +106,7 @@ the loop first, keeping one driver and one task boundary.
 
 `UserPromptSubmit` does not report background task ownership, so this hook does
 not claim it can identify generic live workers. Instead, the user controls the
-boundary explicitly: ordinary prompts never reset it, one typed reset event is
+boundary explicitly: ordinary prompts never reset it, one interactive reset event is
 usable only once, and any later repository edit runs the arm hook and joins the
 active scope. Explicit user reset can retire already-landed work, but it cannot
 stop subsequent work from re-arming. Ralph remains the stronger case because
@@ -126,8 +130,9 @@ session's state. Claude source reaches Codex through existing sync.
 ## Verification
 
 - Parser cases for canonical and motivating syntax, required description,
-  anchoring, case handling, explicit machine sources, transcript mismatches,
-  untrusted transcript paths, and replayed prompt ids.
+  anchoring, case handling, typed/queued interactive sources, explicit machine
+  sources, transcript lag and mismatches, untrusted transcript paths, and
+  replayed prompt ids.
 - State cases proving current session arm/count reset, deduplicated audit,
   other-session isolation, empty-state idempotence, and visible failures.
 - Ralph ownership case proving reset refusal and unchanged state.
