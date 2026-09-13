@@ -32,7 +32,8 @@ ARMWORK=$(mktemp -d -p "$HOME" .dod-armtest.XXXXXX)
 trap 'rm -rf "$SD" "$ARMWORK"' EXIT  # arftl-allow: destructive-shell — both are this run's own mktemp -d
 export CLAUDE_RALPH_STATE_DIR="$SD/ralph"
 mkdir -p "$CLAUDE_RALPH_STATE_DIR"
-GATE="${GATE_UNDER_TEST:-$HOME/.claude/hooks/finishing-up-gate.py}"
+TEST_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd -P)
+GATE="${GATE_UNDER_TEST:-$TEST_ROOT/hooks/finishing-up-gate.py}"
 UNDER_TEST_ROOT=$(cd "$(dirname "$GATE")/.." && pwd -P)
 SCOPE_HOOK="${SCOPE_HOOK_UNDER_TEST:-$UNDER_TEST_ROOT/hooks/finishing-up-task-scope.py}"
 ARMHOOK="${ARM_HOOK_UNDER_TEST:-$UNDER_TEST_ROOT/hooks/finishing-up-arm.sh}"
@@ -1135,7 +1136,7 @@ printf '{"session_id":"%s","tool_input":{"file_path":"%s/a.txt"}}' \
 SCOPEARMPID=$!
 sleep 1
 ck "arming waits while task-scope lock is held" "0" \
-   "$(wc -l < "$SD/$SCOPEARMSID.arm" 2>/dev/null || echo 0)"
+   "$([ -e "$SD/$SCOPEARMSID.arm" ] && wc -l < "$SD/$SCOPEARMSID.arm" || echo 0)"
 wait "$SCOPEARMLOCKPID" "$SCOPEARMPID" 2>/dev/null
 ck "  ...then records the edited repo" "1" \
    "$(wc -l < "$SD/$SCOPEARMSID.arm")"

@@ -90,6 +90,26 @@ mkdir -p "$STATE_DIR" 2>/dev/null || {
   echo "⚠️  finishing-up-arm: cannot create $STATE_DIR — no session will arm, so the definition-of-done gate will never run" >&2
   exit 1
 }
+
+# Task reset and repository arming must be one ordered state transition. Without
+# this stable lock, an explicit UserPromptSubmit reset can read the old armfile,
+# this hook can append a newly landed edit, and reset can then unlink both — the
+# exact long-running-work escape task scoping must not create. The lock is
+# state-directory-wide so it survives armfile deletion and contains no task
+# data. Waiting is bounded below both hooks' registered five-second slots.
+if ! command -v flock >/dev/null 2>&1; then
+  echo "⚠️  finishing-up-arm: flock is not on PATH — $root was NOT recorded, so the definition-of-done gate cannot check this edit" >&2
+  exit 1
+fi
+scope_lock="$STATE_DIR/.task-scope.lock"
+exec 8>>"$scope_lock" || {
+  echo "⚠️  finishing-up-arm: cannot open task-scope lock $scope_lock — $root was NOT recorded, so the definition-of-done gate cannot check this edit" >&2
+  exit 1
+}
+if ! flock -w 4 8; then
+  echo "⚠️  finishing-up-arm: task-scope lock stayed busy — $root was NOT recorded, so the definition-of-done gate cannot check this edit" >&2
+  exit 1
+fi
 armfile="$STATE_DIR/$session.arm"
 
 # One line per repo, de-duplicated. A session may legitimately touch several.
