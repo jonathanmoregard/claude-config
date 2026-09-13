@@ -457,6 +457,24 @@ def legacy_tracker_problem(session, repos):
         )
 
 
+def completed_tracker_paths(session):
+    """Find legacy paths already released by exact deploy + smoke evidence.
+
+    This is deliberately read-only and fail-closed: absent, busy, or corrupt
+    tracker state skips nothing, leaving the ordinary legacy measurement to
+    name the problem.
+    """
+    if os.environ.get("CLAUDE_DOD_LEGACY_TRACKER", "1") == "0":
+        return set()
+    try:
+        from finishing_up_state import Store
+
+        with Store(readonly=True, timeout=0.25) as store:
+            return store.completed_paths(session)
+    except Exception:
+        return set()
+
+
 def main():
     # The four paths below all end the turn without checking anything, because
     # without a usable session id there is no armfile to look up and therefore
@@ -699,6 +717,23 @@ def main():
               f"failed. Run `python3 {DOD} --repo <repo>` for the repositories "
               f"you touched and report what it says.",
               session, why="armfile empty, NOTHING WAS CHECKED")
+
+    # Loaded sessions retain legacy arm entries after the durable tracker has
+    # proved exact deployment + smoke and released a target. That worktree may
+    # then be safely removed. Measuring the removed path first turned success
+    # back into an irrecoverable FileNotFoundError. Skip only exact paths from
+    # inactive COMPLETE targets in this same session. Any tracker read failure
+    # returns no paths, so missing evidence can never bypass measurement.
+    completed_paths = completed_tracker_paths(session)
+    if completed_paths:
+        skipped = [repo for repo in repos if repo in completed_paths]
+        repos = [repo for repo in repos if repo not in completed_paths]
+        for repo in skipped:
+            log(session, {
+                "action": "note",
+                "why": f"{repo}: legacy measurement released by completed "
+                       "deployment target",
+            })
 
     problems = []
     problem_repos = []

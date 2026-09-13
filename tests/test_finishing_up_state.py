@@ -93,6 +93,26 @@ class RegistryTests(RepoFixture):
         self.assertEqual(first["id"], second["id"])
         self.assertEqual(1, len(store.active_targets("session-1")))
 
+    def test_corrupt_complete_row_cannot_release_legacy_target(self) -> None:
+        store = Store()
+        target = store.upsert_target("session-1", self.repo)
+        store.db.execute(
+            "UPDATE targets SET phase='COMPLETE',active=0,completed_at=?,"
+            "completion_reason=?,merge_sha=? WHERE id=?",
+            (
+                "2026-09-13T00:00:00+00:00",
+                "forged completion without deployment evidence",
+                "d" * 40,
+                target["id"],
+            ),
+        )
+        store.db.commit()
+
+        self.assertEqual(set(), store.completed_paths("session-1"))
+        imported = store.import_legacy_target("session-1", self.repo)
+        self.assertIsNotNone(imported)
+        self.assertEqual(1, imported["active"])
+
     def test_remote_credentials_are_never_persisted(self) -> None:
         run(
             "git",
