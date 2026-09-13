@@ -426,6 +426,37 @@ def run_dod(repo, timeout=DOD_TIMEOUT):
     return parsed, None
 
 
+def legacy_tracker_problem(session, repos):
+    """Keep already-loaded Stop hooks from releasing at merge-only DONE.
+
+    New sessions do not register this gate. Old sessions still invoke this
+    deployed file, so their clean legacy verdict must import/consult durable
+    deployment state. Test harnesses may disable this compatibility branch;
+    production defaults on.
+    """
+    if os.environ.get("CLAUDE_DOD_LEGACY_TRACKER", "1") == "0":
+        return None
+    try:
+        from finishing_up_state import Store, render_informer
+
+        with Store() as store:
+            for repo in repos:
+                store.import_legacy_target(session, repo)
+            targets = store.active_targets(session)
+        if not targets:
+            return None
+        return (
+            "Deployment verification remains active for this loaded session. "
+            "A clean/merged checkout is not completion:\n" + render_informer(targets)
+        )
+    except Exception as exc:
+        return (
+            "Deployment tracker could not be consulted "
+            f"({type(exc).__name__}: {str(exc)[:160]}). Treat deployment as "
+            "unverified; do not release this loaded-session gate."
+        )
+
+
 def main():
     # The four paths below all end the turn without checking anything, because
     # without a usable session id there is no armfile to look up and therefore
@@ -765,6 +796,12 @@ def main():
             lines = ["  (dod-check reported not-done but listed no blockers)"]
         problem_repos.append(repo)
         problems.append(f"{repo}:\n" + "\n".join(lines))
+
+    if not problems:
+        tracker_problem = legacy_tracker_problem(session, repos)
+        if tracker_problem:
+            problem_repos.extend(repos)
+            problems.append(tracker_problem)
 
     if not problems:
         # THE ARMFILE SURVIVES A CLEAN PASS. It used to be unlinked here, and

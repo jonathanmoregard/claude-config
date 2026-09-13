@@ -471,16 +471,6 @@
             "timeout": 30
           }
         ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 $HOME/.claude/hooks/finishing-up-gate.py",
-            "timeout": 60,
-            "statusMessage": "Checking definition of done..."
-          }
-        ]
       }
     ],
     "SubagentStop": [
@@ -497,6 +487,11 @@
       {
         "matcher": "",
         "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/hooks/finishing-up-informer.py",
+            "timeout": 1
+          },
           {
             "type": "command",
             "command": "python3 $HOME/.claude/hooks/finishing-up-task-scope.py",
