@@ -34,6 +34,8 @@ export CLAUDE_RALPH_STATE_DIR="$SD/ralph"
 mkdir -p "$CLAUDE_RALPH_STATE_DIR"
 GATE="${GATE_UNDER_TEST:-$HOME/.claude/hooks/finishing-up-gate.py}"
 UNDER_TEST_ROOT=$(cd "$(dirname "$GATE")/.." && pwd -P)
+SCOPE_HOOK="${SCOPE_HOOK_UNDER_TEST:-$UNDER_TEST_ROOT/hooks/finishing-up-task-scope.py}"
+ARMHOOK="${ARM_HOOK_UNDER_TEST:-$UNDER_TEST_ROOT/hooks/finishing-up-arm.sh}"
 RALPH_HOOK="$UNDER_TEST_ROOT/hooks/ralph-loop-stop.sh"
 RALPH_TEST_HOME="$SD/ralph-home"
 mkdir -p "$RALPH_TEST_HOME/.claude/hooks" "$RALPH_TEST_HOME/.claude/scripts"
@@ -101,6 +103,27 @@ payload_run() {  # $1 = complete JSON payload; extra args are env assignments
   printf '%s' "$rc" > "$RCFILE"
   printf '%s' "$out"
 }
+SCOPE_RCFILE="$SD/.last-scope-rc"
+printf '0' > "$SCOPE_RCFILE"
+scope_rc() { cat "$SCOPE_RCFILE" 2>/dev/null || printf 'no-rc-recorded'; }
+scope_run() {  # $1 = complete JSON payload; extra args are env assignments
+  local payload="$1"; shift
+  local out rc
+  out=$(printf '%s' "$payload" \
+        | env CLAUDE_DOD_STATE_DIR="$SD" CLAUDE_RALPH_STATE_DIR="$CLAUDE_RALPH_STATE_DIR" \
+              "$@" python3 "$SCOPE_HOOK" 2>/dev/null)
+  rc=$?
+  printf '%s' "$rc" > "$SCOPE_RCFILE"
+  printf '%s' "$out"
+}
+scope_payload() {  # $1 = sid; $2 = prompt; $3 = source
+  jq -cn --arg sid "$1" --arg prompt "$2" --arg source "$3" \
+    '{session_id:$sid,prompt_id:"prompt-test",source:$source,prompt:$prompt}'
+}
+scope_context() {
+  printf '%s' "$1" | jq -r \
+    '.hookSpecificOutput.additionalContext // .additionalContext // ""' 2>/dev/null
+}
 ralph_under_test() {
   HOME="$RALPH_TEST_HOME" bash "$RALPH_HOOK"
 }
@@ -140,6 +163,91 @@ ck "  ...and a crash is distinguishable" "1" "$rc"
 
 out=$(printf '{"session_id":"%s"}' "$SID" | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE")
 ck "blocks again once the loop is gone" "block" "$(decision "$out")"
+
+echo
+echo "== dod scope: only an explicit user task boundary resets state =="
+SCOPESID="scope-$RANDOM"
+OTHERSID="scope-other-$RANDOM"
+printf '%s\n%s\n' "$BREPO" "$BREPO" > "$SD/$SCOPESID.arm"
+echo 4 > "$SD/$SCOPESID.blocks"
+printf '%s\n' "$SD/other-repo" > "$SD/$OTHERSID.arm"
+echo 2 > "$SD/$OTHERSID.blocks"
+out=$(scope_run "$(scope_payload "$SCOPESID" \
+  'Reset DoD to new task: fix stale task scope' user)")
+ck "an explicit user task boundary exits cleanly" "0" "$(scope_rc)"
+ck "  ...retires the current session arm" "gone" \
+  "$([ -e "$SD/$SCOPESID.arm" ] && echo kept || echo gone)"
+ck "  ...resets the current session block budget" "gone" \
+  "$([ -e "$SD/$SCOPESID.blocks" ] && echo kept || echo gone)"
+ck "  ...leaves another session's arm alone" "kept" \
+  "$([ -e "$SD/$OTHERSID.arm" ] && echo kept || echo gone)"
+ck "  ...leaves another session's budget alone" "kept" \
+  "$([ -e "$SD/$OTHERSID.blocks" ] && echo kept || echo gone)"
+case "$(scope_context "$out")" in *"1 repository"*) r=told ;; *) r="$out" ;; esac
+ck "  ...tells the agent what boundary was applied" "told" "$r"
+audit_repos=$(jq -s --arg sid "$SCOPESID" \
+  '[.[] | select(.session == $sid and .action == "task-reset")] | last | .repos | length' \
+  "$SD/gate.log" 2>/dev/null)
+ck "  ...audits the de-duplicated retired repo set" "1" "$audit_repos"
+
+NATURALSID="scope-natural-$RANDOM"
+printf '%s\n' "$BREPO" > "$SD/$NATURALSID.arm"
+out=$(scope_run "$(scope_payload "$NATURALSID" \
+  'Reset dod skill to new task: investigate task ownership' user)")
+ck "the motivating natural directive resets too" "gone" \
+  "$([ -e "$SD/$NATURALSID.arm" ] && echo kept || echo gone)"
+
+no_reset() {  # $1 label; $2 prompt; $3 source
+  local label="$1" prompt="$2" source="$3" sid out
+  sid="scope-no-$RANDOM"
+  printf '%s\n' "$BREPO" > "$SD/$sid.arm"
+  echo 3 > "$SD/$sid.blocks"
+  out=$(scope_run "$(scope_payload "$sid" "$prompt" "$source")")
+  ck "$label leaves arm active" "kept" \
+    "$([ -e "$SD/$sid.arm" ] && echo kept || echo gone)"
+  ck "  ...and leaves its retry budget active" "kept" \
+    "$([ -e "$SD/$sid.blocks" ] && echo kept || echo gone)"
+  ck "  ...without hook failure" "0" "$(scope_rc)"
+  rm -f "$SD/$sid.arm" "$SD/$sid.blocks"
+}
+no_reset "an ordinary continuation" "continue with the same work" user
+no_reset "an empty task description" "Reset DoD to new task:" user
+no_reset "a reset phrase buried mid-prompt" \
+  "Could you maybe Reset DoD to new task: something else" user
+no_reset "a machine-generated reset-shaped prompt" \
+  "Reset DoD to new task: synthetic wake" synthetic
+
+RALPHSID="scope-ralph-$RANDOM"
+printf '%s\n' "$BREPO" > "$SD/$RALPHSID.arm"
+echo 5 > "$SD/$RALPHSID.blocks"
+printf -- '---\nactive: true\niteration: 2\nmax_iterations: 25\n---\nprompt\n' \
+  > "$CLAUDE_RALPH_STATE_DIR/$RALPHSID.md"
+out=$(scope_run "$(scope_payload "$RALPHSID" \
+  'Reset DoD to new task: interrupt the running loop' user)")
+ck "a live Ralph owner keeps its arm" "kept" \
+  "$([ -e "$SD/$RALPHSID.arm" ] && echo kept || echo gone)"
+ck "  ...keeps its retry budget" "kept" \
+  "$([ -e "$SD/$RALPHSID.blocks" ] && echo kept || echo gone)"
+case "$(scope_context "$out")" in *Ralph*) r=told ;; *) r="$out" ;; esac
+ck "  ...and tells the agent why reset was refused" "told" "$r"
+rm -f "$CLAUDE_RALPH_STATE_DIR/$RALPHSID.md" \
+  "$SD/$RALPHSID.arm" "$SD/$RALPHSID.blocks"
+
+LOCKSID="scope-lock-$RANDOM"
+printf '%s\n' "$BREPO" > "$SD/$LOCKSID.arm"
+flock "$SD/.task-scope.lock" sleep 3 &
+SCOPELOCKPID=$!
+sleep 0.2
+( scope_run "$(scope_payload "$LOCKSID" \
+    'Reset DoD to new task: serialized reset' user)" > "$SD/scope-lock.out" ) &
+SCOPERESETPID=$!
+sleep 1
+ck "reset waits while task-scope lock is held" "kept" \
+  "$([ -e "$SD/$LOCKSID.arm" ] && echo kept || echo gone)"
+wait "$SCOPELOCKPID" "$SCOPERESETPID" 2>/dev/null
+ck "  ...then retires the old scope" "gone" \
+  "$([ -e "$SD/$LOCKSID.arm" ] && echo kept || echo gone)"
+rm -f "$SD/$OTHERSID.arm" "$SD/$OTHERSID.blocks"
 
 echo
 echo "== dod gate: bounded explanatory exits =="
@@ -1010,13 +1118,29 @@ ck "  ...and the turn still ends cleanly" "0" "$(gate_rc)"
 rm -f "$SD/$DUPSID.arm" "$SD/$DUPSID.blocks"
 
 # ...and the arm hook must not create the duplicates in the first place.
-ARMHOOK="$HOME/.claude/hooks/finishing-up-arm.sh"
 ( cd "$ARMWORK" || exit 1
   git init -q -b master .; git config user.email t@t; git config user.name t
   echo hi > a.txt; git add -A; git commit -qm init
   git init -q --bare "$SD/armtest-origin.git"; git remote add origin "$SD/armtest-origin.git"
   git push -q -u origin master
   git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/master ) >/dev/null 2>&1
+
+SCOPEARMSID="scope-arm-$RANDOM"
+flock "$SD/.task-scope.lock" sleep 3 &
+SCOPEARMLOCKPID=$!
+sleep 0.2
+printf '{"session_id":"%s","tool_input":{"file_path":"%s/a.txt"}}' \
+  "$SCOPEARMSID" "$ARMWORK" \
+  | CLAUDE_DOD_STATE_DIR="$SD" bash "$ARMHOOK" >/dev/null 2>&1 &
+SCOPEARMPID=$!
+sleep 1
+ck "arming waits while task-scope lock is held" "0" \
+   "$(wc -l < "$SD/$SCOPEARMSID.arm" 2>/dev/null || echo 0)"
+wait "$SCOPEARMLOCKPID" "$SCOPEARMPID" 2>/dev/null
+ck "  ...then records the edited repo" "1" \
+   "$(wc -l < "$SD/$SCOPEARMSID.arm")"
+rm -f "$SD/$SCOPEARMSID.arm"
+
 # Firing twenty of them at once does NOT reproduce this — measured, they
 # serialise on their own git and jq calls and the file comes out with one line
 # either way. A test that green either way asserts nothing, so this drives the
