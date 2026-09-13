@@ -167,7 +167,8 @@ if [ "$branch" != "$default" ]; then
     echo "⚠️  finishing-up-arm: tracker missing at $tracker — legacy protection remains, but branch/deployment informer coverage is reduced" >&2
     exit 1
   fi
-  if ! python3 "$tracker" --json arm --session "$session" --repo "$root" >/dev/null; then
+  if ! python3 "$tracker" --db-timeout 0.25 --json arm \
+    --session "$session" --repo "$root" >/dev/null; then
     echo "⚠️  finishing-up-arm: tracker could not record $root — legacy protection remains, but branch/deployment informer coverage is reduced" >&2
     exit 1
   fi

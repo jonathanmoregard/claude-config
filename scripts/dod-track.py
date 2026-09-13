@@ -27,6 +27,7 @@ def parser() -> argparse.ArgumentParser:
         description="Track PR readiness, merge, deployment, and production smoke"
     )
     result.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    result.add_argument("--db-timeout", type=float, default=None, help=argparse.SUPPRESS)
     commands = result.add_subparsers(dest="command", required=True)
 
     arm = commands.add_parser("arm", help="upsert branch target from a git path")
@@ -111,7 +112,7 @@ def handoff_text(row: dict) -> str:
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
-        with Store() as store:
+        with Store(timeout=args.db_timeout) as store:
             if args.command == "arm":
                 value = store.upsert_target(args.session, args.repo)
             elif args.command == "list":

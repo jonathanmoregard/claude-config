@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import fcntl
 import json
 import os
 import pathlib
@@ -119,6 +120,27 @@ class RegistryTests(RepoFixture):
         Store()
         self.assertEqual(0o700, stat.S_IMODE(self.state.stat().st_mode))
         self.assertEqual(0o600, stat.S_IMODE((self.state / "state.sqlite3").stat().st_mode))
+
+    def test_symlinked_state_database_is_refused(self) -> None:
+        self.state.mkdir(mode=0o700)
+        target = self.base / "not-the-state-database"
+        target.write_text("do not overwrite\n", encoding="utf-8")
+        (self.state / "state.sqlite3").symlink_to(target)
+        with self.assertRaises(StateError):
+            Store()
+        self.assertEqual("do not overwrite\n", target.read_text(encoding="utf-8"))
+
+    def test_initialization_lock_obeys_writer_timeout(self) -> None:
+        self.state.mkdir(mode=0o700)
+        lock_fd = os.open(self.state / ".state-init.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        started = time.monotonic()
+        try:
+            with self.assertRaises(StateError):
+                Store(timeout=0.05)
+        finally:
+            os.close(lock_fd)
+        self.assertLess(time.monotonic() - started, 0.5)
 
     def test_concurrent_branch_upserts_preserve_both_targets(self) -> None:
         sibling = self.base / "sibling"
@@ -250,6 +272,36 @@ class LifecycleTests(RepoFixture):
             ),
         )
         self.assertEqual("INCONCLUSIVE", row["phase"])
+
+    def test_refresh_uses_current_post_commit_head(self) -> None:
+        store = Store()
+        target = store.upsert_target("session-1", self.repo)
+        old_head = target["head_sha"]
+        (self.repo / "tracked.txt").write_text("changed\n", encoding="utf-8")
+        run("git", "add", "tracked.txt", cwd=self.repo)
+        run("git", "commit", "-qm", "change", cwd=self.repo)
+        run("git", "push", "-q", "-u", "origin", "feature-a", cwd=self.repo)
+        current_head = run("git", "rev-parse", "HEAD", cwd=self.repo)
+
+        row = store.refresh_target(target["id"], runner=self._local_runner())
+        self.assertNotEqual(old_head, current_head)
+        self.assertEqual(current_head, row["head_sha"])
+        self.assertEqual("READY_FOR_REVIEW", row["phase"])
+
+    def test_pr_url_credentials_and_query_are_not_persisted(self) -> None:
+        store = Store()
+        target = store.upsert_target("session-1", self.repo)
+        measurement = json.loads(self._ready())
+        measurement["pr"]["url"] = (
+            "https://alice:secret@github.com/example/project/pull/48?token=leak"
+        )
+        row = store.refresh_target(
+            target["id"], runner=self._local_runner(json.dumps(measurement))
+        )
+        self.assertEqual(
+            "https://github.com/example/project/pull/48", row["pr_url"]
+        )
+        self.assertNotIn("secret", repr(row))
 
     def test_handoff_freezes_reviewed_head_and_commands(self) -> None:
         store = Store()
@@ -456,6 +508,33 @@ class LifecycleTests(RepoFixture):
         row = store.verify_target(target["id"], runner=runner)
         self.assertEqual("INCONCLUSIVE", row["phase"])
         self.assertEqual("INCONCLUSIVE", row["environments"][0]["deploy_status"])
+
+    def test_tampered_stored_timeout_is_refused(self) -> None:
+        run(
+            "git",
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/example/project.git",
+            cwd=self.repo,
+        )
+        store = Store()
+        target = store.upsert_target("session-1", self.repo)
+        self._handoff(store, target["id"])
+        store.db.execute(
+            "UPDATE environments SET timeout_seconds=99999 WHERE target_id=?",
+            (target["id"],),
+        )
+        store.db.commit()
+        merged = self._merged_runner()
+
+        def runner(argv, cwd, timeout):
+            if argv[0] == "gh":
+                return merged(argv, cwd, timeout)
+            return self._result(self.MERGE_SHA + "\n")
+
+        with self.assertRaises(StateError):
+            store.verify_target(target["id"], runner=runner)
 
     def test_reset_wins_against_slow_probe_results(self) -> None:
         run(

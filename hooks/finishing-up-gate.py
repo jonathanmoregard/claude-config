@@ -439,7 +439,7 @@ def legacy_tracker_problem(session, repos):
     try:
         from finishing_up_state import Store, render_informer
 
-        with Store() as store:
+        with Store(timeout=0.25) as store:
             for repo in repos:
                 store.import_legacy_target(session, repo)
             targets = store.active_targets(session)

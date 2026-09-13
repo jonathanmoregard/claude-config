@@ -384,7 +384,7 @@ def main() -> int:
         try:
             from finishing_up_state import Store
 
-            with Store() as store:
+            with Store(timeout=0.25) as store:
                 store.retire_session(session, "transcript-authenticated task reset")
         except Exception as exc:
             context(

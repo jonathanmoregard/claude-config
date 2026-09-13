@@ -16,6 +16,7 @@ import pathlib
 import re
 import sqlite3
 import subprocess
+import time
 import urllib.parse
 import uuid
 from dataclasses import dataclass
@@ -79,6 +80,7 @@ def _run(argv: list[str], cwd: pathlib.Path, timeout: float = 10) -> str:
             text=True,
             timeout=timeout,
             check=False,
+            shell=False,
         )
     except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
         raise StateError(f"{argv[0]} could not run: {type(exc).__name__}") from exc
@@ -177,6 +179,18 @@ def state_db() -> pathlib.Path:
     return state_dir() / "state.sqlite3"
 
 
+def _exclusive_flock(fd: int, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError as exc:
+            if time.monotonic() >= deadline:
+                raise StateError("state initialization lock stayed busy") from exc
+            time.sleep(0.01)
+
+
 def run_command(
     argv: list[str], cwd: pathlib.Path | None, timeout: float
 ) -> subprocess.CompletedProcess[str]:
@@ -187,6 +201,7 @@ def run_command(
         text=True,
         timeout=timeout,
         check=False,
+        shell=False,
     )
 
 
@@ -214,6 +229,24 @@ def _github_repo_from_pr_url(value: object) -> str | None:
     if parsed.hostname == "github.com" and len(parts) >= 4 and parts[2] == "pull":
         slug = "/".join(parts[:2])
         return slug if GITHUB_SLUG.fullmatch(slug) else None
+    return None
+
+
+def normalize_pr_url(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    parsed = urllib.parse.urlsplit(value)
+    parts = parsed.path.strip("/").split("/")
+    slug = "/".join(parts[:2])
+    if (
+        parsed.scheme == "https"
+        and parsed.hostname == "github.com"
+        and len(parts) == 4
+        and parts[2] == "pull"
+        and parts[3].isdigit()
+        and GITHUB_SLUG.fullmatch(slug)
+    ):
+        return f"https://github.com/{'/'.join(parts)}"
     return None
 
 
@@ -320,8 +353,11 @@ class Store:
     def __init__(self, *, readonly: bool = False, timeout: float | None = None):
         self.path = state_db()
         self.readonly = readonly
+        write_timeout = 5.0 if timeout is None else timeout
+        if not isinstance(write_timeout, (int, float)) or not 0.01 <= write_timeout <= 30:
+            raise StateError("database timeout is outside safe bounds")
         if readonly:
-            if not self.path.is_file():
+            if self.path.is_symlink() or not self.path.is_file():
                 raise StateError("state database does not exist")
             uri = f"file:{urllib.parse.quote(str(self.path))}?mode=ro"
             self.db = sqlite3.connect(
@@ -334,18 +370,27 @@ class Store:
         else:
             directory = self.path.parent
             directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if directory.is_symlink() or self.path.is_symlink():
+                raise StateError("state paths may not be symbolic links")
             os.chmod(directory, 0o700)
-            init_fd = os.open(directory / ".state-init.lock", os.O_RDWR | os.O_CREAT, 0o600)
+            nofollow = getattr(os, "O_NOFOLLOW", 0)
+            init_fd = os.open(
+                directory / ".state-init.lock",
+                os.O_RDWR | os.O_CREAT | nofollow,
+                0o600,
+            )
             try:
-                fcntl.flock(init_fd, fcntl.LOCK_EX)
-                fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+                _exclusive_flock(init_fd, write_timeout)
+                if self.path.is_symlink():
+                    raise StateError("state database may not be a symbolic link")
+                fd = os.open(self.path, os.O_RDWR | os.O_CREAT | nofollow, 0o600)
                 os.close(fd)
                 os.chmod(self.path, 0o600)
                 self.db = sqlite3.connect(
                     self.path,
-                    timeout=5.0 if timeout is None else timeout,
+                    timeout=write_timeout,
                 )
-                self.db.execute("PRAGMA busy_timeout = 5000")
+                self.db.execute(f"PRAGMA busy_timeout = {max(1, int(write_timeout * 1000))}")
                 self.db.execute("PRAGMA journal_mode = WAL")
                 self.db.execute("PRAGMA synchronous = FULL")
                 self.db.execute("PRAGMA foreign_keys = ON")
@@ -487,6 +532,7 @@ class Store:
     ) -> dict[str, Any]:
         allowed = {
             "github_repo",
+            "head_sha",
             "pr_number",
             "pr_url",
             "pr_head_sha",
@@ -544,6 +590,11 @@ class Store:
             raise StateError("target is not active")
         reviewed = _normal_sha(snapshot.get("reviewed_head_sha"))
         if reviewed and snapshot.get("github_repo") and snapshot.get("pr_number"):
+            if GITHUB_SLUG.fullmatch(str(snapshot["github_repo"])) is None:
+                return self._cas_target(
+                    snapshot,
+                    {"phase": "INCONCLUSIVE", "detail": "stored GitHub repository is invalid"},
+                )
             argv = [
                 "gh",
                 "pr",
@@ -579,7 +630,9 @@ class Store:
             final_head = _normal_sha(pr.get("headRefOid"))
             state = str(pr.get("state") or "").upper()
             common = {
-                "pr_url": _bounded(pr.get("url") or snapshot.get("pr_url") or "", 2048),
+                "pr_url": normalize_pr_url(pr.get("url"))
+                or normalize_pr_url(snapshot.get("pr_url"))
+                or "",
                 "pr_head_sha": final_head,
             }
             if final_head != reviewed:
@@ -641,6 +694,22 @@ class Store:
                     "detail": "worktree disappeared before review handoff",
                 },
             )
+        try:
+            identity = discover_repo(worktree)
+        except StateError as exc:
+            return self._cas_target(
+                snapshot,
+                {"phase": "INCONCLUSIVE", "detail": f"repository identity failed: {exc}"},
+            )
+        if identity.repo_key != snapshot["repo_key"] or identity.branch != snapshot["branch"]:
+            return self._cas_target(
+                snapshot,
+                {
+                    "phase": "INCONCLUSIVE",
+                    "detail": "worktree now resolves to a different repository or branch",
+                },
+            )
+        current_head = identity.head_sha
         checker = dod_check_path or pathlib.Path(__file__).resolve().parents[1] / "scripts/dod-check.py"
         argv = ["python3", str(checker), "--repo", str(worktree), "--json"]
         try:
@@ -652,16 +721,17 @@ class Store:
                 {"phase": "INCONCLUSIVE", "detail": f"readiness refresh failed: {exc}"},
             )
         pr = measurement.get("pr")
-        updates: dict[str, object] = {}
+        updates: dict[str, object] = {"head_sha": current_head}
         if isinstance(pr, dict):
             pr_head = _normal_sha(pr.get("headRefOid"))
+            pr_url = normalize_pr_url(pr.get("url"))
             updates.update(
                 {
                     "pr_number": pr.get("number") if isinstance(pr.get("number"), int) else None,
-                    "pr_url": _bounded(pr.get("url") or "", 2048),
+                    "pr_url": pr_url or "",
                     "pr_head_sha": pr_head,
                     "github_repo": snapshot.get("github_repo")
-                    or _github_repo_from_pr_url(pr.get("url")),
+                    or _github_repo_from_pr_url(pr_url),
                 }
             )
         else:
@@ -684,7 +754,8 @@ class Store:
             and measurement.get("error") in (None, "")
             and isinstance(pr, dict)
             and str(pr.get("state") or "").upper() == "OPEN"
-            and pr_head == snapshot["head_sha"]
+            and pr_head == current_head
+            and pr_url is not None
             and not uncertain
         )
         if ready:
@@ -826,6 +897,8 @@ class Store:
             revision_argv = validate_argv(json.loads(environment["revision_argv"]), "revision argv")
             smoke_argv = validate_argv(json.loads(environment["smoke_argv"]), "smoke argv")
             timeout = int(environment["timeout_seconds"])
+            if not 1 <= timeout <= 600:
+                raise StateError("stored environment timeout is outside safe bounds")
             revision_status, revision_out, revision_err = self._probe(
                 runner,
                 revision_argv,
