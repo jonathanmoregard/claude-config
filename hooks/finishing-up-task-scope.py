@@ -30,6 +30,8 @@ RALPH_DIR = pathlib.Path(
     )
 )
 LOCK_TIMEOUT = 4.0
+MAX_TRANSCRIPT_TAIL = 2 * 1024 * 1024
+MAX_CLAIM_BYTES = 1024 * 1024
 SESSION_TOKEN = re.compile(r"^[A-Za-z0-9._-]+$")
 RESET_PROMPT = re.compile(
     r"^\s*reset\s+dod(?:\s+skill)?\s+to\s+(?:a\s+)?new\s+task\s*:\s*\S[\s\S]*$",
@@ -100,11 +102,167 @@ def acquire_scope_lock() -> int:
             raise
 
 
-def active_background_owner(payload: dict[str, object]) -> str | None:
-    tasks = payload.get("background_tasks")
-    if isinstance(tasks, list) and tasks:
-        return "background work is still running"
-    return None
+def trusted_transcript_path(raw_path: object) -> pathlib.Path | None:
+    """Resolve transcript files only below the two runtime transcript roots."""
+    if not isinstance(raw_path, str) or not raw_path:
+        return None
+    try:
+        path = pathlib.Path(raw_path).resolve(strict=True)
+        roots = (
+            (pathlib.Path.home() / ".claude/projects").resolve(),
+            (pathlib.Path.home() / ".codex/sessions").resolve(),
+        )
+        if not path.is_file() or not any(path.is_relative_to(root) for root in roots):
+            return None
+        return path
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def transcript_tail(path: pathlib.Path) -> list[dict[str, object]]:
+    """Read bounded complete JSONL records from the end of a transcript."""
+    with path.open("rb") as fh:
+        size = fh.seek(0, os.SEEK_END)
+        start = max(0, size - MAX_TRANSCRIPT_TAIL)
+        fh.seek(start)
+        data = fh.read(MAX_TRANSCRIPT_TAIL)
+    if start:
+        newline = data.find(b"\n")
+        data = b"" if newline < 0 else data[newline + 1 :]
+
+    records: list[dict[str, object]] = []
+    for line in data.splitlines():
+        if not line.strip():
+            continue
+        item = json.loads(line)
+        if not isinstance(item, dict):
+            raise ValueError("transcript record is not an object")
+        records.append(item)
+    return records
+
+
+def claude_prompt_matches(
+    records: list[dict[str, object]], session: str, prompt_id: str, prompt: str
+) -> bool:
+    latest: tuple[str, str, str] | None = None
+    for item in records:
+        message = item.get("message")
+        if (
+            item.get("type") == "user"
+            and item.get("promptSource") == "typed"
+            and item.get("userType") == "external"
+            and item.get("isSidechain") is False
+            and isinstance(message, dict)
+            and message.get("role") == "user"
+            and isinstance(message.get("content"), str)
+            and isinstance(item.get("sessionId"), str)
+            and isinstance(item.get("promptId"), str)
+        ):
+            latest = (
+                item["sessionId"],
+                item["promptId"],
+                message["content"],
+            )
+    return latest == (session, prompt_id, prompt)
+
+
+def codex_session_matches(path: pathlib.Path, session: str) -> bool:
+    """Read bounded transcript head to bind Codex file to this session."""
+    with path.open("rb") as fh:
+        head = fh.read(64 * 1024)
+    for line in head.splitlines():
+        if not line.strip():
+            continue
+        item = json.loads(line)
+        if not isinstance(item, dict):
+            raise ValueError("transcript record is not an object")
+        payload = item.get("payload")
+        if item.get("type") == "session_meta" and isinstance(payload, dict):
+            return payload.get("id") == session
+    return False
+
+
+def codex_prompt_matches(
+    records: list[dict[str, object]], prompt_id: str, prompt: str
+) -> bool:
+    latest: tuple[str, str] | None = None
+    candidate: tuple[str, str] | None = None
+    for item in records:
+        payload = item.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        if (
+            item.get("type") == "response_item"
+            and payload.get("type") == "message"
+            and payload.get("role") == "user"
+        ):
+            content = payload.get("content")
+            metadata = payload.get("internal_chat_message_metadata_passthrough")
+            if isinstance(content, list) and isinstance(metadata, dict):
+                parts = [
+                    block.get("text")
+                    for block in content
+                    if isinstance(block, dict)
+                    and block.get("type") == "input_text"
+                    and isinstance(block.get("text"), str)
+                ]
+                turn_id = metadata.get("turn_id")
+                if parts and isinstance(turn_id, str):
+                    candidate = (turn_id, "".join(parts))
+        elif (
+            item.get("type") == "event_msg"
+            and payload.get("type") == "user_message"
+            and isinstance(payload.get("message"), str)
+            and candidate is not None
+            and candidate[1] == payload["message"]
+        ):
+            latest = candidate
+    return latest == (prompt_id, prompt)
+
+
+def prompt_is_transcript_authenticated(
+    payload: dict[str, object], session: str, prompt_id: str, prompt: str
+) -> bool:
+    path = trusted_transcript_path(payload.get("transcript_path"))
+    if path is None:
+        return False
+    try:
+        records = transcript_tail(path)
+        claude_root = (pathlib.Path.home() / ".claude/projects").resolve()
+        if path.is_relative_to(claude_root):
+            return claude_prompt_matches(records, session, prompt_id, prompt)
+        return codex_session_matches(path, session) and codex_prompt_matches(
+            records, prompt_id, prompt
+        )
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def claim_prompt_once(path: pathlib.Path, prompt_id: str) -> bool:
+    """Consume one authenticated reset event while task-scope lock is held."""
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        raw = b""
+    if len(raw) > MAX_CLAIM_BYTES:
+        raise OSError("reset claim state exceeds size limit")
+    try:
+        claimed = raw.decode("ascii").splitlines()
+    except UnicodeDecodeError as exc:
+        raise OSError("reset claim state is malformed") from exc
+    if prompt_id in claimed:
+        return False
+
+    payload = f"{prompt_id}\n".encode("ascii")
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        written = os.write(fd, payload)
+        if written != len(payload):
+            raise OSError(f"short reset claim write ({written}/{len(payload)} bytes)")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return True
 
 
 def main() -> int:
@@ -130,9 +288,15 @@ def main() -> int:
         context("[dod] Task scope reset refused: session id is missing or unsafe.")
         return 0
 
-    owner = active_background_owner(payload)
-    if owner:
-        context(f"[dod] Task scope reset refused: {owner}; current scope stays enforced.")
+    prompt_id = payload.get("prompt_id")
+    if not isinstance(prompt_id, str) or SESSION_TOKEN.fullmatch(prompt_id) is None:
+        context("[dod] Task scope reset refused: prompt id is missing or unsafe.")
+        return 0
+    if not prompt_is_transcript_authenticated(payload, session, prompt_id, prompt):
+        context(
+            "[dod] Task scope reset refused: this event does not match the latest "
+            "typed user prompt in a trusted transcript; current scope stays enforced."
+        )
         return 0
     try:
         if (RALPH_DIR / f"{session}.md").exists():
@@ -160,7 +324,22 @@ def main() -> int:
 
     armfile = STATE_DIR / f"{session}.arm"
     countfile = STATE_DIR / f"{session}.blocks"
+    claimfile = STATE_DIR / f"{session}.resets"
     try:
+        try:
+            if not claim_prompt_once(claimfile, prompt_id):
+                context(
+                    "[dod] Task scope reset refused: this user prompt was already "
+                    "consumed; current scope stays enforced."
+                )
+                return 0
+        except OSError as exc:
+            context(
+                f"[dod] Task scope reset failed: prompt claim could not be "
+                f"recorded ({exc}); current scope stays enforced."
+            )
+            return 0
+
         try:
             lines = armfile.read_text(encoding="utf-8").splitlines()
         except FileNotFoundError:
@@ -173,10 +352,6 @@ def main() -> int:
             return 0
 
         repos = list(dict.fromkeys(line.strip() for line in lines if line.strip()))
-        prompt_id = payload.get("prompt_id")
-        if not isinstance(prompt_id, str):
-            prompt_id = ""
-
         try:
             audit(session, "task-reset-begin", repos, prompt_id)
         except OSError as exc:

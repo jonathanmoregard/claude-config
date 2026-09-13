@@ -106,20 +106,39 @@ payload_run() {  # $1 = complete JSON payload; extra args are env assignments
 }
 SCOPE_RCFILE="$SD/.last-scope-rc"
 printf '0' > "$SCOPE_RCFILE"
+SCOPE_HOME="$SD/scope-home"
+mkdir -p "$SCOPE_HOME/.claude/projects/test" "$SCOPE_HOME/.codex/sessions/2026/09/13"
 scope_rc() { cat "$SCOPE_RCFILE" 2>/dev/null || printf 'no-rc-recorded'; }
 scope_run() {  # $1 = complete JSON payload; extra args are env assignments
   local payload="$1"; shift
   local out rc
   out=$(printf '%s' "$payload" \
-        | env CLAUDE_DOD_STATE_DIR="$SD" CLAUDE_RALPH_STATE_DIR="$CLAUDE_RALPH_STATE_DIR" \
+        | env HOME="$SCOPE_HOME" CLAUDE_DOD_STATE_DIR="$SD" \
+              CLAUDE_RALPH_STATE_DIR="$CLAUDE_RALPH_STATE_DIR" \
               "$@" python3 "$SCOPE_HOOK" 2>/dev/null)
   rc=$?
   printf '%s' "$rc" > "$SCOPE_RCFILE"
   printf '%s' "$out"
 }
 scope_payload() {  # $1 = sid; $2 = prompt; $3 = source
-  jq -cn --arg sid "$1" --arg prompt "$2" --arg source "$3" \
-    '{session_id:$sid,prompt_id:"prompt-test",source:$source,prompt:$prompt}'
+  local transcript="$SCOPE_HOME/.claude/projects/test/$1.jsonl"
+  jq -cn --arg sid "$1" --arg prompt "$2" \
+    '{type:"user",sessionId:$sid,promptId:"prompt-test",promptSource:"typed",userType:"external",isSidechain:false,message:{role:"user",content:$prompt}}' \
+    > "$transcript"
+  jq -cn --arg sid "$1" --arg prompt "$2" --arg source "$3" --arg tp "$transcript" \
+    '{session_id:$sid,prompt_id:"prompt-test",source:$source,prompt:$prompt,transcript_path:$tp}'
+}
+codex_scope_payload() {  # $1 = sid; $2 = prompt
+  local transcript="$SCOPE_HOME/.codex/sessions/2026/09/13/rollout-test-$1.jsonl"
+  jq -cn --arg sid "$1" '{type:"session_meta",payload:{id:$sid}}' > "$transcript"
+  jq -cn --arg prompt "$2" \
+    '{type:"response_item",payload:{type:"message",role:"user",content:[{type:"input_text",text:$prompt}],internal_chat_message_metadata_passthrough:{turn_id:"prompt-codex"}}}' \
+    >> "$transcript"
+  jq -cn --arg prompt "$2" \
+    '{type:"event_msg",payload:{type:"user_message",message:$prompt,images:[]}}' \
+    >> "$transcript"
+  jq -cn --arg sid "$1" --arg prompt "$2" --arg tp "$transcript" \
+    '{session_id:$sid,prompt_id:"prompt-codex",source:"user",prompt:$prompt,transcript_path:$tp}'
 }
 scope_context() {
   printf '%s' "$1" | jq -r \
@@ -173,8 +192,9 @@ printf '%s\n%s\n' "$BREPO" "$BREPO" > "$SD/$SCOPESID.arm"
 echo 4 > "$SD/$SCOPESID.blocks"
 printf '%s\n' "$SD/other-repo" > "$SD/$OTHERSID.arm"
 echo 2 > "$SD/$OTHERSID.blocks"
-out=$(scope_run "$(scope_payload "$SCOPESID" \
-  'Reset DoD to new task: fix stale task scope' user)")
+explicit_payload=$(scope_payload "$SCOPESID" \
+  'Reset DoD to new task: fix stale task scope' user)
+out=$(scope_run "$explicit_payload")
 ck "an explicit user task boundary exits cleanly" "0" "$(scope_rc)"
 ck "  ...retires the current session arm" "gone" \
   "$([ -e "$SD/$SCOPESID.arm" ] && echo kept || echo gone)"
@@ -190,6 +210,42 @@ audit_repos=$(jq -s --arg sid "$SCOPESID" \
   '[.[] | select(.session == $sid and .action == "task-reset")] | last | .repos | length' \
   "$SD/gate.log" 2>/dev/null)
 ck "  ...audits the de-duplicated retired repo set" "1" "$audit_repos"
+
+# `source:user` is caller-supplied JSON, not authentication. A direct Bash call
+# can replay it after a later edit unless the hook proves this exact prompt is
+# the latest typed transcript event and consumes its prompt id once.
+printf '%s\n' "$BREPO" > "$SD/$SCOPESID.arm"
+out=$(scope_run "$explicit_payload")
+ck "the same user prompt cannot be replayed to clear later work" "kept" \
+  "$([ -e "$SD/$SCOPESID.arm" ] && echo kept || echo gone)"
+rm -f "$SD/$SCOPESID.arm" "$SD/$SCOPESID.blocks"
+
+FORGESID="scope-forged-$RANDOM"
+printf '%s\n' "$BREPO" > "$SD/$FORGESID.arm"
+forged=$(jq -cn --arg sid "$FORGESID" --arg tp "$SD/agent-made.jsonl" \
+  '{session_id:$sid,prompt_id:"forged",source:"user",prompt:"Reset DoD to new task: forged direct call",transcript_path:$tp}')
+out=$(scope_run "$forged")
+ck "source:user with an untrusted transcript cannot reset" "kept" \
+  "$([ -e "$SD/$FORGESID.arm" ] && echo kept || echo gone)"
+rm -f "$SD/$FORGESID.arm" "$SD/$FORGESID.blocks"
+
+MISMATCHSID="scope-mismatch-$RANDOM"
+printf '%s\n' "$BREPO" > "$SD/$MISMATCHSID.arm"
+legit=$(scope_payload "$MISMATCHSID" \
+  'Reset DoD to new task: transcript truth' user)
+mismatch=$(jq -c '.prompt = "Reset DoD to new task: forged different prompt"' \
+  <<<"$legit")
+out=$(scope_run "$mismatch")
+ck "source:user cannot contradict the latest typed transcript prompt" "kept" \
+  "$([ -e "$SD/$MISMATCHSID.arm" ] && echo kept || echo gone)"
+rm -f "$SD/$MISMATCHSID.arm" "$SD/$MISMATCHSID.blocks"
+
+CODEXSID="scope-codex-$RANDOM"
+printf '%s\n' "$BREPO" > "$SD/$CODEXSID.arm"
+out=$(scope_run "$(codex_scope_payload "$CODEXSID" \
+  'Reset DoD to new task: Codex transcript proof')")
+ck "a matching Codex user-message event authorizes reset" "gone" \
+  "$([ -e "$SD/$CODEXSID.arm" ] && echo kept || echo gone)"
 
 NATURALSID="scope-natural-$RANDOM"
 printf '%s\n' "$BREPO" > "$SD/$NATURALSID.arm"
@@ -227,17 +283,6 @@ ck "a source-less reset-shaped event fails closed" "kept" \
   "$([ -e "$SD/$SOURCENONESID.arm" ] && echo kept || echo gone)"
 ck "  ...without hook failure" "0" "$(scope_rc)"
 rm -f "$SD/$SOURCENONESID.arm" "$SD/$SOURCENONESID.blocks"
-
-BGSID="scope-background-$RANDOM"
-printf '%s\n' "$BREPO" > "$SD/$BGSID.arm"
-bgpayload=$(jq -cn --arg sid "$BGSID" \
-  '{session_id:$sid,prompt_id:"prompt-bg",source:"user",prompt:"Reset DoD to new task: leave running work",background_tasks:[{"id":"worker"}]}')
-out=$(scope_run "$bgpayload")
-ck "live background work keeps its arm" "kept" \
-  "$([ -e "$SD/$BGSID.arm" ] && echo kept || echo gone)"
-case "$(scope_context "$out")" in *background*) r=told ;; *) r="$out" ;; esac
-ck "  ...and tells the agent why reset was refused" "told" "$r"
-rm -f "$SD/$BGSID.arm" "$SD/$BGSID.blocks"
 
 RALPHSID="scope-ralph-$RANDOM"
 printf '%s\n' "$BREPO" > "$SD/$RALPHSID.arm"
@@ -847,7 +892,9 @@ echo "== reaping abandoned arm state =="
 # deletes its armfile, so the dir grows forever. Reaping is age-based and
 # self-healing: the arm hook rewrites the file on the next edit.
 OLD=$(( $(date +%s) - 30*86400 ))
-touch -d "@$OLD" "$SD/deadsession.arm" "$SD/deadsession.blocks"
+: > "$SD/deadsession.resets"
+touch -d "@$OLD" "$SD/deadsession.arm" "$SD/deadsession.blocks" \
+  "$SD/deadsession.resets"
 printf '%s\n' "$BREPO" > "$SD/fresh-other.arm"
 LOGSIZE_BEFORE=$(wc -c < "$SD/gate.log" 2>/dev/null || echo 0)
 
@@ -855,6 +902,7 @@ printf '{"session_id":"%s"}' "$SID" | CLAUDE_DOD_STATE_DIR="$SD" python3 "$GATE"
 
 ck "a 30-day-old armfile is reaped"      "gone" "$([ -e "$SD/deadsession.arm" ] && echo kept || echo gone)"
 ck "its orphaned .blocks goes too"       "gone" "$([ -e "$SD/deadsession.blocks" ] && echo kept || echo gone)"
+ck "its consumed reset ids go too"       "gone" "$([ -e "$SD/deadsession.resets" ] && echo kept || echo gone)"
 ck "a fresh armfile survives"            "kept" "$([ -e "$SD/fresh-other.arm" ] && echo kept || echo gone)"
 ck "the reaping session keeps its own"   "kept" "$([ -e "$SD/$SID.arm" ] && echo kept || echo gone)"
 ck "gate.log is never reaped"            "kept" "$([ -e "$SD/gate.log" ] && echo kept || echo gone)"

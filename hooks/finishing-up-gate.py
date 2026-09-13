@@ -340,12 +340,12 @@ def allow():
 
 
 def reap(session):
-    """Delete arm/blocks state left behind by sessions that ended blocked.
+    """Delete per-session DoD state left behind by ended sessions.
 
     Runs only for a session that is ALREADY armed, so an ordinary read-only
     session still pays a single file-existence check and never a directory
-    scan. Touches nothing but `*.arm` and `*.blocks` — gate.log is the audit
-    trail and outlives everything here.
+    scan. Touches only `*.arm`, `*.blocks`, and consumed `*.resets` claims —
+    gate.log is the audit trail and outlives everything here.
     """
     if ARM_MAX_AGE_DAYS <= 0:
         return
@@ -356,7 +356,7 @@ def reap(session):
     except OSError:
         return
     for path in entries:
-        if path.suffix not in (".arm", ".blocks"):
+        if path.suffix not in (".arm", ".blocks", ".resets"):
             continue
         if path.stem == session:  # never reap the session doing the reaping
             continue

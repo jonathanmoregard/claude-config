@@ -52,29 +52,38 @@ has the same meaning. Matching is anchored at the beginning and requires the
 description. Generic phrases such as “new task”, “what is next?”, and
 “continue” never reset scope.
 
-The hook acts only on `UserPromptSubmit` and requires exact `source: user`.
-Known synthetic sources and source-less legacy payloads are ignored. Logging
-hooks may accept source-less events for compatibility; an enforcement reset
-must fail closed when human authority is not identified.
+The hook acts only on `UserPromptSubmit` and requires exact `source: user`, but
+does not treat that caller-supplied field as authentication. It also requires
+the session id, prompt id, and prompt text to match the latest typed external
+user event in a transcript under the Claude or Codex runtime transcript root.
+Known synthetic sources, source-less legacy payloads, untrusted transcript
+paths, mismatches, and replays are ignored. Logging hooks may accept
+source-less events for compatibility; an enforcement reset fails closed when
+human authority cannot be tied to the runtime transcript.
 
 ## State transition
 
 Add `hooks/finishing-up-task-scope.py` as a `UserPromptSubmit` hook. On an
 accepted directive it:
 
-1. validates the session token and task description;
-2. refuses the transition if Ralph's live `<session>.md` ownership record
+1. validates the session token, prompt token, and task description;
+2. proves the exact prompt is the latest typed user event in the calling
+   session's trusted Claude or Codex transcript;
+3. refuses the transition if Ralph's live `<session>.md` ownership record
    exists;
-3. takes a stable `$CLAUDE_DOD_STATE_DIR/.task-scope.lock` advisory lock;
-4. reads and de-duplicates current `<session>.arm` repositories;
-5. appends one compact `task-reset` audit record to `gate.log` with session,
-   prompt id, and retired repository paths, but not prompt prose;
-6. unlinks `<session>.blocks` first, then `<session>.arm`.
+4. takes a stable `$CLAUDE_DOD_STATE_DIR/.task-scope.lock` advisory lock;
+5. consumes the prompt id once in `<session>.resets`, so replay cannot clear
+   work armed after the original boundary;
+6. reads and de-duplicates current `<session>.arm` repositories;
+7. appends compact begin/completion records to `gate.log` with session, prompt
+   id, and retired repository paths, but not prompt prose;
+8. unlinks `<session>.blocks` first, then `<session>.arm`.
 
 Resetting the counter first is fail-closed. If counter removal fails, active
 scope remains untouched. If arm removal then fails, old scope remains active
 with a fresh retry budget. Any failure emits additional context and leaves the
-agent aware that the task boundary did not take effect.
+agent aware that the task boundary did not take effect. Consumed reset ids are
+age-reaped with the session's other DoD state.
 
 `finishing-up-arm.sh` takes the same stable lock around its existing locked
 set append. Thus an edit is wholly before or after reset, never erased by a
@@ -91,10 +100,13 @@ Ralph already owns a session through a runtime state file and the Stop gate
 yields to it. Reset refuses while that file exists. User must halt or complete
 the loop first, keeping one driver and one task boundary.
 
-Other background workers have no trusted task identifier. They therefore do
-not receive an exemption: any later repository edit runs the arm hook and joins
-the active scope. Explicit user reset can retire already-landed work, but it
-cannot stop subsequent work from re-arming.
+`UserPromptSubmit` does not report background task ownership, so this hook does
+not claim it can identify generic live workers. Instead, the user controls the
+boundary explicitly: ordinary prompts never reset it, one typed reset event is
+usable only once, and any later repository edit runs the arm hook and joins the
+active scope. Explicit user reset can retire already-landed work, but it cannot
+stop subsequent work from re-arming. Ralph remains the stronger case because
+it has a trusted session ownership record and is refused outright.
 
 ## Options considered
 
@@ -114,10 +126,12 @@ session's state. Claude source reaches Codex through existing sync.
 ## Verification
 
 - Parser cases for canonical and motivating syntax, required description,
-  anchoring, case handling, and explicit machine sources.
+  anchoring, case handling, explicit machine sources, transcript mismatches,
+  untrusted transcript paths, and replayed prompt ids.
 - State cases proving current session arm/count reset, deduplicated audit,
   other-session isolation, empty-state idempotence, and visible failures.
 - Ralph ownership case proving reset refusal and unchanged state.
+- Claude and Codex transcript cases proving exact user-event authentication.
 - Serialization case proving reset waits behind arming's stable lock and cannot
   erase a post-boundary edit.
 - Existing full Stop-hook interaction suite, Python compile, Bash syntax,

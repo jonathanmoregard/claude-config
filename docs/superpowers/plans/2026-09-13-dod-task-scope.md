@@ -9,10 +9,11 @@
 retires stale DoD scope without letting ordinary prompts release long work.
 
 **Architecture:** Add a narrow `UserPromptSubmit` state-transition hook. It
-validates user-originated reset syntax, refuses live Ralph ownership, serializes
-against the existing arm hook through one stable lock, audits retired repos,
-then clears only the calling session's retry and arm files. Keep Stop/checker
-logic and terminal outcomes unchanged.
+validates user-originated reset syntax against the runtime transcript, consumes
+each prompt id once, refuses live Ralph ownership, serializes against the
+existing arm hook through one stable lock, audits retired repos, then clears
+only the calling session's retry and arm files. Keep Stop/checker logic and
+terminal outcomes unchanged.
 
 **Verifier:** `bash scripts/tests/stop-hooks/run.sh`
 
@@ -37,6 +38,8 @@ logic and terminal outcomes unchanged.
   non-user sources leave state untouched.
 - [ ] Prove another session's arm/count state remains untouched.
 - [ ] Prove a live Ralph owner refuses reset and leaves state untouched.
+- [ ] Prove untrusted transcripts, transcript mismatches, and prompt-id replays
+  leave state untouched; prove both Claude and Codex transcript shapes.
 - [ ] Prove reset waits on `.task-scope.lock` rather than racing through it.
 - [ ] Prove arm hook also waits on the stable lock, then records its repo.
 - [ ] Run focused suite and record expected RED failures from missing hook and
@@ -52,13 +55,18 @@ logic and terminal outcomes unchanged.
 
 - [ ] Parse JSON defensively; allow only a plain session token and exact
   beginning-anchored reset syntax with non-empty task description.
-- [ ] Accept only exact `source: user`; source-less and known non-user payloads
-  fail closed.
-- [ ] Refuse non-empty background ownership fields and a live Ralph state file.
+- [ ] Accept only exact `source: user`, then authenticate session, prompt id,
+  and prompt text against the latest typed user event in a trusted runtime
+  transcript; source-less, known non-user, mismatch, and replay payloads fail
+  closed.
+- [ ] Refuse a live Ralph state file. Do not claim generic background-task
+  detection because `UserPromptSubmit` does not expose that Stop-only field.
 - [ ] Create state directory safely and acquire `.task-scope.lock` with a
   bounded wait.
 - [ ] Read/de-duplicate current arm repositories and append a bounded,
   prompt-free audit record using one `O_APPEND` write.
+- [ ] Consume authenticated prompt ids once under the stable lock, and age-reap
+  those claims with other abandoned per-session DoD state.
 - [ ] Reset `.blocks` before `.arm`; keep old arm active on any failure and emit
   visible `UserPromptSubmit` context.
 - [ ] Emit concise success context; do not create an armfile for a read-only new
