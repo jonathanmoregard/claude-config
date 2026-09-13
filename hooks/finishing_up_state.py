@@ -743,7 +743,7 @@ class Store:
                 timeout_seconds,expected_sha,observed_sha,deploy_status,
                 smoke_status,evidence,verified_at)
                 VALUES(?,?,?,?,?,?,?,NULL,NULL,'UNVERIFIED','UNVERIFIED','',NULL)
-                ON CONFLICT(target_id,name) DO UPDATE SET
+                ON CONFLICT(target_id,name) DO UPDATE SET /* arftl-allow: sql-unscoped-delete — conflict-key-scoped upsert */
                 revision_cwd=excluded.revision_cwd,
                 revision_argv=excluded.revision_argv,
                 smoke_cwd=excluded.smoke_cwd,
