@@ -52,11 +52,10 @@ has the same meaning. Matching is anchored at the beginning and requires the
 description. Generic phrases such as “new task”, “what is next?”, and
 “continue” never reset scope.
 
-The hook acts only on `UserPromptSubmit`. A payload whose `source` explicitly
-identifies anything other than `user` is ignored. Source-less legacy payloads
-remain supported because current prompt hooks already use that compatibility
-rule; narrow reset syntax prevents a generic synthetic notification from
-matching accidentally.
+The hook acts only on `UserPromptSubmit` and requires exact `source: user`.
+Known synthetic sources and source-less legacy payloads are ignored. Logging
+hooks may accept source-less events for compatibility; an enforcement reset
+must fail closed when human authority is not identified.
 
 ## State transition
 

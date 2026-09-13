@@ -218,6 +218,16 @@ no_reset "a reset phrase buried mid-prompt" \
 no_reset "a machine-generated reset-shaped prompt" \
   "Reset DoD to new task: synthetic wake" synthetic
 
+SOURCENONESID="scope-source-none-$RANDOM"
+printf '%s\n' "$BREPO" > "$SD/$SOURCENONESID.arm"
+sourcenone=$(jq -cn --arg sid "$SOURCENONESID" \
+  '{session_id:$sid,prompt_id:"prompt-source-none",prompt:"Reset DoD to new task: unauthenticated event"}')
+out=$(scope_run "$sourcenone")
+ck "a source-less reset-shaped event fails closed" "kept" \
+  "$([ -e "$SD/$SOURCENONESID.arm" ] && echo kept || echo gone)"
+ck "  ...without hook failure" "0" "$(scope_rc)"
+rm -f "$SD/$SOURCENONESID.arm" "$SD/$SOURCENONESID.blocks"
+
 BGSID="scope-background-$RANDOM"
 printf '%s\n' "$BREPO" > "$SD/$BGSID.arm"
 bgpayload=$(jq -cn --arg sid "$BGSID" \

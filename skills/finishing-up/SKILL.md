@@ -27,8 +27,9 @@ abandon, or delete repository work.
 
 Never invoke the task-scope hook yourself or edit its runtime state to escape a
 checker result. Generic “new task”, “next”, continuation, correction, status,
-compaction, and quota-pause prompts remain inside the existing scope. A known
-synthetic prompt cannot reset it. Other sessions are unaffected.
+compaction, and quota-pause prompts remain inside the existing scope. Only a
+runtime event identified as `source: user` can reset it; synthetic and
+source-less events fail closed. Other sessions are unaffected.
 
 Reset is refused while Ralph or a runtime-reported background task owns the
 session. Finish or halt that work first. Any repository edit that lands after a

@@ -52,7 +52,8 @@ logic and terminal outcomes unchanged.
 
 - [ ] Parse JSON defensively; allow only a plain session token and exact
   beginning-anchored reset syntax with non-empty task description.
-- [ ] Ignore payloads with an explicit non-user source.
+- [ ] Accept only exact `source: user`; source-less and known non-user payloads
+  fail closed.
 - [ ] Refuse non-empty background ownership fields and a live Ralph state file.
 - [ ] Create state directory safely and acquire `.task-scope.lock` with a
   bounded wait.

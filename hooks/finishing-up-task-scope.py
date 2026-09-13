@@ -119,11 +119,10 @@ def main() -> int:
     if not isinstance(prompt, str) or RESET_PROMPT.fullmatch(prompt) is None:
         return 0
 
-    # Current clients identify interactive prompts as `user`. Source-less
-    # legacy payloads remain compatible, matching prompt-log.py's established
-    # rule. Any source the runtime explicitly identifies as synthetic is inert.
-    source = payload.get("source")
-    if source is not None and source != "user":
+    # Reset is an enforcement transition, not instrumentation. Unlike prompt
+    # logging, source-less legacy compatibility is unsafe here: no identified
+    # human authority means no task boundary. Older clients fail closed.
+    if payload.get("source") != "user":
         return 0
 
     session = payload.get("session_id")
