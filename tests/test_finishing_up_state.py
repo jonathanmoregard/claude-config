@@ -320,6 +320,51 @@ class LifecycleTests(RepoFixture):
                 timeout_seconds=10,
             )
 
+    def test_open_pr_head_drift_reopens_review_contract(self) -> None:
+        run(
+            "git",
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/example/project.git",
+            cwd=self.repo,
+        )
+        store = Store()
+        target = store.upsert_target("session-1", self.repo)
+        frozen = self._handoff(store, target["id"])
+        old_head = frozen["reviewed_head_sha"]
+
+        (self.repo / "tracked.txt").write_text("review revision\n", encoding="utf-8")
+        run("git", "add", "tracked.txt", cwd=self.repo)
+        run("git", "commit", "-qm", "review revision", cwd=self.repo)
+        current_head = run("git", "rev-parse", "HEAD", cwd=self.repo)
+        store.upsert_target("session-1", self.repo)
+
+        def open_runner(argv, cwd, timeout):
+            self.assertEqual(["gh", "pr", "view"], argv[:3])
+            return self._result(
+                json.dumps(
+                    {
+                        "number": 48,
+                        "url": "https://github.com/example/project/pull/48",
+                        "state": "OPEN",
+                        "headRefOid": current_head,
+                        "baseRefName": "master",
+                        "mergeCommit": None,
+                    }
+                )
+            )
+
+        reopened = store.refresh_target(target["id"], runner=open_runner)
+        self.assertNotEqual(old_head, current_head)
+        self.assertEqual("WORKING", reopened["phase"])
+        self.assertIsNone(reopened["reviewed_head_sha"])
+        self.assertIsNone(reopened["merge_sha"])
+
+        reviewed = store.handoff_target(target["id"], runner=self._local_runner())
+        self.assertEqual("AWAITING_MERGE", reviewed["phase"])
+        self.assertEqual(current_head, reviewed["reviewed_head_sha"])
+
     def test_config_rejects_shell_strings_and_relative_cwd(self) -> None:
         store = Store()
         target = store.upsert_target("session-1", self.repo)
@@ -333,6 +378,65 @@ class LifecycleTests(RepoFixture):
                 smoke_argv=["true"],
                 timeout_seconds=10,
             )
+
+    def test_config_rejects_secret_bearing_argv(self) -> None:
+        secret = "tracker-test-token-9f3d7c1a"
+        os.environ["DOD_TEST_API_TOKEN"] = secret
+        self.addCleanup(os.environ.pop, "DOD_TEST_API_TOKEN", None)
+        store = Store()
+        target = store.upsert_target("session-1", self.repo)
+        unsafe = (
+            ["curl", "-H", "Authorization: Bearer abcdefghijklmno"],
+            ["curl", "https://alice:password@example.test/deploy"],
+            ["probe", "token=abcdefghijklmno"],
+            ["probe", secret],
+        )
+        for index, argv in enumerate(unsafe):
+            with self.subTest(argv=argv), self.assertRaises(StateError):
+                store.configure_environment(
+                    target["id"],
+                    f"production-{index}",
+                    revision_cwd=self.repo,
+                    revision_argv=argv,
+                    smoke_cwd=self.repo,
+                    smoke_argv=["true"],
+                    timeout_seconds=10,
+                )
+
+    def test_cli_redacts_tampered_stored_argv(self) -> None:
+        secret = "tampered-token-93ac17fd"
+        store = Store()
+        target = store.upsert_target("session-1", self.repo)
+        store.configure_environment(
+            target["id"],
+            "production",
+            revision_cwd=self.repo,
+            revision_argv=["true"],
+            smoke_cwd=self.repo,
+            smoke_argv=["true"],
+            timeout_seconds=10,
+        )
+        store.db.execute(
+            "UPDATE environments SET revision_argv=? WHERE target_id=?",
+            (json.dumps(["probe", f"token={secret}"]), target["id"]),
+        )
+        store.db.commit()
+
+        result = subprocess.run(
+            [
+                "python3",
+                str(ROOT / "scripts/dod-track.py"),
+                "--json",
+                "status",
+                target["id"],
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertNotIn(secret, result.stdout)
+        self.assertIn("[REDACTED]", result.stdout)
 
     def test_merge_refresh_survives_deleted_worktree(self) -> None:
         run(
@@ -720,6 +824,18 @@ class InformerTests(RepoFixture):
         self.assertIn("feature-a", text)
         self.assertIn("feature-b", text)
         self.assertIn("dod-track.py refresh", text)
+
+    def test_persistent_state_failure_warns_without_blocking(self) -> None:
+        self.state.mkdir(mode=0o700)
+        (self.state / "state.sqlite3").write_text("not sqlite\n", encoding="utf-8")
+
+        result, _ = self._hook({"session_id": "session-1", "prompt": "status"})
+        self.assertEqual(0, result.returncode, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertNotIn("decision", payload)
+        text = payload["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("DoD state is unavailable", text)
+        self.assertIn("do not infer completion", text)
 
     def test_hostile_stored_text_is_bounded_and_single_line(self) -> None:
         store = Store()

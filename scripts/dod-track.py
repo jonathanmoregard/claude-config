@@ -12,7 +12,7 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "hooks"))
 
-from finishing_up_state import StateError, Store
+from finishing_up_state import StateError, Store, redact_command_arg
 
 
 def argv_json(raw: str) -> object:
@@ -20,6 +20,38 @@ def argv_json(raw: str) -> object:
         return json.loads(raw)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("must be a JSON argv array") from exc
+
+
+def redact_stored_argv(raw: object) -> str:
+    try:
+        value = json.loads(str(raw))
+    except (TypeError, ValueError):
+        return json.dumps(["[REDACTED:invalid stored argv]"])
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        return json.dumps(["[REDACTED:invalid stored argv]"])
+    return json.dumps([redact_command_arg(item) for item in value])
+
+
+def public_target(row: dict) -> dict:
+    result = dict(row)
+    result["environments"] = []
+    for environment in row.get("environments", []):
+        safe = dict(environment)
+        safe["revision_argv"] = redact_stored_argv(safe.get("revision_argv"))
+        safe["smoke_argv"] = redact_stored_argv(safe.get("smoke_argv"))
+        result["environments"].append(safe)
+    return result
+
+
+def public_value(value: object) -> object:
+    if isinstance(value, list):
+        return [
+            public_target(row) if isinstance(row, dict) and "id" in row else row
+            for row in value
+        ]
+    if isinstance(value, dict) and "id" in value:
+        return public_target(value)
+    return value
 
 
 def parser() -> argparse.ArgumentParser:
@@ -146,6 +178,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"dod-track: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
+    value = public_value(value)
     if args.json:
         print(json.dumps(value, ensure_ascii=False, sort_keys=True))
     elif isinstance(value, list):

@@ -92,6 +92,9 @@ Requirements:
 - Put no secret in argv or stored paths. Probe output may contain no secret;
   redaction is defense, not permission.
 - Configuration freezes at handoff. Head or command changes require new review.
+- If an open PR head changes after handoff, refresh reopens its target as
+  `WORKING`; repeat readiness and handoff. A merged PR with head drift stays
+  `INCONCLUSIVE` and is never rebound automatically.
 
 Then:
 

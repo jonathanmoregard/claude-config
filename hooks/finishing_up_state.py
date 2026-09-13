@@ -281,6 +281,26 @@ SECRET_PATTERNS = (
     re.compile(r"(?i)((?:token|password|passwd|secret|api[_-]?key)\s*[=:]\s*)\S+"),
     re.compile(r"(https?://)[^/@\s:]+(?::[^/@\s]*)?@"),
 )
+SENSITIVE_ENV_NAME = re.compile(
+    r"(?i)(?:token|secret|password|passwd|api[_-]?key|credential|auth|cookie)"
+)
+
+
+def redact_command_arg(value: object) -> str:
+    text = str(value)[:2048]
+    for pattern in SECRET_PATTERNS:
+        text = pattern.sub(lambda match: match.group(1) + "[REDACTED]", text)
+    for name, secret in os.environ.items():
+        if SENSITIVE_ENV_NAME.search(name) and len(secret) >= 8 and secret in text:
+            text = text.replace(secret, "[REDACTED:env]")
+    return text
+
+
+def validate_probe_argv(value: object, label: str) -> list[str]:
+    result = validate_argv(value, label)
+    if any(redact_command_arg(item) != item for item in result):
+        raise StateError(f"{label} contains secret-shaped data")
+    return result
 
 
 def redact_evidence(value: object, limit: int = 4096) -> str:
@@ -636,6 +656,21 @@ class Store:
                 "pr_head_sha": final_head,
             }
             if final_head != reviewed:
+                if (
+                    state == "OPEN"
+                    and final_head is not None
+                    and final_head == _normal_sha(snapshot.get("head_sha"))
+                ):
+                    return self._cas_target(
+                        snapshot,
+                        {
+                            **common,
+                            "reviewed_head_sha": None,
+                            "merge_sha": None,
+                            "phase": "WORKING",
+                            "detail": "open PR head changed; fresh review is required",
+                        },
+                    )
                 return self._cas_target(
                     snapshot,
                     {
@@ -795,8 +830,8 @@ class Store:
             raise StateError("environment name is missing or unsafe")
         revision_dir = validate_cwd(revision_cwd, "revision cwd")
         smoke_dir = validate_cwd(smoke_cwd, "smoke cwd")
-        revision = validate_argv(revision_argv, "revision argv")
-        smoke = validate_argv(smoke_argv, "smoke argv")
+        revision = validate_probe_argv(revision_argv, "revision argv")
+        smoke = validate_probe_argv(smoke_argv, "smoke argv")
         if not isinstance(timeout_seconds, int) or not 1 <= timeout_seconds <= 600:
             raise StateError("timeout must be between 1 and 600 seconds")
         self.db.execute("BEGIN IMMEDIATE")
@@ -894,8 +929,12 @@ class Store:
         merge_sha = snapshot["merge_sha"]
         outcomes: list[dict[str, object]] = []
         for environment in snapshot["environments"]:
-            revision_argv = validate_argv(json.loads(environment["revision_argv"]), "revision argv")
-            smoke_argv = validate_argv(json.loads(environment["smoke_argv"]), "smoke argv")
+            revision_argv = validate_probe_argv(
+                json.loads(environment["revision_argv"]), "revision argv"
+            )
+            smoke_argv = validate_probe_argv(
+                json.loads(environment["smoke_argv"]), "smoke argv"
+            )
             timeout = int(environment["timeout_seconds"])
             if not 1 <= timeout <= 600:
                 raise StateError("stored environment timeout is outside safe bounds")
