@@ -31,12 +31,15 @@ SD=$(mktemp -d)
 ARMWORK=$(mktemp -d -p "$HOME" .dod-armtest.XXXXXX)
 trap 'rm -rf "$SD" "$ARMWORK"' EXIT  # arftl-allow: destructive-shell — both are this run's own mktemp -d
 export CLAUDE_RALPH_STATE_DIR="$SD/ralph"
+export CLAUDE_DOD_LEGACY_TRACKER=0
 mkdir -p "$CLAUDE_RALPH_STATE_DIR"
 TEST_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd -P)
 GATE="${GATE_UNDER_TEST:-$TEST_ROOT/hooks/finishing-up-gate.py}"
 UNDER_TEST_ROOT=$(cd "$(dirname "$GATE")/.." && pwd -P)
 SCOPE_HOOK="${SCOPE_HOOK_UNDER_TEST:-$UNDER_TEST_ROOT/hooks/finishing-up-task-scope.py}"
 ARMHOOK="${ARM_HOOK_UNDER_TEST:-$UNDER_TEST_ROOT/hooks/finishing-up-arm.sh}"
+TRACKER="${TRACKER_UNDER_TEST:-$UNDER_TEST_ROOT/scripts/dod-track.py}"
+INFORMER="${INFORMER_UNDER_TEST:-$UNDER_TEST_ROOT/hooks/finishing-up-informer.py}"
 RALPH_HOOK="$UNDER_TEST_ROOT/hooks/ralph-loop-stop.sh"
 RALPH_TEST_HOME="$SD/ralph-home"
 mkdir -p "$RALPH_TEST_HOME/.claude/hooks" "$RALPH_TEST_HOME/.claude/scripts"
@@ -188,7 +191,20 @@ echo
 echo "== dod scope: only an explicit user task boundary resets state =="
 SCOPESID="scope-$RANDOM"
 OTHERSID="scope-other-$RANDOM"
-printf '%s\n%s\n' "$BREPO" "$BREPO" > "$SD/$SCOPESID.arm"
+SCOPE_TRACK_REPO="$SD/scope-track-repo"
+mkdir -p "$SCOPE_TRACK_REPO"
+( cd "$SCOPE_TRACK_REPO" || exit 1
+  git init -q -b master .; git config user.email t@t; git config user.name t
+  echo hi > a.txt; git add -A; git commit -qm init
+  git init -q --bare "$SD/scope-track-origin.git"; git remote add origin "$SD/scope-track-origin.git"
+  git push -q -u origin master
+  git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/master
+  git switch -qc feat/scope ) >/dev/null 2>&1
+CLAUDE_DOD_STATE_DIR="$SD" python3 "$TRACKER" --json arm \
+  --session "$SCOPESID" --repo "$SCOPE_TRACK_REPO" >/dev/null
+CLAUDE_DOD_STATE_DIR="$SD" python3 "$TRACKER" --json arm \
+  --session "$OTHERSID" --repo "$SCOPE_TRACK_REPO" >/dev/null
+printf '%s\n%s\n' "$SCOPE_TRACK_REPO" "$SCOPE_TRACK_REPO" > "$SD/$SCOPESID.arm"
 echo 4 > "$SD/$SCOPESID.blocks"
 printf '%s\n' "$SD/other-repo" > "$SD/$OTHERSID.arm"
 echo 2 > "$SD/$OTHERSID.blocks"
@@ -204,6 +220,12 @@ ck "  ...leaves another session's arm alone" "kept" \
   "$([ -e "$SD/$OTHERSID.arm" ] && echo kept || echo gone)"
 ck "  ...leaves another session's budget alone" "kept" \
   "$([ -e "$SD/$OTHERSID.blocks" ] && echo kept || echo gone)"
+current_db_targets=$(CLAUDE_DOD_STATE_DIR="$SD" python3 "$TRACKER" --json list \
+  --session "$SCOPESID" | jq 'length')
+other_db_targets=$(CLAUDE_DOD_STATE_DIR="$SD" python3 "$TRACKER" --json list \
+  --session "$OTHERSID" | jq 'length')
+ck "  ...retires current session tracker targets" "0" "$current_db_targets"
+ck "  ...leaves another session's tracker targets active" "1" "$other_db_targets"
 case "$(scope_context "$out")" in *"1 repository"*) r=told ;; *) r="$out" ;; esac
 ck "  ...tells the agent what boundary was applied" "told" "$r"
 audit_repos=$(jq -s --arg sid "$SCOPESID" \
@@ -342,6 +364,18 @@ ck "  ...then retires the old scope" "gone" \
   "$([ -e "$SD/$LOCKSID.arm" ] && echo kept || echo gone)"
 rm -f "$SD/$OTHERSID.arm" "$SD/$OTHERSID.blocks"
 
+RESETFAIL="$SD/reset-failure"
+mkdir -p "$RESETFAIL/state.sqlite3"
+FAILSID="scope-db-fail-$RANDOM"
+printf '%s\n' "$SCOPE_TRACK_REPO" > "$RESETFAIL/$FAILSID.arm"
+out=$(scope_run "$(scope_payload "$FAILSID" \
+  'Reset DoD to new task: database failure stays safe' user)" \
+  CLAUDE_DOD_STATE_DIR="$RESETFAIL")
+ck "tracker reset failure retains legacy arm" "kept" \
+  "$([ -e "$RESETFAIL/$FAILSID.arm" ] && echo kept || echo gone)"
+case "$(scope_context "$out")" in *"stays enforced"*) r=told ;; *) r="$out" ;; esac
+ck "  ...and tells agent reset failed safely" "told" "$r"
+
 SETTINGS_UNDER_TEST="$UNDER_TEST_ROOT/settings.json"
 SKILL_UNDER_TEST="$UNDER_TEST_ROOT/skills/finishing-up/SKILL.md"
 scope_registrations=$(jq \
@@ -352,6 +386,18 @@ scope_timeout=$(jq -r \
   '.hooks.UserPromptSubmit[]?.hooks[]? | select(.command | contains("finishing-up-task-scope.py")) | .timeout' \
   "$SETTINGS_UNDER_TEST")
 ck "  ...with a bounded five-second slot" "5" "$scope_timeout"
+informer_registrations=$(jq \
+  '[.hooks.UserPromptSubmit[]?.hooks[]? | select(.command | contains("finishing-up-informer.py"))] | length' \
+  "$SETTINGS_UNDER_TEST")
+ck "DoD informer is registered once on UserPromptSubmit" "1" "$informer_registrations"
+informer_timeout=$(jq -r \
+  '.hooks.UserPromptSubmit[]?.hooks[]? | select(.command | contains("finishing-up-informer.py")) | .timeout' \
+  "$SETTINGS_UNDER_TEST")
+ck "  ...with a one-second latency belt" "1" "$informer_timeout"
+stop_gate_registrations=$(jq \
+  '[.hooks.Stop[]?.hooks[]? | select(.command | contains("finishing-up-gate.py"))] | length' \
+  "$SETTINGS_UNDER_TEST")
+ck "new sessions do not register blocking DoD Stop gate" "0" "$stop_gate_registrations"
 ck "finishing-up advertises task-scope reset requests" "yes" \
   "$(rg -qi 'reset dod.*new task' "$SKILL_UNDER_TEST" && echo yes || echo no)"
 ck "  ...and documents the canonical explicit directive" "yes" \
@@ -1240,7 +1286,8 @@ rm -f "$SD/$DUPSID.arm" "$SD/$DUPSID.blocks"
   echo hi > a.txt; git add -A; git commit -qm init
   git init -q --bare "$SD/armtest-origin.git"; git remote add origin "$SD/armtest-origin.git"
   git push -q -u origin master
-  git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/master ) >/dev/null 2>&1
+  git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/master
+  git switch -qc feat/arm-tracker ) >/dev/null 2>&1
 
 SCOPEARMSID="scope-arm-$RANDOM"
 flock "$SD/.task-scope.lock" sleep 3 &
@@ -1256,7 +1303,38 @@ ck "arming waits while task-scope lock is held" "0" \
 wait "$SCOPEARMLOCKPID" "$SCOPEARMPID" 2>/dev/null
 ck "  ...then records the edited repo" "1" \
    "$(wc -l < "$SD/$SCOPEARMSID.arm")"
+ck "  ...and upserts one branch-scoped tracker target" "1" \
+   "$(CLAUDE_DOD_STATE_DIR="$SD" python3 "$TRACKER" --json list \
+      --session "$SCOPEARMSID" | jq 'length')"
 rm -f "$SD/$SCOPEARMSID.arm"
+
+# Force reset and edit-arm to queue behind the same held flock. Whichever wins
+# first, both stores must agree after both transitions finish: reset-after-arm
+# retires+clears both; arm-after-reset recreates both.
+scope_race_bad=0
+for race_n in $(seq 1 10); do
+  RSTSID="scope-arm-race-$race_n-$RANDOM"
+  reset_payload=$(scope_payload "$RSTSID" \
+    "Reset DoD to new task: race $race_n" user)
+  exec 7>>"$SD/.task-scope.lock"
+  flock 7
+  ( scope_run "$reset_payload" >/dev/null ) &
+  reset_pid=$!
+  printf '{"session_id":"%s","tool_input":{"file_path":"%s/a.txt"}}' \
+    "$RSTSID" "$ARMWORK" \
+    | CLAUDE_DOD_STATE_DIR="$SD" bash "$ARMHOOK" >/dev/null 2>&1 &
+  arm_pid=$!
+  flock -u 7
+  exec 7>&-
+  wait "$reset_pid" "$arm_pid" 2>/dev/null
+  active_n=$(CLAUDE_DOD_STATE_DIR="$SD" python3 "$TRACKER" --json list \
+    --session "$RSTSID" | jq 'length')
+  arm_n=$([ -e "$SD/$RSTSID.arm" ] && echo 1 || echo 0)
+  [ "$active_n" = "$arm_n" ] || scope_race_bad=$((scope_race_bad+1))
+  rm -f "$SD/$RSTSID.arm" "$SD/$RSTSID.blocks"
+done
+ck "reset/edit race leaves legacy and tracker state equivalent (10/10)" \
+  "0" "$scope_race_bad"
 
 # Firing twenty of them at once does NOT reproduce this — measured, they
 # serialise on their own git and jq calls and the file comes out with one line
@@ -1517,6 +1595,23 @@ ck "a clean sibling does not disarm a blocking handover" "kept" \
 ck "  ...and the handover's block still reaches the agent" "block" \
    "$(decision "$(cat "$SD/race-handover.out" 2>/dev/null)")"
 rm -f "$SD/$RACESID.arm" "$SD/$RACESID.blocks"
+
+# Sessions that loaded settings before rollout still invoke this Stop gate.
+# Their command path resolves the newly deployed file, so a clean legacy
+# dod-check must hand control to durable deployment state instead of releasing
+# immediately after merge.
+LEGACYSID="legacy-tracker-$RANDOM"
+printf '%s\n' "$ARMWORK" > "$SD/$LEGACYSID.arm"
+out=$(gate_run "$LEGACYSID" CLAUDE_DOD_LEGACY_TRACKER=1 \
+  CLAUDE_DOD_CHECK="$CLEANDOD")
+ck "loaded-session gate blocks clean checkout until deploy verification" \
+  "block" "$(decision "$out")"
+case "$out" in *"deployment"*|*"Deployment"*) r=named ;; *) r="$out" ;; esac
+ck "  ...and names deployment tracking" "named" "$r"
+ck "  ...while lazily importing its feature target" "1" \
+  "$(CLAUDE_DOD_STATE_DIR="$SD" python3 "$TRACKER" --json list \
+    --session "$LEGACYSID" | jq 'length')"
+rm -f "$SD/$LEGACYSID.arm" "$SD/$LEGACYSID.blocks"
 
 echo
 echo "== $pass passed, $fail failed =="

@@ -155,4 +155,22 @@ if ! (
   echo "⚠️  finishing-up-arm: could not record $root in $armfile — this session will NOT be checked by the definition-of-done gate" >&2
   exit 1
 fi
+
+# PR branches also enter the durable multi-target tracker. Keep this inside the
+# task-scope flock: reset must not retire SQLite state and then clear the legacy
+# arm while a concurrent edit is adding the replacement target. Default-branch
+# work keeps the existing direct-push ladder and needs no deploy verifier.
+if [ "$branch" != "$default" ]; then
+  hook_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+  tracker="${CLAUDE_DOD_TRACKER:-$hook_root/scripts/dod-track.py}"
+  if [ ! -f "$tracker" ]; then
+    echo "⚠️  finishing-up-arm: tracker missing at $tracker — legacy protection remains, but branch/deployment informer coverage is reduced" >&2
+    exit 1
+  fi
+  if ! python3 "$tracker" --db-timeout 0.25 --json arm \
+    --session "$session" --repo "$root" >/dev/null; then
+    echo "⚠️  finishing-up-arm: tracker could not record $root — legacy protection remains, but branch/deployment informer coverage is reduced" >&2
+    exit 1
+  fi
+fi
 exit 0

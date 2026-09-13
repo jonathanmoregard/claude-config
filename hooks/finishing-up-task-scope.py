@@ -377,6 +377,23 @@ def main() -> int:
             )
             return 0
 
+        # Same scope lock as finishing-up-arm.sh spans both stores. Retire the
+        # durable targets first; if SQLite cannot commit, legacy arm/count state
+        # stays intact and the old Stop gate remains fail-safe. A concurrent
+        # edit cannot enter between this commit and legacy cleanup.
+        try:
+            from finishing_up_state import Store
+
+            with Store(timeout=0.25) as store:
+                store.retire_session(session, "transcript-authenticated task reset")
+        except Exception as exc:
+            context(
+                f"[dod] Task scope reset failed: tracker state could not be "
+                f"retired ({type(exc).__name__}: {str(exc)[:160]}); current "
+                "scope stays enforced."
+            )
+            return 0
+
         try:
             countfile.unlink(missing_ok=True)
         except OSError as exc:
