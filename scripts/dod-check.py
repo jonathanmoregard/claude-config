@@ -556,7 +556,7 @@ def collect_pr(root):
     # installed gh.
     fields = (
         "number,url,state,isDraft,mergeStateStatus,mergeable,"
-        "reviewDecision,headRefName,headRefOid,baseRefName,title"
+        "reviewDecision,headRefName,headRefOid,baseRefName,title,mergeCommit"
     )
     code, out, err = run(["gh", "pr", "view", "--json", fields], cwd=root)
     if code != 0:
@@ -575,6 +575,17 @@ def collect_pr(root):
     # failure presented as a measurement that found nothing.
     if not isinstance(pr, dict):
         return None, None, f"gh pr view returned {type(pr).__name__}, expected an object"
+
+    # Post-merge deployment identity is not the reviewed branch head: squash,
+    # rebase, and merge-commit strategies can all write a different commit onto
+    # the base. Preserve only GitHub's full mergeCommit oid. Unknown stays None;
+    # never substitute headRefOid and accidentally bless an unverified deploy.
+    merge = pr.get("mergeCommit")
+    merge_oid = merge.get("oid") if isinstance(merge, dict) else None
+    if isinstance(merge_oid, str) and re.fullmatch(r"[0-9a-fA-F]{40,64}", merge_oid):
+        pr["mergeCommit"] = {"oid": merge_oid.lower()}
+    else:
+        pr["mergeCommit"] = None
 
     checks, cerr = collect_checks(root)
     return pr, checks, cerr

@@ -81,8 +81,9 @@ case "$DOD_FIXTURE" in
     # commit its scenario means; the all-zero default is a SHA no repo has, so a
     # test that forgets to set it gets STRANDED_UNKNOWN rather than a quiet zero.
     if [ "$sub" = "pr view" ]; then
-      printf '{"number":42,"url":"https://github.com/o/r/pull/42","state":"MERGED","isDraft":false,"mergeStateStatus":"UNKNOWN","reviewDecision":"APPROVED","reviewThreads":{"nodes":[]},"headRefName":"f","headRefOid":"%s","baseRefName":"master","title":"t"}\n' \
-        "${DOD_HEAD_OID:-0000000000000000000000000000000000000000}"
+      printf '{"number":42,"url":"https://github.com/o/r/pull/42","state":"MERGED","isDraft":false,"mergeStateStatus":"UNKNOWN","reviewDecision":"APPROVED","reviewThreads":{"nodes":[]},"headRefName":"f","headRefOid":"%s","baseRefName":"master","title":"t","mergeCommit":{"oid":"%s"}}\n' \
+        "${DOD_HEAD_OID:-0000000000000000000000000000000000000000}" \
+        "${DOD_MERGE_OID:-1111111111111111111111111111111111111111}"
       exit 0
     fi
     [ "$sub" = "pr checks" ] && { echo '[{"name":"ci","state":"SUCCESS","bucket":"pass","link":"","workflow":"w"}]'; exit 0; }

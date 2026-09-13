@@ -517,6 +517,16 @@ assert d['pr']['url'].startswith('https://'), 'missing pr url'
 assert d['checks']['pending']==1, 'pending tally wrong'
 " <<<"$j" 2>/dev/null; then ok "JSON contract"; else bad "JSON contract" "valid schema" "$j"; fi
 
+export DOD_HEAD_OID="$(git rev-parse HEAD)"
+export DOD_MERGE_OID="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+m="$(DOD_FIXTURE=merged python3 "$DOD" --repo "$WORK" --json 2>&1)"
+if python3 -c "
+import json,sys
+d=json.loads(sys.stdin.read())
+assert d['pr']['mergeCommit']['oid'] == 'b' * 40, 'missing post-merge SHA'
+" <<<"$m" 2>/dev/null; then ok "merged JSON exposes post-merge SHA"
+else bad "merged JSON exposes post-merge SHA" "mergeCommit.oid" "$m"; fi
+
 echo
 echo "== $pass passed, $fail failed =="
 [ "$fail" -eq 0 ]
