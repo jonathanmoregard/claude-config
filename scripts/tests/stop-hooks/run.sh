@@ -1613,6 +1613,86 @@ ck "  ...while lazily importing its feature target" "1" \
     --session "$LEGACYSID" | jq 'length')"
 rm -f "$SD/$LEGACYSID.arm" "$SD/$LEGACYSID.blocks"
 
+# A target whose exact deployment and smoke already reached COMPLETE is safe to
+# remove as a worktree. Loaded sessions retain their legacy armfile, though, so
+# the old gate must consult completed tracker identity before trying dod-check
+# against that now-absent path. PR #66 reproduced this after its deployed smoke
+# passed and cleanup removed the worktree.
+COMPLETESID="legacy-complete-$RANDOM"
+completed=$(CLAUDE_DOD_STATE_DIR="$SD" python3 "$TRACKER" --json arm \
+  --session "$COMPLETESID" --repo "$ARMWORK")
+completed_id=$(jq -r '.id' <<<"$completed")
+completed_sha=$(jq -r '.head_sha' <<<"$completed")
+STALEWORK="$SD/completed-worktree-removed"
+python3 - "$SD/state.sqlite3" "$completed_id" "$STALEWORK" \
+  "$completed_sha" "$ARMWORK" <<'PY'
+import datetime
+import sqlite3
+import sys
+
+database, target_id, stale_worktree, merge_sha, worktree = sys.argv[1:]
+now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+with sqlite3.connect(database) as connection:
+    connection.execute(
+        "UPDATE targets SET worktree=?,repo_root=?,phase='COMPLETE',active=0,"
+        "merge_sha=?,completed_at=?,completion_reason="
+        "'exact merged revision deployed and smoke passed' WHERE id=?",
+        (stale_worktree, stale_worktree, merge_sha, now, target_id),
+    )
+    connection.execute(
+        "INSERT INTO environments(target_id,name,revision_cwd,revision_argv,"
+        "smoke_cwd,smoke_argv,timeout_seconds,expected_sha,observed_sha,"
+        "deploy_status,smoke_status,evidence,verified_at) "
+        "VALUES(?, 'production', ?, '[\"revision\"]', ?, '[\"smoke\"]', 10,"
+        " ?, ?, 'PASS', 'PASS', 'test verified deployment', ?)",
+        (target_id, worktree, worktree, merge_sha, merge_sha, now),
+    )
+PY
+printf '%s\n' "$STALEWORK" > "$SD/$COMPLETESID.arm"
+out=$(gate_run "$COMPLETESID" CLAUDE_DOD_LEGACY_TRACKER=1)
+ck "loaded-session gate releases a removed worktree already COMPLETE" \
+  "" "$(decision "$out")"
+ck "  ...without crashing" "0" "$(gate_rc)"
+
+# Skipping one completed legacy path must not hide a newer active target for
+# the same session. active_targets remains the final authority.
+CLAUDE_DOD_STATE_DIR="$SD" python3 "$TRACKER" --json arm \
+  --session "$COMPLETESID" --repo "$ARMWORK" >/dev/null
+out=$(gate_run "$COMPLETESID" CLAUDE_DOD_LEGACY_TRACKER=1)
+ck "completed legacy path cannot hide an active sibling target" \
+  "block" "$(decision "$out")"
+case "$out" in *"Deployment verification remains active"*) r=named ;; *) r="$out" ;; esac
+ck "  ...and blocker comes from active tracker state" "named" "$r"
+rm -f "$SD/$COMPLETESID.arm" "$SD/$COMPLETESID.blocks"
+
+# A phase label alone is not deployment evidence. Accidental or partial state
+# corruption must neither skip legacy measurement nor suppress lazy re-import.
+CORRUPTSID="legacy-corrupt-complete-$RANDOM"
+corrupt=$(CLAUDE_DOD_STATE_DIR="$SD" python3 "$TRACKER" --json arm \
+  --session "$CORRUPTSID" --repo "$ARMWORK")
+corrupt_id=$(jq -r '.id' <<<"$corrupt")
+python3 - "$SD/state.sqlite3" "$corrupt_id" <<'PY'
+import sqlite3
+import sys
+
+database, target_id = sys.argv[1:]
+with sqlite3.connect(database) as connection:
+    connection.execute(
+        "UPDATE targets SET phase='COMPLETE',active=0,completed_at=?,"
+        "merge_sha=?,completion_reason='forged without deploy evidence' "
+        "WHERE id=?",
+        ("2026-09-13T00:00:00+00:00", "d" * 40, target_id),
+    )
+PY
+printf '%s\n' "$ARMWORK" > "$SD/$CORRUPTSID.arm"
+out=$(gate_run "$CORRUPTSID" CLAUDE_DOD_LEGACY_TRACKER=1 \
+  CLAUDE_DOD_CHECK="$CLEANDOD")
+ck "corrupt COMPLETE label without deploy evidence still blocks" \
+  "block" "$(decision "$out")"
+case "$out" in *"Deployment verification remains active"*) r=named ;; *) r="$out" ;; esac
+ck "  ...by re-importing an active deployment target" "named" "$r"
+rm -f "$SD/$CORRUPTSID.arm" "$SD/$CORRUPTSID.blocks"
+
 echo
 echo "== $pass passed, $fail failed =="
 [ "$fail" -eq 0 ]

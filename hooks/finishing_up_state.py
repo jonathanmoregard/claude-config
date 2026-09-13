@@ -1059,6 +1059,52 @@ class Store:
         ).fetchall()
         return [self.target(row["id"]) for row in rows]
 
+    def _is_verified_complete(self, target_id: str) -> bool:
+        target = self.db.execute(
+            "SELECT phase,active,merge_sha,completed_at FROM targets WHERE id=?",
+            (target_id,),
+        ).fetchone()
+        if (
+            target is None
+            or target["phase"] != "COMPLETE"
+            or target["active"] != 0
+            or not target["completed_at"]
+        ):
+            return False
+        merge_sha = _normal_sha(target["merge_sha"])
+        if merge_sha is None:
+            return False
+        environments = self.db.execute(
+            "SELECT expected_sha,observed_sha,deploy_status,smoke_status,verified_at "
+            "FROM environments WHERE target_id=?",
+            (target_id,),
+        ).fetchall()
+        return bool(environments) and all(
+            _normal_sha(row["expected_sha"]) == merge_sha
+            and _normal_sha(row["observed_sha"]) == merge_sha
+            and row["deploy_status"] == "PASS"
+            and row["smoke_status"] == "PASS"
+            and bool(row["verified_at"])
+            for row in environments
+        )
+
+    def completed_paths(self, session: str) -> set[str]:
+        """Return exact paths backed by internally consistent completion evidence."""
+        if SESSION_TOKEN.fullmatch(session) is None:
+            raise StateError("session id is missing or unsafe")
+        rows = self.db.execute(
+            "SELECT id,repo_root,worktree FROM targets "
+            "WHERE session_id=? AND phase='COMPLETE' AND active=0",
+            (session,),
+        ).fetchall()
+        return {
+            path
+            for row in rows
+            if self._is_verified_complete(row["id"])
+            for path in (row["repo_root"], row["worktree"])
+            if isinstance(path, str) and pathlib.Path(path).is_absolute()
+        }
+
     def import_legacy_target(
         self, session: str, path: str | os.PathLike[str]
     ) -> dict[str, Any] | None:
@@ -1076,7 +1122,10 @@ class Store:
         if previous is not None:
             if previous["active"]:
                 return self.target(previous["id"])
-            if previous["phase"] == "COMPLETE":
+            if (
+                previous["phase"] == "COMPLETE"
+                and self._is_verified_complete(previous["id"])
+            ):
                 return None
         return self.upsert_target(session, path)
 
