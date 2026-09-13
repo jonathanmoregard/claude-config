@@ -499,6 +499,11 @@
         "hooks": [
           {
             "type": "command",
+            "command": "python3 $HOME/.claude/hooks/finishing-up-task-scope.py",
+            "timeout": 5
+          },
+          {
+            "type": "command",
             "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; $HOME/.claude/fable-warn.sh"
           },
           {

@@ -344,8 +344,8 @@ def reap(session):
 
     Runs only for a session that is ALREADY armed, so an ordinary read-only
     session still pays a single file-existence check and never a directory
-    scan. Touches nothing but `*.arm` and `*.blocks` — gate.log is the audit
-    trail and outlives everything here.
+    scan. Touches nothing but `*.arm` and `*.blocks` — gate.log and durable
+    replay claims are enforcement ledgers and outlive the sweep.
     """
     if ARM_MAX_AGE_DAYS <= 0:
         return
