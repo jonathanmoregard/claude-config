@@ -1,6 +1,6 @@
 ---
 name: finishing-up
-description: Use when wrapping up work that produced a diff; before asking the user to merge, review, or click a PR; when deciding whether unfinished work should ship, be preserved, or be abandoned; or when CI, checks, mergeability, or unpushed work block completion.
+description: Use when wrapping up work that produced a diff; before asking the user to merge, review, or click a PR; when deciding whether unfinished work should ship, be preserved, or be abandoned; when CI, checks, mergeability, or unpushed work block completion; or when the user asks to reset DoD to a new task.
 ---
 
 # Finishing Up
@@ -9,6 +9,31 @@ Choose the terminal outcome before acting on Git blockers. `dod-check` measures
 shipping readiness; it does not decide whether work should ship.
 
 **Iron law: never report repository or PR state you have not just measured.**
+
+## Explicit task boundaries
+
+One session has one active DoD scope. To retire completed or intentionally
+parked repositories before unrelated work, the interactive user starts a prompt
+with:
+
+```text
+Reset DoD to new task: <non-empty task description>
+```
+
+`Reset DoD skill to new task: …` is accepted too. The `UserPromptSubmit` hook
+applies the boundary before the turn begins, resets only that session's arm and
+retry state, and audits retired repository paths. It does not ship, preserve,
+abandon, or delete repository work.
+
+Never invoke the task-scope hook yourself or edit its runtime state to escape a
+checker result. Generic “new task”, “next”, continuation, correction, status,
+compaction, and quota-pause prompts remain inside the existing scope. A known
+synthetic prompt cannot reset it. Other sessions are unaffected.
+
+Reset is refused while Ralph or a runtime-reported background task owns the
+session. Finish or halt that work first. Any repository edit that lands after a
+successful reset arms the new task normally, including edits from a worker that
+outlives the boundary.
 
 ## Step 1 — Select the outcome
 

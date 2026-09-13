@@ -218,6 +218,17 @@ no_reset "a reset phrase buried mid-prompt" \
 no_reset "a machine-generated reset-shaped prompt" \
   "Reset DoD to new task: synthetic wake" synthetic
 
+BGSID="scope-background-$RANDOM"
+printf '%s\n' "$BREPO" > "$SD/$BGSID.arm"
+bgpayload=$(jq -cn --arg sid "$BGSID" \
+  '{session_id:$sid,prompt_id:"prompt-bg",source:"user",prompt:"Reset DoD to new task: leave running work",background_tasks:[{"id":"worker"}]}')
+out=$(scope_run "$bgpayload")
+ck "live background work keeps its arm" "kept" \
+  "$([ -e "$SD/$BGSID.arm" ] && echo kept || echo gone)"
+case "$(scope_context "$out")" in *background*) r=told ;; *) r="$out" ;; esac
+ck "  ...and tells the agent why reset was refused" "told" "$r"
+rm -f "$SD/$BGSID.arm" "$SD/$BGSID.blocks"
+
 RALPHSID="scope-ralph-$RANDOM"
 printf '%s\n' "$BREPO" > "$SD/$RALPHSID.arm"
 echo 5 > "$SD/$RALPHSID.blocks"
@@ -249,6 +260,21 @@ wait "$SCOPELOCKPID" "$SCOPERESETPID" 2>/dev/null
 ck "  ...then retires the old scope" "gone" \
   "$([ -e "$SD/$LOCKSID.arm" ] && echo kept || echo gone)"
 rm -f "$SD/$OTHERSID.arm" "$SD/$OTHERSID.blocks"
+
+SETTINGS_UNDER_TEST="$UNDER_TEST_ROOT/settings.json"
+SKILL_UNDER_TEST="$UNDER_TEST_ROOT/skills/finishing-up/SKILL.md"
+scope_registrations=$(jq \
+  '[.hooks.UserPromptSubmit[]?.hooks[]? | select(.command | contains("finishing-up-task-scope.py"))] | length' \
+  "$SETTINGS_UNDER_TEST")
+ck "task-scope reset is registered once on UserPromptSubmit" "1" "$scope_registrations"
+scope_timeout=$(jq -r \
+  '.hooks.UserPromptSubmit[]?.hooks[]? | select(.command | contains("finishing-up-task-scope.py")) | .timeout' \
+  "$SETTINGS_UNDER_TEST")
+ck "  ...with a bounded five-second slot" "5" "$scope_timeout"
+ck "finishing-up advertises task-scope reset requests" "yes" \
+  "$(rg -qi 'reset dod.*new task' "$SKILL_UNDER_TEST" && echo yes || echo no)"
+ck "  ...and documents the canonical explicit directive" "yes" \
+  "$(rg -q 'Reset DoD to new task:' "$SKILL_UNDER_TEST" && echo yes || echo no)"
 
 echo
 echo "== dod gate: bounded explanatory exits =="
