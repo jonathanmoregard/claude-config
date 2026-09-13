@@ -656,15 +656,23 @@ class Store:
                 "pr_head_sha": final_head,
             }
             if final_head != reviewed:
+                try:
+                    current_identity = discover_repo(snapshot["worktree"])
+                except (OSError, StateError):
+                    current_identity = None
                 if (
                     state == "OPEN"
                     and final_head is not None
-                    and final_head == _normal_sha(snapshot.get("head_sha"))
+                    and current_identity is not None
+                    and current_identity.repo_key == snapshot["repo_key"]
+                    and current_identity.branch == snapshot["branch"]
+                    and current_identity.head_sha == final_head
                 ):
                     return self._cas_target(
                         snapshot,
                         {
                             **common,
+                            "head_sha": final_head,
                             "reviewed_head_sha": None,
                             "merge_sha": None,
                             "phase": "WORKING",

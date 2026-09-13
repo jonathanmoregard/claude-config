@@ -338,7 +338,6 @@ class LifecycleTests(RepoFixture):
         run("git", "add", "tracked.txt", cwd=self.repo)
         run("git", "commit", "-qm", "review revision", cwd=self.repo)
         current_head = run("git", "rev-parse", "HEAD", cwd=self.repo)
-        store.upsert_target("session-1", self.repo)
 
         def open_runner(argv, cwd, timeout):
             self.assertEqual(["gh", "pr", "view"], argv[:3])
