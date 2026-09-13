@@ -804,8 +804,12 @@ class Store:
             return "INCONCLUSIVE", "", "timeout"
         except (OSError, ValueError) as exc:
             return "INCONCLUSIVE", "", type(exc).__name__
-        stdout = redact_evidence(result.stdout or "")
-        stderr = redact_evidence(result.stderr or "")
+        # Compare revision identity before redaction: an expected SHA may also
+        # be present in process environment, and replacing it first turns an
+        # exact deploy into a false PENDING. Raw output remains bounded and
+        # in-memory; callers persist only normalized SHA and redacted evidence.
+        stdout = str(result.stdout or "")[-8192:]
+        stderr = str(result.stderr or "")[-8192:]
         if result.returncode != 0:
             return "FAILED", stdout, stderr or f"exit {result.returncode}"
         return "PASS", stdout, stderr

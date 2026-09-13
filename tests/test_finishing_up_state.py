@@ -487,6 +487,111 @@ class LifecycleTests(RepoFixture):
         self.assertEqual("RETIRED", row["phase"])
         self.assertEqual(0, row["active"])
 
+    def test_black_box_cli_lifecycle_preserves_sibling(self) -> None:
+        cli = ROOT / "scripts/dod-track.py"
+        head = run("git", "rev-parse", "HEAD", cwd=self.repo)
+        run("git", "push", "-q", "-u", "origin", "feature-a", cwd=self.repo)
+        sibling = self.base / "sibling"
+        run("git", "worktree", "add", "-q", str(sibling), "feature-b", cwd=self.repo)
+
+        fake_bin = self.base / "bin"
+        fake_bin.mkdir()
+        pr_state = self.base / "pr-state"
+        pr_state.write_text("OPEN\n", encoding="utf-8")
+        fake_gh = fake_bin / "gh"
+        fake_gh.write_text(
+            """#!/usr/bin/env bash
+set -eu
+sub="$1 $2"
+case "$sub" in
+  "pr list") printf '[{"number":48,"url":"https://github.com/example/project/pull/48","baseRefName":"master"}]\\n' ;;
+  "repo view") printf '{"owner":{"login":"example"},"name":"project"}\\n' ;;
+  "api graphql") printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}\\n' ;;
+  "pr checks") printf '[{"name":"ci","state":"SUCCESS","bucket":"pass","link":"","workflow":"ci"}]\\n' ;;
+  "pr view")
+    if [ "$(cat "$TEST_PR_STATE")" = "MERGED" ]; then
+      printf '{"number":48,"url":"https://github.com/example/project/pull/48","state":"MERGED","isDraft":false,"mergeStateStatus":"UNKNOWN","mergeable":"MERGEABLE","reviewDecision":"APPROVED","headRefName":"feature-a","headRefOid":"%s","baseRefName":"master","title":"test","mergeCommit":{"oid":"%s"}}\\n' "$TEST_HEAD" "$TEST_MERGE"
+    else
+      printf '{"number":48,"url":"https://github.com/example/project/pull/48","state":"OPEN","isDraft":false,"mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","reviewDecision":"APPROVED","headRefName":"feature-a","headRefOid":"%s","baseRefName":"master","title":"test","mergeCommit":null}\\n' "$TEST_HEAD"
+    fi ;;
+  *) printf 'unsupported fake gh call: %s\\n' "$*" >&2; exit 2 ;;
+esac
+""",
+            encoding="utf-8",
+        )
+        fake_gh.chmod(0o755)
+        runtime = self.base / "runtime"
+        runtime.mkdir()
+        deployed = runtime / "deployed-sha"
+        smoke = runtime / "smoke"
+        deployed.write_text("d" * 40 + "\n", encoding="utf-8")
+        smoke.write_text("fail\n", encoding="utf-8")
+        env = {
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "TEST_PR_STATE": str(pr_state),
+            "TEST_HEAD": head,
+            "TEST_MERGE": self.MERGE_SHA,
+        }
+
+        def cli_run(*arguments: str) -> object:
+            result = subprocess.run(
+                ["python3", str(cli), "--json", *arguments],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            return json.loads(result.stdout)
+
+        target = cli_run("arm", "--session", "blackbox", "--repo", str(self.repo))
+        sibling_target = cli_run(
+            "arm", "--session", "blackbox", "--repo", str(sibling)
+        )
+        cli_run(
+            "configure",
+            target["id"],
+            "--environment",
+            "production",
+            "--revision-cwd",
+            str(runtime),
+            "--revision-argv",
+            json.dumps(
+                [
+                    "python3",
+                    "-c",
+                    "from pathlib import Path; print(Path('deployed-sha').read_text().strip())",
+                ]
+            ),
+            "--smoke-cwd",
+            str(runtime),
+            "--smoke-argv",
+            json.dumps(
+                [
+                    "python3",
+                    "-c",
+                    "from pathlib import Path; raise SystemExit(0 if Path('smoke').read_text().strip() == 'pass' else 1)",
+                ]
+            ),
+            "--timeout",
+            "10",
+        )
+        handed = cli_run("handoff", target["id"])
+        self.assertEqual("AWAITING_MERGE", handed["phase"])
+        pr_state.write_text("MERGED\n", encoding="utf-8")
+
+        pending = cli_run("verify", target["id"])
+        self.assertEqual("DEPLOYING", pending["phase"])
+        deployed.write_text(self.MERGE_SHA + "\n", encoding="utf-8")
+        failed = cli_run("verify", target["id"])
+        self.assertEqual("SMOKE_FAILED", failed["phase"])
+        smoke.write_text("pass\n", encoding="utf-8")
+        completed = cli_run("verify", target["id"])
+        self.assertEqual("COMPLETE", completed["phase"])
+        remaining = cli_run("list", "--session", "blackbox")
+        self.assertEqual([sibling_target["id"]], [item["id"] for item in remaining])
+
 
 class InformerTests(RepoFixture):
     def _hook(self, payload: object, raw: bool = False):
