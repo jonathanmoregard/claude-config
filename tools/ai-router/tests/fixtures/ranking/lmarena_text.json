@@ -1,0 +1,34 @@
+{
+  "features": [
+    {"feature_idx": 0, "name": "model_name", "type": {"dtype": "string", "_type": "Value"}},
+    {"feature_idx": 1, "name": "organization", "type": {"dtype": "string", "_type": "Value"}},
+    {"feature_idx": 2, "name": "license", "type": {"dtype": "string", "_type": "Value"}},
+    {"feature_idx": 3, "name": "score", "type": {"dtype": "float64", "_type": "Value"}},
+    {"feature_idx": 4, "name": "score_ci_lower", "type": {"dtype": "float64", "_type": "Value"}},
+    {"feature_idx": 5, "name": "score_ci_upper", "type": {"dtype": "float64", "_type": "Value"}},
+    {"feature_idx": 6, "name": "votes", "type": {"dtype": "int64", "_type": "Value"}},
+    {"feature_idx": 7, "name": "rank", "type": {"dtype": "int64", "_type": "Value"}},
+    {"feature_idx": 8, "name": "category", "type": {"dtype": "string", "_type": "Value"}},
+    {"feature_idx": 9, "name": "date", "type": {"dtype": "string", "_type": "Value"}}
+  ],
+  "rows": [
+    {"row_idx": 0, "row": {"model_name": "Claude Mythos 5.1 (High)", "organization": "Anthropic", "license": "Proprietary", "score": 0.131204, "score_ci_lower": 0.1142, "score_ci_upper": 0.1481, "votes": 18234, "rank": 1, "category": "overall", "date": "2026-09-10"}, "truncated_cells": []},
+    {"row_idx": 1, "row": {"model_name": "Gemini 3.5 Pro", "organization": "Google", "license": "Proprietary", "score": 0.118552, "score_ci_lower": 0.1020, "score_ci_upper": 0.1351, "votes": 22110, "rank": 2, "category": "overall", "date": "2026-09-10"}, "truncated_cells": []},
+    {"row_idx": 2, "row": {"model_name": "Claude Opus 5 (High)", "organization": "Anthropic", "license": "Proprietary", "score": 0.110647, "score_ci_lower": 0.0936, "score_ci_upper": 0.1277, "votes": 25406, "rank": 3, "category": "overall", "date": "2026-09-10"}, "truncated_cells": []},
+    {"row_idx": 3, "row": {"model_name": "Claude Opus 5 (Max)", "organization": "Anthropic", "license": "Proprietary", "score": 0.108039, "score_ci_lower": 0.0911, "score_ci_upper": 0.1250, "votes": 14022, "rank": 4, "category": "overall", "date": "2026-09-10"}, "truncated_cells": []},
+    {"row_idx": 4, "row": {"model_name": "Claude Fable 5 (High)", "organization": "Anthropic", "license": "Proprietary", "score": 0.090932, "score_ci_lower": 0.0742, "score_ci_upper": 0.1076, "votes": 19877, "rank": 5, "category": "overall", "date": "2026-09-10"}, "truncated_cells": []},
+    {"row_idx": 5, "row": {"model_name": "Claude Opus 4.8 (High)", "organization": "Anthropic", "license": "Proprietary", "score": 0.075708, "score_ci_lower": 0.0602, "score_ci_upper": 0.0912, "votes": 31002, "rank": 6, "category": "overall", "date": "2026-09-10"}, "truncated_cells": []},
+    {"row_idx": 6, "row": {"model_name": "GPT 5.6 Sol (xHigh)", "organization": "OpenAI", "license": "Proprietary", "score": 0.075076, "score_ci_lower": 0.0588, "score_ci_upper": 0.0913, "votes": 20450, "rank": 7, "category": "overall", "date": "2026-09-10"}, "truncated_cells": []},
+    {"row_idx": 7, "row": {"model_name": "Kimi K3 (Max)", "organization": "Moonshot", "license": "Modified MIT", "score": 0.064584, "score_ci_lower": 0.0480, "score_ci_upper": 0.0811, "votes": 12310, "rank": 8, "category": "overall", "date": "2026-09-10"}, "truncated_cells": []},
+    {"row_idx": 8, "row": {"model_name": "GPT 5.6 Terra (High)", "organization": "OpenAI", "license": "Proprietary", "score": 0.060112, "score_ci_lower": 0.0441, "score_ci_upper": 0.0762, "votes": 15530, "rank": 9, "category": "overall", "date": "2026-09-10"}, "truncated_cells": []},
+    {"row_idx": 9, "row": {"model_name": "Claude Sonnet 5 (High)", "organization": "Anthropic", "license": "Proprietary", "score": 0.055490, "score_ci_lower": 0.0390, "score_ci_upper": 0.0719, "votes": 17204, "rank": 10, "category": "overall", "date": "2026-09-10"}, "truncated_cells": []},
+    {"row_idx": 10, "row": {"model_name": "GPT 5.5 (High)", "organization": "OpenAI", "license": "Proprietary", "score": 0.048803, "score_ci_lower": 0.0330, "score_ci_upper": 0.0646, "votes": 28840, "rank": 11, "category": "overall", "date": "2026-09-10"}, "truncated_cells": []},
+    {"row_idx": 11, "row": {"model_name": "GPT 5.6 Luna (Medium)", "organization": "OpenAI", "license": "Proprietary", "score": 0.041277, "score_ci_lower": 0.0255, "score_ci_upper": 0.0570, "votes": 9930, "rank": 12, "category": "overall", "date": "2026-09-10"}, "truncated_cells": []},
+    {"row_idx": 12, "row": {"model_name": "Claude Haiku 4.5", "organization": "Anthropic", "license": "Proprietary", "score": 0.020115, "score_ci_lower": 0.0045, "score_ci_upper": 0.0358, "votes": 8102, "rank": 13, "category": "overall", "date": "2026-09-10"}, "truncated_cells": []},
+    {"row_idx": 13, "row": {"model_name": "GPT 5.6 Sol (xHigh)", "organization": "OpenAI", "license": "Proprietary", "score": 0.120004, "score_ci_lower": 0.1031, "score_ci_upper": 0.1369, "votes": 7712, "rank": 1, "category": "coding", "date": "2026-09-10"}, "truncated_cells": []},
+    {"row_idx": 14, "row": {"model_name": "Claude Opus 5 (High)", "organization": "Anthropic", "license": "Proprietary", "score": 0.117320, "score_ci_lower": 0.1004, "score_ci_upper": 0.1343, "votes": 7650, "rank": 2, "category": "coding", "date": "2026-09-10"}, "truncated_cells": []}
+  ],
+  "num_rows_total": 15,
+  "num_rows_per_page": 100,
+  "partial": false
+}
