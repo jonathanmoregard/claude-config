@@ -490,7 +490,7 @@
           {
             "type": "command",
             "command": "python3 $HOME/.claude/hooks/finishing-up-informer.py",
-            "timeout": 1
+            "timeout": 10
           },
           {
             "type": "command",
