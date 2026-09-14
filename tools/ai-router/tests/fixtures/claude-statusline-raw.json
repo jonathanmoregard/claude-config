@@ -1,0 +1,4 @@
+{"provider": "claude", "source": "statusline", "observed_at": 1789390000, "cli_version": "2.1.270",
+ "rate_limits": {"five_hour": {"used_percentage": 42, "resets_at": 1789396000},
+                 "seven_day": {"used_percentage": 63, "resets_at": 1789800000},
+                 "seven_day_fable": {"used_percentage": 80, "resets_at": 1789800000}}}

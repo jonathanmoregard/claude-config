@@ -1,0 +1,13 @@
+{"five_hour": {"utilization": 12.5, "resets_at": "2026-09-14T15:00:00+00:00"},
+ "seven_day": {"utilization": 40, "resets_at": "2026-09-19T10:00:00Z"},
+ "seven_day_opus": {"utilization": 5, "resets_at": "2026-09-19T10:00:00Z"},
+ "seven_day_oauth_apps": null,
+ "extra_usage": {"utilization": 0, "resets_at": null},
+ "limits": [
+   {"kind": "session", "percent": 12.5, "resets_at": "2026-09-14T15:00:00Z"},
+   {"kind": "weekly_all", "percent": 40, "resets_at": "2026-09-19T10:00:00Z"},
+   {"kind": "weekly_scoped", "percent": 70, "resets_at": "2026-09-19T10:00:00Z",
+    "scope": {"model": {"display_name": "Fable 5.1"}}},
+   {"kind": "weekly_scoped", "percent": 33, "resets_at": "2026-09-19T10:00:00Z",
+    "scope": {"model": {"display_name": "Sonnet 5"}}}
+ ]}
