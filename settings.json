@@ -330,6 +330,16 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/hooks/ai-router-agent-gate.py",
+            "timeout": 15
+          }
+        ]
       }
     ],
     "SessionEnd": [
@@ -360,6 +370,16 @@
             "command": "python3 $HOME/.claude/hooks/claude-pull-health.py",
             "timeout": 10,
             "statusMessage": "Checking checkout freshness..."
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/hooks/ai-router-health.py",
+            "timeout": 5,
+            "statusMessage": "Checking ai-router background health..."
           }
         ]
       },
@@ -473,6 +493,18 @@
         ]
       }
     ],
+    "StopFailure": [
+      {
+        "matcher": "rate_limit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/hooks/ai-router-stop-failure.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "SubagentStop": [
       {
         "hooks": [
@@ -578,7 +610,7 @@
   },
   "statusLine": {
     "type": "command",
-    "command": "node '/home/jonathan/Repos/token-optimizer/skills/token-optimizer/scripts/statusline.js'"
+    "command": "bash $HOME/.claude/hooks/statusline-quota-tee.sh"
   },
   "enabledPlugins": {
     "ask-questions-if-underspecified@trailofbits": true,
