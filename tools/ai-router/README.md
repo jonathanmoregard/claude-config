@@ -24,8 +24,8 @@ human line.
 | `cancel <job_id>` · `version` | |
 
 Quota failure handling: a job that fails on a quota class writes
-`quota/<provider>.rejected.json` (until the blocking bucket resets) and is
-retried exactly once on the next eligible model of the same tier
+`quota/<provider>.rejected.json` (until the blocking bucket resets, or a newer
+live snapshot shows headroom again) and is retried exactly once on the next eligible model of the same tier
 (`retry_of` / `retried_as` in `meta.json`; `wait` follows the chain).
 
 Claude jobs never pass `--bare`: on 2.1.270 `--bare` refuses OAuth
@@ -40,7 +40,9 @@ permission rules); `--no-bare` loads settings normally.
 - `quota/codex.json`, `quota/claude.json` — probe snapshots
   (`claude.json` is written raw by the statusline tee hook, or by the OAuth
   fallback when the tee is stale).
-- `quota/<provider>.rejected.json` — provider rejected until `until`.
+- `quota/<provider>.rejected.json` — provider rejected until `until`, or
+  until a newer snapshot shows every applicable bucket with headroom ≥ reserve
+  (the marker is then deleted: the window rolled or the parsed reset was wrong).
 - `quota/claude.oauth-backoff` — epoch; OAuth probe skipped until then.
 - `jobs/<job_id>/` — `meta.json`, `prompt.md`, `events.jsonl`, `stderr.log`,
   `status`, `exit_code`, `result.txt`, `result.json` (when parseable),

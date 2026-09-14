@@ -22,7 +22,9 @@ Pins (2026-09-14): `gpt-5.6-sol` > `claude-fable-5-1` > `claude-opus-5` >
 `claude-haiku-4-5-20251001`. Tiers: strongest = sol/fable/opus, standard =
 terra/sonnet, fast = luna/haiku. A provider whose headroom is below the
 reserve (15 %) or that has been rejected (quota error, rate-limit stop) is
-skipped. Unknown quota is reported as unknown, never guessed.
+skipped; a rejection lapses at its reset time or as soon as a newer live
+snapshot shows headroom again. Unknown quota is reported as unknown, never
+guessed.
 
 ## Decide: native or delegate
 
