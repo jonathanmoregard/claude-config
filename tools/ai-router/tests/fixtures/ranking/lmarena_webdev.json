@@ -1,0 +1,24 @@
+{
+  "features": [
+    {"feature_idx": 0, "name": "model_name", "type": {"dtype": "string", "_type": "Value"}},
+    {"feature_idx": 1, "name": "organization", "type": {"dtype": "string", "_type": "Value"}},
+    {"feature_idx": 2, "name": "license", "type": {"dtype": "string", "_type": "Value"}},
+    {"feature_idx": 3, "name": "score", "type": {"dtype": "float64", "_type": "Value"}},
+    {"feature_idx": 4, "name": "score_ci_lower", "type": {"dtype": "float64", "_type": "Value"}},
+    {"feature_idx": 5, "name": "score_ci_upper", "type": {"dtype": "float64", "_type": "Value"}},
+    {"feature_idx": 6, "name": "votes", "type": {"dtype": "int64", "_type": "Value"}},
+    {"feature_idx": 7, "name": "rank", "type": {"dtype": "int64", "_type": "Value"}},
+    {"feature_idx": 8, "name": "date", "type": {"dtype": "string", "_type": "Value"}}
+  ],
+  "rows": [
+    {"row_idx": 0, "row": {"model_name": "Claude Fable 5.1 (High)", "organization": "Anthropic", "license": "Proprietary", "score": 0.142201, "score_ci_lower": 0.1250, "score_ci_upper": 0.1594, "votes": 6120, "rank": 1, "date": "2026-08-19"}, "truncated_cells": []},
+    {"row_idx": 1, "row": {"model_name": "Claude Opus 5 (High)", "organization": "Anthropic", "license": "Proprietary", "score": 0.131877, "score_ci_lower": 0.1150, "score_ci_upper": 0.1487, "votes": 9110, "rank": 2, "date": "2026-08-19"}, "truncated_cells": []},
+    {"row_idx": 2, "row": {"model_name": "GPT 5.6 Sol (xHigh)", "organization": "OpenAI", "license": "Proprietary", "score": 0.120311, "score_ci_lower": 0.1033, "score_ci_upper": 0.1373, "votes": 8404, "rank": 3, "date": "2026-08-19"}, "truncated_cells": []},
+    {"row_idx": 3, "row": {"model_name": "Gemini 3.5 Pro", "organization": "Google", "license": "Proprietary", "score": 0.101450, "score_ci_lower": 0.0845, "score_ci_upper": 0.1184, "votes": 7730, "rank": 4, "date": "2026-08-19"}, "truncated_cells": []},
+    {"row_idx": 4, "row": {"model_name": "Claude Sonnet 5", "organization": "Anthropic", "license": "Proprietary", "score": 0.088902, "score_ci_lower": 0.0720, "score_ci_upper": 0.1058, "votes": 5502, "rank": 5, "date": "2026-08-19"}, "truncated_cells": []},
+    {"row_idx": 5, "row": {"model_name": "GPT 5.6 Terra", "organization": "OpenAI", "license": "Proprietary", "score": 0.079330, "score_ci_lower": 0.0625, "score_ci_upper": 0.0962, "votes": 4980, "rank": 6, "date": "2026-08-19"}, "truncated_cells": []}
+  ],
+  "num_rows_total": 6,
+  "num_rows_per_page": 100,
+  "partial": false
+}

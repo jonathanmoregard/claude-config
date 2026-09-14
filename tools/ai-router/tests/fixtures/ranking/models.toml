@@ -1,0 +1,105 @@
+# ai-router model catalogue and selection settings.
+# Contract: ~/.local/state/claude-tasks/dot-claude/build-contract-ai-router.md
+# §models.toml. Pins are operator INPUT; update_ranking.py only flags
+# disagreement, it never edits this file.
+version = 1
+
+[settings]
+reserve_pct = 15
+stale_after_s = 900
+policy = "rank-first"            # rank-first | headroom-weighted
+near_reset_relax_min = 120
+rejected_default_ttl_s = 3600
+unknown_is_eligible = true       # unknown quota → eligible, reason says so
+claude_oauth_fallback = true
+codex_cache_s = 60
+job_stall_min = 10
+job_timeout_s = 3600
+
+[providers.codex]
+plan = "pro"
+efforts = ["low", "medium", "high", "xhigh", "max", "ultra"]
+
+[providers.claude]
+plan = "max"
+efforts = ["low", "medium", "high", "xhigh", "max"]
+
+[[models]]
+id = "gpt-5.6-sol"
+provider = "codex"
+family = "sol"
+tier = "strongest"
+default_effort = "high"
+caps = ["code", "vision", "long-context", "write"]
+aliases = ["gpt-5.6", "sol"]
+
+[[models]]
+id = "claude-fable-5-1"
+provider = "claude"
+family = "fable"
+tier = "strongest"
+default_effort = "high"
+caps = ["code", "vision", "long-context", "write"]
+aliases = ["fable"]
+
+[[models]]
+id = "claude-opus-5"
+provider = "claude"
+family = "opus"
+tier = "strongest"
+default_effort = "high"
+caps = ["code", "vision", "long-context", "write"]
+aliases = ["opus"]
+
+[[models]]
+id = "gpt-5.6-terra"
+provider = "codex"
+family = "terra"
+tier = "standard"
+default_effort = "medium"
+caps = ["code", "vision", "long-context", "write"]
+aliases = ["terra"]
+
+[[models]]
+id = "claude-sonnet-5"
+provider = "claude"
+family = "sonnet"
+tier = "standard"
+default_effort = "medium"
+caps = ["code", "vision", "long-context", "write"]
+aliases = ["sonnet"]
+
+[[models]]
+id = "gpt-5.6-luna"
+provider = "codex"
+family = "luna"
+tier = "fast"
+default_effort = "medium"
+caps = ["code", "vision", "write"]
+aliases = ["luna"]
+
+[[models]]
+id = "claude-haiku-4-5-20251001"
+provider = "claude"
+family = "haiku"
+tier = "fast"
+default_effort = "medium"
+caps = ["code", "vision", "write"]
+aliases = ["haiku"]
+
+[buckets.claude]
+five_hour = ["*"]
+seven_day = ["*"]
+seven_day_opus = ["claude-opus-5"]
+seven_day_sonnet = ["claude-sonnet-5"]
+seven_day_fable = ["claude-fable-5-1"]
+extra_usage = []
+
+[buckets.codex]
+primary = ["*"]
+secondary = ["*"]
+
+[pins]
+order = ["gpt-5.6-sol", "claude-fable-5-1", "claude-opus-5", "gpt-5.6-terra",
+         "claude-sonnet-5", "gpt-5.6-luna", "claude-haiku-4-5-20251001"]
+note = "Operator order 2026-09-14. update_ranking.py flags disagreement; never reorders."
