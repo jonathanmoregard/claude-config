@@ -29,6 +29,7 @@ evaluate", never raised. Test: `tests/test_ai_router_health.py`.
 """
 from __future__ import annotations
 
+import contextlib
 import glob
 import json
 import os
@@ -62,15 +63,16 @@ def parse_ts(value: object) -> float | None:
         text = value.strip()
         if not text:
             return None
-        try:
-            return float(text)
-        except ValueError:
-            pass
-        try:
-            return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
-        except ValueError:
-            return None
+        for parse in (float, _iso_epoch):
+            try:
+                return parse(text)
+            except ValueError:
+                continue  # not this format; try the next parser
     return None
+
+
+def _iso_epoch(text: str) -> float:
+    return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
 
 
 def fmt_ts(epoch: float) -> str:
@@ -170,10 +172,8 @@ def check_rejections(state: str, at: float) -> list[str]:
 
 
 def main() -> int:
-    try:
+    with contextlib.suppress(OSError):  # hook stdin is informational only
         sys.stdin.read()
-    except OSError:
-        pass
     try:
         state = state_dir()
         if not os.path.isdir(state):

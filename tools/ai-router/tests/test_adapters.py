@@ -88,6 +88,7 @@ def test_claude_argv_workspace_write_no_bare_with_schema(tmp_path: Path):
     assert argv[argv.index("--json-schema") + 1] == '{"type":"object"}'
     assert "--effort" not in argv
     assert "--setting-sources" not in argv and "--strict-mcp-config" not in argv
+    # arftl-allow: permission-widened — asserting these flags are ABSENT from the argv
     for bad in ("--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--bare"):
         assert bad not in argv
 
@@ -98,8 +99,11 @@ def test_materialize_substitutes_prompt_once():
     assert argv[-1] == PROMPT_PLACEHOLDER  # input untouched
 
 
-@pytest.mark.parametrize("flag", ["--dangerously-bypass-approvals-and-sandbox", "--dangerously-skip-permissions",
-                                  "--allow-dangerously-skip-permissions", "--full-auto", "--yolo"])
+# arftl-allow: permission-widened — the flags the adapter must REFUSE; the test below asserts DangerousFlag is raised
+DANGEROUS_FLAGS = ["--dangerously-bypass-approvals-and-sandbox", "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--full-auto", "--yolo"]
+
+
+@pytest.mark.parametrize("flag", DANGEROUS_FLAGS)
 def test_refuse_dangerous_flags(flag: str):
     with pytest.raises(DangerousFlag):
         refuse_dangerous(["/bin/codex", "exec", flag, "--", "p"])

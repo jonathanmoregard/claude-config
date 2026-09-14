@@ -21,6 +21,7 @@ def emit(obj: dict) -> None:
 def main() -> int:
     argv = sys.argv[1:]
     for a in argv:
+        # arftl-allow: permission-widened — this fixture REFUSES these flags; the tests prove the adapter never passes them
         if a.startswith("--dangerously") or a.startswith("--allow-dangerously") or a == "--bare":
             sys.stderr.write(f"fake_claude: refused flag {a}\n")
             return 99

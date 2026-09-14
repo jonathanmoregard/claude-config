@@ -34,7 +34,7 @@ def fake_rpc(fixtures_dir: Path):
         calls.append(methods)
         return {"account/rateLimits/read": load(fixtures_dir, "codex-app-server-rate-limits.json")["result"],
                 "model/list": load(fixtures_dir, "codex-app-server-model-list.json")["result"]}
-    rpc.calls = calls  # type: ignore[attr-defined]
+    rpc.calls = calls  # runtime attribute on the fake; no type checker runs here
     return rpc
 
 
@@ -168,7 +168,7 @@ def make_urlopen(payload, status: int | None = None):
             def read(self):
                 return json.dumps(payload).encode()
         return Resp()
-    urlopen.calls = calls  # type: ignore[attr-defined]
+    urlopen.calls = calls  # runtime attribute on the fake; no type checker runs here
     return urlopen
 
 

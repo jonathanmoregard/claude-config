@@ -19,6 +19,7 @@ Every provider answer is normalised to one shape (``normalised``) which
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
@@ -284,11 +285,11 @@ def app_server_call(codex_bin: str, methods: list[str], timeout_s: float = RPC_T
     except BrokenPipeError:
         raise RuntimeError("codex app-server closed its stdin") from None
     finally:
-        try:
+        # Best-effort reap: the RPC outcome is already decided above, and a
+        # process that is gone or slow to exit must not turn it into an error.
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
             proc.kill()
             proc.wait(timeout=2)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
 
 
 def model_ids(model_list_result: Any) -> list[str] | None:

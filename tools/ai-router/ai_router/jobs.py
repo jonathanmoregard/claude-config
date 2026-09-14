@@ -333,7 +333,7 @@ def cancel(state: Path, job_id: str, run: Callable[..., Any] = subprocess.run) -
             try:
                 os.killpg(pid, signal.SIGTERM) if pid == meta.get("child_pid") else os.kill(pid, signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
-                pass
+                continue  # already gone, or not ours to signal
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline and (pid_alive(meta.get("child_pid")) or pid_alive(meta.get("runner_pid"))):
         time.sleep(0.1)
@@ -342,7 +342,7 @@ def cancel(state: Path, job_id: str, run: Callable[..., Any] = subprocess.run) -
             try:
                 os.kill(pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
-                pass
+                continue  # already gone, or not ours to signal
     write_status(d, "cancelled")
     update_meta(d, finished_at=int(time.time()), error_class="cancelled")
     return {"job_id": job_id, "status": "cancelled", "cancelled": True}

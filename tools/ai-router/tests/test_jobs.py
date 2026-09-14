@@ -176,6 +176,7 @@ def test_runner_refuses_tampered_dangerous_argv(state_dir: Path, tmp_path: Path,
     spec = spec_for("codex", "gpt-5.6-luna", "hi", tmp_path, env)
     job_id, d = jobs.create_job(state_dir, spec, now=time.time())
     binary = adapters.resolve_binary("codex", env)
+    # arftl-allow: permission-widened — tamper test: the runner must refuse this argv and never launch it
     jobs.update_meta(d, argv=[binary, "exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--",
                               adapters.PROMPT_PLACEHOLDER])
     jobs.launch(d, env=env, launcher="setsid")

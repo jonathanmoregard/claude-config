@@ -195,10 +195,10 @@ def final_message(provider: str, events: list[dict[str, Any]], last_message_path
     if provider == "codex" and last_message_path is not None:
         try:
             text = last_message_path.read_text(encoding="utf-8").strip()
-            if text:
-                return clean(text)
         except OSError:
-            pass
+            text = ""  # -o file absent or unreadable: fall through to the event stream
+        if text:
+            return clean(text)
     if provider == "claude":
         for e in reversed(events):
             if e.get("type") == "result" and isinstance(e.get("result"), str) and e["result"]:

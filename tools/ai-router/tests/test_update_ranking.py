@@ -448,7 +448,7 @@ def test_codex_model_list_helper_reports_rpc_error_and_eof():
 
 def test_resolve_model_list_prefers_ai_router_quota_when_it_exposes_model_list(monkeypatch):
     fake = types.ModuleType("ai_router.quota")
-    fake.model_list = lambda: ["gpt-5.6-luna"]  # type: ignore[attr-defined]
+    fake.model_list = lambda: ["gpt-5.6-luna"]
     monkeypatch.setitem(sys.modules, "ai_router.quota", fake)
     spawn = FakeSpawn([])
     assert ur.resolve_model_list(timeout_s=3, spawn=spawn) == ["gpt-5.6-luna"]

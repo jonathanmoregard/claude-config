@@ -54,6 +54,7 @@ def app_server() -> int:
 
 def exec_cmd(argv: list[str]) -> int:
     for a in argv:
+        # arftl-allow: permission-widened — this fixture REFUSES these flags; the tests prove the adapter never passes them
         if a.startswith("--dangerously") or a in ("--full-auto", "--yolo"):
             sys.stderr.write(f"fake_codex: dangerous flag {a}\n")
             return 99

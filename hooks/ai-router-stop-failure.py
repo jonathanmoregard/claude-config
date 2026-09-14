@@ -26,6 +26,7 @@ one line on stderr when something went wrong. Not gated on
 CLAUDE_CODE_ENTRYPOINT — headless sessions hit caps too. `python3 -S -E`
 compatible (stdlib only).
 """
+import contextlib
 import datetime as _dt
 import json
 import os
@@ -146,10 +147,8 @@ def write_rejected(state_dir, record):
             fh.write("\n")
         os.replace(tmp, final)
     except BaseException:
-        try:
+        with contextlib.suppress(OSError):  # best-effort cleanup of the temp file
             os.unlink(tmp)
-        except OSError:
-            pass
         raise
 
 

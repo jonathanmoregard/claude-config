@@ -47,6 +47,7 @@ CLI (contract §RANK):
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import hashlib
 import importlib
@@ -441,11 +442,10 @@ def codex_model_list(timeout_s: float, spawn: Callable[..., Any] = subprocess.Po
         raise RuntimeError(f"codex app-server closed without answering model/list ({timeout_s:g}s timeout)")
     finally:
         timer.cancel()
-        try:
+        # Best-effort reap: the model/list outcome is already decided above.
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
             proc.kill()
             proc.wait(timeout=5)
-        except Exception:
-            pass
 
 
 def resolve_model_list(timeout_s: float, spawn: Callable[..., Any] = subprocess.Popen,
