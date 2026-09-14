@@ -100,6 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--force", action="store_true")
     sp.add_argument("--no-bare", action="store_true")
     sp.add_argument("--host", choices=PROVIDERS)
+    sp.add_argument("--provider", choices=PROVIDERS, help="constrain a --tier pick to one provider")
     sp.add_argument("--name", metavar="NAME")
     sp.add_argument("--allow-downgrade", action="store_true")
     sp.add_argument("--need", action="append", default=[], metavar="CAP")
@@ -250,6 +251,8 @@ def _choose_for_delegate(ctx: Ctx, args: argparse.Namespace, host: str | None) -
         m = ctx.cfg.model(args.model)
         if m is None:
             raise CliError("usage", f"unknown model or alias: {args.model}")
+        if args.provider and args.provider != m.provider:
+            raise CliError("usage", f"{m.id} belongs to {m.provider}, not --provider {args.provider}")
         if not args.force:
             rows = pick(ctx.cfg, snaps, m.tier, need=tuple(args.need), provider=m.provider, host=host,
                         now=ctx.now)["candidates"]
@@ -260,8 +263,8 @@ def _choose_for_delegate(ctx: Ctx, args: argparse.Namespace, host: str | None) -
                 raise CliError(cls, f"{m.id} not eligible: {why} (use --force to bypass)", {"candidates": rows})
         _check_effort(ctx, m.provider, args.effort)
         return m.provider, m.id, args.effort or m.default_effort, m.tier, bool(args.force)
-    r = pick(ctx.cfg, snaps, args.tier, need=tuple(args.need), host=host, allow_downgrade=args.allow_downgrade,
-             now=ctx.now)
+    r = pick(ctx.cfg, snaps, args.tier, need=tuple(args.need), provider=args.provider, host=host,
+             allow_downgrade=args.allow_downgrade, now=ctx.now)
     if not r["ok"]:
         raise CliError("quota", r["reason"], {"candidates": r["candidates"]})
     _check_effort(ctx, r["provider"], args.effort)

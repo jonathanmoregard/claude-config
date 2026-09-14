@@ -115,8 +115,11 @@ def build_argv(provider: str, binary: str, *, model: str, effort: str | None, sa
         argv += ["--", PROMPT_PLACEHOLDER]
     else:
         argv = [binary] + _claude_common(model, effort, sandbox, schema, bare)
-        # --max-turns immediately precedes the prompt so no variadic option can eat it.
-        argv += ["--max-turns", CLAUDE_MAX_TURNS, PROMPT_PLACEHOLDER]
+        # `--` ends option parsing: a prompt whose first character is `-` (a
+        # markdown bullet, say) is otherwise reported as "unknown option" by
+        # the CLI's parser and never reaches the model (measured 2026-09-14 on
+        # 2.1.270). --max-turns precedes it so no variadic option can eat it.
+        argv += ["--max-turns", CLAUDE_MAX_TURNS, "--", PROMPT_PLACEHOLDER]
     refuse_dangerous(argv)
     return argv
 
@@ -129,7 +132,7 @@ def build_resume_argv(provider: str, binary: str, *, thread_id: str, model: str,
                 "-c", f"model_reasoning_effort={effort or 'medium'}", "--skip-git-repo-check", "--", PROMPT_PLACEHOLDER]
     else:
         argv = [binary] + _claude_common(model, effort, sandbox, None, bare)
-        argv += ["--resume", thread_id, "--max-turns", CLAUDE_MAX_TURNS, PROMPT_PLACEHOLDER]
+        argv += ["--resume", thread_id, "--max-turns", CLAUDE_MAX_TURNS, "--", PROMPT_PLACEHOLDER]
     refuse_dangerous(argv)
     return argv
 
@@ -296,6 +299,15 @@ def classify(provider: str, exit_code: int, events: list[dict[str, Any]], stderr
     """done | quota | rejected | overloaded | unparseable | error (contract §Jobs)."""
     diag = _diagnostics(provider, events, stderr)
     quota_re = CODEX_QUOTA if provider == "codex" else CLAUDE_QUOTA
+    # A run that exited 0 AND finished with a result is done, whatever its
+    # non-fatal event stream said on the way ("Reconnecting… 429" is emitted
+    # by codex as a recoverable `error` event). Deciding quota from the regex
+    # first turned such a success into failed:quota, parked the provider
+    # until its weekly reset and ran the job twice.
+    claude_error = provider == "claude" and any(e.get("type") == "result" and e.get("is_error") for e in events)
+    if exit_code == 0 and not claude_error and _finished_ok(provider, events) \
+            and final_message(provider, events, last_message_path) is not None:
+        return "done"
     if quota_re.search(diag):
         return "quota"
     if exit_code != 0:
@@ -304,7 +316,7 @@ def classify(provider: str, exit_code: int, events: list[dict[str, Any]], stderr
         if REJECT_PATTERN.search(diag):
             return "rejected"
         return "error"
-    if provider == "claude" and any(e.get("type") == "result" and e.get("is_error") for e in events):
+    if claude_error:
         return "error"
     if not _finished_ok(provider, events):
         return "unparseable"

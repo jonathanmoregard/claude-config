@@ -60,7 +60,17 @@ def main() -> int:
         response = json.dumps(DEFAULT)
     sys.stdout.write(response)
     sys.stdout.flush()
-    return int(os.environ.get("AI_ROUTER_STUB_EXIT") or 0)
+    forced = os.environ.get("AI_ROUTER_STUB_EXIT")
+    if forced:
+        return int(forced)
+    # Mirror the real CLI: {ok: false} is answered with exit 3 (contract §CLI
+    # exit codes), never exit 0. A stub that exited 0 hid the fact that the
+    # gate treated the real answer as a router failure (2026-09-14).
+    try:
+        ok = json.loads(response).get("ok")
+    except (ValueError, AttributeError):
+        ok = True
+    return 0 if ok else 3
 
 
 if __name__ == "__main__":

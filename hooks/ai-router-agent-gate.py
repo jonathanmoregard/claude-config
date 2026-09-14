@@ -106,19 +106,29 @@ def run_pick(router, args, timeout_s):
     except OSError as exc:
         _log("cannot run %s (%s); allowing" % (router, exc))
         return None
+    # The router answers "nothing eligible" as {ok: false, ...} WITH exit 3
+    # (quota) or 4 (rejected) — contract §CLI. That is an answer, not a
+    # failure, and it is the answer the deny path exists for. Measured
+    # 2026-09-14: treating exit 3 as a router failure made the deny path
+    # unreachable in production while the stub (exit 0) kept the tests green.
+    # Any other non-zero exit, or no parseable object, is a router failure and
+    # fails open.
+    try:
+        result = json.loads(proc.stdout)
+    except ValueError:
+        result = None
+    if isinstance(result, dict) and "ok" in result:
+        if proc.returncode == 0 or (result.get("ok") is False and proc.returncode in (3, 4)):
+            return result
     if proc.returncode != 0:
         tail = (proc.stderr or proc.stdout or "").strip().splitlines()
         _log("router exit %d (%s); allowing" % (proc.returncode, tail[-1] if tail else "no output"))
         return None
-    try:
-        result = json.loads(proc.stdout)
-    except ValueError:
+    if result is None:
         _log("router output not JSON; allowing")
         return None
-    if not isinstance(result, dict):
-        _log("router output not an object; allowing")
-        return None
-    return result
+    _log("router output not a pick object; allowing")
+    return None
 
 
 def decide(payload):
@@ -180,7 +190,7 @@ def decide(payload):
         "(picks %s/%s); see skill ai-router."
         % (
             _fmt_headroom(claude_headroom(claude)),
-            claude.get("reason") or "no eligible Claude model",
+            claude.get("reason") or claude.get("message") or "no eligible Claude model",
             tier,
             cwd,
             any_pick.get("provider"),

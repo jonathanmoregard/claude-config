@@ -131,5 +131,6 @@ never reorders the pins; changing them is an edit to `models.toml` through the
 
 `~/.claude` is read-only: changes to `bin/ai-router`, `tools/ai-router/**`,
 `hooks/ai-router-*`, `hooks/statusline-quota-tee.sh` or this skill go through
-`~/worktrees/claude-<slug>/` off fresh `origin/master`, then a PR. Tests:
-`python3 -m pytest tools/ai-router/tests tests/test_ai_router_hooks.py -q`.
+`~/worktrees/claude-<slug>/` off fresh `origin/master`, then a PR. Tests
+(pytest is nix-provided, not in the base python):
+`nix shell nixpkgs#python3Packages.pytest -c pytest -q tools/ai-router/tests tests/test_ai_router_hooks.py tests/test_ai_router_health.py`.

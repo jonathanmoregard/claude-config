@@ -74,7 +74,7 @@ def test_claude_argv_read_only_and_bare(tmp_path: Path):
     assert "--bare" not in argv
     assert argv[argv.index("--setting-sources") + 1] == ""
     assert "--strict-mcp-config" in argv
-    assert argv[-3:] == ["--max-turns", "60", PROMPT_PLACEHOLDER]
+    assert argv[-4:] == ["--max-turns", "60", "--", PROMPT_PLACEHOLDER]
 
 
 def test_claude_argv_workspace_write_no_bare_with_schema(tmp_path: Path):

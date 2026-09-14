@@ -161,7 +161,10 @@ def create_job(state: Path, spec: JobSpec, *, now: float) -> tuple[str, Path]:
     atomic_write_text(d / "prompt.md", spec.prompt)
     meta: dict[str, Any] = {k: None for k in META_KEYS}
     meta.update({
-        "job_id": job_id, "name": spec.name, "created_at": int(now), "provider": spec.provider,
+        # Sub-second: job ids carry one-second resolution plus random hex, so a
+        # retry created in the same second as its parent would otherwise sort
+        # randomly against it (seen as an intermittent test failure, 2026-09-14).
+        "job_id": job_id, "name": spec.name, "created_at": round(float(now), 6), "provider": spec.provider,
         "model": spec.model, "effort": spec.effort, "tier": spec.tier, "host": spec.host, "cwd": spec.cwd,
         "sandbox": spec.sandbox, "schema": spec.schema, "timeout_s": spec.timeout_s, "stall_min": spec.stall_min,
         "bare": spec.bare, "need": list(spec.need), "argv": list(spec.argv), "forced": spec.forced,
@@ -260,7 +263,18 @@ def status_obj(state: Path, job_id: str, now: float | None = None) -> dict[str, 
 
 
 def list_jobs(state: Path, *, all_jobs: bool = False, now: float | None = None) -> list[dict[str, Any]]:
-    ids = sorted((p.name for p in jobs_root(state).iterdir() if (p / "meta.json").exists()), reverse=True)
+    """Newest first, by `created_at` (sub-second) then id; never by the random id suffix alone."""
+    entries = []
+    for p in jobs_root(state).iterdir():
+        if not (p / "meta.json").exists():
+            continue
+        try:
+            created = float(read_meta(p).get("created_at") or 0)
+        except (TypeError, ValueError):
+            created = 0.0
+        entries.append((created, p.name))
+    entries.sort(reverse=True)
+    ids = [name for _, name in entries]
     if not all_jobs:
         ids = ids[:DEFAULT_LIST]
     out = []

@@ -35,6 +35,10 @@ import sys
 import time
 
 DEFAULT_TTL_S = 3600
+# No Claude limit window is longer than a week; a parsed reset further out
+# than this is a number that merely looked like a time (a 13-digit request id
+# parked Claude until 2029 on 2026-09-14) and is ignored.
+MAX_AHEAD_S = 8 * 86400
 REASON_MAX = 300
 
 _EPOCH = re.compile(r"(?<![\d.])(\d{13}|\d{10})(?![\d.])")
@@ -72,7 +76,7 @@ def parse_until(text, now):
         value = int(m.group(1))
         if len(m.group(1)) == 13:
             value //= 1000
-        if value > now:
+        if now < value <= now + MAX_AHEAD_S:
             return value
 
     for m in _ISO.finditer(text):
@@ -83,7 +87,7 @@ def parse_until(text, now):
         if when.tzinfo is None:
             when = when.replace(tzinfo=_local_tz())
         value = int(when.timestamp())
-        if value > now:
+        if now < value <= now + MAX_AHEAD_S:
             return value
 
     m = _REL.search(text)
@@ -91,7 +95,7 @@ def parse_until(text, now):
         seconds = 0
         for amount, unit in _REL_PART.findall(m.group(1)):
             seconds += int(amount) * {"h": 3600, "m": 60, "s": 1}[unit.lower()]
-        if seconds > 0:
+        if 0 < seconds <= MAX_AHEAD_S:
             return now + seconds
 
     m = _CLOCK.search(text)

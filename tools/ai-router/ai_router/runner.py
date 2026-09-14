@@ -219,8 +219,12 @@ def run(d: Path) -> int:
         if cid:
             fields["thread_id" if provider == "codex" else "session_id"] = cid
     jobs.update_meta(d, **fields)
-    jobs.write_status(d, status)
 
+    # The retry is linked (retried_as / retry_note) BEFORE the terminal status
+    # lands, so a waiter that sees `failed:quota` sees the retry with it. The
+    # other order let `delegate --wait` return failed:quota while the retry
+    # was still being decided (quota re-probe up to 8 s) — observed as an
+    # intermittent test failure under load, 2026-09-14.
     if status == "failed:quota":
         diag = stderr_text or (text or "")
         for e in events:
@@ -230,6 +234,7 @@ def run(d: Path) -> int:
             _retry_after_quota(state, d, jobs.read_meta(d), diag, time.time())
         except Exception as exc:  # noqa: BLE001 — the retry is best effort; the failure is already recorded
             jobs.update_meta(d, retry_note=f"retry failed: {type(exc).__name__}: {exc}")
+    jobs.write_status(d, status)
     return 0 if status == "done" else 1
 
 
