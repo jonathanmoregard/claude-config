@@ -89,6 +89,38 @@ def rejection(cfg: Config, state: Path, provider: str, now: float) -> dict[str, 
     return None
 
 
+def live_supersedes(cfg: Config, rejected: dict[str, Any] | None, observed_at: Any,
+                    buckets: list[dict[str, Any]]) -> bool:
+    """A rejection marker is a hint with a horizon, not a verdict.
+
+    A snapshot observed AFTER the marker was written, whose applicable buckets
+    all keep headroom >= reserve, is newer evidence than the marker (the window
+    rolled, credits were added, or the parsed "try again at" was wrong). The
+    boundary is the one selection._evaluate applies (`headroom < reserve` is
+    ineligible), so a cleared provider is one `pick` would actually offer.
+    Buckets that apply to no model, and snapshots older than the marker, are
+    not evidence either way.
+    """
+    if rejected is None or observed_at is None:
+        return False
+    if float(observed_at) <= float(rejected.get("observed_at") or 0):
+        return False
+    applicable = [b for b in buckets if b.get("applies_to") and b.get("used_pct") is not None]
+    if not applicable:
+        return False
+    return all(100.0 - float(b["used_pct"]) >= cfg.settings.reserve_pct for b in applicable)
+
+
+def _clear_superseded(cfg: Config, state: Path, provider: str, rejected: dict[str, Any] | None,
+                      observed_at: Any, buckets: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Drop the marker file when live evidence supersedes it; return the rejection still in force."""
+    if not live_supersedes(cfg, rejected, observed_at, buckets):
+        return rejected
+    with contextlib.suppress(OSError):
+        rejected_path(state, provider).unlink()
+    return None
+
+
 # --- normalisation ---------------------------------------------------------------
 
 def _to_epoch(value: Any) -> int | None:
@@ -345,11 +377,13 @@ def rollout_rate_limits(path: Path) -> tuple[dict[str, Any], float] | None:
 
 # --- codex probe ---------------------------------------------------------------
 
-def _codex_from_cache(cfg: Config, cached: dict[str, Any], now: float, rejected: dict[str, Any] | None,
-                      error: str | None = None) -> dict[str, Any]:
+def _codex_from_cache(cfg: Config, state: Path, cached: dict[str, Any], now: float,
+                      rejected: dict[str, Any] | None, error: str | None = None) -> dict[str, Any]:
+    buckets = cached.get("buckets") or []
+    rejected = _clear_superseded(cfg, state, "codex", rejected, cached.get("observed_at"), buckets)
     return normalised(cfg, "codex", status="ok", source=str(cached.get("source", "app-server")),
                       observed_at=cached.get("observed_at"), now=now, plan=cached.get("plan"),
-                      buckets=cached.get("buckets") or [], models=cached.get("models"), rejected=rejected, error=error)
+                      buckets=buckets, models=cached.get("models"), rejected=rejected, error=error)
 
 
 def probe_codex(cfg: Config, state: Path, *, now: float, fresh: bool = False, rpc: RpcFn | None = None,
@@ -361,7 +395,7 @@ def probe_codex(cfg: Config, state: Path, *, now: float, fresh: bool = False, rp
     if not isinstance(cached, dict) or cached.get("observed_at") is None:
         cached = None
     if cached and not fresh and now - float(cached["observed_at"]) < cfg.settings.codex_cache_s:
-        return _codex_from_cache(cfg, cached, now, rejected)
+        return _codex_from_cache(cfg, state, cached, now, rejected)
 
     error: str | None
     if rpc is None and codex_bin is None:
@@ -377,12 +411,12 @@ def probe_codex(cfg: Config, state: Path, *, now: float, fresh: bool = False, rp
                       "buckets": codex_buckets(cfg, rate_limits, rl.get("rateLimitsByLimitId") if isinstance(rl, dict) else None),
                       "models": model_ids(res.get("model/list")), "raw": rl}
             atomic_write_json(path, record)
-            return _codex_from_cache(cfg, record, now, rejected)
+            return _codex_from_cache(cfg, state, record, now, rejected)
         except Exception as exc:  # noqa: BLE001 — any probe failure degrades, never raises
             error = f"{type(exc).__name__}: {exc}"
 
     if cached:
-        return _codex_from_cache(cfg, cached, now, rejected, error=error)
+        return _codex_from_cache(cfg, state, cached, now, rejected, error=error)
 
     sessions = sessions_dir if sessions_dir is not None else (home or Path.home()) / ".codex" / "sessions"
     newest = newest_rollout(sessions)
@@ -393,18 +427,19 @@ def probe_codex(cfg: Config, state: Path, *, now: float, fresh: bool = False, rp
                   "plan": rl.get("plan_type") or cfg.plans.get("codex"),
                   "buckets": codex_buckets(cfg, rl, None), "models": None, "raw": rl}
         atomic_write_json(path, record)
-        return _codex_from_cache(cfg, record, now, rejected, error=error)
+        return _codex_from_cache(cfg, state, record, now, rejected, error=error)
     return normalised(cfg, "codex", status="unknown", source="none", observed_at=None, now=now,
                       rejected=rejected, error=error)
 
 
 # --- claude probe ---------------------------------------------------------------
 
-def _claude_from_raw(cfg: Config, raw: dict[str, Any], now: float, rejected: dict[str, Any] | None,
-                     error: str | None = None) -> dict[str, Any]:
+def _claude_from_raw(cfg: Config, state: Path, raw: dict[str, Any], now: float,
+                     rejected: dict[str, Any] | None, error: str | None = None) -> dict[str, Any]:
+    buckets = claude_buckets(cfg, raw.get("rate_limits"))
+    rejected = _clear_superseded(cfg, state, "claude", rejected, raw.get("observed_at"), buckets)
     return normalised(cfg, "claude", status="ok", source=str(raw.get("source", "statusline")),
-                      observed_at=raw.get("observed_at"), now=now,
-                      buckets=claude_buckets(cfg, raw.get("rate_limits")), rejected=rejected, error=error)
+                      observed_at=raw.get("observed_at"), now=now, buckets=buckets, rejected=rejected, error=error)
 
 
 def _oauth_token(credentials_path: Path) -> str | None:
@@ -448,7 +483,7 @@ def probe_claude(cfg: Config, state: Path, *, now: float, fresh: bool = False, u
     if not isinstance(raw, dict) or raw.get("observed_at") is None:
         raw = None
     if raw and not fresh and now - float(raw["observed_at"]) < cfg.settings.stale_after_s:
-        return _claude_from_raw(cfg, raw, now, rejected)
+        return _claude_from_raw(cfg, state, raw, now, rejected)
 
     error: str | None = None
     creds = credentials_path if credentials_path is not None else \
@@ -462,13 +497,13 @@ def probe_claude(cfg: Config, state: Path, *, now: float, fresh: bool = False, u
                 record = {"provider": "claude", "source": "oauth", "observed_at": int(now),
                           "cli_version": cli_version, "rate_limits": payload}
                 atomic_write_json(path, record)
-                return _claude_from_raw(cfg, record, now, rejected)
+                return _claude_from_raw(cfg, state, record, now, rejected)
             except Exception as exc:  # noqa: BLE001 — degrade, never raise
                 error = f"oauth: {type(exc).__name__}: {exc}"
         else:
             error = "oauth: no credentials"
     if raw:
-        return _claude_from_raw(cfg, raw, now, rejected, error=error)
+        return _claude_from_raw(cfg, state, raw, now, rejected, error=error)
     return normalised(cfg, "claude", status="unknown", source="none", observed_at=None, now=now,
                       rejected=rejected, error=error)
 
