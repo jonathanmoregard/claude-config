@@ -23,9 +23,9 @@ def snap(provider: str, buckets: list[dict], status: str = "ok", **extra) -> dic
     return base
 
 
-def bucket(bid: str, used: float, resets_in_s: int = 100_000, applies=("*",)) -> dict:
+def bucket(bid: str, used: float, resets_in_s: int = 100_000, applies=("*",), window_min: int = 10080) -> dict:
     return {"id": bid, "used_pct": used, "resets_at": NOW + resets_in_s,
-            "window_min": 10080, "applies_to": list(applies)}
+            "window_min": window_min, "applies_to": list(applies)}
 
 
 @pytest.fixture
@@ -33,11 +33,28 @@ def cfg():
     return load_config()
 
 
-def both_ok(codex_used: float = 10, claude_used: float = 10) -> dict:
+def with_policy(cfg, tmp_path: Path, policy: str):
+    """Reload models.toml with ``settings.policy`` swapped (whatever the shipped default is)."""
+    import re
+    text = re.sub(r'^policy = "[a-z-]+"', f'policy = "{policy}"', cfg.path.read_text(), count=1, flags=re.M)
+    assert f'policy = "{policy}"' in text
+    p = tmp_path / "m.toml"
+    p.write_text(text)
+    return load_config(p)
+
+
+def both_ok(codex_used: float = 10, claude_used: float = 10, resets_in_s: int = 100_000) -> dict:
     return {
-        "codex": snap("codex", [bucket("primary", codex_used)]),
-        "claude": snap("claude", [bucket("five_hour", claude_used), bucket("seven_day", claude_used)]),
+        "codex": snap("codex", [bucket("primary", codex_used, resets_in_s)]),
+        "claude": snap("claude", [bucket("five_hour", claude_used, resets_in_s),
+                                  bucket("seven_day", claude_used, resets_in_s)]),
     }
+
+
+# Fixture geometry: window 10080 min = 604 800 s. resets_in 100 000 s → 16.5 % of the
+# window left → linear line 16.5; resets_in 500 000 s → 82.7 % left → line 82.7.
+LINE_LATE = 100 * 100_000 / 604_800   # 16.53
+LINE_EARLY = 100 * 500_000 / 604_800  # 82.67
 
 
 # --- config -----------------------------------------------------------------
@@ -74,7 +91,8 @@ def test_state_dir_created_0700(tmp_path: Path):
 
 # --- pick: rank-first -----------------------------------------------------------
 
-def test_rank_first_picks_first_pin_in_tier(cfg):
+def test_rank_first_picks_first_pin_in_tier(cfg, tmp_path: Path):
+    cfg = with_policy(cfg, tmp_path, "rank-first")
     r = pick(cfg, both_ok(), "strongest", now=NOW)
     assert r["ok"] and r["model"] == "gpt-5.6-sol" and r["provider"] == "codex"
     assert r["effort"] == "high" and r["tier"] == "strongest"
@@ -166,9 +184,12 @@ def test_near_reset_bucket_relaxed(cfg):
     r = pick(cfg, s, "strongest", now=NOW)
     assert r["model"] == "gpt-5.6-sol"
     assert "reset" in r["candidates"][0]["why"]
-    # Same bucket resetting in 3 h is NOT relaxed
-    s["codex"] = snap("codex", [bucket("primary", 90, resets_in_s=3 * 3600)])
-    assert pick(cfg, s, "strongest", now=NOW)["model"] == "claude-fable-5-1"
+    # A 5 h bucket resetting in 3 h is NOT relaxed (and its floor is still the full
+    # reserve: 60 % of the window is left, so the line sits at 60)
+    s["codex"] = snap("codex", [bucket("primary", 90, resets_in_s=3 * 3600, window_min=300)])
+    r2 = pick(cfg, s, "strongest", now=NOW)
+    assert r2["model"] == "claude-fable-5-1"
+    assert "reset" not in r2["candidates"][0]["why"] and "reserve" in r2["candidates"][0]["why"]
 
 
 def test_codex_model_list_availability(cfg):
@@ -195,10 +216,7 @@ def test_allow_downgrade_walks_ladder(cfg):
 
 
 def test_headroom_weighted_prefers_max_headroom_within_tier(cfg, tmp_path: Path):
-    text = cfg.path.read_text().replace('policy = "rank-first"', 'policy = "headroom-weighted"')
-    p = tmp_path / "m.toml"
-    p.write_text(text)
-    c2 = load_config(p)
+    c2 = with_policy(cfg, tmp_path, "headroom-weighted")
     s = both_ok(codex_used=50, claude_used=20)
     r = pick(c2, s, "strongest", now=NOW)
     assert r["model"] == "claude-fable-5-1" and r["headroom"] == 80
@@ -238,3 +256,136 @@ def test_detect_host():
     assert detect_host({"CLAUDE_CODE_SESSION_ID": "x"}) == "claude"
     assert detect_host({"CODEX_SANDBOX": "1"}) == "codex"
     assert detect_host({"HOME": "/x"}) is None
+
+
+# --- pacing: surplus against the linear spend line, descending reserve floor -----
+
+def test_pace_settings_loaded_and_policy_validated(cfg, tmp_path: Path):
+    assert cfg.settings.policy == "pace"
+    assert cfg.settings.pace_slack_pct == 5
+    assert with_policy(cfg, tmp_path, "rank-first").settings.policy == "rank-first"
+    with pytest.raises(ConfigError):
+        with_policy(cfg, tmp_path, "ghost")
+
+
+def test_candidate_rows_report_surplus_against_linear_line(cfg):
+    # used 10 → headroom 90; 16.5 % of the window left → line 16.5 → 73.5 pts ahead
+    r = pick(cfg, both_ok(), "strongest", now=NOW)
+    sol = r["candidates"][0]
+    assert sol["headroom"] == 90
+    assert sol["surplus"] == round(90 - LINE_LATE, 1) == 73.5
+    assert "73.5 pts ahead of pace" in sol["why"]
+    assert r["surplus"] == sol["surplus"]
+
+
+def test_behind_pace_is_reported_as_negative_surplus(cfg):
+    # 82.7 % of the window left → line 82.7; used 40 → headroom 60 → 22.7 pts behind
+    r = pick(cfg, both_ok(codex_used=40, resets_in_s=500_000), "strongest", now=NOW)
+    sol = next(c for c in r["candidates"] if c["model"] == "gpt-5.6-sol")
+    assert sol["surplus"] == round(60 - LINE_EARLY, 1) == -22.7
+    assert sol["eligible"] is True and "22.7 pts behind pace" in sol["why"]
+
+
+def test_reserve_floor_descends_with_the_line_on_a_weekly_bucket(cfg):
+    # 90 % used, 3 h before a weekly reset: the line is at 1.8, so the floor is 1.8,
+    # not 15 → the last 10 % is spendable (the period can end near 0).
+    s = both_ok()
+    s["codex"] = snap("codex", [bucket("primary", 90, resets_in_s=3 * 3600)])
+    r = pick(cfg, s, "strongest", now=NOW)
+    sol = r["candidates"][0]
+    assert sol["eligible"] is True and sol["headroom"] == 10
+    assert sol["surplus"] == round(10 - 100 * 3 * 3600 / 604_800, 1) == 8.2
+    assert r["model"] == "gpt-5.6-sol"
+
+
+def test_reserve_floor_holds_while_the_line_is_above_reserve(cfg):
+    # 90 % used with 82.7 % of the window left: floor = min(15, 82.7) = 15 → ineligible
+    s = both_ok(resets_in_s=500_000)
+    s["codex"] = snap("codex", [bucket("primary", 90, resets_in_s=500_000)])
+    r = pick(cfg, s, "strongest", now=NOW)
+    sol = r["candidates"][0]
+    assert sol["eligible"] is False and "headroom 10 % < reserve floor 15 %" in sol["why"]
+    assert r["model"] == "claude-fable-5-1"
+
+
+def test_reserve_floor_reason_names_the_descended_floor(cfg):
+    # 99 % used, 3 h before a weekly reset: floor 1.8 > headroom 1 → still ineligible
+    s = both_ok()
+    s["codex"] = snap("codex", [bucket("primary", 99, resets_in_s=3 * 3600)])
+    sol = pick(cfg, s, "strongest", now=NOW)["candidates"][0]
+    assert sol["eligible"] is False and "headroom 1 % < reserve floor 1.8 %" in sol["why"]
+
+
+def test_bucket_without_reset_info_has_null_surplus_and_full_reserve(cfg):
+    s = both_ok()
+    s["codex"] = snap("codex", [{"id": "primary", "used_pct": 10, "resets_at": None,
+                                 "window_min": None, "applies_to": ["*"]}])
+    r = pick(cfg, s, "strongest", now=NOW)
+    sol = r["candidates"][0]
+    assert sol["eligible"] is True and sol["headroom"] == 90 and sol["surplus"] is None
+    assert "pace" not in sol["why"]
+    s["codex"]["buckets"][0]["used_pct"] = 90
+    assert pick(cfg, s, "strongest", now=NOW)["candidates"][0]["eligible"] is False
+
+
+# --- pick: pace policy -------------------------------------------------------------
+
+def test_pace_keeps_pins_order_when_everyone_is_on_pace(cfg):
+    r = pick(cfg, both_ok(), "strongest", now=NOW)
+    assert r["ok"] and r["model"] == "gpt-5.6-sol"
+    assert r["reason"].startswith("pace: ")
+
+
+def test_pace_diverts_when_top_pin_is_behind_and_another_provider_is_ahead(cfg):
+    # codex 22.7 behind, claude 7.3 ahead → fable although sol is pinned first
+    r = pick(cfg, both_ok(codex_used=40, claude_used=10, resets_in_s=500_000), "strongest", now=NOW)
+    assert r["model"] == "claude-fable-5-1" and r["surplus"] == 7.3
+    assert "behind pace" in r["candidates"][0]["why"]
+
+
+def test_pace_picks_least_behind_when_everyone_is_behind(cfg):
+    # codex −22.7, claude −12.7 → claude
+    r = pick(cfg, both_ok(codex_used=40, claude_used=30, resets_in_s=500_000), "strongest", now=NOW)
+    assert r["model"] == "claude-fable-5-1" and r["surplus"] == -12.7
+    # codex −22.7, claude −32.7 → codex
+    r2 = pick(cfg, both_ok(codex_used=40, claude_used=50, resets_in_s=500_000), "strongest", now=NOW)
+    assert r2["model"] == "gpt-5.6-sol" and r2["surplus"] == -22.7
+
+
+def test_pace_slack_keeps_a_slightly_behind_top_pin(cfg):
+    # codex 3.7 behind (within slack 5) → still sol; 8.7 behind → divert to claude (+7.3)
+    r = pick(cfg, both_ok(codex_used=21, claude_used=10, resets_in_s=500_000), "strongest", now=NOW)
+    assert r["model"] == "gpt-5.6-sol" and r["surplus"] == -3.7
+    r2 = pick(cfg, both_ok(codex_used=26, claude_used=10, resets_in_s=500_000), "strongest", now=NOW)
+    assert r2["model"] == "claude-fable-5-1"
+
+
+def test_pace_ties_keep_pins_order(cfg):
+    r = pick(cfg, both_ok(codex_used=40, claude_used=40, resets_in_s=500_000), "strongest", now=NOW)
+    assert r["model"] == "gpt-5.6-sol"
+
+
+def test_pace_treats_unknown_quota_as_on_pace(cfg):
+    # claude unknown (surplus None) and codex behind → claude is the on-pace choice
+    s = both_ok(codex_used=40, resets_in_s=500_000)
+    s["claude"] = snap("claude", [], status="unknown", source="none")
+    r = pick(cfg, s, "strongest", now=NOW)
+    assert r["model"] == "claude-fable-5-1" and r["surplus"] is None and "unknown" in r["reason"]
+
+
+def test_pace_uses_the_worst_bucket_of_a_provider(cfg):
+    # claude five_hour ahead but seven_day behind → provider surplus is the seven_day one
+    s = both_ok(codex_used=10, claude_used=10)
+    s["claude"]["buckets"][1] = bucket("seven_day", 40, resets_in_s=500_000)
+    r = pick(cfg, s, "strongest", provider="claude", now=NOW)
+    assert r["surplus"] == -22.7
+
+
+def test_pace_walks_downgrade_ladder_only_when_tier_is_empty(cfg):
+    s = both_ok(codex_used=95, claude_used=10)
+    s["claude"]["buckets"].append(bucket("seven_day_fable", 95, applies=("claude-fable-5-1",)))
+    s["claude"]["buckets"].append(bucket("seven_day_opus", 95, applies=("claude-opus-5",)))
+    assert pick(cfg, s, "strongest", now=NOW)["ok"] is False
+    r = pick(cfg, s, "strongest", allow_downgrade=True, now=NOW)
+    assert r["ok"] and r["model"] == "claude-sonnet-5" and r["tier"] == "standard"
+    assert "downgraded" in r["reason"]

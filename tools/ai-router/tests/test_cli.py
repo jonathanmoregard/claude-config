@@ -65,6 +65,9 @@ def test_pick_json_and_exit3(capsys, env):
     rc, obj, *_ = run(capsys, ["pick", "--tier", "fast", "--json"], env)
     assert rc == 0 and obj["model"] == "claude-haiku-4-5-20251001" and obj["native"] is False
     assert obj["candidates"][0]["model"] == "gpt-5.6-luna" and obj["candidates"][0]["eligible"] is False
+    assert "surplus" in obj and all("surplus" in c for c in obj["candidates"])
+    rc, _, out, _ = run(capsys, ["pick", "--tier", "fast"], env)
+    assert rc == 0 and "pace=" in out
     rc, obj, *_ = run(capsys, ["pick", "--tier", "fast", "--host", "claude", "--json"], env)
     assert obj["native"] is True
     rc, obj, *_ = run(capsys, ["pick", "--tier", "fast", "--provider", "codex", "--json"], env)

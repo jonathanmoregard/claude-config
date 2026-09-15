@@ -33,6 +33,7 @@ from typing import Any, Callable
 
 from . import VERSION
 from .config import Config, atomic_write_json, atomic_write_text, read_json
+from .pacing import bucket_status
 
 RPC_TIMEOUT_S = 8.0
 OAUTH_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -90,16 +91,20 @@ def rejection(cfg: Config, state: Path, provider: str, now: float) -> dict[str, 
 
 
 def live_supersedes(cfg: Config, rejected: dict[str, Any] | None, observed_at: Any,
-                    buckets: list[dict[str, Any]]) -> bool:
+                    buckets: list[dict[str, Any]], now: float) -> bool:
     """A rejection marker is a hint with a horizon, not a verdict.
 
     A snapshot observed AFTER the marker was written, whose applicable buckets
-    all keep headroom >= reserve, is newer evidence than the marker (the window
-    rolled, credits were added, or the parsed "try again at" was wrong). The
-    boundary is the one selection._evaluate applies (`headroom < reserve` is
+    all keep headroom at or above their floor, is newer evidence than the
+    marker (the window rolled, credits were added, or the parsed "try again
+    at" was wrong). The floor is the one selection applies per bucket
+    (``pacing.bucket_status``: headroom under min(reserve, line) is
     ineligible), so a cleared provider is one `pick` would actually offer.
-    Buckets that apply to no model, and snapshots older than the marker, are
-    not evidence either way.
+    Selection's near-reset relax is deliberately NOT mirrored: a capped bucket
+    minutes from its reset keeps the marker (it lapses at that reset anyway),
+    whereas honouring the descending floor matters for days. Buckets that
+    apply to no model, and snapshots older than the marker, are not evidence
+    either way.
     """
     if rejected is None or observed_at is None:
         return False
@@ -108,13 +113,17 @@ def live_supersedes(cfg: Config, rejected: dict[str, Any] | None, observed_at: A
     applicable = [b for b in buckets if b.get("applies_to") and b.get("used_pct") is not None]
     if not applicable:
         return False
-    return all(100.0 - float(b["used_pct"]) >= cfg.settings.reserve_pct for b in applicable)
+    for b in applicable:
+        room, _line, _relaxed, floor = bucket_status(cfg, b, now)
+        if room < floor:
+            return False
+    return True
 
 
 def _clear_superseded(cfg: Config, state: Path, provider: str, rejected: dict[str, Any] | None,
-                      observed_at: Any, buckets: list[dict[str, Any]]) -> dict[str, Any] | None:
+                      observed_at: Any, buckets: list[dict[str, Any]], now: float) -> dict[str, Any] | None:
     """Drop the marker file when live evidence supersedes it; return the rejection still in force."""
-    if not live_supersedes(cfg, rejected, observed_at, buckets):
+    if not live_supersedes(cfg, rejected, observed_at, buckets, now):
         return rejected
     with contextlib.suppress(OSError):
         rejected_path(state, provider).unlink()
@@ -380,7 +389,7 @@ def rollout_rate_limits(path: Path) -> tuple[dict[str, Any], float] | None:
 def _codex_from_cache(cfg: Config, state: Path, cached: dict[str, Any], now: float,
                       rejected: dict[str, Any] | None, error: str | None = None) -> dict[str, Any]:
     buckets = cached.get("buckets") or []
-    rejected = _clear_superseded(cfg, state, "codex", rejected, cached.get("observed_at"), buckets)
+    rejected = _clear_superseded(cfg, state, "codex", rejected, cached.get("observed_at"), buckets, now)
     return normalised(cfg, "codex", status="ok", source=str(cached.get("source", "app-server")),
                       observed_at=cached.get("observed_at"), now=now, plan=cached.get("plan"),
                       buckets=buckets, models=cached.get("models"), rejected=rejected, error=error)
@@ -437,7 +446,7 @@ def probe_codex(cfg: Config, state: Path, *, now: float, fresh: bool = False, rp
 def _claude_from_raw(cfg: Config, state: Path, raw: dict[str, Any], now: float,
                      rejected: dict[str, Any] | None, error: str | None = None) -> dict[str, Any]:
     buckets = claude_buckets(cfg, raw.get("rate_limits"))
-    rejected = _clear_superseded(cfg, state, "claude", rejected, raw.get("observed_at"), buckets)
+    rejected = _clear_superseded(cfg, state, "claude", rejected, raw.get("observed_at"), buckets, now)
     return normalised(cfg, "claude", status="ok", source=str(raw.get("source", "statusline")),
                       observed_at=raw.get("observed_at"), now=now, buckets=buckets, rejected=rejected, error=error)
 

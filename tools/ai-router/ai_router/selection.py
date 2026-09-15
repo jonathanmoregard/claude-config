@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 from .config import TIERS, Config, Model
+from .pacing import bucket_status
 
 MODEL_LIST_MAX_AGE_S = 3600  # codex model/list is trusted for availability for 1 h
 
@@ -29,35 +30,52 @@ def _applies(bucket: dict[str, Any], model: Model) -> bool:
     return any(t == "*" or t == model.id or t == model.family for t in targets)
 
 
-def _headroom(cfg: Config, snap: dict[str, Any] | None, model: Model, now: float) -> tuple[float | None, bool, str]:
-    """(headroom, reserve_test_applies, note).
+def _assess(cfg: Config, snap: dict[str, Any] | None, model: Model, now: float
+            ) -> tuple[float | None, float | None, str | None, str]:
+    """(headroom, surplus, below_floor, note) for one model against its provider snapshot.
 
-    headroom = min(100 - used_pct) over applicable buckets that are not about
-    to reset; buckets resetting within ``near_reset_relax_min`` are reported
-    but excluded from the reserve test. Unknown snapshot → (None, False, …).
+    Over the counted buckets (applicable to the model and not about to reset;
+    terms from ``pacing.bucket_status``): headroom = min headroom; surplus =
+    min(headroom_b − line_b), i.e. the percentage points the provider sits
+    ahead (+) or behind (−) the linear spend line — None when no counted
+    bucket has reset geometry; below_floor names the first bucket whose
+    headroom is under its floor. Buckets resetting within
+    ``near_reset_relax_min`` are reported but exempt from the floor. Unknown
+    snapshot → (None, None, None, "quota unknown").
     """
     if not snap or snap.get("status") == "unknown":
-        return None, False, "quota unknown"
-    relax_s = cfg.settings.near_reset_relax_min * 60
-    counted: list[float] = []
+        return None, None, None, "quota unknown"
+    counted: list[tuple[float, float | None, float]] = []
     relaxed: list[float] = []
     for b in snap.get("buckets", []):
-        if not _applies(b, model):
+        if not _applies(b, model) or b.get("used_pct") is None:
             continue
-        used = b.get("used_pct")
-        if used is None:
-            continue
-        room = 100.0 - float(used)
-        resets_at = b.get("resets_at")
-        if resets_at is not None and (float(resets_at) - now) <= relax_s:
+        room, line, is_relaxed, floor = bucket_status(cfg, b, now)
+        if is_relaxed:
             relaxed.append(room)
         else:
-            counted.append(room)
-    if counted:
-        return min(counted), True, ""
-    if relaxed:
-        return min(relaxed), False, "near reset, reserve relaxed"
-    return None, False, "no applicable bucket"
+            counted.append((room, line, floor))
+    if not counted:
+        if relaxed:
+            return min(relaxed), None, None, "near reset, reserve relaxed"
+        return None, None, None, "no applicable bucket"
+    headroom = min(room for room, _, _ in counted)
+    paced = [room - line for room, line, _ in counted if line is not None]
+    surplus = round(min(paced), 1) if paced else None
+    below: str | None = None
+    for room, _, floor in counted:
+        if room < floor:
+            below = f"headroom {_fmt(room)} % < reserve floor {_fmt(round(floor, 1))} %"
+            break
+    return headroom, surplus, below, ""
+
+
+def _pace_phrase(surplus: float) -> str:
+    if surplus > 0:
+        return f"{surplus:g} pts ahead of pace"
+    if surplus < 0:
+        return f"{-surplus:g} pts behind pace"
+    return "on pace"
 
 
 def _available(snap: dict[str, Any] | None, model: Model, now: float) -> bool:
@@ -82,7 +100,7 @@ def _fmt(n: float | None) -> str:
 def _evaluate(cfg: Config, snapshots: dict[str, dict[str, Any]], model: Model, need: tuple[str, ...],
               provider: str | None, now: float) -> dict[str, Any]:
     snap = snapshots.get(model.provider)
-    headroom, reserve_applies, note = _headroom(cfg, snap, model, now)
+    headroom, surplus, below_floor, note = _assess(cfg, snap, model, now)
     reasons: list[str] = []
     if provider is not None and model.provider != provider:
         reasons.append(f"provider filter {provider}")
@@ -95,19 +113,21 @@ def _evaluate(cfg: Config, snapshots: dict[str, dict[str, Any]], model: Model, n
     if headroom is None:
         if not cfg.settings.unknown_is_eligible:
             reasons.append(f"{note}, unknown_is_eligible=false")
-    elif reserve_applies and headroom < cfg.settings.reserve_pct:
-        reasons.append(f"headroom {_fmt(headroom)} % < reserve {_fmt(cfg.settings.reserve_pct)} %")
+    elif below_floor is not None:
+        reasons.append(below_floor)
     if not _available(snap, model, now):
         reasons.append("unavailable per codex model/list")
     eligible = not reasons
     if eligible:
         why = f"headroom {_fmt(headroom)} %" if headroom is not None else note
+        if surplus is not None:
+            why += ", " + _pace_phrase(surplus)
         if note and headroom is not None:
             why += f" ({note})"
     else:
         why = "; ".join(reasons)
     return {"model": model.id, "provider": model.provider, "tier": model.tier, "eligible": eligible,
-            "headroom": headroom, "why": why}
+            "headroom": headroom, "surplus": surplus, "why": why}
 
 
 def _candidates(cfg: Config, tier: str, allow_downgrade: bool) -> list[Model]:
@@ -135,14 +155,27 @@ def pick(cfg: Config, snapshots: dict[str, dict[str, Any]], tier: str, need: tup
     rows = [_evaluate(cfg, snapshots, m, need_t, provider, now) for m in cands]
 
     chosen: dict[str, Any] | None = None
+    ladder = [tier] + (list(TIERS[TIERS.index(tier) + 1:]) if allow_downgrade else [])
     if cfg.settings.policy == "headroom-weighted":
         # Within the first tier that has any eligible model, prefer max headroom;
         # None sorts last; ties keep pins order (stable sort).
-        for t in [tier] + (list(TIERS[TIERS.index(tier) + 1:]) if allow_downgrade else []):
+        for t in ladder:
             elig = [r for r in rows if r["eligible"] and r["tier"] == t]
             if elig:
                 chosen = sorted(elig, key=lambda r: (r["headroom"] is None, -(r["headroom"] or 0)))[0]
                 break
+    elif cfg.settings.policy == "pace":
+        # Within the first tier that has any eligible model: pins order among the
+        # models whose provider is on pace (surplus ≥ −slack, or unknown); when
+        # every provider is behind, the least behind wins, ties keep pins order.
+        slack = cfg.settings.pace_slack_pct
+        for t in ladder:
+            elig = [r for r in rows if r["eligible"] and r["tier"] == t]
+            if not elig:
+                continue
+            on_pace = [r for r in elig if r["surplus"] is None or r["surplus"] >= -slack]
+            chosen = on_pace[0] if on_pace else sorted(elig, key=lambda r: -r["surplus"])[0]
+            break
     else:
         chosen = next((r for r in rows if r["eligible"]), None)
 
@@ -158,4 +191,4 @@ def pick(cfg: Config, snapshots: dict[str, dict[str, Any]], tier: str, need: tup
         reason += f"; downgraded from {tier} to {model.tier}"
     return {"ok": True, "provider": model.provider, "model": model.id, "effort": model.default_effort,
             "tier": model.tier, "native": host is not None and model.provider == host, "host": host,
-            "headroom": chosen["headroom"], "reason": reason, "candidates": rows}
+            "headroom": chosen["headroom"], "surplus": chosen["surplus"], "reason": reason, "candidates": rows}

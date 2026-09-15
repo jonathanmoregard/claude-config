@@ -33,6 +33,40 @@ credentials, which is how this machine authenticates. "Bare" is spelled
 `--setting-sources "" --strict-mcp-config` (no hooks, no MCP, no user
 permission rules); `--no-bare` loads settings normally.
 
+## Selection
+
+`pick` scores every model of the requested tier against its provider's
+usage-cap snapshot. Per applicable bucket (window `window_min`, reset
+`resets_at`, `used_pct`), at time `now`:
+
+```
+left     = clamp((resets_at − now) / window, 0, 1)   # fraction of the window ahead
+line     = 100 · left                                # where linear pacing would leave it
+headroom = 100 − used_pct
+surplus  = headroom − line                           # pct points ahead (+) / behind (−) pace
+floor    = min(reserve_pct, line)                    # reserve that descends with the line
+```
+
+Per model: `headroom` and `surplus` are the minimum over its counted buckets
+(applicable, not resetting within `near_reset_relax_min`; `surplus` is null
+when no counted bucket carries reset geometry). A model is **eligible** when
+its provider is not rejected, every counted bucket has `headroom ≥ floor`,
+the model has every `--need` capability and (Codex) appears in a fresh
+`model/list`. The floor holds at `reserve_pct` for most of the window and
+slides to 0 over the final stretch, so a period can end near 0 without
+running dry early.
+
+`settings.policy` orders the eligible models of the first tier that has any:
+
+| policy | choice |
+|---|---|
+| `pace` (default) | pins order among providers on pace (`surplus ≥ −pace_slack_pct`, or unknown); when every provider is behind, the least behind; ties keep pins order |
+| `rank-first` | first eligible in pins order, headroom ignored |
+| `headroom-weighted` | largest raw headroom, ties keep pins order |
+
+`candidates[].why` spells the verdict ("headroom 39 %, 14 pts behind pace";
+"headroom 10 % < reserve floor 15 %"); the human line prints `pace=+7.3`.
+
 ## State directory
 
 `$AI_ROUTER_STATE`, default `~/.local/state/ai-router/` (mode 0700):
@@ -41,8 +75,9 @@ permission rules); `--no-bare` loads settings normally.
   (`claude.json` is written raw by the statusline tee hook, or by the OAuth
   fallback when the tee is stale).
 - `quota/<provider>.rejected.json` — provider rejected until `until`, or
-  until a newer snapshot shows every applicable bucket with headroom ≥ reserve
-  (the marker is then deleted: the window rolled or the parsed reset was wrong).
+  until a newer snapshot shows every applicable bucket at or above its floor
+  (see "Selection"; the marker is then deleted: the window rolled or the
+  parsed reset was wrong).
 - `quota/claude.oauth-backoff` — epoch; OAuth probe skipped until then.
 - `jobs/<job_id>/` — `meta.json`, `prompt.md`, `events.jsonl`, `stderr.log`,
   `status`, `exit_code`, `result.txt`, `result.json` (when parseable),

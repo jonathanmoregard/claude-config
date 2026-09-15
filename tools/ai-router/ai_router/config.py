@@ -29,11 +29,15 @@ class ConfigError(ValueError):
     """models.toml is missing, malformed or internally inconsistent."""
 
 
+POLICIES = ("rank-first", "headroom-weighted", "pace")
+
+
 @dataclass(frozen=True)
 class Settings:
     reserve_pct: float = 15
     stale_after_s: int = 900
     policy: str = "rank-first"
+    pace_slack_pct: float = 5
     near_reset_relax_min: int = 120
     rejected_default_ttl_s: int = 3600
     unknown_is_eligible: bool = True
@@ -97,8 +101,8 @@ def _settings(raw: dict[str, Any]) -> Settings:
     if unknown:
         raise ConfigError(f"unknown [settings] keys: {', '.join(unknown)}")
     s = Settings(**raw)
-    if s.policy not in ("rank-first", "headroom-weighted"):
-        raise ConfigError(f"settings.policy must be rank-first|headroom-weighted, got {s.policy!r}")
+    if s.policy not in POLICIES:
+        raise ConfigError(f"settings.policy must be {'|'.join(POLICIES)}, got {s.policy!r}")
     return s
 
 
