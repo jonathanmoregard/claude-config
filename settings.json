@@ -27,6 +27,7 @@
       "Read(//home/jonathan/.claude/templates/**)",
       "Read(//home/jonathan/.claude/hooks/**)",
       "Read(//home/jonathan/.local/state/claude-tasks/**)",
+      "Read(//home/jonathan/.local/state/klaffat/e2e-artifacts/**)",
       "Edit(//tmp/**)",
       "Edit(//home/jonathan/Repos/nixos-config-worktrees/**)",
       "Edit(//home/jonathan/worktrees/**)",
