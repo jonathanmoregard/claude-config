@@ -29,7 +29,11 @@ guessed.
 ## Decide: native or delegate
 
 1. `ai-router pick --tier <strongest|standard|fast> --json` (add `--need
-   vision|write|long-context`, `--provider codex|claude` to constrain).
+   vision|write|long-context` to constrain). Run it unconstrained first: it
+   already paces both providers against their reset windows (`surplus` in
+   the output), so never add `--provider` to second-guess headroom or
+   quota — only when the task itself needs one host (shared worktree, peek
+   into the subagent, same-context resume).
 2. Read `native`:
    - `native: true` → the pick is your own provider. Dispatch with your
      native subagent tool and pass `model: <pick.model>` (Claude: the `Agent`

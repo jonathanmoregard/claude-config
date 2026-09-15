@@ -11,6 +11,7 @@ bucket at 11 % in a new window. `pick` kept Codex ineligible for five days.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -167,7 +168,13 @@ def test_claude_snapshot_at_cap_keeps_rejection(cfg, state_dir: Path, tmp_path: 
 
 # --- end to end through pick ---------------------------------------------------------------
 
-def test_pick_offers_codex_again_after_window_rollover(cfg, state_dir: Path):
+def test_pick_offers_codex_again_after_window_rollover(cfg, state_dir: Path, tmp_path: Path):
+    # The policy is not the subject here (the fixture's fresh window puts codex 11 pts
+    # behind pace, which the default `pace` policy rightly diverts around): pin
+    # rank-first so "offered again" reads as "picked again".
+    p = tmp_path / "m.toml"
+    p.write_text(re.sub(r'^policy = "[a-z-]+"', 'policy = "rank-first"', cfg.path.read_text(), count=1, flags=re.M))
+    cfg = load_config(p)
     quota.mark_rejected(state_dir, "codex", until=UNTIL, reason="usage limit", source="job:x", now=REJECTED_AT)
     write_codex(state_dir, codex_record(NOW - 30, 11.0))
     write_claude(state_dir, NOW - 30, 40.0)
@@ -176,5 +183,6 @@ def test_pick_offers_codex_again_after_window_rollover(cfg, state_dir: Path):
     r = selection.pick(cfg, snaps, "strongest", now=NOW)
 
     assert r["ok"] and r["provider"] == "codex" and r["model"] == "gpt-5.6-sol"
+    assert all(c["eligible"] for c in r["candidates"] if c["provider"] == "codex")
     assert not any("rejected" in c["why"] for c in r["candidates"])
     assert json.loads(quota.snapshot_path(state_dir, "codex").read_text())["observed_at"] == NOW - 30  # cache untouched

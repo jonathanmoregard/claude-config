@@ -239,8 +239,9 @@ def cmd_pick(ctx: Ctx, args: argparse.Namespace, out: Out) -> int:
              host=host, allow_downgrade=args.allow_downgrade, now=ctx.now)
     if not r["ok"]:
         raise CliError("quota", r["reason"], {"candidates": r["candidates"]})
+    pace = "?" if r["surplus"] is None else f"{r['surplus']:+g}"
     out.emit(r, f"{r['provider']}/{r['model']} effort={r['effort']} tier={r['tier']} native={str(r['native']).lower()}"
-                f" headroom={r['headroom']} — {r['reason']}")
+                f" headroom={r['headroom']} pace={pace} — {r['reason']}")
     return 0
 
 

@@ -7,7 +7,8 @@ version = 1
 [settings]
 reserve_pct = 15
 stale_after_s = 900
-policy = "rank-first"            # rank-first | headroom-weighted
+policy = "pace"                  # pace | rank-first | headroom-weighted (README "Selection")
+pace_slack_pct = 5               # pts behind the linear spend line still counted as on pace
 near_reset_relax_min = 120
 rejected_default_ttl_s = 3600
 unknown_is_eligible = true       # unknown quota → eligible, reason says so
