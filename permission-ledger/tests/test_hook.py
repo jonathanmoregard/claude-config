@@ -403,7 +403,7 @@ class TestPatternKeyFileTools(unittest.TestCase):
 
 
 class TestPatternKeyCommandTools(unittest.TestCase):
-    TOOL = "Bash"
+    TOOL = "mcp__safe-bash__exec"
 
     def key(self, command, tool=None):
         return hook.pattern_key(tool or self.TOOL, {"command": command})
@@ -435,14 +435,10 @@ class TestPatternKeyCommandTools(unittest.TestCase):
     def test_subcommand_tool_with_no_second_token_stays_one_token(self):
         self.assertEqual(self.key("git"), self.TOOL + ":git")
 
-    def test_retired_safe_bash_tool_name_still_classifies(self):
-        # `Bash` is the standing shell tool; the safe-bash MCP is retired. Its
-        # name stays in hook.py's BASH_TOOLS because ledger files written before
-        # the switchover recorded calls under it, and aggregate.py still has to
-        # group those historical records as commands rather than as opaque
-        # tool names. Drop the tuple entry and six months of retained ledger
-        # data regroups wrongly.
-        legacy = "mcp__safe-bash__exec"
+    def test_native_bash_tool_name_still_classifies(self):
+        # Native Bash is denied, but retained records and PermissionDenied
+        # events can still carry its name. Keep both command surfaces grouped.
+        legacy = "Bash"
         self.assertEqual(self.key("git diff HEAD", tool=legacy), legacy + ":git diff")
         self.assertEqual(self.key("pwd", tool=legacy), legacy + ":pwd")
 

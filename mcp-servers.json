@@ -1,4 +1,14 @@
 {
+  "safe-bash": {
+    "type": "stdio",
+    "command": "python3",
+    "args": [
+      "/home/jonathan/.claude/mcps/safe-bash/server.py"
+    ],
+    "env": {
+      "DCG_PATH": "/etc/profiles/per-user/jonathan/bin/dcg"
+    }
+  },
   "research-agent": {
     "type": "stdio",
     "command": "research-agent-mcp",

@@ -1,15 +1,14 @@
 ---
 name: detached-long-commands
-description: Use when a command will run longer than the 10-minute Bash timeout ceiling or must survive the session — nix builds, VM test gates, large downloads/ingests, feature-vm launches, index builds. Triggers on "Command timed out after", a Bash call that exits 143 or returns interrupted, a command auto-backgrounded on timeout, or any build you'd otherwise babysit.
+description: Use when a command will run longer than the 10-minute safe-bash cap or must survive the session — nix builds, VM test gates, large downloads/ingests, feature-vm launches, index builds. Triggers on safe-bash exit 124 or "command exceeded timeout", or any build you'd otherwise babysit.
 ---
 
 # Detached Long Commands
 
-The `Bash` tool defaults to 120000 ms and will not accept a `timeout` above
-600000 ms (raising that ceiling needs `BASH_MAX_TIMEOUT_MS`, which this host
-does not set), and `nohup`/`&` children die with the session. The proven
-pattern (~20 uses across VM gates, feature-vm boots, and register-index
-ingests):
+Run every command below through `mcp__safe-bash__exec`; native `Bash` is denied.
+Safe-bash defaults to 120000 ms, clamps `timeout` to 600000 ms, and kills the
+whole foreground process group on timeout. Use a named systemd unit for work
+that must outlive either limit or the session:
 
 ## Launch — detached systemd user unit + sentinel markers
 
@@ -67,23 +66,18 @@ file's existence — each wrapped in `timeout N …` so one hung probe can't
 eat the loop. A launcher log's last line ("building …drv") tells you
 which phase you're waiting on.
 
-## What a timeout looks like, and why it is not a detach
+## What a timeout means
 
-A `Bash` call that hits its timeout comes back as `Command timed out after
-<duration>`, exit **143**, `interrupted: true`, and `timedOutAfterMs` set. The
-command is **not killed** — it is auto-backgrounded, and the result names the
-file its output is still being written to.
-
-That is convenient and it is not the pattern on this page. An auto-backgrounded
-command has no unit name, no `reset-failed` handle, no sentinel markers, and no
-defined lifetime past the session; you got a path and a hope. Read it if it is
-there, then still launch the real run under a systemd user unit. Treat a 143 as
-the signal that this command needed detaching from the start, not as the detach.
+A safe-bash timeout returns partial output, `[safe-bash] command exceeded timeout
+of <ms> ms`, and `--- exit 124 ---`. The process group has been terminated; it is
+not running in background. MCP cancellation also kills the process group and
+suppresses its response. Treat exit 124 as a signal to relaunch under a named
+systemd unit, never as a detached run to poll.
 
 ## Backgrounding inside one call still blocks that call
 
 If you do reach for a plain background job, redirect **all three** streams or the
-`Bash` call burns its own timeout and comes back 143 while the child is perfectly
+safe-bash call burns its own timeout and comes back 124 while the child is
 healthy:
 
 ```bash
@@ -98,11 +92,10 @@ the exit code is what you poll — never infer the result from the log's tail.
 
 ## When a deny rule refuses the command outright
 
-`permissions.deny` matches on the command STRING, so a legitimate command can be
+Safe-bash policy matches the command STRING, so a legitimate command can be
 rejected for a substring it merely contains — including inside a heredoc body.
-A wildcard rule is offered each **subcommand** in turn, never the whole command
-line, so hiding the token behind a `&&` does not help: each half is matched on
-its own. Two live examples:
+Safe-bash checks each **subcommand** and the full command line, so hiding the
+token behind a `&&` does not help. Two live examples:
 
 - `Bash(*quarantine*)` refuses any subcommand mentioning that word, a commit
   message saying "quarantine the flaky test" included.
@@ -118,16 +111,14 @@ Rewrites that work, in order of preference:
 - Select tests by `-k` expression instead of naming a blocked path.
 - Drop the offending flag when the default already does the right thing.
 
-Do not try to defeat the matcher by quoting or splitting; some of these rules are
-deliberate policy, not an accident. And when writing a rule rather than tripping
-over one: rule CONTENT containing `(` or `)` loads and then matches nothing, so
-such a rule reads as protection while stopping zero commands.
+Do not try to defeat the matcher by quoting or splitting; some rules are
+deliberate policy, not accidents.
 
 ## Red flags
 
 - `nohup`/`&` for anything that must outlive the session
-- Asking to raise the `Bash` timeout instead of detaching
-- Treating an auto-backgrounded timed-out command as a detached run
+- Asking to raise the safe-bash timeout instead of detaching
+- Treating a timed-out safe-bash command as still running
 - `--collect` on a unit whose exit status you intend to read
 - Concluding failure from an empty/quiet log without the FAILED marker
 - Killing an in-progress nix build out of impatience

@@ -329,13 +329,13 @@ Applying the tests:
   outcome; do not stretch for a rule change to feel productive.
 
 - **`wrong-tool`** — the prompt fired because the wrong thing was called, not
-  because configuration is wrong. Signals: `Bash` used for work a dedicated tool
+  because configuration is wrong. Signals: native `Bash` used instead of
+  `mcp__safe-bash__exec`; shell used for work a dedicated tool
   already does (`cat`/`head`/`tail` where `Read` applies, `find`/`ls` where
   `Glob` applies, `grep` where `Grep` applies); reads reaching outside the
   configured working roots; repeated retries against a path that was already
   denied; the same command resubmitted in a reworded form after a deny glob or
-  the bash guard refused it. Native `Bash` is the standing shell on this machine
-  and is **not** by itself a `wrong-tool` signal — it is what the rules expect.
+  safe-bash policy refused it.
   The fix is a behavioural one — a CLAUDE.md line, a skill, a hook. It
   is **never** an allowlist entry. If you write an `allow` rule under a
   `wrong-tool` verdict you have misclassified; go back and pick again.
@@ -346,8 +346,8 @@ Applying the tests:
   vice versa) and the matcher does not expand; an MCP rule missing the trailing
   `*` or using `:` where the tool name uses `__`; a broad `deny` shadowing a
   narrower `allow`; a rule attached to the wrong tool name (`Edit(...)` when the
-  call is `Write(...)`; a rule still written against a retired MCP shell tool
-  name such as `mcp__safe-bash__*` when the call now arrives as `Bash`).
+  call is `Write(...)`; a rule written against `Bash(...)` when the call arrives
+  as `mcp__safe-bash__exec`).
   The proposal must name the existing rule verbatim, say exactly why it misses,
   and give the corrected form. If no such rule exists, this is not a
   `rule-bug` — classify it as one of the other three.

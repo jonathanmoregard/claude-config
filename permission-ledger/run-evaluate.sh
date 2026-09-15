@@ -42,9 +42,9 @@
 # `--allowedTools` PRE-APPROVES the tools it names. It does not REMOVE the ones
 # it omits. The original argument here was a blanket `"Bash"` in
 # `permissions.deny` beating any allow — which was true, and was the only thing
-# actually holding the line. When safe-bash was retired, `Bash` moved into
-# `permissions.allow`, that deny went away, and the allowlist was left holding a
-# line it never held.
+# actually holding the line. A prior safe-bash retirement moved `Bash` into
+# `permissions.allow` and exposed this defect. Native Bash is denied again, but
+# this agent keeps its explicit closed tool set so minimal settings remain safe.
 #
 # MEASURED against CLI 2.1.251 with this branch's settings.json:
 # `--allowedTools 'Read Glob Grep'` still offered Bash, Write, Edit,

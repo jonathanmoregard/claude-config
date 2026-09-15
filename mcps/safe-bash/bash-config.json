@@ -1,0 +1,218 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(sudo)",
+      "Bash(sudo *)",
+      "Bash(rm -rf *)",
+      "Bash(rm -fr *)",
+      "Bash(mkfs *)",
+      "Bash(mkfs.*)",
+      "Bash(dd *)",
+      "Bash(bash)",
+      "Bash(sh)",
+      "Bash(bash -s*)",
+      "Bash(sh -s*)",
+      "Bash(curl *|bash*)",
+      "Bash(curl *| bash*)",
+      "Bash(curl *|sh*)",
+      "Bash(curl *| sh*)",
+      "Bash(wget *|bash*)",
+      "Bash(wget *| bash*)",
+      "Bash(git push --force*)",
+      "Bash(git push *--force*)",
+      "Bash(git push -f*)",
+      "Bash(git push *-f *)",
+      "Bash(git reset --hard*)",
+      "Bash(gh pr merge)",
+      "Bash(gh pr merge *)",
+      "Bash(*gh pr create*--base*)",
+      "Bash(*gh pr create*-B *)",
+      "Bash(secret-tool*)",
+      "Bash(docker exec research-agent*)",
+      "Bash(docker exec -* research-agent*)",
+      "Bash(docker inspect*research-agent*)",
+      "Bash(docker logs*research-agent*)",
+      "Bash(docker cp*research-agent*)",
+      "Bash(echo BLOCKED_TEST_STRING*)",
+      "Bash(* BLOCKED_TEST_COMPOUND *)",
+      "Bash(echo BLOCKED_TEST_ESCAPED\\*)",
+      "Bash(*BLOCKED_TEST_ESCAPED\\**)",
+      "Bash(BLOCKED_TEST_SUBCMD*)",
+      "Bash(*quarantine*)",
+      "Bash(*/run/agenix/*)",
+      "Bash(*docs.googleapis.com*)",
+      "Bash(*www.googleapis.com/drive*)",
+      "Bash(*discovery/v1/apis/docs*)",
+      "Bash(*googleapiclient*)",
+      "Bash(*from googleapiclient*)",
+      "Bash(*build(\"docs\"*)",
+      "Bash(*build('docs'*)",
+      "Bash(*build(\"drive\"*)",
+      "Bash(*build('drive'*)",
+      "Bash(*build*\"docs\",*)",
+      "Bash(*build*'docs',*)",
+      "Bash(*build*\"drive\",*)",
+      "Bash(*build*'drive',*)",
+      "Bash(*documents().batchUpdate*)",
+      "Bash(*documents().get*)",
+      "Bash(*documents().create*)",
+      "Bash(*.documents*.batchUpdate*)",
+      "Bash(*.documents*.get*)",
+      "Bash(*.documents*.create*)",
+      "Bash(*automation-review*)",
+      "Bash(*prompts.jsonl*)",
+      "Bash(*.claude/aut*)",
+      "Bash(*prompt*.jsonl*)",
+      "Bash(*aut*review*)",
+      "Bash(*review*prompt*)",
+      "Bash(*prompt*review*)"
+    ]
+  },
+  "untrusted_ingress_single": {
+    "curl": "curl",
+    "wget": "wget",
+    "npx": "npx"
+  },
+  "untrusted_ingress_multi": [
+    {
+      "prefix": [
+        "gh",
+        "pr",
+        "view"
+      ],
+      "label": "gh-fetch"
+    },
+    {
+      "prefix": [
+        "gh",
+        "pr",
+        "diff"
+      ],
+      "label": "gh-fetch"
+    },
+    {
+      "prefix": [
+        "gh",
+        "pr",
+        "comment"
+      ],
+      "label": "gh-fetch"
+    },
+    {
+      "prefix": [
+        "gh",
+        "pr",
+        "list"
+      ],
+      "label": "gh-fetch"
+    },
+    {
+      "prefix": [
+        "gh",
+        "issue",
+        "view"
+      ],
+      "label": "gh-fetch"
+    },
+    {
+      "prefix": [
+        "gh",
+        "issue",
+        "comment"
+      ],
+      "label": "gh-fetch"
+    },
+    {
+      "prefix": [
+        "gh",
+        "issue",
+        "list"
+      ],
+      "label": "gh-fetch"
+    },
+    {
+      "prefix": [
+        "gh",
+        "api"
+      ],
+      "label": "gh-api"
+    },
+    {
+      "prefix": [
+        "git",
+        "clone"
+      ],
+      "label": "git-clone"
+    },
+    {
+      "prefix": [
+        "pip",
+        "install"
+      ],
+      "label": "pip-install"
+    },
+    {
+      "prefix": [
+        "pip3",
+        "install"
+      ],
+      "label": "pip-install"
+    },
+    {
+      "prefix": [
+        "npm",
+        "install"
+      ],
+      "label": "npm-install"
+    },
+    {
+      "prefix": [
+        "npm",
+        "i"
+      ],
+      "label": "npm-install"
+    },
+    {
+      "prefix": [
+        "npm",
+        "ci"
+      ],
+      "label": "npm-install"
+    },
+    {
+      "prefix": [
+        "cargo",
+        "install"
+      ],
+      "label": "cargo-install"
+    },
+    {
+      "prefix": [
+        "gem",
+        "install"
+      ],
+      "label": "gem-install"
+    },
+    {
+      "prefix": [
+        "go",
+        "install"
+      ],
+      "label": "go-fetch"
+    },
+    {
+      "prefix": [
+        "go",
+        "get"
+      ],
+      "label": "go-fetch"
+    },
+    {
+      "prefix": [
+        "bundle",
+        "install"
+      ],
+      "label": "bundle-install"
+    }
+  ]
+}

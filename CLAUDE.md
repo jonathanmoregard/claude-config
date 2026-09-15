@@ -47,7 +47,8 @@ User instructions override everything below.
 - Put safety gates in MCP server code, not hooks. Hooks are for observation and triggers.
 
 ## Bash
-- `permissions.deny` matches the command STRING, so a legitimate command can be rejected for a substring it merely contains — including inside a heredoc body. Route the payload around it (`Write` the text, then `cat >>`; `gh` `--body-file`/`-F` instead of an inline body; select tests by `-k`; drop a flag whose default is already right). Never quote or split to defeat the matcher — some rules are deliberate. Details: `detached-long-commands`.
+- Use `mcp__safe-bash__exec`. Never native `Bash` — it is denied. The MCP validates commands inside the execution boundary, so hook timeouts cannot bypass policy.
+- Policy matches the command STRING, so a legitimate command can be rejected for a substring it merely contains — including inside a heredoc body. Route the payload around it (`Write` the text, then `cat >>`; `gh` `--body-file`/`-F` instead of an inline body; select tests by `-k`; drop a flag whose default is already right). Never quote or split to defeat the matcher — some rules are deliberate. Details: `detached-long-commands`.
 - A `[REDACTED:…]` marker in output means the call succeeded and the value is gated — don't re-run to get it in clear.
 
 ## Build + review

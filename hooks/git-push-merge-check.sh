@@ -5,11 +5,9 @@
 # push is never forced — the recommendation just gives Claude the
 # info to decide.
 #
-# Triggered on Bash tool calls. Filters to git-push commands in-script
-# (the matcher only screens by tool name). The matcher and this case arm
-# used to accept the safe-bash MCP's exec tool as well; that MCP is being
-# retired, so its tool name can never arrive again and keeping it would only
-# mislead the next reader into thinking there are two live shells.
+# Triggered on native Bash and safe-bash exec calls. Native Bash is denied in
+# settings, while safe-bash is the live command surface; naming both keeps this
+# advisory correct during startup/config transitions.
 #
 # WHY THIS STILL EXISTS ALONGSIDE hooks/bash-guard.py's nixos push gate
 # -------------------------------------------------------------------
@@ -37,7 +35,7 @@ input=$(cat)
 
 tool_name=$(jq -r '.tool_name // empty' <<<"$input")
 case "$tool_name" in
-  Bash) ;;
+  Bash|mcp__safe-bash__exec) ;;
   *) exit 0 ;;
 esac
 
