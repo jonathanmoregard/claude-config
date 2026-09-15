@@ -101,6 +101,60 @@ expect_equal() { # expect_equal <name> <expected> <actual>
   fi
 }
 
+# --- settings.json helpers (model-carry cases) -------------------------------
+# The committed baseline stands in for the real ~/.claude/settings.json: a
+# nested object plus scalars, so "only the model key differs" is a claim about
+# parsed JSON rather than about one line of text.
+BASE_SETTINGS='{
+  "permissions": {
+    "allow": [
+      "Bash"
+    ]
+  },
+  "voiceEnabled": false
+}'
+
+seed_settings() { # seed_settings <json> — commit settings.json to origin and pull it into the clone
+  local w="$ROOT/pushwork"; rm -rf "$w"
+  git clone --quiet "$ORIGIN" "$w"
+  printf '%s\n' "$1" > "$w/settings.json"
+  git -C "$w" add -A >/dev/null
+  git -C "$w" commit --quiet -m "seed settings.json"
+  git -C "$w" push --quiet origin master
+  git -C "$CLONE" pull --quiet --ff-only
+}
+
+# Read one key out of the clone's settings.json with a real parser: a file the
+# script rewrote into invalid JSON must fail the test, not slip past a grep.
+settings_field() { # settings_field <key>
+  python3 - "$CLONE/settings.json" "$1" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        doc = json.load(fh)
+except FileNotFoundError:
+    print("<no-settings-file>"); raise SystemExit(0)
+except ValueError as exc:
+    print(f"<invalid-json: {exc}>"); raise SystemExit(0)
+value = doc
+for part in sys.argv[2].split("."):
+    if not isinstance(value, dict) or part not in value:
+        print("<missing-key>"); raise SystemExit(0)
+    value = value[part]
+print(json.dumps(value))
+PY
+}
+
+expect_settings() { # expect_settings <name> <key> <expected-json>
+  local name="$1" key="$2" want="$3" got
+  got="$(settings_field "$key")"
+  if [ "$got" = "$want" ]; then
+    echo "PASS $name"; pass=$((pass+1))
+  else
+    echo "FAIL $name: settings.$key = ${got@Q}, expected ${want@Q}"; fail=$((fail+1))
+  fi
+}
+
 # 1. up to date -> silent no-op
 fresh uptodate; run
 check "up-to-date is a silent no-op" 0 "$rc" "" "$out"
@@ -373,6 +427,71 @@ export CLAUDE_PULL_REPO="$ROOT/notarepo"
 run
 check "unusable repo exits 1" 1 "$rc" "not a git checkout|not a git repository" "$out"
 expect_status "status: unusable repo still records state=alert" state alert
+
+# --- 19-24. the model setting must not park continuous delivery --------------
+# `/model` in a live session persists "model" into settings.json in this
+# master-pinned checkout. Uncommitted by design, so the first upstream edit to
+# settings.json otherwise blocks every subsequent tick until a human intervenes.
+# Only that one key is carried; every other local edit still outranks the pull.
+
+# 19. model-only local edit + upstream settings.json change -> pull lands, model kept
+fresh carrymodel; seed_settings "$BASE_SETTINGS"
+advance_origin settings.json '{"permissions": {"allow": ["Bash", "Glob"]}, "voiceEnabled": false}'
+printf '%s\n' '{"permissions": {"allow": ["Bash"]}, "voiceEnabled": false, "model": "opus[1m]"}' > "$CLONE/settings.json"
+run
+check "model-only settings edit does not block the pull" 0 "$rc" "fast-forwarded master" "$out"
+expect_settings "carried pull takes the upstream settings" permissions.allow '["Bash", "Glob"]'
+expect_settings "carried pull keeps the local model setting" model '"opus[1m]"'
+
+# 20. local model differs from the incoming one -> the session's choice wins
+fresh carrywins; seed_settings '{"permissions": {"allow": ["Bash"]}, "model": "sonnet"}'
+advance_origin settings.json '{"permissions": {"allow": ["Bash", "Glob"]}, "model": "sonnet"}'
+printf '%s\n' '{"permissions": {"allow": ["Bash"]}, "model": "opus[1m]"}' > "$CLONE/settings.json"
+run
+check "model-only change to an existing key pulls" 0 "$rc" "fast-forwarded master" "$out"
+expect_settings "local model outranks the incoming model" model '"opus[1m]"'
+expect_settings "local model does not suppress other incoming keys" permissions.allow '["Bash", "Glob"]'
+
+# 21. model PLUS a real local edit -> blocked exactly as before, nothing touched
+fresh carryother; seed_settings "$BASE_SETTINGS"
+advance_origin settings.json '{"permissions": {"allow": ["Bash", "Glob"]}, "voiceEnabled": false}'
+printf '%s\n' '{"permissions": {"allow": ["Bash", "Read"]}, "voiceEnabled": false, "model": "opus[1m]"}' > "$CLONE/settings.json"
+before_settings="$(cat "$CLONE/settings.json")"
+run
+check "a second settings edit still blocks the pull" 1 "$rc" "Cannot fast-forward" "$out"
+expect_equal "blocked pull leaves the settings edit untouched" "$before_settings" "$(cat "$CLONE/settings.json")"
+
+# 22. model-only settings edit, but a DIFFERENT file conflicts -> the pull is
+#     still refused and the carried setting must survive being set aside.
+fresh carryblocked; seed_settings "$BASE_SETTINGS"
+advance_origin file.txt "remote version"
+echo "local uncommitted" > "$CLONE/file.txt"
+printf '%s\n' '{"permissions": {"allow": ["Bash"]}, "voiceEnabled": false, "model": "opus[1m]"}' > "$CLONE/settings.json"
+run
+check "another file's conflict still blocks the pull" 1 "$rc" "Cannot fast-forward" "$out"
+expect_settings "a blocked pull does not lose the model setting" model '"opus[1m]"'
+grep -q "local uncommitted" "$CLONE/file.txt" || { echo "FAIL carryblocked: local edit clobbered"; fail=$((fail+1)); }
+
+# 23. unparseable settings.json -> nothing is carried and nothing is rewritten
+fresh carrybroken; seed_settings "$BASE_SETTINGS"
+advance_origin settings.json '{"permissions": {"allow": ["Bash", "Glob"]}, "voiceEnabled": false}'
+printf '%s\n' '{"permissions": {"allow": ["Bash"]}, "model": ' > "$CLONE/settings.json"
+before_settings="$(cat "$CLONE/settings.json")"
+run
+check "unparseable settings blocks the pull" 1 "$rc" "Cannot fast-forward" "$out"
+expect_equal "unparseable settings is left byte-for-byte alone" "$before_settings" "$(cat "$CLONE/settings.json")"
+
+# 24. a model-only edit with no incoming settings.json change fast-forwards on
+#     the ordinary dirty-tree path; the carry must not disturb the file it
+#     rewrites (valid JSON, model intact, upstream file delivered).
+fresh carryunrelated; seed_settings "$BASE_SETTINGS"
+advance_origin new.txt hello
+printf '%s\n' '{"permissions": {"allow": ["Bash"]}, "voiceEnabled": false, "model": "opus[1m]"}' > "$CLONE/settings.json"
+run
+check "model-only edit with an unrelated incoming commit pulls" 0 "$rc" "fast-forwarded master" "$out"
+expect_settings "unrelated pull keeps the model setting" model '"opus[1m]"'
+expect_settings "unrelated pull keeps the rest of settings" permissions.allow '["Bash"]'
+[ -f "$CLONE/new.txt" ] || { echo "FAIL carryunrelated: new.txt not present after pull"; fail=$((fail+1)); }
 
 echo
 echo "passed: $pass  failed: $fail"

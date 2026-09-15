@@ -252,15 +252,114 @@ Auto-pull will not rebase or merge that for you — resolve it by hand."
   exit 1
 fi
 
+# --- the model setting is not local work -------------------------------------
+#
+# `/model` in a live session persists `"model"` into settings.json in this
+# checkout. The checkout is master-pinned, so that write is never committed —
+# and from the next upstream settings.json edit onwards the fast-forward below
+# refuses, parking continuous delivery on a transient UI choice until a human
+# intervenes. One key is carried across the pull instead.
+#
+# ONLY that key, and the test is semantic: both versions are parsed and
+# compared with `model` removed. If anything else differs — a permission rule,
+# a hook, an env var — this does nothing at all and the pull blocks exactly as
+# before, because those edits are real work that outranks an automated update.
+#
+# Deliberately not `git stash`: the stash stack is shared with every linked
+# worktree and other agents push to it concurrently, and `stash pop` performs a
+# three-way merge that can conflict — which is the failure being fixed, not a
+# fix for it. Restoring one path and rewriting one key cannot conflict.
+CARRY_SETTINGS="settings.json"
+carry_doc=""        # {"model": <value>} to re-apply, or {} for "delete the key"
+carry_backup=""     # exact pre-pull bytes, the safety net if re-applying fails
+carry_armed=0
+
+# Parse HEAD's copy (stdin) against the working tree's (argv 1). Exit 0 and
+# print the carry document only when `model` is the sole difference.
+carry_capture() {
+  git show "HEAD:./$CARRY_SETTINGS" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    head = json.load(sys.stdin)
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        local = json.load(fh)
+except (OSError, ValueError):
+    raise SystemExit(1)
+if not isinstance(head, dict) or not isinstance(local, dict):
+    raise SystemExit(1)
+if {k: v for k, v in head.items() if k != "model"} != {k: v for k, v in local.items() if k != "model"}:
+    raise SystemExit(1)
+if head.get("model", None) == local.get("model", None) and ("model" in head) == ("model" in local):
+    raise SystemExit(1)   # nothing about the model differs; not ours to carry
+json.dump({"model": local["model"]} if "model" in local else {}, sys.stdout)
+' "$CARRY_SETTINGS"
+}
+
+# Re-apply the captured key to whatever settings.json now says, preserving the
+# file otherwise. json.dumps(indent=2) is the shape the harness itself writes,
+# so this produces no incidental diff.
+carry_reapply() {
+  printf '%s' "$carry_doc" | python3 -c '
+import json, sys
+carry = json.load(sys.stdin)
+path = sys.argv[1]
+with open(path, encoding="utf-8") as fh:
+    doc = json.load(fh)
+if "model" in carry:
+    doc["model"] = carry["model"]
+else:
+    doc.pop("model", None)
+tmp = path + ".carry.tmp"
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(doc, fh, indent=2)
+    fh.write("\n")
+import os
+os.replace(tmp, path)
+' "$CARRY_SETTINGS"
+}
+
+# Runs on every exit path between setting the file aside and putting it back,
+# including a systemd TimeoutStartSec kill, so the operator's choice cannot be
+# lost in a window.
+carry_finish() {
+  [ "$carry_armed" = 1 ] || return 0
+  carry_armed=0
+  if carry_reapply; then
+    rm -f "$carry_backup"
+    return 0
+  fi
+  log "could not re-apply the carried model setting — restoring settings.json as it was"
+  cp -f "$carry_backup" "$CARRY_SETTINGS" && rm -f "$carry_backup"
+}
+trap carry_finish EXIT
+
+if [ -f "$CARRY_SETTINGS" ] \
+  && command -v python3 >/dev/null 2>&1 \
+  && ! git diff --quiet HEAD -- "$CARRY_SETTINGS" \
+  && carry_doc="$(carry_capture)"; then
+  carry_backup="$STATE/settings.json.carry"
+  if cp -f "$CARRY_SETTINGS" "$carry_backup" \
+    && git checkout --quiet HEAD -- "$CARRY_SETTINGS"; then
+    carry_armed=1
+    log "carrying the local model setting across the pull; $CARRY_SETTINGS is otherwise unchanged from HEAD"
+  else
+    log "could not set $CARRY_SETTINGS aside; leaving it in place"
+    rm -f "$carry_backup"
+  fi
+fi
+
 # Fast-forward only. If the incoming commits touch files that are modified
 # or untracked here, git refuses and changes nothing — which is the desired
 # outcome: local work outranks an automated update.
 incoming="$(git rev-list --count "HEAD..$UPSTREAM")"
 if ! ff_err="$(git merge --ff-only --quiet "$UPSTREAM" 2>&1)"; then
+  carry_finish
   alert "Cannot fast-forward $BRANCH to $UPSTREAM ($incoming commit(s) waiting) — local changes are in the way:
 $(printf '%s' "$ff_err" | head -5)"
   exit 1
 fi
+
+carry_finish
 
 log "fast-forwarded $BRANCH: $(git rev-parse --short "$base_sha") -> $(git rev-parse --short HEAD) ($incoming commit(s))"
 
