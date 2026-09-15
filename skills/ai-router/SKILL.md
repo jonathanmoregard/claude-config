@@ -20,11 +20,16 @@ into, and resume. Same-provider work stays native (see "Native vs delegate").
 Pins (2026-09-14): `gpt-5.6-sol` > `claude-fable-5-1` > `claude-opus-5` >
 `gpt-5.6-terra` > `claude-sonnet-5` > `gpt-5.6-luna` >
 `claude-haiku-4-5-20251001`. Tiers: strongest = sol/fable/opus, standard =
-terra/sonnet, fast = luna/haiku. A provider whose headroom is below the
-reserve (15 %) or that has been rejected (quota error, rate-limit stop) is
-skipped; a rejection lapses at its reset time or as soon as a newer live
-snapshot shows headroom again. Unknown quota is reported as unknown, never
-guessed.
+terra/sonnet, fast = luna/haiku. A provider is skipped when any of its
+usage buckets sits under its floor — the 15 % reserve for most of the
+window, descending to 0 over the final stretch before that bucket resets —
+or when it has been rejected (quota error, rate-limit stop); a rejection
+lapses at its reset time or as soon as a newer live snapshot shows every
+bucket above its floor again. Among eligible providers `pick` paces:
+`surplus` is how many points a provider sits ahead (+) or behind (−) the
+linear spend line to its reset; the top pin wins while on pace, otherwise
+the provider with the most slack. Unknown quota is reported as unknown,
+never guessed.
 
 ## Decide: native or delegate
 

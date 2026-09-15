@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 from .config import TIERS, Config, Model
+from .pacing import bucket_status
 
 MODEL_LIST_MAX_AGE_S = 3600  # codex model/list is trusted for availability for 1 h
 
@@ -29,59 +30,40 @@ def _applies(bucket: dict[str, Any], model: Model) -> bool:
     return any(t == "*" or t == model.id or t == model.family for t in targets)
 
 
-def _bucket_terms(bucket: dict[str, Any], now: float) -> tuple[float, float | None]:
-    """(headroom, line) for one bucket.
-
-    ``line`` is where linear pacing would leave the bucket now: 100 × the
-    fraction of the window still ahead. None when the bucket carries no reset
-    geometry (no ``resets_at`` or ``window_min``).
-    """
-    room = 100.0 - float(bucket["used_pct"])
-    resets_at, window_min = bucket.get("resets_at"), bucket.get("window_min")
-    if resets_at is None or not window_min:
-        return room, None
-    left = (float(resets_at) - now) / (float(window_min) * 60.0)
-    return room, 100.0 * max(0.0, min(1.0, left))
-
-
 def _assess(cfg: Config, snap: dict[str, Any] | None, model: Model, now: float
             ) -> tuple[float | None, float | None, str | None, str]:
     """(headroom, surplus, below_floor, note) for one model against its provider snapshot.
 
-    Over the counted buckets (applicable to the model and not about to reset):
-    headroom = min(100 − used_pct); surplus = min(headroom_b − line_b), i.e. the
-    percentage points the provider sits ahead (+) or behind (−) the linear spend
-    line — None when no counted bucket has reset geometry. below_floor names
-    the first bucket whose headroom is under its floor min(reserve_pct, line_b):
-    the reserve holds at reserve_pct for most of the window and then descends
-    with the line, so a period can end near 0 without going to 0 early.
-    Buckets resetting within ``near_reset_relax_min`` are reported but exempt
-    from the floor. Unknown snapshot → (None, None, None, "quota unknown").
+    Over the counted buckets (applicable to the model and not about to reset;
+    terms from ``pacing.bucket_status``): headroom = min headroom; surplus =
+    min(headroom_b − line_b), i.e. the percentage points the provider sits
+    ahead (+) or behind (−) the linear spend line — None when no counted
+    bucket has reset geometry; below_floor names the first bucket whose
+    headroom is under its floor. Buckets resetting within
+    ``near_reset_relax_min`` are reported but exempt from the floor. Unknown
+    snapshot → (None, None, None, "quota unknown").
     """
     if not snap or snap.get("status") == "unknown":
         return None, None, None, "quota unknown"
-    relax_s = cfg.settings.near_reset_relax_min * 60
-    counted: list[tuple[float, float | None]] = []
+    counted: list[tuple[float, float | None, float]] = []
     relaxed: list[float] = []
     for b in snap.get("buckets", []):
         if not _applies(b, model) or b.get("used_pct") is None:
             continue
-        room, line = _bucket_terms(b, now)
-        resets_at = b.get("resets_at")
-        if resets_at is not None and (float(resets_at) - now) <= relax_s:
+        room, line, is_relaxed, floor = bucket_status(cfg, b, now)
+        if is_relaxed:
             relaxed.append(room)
         else:
-            counted.append((room, line))
+            counted.append((room, line, floor))
     if not counted:
         if relaxed:
             return min(relaxed), None, None, "near reset, reserve relaxed"
         return None, None, None, "no applicable bucket"
-    headroom = min(room for room, _ in counted)
-    paced = [room - line for room, line in counted if line is not None]
+    headroom = min(room for room, _, _ in counted)
+    paced = [room - line for room, line, _ in counted if line is not None]
     surplus = round(min(paced), 1) if paced else None
     below: str | None = None
-    for room, line in counted:
-        floor = cfg.settings.reserve_pct if line is None else min(cfg.settings.reserve_pct, line)
+    for room, _, floor in counted:
         if room < floor:
             below = f"headroom {_fmt(room)} % < reserve floor {_fmt(round(floor, 1))} %"
             break

@@ -31,9 +31,10 @@ def cfg():
 
 
 def codex_record(observed_at: int, used_pct: float, *, applies: list[str] | None = None,
-                 extra: list[dict] | None = None) -> dict:
+                 extra: list[dict] | None = None, resets_at: int | None = None) -> dict:
     return {"provider": "codex", "source": "app-server", "observed_at": observed_at, "plan": "pro",
-            "buckets": [{"id": "primary", "used_pct": used_pct, "resets_at": UNTIL + 2 * 86400,
+            "buckets": [{"id": "primary", "used_pct": used_pct,
+                         "resets_at": UNTIL + 2 * 86400 if resets_at is None else resets_at,
                          "window_min": 10080, "applies_to": ["*"] if applies is None else applies}]
             + (extra or []),
             "models": ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]}
@@ -98,6 +99,27 @@ def test_headroom_below_reserve_does_not_clear(cfg, state_dir: Path):
     s = quota.probe_codex(cfg, state_dir, now=NOW, rpc=broken)
 
     assert s["status"] == "rejected" and marker(state_dir).exists()
+
+
+def test_descended_floor_clears_marker_exactly_where_selection_offers_the_provider(cfg, state_dir: Path):
+    """The clear rule must track selection's floor min(reserve, line), not a flat reserve:
+    90 % used 3 h before a weekly reset → line 1.8 → pick offers sol → the marker must go."""
+    quota.mark_rejected(state_dir, "codex", until=UNTIL, reason="usage limit", source="job:x", now=REJECTED_AT)
+    write_codex(state_dir, codex_record(NOW - 30, 90.0, resets_at=NOW + 3 * 3600))
+    write_claude(state_dir, NOW - 30, 40.0)
+
+    snaps = quota.all_snapshots(cfg, state_dir, now=NOW, rpc=broken, urlopen=lambda *a, **k: (_ for _ in ()).throw(OSError("no egress")))
+    r = selection.pick(cfg, snaps, "strongest", now=NOW)
+
+    assert not marker(state_dir).exists()
+    assert snaps["codex"]["status"] == "ok" and snaps["codex"]["rejected_until"] is None
+    sol = next(c for c in r["candidates"] if c["model"] == "gpt-5.6-sol")
+    assert sol["eligible"] is True and sol["headroom"] == 10
+    # Same headroom with the whole window ahead: floor is the full reserve → marker stays
+    quota.mark_rejected(state_dir, "codex", until=UNTIL, reason="usage limit", source="job:x", now=REJECTED_AT)
+    write_codex(state_dir, codex_record(NOW - 20, 90.0))
+    snaps = quota.all_snapshots(cfg, state_dir, now=NOW, rpc=broken, urlopen=lambda *a, **k: (_ for _ in ()).throw(OSError("no egress")))
+    assert marker(state_dir).exists() and snaps["codex"]["status"] == "rejected"
 
 
 def test_headroom_equal_to_reserve_clears_like_selection_treats_it_eligible(cfg, state_dir: Path):

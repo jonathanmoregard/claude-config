@@ -75,8 +75,9 @@ running dry early.
   (`claude.json` is written raw by the statusline tee hook, or by the OAuth
   fallback when the tee is stale).
 - `quota/<provider>.rejected.json` — provider rejected until `until`, or
-  until a newer snapshot shows every applicable bucket with headroom ≥ reserve
-  (the marker is then deleted: the window rolled or the parsed reset was wrong).
+  until a newer snapshot shows every applicable bucket at or above its floor
+  (see "Selection"; the marker is then deleted: the window rolled or the
+  parsed reset was wrong).
 - `quota/claude.oauth-backoff` — epoch; OAuth probe skipped until then.
 - `jobs/<job_id>/` — `meta.json`, `prompt.md`, `events.jsonl`, `stderr.log`,
   `status`, `exit_code`, `result.txt`, `result.json` (when parseable),
