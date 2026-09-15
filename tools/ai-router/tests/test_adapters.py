@@ -61,6 +61,16 @@ def test_codex_argv_with_schema(tmp_path: Path):
     assert argv[-2:] == ["--", PROMPT_PLACEHOLDER]
 
 
+def test_codex_argv_adds_explicit_writable_roots_and_network_opt_in(tmp_path: Path):
+    argv = build_argv("codex", "/bin/codex", model="gpt-5.6-sol", effort="high",
+                      sandbox="workspace-write", cwd="/work", schema=None, bare=True, job_dir=tmp_path,
+                      writable_roots=("/git/common", "/state/klaffat"), network_access=True)
+    assert argv.count("--add-dir") == 2
+    assert argv[argv.index("--add-dir") + 1] == "/git/common"
+    assert argv[argv.index("--add-dir", argv.index("--add-dir") + 1) + 1] == "/state/klaffat"
+    assert argv[argv.index("-c", argv.index("-c") + 1) + 1] == "sandbox_workspace_write.network_access=true"
+
+
 def test_claude_argv_read_only_and_bare(tmp_path: Path):
     argv = build_argv("claude", "/bin/claude", model="claude-haiku-4-5-20251001", effort="low",
                       sandbox="read-only", cwd="/w", schema=None, bare=True, job_dir=tmp_path)

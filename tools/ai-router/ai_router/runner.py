@@ -91,6 +91,9 @@ def _write_results(d: Path, provider: str, events: list[dict[str, Any]], schema:
 
 
 def _retry_after_quota(state: Path, d: Path, meta: dict[str, Any], diag: str, now: float) -> None:
+    if meta.get("dev_gates"):
+        jobs.update_meta(d, retry_note="no retry: --dev-gates must not fall back to a different sandbox")
+        return
     cfg = load_config()
     provider, model_id = meta["provider"], meta["model"]
     model = cfg.model(model_id)

@@ -103,11 +103,15 @@ def _claude_common(model: str, effort: str | None, sandbox: str, schema: str | N
 
 
 def build_argv(provider: str, binary: str, *, model: str, effort: str | None, sandbox: str, cwd: str,
-               schema: str | None, bare: bool, job_dir: Path) -> list[str]:
+               schema: str | None, bare: bool, job_dir: Path, writable_roots: tuple[str, ...] = (),
+               network_access: bool = False) -> list[str]:
     """argv for a fresh job; the prompt is PROMPT_PLACEHOLDER (contract §Jobs)."""
     if provider == "codex":
         argv = [binary, "exec", "--json", "-m", model, "-c", f"model_reasoning_effort={effort or 'medium'}",
                 "--sandbox", sandbox, "-C", cwd, "--skip-git-repo-check", "-o", str(job_dir / "last_message.md")]
+        argv += ["-c", f"sandbox_workspace_write.network_access={str(network_access).lower()}"]
+        for root in writable_roots:
+            argv += ["--add-dir", root]
         if schema:
             argv += ["--output-schema", schema]
         # `--` is load-bearing: codex's variadic options otherwise swallow the
