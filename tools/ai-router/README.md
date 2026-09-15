@@ -16,7 +16,7 @@ human line.
 |---|---|
 | `quota [--fresh] [--provider codex\|claude]` | Normalised usage snapshots per provider (buckets, headroom, staleness, rejection). |
 | `pick --tier strongest\|standard\|fast [--need CAP …] [--provider P] [--host H] [--allow-downgrade] [--fresh]` | Choose a model. `native: true` means the picked provider is the host CLI: use its own subagent tool. |
-| `delegate (--tier T \| --model M) --prompt-file F [--cwd D] [--sandbox read-only\|workspace-write] [--schema S.json] [--timeout-s N] [--effort E] [--wait] [--force] [--no-bare] [--host H] [--name NAME] [--allow-downgrade]` | Start a headless job (always headless, even on the host provider). `--model` keeps the eligibility check unless `--force`. |
+| `delegate (--tier T \| --model M) --prompt-file F [--cwd D] [--sandbox read-only\|workspace-write] [--dev-gates] [--schema S.json] [--timeout-s N] [--effort E] [--wait] [--force] [--no-bare] [--host H] [--name NAME] [--allow-downgrade]` | Start a headless job (always headless, even on the host provider). `--model` keeps the eligibility check unless `--force`. |
 | `wait <job_id> [--timeout-s N]` | Block until terminal, following an automatic retry; prints the result. |
 | `status [<job_id>]` · `list [--all]` | One job or all jobs (newest first, 20 by default). |
 | `peek <job_id>` · `log <job_id> [--tail N]` · `result <job_id>` | Newest agent message · summarised events + stderr · final result (exit 7 while running). |
@@ -32,6 +32,31 @@ Claude jobs never pass `--bare`: on 2.1.270 `--bare` refuses OAuth
 credentials, which is how this machine authenticates. "Bare" is spelled
 `--setting-sources "" --strict-mcp-config` (no hooks, no MCP, no user
 permission rules); `--no-bare` loads settings normally.
+
+## Codex workspace-write scope
+
+Every Codex job explicitly sets `sandbox_workspace_write.network_access=false`.
+For a `workspace-write` job inside a Git worktree, ai-router also adds Git's
+canonical common directory through `--add-dir`; this permits commits from a
+linked worktree without granting the parent repository wholesale.
+
+`--dev-gates` is an explicit Codex `workspace-write` opt-in for Klaffat's
+development gates. It adds these existing directories through `--add-dir`:
+
+- Git common directory for `--cwd`
+- `$HOME/.cache/nix` (Nix fetcher cache)
+- `$XDG_RUNTIME_DIR/klaffat` (normally `/run/user/$UID/klaffat`)
+- `$HOME/.local/state/klaffat` (E2E artifacts)
+
+It also sets `sandbox_workspace_write.network_access=true`. Codex CLI 0.146
+has no loopback-only network flag, so this is all network access, not merely
+localhost; it is never granted by default. `meta.json` records the complete
+effective writable-root list and network flag under `effective_sandbox`.
+
+Codex 0.146 `exec resume` has no `--sandbox` or `--add-dir`; `send` rejects a
+completed `--dev-gates` job rather than resume it with different privileges.
+Likewise, a quota failure does not fall back to another provider for such a
+job, because its sandbox cannot be reproduced there.
 
 ## Selection
 

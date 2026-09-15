@@ -71,6 +71,11 @@ def test_create_job_layout(state_dir: Path, tmp_path: Path, env):
         jobs.job_dir(state_dir, "../etc")
 
 
+def test_systemd_job_environment_preserves_runtime_directory():
+    values = jobs._router_env({"PATH": "/bin", "HOME": "/home/test", "XDG_RUNTIME_DIR": "/run/user/999"})
+    assert "--setenv=XDG_RUNTIME_DIR=/run/user/999" in values
+
+
 def test_codex_job_runs_to_done(state_dir: Path, tmp_path: Path, env):
     job_id, d = start(state_dir, spec_for("codex", "gpt-5.6-luna", "Say hi\nMODE:ok", tmp_path, env), env)
     fid, status = finish(state_dir, job_id)

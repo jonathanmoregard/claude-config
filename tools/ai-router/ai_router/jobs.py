@@ -34,7 +34,7 @@ DEFAULT_LIST = 20
 META_KEYS = ("job_id", "name", "created_at", "provider", "model", "effort", "tier", "host", "cwd", "sandbox",
              "schema", "timeout_s", "stall_min", "bare", "need", "argv", "launcher", "unit", "runner_pid",
              "child_pid", "thread_id", "session_id", "forced", "retry_of", "retried_as", "parent_job",
-             "started_at", "finished_at", "exit_code", "error_class")
+             "started_at", "finished_at", "exit_code", "error_class", "dev_gates", "effective_sandbox")
 
 
 class JobNotFound(LookupError):
@@ -177,6 +177,8 @@ def create_job(state: Path, spec: JobSpec, *, now: float) -> tuple[str, Path]:
 
 def _router_env(env: dict[str, str]) -> list[str]:
     out = [f"--setenv=PATH={env.get('PATH', os.defpath)}", f"--setenv=HOME={env.get('HOME', os.path.expanduser('~'))}"]
+    if env.get("XDG_RUNTIME_DIR"):
+        out.append(f"--setenv=XDG_RUNTIME_DIR={env['XDG_RUNTIME_DIR']}")
     out += [f"--setenv={k}={v}" for k, v in sorted(env.items()) if k.startswith("AI_ROUTER_")]
     return out
 

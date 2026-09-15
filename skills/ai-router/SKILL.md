@@ -73,6 +73,16 @@ Write the task to a file (prompt = the whole file, verbatim), then:
   sandbox; Claude gets `--permission-mode default --tools Read,Glob,Grep`
   for read-only and `acceptEdits` + file/Bash tools for workspace-write.
   There is no flag that bypasses either sandbox.
+- Codex `workspace-write` jobs explicitly disable network access and, for a
+  Git worktree, add only its canonical Git common dir so commits can update
+  linked-worktree metadata. `--dev-gates` is an explicit Codex-only
+  `workspace-write` opt-in for Klaffat gates: it also adds
+  `$HOME/.cache/nix`, `$XDG_RUNTIME_DIR/klaffat`, and
+  `$HOME/.local/state/klaffat`, then enables network access. Codex 0.146 has
+  no loopback-only network scope, so this means all network access. The exact
+  roots and network flag are in the job's `meta.json` `effective_sandbox`.
+  `send` and quota fallback are disabled for a `--dev-gates` job because
+  Codex resume cannot reproduce its `--add-dir` sandbox.
 - `--schema schema.json` forces structured output (Codex `--output-schema`,
   Claude `--json-schema`); `result` then carries `result_json`.
 - `--effort low|medium|high|xhigh|max` (Codex also `ultra`). `--need

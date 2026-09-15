@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import time
 from pathlib import Path
 
@@ -39,6 +40,21 @@ def run(capsys, argv: list[str], env: dict[str, str], **kw) -> tuple[int, dict |
     if "--json" in argv and cap.out.strip():
         obj = json.loads(cap.out)
     return rc, obj, cap.out, cap.err
+
+
+def linked_worktree(tmp_path: Path) -> tuple[Path, Path]:
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "worktree"
+    repo.mkdir()
+    for argv in (
+        ["git", "init", "-q", str(repo)],
+        ["git", "-C", str(repo), "config", "user.name", "test"],
+        ["git", "-C", str(repo), "config", "user.email", "test@example.invalid"],
+        ["git", "-C", str(repo), "commit", "--allow-empty", "-qm", "initial"],
+        ["git", "-C", str(repo), "worktree", "add", "-qb", "probe", str(worktree)],
+    ):
+        subprocess.run(argv, check=True, capture_output=True, text=True)
+    return worktree, repo / ".git"
 
 
 def test_version_and_usage(capsys, env):
@@ -128,6 +144,90 @@ def test_delegate_model_quota_gate_and_force(capsys, env, prompt, tmp_path, stat
     meta = jobs.read_meta(jobs.job_dir(state_dir, res["job_id"]))
     assert meta["forced"] is True and meta["effort"] == "low" and "model_reasoning_effort=low" in meta["argv"]
     assert res["thread_id"] == "thread-fake-0001"
+
+
+def test_workspace_write_codex_adds_linked_git_common_dir(capsys, env, prompt, tmp_path, state_dir):
+    worktree, common_dir = linked_worktree(tmp_path)
+    rc, started, *_ = run(capsys, ["delegate", "--model", "luna", "--force", "--prompt-file", str(prompt),
+                                   "--cwd", str(worktree), "--sandbox", "workspace-write", "--json"], env)
+    assert rc == 0 and started["provider"] == "codex"
+    meta = jobs.read_meta(jobs.job_dir(state_dir, started["job_id"]))
+    assert meta["effective_sandbox"] == {
+        "mode": "workspace-write",
+        "writable_roots": [str(worktree), str(common_dir)],
+        "network_access": False,
+    }
+    argv = meta["argv"]
+    assert argv[argv.index("--add-dir") + 1] == str(common_dir)
+    assert "sandbox_workspace_write.network_access=true" not in argv
+
+
+def test_dev_gates_records_only_required_roots_and_network_opt_in(capsys, env, prompt, tmp_path, state_dir):
+    worktree, common_dir = linked_worktree(tmp_path)
+    home = Path(env["HOME"])
+    runtime = tmp_path / "runtime"
+    env["XDG_RUNTIME_DIR"] = str(runtime)
+    nix_cache = home / ".cache" / "nix"
+    state = home / ".local" / "state" / "klaffat"
+    runtime_klaffat = runtime / "klaffat"
+    for root in (nix_cache, state, runtime_klaffat):
+        root.mkdir(parents=True)
+    rc, started, *_ = run(capsys, ["delegate", "--model", "luna", "--force", "--prompt-file", str(prompt),
+                                   "--cwd", str(worktree), "--sandbox", "workspace-write", "--dev-gates",
+                                   "--json"], env)
+    assert rc == 0 and started["provider"] == "codex"
+    meta = jobs.read_meta(jobs.job_dir(state_dir, started["job_id"]))
+    expected_roots = [str(worktree), str(common_dir), str(nix_cache), str(runtime_klaffat), str(state)]
+    assert meta["effective_sandbox"] == {
+        "mode": "workspace-write",
+        "writable_roots": expected_roots,
+        "network_access": True,
+    }
+    argv = meta["argv"]
+    assert [argv[index + 1] for index, value in enumerate(argv) if value == "--add-dir"] == expected_roots[1:]
+    assert "sandbox_workspace_write.network_access=true" in argv
+
+
+def test_dev_gates_rejects_non_workspace_write_delegate(capsys, env, prompt, tmp_path):
+    rc, obj, _, err = run(capsys, ["delegate", "--model", "luna", "--force", "--prompt-file", str(prompt),
+                                   "--dev-gates", "--json"], env)
+    assert rc == 2 and obj["error_class"] == "usage" and "workspace-write" in obj["message"]
+    assert err == ""
+
+
+def test_dev_gates_job_cannot_resume_without_its_writable_roots(capsys, env, prompt, tmp_path, state_dir):
+    worktree, _ = linked_worktree(tmp_path)
+    home = Path(env["HOME"])
+    runtime = tmp_path / "runtime"
+    env["XDG_RUNTIME_DIR"] = str(runtime)
+    for root in (home / ".cache" / "nix", home / ".local" / "state" / "klaffat", runtime / "klaffat"):
+        root.mkdir(parents=True)
+    rc, result, *_ = run(capsys, ["delegate", "--model", "luna", "--force", "--prompt-file", str(prompt),
+                                  "--cwd", str(worktree), "--sandbox", "workspace-write", "--dev-gates",
+                                  "--wait", "--json"], env)
+    assert rc == 0 and result["status"] == "done"
+    follow_up = tmp_path / "follow.md"
+    follow_up.write_text("continue\n")
+    rc, obj, _, err = run(capsys, ["send", result["job_id"], "--prompt-file", str(follow_up), "--json"], env)
+    assert rc == 2 and obj["error_class"] == "usage" and "does not support --add-dir" in obj["message"]
+    assert err == ""
+
+
+def test_dev_gates_quota_does_not_fallback_to_another_provider(capsys, env, tmp_path, state_dir):
+    worktree, _ = linked_worktree(tmp_path)
+    home = Path(env["HOME"])
+    runtime = tmp_path / "runtime"
+    env["XDG_RUNTIME_DIR"] = str(runtime)
+    for root in (home / ".cache" / "nix", home / ".local" / "state" / "klaffat", runtime / "klaffat"):
+        root.mkdir(parents=True)
+    quota_prompt = tmp_path / "quota.md"
+    quota_prompt.write_text("MODE:quota\n")
+    rc, result, *_ = run(capsys, ["delegate", "--model", "luna", "--force", "--prompt-file", str(quota_prompt),
+                                  "--cwd", str(worktree), "--sandbox", "workspace-write", "--dev-gates",
+                                  "--wait", "--json"], env)
+    assert rc == 3 and result["status"] == "failed:quota" and "retried_as" not in result
+    meta = jobs.read_meta(jobs.job_dir(state_dir, result["job_id"]))
+    assert meta["retry_note"] == "no retry: --dev-gates must not fall back to a different sandbox"
 
 
 def test_delegate_setup_and_usage_errors(capsys, env, prompt, tmp_path):

@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -93,6 +94,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--prompt-file", required=True, metavar="F")
     sp.add_argument("--cwd", default=None, metavar="D")
     sp.add_argument("--sandbox", choices=SANDBOXES, default="read-only")
+    sp.add_argument("--dev-gates", action="store_true",
+                    help="opt into verified Klaffat development-gate roots and network for a Codex job")
     sp.add_argument("--schema", metavar="S.json")
     sp.add_argument("--timeout-s", type=float, default=None)
     sp.add_argument("--effort", metavar="E")
@@ -172,6 +175,56 @@ def _abs_dir(path: str | None) -> str:
     if not os.path.isdir(d):
         raise CliError("usage", f"cwd is not a directory: {d}")
     return d
+
+
+def _existing_dir(path: Path, label: str) -> str:
+    resolved = path.resolve()
+    if not resolved.is_dir():
+        raise CliError("usage", f"{label} is not an existing directory: {resolved}")
+    return str(resolved)
+
+
+def _git_common_dir(cwd: str, env: dict[str, str]) -> str | None:
+    git_env = dict(env)
+    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+        git_env.pop(name, None)
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            check=False, capture_output=True, env=git_env, text=True,
+        )
+    except OSError as exc:
+        raise CliError("setup", f"could not resolve Git common directory: {exc}") from exc
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    if not value:
+        raise CliError("usage", "Git returned an empty common directory")
+    return _existing_dir(Path(value), "Git common directory")
+
+
+def _codex_effective_sandbox(cwd: str, sandbox: str, dev_gates: bool,
+                             env: dict[str, str]) -> tuple[dict[str, Any], tuple[str, ...]]:
+    if sandbox != "workspace-write":
+        return {"mode": sandbox, "writable_roots": [], "network_access": False}, ()
+    roots = [cwd]
+    common_dir = _git_common_dir(cwd, env)
+    if common_dir and common_dir != cwd:
+        roots.append(common_dir)
+    if dev_gates:
+        home = Path(env.get("HOME") or Path.home())
+        runtime_parent = Path(env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+        roots.extend([
+            _existing_dir(home / ".cache" / "nix", "Nix fetcher cache"),
+            _existing_dir(runtime_parent / "klaffat", "Klaffat runtime directory"),
+            _existing_dir(home / ".local" / "state" / "klaffat", "Klaffat state directory"),
+        ])
+    unique_roots = list(dict.fromkeys(roots))
+    return {
+        "mode": sandbox,
+        "writable_roots": unique_roots,
+        "network_access": dev_gates,
+    }, tuple(unique_roots[1:])
 
 
 def _check_effort(ctx: Ctx, provider: str, effort: str | None) -> None:
@@ -282,10 +335,15 @@ def cmd_delegate(ctx: Ctx, args: argparse.Namespace, out: Out, launcher: str) ->
             raise CliError("usage", f"schema file not found: {schema}")
     host = args.host or detect_host(ctx.env)
     provider, model, effort, tier, forced = _choose_for_delegate(ctx, args, host)
+    if args.dev_gates and (provider != "codex" or args.sandbox != "workspace-write"):
+        raise CliError("usage", "--dev-gates requires a Codex workspace-write delegate")
     binary = adapters.resolve_binary(provider, ctx.env)
     if binary is None:
         raise CliError("setup", f"{provider} binary not found (set AI_ROUTER_{provider.upper()}_BIN or PATH)")
     timeout_s = args.timeout_s if args.timeout_s is not None else ctx.cfg.settings.job_timeout_s
+    effective_sandbox, writable_roots = _codex_effective_sandbox(
+        cwd, args.sandbox, bool(args.dev_gates), ctx.env
+    ) if provider == "codex" else ({}, ())
     spec = jobs.JobSpec(provider=provider, model=model, effort=effort, tier=tier, cwd=cwd, sandbox=args.sandbox,
                         prompt=prompt, timeout_s=timeout_s, stall_min=ctx.cfg.settings.job_stall_min,
                         bare=not args.no_bare, schema=schema, host=host, name=args.name, need=list(args.need),
@@ -293,8 +351,9 @@ def cmd_delegate(ctx: Ctx, args: argparse.Namespace, out: Out, launcher: str) ->
     job_id, d = jobs.create_job(ctx.state, spec, now=ctx.now)
     # argv needs the job dir (codex `-o <job_dir>/last_message.md`), so it is built after create
     spec.argv = adapters.build_argv(provider, binary, model=model, effort=effort, sandbox=args.sandbox, cwd=cwd,
-                                    schema=schema, bare=spec.bare, job_dir=d)
-    jobs.update_meta(d, argv=spec.argv)
+                                    schema=schema, bare=spec.bare, job_dir=d, writable_roots=writable_roots,
+                                    network_access=bool(effective_sandbox.get("network_access")))
+    jobs.update_meta(d, argv=spec.argv, dev_gates=bool(args.dev_gates), effective_sandbox=effective_sandbox)
     info = jobs.launch(d, env=ctx.env, launcher=launcher)
     started = {"ok": True, "job_id": job_id, "provider": provider, "model": model, "effort": effort,
                "job_dir": str(d), "events": str(d / "events.jsonl"), "result_path": str(d / "result.txt"),
@@ -357,6 +416,8 @@ def cmd_send(ctx: Ctx, args: argparse.Namespace, out: Out, launcher: str) -> int
     status = jobs.status_of(d, meta)
     if not jobs.is_terminal(status):
         raise CliError("not_finished", f"job {args.job_id} is {status}; send is post-hoc only")
+    if meta["provider"] == "codex" and meta.get("dev_gates"):
+        raise CliError("usage", "Codex 0.146 resume does not support --add-dir; rerun the dev-gates job")
     key = "thread_id" if meta["provider"] == "codex" else "session_id"
     conv = meta.get(key)
     if not conv:
