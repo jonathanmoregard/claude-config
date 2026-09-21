@@ -114,7 +114,7 @@ GUARDED = [
     "agents/some-agent.md",
     "commands/some-command.md",
     "scripts/some-script.sh",
-    "mcps/safe-bash/server.py",
+    "mcps/git-broker/server.py",
     "templates/some-template.md",
     "bin/some-bin",
     ".githooks/pre-commit",

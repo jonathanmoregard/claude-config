@@ -424,7 +424,7 @@ CAPABILITIES = {"tools": {"listChanged": False}}
 
 
 # ----------------------------------------------------------------------
-# JSON-RPC plumbing (mirrors mcps/safe-bash/server.py)
+# JSON-RPC plumbing (mirrors mcps/git-broker/server.py)
 # ----------------------------------------------------------------------
 
 

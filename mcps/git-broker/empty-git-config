@@ -1,0 +1,2 @@
+# Intentionally empty. git-broker bind-mounts this regular file over the
+# repository-local config inside its Codex Git sandbox.

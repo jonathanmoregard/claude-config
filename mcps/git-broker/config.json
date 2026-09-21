@@ -1,0 +1,41 @@
+{
+  "gitBroker": {
+    "version": 1,
+    "repositoryRoots": [
+      "/home/jonathan/Repos",
+      "/home/jonathan/worktrees"
+    ],
+    "metadataRoots": [
+      "/home/jonathan/Repos",
+      "/home/jonathan/worktrees",
+      "/home/jonathan/.claude/.git"
+    ],
+    "protectedWorktrees": [
+      "/home/jonathan/Repos/klaffat",
+      "/home/jonathan/.claude"
+    ],
+    "worktreeCreationRoots": [
+      "/home/jonathan/worktrees"
+    ],
+    "allowedRemoteHosts": [
+      "github.com"
+    ],
+    "allowedRemoteSchemes": [
+      "https",
+      "ssh"
+    ],
+    "gitExecutable": "git",
+    "bubblewrapExecutable": "bwrap",
+    "validatorExecutable": "dcg",
+    "credentialHelperExecutable": "/run/current-system/sw/bin/gh",
+    "githubConfigDir": "/home/jonathan/.config/gh",
+    "sshKnownHostsFile": "/home/jonathan/.ssh/known_hosts",
+    "trustedHooksDir": "/home/jonathan/.config/git/hooks",
+    "userBusSocket": "/run/user/1000/bus",
+    "commitUserName": "jonathanmoregard",
+    "commitUserEmail": "10191435+jonathanmoregard@users.noreply.github.com",
+    "discoveryTimeoutMs": 5000,
+    "maxTimeoutMs": 600000,
+    "outputLimitChars": 60000
+  }
+}
