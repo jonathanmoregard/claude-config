@@ -455,16 +455,16 @@ class GitArgvTests(unittest.TestCase):
             with self.subTest(url=url), self.assertRaises(RuntimeError):
                 self.server._validate_remote_url(url, self.policy)
 
-    def test_protected_primary_allows_only_reads_and_worktree_creation(self) -> None:
+    def test_protected_primary_allows_reads_fetch_and_worktree_creation(self) -> None:
         protected = self.server._GitIdentity(
             Path("/home/jonathan/Repos/klaffat"),
             Path("/home/jonathan/Repos/klaffat/.git"),
             Path("/home/jonathan/Repos/klaffat/.git"),
             False,
         )
-        for operation in ("status", "diff", "log", "worktree_add"):
+        for operation in ("status", "diff", "log", "fetch", "worktree_add"):
             self.server._authorize_git_operation(protected, operation, self.policy)
-        for operation in ("add", "commit", "fetch", "push", "switch"):
+        for operation in ("add", "commit", "push", "switch"):
             with self.subTest(operation=operation), self.assertRaisesRegex(
                 RuntimeError, "protected primary"
             ):

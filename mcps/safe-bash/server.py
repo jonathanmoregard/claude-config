@@ -600,6 +600,7 @@ def _authorize_git_operation(
         "status",
         "diff",
         "log",
+        "fetch",
         "worktree_add",
     }:
         raise RuntimeError(
