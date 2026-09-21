@@ -33,7 +33,7 @@ Run: python3 tests/test_claude_pull_health_hook.py
 Exits 0 on success; 1 with a failure list otherwise.
 
 Plain asserts rather than pytest: there is no pytest on this machine, and the
-repo's other Python suites (mcps/safe-bash/test_safe_bash.py,
+repo's other direct suites (tests/test_bash_guards.py,
 permission-ledger/tests/) use this same check/section harness.
 """
 from __future__ import annotations
