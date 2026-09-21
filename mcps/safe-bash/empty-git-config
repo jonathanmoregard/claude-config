@@ -1,0 +1,2 @@
+# Intentionally empty. safe-bash bind-mounts this regular file over the
+# repository-local config inside its Codex Git sandbox.

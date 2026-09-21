@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -187,9 +188,9 @@ class RequestSchemaTests(unittest.TestCase):
 
     def test_remote_operations_accept_only_origin(self) -> None:
         self.assertEqual(self.validate(operation="fetch")["remote"], "origin")
-        self.assertEqual(
-            self.validate(operation="push", set_upstream=True)["set_upstream"], True
-        )
+        self.assertEqual(self.validate(operation="push")["remote"], "origin")
+        with self.assertRaisesRegex(RuntimeError, "unexpected"):
+            self.validate(operation="push", set_upstream=True)
         for remote in ("upstream", "https://github.com/x/y", "-f", "origin\x00evil"):
             with self.subTest(remote=remote), self.assertRaisesRegex(RuntimeError, "origin"):
                 self.validate(operation="push", remote=remote)
@@ -349,6 +350,9 @@ class GitArgvTests(unittest.TestCase):
         self.assertIn("commit.gpgSign=false", argv)
         self.assertIn("credential.helper=", argv)
         self.assertIn("protocol.allow=never", argv)
+        self.assertIn("protocol.file.allow=never", argv)
+        self.assertIn("fetch.recurseSubmodules=false", argv)
+        self.assertIn("push.recurseSubmodules=no", argv)
         ssh_command = next(value for value in argv if value.startswith("core.sshCommand="))
         self.assertIn(" -F /dev/null ", ssh_command)
         self.assertEqual(argv[-3:], ["commit", "--message", "Safe commit"])
@@ -364,9 +368,37 @@ class GitArgvTests(unittest.TestCase):
         )
         self.assertEqual(all_argv[-2:], ["add", "--all"])
 
+    def test_branch_creation_never_auto_configures_tracking(self) -> None:
+        switch_argv = self.server._build_git_argv(
+            self.request(
+                "switch",
+                branch="feat/topic",
+                create=True,
+                start_point="origin/main",
+            ),
+            self.identity,
+            self.policy,
+        )
+        self.assertEqual(
+            switch_argv[-5:],
+            ["switch", "--no-track", "--create", "feat/topic", "origin/main"],
+        )
+
+        worktree_argv = self.server._build_git_argv(
+            self.request(
+                "worktree_add",
+                worktree_path="/home/jonathan/worktrees/project-new",
+                branch="feat/new",
+                start_point="origin/main",
+            ),
+            self.identity,
+            self.policy,
+        )
+        self.assertIn("--no-track", worktree_argv)
+
     def test_push_pins_validated_remote_and_explicit_branch_refspec(self) -> None:
         argv = self.server._build_git_argv(
-            self.request("push", set_upstream=True),
+            self.request("push"),
             self.identity,
             self.policy,
             remote_url="git@github.com:owner/project.git",
@@ -375,12 +407,29 @@ class GitArgvTests(unittest.TestCase):
         self.assertIn("remote.origin.url=git@github.com:owner/project.git", argv)
         self.assertIn("remote.origin.pushurl=git@github.com:owner/project.git", argv)
         self.assertEqual(
-            argv[-4:],
+            argv[-3:],
             [
                 "--porcelain",
-                "--set-upstream",
                 "origin",
                 "refs/heads/feat/topic:refs/heads/feat/topic",
+            ],
+        )
+        self.assertNotIn("--set-upstream", argv)
+
+    def test_fetch_uses_broker_owned_remote_tracking_refspec(self) -> None:
+        argv = self.server._build_git_argv(
+            self.request("fetch"),
+            self.identity,
+            self.policy,
+            remote_url="https://github.com/owner/project.git",
+        )
+        self.assertEqual(
+            argv[-4:],
+            [
+                "fetch",
+                "--prune",
+                "origin",
+                "+refs/heads/*:refs/remotes/origin/*",
             ],
         )
 
@@ -458,6 +507,13 @@ class ContainmentArgvTests(unittest.TestCase):
         self.assertInSequence(
             [
                 "--ro-bind",
+                str(self.server.EMPTY_GIT_CONFIG),
+                str(self.identity.common_dir / "config"),
+            ]
+        )
+        self.assertInSequence(
+            [
+                "--ro-bind",
                 "/home/jonathan/.config/git/hooks",
                 "/home/jonathan/.config/git/hooks",
             ]
@@ -469,8 +525,51 @@ class ContainmentArgvTests(unittest.TestCase):
             ["--bind", "/home/jonathan/Repos", "/home/jonathan/Repos"]
         )
         self.assertEqual(env["HOME"], "/home/jonathan")
+        self.assertEqual(env["GIT_CONFIG_SYSTEM"], "/dev/null")
         self.assertEqual(env["GIT_CONFIG_GLOBAL"], "/dev/null")
+        self.assertEqual(env["GIT_ATTR_NOSYSTEM"], "1")
+        self.assertEqual(env["GIT_LITERAL_PATHSPECS"], "1")
+        self.assertEqual(env["GIT_NO_REPLACE_OBJECTS"], "1")
         self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+
+    def test_missing_broker_owned_empty_config_fails_closed(self) -> None:
+        request = self.server._validate_git_request(
+            {"repo_path": str(self.identity.worktree), "operation": "status"},
+            self.policy,
+        )
+        with (
+            mock.patch.object(
+                self.server,
+                "EMPTY_GIT_CONFIG",
+                Path("/definitely/missing/empty-git-config"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "empty Git config is unavailable"),
+        ):
+            self.server._build_git_sandbox(
+                request,
+                self.identity,
+                self.policy,
+                ["/nix/store/fake/bin/git", "status"],
+            )
+
+    def test_nonempty_broker_owned_git_config_fails_closed(self) -> None:
+        request = self.server._validate_git_request(
+            {"repo_path": str(self.identity.worktree), "operation": "status"},
+            self.policy,
+        )
+        with tempfile.TemporaryDirectory(prefix="safe-bash-config-") as td:
+            unsafe_config = Path(td) / "config"
+            unsafe_config.write_text("[filter \"pwn\"]\nclean = sh -c true\n")
+            with (
+                mock.patch.object(self.server, "EMPTY_GIT_CONFIG", unsafe_config),
+                self.assertRaisesRegex(RuntimeError, "empty Git config is invalid"),
+            ):
+                self.server._build_git_sandbox(
+                    request,
+                    self.identity,
+                    self.policy,
+                    ["/nix/store/fake/bin/git", "status"],
+                )
 
     def test_https_operation_mounts_only_github_keyring_inputs(self) -> None:
         request = self.server._validate_git_request(
@@ -645,6 +744,45 @@ class ToolExecutionTests(unittest.TestCase):
         self.assertEqual(rc, 124)
         self.assertIn("not rollback", stderr)
 
+    def test_pre_cancelled_process_falls_back_when_group_signal_fails(self) -> None:
+        rec = self.server._InFlight()
+        rec.cancelled = True
+        fake_proc = mock.Mock()
+        fake_proc.pid = 1234
+        fake_proc.returncode = -signal.SIGTERM
+        fake_proc.communicate.return_value = ("", "")
+        with (
+            mock.patch.object(self.server.subprocess, "Popen", return_value=fake_proc),
+            mock.patch.object(self.server.os, "getpgid", return_value=1234),
+            mock.patch.object(self.server.os, "killpg", side_effect=PermissionError),
+        ):
+            self.server._run_argv(["git", "status"], {"PATH": "/bin"}, 1000, rec)
+
+        fake_proc.send_signal.assert_called_once_with(signal.SIGTERM)
+
+    def test_unsafe_worktree_target_cleanup_failure_is_not_swallowed(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="safe-bash-target-", dir="/home/jonathan/worktrees"
+        ) as td:
+            target = Path(td) / "target"
+            original_resolve = Path.resolve
+
+            def noncanonical(path: Path, strict: bool = False) -> Path:
+                if path == target:
+                    return target.with_name("other")
+                return original_resolve(path, strict=strict)
+
+            with (
+                mock.patch.object(Path, "resolve", noncanonical),
+                mock.patch.object(Path, "rmdir", side_effect=OSError("busy")),
+                self.assertRaisesRegex(
+                    RuntimeError, "could not remove unsafe worktree target"
+                ),
+            ):
+                self.server._prepare_worktree_target(
+                    {"operation": "worktree_add", "worktree_path": target}
+                )
+
 
 class BlackBoxBrokerTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -666,6 +804,7 @@ class BlackBoxBrokerTests(unittest.TestCase):
         )
 
     def test_add_and_commit_are_contained_and_ignore_repo_hook(self) -> None:
+        local_filter_marker = self.repo / ".git" / "filter-executed"
         local_hook = self.repo / ".git" / "hooks" / "pre-commit"
         local_hook.write_text(
             "#!/bin/sh\nprintf escaped > " + str(self.canary) + "\n",
@@ -679,7 +818,11 @@ class BlackBoxBrokerTests(unittest.TestCase):
                 str(self.repo),
                 "config",
                 "filter.escape.clean",
-                "sh -c 'printf escaped > " + str(self.canary) + "; cat'",
+                "sh -c 'printf escaped > "
+                + str(local_filter_marker)
+                + "; printf escaped > "
+                + str(self.canary)
+                + "; cat'",
             ],
             check=True,
         )
@@ -690,12 +833,72 @@ class BlackBoxBrokerTests(unittest.TestCase):
 
         add_output = self.tool("add", all=True)
         self.assertIn("--- exit 0 ---", add_output)
+        self.assertFalse(
+            local_filter_marker.exists(),
+            "repository-local clean filter executed inside broker sandbox",
+        )
         self.assertFalse(self.canary.exists(), "filter escaped bubblewrap")
 
         commit_output = self.tool("commit", message="Brokered initial commit")
         self.assertIn("--- exit 0 ---", commit_output)
         self.assertFalse(self.canary.exists(), "repository-local hook executed")
         self.assertTrue((self.repo / ".git" / "refs" / "heads" / "main").is_file())
+
+    def test_fetch_rejects_repo_local_file_url_rewrite(self) -> None:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.repo),
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/owner/project.git",
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.repo),
+                "config",
+                "url.file:///tmp/untrusted.git.insteadOf",
+                "https://github.com/owner/project.git",
+            ],
+            check=True,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "remote scheme is not allowed: file"):
+            self.tool("fetch")
+
+    def test_diff_ignores_repo_local_external_diff_command(self) -> None:
+        local_diff_marker = self.repo / ".git" / "diff-executed"
+        (self.repo / ".gitattributes").write_text(
+            "payload.txt diff=escape\n", encoding="utf-8"
+        )
+        (self.repo / "payload.txt").write_text("before\n", encoding="utf-8")
+        self.assertIn("--- exit 0 ---", self.tool("add", all=True))
+        self.assertIn("--- exit 0 ---", self.tool("commit", message="Diff base"))
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.repo),
+                "config",
+                "diff.escape.command",
+                "sh -c 'printf escaped > " + str(local_diff_marker) + "'",
+            ],
+            check=True,
+        )
+        (self.repo / "payload.txt").write_text("after\n", encoding="utf-8")
+
+        output = self.tool("diff")
+        self.assertIn("--- exit 0 ---", output)
+        self.assertFalse(
+            local_diff_marker.exists(),
+            "repository-local external diff command executed inside broker sandbox",
+        )
 
     def test_trusted_global_secret_scan_still_blocks_commit(self) -> None:
         (self.repo / "credential.txt").write_text(

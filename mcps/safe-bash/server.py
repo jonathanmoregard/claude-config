@@ -76,6 +76,11 @@ MAX_TIMEOUT_MS = 600_000
 OUTPUT_LIMIT_CHARS = 60_000
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "bash-config.json")
+EMPTY_GIT_CONFIG = Path(__file__).resolve().parent / "empty-git-config"
+EMPTY_GIT_CONFIG_TEXT = (
+    "# Intentionally empty. safe-bash bind-mounts this regular file over the\n"
+    "# repository-local config inside its Codex Git sandbox.\n"
+)
 SAFE_BASH_MODE = os.environ.get("SAFE_BASH_MODE", "legacy")
 if SAFE_BASH_MODE not in {"legacy", "codex-git"}:
     raise RuntimeError(
@@ -258,7 +263,7 @@ _GIT_OPERATION_FIELDS = {
     "add": frozenset({"paths", "all"}),
     "commit": frozenset({"message"}),
     "fetch": frozenset({"remote"}),
-    "push": frozenset({"remote", "set_upstream"}),
+    "push": frozenset({"remote"}),
     "switch": frozenset({"branch", "create", "start_point"}),
     "worktree_add": frozenset({"worktree_path", "branch", "start_point"}),
 }
@@ -399,11 +404,6 @@ def _validate_git_request(args: object, policy: dict) -> dict:
         if remote != "origin":
             raise RuntimeError("network Git operations allow only the origin remote")
         request["remote"] = remote
-        if operation == "push":
-            set_upstream = args.get("set_upstream", False)
-            if not isinstance(set_upstream, bool):
-                raise RuntimeError("set_upstream must be a boolean")
-            request["set_upstream"] = set_upstream
     elif operation == "switch":
         request["branch"] = _validate_branch(args.get("branch"))
         create = args.get("create", False)
@@ -452,7 +452,11 @@ def _sanitized_git_env(*, optional_locks: bool = False) -> dict[str, str]:
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
         "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_LITERAL_PATHSPECS": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_ASKPASS": "/bin/false",
         "SSH_ASKPASS": "/bin/false",
@@ -537,6 +541,9 @@ def _discover_git_identity(repo_path: Path, policy: dict) -> _GitIdentity:
         raise RuntimeError("Git metadata resolves outside approved metadata roots")
     if not git_dir.exists() or not common_dir.exists():
         raise RuntimeError("Git metadata path does not exist")
+    local_config = common_dir / "config"
+    if not local_config.is_file() or local_config.is_symlink():
+        raise RuntimeError("Git repository config must be a regular non-symlink file")
 
     linked = git_dir != common_dir
     dot_git = resolved / ".git"
@@ -655,9 +662,12 @@ def _fixed_git_config(policy: dict) -> list[str]:
         f"credential.https://github.com.helper=!{credential_helper} auth git-credential",
         "protocol.allow=never",
         "protocol.ext.allow=never",
-        "protocol.file.allow=user",
+        "protocol.file.allow=never",
         "protocol.https.allow=always",
         "protocol.ssh.allow=always",
+        "fetch.recurseSubmodules=false",
+        "push.recurseSubmodules=no",
+        "submodule.recurse=false",
         "remote.origin.uploadpack=git-upload-pack",
         "remote.origin.receivepack=git-receive-pack",
         (
@@ -715,18 +725,24 @@ def _build_git_argv(
     elif operation == "commit":
         argv.extend(("commit", "--message", request["message"]))
     elif operation == "fetch":
-        argv.extend(("fetch", "--prune", "origin"))
+        argv.extend(
+            (
+                "fetch",
+                "--prune",
+                "origin",
+                "+refs/heads/*:refs/remotes/origin/*",
+            )
+        )
     elif operation == "push":
         if current_branch is None:
             raise RuntimeError("push requires a validated current branch")
         branch = _validate_branch(current_branch, "current branch")
         argv.extend(("push", "--porcelain"))
-        if request["set_upstream"]:
-            argv.append("--set-upstream")
         argv.extend(("origin", f"refs/heads/{branch}:refs/heads/{branch}"))
     elif operation == "switch":
         argv.append("switch")
         if request["create"]:
+            argv.append("--no-track")
             argv.extend(("--create", request["branch"]))
             if request.get("start_point"):
                 argv.append(request["start_point"])
@@ -820,6 +836,17 @@ def _build_git_sandbox(
             f"BROKEN safety boundary: trusted hooks directory is unavailable: {trusted_hooks}"
         )
     binds.append(("--ro-bind", trusted_hooks))
+    if existing_only:
+        try:
+            empty_config_text = EMPTY_GIT_CONFIG.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise RuntimeError(
+                "BROKEN safety boundary: broker-owned empty Git config is unavailable"
+            ) from exc
+        if EMPTY_GIT_CONFIG.is_symlink() or empty_config_text != EMPTY_GIT_CONFIG_TEXT:
+            raise RuntimeError(
+                "BROKEN safety boundary: broker-owned empty Git config is invalid"
+            )
 
     env = _sanitized_git_env(optional_locks=True)
     env["HOME"] = str(home)
@@ -873,6 +900,14 @@ def _build_git_sandbox(
             continue
         argv.extend((mode, str(path), str(path)))
         seen_binds.add(entry)
+    # A repository's local config can name arbitrary filter/diff commands and
+    # URL rewrites. Overlay it only inside the sandbox after mounting Git
+    # metadata, so structured operations cannot become arbitrary execution or
+    # silently select a different transport. Command-line config above supplies
+    # the complete broker-owned runtime policy.
+    argv.extend(
+        ("--ro-bind", str(EMPTY_GIT_CONFIG), str(identity.common_dir / "config"))
+    )
     argv.extend(("--chdir", str(identity.worktree), "--", *git_argv))
     return argv, env
 
@@ -996,8 +1031,10 @@ def _prepare_worktree_target(request: dict) -> Path | None:
     if target.resolve(strict=True) != target or target.is_symlink():
         try:
             target.rmdir()
-        except OSError:
-            pass
+        except OSError as exc:
+            raise RuntimeError(
+                "created noncanonical worktree target and could not remove unsafe worktree target"
+            ) from exc
         raise RuntimeError("created worktree target did not remain canonical")
     return target
 
@@ -2039,15 +2076,6 @@ def _run_argv(
         env=env,
         start_new_session=True,
     )
-    if rec is not None:
-        with _in_flight_lock:
-            rec.proc = proc
-            cancelled_already = rec.cancelled
-        if cancelled_already:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
     try:
         pgid = os.getpgid(proc.pid)
     except OSError:
@@ -2058,12 +2086,29 @@ def _run_argv(
             try:
                 os.killpg(pgid, sig)
                 return
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
+            except ProcessLookupError:
+                return
+            except (PermissionError, OSError):
+                # Fall back to Python's direct child-process signal path.
+                group_signal_failed = True
+            else:
+                group_signal_failed = False
+        else:
+            group_signal_failed = False
         try:
             proc.send_signal(sig)
-        except OSError:
-            pass
+        except ProcessLookupError:
+            return
+        except (PermissionError, OSError) as exc:
+            detail = " after process-group signaling failed" if group_signal_failed else ""
+            raise RuntimeError(f"could not terminate Git subprocess{detail}") from exc
+
+    if rec is not None:
+        with _in_flight_lock:
+            rec.proc = proc
+            cancelled_already = rec.cancelled
+        if cancelled_already:
+            signal_group(signal.SIGTERM)
 
     try:
         stdout, stderr = proc.communicate(timeout=timeout_s)
@@ -2298,7 +2343,6 @@ GIT_TOOLS = [
                 "all": {"type": "boolean"},
                 "message": {"type": "string"},
                 "remote": {"type": "string"},
-                "set_upstream": {"type": "boolean"},
                 "branch": {"type": "string"},
                 "create": {"type": "boolean"},
                 "start_point": {"type": "string"},
