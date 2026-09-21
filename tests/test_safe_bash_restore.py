@@ -74,6 +74,7 @@ allowed_diff = {
     "mcps/safe-bash/test_cancellation.py",
     "mcps/safe-bash/test_git_broker.py",
     "mcps/safe-bash/test_safe_bash.py",
+    "tests/test_bash_guards.py",
     "tests/test_safe_bash_restore.py",
 }
 changed = set(
