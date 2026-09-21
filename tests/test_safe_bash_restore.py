@@ -69,6 +69,7 @@ check("safe-bash MCP is not registered for Claude", not safe_registration)
 
 allowed_diff = {
     "mcps/safe-bash/bash-config.json",
+    "mcps/safe-bash/empty-git-config",
     "mcps/safe-bash/server.py",
     "mcps/safe-bash/test_cancellation.py",
     "mcps/safe-bash/test_git_broker.py",
