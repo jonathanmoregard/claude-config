@@ -895,6 +895,25 @@ class ToolExecutionTests(unittest.TestCase):
 
         fake_proc.send_signal.assert_called_once_with(signal.SIGTERM)
 
+    def test_cancel_notification_falls_back_to_direct_child_terminate(self) -> None:
+        rec = self.server._InFlight()
+        fake_proc = mock.Mock()
+        fake_proc.pid = 1234
+        rec.proc = fake_proc
+        self.server._in_flight["request"] = rec
+        self.addCleanup(self.server._in_flight.pop, "request", None)
+
+        with (
+            mock.patch.object(self.server.os, "getpgid", return_value=1234),
+            mock.patch.object(
+                self.server.os, "killpg", side_effect=PermissionError("denied")
+            ),
+        ):
+            self.server._on_cancelled("request")
+
+        self.assertTrue(rec.cancelled)
+        fake_proc.terminate.assert_called_once_with()
+
     def test_unsafe_worktree_target_cleanup_failure_is_not_swallowed(self) -> None:
         with tempfile.TemporaryDirectory(
             prefix="git-broker-target-", dir="/home/jonathan/worktrees"

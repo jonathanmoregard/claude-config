@@ -1415,13 +1415,17 @@ def _candidate_repo_paths(command: str) -> list[str]:
     if m:
         raw = m.group(1).strip("\"'")
         try:
-            candidates.append(os.path.abspath(os.path.expanduser(raw)))
+            candidate = os.path.abspath(os.path.expanduser(raw))
         except (ValueError, OSError):
-            pass
+            candidate = None
+        if candidate is not None:
+            candidates.append(candidate)
     try:
-        candidates.append(os.getcwd())
+        current_directory = os.getcwd()
     except OSError:
-        pass
+        current_directory = None
+    if current_directory is not None:
+        candidates.append(current_directory)
     # Dedupe while preserving order.
     seen: set[str] = set()
     deduped: list[str] = []
@@ -1989,8 +1993,18 @@ def _on_cancelled(req_id) -> None:
     if proc is not None:
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
+        except ProcessLookupError:
+            return
+        except (PermissionError, OSError) as group_exc:
+            try:
+                proc.terminate()
+            except (ProcessLookupError, PermissionError, OSError) as child_exc:
+                sys.stderr.write(
+                    "[git-broker] cancellation could not terminate Git: "
+                    f"group={type(group_exc).__name__}; "
+                    f"child={type(child_exc).__name__}\n"
+                )
+                sys.stderr.flush()
 
 
 def _dispatch_tools_call(msg_id, params, rec) -> None:
