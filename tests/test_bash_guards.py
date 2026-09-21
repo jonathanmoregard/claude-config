@@ -535,21 +535,21 @@ check(
     f"servers: {sorted(_MCP_SERVERS)}",
 )
 
-# The implementation is restored for Codex's structured Git broker, but the
-# Claude switchover above must stay complete: code presence is inert unless a
-# settings or MCP registration exposes it.  The preceding assertions pin that
-# live surface; this one pins the intentional dormant asset so a future cleanup
+# The dedicated implementation exists for Codex's structured Git broker, but
+# Claude's switchover above must stay complete: code presence is inert unless a
+# settings or MCP registration exposes it. The preceding assertions pin that
+# live surface; this one pins the intentional dormant asset so future cleanup
 # cannot silently break the downstream renderer.
 check(
-    "mcps/safe-bash/ exists only as a dormant Codex broker asset",
-    os.path.isfile(os.path.join(REPO_ROOT, "mcps", "safe-bash", "server.py")),
+    "mcps/git-broker/ exists only as a dormant Codex broker asset",
+    os.path.isfile(os.path.join(REPO_ROOT, "mcps", "git-broker", "server.py")),
     "ai-client-config consumes this source for Codex; Claude remains on native "
     "Bash because settings.json and mcp-servers.json do not register it",
 )
 check(
     "the sibling MCP tree is untouched",
     os.path.isdir(os.path.join(REPO_ROOT, "mcps", "egress-guard")),
-    "the restored broker must not displace sibling MCPs",
+    "the dedicated broker must not displace sibling MCPs",
 )
 
 # ----------------------------------------------------------------------

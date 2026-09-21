@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Security contract tests for safe-bash's Codex-only Git broker."""
+"""Security contract tests for the dedicated Codex Git broker."""
 
 from __future__ import annotations
 
@@ -18,15 +18,14 @@ HERE = Path(__file__).resolve().parent
 SERVER = HERE / "server.py"
 
 
-def load_server(mode: str = "codex-git"):
-    name = f"safe_bash_git_test_{os.getpid()}_{id(object())}"
+def load_server():
+    name = f"git_broker_test_{os.getpid()}_{id(object())}"
     spec = importlib.util.spec_from_file_location(name, SERVER)
     if spec is None or spec.loader is None:
-        raise RuntimeError("could not load safe-bash server")
+        raise RuntimeError("could not load git-broker server")
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
-    with mock.patch.dict(os.environ, {"SAFE_BASH_MODE": mode}, clear=False):
-        spec.loader.exec_module(module)
+    spec.loader.exec_module(module)
     return module
 
 
@@ -63,8 +62,9 @@ def valid_policy() -> dict:
 
 
 class ToolSurfaceTests(unittest.TestCase):
-    def test_codex_mode_exposes_only_structured_git(self) -> None:
-        server = load_server("codex-git")
+    def test_dedicated_server_exposes_only_structured_git(self) -> None:
+        server = load_server()
+        self.assertEqual(server.SERVER_INFO["name"], "git-broker")
         self.assertEqual([tool["name"] for tool in server.TOOLS], ["git"])
         schema = server.TOOLS[0]["inputSchema"]
         self.assertEqual(schema["required"], ["repo_path", "operation"])
@@ -80,14 +80,7 @@ class ToolSurfaceTests(unittest.TestCase):
             "worktree_add",
         ])
         self.assertNotIn("command", schema["properties"])
-
-    def test_default_mode_keeps_legacy_exec_surface(self) -> None:
-        server = load_server("legacy")
-        self.assertEqual([tool["name"] for tool in server.TOOLS], ["exec"])
-
-    def test_unknown_mode_fails_at_import(self) -> None:
-        with self.assertRaisesRegex(RuntimeError, "SAFE_BASH_MODE"):
-            load_server("typo")
+        self.assertFalse(hasattr(server, "_tool_exec"))
 
 
 class PolicySchemaTests(unittest.TestCase):
@@ -585,7 +578,7 @@ class ContainmentArgvTests(unittest.TestCase):
             {"repo_path": str(self.identity.worktree), "operation": "status"},
             self.policy,
         )
-        with tempfile.TemporaryDirectory(prefix="safe-bash-config-") as td:
+        with tempfile.TemporaryDirectory(prefix="git-broker-config-") as td:
             unsafe_config = Path(td) / "config"
             unsafe_config.write_text("[filter \"pwn\"]\nclean = sh -c true\n")
             with (
@@ -790,7 +783,7 @@ class ToolExecutionTests(unittest.TestCase):
 
     def test_unsafe_worktree_target_cleanup_failure_is_not_swallowed(self) -> None:
         with tempfile.TemporaryDirectory(
-            prefix="safe-bash-target-", dir="/home/jonathan/worktrees"
+            prefix="git-broker-target-", dir="/home/jonathan/worktrees"
         ) as td:
             target = Path(td) / "target"
             original_resolve = Path.resolve
@@ -816,13 +809,13 @@ class BlackBoxBrokerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.server = load_server()
         self.temp = tempfile.TemporaryDirectory(
-            prefix="safe-bash-git-", dir="/home/jonathan/worktrees"
+            prefix="git-broker-git-", dir="/home/jonathan/worktrees"
         )
         self.addCleanup(self.temp.cleanup)
         self.repo = Path(self.temp.name)
         subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
         notes = Path("/home/jonathan/.local/state/claude-tasks/ai-client-config")
-        self.canary = notes / f"safe-bash-escape-{os.getpid()}"
+        self.canary = notes / f"git-broker-escape-{os.getpid()}"
         self.canary.unlink(missing_ok=True)
         self.addCleanup(self.canary.unlink, missing_ok=True)
 
@@ -948,7 +941,7 @@ class BlackBoxBrokerTests(unittest.TestCase):
         )
 
         target = Path("/home/jonathan/worktrees") / (
-            f"safe-bash-linked-{os.getpid()}-{self.id().rsplit('.', 1)[-1]}"
+            f"git-broker-linked-{os.getpid()}-{self.id().rsplit('.', 1)[-1]}"
         )
 
         def cleanup_target() -> None:
