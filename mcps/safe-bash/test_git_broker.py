@@ -349,6 +349,8 @@ class GitArgvTests(unittest.TestCase):
         self.assertIn("commit.gpgSign=false", argv)
         self.assertIn("credential.helper=", argv)
         self.assertIn("protocol.allow=never", argv)
+        ssh_command = next(value for value in argv if value.startswith("core.sshCommand="))
+        self.assertIn(" -F /dev/null ", ssh_command)
         self.assertEqual(argv[-3:], ["commit", "--message", "Safe commit"])
         self.assertNotIn("--no-verify", argv)
 

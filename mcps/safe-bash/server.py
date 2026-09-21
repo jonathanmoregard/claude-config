@@ -661,7 +661,7 @@ def _fixed_git_config(policy: dict) -> list[str]:
         "remote.origin.uploadpack=git-upload-pack",
         "remote.origin.receivepack=git-receive-pack",
         (
-            "core.sshCommand=/run/current-system/sw/bin/ssh -oBatchMode=yes "
+            "core.sshCommand=/run/current-system/sw/bin/ssh -F /dev/null -oBatchMode=yes "
             f"-oUserKnownHostsFile={policy['sshKnownHostsFile']} "
             "-oGlobalKnownHostsFile=/etc/ssh/ssh_known_hosts"
         ),
