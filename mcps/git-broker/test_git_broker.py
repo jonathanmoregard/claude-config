@@ -314,6 +314,120 @@ class RepositoryIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "metadata"):
             self.server._discover_git_identity(forged, self.policy)
 
+    def test_rejects_primary_dot_git_directory_symlink(self) -> None:
+        victim = self.repos / "victim"
+        subprocess.run(["git", "init", "-q", str(victim)], check=True)
+        forged = self.worktrees / "forged-primary"
+        forged.mkdir()
+        (forged / ".git").symlink_to(victim / ".git", target_is_directory=True)
+
+        with self.assertRaisesRegex(RuntimeError, "symlink"):
+            self.server._discover_git_identity(forged, self.policy)
+
+
+class NixosPushGateSafetyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server = load_server()
+        self.temp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.temp.name) / "repo"
+        subprocess.run(
+            ["git", "init", "-q", "-b", "main", str(self.repo)], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(self.repo), "config", "user.name", "Broker Test"],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.repo),
+                "config",
+                "user.email",
+                "broker@example.test",
+            ],
+            check=True,
+        )
+        (self.repo / "payload.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repo), "add", "payload.txt"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.repo), "commit", "-qm", "initial"], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(self.repo), "switch", "-q", "-c", "feat/test"],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.repo),
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/jonathanmoregard/nixos-config.git",
+            ],
+            check=True,
+        )
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def test_diff_for_push_gate_cannot_execute_repo_local_external_command(self) -> None:
+        marker = Path(self.temp.name) / "external-diff-executed"
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.repo),
+                "config",
+                "diff.external",
+                f"sh -c 'printf escaped > {marker}'",
+            ],
+            check=True,
+        )
+        (self.repo / "payload.txt").write_text("changed\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repo), "add", "payload.txt"], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.repo),
+                "commit",
+                "-qm",
+                "test\n\nPre-push checklist:\n- Type: pure-data",
+            ],
+            check=True,
+        )
+
+        result = self.server._check_nixos_push(
+            f"git -C {self.repo} push origin"
+        )
+
+        self.assertIsNone(result)
+        self.assertFalse(
+            marker.exists(),
+            "repository-local external diff command executed in Nix push gate",
+        )
+
+
+class OutputRedactionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server = load_server()
+
+    def test_git_output_redacts_known_token_and_private_key(self) -> None:
+        token = "sk-proj-" + "A" * 32
+        private_key = (
+            "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----"
+        )
+
+        output = self.server._compose_output(0, token + "\n" + private_key, "")
+
+        self.assertNotIn(token, output)
+        self.assertNotIn("secret", output)
+        self.assertIn("[REDACTED:openai-project:", output)
+        self.assertIn("[REDACTED:private-key:", output)
+
 
 class GitArgvTests(unittest.TestCase):
     def setUp(self) -> None:

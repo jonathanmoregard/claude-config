@@ -569,8 +569,14 @@ def _discover_git_identity(repo_path: Path, policy: dict) -> _GitIdentity:
         }
         if resolved not in listed:
             raise RuntimeError("linked worktree is absent from common-dir registry")
-    elif not dot_git.is_dir() or git_dir != dot_git.resolve(strict=False):
-        raise RuntimeError("primary worktree Git metadata layout is not supported")
+    elif (
+        dot_git.is_symlink()
+        or not dot_git.is_dir()
+        or git_dir != dot_git.resolve(strict=False)
+    ):
+        raise RuntimeError(
+            "primary worktree .git must be a real non-symlink directory"
+        )
 
     return _GitIdentity(resolved, git_dir, common_dir, linked)
 
@@ -1464,8 +1470,21 @@ def _nixos_git(worktree: str, args: list[str], timeout_s: float = 10.0) -> tuple
     # files), which would otherwise crash the whole gate before it can run.
     try:
         result = subprocess.run(
-            ["git", "-C", worktree, *args],
-            capture_output=True, text=False, timeout=timeout_s,
+            [
+                "git",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=false",
+                "-C",
+                worktree,
+                *args,
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=False,
+            timeout=timeout_s,
+            env=_sanitized_git_env(),
         )
         stdout = result.stdout.decode("utf-8", errors="replace")
         stderr = result.stderr.decode("utf-8", errors="replace")
@@ -1545,10 +1564,16 @@ def _check_nixos_push(command: str) -> Optional[str]:
 
     # Diff against origin/main (falls back to local main, then empty).
     rc, diff, _ = _nixos_git(
-        worktree, ["diff", "origin/main...HEAD"], timeout_s=15.0
+        worktree,
+        ["diff", "--no-ext-diff", "--no-textconv", "origin/main...HEAD"],
+        timeout_s=15.0,
     )
     if rc != 0 or not diff:
-        rc2, diff2, _ = _nixos_git(worktree, ["diff", "main...HEAD"], timeout_s=15.0)
+        rc2, diff2, _ = _nixos_git(
+            worktree,
+            ["diff", "--no-ext-diff", "--no-textconv", "main...HEAD"],
+            timeout_s=15.0,
+        )
         if rc2 == 0:
             diff = diff2
     diff_has_risky = bool(_NIXOS_RISKY_MARKERS.search(diff)) if diff else False
