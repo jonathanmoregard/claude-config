@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stdio MCP server: bash-exec tool with in-band untrusted-ingress wrapping.
+"""Stdio MCP server with legacy exec and contained Codex Git modes.
 
 Replaces the PostToolUse `wrap-untrusted-bash.py` hook. Wrapping lives
 inside this MCP server's tool-return path, so it applies identically to
@@ -9,7 +9,11 @@ subagents; MCP tool output does).
 Policy: safety-critical content wrapping belongs in MCP server code, not
 PreToolUse/PostToolUse hooks. Hooks remain useful for observation only.
 
-Tool: `mcp__safe-bash__exec(command, timeout_ms?, description?)`
+Default tool: `mcp__safe-bash__exec(command, timeout_ms?, description?)`.
+
+`SAFE_BASH_MODE=codex-git` instead exposes only a structured `git` tool. Git
+runs without a shell inside a broker-owned bubblewrap boundary; repository
+hooks are replaced by the read-only trusted global hook directory.
 
 Wrapping is selective (allowlist of known untrusted-ingress commands):
 curl/wget/npx, gh pr/issue fetch, gh api, git clone, pip/npm/cargo/gem/go
@@ -20,6 +24,7 @@ Protocol: MCP 2024-11-05 over stdio, JSON-RPC 2.0 line-delimited.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import os
 import re
@@ -30,7 +35,9 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 
 class _InFlight:
@@ -69,6 +76,11 @@ MAX_TIMEOUT_MS = 600_000
 OUTPUT_LIMIT_CHARS = 60_000
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "bash-config.json")
+SAFE_BASH_MODE = os.environ.get("SAFE_BASH_MODE", "legacy")
+if SAFE_BASH_MODE not in {"legacy", "codex-git"}:
+    raise RuntimeError(
+        "SAFE_BASH_MODE must be either 'legacy' or 'codex-git'; refusing startup"
+    )
 
 HEREDOC_RE = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?")
 SEPARATORS = {";", "&&", "||", "|", "&", "(", ")", "\n"}
@@ -89,6 +101,905 @@ def _load_config() -> dict:
     if not _deny_rules_from_config(config):
         raise RuntimeError("safe-bash policy config contains no Bash deny rules; refusing execution")
     return config
+
+
+_GIT_POLICY_KEYS = frozenset(
+    {
+        "version",
+        "repositoryRoots",
+        "metadataRoots",
+        "protectedWorktrees",
+        "worktreeCreationRoots",
+        "allowedRemoteHosts",
+        "allowedRemoteSchemes",
+        "gitExecutable",
+        "bubblewrapExecutable",
+        "validatorExecutable",
+        "credentialHelperExecutable",
+        "githubConfigDir",
+        "sshKnownHostsFile",
+        "trustedHooksDir",
+        "userBusSocket",
+        "commitUserName",
+        "commitUserEmail",
+        "discoveryTimeoutMs",
+        "maxTimeoutMs",
+        "outputLimitChars",
+    }
+)
+_GIT_POLICY_PATH_LISTS = (
+    "repositoryRoots",
+    "metadataRoots",
+    "protectedWorktrees",
+    "worktreeCreationRoots",
+)
+_GIT_POLICY_STRING_LISTS = ("allowedRemoteHosts", "allowedRemoteSchemes")
+_GIT_POLICY_EXECUTABLES = (
+    "gitExecutable",
+    "bubblewrapExecutable",
+    "validatorExecutable",
+    "credentialHelperExecutable",
+)
+_GIT_POLICY_POSITIVE_INTS = (
+    "discoveryTimeoutMs",
+    "maxTimeoutMs",
+    "outputLimitChars",
+)
+
+
+def _load_git_policy(config: dict) -> dict:
+    """Validate and normalize the complete Git-broker policy.
+
+    Unknown fields reject so a typo or future permissive default cannot be
+    silently accepted by an older broker.
+    """
+    raw = config.get("gitBroker") if isinstance(config, dict) else None
+    if not isinstance(raw, dict):
+        raise RuntimeError("safe-bash gitBroker policy is missing or not an object")
+    missing = sorted(_GIT_POLICY_KEYS - raw.keys())
+    if missing:
+        raise RuntimeError(
+            "safe-bash gitBroker policy is missing required keys: "
+            + ", ".join(missing)
+        )
+    unknown = sorted(raw.keys() - _GIT_POLICY_KEYS)
+    if unknown:
+        raise RuntimeError(
+            "safe-bash gitBroker policy contains unknown keys: "
+            + ", ".join(unknown)
+        )
+    if raw["version"] != 1:
+        raise RuntimeError("safe-bash gitBroker version must be exactly 1")
+
+    policy = dict(raw)
+    for key in _GIT_POLICY_PATH_LISTS:
+        values = raw[key]
+        if not isinstance(values, list) or not values:
+            raise RuntimeError(f"safe-bash gitBroker {key} must be a non-empty list")
+        normalized: list[Path] = []
+        for value in values:
+            if not isinstance(value, str) or not value or not Path(value).is_absolute():
+                raise RuntimeError(
+                    f"safe-bash gitBroker {key} entries must be absolute paths"
+                )
+            path = Path(os.path.normpath(value)).resolve(strict=False)
+            if path in normalized:
+                raise RuntimeError(f"safe-bash gitBroker {key} contains duplicates")
+            normalized.append(path)
+        policy[key] = tuple(normalized)
+
+    for key in _GIT_POLICY_STRING_LISTS:
+        values = raw[key]
+        if (
+            not isinstance(values, list)
+            or not values
+            or any(not isinstance(value, str) or not value for value in values)
+        ):
+            raise RuntimeError(f"safe-bash gitBroker {key} must be a non-empty string list")
+        if len(values) != len(set(values)):
+            raise RuntimeError(f"safe-bash gitBroker {key} contains duplicates")
+        policy[key] = tuple(values)
+
+    for key in _GIT_POLICY_EXECUTABLES:
+        if not isinstance(raw[key], str) or not raw[key]:
+            raise RuntimeError(f"safe-bash gitBroker {key} must be a non-empty string")
+    for key in (
+        "githubConfigDir",
+        "sshKnownHostsFile",
+        "trustedHooksDir",
+        "userBusSocket",
+    ):
+        value = raw[key]
+        if not isinstance(value, str) or not value or not Path(value).is_absolute():
+            raise RuntimeError(f"safe-bash gitBroker {key} must be an absolute path")
+        policy[key] = Path(os.path.normpath(value)).resolve(strict=False)
+    for key in ("commitUserName", "commitUserEmail"):
+        value = raw[key]
+        if (
+            not isinstance(value, str)
+            or not value.strip()
+            or "\x00" in value
+            or "\n" in value
+            or len(value) > 320
+        ):
+            raise RuntimeError(f"safe-bash gitBroker {key} must be a bounded string")
+    for key in _GIT_POLICY_POSITIVE_INTS:
+        value = raw[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise RuntimeError(f"safe-bash gitBroker {key} must be a positive integer")
+    if raw["maxTimeoutMs"] > MAX_TIMEOUT_MS:
+        raise RuntimeError(
+            f"safe-bash gitBroker maxTimeoutMs cannot exceed {MAX_TIMEOUT_MS}"
+        )
+    if raw["outputLimitChars"] > OUTPUT_LIMIT_CHARS:
+        raise RuntimeError(
+            f"safe-bash gitBroker outputLimitChars cannot exceed {OUTPUT_LIMIT_CHARS}"
+        )
+    return policy
+
+
+_GIT_OPERATIONS = frozenset(
+    {
+        "status",
+        "diff",
+        "log",
+        "add",
+        "commit",
+        "fetch",
+        "push",
+        "switch",
+        "worktree_add",
+    }
+)
+_GIT_OPERATION_FIELDS = {
+    "status": frozenset(),
+    "diff": frozenset({"paths", "staged"}),
+    "log": frozenset({"max_count"}),
+    "add": frozenset({"paths", "all"}),
+    "commit": frozenset({"message"}),
+    "fetch": frozenset({"remote"}),
+    "push": frozenset({"remote", "set_upstream"}),
+    "switch": frozenset({"branch", "create", "start_point"}),
+    "worktree_add": frozenset({"worktree_path", "branch", "start_point"}),
+}
+_GIT_BASE_FIELDS = frozenset({"repo_path", "operation", "timeout"})
+_BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
+
+
+def _path_within(path: Path, roots: tuple[Path, ...]) -> bool:
+    return any(path == root or root in path.parents for root in roots)
+
+
+def _validate_branch(value: object, field: str = "branch") -> str:
+    if not isinstance(value, str) or not _BRANCH_RE.fullmatch(value):
+        raise RuntimeError(f"{field} must be a safe local Git branch name")
+    if (
+        value.startswith("-")
+        or value.endswith((".", "/", ".lock"))
+        or ".." in value
+        or "//" in value
+        or "@{" in value
+        or "\\" in value
+        or any(part in {"", ".", ".."} for part in value.split("/"))
+    ):
+        raise RuntimeError(f"{field} must be a safe local Git branch name")
+    return value
+
+
+def _validate_start_point(value: object) -> str:
+    if not isinstance(value, str) or not value or len(value) > 240:
+        raise RuntimeError("start_point must be a bounded Git ref name")
+    if (
+        "\x00" in value
+        or value.startswith("-")
+        or value.endswith((".", "/", ".lock"))
+        or ".." in value
+        or "//" in value
+        or "@{" in value
+        or "\\" in value
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", value)
+    ):
+        raise RuntimeError("start_point must be a bounded Git ref name")
+    return value
+
+
+def _validate_relative_paths(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list) or not value or len(value) > 500:
+        raise RuntimeError("paths must be a non-empty list with at most 500 entries")
+    result: list[str] = []
+    for raw in value:
+        if not isinstance(raw, str) or not raw or len(raw) > 4096 or "\x00" in raw:
+            raise RuntimeError("each path must be a bounded non-empty string")
+        path = Path(raw)
+        if (
+            path.is_absolute()
+            or raw.startswith(("-", ":"))
+            or any(part in {"", ".", "..", ".git"} for part in path.parts)
+        ):
+            raise RuntimeError(f"unsafe Git path argument: {raw!r}")
+        result.append(raw)
+    if len(result) != len(set(result)):
+        raise RuntimeError("paths must not contain duplicates")
+    return tuple(result)
+
+
+def _validate_git_request(args: object, policy: dict) -> dict:
+    """Validate one typed broker request without touching repository state."""
+    if not isinstance(args, dict):
+        raise RuntimeError("Git broker arguments must be an object")
+    operation = args.get("operation")
+    if operation not in _GIT_OPERATIONS:
+        raise RuntimeError(f"unsupported Git operation: {operation!r}")
+    allowed_fields = _GIT_BASE_FIELDS | _GIT_OPERATION_FIELDS[operation]
+    unexpected = sorted(set(args) - allowed_fields)
+    if unexpected:
+        raise RuntimeError(
+            f"unexpected fields for {operation}: " + ", ".join(unexpected)
+        )
+
+    raw_repo = args.get("repo_path")
+    if (
+        not isinstance(raw_repo, str)
+        or not raw_repo
+        or "\x00" in raw_repo
+        or not Path(raw_repo).is_absolute()
+    ):
+        raise RuntimeError("repo_path must be an absolute path")
+    request: dict[str, Any] = {
+        "repo_path": Path(os.path.normpath(raw_repo)),
+        "operation": operation,
+    }
+
+    timeout = args.get("timeout", min(DEFAULT_TIMEOUT_MS, policy["maxTimeoutMs"]))
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, int)
+        or timeout < 1
+        or timeout > policy["maxTimeoutMs"]
+    ):
+        raise RuntimeError(
+            f"timeout must be an integer from 1 to {policy['maxTimeoutMs']}"
+        )
+    request["timeout"] = timeout
+
+    if operation == "diff":
+        staged = args.get("staged", False)
+        if not isinstance(staged, bool):
+            raise RuntimeError("staged must be a boolean")
+        request["staged"] = staged
+        request["paths"] = (
+            _validate_relative_paths(args["paths"]) if "paths" in args else ()
+        )
+    elif operation == "log":
+        count = args.get("max_count", 20)
+        if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 200:
+            raise RuntimeError("max_count must be an integer from 1 to 200")
+        request["max_count"] = count
+    elif operation == "add":
+        all_files = args.get("all", False)
+        if not isinstance(all_files, bool):
+            raise RuntimeError("add all must be a boolean")
+        has_paths = "paths" in args
+        if has_paths == all_files:
+            raise RuntimeError("add requires exactly one of non-empty paths or all=true")
+        request["all"] = all_files
+        request["paths"] = _validate_relative_paths(args["paths"]) if has_paths else ()
+    elif operation == "commit":
+        message = args.get("message")
+        if (
+            not isinstance(message, str)
+            or not message.strip()
+            or "\x00" in message
+            or len(message) > 10_000
+        ):
+            raise RuntimeError("commit message must be non-empty and at most 10000 characters")
+        request["message"] = message
+    elif operation in {"fetch", "push"}:
+        remote = args.get("remote", "origin")
+        if remote != "origin":
+            raise RuntimeError("network Git operations allow only the origin remote")
+        request["remote"] = remote
+        if operation == "push":
+            set_upstream = args.get("set_upstream", False)
+            if not isinstance(set_upstream, bool):
+                raise RuntimeError("set_upstream must be a boolean")
+            request["set_upstream"] = set_upstream
+    elif operation == "switch":
+        request["branch"] = _validate_branch(args.get("branch"))
+        create = args.get("create", False)
+        if not isinstance(create, bool):
+            raise RuntimeError("create must be a boolean")
+        request["create"] = create
+        if "start_point" in args:
+            if not create:
+                raise RuntimeError("start_point requires create=true")
+            request["start_point"] = _validate_start_point(args["start_point"])
+    elif operation == "worktree_add":
+        raw_target = args.get("worktree_path")
+        if (
+            not isinstance(raw_target, str)
+            or not raw_target
+            or "\x00" in raw_target
+            or not Path(raw_target).is_absolute()
+        ):
+            raise RuntimeError("worktree_path must be an absolute path")
+        lexical_target = Path(os.path.normpath(raw_target))
+        resolved_target = lexical_target.resolve(strict=False)
+        if lexical_target != resolved_target or not _path_within(
+            resolved_target, policy["worktreeCreationRoots"]
+        ):
+            raise RuntimeError("worktree_path must be canonical and under an allowed root")
+        request["worktree_path"] = resolved_target
+        request["branch"] = _validate_branch(args.get("branch"))
+        if "start_point" in args:
+            request["start_point"] = _validate_start_point(args["start_point"])
+    return request
+
+
+@dataclass(frozen=True)
+class _GitIdentity:
+    worktree: Path
+    git_dir: Path
+    common_dir: Path
+    linked: bool
+
+
+def _sanitized_git_env(*, optional_locks: bool = False) -> dict[str, str]:
+    path = os.environ.get("PATH") or "/run/current-system/sw/bin:/usr/bin:/bin"
+    env = {
+        "PATH": path,
+        "HOME": "/nonexistent",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": "/bin/false",
+        "SSH_ASKPASS": "/bin/false",
+    }
+    if not optional_locks:
+        env["GIT_OPTIONAL_LOCKS"] = "0"
+    return env
+
+
+def _resolve_required_executable(policy: dict, key: str) -> str:
+    configured = policy[key]
+    resolved = shutil.which(configured)
+    if resolved is None or not os.access(resolved, os.X_OK):
+        raise RuntimeError(
+            f"BROKEN safety boundary: required {key} executable {configured!r} is unavailable"
+        )
+    return str(Path(resolved).resolve())
+
+
+def _run_git_discovery(argv: list[str], policy: dict) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            argv,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            env=_sanitized_git_env(),
+            timeout=policy["discoveryTimeoutMs"] / 1000.0,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Git repository discovery timed out; refusing execution") from exc
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        raise RuntimeError(
+            f"Git repository discovery failed closed: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def _discover_git_identity(repo_path: Path, policy: dict) -> _GitIdentity:
+    """Resolve and authenticate a normal or linked Git worktree."""
+    if not repo_path.is_absolute():
+        raise RuntimeError("repo_path must be absolute")
+    lexical = Path(os.path.normpath(str(repo_path)))
+    try:
+        resolved = lexical.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(f"repo_path does not resolve to a directory: {lexical}") from exc
+    if lexical != resolved:
+        raise RuntimeError("repo_path must be canonical and must not traverse symlinks")
+    if not resolved.is_dir() or not _path_within(resolved, policy["repositoryRoots"]):
+        raise RuntimeError("repo_path is outside approved repository roots")
+
+    git = _resolve_required_executable(policy, "gitExecutable")
+    proc = _run_git_discovery(
+        [
+            git,
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-C",
+            str(resolved),
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+            "--git-dir",
+            "--git-common-dir",
+        ],
+        policy,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "repo_path is not a trustworthy Git worktree: "
+            + (proc.stderr or "git rev-parse failed").strip()[:300]
+        )
+    lines = (proc.stdout or "").splitlines()
+    if len(lines) != 3 or any(not line.startswith("/") for line in lines):
+        raise RuntimeError("Git repository discovery returned malformed paths")
+    top, git_dir, common_dir = (Path(line).resolve(strict=False) for line in lines)
+    if top != resolved:
+        raise RuntimeError("repo_path must name the repository top-level exactly")
+    if not _path_within(git_dir, policy["metadataRoots"]) or not _path_within(
+        common_dir, policy["metadataRoots"]
+    ):
+        raise RuntimeError("Git metadata resolves outside approved metadata roots")
+    if not git_dir.exists() or not common_dir.exists():
+        raise RuntimeError("Git metadata path does not exist")
+
+    linked = git_dir != common_dir
+    dot_git = resolved / ".git"
+    if linked:
+        if not dot_git.is_file():
+            raise RuntimeError("linked worktree .git pointer is missing or not a file")
+        try:
+            pointer = dot_git.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise RuntimeError("linked worktree .git pointer is unreadable") from exc
+        prefix = "gitdir: "
+        if not pointer.startswith(prefix):
+            raise RuntimeError("linked worktree .git pointer is malformed")
+        pointed = Path(pointer[len(prefix) :])
+        if not pointed.is_absolute():
+            pointed = (resolved / pointed).resolve(strict=False)
+        else:
+            pointed = pointed.resolve(strict=False)
+        if pointed != git_dir:
+            raise RuntimeError("linked worktree .git pointer disagrees with Git discovery")
+
+        listing = _run_git_discovery(
+            [
+                git,
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-C",
+                str(resolved),
+                "worktree",
+                "list",
+                "--porcelain",
+            ],
+            policy,
+        )
+        if listing.returncode != 0:
+            raise RuntimeError("could not verify linked worktree membership")
+        listed = {
+            Path(line.removeprefix("worktree ")).resolve(strict=False)
+            for line in (listing.stdout or "").splitlines()
+            if line.startswith("worktree ")
+        }
+        if resolved not in listed:
+            raise RuntimeError("linked worktree is absent from common-dir registry")
+    elif not dot_git.is_dir() or git_dir != dot_git.resolve(strict=False):
+        raise RuntimeError("primary worktree Git metadata layout is not supported")
+
+    return _GitIdentity(resolved, git_dir, common_dir, linked)
+
+
+def _authorize_git_operation(
+    identity: _GitIdentity, operation: str, policy: dict
+) -> None:
+    if identity.worktree in policy["protectedWorktrees"] and operation not in {
+        "status",
+        "diff",
+        "log",
+        "worktree_add",
+    }:
+        raise RuntimeError(
+            f"Git mutation denied in protected primary worktree: {identity.worktree}"
+        )
+
+
+def _validate_remote_url(url: object, policy: dict) -> str:
+    if not isinstance(url, str) or not url or len(url) > 2048 or "\x00" in url:
+        raise RuntimeError("remote URL is missing or malformed")
+
+    scp = re.fullmatch(
+        r"git@([A-Za-z0-9.-]+):([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?)",
+        url,
+    )
+    if scp is not None:
+        host = scp.group(1).lower()
+        if "ssh" not in policy["allowedRemoteSchemes"]:
+            raise RuntimeError("SSH remotes are not allowed by Git broker policy")
+        if host not in policy["allowedRemoteHosts"]:
+            raise RuntimeError(f"remote host is not allowed: {host}")
+        return url
+
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+    if scheme not in policy["allowedRemoteSchemes"]:
+        raise RuntimeError(f"remote scheme is not allowed: {scheme or 'missing'}")
+    if parsed.hostname is None or parsed.hostname.lower() not in policy["allowedRemoteHosts"]:
+        raise RuntimeError(f"remote host is not allowed: {parsed.hostname!r}")
+    if parsed.password is not None or parsed.query or parsed.fragment:
+        raise RuntimeError("remote URL credentials, query strings, and fragments are denied")
+    if scheme == "https":
+        if parsed.username is not None or parsed.port not in {None, 443}:
+            raise RuntimeError("HTTPS remote must not contain userinfo or a custom port")
+    elif scheme == "ssh":
+        if parsed.username != "git" or parsed.port not in {None, 22}:
+            raise RuntimeError("SSH remote must use the git user and standard port")
+    else:
+        raise RuntimeError(f"remote scheme is not supported: {scheme}")
+    if not re.fullmatch(
+        r"/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?", parsed.path
+    ):
+        raise RuntimeError("remote URL must name one owner/repository path")
+    return url
+
+
+def _fixed_git_config(policy: dict) -> list[str]:
+    credential_helper = _resolve_required_executable(
+        policy, "credentialHelperExecutable"
+    )
+    values = (
+        f"core.hooksPath={policy['trustedHooksDir']}",
+        "core.fsmonitor=false",
+        "core.pager=cat",
+        "pager.status=false",
+        "pager.diff=false",
+        "commit.gpgSign=false",
+        "tag.gpgSign=false",
+        "credential.helper=",
+        f"credential.https://github.com.helper=!{credential_helper} auth git-credential",
+        "protocol.allow=never",
+        "protocol.ext.allow=never",
+        "protocol.file.allow=user",
+        "protocol.https.allow=always",
+        "protocol.ssh.allow=always",
+        "remote.origin.uploadpack=git-upload-pack",
+        "remote.origin.receivepack=git-receive-pack",
+        (
+            "core.sshCommand=/run/current-system/sw/bin/ssh -oBatchMode=yes "
+            f"-oUserKnownHostsFile={policy['sshKnownHostsFile']} "
+            "-oGlobalKnownHostsFile=/etc/ssh/ssh_known_hosts"
+        ),
+        "http.proxy=",
+        f"user.name={policy['commitUserName']}",
+        f"user.email={policy['commitUserEmail']}",
+    )
+    argv: list[str] = []
+    for value in values:
+        argv.extend(("-c", value))
+    return argv
+
+
+def _build_git_argv(
+    request: dict,
+    identity: _GitIdentity,
+    policy: dict,
+    *,
+    remote_url: str | None = None,
+    current_branch: str | None = None,
+) -> list[str]:
+    git = _resolve_required_executable(policy, "gitExecutable")
+    argv = [git, *_fixed_git_config(policy)]
+    operation = request["operation"]
+    if operation in {"fetch", "push"}:
+        if remote_url is None:
+            raise RuntimeError(f"{operation} requires a validated remote URL")
+        _validate_remote_url(remote_url, policy)
+        argv.extend(("-c", f"remote.origin.url={remote_url}"))
+        argv.extend(("-c", f"remote.origin.pushurl={remote_url}"))
+    argv.extend(("-C", str(identity.worktree)))
+
+    if operation == "status":
+        argv.extend(("status", "--short", "--branch"))
+    elif operation == "diff":
+        argv.append("diff")
+        if request["staged"]:
+            argv.append("--cached")
+        if request["paths"]:
+            argv.append("--")
+            argv.extend(request["paths"])
+    elif operation == "log":
+        argv.extend(("log", "--oneline", "--decorate=no", f"--max-count={request['max_count']}"))
+    elif operation == "add":
+        argv.append("add")
+        if request["all"]:
+            argv.append("--all")
+        else:
+            argv.append("--")
+            argv.extend(request["paths"])
+    elif operation == "commit":
+        argv.extend(("commit", "--message", request["message"]))
+    elif operation == "fetch":
+        argv.extend(("fetch", "--prune", "origin"))
+    elif operation == "push":
+        if current_branch is None:
+            raise RuntimeError("push requires a validated current branch")
+        branch = _validate_branch(current_branch, "current branch")
+        argv.extend(("push", "--porcelain"))
+        if request["set_upstream"]:
+            argv.append("--set-upstream")
+        argv.extend(("origin", f"refs/heads/{branch}:refs/heads/{branch}"))
+    elif operation == "switch":
+        argv.append("switch")
+        if request["create"]:
+            argv.extend(("--create", request["branch"]))
+            if request.get("start_point"):
+                argv.append(request["start_point"])
+        else:
+            argv.append(request["branch"])
+    elif operation == "worktree_add":
+        argv.extend(
+            (
+                "worktree",
+                "add",
+                "--no-track",
+                "-b",
+                request["branch"],
+                str(request["worktree_path"]),
+            )
+        )
+        if request.get("start_point"):
+            argv.append(request["start_point"])
+    else:  # Defensive: validation should make this unreachable.
+        raise RuntimeError(f"unsupported Git operation: {operation!r}")
+    return argv
+
+
+def _sandbox_parent_dirs(path: Path, hidden_roots: tuple[Path, ...]) -> list[Path]:
+    for root in hidden_roots:
+        if path == root or root in path.parents:
+            relative = path.relative_to(root)
+            parts = relative.parts[:-1]
+            result: list[Path] = []
+            current = root
+            for part in parts:
+                current /= part
+                result.append(current)
+            return result
+    return []
+
+
+def _build_git_sandbox(
+    request: dict,
+    identity: _GitIdentity,
+    policy: dict,
+    git_argv: list[str],
+    *,
+    existing_only: bool = True,
+    ssh_auth_sock: str | None = None,
+    remote_url: str | None = None,
+) -> tuple[list[str], dict[str, str]]:
+    """Build a bubblewrap command with only selected Git state writable."""
+    bwrap = _resolve_required_executable(policy, "bubblewrapExecutable")
+    networked = request["operation"] in {"fetch", "push"}
+    home = Path.home().resolve()
+    runtime_dir = Path(f"/run/user/{os.getuid()}")
+    hidden_roots = (home, Path("/tmp"), runtime_dir)
+    argv = [
+        bwrap,
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-all",
+    ]
+    if networked:
+        argv.append("--share-net")
+    argv.extend(
+        (
+            "--ro-bind",
+            "/",
+            "/",
+            "--tmpfs",
+            str(home),
+            "--tmpfs",
+            "/tmp",
+            "--tmpfs",
+            str(runtime_dir),
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+        )
+    )
+
+    binds: list[tuple[str, Path]] = []
+    worktree_mode = "--ro-bind" if request["operation"] == "worktree_add" else "--bind"
+    binds.append((worktree_mode, identity.worktree))
+    binds.append(("--bind", identity.common_dir))
+    if not _path_within(identity.git_dir, (identity.common_dir,)):
+        binds.append(("--bind", identity.git_dir))
+    if request["operation"] == "worktree_add":
+        binds.append(("--bind", request["worktree_path"]))
+    trusted_hooks: Path = policy["trustedHooksDir"]
+    if existing_only and (not trusted_hooks.is_dir() or trusted_hooks.is_symlink()):
+        raise RuntimeError(
+            f"BROKEN safety boundary: trusted hooks directory is unavailable: {trusted_hooks}"
+        )
+    binds.append(("--ro-bind", trusted_hooks))
+
+    env = _sanitized_git_env(optional_locks=True)
+    env["HOME"] = str(home)
+    if networked:
+        if remote_url is None:
+            raise RuntimeError("network Git operation requires a validated remote URL")
+        _validate_remote_url(remote_url, policy)
+        is_https = remote_url.startswith("https://")
+        credential_paths = (
+            (policy["githubConfigDir"], policy["userBusSocket"])
+            if is_https
+            else (policy["sshKnownHostsFile"],)
+        )
+        for path in credential_paths:
+            if existing_only and not path.exists():
+                raise RuntimeError(
+                    f"BROKEN safety boundary: required credential path is unavailable: {path}"
+                )
+            binds.append(("--ro-bind", path))
+        if is_https:
+            env["DBUS_SESSION_BUS_ADDRESS"] = (
+                "unix:path=" + str(policy["userBusSocket"])
+            )
+        else:
+            socket_value = (
+                ssh_auth_sock if ssh_auth_sock is not None else os.environ.get("SSH_AUTH_SOCK")
+            )
+            if not isinstance(socket_value, str) or not socket_value.startswith("/"):
+                raise RuntimeError("BROKEN safety boundary: SSH_AUTH_SOCK is unavailable")
+            socket_path = Path(socket_value).resolve(strict=False)
+            expected_socket_root = Path(f"/run/user/{os.getuid()}")
+            if not _path_within(socket_path, (expected_socket_root,)):
+                raise RuntimeError(
+                    "BROKEN safety boundary: SSH_AUTH_SOCK is outside the user runtime dir"
+                )
+            if existing_only and not socket_path.exists():
+                raise RuntimeError("BROKEN safety boundary: SSH_AUTH_SOCK does not exist")
+            binds.append(("--ro-bind", socket_path))
+            env["SSH_AUTH_SOCK"] = str(socket_path)
+
+    seen_dirs: set[Path] = set()
+    for _mode, path in binds:
+        for parent in _sandbox_parent_dirs(path, hidden_roots):
+            if parent not in seen_dirs:
+                argv.extend(("--dir", str(parent)))
+                seen_dirs.add(parent)
+    seen_binds: set[tuple[str, Path]] = set()
+    for mode, path in binds:
+        entry = (mode, path)
+        if entry in seen_binds:
+            continue
+        argv.extend((mode, str(path), str(path)))
+        seen_binds.add(entry)
+    argv.extend(("--chdir", str(identity.worktree), "--", *git_argv))
+    return argv, env
+
+
+def _network_git_context(
+    request: dict, identity: _GitIdentity, policy: dict
+) -> tuple[str | None, str | None]:
+    operation = request["operation"]
+    if operation not in {"fetch", "push"}:
+        return None, None
+    git = _resolve_required_executable(policy, "gitExecutable")
+    url_argv = [
+        git,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-C",
+        str(identity.worktree),
+        "remote",
+        "get-url",
+    ]
+    if operation == "push":
+        url_argv.append("--push")
+    url_argv.extend(("--all", "origin"))
+    remote = _run_git_discovery(url_argv, policy)
+    if remote.returncode != 0:
+        raise RuntimeError(
+            "could not resolve origin remote: "
+            + (remote.stderr or "git remote get-url failed").strip()[:300]
+        )
+    urls = [line.strip() for line in (remote.stdout or "").splitlines() if line.strip()]
+    if len(urls) != 1:
+        raise RuntimeError("origin must resolve to exactly one remote URL")
+    remote_url = _validate_remote_url(urls[0], policy)
+
+    branch: str | None = None
+    if operation == "push":
+        current = _run_git_discovery(
+            [
+                git,
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-C",
+                str(identity.worktree),
+                "symbolic-ref",
+                "--quiet",
+                "--short",
+                "HEAD",
+            ],
+            policy,
+        )
+        if current.returncode != 0:
+            raise RuntimeError("push requires a non-detached current branch")
+        branch = _validate_branch((current.stdout or "").strip(), "current branch")
+    return remote_url, branch
+
+
+def _dcg_command_for_git_request(request: dict) -> str:
+    """Render the typed request as an equivalent command for dcg analysis."""
+    argv = ["git", "-C", str(request["repo_path"])]
+    operation = request["operation"]
+    if operation == "status":
+        argv.append("status")
+    elif operation == "diff":
+        argv.append("diff")
+        if request["staged"]:
+            argv.append("--cached")
+        if request["paths"]:
+            argv.extend(("--", *request["paths"]))
+    elif operation == "log":
+        argv.extend(("log", f"--max-count={request['max_count']}"))
+    elif operation == "add":
+        argv.append("add")
+        argv.extend(("--all",) if request["all"] else ("--", *request["paths"]))
+    elif operation == "commit":
+        argv.extend(("commit", "--message", request["message"]))
+    elif operation == "fetch":
+        argv.extend(("fetch", "origin"))
+    elif operation == "push":
+        argv.extend(("push", "origin"))
+    elif operation == "switch":
+        argv.append("switch")
+        if request["create"]:
+            argv.extend(("--create", request["branch"]))
+            if request.get("start_point"):
+                argv.append(request["start_point"])
+        else:
+            argv.append(request["branch"])
+    elif operation == "worktree_add":
+        argv.extend(
+            (
+                "worktree",
+                "add",
+                "-b",
+                request["branch"],
+                str(request["worktree_path"]),
+            )
+        )
+        if request.get("start_point"):
+            argv.append(request["start_point"])
+    else:
+        raise RuntimeError(f"unsupported Git operation: {operation!r}")
+    return shlex.join(argv)
+
+
+def _prepare_worktree_target(request: dict) -> Path | None:
+    if request["operation"] != "worktree_add":
+        return None
+    target: Path = request["worktree_path"]
+    if target.exists() or target.is_symlink():
+        raise RuntimeError("worktree_path already exists; refusing to overwrite it")
+    try:
+        parent = target.parent.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError("worktree_path parent must already exist") from exc
+    if parent != target.parent:
+        raise RuntimeError("worktree_path parent must not traverse symlinks")
+    try:
+        target.mkdir(mode=0o700)
+    except OSError as exc:
+        raise RuntimeError(f"could not create worktree target: {exc}") from exc
+    if target.resolve(strict=True) != target or target.is_symlink():
+        try:
+            target.rmdir()
+        except OSError:
+            pass
+        raise RuntimeError("created worktree target did not remain canonical")
+    return target
 
 
 def _deny_rules_from_config(config: dict) -> list[str]:
@@ -389,7 +1300,7 @@ def _check_dcg_config(path: str) -> Optional[str]:
     return None
 
 
-def _check_denied_by_dcg(command: str) -> Optional[str]:
+def _check_denied_by_dcg(command: str, dcg_path: str | None = None) -> Optional[str]:
     """Ask dcg (destructive-command guard) whether the command should be blocked.
 
     dcg speaks Claude-Code hook JSON: reads tool-invocation payload from stdin,
@@ -398,12 +1309,13 @@ def _check_denied_by_dcg(command: str) -> Optional[str]:
     on any unavailable, malformed, timed-out, or indeterminate policy state.
     Only a successful allow with the user config proven loaded returns None.
     """
-    if not os.path.exists(DCG_PATH) or not os.access(DCG_PATH, os.X_OK):
-        return _broken_boundary(f"dcg is missing or not executable at {DCG_PATH!r}")
+    path = dcg_path or DCG_PATH
+    if not os.path.exists(path) or not os.access(path, os.X_OK):
+        return _broken_boundary(f"dcg is missing or not executable at {path!r}")
     payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
     try:
         proc = subprocess.run(
-            [DCG_PATH],
+            [path],
             input=payload,
             capture_output=True,
             text=True,
@@ -453,7 +1365,7 @@ def _check_denied_by_dcg(command: str) -> Optional[str]:
         return _broken_boundary(
             f"dcg exited {proc.returncode} without a deny: {(proc.stderr or '').strip()[:160]}"
         )
-    config_fault = _check_dcg_config(DCG_PATH)
+    config_fault = _check_dcg_config(path)
     if config_fault is not None:
         return config_fault
     return None
@@ -1110,6 +2022,83 @@ def _run(
     return 124, stdout or "", stderr
 
 
+def _run_argv(
+    argv: list[str],
+    env: dict[str, str],
+    timeout_ms: int,
+    rec: Optional[_InFlight] = None,
+) -> tuple[int, str, str]:
+    """Run a prevalidated argv directly; never invoke a shell."""
+    timeout_s = max(1, timeout_ms) / 1000.0
+    proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        start_new_session=True,
+    )
+    if rec is not None:
+        with _in_flight_lock:
+            rec.proc = proc
+            cancelled_already = rec.cancelled
+        if cancelled_already:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        pgid = None
+
+    def signal_group(sig: int) -> None:
+        if pgid is not None:
+            try:
+                os.killpg(pgid, sig)
+                return
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        try:
+            proc.send_signal(sig)
+        except OSError:
+            pass
+
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_s)
+        return proc.returncode, stdout or "", stderr or ""
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
+
+    signal_group(signal.SIGTERM)
+    try:
+        out, err = proc.communicate(timeout=2.0)
+        stdout, stderr = out or stdout, err or stderr
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or stdout
+        stderr = exc.stderr or stderr
+        signal_group(signal.SIGKILL)
+        try:
+            out, err = proc.communicate(timeout=2.0)
+            stdout, stderr = out or stdout, err or stderr
+        except subprocess.TimeoutExpired as final_exc:
+            stdout = final_exc.stdout or stdout
+            stderr = final_exc.stderr or stderr
+            sys.stderr.write(
+                "[safe-bash] Git timeout fallback: pipes remain open; "
+                "giving up reaping to keep MCP responsive\n"
+            )
+            sys.stderr.flush()
+    warning = (
+        f"[safe-bash] Git operation exceeded timeout of {timeout_ms} ms. "
+        "Timeout or cancellation is not rollback; inspect repository state before retrying."
+    )
+    stderr = ((stderr or "") + "\n" + warning).strip()
+    return 124, stdout or "", stderr
+
+
 # High-entropy secret prefixes. If a command's output contains a string
 # matching any of these patterns, the matched substring is replaced with
 # `[REDACTED:<label>:<len>chars]` before the body is returned to the
@@ -1206,7 +2195,7 @@ def _wrap_if_untrusted(command: str, body: str, config: dict) -> str:
     )
 
 
-TOOLS = [
+LEGACY_TOOLS = [
     {
         "name": "exec",
         "description": (
@@ -1272,6 +2261,63 @@ TOOLS = [
         },
     }
 ]
+
+GIT_TOOLS = [
+    {
+        "name": "git",
+        "description": (
+            "Runs one policy-approved Git operation in a validated repository. "
+            "The tool accepts structured fields only, never shell text or raw argv."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "repo_path": {
+                    "type": "string",
+                    "description": "Absolute path to the selected Git worktree",
+                },
+                "operation": {
+                    "type": "string",
+                    "enum": [
+                        "status",
+                        "diff",
+                        "log",
+                        "add",
+                        "commit",
+                        "fetch",
+                        "push",
+                        "switch",
+                        "worktree_add",
+                    ],
+                },
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Relative paths for add or diff",
+                },
+                "all": {"type": "boolean"},
+                "message": {"type": "string"},
+                "remote": {"type": "string"},
+                "set_upstream": {"type": "boolean"},
+                "branch": {"type": "string"},
+                "create": {"type": "boolean"},
+                "start_point": {"type": "string"},
+                "worktree_path": {"type": "string"},
+                "staged": {"type": "boolean"},
+                "max_count": {"type": "integer", "minimum": 1, "maximum": 200},
+                "timeout": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_TIMEOUT_MS,
+                },
+            },
+            "required": ["repo_path", "operation"],
+            "additionalProperties": False,
+        },
+    }
+]
+
+TOOLS = GIT_TOOLS if SAFE_BASH_MODE == "codex-git" else LEGACY_TOOLS
 
 SERVER_INFO = {"name": "safe-bash", "version": "1.0.0"}
 CAPABILITIES = {"tools": {"listChanged": False}}
@@ -1395,10 +2441,15 @@ def _dispatch_tools_call(msg_id, params, rec) -> None:
     try:
         name = params.get("name")
         arguments = params.get("arguments") or {}
-        if name != "exec":
+        expected_tool = "git" if SAFE_BASH_MODE == "codex-git" else "exec"
+        if name != expected_tool:
             _send_response(msg_id, error={"code": -32601, "message": f"Unknown tool: {name}"})
             return
-        text = _tool_exec(arguments, rec)
+        text = (
+            _tool_git(arguments, rec)
+            if SAFE_BASH_MODE == "codex-git"
+            else _tool_exec(arguments, rec)
+        )
         _send_response(msg_id, result={"content": [{"type": "text", "text": text}]})
     except Exception as e:
         _send_response(
@@ -1424,6 +2475,60 @@ def _tool_exec(args: dict, rec: Optional[_InFlight] = None) -> str:
     rc, stdout, stderr = _run(command, timeout_ms, rec)
     body = _compose_output(rc, stdout, stderr)
     return _wrap_if_untrusted(command, body, config)
+
+
+def _tool_git(args: dict, rec: Optional[_InFlight] = None) -> str:
+    """Authorize and run one structured Git operation inside bubblewrap."""
+    config = _load_config()
+    policy = _load_git_policy(config)
+    request = _validate_git_request(args, policy)
+
+    validator = _resolve_required_executable(policy, "validatorExecutable")
+    verdict_command = _dcg_command_for_git_request(request)
+    validator_reason = _check_denied_by_dcg(verdict_command, validator)
+    if validator_reason is not None:
+        return f"[safe-bash] {validator_reason}"
+
+    identity = _discover_git_identity(request["repo_path"], policy)
+    _authorize_git_operation(identity, request["operation"], policy)
+    if request["operation"] == "push":
+        nixos_reason = _check_nixos_push(
+            "git -C " + shlex.quote(str(identity.worktree)) + " push origin"
+        )
+        if nixos_reason is not None:
+            return f"[safe-bash] {nixos_reason}"
+
+    remote_url, current_branch = _network_git_context(request, identity, policy)
+    created_target = _prepare_worktree_target(request)
+    completed = False
+    try:
+        git_argv = _build_git_argv(
+            request,
+            identity,
+            policy,
+            remote_url=remote_url,
+            current_branch=current_branch,
+        )
+        sandbox_argv, env = _build_git_sandbox(
+            request,
+            identity,
+            policy,
+            git_argv,
+            remote_url=remote_url,
+        )
+        rc, stdout, stderr = _run_argv(
+            sandbox_argv, env, request["timeout"], rec
+        )
+        completed = rc == 0
+        return _compose_output(rc, stdout, stderr)
+    finally:
+        if created_target is not None and not completed:
+            try:
+                created_target.rmdir()
+            except OSError:
+                # A failed Git operation may have partially populated its
+                # target. Never recursively clean it: timeout is not rollback.
+                pass
 
 
 def _handle(msg: dict) -> None:

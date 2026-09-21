@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Restoration contract for safe-bash as command-execution boundary."""
+"""Contract for dormant safe-bash source plus Codex-only Git broker mode."""
 from __future__ import annotations
 
 import importlib.util
@@ -37,18 +37,57 @@ safe_config = load_json(CONFIG)
 ingress_config = load_json(os.path.join(ROOT, "hooks", "bash-guard-config.json"))
 permissions = settings.get("permissions") or {}
 
-print("\n== command surface ==")
-check("native Bash is denied", "Bash" in (permissions.get("deny") or []))
-check("native Bash is not explicitly allowed", "Bash" not in (permissions.get("allow") or []))
-check("safe-bash MCP is allowed", "mcp__safe-bash__*" in (permissions.get("allow") or []))
+
+def master_file(path: str) -> bytes:
+    return subprocess.run(
+        ["git", "show", f"origin/master:{path}"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+    ).stdout
+
+
+print("\n== dormant Claude surface ==")
+check(
+    "Claude settings are byte-identical to origin/master",
+    open(os.path.join(ROOT, "settings.json"), "rb").read() == master_file("settings.json"),
+)
+check(
+    "Claude MCP registry is byte-identical to origin/master",
+    open(os.path.join(ROOT, "mcp-servers.json"), "rb").read()
+    == master_file("mcp-servers.json"),
+)
+check("native Bash remains available to Claude", "Bash" in (permissions.get("allow") or []))
+check("native Bash is not blanket-denied", "Bash" not in (permissions.get("deny") or []))
+check(
+    "safe-bash MCP is not granted to Claude",
+    "mcp__safe-bash__*" not in (permissions.get("allow") or []),
+)
 
 safe_registration = servers.get("safe-bash") or {}
-check("safe-bash MCP is registered", bool(safe_registration))
-check("safe-bash registration is stdio", safe_registration.get("type") == "stdio")
+check("safe-bash MCP is not registered for Claude", not safe_registration)
+
+allowed_diff = {
+    "mcps/safe-bash/bash-config.json",
+    "mcps/safe-bash/server.py",
+    "mcps/safe-bash/test_cancellation.py",
+    "mcps/safe-bash/test_git_broker.py",
+    "mcps/safe-bash/test_safe_bash.py",
+    "tests/test_safe_bash_restore.py",
+}
+changed = set(
+    subprocess.run(
+        ["git", "diff", "--name-only", "origin/master", "--"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+)
 check(
-    "safe-bash registration points at tracked server",
-    safe_registration.get("args") == ["/home/jonathan/.claude/mcps/safe-bash/server.py"],
-    repr(safe_registration.get("args")),
+    "branch changes only dormant broker source and tests",
+    changed <= allowed_diff,
+    f"unexpected={sorted(changed - allowed_diff)}",
 )
 
 print("\n== policy parity ==")
@@ -57,7 +96,7 @@ expected_rules = [
 ]
 actual_rules = ((safe_config.get("permissions") or {}).get("deny") or [])
 check(
-    "safe-bash enforces every native Bash deny rule",
+    "dormant safe-bash preserves every Claude Bash deny rule",
     set(expected_rules) <= set(actual_rules),
     f"missing={sorted(set(expected_rules) - set(actual_rules))}",
 )
@@ -156,6 +195,7 @@ with tempfile.TemporaryDirectory(prefix="safe-bash-restore-") as scratch:
     spec = importlib.util.spec_from_file_location("safe_bash_restore_server", SERVER)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     original_config = module.CONFIG_PATH
     try:

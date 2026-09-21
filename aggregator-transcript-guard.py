@@ -40,7 +40,7 @@ REASON = (
     "If you need a specific session's raw turns, that is "
     f"`{TOOL}` with dsl=\"session:<id>\" and drilldown=True. Only if the "
     "aggregator has genuinely not indexed what you need, say so and use "
-    "`mcp__safe-bash__exec` to read the file directly."
+    "`Bash` to read the file directly."
 )
 
 

@@ -474,25 +474,32 @@ with open(os.path.join(REPO_ROOT, "settings.json"), encoding="utf-8") as fh:
 # `deny` overrides an allow rule, which is why `bash-guard.py` never emits an
 # `allow` decision of its own (see K4 below).
 # ----------------------------------------------------------------------
-section("settings.json: safe-bash owns command execution")
+section("settings.json: the permission surface the switchover creates")
 
 _ALLOW = SETTINGS.get("permissions", {}).get("allow", [])
 _DENY_ALL = SETTINGS.get("permissions", {}).get("deny", [])
 
 check(
-    "native Bash is denied independently of hook outcomes",
-    "Bash" in _DENY_ALL,
-    "a hook timeout must not make native Bash reachable",
+    # L1. Until this is gone the guards are unreachable: the CLI refuses the
+    # tool before any hook or glob is consulted.
+    "the tool-wide `Bash` deny is GONE — native Bash is reachable at all",
+    "Bash" not in _DENY_ALL,
+    "`\"Bash\"` in permissions.deny refuses the native tool outright, which "
+    "makes every guard in this suite dead code",
 )
 check(
-    "safe-bash is the allowed command surface",
-    "mcp__safe-bash__*" in _ALLOW,
-    f"safe-bash entries: {[r for r in _ALLOW if 'safe-bash' in r]}",
+    # L2. The dead entry for a server that no longer exists.
+    "the retired MCP's allow entry is gone",
+    not [r for r in _ALLOW if "safe-bash" in r],
+    f"still in allow: {[r for r in _ALLOW if 'safe-bash' in r]}",
 )
 check(
-    "native Bash is not explicitly allowed",
-    "Bash" not in _ALLOW,
-    "permissions.deny is the fail-closed outer boundary",
+    # A7 / W11, arm (b). Absence here is not neutral: it silently converts
+    # every Bash call in every unattended run into a permission prompt.
+    "arm (b) is in force: `Bash` is allowed, matching the posture safe-bash had",
+    "Bash" in _ALLOW,
+    "permissions.allow must carry `Bash`; see the block comment above for why "
+    "the other two arms were rejected",
 )
 check(
     "`ask` stays empty — the switchover adds no new prompt surface",
@@ -500,33 +507,41 @@ check(
     f"ask={SETTINGS.get('permissions', {}).get('ask')!r}",
 )
 
+# L4/L10. Nothing in the live settings surface may still name the retired
+# tool — not a matcher, not a permission rule, not a hook command line.
 with open(os.path.join(REPO_ROOT, "settings.json"), encoding="utf-8") as fh:
     _settings_text = fh.read()
 check(
-    "settings.json names the safe-bash boundary",
-    "mcp__safe-bash__*" in _settings_text,
-    "safe-bash must be explicitly allowed",
+    "no matcher, rule or hook command in settings.json names the retired MCP",
+    "safe-bash" not in _settings_text,
+    "grep -n safe-bash settings.json",
 )
 
+# L3. The registration, and the `DCG_PATH` handoff it carried. Removing the
+# server removes the only place DCG_PATH was exported to the guard, so the
+# fallback chain in `_dcg_path()` is what keeps dcg resolvable — asserted
+# behaviourally by the DCG_PATH-unset rows further down (parity row B3).
 _mcp_servers_path = os.path.join(REPO_ROOT, "mcp-servers.json")
 with open(_mcp_servers_path, encoding="utf-8") as fh:
     _MCP_SERVERS = json.load(fh)
 check(
-    "mcp-servers.json registers the safe-bash server",
-    "safe-bash" in _MCP_SERVERS,
+    "mcp-servers.json no longer registers the safe-bash server",
+    "safe-bash" not in _MCP_SERVERS,
     f"servers: {sorted(_MCP_SERVERS)}",
 )
 check(
-    "safe-bash registration pins dcg path",
-    (_MCP_SERVERS.get("safe-bash") or {}).get("env", {}).get("DCG_PATH")
-    == "/etc/profiles/per-user/jonathan/bin/dcg",
-    f"registration={_MCP_SERVERS.get('safe-bash')!r}",
+    "no surviving server registration smuggles the retired server back in",
+    not [k for k in _MCP_SERVERS if "safe-bash" in k],
+    f"servers: {sorted(_MCP_SERVERS)}",
 )
 
+# The migration is not half-done: the source tree the port was made from is
+# gone, so nothing can quietly keep depending on it.
 check(
-    "mcps/safe-bash/ is restored",
-    os.path.isdir(os.path.join(REPO_ROOT, "mcps", "safe-bash")),
-    "server and policy must remain tracked together",
+    "mcps/safe-bash/ is deleted",
+    not os.path.exists(os.path.join(REPO_ROOT, "mcps", "safe-bash")),
+    "the port's source of truth is snapshotted in this file (SOURCE_BASH_RULES); "
+    "leaving the tree in place invites a consumer that outlives the migration",
 )
 check(
     "the sibling MCP tree is untouched",
@@ -588,7 +603,7 @@ _guard_entries = [
     for hook in entry.get("hooks", [])
     if "bash-guard.py" in (hook.get("command") or "")
 ]
-check("settings.json does not rely on bash-guard.py for enforcement", not _guard_entries,
+check("settings.json registers bash-guard.py on PreToolUse", len(_guard_entries) == 1,
       f"found {len(_guard_entries)}")
 
 if _guard_entries:
@@ -1684,8 +1699,8 @@ _out_entries = [
     for hook in entry.get("hooks", [])
     if "bash-output-guard.py" in (hook.get("command") or "")
 ]
-check("settings.json does not rely on bash-output-guard.py for redaction",
-      not _out_entries, f"found {len(_out_entries)}")
+check("settings.json registers bash-output-guard.py on PostToolUse",
+      len(_out_entries) == 1, f"found {len(_out_entries)}")
 if _out_entries:
     entry, hook = _out_entries[0]
     check(
@@ -1788,8 +1803,8 @@ _health_entries = [
     for hook in entry.get("hooks", [])
     if "bash-guard-health.py" in (hook.get("command") or "")
 ]
-check("settings.json does not announce dormant native bash guards",
-      not _health_entries, f"found {len(_health_entries)}")
+check("settings.json registers bash-guard-health.py on SessionStart",
+      len(_health_entries) == 1, f"found {len(_health_entries)}")
 
 
 # ----------------------------------------------------------------------
@@ -2225,7 +2240,7 @@ check(
 # future reader hits the reasoning, and these assertions are what stop that
 # comment from drifting away from the settings.json it describes.
 # ----------------------------------------------------------------------
-section("git-push-merge-check.sh: matcher covers restored MCP")
+section("git-push-merge-check.sh: matcher no longer names the retired MCP")
 
 _merge_entries = [
     (entry, hook)
@@ -2238,17 +2253,17 @@ check("settings.json still registers git-push-merge-check.sh", len(_merge_entrie
 if _merge_entries:
     entry, hook = _merge_entries[0]
     check(
-        "matcher includes the safe-bash tool",
-        entry.get("matcher") == "Bash|mcp__safe-bash__exec",
+        "matcher targets the native Bash tool only",
+        entry.get("matcher") == "Bash",
         f"matcher={entry.get('matcher')!r}",
     )
 
 with open(os.path.join(HOOKS, "git-push-merge-check.sh"), encoding="utf-8") as fh:
     _merge_src = fh.read()
 check(
-    "the script accepts the restored MCP tool name",
-    "mcp__safe-bash__exec" in _merge_src,
-    "settings matcher and in-script filter must agree",
+    "the script itself no longer filters on the retired MCP tool name",
+    "mcp__safe-bash__exec" not in _merge_src,
+    "chunk C deletes mcps/safe-bash/, so the tool name can never arrive again",
 )
 check(
     "the script records why it survives alongside the hard nixos gate",
@@ -2287,12 +2302,13 @@ _LEDGER = os.path.join(REPO_ROOT, "permission-ledger")
 with open(os.path.join(_LEDGER, "run-evaluate.sh"), encoding="utf-8") as fh:
     _RUNEVAL_SRC = fh.read()
 
-# Blanket native Bash deny is independent defence. Nightly agent closure remains
-# load-bearing because its explicit minimal settings may not inherit user config.
+# The precondition. If a future change puts a blanket `Bash` deny back, the
+# allowlist argument becomes true again and these assertions can be revisited —
+# but until then they are load-bearing.
 _perms = SETTINGS.get("permissions", {})
 check(
-    "precondition: settings.json denies bare Bash",
-    "Bash" in _perms.get("deny", []) and "Bash" not in _perms.get("allow", []),
+    "precondition: settings.json allows bare Bash and does not deny it",
+    "Bash" in _perms.get("allow", []) and "Bash" not in _perms.get("deny", []),
     f"allow_has_bash={'Bash' in _perms.get('allow', [])} "
     f"deny_has_bash={'Bash' in _perms.get('deny', [])}",
 )

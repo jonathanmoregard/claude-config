@@ -11,6 +11,7 @@
   "permissions": {
     "defaultMode": "acceptEdits",
     "allow": [
+      "Bash",
       "Glob",
       "Grep",
       "Skill",
@@ -38,13 +39,11 @@
       "Edit(//home/jonathan/.local/state/claude-tasks/**)",
       "mcp__aggregator__aggregator_search_memory",
       "mcp__aggregator__aggregator_capabilities",
-      "mcp__research-agent__*",
-      "mcp__safe-bash__*"
+      "mcp__research-agent__*"
     ],
     "deny": [
       "WebFetch",
       "WebSearch",
-      "Bash",
       "Bash(sudo)",
       "Bash(sudo *)",
       "Bash(rm -rf *)",
@@ -243,6 +242,16 @@
         ]
       },
       {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/hooks/bash-output-guard.py",
+            "timeout": 10
+          }
+        ]
+      },
+      {
         "matcher": "Write|Edit|MultiEdit|NotebookEdit",
         "hooks": [
           {
@@ -274,12 +283,32 @@
         ]
       },
       {
-        "matcher": "Bash|mcp__safe-bash__exec",
+        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
             "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; $HOME/.claude/hooks/git-push-merge-check.sh",
             "timeout": 12
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/hooks/bash-guard.py",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/hooks/deny-hints.py",
+            "timeout": 5
           }
         ]
       },
@@ -388,6 +417,16 @@
           {
             "type": "command",
             "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; $HOME/.claude/nixos-reminder-hook.sh"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/hooks/bash-guard-health.py",
+            "timeout": 10,
+            "statusMessage": "Checking bash guard health..."
           }
         ]
       },
