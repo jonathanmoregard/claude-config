@@ -424,10 +424,11 @@ class GitArgvTests(unittest.TestCase):
             remote_url="https://github.com/owner/project.git",
         )
         self.assertEqual(
-            argv[-4:],
+            argv[-5:],
             [
                 "fetch",
                 "--prune",
+                "--no-tags",
                 "origin",
                 "+refs/heads/*:refs/remotes/origin/*",
             ],
@@ -531,6 +532,33 @@ class ContainmentArgvTests(unittest.TestCase):
         self.assertEqual(env["GIT_LITERAL_PATHSPECS"], "1")
         self.assertEqual(env["GIT_NO_REPLACE_OBJECTS"], "1")
         self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+
+    def test_fetch_mounts_worktree_read_only(self) -> None:
+        request = self.server._validate_git_request(
+            {"repo_path": str(self.identity.worktree), "operation": "fetch"},
+            self.policy,
+        )
+        argv, _env = self.server._build_git_sandbox(
+            request,
+            self.identity,
+            self.policy,
+            ["/nix/store/fake/bin/git", "fetch"],
+            existing_only=False,
+            remote_url="https://github.com/owner/project.git",
+        )
+        worktree = str(self.identity.worktree)
+        self.assertTrue(
+            any(
+                argv[i : i + 3] == ["--ro-bind", worktree, worktree]
+                for i in range(len(argv))
+            )
+        )
+        self.assertFalse(
+            any(
+                argv[i : i + 3] == ["--bind", worktree, worktree]
+                for i in range(len(argv))
+            )
+        )
 
     def test_missing_broker_owned_empty_config_fails_closed(self) -> None:
         request = self.server._validate_git_request(

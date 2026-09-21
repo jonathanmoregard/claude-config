@@ -730,6 +730,7 @@ def _build_git_argv(
             (
                 "fetch",
                 "--prune",
+                "--no-tags",
                 "origin",
                 "+refs/heads/*:refs/remotes/origin/*",
             )
@@ -824,7 +825,11 @@ def _build_git_sandbox(
     )
 
     binds: list[tuple[str, Path]] = []
-    worktree_mode = "--ro-bind" if request["operation"] == "worktree_add" else "--bind"
+    worktree_mode = (
+        "--ro-bind"
+        if request["operation"] in {"fetch", "worktree_add"}
+        else "--bind"
+    )
     binds.append((worktree_mode, identity.worktree))
     binds.append(("--bind", identity.common_dir))
     if not _path_within(identity.git_dir, (identity.common_dir,)):
