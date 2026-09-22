@@ -33,7 +33,6 @@
       "Edit(//home/jonathan/worktrees/**)",
       "Edit(//home/jonathan/.claude/projects/**)",
       "Edit(//home/jonathan/.claude/skills/**)",
-      "Edit(//home/jonathan/.claude/homunculus/**)",
       "Edit(//home/jonathan/.claude/loops/**)",
       "Edit(//home/jonathan/.local/state/claude-self-compact/**)",
       "Edit(//home/jonathan/.local/state/claude-tasks/**)",
@@ -224,15 +223,6 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "~/.claude/skills/continuous-learning-v2/hooks/observe.sh post"
-          }
-        ]
-      },
-      {
         "matcher": "Write|Edit|MultiEdit",
         "hooks": [
           {
@@ -273,15 +263,6 @@
       }
     ],
     "PreToolUse": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "~/.claude/skills/continuous-learning-v2/hooks/observe.sh pre"
-          }
-        ]
-      },
       {
         "matcher": "Bash",
         "hooks": [
@@ -399,16 +380,6 @@
           {
             "type": "command",
             "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; f=/home/jonathan/.claude/token-optimizer/.security-alert; [ -f \"$f\" ] && echo \"[token-optimizer] SECURITY ALERT: $(cat $f)\" || true"
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "(CLV2_PYTHON_CMD=python3 ECC_OBSERVER_TIMEOUT_SECONDS=300 ~/.claude/skills/continuous-learning-v2/agents/start-observer.sh start >/dev/null 2>&1 &) || true",
-            "timeout": 3,
-            "statusMessage": "Launching instinct observer..."
           }
         ]
       },
@@ -557,10 +528,6 @@
           {
             "type": "command",
             "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/step-back-nudge.py"
-          },
-          {
-            "type": "command",
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/evolve-reminder.py"
           },
           {
             "type": "command",
