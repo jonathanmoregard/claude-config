@@ -64,7 +64,7 @@ Best practices:
 - Non-systemd / user-launched processes: wrap with `pkgs.writeShellApplication` that reads the secret at exec time, expose on PATH.
 - Prefer declarative modules (modules/nixos/*.nix imported from hosts/<host>/default.nix) over imperative tweaks.
 - BEFORE rebuilding the flake locally for debug, `git add -A` (or `git add <new-file>`) inside the worktree. Flakes evaluate only git-tracked files; new/untracked files are invisible and rebuild fails with `Path '<file>' in the repository "/etc/nixos" is not tracked by Git`. Staging is enough — no commit required.
-- VM e2e tests are the DEFAULT gate before any merge. CI runs them automatically; for local debug invoke the nixos-automated-testing skill. When adding HM units / scripts / timers, also add an assertion in the matching `tests/<lane>.nix`. Skip only for hardware-specific config the VM can't model (real touchpad, GPU, LUKS).
+- VM e2e tests are the DEFAULT gate before any merge. CI runs them automatically; for local debug invoke the nixos-automated-testing skill. Add an assertion in the matching `tests/<lane>.nix` only for runtime behaviour (a unit/script/timer actually doing its job) or a cross-cutting invariant — never one restating the declaration (package on PATH, option value); eval/build covers declarations. Skip only for hardware-specific config the VM can't model (real touchpad, GPU, LUKS).
 - For interactive smoke-testing pre-merge (e.g. "does the actual login screen come up", "does this systemd unit start when I poke it"), invoke the nixos-agent-testing skill — it covers `nix run .#feature-vm` plus the QMP / screencap / sendkey / serial control channels.
 - FHS-assuming binaries: wrap in `buildFHSEnv` or use `pkgs.steam-run`, don't try to recreate /lib paths.
 EOF
