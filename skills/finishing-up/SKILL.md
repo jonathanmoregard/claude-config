@@ -66,6 +66,24 @@ Do not continue until phase is `READY_FOR_REVIEW`. It requires current branch
 head equal PR head, no conflicts, all reported builds passing, mergeability
 known, and review-thread evidence available.
 
+### Live check before any merge or review ask
+
+In the same turn as any message that asks the user to merge or review a PR,
+or says one is "ready", query every PR the message names live:
+
+```bash
+gh pr view <n> -R <owner/repo> --json state,mergedAt,autoMergeRequest,headRefOid,mergeStateStatus
+```
+
+- `MERGED`: report it merged (with `mergedAt`) and move to deployment; never ask.
+- `autoMergeRequest` set: say it will merge itself once checks pass; never ask.
+- `headRefOid` differs from the head you verified: re-verify before any ask.
+
+A result from an earlier turn, or from before a background task notification,
+does not count: the user or a bot may have merged it meanwhile, and
+`dod-track` does not check auto-merge. 2026-09-23: asked the user to merge two
+PRs, one merged 30 min earlier and one merged by auto-merge seconds before.
+
 ## 3. Freeze deployment contract before review
 
 Configure every required environment before handoff. Commands are JSON argv
@@ -188,6 +206,7 @@ Ship has no override.
 
 - Calling `dod-check` exit `0` done instead of PR-ready
 - Trusting “merged” without refreshing stored PR
+- Asking for a merge or review without a same-turn live `gh pr view` of that PR
 - Using reviewed branch SHA as deployed merge SHA
 - Asking for merge before revision/smoke commands are frozen and shown
 - Smoke-testing source tree, stub, mock, or changed artifact
