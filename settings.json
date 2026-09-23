@@ -219,6 +219,15 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 10,
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark PermissionRequest"
+          }
+        ]
       }
     ],
     "PostToolUse": [
@@ -248,6 +257,15 @@
             "type": "command",
             "command": "bash $HOME/.claude/hooks/finishing-up-arm.sh",
             "timeout": 5
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 10,
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark PostToolUse"
           }
         ]
       }
@@ -330,6 +348,15 @@
           {
             "type": "command",
             "command": "bash ~/.claude/skills/session-reflect/reflect.sh sessionend"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 10,
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark SessionEnd"
           }
         ]
       }
@@ -463,6 +490,15 @@
             "timeout": 30
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 10,
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark Stop"
+          }
+        ]
       }
     ],
     "StopFailure": [
@@ -475,6 +511,15 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 10,
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark StopFailure"
+          }
+        ]
       }
     ],
     "SubagentStop": [
@@ -483,6 +528,15 @@
           {
             "type": "command",
             "command": "bash ~/.claude/skills/session-reflect/reflect.sh subagentstop"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 10,
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark SubagentStop"
           }
         ]
       }
@@ -553,6 +607,15 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 10,
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark UserPromptSubmit"
+          }
+        ]
       }
     ],
     "InstructionsLoaded": [
@@ -571,6 +634,17 @@
           {
             "type": "command",
             "command": "python3 ~/.claude/hooks/harness-tripwire.py"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 10,
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark SubagentStart"
           }
         ]
       }
