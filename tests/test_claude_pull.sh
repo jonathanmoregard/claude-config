@@ -21,6 +21,10 @@ export PATH="$ROOT/fakebin:$PATH"
 mkdir -p "$ROOT/fakebin"
 printf '#!/usr/bin/env bash\necho "NOTIFY: $*" >> %s/notifications\n' "$ROOT" > "$ROOT/fakebin/notify-send"
 chmod +x "$ROOT/fakebin/notify-send"
+# The offline check resolves this host after a failed fetch. localhost always
+# resolves, so every case below is "online" unless it overrides it — the
+# harness never depends on the machine's real network.
+export CLAUDE_PULL_ONLINE_PROBE_HOST=localhost
 
 pass=0; fail=0
 check() { # check <name> <expected-rc> <actual-rc> [grep-pattern] [output]
@@ -336,6 +340,34 @@ if tail -1 "$ROOT/notifications" | grep -q 'journalctl --user -u widget-pull'; t
 else
   echo "FAIL notification did not name dedicated systemd unit"; fail=$((fail+1))
 fi
+# The failure count is in the alert text, so a text-keyed debounce treated
+# every later tick as a new problem: 88 identical toasts on 2026-09-27.
+for _ in 1 2 3; do run; done
+check "fetch failure keeps counting past the threshold" 1 "$rc" "consecutive failures: 9" "$out"
+notif_later=$(wc -l < "$ROOT/notifications" 2>/dev/null || echo 0)
+[ "$notif_later" = "$notif_after" ] && { echo "PASS ongoing fetch failure notifies once"; pass=$((pass+1)); } \
+  || { echo "FAIL ongoing fetch failure re-notified ($notif_after -> $notif_later)"; fail=$((fail+1)); }
+
+# 10b. offline: a failed fetch while the probe host does not resolve is not a
+# fault — it must not count toward the threshold, notify, or fail the unit.
+fresh offline
+git -C "$CLONE" remote set-url origin "$ROOT/does-not-exist.git"
+notif_before=$(wc -l < "$ROOT/notifications" 2>/dev/null || echo 0)
+export CLAUDE_PULL_ONLINE_PROBE_HOST=offline-probe.invalid
+for _ in 1 2 3 4 5 6 7 8; do run; done
+export CLAUDE_PULL_ONLINE_PROBE_HOST=localhost
+check "offline fetch failure is a quiet skip" 0 "$rc" "offline" "$out"
+notif_after=$(wc -l < "$ROOT/notifications" 2>/dev/null || echo 0)
+[ "$notif_before" = "$notif_after" ] && { echo "PASS offline ticks never notify"; pass=$((pass+1)); } \
+  || { echo "FAIL offline ticks notified"; fail=$((fail+1)); }
+[ -f "$(statedir)/fetch-failures" ] && { echo "FAIL offline ticks counted as fetch failures"; fail=$((fail+1)); } \
+  || { echo "PASS offline ticks are not counted"; pass=$((pass+1)); }
+grep -q '"state":"unverified"' "$(statedir)/status.json" \
+  && { echo "PASS offline tick records unverified"; pass=$((pass+1)); } \
+  || { echo "FAIL offline tick did not record unverified"; fail=$((fail+1)); }
+# Back online, the same broken remote is a real fault and counts from 1.
+run
+check "online failure after offline counts from one" 1 "$rc" "consecutive failures: 1" "$out"
 
 # 11. recovery clears the alert state so the next problem notifies again
 fresh recover; advance_origin file.txt "remote version"
