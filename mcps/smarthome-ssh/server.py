@@ -70,6 +70,18 @@ def _path_within(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
 
+def _runtime_dir() -> Path:
+    # From getuid(), never the environment: the policy stays non-injectable.
+    return Path(f"/run/user/{os.getuid()}")
+
+
+def _expand_runtime_dir(value):
+    """Expand a leading "%t" path component (systemd's runtime-dir specifier)."""
+    if isinstance(value, str) and (value == "%t" or value.startswith("%t/")):
+        return str(_runtime_dir()) + value[2:]
+    return value
+
+
 def _require_executable(path: str, key: str) -> str:
     if not os.path.isfile(path) or not os.access(path, os.X_OK):
         raise RuntimeError(f"BROKEN safety boundary: {key} is not executable: {path}")
@@ -109,6 +121,9 @@ def _load_policy(config: dict, base_dir: Path = HERE) -> dict:
         raise RuntimeError(f"policy has unknown keys: {', '.join(unknown)}")
     if raw["version"] != 1:
         raise RuntimeError("unsupported policy version")
+    raw = dict(raw)
+    for key in ("identityAgent", "identityAgentRoot"):
+        raw[key] = _expand_runtime_dir(raw[key])
     for key in ("host", "user"):
         value = raw[key]
         if not isinstance(value, str) or not _NAME_RE.fullmatch(value):

@@ -197,6 +197,12 @@ def _load_git_policy(config: dict) -> dict:
         "userBusSocket",
     ):
         value = raw[key]
+        # "%t" (systemd's runtime-dir specifier) as the first path component
+        # means the caller's own /run/user/<uid>. Derived from getuid(), never
+        # from the environment, so the policy stays non-injectable while one
+        # config serves hosts where jonathan's uid differs.
+        if isinstance(value, str) and (value == "%t" or value.startswith("%t/")):
+            value = f"/run/user/{os.getuid()}" + value[2:]
         if not isinstance(value, str) or not value or not Path(value).is_absolute():
             raise RuntimeError(f"git-broker gitBroker {key} must be an absolute path")
         policy[key] = Path(os.path.normpath(value)).resolve(strict=False)

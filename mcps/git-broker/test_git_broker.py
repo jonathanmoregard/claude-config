@@ -127,6 +127,20 @@ class PolicySchemaTests(unittest.TestCase):
         )
         self.assertEqual(loaded["allowedRemoteHosts"], ("github.com",))
 
+    def test_user_bus_socket_expands_runtime_dir_token(self) -> None:
+        # %t is the caller's own runtime dir, derived from getuid() (not the
+        # environment), so one config works on hosts where jonathan's uid differs.
+        policy = valid_policy()
+        policy["userBusSocket"] = "%t/bus"
+        loaded = self.server._load_git_policy({"gitBroker": policy})
+        self.assertEqual(loaded["userBusSocket"], Path(f"/run/user/{os.getuid()}/bus"))
+
+    def test_runtime_dir_token_must_be_a_whole_path_component(self) -> None:
+        policy = valid_policy()
+        policy["userBusSocket"] = "%tx/bus"
+        with self.assertRaisesRegex(RuntimeError, "userBusSocket"):
+            self.server._load_git_policy({"gitBroker": policy})
+
 
 class RequestSchemaTests(unittest.TestCase):
     def setUp(self) -> None:

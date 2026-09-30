@@ -5,8 +5,8 @@
     "user": "jonathan",
     "knownHostsFile": "known_hosts",
     "sshExecutable": "/run/current-system/sw/bin/ssh",
-    "identityAgent": "/run/user/1000/gcr/ssh",
-    "identityAgentRoot": "/run/user/1000",
+    "identityAgent": "%t/gcr/ssh",
+    "identityAgentRoot": "%t",
     "connectTimeoutSec": 10,
     "maxTimeoutMs": 600000,
     "outputLimitChars": 60000
