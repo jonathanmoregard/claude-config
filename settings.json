@@ -9,7 +9,6 @@
     "MCP_TIMEOUT": "120000"
   },
   "permissions": {
-    "defaultMode": "acceptEdits",
     "allow": [
       "Bash",
       "Glob",
@@ -181,6 +180,7 @@
       "Edit(~/.local/state/claude-harness-tripwire/**)"
     ],
     "ask": [],
+    "defaultMode": "auto",
     "additionalDirectories": [
       "/home/jonathan/Repos/nixos-config-worktrees",
       "/home/jonathan/.claude/projects",
@@ -195,6 +195,7 @@
       "/home/jonathan/Repos/research-agent/reports"
     ]
   },
+  "model": "opus[1m]",
   "enableAllProjectMcpServers": false,
   "hooks": {
     "PermissionDenied": [
@@ -224,8 +225,8 @@
         "hooks": [
           {
             "type": "command",
-            "timeout": 10,
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark PermissionRequest"
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark PermissionRequest",
+            "timeout": 10
           }
         ]
       }
@@ -264,8 +265,8 @@
         "hooks": [
           {
             "type": "command",
-            "timeout": 10,
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark PostToolUse"
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark PostToolUse",
+            "timeout": 10
           }
         ]
       }
@@ -355,8 +356,8 @@
         "hooks": [
           {
             "type": "command",
-            "timeout": 10,
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark SessionEnd"
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark SessionEnd",
+            "timeout": 10
           }
         ]
       }
@@ -495,8 +496,8 @@
         "hooks": [
           {
             "type": "command",
-            "timeout": 10,
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark Stop"
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark Stop",
+            "timeout": 10
           }
         ]
       }
@@ -516,8 +517,8 @@
         "hooks": [
           {
             "type": "command",
-            "timeout": 10,
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark StopFailure"
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark StopFailure",
+            "timeout": 10
           }
         ]
       }
@@ -535,8 +536,8 @@
         "hooks": [
           {
             "type": "command",
-            "timeout": 10,
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark SubagentStop"
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark SubagentStop",
+            "timeout": 10
           }
         ]
       }
@@ -612,8 +613,8 @@
         "hooks": [
           {
             "type": "command",
-            "timeout": 10,
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark UserPromptSubmit"
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark UserPromptSubmit",
+            "timeout": 10
           }
         ]
       }
@@ -643,8 +644,8 @@
         "hooks": [
           {
             "type": "command",
-            "timeout": 10,
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark SubagentStart"
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark SubagentStart",
+            "timeout": 10
           }
         ]
       }
