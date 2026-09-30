@@ -31,7 +31,7 @@
     "githubConfigDir": "/home/jonathan/.config/gh",
     "sshKnownHostsFile": "/home/jonathan/.ssh/known_hosts",
     "trustedHooksDir": "/home/jonathan/.config/git/hooks",
-    "userBusSocket": "/run/user/1000/bus",
+    "userBusSocket": "%t/bus",
     "commitUserName": "jonathanmoregard",
     "commitUserEmail": "10191435+jonathanmoregard@users.noreply.github.com",
     "discoveryTimeoutMs": 5000,

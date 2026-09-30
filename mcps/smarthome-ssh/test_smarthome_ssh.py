@@ -124,6 +124,15 @@ class PolicyTests(Fixture):
         with self.assertRaisesRegex(RuntimeError, "identity agent"):
             self.policy(identityAgent=str(outside))
 
+    def test_agent_paths_expand_runtime_dir_token(self) -> None:
+        with mock.patch.object(self.server, "_runtime_dir", return_value=self.agent_root):
+            policy = self.policy(identityAgent="%t/agent.sock", identityAgentRoot="%t")
+        self.assertEqual(policy["identityAgent"], self.agent)
+        self.assertEqual(policy["identityAgentRoot"], self.agent_root)
+
+    def test_runtime_dir_is_derived_from_uid(self) -> None:
+        self.assertEqual(self.server._runtime_dir(), Path(f"/run/user/{os.getuid()}"))
+
     def test_ssh_executable_must_be_absolute(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "sshExecutable"):
             self.policy(sshExecutable="ssh")
