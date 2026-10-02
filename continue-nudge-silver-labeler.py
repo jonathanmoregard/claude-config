@@ -124,7 +124,7 @@ def call_fable(prompt):
         result = subprocess.run(
             [
                 "claude", "-p",
-                "--model", "claude-fable-5",
+                "--model", "claude-fable-5-1",
                 "--strict-mcp-config",
                 prompt,
             ],
