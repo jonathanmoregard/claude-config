@@ -77,7 +77,8 @@ def _compute_hours(now):
                         entry = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if not isinstance(entry, dict):
+                    if not isinstance(entry, dict) or not isinstance(
+                            entry.get("timestamp"), str):
                         continue
                     if entry.get("type") != "user":
                         continue
@@ -97,7 +98,7 @@ def _compute_hours(now):
                     ):
                         continue
                     ts_str = entry.get("timestamp")
-                    if not isinstance(ts_str, str) or not ts_str:
+                    if not ts_str:
                         continue
                     try:
                         ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
