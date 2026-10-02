@@ -166,6 +166,10 @@ backfill_next_candidate() {
     is_valid_sid "$sid" || continue
     [[ -z "${_BF_TRIED[$sid]:-}" ]] || continue
     [[ -n "$tp" && -f "$tp" && -r "$tp" ]] || continue
+    # Legacy manifests predate source_client; classify by path exactly as
+    # reflect.sh will, so a Codex rollout never reaches `codex exec resume` on a
+    # budget this gate did not read.
+    [[ "$(reflect_transcript_client "$tp")" == claude ]] || continue
     [[ -f "$REFLECT_ROOT/sessions/$sid/manifest.json" ]] || continue
     printf '%s\t%s\n' "$sid" "$tp"
     return 0

@@ -230,6 +230,31 @@ reset_root; set_quota 40 0; drop "$A" 2026-09-08T20:00:00Z
 REFLECT_BACKFILL_SLEEP_CMD=false run_drain
 jqe '.status == "error" and .reason == "drain_crashed"' <<<"$(last)"; assert $? "crash recorded as error"
 
+t_begin "D9: a legacy Codex drop (no source_client) is not dispatched"
+# Manifests written before source_client existed carry only the rollout path.
+# reflect.sh classifies by that path and would route it to `codex exec resume`,
+# a call on a budget this gate never read (observed on a copy of the live
+# corpus: 6 such drops, one 98M-input-token Codex resume).
+reset_root; set_quota 40 0
+export CODEX_HOME="$SCRATCH/codex"
+mkdir -p "$CODEX_HOME/sessions/2026/09/08"
+cat > "$STUB_DIR/codex" <<'CX'
+#!/usr/bin/env bash
+cat >/dev/null || true; printf '=== codex ===\n' >> "${STUB_ARGV_LOG:-/dev/null}"; exit 1
+CX
+chmod +x "$STUB_DIR/codex"
+drop "$A" 2026-09-08T20:00:00Z
+CX_TP="$CODEX_HOME/sessions/2026/09/08/rollout-2026-09-08T00-05-35-$A.jsonl"
+mv -- "$PROJECTS_DIR/$A.jsonl" "$CX_TP"
+jq --arg tp "$CX_TP" '.source_transcript = $tp | del(.modes.sessionend.source_client)' \
+  "$REFLECT_ROOT/sessions/$A/manifest.json" > "$SCRATCH/m.json" && mv -- "$SCRATCH/m.json" "$REFLECT_ROOT/sessions/$A/manifest.json"
+drop "$B" 2026-09-09T20:00:00Z
+run_drain
+[[ "$(att "$A")" == 0 ]]; assert $? "Codex drop: no attempt spent"
+! grep -q '^=== codex ===' "$STUB_ARGV_LOG"; assert $? "no codex call"
+[[ "$(st "$B")" == complete ]]; assert $? "the Claude drop behind it still drains"
+unset CODEX_HOME
+
 t_begin "T: syntax"
 bash -n "$BACKFILL_SH"; assert $? "bash -n backfill.sh"
 
