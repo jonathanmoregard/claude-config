@@ -1406,9 +1406,9 @@ def _candidate_repo_paths(command: str, cwd: str | None) -> tuple[list[str], lis
     Returns ``(paths, unresolved)``. ``unresolved`` names each candidate that
     could not be turned into a path at all.
 
-    Order:
-      1. Last `cd <path>` target in the command's pipeline chain
-      2. `git -C <path>` flag
+    Order (the first that IS a repository wins — `_nixos_resolve_target_repo`):
+      1. `git -C <path>` flag
+      2. Last `cd <path>` target in the command's pipeline chain
       3. The session cwd carried on the hook payload
       4. The hook process's own cwd
 
@@ -1428,9 +1428,10 @@ def _candidate_repo_paths(command: str, cwd: str | None) -> tuple[list[str], lis
     """
     candidates: list[str] = []
     unresolved: list[str] = []
-    cd_target = _nixos_extract_cd_target(command)
-    if cd_target:
-        candidates.append(cd_target)
+    # `git -C <path>` names the push's repository on the git command itself,
+    # so it outranks a `cd` earlier in the chain: `cd A && git -C B push`
+    # pushes B. Both outrank the session cwd, which only matters for a push
+    # that names no path at all.
     m = re.search(r"\bgit\s+(?:[^\n;|&]*?\s+)?-C\s+(\S+)", command)
     if m:
         raw = m.group(1).strip("\"'")
@@ -1438,6 +1439,9 @@ def _candidate_repo_paths(command: str, cwd: str | None) -> tuple[list[str], lis
             candidates.append(os.path.abspath(os.path.expanduser(raw)))
         except (ValueError, OSError) as exc:
             unresolved.append(f"the `git -C {raw[:80]}` path ({type(exc).__name__})")
+    cd_target = _nixos_extract_cd_target(command)
+    if cd_target:
+        candidates.append(cd_target)
     if isinstance(cwd, str) and cwd.strip():
         candidates.append(cwd)
     try:
@@ -1497,6 +1501,16 @@ def _nixos_resolve_target_repo(command: str, cwd: str | None) -> str | None:
     identically, and the gate would be switched off by a deleted directory.
     That is the same failure `_nixos_git` already refuses to make for a git
     command it could not run.
+
+    THE CANDIDATES ARE FALLBACKS, NOT A SEARCH. The first one that IS a
+    working tree is the repository the push goes to — `cd <repo> && git
+    push` pushes <repo>, whatever directory the session sits in. The loop
+    used to keep walking after a candidate resolved to a repo that was not
+    nixos-config, and fire on the session cwd instead; measured 2026-10-02,
+    `cd ~/worktrees/survival-corpus-first-aid && git push` was refused for
+    the trailer missing from a nixos-config worktree's merge commit. Later
+    candidates are consulted only when an earlier one was not a repository
+    at all.
     """
     paths, unresolved = _candidate_repo_paths(command, cwd)
     for path in paths:
@@ -1528,7 +1542,7 @@ def _nixos_resolve_target_repo(command: str, cwd: str | None) -> str | None:
                 if rc_gd == 0 and gitdir.strip():
                     if _repo_has_nixos_remote(gitdir.strip()):
                         return gitdir.strip()
-                    continue
+                    break  # a repository, and not nixos-config: that is the answer
                 _fail_closed(
                     f"the nixos push gate found a git repository at {path!r} with "
                     "no working tree and could not resolve its git directory "
@@ -1546,6 +1560,7 @@ def _nixos_resolve_target_repo(command: str, cwd: str | None) -> str | None:
             continue
         if _repo_has_nixos_remote(repo_root):
             return repo_root
+        break  # the push's repository is this one, and it is not nixos-config
     if unresolved:
         _fail_closed(
             "the nixos push gate found no nixos-config repo among the paths it "

@@ -1448,6 +1448,60 @@ check(
     f"decision={dec!r} {why[:200]}",
 )
 
+# --- D9: the push's target repo is the FIRST candidate that is a repo -
+# `_candidate_repo_paths` is an ordered list of fallbacks (cd target, then
+# `git -C`, then the session cwd, then the hook's cwd). The gate used to walk
+# the whole list and fire on the first NIXOS repo in it, so a push aimed by
+# `cd <other repo> && git push` from a session sitting in a nixos-config
+# worktree was judged by that worktree's HEAD instead of the repo being
+# pushed. Measured 2026-10-02: a survival-corpus branch could not be pushed
+# from a nixos-config session whose HEAD was a merge commit without a
+# trailer. Once a candidate resolves to a working tree it IS the target;
+# later candidates matter only when earlier ones were not repositories.
+_other = branch_with(
+    make_repo(remote_tail="someone-else/survival-corpus.git"),
+    "feat: corpus, no trailer (not a nixos repo)",
+    {"docs/a.md": "x\n"},
+)
+_nixos_cwd = branch_with(
+    make_repo(),
+    "merge commit without a trailer",
+    {"docs/b.md": "y\n"},
+)
+dec, why = push_guard(_other, command=f"cd {_other} && git push -u origin HEAD", cwd=_nixos_cwd)
+check(
+    "`cd <non-nixos repo> && git push` from a nixos-config session cwd is NOT gated",
+    dec is None,
+    f"decision={dec!r} {why[:200]}; the cd target is the push's repo, the "
+    f"session cwd is a fallback for commands that name no path",
+)
+dec, why = push_guard(_other, command=f"git -C {_other} push -u origin HEAD", cwd=_nixos_cwd)
+check(
+    "`git -C <non-nixos repo> push` from a nixos-config session cwd is NOT gated",
+    dec is None,
+    f"decision={dec!r} {why[:200]}",
+)
+dec, why = push_guard(_nixos_cwd, command=f"cd {_nixos_cwd} && git push origin HEAD", cwd=_other)
+check(
+    "control: `cd <nixos repo> && git push` from a non-nixos cwd IS gated",
+    dec == "deny" and "Pre-push checklist:" in why,
+    f"decision={dec!r} {why[:200]}",
+)
+dec, why = push_guard(_other, command=f"cd {_other} && git -C {_nixos_cwd} push origin HEAD", cwd=_other)
+check(
+    "`cd <non-nixos> && git -C <nixos> push` IS gated: -C names the push's repo, cd does not",
+    dec == "deny" and "Pre-push checklist:" in why,
+    f"decision={dec!r} {why[:200]}",
+)
+_not_a_repo = os.path.join(SCRATCH, "plain-dir")
+os.makedirs(_not_a_repo, exist_ok=True)
+dec, why = push_guard(_nixos_cwd, command=f"cd {_not_a_repo} && git push origin HEAD", cwd=_nixos_cwd)
+check(
+    "control: a cd target that is not a repo falls through to the session cwd",
+    dec == "deny" and "Pre-push checklist:" in why,
+    f"decision={dec!r} {why[:200]}",
+)
+
 w = branch_with(
     make_repo(
         remote_tail="someone-else/unrelated.git",
