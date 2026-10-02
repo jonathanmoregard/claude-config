@@ -864,9 +864,13 @@ def dispatch_scorer(prompt, cfg):
                                         suffix=".txt")  # mkstemp: mode 0600
         try:
             with os.fdopen(fd, "wb") as out_fh:
+                # CLAUDE_PIPELINE_INTERNAL: a machine session — session-reflect
+                # must not reflect on it into the corpus the RSI review reads.
                 proc = subprocess.run(cmd, stdout=out_fh,
                                       stderr=subprocess.PIPE, text=True,
-                                      timeout=scorer["timeout_seconds"])
+                                      timeout=scorer["timeout_seconds"],
+                                      env={**os.environ,
+                                           "CLAUDE_PIPELINE_INTERNAL": "1"})
         except (OSError, subprocess.TimeoutExpired) as exc:
             unlink_quiet(out_path)
             last_err = "dispatch failed for %s: %s" % (model, exc)

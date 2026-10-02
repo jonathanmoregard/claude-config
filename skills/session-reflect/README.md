@@ -205,7 +205,7 @@ is documented inside `settings-patch.json` under `_comment`.
 | `REFLECT_HANDOFF_CAP_BYTES` | `8192` | Cap on the self-compact handoff inlined into a fallback prompt. A handoff is a page of markdown by construction; this admits a whole one and refuses a runaway one. |
 | `REFLECT_HANDOFF_MAX_AGE_SECONDS` | `86400` | Age past which that handoff is not offered to the model as this session's state. Long enough that no live session's own handoff is excluded. |
 | `REFLECT_EXCERPT_BYTES` | `200` | Length of every quoted excerpt: `tool_result` bodies in an inlined transcript, the envelope's `result` in an error manifest, and an unparseable reply's `raw_excerpt`. |
-| `CLAUDE_PIPELINE_INTERNAL` | (unset) | Truthy marks a machine session (cron wrappers: RSI daily review, permission-ledger evaluator). Every mode no-ops with a record under `skipped-pipeline/`. Sessions whose `cwd` is under `~/.claude/step-back` or `~/.claude/homunculus` are skipped the same way without it. See "Pipeline-internal sessions". |
+| `CLAUDE_PIPELINE_INTERNAL` | (unset) | Truthy marks a machine session. Set by: the RSI daily review and permission-ledger evaluator, the proposal intake-gate scorer, `date-check.sh`, repo-autosync `sync-agent.sh` / `upstream-merge.sh`, and crontab-wide for every cron job (nixos-config). Every mode no-ops with a record under `skipped-pipeline/`. Sessions whose `cwd` is under `~/.claude/step-back` or `~/.claude/homunculus` are skipped the same way without it. See "Pipeline-internal sessions". |
 | `_REFLECT_INTERNAL` | (internal) | Sentinel set by the parent dispatcher to gate the `--worker` re-entry path. Do not set manually. |
 
 Every size and threshold above is an **input**, not a tuned constant: each has its
