@@ -652,6 +652,36 @@ class AggregateTestCase(unittest.TestCase):
         self.assertEqual(d["groups"][0]["samples"], [aggregate.SECRET_PLACEHOLDER])
         self.assertIn("redacted", d["scan_status"]["detect_secrets"])
 
+    def test_detect_secrets_failed_verification_still_redacts(self):
+        # detect-secrets 1.5.0 live-verifies by default and prints `False`
+        # for a detector whose secret fails verification (revoked key, or no
+        # network) — measured with an AWS key+secret pair and a Slack token.
+        # A secret is a secret whether or not its issuer accepts it.
+        for _ in range(3):
+            self.b.record(self.now, tool_input={"command": "curl -H 'Bearer xoxb-1'"})
+        fakebin = os.path.join(self.tmp, "fakebin")
+        os.makedirs(fakebin, exist_ok=True)
+        exe = os.path.join(fakebin, "detect-secrets")
+        with open(exe, "w", encoding="utf-8") as fh:
+            fh.write(
+                "#!/bin/sh\n"
+                'case " $* " in\n'
+                "  *' --no-verify '*) echo 'SlackDetector           : True' ;;\n"
+                "  *) echo 'SlackDetector           : False' ;;\n"
+                "esac\n"
+                "exit 0\n"
+            )
+        os.chmod(exe, 0o755)
+        old = os.environ.get("PATH", "")
+        os.environ["PATH"] = fakebin + os.pathsep + old
+        self.addCleanup(os.environ.__setitem__, "PATH", old)
+        code, out, err = self.run_aggregate(
+            "--scan-script", os.path.join(self.tmp, "nope.py"), scan=True
+        )
+        self.assertEqual(code, 0, err)
+        d = json.loads(out)
+        self.assertEqual(d["groups"][0]["samples"], [aggregate.SECRET_PLACEHOLDER])
+
     # -- injection content is inert data -----------------------------------
 
     def test_injection_string_passes_through_as_inert_data(self):

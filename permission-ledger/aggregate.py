@@ -474,8 +474,12 @@ _DETECTOR_HIT = re.compile(r":\s*True\b")
 
 
 def _detect_secrets_hit(binary, text):
+    # --no-verify: by default 1.5.0 sends each hit to its issuer (AWS STS,
+    # Slack auth.test, ...) and prints `False` when that fails — a revoked key
+    # or no network then passes through unredacted, and the nightly job would
+    # be shipping the user's credentials over the wire to check them.
     proc = subprocess.run(
-        [binary, "scan", "--string", text],
+        [binary, "scan", "--no-verify", "--string", text],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=DETECT_SECRETS_TIMEOUT,
