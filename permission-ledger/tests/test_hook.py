@@ -516,6 +516,35 @@ class TestRedaction(unittest.TestCase):
             "sk-proj-abc123DEF456ghi789JKL012",
         )
 
+    def test_provider_keys_leave_no_fragment_in_any_context(self):
+        # Synthetic, real-shaped values (body mixes '-' and '_' like real keys,
+        # which breaks the body into runs too short for the high-entropy rule).
+        bodies = {
+            "anthropic": "sk-" + "ant-api03-" + "Ab3_dE5-" * 12 + "xyzAA",
+            "anthropic-oauth": "sk-" + "ant-oat01-" + "Qw9-rT_7" * 12 + "AA",
+            "openai-project": "sk-" + "proj-" + "Zx8_cV-2nM" * 15,
+            "openai-svcacct": "sk-" + "svcacct-" + "Lk4-jH_6gF" * 15,
+        }
+        # Contexts where the key is glued to a preceding word character, so a
+        # leading \b never fires: an escaped newline in a literal, a URL-encoded
+        # '=', and plain concatenation.
+        contexts = ["VAR={}", "printf 'a\\n{}'", "curl 'https://h/?k%3D{}'", "echo x{}"]
+        for kind, key in bodies.items():
+            for ctx in contexts:
+                with self.subTest(kind=kind, ctx=ctx):
+                    out = self.assert_redacted(ctx.format(key), key)
+                    tail = key[-16:]
+                    self.assertNotIn(tail, out, "key fragment survived: %r" % out)
+
+    def test_provider_prefixes_in_ordinary_words_are_left_alone(self):
+        for benign in [
+            "git switch -c task-proj-cleanup",
+            "cat ~/notes/risk-ant-api-notes.md",
+            "rg disk-proj-",
+        ]:
+            with self.subTest(benign=benign):
+                self.assertEqual(hook.redact(benign), benign)
+
     def test_github_classic_token(self):
         self.assert_redacted(
             "git clone https://ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@github.com/x/y",

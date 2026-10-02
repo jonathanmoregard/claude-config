@@ -91,6 +91,12 @@ REDACTIONS = [
     # Known credential shapes.
     (re.compile(r"github_pat_[A-Za-z0-9_]{20,}"), "[REDACTED:github-pat]"),
     (re.compile(r"\bgh[porsu]_[A-Za-z0-9]{20,}"), "[REDACTED:github-token]"),
+    # Provider keys used on this host. No leading \b: the prefixes are distinctive
+    # enough to match mid-word, and keys glued to a word character (`\nsk-...`
+    # in a printf literal, `%3Dsk-...` in a URL) otherwise slip past the generic
+    # rule below -- and their '-'/'_'-broken bodies past the high-entropy rule.
+    (re.compile(r"sk-ant-(?:api|oat|admin)\d{2}-[A-Za-z0-9_-]{20,}"), "[REDACTED:api-key]"),
+    (re.compile(r"sk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{40,}"), "[REDACTED:api-key]"),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{12,}"), "[REDACTED:api-key]"),
     (re.compile(r"\bAKIA[0-9A-Z]{12,}"), "[REDACTED:aws-key]"),
     (re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{8,}"), "[REDACTED:slack-token]"),
