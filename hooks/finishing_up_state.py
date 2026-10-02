@@ -598,6 +598,81 @@ class Store:
             raise
         return self.target(snapshot["id"])
 
+    def _github_pr(
+        self, snapshot: dict[str, Any], runner
+    ) -> tuple[dict[str, Any] | None, dict[str, object]]:
+        """Read the stored PR from GitHub, or return INCONCLUSIVE updates."""
+        if GITHUB_SLUG.fullmatch(str(snapshot["github_repo"])) is None:
+            return None, {"phase": "INCONCLUSIVE", "detail": "stored GitHub repository is invalid"}
+        argv = [
+            "gh",
+            "pr",
+            "view",
+            str(snapshot["pr_number"]),
+            "--repo",
+            str(snapshot["github_repo"]),
+            "--json",
+            "number,url,state,isDraft,mergeStateStatus,mergeable,headRefOid,baseRefName,mergeCommit",
+        ]
+        try:
+            result = runner(argv, None, 45)
+        except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+            return None, {
+                "phase": "INCONCLUSIVE",
+                "detail": f"GitHub refresh failed: {type(exc).__name__}",
+            }
+        if result.returncode != 0:
+            return None, {
+                "phase": "INCONCLUSIVE",
+                "detail": "GitHub refresh failed: "
+                + redact_evidence(result.stderr or f"exit {result.returncode}", 240),
+            }
+        try:
+            return _json_object(result.stdout, "gh pr view"), {}
+        except StateError as exc:
+            return None, {"phase": "INCONCLUSIVE", "detail": str(exc)}
+
+    @staticmethod
+    def _pr_common(snapshot: dict[str, Any], pr: dict[str, Any]) -> dict[str, object]:
+        return {
+            "pr_url": normalize_pr_url(pr.get("url"))
+            or normalize_pr_url(snapshot.get("pr_url"))
+            or "",
+            "pr_head_sha": _normal_sha(pr.get("headRefOid")),
+        }
+
+    def _settle_unreviewed_merge(self, snapshot: dict[str, Any], runner) -> dict[str, Any]:
+        pr, failure = self._github_pr(snapshot, runner)
+        if pr is None:
+            return self._cas_target(snapshot, failure)
+        state = str(pr.get("state") or "").upper()
+        merge = pr.get("mergeCommit")
+        merge_sha = _normal_sha(merge.get("oid") if isinstance(merge, dict) else None)
+        common = self._pr_common(snapshot, pr)
+        if state != "MERGED" or merge_sha is None:
+            return self._cas_target(
+                snapshot,
+                {
+                    **common,
+                    "merge_sha": None,
+                    "phase": "INCONCLUSIVE",
+                    "detail": "worktree disappeared before review handoff; PR state is "
+                    + (state or "unknown")
+                    + ("" if state != "MERGED" else " without a trustworthy merge SHA"),
+                },
+            )
+        return self._cas_target(
+            snapshot,
+            {
+                **common,
+                "merge_sha": merge_sha,
+                "phase": "MERGED",
+                "detail": "merged before review handoff (auto-merge); merge independently "
+                "verified; deployment unverified",
+            },
+            environment_expected_sha=merge_sha,
+        )
+
     def refresh_target(
         self,
         target_id: str,
@@ -609,52 +684,14 @@ class Store:
         if not snapshot["active"]:
             raise StateError("target is not active")
         reviewed = _normal_sha(snapshot.get("reviewed_head_sha"))
-        if reviewed and snapshot.get("github_repo") and snapshot.get("pr_number"):
-            if GITHUB_SLUG.fullmatch(str(snapshot["github_repo"])) is None:
-                return self._cas_target(
-                    snapshot,
-                    {"phase": "INCONCLUSIVE", "detail": "stored GitHub repository is invalid"},
-                )
-            argv = [
-                "gh",
-                "pr",
-                "view",
-                str(snapshot["pr_number"]),
-                "--repo",
-                str(snapshot["github_repo"]),
-                "--json",
-                "number,url,state,isDraft,mergeStateStatus,mergeable,headRefOid,baseRefName,mergeCommit",
-            ]
-            try:
-                result = runner(argv, None, 45)
-            except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
-                return self._cas_target(
-                    snapshot,
-                    {"phase": "INCONCLUSIVE", "detail": f"GitHub refresh failed: {type(exc).__name__}"},
-                )
-            if result.returncode != 0:
-                return self._cas_target(
-                    snapshot,
-                    {
-                        "phase": "INCONCLUSIVE",
-                        "detail": "GitHub refresh failed: "
-                        + redact_evidence(result.stderr or f"exit {result.returncode}", 240),
-                    },
-                )
-            try:
-                pr = _json_object(result.stdout, "gh pr view")
-            except StateError as exc:
-                return self._cas_target(
-                    snapshot, {"phase": "INCONCLUSIVE", "detail": str(exc)}
-                )
+        has_pr = bool(snapshot.get("github_repo") and snapshot.get("pr_number"))
+        if reviewed and has_pr:
+            pr, failure = self._github_pr(snapshot, runner)
+            if pr is None:
+                return self._cas_target(snapshot, failure)
             final_head = _normal_sha(pr.get("headRefOid"))
             state = str(pr.get("state") or "").upper()
-            common = {
-                "pr_url": normalize_pr_url(pr.get("url"))
-                or normalize_pr_url(snapshot.get("pr_url"))
-                or "",
-                "pr_head_sha": final_head,
-            }
+            common = self._pr_common(snapshot, pr)
             if final_head != reviewed:
                 try:
                     current_identity = discover_repo(snapshot["worktree"])
@@ -730,6 +767,11 @@ class Store:
 
         worktree = pathlib.Path(snapshot["worktree"])
         if not worktree.is_dir():
+            if has_pr:
+                # Auto-merge can land the PR (and the session clean up the
+                # worktree) before any handoff froze a reviewed head. GitHub
+                # alone can still prove the merge and its exact SHA.
+                return self._settle_unreviewed_merge(snapshot, runner)
             return self._cas_target(
                 snapshot,
                 {
@@ -849,7 +891,10 @@ class Store:
             ).fetchone()
             if target is None:
                 raise StateError("active target not found")
-            if target["phase"] not in {"WORKING", "READY_FOR_REVIEW"}:
+            # A target merged before handoff (auto-merge) never froze a
+            # contract, so its environments may still be declared.
+            unfrozen_merge = target["phase"] == "MERGED" and target["reviewed_head_sha"] is None
+            if target["phase"] not in {"WORKING", "READY_FOR_REVIEW"} and not unfrozen_merge:
                 raise StateError("deployment contract is frozen after handoff")
             self.db.execute(
                 """INSERT INTO environments(
@@ -933,6 +978,8 @@ class Store:
         refreshed = self.refresh_target(target_id, runner=runner)
         if refreshed["phase"] != "MERGED" or _normal_sha(refreshed.get("merge_sha")) is None:
             raise StateError(f"target is not independently verified merged ({refreshed['phase']})")
+        if not refreshed["environments"]:
+            raise StateError("configure at least one deployment environment before verify")
         snapshot = refreshed
         merge_sha = snapshot["merge_sha"]
         outcomes: list[dict[str, object]] = []
