@@ -43,6 +43,10 @@ DENY = [
     "sleep 90\ngh pr view 7 --json statusCheckRollup",
     "for i in $(seq 1 19); do OUT=$(gh pr checks 97 2>&1); sleep 30; done",
     "for i in $(seq 1 55); do S=$(gh run view 3639 --json status -q .status); [ \"$S\" = completed ] && break; sleep 10; done",
+    # a heredoc note written first does not hide the real poll after it
+    "cat >> /tmp/progress.md <<EOF\n- pushed; PR #15 opened\nEOF\nsleep 240; gh pr checks 15 2>&1 | head -6",
+    # backticks inside double quotes DO execute
+    "sleep 30; echo \"state: `gh pr checks 5 | grep -c pending`\"",
 ]
 
 ALLOW = [
@@ -60,6 +64,13 @@ ALLOW = [
     # the words only appear inside quoted text
     "git commit -m 'stop doing sleep 30; gh pr checks 4 loops'",
     "echo \"sleep 10; gh run list\"",
+    # heredoc bodies are data: markdown backticks there are not substitutions
+    # (2026-10-02, this PR's own SKILL.md edit was denied by this layer)
+    "python3 - <<'EOF'\nnew='before re-running `gh pr checks` / `gh run view` / `sleep N; <status>`'\nEOF",
+    "git commit -F - <<'EOF'\nfix: stop polling\n\nInstead of `sleep 30; gh pr checks 9` use the watch.\nEOF",
+    "cat >> /tmp/notes.md <<EOF\nsleep 30\ngh pr checks 9\nEOF",
+    # backticks inside single quotes are literal text
+    "echo 'avoid `sleep 9` then `gh pr checks 3`'",
 ]
 
 

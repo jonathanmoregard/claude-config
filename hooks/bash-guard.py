@@ -1963,14 +1963,78 @@ def _is_ci_snapshot(toks: list[str]) -> bool:
     return sub == ["pr", "view"] and any("statusCheckRollup" in t for t in toks)
 
 
+_HEREDOC_OP_RE = re.compile(r"(?<!<)<<(?!<)-?[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+
+def _split_heredocs(command: str) -> tuple[str, list[str]]:
+    """(shell text with heredoc bodies removed, bodies of UNQUOTED heredocs).
+
+    A heredoc body is data, not commands: a commit message or progress note
+    that says "`sleep 30; gh pr checks 9`" is not a poll. Only an unquoted
+    delimiter still expands `$( )` / backticks inside the body, so those
+    bodies are returned for the substitution scan alone.
+    """
+    lines = command.split("\n")
+    shell: list[str] = []
+    live: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        shell.append(line)
+        i += 1
+        for m in _HEREDOC_OP_RE.finditer(line):
+            quoted, delim = bool(m.group(1)), m.group(2)
+            body: list[str] = []
+            while i < len(lines) and lines[i].strip() != delim:
+                body.append(lines[i])
+                i += 1
+            i += 1  # the terminator line (or past the end when unterminated)
+            if not quoted:
+                live.append("\n".join(body))
+    return "\n".join(shell), live
+
+
+def _mask_single_quotes(s: str) -> str:
+    """`s` with single-quoted text blanked, so a backtick or `$(` inside
+    'literal text' is not mistaken for a command substitution."""
+    out: list[str] = []
+    in_single = in_double = False
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if in_single:
+            if ch == "'":
+                in_single = False
+                out.append(ch)
+            else:
+                out.append(" ")
+        elif ch == "\\" and i + 1 < len(s):
+            out.append(s[i : i + 2])
+            i += 2
+            continue
+        elif ch == '"':
+            in_double = not in_double
+            out.append(ch)
+        elif ch == "'" and not in_double:
+            in_single = True
+            out.append(ch)
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _check_ci_poll(command: str, background: bool) -> str | None:
     if background:
         return None
     has_sleep = has_snapshot = False
-    segments = _pipeline_subcommands(command)
+    shell_text, live_bodies = _split_heredocs(command)
+    segments = _pipeline_subcommands(shell_text)
     # `s=$(gh pr checks 9 | grep -c pending)` inside a loop is the same poll.
-    for body in _command_substitutions(command):
-        segments.extend(_pipeline_subcommands(body))
+    subst_sources = [_mask_single_quotes(shell_text), *live_bodies]
+    for src in subst_sources:
+        for body in _command_substitutions(src):
+            segments.extend(_pipeline_subcommands(body))
     for seg in segments:
         toks = _segment_tokens(seg)
         if not toks:
