@@ -1140,10 +1140,19 @@ def _check_bg_status_masked(command: str, background: bool) -> str | None:
     if not background or not _STATUS_CAPTURE.search(command):
         return None
     body = command.rstrip().rstrip(")}; \t\n")
-    segments = [seg for seg, _op in _split_operators(body) if seg]
-    if segments and _STATUS_DISCARDING_TAIL.match(segments[-1]):
-        return _BG_STATUS_MASKED_HINT
-    return None
+    parts = [(seg, op) for seg, op in _split_operators(body) if seg]
+    if not parts or not _STATUS_DISCARDING_TAIL.match(parts[-1][0]):
+        return None
+    # `cmd && echo …` skips the echo when cmd fails, so cmd's status is reported.
+    if len(parts) > 1 and parts[-2][1] == "&&":
+        return None
+    # A `$?` inside a loop body tests an in-loop command; only a capture after
+    # the last `done` is a status the trailing echo throws away.
+    last_done = max((i for i, (seg, _op) in enumerate(parts)
+                     if re.match(r"done\b", seg)), default=-1)
+    if not any(_STATUS_CAPTURE.search(seg) for seg, _op in parts[last_done + 1:]):
+        return None
+    return _BG_STATUS_MASKED_HINT
 
 
 # ----------------------------------------------------------------------

@@ -2854,6 +2854,13 @@ _PRESERVING = {
         "make test > /tmp/t.log 2>&1 && echo done",
     "no status capture at all":
         "sleep 1; echo hello",
+    # `&&` skips the echo on failure, so the command's own status is reported.
+    "echo joined by && reports the failing status":
+        "make test > /tmp/t.log 2>&1 && echo \"ok rc=$?\"",
+    # A `$?` inside a loop body tests an in-loop command; the status after
+    # `done` is the loop's own, and the trailing echo discards nothing captured.
+    "status capture only inside a wait-until loop":
+        "until curl -sf localhost:8080; do echo \"waiting rc=$?\"; sleep 2; done; echo UP",
 }
 for _label, _cmd in _PRESERVING.items():
     _dec, _why = bg_guard(_cmd)
