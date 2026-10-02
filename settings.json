@@ -430,6 +430,16 @@
         ]
       },
       {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/hooks/pending-for-human.py",
+            "timeout": 10,
+            "statusMessage": "Checking pending human blockers..."
+          }
+        ]
+      },
+      {
         "matcher": "startup|clear|compact",
         "hooks": [
           {
