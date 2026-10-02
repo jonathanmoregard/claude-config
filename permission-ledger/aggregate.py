@@ -470,6 +470,9 @@ def run_injection_scan(groups, scan_script):
     return "error: scanner exited %d; samples emitted unscanned" % proc.returncode
 
 
+_DETECTOR_HIT = re.compile(r":\s*True\b")
+
+
 def _detect_secrets_hit(binary, text):
     proc = subprocess.run(
         [binary, "scan", "--string", text],
@@ -478,7 +481,9 @@ def _detect_secrets_hit(binary, text):
         timeout=DETECT_SECRETS_TIMEOUT,
     )
     out = proc.stdout.decode("utf-8", "replace")
-    return any(line.strip().endswith(": True") for line in out.splitlines())
+    # 1.5.0 prints `AWSKeyDetector          : True  (unverified)` — padded,
+    # with a qualifier after True — so match the field, not the line end.
+    return any(_DETECTOR_HIT.search(line) for line in out.splitlines())
 
 
 def run_secret_scan(groups):

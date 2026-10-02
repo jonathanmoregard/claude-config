@@ -632,7 +632,14 @@ class AggregateTestCase(unittest.TestCase):
         os.makedirs(fakebin, exist_ok=True)
         exe = os.path.join(fakebin, "detect-secrets")
         with open(exe, "w", encoding="utf-8") as fh:
-            fh.write("#!/bin/sh\necho 'AWSKeyDetector: True'\nexit 0\n")
+            # Verbatim detect-secrets 1.5.0 `scan --string` shape: padded
+            # names and a trailing qualifier after True.
+            fh.write(
+                "#!/bin/sh\n"
+                "echo 'ArtifactoryDetector     : False'\n"
+                "echo 'AWSKeyDetector          : True  (unverified)'\n"
+                "exit 0\n"
+            )
         os.chmod(exe, 0o755)
         old = os.environ.get("PATH", "")
         os.environ["PATH"] = fakebin + os.pathsep + old
