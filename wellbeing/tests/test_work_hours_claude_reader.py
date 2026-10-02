@@ -86,6 +86,16 @@ def test_entry_with_non_object_message_or_null_cwd():
          "timestamp": "2026-01-01T00:00:00Z"}).encode())
 
 
+def test_entry_with_non_string_timestamp():
+    for ts in (123, 1.5, ["2026"], {"t": 1}):
+        _assert_both_prompts_count(json.dumps(
+            {"type": "user", "timestamp": ts, "message": {"content": "x"}}).encode())
+
+
+def test_invalid_utf8_inside_an_otherwise_valid_file():
+    _assert_both_prompts_count(b"\xff\xfe not text")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

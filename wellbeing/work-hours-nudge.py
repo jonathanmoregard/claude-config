@@ -97,7 +97,7 @@ def _compute_hours(now):
                     ):
                         continue
                     ts_str = entry.get("timestamp")
-                    if not ts_str:
+                    if not isinstance(ts_str, str) or not ts_str:
                         continue
                     try:
                         ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
