@@ -224,7 +224,7 @@ Mission artifact layout:
   always kept.
 
 Diagnostic retention (not settable — a constant in lib.sh):
-  skipped-recursions/, malformed/ and \$REFLECT_LOG_DIR are swept by every DETACHED
+  skipped-recursions/, skipped-pipeline/, malformed/ and \$REFLECT_LOG_DIR are swept by every DETACHED
   worker; regular files older than REFLECT_ARTIFACT_RETENTION_DAYS
   (${REFLECT_ARTIFACT_RETENTION_DAYS}) are removed. sessions/ is never swept.
 
@@ -624,6 +624,54 @@ fi
 
 if ! is_valid_sid "$SESSION_ID"; then
   malformed_manifest "invalid_session_id"
+fi
+
+# --- Pipeline-internal sessions are not reflected on --------------------------
+# Machine sessions — the step-back classifier's haiku call, the homunculus
+# observer's analysis runs, the nightly RSI review and permission-ledger
+# evaluator — fire the same global hooks as work sessions. Reflecting on them
+# filled the corpus the daily review reads with the pipeline's own telemetry
+# (239 of 300 recent artifacts were step-back classifier runs) and fed the
+# reviewer its own previous night back as "findings".
+#
+# Two signals, either suffices:
+#   * CLAUDE_PIPELINE_INTERNAL truthy — exported by cron wrappers whose cwd
+#     ($HOME, ~/.claude) is indistinguishable from a work session's.
+#   * payload cwd under a machine-owned state dir — helpers that run claude from
+#     their own STATE_DIR precisely so the transcript lands outside the user's
+#     project (step-back-classifier.py, the homunculus observer).
+# Distinct from REFLECT_SUBPROCESS, which is the recursion break and also gates
+# the self-compact trigger. Applies to every mode: a pipeline session needs no
+# checkpoint, mission handoff or subagent reflection either. The skip leaves a
+# record under skipped-pipeline/ so it stays countable rather than silent.
+_pipeline_reason=""
+if reflect_truthy "${CLAUDE_PIPELINE_INTERNAL:-}"; then
+  _pipeline_reason="sentinel"
+else
+  for _machine_dir in "$HOME/.claude/step-back" "$HOME/.claude/homunculus"; do
+    if [[ "$CWD/" == "$_machine_dir/"* ]]; then
+      _pipeline_reason="machine_cwd"
+      break
+    fi
+  done
+fi
+if [[ -n "$_pipeline_reason" ]]; then
+  _pipe_dir="$REFLECT_ROOT/skipped-pipeline"
+  if mkdir -p "$_pipe_dir" 2>/dev/null && \
+     _pipe_file="$(mktemp -p "$_pipe_dir" \
+       "$(date -u +%Y%m%dT%H%M%SZ)-${SESSION_ID}-${MODE}-XXXX.json" 2>/dev/null)"; then
+    jq -n \
+      --arg sid "$SESSION_ID" \
+      --arg mode "$MODE" \
+      --arg reason "$_pipeline_reason" \
+      --arg cwd "$CWD" \
+      --arg tp "$TRANSCRIPT_PATH" \
+      --arg now "$(reflect_now)" \
+      '{status:"skipped_pipeline",session_id:$sid,mode:$mode,reason:$reason,
+        cwd:$cwd,source_transcript:$tp,seen_at:$now}' \
+      > "$_pipe_file" 2>/dev/null || true
+  fi
+  exit 0
 fi
 
 # --- Subagent identity: taken from the payload, never inferred (A1/A2) -------
