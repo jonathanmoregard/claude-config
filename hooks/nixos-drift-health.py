@@ -75,14 +75,16 @@ def _dirs() -> tuple[Path, Path]:
     return data / "nixos-drift-analyzer", state / "nixos-drift-analyzer"
 
 
-def _heartbeat_age(path: Path) -> float | None:
+def _heartbeat(path: Path) -> tuple[float | None, int | None]:
+    """(age in seconds or None if unusable, finding count or None if absent)."""
     fields = dict(
         line.split("=", 1) for line in path.read_text().splitlines() if "=" in line
     )
     ts = datetime.fromisoformat(fields["timestamp"].strip())
+    count = int(fields["findings"]) if "findings" in fields else None
     if ts.tzinfo is None:
-        return None
-    return time.time() - ts.timestamp()
+        return None, count
+    return time.time() - ts.timestamp(), count
 
 
 def _sections(report: str) -> dict[str, list[str]]:
@@ -125,9 +127,9 @@ def main() -> int:
 
     journal = "journalctl --user -u nixos-drift-analyzer.service"
     try:
-        age = _heartbeat_age(state_dir / "last-success")
+        age, expected = _heartbeat(state_dir / "last-success")
     except (OSError, KeyError, ValueError):
-        age = None
+        age, expected = None, None
     if age is None or age > STALE_S:
         why = ("no readable heartbeat" if age is None
                else f"last successful run {age / 3600:.0f}h ago")
@@ -140,6 +142,13 @@ def main() -> int:
     except (OSError, UnicodeDecodeError):
         _emit(f"NixOS drift status UNVERIFIED — report unreadable: "
               f"{data_dir / 'latest.md'}")
+        return 0
+    # Producer and consumer live in different repos. If the report format
+    # drifts, parsing nothing must not pass for "checked and clean".
+    if expected is not None and len(sections) < expected:
+        _emit(f"NixOS drift status UNVERIFIED — heartbeat reports {expected} "
+              f"finding(s) but {len(sections)} parsed from "
+              f"{data_dir / 'latest.md'} (report format changed?)")
         return 0
 
     lines: list[str] = []

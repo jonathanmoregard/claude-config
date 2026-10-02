@@ -132,6 +132,17 @@ def test_garbage_heartbeat_speaks(tmp_path):
     assert "UNVERIFIED" in _context(_run(env))
 
 
+def test_report_that_does_not_parse_to_the_heartbeat_count_speaks(tmp_path):
+    # The two halves live in different repos. If the analyzer's report format
+    # drifts (fence or heading style) while the heartbeat still says it found
+    # things, parsing nothing must not read as "checked and clean".
+    env = _setup(tmp_path, [
+        "## Entries outside /nix/store in ~/.local/bin\n\n```text\nmyscript\n```\n\n",
+        "## Multiple worktrees share refs/heads/main\n\n```text\n/a\n/b\n```\n\n",
+    ])
+    assert "UNVERIFIED" in _context(_run(env))
+
+
 def test_host_without_analyzer_is_silent(tmp_path):
     env = {"XDG_DATA_HOME": str(tmp_path / "d"), "XDG_STATE_HOME": str(tmp_path / "s")}
     assert _context(_run(env)) == ""
