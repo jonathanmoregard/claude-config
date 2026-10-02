@@ -149,6 +149,19 @@ def test_missing_codex_dir_is_harmless():
         assert total == 0.0
 
 
+def test_codex_rollout_being_written_does_not_crash():
+    """A rollout read mid-append can end in a cut multibyte char or hold a
+    non-object JSON line; the hook must skip it, not raise."""
+    def setup(c, x, b):
+        _codex_rollout(x, "tui", "cli", [b])
+        f = next(x.rglob("rollout-tui.jsonl"))
+        with open(f, "ab") as fh:
+            fh.write(b"[1, 2]\n")
+            fh.write('{"type": "event_msg", "payload": {"message": "hå'
+                     .encode()[:-1])
+    assert _close(_hours(setup), WINDOW_H)
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

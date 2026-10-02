@@ -120,12 +120,16 @@ def _codex_prompt_times(today_start):
         if not _touched_today(jsonl, today_ts):
             continue
         try:
-            with open(jsonl) as f:
+            # errors="replace": a rollout Codex is still appending to can end
+            # mid-character; that line fails json.loads and is skipped.
+            with open(jsonl, errors="replace") as f:
                 interactive = False
                 for n, line in enumerate(f):
                     try:
                         entry = json.loads(line)
                     except json.JSONDecodeError:
+                        continue
+                    if not isinstance(entry, dict):
                         continue
                     payload = entry.get("payload")
                     if not isinstance(payload, dict):
