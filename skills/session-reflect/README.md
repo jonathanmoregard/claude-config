@@ -329,6 +329,19 @@ alongside the measured `transcript_bytes` and the threshold that fired. The
 primary is still tried first wherever it can work: the prompt-cache reuse is the
 cost story for this feature, and the fallback buys only that `final.json` lands.
 
+### Quota backfill
+
+A primary that comes back 429 is the account's spend cap, so no fallback is
+placed and the manifest records `status: error`, `api_error_status: 429`,
+`fallback_skipped_quota: true`. Since SessionEnd fires once, such a drop used to
+be permanent. Now every **organic** Claude SessionEnd that completes (proof that
+quota is back) re-dispatches **one** dropped session, oldest first, through the
+normal dispatcher with a synthesized payload. Each dispatch bumps
+`quota_backfill_attempts` (cap 3) and stamps `quota_backfill_last_at`; a
+backfill's own success does not trigger another, so recovery never spends more
+than live reflection does. Candidates whose transcript is gone are skipped.
+Constants live in `lib.sh` under "Quota backfill".
+
 ### Tests
 
 ```bash
