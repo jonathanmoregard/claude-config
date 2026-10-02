@@ -58,8 +58,9 @@ projects/
 /plans/
 **/__pycache__/
 
-# Caveman state flag
+# Caveman state flag, plus its per-process variant .caveman-active.<pid>.<ts>
 .caveman-active
+/.caveman-active.*
 
 # Dev-container user-local overrides
 dev-container/proxy-allow.txt

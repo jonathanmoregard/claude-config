@@ -135,6 +135,16 @@ class HarnessRuntimeIsIgnored(unittest.TestCase):
                     % (rel, proc.stdout.strip()))
 
 
+class PluginMarkersAreIgnored(unittest.TestCase):
+    def test_suffixed_caveman_marker_is_ignored(self):
+        # The caveman plugin writes a per-process marker
+        # `.caveman-active.<pid>.<epoch-ms>` beside the bare `.caveman-active`.
+        for rel in (".caveman-active", ".caveman-active.366232.1789375859676"):
+            with self.subTest(path=rel):
+                proc = git("check-ignore", "-q", "--no-index", "--", rel)
+                self.assertEqual(0, proc.returncode, "%s is not ignored" % rel)
+
+
 class NoTrackedFileIsIgnored(unittest.TestCase):
     def test_ls_files_ignored_is_empty(self):
         proc = git("ls-files", "-ci", "--exclude-standard")
