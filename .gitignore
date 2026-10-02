@@ -153,6 +153,12 @@ jobs/
 # Two registry entries are DELIBERATELY absent: `keybindings.json` and
 # `CLAUDE.md` are real user config that belongs in this repo.
 #
+# From 2.1.285 the Map is gone: each path is built inline as
+# `join(<configHome>(), "<name>")`, and tests/test_tree_stays_clean.py now
+# collects the file names joined onto that getter instead. That surfaced
+# `.config.json`, the legacy in-config-home location of the global
+# `.claude.json` (account and per-project state) -- harness-owned, never config.
+#
 # The registry's five daemon* names (daemon.json, daemon.status.json,
 # daemon.scheduled.status.json, daemon-auth-status.json, daemon-auth-cooldown)
 # are NOT relisted here: the `daemon.*` / `daemon-*` globs above already cover
@@ -160,6 +166,7 @@ jobs/
 # next reader cannot tell which is authoritative. The globs own the daemon
 # subsystem; this block owns the rest of the registry, which no glob catches.
 active-time.json
+.config.json
 .deep-link-register-failed
 gh-pr-status-cache.json
 hfi-auth.json
