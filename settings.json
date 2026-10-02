@@ -387,6 +387,16 @@
         "hooks": [
           {
             "type": "command",
+            "command": "python3 $HOME/.claude/hooks/nixos-drift-health.py",
+            "timeout": 5,
+            "statusMessage": "Checking NixOS drift..."
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
             "command": "python3 -S -E $HOME/.claude/hooks/ai-router-health.py",
             "timeout": 5,
             "statusMessage": "Checking ai-router background health..."
