@@ -1799,12 +1799,20 @@ def _check_nixos_push(command: str, cwd: str | None) -> str | None:
     # back a third time to "" — an empty diff satisfies every cross-check
     # below, so a `git diff` that could not resolve either ref silently
     # switched the gate off. Both refs failing is now a deny.
+    #
+    # Fall back ONLY when the origin/main diff FAILED. An empty diff from a
+    # resolvable origin/main is a real answer — the branch adds nothing on
+    # top of origin/main (already merged, or HEAD sits on origin/main's tip)
+    # — and there is then nothing for the claims to contradict. Falling back
+    # on empty compared HEAD against a stale local `main` instead, whose
+    # unrelated history then produced false "feature-vm.nix modified" and
+    # risky-marker mismatches.
     rc1, diff, _ = _nixos_git(worktree, ["diff", "origin/main...HEAD"])
-    if rc1 != 0 or not diff:
+    if rc1 != 0:
         rc2, diff2, err2 = _nixos_git(worktree, ["diff", "main...HEAD"])
         if rc2 == 0:
             diff = diff2
-        elif rc1 != 0:
+        else:
             _fail_closed(
                 "the nixos push gate could not diff this branch against either "
                 f"origin/main or main in {worktree!r}, so the checklist's claims "

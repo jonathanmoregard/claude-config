@@ -2097,6 +2097,47 @@ check("`git -C <worktree> push` from an unrelated cwd -> deny", dec == "deny",
       f"decision={dec!r}")
 
 
+# --- diff base: origin/main first, local main only when origin/main fails --
+section("bash-guard: nixos push gate, diff base selection")
+
+# HEAD sits on origin/main's tip (the feature-vm.nix change is already on
+# origin/main) while the LOCAL `main` ref is stale, one commit behind. The
+# branch adds nothing over origin/main, so no claim can be contradicted. An
+# empty origin/main diff used to trigger the fallback to stale `main`, whose
+# diff carries feature-vm.nix and refused the honest 'no'.
+w = make_repo()
+_write_in(w, "modules/nixos/feature-vm.nix", NIX_INERT)
+_g(w, "add", "-A")
+_g(w, "commit", "-m", CHECKLIST_RISKY.format(fv="no"))
+_g(w, "push", "origin", "main")
+_g(w, "checkout", "-q", "-b", "feature/x")
+_g(w, "branch", "-f", "main", "HEAD~1")
+dec, why = push_guard(w)
+check(
+    "empty origin/main...HEAD with a stale local main -> no false mismatch",
+    dec is None,
+    f"decision={dec!r} {why[:250]}",
+)
+
+# origin/main does NOT resolve, local main does: the fallback must still run,
+# so the cross-check sees the feature-vm.nix edit and refuses the false 'no'.
+# (Rebased claim is 'no' — the rebased check needs origin/main by design.)
+w = branch_with(
+    make_repo(),
+    CHECKLIST_RISKY.format(fv="no").replace(
+        "Rebased on origin/main: yes", "Rebased on origin/main: no"
+    ),
+    {"modules/nixos/feature-vm.nix": NIX_INERT},
+)
+_g(w, "update-ref", "-d", "refs/remotes/origin/main")
+dec, why = push_guard(w)
+check(
+    "origin/main unresolvable -> falls back to local main and catches the mismatch",
+    dec == "deny" and "DOES touch modules/nixos/feature-vm.nix" in why,
+    f"decision={dec!r} {why[:250]}",
+)
+
+
 # --- fail-closed: the gate must deny when it cannot evaluate -----------
 # safe-bash returned None (allow) for every one of these. A `git diff` that
 # fails silently disables the claim-vs-diff cross-check — the gate would
