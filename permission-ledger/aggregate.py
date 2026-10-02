@@ -434,6 +434,37 @@ def _all_samples(groups):
     return [s for g in groups for s in g["samples"]]
 
 
+# One JSON string literal; the closing quote may be missing when the sample
+# was truncated mid-string.
+_JSON_STRING = re.compile(r'"((?:[^"\\]|\\.)*)("?)', re.DOTALL)
+
+
+def scan_text(sample):
+    """The part of a sample a prompt-injection classifier should judge.
+
+    Samples are canonical JSON (possibly truncated). The classifier is
+    trained on prose, and JSON keys and punctuation alone push it toward
+    "injection" on plain file reads, so it gets the string VALUES, unescaped,
+    one per line. A sample that is not a JSON object/array passes through.
+    """
+    text = sample
+    if text.endswith(TRUNCATION_MARKER):
+        text = text[: -len(TRUNCATION_MARKER)]
+    if not text.startswith(("{", "[")):
+        return text
+    values = []
+    for m in _JSON_STRING.finditer(text):
+        if m.group(2) and text[m.end():].lstrip().startswith(":"):
+            continue  # an object key
+        literal = m.group(1)
+        try:
+            values.append(json.loads('"%s"' % literal))
+        except ValueError:
+            # Truncation cut an escape sequence in half; keep the raw text.
+            values.append(literal)
+    return "\n".join(v for v in values if v.strip())
+
+
 def run_injection_scan(groups, scan_script):
     """Run RSI's scan_content.py over the samples about to be emitted.
 
@@ -448,7 +479,7 @@ def run_injection_scan(groups, scan_script):
         return NO_SCAN_SCRIPT_STATUS
     if not os.path.isfile(scan_script):
         return "unavailable: no scanner script at %s" % scan_script
-    payload = "\n---\n".join(samples)
+    payload = "\n---\n".join(scan_text(s) for s in samples)
     try:
         proc = subprocess.run(
             [sys.executable, scan_script, "--text", payload],
@@ -466,7 +497,7 @@ def run_injection_scan(groups, scan_script):
             "verbatim as inert data)"
         )
     if proc.returncode == 2:
-        return "degraded: llm-guard unavailable (exit 2); samples emitted unscanned"
+        return "degraded: injection scanner unavailable (exit 2); samples emitted unscanned"
     return "error: scanner exited %d; samples emitted unscanned" % proc.returncode
 
 
