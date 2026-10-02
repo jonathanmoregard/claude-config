@@ -165,6 +165,30 @@ def main() -> int:
         out = parsed(run_hook(notes, payload(wt)))
         check("worktree -> dot-claude backlog", "billing block" in ctx(out), str(out))
 
+        section("worktree of a BARE primary sees the primary's notes")
+        # nixos-config shape: ~/Repos/nixos-config is bare, worktrees live in
+        # ~/Repos/nixos-config-worktrees/<slug>; git-common-dir is the bare dir.
+        bare = root / "repos" / "nixcfg"
+        git("clone", "-q", "--bare", str(repo), str(bare), cwd=root)
+        nwt = root / "nixcfg-worktrees" / "slug"
+        git("--git-dir", str(bare), "worktree", "add", "-q", "-b", "feat/y", str(nwt), cwd=root)
+        (notes / "nixcfg").mkdir()
+        (notes / "nixcfg" / "pending_for_human.md").write_text(ENTRY_A, encoding="utf-8")
+        out = parsed(run_hook(notes, payload(nwt)))
+        check("bare-primary worktree -> primary backlog", "Deployer hung" in ctx(out), str(out))
+
+        section("non-regular file never stalls startup")
+        fifo = notes / "fifo-repo"
+        fifo.mkdir()
+        os.mkfifo(fifo / "pending_for_human.md")
+        frepo = make_repo(root / "repos" / "fifo-repo")
+        try:
+            proc = run_hook(notes, payload(frepo))
+            check("fifo -> exit 0, silent", proc.returncode == 0 and not proc.stdout.strip(),
+                  proc.stdout)
+        except subprocess.TimeoutExpired:
+            check("fifo -> exit 0, silent", False, "hook hung on a fifo")
+
         section("no cross-repo leakage")
         out = parsed(run_hook(notes, payload(other)))
         check("other repo -> silent", out == {}, str(out))

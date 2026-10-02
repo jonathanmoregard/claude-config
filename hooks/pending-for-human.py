@@ -10,8 +10,8 @@ other SessionStart health hooks do: the fact goes into Claude's context
 (systemMessage).
 
 SCOPE. Only the current repo: the notes dir named after the git toplevel of
-``cwd`` and, for a linked worktree, the one named after the primary checkout
-(a leading dot becomes ``dot-``, so ~/.claude -> dot-claude). Other repos'
+``cwd`` and, for a linked worktree, the one named after the primary checkout,
+bare or not (a leading dot becomes ``dot-``, so ~/.claude -> dot-claude). Other repos'
 backlogs stay out of this session.
 
 WHAT COUNTS. Each level-2 heading (``## ``) is one entry, per
@@ -32,6 +32,7 @@ from pathlib import Path
 FILENAME = "pending_for_human.md"
 MAX_LISTED = 15
 MAX_TITLE = 140
+MAX_BYTES = 2_000_000
 CLOSED = re.compile(r"^(resolved|done)\b", re.IGNORECASE)
 DATE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
 
@@ -67,10 +68,26 @@ def repo_names(cwd: str) -> list[str]:
     if common:
         common_path = Path(common)
         if common_path.name == ".git":
-            primary = notes_name(common_path.parent)
-            if primary not in names:
-                names.append(primary)
+            primary_dir = common_path.parent
+        else:
+            # Bare primary (nixos-config: ~/Repos/nixos-config is bare, its
+            # worktrees live elsewhere). Its own dir name is the repo name.
+            primary_dir = common_path.with_name(common_path.name.removesuffix(".git"))
+        primary = notes_name(primary_dir)
+        if primary not in names:
+            names.append(primary)
     return names
+
+
+def read_capped(path: Path) -> str | None:
+    """Regular files only, at most MAX_BYTES: a fifo or device never stalls startup."""
+    try:
+        if not path.is_file():
+            return None
+        with path.open("rb") as fh:
+            return fh.read(MAX_BYTES).decode("utf-8", errors="replace")
+    except OSError:
+        return None
 
 
 def open_entries(text: str) -> list[str]:
@@ -99,9 +116,8 @@ def main() -> int:
     found: list[tuple[Path, list[str]]] = []
     for name in repo_names(cwd):
         path = root / name / FILENAME
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        text = read_capped(path)
+        if text is None:
             continue
         titles = open_entries(text)
         if titles:
