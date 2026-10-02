@@ -153,6 +153,7 @@ OPTIONAL_RESULT_FIELDS = {
     "staleReadFileStateHint": str,
     "ghRateLimitHint": str,
     "gitOperation": dict,
+    "bashEditDiff": dict,
 }
 
 
@@ -484,6 +485,10 @@ check(
     "gitOperation" in getattr(guard, "NON_MODEL_FACING_FIELDS", frozenset()),
 )
 check(
+    "bashEditDiff is classified as never reaching the model",
+    "bashEditDiff" in getattr(guard, "NON_MODEL_FACING_FIELDS", frozenset()),
+)
+check(
     "structuredContent is classified as content-REPLACING, not content-adjacent",
     getattr(guard, "CONTENT_REPLACING_FIELD", None) == "structuredContent",
 )
@@ -807,6 +812,55 @@ parsed, updated, raw = bash_out(
     "git push", response_obj("clean\n", gitOperation={"kind": "push", "note": _s})
 )
 check_scrubbed("a secret nested inside gitOperation", updated, raw, _s)
+
+# bashEditDiff: the harness's own diff of files the command changed, for the
+# terminal and for PostToolUse hooks; the Bash mapper never renders it. A
+# file-editing command that is also ingress (npx, a fetch) used to be
+# withheld whole because this nested object was "unknown text".
+_edit_diff = {
+    "files": [
+        {
+            "filePath": "/repo/docs/spec.md",
+            "hunks": [
+                {
+                    "oldStart": 1,
+                    "oldLines": 1,
+                    "newStart": 1,
+                    "newLines": 1,
+                    "lines": ["-old", "+new"],
+                }
+            ],
+        }
+    ],
+    "moreFiles": 0,
+    "changedFiles": ["/repo/docs/spec.md"],
+}
+parsed, updated, raw = bash_out(
+    INGRESS_CMD, response_obj("remote body\n", bashEditDiff=_edit_diff)
+)
+_body = stdout_of(updated)
+check(
+    "an ingress result carrying bashEditDiff is NOT withheld",
+    isinstance(_body, str) and WITHHELD_MARKER not in _body,
+    str(_body)[:200],
+)
+check(
+    "... and bashEditDiff survives the rewrite intact",
+    isinstance(updated, dict) and updated.get("bashEditDiff") == _edit_diff,
+    str(updated)[:240],
+)
+_s = secret("Y")
+parsed, updated, raw = bash_out(
+    "sed -i s/a/b/ f",
+    response_obj(
+        "clean\n",
+        bashEditDiff={
+            "files": [{"filePath": "/r/f", "hunks": [{"lines": [f"+{_s}"]}]}],
+            "moreFiles": 0,
+        },
+    ),
+)
+check_scrubbed("a secret nested inside bashEditDiff hunks", updated, raw, _s)
 
 # backgroundedToDeliverMessage: genuinely new in 2.1.251 (0 occurrences in
 # the 2.1.247 and 2.1.248 bundles, 17 in .251). A boolean the harness wrote:
@@ -2069,11 +2123,23 @@ _TOKEN_RE = re.compile(r"[^\s'\"]+")
 
 
 def _resolve_hook_script(command: str) -> str | None:
-    """The first token in `command` that names an existing file, expanded."""
+    """The script `command` runs: the first token naming an existing file,
+    else the program its LAST shell segment runs, looked up on PATH.
+
+    A hook may call a Nix-installed tool by bare name behind guard clauses
+    (`[ … ] || exit 0; command -v tool || exit 0; tool mark X`); the
+    program that can emit output is the one the final segment runs.
+    """
     for tok in _TOKEN_RE.findall(command):
         cand = os.path.expandvars(os.path.expanduser(tok))
         if os.path.isfile(cand):
             return cand
+    last = re.split(r"[;&|]+", command)[-1].strip()
+    words = _TOKEN_RE.findall(last)
+    if words:
+        found = shutil.which(words[0])
+        if found:
+            return os.path.realpath(found)
     return None
 
 
