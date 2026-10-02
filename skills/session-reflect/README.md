@@ -334,13 +334,28 @@ cost story for this feature, and the fallback buys only that `final.json` lands.
 A primary that comes back 429 is the account's spend cap, so no fallback is
 placed and the manifest records `status: error`, `api_error_status: 429`,
 `fallback_skipped_quota: true`. Since SessionEnd fires once, such a drop used to
-be permanent. Now every **organic** Claude SessionEnd that completes (proof that
-quota is back) re-dispatches **one** dropped session, oldest first, through the
-normal dispatcher with a synthesized payload. Each dispatch bumps
-`quota_backfill_attempts` (cap 3) and stamps `quota_backfill_last_at`; a
-backfill's own success does not trigger another, so recovery never spends more
-than live reflection does. Candidates whose transcript is gone are skipped.
-Constants live in `lib.sh` under "Quota backfill".
+be permanent. `backfill.sh` drains them on **Fridays, before the weekly reset**,
+when budget is ample (systemd user timer `session-reflect-backfill`, hourly on
+Fridays, declared in nixos-config):
+
+- **Gate** (re-checked before every item, readings from `ai-router quota --fresh
+  --json`): local Friday; `seven_day.resets_at` still ahead; weekly remaining
+  > 20%; monthly extra-usage spend (`spend` bucket) used below
+  `(w+1)*25 - 15`% for 0-based week-of-month `w` (10/35/60/85). A missing
+  reading fails closed as `gate_unavailable`. `backfill.sh --gate` prints today's
+  decision.
+- **Loop**: oldest candidate first, one at a time, re-dispatched through the
+  normal `reflect.sh sessionend` front door; stops at the first 429, when a gate
+  closes, when the backlog is empty, or after 30 minutes of a busy machine
+  (load >= 0.75 x cores or < 15% memory available). The gap between items grows
+  with load.
+- **Bounds**: `quota_backfill_attempts` cap 3 per session, each session tried at
+  most once per run, missing transcripts skipped, no chaining.
+- **Visibility**: `backfill/last-run.json` (+ `runs.jsonl`); the SessionStart
+  hook `hooks/reflect-backfill-health.py` speaks when a run crashed, failed
+  closed, or hung.
+
+Tests: `bash skills/session-reflect/tests/backfill.sh`.
 
 ### Tests
 

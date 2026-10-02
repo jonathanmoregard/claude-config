@@ -1986,16 +1986,6 @@ if (( IS_WORKER == 1 )); then
     printf '[session-reflect] artifact GC removed %s diagnostic file(s) older than %s days\n' \
       "$_artifact_gc" "$REFLECT_ARTIFACT_RETENTION_DAYS" >&2
   fi
-  # Quota backfill: an ORGANIC Claude sessionend that just completed proves the
-  # account has quota again, so it re-dispatches one session an earlier 429
-  # dropped (see "Quota backfill" in lib.sh). A backfill run carries
-  # quota_backfill_attempts and does not trigger another — no chained drain.
-  if [[ "$MODE" == "sessionend" && "$TRANSCRIPT_CLIENT" == "claude" ]] \
-     && jq -e '.modes.sessionend.status == "complete"
-               and (.modes.sessionend.quota_backfill_attempts // null) == null' \
-          "$manifest_path" >/dev/null 2>&1; then
-    reflect_quota_backfill 2>&1 || true
-  fi
   exit 0
 fi
 

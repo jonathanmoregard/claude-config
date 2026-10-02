@@ -615,11 +615,6 @@ jqe '.modes.sessionend.primary_failure == "error"' "$Q_MANIFEST"; assert $? "the
 (( $(call_count) == 1 )); assert $? "exactly ONE model call ($(call_count) seen)"
 (( $(resume_calls) == 1 )); assert $? "and it was the resumed primary"
 [[ ! -f "$REFLECT_ROOT/sessions/$Q_SID/final.json" ]]; assert $? "no final.json invented from a call that was never made"
-# Both fixtures above are quota drops, which makes them backfill candidates (Q1
-# below): the next healthy sessionend in this file would recover one of them in a
-# detached worker and its stub call would land in a later case's argv log. Q1
-# owns its own fixtures, so these leave the tree once their assertions are done.
-rm -rf -- "$REFLECT_ROOT/sessions/$ERR_SID" "$REFLECT_ROOT/sessions/$Q_SID"
 
 t_begin "C1 control: a healthy run carries no failure fields"
 if jqe '.modes.sessionend.api_error_status != null' "$OK_MANIFEST"; then
@@ -1066,102 +1061,6 @@ if [[ -n "$REC_P1" && "$REC_P1" == "$REC_P2" ]]; then
 else
   note "the two fires straddled a second boundary ($REC_P1 vs $REC_P2); the count above is a weaker check this run"
 fi
-
-# ===========================================================================
-# Q1 — quota drops are backfilled, oldest first, one per organic success.
-#
-# A 429 sessionend is terminal `error` and SessionEnd fires once, so before Q1
-# nothing ever asked again: the transcript sat on disk and the reflection was
-# lost for good. The invariants: a healthy organic sessionend (proof that quota
-# is back) recovers exactly ONE dropped session, the oldest; a backfill does not
-# chain into another; a failing run triggers nothing; a capped or
-# transcript-less candidate is never dialed.
-# ===========================================================================
-t_begin "Q1: a quota-dropped sessionend is backfilled after the next healthy one"
-# Own fixtures: earlier cases' manifests must not compete for "oldest".
-_Q_ROOT_SAVED="$REFLECT_ROOT"
-REFLECT_ROOT="$SCRATCH/reflections-q1"
-mkdir -p "$REFLECT_ROOT"
-export REFLECT_ROOT
-
-q_transcript() {
-  # $1=sid — a transcript carrying the cwd line a real one has, so the backfill
-  # can resume from the project the session ran in.
-  local p="$PROJECTS_DIR/$1.jsonl"
-  jq -cn --arg cwd "$PAYLOAD_CWD" --arg sid "$1" \
-    '{type:"user",cwd:$cwd,sessionId:$sid,message:{role:"user",content:"Q1 fixture"}}' > "$p"
-  printf '%s\n' "$p"
-}
-q_drop() {
-  # $1=sid — run a real sessionend against the spend-cap stub: the exact
-  # manifest shape the live corpus holds 413 of.
-  local tp; tp="$(q_transcript "$1")"
-  STUB_MODE=error429 bash "$REFLECT_SH" sessionend <<<"$(sessionend_payload "$1" "$tp")"
-  wait_terminal "$REFLECT_ROOT/sessions/$1/manifest.json" sessionend
-}
-# wait_status <manifest> <status> [timeout_s]
-wait_status() {
-  local mpath="$1" want="$2" timeout="${3:-25}" start=$SECONDS
-  while (( SECONDS - start < timeout )); do
-    jqe --arg w "$want" '.modes.sessionend.status == $w' "$mpath" && return 0
-    sleep 0.1
-  done
-  return 1
-}
-q_status() { jq -r '.modes.sessionend.status // ""' "$REFLECT_ROOT/sessions/$1/manifest.json" 2>/dev/null; }
-q_attempts() { jq -r '.modes.sessionend.quota_backfill_attempts // 0' "$REFLECT_ROOT/sessions/$1/manifest.json" 2>/dev/null; }
-
-QB_OLD="0b0b0b0b-1a2b-4c3d-9e8f-0000000000a1"
-QB_NEW="0b0b0b0b-1a2b-4c3d-9e8f-0000000000a2"
-q_drop "$QB_OLD"; assert $? "fixture: oldest drop reached error"
-sleep 1.1   # started_at has one-second resolution; make "oldest" unambiguous
-q_drop "$QB_NEW"; assert $? "fixture: newer drop reached error"
-
-# A failing organic run is no proof that quota is back.
-reset_logs
-FAILQ_SID="0b0b0b0b-1a2b-4c3d-9e8f-0000000000a3"
-STUB_MODE=error429 bash "$REFLECT_SH" sessionend <<<"$(sessionend_payload "$FAILQ_SID" "$(q_transcript "$FAILQ_SID")")"
-wait_terminal "$REFLECT_ROOT/sessions/$FAILQ_SID/manifest.json" sessionend
-sleep 1
-[[ "$(q_attempts "$QB_OLD")" == 0 && "$(q_attempts "$QB_NEW")" == 0 ]]; assert $? "a 429 organic run dispatches no backfill"
-(( $(call_count) == 1 )); assert $? "and makes no call beyond its own ($(call_count) seen)"
-
-# A healthy organic run recovers the OLDEST drop, and only that one.
-reset_logs
-LIVE_SID="0b0b0b0b-1a2b-4c3d-9e8f-0000000000a4"
-STUB_MODE=ok bash "$REFLECT_SH" sessionend <<<"$(sessionend_payload "$LIVE_SID" "$(q_transcript "$LIVE_SID")")"
-wait_status "$REFLECT_ROOT/sessions/$LIVE_SID/manifest.json" complete; assert $? "organic run completes"
-wait_status "$REFLECT_ROOT/sessions/$QB_OLD/manifest.json" complete; assert $? "oldest drop is backfilled to complete"
-[[ -f "$REFLECT_ROOT/sessions/$QB_OLD/final.json" ]]; assert $? "the recovered reflection's final.json landed"
-[[ "$(q_attempts "$QB_OLD")" == 1 ]]; assert $? "the attempt is counted on the recovered manifest"
-grep -q -- "--resume $QB_OLD" "$STUB_ARGV_LOG"; assert $? "the backfill resumed the dropped session itself"
-sleep 1.5   # negative assertion: give a (defective) chained backfill time to show
-[[ "$(q_status "$QB_NEW")" == "error" && "$(q_attempts "$QB_NEW")" == 0 ]]; assert $? "the backfill did not chain into the next drop"
-(( $(call_count) == 2 )); assert $? "exactly two calls: the organic one and one backfill ($(call_count) seen)"
-
-# Capped and transcript-less candidates are skipped without a call.
-QB_GONE="0b0b0b0b-1a2b-4c3d-9e8f-0000000000a5"
-sleep 1.1
-q_drop "$QB_GONE"; assert $? "fixture: transcript-less drop reached error"
-rm -f -- "$PROJECTS_DIR/$QB_GONE.jsonl"
-# QB_NEW is now the oldest live candidate; cap it.
-_qm="$REFLECT_ROOT/sessions/$QB_NEW/manifest.json"
-jq -c '.modes.sessionend.quota_backfill_attempts = 3' "$_qm" > "$_qm.tmp" && mv -- "$_qm.tmp" "$_qm"
-reset_logs
-LIVE2_SID="0b0b0b0b-1a2b-4c3d-9e8f-0000000000a6"
-STUB_MODE=ok bash "$REFLECT_SH" sessionend <<<"$(sessionend_payload "$LIVE2_SID" "$(q_transcript "$LIVE2_SID")")"
-wait_status "$REFLECT_ROOT/sessions/$LIVE2_SID/manifest.json" complete; assert $? "second organic run completes"
-sleep 1.5
-[[ "$(q_status "$QB_NEW")" == "error" && "$(q_attempts "$QB_NEW")" == 3 ]]; assert $? "a candidate at the attempt cap is not retried"
-[[ "$(q_status "$QB_GONE")" == "error" && "$(q_attempts "$QB_GONE")" == 0 ]]; assert $? "a candidate whose transcript is gone is not retried"
-! grep -q -- "--resume $QB_NEW" "$STUB_ARGV_LOG"; assert $? "no call was placed for the capped candidate"
-! grep -q -- "--resume $QB_GONE" "$STUB_ARGV_LOG"; assert $? "no call was placed for the transcript-less candidate"
-# FAILQ (the 429 organic run above) is itself a drop with its transcript intact,
-# so it is the next eligible candidate past the skipped two.
-wait_status "$REFLECT_ROOT/sessions/$FAILQ_SID/manifest.json" complete; assert $? "the next eligible drop past them was the one recovered"
-
-REFLECT_ROOT="$_Q_ROOT_SAVED"
-export REFLECT_ROOT
 
 # ===========================================================================
 # T2 — syntax + lint
