@@ -66,7 +66,9 @@ def _compute_hours(now):
             continue
 
         try:
-            with open(jsonl) as f:
+            # errors="replace": a transcript still being appended to can end
+            # mid-character; that line then fails json.loads and is skipped.
+            with open(jsonl, errors="replace") as f:
                 for line in f:
                     line = line.strip()
                     if not line:
@@ -74,6 +76,8 @@ def _compute_hours(now):
                     try:
                         entry = json.loads(line)
                     except json.JSONDecodeError:
+                        continue
+                    if not isinstance(entry, dict):
                         continue
                     if entry.get("type") != "user":
                         continue
@@ -83,9 +87,10 @@ def _compute_hours(now):
                     # aren't real user presence (hooks, schedule, headless agents).
                     if entry.get("entrypoint") == "sdk-cli":
                         continue
-                    if "/homunculus/" in entry.get("cwd", ""):
+                    if "/homunculus/" in str(entry.get("cwd") or ""):
                         continue
-                    content = entry.get("message", {}).get("content")
+                    message = entry.get("message")
+                    content = message.get("content") if isinstance(message, dict) else None
                     if isinstance(content, list) and any(
                         isinstance(c, dict) and c.get("type") == "tool_result"
                         for c in content
