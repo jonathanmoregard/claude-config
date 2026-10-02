@@ -333,6 +333,39 @@ class AggregateTestCase(unittest.TestCase):
         self.assertIs(g["reask"], True)
         self.assertEqual(g["prior_decision"], prior)
 
+    def write_pending(self, name, body):
+        pdir = os.path.join(self.tmp, "pending")
+        os.makedirs(pdir, exist_ok=True)
+        with open(os.path.join(pdir, name), "w", encoding="utf-8") as fh:
+            fh.write(body)
+        return pdir
+
+    def test_pending_proposal_suppresses_its_pattern(self):
+        for key in ("Bash:cd", "Read:/etc", "Bash:curl", "Bash:ls"):
+            self.b.record(self.now, pattern_key=key)
+        self.write_pending(
+            "2026-09-05-bash-cd.md",
+            '---\nstatus: pending\npattern_key: "Bash:cd"\n---\nbody\n',
+        )
+        self.write_pending("2026-09-06-etc.md", "---\npattern_key: Read:/etc\n---\n")
+        self.write_pending(
+            "2026-09-07-curl.md",
+            '---\nstatus: implemented\npattern_key: "Bash:curl"\n---\n',
+        )
+        pdir = self.write_pending("README.md", '---\npattern_key: "Bash:ls"\n---\n')
+        os.makedirs(os.path.join(pdir, "archived"))
+        d = self.digest("--min-count", "1", "--pending-dir", pdir)
+        self.assertEqual(
+            sorted(g["pattern_key"] for g in d["groups"]), ["Bash:curl", "Bash:ls"]
+        )
+
+    def test_missing_pending_dir_suppresses_nothing(self):
+        self.b.record(self.now, pattern_key="Bash:cd")
+        d = self.digest(
+            "--min-count", "1", "--pending-dir", os.path.join(self.tmp, "nope")
+        )
+        self.assertEqual(len(d["groups"]), 1)
+
     def test_decided_just_below_3x_still_suppressed(self):
         for _ in range(11):
             self.b.record(self.now, pattern_key="Bash:curl")
