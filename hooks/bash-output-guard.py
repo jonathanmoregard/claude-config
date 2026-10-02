@@ -217,9 +217,13 @@ METADATA_STRING_FIELDS = frozenset(
 # not even destructured by the Bash tool's
 # `mapToolResultToToolResultBlockParam` (2.1.251, offset 183860436), and its
 # own schema note says "Client-facing — lets clients render git activity
-# without re-parsing stdout; not surfaced to the model". It is still
-# redacted: everything is.
-NON_MODEL_FACING_FIELDS = frozenset({"gitOperation"})
+# without re-parsing stdout; not surfaced to the model". `bashEditDiff`
+# (2.1.287) is the harness's per-file diff of what the command changed, for
+# the terminal and for PostToolUse hooks; the mapper does not destructure it
+# either, and its schema note ends "not surfaced to the model". Unclassified,
+# it withheld every ingress command that also edited a tracked file. Both
+# are still redacted: everything is.
+NON_MODEL_FACING_FIELDS = frozenset({"gitOperation", "bashEditDiff"})
 
 # `structuredContent` does not sit beside stdout. It REPLACES the entire
 # tool result the model reads — the first line of the same mapper is
@@ -411,6 +415,7 @@ OPTIONAL_RESULT_FIELDS = {
     "staleReadFileStateHint": str,
     "ghRateLimitHint": str,
     "gitOperation": dict,
+    "bashEditDiff": dict,
 }
 
 
