@@ -51,8 +51,8 @@ def main():
             f"Date-check notice: the weekly date check could not read Google Calendar "
             f"(last run {state.get('last_checked', '?')}): {calendar_error}. "
             f"Mention this to the user in one brief sentence at a natural moment; "
-            f"fixing it is ~/.claude/date-check.sh / gcal-check.py (missing token → "
-            f"run ~/.claude/gcal-auth.py interactively)."
+            f"fixing it is ~/.claude/date-check.sh / gcal-check.py (the feed URL is "
+            f"the agenix secret gcal-ical-url in nixos-config)."
         )
         emit(context, state, session_id)
         return
