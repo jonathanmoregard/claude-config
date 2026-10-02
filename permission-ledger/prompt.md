@@ -162,6 +162,7 @@ Each group:
 | `first_seen` / `last_seen` | string | RFC3339 timestamps of the earliest and latest occurrence. |
 | `samples` | array of strings | See below. |
 | `suggestions` | array of objects | Claude Code's own proposed rules, deduped, at most 10, each `{"toolName", "ruleContent", "behavior", "destination"}`. |
+| `protected_path` | boolean | See the protected-path rule in section 3. |
 | `reask` | boolean | See 1c. |
 | `prior_decision` | object | **Present only when `reask` is true.** See 1c. |
 
@@ -351,6 +352,22 @@ Applying the tests:
   The proposal must name the existing rule verbatim, say exactly why it misses,
   and give the corrected form. If no such rule exists, this is not a
   `rule-bug` — classify it as one of the other three.
+
+- **Protected paths — no rule can be the fix.** A group with
+  `protected_path: true` has a `.claude` or `.git` directory component in its
+  path (below the user config root `~/.claude`, which is not gated). Claude
+  Code gates those directories in a layer *outside* `permissions.allow`/`deny`:
+  no allow rule silences the prompt, whatever its glob, and even
+  `acceptEdits` does not. So never propose an `allow` rule for such a group, and
+  do not call it `rule-bug` because an existing glob "should have matched".
+  Classify by the usual tests (normally `bad-config` or `sensitive`), and
+  write the `## Proposed change` as: relocate or rename the path out of the
+  protected component, or accept the prompt as the cost — stating plainly that
+  a permission rule will not help. Separately, a group under
+  `~/.claude/skills/<name>` that prompts despite sibling `Read`/`Edit` rules is
+  usually a symlink into another repository whose target lies outside the
+  allowed roots; name that cause rather than proposing another rule for the
+  symlink path. Background: the `claude-code-permissions` skill.
 
 Rank the classified groups by `count` descending — the digest already arrives
 in that order, so this is a check, not a sort. Take the top 5. Discard the rest
