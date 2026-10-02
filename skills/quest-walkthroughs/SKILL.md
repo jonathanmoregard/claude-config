@@ -32,6 +32,7 @@ This overrides terse or compressed reply modes (e.g. caveman) for the walkthroug
 - Make security warnings playful. Secrets, card details and irreversible actions get plain, serious wording.
 - Hide a question inside the flavour text. Asks to the user stay explicit.
 - Add flavour to code, commits, PR bodies or non-walkthrough replies.
+- Use quest framing outside admin chores (registrations, signups, console/portal setup, credentials). PR reviews, merge requests, copy verdicts, design decisions and status reports stay plain.
 - Feature meat, fish, dairy or other animal products in flavour text, emojis or jokes (no 🍖🥩🍗🧀🍣, barbecue, cheese boards). Use plant-based food, fika, picnics, walks and games instead.
 
 ## Example
