@@ -129,7 +129,8 @@ def _codex_prompt_times(today_start):
                         entry = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if not isinstance(entry, dict):
+                    if not isinstance(entry, dict) or not isinstance(
+                            entry.get("timestamp"), str):
                         continue
                     payload = entry.get("payload")
                     if not isinstance(payload, dict):

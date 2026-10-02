@@ -162,6 +162,22 @@ def test_codex_rollout_being_written_does_not_crash():
     assert _close(_hours(setup), WINDOW_H)
 
 
+def test_codex_line_with_non_string_timestamp_is_skipped():
+    """A user_message whose timestamp is not a string is skipped; the valid
+    prompts around it still count."""
+    for ts in (123, 1.5, ["2026"], {"t": 1}, True):
+        def setup(c, x, b, ts=ts):
+            _codex_rollout(x, "tui", "cli", [b, b + timedelta(minutes=20)])
+            f = next(x.rglob("rollout-tui.jsonl"))
+            with open(f, "a") as fh:
+                fh.write(json.dumps({
+                    "timestamp": ts, "type": "event_msg",
+                    "payload": {"type": "user_message", "message": "x"},
+                }) + "\n")
+        total = _hours(setup)
+        assert _close(total, 2 * WINDOW_H), (ts, total)
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
