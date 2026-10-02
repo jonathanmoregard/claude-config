@@ -11,6 +11,13 @@ Active time is computed from real user prompts only: each prompt claims a
 5-minute forward window; overlapping windows merge; gaps > 5 minutes between
 prompts count as a break. On any trigger the user is also nudged to do
 breathwork. Late/marathon and continuous triggers have independent cooldowns.
+
+The hook's output is an instruction to the model, not the nudge itself, so it
+spells out how the nudge must reach the user: its own line, the trigger named,
+the word "breathwork" kept, the practice named in the user's own words:
+"wim hof breathwork (or a minute of mindful breathing if in a rush)" — no
+breathing instructions (2026-10-02). A vague instruction got relayed as "a
+short breath pause", which the user read as noise.
 """
 import json
 import sys
@@ -192,9 +199,13 @@ def main():
 
     print(
         " ".join(reasons)
-        + " Gently remind the user — their wellbeing goals include mindful"
-        " breaks and not marathoning. Recommend a short breathwork pause."
-        " This is a nudge, not an order."
+        + " Relay this to the user as a wellbeing nudge on its own line, stated"
+        " plainly: name the trigger (hours active today, after 20:00, or the"
+        " unbroken block) and suggest, in these words, 'wim hof breathwork (or"
+        " a minute of mindful breathing if in a rush)'. No instructions on how"
+        " to breathe. Do not soften it to 'take a breath' or 'a short pause', do"
+        " not paraphrase 'breathwork' away, and do not fold it into another"
+        " sentence. It is a nudge, not an order: one clear line, then carry on."
     )
 
 
