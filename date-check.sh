@@ -79,9 +79,9 @@ print('Winter' if m in (12,1,2) else 'Spring' if m in (3,4,5) else 'Summer' if m
 ")
 
 # ── Check Google Calendar (shell-side, no MCP needed) ────────────────────────
-# The Google client libraries come from the system-pinned nixpkgs; the bare
+# The iCal parsing libraries come from the system-pinned nixpkgs; the bare
 # python3 on PATH does not have them. Absolute nix path: cron's PATH is minimal.
-GCAL_PYTHON='let p = (builtins.getFlake "nixpkgs").legacyPackages.${builtins.currentSystem}; in p.python3.withPackages (ps: [ ps.google-api-python-client ps.google-auth ])'
+GCAL_PYTHON='let p = (builtins.getFlake "nixpkgs").legacyPackages.${builtins.currentSystem}; in p.python3.withPackages (ps: [ ps.icalendar ps.recurring-ical-events ])'
 GCAL_RESULT=$(/run/current-system/sw/bin/nix shell --impure --expr "$GCAL_PYTHON" \
   -c python3 "$HOME/.claude/gcal-check.py" --partner "$PARTNER" --days 31 2>/dev/null \
   || echo "GCAL_ERROR: gcal-check.py failed")
