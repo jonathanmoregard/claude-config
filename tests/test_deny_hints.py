@@ -179,6 +179,29 @@ def test_hook_denies_exactly_when_settings_would():
             assert r in reason, (cmd, r)
 
 
+# Shapes the operator-split model mis-parses, so it would deny where the CLI's
+# real shell parser does not. Every entry was measured ALLOWED by a live
+# `claude -p` (2.1.288) carrying the full settings.json Bash deny list and no
+# hooks, and DENIED by this hook before the fix (2026-10-02, PR #100 empirical
+# verification): heredoc bodies, comments, and ANSI-C `$'...'` quoting. The
+# hook must stand aside on them — the stock deny still lands wherever the
+# CLI really denies.
+_CLI_ALLOWS_MODEL_DENIES = [
+    "cat > y.sh <<'EOF'\nsudo systemctl restart foo\nEOF",
+    "cat > x.sh <<'EOF'\nset -e\nrm -rf \"$tmpdir\"\nEOF",
+    "cat > msg.txt <<'EOF'\nfix thing\n\ndd if=a of=b was wrong\nEOF",
+    "git commit -F - <<EOF\nwhy\n\nsudo is no longer needed\nEOF",
+    "echo hi # ; sudo -n true",
+    "ls\n# then: git reset --hard HEAD",
+    "echo $'a\\'; sudo -n true'",
+]
+
+
+def test_never_denies_where_the_cli_parser_allows():
+    for cmd in _CLI_ALLOWS_MODEL_DENIES:
+        assert _hook_reason(cmd) is None, cmd
+
+
 def test_uncurated_rule_gets_generic_attribution_without_licence_to_evade():
     reason = _hook_reason("dd if=/dev/zero of=x")
     assert "Bash(dd *)" in reason

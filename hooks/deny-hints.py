@@ -203,12 +203,19 @@ def _rule_fires(content: str, command: str, subs: list[str]) -> bool:
     )
 
 
-def _subcommands(command: str) -> list[str]:
+def _subcommands(command: str) -> list[str] | None:
     """Quote-aware split on ``&&``, ``||``, ``;``, ``|``, ``&``, newline.
 
     Same walk as ``bash-guard.py``'s ``_split_operators``, which the
     ``matched_by`` model uses; quoted operators stay inside their token, so
     an operator in a commit message does not fabricate a subcommand.
+
+    Returns None — stand aside, let settings speak — for shapes this walk
+    mis-parses into subcommands the CLI's real shell parser never sees:
+    heredoc bodies (``<<``), comments (``#`` at a word start) and ANSI-C
+    ``$'...'`` quoting. Measured 2026-10-02 against a live CLI: each of
+    those turned a line of data into a "subcommand" and the hook denied a
+    command settings allows — i.e. became new policy.
     """
     parts: list[str] = []
     current: list[str] = []
@@ -221,10 +228,16 @@ def _subcommands(command: str) -> list[str]:
             i += 2
             continue
         if ch == "'" and not in_double:
+            if not in_single and i > 0 and command[i - 1] == "$":
+                return None  # ANSI-C quoting: `\'` does not close it
             in_single = not in_single
         elif ch == '"' and not in_single:
             in_double = not in_double
         elif not in_single and not in_double:
+            if command[i : i + 2] == "<<":
+                return None  # heredoc body is data, not commands
+            if ch == "#" and (i == 0 or command[i - 1] in " \t\n;|&("):
+                return None  # comment runs to end of line
             if command[i : i + 2] in ("&&", "||"):
                 parts.append("".join(current).strip())
                 current = []
@@ -265,6 +278,8 @@ def main() -> int:
             return 0
         deny = json.loads(SETTINGS.read_text())["permissions"]["deny"]
         subs = _subcommands(command)
+        if subs is None:
+            return 0
         fired: list[str] = []
         for rule in deny:
             content = _rule_content(rule)
