@@ -647,9 +647,12 @@ fi
 _pipeline_reason=""
 if reflect_truthy "${CLAUDE_PIPELINE_INTERNAL:-}"; then
   _pipeline_reason="sentinel"
-else
+elif [[ -n "$CWD" ]]; then
+  # Lexical normalization (-s: no symlink resolution, -m: need not exist) so a
+  # `..` segment cannot make a work dir textually start under a machine dir.
+  _norm_cwd="$(realpath -m -s -- "$CWD" 2>/dev/null || printf '%s' "$CWD")"
   for _machine_dir in "$HOME/.claude/step-back" "$HOME/.claude/homunculus"; do
-    if [[ "$CWD/" == "$_machine_dir/"* ]]; then
+    if [[ "$_norm_cwd/" == "$_machine_dir/"* ]]; then
       _pipeline_reason="machine_cwd"
       break
     fi

@@ -1119,6 +1119,15 @@ jq -cn --arg sid "$PIPE_CTRL_SID" --arg tp "$PARENT_TRANSCRIPT" --arg cwd "$PIPE
 wait_terminal "$REFLECT_ROOT/sessions/$PIPE_CTRL_SID/manifest.json" sessionend
 assert $? "a work session in ~/.claude/step-backup with CLAUDE_PIPELINE_INTERNAL=0 is reflected"
 
+t_begin "P1 control: a cwd that only textually starts under step-back still reflects"
+reset_logs
+PIPE_DOT_SID="8ea0c109-1a2b-4c3d-9e8f-0000000000a5"
+jq -cn --arg sid "$PIPE_DOT_SID" --arg tp "$PARENT_TRANSCRIPT" --arg cwd "$PIPE_HOME/.claude/step-back/../step-backup" \
+  '{session_id:$sid, transcript_path:$tp, cwd:$cwd, hook_event_name:"SessionEnd", reason:"other"}' \
+  | env HOME="$PIPE_HOME" bash "$REFLECT_SH" sessionend
+wait_terminal "$REFLECT_ROOT/sessions/$PIPE_DOT_SID/manifest.json" sessionend
+assert $? "a step-back/../step-backup cwd is normalized before the prefix test"
+
 # ===========================================================================
 # T2 — syntax + lint
 # ===========================================================================
