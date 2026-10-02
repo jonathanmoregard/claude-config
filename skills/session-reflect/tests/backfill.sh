@@ -120,9 +120,15 @@ jqe '.open == false and .reason == "budget_cap"' <<<"$(gate "$(quota_json 10 0 o
 # --- drain fixtures -------------------------------------------------------
 # drop <sid> <started_at> [attempts] — a quota-dropped sessionend, as the live
 # corpus records it, with a transcript carrying the session's cwd.
+# [entrypoint] [cwd] shape the transcript the way Claude Code writes it: a
+# leading queue-operation line without either field, then lines carrying both.
 drop() {
-  local sid="$1" at="$2" n="${3:-0}" tp="$PROJECTS_DIR/$1.jsonl"
-  jq -cn --arg cwd "$PROJECT" '{type:"user",cwd:$cwd,message:{role:"user",content:"fixture"}}' > "$tp"
+  local sid="$1" at="$2" n="${3:-0}" ep="${4:-cli}" cwd="${5:-$PROJECT}" tp="$PROJECTS_DIR/$1.jsonl"
+  {
+    printf '%s\n' '{"type":"queue-operation","operation":"enqueue"}'
+    jq -cn --arg cwd "$cwd" --arg ep "$ep" \
+      '{type:"user",entrypoint:$ep,cwd:$cwd,message:{role:"user",content:"fixture"}}'
+  } > "$tp"
   mkdir -p "$REFLECT_ROOT/sessions/$sid"
   jq -cn --arg sid "$sid" --arg tp "$tp" --arg at "$at" --argjson n "$n" '
     {session_id:$sid, source_transcript:$tp, hook_event_name:"SessionEnd", parent_session_id:null,
@@ -254,6 +260,47 @@ run_drain
 ! grep -q '^=== codex ===' "$STUB_ARGV_LOG"; assert $? "no codex call"
 [[ "$(st "$B")" == complete ]]; assert $? "the Claude drop behind it still drains"
 unset CODEX_HOME
+
+t_begin "D9: machine sessions are excluded before dispatch, permanently"
+# The live backlog is headless pipeline runs (homunculus observer, drift
+# analyzer, ledger evaluator, RSI review); reflecting them feeds the review its
+# own telemetry. Interactive sessions are the ones worth recovering.
+reset_root; set_quota 40 0
+SLEEPS="$SCRATCH/sleeps"; : > "$SLEEPS"
+cat > "$STUB_DIR/sleep-log" <<SL
+#!/usr/bin/env bash
+echo "\$1" >> "$SLEEPS"
+SL
+chmod +x "$STUB_DIR/sleep-log"
+drop "$A" 2026-09-08T20:00:00Z 0 sdk-cli
+drop "$B" 2026-09-09T20:00:00Z 0 cli "$HOME/.claude/homunculus/projects/x"
+drop "$C" 2026-09-10T20:00:00Z 0 cli "$HOME/.claude/step-back"
+drop "$D" 2026-09-11T20:00:00Z 0 cli
+REFLECT_BACKFILL_SLEEP_CMD="$STUB_DIR/sleep-log" run_drain
+for s in "$A" "$B" "$C"; do
+  jqe '.modes.sessionend.backfill_skip == "machine_session" and .modes.sessionend.status == "error"' \
+    "$REFLECT_ROOT/sessions/$s/manifest.json"; assert $? "machine drop $s marked backfill_skip, never dispatched"
+  [[ "$(att "$s")" == 0 ]]; assert $? "no attempt spent on $s"
+done
+[[ "$(st "$D")" == complete ]]; assert $? "the interactive drop is still recovered"
+(( $(calls) == 1 )); assert $? "one model call, for the interactive drop only ($(calls))"
+(( $(wc -l < "$SLEEPS") == 1 )); assert $? "pace sleep only after the item that made a call ($(wc -l < "$SLEEPS") sleeps)"
+[[ -z "$(bash -c "source '$BACKFILL_SH'; backfill_candidates")" ]]; assert $? "excluded drops are not rescanned"
+
+t_begin "D10: a SIGTERM'd drain records a non-zero exit"
+reset_root; set_quota 40 0; drop "$A" 2026-09-08T20:00:00Z
+cat > "$SCRATCH/bin-slow-claude" <<'SC'
+#!/usr/bin/env bash
+cat >/dev/null; exec sleep 30
+SC
+mkdir -p "$SCRATCH/bin-slow"; install -m 755 "$SCRATCH/bin-slow-claude" "$SCRATCH/bin-slow/claude"
+# setsid: own process group, signalled as a whole the way systemd signals a cgroup.
+PATH="$SCRATCH/bin-slow:$PATH" setsid bash "$BACKFILL_SH" 2>/dev/null &
+DRAIN_PID=$!
+for _ in $(seq 1 100); do jqe '.modes.sessionend.status == "started"' "$REFLECT_ROOT/sessions/$A/manifest.json" && break; sleep 0.1; done
+kill -TERM -- "-$DRAIN_PID"; wait "$DRAIN_PID" 2>/dev/null
+jqe '.status == "error" and .exit_code != 0' <<<"$(last)"; assert $? "killed run recorded as error with non-zero exit ($(last))"
+pkill -f "$SCRATCH/bin-slow/claude" 2>/dev/null || true
 
 t_begin "T: syntax"
 bash -n "$BACKFILL_SH"; assert $? "bash -n backfill.sh"

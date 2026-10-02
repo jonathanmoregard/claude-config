@@ -149,11 +149,35 @@ backfill_candidates() {
         | select($m.status == "error"
                  and ($m.api_error_status == 429 or $m.quota_backfill_origin == 429)
                  and ($m.source_client // "claude") == "claude"
-                 and (($m.quota_backfill_attempts // 0) < $max))
+                 and (($m.quota_backfill_attempts // 0) < $max)
+                 and ($m.backfill_skip // null) == null)
         | [($m.started_at // ""), (.session_id // ""), (.source_transcript // "")]
         | @tsv' 2>/dev/null \
     | LC_ALL=C sort \
     | cut -f2-
+}
+
+# backfill_machine_session <transcript> — prints why a dropped session is a
+# machine (pipeline) run, or nothing for an interactive one. Read off the
+# transcript the same way the dispatcher's eligibility rule reads the payload:
+#   * entrypoint `sdk-cli` — a headless `claude -p` run (homunculus observer,
+#     drift analyzer, ledger evaluator, RSI review); interactive sessions are `cli`;
+#   * cwd under a machine-owned state dir (step-back classifier, homunculus).
+# Reflecting these feeds the daily review its own pipeline telemetry.
+backfill_machine_session() {
+  local tp="$1" ep cwd d
+  ep="$(grep -m1 -o '"entrypoint":"[^"]*"' "$tp" 2>/dev/null | cut -d'"' -f4 || true)"
+  if [[ "$ep" == sdk-cli ]]; then
+    printf 'entrypoint=sdk-cli'
+    return 0
+  fi
+  cwd="$(grep -m1 -o '"cwd":"[^"]*"' "$tp" 2>/dev/null | cut -d'"' -f4 || true)"
+  for d in "$HOME/.claude/step-back" "$HOME/.claude/homunculus"; do
+    if [[ -n "$cwd" && "$cwd/" == "$d/"* ]]; then
+      printf 'cwd=%s' "$cwd"
+      return 0
+    fi
+  done
 }
 
 # backfill_next_candidate — first candidate whose transcript is still readable
@@ -161,7 +185,7 @@ backfill_candidates() {
 # the NEXT run; retrying it straight away would spend all its attempts at once).
 declare -A _BF_TRIED=()
 backfill_next_candidate() {
-  local sid tp
+  local sid tp machine
   while IFS=$'\t' read -r sid tp; do
     is_valid_sid "$sid" || continue
     [[ -z "${_BF_TRIED[$sid]:-}" ]] || continue
@@ -171,6 +195,14 @@ backfill_next_candidate() {
     # budget this gate did not read.
     [[ "$(reflect_transcript_client "$tp")" == claude ]] || continue
     [[ -f "$REFLECT_ROOT/sessions/$sid/manifest.json" ]] || continue
+    machine="$(backfill_machine_session "$tp")"
+    if [[ -n "$machine" ]]; then
+      # Marked permanently: the candidate query never offers it again, and no
+      # attempt, dispatch or pace sleep is spent on it.
+      write_manifest "$REFLECT_ROOT/sessions/$sid/manifest.json" "$sid" "sessionend" "error" \
+        "$(jq -cn --arg d "$machine" '{backfill_skip:"machine_session", backfill_skip_detail:$d}')" || true
+      continue
+    fi
     printf '%s\t%s\n' "$sid" "$tp"
     return 0
   done < <(backfill_candidates)
@@ -281,6 +313,10 @@ backfill_main() {
   _BF_STARTED_AT="$started_at"
   _BF_FINISHED=0
   trap backfill_on_exit EXIT
+  # A signal must end the run with a non-zero status for the crash record
+  # (systemd stop or TimeoutStartSec sends SIGTERM to the whole cgroup).
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
 
   while :; do
     backfill_gate; gate="$_BF_GATE"
@@ -312,7 +348,8 @@ backfill_main() {
     backfill_log "sid=$sid -> $result"
     case "$result" in
       recovered) recovered=$(( recovered + 1 )) ;;
-      declined)  declined=$(( declined + 1 )) ;;
+      # Declined by the dispatcher: no model call was made, so no pacing gap.
+      declined)  declined=$(( declined + 1 )); continue ;;
       quota)     reason="budget_cap_hit"; break ;;
       *)         failed=$(( failed + 1 )) ;;
     esac

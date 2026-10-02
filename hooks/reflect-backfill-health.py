@@ -27,7 +27,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
-HUNG_AFTER_S = 4 * 3600   # the unit's RuntimeMaxSec is 3h
+HUNG_AFTER_S = 4 * 3600   # the unit's TimeoutStartSec is 3h
 LOG_HINT = "journalctl --user -u session-reflect-backfill"
 
 
