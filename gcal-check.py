@@ -130,7 +130,9 @@ def main():
         # as an override with STATUS:CANCELLED, so filter those below.
         events = recurring_ical_events.of(cal).between(today, today + timedelta(days=args.days))
     except Exception as e:
-        print(f"GCAL_ERROR: could not parse calendar: {type(e).__name__}: {e}")
+        # Type only: icalendar quotes the offending line, and a non-iCal
+        # body (e.g. a Google sign-in page) can embed the feed URL.
+        print(f"GCAL_ERROR: could not parse calendar ({len(raw)} bytes): {type(e).__name__}")
         return
 
     date_events = sorted(
