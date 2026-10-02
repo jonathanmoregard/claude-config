@@ -1914,6 +1914,79 @@ def _check_nixos_push(command: str, cwd: str | None) -> str | None:
 
 
 # ----------------------------------------------------------------------
+# Layer 5: foreground CI polling
+# ----------------------------------------------------------------------
+# `sleep N; gh pr checks X` in the foreground holds the turn for N seconds and
+# then returns a snapshot that is usually "still pending", so it gets re-issued
+# turn after turn: measured 2026-09-12 at 12-19 polls per wait on NixOS VM
+# suites, and still live 2026-10-02 (`sleep 20/40/150; gh pr checks …`). gh
+# ships the blocking primitive; run in the background, the harness re-invokes
+# the session when it exits, so one call replaces the whole loop. A single
+# status look (no sleep) is fine and stays allowed.
+_SHELL_KEYWORDS = frozenset({"do", "then", "else", "while", "until", "if", "!", "{", "(", "time"})
+
+_CI_POLL_HINT = (
+    "bash-guard: foreground CI poll denied — `sleep` plus a one-shot CI status "
+    "snapshot (`gh pr checks` / `gh run view|list` / statusCheckRollup) holds the "
+    "turn and still returns a snapshot, so it gets repeated: a hand-rolled wait "
+    "loop.\n"
+    "Use the blocking primitive, with Bash run_in_background: true — you are "
+    "re-invoked when it exits:\n"
+    "  gh pr checks <PR> --watch --fail-fast\n"
+    "  gh run watch <RUN_ID> --exit-status\n"
+    "Checks not registered yet right after a push? Keep the delay in front of the "
+    "watch: `sleep 20; gh pr checks <PR> --watch --fail-fast` (background). "
+    "Same for fetching a fresh run id after a push.\n"
+    "Long or must survive /clear: scheduling-follow-through (durable CronCreate). "
+    "A single status look without `sleep` is allowed."
+)
+
+
+def _segment_tokens(segment: str) -> list[str]:
+    try:
+        toks = shlex.split(segment)
+    except ValueError:
+        toks = segment.split()
+    while toks and toks[0] in _SHELL_KEYWORDS:
+        toks = toks[1:]
+    return toks
+
+
+def _is_ci_snapshot(toks: list[str]) -> bool:
+    if len(toks) < 3 or toks[0] != "gh":
+        return False
+    if "--watch" in toks:
+        return False
+    sub = toks[1:3]
+    if sub == ["pr", "checks"] or sub == ["run", "view"] or sub == ["run", "list"]:
+        return True
+    return sub == ["pr", "view"] and any("statusCheckRollup" in t for t in toks)
+
+
+def _check_ci_poll(command: str, background: bool) -> str | None:
+    if background:
+        return None
+    has_sleep = has_snapshot = False
+    segments = _pipeline_subcommands(command)
+    # `s=$(gh pr checks 9 | grep -c pending)` inside a loop is the same poll.
+    for body in _command_substitutions(command):
+        segments.extend(_pipeline_subcommands(body))
+    for seg in segments:
+        toks = _segment_tokens(seg)
+        if not toks:
+            continue
+        if toks[0] == "sleep":
+            has_sleep = True
+        elif toks[:3] == ["gh", "run", "watch"] or (toks[:1] == ["gh"] and "--watch" in toks):
+            # The blocking primitive is in the command; a snapshot after it
+            # just prints the settled result.
+            return None
+        elif _is_ci_snapshot(toks):
+            has_snapshot = True
+    return _CI_POLL_HINT if has_sleep and has_snapshot else None
+
+
+# ----------------------------------------------------------------------
 def main() -> int:
     if not _TIMEOUTS_SANE:
         _fail_closed(
@@ -1967,6 +2040,8 @@ def main() -> int:
         reason = _check_nixos_push(command, cwd if isinstance(cwd, str) else None)
         if reason is not None:
             reason = "bash-guard: " + reason
+    if reason is None:
+        reason = _check_ci_poll(command, tool_input.get("run_in_background") is True)
 
     _disarm_watchdog()
     if reason is not None:
