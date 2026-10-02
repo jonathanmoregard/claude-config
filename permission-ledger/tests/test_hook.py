@@ -524,6 +524,11 @@ class TestRedaction(unittest.TestCase):
             "anthropic-oauth": "sk-" + "ant-oat01-" + "Qw9-rT_7" * 12 + "AA",
             "openai-project": "sk-" + "proj-" + "Zx8_cV-2nM" * 15,
             "openai-svcacct": "sk-" + "svcacct-" + "Lk4-jH_6gF" * 15,
+            # Claude Code's OAuth refresh token and claude.ai session keys share
+            # the sk-ant-<kind>NN- shape; the rule must not enumerate kinds.
+            "anthropic-oauth-refresh": "sk-" + "ant-ort01-" + "Pm2_wE-8" * 12 + "AA",
+            "anthropic-session": "sk-" + "ant-sid01-" + "Hy5-uI_3" * 12 + "AA",
+            "openai-user": "sk-" + "None-" + "Rt6_yU-1oP" * 15,
         }
         # Contexts where the key is glued to a preceding word character, so a
         # leading \b never fires: an escaped newline in a literal, a URL-encoded

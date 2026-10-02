@@ -95,8 +95,10 @@ REDACTIONS = [
     # enough to match mid-word, and keys glued to a word character (`\nsk-...`
     # in a printf literal, `%3Dsk-...` in a URL) otherwise slip past the generic
     # rule below -- and their '-'/'_'-broken bodies past the high-entropy rule.
-    (re.compile(r"sk-ant-(?:api|oat|admin)\d{2}-[A-Za-z0-9_-]{20,}"), "[REDACTED:api-key]"),
-    (re.compile(r"sk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{40,}"), "[REDACTED:api-key]"),
+    # The Anthropic kind is not enumerated: api03/oat01/admin01 plus the OAuth
+    # refresh token (ort01) and claude.ai session key (sid01) share the shape.
+    (re.compile(r"sk-ant-[a-z]{2,8}\d{2}-[A-Za-z0-9_-]{20,}"), "[REDACTED:api-key]"),
+    (re.compile(r"sk-(?:proj|svcacct|admin|None)-[A-Za-z0-9_-]{40,}"), "[REDACTED:api-key]"),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{12,}"), "[REDACTED:api-key]"),
     (re.compile(r"\bAKIA[0-9A-Z]{12,}"), "[REDACTED:aws-key]"),
     (re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{8,}"), "[REDACTED:slack-token]"),
