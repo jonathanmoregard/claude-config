@@ -84,6 +84,7 @@ module refuses to run if the ordering ever inverts, and
 """
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import re
@@ -1250,7 +1251,11 @@ def _check_bg_status_masked(command: str, background: bool) -> str | None:
 #   * `Override: [skip-vm-gate] <reason>` still bypasses. It is not an
 #     agent-reachable env var — it goes in the commit message and stays
 #     readable in `git log` after the merge, which is the point.
-#   * Pushing `main` itself is not gated (branch-protected upstream).
+#
+# What is deliberately TIGHTENED (K01, 2026-10-03): safe-bash let any push
+# from a checkout on `main` through as "branch-protected upstream". The
+# upstream protection does not bind admins, so every push whose destination
+# is main is now refused outright — see `_nixos_push_to_main_reason`.
 #
 # What is deliberately INVERTED from safe-bash: every way the gate could
 # fail to reach a verdict used to return "allow" — a failed `git diff` left
@@ -1802,6 +1807,120 @@ def _nixos_parse_checklist(commit_msg: str) -> _ChecklistParse | None:
     return fields
 
 
+# K01 (security review 2026-10-03): nixos-config `main` is fetched and
+# activated as root by nixos-auto-deploy, and the upstream protection does not
+# bind admins (enforce_admins=false), so "pushing main is branch-protected
+# upstream" was not a control: a direct push skipped every required check.
+# Every push whose DESTINATION is main is refused here, before the checklist
+# and before `Override: [skip-vm-gate]`, which is a vm-gate bypass and never a
+# licence to skip review. Main changes land through a pull request.
+_NIXOS_PROTECTED_BRANCH = "main"
+# `git push` options that consume the NEXT argument as their value.
+_GIT_PUSH_VALUE_OPTS = frozenset({"-o", "--push-option", "--repo", "--receive-pack", "--exec"})
+# Options that push every local branch, main included.
+_GIT_PUSH_EVERY_BRANCH_OPTS = frozenset({"--all", "--mirror", "--branches"})
+_NIXOS_MAIN_PUSH_HELP = (
+    "nixos push gate: this push would update nixos-config `main` directly "
+    "({why}).\n\n"
+    "main auto-deploys as root, and the upstream branch protection does not "
+    "bind admins, so a direct push skips every required check. Push a feature "
+    "branch and open a pull request instead: from a "
+    "~/Repos/nixos-config-worktrees/<slug> worktree, `git push -u origin "
+    "<branch>`, then `gh pr create`.\n"
+    "There is no override: `Override: [skip-vm-gate]` does not apply to main."
+)
+
+
+def _nixos_push_arg_lists(command: str) -> list[list[str]]:
+    """The arguments after `push` for every real (non-dry-run) git push."""
+    out: list[list[str]] = []
+    for sub in _nixos_pipeline_subcommands(command):
+        effective = re.split(r"(?:^|\s)#", sub, maxsplit=1)[0]
+        if not re.search(r"\bgit\s+(?:-C\s+\S+\s+)?(?:[\w.-]+(?:=\S+)?\s+)*push\b", effective):
+            continue
+        if re.search(r"(?:^|\s)--dry-run(?:\s|$)", effective):
+            continue
+        try:
+            toks = shlex.split(effective)
+        except ValueError:
+            toks = effective.split()
+        git_at = next((i for i, t in enumerate(toks) if os.path.basename(t) == "git"), None)
+        if git_at is None or "push" not in toks[git_at + 1:]:
+            continue
+        out.append(toks[toks.index("push", git_at + 1) + 1:])
+    return out
+
+
+def _nixos_ref_is_main(dst: str) -> bool:
+    if "*" in dst:  # glob refspec, e.g. refs/heads/*:refs/heads/*
+        return fnmatch.fnmatchcase("refs/heads/" + _NIXOS_PROTECTED_BRANCH, dst)
+    for prefix in ("refs/heads/", "heads/"):
+        if dst.startswith(prefix):
+            return dst[len(prefix):] == _NIXOS_PROTECTED_BRANCH
+    return dst == _NIXOS_PROTECTED_BRANCH
+
+
+def _nixos_default_push_dst(worktree: str, branch: str) -> str:
+    """Where a refspec-less push sends the current branch, per git itself."""
+    rc, mode, _ = _nixos_git(worktree, ["config", "--get", "push.default"])
+    if rc == 0 and mode.strip() == "matching":
+        return _NIXOS_PROTECTED_BRANCH  # every same-named branch, main included
+    rc, ref, _ = _nixos_git(worktree, ["rev-parse", "--symbolic-full-name", "@{push}"])
+    ref = ref.strip()
+    if rc == 0 and ref.startswith("refs/remotes/"):
+        return ref.split("/", 3)[3] if ref.count("/") >= 3 else ref
+    return branch
+
+
+def _nixos_push_to_main_reason(command: str, worktree: str, branch: str) -> str | None:
+    """Why this command would update main, or None if no push lands there."""
+    for args in _nixos_push_arg_lists(command):
+        positional: list[str] = []
+        flags: set[str] = set()
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--":
+                positional.extend(args[i + 1:])
+                break
+            if a.startswith("-") and a != "-":
+                name = a.split("=", 1)[0]
+                if name in _GIT_PUSH_EVERY_BRANCH_OPTS:
+                    return f"`{a}` pushes every branch, main included"
+                flags.add(name)
+                if not a.startswith(("--", "-o")) and "d" in a[1:]:
+                    flags.add("--delete")  # -d, or bundled like -fd
+                takes_next = name in _GIT_PUSH_VALUE_OPTS and "=" not in a and (
+                    a.startswith("--") or a == "-o"
+                )
+                i += 2 if takes_next else 1
+                continue
+            positional.append(a)
+            i += 1
+        refspecs = positional[1:]
+        if not refspecs:
+            if flags & {"--tags", "-d", "--delete"}:
+                continue
+            dst = _nixos_default_push_dst(worktree, branch)
+            if _nixos_ref_is_main(dst):
+                return f"a push without a refspec sends branch {branch!r} to {dst!r}"
+            continue
+        for spec in refspecs:
+            s = spec.lstrip("+")
+            if "--delete" in flags:
+                dst = s
+            elif ":" in s:
+                src, dst = s.split(":", 1)
+                dst = dst or src
+            else:
+                dst = s
+            if dst in ("HEAD", "@"):
+                dst = branch
+            if _nixos_ref_is_main(dst):
+                return f"refspec `{spec}` targets main"
+    return None
+
+
 def _check_nixos_push(command: str, cwd: str | None) -> str | None:
     """Gate `git push` of a nixos-config branch.
 
@@ -1820,8 +1939,14 @@ def _check_nixos_push(command: str, cwd: str | None) -> str | None:
     if not worktree:
         return None
     rc, branch, _ = _nixos_git(worktree, ["branch", "--show-current"])
-    if rc == 0 and branch.strip() == "main":
-        return None  # Pushing main is already branch-protected upstream.
+    branch = branch.strip() if rc == 0 else ""
+    to_main = _nixos_push_to_main_reason(command, worktree, branch)
+    if to_main:
+        return _NIXOS_MAIN_PUSH_HELP.format(why=to_main)
+    if branch == _NIXOS_PROTECTED_BRANCH:
+        # From a main checkout, a push that does NOT land on main (a tag, or
+        # main's tip to a feature branch for a PR) keeps its old verdict.
+        return None
 
     rc, msg, err = _nixos_git(worktree, ["log", "-1", "--format=%B"])
     if rc != 0:

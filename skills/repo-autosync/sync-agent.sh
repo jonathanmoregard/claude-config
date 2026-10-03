@@ -245,7 +245,7 @@ THEN commit what is left — source, config, docs, notes. Group into logical com
 
 If you cannot tell whether something is runtime state or real content, leave it untracked and uncommitted rather than guessing — that outcome is logged for human review, not treated as a failure.
 
-After all commits are done, push origin $BRANCH once. Do nothing else."
+Do NOT push: this script secret-scans your commits and pushes them itself. Do nothing else."
 
 # Capture the agent's output as well as tee it to the log. Claude Code prints
 # "You've hit your org's monthly usage limit" and "API Error: ..." to stdout
@@ -258,7 +258,8 @@ claude_rc=0
 claude_out="$(
   "$CLAUDE" \
     --model claude-sonnet-4-6 \
-    --allowedTools "Read Bash(git status:*) Bash(git diff:*) Bash(git add:*) Bash(git commit:*) Bash(git push:*) Bash(git log:*) Bash(git rm:*) Bash(git check-ignore:*) Bash($IGNORE_TOOL:*)" \
+    --allowedTools "Read Bash(git status:*) Bash(git diff:*) Bash(git add:*) Bash(git commit:*) Bash(git log:*) Bash(git rm:*) Bash(git check-ignore:*) Bash($IGNORE_TOOL:*)" \
+    --disallowedTools "Bash(git push:*)" \
     -p "$PROMPT" 2>&1
 )" || claude_rc=$?
 printf '%s\n' "$claude_out"
@@ -289,13 +290,38 @@ fi
 # permanent red — nothing ever removes the file — so an untracked-only
 # leftover is logged, not escalated.
 tracked_dirty="$(git status --porcelain --untracked-files=no)"
-unpushed="$(git log --oneline "origin/$BRANCH..$BRANCH" 2>/dev/null || true)"
 
 if [ -n "$tracked_dirty" ]; then
   notify_failure "claude exited 0 but tracked changes are still uncommitted — sync incomplete.
 $(printf '%s\n' "$tracked_dirty" | head -20)$api_hint"
   exit 1
 fi
+
+# Scan exactly what would leave the machine, then push it ourselves. The scan
+# above saw only the files that were dirty BEFORE the agent ran; whatever the
+# agent wrote or committed afterwards was never checked, and the agent used to
+# push it itself. A repo with its own hooksPath never runs the global gitleaks
+# pre-commit hook, and `git commit --no-verify` skips it anywhere. Fail closed:
+# a scan that cannot run, or finds anything, means no push.
+if git rev-parse --verify --quiet "origin/$BRANCH" >/dev/null; then
+  outgoing_range="origin/$BRANCH..$BRANCH"
+else
+  outgoing_range="$BRANCH" # no remote branch yet: everything is outgoing
+fi
+if [ -n "$(git rev-list "$outgoing_range" 2>/dev/null | head -1)" ]; then
+  if ! gitleaks git --no-banner --redact --exit-code 1 --log-level error \
+    --log-opts="$outgoing_range" . >&2; then
+    notify_failure "gitleaks flagged the commits about to be pushed (or could not scan them) — NOT pushed.
+$(git log --oneline "$outgoing_range" | head -10)
+Remove the secret from those commits (they are local only), then re-run."
+    exit 1
+  fi
+  if ! git push origin "$BRANCH"; then
+    notify_failure "git push origin $BRANCH failed after a clean secret scan.$api_hint"
+    exit 1
+  fi
+fi
+unpushed="$(git log --oneline "origin/$BRANCH..$BRANCH" 2>/dev/null || true)"
 
 if [ -n "$unpushed" ]; then
   notify_failure "Commits were made but not pushed — origin/$BRANCH is behind.

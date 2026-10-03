@@ -95,7 +95,13 @@ notification via `notify-send`:
 | Secret scan | `gitleaks` missing, or a finding in a pending file |
 | Agent failure | `claude` exits non-zero, **or** exits 0 having printed a usage-limit / API error |
 | Incomplete sync | `claude` exits 0 but **tracked** changes are still uncommitted |
+| Outgoing secret scan | `gitleaks git` over `origin/$BRANCH..$BRANCH` flags (or cannot scan) the agent's commits; nothing is pushed |
 | Unpushed | commits made but `origin/$BRANCH` still behind |
+
+The agent only commits. The script pushes, and only after scanning the
+outgoing commits: the pre-agent scan never sees what the agent itself writes,
+and a repo with its own `core.hooksPath` (or a `--no-verify` commit) never
+runs the global gitleaks pre-commit hook.
 
 The size guard is **per-file, not aggregate** — it cannot catch a thousand
 small files, which is the actual shape of accidental runtime-state capture
@@ -121,8 +127,9 @@ trains you to ignore the notification.
 The agent runs under `--allowedTools`, not `--dangerously-skip-permissions`:
 
 ```
-Read  Bash(git status|diff|add|commit|push|log|rm|check-ignore:*)
+Read  Bash(git status|diff|add|commit|log|rm|check-ignore:*)
 Bash($REPO/.git/sync-agent-ignore:*)
+--disallowedTools Bash(git push:*)
 ```
 
 `sync-agent-ignore` is generated into `$REPO/.git/` on every run (so

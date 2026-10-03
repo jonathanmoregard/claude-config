@@ -881,6 +881,12 @@ fi  # end IS_WORKER == 0 setup block
 # body, and that body is untrusted data to every downstream consumer —
 # JSON-parsed, schema-normalised, never fed back into an interpreter.
 #
+# `--tools ""` covers BUILT-IN tools only: every configured MCP server (claude.ai
+# connectors included) was still offered, so a transcript could steer an MCP
+# call. `--strict-mcp-config` with no --mcp-config loads none. Measured
+# 2026-10-03 on 2.1.288: it also cut a fork-resume's prompt from ~140k to ~50k
+# input tokens, the MCP tool schemas being most of the difference.
+#
 # RECURSION BREAK: REFLECT_SUBPROCESS=1 in the child env so any Claude Code hook
 # the child fires (its own SessionEnd, PreCompact) detects it is inside a
 # reflection run and no-ops instead of spawning another one. REFLECT_PARENT_SID
@@ -903,7 +909,7 @@ reflect_claude_call() {
   if [[ -n "$_resume" ]]; then
     _args+=( --resume "$_resume" --fork-session )
   fi
-  _args+=( --model "$REFLECT_MODEL" --output-format json --tools "" )
+  _args+=( --model "$REFLECT_MODEL" --output-format json --tools "" --strict-mcp-config )
 
   local _cwd="${CWD:-}"
   if [[ -z "$_cwd" || ! -d "$_cwd" ]]; then

@@ -221,6 +221,12 @@ reset_logs() {
 # would print a SECOND zero and turn `(( $(call_count) == 0 ))` into a syntax error.
 call_count() { grep -c '^=== call ===' "$STUB_ARGV_LOG" 2>/dev/null || true; }
 resume_calls() { grep -c -- '--resume' "$STUB_ARGV_LOG" 2>/dev/null || true; }
+# Calls missing either half of the tool closure. The stub logs argv joined by
+# single spaces, so an empty `--tools ""` operand shows as `--tools  `.
+unclosed_calls() {
+  awk '/^=== call ===/ && !(/ --strict-mcp-config( |$)/ && / --tools  /) { n++ }
+       END { print n + 0 }' "$STUB_ARGV_LOG" 2>/dev/null || echo 0
+}
 codex_call_count() { grep -c '^=== call ===' "$STUB_CODEX_ARGV_LOG" 2>/dev/null || true; }
 
 # ---------------------------------------------------------------------------
@@ -361,6 +367,9 @@ jqe --arg t "$PARENT_TRANSCRIPT" '.modes.subagentstop.parent_transcript == $t' "
 # A3: the agent transcript is fed INLINE — no --resume, because an agent
 # transcript is not a resumable session.
 (( $(resume_calls) == 0 )); assert $? "no --resume on the subagent call ($(resume_calls) seen)"
+# K06: `--tools ""` removes built-ins only; inherited MCP servers stay offered
+# unless --strict-mcp-config drops them. Every call must carry both.
+(( $(call_count) > 0 && $(unclosed_calls) == 0 )); assert $? "inline call carries --tools \"\" + --strict-mcp-config ($(unclosed_calls) unclosed)"
 grep -qF 'FIXTURE-MARKER-AGENT-REPLY' "$STUB_PROMPT_LOG"; assert $? "agent transcript text reached the prompt"
 grep -qF 'FIXTURE-MARKER-AGENT-CONCLUSION' "$STUB_PROMPT_LOG"; assert $? "the agent's last message reached the prompt"
 grep -qF 'HEAD-OF-TOOL-RESULT' "$STUB_PROMPT_LOG"; assert $? "tool_result head excerpt is present"
@@ -521,6 +530,7 @@ fi
 jqe '(.modes.sessionend.fallback_used // false) == false' "$OK_MANIFEST"; assert $? "fallback_used is false/absent"
 (( $(call_count) == 1 )); assert $? "exactly one model call ($(call_count) seen)"
 (( $(resume_calls) == 1 )); assert $? "the resumed path was used"
+(( $(unclosed_calls) == 0 )); assert $? "resumed call carries --tools \"\" + --strict-mcp-config ($(unclosed_calls) unclosed)"
 
 # ===========================================================================
 # B2 — an oversize transcript skips the doomed primary attempt

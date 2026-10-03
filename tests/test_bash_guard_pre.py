@@ -1537,12 +1537,74 @@ check(
 # --- D9 complement: `git push origin main` from a feature branch ------
 dec, why = push_guard(w, command="git push origin main", cwd=w)
 check(
-    # safe-bash's case M4. The skip keys off the CURRENT branch, not the
-    # refspec, so a feature branch shoving itself at main is still gated.
+    # safe-bash's case M4. Since K01 the refusal names the main destination
+    # rather than the missing checklist; either way it must not pass.
     "`git push origin main` from a feature branch -> still gated",
-    dec == "deny" and "Pre-push checklist:" in why,
+    dec == "deny",
     f"decision={dec!r} {why[:200]}",
 )
+
+# --- K01: no push may land on nixos-config `main` directly ------------
+# main auto-deploys as root, and the upstream protection does not bind
+# admins, so "already branch-protected upstream" was not a control. Every
+# spelling whose DESTINATION is main is refused, whatever the checklist or
+# override says; a push to any other branch keeps its old verdict.
+_PURE = "chore: bump\n\nPre-push checklist:\n- Type: pure-data\n"
+_main_wt = make_repo()  # sits on main, upstream origin/main
+_g(_main_wt, "commit", "-q", "--allow-empty", "-m", _PURE)
+_feat_wt = branch_with(make_repo(), _PURE, {"docs/a.md": "x\n"}, branch="feat/x")
+_override_wt = branch_with(
+    make_repo(),
+    "chore: x\n\nOverride: [skip-vm-gate] emergency\n",
+    {"docs/a.md": "x\n"},
+    branch="feat/o",
+)
+_tracking_wt = make_repo()
+_g(_tracking_wt, "checkout", "-q", "-b", "feat/t", "--track", "origin/main")
+_g(_tracking_wt, "config", "push.default", "upstream")
+_g(_tracking_wt, "commit", "-q", "--allow-empty", "-m", _PURE)
+
+for _label, _wt, _cmd in [
+    ("main checkout: git push origin main", _main_wt, "git push origin main"),
+    ("main checkout: bare git push", _main_wt, "git push"),
+    ("main checkout: git push -u origin main", _main_wt, "git push -u origin main"),
+    ("main checkout: git push origin HEAD", _main_wt, "git push origin HEAD"),
+    ("feature: HEAD:main", _feat_wt, "git push origin HEAD:main"),
+    ("feature: feat/x:main", _feat_wt, "git push origin feat/x:main"),
+    ("feature: +HEAD:refs/heads/main", _feat_wt, "git push origin +HEAD:refs/heads/main"),
+    ("feature: delete main", _feat_wt, "git push origin :main"),
+    ("feature: --delete main", _feat_wt, "git push --delete origin main"),
+    ("feature: --all", _feat_wt, "git push --all origin"),
+    ("feature: --mirror", _feat_wt, "git push --mirror origin"),
+    ("feature: glob refspec", _feat_wt, "git push origin 'refs/heads/*:refs/heads/*'"),
+    ("feature: -C form", _feat_wt, f"git -C {_feat_wt} push origin HEAD:main"),
+    ("feature: second push in a chain", _feat_wt,
+     "git push origin feat/x && git push origin HEAD:main"),
+    ("override trailer does not bypass", _override_wt, "git push origin HEAD:main"),
+    ("bare push whose @{push} is main", _tracking_wt, "git push"),
+]:
+    dec, why = push_guard(_wt, command=_cmd, cwd=_wt)
+    check(
+        f"K01 {_label} -> deny (destination main)",
+        dec == "deny" and "main" in why and "pull request" in why.lower(),
+        f"decision={dec!r} {why[:200]}",
+    )
+
+for _label, _wt, _cmd in [
+    ("feature: push own branch", _feat_wt, "git push -u origin feat/x"),
+    ("feature: push HEAD", _feat_wt, "git push origin HEAD"),
+    ("feature: HEAD to another branch", _feat_wt, "git push origin HEAD:feat/y"),
+    ("feature: tags only", _feat_wt, "git push origin --tags"),
+    ("main checkout: dry run", _main_wt, "git push --dry-run origin main"),
+    ("main checkout: push a feature ref", _main_wt, "git push origin main:feat/z"),
+    ("override trailer to own branch", _override_wt, "git push origin feat/o"),
+]:
+    dec, why = push_guard(_wt, command=_cmd, cwd=_wt)
+    check(
+        f"K01 control {_label} -> allowed",
+        dec != "deny",
+        f"decision={dec!r} {why[:200]}",
+    )
 
 # --- D2: flag forms of `git push` -------------------------------------
 dec, why = push_guard(w, command="git --no-pager push origin HEAD", cwd=w)

@@ -1554,7 +1554,16 @@ def _check_nixos_push(command: str) -> Optional[str]:
         return None
     rc, branch, _ = _nixos_git(worktree, ["branch", "--show-current"])
     if rc == 0 and branch.strip() == "main":
-        return None  # Pushing main is already branch-protected upstream.
+        # K01: the broker always pushes the current branch to its same name,
+        # so this lands on main — which auto-deploys as root, and whose
+        # upstream protection does not bind admins. No checklist or
+        # Override applies; main changes go through a pull request.
+        return (
+            "nixos push gate: this push would update nixos-config `main` "
+            "directly. main auto-deploys as root and its upstream protection "
+            "does not bind admins. Push a feature branch and open a pull "
+            "request instead."
+        )
 
     rc, msg, _ = _nixos_git(worktree, ["log", "-1", "--format=%B"])
     if rc != 0:

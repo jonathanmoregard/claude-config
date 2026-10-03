@@ -879,8 +879,15 @@ def dispatch_scorer(prompt, cfg):
         models.append(scorer["fallback_model"])
     last_err = None
     for model in models:
+        # `--allowedTools` only pre-approves; it does not limit what is
+        # offered, so the scorer still had the globally allowed Bash and every
+        # MCP server while reading agent-written proposal text. `--tools`
+        # (validated against SCORER_TOOL_ALLOWLIST) is the closure and
+        # `--strict-mcp-config` drops MCP — same rail as run-evaluate.sh.
         cmd = ["claude", "--model", model, "--print",
-               "--allowedTools", scorer["allowed_tools"], "-p", prompt]
+               "--tools", scorer["allowed_tools"],
+               "--allowedTools", scorer["allowed_tools"],
+               "--strict-mcp-config", "-p", prompt]
         fd, out_path = tempfile.mkstemp(prefix="gate-scorer-stdout-",
                                         suffix=".txt")  # mkstemp: mode 0600
         try:
