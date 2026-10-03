@@ -1829,26 +1829,104 @@ _NIXOS_MAIN_PUSH_HELP = (
     "<branch>`, then `gh pr create`.\n"
     "There is no override: `Override: [skip-vm-gate]` does not apply to main."
 )
+_NIXOS_UNRESOLVED_PUSH_HELP = (
+    "nixos push gate: cannot tell where this nixos-config push lands ({why}), "
+    "so it is refused rather than guessed (a push to main must never slip "
+    "through a wrapper).\n\n"
+    "Issue the push as a plain literal command instead: "
+    "`git push <remote> <branch>` with the names written out, e.g. "
+    "`git push -u origin my-feature` — no `bash -c`/`eval`/`xargs`, no "
+    "`$VAR` and no `$(...)`."
+)
 
 
-def _nixos_push_arg_lists(command: str) -> list[list[str]]:
-    """The arguments after `push` for every real (non-dry-run) git push."""
-    out: list[list[str]] = []
-    for sub in _nixos_pipeline_subcommands(command):
-        effective = re.split(r"(?:^|\s)#", sub, maxsplit=1)[0]
-        if not re.search(r"\bgit\s+(?:-C\s+\S+\s+)?(?:[\w.-]+(?:=\S+)?\s+)*push\b", effective):
+_HEREDOC_START = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+
+# A heredoc whose body is only DATA: a commit message read by `git commit -F -`
+# (or `git tag -F -`). Any other opener (bash, python3, cat | sh, ...) may
+# execute its body.
+_HEREDOC_DATA_OPENER = re.compile(r"\bgit\s+(?:commit|tag)\b[^|;&]*\s-F\s*-(?:\s|$)")
+_GIT_PUSH_TEXT = re.compile(r"\bgit\s+(?:-C\s+\S+\s+)?(?:[\w.-]+(?:=\S+)?\s+)*push\b")
+
+
+def _strip_heredoc_bodies(command: str) -> tuple[str, bool]:
+    """Drop heredoc bodies, and say whether a push hid inside an executable one.
+
+    A commit-message body that merely MENTIONS `git push` next to `$(...)` must
+    not read as an unresolvable push: on 30 days of real nixos-config commands
+    those were the main false hit. But `bash <<EOF` / `python3 - <<EOF` run
+    their body, so a push inside one of those is reported (fail closed)."""
+    out: list[str] = []
+    ends: list[str] = []
+    data_body = False
+    hidden_push = False
+    for line in command.split("\n"):
+        if ends:
+            if line.strip() == ends[0]:
+                ends.pop(0)
+            elif not data_body and _GIT_PUSH_TEXT.search(line):
+                hidden_push = True
             continue
-        if re.search(r"(?:^|\s)--dry-run(?:\s|$)", effective):
+        out.append(line)
+        opened = [m.group(2) for m in _HEREDOC_START.finditer(line)]
+        if opened:
+            data_body = bool(_HEREDOC_DATA_OPENER.search(line))
+            ends.extend(opened)
+    return "\n".join(out), hidden_push
+
+
+def _nixos_push_shapes(command: str) -> list[tuple[str, object]]:
+    """Every git push in the command, classified for the main-destination check.
+
+    ("literal", args)    a plain `[VAR=x ...] git ... push <args>` whose args
+                         are all literal words: the destination is knowable.
+    ("unresolved", why)  a push the parser cannot see through: a shell wrapper
+                         (`bash -c`, `eval`, `xargs`, `env -S`, ...), command
+                         substitution, or a `$variable` in the git argv. These
+                         FAIL CLOSED (K01 close-out: `bash -c 'git push origin
+                         main'` reached main because the parser never saw it).
+    A literal push carrying `--dry-run` is dropped: it updates nothing.
+    """
+    out: list[tuple[str, object]] = []
+    stripped, hidden_push = _strip_heredoc_bodies(command)
+    if hidden_push:
+        out.append(("unresolved", "the push sits in a heredoc that a shell or interpreter runs"))
+    for sub in _nixos_pipeline_subcommands(stripped):
+        effective = re.split(r"(?:^|\s)#", sub, maxsplit=1)[0]
+        if not _GIT_PUSH_TEXT.search(effective):
+            continue
+        if "`" in effective or "$(" in effective or "<(" in effective:
+            out.append(("unresolved", "command substitution in the push"))
             continue
         try:
             toks = shlex.split(effective)
         except ValueError:
-            toks = effective.split()
+            out.append(("unresolved", "quoting the gate cannot parse"))
+            continue
         git_at = next((i for i, t in enumerate(toks) if os.path.basename(t) == "git"), None)
         if git_at is None or "push" not in toks[git_at + 1:]:
+            wrapper = toks[0] if toks else "a wrapper"
+            out.append(("unresolved", f"the push runs inside `{wrapper}`"))
             continue
-        out.append(toks[toks.index("push", git_at + 1) + 1:])
+        prefix = [t for t in toks[:git_at] if not _ENV_ASSIGNMENT.match(t)]
+        if prefix:
+            out.append(("unresolved", f"the push runs through `{prefix[0]}`"))
+            continue
+        if any("$" in t for t in toks[git_at:]):
+            out.append(("unresolved", "a $variable in the push"))
+            continue
+        args = toks[toks.index("push", git_at + 1) + 1:]
+        opts = args[: args.index("--")] if "--" in args else args
+        if "--dry-run" in opts or "-n" in opts:
+            continue
+        out.append(("literal", args))
     return out
+
+
+def _nixos_push_arg_lists(command: str) -> list[list[str]]:
+    """The arguments after `push` for every literal, non-dry-run git push."""
+    return [a for kind, a in _nixos_push_shapes(command) if kind == "literal"]  # type: ignore[misc]
 
 
 def _nixos_ref_is_main(dst: str) -> bool:
@@ -1933,11 +2011,17 @@ def _check_nixos_push(command: str, cwd: str | None) -> str | None:
     mechanical cross-checks to agree with the diff. Anything the gate cannot
     evaluate routes through `_fail_closed`.
     """
-    if not _nixos_command_pushes(command):
+    shapes = _nixos_push_shapes(command)
+    unresolved = [why for kind, why in shapes if kind == "unresolved"]
+    # `_nixos_command_pushes` drops any line carrying `--dry-run`; a wrapped
+    # push (`bash -c 'git push origin main' --dry-run`) must not ride on that.
+    if not _nixos_command_pushes(command) and not unresolved:
         return None
     worktree = _nixos_resolve_target_repo(command, cwd)
     if not worktree:
         return None
+    if unresolved:
+        return _NIXOS_UNRESOLVED_PUSH_HELP.format(why=unresolved[0])
     rc, branch, _ = _nixos_git(worktree, ["branch", "--show-current"])
     branch = branch.strip() if rc == 0 else ""
     to_main = _nixos_push_to_main_reason(command, worktree, branch)

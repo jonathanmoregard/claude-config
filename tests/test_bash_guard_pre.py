@@ -1590,7 +1590,36 @@ for _label, _wt, _cmd in [
         f"decision={dec!r} {why[:200]}",
     )
 
+# A push the parser cannot resolve to literal refs must fail closed: a shell
+# wrapper, eval, xargs or a substitution hides the destination from it.
 for _label, _wt, _cmd in [
+    ("main: bash -c", _main_wt, "bash -c 'git push origin main'"),
+    ("main: zsh -c", _main_wt, 'zsh -c "git push origin main"'),
+    ("main: eval", _main_wt, "eval 'git push origin main'"),
+    ("main: $(...) refspec", _main_wt, 'git push origin "$(git branch --show-current)"'),
+    ("main: backtick refspec", _main_wt, "git push origin `git branch --show-current`"),
+    ("main: $VAR refspec", _main_wt, "B=main; git push origin $B"),
+    ("main: ${VAR} refspec", _main_wt, "B=main; git push origin ${B}"),
+    ("main: $VAR remote", _main_wt, "R=origin; git push $R main"),
+    ("main: xargs", _main_wt, "echo main | xargs git push origin"),
+    ("main: env -S", _main_wt, "env -S 'git push origin main'"),
+    ("main: wrapper with a trailing --dry-run", _main_wt, "bash -c 'git push origin main' --dry-run"),
+    ("main: push inside a bash heredoc", _main_wt, "bash <<'EOF'\ngit push origin main\nEOF"),
+    ("feature: sh -c HEAD:main", _feat_wt, "sh -c 'git push origin HEAD:main'"),
+    ("override: sh -c HEAD:main", _override_wt, "sh -c 'git push origin HEAD:main'"),
+]:
+    dec, why = push_guard(_wt, command=_cmd, cwd=_wt)
+    check(
+        f"K01 unresolvable push {_label} -> deny (fail closed)",
+        dec == "deny" and "literal" in why,
+        f"decision={dec!r} {why[:200]}",
+    )
+
+for _label, _wt, _cmd in [
+    ("feature: env-assignment prefix", _feat_wt, "GIT_TRACE=0 git push -u origin feat/x"),
+    ("feature: commit-message heredoc that mentions a wrapped push", _feat_wt,
+     "git commit -q --allow-empty -F - <<'EOF'\nchore: x\n\nNever run `bash -c 'git push origin $(x)'`.\n"
+     "\nPre-push checklist:\n- Type: pure-data\nEOF\ngit push -u origin feat/x"),
     ("feature: push own branch", _feat_wt, "git push -u origin feat/x"),
     ("feature: push HEAD", _feat_wt, "git push origin HEAD"),
     ("feature: HEAD to another branch", _feat_wt, "git push origin HEAD:feat/y"),

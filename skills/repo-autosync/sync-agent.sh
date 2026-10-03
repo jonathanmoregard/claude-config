@@ -254,12 +254,21 @@ Do NOT push: this script secret-scans your commits and pushes them itself. Do no
 # ConnectionRefused, every one of them reported as "worktree still dirty".
 # The text is kept only to explain a failure the checks below detect, never to
 # declare one, so a commit message containing "API Error" cannot fake a fail.
+#
+# Where origin's branch stands BEFORE the agent runs. The agent must not push
+# (the wrapper scans, then pushes); if origin moved during the run, something
+# pushed unscanned commits, and the outgoing scan below would see nothing to
+# scan. Fail closed when origin cannot be read: the push needs it anyway.
+if ! remote_before="$(git ls-remote origin "refs/heads/$BRANCH")"; then
+  notify_failure "git ls-remote origin failed — cannot baseline the remote, nothing committed."
+  exit 1
+fi
 claude_rc=0
 claude_out="$(
   "$CLAUDE" \
     --model claude-sonnet-4-6 \
     --allowedTools "Read Bash(git status:*) Bash(git diff:*) Bash(git add:*) Bash(git commit:*) Bash(git log:*) Bash(git rm:*) Bash(git check-ignore:*) Bash($IGNORE_TOOL:*)" \
-    --disallowedTools "Bash(git push:*)" \
+    --disallowedTools "Bash(*push*)" \
     -p "$PROMPT" 2>&1
 )" || claude_rc=$?
 printf '%s\n' "$claude_out"
@@ -303,6 +312,19 @@ fi
 # push it itself. A repo with its own hooksPath never runs the global gitleaks
 # pre-commit hook, and `git commit --no-verify` skips it anywhere. Fail closed:
 # a scan that cannot run, or finds anything, means no push.
+#
+# `Bash(*push*)` is the agent's disallow rule because a `Bash(git push:*)`
+# PREFIX rule let `git -C "$PWD" push` through. The remote check is the
+# backstop for any push that got past the permission layer regardless.
+if ! remote_after="$(git ls-remote origin "refs/heads/$BRANCH")" ||
+  [ "$remote_after" != "$remote_before" ]; then
+  notify_failure "SECURITY: origin/$BRANCH MOVED during the agent run (or could not be re-read) — the agent may have pushed commits that were never secret-scanned. Nothing more pushed.
+before: ${remote_before:-<absent>}
+after:  ${remote_after:-<unreadable>}
+Inspect origin/$BRANCH by hand now."
+  exit 1
+fi
+git fetch -q origin "$BRANCH" 2>/dev/null || true
 if git rev-parse --verify --quiet "origin/$BRANCH" >/dev/null; then
   outgoing_range="origin/$BRANCH..$BRANCH"
 else

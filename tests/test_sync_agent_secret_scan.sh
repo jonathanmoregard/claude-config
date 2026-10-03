@@ -26,17 +26,36 @@ printf '#!/usr/bin/env bash\necho "NOTIFY: $*" >> %s/notifications\n' "$ROOT" > 
 # in this file (the repo's own secret scanners would rightly flag one).
 FAKE_TOKEN="ghp_$(printf 'aB3dE6gH9k%.0s' 1 2 3)Zq8Wv2"
 
-# The stub agent: commits whatever the scenario says, pushes only if allowed.
+# The stub agent: commits whatever the scenario says, then tries to push the
+# way AGENT_PUSH says. It honours the CLI's rules the way the CLI does:
+# `Bash(git push:*)` is a PREFIX rule (so `git -C dir push` slips past it),
+# `Bash(*push*)` matches anywhere. AGENT_PUSH=rogue models a push that gets
+# past the permission layer anyway (ambient Bash, a hook gap, a future bug).
 cat > "$ROOT/fakebin/claude" <<'STUB'
 #!/usr/bin/env bash
+allowed="" disallowed=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --allowedTools) allowed="$2"; shift 2 ;;
+    --disallowedTools) disallowed="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
 case "${AGENT_DOES:-benign}" in
   leak)   printf 'token = "%s"\n' "$FAKE_TOKEN" > agent-wrote.txt ;;
   benign) printf 'hello\n' > agent-wrote.txt ;;
 esac
 git add -A >/dev/null && git commit -qm "chore: sync" >/dev/null
-if [[ "$*" == *"Bash(git push:*)"* && "$*" != *"--disallowedTools Bash(git push:*)"* ]]; then
-  git push -q origin HEAD
-fi
+denied() { # denied <command>: does a disallow rule match it?
+  case "$disallowed" in *"Bash(*push*)"*) [[ "$1" == *push* ]] && return 0 ;; esac
+  case "$disallowed" in *"Bash(git push:*)"*) [[ "$1" == "git push"* ]] && return 0 ;; esac
+  return 1
+}
+case "${AGENT_PUSH:-if-told}" in
+  if-told) [[ "$allowed" == *"Bash(git push:*)"* ]] && ! denied "git push origin HEAD" && git push -q origin HEAD ;;
+  dash-C)  denied "git -C $PWD push origin HEAD" || git -C "$PWD" push -q origin HEAD ;;
+  rogue)   git -C "$PWD" push -q origin HEAD ;;
+esac
 echo "stub agent done"
 STUB
 chmod +x "$ROOT/fakebin/"*
@@ -70,6 +89,18 @@ if remote_has leak; then bad "agent-introduced secret was pushed (rc=$rc)"; else
 [ "$rc" -ne 0 ] && ok "run reports failure (rc=$rc)" || bad "run exited 0 with a leaked commit held back"
 grep -q "gitleaks" "$ROOT/notifications" 2>/dev/null && ok "failure notification names the secret scan" || bad "no secret-scan notification"
 if printf '%s' "$out" | grep -qF "$FAKE_TOKEN"; then bad "the token was printed unredacted"; else ok "the token is not printed"; fi
+
+# --- `git -C dir push` slips past a `Bash(git push:*)` prefix rule -----------
+w=$(fixture dashc)
+out=$(cd "$w" && AGENT_DOES=leak AGENT_PUSH=dash-C SYNC_REPO="$w" bash "$SCRIPT" 2>&1); rc=$?
+if remote_has dashc; then bad "agent pushed the secret via git -C (rc=$rc)"; else ok "git -C push is denied to the agent; secret held back"; fi
+
+# --- a push that got past the permission layer anyway is caught loudly -------
+: > "$ROOT/notifications"
+w=$(fixture rogue)
+out=$(cd "$w" && AGENT_DOES=benign AGENT_PUSH=rogue SYNC_REPO="$w" bash "$SCRIPT" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "remote moved during the agent run -> failure (rc=$rc)" || bad "rogue agent push went unnoticed (rc=0)"
+grep -qi "moved" "$ROOT/notifications" 2>/dev/null && ok "notification says origin moved during the run" || bad "no remote-moved notification"
 
 # --- a clean run still syncs end to end ---------------------------------------
 w=$(fixture clean)
