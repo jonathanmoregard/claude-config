@@ -2286,5 +2286,37 @@ class TestRegeneratedRejectedProposalIsSkipped(BackfillCase):
             os.path.exists(os.path.join(self.sink, "rsi", regenerated)),
             "with an empty ledger the sink has nothing to dedup against")
 
+
+class ScorerSessionIsPipelineInternal(unittest.TestCase):
+    """The scorer is a machine session: session-reflect must recognise it
+    (CLAUDE_PIPELINE_INTERNAL) and not mint a reflection of it into the corpus
+    the RSI review reads. Asserted on what the spawned `claude` actually sees,
+    whatever the caller's own environment holds."""
+
+    def test_scorer_claude_sees_the_sentinel(self):
+        tmp = tempfile.mkdtemp(prefix="gate-scorer-env-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        seen = os.path.join(tmp, "seen")
+        stub = os.path.join(tmp, "claude")
+        with open(stub, "w", encoding="utf-8") as fh:
+            fh.write('#!/usr/bin/env bash\n'
+                     'printf %%s "${CLAUDE_PIPELINE_INTERNAL-<unset>}" > %s\n'
+                     'echo "{}"\n' % seen)
+        os.chmod(stub, 0o755)
+        old_path = os.environ.get("PATH", "")
+        old_flag = os.environ.pop("CLAUDE_PIPELINE_INTERNAL", None)
+        os.environ["PATH"] = tmp + os.pathsep + old_path
+        try:
+            out, model = gate.dispatch_scorer(
+                "prompt", {"scorer": {"model": "m", "allowed_tools": "Read",
+                                      "timeout_seconds": 30}})
+        finally:
+            os.environ["PATH"] = old_path
+            if old_flag is not None:
+                os.environ["CLAUDE_PIPELINE_INTERNAL"] = old_flag
+        self.assertEqual(model, "m")
+        os.unlink(out)
+        self.assertEqual(read(seen), "1")
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

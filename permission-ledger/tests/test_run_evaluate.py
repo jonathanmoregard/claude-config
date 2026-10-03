@@ -43,6 +43,7 @@ CLAUDE_STUB = """#!/usr/bin/env bash
 # Stand-in for the claude binary. Records argv (NUL-separated) and cwd, then
 # emits whatever PL_STUB_STDOUT holds (default: one prose line, no proposals).
 pwd > "$PL_STUB_CWD_FILE"
+printf '%s' "${CLAUDE_PIPELINE_INTERNAL-<unset>}" > "$PL_STUB_CWD_FILE.pipeline"
 printf '%s\\0' "$@" > "$PL_STUB_ARGV_FILE"
 printf '%s\\n' "${PL_STUB_STDOUT:-stub: pretended to evaluate}"
 exit "${PL_STUB_EXIT:-0}"
@@ -425,6 +426,15 @@ class RunEvaluateTestCase(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout.decode())
         self.assertTrue(os.path.exists(self.digest))
         self.assertEqual(self.stub_argv_list()[:2], ["--model", "opus"])
+
+    def test_agent_session_is_marked_pipeline_internal(self):
+        # The evaluator's claude session must not be reflected on by
+        # session-reflect: it is machine telemetry, not user work.
+        self.seed_friction()
+        proc = self.run_evaluate_sh(CLAUDE_PIPELINE_INTERNAL="")
+        self.assertEqual(proc.returncode, 0, proc.stdout.decode())
+        with open(self.stub_cwd + ".pipeline", encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "1")
 
     def test_missing_or_broken_config_leaves_the_ledger_running(self):
         # Absent config: the default installed state, and the state every other

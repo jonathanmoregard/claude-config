@@ -205,6 +205,7 @@ is documented inside `settings-patch.json` under `_comment`.
 | `REFLECT_HANDOFF_CAP_BYTES` | `8192` | Cap on the self-compact handoff inlined into a fallback prompt. A handoff is a page of markdown by construction; this admits a whole one and refuses a runaway one. |
 | `REFLECT_HANDOFF_MAX_AGE_SECONDS` | `86400` | Age past which that handoff is not offered to the model as this session's state. Long enough that no live session's own handoff is excluded. |
 | `REFLECT_EXCERPT_BYTES` | `200` | Length of every quoted excerpt: `tool_result` bodies in an inlined transcript, the envelope's `result` in an error manifest, and an unparseable reply's `raw_excerpt`. |
+| `CLAUDE_PIPELINE_INTERNAL` | (unset) | Truthy marks a machine session. Set by: the RSI daily review and permission-ledger evaluator, the proposal intake-gate scorer, `date-check.sh`, repo-autosync `sync-agent.sh` / `upstream-merge.sh`, and crontab-wide for every cron job (nixos-config). Every mode no-ops with a record under `skipped-pipeline/`. Sessions whose `cwd` is under `~/.claude/step-back` or `~/.claude/homunculus` are skipped the same way without it. See "Pipeline-internal sessions". |
 | `_REFLECT_INTERNAL` | (internal) | Sentinel set by the parent dispatcher to gate the `--worker` re-entry path. Do not set manually. |
 
 Every size and threshold above is an **input**, not a tuned constant: each has its
@@ -251,6 +252,18 @@ On the 2nd-and-later `PreCompact` of a session the dispatcher also pre-fires
 `mission` mode. That pre-fire is **detached** (`REFLECT_ASYNC=1`): it used to run
 synchronously ahead of the precompact worker, which measured 121 s of in-hook
 wall time against a 60 s cap.
+
+### Pipeline-internal sessions
+
+The step-back classifier, the homunculus observer and the nightly RSI review /
+permission-ledger evaluator all run `claude`, so they fire the same hooks as work
+sessions. They are not reflected on: their artifacts crowded the corpus the RSI
+review reads (239 of 300 recent artifacts were step-back classifier runs) and fed
+the reviewer its own previous night as input. A session is skipped when
+`CLAUDE_PIPELINE_INTERNAL` is truthy, or when the payload `cwd` is under
+`~/.claude/step-back` or `~/.claude/homunculus` (helpers that run from their own
+state dir). Each skip writes `skipped-pipeline/<ts>-<sid>-<mode>-XXXX.json` with
+`reason` `sentinel` or `machine_cwd`.
 
 ### SubagentStop and the agent transcript
 
@@ -328,6 +341,34 @@ A stat(2) pre-check skips the doomed primary outright when the transcript exceed
 alongside the measured `transcript_bytes` and the threshold that fired. The
 primary is still tried first wherever it can work: the prompt-cache reuse is the
 cost story for this feature, and the fallback buys only that `final.json` lands.
+
+### Quota backfill
+
+A primary that comes back 429 is the account's spend cap, so no fallback is
+placed and the manifest records `status: error`, `api_error_status: 429`,
+`fallback_skipped_quota: true`. Since SessionEnd fires once, such a drop used to
+be permanent. `backfill.sh` drains them on **Fridays, before the weekly reset**,
+when budget is ample (systemd user timer `session-reflect-backfill`, hourly on
+Fridays, declared in nixos-config):
+
+- **Gate** (re-checked before every item, readings from `ai-router quota --fresh
+  --json`): local Friday; `seven_day.resets_at` still ahead; weekly remaining
+  > 20%; monthly extra-usage spend (`spend` bucket) used below
+  `(w+1)*25 - 15`% for 0-based week-of-month `w` (10/35/60/85). A missing
+  reading fails closed as `gate_unavailable`. `backfill.sh --gate` prints today's
+  decision.
+- **Loop**: oldest candidate first, one at a time, re-dispatched through the
+  normal `reflect.sh sessionend` front door; stops at the first 429, when a gate
+  closes, when the backlog is empty, or after 30 minutes of a busy machine
+  (load >= 0.75 x cores or < 15% memory available). The gap between items grows
+  with load.
+- **Bounds**: `quota_backfill_attempts` cap 3 per session, each session tried at
+  most once per run, missing transcripts skipped, no chaining.
+- **Visibility**: `backfill/last-run.json` (+ `runs.jsonl`); the SessionStart
+  hook `hooks/reflect-backfill-health.py` speaks when a run crashed, failed
+  closed, or hung.
+
+Tests: `bash skills/session-reflect/tests/backfill.sh`.
 
 ### Tests
 
@@ -418,6 +459,7 @@ already guarantee.
 | self-compact state + requests | `~/.local/state/claude-self-compact/<sid>/` — its own root, not under `$REFLECT_ROOT` | `STATE_RETENTION_DAYS` = 30 | `self-compact-trigger.py`, on fire |
 | human mission copies | `<project>/tasks/mission.<sid>.md` | `REFLECT_MISSION_RETENTION_DAYS` = 30, or session dir gone | `mission_gc`, on each mission write |
 | recursion markers | `skipped-recursions/` | `REFLECT_ARTIFACT_RETENTION_DAYS` = 14 | `reflect_artifact_gc`, every detached worker |
+| pipeline-session skip records | `skipped-pipeline/` | same | same |
 | malformed-payload manifests | `malformed/` | same | same |
 | worker logs | `$REFLECT_LOG_DIR` | same | same |
 | **reflections** | `sessions/**` | **never collected** | — |

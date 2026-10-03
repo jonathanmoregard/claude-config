@@ -417,6 +417,16 @@
         "hooks": [
           {
             "type": "command",
+            "command": "python3 -S -E $HOME/.claude/hooks/reflect-backfill-health.py",
+            "timeout": 5,
+            "statusMessage": "Checking reflection backfill health..."
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
             "command": "python3 $HOME/.claude/worktree-additional-dirs.py",
             "timeout": 15,
             "statusMessage": "Scoping this repo's worktrees..."
