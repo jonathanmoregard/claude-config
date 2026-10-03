@@ -200,10 +200,18 @@ expect_refused "merge (creating a merge commit) is refused" 'commits are forbidd
 git -C "$PRIMARY" merge --abort >/dev/null 2>&1; settle
 expect_refused "rebase is refused" 'pinned to master' git -C "$PRIMARY" rebase feat/side
 git -C "$PRIMARY" rebase --abort >/dev/null 2>&1; settle
+PREPUSH_SEEN="$(grep -c '^GLOBAL-pre-push:' "$WITNESS")"
 expect_refused "push from the primary is refused" 'pushes are forbidden' \
   git -C "$PRIMARY" push origin master
 expect_refused "push of another branch from the primary is refused" 'pushes are forbidden' \
   git -C "$PRIMARY" push origin feat/side
+# A refused push must have no side effects. The machine-wide pre-push has a
+# body keyed on the ~/.claude toplevel (mcp-sync) that rewrites and STAGES a
+# tracked file in the live checkout; running it before refusing leaves the live
+# checkout dirty after a push that never happened.
+[ "$(grep -c '^GLOBAL-pre-push:' "$WITNESS")" -eq "$PREPUSH_SEEN" ] \
+  && ok "a refused primary push does not run the global pre-push" \
+  || bad "a refused primary push does not run the global pre-push" "global pre-push ran"
 [ "$(head_of "$PRIMARY" master)" = "$P_MASTER" ] && [ "$(branch_of "$PRIMARY")" = master ] \
   && [ -z "$(git -C "$PRIMARY" status --porcelain --untracked-files=no)" ] \
   && ok "after all refusals: master unmoved, on master, tree clean" \
@@ -318,15 +326,76 @@ expect_ok "hooks are inert in another repo (commit, switch, push)" bash -c "
 # --- session observer --------------------------------------------------------
 observe() { CLAUDE_PRIMARY_CHECKOUT="$PRIMARY" "$PRIMARY/scripts/worktree-policy-session-start.sh" 2>&1; }
 git -C "$PRIMARY" config --unset core.hooksPath
-touch "$PRIMARY/stray-untracked"
+printf 'local edit\n' >> "$PRIMARY/tracked.txt"
 OBS="$(observe)"; OBS_RC=$?
 if [ "$OBS_RC" -eq 0 ] && [ -z "$(git -C "$PRIMARY" config --local --get core.hooksPath)" ] \
   && printf '%s' "$OBS" | grep -q 'stop and report exact state'; then
-  ok "observer reports a dirty primary and changes nothing"
+  ok "observer reports tracked changes in the primary and changes nothing"
 else
-  bad "observer reports a dirty primary and changes nothing" "rc=$OBS_RC $OBS"
+  bad "observer reports tracked changes in the primary and changes nothing" "rc=$OBS_RC $OBS"
+fi
+printf '%s' "$OBS" | grep -q 'other repositories' \
+  && ok "observer's stop is scoped to ~/.claude, not every project's session" \
+  || bad "observer's stop is scoped to ~/.claude, not every project's session" "$OBS"
+git -C "$PRIMARY" restore tracked.txt
+# Untracked strays (the live checkout has had MEMORY.md and `e` for weeks) are
+# not unknown work the installer could disturb: it only writes git config,
+# .git/info/exclude and .githooks/. Leaving the pin OFF because of a stray file,
+# and telling every session in every project to stop, is the wrong trade.
+touch "$PRIMARY/stray-untracked"
+OBS="$(observe)"
+if [ "$(git -C "$PRIMARY" config --get core.hooksPath)" = "$PRIMARY/.githooks" ] \
+  && printf '%s' "$OBS" | grep -q 'stray-untracked' \
+  && ! printf '%s' "$OBS" | grep -q 'stop and report'; then
+  ok "observer activates the pin despite untracked strays, and notes them without a stop"
+else
+  bad "observer activates the pin despite untracked strays, and notes them without a stop" "$OBS"
 fi
 rm -f -- "$PRIMARY/stray-untracked"
+# `/model` writes settings.json's "model" key in the live checkout; claude-pull
+# carries exactly that difference across pulls. It is expected state, not
+# unknown work, so it neither stops sessions nor holds activation back.
+git -C "$PRIMARY" config --unset core.hooksPath
+python3 - "$PRIMARY/settings.json" <<'PY'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p)); d["model"] = "operator-choice"
+json.dump(d, open(p, "w"), indent=2); open(p, "a").write("\n")
+PY
+OBS="$(observe)"
+if [ "$(git -C "$PRIMARY" config --get core.hooksPath)" = "$PRIMARY/.githooks" ] \
+  && ! printf '%s' "$OBS" | grep -q 'stop and report'; then
+  ok "observer treats a model-only settings.json change as expected state"
+else
+  bad "observer treats a model-only settings.json change as expected state" "$OBS"
+fi
+python3 - "$PRIMARY/settings.json" <<'PY'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p)); d["env"]["X"] = "1"
+json.dump(d, open(p, "w"), indent=2); open(p, "a").write("\n")
+PY
+git -C "$PRIMARY" config --unset core.hooksPath
+OBS="$(observe)"
+if [ -z "$(git -C "$PRIMARY" config --local --get core.hooksPath)" ] \
+  && printf '%s' "$OBS" | grep -q 'stop and report'; then
+  ok "observer still stops on settings.json changes beyond the model key"
+else
+  bad "observer still stops on settings.json changes beyond the model key" "$OBS"
+fi
+git -C "$PRIMARY" restore settings.json
+# A linked worktree attached to local master is reported, but does not keep
+# the pin switched off either.
+git -C "$PRIMARY" config --unset core.hooksPath
+git -C "$PRIMARY" worktree add -q -f "$WT_ROOT/on-master" master
+OBS="$(observe)"
+if [ "$(git -C "$PRIMARY" config --get core.hooksPath)" = "$PRIMARY/.githooks" ] \
+  && printf '%s' "$OBS" | grep -q 'repair: git -C'; then
+  ok "observer activates the pin while reporting a linked worktree on master"
+else
+  bad "observer activates the pin while reporting a linked worktree on master" "$OBS"
+fi
+git -C "$WT_ROOT/on-master" switch -q --detach
+git -C "$PRIMARY" worktree remove "$WT_ROOT/on-master"
+git -C "$PRIMARY" config --unset core.hooksPath
 OBS="$(observe)"
 [ "$(git -C "$PRIMARY" config --get core.hooksPath)" = "$PRIMARY/.githooks" ] \
   && ok "observer self-heals activation on a clean primary" || bad "observer self-heals activation on a clean primary" "$OBS"

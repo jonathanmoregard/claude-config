@@ -27,9 +27,32 @@ fi
 
 # Drift is report-only. The installer can edit repository config, executable
 # bits, .git/info/exclude, and missing forwarders, so do not invoke it while
-# unknown work is present or the primary checkout is off master.
+# the primary checkout is off master or has TRACKED changes (unknown work).
+# Untracked strays are reported but do not hold activation back: the installer
+# never touches them, and a pin left off because of a stray file is the worse
+# failure (the live checkout has carried MEMORY.md and `e` for weeks).
 branch="$(git -C "$MAIN" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
 dirty="$(git -C "$MAIN" status --porcelain=v1 --untracked-files=all 2>/dev/null || true)"
+tracked_dirty="$(git -C "$MAIN" status --porcelain=v1 --untracked-files=no 2>/dev/null || true)"
+untracked="$(git -C "$MAIN" ls-files --others --exclude-standard 2>/dev/null || true)"
+# `/model` writes settings.json's "model" key into the live checkout, and
+# claude-pull.sh carries exactly that difference across pulls. A settings.json
+# whose ONLY difference from HEAD is "model" is expected state, not unknown work.
+if [ "$tracked_dirty" = " M settings.json" ] && command -v python3 >/dev/null 2>&1 \
+  && git -C "$MAIN" show HEAD:settings.json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    head = json.load(sys.stdin)
+    local = json.load(open(sys.argv[1], encoding="utf-8"))
+except (OSError, ValueError):
+    raise SystemExit(1)
+if not (isinstance(head, dict) and isinstance(local, dict)):
+    raise SystemExit(1)
+strip = lambda d: {k: v for k, v in d.items() if k != "model"}
+raise SystemExit(0 if strip(head) == strip(local) else 1)
+' "$MAIN/settings.json" 2>/dev/null; then
+  tracked_dirty=""
+fi
 main_real="$(readlink -f "$MAIN" 2>/dev/null || printf '%s' "$MAIN")"
 linked_main_paths=()
 _wt=""
@@ -46,8 +69,15 @@ while IFS= read -r _line; do
 done < <(git -C "$MAIN" worktree list --porcelain 2>/dev/null || true)
 
 primary_drift=0
-if [ "$branch" != master ] || [ -n "$dirty" ]; then
+if [ "$branch" != master ] || [ -n "$tracked_dirty" ]; then
   primary_drift=1
+fi
+
+if [ "$primary_drift" -eq 0 ] && [ -n "$untracked" ]; then
+  printf '[claude-policy] note: %s untracked path(s) in %s (live checkout, not a workspace): %s\n' \
+    "$(printf '%s\n' "$untracked" | wc -l)" "$MAIN" \
+    "$(printf '%s\n' "$untracked" | head -5 | paste -sd' ' -)"
+  printf '  Not blocking: the pin stays active and no work is held up.\n\n'
 fi
 
 if [ "$primary_drift" -eq 1 ] || [ "${#linked_main_paths[@]}" -gt 0 ]; then
@@ -97,8 +127,9 @@ if [ "$primary_drift" -eq 1 ] || [ "${#linked_main_paths[@]}" -gt 0 ]; then
     cat <<'EOF'
 
 Agent action: stop and report exact state to Jonathan. Do not stash, reset,
-clean, switch branches, or move unknown work. Start new development only after
-the primary checkout is clean on master, using:
+clean, switch branches, or move unknown work. This concerns ~/.claude only;
+work in other repositories proceeds as normal. Start new ~/.claude development
+only after the primary checkout is clean on master, using:
 EOF
   else
     cat <<'EOF'
@@ -119,7 +150,10 @@ checkout, plus any linked-worktree attachment or update to local master. Read-on
 git and `git worktree add` are untouched. Local master may move only by a primary
 fast-forward so scheduled pulls keep working; rebases use origin/master.
 EOF
-  exit 0
+  # Unknown work in the primary: never run the installer over it. A linked
+  # worktree on master alone does not hold activation back.
+  [ "$primary_drift" -eq 1 ] && exit 0
+  printf '\n'
 fi
 
 # Self-heal the git-layer floor. core.hooksPath is local config, so it does not

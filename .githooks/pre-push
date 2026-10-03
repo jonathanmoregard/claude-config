@@ -4,8 +4,11 @@
 # anything worth pushing was made in a linked worktree and is pushed from
 # there. Linked worktrees and unrelated repositories are untouched.
 #
-# The machine-wide pre-push hook runs first, with the same argv and stdin, and
-# its non-zero exit is propagated. `git push --no-verify` skips this hook (git
+# The refusal comes FIRST and has no side effects. Only a push that is allowed
+# reaches the machine-wide pre-push hook (same argv and stdin, non-zero exit
+# propagated): that hook has a body keyed on the ~/.claude toplevel which
+# rewrites and stages mcp-servers.json, and running it for a push that is then
+# refused would leave the live checkout dirty. `git push --no-verify` skips this hook (git
 # offers no unskippable push hook); the commit and ref guards are the floor.
 
 set -uo pipefail
@@ -22,13 +25,16 @@ while IFS= read -r line; do
   payload+="$line"$'\n'
 done
 
-hook_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-printf '%s' "$payload" \
-  | WORKTREE_POLICY_FORWARD_HOOK=pre-push "$hook_dir/_forward-global-hook" "$@" \
-  || exit $?
-
 origin_url="$(git config --local --get remote.origin.url 2>/dev/null || true)"
-[[ "$origin_url" =~ [:/]jonathanmoregard/\.claude(\.git)?/?$ ]] || exit 0
+forward_global() {
+  local hook_dir
+  hook_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+  printf '%s' "$payload" \
+    | WORKTREE_POLICY_FORWARD_HOOK=pre-push "$hook_dir/_forward-global-hook" "$@"
+  exit $?
+}
+
+[[ "$origin_url" =~ [:/]jonathanmoregard/\.claude(\.git)?/?$ ]] || forward_global "$@"
 
 dirs="$(git rev-parse --path-format=absolute --git-dir --git-common-dir 2>/dev/null || true)"
 git_dir=""
@@ -36,10 +42,10 @@ common_dir=""
 if [ -n "$dirs" ]; then
   { IFS= read -r git_dir; IFS= read -r common_dir; } <<< "$dirs"
 fi
-[ -n "$git_dir" ] && [ -n "$common_dir" ] || exit 0
+[ -n "$git_dir" ] && [ -n "$common_dir" ] || forward_global "$@"
 git_dir="$(readlink -f "$git_dir" 2>/dev/null || printf '%s' "$git_dir")"
 common_dir="$(readlink -f "$common_dir" 2>/dev/null || printf '%s' "$common_dir")"
-[ "$git_dir" = "$common_dir" ] || exit 0
+[ "$git_dir" = "$common_dir" ] || forward_global "$@"
 
 repo_top="$(git rev-parse --show-toplevel 2>/dev/null || printf '%s' "$PWD")"
 cat >&2 <<EOF

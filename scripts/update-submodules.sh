@@ -92,33 +92,67 @@ update_submodule() {
   fi
 
   local branch="chore/auto-update-${short}-${latest:0:8}"
+  local title="chore: auto-update $short to ${latest:0:8}"
+  local body="Automated weekly bump of \`$path\` from \`${current:0:8}\` to \`${latest:0:8}\` (upstream HEAD of $url). deps.dev reported no critical/high advisories.
+
+Opened by scripts/update-submodules.sh from a throwaway worktree; the live ~/.claude checkout was not touched. After merge, claude-pull.sh fast-forwards it and runs \`git submodule update --init\`."
+
+  # This function runs as `update_submodule ... || rc=1`, a context in which
+  # bash ignores `set -e`; every step below therefore checks its own status.
+  # Without that, a commit blocked by the gitleaks pre-commit would fall
+  # through to pushing an empty branch.
   if git -C "$REPO_DIR" ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
-    log "  $branch already on origin (PR open or merged) — nothing to do"
-    return 0
+    # The branch alone does not prove a PR exists: an earlier run may have
+    # pushed it and then failed at `gh pr create`. Skipping on the branch
+    # would make that bump invisible forever, so ask GitHub.
+    local prs
+    prs=$(cd "$REPO_DIR" && gh pr list --head "$branch" --state all --json number --jq length 2>/dev/null)
+    if ! [[ "$prs" =~ ^[0-9]+$ ]]; then
+      log "  $branch is on origin but its PR state could not be read (gh pr list failed)"
+      return 1
+    fi
+    if [ "$prs" != 0 ]; then
+      log "  $branch already on origin (PR open or merged) — nothing to do"
+      return 0
+    fi
+    local pr_url
+    if pr_url=$(cd "$REPO_DIR" && gh pr create --head "$branch" --title "$title" --body "$body" 2>&1); then
+      log "  $branch was on origin without a PR (earlier run failed); opened $pr_url"
+      return 0
+    fi
+    log "  $branch is on origin but still has no PR: $pr_url"
+    return 1
   fi
 
   # Throwaway linked worktree off fresh origin/master. A pre-existing local
   # branch of that name is a leftover of an earlier failed run of this script.
   local wt
-  wt=$(mktemp -d "$WT_PARENT/claude-submodule-bump.XXXXXX")   # empty dir: worktree add accepts it
+  wt=$(mktemp -d "$WT_PARENT/claude-submodule-bump.XXXXXX") || return 1   # empty dir: worktree add accepts it
   git -C "$REPO_DIR" branch -D "$branch" >/dev/null 2>&1 || true
-  git -C "$REPO_DIR" worktree add --quiet --no-track -b "$branch" "$wt" origin/master
+  if ! git -C "$REPO_DIR" worktree add --quiet --no-track -b "$branch" "$wt" origin/master; then
+    log "  could not create the throwaway worktree $wt"
+    rmdir "$wt" 2>/dev/null || true
+    return 1
+  fi
   CREATED_WT+=("$wt")
 
   # Move the gitlink without cloning the submodule: the pin is just the commit
   # id recorded in the superproject's tree.
-  git -C "$wt" update-index --cacheinfo "160000,$latest,$path"
-  git -C "$wt" commit --quiet -m "chore: auto-update $short to ${latest:0:8}"
-  git -C "$wt" push --quiet -u origin "$branch"
+  if ! git -C "$wt" update-index --cacheinfo "160000,$latest,$path" \
+    || ! git -C "$wt" commit --quiet -m "$title"; then
+    log "  could not commit the bump in $wt — nothing pushed"
+    return 1
+  fi
+  if ! git -C "$wt" push --quiet -u origin "$branch"; then
+    log "  could not push $branch"
+    return 1
+  fi
 
-  local body="Automated weekly bump of \`$path\` from \`${current:0:8}\` to \`${latest:0:8}\` (upstream HEAD of $url). deps.dev reported no critical/high advisories.
-
-Opened by scripts/update-submodules.sh from a throwaway worktree; the live ~/.claude checkout was not touched. After merge, claude-pull.sh fast-forwards it and runs \`git submodule update --init\`."
   local pr_url
-  if pr_url=$(cd "$wt" && gh pr create --head "$branch" --title "chore: auto-update $short to ${latest:0:8}" --body "$body" 2>&1); then
+  if pr_url=$(cd "$wt" && gh pr create --head "$branch" --title "$title" --body "$body" 2>&1); then
     log "  Pushed $branch and opened $pr_url"
   else
-    log "  Pushed $branch but could not open the PR: $pr_url"
+    log "  Pushed $branch but could not open the PR (the next run retries): $pr_url"
     return 1
   fi
 

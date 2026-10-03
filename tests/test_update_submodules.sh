@@ -27,9 +27,18 @@ printf '[init]\n\tdefaultBranch = master\n[protocol "file"]\n\tallow = always\n'
 export GIT_CONFIG_GLOBAL="$ROOT/global.gitconfig" GIT_CONFIG_SYSTEM=/dev/null
 
 mkdir -p "$ROOT/fakebin"
+# gh stub. `pr create` is recorded (and fails while $ROOT/gh-down exists);
+# `pr list --head B` answers from the recorded creates, standing in for GitHub.
 cat > "$ROOT/fakebin/gh" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$ROOT/gh-calls"
+if [ "\$1 \$2" = "pr list" ]; then
+  head=""; while [ \$# -gt 0 ]; do [ "\$1" = --head ] && head="\$2"; shift; done
+  grep -c -- "^pr create --head \$head " "$ROOT/gh-creates" 2>/dev/null || true
+  exit 0
+fi
+[ -e "$ROOT/gh-down" ] && { echo "gh: could not create PR (stub outage)" >&2; exit 1; }
+printf '%s\n' "\$*" >> "$ROOT/gh-creates"
 echo "https://github.com/jonathanmoregard/.claude/pull/999"
 EOF
 printf '#!/bin/sh\nexit 22\n' > "$ROOT/fakebin/curl"
@@ -76,7 +85,7 @@ else bad "baseline: an in-place commit in the pinned primary is refused" "commit
 # --- up to date: nothing happens ---------------------------------------------
 BEFORE="$(snapshot)"
 OUT="$("$PRIMARY/scripts/update-submodules.sh" 2>&1)"; RC=$?
-[ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q 'Up to date' && [ ! -e "$ROOT/gh-calls" ] \
+[ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q 'Up to date' && [ ! -e "$ROOT/gh-creates" ] \
   && ok "up to date: no branch, no PR" || bad "up to date: no branch, no PR" "rc=$RC $OUT"
 
 # --- upstream moved: a bump PR is proposed, live checkout untouched ----------
@@ -90,7 +99,7 @@ PIN="$(git --git-dir="$ORIGIN" ls-tree "refs/heads/$BRANCH" -- skills/prompt-mas
   || bad "origin has the bump branch pinning the new upstream commit" "pin=$PIN $OUT"
 [ "$(git --git-dir="$ORIGIN" rev-parse master)" = "$(git -C "$SEED" rev-parse HEAD)" ] \
   && ok "origin master is untouched (the bump goes through a PR)" || bad "origin master is untouched" "moved"
-grep -q -- "--head $BRANCH" "$ROOT/gh-calls" 2>/dev/null && ok "a PR is opened for the branch" \
+grep -q -- "--head $BRANCH" "$ROOT/gh-creates" 2>/dev/null && ok "a PR is opened for the branch" \
   || bad "a PR is opened for the branch" "$(cat "$ROOT/gh-calls" 2>/dev/null)"
 [ "$(snapshot)" = "$BEFORE" ] && ok "live checkout HEAD, branch and tree unchanged" \
   || bad "live checkout HEAD, branch and tree unchanged" "before=$BEFORE after=$(snapshot)"
@@ -100,10 +109,43 @@ git -C "$PRIMARY" show-ref --verify --quiet "refs/heads/$BRANCH" \
   && bad "no local bump branch left behind" "present" || ok "no local bump branch left behind"
 
 # --- idempotent ----------------------------------------------------------------
-CALLS="$(wc -l < "$ROOT/gh-calls")"
+CALLS="$(wc -l < "$ROOT/gh-creates")"
 OUT="$("$PRIMARY/scripts/update-submodules.sh" 2>&1)"; RC=$?
-[ "$RC" -eq 0 ] && [ "$(wc -l < "$ROOT/gh-calls")" -eq "$CALLS" ] && printf '%s' "$OUT" | grep -q 'already on origin' \
+[ "$RC" -eq 0 ] && [ "$(wc -l < "$ROOT/gh-creates")" -eq "$CALLS" ] && printf '%s' "$OUT" | grep -q 'already on origin' \
   && ok "re-run with the bump already on origin is a no-op" || bad "re-run is a no-op" "rc=$RC $OUT"
+
+# --- a run that pushed the branch but could not open the PR is not sticky -----
+git -C "$UP" commit -q --allow-empty -m v3
+V3="$(git -C "$UP" rev-parse HEAD)"
+B3="chore/auto-update-prompt-master-${V3:0:8}"
+touch "$ROOT/gh-down"
+OUT="$("$PRIMARY/scripts/update-submodules.sh" 2>&1)"; RC=$?
+rm -f "$ROOT/gh-down"
+[ "$RC" -ne 0 ] && git --git-dir="$ORIGIN" show-ref --verify --quiet "refs/heads/$B3" \
+  && ok "gh outage: the run fails loudly with the branch already pushed" \
+  || bad "gh outage: the run fails loudly with the branch already pushed" "rc=$RC $OUT"
+OUT="$("$PRIMARY/scripts/update-submodules.sh" 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && grep -q -- "^pr create --head $B3 " "$ROOT/gh-creates" \
+  && ok "next run opens the missing PR instead of skipping the pushed branch forever" \
+  || bad "next run opens the missing PR instead of skipping the pushed branch forever" "rc=$RC $OUT"
+[ "$(snapshot)" = "$BEFORE" ] && [ "$(git -C "$PRIMARY" worktree list | wc -l)" -eq 1 ] \
+  && ok "after the outage and recovery: live checkout unchanged, no worktree left" \
+  || bad "after the outage and recovery: live checkout unchanged, no worktree left" "$(snapshot)"
+
+# --- a refused commit in the throwaway worktree stops the run before any push --
+git -C "$UP" commit -q --allow-empty -m v4
+V4="$(git -C "$UP" rev-parse HEAD)"
+B4="chore/auto-update-prompt-master-${V4:0:8}"
+mkdir -p "$ROOT/blocking-hooks"
+printf '#!/bin/sh\necho "stub gitleaks: blocked" >&2\nexit 1\n' > "$ROOT/blocking-hooks/pre-commit"
+chmod +x "$ROOT/blocking-hooks/pre-commit"
+cp "$ROOT/global.gitconfig" "$ROOT/global.gitconfig.bak"
+printf '[core]\n\thooksPath = %s\n' "$ROOT/blocking-hooks" >> "$ROOT/global.gitconfig"
+OUT="$("$PRIMARY/scripts/update-submodules.sh" 2>&1)"; RC=$?
+mv "$ROOT/global.gitconfig.bak" "$ROOT/global.gitconfig"
+[ "$RC" -ne 0 ] && ! git --git-dir="$ORIGIN" show-ref --verify --quiet "refs/heads/$B4" \
+  && ok "a blocked commit fails the run and pushes nothing" \
+  || bad "a blocked commit fails the run and pushes nothing" "rc=$RC $OUT"
 
 printf '\npassed: %s  failed: %s\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
