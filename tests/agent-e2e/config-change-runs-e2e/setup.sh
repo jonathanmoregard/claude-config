@@ -13,11 +13,12 @@ echo PRIVATE > "$RUN/visibility"
 echo jonathanmoregard/.claude > "$RUN/repo"
 echo master > "$RUN/default-branch"
 : > "$RUN/gh.log"
-# The log path is baked in, not read from $E2E_RUN at call time: an inner
-# agent_e2e.py run re-exports E2E_RUN for its own run directory, and the first
-# probe lost the very call this scenario exists to see.
+# The log goes to $E2E_SHARED, baked in at setup: an inner agent_e2e.py run
+# re-exports E2E_RUN for its own run and gives it a private /tmp, and both lost
+# the very call this scenario exists to see. E2E_SHARED stays bound at every level.
+SHARED="${E2E_SHARED:?}"
 { echo '#!/usr/bin/env bash'
-  printf 'printf "%%s\\n" "$*" >> %q\n' "$RUN/claude.log"
+  printf 'printf "%%s\\n" "$*" >> %q\n' "$SHARED/claude.log"
 } > "$BIN/claude"
 cat >> "$BIN/claude" <<'STUB'
 printf '{"type":"assistant","message":{"content":[{"type":"text","text":"ok"}]}}\n'

@@ -20,7 +20,9 @@ is the usual "before" arm).
 SCENARIO is a directory holding:
     prompt.md   the user's message, verbatim
     setup.sh    `setup.sh WORK RUN` builds the workspace in WORK. Stubs it puts
-                in $E2E_BIN shadow real tools (on PATH first); logs go to RUN.
+                in $E2E_BIN shadow real tools (on PATH first); logs go to RUN,
+                or to $E2E_SHARED (RUN/shared at the top level) when a stub
+                may be called from a nested harness run.
     check.sh    `check.sh RUN` grades one run: exit 0 PASS, 1 FAIL, anything
                 else INCONCLUSIVE. RUN holds final.txt (the agent's last message),
                 commands.txt (every Bash command the agent issued, one per
@@ -214,8 +216,15 @@ def run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
     for d in (home, work, bindir):
         d.mkdir(parents=True)
     provenance = stage(src, home)
+    # E2E_SHARED is the one directory every nesting level keeps writable: a
+    # scenario whose agent runs this harness itself (the dogfood) gets a
+    # private /tmp inside the inner run too, and a stub logging to the outer
+    # run dir wrote into that tmpfs and was lost. Inherited when already set.
+    shared = pathlib.Path(os.environ.get("E2E_SHARED") or run / "shared")
+    shared.mkdir(parents=True, exist_ok=True)
     env = {
         **os.environ,
+        "E2E_SHARED": str(shared),
         "HOME": str(home),
         "PATH": f"{bindir}:{os.environ.get('PATH', '')}",
         "E2E_BIN": str(bindir), "E2E_RUN": str(run), "E2E_WORK": str(work),
@@ -248,8 +257,8 @@ def run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
         exe_dir = pathlib.Path(args.claude).resolve().parent
         if str(exe_dir).startswith("/tmp"):  # else hidden by the private /tmp
             binds += ["--ro-bind", str(exe_dir), str(exe_dir)]
-        # Last, so a read-only ancestor bind above cannot shadow it.
-        binds += ["--bind", str(run), str(run)]
+        # Last, so a read-only ancestor bind above cannot shadow them.
+        binds += ["--bind", str(run), str(run), "--bind", str(shared), str(shared)]
         argv = [bwrap, "--dev-bind", "/", "/", "--tmpfs", "/tmp", *binds,
                 "--chdir", str(work), "--", *argv]
     verdict["isolated_tmp"] = bool(bwrap)

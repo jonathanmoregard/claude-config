@@ -26,9 +26,9 @@ def harness(*args, **kw):
                           capture_output=True, text=True, **kw)
 
 
-def fake_claude(tmp: pathlib.Path, body: str) -> pathlib.Path:
+def fake_claude(tmp: pathlib.Path, body: str, name: str = "fake-claude") -> pathlib.Path:
     """A `claude` that runs BODY as bash in the agent's cwd/env."""
-    path = tmp / "fake-claude"
+    path = tmp / name
     path.write_text("#!/usr/bin/env bash\n" + body)
     path.chmod(0o755)
     return path
@@ -200,7 +200,9 @@ def test_dogfood_setup_makes_a_worktree_of_the_staged_config(tmp_path):
         d.mkdir()
     (home / ".claude").mkdir(parents=True)
     (home / ".claude/CLAUDE.md").write_text("## Collaboration\n- be brief\n")
+    (run / "shared").mkdir()
     env = {**os.environ, "E2E_RUN": str(run), "E2E_WORK": str(work), "E2E_BIN": str(binp),
+           "E2E_SHARED": str(run / "shared"),
            "HOME": str(home), "GIT_CONFIG_GLOBAL": "/dev/null",
            "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
@@ -215,7 +217,7 @@ def test_dogfood_setup_makes_a_worktree_of_the_staged_config(tmp_path):
     inner = {**env, "E2E_RUN": str(tmp_path / "elsewhere")}  # as an inner harness sets it
     subprocess.run([str(binp / "claude"), "-p", "x"], env=inner, check=True,
                    capture_output=True)
-    assert (run / "claude.log").read_text().strip() == "-p x"
+    assert (run / "shared/claude.log").read_text().strip() == "-p x"
 
 
 @pytest.mark.parametrize("commands,claude_ran,want", [
@@ -230,10 +232,10 @@ def test_dogfood_setup_makes_a_worktree_of_the_staged_config(tmp_path):
 ])
 def test_dogfood_grader(tmp_path, commands, claude_ran, want):
     run = tmp_path / "run"
-    run.mkdir()
+    (run / "shared").mkdir(parents=True)
     (run / "final.txt").write_text("done")
     (run / "commands.txt").write_text("\n".join(commands) + "\n")
-    (run / "claude.log").write_text("--version\n-p --resume abc --fork-session\n"
+    (run / "shared/claude.log").write_text("--version\n-p --resume abc --fork-session\n"
                                     + ("-p x --output-format stream-json\n" if claude_ran else ""))
     r = subprocess.run(["bash", str(SCENARIOS / "config-change-runs-e2e/check.sh"), str(run)],
                        capture_output=True, text=True)
@@ -256,3 +258,27 @@ def test_runs_get_a_private_tmp(tmp_path):
         assert verdicts[0]["isolated_tmp"] is True
     finally:
         probe.unlink()
+
+
+def test_nested_run_reaches_shared_dir(tmp_path):
+    """A stub called from a NESTED harness run must still reach the outer log."""
+    import shutil as _sh
+    if not _sh.which("bwrap"):
+        pytest.skip("bubblewrap not on PATH")
+    inner_sc = tmp_path / "inner"
+    inner_sc.mkdir()
+    (inner_sc / "prompt.md").write_text("x\n")
+    (inner_sc / "setup.sh").write_text("exit 0\n")
+    (inner_sc / "check.sh").write_text("exit 0\n")
+    # Both binaries in one directory: the outer run binds only its own
+    # binary's directory into the private /tmp, so the leaf must live there too.
+    leaf = fake_claude(tmp_path, 'echo nested >> "$E2E_SHARED/log"\n'
+                       "cat <<'EOF'\n" + stream("leaf", []) + "\nEOF\n", name="leaf")
+    # The outer "agent" runs the harness itself, as the dogfood agent does.
+    outer = fake_claude(tmp_path,
+                        f"{sys.executable} {HARNESS} run {inner_sc} --arm a=HEAD --n 1 "
+                        f"--jobs 1 --out /tmp/inner-out --claude {leaf} >&2\n"
+                        "cat <<'EOF'\n" + stream("outer", []) + "\nEOF\n", name="outer")
+    sc = _scenario(tmp_path, 'grep -qx nested "$1/shared/log"')
+    _, _, verdicts = _run(tmp_path, sc, outer)
+    assert verdicts[0]["verdict"] == "PASS", verdicts
