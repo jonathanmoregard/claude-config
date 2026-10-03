@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# Generic forwarder to the machine-wide hooks directory. No logic of its own.
+#
+# WHY
+# ---
+# Activating this layer sets core.hooksPath to an ABSOLUTE path at the main
+# checkout's .githooks. That replaces the machine-wide core.hooksPath
+# (~/.config/git/hooks, managed by home-manager) wholesale, for this repo, in
+# EVERY worktree and for EVERY hook type — not just the one we care about. Any
+# global hook without a same-named entry here stops running, silently. The two
+# that exist today both matter:
+#
+#   * pre-commit — runs gitleaks over the staged diff and BLOCKS on a hit.
+#     Dropping it would remove secret scanning from the one repo most likely to
+#     hold credentials, as a side effect of installing a branch pin.
+#   * pre-push — dispatches machine-wide repository checks.
+#
+# HOW
+# ---
+# One file, invoked by a tiny tracked wrapper or an installer-created symlink
+# under each hook name we need to cover:
+#
+#     .githooks/pre-commit  exports its hook name, then execs this file
+#     .githooks/pre-push    exports its hook name, then execs this file
+#
+# An explicit `WORKTREE_POLICY_FORWARD_HOOK` from a wrapper selects the hook;
+# installer-created symlinks fall back to `basename "$0"`. Adding a type is one
+# symlink; scripts/install-worktree-policy.sh repairs when a global hook has none.
+#
+# The leading underscore is deliberate: git only runs files whose names are
+# hook names, so this file is inert if it is ever invoked as a hook path.
+#
+# `exec` hands over argv, stdin and the exit status untouched. That last part
+# is the point — a forwarder that swallowed a non-zero exit would turn a
+# blocking global hook into a no-op, which is the same class of bug as an
+# enforcement layer with an off switch.
+
+set -uo pipefail
+
+# Same config-override sanitisation as .githooks/reference-transaction, and for
+# the same reason: this file decides which global hook to run by asking `git
+# config`, and GIT_CONFIG is a whole-file override for that builtin. Blanking
+# it here would make the forwarder find no global hooksPath and quietly forward
+# nothing — turning off the machine-wide gitleaks pre-commit with a one-token
+# env prefix. GIT_CONFIG_GLOBAL is deliberately left alone: it is how the
+# global hooks directory is legitimately selected, and the test suite sets it.
+unset GIT_CONFIG GIT_CONFIG_COUNT
+for _v in "${!GIT_CONFIG_KEY_@}" "${!GIT_CONFIG_VALUE_@}"; do
+  unset "$_v"
+done
+unset _v
+
+_name="${WORKTREE_POLICY_FORWARD_HOOK:-$(basename -- "$0")}"
+# Invoked directly without a wrapper/symlink hook name: nothing to forward.
+case "$_name" in _*) exit 0 ;; esac
+
+_dir="$(git config --global --get core.hooksPath 2>/dev/null)" || exit 0
+[ -n "$_dir" ] || exit 0
+# git does not expand `~` in config values it hands to us; home-manager writes
+# core.hooksPath as `~/.config/git/hooks`.
+case "$_dir" in
+  "~/"*) _dir="$HOME/${_dir#\~/}" ;;
+  "~")   _dir="$HOME" ;;
+esac
+
+_hook="$_dir/$_name"
+if [ ! -x "$_hook" ]; then
+  # Present but not executable is the dangerous shape: the hook is sitting
+  # right there, looks installed, and does nothing. Baseline git at least
+  # prints an advice.ignoredHook hint for this; forwarding silently past it
+  # means a dropped exec bit on the gitleaks pre-commit removes secret scanning
+  # with no message anywhere. Warn, but do not block — git would not block
+  # either, and a forwarder that started failing closed on a permissions quirk
+  # would wedge every commit in the repo.
+  if [ -e "$_hook" ]; then
+    printf '\n  [~/.claude hooks] WARNING: the global %s hook is present but NOT executable,\n' "$_name" >&2
+    printf '  so it is being skipped:  %s\n' "$_hook" >&2
+    printf '  If that is the gitleaks pre-commit, secret scanning is OFF for this commit.\n' >&2
+    printf '  Restore it with:  chmod +x %s\n\n' "$_hook" >&2
+  fi
+  exit 0
+fi
+
+# Never invoke ourselves: a global hooksPath pointing back at this directory
+# (or a global hook symlinked to this file) would recurse forever.
+_self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null)"
+_target="$(readlink -f "$_hook" 2>/dev/null)"
+[ -n "$_self" ] && [ "$_self" = "$_target" ] && exit 0
+
+exec "$_hook" "$@"

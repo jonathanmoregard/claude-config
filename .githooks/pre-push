@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Pushes never leave ~/.claude's primary checkout. That checkout is the live
+# harness config and the claude-pull fast-forward target, not a workspace:
+# anything worth pushing was made in a linked worktree and is pushed from
+# there. Linked worktrees and unrelated repositories are untouched.
+#
+# The refusal comes FIRST and has no side effects. Only a push that is allowed
+# reaches the machine-wide pre-push hook (same argv and stdin, non-zero exit
+# propagated): that hook has a body keyed on the ~/.claude toplevel which
+# rewrites and stages mcp-servers.json, and running it for a push that is then
+# refused would leave the live checkout dirty. `git push --no-verify` skips this hook (git
+# offers no unskippable push hook); the commit and ref guards are the floor.
+
+set -uo pipefail
+
+unset GIT_CONFIG GIT_CONFIG_COUNT
+for _v in "${!GIT_CONFIG_KEY_@}" "${!GIT_CONFIG_VALUE_@}"; do
+  unset "$_v"
+done
+unset _v
+
+# stdin carries the refs being pushed and can be read only once.
+payload=""
+while IFS= read -r line; do
+  payload+="$line"$'\n'
+done
+
+origin_url="$(git config --local --get remote.origin.url 2>/dev/null || true)"
+forward_global() {
+  local hook_dir
+  hook_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+  printf '%s' "$payload" \
+    | WORKTREE_POLICY_FORWARD_HOOK=pre-push "$hook_dir/_forward-global-hook" "$@"
+  exit $?
+}
+
+[[ "$origin_url" =~ [:/]jonathanmoregard/\.claude(\.git)?/?$ ]] || forward_global "$@"
+
+dirs="$(git rev-parse --path-format=absolute --git-dir --git-common-dir 2>/dev/null || true)"
+git_dir=""
+common_dir=""
+if [ -n "$dirs" ]; then
+  { IFS= read -r git_dir; IFS= read -r common_dir; } <<< "$dirs"
+fi
+[ -n "$git_dir" ] && [ -n "$common_dir" ] || forward_global "$@"
+git_dir="$(readlink -f "$git_dir" 2>/dev/null || printf '%s' "$git_dir")"
+common_dir="$(readlink -f "$common_dir" 2>/dev/null || printf '%s' "$common_dir")"
+[ "$git_dir" = "$common_dir" ] || forward_global "$@"
+
+repo_top="$(git rev-parse --show-toplevel 2>/dev/null || printf '%s' "$PWD")"
+cat >&2 <<EOF
+
+REFUSED — pushes are forbidden from the ~/.claude primary checkout.
+
+  checkout: $repo_top
+  remote:   ${1:-?} ${2:-}
+
+Push from the linked worktree that owns the branch instead:
+
+  git -C ~/worktrees/claude-<slug> push -u origin <branch>
+
+New work starts with:
+
+  $repo_top/scripts/claude-worktree.sh <slug>
+EOF
+exit 1
