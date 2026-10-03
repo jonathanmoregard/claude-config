@@ -285,7 +285,8 @@ trap cleanup EXIT
 old_umask="$(umask)"
 umask 077
 
-python3 "$AGGREGATE" --ledger-dir "$LEDGER_DIR" > "$tmp_new" 2>"$tmp_err"
+python3 "$AGGREGATE" --ledger-dir "$LEDGER_DIR" \
+  --pending-dir "$PROPOSALS_SINK/permissions" > "$tmp_new" 2>"$tmp_err"
 status=$?
 if [[ $status -ne 0 ]]; then
   while IFS= read -r line; do

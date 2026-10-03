@@ -431,6 +431,54 @@ def apply_decided(groups, decided):
     return kept
 
 
+PENDING_STATUSES = ("pending", "open")
+
+
+def load_pending_keys(pending_dir):
+    """pattern_keys of undecided proposals in the sink's permissions dir.
+
+    A pattern that already waits in the review queue is suppressed like a
+    decided one: re-evaluating it nightly only mints duplicate proposals.
+    Top-level `*.md` files only (README*/dotfiles/archived/ skipped); a file
+    with no `status:` line counts as pending, matching the SessionStart count.
+    """
+    keys = set()
+    try:
+        names = os.listdir(pending_dir)
+    except OSError:
+        return keys
+    for name in names:
+        if not name.endswith(".md") or name.startswith((".", "README")):
+            continue
+        try:
+            with open(os.path.join(pending_dir, name), "r", encoding="utf-8") as fh:
+                lines = fh.read().split("\n")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if not lines or lines[0].strip() != "---":
+            continue
+        status, key = None, None
+        for line in lines[1:]:
+            if line.strip() == "---":
+                break
+            field, sep, value = line.partition(":")
+            if not sep or field != field.strip():
+                continue
+            value = value.strip()
+            if field == "status":
+                status = value
+            elif field == "pattern_key":
+                if value.startswith('"'):
+                    try:
+                        value = json.loads(value)
+                    except ValueError:
+                        continue
+                key = value
+        if key and (status is None or status in PENDING_STATUSES):
+            keys.add(key)
+    return keys
+
+
 # --------------------------------------------------------------------------
 # scanning (best effort, never fatal)
 # --------------------------------------------------------------------------
@@ -566,6 +614,7 @@ def build_digest(
     scan_script=None,
     no_scan=False,
     now=None,
+    pending_dir=None,
 ):
     now = now or datetime.now(timezone.utc)
     cutoff = now - timedelta(days=days)
@@ -574,6 +623,9 @@ def build_digest(
     groups = build_groups(join_outcomes(records))
     groups = [g for g in groups if g["count"] >= min_count]
     groups = apply_decided(groups, load_decided(decided_path) if decided_path else {})
+    if pending_dir:
+        pending = load_pending_keys(pending_dir)
+        groups = [g for g in groups if g["pattern_key"] not in pending]
     groups = groups[:MAX_GROUPS]
     scan_status = scan_samples(groups, no_scan, scan_script)
 
@@ -597,6 +649,11 @@ def build_parser():
     parser.add_argument("--min-count", type=int, default=DEFAULT_MIN_COUNT)
     parser.add_argument(
         "--decided", default=None, help="default: <ledger-dir>/decided.json"
+    )
+    parser.add_argument(
+        "--pending-dir",
+        default=None,
+        help="proposals dir; groups with an undecided proposal there are dropped",
     )
     parser.add_argument(
         "--scan-script",
@@ -643,6 +700,7 @@ def main(argv=None):
         decided_path=decided_path,
         scan_script=scan_script,
         no_scan=args.no_scan,
+        pending_dir=os.path.expanduser(args.pending_dir) if args.pending_dir else None,
     )
     print(json.dumps(digest, ensure_ascii=False, indent=2))
     return 0
