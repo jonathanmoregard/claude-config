@@ -6,6 +6,7 @@ every built-in tool (Bash included, which settings.json allows globally) and
 every configured MCP server. The closure is `--tools <list>` (what is offered
 at all) plus `--strict-mcp-config` (no MCP server unless --mcp-config names
 one). Measured 2026-10-03 on 2.1.288 via the init event: an `--allowedTools
+(arftl-allow: permission-widened — this docstring describes the removed shape)
 Read` + bypassPermissions launch was offered Bash, Write, Edit and 161 MCP
 tools; `--tools "" --strict-mcp-config` was offered none.
 
@@ -39,8 +40,10 @@ def assert_closed(tc, argv, allowed=READ_ONLY):
     tc.assertIsNotNone(offered, "no --tools closure in %r" % (argv,))
     tc.assertLessEqual(offered, allowed, "offers more than %r: %r" % (allowed, offered))
     tc.assertIn("--strict-mcp-config", argv, "MCP servers still load: %r" % (argv,))
+    # arftl-allow: permission-widened (asserts the bypass flag is ABSENT)
     tc.assertNotIn("--dangerously-skip-permissions", argv)
     if "--permission-mode" in argv:
+        # arftl-allow: permission-widened (asserts bypass mode is ABSENT)
         tc.assertNotEqual(argv[argv.index("--permission-mode") + 1], "bypassPermissions")
 
 
@@ -81,6 +84,7 @@ class DateCheckClosureTest(unittest.TestCase):
         self.assertEqual(len(calls), 1, "expected exactly one claude call")
         argv = shlex.split(calls[0].replace("\\\n", " ").rstrip(")"))
         assert_closed(self, argv, allowed=set())
+        # arftl-allow: permission-widened (asserts the bypass flag is ABSENT)
         self.assertNotIn("dangerously-skip-permissions", src)
 
 

@@ -189,6 +189,7 @@ Do NOT touch the todo_created flag — the shell script owns escalation.
 
 # `--tools ""` offers no built-in tool, and `--strict-mcp-config` with no
 # --mcp-config loads no MCP server (claude.ai connectors included). Measured
+# arftl-allow: permission-widened (describes the removed bypass shape)
 # 2026-10-03 on 2.1.288 from the init event: the previous bypassPermissions
 # shape was offered Bash, Write, Edit and 161 MCP tools (Gmail, Drive,
 # Calendar...); this shape is offered none.
