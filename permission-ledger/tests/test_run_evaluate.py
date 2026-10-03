@@ -265,19 +265,28 @@ class RunEvaluateTestCase(unittest.TestCase):
 
         # the agent got exactly the argv the fix specifies
         argv = self.stub_argv_list()
-        self.assertEqual(argv[:5], ["--model", "opus", "--print", "--allowedTools",
-                                    EXPECTED_ALLOWED_TOOLS])
-        self.assertEqual(argv[5], "-p")
+        self.assertEqual(argv[:3], ["--model", "opus", "--print"])
+        self.assertEqual(argv[-2], "-p")
         with open(PROMPT, encoding="utf-8") as fh:
-            self.assertEqual(argv[6], fh.read().rstrip("\n"))
-        self.assertEqual(len(argv), 7, argv)
+            self.assertEqual(argv[-1], fh.read().rstrip("\n"))
+        flags = argv[3:-2]
+        self.assertIn("--strict-mcp-config", flags)
+        opts = dict(zip(flags[::2], flags[1::2]))
 
-        # no Bash allowance is granted: not in the constant, not in the argv
-        # that was actually passed. (The prompt body, argv[6], legitimately
-        # mentions Bash — it is the forbidden-allow list.)
+        # Both tool rails are passed: `--tools` closes the offer to exactly the
+        # read-only set (so a tool a future CLI adds is never offered), and
+        # `--allowedTools` only pre-approves that same set. Neither carries Bash.
+        # (The prompt body legitimately mentions Bash — it is the forbidden-allow
+        # list — so only the flag values are checked.)
+        self.assertEqual(opts.get("--tools"), EXPECTED_ALLOWED_TOOLS, argv)
+        self.assertEqual(opts.get("--allowedTools"), EXPECTED_ALLOWED_TOOLS, argv)
         self.assertNotIn("Bash", EXPECTED_ALLOWED_TOOLS)
-        self.assertNotIn("Bash", argv[4])
-        self.assertFalse([a for a in argv[:6] if "Bash" in a], argv[:6])
+        # ...and the named-removal rail takes the shell away explicitly.
+        self.assertIn("Bash", opts.get("--disallowedTools", "").split(), argv)
+        self.assertFalse(
+            set(EXPECTED_ALLOWED_TOOLS.split()) & set(opts.get("--disallowedTools", "").split()),
+            "allow and deny lists must not contradict",
+        )
 
         # ...run from ~/.claude, as the cron line always did
         with open(self.stub_cwd, encoding="utf-8") as fh:
