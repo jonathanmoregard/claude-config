@@ -540,6 +540,47 @@ def open_prs_for_branch(root, branch):
     return (prs if isinstance(prs, list) else None), None
 
 
+PR_TRIGGER = re.compile(r"\bpull_request(?:_target)?\b")
+
+
+def pr_gate(root):
+    """Does opening a PR here spend billed Actions minutes? Returns a dict.
+
+    `gated` is true for a private or internal repository whose workflows run on
+    `pull_request`: the PR, and every push to it afterwards, runs CI on paid
+    minutes. Pushing the branch alone triggers nothing there, so the PR is the
+    step to hold. Workflows are read from this checkout, because GitHub runs a
+    PR's `pull_request` jobs from the PR head's own workflow files.
+
+    Unknown visibility counts as gated: the cost of guessing wrong that way is
+    one extra question to the user, the other way is minutes nobody approved.
+    """
+    triggers = False
+    wf_dir = os.path.join(root, ".github", "workflows")
+    try:
+        names = sorted(os.listdir(wf_dir))
+    except OSError:
+        names = []
+    for name in names:
+        if not name.endswith((".yml", ".yaml")):
+            continue
+        try:
+            with open(os.path.join(wf_dir, name), encoding="utf-8") as fh:
+                text = "\n".join(line.split("#", 1)[0] for line in fh)
+        except (OSError, UnicodeDecodeError):
+            continue
+        if PR_TRIGGER.search(text):
+            triggers = True
+            break
+    if not triggers:
+        return {"gated": False, "visibility": None, "pr_ci": False}
+    code, out, _ = run(["gh", "repo", "view", "--json", "visibility",
+                        "-q", ".visibility"], cwd=root)
+    visibility = out.strip().upper() if code == 0 and out.strip() else None
+    return {"gated": visibility != "PUBLIC", "visibility": visibility,
+            "pr_ci": True}
+
+
 def collect_pr(root):
     """PR facts via gh. Returns (pr_or_None, checks_or_None, error_or_None)."""
     if shutil.which("gh") is None:
@@ -962,8 +1003,22 @@ def evaluate(cwd, do_integrity=True):
     result["checks"] = checks
 
     if pr is None:
-        b.add("NO_PR", "no pull request open for this branch",
-              "gh pr create --fill")
+        gate = pr_gate(repo["root"])
+        result["pr_gate"] = gate
+        if gate["gated"]:
+            # Private repo, PR-triggered CI: the PR is what spends minutes, so
+            # it is opened once, on a branch the user has already reviewed, and
+            # only after the user says yes. CLAUDE.md "PRs" owns the rule.
+            b.add("NO_PR",
+                  "no pull request open for this branch — PR HELD: "
+                  f"{(gate['visibility'] or 'unknown-visibility').lower()} "
+                  "repo whose CI runs on pull_request (billed Actions minutes)",
+                  "finish local gates and the user's review first, then ASK "
+                  "the user whether to open the PR. Never `gh pr create` "
+                  "without that yes")
+        else:
+            b.add("NO_PR", "no pull request open for this branch",
+                  "gh pr create --fill")
     elif (pr.get("state") or "").upper() == "MERGED":
         # Already landed. Every downstream gate is moot, and asking the user to
         # merge it is the specific failure this branch of the logic exists to

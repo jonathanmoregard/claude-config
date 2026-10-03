@@ -10,7 +10,7 @@ Never ask the user to do what you can do. Run the commands, tests, reads, edits,
 - Uploading sensitive content to third-party tools
 - Scope expansion — flag in one sentence, wait
 
-**Proceed without asking:** `git push`, opening/updating PRs, updating an outdated green PR's branch (merging stays the user's click), expected status updates.
+**Proceed without asking:** `git push`, opening/updating PRs (except PR-gated repos — see **PRs**), updating an outdated green PR's branch (merging stays the user's click), expected status updates.
 
 **Safe cleanup without asking:**
 - Temporary files created by the current agent/session may be deleted after verifying the exact target, ownership, and scope.
@@ -106,3 +106,6 @@ User instructions override everything below.
 
 ## PRs
 - Target the repo's default branch. Non-default only when asked, then re-target before merge.
+- **PR-gated repo** = private/internal repo whose workflows run on `pull_request`: opening the PR, and every push to it, spends billed Actions minutes; pushing the branch alone does not. `dod-check.py` reports it as `NO_PR … PR HELD`. Check: `gh repo view --json visibility` + `grep pull_request .github/workflows/*`.
+- PR-gated → no PR until the branch is ready: local gates green (`scripts/check` etc.) and the user's review back-and-forth settled. Push the branch for backup freely. Then ask one closed question — "Open the PR?" — and wait. Only the user's yes, or an explicit "open a PR", authorizes `gh pr create`. Draft PRs run CI too; no draft workaround.
+- Public, or private with no PR-triggered CI → open PRs as before.

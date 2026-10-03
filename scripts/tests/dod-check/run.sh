@@ -124,6 +124,20 @@ case_run "unpushed commits block" green 1 "UNPUSHED_COMMITS"
 # ---- PR states ------------------------------------------------------------
 fresh_repo; git push -q -u origin feat/x
 case_run "no PR blocks"            no_pr    1 "NO_PR"
+# A PR in a private repo with PR-triggered CI spends billed Actions minutes, so
+# the fix line stops saying `gh pr create` and says to ask the user first. No
+# workflows, a public repo, or a comment-only mention keep the plain fix.
+case_run "no PR, no CI: plain fix" no_pr    1 "gh pr create --fill"
+mkdir -p .github/workflows
+printf 'on:\n  push:\n    branches: [main]\n# no pull_request trigger here\n' > .github/workflows/ci.yml
+DOD_VISIBILITY=PRIVATE case_run "comment-only pull_request is not a trigger" no_pr 1 "gh pr create --fill"
+printf 'on:\n  pull_request:\n' > .github/workflows/ci.yml
+DOD_VISIBILITY=PUBLIC   case_run "public repo with PR CI: plain fix" no_pr 1 "gh pr create --fill"
+DOD_VISIBILITY=PRIVATE  case_run "private repo with PR CI: PR held"  no_pr 1 "PR HELD: private"
+DOD_VISIBILITY=PRIVATE  case_run "private repo: ask before creating" no_pr 1 "ASK the user"
+DOD_VISIBILITY=INTERNAL case_run "internal repo counts as private"   no_pr 1 "PR HELD: internal"
+DOD_VISIBILITY=fail     case_run "unknown visibility holds the PR"   no_pr 1 "PR HELD: unknown-visibility"
+rm -r .github
 # The `merged` fixture reports headRefOid — the commit the PR actually merged.
 # Here nothing was pushed after the merge, so that is HEAD.
 export DOD_HEAD_OID="$(git rev-parse HEAD)"
