@@ -69,7 +69,7 @@ Poll the tab title with `tabs_context`: `✶` working, `✓` done, `💤` asleep
 
 - Keep exactly one Claude Design tab; a run is bound to the tab that started it.
 - `💤`: Memory Saver slept the tab and changed its tab id. Re-run `tabs_context`, navigate to wake it, click Resume if the chat says "We got interrupted". Never send into a sleeping tab.
-- A Memory Saver exception for claude.ai is not enough: a run still stopped with the exception set and no memory pressure. Before asking the user for that setting, check it is not already set (`performance_tuning.tab_discarding` in the Chrome profile's `Preferences`). Poll every ~10 minutes and Resume on interruption; expect it, do not treat it as a one-off.
+- Cause seen: the Chrome window was minimized. The page then reports `document.visibilityState === "hidden"` with a 0x0 viewport, screenshots time out, and the run stops ("We got interrupted"). A Memory Saver exception does not help. Before sending a round, check visibility with JS; if hidden, ask the user to restore the window (a window you cannot un-minimize yourself). Poll about every 10 minutes and Resume if interrupted.
 
 ## Review a round
 
