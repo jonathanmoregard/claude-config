@@ -440,6 +440,9 @@ def _all_samples(groups):
 # One JSON string literal; the closing quote may be missing when the sample
 # was truncated mid-string.
 _JSON_STRING = re.compile(r'"((?:[^"\\]|\\.)*)("?)', re.DOTALL)
+_IDENTIFIER = re.compile(r"\A[A-Za-z_][A-Za-z0-9_.-]*\Z")
+# prompt-injection-scan scores documents separated by such lines one by one.
+_DOC_SEPARATOR = re.compile(r"^[ \t]*---[ \t]*$", re.MULTILINE)
 
 
 def scan_text(sample):
@@ -457,15 +460,22 @@ def scan_text(sample):
         return text
     values = []
     for m in _JSON_STRING.finditer(text):
-        if m.group(2) and text[m.end():].lstrip().startswith(":"):
-            continue  # an object key
         literal = m.group(1)
         try:
-            values.append(json.loads('"%s"' % literal))
+            value = json.loads('"%s"' % literal)
         except ValueError:
             # Truncation cut an escape sequence in half; keep the raw text.
-            values.append(literal)
+            value = literal
+        if m.group(2) and text[m.end():].lstrip().startswith(":"):
+            if _IDENTIFIER.match(value):
+                continue  # a structural key (file_path, command, ...)
+        values.append(value)
     return "\n".join(v for v in values if v.strip())
+
+
+def _scan_document(text):
+    """A sample as one scanner document: it may not draw `---` boundaries."""
+    return _DOC_SEPARATOR.sub("- - -", text)
 
 
 def run_injection_scan(groups, scan_script):
@@ -482,20 +492,23 @@ def run_injection_scan(groups, scan_script):
         return NO_SCAN_SCRIPT_STATUS
     if not os.path.isfile(scan_script):
         return "unavailable: no scanner script at %s" % scan_script
-    payload = "\n---\n".join(scan_text(s) for s in samples)
+    payload = "\n---\n".join(_scan_document(scan_text(s)) for s in samples)
+    # Over stdin: one argv string caps at 128 KiB and cannot hold a NUL.
+    data = payload.encode("utf-8", "replace")
     try:
         # Own session, so a timeout kills the scanner's children too (the
         # classifier it runs would otherwise outlive it, model in memory).
         proc = subprocess.Popen(
-            [sys.executable, scan_script, "--text", payload],
+            [sys.executable, scan_script],
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         return "error: %s: %s" % (type(exc).__name__, exc)
     try:
-        _, stderr = proc.communicate(timeout=SCAN_CONTENT_TIMEOUT)
+        _, stderr = proc.communicate(input=data, timeout=SCAN_CONTENT_TIMEOUT)
     except subprocess.TimeoutExpired:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
