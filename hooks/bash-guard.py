@@ -14,6 +14,8 @@ Layers, in order:
      ``_check_pipe_to_shell``, which reads tokenised pipeline stages and never
      this literal. The intent of six ported deny rules that the CLI's matcher
      structurally cannot enforce
+  3b. a ``run_in_background`` command that captures ``$?`` and then ends on
+     ``echo``/``printf``, so its completion notice always reads exit code 0
   4. the nixos-config push gate (``Pre-push checklist:`` trailer, with its
      claim-vs-diff and merge-base cross-checks)
   5. allow — by emitting NOTHING
@@ -1112,6 +1114,48 @@ def _check_pipe_to_shell(command: str) -> str | None:
 
 
 # ----------------------------------------------------------------------
+# Layer 3b: a background command that captures its exit status and then
+# throws it away on a trailing echo
+# ----------------------------------------------------------------------
+# A `run_in_background` call is reported back as "completed (exit code N)",
+# and N is the status of the LAST statement. Capture `$?`, end on `echo`, and
+# N is always 0. Measured 2026-09-28 (klaffat): `(scripts/check affected >
+# gate3.log 2>&1; echo EXIT=$? >> gate3.log)` ran with one failing e2e test,
+# notified exit code 0, and a push went out on it. A foreground call is not
+# caught: its output, `$?` line included, is read directly.
+_STATUS_CAPTURE = re.compile(r"\$\?|\$\{\?\}|PIPESTATUS")
+_STATUS_DISCARDING_TAIL = re.compile(r"^[\s({]*(?:builtin\s+)?(?:echo|printf)\b")
+
+_BG_STATUS_MASKED_HINT = (
+    "bash-guard: this background command captures its exit status and then "
+    "ends on echo/printf, so the completion notice will report exit code 0 "
+    "even if the command failed. That masked a failing gate as green and a "
+    "push went out on it (2026-09-28).\n"
+    "Keep the log line and re-raise the status as the last statement:\n"
+    "  (<cmd> > LOG 2>&1; rc=$?; echo EXIT=$rc >> LOG; exit $rc)"
+)
+
+
+def _check_bg_status_masked(command: str, background: bool) -> str | None:
+    if not background or not _STATUS_CAPTURE.search(command):
+        return None
+    body = command.rstrip().rstrip(")}; \t\n")
+    parts = [(seg, op) for seg, op in _split_operators(body) if seg]
+    if not parts or not _STATUS_DISCARDING_TAIL.match(parts[-1][0]):
+        return None
+    # `cmd && echo …` skips the echo when cmd fails, so cmd's status is reported.
+    if len(parts) > 1 and parts[-2][1] == "&&":
+        return None
+    # A `$?` inside a loop body tests an in-loop command; only a capture after
+    # the last `done` is a status the trailing echo throws away.
+    last_done = max((i for i, (seg, _op) in enumerate(parts)
+                     if re.match(r"done\b", seg)), default=-1)
+    if not any(_STATUS_CAPTURE.search(seg) for seg, _op in parts[last_done + 1:]):
+        return None
+    return _BG_STATUS_MASKED_HINT
+
+
+# ----------------------------------------------------------------------
 # Layer 4: the nixos-config push gate
 # (ported from `_check_nixos_push` in mcps/safe-bash/server.py, which chunk
 # C deletes; the incident texts below are the behaviour, not decoration)
@@ -1971,6 +2015,10 @@ def main() -> int:
         reason = _check_dangerous_find(command)
     if reason is None:
         reason = _check_pipe_to_shell(command)
+    if reason is None:
+        reason = _check_bg_status_masked(
+            command, tool_input.get("run_in_background") is True
+        )
     if reason is None:
         reason = _check_nixos_push(command, cwd if isinstance(cwd, str) else None)
         if reason is not None:

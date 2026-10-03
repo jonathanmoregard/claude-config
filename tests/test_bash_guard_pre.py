@@ -2813,6 +2813,66 @@ check("and names what it could not resolve",
 
 
 # ----------------------------------------------------------------------
+section("Background exit-status masking (2026-09-28 klaffat incident)")
+# Invariant: a `run_in_background` command's completion notification reports
+# the command's exit code. A command that captures the status (`$?`) and then
+# ends on `echo`/`printf` always reports 0, so a failed gate reads as green.
+# Measured: `(scripts/check affected > log 2>&1; echo EXIT=$? >> log)` ran
+# with one e2e failure, notified "completed (exit code 0)", and a push went
+# out on it.
+
+
+def bg_guard(command: str, background: bool = True) -> tuple[str | None, str]:
+    payload = pre_payload(command)
+    if background:
+        payload["tool_input"]["run_in_background"] = True
+    _, parsed, _, _ = run_hook("bash-guard.py", payload,
+                               env_extra={"DCG_PATH": STUB_ALLOW})
+    return decision_of(parsed), reason_of(parsed)
+
+
+_MASKING = {
+    "incident shape (subshell, echo EXIT=$? into the log)":
+        "cd /tmp && git log -1 && (timeout 2400 bash scripts/check affected "
+        "> /tmp/gate3.log 2>&1; echo EXIT=$? >> /tmp/gate3.log)",
+    "plain trailing echo of $?":
+        "make test > /tmp/t.log 2>&1; echo \"rc=$?\"",
+    "status saved to a variable, then echoed last":
+        "make test > /tmp/t.log 2>&1\nrc=$?\nprintf 'EXIT=%s\\n' \"$rc\" >> /tmp/t.log",
+}
+for _label, _cmd in _MASKING.items():
+    _dec, _why = bg_guard(_cmd)
+    check(f"masking DENIED in background: {_label}", _dec == "deny",
+          f"decision={_dec!r} {_why[:200]}")
+    check(f"  and the hint gives the status-preserving rewrite: {_label}",
+          "exit $rc" in _why, _why[:300])
+
+_PRESERVING = {
+    "rewrite that re-raises the status":
+        "(make test > /tmp/t.log 2>&1; rc=$?; echo EXIT=$rc >> /tmp/t.log; exit $rc)",
+    "&& keeps the status, no capture":
+        "make test > /tmp/t.log 2>&1 && echo done",
+    "no status capture at all":
+        "sleep 1; echo hello",
+    # `&&` skips the echo on failure, so the command's own status is reported.
+    "echo joined by && reports the failing status":
+        "make test > /tmp/t.log 2>&1 && echo \"ok rc=$?\"",
+    # A `$?` inside a loop body tests an in-loop command; the status after
+    # `done` is the loop's own, and the trailing echo discards nothing captured.
+    "status capture only inside a wait-until loop":
+        "until curl -sf localhost:8080; do echo \"waiting rc=$?\"; sleep 2; done; echo UP",
+}
+for _label, _cmd in _PRESERVING.items():
+    _dec, _why = bg_guard(_cmd)
+    check(f"status-preserving background command allowed: {_label}",
+          _dec is None, f"decision={_dec!r} {_why[:200]}")
+
+_dec, _why = bg_guard("make test > /tmp/t.log 2>&1; echo \"rc=$?\"", background=False)
+check("foreground `cmd; echo rc=$?` allowed: its output is read directly",
+      _dec is None, f"decision={_dec!r} {_why[:200]}")
+
+
+# ----------------------------------------------------------------------
 section("Summary")
 shutil.rmtree(SCRATCH, ignore_errors=True)
 if FAILURES:
