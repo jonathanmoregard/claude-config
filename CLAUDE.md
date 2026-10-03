@@ -10,7 +10,7 @@ Never ask the user to do what you can do. Run the commands, tests, reads, edits,
 - Uploading sensitive content to third-party tools
 - Scope expansion — flag in one sentence, wait
 
-**Proceed without asking:** `git push`, opening/updating PRs, merging a green PR on an outdated branch, expected status updates.
+**Proceed without asking:** `git push`, opening/updating PRs, updating an outdated green PR's branch (merging stays the user's click), expected status updates.
 
 **Safe cleanup without asking:**
 - Temporary files created by the current agent/session may be deleted after verifying the exact target, ownership, and scope.
