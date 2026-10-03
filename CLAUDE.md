@@ -73,8 +73,9 @@ User instructions override everything below.
 - Skill misses a trigger clearly in its scope → add that phrasing to its `description` the same session. Store-symlinked skills → route through the owning repo's PR flow.
 
 ## Config edits (`~/.claude`)
-- Read-only, pinned to `master` — the harness reads that working tree live. Every edit (settings.json, hooks, skills, agents, commands, permissions, scripts, CLAUDE.md) goes in `~/worktrees/claude-<slug>/` off freshly fetched `origin/master`, then a PR. One-liners included; branch ownership is the criterion, not diff size.
+- Read-only, pinned to `master` — the harness reads that working tree live. Every edit (settings.json, hooks, skills, agents, commands, permissions, scripts, CLAUDE.md) goes in `~/worktrees/claude-<slug>/` off freshly fetched `origin/master` (`~/.claude/scripts/claude-worktree.sh <slug>`), then a PR. One-liners included; branch ownership is the criterion, not diff size.
 - Never commit to a branch this session did not create.
+- `~/.claude` dirty or off `master` → stop and report its exact state. Never stash, reset, clean or switch it.
 - A skill telling you to edit config does not exempt you — built-in (`update-config`, `keybindings-help`, `statusline-setup`, `fewer-permission-prompts`), plugin, or newly installed. This rule wins; run its steps inside the worktree.
 - `skills/<name>` is a symlink → it belongs to another repo. Edit it there, via that repo's PR.
 - Untracked runtime state (`tmp/`, `projects/`, `homunculus/`, `reflections/`) needs no worktree.

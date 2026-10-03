@@ -397,6 +397,16 @@
         "hooks": [
           {
             "type": "command",
+            "command": "bash $HOME/.claude/scripts/worktree-policy-session-start.sh",
+            "timeout": 10,
+            "statusMessage": "Checking ~/.claude master pin..."
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
             "command": "python3 $HOME/.claude/hooks/nixos-drift-health.py",
             "timeout": 5,
             "statusMessage": "Checking NixOS drift..."

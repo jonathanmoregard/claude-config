@@ -1,0 +1,709 @@
+#!/usr/bin/env bash
+# git-level enforcement floor for the ~/.claude repository.
+#
+# WHY THIS EXISTS
+# ---------------
+# `~/.claude` is the LIVE harness config: settings.json, hooks/ and skills/ are
+# read from its working tree by every running session, and claude-pull.timer
+# fast-forwards it to origin/master. Development branches belong in linked
+# worktrees (~/worktrees/claude-<slug>). The incident this exists for: a
+# settings edit was committed onto another session's feature branch that this
+# checkout happened to be parked on; that PR merged and was reverted wholesale.
+#
+# Agent instructions describe the workflow and prepare-commit-msg rejects
+# commits in the primary checkout. This is the floor underneath both: Git
+# enforces its own ref transactions, so command spelling does not matter and
+# Claude, Codex, timers, and hand-typed commands receive the same result.
+#
+# THE RULE — in the MAIN worktree of a ~/.claude clone only:
+#   * refs/heads/master, fast-forward .................. ALLOWED
+#     (load-bearing: the scheduled puller advances master by fast-forward)
+#   * refs/heads/master, non-fast-forward ............... REFUSED
+#   * any other refs/heads/*, advancing an existing ref . REFUSED  (branch pin)
+#   * creating a ref that does not yet exist ............ ALLOWED
+#   * creating refs/heads/master, not a descendant of
+#     where the reflog says it last pointed ............. REFUSED
+#   * a no-op update (new == current) ................... ALLOWED
+#   * deleting any ref other than refs/heads/master ..... ALLOWED
+#   * deleting refs/heads/master, pack-refs prune pass .. ALLOWED
+#   * deleting refs/heads/master, any other way ......... REFUSED
+#   * HEAD -> ref:refs/heads/<not-master>, this worktree . REFUSED  (HEAD pin)
+#   * HEAD -> ref:refs/heads/master ..................... ALLOWED  (recovery)
+#   * HEAD -> a raw OID (detached), this worktree ...... REFUSED  (HEAD pin)
+#   * HEAD of a LINKED worktree -> refs/heads/master ...... REFUSED
+#   * HEAD of a LINKED worktree -> any other target ..... ALLOWED
+#   * refs/heads/master moved from a LINKED worktree ...... REFUSED
+#   * anything not under refs/heads/, and not HEAD ...... UNTOUCHED
+#   * in a LINKED worktree, non-master branches stay unrestricted.
+#
+# The HEAD pin is what makes "the main checkout is on master" true at the git
+# layer rather than true only as long as a command-string parser keeps up. The
+# branch pin says no commit may land on a feature branch here; the HEAD pin
+# says the checkout may not be moved onto one in the first place.
+#
+# Three of those allowances are not softness, they are load-bearing — each was
+# established by running the operation against a logging hook:
+#
+#   * CREATION must be allowed because `git worktree add -b <branch>` emits
+#     `0000…0 <sha> refs/heads/<branch>` *in the main checkout's gitdir*. That
+#     is exactly what scripts/claude-worktree.sh does, so refusing creation
+#     would break the sanctioned way to comply with this very rule.
+#   * NO-OP must be allowed because Git maintenance can emit an update whose
+#     new value already equals its current value.
+#   * DELETION must be allowed because `git pack-refs --all` — which `git gc`
+#     runs on its own — deletes every loose ref after packing it, emitting
+#     `new = 0000…0` for master and every feature branch. Refusing deletions
+#     would break gc.
+#
+#     This one used to be blanket, and the reason given was that git refuses to
+#     delete a branch a worktree has checked out. That only holds while HEAD is
+#     ATTACHED — and detaching HEAD was itself allowed, so three permitted steps
+#     composed into "master moves anywhere". master's deletion is now narrowed
+#     to the pack-refs prune pass, discriminated on disk rather than from the
+#     payload (which cannot tell them apart); see the deletion branch below.
+#
+# The old-oid on stdin is NOT used to make any decision. `git branch -f` and
+# `git update-ref <ref> <new>` both send all-zeros as <old-oid> even when the
+# ref already exists, so "old is zeros" does not mean "creation". githooks(5)
+# says so explicitly and prescribes the fix used here: resolve the ref's
+# current value with `git rev-parse`. At the `prepared` state refs are locked
+# but still hold their pre-transaction value, so rev-parse is authoritative.
+#
+# WHAT THIS LAYER DELIBERATELY DOES NOT DO
+# ----------------------------------------
+# A plain `git commit` or `git revert` on main in the main checkout is a
+# fast-forward advance of master, so it is ALLOWED here. It is the same
+# operation the puller performs and git cannot tell them apart. The
+# prepare-commit-msg hook refuses ordinary commits here. No heuristic
+# (process name, tty, env sniffing) is used to guess the caller's identity —
+# guessing is precisely what this layer exists to avoid.
+
+# No `set -e`: exit codes are inspected deliberately throughout, and an
+# unexpected abort in a ref hook would take down every git command in the repo.
+set -uo pipefail
+
+state="${1:-}"
+
+# --- neutralise config-override env vars ------------------------------------
+# REPRODUCED bypass, same env-prefix class as the kill switch removed below:
+#
+#   git config --get-regexp '^remote\..*\.url$'   -> remote.origin.url …/.claude.git
+#   GIT_CONFIG=/dev/null git config --get-regexp …-> (empty, rc=0)
+#   GIT_CONFIG=/dev/null git commit               -> commit landed on a feature
+#                                                    branch in the main checkout
+#
+# GIT_CONFIG is a whole-file override for the `git config` BUILTIN only, so the
+# outer `git commit` ran perfectly normally while the hook's own remote lookup
+# read an empty file, concluded "not the ~/.claude repo" and stood down.
+#
+# Cleared here:
+#   GIT_CONFIG          — the reproduced one.
+#   GIT_CONFIG_COUNT,
+#   GIT_CONFIG_KEY_*,
+#   GIT_CONFIG_VALUE_*  — inject config at the highest precedence. Measured,
+#                         they can only ADD keys, so they cannot hide the
+#                         repo's remote; but they can reach core.* for the
+#                         hook's own git calls, and there is no reason to let
+#                         the environment steer those.
+#
+# Deliberately NOT cleared:
+#   GIT_CONFIG_GLOBAL,
+#   GIT_CONFIG_SYSTEM   — these select which global/system file is merged in,
+#                         at LOWER precedence than the repo's own config.
+#                         Measured on git 2.55: with the ~/.claude remote in
+#                         local config, all of GIT_CONFIG_GLOBAL=/dev/null,
+#                         =<missing file> and =<file defining another remote>
+#                         still returned the local ~/.claude URL. They can only
+#                         ADD remotes, i.e. only ever make this hook MORE
+#                         likely to enforce, never less. Clearing them would
+#                         also make the hook read the real machine config from
+#                         inside the test suite (which sets them to /dev/null
+#                         for isolation) and chain to the real gitleaks hook.
+#
+#   GIT_DIR, GIT_COMMON_DIR — could in principle point the scope check at an
+#                         empty config, but measured they take git itself down
+#                         with them (`GIT_COMMON_DIR=<empty dir> git commit`
+#                         -> fatal, rc=128, nothing lands), so there is no
+#                         bypass to close; and git sets GIT_DIR legitimately
+#                         when it runs hooks for a linked worktree, so
+#                         clearing it would break the hook's own git calls.
+#
+# The list is belt to the braces of the scope check below, which no longer
+# depends on the `git config` builtin alone — precisely so that keeping this
+# list complete is not the only thing standing between here and a bypass.
+unset GIT_CONFIG GIT_CONFIG_COUNT
+for _v in "${!GIT_CONFIG_KEY_@}" "${!GIT_CONFIG_VALUE_@}"; do
+  unset "$_v"
+done
+unset _v
+
+# --- NO re-entrancy guard, on purpose ---------------------------------------
+# There used to be one: `if [ -n "$WORKTREE_POLICY_RT_HOOK" ]; then exit 0; fi`
+# at the top, exported so nested invocations returned immediately. It was a
+# kill switch. `env WORKTREE_POLICY_RT_HOOK=1 git commit` disabled the whole
+# pin — reproduced: the commit landed on a feature branch in the main checkout.
+# An env-prefix spelling is exactly the class of bypass this layer exists to
+# close, so there is nothing to keep. A guard that can be forged from outside
+# is worse than no guard, and binding it to a PID does not help: any caller can
+# read its own pid and pass it.
+#
+# It is safe to have none. Every git command this hook runs is read-only and
+# opens no reference transaction, so nothing here can re-enter:
+#
+#     git config --global --get core.hooksPath
+#     git config --get-regexp '^remote\..*\.url$'
+#     git rev-parse --path-format=absolute --git-dir --git-common-dir
+#     git rev-parse --show-toplevel
+#     git rev-parse --verify --quiet <ref>
+#     git merge-base --is-ancestor <a> <b>
+#     git symbolic-ref --quiet HEAD          (only on the refusal path)
+#
+# The scope check's primary source is not a git command at all — it reads the
+# repository's config file directly — so it cannot re-enter either.
+#
+# `<ref>` is taken from the payload but is filtered to `refs/heads/*` before
+# use, so it can never be read as an option. tests/worktree-policy.sh
+# holds the empirical half: a counting wrapper records how many times the hook
+# actually runs for one commit and fails if it exceeds a small bound.
+#
+# The one thing that could still recurse is a machine-wide
+# reference-transaction hook, chained below, that itself updates a ref. That is
+# not a failure mode this file introduces: such a hook recurses identically
+# when core.hooksPath points straight at it and we are not in the picture.
+
+# --- read the transaction ---------------------------------------------------
+# Pure-builtin read: stdin can only be consumed once and a copy is needed both
+# for our own analysis and for the chained global hook.
+payload=""
+while IFS= read -r line; do
+  payload+="$line"$'\n'
+done
+
+# --- chain the global hook --------------------------------------------------
+# This machine sets a global core.hooksPath (~/.config/git/hooks, managed by
+# home-manager). Pointing this repo at its own hooks directory overrides that
+# for this repo, which would silently drop any same-named global hook. Run it
+# too, and let it block if it wants to.
+#
+# Every other hook type gets the same treatment through .githooks/
+# _forward-global-hook; reference-transaction cannot use that forwarder because
+# it has to consume stdin for its own rule and hand a copy on.
+global_rc=0
+_global_dir="$(git config --global --get core.hooksPath 2>/dev/null)"
+if [ -n "$_global_dir" ]; then
+  case "$_global_dir" in
+    "~/"*) _global_dir="$HOME/${_global_dir#\~/}" ;;
+    "~")   _global_dir="$HOME" ;;
+  esac
+  _global_hook="$_global_dir/reference-transaction"
+  # The readlink pair is deliberately inside the -x test: this hook runs on
+  # every ref update, and there is normally no global reference-transaction
+  # hook at all, so the two extra forks should not be paid for nothing.
+  if [ -x "$_global_hook" ]; then
+    # Never invoke ourselves (a global hooksPath pointing back at this file).
+    if [ "$(readlink -f "$_global_hook" 2>/dev/null)" \
+         != "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null)" ]; then
+      printf '%s' "$payload" | "$_global_hook" "$state"
+      global_rc=$?
+    fi
+  fi
+fi
+
+# A non-zero exit only aborts the transaction in the preparing/prepared states;
+# elsewhere it is ignored, so propagating it unconditionally is harmless.
+if [ "$global_rc" -ne 0 ]; then
+  exit "$global_rc"
+fi
+
+# --- our own rule -----------------------------------------------------------
+# Two of the four states can abort a transaction. githooks(5) on git 2.55,
+# verbatim: "The exit status of the hook is ignored for any state except for
+# the 'preparing' and 'prepared' states. In these states, a non-zero exit
+# status will cause the transaction to be aborted." (`preparing` is the newer
+# of the two; older git only documented `prepared`, which is why this is worth
+# quoting rather than paraphrasing.)
+#
+# We act at `prepared`, not `preparing`, because symbolic refs are resolved by
+# then: a `git commit` arrives as `HEAD` during `preparing` but as
+# `refs/heads/<branch>` at `prepared`, which is the form the rule is written
+# against. githooks(5) again: "During the 'preparing' state, symbolic
+# references are not resolved."
+[ "$state" = "prepared" ] || exit 0
+
+# Fast path: the overwhelming majority of transactions touch ORIG_HEAD,
+# AUTO_MERGE, FETCH_HEAD, refs/remotes/*, refs/tags/* or refs/stash. Bail
+# before spawning a single git process.
+#
+# `ref:` is here for the HEAD rule below. A symref update is the only thing
+# that produces it, it is rare, and any symref update is worth looking at —
+# including the exotic `git symbolic-ref HEAD refs/remotes/…`, which would slip
+# past a `refs/heads/`-only match. The high-volume traffic this path exists to
+# skip (ORIG_HEAD, AUTO_MERGE, FETCH_HEAD) carries raw OIDs and never matches.
+case "$payload" in
+  *"refs/heads/"*|*"ref:"*|*" HEAD"*) ;;
+  *) exit 0 ;;
+esac
+
+is_zero_oid() { [[ "$1" =~ ^0+$ ]]; }
+
+# True ONLY for the loose-ref pruning pass of `git pack-refs --all`, which
+# `git gc` runs unprompted. See the deletion branch below for why these facts
+# together are that pass and nothing else.
+#
+# Fails closed: no common dir, an unreadable file, a symref where an OID
+# belongs, a value that does not match — all answer "no", which refuses. A
+# wrong "no" costs one failed ref update inside gc and leaves a loose ref in
+# place; a wrong "yes" reopens the walk-around. Uses $_common_dir, set below.
+is_packrefs_prune() {
+  local ref="$1" loose loose_oid cur rc line
+
+  [ -n "$_common_dir" ] || return 1
+  loose="$_common_dir/$ref"
+  # The loose ref file is the thing being pruned; if there is none, no prune
+  # pass can be in progress and this is a real deletion.
+  [ -f "$loose" ] || return 1
+
+  loose_oid=""
+  IFS= read -r loose_oid < "$loose" 2>/dev/null
+  loose_oid="${loose_oid%%[[:space:]]*}"
+  # `ref: refs/…` in a loose file is a symref, not a packed-ref candidate.
+  [[ "$loose_oid" =~ ^[0-9a-f]{40,64}$ ]] || return 1
+
+  # ...and it must be what the ref actually resolves to right now. At the
+  # `prepared` state the ref is locked but still holds its pre-transaction
+  # value, so rev-parse is authoritative.
+  cur="$(git rev-parse --verify --quiet "$ref" 2>/dev/null)"
+  rc=$?
+  [ "$rc" -eq 0 ] || return 1
+  [ -n "$cur" ] || return 1
+  [ "$cur" = "$loose_oid" ] || return 1
+
+  # packed-refs must ALREADY carry the ref at exactly that value — i.e. the
+  # ref survives this transaction and only its storage changes.
+  [ -f "$_common_dir/packed-refs" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ "$line" = "$loose_oid $ref" ] && return 0
+  done < "$_common_dir/packed-refs"
+  return 1
+}
+
+# The new-oid of the last entry in <ref>'s reflog, or empty when there is no
+# usable one. Read as a FILE, not through `git reflog`: this is asked when the
+# ref itself is gone, and git will not show a reflog for a ref that no longer
+# exists. Reflog lines are `<old-oid> <new-oid> <ident> <ts> <tz>\t<message>`.
+last_reflog_oid() {
+  local log line last="" oid
+  [ -n "$_common_dir" ] || return 0
+  log="$_common_dir/logs/$1"
+  [ -f "$log" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] && last="$line"
+  done < "$log"
+  [ -n "$last" ] || return 0
+  oid="${last#* }"; oid="${oid%% *}"
+  [[ "$oid" =~ ^[0-9a-f]{40,64}$ ]] || return 0
+  is_zero_oid "$oid" && return 0
+  printf '%s' "$oid"
+}
+
+# Does <lock-file> hold the symref value we are being asked to write? git
+# writes `ref: refs/heads/<branch>` into the lock before the `prepared` state,
+# so this identifies WHICH pending HEAD write a given lock belongs to — the
+# part that mere existence cannot answer when sessions run concurrently.
+lock_matches_head_update() {
+  local f="$1" want="$2" first=""
+  [ -r "$f" ] || return 1
+  IFS= read -r first < "$f" 2>/dev/null
+  case "$want" in
+    ref:*)
+      want="${want#ref:}"
+      want="${want#"${want%%[![:space:]]*}"}"
+      want="ref: $want"
+      ;;
+  esac
+  [ "$first" = "$want" ]
+}
+
+# Tail-match on `[:/]owner/repo(.git)?`, mirroring the origin check
+# used by the installer: ssh, https, ssh:// and an optional `.git` suffix all
+# match, while similarly named repositories do not.
+is_dot_claude_url() {
+  [[ "$1" =~ [:/]jonathanmoregard/\.claude(\.git)?/?$ ]]
+}
+
+# --- locate the repo, structurally ------------------------------------------
+# Needed by both checks below, and by neither via `git config`: --git-dir and
+# --git-common-dir come from repository discovery, which is filesystem-based.
+# Measured: unaffected by GIT_CONFIG=/dev/null.
+_git_dir=""; _common_dir=""
+_dirs="$(git rev-parse --path-format=absolute --git-dir --git-common-dir 2>/dev/null)"
+if [ -n "$_dirs" ]; then
+  { IFS= read -r _git_dir; IFS= read -r _common_dir; } <<< "$_dirs"
+fi
+
+# --- scope: only clones of jonathanmoregard/.claude -------------------------
+# A hook that fires on the wrong repository is a far worse failure than one
+# that misses, so this stays confirmation-required: if nothing here can confirm
+# the repo is ~/.claude, the hook stands down.
+#
+# The helper and puller fetch the remote named `origin`; accepting some other
+# matching remote would let a misconfigured origin supply the commits while
+# these guards claimed the repository was verified. Config override variables
+# were neutralised above, so this reads the repository-local origin.
+_origin_url="$(git config --local --get remote.origin.url 2>/dev/null)"
+is_dot_claude_url "$_origin_url" || exit 0
+
+# --- identify main vs linked worktree ---------------------------------------
+# Structural, never a hardcoded path: --git-dir and --git-common-dir resolve to
+# the same directory only in the main worktree; a linked worktree's git dir is
+# <common>/worktrees/<name>. If this cannot be determined we assume the main
+# worktree and keep enforcing — by this point the repo is confirmed to be
+# ~/.claude, and the cost of a false refusal is one recovery command while the
+# cost of failing open is development in the protected primary checkout.
+#
+# NOTE for the HEAD rule below: this answers "which worktree is git RUNNING in",
+# which is NOT the same question as "whose HEAD is being written". `git worktree
+# add` writes the new worktree's HEAD from inside the MAIN worktree's context,
+# so this test alone would mistake it for a branch switch. See the HEAD rule.
+_is_linked=0
+if [ -n "$_git_dir" ] && [ -n "$_common_dir" ] && [ "$_git_dir" != "$_common_dir" ]; then
+  # Both come from one git invocation and are already absolute, so the common
+  # case is a plain string match with no forks. Only when they differ is it
+  # worth resolving symlinks to be sure they are not the same directory by
+  # another name — getting that wrong would disable the hook in the main
+  # worktree, which is the only place it does anything.
+  _git_dir="$(readlink -f "$_git_dir" 2>/dev/null || printf '%s' "$_git_dir")"
+  _common_dir="$(readlink -f "$_common_dir" 2>/dev/null || printf '%s' "$_common_dir")"
+  if [ "$_git_dir" != "$_common_dir" ]; then
+    _is_linked=1
+  fi
+fi
+
+repo_top="$(git rev-parse --show-toplevel 2>/dev/null)" || repo_top="$PWD"
+
+refuse() {
+  local ref="$1" cur="$2" new="$3" what="$4"
+  {
+    printf '\n'
+    printf '  REFUSED — the ~/.claude primary checkout is pinned to master.\n'
+    printf '\n'
+    printf '    refused:  %s\n' "$what"
+    printf '    ref:      %s\n' "$ref"
+    printf '    current:  %s\n' "${cur:-(none)}"
+    printf '    new:      %s\n' "${new:-(none)}"
+    printf '    checkout: %s\n' "$repo_top"
+    printf '\n'
+    printf '  This checkout is not a development workspace. It is the shared\n'
+    printf '  integration and scheduled-pull target. Feature branches and edits\n'
+    printf '  belong in dedicated linked worktrees.\n'
+    printf '\n'
+    printf '  Do this instead — work in a worktree branched off fresh origin/master:\n'
+    printf '\n'
+    printf '      %s/scripts/claude-worktree.sh <slug>\n' "$repo_top"
+    printf '      cd ~/worktrees/claude-<slug>\n'
+    printf '\n'
+    printf '  If this checkout is already dirty or off master, stop and report its\n'
+    printf '  exact state. Do not stash, reset, clean, switch, or move unknown work.\n'
+    printf '\n'
+    printf '  This is a git hook, so it applies to everything equally: Claude, codex,\n'
+    printf '  cron jobs and hand-typed commands.\n'
+    printf '\n'
+  } >&2
+}
+
+refuse_linked_main() {
+  local ref="$1" cur="$2" new="$3" what="$4"
+  {
+    printf '\n'
+    printf '  REFUSED — ~/.claude local master belongs to the primary checkout.\n'
+    printf '\n'
+    printf '    refused:  %s\n' "$what"
+    printf '    ref:      %s\n' "$ref"
+    printf '    current:  %s\n' "${cur:-(none)}"
+    printf '    new:      %s\n' "${new:-(none)}"
+    printf '    checkout: %s\n' "$repo_top"
+    printf '\n'
+    printf '  Linked worktrees may use feature branches only. Fetch and integrate\n'
+    printf '  against origin/master; never attach to or advance local master.\n'
+    printf '\n'
+  } >&2
+}
+
+while IFS=' ' read -r old new ref; do
+  [ -n "${ref:-}" ] || continue
+
+  # Local master is owned by the primary auto-pull checkout. A linked worktree
+  # attached to it can otherwise advance the shared ref while leaving the
+  # primary index/worktree behind — exactly the drift this policy prevents.
+  if [ "$_is_linked" -eq 1 ]; then
+    if [ "$ref" = HEAD ]; then
+      if [ "$new" = ref:refs/heads/master ]; then
+        refuse_linked_main HEAD \
+          "$(git symbolic-ref --quiet HEAD 2>/dev/null || printf '(detached)')" \
+          refs/heads/master \
+          "attaching a linked worktree to local master"
+        exit 1
+      fi
+      continue
+    fi
+
+    [ "$ref" = refs/heads/master ] || continue
+    if is_zero_oid "$new" && is_packrefs_prune "$ref"; then
+      continue
+    fi
+    _linked_cur="$(git rev-parse --verify --quiet "$ref" 2>/dev/null || true)"
+    [ -n "$_linked_cur" ] && [ "$new" = "$_linked_cur" ] && continue
+    refuse_linked_main "$ref" "$_linked_cur" "$new" \
+      "moving local master from a linked worktree"
+    exit 1
+  fi
+
+  # --- HEAD: which branch the main checkout SITS on -------------------------
+  # The branch rule below protects refs/heads/*; this protects the checkout's
+  # own position. Without it, "pinned to master" is only prose and any branch
+  # switch silently disables scheduled updates of the expected branch.
+  #
+  # Measured on git 2.55 with a logging hook, at the `prepared` state, a branch
+  # switch arrives as an update to the ref named `HEAD` whose new value is the
+  # literal string `ref:refs/heads/<branch>`:
+  #
+  #     0000000000000000000000000000000000000000 ref:refs/heads/feat/x HEAD
+  #
+  # Identical for `git switch`, `git checkout <branch>`, `git checkout -b` and
+  # `git symbolic-ref HEAD refs/heads/x`. That is the whole point: the rule is
+  # written against the operation git is performing, so how the command was
+  # spelled — env prefixes, `bash -c`, aliases — cannot change the answer.
+  if [ "$ref" = "HEAD" ]; then
+    case "$new" in
+      ref:*)
+        _target="${new#ref:}"
+        _target="${_target#"${_target%%[![:space:]]*}"}"
+        _what="moving the primary checkout onto a branch other than master"
+        ;;
+      *)
+        _target="detached at $new"
+        _what="detaching HEAD in the primary checkout"
+        ;;
+    esac
+
+    # WHOSE HEAD IS THIS? The main-vs-linked test above cannot answer it.
+    # `git worktree add -b <branch>` writes the NEW worktree's HEAD while git
+    # is still running in the MAIN worktree's context, so it reaches here
+    # byte-identical to a real switch:
+    #
+    #   git switch feat/x                 -> [main ctx] ref:refs/heads/feat/x HEAD
+    #   git worktree add -b feat/x <path> -> [main ctx] ref:refs/heads/feat/x HEAD
+    #
+    # Refusing that would break scripts/claude-worktree.sh — the sanctioned way
+    # to comply with this very rule, and the other half of the recovery advice.
+    #
+    # What does separate them is which HEAD git has locked for the transaction,
+    # and — this is the part that matters when sessions overlap — WHAT THAT
+    # LOCK SAYS. At `prepared` the lock is held, it sits next to the ref being
+    # written, and it already contains the value about to be stored:
+    #
+    #   real switch in the main worktree
+    #     <common>/HEAD.lock                  = "ref: refs/heads/<target>"
+    #   git worktree add -b <target> <path>
+    #     <common>/worktrees/<name>/HEAD.lock = "ref: refs/heads/<target>"
+    #
+    # Testing only whether <common>/HEAD.lock EXISTS was wrong, and it failed
+    # in the direction that hurts most. This checkout is shared by several
+    # sessions, so another one can be holding <common>/HEAD.lock for its own
+    # operation while this one runs `git worktree add -b`. REPRODUCED on git
+    # 2.55: with a foreign <common>/HEAD.lock present, worktree add reaches
+    # here with BOTH locks on disk and was refused — the sanctioned compliance
+    # path breaking for the user who was trying to do the right thing, and
+    # leaving nowhere to go.
+    #
+    # Matching the CONTENT against the target we are being asked to write fixes
+    # that: a concurrent session's lock names ITS branch, not ours.
+    _head_owner=unknown
+    if lock_matches_head_update "$_common_dir/HEAD.lock" "$new"; then
+      _head_owner=main
+    else
+      for _wl in "$_common_dir"/worktrees/*/HEAD.lock; do
+        if lock_matches_head_update "$_wl" "$new"; then _head_owner=linked; break; fi
+      done
+    fi
+
+    # No lock names our target. Fall back to presence, MAIN first: a
+    # <common>/HEAD.lock with nothing else claiming this write is a
+    # main-worktree HEAD update whose value we could not read, and the strict
+    # reading is the right one there. Only when no main lock exists at all does
+    # a linked lock get to decide. The concurrency case above never reaches
+    # here — `worktree add` always writes its own lock, and that lock matches.
+    if [ "$_head_owner" = unknown ]; then
+      if [ -e "$_common_dir/HEAD.lock" ]; then
+        _head_owner=main
+      else
+        for _wl in "$_common_dir"/worktrees/*/HEAD.lock; do
+          if [ -e "$_wl" ]; then _head_owner=linked; break; fi
+        done
+      fi
+    fi
+
+    case "$_head_owner" in
+      linked)
+        if [ "$new" = ref:refs/heads/master ]; then
+          refuse_linked_main HEAD "(new linked worktree)" refs/heads/master \
+            "attaching a linked worktree to local master"
+          exit 1
+        fi
+        continue ;;
+      unknown)
+        _what="a HEAD update whose owning worktree could not be verified"
+        ;;
+    esac
+
+    # Load-bearing recovery: moving the primary checkout back onto master must
+    # work from a feature branch, detached HEAD, and with a dirty tree.
+    [ "$new" = ref:refs/heads/master ] && continue
+
+    refuse "HEAD" "$(git symbolic-ref --quiet HEAD 2>/dev/null || printf '(detached)')" \
+      "$_target" \
+      "$_what"
+    exit 1
+  fi
+
+  case "$ref" in refs/heads/*) ;; *) continue ;; esac
+
+  # --- deletion, and the pruning pass of `git pack-refs` / `git gc` ---------
+  # Deletions used to be allowed outright, and that composed with two other
+  # allowances into a walk-around of the whole fast-forward rule: detach HEAD
+  # (allowed), delete refs/heads/master (allowed), re-create it at any commit
+  # (allowed, because the ref does not exist so it is a creation). The header's
+  # reasoning that git refuses to delete a branch a worktree has checked out
+  # only holds while HEAD is ATTACHED, and step one removes that.
+  #
+  # It cannot be fixed by refusing deletions: `git pack-refs --all` really does
+  # delete every loose ref, and `git gc` runs it unprompted.
+  #
+  # MEASURED on git 2.55 with a logging hook, at `prepared`:
+  #
+  #   git pack-refs --all         -> <oid>   0000…0 refs/heads/master
+  #   git branch -D master       -> 0000…0  0000…0 refs/heads/master
+  #   git update-ref -d refs/heads/master <oid>
+  #                               -> <oid>   0000…0 refs/heads/master
+  #
+  # So the PAYLOAD cannot tell them apart. The third line is byte-identical to
+  # the first and is spellable on demand, which rules out deciding on the
+  # old-oid. The difference is on disk. `pack-refs` writes packed-refs FIRST
+  # and prunes the loose files afterwards, in separate transactions, so during
+  # the prune both of these hold:
+  #
+  #   * the loose file <common>/refs/heads/master still exists, and
+  #   * <common>/packed-refs already lists refs/heads/master at exactly the
+  #     value the ref currently resolves to.
+  #
+  # That is to say the ref SURVIVES: this is a change of storage, not a
+  # deletion. A real deletion never shows both halves — `branch -D` of a loose
+  # ref has no packed-refs entry at that value, and `branch -D` of a packed ref
+  # has no loose file. Nor can the pair be manufactured, and the reason is the
+  # rule this protects: master is fast-forward-only, packed-refs holds a
+  # snapshot of an EARLIER master, and moving master back down onto it is the
+  # non-fast-forward move already refused below. (Measured: after a pack, a
+  # no-op `update-ref` to the packed value writes no loose file at all, so
+  # there is no way to recreate the pair by hand either.)
+  #
+  # Only refs/heads/master is protected here. Deleting feature branches is
+  # ordinary housekeeping — `git branch -d` after a merge, worktree cleanup —
+  # and the branch pin already stops anything landing ON them.
+  if is_zero_oid "$new"; then
+    [ "$ref" = "refs/heads/master" ] || continue
+    if is_packrefs_prune "$ref"; then
+      continue
+    fi
+    refuse "$ref" "$(git rev-parse --verify --quiet "$ref" 2>/dev/null)" "(deleted)" \
+      "deleting refs/heads/master. Deleting master and re-creating it elsewhere is how the fast-forward rule gets walked around, so master may only be removed by the loose-ref pruning pass of \`git pack-refs\` / \`git gc\`, which leaves the ref itself in place"
+    exit 1
+  fi
+
+  # A symbolic value under refs/heads/* is not something any normal command
+  # produces. Refuse rather than reason about it.
+  if [ "${new#ref:}" != "$new" ]; then
+    refuse "$ref" "(symbolic)" "$new" "turning a branch into a symbolic ref"
+    exit 1
+  fi
+
+  # Authoritative pre-transaction value. Only rc=1 means "no such ref", i.e.
+  # the ref is being created, which is the ALLOW branch — so every other
+  # failure must be told apart from it rather than falling into it. Measured on
+  # git 2.55: missing ref => 1, outside a repo or a bad GIT_DIR => 128, the
+  # binary missing => 127, killed by `timeout` => 124. Same shape as the
+  # merge-base handling below, and the same reason: an error must never be read
+  # as a permission.
+  cur="$(git rev-parse --verify --quiet "$ref" 2>/dev/null)"
+  rp_rc=$?
+  if [ "$rp_rc" -eq 1 ]; then
+    # The ref does not exist yet — creation. Allowed in general, and
+    # load-bearing: `git worktree add -b` creates a branch from inside the main
+    # checkout, which is the sanctioned way to comply with this rule.
+    #
+    # refs/heads/master is the exception, because "delete, then re-create" is
+    # the shape the fast-forward rule has to survive. The deletion branch above
+    # is the primary defence; this is the second line, for the one route past
+    # it — removing <common>/refs/heads/master by hand, which is a filesystem
+    # operation no ref hook can ever see.
+    #
+    # MEASURED: `git branch -D` and `git update-ref -d` delete the reflog along
+    # with the ref, so after a *git* deletion nothing on disk says where master
+    # was and there is nothing to check against. An `rm` of the ref file leaves
+    # <common>/logs/refs/heads/master behind, and the new-oid of its last entry
+    # is master's last position. That is the case this catches.
+    #
+    # No evidence => ALLOWED. A fresh clone has no reflog, and refusing there
+    # would leave an unrecoverable repository with no way to put master back.
+    [ "$ref" = "refs/heads/master" ] || continue
+    last_main="$(last_reflog_oid "$ref")"
+    [ -n "$last_main" ] || continue
+    git merge-base --is-ancestor "$last_main" "$new" >/dev/null 2>&1
+    mb_rc=$?
+    [ "$mb_rc" -eq 0 ] && continue
+    if [ "$mb_rc" -eq 1 ]; then
+      refuse "$ref" "$last_main (gone; recovered from the reflog)" "$new" \
+        "re-creating master at a commit that is not a descendant of where it last pointed — the ref file was removed out of band, and putting master back somewhere unrelated is the second half of a walk-around of the fast-forward rule"
+    else
+      refuse "$ref" "$last_main (gone; recovered from the reflog)" "$new" \
+        "re-creating master at a commit whose ancestry could not be verified (git merge-base exited $mb_rc); refusing rather than guessing"
+    fi
+    exit 1
+  elif [ "$rp_rc" -ne 0 ]; then
+    refuse "$ref" "(unknown)" "$new" \
+      "an update whose current value could not be read (git rev-parse exited $rp_rc); refusing rather than assuming the ref is new"
+    exit 1
+  fi
+  # rc=0 with empty output should not happen; treat it as unreadable, not new.
+  if [ -z "$cur" ]; then
+    refuse "$ref" "(empty)" "$new" \
+      "an update whose current value came back empty from git rev-parse; refusing rather than assuming the ref is new"
+    exit 1
+  fi
+
+  # No-op (git stash, the packing pass of pack-refs).
+  [ "$new" = "$cur" ] && continue
+
+  if [ "$ref" != "refs/heads/master" ]; then
+    refuse "$ref" "$cur" "$new" \
+      "advancing a branch other than master in the main checkout"
+    exit 1
+  fi
+
+  # master: fast-forward only. `--is-ancestor` exits 0 for yes, 1 for no, and
+  # something else on error — an error must not be read as "yes".
+  git merge-base --is-ancestor "$cur" "$new" >/dev/null 2>&1
+  mb_rc=$?
+  if [ "$mb_rc" -eq 0 ]; then
+    continue
+  elif [ "$mb_rc" -eq 1 ]; then
+    refuse "$ref" "$cur" "$new" \
+      "a non-fast-forward move of master (the new commit is not a descendant of the current one — a reset to an earlier commit, or a force move)"
+    exit 1
+  else
+    refuse "$ref" "$cur" "$new" \
+      "a move of master whose ancestry could not be verified (git merge-base exited $mb_rc); refusing rather than guessing"
+    exit 1
+  fi
+done <<< "$payload"
+
+exit 0
