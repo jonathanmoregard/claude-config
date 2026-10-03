@@ -470,15 +470,24 @@ def run_injection_scan(groups, scan_script):
     return "error: scanner exited %d; samples emitted unscanned" % proc.returncode
 
 
+_DETECTOR_HIT = re.compile(r":\s*True\b")
+
+
 def _detect_secrets_hit(binary, text):
+    # --no-verify: by default 1.5.0 sends each hit to its issuer (AWS STS,
+    # Slack auth.test, ...) and prints `False` when that fails — a revoked key
+    # or no network then passes through unredacted, and the nightly job would
+    # be shipping the user's credentials over the wire to check them.
     proc = subprocess.run(
-        [binary, "scan", "--string", text],
+        [binary, "scan", "--no-verify", "--string", text],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=DETECT_SECRETS_TIMEOUT,
     )
     out = proc.stdout.decode("utf-8", "replace")
-    return any(line.strip().endswith(": True") for line in out.splitlines())
+    # 1.5.0 prints `AWSKeyDetector          : True  (unverified)` — padded,
+    # with a qualifier after True — so match the field, not the line end.
+    return any(_DETECTOR_HIT.search(line) for line in out.splitlines())
 
 
 def run_secret_scan(groups):
