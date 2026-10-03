@@ -348,7 +348,7 @@ def build_record(payload, now=None):
     }
     if event == "denied":
         record["tool_use_id"] = payload.get("tool_use_id")
-        record["reason"] = payload.get("reason")
+        record["reason"] = redact(payload.get("reason"))
     return record
 
 

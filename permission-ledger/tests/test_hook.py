@@ -807,6 +807,24 @@ class TestRedactionEndToEnd(HookRunMixin, unittest.TestCase):
         line = self.read_lines()[0]
         self.assertNotIn("ghtok_supersecret_value", line)
 
+    def test_secret_quoted_in_a_denial_reason_is_redacted(self):
+        # The harness's denial reason can quote the denied command verbatim.
+        secret = "ghp_" + "Ab3dE5fG7hJ9kL2mN4pQ6rS8tU0vW1xY3zA5"
+        command = "curl -H 'Authorization: token %s' https://api.github.com" % secret
+        req = make_request(tool_name="Bash", tool_input={"command": command})
+        den = make_denied(req, reason="Permission to use Bash with command %s has been denied." % command)
+        self.assert_silent_success(self.run_hook(den))
+        line = self.read_lines()[0]
+        self.assertNotIn(secret, line)
+        self.assertIn("[REDACTED:", json.loads(line)["reason"])
+
+    def test_clean_or_absent_denial_reason_is_stored_unchanged(self):
+        req = make_request()
+        for reason in ("user said no", "Permission to use Bash with command ls -la has been denied.", None):
+            with self.subTest(reason=reason):
+                self.assert_silent_success(self.run_hook(make_denied(req, reason=reason)))
+                self.assertEqual(self.read_records()[-1]["reason"], reason)
+
     def test_injection_string_is_stored_as_inert_data(self):
         payload = make_request(
             tool_name="Bash",
