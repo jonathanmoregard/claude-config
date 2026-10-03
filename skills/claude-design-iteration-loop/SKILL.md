@@ -69,7 +69,7 @@ Poll the tab title with `tabs_context`: `✶` working, `✓` done, `💤` asleep
 
 - Keep exactly one Claude Design tab; a run is bound to the tab that started it.
 - `💤`: Memory Saver slept the tab and changed its tab id. Re-run `tabs_context`, navigate to wake it, click Resume if the chat says "We got interrupted". Never send into a sleeping tab.
-- Standing fix: add claude.ai to Memory Saver "always keep active".
+- A Memory Saver exception for claude.ai is not enough: a run still stopped with the exception set and no memory pressure. Before asking the user for that setting, check it is not already set (`performance_tuning.tab_discarding` in the Chrome profile's `Preferences`). Poll every ~10 minutes and Resume on interruption; expect it, do not treat it as a one-off.
 
 ## Review a round
 
