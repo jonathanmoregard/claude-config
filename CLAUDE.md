@@ -85,7 +85,7 @@ User instructions override everything below.
 
 ## Web
 - No web access. `WebFetch`, `WebSearch`, `curl`, `wget` denied. HTTP clients via python/node are denied too.
-- Use `mcp__research-agent__research(prompt, depth, model?)`. Default model `claude-opus-5`. `model` valid on `normal`/`deep` only.
+- Use `mcp__research-agent__research(prompt, depth, model?)`. Default model `claude-opus-5-5`. `model` valid on `normal`/`deep` only.
 - Wall time: `fast` ~2–5 s · `normal` ~1.5–3 min · `deep` ~10–15 min. Warn the user before `normal`/`deep`.
 - `agent refused: provider usage-policy block` → rephrase defensively. Don't retry verbatim.
 
