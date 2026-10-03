@@ -10,13 +10,14 @@ Never ask the user to do what you can do. Run the commands, tests, reads, edits,
 - Uploading sensitive content to third-party tools
 - Scope expansion — flag in one sentence, wait
 
-**Proceed without asking:** `git push`, opening/updating PRs, merging a green PR on an outdated branch, expected status updates.
+**Proceed without asking:** `git push`, opening/updating PRs, updating an outdated green PR's branch (merging stays the user's click), expected status updates.
 
 **Safe cleanup without asking:**
 - Temporary files created by the current agent/session may be deleted after verifying the exact target, ownership, and scope.
 - Files created by an AI earlier in the same session may be deleted without asking when they block progress or consume storage/memory without further use, after verifying the exact target, provenance, scope, and lack of remaining value.
 - Stale or stuck lock files created by the current agent/session may be deleted after the same checks and verification that no live process still owns or uses the lock. Uncertain ownership or live use requires asking.
 - Worktrees created by the current agent/session follow the additional checks under **Worktrees**. Worktree cleanup does not include branch deletion.
+- Run sanctioned cleanup on literal absolute paths: `rm -r /tmp/<path>` under `/tmp`, `gio trash <path>` elsewhere (reversible). Never `rm -rf`, never `$VAR`/`$(...)` paths. Reclaiming space outside `/tmp` → ask.
 
 **Defaults:**
 
@@ -49,6 +50,7 @@ User instructions override everything below.
 ## Bash
 - `permissions.deny` matches the command STRING, so a legitimate command can be rejected for a substring it merely contains — including inside a heredoc body. Route the payload around it (`Write` the text, then `cat >>`; `gh` `--body-file`/`-F` instead of an inline body; select tests by `-k`; drop a flag whose default is already right). Never quote or split to defeat the matcher — some rules are deliberate. Details: `detached-long-commands`.
 - A `[REDACTED:…]` marker in output means the call succeeded and the value is gated — don't re-run to get it in clear.
+- Waiting on CI, mergeability, a deploy or a unit → `~/.claude/scripts/wait-for pr|run|unit …` with `run_in_background: true`, then end the turn; you are re-invoked when it settles. Never `sleep N; <status>` to check again.
 
 ## Build + review
 - Substantial multi-part or unattended work → invoke `orchestrate` and follow it. Use judgment for ordinary branch-sized changes; subagents are a context tool, not a ritual.

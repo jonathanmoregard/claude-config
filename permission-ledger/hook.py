@@ -88,13 +88,56 @@ REDACTIONS = [
     ),
     # ...and an unterminated block (e.g. cut by MAX_STRING) takes the rest.
     (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*"), "[REDACTED:private-key]"),
-    # Known credential shapes.
+    # Credentials embedded in a URL's userinfo (scheme://user:pass@host). The
+    # user and host stay legible; only the password goes. RFC 3986 forbids raw
+    # '/', '?', '#' in userinfo, which keeps `http://host:8080?x=a@b` out.
+    (
+        re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://[^\s/?#@:]*:)" + _NOT_ALREADY + r"[^\s/?#]+@"),
+        r"\1[REDACTED:url-credential]@",
+    ),
+    # Known credential shapes. Prefixes distinctive enough to need no leading \b
+    # (so a token glued to a word char -- `\n<tok>` in printf, `%3D<tok>` -- is
+    # still caught) have none.
     (re.compile(r"github_pat_[A-Za-z0-9_]{20,}"), "[REDACTED:github-pat]"),
-    (re.compile(r"\bgh[porsu]_[A-Za-z0-9]{20,}"), "[REDACTED:github-token]"),
+    (re.compile(r"gh[porsu]_[A-Za-z0-9]{30,}"), "[REDACTED:github-token]"),
+    (re.compile(r"gl(?:pat|dt|rt|ptt|cbt|oas|soat|ffct|imt|agent)-[A-Za-z0-9_-]{20,}"),
+     "[REDACTED:gitlab-token]"),
+    (re.compile(r"npm_[A-Za-z0-9]{36,}"), "[REDACTED:npm-token]"),
+    (re.compile(r"pypi-AgE[A-Za-z0-9_-]{50,}"), "[REDACTED:pypi-token]"),
+    (re.compile(r"hf_[A-Za-z0-9]{30,}"), "[REDACTED:huggingface-token]"),
+    (re.compile(r"(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}"), "[REDACTED:stripe-key]"),
+    (re.compile(r"whsec_[A-Za-z0-9]{24,}"), "[REDACTED:stripe-webhook-secret]"),
+    (re.compile(r"xapp-\d-[A-Za-z0-9-]{20,}"), "[REDACTED:slack-token]"),
+    # A JWT anywhere (cookie, custom header, bare): base64url('{"') == "eyJ" opens
+    # both header and payload, which nothing else in a command line does.
+    (re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*"),
+     "[REDACTED:jwt]"),
+    # AWS secret access keys / session tokens are base64 with '/' and '+', which
+    # the high-entropy rule deliberately splits on; catch them by their key name,
+    # whether positional (`aws configure set aws_secret_access_key X`), in an
+    # ini/JSON body, or after '='. The value must mix upper, lower and digits so
+    # a path argument (`rg session_token src/auth`) is left alone.
+    (
+        re.compile(
+            r"(?i)((?:aws_)?(?:secret_?access_?key|session_?token)[\"']?\s*[=:]?\s*[\"']?)"
+            + _NOT_ALREADY
+            + r"(?-i:(?=[A-Za-z0-9/+=]*[A-Z])(?=[A-Za-z0-9/+=]*[a-z])(?=[A-Za-z0-9/+=]*\d)"
+            r"[A-Za-z0-9/+=]{20,})"
+        ),
+        r"\1[REDACTED:aws-secret]",
+    ),
+    # Provider keys used on this host. No leading \b: the prefixes are distinctive
+    # enough to match mid-word, and keys glued to a word character (`\nsk-...`
+    # in a printf literal, `%3Dsk-...` in a URL) otherwise slip past the generic
+    # rule below -- and their '-'/'_'-broken bodies past the high-entropy rule.
+    # The Anthropic kind is not enumerated: api03/oat01/admin01 plus the OAuth
+    # refresh token (ort01) and claude.ai session key (sid01) share the shape.
+    (re.compile(r"sk-ant-[a-z]{2,8}\d{2}-[A-Za-z0-9_-]{20,}"), "[REDACTED:api-key]"),
+    (re.compile(r"sk-(?:proj|svcacct|admin|None)-[A-Za-z0-9_-]{40,}"), "[REDACTED:api-key]"),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{12,}"), "[REDACTED:api-key]"),
-    (re.compile(r"\bAKIA[0-9A-Z]{12,}"), "[REDACTED:aws-key]"),
+    (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{12,}"), "[REDACTED:aws-key]"),
     (re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{8,}"), "[REDACTED:slack-token]"),
-    (re.compile(r"\bAIza[0-9A-Za-z_-]{20,}"), "[REDACTED:google-key]"),
+    (re.compile(r"AIza[0-9A-Za-z_-]{30,}"), "[REDACTED:google-key]"),
     (re.compile(r"(?i)\b(bearer\s+)" + _NOT_ALREADY + r"[A-Za-z0-9._~+/=-]{8,}"),
      r"\1[REDACTED:bearer-token]"),
     # --password / --token style flags, with either separator.
@@ -305,7 +348,7 @@ def build_record(payload, now=None):
     }
     if event == "denied":
         record["tool_use_id"] = payload.get("tool_use_id")
-        record["reason"] = payload.get("reason")
+        record["reason"] = redact(payload.get("reason"))
     return record
 
 

@@ -5,6 +5,10 @@
 
 set -euo pipefail
 
+# Every claude this script spawns is a machine session: session-reflect must
+# not reflect on it into the corpus the RSI review reads.
+export CLAUDE_PIPELINE_INTERNAL=1
+
 # Normally the script lives in the repo it syncs and infers the path from its
 # own location. SYNC_REPO overrides that, so a repo can be synced without
 # planting this file inside it — required for public forks, where local

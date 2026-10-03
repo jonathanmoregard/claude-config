@@ -142,6 +142,11 @@ base SHAs.
 If still open, closed, head-drifted, missing merge SHA, or GitHub unreadable,
 report measured state and keep target active.
 
+Auto-merge can land the PR before handoff. Once the worktree is gone, refresh
+settles a target with a stored PR number from GitHub alone: `MERGED` with the
+exact merge SHA, detail noting the skipped handoff. No contract was frozen, so
+`configure` stays open for it; `verify` refuses until one environment exists.
+
 ## 5. Verify deployment and smoke
 
 Once phase is `MERGED`:

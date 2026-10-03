@@ -10,6 +10,10 @@
 
 set -euo pipefail
 
+# Every claude this script spawns is a machine session: session-reflect must
+# not reflect on it into the corpus the RSI review reads.
+export CLAUDE_PIPELINE_INTERNAL=1
+
 : "${REPO:?REPO not set}"
 : "${UPSTREAM_REMOTE:=upstream}"
 : "${UPSTREAM_BRANCH:=main}"

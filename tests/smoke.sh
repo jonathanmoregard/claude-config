@@ -4844,7 +4844,7 @@ fi
 test_begin "TEST 38: R3 — skipped-recursions/, malformed/ and logs/ are age-bounded"
 canonical_stub
 R3_LOG_DIR="$REFLECT_ROOT/logs"
-R3_DIRS=( "$REFLECT_ROOT/skipped-recursions" "$REFLECT_ROOT/malformed" "$R3_LOG_DIR" )
+R3_DIRS=( "$REFLECT_ROOT/skipped-recursions" "$REFLECT_ROOT/skipped-pipeline" "$REFLECT_ROOT/malformed" "$R3_LOG_DIR" )
 mkdir -p "${R3_DIRS[@]}"
 R3_OLD=()
 R3_KEEP=()
