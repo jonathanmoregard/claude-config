@@ -1,6 +1,6 @@
 ---
 name: visual-verify
-description: Use whenever a subagent or the parent session has edited a rendered-view file (HTML template, htmx partial, TypeScript/JavaScript rendering component, Rust HTML-returning handler) and the UI has not yet been looked at by human eyes. Enforces a 4-step review rubric with anti-rubber-stamp discipline. Triggers automatically on Write/Edit against `**/*.{html,htm,htmx}`, `templates/**`, `client/**/*.{ts,tsx,jsx}`, and Rust files matching `askama::Template`, `maud::html!`, `axum::response::Html`, `Response::builder()` returning HTML.
+description: Use whenever a subagent or the parent session has edited a rendered-view file (HTML template, htmx partial, TypeScript/JavaScript rendering component, Rust HTML-returning handler) and the UI has not yet been looked at by human eyes. Enforces a 4-step review rubric with anti-rubber-stamp discipline. Triggers automatically on Write/Edit against `**/*.{html,htm,htmx}`, `templates/**`, `client/**/*.{ts,tsx,jsx}`, and Rust files matching `askama::Template`, `maud::html!`, `axum::response::Html`, `Response::builder()` returning HTML. Not for edits that change only comments, imports or formatting.
 ---
 
 # visual-verify
@@ -39,6 +39,13 @@ Both independently converged on this design 2026-06 to 2026-07.
   only (Read the file, confirm it looks like a document not a broken page).
 - README/CHANGELOG/docs with inline HTML.
 - Test fixtures that aren't user-facing.
+- Render-neutral edits inside a triggering file: changes touching only comments,
+  imports or formatting (the PostToolUse hook already stays silent on these).
+  Also logic-only changes — validation, parsing, error types, persistence — that
+  alter no markup, template, style token, user-visible string or view-model
+  field, **when an E2E suite covering the surface passed after the change**. These
+  get one capture at one width to confirm the page still renders, not the matrix.
+  Unsure whether output changed → it changed; run the full rubric.
 
 **Explicit user request overrides every exclusion.**
 
@@ -262,6 +269,11 @@ Every check named explicitly. Skipping is a failure.
   for large text and UI). Use browser devtools if unsure.
 - **Spacing & alignment** — Elements share a spacing scale? Rows same height?
   Grid columns aligned? Nothing off-baseline?
+- **Scale coherence** — When the diff touches a step scale (font-size, spacing,
+  radius tokens) or a surface shows several steps, capture all steps side by
+  side in one shot. Adjacent jumps must look monotonic and roughly even; two
+  steps that read the same, or one jump far larger than its neighbours, is a
+  should-fix.
 - **Clutter & density** — Too many colors, too many weights, information not
   organized into hierarchy?
 - **Typography** — Font stack loaded (not FOUT), line-height readable, no

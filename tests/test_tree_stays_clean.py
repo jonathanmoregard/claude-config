@@ -54,12 +54,18 @@ REPO = Path(__file__).resolve().parents[1]
 # Registry entries that are genuine user config and MUST stay trackable. The
 # harness reads them from the same directory it drops state into, so the two
 # classes are only separable by hand.
-HARNESS_CONFIG_ALLOWLIST = {"keybindings.json", "CLAUDE.md"}
+HARNESS_CONFIG_ALLOWLIST = {"keybindings.json", "CLAUDE.md", "settings.json"}
 
-# Anchor into the harness's state-name registry, which is a literal
-# `new Map([["daemon-status","daemon.status.json"], ...])` in the bundle.
-REGISTRY_ANCHOR = b'[["daemon-status","daemon.status.json"]'
-REGISTRY_PAIR = re.compile(rb'\["([A-Za-z0-9_.-]+)","([^"]+)"\]')
+# How the harness names the files it keeps in its config home. Up to 2.1.251
+# that was a literal `new Map([["daemon-status","daemon.status.json"], ...])`;
+# by 2.1.285 the Map is gone and each path is built inline as
+# `join(<configHome>(), "<name>")`. The getter's minified name changes per
+# build, so it is learned from one call we know exists (daemon.status.json)
+# and every other literal joined onto the same getter is then collected.
+REGISTRY_ANCHOR = b'(),"daemon.status.json")'
+REGISTRY_NAME = re.compile(rb'"([^"]+)"\)')
+GETTER_NAME = re.compile(rb'([A-Za-z_$][\w$]*)$')
+IDENT_BYTE = re.compile(rb'[\w$]')
 
 # Writers we own that used to write into the repo and now must not. Each row:
 # (source file, a fragment that marks the lines doing the writing, the
@@ -177,21 +183,35 @@ def find_claude_binary() -> Path | None:
     return None
 
 
-def harness_state_files(binary: Path) -> dict[str, str]:
-    """id -> filename, read out of the bundle's own state-name registry."""
+def harness_config_home_names(binary: Path) -> set[str]:
+    """Every literal name the bundle joins directly onto its config home."""
+    names: set[str] = set()
     with open(binary, "rb") as fh:
         with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as data:
-            start = data.find(REGISTRY_ANCHOR)
-            if start == -1:
-                return {}
-            end = data.find(b"]]", start)
-            if end == -1:
-                return {}
-            window = data[start:end + 2]
-    return {
-        m.group(1).decode(): m.group(2).decode()
-        for m in REGISTRY_PAIR.finditer(window)
-    }
+            anchor = data.find(REGISTRY_ANCHOR)
+            if anchor == -1:
+                return names
+            getter = GETTER_NAME.search(data[max(0, anchor - 64):anchor])
+            if getter is None:
+                return names
+            needle = getter.group(1) + b'(),"'
+            pos = data.find(needle)
+            while pos != -1:
+                # `xwe()` is another function, not `we()`.
+                if not IDENT_BYTE.match(data[pos - 1:pos]):
+                    start = pos + len(needle) - 1
+                    m = REGISTRY_NAME.match(data[start:start + 256])
+                    if m:
+                        names.add(m.group(1).decode())
+                pos = data.find(needle, pos + 1)
+    return names
+
+
+def harness_state_files(binary: Path) -> set[str]:
+    """The harness's state FILES in ~/.claude (directories have their own
+    rules, as subdir entries did under the old registry)."""
+    return {n for n in harness_config_home_names(binary)
+            if "/" not in n and ("." in n or n.startswith("."))}
 
 
 def source_files() -> list[Path]:
@@ -212,29 +232,28 @@ class HarnessStateIsIgnored(unittest.TestCase):
         binary = find_claude_binary()
         if binary is None:
             self.skipTest("no claude bundle on this machine")
-        names = harness_state_files(binary)
-        self.assertIn("daemon.status.json", names.values())
-        self.assertIn("daemon-auth-cooldown", names.values())
+        names = harness_config_home_names(binary)
+        self.assertIn("daemon.status.json", names)
+        self.assertIn("settings.json", names)
         # A registry that suddenly parses to a handful of entries means the
         # bundle layout moved and this test stopped guarding anything.
         self.assertGreaterEqual(
             len(names), 20,
             "state registry parsed to %d entries — parser is out of date "
             "against the bundle, not a real shrink" % len(names))
+        self.assertGreaterEqual(len(harness_state_files(binary)), 10)
 
     def test_every_harness_state_file_is_ignored(self):
         binary = find_claude_binary()
         if binary is None:
             self.skipTest("no claude bundle on this machine")
         missing = []
-        for state_id, name in sorted(harness_state_files(binary).items()):
+        for name in sorted(harness_state_files(binary)):
             if name in HARNESS_CONFIG_ALLOWLIST:
-                continue
-            if "/" in name:  # a subdir entry, covered by its own dir rule
                 continue
             matched, _rule = is_ignored(name)
             if not matched:
-                missing.append("%s -> %s" % (state_id, name))
+                missing.append(name)
         self.assertEqual(
             [], missing,
             "harness writes these into ~/.claude and no ignore rule covers "
