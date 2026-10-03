@@ -58,8 +58,9 @@ projects/
 /plans/
 **/__pycache__/
 
-# Caveman state flag
+# Caveman state flag, plus its per-process variant .caveman-active.<pid>.<ts>
 .caveman-active
+/.caveman-active.*
 
 # Dev-container user-local overrides
 dev-container/proxy-allow.txt
@@ -180,6 +181,57 @@ server-sessions.json
 .session-log-cleanup
 stats-cache.json
 .version-cleanup
+
+# ---------------------------------------------------------------------
+# Claude Code harness runtime DIRECTORIES — from the binary's own list
+# ---------------------------------------------------------------------
+# The bundle carries a literal set of config-home entries it treats as runtime
+# when snapshotting a host config dir (next to the `.host-config-snapshot-`
+# prefix): `new Set([".claude.json", ".claude.json.backup", ...])`. Read out
+# of ~/.local/share/claude/versions/2.1.288 on 2026-10-02; these are the
+# entries no rule above covered (`chrome/` was sitting untracked that day).
+# tests/test_harness_runtime_dirs_ignored.py re-reads the set from the
+# installed bundle, so the next new entry fails a test instead of dirtying
+# the checkout.
+#
+# Anchored to the repo root: `state/`, `scratch/`, `remote/`, `local/` are
+# ordinary names a skill may legitimately use in a subdirectory.
+#
+# Deliberately NOT here: `logs` (in the set, but logs/ holds tracked files
+# and has narrower rules above). `memory/` and `agent-memory/` are not in
+# the set — the binary keeps them because they are user content — and must
+# stay trackable.
+/.claude.json
+/.session_ingress_token
+/antproto.json
+/api-dumps/
+/bridge-spawn/
+/ccr/
+/chrome/
+/dump-prompts/
+/feedback/
+/feedback-bundles/
+/file-transfers/
+/ide/
+/image-cache/
+/local/
+/local-settings/
+/mcp-discovery-cache/
+/mcp-skill-archives/
+/project-settings/
+/remote/
+/scratch/
+/seed-admin/
+/shares/
+/startup-perf/
+/state/
+/statsig/
+/storage-v2/
+/systemd/
+/teams/
+/todos/
+/traces/
+/uploads/
 
 # Session-reflection hook output: per-session stdout/stderr logs, skipped-
 # recursion records, idle-handoff logs and counters. Pure runtime — 1496 files
