@@ -55,6 +55,27 @@ def sort_key(event):
     return datetime(start.year, start.month, start.day, tzinfo=timezone.utc)
 
 
+def normalize_url(url):
+    """webcal:// is the subscribe-link alias of https:// for the same feed."""
+    if url.lower().startswith("webcal://"):
+        return "https://" + url[len("webcal://"):]
+    return url
+
+
+def url_problem(url):
+    """Describe why url is not a fetchable https URL, without echoing it."""
+    if any(c.isspace() or ord(c) < 0x20 for c in url):
+        return "URL contains whitespace or control characters (wrapped paste or extra lines?)"
+    if url[:1] in "\"'":
+        return "URL is wrapped in quotes"
+    scheme, sep, _ = url.partition("://")
+    if not sep:
+        return "URL has no scheme (expected https://...)"
+    if scheme.lower() != "https":
+        return f"URL scheme is not https ({len(scheme)} chars before ://)"
+    return None
+
+
 def fetch_error_summary(e):
     """Describe a fetch failure without any text that could contain the URL."""
     code = getattr(e, "code", None)
@@ -80,6 +101,11 @@ def main():
     if not url:
         print(f"GCAL_ERROR: {ICAL_URL_PATH} is empty")
         return
+    url = normalize_url(url)
+    problem = url_problem(url)
+    if problem:
+        print(f"GCAL_ERROR: {ICAL_URL_PATH}: {problem}")
+        return
 
     try:
         import icalendar
@@ -104,7 +130,9 @@ def main():
         # as an override with STATUS:CANCELLED, so filter those below.
         events = recurring_ical_events.of(cal).between(today, today + timedelta(days=args.days))
     except Exception as e:
-        print(f"GCAL_ERROR: could not parse calendar: {type(e).__name__}: {e}")
+        # Type only: icalendar quotes the offending line, and a non-iCal
+        # body (e.g. a Google sign-in page) can embed the feed URL.
+        print(f"GCAL_ERROR: could not parse calendar ({len(raw)} bytes): {type(e).__name__}")
         return
 
     date_events = sorted(
