@@ -29,6 +29,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -62,6 +63,8 @@ REASK_MULTIPLIER = 3
 SUPPRESSING_DECISIONS = ("rejected", "implemented")
 
 SCAN_CONTENT_TIMEOUT = 120
+# scan_content.py prints this on stderr when it exits 1 for a detection.
+SCAN_VERDICT = "Prompt injection detected"
 DETECT_SECRETS_TIMEOUT = 30
 
 MONTH_FILE_RE = re.compile(r"^(\d{4})-(\d{2})\.jsonl$")
@@ -481,17 +484,33 @@ def run_injection_scan(groups, scan_script):
         return "unavailable: no scanner script at %s" % scan_script
     payload = "\n---\n".join(scan_text(s) for s in samples)
     try:
-        proc = subprocess.run(
+        # Own session, so a timeout kills the scanner's children too (the
+        # classifier it runs would otherwise outlive it, model in memory).
+        proc = subprocess.Popen(
             [sys.executable, scan_script, "--text", payload],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=SCAN_CONTENT_TIMEOUT,
+            start_new_session=True,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except OSError as exc:
         return "error: %s: %s" % (type(exc).__name__, exc)
+    try:
+        _, stderr = proc.communicate(timeout=SCAN_CONTENT_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.communicate()
+        # Not str(exc): that quotes the argv, i.e. the samples themselves.
+        return "error: scanner timed out after %ds; samples emitted unscanned" % (
+            SCAN_CONTENT_TIMEOUT
+        )
     if proc.returncode == 0:
         return "ok"
-    if proc.returncode == 1:
+    # A traceback exits 1 too: only exit 1 WITH the scanner's verdict line is
+    # a detection. Anything else is a failed scan and must not read as "ok".
+    if proc.returncode == 1 and SCAN_VERDICT in stderr.decode("utf-8", "replace"):
         return (
             "ok (injection patterns flagged in samples; samples emitted "
             "verbatim as inert data)"
