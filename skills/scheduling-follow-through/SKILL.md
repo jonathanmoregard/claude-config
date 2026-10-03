@@ -1,6 +1,6 @@
 ---
 name: scheduling-follow-through
-description: Use when about to end a turn while something is still running — a background agent, CI build, long test suite, nix build, VM gate, download, deploy, or research call — or when finishing depends on state that changes without you. Also use when tempted to write "I'll report when it lands" or "running in the background".
+description: Use when about to end a turn while something is still running — a background agent, CI build, long test suite, nix build, VM gate, download, deploy, or research call — or when finishing depends on state that changes without you. Also use when tempted to write "I'll report when it lands" or "running in the background", or when about to re-run `gh pr checks` / `gh run view` / `sleep N; <status>` to see whether CI or a gate has finished yet.
 ---
 
 # Scheduling Follow-Through
@@ -35,6 +35,7 @@ CronCreate(cron: "<M> <H> <DoM> <Mon> *", recurring: false, durable: true, promp
 - **`durable: true`** — survives `/clear`, restart, crash. Session-only jobs die with the process, which is the exact case you are protecting against.
 - **Delay matched to the process**, not to a default. An 8-minute CI run gets one ~10-minute check, not six 90-second ones. Add slack; firing early wastes the wake.
 - **Off-minute** (not :00 or :30).
+- **CI has a blocking primitive — use it instead of re-checking.** `gh pr checks <PR> --watch --fail-fast` (or `gh run watch <ID> --exit-status`) with Bash `run_in_background: true` costs one call and re-invokes you when it settles. Never `sleep N; gh pr checks` in the foreground — bash-guard denies it. Add the durable cron on top only when the wait must survive a `/clear`.
 - `ScheduleWakeup` is `/loop`-only and does not survive a clear — do not reach for it here.
 
 ### The scheduled prompt must be self-contained

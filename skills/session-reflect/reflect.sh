@@ -1241,7 +1241,10 @@ run_worker() {
   }
 
   # --- Attempt strategy ------------------------------------------------------
-  # precompact / mission  one resumed call, unchanged.
+  # precompact           one resumed call, unchanged.
+  # mission               one call: resumed, or — when the B2 pre-check says the
+  #                       resume is doomed — a no-resume call with the
+  #                       transcript tail inlined (prompts/mission-fallback.md).
   # subagentstop          one INLINE call. There is no session to resume; the
   #                       agent transcript is already in the prompt.
   # sessionend            resumed primary, then the B1 no-resume fallback if it
@@ -1264,6 +1267,45 @@ run_worker() {
   elif [[ "$MODE" != "sessionend" ]]; then
     local primary_resume="$SESSION_ID"
     [[ "$MODE" == "subagentstop" ]] && primary_resume=""
+    if [[ "$MODE" == "mission" ]]; then
+      # B2 for the handoff writer. Same stat(2), same threshold as sessionend
+      # below: a transcript past it cannot survive `--resume` (18 live missions,
+      # 2026-09-04..09-28, died on a 400 "Prompt is too long" while sessionend on
+      # the same files took this path and completed). Mission has no second
+      # attempt — its budget is the synchronous hook cap — so the oversize case
+      # goes straight to one no-resume call with the evidence inlined, and a
+      # thinner handoff lands instead of none.
+      local m_bytes m_skipped=false
+      m_bytes="$(reflect_file_size "$TRANSCRIPT_PATH")"
+      if (( m_bytes > REFLECT_RESUME_MAX_TRANSCRIPT_BYTES )); then
+        local m_prompt m_tail m_handoff
+        m_prompt="$(cat "$SCRIPT_DIR/prompts/mission-fallback.md" 2>/dev/null || true)"
+        # A missing template keeps the resume: a no-resume call with no evidence
+        # inlined would invent a handoff, which is worse than none.
+        if [[ -n "$m_prompt" ]]; then
+          m_skipped=true
+          primary_resume=""
+          m_tail="$(reflect_transcript_extract \
+            "$TRANSCRIPT_PATH" "$REFLECT_FALLBACK_TAIL_CAP_BYTES" tail)"
+          [[ -n "$m_tail" ]] || m_tail="(the session transcript could not be read)"
+          m_handoff="$(reflect_handoff_block "$SESSION_ID")"
+          [[ -n "$m_handoff" ]] || m_handoff="(no previous handoff for this session)"
+          # Quoted replacements — see the patsub_replacement note at the
+          # checkpoints substitution above. Trusted instructions first.
+          m_prompt="${m_prompt//\{\{MISSION_INSTRUCTIONS\}\}/"$prompt"}"
+          m_prompt="${m_prompt//\{\{TRANSCRIPT_TAIL_BLOCK\}\}/"$m_tail"}"
+          m_prompt="${m_prompt//\{\{HANDOFF_BLOCK\}\}/"$m_handoff"}"
+          prompt="$m_prompt"
+        fi
+      fi
+      attempt_extra="$(jq -cn \
+        --argjson bytes "$m_bytes" \
+        --argjson maxbytes "$REFLECT_RESUME_MAX_TRANSCRIPT_BYTES" \
+        --argjson skipped "$m_skipped" \
+        '{transcript_bytes:$bytes,
+          resume_max_transcript_bytes:$maxbytes,
+          primary_skipped_oversize:$skipped}')"
+    fi
     reflect_claude_call "$prompt" "$budget" "$primary_resume" "$worker_out" "$worker_log"
     claude_json="$REFLECT_CALL_ENVELOPE"
     rc="$REFLECT_CALL_RC"
@@ -1682,7 +1724,8 @@ run_worker() {
           --arg action "$pointer_action" \
           --argjson refused "$pointer_refused" \
           --argjson gc "$mission_gc_removed" \
-          '{source_transcript:$tp,hook_event_name:$event,
+          --argjson attempt "$attempt_extra" \
+          '$attempt + {source_transcript:$tp,hook_event_name:$event,
             parent_session_id:(if $parent == "" then null else $parent end),
             artifact:$handoff,handoff:$handoff,handoff_cwd_file:$cwdfile,
             project_cwd:$project,

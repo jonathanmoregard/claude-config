@@ -566,6 +566,41 @@ fi
 (( $(resume_calls) == 1 )); assert $? "the resumed path was used"
 
 # ===========================================================================
+# B2-mission — the same pre-check for the handoff writer. Mission is the mode
+# where a doomed resume costs the most: no fallback means NO handoff at all.
+# Observed 18 times in the live corpus (2026-09-04..09-28) as a 400 "Prompt is
+# too long" on transcripts of 1.25-15 MB, while sessionend on the very same
+# transcripts took the B2 path and completed.
+# ===========================================================================
+t_begin "B2-mission: oversize transcript writes the handoff without --resume"
+reset_logs
+MBIG_SID="0c4e1897-1a2b-4c3d-9e8f-000000000015"
+MBIG_TRANSCRIPT="$PROJECTS_DIR/$MBIG_SID.jsonl"
+cp -- "$BIG_TRANSCRIPT" "$MBIG_TRANSCRIPT"
+STUB_MODE=ok REFLECT_RESUME_MAX_TRANSCRIPT_BYTES=$(( BIG_BYTES / 2 )) \
+  bash "$REFLECT_SH" mission <<<"$(sessionend_payload "$MBIG_SID" "$MBIG_TRANSCRIPT")"
+MBIG_MANIFEST="$REFLECT_ROOT/sessions/$MBIG_SID/manifest.json"
+jqe '.modes.mission.status == "complete"' "$MBIG_MANIFEST"; assert $? "mission status=complete"
+[[ -s "$CLAUDE_SESSIONS_DIR/$MBIG_SID/handoff/mission.md" ]]; assert $? "authoritative handoff written"
+(( $(call_count) == 1 )); assert $? "exactly one model call ($(call_count) seen)"
+(( $(resume_calls) == 0 )); assert $? "no --resume on an oversize transcript"
+grep -qF 'FIXTURE-BIG-TAIL-MARKER' "$STUB_PROMPT_LOG"; assert $? "prompt carries the newest end of the transcript"
+grep -qF '## State on disk' "$STUB_PROMPT_LOG"; assert $? "prompt still carries the mission handoff structure"
+if grep -qF '{{' "$STUB_PROMPT_LOG"; then bad "a template placeholder survived into the prompt"; else ok "no template placeholder survived"; fi
+jqe '.modes.mission.primary_skipped_oversize == true' "$MBIG_MANIFEST"; assert $? "manifest records primary_skipped_oversize"
+jqe --argjson b "$BIG_BYTES" '.modes.mission.transcript_bytes == $b' "$MBIG_MANIFEST"; assert $? "the measured transcript size is reported"
+
+t_begin "B2-mission control: a transcript under the threshold keeps the resumed handoff"
+reset_logs
+MSMALL_SID="0c4e1897-1a2b-4c3d-9e8f-000000000016"
+STUB_MODE=ok bash "$REFLECT_SH" mission <<<"$(sessionend_payload "$MSMALL_SID")"
+MSMALL_MANIFEST="$REFLECT_ROOT/sessions/$MSMALL_SID/manifest.json"
+jqe '.modes.mission.status == "complete"' "$MSMALL_MANIFEST"; assert $? "mission status=complete"
+(( $(resume_calls) == 1 )); assert $? "the resumed path was used"
+jqe '.modes.mission.primary_skipped_oversize == false' "$MSMALL_MANIFEST"; assert $? "primary_skipped_oversize:false recorded"
+if grep -qF 'FIXTURE-PARENT-TAIL-MARKER' "$STUB_PROMPT_LOG"; then bad "resumed mission prompt inlined the transcript"; else ok "resumed mission prompt does not inline the transcript"; fi
+
+# ===========================================================================
 # C1 + G1 — a 429 primary ends the run: error manifest WITH a reason, and no
 # second call. The old contract here was "the fallback was attempted before
 # giving up"; that assertion is retired because attempting it was the defect.
