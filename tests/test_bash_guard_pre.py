@@ -2871,6 +2871,89 @@ _dec, _why = bg_guard("make test > /tmp/t.log 2>&1; echo \"rc=$?\"", background=
 check("foreground `cmd; echo rc=$?` allowed: its output is read directly",
       _dec is None, f"decision={_dec!r} {_why[:200]}")
 
+section("bash-guard: a cleanup deny names the guard-approved form")
+# Sessions doing cleanup CLAUDE.md sanctions were stopped by dcg, whose own
+# reason says "ask the user to run the command manually", and either hunted
+# workarounds for turns or handed the deletion back. The guard's VERDICT is
+# right and must not move; what was missing is the form that passes. These
+# checks hold the verdict fixed and assert only on the explanation.
+CLEANUP_MARKER = "Sanctioned cleanup"
+DYNAMIC_MARKER = "literal absolute path"
+
+for _rule in (
+    "core.filesystem:rm-rf-general",
+    "core.filesystem:rm-recursive-general",
+    "core.filesystem:rm-r-f-separate",
+    "core.filesystem:rm-recursive-force-long",
+    "core.filesystem:find-delete-general",
+    "core.git:clean-force",
+):
+    _stub = _dcg_stub(
+        f"stubs/dcg-cleanup-{_rule.replace(':', '_')}",
+        "cat >/dev/null\n" f"echo '{_deny_line(rule=_rule, why='upstream says ask')}'\nexit 0\n",
+    )
+    _dec, _why = guard("rm -r build/__pycache__", dcg=_stub)
+    check(f"{_rule}: still a deny", _dec == "deny", f"decision={_dec!r}")
+    check(f"{_rule}: keeps dcg's own reason", "upstream says ask" in _why, _why[:300])
+    check(f"{_rule}: names the sanctioned-cleanup route",
+          CLEANUP_MARKER in _why and "gio trash" in _why, _why[:600])
+    check(f"{_rule}: scopes it to sanctioned cleanup, else ask",
+          "ask the user" in _why, _why[:600])
+
+for _rule in ("core.filesystem:mv-dynamic-path",
+              "core.filesystem:redirect-truncate-dynamic-path"):
+    _stub = _dcg_stub(
+        f"stubs/dcg-dyn-{_rule.replace(':', '_')}",
+        "cat >/dev/null\n" f"echo '{_deny_line(rule=_rule, why='dynamic path')}'\nexit 0\n",
+    )
+    _dec, _why = guard('mv a "$S/b"', dcg=_stub)
+    check(f"{_rule}: still a deny", _dec == "deny", f"decision={_dec!r}")
+    check(f"{_rule}: says to resolve the path and write it literally",
+          DYNAMIC_MARKER in _why, _why[:600])
+    check(f"{_rule}: a move/write is not steered towards deleting",
+          "gio trash" not in _why and "rm -r" not in _why, _why[:600])
+
+_dec, _why = guard("rm -rf /", dcg=STUB_DENY_EXIT0)
+check("an unrelated rule (rm -rf on root/home) gets no cleanup route",
+      _dec == "deny" and CLEANUP_MARKER not in _why and DYNAMIC_MARKER not in _why,
+      _why[:400])
+
+# Live: the rule ids above are transcribed, and a stub would agree with a
+# wrong transcription forever. Ask the packaged dcg what it actually emits,
+# and check the forms the hint recommends really do pass it. A scratch HOME
+# whose USER config is the full-rule fixture: the guard only trusts an allow
+# once `dcg config` reports a loaded user config, and the host's own config
+# must not decide this lane.
+_LIVE_HOME = os.path.join(SCRATCH, "live-cleanup-home")
+os.makedirs(os.path.join(_LIVE_HOME, ".config", "dcg"), exist_ok=True)
+shutil.copyfile(LIVE_FULL_TOML,
+                os.path.join(_LIVE_HOME, ".config", "dcg", "config.toml"))
+_LIVE_CLEANUP_ENV = {"HOME": _LIVE_HOME,
+                     "XDG_CONFIG_HOME": os.path.join(_LIVE_HOME, ".config")}
+if os.access(REAL_DCG, os.X_OK):
+    for _cmd in ("rm -rf build/__pycache__", "rm -r build/__pycache__",
+                 "rm -r -f build/__pycache__", "rm --recursive --force build/x",
+                 "find . -name '*.pyc' -delete", "git clean -fdX"):
+        _dec, _why = guard(_cmd, dcg=REAL_DCG,
+                           env_extra=_LIVE_CLEANUP_ENV)
+        check(f"LIVE {_cmd!r}: denied with the cleanup route",
+              _dec == "deny" and CLEANUP_MARKER in _why, _why[:400])
+    for _cmd in ('mv a "$S/b"', 'echo hi > "$S/b"'):
+        _dec, _why = guard(_cmd, dcg=REAL_DCG,
+                           env_extra=_LIVE_CLEANUP_ENV)
+        check(f"LIVE {_cmd!r}: denied with the literal-path route",
+              _dec == "deny" and DYNAMIC_MARKER in _why, _why[:400])
+    for _cmd in ("rm -r /tmp/claude-1003/session/scratchpad/old",
+                 "gio trash /home/jonathan/worktrees/x/build/__pycache__",
+                 "mv a /tmp/claude-1003/session/scratchpad/b"):
+        _dec, _why = guard(_cmd, dcg=REAL_DCG,
+                           env_extra=_LIVE_CLEANUP_ENV)
+        check(f"LIVE recommended form {_cmd!r} passes dcg",
+              _dec is None, f"decision={_dec!r} {_why[:300]}")
+else:
+    check("no dcg on this host — live cleanup lane NOT exercised (read as "
+          "'not checked', never as 'passed')", True, REAL_DCG)
+
 
 # ----------------------------------------------------------------------
 section("Summary")

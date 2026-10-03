@@ -17,6 +17,7 @@ Never ask the user to do what you can do. Run the commands, tests, reads, edits,
 - Files created by an AI earlier in the same session may be deleted without asking when they block progress or consume storage/memory without further use, after verifying the exact target, provenance, scope, and lack of remaining value.
 - Stale or stuck lock files created by the current agent/session may be deleted after the same checks and verification that no live process still owns or uses the lock. Uncertain ownership or live use requires asking.
 - Worktrees created by the current agent/session follow the additional checks under **Worktrees**. Worktree cleanup does not include branch deletion.
+- Run sanctioned cleanup on literal absolute paths: `rm -r /tmp/<path>` under `/tmp`, `gio trash <path>` elsewhere (reversible). Never `rm -rf`, never `$VAR`/`$(...)` paths. Reclaiming space outside `/tmp` → ask.
 
 **Defaults:**
 

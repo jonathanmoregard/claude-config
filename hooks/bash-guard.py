@@ -445,6 +445,55 @@ def _check_dcg_config(path: str) -> None:
     _DCG_CONFIG_VERIFIED = True
 
 
+# Explanation only: these never change a verdict. dcg's own reason for a
+# recursive delete says "ask the user to run the command manually", so
+# sessions doing cleanup CLAUDE.md sanctions either hunted workarounds or
+# handed the deletion back (RSI 2026-09-23). The hint names the form that
+# passes, scoped to sanctioned cleanup. Rule ids are pinned against the
+# packaged dcg by the live lane in tests/test_bash_guard_pre.py.
+# `gio trash` stays OUT of permissions.allow: each use keeps its prompt.
+# Allowlisted, one call could trash this hook, and a missing hook fails open.
+_CLEANUP_DELETE_RULES = frozenset({
+    "core.filesystem:rm-rf-general",
+    "core.filesystem:rm-recursive-general",
+    "core.filesystem:rm-r-f-separate",
+    "core.filesystem:rm-recursive-force-long",
+    "core.filesystem:find-delete-general",
+    "core.git:clean-force",
+})
+_CLEANUP_DELETE_HINT = (
+    "Sanctioned cleanup (CLAUDE.md 'Safe cleanup without asking') only; any "
+    "other deletion is the user's call, so ask the user. After verifying the "
+    "exact target: under /tmp, `rm -r /tmp/<literal absolute path>`; "
+    "elsewhere, `gio trash <literal absolute path>` (reversible). For "
+    "`git clean`, list the targets first with `git clean -n` and remove "
+    "those literal paths. Trash frees "
+    "no space and fails on system mounts, so if the point is reclaiming space "
+    "outside /tmp, ask the user. Wrapping the same deletion in another "
+    "command does not change the policy."
+)
+# A move or write to a `$VAR` path is not a deletion; steering it towards
+# rm/trash would be wrong, so these rules get only the literal-path advice.
+_DYNAMIC_PATH_RULES = frozenset({
+    "core.filesystem:mv-dynamic-path",
+    "core.filesystem:redirect-truncate-dynamic-path",
+})
+_DYNAMIC_PATH_HINT = (
+    "A path built from `$VAR`, `$(...)` or backslash escapes cannot be "
+    "verified before it runs. Resolve it yourself (e.g. `echo \"$VAR\"`), "
+    "check it, then put the literal absolute path in the command, or use the "
+    "Write tool for file contents."
+)
+
+
+def _dcg_deny_hint(rule: str) -> str:
+    if rule in _CLEANUP_DELETE_RULES:
+        return _CLEANUP_DELETE_HINT + "\n"
+    if rule in _DYNAMIC_PATH_RULES:
+        return _DYNAMIC_PATH_HINT + "\n"
+    return ""
+
+
 def _check_dcg(command: str) -> str | None:
     """Ask dcg whether to block. Returns a deny reason, or None to allow.
 
@@ -527,6 +576,7 @@ def _check_dcg(command: str) -> str | None:
                 deny_reason = (
                     f"bash-guard: dcg blocked this command (rule: {rule}).\n"
                     f"{why}\n"
+                    f"{_dcg_deny_hint(rule)}"
                     "This is dcg working as intended, not a broken guard. To run it "
                     "anyway, run it yourself in the prompt with `! <command>`."
                 ).strip()
