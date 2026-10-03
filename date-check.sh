@@ -7,6 +7,10 @@
 
 set -euo pipefail
 
+# Every claude this script spawns is a machine session: session-reflect must
+# not reflect on it into the corpus the RSI review reads.
+export CLAUDE_PIPELINE_INTERNAL=1
+
 DATES_DIR="$HOME/.claude/dates"
 CONFIG_FILE="$DATES_DIR/config.json"
 STATE_FILE="$DATES_DIR/state.json"
@@ -79,9 +83,36 @@ print('Winter' if m in (12,1,2) else 'Spring' if m in (3,4,5) else 'Summer' if m
 ")
 
 # ── Check Google Calendar (shell-side, no MCP needed) ────────────────────────
-GCAL_RESULT=$(python3 "$HOME/.claude/gcal-check.py" --partner "$PARTNER" --days 31 2>/dev/null \
+# The iCal parsing libraries come from the system-pinned nixpkgs; the bare
+# python3 on PATH does not have them. Absolute nix path: cron's PATH is minimal.
+GCAL_PYTHON='let p = (builtins.getFlake "nixpkgs").legacyPackages.${builtins.currentSystem}; in p.python3.withPackages (ps: [ ps.icalendar ps.recurring-ical-events ])'
+GCAL_RESULT=$(/run/current-system/sw/bin/nix shell --impure --expr "$GCAL_PYTHON" \
+  -c python3 "$HOME/.claude/gcal-check.py" --partner "$PARTNER" --days 31 2>/dev/null \
   || echo "GCAL_ERROR: gcal-check.py failed")
 echo "Calendar check: $GCAL_RESULT"
+
+# Without a readable calendar there is nothing to decide on: guessing "no dates"
+# nags about dates that are already booked. Drop any pending suggestion, record
+# the error so the reminder hook can say the check is broken, and stop here.
+if [[ "$GCAL_RESULT" != DATE_COUNT:* ]]; then
+  STATE_FILE="$STATE_FILE" TODAY="$TODAY" GCAL_RESULT="$GCAL_RESULT" python3 <<'PYEOF'
+import json, os
+path = os.environ["STATE_FILE"]
+try:
+    with open(path) as f:
+        state = json.load(f)
+except Exception:
+    state = {}
+state["last_checked"] = os.environ["TODAY"]
+state["pending_suggestion"] = None
+state["calendar_error"] = os.environ["GCAL_RESULT"].splitlines()[0][:300]
+with open(path, "w") as f:
+    json.dump(state, f, indent=2)
+PYEOF
+  echo "Calendar unreadable — suggestion cleared, calendar_error recorded."
+  echo "--- done ---"
+  exit 0
+fi
 
 # ── Run the agent (Read + Write only) ────────────────────────────────────────
 PROMPT="You are a weekly date-night planner helping Jonathan stay on a regular date rhythm with $PARTNER in $CITY.
@@ -106,7 +137,7 @@ $GCAL_RESULT
 
 The calendar result starts with DATE_COUNT: N where N is the number of upcoming dates with $PARTNER in the next 31 days.
 
-**Case A — DATE_COUNT is $DATES_PER_MONTH or more (or GCAL_ERROR and you want to be safe):**
+**Case A — DATE_COUNT is $DATES_PER_MONTH or more:**
 Enough dates are planned. Clear any pending suggestion and write:
 {
   \"last_checked\": \"$TODAY\",
@@ -148,8 +179,9 @@ echo "$AGENT_OUTPUT"
 STATE_LINE=$(echo "$AGENT_OUTPUT" | grep '^STATE_JSON:')
 if [[ -n "$STATE_LINE" ]]; then
   NEW_STATE="${STATE_LINE#STATE_JSON:}"
+  # calendar_error is dropped: this run read the calendar fine.
   echo "$NEW_STATE" | python3 -c "import json,sys; json.dumps(json.load(sys.stdin))" 2>/dev/null \
-    && echo "$NEW_STATE" | python3 -c "import json,sys; print(json.dumps(json.load(sys.stdin), indent=2))" > "$STATE_FILE" \
+    && echo "$NEW_STATE" | python3 -c "import json,sys; s=json.load(sys.stdin); s.pop('calendar_error',None); print(json.dumps(s, indent=2))" > "$STATE_FILE" \
     && echo "State written by shell." \
     || echo "State parse error — not written."
 else

@@ -37,6 +37,9 @@ export PATH="$ROOT/fakebin:$PATH"
 mkdir -p "$ROOT/fakebin" "$ROOT/nohooks"
 printf '#!/usr/bin/env bash\necho "NOTIFY: $*" >> %s/notifications\n' "$ROOT" > "$ROOT/fakebin/notify-send"
 chmod +x "$ROOT/fakebin/notify-send"
+# Offline check after a failed fetch resolves this host; localhost keeps every
+# case "online" unless it overrides it, independent of the real network.
+export CLAUDE_PULL_ONLINE_PROBE_HOST=localhost
 
 # A string real gitleaks 8.30.1 flags. Verified empirically before this file was
 # written: the AWS docs example key AKIAIOSFODNN7EXAMPLE is ALLOWLISTED by the
@@ -360,6 +363,31 @@ git -C "$SINK" remote set-url origin "$ROOT/gone.git"
 run
 check "an unreachable remote exits 1" 1 "$rc" "fetch" "$out"
 expect_status "an unreachable remote records state=unverified" state unverified
+
+# 17. a persistent fetch failure notifies ONCE, not once per tick (the count in
+# the alert text used to defeat the debounce: 60 toasts on 2026-09-27)
+notif_before=$(grep -c '^NOTIFY' "$ROOT/notifications" 2>/dev/null || echo 0)
+for _ in 1 2 3 4 5 6 7 8; do run; done
+check "a persistent fetch failure keeps counting" 1 "$rc" "consecutive failures: 9" "$out"
+notif_after=$(grep -c '^NOTIFY' "$ROOT/notifications" 2>/dev/null || echo 0)
+[ "$notif_after" -eq $((notif_before + 1)) ] \
+  && { echo "PASS persistent fetch failure notifies exactly once"; pass=$((pass+1)); } \
+  || { echo "FAIL persistent fetch failure notified $((notif_after - notif_before)) times"; fail=$((fail+1)); }
+
+# 18. offline: no DNS for the probe host -> quiet skip, not counted
+fresh offline
+git -C "$SINK" remote set-url origin "$ROOT/gone.git"
+notif_before=$(grep -c '^NOTIFY' "$ROOT/notifications" 2>/dev/null || echo 0)
+export CLAUDE_PULL_ONLINE_PROBE_HOST=offline-probe.invalid
+for _ in 1 2 3 4 5 6 7 8; do run; done
+export CLAUDE_PULL_ONLINE_PROBE_HOST=localhost
+check "an offline fetch failure is a quiet skip" 0 "$rc" "offline" "$out"
+expect_status "an offline tick records state=unverified" state unverified
+notif_after=$(grep -c '^NOTIFY' "$ROOT/notifications" 2>/dev/null || echo 0)
+[ "$notif_after" = "$notif_before" ] && { echo "PASS offline ticks never notify"; pass=$((pass+1)); } \
+  || { echo "FAIL offline ticks notified"; fail=$((fail+1)); }
+run
+check "back online the broken remote counts from one" 1 "$rc" "consecutive failures: 1" "$out"
 
 echo
 echo "passed: $pass  failed: $fail"

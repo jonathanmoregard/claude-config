@@ -14,6 +14,8 @@ Layers, in order:
      ``_check_pipe_to_shell``, which reads tokenised pipeline stages and never
      this literal. The intent of six ported deny rules that the CLI's matcher
      structurally cannot enforce
+  3b. a ``run_in_background`` command that captures ``$?`` and then ends on
+     ``echo``/``printf``, so its completion notice always reads exit code 0
   4. the nixos-config push gate (``Pre-push checklist:`` trailer, with its
      claim-vs-diff and merge-base cross-checks)
   5. allow — by emitting NOTHING
@@ -443,6 +445,55 @@ def _check_dcg_config(path: str) -> None:
     _DCG_CONFIG_VERIFIED = True
 
 
+# Explanation only: these never change a verdict. dcg's own reason for a
+# recursive delete says "ask the user to run the command manually", so
+# sessions doing cleanup CLAUDE.md sanctions either hunted workarounds or
+# handed the deletion back (RSI 2026-09-23). The hint names the form that
+# passes, scoped to sanctioned cleanup. Rule ids are pinned against the
+# packaged dcg by the live lane in tests/test_bash_guard_pre.py.
+# `gio trash` stays OUT of permissions.allow: each use keeps its prompt.
+# Allowlisted, one call could trash this hook, and a missing hook fails open.
+_CLEANUP_DELETE_RULES = frozenset({
+    "core.filesystem:rm-rf-general",
+    "core.filesystem:rm-recursive-general",
+    "core.filesystem:rm-r-f-separate",
+    "core.filesystem:rm-recursive-force-long",
+    "core.filesystem:find-delete-general",
+    "core.git:clean-force",
+})
+_CLEANUP_DELETE_HINT = (
+    "Sanctioned cleanup (CLAUDE.md 'Safe cleanup without asking') only; any "
+    "other deletion is the user's call, so ask the user. After verifying the "
+    "exact target: under /tmp, `rm -r /tmp/<literal absolute path>`; "
+    "elsewhere, `gio trash <literal absolute path>` (reversible). For "
+    "`git clean`, list the targets first with `git clean -n` and remove "
+    "those literal paths. Trash frees "
+    "no space and fails on system mounts, so if the point is reclaiming space "
+    "outside /tmp, ask the user. Wrapping the same deletion in another "
+    "command does not change the policy."
+)
+# A move or write to a `$VAR` path is not a deletion; steering it towards
+# rm/trash would be wrong, so these rules get only the literal-path advice.
+_DYNAMIC_PATH_RULES = frozenset({
+    "core.filesystem:mv-dynamic-path",
+    "core.filesystem:redirect-truncate-dynamic-path",
+})
+_DYNAMIC_PATH_HINT = (
+    "A path built from `$VAR`, `$(...)` or backslash escapes cannot be "
+    "verified before it runs. Resolve it yourself (e.g. `echo \"$VAR\"`), "
+    "check it, then put the literal absolute path in the command, or use the "
+    "Write tool for file contents."
+)
+
+
+def _dcg_deny_hint(rule: str) -> str:
+    if rule in _CLEANUP_DELETE_RULES:
+        return _CLEANUP_DELETE_HINT + "\n"
+    if rule in _DYNAMIC_PATH_RULES:
+        return _DYNAMIC_PATH_HINT + "\n"
+    return ""
+
+
 def _check_dcg(command: str) -> str | None:
     """Ask dcg whether to block. Returns a deny reason, or None to allow.
 
@@ -525,6 +576,7 @@ def _check_dcg(command: str) -> str | None:
                 deny_reason = (
                     f"bash-guard: dcg blocked this command (rule: {rule}).\n"
                     f"{why}\n"
+                    f"{_dcg_deny_hint(rule)}"
                     "This is dcg working as intended, not a broken guard. To run it "
                     "anyway, run it yourself in the prompt with `! <command>`."
                 ).strip()
@@ -1112,6 +1164,48 @@ def _check_pipe_to_shell(command: str) -> str | None:
 
 
 # ----------------------------------------------------------------------
+# Layer 3b: a background command that captures its exit status and then
+# throws it away on a trailing echo
+# ----------------------------------------------------------------------
+# A `run_in_background` call is reported back as "completed (exit code N)",
+# and N is the status of the LAST statement. Capture `$?`, end on `echo`, and
+# N is always 0. Measured 2026-09-28 (klaffat): `(scripts/check affected >
+# gate3.log 2>&1; echo EXIT=$? >> gate3.log)` ran with one failing e2e test,
+# notified exit code 0, and a push went out on it. A foreground call is not
+# caught: its output, `$?` line included, is read directly.
+_STATUS_CAPTURE = re.compile(r"\$\?|\$\{\?\}|PIPESTATUS")
+_STATUS_DISCARDING_TAIL = re.compile(r"^[\s({]*(?:builtin\s+)?(?:echo|printf)\b")
+
+_BG_STATUS_MASKED_HINT = (
+    "bash-guard: this background command captures its exit status and then "
+    "ends on echo/printf, so the completion notice will report exit code 0 "
+    "even if the command failed. That masked a failing gate as green and a "
+    "push went out on it (2026-09-28).\n"
+    "Keep the log line and re-raise the status as the last statement:\n"
+    "  (<cmd> > LOG 2>&1; rc=$?; echo EXIT=$rc >> LOG; exit $rc)"
+)
+
+
+def _check_bg_status_masked(command: str, background: bool) -> str | None:
+    if not background or not _STATUS_CAPTURE.search(command):
+        return None
+    body = command.rstrip().rstrip(")}; \t\n")
+    parts = [(seg, op) for seg, op in _split_operators(body) if seg]
+    if not parts or not _STATUS_DISCARDING_TAIL.match(parts[-1][0]):
+        return None
+    # `cmd && echo …` skips the echo when cmd fails, so cmd's status is reported.
+    if len(parts) > 1 and parts[-2][1] == "&&":
+        return None
+    # A `$?` inside a loop body tests an in-loop command; only a capture after
+    # the last `done` is a status the trailing echo throws away.
+    last_done = max((i for i, (seg, _op) in enumerate(parts)
+                     if re.match(r"done\b", seg)), default=-1)
+    if not any(_STATUS_CAPTURE.search(seg) for seg, _op in parts[last_done + 1:]):
+        return None
+    return _BG_STATUS_MASKED_HINT
+
+
+# ----------------------------------------------------------------------
 # Layer 4: the nixos-config push gate
 # (ported from `_check_nixos_push` in mcps/safe-bash/server.py, which chunk
 # C deletes; the incident texts below are the behaviour, not decoration)
@@ -1406,9 +1500,9 @@ def _candidate_repo_paths(command: str, cwd: str | None) -> tuple[list[str], lis
     Returns ``(paths, unresolved)``. ``unresolved`` names each candidate that
     could not be turned into a path at all.
 
-    Order:
-      1. Last `cd <path>` target in the command's pipeline chain
-      2. `git -C <path>` flag
+    Order (the first that IS a repository wins — `_nixos_resolve_target_repo`):
+      1. `git -C <path>` flag
+      2. Last `cd <path>` target in the command's pipeline chain
       3. The session cwd carried on the hook payload
       4. The hook process's own cwd
 
@@ -1428,9 +1522,10 @@ def _candidate_repo_paths(command: str, cwd: str | None) -> tuple[list[str], lis
     """
     candidates: list[str] = []
     unresolved: list[str] = []
-    cd_target = _nixos_extract_cd_target(command)
-    if cd_target:
-        candidates.append(cd_target)
+    # `git -C <path>` names the push's repository on the git command itself,
+    # so it outranks a `cd` earlier in the chain: `cd A && git -C B push`
+    # pushes B. Both outrank the session cwd, which only matters for a push
+    # that names no path at all.
     m = re.search(r"\bgit\s+(?:[^\n;|&]*?\s+)?-C\s+(\S+)", command)
     if m:
         raw = m.group(1).strip("\"'")
@@ -1438,6 +1533,9 @@ def _candidate_repo_paths(command: str, cwd: str | None) -> tuple[list[str], lis
             candidates.append(os.path.abspath(os.path.expanduser(raw)))
         except (ValueError, OSError) as exc:
             unresolved.append(f"the `git -C {raw[:80]}` path ({type(exc).__name__})")
+    cd_target = _nixos_extract_cd_target(command)
+    if cd_target:
+        candidates.append(cd_target)
     if isinstance(cwd, str) and cwd.strip():
         candidates.append(cwd)
     try:
@@ -1497,6 +1595,16 @@ def _nixos_resolve_target_repo(command: str, cwd: str | None) -> str | None:
     identically, and the gate would be switched off by a deleted directory.
     That is the same failure `_nixos_git` already refuses to make for a git
     command it could not run.
+
+    THE CANDIDATES ARE FALLBACKS, NOT A SEARCH. The first one that IS a
+    working tree is the repository the push goes to — `cd <repo> && git
+    push` pushes <repo>, whatever directory the session sits in. The loop
+    used to keep walking after a candidate resolved to a repo that was not
+    nixos-config, and fire on the session cwd instead; measured 2026-10-02,
+    `cd ~/worktrees/survival-corpus-first-aid && git push` was refused for
+    the trailer missing from a nixos-config worktree's merge commit. Later
+    candidates are consulted only when an earlier one was not a repository
+    at all.
     """
     paths, unresolved = _candidate_repo_paths(command, cwd)
     for path in paths:
@@ -1528,7 +1636,7 @@ def _nixos_resolve_target_repo(command: str, cwd: str | None) -> str | None:
                 if rc_gd == 0 and gitdir.strip():
                     if _repo_has_nixos_remote(gitdir.strip()):
                         return gitdir.strip()
-                    continue
+                    break  # a repository, and not nixos-config: that is the answer
                 _fail_closed(
                     f"the nixos push gate found a git repository at {path!r} with "
                     "no working tree and could not resolve its git directory "
@@ -1546,6 +1654,7 @@ def _nixos_resolve_target_repo(command: str, cwd: str | None) -> str | None:
             continue
         if _repo_has_nixos_remote(repo_root):
             return repo_root
+        break  # the push's repository is this one, and it is not nixos-config
     if unresolved:
         _fail_closed(
             "the nixos push gate found no nixos-config repo among the paths it "
@@ -1784,12 +1893,20 @@ def _check_nixos_push(command: str, cwd: str | None) -> str | None:
     # back a third time to "" — an empty diff satisfies every cross-check
     # below, so a `git diff` that could not resolve either ref silently
     # switched the gate off. Both refs failing is now a deny.
+    #
+    # Fall back ONLY when the origin/main diff FAILED. An empty diff from a
+    # resolvable origin/main is a real answer — the branch adds nothing on
+    # top of origin/main (already merged, or HEAD sits on origin/main's tip)
+    # — and there is then nothing for the claims to contradict. Falling back
+    # on empty compared HEAD against a stale local `main` instead, whose
+    # unrelated history then produced false "feature-vm.nix modified" and
+    # risky-marker mismatches.
     rc1, diff, _ = _nixos_git(worktree, ["diff", "origin/main...HEAD"])
-    if rc1 != 0 or not diff:
+    if rc1 != 0:
         rc2, diff2, err2 = _nixos_git(worktree, ["diff", "main...HEAD"])
         if rc2 == 0:
             diff = diff2
-        elif rc1 != 0:
+        else:
             _fail_closed(
                 "the nixos push gate could not diff this branch against either "
                 f"origin/main or main in {worktree!r}, so the checklist's claims "
@@ -1899,6 +2016,198 @@ def _check_nixos_push(command: str, cwd: str | None) -> str | None:
 
 
 # ----------------------------------------------------------------------
+# Layer 5: foreground CI polling
+# ----------------------------------------------------------------------
+# `sleep N; gh pr checks X` in the foreground holds the turn for N seconds and
+# then returns a snapshot that is usually "still pending", so it gets re-issued
+# turn after turn: measured 2026-09-12 at 12-19 polls per wait on NixOS VM
+# suites, and still live 2026-10-02 (`sleep 20/40/150; gh pr checks …`). gh
+# ships the blocking primitive; run in the background, the harness re-invokes
+# the session when it exits, so one call replaces the whole loop. A single
+# status look (no sleep) is fine and stays allowed.
+#
+# The same loop shows up for waits gh has no `--watch` for: GitHub's lazily
+# computed mergeability (`sleep 15; gh pr view … mergeable` while it reads
+# UNKNOWN) and deploys/units (`sleep 30; systemctl status …`). scripts/wait-for
+# is the blocking primitive for those, so a status read of either kind counts.
+# A unit status read is held to a narrower test: replayed against ~30k real
+# foreground commands, "act, then look" (`systemctl restart x && sleep 2 &&
+# systemctl status x`) is a common health check, not a wait. So it counts only
+# inside a loop or after a sleep over _UNIT_SETTLE_S, and never when the same
+# command acts on a unit.
+_SHELL_KEYWORDS = frozenset({"do", "then", "else", "while", "until", "if", "!", "{", "(", "time"})
+
+_CI_POLL_HINT = (
+    "bash-guard: foreground CI poll denied — `sleep` plus a one-shot CI status "
+    "snapshot (`gh pr checks` / `gh pr view` / `gh run view|list` / `systemctl "
+    "status|is-active|show`) holds the "
+    "turn and still returns a snapshot, so it gets repeated: a hand-rolled wait "
+    "loop.\n"
+    "Use the blocking primitive, with Bash run_in_background: true — you are "
+    "re-invoked when it exits:\n"
+    "  ~/.claude/scripts/wait-for pr <PR> [-R owner/repo]   (CI settled + mergeability known)\n"
+    "  ~/.claude/scripts/wait-for unit <name> [--user] [--since now]   (deploy/unit run finished)\n"
+    "  ~/.claude/scripts/wait-for run <RUN_ID> [-R owner/repo]\n"
+    "  or gh's own: gh pr checks <PR> --watch --fail-fast / gh run watch <RUN_ID> --exit-status\n"
+    "Checks not registered yet right after a push? Keep the delay in front of the "
+    "watch: `sleep 20; gh pr checks <PR> --watch --fail-fast` (background). "
+    "Same for fetching a fresh run id after a push.\n"
+    "Long or must survive /clear: scheduling-follow-through (durable CronCreate). "
+    "A single status look without `sleep` is allowed."
+)
+
+
+def _segment_tokens(segment: str) -> list[str]:
+    try:
+        toks = shlex.split(segment)
+    except ValueError:
+        toks = segment.split()
+    while toks and toks[0] in _SHELL_KEYWORDS:
+        toks = toks[1:]
+    return toks
+
+
+_UNIT_STATUS_VERBS = frozenset({"status", "is-active", "is-failed", "show"})
+_UNIT_ACTION_VERBS = frozenset({"start", "restart", "reload", "try-restart",
+                                "reload-or-restart", "enable", "stop"})
+_LOOP_KEYWORDS = frozenset({"while", "until", "for"})
+_UNIT_SETTLE_S = 10
+
+
+def _systemctl_verb(toks: list[str]) -> str | None:
+    if not toks or toks[0] != "systemctl":
+        return None
+    verbs = [t for t in toks[1:] if not t.startswith("-")]
+    return verbs[0] if verbs else None
+
+
+def _sleep_seconds(toks: list[str]) -> float:
+    """Seconds a `sleep` segment waits; unparseable counts as long."""
+    total = 0.0
+    for arg in toks[1:]:
+        m = re.fullmatch(r"(\d+(?:\.\d+)?)([smhd]?)", arg)
+        if not m:
+            return float("inf")
+        total += float(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+    return total
+
+
+def _is_ci_snapshot(toks: list[str]) -> bool:
+    if len(toks) < 3 or toks[0] != "gh":
+        return False
+    if "--watch" in toks:
+        return False
+    sub = toks[1:3]
+    return sub in (["pr", "checks"], ["pr", "view"], ["run", "view"], ["run", "list"])
+
+
+_HEREDOC_OP_RE = re.compile(r"(?<!<)<<(?!<)-?[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+
+def _split_heredocs(command: str) -> tuple[str, list[str]]:
+    """(shell text with heredoc bodies removed, bodies of UNQUOTED heredocs).
+
+    A heredoc body is data, not commands: a commit message or progress note
+    that says "`sleep 30; gh pr checks 9`" is not a poll. Only an unquoted
+    delimiter still expands `$( )` / backticks inside the body, so those
+    bodies are returned for the substitution scan alone.
+    """
+    lines = command.split("\n")
+    shell: list[str] = []
+    live: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        shell.append(line)
+        i += 1
+        for m in _HEREDOC_OP_RE.finditer(line):
+            quoted, delim = bool(m.group(1)), m.group(2)
+            body: list[str] = []
+            while i < len(lines) and lines[i].strip() != delim:
+                body.append(lines[i])
+                i += 1
+            i += 1  # the terminator line (or past the end when unterminated)
+            if not quoted:
+                live.append("\n".join(body))
+    return "\n".join(shell), live
+
+
+def _mask_single_quotes(s: str) -> str:
+    """`s` with single-quoted text blanked, so a backtick or `$(` inside
+    'literal text' is not mistaken for a command substitution."""
+    out: list[str] = []
+    in_single = in_double = False
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if in_single:
+            if ch == "'":
+                in_single = False
+                out.append(ch)
+            else:
+                out.append(" ")
+        elif ch == "\\" and i + 1 < len(s):
+            out.append(s[i : i + 2])
+            i += 2
+            continue
+        elif ch == '"':
+            in_double = not in_double
+            out.append(ch)
+        elif ch == "'" and not in_double:
+            in_single = True
+            out.append(ch)
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _check_ci_poll(command: str, background: bool) -> str | None:
+    if background:
+        return None
+    has_sleep = has_snapshot = has_unit_read = acts_on_unit = in_loop = False
+    longest_sleep = 0.0
+    shell_text, live_bodies = _split_heredocs(command)
+    segments = _pipeline_subcommands(shell_text)
+    # `s=$(gh pr checks 9 | grep -c pending)` inside a loop is the same poll.
+    subst_sources = [_mask_single_quotes(shell_text), *live_bodies]
+    for src in subst_sources:
+        for body in _command_substitutions(src):
+            segments.extend(_pipeline_subcommands(body))
+    for seg in segments:
+        try:
+            raw = shlex.split(seg)
+        except ValueError:
+            raw = seg.split()
+        if raw and raw[0] in _LOOP_KEYWORDS:
+            in_loop = True
+        toks = _segment_tokens(seg)
+        if not toks:
+            continue
+        verb = _systemctl_verb(toks)
+        if verb in _UNIT_STATUS_VERBS:
+            has_unit_read = True
+            continue
+        if verb in _UNIT_ACTION_VERBS:
+            acts_on_unit = True
+            continue
+        if toks[0] == "sleep":
+            has_sleep = True
+            longest_sleep = max(longest_sleep, _sleep_seconds(toks))
+        elif toks[:3] == ["gh", "run", "watch"] or (toks[:1] == ["gh"] and "--watch" in toks):
+            # The blocking primitive is in the command; a snapshot after it
+            # just prints the settled result.
+            return None
+        elif _is_ci_snapshot(toks):
+            has_snapshot = True
+    if has_sleep and has_unit_read and not acts_on_unit and (
+        in_loop or longest_sleep > _UNIT_SETTLE_S
+    ):
+        has_snapshot = True
+    return _CI_POLL_HINT if has_sleep and has_snapshot else None
+
+
+# ----------------------------------------------------------------------
 def main() -> int:
     if not _TIMEOUTS_SANE:
         _fail_closed(
@@ -1949,9 +2258,15 @@ def main() -> int:
     if reason is None:
         reason = _check_pipe_to_shell(command)
     if reason is None:
+        reason = _check_bg_status_masked(
+            command, tool_input.get("run_in_background") is True
+        )
+    if reason is None:
         reason = _check_nixos_push(command, cwd if isinstance(cwd, str) else None)
         if reason is not None:
             reason = "bash-guard: " + reason
+    if reason is None:
+        reason = _check_ci_poll(command, tool_input.get("run_in_background") is True)
 
     _disarm_watchdog()
     if reason is not None:

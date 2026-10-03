@@ -108,15 +108,20 @@ write_status() { # write_status <ok|unverified|alert> [reason]
 # "diverged from origin" persists until someone fixes it. Re-notifying each
 # tick would train the notification away. The status record is written on every
 # tick regardless — the debounce is a property of the toast, not of the truth.
-alert() {
-  local reason="$1"
+#
+# The debounce is keyed on the optional second argument, defaulting to the
+# reason. A reason that carries a changing detail (a failure count) MUST pass a
+# stable key: keyed on its text, every tick looked like a new problem and the
+# fetch-failure alert raised 88 identical toasts on 2026-09-27.
+alert() { # alert <reason> [debounce-key]
+  local reason="$1" key="${2:-$1}"
   log "ALERT: $reason"
   write_status alert "$reason"
 
-  if [ -f "$STATE/last-alert" ] && [ "$(cat "$STATE/last-alert")" = "$reason" ]; then
+  if [ -f "$STATE/last-alert" ] && [ "$(cat "$STATE/last-alert")" = "$key" ]; then
     return 0
   fi
-  printf '%s' "$reason" > "$STATE/last-alert"
+  printf '%s' "$key" > "$STATE/last-alert"
 
   command -v notify-send >/dev/null 2>&1 || {
     log "notify-send not on PATH — alert recorded in journal only"
@@ -211,6 +216,17 @@ fi
 export GIT_SSH_COMMAND="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
 
 if ! timeout 60 git fetch --quiet --prune origin "$BRANCH"; then
+  # No uplink is not a fault: the tick is a skip, like lock contention. It
+  # must not count toward the alert threshold (an offline evening used to
+  # cross it within the hour) and must not fail the unit. The record still
+  # says `unverified` — origin was not compared. A remote that is broken while
+  # the host is online keeps counting and alerts once, below.
+  probe_host="${CLAUDE_PULL_ONLINE_PROBE_HOST:-github.com}"
+  if ! timeout 5 getent ahosts "$probe_host" >/dev/null 2>&1; then
+    log "fetch failed while offline (cannot resolve $probe_host) — skipping tick, not counted"
+    write_status unverified "offline: git fetch could not run (no DNS for $probe_host); this checkout has not been compared against origin since the last successful tick."
+    exit 0
+  fi
   # A laptop is offline often enough that one failed fetch is noise. Only a
   # run of them means something is actually broken (expired key, bad remote),
   # so count consecutive failures and speak up after six failed ticks.
@@ -218,7 +234,7 @@ if ! timeout 60 git fetch --quiet --prune origin "$BRANCH"; then
   printf '%s' "$fails" > "$STATE/fetch-failures"
   log "fetch failed or timed out (60s) — consecutive failures: $fails"
   if [ "$fails" -ge 6 ]; then
-    alert "git fetch has failed $fails times in a row — check network, SSH key, or the origin remote."
+    alert "git fetch has failed $fails times in a row — check network, SSH key, or the origin remote." fetch-failing
   else
     # Below the notification threshold this is not yet a human's problem, but
     # it is emphatically not a clean bill of health either: the tick never

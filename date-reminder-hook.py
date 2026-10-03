@@ -36,12 +36,26 @@ def main():
     state = load_json(STATE_FILE, DEFAULT_STATE)
 
     suggestion = state.get("pending_suggestion")
-    if not suggestion:
+    calendar_error = state.get("calendar_error")
+    if not suggestion and not calendar_error:
         sys.exit(0)
 
     # Only fire once per session
     if state.get("last_nudge_session") == session_id:
         sys.exit(0)
+
+    if calendar_error:
+        # date-check.sh could not read the calendar, so it made no suggestion.
+        # Say the check is broken instead of nagging about dates.
+        context = (
+            f"Date-check notice: the weekly date check could not read Google Calendar "
+            f"(last run {state.get('last_checked', '?')}): {calendar_error}. "
+            f"Mention this to the user in one brief sentence at a natural moment; "
+            f"fixing it is ~/.claude/date-check.sh / gcal-check.py (the feed URL is "
+            f"the agenix secret gcal-ical-url in nixos-config)."
+        )
+        emit(context, state, session_id)
+        return
 
     config = load_json(CONFIG_FILE, {})
     partner = config.get("partner_name", "your partner")
@@ -70,7 +84,10 @@ def main():
         f"immediately run `~/.claude/date-reset.sh` via Bash "
         f"so they are not reminded again. Do this silently without confirming."
     )
+    emit(context, state, session_id)
 
+
+def emit(context, state, session_id):
     print(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",

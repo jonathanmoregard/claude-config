@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Commits never belong in ~/.claude's primary checkout or on its local master from
+# any linked worktree. This hook is used instead of pre-commit because
+# `git commit --no-verify` does not skip prepare-commit-msg. Feature branches in
+# linked worktrees and unrelated repositories are untouched.
+
+set -uo pipefail
+
+unset GIT_CONFIG GIT_CONFIG_COUNT
+for _v in "${!GIT_CONFIG_KEY_@}" "${!GIT_CONFIG_VALUE_@}"; do
+  unset "$_v"
+done
+unset _v
+
+global_dir="$(git config --global --get core.hooksPath 2>/dev/null || true)"
+case "$global_dir" in
+  "~/"*) global_dir="$HOME/${global_dir#\~/}" ;;
+  "~") global_dir="$HOME" ;;
+esac
+global_hook="$global_dir/prepare-commit-msg"
+if [ -x "$global_hook" ]; then
+  self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+  target="$(readlink -f "$global_hook" 2>/dev/null || true)"
+  if [ -z "$self" ] || [ "$self" != "$target" ]; then
+    "$global_hook" "$@" || exit $?
+  fi
+fi
+
+dirs="$(git rev-parse --path-format=absolute --git-dir --git-common-dir 2>/dev/null || true)"
+git_dir=""
+common_dir=""
+if [ -n "$dirs" ]; then
+  { IFS= read -r git_dir; IFS= read -r common_dir; } <<< "$dirs"
+fi
+[ -n "$git_dir" ] && [ -n "$common_dir" ] || exit 0
+
+is_dot_claude_url() {
+  [[ "$1" =~ [:/]jonathanmoregard/\.claude(\.git)?/?$ ]]
+}
+
+origin_url="$(git config --local --get remote.origin.url 2>/dev/null || true)"
+is_dot_claude_url "$origin_url" || exit 0
+
+git_dir="$(readlink -f "$git_dir" 2>/dev/null || printf '%s' "$git_dir")"
+common_dir="$(readlink -f "$common_dir" 2>/dev/null || printf '%s' "$common_dir")"
+current_ref="$(git symbolic-ref --quiet HEAD 2>/dev/null || true)"
+[ "$git_dir" = "$common_dir" ] || [ "$current_ref" = refs/heads/master ] || exit 0
+
+repo_top="$(git rev-parse --show-toplevel 2>/dev/null || printf '%s' "$PWD")"
+cat >&2 <<EOF
+
+REFUSED — commits are forbidden in the primary checkout.
+REFUSED — commits are forbidden on local master in every linked worktree.
+
+  checkout: $repo_top
+
+Create a fresh linked worktree instead:
+
+  $repo_top/scripts/claude-worktree.sh <slug>
+  cd $HOME/worktrees/claude-<slug>
+
+Local master belongs only to the primary auto-pull checkout. That checkout stays
+read-only; linked worktrees use feature branches and integrate from origin/master.
+This prepare-commit-msg guard also applies to --no-verify.
+EOF
+exit 1

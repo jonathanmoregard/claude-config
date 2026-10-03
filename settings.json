@@ -9,7 +9,6 @@
     "MCP_TIMEOUT": "120000"
   },
   "permissions": {
-    "defaultMode": "acceptEdits",
     "allow": [
       "Bash",
       "Glob",
@@ -33,7 +32,6 @@
       "Edit(//home/jonathan/worktrees/**)",
       "Edit(//home/jonathan/.claude/projects/**)",
       "Edit(//home/jonathan/.claude/skills/**)",
-      "Edit(//home/jonathan/.claude/homunculus/**)",
       "Edit(//home/jonathan/.claude/loops/**)",
       "Edit(//home/jonathan/.local/state/claude-self-compact/**)",
       "Edit(//home/jonathan/.local/state/claude-tasks/**)",
@@ -182,6 +180,7 @@
       "Edit(~/.local/state/claude-harness-tripwire/**)"
     ],
     "ask": [],
+    "defaultMode": "auto",
     "additionalDirectories": [
       "/home/jonathan/Repos/nixos-config-worktrees",
       "/home/jonathan/.claude/projects",
@@ -196,6 +195,7 @@
       "/home/jonathan/Repos/research-agent/reports"
     ]
   },
+  "model": "opus[1m]",
   "enableAllProjectMcpServers": false,
   "hooks": {
     "PermissionDenied": [
@@ -220,18 +220,18 @@
             "timeout": 5
           }
         ]
-      }
-    ],
-    "PostToolUse": [
+      },
       {
-        "matcher": "*",
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/skills/continuous-learning-v2/hooks/observe.sh post"
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark PermissionRequest",
+            "timeout": 10
           }
         ]
-      },
+      }
+    ],
+    "PostToolUse": [
       {
         "matcher": "Write|Edit|MultiEdit",
         "hooks": [
@@ -260,6 +260,15 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark PostToolUse",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "PreCompact": [
@@ -273,15 +282,6 @@
       }
     ],
     "PreToolUse": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "~/.claude/skills/continuous-learning-v2/hooks/observe.sh pre"
-          }
-        ]
-      },
       {
         "matcher": "Bash",
         "hooks": [
@@ -351,6 +351,15 @@
             "command": "bash ~/.claude/skills/session-reflect/reflect.sh sessionend"
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark SessionEnd",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "SessionStart": [
@@ -368,6 +377,16 @@
         "hooks": [
           {
             "type": "command",
+            "command": "python3 $HOME/.claude/hooks/offline-ai-smoke-health.py",
+            "timeout": 10,
+            "statusMessage": "Checking offline-ai smoke health..."
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
             "command": "python3 $HOME/.claude/hooks/claude-pull-health.py",
             "timeout": 10,
             "statusMessage": "Checking checkout freshness..."
@@ -378,9 +397,49 @@
         "hooks": [
           {
             "type": "command",
+            "command": "bash $HOME/.claude/scripts/worktree-policy-session-start.sh",
+            "timeout": 10,
+            "statusMessage": "Checking ~/.claude master pin..."
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/hooks/nixos-drift-health.py",
+            "timeout": 5,
+            "statusMessage": "Checking NixOS drift..."
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
             "command": "python3 -S -E $HOME/.claude/hooks/ai-router-health.py",
             "timeout": 5,
             "statusMessage": "Checking ai-router background health..."
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/hooks/unit-failure-health.py",
+            "timeout": 5,
+            "statusMessage": "Checking failed system units..."
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/hooks/reflect-backfill-health.py",
+            "timeout": 5,
+            "statusMessage": "Checking reflection backfill health..."
           }
         ]
       },
@@ -406,16 +465,6 @@
         "hooks": [
           {
             "type": "command",
-            "command": "(CLV2_PYTHON_CMD=python3 ECC_OBSERVER_TIMEOUT_SECONDS=300 ~/.claude/skills/continuous-learning-v2/agents/start-observer.sh start >/dev/null 2>&1 &) || true",
-            "timeout": 3,
-            "statusMessage": "Launching instinct observer..."
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
             "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; $HOME/.claude/nixos-reminder-hook.sh"
           }
         ]
@@ -427,6 +476,16 @@
             "command": "python3 $HOME/.claude/hooks/bash-guard-health.py",
             "timeout": 10,
             "statusMessage": "Checking bash guard health..."
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/hooks/pending-for-human.py",
+            "timeout": 10,
+            "statusMessage": "Checking pending human blockers..."
           }
         ]
       },
@@ -492,6 +551,15 @@
             "timeout": 30
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark Stop",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "StopFailure": [
@@ -504,6 +572,15 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark StopFailure",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "SubagentStop": [
@@ -512,6 +589,15 @@
           {
             "type": "command",
             "command": "bash ~/.claude/skills/session-reflect/reflect.sh subagentstop"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark SubagentStop",
+            "timeout": 10
           }
         ]
       }
@@ -560,10 +646,6 @@
           },
           {
             "type": "command",
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/evolve-reminder.py"
-          },
-          {
-            "type": "command",
             "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/hooks/prompt-log.py"
           }
         ]
@@ -586,6 +668,15 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark UserPromptSubmit",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "InstructionsLoaded": [
@@ -604,6 +695,17 @@
           {
             "type": "command",
             "command": "python3 ~/.claude/hooks/harness-tripwire.py"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark SubagentStart",
+            "timeout": 10
           }
         ]
       }

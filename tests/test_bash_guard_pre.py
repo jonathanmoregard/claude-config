@@ -1448,6 +1448,60 @@ check(
     f"decision={dec!r} {why[:200]}",
 )
 
+# --- D9: the push's target repo is the FIRST candidate that is a repo -
+# `_candidate_repo_paths` is an ordered list of fallbacks (cd target, then
+# `git -C`, then the session cwd, then the hook's cwd). The gate used to walk
+# the whole list and fire on the first NIXOS repo in it, so a push aimed by
+# `cd <other repo> && git push` from a session sitting in a nixos-config
+# worktree was judged by that worktree's HEAD instead of the repo being
+# pushed. Measured 2026-10-02: a survival-corpus branch could not be pushed
+# from a nixos-config session whose HEAD was a merge commit without a
+# trailer. Once a candidate resolves to a working tree it IS the target;
+# later candidates matter only when earlier ones were not repositories.
+_other = branch_with(
+    make_repo(remote_tail="someone-else/survival-corpus.git"),
+    "feat: corpus, no trailer (not a nixos repo)",
+    {"docs/a.md": "x\n"},
+)
+_nixos_cwd = branch_with(
+    make_repo(),
+    "merge commit without a trailer",
+    {"docs/b.md": "y\n"},
+)
+dec, why = push_guard(_other, command=f"cd {_other} && git push -u origin HEAD", cwd=_nixos_cwd)
+check(
+    "`cd <non-nixos repo> && git push` from a nixos-config session cwd is NOT gated",
+    dec is None,
+    f"decision={dec!r} {why[:200]}; the cd target is the push's repo, the "
+    f"session cwd is a fallback for commands that name no path",
+)
+dec, why = push_guard(_other, command=f"git -C {_other} push -u origin HEAD", cwd=_nixos_cwd)
+check(
+    "`git -C <non-nixos repo> push` from a nixos-config session cwd is NOT gated",
+    dec is None,
+    f"decision={dec!r} {why[:200]}",
+)
+dec, why = push_guard(_nixos_cwd, command=f"cd {_nixos_cwd} && git push origin HEAD", cwd=_other)
+check(
+    "control: `cd <nixos repo> && git push` from a non-nixos cwd IS gated",
+    dec == "deny" and "Pre-push checklist:" in why,
+    f"decision={dec!r} {why[:200]}",
+)
+dec, why = push_guard(_other, command=f"cd {_other} && git -C {_nixos_cwd} push origin HEAD", cwd=_other)
+check(
+    "`cd <non-nixos> && git -C <nixos> push` IS gated: -C names the push's repo, cd does not",
+    dec == "deny" and "Pre-push checklist:" in why,
+    f"decision={dec!r} {why[:200]}",
+)
+_not_a_repo = os.path.join(SCRATCH, "plain-dir")
+os.makedirs(_not_a_repo, exist_ok=True)
+dec, why = push_guard(_nixos_cwd, command=f"cd {_not_a_repo} && git push origin HEAD", cwd=_nixos_cwd)
+check(
+    "control: a cd target that is not a repo falls through to the session cwd",
+    dec == "deny" and "Pre-push checklist:" in why,
+    f"decision={dec!r} {why[:200]}",
+)
+
 w = branch_with(
     make_repo(
         remote_tail="someone-else/unrelated.git",
@@ -2756,6 +2810,149 @@ check("a push whose candidate paths will not resolve is DENIED, not allowed",
 check("and names what it could not resolve",
       "could not resolve" in _why,
       _why[:300])
+
+
+# ----------------------------------------------------------------------
+section("Background exit-status masking (2026-09-28 klaffat incident)")
+# Invariant: a `run_in_background` command's completion notification reports
+# the command's exit code. A command that captures the status (`$?`) and then
+# ends on `echo`/`printf` always reports 0, so a failed gate reads as green.
+# Measured: `(scripts/check affected > log 2>&1; echo EXIT=$? >> log)` ran
+# with one e2e failure, notified "completed (exit code 0)", and a push went
+# out on it.
+
+
+def bg_guard(command: str, background: bool = True) -> tuple[str | None, str]:
+    payload = pre_payload(command)
+    if background:
+        payload["tool_input"]["run_in_background"] = True
+    _, parsed, _, _ = run_hook("bash-guard.py", payload,
+                               env_extra={"DCG_PATH": STUB_ALLOW})
+    return decision_of(parsed), reason_of(parsed)
+
+
+_MASKING = {
+    "incident shape (subshell, echo EXIT=$? into the log)":
+        "cd /tmp && git log -1 && (timeout 2400 bash scripts/check affected "
+        "> /tmp/gate3.log 2>&1; echo EXIT=$? >> /tmp/gate3.log)",
+    "plain trailing echo of $?":
+        "make test > /tmp/t.log 2>&1; echo \"rc=$?\"",
+    "status saved to a variable, then echoed last":
+        "make test > /tmp/t.log 2>&1\nrc=$?\nprintf 'EXIT=%s\\n' \"$rc\" >> /tmp/t.log",
+}
+for _label, _cmd in _MASKING.items():
+    _dec, _why = bg_guard(_cmd)
+    check(f"masking DENIED in background: {_label}", _dec == "deny",
+          f"decision={_dec!r} {_why[:200]}")
+    check(f"  and the hint gives the status-preserving rewrite: {_label}",
+          "exit $rc" in _why, _why[:300])
+
+_PRESERVING = {
+    "rewrite that re-raises the status":
+        "(make test > /tmp/t.log 2>&1; rc=$?; echo EXIT=$rc >> /tmp/t.log; exit $rc)",
+    "&& keeps the status, no capture":
+        "make test > /tmp/t.log 2>&1 && echo done",
+    "no status capture at all":
+        "sleep 1; echo hello",
+    # `&&` skips the echo on failure, so the command's own status is reported.
+    "echo joined by && reports the failing status":
+        "make test > /tmp/t.log 2>&1 && echo \"ok rc=$?\"",
+    # A `$?` inside a loop body tests an in-loop command; the status after
+    # `done` is the loop's own, and the trailing echo discards nothing captured.
+    "status capture only inside a wait-until loop":
+        "until curl -sf localhost:8080; do echo \"waiting rc=$?\"; sleep 2; done; echo UP",
+}
+for _label, _cmd in _PRESERVING.items():
+    _dec, _why = bg_guard(_cmd)
+    check(f"status-preserving background command allowed: {_label}",
+          _dec is None, f"decision={_dec!r} {_why[:200]}")
+
+_dec, _why = bg_guard("make test > /tmp/t.log 2>&1; echo \"rc=$?\"", background=False)
+check("foreground `cmd; echo rc=$?` allowed: its output is read directly",
+      _dec is None, f"decision={_dec!r} {_why[:200]}")
+
+section("bash-guard: a cleanup deny names the guard-approved form")
+# Sessions doing cleanup CLAUDE.md sanctions were stopped by dcg, whose own
+# reason says "ask the user to run the command manually", and either hunted
+# workarounds for turns or handed the deletion back. The guard's VERDICT is
+# right and must not move; what was missing is the form that passes. These
+# checks hold the verdict fixed and assert only on the explanation.
+CLEANUP_MARKER = "Sanctioned cleanup"
+DYNAMIC_MARKER = "literal absolute path"
+
+for _rule in (
+    "core.filesystem:rm-rf-general",
+    "core.filesystem:rm-recursive-general",
+    "core.filesystem:rm-r-f-separate",
+    "core.filesystem:rm-recursive-force-long",
+    "core.filesystem:find-delete-general",
+    "core.git:clean-force",
+):
+    _stub = _dcg_stub(
+        f"stubs/dcg-cleanup-{_rule.replace(':', '_')}",
+        "cat >/dev/null\n" f"echo '{_deny_line(rule=_rule, why='upstream says ask')}'\nexit 0\n",
+    )
+    _dec, _why = guard("rm -r build/__pycache__", dcg=_stub)
+    check(f"{_rule}: still a deny", _dec == "deny", f"decision={_dec!r}")
+    check(f"{_rule}: keeps dcg's own reason", "upstream says ask" in _why, _why[:300])
+    check(f"{_rule}: names the sanctioned-cleanup route",
+          CLEANUP_MARKER in _why and "gio trash" in _why, _why[:600])
+    check(f"{_rule}: scopes it to sanctioned cleanup, else ask",
+          "ask the user" in _why, _why[:600])
+
+for _rule in ("core.filesystem:mv-dynamic-path",
+              "core.filesystem:redirect-truncate-dynamic-path"):
+    _stub = _dcg_stub(
+        f"stubs/dcg-dyn-{_rule.replace(':', '_')}",
+        "cat >/dev/null\n" f"echo '{_deny_line(rule=_rule, why='dynamic path')}'\nexit 0\n",
+    )
+    _dec, _why = guard('mv a "$S/b"', dcg=_stub)
+    check(f"{_rule}: still a deny", _dec == "deny", f"decision={_dec!r}")
+    check(f"{_rule}: says to resolve the path and write it literally",
+          DYNAMIC_MARKER in _why, _why[:600])
+    check(f"{_rule}: a move/write is not steered towards deleting",
+          "gio trash" not in _why and "rm -r" not in _why, _why[:600])
+
+_dec, _why = guard("rm -rf /", dcg=STUB_DENY_EXIT0)
+check("an unrelated rule (rm -rf on root/home) gets no cleanup route",
+      _dec == "deny" and CLEANUP_MARKER not in _why and DYNAMIC_MARKER not in _why,
+      _why[:400])
+
+# Live: the rule ids above are transcribed, and a stub would agree with a
+# wrong transcription forever. Ask the packaged dcg what it actually emits,
+# and check the forms the hint recommends really do pass it. A scratch HOME
+# whose USER config is the full-rule fixture: the guard only trusts an allow
+# once `dcg config` reports a loaded user config, and the host's own config
+# must not decide this lane.
+_LIVE_HOME = os.path.join(SCRATCH, "live-cleanup-home")
+os.makedirs(os.path.join(_LIVE_HOME, ".config", "dcg"), exist_ok=True)
+shutil.copyfile(LIVE_FULL_TOML,
+                os.path.join(_LIVE_HOME, ".config", "dcg", "config.toml"))
+_LIVE_CLEANUP_ENV = {"HOME": _LIVE_HOME,
+                     "XDG_CONFIG_HOME": os.path.join(_LIVE_HOME, ".config")}
+if os.access(REAL_DCG, os.X_OK):
+    for _cmd in ("rm -rf build/__pycache__", "rm -r build/__pycache__",
+                 "rm -r -f build/__pycache__", "rm --recursive --force build/x",
+                 "find . -name '*.pyc' -delete", "git clean -fdX"):
+        _dec, _why = guard(_cmd, dcg=REAL_DCG,
+                           env_extra=_LIVE_CLEANUP_ENV)
+        check(f"LIVE {_cmd!r}: denied with the cleanup route",
+              _dec == "deny" and CLEANUP_MARKER in _why, _why[:400])
+    for _cmd in ('mv a "$S/b"', 'echo hi > "$S/b"'):
+        _dec, _why = guard(_cmd, dcg=REAL_DCG,
+                           env_extra=_LIVE_CLEANUP_ENV)
+        check(f"LIVE {_cmd!r}: denied with the literal-path route",
+              _dec == "deny" and DYNAMIC_MARKER in _why, _why[:400])
+    for _cmd in ("rm -r /tmp/claude-1003/session/scratchpad/old",
+                 "gio trash /home/jonathan/worktrees/x/build/__pycache__",
+                 "mv a /tmp/claude-1003/session/scratchpad/b"):
+        _dec, _why = guard(_cmd, dcg=REAL_DCG,
+                           env_extra=_LIVE_CLEANUP_ENV)
+        check(f"LIVE recommended form {_cmd!r} passes dcg",
+              _dec is None, f"decision={_dec!r} {_why[:300]}")
+else:
+    check("no dcg on this host — live cleanup lane NOT exercised (read as "
+          "'not checked', never as 'passed')", True, REAL_DCG)
 
 
 # ----------------------------------------------------------------------

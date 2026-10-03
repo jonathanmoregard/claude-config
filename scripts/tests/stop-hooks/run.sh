@@ -393,7 +393,14 @@ ck "DoD informer is registered once on UserPromptSubmit" "1" "$informer_registra
 informer_timeout=$(jq -r \
   '.hooks.UserPromptSubmit[]?.hooks[]? | select(.command | contains("finishing-up-informer.py")) | .timeout' \
   "$SETTINGS_UNDER_TEST")
-ck "  ...with a one-second latency belt" "1" "$informer_timeout"
+# 1s was measured too tight (11a5724: 380-784 ms serial, timed out under the
+# sibling UserPromptSubmit hooks' contention, output silently discarded), so the
+# belt must clear that while staying under the 30s UserPromptSubmit default.
+informer_timeout_ok=no
+[[ "$informer_timeout" =~ ^[0-9]+$ ]] && (( informer_timeout >= 2 && informer_timeout < 30 )) \
+  && informer_timeout_ok=yes
+ck "  ...with a latency belt above the measured 1s timeouts, below the 30s default" \
+  "yes" "$informer_timeout_ok"
 stop_gate_registrations=$(jq \
   '[.hooks.Stop[]?.hooks[]? | select(.command | contains("finishing-up-gate.py"))] | length' \
   "$SETTINGS_UNDER_TEST")

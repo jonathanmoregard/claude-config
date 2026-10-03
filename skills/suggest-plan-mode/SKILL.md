@@ -10,6 +10,7 @@ description: >
   "move everything to", "change how we handle X everywhere", or mentions of 15+ files.
   Also trigger when the user seems about to start a large task without pausing to plan.
 context: fork
+background: false
 allowed-tools: []
 ---
 

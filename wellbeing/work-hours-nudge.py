@@ -7,10 +7,18 @@ Three triggers:
   2. marathon:   >= 8h active time today (any hour)
   3. continuous: current unbroken work block >= 1.5h (no >= 5min break)
 
-Active time is computed from real user prompts only: each prompt claims a
-5-minute forward window; overlapping windows merge; gaps > 5 minutes between
+Active time is computed from real user prompts only, across Claude Code
+(~/.claude/projects) and interactive Codex sessions (~/.codex/sessions, read
+only): each prompt claims a 5-minute forward window; overlapping windows merge; gaps > 5 minutes between
 prompts count as a break. On any trigger the user is also nudged to do
 breathwork. Late/marathon and continuous triggers have independent cooldowns.
+
+The hook's output is an instruction to the model, not the nudge itself, so it
+spells out how the nudge must reach the user: its own line, the trigger named,
+the word "breathwork" kept, the practice named in the user's own words:
+"wim hof breathwork (or a minute of mindful breathing if in a rush)" — no
+breathing instructions (2026-10-02). A vague instruction got relayed as "a
+short breath pause", which the user read as noise.
 """
 import json
 import sys
@@ -23,6 +31,10 @@ STAMP_LATE_MARATHON = TMP / ".wellbeing-late-marathon-stamp"
 STAMP_CONTINUOUS = TMP / ".wellbeing-continuous-stamp"
 CACHE = TMP / ".wellbeing-cache.json"
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
+CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
+# Codex session_meta.source values typed into by a person. "exec" (delegated
+# by another agent) and {"subagent": ...} are automation, like sdk-cli above.
+CODEX_INTERACTIVE_SOURCES = {"cli", "vscode"}
 
 COOLDOWN_LATE_MARATHON = 3600   # 60 min
 COOLDOWN_CONTINUOUS = 1800      # 30 min
@@ -33,6 +45,124 @@ LATE_NIGHT_HOURS = 5
 MAX_HOURS_ANY_TIME = 8
 CONTINUOUS_BLOCK_HOURS = 1.5
 IDLE_SECONDS = 5 * 60           # gaps longer than this = break
+
+
+def _parse_local(ts_str):
+    """ISO-8601 (UTC 'Z' or offset) -> naive local datetime, or None."""
+    if not ts_str:
+        return None
+    try:
+        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        return ts.astimezone().replace(tzinfo=None)
+    except (ValueError, TypeError):
+        return None
+
+
+def _touched_today(jsonl, today_ts):
+    try:
+        return jsonl.stat().st_mtime >= today_ts
+    except OSError:
+        return False
+
+
+def _claude_prompt_times(today_start):
+    """Local times of real user prompts in today's Claude Code transcripts."""
+    today_ts = today_start.timestamp()
+    prompt_times = []
+    for jsonl in PROJECTS_DIR.rglob("*.jsonl"):
+        if "subagents" in jsonl.parts or not _touched_today(jsonl, today_ts):
+            continue
+
+        try:
+            # errors="replace": a transcript still being appended to can end
+            # mid-character; that line then fails json.loads and is skipped.
+            with open(jsonl, errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(entry, dict) or not isinstance(
+                            entry.get("timestamp"), str):
+                        continue
+                    if entry.get("type") != "user":
+                        continue
+                    if entry.get("isSidechain") or entry.get("isMeta"):
+                        continue
+                    # Exclude SDK-driven / background automation sessions: these
+                    # aren't real user presence (hooks, schedule, headless agents).
+                    if entry.get("entrypoint") == "sdk-cli":
+                        continue
+                    if "/homunculus/" in str(entry.get("cwd") or ""):
+                        continue
+                    message = entry.get("message")
+                    content = message.get("content") if isinstance(message, dict) else None
+                    if isinstance(content, list) and any(
+                        isinstance(c, dict) and c.get("type") == "tool_result"
+                        for c in content
+                    ):
+                        continue
+                    ts_local = _parse_local(entry.get("timestamp"))
+                    if ts_local is not None and ts_local >= today_start:
+                        prompt_times.append(ts_local)
+        except OSError:
+            continue
+    return prompt_times
+
+
+def _codex_prompt_times(today_start):
+    """Local times of user prompts in today's interactive Codex rollouts.
+
+    Read-only: ~/.codex is Codex-owned runtime state.
+    """
+    today_ts = today_start.timestamp()
+    prompt_times = []
+    if not CODEX_SESSIONS_DIR.is_dir():
+        return prompt_times
+    for jsonl in CODEX_SESSIONS_DIR.rglob("rollout-*.jsonl"):
+        if not _touched_today(jsonl, today_ts):
+            continue
+        try:
+            # errors="replace": a rollout Codex is still appending to can end
+            # mid-character; that line fails json.loads and is skipped.
+            with open(jsonl, errors="replace") as f:
+                interactive = False
+                for n, line in enumerate(f):
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(entry, dict) or not isinstance(
+                            entry.get("timestamp"), str):
+                        continue
+                    payload = entry.get("payload")
+                    if not isinstance(payload, dict):
+                        continue
+                    if entry.get("type") == "session_meta":
+                        source = payload.get("source")
+                        interactive = (isinstance(source, str)
+                                       and source in CODEX_INTERACTIVE_SOURCES)
+                        if not interactive:
+                            break
+                        continue
+                    if n == 0:
+                        break  # no session_meta header: provenance unknown
+                    if not interactive:
+                        continue
+                    # event_msg/user_message is what the person typed;
+                    # response_item user messages also carry injected context.
+                    if (entry.get("type") != "event_msg"
+                            or payload.get("type") != "user_message"):
+                        continue
+                    ts_local = _parse_local(entry.get("timestamp"))
+                    if ts_local is not None and ts_local >= today_start:
+                        prompt_times.append(ts_local)
+        except OSError:
+            continue
+    return prompt_times
 
 
 def _compute_hours(now):
@@ -46,57 +176,8 @@ def _compute_hours(now):
             pass
 
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    today_ts = today_start.timestamp()
-    prompt_times = []
-
-    for jsonl in PROJECTS_DIR.rglob("*.jsonl"):
-        if "subagents" in jsonl.parts:
-            continue
-        try:
-            if jsonl.stat().st_mtime < today_ts:
-                continue
-        except OSError:
-            continue
-
-        try:
-            with open(jsonl) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        entry = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if entry.get("type") != "user":
-                        continue
-                    if entry.get("isSidechain") or entry.get("isMeta"):
-                        continue
-                    # Exclude SDK-driven / background automation sessions: these
-                    # aren't real user presence (hooks, schedule, headless agents).
-                    if entry.get("entrypoint") == "sdk-cli":
-                        continue
-                    if "/homunculus/" in entry.get("cwd", ""):
-                        continue
-                    content = entry.get("message", {}).get("content")
-                    if isinstance(content, list) and any(
-                        isinstance(c, dict) and c.get("type") == "tool_result"
-                        for c in content
-                    ):
-                        continue
-                    ts_str = entry.get("timestamp")
-                    if not ts_str:
-                        continue
-                    try:
-                        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                        ts_local = ts.astimezone().replace(tzinfo=None)
-                    except (ValueError, TypeError):
-                        continue
-                    if ts_local < today_start:
-                        continue
-                    prompt_times.append(ts_local)
-        except OSError:
-            continue
+    prompt_times = (_claude_prompt_times(today_start)
+                    + _codex_prompt_times(today_start))
 
     # Each user prompt claims a forward IDLE_SECONDS window. Merge overlaps
     # across all sessions so concurrent terminals don't double-count.
@@ -192,9 +273,13 @@ def main():
 
     print(
         " ".join(reasons)
-        + " Gently remind the user — their wellbeing goals include mindful"
-        " breaks and not marathoning. Recommend a short breathwork pause."
-        " This is a nudge, not an order."
+        + " Relay this to the user as a wellbeing nudge on its own line, stated"
+        " plainly: name the trigger (hours active today, after 20:00, or the"
+        " unbroken block) and suggest, in these words, 'wim hof breathwork (or"
+        " a minute of mindful breathing if in a rush)'. No instructions on how"
+        " to breathe. Do not soften it to 'take a breath' or 'a short pause', do"
+        " not paraphrase 'breathwork' away, and do not fold it into another"
+        " sentence. It is a nudge, not an order: one clear line, then carry on."
     )
 
 

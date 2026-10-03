@@ -141,15 +141,19 @@ write_status() { # write_status <ok|unverified|alert> [reason]
 # pusher that stops silently is invisible until someone notices the backup is
 # months old. The record is written on every tick; the debounce is a property of
 # the toast alone.
-alert() {
-  local reason="$1"
+#
+# Debounce is keyed on the optional second argument (default: the reason). A
+# reason carrying a changing detail such as a failure count MUST pass a stable
+# key, or every tick reads as a new problem (60 toasts on 2026-09-27).
+alert() { # alert <reason> [debounce-key]
+  local reason="$1" key="${2:-$1}"
   log "ALERT: $reason"
   write_status alert "$reason"
 
-  if [ -f "$STATE/last-alert" ] && [ "$(cat "$STATE/last-alert")" = "$reason" ]; then
+  if [ -f "$STATE/last-alert" ] && [ "$(cat "$STATE/last-alert")" = "$key" ]; then
     return 0
   fi
-  printf '%s' "$reason" > "$STATE/last-alert"
+  printf '%s' "$key" > "$STATE/last-alert"
 
   command -v notify-send >/dev/null 2>&1 || {
     log "notify-send not on PATH — alert recorded in journal and status record only"
@@ -320,6 +324,14 @@ REMOTE="${UPSTREAM%%/*}"
 export GIT_SSH_COMMAND="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
 
 if ! timeout 60 git fetch --quiet --prune "$REMOTE" "$BRANCH"; then
+  # No uplink is not a fault: skip the tick without counting it toward the
+  # alert threshold or failing the unit. Same rule as claude-pull.sh.
+  probe_host="${CLAUDE_PULL_ONLINE_PROBE_HOST:-github.com}"
+  if ! timeout 5 getent ahosts "$probe_host" >/dev/null 2>&1; then
+    log "fetch failed while offline (cannot resolve $probe_host) — skipping tick, not counted"
+    write_status unverified "offline: git fetch could not run (no DNS for $probe_host); it is unknown whether the proposals sink has been pushed since the last successful tick."
+    exit 0
+  fi
   # A laptop is offline often enough that one failed fetch is noise; a run of
   # them means something is actually broken. Below the threshold it is still
   # emphatically not a clean bill of health — the tick never learned what origin
@@ -328,7 +340,7 @@ if ! timeout 60 git fetch --quiet --prune "$REMOTE" "$BRANCH"; then
   printf '%s' "$fails" > "$STATE/fetch-failures"
   log "fetch failed or timed out (60s) — consecutive failures: $fails"
   if [ "$fails" -ge 6 ]; then
-    alert "git fetch has failed $fails times in a row for $SINK — check network, SSH key, or the origin remote. Proposals written since the last successful push exist on this disk only."
+    alert "git fetch has failed $fails times in a row for $SINK — check network, SSH key, or the origin remote. Proposals written since the last successful push exist on this disk only." fetch-failing
   else
     write_status unverified "git fetch failed $fails time(s) in a row; it is unknown whether the proposals sink has been pushed since the last successful tick."
   fi

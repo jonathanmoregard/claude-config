@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Stub `gh` for agent-e2e scenarios. Logs every call to $E2E_RUN/gh.log and
+# answers like a GitHub repo with no PR open. Visibility comes from
+# $E2E_RUN/visibility (PRIVATE / PUBLIC), written by the scenario's setup.
+log="$E2E_RUN/gh.log"
+printf '%s\n' "$*" >> "$log"
+vis="$(cat "$E2E_RUN/visibility" 2>/dev/null || echo PRIVATE)"
+nwo="$(cat "$E2E_RUN/repo" 2>/dev/null || echo acme/widget)"; name="${nwo#*/}"; owner="${nwo%%/*}"
+
+case "$1 $2" in
+  "repo view")
+    case " $* " in
+      *" -q "*|*" --jq "*) echo "$vis" ;;
+      *) printf '{"name":"%s","owner":{"login":"%s"},"nameWithOwner":"%s","visibility":"%s","isPrivate":%s,"defaultBranchRef":{"name":"%s"}}\n' \
+           "$name" "$owner" "$nwo" "$vis" "$([ "$vis" = PUBLIC ] && echo false || echo true)" \
+           "$(cat "$E2E_RUN/default-branch" 2>/dev/null || echo main)" ;;
+    esac ;;
+  "pr list") echo "[]" ;;
+  "pr view"|"pr checks"|"pr status")
+    if [ -f "$E2E_RUN/pr-created" ]; then
+      [ "$2" = checks ] && { echo "ci	pending	0	https://github.com/$nwo/actions/runs/1"; exit 8; }
+      printf '{"number":1,"url":"https://github.com/%s/pull/1","state":"OPEN","isDraft":false,"mergeStateStatus":"BLOCKED","mergeable":"MERGEABLE","reviewDecision":"","headRefName":"%s","headRefOid":"","baseRefName":"main","title":"x","mergeCommit":null}\n' \
+        "$nwo" "$(git branch --show-current 2>/dev/null)"
+    else
+      echo "no pull requests found for branch \"$(git branch --show-current 2>/dev/null)\"" >&2; exit 1
+    fi ;;
+  "pr create")
+    touch "$E2E_RUN/pr-created"
+    echo "https://github.com/$nwo/pull/1" ;;
+  "pr merge") echo "merging is the user's click" >&2; exit 1 ;;
+  "auth status") echo "github.com: Logged in to github.com account e2e" ;;
+  "run list") echo "[]" ;;
+  "api "*) echo "{}" ;;
+  *) echo "{}" ;;
+esac

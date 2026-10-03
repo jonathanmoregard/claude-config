@@ -10,13 +10,14 @@ Never ask the user to do what you can do. Run the commands, tests, reads, edits,
 - Uploading sensitive content to third-party tools
 - Scope expansion — flag in one sentence, wait
 
-**Proceed without asking:** `git push`, opening/updating PRs, merging a green PR on an outdated branch, expected status updates.
+**Proceed without asking:** `git push`, opening/updating PRs (except PR-gated repos — see **PRs**), updating an outdated green PR's branch (merging stays the user's click), expected status updates.
 
 **Safe cleanup without asking:**
 - Temporary files created by the current agent/session may be deleted after verifying the exact target, ownership, and scope.
 - Files created by an AI earlier in the same session may be deleted without asking when they block progress or consume storage/memory without further use, after verifying the exact target, provenance, scope, and lack of remaining value.
 - Stale or stuck lock files created by the current agent/session may be deleted after the same checks and verification that no live process still owns or uses the lock. Uncertain ownership or live use requires asking.
 - Worktrees created by the current agent/session follow the additional checks under **Worktrees**. Worktree cleanup does not include branch deletion.
+- Run sanctioned cleanup on literal absolute paths: `rm -r /tmp/<path>` under `/tmp`, `gio trash <path>` elsewhere (reversible). Never `rm -rf`, never `$VAR`/`$(...)` paths. Reclaiming space outside `/tmp` → ask.
 
 **Defaults:**
 
@@ -49,6 +50,7 @@ User instructions override everything below.
 ## Bash
 - `permissions.deny` matches the command STRING, so a legitimate command can be rejected for a substring it merely contains — including inside a heredoc body. Route the payload around it (`Write` the text, then `cat >>`; `gh` `--body-file`/`-F` instead of an inline body; select tests by `-k`; drop a flag whose default is already right). Never quote or split to defeat the matcher — some rules are deliberate. Details: `detached-long-commands`.
 - A `[REDACTED:…]` marker in output means the call succeeded and the value is gated — don't re-run to get it in clear.
+- Waiting on CI, mergeability, a deploy or a unit → `~/.claude/scripts/wait-for pr|run|unit …` with `run_in_background: true`, then end the turn; you are re-invoked when it settles. Never `sleep N; <status>` to check again.
 
 ## Build + review
 - Substantial multi-part or unattended work → invoke `orchestrate` and follow it. Use judgment for ordinary branch-sized changes; subagents are a context tool, not a ritual.
@@ -71,8 +73,10 @@ User instructions override everything below.
 - Skill misses a trigger clearly in its scope → add that phrasing to its `description` the same session. Store-symlinked skills → route through the owning repo's PR flow.
 
 ## Config edits (`~/.claude`)
-- Read-only, pinned to `master` — the harness reads that working tree live. Every edit (settings.json, hooks, skills, agents, commands, permissions, scripts, CLAUDE.md) goes in `~/worktrees/claude-<slug>/` off freshly fetched `origin/master`, then a PR. One-liners included; branch ownership is the criterion, not diff size.
+- Read-only, pinned to `master` — the harness reads that working tree live. Every edit (settings.json, hooks, skills, agents, commands, permissions, scripts, CLAUDE.md) goes in `~/worktrees/claude-<slug>/` off freshly fetched `origin/master` (`~/.claude/scripts/claude-worktree.sh <slug>`), then a PR. One-liners included; branch ownership is the criterion, not diff size.
 - Never commit to a branch this session did not create.
+- Behavior-changing edit (CLAUDE.md, skills, agents, commands, hooks, settings, any text an agent reads) → agent e2e before the PR, per `agent-config-e2e`: a real headless agent on the staged candidate config, driven through the situation the change targets, `origin/master` vs worktree. Results table goes in the PR body. Unit tests, a diff read, or "the text says so" are not e2e. This rule included.
+- `~/.claude` off `master` or with tracked changes → stop and report its exact state. Never stash, reset, clean or switch it.
 - A skill telling you to edit config does not exempt you — built-in (`update-config`, `keybindings-help`, `statusline-setup`, `fewer-permission-prompts`), plugin, or newly installed. This rule wins; run its steps inside the worktree.
 - `skills/<name>` is a symlink → it belongs to another repo. Edit it there, via that repo's PR.
 - Untracked runtime state (`tmp/`, `projects/`, `homunculus/`, `reflections/`) needs no worktree.
@@ -83,7 +87,7 @@ User instructions override everything below.
 
 ## Web
 - No web access. `WebFetch`, `WebSearch`, `curl`, `wget` denied. HTTP clients via python/node are denied too.
-- Use `mcp__research-agent__research(prompt, depth, model?)`. Default model `claude-opus-5`. `model` valid on `normal`/`deep` only.
+- Use `mcp__research-agent__research(prompt, depth, model?)`. Default model `claude-opus-5-5`. `model` valid on `normal`/`deep` only.
 - Wall time: `fast` ~2–5 s · `normal` ~1.5–3 min · `deep` ~10–15 min. Warn the user before `normal`/`deep`.
 - `agent refused: provider usage-policy block` → rephrase defensively. Don't retry verbatim.
 
@@ -103,3 +107,6 @@ User instructions override everything below.
 
 ## PRs
 - Target the repo's default branch. Non-default only when asked, then re-target before merge.
+- **PR-gated repo** = private/internal repo whose workflows run on `pull_request`: opening the PR, and every push to it, spends billed Actions minutes; pushing the branch alone does not, unless a workflow runs on `push` to any branch. `dod-check.py` reports it as `NO_PR … PR HELD`. Check: `gh repo view --json visibility` + `grep pull_request .github/workflows/*`.
+- PR-gated → no PR until the branch is ready: local gates green (`scripts/check` etc.) and the user's review back-and-forth settled. Push the branch for backup freely (unless `push` triggers CI on all branches: then batch pushes too). Then ask one closed question — "Open the PR?" — and wait. Only the user's yes, or an explicit "open a PR", authorizes `gh pr create`. Draft PRs run CI too; no draft workaround.
+- Public, or private with no PR-triggered CI → open PRs as before.

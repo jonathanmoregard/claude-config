@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+export WORKTREE_POLICY_FORWARD_HOOK=pre-commit
+exec "$(dirname "$(readlink -f "$0")")/_forward-global-hook" "$@"

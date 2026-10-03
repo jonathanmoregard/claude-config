@@ -131,13 +131,6 @@ printf '%s' "$REPO_ID" > "$SANDBOX_DIR/repo_id"
 # Seed initial token so container sees it on first launch.
 mint-gh-token || { echo "claude-sandbox: initial token mint failed" >&2; exit 1; }
 
-# CL-v2 staging: per-project homunculus dir on host, bind-mounted rw into
-# container so CL-v2's observe hook lands observations in a host-visible path.
-# Host vetter (claude-cl-sync, 6h timer) picks up from here.
-CL_STAGING="$HOME/.claude/container-staging/$PROJECT/homunculus"
-mkdir -p "$CL_STAGING"
-chmod 700 "$CL_STAGING"
-
 # Install ToB template if repo has no .devcontainer yet.
 if [ ! -d "$REPO_PATH/.devcontainer" ]; then
     echo "claude-sandbox: installing devcontainer template into $REPO_PATH/.devcontainer/" >&2
@@ -188,20 +181,6 @@ add_mount 'source=${localEnv:HOME}/.claude/agents,target=/home/vscode/.claude/ag
 add_mount 'source=${localEnv:HOME}/.claude/commands,target=/home/vscode/.claude/commands,type=bind,readonly' \
     /home/vscode/.claude/commands "$HOME/.claude/commands"
 
-# The skill entry under ~/.claude/skills/ is often a host-side symlink (e.g.
-# continuous-learning-v2 → ~/Repos/everything-claude-code/skills/...). Inside
-# container, that symlink points at a host-only path. Resolve and overlay the
-# real source at the expected in-container path so `observe.sh` is reachable.
-CLV2_HOST="$(readlink -f "$HOME/.claude/skills/continuous-learning-v2" 2>/dev/null || echo "$HOME/.claude/skills/continuous-learning-v2")"
-add_mount "source=$CLV2_HOST,target=/home/vscode/.claude/skills/continuous-learning-v2,type=bind,readonly" \
-    /home/vscode/.claude/skills/continuous-learning-v2 "$CLV2_HOST"
-
-# CL-v2 staging homunculus — rw. Container captures observations here; host
-# vetter + scanner process them and writes to the real host homunculus.
-MOUNTS_JSON=$(printf '%s' "$MOUNTS_JSON" | jq \
-    --arg m 'source=${localEnv:HOME}/.claude/container-staging/${localWorkspaceFolderBasename}/homunculus,target=/home/vscode/.claude/homunculus,type=bind' \
-    '. + [$m]')
-
 POST_TAIL='bash /workspace/.devcontainer/claude-sandbox-post.sh'
 
 TMP=$(mktemp)
@@ -225,9 +204,7 @@ jq --argjson our_mounts "$MOUNTS_JSON" --arg tail "$POST_TAIL" '
         HTTPS_PROXY: "http://172.17.0.1:8888",
         NO_PROXY:    "localhost,127.0.0.1"
     })
-    | .containerEnv = ((.containerEnv // {}) + {
-        CLV2_CONFIG: "/workspace/.devcontainer/cl-v2-container-config.json"
-    })
+    | .containerEnv = ((.containerEnv // {}) | del(.CLV2_CONFIG))
     | .postCreateCommand = (
         if (.postCreateCommand // "" | type) == "string" and (.postCreateCommand // "" | contains($tail)) then
             .postCreateCommand
@@ -272,29 +249,6 @@ if [ -d /opt/token-optimizer ]; then
             type: "command",
             command: "node /opt/token-optimizer/skills/token-optimizer/scripts/statusline.js"
           }
-    ' "$HOME/.claude/settings.json" > "$TMP" && mv "$TMP" "$HOME/.claude/settings.json"
-fi
-
-# Continuous-learning-v2: observation capture only. Observer analysis runs on
-# host (reads homunculus/ via the bind mount from staging). We wire the
-# observe.sh PreToolUse + PostToolUse hooks but rely on CLV2_CONFIG
-# (containerEnv) pointing at /workspace/.devcontainer/cl-v2-container-config.json
-# which has observer.enabled=false so lazy-start stays quiet.
-if [ -x "$HOME/.claude/skills/continuous-learning-v2/hooks/observe.sh" ]; then
-    TMP=$(mktemp)
-    jq '
-        .hooks.PreToolUse = ((.hooks.PreToolUse // []) | map(select(
-            (.hooks // []) | all(.command // "" | contains("continuous-learning-v2") | not)
-        )) + [{
-            matcher: "*",
-            hooks: [{ type: "command", command: "~/.claude/skills/continuous-learning-v2/hooks/observe.sh pre" }]
-        }])
-        | .hooks.PostToolUse = ((.hooks.PostToolUse // []) | map(select(
-            (.hooks // []) | all(.command // "" | contains("continuous-learning-v2") | not)
-        )) + [{
-            matcher: "*",
-            hooks: [{ type: "command", command: "~/.claude/skills/continuous-learning-v2/hooks/observe.sh post" }]
-        }])
     ' "$HOME/.claude/settings.json" > "$TMP" && mv "$TMP" "$HOME/.claude/settings.json"
 fi
 EOS
@@ -349,19 +303,8 @@ fi
 EOS
 chmod +x "$FIREWALL_SCRIPT"
 
-# CL-v2 container config: disables the lazy-start observer background process
-# (analysis runs on host over the staging mount). Observe hook still fires and
-# writes observations.jsonl to the mounted homunculus.
-CLV2_CONF="$REPO_PATH/.devcontainer/cl-v2-container-config.json"
-cat > "$CLV2_CONF" <<'EOS'
-{
-  "version": "2.1",
-  "observer": {
-    "enabled": false,
-    "_comment": "analysis happens on host; container only captures observations"
-  }
-}
-EOS
+# Continuous-learning-v2 was removed; drop its leftover container config.
+rm -f "$REPO_PATH/.devcontainer/cl-v2-container-config.json"
 
 # P1: rebuild on drift. Hash the things that actually affect container state:
 # post + firewall scripts PLUS devcontainer.json mounts/env (changes to these
@@ -372,7 +315,7 @@ SIG_FILE="$SANDBOX_DIR/.script-sig"
 # rebuild (and is visible via diff) instead of silently degrading egress.
 CUR_SIG=$(
     {
-        cat "$POST_SCRIPT" "$FIREWALL_SCRIPT" "$CLV2_CONF"
+        cat "$POST_SCRIPT" "$FIREWALL_SCRIPT"
         jq -S '{
             mounts, remoteEnv, containerEnv, postCreateCommand,
             runArgs, features, build, capAdd, securityOpt,

@@ -1,0 +1,14 @@
+{
+  "smarthomeSsh": {
+    "version": 1,
+    "host": "home-server",
+    "user": "jonathan",
+    "knownHostsFile": "known_hosts",
+    "sshExecutable": "/run/current-system/sw/bin/ssh",
+    "identityAgent": "%t/gcr/ssh",
+    "identityAgentRoot": "%t",
+    "connectTimeoutSec": 10,
+    "maxTimeoutMs": 600000,
+    "outputLimitChars": 60000
+  }
+}
