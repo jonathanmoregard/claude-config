@@ -377,6 +377,16 @@
         "hooks": [
           {
             "type": "command",
+            "command": "python3 $HOME/.claude/hooks/offline-ai-smoke-health.py",
+            "timeout": 10,
+            "statusMessage": "Checking offline-ai smoke health..."
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
             "command": "python3 $HOME/.claude/hooks/claude-pull-health.py",
             "timeout": 10,
             "statusMessage": "Checking checkout freshness..."

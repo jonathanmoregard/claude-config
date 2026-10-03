@@ -963,7 +963,7 @@ PORTED_RULES: list[tuple[str, str]] = [
     ("Bash(*googleapiclient*)", "python3 -c 'import googleapiclient'"),
     ("Bash(*from googleapiclient*)", "python3 -c 'from googleapiclient import discovery'"),
     ("Bash(*automation-review*)", "ls /home/jonathan/.claude/automation-review"),
-    ("Bash(*prompts.jsonl*)", "cat /home/jonathan/.claude/logs/prompts.jsonl"),
+    ("Bash(*prompts.jsonl*)", "cat /home/jonathan/.claude/automation-review/prompts.jsonl"),
 ]
 
 # Rules from bash-config.json that were deliberately NOT carried over, each

@@ -493,6 +493,103 @@ class LifecycleTests(RepoFixture):
         self.assertEqual("INCONCLUSIVE", row["phase"])
         self.assertIsNone(row["merge_sha"])
 
+    def _github_origin(self) -> None:
+        run(
+            "git",
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/example/project.git",
+            cwd=self.repo,
+        )
+
+    def _automerged_before_handoff(self, store: Store) -> dict:
+        """PR found, then auto-merge landed and the worktree was cleaned up
+        before any handoff froze a reviewed head."""
+        self._github_origin()
+        target = store.upsert_target("session-1", self.repo)
+        ready = store.refresh_target(target["id"], runner=self._local_runner())
+        self.assertEqual("READY_FOR_REVIEW", ready["phase"])
+        self.assertIsNone(ready["reviewed_head_sha"])
+        shutil.rmtree(self.repo)
+        return ready
+
+    def test_automerge_before_handoff_settles_merged_without_worktree(self) -> None:
+        store = Store()
+        ready = self._automerged_before_handoff(store)
+        row = store.refresh_target(
+            ready["id"], runner=self._merged_runner(head=ready["head_sha"])
+        )
+        self.assertEqual("MERGED", row["phase"])
+        self.assertEqual(self.MERGE_SHA, row["merge_sha"])
+        self.assertEqual(1, row["active"])
+        # The skipped review contract stays visible rather than silent.
+        self.assertIn("before review handoff", row["detail"])
+
+    def test_unmerged_pr_with_missing_worktree_stays_inconclusive(self) -> None:
+        store = Store()
+        ready = self._automerged_before_handoff(store)
+        for state in ("OPEN", "CLOSED"):
+            def runner(argv, cwd, timeout, state=state):
+                self.assertEqual(["gh", "pr", "view"], argv[:3])
+                return self._result(
+                    json.dumps(
+                        {
+                            "number": 48,
+                            "url": "https://github.com/example/project/pull/48",
+                            "state": state,
+                            "headRefOid": ready["head_sha"],
+                            "mergeCommit": None,
+                        }
+                    )
+                )
+
+            with self.subTest(state=state):
+                row = store.refresh_target(ready["id"], runner=runner)
+                self.assertEqual("INCONCLUSIVE", row["phase"])
+                self.assertIsNone(row["merge_sha"])
+
+    def test_missing_worktree_without_pr_does_not_query_github(self) -> None:
+        self._github_origin()
+        store = Store()
+        target = store.upsert_target("session-1", self.repo)
+        shutil.rmtree(self.repo)
+
+        def runner(argv, cwd, timeout):
+            raise AssertionError(argv)
+
+        row = store.refresh_target(target["id"], runner=runner)
+        self.assertEqual("INCONCLUSIVE", row["phase"])
+
+    def test_automerged_target_needs_environment_before_complete(self) -> None:
+        store = Store()
+        ready = self._automerged_before_handoff(store)
+        merged = self._merged_runner(head=ready["head_sha"])
+        store.refresh_target(ready["id"], runner=merged)
+        # No deployment contract was ever frozen: verify must not call an
+        # empty environment set green.
+        with self.assertRaises(StateError):
+            store.verify_target(ready["id"], runner=merged)
+        probe_dir = pathlib.Path(self.tmp.name)
+        store.configure_environment(
+            ready["id"],
+            "production",
+            revision_cwd=probe_dir,
+            revision_argv=["python3", "-c", f"print('{self.MERGE_SHA}')"],
+            smoke_cwd=probe_dir,
+            smoke_argv=["python3", "-c", "raise SystemExit(0)"],
+            timeout_seconds=10,
+        )
+
+        def runner(argv, cwd, timeout):
+            if argv[0] == "gh":
+                return merged(argv, cwd, timeout)
+            return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+
+        row = store.verify_target(ready["id"], runner=runner)
+        self.assertEqual("COMPLETE", row["phase"])
+        self.assertEqual(0, row["active"])
+
     def test_verify_requires_exact_sha_then_smoke(self) -> None:
         run(
             "git",
