@@ -115,3 +115,21 @@ def test_record_cannot_inject_extra_lines(tmp_path):
     lines = out.stdout.strip().splitlines()
     assert len(lines) == 1, lines
     assert len(lines[0]) < 1000
+
+
+def test_record_control_characters_are_neutralised(tmp_path):
+    # Terminal escapes, NUL/BEL/BS and bidi overrides are not whitespace, so
+    # collapsing whitespace alone lets them through verbatim.
+    nasty = "\x1b[2J\x1b[31mRED\x1b[0m\x07\x00\x08‮evil⁦"
+    write(
+        str(tmp_path / ("nix-gc\x1b[31m.json")),
+        record(unit="nix-gc.service" + nasty, summary="gc failed" + nasty, inspect="journalctl" + nasty),
+    )
+    write(str(tmp_path / ("bad\x1b]0;t\x07.json")), "not json")
+    out = run_hook(str(tmp_path))
+    assert out.returncode == 0
+    lines = out.stdout.splitlines()
+    assert len(lines) == 2, lines
+    for ch in out.stdout:
+        assert ch == "\n" or not (ord(ch) < 32 or 0x7F <= ord(ch) < 0xA0 or 0x202A <= ord(ch) <= 0x202E or 0x2066 <= ord(ch) <= 0x2069), repr(ch)
+    assert "gc failed" in out.stdout and "RED" in out.stdout

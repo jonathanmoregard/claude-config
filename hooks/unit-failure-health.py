@@ -29,6 +29,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import sys
 
 DEFAULT_DIR = "/var/lib/unit-failures"
@@ -36,8 +37,13 @@ FIELD_MAX = 300
 LINE_MAX = 900
 
 
+# C0/C1 controls (terminal escapes, NUL, BEL, BS) and bidi overrides are not
+# whitespace, so str.split() alone would pass them through verbatim.
+_CONTROL = re.compile("[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
+
+
 def one_line(value: object, limit: int = FIELD_MAX) -> str:
-    text = " ".join(str(value).split())
+    text = " ".join(_CONTROL.sub(" ", str(value)).split())
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
