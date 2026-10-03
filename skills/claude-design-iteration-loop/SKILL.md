@@ -1,0 +1,108 @@
+---
+name: claude-design-iteration-loop
+description: Use when a product feature should be designed in Claude Design (claude.ai/design) as the source of truth and the agent drives it autonomously - "iterate in Claude Design", "drive Claude Design", "design round", "send a round to Claude Design", "make Claude Design the source of truth", "design→impl pipeline", or when implementation subagents need design files they cannot fetch themselves.
+---
+
+# Claude Design iteration loop
+
+The design is the spec. Implementation follows it 1:1. Gaps found while building go back to the designer as a new numbered round. The agent never fills them.
+
+Per-project half (diffing, porting, exporting, uploading): a project skill pair such as `klaffat-design-adopt` (inbound, never uploads) and `klaffat-design-sync` (outbound, add-only). Write the equivalent per project; this skill stays project-agnostic.
+
+## Loop
+
+1. **Spec in chat.** Feature intent plus every founder decision as facts. New chat per feature (history icon, top-left, then "New chat").
+2. **Round N.** Write the brief, send it, verify it landed, wait for the run to finish.
+3. **Review** via DesignSync (parent session only).
+4. **Gaps in the design** become round N+1. Repeat 2-4 until the design is up to scratch. Design first, then implement.
+5. **Mirror** the design to disk.
+6. **Implement** with subagents against the mirror.
+7. **Build-found gaps** (a state, string, or layout the design lacks) become a new round. Never patch them in code, never use placeholder copy.
+8. **Match 1:1**, then **upload** implemented screens add-only.
+
+Do not dispatch implementation for a surface while a known gap on it is unresolved. Surfaces whose design is complete may proceed in parallel.
+
+## Brief format
+
+One chat message. Order:
+
+1. First instruction: "Save this message verbatim as `briefs/ROUND-N-BRIEF.md`."
+2. Update `DECISIONS.md` (numbered decisions D1..Dn) from this brief; read it at the start of every round.
+3. Output rules: new files with this round's suffix (`-100N`); older files untouched; per round a `HANDOFF` section (what changed, open items) and a `COPY` section (every user-visible string by key).
+4. Standing rules, restated every round. Example set: every user-visible string in en and sv, no "translate at build"; exact scope/permission lists given as facts; log open items, never guess.
+5. Numbered items. Decisions stated as facts. Leave only wording and layout to the designer; never write "decide X".
+
+Founder decisions made after a send are lost unless re-sent: put each in the next brief and DECISIONS, and append it to the project's session constraints the same turn.
+
+## Sending
+
+Do not deliver briefs with DesignSync `write_files` (prompts the user per write, blocks unattended runs). Send the brief as one chat message; the designer saves it per instruction 1.
+
+- Window visible: paste into the chat editor (Shift+Enter for newlines; a bare Enter sends).
+- Window hidden or minimized (screenshots and typing time out): drive the page with JS.
+
+```js
+const ed = document.querySelector('.ProseMirror'); ed.focus();
+const dt = new DataTransfer(); dt.setData('text/plain', BRIEF);
+ed.dispatchEvent(new ClipboardEvent('paste', {clipboardData: dt, bubbles: true, cancelable: true}));
+// then click the Send button via JS
+```
+
+Verify: about 2 minutes later `DesignSync get_file briefs/ROUND-N-BRIEF.md`. Missing means the send was lost (editor cleared, nothing posted). Re-send and re-verify. Do not log a round as sent before the file exists.
+
+## Status
+
+Poll the tab title with `tabs_context`: `✶` working, `✓` done, `💤` asleep. Do not screenshot or `get_page_text` during a run (heavy pages freeze the renderer; the overview dumps ~50k chars). Poll output files with DesignSync instead.
+
+- Keep exactly one Claude Design tab; a run is bound to the tab that started it.
+- `💤`: Memory Saver slept the tab and changed its tab id. Re-run `tabs_context`, navigate to wake it, click Resume if the chat says "We got interrupted". Never send into a sleeping tab.
+- Standing fix: add claude.ai to Memory Saver "always keep active".
+
+## Review a round
+
+DesignSync reads (`list_files`, `get_file`) do not prompt.
+
+1. `DECISIONS.md`: every brief decision present, worded as given. A product decision the designer made on its own is a defect.
+2. `HANDOFF`: changes and open items.
+3. Targeted files (screens the handoff names). Spot-check the markup, not the summary: copy keys present in en and sv, states complete.
+4. Defects, new gaps, and open items form the next brief.
+
+The designer rewrites files in place despite "new files only", and DesignSync has no history. To diff across rounds, snapshot first (DECISIONS, HANDOFF, COPY text plus file list and sizes).
+
+## Mirror to disk
+
+Subagents cannot load DesignSync. The parent writes the mirror; subagents read paths.
+
+- Large `get_file` result: it persists to a tool-results file. Write it out with no re-typing:
+  `python3 -c "import json,sys; sys.stdout.write(json.load(open(P))['content'])" > design-mirror/X.html`
+- Small or many files (phone variants share markup): do not mirror every HTML. Write structural extracts plus one consolidated copy file per surface holding all current strings by key, verbatim: `design-mirror/DECISIONS.md`, `COPY-current.md`, markup extracts per page group.
+- Re-sync after every round; keep the superseded copy file as `.rN.md`.
+
+## Briefing implementation subagents
+
+- Paste the founder's constraints from session constraints verbatim, never paraphrased.
+- Give mirror paths, not DesignSync instructions.
+- Every brief says: use design strings and markup verbatim; if a string, state, or style is missing, stop that item and report it as a "design gap". Never invent or translate copy, never write placeholder copy, never reconstruct CSS without the design HTML.
+- Require a final report with a `Design gaps` list; collect every list into the next round.
+- Disjoint files per agent; shared CSS has one writer.
+
+## Match, then upload
+
+- Diff implemented screens against the design: CSS delta first, DOM structurally. Each residual delta is an unadopted design change or a design gap for a new round. Adapt design output that breaks project lint or HTML validity; record each adaptation in the PR.
+- Upload only after everything designed is implemented.
+- Add-only: `list_files`, write only paths that do not yet exist, `deletes: []`, never overwrite (list changed existing paths for the user). Never delete.
+- Record the uploaded commit SHA for later three-way diffs.
+
+## Red flags
+
+Stop and fix if any hold:
+
+- An agent writes Swedish (or any) copy the design lacks, or leaves placeholder strings.
+- CSS or markup reconstructed without the design HTML.
+- A round sent into a `💤` tab, or logged as sent without the brief file present.
+- A brief item says "decide" about a product choice.
+- Implementation dispatched on a surface with an open design gap.
+- Mirror made by re-typing file contents.
+- A subagent's relay ("founder approves") treated as founder approval; only the founder's own message counts.
+- Any delete or overwrite in an upload plan.
+- Briefs delivered via `write_files`.
