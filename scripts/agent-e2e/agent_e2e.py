@@ -238,6 +238,21 @@ def run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
             "--max-budget-usd", f"{args.budget:g}"]
     if args.model:
         argv += ["--model", args.model]
+    # A private /tmp per run. Agents write literal /tmp paths, and concurrent
+    # runs sharing the real one leaked into each other: two dogfood runs picked
+    # the same /tmp output dir and one "ran" its e2e by reusing the other's
+    # verdict. Only this run's own directory is bound back in.
+    bwrap = shutil.which("bwrap")
+    if bwrap:
+        binds = []
+        exe_dir = pathlib.Path(args.claude).resolve().parent
+        if str(exe_dir).startswith("/tmp"):  # else hidden by the private /tmp
+            binds += ["--ro-bind", str(exe_dir), str(exe_dir)]
+        # Last, so a read-only ancestor bind above cannot shadow it.
+        binds += ["--bind", str(run), str(run)]
+        argv = [bwrap, "--dev-bind", "/", "/", "--tmpfs", "/tmp", *binds,
+                "--chdir", str(work), "--", *argv]
+    verdict["isolated_tmp"] = bool(bwrap)
     t0 = time.monotonic()
     try:
         proc = subprocess.run(argv, cwd=work, env=env, capture_output=True,

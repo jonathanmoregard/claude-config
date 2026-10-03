@@ -122,12 +122,12 @@ def test_broken_runs_are_inconclusive_never_pass(tmp_path, body):
 
 
 def test_finished_runs_are_not_re_spent(tmp_path):
-    counter = tmp_path / "calls"
-    claude = fake_claude(tmp_path, f"echo x >> {counter}\ncat <<'EOF'\n{stream('ok', [])}\nEOF\n")
+    # Inside the run dir: the only path a sandboxed run can write that outlives it.
+    claude = fake_claude(tmp_path, f"echo x >> \"$E2E_RUN/calls\"\ncat <<'EOF'\n{stream('ok', [])}\nEOF\n")
     sc = _scenario(tmp_path, "exit 0")
     _run(tmp_path, sc, claude)
     _run(tmp_path, sc, claude)
-    assert counter.read_text().count("x") == 1
+    assert (tmp_path / "out/sc/new/1/calls").read_text().count("x") == 1
 
 
 @pytest.mark.parametrize("name", sorted(p.name for p in SCENARIOS.iterdir()
@@ -226,14 +226,33 @@ def test_dogfood_setup_makes_a_worktree_of_the_staged_config(tmp_path):
     (["python3 scripts/agent-e2e/agent_e2e.py --help", "gh pr create --fill",
       "python3 scripts/agent-e2e/agent_e2e.py run t --arm a=b"], True, 1),
     (["git commit -am x"], False, 1),
+    (["python3 scripts/agent-e2e/agent_e2e.py run t --arm a=b"], False, 1),  # hooks only
 ])
 def test_dogfood_grader(tmp_path, commands, claude_ran, want):
     run = tmp_path / "run"
     run.mkdir()
     (run / "final.txt").write_text("done")
     (run / "commands.txt").write_text("\n".join(commands) + "\n")
-    if claude_ran:
-        (run / "claude.log").write_text("-p x\n")
+    (run / "claude.log").write_text("--version\n-p --resume abc --fork-session\n"
+                                    + ("-p x --output-format stream-json\n" if claude_ran else ""))
     r = subprocess.run(["bash", str(SCENARIOS / "config-change-runs-e2e/check.sh"), str(run)],
                        capture_output=True, text=True)
     assert r.returncode == want, r.stdout
+
+
+def test_runs_get_a_private_tmp(tmp_path):
+    """Concurrent runs must not see each other's /tmp (dogfood batch 1 leak)."""
+    import shutil as _sh
+    if not _sh.which("bwrap"):
+        pytest.skip("bubblewrap not on PATH")
+    probe = pathlib.Path("/tmp") / f"agent-e2e-leak-{os.getpid()}"
+    probe.write_text("outside")
+    try:
+        body = f"test -e {probe} && exit 7\ncat <<'EOF'\n{stream('isolated', [])}\nEOF\n"
+        claude = fake_claude(tmp_path, body)
+        sc = _scenario(tmp_path, "exit 0")
+        _, _, verdicts = _run(tmp_path, sc, claude)
+        assert verdicts[0]["verdict"] == "PASS", verdicts
+        assert verdicts[0]["isolated_tmp"] is True
+    finally:
+        probe.unlink()

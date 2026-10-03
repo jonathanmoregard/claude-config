@@ -10,6 +10,8 @@ LIB="$(cd "$(dirname "$0")/../_lib" && pwd)"
 
 cp "$LIB/gh" "$BIN/gh"; chmod +x "$BIN/gh"
 echo PRIVATE > "$RUN/visibility"
+echo jonathanmoregard/.claude > "$RUN/repo"
+echo master > "$RUN/default-branch"
 : > "$RUN/gh.log"
 # The log path is baked in, not read from $E2E_RUN at call time: an inner
 # agent_e2e.py run re-exports E2E_RUN for its own run directory, and the first
