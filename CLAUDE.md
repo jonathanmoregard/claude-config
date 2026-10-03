@@ -75,6 +75,7 @@ User instructions override everything below.
 ## Config edits (`~/.claude`)
 - Read-only, pinned to `master` — the harness reads that working tree live. Every edit (settings.json, hooks, skills, agents, commands, permissions, scripts, CLAUDE.md) goes in `~/worktrees/claude-<slug>/` off freshly fetched `origin/master` (`~/.claude/scripts/claude-worktree.sh <slug>`), then a PR. One-liners included; branch ownership is the criterion, not diff size.
 - Never commit to a branch this session did not create.
+- Behavior-changing edit (CLAUDE.md, skills, agents, commands, hooks, settings, any text an agent reads) → agent e2e before the PR, per `agent-config-e2e`: a real headless agent on the staged candidate config, driven through the situation the change targets, `origin/master` vs worktree. Results table goes in the PR body. Unit tests, a diff read, or "the text says so" are not e2e. This rule included.
 - `~/.claude` off `master` or with tracked changes → stop and report its exact state. Never stash, reset, clean or switch it.
 - A skill telling you to edit config does not exempt you — built-in (`update-config`, `keybindings-help`, `statusline-setup`, `fewer-permission-prompts`), plugin, or newly installed. This rule wins; run its steps inside the worktree.
 - `skills/<name>` is a symlink → it belongs to another repo. Edit it there, via that repo's PR.

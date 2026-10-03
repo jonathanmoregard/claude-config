@@ -141,6 +141,10 @@ Verify the intended field appears, the exit code is what you meant, and the
 no-match case prints nothing. Run it against the copy in your worktree, not the
 live one in `~/.claude`; the PR is what puts it there.
 
+That proves the script. Then prove the session: `agent-config-e2e` runs a real
+headless agent on the staged settings.json, so the hook fires where the agent
+meets it and the scenario grades what the agent did next.
+
 ## Common mistakes
 
 | Mistake | Fix |

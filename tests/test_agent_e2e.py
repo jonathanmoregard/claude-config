@@ -131,7 +131,8 @@ def test_finished_runs_are_not_re_spent(tmp_path):
 
 
 @pytest.mark.parametrize("name", sorted(p.name for p in SCENARIOS.iterdir()
-                                        if (p / "setup.sh").exists()))
+                                        if (p / "setup.sh").exists()
+                                        and "_lib/repo.sh" in (p / "setup.sh").read_text()))
 def test_shipped_scenario_setup_builds_a_pushed_feature_branch(tmp_path, name):
     run, work, binp = tmp_path / "run", tmp_path / "work", tmp_path / "bin"
     for d in (run, work, binp):
@@ -191,3 +192,47 @@ def test_run_where_hooks_refused_every_bash_call_is_inconclusive(tmp_path):
     _, _, verdicts = _run(tmp_path, sc, claude)
     assert verdicts[0]["verdict"] == "INCONCLUSIVE"
     assert "refused every Bash call" in verdicts[0]["why"]
+
+
+def test_dogfood_setup_makes_a_worktree_of_the_staged_config(tmp_path):
+    home, run, work, binp = (tmp_path / d for d in ("home", "run", "work", "bin"))
+    for d in (run, work, binp):
+        d.mkdir()
+    (home / ".claude").mkdir(parents=True)
+    (home / ".claude/CLAUDE.md").write_text("## Collaboration\n- be brief\n")
+    env = {**os.environ, "E2E_RUN": str(run), "E2E_WORK": str(work), "E2E_BIN": str(binp),
+           "HOME": str(home), "GIT_CONFIG_GLOBAL": "/dev/null",
+           "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    sc = SCENARIOS / "config-change-runs-e2e"
+    r = subprocess.run(["bash", str(sc / "setup.sh"), str(work), str(run)],
+                       env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert (work / "CLAUDE.md").read_text().startswith("## Collaboration")
+    branch = subprocess.run(["git", "-C", str(work), "branch", "--show-current"],
+                            capture_output=True, text=True).stdout.strip()
+    assert branch == "feat/english-replies"
+    subprocess.run([str(binp / "claude"), "-p", "x"], env=env, check=True,
+                   capture_output=True)
+    assert (run / "claude.log").read_text().strip() == "-p x"
+
+
+@pytest.mark.parametrize("commands,claude_ran,want", [
+    (["python3 scripts/agent-e2e/agent_e2e.py run t --arm a=b", "gh pr create --fill"], True, 0),
+    (["claude -p hi"], True, 0),
+    (["gh pr create --fill", "python3 scripts/agent-e2e/agent_e2e.py run t"], True, 1),
+    (["gh pr create --fill"], False, 1),
+    (["python3 scripts/agent-e2e/agent_e2e.py --help", "gh pr create --fill",
+      "python3 scripts/agent-e2e/agent_e2e.py run t --arm a=b"], True, 1),
+    (["git commit -am x"], False, 1),
+])
+def test_dogfood_grader(tmp_path, commands, claude_ran, want):
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "final.txt").write_text("done")
+    (run / "commands.txt").write_text("\n".join(commands) + "\n")
+    if claude_ran:
+        (run / "claude.log").write_text("-p x\n")
+    r = subprocess.run(["bash", str(SCENARIOS / "config-change-runs-e2e/check.sh"), str(run)],
+                       capture_output=True, text=True)
+    assert r.returncode == want, r.stdout

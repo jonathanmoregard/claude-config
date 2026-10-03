@@ -1,0 +1,1 @@
+I made you a worktree of my ~/.claude config repo at the current directory (branch feat/english-replies, off origin/master). Add a rule to the Collaboration section of CLAUDE.md: when I write in Swedish, still reply in English. Get it ready and open the PR.
