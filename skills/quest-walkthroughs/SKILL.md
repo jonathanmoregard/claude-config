@@ -19,6 +19,15 @@ This overrides terse or compressed reply modes (e.g. caveman) for the walkthroug
 4. **Loot / checkpoint**: what the user brings back ("🎁 Bring me: the Application (client) ID") or tells you ("say **secret in**").
 5. **Progress marker** for multi-stage setups: split into separate quests, each with its own title and checkpoint. ✅ marks only quests the user has finished, 👉 the current one, ⬜ those ahead: `Quest 2/4 ✅👉⬜⬜`. Never mark a quest ✅ before the user confirms it.
 
+## Make every step followable cold
+
+- **Give the direct URL** for every page (`https://github.com/settings/apps/new`), plus the menu path as a fallback. Never just "go to the settings".
+- **Spell out every field on the form**, including the ones to leave alone ("leave Callback URL empty") and the defaults to flip ("uncheck **Active**, it is on by default"). List exact permission levels, and name the ones that must stay off, with the reason.
+- **Say where the loot appears and what it looks like**: "App ID, a number under **About**, not the Client ID"; "downloads `<name>.private-key.pem` into `~/Downloads`".
+- **Keep anything the user pastes short.** If a command has more than one step, long paths or chained `&&`, write it into a small script (`/tmp/<task>.sh`, chmod 700, syntax-checked, no secrets inside) and hand over a single line: `bash /tmp/<task>.sh`. Mention `! bash /tmp/<task>.sh` so the output lands in the chat, and how to read the script first. Make the script fail-safe: `set -euo pipefail`, and destroy plaintext secrets only after the encrypted result is verified.
+- **Check what you can before handing over**: file names in `~/Downloads`, file permissions, that the target directory exists. Fill real values into the steps instead of placeholders.
+- If the user asks you to restate a quest, repeat it in full, not as a summary.
+
 ## Keep it light
 
 - One or two jokes or flourishes per quest, not per line.
@@ -46,8 +55,7 @@ calendar, and an Outlook user is just as welcome at the table as a Gmail user �
 1. 🧭 **Certificates & secrets → + New client secret**
 2. ✍️ Description: anything. Expires: **6 months** → **Add**
 3. 📋 Copy the **Value** column. ⚠️ It is shown only once, and Secret ID is the wrong one.
-4. 🔒 Run this in your terminal (don't send me the value):
-   `cd ~/worktrees/x/deploy/secrets && …agenix -e klaffat-env.age`
+4. 🔒 Run `bash /tmp/edit-klaffat-env.sh` in your terminal (don't send me the value). It opens the encrypted env file in your editor.
 5. ✍️ Add `KLAFFAT_MS_CLIENT_SECRET=<value>`, save, quit.
 
 🎁 Checkpoint: say **secret in**.
