@@ -111,6 +111,13 @@ DEFAULTS = {
     # decision on a proposal in <subdir>, run `<callback> <path> <decision>`.
     "on_decision": {},
     "gate_log": PROPOSALS_SINK + "/gate-log.jsonl",
+    # Subdirs whose content never enters git (the sink's .gitignore lists
+    # them). Their gate verdicts quote that content, so they go to
+    # local_gate_log — gitignored too — instead of the tracked gate_log.
+    # permissions/ is the permission ledger: a record of denied and prompted
+    # tool calls that Jonathan wants kept off any remote (2026-10-03).
+    "local_only_subdirs": ["permissions"],
+    "local_gate_log": PROPOSALS_SINK + "/.gate-log.local.jsonl",
 }
 
 # Printed verbatim whenever run_callback refuses. The rule is a security
@@ -279,6 +286,11 @@ def require_config_describes_its_own_spine(config_path, cfg):
             "gate_log %r resolves outside the spine %s. %s"
             % (cfg["gate_log"], spine,
                SPINE_MISMATCH_REMEDY % {"key": "gate_log"}))
+    if not contained(cfg["local_gate_log"], spine):
+        raise ValueError(
+            "local_gate_log %r resolves outside the spine %s. %s"
+            % (cfg["local_gate_log"], spine,
+               SPINE_MISMATCH_REMEDY % {"key": "local_gate_log"}))
 
 
 def validate_model_name(value, label):
@@ -323,12 +335,14 @@ def load_config(path, explicit=False):
         log("config absent at %s; using built-in defaults" % path)
     cfg["spine_root"] = os.path.expanduser(cfg["spine_root"])
     cfg["gate_log"] = os.path.expanduser(cfg["gate_log"])
+    cfg["local_gate_log"] = os.path.expanduser(cfg["local_gate_log"])
     cfg["search_paths"] = [os.path.expanduser(p) for p in cfg["search_paths"]]
     pr = cfg["pr_context"]
     pr["repo_roots"] = [os.path.expanduser(p) for p in pr["repo_roots"]]
     pr["extra_repos"] = {k: os.path.expanduser(v) for k, v in pr["extra_repos"].items()}
     require_under_home(cfg["spine_root"], "spine_root")
     require_under_home(cfg["gate_log"], "gate_log")
+    require_under_home(cfg["local_gate_log"], "local_gate_log")
     require_config_describes_its_own_spine(path, cfg)
     for p in cfg["search_paths"]:
         require_under_home(p, "search_paths entry")
@@ -483,8 +497,15 @@ def load_gate_log_index(cfg):
     always subdir-qualified; a bare-basename entry never reconciles (it
     would create a cross-subdir acceptance edge)."""
     index = set()
+    for path in (cfg["gate_log"], cfg["local_gate_log"]):
+        index |= _read_gate_log(path)
+    return index
+
+
+def _read_gate_log(path):
+    index = set()
     try:
-        with open(cfg["gate_log"], encoding="utf-8") as fh:
+        with open(path, encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
                 if not line:
@@ -997,7 +1018,10 @@ def annotate(candidate, verdict, evidence, model, today):
 
 
 def append_gate_log(cfg, entry):
-    path = cfg["gate_log"]
+    if entry.get("subdir") in cfg["local_only_subdirs"]:
+        path = cfg["local_gate_log"]
+    else:
+        path = cfg["gate_log"]
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(entry, sort_keys=True) + "\n")
