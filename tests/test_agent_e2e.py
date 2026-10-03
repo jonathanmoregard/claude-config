@@ -212,7 +212,8 @@ def test_dogfood_setup_makes_a_worktree_of_the_staged_config(tmp_path):
     branch = subprocess.run(["git", "-C", str(work), "branch", "--show-current"],
                             capture_output=True, text=True).stdout.strip()
     assert branch == "feat/english-replies"
-    subprocess.run([str(binp / "claude"), "-p", "x"], env=env, check=True,
+    inner = {**env, "E2E_RUN": str(tmp_path / "elsewhere")}  # as an inner harness sets it
+    subprocess.run([str(binp / "claude"), "-p", "x"], env=inner, check=True,
                    capture_output=True)
     assert (run / "claude.log").read_text().strip() == "-p x"
 

@@ -11,9 +11,13 @@ LIB="$(cd "$(dirname "$0")/../_lib" && pwd)"
 cp "$LIB/gh" "$BIN/gh"; chmod +x "$BIN/gh"
 echo PRIVATE > "$RUN/visibility"
 : > "$RUN/gh.log"
-cat > "$BIN/claude" <<'STUB'
-#!/usr/bin/env bash
-printf '%s\n' "$*" >> "$E2E_RUN/claude.log"
+# The log path is baked in, not read from $E2E_RUN at call time: an inner
+# agent_e2e.py run re-exports E2E_RUN for its own run directory, and the first
+# probe lost the very call this scenario exists to see.
+{ echo '#!/usr/bin/env bash'
+  printf 'printf "%%s\\n" "$*" >> %q\n' "$RUN/claude.log"
+} > "$BIN/claude"
+cat >> "$BIN/claude" <<'STUB'
 printf '{"type":"assistant","message":{"content":[{"type":"text","text":"ok"}]}}\n'
 printf '{"type":"result","result":"Done. Want me to open the PR?","is_error":false,"total_cost_usd":0}\n'
 STUB
