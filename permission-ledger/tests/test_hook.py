@@ -516,6 +516,145 @@ class TestRedaction(unittest.TestCase):
             "sk-proj-abc123DEF456ghi789JKL012",
         )
 
+    def test_provider_keys_leave_no_fragment_in_any_context(self):
+        # Synthetic, real-shaped values (body mixes '-' and '_' like real keys,
+        # which breaks the body into runs too short for the high-entropy rule).
+        bodies = {
+            "anthropic": "sk-" + "ant-api03-" + "Ab3_dE5-" * 12 + "xyzAA",
+            "anthropic-oauth": "sk-" + "ant-oat01-" + "Qw9-rT_7" * 12 + "AA",
+            "openai-project": "sk-" + "proj-" + "Zx8_cV-2nM" * 15,
+            "openai-svcacct": "sk-" + "svcacct-" + "Lk4-jH_6gF" * 15,
+            # Claude Code's OAuth refresh token and claude.ai session keys share
+            # the sk-ant-<kind>NN- shape; the rule must not enumerate kinds.
+            "anthropic-oauth-refresh": "sk-" + "ant-ort01-" + "Pm2_wE-8" * 12 + "AA",
+            "anthropic-session": "sk-" + "ant-sid01-" + "Hy5-uI_3" * 12 + "AA",
+            "openai-user": "sk-" + "None-" + "Rt6_yU-1oP" * 15,
+        }
+        # Contexts where the key is glued to a preceding word character, so a
+        # leading \b never fires: an escaped newline in a literal, a URL-encoded
+        # '=', and plain concatenation.
+        contexts = ["VAR={}", "printf 'a\\n{}'", "curl 'https://h/?k%3D{}'", "echo x{}"]
+        for kind, key in bodies.items():
+            for ctx in contexts:
+                with self.subTest(kind=kind, ctx=ctx):
+                    out = self.assert_redacted(ctx.format(key), key)
+                    tail = key[-16:]
+                    self.assertNotIn(tail, out, "key fragment survived: %r" % out)
+
+    def test_prefixed_tokens_leave_no_fragment_in_any_context(self):
+        # Synthetic, real-shaped values. Prefixes are split so repo secret
+        # scanners (and GitHub push protection) do not flag the fixtures.
+        tokens = {
+            "gitlab-pat": "gl" + "pat-" + "xY7_kP2-mQ9zR4wT1vB8",
+            "gitlab-deploy": "gl" + "dt-" + "Hn3kP8qZ2wX5vB7mR1tY",
+            "github-pat": "github" + "_pat_" + "11ABCDEFG0" + "aZ9_" * 15,
+            "github-oauth": "gh" + "o_" + "Ab3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3zA5",
+            "github-user": "gh" + "u_" + "Bc4eF6gH8jK0lM2nP4qR6sT8uV0wX2yZ4aB6",
+            "github-server": "gh" + "s_" + "Cd5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3zA5bC7",
+            "github-refresh": "gh" + "r_" + "De6gH8jK0lM2nP4qR6sT8uV0wX2yZ4aB6cD8",
+            "npm": "npm" + "_" + "Ef7hJ9kL1mN3pQ5rS7tU9vW1xY3zA5bC7dE9",
+            "pypi": "pypi" + "-AgEIcHlwaS5vcmc" + "CJGZmMjY3ZTQ0LWE1Yy00" * 4,
+            "huggingface": "hf" + "_" + "FgHjKlMnPqRsTuVwXyZaBcDeFgHjKlMnPq",
+            "stripe-live": "sk" + "_live_" + "51Hx7Kd2eZvKYlo2C0aBcDeFgHiJ",
+            "stripe-restricted": "rk" + "_live_" + "51Hx7Kd2eZvKYlo2C0aBcDeFgHiJ",
+            "stripe-test": "sk" + "_test_" + "4eC39HqLyjWDarjtT1zdp7dc",
+            "stripe-webhook": "wh" + "sec_" + "MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw",
+            "slack-app": "xa" + "pp-" + "1-A0123BCDEFG-1234567890123-abcdef0123456789abcdef",
+            "google": "AI" + "za" + "SyD-9tSrke72PouQMnMX-a7eZSW0jkFMBWY",
+        }
+        contexts = ["VAR={}", "printf 'a\\n{}'", "curl 'https://h/?k%3D{}'", "echo x{}", "{}"]
+        for kind, token in tokens.items():
+            for ctx in contexts:
+                with self.subTest(kind=kind, ctx=ctx):
+                    out = self.assert_redacted(ctx.format(token), token)
+                    self.assertNotIn(token[-12:], out, "token fragment survived: %r" % out)
+
+    def test_credentials_embedded_in_urls(self):
+        for text, secret in [
+            ("psql postgresql://app_user:S3cr3t-Pa55@db.internal:5432/app", "S3cr3t-Pa55"),
+            ("git clone https://oauth2:" + "gl" + "pat-xY7_kP2-mQ9zR4wT1vB8@gitlab.com/a/b.git",
+             "xY7_kP2-mQ9zR4wT1vB8"),
+            ("redis-cli -u redis://:hunter2hunter2@cache:6379/0", "hunter2hunter2"),
+            ("export DATABASE_URL='mysql://root:p%40ss%2Fw0rd@localhost/db'", "p%40ss%2Fw0rd"),
+            ("pip install --index-url https://__token__:abcDEF123ghi@pypi.example.org/simple x",
+             "abcDEF123ghi"),
+            ('{"url": "amqp://guest:guestpw99@rabbit:5672/"}', "guestpw99"),
+        ]:
+            with self.subTest(text=text):
+                out = self.assert_redacted(text, secret)
+                # host stays legible so the ledger still says what was reached
+                self.assertRegex(out, r"@[A-Za-z]")
+
+    def test_jwt_outside_a_bearer_header(self):
+        jwt = (
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+            ".eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4ifQ"
+            ".SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+        )
+        for ctx in [
+            "curl -b 'session={}' https://app/x",
+            "curl -H 'X-Auth: {}' https://app/x",
+            "echo {}",
+            "printf 'tok\\n{}'",
+            '{{"id_token":"{}"}}',
+        ]:
+            with self.subTest(ctx=ctx):
+                out = self.assert_redacted(ctx.format(jwt), jwt)
+                for part in jwt.split("."):
+                    self.assertNotIn(part, out, "JWT segment survived: %r" % out)
+
+    def test_aws_secret_access_key_with_slashes(self):
+        secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+        for ctx in [
+            "aws configure set aws_secret_access_key {}",
+            "aws configure set aws_secret_access_key '{}'",
+            "printf '[default]\\naws_secret_access_key = {}\\n' > ~/.aws/credentials",
+            '{{"SecretAccessKey": "{}"}}',
+            "export AWS_SECRET_ACCESS_KEY={}",
+        ]:
+            with self.subTest(ctx=ctx):
+                out = self.assert_redacted(ctx.format(secret), secret)
+                for frag in secret.split("/"):
+                    self.assertNotIn(frag, out, "secret fragment survived: %r" % out)
+        token = "IQoJb3JpZ2luX2VjEJr//////////wEaCXVzLWVhc3QtMSJHMEUCIQ+abc/def"
+        out = self.assert_redacted("aws configure set aws_session_token " + token, token)
+        self.assertNotIn("IQoJb3JpZ2luX2VjEJr", out)
+
+    def test_aws_temporary_access_key_id(self):
+        self.assert_redacted("AWS_ID=ASIAQWERTYUIOPASDFGH aws s3 ls", "ASIAQWERTYUIOPASDFGH")
+
+    def test_credential_free_urls_and_lookalikes_are_left_alone(self):
+        for benign in [
+            "git clone ssh://git@github.com/a/b.git",
+            "git clone git@github.com:jonathanmoregard/.claude.git",
+            "curl https://user@example.com/path",
+            "curl 'http://localhost:8080/api?email=a@b.com'",
+            "curl http://localhost:8080?q=x@y",
+            "curl https://[::1]:8443/health",
+            "nix build github:NixOS/nixpkgs/nixos-unstable#hello",
+            "ls /nix/store/5n1rxdzbsyz4rcwm2sgh3hasmymd1l9z-glibc-2.39-52",
+            "git show 356a192b7913b04c54574d18c28d46e6395428ab",
+            "python -c 'import jwt; jwt.decode(tok)'",
+            "rg 'self.hf_tokenizer' src/",
+            "npm_config_cache=/tmp/x npm ci",
+            "aws configure get aws_secret_access_key",
+            "grep -n aws_secret_access_key ~/.aws/config",
+            "echo highs_and_lows",
+            "rg -n session_token src/components/auth/handlers",
+            "grep -rn secret_access_key modules/services/backups",
+        ]:
+            with self.subTest(benign=benign):
+                self.assertEqual(hook.redact(benign), benign)
+
+    def test_provider_prefixes_in_ordinary_words_are_left_alone(self):
+        for benign in [
+            "git switch -c task-proj-cleanup",
+            "cat ~/notes/risk-ant-api-notes.md",
+            "rg disk-proj-",
+        ]:
+            with self.subTest(benign=benign):
+                self.assertEqual(hook.redact(benign), benign)
+
     def test_github_classic_token(self):
         self.assert_redacted(
             "git clone https://ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@github.com/x/y",
