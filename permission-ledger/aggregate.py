@@ -90,6 +90,7 @@ DIGEST_GROUP_KEYS = [
     "last_seen",
     "samples",
     "suggestions",
+    "protected_path",
     "reask",
 ]
 # "prior_decision" is added only on groups where reask is true.
@@ -269,6 +270,26 @@ def _dedupe(seq):
     return out
 
 
+PROTECTED_COMPONENTS = (".claude", ".git")
+
+
+def is_protected_path(pattern_key):
+    """True when a path-keyed group sits under a `.claude` or `.git` component.
+
+    Claude Code gates those directories in a layer outside the allow/deny
+    lists, so no allow rule silences the prompt. The user config root
+    `~/.claude` itself is measured NOT to be gated, so it is stripped before
+    the component test; a nested `.claude`/`.git` below it still counts.
+    """
+    _, sep, path = pattern_key.partition(":")
+    if not sep or not path.startswith("/"):
+        return False
+    config_root = os.path.join(os.path.expanduser("~"), ".claude")
+    if path == config_root or path.startswith(config_root + "/"):
+        path = path[len(config_root):]
+    return any(part in PROTECTED_COMPONENTS for part in path.split("/"))
+
+
 def build_groups(occurrences):
     """Group occurrences by pattern_key into digest-shaped dicts."""
     acc = {}
@@ -354,6 +375,7 @@ def build_groups(occurrences):
                 "last_seen": g["last_seen"],
                 "samples": _dedupe(truncate_sample(s) for s in g["samples"]),
                 "suggestions": g["suggestions"],
+                "protected_path": is_protected_path(g["pattern_key"]),
                 "reask": False,
             }
         )

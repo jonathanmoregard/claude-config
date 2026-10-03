@@ -333,6 +333,24 @@ class AggregateTestCase(unittest.TestCase):
         self.assertIs(g["reask"], True)
         self.assertEqual(g["prior_decision"], prior)
 
+    def test_protected_path_tag(self):
+        home = os.path.expanduser("~")
+        cases = {
+            "Edit:/w/repo/.claude/skills/x": True,
+            "Write:/w/repo/.git": True,
+            "Read:/w/repo/.git/hooks": True,
+            "Edit:%s/.claude/skills/x" % home: False,
+            "Edit:%s/.claude/worktree/.git" % home: True,
+            "Read:/w/repo/.claudette": False,
+            "Bash:git status": False,
+            "mcp__x__y": False,
+        }
+        for key in cases:
+            self.b.record(self.now, pattern_key=key)
+        d = self.digest("--min-count", "1")
+        for key, expected in cases.items():
+            self.assertIs(self.group_for(d, key)["protected_path"], expected, key)
+
     def test_decided_just_below_3x_still_suppressed(self):
         for _ in range(11):
             self.b.record(self.now, pattern_key="Bash:curl")
