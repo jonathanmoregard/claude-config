@@ -781,6 +781,9 @@ reap_stale_started() {
 #   $REFLECT_ROOT/skipped-recursions/  one marker per hook fire inside EVERY
 #                                      reflection subprocess (the recursion break
 #                                      in reflect.sh drops one and exits 0)
+#   $REFLECT_ROOT/skipped-pipeline/    one record per hook fire in a pipeline-
+#                                      internal session (step-back classifier,
+#                                      observer, RSI/ledger cron runs)
 #   $REFLECT_ROOT/malformed/           one manifest per malformed hook payload
 #   $REFLECT_LOG_DIR                   two worker logs per detached run
 #
@@ -812,6 +815,7 @@ reflect_artifact_gc() {
   local removed=0 d f
   local -a dirs=(
     "$REFLECT_ROOT/skipped-recursions"
+    "$REFLECT_ROOT/skipped-pipeline"
     "$REFLECT_ROOT/malformed"
     "${REFLECT_LOG_DIR:-$REFLECT_ROOT/logs}"
   )

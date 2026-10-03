@@ -205,6 +205,7 @@ is documented inside `settings-patch.json` under `_comment`.
 | `REFLECT_HANDOFF_CAP_BYTES` | `8192` | Cap on the self-compact handoff inlined into a fallback prompt. A handoff is a page of markdown by construction; this admits a whole one and refuses a runaway one. |
 | `REFLECT_HANDOFF_MAX_AGE_SECONDS` | `86400` | Age past which that handoff is not offered to the model as this session's state. Long enough that no live session's own handoff is excluded. |
 | `REFLECT_EXCERPT_BYTES` | `200` | Length of every quoted excerpt: `tool_result` bodies in an inlined transcript, the envelope's `result` in an error manifest, and an unparseable reply's `raw_excerpt`. |
+| `CLAUDE_PIPELINE_INTERNAL` | (unset) | Truthy marks a machine session. Set by: the RSI daily review and permission-ledger evaluator, the proposal intake-gate scorer, `date-check.sh`, repo-autosync `sync-agent.sh` / `upstream-merge.sh`, and crontab-wide for every cron job (nixos-config). Every mode no-ops with a record under `skipped-pipeline/`. Sessions whose `cwd` is under `~/.claude/step-back` or `~/.claude/homunculus` are skipped the same way without it. See "Pipeline-internal sessions". |
 | `_REFLECT_INTERNAL` | (internal) | Sentinel set by the parent dispatcher to gate the `--worker` re-entry path. Do not set manually. |
 
 Every size and threshold above is an **input**, not a tuned constant: each has its
@@ -251,6 +252,18 @@ On the 2nd-and-later `PreCompact` of a session the dispatcher also pre-fires
 `mission` mode. That pre-fire is **detached** (`REFLECT_ASYNC=1`): it used to run
 synchronously ahead of the precompact worker, which measured 121 s of in-hook
 wall time against a 60 s cap.
+
+### Pipeline-internal sessions
+
+The step-back classifier, the homunculus observer and the nightly RSI review /
+permission-ledger evaluator all run `claude`, so they fire the same hooks as work
+sessions. They are not reflected on: their artifacts crowded the corpus the RSI
+review reads (239 of 300 recent artifacts were step-back classifier runs) and fed
+the reviewer its own previous night as input. A session is skipped when
+`CLAUDE_PIPELINE_INTERNAL` is truthy, or when the payload `cwd` is under
+`~/.claude/step-back` or `~/.claude/homunculus` (helpers that run from their own
+state dir). Each skip writes `skipped-pipeline/<ts>-<sid>-<mode>-XXXX.json` with
+`reason` `sentinel` or `machine_cwd`.
 
 ### SubagentStop and the agent transcript
 
@@ -418,6 +431,7 @@ already guarantee.
 | self-compact state + requests | `~/.local/state/claude-self-compact/<sid>/` — its own root, not under `$REFLECT_ROOT` | `STATE_RETENTION_DAYS` = 30 | `self-compact-trigger.py`, on fire |
 | human mission copies | `<project>/tasks/mission.<sid>.md` | `REFLECT_MISSION_RETENTION_DAYS` = 30, or session dir gone | `mission_gc`, on each mission write |
 | recursion markers | `skipped-recursions/` | `REFLECT_ARTIFACT_RETENTION_DAYS` = 14 | `reflect_artifact_gc`, every detached worker |
+| pipeline-session skip records | `skipped-pipeline/` | same | same |
 | malformed-payload manifests | `malformed/` | same | same |
 | worker logs | `$REFLECT_LOG_DIR` | same | same |
 | **reflections** | `sessions/**` | **never collected** | — |
