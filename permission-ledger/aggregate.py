@@ -96,6 +96,14 @@ DIGEST_GROUP_KEYS = [
     "reask",
 ]
 # "prior_decision" is added only on groups where reask is true.
+# "injection_flagged" (always true), "injection_score" (float, or None when
+# the scanner could not attribute its verdict) and "injection_flagged_samples"
+# (indices into "samples") are added only on groups the injection pass flagged.
+INJECTION_GROUP_KEYS = [
+    "injection_flagged",
+    "injection_score",
+    "injection_flagged_samples",
+]
 
 
 # --------------------------------------------------------------------------
@@ -478,12 +486,59 @@ def _scan_document(text):
     return _DOC_SEPARATOR.sub("- - -", text)
 
 
+def _attribution(stdout, n_samples):
+    """{sample index: score} from scan_content's --json verdict, or None.
+
+    None whenever the verdict cannot be trusted to name the samples: not
+    JSON, a document count that does not match what was sent, an index out
+    of range, or a detection that names no document at all.
+    """
+    try:
+        verdict = json.loads(stdout.decode("utf-8", "replace"))
+    except ValueError:
+        return None
+    if not isinstance(verdict, dict) or verdict.get("documents") != n_samples:
+        return None
+    flagged, scores = verdict.get("flagged"), verdict.get("scores")
+    if not isinstance(flagged, list) or not flagged:
+        return None
+    out = {}
+    for i in flagged:
+        if isinstance(i, bool) or not isinstance(i, int) or not 0 <= i < n_samples:
+            return None
+        score = scores[i] if isinstance(scores, list) and len(scores) == n_samples else None
+        out[i] = float(score) if isinstance(score, (int, float)) and not isinstance(score, bool) else None
+    return out
+
+
+def _mark_flagged(groups, attribution):
+    """Put the verdict on the groups (and sample indices) that carried it.
+
+    attribution None means "flagged, but not attributable": every group is
+    marked, so the conservative reading is the default one.
+    """
+    flat = [(g, j) for g in groups for j in range(len(g["samples"]))]
+    for gi, group in enumerate(groups):
+        if attribution is None:
+            hits = {}
+        else:
+            hits = {j: attribution[k] for k, (g, j) in enumerate(flat)
+                    if g is group and k in attribution}
+            if not hits:
+                continue
+        scores = [v for v in hits.values() if v is not None]
+        group["injection_flagged"] = True
+        group["injection_score"] = round(max(scores), 4) if scores else None
+        group["injection_flagged_samples"] = sorted(hits)
+
+
 def run_injection_scan(groups, scan_script):
     """Run RSI's scan_content.py over the samples about to be emitted.
 
-    Returns a status string. Samples are always emitted verbatim: the stage 3
-    prompt has to *see* a directive-shaped payload to classify the group
-    `sensitive`, so this pass reports rather than rewrites.
+    Returns a status string, and marks each group holding a flagged sample
+    (see INJECTION_GROUP_KEYS). Samples are always emitted verbatim: the
+    stage 3 prompt has to *see* a directive-shaped payload to classify the
+    group `sensitive`, so this pass reports rather than rewrites.
     """
     samples = _all_samples(groups)
     if not samples:
@@ -499,7 +554,7 @@ def run_injection_scan(groups, scan_script):
         # Own session, so a timeout kills the scanner's children too (the
         # classifier it runs would otherwise outlive it, model in memory).
         proc = subprocess.Popen(
-            [sys.executable, scan_script],
+            [sys.executable, scan_script, "--json"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -508,7 +563,7 @@ def run_injection_scan(groups, scan_script):
     except (OSError, ValueError) as exc:
         return "error: %s: %s" % (type(exc).__name__, exc)
     try:
-        _, stderr = proc.communicate(input=data, timeout=SCAN_CONTENT_TIMEOUT)
+        stdout, stderr = proc.communicate(input=data, timeout=SCAN_CONTENT_TIMEOUT)
     except subprocess.TimeoutExpired:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
@@ -524,9 +579,20 @@ def run_injection_scan(groups, scan_script):
     # A traceback exits 1 too: only exit 1 WITH the scanner's verdict line is
     # a detection. Anything else is a failed scan and must not read as "ok".
     if proc.returncode == 1 and SCAN_VERDICT in stderr.decode("utf-8", "replace"):
+        attribution = _attribution(stdout, len(samples))
+        _mark_flagged(groups, attribution)
+        if attribution is None:
+            return (
+                "ok (injection patterns flagged in samples, but the scanner did "
+                "not say which, so every group carries injection_flagged: true; "
+                "samples emitted verbatim as inert data)"
+            )
+        marked = sum(1 for g in groups if g.get("injection_flagged"))
         return (
-            "ok (injection patterns flagged in samples; samples emitted "
-            "verbatim as inert data)"
+            "ok (injection patterns flagged in %d of %d samples, in %d of %d "
+            "groups; those groups carry injection_flagged: true; samples "
+            "emitted verbatim as inert data)"
+            % (len(attribution), len(samples), marked, len(groups))
         )
     if proc.returncode == 2:
         return "degraded: injection scanner unavailable (exit 2); samples emitted unscanned"
@@ -579,9 +645,12 @@ def scan_samples(groups, no_scan, scan_script):
             "scan_content": "skipped (--no-scan)",
             "detect_secrets": "skipped (--no-scan)",
         }
+    # Secrets first: redaction replaces and dedupes samples, and the
+    # injection pass's per-sample indices must point at what is emitted.
+    detect_secrets = run_secret_scan(groups)
     return {
         "scan_content": run_injection_scan(groups, scan_script),
-        "detect_secrets": run_secret_scan(groups),
+        "detect_secrets": detect_secrets,
     }
 
 
