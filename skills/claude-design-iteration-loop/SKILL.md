@@ -43,6 +43,8 @@ One chat message. Order:
 4. Standing rules, restated every round. Example set: every user-visible string in en and sv, no "translate at build"; exact scope/permission lists given as facts; log open items, never guess.
 5. Numbered items. Decisions stated as facts. Leave only wording and layout to the designer; never write "decide X".
 
+Founder statements that cut across screens (copy brevity, naming, a colour or notice treatment, an interaction pattern) apply to every surface they reasonably reach, not only the screen under review. Write the decision with that scope and list the reached surfaces as brief items. Do not ask the founder whether to extend it; ask only when the extension would change a product decision (scope, data, permissions).
+
 Founder decisions made after a send are lost unless re-sent: put each in the next brief and DECISIONS, and append it to the project's session constraints the same turn.
 
 ## Sending
