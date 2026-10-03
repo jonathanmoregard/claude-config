@@ -50,6 +50,7 @@ User instructions override everything below.
 ## Bash
 - `permissions.deny` matches the command STRING, so a legitimate command can be rejected for a substring it merely contains — including inside a heredoc body. Route the payload around it (`Write` the text, then `cat >>`; `gh` `--body-file`/`-F` instead of an inline body; select tests by `-k`; drop a flag whose default is already right). Never quote or split to defeat the matcher — some rules are deliberate. Details: `detached-long-commands`.
 - A `[REDACTED:…]` marker in output means the call succeeded and the value is gated — don't re-run to get it in clear.
+- Waiting on CI, mergeability, a deploy or a unit → `~/.claude/scripts/wait-for pr|run|unit …` with `run_in_background: true`, then end the turn; you are re-invoked when it settles. Never `sleep N; <status>` to check again.
 
 ## Build + review
 - Substantial multi-part or unattended work → invoke `orchestrate` and follow it. Use judgment for ordinary branch-sized changes; subagents are a context tool, not a ritual.

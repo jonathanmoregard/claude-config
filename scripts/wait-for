@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# wait-for — block until something outside the session settles, then print one
+# summary line and exit with a status that says how it settled.
+#
+# Run it with Bash `run_in_background: true` and end the turn: the harness
+# re-invokes the session when it exits, so one call replaces a sleep-poll loop
+# (bash-guard denies `sleep N; <status snapshot>` in the foreground).
+#
+#   wait-for pr <N> [-R owner/repo]        CI settled and GitHub's mergeability
+#                                          computed (or the PR merged/closed)
+#   wait-for run <RUN_ID> [-R owner/repo]  one Actions run finished
+#   wait-for unit <name> [--user] [--since now|<date>]
+#                                          a systemd unit's run finished; with
+#                                          --since, a run that STARTED after
+#                                          that moment (e.g. the deploy a merge
+#                                          is about to trigger)
+#   common: --timeout <seconds> (default 3600)
+#
+# Exit: 0 settled fine · 1 settled badly (failed check/run/unit) ·
+#       2 settled but not mergeable (conflict) or PR closed unmerged ·
+#       3 settled, but the PR's checks could not be read (token scope) ·
+#       124 timed out · 64 usage error.
+# The waiting inside is a loop on purpose: it runs detached in one background
+# call, never in a foreground turn.
+set -uo pipefail
+
+usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
+
+[ $# -ge 2 ] || usage
+mode=$1 target=$2
+shift 2
+repo=() user=() since="" timeout=3600
+while [ $# -gt 0 ]; do
+  case $1 in
+    -R|--repo) [ $# -ge 2 ] || usage; repo=(-R "$2"); shift 2 ;;
+    --user) user=(--user); shift ;;
+    --since) [ $# -ge 2 ] || usage; since=$2; shift 2 ;;
+    --timeout) [ $# -ge 2 ] || usage; timeout=$2; shift 2 ;;
+    *) usage ;;
+  esac
+done
+case $timeout in ''|*[!0-9]*) usage ;; esac
+deadline=$(( $(date +%s) + timeout ))
+left() { echo $(( deadline - $(date +%s) )); }
+# nap <step>: sleep up to <step> seconds, never past the deadline.
+nap() { local l; l=$(left); [ "$l" -gt 0 ] || timed_out; sleep $(( l < $1 ? l : $1 )); }
+timed_out() { echo "wait-for: timed out after ${timeout}s waiting on $mode $target"; exit 124; }
+
+pr_field() { gh pr view "$target" "${repo[@]}" --json "$1" --jq ".$1" 2>/dev/null; }
+
+wait_pr() {
+  case $target in ''|*[!0-9]*) usage ;; esac
+  local state checks_rc=0 m ms checks=n/a
+  state=$(pr_field state) || { echo "wait-for: cannot read PR $target"; exit 1; }
+  if [ "$state" = OPEN ]; then
+    # The exit code cannot tell checks from no checks (1 = a failed check,
+    # "no checks reported", or an API error alike); the --json output can: a
+    # JSON array means checks exist. "no checks reported" right after a push
+    # may just mean not registered yet; any other error (e.g. a token without
+    # checks:read) will not heal.
+    local n=0 out
+    while :; do
+      out=$(gh pr checks "$target" "${repo[@]}" --json bucket 2>&1)
+      if [[ $out == \[* ]]; then checks=present; break; fi
+      if [[ $out == *"no checks reported"* ]]; then
+        checks=none
+        [ $n -lt 3 ] || break
+        sleep 10; n=$((n + 1))
+      else
+        checks="unreadable (${out:0:80})"; break
+      fi
+    done
+    if [ "$checks" = present ]; then
+      [ "$(left)" -gt 0 ] || timed_out
+      timeout "$(left)" gh pr checks "$target" "${repo[@]}" --watch --fail-fast \
+        --interval 20 >/dev/null 2>&1
+      checks_rc=$?
+      [ $checks_rc = 124 ] && timed_out
+    fi
+    # mergeable is computed lazily: UNKNOWN right after a push or a base move.
+    while :; do
+      state=$(pr_field state); m=$(pr_field mergeable)
+      [ "$state" != OPEN ] || [ "$m" != UNKNOWN ] && break
+      nap 10
+    done
+  fi
+  ms=$(pr_field mergeStateStatus)
+  local failed="?"
+  if [ "$checks" = present ]; then
+    failed=$(gh pr checks "$target" "${repo[@]}" --json bucket \
+      --jq '[.[] | select(.bucket == "fail" or .bucket == "cancel")] | length' 2>/dev/null || echo "?")
+    checks="present failed=$failed"
+  fi
+  echo "PR #$target $state mergeable=${m:-n/a} mergeState=$ms checks=$checks"
+  case $state in
+    MERGED) exit 0 ;;
+    CLOSED) exit 2 ;;
+  esac
+  [ "$failed" != 0 ] && [ "$failed" != "?" ] && exit 1
+  [ "$m" = CONFLICTING ] && exit 2
+  [[ $checks == unreadable* ]] && exit 3
+  exit 0
+}
+
+wait_run() {
+  [ "$(left)" -gt 0 ] || timed_out
+  timeout "$(left)" gh run watch "$target" "${repo[@]}" --exit-status >/dev/null 2>&1
+  local rc=$?
+  [ $rc = 124 ] && timed_out
+  gh run view "$target" "${repo[@]}" --json status,conclusion,name \
+    --jq '"run '"$target"' \(.name): \(.status) \(.conclusion)"' 2>/dev/null
+  [ $rc = 0 ] && exit 0 || exit 1
+}
+
+unit_prop() { systemctl "${user[@]}" show "$target" -p "$1" --value 2>/dev/null; }
+to_epoch() { [ -n "$1" ] && [ "$1" != n/a ] && date -d "$1" +%s 2>/dev/null || echo 0; }
+
+wait_unit() {
+  [ "$(unit_prop LoadState)" = loaded ] || { echo "wait-for: unit $target is not loaded"; exit 1; }
+  local since_epoch=0
+  if [ -n "$since" ]; then
+    since_epoch=$(to_epoch "$since"); [ "$since_epoch" -gt 0 ] || usage
+  fi
+  local state started
+  while :; do
+    state=$(unit_prop ActiveState)
+    started=$(to_epoch "$(unit_prop ExecMainStartTimestamp)")
+    case $state in
+      activating|deactivating|reloading|refreshing) ;;
+      active)
+        # A oneshot is active/start while it runs and active/exited after it
+        # (RemainAfterExit); any other type is "up" once active.
+        if [ "$(unit_prop Type)" != oneshot ] || [ "$(unit_prop SubState)" = exited ]; then
+          [ "$started" -ge "$since_epoch" ] && break
+        fi ;;
+      *)
+        # inactive/failed: done, unless --since asks for a run not yet begun.
+        if [ "$since_epoch" = 0 ] || [ "$started" -ge "$since_epoch" ]; then break; fi ;;
+    esac
+    nap 5
+  done
+  local result status
+  result=$(unit_prop Result); status=$(unit_prop ExecMainStatus)
+  echo "unit $target $(unit_prop ActiveState)/$(unit_prop SubState) result=$result status=$status started=$(unit_prop ExecMainStartTimestamp)"
+  [ "$result" = success ] && exit 0 || exit 1
+}
+
+case $mode in
+  pr) wait_pr ;;
+  run) wait_run ;;
+  unit) wait_unit ;;
+  *) usage ;;
+esac

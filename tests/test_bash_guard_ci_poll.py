@@ -47,6 +47,14 @@ DENY = [
     "cat >> /tmp/progress.md <<EOF\n- pushed; PR #15 opened\nEOF\nsleep 240; gh pr checks 15 2>&1 | head -6",
     # backticks inside double quotes DO execute
     "sleep 30; echo \"state: `gh pr checks 5 | grep -c pending`\"",
+    # 2026-10-03, this session: waiting out GitHub's lazy UNKNOWN mergeability
+    "sleep 15; for n in 96 104; do gh pr view $n -R jonathanmoregard/.claude --json number,state,mergeable,mergeStateStatus --jq '.state'; done",
+    "sleep 20; gh pr view 302 -R jonathanmoregard/nixos-config --json state,mergeStateStatus",
+    # waiting on a deploy / unit by re-reading its status
+    "sleep 30; systemctl status nixos-deploy.service --no-pager | head -5",
+    "while systemctl --user is-active -q foo.service; do sleep 5; done",
+    "sleep 60; systemctl --user show aggregator-ingest.service -p ActiveState -p Result -p ExecMainStatus",
+    "sleep 330; systemctl --user is-active vmbase-proposals-push 2>&1; tail -8 /tmp/vm-base-merged.log",
 ]
 
 ALLOW = [
@@ -58,6 +66,19 @@ ALLOW = [
     "sleep 45; gh run watch 99 --exit-status",
     # watch first, then print the settled result
     "sleep 20; gh pr checks 11 --watch --interval 30 >/dev/null 2>&1; gh pr checks 11",
+    # the wait-for helper is the blocking primitive for PRs, runs and units
+    "~/.claude/scripts/wait-for pr 302 -R jonathanmoregard/nixos-config",
+    "sleep 20; $HOME/.claude/scripts/wait-for unit nixos-deploy.service --since now",
+    # single looks without a wait
+    "gh pr view 302 --json state,mergeable",
+    "systemctl --user status foo.service",
+    # sleep next to a unit ACTION, not a status read
+    "sleep 2; systemctl --user restart foo.service",
+    # act, then look: a health check after starting a unit (real, 2026-09)
+    "systemctl --user restart whisper-writer && sleep 2 && systemctl --user status whisper-writer --no-pager",
+    "systemctl start --no-ask-password --no-block nixos-deploy.service; sleep 5; systemctl is-active nixos-deploy.service",
+    # a short settle delay before one look
+    "sleep 3 && systemctl --user status autodoro --no-pager | head -5",
     # sleep next to unrelated work
     "sleep 5; git status",
     "gh pr checks 3; git log --oneline -3",
@@ -81,6 +102,7 @@ def main() -> int:
         check(f"deny: {cmd[:70]!r}", reason is not None)
         if reason is not None:
             check("  reason names the blocking primitive", "--watch" in reason)
+            check("  reason names wait-for", "wait-for" in reason)
 
     print("== legitimate shapes pass ==")
     for cmd in ALLOW:

@@ -35,7 +35,7 @@ CronCreate(cron: "<M> <H> <DoM> <Mon> *", recurring: false, durable: true, promp
 - **`durable: true`** — survives `/clear`, restart, crash. Session-only jobs die with the process, which is the exact case you are protecting against.
 - **Delay matched to the process**, not to a default. An 8-minute CI run gets one ~10-minute check, not six 90-second ones. Add slack; firing early wastes the wake.
 - **Off-minute** (not :00 or :30).
-- **CI has a blocking primitive — use it instead of re-checking.** `gh pr checks <PR> --watch --fail-fast` (or `gh run watch <ID> --exit-status`) with Bash `run_in_background: true` costs one call and re-invokes you when it settles. Never `sleep N; gh pr checks` in the foreground — bash-guard denies it. Add the durable cron on top only when the wait must survive a `/clear`.
+- **Waits have a blocking primitive — use it instead of re-checking.** `~/.claude/scripts/wait-for pr <PR> [-R owner/repo]` (CI settled and GitHub's lazy mergeability computed), `wait-for unit <name> [--user] [--since now]` (a deploy or oneshot run finished), `wait-for run <ID>`; or gh's own `gh pr checks <PR> --watch --fail-fast`. Run it with Bash `run_in_background: true`: one call, and you are re-invoked when it settles, with a one-line summary and an exit code (0 fine · 1 failed · 2 conflict/closed · 3 checks unreadable · 124 timeout). Never `sleep N; gh pr checks|gh pr view|systemctl status` in the foreground — bash-guard denies it. Add the durable cron on top only when the wait must survive a `/clear`.
 - `ScheduleWakeup` is `/loop`-only and does not survive a clear — do not reach for it here.
 
 ### The scheduled prompt must be self-contained

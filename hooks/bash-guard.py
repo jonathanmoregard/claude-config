@@ -2025,17 +2025,30 @@ def _check_nixos_push(command: str, cwd: str | None) -> str | None:
 # ships the blocking primitive; run in the background, the harness re-invokes
 # the session when it exits, so one call replaces the whole loop. A single
 # status look (no sleep) is fine and stays allowed.
+#
+# The same loop shows up for waits gh has no `--watch` for: GitHub's lazily
+# computed mergeability (`sleep 15; gh pr view … mergeable` while it reads
+# UNKNOWN) and deploys/units (`sleep 30; systemctl status …`). scripts/wait-for
+# is the blocking primitive for those, so a status read of either kind counts.
+# A unit status read is held to a narrower test: replayed against ~30k real
+# foreground commands, "act, then look" (`systemctl restart x && sleep 2 &&
+# systemctl status x`) is a common health check, not a wait. So it counts only
+# inside a loop or after a sleep over _UNIT_SETTLE_S, and never when the same
+# command acts on a unit.
 _SHELL_KEYWORDS = frozenset({"do", "then", "else", "while", "until", "if", "!", "{", "(", "time"})
 
 _CI_POLL_HINT = (
     "bash-guard: foreground CI poll denied — `sleep` plus a one-shot CI status "
-    "snapshot (`gh pr checks` / `gh run view|list` / statusCheckRollup) holds the "
+    "snapshot (`gh pr checks` / `gh pr view` / `gh run view|list` / `systemctl "
+    "status|is-active|show`) holds the "
     "turn and still returns a snapshot, so it gets repeated: a hand-rolled wait "
     "loop.\n"
     "Use the blocking primitive, with Bash run_in_background: true — you are "
     "re-invoked when it exits:\n"
-    "  gh pr checks <PR> --watch --fail-fast\n"
-    "  gh run watch <RUN_ID> --exit-status\n"
+    "  ~/.claude/scripts/wait-for pr <PR> [-R owner/repo]   (CI settled + mergeability known)\n"
+    "  ~/.claude/scripts/wait-for unit <name> [--user] [--since now]   (deploy/unit run finished)\n"
+    "  ~/.claude/scripts/wait-for run <RUN_ID> [-R owner/repo]\n"
+    "  or gh's own: gh pr checks <PR> --watch --fail-fast / gh run watch <RUN_ID> --exit-status\n"
     "Checks not registered yet right after a push? Keep the delay in front of the "
     "watch: `sleep 20; gh pr checks <PR> --watch --fail-fast` (background). "
     "Same for fetching a fresh run id after a push.\n"
@@ -2054,15 +2067,38 @@ def _segment_tokens(segment: str) -> list[str]:
     return toks
 
 
+_UNIT_STATUS_VERBS = frozenset({"status", "is-active", "is-failed", "show"})
+_UNIT_ACTION_VERBS = frozenset({"start", "restart", "reload", "try-restart",
+                                "reload-or-restart", "enable", "stop"})
+_LOOP_KEYWORDS = frozenset({"while", "until", "for"})
+_UNIT_SETTLE_S = 10
+
+
+def _systemctl_verb(toks: list[str]) -> str | None:
+    if not toks or toks[0] != "systemctl":
+        return None
+    verbs = [t for t in toks[1:] if not t.startswith("-")]
+    return verbs[0] if verbs else None
+
+
+def _sleep_seconds(toks: list[str]) -> float:
+    """Seconds a `sleep` segment waits; unparseable counts as long."""
+    total = 0.0
+    for arg in toks[1:]:
+        m = re.fullmatch(r"(\d+(?:\.\d+)?)([smhd]?)", arg)
+        if not m:
+            return float("inf")
+        total += float(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+    return total
+
+
 def _is_ci_snapshot(toks: list[str]) -> bool:
     if len(toks) < 3 or toks[0] != "gh":
         return False
     if "--watch" in toks:
         return False
     sub = toks[1:3]
-    if sub == ["pr", "checks"] or sub == ["run", "view"] or sub == ["run", "list"]:
-        return True
-    return sub == ["pr", "view"] and any("statusCheckRollup" in t for t in toks)
+    return sub in (["pr", "checks"], ["pr", "view"], ["run", "view"], ["run", "list"])
 
 
 _HEREDOC_OP_RE = re.compile(r"(?<!<)<<(?!<)-?[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
@@ -2129,7 +2165,8 @@ def _mask_single_quotes(s: str) -> str:
 def _check_ci_poll(command: str, background: bool) -> str | None:
     if background:
         return None
-    has_sleep = has_snapshot = False
+    has_sleep = has_snapshot = has_unit_read = acts_on_unit = in_loop = False
+    longest_sleep = 0.0
     shell_text, live_bodies = _split_heredocs(command)
     segments = _pipeline_subcommands(shell_text)
     # `s=$(gh pr checks 9 | grep -c pending)` inside a loop is the same poll.
@@ -2138,17 +2175,35 @@ def _check_ci_poll(command: str, background: bool) -> str | None:
         for body in _command_substitutions(src):
             segments.extend(_pipeline_subcommands(body))
     for seg in segments:
+        try:
+            raw = shlex.split(seg)
+        except ValueError:
+            raw = seg.split()
+        if raw and raw[0] in _LOOP_KEYWORDS:
+            in_loop = True
         toks = _segment_tokens(seg)
         if not toks:
             continue
+        verb = _systemctl_verb(toks)
+        if verb in _UNIT_STATUS_VERBS:
+            has_unit_read = True
+            continue
+        if verb in _UNIT_ACTION_VERBS:
+            acts_on_unit = True
+            continue
         if toks[0] == "sleep":
             has_sleep = True
+            longest_sleep = max(longest_sleep, _sleep_seconds(toks))
         elif toks[:3] == ["gh", "run", "watch"] or (toks[:1] == ["gh"] and "--watch" in toks):
             # The blocking primitive is in the command; a snapshot after it
             # just prints the settled result.
             return None
         elif _is_ci_snapshot(toks):
             has_snapshot = True
+    if has_sleep and has_unit_read and not acts_on_unit and (
+        in_loop or longest_sleep > _UNIT_SETTLE_S
+    ):
+        has_snapshot = True
     return _CI_POLL_HINT if has_sleep and has_snapshot else None
 
 
