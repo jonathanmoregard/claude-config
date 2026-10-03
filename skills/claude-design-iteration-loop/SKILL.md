@@ -9,6 +9,17 @@ The design is the spec. Implementation follows it 1:1. Gaps found while building
 
 Per-project half (diffing, porting, exporting, uploading): a project skill pair such as `klaffat-design-adopt` (inbound, never uploads) and `klaffat-design-sync` (outbound, add-only). Write the equivalent per project; this skill stays project-agnostic.
 
+## Before round 1
+
+Do all four before the first send. Each missed item costs later rounds.
+
+1. **Research hard platform constraints** the design depends on (e.g. whether a provider can revoke a single permission, token and scope limits). Record them as facts in DECISIONS so decisions do not flip later.
+2. **Write the state x surface matrix**: every surface against counts 0/1/n, every provider/account combination, limits, error, conflict, unlinked, and recurring/variant states. Put it in the brief and require the designer to draw every cell in rounds 1-2.
+3. **Collect platform brand and legal rules** (provider sign-in button wording and logos, required disclosures) and state them as facts in the brief.
+4. **Set a round budget** (default 6, counting from round 1) and name the freeze point.
+
+Batch build findings: collect gaps from all agents and send one round per batch, not one per finding. At the freeze, stop opening rounds: implement each remaining gap with the closest existing design pattern and string, and list it under "design follow-ups" (surface, what was assumed) for the founder. Past the budget, ask the founder before another round.
+
 ## Loop
 
 1. **Spec in chat.** Feature intent plus every founder decision as facts. New chat per feature (history icon, top-left, then "New chat").
@@ -17,7 +28,7 @@ Per-project half (diffing, porting, exporting, uploading): a project skill pair 
 4. **Gaps in the design** become round N+1. Repeat 2-4 until the design is up to scratch. Design first, then implement.
 5. **Mirror** the design to disk.
 6. **Implement** with subagents against the mirror.
-7. **Build-found gaps** (a state, string, or layout the design lacks) become a new round. Never patch them in code, never use placeholder copy.
+7. **Build-found gaps** (a state, string, or layout the design lacks) are batched into a new round. Before the freeze, never patch them in code or use placeholder copy.
 8. **Match 1:1**, then **upload** implemented screens add-only.
 
 Do not dispatch implementation for a surface while a known gap on it is unresolved. Surfaces whose design is complete may proceed in parallel.
