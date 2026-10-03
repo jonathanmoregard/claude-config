@@ -28,7 +28,9 @@ git -C ~/.claude worktree add ~/worktrees/claude-<slug> -b feat/<slug> origin/ma
 cd ~/worktrees/claude-<slug>
 ```
 
-Edit, verify and commit **there**, push, then `gh pr create`. The merge click is
+Edit, verify and commit **there**, push, then `gh pr create`. "Verify" for a
+behavior-changing edit means agent e2e (`agent-config-e2e`): a real headless
+agent on the staged config, old vs new, results in the PR body. The merge click is
 Jonathan's. Never commit to a branch this session did not create — another
 session's branch is not a delivery vehicle for your diff.
 

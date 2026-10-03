@@ -33,6 +33,12 @@ fi
 
 # owner/repo lookup + the GraphQL review-thread query.
 if [ "$sub" = "repo view" ]; then
+  case " $* " in
+    *" visibility "*)
+      # The PR-minutes gate. DOD_VISIBILITY=fail models an unreadable answer.
+      [ "${DOD_VISIBILITY:-PUBLIC}" = fail ] && { echo "HTTP 502" >&2; exit 1; }
+      echo "${DOD_VISIBILITY:-PUBLIC}"; exit 0 ;;
+  esac
   echo '{"owner":{"login":"o"},"name":"r"}'; exit 0
 fi
 if [ "$sub" = "api graphql" ]; then

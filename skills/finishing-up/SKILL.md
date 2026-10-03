@@ -1,6 +1,6 @@
 ---
 name: finishing-up
-description: Use when wrapping up work that produced a diff; before asking the user to review or merge a PR; after the user says a PR merged; when verifying deployment or smoke-testing deployed work; when CI, conflicts, mergeability, deployment, or smoke block completion; when managing multiple branch/repository delivery targets; or when the user asks to reset DoD to a new task.
+description: Use when wrapping up work that produced a diff; when deciding whether to open a PR (private repos with PR-triggered CI hold the PR until the user says yes); before asking the user to review or merge a PR; after the user says a PR merged; when verifying deployment or smoke-testing deployed work; when CI, conflicts, mergeability, deployment, or smoke block completion; when managing multiple branch/repository delivery targets; or when the user asks to reset DoD to a new task.
 ---
 
 # Finishing Up
@@ -37,6 +37,7 @@ infer sibling state while working one target.
 | Outcome | Use when | Action |
 |---|---|---|
 | **Ship** | Work belongs upstream; no contrary user intent | Complete full ladder below |
+| **Hold PR** | PR-gated repo (private/internal + `pull_request` CI); branch not yet reviewed, or user not yet asked | Push branch; finish local gates and user review; then ask "Open the PR?" and stop. Resume Ship on yes |
 | **Preserve** | User explicitly wants work retained, or another session owns it | Do not publish or alter; record exact worktree, branch, HEAD, blockers, owner, next action |
 | **Abandon** | User explicitly authorizes discard | Resolve exact targets and ownership; remove only authorized work; report recovery status |
 
@@ -54,6 +55,10 @@ python3 ~/.claude/scripts/dod-check.py --repo <absolute-repo> --json
 
 Exit `0` means PR-ready, not complete. Exit `1` names blockers; `2` means not
 applicable; `3` means unknown and is never green. Fix branch-caused failures.
+`NO_PR … PR HELD` is not a fix-it-now blocker: the repo is PR-gated (global
+CLAUDE.md, **PRs**). A PR there costs billed Actions minutes on open and on
+every later push, so it opens once, on a branch the user has reviewed, after
+their explicit yes. Never `gh pr create` to clear the blocker on your own.
 No CI in a repository is not a blocker. Existing CI that did not run is.
 
 Refresh target after fixes:
@@ -212,6 +217,7 @@ Ship has no override.
 - Calling `dod-check` exit `0` done instead of PR-ready
 - Trusting “merged” without refreshing stored PR
 - Asking for a merge or review without a same-turn live `gh pr view` of that PR
+- Opening a PR in a PR-gated repo before the user's review and explicit yes
 - Using reviewed branch SHA as deployed merge SHA
 - Asking for merge before revision/smoke commands are frozen and shown
 - Smoke-testing source tree, stub, mock, or changed artifact

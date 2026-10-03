@@ -10,7 +10,7 @@ Never ask the user to do what you can do. Run the commands, tests, reads, edits,
 - Uploading sensitive content to third-party tools
 - Scope expansion — flag in one sentence, wait
 
-**Proceed without asking:** `git push`, opening/updating PRs, updating an outdated green PR's branch (merging stays the user's click), expected status updates.
+**Proceed without asking:** `git push`, opening/updating PRs (except PR-gated repos — see **PRs**), updating an outdated green PR's branch (merging stays the user's click), expected status updates.
 
 **Safe cleanup without asking:**
 - Temporary files created by the current agent/session may be deleted after verifying the exact target, ownership, and scope.
@@ -75,6 +75,7 @@ User instructions override everything below.
 ## Config edits (`~/.claude`)
 - Read-only, pinned to `master` — the harness reads that working tree live. Every edit (settings.json, hooks, skills, agents, commands, permissions, scripts, CLAUDE.md) goes in `~/worktrees/claude-<slug>/` off freshly fetched `origin/master` (`~/.claude/scripts/claude-worktree.sh <slug>`), then a PR. One-liners included; branch ownership is the criterion, not diff size.
 - Never commit to a branch this session did not create.
+- Behavior-changing edit (CLAUDE.md, skills, agents, commands, hooks, settings, any text an agent reads) → agent e2e before the PR, per `agent-config-e2e`: a real headless agent on the staged candidate config, driven through the situation the change targets, `origin/master` vs worktree. Results table goes in the PR body. Unit tests, a diff read, or "the text says so" are not e2e. This rule included.
 - `~/.claude` off `master` or with tracked changes → stop and report its exact state. Never stash, reset, clean or switch it.
 - A skill telling you to edit config does not exempt you — built-in (`update-config`, `keybindings-help`, `statusline-setup`, `fewer-permission-prompts`), plugin, or newly installed. This rule wins; run its steps inside the worktree.
 - `skills/<name>` is a symlink → it belongs to another repo. Edit it there, via that repo's PR.
@@ -106,3 +107,6 @@ User instructions override everything below.
 
 ## PRs
 - Target the repo's default branch. Non-default only when asked, then re-target before merge.
+- **PR-gated repo** = private/internal repo whose workflows run on `pull_request`: opening the PR, and every push to it, spends billed Actions minutes; pushing the branch alone does not, unless a workflow runs on `push` to any branch. `dod-check.py` reports it as `NO_PR … PR HELD`. Check: `gh repo view --json visibility` + `grep pull_request .github/workflows/*`.
+- PR-gated → no PR until the branch is ready: local gates green (`scripts/check` etc.) and the user's review back-and-forth settled. Push the branch for backup freely (unless `push` triggers CI on all branches: then batch pushes too). Then ask one closed question — "Open the PR?" — and wait. Only the user's yes, or an explicit "open a PR", authorizes `gh pr create`. Draft PRs run CI too; no draft workaround.
+- Public, or private with no PR-triggered CI → open PRs as before.
