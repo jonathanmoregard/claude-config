@@ -282,3 +282,60 @@ def test_nested_run_reaches_shared_dir(tmp_path):
     sc = _scenario(tmp_path, 'grep -qx nested "$1/shared/log"')
     _, _, verdicts = _run(tmp_path, sc, outer)
     assert verdicts[0]["verdict"] == "PASS", verdicts
+
+
+def test_run_cannot_reach_ssh_agent_keys_or_write_real_home(tmp_path):
+    """Review H2: credentials and real checkouts must be out of an agent's reach."""
+    import shutil as _sh
+    if not _sh.which("bwrap"):
+        pytest.skip("bubblewrap not on PATH")
+    import pwd as _pwd
+    real = _pwd.getpwuid(os.getuid()).pw_dir
+    body = (
+        f'[ -z "$SSH_AUTH_SOCK$GH_TOKEN$GITHUB_TOKEN" ] || exit 11\n'
+        f'[ "$GIT_SSH_COMMAND" = false ] || exit 12\n'
+        f'[ -z "$(ls -A {real}/.ssh 2>/dev/null)" ] || exit 13\n'
+        f'touch {real}/.agent-e2e-escape 2>/dev/null && exit 14\n'
+        "cat <<'EOF'\n" + stream("contained", []) + "\nEOF\n")
+    claude = fake_claude(tmp_path, body)
+    sc = _scenario(tmp_path, "exit 0")
+    env_before = os.environ.get("SSH_AUTH_SOCK")
+    os.environ["SSH_AUTH_SOCK"] = "/nonexistent/agent.sock"
+    try:
+        _, _, verdicts = _run(tmp_path, sc, claude)
+    finally:
+        if env_before is None:
+            os.environ.pop("SSH_AUTH_SOCK")
+        else:
+            os.environ["SSH_AUTH_SOCK"] = env_before
+    assert not pathlib.Path(real, ".agent-e2e-escape").exists()
+    assert verdicts[0]["verdict"] == "PASS", verdicts
+
+
+def test_nested_default_out_stays_inside_the_run(tmp_path):
+    """Review H1: a nested harness must not default into the outer --out tree."""
+    outer_run = tmp_path / "outer-run"
+    outer_run.mkdir()
+    claude = fake_claude(tmp_path, "cat <<'EOF'\n" + stream("ok", []) + "\nEOF\n")
+    sc = _scenario(tmp_path, "exit 0")
+    r = harness("run", str(sc), "--arm", "a=HEAD", "--n", "1", "--jobs", "1",
+                "--claude", str(claude),
+                env={**os.environ, "E2E_RUN": str(outer_run), "E2E_SHARED": str(tmp_path)})
+    assert r.returncode == 0, r.stderr
+    assert (outer_run / "nested-e2e/sc/a/1/verdict.json").is_file()
+
+
+def test_headless_permission_denials_count_as_blocked(tmp_path):
+    """Review M3: -p permission denials make a run INCONCLUSIVE, like hook refusals."""
+    events = [
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "gh pr create"}}]}},
+        {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "t1", "is_error": True,
+             "content": "Claude requested permissions to use Bash, but you haven't granted it yet."}]}},
+        {"type": "result", "result": "Could not run anything.", "is_error": False},
+    ]
+    body = "cat <<'EOF'\n" + "\n".join(json.dumps(e) for e in events) + "\nEOF\n"
+    sc = _scenario(tmp_path, "exit 0")
+    _, _, verdicts = _run(tmp_path, sc, fake_claude(tmp_path, body))
+    assert verdicts[0]["verdict"] == "INCONCLUSIVE"

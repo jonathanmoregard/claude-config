@@ -29,7 +29,7 @@ non-agent script with its own tests, a formatting-only diff.
 
 ```bash
 cd ~/worktrees/claude-<slug>
-git commit -am wip   # the arm is a ref: the batch must not see later edits
+git add -A && git commit -m wip   # arm is a ref; -A so new skills/scenarios are in it
 python3 scripts/agent-e2e/agent_e2e.py run tests/agent-e2e/<scenario> \
   --arm old=origin/master --arm new=$(git rev-parse --short HEAD) --n 5
 ```
@@ -85,6 +85,13 @@ text, such as "asked a question".
 - No MCP servers (`--strict-mcp-config`). Credentials, the plugin cache,
   `~/Repos` and caveman config are linked from the real HOME. dcg's config is
   copied.
+- Isolation needs bubblewrap: a private `/tmp`, the real HOME read-only,
+  `~/.ssh` hidden, and credential env vars (`SSH_AUTH_SOCK`, `GH_TOKEN`, …)
+  scrubbed. Without `bwrap`, verdicts say `isolated_tmp: false`. Don't run
+  concurrent batches that way.
+- Workspaces live under `/tmp`, where `finishing-up-arm.sh` deliberately
+  arms nothing, so the DoD informer never fires in e2e. A change to it needs
+  its own scenario rooted outside `/tmp`.
 - One user turn. A multi-turn history is described in the prompt, not
   replayed.
 - Runs draw on the subscription quota, about $0.25–1 equivalent per run.

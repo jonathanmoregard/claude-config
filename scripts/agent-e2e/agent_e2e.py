@@ -55,13 +55,17 @@ import concurrent.futures as cf
 import json
 import os
 import pathlib
+import pwd
+import re
 import shutil
 import subprocess
 import sys
 import time
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
-REAL_HOME = pathlib.Path.home()
+# From the passwd entry, not $HOME: inside a run (a nested harness) $HOME is
+# the sandbox, and ssh resolves ~/.ssh the same way.
+REAL_HOME = pathlib.Path(pwd.getpwuid(os.getuid()).pw_dir)
 # Linked, never copied: auth, the plugin cache and the tree relative skill
 # symlinks (`../../Repos/superpowers/...`) resolve into.
 LINKS = {
@@ -70,6 +74,12 @@ LINKS = {
     "Repos": REAL_HOME / "Repos",
     ".config/caveman": REAL_HOME / ".config/caveman",
 }
+# Credentials and agents a run must not inherit: with them, an agent in the
+# sandbox could push a real checkout under the linked ~/Repos, or call GitHub
+# with the user's token, past every stub.
+SCRUB = ("SSH_AUTH_SOCK", "SSH_AGENT_PID", "SSH_ASKPASS", "GIT_ASKPASS",
+         "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
+         "DBUS_SESSION_BUS_ADDRESS")
 # Copied, never linked: config a hook needs to run at all, in a directory the
 # hook also WRITES (dcg records allow-once and pending exceptions beside its
 # config), so a sandbox run must not reach the real one. Without dcg's config
@@ -173,12 +183,18 @@ def bash_commands(events: list[dict]) -> list[str]:
     return cmds
 
 
+# A hook refusing the call, or headless -p denying a permission it cannot ask for.
+REFUSAL = re.compile(r"hook error|requested permissions|permission to use|"
+                     r"denied by your permission|haven't granted", re.I)
+
+
 def bash_blocked(events: list[dict]) -> bool:
     """True when the agent ran Bash and the environment refused every call.
 
     That run measured the sandbox, not the config: an agent that cannot run a
     command cannot open a PR either, and would "pass" a hold-the-PR check. The
-    probe that found this had bash-guard failing closed on a missing dcg config.
+    probe that found this had bash-guard failing closed on a missing dcg config;
+    headless permission denials count the same way.
     """
     bash_ids = {part.get("id")
                 for ev in events if ev.get("type") == "assistant"
@@ -193,7 +209,7 @@ def bash_blocked(events: list[dict]) -> bool:
         content = (ev.get("message") or {}).get("content")
         for part in content if isinstance(content, list) else []:
             if part.get("type") == "tool_result" and part.get("tool_use_id") in bash_ids \
-                    and part.get("is_error") and "hook error" in str(part.get("content")):
+                    and part.get("is_error") and REFUSAL.search(str(part.get("content"))):
                 refused += 1
     return refused == len(bash_ids)
 
@@ -231,8 +247,11 @@ def run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
         "DISABLE_AUTOUPDATER": "1",
     }
     for var in ("GIT_CONFIG_GLOBAL", "CLAUDE_CONFIG_DIR", "CLAUDECODE",
-                "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID"):
+                "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", *SCRUB):
         env.pop(var, None)
+    # ssh finds keys via getpwuid, not $HOME; refuse it outright. Scenario
+    # remotes are local bare repos behind insteadOf, so nothing needs ssh.
+    env["GIT_SSH_COMMAND"] = "false"
     setup = subprocess.run(["bash", str(scenario / "setup.sh"), str(work), str(run)],
                            env=env, capture_output=True, text=True)
     (run / "setup.log").write_text(setup.stdout + setup.stderr, encoding="utf-8")
@@ -259,8 +278,16 @@ def run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
             binds += ["--ro-bind", str(exe_dir), str(exe_dir)]
         # Last, so a read-only ancestor bind above cannot shadow them.
         binds += ["--bind", str(run), str(run), "--bind", str(shared), str(shared)]
-        argv = [bwrap, "--dev-bind", "/", "/", "--tmpfs", "/tmp", *binds,
-                "--chdir", str(work), "--", *argv]
+        # The real HOME is read-only (linked ~/Repos and ~/.claude/plugins
+        # included) and ~/.ssh is hidden; only the run, the shared log dir and
+        # the credentials file (token refresh) stay writable.
+        creds = REAL_HOME / ".claude/.credentials.json"
+        home_guard = ["--ro-bind", str(REAL_HOME), str(REAL_HOME),
+                      "--tmpfs", str(REAL_HOME / ".ssh")]
+        if creds.is_file():
+            home_guard += ["--bind", str(creds), str(creds)]
+        argv = [bwrap, "--dev-bind", "/", "/", *home_guard, "--tmpfs", "/tmp",
+                *binds, "--chdir", str(work), "--", *argv]
     verdict["isolated_tmp"] = bool(bwrap)
     t0 = time.monotonic()
     try:
@@ -365,7 +392,12 @@ def main() -> int:
     rn.add_argument("--model", default=None, help="default: the staged config's own")
     rn.add_argument("--budget", type=float, default=3.0)
     rn.add_argument("--timeout", type=int, default=900)
-    rn.add_argument("--out", default=os.environ.get("TMPDIR", "/tmp") + "/agent-e2e")
+    # Nested (an agent under test running this harness): default inside its own
+    # run, never the outer tree, whose finished verdicts it would otherwise
+    # resume as real and whose in-flight run dirs it could delete.
+    nested = os.environ.get("E2E_RUN")
+    rn.add_argument("--out", default=(f"{nested}/nested-e2e" if nested else
+                                      os.environ.get("TMPDIR", "/tmp") + "/agent-e2e"))
     rn.add_argument("--claude", default=shutil.which("claude") or "claude")
     args = ap.parse_args()
     if args.cmd == "stage":
