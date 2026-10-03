@@ -373,7 +373,9 @@ log "invoking $CLAUDE_CMD over $n_groups group(s)"
 # unless the sink reports an anomaly worth keeping.
 old_umask="$(umask)"
 umask 077
-( cd "$CLAUDE_HOME" 2>/dev/null && "${run_agent[@]}" \
+# CLAUDE_PIPELINE_INTERNAL: this is a machine session, so session-reflect must
+# not mint a reflection of it into the corpus the RSI review reads.
+( cd "$CLAUDE_HOME" 2>/dev/null && CLAUDE_PIPELINE_INTERNAL=1 "${run_agent[@]}" \
   --model opus \
   --print \
   --tools "$AGENT_TOOLS" \

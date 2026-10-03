@@ -566,6 +566,41 @@ fi
 (( $(resume_calls) == 1 )); assert $? "the resumed path was used"
 
 # ===========================================================================
+# B2-mission — the same pre-check for the handoff writer. Mission is the mode
+# where a doomed resume costs the most: no fallback means NO handoff at all.
+# Observed 18 times in the live corpus (2026-09-04..09-28) as a 400 "Prompt is
+# too long" on transcripts of 1.25-15 MB, while sessionend on the very same
+# transcripts took the B2 path and completed.
+# ===========================================================================
+t_begin "B2-mission: oversize transcript writes the handoff without --resume"
+reset_logs
+MBIG_SID="0c4e1897-1a2b-4c3d-9e8f-000000000015"
+MBIG_TRANSCRIPT="$PROJECTS_DIR/$MBIG_SID.jsonl"
+cp -- "$BIG_TRANSCRIPT" "$MBIG_TRANSCRIPT"
+STUB_MODE=ok REFLECT_RESUME_MAX_TRANSCRIPT_BYTES=$(( BIG_BYTES / 2 )) \
+  bash "$REFLECT_SH" mission <<<"$(sessionend_payload "$MBIG_SID" "$MBIG_TRANSCRIPT")"
+MBIG_MANIFEST="$REFLECT_ROOT/sessions/$MBIG_SID/manifest.json"
+jqe '.modes.mission.status == "complete"' "$MBIG_MANIFEST"; assert $? "mission status=complete"
+[[ -s "$CLAUDE_SESSIONS_DIR/$MBIG_SID/handoff/mission.md" ]]; assert $? "authoritative handoff written"
+(( $(call_count) == 1 )); assert $? "exactly one model call ($(call_count) seen)"
+(( $(resume_calls) == 0 )); assert $? "no --resume on an oversize transcript"
+grep -qF 'FIXTURE-BIG-TAIL-MARKER' "$STUB_PROMPT_LOG"; assert $? "prompt carries the newest end of the transcript"
+grep -qF '## State on disk' "$STUB_PROMPT_LOG"; assert $? "prompt still carries the mission handoff structure"
+if grep -qF '{{' "$STUB_PROMPT_LOG"; then bad "a template placeholder survived into the prompt"; else ok "no template placeholder survived"; fi
+jqe '.modes.mission.primary_skipped_oversize == true' "$MBIG_MANIFEST"; assert $? "manifest records primary_skipped_oversize"
+jqe --argjson b "$BIG_BYTES" '.modes.mission.transcript_bytes == $b' "$MBIG_MANIFEST"; assert $? "the measured transcript size is reported"
+
+t_begin "B2-mission control: a transcript under the threshold keeps the resumed handoff"
+reset_logs
+MSMALL_SID="0c4e1897-1a2b-4c3d-9e8f-000000000016"
+STUB_MODE=ok bash "$REFLECT_SH" mission <<<"$(sessionend_payload "$MSMALL_SID")"
+MSMALL_MANIFEST="$REFLECT_ROOT/sessions/$MSMALL_SID/manifest.json"
+jqe '.modes.mission.status == "complete"' "$MSMALL_MANIFEST"; assert $? "mission status=complete"
+(( $(resume_calls) == 1 )); assert $? "the resumed path was used"
+jqe '.modes.mission.primary_skipped_oversize == false' "$MSMALL_MANIFEST"; assert $? "primary_skipped_oversize:false recorded"
+if grep -qF 'FIXTURE-PARENT-TAIL-MARKER' "$STUB_PROMPT_LOG"; then bad "resumed mission prompt inlined the transcript"; else ok "resumed mission prompt does not inline the transcript"; fi
+
+# ===========================================================================
 # C1 + G1 — a 429 primary ends the run: error manifest WITH a reason, and no
 # second call. The old contract here was "the fallback was attempted before
 # giving up"; that assertion is retired because attempting it was the defect.
@@ -1061,6 +1096,72 @@ if [[ -n "$REC_P1" && "$REC_P1" == "$REC_P2" ]]; then
 else
   note "the two fires straddled a second boundary ($REC_P1 vs $REC_P2); the count above is a weaker check this run"
 fi
+
+# ===========================================================================
+# P1 — pipeline-internal sessions never mint a reflection.
+# The step-back classifier, the homunculus observer and the nightly RSI /
+# permission-ledger cron runs are machine sessions; reflecting on them filled
+# the corpus the daily review reads with the pipeline's own telemetry. They are
+# recognized by an explicit sentinel (cron wrappers) or by running from a
+# machine-owned state dir under ~/.claude (helpers that cd there on purpose).
+# ===========================================================================
+PIPE_HOME="$SCRATCH/home"
+mkdir -p "$PIPE_HOME/.claude/step-back" "$PIPE_HOME/.claude/homunculus/projects/abc123" \
+  "$PIPE_HOME/.claude/step-backup"
+PIPE_DIR="$REFLECT_ROOT/skipped-pipeline"
+
+# pipeline_case <label> <sid> <cwd> [env assignments...] — fire a sessionend
+# whose payload names <cwd>, under HOME=$PIPE_HOME plus any extra env.
+pipeline_case() {
+  local label="$1" sid="$2" cwd="$3"; shift 3
+  t_begin "P1: $label"
+  reset_logs
+  local before after rc
+  before=$(find "$PIPE_DIR" -type f -name '*.json' 2>/dev/null | wc -l)
+  jq -cn --arg sid "$sid" --arg tp "$PARENT_TRANSCRIPT" --arg cwd "$cwd" \
+    '{session_id:$sid, transcript_path:$tp, cwd:$cwd,
+      hook_event_name:"SessionEnd", reason:"other"}' \
+    | env HOME="$PIPE_HOME" "$@" bash "$REFLECT_SH" sessionend
+  rc=$?
+  assert "$(( rc == 0 ? 0 : 1 ))" "dispatcher exits 0 (rc=$rc)"
+  after=$(find "$PIPE_DIR" -type f -name '*.json' 2>/dev/null | wc -l)
+  (( after - before == 1 )); assert $? "one skip record under skipped-pipeline/ ($(( after - before )) seen)"
+  sleep 0.5   # a wrongly-detached worker would have called the stub by now
+  (( $(call_count) == 0 )); assert $? "no model call ($(call_count) seen)"
+  [[ ! -d "$REFLECT_ROOT/sessions/$sid" ]]; assert $? "no session dir minted"
+}
+
+pipeline_case "sentinel CLAUDE_PIPELINE_INTERNAL=1 skips" \
+  "8ea0c109-1a2b-4c3d-9e8f-0000000000a1" "$PAYLOAD_CWD" CLAUDE_PIPELINE_INTERNAL=1
+if find "$PIPE_DIR" -type f -name '*.json' -print0 2>/dev/null \
+     | xargs -0 -r jq -e 'select(.session_id == "8ea0c109-1a2b-4c3d-9e8f-0000000000a1"
+                                 and .reason == "sentinel" and .mode == "sessionend")' >/dev/null 2>&1; then
+  ok "record names the session, the mode and reason=sentinel"
+else
+  bad "no sentinel skip record with session_id/mode/reason"
+fi
+pipeline_case "step-back classifier cwd skips" \
+  "8ea0c109-1a2b-4c3d-9e8f-0000000000a2" "$PIPE_HOME/.claude/step-back"
+pipeline_case "homunculus observer cwd skips" \
+  "8ea0c109-1a2b-4c3d-9e8f-0000000000a3" "$PIPE_HOME/.claude/homunculus/projects/abc123"
+
+t_begin "P1 control: a lookalike cwd and a falsy sentinel still reflect"
+reset_logs
+PIPE_CTRL_SID="8ea0c109-1a2b-4c3d-9e8f-0000000000a4"
+jq -cn --arg sid "$PIPE_CTRL_SID" --arg tp "$PARENT_TRANSCRIPT" --arg cwd "$PIPE_HOME/.claude/step-backup" \
+  '{session_id:$sid, transcript_path:$tp, cwd:$cwd, hook_event_name:"SessionEnd", reason:"other"}' \
+  | env HOME="$PIPE_HOME" CLAUDE_PIPELINE_INTERNAL=0 bash "$REFLECT_SH" sessionend
+wait_terminal "$REFLECT_ROOT/sessions/$PIPE_CTRL_SID/manifest.json" sessionend
+assert $? "a work session in ~/.claude/step-backup with CLAUDE_PIPELINE_INTERNAL=0 is reflected"
+
+t_begin "P1 control: a cwd that only textually starts under step-back still reflects"
+reset_logs
+PIPE_DOT_SID="8ea0c109-1a2b-4c3d-9e8f-0000000000a5"
+jq -cn --arg sid "$PIPE_DOT_SID" --arg tp "$PARENT_TRANSCRIPT" --arg cwd "$PIPE_HOME/.claude/step-back/../step-backup" \
+  '{session_id:$sid, transcript_path:$tp, cwd:$cwd, hook_event_name:"SessionEnd", reason:"other"}' \
+  | env HOME="$PIPE_HOME" bash "$REFLECT_SH" sessionend
+wait_terminal "$REFLECT_ROOT/sessions/$PIPE_DOT_SID/manifest.json" sessionend
+assert $? "a step-back/../step-backup cwd is normalized before the prefix test"
 
 # ===========================================================================
 # T2 — syntax + lint

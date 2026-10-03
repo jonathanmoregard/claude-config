@@ -397,9 +397,39 @@
         "hooks": [
           {
             "type": "command",
+            "command": "python3 $HOME/.claude/hooks/nixos-drift-health.py",
+            "timeout": 5,
+            "statusMessage": "Checking NixOS drift..."
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
             "command": "python3 -S -E $HOME/.claude/hooks/ai-router-health.py",
             "timeout": 5,
             "statusMessage": "Checking ai-router background health..."
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/hooks/unit-failure-health.py",
+            "timeout": 5,
+            "statusMessage": "Checking failed system units..."
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/hooks/reflect-backfill-health.py",
+            "timeout": 5,
+            "statusMessage": "Checking reflection backfill health..."
           }
         ]
       },
@@ -436,6 +466,16 @@
             "command": "python3 $HOME/.claude/hooks/bash-guard-health.py",
             "timeout": 10,
             "statusMessage": "Checking bash guard health..."
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/hooks/pending-for-human.py",
+            "timeout": 10,
+            "statusMessage": "Checking pending human blockers..."
           }
         ]
       },
