@@ -1926,7 +1926,7 @@ def _nixos_push_shapes(command: str) -> list[tuple[str, object]]:
 
 def _nixos_push_arg_lists(command: str) -> list[list[str]]:
     """The arguments after `push` for every literal, non-dry-run git push."""
-    return [a for kind, a in _nixos_push_shapes(command) if kind == "literal"]  # type: ignore[misc]
+    return [a for kind, a in _nixos_push_shapes(command) if kind == "literal" and isinstance(a, list)]
 
 
 def _nixos_ref_is_main(dst: str) -> bool:
