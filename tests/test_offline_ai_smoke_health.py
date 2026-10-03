@@ -102,6 +102,20 @@ def test_unreadable_file_is_announced(tmp_path):
     assert out["hookSpecificOutput"]["hookEventName"] == "SessionStart"
 
 
+def test_never_passed_is_announced_once_the_first_run_is_old(tmp_path):
+    # Nightly skips keep moving last_run; without first_run as the anchor a host that
+    # never passed would stay silent forever.
+    out = run(tmp_path, {"first_run": ago(11), "last_run": ago(0), "last_skip": ago(0),
+                         "skip_reason": "on battery"})
+    assert "has not passed since never" in out["systemMessage"]
+    assert "on battery" in out["systemMessage"]
+
+
+def test_never_passed_but_young_is_silent(tmp_path):
+    assert run(tmp_path, {"first_run": ago(2), "last_run": ago(0), "last_skip": ago(0),
+                          "skip_reason": "outside the night window 01-07 (hour 10)"}) is None
+
+
 def test_hook_is_registered_once_in_session_start():
     """The registration is the half most likely to be lost in a merge."""
     settings = json.loads((Path(REPO_ROOT) / "settings.json").read_text())

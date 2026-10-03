@@ -63,12 +63,18 @@ def main():
             f"offline-ai weekly smoke FAILED on {state.get('last_run', '?')}: {reason}. "
             "The local model may not load in an emergency. "
             "Check: journalctl --user -u offline-ai-smoke; offline-ai status")
-    reference = last_ok or last_run
+    first_run = parse(state.get("first_run"))
+    last_attempt = parse(state.get("last_attempt"))
+    # Skips refresh last_run every night, so a host that never passed needs an anchor
+    # that does not move: the first run, else the last attempt, else the last run.
+    reference = last_ok or first_run or last_attempt or last_run
     if reference and datetime.now(timezone.utc) - reference > timedelta(days=STALE_DAYS):
+        since = last_ok.date() if last_ok else f"never (first run {first_run.date() if first_run else 'unknown'})"
+        skipped = f", last skip: {state['skip_reason']}" if state.get("skip_reason") else ""
         return announce(
-            f"offline-ai weekly smoke has not passed since "
-            f"{last_ok.date() if last_ok else 'never'} (last run {last_run.date() if last_run else 'never'}, "
-            f"{state.get('status', '?')}: {reason}). "
+            f"offline-ai weekly smoke has not passed since {since} "
+            f"(last run {last_run.date() if last_run else 'never'}, "
+            f"{state.get('status', 'no verdict yet')}: {reason}{skipped}). "
             "Check: systemctl --user list-timers offline-ai-smoke.timer")
     return 0
 
