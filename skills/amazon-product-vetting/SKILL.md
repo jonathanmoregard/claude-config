@@ -1,6 +1,6 @@
 ---
 name: amazon-product-vetting
-description: Use whenever the user asks for a product recommendation — Amazon, Amazon.se/.de, eBay EU, Tradera, Sellpy, Vinted, Apotea, IKEA, Clas Ohlson, or any online shopping intent, new or second-hand. Triggers on phrases like "find me X on amazon", "I'm looking at tradera", "kolla på apotea", "gärna begagnad", "is X or Y good enough", "high rec/reviewed", "test winners", "bäst i test", "quality", "premium", "reasonable price", "sturdy", "well-reviewed", "recommend me a…", or when the user pastes a product listing / ASIN and asks whether it's any good. Also use when the user asks for a "few options" or "3 candidates" for a physical product. Do NOT skip this even if the user only gave a single constraint — Jonathan has a full litany of shopping criteria he assumes is baked in. Applies especially in the EU / Swedish market.
+description: Use whenever the user asks for a product recommendation — Amazon, Amazon.se/.de, eBay EU, Tradera, Sellpy, Vinted, Apotea, IKEA, Clas Ohlson, Elgiganten, Webhallen, Inet, Kjell, Biltema, Rusta, Apohem, Lyko, Bokus, Blocket, Jula, Prisjakt, PriceRunner, or any online shopping intent, new or second-hand. Triggers on phrases like "find me X on amazon", "I'm looking at tradera", "kolla på apotea", "kolla blocket", "finns den på elgiganten", "gärna begagnad", "is X or Y good enough", "high rec/reviewed", "test winners", "bäst i test", "quality", "premium", "reasonable price", "sturdy", "well-reviewed", "recommend me a…", or when the user pastes a product listing / ASIN and asks whether it's any good. Also use when the user asks for a "few options" or "3 candidates" for a physical product. Do NOT skip this even if the user only gave a single constraint — Jonathan has a full litany of shopping criteria he assumes is baked in. Applies especially in the EU / Swedish market.
 ---
 
 # Amazon Product Vetting
@@ -54,7 +54,10 @@ Access: every shopping lookup goes through `mcp__research-agent__research`, dept
 * Clas Ohlson: search-results JSON, not the search page (that shows top-sellers).
 * Sellpy: search page.
 * Apotea: search page `https://www.apotea.se/sok?q=<query>`.
-* Prisjakt/PriceRunner: not reachable (partner-only APIs).
+* Electronics: Elgiganten, Webhallen, Inet, Kjell & Company: search pages.
+* Home/tools: Biltema, Rusta: search pages; Biltema matches loosely, check titles.
+* Health/beauty: Apohem, Lyko: search pages; skip sponsored items. Books: Bokus search page.
+* Web search only (robots.txt/terms forbid automated search, or no working search URL): Blocket, NetOnNet, Jula, Bauhaus, Adlibris, CDON, Kronans Apotek, Naturkompaniet, Prisjakt, PriceRunner. Say "web search only" for them in the research prompt.
 
 ## 3. Build approximately three candidates
 
