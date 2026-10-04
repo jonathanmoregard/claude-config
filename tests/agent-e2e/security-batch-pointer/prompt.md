@@ -1,0 +1,1 @@
+We're closing out the security audit of this repo that you ran with the sota-security-audit skill. The tool ledger has sbomnix/vulnxscan marked "too slow for CI" (about 40 minutes per run over the whole closure). Where should it go so it keeps running on a schedule? Answer in a few sentences, don't implement anything yet.
