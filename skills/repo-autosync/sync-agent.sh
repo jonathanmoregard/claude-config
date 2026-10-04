@@ -245,7 +245,7 @@ THEN commit what is left — source, config, docs, notes. Group into logical com
 
 If you cannot tell whether something is runtime state or real content, leave it untracked and uncommitted rather than guessing — that outcome is logged for human review, not treated as a failure.
 
-After all commits are done, push origin $BRANCH once. Do nothing else."
+Do NOT push: this script secret-scans your commits and pushes them itself. Do nothing else."
 
 # Capture the agent's output as well as tee it to the log. Claude Code prints
 # "You've hit your org's monthly usage limit" and "API Error: ..." to stdout
@@ -254,11 +254,21 @@ After all commits are done, push origin $BRANCH once. Do nothing else."
 # ConnectionRefused, every one of them reported as "worktree still dirty".
 # The text is kept only to explain a failure the checks below detect, never to
 # declare one, so a commit message containing "API Error" cannot fake a fail.
+#
+# Where origin's branch stands BEFORE the agent runs. The agent must not push
+# (the wrapper scans, then pushes); if origin moved during the run, something
+# pushed unscanned commits, and the outgoing scan below would see nothing to
+# scan. Fail closed when origin cannot be read: the push needs it anyway.
+if ! remote_before="$(git ls-remote origin "refs/heads/$BRANCH")"; then
+  notify_failure "git ls-remote origin failed — cannot baseline the remote, nothing committed."
+  exit 1
+fi
 claude_rc=0
 claude_out="$(
   "$CLAUDE" \
     --model claude-sonnet-4-6 \
-    --allowedTools "Read Bash(git status:*) Bash(git diff:*) Bash(git add:*) Bash(git commit:*) Bash(git push:*) Bash(git log:*) Bash(git rm:*) Bash(git check-ignore:*) Bash($IGNORE_TOOL:*)" \
+    --allowedTools "Read Bash(git status:*) Bash(git diff:*) Bash(git add:*) Bash(git commit:*) Bash(git log:*) Bash(git rm:*) Bash(git check-ignore:*) Bash($IGNORE_TOOL:*)" \
+    --disallowedTools "Bash(*push*)" \
     -p "$PROMPT" 2>&1
 )" || claude_rc=$?
 printf '%s\n' "$claude_out"
@@ -289,13 +299,51 @@ fi
 # permanent red — nothing ever removes the file — so an untracked-only
 # leftover is logged, not escalated.
 tracked_dirty="$(git status --porcelain --untracked-files=no)"
-unpushed="$(git log --oneline "origin/$BRANCH..$BRANCH" 2>/dev/null || true)"
 
 if [ -n "$tracked_dirty" ]; then
   notify_failure "claude exited 0 but tracked changes are still uncommitted — sync incomplete.
 $(printf '%s\n' "$tracked_dirty" | head -20)$api_hint"
   exit 1
 fi
+
+# Scan exactly what would leave the machine, then push it ourselves. The scan
+# above saw only the files that were dirty BEFORE the agent ran; whatever the
+# agent wrote or committed afterwards was never checked, and the agent used to
+# push it itself. A repo with its own hooksPath never runs the global gitleaks
+# pre-commit hook, and `git commit --no-verify` skips it anywhere. Fail closed:
+# a scan that cannot run, or finds anything, means no push.
+#
+# `Bash(*push*)` is the agent's disallow rule because a `Bash(git push:*)`
+# PREFIX rule let `git -C "$PWD" push` through. The remote check is the
+# backstop for any push that got past the permission layer regardless.
+if ! remote_after="$(git ls-remote origin "refs/heads/$BRANCH")" ||
+  [ "$remote_after" != "$remote_before" ]; then
+  notify_failure "SECURITY: origin/$BRANCH MOVED during the agent run (or could not be re-read) — the agent may have pushed commits that were never secret-scanned. Nothing more pushed.
+before: ${remote_before:-<absent>}
+after:  ${remote_after:-<unreadable>}
+Inspect origin/$BRANCH by hand now."
+  exit 1
+fi
+git fetch -q origin "$BRANCH" 2>/dev/null || true
+if git rev-parse --verify --quiet "origin/$BRANCH" >/dev/null; then
+  outgoing_range="origin/$BRANCH..$BRANCH"
+else
+  outgoing_range="$BRANCH" # no remote branch yet: everything is outgoing
+fi
+if [ -n "$(git rev-list "$outgoing_range" 2>/dev/null | head -1)" ]; then
+  if ! gitleaks git --no-banner --redact --exit-code 1 --log-level error \
+    --log-opts="$outgoing_range" . >&2; then
+    notify_failure "gitleaks flagged the commits about to be pushed (or could not scan them) — NOT pushed.
+$(git log --oneline "$outgoing_range" | head -10)
+Remove the secret from those commits (they are local only), then re-run."
+    exit 1
+  fi
+  if ! git push origin "$BRANCH"; then
+    notify_failure "git push origin $BRANCH failed after a clean secret scan.$api_hint"
+    exit 1
+  fi
+fi
+unpushed="$(git log --oneline "origin/$BRANCH..$BRANCH" 2>/dev/null || true)"
 
 if [ -n "$unpushed" ]; then
   notify_failure "Commits were made but not pushed — origin/$BRANCH is behind.

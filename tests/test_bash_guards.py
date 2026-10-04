@@ -2068,7 +2068,10 @@ check(
 
 w = make_repo()
 dec, why = push_guard(w, command="git push origin main")
-check("pushing main itself -> allow (branch protection covers it)", dec is None,
+# Inverted by K01 (2026-10-03): the upstream protection does not bind admins,
+# so it never covered this. Main is auto-deployed as root; pushes go via a PR.
+check("pushing main itself -> deny (main changes go through a PR)",
+      dec == "deny" and "pull request" in why,
       f"decision={dec!r} {why[:200]}")
 
 w = branch_with(make_repo(remote_tail="someone-else/other-repo.git"),

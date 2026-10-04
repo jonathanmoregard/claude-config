@@ -387,6 +387,22 @@ class NixosPushGateSafetyTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
+    def test_push_from_main_is_refused_even_with_checklist(self) -> None:
+        # K01: the broker pushes refs/heads/<current>:refs/heads/<current>, so a
+        # push from main lands on main, which auto-deploys as root and whose
+        # upstream protection does not bind admins.
+        subprocess.run(["git", "-C", str(self.repo), "switch", "-q", "main"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.repo), "commit", "-q", "--allow-empty", "-m",
+             "x\n\nPre-push checklist:\n- Type: pure-data\n\n"
+             "Override: [skip-vm-gate] emergency"],
+            check=True,
+        )
+        result = self.server._check_nixos_push(f"git -C {self.repo} push origin")
+        self.assertIsNotNone(result)
+        self.assertIn("main", result)
+        self.assertIn("pull request", result)
+
     def test_diff_for_push_gate_cannot_execute_repo_local_external_command(self) -> None:
         marker = Path(self.temp.name) / "external-diff-executed"
         subprocess.run(

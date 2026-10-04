@@ -45,9 +45,9 @@
     "command": "/etc/profiles/per-user/jonathan/bin/uvx",
     "args": [
       "--with",
-      "mcp<2",
+      "mcp==1.30.0",
       "--from",
-      "mcp-server-reddit",
+      "mcp-server-reddit==0.2.1",
       "mcp-server-reddit"
     ],
     "env": {}
