@@ -88,7 +88,7 @@ The founder reviews rendered screens, not file lists or preview-pane screenshots
 
 1. **Export.** Share, Export, Project HTML, "Project archive" (instant, free; "Standalone HTML" spends usage). It downloads a zip of the whole project, so ask the founder before the first download.
 2. **Unzip** to `design-mirror/rN-export/`.
-3. **Render** every file with this round's suffix in a headless browser, full page: desktop at 1280 px from `X.html`, phone at 390 px from `X-phone.html` when it exists, else `X.html`. Log failed requests and `scrollWidth`; either one non-zero or over width is a defect to check before the founder sees it. Look at two renders yourself.
+3. **Render** every file with this round's suffix in a headless browser, full page: desktop at 1280 px from `X.html`, phone at 390 px from `X-phone.html` when it exists, else `X.html`. Do not use full-page capture: a sticky bar (e.g. a bottom submit button) is drawn at the first viewport's edge and covers content. Set the viewport height to the page's `scrollHeight`, then capture. Log failed requests and `scrollWidth`; either one non-zero or over width is a defect to check before the founder sees it. Look at two renders yourself.
 4. **Pair** each render with the current built screen of the same state ("now" vs "round N"). No built equivalent: show it as new. A pair that differs in state (e.g. built shot at a different level) gets a note saying so.
 5. **Tour**: a local slideshow (prev/next, desktop/phone, flip one image at full width, a Swedish toggle, one notes box per slide that autosaves to `notes.md`). Each slide's caption names the founder note it answers.
 6. Before writing the next brief, read `notes.md`; every note becomes a brief item or an answered question.
