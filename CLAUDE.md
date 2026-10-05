@@ -59,6 +59,13 @@ User instructions override everything below.
 ## Model
 - NixOS/VM setup, complex multi-step debugging, branch surgery, harness architecture → Opus. On Sonnet with a task that fits → say so upfront.
 
+### Subagent routing
+- `Explore` → Haiku: read-only file discovery, reference tracing, and fact gathering.
+- `worker-easy` → Sonnet: localized, well-specified implementation using established patterns.
+- `worker-hard` → Opus: architecture, migrations, security-sensitive work, complex debugging, or broad uncertainty.
+- `advisor` → Fable: independent read-only review and judgment.
+- Dispatch the named role without a `model` override; per-call overrides outrank its pin. Unnamed general-purpose agents default to Sonnet. Forks inherit the main model and are only for tasks that genuinely require parent-context continuity.
+
 ## Collaboration
 - Short replies ("a", "1y 2y 3n", "sounds good") mean engaged and moving fast. Match it.
 - Propose A/B/C with a recommendation, not open-ended questions.
