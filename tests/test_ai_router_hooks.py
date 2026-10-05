@@ -563,15 +563,14 @@ def test_settings_has_stop_failure_rate_limit_hook():
     }]
 
 
-def test_settings_has_agent_gate_pretooluse_hook():
+def test_settings_does_not_rewrite_native_agent_models():
     entries = _settings()["hooks"]["PreToolUse"]
-    matching = [e for e in entries if e.get("matcher") == "Agent"]
-    assert len(matching) == 1
-    assert matching[0]["hooks"] == [{
-        "type": "command",
-        "command": "python3 -S -E $HOME/.claude/hooks/ai-router-agent-gate.py",
-        "timeout": 15,
-    }]
+    commands = [
+        hook.get("command", "")
+        for entry in entries
+        for hook in entry.get("hooks", [])
+    ]
+    assert not any(command.endswith("hooks/ai-router-agent-gate.py") for command in commands)
 
 
 def test_stub_router_is_executable():

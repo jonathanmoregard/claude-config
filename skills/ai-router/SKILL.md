@@ -1,6 +1,6 @@
 ---
 name: ai-router
-description: Use when choosing which model or provider should run a subtask, when delegating work from Claude Code to Codex (or from Codex to Claude), when a usage cap or rate limit ("You've hit your", "usage limit", weekly limit, 5-hour limit) is near or hit, or when asked about quota headroom, load-spreading between the ChatGPT Pro and Claude Max plans, or running a job on gpt-5.6-sol/terra/luna from Claude. Also use before any Agent-tool dispatch that pins a model (opus, sonnet, haiku, fable).
+description: Use when choosing between Claude and Codex providers, delegating work across providers, handling a usage cap or rate limit ("You've hit your", "usage limit", weekly limit, 5-hour limit), checking quota headroom, load-spreading between the ChatGPT Pro and Claude Max plans, or running a job on gpt-5.6-sol/terra/luna from Claude. Native Claude-to-Claude subagents use the pinned role agents instead.
 ---
 
 # ai-router — cross-provider subagent routing
@@ -16,6 +16,12 @@ It picks a model by the operator-pinned ranking in
 headroom per provider (Codex via `codex app-server`, Claude via the statusline
 tee), then runs cross-provider work as a detached job you can wait on, peek
 into, and resume. Same-provider work stays native (see "Native vs delegate").
+
+Normal Claude-to-Claude routing does not use this router: `Explore` is Haiku,
+`worker-easy` is Sonnet, `worker-hard` is Opus, and `advisor` is Fable. Their
+full model IDs are pinned in `~/.claude/agents/`; do not override them per
+call. Use ai-router when provider selection or quota escape is actually part
+of the task.
 
 Pins (2026-09-14): `gpt-5.6-sol` > `claude-fable-5-1` > `claude-opus-5` >
 `gpt-5.6-terra` > `claude-sonnet-5` > `gpt-5.6-luna` >
@@ -40,18 +46,13 @@ never guessed.
    quota — only when the task itself needs one host (shared worktree, peek
    into the subagent, same-context resume).
 2. Read `native`:
-   - `native: true` → the pick is your own provider. Dispatch with your
-     native subagent tool and pass `model: <pick.model>` (Claude: the `Agent`
-     tool; Codex: never spawn natively — see below). You keep full
-     observability.
+   - `native: true` → the pick is your own provider. On Claude, dispatch the
+     appropriate named role (`Explore`, `worker-easy`, `worker-hard`, or
+     `advisor`) without a per-call model override. Codex never spawns natively
+     — see below.
    - `native: false` → cross-provider. Use `delegate` (below).
    - `ok: false` → nothing eligible in that tier; add `--allow-downgrade` or
      wait for the reset shown in `candidates[].why`.
-3. In Claude Code a `PreToolUse` hook on `Agent` applies this automatically:
-   it rewrites `model` to the eligible pick, or denies with the exact
-   `delegate` command to run when Claude is below reserve and Codex is not.
-   `AI_ROUTER_GATE=off` in the environment disables that gate for a session.
-
 Codex hosts: Codex→Codex is NEVER native (subagent model pinning is
 unreliable there); run `delegate --provider codex` or `--model` explicitly so
 the model is pinned per process. Pass `--host codex` when autodetection is in
@@ -154,4 +155,4 @@ never reorders the pins; changing them is an edit to `models.toml` through the
 `hooks/ai-router-*`, `hooks/statusline-quota-tee.sh` or this skill go through
 `~/worktrees/claude-<slug>/` off fresh `origin/master`, then a PR. Tests
 (pytest is nix-provided, not in the base python):
-`nix shell nixpkgs#python3Packages.pytest -c pytest -q tools/ai-router/tests tests/test_ai_router_hooks.py tests/test_ai_router_health.py`.
+`nix shell nixpkgs#python3Packages.pytest -c pytest -q tools/ai-router/tests tests/test_ai_router_hooks.py tests/test_ai_router_health.py tests/test_native_agent_routing.py`.
