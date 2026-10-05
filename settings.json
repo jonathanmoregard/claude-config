@@ -462,14 +462,6 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; f=/home/jonathan/.claude/token-optimizer/.security-alert; [ -f \"$f\" ] && echo \"[token-optimizer] SECURITY ALERT: $(cat $f)\" || true"
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
             "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; $HOME/.claude/nixos-reminder-hook.sh"
           }
         ]
@@ -726,16 +718,9 @@
     "skill-creator@claude-plugins-official": true,
     "spec-to-code-compliance@trailofbits": false,
     "static-analysis@trailofbits": false,
-    "token-optimizer@alexgreensh-token-optimizer": true,
     "typescript-lsp@claude-plugins-official": true
   },
   "extraKnownMarketplaces": {
-    "alexgreensh-token-optimizer": {
-      "source": {
-        "source": "directory",
-        "path": "/home/jonathan/Repos/token-optimizer"
-      }
-    },
     "caveman": {
       "source": {
         "source": "directory",

@@ -35,7 +35,8 @@ BASH = shutil.which("bash")
 
 STATUSLINE_STDIN = {
     "version": "2.1.270",
-    "model": {"id": "claude-fable-5-1"},
+    "model": {"id": "claude-fable-5-1", "display_name": "Fable 5.1"},
+    "context_window": {"used_percentage": 27.4},
     "rate_limits": {
         "five_hour": {"used_percentage": 12, "resets_at": 1789400000},
         "seven_day": {"used_percentage": 38, "resets_at": 1789805383},
@@ -77,6 +78,23 @@ def run_tee(stdin: bytes, env):
     return subprocess.run(
         [BASH, TEE], input=stdin, capture_output=True, timeout=20, env=env
     )
+
+
+def test_native_statusline_is_passive_and_compact(tmp_path):
+    env = base_env(tmp_path)
+    proc = run_tee(json.dumps(STATUSLINE_STDIN).encode(), env)
+    assert proc.returncode == 0
+    assert proc.stdout == b"Fable 5.1 \xc2\xb7 27% ctx \xc2\xb7 12% 5h \xc2\xb7 38% week\n"
+    assert proc.stderr == b""
+    snap = read_json(tmp_path / "state" / "quota" / "claude.json")
+    assert snap["rate_limits"] == STATUSLINE_STDIN["rate_limits"]
+
+
+def test_native_statusline_survives_garbage_stdin(tmp_path):
+    proc = run_tee(b"not json", base_env(tmp_path))
+    assert proc.returncode == 0
+    assert proc.stdout == b""
+    assert proc.stderr == b""
 
 
 def test_tee_passthrough_is_byte_identical_including_stderr_and_exit(

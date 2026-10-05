@@ -5,9 +5,9 @@
 # v2.1.80 it carries `rate_limits` (five_hour / seven_day … with
 # used_percentage + resets_at) once the first API response has arrived. This
 # wrapper tees that key into $AI_ROUTER_STATE/quota/claude.json — the RAW
-# snapshot the router's Claude quota probe reads — and then execs the real
-# statusline with the very same stdin bytes, so stdout, stderr and the exit
-# code are byte-identical to running it directly.
+# snapshot the router's Claude quota probe reads — and renders a small local
+# statusline. Tests can supply AI_ROUTER_STATUSLINE_CMD; that command receives
+# the same stdin bytes and its stdout, stderr and exit code are preserved.
 #
 # Invariants:
 #   * the tee half can never break the statusline (`|| true`, no `set -e`);
@@ -21,15 +21,15 @@
 #
 # Env:
 #   AI_ROUTER_STATE           state dir (default ~/.local/state/ai-router)
-#   AI_ROUTER_STATUSLINE_CMD  real statusline command line (tests); default
-#                             is the token-optimizer statusline below.
+#   AI_ROUTER_STATUSLINE_CMD  optional statusline command line (tests/custom)
 set -u
-
-REAL_CMD="${AI_ROUTER_STATUSLINE_CMD:-node '/home/jonathan/Repos/token-optimizer/skills/token-optimizer/scripts/statusline.js'}"
 
 # Capture stdin once; if that is impossible, run the statusline untouched.
 tmp_in="$(mktemp "${TMPDIR:-/tmp}/statusline-stdin.XXXXXX" 2>/dev/null)" || {
-  eval "exec $REAL_CMD"
+  if [ -n "${AI_ROUTER_STATUSLINE_CMD:-}" ]; then
+    eval "exec $AI_ROUTER_STATUSLINE_CMD" < /dev/null
+  fi
+  exit 0
 }
 cat > "$tmp_in" 2>/dev/null || true
 
@@ -77,9 +77,51 @@ PY
 
 ( tee_quota ) 2>/dev/null || true
 
-# Hand the captured bytes to the real statusline as its stdin, unlink the
-# temp file first (the open fd keeps it readable), then replace this process.
-exec 3< "$tmp_in" || { rm -f "$tmp_in"; eval "exec $REAL_CMD" < /dev/null; }
+if [ -n "${AI_ROUTER_STATUSLINE_CMD:-}" ]; then
+  # Hand the captured bytes to the custom statusline, unlink the temp file
+  # first (the open fd keeps it readable), then replace this process.
+  exec 3< "$tmp_in" || { rm -f "$tmp_in"; eval "exec $AI_ROUTER_STATUSLINE_CMD" < /dev/null; }
+  rm -f "$tmp_in"
+  exec 0<&3 3<&-
+  eval "exec $AI_ROUTER_STATUSLINE_CMD"
+fi
+
+# Native passive renderer: local JSON parsing only, with no model/API calls.
+if command -v jq >/dev/null 2>&1; then
+  jq -r '
+    def pct($label; $value):
+      if $value == null then empty
+      else (($value | round | tostring) + "% " + $label)
+      end;
+    [
+      (.model.display_name // .model.id // "Claude"),
+      pct("ctx"; .context_window.used_percentage?),
+      pct("5h"; .rate_limits.five_hour.used_percentage?),
+      pct("week"; .rate_limits.seven_day.used_percentage?)
+    ] | join(" · ")
+  ' "$tmp_in" 2>/dev/null || true
+else
+  python3 -S -E - "$tmp_in" 2>/dev/null <<'PY' || true
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        data = json.load(fh)
+except Exception:
+    raise SystemExit(0)
+
+model = data.get("model") or {}
+parts = [model.get("display_name") or model.get("id") or "Claude"]
+for label, path in (
+    ("ctx", ("context_window", "used_percentage")),
+    ("5h", ("rate_limits", "five_hour", "used_percentage")),
+    ("week", ("rate_limits", "seven_day", "used_percentage")),
+):
+    value = data
+    for key in path:
+        value = value.get(key) if isinstance(value, dict) else None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        parts.append(f"{round(value)}% {label}")
+print(" · ".join(parts))
+PY
+fi
 rm -f "$tmp_in"
-exec 0<&3 3<&-
-eval "exec $REAL_CMD"

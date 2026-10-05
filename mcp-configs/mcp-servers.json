@@ -120,11 +120,6 @@
       "url": "http://localhost:18801/mcp",
       "description": "Multi-agent orchestration — dispatch parallel Claude Code agents in isolated worktrees. Plan projects, auto-chain missions, read structured reports. Repo: https://github.com/LEC-AI/claude-devfleet"
     },
-    "token-optimizer": {
-      "command": "npx",
-      "args": ["-y", "token-optimizer-mcp"],
-      "description": "Token optimization for 95%+ context reduction via content deduplication and compression"
-    },
     "laraplugins": {
       "type": "http",
       "url": "https://laraplugins.io/mcp/plugins",
