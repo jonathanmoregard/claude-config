@@ -55,7 +55,9 @@ def record_from(payload: object) -> dict[str, object] | None:
     expected = expected_family(agent_type, requested)
     resolved_family = family(resolved)
     models_used = response.get("modelsUsed")
-    if not isinstance(models_used, list):
+    if isinstance(models_used, list):
+        models_used = [model for model in models_used if isinstance(model, str)]
+    else:
         models_used = None
     return {
         "observed_at": int(time.time()),

@@ -16,8 +16,10 @@ seen = {(row.get("agent_type"), row.get("resolved_model"), row.get("mismatch")) 
 required = {
     ("Explore", "claude-haiku-4-5-20251001", False),
     ("worker-easy", "claude-sonnet-5-5", False),
+    ("worker-hard", "claude-opus-5-5", False),
+    ("advisor", "claude-fable-5-1", False),
 }
 raise SystemExit(0 if required <= seen else 1)
 PY
 
-pass "Explore resolved to Haiku and worker-easy resolved to Sonnet"
+pass "all four native roles resolved to their pinned model families"

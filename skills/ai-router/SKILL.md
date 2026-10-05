@@ -46,10 +46,10 @@ never guessed.
    quota — only when the task itself needs one host (shared worktree, peek
    into the subagent, same-context resume).
 2. Read `native`:
-   - `native: true` → the pick is your own provider. Dispatch with your
-     native subagent tool and pass `model: <pick.model>` (Claude: the `Agent`
-     tool; Codex: never spawn natively — see below). You keep full
-     observability.
+   - `native: true` → the pick is your own provider. On Claude, dispatch the
+     appropriate named role (`Explore`, `worker-easy`, `worker-hard`, or
+     `advisor`) without a per-call model override. Codex never spawns natively
+     — see below.
    - `native: false` → cross-provider. Use `delegate` (below).
    - `ok: false` → nothing eligible in that tier; add `--allow-downgrade` or
      wait for the reset shown in `candidates[].why`.

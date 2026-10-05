@@ -82,6 +82,7 @@ def test_unspecified_agents_default_to_current_sonnet():
 def test_named_roles_pin_full_model_ids():
     expected = {
         "Explore.md": ("Explore", "claude-haiku-4-5-20251001"),
+        "general-purpose.md": ("general-purpose", "claude-sonnet-5-5"),
         "worker-easy.md": ("worker-easy", "claude-sonnet-5-5"),
         "worker-hard.md": ("worker-hard", "claude-opus-5-5"),
         "advisor.md": ("advisor", "claude-fable-5-1"),
@@ -90,6 +91,11 @@ def test_named_roles_pin_full_model_ids():
         metadata = frontmatter(REPO_ROOT / "agents" / filename)
         assert metadata["name"] == name
         assert metadata["model"] == model
+
+
+def test_default_general_purpose_agent_does_not_inherit_xhigh_effort():
+    metadata = frontmatter(REPO_ROOT / "agents" / "general-purpose.md")
+    assert metadata["effort"] == "medium"
 
 
 def test_settings_observes_resolved_agent_models_without_a_model_hook():
@@ -122,6 +128,26 @@ def test_observer_records_expected_and_resolved_models_without_prompt_text(tmp_p
     assert record["mismatch"] is False
     raw = (tmp_path / "state" / "native-agent-routes.jsonl").read_text(encoding="utf-8")
     assert "SECRET_PROMPT" not in raw and "SECRET_RESULT" not in raw
+
+
+def test_observer_whitelists_models_used_to_strings(tmp_path):
+    body = payload("worker-easy", "claude-sonnet-5-5")
+    body["tool_response"]["modelsUsed"] = [
+        "claude-sonnet-5-5",
+        {"model": "claude-opus-5-5", "prompt": "SECRET_NESTED_PROMPT"},
+        42,
+    ]
+    proc = run_observer(tmp_path, body)
+    assert proc.returncode == 0
+    assert records(tmp_path)[0]["models_used"] == ["claude-sonnet-5-5"]
+    raw = (tmp_path / "state" / "native-agent-routes.jsonl").read_text(encoding="utf-8")
+    assert "SECRET_NESTED_PROMPT" not in raw
+
+
+def test_ai_router_native_path_does_not_override_named_agent_models():
+    skill = (REPO_ROOT / "skills" / "ai-router" / "SKILL.md").read_text(encoding="utf-8")
+    assert "pass `model: <pick.model>`" not in skill
+    assert "without a per-call model override" in skill
 
 
 def test_observer_flags_a_named_role_overridden_to_the_wrong_family(tmp_path):

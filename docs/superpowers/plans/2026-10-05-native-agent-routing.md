@@ -4,7 +4,7 @@
 
 **Goal:** Route exploration to Haiku, routine implementation to Sonnet, hard implementation to Opus, and advisory review to Fable without relying on ai-router model rewrites.
 
-**Architecture:** Claude Code's native model precedence is the source of truth. `CLAUDE_CODE_SUBAGENT_MODEL` supplies the Sonnet default, pinned custom agents override it for Explore/easy/hard/advisory roles, and the ai-router remains an explicit cross-provider CLI only. A synchronous observation-only PostToolUse hook records the requested and resolved model without prompts or model calls.
+**Architecture:** Claude Code's native model precedence is the source of truth. A custom general-purpose agent supplies the Sonnet/medium default, pinned custom agents override it for Explore/easy/hard/advisory roles, and the ai-router remains an explicit cross-provider CLI only. A synchronous observation-only PostToolUse hook records the requested and resolved model without prompts or model calls.
 
 **Tech Stack:** Claude Code 2.1.289 settings and custom-agent frontmatter, Python 3 standard-library hooks, pytest, agent-config-e2e.
 
@@ -91,7 +91,7 @@ nix shell nixpkgs#python3Packages.pytest -c pytest -q \
 
 - [ ] **Step 1: Build a two-route scenario**
 
-Ask a real headless parent to delegate one read-only discovery task and one routine implementation task. Grade the Agent tool results and subagent transcripts, not the parent's prose: Explore must resolve to Haiku and the easy worker to Sonnet.
+Ask a real headless parent to delegate one task to each native role. Grade the Agent tool results and subagent transcripts, not the parent's prose: Explore must resolve to Haiku, the easy worker to Sonnet, the hard worker to Opus, and the advisor to Fable.
 
 - [ ] **Step 2: Probe the new arm once**
 
