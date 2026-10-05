@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Dedicated, contained Git mutation broker over stdio MCP.
+"""Dedicated, contained Git and GitHub PR mutation broker over stdio MCP.
 
 The server exposes one structured ``git`` tool. It never accepts shell text or
-raw argv. Every operation is validated before Git runs without a shell inside
-a broker-owned bubblewrap boundary. Repository-local execution config is
-masked and network exists only for validated fetch and push operations.
+raw argv. Every operation is validated before the corresponding client runs
+without a shell inside a broker-owned bubblewrap boundary. Repository-local
+execution config is masked and network exists only for validated fetch, push,
+and PR-creation operations.
 
 Protocol: MCP 2024-11-05 over stdio, JSON-RPC 2.0 line-delimited.
 """
@@ -242,6 +243,7 @@ _GIT_OPERATIONS = frozenset(
         "push",
         "switch",
         "worktree_add",
+        "pr_create",
     }
 )
 _GIT_OPERATION_FIELDS = {
@@ -254,6 +256,7 @@ _GIT_OPERATION_FIELDS = {
     "push": frozenset({"remote"}),
     "switch": frozenset({"branch", "create", "start_point"}),
     "worktree_add": frozenset({"worktree_path", "branch", "start_point"}),
+    "pr_create": frozenset({"base", "title", "body"}),
 }
 _GIT_BASE_FIELDS = frozenset({"repo_path", "operation", "timeout"})
 _BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
@@ -421,6 +424,31 @@ def _validate_git_request(args: object, policy: dict) -> dict:
         request["branch"] = _validate_branch(args.get("branch"))
         if "start_point" in args:
             request["start_point"] = _validate_start_point(args["start_point"])
+    elif operation == "pr_create":
+        base = _validate_branch(args.get("base"), "base")
+        title = args.get("title")
+        if (
+            not isinstance(title, str)
+            or not title.strip()
+            or "\x00" in title
+            or "\n" in title
+            or "\r" in title
+            or len(title) > 256
+        ):
+            raise RuntimeError("PR title must be one non-empty line of at most 256 characters")
+        body = args.get("body")
+        if (
+            not isinstance(body, str)
+            or not body.strip()
+            or "\x00" in body
+            or len(body) > 100_000
+        ):
+            raise RuntimeError("PR body must be non-empty and at most 100000 characters")
+        if any(_redact_secrets(value) != value for value in (base, title, body)):
+            raise RuntimeError("PR base, title, or body contains a recognizable secret")
+        request["base"] = base
+        request["title"] = title
+        request["body"] = body
     return request
 
 
@@ -641,6 +669,17 @@ def _validate_remote_url(url: object, policy: dict) -> str:
     return url
 
 
+def _github_repo_from_remote(url: object, policy: dict) -> str:
+    """Return owner/repository only after the origin URL passes policy."""
+    remote = _validate_remote_url(url, policy)
+    scp = re.fullmatch(
+        r"git@([A-Za-z0-9.-]+):([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?)",
+        remote,
+    )
+    path = scp.group(2) if scp is not None else urlparse(remote).path.removeprefix("/")
+    return path.removesuffix(".git")
+
+
 def _fixed_git_config(policy: dict) -> list[str]:
     credential_helper = _resolve_required_executable(
         policy, "credentialHelperExecutable"
@@ -762,6 +801,37 @@ def _build_git_argv(
     return argv
 
 
+def _build_pr_create_argv(
+    request: dict,
+    policy: dict,
+    *,
+    remote_url: str | None,
+    current_branch: str | None,
+) -> list[str]:
+    if remote_url is None:
+        raise RuntimeError("pr_create requires a validated origin remote URL")
+    if current_branch is None:
+        raise RuntimeError("pr_create requires a validated current branch")
+    repository = _github_repo_from_remote(remote_url, policy)
+    head = _validate_branch(current_branch, "current branch")
+    gh = _resolve_required_executable(policy, "credentialHelperExecutable")
+    return [
+        gh,
+        "pr",
+        "create",
+        "--repo",
+        repository,
+        "--base",
+        request["base"],
+        "--head",
+        head,
+        "--title",
+        request["title"],
+        "--body",
+        request["body"],
+    ]
+
+
 def _sandbox_parent_dirs(path: Path, hidden_roots: tuple[Path, ...]) -> list[Path]:
     for root in hidden_roots:
         if path == root or root in path.parents:
@@ -788,7 +858,7 @@ def _build_git_sandbox(
 ) -> tuple[list[str], dict[str, str]]:
     """Build a bubblewrap command with only selected Git state writable."""
     bwrap = _resolve_required_executable(policy, "bubblewrapExecutable")
-    networked = request["operation"] in {"fetch", "push"}
+    networked = request["operation"] in {"fetch", "push", "pr_create"}
     home = Path.home().resolve()
     runtime_dir = Path(f"/run/user/{os.getuid()}")
     hidden_roots = (home, Path("/tmp"), runtime_dir)
@@ -821,13 +891,14 @@ def _build_git_sandbox(
     binds: list[tuple[str, Path]] = []
     worktree_mode = (
         "--ro-bind"
-        if request["operation"] in {"fetch", "worktree_add"}
+        if request["operation"] in {"fetch", "worktree_add", "pr_create"}
         else "--bind"
     )
     binds.append((worktree_mode, identity.worktree))
-    binds.append(("--bind", identity.common_dir))
+    metadata_mode = "--ro-bind" if request["operation"] == "pr_create" else "--bind"
+    binds.append((metadata_mode, identity.common_dir))
     if not _path_within(identity.git_dir, (identity.common_dir,)):
-        binds.append(("--bind", identity.git_dir))
+        binds.append((metadata_mode, identity.git_dir))
     if request["operation"] == "worktree_add":
         binds.append(("--bind", request["worktree_path"]))
     trusted_hooks: Path = policy["trustedHooksDir"]
@@ -854,10 +925,11 @@ def _build_git_sandbox(
         if remote_url is None:
             raise RuntimeError("network Git operation requires a validated remote URL")
         _validate_remote_url(remote_url, policy)
+        uses_github_api = request["operation"] == "pr_create"
         is_https = remote_url.startswith("https://")
         credential_paths = (
             (policy["githubConfigDir"], policy["userBusSocket"])
-            if is_https
+            if is_https or uses_github_api
             else (policy["sshKnownHostsFile"],)
         )
         for path in credential_paths:
@@ -866,10 +938,14 @@ def _build_git_sandbox(
                     f"BROKEN safety boundary: required credential path is unavailable: {path}"
                 )
             binds.append(("--ro-bind", path))
-        if is_https:
+        if is_https or uses_github_api:
             env["DBUS_SESSION_BUS_ADDRESS"] = (
                 "unix:path=" + str(policy["userBusSocket"])
             )
+            if uses_github_api:
+                env["GH_PROMPT_DISABLED"] = "1"
+                env["GH_NO_UPDATE_NOTIFIER"] = "1"
+                env["NO_COLOR"] = "1"
         else:
             socket_value = (
                 ssh_auth_sock if ssh_auth_sock is not None else os.environ.get("SSH_AUTH_SOCK")
@@ -916,7 +992,7 @@ def _network_git_context(
     request: dict, identity: _GitIdentity, policy: dict
 ) -> tuple[str | None, str | None]:
     operation = request["operation"]
-    if operation not in {"fetch", "push"}:
+    if operation not in {"fetch", "push", "pr_create"}:
         return None, None
     git = _resolve_required_executable(policy, "gitExecutable")
     url_argv = [
@@ -928,7 +1004,7 @@ def _network_git_context(
         "remote",
         "get-url",
     ]
-    if operation == "push":
+    if operation in {"push", "pr_create"}:
         url_argv.append("--push")
     url_argv.extend(("--all", "origin"))
     remote = _run_git_discovery(url_argv, policy)
@@ -943,7 +1019,7 @@ def _network_git_context(
     remote_url = _validate_remote_url(urls[0], policy)
 
     branch: str | None = None
-    if operation == "push":
+    if operation in {"push", "pr_create"}:
         current = _run_git_discovery(
             [
                 git,
@@ -959,7 +1035,7 @@ def _network_git_context(
             policy,
         )
         if current.returncode != 0:
-            raise RuntimeError("push requires a non-detached current branch")
+            raise RuntimeError(f"{operation} requires a non-detached current branch")
         branch = _validate_branch((current.stdout or "").strip(), "current branch")
     return remote_url, branch
 
@@ -1007,6 +1083,18 @@ def _dcg_command_for_git_request(request: dict) -> str:
         )
         if request.get("start_point"):
             argv.append(request["start_point"])
+    elif operation == "pr_create":
+        argv = [
+            "gh",
+            "pr",
+            "create",
+            "--base",
+            request["base"],
+            "--title",
+            request["title"],
+            "--body",
+            request["body"],
+        ]
     else:
         raise RuntimeError(f"unsupported Git operation: {operation!r}")
     return shlex.join(argv)
@@ -1850,7 +1938,7 @@ TOOLS = [
     {
         "name": "git",
         "description": (
-            "Runs one policy-approved Git operation in a validated repository. "
+            "Runs one policy-approved Git or GitHub PR operation in a validated repository. "
             "The tool accepts structured fields only, never shell text or raw argv."
         ),
         "inputSchema": {
@@ -1872,6 +1960,7 @@ TOOLS = [
                         "push",
                         "switch",
                         "worktree_add",
+                        "pr_create",
                     ],
                 },
                 "paths": {
@@ -1886,6 +1975,9 @@ TOOLS = [
                 "create": {"type": "boolean"},
                 "start_point": {"type": "string"},
                 "worktree_path": {"type": "string"},
+                "base": {"type": "string"},
+                "title": {"type": "string"},
+                "body": {"type": "string"},
                 "staged": {"type": "boolean"},
                 "max_count": {"type": "integer", "minimum": 1, "maximum": 200},
                 "timeout": {
@@ -1901,7 +1993,7 @@ TOOLS = [
 ]
 
 
-SERVER_INFO = {"name": "git-broker", "version": "1.0.0"}
+SERVER_INFO = {"name": "git-broker", "version": "1.1.0"}
 CAPABILITIES = {"tools": {"listChanged": False}}
 
 
@@ -2068,13 +2160,21 @@ def _tool_git(args: dict, rec: Optional[_InFlight] = None) -> str:
     created_target = _prepare_worktree_target(request)
     completed = False
     try:
-        git_argv = _build_git_argv(
-            request,
-            identity,
-            policy,
-            remote_url=remote_url,
-            current_branch=current_branch,
-        )
+        if request["operation"] == "pr_create":
+            git_argv = _build_pr_create_argv(
+                request,
+                policy,
+                remote_url=remote_url,
+                current_branch=current_branch,
+            )
+        else:
+            git_argv = _build_git_argv(
+                request,
+                identity,
+                policy,
+                remote_url=remote_url,
+                current_branch=current_branch,
+            )
         sandbox_argv, env = _build_git_sandbox(
             request,
             identity,
