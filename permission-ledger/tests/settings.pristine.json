@@ -127,14 +127,6 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; f=/home/jonathan/.claude/token-optimizer/.security-alert; [ -f \"$f\" ] && echo \"[token-optimizer] SECURITY ALERT: $(cat $f)\" || true"
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
             "command": "(CLV2_PYTHON_CMD=python3 ECC_OBSERVER_TIMEOUT_SECONDS=300 ~/.claude/skills/continuous-learning-v2/agents/start-observer.sh start >/dev/null 2>&1 &) || true",
             "timeout": 3,
             "statusMessage": "Launching instinct observer..."
@@ -256,7 +248,7 @@
   },
   "statusLine": {
     "type": "command",
-    "command": "node '/home/jonathan/Repos/token-optimizer/skills/token-optimizer/scripts/statusline.js'"
+    "command": "bash $HOME/.claude/hooks/statusline-quota-tee.sh"
   },
   "enabledPlugins": {
     "skill-creator@claude-plugins-official": true,
@@ -276,8 +268,7 @@
     "debug-buttercup@trailofbits": false,
     "spec-to-code-compliance@trailofbits": false,
     "entry-point-analyzer@trailofbits": false,
-    "caveman@caveman": true,
-    "token-optimizer@alexgreensh-token-optimizer": true
+    "caveman@caveman": true
   },
   "extraKnownMarketplaces": {
     "caveman": {
@@ -290,12 +281,6 @@
       "source": {
         "source": "directory",
         "path": "/home/jonathan/.claude/plugins/marketplaces/jonathanmoregard"
-      }
-    },
-    "alexgreensh-token-optimizer": {
-      "source": {
-        "source": "directory",
-        "path": "/home/jonathan/Repos/token-optimizer"
       }
     },
     "nix-search-marketplace": {

@@ -146,7 +146,7 @@ DC_JSON="$REPO_PATH/.devcontainer/devcontainer.json"
 #   - Append firewall init to postCreateCommand.
 # Existing mounts/commands are preserved.
 
-# Build mount list. Token dir always required (created above). Other sources
+# Build mount list. GitHub token dir is always required (created above). Other sources
 # only contributed if present on host, so Docker doesn't silently create empty
 # dirs or fail the run with "bind source does not exist".
 MOUNTS_JSON=$(jq -n '[]')
@@ -159,13 +159,10 @@ add_mount() {
     fi
 }
 
-# Token dir (always present — just created).
+# GitHub token dir (always present — just created).
 MOUNTS_JSON=$(printf '%s' "$MOUNTS_JSON" | jq \
     --arg m 'source=${localEnv:HOME}/.cache/gh-tokens/${localWorkspaceFolderBasename},target=/run/gh-token,type=bind,readonly' \
     '. + [$m]')
-
-add_mount 'source=${localEnv:HOME}/Repos/token-optimizer,target=/opt/token-optimizer,type=bind,readonly' \
-    /opt/token-optimizer "$HOME/Repos/token-optimizer"
 
 # Selective read-only mounts of host ~/.claude/ — share global config/skills.
 # NOT mounted: .credentials.json, projects/, memory/, settings.local.json,
@@ -237,20 +234,6 @@ if [ ! -f "$HOME/.claude/settings.json" ]; then
     echo '{}' > "$HOME/.claude/settings.json"
 fi
 
-# Token-optimizer: enable the plugin from the read-only mount at /opt/token-optimizer.
-if [ -d /opt/token-optimizer ]; then
-    TMP=$(mktemp)
-    jq '
-        .enabledPlugins["token-optimizer@alexgreensh-token-optimizer"] = true
-        | .extraKnownMarketplaces["alexgreensh-token-optimizer"] = {
-            source: { source: "directory", path: "/opt/token-optimizer" }
-          }
-        | .statusLine = {
-            type: "command",
-            command: "node /opt/token-optimizer/skills/token-optimizer/scripts/statusline.js"
-          }
-    ' "$HOME/.claude/settings.json" > "$TMP" && mv "$TMP" "$HOME/.claude/settings.json"
-fi
 EOS
 chmod +x "$POST_SCRIPT"
 
