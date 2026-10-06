@@ -1,0 +1,22 @@
+{
+  "agentE2eBroker": {
+    "version": 1,
+    "repo": "/home/jonathan/.claude",
+    "harness": "scripts/agent-e2e/agent_e2e.py",
+    "scenarioRoot": "tests/agent-e2e",
+    "claudeExecutable": "/home/jonathan/.local/bin/claude",
+    "outputRoot": "/tmp/agent-e2e-broker",
+    "path": [
+      "/home/jonathan/.local/bin",
+      "/etc/profiles/per-user/jonathan/bin",
+      "/run/current-system/sw/bin"
+    ],
+    "models": ["haiku", "sonnet"],
+    "maxSamples": 2,
+    "maxJobs": 2,
+    "maxBudgetUsd": 3.0,
+    "maxTimeoutSec": 900,
+    "maxCallSec": 3600,
+    "outputLimitChars": 20000
+  }
+}
