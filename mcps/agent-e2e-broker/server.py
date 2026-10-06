@@ -218,8 +218,8 @@ def _run_argv(argv: list[str], env: dict, timeout_s: int, rec: Optional[_InFligh
     def signal_group(sig: int) -> None:
         try:
             os.killpg(proc.pid, sig)
-        except OSError:
-            pass
+        except ProcessLookupError:
+            pass  # already exited
 
     if rec is not None:
         with _in_flight_lock:
@@ -379,8 +379,8 @@ def _on_cancelled(req_id) -> None:
     if proc is not None:
         try:
             os.killpg(proc.pid, signal.SIGTERM)
-        except OSError:
-            pass
+        except ProcessLookupError:
+            pass  # already exited
 
 
 def _dispatch_tools_call(msg_id, params, rec) -> None:
