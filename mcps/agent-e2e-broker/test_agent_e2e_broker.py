@@ -144,7 +144,7 @@ class RefPolicyTests(Fixture):
     def test_harness_must_be_master_and_clean(self) -> None:
         self.server._check_harness(self.policy)
         (self.repo / "scripts/agent-e2e/agent_e2e.py").write_text("print('pwn')\n")
-        with self.assertRaisesRegex(RuntimeError, "modified"):
+        with self.assertRaisesRegex(RuntimeError, "differs"):
             self.server._check_harness(self.policy)
         git(self.repo, "checkout", "-q", "--", ".")
         git(self.repo, "switch", "-q", "feat/x")
@@ -180,6 +180,81 @@ class RunTests(Fixture):
                              capture_output=True, text=True, timeout=30).stdout.splitlines()
         tools = json.loads(out[1])["result"]["tools"]
         self.assertEqual([t["name"] for t in tools], ["run"])
+
+
+class ReviewFindingTests(Fixture):
+    def test_planted_remote_tracking_ref_refused(self) -> None:
+        git(self.repo, "switch", "-qc", "unpushed")
+        (self.repo / "CLAUDE.md").write_text("CANDIDATE planted\n")
+        git(self.repo, "commit", "-qam", "planted")
+        sha = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "switch", "-q", "master")
+        git(self.repo, "update-ref", "refs/remotes/origin/zz", sha)
+        with self.assertRaises(RuntimeError) as ctx:
+            self.server._tool_run(self.req(new_ref="origin/zz"))
+        self.assertIn("does not exist", str(ctx.exception))
+
+    def test_unreachable_origin_fails_closed(self) -> None:
+        git(self.repo, "remote", "set-url", "origin", str(self.repo.parent / "gone.git"))
+        with self.assertRaisesRegex(RuntimeError, "fetch"):
+            self.server._tool_run(self.req())
+
+    def test_unpushed_harness_commit_on_master_refused(self) -> None:
+        (self.repo / "scripts/agent-e2e/agent_e2e.py").write_text("print('local')\n")
+        git(self.repo, "commit", "-qam", "local harness")
+        with self.assertRaisesRegex(RuntimeError, "origin/master"):
+            self.server._tool_run(self.req())
+
+    def test_redacts_private_and_age_keys(self) -> None:
+        key = "AGE-SECRET-KEY-1" + "Q" * 58
+        pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----"
+        out = self.server._redact(f"{key}\n{pem}\nAKIA" + "A" * 16)
+        self.assertNotIn(key, out)
+        self.assertNotIn("abc", out)
+        self.assertNotIn("AKIA" + "A" * 16, out)
+
+    def test_broker_death_stops_harness_and_keeps_lock_until_then(self) -> None:
+        import fcntl, signal, time
+        root = Path(self.tmp.name)
+        # The run dir is the one path bwrap binds back into its private /tmp.
+        self.claude.write_text("#!/usr/bin/env bash\ntouch \"$E2E_RUN/started\"\nsleep 30\n")
+        broker = root / "broker"
+        broker.mkdir()
+        shutil.copy(SERVER, broker / "server.py")
+        (broker / "config.json").write_text(json.dumps({"agentE2eBroker": self.raw}))
+        proc = subprocess.Popen([sys.executable, str(broker / "server.py")],
+                                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, text=True)
+        call = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "run", "arguments": self.req(timeout_sec=60)}}
+        proc.stdin.write(json.dumps(call) + "\n")
+        proc.stdin.flush()
+        deadline = time.monotonic() + 30
+        while not list(self.out.glob("*/runs/demo/*/*/started")) \
+                and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertTrue(list(self.out.glob("*/runs/demo/*/*/started")),
+                        "stub claude never started")
+        proc.kill()
+        proc.wait()
+        deadline = time.monotonic() + 15
+        freed = False
+        while time.monotonic() < deadline:
+            harness = subprocess.run(["pgrep", "-f", f"{self.out}/.*runs"],
+                                     capture_output=True, text=True).stdout.split()
+            with open(self.out / ".lock", "w") as fh:
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = False
+                except BlockingIOError:
+                    locked = True
+            # The lock may be free only once no harness is left running.
+            self.assertFalse(harness and not locked, "harness runs without the lock")
+            if not harness and not locked:
+                freed = True
+                break
+            time.sleep(0.2)
+        self.assertTrue(freed, "harness outlived the broker")
 
 
 if __name__ == "__main__":

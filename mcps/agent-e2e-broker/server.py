@@ -25,6 +25,7 @@ import json
 import math
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -166,14 +167,15 @@ def _git(policy: dict, *argv: str, timeout: int = 60, env: Optional[dict] = None
 
 
 def _check_harness(policy: dict) -> Path:
-    """The harness runs from the live checkout: master, harness file unmodified."""
+    """The harness runs from the live checkout: master, harness as merged on origin/master."""
     head = _git(policy, "symbolic-ref", "--short", "HEAD")
     if head.returncode != 0 or head.stdout.strip() != "master":
         raise RuntimeError(f"BROKEN safety boundary: {policy['repo']} is not on master")
     rel = policy["harness"]
     if _git(policy, "ls-files", "--error-unmatch", "--", rel).returncode != 0 \
-            or _git(policy, "diff", "--quiet", "HEAD", "--", rel).returncode != 0:
-        raise RuntimeError(f"BROKEN safety boundary: harness {rel} is untracked or modified")
+            or _git(policy, "diff", "--quiet", "origin/master", "--", rel).returncode != 0:
+        raise RuntimeError(f"BROKEN safety boundary: harness {rel} is untracked or differs "
+                           "from origin/master")
     return policy["repo"] / rel
 
 
@@ -211,9 +213,28 @@ def _extract_scenarios(policy: dict, sha: str, dest: Path) -> None:
         raise RuntimeError(f"could not extract {policy['scenarioRoot']} from {sha}")
 
 
-def _run_argv(argv: list[str], env: dict, timeout_s: int, rec: Optional[_InFlight]):
+# The harness runs under a supervisor that the kernel signals when the broker
+# dies (pdeathsig), and that then kills its whole process group: harness,
+# bwrap and the agent under test. The supervisor and harness also hold the
+# campaign lock, so it frees only once nothing is left spending.
+_SUPERVISOR = 'trap "kill -KILL 0" TERM; "$@" & wait $!'
+
+
+def _supervised(argv: list[str], policy: dict) -> list[str]:
+    path = ":".join(policy["path"])
+    tools = {name: shutil.which(name, path=path) for name in ("setpriv", "bash")}
+    missing = [name for name, found in tools.items() if not found]
+    if missing:
+        raise RuntimeError(f"BROKEN safety boundary: not on policy path: {', '.join(missing)}")
+    return [tools["setpriv"], "--pdeathsig", "TERM", "--", tools["bash"], "-c", _SUPERVISOR,
+            "agent-e2e-supervisor", *argv]
+
+
+def _run_argv(argv: list[str], env: dict, timeout_s: int, rec: Optional[_InFlight],
+              lock_fd: int):
     proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True, env=env, start_new_session=True)
+                            stderr=subprocess.PIPE, text=True, env=env, start_new_session=True,
+                            pass_fds=(lock_fd,))
 
     def signal_group(sig: int) -> None:
         try:
@@ -246,10 +267,20 @@ _SECRET_PATTERNS = [
     ("github-token", re.compile(r"\bgh[psoure]_[A-Za-z0-9]{36,}\b")),
     ("github-pat", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{82}\b")),
     ("jwt", re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b")),
+    ("slack-token", re.compile(r"\bxox[boaprs]-[A-Za-z0-9\-]{10,}\b")),
+    ("aws-access", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("tavily-key", re.compile(r"\btvly-[A-Za-z0-9_\-]{20,}\b")),
+    ("age-secret-key", re.compile(r"\bAGE-SECRET-KEY-1[0-9A-Z]{58}\b")),
 ]
+_PRIVATE_KEY_RE = re.compile(
+    r"-----BEGIN (?:[A-Z0-9 ]*)PRIVATE KEY(?: BLOCK)?-----"
+    r"(?:.*?-----END (?:[A-Z0-9 ]*)PRIVATE KEY(?: BLOCK)?-----|.*\Z)",
+    re.DOTALL,
+)
 
 
 def _redact(body: str) -> str:
+    body = _PRIVATE_KEY_RE.sub(lambda m: f"[REDACTED:private-key:{len(m.group(0))}chars]", body)
     for label, pat in _SECRET_PATTERNS:
         body = pat.sub(lambda m, _l=label: f"[REDACTED:{_l}:{len(m.group(0))}chars]", body)
     return body
@@ -283,16 +314,21 @@ def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise RuntimeError("another agent-e2e campaign is running; one at a time") from None
-        harness = _check_harness(policy)
         # The fetch alone gets the SSH agent (origin is an ssh remote); the
         # harness and the agent under test never do.
         fetch_env = dict(_env(policy), GIT_TERMINAL_PROMPT="0")
         if os.environ.get("SSH_AUTH_SOCK"):
             fetch_env["SSH_AUTH_SOCK"] = os.environ["SSH_AUTH_SOCK"]
         try:
-            fetch = _git(policy, "fetch", "--quiet", "origin", timeout=120, env=fetch_env)
+            fetch = _git(policy, "fetch", "--quiet", "--prune", "origin", timeout=120,
+                         env=fetch_env)
         except subprocess.TimeoutExpired:
-            fetch = subprocess.CompletedProcess([], 124, "", "fetch timed out")
+            fetch = subprocess.CompletedProcess([], 124, "", "timed out")
+        # Fail closed: stale or planted remote-tracking refs must never stand
+        # in for what origin holds now.
+        if fetch.returncode != 0:
+            raise RuntimeError(f"git fetch origin failed: {fetch.stderr.strip()[:300]}")
+        harness = _check_harness(policy)
         old = _resolve(policy, req["old_ref"])
         new = _resolve(policy, req["new_ref"])
         scen_rel = f"{policy['scenarioRoot']}/{req['scenario']}"
@@ -307,11 +343,11 @@ def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
                 "--n", str(req["n"]), "--jobs", str(req["jobs"]), "--model", req["model"],
                 "--budget", f"{req['budget']:g}", "--timeout", str(req["timeout"]),
                 "--out", str(out / "runs"), "--claude", str(exe)]
-        rc, stdout, stderr = _run_argv(argv, _env(policy), req["call_timeout"], rec)
+        rc, stdout, stderr = _run_argv(_supervised(argv, policy), _env(policy),
+                                       req["call_timeout"], rec, lock.fileno())
     header = (f"agent-e2e campaign `{req['scenario']}` model={req['model']} n={req['n']} "
               f"jobs={req['jobs']} budget=${req['budget']:g} timeout={req['timeout']}s\n"
               f"old = {req['old_ref']} = {old}\nnew = {req['new_ref']} = {new}\n"
-              f"fetch: {'ok' if fetch.returncode == 0 else 'FAILED, used local refs: ' + fetch.stderr.strip()[:200]}\n"
               f"output: {out}\n")
     body = "\n".join([header, stdout.rstrip(), "--- per run ---",
                       _report(out / "runs", req["scenario"]),
