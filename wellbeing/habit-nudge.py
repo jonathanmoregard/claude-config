@@ -86,7 +86,7 @@ def main() -> int:
             print(
                 "[wellbeing] habit-tracker cache missing — TickTick habit nudges "
                 "are silent. If this persists, check ~/.claude/logs/habit-tracker.log "
-                "(token may need re-auth via `~/.claude/todo-add --login`)."
+                "(token may need re-auth via `~/.claude/ticktick-login`)."
             )
         return 0
 
@@ -97,7 +97,7 @@ def main() -> int:
                 f"[wellbeing] habit-tracker cache is stale (date={stale_date}, "
                 f"today={today}). Nudges silent. Check "
                 "~/.claude/logs/habit-tracker.log — TickTick token may need "
-                "re-auth via `~/.claude/todo-add --login`."
+                "re-auth via `~/.claude/ticktick-login`."
             )
         return 0
 
