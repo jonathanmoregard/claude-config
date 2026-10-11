@@ -10,7 +10,8 @@ Invariants:
 - A secret found in one string is redacted in every string of the value.
 - Redaction is idempotent: a marker is never redacted again.
 - Binary payloads (image/PDF base64, MCP image data, blobs) are neither scanned nor changed.
-- Only string contents change: the result has the input's exact shape.
+- Only string values change: the result has the input's exact shape. Dict keys
+  are field names; they are neither scanned nor changed.
 """
 from __future__ import annotations
 
@@ -26,8 +27,8 @@ RULES = os.path.join(HERE, "secret-rules.toml")
 MAX_SCAN_CHARS = 8 * 1024 * 1024
 # Each distinct secret is one str.find pass over the text; 1,000 over 8 MB take ~1 s.
 MAX_TARGETS = 1000
-# map_strings recurses once per level; json.loads accepts ~52,000 levels.
-sys.setrecursionlimit(max(sys.getrecursionlimit(), 60_000))
+# json.loads accepts ~52,000 levels of nesting; map_strings recurses once per level.
+JSON_DEPTH = 60_000
 
 ScanError = gitleaks_driver.GitleaksError
 
@@ -44,16 +45,29 @@ def _is_binary_slot(container: dict, key) -> bool:
 
 
 def map_strings(value, fn):
-    """``value`` with ``fn`` applied to every string outside a binary slot, as a new value."""
+    """``value`` with ``fn`` applied to every string value outside a binary slot, as a new value.
+
+    Recursion deep enough for anything json.loads accepts, raised for this call
+    only. Assumes CPython >= 3.12, where Python-to-Python calls use no C stack.
+    """
     # Hand-rolled on purpose: glom and boltons' remap are not importable under the hooks'
     # `python3 -S -E`, and scanning json.dumps(value) instead hides tokens from gitleaks
     # (`\nghp_...` serialises as `\\nghp_...`, so rules anchored on `\b` stop matching).
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(max(limit, JSON_DEPTH))
+    try:
+        return _map(value, fn)
+    finally:
+        sys.setrecursionlimit(limit)
+
+
+def _map(value, fn):
     if isinstance(value, str):
         return fn(value)
     if isinstance(value, list):
-        return [map_strings(v, fn) for v in value]
+        return [_map(v, fn) for v in value]
     if isinstance(value, dict):
-        return {k: v if _is_binary_slot(value, k) else map_strings(v, fn) for k, v in value.items()}
+        return {k: v if _is_binary_slot(value, k) else _map(v, fn) for k, v in value.items()}
     return value
 
 

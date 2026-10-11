@@ -1306,4 +1306,10 @@ def _rewrite(payload: dict, response, redact, max_scan_bytes: int) -> dict | Non
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except BaseException as exc:  # noqa: BLE001 — e.g. the deadline landing in main's handlers
+        _disarm_watchdog()
+        _emit(_withheld_result(str(exc) if isinstance(exc, Withhold) else type(exc).__name__, None))

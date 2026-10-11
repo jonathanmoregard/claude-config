@@ -122,13 +122,16 @@ class Result(NamedTuple):
 
 
 def run_hook(payload, script: str = HOOK, env: dict | None = None,
-             raw_stdin: str | None = None, cwd: str | None = None) -> Result:
+             raw_stdin: str | None = None, cwd: str | None = None, timeout: float = 120) -> Result:
     t0 = time.monotonic()
-    proc = subprocess.run(
-        [sys.executable, script], input=raw_stdin if raw_stdin is not None else json.dumps(payload),
-        capture_output=True, text=True, env={**os.environ, **(env or {})}, cwd=cwd or SCRATCH,
-        timeout=120,
-    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, script], input=raw_stdin if raw_stdin is not None else json.dumps(payload),
+            capture_output=True, text=True, env={**os.environ, **(env or {})}, cwd=cwd or SCRATCH,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return Result(-1, None, "", f"<<killed after {timeout}s>>", time.monotonic() - t0)
     updated = None
     if proc.stdout.strip():
         try:
@@ -396,6 +399,18 @@ for label, script, env, response in FAULTS:
     if script is slow_hook:
         check("the deadline withhold lands before the (patched) 6 s harness timeout", r.seconds < 6,
               f"{r.seconds:.1f}s")
+# Applying findings is bounded by the hook's deadline too: 1,000 overlapping
+# targets over 2 MB of one repeated character would take hours.
+flood_report = os.path.join(SCRATCH, "flood-report.json")
+with open(flood_report, "w", encoding="utf-8") as fh:
+    json.dump([{"File": "in/0.txt", "RuleID": "flood", "Secret": "a" * n, "Tags": []}
+               for n in range(20, 1020)], fh)
+r = run_hook(post("mcp__x__y", "a" * 2_000_000 + f" K={t}"), script=slow_hook, timeout=30,
+             env=fake_gitleaks("flood", f"cat {flood_report}; echo 'INF scanned ~999999999 bytes' >&2"))
+check(f"1,000 findings over 2 MB of one repeated character: withheld before the (patched) 6 s "
+      f"harness timeout ({r.seconds:.1f}s)",
+      r.rc == 0 and WITHHELD in r.stdout and t not in r.stdout and r.seconds < 6, f"rc={r.rc} {r.stderr[:200]}")
+
 r = run_hook(post("Read", READ), env=NO_GITLEAKS)
 check("withhold: the notice names the fault", "gitleaks could not run" in r.stdout, r.stdout[:300])
 check("withhold: path and enum slots keep their values",
@@ -412,6 +427,14 @@ for label, tool, make in (
     r = run_hook(post(tool, make(v)), env=NO_GITLEAKS)
     check(f"gitleaks missing, {label}: withheld as a rewrite (exit 0)",
           r.rc == 0 and WITHHELD in r.stdout and v not in r.stdout, f"rc={r.rc}")
+
+# Short credentials without whitespace or a 16-char run are withheld too.
+for label, secret, make in (
+        ("compact JSON", _rand(15), lambda v: '{"token":"' + v + '"}'),
+        ("URL with a password", _rand(8), lambda v: f"https://user:{v}@host.invalid/x")):
+    r = run_hook(post("mcp__x__y", [{"type": "text", "text": make(secret)}]), env=NO_GITLEAKS)
+    check(f"gitleaks missing, {label}: withheld (exit 0)",
+          r.rc == 0 and WITHHELD in r.stdout and secret not in r.stdout, f"rc={r.rc} {r.stdout[:200]}")
 
 # Depth is not cut: a deep token is redacted in place, or withheld with the rest.
 deep_tok = tok()

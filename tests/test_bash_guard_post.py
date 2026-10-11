@@ -1239,10 +1239,13 @@ def _fake_key(kind: str = "OPENSSH", terminated: bool = True) -> str:
 
 
 def guarded(text: str) -> tuple[str, str]:
-    """(stdout the model gets, the hook's whole raw stdout) for a Bash result."""
+    """(stdout the model gets, everything the model gets) for a Bash result:
+    the rewrite if the guard emitted one, else the original."""
     parsed, updated, raw = bash_out("cat /tmp/synthetic-key", response_obj(text))
+    if updated is None:
+        return text, text
     body = stdout_of(updated)
-    return (body if isinstance(body, str) else text), raw
+    return (body if isinstance(body, str) else ""), raw
 
 
 for _kind in ("OPENSSH", "RSA", "EC", "DSA", "ENCRYPTED", "", "PGP"):
@@ -1265,6 +1268,14 @@ for _kind in ("RSA", "PGP"):
           _TRACER not in raw and _PEM_BODY not in raw and _armor(_kind, "END") not in raw
           and "[REDACTED:private-key" in _body, _body[:200])
     check(f"text after the orphan {_kind} END survives", _body.endswith("\nafter the marker\n"), _body[-60:])
+
+# Real tails rarely end on a full line: the last body line is short in most
+# PEM keys, and PGP armor ends in a `=CRC` checksum line.
+for _label, _last in (("short final PEM line", "Ab3+/x=="), ("PGP =CRC line", "=Xy4Z")):
+    _kind = "PGP" if "PGP" in _label else "RSA"
+    _body, raw = guarded(f"{_PEM_BODY}\n{_TRACER}\n{_last}\n{_armor(_kind, 'END')}\nafter the marker\n")
+    check(f"an END-only key tail with a {_label} loses its body",
+          _TRACER not in raw and _PEM_BODY not in raw and _body.endswith("\nafter the marker\n"), _body[:200])
 
 _body, raw = guarded(_fake_key("RSA") + "prose between blocks\n" + _armor("EC", "END") + "\nuntouched tail\n")
 check("a full block, prose, then a lone END: no key material survives, the prose does",
@@ -1852,6 +1863,20 @@ _s = secret("N")
 parsed, updated, raw = bash_out("cat /tmp/x", response_obj(f"KEY={_s}"), script=_redactor_fault)
 check_withheld("the redactor itself raises", parsed, updated)
 check("a crashing redactor does not pass the secret through", _s not in raw, "secret leaked")
+
+# A Withhold that escapes main()'s own handlers (the deadline landing while a
+# handler or `finally` runs) must still become a withhold, not a traceback.
+_escaped = patched_guard(
+    "guard-withhold-escapes.py",
+    ("    deadline = time.monotonic() + GUARD_DEADLINE_S - 0.5\n",
+     '    raise Withhold("injected: raised outside main\'s try")\n'),
+)
+_s = secret("E")
+rc, parsed, raw, err = run_hook(_escaped, post_payload("cat /tmp/x", response_obj(f"KEY={_s}")))
+updated = (parsed or {}).get("hookSpecificOutput", {}).get("updatedToolOutput")
+check("a Withhold escaping main() exits 0", rc == 0, f"rc={rc} {err[-200:]}")
+check_withheld("a Withhold escaping main()", parsed, updated)
+check_applied("a Withhold escaping main()", updated)
 
 # A deeply nested field is walked all the way down and redacted in place,
 # not cut off: json.loads already bounds the depth.

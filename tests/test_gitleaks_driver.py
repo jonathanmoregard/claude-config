@@ -121,6 +121,15 @@ for name, n in (("empty", 0), ("one byte", 1), ("exactly one piece", gd.PIECE_BY
           all(ps[i][step:] == ps[i + 1][: gd.OVERLAP_BYTES] for i in range(len(ps) - 1)))
     check(f"{name}: pieces cover the data, last one ends it",
           ps[0] == data[: len(ps[0])] and data.endswith(ps[-1]) and len(ps) == max(1, -(-(n - gd.OVERLAP_BYTES) // step)))
+# An armored key across two piece boundaries (75 KB to ~105 KB crosses both the
+# second piece's start at 80,000 and the first piece's end at 96,000).
+key_lines = ["".join(secrets.choice(ALNUM + "+/") for _ in range(64)) for _ in range(460)]
+key = "-----BEGIN RSA " + "PRIVATE KEY-----\n" + "\n".join(key_lines) + "\nAb3+/x==\n-----END RSA " + "PRIVATE KEY-----"
+text = "x" * 75_000 + "\n" + key + "\ntrailing prose\n" + "y" * 60_000
+found = scan([text])[0]
+redacted = gd.redact(text, found, lambda rule, n: f"<{rule}>")
+check(f"a {len(key) // 1000} KB key across two piece boundaries: no body line survives",
+      not any(line in redacted for line in key_lines) and "trailing prose" in redacted, sorted(set(found.values())))
 tokens = [tok() for _ in range(12000)]
 t0 = time.monotonic()
 found = scan([" ".join(tokens)])[0]

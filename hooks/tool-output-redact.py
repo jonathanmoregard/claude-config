@@ -13,26 +13,29 @@ output (2.1.296, "PostToolUse hook returned updatedToolOutput that does not
 match"). Redaction and withholding therefore only ever change string contents.
 
 Invariants:
-- Fail closed. A scanner fault WITHHOLDS: every string that could carry a
-  secret (free text, token-shaped strings) becomes a notice; other strings
-  (enum/literal/path slots a schema may pin) keep their value.
+- Fail closed. A scanner fault WITHHOLDS: every string becomes a notice except
+  identifier-like ones (letters and ``_./:+-`` only, at most 64 characters:
+  the enum, MIME-type and path slots a schema may pin), which keep their value.
 - No shape to withhold into (unparseable stdin, a module that cannot load) ->
   exit 2, the status whose stderr reaches the model.
-- The scan's timeout ends before the harness timeout, which would discard the
-  rewrite and show the original.
+- Scanning and applying findings both end by the hook's own deadline (gitleaks'
+  timeout, then SIGALRM), which lands before the harness timeout that would
+  discard the rewrite and show the original.
 """
 from __future__ import annotations
 
 import json
 import os
+import itertools
 import re
+import signal
 import sys
 import time
 from typing import NoReturn
 
 HOOK_NAME = "tool-output-redact"
 HARNESS_HOOK_TIMEOUT_S = 15  # settings.json
-# The scan must end by then; what follows it (applying findings, emitting) takes < 2 s.
+# Redaction must end by then; withholding and emitting take well under a second.
 SCAN_DEADLINE_S = HARNESS_HOOK_TIMEOUT_S - 4
 # Resolved on PATH, like the python3 that runs this hook.
 GITLEAKS = "gitleaks"
@@ -42,9 +45,9 @@ GITLEAKS = "gitleaks"
 # from the model's own input; scanning their originalFile would buy nothing.
 SKIP_TOOLS = frozenset({"Bash", "Edit", "MultiEdit", "Write", "NotebookEdit"})
 
-# A whitespace-free string that could BE a credential: 16+ token characters
-# mixing letters and digits. Enum/literal values (`text`, `image/png`) never match.
-_TOKENISH_RE = re.compile(r"[A-Za-z0-9_+/=.\-]{16,}")
+# Strings a withhold keeps: enum, MIME-type and path values (`text`,
+# `image/png`, `/w/.env`). No digits, so no token, password or key can pass.
+_IDENTIFIER_RE = re.compile(r"[A-Za-z_./:+-]{1,64}")
 
 _SHORT_WITHHELD = f"[{HOOK_NAME}: withheld, see the notice above]"
 
@@ -62,25 +65,20 @@ def _withheld_text(detail: str) -> str:
     )
 
 
-def _could_hold_secret(s: str) -> bool:
-    return any(c.isspace() for c in s) or any(
-        any(c.isdigit() for c in run) and any(c.isalpha() for c in run)
-        for run in _TOKENISH_RE.findall(s)
-    )
+class Withhold(BaseException):
+    """The hook's deadline passed. A BaseException, so no ``except Exception`` swallows it."""
+
+
+def _on_deadline(signum, frame) -> NoReturn:  # noqa: ARG001
+    raise Withhold(f"the hook passed its own {SCAN_DEADLINE_S}s deadline")
 
 
 def _withheld(response, detail: str, map_strings):
-    """``response`` with the notice in the first string that could hold a secret, the
-    short notice in the others, and every other string unchanged."""
-    notice = [_withheld_text(detail)]
-
-    def leaf(s: str) -> str:
-        if s and _could_hold_secret(s):
-            return notice.pop() if notice else _SHORT_WITHHELD
-        return s
-
-    updated = map_strings(response, leaf)
-    if notice:  # nothing that could hold a secret: nothing to hold back
+    """``response`` with every non-identifier string replaced: the first by the
+    notice, the rest by a pointer to it."""
+    notices = itertools.chain([_withheld_text(detail)], itertools.repeat(_SHORT_WITHHELD))
+    updated = map_strings(response, lambda s: s if not s or _IDENTIFIER_RE.fullmatch(s) else next(notices))
+    if updated == response:  # nothing that could hold a secret: nothing to hold back
         _not_inspected(detail)
     return updated
 
@@ -121,11 +119,16 @@ def main(gitleaks: str = GITLEAKS) -> int:
         return 0
     import secret_redaction as sr  # a module that cannot load: exit 2, below
 
+    signal.signal(signal.SIGALRM, _on_deadline)
+    signal.setitimer(signal.ITIMER_REAL, max(deadline - time.monotonic(), 0.01))
     try:
         updated = sr.redact_value(response, gitleaks=gitleaks, timeout=deadline - time.monotonic())
-    except Exception as exc:  # noqa: BLE001 — fail closed on any fault
-        detail = str(exc) if isinstance(exc, sr.ScanError) else f"{type(exc).__name__} in the hook: {exc}"
-        updated = _withheld(response, detail, sr.map_strings)
+    except (Exception, Withhold) as exc:  # noqa: BLE001 — fail closed on any fault
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        known = isinstance(exc, (sr.ScanError, Withhold))
+        updated = _withheld(response, str(exc) if known else f"{type(exc).__name__} in the hook: {exc}",
+                            sr.map_strings)
+    signal.setitimer(signal.ITIMER_REAL, 0)
     if updated != response:
         _emit(updated)
     return 0
