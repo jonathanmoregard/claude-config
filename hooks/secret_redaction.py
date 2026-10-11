@@ -64,32 +64,8 @@ def redact_value(value, *, gitleaks: str, timeout: float):
     rule_of = {target: rule for per_text in found for target, rule in per_text.items()}
     if len(rule_of) > MAX_TARGETS:
         raise ScanError(f"{len(rule_of)} distinct secrets, more than the {MAX_TARGETS} redacted in time")
-    return map_strings(value, lambda s: _redact(s, rule_of))
+    return map_strings(value, lambda s: gitleaks_driver.redact(s, rule_of, _marker))
 
 
-def _redact(text: str, rule_of: dict[str, str]) -> str:
-    """``text`` with every occurrence of every target replaced by a marker.
-
-    Overlapping occurrences (two findings sharing characters) become one marker,
-    so no fragment of either survives between them.
-    """
-    spans = sorted(((i, i + len(t), rule) for t, rule in rule_of.items() for i in _find_all(text, t)),
-                   key=lambda span: (span[0], -span[1]))  # at one start, the longest names the marker
-    merged: list[list] = []
-    for start, end, rule in spans:
-        if merged and start < merged[-1][1]:
-            merged[-1][1] = max(merged[-1][1], end)
-        else:
-            merged.append([start, end, rule])
-    out, pos = [], 0
-    for start, end, rule in merged:
-        out += [text[pos:start], f"[REDACTED:{rule}:{end - start}chars]"]
-        pos = end
-    return "".join(out) + text[pos:]
-
-
-def _find_all(text: str, target: str):
-    i = text.find(target)
-    while i != -1:
-        yield i
-        i = text.find(target, i + 1)
+def _marker(rule: str, length: int) -> str:
+    return f"[REDACTED:{rule}:{length}chars]"

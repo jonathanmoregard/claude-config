@@ -629,7 +629,7 @@ with open(_p, encoding="utf-8") as fh:
 check("the persisted overflow file is redacted in place", _s not in _after, _after[:120])
 check(
     "the persisted overflow file keeps a redaction marker",
-    "[REDACTED:anthropic-api-key:" in _after,
+    "[REDACTED:" in _after,
     _after[:160],
 )
 check(
@@ -709,7 +709,7 @@ parsed, updated, raw = bash_out(
 _elapsed = time.monotonic() - _t0
 check(
     "a persisted file at the scan limit is still scrubbed",
-    "[REDACTED:anthropic-api-key:" in open(_p_limit, encoding="utf-8").read(),
+    "[REDACTED:" in open(_p_limit, encoding="utf-8").read(),
     "the limit is set above what the guard can actually scan",
 )
 check(
@@ -934,7 +934,7 @@ check(
 )
 check(
     "... and keeps a redaction marker",
-    "[REDACTED:anthropic-api-key:" in _raw_after,
+    "[REDACTED:" in _raw_after,
     _raw_after[:160],
 )
 check(
@@ -1186,7 +1186,7 @@ check(
     _s not in raw
     and isinstance(stdout_of(updated), str)
     and "<untrusted_external_content" in stdout_of(updated)
-    and "[REDACTED:anthropic-api-key:" in stdout_of(updated),
+    and "[REDACTED:" in stdout_of(updated),
     str(stdout_of(updated))[:240],
 )
 

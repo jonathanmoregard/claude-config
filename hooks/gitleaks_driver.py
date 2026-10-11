@@ -7,6 +7,7 @@ Invariants:
 - Nothing in or around the input can silence a finding (no ignore files, gitleaks:allow ignored).
 - Any scanner fault raises GitleaksError; an empty result means "read it all, found nothing".
 - Results are plain target strings (never containing a redaction marker); no coordinates leave.
+- ``redact`` replaces every occurrence of every target; overlapping ones become one marker.
 Stdlib only: vendored byte-identical into the aggregator repo.
 """
 from __future__ import annotations
@@ -16,6 +17,7 @@ import os
 import re
 import subprocess
 import tempfile
+from collections.abc import Callable
 
 # BMP magic: gitleaks sniffs each file and silently skips application/* types (%PDF, MZ, ...).
 HEADER = b"BM gitleaks-driver\n\n"
@@ -63,8 +65,8 @@ def find_secrets(texts: list[str], *, gitleaks: str, rules: str, timeout: float,
         for finding in report:
             i, data = files[int(os.path.basename(finding["File"]).removesuffix(".txt"))]
             for target in _targets(finding, data):
-                if MARKER not in target:
-                    result[i].setdefault(target, finding["RuleID"])
+                if MARKER not in target:  # several rules on one target: the same one every run
+                    result[i][target] = min(finding["RuleID"], result[i].get(target, finding["RuleID"]))
     except (ValueError, KeyError, TypeError, IndexError) as e:
         raise GitleaksError("gitleaks report was unreadable") from e
     return result
@@ -118,3 +120,29 @@ def _targets(finding: dict, data: bytes) -> list[str]:
     secret = finding.get("Secret") or ""
     target = secret if len(secret) >= MIN_SECRET_CHARS else finding.get("Match") or secret
     return [target] if target else []
+
+
+def redact(text: str, targets: dict[str, str], marker: Callable[[str, int], str]) -> str:
+    """``text`` with each occurrence of each target (``{target: rule id}``) replaced by
+    ``marker(rule, length)``. Occurrences that share characters become one marker, named
+    by the longest target at its start, so no fragment of either survives between them."""
+    spans = sorted(((i, i + len(t), rule) for t, rule in targets.items() for i in _find_all(text, t)),
+                   key=lambda span: (span[0], -span[1]))
+    merged: list[list] = []
+    for start, end, rule in spans:
+        if merged and start < merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end, rule])
+    out, pos = [], 0
+    for start, end, rule in merged:
+        out += [text[pos:start], marker(rule, end - start)]
+        pos = end
+    return "".join(out) + text[pos:]
+
+
+def _find_all(text: str, target: str):
+    i = text.find(target)
+    while i != -1:
+        yield i
+        i = text.find(target, i + 1)

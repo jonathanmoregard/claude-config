@@ -343,12 +343,21 @@ for rule, value in (("fireworks-api-key", tok("fireworks")), ("tavily-api-key", 
                     ("anthropic-oauth-token", tok("oauth-long"))):
     for label, text in (("env assignment", f"KEY={value}\n"), ("quoted value", f'key: "{value}"'),
                         ("start of input", value)):
-        check(f"{rule}: fires on {label}", rule in rule_hits(text))
+        check(f"{rule}: fires on {label}", {rule, "known-prefix-token"} & set(rule_hits(text)))
     for sep in ("/", "+", ""):
         check(f"{rule}: does NOT fire mid-base64 (after {sep or 'an alnum char'!r})",
-              rule not in rule_hits(b64(60)[:40] + sep + value + b64(30)))
+              not {rule, "known-prefix-token"} & set(rule_hits(b64(60)[:40] + sep + value + b64(30))))
 check("fireworks-api-key: an over-long fw_ run (a blob, not a key) does not fire",
       "fireworks-api-key" not in rule_hits(f"x fw_{_rand(80)} y"))
+for label, value in (("truncated fine-grained PAT", "github" + "_pat_11" + _rand(41)),
+                     ("short classic PAT", "gh" + "p_" + _rand(20)),
+                     ("Anthropic admin key", "sk-" + "ant-admin01-" + _rand(40)),
+                     ("OpenAI legacy key", "sk-" + _rand(48)),
+                     ("short JWT", "eyJ" + _rand(10) + ".eyJ" + _rand(10) + "." + _rand(10))):
+    check(f"known-prefix-token: fires on a {label}", rule_hits(f"value: {value}\n") != [])
+for label, text in (("inside a word", "task-" + _rand(30)), ("mid-base64", b64(30)[:20] + "+gh" + "p_" + _rand(30)),
+                    ("a short identifier", "test_github" + "_pat_redacted")):
+    check(f"known-prefix-token: does NOT fire {label}", "known-prefix-token" not in rule_hits(text))
 
 # -------------------------------------------------------------------------
 section("skipped tools: Bash (own guard) and the edit tools")

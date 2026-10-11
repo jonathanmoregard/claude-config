@@ -168,6 +168,24 @@ check("an empty batch makes no call", scan([], binary="/nonexistent") == [])
 check("empty texts make no call", scan(["", ""], binary="/nonexistent") == [{}, {}])
 
 # ----------------------------------------------------------------------
+section("redact: every occurrence, overlaps merged")
+
+
+def mark(rule: str, n: int) -> str:
+    return f"<{rule}:{n}>"
+
+
+check("each occurrence of each target is replaced",
+      gd.redact("a SECRET1x b SECRET1x c", {"SECRET1x": "r"}, mark) == "a <r:8> b <r:8> c")
+check("overlapping targets become one marker, named by the longest at its start",
+      gd.redact("xx ABCDEFGH yy", {"ABCDEF": "a", "DEFGH": "b", "ABC": "c"}, mark) == "xx <a:8> yy")
+check("overlapping occurrences of one target leave nothing behind",
+      gd.redact("aaaaa", {"aaa": "r"}, mark) == "<r:5>")
+check("no targets: text unchanged", gd.redact("plain", {}, mark) == "plain")
+check("adjacent targets keep separate markers",
+      gd.redact("AAAABBBB", {"AAAA": "a", "BBBB": "b"}, mark) == "<a:4><b:4>")
+
+# ----------------------------------------------------------------------
 section("any scanner fault raises GitleaksError")
 for label, binary, kw in (
     ("missing binary", "/nonexistent/gitleaks", {}),
