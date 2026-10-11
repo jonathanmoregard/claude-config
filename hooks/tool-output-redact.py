@@ -72,16 +72,24 @@ def _tokenish(s: str) -> bool:
 
 
 def _same_shape(a, b) -> bool:
-    """``b`` differs from ``a`` only in the content of non-empty strings."""
-    if isinstance(a, bool) or isinstance(b, bool):
-        return type(a) is type(b) and a == b
-    if isinstance(a, str):
-        return isinstance(b, str) and (bool(b) or not a)
-    if isinstance(a, dict):
-        return isinstance(b, dict) and list(a) == list(b) and all(_same_shape(a[k], b[k]) for k in a)
-    if isinstance(a, list):
-        return isinstance(b, list) and len(a) == len(b) and all(map(_same_shape, a, b))
-    return type(a) is type(b) and a == b
+    """``b`` differs from ``a`` only in the content of non-empty strings (iterative)."""
+    stack = [(a, b)]
+    while stack:
+        x, y = stack.pop()
+        if isinstance(x, str) and not isinstance(x, bool):
+            if not isinstance(y, str) or (x and not y):
+                return False
+        elif isinstance(x, dict):
+            if not isinstance(y, dict) or list(x) != list(y):
+                return False
+            stack.extend((x[k], y[k]) for k in x)
+        elif isinstance(x, list):
+            if not isinstance(y, list) or len(x) != len(y):
+                return False
+            stack.extend(zip(x, y))
+        elif type(x) is not type(y) or x != y:
+            return False
+    return True
 
 
 def _not_inspected(detail: str) -> NoReturn:
@@ -108,6 +116,7 @@ def _emit(updated) -> None:
 
 
 def _withhold(detail: str) -> NoReturn:
+    signal.setitimer(signal.ITIMER_REAL, 0)  # a running withhold is not replaced by the deadline's
     if _RESPONSE is None:
         _not_inspected(detail)
     try:

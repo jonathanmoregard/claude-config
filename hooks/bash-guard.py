@@ -2416,6 +2416,26 @@ def _check_ci_poll(command: str, background: bool) -> str | None:
     return _CI_POLL_HINT if has_sleep and has_snapshot else None
 
 
+_REDACTION_MARKER_HINT = (
+    "bash-guard: this command contains a redaction marker. A marker stands in "
+    "for a secret you were never shown; the real value is still on disk, and "
+    "writing the marker into a file would replace that secret with the "
+    "placeholder. If a file's secret line must change, ask the user to do it."
+)
+
+
+def _check_redaction_marker(command: str) -> str | None:
+    """Deny a command holding a COMPLETE redaction marker (the write guard's twin
+    for Bash: `sed -i`/heredoc/`printf` writes bypass Write/Edit). Searching for
+    the bare prefix (`grep -F '[REDACTED:'`) is not a complete marker and passes."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from redaction_marker import MARKER_RE, PREFIX
+
+    if PREFIX in command and MARKER_RE.search(command):
+        return _REDACTION_MARKER_HINT
+    return None
+
+
 # ----------------------------------------------------------------------
 def main() -> int:
     if not _TIMEOUTS_SANE:
@@ -2476,6 +2496,8 @@ def main() -> int:
             reason = "bash-guard: " + reason
     if reason is None:
         reason = _check_ci_poll(command, tool_input.get("run_in_background") is True)
+    if reason is None:
+        reason = _check_redaction_marker(command)
 
     _disarm_watchdog()
     if reason is not None:

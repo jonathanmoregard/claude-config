@@ -293,6 +293,16 @@ r = run_hook(post("mcp__x__y", " ".join(many)))
 check(f"12,000 distinct tokens on one line: all redacted, not withheld ({r.seconds:.1f}s)",
       r.updated is not None and WITHHELD not in r.stdout and not any(t in r.stdout for t in many),
       f"rc={r.rc} {r.seconds:.1f}s")
+# Applying findings must be linear in the text: 12,000 findings with diverse
+# first characters, then ~3 MB with none. A flat alternation tried every
+# finding at every position and ran into the deadline (withheld at 11 s).
+diverse = [f"token: {_rand(31)}k\n" for _ in range(12000)]
+text = "".join(diverse) + ("the quick brown fox jumps over the lazy dog " * 20 + "\n") * 3500
+found = gitleaks_driver.find_secrets([text], rules=RULES, binary=gitleaks_driver.gitleaks_binary())[0]
+r = run_hook(post("mcp__x__y", text))
+check(f"{len(found)} findings + 3 MB without any: redacted, not withheld, in {r.seconds:.1f}s (< 8 s)",
+      r.rc == 0 and WITHHELD not in r.stdout and r.seconds < 8
+      and not any(f in r.stdout for f in found), f"rc={r.rc} {r.seconds:.1f}s")
 
 # -------------------------------------------------------------------------
 # secret-rules.toml: prefix rules fire on a token, not inside a base64 blob
@@ -381,6 +391,23 @@ for label, env, want in (("gitleaks present", None, "[REDACTED:gitlab-pat:"),
     check(f"{label}: a token 41 levels down is not emitted, shape kept",
           r.rc == 0 and deep_tok not in r.stdout and want in r.stdout and hook._same_shape(deep, r.updated),
           f"rc={r.rc} {r.stdout[:200]}")
+# Deeper than Python's recursion limit, still inside what json.loads accepts:
+# the walkers are iterative.
+deep_tok = tok()
+r = run_hook(None, raw_stdin='{"tool_name": "SomeTool", "tool_response": '
+             + "[" * 3000 + json.dumps(f"x {deep_tok}") + "]" * 3000 + "}")
+check("a 3,000-deep list with a token at the bottom: redacted (exit 0)",
+      r.rc == 0 and deep_tok not in r.stdout and "[REDACTED:gitlab-pat:" in r.stdout,
+      f"rc={r.rc} {r.stderr[:200]}")
+
+# A withhold still running when the deadline fires keeps its own fault.
+race_hook = sandbox("race", hook_patch=(
+    ("HARNESS_HOOK_TIMEOUT_S = 15", "HARNESS_HOOK_TIMEOUT_S = 6"),
+    ("    try:\n        import secret_redaction as sr\n",
+     "    time.sleep(2.5)\n    try:\n        import secret_redaction as sr\n")))
+r = run_hook(post("Read", READ), script=race_hook, env=fake_gitleaks("late", "sleep 1.4; exit 3"))
+check("a slow withhold racing the deadline reports the real fault, not the deadline",
+      "gitleaks exited 3" in r.stdout and "deadline" not in r.stdout, r.stdout[:300])
 
 r = run_hook(post("Read", READ), script=sandbox(
     "broken-module", module_patch=(("import re\n", "import re\nraise ImportError('injected')\n"),)))
@@ -460,6 +487,11 @@ WRITES = [  # label, tool, input, expected decision
 ]
 for label, tool, tool_input, want in WRITES:
     check(f"{label}: {want or 'allowed'}", decide(tool, tool_input) == want)
+reason = run_hook({"tool_name": "Write", "tool_input": {"file_path": env_file, "content": f"T={LONG}"}},
+                  script=WRITE_GUARD).stdout
+check("the denial steers to Edit or the user only: no sed, no placeholder spelling",
+      "old_string" in reason and "ask the user" in reason and "sed" not in reason and "<rule>" not in reason,
+      reason[:300])
 with open(env_file, encoding="utf-8") as fh:
     check("the secret is still on disk", secret_tok in fh.read())
 locked = os.path.join(wdir, "locked.env")

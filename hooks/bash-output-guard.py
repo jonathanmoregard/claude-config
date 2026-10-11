@@ -26,18 +26,10 @@ Two layers:
 
 EMITTING A REWRITE IS NOT LANDING ONE
 -------------------------------------
-``updatedToolOutput`` is validated against the TOOL'S OWN output schema
-before it is used, and a value that does not conform is thrown away in
-favour of the ORIGINAL, un-inspected result. For a redactor that is the
-worst outcome there is: every redaction goes with the rejected rewrite.
-So the invariant this file cannot lose is that NOTHING LEAVES HERE THAT
-THE CLI WOULD REFUSE — see ``_schema_violation`` for the bundle offsets
-and the end-to-end measurement, and ``_emit_rewrite`` for the choke point.
-
-Shape is therefore NOT preserved for its own sake. The Bash result is an
-object, the Bash output schema requires an object, and so every rewrite
-this guard emits is an object — including the ones built from a string- or
-list-shaped result, and including the withheld-output notice.
+The CLI drops a rewrite its Bash output schema refuses and shows the
+ORIGINAL output (measurement at ``_schema_violation``). So nothing leaves
+here that the schema would refuse — ``_emit_rewrite`` is the choke point —
+and every rewrite, the withheld-output notice included, is an object.
 
 WHAT A BASH TOOL RESULT CAN CONTAIN
 -----------------------------------
@@ -504,19 +496,13 @@ def _withhold(detail: str) -> None:
     renders. The pointer fields go with the strings, so the model is not
     left a path to output nobody inspected.
 
-    THE REPLACEMENT IS BUILT TO CONFORM, ALWAYS. This branch used to emit a
-    bare string whenever ``_SHAPE`` was ``None`` — every fail-closed path
-    reached before an object-shaped response had been read: unparseable
-    stdin, a missing or broken config, a string- or list-shaped result. The
-    CLI refuses a bare string and shows the ORIGINAL output instead, so the
-    one code path whose entire job is to fail closed was the one that failed
-    open. See ``_schema_violation`` for the measurement. A shape carrying no
-    usable scalars is another road to the same place: ``interrupted`` is
-    required, and copying zero scalars leaves it absent.
-
-    ``os._exit`` skips interpreter shutdown on purpose — this is also the
-    watchdog's exit path.
+    The replacement always conforms to the Bash output schema (an object
+    with a boolean ``interrupted``), whatever shape arrived; a refused
+    withhold would show the original. The deadline is disarmed first, so a
+    withhold already running is not replaced by the watchdog's.
+    ``os._exit`` skips interpreter shutdown on purpose.
     """
+    _disarm_watchdog()
     text = _withheld_text(detail)
     replacement: dict = {}
     if isinstance(_SHAPE, dict):
@@ -583,20 +569,22 @@ def _disarm_watchdog() -> None:
 
 
 # ----------------------------------------------------------------------
-# Layer 1: secret redaction — secret_redaction.py, imported by main() so a
-# module that cannot load is a withhold, not a traceback (exit 1 would show
-# the original output).
+# Layer 1: secret redaction — secret_redaction.py (regex floor + gitleaks).
+# A module that cannot load must become a withhold in main(), not a
+# traceback here (exit 1 would show the original output).
 # ----------------------------------------------------------------------
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-sr = None  # the secret_redaction module, once main() has imported it
+try:
+    import secret_redaction as sr
+    _SR_IMPORT_FAULT = None
+except Exception as exc:  # noqa: BLE001 — main() withholds with this
+    sr, _SR_IMPORT_FAULT = None, f"{type(exc).__name__}: {exc}"
 _DEADLINE = 0.0  # set by main(): the time.monotonic() instant scans must end by
 
 
 def _redact_secrets(body: str) -> str:
     """The regex floor alone."""
-    import secret_redaction
-
-    return secret_redaction.floor_redact(body)
+    return sr.floor_redact(body)
 
 
 def _redact_tree(value):
@@ -1157,7 +1145,7 @@ def _load_config() -> dict:
 
 
 def main() -> int:
-    global _SHAPE, _DEADLINE, sr
+    global _SHAPE, _DEADLINE
     _DEADLINE = time.monotonic() + GUARD_DEADLINE_S - 0.5
 
     if not _TIMEOUTS_SANE:
@@ -1190,7 +1178,8 @@ def main() -> int:
     response = payload.get("tool_response")
     if isinstance(response, dict):
         _SHAPE = response
-    import secret_redaction as sr
+    if sr is None:
+        _withhold(f"secret_redaction.py could not be imported ({_SR_IMPORT_FAULT})")
 
     tool_input = payload.get("tool_input")
     command = ""

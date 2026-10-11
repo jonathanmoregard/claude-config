@@ -38,27 +38,21 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 from typing import NoReturn
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from redaction_marker import MARKER_RE, PREFIX as NEEDLE  # noqa: E402
+
 FILE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
-NEEDLE = "[REDACTED:"
-# Both spellings that reach the model: `[REDACTED:<rule>:<n>chars]` from the
-# output hooks, and the historic short `[REDACTED:<rule>]` the aggregator still
-# returns in memory-search results.
-MARKER_RE = re.compile(r"\[REDACTED:[A-Za-z0-9_.\-]+(?::\d+chars)?\]")
 MAX_READ_BYTES = 16 * 1024 * 1024
 
 RECOVER = (
     "The value you saw is a redaction marker: the real secret is still on disk, "
     "and this write would replace it with the marker. Recover: leave the "
-    "secret's line out of the edit — anchor Edit's old_string on the "
-    "neighbouring lines, or change other lines with a line-addressed edit "
-    "(e.g. `sed -i '<N>s/.../.../'` on a line that does not hold the secret). "
-    "If you need the secret line itself changed, ask the user to do it. If the "
-    "marker text is meant literally (docs, tests), write it so it does not form "
-    "a complete marker, e.g. `[REDACTED:<rule>:<n>chars]` or `[REDACTED:<rule>]`."
+    "secret's line out of the edit by anchoring Edit's old_string on the "
+    "neighbouring lines. If the secret's line itself must change, ask the user "
+    "to do it."
 )
 
 

@@ -107,12 +107,37 @@ def redact_strings(strings: list[str], deadline: float) -> list[str]:
             targets.setdefault(target, rule)
     if not targets:
         return floored
-    # One longest-first alternation in ONE pass: an inserted marker is never rescanned.
-    pattern = re.compile("|".join(re.escape(t) for t in sorted(targets, key=len, reverse=True)))
-    return [
-        pattern.sub(lambda m: f"[REDACTED:{targets[m.group(0)]}:{len(m.group(0))}chars]", s)
-        for s in floored
-    ]
+    pattern = _target_pattern(targets)
+    return [pattern.sub(lambda m: f"[REDACTED:{targets[m[0]]}:{len(m[0])}chars]", s) for s in floored]
+
+
+# Longer targets (a whole key block) skip the trie, whose build recurses per character.
+_TRIE_MAX = 400
+
+
+def _target_pattern(targets) -> "re.Pattern[str]":
+    """One regex matching every target, longest match first, in time linear in the text.
+
+    A flat alternation of N literals tries all N at every position (12,000
+    findings over 3 MB took past the deadline); factored into a trie, each
+    position follows one branch per character.
+    """
+    trie: dict = {}
+    for t in (t for t in targets if len(t) <= _TRIE_MAX):
+        node = trie
+        for ch in t:
+            node = node.setdefault(ch, {})
+        node[""] = {}
+
+    def branch(node: dict) -> str:
+        alts = [re.escape(ch) + branch(child) for ch, child in node.items() if ch]
+        if not alts:
+            return ""
+        body = alts[0] if len(alts) == 1 else "(?:" + "|".join(alts) + ")"
+        return f"(?:{body})?" if "" in node else body  # greedy: the longer target wins
+
+    longest = sorted((t for t in targets if len(t) > _TRIE_MAX), key=len, reverse=True)
+    return re.compile("|".join([re.escape(t) for t in longest] + ([branch(trie)] if trie else [])))
 
 
 # ---- values (tool results) -------------------------------------------------
@@ -128,21 +153,38 @@ def _is_binary_slot(container: dict, key) -> bool:
     )
 
 
-def map_strings(value, fn, binary: bool = False):
-    """``value`` with ``fn`` applied to every non-binary string, shape unchanged."""
-    if isinstance(value, str):
-        return value if binary else fn(value)
-    if isinstance(value, dict):
-        return {k: map_strings(v, fn, binary or _is_binary_slot(value, k)) for k, v in value.items()}
-    if isinstance(value, list):
-        return [map_strings(v, fn, binary) for v in value]
-    return value
+def map_strings(value, fn):
+    """``value`` with ``fn`` applied to every non-binary string, in document order.
+
+    Shape unchanged, ``value`` untouched (containers are copied). Iterative, so
+    any depth ``json.loads`` accepts is walked.
+    """
+    root = [value]
+    stack = [(root, 0, False)]  # (container, key, inside a binary slot)
+    while stack:
+        parent, key, binary = stack.pop()
+        item = parent[key]
+        if isinstance(item, str):
+            if not binary:
+                parent[key] = fn(item)
+        elif isinstance(item, dict):
+            parent[key] = copy = dict(item)
+            stack.extend((copy, k, binary or _is_binary_slot(item, k)) for k in reversed(list(copy)))
+        elif isinstance(item, list):
+            parent[key] = copy = list(item)
+            stack.extend((copy, i, binary) for i in reversed(range(len(copy))))
+    return root[0]
 
 
 def redact_value(value, deadline: float):
     """``value`` with every secret in its strings redacted. Raises ScanError."""
     leaves: list[str] = []
-    map_strings(value, lambda s: leaves.append(s) or s)
+
+    def collect(s: str) -> str:
+        leaves.append(s)
+        return s
+
+    map_strings(value, collect)
     if not any(s.strip() for s in leaves):
         return value
     redacted = iter(redact_strings(leaves, deadline))

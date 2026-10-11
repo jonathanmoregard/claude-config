@@ -3047,6 +3047,28 @@ else:
 
 
 # ----------------------------------------------------------------------
+# A redaction marker stands in for a secret the model never saw. Writing one
+# into a file through Bash (sed, a heredoc, printf) bypasses the Write/Edit
+# guard and replaces the real secret with the placeholder. A command holding
+# a COMPLETE marker is denied; searching for the bare prefix is not.
+section("bash-guard: a complete redaction marker in a command is denied")
+_LONG = "[REDACTED:" + "generic-api-key:30chars]"
+_SHORT = "[REDACTED:" + "github-token]"
+for _label, _cmd, _want in (
+    ("sed -i writing a long marker", f"sed -i 's/^TOKEN=.*/TOKEN={_LONG}/' app.env", "deny"),
+    ("heredoc writing a short marker", f"cat > app.env <<'EOF'\nTOKEN={_SHORT}\nEOF", "deny"),
+    ("printf writing a long marker", f"printf 'TOKEN={_LONG}\\n' > app.env", "deny"),
+    ("grep for the bare prefix", "grep -rnF '[REDACTED:' .", None),
+    ("a placeholder spelling", "echo 'markers look like [REDACTED:<rule>]'", None),
+):
+    _dec, _why = guard(_cmd)
+    check(f"{_label}: {_want or 'allowed'}", _dec == _want, f"decision={_dec!r} {_why[:200]}")
+    if _want:
+        check(f"{_label}: the reason says to ask the user, and suggests no other write",
+              "ask the user" in _why and "sed" not in _why, _why[:300])
+
+
+# ----------------------------------------------------------------------
 section("Summary")
 shutil.rmtree(SCRATCH, ignore_errors=True)
 if FAILURES:
