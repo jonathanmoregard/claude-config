@@ -3058,6 +3058,10 @@ for _label, _cmd, _want in (
     ("sed -i writing a long marker", f"sed -i 's/^TOKEN=.*/TOKEN={_LONG}/' app.env", "deny"),
     ("heredoc writing a short marker", f"cat > app.env <<'EOF'\nTOKEN={_SHORT}\nEOF", "deny"),
     ("printf writing a long marker", f"printf 'TOKEN={_LONG}\\n' > app.env", "deny"),
+    ("sed writing a backslash-escaped marker",
+     "sed -i 's/^K=.*/K=\\" + _LONG[:-1] + "\\]/' app.env", "deny"),
+    ("perl writing a backslash-escaped short marker",
+     "perl -pi -e 's/K=.*/K=\\" + _SHORT[:-1] + "\\]/' app.env", "deny"),
     ("grep for the bare prefix", "grep -rnF '[REDACTED:' .", None),
     ("a placeholder spelling", "echo 'markers look like [REDACTED:<rule>]'", None),
 ):

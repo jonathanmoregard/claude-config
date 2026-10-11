@@ -2427,11 +2427,13 @@ _REDACTION_MARKER_HINT = (
 def _check_redaction_marker(command: str) -> str | None:
     """Deny a command holding a COMPLETE redaction marker (the write guard's twin
     for Bash: `sed -i`/heredoc/`printf` writes bypass Write/Edit). Searching for
-    the bare prefix (`grep -F '[REDACTED:'`) is not a complete marker and passes."""
+    the bare prefix (`grep -F '[REDACTED:'`) is not a complete marker and passes.
+    Backslashes are ignored: sed/perl write `\\[REDACTED:x\\]` as the bare marker.
+    A read-only command quoting a full marker is denied too (loud, recoverable)."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from redaction_marker import MARKER_RE, PREFIX
 
-    if PREFIX in command and MARKER_RE.search(command):
+    if PREFIX in command and MARKER_RE.search(command.replace("\\", "")):
         return _REDACTION_MARKER_HINT
     return None
 
