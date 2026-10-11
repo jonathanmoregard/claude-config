@@ -1,0 +1,1 @@
+Implement `redact(text, secrets)` in hooks/redact_output.py. It runs on every tool output with the full list of known secrets (thousands of entries), and every occurrence of any of them has to become `[REDACTED]`. When secrets overlap, the longest one wins. It must stay fast as the list grows, so a str.replace loop per secret is out. Add tests and make sure they pass.
