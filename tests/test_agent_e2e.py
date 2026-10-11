@@ -339,3 +339,27 @@ def test_headless_permission_denials_count_as_blocked(tmp_path):
     sc = _scenario(tmp_path, "exit 0")
     _, _, verdicts = _run(tmp_path, sc, fake_claude(tmp_path, body))
     assert verdicts[0]["verdict"] == "INCONCLUSIVE"
+
+
+def test_scenario_stub_mcp_config_is_passed_only_when_written(tmp_path):
+    """A setup.sh that writes RUN/mcp.json gets --mcp-config RUN/mcp.json (and
+    still --strict-mcp-config); one that does not gets no --mcp-config."""
+    body = ('printf \'%s\\n\' "$@" > "$E2E_RUN/argv"\n'
+            "cat <<'EOF'\n" + stream("ok", []) + "\nEOF\n")
+    claude = fake_claude(tmp_path, body)
+    with_mcp = _scenario(tmp_path, 'grep -qx -- "--mcp-config" "$1/argv" && '
+                                   'grep -qx -- "$1/mcp.json" "$1/argv" && '
+                                   'grep -qx -- "--strict-mcp-config" "$1/argv"')
+    (with_mcp / "setup.sh").write_text('#!/usr/bin/env bash\necho "{}" > "$2/mcp.json"\n')
+    _, _, verdicts = _run(tmp_path, with_mcp, claude)
+    assert [v["verdict"] for v in verdicts] == ["PASS"]
+
+    without = tmp_path / "plain"
+    without.mkdir()
+    (without / "prompt.md").write_text("do it\n")
+    (without / "setup.sh").write_text("#!/usr/bin/env bash\ntrue\n")
+    (without / "check.sh").write_text(
+        '#!/usr/bin/env bash\ntest -f "$1/argv" && ! grep -qx -- "--mcp-config" "$1/argv"\n')
+    _, out, _ = _run(tmp_path, without, claude)
+    plain = json.loads((out / "plain/new/1/verdict.json").read_text())
+    assert plain["verdict"] == "PASS"
