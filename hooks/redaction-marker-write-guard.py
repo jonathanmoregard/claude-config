@@ -3,7 +3,9 @@
 
 Secrets are redacted out of every tool result the model reads
 (``tool-output-redact.py``, ``bash-output-guard.py``): the model sees
-``[REDACTED:<rule>:<n>chars]`` where the file holds the real value. The file
+``[REDACTED:<rule>:<n>chars]`` where the file holds the real value (the
+aggregator's memory search still returns the older short ``[REDACTED:<rule>]``;
+both spellings count). The file
 on disk is untouched — until the model writes back what it saw. Read an
 ``.env``, change one line, Write the whole file: the secret on disk is now the
 marker, and the credential is gone. Redaction made that mistake possible, so
@@ -41,7 +43,10 @@ import sys
 
 FILE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 NEEDLE = "[REDACTED:"
-MARKER_RE = re.compile(r"\[REDACTED:[A-Za-z0-9_.\-]+:\d+chars\]")
+# Both spellings that reach the model: `[REDACTED:<rule>:<n>chars]` from the
+# output hooks, and the historic short `[REDACTED:<rule>]` the aggregator still
+# returns in memory-search results.
+MARKER_RE = re.compile(r"\[REDACTED:[A-Za-z0-9_.\-]+(?::\d+chars)?\]")
 MAX_READ_BYTES = 16 * 1024 * 1024
 
 RECOVER = (
@@ -52,7 +57,7 @@ RECOVER = (
     "(e.g. `sed -i '<N>s/.../.../'` on a line that does not hold the secret). "
     "If you need the secret line itself changed, ask the user to do it. If the "
     "marker text is meant literally (docs, tests), write it so it does not form "
-    "a complete marker, e.g. `[REDACTED:<rule>:<n>chars]`."
+    "a complete marker, e.g. `[REDACTED:<rule>:<n>chars]` or `[REDACTED:<rule>]`."
 )
 
 

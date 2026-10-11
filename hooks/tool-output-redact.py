@@ -41,10 +41,11 @@ FAIL-CLOSED
 -----------
 A PostToolUse hook cannot un-run a tool, so failing closed means WITHHOLDING:
 gitleaks missing, crashing, past the deadline, an output too large to scan,
-or any fault in this file replaces every free-text string (anything holding
-whitespace) with a notice saying so and how to recover. Whitespace-free
-strings — paths, ids, enum values the schema may pin — keep their place
-after the regex floor. The withheld value has the original's exact shape, so
+or any fault in this file replaces every string that could carry a secret —
+free text (anything holding whitespace) and token-shaped strings (16+ token
+characters mixing letters and digits) — with a notice saying so and how to
+recover. Other whitespace-free strings — enum and literal values the schema
+may pin — keep their place after the regex floor. The withheld value has the original's exact shape, so
 the CLI applies it.
 
 A stdin this hook cannot parse gives it no shape to withhold INTO. It exits 2,
@@ -70,6 +71,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import sys
 import time
@@ -235,12 +237,30 @@ def _not_inspected(detail: str) -> None:
     os._exit(2)
 
 
+# A whitespace-free string that could BE a credential: a run of 16+ token
+# characters mixing letters and digits. Enum and literal values (`text`,
+# `completed`, `image/png`, `files_with_matches`) never match, so they keep
+# their place; a bare token — a Read of a one-line key file, an MCP text block
+# holding only a key — does, and is withheld with the rest.
+_TOKENISH_RE = re.compile(r"[A-Za-z0-9_+/=.\-]{16,}")
+
+
+def _tokenish(s: str) -> bool:
+    for run in _TOKENISH_RE.findall(s):
+        if any(c.isdigit() for c in run) and any(c.isalpha() for c in run):
+            return True
+    return False
+
+
 def _withheld_value(response, detail: str):
-    """``response`` with every free-text string replaced by the notice.
+    """``response`` with every string that could carry a secret replaced by
+    the notice: free text (anything holding whitespace) and token-shaped
+    strings. Other whitespace-free strings — the enum/literal/path slots a
+    schema may pin — keep their place after the regex floor.
 
     Shape-preserving by construction (see the module docstring), so the CLI
-    applies it. Whitespace-free strings keep their place after the floor:
-    those are the enum/literal/path slots a schema may pin.
+    applies it. The walk has NO depth cut: everything below MAX_DEPTH is
+    exactly what was not inspected, so it is withheld like the rest.
     """
     from secret_redaction import floor_redact  # pure Python, no I/O
 
@@ -249,29 +269,29 @@ def _withheld_value(response, detail: str):
     def leaf(s: str) -> str:
         if not s:
             return s
-        if any(ch.isspace() for ch in s):
+        if any(ch.isspace() for ch in s) or _tokenish(s):
             if first[0]:
                 first[0] = False
                 return _withheld_text(detail)
             return _SHORT_WITHHELD
         return floor_redact(s) or s
 
-    def walk(v, depth=0, binary=False):
+    def walk(v, binary=False):
         if isinstance(v, str):
             return v if binary else leaf(v)
-        if depth > MAX_DEPTH:
-            # Nothing below the cut was inspected: blank what can be blanked
-            # without changing type.
-            return v
         if isinstance(v, dict):
-            return {k: walk(x, depth + 1, binary or _is_binary_slot(v, k)) for k, x in v.items()}
+            return {k: walk(x, binary or _is_binary_slot(v, k)) for k, x in v.items()}
         if isinstance(v, list):
-            return [walk(x, depth + 1, binary) for x in v]
+            return [walk(x, binary) for x in v]
         return v
 
-    out = walk(response)
+    try:
+        out = walk(response)
+    except RecursionError:
+        return None  # deeper than Python can walk: not inspected, say so
     if first[0] and out == response:
-        # Nothing free-text to hold back. Say so instead of silently passing.
+        # Nothing that could hold a secret to hold back. Say so instead of
+        # silently passing.
         return None
     return out
 

@@ -456,12 +456,38 @@ rc, upd, raw, err, _ = run_hook(None, raw_stdin="{not json")
 check("unparseable stdin: exit 2 with a not-inspected notice", rc == 2 and "NOT INSPECTED" in err,
       f"rc={rc} err={err[:200]}")
 
-_deep = f"v={tok('gitlab')}"
+# A token that is the WHOLE string (no whitespace): a Read of a one-line key
+# file without a trailing newline, an MCP text block holding only a key. The
+# withhold used to leave whitespace-free strings in place, find nothing to
+# hold back, exit 2 — and the CLI showed the ORIGINAL.
+for _label, _tool, _mk in (
+    ("Read of a token-only file", "Read", lambda t: {"type": "text", "file": {
+        "filePath": "/w/key", "content": t, "numLines": 1, "startLine": 1, "totalLines": 1}}),
+    ("MCP bare-token text block", "mcp__x__y", lambda t: [{"type": "text", "text": t}]),
+    ("MCP bare-token string", "mcp__x__z", lambda t: t),
+):
+    _tb = tok("gitlab")
+    _rb = _mk(_tb)
+    rc, upd, raw, err, _ = run_hook(payload(_tool, _rb), script=_missing,
+                                    env_extra={"PATH": "/nonexistent"})
+    withheld_ok(f"gitleaks missing, {_label}", _rb, upd, raw, _tb)
+    check(f"gitleaks missing, {_label}: applied as a rewrite (exit 0), not exit 2", rc == 0,
+          f"rc={rc}")
+
+# Past MAX_DEPTH nothing was inspected, so the withhold must cover it too —
+# not hand the subtree back verbatim inside the "withheld" rewrite.
+_deep_tok = tok("gitlab")
+_deep = f"v={_deep_tok}"
 for _ in range(40):
     _deep = {"d": _deep}
-rc, upd, raw, err, _ = run_hook(payload("SomeTool", _deep))
-check("a result nested past MAX_DEPTH is withheld, not passed", TOKENS[-1] not in raw and
-      (WITHHELD in raw or rc == 2), f"rc={rc} out={raw[:200]}")
+_deep_resp = {"deep": _deep, "note": "shallow free text"}
+for _label, _script, _env in (("gitleaks present", HOOK, None),
+                              ("gitleaks missing", _missing, {"PATH": "/nonexistent"})):
+    rc, upd, raw, err, _ = run_hook(payload("SomeTool", _deep_resp), script=_script, env_extra=_env)
+    check(f"{_label}: a result nested past MAX_DEPTH is withheld, deep token included",
+          _deep_tok not in raw and WITHHELD in raw and rc == 0, f"rc={rc} out={raw[:200]}")
+    check(f"{_label}: the deep withhold keeps the original's shape",
+          upd is not None and hook._same_shape(_deep_resp, upd))
 
 
 # ----------------------------------------------------------------------
@@ -563,6 +589,24 @@ check("the placeholder spelling of a marker is not a marker", dec is None, raw[:
 rc, dec, raw, _ = guard("NotebookEdit", {"notebook_path": os.path.join(_envdir, "n.ipynb"),
                                          "cell_id": "c1", "new_source": f"k = '{_m2}'"})
 check("a NotebookEdit adding a marker is denied", dec == "deny", raw[:200])
+
+# The aggregator's memory search returns the historic short form, no length.
+_short = "[REDACTED:" + "github-token]"
+rc, dec, raw, _ = guard("Write", {"file_path": _env, "content": f"GITLAB_TOKEN={_short}\n"})
+check("a Write carrying the SHORT marker form over the secret is denied", dec == "deny", raw[:200])
+with open(_env, encoding="utf-8") as fh:
+    check("and the secret is still on disk", _tw in fh.read())
+rc, dec, raw, _ = guard("Edit", {"file_path": _env, "old_string": "LOG_LEVEL=info",
+                                 "new_string": f"LOG_LEVEL=info\nK={_short}"})
+check("an Edit adding a SHORT marker is denied", dec == "deny", raw[:200])
+with open(_notes, "a", encoding="utf-8") as fh:
+    fh.write(f"Older form: {_short}\n")
+rc, dec, raw, _ = guard("Edit", {"file_path": _notes, "old_string": f"form: {_short}",
+                                 "new_string": f"form, still: {_short}"})
+check("editing around a SHORT marker the file already holds is allowed", dec is None, raw[:200])
+rc, dec, raw, _ = guard("Write", {"file_path": os.path.join(_envdir, "new2.md"),
+                                  "content": "docs: [REDACTED:<rule>] is the short placeholder"})
+check("the short placeholder spelling is not a marker", dec is None, raw[:200])
 
 _unreadable = os.path.join(_envdir, "locked.env")
 with open(_unreadable, "w", encoding="utf-8") as fh:
