@@ -68,6 +68,7 @@ User instructions override everything below.
 
 ## Collaboration
 - Short replies ("a", "1y 2y 3n", "sounds good") mean engaged and moving fast. Match it.
+- Number every list and table row in replies (`1.` / a `#` column), never bare bullets, so items can be answered by number.
 - Propose A/B/C with a recommendation, not open-ended questions.
 - Fold mid-flight corrections in silently. Don't restart the flow.
 - Do exactly what was asked, no more. Adjacent idea → one sentence, don't act unless confirmed.
