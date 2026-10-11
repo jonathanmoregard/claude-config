@@ -75,6 +75,13 @@ def section(name: str) -> None:
 
 
 SCRATCH = tempfile.mkdtemp(prefix="bash-output-guard-test-")
+# Fault-injected copies of bash-output-guard.py are written here and load the
+# shared redaction module (and its gitleaks rules) from beside themselves.
+for _shared in ("secret_redaction.py", "secret-rules.toml"):
+    __import__("shutil").copy(
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks", _shared),
+        SCRATCH,
+    )
 
 _spec = importlib.util.spec_from_file_location("bash_output_guard_under_test", GUARD)
 guard = importlib.util.module_from_spec(_spec)
@@ -1066,6 +1073,8 @@ E2E_SECRETS = {
         + "." + "dBjftJeZ4CVP" + "mB92K27uhbUJU1p1r-wW1gFWFOEjXk"
     ),
     "tavily-key": "tvly" + "-" + ("F" * 28),
+    "cloudflare-token": "cfut" + "_" + ("G" * 40) + ("a1" * 4),
+    "google-oauth-secret": "GOCSPX" + "-" + ("H" * 28),
 }
 
 check(
@@ -1081,10 +1090,11 @@ check(
 # quietly falling outside the drift guard that exists to stop exactly that.
 check(
     "the private-key scanner is wired into the redactor",
-    "_redact_private_keys" in guard._redact_secrets.__code__.co_names,
+    "redact_private_keys" in guard._SR.floor_redact.__code__.co_names
+    and "floor_redact" in guard._redact_secrets.__code__.co_names,
     "keys are a separate mechanism; if it is not called, nothing redacts them",
 )
-for _marker_re, _which in ((guard._KEY_BEGIN_RE, "BEGIN"), (guard._KEY_END_RE, "END")):
+for _marker_re, _which in ((guard._SR._KEY_BEGIN_RE, "BEGIN"), (guard._SR._KEY_END_RE, "END")):
     check(
         f"the {_which} marker regex spans no body",
         r"[\s\S]" not in _marker_re.pattern,
@@ -1326,8 +1336,8 @@ check(
 # orphan END redacts from the segment start through the marker. Both
 # over-redact on purpose; a false negative here is a leaked key.
 _end_only = f"{_PEM_BODY}\n{_TRACER}\n{_armor('RSA', 'END')}\nafter the marker\n"
-for _fn_name in ("_redact_private_keys", "_redact_secrets"):
-    _got = getattr(guard, _fn_name)(_end_only)
+for _fn_name, _fn in (("redact_private_keys", guard._SR.redact_private_keys), ("_redact_secrets", guard._redact_secrets)):
+    _got = _fn(_end_only)
     check(
         f"an END-only RSA key tail is redacted by {_fn_name}",
         _TRACER not in _got
@@ -1345,8 +1355,8 @@ for _fn_name in ("_redact_private_keys", "_redact_secrets"):
 # The PGP spelling ends in `KEY BLOCK-----`; an orphan-END rule that only
 # knew `KEY-----` would pass a gpg export's tail through whole.
 _pgp_end_only = f"{_PEM_BODY}\n{_TRACER}\n{_armor('PGP', 'END')}\n"
-for _fn_name in ("_redact_private_keys", "_redact_secrets"):
-    _got = getattr(guard, _fn_name)(_pgp_end_only)
+for _fn_name, _fn in (("redact_private_keys", guard._SR.redact_private_keys), ("_redact_secrets", guard._redact_secrets)):
+    _got = _fn(_pgp_end_only)
     check(
         f"an END-only PGP KEY BLOCK tail is redacted by {_fn_name}",
         _TRACER not in _got
@@ -1366,7 +1376,7 @@ _mixed = (
     + _armor("EC", "END")
     + "\nuntouched tail\n"
 )
-_got = guard._redact_private_keys(_mixed)
+_got = guard._SR.redact_private_keys(_mixed)
 check(
     "a full block followed by a lone END yields two redactions, no survivors",
     _got.count("[REDACTED:private-key:") == 2
@@ -1391,9 +1401,9 @@ check(
 _plain = "no armor markers here; keys are discussed but never printed.\n"
 check(
     "control: prose with no markers passes unchanged",
-    guard._redact_private_keys(_plain) == _plain
+    guard._SR.redact_private_keys(_plain) == _plain
     and guard._redact_secrets(_plain) == _plain,
-    guard._redact_private_keys(_plain)[:120],
+    guard._SR.redact_private_keys(_plain)[:120],
 )
 
 # No false positives: prose about keys is not a key.
@@ -2034,8 +2044,8 @@ check_withheld("hook stdin cannot be read", parsed, updated)
 _redactor_fault = patched_guard(
     "guard-redactor-fault.py",
     (
-        "    for label, pat in _SECRET_PATTERNS:",
-        '    raise RuntimeError("injected redactor fault")\n    for label, pat in _SECRET_PATTERNS:',
+        "        return _SR.redact_strings(strings, _scan_deadline())",
+        '        raise RuntimeError("injected redactor fault")',
     ),
 )
 _s = secret("N")
@@ -2160,11 +2170,21 @@ for _matcher, _cmd in _siblings:
         continue
     with open(_script, "r", encoding="utf-8", errors="replace") as _fh:
         _sib_src = _fh.read()
+    if "updatedToolOutput" not in _sib_src:
+        check(f"{_label} -> never returns updatedToolOutput", True)
+        continue
+    # A sibling that CAN rewrite (tool-output-redact.py redacts every
+    # non-Bash tool) must be shown, by running it, to leave a Bash result
+    # alone — a source grep cannot tell "skips Bash" from "rewrites Bash".
+    _rc, _parsed, _raw, _err = run_hook(
+        _script,
+        post_payload("cat /tmp/x", response_obj(f"KEY={secret('S')}\nplain text\n")),
+    )
     check(
-        f"{_label} -> never returns updatedToolOutput",
-        "updatedToolOutput" not in _sib_src,
-        f"{_script} names updatedToolOutput; under last-write-wins it can "
-        f"restore bytes this guard redacted",
+        f"{_label} -> names updatedToolOutput but emits NOTHING for a Bash result",
+        _rc == 0 and _raw.strip() == "",
+        f"rc={_rc} out={_raw[:120]!r}; under last-write-wins it can restore or "
+        "replace bytes this guard rewrote",
     )
 
 

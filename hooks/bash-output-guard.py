@@ -13,6 +13,9 @@ Two layers:
      positives are acceptable — the model knows what it asked for, and the
      marker tells it the call succeeded but the value is gated. False
      negatives are not: every missed pattern is a future incident.
+     Detection is shared with every other tool's output
+     (``tool-output-redact.py``) through ``secret_redaction.py``: a regex
+     floor plus gitleaks' ~220 provider rules. A gitleaks fault withholds.
   2. Untrusted-ingress tagging. Output from curl/wget/npx, gh fetches, gh
      api, git clone and package installs is wrapped in
      ``<untrusted_external_content>`` so it reads as data, not instructions.
@@ -122,6 +125,7 @@ import re
 import shlex
 import signal
 import sys
+import time
 
 # --- Timeout ladder. See bash-guard.py for why the relationship matters.
 HARNESS_HOOK_TIMEOUT_S = 10
@@ -590,159 +594,120 @@ def _disarm_watchdog() -> None:
 
 
 # ----------------------------------------------------------------------
-# Layer 1: secret redaction (ported from mcps/safe-bash/server.py)
+# Layer 1: secret redaction — hooks/secret_redaction.py
 # ----------------------------------------------------------------------
-# High-entropy secret prefixes. Prefixes only — generic high-entropy
-# matching is too false-positive prone (hashes, nix store paths, base64).
-_SECRET_PATTERNS: list[tuple[str, "re.Pattern[str]"]] = [
-    ("anthropic-api", re.compile(r"sk-ant-(?:api|oat)\d{2}-[A-Za-z0-9_\-]{20,}")),
-    ("openai-project", re.compile(r"sk-proj-[A-Za-z0-9_\-]{20,}")),
-    ("openai-legacy", re.compile(r"sk-[A-Za-z0-9]{20,}")),
-    ("github-token", re.compile(r"\bgh[psoure]_[A-Za-z0-9]{36,}\b")),
-    ("github-pat", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{82}\b")),
-    ("slack-token", re.compile(r"\bxox[boaprs]-[A-Za-z0-9\-]{10,}\b")),
-    ("aws-access", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
-    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b")),
-    ("tavily-key", re.compile(r"\btvly-[A-Za-z0-9_\-]{20,}\b")),
-]
+# The detectors live in a module shared with tool-output-redact.py (every
+# non-Bash tool): the regex floor that used to sit here (prefix patterns and
+# the linear private-key scanner, unchanged) plus gitleaks over the floor's
+# output. See that module for both, and for why a gitleaks fault is a
+# WITHHOLD and never a silent drop to "floor only".
+#
+# Loaded by PATH, from beside this file, and at RUNTIME rather than with an
+# `import` at the top: a module that fails to load must turn into a withhold
+# inside main(), not a traceback before main() runs — a hook that dies with
+# exit 1 is a non-blocking error, and the CLI shows the ORIGINAL output.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+REDACTION_MODULE_PATH = os.path.join(_HERE, "secret_redaction.py")
 
 
-# ---- armored private keys: MARKERS matched, bodies never spanned ----------
-#
-# WHY THIS IS NOT A REGEX. The first version of this was the obvious pair —
-# `BEGIN...-----[\s\S]+?-----END...` plus a greedy `[\s\S]*` catcher for the
-# truncated case — and it was QUADRATIC. Each BEGIN with no END behind it makes
-# the engine scan to end-of-string before failing, so cost grows with
-# (BEGIN count x body length). MEASURED on this host, terminated pattern alone:
-#
-#   154 KB / 2000 BEGINs ->  2.6 s
-#   308 KB / 4000 BEGINs -> 11.9 s
-#   616 KB / 8000 BEGINs -> 44.2 s
-#
-# Doubling the input quadruples the time, and 308 KB already exceeds the
-# HARNESS_HOOK_TIMEOUT_S cap. That matters more than a slow hook: the harness
-# CANCELS a hook that overruns and DISCARDS its output, so the result reaches
-# the model unrewritten — and `_arm_watchdog`'s SIGALRM cannot save it, because
-# CPython runs a Python-level signal handler only when the interpreter regains
-# control and `re` does not return to it mid-match. A body shaped like this is
-# therefore a fail-OPEN, reachable by any command whose output an attacker
-# influences. The bound must come from the algorithm, not from a timer.
-#
-# So: find MARKERS (bounded, no body spanning, linear), then slice between
-# them with str.find. One pass, no backtracking, no dependency.
-#
-# TRUNCATION IS SYMMETRIC, AND SO IS THE CONTRACT. Redaction runs AFTER the
-# harness truncates (F11), and a cut can land on either side of a block:
-#
-#   * orphan BEGIN — the END was truncated away — redact from the BEGIN
-#     marker to end-of-string;
-#   * orphan END — the BEGIN is not in view: the tail of a key file,
-#     `grep -A`, head-side truncation — redact from the start of the
-#     current unredacted segment through the END marker.
-#
-# The first version anchored on BEGIN alone, so an END-only tail passed
-# byte-identical: key-body bytes and the END marker, zero redaction, silent.
-# Both orphan rules OVER-redact — the orphan-END rule swallows any prose
-# sitting between the segment start and the marker. That is the accepted
-# direction, per the bar at the top of this file: a false positive costs the
-# reader a visible [REDACTED] marker and a re-run, a false negative is a
-# leaked key.
-#
-# The marker vocabulary also fixes a false negative the regex had: PGP armor is
-# `-----BEGIN PGP PRIVATE KEY BLOCK-----`, which ends in `KEY BLOCK-----` and
-# not `KEY-----`, so `gpg --export-secret-keys` output passed through WHOLE.
-# `(?: BLOCK)?` covers it; `[A-Z0-9 ]*` covers PKCS#8 (`BEGIN PRIVATE KEY`),
-# ENCRYPTED, RSA, DSA, EC, OPENSSH and SSH2.
-#
-# KNOWN, DELIBERATE SCOPE: the 4-dash spaced SSH2 form
-# (`---- BEGIN SSH2 ENCRYPTED PRIVATE KEY ----`) and PuTTY's
-# `PuTTY-User-Key-File-2:` header are different shapes and are NOT matched. Both
-# are rare in tool output on this host; add them here rather than by widening
-# the marker regex into prose-matching territory.
-_KEY_BEGIN_RE = re.compile(r"-----BEGIN (?:[A-Z0-9 ]*)PRIVATE KEY(?: BLOCK)?-----")
-_KEY_END_RE = re.compile(r"-----END (?:[A-Z0-9 ]*)PRIVATE KEY(?: BLOCK)?-----")
+def _load_redaction_module():
+    try:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "secret_redaction_for_bash_output_guard", REDACTION_MODULE_PATH
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(f"no loader for {REDACTION_MODULE_PATH}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module, None
+    except Exception as exc:  # noqa: BLE001 — reported by main() as a withhold
+        return None, f"{type(exc).__name__}: {exc}"
 
 
-def _redact_private_keys(body: str) -> str:
-    """Replace every armored private-key block, terminated or not, in ONE pass.
+_SR, _SR_LOAD_ERROR = _load_redaction_module()
 
-    Symmetric truncation contract (see the comment block above): an orphan
-    BEGIN redacts to end-of-string, an orphan END redacts from the segment
-    start through the marker. Over-redaction is the accepted direction.
+# The floor's pattern table, re-exported so the test suite's "every pattern
+# has a test row" check keeps reading the table the guard actually runs.
+_SECRET_PATTERNS = list(_SR.SECRET_PATTERNS) if _SR else []
 
-    LINEARITY is load-bearing — the quadratic regex this replaced was a
-    fail-open (see above). The invariant that keeps it: ``pos`` only moves
-    forward, and the next BEGIN is CACHED and re-searched only once the scan
-    has consumed it, so no position is scanned more than a constant number of
-    times. An ENDs-only body must not make the BEGIN search restart from
-    every marker.
-    """
-    out: list[str] = []
-    pos = 0
-    begin = _KEY_BEGIN_RE.search(body, pos)
-    while True:
-        end = _KEY_END_RE.search(body, pos)
-        if end is not None and (begin is None or end.start() < begin.start()):
-            # Orphaned END: no BEGIN in view before it, so the bytes in front
-            # of the marker are the tail of a key whose head is not in this
-            # body (head-side truncation semantics). Everything from the
-            # segment start through the marker goes as one block.
-            out.append(f"[REDACTED:private-key:{end.end() - pos}chars]")
-            pos = end.end()
-            if begin is not None and begin.start() < pos:
-                begin = _KEY_BEGIN_RE.search(body, pos)
-            continue
-        if begin is None:
-            out.append(body[pos:])
-            return "".join(out)
-        out.append(body[pos : begin.start()])
-        if end is not None and end.start() < begin.end():
-            # The cached END starts inside the BEGIN marker itself (only
-            # possible when the two share trailing/leading dashes). BEGIN
-            # pairs with the next END past its own marker, as always.
-            end = _KEY_END_RE.search(body, begin.end())
-        # No END means truncation cut it off (F11: redaction runs AFTER the
-        # harness truncates). Everything from BEGIN onward goes — an END that
-        # was never emitted must not leave the body behind.
-        stop = end.end() if end else len(body)
-        out.append(f"[REDACTED:private-key:{stop - begin.start()}chars]")
-        pos = stop
-        begin = _KEY_BEGIN_RE.search(body, pos)
+# Set by main() when it starts: the gitleaks scan gets whatever is left of
+# GUARD_DEADLINE_S, minus a margin for building and writing the rewrite.
+_STARTED: float | None = None
+_DEADLINE_MARGIN_S = 0.5
+
+
+def _scan_deadline() -> float:
+    started = _STARTED if _STARTED is not None else time.monotonic()
+    return started + GUARD_DEADLINE_S - _DEADLINE_MARGIN_S
+
+
+def _require_redactor() -> None:
+    if _SR is None:
+        _withhold(
+            f"the shared redaction module could not be loaded from "
+            f"{REDACTION_MODULE_PATH!r} ({_SR_LOAD_ERROR})"
+        )
 
 
 def _redact_secrets(body: str) -> str:
-    """Replace known-shape secret values with `[REDACTED:<label>:<len>chars]`."""
-    # Keys first: a block is replaced whole before any prefix pattern can
-    # nibble at its interior. A partly-rewritten key is still a key, and a
-    # `[REDACTED:...]` marker inside the body would corrupt the length report.
-    body = _redact_private_keys(body)
-    for label, pat in _SECRET_PATTERNS:
-        body = pat.sub(
-            lambda m, _label=label: f"[REDACTED:{_label}:{len(m.group(0))}chars]",
-            body,
-        )
-    return body
+    """The regex FLOOR only: prefixes and private-key blocks. Pure Python,
+    linear, no subprocess. ``_redact_batch`` adds gitleaks on top."""
+    _require_redactor()
+    return _SR.floor_redact(body)
 
 
-def _redact_tree(value, depth: int = 0):
+def _redact_batch(strings: list[str]) -> list[str]:
+    """Floor + ONE gitleaks scan over every string. A scanner that cannot
+    vouch for the batch withholds."""
+    _require_redactor()
+    try:
+        return _SR.redact_strings(strings, _scan_deadline())
+    except _SR.ScanError as exc:
+        _withhold(f"the gitleaks secret scan failed: {exc}")
+
+
+def _redact_tree(value):
     """Redact every string anywhere in the result, whatever field it is in.
 
     Two named fields is a list that goes stale the moment the tool result
-    grows a third. This walks whatever arrived.
+    grows a third. This walks whatever arrived, collects every string, scans
+    them as ONE gitleaks batch, and puts the results back in place.
     """
-    if depth > MAX_RESULT_DEPTH:
-        _withhold(
-            f"the tool result nests deeper than {MAX_RESULT_DEPTH} levels, so the "
-            "guard stopped walking it and cannot say the bytes below that point "
-            "were inspected"
-        )
-    if isinstance(value, str):
-        return _redact_secrets(value)
-    if isinstance(value, dict):
-        return {k: _redact_tree(v, depth + 1) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_redact_tree(v, depth + 1) for v in value]
-    return value
+    leaves: list[str] = []
+
+    def collect(v, depth: int) -> None:
+        if depth > MAX_RESULT_DEPTH:
+            _withhold(
+                f"the tool result nests deeper than {MAX_RESULT_DEPTH} levels, so the "
+                "guard stopped walking it and cannot say the bytes below that point "
+                "were inspected"
+            )
+        if isinstance(v, str):
+            leaves.append(v)
+        elif isinstance(v, dict):
+            for x in v.values():
+                collect(x, depth + 1)
+        elif isinstance(v, list):
+            for x in v:
+                collect(x, depth + 1)
+
+    collect(value, 0)
+    if not leaves:
+        return value
+    it = iter(_redact_batch(leaves))
+
+    def rebuild(v):
+        if isinstance(v, str):
+            return next(it)
+        if isinstance(v, dict):
+            return {k: rebuild(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [rebuild(x) for x in v]
+        return v
+
+    return rebuild(value)
 
 
 def _persisted_is_harness_owned(path: str) -> bool:
@@ -782,7 +747,11 @@ def _scrub_persisted(path: str) -> tuple[bool, str, int]:
             body = fh.read()
     except OSError as exc:
         return False, f"it could not be read ({type(exc).__name__})", 0
-    scrubbed = _redact_secrets(body)
+    _require_redactor()
+    try:
+        scrubbed = _SR.redact_strings([body], _scan_deadline())[0]
+    except _SR.ScanError as exc:
+        return False, f"the gitleaks secret scan of it failed ({exc})", 0
     if scrubbed == body:
         return True, "", size
     tmp = path + ".bash-output-guard.tmp"
@@ -1288,7 +1257,8 @@ def _load_config() -> dict:
 
 
 def main() -> int:
-    global _SHAPE
+    global _SHAPE, _STARTED
+    _STARTED = time.monotonic()
 
     if not _TIMEOUTS_SANE:
         _withhold(
@@ -1321,6 +1291,8 @@ def main() -> int:
     if isinstance(response, dict):
         _SHAPE = response
 
+    _require_redactor()
+
     tool_input = payload.get("tool_input")
     command = ""
     if isinstance(tool_input, dict):
@@ -1338,7 +1310,7 @@ def main() -> int:
         # is an OBJECT, so a string rewrite is refused and the unredacted
         # original is shown instead. The redaction only survives as a result
         # object, so that is what goes back.
-        new_body = _redact_secrets(response)
+        new_body = _redact_batch([response])[0]
         if label:
             new_body = _wrap(new_body, label, command, reminder=True)
         _disarm_watchdog()

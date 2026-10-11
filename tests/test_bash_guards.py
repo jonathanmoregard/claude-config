@@ -56,6 +56,13 @@ def section(name: str) -> None:
 # Harness
 # ----------------------------------------------------------------------
 SCRATCH = tempfile.mkdtemp(prefix="bash-guards-test-")
+# Fault-injected copies of bash-output-guard.py are written here and load the
+# shared redaction module (and its gitleaks rules) from beside themselves.
+for _shared in ("secret_redaction.py", "secret-rules.toml"):
+    __import__("shutil").copy(
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks", _shared),
+        SCRATCH,
+    )
 
 
 def _write_stub(name: str, body: str, executable: bool = True) -> str:
@@ -1479,6 +1486,8 @@ SECRETS = [
     ("aws-access", "AK" + "IA" + "E" * 16),
     ("jwt", "ey" + "J" + "abcdefghij" + "." + "ey" + "J" + "klmnopqrst" + "." + "uvwxyz1234"),
     ("tavily-key", "tv" + "ly-" + "F" * 24),
+    ("cloudflare-token", "cf" + "at_" + "G" * 40 + "0a" * 4),
+    ("google-oauth-secret", "GOC" + "SPX-" + "H" * 28),
     # Private keys, the class safe-bash omitted. Terminated here because the
     # row below plants the value in `KEY=<secret>\n` and asserts on what
     # follows; the unterminated spelling (the one truncation produces) has
