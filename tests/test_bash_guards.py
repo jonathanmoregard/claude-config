@@ -1630,13 +1630,15 @@ _spec2 = importlib.util.spec_from_file_location(
 )
 out_guard = importlib.util.module_from_spec(_spec2)
 _spec2.loader.exec_module(out_guard)
+sys.path.insert(0, HOOKS)
+import secret_redaction as sr  # noqa: E402  (the output guard's detectors)
 
 WITHHELD_MARKER = "the output guard is BROKEN"
 
 # A redaction pattern with no test row is a pattern nobody has ever watched
 # fire. safe-bash shipped all nine of them with exactly that much evidence.
 _untested_secrets = [
-    label for label, _ in out_guard._SECRET_PATTERNS if label not in {l for l, _ in SECRETS}
+    label for label, _ in sr.SECRET_PATTERNS if label not in {l for l, _ in SECRETS}
 ]
 check(
     "every secret pattern in the guard has a test row",

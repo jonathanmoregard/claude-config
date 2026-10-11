@@ -86,6 +86,8 @@ for _shared in ("secret_redaction.py", "gitleaks_driver.py", "secret-rules.toml"
 _spec = importlib.util.spec_from_file_location("bash_output_guard_under_test", GUARD)
 guard = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(guard)
+sys.path.insert(0, HOOKS)
+import secret_redaction as sr  # noqa: E402  (the guard's detectors)
 
 with open(GUARD, encoding="utf-8") as fh:
     GUARD_SRC = fh.read()
@@ -668,7 +670,7 @@ os.chmod(_p_bad, 0o600)
 # Oversized: scanning 17 MiB costs ~7 s, past the guard's own 6 s deadline.
 # Bigger than the scan limit means the pointer goes, not that the guard
 # blows its deadline and gets its output discarded by the harness.
-_scan_limit = getattr(guard, "PERSISTED_SCAN_LIMIT_BYTES", 4 * 1024 * 1024)
+_scan_limit = sr.MAX_SCAN_BYTES
 _p_big = persisted("oversized.txt", "x" * (_scan_limit + 1))
 parsed, updated, raw = bash_out(
     "cat /tmp/huge",
@@ -1079,22 +1081,22 @@ E2E_SECRETS = {
 
 check(
     "every configured redaction pattern has an end-to-end fixture",
-    {label for label, _ in guard._SECRET_PATTERNS} == set(E2E_SECRETS),
+    {label for label, _ in sr.SECRET_PATTERNS} == set(E2E_SECRETS),
     "untested: "
-    + str(sorted({label for label, _ in guard._SECRET_PATTERNS} - set(E2E_SECRETS))),
+    + str(sorted({label for label, _ in sr.SECRET_PATTERNS} - set(E2E_SECRETS))),
 )
 
-# Private keys are NOT in _SECRET_PATTERNS — they are a marker scan, because a
+# Private keys are NOT in SECRET_PATTERNS — they are a marker scan, because a
 # BEGIN..END regex was quadratic (F12). The equality check above therefore
 # cannot see them, so the second mechanism gets its own coverage rather than
 # quietly falling outside the drift guard that exists to stop exactly that.
 check(
     "the private-key scanner is wired into the redactor",
-    "redact_private_keys" in guard._SR.floor_redact.__code__.co_names
+    "redact_private_keys" in sr.floor_redact.__code__.co_names
     and "floor_redact" in guard._redact_secrets.__code__.co_names,
     "keys are a separate mechanism; if it is not called, nothing redacts them",
 )
-for _marker_re, _which in ((guard._SR._KEY_BEGIN_RE, "BEGIN"), (guard._SR._KEY_END_RE, "END")):
+for _marker_re, _which in ((sr._KEY_BEGIN_RE, "BEGIN"), (sr._KEY_END_RE, "END")):
     check(
         f"the {_which} marker regex spans no body",
         r"[\s\S]" not in _marker_re.pattern,
@@ -1336,7 +1338,7 @@ check(
 # orphan END redacts from the segment start through the marker. Both
 # over-redact on purpose; a false negative here is a leaked key.
 _end_only = f"{_PEM_BODY}\n{_TRACER}\n{_armor('RSA', 'END')}\nafter the marker\n"
-for _fn_name, _fn in (("redact_private_keys", guard._SR.redact_private_keys), ("_redact_secrets", guard._redact_secrets)):
+for _fn_name, _fn in (("redact_private_keys", sr.redact_private_keys), ("_redact_secrets", guard._redact_secrets)):
     _got = _fn(_end_only)
     check(
         f"an END-only RSA key tail is redacted by {_fn_name}",
@@ -1355,7 +1357,7 @@ for _fn_name, _fn in (("redact_private_keys", guard._SR.redact_private_keys), ("
 # The PGP spelling ends in `KEY BLOCK-----`; an orphan-END rule that only
 # knew `KEY-----` would pass a gpg export's tail through whole.
 _pgp_end_only = f"{_PEM_BODY}\n{_TRACER}\n{_armor('PGP', 'END')}\n"
-for _fn_name, _fn in (("redact_private_keys", guard._SR.redact_private_keys), ("_redact_secrets", guard._redact_secrets)):
+for _fn_name, _fn in (("redact_private_keys", sr.redact_private_keys), ("_redact_secrets", guard._redact_secrets)):
     _got = _fn(_pgp_end_only)
     check(
         f"an END-only PGP KEY BLOCK tail is redacted by {_fn_name}",
@@ -1376,7 +1378,7 @@ _mixed = (
     + _armor("EC", "END")
     + "\nuntouched tail\n"
 )
-_got = guard._SR.redact_private_keys(_mixed)
+_got = sr.redact_private_keys(_mixed)
 check(
     "a full block followed by a lone END yields two redactions, no survivors",
     _got.count("[REDACTED:private-key:") == 2
@@ -1401,9 +1403,9 @@ check(
 _plain = "no armor markers here; keys are discussed but never printed.\n"
 check(
     "control: prose with no markers passes unchanged",
-    guard._SR.redact_private_keys(_plain) == _plain
+    sr.redact_private_keys(_plain) == _plain
     and guard._redact_secrets(_plain) == _plain,
-    guard._SR.redact_private_keys(_plain)[:120],
+    sr.redact_private_keys(_plain)[:120],
 )
 
 # No false positives: prose about keys is not a key.
@@ -2044,7 +2046,7 @@ check_withheld("hook stdin cannot be read", parsed, updated)
 _redactor_fault = patched_guard(
     "guard-redactor-fault.py",
     (
-        "        return _SR.redact_strings(strings, _scan_deadline())",
+        "        return sr.redact_value(value, _DEADLINE)",
         '        raise RuntimeError("injected redactor fault")',
     ),
 )

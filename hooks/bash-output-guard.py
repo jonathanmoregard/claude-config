@@ -13,9 +13,8 @@ Two layers:
      positives are acceptable — the model knows what it asked for, and the
      marker tells it the call succeeded but the value is gated. False
      negatives are not: every missed pattern is a future incident.
-     Detection is shared with every other tool's output
-     (``tool-output-redact.py``) through ``secret_redaction.py``: a regex
-     floor plus gitleaks' ~220 provider rules. A gitleaks fault withholds.
+     Detection is ``secret_redaction.py`` (regex floor + gitleaks), shared
+     with ``tool-output-redact.py``. A gitleaks fault withholds.
   2. Untrusted-ingress tagging. Output from curl/wget/npx, gh fetches, gh
      api, git clone and package installs is wrapped in
      ``<untrusted_external_content>`` so it reads as data, not instructions.
@@ -267,12 +266,6 @@ OUTPUT_POINTER_FIELDS = (
 # A real Bash result is flat. Anything deeper is a shape this guard was not
 # built for, and it stops walking rather than pass uninspected bytes on.
 MAX_RESULT_DEPTH = 8
-
-# Redacting 17 MiB costs ~7 s, past this guard's own 6 s deadline; 4 MiB
-# costs ~1.5 s. Over the limit the pointer is withheld instead — blowing
-# the deadline would hand the harness a timeout, which DISCARDS the hook's
-# output and rewrites nothing at all.
-PERSISTED_SCAN_LIMIT_BYTES = 4 * 1024 * 1024
 
 # The harness writes overflow output under <config dir>/projects/.../tool-results/.
 # The guard rewrites files only there, so a result naming some other path
@@ -594,120 +587,45 @@ def _disarm_watchdog() -> None:
 
 
 # ----------------------------------------------------------------------
-# Layer 1: secret redaction — hooks/secret_redaction.py
+# Layer 1: secret redaction — secret_redaction.py, imported by main() so a
+# module that cannot load is a withhold, not a traceback (exit 1 would show
+# the original output).
 # ----------------------------------------------------------------------
-# The detectors live in a module shared with tool-output-redact.py (every
-# non-Bash tool): the regex floor that used to sit here (prefix patterns and
-# the linear private-key scanner, unchanged) plus gitleaks over the floor's
-# output. See that module for both, and for why a gitleaks fault is a
-# WITHHOLD and never a silent drop to "floor only".
-#
-# Loaded by PATH, from beside this file, and at RUNTIME rather than with an
-# `import` at the top: a module that fails to load must turn into a withhold
-# inside main(), not a traceback before main() runs — a hook that dies with
-# exit 1 is a non-blocking error, and the CLI shows the ORIGINAL output.
-_HERE = os.path.dirname(os.path.abspath(__file__))
-REDACTION_MODULE_PATH = os.path.join(_HERE, "secret_redaction.py")
-
-
-def _load_redaction_module():
-    try:
-        import importlib.util
-
-        spec = importlib.util.spec_from_file_location(
-            "secret_redaction_for_bash_output_guard", REDACTION_MODULE_PATH
-        )
-        if spec is None or spec.loader is None:
-            raise ImportError(f"no loader for {REDACTION_MODULE_PATH}")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module, None
-    except Exception as exc:  # noqa: BLE001 — reported by main() as a withhold
-        return None, f"{type(exc).__name__}: {exc}"
-
-
-_SR, _SR_LOAD_ERROR = _load_redaction_module()
-
-# The floor's pattern table, re-exported so the test suite's "every pattern
-# has a test row" check keeps reading the table the guard actually runs.
-_SECRET_PATTERNS = list(_SR.SECRET_PATTERNS) if _SR else []
-
-# Set by main() when it starts: the gitleaks scan gets whatever is left of
-# GUARD_DEADLINE_S, minus a margin for building and writing the rewrite.
-_STARTED: float | None = None
-_DEADLINE_MARGIN_S = 0.5
-
-
-def _scan_deadline() -> float:
-    started = _STARTED if _STARTED is not None else time.monotonic()
-    return started + GUARD_DEADLINE_S - _DEADLINE_MARGIN_S
-
-
-def _require_redactor() -> None:
-    if _SR is None:
-        _withhold(
-            f"the shared redaction module could not be loaded from "
-            f"{REDACTION_MODULE_PATH!r} ({_SR_LOAD_ERROR})"
-        )
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sr = None  # the secret_redaction module, once main() has imported it
+_DEADLINE = 0.0  # set by main(): the time.monotonic() instant scans must end by
 
 
 def _redact_secrets(body: str) -> str:
-    """The regex FLOOR only: prefixes and private-key blocks. Pure Python,
-    linear, no subprocess. ``_redact_batch`` adds gitleaks on top."""
-    _require_redactor()
-    return _SR.floor_redact(body)
+    """The regex floor alone."""
+    import secret_redaction
 
-
-def _redact_batch(strings: list[str]) -> list[str]:
-    """Floor + ONE gitleaks scan over every string. A scanner that cannot
-    vouch for the batch withholds."""
-    _require_redactor()
-    try:
-        return _SR.redact_strings(strings, _scan_deadline())
-    except _SR.ScanError as exc:
-        _withhold(f"the gitleaks secret scan failed: {exc}")
+    return secret_redaction.floor_redact(body)
 
 
 def _redact_tree(value):
     """Redact every string anywhere in the result, whatever field it is in.
 
     Two named fields is a list that goes stale the moment the tool result
-    grows a third. This walks whatever arrived, collects every string, scans
-    them as ONE gitleaks batch, and puts the results back in place.
+    grows a third. This walks whatever arrived.
     """
-    leaves: list[str] = []
+    if _nesting(value) > MAX_RESULT_DEPTH:
+        _withhold(
+            f"the tool result nests deeper than {MAX_RESULT_DEPTH} levels, so the "
+            "guard stopped walking it and cannot say the bytes below that point "
+            "were inspected"
+        )
+    try:
+        return sr.redact_value(value, _DEADLINE)
+    except sr.ScanError as exc:
+        _withhold(f"the gitleaks secret scan failed: {exc}")
 
-    def collect(v, depth: int) -> None:
-        if depth > MAX_RESULT_DEPTH:
-            _withhold(
-                f"the tool result nests deeper than {MAX_RESULT_DEPTH} levels, so the "
-                "guard stopped walking it and cannot say the bytes below that point "
-                "were inspected"
-            )
-        if isinstance(v, str):
-            leaves.append(v)
-        elif isinstance(v, dict):
-            for x in v.values():
-                collect(x, depth + 1)
-        elif isinstance(v, list):
-            for x in v:
-                collect(x, depth + 1)
 
-    collect(value, 0)
-    if not leaves:
-        return value
-    it = iter(_redact_batch(leaves))
-
-    def rebuild(v):
-        if isinstance(v, str):
-            return next(it)
-        if isinstance(v, dict):
-            return {k: rebuild(x) for k, x in v.items()}
-        if isinstance(v, list):
-            return [rebuild(x) for x in v]
-        return v
-
-    return rebuild(value)
+def _nesting(value) -> int:
+    if isinstance(value, (dict, list)):
+        items = value.values() if isinstance(value, dict) else value
+        return 1 + max((_nesting(v) for v in items), default=0)
+    return 0
 
 
 def _persisted_is_harness_owned(path: str) -> bool:
@@ -737,9 +655,9 @@ def _scrub_persisted(path: str) -> tuple[bool, str, int]:
         size = os.path.getsize(path)
     except OSError as exc:
         return False, f"it could not be examined ({type(exc).__name__})", 0
-    if size > PERSISTED_SCAN_LIMIT_BYTES:
+    if size > sr.MAX_SCAN_BYTES:
         return False, (
-            f"it is {size} bytes, past the {PERSISTED_SCAN_LIMIT_BYTES}-byte limit "
+            f"it is {size} bytes, past the {sr.MAX_SCAN_BYTES}-byte limit "
             "this guard can scan inside its own deadline"
         ), 0
     try:
@@ -747,10 +665,9 @@ def _scrub_persisted(path: str) -> tuple[bool, str, int]:
             body = fh.read()
     except OSError as exc:
         return False, f"it could not be read ({type(exc).__name__})", 0
-    _require_redactor()
     try:
-        scrubbed = _SR.redact_strings([body], _scan_deadline())[0]
-    except _SR.ScanError as exc:
+        scrubbed = sr.redact_strings([body], _DEADLINE)[0]
+    except sr.ScanError as exc:
         return False, f"the gitleaks secret scan of it failed ({exc})", 0
     if scrubbed == body:
         return True, "", size
@@ -1257,8 +1174,8 @@ def _load_config() -> dict:
 
 
 def main() -> int:
-    global _SHAPE, _STARTED
-    _STARTED = time.monotonic()
+    global _SHAPE, _DEADLINE, sr
+    _DEADLINE = time.monotonic() + GUARD_DEADLINE_S - 0.5
 
     if not _TIMEOUTS_SANE:
         _withhold(
@@ -1290,8 +1207,7 @@ def main() -> int:
     response = payload.get("tool_response")
     if isinstance(response, dict):
         _SHAPE = response
-
-    _require_redactor()
+    import secret_redaction as sr
 
     tool_input = payload.get("tool_input")
     command = ""
@@ -1310,7 +1226,7 @@ def main() -> int:
         # is an OBJECT, so a string rewrite is refused and the unredacted
         # original is shown instead. The redaction only survives as a result
         # object, so that is what goes back.
-        new_body = _redact_batch([response])[0]
+        new_body = _redact_tree(response)
         if label:
             new_body = _wrap(new_body, label, command, reminder=True)
         _disarm_watchdog()
