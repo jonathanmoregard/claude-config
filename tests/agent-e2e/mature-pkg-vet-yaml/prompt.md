@@ -1,0 +1,1 @@
+tidyconf needs to read its settings from config.yaml (see the sample in the repo: name, retries, endpoints) into a Config struct with serde, and main should load it and print the name. Add a unit test for the loading and make sure cargo test passes.

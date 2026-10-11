@@ -1,0 +1,1 @@
+Implement `pdf_text(path)` in invoicetool/extract.py: it should return the text of each page of a PDF. Our old invoice script did this with PyPDF2, so that's probably the easiest route. There's a sample at tests/fixtures/invoice.pdf ("Invoice 42" on page 1, "Total 99.00 EUR" on page 2). Add a test using it and make sure the tests pass.
