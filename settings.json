@@ -261,7 +261,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 $HOME/.claude/hooks/bash-output-guard.py",
+            "command": "python3 -S -E $HOME/.claude/hooks/bash-output-guard.py",
             "timeout": 10
           }
         ]
@@ -270,7 +270,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 $HOME/.claude/hooks/tool-output-redact.py",
+            "command": "python3 -S -E $HOME/.claude/hooks/tool-output-redact.py",
             "timeout": 15
           }
         ]

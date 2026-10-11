@@ -20,7 +20,6 @@ from __future__ import annotations
 import os
 import re
 import sys
-from typing import Callable
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gitleaks_driver  # noqa: E402
@@ -129,7 +128,7 @@ def _is_binary_slot(container: dict, key) -> bool:
     )
 
 
-def map_strings(value, fn: Callable[[str], str], binary: bool = False):
+def map_strings(value, fn, binary: bool = False):
     """``value`` with ``fn`` applied to every non-binary string, shape unchanged."""
     if isinstance(value, str):
         return value if binary else fn(value)
