@@ -510,19 +510,19 @@ for _label, _tool, _mk in (
     check(f"gitleaks missing, {_label}: applied as a rewrite (exit 0), not exit 2", rc == 0,
           f"rc={rc}")
 
-# Past MAX_DEPTH nothing was inspected, so the withhold must cover it too —
-# not hand the subtree back verbatim inside the "withheld" rewrite.
+# Depth is not cut: a deep token is redacted in place, and a withhold covers
+# deep strings too.
 _deep_tok = tok("gitlab")
 _deep = f"v={_deep_tok}"
 for _ in range(40):
     _deep = {"d": _deep}
 _deep_resp = {"deep": _deep, "note": "shallow free text"}
-for _label, _script, _env in (("gitleaks present", HOOK, None),
-                              ("gitleaks missing", _missing, NO_GITLEAKS)):
-    rc, upd, raw, err, _ = run_hook(payload("SomeTool", _deep_resp), script=_script, env_extra=_env)
-    check(f"{_label}: a result nested past MAX_DEPTH is withheld, deep token included",
-          _deep_tok not in raw and WITHHELD in raw and rc == 0, f"rc={rc} out={raw[:200]}")
-    check(f"{_label}: the deep withhold keeps the original's shape",
+for _label, _env, _want in (("gitleaks present", None, "[REDACTED:gitlab-pat:"),
+                            ("gitleaks missing", NO_GITLEAKS, WITHHELD)):
+    rc, upd, raw, err, _ = run_hook(payload("SomeTool", _deep_resp), env_extra=_env)
+    check(f"{_label}: a token 41 levels down is not emitted ({_want.strip('[:')})",
+          _deep_tok not in raw and _want in raw and rc == 0, f"rc={rc} out={raw[:200]}")
+    check(f"{_label}: the deep rewrite keeps the original's shape",
           upd is not None and hook._same_shape(_deep_resp, upd))
 
 

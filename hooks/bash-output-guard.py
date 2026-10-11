@@ -73,8 +73,8 @@ context window. So:
     tool-results tree) the pointer is withheld, because handing the model a
     path to bytes this guard could not inspect is the same leak with one
     extra step;
-  * a result nested deeper than ``MAX_RESULT_DEPTH`` is a result this guard
-    did not fully inspect, so it is withheld rather than passed on.
+  * a result is walked however deeply it nests (``json.loads`` already
+    bounds the depth), so no part of it goes uninspected.
 
 ONE WRAPPER, NOT TWO
 --------------------
@@ -262,10 +262,6 @@ OUTPUT_POINTER_FIELDS = (
     ("persistedOutputPath", "persistedOutputSize"),
     ("rawOutputPath", None),
 )
-
-# A real Bash result is flat. Anything deeper is a shape this guard was not
-# built for, and it stops walking rather than pass uninspected bytes on.
-MAX_RESULT_DEPTH = 8
 
 # The harness writes overflow output under <config dir>/projects/.../tool-results/.
 # The guard rewrites files only there, so a result naming some other path
@@ -609,23 +605,10 @@ def _redact_tree(value):
     Two named fields is a list that goes stale the moment the tool result
     grows a third. This walks whatever arrived.
     """
-    if _nesting(value) > MAX_RESULT_DEPTH:
-        _withhold(
-            f"the tool result nests deeper than {MAX_RESULT_DEPTH} levels, so the "
-            "guard stopped walking it and cannot say the bytes below that point "
-            "were inspected"
-        )
     try:
         return sr.redact_value(value, _DEADLINE)
     except sr.ScanError as exc:
         _withhold(f"the gitleaks secret scan failed: {exc}")
-
-
-def _nesting(value) -> int:
-    if isinstance(value, (dict, list)):
-        items = value.values() if isinstance(value, dict) else value
-        return 1 + max((_nesting(v) for v in items), default=0)
-    return 0
 
 
 def _persisted_is_harness_owned(path: str) -> bool:

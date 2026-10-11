@@ -43,9 +43,6 @@ GUARD_DEADLINE_S = HARNESS_HOOK_TIMEOUT_S - 4
 # from the model's own input; scanning their originalFile would buy nothing.
 SKIP_TOOLS = frozenset({"Bash", "Edit", "MultiEdit", "Write", "NotebookEdit"})
 
-# Nesting past this was not walked; withhold rather than pass it on.
-MAX_DEPTH = 32
-
 # A whitespace-free string that could BE a credential: 16+ token characters
 # mixing letters and digits. Enum/literal values (`text`, `image/png`) never match.
 _TOKENISH_RE = re.compile(r"[A-Za-z0-9_+/=.\-]{16,}")
@@ -72,14 +69,6 @@ def _tokenish(s: str) -> bool:
         any(c.isdigit() for c in run) and any(c.isalpha() for c in run)
         for run in _TOKENISH_RE.findall(s)
     )
-
-
-def _depth(value, level: int = 0) -> int:
-    if isinstance(value, dict):
-        return max((_depth(v, level + 1) for v in value.values()), default=level)
-    if isinstance(value, list):
-        return max((_depth(v, level + 1) for v in value), default=level)
-    return level
 
 
 def _same_shape(a, b) -> bool:
@@ -162,8 +151,6 @@ def main() -> int:
     if payload.get("tool_name") in SKIP_TOOLS or not isinstance(response, (str, dict, list)):
         return 0
     _RESPONSE = response
-    if _depth(response) > MAX_DEPTH:
-        _withhold(f"the result nests deeper than {MAX_DEPTH} levels and was not fully walked")
 
     import secret_redaction as sr
 

@@ -378,9 +378,9 @@ rc, parsed, raw, err = run_hook(GUARD, None, raw_stdin="[1, 2, 3]")
 updated = (parsed or {}).get("hookSpecificOutput", {}).get("updatedToolOutput")
 check_applied("withhold after non-object stdin", updated)
 
-# ... and a third: a result nested deeper than the guard walks. _SHAPE is an
-# object here, but it holds no scalars at all, so the replacement is built
-# from nothing and `interrupted` has to come from somewhere.
+# ... and a third: a result that is not Bash-shaped at all. _SHAPE is an
+# object here, but it holds no scalars, so the replacement is built from
+# nothing and `interrupted` has to come from somewhere.
 _deep_probe: object = f"KEY={secret('R')}"
 for _ in range(14):
     _deep_probe = {"inner": _deep_probe}
@@ -2055,13 +2055,15 @@ parsed, updated, raw = bash_out("cat /tmp/x", response_obj(f"KEY={_s}"), script=
 check_withheld("the redactor itself raises", parsed, updated)
 check("a crashing redactor does not pass the secret through", _s not in raw, "secret leaked")
 
-# A result nested deeper than the guard walks is a result it did not fully
-# inspect, so it does not get passed on.
-_deep: object = f"KEY={secret('O')}"
+# A deeply nested field is walked all the way down and redacted in place,
+# not cut off: json.loads already bounds the depth.
+_deep_s = secret("O")
+_deep: object = f"KEY={_deep_s}"
 for _ in range(14):
     _deep = {"inner": _deep}
-parsed, updated, raw = bash_out("cat /tmp/x", _deep)
-check_withheld("the result is nested deeper than the guard inspects", parsed, updated)
+parsed, updated, raw = bash_out("cat /tmp/x", response_obj("ok\n", extraField=_deep))
+check("a secret 15 levels down is redacted, the result is not withheld",
+      _deep_s not in raw and "[REDACTED:" in raw and WITHHELD_MARKER not in raw, raw[:200])
 
 # Not our tool: no rewrite at all, even though this hook is registered for
 # Bash only. A stray payload must not be silently blanked.
