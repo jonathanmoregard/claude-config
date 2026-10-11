@@ -123,7 +123,9 @@ installation token. Context and threat model: klaffat#165, 3a addendum.
 - **`gh` wrapper** (nixos-config `home/gh-host-token.nix`, on PATH ahead of
   `/run/current-system/sw/bin/gh`). An explicit `GH_TOKEN`/`GITHUB_TOKEN`
   passes through. Otherwise it picks the owner from, first present wins,
-  `-R`/`--repo [HOST/]OWNER/NAME` (or `gh repo <sub> OWNER/NAME`), `GH_REPO`,
+  `-R`/`--repo [HOST/]OWNER/NAME` (or `gh repo <sub> OWNER/NAME`), the
+  endpoint of `gh api [/]repos/OWNER/...` or `[/]orgs/OWNER...` (a
+  `{owner}` placeholder falls through), `gh repo list OWNER`, `GH_REPO`,
   or the cwd repo's `remote.origin.url`; `host/<owner>/token` when that file
   exists, else `host/token`, becomes `GH_TOKEN` for the real `gh`, referenced
   by store path.
@@ -157,6 +159,16 @@ switch only closes self-merge together with the approval ruleset.
 
 **Escape hatch** for the founder's own credential work (e.g. `gh auth logout`
 of the old PAT): the unwrapped `/run/current-system/sw/bin/gh`.
+
+**Follow-up, not done: sandbox mode is personal-only.** Multi-owner covers
+the host token only. `claude-sandbox` looks the repo up with a broad token
+from `INSTALLATION_ID`, and `mint_for_sandbox` mints every sandbox token
+from `INSTALLATION_ID`. Once `klaffat/klaffat` lives under the org
+installation, `claude-sandbox` for it fails with "not in this App
+installation's allowlist". The fix: `claude-sandbox` picks the installation
+by OWNER from `ORG_INSTALLATIONS` and records it as
+`TOKEN_ROOT/<sandbox>/installation_id`, and `mint_for_sandbox` passes it to
+`request_token` (which already takes an installation id).
 
 ### Switchover order
 
