@@ -154,7 +154,9 @@ of the old PAT): the unwrapped `/run/current-system/sw/bin/gh`.
    `ls -l ~/.cache/gh-tokens/host/token` and `gh auth status` (App bot
    account), then re-run the pull timers and read their journals.
 4. Only then: approval rulesets (1 approval, last-push approval, dismiss stale
-   reviews), `/run/current-system/sw/bin/gh auth logout`, revoke the PAT.
+   reviews). Switch aggregator-ingest's GitHub source from `@me` (0 hits on
+   an App token, silently) to a literal login on the App token. Then
+   `/run/current-system/sw/bin/gh auth logout` and revoke the PAT.
 
 ## Customizing the proxy allowlist
 
