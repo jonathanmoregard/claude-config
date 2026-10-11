@@ -77,7 +77,7 @@ def tok(kind: str) -> str:
     """A fresh synthetic token of a known shape. Never a real credential."""
     makers = {
         # a format only gitleaks knows (no floor pattern): tests the scanner
-        "gitlab": lambda: "glp" + "at-" + _rand(20),
+        "gitlab": lambda: "glp" + "at-" + _rand(19) + _rand(1, string.digits),
         # floor + gitleaks both know these
         "github": lambda: "gh" + "p_" + _rand(36),
         "tavily": lambda: "tv" + "ly-dev-" + _rand(32),
@@ -315,9 +315,6 @@ check("a base64 run at the end of a ~330 KB result (a later chunk) is redacted",
 # gitleaks 8.30.1 `stdin` quirks that drop findings silently. Each case is the
 # shape that made the unshaped input fail (see _gitleaks_input).
 section("gitleaks stdin quirks: magic bytes, internal cuts")
-_q_spec = importlib.util.spec_from_file_location("secret_redaction_quirks", MODULE)
-_srq = importlib.util.module_from_spec(_q_spec)
-_q_spec.loader.exec_module(_srq)
 for _magic in ("%PDF-1.4\n", "%!PS-Adobe-3.0\n", "{\\rtf1\n", "MZ\n", "SQLite format 3\x00\n"):
     _tm = tok("gitlab")
     rc, upd, raw, _, _ = run_hook(payload("mcp__x__y", [{"type": "text", "text": _magic + f"K={_tm}"}]))
@@ -334,11 +331,6 @@ rc, upd, raw, _, _ = run_hook(payload("mcp__x__y", " ".join(_many)))
 _missed = sum(1 for t in _many if t in raw)
 check("12,000 tokens on ONE ~320 KB line: none survive gitleaks' internal read cuts",
       _missed == 0 and upd, f"missed={_missed} rc={rc}")
-check("the gitleaks input carries a blank line inside every peek window",
-      all(len(seg) <= _srq.SEGMENT_CHARS
-          for seg in _srq._gitleaks_input("a" * 100_000).split("\n\n")))
-check("the gitleaks input never starts with the tool's own bytes",
-      _srq._gitleaks_input("%PDF-1.4\nx").startswith(_srq.SCAN_PREAMBLE))
 del TOKENS[-12000:]  # keep _safe() fast; none of them is printed
 
 
@@ -350,8 +342,9 @@ _spec_sr.loader.exec_module(sr)
 _filler = ("lorem ipsum dolor sit amet " * 3 + "\n") * 2000  # ~160 KB
 _big_tokens = [tok("gitlab") for _ in range(4)]
 _big_text = "".join(_filler + f"line with {t}\n" for t in _big_tokens)
-check("fixture spans several chunks", len(sr._chunks(_big_text)) >= 3,
-      str(len(sr._chunks(_big_text))))
+sys.path.insert(0, HOOKS)
+import gitleaks_driver  # noqa: E402
+check("fixture spans several pieces", len(gitleaks_driver.pieces(_big_text)) >= 3)
 rc, upd, raw, err, elapsed = run_hook(payload("mcp__x__big", [{"type": "text", "text": _big_text}]))
 check("every token in every chunk is redacted", all(t not in raw for t in _big_tokens) and upd,
       f"rc={rc} err={err[:200]}")
@@ -373,7 +366,8 @@ def _b64(n: int) -> str:
 
 
 def _rule_hits(text: str) -> list[str]:
-    return [f.get("RuleID") for f in sr.gitleaks_findings(text, time.monotonic() + 20)]
+    found = gitleaks_driver.find_secrets([text], rules=RULES, binary=gitleaks_driver.gitleaks_binary())
+    return list(found[0].values())
 
 
 _fw = "fw_" + _rand(24)
@@ -422,6 +416,7 @@ def sandbox(name: str, module_patch=(), hook_patch=()) -> str:
     d = os.path.join(SCRATCH, name)
     os.makedirs(d, exist_ok=True)
     shutil.copy(RULES, d)
+    shutil.copy(os.path.join(HOOKS, "gitleaks_driver.py"), d)
     for src, patches in ((MODULE, module_patch), (HOOK, hook_patch)):
         with open(src, encoding="utf-8") as fh:
             text = fh.read()
@@ -434,7 +429,7 @@ def sandbox(name: str, module_patch=(), hook_patch=()) -> str:
     return os.path.join(d, "tool-output-redact.py")
 
 
-NO_FALLBACKS = ("GITLEAKS_FALLBACKS = (", "GITLEAKS_FALLBACKS = () and (")
+NO_GITLEAKS = {"SECRET_REDACTION_GITLEAKS": "/nonexistent/gitleaks"}
 
 
 def fake_gitleaks(name: str, body: str) -> str:
@@ -444,7 +439,7 @@ def fake_gitleaks(name: str, body: str) -> str:
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("#!/bin/sh\n" + body + "\n")
     os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
-    return d
+    return {"SECRET_REDACTION_GITLEAKS": path}
 
 
 def withheld_ok(label, response, updated, raw, planted):
@@ -458,30 +453,27 @@ _t6 = tok("gitlab")
 _resp6 = {"type": "text", "file": {"filePath": "/w/.env", "content": f"K={_t6}\nmore text",
                                    "numLines": 2, "startLine": 1, "totalLines": 2}}
 
-_missing = sandbox("missing", module_patch=(NO_FALLBACKS,))
-rc, upd, raw, err, _ = run_hook(payload("Read", _resp6), script=_missing,
-                                env_extra={"PATH": "/nonexistent"})
+_missing = HOOK
+rc, upd, raw, err, _ = run_hook(payload("Read", _resp6), script=_missing, env_extra=NO_GITLEAKS)
 withheld_ok("gitleaks missing", _resp6, upd, raw, _t6)
 check("gitleaks missing: the notice names the fault", "not installed" in raw, raw[:300])
 check("gitleaks missing: the path/enum slots stay intact",
       isinstance(upd, dict) and upd["file"]["filePath"] == "/w/.env" and upd["type"] == "text")
 
 _err_bin = fake_gitleaks("crash", "echo boom >&2; exit 3")
-_crash = sandbox("crash", module_patch=(NO_FALLBACKS,))
-rc, upd, raw, err, _ = run_hook(payload("Read", _resp6), script=_crash,
-                                env_extra={"PATH": _err_bin + ":/usr/bin:/bin"})
+_crash = HOOK
+rc, upd, raw, err, _ = run_hook(payload("Read", _resp6), script=_crash, env_extra=_err_bin)
 withheld_ok("gitleaks exits with an error", _resp6, upd, raw, _t6)
 
 _garbage_bin = fake_gitleaks("garbage", "echo 'not json'; exit 1")
-rc, upd, raw, err, _ = run_hook(payload("Read", _resp6), script=_crash,
-                                env_extra={"PATH": _garbage_bin + ":/usr/bin:/bin"})
+rc, upd, raw, err, _ = run_hook(payload("Read", _resp6), script=_crash, env_extra=_garbage_bin)
 withheld_ok("gitleaks prints unparseable output", _resp6, upd, raw, _t6)
 
 _slow_bin = fake_gitleaks("slow", "sleep 60")
-_slow = sandbox("slow", module_patch=(NO_FALLBACKS,),
+_slow = sandbox("slow",
                 hook_patch=(("HARNESS_HOOK_TIMEOUT_S = 15", "HARNESS_HOOK_TIMEOUT_S = 6"),))
 rc, upd, raw, err, elapsed = run_hook(payload("Read", _resp6), script=_slow,
-                                      env_extra={"PATH": _slow_bin + ":/usr/bin:/bin"})
+                                      env_extra=_slow_bin)
 withheld_ok("gitleaks overruns the deadline", _resp6, upd, raw, _t6)
 check("deadline withhold lands before the (patched) harness timeout", elapsed < 6,
       f"{elapsed:.1f}s")
@@ -491,7 +483,7 @@ _resp_big = [{"type": "text", "text": f"K={_t6}\n" + ("lorem ipsum " * 200)}]
 rc, upd, raw, err, _ = run_hook(payload("mcp__x__y", _resp_big), script=_big)
 withheld_ok("output too large to scan", _resp_big, upd, raw, _t6)
 
-_broken_mod = sandbox("broken-module", module_patch=(("import base64\n", "import base64\nraise ImportError('injected')\n"),))
+_broken_mod = sandbox("broken-module", module_patch=(("import re\n", "import re\nraise ImportError('injected')\n"),))
 rc, upd, raw, err, _ = run_hook(payload("Read", _resp6), script=_broken_mod)
 check("a module that cannot load: secret not emitted", _t6 not in raw, raw[:200])
 check("a module that cannot load: the model is told (exit 2 + stderr)",
@@ -513,8 +505,7 @@ for _label, _tool, _mk in (
 ):
     _tb = tok("gitlab")
     _rb = _mk(_tb)
-    rc, upd, raw, err, _ = run_hook(payload(_tool, _rb), script=_missing,
-                                    env_extra={"PATH": "/nonexistent"})
+    rc, upd, raw, err, _ = run_hook(payload(_tool, _rb), script=_missing, env_extra=NO_GITLEAKS)
     withheld_ok(f"gitleaks missing, {_label}", _rb, upd, raw, _tb)
     check(f"gitleaks missing, {_label}: applied as a rewrite (exit 0), not exit 2", rc == 0,
           f"rc={rc}")
@@ -527,7 +518,7 @@ for _ in range(40):
     _deep = {"d": _deep}
 _deep_resp = {"deep": _deep, "note": "shallow free text"}
 for _label, _script, _env in (("gitleaks present", HOOK, None),
-                              ("gitleaks missing", _missing, {"PATH": "/nonexistent"})):
+                              ("gitleaks missing", _missing, NO_GITLEAKS)):
     rc, upd, raw, err, _ = run_hook(payload("SomeTool", _deep_resp), script=_script, env_extra=_env)
     check(f"{_label}: a result nested past MAX_DEPTH is withheld, deep token included",
           _deep_tok not in raw and WITHHELD in raw and rc == 0, f"rc={rc} out={raw[:200]}")
@@ -545,17 +536,7 @@ rc, upd, raw, err, _ = run_hook(_bash_payload, script=BASH_GUARD)
 check("a gitleaks-only format is redacted from Bash output", _t7 not in raw and upd, raw[:200])
 check("and marked with the gitleaks rule id", "[REDACTED:gitlab-pat:" in raw, raw[:200])
 
-_bg_dir = os.path.join(SCRATCH, "bash-missing")
-os.makedirs(_bg_dir, exist_ok=True)
-shutil.copy(BASH_GUARD, _bg_dir)
-shutil.copy(os.path.join(HOOKS, "bash-guard-config.json"), _bg_dir)
-shutil.copy(RULES, _bg_dir)
-with open(MODULE, encoding="utf-8") as fh:
-    _m = fh.read().replace(*NO_FALLBACKS)
-with open(os.path.join(_bg_dir, "secret_redaction.py"), "w", encoding="utf-8") as fh:
-    fh.write(_m)
-rc, upd, raw, err, _ = run_hook(_bash_payload, script=os.path.join(_bg_dir, "bash-output-guard.py"),
-                                env_extra={"PATH": "/nonexistent"})
+rc, upd, raw, err, _ = run_hook(_bash_payload, script=BASH_GUARD, env_extra=NO_GITLEAKS)
 check("bash-output-guard with gitleaks missing withholds", "the output guard is BROKEN" in raw
       and _t7 not in raw, raw[:300])
 
