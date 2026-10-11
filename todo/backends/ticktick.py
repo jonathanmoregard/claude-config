@@ -19,8 +19,9 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Any, Optional, Tuple, Union
+from typing import Any, Optional, Union
 
+from .._envfile import load as load_env_file
 from .._envfile import update as update_env_file
 from .base import BackendError
 
@@ -38,11 +39,11 @@ class TickTickBackend:
     client_id: Optional[str] = None
     client_secret: Optional[str] = None
     redirect_uri: str = DEFAULT_REDIRECT
-    default_project_id: Optional[str] = None
     timezone: str = "Europe/Stockholm"
 
     @classmethod
     def from_env(cls) -> "TickTickBackend":
+        load_env_file()
         token = os.environ.get("TICKTICK_ACCESS_TOKEN", "")
         try:
             expires_at = int(os.environ.get("TICKTICK_TOKEN_EXPIRES_AT", "0") or 0)
@@ -54,36 +55,10 @@ class TickTickBackend:
             client_id=os.environ.get("TICKTICK_CLIENT_ID") or None,
             client_secret=os.environ.get("TICKTICK_CLIENT_SECRET") or None,
             redirect_uri=os.environ.get("TICKTICK_REDIRECT_URI", DEFAULT_REDIRECT),
-            default_project_id=os.environ.get("TICKTICK_DEFAULT_PROJECT_ID") or None,
             timezone=os.environ.get("TICKTICK_TIMEZONE", "Europe/Stockholm"),
         )
 
-    # --- Backend protocol ---------------------------------------------------
-
-    def add_reminder(
-        self,
-        *,
-        title: str,
-        due: Union[str, date, datetime],
-        list: Optional[str] = None,
-        notes: Optional[str] = None,
-    ) -> str:
-        project_id = self._resolve_project(list)
-        due_str, is_all_day = _format_due(due)
-
-        body: dict = {
-            "title": title,
-            "timeZone": self.timezone,
-            "dueDate": due_str,
-            "isAllDay": is_all_day,
-        }
-        if project_id:
-            body["projectId"] = project_id
-        if notes:
-            body["content"] = notes
-
-        resp = self._request("POST", "/task", body)
-        return str(resp.get("id", "")) if isinstance(resp, dict) else ""
+    # --- Habit API ----------------------------------------------------------
 
     def list_habits(self) -> list[dict]:
         """Return all habits (OpenHabit objects)."""
@@ -125,10 +100,15 @@ class TickTickBackend:
     def _ensure_fresh_token(self) -> None:
         if self.access_token and self.expires_at and time.time() < self.expires_at - EXPIRY_MARGIN_SECONDS:
             return  # plenty of headroom
-        # Token missing or near-expiry — another process (e.g. CLI --login) may
-        # have refreshed it since this instance was created. Re-read env file
-        # before falling back to interactive refresh.
+        # Token missing or near-expiry — another process (e.g. ticktick-login)
+        # may have refreshed it since this instance was created. Re-read env
+        # file before falling back to interactive refresh.
         if self._reload_token_from_envfile() and time.time() < self.expires_at - EXPIRY_MARGIN_SECONDS:
+            return
+        # Inside the refresh margin but not yet expired: a non-interactive
+        # caller (cron) cannot refresh, so keep using the token until it dies.
+        from .ticktick_oauth import can_do_interactive_login
+        if self.access_token and time.time() < self.expires_at and not can_do_interactive_login():
             return
         self._refresh()
 
@@ -180,7 +160,7 @@ class TickTickBackend:
 
         if not force and not can_do_interactive_login():
             raise LoginRequired(
-                "TickTick access token expired. Run `~/.claude/todo-add --login` "
+                "TickTick access token expired. Run `~/.claude/ticktick-login` "
                 "from an interactive terminal to re-authorize."
             )
 
@@ -202,18 +182,6 @@ class TickTickBackend:
         )
 
     # --- Helpers ------------------------------------------------------------
-
-    def _resolve_project(self, list_: Optional[str]) -> Optional[str]:
-        if not list_:
-            return self.default_project_id
-        if len(list_) == 24 and all(c in "0123456789abcdef" for c in list_.lower()):
-            return list_
-        projects = self._request("GET", "/project")
-        if isinstance(projects, list):
-            for p in projects:
-                if isinstance(p, dict) and p.get("name") == list_:
-                    return p.get("id")
-        raise BackendError(f"TickTick project not found: {list_!r}")
 
     def _request(
         self,
@@ -253,23 +221,3 @@ class TickTickBackend:
             return {}
         return json.loads(raw)
 
-
-def _format_due(due: Union[str, date, datetime]) -> Tuple[str, bool]:
-    """Return (TickTick ``dueDate`` string, ``isAllDay``).
-
-    TickTick expects ``yyyy-MM-ddTHH:mm:ssZ``. We emit ``+0000`` and set
-    ``timeZone`` separately so the task displays correctly in the user's zone.
-    """
-    if isinstance(due, datetime):
-        return due.strftime("%Y-%m-%dT%H:%M:%S+0000"), False
-    if isinstance(due, date):
-        return due.strftime("%Y-%m-%dT00:00:00+0000"), True
-
-    s = due.strip()
-    if len(s) == 10 and s[4] == "-" and s[7] == "-":
-        return f"{s}T00:00:00+0000", True
-    try:
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except ValueError as e:
-        raise BackendError(f"Unparseable due date: {due!r}") from e
-    return dt.strftime("%Y-%m-%dT%H:%M:%S+0000"), False

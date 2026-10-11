@@ -4,8 +4,6 @@
 # calendar) and answers with one STATE_JSON line; the shell does all reads and
 # writes. Calendar titles are attacker-reachable text (anyone can send an
 # invite), so the agent runs with no tools and no MCP servers at all.
-# Escalation (creating a TickTick reminder) is handled here in the shell,
-# not by the agent — the agent never touches the todo_created flag.
 # Cron: CRON_TZ=Europe/Stockholm 0 9 * * 1  (Mondays at 09:00 Stockholm time)
 
 set -euo pipefail
@@ -20,7 +18,6 @@ STATE_FILE="$DATES_DIR/state.json"
 IDEAS_FILE="$DATES_DIR/ideas.md"
 LOG_FILE="$HOME/.claude/tmp/date-check.log"
 CLAUDE="$HOME/.local/bin/claude"
-TODO_ADD="$HOME/.claude/todo-add"
 
 mkdir -p "$(dirname "$LOG_FILE")"
 exec >> "$LOG_FILE" 2>&1
@@ -178,7 +175,7 @@ Write:
 
 **Case C — DATE_COUNT is less than $DATES_PER_MONTH, and a pending suggestion already exists:**
 Only update last_checked. Leave pending_suggestion completely unchanged.
-Do NOT touch the todo_created flag — the shell script owns escalation.
+Do NOT touch the todo_created flag.
 
 ## Rules
 - You have no tools. Output the new state JSON on a single line
@@ -210,65 +207,5 @@ if [[ -n "$STATE_LINE" ]]; then
 else
   echo "No STATE_JSON line found in agent output — state not updated."
 fi
-
-# ── Escalation: create a TickTick reminder if suggestion has sat for 7+ days ─
-# The shell owns the todo_created flag. The agent never sets it.
-STATE_FILE="$STATE_FILE" TODO_ADD="$TODO_ADD" PARTNER="$PARTNER" python3 <<'PYEOF'
-import json, os, subprocess, sys
-from datetime import date, datetime, timedelta
-
-state_file = os.environ["STATE_FILE"]
-todo_add   = os.environ["TODO_ADD"]
-partner    = os.environ["PARTNER"]
-
-try:
-    with open(state_file) as f:
-        state = json.load(f)
-except Exception as e:
-    print(f"Escalation: cannot read state ({e}), skipping.")
-    sys.exit(0)
-
-s = state.get("pending_suggestion") or {}
-if not s:
-    print("Escalation: no pending suggestion.")
-    sys.exit(0)
-if s.get("todo_created"):
-    print("Escalation: todo already created for this suggestion.")
-    sys.exit(0)
-
-try:
-    created = datetime.strptime(s["created_at"], "%Y-%m-%d").date()
-except Exception:
-    print("Escalation: bad created_at, skipping.")
-    sys.exit(0)
-
-days_old = (date.today() - created).days
-if days_old < 7:
-    print(f"Escalation: suggestion is {days_old}d old, not yet due.")
-    sys.exit(0)
-
-idea = s.get("idea", "Plan a date")
-title = f"Plan date with {partner}: {idea}"
-notes = f"No date with {partner} planned recently. Suggestion: {idea}"
-due = (date.today() + timedelta(days=3)).isoformat()
-
-try:
-    result = subprocess.run(
-        [todo_add, title, "--due", due, "--notes", notes],
-        check=True, capture_output=True, text=True,
-    )
-    task_id = result.stdout.strip()
-    print(f"Escalation: TickTick task created ({task_id}).")
-except subprocess.CalledProcessError as e:
-    print(f"Escalation: todo-add failed ({e.returncode}): {e.stderr.strip()}")
-    sys.exit(0)  # do not flip flag; retry next week
-
-# Flip the flag so we don't recreate the task next week.
-s["todo_created"] = True
-state["pending_suggestion"] = s
-with open(state_file, "w") as f:
-    json.dump(state, f, indent=2)
-print("Escalation: state updated (todo_created=true).")
-PYEOF
 
 echo "--- done ---"
