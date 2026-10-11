@@ -126,6 +126,9 @@ def redact(text: str, targets: dict[str, str], marker: Callable[[str, int], str]
     """``text`` with each occurrence of each target (``{target: rule id}``) replaced by
     ``marker(rule, length)``. Occurrences that share characters become one marker, named
     by the longest target at its start, so no fragment of either survives between them."""
+    # Hand-rolled on purpose: the hooks run stdlib-only `python3 -S -E`, where pyahocorasick
+    # (in nixpkgs) is not importable, and an `re` alternation took 19 s for 1,000 targets
+    # over 8 MB. One str.find pass per target took 0.7 s.
     spans = sorted(((i, i + len(t), rule) for t, rule in targets.items() if t for i in _find_all(text, t)),
                    key=lambda span: (span[0], -span[1]))
     merged: list[list] = []

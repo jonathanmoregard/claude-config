@@ -45,6 +45,9 @@ def _is_binary_slot(container: dict, key) -> bool:
 
 def map_strings(value, fn):
     """``value`` with ``fn`` applied to every string outside a binary slot, as a new value."""
+    # Hand-rolled on purpose: glom and boltons' remap are not importable under the hooks'
+    # `python3 -S -E`, and scanning json.dumps(value) instead hides tokens from gitleaks
+    # (`\nghp_...` serialises as `\\nghp_...`, so rules anchored on `\b` stop matching).
     if isinstance(value, str):
         return fn(value)
     if isinstance(value, list):
