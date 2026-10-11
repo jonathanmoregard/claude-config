@@ -16,7 +16,10 @@ alnum = string.ascii_letters + string.digits
 rand = lambda n: "".join(secrets.choice(alnum) for _ in range(n))
 tokens = {
     "read": "glp" + "at-" + rand(20),        # gitlab-pat
-    "grep": rand(32),                        # generic-api-key (keyword context)
+    # generic-api-key (keyword context). gitleaks allowlists letters-only
+    # values, so the fixture holds a digit, as real keys do: a random 32-char
+    # value is letters-only 0.4% of the time, and one run hit exactly that.
+    "grep": rand(30) + secrets.choice(string.digits) + secrets.choice(string.ascii_letters),
     "mcp": "np" + "m_" + rand(36),           # npm-access-token
 }
 os.makedirs(os.path.join(work, "config"), exist_ok=True)

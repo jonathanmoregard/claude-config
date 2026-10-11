@@ -269,7 +269,54 @@ def _chunks(text: str) -> list[str]:
     return out
 
 
+# ---- what gitleaks is actually fed --------------------------------------
+# Two gitleaks 8.30.1 stdin behaviours (sources/file.go, sources/common.go)
+# would each drop findings silently, so the text is reshaped before it goes in:
+#
+# * MAGIC BYTES. The first read is sniffed with filetype.Match; if it looks
+#   like an application/* file (%PDF, %!, {\rtf, MZ, SQLite, ...) gitleaks
+#   skips the whole input, exits 0, reports []. A tool result that starts
+#   with `%PDF-1.4` would be "clean". A fixed first line means the sniff
+#   never sees the tool's bytes.
+# * INTERNAL CUTS. gitleaks reads ~100 KB (fewer from a pipe) and then peeks
+#   up to 25 KB for a blank line ("\n\n") to end the fragment on; with none
+#   in reach it cuts wherever it stopped, and a token straddling that cut is
+#   missed (measured: 8 of 12,000 tokens on one 320 KB line). The text is
+#   therefore fed as SEGMENTS of at most SEGMENT_CHARS joined by blank lines,
+#   so a blank line is always inside the peek window. Segments overlap by
+#   SEGMENT_OVERLAP characters, so a match up to that long lies wholly inside
+#   one of them wherever the cut falls; a duplicate finding is harmless.
+#
+# Findings are applied by STRING (see _targets), so the reshaping never has to
+# be mapped back; a decoded finding's line number refers to the reshaped text,
+# which is what is kept for _decoded_targets.
+SCAN_PREAMBLE = "secret-redaction scan input\n\n"
+SEGMENT_CHARS = 16_000
+SEGMENT_OVERLAP = 1_024
+
+
+def _gitleaks_input(chunk: str) -> str:
+    segments: list[str] = []
+    start, n = 0, len(chunk)
+    while start < n:
+        stop = min(n, start + SEGMENT_CHARS)
+        if stop < n:
+            # Prefer a newline in the back half, so most cuts split nothing.
+            nl = chunk.rfind("\n", start + SEGMENT_CHARS // 2, stop)
+            if nl != -1:
+                segments.append(chunk[start:nl])
+                start = nl + 1
+                continue
+            segments.append(chunk[start:stop])
+            start = stop - SEGMENT_OVERLAP
+            continue
+        segments.append(chunk[start:stop])
+        break
+    return SCAN_PREAMBLE + "\n\n".join(segments) + "\n"
+
+
 def _scan_chunk(binary: str, chunk: str, deadline: float) -> list[dict]:
+    chunk = _gitleaks_input(chunk)
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise ScanError("the deadline passed before the secret scan could start")
@@ -336,8 +383,11 @@ def gitleaks_findings(text: str, deadline: float) -> list[dict]:
     binary = gitleaks_binary()
     if binary is None:
         raise ScanError("gitleaks is not installed or not on PATH")
-    if os.path.exists(NO_IGNORE_FILE):
-        raise ScanError(f"{NO_IGNORE_FILE} exists and could suppress findings")
+    for ignore in (NO_IGNORE_FILE, "/.gitleaksignore"):
+        # gitleaks reads ./.gitleaksignore from its cwd ("/") whatever
+        # --gitleaks-ignore-path says (cmd/root.go), so that file must not exist.
+        if os.path.exists(ignore):
+            raise ScanError(f"{ignore} exists and could suppress findings")
     chunks = _chunks(text)
     if len(chunks) == 1:
         return _scan_chunk(binary, chunks[0], deadline)

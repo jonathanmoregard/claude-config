@@ -85,7 +85,9 @@ def tok(kind: str) -> str:
         "gocspx": lambda: "GOC" + "SPX-" + _rand(28),
         "oauth": lambda: "sk-" + "ant-" + "oat01-" + _rand(80),
         # keyword-proximity: only gitleaks' generic-api-key rule sees it
-        "generic": lambda: _rand(32),
+        # gitleaks' generic rule allowlists letters-only values
+        # (`^[a-zA-Z_.-]+$`), so a fixture must hold a digit — as real keys do.
+        "generic": lambda: _rand(30) + _rand(1, string.digits) + _rand(1, string.ascii_letters),
     }
     value = makers[kind]()
     TOKENS.append(value)
@@ -295,6 +297,49 @@ _enc = base64.b64encode(f"token {_t4}".encode()).decode()
 rc, upd, raw, _, _ = run_hook(payload("mcp__x__y", f"blob: {_enc}\nnext line stays"))
 check("the base64 run carrying a token is redacted", _enc not in raw and upd, raw[:300])
 check("the line after it is untouched", isinstance(upd, str) and "next line stays" in upd)
+# Not on line 1, and in a later 256 KB chunk: the finding's line number must
+# be read against the text gitleaks was actually fed.
+_t4b = tok("github")
+_enc_b = base64.b64encode(f"token {_t4b}".encode()).decode()
+rc, upd, raw, _, _ = run_hook(payload("mcp__x__y", f"x\ny\nblob: {_enc_b}\nz"))
+check("a base64 run on line 3 is redacted, the other lines kept",
+      _enc_b not in raw and isinstance(upd, str) and upd.startswith("x\ny\nblob: [REDACTED:")
+      and upd.endswith("\nz"), _safe(upd)[:200])
+_far = ("lorem ipsum dolor sit amet " * 3 + "\n") * 4000 + f"blob: {_enc_b}\n"
+rc, upd, raw, _, _ = run_hook(payload("mcp__x__y", [{"type": "text", "text": _far}]))
+check("a base64 run at the end of a ~330 KB result (a later chunk) is redacted",
+      _enc_b not in raw and upd and "blob: [REDACTED:" in raw, f"rc={rc}")
+
+
+# ----------------------------------------------------------------------
+# gitleaks 8.30.1 `stdin` quirks that drop findings silently. Each case is the
+# shape that made the unshaped input fail (see _gitleaks_input).
+section("gitleaks stdin quirks: magic bytes, internal cuts")
+_q_spec = importlib.util.spec_from_file_location("secret_redaction_quirks", MODULE)
+_srq = importlib.util.module_from_spec(_q_spec)
+_q_spec.loader.exec_module(_srq)
+for _magic in ("%PDF-1.4\n", "%!PS-Adobe-3.0\n", "{\\rtf1\n", "MZ\n", "SQLite format 3\x00\n"):
+    _tm = tok("gitlab")
+    rc, upd, raw, _, _ = run_hook(payload("mcp__x__y", [{"type": "text", "text": _magic + f"K={_tm}"}]))
+    check(f"output starting {_magic[:8]!r} is still scanned", _tm not in raw and upd, f"rc={rc}")
+_tm = tok("gitlab")
+rc, upd, raw, _, _ = run_hook(
+    {"tool_name": "Bash", "tool_input": {"command": "cat x"},
+     "tool_response": {"stdout": f"%PDF-1.4\nK={_tm}\n", "stderr": "", "interrupted": False}},
+    script=BASH_GUARD)
+check("Bash stdout starting %PDF is still scanned (bash-output-guard)", _tm not in raw and upd)
+
+_many = [tok("gitlab") for _ in range(12000)]
+rc, upd, raw, _, _ = run_hook(payload("mcp__x__y", " ".join(_many)))
+_missed = sum(1 for t in _many if t in raw)
+check("12,000 tokens on ONE ~320 KB line: none survive gitleaks' internal read cuts",
+      _missed == 0 and upd, f"missed={_missed} rc={rc}")
+check("the gitleaks input carries a blank line inside every peek window",
+      all(len(seg) <= _srq.SEGMENT_CHARS
+          for seg in _srq._gitleaks_input("a" * 100_000).split("\n\n")))
+check("the gitleaks input never starts with the tool's own bytes",
+      _srq._gitleaks_input("%PDF-1.4\nx").startswith(_srq.SCAN_PREAMBLE))
+del TOKENS[-12000:]  # keep _safe() fast; none of them is printed
 
 
 # ----------------------------------------------------------------------
