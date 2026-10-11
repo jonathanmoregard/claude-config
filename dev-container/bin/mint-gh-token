@@ -10,6 +10,14 @@
 # (nixos-config, home/gh-host-token.nix) read it, so agents on the laptop reach
 # GitHub as the App, never as the founder. `host` is reserved: it is never
 # treated as a sandbox dir, even if a repo_id appears in it.
+#
+# Multi-owner: one App installation covers one owner. INSTALLATION_ID is the
+# personal installation (host/token). ORG_INSTALLATIONS in the config is a
+# space-separated list of `owner=installation-id` pairs; each gets its own
+# whole-installation token in TOKEN_ROOT/host/<owner>/token (dir 0700, file
+# 0600, owner lowercased), minted on every run alongside the personal one. The
+# wrapper and helper pick host/<owner>/token for repos under that owner and
+# fall back to host/token otherwise. Unset ORG_INSTALLATIONS = personal only.
 
 set -euo pipefail
 
@@ -42,15 +50,22 @@ build_jwt() {
     header=$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)
     payload=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "$((now - 60))" "$exp" "$APP_ID" | b64url)
     signing_input="${header}.${payload}"
-    sig=$(printf '%s' "$signing_input" | openssl dgst -sha256 -sign "$KEY_PATH" | b64url)
+    # `|| return 1`: callers run in an `if`/`||` context, where set -e is off,
+    # so without it a key openssl cannot use would send an unsigned JWT.
+    sig=$(printf '%s' "$signing_input" | openssl dgst -sha256 -sign "$KEY_PATH" | b64url) || return 1
+    [ -n "$sig" ] || return 1
     printf '%s.%s' "$signing_input" "$sig"
 }
 
-# request_token <dir> <json-body>: ask GitHub for an installation access token
-# and print the raw JSON response on stdout. Failures go to stderr, <dir> named.
+# request_token <dir> <json-body> [installation-id]: ask GitHub for an
+# installation access token (default: INSTALLATION_ID) and print the raw JSON
+# response on stdout. Failures go to stderr, <dir> named.
 request_token() {
-    local dir="$1" body="$2" jwt auth_file response rc
-    jwt=$(build_jwt)
+    local dir="$1" body="$2" installation_id="${3:-$INSTALLATION_ID}" jwt auth_file response rc
+    jwt=$(build_jwt) || {
+        echo "mint-gh-token: could not sign the App JWT with $KEY_PATH for $dir" >&2
+        return 1
+    }
     auth_file=$(mktemp) && chmod 600 "$auth_file" || return 1
     printf 'Authorization: Bearer %s' "$jwt" > "$auth_file"
 
@@ -59,7 +74,7 @@ request_token() {
         -H "Accept: application/vnd.github+json" \
         -H "X-GitHub-Api-Version: 2022-11-28" \
         -d "$body" \
-        "https://api.github.com/app/installations/$INSTALLATION_ID/access_tokens" 2>&1)
+        "https://api.github.com/app/installations/$installation_id/access_tokens" 2>&1)
     rc=$?
     : > "$auth_file"
     rm -f "$auth_file"
@@ -102,11 +117,50 @@ mint_for_host() {
         return 1
     fi
 
-    response=$(request_token "$dir" '{}') || return 1
-    write_token "$dir" "$response" || return 1
-    printf '%s' "$response" \
-        | jq -c '{host_token: "minted", expires_at, repository_selection, permissions}' \
-        | sed 's/^/mint-gh-token: /'
+    local rc=0
+    if response=$(request_token "$dir" '{}') && write_token "$dir" "$response"; then
+        printf '%s' "$response" \
+            | jq -c '{host_token: "minted", expires_at, repository_selection, permissions}' \
+            | sed 's/^/mint-gh-token: /'
+    else
+        rc=1
+    fi
+    # Org installations are minted even when the personal one failed: one
+    # owner's outage must not take the others down with it.
+    mint_for_orgs "$dir" || rc=1
+    return "$rc"
+}
+
+# One whole-installation token per ORG_INSTALLATIONS entry, into
+# <host-dir>/<owner>/token. A malformed entry is reported and skipped; the
+# remaining entries are still minted.
+mint_for_orgs() {
+    local host_dir="$1" pair owner id dir response rc=0
+    for pair in ${ORG_INSTALLATIONS:-}; do
+        owner=$(printf '%s' "${pair%%=*}" | tr '[:upper:]' '[:lower:]')
+        id="${pair#*=}"
+        if [[ "$pair" != *=* ]] || ! [[ "$owner" =~ ^[a-z0-9][a-z0-9-]*$ ]] \
+            || ! [[ "$id" =~ ^[0-9]+$ ]]; then
+            echo "mint-gh-token: ORG_INSTALLATIONS entry '$pair' is not owner=installation-id; skipped" >&2
+            rc=1
+            continue
+        fi
+        dir="$host_dir/$owner"
+        if [ ! -d "$dir" ] && ! mkdir -m 0700 "$dir"; then
+            echo "mint-gh-token: cannot create $dir; $owner token not minted" >&2
+            rc=1
+            continue
+        fi
+        if response=$(request_token "$dir" '{}' "$id") && write_token "$dir" "$response"; then
+            printf '%s' "$response" \
+                | jq -c --arg owner "$owner" \
+                    '{host_token: "minted", owner: $owner, expires_at, repository_selection, permissions}' \
+                | sed 's/^/mint-gh-token: /'
+        else
+            rc=1
+        fi
+    done
+    return "$rc"
 }
 
 mkdir -p "$TOKEN_ROOT"
