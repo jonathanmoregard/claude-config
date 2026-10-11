@@ -28,7 +28,7 @@ import gitleaks_driver as gd  # noqa: E402
 FAILURES: list[str] = []
 TOKENS: list[str] = []
 SCRATCH = tempfile.mkdtemp(prefix="gitleaks-driver-test-")
-BINARY = gd.gitleaks_binary()
+BINARY = shutil.which("gitleaks")
 ALNUM = string.ascii_letters + string.digits
 
 
@@ -62,8 +62,8 @@ def tok(kind: str = "gitlab") -> str:
     return value
 
 
-def scan(texts, **kw):
-    return gd.find_secrets(texts, rules=RULES, binary=kw.pop("binary", BINARY), **kw)
+def scan(texts, binary=None, timeout=120.0):
+    return gd.find_secrets(texts, rules=RULES, gitleaks=binary or BINARY, timeout=timeout)
 
 
 def fake_gitleaks(name: str, body: str) -> str:
@@ -90,7 +90,7 @@ if BINARY is None:
 section("binary-type sniffing never skips a text")
 # The last two put a magic at a fixed FILE offset (tar at 257, ISO 9660 at 32769),
 # past the header, so only the header's own type keeps them from being sniffed.
-_pad = len(gd.HEADER.encode())
+_pad = len(gd.HEADER)
 for prefix in ("%PDF-1.4", "%!PS-Adobe-3.0", "{\\rtf1", "MZ", "SQLite format 3",
                "y" * (257 - _pad) + "ustar", "z" * (32769 - _pad) + "CD001"):
     t = tok()
@@ -110,21 +110,23 @@ check("findings come back on the text they were found in", a in r[0] and r[1] ==
 
 # ----------------------------------------------------------------------
 section("pieces: one gitleaks read each, overlapping")
-for name, text in (
-    ("ascii, no newlines", "x" * 400_000),
-    ("ascii, many lines", ("line of text\n" * 40_000)),
-    ("4-byte characters", "\U0001F600" * 100_000),
-):
-    ps = gd.pieces(text)
-    sizes = [len((gd.HEADER + p).encode()) for p in ps]
-    check(f"{name}: every piece incl. header is <= {gd.PIECE_BYTES} bytes", max(sizes) <= gd.PIECE_BYTES, sizes)
-    joined_ok = all(ps[i + 1][: gd.OVERLAP_CHARS] in ps[i] for i in range(len(ps) - 1))
-    check(f"{name}: consecutive pieces overlap by {gd.OVERLAP_CHARS} chars", joined_ok)
-    check(f"{name}: pieces cover the text", ps[0] == text[: len(ps[0])] and text.endswith(ps[-1]))
+for name, n in (("empty", 0), ("one byte", 1), ("exactly one piece", gd.PIECE_BYTES),
+                ("one byte over", gd.PIECE_BYTES + 1), ("400 KB", 400_000)):
+    data = os.urandom(n)
+    ps = gd.pieces(data)
+    step = gd.PIECE_BYTES - gd.OVERLAP_BYTES
+    check(f"{name}: HEADER + any piece fits one gitleaks read (100,000 bytes)",
+          max(len(gd.HEADER + p) for p in ps) <= 100_000)
+    check(f"{name}: consecutive pieces overlap by {gd.OVERLAP_BYTES} bytes",
+          all(ps[i][step:] == ps[i + 1][: gd.OVERLAP_BYTES] for i in range(len(ps) - 1)))
+    check(f"{name}: pieces cover the data, last one ends it",
+          ps[0] == data[: len(ps[0])] and data.endswith(ps[-1]) and len(ps) == max(1, -(-(n - gd.OVERLAP_BYTES) // step)))
 tokens = [tok() for _ in range(12000)]
 t0 = time.monotonic()
 found = scan([" ".join(tokens)])[0]
-missed = [t for t in tokens if t not in found]
+# About 1 random token in 240,000 is rejected by gitleaks' own rule even alone;
+# only a token the batch misses but a single-text scan catches is a driver bug.
+missed = [t for t in tokens if t not in found and t in scan([t])[0]]
 check(f"12,000 tokens on one line: 0 missed ({time.monotonic() - t0:.1f}s)", not missed, len(missed))
 
 # ----------------------------------------------------------------------
@@ -156,6 +158,12 @@ for target in sorted(found, key=len, reverse=True):
     redacted = redacted.replace(target, f"[REDACTED:{found[target]}]")
 check("no target contains a marker", all(gd.MARKER not in t for t in found))
 check("rescanning the redacted text finds nothing (idempotent)", scan([redacted])[0] == {}, scan([redacted]))
+marked = f"Authorization: Basic {encoded} [REDACTED:google-oauth-client-secret:35chars]"
+r = scan([marked])[0]
+check("a decoded line's existing marker is not taken for an encoded run",
+      encoded in r and not any(t in marked[marked.index("[REDACTED:"):] for t in r), r)
+ok, _ = raises(lambda: gd._targets({"Tags": ["decoded:base64"], "StartLine": 99, "RuleID": "r"}, b"a\nb\n"))
+check("a decoded finding placed outside its file raises GitleaksError", ok)
 check("an empty batch makes no call", scan([], binary="/nonexistent") == [])
 check("empty texts make no call", scan(["", ""], binary="/nonexistent") == [{}, {}])
 
@@ -170,22 +178,13 @@ for label, binary, kw in (
     ("finding in an unknown file", fake_gitleaks(
         "unknown", "echo '[{\"File\": \"in/99.txt\", \"RuleID\": \"x\", \"Secret\": \"abcdefgh1\"}]';"
         " echo 'INF scanned ~999999999 bytes' >&2"), {}),
-    ("timeout", fake_gitleaks("slow", "sleep 5"), {"deadline": time.monotonic() + 0.5}),
-    ("deadline already passed", BINARY, {"deadline": time.monotonic() - 1}),
+    ("timeout", fake_gitleaks("slow", "sleep 5"), {"timeout": 0.5}),
+    ("no time left", BINARY, {"timeout": -1}),
 ):
     t = tok()
     ok, msg = raises(lambda b=binary, k=kw, t=t: scan([f"canary {t}"], binary=b, **k))
     check(f"{label}", ok, msg)
     check(f"{label}: the error carries no scanned text", t not in msg and "canary" not in msg, msg)
-
-# ----------------------------------------------------------------------
-section("binary lookup")
-os.environ["GITLEAKS_DRIVER_TEST_BIN"] = BINARY
-check("an env override names the binary", gd.gitleaks_binary("GITLEAKS_DRIVER_TEST_BIN") == BINARY)
-os.environ["GITLEAKS_DRIVER_TEST_BIN"] = "/nonexistent/gitleaks"
-check("a bad env override gives None, not a PATH fallback",
-      gd.gitleaks_binary("GITLEAKS_DRIVER_TEST_BIN") is None)
-del os.environ["GITLEAKS_DRIVER_TEST_BIN"]
 
 # ----------------------------------------------------------------------
 section("Summary")

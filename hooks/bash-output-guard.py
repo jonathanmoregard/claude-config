@@ -13,7 +13,7 @@ Two layers:
      positives are acceptable — the model knows what it asked for, and the
      marker tells it the call succeeded but the value is gated. False
      negatives are not: every missed pattern is a future incident.
-     Detection is ``secret_redaction.py`` (regex floor + gitleaks), shared
+     Detection is ``secret_redaction.py`` (gitleaks), shared
      with ``tool-output-redact.py``. A gitleaks fault withholds.
   2. Untrusted-ingress tagging. Output from curl/wget/npx, gh fetches, gh
      api, git clone and package installs is wrapped in
@@ -28,7 +28,7 @@ EMITTING A REWRITE IS NOT LANDING ONE
 -------------------------------------
 The CLI drops a rewrite its Bash output schema refuses and shows the
 ORIGINAL output (measurement at ``_schema_violation``). So nothing leaves
-here that the schema would refuse — ``_emit_rewrite`` is the choke point —
+here that the schema would refuse — ``_conforming`` is the choke point —
 and every rewrite, the withheld-output notice included, is an object.
 
 WHAT A BASH TOOL RESULT CAN CONTAIN
@@ -97,7 +97,7 @@ unparseable payload, a string- or list-shaped result — and a bare string is
 refused, which restores the original un-inspected output. The one branch
 whose whole job was failing closed was the one that failed open, and it had
 been that way since it was written: the gate is byte-identical in 2.1.247
-and 2.1.248. ``_withhold`` now builds a conforming object every time.
+and 2.1.248. ``_withheld_result`` builds a conforming object every time.
 
 The same harness-timeout trap applies as in bash-guard.py: a harness-level
 timeout cancels the hook and DISCARDS its output, so no rewrite happens at
@@ -123,6 +123,8 @@ HARNESS_HOOK_TIMEOUT_S = 10
 GUARD_DEADLINE_S = HARNESS_HOOK_TIMEOUT_S - 4  # 6
 
 _TIMEOUTS_SANE = 0 < GUARD_DEADLINE_S < HARNESS_HOOK_TIMEOUT_S
+# Resolved on PATH, like the python3 that runs this hook.
+GITLEAKS = "gitleaks"
 
 CONFIG_PATH = os.environ.get(
     "BASH_GUARD_CONFIG",
@@ -227,8 +229,8 @@ NON_MODEL_FACING_FIELDS = frozenset({"gitOperation", "bashEditDiff"})
 #                                    content: O};
 #
 # so stdout, stderr and any <untrusted_external_content> wrapper this guard
-# put on them are never rendered at all. Its text IS redacted (`_redact_tree`
-# walks the whole result), so it is not a redaction hole — it is a TAGGING
+# put on them are never rendered at all. Its text IS redacted (the whole
+# result is), so it is not a redaction hole — it is a TAGGING
 # hole, and tagging stdout cannot close it. The Bash tool's own result
 # builder (offset 183867600) never sets the field, so no real command hits
 # this; if that changes, the withhold below says so out loud.
@@ -291,7 +293,7 @@ def _emit(updated) -> None:
     A swallowed write error here was a silent fail-open. Not emitting a
     rewrite is not a no-op: the CLI keeps the ORIGINAL, un-inspected result,
     so every redaction goes with the write that never landed — the same
-    outcome as the refused rewrite `_emit_rewrite` exists to prevent, reached
+    outcome as the refused rewrite `_conforming` exists to prevent, reached
     by a different road. Measured with stdout on /dev/full: the guard exited
     0 with empty stdout AND empty stderr, and the unredacted secret went to
     the model with nothing said.
@@ -458,8 +460,16 @@ def _drop_null_optionals(result: dict) -> dict:
     }
 
 
-def _emit_rewrite(updated) -> None:
-    """Emit a rewrite, or withhold if the consumer would refuse it.
+class Withhold(BaseException):
+    """The guard cannot vouch for this output: main() replaces it with a notice.
+
+    A BaseException, so no ``except Exception`` on the way up can swallow it;
+    the deadline raises it from wherever the guard happens to be.
+    """
+
+
+def _conforming(updated) -> dict:
+    """``updated`` as the CLI will apply it, or Withhold.
 
     The one invariant this file cannot afford to lose: nothing leaves the
     guard that the CLI would drop, because dropping the rewrite restores the
@@ -471,23 +481,17 @@ def _emit_rewrite(updated) -> None:
         updated = _drop_null_optionals(updated)
     why = _schema_violation(updated)
     if why is not None:
-        _withhold(
+        raise Withhold(
             "the guard built a replacement the CLI would refuse to apply "
             f"({why}). A refused rewrite is not a no-op: the CLI falls back to "
             "the ORIGINAL, un-inspected output, so every redaction would be "
             "dropped with it"
         )
-    _emit(updated)
+    return updated
 
 
-# Shape of the last response we managed to read, so a withhold can hand back
-# something the model renders the same way as a real result. Set as early as
-# parsing allows; ``None`` means we never got that far.
-_SHAPE: dict | None = None
-
-
-def _withhold(detail: str) -> None:
-    """Replace the tool output with a broken-guard notice, then leave.
+def _withheld_result(detail: str, response) -> dict:
+    """The broken-guard notice, in the shape of ``response`` where it has one.
 
     Every string and every container in the original shape is dropped, not
     just ``stdout``/``stderr``: a withhold that copies the rest of the
@@ -498,18 +502,15 @@ def _withhold(detail: str) -> None:
 
     The replacement always conforms to the Bash output schema (an object
     with a boolean ``interrupted``), whatever shape arrived; a refused
-    withhold would show the original. The deadline is disarmed first, so a
-    withhold already running is not replaced by the watchdog's.
-    ``os._exit`` skips interpreter shutdown on purpose.
+    withhold would show the original.
     """
-    _disarm_watchdog()
     text = _withheld_text(detail)
     replacement: dict = {}
-    if isinstance(_SHAPE, dict):
+    if isinstance(response, dict):
         sizes = {size for _, size in OUTPUT_POINTER_FIELDS if size}
         replacement = {
             k: v
-            for k, v in _SHAPE.items()
+            for k, v in response.items()
             if v is not None
             and not isinstance(v, (str, dict, list))
             and k not in sizes
@@ -523,12 +524,11 @@ def _withhold(detail: str) -> None:
         # Hand back the smallest result it does accept: a withhold that gets
         # dropped is a withhold that showed the output anyway.
         replacement = _minimal_result(text, replacement["interrupted"])
-    _emit(replacement)
-    os._exit(0)
+    return replacement
 
 
 def _on_deadline(signum, frame) -> None:  # noqa: ARG001
-    _withhold(
+    raise Withhold(
         f"the guard exceeded its own {GUARD_DEADLINE_S}s deadline. The harness hook "
         f"timeout ({HARNESS_HOOK_TIMEOUT_S}s) would have discarded this hook's output "
         "and left the tool result unrewritten, which is fail-open."
@@ -547,7 +547,7 @@ def _arm_watchdog() -> None:
         # timeout, and that one CANCELS the hook and discards its output,
         # leaving the result unrewritten. The deadline is the only thing that
         # turns "too slow" into a withhold instead of a leak.
-        _withhold(
+        raise Withhold(
             "the guard could not arm its own deadline "
             f"({type(exc).__name__}: {exc}), so it cannot promise to finish "
             f"inside the {HARNESS_HOOK_TIMEOUT_S}s harness timeout — and that "
@@ -561,7 +561,7 @@ def _disarm_watchdog() -> None:
     # where _arm_watchdog's setitimer() also failed, and that path now
     # withholds instead of returning, so reaching here means a timer was
     # armed and can be cancelled. No permissive outcome either way: a
-    # watchdog that fires anyway calls _withhold, which holds the bytes back.
+    # watchdog that fires anyway raises Withhold, which holds the bytes back.
     try:
         signal.setitimer(signal.ITIMER_REAL, 0)
     # arftl-allow: swallowed-exception — reasoning directly above.
@@ -569,36 +569,9 @@ def _disarm_watchdog() -> None:
 
 
 # ----------------------------------------------------------------------
-# Layer 1: secret redaction — secret_redaction.py (regex floor + gitleaks).
-# A module that cannot load must become a withhold in main(), not a
-# traceback here (exit 1 would show the original output).
+# Layer 1: secret redaction — secret_redaction.py, handed in by main() as
+# `redact` (value -> redacted value, raising on a scan fault).
 # ----------------------------------------------------------------------
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-try:
-    import secret_redaction as sr
-    _SR_IMPORT_FAULT = None
-except Exception as exc:  # noqa: BLE001 — main() withholds with this
-    sr, _SR_IMPORT_FAULT = None, f"{type(exc).__name__}: {exc}"
-_DEADLINE = 0.0  # set by main(): the time.monotonic() instant scans must end by
-
-
-def _redact_secrets(body: str) -> str:
-    """The regex floor alone."""
-    return sr.floor_redact(body)
-
-
-def _redact_tree(value):
-    """Redact every string anywhere in the result, whatever field it is in.
-
-    Two named fields is a list that goes stale the moment the tool result
-    grows a third. This walks whatever arrived.
-    """
-    try:
-        return sr.redact_value(value, _DEADLINE)
-    except sr.ScanError as exc:
-        _withhold(f"the gitleaks secret scan failed: {exc}")
-
-
 def _persisted_is_harness_owned(path: str) -> bool:
     """True only for the harness's own overflow files."""
     try:
@@ -611,7 +584,7 @@ def _persisted_is_harness_owned(path: str) -> bool:
     return (os.sep + PERSISTED_DIR_NAME + os.sep) in real
 
 
-def _scrub_persisted(path: str) -> tuple[bool, str, int]:
+def _scrub_persisted(path: str, redact, max_bytes: int) -> tuple[bool, str, int]:
     """Redact the overflow file in place.
 
     Returns ``(ok, why_not, size)``. ``ok`` false means the model must not
@@ -626,9 +599,9 @@ def _scrub_persisted(path: str) -> tuple[bool, str, int]:
         size = os.path.getsize(path)
     except OSError as exc:
         return False, f"it could not be examined ({type(exc).__name__})", 0
-    if size > sr.MAX_SCAN_BYTES:
+    if size > max_bytes:
         return False, (
-            f"it is {size} bytes, past the {sr.MAX_SCAN_BYTES}-byte limit "
+            f"it is {size} bytes, past the {max_bytes}-byte limit "
             "this guard can scan inside its own deadline"
         ), 0
     try:
@@ -637,8 +610,8 @@ def _scrub_persisted(path: str) -> tuple[bool, str, int]:
     except OSError as exc:
         return False, f"it could not be read ({type(exc).__name__})", 0
     try:
-        scrubbed = sr.redact_strings([body], _DEADLINE)[0]
-    except sr.ScanError as exc:
+        scrubbed = redact(body)
+    except Exception as exc:  # noqa: BLE001 — unscanned: the pointer is withheld
         return False, f"the gitleaks secret scan of it failed ({exc})", 0
     if scrubbed == body:
         return True, "", size
@@ -991,7 +964,7 @@ def _require_prefixes_fit(multi: list) -> None:
         and len(entry["prefix"]) >= MAX_SEGMENT_TOKENS
     ]
     if doomed:
-        _withhold(
+        raise Withhold(
             "the ingress vocabulary holds prefix(es) at or past the "
             f"{MAX_SEGMENT_TOKENS}-token segment cap, so they could never be "
             "compared in full and would sit in the config looking alive: "
@@ -1081,7 +1054,7 @@ def _require_ingress_vocabulary(config: dict) -> None:
     """
     single = config.get("untrusted_ingress_single")
     if not isinstance(single, dict) or not single:
-        _withhold(
+        raise Withhold(
             f"ingress config at {CONFIG_PATH!r} has an empty or non-object "
             "untrusted_ingress_single, so no fetch could ever be tagged and the "
             "ingress vocabulary would be silently empty"
@@ -1092,14 +1065,14 @@ def _require_ingress_vocabulary(config: dict) -> None:
         or not isinstance(v, str) or not v.strip()
     )
     if bad_single:
-        _withhold(
+        raise Withhold(
             f"ingress config at {CONFIG_PATH!r} has untrusted_ingress_single "
             f"entries that cannot label a match: {bad_single}"
         )
 
     multi = config.get("untrusted_ingress_multi")
     if not isinstance(multi, list) or not multi:
-        _withhold(
+        raise Withhold(
             f"ingress config at {CONFIG_PATH!r} has a missing, misspelled, empty "
             "or non-list untrusted_ingress_multi. Every multi-token ingress entry "
             "would be silently inert while the config still loaded"
@@ -1118,7 +1091,7 @@ def _require_ingress_vocabulary(config: dict) -> None:
         if not isinstance(label, str) or not label.strip():
             doomed.append(f"[{i}] label is missing or empty, so a match would be dropped")
     if doomed:
-        _withhold(
+        raise Withhold(
             f"ingress config at {CONFIG_PATH!r} holds entries that could never "
             "tag anything: " + "; ".join(doomed)
         )
@@ -1130,13 +1103,13 @@ def _load_config() -> dict:
         with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
             config = json.load(fh)
     except FileNotFoundError:
-        _withhold(f"ingress config not found at {CONFIG_PATH!r}")
+        raise Withhold(f"ingress config not found at {CONFIG_PATH!r}")
     except (json.JSONDecodeError, ValueError) as exc:
-        _withhold(f"ingress config at {CONFIG_PATH!r} is not parseable JSON: {exc}")
+        raise Withhold(f"ingress config at {CONFIG_PATH!r} is not parseable JSON: {exc}")
     except OSError as exc:
-        _withhold(f"ingress config at {CONFIG_PATH!r} could not be read: {exc}")
+        raise Withhold(f"ingress config at {CONFIG_PATH!r} could not be read: {exc}")
     if not isinstance(config, dict) or "untrusted_ingress_single" not in config:
-        _withhold(
+        raise Withhold(
             f"ingress config at {CONFIG_PATH!r} is missing untrusted_ingress_single; "
             "the ingress vocabulary would be silently empty"
         )
@@ -1144,43 +1117,55 @@ def _load_config() -> dict:
     return config
 
 
-def main() -> int:
-    global _SHAPE, _DEADLINE
-    _DEADLINE = time.monotonic() + GUARD_DEADLINE_S - 0.5
+def main(gitleaks: str = GITLEAKS) -> int:
+    deadline = time.monotonic() + GUARD_DEADLINE_S - 0.5
+    response = None
+    try:
+        if not _TIMEOUTS_SANE:
+            raise Withhold(
+                "the guard's timeout ladder no longer holds "
+                f"(0 < GUARD_DEADLINE_S={GUARD_DEADLINE_S} < "
+                f"HARNESS_HOOK_TIMEOUT_S={HARNESS_HOOK_TIMEOUT_S} is false)"
+            )
+        _arm_watchdog()
+        payload = _read_payload()
+        # Registered with matcher `Bash`; anything else is not ours to rewrite.
+        if payload.get("tool_name") != "Bash":
+            return 0
+        response = payload.get("tool_response")
+        import secret_redaction as sr  # one that cannot load withholds, below
 
-    if not _TIMEOUTS_SANE:
-        _withhold(
-            "the guard's timeout ladder no longer holds "
-            f"(0 < GUARD_DEADLINE_S={GUARD_DEADLINE_S} < "
-            f"HARNESS_HOOK_TIMEOUT_S={HARNESS_HOOK_TIMEOUT_S} is false)"
-        )
+        def redact(value):
+            return sr.redact_value(value, gitleaks=gitleaks, timeout=deadline - time.monotonic())
 
-    _arm_watchdog()
+        updated = _rewrite(payload, response, redact, sr.MAX_SCAN_CHARS)
+    except Withhold as w:
+        updated = _withheld_result(str(w), response)
+    except Exception as exc:  # noqa: BLE001 — a scan fault or a guard bug: fail closed
+        updated = _withheld_result(f"{type(exc).__name__} inside the guard: {exc}", response)
+    finally:
+        _disarm_watchdog()
+    if updated is not None:
+        _emit(updated)
+    return 0
 
+
+def _read_payload() -> dict:
     try:
         raw = sys.stdin.read()
     except (OSError, ValueError) as exc:
-        _withhold(f"could not read hook stdin: {type(exc).__name__}: {exc}")
-
+        raise Withhold(f"could not read hook stdin: {type(exc).__name__}: {exc}") from None
     try:
         payload = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
-        _withhold("hook stdin was not parseable JSON, so the output was not inspected")
-
+        raise Withhold("hook stdin was not parseable JSON, so the output was not inspected") from None
     if not isinstance(payload, dict):
-        _withhold("hook stdin was JSON but not an object")
+        raise Withhold("hook stdin was JSON but not an object")
+    return payload
 
-    # Registered with matcher `Bash`; anything else is not ours to rewrite.
-    if payload.get("tool_name") != "Bash":
-        _disarm_watchdog()
-        return 0
 
-    response = payload.get("tool_response")
-    if isinstance(response, dict):
-        _SHAPE = response
-    if sr is None:
-        _withhold(f"secret_redaction.py could not be imported ({_SR_IMPORT_FAULT})")
-
+def _rewrite(payload: dict, response, redact, max_scan_bytes: int) -> dict | None:
+    """The rewrite of a Bash result, or None to leave it. Raises Withhold."""
     tool_input = payload.get("tool_input")
     command = ""
     if isinstance(tool_input, dict):
@@ -1198,13 +1183,10 @@ def main() -> int:
         # is an OBJECT, so a string rewrite is refused and the unredacted
         # original is shown instead. The redaction only survives as a result
         # object, so that is what goes back.
-        new_body = _redact_tree(response)
+        new_body = redact(response)
         if label:
             new_body = _wrap(new_body, label, command, reminder=True)
-        _disarm_watchdog()
-        if new_body != response:
-            _emit_rewrite(_minimal_result(new_body))
-        return 0
+        return _conforming(_minimal_result(new_body)) if new_body != response else None
 
     if isinstance(response, list):
         # Not the shape the Bash tool returns, and — unlike a string — not a
@@ -1212,32 +1194,30 @@ def main() -> int:
         # object schema, so a redacted copy is refused and the ORIGINAL list,
         # secrets and all, is what the model reads. Redaction cannot be
         # DELIVERED here, so finding something to redact is itself the fault.
-        scrubbed = _redact_tree(response)
+        scrubbed = redact(response)
         if label:
-            _withhold(
+            raise Withhold(
                 f"the result arrived as a list, a shape this guard cannot tag, and "
                 f"the command is untrusted ingress ({label}). Its body would have "
                 "reached the model without an <untrusted_external_content> marker"
             )
         if scrubbed != response:
-            _withhold(
+            raise Withhold(
                 "the result arrived as a list and carried a secret-shaped value. "
                 "The Bash output schema is an object, so a redacted list would be "
                 "refused and the ORIGINAL list shown in its place — the redaction "
                 "cannot be delivered in this shape, so the output is held back "
                 "instead"
             )
-        _disarm_watchdog()
-        return 0
+        return None
 
     if not isinstance(response, dict):
         # Nothing text-shaped to inspect and nothing to preserve. Leave it.
-        _disarm_watchdog()
-        return 0
+        return None
 
     # Everything, not two named fields: a field this file has never heard of
     # still carries bytes the model will read.
-    updated = _redact_tree(response)
+    updated = redact(response)
 
     # An image-carrying stdout is base64, not prose: wrapping it would corrupt
     # the payload. Redaction still runs — corrupting an image beats leaking a
@@ -1249,7 +1229,7 @@ def main() -> int:
     # need a tag added, it makes the tag unreachable.
     structured = response.get(CONTENT_REPLACING_FIELD)
     if label and isinstance(structured, list) and structured:
-        _withhold(
+        raise Withhold(
             f"the result carries {CONTENT_REPLACING_FIELD}, which does not sit "
             "beside stdout — it REPLACES the whole tool result the model reads "
             "(the Bash mapper's first line is `if (O && O.length > 0) return "
@@ -1273,7 +1253,7 @@ def main() -> int:
 
     unknown = sorted(k for k, v in response.items() if _untaggable(k, v))
     if label and unknown:
-        _withhold(
+        raise Withhold(
             f"the result carries text in field(s) {unknown} that this guard does not "
             f"know how to tag, and the command is untrusted ingress ({label}). "
             "Teach hooks/bash-output-guard.py about the field — OUTPUT_FIELDS if it "
@@ -1290,7 +1270,7 @@ def main() -> int:
         pointer = response.get(path_field)
         if not (isinstance(pointer, str) and pointer):
             continue
-        ok, why_not, size = _scrub_persisted(pointer)
+        ok, why_not, size = _scrub_persisted(pointer, redact, max_scan_bytes)
         if ok:
             if size_field and size_field in updated:
                 updated[size_field] = size
@@ -1322,17 +1302,8 @@ def main() -> int:
         base = updated.get("stdout") if isinstance(updated.get("stdout"), str) else ""
         updated["stdout"] = (base.rstrip("\n") + "\n" if base else "") + note
 
-    _disarm_watchdog()
-    if updated != response:
-        _emit_rewrite(updated)
-    return 0
+    return _conforming(updated) if updated != response else None
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except SystemExit:
-        raise
-    except BaseException as exc:  # noqa: BLE001 — fail-closed is the point
-        _disarm_watchdog()
-        _withhold(f"unhandled {type(exc).__name__} inside the guard itself: {exc}")
+    sys.exit(main())

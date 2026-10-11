@@ -464,7 +464,7 @@ check("the command ran rather than being denied",
       _c_cmd in _c.attempted and _c.denied == [],
       f"attempted={_c.attempted} denied={_c.denied}")
 check("the redaction marker reached the model",
-      "[REDACTED:aws-access:20chars]" in result_text(_c), result_text(_c)[:300])
+      "[REDACTED:" in result_text(_c) and ":20chars]" in result_text(_c), result_text(_c)[:300])
 check(
     "the key itself did NOT reach the model",
     AWS_KEY not in result_text(_c),

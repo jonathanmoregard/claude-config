@@ -41,7 +41,7 @@ RULES = os.path.join(HOOKS, "secret-rules.toml")
 SCRATCH = tempfile.mkdtemp(prefix="tool-output-redact-test-")
 WITHHELD = "OUTPUT WITHHELD"
 BASH_WITHHELD = "the output guard is BROKEN"
-NO_GITLEAKS = {"SECRET_REDACTION_GITLEAKS": "/nonexistent/gitleaks"}
+NO_GITLEAKS = {"PATH": "/nonexistent"}  # the hooks find gitleaks on PATH
 
 _spec = importlib.util.spec_from_file_location("tool_output_redact_under_test", HOOK)
 hook = importlib.util.module_from_spec(_spec)
@@ -149,11 +149,14 @@ def bash(stdout: str, command: str = "cat .env") -> dict:
 
 
 def fake_gitleaks(name: str, body: str) -> dict:
-    path = os.path.join(SCRATCH, f"gitleaks-{name}")
+    """Env whose PATH holds only a fake `gitleaks` running ``body``."""
+    bindir = os.path.join(SCRATCH, f"bin-{name}")
+    os.makedirs(bindir)
+    path = os.path.join(bindir, "gitleaks")
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("#!/bin/sh\n" + body + "\n")
     os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
-    return {"SECRET_REDACTION_GITLEAKS": path}
+    return {"PATH": f"{bindir}:/run/current-system/sw/bin"}
 
 
 def sandbox(name: str, module_patch=(), hook_patch=()) -> str:
@@ -173,6 +176,21 @@ def sandbox(name: str, module_patch=(), hook_patch=()) -> str:
     return os.path.join(d, "tool-output-redact.py")
 
 
+def same_shape(a, b) -> bool:
+    """``b`` differs from ``a`` only in the content of non-empty strings."""
+    if isinstance(a, str):
+        return isinstance(b, str) and bool(b or not a)
+    if isinstance(a, dict):
+        return isinstance(b, dict) and list(a) == list(b) and all(same_shape(a[k], b[k]) for k in a)
+    if isinstance(a, list):
+        return isinstance(b, list) and len(a) == len(b) and all(map(same_shape, a, b))
+    return type(a) is type(b) and a == b
+
+
+def scan(text: str) -> dict:
+    return gitleaks_driver.find_secrets([text], rules=RULES, gitleaks=GITLEAKS, timeout=120)[0]
+
+
 def dig(value, path):
     for p in path:
         value = value[p]
@@ -181,7 +199,8 @@ def dig(value, path):
 
 # =========================================================================
 section("preconditions")
-check("gitleaks resolves on this host", gitleaks_driver.gitleaks_binary() is not None)
+GITLEAKS = shutil.which("gitleaks")
+check("gitleaks resolves on this host", GITLEAKS is not None)
 check("the rules file sits beside the shared module", os.path.isfile(RULES))
 
 # -------------------------------------------------------------------------
@@ -232,7 +251,7 @@ for label, tool, response, planted, binary_paths in SHAPES:
               r.updated is not None and all(t not in r.stdout for t in planted) and "[REDACTED:" in r.stdout,
               f"rc={r.rc} {r.stdout[:300]} {r.stderr[:200]}")
         check(f"{label}: shape identical to the original",
-              r.updated is not None and hook._same_shape(response, r.updated), r.updated)
+              r.updated is not None and same_shape(response, r.updated), r.updated)
     else:
         check(f"{label}: nothing to redact -> no rewrite", r.stdout.strip() == "", r.stdout[:200])
     for path in binary_paths:
@@ -272,6 +291,14 @@ for label, make in (("on line 1", lambda e: f"blob: {e}\nnext line stays"),
           enc not in r.stdout and isinstance(r.updated, str) and "blob: [REDACTED:" in r.updated
           and r.updated.endswith("\nnext line stays"), r.stdout[:200])
 
+# A decoded finding next to another finding on the same line: both go, and no
+# run inside the first marker is taken for an encoded secret.
+enc = base64.b64encode(f"user:{tok('github')}".encode()).decode()
+r = run_hook(post("mcp__x__y", f"Authorization: Basic {enc} {tok('gocspx')}"))
+check("a decoded run next to another finding: both redacted, no nested marker",
+      isinstance(r.updated, str) and "[REDACTED:[REDACTED:" not in r.updated
+      and r.updated.count("[REDACTED:") == 2 and enc not in r.updated, r.stdout[:200])
+
 # -------------------------------------------------------------------------
 section("large and odd inputs end to end (quirk mechanics: test_gitleaks_driver.py)")
 for magic in ("%PDF-1.4\n", "MZ\n"):
@@ -282,27 +309,25 @@ for magic in ("%PDF-1.4\n", "MZ\n"):
           t not in run_hook(bash(f"{magic}K={t}\n"), script=BASH_GUARD).stdout)
 big_tokens = [tok() for _ in range(4)]
 big = "".join(("lorem ipsum dolor sit amet " * 3 + "\n") * 2000 + f"line {t}\n" for t in big_tokens)
-check("fixture spans several driver pieces", len(gitleaks_driver.pieces(big)) >= 3)
+check("fixture spans several driver pieces", len(gitleaks_driver.pieces(big.encode())) >= 3)
 r = run_hook(post("mcp__x__big", [{"type": "text", "text": big}]))
 check(f"{len(big) // 1024} KB: every token redacted, every other byte kept, inside the deadline",
       all(t not in r.stdout for t in big_tokens) and isinstance(r.updated, list)
-      and r.updated[0]["text"].count("lorem") == big.count("lorem") and r.seconds < hook.GUARD_DEADLINE_S,
+      and r.updated[0]["text"].count("lorem") == big.count("lorem") and r.seconds < hook.SCAN_DEADLINE_S,
       f"rc={r.rc} {r.seconds:.1f}s")
-many = [TOKEN_MAKERS["gitlab"]() for _ in range(12000)]  # not in TOKENS: none is printed
-r = run_hook(post("mcp__x__y", " ".join(many)))
-check(f"12,000 distinct tokens on one line: all redacted, not withheld ({r.seconds:.1f}s)",
-      r.updated is not None and WITHHELD not in r.stdout and not any(t in r.stdout for t in many),
-      f"rc={r.rc} {r.seconds:.1f}s")
-# Applying findings must be linear in the text: 12,000 findings with diverse
-# first characters, then ~3 MB with none. A flat alternation tried every
-# finding at every position and ran into the deadline (withheld at 11 s).
-diverse = [f"token: {_rand(31)}k\n" for _ in range(12000)]
-text = "".join(diverse) + ("the quick brown fox jumps over the lazy dog " * 20 + "\n") * 3500
-found = gitleaks_driver.find_secrets([text], rules=RULES, binary=gitleaks_driver.gitleaks_binary())[0]
+# Up to MAX_TARGETS distinct findings are applied (one str.replace pass each),
+# over a large result, well inside the deadline; past it the output is withheld.
+many = [TOKEN_MAKERS["gitlab"]() for _ in range(sr.MAX_TARGETS)]  # not in TOKENS: none is printed
+text = "".join(f"token: {t}\n" for t in many) + ("the quick brown fox jumps over the lazy dog " * 20 + "\n") * 3500
 r = run_hook(post("mcp__x__y", text))
-check(f"{len(found)} findings + 3 MB without any: redacted, not withheld, in {r.seconds:.1f}s (< 8 s)",
-      r.rc == 0 and WITHHELD not in r.stdout and r.seconds < 8
-      and not any(f in r.stdout for f in found), f"rc={r.rc} {r.seconds:.1f}s")
+check(f"{sr.MAX_TARGETS} distinct findings + 3 MB: all redacted, not withheld, in {r.seconds:.1f}s (< 8 s)",
+      r.rc == 0 and WITHHELD not in r.stdout and r.seconds < 8 and not any(t in r.stdout for t in many),
+      f"rc={r.rc} {r.seconds:.1f}s")
+many = [TOKEN_MAKERS["gitlab"]() for _ in range(sr.MAX_TARGETS + 50)]
+r = run_hook(post("mcp__x__y", " ".join(many)))
+check(f"{len(many)} distinct findings: withheld, naming the limit ({r.seconds:.1f}s)",
+      r.rc == 0 and WITHHELD in r.stdout and "distinct secrets" in r.stdout
+      and not any(t in r.stdout for t in many), f"rc={r.rc} {r.stdout[:200]}")
 
 # -------------------------------------------------------------------------
 # secret-rules.toml: prefix rules fire on a token, not inside a base64 blob
@@ -311,7 +336,7 @@ section("custom prefix rules: token boundary, not mid-base64")
 
 
 def rule_hits(text: str) -> list[str]:
-    return list(gitleaks_driver.find_secrets([text], rules=RULES, binary=gitleaks_driver.gitleaks_binary())[0].values())
+    return list(scan(text).values())
 
 
 for rule, value in (("fireworks-api-key", tok("fireworks")), ("tavily-api-key", tok("tavily")),
@@ -346,7 +371,7 @@ READ = {"type": "text", "file": {"filePath": "/w/.env", "content": f"K={t}\nmore
                                  "numLines": 2, "startLine": 1, "totalLines": 2}}
 MCP_BIG = [{"type": "text", "text": f"K={t}\n" + "lorem ipsum " * 200}]
 slow_hook = sandbox("slow", hook_patch=(("HARNESS_HOOK_TIMEOUT_S = 15", "HARNESS_HOOK_TIMEOUT_S = 6"),))
-big_limit_hook = sandbox("big", module_patch=(("MAX_SCAN_BYTES = 8 * 1024 * 1024", "MAX_SCAN_BYTES = 1000"),))
+big_limit_hook = sandbox("big", module_patch=(("MAX_SCAN_CHARS = 8 * 1024 * 1024", "MAX_SCAN_CHARS = 1000"),))
 FAULTS = [  # label, script, env, response
     ("gitleaks missing", HOOK, NO_GITLEAKS, READ),
     ("gitleaks exits with an error", HOOK, fake_gitleaks("crash", "echo boom >&2; exit 3"), READ),
@@ -358,12 +383,12 @@ for label, script, env, response in FAULTS:
     r = run_hook(post("mcp__x__y" if response is MCP_BIG else "Read", response), script=script, env=env)
     check(f"{label}: withheld, secret not shown, original shape kept (exit 0)",
           r.rc == 0 and WITHHELD in r.stdout and t not in r.stdout
-          and r.updated is not None and hook._same_shape(response, r.updated), f"rc={r.rc} {r.stdout[:200]}")
+          and r.updated is not None and same_shape(response, r.updated), f"rc={r.rc} {r.stdout[:200]}")
     if script is slow_hook:
         check("the deadline withhold lands before the (patched) 6 s harness timeout", r.seconds < 6,
               f"{r.seconds:.1f}s")
 r = run_hook(post("Read", READ), env=NO_GITLEAKS)
-check("withhold: the notice names the fault", "not installed" in r.stdout)
+check("withhold: the notice names the fault", "gitleaks could not run" in r.stdout, r.stdout[:300])
 check("withhold: path and enum slots keep their values",
       isinstance(r.updated, dict) and r.updated["file"]["filePath"] == "/w/.env"
       and r.updated["type"] == "text")
@@ -389,28 +414,18 @@ for label, env, want in (("gitleaks present", None, "[REDACTED:gitlab-pat:"),
                          ("gitleaks missing", NO_GITLEAKS, WITHHELD)):
     r = run_hook(post("SomeTool", deep), env=env)
     check(f"{label}: a token 41 levels down is not emitted, shape kept",
-          r.rc == 0 and deep_tok not in r.stdout and want in r.stdout and hook._same_shape(deep, r.updated),
+          r.rc == 0 and deep_tok not in r.stdout and want in r.stdout and same_shape(deep, r.updated),
           f"rc={r.rc} {r.stdout[:200]}")
-# Deeper than Python's recursion limit, still inside what json.loads accepts:
-# the walkers are iterative.
+# Far past Python's default recursion limit, still inside what json.loads accepts.
 deep_tok = tok()
 r = run_hook(None, raw_stdin='{"tool_name": "SomeTool", "tool_response": '
-             + "[" * 3000 + json.dumps(f"x {deep_tok}") + "]" * 3000 + "}")
-check("a 3,000-deep list with a token at the bottom: redacted (exit 0)",
+             + "[" * 30000 + json.dumps(f"x {deep_tok}") + "]" * 30000 + "}")
+check("a 30,000-deep list with a token at the bottom: redacted (exit 0)",
       r.rc == 0 and deep_tok not in r.stdout and "[REDACTED:gitlab-pat:" in r.stdout,
       f"rc={r.rc} {r.stderr[:200]}")
 
-# A withhold still running when the deadline fires keeps its own fault.
-race_hook = sandbox("race", hook_patch=(
-    ("HARNESS_HOOK_TIMEOUT_S = 15", "HARNESS_HOOK_TIMEOUT_S = 6"),
-    ("    try:\n        import secret_redaction as sr\n",
-     "    time.sleep(2.5)\n    try:\n        import secret_redaction as sr\n")))
-r = run_hook(post("Read", READ), script=race_hook, env=fake_gitleaks("late", "sleep 1.4; exit 3"))
-check("a slow withhold racing the deadline reports the real fault, not the deadline",
-      "gitleaks exited 3" in r.stdout and "deadline" not in r.stdout, r.stdout[:300])
-
 r = run_hook(post("Read", READ), script=sandbox(
-    "broken-module", module_patch=(("import re\n", "import re\nraise ImportError('injected')\n"),)))
+    "broken-module", module_patch=(("import os\n", "import os\nraise ImportError('injected')\n"),)))
 check("a module that cannot load: not emitted, the model is told (exit 2)",
       r.rc == 2 and t not in r.stdout and "NOT INSPECTED" in r.stderr, f"rc={r.rc} {r.stderr[:200]}")
 r = run_hook(None, raw_stdin="{not json")
@@ -513,7 +528,7 @@ pre_hooks = [(e, h) for e in SETTINGS["hooks"]["PreToolUse"] for h in e["hooks"]
 check("tool-output-redact.py registered once on PostToolUse, no matcher (every future tool too)",
       len(post_hooks) == 1 and post_hooks[0][0].get("matcher") in (None, "", "*"))
 check("its harness timeout is the one the hook's deadline assumes",
-      post_hooks[0][1].get("timeout") == hook.HARNESS_HOOK_TIMEOUT_S > hook.GUARD_DEADLINE_S > 0)
+      post_hooks[0][1].get("timeout") == hook.HARNESS_HOOK_TIMEOUT_S > hook.SCAN_DEADLINE_S > 0)
 check("the write guard registered once on PreToolUse, covering every file tool",
       len(pre_hooks) == 1 and all(re.search(pre_hooks[0][0]["matcher"], t)
                                   for t in ("Write", "Edit", "MultiEdit", "NotebookEdit")))

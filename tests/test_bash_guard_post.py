@@ -46,6 +46,7 @@ import importlib.util
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import stat
@@ -87,7 +88,7 @@ _spec = importlib.util.spec_from_file_location("bash_output_guard_under_test", G
 guard = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(guard)
 sys.path.insert(0, HOOKS)
-import secret_redaction as sr  # noqa: E402  (the guard's detectors)
+import secret_redaction as sr  # noqa: E402  (the guard's detector)
 
 with open(GUARD, encoding="utf-8") as fh:
     GUARD_SRC = fh.read()
@@ -286,9 +287,17 @@ def stdout_of(updated):
     return updated.get("stdout") if isinstance(updated, dict) else updated
 
 
-def secret(tag: str = "A", n: int = 32) -> str:
-    """A synthetic anthropic-api-shaped value. Never a real credential."""
-    return "sk-" + "ant-" + "api03-" + (tag * n)
+ALNUM = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+
+
+def rand(n: int) -> str:
+    """n random token characters, the last a digit (gitleaks skips low-entropy values)."""
+    return "".join(secrets.choice(ALNUM) for _ in range(n - 1)) + secrets.choice("0123456789")
+
+
+def secret(tag: str = "A") -> str:
+    """A fresh synthetic Anthropic API key (``tag`` names the call site). Never a real credential."""
+    return "sk-" + "ant-" + "api03-" + rand(93) + "AA"
 
 
 def patched_guard(name: str, *replacements: tuple[str, str]) -> str:
@@ -356,7 +365,7 @@ check(
     is None,
 )
 
-# _withhold's `_SHAPE is None` branch. Reached whenever the guard fails
+# A withhold with no object-shaped response to copy. Reached whenever the guard fails
 # before it has read an object-shaped tool_response — a string result, a
 # list result, unparseable stdin — which is most of the fail-closed ladder.
 _s = secret("Q")
@@ -378,7 +387,7 @@ rc, parsed, raw, err = run_hook(GUARD, None, raw_stdin="[1, 2, 3]")
 updated = (parsed or {}).get("hookSpecificOutput", {}).get("updatedToolOutput")
 check_applied("withhold after non-object stdin", updated)
 
-# ... and a third: a result that is not Bash-shaped at all. _SHAPE is an
+# ... and a third: a result that is not Bash-shaped at all. The response is an
 # object here, but it holds no scalars, so the replacement is built from
 # nothing and `interrupted` has to come from somewhere.
 _deep_probe: object = f"KEY={secret('R')}"
@@ -620,7 +629,7 @@ with open(_p, encoding="utf-8") as fh:
 check("the persisted overflow file is redacted in place", _s not in _after, _after[:120])
 check(
     "the persisted overflow file keeps a redaction marker",
-    "[REDACTED:anthropic-api:" in _after,
+    "[REDACTED:anthropic-api-key:" in _after,
     _after[:160],
 )
 check(
@@ -670,7 +679,7 @@ os.chmod(_p_bad, 0o600)
 # Oversized: scanning 17 MiB costs ~7 s, past the guard's own 6 s deadline.
 # Bigger than the scan limit means the pointer goes, not that the guard
 # blows its deadline and gets its output discarded by the harness.
-_scan_limit = sr.MAX_SCAN_BYTES
+_scan_limit = sr.MAX_SCAN_CHARS
 _p_big = persisted("oversized.txt", "x" * (_scan_limit + 1))
 parsed, updated, raw = bash_out(
     "cat /tmp/huge",
@@ -688,7 +697,7 @@ check(
 # harness-level timeout DISCARDS the hook's output and rewrites nothing,
 # which is fail-open. A file right at the limit must still land in time.
 _filler = ("path/to/file-%04d some prose and a hash 0a1b2c3d4e5f\n" % 0) * 512
-_big_body = (_filler * ((_scan_limit // len(_filler)) + 1))[: _scan_limit - 64]
+_big_body = (_filler * ((_scan_limit // len(_filler)) + 1))[: _scan_limit - 256]
 _p_limit = persisted("at-the-limit.txt", _big_body + f"\nKEY={secret('P')}\n")
 _t0 = time.monotonic()
 parsed, updated, raw = bash_out(
@@ -700,7 +709,7 @@ parsed, updated, raw = bash_out(
 _elapsed = time.monotonic() - _t0
 check(
     "a persisted file at the scan limit is still scrubbed",
-    "[REDACTED:anthropic-api:" in open(_p_limit, encoding="utf-8").read(),
+    "[REDACTED:anthropic-api-key:" in open(_p_limit, encoding="utf-8").read(),
     "the limit is set above what the guard can actually scan",
 )
 check(
@@ -925,7 +934,7 @@ check(
 )
 check(
     "... and keeps a redaction marker",
-    "[REDACTED:anthropic-api:" in _raw_after,
+    "[REDACTED:anthropic-api-key:" in _raw_after,
     _raw_after[:160],
 )
 check(
@@ -979,7 +988,7 @@ check(
     str(updated)[:280],
 )
 
-# structuredContent. Not a redaction hole — `_redact_tree` walks it like
+# structuredContent. Not a redaction hole — the redactor walks it like
 # everything else — but a TAGGING hole: the Bash mapper's first line is
 # `if (O && O.length > 0) return {..., content: O}`, so it REPLACES the
 # whole result and any wrapper on stdout is never rendered. Teaching the
@@ -1061,48 +1070,21 @@ check(
 # ----------------------------------------------------------------------
 section("bash-output-guard: every redaction pattern fires end-to-end (F14)")
 
+# The formats this host holds keys for, each planted in a real command's stdout.
 E2E_SECRETS = {
-    "anthropic-api": "sk-" + "ant-" + "api03-" + ("A" * 95),
-    "openai-project": "sk-" + "proj-" + ("B" * 48),
-    "openai-legacy": "sk-" + ("C" * 48),
-    "github-token": "ghp" + "_" + ("D" * 36),
-    "github-pat": "github" + "_pat_" + ("E" * 82),
-    "slack-token": "xoxb" + "-" + "1234567890-0987654321-abcdefghij",
-    "aws-access": "AKIA" + "IOSFODNN7EXAMPLE",
-    "jwt": (
-        "eyJ" + "hbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
-        + "." + "eyJ" + "zdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkEifQ"
-        + "." + "dBjftJeZ4CVP" + "mB92K27uhbUJU1p1r-wW1gFWFOEjXk"
-    ),
-    "tavily-key": "tvly" + "-" + ("F" * 28),
-    "cloudflare-token": "cfut" + "_" + ("G" * 40) + ("a1" * 4),
-    "google-oauth-secret": "GOCSPX" + "-" + ("H" * 28),
+    "anthropic-api": "sk-" + "ant-" + "api03-" + rand(93) + "AA",
+    "anthropic-oauth": "sk-" + "ant-" + "oat01-" + rand(80),
+    "openai-project": "sk-" + "proj-" + rand(48),
+    "openai-legacy": "sk-" + rand(48),
+    "github-token": "ghp" + "_" + rand(36),
+    "github-pat": "github" + "_pat_" + rand(22) + "_" + rand(59),
+    "slack-token": "xoxb" + "-" + "1234567890-0987654321-" + rand(24),
+    "aws-access": "AKIA" + "".join(secrets.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567") for _ in range(16)),
+    "jwt": "eyJ" + rand(30) + "." + "eyJ" + rand(40) + "." + rand(43),
+    "tavily-key": "tvly" + "-dev-" + rand(32),
+    "cloudflare-token": "cfut" + "_" + rand(40) + "".join(secrets.choice("0123456789abcdef") for _ in range(8)),
+    "google-oauth-secret": "GOCSPX" + "-" + rand(28),
 }
-
-check(
-    "every configured redaction pattern has an end-to-end fixture",
-    {label for label, _ in sr.SECRET_PATTERNS} == set(E2E_SECRETS),
-    "untested: "
-    + str(sorted({label for label, _ in sr.SECRET_PATTERNS} - set(E2E_SECRETS))),
-)
-
-# Private keys are NOT in SECRET_PATTERNS — they are a marker scan, because a
-# BEGIN..END regex was quadratic (F12). The equality check above therefore
-# cannot see them, so the second mechanism gets its own coverage rather than
-# quietly falling outside the drift guard that exists to stop exactly that.
-check(
-    "the private-key scanner is wired into the redactor",
-    "redact_private_keys" in sr.floor_redact.__code__.co_names
-    and "floor_redact" in guard._redact_secrets.__code__.co_names,
-    "keys are a separate mechanism; if it is not called, nothing redacts them",
-)
-for _marker_re, _which in ((sr._KEY_BEGIN_RE, "BEGIN"), (sr._KEY_END_RE, "END")):
-    check(
-        f"the {_which} marker regex spans no body",
-        r"[\s\S]" not in _marker_re.pattern,
-        f"a body-spanning quantifier here is what made the old version "
-        f"quadratic: {_marker_re.pattern}",
-    )
 
 E2E_DIR = os.path.join(SCRATCH, "e2e-secrets")
 os.makedirs(E2E_DIR, exist_ok=True)
@@ -1111,9 +1093,9 @@ os.makedirs(E2E_DIR, exist_ok=True)
 def real_command_output(label: str, value: str) -> tuple[str, str]:
     """Actually run a command whose output carries the secret.
 
-    Hand-built strings would prove the regex compiles. Running `cat` over a
-    file on disk and taking its real stdout proves the value survives the
-    round trip a real command makes — encoding, trailing newline and all.
+    Running `cat` over a file on disk and taking its real stdout proves the
+    value survives the round trip a real command makes — encoding, trailing
+    newline and all.
     """
     path = os.path.join(E2E_DIR, f"{label}.env")
     with open(path, "w", encoding="utf-8") as fh:
@@ -1138,27 +1120,21 @@ for _label, _value in sorted(E2E_SECRETS.items()):
                                     response_obj(_out, stderr=_err))
     _body = stdout_of(updated)
     check(
-        f"end-to-end: a real {_label} secret does not survive the guard",
-        updated is not None and _value not in raw,
+        f"end-to-end: a real {_label} secret does not survive the guard, and is marked",
+        updated is not None and _value not in raw and "[REDACTED:" in str(_body),
         "PATTERN DID NOT FIRE IN THE REAL PIPELINE" if updated is None
         else str(_body)[:160],
-    )
-    check(
-        f"end-to-end: the {_label} redaction is marked, not silently dropped",
-        isinstance(_body, str) and f"[REDACTED:{_label}:" in _body,
-        str(_body)[:200],
     )
     if updated is None or _value in raw:
         _missed.append(_label)
 
 check(
-    "no configured pattern fails to fire in the real pipeline",
+    "no format fails to fire in the real pipeline",
     not _missed,
-    f"patterns present in the set but inert end-to-end: {_missed}",
+    f"formats inert end-to-end: {_missed}",
 )
 
-# The same nine, through the overflow file rather than in band: the pointer
-# path has only ever been exercised with one pattern.
+# The same formats through the overflow file rather than in band.
 for _label, _value in sorted(E2E_SECRETS.items()):
     _p = persisted(f"e2e-{_label}.txt", f"line one\nKEY={_value}\nline three\n")
     parsed, updated, raw = bash_out(
@@ -1173,8 +1149,7 @@ for _label, _value in sorted(E2E_SECRETS.items()):
         open(_p, encoding="utf-8").read()[:160],
     )
 
-# Private keys end-to-end, by the same method as the loop above: a real file,
-# a real `cat`, its real stdout. Every armor spelling the scanner claims.
+# Private keys end-to-end, by the same method: a real file, a real `cat`.
 for _kind in ("OPENSSH", "RSA", "PGP", ""):
     _blk = "-----BEGIN " + (f"{_kind} " if _kind else "") + "PRIVATE KEY" + (
         " BLOCK" if _kind == "PGP" else ""
@@ -1211,7 +1186,7 @@ check(
     _s not in raw
     and isinstance(stdout_of(updated), str)
     and "<untrusted_external_content" in stdout_of(updated)
-    and "[REDACTED:anthropic-api:" in stdout_of(updated),
+    and "[REDACTED:anthropic-api-key:" in stdout_of(updated),
     str(stdout_of(updated))[:240],
 )
 
@@ -1219,10 +1194,8 @@ check(
 # ----------------------------------------------------------------------
 # F11. Redaction versus truncation.
 #
-# safe-bash truncated, then redacted (server.py:1049-1051), so every byte
-# it returned passed the redactor and a secret cut in half by truncation
-# could not match. The native Bash tool truncates before PostToolUse fires,
-# so the port has the same ordering — asserted here rather than assumed.
+# The native Bash tool truncates before PostToolUse fires, so every byte the
+# model gets passed the redactor — asserted here rather than assumed.
 # ----------------------------------------------------------------------
 section("bash-output-guard: redaction after truncation (F11)")
 
@@ -1236,30 +1209,14 @@ check(
     str(stdout_of(updated))[-80:],
 )
 
-_fragment = _s[:14]  # what a truncation boundary through the middle leaves
-check(
-    "a secret cut short by truncation is below every pattern's minimum length",
-    guard._redact_secrets(_fragment) == _fragment,
-    "a fragment that still matches would mean the full value also matched",
-)
-
 
 # ----------------------------------------------------------------------
-# F12. Private keys — the one secret class the ported patterns omitted.
+# F12. Private keys, whole or cut by truncation.
 #
-# safe-bash carried the same nine prefix patterns and no PEM rule, so this
-# is a parity-preserving GAP rather than a regression. It is closed here
-# because a private key is the highest-consequence value on the list and
-# the operator named secret redaction as a feature that must survive the
-# switchover. Donors, both already trusted in this repo: hooks/prompt-log.py
-# and permission-ledger/hook.py.
-#
-# The UNTERMINATED form is load-bearing, not thoroughness. Redaction runs
-# AFTER the harness truncates (F11 above), so a key whose END marker was cut
-# off would otherwise leave every base64 body line in the transcript — the
-# terminated pattern cannot match, and the prefix patterns never could.
-# Every key below is synthetic: invented base64-looking filler, never read
-# from disk and never a real key.
+# Redaction runs AFTER the harness truncates (F11), so a key whose END marker
+# was cut off, or whose BEGIN is out of view (the tail of a key file,
+# `grep -A`), must still lose its body: secret-rules.toml's private-key-head
+# and private-key-tail rules. Every key below is synthetic filler.
 # ----------------------------------------------------------------------
 section("bash-output-guard: private keys are redacted (F12)")
 
@@ -1268,12 +1225,7 @@ _TRACER = "TRACERLINEfakekeymaterial0123456789"
 
 
 def _armor(kind: str, marker: str = "BEGIN") -> str:
-    """The armor line for a key type. PGP's ends in `KEY BLOCK-----`.
-
-    That difference is not cosmetic: the regex this section replaced required
-    `PRIVATE KEY-----` and so passed `gpg --export-secret-keys` output through
-    WHOLE. `kind=""` is PKCS#8, whose header is bare `BEGIN PRIVATE KEY`.
-    """
+    """The armor line for a key type. PGP's ends in `KEY BLOCK-----`; `kind=""` is PKCS#8."""
     words = f"{kind} " if kind else ""
     block = " BLOCK" if kind == "PGP" else ""
     return f"-----{marker} {words}PRIVATE KEY{block}-----"
@@ -1286,217 +1238,63 @@ def _fake_key(kind: str = "OPENSSH", terminated: bool = True) -> str:
     return block
 
 
+def guarded(text: str) -> tuple[str, str]:
+    """(stdout the model gets, the hook's whole raw stdout) for a Bash result."""
+    parsed, updated, raw = bash_out("cat /tmp/synthetic-key", response_obj(text))
+    body = stdout_of(updated)
+    return (body if isinstance(body, str) else text), raw
+
+
 for _kind in ("OPENSSH", "RSA", "EC", "DSA", "ENCRYPTED", "", "PGP"):
-    _key = _fake_key(_kind)
-    parsed, updated, raw = bash_out("cat /tmp/synthetic-key", response_obj(_key))
-    _body = stdout_of(updated)
-    check(
-        f"a terminated {_kind} private key is redacted",
-        isinstance(_body, str) and "[REDACTED:private-key:" in _body,
-        str(_body)[:200],
-    )
-    check(
-        f"the {_kind} key body does not survive anywhere in the guard's output",
-        _TRACER not in raw and _PEM_BODY not in raw,
-        raw[:240],
-    )
+    _body, raw = guarded(_fake_key(_kind))
+    check(f"a terminated {_kind} private key is redacted", "[REDACTED:private-key" in _body, _body[:200])
+    check(f"the {_kind} key body does not survive anywhere in the guard's output",
+          _TRACER not in raw and _PEM_BODY not in raw, raw[:240])
 
-# Truncation ate the END marker. The body after BEGIN must still go.
-_cut = _fake_key("OPENSSH", terminated=False) + "\n[output truncated]"
-parsed, updated, raw = bash_out("cat /tmp/synthetic-key", response_obj(_cut))
-_body = stdout_of(updated)
-check(
-    "an UNTERMINATED private key block is redacted from BEGIN onward",
-    isinstance(_body, str) and "[REDACTED:private-key:" in _body,
-    str(_body)[:200],
-)
-check(
-    "the unterminated key's body does not survive truncation",
-    _TRACER not in raw and _PEM_BODY not in raw,
-    raw[:240],
-)
+_body, raw = guarded(_fake_key("OPENSSH", terminated=False) + "\n[output truncated]")
+check("an UNTERMINATED private key loses its body", _TRACER not in raw and _PEM_BODY not in raw, raw[:240])
+check("and keeps the truncation marker after it", _body.endswith("[output truncated]"), _body[-80:])
 
-# A terminated block must not be swallowed by the unterminated catcher: text
-# after END is ordinary output and has to stay.
 _after = "ordinary trailing output line\n"
-parsed, updated, raw = bash_out(
-    "cat /tmp/synthetic-key", response_obj(_fake_key("RSA") + _after)
-)
-_body = stdout_of(updated)
-check(
-    "output after a terminated key's END marker is preserved",
-    isinstance(_body, str) and _after.strip() in _body,
-    str(_body)[:240],
-)
+_body, raw = guarded(_fake_key("RSA") + _after)
+check("output after a terminated key's END marker is preserved", _after.strip() in _body, _body[:240])
 
-# ---- orphaned END markers: head-side truncation (r4-A) --------------------
-#
-# The scanner used to anchor on BEGIN alone, so output carrying key-body
-# bytes followed by an END marker with NO BEGIN in view — the tail of a key
-# file, `grep -A`, head-side truncation — passed byte-identical. The
-# contract is now symmetric: an orphan BEGIN redacts to end-of-string, an
-# orphan END redacts from the segment start through the marker. Both
-# over-redact on purpose; a false negative here is a leaked key.
-_end_only = f"{_PEM_BODY}\n{_TRACER}\n{_armor('RSA', 'END')}\nafter the marker\n"
-for _fn_name, _fn in (("redact_private_keys", sr.redact_private_keys), ("_redact_secrets", guard._redact_secrets)):
-    _got = _fn(_end_only)
-    check(
-        f"an END-only RSA key tail is redacted by {_fn_name}",
-        _TRACER not in _got
-        and _PEM_BODY not in _got
-        and _armor("RSA", "END") not in _got
-        and "[REDACTED:private-key:" in _got,
-        _got[:200],
-    )
-    check(
-        f"text after the orphan END survives {_fn_name}",
-        _got.endswith("\nafter the marker\n"),
-        _got[-60:],
-    )
+for _kind in ("RSA", "PGP"):
+    _body, raw = guarded(f"{_PEM_BODY}\n{_TRACER}\n{_armor(_kind, 'END')}\nafter the marker\n")
+    check(f"an END-only {_kind} key tail loses its body and END line",
+          _TRACER not in raw and _PEM_BODY not in raw and _armor(_kind, "END") not in raw
+          and "[REDACTED:private-key" in _body, _body[:200])
+    check(f"text after the orphan {_kind} END survives", _body.endswith("\nafter the marker\n"), _body[-60:])
 
-# The PGP spelling ends in `KEY BLOCK-----`; an orphan-END rule that only
-# knew `KEY-----` would pass a gpg export's tail through whole.
-_pgp_end_only = f"{_PEM_BODY}\n{_TRACER}\n{_armor('PGP', 'END')}\n"
-for _fn_name, _fn in (("redact_private_keys", sr.redact_private_keys), ("_redact_secrets", guard._redact_secrets)):
-    _got = _fn(_pgp_end_only)
-    check(
-        f"an END-only PGP KEY BLOCK tail is redacted by {_fn_name}",
-        _TRACER not in _got
-        and _PEM_BODY not in _got
-        and _armor("PGP", "END") not in _got
-        and "[REDACTED:private-key:" in _got,
-        _got[:200],
-    )
+_body, raw = guarded(_fake_key("RSA") + "prose between blocks\n" + _armor("EC", "END") + "\nuntouched tail\n")
+check("a full block, prose, then a lone END: no key material survives, the prose does",
+      _TRACER not in raw and _PEM_BODY not in raw and "prose between blocks" in _body
+      and _body.endswith("\nuntouched tail\n"), _body[:240])
 
-# A full block, prose, then a lone END. The contract: the full block is one
-# redaction, and the orphan END swallows everything from the segment start —
-# the prose included — as a second. Bytes past the lone END's end() are not
-# touched.
-_mixed = (
-    _fake_key("RSA")
-    + "prose between blocks\n"
-    + _armor("EC", "END")
-    + "\nuntouched tail\n"
-)
-_got = sr.redact_private_keys(_mixed)
-check(
-    "a full block followed by a lone END yields two redactions, no survivors",
-    _got.count("[REDACTED:private-key:") == 2
-    and _TRACER not in _got
-    and _PEM_BODY not in _got
-    and _armor("EC", "END") not in _got,
-    _got[:240],
-)
-check(
-    "the prose before the orphan END is swallowed into its redaction (the stated contract: over-redact toward the marker)",
-    "prose between blocks" not in _got,
-    _got[:240],
-)
-check(
-    "nothing after the lone END's end() is touched",
-    _got.endswith("\nuntouched tail\n"),
-    _got[-60:],
-)
-
-# Control: prose with no markers at all passes unchanged through both entry
-# points — the orphan-END rule must not turn the scanner into a shredder.
 _plain = "no armor markers here; keys are discussed but never printed.\n"
-check(
-    "control: prose with no markers passes unchanged",
-    sr.redact_private_keys(_plain) == _plain
-    and guard._redact_secrets(_plain) == _plain,
-    sr.redact_private_keys(_plain)[:120],
-)
-
-# No false positives: prose about keys is not a key.
 _prose = "Rotate the private key in the vault; -----BEGIN is not a header here.\n"
-check(
-    "prose mentioning a private key is not redacted",
-    guard._redact_secrets(_prose) == _prose,
-    guard._redact_secrets(_prose)[:200],
-)
+for _label, _text in (("prose with no markers", _plain), ("prose mentioning a private key", _prose)):
+    parsed, updated, raw = bash_out("cat /tmp/notes", response_obj(_text))
+    check(f"control: {_label} is not rewritten", raw.strip() == "", raw[:200])
 
-# The siblings still work — a pattern list is easy to break while adding to.
-_s = secret("P")
-parsed, updated, raw = bash_out("cat /tmp/creds", response_obj(f"KEY={_s}\n"))
-check(
-    "adding the private-key patterns did not break prefix redaction",
-    _s not in raw
-    and isinstance(stdout_of(updated), str)
-    and "[REDACTED:anthropic-api:" in stdout_of(updated),
-    str(stdout_of(updated))[:200],
-)
+_body, raw = guarded("before\n" + _fake_key("RSA") + "middle\n" + _fake_key("PGP") + "after\n")
+check("every block in a multi-key body is redacted and the prose between survives",
+      _TRACER not in raw and all(w in _body for w in ("before", "middle", "after")), _body[:240])
 
-# Several blocks in one body, each replaced independently, prose between kept.
-_multi = (
-    "before\n" + _fake_key("RSA") + "middle\n" + _fake_key("PGP") + "after\n"
-)
-_red = guard._redact_secrets(_multi)
-check(
-    "every block in a multi-key body is redacted and the prose between survives",
-    _red.count("[REDACTED:private-key:") == 2
-    and _TRACER not in _red
-    and "before" in _red and "middle" in _red and "after" in _red,
-    _red[:240],
-)
-
-# ---- the quadratic blowup this section's first implementation shipped -----
-#
-# The original was `BEGIN...-----[\s\S]+?-----END...` plus a greedy catcher.
-# Every BEGIN with no END behind it made the engine scan to end-of-string
-# before failing, so cost grew with (BEGIN count x length): MEASURED 2.6s at
-# 154KB, 11.9s at 308KB, 44.2s at 616KB. That is past HARNESS_HOOK_TIMEOUT_S,
-# and an overrun hook is CANCELLED with its output DISCARDED — the result then
-# reaches the model unrewritten. SIGALRM cannot catch it either: CPython defers
-# a Python-level handler until the interpreter regains control, which `re` does
-# not do mid-match. So the bound has to come from the algorithm.
-#
-# Asserted as WALL TIME on the adversarial shape, because that is the property
-# that failed. A timing assertion is a blunt instrument, so the budget is set
-# ~50x above the measured linear cost rather than near it.
-# The marker is split like _blk's above, and for the same reason: the fixture
-# is synthetic, and the repo's gitleaks scan must stay meaningful for this file.
-_ADVERSARIAL = (
-    "-----BEGIN " + "OPENSSH PRIVATE KEY" + "-----\n" + "A" * 40 + "\n"
-) * 8000
-_t0 = time.perf_counter()
-_out_adv = guard._redact_secrets(_ADVERSARIAL)
-_elapsed = time.perf_counter() - _t0
-check(
-    "an adversarial BEGIN-without-END body redacts in linear time",
-    _elapsed < 2.0,
-    f"{len(_ADVERSARIAL)} bytes took {_elapsed:.3f}s "
-    f"(the regex implementation took 44.2s on this shape)",
-)
-check(
-    "and that body is actually redacted, not merely fast",
-    ("-----BEGIN " + "OPENSSH PRIVATE KEY" + "-----") not in _out_adv,
-    _out_adv[:160],
-)
-
-# The orphan-END rule (r4-A) adds a second worst-case shape: ENDs with no
-# BEGIN anywhere. A naive implementation re-runs the BEGIN search from every
-# marker — (END count x length), the same quadratic through the other door.
-# The scanner caches the next BEGIN instead, so this must fit the SAME
-# budget as the BEGINs-only shape above.
-_ADVERSARIAL_ENDS = (
-    "A" * 40 + "\n" + "-----END " + "OPENSSH PRIVATE KEY" + "-----\n"
-) * 8000
-_t0 = time.perf_counter()
-_out_adv_ends = guard._redact_secrets(_ADVERSARIAL_ENDS)
-_elapsed_ends = time.perf_counter() - _t0
-check(
-    "an adversarial END-without-BEGIN body redacts in linear time",
-    _elapsed_ends < 2.0,
-    f"{len(_ADVERSARIAL_ENDS)} bytes took {_elapsed_ends:.3f}s "
-    "(re-searching BEGIN from every END would be quadratic here)",
-)
-check(
-    "and the ENDs-only body is actually redacted, not merely fast",
-    ("-----END " + "OPENSSH PRIVATE KEY" + "-----") not in _out_adv_ends
-    and ("A" * 40) not in _out_adv_ends,
-    _out_adv_ends[:160],
-)
+# A BEGIN..END regex in a backtracking engine is quadratic on BEGINs without
+# an END (616 KB took 44 s, past the harness timeout, which shows the
+# original). gitleaks' RE2 is linear; both adversarial shapes must land well
+# inside the guard's deadline and be redacted.
+for _label, _adv in (
+    ("BEGIN-without-END", ("-----BEGIN " + "OPENSSH PRIVATE KEY" + "-----\n" + "A" * 40 + "\n") * 8000),
+    ("END-without-BEGIN", ("A" * 40 + "\n" + "-----END " + "OPENSSH PRIVATE KEY" + "-----\n") * 8000),
+):
+    _t0 = time.monotonic()
+    _body, raw = guarded(_adv)
+    _elapsed = time.monotonic() - _t0
+    check(f"an adversarial {_label} body ({len(_adv) // 1000} KB) is redacted inside the deadline",
+          _elapsed < guard.GUARD_DEADLINE_S and "OPENSSH PRIVATE KEY" not in _body and "A" * 40 not in _body,
+          f"{_elapsed:.1f}s {_body[:120]}")
 
 
 # ----------------------------------------------------------------------
@@ -2046,8 +1844,8 @@ check_withheld("hook stdin cannot be read", parsed, updated)
 _redactor_fault = patched_guard(
     "guard-redactor-fault.py",
     (
-        "        return sr.redact_value(value, _DEADLINE)",
-        '        raise RuntimeError("injected redactor fault")',
+        "            return sr.redact_value(value, gitleaks=gitleaks, timeout=deadline - time.monotonic())",
+        '            raise RuntimeError("injected redactor fault")',
     ),
 )
 _s = secret("N")
@@ -2219,7 +2017,7 @@ section("bash-output-guard: a rewrite that cannot be written is announced")
 check("fixture precondition: /dev/full exists", os.path.exists("/dev/full"),
       "without it this section cannot make stdout fail")
 
-_SECRET = "sk-ant-" + "api03-" + "B" * 40
+_SECRET = secret("B")
 _PAYLOAD = post_payload(
     "curl https://example.invalid/x",
     {"stdout": _SECRET, "stderr": "", "interrupted": False, "isImage": False},
