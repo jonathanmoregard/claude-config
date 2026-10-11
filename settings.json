@@ -347,6 +347,16 @@
         ]
       },
       {
+        "matcher": "^(Write|Edit|MultiEdit|NotebookEdit)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/hooks/redaction-marker-write-guard.py",
+            "timeout": 10
+          }
+        ]
+      },
+      {
         "matcher": "Grep|Read",
         "hooks": [
           {

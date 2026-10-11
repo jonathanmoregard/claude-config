@@ -317,6 +317,40 @@ check(f"{len(_big_text) // 1024} KB scanned inside the deadline", elapsed < hook
 
 
 # ----------------------------------------------------------------------
+# Custom prefix rules fire on tokens, not inside base64 blobs. `\b` holds
+# after `/` and `+`, so a bare-`\b` prefix rule fired mid-blob: 8 `fw_` hits
+# in Codex encrypted reasoning in the full-transcript scan.
+section("custom prefix rules: token boundary, not mid-base64")
+
+
+def _b64(n: int) -> str:
+    return base64.b64encode(os.urandom(n)).decode()
+
+
+def _rule_hits(text: str) -> list[str]:
+    return [f.get("RuleID") for f in sr.gitleaks_findings(text, time.monotonic() + 20)]
+
+
+_fw = "fw_" + _rand(24)
+_tv = "tv" + "ly-dev-" + _rand(32)
+_oat = "sk-" + "ant-oat01-" + _rand(95) + "AA"
+TOKENS.extend([_fw, _tv, _oat])
+for _rule, _value in (("fireworks-api-key", _fw), ("tavily-api-key", _tv),
+                      ("anthropic-oauth-token", _oat)):
+    check(f"{_rule}: fires on an env assignment", _rule in _rule_hits(f"KEY={_value}\n"))
+    check(f"{_rule}: fires on a quoted value", _rule in _rule_hits(f'key: "{_value}"'))
+    check(f"{_rule}: fires at start of input", _rule in _rule_hits(_value))
+    for _sep in ("/", "+", ""):
+        _blob = _b64(60)[:40] + _sep + _value + _b64(30)
+        check(f"{_rule}: does NOT fire mid-base64 (after {_sep or 'an alnum char'!r})",
+              _rule not in _rule_hits(_blob))
+_long_fw = "fw_" + _rand(80)
+TOKENS.append(_long_fw)
+check("fireworks-api-key: an over-long fw_ run (a blob, not a key) does not fire",
+      "fireworks-api-key" not in _rule_hits(f"x {_long_fw} y"))
+
+
+# ----------------------------------------------------------------------
 section("skipped tools: Bash (own guard) and the edit tools")
 _t5 = tok("gitlab")
 for tool, resp in [("Bash", {"stdout": f"x {_t5}", "stderr": "", "interrupted": False}),
@@ -456,7 +490,113 @@ check("bash-output-guard with gitleaks missing withholds", "the output guard is 
 
 
 # ----------------------------------------------------------------------
-section("settings.json wiring")
+# redaction-marker-write-guard.py: the regression redaction itself creates.
+# The model sees a marker where the file holds a secret; writing back what it
+# saw must not replace the secret with the marker.
+# ----------------------------------------------------------------------
+section("write guard: a redacted Read written back does not destroy the secret")
+WRITE_GUARD = os.path.join(HOOKS, "redaction-marker-write-guard.py")
+
+
+def guard(tool: str, tool_input: dict, raw_stdin: str | None = None):
+    rc, _, raw, err, elapsed = run_hook(
+        {"tool_name": tool, "tool_input": tool_input, "hook_event_name": "PreToolUse"},
+        script=WRITE_GUARD, raw_stdin=raw_stdin)
+    decision = None
+    if raw.strip():
+        try:
+            decision = json.loads(raw)["hookSpecificOutput"]["permissionDecision"]
+        except (ValueError, KeyError, TypeError):
+            decision = "<<unparseable>>"
+    return rc, decision, raw, elapsed
+
+
+_envdir = os.path.join(SCRATCH, "wg")
+os.makedirs(_envdir, exist_ok=True)
+_env = os.path.join(_envdir, "app.env")
+_tw = tok("gitlab")
+_env_text = f"APP_ENV=staging\nGITLAB_TOKEN={_tw}\nLOG_LEVEL=info\n"
+with open(_env, "w", encoding="utf-8") as fh:
+    fh.write(_env_text)
+
+# The real roundtrip: Read through the output hook, then Write what the model saw.
+_, _read_upd, _, _, _ = run_hook(payload("Read", {"type": "text", "file": {
+    "filePath": _env, "content": _env_text, "numLines": 3, "startLine": 1, "totalLines": 3}}))
+_seen = _read_upd["file"]["content"] if isinstance(_read_upd, dict) else ""
+check("fixture: the model's view of the file is redacted", "[REDACTED:" in _seen and _tw not in _seen)
+_rewrite = _seen.replace("LOG_LEVEL=info", "LOG_LEVEL=debug")
+rc, dec, raw, _ = guard("Write", {"file_path": _env, "content": _rewrite})
+check("Read -> Write of the redacted view is DENIED", dec == "deny", raw[:300])
+check("the denial explains and gives a recovery path", "line" in raw and "old_string" in raw)
+with open(_env, encoding="utf-8") as fh:
+    check("the secret is still on disk", _tw in fh.read())
+
+rc, dec, raw, _ = guard("Edit", {"file_path": _env, "old_string": "LOG_LEVEL=info",
+                                 "new_string": "LOG_LEVEL=debug"})
+check("an Edit that leaves the secret line alone is allowed (no output)", dec is None and rc == 0, raw)
+_marker = _seen.splitlines()[1].split("=", 1)[1]
+rc, dec, raw, _ = guard("Edit", {"file_path": _env, "old_string": "LOG_LEVEL=info",
+                                 "new_string": f"LOG_LEVEL=info\nBACKUP_TOKEN={_marker}"})
+check("an Edit that ADDS a marker line is denied", dec == "deny", raw[:200])
+rc, dec, raw, _ = guard("Edit", {"file_path": _env, "old_string": f"GITLAB_TOKEN={_marker}",
+                                 "new_string": f"GITLAB_TOKEN={_marker}\nX=1"})
+check("an Edit whose old_string is the redacted view (cannot match on disk) is left to fail on its own",
+      dec is None, raw[:200])
+rc, dec, raw, _ = guard("MultiEdit", {"file_path": _env, "edits": [
+    {"old_string": "APP_ENV=staging", "new_string": "APP_ENV=prod"},
+    {"old_string": "LOG_LEVEL=info", "new_string": f"LOG_LEVEL=info\nK={_marker}"}]})
+check("a MultiEdit that adds a marker in any step is denied", dec == "deny", raw[:200])
+
+_notes = os.path.join(_envdir, "notes.md")
+_m2 = "[REDACTED:" + "github-token:40chars]"
+with open(_notes, "w", encoding="utf-8") as fh:
+    fh.write(f"Redaction looks like {_m2} in output.\n")
+rc, dec, raw, _ = guard("Edit", {"file_path": _notes, "old_string": f"like {_m2} in",
+                                 "new_string": f"like {_m2} in tool"})
+check("editing around a marker the file already holds is allowed", dec is None, raw[:200])
+rc, dec, raw, _ = guard("Write", {"file_path": os.path.join(_envdir, "new.md"),
+                                  "content": f"x {_m2}"})
+check("a Write that creates a NEW file containing a marker is denied", dec == "deny", raw[:200])
+rc, dec, raw, _ = guard("Write", {"file_path": os.path.join(_envdir, "new.md"),
+                                  "content": "placeholder form [REDACTED:<rule>:<n>chars] is fine"})
+check("the placeholder spelling of a marker is not a marker", dec is None, raw[:200])
+rc, dec, raw, _ = guard("NotebookEdit", {"notebook_path": os.path.join(_envdir, "n.ipynb"),
+                                         "cell_id": "c1", "new_source": f"k = '{_m2}'"})
+check("a NotebookEdit adding a marker is denied", dec == "deny", raw[:200])
+
+_unreadable = os.path.join(_envdir, "locked.env")
+with open(_unreadable, "w", encoding="utf-8") as fh:
+    fh.write("x\n")
+os.chmod(_unreadable, 0)
+rc, dec, raw, _ = guard("Write", {"file_path": _unreadable, "content": f"T={_m2}"})
+check("an unreadable target with a marker in the input is denied (fail-safe)",
+      dec == "deny" or os.access(_unreadable, os.R_OK), raw[:200])
+os.chmod(_unreadable, 0o600)
+rc, dec, raw, _ = guard("Write", {}, raw_stdin='{"tool_name": "Write", [REDACTED:x:3chars] broken')
+check("unparseable input carrying a marker is denied", dec == "deny", raw[:200])
+
+_times = []
+for _ in range(10):
+    rc, dec, raw, el = guard("Write", {"file_path": _env, "content": "no markers here\n" * 2000})
+    _times.append(el)
+check("no marker in the input: no output, and the target is never read", dec is None and rc == 0)
+print(f"  (no-marker path, whole process: median {sorted(_times)[5] * 1000:.0f} ms)")
+
+
+# ----------------------------------------------------------------------
+section("settings.json wiring: write guard")
+with open(os.path.join(REPO_ROOT, "settings.json"), encoding="utf-8") as fh:
+    _settings_pre = json.load(fh)
+_pre = [
+    (e, h) for e in _settings_pre.get("hooks", {}).get("PreToolUse", [])
+    for h in e.get("hooks", []) if "redaction-marker-write-guard.py" in (h.get("command") or "")
+]
+check("the write guard is registered on PreToolUse exactly once", len(_pre) == 1)
+if _pre:
+    import re as _re
+    for _t in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+        check(f"its matcher covers {_t}", _re.search(_pre[0][0].get("matcher") or "", _t) is not None)
+    check("its harness timeout is set", isinstance(_pre[0][1].get("timeout"), int))
 with open(os.path.join(REPO_ROOT, "settings.json"), encoding="utf-8") as fh:
     SETTINGS = json.load(fh)
 _entries = [
