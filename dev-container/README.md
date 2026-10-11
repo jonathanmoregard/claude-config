@@ -79,6 +79,7 @@ directly.
 | `~/.config/github-app/config` | `APP_ID` + `INSTALLATION_ID` | Identifying; CC-denied (same rule) |
 | `~/.config/claude-sandbox/trust/<sha256>` | Per-repo `host` vs `sandbox` mode (written by `shell/dispatch.zsh`) | Behavioral fingerprint; CC-denied via `Read(~/.config/claude-sandbox/**)` |
 | `~/.cache/gh-tokens/<project>/{repo_id,token}` | Per-sandbox installation token (≤60min TTL) | Runtime cache; mounted into containers read-only |
+| `~/.cache/gh-tokens/host/{scope,token}` | Whole-installation host token (≤60min TTL, 0600, dir 0700) read by the host `gh` wrapper and git credential helper | Runtime cache; `scope` is declared by nixos-config tmpfiles |
 | `~/src/claude-code-devcontainer/` | ToB upstream `devc` template + helper | Upstream clone — see Phase 5 / pending discussion |
 
 ## Dispatch flow
@@ -91,9 +92,69 @@ directly.
 ## systemd timers (current cadence)
 
 ```
-gh-token.timer        every 50 min      walks ~/.cache/gh-tokens/*/repo_id, mints + atomic-replaces token
+gh-token.timer        every 20 min      walks ~/.cache/gh-tokens/*/repo_id, mints + atomic-replaces token;
+                                        mints the host token when host/scope reads `installation`
 claude-sandbox-proxy  resident          listens 127.0.0.1:8888 + 172.17.0.1:8888; allowlists hostname per CONNECT/Host
 ```
+
+## Host token: agents reach GitHub as the App, never as the founder
+
+Every agent on the laptop (interactive Claude, headless timers, the Codex
+git-broker) used to act through `gh`'s keyring credential: the founder's PAT,
+admin on most repos. Host mode replaces that with a short-lived GitHub App
+installation token. Context and threat model: klaffat#165, 3a addendum.
+
+- **Mint.** `mint-gh-token` mints a whole-installation token (no
+  `repository_ids`) into `~/.cache/gh-tokens/host/token` whenever
+  `host/scope` reads `installation`. Each tick logs the token's
+  `repository_selection` and `permissions` (never the token), so
+  `journalctl --user -u gh-token.service` shows what the App can do. `host`
+  is reserved: it is never minted as a sandbox dir, and `claude-sandbox`
+  refuses a checkout named `host`.
+- **`gh` wrapper** (nixos-config `home/gh-host-token.nix`, on PATH ahead of
+  `/run/current-system/sw/bin/gh`). An explicit `GH_TOKEN`/`GITHUB_TOKEN`
+  passes through; otherwise the host token becomes `GH_TOKEN` for the real
+  `gh`, referenced by store path.
+- **`gh-app-credential`**, the git credential helper for
+  `https://github.com` (global git config and `ai-client-config-codex-sync`):
+  answers `get` with `username=x-access-token` + the host token; `store` and
+  `erase` are no-ops.
+- **git-broker** (`mcps/git-broker`, mirrored into Codex by the sync) runs the
+  wrapper as `credentialHelperExecutable` and mounts only
+  `~/.cache/gh-tokens/host` into its sandbox. No gh config, no user bus.
+
+**Fail closed.** A missing, empty or stale (55 minutes or older) token makes
+the wrapper and helper exit non-zero with one line naming
+`gh-token.service`, and the helper answers git with `quit=1` so no other
+credential is tried. There is no fallback to the keyring PAT. Repair:
+`systemctl --user start gh-token.service`. The timer is realtime
+(`OnCalendar`), so a tick missed during suspend fires on resume.
+
+**What an installation token cannot do.** `/user` endpoints (`gh api user`
+is 403 "Resource not accessible by integration"), `@me` search qualifiers
+and anything else keyed on a human viewer. `gh auth status` works and
+reports the App's bot account. Merging is a Contents-write operation: the
+token CAN merge an unapproved PR through `gh api -X PUT .../pulls/N/merge`
+on any repo whose ruleset does not require an approval, so the identity
+switch only closes self-merge together with the approval ruleset.
+
+**Escape hatch** for the founder's own credential work (e.g. `gh auth logout`
+of the old PAT): the unwrapped `/run/current-system/sw/bin/gh`.
+
+### Switchover order
+
+1. App permissions: Contents RW, Pull requests RW, Issues RW, Workflows RW,
+   Metadata R, Actions R, Checks R, Commit statuses R; installed on all
+   repositories (GitHub UI).
+2. Merge the nixos-config PR and wait for its deploy (wrapper, helper,
+   tmpfiles, timer). Then merge this repo's PR and run
+   `systemctl --user start claude-pull.service` so the mint script with host
+   mode and the git-broker policy land at once.
+3. `systemctl --user start gh-token.service`; check
+   `ls -l ~/.cache/gh-tokens/host/token` and `gh auth status` (App bot
+   account), then re-run the pull timers and read their journals.
+4. Only then: approval rulesets (1 approval, last-push approval, dismiss stale
+   reviews), `/run/current-system/sw/bin/gh auth logout`, revoke the PAT.
 
 ## Customizing the proxy allowlist
 
