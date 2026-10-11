@@ -40,6 +40,7 @@ import json
 import os
 import re
 import sys
+from typing import NoReturn
 
 FILE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 NEEDLE = "[REDACTED:"
@@ -61,7 +62,7 @@ RECOVER = (
 )
 
 
-def deny(reason: str) -> None:
+def deny(reason: str) -> NoReturn:
     json.dump(
         {
             "hookSpecificOutput": {
