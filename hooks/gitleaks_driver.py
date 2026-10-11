@@ -126,7 +126,7 @@ def redact(text: str, targets: dict[str, str], marker: Callable[[str, int], str]
     """``text`` with each occurrence of each target (``{target: rule id}``) replaced by
     ``marker(rule, length)``. Occurrences that share characters become one marker, named
     by the longest target at its start, so no fragment of either survives between them."""
-    spans = sorted(((i, i + len(t), rule) for t, rule in targets.items() for i in _find_all(text, t)),
+    spans = sorted(((i, i + len(t), rule) for t, rule in targets.items() if t for i in _find_all(text, t)),
                    key=lambda span: (span[0], -span[1]))
     merged: list[list] = []
     for start, end, rule in spans:

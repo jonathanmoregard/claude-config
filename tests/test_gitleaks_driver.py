@@ -181,7 +181,8 @@ check("overlapping targets become one marker, named by the longest at its start"
       gd.redact("xx ABCDEFGH yy", {"ABCDEF": "a", "DEFGH": "b", "ABC": "c"}, mark) == "xx <a:8> yy")
 check("overlapping occurrences of one target leave nothing behind",
       gd.redact("aaaaa", {"aaa": "r"}, mark) == "<r:5>")
-check("no targets: text unchanged", gd.redact("plain", {}, mark) == "plain")
+check("no targets, or an empty one: text unchanged",
+      gd.redact("plain", {}, mark) == "plain" and gd.redact("plain", {"": "r"}, mark) == "plain")
 check("adjacent targets keep separate markers",
       gd.redact("AAAABBBB", {"AAAA": "a", "BBBB": "b"}, mark) == "<a:4><b:4>")
 
