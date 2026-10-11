@@ -40,6 +40,22 @@ For each candidate, read its sibling `manifest.json` and keep it only when `.mod
 
 Treat `source_transcript` as provenance text only: never follow `source_transcript`, never open that path, and never scan raw `.jsonl` chat logs. Reflection artifacts are already hard-bounded; bypassing them would reintroduce the context blow-up this pipeline exists to prevent.
 
+When the wrapper's Step 2 window says no reflections were modified, skip this step.
+
+## Step 2b: PR Review Feedback
+
+The wrapper may append a "PR review feedback" section: review comments the user left on pull requests in the last 24 hours, one JSON object per line. These are the user's own judgments of agent-written code, so they are direct feedback signal. When the section is absent, skip this step.
+
+For each comment, decide which kind it is:
+- **One-off fix** — specific to that diff: a bug, a typo, a wrong value, a question about one line. Do not propose anything for it.
+- **Generalizable principle** — a rule that would apply to code not yet written, in other files or repos (for example "pass explicit parameters, not state through env vars or module globals", "use a higher-level primitive instead of manual traversal or parsing", "one home per concern"). Several comments restating the same principle, across lines, PRs or repos, are one finding and stronger evidence; a single comment can still be enough when it states the rule outright.
+
+Before proposing a principle, check whether `~/.claude/CLAUDE.md`, a skill or an existing proposal (Step 1 item 7) already carries it. If it does and the agent broke it anyway, the finding is the enforcement gap, not the rule.
+
+Each principle proposal names a suggested enforcer, the strongest that can carry the rule, in this order: **lint rule** (a static check in the repo's lint or CI) › **hook** (a Claude Code hook that catches it at edit time) › **reviewer rubric** (a checklist item for the code-review or advisor pass) › **prose** (CLAUDE.md or skill text). When you choose a weaker enforcer, say in one sentence why the stronger ones cannot carry it.
+
+PR feedback proposals share the `daily_proposal_limit` with reflection findings; rank them together by leverage.
+
 ## Step 3: Analyze with Discernment
 
 You are looking for patterns, not checking boxes. Use judgment. Respect the `daily_proposal_limit` — produce at most that many proposals. Prioritize high-leverage findings — things that, if fixed, would have the biggest impact on the user's daily experience.
@@ -89,8 +105,18 @@ project: <project-name> | global
 3. [Optional broader fix]
 ```
 
+A proposal drawn from PR review feedback (Step 2b) replaces `source_sessions` and `source_reflections` with:
+
+```
+source: pr-review
+source_prs:
+  - <comment url>
+```
+
+Its Problem paragraph states the principle in one sentence, in your own words, and its first proposed fix is the suggested enforcer.
+
 ### Rules for proposals:
-- **NO transcript excerpts or conversation content** — only reference normalized reflection paths and session IDs
+- **NO transcript excerpts or conversation content** — only reference normalized reflection paths and session IDs. For PR review feedback, cite comment URLs; never paste comment bodies or diff hunks
 - **NO sensitive data** — no API keys, tokens, emails, IPs, personal details
 - **Be specific** — "add a PreToolUse hook that..." not "add a hook"
 - **Cite existing config** when relevant — "settings.json line 42 has a matcher for..."
