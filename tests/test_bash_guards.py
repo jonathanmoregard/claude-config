@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import secrets
 import shutil
 import stat
 import subprocess
@@ -56,6 +57,13 @@ def section(name: str) -> None:
 # Harness
 # ----------------------------------------------------------------------
 SCRATCH = tempfile.mkdtemp(prefix="bash-guards-test-")
+# Fault-injected copies of bash-output-guard.py are written here and load the
+# shared redaction module from beside themselves.
+for _shared in ("secret_redaction.py",):
+    __import__("shutil").copy(
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks", _shared),
+        SCRATCH,
+    )
 
 
 def _write_stub(name: str, body: str, executable: bool = True) -> str:
@@ -1431,7 +1439,7 @@ check(
 # ----------------------------------------------------------------------
 # bash-output-guard: secret redaction.
 #
-# _redact_secrets exists because `cat /run/agenix/...` once put a live
+# Redaction exists because `cat /run/agenix/...` once put a live
 # Anthropic API key into the assistant's context window. safe-bash shipped
 # it with no test coverage at all; these are new.
 #
@@ -1467,22 +1475,27 @@ def response_obj(stdout: str, stderr: str = "", **extra) -> dict:
     return dict({"stdout": stdout, "stderr": stderr, "interrupted": False}, **extra)
 
 
+def _rand(n: int, alphabet: str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789") -> str:
+    """n random characters, the last a digit: gitleaks skips low-entropy values."""
+    return "".join(secrets.choice(alphabet) for _ in range(n - 1)) + secrets.choice("0123456789")
+
+
+def _anthropic() -> str:
+    return "sk-" + "ant-" + "api03-" + _rand(93) + "AA"
+
+
 SECRETS = [
-    ("anthropic-api", "sk-" + "ant-" + "api03-" + "A" * 32),
-    ("openai-project", "sk-" + "proj-" + "B" * 32),
-    # Bare sk- prefix: matches only after the two more specific patterns
-    # above have had their turn, which is why pattern order is load-bearing.
-    ("openai-legacy", "sk-" + "K" * 24),
-    ("github-token", "gh" + "p_" + "C" * 40),
-    ("github-pat", "github" + "_pat_" + "D" * 82),
-    ("slack-token", "xo" + "xb-" + "1234567890-abcdefghij"),
-    ("aws-access", "AK" + "IA" + "E" * 16),
-    ("jwt", "ey" + "J" + "abcdefghij" + "." + "ey" + "J" + "klmnopqrst" + "." + "uvwxyz1234"),
-    ("tavily-key", "tv" + "ly-" + "F" * 24),
-    # Private keys, the class safe-bash omitted. Terminated here because the
-    # row below plants the value in `KEY=<secret>\n` and asserts on what
-    # follows; the unterminated spelling (the one truncation produces) has
-    # dedicated fixtures in tests/test_bash_guard_post.py's F12 section.
+    ("anthropic-api", _anthropic()),
+    ("openai-project", "sk-" + "proj-" + _rand(32)),
+    ("openai-legacy", "sk-" + _rand(24)),
+    ("github-token", "gh" + "p_" + _rand(36)),
+    ("github-pat", "github" + "_pat_" + _rand(22) + "_" + _rand(59)),
+    ("slack-token", "xo" + "xb-" + "1234567890-" + _rand(24)),
+    ("aws-access", "AK" + "IA" + _rand(16, "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567")),
+    ("jwt", "ey" + "J" + _rand(20) + "." + "ey" + "J" + _rand(30) + "." + _rand(43)),
+    ("tavily-key", "tv" + "ly-dev-" + _rand(32)),
+    ("cloudflare-token", "cf" + "at_" + _rand(40) + _rand(8, "0123456789abcdef")),
+    ("google-oauth-secret", "GOC" + "SPX-" + _rand(28)),
     (
         "private-key",
         "-----BEGIN " + "RSA PRIVATE KEY" + "-----\n"
@@ -1496,8 +1509,8 @@ for label, secret in SECRETS:
     body = updated.get("stdout") if isinstance(updated, dict) else updated
     check(f"redacts {label}", isinstance(body, str) and secret not in body, str(body)[:120])
     check(
-        f"leaves a marker naming {label}",
-        isinstance(body, str) and f"[REDACTED:{label}:" in body,
+        f"leaves a redaction marker for {label}",
+        isinstance(body, str) and "[REDACTED:" in body,
         str(body)[:120],
     )
     check(
@@ -1507,7 +1520,7 @@ for label, secret in SECRETS:
     )
 
 # stderr is model-visible too, so it is redacted on the same terms.
-_s = "sk-" + "ant-" + "api03-" + "G" * 32
+_s = _anthropic()
 parsed, updated, raw = bash_out("cat /tmp/x", response_obj("", stderr=f"failed with {_s}"))
 check(
     "redacts stderr as well as stdout",
@@ -1591,7 +1604,7 @@ for cmd in ("ls", "git status", "echo hello"):
     check(f"does not wrap non-ingress command {cmd!r}", raw.strip() == "", raw[:120])
 
 # Both layers on one response: an ingress command whose body carries a secret.
-_s2 = "sk-" + "ant-" + "api03-" + "H" * 32
+_s2 = _anthropic()
 parsed, updated, raw = bash_out("curl https://example.invalid/x", response_obj(f"tok={_s2}\n"))
 body = updated.get("stdout") if isinstance(updated, dict) else updated
 check("redaction applies inside a wrapped body", isinstance(body, str) and _s2 not in body,
@@ -1624,18 +1637,6 @@ _spec2.loader.exec_module(out_guard)
 
 WITHHELD_MARKER = "the output guard is BROKEN"
 
-# A redaction pattern with no test row is a pattern nobody has ever watched
-# fire. safe-bash shipped all nine of them with exactly that much evidence.
-_untested_secrets = [
-    label for label, _ in out_guard._SECRET_PATTERNS if label not in {l for l, _ in SECRETS}
-]
-check(
-    "every secret pattern in the guard has a test row",
-    not _untested_secrets,
-    f"untested: {_untested_secrets}",
-)
-
-
 def check_withheld(label: str, parsed, updated) -> None:
     body = updated.get("stdout") if isinstance(updated, dict) else updated
     check(f"{label} -> output replaced", updated is not None, f"parsed={str(parsed)[:120]}")
@@ -1650,7 +1651,7 @@ rc, parsed, raw, err = run_hook("bash-output-guard.py", None, raw_stdin="not jso
 updated = (parsed or {}).get("hookSpecificOutput", {}).get("updatedToolOutput")
 check_withheld("unparseable hook stdin", parsed, updated)
 
-_secret_cfg = "sk-" + "ant-" + "api03-" + "J" * 32
+_secret_cfg = _anthropic()
 parsed, updated, raw = bash_out(
     "curl https://example.invalid/x",
     response_obj(f"tok={_secret_cfg}\n"),

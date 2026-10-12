@@ -260,8 +260,17 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 $HOME/.claude/hooks/bash-output-guard.py",
+            "command": "python3 -S -E $HOME/.claude/hooks/bash-output-guard.py",
             "timeout": 10
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/hooks/tool-output-redact.py",
+            "timeout": 15
           }
         ]
       },
@@ -322,6 +331,16 @@
           {
             "type": "command",
             "command": "python3 -S -E $HOME/.claude/hooks/path-edit-guard.py",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "^(Write|Edit|MultiEdit|NotebookEdit)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/hooks/redaction-marker-write-guard.py",
             "timeout": 10
           }
         ]

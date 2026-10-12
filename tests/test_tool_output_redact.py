@@ -1,0 +1,598 @@
+#!/usr/bin/env python3
+"""End-to-end tests for secret redaction in tool results, and the write guard.
+
+Covers ``hooks/tool-output-redact.py`` (every non-Bash tool), the scanner
+call as ``hooks/bash-output-guard.py`` makes it, ``hooks/secret_redaction.py``
+and ``hooks/redaction-marker-write-guard.py``. Each hook runs as a real
+process on the JSON the CLI sends, calling the real ``secret-redact`` on PATH.
+That CLI's own contract and gitleaks' quirks are tested once, in nixos-config
+(checks.x86_64-linux.secret-redact); here only their end-to-end effect is.
+
+No secret-shaped literal is written in this file: every token is generated at
+run time, and ``_safe`` masks tokens out of everything printed.
+
+Run:  python3 tests/test_tool_output_redact.py
+Exit: 0 = all green, 1 = at least one failure.
+"""
+from __future__ import annotations
+
+import base64
+import importlib.util
+import json
+import os
+import re
+import secrets
+import shutil
+import stat
+import string
+import subprocess
+import sys
+import tempfile
+import time
+from typing import NamedTuple
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(HERE)
+HOOKS = os.path.join(REPO_ROOT, "hooks")
+HOOK = os.path.join(HOOKS, "tool-output-redact.py")
+BASH_GUARD = os.path.join(HOOKS, "bash-output-guard.py")
+WRITE_GUARD = os.path.join(HOOKS, "redaction-marker-write-guard.py")
+MODULE = os.path.join(HOOKS, "secret_redaction.py")
+SCRATCH = tempfile.mkdtemp(prefix="tool-output-redact-test-")
+WITHHELD = "OUTPUT WITHHELD"
+BASH_WITHHELD = "the output guard is BROKEN"
+NO_SCANNER = {"PATH": "/nonexistent"}  # the hooks find secret-redact on PATH
+
+_spec = importlib.util.spec_from_file_location("tool_output_redact_under_test", HOOK)
+hook = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(hook)
+sys.path.insert(0, HOOKS)
+import secret_redaction as sr  # noqa: E402
+
+with open(os.path.join(REPO_ROOT, "settings.json"), encoding="utf-8") as _fh:
+    SETTINGS = json.load(_fh)
+
+# ---- reporting ---------------------------------------------------------
+FAILURES: list[str] = []
+TOKENS: list[str] = []
+
+
+def _safe(text) -> str:
+    text = str(text)
+    for t in TOKENS:
+        if t in text:
+            text = text.replace(t, f"<TOKEN {t[:4]}…{len(t)}>")
+    return text
+
+
+def check(label: str, cond, detail="") -> None:
+    print(f"  [{'OK ' if cond else 'FAIL'}] {label}" + (f" :: {_safe(detail)}" if detail and not cond else ""))
+    if not cond:
+        FAILURES.append(label)
+
+
+def section(name: str) -> None:
+    print(f"\n== {name} ==")
+
+
+# ---- fixtures -----------------------------------------------------------
+ALNUM = string.ascii_letters + string.digits
+
+
+def _rand(n: int, alphabet: str = ALNUM) -> str:
+    """n random chars, the last a digit: gitleaks ignores letters-only values."""
+    return "".join(secrets.choice(alphabet) for _ in range(n - 1)) + secrets.choice(string.digits)
+
+
+TOKEN_MAKERS = {
+    "gitlab": lambda: "glp" + "at-" + _rand(20),
+    "github": lambda: "gh" + "p_" + _rand(36),
+    "tavily": lambda: "tv" + "ly-dev-" + _rand(32),
+    "cloudflare": lambda: "cf" + "ut_" + _rand(40) + _rand(8, "0123456789abcdef"),
+    "gocspx": lambda: "GOC" + "SPX-" + _rand(28),
+    "oauth": lambda: "sk-" + "ant-" + "oat01-" + _rand(80),
+    "generic": lambda: _rand(31) + "k",  # generic-api-key: needs a keyword next to it
+    "fireworks": lambda: "fw_" + _rand(24),
+    "oauth-long": lambda: "sk-" + "ant-oat01-" + _rand(95) + "AA",
+}
+
+
+def tok(kind: str = "gitlab") -> str:
+    """A fresh synthetic token of a known shape. Never a real credential."""
+    value = TOKEN_MAKERS[kind]()
+    TOKENS.append(value)
+    return value
+
+
+def b64(n: int) -> str:
+    return base64.b64encode(os.urandom(n)).decode()
+
+
+PNG_B64 = base64.b64encode(b"\x89PNG\r\n\x1a\n" + os.urandom(64)).decode()
+
+
+# ---- running hooks --------------------------------------------------------
+class Result(NamedTuple):
+    rc: int
+    updated: object  # the emitted updatedToolOutput, or None
+    stdout: str
+    stderr: str
+    seconds: float
+
+
+def run_hook(payload, script: str = HOOK, env: dict | None = None,
+             raw_stdin: str | None = None, cwd: str | None = None, timeout: float = 120) -> Result:
+    t0 = time.monotonic()
+    try:
+        proc = subprocess.run(
+            [sys.executable, script], input=raw_stdin if raw_stdin is not None else json.dumps(payload),
+            capture_output=True, text=True, env={**os.environ, **(env or {})}, cwd=cwd or SCRATCH,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return Result(-1, None, "", f"<<killed after {timeout}s>>", time.monotonic() - t0)
+    updated = None
+    if proc.stdout.strip():
+        try:
+            updated = json.loads(proc.stdout)["hookSpecificOutput"]["updatedToolOutput"]
+        except (ValueError, KeyError, TypeError):
+            updated = "<<unparseable hook stdout>>"
+    return Result(proc.returncode, updated, proc.stdout, proc.stderr, time.monotonic() - t0)
+
+
+def post(tool: str, response, tool_input=None) -> dict:
+    return {"session_id": "test", "cwd": SCRATCH, "hook_event_name": "PostToolUse",
+            "tool_name": tool, "tool_input": tool_input or {}, "tool_response": response,
+            "tool_use_id": "toolu_test"}
+
+
+def bash(stdout: str, command: str = "cat .env") -> dict:
+    return post("Bash", {"stdout": stdout, "stderr": "", "interrupted": False}, {"command": command})
+
+
+def fake_scanner(name: str, body: str) -> dict:
+    """Env whose PATH holds only a fake `secret-redact` running ``body``."""
+    bindir = os.path.join(SCRATCH, f"bin-{name}")
+    os.makedirs(bindir)
+    path = os.path.join(bindir, "secret-redact")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("#!/bin/sh\n" + body + "\n")
+    os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
+    return {"PATH": f"{bindir}:/run/current-system/sw/bin"}
+
+
+def sandbox(name: str, module_patch=(), hook_patch=()) -> str:
+    """A copy of the hook and its modules with source patches applied."""
+    d = os.path.join(SCRATCH, name)
+    os.makedirs(d, exist_ok=True)
+    for src, patches in ((MODULE, module_patch), (HOOK, hook_patch)):
+        with open(src, encoding="utf-8") as fh:
+            text = fh.read()
+        for old, new in patches:
+            assert old in text, f"sandbox {name}: anchor not found: {old!r}"
+            text = text.replace(old, new, 1)
+        with open(os.path.join(d, os.path.basename(src)), "w", encoding="utf-8") as fh:
+            fh.write(text)
+    return os.path.join(d, "tool-output-redact.py")
+
+
+def same_shape(a, b) -> bool:
+    """``b`` differs from ``a`` only in the content of non-empty strings."""
+    if isinstance(a, str):
+        return isinstance(b, str) and bool(b or not a)
+    if isinstance(a, dict):
+        return isinstance(b, dict) and list(a) == list(b) and all(same_shape(a[k], b[k]) for k in a)
+    if isinstance(a, list):
+        return isinstance(b, list) and len(a) == len(b) and all(map(same_shape, a, b))
+    return type(a) is type(b) and a == b
+
+
+def dig(value, path):
+    for p in path:
+        value = value[p]
+    return value
+
+
+# =========================================================================
+section("preconditions")
+check("secret-redact resolves on PATH (nixos-config pkgs.secret-redact)", shutil.which("secret-redact") is not None)
+
+# -------------------------------------------------------------------------
+# Every tool's result shape (from the 2.1.296 CLI's output schemas and real
+# transcripts): the secret goes, the shape stays, binary stays byte-identical.
+section("each tool's result shape")
+gl, gh, tv, cf, gx, oa, gen = (tok(k) for k in
+                               ("gitlab", "github", "tavily", "cloudflare", "gocspx", "oauth", "generic"))
+SHAPES = [  # label, tool, response, planted tokens, binary paths
+    ("Read text", "Read", {"type": "text", "file": {
+        "filePath": "/w/.env", "content": f"A={gl}\nB={gh}\nclient_secret = \"{gen}\"\n",
+        "numLines": 3, "startLine": 1, "totalLines": 3}}, [gl, gh, gen], []),
+    ("Read image", "Read", {"type": "image", "file": {
+        "base64": PNG_B64, "type": "image/png", "originalSize": 72}}, [], [("file", "base64")]),
+    ("Read pdf", "Read", {"type": "pdf", "file": {
+        "filePath": "/w/x.pdf", "base64": PNG_B64, "originalSize": 72}}, [], [("file", "base64")]),
+    ("Read notebook", "Read", {"type": "notebook", "file": {"filePath": "/w/n.ipynb", "cells": [
+        {"cellType": "code", "source": f"key = '{tv}'", "cell_id": "c1", "outputs": [
+            {"output_type": "stream", "text": f"{cf}\n"},
+            {"output_type": "display_data", "image": {"image_data": PNG_B64, "media_type": "image/png"}}]}]}},
+     [tv, cf], [("file", "cells", 0, "outputs", 1, "image", "image_data")]),
+    ("Grep content", "Grep", {"mode": "content", "numFiles": 1, "filenames": ["/w/a.py"],
+                              "content": f"/w/a.py:3:TOKEN={gx}", "numLines": 1}, [gx], []),
+    ("Glob filenames", "Glob", {"durationMs": 3, "numFiles": 1, "filenames": [f"/w/{gh}.txt"],
+                                "truncated": False}, [gh], []),
+    ("MCP text + image blocks", "mcp__srv__tool", [
+        {"type": "text", "text": f"here: {oa}"},
+        {"type": "image", "data": PNG_B64, "mimeType": "image/png"}], [oa], [(1, "data")]),
+    ("MCP plain string", "mcp__srv__other", f"result {gl} done", [gl], []),
+    ("MCP resource blob", "mcp__srv__res", [
+        {"type": "resource", "resource": {"uri": "file:///x", "blob": PNG_B64, "mimeType": "image/png"}},
+        {"type": "text", "text": f"t {tv}"}], [tv], [(0, "resource", "blob")]),
+    ("Agent completed", "Agent", {"status": "completed", "prompt": "find it", "agentId": "a1",
+                                  "content": [{"type": "text", "text": f"found {cf} in the env"}],
+                                  "totalDurationMs": 10, "totalTokens": 5, "totalToolUseCount": 1}, [cf], []),
+    ("WebFetch", "WebFetch", {"bytes": 10, "code": 200, "codeText": "OK", "result": f"page says {gx}",
+                              "durationMs": 5, "url": "https://example.invalid/"}, [gx], []),
+    ("unknown future tool", "SomeNewTool", {"nested": {"deep": [{"x": f"v={oa}"}]}, "count": 3,
+                                            "ok": True}, [oa], []),
+    ("isBase64 content", "DesignSync", {"method": "get", "path": "/p", "isBase64": True,
+                                        "content": PNG_B64, "contentType": "image/png",
+                                        "truncated": False}, [], [("content",)]),
+]
+for label, tool, response, planted, binary_paths in SHAPES:
+    r = run_hook(post(tool, response))
+    if planted:
+        check(f"{label}: no planted token survives, redactions marked",
+              r.updated is not None and all(t not in r.stdout for t in planted) and "[REDACTED:" in r.stdout,
+              f"rc={r.rc} {r.stdout[:300]} {r.stderr[:200]}")
+        check(f"{label}: shape identical to the original",
+              r.updated is not None and same_shape(response, r.updated), r.updated)
+    else:
+        check(f"{label}: nothing to redact -> no rewrite", r.stdout.strip() == "", r.stdout[:200])
+    for path in binary_paths:
+        got = dig(r.updated if isinstance(r.updated, (dict, list)) else response, path)
+        check(f"{label}: binary at {path} byte-identical", got == dig(response, path))
+
+# -------------------------------------------------------------------------
+section("benign output and idempotency")
+BENIGN = [
+    ("Read", {"type": "text", "file": {
+        "filePath": "/nix/store/0c3k5qx3k7f2l1q1m8v4zv1mr0a9q8jh-python3-3.14.6/x.py",
+        "content": f"sha256-{b64(32)}\ncommit {_rand(40, '0123456789abcdef')}\n"
+                   "uuid 3f2b8c1e-1d2a-4c55-9a0b-7e6f5d4c3b2a\n",
+        "numLines": 3, "startLine": 1, "totalLines": 3}}),
+    ("Grep", {"mode": "files_with_matches", "numFiles": 2, "filenames": ["/a/b.py", "/c/d.rs"]}),
+    ("mcp__x__y", [{"type": "text", "text": "hello world, nothing secret"}]),
+]
+for tool, response in BENIGN:
+    r = run_hook(post(tool, response))
+    check(f"benign {tool} result: no rewrite, exit 0", r.rc == 0 and r.stdout.strip() == "", r)
+# A credential with no provider prefix is found by the field it sits in
+# (gitleaks' generic-api-key rule needs the key name beside the value).
+for label, response, value in (
+        ("dict value", lambda v: {"config": {"api_key": v, "region": "eu-north-1"}}, tok("generic")),
+        ("list under a credential field", lambda v: {"tokens": [v], "count": 1}, tok("generic")),
+        ("MCP structured result", lambda v: [{"type": "text", "text": "ok"}, {"client_secret": v}],
+         tok("generic"))):
+    r = run_hook(post("mcp__x__y", response(value)))
+    check(f"unprefixed credential as a {label}: redacted by its field name, shape kept",
+          r.rc == 0 and value not in r.stdout and "[REDACTED:generic-api-key:" in r.stdout
+          and same_shape(response(value), r.updated), f"rc={r.rc} {r.stdout[:200]}")
+r = run_hook(post("mcp__x__y", {"config": {"api_key": tok("generic"), "region": "eu-north-1"}}))
+check("a benign field keeps its value next to a redacted one",
+      isinstance(r.updated, dict) and r.updated["config"]["region"] == "eu-north-1", r.stdout[:200])
+
+first = run_hook(post("Read", {"type": "text", "file": {
+    "filePath": "/w/c", "content": f"x={tok('github')}\napi_key = \"{tok('generic')}\"\n",
+    "numLines": 2, "startLine": 1, "totalLines": 2}})).updated
+check("first pass redacts", "[REDACTED:" in json.dumps(first))
+check("a second pass over the redacted result emits nothing",
+      run_hook(post("Read", first)).stdout.strip() == "")
+
+# -------------------------------------------------------------------------
+section("encoded secrets: the base64 run carrying a token is redacted")
+for label, make in (("on line 1", lambda e: f"blob: {e}\nnext line stays"),
+                    ("on line 3", lambda e: f"x\ny\nblob: {e}\nnext line stays"),
+                    ("at the end of ~330 KB", lambda e: ("lorem ipsum dolor sit amet " * 3 + "\n") * 4000
+                     + f"blob: {e}\nnext line stays")):
+    enc = base64.b64encode(f"token {tok('github')}".encode()).decode()
+    r = run_hook(post("mcp__x__y", make(enc)))
+    check(f"{label}: run redacted, the next line kept",
+          enc not in r.stdout and isinstance(r.updated, str) and "blob: [REDACTED:" in r.updated
+          and r.updated.endswith("\nnext line stays"), r.stdout[:200])
+
+# A decoded finding next to another finding on the same line: both go (as one
+# marker when their spans touch), and never a marker inside a marker.
+enc = base64.b64encode(f"user:{tok('github')}".encode()).decode()
+gx = tok("gocspx")
+r = run_hook(post("mcp__x__y", f"Authorization: Basic {enc} {gx}"))
+check("a decoded run next to another finding: both redacted, no nested marker",
+      isinstance(r.updated, str) and "[REDACTED:[REDACTED:" not in r.updated
+      and enc not in r.updated and gx not in r.updated, r.stdout[:200])
+
+# -------------------------------------------------------------------------
+section("large and odd inputs end to end")
+for magic in ("%PDF-1.4\n", "MZ\n"):
+    t = tok()
+    check(f"output starting {magic.strip()!r} is scanned (generic hook)",
+          t not in run_hook(post("mcp__x__y", [{"type": "text", "text": f"{magic}K={t}"}])).stdout)
+    check(f"output starting {magic.strip()!r} is scanned (bash guard)",
+          t not in run_hook(bash(f"{magic}K={t}\n"), script=BASH_GUARD).stdout)
+big_tokens = [tok() for _ in range(4)]
+big = "".join(("lorem ipsum dolor sit amet " * 3 + "\n") * 2000 + f"line {t}\n" for t in big_tokens)
+r = run_hook(post("mcp__x__big", [{"type": "text", "text": big}]))
+check(f"{len(big) // 1024} KB: every token redacted, every other byte kept, inside the deadline",
+      all(t not in r.stdout for t in big_tokens) and isinstance(r.updated, list)
+      and r.updated[0]["text"].count("lorem") == big.count("lorem") and r.seconds < hook.SCAN_DEADLINE_S,
+      f"rc={r.rc} {r.seconds:.1f}s")
+# Up to the CLI's 1,000 distinct secrets are redacted over a large result, well
+# inside the deadline; past that the CLI fails and the output is withheld.
+many = [TOKEN_MAKERS["gitlab"]() for _ in range(1000)]  # not in TOKENS: none is printed
+text = "".join(f"token: {t}\n" for t in many) + ("the quick brown fox jumps over the lazy dog " * 20 + "\n") * 3500
+r = run_hook(post("mcp__x__y", text))
+check(f"{len(many)} distinct findings + 3 MB: all redacted, not withheld, in {r.seconds:.1f}s (< 8 s)",
+      r.rc == 0 and WITHHELD not in r.stdout and r.seconds < 8 and not any(t in r.stdout for t in many),
+      f"rc={r.rc} {r.seconds:.1f}s")
+many = [TOKEN_MAKERS["gitlab"]() for _ in range(1050)]
+r = run_hook(post("mcp__x__y", " ".join(many)))
+check(f"{len(many)} distinct findings: withheld, naming the limit ({r.seconds:.1f}s)",
+      r.rc == 0 and WITHHELD in r.stdout and "distinct secrets" in r.stdout
+      and not any(t in r.stdout for t in many), f"rc={r.rc} {r.stdout[:200]}")
+
+# -------------------------------------------------------------------------
+section("skipped tools: Bash (own guard) and the edit tools")
+t = tok()
+for tool, response in (("Bash", {"stdout": f"x {t}", "stderr": "", "interrupted": False}),
+                       ("Edit", {"filePath": "/w/x", "oldString": "a", "newString": "b",
+                                 "originalFile": f"k={t}", "structuredPatch": [],
+                                 "userModified": False, "replaceAll": False}),
+                       ("Write", {"type": "update", "filePath": "/w/x", "content": "c",
+                                  "originalFile": f"k={t}", "structuredPatch": []})):
+    r = run_hook(post(tool, response))
+    check(f"{tool}: this hook emits nothing", r.rc == 0 and r.stdout.strip() == "", r.stdout[:200])
+
+# -------------------------------------------------------------------------
+# Fail closed: a scanner that cannot vouch for the output withholds, in a shape
+# the CLI applies (a refused rewrite shows the original).
+section("fail-closed: the scanner cannot vouch -> withheld")
+t = tok()
+READ = {"type": "text", "file": {"filePath": "/w/.env", "content": f"K={t}\nmore text",
+                                 "numLines": 2, "startLine": 1, "totalLines": 2}}
+MCP_BIG = [{"type": "text", "text": f"K={t}\n" + "lorem ipsum " * 200}]
+slow_hook = sandbox("slow", hook_patch=(("HARNESS_HOOK_TIMEOUT_S = 15", "HARNESS_HOOK_TIMEOUT_S = 6"),))
+big_limit_hook = sandbox("big", module_patch=(("MAX_SCAN_CHARS = 8 * 1024 * 1024", "MAX_SCAN_CHARS = 1000"),))
+FAULTS = [  # label, script, env, response
+    ("secret-redact missing", HOOK, NO_SCANNER, READ),
+    ("secret-redact exits with an error", HOOK, fake_scanner("crash", "echo boom >&2; exit 1"), READ),
+    ("secret-redact prints unparseable output", HOOK, fake_scanner("garbage", "echo 'not json'"), READ),
+    ("secret-redact returns too few texts", HOOK, fake_scanner("short", """echo '{"texts": [], "counts": {}}'"""), READ),
+    ("secret-redact overruns the deadline", slow_hook, fake_scanner("slow", "sleep 60"), READ),
+    ("a finding reaches into the field name", HOOK, fake_scanner("spans", f"exec {sys.executable} -c '"
+     "import json, sys; t = json.load(sys.stdin)[\"texts\"]; print(json.dumps({\"texts\": "
+     "[\"[REDACTED:x:3chars]\" if \": \" in s else s for s in t], \"counts\": [{} for s in t]}))'"), READ),
+    ("output too large to scan", big_limit_hook, None, MCP_BIG),
+]
+for label, script, env, response in FAULTS:
+    r = run_hook(post("mcp__x__y" if response is MCP_BIG else "Read", response), script=script, env=env)
+    check(f"{label}: withheld, secret not shown, original shape kept (exit 0)",
+          r.rc == 0 and WITHHELD in r.stdout and t not in r.stdout
+          and r.updated is not None and same_shape(response, r.updated), f"rc={r.rc} {r.stdout[:200]}")
+    if script is slow_hook:
+        check("the deadline withhold lands before the (patched) 6 s harness timeout", r.seconds < 6,
+              f"{r.seconds:.1f}s")
+r = run_hook(post("Read", READ), env=NO_SCANNER)
+check("withhold: the notice names the fault", "secret-redact could not run" in r.stdout, r.stdout[:300])
+check("withhold: path and enum slots keep their values",
+      isinstance(r.updated, dict) and r.updated["file"]["filePath"] == "/w/.env"
+      and r.updated["type"] == "text")
+
+# A token that is the WHOLE string (no whitespace) is withheld too, as a rewrite.
+for label, tool, make in (
+        ("Read of a token-only file", "Read", lambda v: {"type": "text", "file": {
+            "filePath": "/w/key", "content": v, "numLines": 1, "startLine": 1, "totalLines": 1}}),
+        ("MCP bare-token block", "mcp__x__y", lambda v: [{"type": "text", "text": v}]),
+        ("MCP bare-token string", "mcp__x__z", lambda v: v)):
+    v = tok()
+    r = run_hook(post(tool, make(v)), env=NO_SCANNER)
+    check(f"scanner missing, {label}: withheld as a rewrite (exit 0)",
+          r.rc == 0 and WITHHELD in r.stdout and v not in r.stdout, f"rc={r.rc}")
+
+# Short credentials without whitespace or a 16-char run are withheld too.
+for label, secret, make in (
+        ("compact JSON", _rand(15), lambda v: '{"token":"' + v + '"}'),
+        ("URL with a password", _rand(8), lambda v: f"https://user:{v}@host.invalid/x")):
+    r = run_hook(post("mcp__x__y", [{"type": "text", "text": make(secret)}]), env=NO_SCANNER)
+    check(f"scanner missing, {label}: withheld (exit 0)",
+          r.rc == 0 and WITHHELD in r.stdout and secret not in r.stdout, f"rc={r.rc} {r.stdout[:200]}")
+
+# A withhold keeps only the fields the tool's schema pins, never a string because
+# of its characters: a letters-only token or a passphrase passes any character rule.
+letters_tok = "gh" + "p_" + "".join(secrets.choice(string.ascii_letters) for _ in range(36))
+passphrase = "-".join(secrets.choice(("correct", "horse", "battery", "staple", "orbit", "lantern"))
+                      for _ in range(5))
+TOKENS.extend([letters_tok, passphrase])
+for label, tool, response in (
+        ("Read of a letters-only token", "Read", {"type": "text", "file": {
+            "filePath": "/w/key", "content": letters_tok, "numLines": 1, "startLine": 1, "totalLines": 1}}),
+        ("MCP block holding a passphrase", "mcp__x__y", [{"type": "text", "text": passphrase}]),
+        ("unknown tool, token in an enum-looking slot", "SomeTool", {"status": letters_tok, "mode": passphrase})):
+    r = run_hook(post(tool, response), env=NO_SCANNER)
+    check(f"scanner missing, {label}: withheld, no character rule lets it through",
+          r.rc == 0 and WITHHELD in r.stdout and letters_tok not in r.stdout and passphrase not in r.stdout,
+          f"rc={r.rc} {r.stdout[:200]}")
+
+# Depth is not cut: a deep token is redacted in place, or withheld with the rest.
+deep_tok = tok()
+deep: object = f"v={deep_tok}"
+for _ in range(40):
+    deep = {"d": deep}
+deep = {"deep": deep, "note": "shallow free text"}
+for label, env, want in (("scanner present", None, "[REDACTED:gitlab-pat:"),
+                         ("scanner missing", NO_SCANNER, WITHHELD)):
+    r = run_hook(post("SomeTool", deep), env=env)
+    check(f"{label}: a token 41 levels down is not emitted, shape kept",
+          r.rc == 0 and deep_tok not in r.stdout and want in r.stdout and same_shape(deep, r.updated),
+          f"rc={r.rc} {r.stdout[:200]}")
+# Past MAX_DEPTH levels the result is not walked: it is withheld (fail closed),
+# whether the scanner works or not, and however deep json.loads let it get.
+for depth in (sr.MAX_DEPTH + 1, 30_000):
+    for label, env in (("scanner present", None), ("scanner missing", NO_SCANNER)):
+        deep_tok = tok()
+        r = run_hook(None, env=env, raw_stdin='{"tool_name": "SomeTool", "tool_response": {"note": "free text", '
+                     '"deep": ' + "[" * depth + json.dumps(f"x {deep_tok}") + "]" * depth + "}}")
+        check(f"{label}: a {depth:,}-deep result is withheld (exit 0), not crashed on",
+              r.rc == 0 and deep_tok not in r.stdout and WITHHELD in r.stdout, f"rc={r.rc} {r.stderr[:200]}")
+deep_tok = tok()
+r = run_hook(None, raw_stdin='{"tool_name": "SomeTool", "tool_response": '
+             + "[" * (sr.MAX_DEPTH - 1) + json.dumps(f"x {deep_tok}") + "]" * (sr.MAX_DEPTH - 1) + "}")
+check(f"a {sr.MAX_DEPTH - 1}-deep result is still redacted in place",
+      r.rc == 0 and deep_tok not in r.stdout and "[REDACTED:gitlab-pat:" in r.stdout, f"rc={r.rc}")
+
+# A secret used as a dict KEY: keys are not rewritten, so the output is withheld.
+for label, env in (("scanner present", None), ("scanner missing", NO_SCANNER)):
+    key_tok = tok()
+    r = run_hook(post("SomeTool", {"result": {key_tok: 1, "status": "ok"}, "note": "free text"}), env=env)
+    check(f"{label}: a token used as a dict key is withheld, never shown (exit 0)",
+          r.rc == 0 and key_tok not in r.stdout and WITHHELD in r.stdout, f"rc={r.rc} {r.stdout[:200]}")
+
+r = run_hook(post("Read", READ), script=sandbox(
+    "broken-module", module_patch=(("import json\n", "import json\nraise ImportError('injected')\n"),)))
+check("a module that cannot load: not emitted, the model is told (exit 2)",
+      r.rc == 2 and t not in r.stdout and "NOT INSPECTED" in r.stderr, f"rc={r.rc} {r.stderr[:200]}")
+r = run_hook(None, raw_stdin="{not json")
+check("unparseable stdin: exit 2 with a not-inspected notice", r.rc == 2 and "NOT INSPECTED" in r.stderr)
+
+# -------------------------------------------------------------------------
+section("bash-output-guard runs the same detector")
+t = tok()
+r = run_hook(bash(f"GITLAB={t}\n"), script=BASH_GUARD)
+check("a token is redacted from Bash output, marked with its rule id",
+      t not in r.stdout and "[REDACTED:gitlab-pat:" in r.stdout, r.stdout[:200])
+r = run_hook(bash(f"GITLAB={t}\n"), script=BASH_GUARD, env=NO_SCANNER)
+check("bash-output-guard with the scanner missing withholds", BASH_WITHHELD in r.stdout and t not in r.stdout)
+
+# -------------------------------------------------------------------------
+# The regression redaction creates: the model sees a marker where the file holds
+# a secret, and writing back what it saw must not replace the secret.
+section("write guard: a marker is never written over a secret")
+wdir = os.path.join(SCRATCH, "wg")
+os.makedirs(wdir)
+env_file = os.path.join(wdir, "app.env")
+notes = os.path.join(wdir, "notes.md")
+secret_tok = tok()
+env_text = f"APP_ENV=staging\nGITLAB_TOKEN={secret_tok}\nLOG_LEVEL=info\n"
+LONG = "[REDACTED:" + "github-token:40chars]"
+SHORT = "[REDACTED:" + "github-token]"  # the aggregator's historic form
+with open(env_file, "w", encoding="utf-8") as fh:
+    fh.write(env_text)
+with open(notes, "w", encoding="utf-8") as fh:
+    fh.write(f"Redaction looks like {LONG} in output.\nOlder form: {SHORT}\n")
+
+seen = run_hook(post("Read", {"type": "text", "file": {
+    "filePath": env_file, "content": env_text, "numLines": 3, "startLine": 1, "totalLines": 3}})).updated
+seen = seen["file"]["content"] if isinstance(seen, dict) else ""
+marker = seen.splitlines()[1].split("=", 1)[1] if "[REDACTED:" in seen else "?"
+check("fixture: the model's view of the file is redacted", marker.startswith("[REDACTED:") and secret_tok not in seen)
+
+
+def decide(tool: str, tool_input: dict | None = None, raw_stdin: str | None = None) -> str | None:
+    r = run_hook({"tool_name": tool, "tool_input": tool_input, "hook_event_name": "PreToolUse"},
+                 script=WRITE_GUARD, raw_stdin=raw_stdin)
+    return json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"] if r.stdout.strip() else None
+
+
+new_md = os.path.join(wdir, "new.md")
+WRITES = [  # label, tool, input, expected decision
+    ("Read -> Write of the redacted view", "Write",
+     {"file_path": env_file, "content": seen.replace("LOG_LEVEL=info", "LOG_LEVEL=debug")}, "deny"),
+    ("Write with the SHORT marker over the secret", "Write",
+     {"file_path": env_file, "content": f"GITLAB_TOKEN={SHORT}\n"}, "deny"),
+    ("Edit that leaves the secret line alone", "Edit",
+     {"file_path": env_file, "old_string": "LOG_LEVEL=info", "new_string": "LOG_LEVEL=debug"}, None),
+    ("Edit that adds a marker line", "Edit",
+     {"file_path": env_file, "old_string": "LOG_LEVEL=info", "new_string": f"LOG_LEVEL=info\nB={marker}"}, "deny"),
+    ("Edit that adds a SHORT marker", "Edit",
+     {"file_path": env_file, "old_string": "LOG_LEVEL=info", "new_string": f"LOG_LEVEL=info\nK={SHORT}"}, "deny"),
+    ("Edit whose old_string is the redacted view (fails on its own)", "Edit",
+     {"file_path": env_file, "old_string": f"GITLAB_TOKEN={marker}", "new_string": f"GITLAB_TOKEN={marker}\nX=1"},
+     None),
+    ("MultiEdit adding a marker in any step", "MultiEdit", {"file_path": env_file, "edits": [
+        {"old_string": "APP_ENV=staging", "new_string": "APP_ENV=prod"},
+        {"old_string": "LOG_LEVEL=info", "new_string": f"LOG_LEVEL=info\nK={marker}"}]}, "deny"),
+    ("Edit around a marker the file already holds", "Edit",
+     {"file_path": notes, "old_string": f"like {LONG} in", "new_string": f"like {LONG} in tool"}, None),
+    ("Edit around a SHORT marker the file already holds", "Edit",
+     {"file_path": notes, "old_string": f"form: {SHORT}", "new_string": f"form, still: {SHORT}"}, None),
+    ("Write creating a new file with a marker", "Write", {"file_path": new_md, "content": f"x {LONG}"}, "deny"),
+    ("placeholder spellings are not markers", "Write",
+     {"file_path": new_md, "content": "[REDACTED:<rule>:<n>chars] and [REDACTED:<rule>]"}, None),
+    ("NotebookEdit adding a marker", "NotebookEdit",
+     {"notebook_path": os.path.join(wdir, "n.ipynb"), "cell_id": "c1", "new_source": f"k = '{LONG}'"}, "deny"),
+    ("no marker in the input (the file is never read)", "Write",
+     {"file_path": env_file, "content": "no markers here\n" * 2000}, None),
+]
+for label, tool, tool_input, want in WRITES:
+    check(f"{label}: {want or 'allowed'}", decide(tool, tool_input) == want)
+
+# NotebookEdit: markers are counted in the notebook as it would be after the edit,
+# so a marker held by one cell does not license writing it over another cell's secret.
+nb_secret = tok()
+nb_path = os.path.join(wdir, "keys.ipynb")
+with open(nb_path, "w", encoding="utf-8") as fh:
+    json.dump({"cells": [
+        {"id": "c1", "cell_type": "code", "source": [f"TOKEN = '{nb_secret}'\n"], "metadata": {}, "outputs": []},
+        {"id": "c2", "cell_type": "markdown", "source": [f"Output shows {LONG} for it.\n"], "metadata": {}}],
+        "metadata": {}, "nbformat": 4, "nbformat_minor": 5}, fh)
+for label, tool_input, want in (
+        ("replacing the secret's cell with a marker another cell holds",
+         {"cell_id": "c1", "new_source": f"TOKEN = '{LONG}'\n"}, "deny"),
+        ("replacing the secret's cell by index form with that marker",
+         {"cell_id": "cell-0", "new_source": f"TOKEN = '{LONG}'\n"}, "deny"),
+        ("inserting a cell with that marker", {"cell_id": "c1", "new_source": f"x = '{LONG}'",
+                                               "cell_type": "code", "edit_mode": "insert"}, "deny"),
+        ("editing the cell that holds the marker, keeping it",
+         {"cell_id": "c2", "new_source": f"Output shows {LONG} for the token.\n"}, None),
+        ("deleting the cell that holds the marker", {"cell_id": "c2", "new_source": f"{LONG}",
+                                                      "edit_mode": "delete"}, None)):
+    check(f"NotebookEdit {label}: {want or 'allowed'}",
+          decide("NotebookEdit", {"notebook_path": nb_path, **tool_input}) == want)
+
+reason = run_hook({"tool_name": "Write", "tool_input": {"file_path": env_file, "content": f"T={LONG}"}},
+                  script=WRITE_GUARD).stdout
+check("the denial steers to Edit or the user only: no sed, no placeholder spelling",
+      "old_string" in reason and "ask the user" in reason and "sed" not in reason and "<rule>" not in reason,
+      reason[:300])
+with open(env_file, encoding="utf-8") as fh:
+    check("the secret is still on disk", secret_tok in fh.read())
+locked = os.path.join(wdir, "locked.env")
+with open(locked, "w", encoding="utf-8") as fh:
+    fh.write("x\n")
+os.chmod(locked, 0)
+check("an unreadable target with a marker in the input is denied (fail-safe)",
+      decide("Write", {"file_path": locked, "content": f"T={LONG}"}) == "deny" or os.access(locked, os.R_OK))
+os.chmod(locked, 0o600)
+check("unparseable input carrying a marker is denied",
+      decide("Write", raw_stdin='{"tool_name": "Write", [REDACTED:x:3chars] broken') == "deny")
+
+# -------------------------------------------------------------------------
+section("settings.json wiring")
+post_hooks = [(e, h) for e in SETTINGS["hooks"]["PostToolUse"] for h in e["hooks"]
+              if "tool-output-redact.py" in h.get("command", "")]
+pre_hooks = [(e, h) for e in SETTINGS["hooks"]["PreToolUse"] for h in e["hooks"]
+             if "redaction-marker-write-guard.py" in h.get("command", "")]
+check("tool-output-redact.py registered once on PostToolUse, no matcher (every future tool too)",
+      len(post_hooks) == 1 and post_hooks[0][0].get("matcher") in (None, "", "*"))
+check("its harness timeout is the one the hook's deadline assumes",
+      post_hooks[0][1].get("timeout") == hook.HARNESS_HOOK_TIMEOUT_S > hook.SCAN_DEADLINE_S > 0)
+check("the write guard registered once on PreToolUse, covering every file tool",
+      len(pre_hooks) == 1 and all(re.search(pre_hooks[0][0]["matcher"], t)
+                                  for t in ("Write", "Edit", "MultiEdit", "NotebookEdit")))
+
+# =========================================================================
+section("Summary")
+shutil.rmtree(SCRATCH, ignore_errors=True)
+if FAILURES:
+    print(f"\nFAIL: {len(FAILURES)} failure(s):")
+    for f in FAILURES:
+        print(f"  - {f}")
+    sys.exit(1)
+print("\nall green")

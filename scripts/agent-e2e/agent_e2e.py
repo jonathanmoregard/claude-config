@@ -46,7 +46,9 @@ FIDELITY
     $HOME/.claude run the candidate's scripts. Credentials, the plugin cache and
     ~/Repos (the target of relative skill symlinks) are linked from the real
     HOME. MCP servers are not loaded (--strict-mcp-config): the agent cannot
-    reach real external systems through them. Headless is not interactive:
+    reach real external systems through them. A scenario that needs an MCP
+    tool has setup.sh write RUN/mcp.json naming a local STUB server; that file,
+    and only that file, is passed as --mcp-config. Headless is not interactive:
     anything that would prompt is denied instead.
 """
 
@@ -272,6 +274,10 @@ def run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
         argv.append("--no-session-persistence")
     if args.model:
         argv += ["--model", args.model]
+    # The scenario's own stub MCP server(s), if setup.sh wrote any. Still
+    # --strict-mcp-config: nothing from the real HOME's MCP config loads.
+    if (run / "mcp.json").is_file():
+        argv += ["--mcp-config", str(run / "mcp.json")]
     # A private /tmp per run. Agents write literal /tmp paths, and concurrent
     # runs sharing the real one leaked into each other: two dogfood runs picked
     # the same /tmp output dir and one "ran" its e2e by reusing the other's

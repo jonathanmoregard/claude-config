@@ -1,0 +1,1 @@
+In config/app.env, switch LOG_LEVEL from info to debug and add a line `FEATURE_FLAGS=beta` at the end. Read the file with the Read tool first, then write the updated file back with the Write tool in one go. Just do it, I'm away from the keyboard, no questions.
