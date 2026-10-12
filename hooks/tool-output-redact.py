@@ -14,9 +14,9 @@ match"). Redaction and withholding therefore only ever change string contents.
 
 Invariants:
 - Fail closed. A scanner fault WITHHOLDS: every string becomes a notice except
-  identifier-like ones (letters and ``_./:+-`` only, at most 64 characters:
-  the enum, MIME-type and path slots a schema may pin), which keep their value.
-  Non-identifier keys are renamed and anything past MAX_DEPTH levels is dropped.
+  the schema-pinned slots listed for that tool in WITHHOLD_KEEPS, which keep their
+  value. Keys that are not name-shaped are renamed and anything past MAX_DEPTH
+  levels is dropped.
 - No shape to withhold into (unparseable stdin, a module that cannot load) ->
   exit 2, the status whose stderr reaches the model.
 - The scan ends by the hook's own deadline (the CLI's timeout, then SIGALRM),
@@ -46,9 +46,24 @@ SECRET_REDACT = "secret-redact"
 # from the model's own input; scanning their originalFile would buy nothing.
 SKIP_TOOLS = frozenset({"Bash", "Edit", "MultiEdit", "Write", "NotebookEdit"})
 
-# Strings a withhold keeps: enum, MIME-type and path values (`text`,
-# `image/png`, `/w/.env`). No digits, so no token, password or key can pass.
-_IDENTIFIER_RE = re.compile(r"[A-Za-z_./:+-]{1,64}")
+# The strings a withhold keeps, per tool, by path ("*" is any list index): the slots
+# the tool's output schema pins to an enum or literal (2.1.296), which the rewrite
+# must keep for the CLI to apply it, and Read's filePath, the model's own input.
+# Every other string is replaced, whatever its characters. A tool not listed keeps
+# none; if its schema pins a string, the CLI refuses the withhold and shows the
+# original.
+WITHHOLD_KEEPS = {
+    "Read": frozenset({("type",), ("file", "type"), ("file", "filePath"), ("file", "cells", "*", "cellType"),
+                       ("file", "cells", "*", "outputs", "*", "image", "media_type")}),
+    "Grep": frozenset({("mode",)}),
+    "Agent": frozenset({("status",), ("content", "*", "type")}),
+    "TodoWrite": frozenset({("oldTodos", "*", "status"), ("newTodos", "*", "status")}),
+}
+MCP_WITHHOLD_KEEPS = frozenset({("*", "type")})  # the content blocks' type
+
+# Keys a withhold keeps: field names, which every schema needs to accept the
+# rewrite (letters and `_./:+-` only, at most 64). Any other key is renamed.
+_FIELD_NAME_RE = re.compile(r"[A-Za-z_./:+-]{1,64}")
 
 _SHORT_WITHHELD = f"[{HOOK_NAME}: withheld, see the notice above]"
 
@@ -74,16 +89,27 @@ def _on_deadline(signum, frame) -> NoReturn:  # noqa: ARG001
     raise Withhold(f"the hook passed its own {SCAN_DEADLINE_S}s deadline")
 
 
-def _withheld(response, detail: str, map_strings):
-    """``response`` with every non-identifier string replaced (the first by the notice, the
-    rest by a pointer to it), every non-identifier key renamed, and anything nested past
-    MAX_DEPTH replaced by a pointer."""
+def _withhold_keeps(tool) -> frozenset:
+    if isinstance(tool, str) and tool.startswith("mcp__"):
+        return MCP_WITHHOLD_KEEPS
+    return WITHHOLD_KEEPS.get(tool, frozenset())
+
+
+def _withheld(response, tool, detail: str, map_strings):
+    """``response`` with every non-empty string outside ``tool``'s WITHHOLD_KEEPS replaced
+    (the first by the notice, the rest by a pointer to it), every key that is not
+    name-shaped renamed, and anything nested past MAX_DEPTH replaced by a pointer."""
+    keeps = _withhold_keeps(tool)
     notices = itertools.chain([_withheld_text(detail)], itertools.repeat(_SHORT_WITHHELD))
     fields = itertools.count(1)
+
+    def kept(path: tuple) -> bool:
+        return tuple("*" if isinstance(p, int) else p for p in path) in keeps
+
     updated = map_strings(
         response,
-        lambda s: s if not s or _IDENTIFIER_RE.fullmatch(s) else next(notices),
-        keys=lambda k: k if _IDENTIFIER_RE.fullmatch(k) else f"[{HOOK_NAME}: withheld field {next(fields)}]",
+        lambda s, path: s if not s or kept(path) else next(notices),
+        keys=lambda k: k if _FIELD_NAME_RE.fullmatch(k) else f"[{HOOK_NAME}: withheld field {next(fields)}]",
         too_deep=lambda: next(notices),
     )
     if updated == response:  # nothing that could hold a secret: nothing to hold back
@@ -122,8 +148,8 @@ def main(cli: str = SECRET_REDACT) -> int:
         _not_inspected(f"hook stdin was not readable JSON ({type(exc).__name__})")
     if not isinstance(payload, dict):
         _not_inspected("hook stdin was JSON but not an object")
-    response = payload.get("tool_response")
-    if payload.get("tool_name") in SKIP_TOOLS or not isinstance(response, (str, dict, list)):
+    tool, response = payload.get("tool_name"), payload.get("tool_response")
+    if tool in SKIP_TOOLS or not isinstance(response, (str, dict, list)):
         return 0
     import secret_redaction as sr  # a module that cannot load: exit 2, below
 
@@ -134,7 +160,7 @@ def main(cli: str = SECRET_REDACT) -> int:
     except (Exception, Withhold) as exc:  # noqa: BLE001 — fail closed on any fault
         signal.setitimer(signal.ITIMER_REAL, 0)
         known = isinstance(exc, (sr.ScanError, Withhold))
-        updated = _withheld(response, str(exc) if known else f"{type(exc).__name__} in the hook: {exc}",
+        updated = _withheld(response, tool, str(exc) if known else f"{type(exc).__name__} in the hook: {exc}",
                             sr.map_strings)
     signal.setitimer(signal.ITIMER_REAL, 0)
     if updated != response:

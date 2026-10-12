@@ -266,6 +266,21 @@ BENIGN = [
 for tool, response in BENIGN:
     r = run_hook(post(tool, response))
     check(f"benign {tool} result: no rewrite, exit 0", r.rc == 0 and r.stdout.strip() == "", r)
+# A credential with no provider prefix is found by the field it sits in
+# (gitleaks' generic-api-key rule needs the key name beside the value).
+for label, response, value in (
+        ("dict value", lambda v: {"config": {"api_key": v, "region": "eu-north-1"}}, tok("generic")),
+        ("list under a credential field", lambda v: {"tokens": [v], "count": 1}, tok("generic")),
+        ("MCP structured result", lambda v: [{"type": "text", "text": "ok"}, {"client_secret": v}],
+         tok("generic"))):
+    r = run_hook(post("mcp__x__y", response(value)))
+    check(f"unprefixed credential as a {label}: redacted by its field name, shape kept",
+          r.rc == 0 and value not in r.stdout and "[REDACTED:generic-api-key:" in r.stdout
+          and same_shape(response(value), r.updated), f"rc={r.rc} {r.stdout[:200]}")
+r = run_hook(post("mcp__x__y", {"config": {"api_key": tok("generic"), "region": "eu-north-1"}}))
+check("a benign field keeps its value next to a redacted one",
+      isinstance(r.updated, dict) and r.updated["config"]["region"] == "eu-north-1", r.stdout[:200])
+
 first = run_hook(post("Read", {"type": "text", "file": {
     "filePath": "/w/c", "content": f"x={tok('github')}\napi_key = \"{tok('generic')}\"\n",
     "numLines": 2, "startLine": 1, "totalLines": 2}})).updated
@@ -351,6 +366,9 @@ FAULTS = [  # label, script, env, response
     ("secret-redact prints unparseable output", HOOK, fake_scanner("garbage", "echo 'not json'"), READ),
     ("secret-redact returns too few texts", HOOK, fake_scanner("short", """echo '{"texts": [], "counts": {}}'"""), READ),
     ("secret-redact overruns the deadline", slow_hook, fake_scanner("slow", "sleep 60"), READ),
+    ("a finding reaches into the field name", HOOK, fake_scanner("spans", f"exec {sys.executable} -c '"
+     "import json, sys; t = json.load(sys.stdin)[\"texts\"]; print(json.dumps({\"texts\": "
+     "[\"[REDACTED:x:3chars]\" if \": \" in s else s for s in t], \"counts\": [{} for s in t]}))'"), READ),
     ("output too large to scan", big_limit_hook, None, MCP_BIG),
 ]
 for label, script, env, response in FAULTS:
@@ -385,6 +403,22 @@ for label, secret, make in (
     r = run_hook(post("mcp__x__y", [{"type": "text", "text": make(secret)}]), env=NO_SCANNER)
     check(f"scanner missing, {label}: withheld (exit 0)",
           r.rc == 0 and WITHHELD in r.stdout and secret not in r.stdout, f"rc={r.rc} {r.stdout[:200]}")
+
+# A withhold keeps only the fields the tool's schema pins, never a string because
+# of its characters: a letters-only token or a passphrase passes any character rule.
+letters_tok = "gh" + "p_" + "".join(secrets.choice(string.ascii_letters) for _ in range(36))
+passphrase = "-".join(secrets.choice(("correct", "horse", "battery", "staple", "orbit", "lantern"))
+                      for _ in range(5))
+TOKENS.extend([letters_tok, passphrase])
+for label, tool, response in (
+        ("Read of a letters-only token", "Read", {"type": "text", "file": {
+            "filePath": "/w/key", "content": letters_tok, "numLines": 1, "startLine": 1, "totalLines": 1}}),
+        ("MCP block holding a passphrase", "mcp__x__y", [{"type": "text", "text": passphrase}]),
+        ("unknown tool, token in an enum-looking slot", "SomeTool", {"status": letters_tok, "mode": passphrase})):
+    r = run_hook(post(tool, response), env=NO_SCANNER)
+    check(f"scanner missing, {label}: withheld, no character rule lets it through",
+          r.rc == 0 and WITHHELD in r.stdout and letters_tok not in r.stdout and passphrase not in r.stdout,
+          f"rc={r.rc} {r.stdout[:200]}")
 
 # Depth is not cut: a deep token is redacted in place, or withheld with the rest.
 deep_tok = tok()
