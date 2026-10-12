@@ -75,8 +75,8 @@ Once all implementation criteria are checked:
 3. Invoke `advice-refine-test-loop once` over the finished integrated diff.
    Reproduce material findings, fix confirmed regressions, and rerun affected
    evidence plus the full gate.
-4. Invoke `finishing-up`. Run `~/.claude/scripts/dod-check.py` fresh and act on
-   its measured blockers. That skill owns commit, push, PR, CI, mergeability,
+4. Invoke `finishing-up`. Run its fresh `git`/`gh` readiness checks and act on
+   the measured blockers. That skill owns commit, push, PR, CI, mergeability,
    follow-up scheduling, and handover; do not restate its ladder here.
 5. Emit the exact completion promise only after criteria, verification, review,
    and delivery state make it literally true.
