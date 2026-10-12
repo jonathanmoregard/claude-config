@@ -11,24 +11,29 @@ Stateless. Every Stop re-derives everything:
 1. WHAT THIS SESSION TOUCHED comes from its transcript (`transcript_path`)
    plus its subagents' transcripts (`<transcript dir>/<session>/subagents/
    agent-*.jsonl`; a glob, so cheap, and subagents are where delegated git work
-   happens). A checkout counts when a tool call ran, in it, one of:
+   happens). A checkout counts when a tool call SUCCEEDED (its tool_result
+   arrived without is_error) after running, in it, one of:
    `git commit`, `git push`, `git worktree add`, `gh pr create`,
    `scripts/claude-worktree.sh` / `scripts/klaffat-worktree.sh` (which create
    `~/worktrees/{claude,klaffat}-<slug>`), or the git-broker MCP operations
    commit / push / worktree_add / pr_create. The directory comes from
    `git -C`, a preceding `cd`, or the entry's `cwd`. Worktrees created by
    `git worktree add`, the two helper scripts or the broker are "created by
-   this session".
+   this session" only when, in addition, the output shows no creation failure
+   ("already exists", `fatal:`): a failed add never claims someone's worktree.
 
 2. WHAT IS STILL OPEN is measured live with git and gh, per checkout, in
    parallel (at most MAX_CHECKOUTS, most recently touched first):
-   - commits not pushed (ahead of upstream, or a branch never pushed);
+   - commits not pushed: ahead of the branch's PUSH destination (`@{push}`,
+     else push remote + same branch name; never an inherited `@{u}`), or a
+     branch with no remote ref and no PR (never pushed);
    - a pushed feature branch with commits and no PR, in a repo that is not
-     PR-gated (private + a workflow on `pull_request`: there the PR waits for
-     the user's "Open the PR?" answer, which is not a gap);
+     PR-gated (non-public + a workflow whose `on:` includes `pull_request` or
+     `pull_request_target`, read with yq: there the PR waits for the user's
+     "Open the PR?" answer, which is not a gap);
    - an open PR with a failed check;
-   - a merged PR whose PRIMARY checkout still sits on the feature branch, or a
-     primary checkout on the default branch that is behind origin
+   - a merged PR whose clean PRIMARY checkout still sits on the branch, or a
+     clean primary checkout on the default branch that is behind origin
      (`git ls-remote`, no fetch); linked worktrees may stay until cleanup;
    - uncommitted changes in a worktree this session created.
 
@@ -60,12 +65,15 @@ from typing import NamedTuple
 GIT_TIMEOUT_S = 5
 GH_TIMEOUT_S = 8
 MAX_CHECKOUTS = 8
+PR_EVENTS = {"pull_request", "pull_request_target"}
 FAILED = {"FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"}
 GITHUB_RE = re.compile(r"github\.com[:/]([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$")
 SEPARATORS = {"&&", "||", ";", "|", "&", "(", ")", ";;", "|&"}
 WRAPPERS = {"command", "env", "exec", "nice", "nohup"}
 HELPERS = {"claude-worktree.sh": "claude-", "klaffat-worktree.sh": "klaffat-"}
 BROKER_TOOL = "mcp__git-broker__git"
+TOOL_RESULT_ID_RE = re.compile(r'"tool_use_id":\s*"([^"]+)"')
+CREATE_FAILED_RE = re.compile(r"already exists|^fatal:|^error:", re.M | re.I)
 
 
 class Touched(NamedTuple):
@@ -191,15 +199,19 @@ def scan_bash(command: str, cwd: str, home: str, t: Touched) -> None:
                     break
 
 
-def scan_entry(entry: dict, home: str, t: Touched) -> None:
+def scan_entry(entry: dict, home: str) -> list[tuple[str, Touched]]:
+    """[(tool_use id, what that call would touch)] for one transcript entry."""
     msg = entry.get("message")
     content = msg.get("content") if isinstance(msg, dict) else None
     if not isinstance(content, list):
-        return
+        return []
     cwd = entry.get("cwd") if isinstance(entry.get("cwd"), str) else home
+    out = []
     for item in content:
-        if not isinstance(item, dict) or item.get("type") != "tool_use":
+        if not isinstance(item, dict) or item.get("type") != "tool_use" \
+                or not isinstance(item.get("id"), str):
             continue
+        t = Touched([], set())
         inp = item.get("input") if isinstance(item.get("input"), dict) else {}
         if item.get("name") == "Bash" and isinstance(inp.get("command"), str):
             scan_bash(inp["command"], cwd, home, t)
@@ -211,6 +223,17 @@ def scan_entry(entry: dict, home: str, t: Touched) -> None:
                 new = _resolve(inp["worktree_path"], repo, home)
                 t.created.add(new)
                 t.dirs.append(new)
+        if t.dirs:
+            out.append((item["id"], t))
+    return out
+
+
+def _result_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(c.get("text", "") for c in content if isinstance(c, dict))
+    return ""
 
 
 def transcripts_for(transcript_path: str, session_id: str) -> list[pathlib.Path]:
@@ -221,7 +244,16 @@ def transcripts_for(transcript_path: str, session_id: str) -> list[pathlib.Path]
 
 
 def touched_by(paths: list[pathlib.Path], home: str) -> Touched:
+    """Checkouts touched by tool calls that SUCCEEDED.
+
+    A tool_use counts only once its tool_result arrives without is_error: a
+    call refused by a hook or permission rule, a failing command, or one with
+    no result yet claims nothing. A worktree counts as created by this session
+    only when, in addition, the output carries no creation failure (a
+    `…; echo done` compound exits 0 after `fatal: '<path>' already exists`).
+    """
     t = Touched([], set())
+    pending: dict[str, Touched] = {}
     for p in paths:
         try:
             fh = p.open(encoding="utf-8", errors="replace")
@@ -229,16 +261,33 @@ def touched_by(paths: list[pathlib.Path], home: str) -> Touched:
             continue
         with fh:
             for line in fh:
-                if '"tool_use"' not in line or not (
+                if '"tool_use"' in line and (
                         "git" in line or "gh pr create" in line or "worktree" in line):
-                    continue
-                try:
-                    entry = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(entry, dict):
-                    scan_entry(entry, home, t)
+                    entry = _loads(line)
+                    if entry:
+                        pending.update(scan_entry(entry, home))
+                elif '"tool_result"' in line and pending and any(
+                        i in pending for i in TOOL_RESULT_ID_RE.findall(line)):
+                    entry = _loads(line)
+                    content = (entry or {}).get("message", {}).get("content")
+                    for item in content if isinstance(content, list) else []:
+                        if not isinstance(item, dict) or item.get("type") != "tool_result":
+                            continue
+                        claim = pending.pop(item.get("tool_use_id"), None)
+                        if claim is None or item.get("is_error"):
+                            continue
+                        t.dirs.extend(claim.dirs)
+                        if not CREATE_FAILED_RE.search(_result_text(item.get("content"))):
+                            t.created.update(claim.created)
     return t
+
+
+def _loads(line: str) -> dict | None:
+    try:
+        entry = json.loads(line)
+    except ValueError:
+        return None
+    return entry if isinstance(entry, dict) else None
 
 
 # ---------------------------------------------------------------- live state
@@ -277,21 +326,73 @@ def toplevel(d: str) -> str | None:
     return os.path.realpath(p.stdout.strip()) if p.returncode == 0 else None
 
 
-def pr_gated(top: str, gh: str, nwo: str) -> bool:
+def workflow_events(yq: str | None, path: pathlib.Path) -> set[str]:
+    """Event names under a workflow's `on:` (scalar, list or mapping, any quoting).
+
+    Parsed by yq-go (declared system-wide in nixos-config, YAML 1.2, so `on` is
+    a plain key, not the YAML 1.1 boolean). A hand-rolled matcher missed quoted
+    and flow forms; the stdlib has no YAML parser. Raises Unverified when yq is
+    missing or the file does not parse.
+    """
+    if not yq:
+        raise Unverified("yq is not on PATH; cannot tell whether the repo is PR-gated")
+    p = run([yq, "-o", "json", ".on", str(path)], GIT_TIMEOUT_S)
+    if p.returncode != 0:
+        raise Unverified(f"yq {path.name}: {(p.stderr or '').strip()[:120]}")
+    try:
+        on = json.loads(p.stdout or "null")
+    except ValueError:
+        raise Unverified(f"yq {path.name}: unparseable output")
+    if isinstance(on, str):
+        return {on}
+    if isinstance(on, list):
+        return {e for e in on if isinstance(e, str)}
+    if isinstance(on, dict):
+        return set(on)
+    return set()
+
+
+def pr_gated(top: str, gh: str, nwo: str, yq: str | None) -> bool:
+    """CLAUDE.md: non-public repo whose workflows run on pull_request."""
     vis = gh_json(gh, "repo", "view", nwo, "--json", "visibility").get("visibility")
     if vis == "PUBLIC":
         return False
     wf = pathlib.Path(top, ".github", "workflows")
-    for f in list(wf.glob("*.yml")) + list(wf.glob("*.yaml")):
-        try:
-            if re.search(r"^\s*pull_request\b|[\[{,\s]pull_request\b", f.read_text(), re.M):
-                return True
-        except OSError:
-            continue
-    return False
+    files = sorted(list(wf.glob("*.yml")) + list(wf.glob("*.yaml")))
+    return any(workflow_events(yq, f) & PR_EVENTS for f in files)
 
 
-def inspect(top: str, created: bool, gh: str | None) -> list[tuple[str, str]]:
+def push_target(top: str, branch: str) -> tuple[str, str, str]:
+    """(remote, destination branch, remote-tracking ref) a push of `branch` goes to.
+
+    Git's own answer, `@{push}`, when it resolves. It does not under
+    push.default=simple when the upstream was inherited from another branch
+    (e.g. a worktree cut from origin/main); then the push remote
+    (branch.<b>.pushRemote, remote.pushDefault, branch.<b>.remote, origin) and
+    the same branch name, which is what `git push <remote> <branch>` updates.
+    Never `@{u}`: an inherited upstream is not where the branch was pushed.
+    """
+    ref = git(top, "rev-parse", "--symbolic-full-name", "@{push}", ok_fail=True)
+    remotes = sorted((git(top, "remote") or "").split(), key=len, reverse=True)
+    if ref and ref.startswith("refs/remotes/"):
+        rest = ref[len("refs/remotes/"):]
+        for r in remotes:
+            if rest.startswith(r + "/"):
+                return r, rest[len(r) + 1:], ref
+    remote = next((v for v in (
+        git(top, "config", "--get", f"branch.{branch}.pushRemote", ok_fail=True),
+        git(top, "config", "--get", "remote.pushDefault", ok_fail=True),
+        git(top, "config", "--get", f"branch.{branch}.remote", ok_fail=True),
+    ) if v and v != "."), "origin")
+    return remote, branch, f"refs/remotes/{remote}/{branch}"
+
+
+def pr_list(gh: str, nwo: str, branch: str) -> list:
+    return gh_json(gh, "pr", "list", "-R", nwo, "--head", branch, "--state", "all",
+                   "--limit", "5", "--json", "number,url,state,statusCheckRollup")
+
+
+def inspect(top: str, created: bool, gh: str | None, yq: str | None) -> list[tuple[str, str]]:
     """[(gap, next command)] for one checkout. Raises Unverified."""
     gaps: list[tuple[str, str]] = []
     primary = os.path.realpath(git(top, "rev-parse", "--absolute-git-dir")) == \
@@ -316,27 +417,27 @@ def inspect(top: str, created: bool, gh: str | None) -> list[tuple[str, str]]:
         gaps.append(("uncommitted changes in a worktree this session created",
                      f"git -C {q} status  (commit them, or discard scratch)"))
 
-    # Upstream: the configured one, else origin/<branch>. A configured upstream
-    # whose ref is gone (remote branch deleted after merge) counts as pushed.
-    if git(top, "rev-parse", "--verify", "--quiet", "@{u}", ok_fail=True):
-        upstream = "@{u}"
-    elif git(top, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}", ok_fail=True):
-        upstream = f"refs/remotes/origin/{branch}"
-    else:
-        upstream = None
-    gone = upstream is None and git(top, "config", "--get", f"branch.{branch}.merge", ok_fail=True)
-    if upstream:
-        ahead = int(git(top, "rev-list", "--count", f"{upstream}..HEAD") or 0)
+    remote, dest, ref = push_target(top, branch)
+    push_cmd = f"git -C {q} push {shlex.quote(remote)} " + (
+        shlex.quote(branch) if dest == branch else f"HEAD:{shlex.quote(dest)}")
+    prs = None
+    if git(top, "rev-parse", "--verify", "--quiet", ref, ok_fail=True):
+        ahead = int(git(top, "rev-list", "--count", f"{ref}..HEAD") or 0)
         if ahead:
-            gaps.append((f"{ahead} commit(s) on {branch} not pushed", f"git -C {q} push"))
+            gaps.append((f"{ahead} commit(s) on {branch} not pushed", push_cmd))
             return gaps
-    elif branch != default and not gone:
-        base = git(top, "rev-parse", "--verify", "--quiet", f"origin/{default}", ok_fail=True)
-        ahead = int(git(top, "rev-list", "--count", f"origin/{default}..HEAD") or 0) if base else 1
-        if ahead:
-            gaps.append((f"branch {branch} was never pushed",
-                         f"git -C {q} push -u origin {shlex.quote(branch)}"))
-        return gaps
+    elif branch != default:
+        # No remote ref. A PR for this head proves it was pushed (and the
+        # remote branch deleted after merge); otherwise it never was.
+        if nwo and gh:
+            prs = pr_list(gh, nwo, branch)
+        if not prs:
+            base = git(top, "rev-parse", "--verify", "--quiet", f"origin/{default}", ok_fail=True)
+            ahead = int(git(top, "rev-list", "--count", f"origin/{default}..HEAD") or 0) if base else 1
+            if ahead:
+                gaps.append((f"branch {branch} was never pushed",
+                             f"git -C {q} push -u {shlex.quote(remote)} {shlex.quote(branch)}"))
+            return gaps
 
     if branch == default:
         if primary and not dirty:
@@ -356,11 +457,11 @@ def inspect(top: str, created: bool, gh: str | None) -> list[tuple[str, str]]:
         return gaps
     if not gh:
         raise Unverified("gh is not on PATH")
-    prs = gh_json(gh, "pr", "list", "-R", nwo, "--head", branch, "--state", "all", "--limit", "5",
-                  "--json", "number,url,state,statusCheckRollup")
+    if prs is None:
+        prs = pr_list(gh, nwo, branch)
     if not prs:
         has_commits = int(git(top, "rev-list", "--count", f"origin/{default}..HEAD") or 0)
-        if has_commits and not pr_gated(top, gh, nwo):
+        if has_commits and not pr_gated(top, gh, nwo, yq):
             gaps.append((f"{branch} is pushed but has no PR",
                          f"gh pr create -R {nwo} --head {shlex.quote(branch)} --fill"))
         return gaps
@@ -372,7 +473,7 @@ def inspect(top: str, created: bool, gh: str | None) -> list[tuple[str, str]]:
         if failed:
             gaps.append((f"PR {pr['url']} has failing checks: {', '.join(failed)[:120]}",
                          f"gh pr checks {pr['number']} -R {nwo}"))
-    elif pr.get("state") == "MERGED" and primary:
+    elif pr.get("state") == "MERGED" and primary and not dirty:
         gaps.append((f"PR {pr['url']} merged; this primary checkout is still on {branch}",
                      f"git -C {q} switch {shlex.quote(default)} && git -C {q} pull --ff-only"))
     return gaps
@@ -393,7 +494,7 @@ def checkouts(t: Touched, home: str) -> list[str]:
     return seen
 
 
-def decide(payload: dict, home: str, gh: str | None) -> dict | None:
+def decide(payload: dict, home: str, gh: str | None, yq: str | None) -> dict | None:
     tp, sid = payload.get("transcript_path"), payload.get("session_id")
     if not isinstance(tp, str) or not tp:
         return None
@@ -407,7 +508,7 @@ def decide(payload: dict, home: str, gh: str | None) -> dict | None:
 
     def one(top):
         try:
-            return top, inspect(top, top in created, gh), None
+            return top, inspect(top, top in created, gh, yq), None
         except Unverified as exc:
             return top, [], str(exc)
 
@@ -443,7 +544,7 @@ def main() -> int:
     if not isinstance(payload, dict):
         return 0
     try:
-        out = decide(payload, str(pathlib.Path.home()), shutil.which("gh"))
+        out = decide(payload, str(pathlib.Path.home()), shutil.which("gh"), shutil.which("yq"))
     except Exception:  # a checker that crashes must not wedge the turn
         return 0
     if out:
