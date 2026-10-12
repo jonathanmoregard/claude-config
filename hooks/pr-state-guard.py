@@ -30,6 +30,12 @@ Outcomes:
     unverified; never a block.
   - anything unparseable -> exit 0, no output.
 
+Known limits (deliberate, to keep false blocks rare): a PR named only as a bare
+`#n` with no URL anywhere in the reply is not resolved; a segment that says
+"merged" about one PR excuses every PR on it; a sentence about the old list
+("it wrongly lists #339 as waiting") reads as awaiting: at most one needless
+block, and only a notice once stop_hook_active is set.
+
 MERGED is terminal, so it is cached per session under
 ~/.local/state/claude-pr-state-guard/; OPEN and CLOSED (reopenable) are queried
 fresh at every Stop.
@@ -74,7 +80,7 @@ AWAITING = re.compile(
     re.I,
 )
 # Words that already state the PR is finished.
-TERMINAL = re.compile(r"\b(?:merged|closed|landed|abandoned|superseded)\b", re.I)
+TERMINAL = re.compile(r"\b(?:merged|closed|landed|abandoned|superseded|no longer)\b", re.I)
 
 SESSION_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
@@ -212,7 +218,8 @@ def live_states(prs: list[PR], gh: str | None, cache: dict) -> dict[str, dict | 
     if todo and gh is None:
         states.update({pr.key: None for pr in todo})
     elif todo:
-        with ThreadPoolExecutor(max_workers=min(8, len(todo))) as pool:
+        # One worker per PR: worst case is one GH_TIMEOUT_S, inside the 15 s hook slot.
+        with ThreadPoolExecutor(max_workers=len(todo)) as pool:
             for pr, st in zip(todo, pool.map(lambda p: query_state(gh, p), todo)):
                 states[pr.key] = st
     return states
@@ -258,14 +265,14 @@ def decide(payload: dict, home: pathlib.Path, gh: str | None, now: float) -> dic
                   + ", ".join(unverified) + ". The PR states in this reply are unchecked.")
 
     if stale:
-        body = ("PR-state guard: this reply presents PRs as open or awaiting action that "
-                "GitHub reports as finished:\n" + "\n".join(stale) +
-                "\nA merged PR is reported as merged (with its time), a closed one as "
-                "closed, and neither is listed as needing a click. Rewrite the reply "
-                "from live `gh pr view` state.")
+        facts = ("PR-state guard: this reply presents PRs as open or awaiting action that "
+                 "GitHub reports as finished:\n" + "\n".join(stale))
         if payload.get("stop_hook_active"):
-            return {"systemMessage": body + (("\n" + notice) if notice else "")}
-        out: dict = {"decision": "block", "reason": body}
+            return {"systemMessage": facts + (("\n" + notice) if notice else "")}
+        out: dict = {"decision": "block", "reason": facts + (
+            "\nA merged PR is reported as merged (with its time), a closed one as "
+            "closed, and neither is listed as needing a click. Rewrite the reply "
+            "from live `gh pr view` state.")}
         if notice:
             out["systemMessage"] = notice
         return out

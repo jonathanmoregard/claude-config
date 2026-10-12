@@ -152,6 +152,7 @@ def test_merged_pr_reported_as_merged_passes(env):
     env.set(MERGED_339)
     assert env.run(f"Merged 10:07 CEST, deploy ran:\n{NIX}/339") is None
     assert env.run(f"nixos-config #339 - MERGED, nothing awaiting you.\n{NIX}/339") is None
+    assert env.run(f"nixos-config #339 no longer needs your click.\n{NIX}/339") is None
 
 
 def test_open_pr_awaiting_click_passes(env):
