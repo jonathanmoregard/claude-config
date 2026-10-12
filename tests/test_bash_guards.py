@@ -58,8 +58,8 @@ def section(name: str) -> None:
 # ----------------------------------------------------------------------
 SCRATCH = tempfile.mkdtemp(prefix="bash-guards-test-")
 # Fault-injected copies of bash-output-guard.py are written here and load the
-# shared redaction module (and its gitleaks rules) from beside themselves.
-for _shared in ("secret_redaction.py", "gitleaks_driver.py", "secret-rules.toml"):
+# shared redaction module from beside themselves.
+for _shared in ("secret_redaction.py",):
     __import__("shutil").copy(
         os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks", _shared),
         SCRATCH,

@@ -13,8 +13,8 @@ Two layers:
      positives are acceptable — the model knows what it asked for, and the
      marker tells it the call succeeded but the value is gated. False
      negatives are not: every missed pattern is a future incident.
-     Detection is ``secret_redaction.py`` (gitleaks), shared
-     with ``tool-output-redact.py``. A gitleaks fault withholds.
+     Detection is ``secret_redaction.py`` (the ``secret-redact`` CLI),
+     shared with ``tool-output-redact.py``. A scanner fault withholds.
   2. Untrusted-ingress tagging. Output from curl/wget/npx, gh fetches, gh
      api, git clone and package installs is wrapped in
      ``<untrusted_external_content>`` so it reads as data, not instructions.
@@ -124,7 +124,7 @@ GUARD_DEADLINE_S = HARNESS_HOOK_TIMEOUT_S - 4  # 6
 
 _TIMEOUTS_SANE = 0 < GUARD_DEADLINE_S < HARNESS_HOOK_TIMEOUT_S
 # Resolved on PATH, like the python3 that runs this hook.
-GITLEAKS = "gitleaks"
+SECRET_REDACT = "secret-redact"
 
 CONFIG_PATH = os.environ.get(
     "BASH_GUARD_CONFIG",
@@ -614,7 +614,7 @@ def _scrub_persisted(path: str, redact, max_bytes: int) -> tuple[bool, str, int]
     try:
         scrubbed = redact(body)
     except Exception as exc:  # noqa: BLE001 — unscanned: the pointer is withheld
-        return False, f"the gitleaks secret scan of it failed ({exc})", 0
+        return False, f"the secret scan of it failed ({exc})", 0
     if scrubbed == body:
         return True, "", size
     tmp = path + ".bash-output-guard.tmp"
@@ -1119,7 +1119,7 @@ def _load_config() -> dict:
     return config
 
 
-def main(gitleaks: str = GITLEAKS) -> int:
+def main(cli: str = SECRET_REDACT) -> int:
     deadline = time.monotonic() + GUARD_DEADLINE_S - 0.5
     response = None
     try:
@@ -1138,7 +1138,7 @@ def main(gitleaks: str = GITLEAKS) -> int:
         import secret_redaction as sr  # one that cannot load withholds, below
 
         def redact(value):
-            return sr.redact_value(value, gitleaks=gitleaks, timeout=deadline - time.monotonic())
+            return sr.redact_value(value, cli=cli, timeout=deadline - time.monotonic() - 1)
 
         updated = _rewrite(payload, response, redact, sr.MAX_SCAN_CHARS)
     except Withhold as w:

@@ -4,7 +4,7 @@
 Bash has its own guard (``bash-output-guard.py``, which also tags untrusted
 ingress). Everything else — Read, WebFetch, Agent, every ``mcp__*`` tool, any
 future tool — comes here: registered with no matcher. Detection is
-``secret_redaction.redact_value`` (gitleaks).
+``secret_redaction.redact_value`` (the ``secret-redact`` CLI).
 
 Why the rewrite must keep the original's exact shape: the CLI checks
 ``updatedToolOutput`` against the tool's own output schema and runs its result
@@ -19,9 +19,9 @@ Invariants:
   Non-identifier keys are renamed and anything past MAX_DEPTH levels is dropped.
 - No shape to withhold into (unparseable stdin, a module that cannot load) ->
   exit 2, the status whose stderr reaches the model.
-- Scanning and applying findings both end by the hook's own deadline (gitleaks'
-  timeout, then SIGALRM), which lands before the harness timeout that would
-  discard the rewrite and show the original.
+- The scan ends by the hook's own deadline (the CLI's timeout, then SIGALRM),
+  which lands before the harness timeout that would discard the rewrite and
+  show the original.
 """
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ HARNESS_HOOK_TIMEOUT_S = 15  # settings.json
 # Redaction must end by then; withholding and emitting take well under a second.
 SCAN_DEADLINE_S = HARNESS_HOOK_TIMEOUT_S - 4
 # Resolved on PATH, like the python3 that runs this hook.
-GITLEAKS = "gitleaks"
+SECRET_REDACT = "secret-redact"
 
 # Bash: its own guard rewrites it, and two rewrites race (last one wins).
 # Edit tools: the model-facing result is only the path and a confirmation built
@@ -60,8 +60,8 @@ def _withheld_text(detail: str) -> str:
         "tool itself ran; only its output is being held back.\n"
         f"Fault: {detail}\n"
         "Recover: if the result was too large, narrow the request (a smaller Read "
-        "range, a tighter Grep). If gitleaks is missing or broken, fix it "
-        "(hooks/secret_redaction.py, hooks/secret-rules.toml, `gitleaks version`) and "
+        "range, a tighter Grep). If secret-redact is missing or broken, fix it "
+        "(nixos-config's pkgs.secret-redact, on PATH) and "
         "re-run the tool. A human can view the output directly in their own terminal.]"
     )
 
@@ -114,7 +114,7 @@ def _emit(updated) -> None:
         _not_inspected(f"the rewrite could not be written ({type(exc).__name__}: {exc})")
 
 
-def main(gitleaks: str = GITLEAKS) -> int:
+def main(cli: str = SECRET_REDACT) -> int:
     deadline = time.monotonic() + SCAN_DEADLINE_S
     try:
         payload = json.loads(sys.stdin.read())
@@ -130,7 +130,7 @@ def main(gitleaks: str = GITLEAKS) -> int:
     signal.signal(signal.SIGALRM, _on_deadline)
     signal.setitimer(signal.ITIMER_REAL, max(deadline - time.monotonic(), 0.01))
     try:
-        updated = sr.redact_value(response, gitleaks=gitleaks, timeout=deadline - time.monotonic())
+        updated = sr.redact_value(response, cli=cli, timeout=deadline - time.monotonic() - 1)
     except (Exception, Withhold) as exc:  # noqa: BLE001 — fail closed on any fault
         signal.setitimer(signal.ITIMER_REAL, 0)
         known = isinstance(exc, (sr.ScanError, Withhold))

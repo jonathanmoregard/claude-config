@@ -1,14 +1,14 @@
 """Secret redaction shared by the PostToolUse output hooks.
 
-``redact_value(value, gitleaks=..., timeout=...)`` returns ``value`` with every
-secret in its strings replaced by ``[REDACTED:<rule>:<n>chars]``. Detection is
-gitleaks (``gitleaks_driver.py``) with ``secret-rules.toml``: gitleaks' own
-rules plus the formats it lacks.
+``redact_value(value, cli=..., timeout=...)`` returns ``value`` with every secret
+in its strings replaced by ``[REDACTED:<rule>:<n>chars]``. Detection is the
+``secret-redact`` CLI (nixos-config, ``pkgs.secret-redact``): gitleaks with
+pinned rules, called once per value.
 
 Invariants:
-- Any scanner fault raises ``ScanError``; callers WITHHOLD. There is no partial result.
+- Any fault (the CLI missing, failing or timing out) raises ``ScanError``; callers
+  WITHHOLD. There is no partial result.
 - A secret found in one string is redacted in every string of the value.
-- Redaction is idempotent: a marker is never redacted again.
 - Binary payloads (image/PDF base64, MCP image data, blobs) are neither scanned nor changed.
 - Only string values change: the result has the input's exact shape. Dict keys are
   scanned but never rewritten: a secret in a key raises ScanError (the caller withholds).
@@ -16,22 +16,18 @@ Invariants:
 """
 from __future__ import annotations
 
-import os
-import sys
+import json
+import subprocess
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
-import gitleaks_driver  # noqa: E402
 
-RULES = os.path.join(HERE, "secret-rules.toml")
+class ScanError(Exception):
+    """The value is NOT known to be clean. Never carries the value's text."""
+
+
 # Past this many characters a result cannot be scanned inside the hooks' deadlines.
 MAX_SCAN_CHARS = 8 * 1024 * 1024
-# Each distinct secret is one str.find pass over the text; 1,000 over 8 MB take ~1 s.
-MAX_TARGETS = 1000
 # Deeper results are withheld unwalked (fail closed): no tool's own output nests near this.
 MAX_DEPTH = 100
-
-ScanError = gitleaks_driver.GitleaksError
 
 BINARY_KEYS = frozenset({"base64", "blob", "image_data"})
 BINARY_BLOCK_TYPES = frozenset({"image", "audio", "video"})  # MCP blocks whose `data` is binary
@@ -68,21 +64,39 @@ def map_strings(value, fn, *, keys=lambda key: key, too_deep=None):
     return walk(value, 0)
 
 
-def redact_value(value, *, gitleaks: str, timeout: float):
-    """A copy of ``value`` with every secret in its strings redacted. Raises ScanError."""
+def redact_value(value, *, cli: str, timeout: float):
+    """A copy of ``value`` with every secret in its strings redacted, by one ``cli`` call
+    that must finish within ``timeout`` seconds. Raises ScanError."""
     texts: list[str] = []
     keys: list[str] = []
     map_strings(value, texts.append, keys=keys.append)
     if sum(map(len, texts + keys)) > MAX_SCAN_CHARS:
         raise ScanError(f"the output is past the {MAX_SCAN_CHARS}-character scan limit")
-    found = gitleaks_driver.find_secrets(texts + keys, gitleaks=gitleaks, rules=RULES, timeout=timeout)
-    rule_of = {target: rule for per_text in found for target, rule in per_text.items()}
-    if len(rule_of) > MAX_TARGETS:
-        raise ScanError(f"{len(rule_of)} distinct secrets, more than the {MAX_TARGETS} redacted in time")
-    if any(target in key for key in keys for target in rule_of):
+    redacted = _run(cli, texts + keys, timeout)
+    if redacted[len(texts):] != keys:
         raise ScanError("a secret is used as a field name, which redaction does not rewrite")
-    return map_strings(value, lambda s: gitleaks_driver.redact(s, rule_of, _marker))
+    values = iter(redacted[: len(texts)])
+    return map_strings(value, lambda s: next(values))
 
 
-def _marker(rule: str, length: int) -> str:
-    return f"[REDACTED:{rule}:{length}chars]"
+def _run(cli: str, texts: list[str], timeout: float) -> list[str]:
+    """The CLI's redacted texts. Its own timeout ends first; the extra second lets it exit."""
+    request = json.dumps({"texts": texts, "timeout": timeout})
+    try:
+        proc = subprocess.run([cli], input=request.encode(),
+                              capture_output=True, timeout=timeout + 1, check=False)
+    except subprocess.TimeoutExpired:
+        raise ScanError(f"{cli} did not finish in {timeout + 1:.1f}s") from None
+    except OSError as e:
+        raise ScanError(f"{cli} could not run: {e.strerror or type(e).__name__}") from None
+    if proc.returncode != 0:
+        reason = proc.stderr.decode("utf-8", "replace").strip()[-300:]
+        raise ScanError(f"{cli} exited {proc.returncode}: {reason}")
+    try:
+        redacted = json.loads(proc.stdout)["texts"]
+    except (ValueError, KeyError, TypeError):
+        raise ScanError(f"{cli} wrote no readable result") from None
+    if not isinstance(redacted, list) or len(redacted) != len(texts) or not all(
+            isinstance(t, str) for t in redacted):
+        raise ScanError(f"{cli} returned a result of the wrong shape")
+    return redacted

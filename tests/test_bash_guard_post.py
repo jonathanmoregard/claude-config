@@ -77,8 +77,8 @@ def section(name: str) -> None:
 
 SCRATCH = tempfile.mkdtemp(prefix="bash-output-guard-test-")
 # Fault-injected copies of bash-output-guard.py are written here and load the
-# shared redaction module (and its gitleaks rules) from beside themselves.
-for _shared in ("secret_redaction.py", "gitleaks_driver.py", "secret-rules.toml"):
+# shared redaction module from beside themselves.
+for _shared in ("secret_redaction.py",):
     __import__("shutil").copy(
         os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks", _shared),
         SCRATCH,
@@ -1215,8 +1215,8 @@ check(
 #
 # Redaction runs AFTER the harness truncates (F11), so a key whose END marker
 # was cut off, or whose BEGIN is out of view (the tail of a key file,
-# `grep -A`), must still lose its body: secret-rules.toml's private-key-head
-# and private-key-tail rules. Every key below is synthetic filler.
+# `grep -A`), must still lose its body (secret-redact handles both). Every key
+# below is synthetic filler.
 # ----------------------------------------------------------------------
 section("bash-output-guard: private keys are redacted (F12)")
 
@@ -1856,7 +1856,7 @@ check_withheld("hook stdin cannot be read", parsed, updated)
 _redactor_fault = patched_guard(
     "guard-redactor-fault.py",
     (
-        "            return sr.redact_value(value, gitleaks=gitleaks, timeout=deadline - time.monotonic())",
+        "            return sr.redact_value(value, cli=cli, timeout=deadline - time.monotonic() - 1)",
         '            raise RuntimeError("injected redactor fault")',
     ),
 )
