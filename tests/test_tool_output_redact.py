@@ -532,6 +532,30 @@ WRITES = [  # label, tool, input, expected decision
 ]
 for label, tool, tool_input, want in WRITES:
     check(f"{label}: {want or 'allowed'}", decide(tool, tool_input) == want)
+
+# NotebookEdit: markers are counted in the notebook as it would be after the edit,
+# so a marker held by one cell does not license writing it over another cell's secret.
+nb_secret = tok()
+nb_path = os.path.join(wdir, "keys.ipynb")
+with open(nb_path, "w", encoding="utf-8") as fh:
+    json.dump({"cells": [
+        {"id": "c1", "cell_type": "code", "source": [f"TOKEN = '{nb_secret}'\n"], "metadata": {}, "outputs": []},
+        {"id": "c2", "cell_type": "markdown", "source": [f"Output shows {LONG} for it.\n"], "metadata": {}}],
+        "metadata": {}, "nbformat": 4, "nbformat_minor": 5}, fh)
+for label, tool_input, want in (
+        ("replacing the secret's cell with a marker another cell holds",
+         {"cell_id": "c1", "new_source": f"TOKEN = '{LONG}'\n"}, "deny"),
+        ("replacing the secret's cell by index form with that marker",
+         {"cell_id": "cell-0", "new_source": f"TOKEN = '{LONG}'\n"}, "deny"),
+        ("inserting a cell with that marker", {"cell_id": "c1", "new_source": f"x = '{LONG}'",
+                                               "cell_type": "code", "edit_mode": "insert"}, "deny"),
+        ("editing the cell that holds the marker, keeping it",
+         {"cell_id": "c2", "new_source": f"Output shows {LONG} for the token.\n"}, None),
+        ("deleting the cell that holds the marker", {"cell_id": "c2", "new_source": f"{LONG}",
+                                                      "edit_mode": "delete"}, None)):
+    check(f"NotebookEdit {label}: {want or 'allowed'}",
+          decide("NotebookEdit", {"notebook_path": nb_path, **tool_input}) == want)
+
 reason = run_hook({"tool_name": "Write", "tool_input": {"file_path": env_file, "content": f"T={LONG}"}},
                   script=WRITE_GUARD).stdout
 check("the denial steers to Edit or the user only: no sed, no placeholder spelling",

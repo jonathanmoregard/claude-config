@@ -22,7 +22,9 @@ around it; a call that ADDS one is refused with a recovery hint.
                   An ``old_string`` that is not in the file makes the Edit fail
                   on its own, so nothing is refused for it.
   * MultiEdit:    the edits applied in order, the same way.
-  * NotebookEdit: count in ``new_source`` vs count anywhere in the notebook.
+  * NotebookEdit: the notebook's count with the edited cell's source taken out
+                  and ``new_source`` put in (insert: only put in; delete adds
+                  nothing). A cell the guard cannot find takes nothing out.
 
 COST. The raw stdin is checked for the literal ``[REDACTED:`` before anything
 is parsed; a call without it (all but ~0.01% of 80,273 past file-tool calls)
@@ -39,6 +41,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections import Counter
 from typing import NoReturn
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -71,11 +74,27 @@ def deny(reason: str) -> NoReturn:
     sys.exit(0)
 
 
-def counts(text: str) -> dict[str, int]:
-    out: dict[str, int] = {}
-    for m in MARKER_RE.findall(text):
-        out[m] = out.get(m, 0) + 1
-    return out
+def counts(text: str) -> Counter:
+    return Counter(MARKER_RE.findall(text))
+
+
+def notebook_cell_source(notebook: str | None, cell_id) -> str:
+    """The source of the cell NotebookEdit resolves ``cell_id`` to (its id, or the
+    ``cell-<n>`` index form), ``""`` when there is none. An unparseable notebook refuses."""
+    if notebook is None or not isinstance(cell_id, str):
+        return ""
+    try:
+        cells = json.loads(notebook)["cells"]
+    except (ValueError, KeyError, TypeError):
+        deny("the notebook is not parseable, so the guard cannot tell which cell this edit replaces.")
+    if not isinstance(cells, list):
+        deny("the notebook's cells are not a list, so the guard cannot tell which cell this edit replaces.")
+    cell = next((c for c in cells if isinstance(c, dict) and c.get("id") == cell_id), None)
+    index = cell_id.removeprefix("cell-")
+    if cell is None and index.isdigit() and int(index) < len(cells):
+        cell = cells[int(index)]
+    source = cell.get("source", "") if isinstance(cell, dict) else ""
+    return "".join(source) if isinstance(source, list) else str(source)
 
 
 def read_target(path: str) -> str | None:
@@ -104,8 +123,8 @@ def apply_edit(text: str, old: str, new: str, replace_all: bool) -> str:
     return text.replace(old, new) if replace_all else text.replace(old, new, 1)
 
 
-def check(before: dict[str, int], after: dict[str, int], path: str) -> None:
-    added = sorted(m for m, n in after.items() if n > before.get(m, 0))
+def check(before: Counter, after: Counter, path: str) -> None:
+    added = sorted(after - before)
     if added:
         shown = ", ".join(added[:3]) + (f" (+{len(added) - 3} more)" if len(added) > 3 else "")
         deny(f"this call would write {shown} into {path!r}, which does not hold "
@@ -142,9 +161,14 @@ def main() -> int:
             deny("Write content is not a string.")
         check(before, counts(content), path)
     elif tool == "NotebookEdit":
+        mode = ti.get("edit_mode") or "replace"
+        if mode == "delete":
+            return 0  # removes a cell, writes none
         source = ti.get("new_source")
-        added = counts(source) if isinstance(source, str) else {}
-        check(before, added, path)
+        if not isinstance(source, str):
+            deny("NotebookEdit new_source is not a string.")
+        replaced = notebook_cell_source(disk, ti.get("cell_id")) if mode == "replace" else ""
+        check(before, before - counts(replaced) + counts(source), path)
     else:
         edits = ti.get("edits") if tool == "MultiEdit" else [ti]
         if not isinstance(edits, list):
