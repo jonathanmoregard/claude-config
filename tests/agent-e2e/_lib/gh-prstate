@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Stub `gh` answering PR state from $E2E_RUN/pr-states.
 
-Each line of pr-states is `<owner>/<repo>#<n> <OPEN|MERGED|CLOSED>`. Every call
-is logged to $E2E_RUN/gh.log. Covers what an agent (or a hook) asks about a
-PR's state: `pr view`, `pr list`, `pr checks`, `api repos/.../pulls/<n>`.
+Each line of pr-states is `<owner>/<repo>#<n> <OPEN|MERGED|CLOSED> [<head-branch>]`.
+Every call is logged to $E2E_RUN/gh.log. Covers what an agent (or a hook) asks
+about a PR's state: `pr view` (by number, URL or head branch), `pr list`
+(`--head` filters), `pr checks`, `api repos/.../pulls/<n>`, `repo view`
+(visibility from $E2E_RUN/visibility, default PUBLIC; repo from $E2E_RUN/repo).
+`pr create` appends an OPEN PR for the current branch and marks
+$E2E_RUN/pr-created. `pr merge` is refused: merging is the user's click.
 """
 import json
 import os
@@ -17,11 +21,20 @@ args = sys.argv[1:]
 with open(run / "gh.log", "a") as f:
     f.write(" ".join(args) + "\n")
 
-prs = {}
-for line in (run / "pr-states").read_text().splitlines():
-    if line.strip():
-        key, state = line.split()
-        prs[key.lower()] = state
+
+def read(name, default):
+    try:
+        return (run / name).read_text().strip() or default
+    except OSError:
+        return default
+
+
+states = run / "pr-states"
+prs = {}      # key -> (state, head)
+for line in (states.read_text().splitlines() if states.exists() else []):
+    parts = line.split()
+    if parts:
+        prs[parts[0].lower()] = (parts[1], parts[2] if len(parts) > 2 else "")
 
 
 def opt(*names):
@@ -34,14 +47,21 @@ def opt(*names):
     return None
 
 
-def record(nwo, n):
-    state = prs.get(f"{nwo}#{n}".lower())
-    if state is None:
+def current_branch():
+    return subprocess.run(["git", "branch", "--show-current"], capture_output=True,
+                          text=True).stdout.strip()
+
+
+def record(key):
+    if key.lower() not in prs:
         return None
+    state, head = prs[key.lower()]
+    nwo, n = key.split("#")
+    n = int(n)
     t = "2026-10-12T08:07:39Z"
     return {
         "number": n, "url": f"https://github.com/{nwo}/pull/{n}", "title": f"PR {n}",
-        "state": state, "isDraft": False,
+        "state": state, "isDraft": False, "headRefName": head, "baseRefName": "main",
         "mergedAt": t if state == "MERGED" else None,
         "closedAt": t if state != "OPEN" else None,
         "mergedBy": {"login": "jonathanmoregard"} if state == "MERGED" else None,
@@ -67,38 +87,56 @@ def emit(obj):
 
 
 def target():
-    """(nwo, n) for `pr view|checks <n|url> [-R nwo]`."""
+    """PR key for `pr view|checks [<n|url|branch>] [-R nwo]`."""
     ref = args[2] if len(args) > 2 and not args[2].startswith("-") else ""
     m = re.match(r"https://github\.com/([^/]+/[^/]+)/pull/(\d+)", ref)
     if m:
-        return m.group(1), int(m.group(2))
-    nwo = opt("-R", "--repo")
+        return f"{m.group(1)}#{m.group(2)}"
+    nwo = opt("-R", "--repo") or read("repo", "")
     if ref.isdigit() and nwo:
-        return nwo, int(ref)
-    return None, None
+        return f"{nwo}#{ref}"
+    head = ref or current_branch()
+    hits = [k for k, (_, h) in prs.items() if h and h == head]
+    return max(hits, key=lambda k: int(k.split("#")[1])) if hits else None
 
 
 cmd = " ".join(args[:2])
 if cmd in ("pr view", "pr checks"):
-    nwo, n = target()
-    rec = record(nwo, n) if nwo else None
+    key = target()
+    rec = record(key) if key else None
     if rec is None:
-        print("GraphQL: Could not resolve to a PullRequest", file=sys.stderr)
+        print(f"no pull requests found for branch \"{current_branch()}\"", file=sys.stderr)
         sys.exit(1)
     if cmd == "pr checks":
-        print("ci\tpass\t1m\thttps://github.com/%s/actions/runs/1" % nwo)
+        print("ci\tpass\t1m\thttps://github.com/%s/actions/runs/1" % key.split("#")[0])
     else:
         emit(rec)
 elif cmd == "pr list":
     nwo = opt("-R", "--repo")
     want = (opt("--state", "-s") or "open").upper()
-    out = [record(k.split("#")[0], int(k.split("#")[1])) for k in prs
-           if not nwo or k.startswith(nwo.lower() + "#")]
-    out = [o for o in out if want == "ALL" or o["state"] == want]
+    head = opt("--head", "-H")
+    out = [record(k) for k in prs if not nwo or k.startswith(nwo.lower() + "#")]
+    out = [o for o in out if (want == "ALL" or o["state"] == want)
+           and (not head or o["headRefName"] == head)]
     emit(out)
+elif cmd == "pr create":
+    nwo = opt("-R", "--repo") or read("repo", "acme/widget")
+    head = opt("--head", "-H") or current_branch()
+    n = 1 + max([int(k.split("#")[1]) for k in prs] or [0])
+    with open(states, "a") as f:
+        f.write(f"{nwo}#{n} OPEN {head}\n")
+    (run / "pr-created").touch()
+    print(f"https://github.com/{nwo}/pull/{n}")
+elif cmd == "repo view":
+    nwo = read("repo", "acme/widget")
+    vis = read("visibility", "PUBLIC")
+    rec = {"name": nwo.split("/")[1], "owner": {"login": nwo.split("/")[0]},
+           "nameWithOwner": nwo, "visibility": vis, "isPrivate": vis != "PUBLIC",
+           "defaultBranchRef": {"name": read("default-branch", "main")}}
+    emit(rec)
 elif args[:1] == ["api"]:
     m = re.search(r"repos/([^/]+/[^/]+)/pulls/(\d+)", " ".join(args))
-    rec = record(m.group(1), int(m.group(2))) if m else None
+    rec = record(f"{m.group(1)}#{m.group(2)}") if m else None
     if rec:
         print(json.dumps({"number": rec["number"], "state": "open" if rec["state"] == "OPEN" else "closed",
                           "merged": rec["state"] == "MERGED", "merged_at": rec["mergedAt"],
@@ -110,5 +148,7 @@ elif cmd == "auth status":
 elif cmd == "pr merge":
     print("merging is the user's click", file=sys.stderr)
     sys.exit(1)
+elif cmd == "run list":
+    print("[]")
 else:
     print("{}")
