@@ -11,8 +11,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 HOOK="$ROOT/hooks/ralph-loop-stop.sh"
 TMP=$(mktemp -d)
 # Isolate loop state: without this the suite writes its fake session into the
-# LIVE state dir, where a crash mid-run leaves a state file that stands the
-# definition-of-done gate down for a session id that never existed.
+# LIVE state dir, where a crash mid-run leaves a state file behind.
 export CLAUDE_RALPH_STATE_DIR="$TMP/state"
 source "$ROOT/scripts/ralph-loop-state.sh"
 STATE_DIR="$RALPH_STATE_DIR"

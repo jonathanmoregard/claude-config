@@ -89,10 +89,10 @@ text, such as "asked a question".
   `~/.ssh` hidden, and credential env vars (`SSH_AUTH_SOCK`, `GH_TOKEN`, …)
   scrubbed. Without `bwrap`, verdicts say `isolated_tmp: false`. Don't run
   concurrent batches that way.
-- Workspaces live under `/tmp`, where `finishing-up-arm.sh` deliberately
-  arms nothing, so the DoD informer never fires in e2e. A change to it needs
-  its own scenario rooted outside `/tmp`.
 - One user turn. A multi-turn history is described in the prompt, not
   replayed.
+- Sessions run with `--no-session-persistence`, so a hook reading
+  `transcript_path` sees no file. A scenario testing such a hook adds an
+  empty `persist-session` file to its directory.
 - Runs draw on the subscription quota, about $0.25–1 equivalent per run.
   `--budget` is a per-run truncation guard, not a bill.

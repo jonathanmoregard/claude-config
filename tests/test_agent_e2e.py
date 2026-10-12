@@ -67,7 +67,7 @@ def test_stage_from_git_ref(tmp_path):
     r = harness("stage", "--config", "HEAD", "--home", str(home))
     assert r.returncode == 0, r.stderr
     assert (home / ".claude/CLAUDE.md").is_file()
-    assert (home / ".claude/scripts/dod-check.py").is_file()
+    assert (home / ".claude/scripts/claude-worktree.sh").is_file()
 
 
 def _scenario(tmp_path, check_body: str) -> pathlib.Path:

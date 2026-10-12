@@ -266,16 +266,6 @@
         ]
       },
       {
-        "matcher": "Write|Edit|MultiEdit|NotebookEdit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash $HOME/.claude/hooks/finishing-up-arm.sh",
-            "timeout": 5
-          }
-        ]
-      },
-      {
         "hooks": [
           {
             "type": "command",
@@ -535,6 +525,26 @@
         "hooks": [
           {
             "type": "command",
+            "command": "python3 $HOME/.claude/hooks/pr-state-guard.py",
+            "timeout": 15,
+            "statusMessage": "Checking linked PR states..."
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/hooks/completion-check.py",
+            "timeout": 30,
+            "statusMessage": "Checking delivery state..."
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
             "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; python3 $HOME/.claude/self-compact-trigger.py",
             "timeout": 30
           }
@@ -594,16 +604,6 @@
       {
         "matcher": "",
         "hooks": [
-          {
-            "type": "command",
-            "command": "python3 $HOME/.claude/hooks/finishing-up-informer.py",
-            "timeout": 10
-          },
-          {
-            "type": "command",
-            "command": "python3 $HOME/.claude/hooks/finishing-up-task-scope.py",
-            "timeout": 5
-          },
           {
             "type": "command",
             "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; $HOME/.claude/fable-warn.sh"
