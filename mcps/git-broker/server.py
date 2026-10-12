@@ -296,12 +296,13 @@ _NETWORK_GIT_OPERATIONS = frozenset(
 _NETWORK_OPERATIONS = _NETWORK_GIT_OPERATIONS | _GH_OPERATIONS
 # Operations whose sandbox needs the current worktree writable.
 _READ_ONLY_WORKTREE_OPERATIONS = (
-    frozenset({"fetch", "worktree_add", "remote_branch_delete"}) | _GH_OPERATIONS
+    frozenset({"fetch", "worktree_add", "worktree_remove", "remote_branch_delete"})
+    | _GH_OPERATIONS
 )
 # Operations that need no current branch and change nothing local, so they
 # may run from a protected primary checkout.
 _PROTECTED_WORKTREE_OPERATIONS = (
-    frozenset({"status", "diff", "log", "fetch", "worktree_add"})
+    frozenset({"status", "diff", "log", "fetch", "worktree_add", "worktree_remove"})
     | (_GH_OPERATIONS - {"pr_create"})
 )
 _SEQUENCER_ACTIONS = {
@@ -895,14 +896,22 @@ def _validate_remote_url(url: object, policy: dict) -> str:
 
 
 def _github_repo_from_remote(url: object, policy: dict) -> str:
-    """Return owner/repository only after the origin URL passes policy."""
+    """Return host/owner/repository only after the origin URL passes policy.
+
+    The host is explicit so gh never falls back to its default host when the
+    policy allows more than github.com.
+    """
     remote = _validate_remote_url(url, policy)
     scp = re.fullmatch(
         r"git@([A-Za-z0-9.-]+):([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?)",
         remote,
     )
-    path = scp.group(2) if scp is not None else urlparse(remote).path.removeprefix("/")
-    return path.removesuffix(".git")
+    if scp is not None:
+        host, path = scp.group(1), scp.group(2)
+    else:
+        parsed = urlparse(remote)
+        host, path = parsed.hostname or "", parsed.path.removeprefix("/")
+    return f"{host.lower()}/{path.removesuffix('.git')}"
 
 
 def _fixed_git_config(policy: dict) -> list[str]:
@@ -1217,6 +1226,23 @@ def _build_gh_argv(
     return [gh, *subcommand[:2], "--repo", repository, *subcommand[2:]]
 
 
+def _open_bind_dir(path: Path) -> int:
+    """Open a directory without following symlinks and prove it is ``path``."""
+    try:
+        fd = os.open(path, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as exc:
+        raise RuntimeError(f"could not open sandbox target {path}: {exc}") from exc
+    try:
+        actual = os.readlink(f"/proc/self/fd/{fd}")
+    except OSError as exc:
+        os.close(fd)
+        raise RuntimeError(f"could not verify sandbox target {path}: {exc}") from exc
+    if actual != str(path):
+        os.close(fd)
+        raise RuntimeError(f"sandbox target {path} resolved to {actual}; refusing")
+    return fd
+
+
 def _sandbox_parent_dirs(path: Path, hidden_roots: tuple[Path, ...]) -> list[Path]:
     for root in hidden_roots:
         if path == root or root in path.parents:
@@ -1240,8 +1266,17 @@ def _build_git_sandbox(
     existing_only: bool = True,
     ssh_auth_sock: str | None = None,
     remote_url: str | None = None,
+    bind_fds: list[int] | None = None,
 ) -> tuple[list[str], dict[str, str]]:
-    """Build a bubblewrap command with only selected Git state writable."""
+    """Build a bubblewrap command with only selected Git state writable.
+
+    Directories the broker creates or removes for the caller (clone and
+    worktree targets) sit in trees the agent can write, so they are bound by
+    an O_NOFOLLOW descriptor verified to name the canonical path: swapping
+    the path for a symlink before bubblewrap starts cannot redirect the
+    writable mount. The descriptors are appended to ``bind_fds`` for the
+    caller to pass to the child and close.
+    """
     bwrap = _resolve_required_executable(policy, "bubblewrapExecutable")
     operation = request["operation"]
     networked = operation in _NETWORK_OPERATIONS
@@ -1275,9 +1310,10 @@ def _build_git_sandbox(
     )
 
     binds: list[tuple[str, Path]] = []
+    target_binds: list[Path] = []
     if operation == "clone":
         # The only writable path is the empty, broker-created clone target.
-        binds.append(("--bind", request["repo_path"]))
+        target_binds.append(request["repo_path"])
     else:
         if identity is None:
             raise RuntimeError(f"{operation} requires a discovered Git identity")
@@ -1290,7 +1326,7 @@ def _build_git_sandbox(
         if not _path_within(identity.git_dir, (identity.common_dir,)):
             binds.append((metadata_mode, identity.git_dir))
     if operation in {"worktree_add", "worktree_remove"}:
-        binds.append(("--bind", request["worktree_path"]))
+        target_binds.append(request["worktree_path"])
     trusted_hooks: Path = policy["trustedHooksDir"]
     if existing_only and (not trusted_hooks.is_dir() or trusted_hooks.is_symlink()):
         raise RuntimeError(
@@ -1363,7 +1399,7 @@ def _build_git_sandbox(
             env["SSH_AUTH_SOCK"] = str(socket_path)
 
     seen_dirs: set[Path] = set()
-    for _mode, path in binds:
+    for _mode, path in [*binds, *(("--bind", target) for target in target_binds)]:
         for parent in _sandbox_parent_dirs(path, hidden_roots):
             if parent not in seen_dirs:
                 argv.extend(("--dir", str(parent)))
@@ -1375,6 +1411,15 @@ def _build_git_sandbox(
             continue
         argv.extend((mode, str(path), str(path)))
         seen_binds.add(entry)
+    for target in target_binds:
+        if not existing_only:
+            argv.extend(("--bind", str(target), str(target)))
+            continue
+        if bind_fds is None:
+            raise RuntimeError("BROKEN safety boundary: target bind needs a descriptor sink")
+        fd = _open_bind_dir(target)
+        bind_fds.append(fd)
+        argv.extend(("--bind-fd", str(fd), str(target)))
     # A repository's local config can name arbitrary filter/diff commands and
     # URL rewrites. Overlay it only inside the sandbox after mounting Git
     # metadata, so structured operations cannot become arbitrary execution or
@@ -1526,9 +1571,10 @@ def _dcg_command_for_git_request(request: dict) -> str:
     return shlex.join(argv)
 
 
-def _prepare_worktree_target(request: dict) -> Path | None:
+def _prepare_worktree_target(request: dict, policy: dict) -> Path | None:
     if request["operation"] != "worktree_add":
         return None
+    _reject_nested_target(request["worktree_path"], policy["worktreeCreationRoots"], policy)
     return _create_empty_target(request["worktree_path"], "worktree_path")
 
 
@@ -1540,6 +1586,7 @@ def _prepare_clone_target(request: dict, policy: dict) -> Path:
         or target in policy["protectedWorktrees"]
     ):
         raise RuntimeError("clone repo_path must be a new directory below an approved repository root")
+    _reject_nested_target(target, policy["repositoryRoots"], policy)
     return _create_empty_target(target, "repo_path")
 
 
@@ -1617,6 +1664,17 @@ def _set_upstream(identity: _GitIdentity, branch: str | None, policy: dict) -> s
                 + (proc.stderr or "git config failed").strip()[:300]
             )
     return f"[git-broker] upstream set: {branch} -> origin/{branch}"
+
+
+def _reject_nested_target(target: Path, roots: tuple[Path, ...], policy: dict) -> None:
+    """A new checkout must not land inside Git metadata or another checkout."""
+    if ".git" in target.parts or _path_within(target, policy["protectedWorktrees"]):
+        raise RuntimeError("target must not be inside Git metadata or a protected worktree")
+    for ancestor in target.parents:
+        if ancestor in roots or not _path_within(ancestor, roots):
+            break
+        if (ancestor / ".git").exists() or (ancestor / ".git").is_symlink():
+            raise RuntimeError(f"target must not be nested inside the repository at {ancestor}")
 
 
 def _create_empty_target(target: Path, field: str) -> Path:
@@ -2290,6 +2348,7 @@ def _run_argv(
     env: dict[str, str],
     timeout_ms: int,
     rec: Optional[_InFlight] = None,
+    pass_fds: tuple[int, ...] = (),
 ) -> tuple[int, str, str]:
     """Run a prevalidated argv directly; never invoke a shell."""
     timeout_s = max(1, timeout_ms) / 1000.0
@@ -2301,6 +2360,7 @@ def _run_argv(
         text=True,
         env=env,
         start_new_session=True,
+        pass_fds=pass_fds,
     )
     try:
         pgid = os.getpgid(proc.pid)
@@ -2529,6 +2589,7 @@ TOOLS = [
                     "type": "integer",
                     "minimum": 1,
                     "maximum": MAX_TIMEOUT_MS,
+                    "description": "Milliseconds (not seconds); default 120000",
                 },
             },
             "required": ["repo_path", "operation"],
@@ -2695,7 +2756,7 @@ def _tool_git(args: dict, rec: Optional[_InFlight] = None) -> str:
     operation = request["operation"]
     if operation == "clone":
         identity = None
-        remote_url, current_branch = None, None
+        remote_url, current_branch = request["url"], None
     else:
         identity = _discover_git_identity(request["repo_path"], policy)
         _authorize_git_operation(identity, operation, policy)
@@ -2712,8 +2773,9 @@ def _tool_git(args: dict, rec: Optional[_InFlight] = None) -> str:
     if operation == "clone":
         created_target = _prepare_clone_target(request, policy)
     else:
-        created_target = _prepare_worktree_target(request)
+        created_target = _prepare_worktree_target(request, policy)
     completed = False
+    bind_fds: list[int] = []
     try:
         if operation in _GH_OPERATIONS:
             git_argv = _build_gh_argv(
@@ -2736,9 +2798,10 @@ def _tool_git(args: dict, rec: Optional[_InFlight] = None) -> str:
             policy,
             git_argv,
             remote_url=remote_url,
+            bind_fds=bind_fds,
         )
         rc, stdout, stderr = _run_argv(
-            sandbox_argv, env, request["timeout"], rec
+            sandbox_argv, env, request["timeout"], rec, pass_fds=tuple(bind_fds)
         )
         if operation == "worktree_remove":
             rc, stderr = _finish_worktree_remove(identity, request["worktree_path"], policy, rc, stderr)
@@ -2747,6 +2810,8 @@ def _tool_git(args: dict, rec: Optional[_InFlight] = None) -> str:
             stderr = (stderr + "\n" + _set_upstream(identity, current_branch, policy)).strip()
         return _compose_output(rc, stdout, stderr)
     finally:
+        for fd in bind_fds:
+            os.close(fd)
         if created_target is not None and not completed:
             try:
                 created_target.rmdir()

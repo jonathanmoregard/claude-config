@@ -644,7 +644,7 @@ class GitArgvTests(unittest.TestCase):
                 "pr",
                 "create",
                 "--repo",
-                "owner/project",
+                "github.com/owner/project",
                 "--base",
                 "master",
                 "--head",
@@ -665,7 +665,7 @@ class GitArgvTests(unittest.TestCase):
             with self.subTest(remote=remote):
                 self.assertEqual(
                     self.server._github_repo_from_remote(remote, self.policy),
-                    "owner/project",
+                    "github.com/owner/project",
                 )
 
     def test_remote_url_validator_accepts_only_pinned_github_shapes(self) -> None:
@@ -980,6 +980,7 @@ class ToolExecutionTests(unittest.TestCase):
             {"HOME": "/home/jonathan"},
             120000,
             None,
+            pass_fds=(),
         )
 
     def test_pr_create_resolves_origin_and_branch_then_runs_fixed_gh(self) -> None:
@@ -1040,6 +1041,7 @@ class ToolExecutionTests(unittest.TestCase):
             {"HOME": "/home/jonathan", "GH_PROMPT_DISABLED": "1"},
             120000,
             None,
+            pass_fds=(),
         )
 
     def test_dcg_receives_real_git_subcommand_not_broker_operation_name(self) -> None:
@@ -1160,7 +1162,8 @@ class ToolExecutionTests(unittest.TestCase):
                 ),
             ):
                 self.server._prepare_worktree_target(
-                    {"operation": "worktree_add", "worktree_path": target}
+                    {"operation": "worktree_add", "worktree_path": target},
+                    self.server._load_git_policy({"gitBroker": valid_policy()}),
                 )
 
 
@@ -1451,11 +1454,11 @@ class ParityOperationSchemaTests(unittest.TestCase):
             Path("/home/jonathan/.claude/.git"),
             False,
         )
-        for operation in ("pr_view", "pr_comment", "issue_list", "run_view"):
+        for operation in ("pr_view", "pr_comment", "issue_list", "run_view", "worktree_remove"):
             self.server._authorize_git_operation(identity, operation, self.policy)
         for operation in (
             "stash", "reset", "rebase", "merge", "cherry_pick", "tag", "pull",
-            "remote_branch_delete", "unstage", "worktree_remove", "pr_create",
+            "remote_branch_delete", "unstage", "pr_create",
         ):
             with self.subTest(operation=operation), self.assertRaisesRegex(
                 RuntimeError, "protected primary"
@@ -1554,21 +1557,21 @@ class ParityOperationArgvTests(unittest.TestCase):
 
     def test_github_argv_pins_origin_repository(self) -> None:
         cases = [
-            (("pr_view", {"number": 7, "comments": True}), ["pr", "view", "--repo", "owner/project", "7", "--comments"]),
+            (("pr_view", {"number": 7, "comments": True}), ["pr", "view", "--repo", "github.com/owner/project", "7", "--comments"]),
             (("pr_list", {"state": "all", "limit": 5, "head": "feat/x"}),
-             ["pr", "list", "--repo", "owner/project", "--state", "all", "--limit", "5", "--head", "feat/x"]),
-            (("pr_diff", {"number": 7}), ["pr", "diff", "--repo", "owner/project", "7"]),
-            (("pr_checks", {"number": 7}), ["pr", "checks", "--repo", "owner/project", "7"]),
-            (("pr_comment", {"number": 7, "body": "b"}), ["pr", "comment", "--repo", "owner/project", "7", "--body", "b"]),
-            (("pr_edit", {"number": 7, "title": "t"}), ["pr", "edit", "--repo", "owner/project", "7", "--title", "t"]),
-            (("pr_close", {"number": 7}), ["pr", "close", "--repo", "owner/project", "7"]),
-            (("pr_reopen", {"number": 7}), ["pr", "reopen", "--repo", "owner/project", "7"]),
-            (("issue_view", {"number": 3}), ["issue", "view", "--repo", "owner/project", "3"]),
-            (("issue_list", {}), ["issue", "list", "--repo", "owner/project", "--state", "open", "--limit", "30"]),
-            (("issue_comment", {"number": 3, "body": "b"}), ["issue", "comment", "--repo", "owner/project", "3", "--body", "b"]),
-            (("issue_create", {"title": "t", "body": "b"}), ["issue", "create", "--repo", "owner/project", "--title", "t", "--body", "b"]),
-            (("run_list", {"head": "feat/x"}), ["run", "list", "--repo", "owner/project", "--limit", "20", "--branch", "feat/x"]),
-            (("run_view", {"run_id": 99, "log_failed": True}), ["run", "view", "--repo", "owner/project", "99", "--log-failed"]),
+             ["pr", "list", "--repo", "github.com/owner/project", "--state", "all", "--limit", "5", "--head", "feat/x"]),
+            (("pr_diff", {"number": 7}), ["pr", "diff", "--repo", "github.com/owner/project", "7"]),
+            (("pr_checks", {"number": 7}), ["pr", "checks", "--repo", "github.com/owner/project", "7"]),
+            (("pr_comment", {"number": 7, "body": "b"}), ["pr", "comment", "--repo", "github.com/owner/project", "7", "--body", "b"]),
+            (("pr_edit", {"number": 7, "title": "t"}), ["pr", "edit", "--repo", "github.com/owner/project", "7", "--title", "t"]),
+            (("pr_close", {"number": 7}), ["pr", "close", "--repo", "github.com/owner/project", "7"]),
+            (("pr_reopen", {"number": 7}), ["pr", "reopen", "--repo", "github.com/owner/project", "7"]),
+            (("issue_view", {"number": 3}), ["issue", "view", "--repo", "github.com/owner/project", "3"]),
+            (("issue_list", {}), ["issue", "list", "--repo", "github.com/owner/project", "--state", "open", "--limit", "30"]),
+            (("issue_comment", {"number": 3, "body": "b"}), ["issue", "comment", "--repo", "github.com/owner/project", "3", "--body", "b"]),
+            (("issue_create", {"title": "t", "body": "b"}), ["issue", "create", "--repo", "github.com/owner/project", "--title", "t", "--body", "b"]),
+            (("run_list", {"head": "feat/x"}), ["run", "list", "--repo", "github.com/owner/project", "--limit", "20", "--branch", "feat/x"]),
+            (("run_view", {"run_id": 99, "log_failed": True}), ["run", "view", "--repo", "github.com/owner/project", "99", "--log-failed"]),
         ]
         for (operation, fields), expected in cases:
             with self.subTest(operation=operation):
@@ -1648,6 +1651,77 @@ class ParityOperationArgvTests(unittest.TestCase):
                     self.server._dcg_command_for_git_request(request).endswith(expected)
                 )
 
+
+class CloneDispatchTests(unittest.TestCase):
+    def test_clone_reaches_sandbox_with_validated_url(self) -> None:
+        server = load_server()
+        target = Path("/home/jonathan/Repos") / f"git-broker-clone-{os.getpid()}"
+        self.addCleanup(lambda: target.rmdir() if target.exists() else None)
+        seen = {}
+
+        def fake_run(argv, env, timeout_ms, rec=None, pass_fds=()):
+            seen["argv"] = argv
+            seen["fds"] = pass_fds
+            fd = int(argv[argv.index("--bind-fd") + 1])
+            seen["fd_path"] = os.readlink(f"/proc/self/fd/{fd}")
+            return 0, "", ""
+
+        with (
+            mock.patch.object(server, "_check_denied_by_dcg", return_value=None),
+            mock.patch.object(server, "_run_argv", side_effect=fake_run),
+        ):
+            output = server._tool_git({
+                "repo_path": str(target),
+                "operation": "clone",
+                "url": "https://github.com/owner/project.git",
+            })
+        self.assertIn("--- exit 0 ---", output)
+        argv = seen["argv"]
+        self.assertIn("--share-net", argv)
+        self.assertEqual(argv[-2:], ["https://github.com/owner/project.git", str(target)])
+        self.assertNotIn("--bind", argv)
+        fd_index = argv.index("--bind-fd")
+        self.assertEqual(argv[fd_index + 2], str(target))
+        self.assertEqual(seen["fds"], (int(argv[fd_index + 1]),))
+        self.assertEqual(seen["fd_path"], str(target))
+
+class TargetContainmentTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server = load_server()
+        self.policy = self.server._load_git_policy({"gitBroker": valid_policy()})
+        self.temp = tempfile.TemporaryDirectory(
+            prefix="git-broker-target-", dir="/home/jonathan/worktrees"
+        )
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def test_targets_inside_git_metadata_or_another_checkout_are_refused(self) -> None:
+        subprocess.run(["git", "init", "-q", str(self.root / "repo")], check=True)
+        for target in (
+            self.root / "repo" / "nested",
+            self.root / "repo" / ".git" / "worktrees" / "evil",
+            Path("/home/jonathan/Repos/klaffat/sub"),
+        ):
+            with self.subTest(target=target), self.assertRaises(RuntimeError):
+                self.server._prepare_worktree_target(
+                    {"operation": "worktree_add", "worktree_path": target}, self.policy
+                )
+            self.assertFalse(target.exists() and target.parent.name == "worktrees")
+
+    def test_bind_descriptor_refuses_a_symlink_swapped_target(self) -> None:
+        real = self.root / "real"
+        real.mkdir()
+        fd = self.server._open_bind_dir(real)
+        self.addCleanup(os.close, fd)
+        self.assertEqual(os.readlink(f"/proc/self/fd/{fd}"), str(real))
+        swapped = self.root / "swapped"
+        swapped.symlink_to(Path.home())
+        with self.assertRaisesRegex(RuntimeError, "could not open sandbox target"):
+            self.server._open_bind_dir(swapped)
+        (self.root / "dir-link").symlink_to(self.root)
+        via_link = self.root / "dir-link" / "real"
+        with self.assertRaisesRegex(RuntimeError, "resolved to"):
+            self.server._open_bind_dir(via_link)
 
 class BlackBoxParityTests(unittest.TestCase):
     """Real bubblewrap runs of the local operations added for Codex parity."""
