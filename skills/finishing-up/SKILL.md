@@ -14,6 +14,14 @@ exact merged revision is deployed and a deployed-path smoke check passed —
 or, for a repo with nothing to deploy, merged and the local default branch
 pulled.**
 
+The `completion-check` Stop hook re-measures, at every stop, each checkout this
+session committed, pushed or created a worktree in, and sends the turn back once
+naming what is still open: commits not pushed, a pushed branch without a PR
+(outside PR-gated repos), failing PR checks, a merged PR whose primary checkout
+is still on the branch or behind, a dirty worktree this session created. It is a
+backstop that catches the ladder half-climbed, not the ladder. When a gap must
+stay open (the user asked to hold it), say why in the reply.
+
 ## 1. Choose outcome
 
 | Outcome | Use when | Action |
