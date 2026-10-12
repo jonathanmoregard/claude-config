@@ -596,6 +596,7 @@ class GitArgvTests(unittest.TestCase):
         )
         self.assertIn("remote.origin.url=git@github.com:owner/project.git", argv)
         self.assertIn("remote.origin.pushurl=git@github.com:owner/project.git", argv)
+        self.assertIn("remote.origin.fetch=+refs/heads/*:refs/remotes/origin/*", argv)
         self.assertEqual(
             argv[-3:],
             [

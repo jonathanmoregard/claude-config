@@ -1024,6 +1024,10 @@ def _build_git_argv(
         _validate_remote_url(remote_url, policy)
         argv.extend(("-c", f"remote.origin.url={remote_url}"))
         argv.extend(("-c", f"remote.origin.pushurl={remote_url}"))
+        # The sandbox hides the repository config, so give origin its standard
+        # fetch refspec: push, pull and branch deletion then keep
+        # refs/remotes/origin/* in step, as they do for Claude's own git.
+        argv.extend(("-c", "remote.origin.fetch=+refs/heads/*:refs/remotes/origin/*"))
     if operation == "clone":
         url = _validate_remote_url(request["url"], policy)
         argv.extend(
