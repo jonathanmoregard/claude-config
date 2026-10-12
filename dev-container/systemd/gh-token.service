@@ -1,5 +1,9 @@
 [Unit]
-Description=Rotate GitHub App installation tokens for active Claude sandboxes
+Description=Rotate GitHub App installation tokens (host + active Claude sandboxes)
+
+# Mirror of the declarative unit in nixos-config home/claude-services.nix,
+# which also pins PATH (coreutils curl gnused jq openssl) and creates
+# ~/.cache/gh-tokens/host/scope via tmpfiles.
 
 [Service]
 Type=oneshot

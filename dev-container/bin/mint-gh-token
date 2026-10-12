@@ -1,14 +1,26 @@
 #!/usr/bin/env bash
-# Mint per-sandbox GitHub App installation tokens.
-# Walks TOKEN_ROOT/<sandbox-id>/repo_id, mints a token scoped to that repo,
-# atomically replaces TOKEN_ROOT/<sandbox-id>/token.
+# Mint GitHub App installation tokens.
+#
+# Per-sandbox mode: walks TOKEN_ROOT/<sandbox-id>/repo_id, mints a token scoped
+# to that one repo, atomically replaces TOKEN_ROOT/<sandbox-id>/token.
+#
+# Host mode: when TOKEN_ROOT/host/scope exists and reads `installation`, mints a
+# token for the whole installation (no repository_ids) into
+# TOKEN_ROOT/host/token (0600). The host `gh` wrapper and git credential helper
+# (nixos-config, home/gh-host-token.nix) read it, so agents on the laptop reach
+# GitHub as the App, never as the founder. `host` is reserved: it is never
+# treated as a sandbox dir, even if a repo_id appears in it.
 
 set -euo pipefail
 
 CONFIG="${GH_APP_CONFIG:-$HOME/.config/github-app/config}"
 [ -r "$CONFIG" ] || { echo "mint-gh-token: cannot read $CONFIG" >&2; exit 1; }
+# A TOKEN_ROOT set in the environment wins over the config file's, so a
+# scratch dir can be minted into without touching the live cache.
+env_token_root="${TOKEN_ROOT:-}"
 # shellcheck disable=SC1090
 . "$CONFIG"
+TOKEN_ROOT="${env_token_root:-${TOKEN_ROOT:-}}"
 
 : "${APP_ID:?APP_ID not set}"
 : "${INSTALLATION_ID:?INSTALLATION_ID not set}"
@@ -34,13 +46,10 @@ build_jwt() {
     printf '%s.%s' "$signing_input" "$sig"
 }
 
-mint_for_sandbox() {
-    local dir="$1" repo_id token_file tmp response token
-    [ -f "$dir/repo_id" ] || return 0
-    repo_id=$(cat "$dir/repo_id")
-    [ -n "$repo_id" ] || { echo "mint-gh-token: empty repo_id in $dir" >&2; return 0; }
-
-    local jwt auth_file
+# request_token <dir> <json-body>: ask GitHub for an installation access token
+# and print the raw JSON response on stdout. Failures go to stderr, <dir> named.
+request_token() {
+    local dir="$1" body="$2" jwt auth_file response rc
     jwt=$(build_jwt)
     auth_file=$(mktemp) && chmod 600 "$auth_file" || return 1
     printf 'Authorization: Bearer %s' "$jwt" > "$auth_file"
@@ -49,29 +58,66 @@ mint_for_sandbox() {
         -H "@$auth_file" \
         -H "Accept: application/vnd.github+json" \
         -H "X-GitHub-Api-Version: 2022-11-28" \
-        -d "{\"repository_ids\":[$repo_id]}" \
+        -d "$body" \
         "https://api.github.com/app/installations/$INSTALLATION_ID/access_tokens" 2>&1)
-    local rc=$?
+    rc=$?
     : > "$auth_file"
     rm -f "$auth_file"
     if [ $rc -ne 0 ]; then
         echo "mint-gh-token: curl failed for $dir: $response" >&2
         return 1
     fi
+    printf '%s' "$response"
+}
 
+# write_token <dir> <response>: extract .token and atomically replace
+# <dir>/token with it, mode 0600.
+write_token() {
+    local dir="$1" response="$2" token
     token=$(printf '%s' "$response" | jq -r '.token // empty')
     [ -n "$token" ] || { echo "mint-gh-token: no token in response for $dir: $response" >&2; return 1; }
+    ( umask 077; printf '%s' "$token" > "$dir/token.new" )
+    mv "$dir/token.new" "$dir/token"
+}
 
-    tmp="$dir/token.new"
-    token_file="$dir/token"
-    ( umask 077; printf '%s' "$token" > "$tmp" )
-    mv "$tmp" "$token_file"
+mint_for_sandbox() {
+    local dir="$1" repo_id response
+    [ -f "$dir/repo_id" ] || return 0
+    repo_id=$(cat "$dir/repo_id")
+    [ -n "$repo_id" ] || { echo "mint-gh-token: empty repo_id in $dir" >&2; return 0; }
+
+    response=$(request_token "$dir" "{\"repository_ids\":[$repo_id]}") || return 1
+    write_token "$dir" "$response"
+}
+
+# Host token: the whole installation, no repository_ids. Logs what the App can
+# do (repository_selection + permissions, never the token) on every tick, so
+# the journal shows the App's reach without anyone reading the token.
+mint_for_host() {
+    local dir="$1" scope response
+    [ -f "$dir/scope" ] || return 0
+    scope=$(tr -d '[:space:]' < "$dir/scope")
+    if [ "$scope" != "installation" ]; then
+        echo "mint-gh-token: $dir/scope is '$scope', expected 'installation'; host token not minted" >&2
+        return 1
+    fi
+
+    response=$(request_token "$dir" '{}') || return 1
+    write_token "$dir" "$response" || return 1
+    printf '%s' "$response" \
+        | jq -c '{host_token: "minted", expires_at, repository_selection, permissions}' \
+        | sed 's/^/mint-gh-token: /'
 }
 
 mkdir -p "$TOKEN_ROOT"
 shopt -s nullglob
 exit_code=0
 for dir in "$TOKEN_ROOT"/*/; do
-    mint_for_sandbox "${dir%/}" || exit_code=1
+    dir="${dir%/}"
+    [ "${dir##*/}" = host ] && continue
+    mint_for_sandbox "$dir" || exit_code=1
 done
+if [ -d "$TOKEN_ROOT/host" ]; then
+    mint_for_host "$TOKEN_ROOT/host" || exit_code=1
+fi
 exit "$exit_code"

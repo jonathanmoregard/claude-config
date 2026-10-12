@@ -104,10 +104,9 @@ _GIT_POLICY_KEYS = frozenset(
         "bubblewrapExecutable",
         "validatorExecutable",
         "credentialHelperExecutable",
-        "githubConfigDir",
+        "githubHostTokenDir",
         "sshKnownHostsFile",
         "trustedHooksDir",
-        "userBusSocket",
         "commitUserName",
         "commitUserEmail",
         "discoveryTimeoutMs",
@@ -192,10 +191,9 @@ def _load_git_policy(config: dict) -> dict:
         if not isinstance(raw[key], str) or not raw[key]:
             raise RuntimeError(f"git-broker gitBroker {key} must be a non-empty string")
     for key in (
-        "githubConfigDir",
+        "githubHostTokenDir",
         "sshKnownHostsFile",
         "trustedHooksDir",
-        "userBusSocket",
     ):
         value = raw[key]
         # "%t" (systemd's runtime-dir specifier) as the first path component
@@ -927,8 +925,13 @@ def _build_git_sandbox(
         _validate_remote_url(remote_url, policy)
         uses_github_api = request["operation"] == "pr_create"
         is_https = remote_url.startswith("https://")
+        # GitHub over HTTPS and the GitHub API authenticate only with the
+        # GitHub App host token: credentialHelperExecutable is the host gh
+        # wrapper, which reads $HOME/.cache/gh-tokens/host/token and fails
+        # closed without it. Neither gh's config nor the user bus (Secret
+        # Service, where the founder's keyring credential lives) is mounted.
         credential_paths = (
-            (policy["githubConfigDir"], policy["userBusSocket"])
+            (policy["githubHostTokenDir"],)
             if is_https or uses_github_api
             else (policy["sshKnownHostsFile"],)
         )
@@ -939,9 +942,6 @@ def _build_git_sandbox(
                 )
             binds.append(("--ro-bind", path))
         if is_https or uses_github_api:
-            env["DBUS_SESSION_BUS_ADDRESS"] = (
-                "unix:path=" + str(policy["userBusSocket"])
-            )
             if uses_github_api:
                 env["GH_PROMPT_DISABLED"] = "1"
                 env["GH_NO_UPDATE_NOTIFIER"] = "1"
