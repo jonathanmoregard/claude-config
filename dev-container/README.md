@@ -76,10 +76,11 @@ directly.
 | Path | Content | Why outside `~/.claude/` |
 |------|---------|--------------------------|
 | `~/.config/github-app/app.pem` | GitHub App private key (0600) | Cryptographic secret; CC-denied via `Read(~/.config/github-app/**)` |
-| `~/.config/github-app/config` | `APP_ID` + `INSTALLATION_ID` | Identifying; CC-denied (same rule) |
+| `~/.config/github-app/config` | `APP_ID` + `INSTALLATION_ID` (personal installation), optional `ORG_INSTALLATIONS="<owner>=<installation id> ..."` | Identifying; CC-denied (same rule) |
 | `~/.config/claude-sandbox/trust/<sha256>` | Per-repo `host` vs `sandbox` mode (written by `shell/dispatch.zsh`) | Behavioral fingerprint; CC-denied via `Read(~/.config/claude-sandbox/**)` |
 | `~/.cache/gh-tokens/<project>/{repo_id,token}` | Per-sandbox installation token (≤60min TTL) | Runtime cache; mounted into containers read-only |
 | `~/.cache/gh-tokens/host/{scope,token}` | Whole-installation host token (≤60min TTL, 0600, dir 0700) read by the host `gh` wrapper and git credential helper | Runtime cache; `scope` is declared by nixos-config tmpfiles |
+| `~/.cache/gh-tokens/host/<owner>/token` | One whole-installation token per `ORG_INSTALLATIONS` entry (0600, dir 0700, owner lowercased) | Runtime cache; `host/klaffat` is declared by nixos-config tmpfiles |
 | `~/src/claude-code-devcontainer/` | ToB upstream `devc` template + helper | Upstream clone — see Phase 5 / pending discussion |
 
 ## Dispatch flow
@@ -111,19 +112,37 @@ installation token. Context and threat model: klaffat#165, 3a addendum.
   `journalctl --user -u gh-token.service` shows what the App can do. `host`
   is reserved: it is never minted as a sandbox dir, and `claude-sandbox`
   refuses a checkout named `host`.
+- **Multi-owner.** One App installation covers one owner, so a repo moved to
+  an organization needs that org's installation. `INSTALLATION_ID` stays the
+  personal one (`host/token`); each `owner=id` pair in `ORG_INSTALLATIONS`
+  (space-separated) is minted on the same tick into `host/<owner>/token` and
+  logged as `{"host_token":"minted","owner":"<owner>",...}`. Each
+  installation is minted independently: one failing does not stop the
+  others, and a malformed pair is named and skipped. No `ORG_INSTALLATIONS`
+  means personal only.
 - **`gh` wrapper** (nixos-config `home/gh-host-token.nix`, on PATH ahead of
   `/run/current-system/sw/bin/gh`). An explicit `GH_TOKEN`/`GITHUB_TOKEN`
-  passes through; otherwise the host token becomes `GH_TOKEN` for the real
-  `gh`, referenced by store path.
+  passes through. Otherwise it picks the owner from, first present wins,
+  `-R`/`--repo [HOST/]OWNER/NAME` (or `gh repo <sub> OWNER/NAME`), the
+  endpoint of `gh api [/]repos/OWNER/...` or `[/]orgs/OWNER...` (a
+  `{owner}` placeholder falls through), `gh repo list OWNER`, `GH_REPO`,
+  or the cwd repo's `remote.origin.url`; `host/<owner>/token` when that file
+  exists, else `host/token`, becomes `GH_TOKEN` for the real `gh`, referenced
+  by store path.
 - **`gh-app-credential`**, the git credential helper for
-  `https://github.com` (global git config and `ai-client-config-codex-sync`):
-  answers `get` with `username=x-access-token` + the host token; `store` and
-  `erase` are no-ops.
+  `https://github.com` (global git config and `ai-client-config-codex-sync`,
+  both with `credential.useHttpPath`): answers `get` with
+  `username=x-access-token` + the token of the owner in `path=OWNER/NAME.git`
+  (same file choice as the wrapper); `store` and `erase` are no-ops.
 - **git-broker** (`mcps/git-broker`, mirrored into Codex by the sync) runs the
   wrapper as `credentialHelperExecutable` and mounts only
-  `~/.cache/gh-tokens/host` into its sandbox. No gh config, no user bus.
+  `~/.cache/gh-tokens/host` (org subdirs included) into its sandbox. No gh
+  config, no user bus. Its `gh auth git-credential` picks the owner from the
+  worktree's origin (bwrap `--chdir`), and `pr_create` passes `--repo`.
 
-**Fail closed.** A missing, empty or stale (55 minutes or older) token makes
+**Fail closed.** A missing, empty or stale (55 minutes or older) token (the
+one picked for the owner; a stale org token never falls back to personal, only
+an absent org token file does) makes
 the wrapper and helper exit non-zero with one line naming
 `gh-token.service`, and the helper answers git with `quit=1` so no other
 credential is tried. There is no fallback to the keyring PAT. Repair:
@@ -140,6 +159,16 @@ switch only closes self-merge together with the approval ruleset.
 
 **Escape hatch** for the founder's own credential work (e.g. `gh auth logout`
 of the old PAT): the unwrapped `/run/current-system/sw/bin/gh`.
+
+**Follow-up, not done: sandbox mode is personal-only.** Multi-owner covers
+the host token only. `claude-sandbox` looks the repo up with a broad token
+from `INSTALLATION_ID`, and `mint_for_sandbox` mints every sandbox token
+from `INSTALLATION_ID`. Once `klaffat/klaffat` lives under the org
+installation, `claude-sandbox` for it fails with "not in this App
+installation's allowlist". The fix: `claude-sandbox` picks the installation
+by OWNER from `ORG_INSTALLATIONS` and records it as
+`TOKEN_ROOT/<sandbox>/installation_id`, and `mint_for_sandbox` passes it to
+`request_token` (which already takes an installation id).
 
 ### Switchover order
 
