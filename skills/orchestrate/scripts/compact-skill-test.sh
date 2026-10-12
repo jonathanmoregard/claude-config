@@ -23,7 +23,7 @@ required=(
   "visual-verify"
   "advice-refine-test-loop once"
   "finishing-up"
-  "dod-check.py"
+  "readiness checks"
   "durable follow-up"
   "ralph-loop-cancel.sh"
   "Use judgment"

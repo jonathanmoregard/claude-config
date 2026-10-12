@@ -89,9 +89,6 @@ text, such as "asked a question".
   `~/.ssh` hidden, and credential env vars (`SSH_AUTH_SOCK`, `GH_TOKEN`, …)
   scrubbed. Without `bwrap`, verdicts say `isolated_tmp: false`. Don't run
   concurrent batches that way.
-- Workspaces live under `/tmp`, where `finishing-up-arm.sh` deliberately
-  arms nothing, so the DoD informer never fires in e2e. A change to it needs
-  its own scenario rooted outside `/tmp`.
 - One user turn. A multi-turn history is described in the prompt, not
   replayed.
 - Runs draw on the subscription quota, about $0.25–1 equivalent per run.

@@ -35,6 +35,8 @@ gh pr list --repo <owner>/<repo> --state all \
 
 `--state open` is the default and it silently hides exactly the PR you are about to misreport.
 
+The `pr-state-guard` Stop hook queries every PR linked in a final reply and sends the reply back when it presents a MERGED or CLOSED PR as open or awaiting action. It is a backstop that fires after the mistake is written; the query above is what prevents it.
+
 ## The UNKNOWN Trap
 
 `mergeable` / `mergeStateStatus` return `UNKNOWN` for **two unrelated reasons**:

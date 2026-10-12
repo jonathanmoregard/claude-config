@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""Stub `gh` answering PR state from $E2E_RUN/pr-states.
+
+Each line of pr-states is `<owner>/<repo>#<n> <OPEN|MERGED|CLOSED>`. Every call
+is logged to $E2E_RUN/gh.log. Covers what an agent (or a hook) asks about a
+PR's state: `pr view`, `pr list`, `pr checks`, `api repos/.../pulls/<n>`.
+"""
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+
+run = pathlib.Path(os.environ["E2E_RUN"])
+args = sys.argv[1:]
+with open(run / "gh.log", "a") as f:
+    f.write(" ".join(args) + "\n")
+
+prs = {}
+for line in (run / "pr-states").read_text().splitlines():
+    if line.strip():
+        key, state = line.split()
+        prs[key.lower()] = state
+
+
+def opt(*names):
+    for i, a in enumerate(args):
+        for n in names:
+            if a == n and i + 1 < len(args):
+                return args[i + 1]
+            if a.startswith(n + "="):
+                return a.split("=", 1)[1]
+    return None
+
+
+def record(nwo, n):
+    state = prs.get(f"{nwo}#{n}".lower())
+    if state is None:
+        return None
+    t = "2026-10-12T08:07:39Z"
+    return {
+        "number": n, "url": f"https://github.com/{nwo}/pull/{n}", "title": f"PR {n}",
+        "state": state, "isDraft": False,
+        "mergedAt": t if state == "MERGED" else None,
+        "closedAt": t if state != "OPEN" else None,
+        "mergedBy": {"login": "jonathanmoregard"} if state == "MERGED" else None,
+        "mergeable": "MERGEABLE" if state == "OPEN" else "UNKNOWN",
+        "mergeStateStatus": "CLEAN" if state == "OPEN" else "UNKNOWN",
+        "reviewDecision": "", "autoMergeRequest": None, "headRefOid": "a" * 40,
+        "mergeCommit": {"oid": "b" * 40} if state == "MERGED" else None,
+        "statusCheckRollup": [{"name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"}],
+    }
+
+
+def emit(obj):
+    fields = opt("--json")
+    if fields and isinstance(obj, dict):
+        obj = {k: obj.get(k) for k in fields.split(",")}
+    elif fields:
+        obj = [{k: o.get(k) for k in fields.split(",")} for o in obj]
+    text = json.dumps(obj)
+    jq = opt("-q", "--jq")
+    if jq:
+        text = subprocess.run(["jq", "-r", jq], input=text, capture_output=True, text=True).stdout
+    print(text.rstrip("\n"))
+
+
+def target():
+    """(nwo, n) for `pr view|checks <n|url> [-R nwo]`."""
+    ref = args[2] if len(args) > 2 and not args[2].startswith("-") else ""
+    m = re.match(r"https://github\.com/([^/]+/[^/]+)/pull/(\d+)", ref)
+    if m:
+        return m.group(1), int(m.group(2))
+    nwo = opt("-R", "--repo")
+    if ref.isdigit() and nwo:
+        return nwo, int(ref)
+    return None, None
+
+
+cmd = " ".join(args[:2])
+if cmd in ("pr view", "pr checks"):
+    nwo, n = target()
+    rec = record(nwo, n) if nwo else None
+    if rec is None:
+        print("GraphQL: Could not resolve to a PullRequest", file=sys.stderr)
+        sys.exit(1)
+    if cmd == "pr checks":
+        print("ci\tpass\t1m\thttps://github.com/%s/actions/runs/1" % nwo)
+    else:
+        emit(rec)
+elif cmd == "pr list":
+    nwo = opt("-R", "--repo")
+    want = (opt("--state", "-s") or "open").upper()
+    out = [record(k.split("#")[0], int(k.split("#")[1])) for k in prs
+           if not nwo or k.startswith(nwo.lower() + "#")]
+    out = [o for o in out if want == "ALL" or o["state"] == want]
+    emit(out)
+elif args[:1] == ["api"]:
+    m = re.search(r"repos/([^/]+/[^/]+)/pulls/(\d+)", " ".join(args))
+    rec = record(m.group(1), int(m.group(2))) if m else None
+    if rec:
+        print(json.dumps({"number": rec["number"], "state": "open" if rec["state"] == "OPEN" else "closed",
+                          "merged": rec["state"] == "MERGED", "merged_at": rec["mergedAt"],
+                          "html_url": rec["url"]}))
+    else:
+        print("{}")
+elif cmd == "auth status":
+    print("github.com: Logged in to github.com account e2e")
+elif cmd == "pr merge":
+    print("merging is the user's click", file=sys.stderr)
+    sys.exit(1)
+else:
+    print("{}")

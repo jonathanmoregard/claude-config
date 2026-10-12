@@ -23,12 +23,8 @@
 # migration that moved the writer and left four readers behind, so writer and
 # readers disagreed about where the state was and neither one errored.
 
-# CLAUDE_RALPH_STATE_DIR overrides the location. Two reasons, neither cosmetic:
-# a test must not write into the live loop directory, and there is now a reader
-# that CANNOT source this file — finishing-up-gate.py, which yields when a ralph
-# loop owns the session. Python cannot source bash, so that reader agrees with
-# this one by sharing the ENV VAR rather than by copying the literal path. If
-# this default ever moves, change it here and the Python reader keeps working.
+# CLAUDE_RALPH_STATE_DIR overrides the location, so a test never writes into
+# the live loop directory.
 RALPH_STATE_DIR="${CLAUDE_RALPH_STATE_DIR:-$HOME/.local/state/claude-ralph-loop}"
 
 # Absolute path of the state file for a session id. The CALLER validates the id
