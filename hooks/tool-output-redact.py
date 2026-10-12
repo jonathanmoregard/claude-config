@@ -16,6 +16,7 @@ Invariants:
 - Fail closed. A scanner fault WITHHOLDS: every string becomes a notice except
   identifier-like ones (letters and ``_./:+-`` only, at most 64 characters:
   the enum, MIME-type and path slots a schema may pin), which keep their value.
+  Non-identifier keys are renamed and anything past MAX_DEPTH levels is dropped.
 - No shape to withhold into (unparseable stdin, a module that cannot load) ->
   exit 2, the status whose stderr reaches the model.
 - Scanning and applying findings both end by the hook's own deadline (gitleaks'
@@ -74,10 +75,17 @@ def _on_deadline(signum, frame) -> NoReturn:  # noqa: ARG001
 
 
 def _withheld(response, detail: str, map_strings):
-    """``response`` with every non-identifier string replaced: the first by the
-    notice, the rest by a pointer to it."""
+    """``response`` with every non-identifier string replaced (the first by the notice, the
+    rest by a pointer to it), every non-identifier key renamed, and anything nested past
+    MAX_DEPTH replaced by a pointer."""
     notices = itertools.chain([_withheld_text(detail)], itertools.repeat(_SHORT_WITHHELD))
-    updated = map_strings(response, lambda s: s if not s or _IDENTIFIER_RE.fullmatch(s) else next(notices))
+    fields = itertools.count(1)
+    updated = map_strings(
+        response,
+        lambda s: s if not s or _IDENTIFIER_RE.fullmatch(s) else next(notices),
+        keys=lambda k: k if _IDENTIFIER_RE.fullmatch(k) else f"[{HOOK_NAME}: withheld field {next(fields)}]",
+        too_deep=lambda: next(notices),
+    )
     if updated == response:  # nothing that could hold a secret: nothing to hold back
         _not_inspected(detail)
     return updated

@@ -1256,7 +1256,8 @@ for _kind in ("OPENSSH", "RSA", "EC", "DSA", "ENCRYPTED", "", "PGP"):
 
 _body, raw = guarded(_fake_key("OPENSSH", terminated=False) + "\n[output truncated]")
 check("an UNTERMINATED private key loses its body", _TRACER not in raw and _PEM_BODY not in raw, raw[:240])
-check("and keeps the truncation marker after it", _body.endswith("[output truncated]"), _body[-80:])
+check("and is redacted to the end of the output (no END: nothing after BEGIN is known not to be key)",
+      _body.endswith("chars]") and "[output truncated]" not in _body, _body[-80:])
 
 _after = "ordinary trailing output line\n"
 _body, raw = guarded(_fake_key("RSA") + _after)
@@ -1878,8 +1879,25 @@ check("a Withhold escaping main() exits 0", rc == 0, f"rc={rc} {err[-200:]}")
 check_withheld("a Withhold escaping main()", parsed, updated)
 check_applied("a Withhold escaping main()", updated)
 
-# A deeply nested field is walked all the way down and redacted in place,
-# not cut off: json.loads already bounds the depth.
+# Past MAX_DEPTH levels nothing is walked: the result is withheld.
+_deep_s = secret("D")
+_deep = f"KEY={_deep_s}"
+for _ in range(sr.MAX_DEPTH + 1):
+    _deep = [_deep]
+parsed, updated, raw = bash_out("cat /tmp/x", response_obj("ok\n", extraField=_deep))
+check_withheld(f"a secret {sr.MAX_DEPTH + 2} levels down", parsed, updated)
+check(f"a secret {sr.MAX_DEPTH + 2} levels down is not emitted", _deep_s not in raw, raw[:200])
+
+# A secret used as a key, nested or at the top: withheld, and the withhold
+# copies no unknown top-level field (it would carry the key along).
+for _label, _resp in (("nested", lambda k: response_obj("ok\n", extraField={k: 1})),
+                      ("top-level", lambda k: dict(response_obj("ok\n"), **{k: True}))):
+    _key_s = secret("K")
+    parsed, updated, raw = bash_out("cat /tmp/x", _resp(_key_s))
+    check_withheld(f"a secret as a {_label} key", parsed, updated)
+    check(f"a secret as a {_label} key is not emitted", _key_s not in raw, raw[:200])
+
+# A field nested within MAX_DEPTH is walked all the way down and redacted in place.
 _deep_s = secret("O")
 _deep: object = f"KEY={_deep_s}"
 for _ in range(14):

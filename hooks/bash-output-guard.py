@@ -508,10 +508,12 @@ def _withheld_result(detail: str, response) -> dict:
     replacement: dict = {}
     if isinstance(response, dict):
         sizes = {size for _, size in OUTPUT_POINTER_FIELDS if size}
+        known = REQUIRED_RESULT_FIELDS.keys() | OPTIONAL_RESULT_FIELDS.keys()
         replacement = {
             k: v
             for k, v in response.items()
-            if v is not None
+            if k in known  # an unknown key could itself be the secret
+            and v is not None
             and not isinstance(v, (str, dict, list))
             and k not in sizes
         }

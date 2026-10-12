@@ -130,6 +130,19 @@ found = scan([text])[0]
 redacted = gd.redact(text, found, lambda rule, n: f"<{rule}>")
 check(f"a {len(key) // 1000} KB key across two piece boundaries: no body line survives",
       not any(line in redacted for line in key_lines) and "trailing prose" in redacted, sorted(set(found.values())))
+# Longer than one piece's overlap: only the whole string sees BEGIN and END
+# together, so a block spanning 3+ pieces is redacted whole, and a BEGIN with
+# no END is redacted to the end of the text.
+key_lines = ["".join(secrets.choice(ALNUM + "+/") for _ in range(64)) for _ in range(3200)]
+big_key = "-----BEGIN PGP " + "PRIVATE KEY BLOCK-----\n" + "\n".join(key_lines) + "\n=Xy4Z\n-----END PGP " + "PRIVATE KEY BLOCK-----"
+for label, text, tail in (
+        (f"a {len(big_key) // 1000} KB block across {len(gd.pieces(big_key.encode()))} pieces",
+         "x" * 10_000 + "\n" + big_key + "\ntrailing prose\n", "\ntrailing prose\n"),
+        ("a 150 KB BEGIN with no END", "head\n" + big_key[:150_000], "")):
+    redacted = gd.redact(text, scan([text])[0], lambda rule, n: f"<{rule}>")
+    check(f"{label}: no body line survives, the text around it does",
+          not any(line in redacted for line in key_lines) and redacted.endswith(tail)
+          and redacted.startswith("x" * 100 if text.startswith("x") else "head\n"), redacted[-120:])
 tokens = [tok() for _ in range(12000)]
 t0 = time.monotonic()
 found = scan([" ".join(tokens)])[0]

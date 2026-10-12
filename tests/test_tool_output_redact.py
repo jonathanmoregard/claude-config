@@ -448,13 +448,27 @@ for label, env, want in (("gitleaks present", None, "[REDACTED:gitlab-pat:"),
     check(f"{label}: a token 41 levels down is not emitted, shape kept",
           r.rc == 0 and deep_tok not in r.stdout and want in r.stdout and same_shape(deep, r.updated),
           f"rc={r.rc} {r.stdout[:200]}")
-# Far past Python's default recursion limit, still inside what json.loads accepts.
+# Past MAX_DEPTH levels the result is not walked: it is withheld (fail closed),
+# whether gitleaks works or not, and however deep json.loads let it get.
+for depth in (sr.MAX_DEPTH + 1, 30_000):
+    for label, env in (("gitleaks present", None), ("gitleaks missing", NO_GITLEAKS)):
+        deep_tok = tok()
+        r = run_hook(None, env=env, raw_stdin='{"tool_name": "SomeTool", "tool_response": {"note": "free text", '
+                     '"deep": ' + "[" * depth + json.dumps(f"x {deep_tok}") + "]" * depth + "}}")
+        check(f"{label}: a {depth:,}-deep result is withheld (exit 0), not crashed on",
+              r.rc == 0 and deep_tok not in r.stdout and WITHHELD in r.stdout, f"rc={r.rc} {r.stderr[:200]}")
 deep_tok = tok()
 r = run_hook(None, raw_stdin='{"tool_name": "SomeTool", "tool_response": '
-             + "[" * 30000 + json.dumps(f"x {deep_tok}") + "]" * 30000 + "}")
-check("a 30,000-deep list with a token at the bottom: redacted (exit 0)",
-      r.rc == 0 and deep_tok not in r.stdout and "[REDACTED:gitlab-pat:" in r.stdout,
-      f"rc={r.rc} {r.stderr[:200]}")
+             + "[" * (sr.MAX_DEPTH - 1) + json.dumps(f"x {deep_tok}") + "]" * (sr.MAX_DEPTH - 1) + "}")
+check(f"a {sr.MAX_DEPTH - 1}-deep result is still redacted in place",
+      r.rc == 0 and deep_tok not in r.stdout and "[REDACTED:gitlab-pat:" in r.stdout, f"rc={r.rc}")
+
+# A secret used as a dict KEY: keys are not rewritten, so the output is withheld.
+for label, env in (("gitleaks present", None), ("gitleaks missing", NO_GITLEAKS)):
+    key_tok = tok()
+    r = run_hook(post("SomeTool", {"result": {key_tok: 1, "status": "ok"}, "note": "free text"}), env=env)
+    check(f"{label}: a token used as a dict key is withheld, never shown (exit 0)",
+          r.rc == 0 and key_tok not in r.stdout and WITHHELD in r.stdout, f"rc={r.rc} {r.stdout[:200]}")
 
 r = run_hook(post("Read", READ), script=sandbox(
     "broken-module", module_patch=(("import os\n", "import os\nraise ImportError('injected')\n"),)))
