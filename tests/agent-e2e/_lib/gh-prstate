@@ -33,7 +33,7 @@ states = run / "pr-states"
 prs = {}      # key -> (state, head)
 for line in (states.read_text().splitlines() if states.exists() else []):
     parts = line.split()
-    if parts:
+    if len(parts) >= 2:
         prs[parts[0].lower()] = (parts[1], parts[2] if len(parts) > 2 else "")
 
 
