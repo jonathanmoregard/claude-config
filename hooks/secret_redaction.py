@@ -8,7 +8,7 @@ pinned rules, called once per value.
 Invariants:
 - Any fault (the CLI missing, failing or timing out) raises ``ScanError``; callers
   WITHHOLD. There is no partial result.
-- A secret found in one string is redacted in every string of the value.
+- Each string is scanned and redacted on its own findings (the CLI's contract).
 - Binary payloads (image/PDF base64, MCP image data, blobs) are neither scanned nor changed.
 - Only string values change: the result has the input's exact shape. Dict keys are
   scanned but never rewritten: a secret in a key raises ScanError (the caller withholds).
