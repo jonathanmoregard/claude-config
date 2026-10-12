@@ -1,10 +1,13 @@
 [Unit]
-Description=Rotate GitHub App tokens every 50 minutes
+Description=Rotate GitHub App tokens every 20 minutes
 
+# Mirror of the declarative unit in nixos-config home/claude-services.nix,
+# which is what actually runs. Realtime (OnCalendar), not OnUnitActiveSec:
+# the monotonic clock stops during suspend and would leave the 60-minute host
+# token expired after resume.
 [Timer]
 OnBootSec=1min
-OnUnitActiveSec=50min
-Persistent=true
+OnCalendar=*:0/20
 
 [Install]
 WantedBy=timers.target

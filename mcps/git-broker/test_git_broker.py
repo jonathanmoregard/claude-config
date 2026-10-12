@@ -48,11 +48,10 @@ def valid_policy() -> dict:
         "gitExecutable": "git",
         "bubblewrapExecutable": "bwrap",
         "validatorExecutable": "dcg",
-        "credentialHelperExecutable": "/run/current-system/sw/bin/gh",
-        "githubConfigDir": "/home/jonathan/.config/gh",
+        "credentialHelperExecutable": "/etc/profiles/per-user/jonathan/bin/gh",
+        "githubHostTokenDir": "/home/jonathan/.cache/gh-tokens/host",
         "sshKnownHostsFile": "/home/jonathan/.ssh/known_hosts",
         "trustedHooksDir": "/home/jonathan/.config/git/hooks",
-        "userBusSocket": f"/run/user/{os.getuid()}/bus",
         "commitUserName": "jonathanmoregard",
         "commitUserEmail": "10191435+jonathanmoregard@users.noreply.github.com",
         "discoveryTimeoutMs": 5000,
@@ -128,18 +127,21 @@ class PolicySchemaTests(unittest.TestCase):
         )
         self.assertEqual(loaded["allowedRemoteHosts"], ("github.com",))
 
-    def test_user_bus_socket_expands_runtime_dir_token(self) -> None:
+    def test_policy_path_expands_runtime_dir_token(self) -> None:
         # %t is the caller's own runtime dir, derived from getuid() (not the
         # environment), so one config works on hosts where jonathan's uid differs.
         policy = valid_policy()
-        policy["userBusSocket"] = "%t/bus"
+        policy["githubHostTokenDir"] = "%t/gh-host-token"
         loaded = self.server._load_git_policy({"gitBroker": policy})
-        self.assertEqual(loaded["userBusSocket"], Path(f"/run/user/{os.getuid()}/bus"))
+        self.assertEqual(
+            loaded["githubHostTokenDir"],
+            Path(f"/run/user/{os.getuid()}/gh-host-token"),
+        )
 
     def test_runtime_dir_token_must_be_a_whole_path_component(self) -> None:
         policy = valid_policy()
-        policy["userBusSocket"] = "%tx/bus"
-        with self.assertRaisesRegex(RuntimeError, "userBusSocket"):
+        policy["githubHostTokenDir"] = "%tx/gh-host-token"
+        with self.assertRaisesRegex(RuntimeError, "githubHostTokenDir"):
             self.server._load_git_policy({"gitBroker": policy})
 
 
@@ -828,7 +830,7 @@ class ContainmentArgvTests(unittest.TestCase):
                     ["/nix/store/fake/bin/git", "status"],
                 )
 
-    def test_https_operation_mounts_only_github_keyring_inputs(self) -> None:
+    def test_https_operation_mounts_only_the_app_host_token(self) -> None:
         request = self.server._validate_git_request(
             {"repo_path": str(self.identity.worktree), "operation": "push"},
             self.policy,
@@ -842,21 +844,19 @@ class ContainmentArgvTests(unittest.TestCase):
             remote_url="https://github.com/owner/project.git",
         )
         self.assertIn("--share-net", argv)
-        for source in (
-            "/home/jonathan/.config/gh",
-            f"/run/user/{os.getuid()}/bus",
-        ):
-            with self.subTest(source=source):
-                self.assertTrue(
-                    any(
-                        argv[i : i + 3] == ["--ro-bind", source, source]
-                        for i in range(len(argv))
-                    )
-                )
-        self.assertNotIn("SSH_AUTH_SOCK", env)
-        self.assertEqual(
-            env["DBUS_SESSION_BUS_ADDRESS"], f"unix:path=/run/user/{os.getuid()}/bus"
+        source = "/home/jonathan/.cache/gh-tokens/host"
+        self.assertTrue(
+            any(
+                argv[i : i + 3] == ["--ro-bind", source, source]
+                for i in range(len(argv))
+            )
         )
+        # The founder's keyring credential must stay out of reach: no gh
+        # config, no user bus (Secret Service), no SSH agent.
+        self.assertNotIn("/home/jonathan/.config/gh", argv)
+        self.assertNotIn(f"/run/user/{os.getuid()}/bus", argv)
+        self.assertNotIn("SSH_AUTH_SOCK", env)
+        self.assertNotIn("DBUS_SESSION_BUS_ADDRESS", env)
 
     def test_ssh_operation_mounts_only_agent_and_known_hosts(self) -> None:
         request = self.server._validate_git_request(
@@ -902,7 +902,7 @@ class ContainmentArgvTests(unittest.TestCase):
             request,
             self.identity,
             self.policy,
-            ["/run/current-system/sw/bin/gh", "pr", "create"],
+            ["/etc/profiles/per-user/jonathan/bin/gh", "pr", "create"],
             existing_only=False,
             remote_url="git@github.com:owner/project.git",
         )
@@ -910,8 +910,7 @@ class ContainmentArgvTests(unittest.TestCase):
         for path in (
             self.identity.worktree,
             self.identity.common_dir,
-            Path("/home/jonathan/.config/gh"),
-            Path(f"/run/user/{os.getuid()}/bus"),
+            Path("/home/jonathan/.cache/gh-tokens/host"),
         ):
             with self.subTest(path=path):
                 self.assertTrue(
@@ -921,9 +920,8 @@ class ContainmentArgvTests(unittest.TestCase):
                     )
                 )
         self.assertNotIn("SSH_AUTH_SOCK", env)
-        self.assertEqual(
-            env["DBUS_SESSION_BUS_ADDRESS"], f"unix:path=/run/user/{os.getuid()}/bus"
-        )
+        self.assertNotIn("DBUS_SESSION_BUS_ADDRESS", env)
+        self.assertNotIn(f"/run/user/{os.getuid()}/bus", argv)
         self.assertEqual(env["GH_PROMPT_DISABLED"], "1")
 
 

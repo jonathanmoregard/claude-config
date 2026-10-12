@@ -58,6 +58,12 @@ NAME="${SLUG##*/}"
 # Project identifier used by devcontainer and by our token dir.
 # Must match ${localWorkspaceFolderBasename} — which is basename of REPO_PATH.
 PROJECT=$(basename "$REPO_PATH")
+# TOKEN_ROOT/host holds the whole-installation host token (mint-gh-token host
+# mode). A sandbox dir of that name would mount it into the container.
+if [ "$PROJECT" = host ]; then
+    echo "claude-sandbox: a repo checked out as '$REPO_PATH' would share the reserved token dir $TOKEN_ROOT/host; clone it under another directory name" >&2
+    exit 1
+fi
 SANDBOX_DIR="$TOKEN_ROOT/$PROJECT"
 
 b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
