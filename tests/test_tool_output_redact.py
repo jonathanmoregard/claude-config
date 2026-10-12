@@ -285,13 +285,14 @@ for label, make in (("on line 1", lambda e: f"blob: {e}\nnext line stays"),
           enc not in r.stdout and isinstance(r.updated, str) and "blob: [REDACTED:" in r.updated
           and r.updated.endswith("\nnext line stays"), r.stdout[:200])
 
-# A decoded finding next to another finding on the same line: both go, and no
-# run inside the first marker is taken for an encoded secret.
+# A decoded finding next to another finding on the same line: both go (as one
+# marker when their spans touch), and never a marker inside a marker.
 enc = base64.b64encode(f"user:{tok('github')}".encode()).decode()
-r = run_hook(post("mcp__x__y", f"Authorization: Basic {enc} {tok('gocspx')}"))
+gx = tok("gocspx")
+r = run_hook(post("mcp__x__y", f"Authorization: Basic {enc} {gx}"))
 check("a decoded run next to another finding: both redacted, no nested marker",
       isinstance(r.updated, str) and "[REDACTED:[REDACTED:" not in r.updated
-      and r.updated.count("[REDACTED:") == 2 and enc not in r.updated, r.stdout[:200])
+      and enc not in r.updated and gx not in r.updated, r.stdout[:200])
 
 # -------------------------------------------------------------------------
 section("large and odd inputs end to end")
