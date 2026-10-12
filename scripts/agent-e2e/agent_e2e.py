@@ -23,6 +23,8 @@ SCENARIO is a directory holding:
                 in $E2E_BIN shadow real tools (on PATH first); logs go to RUN,
                 or to $E2E_SHARED (RUN/shared at the top level) when a stub
                 may be called from a nested harness run.
+    persist-session  optional, empty: keep the session transcript (for hooks
+                that read `transcript_path`); default is --no-session-persistence
     check.sh    `check.sh RUN` grades one run: exit 0 PASS, 1 FAIL, anything
                 else INCONCLUSIVE. RUN holds final.txt (the agent's last message),
                 commands.txt (every Bash command the agent issued, one per
@@ -262,8 +264,12 @@ def run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
         return verdict
     prompt = (scenario / "prompt.md").read_text(encoding="utf-8")
     argv = [args.claude, "-p", prompt, "--output-format", "stream-json", "--verbose",
-            "--strict-mcp-config", "--no-session-persistence",
-            "--max-budget-usd", f"{args.budget:g}"]
+            "--strict-mcp-config", "--max-budget-usd", f"{args.budget:g}"]
+    # Sessions are not persisted by default, so a hook reading `transcript_path`
+    # finds no file. A scenario that tests such a hook opts in with an empty
+    # `persist-session` file; the transcript lands in the throwaway HOME.
+    if not (scenario / "persist-session").exists():
+        argv.append("--no-session-persistence")
     if args.model:
         argv += ["--model", args.model]
     # A private /tmp per run. Agents write literal /tmp paths, and concurrent
