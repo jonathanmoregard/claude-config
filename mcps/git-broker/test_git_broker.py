@@ -67,18 +67,19 @@ class ToolSurfaceTests(unittest.TestCase):
         self.assertEqual([tool["name"] for tool in server.TOOLS], ["git"])
         schema = server.TOOLS[0]["inputSchema"]
         self.assertEqual(schema["required"], ["repo_path", "operation"])
-        self.assertEqual(schema["properties"]["operation"]["enum"], [
-            "status",
-            "diff",
-            "log",
-            "add",
-            "commit",
-            "fetch",
-            "push",
-            "switch",
-            "worktree_add",
-            "pr_create",
-        ])
+        self.assertEqual(
+            schema["properties"]["operation"]["enum"],
+            list(server._GIT_OPERATION_FIELDS),
+        )
+        # Every schema property is accepted by at least one operation, and every
+        # operation's fields are documented in the schema and description.
+        accepted = set().union(*server._GIT_OPERATION_FIELDS.values())
+        self.assertEqual(
+            set(schema["properties"]) - server._GIT_BASE_FIELDS, accepted
+        )
+        for operation in server._GIT_OPERATION_FIELDS:
+            self.assertIn(f"- {operation}:", server.TOOLS[0]["description"])
+        self.assertNotIn("pr_merge", server._GIT_OPERATION_FIELDS)
         self.assertNotIn("command", schema["properties"])
         self.assertFalse(hasattr(server, "_tool_exec"))
 
@@ -199,8 +200,10 @@ class RequestSchemaTests(unittest.TestCase):
     def test_remote_operations_accept_only_origin(self) -> None:
         self.assertEqual(self.validate(operation="fetch")["remote"], "origin")
         self.assertEqual(self.validate(operation="push")["remote"], "origin")
-        with self.assertRaisesRegex(RuntimeError, "unexpected"):
-            self.validate(operation="push", set_upstream=True)
+        self.assertFalse(self.validate(operation="push")["set_upstream"])
+        self.assertTrue(self.validate(operation="push", set_upstream=True)["set_upstream"])
+        with self.assertRaisesRegex(RuntimeError, "unexpected.*accepts: remote"):
+            self.validate(operation="fetch", set_upstream=True)
         for remote in ("upstream", "https://github.com/x/y", "-f", "origin\x00evil"):
             with self.subTest(remote=remote), self.assertRaisesRegex(RuntimeError, "origin"):
                 self.validate(operation="push", remote=remote)
@@ -1330,6 +1333,435 @@ class BlackBoxBrokerTests(unittest.TestCase):
         )
         self.assertIn("--- exit 0 ---", linked_add)
         self.assertIn("--- exit 0 ---", linked_commit)
+
+
+
+class ParityOperationSchemaTests(unittest.TestCase):
+    """Operations added so Codex reaches the Git/GitHub surface Claude has."""
+
+    def setUp(self) -> None:
+        self.server = load_server()
+        self.policy = self.server._load_git_policy({"gitBroker": valid_policy()})
+
+    def validate(self, **fields):
+        request = {"repo_path": "/home/jonathan/Repos/example", **fields}
+        return self.server._validate_git_request(request, self.policy)
+
+    def test_unexpected_field_error_lists_accepted_fields(self) -> None:
+        with self.assertRaisesRegex(
+            RuntimeError, "unexpected fields for worktree_add: create; it accepts: branch, start_point, worktree_path"
+        ):
+            self.validate(operation="worktree_add", create=True)
+
+    def test_revisions_allow_ancestry_but_not_ranges_or_options(self) -> None:
+        for good in ("HEAD~1", "origin/master", "abc1234", "feat/x^2", "HEAD^^"):
+            with self.subTest(good=good):
+                self.assertEqual(self.validate(operation="reset", target=good)["target"], good)
+        for bad in ("-h", "a..b", "HEAD@{1}", "x:y", "a b", "", "--soft", "a//b"):
+            with self.subTest(bad=bad), self.assertRaises(RuntimeError):
+                self.validate(operation="reset", target=bad)
+
+    def test_reset_has_no_hard_mode(self) -> None:
+        self.assertEqual(self.validate(operation="reset", target="HEAD~1")["mode"], "mixed")
+        with self.assertRaisesRegex(RuntimeError, "mode"):
+            self.validate(operation="reset", mode="hard", target="HEAD~1")
+
+    def test_stash_actions_take_only_their_fields(self) -> None:
+        self.assertEqual(self.validate(operation="stash")["action"], "push")
+        self.assertEqual(self.validate(operation="stash", action="pop")["index"], 0)
+        self.assertEqual(self.validate(operation="stash", action="drop", index=3)["index"], 3)
+        for fields in (
+            {"action": "clear"},
+            {"action": "pop", "message": "x"},
+            {"action": "list", "index": 1},
+            {"action": "push", "index": 1},
+            {"action": "apply", "index": -1},
+            {"action": "apply", "index": True},
+        ):
+            with self.subTest(fields=fields), self.assertRaises(RuntimeError):
+                self.validate(operation="stash", **fields)
+
+    def test_sequencer_start_requires_target_and_control_actions_take_none(self) -> None:
+        self.assertEqual(self.validate(operation="rebase", onto="origin/master")["action"], "start")
+        self.assertEqual(self.validate(operation="rebase", action="continue")["action"], "continue")
+        self.assertEqual(
+            self.validate(operation="cherry_pick", commits=["abc123", "HEAD~2"])["commits"],
+            ("abc123", "HEAD~2"),
+        )
+        for operation, fields in (
+            ("rebase", {}),
+            ("rebase", {"action": "continue", "onto": "x"}),
+            ("rebase", {"action": "edit-todo"}),
+            ("merge", {"action": "skip"}),
+            ("merge", {"ref": "x", "ff_mode": "ff_only", "message": "m"}),
+            ("merge", {"ref": "x", "ff_mode": "squash"}),
+            ("cherry_pick", {"commits": []}),
+            ("cherry_pick", {"commits": ["-n"]}),
+            ("cherry_pick", {"action": "abort", "commits": ["x"]}),
+        ):
+            with self.subTest(operation=operation, fields=fields), self.assertRaises(RuntimeError):
+                self.validate(operation=operation, **fields)
+
+    def test_remote_branch_delete_refuses_default_branch_names(self) -> None:
+        self.assertEqual(
+            self.validate(operation="remote_branch_delete", branch="feat/x")["branch"], "feat/x"
+        )
+        for branch in ("main", "master", "-x", "a..b"):
+            with self.subTest(branch=branch), self.assertRaises(RuntimeError):
+                self.validate(operation="remote_branch_delete", branch=branch)
+
+    def test_clone_url_must_pass_remote_policy(self) -> None:
+        url = "https://github.com/owner/project.git"
+        self.assertEqual(self.validate(operation="clone", url=url)["url"], url)
+        for bad in (
+            "file:///etc",
+            "https://evil.example/owner/project",
+            "https://token@github.com/owner/project",
+            "ext::sh -c x",
+            "/home/jonathan/Repos/other",
+        ):
+            with self.subTest(bad=bad), self.assertRaises(RuntimeError):
+                self.validate(operation="clone", url=bad)
+
+    def test_github_text_fields_are_bounded_and_secret_scanned(self) -> None:
+        token = "ghp_" + "A" * 36
+        for operation, fields in (
+            ("pr_comment", {"number": 1, "body": token}),
+            ("issue_comment", {"number": 1, "body": ""}),
+            ("pr_edit", {"number": 1}),
+            ("pr_edit", {"number": 1, "title": "two\nlines"}),
+            ("issue_create", {"title": "t", "body": "x" * 100_001}),
+            ("pr_view", {"number": 0}),
+            ("pr_list", {"state": "draft"}),
+            ("issue_list", {"state": "merged"}),
+            ("run_view", {"run_id": "1"}),
+        ):
+            with self.subTest(operation=operation, fields=fields), self.assertRaises(RuntimeError):
+                self.validate(operation=operation, **fields)
+
+    def test_worktree_paths_must_be_below_creation_root(self) -> None:
+        for bad in ("/home/jonathan/worktrees", "/home/jonathan/Repos/x", "relative/x"):
+            with self.subTest(bad=bad), self.assertRaises(RuntimeError):
+                self.validate(operation="worktree_remove", worktree_path=bad)
+
+    def test_protected_primary_allows_github_reads_but_not_new_mutations(self) -> None:
+        identity = self.server._GitIdentity(
+            Path("/home/jonathan/.claude"),
+            Path("/home/jonathan/.claude/.git"),
+            Path("/home/jonathan/.claude/.git"),
+            False,
+        )
+        for operation in ("pr_view", "pr_comment", "issue_list", "run_view"):
+            self.server._authorize_git_operation(identity, operation, self.policy)
+        for operation in (
+            "stash", "reset", "rebase", "merge", "cherry_pick", "tag", "pull",
+            "remote_branch_delete", "unstage", "worktree_remove", "pr_create",
+        ):
+            with self.subTest(operation=operation), self.assertRaisesRegex(
+                RuntimeError, "protected primary"
+            ):
+                self.server._authorize_git_operation(identity, operation, self.policy)
+
+
+class ParityOperationArgvTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server = load_server()
+        self.policy = self.server._load_git_policy({"gitBroker": valid_policy()})
+        self.identity = self.server._GitIdentity(
+            Path("/home/jonathan/worktrees/project-topic"),
+            Path("/home/jonathan/Repos/project/.git/worktrees/project-topic"),
+            Path("/home/jonathan/Repos/project/.git"),
+            True,
+        )
+
+    def argv(self, operation: str, current_branch: str | None = None, **fields) -> list[str]:
+        request = self.server._validate_git_request(
+            {"repo_path": str(self.identity.worktree), "operation": operation, **fields},
+            self.policy,
+        )
+        remote = "https://github.com/owner/project.git"
+        if operation in self.server._GH_OPERATIONS:
+            return self.server._build_gh_argv(
+                request, self.policy, remote_url=remote, current_branch=current_branch
+            )
+        argv = self.server._build_git_argv(
+            request, self.identity, self.policy,
+            remote_url=remote, current_branch=current_branch,
+        )
+        if operation == "clone":
+            return argv[argv.index("clone"):]
+        return argv[argv.index(str(self.identity.worktree)) + 1 :]
+
+    def test_local_operation_argv(self) -> None:
+        cases = [
+            (("commit", {"message": "m", "amend": True}), ["commit", "--amend", "--message", "m"]),
+            (("unstage", {"paths": ["a.txt"]}), ["restore", "--staged", "--", "a.txt"]),
+            (("stash", {"include_untracked": True, "message": "wip"}),
+             ["stash", "push", "--include-untracked", "--message", "wip"]),
+            (("stash", {"action": "pop", "index": 2}), ["stash", "pop", "stash@{2}"]),
+            (("stash", {"action": "list"}), ["stash", "list"]),
+            (("stash", {"action": "show"}), ["stash", "show", "--patch", "stash@{0}"]),
+            (("reset", {"mode": "soft", "target": "HEAD~1"}), ["reset", "--soft", "HEAD~1", "--"]),
+            (("rebase", {"onto": "origin/master"}), ["rebase", "origin/master"]),
+            (("rebase", {"action": "continue"}), ["rebase", "--continue"]),
+            (("merge", {"ref": "feat/x", "ff_mode": "no_ff"}), ["merge", "--no-ff", "--no-edit", "feat/x"]),
+            (("merge", {"ref": "feat/x", "message": "m"}), ["merge", "--message", "m", "feat/x"]),
+            (("cherry_pick", {"commits": ["abc", "def"]}), ["cherry-pick", "abc", "def"]),
+            (("cherry_pick", {"action": "abort"}), ["cherry-pick", "--abort"]),
+            (("tag", {"name": "v1", "target": "HEAD~1", "message": "rel"}),
+             ["tag", "--annotate", "--message", "rel", "v1", "HEAD~1"]),
+            (("worktree_remove", {"worktree_path": "/home/jonathan/worktrees/other"}),
+             ["worktree", "remove", "/home/jonathan/worktrees/other"]),
+            (("remote_branch_delete", {"branch": "feat/x"}),
+             ["push", "--porcelain", "origin", ":refs/heads/feat/x"]),
+        ]
+        for (operation, fields), expected in cases:
+            with self.subTest(operation=operation, fields=fields):
+                self.assertEqual(self.argv(operation, **fields), expected)
+
+    def test_pull_is_fast_forward_only_from_same_named_origin_branch(self) -> None:
+        self.assertEqual(
+            self.argv("pull", current_branch="feat/x"),
+            ["pull", "--ff-only", "--no-rebase", "--no-tags", "--no-recurse-submodules",
+             "origin", "refs/heads/feat/x"],
+        )
+        with self.assertRaisesRegex(RuntimeError, "current branch"):
+            self.argv("pull")
+
+    def test_network_git_operations_pin_validated_origin_url(self) -> None:
+        for operation, fields in (("pull", {}), ("remote_branch_delete", {"branch": "feat/x"})):
+            request = self.server._validate_git_request(
+                {"repo_path": str(self.identity.worktree), "operation": operation, **fields},
+                self.policy,
+            )
+            argv = self.server._build_git_argv(
+                request, self.identity, self.policy,
+                remote_url="https://github.com/owner/project.git", current_branch="feat/x",
+            )
+            self.assertIn("remote.origin.url=https://github.com/owner/project.git", argv)
+            with self.assertRaises(RuntimeError):
+                self.server._build_git_argv(
+                    request, self.identity, self.policy,
+                    remote_url=None, current_branch="feat/x",
+                )
+
+    def test_clone_argv_disables_submodules_and_separates_url(self) -> None:
+        self.assertEqual(
+            self.argv("clone", url="https://github.com/owner/project.git"),
+            ["clone", "--no-recurse-submodules", "--origin", "origin", "--",
+             "https://github.com/owner/project.git", str(self.identity.worktree)],
+        )
+
+    def test_github_argv_pins_origin_repository(self) -> None:
+        cases = [
+            (("pr_view", {"number": 7, "comments": True}), ["pr", "view", "--repo", "owner/project", "7", "--comments"]),
+            (("pr_list", {"state": "all", "limit": 5, "head": "feat/x"}),
+             ["pr", "list", "--repo", "owner/project", "--state", "all", "--limit", "5", "--head", "feat/x"]),
+            (("pr_diff", {"number": 7}), ["pr", "diff", "--repo", "owner/project", "7"]),
+            (("pr_checks", {"number": 7}), ["pr", "checks", "--repo", "owner/project", "7"]),
+            (("pr_comment", {"number": 7, "body": "b"}), ["pr", "comment", "--repo", "owner/project", "7", "--body", "b"]),
+            (("pr_edit", {"number": 7, "title": "t"}), ["pr", "edit", "--repo", "owner/project", "7", "--title", "t"]),
+            (("pr_close", {"number": 7}), ["pr", "close", "--repo", "owner/project", "7"]),
+            (("pr_reopen", {"number": 7}), ["pr", "reopen", "--repo", "owner/project", "7"]),
+            (("issue_view", {"number": 3}), ["issue", "view", "--repo", "owner/project", "3"]),
+            (("issue_list", {}), ["issue", "list", "--repo", "owner/project", "--state", "open", "--limit", "30"]),
+            (("issue_comment", {"number": 3, "body": "b"}), ["issue", "comment", "--repo", "owner/project", "3", "--body", "b"]),
+            (("issue_create", {"title": "t", "body": "b"}), ["issue", "create", "--repo", "owner/project", "--title", "t", "--body", "b"]),
+            (("run_list", {"head": "feat/x"}), ["run", "list", "--repo", "owner/project", "--limit", "20", "--branch", "feat/x"]),
+            (("run_view", {"run_id": 99, "log_failed": True}), ["run", "view", "--repo", "owner/project", "99", "--log-failed"]),
+        ]
+        for (operation, fields), expected in cases:
+            with self.subTest(operation=operation):
+                argv = self.argv(operation, **fields)
+                self.assertEqual(Path(argv[0]).name, "gh")
+                self.assertEqual(argv[1:], expected)
+
+    def test_github_operations_mount_repo_read_only_with_network(self) -> None:
+        request = self.server._validate_git_request(
+            {"repo_path": str(self.identity.worktree), "operation": "pr_comment",
+             "number": 1, "body": "b"},
+            self.policy,
+        )
+        argv, env = self.server._build_git_sandbox(
+            request, self.identity, self.policy, ["gh"],
+            existing_only=False, remote_url="https://github.com/owner/project.git",
+        )
+        self.assertIn("--share-net", argv)
+        for path in (self.identity.worktree, self.identity.common_dir):
+            self.assertTrue(any(
+                argv[i : i + 3] == ["--ro-bind", str(path), str(path)] for i in range(len(argv))
+            ))
+        self.assertEqual(env["GH_PROMPT_DISABLED"], "1")
+
+    def test_local_sequencer_runs_offline_with_editor_disabled(self) -> None:
+        request = self.server._validate_git_request(
+            {"repo_path": str(self.identity.worktree), "operation": "rebase", "action": "continue"},
+            self.policy,
+        )
+        argv, env = self.server._build_git_sandbox(
+            request, self.identity, self.policy, ["git"], existing_only=False,
+        )
+        self.assertNotIn("--share-net", argv)
+        self.assertEqual(env["GIT_EDITOR"], "true")
+        self.assertTrue(any(
+            argv[i : i + 3] == ["--bind", str(self.identity.worktree), str(self.identity.worktree)]
+            for i in range(len(argv))
+        ))
+
+    def test_clone_sandbox_binds_only_the_new_target_writable(self) -> None:
+        target = Path("/home/jonathan/Repos/new-clone")
+        request = self.server._validate_git_request(
+            {"repo_path": str(target), "operation": "clone",
+             "url": "https://github.com/owner/project.git"},
+            self.policy,
+        )
+        argv, _env = self.server._build_git_sandbox(
+            request, None, self.policy, ["git", "clone"], existing_only=False,
+            remote_url="https://github.com/owner/project.git",
+        )
+        writable = [argv[i + 1] for i in range(len(argv)) if argv[i] == "--bind"]
+        self.assertEqual(writable, [str(target)])
+        self.assertIn("--share-net", argv)
+
+    def test_clone_target_must_be_new_and_below_repository_root(self) -> None:
+        for target in ("/home/jonathan/Repos", "/home/jonathan/Repos/klaffat", "/tmp/x"):
+            with self.subTest(target=target), self.assertRaises(RuntimeError):
+                self.server._prepare_clone_target(
+                    {"operation": "clone", "repo_path": Path(target)}, self.policy
+                )
+
+    def test_dcg_sees_equivalent_commands_for_new_operations(self) -> None:
+        cases = {
+            ("reset", ("mode", "soft"), ("target", "HEAD~1")): "reset --soft 'HEAD~1'",
+            ("remote_branch_delete", ("branch", "feat/x")): "push origin --delete feat/x",
+            ("stash", ("action", "drop"), ("index", 1)): "stash drop 'stash@{1}'",
+            ("commit", ("message", "m"), ("amend", True)): "commit --amend --message m",
+            ("pr_close", ("number", 4)): "gh pr close 4",
+        }
+        for (operation, *fields), expected in cases.items():
+            request = self.server._validate_git_request(
+                {"repo_path": "/home/jonathan/Repos/example", "operation": operation, **dict(fields)},
+                self.policy,
+            )
+            with self.subTest(operation=operation):
+                self.assertTrue(
+                    self.server._dcg_command_for_git_request(request).endswith(expected)
+                )
+
+
+class BlackBoxParityTests(unittest.TestCase):
+    """Real bubblewrap runs of the local operations added for Codex parity."""
+
+    def setUp(self) -> None:
+        self.server = load_server()
+        self.temp = tempfile.TemporaryDirectory(
+            prefix="git-broker-parity-", dir="/home/jonathan/worktrees"
+        )
+        self.addCleanup(self.temp.cleanup)
+        self.repo = Path(self.temp.name)
+        subprocess.run(["git", "init", "-q", "-b", "main", str(self.repo)], check=True)
+        self.write("base.txt", "base\n")
+        self.ok("add", all=True)
+        self.ok("commit", message="base")
+
+    def write(self, name: str, text: str) -> None:
+        (self.repo / name).write_text(text, encoding="utf-8")
+
+    def tool(self, operation: str, repo: Path | None = None, **fields) -> str:
+        return self.server._tool_git(
+            {"repo_path": str(repo or self.repo), "operation": operation, **fields}
+        )
+
+    def ok(self, operation: str, **fields) -> str:
+        output = self.tool(operation, **fields)
+        self.assertIn("--- exit 0 ---", output, output)
+        return output
+
+    def git(self, *args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(self.repo), *args], check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    def test_amend_unstage_reset_and_tag(self) -> None:
+        self.write("a.txt", "a\n")
+        self.ok("add", paths=["a.txt"])
+        self.ok("commit", message="first")
+        self.ok("commit", message="first, amended", amend=True)
+        self.assertEqual(self.git("log", "-1", "--format=%s"), "first, amended")
+        self.write("b.txt", "b\n")
+        self.ok("add", paths=["b.txt"])
+        self.ok("unstage", paths=["b.txt"])
+        self.assertEqual(self.git("diff", "--cached", "--name-only"), "")
+        self.ok("reset", mode="soft", target="HEAD~1")
+        self.assertEqual(self.git("diff", "--cached", "--name-only"), "a.txt")
+        self.ok("tag", name="v0", message="tagged")
+        self.assertEqual(self.git("tag", "--list"), "v0")
+
+    def test_stash_push_list_pop(self) -> None:
+        self.write("base.txt", "changed\n")
+        self.write("new.txt", "untracked\n")
+        self.ok("stash", include_untracked=True, message="wip")
+        self.assertFalse((self.repo / "new.txt").exists())
+        self.assertIn("wip", self.ok("stash", action="list"))
+        self.ok("stash", action="pop")
+        self.assertEqual((self.repo / "base.txt").read_text(), "changed\n")
+        self.assertTrue((self.repo / "new.txt").exists())
+
+    def test_merge_rebase_conflict_continue_and_cherry_pick(self) -> None:
+        self.ok("switch", branch="feat", create=True)
+        self.write("base.txt", "feat\n")
+        self.ok("add", all=True)
+        self.ok("commit", message="feat change")
+        feat_commit = self.git("rev-parse", "HEAD")
+        self.ok("switch", branch="main")
+        self.write("base.txt", "main\n")
+        self.ok("add", all=True)
+        self.ok("commit", message="main change")
+        self.ok("switch", branch="side", create=True, start_point="HEAD~1")
+        self.ok("cherry_pick", commits=[feat_commit])
+        self.assertEqual((self.repo / "base.txt").read_text(), "feat\n")
+        self.ok("switch", branch="feat")
+        conflict = self.tool("rebase", onto="main")
+        self.assertNotIn("--- exit 0 ---", conflict)
+        self.write("base.txt", "resolved\n")
+        self.ok("add", paths=["base.txt"])
+        self.ok("rebase", action="continue")
+        self.assertEqual(self.git("log", "-1", "--format=%s"), "feat change")
+        self.assertEqual(self.git("merge-base", "HEAD", "main"), self.git("rev-parse", "main"))
+        self.ok("switch", branch="main")
+        self.ok("merge", ref="feat", ff_mode="no_ff")
+        self.assertEqual(len(self.git("log", "-1", "--format=%P").split()), 2)
+
+    def test_worktree_remove_only_removes_other_linked_worktrees(self) -> None:
+        target = Path("/home/jonathan/worktrees") / f"git-broker-parity-wt-{os.getpid()}"
+        self.addCleanup(
+            subprocess.run,
+            ["git", "-C", str(self.repo), "worktree", "remove", "--force", str(target)],
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        self.ok("worktree_add", worktree_path=str(target), branch="wt")
+        with self.assertRaisesRegex(RuntimeError, "different worktree"):
+            self.tool("worktree_remove", repo=target, worktree_path=str(target))
+        with self.assertRaisesRegex(RuntimeError, "not a linked worktree"):
+            self.tool("worktree_remove", worktree_path=str(self.repo.parent / "unrelated"))
+        (target / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
+        refused = self.tool("worktree_remove", worktree_path=str(target))
+        self.assertNotIn("--- exit 0 ---", refused)
+        self.assertTrue((target / "dirty.txt").exists())
+        (target / "dirty.txt").unlink()
+        self.ok("worktree_remove", worktree_path=str(target))
+        self.assertFalse(target.exists())
+
+    def test_set_upstream_writes_only_fixed_tracking_keys(self) -> None:
+        identity = self.server._discover_git_identity(
+            self.repo, self.server._load_git_policy(self.server._load_config())
+        )
+        note = self.server._set_upstream(
+            identity, "main", self.server._load_git_policy(self.server._load_config())
+        )
+        self.assertIn("upstream set", note)
+        self.assertEqual(self.git("config", "branch.main.remote"), "origin")
+        self.assertEqual(self.git("config", "branch.main.merge"), "refs/heads/main")
 
 
 if __name__ == "__main__":
