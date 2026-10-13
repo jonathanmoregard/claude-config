@@ -208,53 +208,6 @@ class RequestSchemaTests(unittest.TestCase):
             with self.subTest(remote=remote), self.assertRaisesRegex(RuntimeError, "origin"):
                 self.validate(operation="push", remote=remote)
 
-    def test_pr_create_requires_bounded_structured_fields(self) -> None:
-        request = self.validate(
-            operation="pr_create",
-            base="master",
-            title="Enable brokered pull requests",
-            body="Adds a least-privilege PR creation path.",
-        )
-        self.assertEqual(request["base"], "master")
-        self.assertEqual(request["title"], "Enable brokered pull requests")
-        self.assertEqual(request["body"], "Adds a least-privilege PR creation path.")
-
-        for fields in (
-            {"base": "master", "title": "Title"},
-            {"base": "master", "body": "Body"},
-            {"title": "Title", "body": "Body"},
-            {"base": "../master", "title": "Title", "body": "Body"},
-            {"base": "master", "title": "", "body": "Body"},
-            {"base": "master", "title": "bad\nTitle", "body": "Body"},
-            {"base": "master", "title": "x" * 257, "body": "Body"},
-            {"base": "master", "title": "Title", "body": ""},
-            {"base": "master", "title": "Title", "body": "bad\x00body"},
-            {"base": "master", "title": "Title", "body": "x" * 100_001},
-        ):
-            with self.subTest(fields=fields), self.assertRaises(RuntimeError):
-                self.validate(operation="pr_create", **fields)
-
-    def test_pr_create_rejects_recognizable_secrets_before_upload(self) -> None:
-        token = "ghp_" + "A" * 36
-        private_key = (
-            "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----"
-        )
-        for base, title, body in (
-            (token, "Title", "Body"),
-            ("master", f"Token {token}", "Body"),
-            ("master", "Title", f"Do not upload {token}"),
-            ("master", "Title", private_key),
-        ):
-            with self.subTest(base=base[:20], title=title[:20]), self.assertRaisesRegex(
-                RuntimeError, "secret"
-            ):
-                self.validate(
-                    operation="pr_create",
-                    base=base,
-                    title=title,
-                    body=body,
-                )
-
     def test_switch_rejects_detach_force_and_invalid_branch(self) -> None:
         request = self.validate(operation="switch", branch="feat/safe", create=True)
         self.assertEqual(request["branch"], "feat/safe")
@@ -625,50 +578,6 @@ class GitArgvTests(unittest.TestCase):
             ],
         )
 
-    def test_pr_create_argv_pins_repo_base_head_title_and_body(self) -> None:
-        request = self.request(
-            "pr_create",
-            base="master",
-            title="Enable brokered pull requests",
-            body="Security notes and test evidence.",
-        )
-        argv = self.server._build_pr_create_argv(
-            request,
-            self.policy,
-            remote_url="git@github.com:owner/project.git",
-            current_branch="feat/topic",
-        )
-        self.assertEqual(Path(argv[0]).name, "gh")
-        self.assertEqual(
-            argv[1:],
-            [
-                "pr",
-                "create",
-                "--repo",
-                "github.com/owner/project",
-                "--base",
-                "master",
-                "--head",
-                "feat/topic",
-                "--title",
-                "Enable brokered pull requests",
-                "--body",
-                "Security notes and test evidence.",
-            ],
-        )
-
-    def test_github_repo_slug_is_derived_only_from_validated_origin(self) -> None:
-        for remote in (
-            "https://github.com/owner/project.git",
-            "git@github.com:owner/project.git",
-            "ssh://git@github.com/owner/project.git",
-        ):
-            with self.subTest(remote=remote):
-                self.assertEqual(
-                    self.server._github_repo_from_remote(remote, self.policy),
-                    "github.com/owner/project",
-                )
-
     def test_remote_url_validator_accepts_only_pinned_github_shapes(self) -> None:
         accepted = (
             "https://github.com/owner/project.git",
@@ -700,7 +609,7 @@ class GitArgvTests(unittest.TestCase):
         )
         for operation in ("status", "diff", "log", "fetch", "worktree_add"):
             self.server._authorize_git_operation(protected, operation, self.policy)
-        for operation in ("add", "commit", "push", "switch", "pr_create"):
+        for operation in ("add", "commit", "push", "switch"):
             with self.subTest(operation=operation), self.assertRaisesRegex(
                 RuntimeError, "protected primary"
             ):
@@ -891,43 +800,6 @@ class ContainmentArgvTests(unittest.TestCase):
             env["SSH_AUTH_SOCK"], f"/run/user/{os.getuid()}/gcr/ssh"
         )
 
-    def test_pr_create_mounts_only_github_auth_and_repo_read_only(self) -> None:
-        request = self.server._validate_git_request(
-            {
-                "repo_path": str(self.identity.worktree),
-                "operation": "pr_create",
-                "base": "master",
-                "title": "Enable brokered pull requests",
-                "body": "Test evidence.",
-            },
-            self.policy,
-        )
-        argv, env = self.server._build_git_sandbox(
-            request,
-            self.identity,
-            self.policy,
-            ["/etc/profiles/per-user/jonathan/bin/gh", "pr", "create"],
-            existing_only=False,
-            remote_url="git@github.com:owner/project.git",
-        )
-        self.assertIn("--share-net", argv)
-        for path in (
-            self.identity.worktree,
-            self.identity.common_dir,
-            Path("/home/jonathan/.cache/gh-tokens/host"),
-        ):
-            with self.subTest(path=path):
-                self.assertTrue(
-                    any(
-                        argv[i : i + 3] == ["--ro-bind", str(path), str(path)]
-                        for i in range(len(argv))
-                    )
-                )
-        self.assertNotIn("SSH_AUTH_SOCK", env)
-        self.assertNotIn("DBUS_SESSION_BUS_ADDRESS", env)
-        self.assertNotIn(f"/run/user/{os.getuid()}/bus", argv)
-        self.assertEqual(env["GH_PROMPT_DISABLED"], "1")
-
 
 class ToolExecutionTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -979,67 +851,6 @@ class ToolExecutionTests(unittest.TestCase):
         run.assert_called_once_with(
             ["bwrap", "--", "git", "commit"],
             {"HOME": "/home/jonathan"},
-            120000,
-            None,
-            pass_fds=(),
-        )
-
-    def test_pr_create_resolves_origin_and_branch_then_runs_fixed_gh(self) -> None:
-        args = {
-            "repo_path": str(self.identity.worktree),
-            "operation": "pr_create",
-            "base": "master",
-            "title": "Enable brokered pull requests",
-            "body": "Test and security evidence.",
-        }
-        with (
-            mock.patch.object(
-                self.server,
-                "_load_config",
-                return_value={"gitBroker": valid_policy()},
-            ),
-            mock.patch.object(self.server, "_check_denied_by_dcg", return_value=None),
-            mock.patch.object(
-                self.server, "_discover_git_identity", return_value=self.identity
-            ),
-            mock.patch.object(
-                self.server,
-                "_network_git_context",
-                return_value=("git@github.com:owner/project.git", "feat/topic"),
-            ) as network_context,
-            mock.patch.object(
-                self.server,
-                "_build_pr_create_argv",
-                return_value=["gh", "pr", "create"],
-            ) as build_pr,
-            mock.patch.object(
-                self.server,
-                "_build_git_sandbox",
-                return_value=(
-                    ["bwrap", "--", "gh", "pr", "create"],
-                    {"HOME": "/home/jonathan", "GH_PROMPT_DISABLED": "1"},
-                ),
-            ) as build_sandbox,
-            mock.patch.object(
-                self.server,
-                "_run_argv",
-                return_value=(0, "https://github.com/owner/project/pull/1\n", ""),
-            ) as run,
-        ):
-            output = self.server._tool_git(args)
-
-        self.assertIn("https://github.com/owner/project/pull/1", output)
-        network_context.assert_called_once()
-        build_pr.assert_called_once_with(
-            mock.ANY,
-            mock.ANY,
-            remote_url="git@github.com:owner/project.git",
-            current_branch="feat/topic",
-        )
-        build_sandbox.assert_called_once()
-        run.assert_called_once_with(
-            ["bwrap", "--", "gh", "pr", "create"],
-            {"HOME": "/home/jonathan", "GH_PROMPT_DISABLED": "1"},
             120000,
             None,
             pass_fds=(),
@@ -1341,7 +1152,7 @@ class BlackBoxBrokerTests(unittest.TestCase):
 
 
 class ParityOperationSchemaTests(unittest.TestCase):
-    """Operations added so Codex reaches the Git surface Claude has."""
+    """Schema validation for every supported Git operation."""
 
     def setUp(self) -> None:
         self.server = load_server()
@@ -1442,7 +1253,7 @@ class ParityOperationSchemaTests(unittest.TestCase):
         self.server._authorize_git_operation(identity, "worktree_remove", self.policy)
         for operation in (
             "stash", "reset", "rebase", "merge", "cherry_pick", "tag", "pull",
-            "remote_branch_delete", "unstage", "pr_create",
+            "remote_branch_delete", "unstage",
         ):
             with self.subTest(operation=operation), self.assertRaisesRegex(
                 RuntimeError, "protected primary"
@@ -1467,10 +1278,6 @@ class ParityOperationArgvTests(unittest.TestCase):
             self.policy,
         )
         remote = "https://github.com/owner/project.git"
-        if operation == "pr_create":
-            return self.server._build_pr_create_argv(
-                request, self.policy, remote_url=remote, current_branch=current_branch
-            )
         argv = self.server._build_git_argv(
             request, self.identity, self.policy,
             remote_url=remote, current_branch=current_branch,
@@ -1666,7 +1473,7 @@ class TargetContainmentTests(unittest.TestCase):
             self.server._open_bind_dir(via_link)
 
 class BlackBoxParityTests(unittest.TestCase):
-    """Real bubblewrap runs of the local operations added for Codex parity."""
+    """Real bubblewrap coverage for state-changing local Git operations."""
 
     def setUp(self) -> None:
         self.server = load_server()
