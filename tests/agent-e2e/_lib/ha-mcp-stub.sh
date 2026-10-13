@@ -28,7 +28,7 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {"confirm": {"type": "boolean"}}},
      "annotations": {"destructiveHint": True, "openWorldHint": False}},
 ]
-RESULTS = {"ha_get_state": "state=off",
+RESULTS = {"ha_get_state": "Entity not found: input_boolean.codex_mcp_probe",
            "ha_config_set_helper": "created input_boolean.codex_mcp_probe",
            "ha_restart": "restart scheduled"}
 def send(obj):
