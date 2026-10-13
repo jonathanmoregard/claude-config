@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dedicated, contained Git and GitHub PR mutation broker over stdio MCP.
+"""Dedicated, contained Git operation broker over stdio MCP.
 
 The server exposes one structured ``git`` tool. It never accepts shell text or
 raw argv. Every operation is validated before the corresponding client runs
@@ -252,58 +252,20 @@ _GIT_OPERATION_FIELDS = {
     "worktree_add": frozenset({"worktree_path", "branch", "start_point"}),
     "worktree_remove": frozenset({"worktree_path"}),
     "pr_create": frozenset({"base", "title", "body"}),
-    "pr_view": frozenset({"number", "comments"}),
-    "pr_list": frozenset({"state", "limit", "head"}),
-    "pr_diff": frozenset({"number"}),
-    "pr_checks": frozenset({"number"}),
-    "pr_comment": frozenset({"number", "body"}),
-    "pr_edit": frozenset({"number", "title", "body"}),
-    "pr_close": frozenset({"number"}),
-    "pr_reopen": frozenset({"number"}),
-    "issue_view": frozenset({"number", "comments"}),
-    "issue_list": frozenset({"state", "limit"}),
-    "issue_comment": frozenset({"number", "body"}),
-    "issue_create": frozenset({"title", "body"}),
-    "run_list": frozenset({"head", "limit"}),
-    "run_view": frozenset({"run_id", "log_failed"}),
 }
 _GIT_OPERATIONS = frozenset(_GIT_OPERATION_FIELDS)
-# GitHub operations run `gh` against the repository named by the validated
-# origin remote, never against a caller-chosen repository. No merge or
-# approval operation exists: those stay a human gesture, as for Claude.
-_GH_OPERATIONS = frozenset(
-    {
-        "pr_create",
-        "pr_view",
-        "pr_list",
-        "pr_diff",
-        "pr_checks",
-        "pr_comment",
-        "pr_edit",
-        "pr_close",
-        "pr_reopen",
-        "issue_view",
-        "issue_list",
-        "issue_comment",
-        "issue_create",
-        "run_list",
-        "run_view",
-    }
-)
 _NETWORK_GIT_OPERATIONS = frozenset(
     {"clone", "fetch", "pull", "push", "remote_branch_delete"}
 )
-_NETWORK_OPERATIONS = _NETWORK_GIT_OPERATIONS | _GH_OPERATIONS
+_NETWORK_OPERATIONS = _NETWORK_GIT_OPERATIONS | {"pr_create"}
 # Operations whose sandbox needs the current worktree writable.
-_READ_ONLY_WORKTREE_OPERATIONS = (
-    frozenset({"fetch", "worktree_add", "worktree_remove", "remote_branch_delete"})
-    | _GH_OPERATIONS
+_READ_ONLY_WORKTREE_OPERATIONS = frozenset(
+    {"fetch", "worktree_add", "worktree_remove", "remote_branch_delete", "pr_create"}
 )
 # Operations that need no current branch and change nothing local, so they
 # may run from a protected primary checkout.
-_PROTECTED_WORKTREE_OPERATIONS = (
-    frozenset({"status", "diff", "log", "fetch", "worktree_add", "worktree_remove"})
-    | (_GH_OPERATIONS - {"pr_create"})
+_PROTECTED_WORKTREE_OPERATIONS = frozenset(
+    {"status", "diff", "log", "fetch", "worktree_add", "worktree_remove"}
 )
 _SEQUENCER_ACTIONS = {
     "rebase": frozenset({"start", "continue", "abort", "skip"}),
@@ -604,38 +566,6 @@ def _validate_git_request(args: object, policy: dict) -> dict:
         request["worktree_path"] = _validate_worktree_path(
             args.get("worktree_path"), policy
         )
-    elif operation in {"pr_view", "issue_view"}:
-        request["number"] = _validate_int(args, "number", 1, 10**9)
-        request["comments"] = _validate_bool(args, "comments")
-    elif operation in {"pr_diff", "pr_checks", "pr_close", "pr_reopen"}:
-        request["number"] = _validate_int(args, "number", 1, 10**9)
-    elif operation in {"pr_list", "issue_list"}:
-        states = {"open", "closed", "all"} | ({"merged"} if operation == "pr_list" else set())
-        request["state"] = _validate_choice(args, "state", frozenset(states), "open")
-        request["limit"] = _validate_int(args, "limit", 1, 100, 30)
-        if "head" in args:
-            request["head"] = _validate_branch(args["head"], "head")
-    elif operation in {"pr_comment", "issue_comment"}:
-        request["number"] = _validate_int(args, "number", 1, 10**9)
-        request["body"] = _validate_text(args.get("body"), "body", 65_000)
-    elif operation == "pr_edit":
-        request["number"] = _validate_int(args, "number", 1, 10**9)
-        if "title" not in args and "body" not in args:
-            raise RuntimeError("pr_edit requires title, body, or both")
-        if "title" in args:
-            request["title"] = _validate_text(args["title"], "title", 256, one_line=True)
-        if "body" in args:
-            request["body"] = _validate_text(args["body"], "body", 100_000)
-    elif operation == "issue_create":
-        request["title"] = _validate_text(args.get("title"), "title", 256, one_line=True)
-        request["body"] = _validate_text(args.get("body"), "body", 100_000)
-    elif operation == "run_list":
-        request["limit"] = _validate_int(args, "limit", 1, 100, 20)
-        if "head" in args:
-            request["head"] = _validate_branch(args["head"], "head")
-    elif operation == "run_view":
-        request["run_id"] = _validate_int(args, "run_id", 1, 10**12)
-        request["log_failed"] = _validate_bool(args, "log_failed")
     elif operation == "switch":
         request["branch"] = _validate_branch(args.get("branch"))
         create = args.get("create", False)
@@ -1171,65 +1101,6 @@ def _build_pr_create_argv(
     ]
 
 
-def _gh_subcommand(request: dict) -> list[str]:
-    """The gh arguments for a non-create GitHub operation, minus --repo."""
-    operation = request["operation"]
-    group, _, verb = operation.partition("_")
-    if operation in {"pr_view", "issue_view"}:
-        args = [group, "view", str(request["number"])]
-        if request["comments"]:
-            args.append("--comments")
-        return args
-    if operation in {"pr_diff", "pr_checks", "pr_close", "pr_reopen"}:
-        return [group, verb, str(request["number"])]
-    if operation in {"pr_list", "issue_list"}:
-        args = [group, "list", "--state", request["state"], "--limit", str(request["limit"])]
-        if request.get("head"):
-            args.extend(("--head", request["head"]))
-        return args
-    if operation in {"pr_comment", "issue_comment"}:
-        return [group, "comment", str(request["number"]), "--body", request["body"]]
-    if operation == "pr_edit":
-        args = ["pr", "edit", str(request["number"])]
-        if "title" in request:
-            args.extend(("--title", request["title"]))
-        if "body" in request:
-            args.extend(("--body", request["body"]))
-        return args
-    if operation == "issue_create":
-        return ["issue", "create", "--title", request["title"], "--body", request["body"]]
-    if operation == "run_list":
-        args = ["run", "list", "--limit", str(request["limit"])]
-        if request.get("head"):
-            args.extend(("--branch", request["head"]))
-        return args
-    if operation == "run_view":
-        args = ["run", "view", str(request["run_id"])]
-        if request["log_failed"]:
-            args.append("--log-failed")
-        return args
-    raise RuntimeError(f"unsupported GitHub operation: {operation!r}")
-
-
-def _build_gh_argv(
-    request: dict,
-    policy: dict,
-    *,
-    remote_url: str | None,
-    current_branch: str | None,
-) -> list[str]:
-    if request["operation"] == "pr_create":
-        return _build_pr_create_argv(
-            request, policy, remote_url=remote_url, current_branch=current_branch
-        )
-    if remote_url is None:
-        raise RuntimeError(f"{request['operation']} requires a validated origin remote URL")
-    repository = _github_repo_from_remote(remote_url, policy)
-    gh = _resolve_required_executable(policy, "credentialHelperExecutable")
-    subcommand = _gh_subcommand(request)
-    return [gh, *subcommand[:2], "--repo", repository, *subcommand[2:]]
-
-
 def _open_bind_dir(path: Path) -> int:
     """Open a directory without following symlinks and prove it is ``path``."""
     try:
@@ -1325,7 +1196,7 @@ def _build_git_sandbox(
             "--ro-bind" if operation in _READ_ONLY_WORKTREE_OPERATIONS else "--bind"
         )
         binds.append((worktree_mode, identity.worktree))
-        metadata_mode = "--ro-bind" if operation in _GH_OPERATIONS else "--bind"
+        metadata_mode = "--ro-bind" if operation == "pr_create" else "--bind"
         binds.append((metadata_mode, identity.common_dir))
         if not _path_within(identity.git_dir, (identity.common_dir,)):
             binds.append((metadata_mode, identity.git_dir))
@@ -1362,7 +1233,7 @@ def _build_git_sandbox(
         if remote_url is None:
             raise RuntimeError("network Git operation requires a validated remote URL")
         _validate_remote_url(remote_url, policy)
-        uses_github_api = operation in _GH_OPERATIONS
+        uses_github_api = operation == "pr_create"
         is_https = remote_url.startswith("https://")
         # GitHub over HTTPS and the GitHub API authenticate only with the
         # GitHub App host token: credentialHelperExecutable is the host gh
@@ -1556,8 +1427,6 @@ def _dcg_command_for_git_request(request: dict) -> str:
         argv.extend(("push", "origin", "--delete", request["branch"]))
     elif operation == "worktree_remove":
         argv.extend(("worktree", "remove", str(request["worktree_path"])))
-    elif operation in _GH_OPERATIONS - {"pr_create"}:
-        argv = ["gh", *_gh_subcommand(request)]
     elif operation == "pr_create":
         argv = [
             "gh",
@@ -2526,7 +2395,7 @@ TOOLS = [
     {
         "name": "git",
         "description": (
-            "Runs one policy-approved Git or GitHub operation in a validated repository. "
+            "Runs one policy-approved Git operation in a validated repository. "
             "The tool accepts structured fields only, never shell text or raw argv. "
             "Every call takes repo_path, operation and optional timeout; each operation "
             "accepts only the extra fields listed for it:\n"
@@ -2537,8 +2406,8 @@ TOOLS = [
             "rebase/merge/cherry_pick action: start|continue|abort (and skip for "
             "rebase/cherry_pick); resolve conflicts by editing files, add, then "
             "action=continue. merge ff_mode: default|ff_only|no_ff. reset mode: "
-            "soft|mixed (no hard). GitHub operations target the origin repository. "
-            "Merging or approving PRs is not available."
+            "soft|mixed (no hard). PR review and comments, issues, and CI are provided "
+            "by the separate GitHub MCP server; merging or approving is not available here."
         ),
         "inputSchema": {
             "type": "object",
@@ -2578,15 +2447,8 @@ TOOLS = [
                 "name": {"type": "string"},
                 "url": {"type": "string"},
                 "base": {"type": "string"},
-                "head": {"type": "string"},
                 "title": {"type": "string"},
                 "body": {"type": "string"},
-                "number": {"type": "integer", "minimum": 1},
-                "comments": {"type": "boolean"},
-                "state": {"type": "string"},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
-                "run_id": {"type": "integer", "minimum": 1},
-                "log_failed": {"type": "boolean"},
                 "staged": {"type": "boolean"},
                 "max_count": {"type": "integer", "minimum": 1, "maximum": 200},
                 "timeout": {
@@ -2781,8 +2643,8 @@ def _tool_git(args: dict, rec: Optional[_InFlight] = None) -> str:
     completed = False
     bind_fds: list[int] = []
     try:
-        if operation in _GH_OPERATIONS:
-            git_argv = _build_gh_argv(
+        if operation == "pr_create":
+            git_argv = _build_pr_create_argv(
                 request,
                 policy,
                 remote_url=remote_url,

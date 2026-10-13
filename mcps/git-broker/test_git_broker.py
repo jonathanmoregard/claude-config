@@ -1341,7 +1341,7 @@ class BlackBoxBrokerTests(unittest.TestCase):
 
 
 class ParityOperationSchemaTests(unittest.TestCase):
-    """Operations added so Codex reaches the Git/GitHub surface Claude has."""
+    """Operations added so Codex reaches the Git surface Claude has."""
 
     def setUp(self) -> None:
         self.server = load_server()
@@ -1427,36 +1427,19 @@ class ParityOperationSchemaTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(RuntimeError):
                 self.validate(operation="clone", url=bad)
 
-    def test_github_text_fields_are_bounded_and_secret_scanned(self) -> None:
-        token = "ghp_" + "A" * 36
-        for operation, fields in (
-            ("pr_comment", {"number": 1, "body": token}),
-            ("issue_comment", {"number": 1, "body": ""}),
-            ("pr_edit", {"number": 1}),
-            ("pr_edit", {"number": 1, "title": "two\nlines"}),
-            ("issue_create", {"title": "t", "body": "x" * 100_001}),
-            ("pr_view", {"number": 0}),
-            ("pr_list", {"state": "draft"}),
-            ("issue_list", {"state": "merged"}),
-            ("run_view", {"run_id": "1"}),
-        ):
-            with self.subTest(operation=operation, fields=fields), self.assertRaises(RuntimeError):
-                self.validate(operation=operation, **fields)
-
     def test_worktree_paths_must_be_below_creation_root(self) -> None:
         for bad in ("/home/jonathan/worktrees", "/home/jonathan/Repos/x", "relative/x"):
             with self.subTest(bad=bad), self.assertRaises(RuntimeError):
                 self.validate(operation="worktree_remove", worktree_path=bad)
 
-    def test_protected_primary_allows_github_reads_but_not_new_mutations(self) -> None:
+    def test_protected_primary_allows_worktree_removal_but_not_new_mutations(self) -> None:
         identity = self.server._GitIdentity(
             Path("/home/jonathan/.claude"),
             Path("/home/jonathan/.claude/.git"),
             Path("/home/jonathan/.claude/.git"),
             False,
         )
-        for operation in ("pr_view", "pr_comment", "issue_list", "run_view", "worktree_remove"):
-            self.server._authorize_git_operation(identity, operation, self.policy)
+        self.server._authorize_git_operation(identity, "worktree_remove", self.policy)
         for operation in (
             "stash", "reset", "rebase", "merge", "cherry_pick", "tag", "pull",
             "remote_branch_delete", "unstage", "pr_create",
@@ -1484,8 +1467,8 @@ class ParityOperationArgvTests(unittest.TestCase):
             self.policy,
         )
         remote = "https://github.com/owner/project.git"
-        if operation in self.server._GH_OPERATIONS:
-            return self.server._build_gh_argv(
+        if operation == "pr_create":
+            return self.server._build_pr_create_argv(
                 request, self.policy, remote_url=remote, current_branch=current_branch
             )
         argv = self.server._build_git_argv(
@@ -1556,47 +1539,6 @@ class ParityOperationArgvTests(unittest.TestCase):
              "https://github.com/owner/project.git", str(self.identity.worktree)],
         )
 
-    def test_github_argv_pins_origin_repository(self) -> None:
-        cases = [
-            (("pr_view", {"number": 7, "comments": True}), ["pr", "view", "--repo", "github.com/owner/project", "7", "--comments"]),
-            (("pr_list", {"state": "all", "limit": 5, "head": "feat/x"}),
-             ["pr", "list", "--repo", "github.com/owner/project", "--state", "all", "--limit", "5", "--head", "feat/x"]),
-            (("pr_diff", {"number": 7}), ["pr", "diff", "--repo", "github.com/owner/project", "7"]),
-            (("pr_checks", {"number": 7}), ["pr", "checks", "--repo", "github.com/owner/project", "7"]),
-            (("pr_comment", {"number": 7, "body": "b"}), ["pr", "comment", "--repo", "github.com/owner/project", "7", "--body", "b"]),
-            (("pr_edit", {"number": 7, "title": "t"}), ["pr", "edit", "--repo", "github.com/owner/project", "7", "--title", "t"]),
-            (("pr_close", {"number": 7}), ["pr", "close", "--repo", "github.com/owner/project", "7"]),
-            (("pr_reopen", {"number": 7}), ["pr", "reopen", "--repo", "github.com/owner/project", "7"]),
-            (("issue_view", {"number": 3}), ["issue", "view", "--repo", "github.com/owner/project", "3"]),
-            (("issue_list", {}), ["issue", "list", "--repo", "github.com/owner/project", "--state", "open", "--limit", "30"]),
-            (("issue_comment", {"number": 3, "body": "b"}), ["issue", "comment", "--repo", "github.com/owner/project", "3", "--body", "b"]),
-            (("issue_create", {"title": "t", "body": "b"}), ["issue", "create", "--repo", "github.com/owner/project", "--title", "t", "--body", "b"]),
-            (("run_list", {"head": "feat/x"}), ["run", "list", "--repo", "github.com/owner/project", "--limit", "20", "--branch", "feat/x"]),
-            (("run_view", {"run_id": 99, "log_failed": True}), ["run", "view", "--repo", "github.com/owner/project", "99", "--log-failed"]),
-        ]
-        for (operation, fields), expected in cases:
-            with self.subTest(operation=operation):
-                argv = self.argv(operation, **fields)
-                self.assertEqual(Path(argv[0]).name, "gh")
-                self.assertEqual(argv[1:], expected)
-
-    def test_github_operations_mount_repo_read_only_with_network(self) -> None:
-        request = self.server._validate_git_request(
-            {"repo_path": str(self.identity.worktree), "operation": "pr_comment",
-             "number": 1, "body": "b"},
-            self.policy,
-        )
-        argv, env = self.server._build_git_sandbox(
-            request, self.identity, self.policy, ["gh"],
-            existing_only=False, remote_url="https://github.com/owner/project.git",
-        )
-        self.assertIn("--share-net", argv)
-        for path in (self.identity.worktree, self.identity.common_dir):
-            self.assertTrue(any(
-                argv[i : i + 3] == ["--ro-bind", str(path), str(path)] for i in range(len(argv))
-            ))
-        self.assertEqual(env["GH_PROMPT_DISABLED"], "1")
-
     def test_local_sequencer_runs_offline_with_editor_disabled(self) -> None:
         request = self.server._validate_git_request(
             {"repo_path": str(self.identity.worktree), "operation": "rebase", "action": "continue"},
@@ -1640,7 +1582,6 @@ class ParityOperationArgvTests(unittest.TestCase):
             ("remote_branch_delete", ("branch", "feat/x")): "push origin --delete feat/x",
             ("stash", ("action", "drop"), ("index", 1)): "stash drop 'stash@{1}'",
             ("commit", ("message", "m"), ("amend", True)): "commit --amend --message m",
-            ("pr_close", ("number", 4)): "gh pr close 4",
         }
         for (operation, *fields), expected in cases.items():
             request = self.server._validate_git_request(
