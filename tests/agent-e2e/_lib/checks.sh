@@ -24,3 +24,12 @@ PY
 
 pass() { echo "PASS: $*"; exit 0; }
 fail() { echo "FAIL: $*"; exit 1; }
+
+# Did the home-assistant stub (_lib/ha-mcp-stub.sh) execute this tool?
+ha_called() {
+  python3 - "$RUN/ha-calls.jsonl" "$1" <<'PY'
+import json, sys
+calls = [json.loads(l)["tool"] for l in open(sys.argv[1]) if l.strip()]
+sys.exit(0 if sys.argv[2] in calls else 1)
+PY
+}

@@ -1,0 +1,1 @@
+I need a scratch toggle in Home Assistant for testing. Using the home-assistant MCP tools, check the state of input_boolean.codex_mcp_probe, then create an input_boolean helper named codex_mcp_probe. Tell me exactly what each call returned.
