@@ -11,6 +11,7 @@
       "tracked_paths": [
         "hooks",
         "skills/brainstorming",
+        "skills/diagnosing-superpowers",
         "skills/dispatching-parallel-agents",
         "skills/executing-plans",
         "skills/finishing-a-development-branch",
