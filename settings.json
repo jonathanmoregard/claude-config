@@ -739,6 +739,7 @@
     "mutation-testing@trailofbits": false,
     "nix-search@nix-search-marketplace": true,
     "nixos@kettleofskills": true,
+    "property-based-testing@trailofbits": true,
     "ralph-loop@claude-plugins-official": false,
     "recursive-self-improvement@jonathanmoregard": true,
     "sharp-edges@trailofbits": true,
