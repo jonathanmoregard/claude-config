@@ -1,0 +1,39 @@
+{
+  "_comment": "Forks whose upstream scripts/upstream-drift.py watches. Per entry: fork_repo/fork_branch and upstream_url/upstream_branch are fetched into a private cache; tracked_paths are the upstream paths we consume (a commit touching none of them is not drift); customized_paths are the subset we changed in the fork, where an upstream commit is a merge-collision risk; pin is where ~/.claude vendors the fork.",
+  "entries": [
+    {
+      "name": "superpowers",
+      "fork_repo": "https://github.com/jonathanmoregard/superpowers.git",
+      "fork_branch": "main",
+      "upstream_url": "https://github.com/obra/superpowers.git",
+      "upstream_branch": "main",
+      "pin": "vendor/superpowers",
+      "tracked_paths": [
+        "hooks",
+        "skills/brainstorming",
+        "skills/dispatching-parallel-agents",
+        "skills/executing-plans",
+        "skills/finishing-a-development-branch",
+        "skills/receiving-code-review",
+        "skills/requesting-code-review",
+        "skills/researching-prior-art",
+        "skills/subagent-driven-development",
+        "skills/systematic-debugging",
+        "skills/test-driven-development",
+        "skills/using-git-worktrees",
+        "skills/using-superpowers",
+        "skills/verification-before-completion",
+        "skills/writing-plans",
+        "skills/writing-skills"
+      ],
+      "customized_paths": [
+        "skills/brainstorming",
+        "skills/researching-prior-art",
+        "skills/subagent-driven-development",
+        "skills/test-driven-development",
+        "skills/writing-plans",
+        "skills/writing-skills"
+      ]
+    }
+  ]
+}
