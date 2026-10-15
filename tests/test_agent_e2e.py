@@ -70,6 +70,60 @@ def test_stage_from_git_ref(tmp_path):
     assert (home / ".claude/scripts/claude-worktree.sh").is_file()
 
 
+def _git(*args):
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t",
+                    "-c", "protocol.file.allow=always", *map(str, args)],
+                   check=True, capture_output=True)
+
+
+def _config_with_vendored_skill(tmp_path) -> pathlib.Path:
+    """A config repo whose skills/x links into a vendor/ submodule, carrying
+    a copy of this harness so its git-ref mode archives THIS repo."""
+    sub = tmp_path / "upstream"
+    (sub / "skills/x").mkdir(parents=True)
+    (sub / "skills/x/SKILL.md").write_text("vendored\n")
+    _git("init", "-q", sub)
+    _git("-C", sub, "add", "-A")
+    _git("-C", sub, "commit", "-qm", "x")
+    cfg = tmp_path / "cfg"
+    (cfg / "scripts/agent-e2e").mkdir(parents=True)
+    (cfg / "skills").mkdir()
+    (cfg / "scripts/agent-e2e/agent_e2e.py").write_text(HARNESS.read_text())
+    (cfg / "skills/x").symlink_to("../vendor/sub/skills/x")
+    _git("init", "-q", cfg)
+    _git("-C", cfg, "submodule", "add", "-q", sub, "vendor/sub")
+    _git("-C", cfg, "add", "-A")
+    _git("-C", cfg, "commit", "-qm", "x")
+    return cfg
+
+
+def test_stage_from_worktree_carries_vendored_submodule(tmp_path):
+    cfg = _config_with_vendored_skill(tmp_path)
+    home = tmp_path / "home"
+    r = harness("stage", "--config", str(cfg), "--home", str(home))
+    assert r.returncode == 0, r.stderr
+    assert (home / ".claude/skills/x/SKILL.md").read_text() == "vendored\n"
+
+
+def test_stage_from_git_ref_carries_vendored_submodule(tmp_path):
+    cfg = _config_with_vendored_skill(tmp_path)
+    home = tmp_path / "home"
+    r = subprocess.run([sys.executable, str(cfg / "scripts/agent-e2e/agent_e2e.py"),
+                        "stage", "--config", "HEAD", "--home", str(home)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert (home / ".claude/skills/x/SKILL.md").read_text() == "vendored\n"
+
+
+def test_stage_names_a_submodule_it_could_not_stage(tmp_path):
+    cfg = _config_with_vendored_skill(tmp_path)
+    _git("-C", cfg, "submodule", "deinit", "-q", "--force", "vendor/sub")
+    home = tmp_path / "home"
+    r = harness("stage", "--config", str(cfg), "--home", str(home))
+    assert r.returncode == 0, r.stderr
+    assert "vendor/sub" in r.stdout and "not initialised" in r.stdout
+
+
 def _scenario(tmp_path, check_body: str) -> pathlib.Path:
     sc = tmp_path / "sc"
     sc.mkdir()
