@@ -48,10 +48,12 @@ of the diff is not the criterion, the ownership of the branch is.
 | `CLAUDE.md` | global instructions |
 
 A `skills/<name>` entry that is a **symlink** belongs to another repo
-(`~/Repos/superpowers`, `~/Repos/everything-claude-code`, `~/Repos/token-optimizer`,
-`~/Repos/router-agent`, `/nix/store`). Editing it from here lands the change in
-that repo, or fails on a read-only store path. Route it through the owning
-repo's own PR flow.
+(`~/Repos/everything-claude-code`, `~/Repos/token-optimizer`,
+`~/Repos/router-agent`, `/nix/store`), or to a pinned submodule under `vendor/`
+(`vendor/superpowers` = github.com/jonathanmoregard/superpowers). Editing it
+from here lands the change in that repo, fails on a read-only store path, or
+edits a pinned copy. Route it through the owning repo's own PR flow; a
+`vendor/` pin then moves by a `~/.claude` PR.
 
 ## Ephemeral files → `tmp/`
 

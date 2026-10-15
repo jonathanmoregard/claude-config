@@ -118,6 +118,8 @@ GUARDED = [
     "templates/some-template.md",
     "bin/some-bin",
     ".githooks/pre-commit",
+    "vendor/superpowers/skills/brainstorming/SKILL.md",
+    "vendor/superpowers/hooks/session-start",
 ]
 
 
@@ -140,6 +142,13 @@ def test_symlinked_skill_entry_is_refused_and_redirected():
     """A skills/ entry symlinked into another repo must go through that repo."""
     reason = assert_denied(write_payload(os.path.join(LIVE, "skills/writing-skills/SKILL.md")))
     assert "symlink" in reason
+
+
+def test_vendored_submodule_is_refused_and_redirected():
+    """A vendor/ submodule is a pinned copy of another repo: edit it there."""
+    reason = assert_denied(write_payload(
+        os.path.join(LIVE, "vendor/superpowers/skills/brainstorming/SKILL.md")))
+    assert "submodule" in reason
 
 
 # --- live Codex tree is sync/runtime-owned, never agent-edited --------------

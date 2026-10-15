@@ -59,6 +59,7 @@ GUARDED_DIRS = (
     "templates",
     "bin",
     ".githooks",
+    "vendor",
 )
 
 # Sibling-owned data trees that live under ~/.claude for historical reasons and
@@ -97,9 +98,11 @@ REASON = (
     "Edit ~/worktrees/claude-<slug>/{rel} there, commit, push, then "
     "`gh pr create`. The merge click is Jonathan's. Never commit to a branch "
     "this session did not create.\n\n"
-    "If {rel} is a symlink into another repo (~/Repos/superpowers, "
-    "~/Repos/everything-claude-code, /nix/store, ...), edit it in that repo "
-    "and route it through that repo's own PR flow."
+    "If {rel} is a symlink into another repo (~/Repos/everything-claude-code, "
+    "/nix/store, ...) or sits in a vendored submodule (vendor/superpowers, "
+    "pinned from github.com/jonathanmoregard/superpowers), edit it in that "
+    "repo and route it through that repo's own PR flow; a submodule pin "
+    "moves only by a ~/.claude PR."
 )
 
 CODEX_REASON = (
