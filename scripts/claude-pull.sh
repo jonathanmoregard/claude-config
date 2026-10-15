@@ -246,6 +246,23 @@ if ! timeout 60 git fetch --quiet --prune origin "$BRANCH"; then
 fi
 rm -f "$STATE/fetch-failures"
 
+# Check out every submodule at the commit the superproject pins.
+sync_submodules() {
+  [ -f .gitmodules ] || return 0
+  local sub_err
+  if ! sub_err="$(git submodule update --init --recursive --quiet 2>&1)"; then
+    log "submodule update failed (superproject is unaffected): $(printf '%s' "$sub_err" | head -3)"
+  fi
+}
+
+# A submodule whose first clone failed stays empty until it is retried, and
+# skills load through vendor/superpowers. So a tick with nothing to pull still
+# retries any submodule that was never checked out (`-` in submodule status).
+# Initialized submodules are left alone here; only a pull moves them.
+if [ -f .gitmodules ] && git submodule status --recursive 2>/dev/null | grep -q '^-'; then
+  sync_submodules
+fi
+
 local_sha="$(git rev-parse HEAD)"
 remote_sha="$(git rev-parse "$UPSTREAM")"
 base_sha="$(git merge-base HEAD "$UPSTREAM")"
@@ -383,10 +400,6 @@ log "fast-forwarded $BRANCH: $(git rev-parse --short "$base_sha") -> $(git rev-p
 # leaves the submodule at the old commit until it is checked out. Best
 # effort: a submodule with local edits is a reason to log, not to fail the
 # pull that already succeeded.
-if [ -f .gitmodules ]; then
-  if ! sub_err="$(git submodule update --init --recursive --quiet 2>&1)"; then
-    log "submodule update failed (superproject is still fast-forwarded): $(printf '%s' "$sub_err" | head -3)"
-  fi
-fi
+sync_submodules
 
 clear_alert
