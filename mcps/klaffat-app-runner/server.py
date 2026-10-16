@@ -524,7 +524,7 @@ def _write_state(state: dict, policy: dict, *, create: bool) -> None:
 
 
 def _read_state(run_id: str, policy: dict) -> dict:
-    root = _ensure_state_root(policy)
+    _ensure_state_root(policy)
     path = _state_path(run_id, policy)
     try:
         info = path.lstat()
