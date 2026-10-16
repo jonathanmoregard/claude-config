@@ -525,6 +525,33 @@ expect_settings "unrelated pull keeps the model setting" model '"opus[1m]"'
 expect_settings "unrelated pull keeps the rest of settings" permissions.allow '["Bash"]'
 [ -f "$CLONE/new.txt" ] || { echo "FAIL carryunrelated: new.txt not present after pull"; fail=$((fail+1)); }
 
+# 15. A submodule whose first clone failed is retried on the next tick, even
+#     when the superproject is already current. Skills load through
+#     vendor/superpowers, so an empty submodule must not wait for the next
+#     master commit to heal.
+export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=protocol.file.allow GIT_CONFIG_VALUE_0=always
+fresh subretry
+SUB="$ROOT/subretry/sub.git"
+git init --quiet --bare -b main "$SUB"
+git init --quiet -b main "$ROOT/subretry/subseed"
+echo skill > "$ROOT/subretry/subseed/SKILL.md"
+git -C "$ROOT/subretry/subseed" add -A >/dev/null
+git -C "$ROOT/subretry/subseed" commit --quiet -m sub
+git -C "$ROOT/subretry/subseed" push --quiet "$SUB" main
+w="$ROOT/pushwork"; rm -rf "$w"; git clone --quiet "$ORIGIN" "$w"
+git -C "$w" submodule --quiet add "$SUB" vendor/sub
+git -C "$w" commit --quiet -m "add submodule"
+git -C "$w" push --quiet origin master
+mv "$SUB" "$SUB.away"
+run
+check "submodule clone failure still fast-forwards" 0 "$rc" "submodule update failed" "$out"
+mv "$SUB.away" "$SUB"
+run
+[ -f "$CLONE/vendor/sub/SKILL.md" ] \
+  && { echo "PASS empty submodule is populated on the next tick"; pass=$((pass+1)); } \
+  || { echo "FAIL subretry: vendor/sub still empty on the tick after a failed clone"; fail=$((fail+1)); }
+unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+
 echo
 echo "passed: $pass  failed: $fail"
 echo "workdir: $ROOT"

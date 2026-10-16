@@ -1,3 +1,6 @@
 [submodule "skills/prompt-master"]
 	path = skills/prompt-master
 	url = https://github.com/nidhinjs/prompt-master.git
+[submodule "vendor/superpowers"]
+	path = vendor/superpowers
+	url = https://github.com/jonathanmoregard/superpowers.git

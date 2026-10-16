@@ -508,7 +508,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; CLAUDE_PLUGIN_ROOT=/home/jonathan/Repos/superpowers /home/jonathan/Repos/superpowers/hooks/session-start"
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; CLAUDE_PLUGIN_ROOT=$HOME/.claude/vendor/superpowers $HOME/.claude/vendor/superpowers/hooks/session-start"
           }
         ]
       },

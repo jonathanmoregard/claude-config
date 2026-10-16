@@ -71,7 +71,7 @@ REPO = pathlib.Path(__file__).resolve().parents[2]
 # the sandbox, and ssh resolves ~/.ssh the same way.
 REAL_HOME = pathlib.Path(pwd.getpwuid(os.getuid()).pw_dir)
 # Linked, never copied: auth, the plugin cache and the tree relative skill
-# symlinks (`../../Repos/superpowers/...`) resolve into.
+# symlinks (`../../Repos/everything-claude-code/...`) resolve into.
 LINKS = {
     ".claude/.credentials.json": REAL_HOME / ".claude/.credentials.json",
     ".claude/plugins": REAL_HOME / ".claude/plugins",
@@ -97,6 +97,48 @@ def sh(argv, **kw):
     return subprocess.run(argv, check=True, capture_output=True, text=True, **kw)
 
 
+def extract(repo: pathlib.Path, rev: str, dest: pathlib.Path) -> None:
+    """Write the tree of REV in REPO under DEST (submodules come empty)."""
+    dest.mkdir(parents=True, exist_ok=True)
+    archive = subprocess.run(["git", "-C", str(repo), "archive", rev],
+                             check=True, capture_output=True)
+    subprocess.run(["tar", "-xf", "-", "-C", str(dest)], input=archive.stdout,
+                   check=True)
+
+
+def gitlinks(repo: pathlib.Path, rev: str | None) -> list[tuple[str, str]]:
+    """(path, pinned commit) of every submodule in REV's tree, or the index."""
+    argv = ["ls-tree", "-r", "-z", rev] if rev else ["ls-files", "-s", "-z"]
+    links = []
+    for entry in filter(None, sh(["git", "-C", str(repo), *argv]).stdout.split("\0")):
+        meta, path = entry.split("\t", 1)
+        fields = meta.split()
+        if fields[0] == "160000":
+            links.append((path, fields[2] if rev else fields[1]))
+    return links
+
+
+def stage_submodules(repo: pathlib.Path, rev: str | None, dest: pathlib.Path) -> list[str]:
+    """Copy each submodule's content under DEST: its working tree when staging
+    a worktree (REV None), its pinned commit when staging a git ref. Skill
+    symlinks into vendor/ dangle without this. Returns a note per submodule
+    that could not be staged."""
+    notes = []
+    for path, pin in gitlinks(repo, rev):
+        sub = repo / path
+        if not (sub / ".git").exists():
+            notes.append(f"submodule {path} not initialised")
+        elif rev is None:
+            shutil.copytree(sub, dest / path, symlinks=True, dirs_exist_ok=True,
+                            ignore=shutil.ignore_patterns(".git"))
+        else:
+            try:
+                extract(sub, pin, dest / path)
+            except subprocess.CalledProcessError:
+                notes.append(f"submodule {path} @ {pin[:7]} not fetched locally")
+    return notes
+
+
 def copy_config(src: str, dest: pathlib.Path) -> str:
     """Materialise config SRC at DEST. Returns a short provenance string."""
     dest.mkdir(parents=True, exist_ok=True)
@@ -114,17 +156,16 @@ def copy_config(src: str, dest: pathlib.Path) -> str:
                     d.symlink_to(os.readlink(s))
                 elif s.is_file():
                     shutil.copy2(s, d)
+            notes = stage_submodules(path, None, dest)
             head = sh(["git", "-C", str(path), "rev-parse", "--short", "HEAD"]).stdout.strip()
             dirty = sh(["git", "-C", str(path), "status", "--porcelain"]).stdout.strip()
-            return f"{path} @ {head}{' +uncommitted' if dirty else ''}"
+            return "; ".join([f"{path} @ {head}{' +uncommitted' if dirty else ''}", *notes])
         shutil.copytree(path, dest, symlinks=True, dirs_exist_ok=True)
         return f"{path} (plain directory)"
     sha = sh(["git", "-C", str(REPO), "rev-parse", "--short", src]).stdout.strip()
-    archive = subprocess.run(["git", "-C", str(REPO), "archive", src],
-                             check=True, capture_output=True)
-    subprocess.run(["tar", "-xf", "-", "-C", str(dest)], input=archive.stdout,
-                   check=True)
-    return f"{src} @ {sha}"
+    extract(REPO, src, dest)
+    notes = stage_submodules(REPO, src, dest)
+    return "; ".join([f"{src} @ {sha}", *notes])
 
 
 def stage(src: str, home: pathlib.Path) -> str:
