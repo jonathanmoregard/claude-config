@@ -993,6 +993,15 @@ class LifecycleTests(unittest.TestCase):
         )
         self.assertEqual(again["phase"], "stopped")
 
+    def test_stop_keeps_the_exit_code_a_finished_run_reported(self) -> None:
+        state = self.start("e2e", FakeRunner((0, "accepted", "")))
+        state.update(phase="failed", exit_code=1)
+        self.server._write_state(state, self.policy, create=False)
+        stopped = self.server._stop_run(
+            self.first_id, self.policy, runner=FakeRunner((0, "", ""), (0, "", ""))
+        )
+        self.assertEqual((stopped["phase"], stopped["exit_code"]), ("stopped", 1))
+
     def test_only_active_real_calendar_owner_can_stop_singleton(self) -> None:
         self.start("real_calendar", FakeRunner((0, "ready", "")))
         self.start(

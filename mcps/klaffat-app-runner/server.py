@@ -1083,7 +1083,9 @@ def _stop_run(run_id: str, policy: dict, *, runner, rec=None) -> dict:
             rec,
         )
         _cleanup_runtime_dir(state, policy)
-    state.update(phase="stopped", exit_code=0)
+    # A finished one-shot run keeps the exit code it finished with.
+    finished = state["phase"] in {"succeeded", "failed"}
+    state.update(phase="stopped", exit_code=state["exit_code"] if finished else 0)
     _write_state(state, policy, create=False)
     return state
 
