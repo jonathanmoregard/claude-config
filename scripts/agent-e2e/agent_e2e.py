@@ -71,7 +71,7 @@ REPO = pathlib.Path(__file__).resolve().parents[2]
 # the sandbox, and ssh resolves ~/.ssh the same way.
 REAL_HOME = pathlib.Path(pwd.getpwuid(os.getuid()).pw_dir)
 # Linked, never copied: auth, the plugin cache and the tree relative skill
-# symlinks (`../../Repos/everything-claude-code/...`) resolve into.
+# symlinks (`../../Repos/router-agent/...`) resolve into.
 LINKS = {
     ".claude/.credentials.json": REAL_HOME / ".claude/.credentials.json",
     ".claude/plugins": REAL_HOME / ".claude/plugins",
