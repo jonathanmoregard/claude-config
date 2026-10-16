@@ -41,6 +41,15 @@
     "args": [],
     "env": {}
   },
+  "klaffat-app-runner": {
+    "type": "stdio",
+    "command": "/run/current-system/sw/bin/python3",
+    "args": [
+      "/home/jonathan/.claude/mcps/klaffat-app-runner/server.py"
+    ],
+    "env": {},
+    "timeout": 1900000
+  },
   "reddit": {
     "command": "/etc/profiles/per-user/jonathan/bin/uvx",
     "args": [
