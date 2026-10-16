@@ -60,5 +60,11 @@
       "mcp-server-reddit"
     ],
     "env": {}
+  },
+  "home-assistant": {
+    "type": "stdio",
+    "command": "ha-mcp",
+    "args": [],
+    "env": {}
   }
 }
