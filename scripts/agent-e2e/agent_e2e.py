@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import hashlib
 import json
 import os
 import pathlib
@@ -71,7 +72,7 @@ REPO = pathlib.Path(__file__).resolve().parents[2]
 # the sandbox, and ssh resolves ~/.ssh the same way.
 REAL_HOME = pathlib.Path(pwd.getpwuid(os.getuid()).pw_dir)
 # Linked, never copied: auth, the plugin cache and the tree relative skill
-# symlinks (`../../Repos/everything-claude-code/...`) resolve into.
+# symlinks (`../../Repos/router-agent/...`) resolve into.
 LINKS = {
     ".claude/.credentials.json": REAL_HOME / ".claude/.credentials.json",
     ".claude/plugins": REAL_HOME / ".claude/plugins",
@@ -166,6 +167,30 @@ def copy_config(src: str, dest: pathlib.Path) -> str:
     extract(REPO, src, dest)
     notes = stage_submodules(REPO, src, dest)
     return "; ".join([f"{src} @ {sha}", *notes])
+
+
+def scenario_id(scenario: pathlib.Path) -> str:
+    """Digest of every file in the scenario (prompt, setup, check, stubs), so
+    an edited scenario is run again rather than resumed."""
+    h = hashlib.sha256()
+    for f in sorted(p for p in scenario.rglob("*") if p.is_file()):
+        h.update(str(f.relative_to(scenario)).encode() + b"\0" + f.read_bytes() + b"\0")
+    return h.hexdigest()
+
+
+def config_id(src: str) -> str | None:
+    """The exact config SRC names right now: a commit, or None when it has no
+    fixed identity (an uncommitted worktree, a plain directory). A finished run
+    is resumed only under the same id, so an arm pointed at another commit, or
+    a moving ref that has moved, is run again rather than reported stale."""
+    path = pathlib.Path(src).expanduser()
+    if path.is_dir():
+        if not (path / ".git").exists():
+            return None
+        if sh(["git", "-C", str(path), "status", "--porcelain"]).stdout.strip():
+            return None
+        return sh(["git", "-C", str(path), "rev-parse", "HEAD"]).stdout.strip()
+    return sh(["git", "-C", str(REPO), "rev-parse", src]).stdout.strip()
 
 
 def stage(src: str, home: pathlib.Path) -> str:
@@ -269,8 +294,12 @@ def result_event(events: list[dict]) -> dict:
 def run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
             out: pathlib.Path, args) -> dict:
     run = out / arm / str(idx)
-    if (run / "verdict.json").exists():  # resumable; never re-spend
-        return json.loads((run / "verdict.json").read_text(encoding="utf-8"))
+    cid = config_id(src)
+    key = cid and f"{cid}:{scenario_id(scenario)}"
+    if key and (run / "verdict.json").exists():  # resumable; never re-spend
+        done = json.loads((run / "verdict.json").read_text(encoding="utf-8"))
+        if done.get("resume_key") == key:
+            return done
     if run.exists():
         shutil.rmtree(run)
     home, work, bindir = run / "home", run / "work", run / "bin"
@@ -300,7 +329,7 @@ def run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
     setup = subprocess.run(["bash", str(scenario / "setup.sh"), str(work), str(run)],
                            env=env, capture_output=True, text=True)
     (run / "setup.log").write_text(setup.stdout + setup.stderr, encoding="utf-8")
-    verdict = {"arm": arm, "run": idx, "config": provenance}
+    verdict = {"arm": arm, "run": idx, "config": provenance, "resume_key": key}
     if setup.returncode != 0:
         verdict.update(verdict="INCONCLUSIVE", why=f"setup.sh exit {setup.returncode}")
         (run / "verdict.json").write_text(json.dumps(verdict, indent=2), encoding="utf-8")
