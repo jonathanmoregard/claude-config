@@ -255,6 +255,18 @@ sync_submodules() {
   fi
 }
 
+# Report ok only when every submodule is checked out: skills link into
+# vendor/, so an empty submodule is missing skills, not a healthy checkout.
+finish_ok() {
+  local missing
+  missing="$(git submodule status --recursive 2>/dev/null | sed -n 's/^-[0-9a-f]* \([^ ]*\).*/\1/p')"
+  if [ -n "$missing" ]; then
+    alert "Submodule(s) not checked out, so skills that link into them are missing: $(printf '%s' "$missing" | tr '\n' ' ')"
+    exit 1
+  fi
+  clear_alert
+}
+
 # A submodule whose first clone failed stays empty until it is retried, and
 # skills load through vendor/superpowers. So a tick with nothing to pull still
 # retries any submodule that was never checked out (`-` in submodule status).
@@ -268,13 +280,13 @@ remote_sha="$(git rev-parse "$UPSTREAM")"
 base_sha="$(git merge-base HEAD "$UPSTREAM")"
 
 if [ "$local_sha" = "$remote_sha" ]; then
-  clear_alert
+  finish_ok
   exit 0
 fi
 
 if [ "$remote_sha" = "$base_sha" ]; then
   # Local commits not yet pushed — sync-agent.sh's job, not this script's.
-  clear_alert
+  finish_ok
   log "$BRANCH is ahead of $UPSTREAM by $(git rev-list --count "$UPSTREAM..HEAD") commit(s); nothing to pull"
   exit 0
 fi
@@ -402,4 +414,4 @@ log "fast-forwarded $BRANCH: $(git rev-parse --short "$base_sha") -> $(git rev-p
 # pull that already succeeded.
 sync_submodules
 
-clear_alert
+finish_ok
