@@ -35,6 +35,40 @@
         "skills/writing-plans",
         "skills/writing-skills"
       ]
+    },
+    {
+      "name": "everything-claude-code",
+      "fork_repo": "https://github.com/jonathanmoregard/everything-claude-code.git",
+      "fork_branch": "main",
+      "upstream_url": "https://github.com/affaan-m/ECC.git",
+      "upstream_branch": "main",
+      "pin": "vendor/everything-claude-code",
+      "tracked_paths": [
+        "skills/accessibility",
+        "skills/brand-voice",
+        "skills/codebase-onboarding",
+        "skills/content-engine",
+        "skills/context-budget",
+        "skills/database-migrations",
+        "skills/deep-research",
+        "skills/frontend-patterns",
+        "skills/knowledge-ops",
+        "skills/lead-intelligence",
+        "skills/market-research",
+        "skills/research-ops",
+        "skills/security-review",
+        "skills/seo",
+        "skills/skill-comply",
+        "skills/skill-stocktake",
+        "skills/strategic-compact"
+      ],
+      "customized_paths": [
+        "skills/brand-voice",
+        "skills/deep-research",
+        "skills/seo",
+        "skills/skill-stocktake",
+        "skills/strategic-compact"
+      ]
     }
   ]
 }

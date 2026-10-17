@@ -544,9 +544,15 @@ git -C "$w" commit --quiet -m "add submodule"
 git -C "$w" push --quiet origin master
 mv "$SUB" "$SUB.away"
 run
-check "submodule clone failure still fast-forwards" 0 "$rc" "submodule update failed" "$out"
+check "submodule clone failure alerts instead of reporting ok" 1 "$rc" "Submodule\(s\) not checked out, so skills that link into them are missing: vendor/sub" "$out"
+printf '%s' "$out" | grep -q "fast-forwarded master" \
+  && { echo "PASS submodule clone failure still fast-forwards"; pass=$((pass+1)); } \
+  || { echo "FAIL subretry: superproject was not fast-forwarded"; fail=$((fail+1)); }
+expect_status "an empty submodule is not a healthy checkout" state alert
 mv "$SUB.away" "$SUB"
 run
+check "retried submodule clears the alert" 0 "$rc"
+expect_status "status is ok once the submodule is checked out" state ok
 [ -f "$CLONE/vendor/sub/SKILL.md" ] \
   && { echo "PASS empty submodule is populated on the next tick"; pass=$((pass+1)); } \
   || { echo "FAIL subretry: vendor/sub still empty on the tick after a failed clone"; fail=$((fail+1)); }
