@@ -417,3 +417,31 @@ def test_scenario_stub_mcp_config_is_passed_only_when_written(tmp_path):
     _, out, _ = _run(tmp_path, without, claude)
     plain = json.loads((out / "plain/new/1/verdict.json").read_text())
     assert plain["verdict"] == "PASS"
+
+
+def test_resume_reuses_a_verdict_only_for_the_same_config(tmp_path):
+    """A finished run is resumed only when its arm still names the same commit;
+    pointing the arm elsewhere re-runs it instead of reporting the old verdict."""
+    # The agent's /tmp is private, so it leaves its mark in its own run dir.
+    claude = fake_claude(tmp_path, 'date +%s%N > "$E2E_RUN/called"\ncat <<\'EOF\'\n'
+                                   + stream("ok", []) + "\nEOF\n")
+    sc = _scenario(tmp_path, "true\n")
+    out = tmp_path / "out"
+
+    def run(src):
+        r = harness("run", str(sc), "--arm", f"new={src}", "--n", "1", "--jobs", "1",
+                    "--out", str(out), "--claude", str(claude))
+        assert r.returncode == 0, r.stderr
+        run_dir = out / "sc/new/1"
+        return (json.loads((run_dir / "verdict.json").read_text()),
+                (run_dir / "called").read_text())
+
+    first = run("HEAD")
+    assert run("HEAD") == first, "same commit: resumed, not re-spent"
+    moved = run("HEAD~1")
+    assert moved[1] != first[1], "another commit must re-run"
+    assert moved[0]["config"] != first[0]["config"]
+    (sc / "check.sh").write_text("#!/usr/bin/env bash\nexit 1\n")
+    edited = run("HEAD~1")
+    assert edited[1] != moved[1], "an edited scenario must re-run"
+    assert edited[0]["verdict"] == "FAIL"
