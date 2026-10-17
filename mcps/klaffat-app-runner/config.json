@@ -8,7 +8,6 @@
       "https://github.com/klaffat/klaffat.git"
     ],
     "stateRoot": "/home/jonathan/.local/state/klaffat-app-runner",
-    "gitExecutable": "/run/current-system/sw/bin/git",
     "nixExecutable": "/run/current-system/sw/bin/nix",
     "bashExecutable": "/run/current-system/sw/bin/bash",
     "pythonExecutable": "/run/current-system/sw/bin/python3",

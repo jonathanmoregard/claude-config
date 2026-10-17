@@ -48,7 +48,6 @@ def valid_policy() -> dict:
             "https://github.com/klaffat/klaffat.git",
         ],
         "stateRoot": "/home/jonathan/.local/state/klaffat-app-runner",
-        "gitExecutable": "/run/current-system/sw/bin/git",
         "nixExecutable": "/run/current-system/sw/bin/nix",
         "bashExecutable": "/run/current-system/sw/bin/bash",
         "pythonExecutable": "/run/current-system/sw/bin/python3",
@@ -133,6 +132,16 @@ class PolicySchemaTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "unknown"):
             self.load(policy)
 
+    def test_policy_declares_no_git_executable(self) -> None:
+        # Worktree validation reads git metadata files directly and never
+        # invokes git, so a gitExecutable would be unenforced policy.
+        self.assertNotIn("gitExecutable", self.server._POLICY_KEYS)
+        self.assertNotIn("gitExecutable", self.server._PATH_KEYS)
+        policy = valid_policy()
+        policy["gitExecutable"] = "/run/current-system/sw/bin/git"
+        with self.assertRaisesRegex(RuntimeError, "gitExecutable"):
+            self.load(policy)
+
     def test_policy_version_is_exact_integer_one(self) -> None:
         for version in (True, 1.0, 0, 2, "1"):
             with self.subTest(version=version):
@@ -146,7 +155,6 @@ class PolicySchemaTests(unittest.TestCase):
             "worktreeRoot",
             "klaffatPrimary",
             "stateRoot",
-            "gitExecutable",
             "nixExecutable",
             "bashExecutable",
             "pythonExecutable",
@@ -1092,6 +1100,13 @@ class RedactionAndLogsTests(unittest.TestCase):
         self.assertLessEqual(len(safe), 120)
         self.assertTrue(safe.endswith("[output truncated]"))
 
+    def test_output_bound_holds_below_the_truncation_marker(self) -> None:
+        for limit in (1, 8, len("\n[output truncated]")):
+            with self.subTest(limit=limit):
+                policy = dict(self.policy, maxOutputChars=limit)
+                safe = self.server._safe_output("x" * 1000, policy)
+                self.assertLessEqual(len(safe), limit)
+
     def test_logs_uses_exact_owned_unit_and_requested_tail(self) -> None:
         self.assertTrue(hasattr(self.server, "_logs_run"), "missing logs lifecycle")
         runner = FakeRunner(
@@ -1439,7 +1454,6 @@ class McpProtocolTests(unittest.TestCase):
                 klaffatPrimary=str(primary),
                 allowedOrigins=[origin],
                 stateRoot=str(base / "state"),
-                gitExecutable=executables["nix"],
                 nixExecutable=executables["nix"],
                 bashExecutable=executables["bash"],
                 pythonExecutable=executables["python3"],

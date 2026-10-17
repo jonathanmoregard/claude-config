@@ -39,7 +39,6 @@ _POLICY_KEYS = frozenset(
         "klaffatPrimary",
         "allowedOrigins",
         "stateRoot",
-        "gitExecutable",
         "nixExecutable",
         "bashExecutable",
         "pythonExecutable",
@@ -59,7 +58,6 @@ _PATH_KEYS = (
     "worktreeRoot",
     "klaffatPrimary",
     "stateRoot",
-    "gitExecutable",
     "nixExecutable",
     "bashExecutable",
     "pythonExecutable",
@@ -88,6 +86,9 @@ _STATE_KEYS = frozenset(
     }
 )
 _PHASES = frozenset(
+    # "cancelled" is reserved: no code path writes it today, because a cancelled
+    # request suppresses its response rather than settling the run. It stays in
+    # the enum so `_settled` keeps treating it as terminal if that ever changes.
     {"accepted", "active", "running", "succeeded", "failed", "stopped", "cancelled"}
 )
 # Origin-relative path plus optional query: RFC 3986 characters only, no
@@ -1158,7 +1159,11 @@ def _safe_output(text: str, policy: dict) -> str:
     limit = policy["maxOutputChars"]
     marker = "\n[output truncated]"
     if len(safe) > limit:
-        safe = safe[: max(0, limit - len(marker))] + marker
+        if limit > len(marker):
+            safe = safe[: limit - len(marker)] + marker
+        else:
+            # No room to say "truncated" without breaking the bound; bound wins.
+            safe = safe[:limit]
     return safe
 
 
