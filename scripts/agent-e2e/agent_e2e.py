@@ -168,6 +168,21 @@ def copy_config(src: str, dest: pathlib.Path) -> str:
     return "; ".join([f"{src} @ {sha}", *notes])
 
 
+def config_id(src: str) -> str | None:
+    """The exact config SRC names right now: a commit, or None when it has no
+    fixed identity (an uncommitted worktree, a plain directory). A finished run
+    is resumed only under the same id, so an arm pointed at another commit, or
+    a moving ref that has moved, is run again rather than reported stale."""
+    path = pathlib.Path(src).expanduser()
+    if path.is_dir():
+        if not (path / ".git").exists():
+            return None
+        if sh(["git", "-C", str(path), "status", "--porcelain"]).stdout.strip():
+            return None
+        return sh(["git", "-C", str(path), "rev-parse", "HEAD"]).stdout.strip()
+    return sh(["git", "-C", str(REPO), "rev-parse", src]).stdout.strip()
+
+
 def stage(src: str, home: pathlib.Path) -> str:
     """Build a sandbox HOME whose ~/.claude is config SRC."""
     provenance = copy_config(src, home / ".claude")
@@ -269,8 +284,11 @@ def result_event(events: list[dict]) -> dict:
 def run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
             out: pathlib.Path, args) -> dict:
     run = out / arm / str(idx)
-    if (run / "verdict.json").exists():  # resumable; never re-spend
-        return json.loads((run / "verdict.json").read_text(encoding="utf-8"))
+    cid = config_id(src)
+    if cid and (run / "verdict.json").exists():  # resumable; never re-spend
+        done = json.loads((run / "verdict.json").read_text(encoding="utf-8"))
+        if done.get("config_id") == cid:
+            return done
     if run.exists():
         shutil.rmtree(run)
     home, work, bindir = run / "home", run / "work", run / "bin"
@@ -300,7 +318,7 @@ def run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
     setup = subprocess.run(["bash", str(scenario / "setup.sh"), str(work), str(run)],
                            env=env, capture_output=True, text=True)
     (run / "setup.log").write_text(setup.stdout + setup.stderr, encoding="utf-8")
-    verdict = {"arm": arm, "run": idx, "config": provenance}
+    verdict = {"arm": arm, "run": idx, "config": provenance, "config_id": cid}
     if setup.returncode != 0:
         verdict.update(verdict="INCONCLUSIVE", why=f"setup.sh exit {setup.returncode}")
         (run / "verdict.json").write_text(json.dumps(verdict, indent=2), encoding="utf-8")
