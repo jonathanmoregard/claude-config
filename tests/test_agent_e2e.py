@@ -441,3 +441,7 @@ def test_resume_reuses_a_verdict_only_for_the_same_config(tmp_path):
     moved = run("HEAD~1")
     assert moved[1] != first[1], "another commit must re-run"
     assert moved[0]["config"] != first[0]["config"]
+    (sc / "check.sh").write_text("#!/usr/bin/env bash\nexit 1\n")
+    edited = run("HEAD~1")
+    assert edited[1] != moved[1], "an edited scenario must re-run"
+    assert edited[0]["verdict"] == "FAIL"
