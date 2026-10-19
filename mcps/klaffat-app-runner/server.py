@@ -714,32 +714,67 @@ def _host_env(policy: dict) -> dict[str, str]:
     }
 
 
-@contextmanager
-def _real_calendar_lock(policy: dict):
+def _open_lock(name: str, label: str, policy: dict) -> int:
     root = _ensure_state_root(policy)
-    path = root / ".real-calendar.lock"
     flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
-        fd = os.open(path, flags, 0o600)
+        fd = os.open(root / name, flags, 0o600)
     except OSError as exc:
-        raise RuntimeError("real-calendar lock is unavailable") from exc
+        raise RuntimeError(f"{label} lock is unavailable") from exc
+    info = os.fstat(fd)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != 0o600
+    ):
+        os.close(fd)
+        raise RuntimeError(f"{label} lock is not private")
+    return fd
+
+
+@contextmanager
+def _flock(name: str, label: str, policy: dict):
+    fd = _open_lock(name, label, policy)
     try:
-        info = os.fstat(fd)
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or info.st_uid != os.getuid()
-            or stat.S_IMODE(info.st_mode) != 0o600
-        ):
-            raise RuntimeError("real-calendar lock is not private")
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
+        os.close(fd)
+
+
+def _real_calendar_lock(policy: dict):
+    return _flock(".real-calendar.lock", "real-calendar", policy)
+
+
+def _run_lock(run_id: str, policy: dict):
+    """Serialize one run's lifecycle transitions across MCP processes.
+
+    Lock order: run lock, then the real-calendar lock, then (never blocking)
+    the launch lock."""
+    _state_path(run_id, policy)  # validates run_id before it names a file
+    return _flock(f".{run_id}.lock", "run", policy)
+
+
+def _try_launch_lock(policy: dict) -> int | None:
+    """Return a held launch-lock fd, or None while a real-calendar launcher
+    from any process is still settling. Closing the fd releases it."""
+    fd = _open_lock(".real-calendar-launch.lock", "real-calendar launch", policy)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _launch_settling(policy: dict) -> bool:
+    fd = _try_launch_lock(policy)
+    if fd is None:
+        return True
+    os.close(fd)
+    return False
 
 
 def _real_owner_path(policy: dict) -> Path:
@@ -828,6 +863,69 @@ def _initial_state(run_id: str, mode: str, worktree: Path, policy: dict) -> dict
     }
 
 
+class _Settle:
+    """Lets a non-interruptible launcher report a result that arrives after
+    its deadline. The runner sets `deferred` and later calls `callback(rc)`."""
+
+    __slots__ = ("callback", "deferred")
+
+    def __init__(self, callback) -> None:
+        self.callback = callback
+        self.deferred = False
+
+
+def _restore_real_owner(run_id: str, prior: str | None, policy: dict) -> None:
+    if prior is None:
+        _clear_real_owner(run_id, policy)
+    else:
+        _write_real_owner(prior, policy)
+
+
+def _finish_real_start(
+    state: dict, prior: str | None, prior_state: dict | None, rc: int, policy: dict
+) -> None:
+    """Record a launcher's final result. Caller holds the real-calendar lock."""
+    if rc != 0:
+        _restore_real_owner(state["run_id"], prior, policy)
+        state.update(phase="failed", exit_code=rc)
+        _write_state(state, policy, create=False)
+        return
+    if prior_state is not None:
+        prior_state.update(phase="stopped", exit_code=0)
+        _write_state(prior_state, policy, create=False)
+    state.update(phase="active", exit_code=0, url="http://localhost:3740")
+    _write_state(state, policy, create=False)
+
+
+def _settle_real_start(
+    run_id: str, prior: str | None, rc: int, policy: dict, launch_fd: int
+) -> None:
+    """Reconcile a launcher that outlived its deadline, then release the launch."""
+    try:
+        with _real_calendar_lock(policy):
+            # Release the launch inside the lock so no caller sees "settling"
+            # after the result is recorded.
+            try:
+                state = _read_state(run_id, policy)
+                if state["phase"] != "accepted" or _read_real_owner(policy) != run_id:
+                    return
+                prior_state = None
+                if prior is not None and prior != run_id:
+                    prior_state = _read_state(prior, policy)
+                _finish_real_start(state, prior, prior_state, rc, policy)
+            finally:
+                os.close(launch_fd)
+                launch_fd = None
+    except Exception as exc:  # a daemon thread has nowhere to raise to
+        print(
+            f"klaffat-app-runner: real-calendar settle failed: {exc}",
+            file=sys.stderr,
+        )
+    finally:
+        if launch_fd is not None:
+            os.close(launch_fd)
+
+
 def _start_run(request: dict, policy: dict, *, runner, rec=None) -> dict:
     worktree = _validate_worktree(request["worktree_path"], policy)
     mode = request["mode"]
@@ -851,44 +949,49 @@ def _start_run(request: dict, policy: dict, *, runner, rec=None) -> dict:
             # a definitive result even when the MCP request is cancelled.
             rec.interruptible = False
         with _real_calendar_lock(policy):
-            prior = _read_real_owner(policy)
-            prior_state = None
-            if prior is not None and prior != run_id:
-                # Validate the existing ownership record before touching the
-                # singleton host service. A dangling/tampered marker must not
-                # be silently replaced after a new activation.
-                prior_state = _read_state(prior, policy)
-            # Claim ownership before the host-side side effect. If the MCP
-            # process disappears after this point, the persisted run remains a
-            # recoverable handle for the singleton instead of leaving it
-            # active with no owner.
-            _write_real_owner(run_id, policy)
-            try:
-                rc, _stdout, _stderr = runner(
-                    argv, _host_env(policy), timeout, rec
-                )
-            except Exception:
-                if prior is None:
-                    _clear_real_owner(run_id, policy)
-                else:
-                    _write_real_owner(prior, policy)
+            launch_fd = _try_launch_lock(policy)
+            if launch_fd is None:
                 state.update(phase="failed", exit_code=None)
                 _write_state(state, policy, create=False)
-                raise
-            if rc != 0:
-                if prior is None:
-                    _clear_real_owner(run_id, policy)
-                else:
-                    _write_real_owner(prior, policy)
-                state.update(phase="failed", exit_code=rc)
-                _write_state(state, policy, create=False)
+                raise RuntimeError(
+                    "a real-calendar start is still settling; poll status"
+                )
+            settle = None
+            try:
+                prior = _read_real_owner(policy)
+                prior_state = None
+                if prior is not None and prior != run_id:
+                    # Validate the existing ownership record before touching the
+                    # singleton host service. A dangling/tampered marker must not
+                    # be silently replaced after a new activation.
+                    prior_state = _read_state(prior, policy)
+                settle = _Settle(
+                    lambda rc: _settle_real_start(run_id, prior, rc, policy, launch_fd)
+                )
+                # Claim ownership before the host-side side effect. If the MCP
+                # process disappears after this point, the persisted run remains a
+                # recoverable handle for the singleton instead of leaving it
+                # active with no owner.
+                _write_real_owner(run_id, policy)
+                try:
+                    rc, _stdout, _stderr = runner(
+                        argv, _host_env(policy), timeout, rec, settle=settle
+                    )
+                except Exception:
+                    _restore_real_owner(run_id, prior, policy)
+                    state.update(phase="failed", exit_code=None)
+                    _write_state(state, policy, create=False)
+                    raise
+                if settle.deferred:
+                    # The launcher outlived its deadline and keeps running. It
+                    # keeps ownership and the launch lock; the settle callback
+                    # records its real result once it exits.
+                    return state
+                _finish_real_start(state, prior, prior_state, rc, policy)
                 return state
-            if prior_state is not None:
-                prior_state.update(phase="stopped", exit_code=0)
-                _write_state(prior_state, policy, create=False)
-            state.update(phase="active", exit_code=0, url="http://localhost:3740")
-            _write_state(state, policy, create=False)
-            return state
+            finally:
+                if settle is None or not settle.deferred:
+                    os.close(launch_fd)
 
     rc, _stdout, _stderr = runner(argv, _host_env(policy), timeout, rec)
     if rc != 0:
@@ -951,14 +1054,28 @@ def _discovery_argv(state: dict, policy: dict) -> list[str]:
 
 
 def _status_run(run_id: str, policy: dict, *, runner, rec=None) -> dict:
+    # Hold the run lock from read to write: a concurrent stop must not be
+    # overwritten by a snapshot taken before it.
+    with _run_lock(run_id, policy):
+        return _status_locked(run_id, policy, runner=runner, rec=rec)
+
+
+def _status_locked(run_id: str, policy: dict, *, runner, rec=None) -> dict:
     state = _read_state(run_id, policy)
     if state["phase"] == "stopped":
         return state
     if state["mode"] == "real_calendar":
         with _real_calendar_lock(policy):
+            # A deferred start settles under this lock alone; re-read so its
+            # result is not overwritten by the snapshot taken above.
+            state = _read_state(run_id, policy)
             if _read_real_owner(policy) != run_id:
-                state.update(phase="stopped", exit_code=0)
-                _write_state(state, policy, create=False)
+                # A failed start already released ownership; keep its result.
+                if state["phase"] != "failed":
+                    state.update(phase="stopped", exit_code=0)
+                    _write_state(state, policy, create=False)
+                return state
+            if state["phase"] == "accepted" and _launch_settling(policy):
                 return state
             argv = [str(policy["realCalendarExecutable"]), "status"]
             rc, _stdout, _stderr = runner(
@@ -1043,6 +1160,11 @@ def _await_status(
 
 
 def _stop_run(run_id: str, policy: dict, *, runner, rec=None) -> dict:
+    with _run_lock(run_id, policy):
+        return _stop_locked(run_id, policy, runner=runner, rec=rec)
+
+
+def _stop_locked(run_id: str, policy: dict, *, runner, rec=None) -> dict:
     state = _read_state(run_id, policy)
     if state["phase"] == "stopped":
         return state
@@ -1050,6 +1172,10 @@ def _stop_run(run_id: str, policy: dict, *, runner, rec=None) -> dict:
         with _real_calendar_lock(policy):
             if _read_real_owner(policy) != run_id:
                 raise RuntimeError("run is not the active real-calendar owner")
+            if _launch_settling(policy):
+                raise RuntimeError(
+                    "real-calendar start is still settling; poll status, then stop"
+                )
             argv = [str(policy["realCalendarExecutable"]), "stop"]
             rc, _stdout, _stderr = runner(
                 argv, _host_env(policy), policy["commandTimeoutMs"], rec
@@ -1131,11 +1257,12 @@ _ASSIGNMENT_SECRET = re.compile(
 )
 _JSON_SECRET = re.compile(
     r'("(?:access_token|refresh_token|id_token|client_secret|client_id|'
-    r'authorization_code|code|state|token)"\s*:\s*")([^"]*)(")',
+    r'authorization_code|authorization|cookie|password|secret|code|state|token)"'
+    r'\s*:\s*")([^"]*)("|$)',
     re.IGNORECASE,
 )
 _QUERY_SECRET = re.compile(
-    r"([?&](?:code|state|token|access_token|refresh_token|id_token)=)([^&#\s]+)",
+    r"([?&](?:code|state|token|access_token|refresh_token|id_token)=)([^&#\s\"'<>\\]+)",
     re.IGNORECASE,
 )
 _CAPABILITY_PATH = re.compile(
@@ -1231,24 +1358,42 @@ def _http_get(run_id: str, path: str, policy: dict) -> dict:
         raise RuntimeError(
             f"app request failed ({type(exc).__name__}); check status and logs"
         ) from exc
-    limit = policy["maxOutputChars"] // 2  # headroom for JSON escaping
+    limit = policy["maxOutputChars"]
     with response:
         body = response.read(limit + 1)
         content_type = response.headers.get("Content-Type", "")
         location = response.headers.get("Location")
         status = response.status
+    # Redact each field as raw text, before JSON escaping hides quotes and
+    # line starts from the matchers; the serialized object is never rescanned.
     result = {
         "status": status,
-        "content_type": content_type,
-        "location": location,
+        "content_type": _redact_output(content_type),
+        "location": None if location is None else _redact_output(location),
         "truncated": len(body) > limit,
     }
     body = body[:limit]
     if _TEXT_TYPES.match(content_type):
-        result["body"] = body.decode("utf-8", errors="replace")
+        result["body"] = _redact_output(body.decode("utf-8", errors="replace"))
     else:
         result["body"] = f"[{len(body)} bytes of {content_type or 'untyped'} content omitted]"
     return result
+
+
+def _http_output(result: dict, policy: dict) -> str:
+    """Serialize an already-redacted http_get result within the output bound,
+    shortening the body rather than cutting the serialized object."""
+    limit = policy["maxOutputChars"]
+    while True:
+        text = json.dumps(result, sort_keys=True)
+        overshoot = len(text) - limit
+        if overshoot <= 0:
+            return text
+        if not result["body"]:
+            raise RuntimeError("maxOutputChars is too small for an http_get result")
+        # Each removed character shortens the JSON by at least one.
+        result["body"] = result["body"][: max(0, len(result["body"]) - overshoot)]
+        result["truncated"] = True
 
 
 class _InFlight:
@@ -1322,6 +1467,8 @@ def _run_argv(
     env: dict[str, str],
     timeout_ms: int,
     rec: _InFlight | None = None,
+    *,
+    settle: _Settle | None = None,
 ) -> tuple[int, str, str]:
     if rec is not None and rec.cancelled and rec.interruptible:
         return 130, "", "request cancelled before process start"
@@ -1349,7 +1496,14 @@ def _run_argv(
         stdout, stderr = proc.communicate(timeout=timeout_ms / 1000)
     except subprocess.TimeoutExpired:
         if rec is not None and not rec.interruptible:
-            threading.Thread(target=proc.communicate, daemon=True).start()
+            def drain() -> None:
+                proc.communicate()
+                if settle is not None:
+                    settle.callback(proc.returncode)
+
+            threading.Thread(target=drain, daemon=True).start()
+            if settle is not None:
+                settle.deferred = True
             return 124, "", "trusted launcher exceeded its deadline and was allowed to settle"
         _terminate_process_group(proc)
         try:
@@ -1435,7 +1589,7 @@ def _tool_klaffat_app(args: dict, rec: _InFlight | None = None) -> str:
         )
     if operation == "http_get":
         result = _http_get(request["run_id"], request["path"], policy)
-        return _safe_output(json.dumps(result, sort_keys=True), policy)
+        return _http_output(result, policy)
     result = _stop_run(request["run_id"], policy, runner=_run_argv, rec=rec)
     return _safe_output(json.dumps(result, sort_keys=True), policy)
 

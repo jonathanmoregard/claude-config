@@ -741,7 +741,7 @@ class FakeRunner:
         self.responses = list(responses)
         self.calls: list[tuple[list[str], dict[str, str], int]] = []
 
-    def __call__(self, argv, env, timeout_ms, rec=None):
+    def __call__(self, argv, env, timeout_ms, rec=None, *, settle=None):
         self.calls.append((list(argv), dict(env), timeout_ms))
         if not self.responses:
             raise AssertionError(f"unexpected runner call: {argv}")
@@ -887,6 +887,94 @@ class LifecycleTests(unittest.TestCase):
         )
         with self.server._in_flight_lock:
             self.server._in_flight.pop(request_id, None)
+
+    def start_slow_real_calendar(self, exit_code: int) -> dict:
+        launcher = Path(self.temp.name) / "real-calendar-launcher"
+        launcher.write_text(f"#!/bin/sh\nsleep 0.4\nexit {exit_code}\n", encoding="utf-8")
+        launcher.chmod(0o700)
+        self.policy["realCalendarExecutable"] = launcher
+        self.policy["realStartTimeoutMs"] = 50
+        request = {"operation": "start", "mode": "real_calendar", "worktree_path": self.worktree}
+        with (
+            mock.patch.object(self.server, "_validate_worktree", return_value=self.worktree),
+            mock.patch.object(self.server, "_new_run_id", return_value=self.first_id),
+        ):
+            return self.server._start_run(
+                request, self.policy, runner=self.server._run_argv, rec=self.server._InFlight()
+            )
+
+    def wait_for_phase(self, phase: str) -> dict:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            state = self.server._read_state(self.first_id, self.policy)
+            if state["phase"] == phase:
+                return state
+            time.sleep(0.02)
+        self.fail(f"run never reached {phase}")
+
+    def test_real_calendar_start_past_its_deadline_keeps_ownership_until_settled(self) -> None:
+        state = self.start_slow_real_calendar(0)
+        self.assertEqual((state["phase"], state["exit_code"]), ("accepted", None))
+        self.assertEqual(self.server._read_real_owner(self.policy), self.first_id)
+        # While the launcher still runs, status reports it unchanged without
+        # querying the host, and stop refuses to race the activation.
+        polled = self.server._status_run(self.first_id, self.policy, runner=FakeRunner())
+        self.assertEqual(polled["phase"], "accepted")
+        with self.assertRaisesRegex(RuntimeError, "still settling"):
+            self.server._stop_run(self.first_id, self.policy, runner=FakeRunner())
+        settled = self.wait_for_phase("active")
+        self.assertEqual(settled["url"], "http://localhost:3740")
+        self.assertEqual(self.server._current_real_state(self.policy)["run_id"], self.first_id)
+        stopped = self.server._stop_run(
+            self.first_id, self.policy, runner=FakeRunner((0, "", ""))
+        )
+        self.assertEqual(stopped["phase"], "stopped")
+
+    def test_second_real_calendar_start_is_refused_while_one_settles(self) -> None:
+        self.start_slow_real_calendar(0)
+        runner = FakeRunner()
+        with self.assertRaisesRegex(RuntimeError, "still settling"):
+            self.start("real_calendar", runner, run_id=self.second_id)
+        self.assertEqual(runner.calls, [])
+        self.assertEqual(self.server._read_real_owner(self.policy), self.first_id)
+        self.wait_for_phase("active")
+
+    def test_real_calendar_start_failing_after_its_deadline_releases_ownership(self) -> None:
+        self.start_slow_real_calendar(3)
+        failed = self.wait_for_phase("failed")
+        self.assertEqual(failed["exit_code"], 3)
+        self.assertIsNone(self.server._read_real_owner(self.policy))
+        polled = self.server._status_run(self.first_id, self.policy, runner=FakeRunner())
+        self.assertEqual((polled["phase"], polled["exit_code"]), ("failed", 3))
+
+    def test_status_snapshot_cannot_overwrite_a_concurrent_stop(self) -> None:
+        self.start("app", FakeRunner((0, "accepted", "")))
+        stopper = threading.Thread(
+            target=self.server._stop_run,
+            args=(self.first_id, self.policy),
+            kwargs={"runner": FakeRunner((0, "", ""), (1, "", ""))},
+        )
+        show = (
+            "LoadState=loaded\nActiveState=active\nSubState=running\n"
+            "Result=success\nExecMainStatus=0\n"
+        )
+
+        class StopDuringStatus(FakeRunner):
+            def __call__(inner, argv, env, timeout_ms, rec=None, *, settle=None):
+                if len(inner.calls) == 0:
+                    stopper.start()
+                    time.sleep(0.2)
+                    self.assertTrue(stopper.is_alive(), "stop did not wait for status")
+                return super().__call__(argv, env, timeout_ms, rec)
+
+        status = StopDuringStatus((0, show, ""), (0, self.server._READY_MARKER + "\n", ""))
+        self.assertEqual(
+            self.server._status_run(self.first_id, self.policy, runner=status)["phase"],
+            "running",
+        )
+        stopper.join(timeout=5)
+        self.assertFalse(stopper.is_alive())
+        self.assertEqual(self.server._read_state(self.first_id, self.policy)["phase"], "stopped")
 
     def test_status_maps_running_url_success_and_failure(self) -> None:
         self.start("app", FakeRunner((0, "accepted", "")))
@@ -1156,9 +1244,23 @@ class _LocalApp(http.server.BaseHTTPRequestHandler):
             self.send_header("Location", "http://198.51.100.7/elsewhere")
             self.end_headers()
             return
+        if self.path == "/callback":
+            self.send_response(302)
+            self.send_header("Location", "http://127.0.0.1/done?code=LOCATIONSECRET")
+            self.end_headers()
+            return
         if self.path == "/logo.png":
             body = b"\x89PNG\r\n"
             content_type = "image/png"
+        elif self.path == "/token":
+            body = (
+                b'{"access_token": "BODYSECRET", "note": "ok"}\n'
+                b"Authorization: Bearer HEADERSECRET\n"
+            )
+            content_type = "application/json"
+        elif self.path == "/quotes":
+            body = b'"' * 50_000
+            content_type = "text/plain"
         else:
             body = f"<h1>klaffat home</h1> path={self.path}".encode()
             content_type = "text/html; charset=utf-8"
@@ -1220,6 +1322,49 @@ class HttpGetTests(unittest.TestCase):
         self.assertEqual(result["status"], 302)
         self.assertEqual(result["location"], "http://198.51.100.7/elsewhere")
         self.assertNotIn("klaffat home", result["body"])
+
+    def tool_output(self, path: str) -> dict:
+        text = self.server._http_output(self.get(path), self.policy)
+        self.assertLessEqual(len(text), self.policy["maxOutputChars"])
+        return json.loads(text)
+
+    def test_body_secrets_are_redacted_before_serialization(self) -> None:
+        result = self.tool_output("/token")
+        self.assertNotIn("BODYSECRET", result["body"])
+        self.assertNotIn("HEADERSECRET", result["body"])
+        self.assertIn('"note": "ok"', result["body"])
+        self.assertIn("Authorization: ", result["body"])
+
+    def test_redacted_location_keeps_the_output_valid_json(self) -> None:
+        result = self.tool_output("/callback")
+        self.assertEqual(result["status"], 302)
+        self.assertTrue(result["location"].startswith("http://127.0.0.1/done?code="))
+        self.assertNotIn("LOCATIONSECRET", result["location"])
+
+    def test_escape_heavy_body_is_shortened_not_cut(self) -> None:
+        result = self.tool_output("/quotes")
+        self.assertTrue(result["truncated"])
+        self.assertTrue(set(result["body"]) <= {'"'})
+        self.assertGreater(len(result["body"]), 0)
+
+    def test_output_too_small_for_any_result_fails_closed(self) -> None:
+        policy = dict(self.policy, maxOutputChars=20)
+        with self.assertRaisesRegex(RuntimeError, "too small"):
+            self.server._http_output(self.get("/p"), policy)
+
+    def test_json_authorization_field_is_redacted(self) -> None:
+        redacted = self.server._redact_output('{"authorization": "Bearer JSONAUTH"}')
+        self.assertNotIn("JSONAUTH", redacted)
+
+    def test_secret_cut_by_the_read_limit_is_still_redacted(self) -> None:
+        redacted = self.server._redact_output('{"access_token": "PARTIALSECR')
+        self.assertTrue(redacted.startswith('{"access_token": "'))
+        self.assertNotIn("PARTIALSECR", redacted)
+
+    def test_query_redaction_stops_at_quotes(self) -> None:
+        redacted = self.server._redact_output('{"next": "/cb?code=QSECRET", "n": 1}')
+        self.assertNotIn("QSECRET", redacted)
+        self.assertTrue(redacted.endswith('", "n": 1}'))
 
     def test_binary_bodies_are_summarized(self) -> None:
         self.assertIn("omitted", self.get("/logo.png")["body"])
