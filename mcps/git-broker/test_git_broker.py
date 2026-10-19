@@ -986,6 +986,7 @@ class GithubWatcherSignalTests(unittest.TestCase):
                 if watcher_pid is not None:
                     try:
                         os.kill(watcher_pid, signal.SIGKILL)
+                    # arftl-allow: swallowed-exception watcher may already be gone
                     except ProcessLookupError:
                         pass
                 for stream in (

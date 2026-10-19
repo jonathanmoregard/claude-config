@@ -59,6 +59,7 @@ class _WatchRegistry:
     """Own live host watchers and serialize replacement and shutdown."""
 
     def __init__(self) -> None:
+        # Signal handlers may reenter shutdown() on the main thread.
         self._lock = threading.RLock()
         self._entries: dict[tuple[str, str, int], _WatchRecord] = {}
         self._generation = 0
@@ -1241,9 +1242,7 @@ def _ensure_owned_watch_directory(root: Path, directory: Path) -> None:
     for part in relative.parts:
         current = current / part
         try:
-            current.mkdir(mode=0o700)
-        except FileExistsError:
-            pass
+            current.mkdir(mode=0o700, exist_ok=True)
         except OSError as exc:
             raise RuntimeError(f"could not create watch status directory: {exc}") from exc
         components.append(current)
@@ -1284,10 +1283,7 @@ def _write_watch_status(root: Path, path: Path, data: dict[str, Any]) -> None:
         temp_name = None
     finally:
         if temp_name is not None:
-            try:
-                os.unlink(temp_name)
-            except FileNotFoundError:
-                pass
+            Path(temp_name).unlink(missing_ok=True)
 
 
 def _finished_watch_status(watching: dict[str, Any], rc: int | None, line: str) -> dict[str, Any]:
@@ -1315,20 +1311,18 @@ def _terminate_process_group(proc: subprocess.Popen) -> None:
             return
     try:
         proc.wait(timeout=5)
-        return
     except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
         try:
-            proc.kill()
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except (ProcessLookupError, PermissionError, OSError):
+            try:
+                proc.kill()
+            except (ProcessLookupError, PermissionError, OSError):
+                return
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
             return
-    try:
-        proc.wait(timeout=2)
-    except subprocess.TimeoutExpired:
-        return
 
 
 def _fixed_git_config(policy: dict) -> list[str]:
