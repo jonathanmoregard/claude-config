@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Contract for the dormant, Codex-only dedicated Git broker asset."""
+"""Contract for the registered, agent-neutral dedicated Git broker asset."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ class DedicatedGitBrokerAssetTests(unittest.TestCase):
         self.assertTrue((BROKER / "empty-git-config").is_file())
         self.assertFalse(LEGACY.exists())
 
-    def test_server_has_git_only_identity(self) -> None:
+    def test_server_has_dedicated_broker_identity(self) -> None:
         server = BROKER / "server.py"
         self.assertTrue(server.is_file(), f"missing dedicated server: {server}")
         source = server.read_text(encoding="utf-8")
@@ -36,13 +36,17 @@ class DedicatedGitBrokerAssetTests(unittest.TestCase):
         self.assertEqual(set(config), {"gitBroker"})
         self.assertIsInstance(config["gitBroker"], dict)
 
-    def test_claude_does_not_register_or_allow_git_broker(self) -> None:
+    def test_claude_registers_and_allows_git_broker_under_canonical_name(self) -> None:
         servers = json.loads((ROOT / "mcp-servers.json").read_text(encoding="utf-8"))
         settings = json.loads((ROOT / "settings.json").read_text(encoding="utf-8"))
         self.assertNotIn("git-broker", servers)
-        self.assertNotIn("git_broker", servers)
+        self.assertIn("git_broker", servers)
+        broker = servers["git_broker"]
+        self.assertTrue(
+            any("/mcps/git-broker/server.py" in arg for arg in broker.get("args", []))
+        )
         allowed = ((settings.get("permissions") or {}).get("allow") or [])
-        self.assertFalse(any("git_broker" in entry for entry in allowed))
+        self.assertIn("mcp__git_broker__*", allowed)
 
 
 if __name__ == "__main__":

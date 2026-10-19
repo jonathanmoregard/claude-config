@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -19,13 +20,24 @@ RUN_DONE = {"status": "completed", "conclusion": "success", "name": "infra"}
 RUN_BUSY = {"status": "in_progress", "conclusion": "", "name": "infra"}
 
 
-def run_wait_for(tmp_path: Path, script: dict, *args: str) -> tuple[int, str, list[str]]:
+def run_wait_for(
+    tmp_path: Path,
+    script: dict,
+    *args: str,
+    wait_for: Path = WAIT_FOR,
+    cwd: Path | None = None,
+    timeout: str = "600",
+) -> tuple[int, str, list[str]]:
     bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
+    bin_dir.mkdir(exist_ok=True)
     for name in ("gh", "systemctl", "sleep"):
-        (bin_dir / name).symlink_to(FAKE)
+        link = bin_dir / name
+        if not link.exists():
+            link.symlink_to(FAKE)
     state = tmp_path / "script.json"
-    state.write_text(json.dumps(script))
+    scripted = json.loads(json.dumps(script))
+    scripted.setdefault("gh", {}).setdefault("auth token", [{"rc": 0}])
+    state.write_text(json.dumps(scripted))
     log = tmp_path / "calls.log"
     log.touch()
     env = {
@@ -35,10 +47,45 @@ def run_wait_for(tmp_path: Path, script: dict, *args: str) -> tuple[int, str, li
         "FAKE_LOG": str(log),
     }
     proc = subprocess.run(
-        ["bash", str(WAIT_FOR), *args, "--timeout", "600"],
-        capture_output=True, text=True, env=env, timeout=60, check=False,
+        ["bash", str(wait_for), *args, "--timeout", timeout],
+        capture_output=True, text=True, env=env, cwd=cwd, timeout=60, check=False,
     )
     return proc.returncode, proc.stdout + proc.stderr, log.read_text().splitlines()
+
+
+def sandbox_layout(tmp_path: Path, status_root: Path) -> Path:
+    layout = tmp_path / "layout"
+    scripts = layout / "scripts"
+    policy_dir = layout / "mcps" / "git-broker"
+    scripts.mkdir(parents=True)
+    policy_dir.mkdir(parents=True)
+    copied = scripts / "wait-for"
+    shutil.copy2(WAIT_FOR, copied)
+    (policy_dir / "config.json").write_text(
+        json.dumps({"gitBroker": {"watchStatusDir": str(status_root)}}),
+        encoding="utf-8",
+    )
+    return copied
+
+
+def write_status(
+    root: Path,
+    *,
+    state: str,
+    exit_code: int | str | None = None,
+    line: str = "settled",
+    repo: str = "owner/repo",
+    kind: str = "pr",
+    number: int = 7,
+) -> Path:
+    owner, name = repo.split("/")
+    path = root / owner / name / f"{kind}-{number}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {"state": state, "kind": kind, "repo": repo, "number": number}
+    if exit_code is not None:
+        data.update({"exit": exit_code, "line": line})
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return path
 
 
 def test_run_keeps_waiting_when_watch_exits_early(tmp_path: Path) -> None:
@@ -135,3 +182,87 @@ def test_long_running_service_still_counts_as_up(tmp_path: Path) -> None:
     rc, out, _ = run_wait_for(tmp_path, {"systemctl": [up]}, "unit", "web", "--user")
     assert rc == 0, out
     assert "active/running" in out, out
+
+
+def test_sandbox_done_status_returns_host_line_and_exit(tmp_path: Path) -> None:
+    status_root = tmp_path / "status"
+    copied = sandbox_layout(tmp_path, status_root)
+    for exit_code in (0, 1, 2):
+        write_status(status_root, state="done", exit_code=exit_code, line=f"host {exit_code}")
+        rc, out, calls = run_wait_for(
+            tmp_path,
+            {"gh": {"auth token": [{"rc": 1}]}},
+            "pr", "7", "-R", "Owner/Repo",
+            wait_for=copied,
+        )
+        assert rc == exit_code, out
+        assert f"host {exit_code}" in out, out
+        assert [call for call in calls if call.startswith("gh ")] == ["gh auth token"], calls
+        (tmp_path / "calls.log").write_text("")
+
+
+def test_sandbox_watching_then_done_waits_and_reports(tmp_path: Path) -> None:
+    status_root = tmp_path / "status"
+    copied = sandbox_layout(tmp_path, status_root)
+    status = write_status(status_root, state="watching")
+    done = {"state": "done", "kind": "pr", "repo": "owner/repo", "number": 7,
+            "exit": 0, "line": "host finished"}
+    script = {
+        "gh": {"auth token": [{"rc": 1}]},
+        "sleep": [{"write_json": str(status), "value": done}],
+    }
+    rc, out, _ = run_wait_for(
+        tmp_path, script, "pr", "7", "-R", "owner/repo", wait_for=copied
+    )
+    assert rc == 0, out
+    assert "host finished" in out, out
+
+
+def test_sandbox_missing_watch_has_actionable_error(tmp_path: Path) -> None:
+    status_root = tmp_path / "status"
+    copied = sandbox_layout(tmp_path, status_root)
+    rc, out, _ = run_wait_for(
+        tmp_path,
+        {"gh": {"auth token": [{"rc": 1}]}},
+        "run", "99", "-R", "owner/repo",
+        wait_for=copied,
+    )
+    assert rc == 1
+    assert "gh cannot authenticate here and no host watch exists" in out
+    assert "git broker github tool (operation watch)" in out
+
+
+def test_sandbox_watching_forever_times_out(tmp_path: Path) -> None:
+    status_root = tmp_path / "status"
+    copied = sandbox_layout(tmp_path, status_root)
+    write_status(status_root, state="watching", kind="run", number=99)
+    rc, out, _ = run_wait_for(
+        tmp_path,
+        {"gh": {"auth token": [{"rc": 1}]}, "sleep": [{"delay": 0.02}]},
+        "run", "99", "-R", "owner/repo",
+        wait_for=copied,
+        timeout="1",
+    )
+    assert rc == 124, out
+    assert "timed out" in out
+
+
+def test_sandbox_repo_is_derived_from_origin_without_dash_r(tmp_path: Path) -> None:
+    status_root = tmp_path / "status"
+    copied = sandbox_layout(tmp_path, status_root)
+    write_status(status_root, state="done", exit_code=0, line="derived")
+    repo = tmp_path / "checkout"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin", "git@github.com:Owner/Repo.git"],
+        check=True,
+    )
+    rc, out, _ = run_wait_for(
+        tmp_path,
+        {"gh": {"auth token": [{"rc": 1}]}},
+        "pr", "7",
+        wait_for=copied,
+        cwd=repo,
+    )
+    assert rc == 0, out
+    assert "derived" in out

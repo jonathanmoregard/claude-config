@@ -50,6 +50,41 @@
     "env": {},
     "timeout": 1900000
   },
+  "git_broker": {
+    "type": "stdio",
+    "command": "/run/current-system/sw/bin/python3",
+    "args": [
+      "/home/jonathan/.claude/mcps/git-broker/server.py"
+    ],
+    "env": {},
+    "timeout": 600000
+  },
+  "github": {
+    "type": "stdio",
+    "command": "/etc/profiles/per-user/jonathan/bin/github-app-mcp-server",
+    "args": [
+      "--toolsets",
+      "context,repos,issues,pull_requests,actions",
+      "--exclude-tools",
+      "merge_pull_request,pull_request_review_write,delete_file,create_repository,fork_repository,create_branch,create_or_update_file,push_files,update_pull_request_branch,actions_run_trigger"
+    ],
+    "env": {},
+    "timeout": 600000
+  },
+  "github_klaffat": {
+    "type": "stdio",
+    "command": "/etc/profiles/per-user/jonathan/bin/github-app-mcp-server",
+    "args": [
+      "--owner",
+      "klaffat",
+      "--toolsets",
+      "context,repos,issues,pull_requests,actions",
+      "--exclude-tools",
+      "merge_pull_request,pull_request_review_write,delete_file,create_repository,fork_repository,create_branch,create_or_update_file,push_files,update_pull_request_branch,actions_run_trigger"
+    ],
+    "env": {},
+    "timeout": 600000
+  },
   "reddit": {
     "command": "/etc/profiles/per-user/jonathan/bin/uvx",
     "args": [

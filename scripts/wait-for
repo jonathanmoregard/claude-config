@@ -6,6 +6,10 @@
 # re-invokes the session when it exits, so one call replaces a sleep-poll loop
 # (bash-guard denies `sleep N; <status snapshot>` in the foreground).
 #
+# In a sandbox where gh cannot authenticate, pr/run mode reads the latest
+# host watch started by the git-broker `github` tool from its protected status
+# file; authenticated host behavior is unchanged.
+#
 #   wait-for pr <N> [-R owner/repo]        CI settled and GitHub's mergeability
 #                                          computed (or the PR merged/closed);
 #                                          a token without checks:read waits on
@@ -26,15 +30,15 @@
 # call, never in a foreground turn.
 set -uo pipefail
 
-usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
+usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
 
 [ $# -ge 2 ] || usage
 mode=$1 target=$2
 shift 2
-repo=() user=() since="" timeout=3600
+repo=() repo_name="" user=() since="" timeout=3600
 while [ $# -gt 0 ]; do
   case $1 in
-    -R|--repo) [ $# -ge 2 ] || usage; repo=(-R "$2"); shift 2 ;;
+    -R|--repo) [ $# -ge 2 ] || usage; repo=(-R "$2"); repo_name=$2; shift 2 ;;
     --user) user=(--user); shift ;;
     --since) [ $# -ge 2 ] || usage; since=$2; shift 2 ;;
     --timeout) [ $# -ge 2 ] || usage; timeout=$2; shift 2 ;;
@@ -47,6 +51,70 @@ left() { echo $(( deadline - $(date +%s) )); }
 # nap <step>: sleep up to <step> seconds, never past the deadline.
 nap() { local l; l=$(left); [ "$l" -gt 0 ] || timed_out; sleep $(( l < $1 ? l : $1 )); }
 timed_out() { echo "wait-for: timed out after ${timeout}s waiting on $mode $target"; exit 124; }
+
+github_repo() {
+  local value=$repo_name remote path owner name
+  if [ -z "$value" ]; then
+    remote=$(git remote get-url origin 2>/dev/null) || {
+      echo "wait-for: cannot derive GitHub repository from origin" >&2
+      return 1
+    }
+    case $remote in
+      https://github.com/*) path=${remote#https://github.com/} ;;
+      git@github.com:*) path=${remote#git@github.com:} ;;
+      ssh://git@github.com/*) path=${remote#ssh://git@github.com/} ;;
+      *) echo "wait-for: origin is not a supported github.com URL" >&2; return 1 ;;
+    esac
+    value=${path%.git}
+  fi
+  value=${value,,}
+  if [[ ! $value =~ ^[a-z0-9][a-z0-9-]*/[a-z0-9._-]+$ ]]; then
+    echo "wait-for: invalid GitHub repository: $value" >&2
+    return 1
+  fi
+  owner=${value%%/*}; name=${value#*/}
+  if [ "$name" = . ] || [ "$name" = .. ]; then
+    echo "wait-for: invalid GitHub repository: $value" >&2
+    return 1
+  fi
+  printf '%s/%s\n' "$owner" "$name"
+}
+
+wait_host_watch() {
+  case $target in ''|*[!0-9]*) usage ;; esac
+  local selected script_path policy status_dir status_file state exit_code line
+  selected=$(github_repo) || exit 1
+  script_path=$(readlink -f -- "$0") || {
+    echo "wait-for: cannot resolve script path" >&2; exit 1;
+  }
+  policy=$(dirname "$script_path")/../mcps/git-broker/config.json
+  status_dir=$(jq -er '.gitBroker.watchStatusDir | select(type == "string" and length > 0)' "$policy" 2>/dev/null) || {
+    echo "wait-for: cannot read git-broker watchStatusDir policy" >&2; exit 1;
+  }
+  case $status_dir in
+    %t) status_dir=/run/user/"$(id -u)" ;;
+    %t/*) status_dir=/run/user/"$(id -u)"/${status_dir#%t/} ;;
+  esac
+  case $status_dir in /*) ;; *) echo "wait-for: watchStatusDir is not absolute" >&2; exit 1 ;; esac
+  status_file=$status_dir/${selected%/*}/${selected#*/}/$mode-$target.json
+  if [ ! -f "$status_file" ]; then
+    echo "wait-for: gh cannot authenticate here and no host watch exists for $mode $target in $selected; start one with the git broker github tool (operation watch), then run wait-for again"
+    exit 1
+  fi
+  while :; do
+    state=$(jq -r 'if type == "object" then (.state // "") else "" end' "$status_file" 2>/dev/null) || state=""
+    case $state in
+      done)
+        exit_code=$(jq -r 'if ((.exit | type) == "number" and .exit >= 0 and .exit <= 255 and .exit == (.exit | floor)) then .exit else "" end' "$status_file" 2>/dev/null) || exit_code=""
+        case $exit_code in ''|*[!0-9]*) echo "wait-for: invalid host watch result for $mode $target"; exit 1 ;; esac
+        line=$(jq -r 'if (.line | type) == "string" then .line else "" end' "$status_file" 2>/dev/null) || line=""
+        printf '%s\n' "$line"
+        exit "$exit_code" ;;
+      watching) nap 10 ;;
+      *) echo "wait-for: invalid host watch status for $mode $target"; exit 1 ;;
+    esac
+  done
+}
 
 pr_field() { gh pr view "$target" "${repo[@]}" --json "$1" --jq ".$1" 2>/dev/null; }
 
@@ -193,6 +261,11 @@ wait_unit() {
   echo "unit $target $(unit_prop ActiveState)/$(unit_prop SubState) result=$result status=$status started=$(unit_prop ExecMainStartTimestamp)"
   [ "$result" = success ] && exit 0 || exit 1
 }
+
+case $mode in
+  pr|run)
+    if ! gh auth token >/dev/null 2>&1; then wait_host_watch; fi ;;
+esac
 
 case $mode in
   pr) wait_pr ;;

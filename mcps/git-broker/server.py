@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Dedicated, contained Git operation broker over stdio MCP.
+"""Dedicated Git and GitHub operation broker over stdio MCP.
 
-The server exposes one structured ``git`` tool. It never accepts shell text or
-raw argv. Every operation is validated before the corresponding client runs
-without a shell inside a broker-owned bubblewrap boundary. Repository-local
-execution config is masked and network exists only for validated Git operations.
+The server exposes structured ``git`` and ``github`` tools. Neither accepts
+shell text or raw argv. Git runs inside a broker-owned bubblewrap boundary;
+GitHub operations use a closed set of host-side gh and wait-for commands.
 
 Protocol: MCP 2024-11-05 over stdio, JSON-RPC 2.0 line-delimited.
 """
@@ -17,13 +16,15 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 
 class _InFlight:
@@ -43,6 +44,112 @@ class _InFlight:
     def __init__(self) -> None:
         self.cancelled = False
         self.proc: Optional[subprocess.Popen] = None
+
+
+@dataclass
+class _WatchRecord:
+    proc: subprocess.Popen
+    generation: int
+    status_root: Path
+    status_path: Path
+    watching: dict[str, Any]
+
+
+class _WatchRegistry:
+    """Own live host watchers and serialize replacement and shutdown."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._entries: dict[tuple[str, str, int], _WatchRecord] = {}
+        self._generation = 0
+
+    def start(
+        self,
+        key: tuple[str, str, int],
+        argv: list[str],
+        env: dict[str, str],
+        status_root: Path,
+        status_path: Path,
+        watching: dict[str, Any],
+    ) -> None:
+        with self._lock:
+            old = self._entries.get(key)
+            if old is None and len(self._entries) >= 16:
+                raise RuntimeError("git-broker allows at most 16 live GitHub watches")
+            self._generation += 1
+            generation = self._generation
+            if old is not None:
+                _terminate_process_group(old.proc)
+                del self._entries[key]
+            _write_watch_status(status_root, status_path, watching)
+            try:
+                proc = subprocess.Popen(
+                    argv,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    env=env,
+                    cwd="/",
+                    start_new_session=True,
+                )
+            except (OSError, ValueError) as exc:
+                failed = _finished_watch_status(
+                    watching,
+                    1,
+                    f"wait-for: could not start host watch: {type(exc).__name__}",
+                )
+                _write_watch_status(status_root, status_path, failed)
+                raise RuntimeError("could not start host wait-for watcher") from exc
+            record = _WatchRecord(
+                proc, generation, status_root, status_path, dict(watching)
+            )
+            self._entries[key] = record
+        threading.Thread(
+            target=self._finish,
+            args=(key, record),
+            daemon=True,
+            name=f"git-broker-watch-{generation}",
+        ).start()
+
+    def _finish(
+        self, key: tuple[str, str, int], record: _WatchRecord
+    ) -> None:
+        output, _unused = record.proc.communicate()
+        line = ""
+        for candidate in (output or "").splitlines():
+            if candidate.strip():
+                line = candidate.strip()
+        line = _redact_secrets(line)[:500]
+        with self._lock:
+            if self._entries.get(key) is not record:
+                return
+            _write_watch_status(
+                record.status_root,
+                record.status_path,
+                _finished_watch_status(record.watching, record.proc.returncode, line),
+            )
+            del self._entries[key]
+
+    def shutdown(self) -> None:
+        with self._lock:
+            records = list(self._entries.values())
+            self._entries.clear()
+            self._generation += 1
+        line = (
+            "wait-for: host watch stopped because the git broker exited; "
+            "start a new watch"
+        )
+        for record in records:
+            _terminate_process_group(record.proc)
+            _write_watch_status(
+                record.status_root,
+                record.status_path,
+                _finished_watch_status(record.watching, 1, line),
+            )
+
+
+_watch_registry = _WatchRegistry()
 
 
 # Stdout writes from main thread + N worker threads MUST be serialized,
@@ -103,6 +210,9 @@ _GIT_POLICY_KEYS = frozenset(
         "bubblewrapExecutable",
         "validatorExecutable",
         "credentialHelperExecutable",
+        "githubCliExecutable",
+        "waitForExecutable",
+        "watchStatusDir",
         "githubHostTokenDir",
         "sshKnownHostsFile",
         "trustedHooksDir",
@@ -125,6 +235,8 @@ _GIT_POLICY_EXECUTABLES = (
     "bubblewrapExecutable",
     "validatorExecutable",
     "credentialHelperExecutable",
+    "githubCliExecutable",
+    "waitForExecutable",
 )
 _GIT_POLICY_POSITIVE_INTS = (
     "discoveryTimeoutMs",
@@ -189,10 +301,15 @@ def _load_git_policy(config: dict) -> dict:
     for key in _GIT_POLICY_EXECUTABLES:
         if not isinstance(raw[key], str) or not raw[key]:
             raise RuntimeError(f"git-broker gitBroker {key} must be a non-empty string")
+    if not Path(raw["waitForExecutable"]).is_absolute():
+        raise RuntimeError(
+            "git-broker gitBroker waitForExecutable must be an absolute path"
+        )
     for key in (
         "githubHostTokenDir",
         "sshKnownHostsFile",
         "trustedHooksDir",
+        "watchStatusDir",
     ):
         value = raw[key]
         # "%t" (systemd's runtime-dir specifier) as the first path component
@@ -233,23 +350,32 @@ _GIT_OPERATION_FIELDS = {
     "status": frozenset(),
     "diff": frozenset({"paths", "staged"}),
     "log": frozenset({"max_count"}),
+    "reflog": frozenset({"ref", "max_count"}),
+    "branch": frozenset({"action", "branch", "new_branch"}),
     "add": frozenset({"paths", "all"}),
     "unstage": frozenset({"paths"}),
-    "commit": frozenset({"message", "amend"}),
+    "untrack": frozenset({"paths"}),
+    "restore": frozenset({"paths", "source", "side"}),
+    "commit": frozenset({"message", "amend", "all"}),
     "stash": frozenset({"action", "index", "include_untracked", "message"}),
     "reset": frozenset({"mode", "target"}),
     "rebase": frozenset({"action", "onto"}),
     "merge": frozenset({"action", "ref", "ff_mode", "message"}),
     "cherry_pick": frozenset({"action", "commits"}),
+    "revert": frozenset({"action", "commits"}),
     "tag": frozenset({"name", "target", "message"}),
     "clone": frozenset({"url"}),
     "fetch": frozenset({"remote"}),
     "pull": frozenset({"remote"}),
     "push": frozenset({"remote", "set_upstream"}),
     "remote_branch_delete": frozenset({"branch"}),
-    "switch": frozenset({"branch", "create", "start_point"}),
-    "worktree_add": frozenset({"worktree_path", "branch", "start_point"}),
-    "worktree_remove": frozenset({"worktree_path"}),
+    "switch": frozenset(
+        {"branch", "create", "force_create", "detach", "start_point"}
+    ),
+    "worktree_add": frozenset(
+        {"worktree_path", "branch", "start_point", "create", "detach"}
+    ),
+    "worktree_remove": frozenset({"worktree_path", "force"}),
 }
 _GIT_OPERATIONS = frozenset(_GIT_OPERATION_FIELDS)
 _NETWORK_GIT_OPERATIONS = frozenset(
@@ -257,23 +383,33 @@ _NETWORK_GIT_OPERATIONS = frozenset(
 )
 # Operations whose sandbox needs the current worktree writable.
 _READ_ONLY_WORKTREE_OPERATIONS = frozenset(
-    {"fetch", "worktree_add", "worktree_remove", "remote_branch_delete"}
+    {"fetch", "reflog", "branch", "worktree_add", "worktree_remove", "remote_branch_delete"}
 )
 # Operations that need no current branch and change nothing local, so they
 # may run from a protected primary checkout.
 _PROTECTED_WORKTREE_OPERATIONS = frozenset(
-    {"status", "diff", "log", "fetch", "worktree_add", "worktree_remove"}
+    {"status", "diff", "log", "reflog", "fetch", "worktree_add", "worktree_remove"}
 )
 _SEQUENCER_ACTIONS = {
     "rebase": frozenset({"start", "continue", "abort", "skip"}),
     "merge": frozenset({"start", "continue", "abort"}),
     "cherry_pick": frozenset({"start", "continue", "abort", "skip"}),
+    "revert": frozenset({"start", "continue", "abort", "skip"}),
 }
 _STASH_ACTIONS = frozenset({"push", "pop", "apply", "drop", "list", "show"})
 _PROTECTED_REMOTE_BRANCHES = frozenset({"main", "master"})
 _GIT_BASE_FIELDS = frozenset({"repo_path", "operation", "timeout"})
 _BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 _REVISION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*(?:[~^][0-9]{0,3})*$")
+_GITHUB_OWNER_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,38}$")
+_GITHUB_NAME_RE = re.compile(r"^[a-z0-9._-]{1,100}$")
+_GITHUB_OPERATION_FIELDS = {
+    "watch": frozenset({"kind", "number", "timeout_s"}),
+    "update_branch": frozenset({"number"}),
+    "rerun": frozenset({"run_id", "failed_only"}),
+    "repo_settings": frozenset({"kind", "branch", "ruleset_id"}),
+}
+_GITHUB_BASE_FIELDS = frozenset({"repo_path", "operation", "timeout"})
 
 
 def _path_within(path: Path, roots: tuple[Path, ...]) -> bool:
@@ -455,10 +591,18 @@ def _validate_git_request(args: object, policy: dict) -> dict:
         if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 200:
             raise RuntimeError("max_count must be an integer from 1 to 200")
         request["max_count"] = count
+    elif operation == "reflog":
+        request["max_count"] = _validate_int(args, "max_count", 1, 200, 20)
+        if "ref" in args:
+            request["ref"] = _validate_revision(args["ref"], "ref")
+    elif operation == "branch":
+        _validate_branch_request(args, request)
     elif operation == "add":
         _validate_add_request(args, request)
-    elif operation == "unstage":
+    elif operation in {"unstage", "untrack"}:
         request["paths"] = _validate_relative_paths(args.get("paths"))
+    elif operation == "restore":
+        _validate_restore_request(args, request)
     elif operation == "commit":
         _validate_commit_request(args, request)
     elif operation == "stash":
@@ -485,10 +629,87 @@ def _validate_git_request(args: object, policy: dict) -> dict:
         request["worktree_path"] = _validate_worktree_path(
             args.get("worktree_path"), policy
         )
+        request["force"] = _validate_bool(args, "force")
     elif operation == "switch":
         _validate_switch_request(args, request)
     elif operation == "worktree_add":
         _validate_worktree_add_request(args, request, policy)
+    return request
+
+
+def _validate_github_request(args: object, policy: dict) -> dict:
+    """Validate the closed GitHub operation surface before repository discovery."""
+    if not isinstance(args, dict):
+        raise RuntimeError("GitHub broker arguments must be an object")
+    operation = args.get("operation")
+    if operation not in _GITHUB_OPERATION_FIELDS:
+        raise RuntimeError(f"unsupported GitHub operation: {operation!r}")
+    unexpected = sorted(
+        set(args) - (_GITHUB_BASE_FIELDS | _GITHUB_OPERATION_FIELDS[operation])
+    )
+    if unexpected:
+        accepted = sorted(_GITHUB_OPERATION_FIELDS[operation]) or ["(none)"]
+        raise RuntimeError(
+            f"unexpected fields for {operation}: "
+            + ", ".join(unexpected)
+            + "; it accepts: "
+            + ", ".join(accepted)
+        )
+    raw_repo = args.get("repo_path")
+    if (
+        not isinstance(raw_repo, str)
+        or not raw_repo
+        or "\x00" in raw_repo
+        or not Path(raw_repo).is_absolute()
+    ):
+        raise RuntimeError("repo_path must be an absolute path")
+    timeout = args.get("timeout", min(DEFAULT_TIMEOUT_MS, policy["maxTimeoutMs"]))
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, int)
+        or not 1 <= timeout <= policy["maxTimeoutMs"]
+    ):
+        raise RuntimeError(
+            f"timeout must be an integer from 1 to {policy['maxTimeoutMs']}"
+        )
+    request: dict[str, Any] = {
+        "repo_path": Path(os.path.normpath(raw_repo)),
+        "operation": operation,
+        "timeout": timeout,
+    }
+    if operation == "watch":
+        request["kind"] = _validate_choice(
+            args, "kind", frozenset({"pr", "run"}), ""
+        )
+        request["number"] = _validate_int(args, "number", 1, 10**10)
+        request["timeout_s"] = _validate_int(
+            args, "timeout_s", 60, 21_600, 3_600
+        )
+    elif operation == "update_branch":
+        request["number"] = _validate_int(args, "number", 1, 10**10)
+    elif operation == "rerun":
+        request["run_id"] = _validate_int(args, "run_id", 1, 10**12)
+        request["failed_only"] = _validate_bool(args, "failed_only")
+    else:
+        request["kind"] = _validate_choice(
+            args,
+            "kind",
+            frozenset({"rulesets", "branch_protection", "branch_rules"}),
+            "",
+        )
+        if request["kind"] == "rulesets":
+            if "branch" in args:
+                raise RuntimeError("repo_settings rulesets refuses branch")
+            if "ruleset_id" in args:
+                request["ruleset_id"] = _validate_int(
+                    args, "ruleset_id", 1, 10**12
+                )
+        else:
+            if "ruleset_id" in args:
+                raise RuntimeError(
+                    f"repo_settings {request['kind']} refuses ruleset_id"
+                )
+            request["branch"] = _validate_branch(args.get("branch"))
     return request
 
 
@@ -511,6 +732,47 @@ def _validate_add_request(args: dict, request: dict) -> None:
     request["paths"] = _validate_relative_paths(args["paths"]) if has_paths else ()
 
 
+def _validate_restore_request(args: dict, request: dict) -> None:
+    request["paths"] = _validate_relative_paths(args.get("paths"))
+    if "source" in args and "side" in args:
+        raise RuntimeError("restore source and side are mutually exclusive")
+    if "source" in args:
+        request["source"] = _validate_revision(args["source"], "source")
+    if "side" in args:
+        request["side"] = _validate_choice(
+            args, "side", frozenset({"ours", "theirs"}), "ours"
+        )
+
+
+def _validate_branch_request(args: dict, request: dict) -> None:
+    action = _validate_choice(
+        args,
+        "action",
+        frozenset({"delete", "rename", "set_upstream"}),
+        "",
+    )
+    request["action"] = action
+    if action == "delete":
+        if "new_branch" in args:
+            raise RuntimeError("branch delete takes no new_branch")
+        branch = _validate_branch(args.get("branch"))
+        if branch in _PROTECTED_REMOTE_BRANCHES:
+            raise RuntimeError(f"refusing to delete protected branch {branch!r}")
+        request["branch"] = branch
+    elif action == "rename":
+        branch = _validate_branch(args.get("branch"))
+        new_branch = _validate_branch(args.get("new_branch"), "new_branch")
+        if branch in _PROTECTED_REMOTE_BRANCHES or new_branch in _PROTECTED_REMOTE_BRANCHES:
+            raise RuntimeError("refusing to rename from or to a protected branch")
+        request["branch"] = branch
+        request["new_branch"] = new_branch
+    else:
+        if "new_branch" in args:
+            raise RuntimeError("branch set_upstream takes no new_branch")
+        if "branch" in args:
+            request["branch"] = _validate_branch(args["branch"])
+
+
 def _validate_commit_request(args: dict, request: dict) -> None:
     message = args.get("message")
     if (
@@ -522,6 +784,7 @@ def _validate_commit_request(args: dict, request: dict) -> None:
         raise RuntimeError("commit message must be non-empty and at most 10000 characters")
     request["message"] = message
     request["amend"] = _validate_bool(args, "amend")
+    request["all"] = _validate_bool(args, "all")
 
 
 def _validate_stash_request(args: dict, request: dict) -> None:
@@ -601,21 +864,47 @@ def _validate_network_request(args: dict, request: dict, operation: str) -> None
 
 
 def _validate_switch_request(args: dict, request: dict) -> None:
+    detach = _validate_bool(args, "detach")
+    request["detach"] = detach
+    if detach:
+        conflicts = sorted({"branch", "create", "force_create"} & args.keys())
+        if conflicts:
+            raise RuntimeError("switch detach takes no " + ", ".join(conflicts))
+        if "start_point" in args:
+            request["start_point"] = _validate_start_point(args["start_point"])
+        return
     request["branch"] = _validate_branch(args.get("branch"))
-    create = args.get("create", False)
-    if not isinstance(create, bool):
-        raise RuntimeError("create must be a boolean")
+    create = _validate_bool(args, "create")
+    force_create = _validate_bool(args, "force_create")
+    if create and force_create:
+        raise RuntimeError("create and force_create are mutually exclusive")
     request["create"] = create
+    request["force_create"] = force_create
     if "start_point" in args:
-        if not create:
-            raise RuntimeError("start_point requires create=true")
+        if not (create or force_create):
+            raise RuntimeError("start_point requires create=true, force_create=true, or detach=true")
         request["start_point"] = _validate_start_point(args["start_point"])
 
 
 def _validate_worktree_add_request(args: dict, request: dict, policy: dict) -> None:
     request["worktree_path"] = _validate_worktree_path(args.get("worktree_path"), policy)
+    detach = _validate_bool(args, "detach")
+    request["detach"] = detach
+    if detach:
+        conflicts = sorted({"branch", "create"} & args.keys())
+        if conflicts:
+            raise RuntimeError("worktree_add detach takes no " + ", ".join(conflicts))
+        if "start_point" in args:
+            request["start_point"] = _validate_start_point(args["start_point"])
+        return
     request["branch"] = _validate_branch(args.get("branch"))
+    create = args.get("create", True)
+    if not isinstance(create, bool):
+        raise RuntimeError("create must be a boolean")
+    request["create"] = create
     if "start_point" in args:
+        if not create:
+            raise RuntimeError("start_point requires create=true or detach=true")
         request["start_point"] = _validate_start_point(args["start_point"])
 
 
@@ -833,6 +1122,215 @@ def _validate_remote_url(url: object, policy: dict) -> str:
     return url
 
 
+def _github_repo_from_origin(identity: _GitIdentity, policy: dict) -> str:
+    """Return a validated lowercase owner/name derived only from origin."""
+    git = _resolve_required_executable(policy, "gitExecutable")
+    proc = _run_git_discovery(
+        [
+            git,
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-C",
+            str(identity.worktree),
+            "remote",
+            "get-url",
+            "--all",
+            "origin",
+        ],
+        policy,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "could not resolve origin remote: "
+            + (proc.stderr or "git remote get-url failed").strip()[:300]
+        )
+    urls = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
+    if len(urls) != 1:
+        raise RuntimeError("origin must resolve to exactly one fetch URL")
+    url = _validate_remote_url(urls[0], policy)
+    scp = re.fullmatch(
+        r"git@([A-Za-z0-9.-]+):([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?)",
+        url,
+    )
+    if scp is not None:
+        host = scp.group(1).lower()
+        path = scp.group(2)
+    else:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        path = parsed.path.removeprefix("/")
+    if host != "github.com":
+        raise RuntimeError("origin must be hosted on github.com")
+    if path.endswith(".git"):
+        path = path[:-4]
+    owner, separator, name = path.partition("/")
+    owner = owner.lower()
+    name = name.lower()
+    if (
+        separator != "/"
+        or "/" in name
+        or not _GITHUB_OWNER_RE.fullmatch(owner)
+        or not _GITHUB_NAME_RE.fullmatch(name)
+        or name in {".", ".."}
+    ):
+        raise RuntimeError("origin has an unsafe GitHub owner/repository path")
+    return f"{owner}/{name}"
+
+
+def _github_env() -> dict[str, str]:
+    """Environment for host-side gh and wait-for processes."""
+    return {
+        "PATH": os.environ.get("PATH") or "/run/current-system/sw/bin:/usr/bin:/bin",
+        "HOME": str(Path.home()),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "GH_PROMPT_DISABLED": "1",
+        "GH_NO_UPDATE_NOTIFIER": "1",
+        "NO_COLOR": "1",
+    }
+
+
+def _build_github_argv(request: dict, repo: str, policy: dict) -> list[str]:
+    """Build one fixed gh argv; callers cannot supply flags or endpoints."""
+    gh = _resolve_required_executable(policy, "githubCliExecutable")
+    operation = request["operation"]
+    if operation == "update_branch":
+        return [gh, "pr", "update-branch", str(request["number"]), "-R", repo]
+    if operation == "rerun":
+        argv = [gh, "run", "rerun", str(request["run_id"])]
+        if request["failed_only"]:
+            argv.append("--failed")
+        argv.extend(("-R", repo))
+        return argv
+    if operation != "repo_settings":
+        raise RuntimeError(f"{operation} has no gh argv")
+    owner, name = repo.split("/", 1)
+    kind = request["kind"]
+    if kind == "rulesets":
+        endpoint = f"repos/{owner}/{name}/rulesets"
+        if request.get("ruleset_id") is not None:
+            endpoint += f"/{request['ruleset_id']}"
+    else:
+        branch = quote(request["branch"], safe="")
+        if kind == "branch_protection":
+            endpoint = f"repos/{owner}/{name}/branches/{branch}/protection"
+        else:
+            endpoint = f"repos/{owner}/{name}/rules/branches/{branch}"
+    return [gh, "api", "--method", "GET", endpoint]
+
+
+def _watch_status_path(root: Path, repo: str, kind: str, number: int) -> Path:
+    owner, name = repo.split("/", 1)
+    path = root / owner / name / f"{kind}-{number}.json"
+    if not root.is_absolute() or not (root == path or root in path.parents):
+        raise RuntimeError("watch status path escapes watchStatusDir")
+    return path
+
+
+def _ensure_owned_watch_directory(root: Path, directory: Path) -> None:
+    """Create private watch directories and refuse symlinks or foreign owners."""
+    if not root.is_absolute() or not (root == directory or root in directory.parents):
+        raise RuntimeError("watch status directory escapes watchStatusDir")
+    try:
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RuntimeError(f"could not create watchStatusDir: {exc}") from exc
+    current = root
+    components = [root]
+    relative = directory.relative_to(root)
+    for part in relative.parts:
+        current = current / part
+        try:
+            current.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise RuntimeError(f"could not create watch status directory: {exc}") from exc
+        components.append(current)
+    for component in components:
+        try:
+            info = component.lstat()
+        except OSError as exc:
+            raise RuntimeError(f"could not verify watch status directory: {exc}") from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise RuntimeError(f"watch status directory component is a symlink: {component}")
+        if not stat.S_ISDIR(info.st_mode):
+            raise RuntimeError(f"watch status component is not a directory: {component}")
+        if info.st_uid != os.getuid():
+            raise RuntimeError(f"watch status directory is not owned by uid {os.getuid()}")
+    if directory.resolve(strict=True) != root.resolve(strict=True) / relative:
+        raise RuntimeError("watch status directory traverses a symlink")
+
+
+def _write_watch_status(root: Path, path: Path, data: dict[str, Any]) -> None:
+    _ensure_owned_watch_directory(root, path.parent)
+    temp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=".watch-",
+            suffix=".json",
+            delete=False,
+        ) as handle:
+            temp_name = handle.name
+            os.fchmod(handle.fileno(), 0o600)
+            json.dump(data, handle, separators=(",", ":"), sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+        temp_name = None
+    finally:
+        if temp_name is not None:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
+
+
+def _finished_watch_status(watching: dict[str, Any], rc: int | None, line: str) -> dict[str, Any]:
+    done = dict(watching)
+    done.update(
+        {
+            "state": "done",
+            "exit": rc if isinstance(rc, int) else 1,
+            "line": line,
+            "finished_at": int(time.time()),
+        }
+    )
+    return done
+
+
+def _terminate_process_group(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.terminate()
+        except (ProcessLookupError, PermissionError, OSError):
+            return
+    try:
+        proc.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except (ProcessLookupError, PermissionError, OSError):
+            return
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        return
+
+
 def _fixed_git_config(policy: dict) -> list[str]:
     credential_helper = _resolve_required_executable(
         policy, "credentialHelperExecutable"
@@ -888,7 +1386,7 @@ def _stash_args(request: dict) -> list[str]:
 
 
 def _sequencer_args(request: dict) -> list[str]:
-    """rebase / merge / cherry-pick: start, or drive an in-progress sequence.
+    """rebase / merge / cherry-pick / revert start or control actions.
 
     Never interactive: no --interactive, --exec, or strategy options exist,
     and the sandbox sets GIT_EDITOR=true so --continue cannot block on an
@@ -903,6 +1401,8 @@ def _sequencer_args(request: dict) -> list[str]:
         return [command, request["onto"]]
     if operation == "merge":
         return _merge_sequencer_args(command, request)
+    if operation == "revert":
+        return [command, "--no-edit", *request["commits"]]
     return [command, *request["commits"]]
 
 
@@ -957,14 +1457,33 @@ def _build_git_argv(
         _append_diff_argv(argv, request)
     elif operation == "log":
         argv.extend(("log", "--oneline", "--decorate=no", f"--max-count={request['max_count']}"))
+    elif operation == "reflog":
+        argv.extend(("reflog", "show", f"--max-count={request['max_count']}"))
+        if request.get("ref"):
+            argv.append(request["ref"])
+    elif operation == "branch":
+        if request["action"] == "delete":
+            argv.extend(("branch", "--delete", request["branch"]))
+        elif request["action"] == "rename":
+            argv.extend(
+                ("branch", "--move", request["branch"], request["new_branch"])
+            )
+        else:
+            raise RuntimeError("branch set_upstream has no sandboxed Git argv")
     elif operation == "add":
         _append_add_argv(argv, request)
     elif operation == "unstage":
         argv.extend(("restore", "--staged", "--", *request["paths"]))
+    elif operation == "untrack":
+        argv.extend(("rm", "--cached", "-r", "--quiet", "--", *request["paths"]))
+    elif operation == "restore":
+        _append_restore_argv(argv, request)
     elif operation == "commit":
         argv.append("commit")
         if request["amend"]:
             argv.append("--amend")
+        if request["all"]:
+            argv.append("--all")
         argv.extend(("--message", request["message"]))
     elif operation == "stash":
         argv.extend(_stash_args(request))
@@ -1042,6 +1561,23 @@ def _append_add_argv(argv: list[str], request: dict) -> None:
         argv.extend(request["paths"])
 
 
+def _append_restore_argv(argv: list[str], request: dict) -> None:
+    if request.get("side"):
+        argv.extend(("checkout", f"--{request['side']}", "--", *request["paths"]))
+        return
+    source = request.get("source", "HEAD")
+    argv.extend(
+        (
+            "restore",
+            f"--source={source}",
+            "--staged",
+            "--worktree",
+            "--",
+            *request["paths"],
+        )
+    )
+
+
 def _append_pull_argv(argv: list[str], current_branch: str | None) -> None:
     branch = _validate_branch(current_branch, "current branch")
     argv.extend(
@@ -1071,7 +1607,15 @@ def _append_fetch_argv(argv: list[str]) -> None:
 
 def _append_switch_argv(argv: list[str], request: dict) -> None:
     argv.append("switch")
-    if request["create"]:
+    if request["detach"]:
+        argv.append("--detach")
+        if request.get("start_point"):
+            argv.append(request["start_point"])
+    elif request["force_create"]:
+        argv.extend(("--no-track", "--force-create", request["branch"]))
+        if request.get("start_point"):
+            argv.append(request["start_point"])
+    elif request["create"]:
         argv.append("--no-track")
         argv.extend(("--create", request["branch"]))
         if request.get("start_point"):
@@ -1081,16 +1625,17 @@ def _append_switch_argv(argv: list[str], request: dict) -> None:
 
 
 def _append_worktree_add_argv(argv: list[str], request: dict) -> None:
-    argv.extend(
-        (
-            "worktree",
-            "add",
-            "--no-track",
-            "-b",
-            request["branch"],
-            str(request["worktree_path"]),
+    argv.extend(("worktree", "add"))
+    if request["detach"]:
+        argv.extend(("--detach", str(request["worktree_path"])))
+    elif request["create"]:
+        argv.extend(
+            ("--no-track", "-b", request["branch"], str(request["worktree_path"]))
         )
-    )
+    else:
+        argv.extend(
+            ("--no-guess-remote", str(request["worktree_path"]), request["branch"])
+        )
     if request.get("start_point"):
         argv.append(request["start_point"])
 
@@ -1210,7 +1755,9 @@ def _build_git_sandbox(
     # --continue and merge commits must never wait on an interactive editor.
     env["GIT_EDITOR"] = "true"
     env["GIT_SEQUENCE_EDITOR"] = "true"
-    if operation == "stash":
+    if operation == "stash" or (
+        operation == "worktree_remove" and request.get("force")
+    ):
         # stash takes no caller pathspecs, and its --include-untracked path
         # relies on git's own ":/" pathspec magic, which literal mode disables.
         del env["GIT_LITERAL_PATHSPECS"]
@@ -1367,6 +1914,21 @@ def _dcg_command_for_git_request(request: dict) -> str:
         _append_dcg_diff_args(argv, request)
     elif operation == "log":
         argv.extend(("log", f"--max-count={request['max_count']}"))
+    elif operation == "reflog":
+        argv.extend(("reflog", "show", f"--max-count={request['max_count']}"))
+        if request.get("ref"):
+            argv.append(request["ref"])
+    elif operation == "branch":
+        action = request["action"]
+        if action == "delete":
+            argv.extend(("branch", "--delete", request["branch"]))
+        elif action == "rename":
+            argv.extend(("branch", "--move", request["branch"], request["new_branch"]))
+        else:
+            branch = request.get("branch", "CURRENT_BRANCH")
+            argv.extend(("branch", "--set-upstream-to", f"origin/{branch}"))
+            if request.get("branch"):
+                argv.append(branch)
     elif operation == "add":
         argv.append("add")
         argv.extend(("--all",) if request["all"] else ("--", *request["paths"]))
@@ -1374,6 +1936,8 @@ def _dcg_command_for_git_request(request: dict) -> str:
         argv.append("commit")
         if request["amend"]:
             argv.append("--amend")
+        if request["all"]:
+            argv.append("--all")
         argv.extend(("--message", request["message"]))
     elif operation == "fetch":
         argv.extend(("fetch", "origin"))
@@ -1385,6 +1949,10 @@ def _dcg_command_for_git_request(request: dict) -> str:
         _append_dcg_worktree_add_args(argv, request)
     elif operation == "unstage":
         argv.extend(("restore", "--staged", "--", *request["paths"]))
+    elif operation == "untrack":
+        argv.extend(("rm", "--cached", "-r", "--quiet", "--", *request["paths"]))
+    elif operation == "restore":
+        _append_restore_argv(argv, request)
     elif operation == "stash":
         argv.extend(_stash_args(request))
     elif operation == "reset":
@@ -1416,7 +1984,15 @@ def _append_dcg_diff_args(argv: list[str], request: dict) -> None:
 
 def _append_dcg_switch_args(argv: list[str], request: dict) -> None:
     argv.append("switch")
-    if request["create"]:
+    if request["detach"]:
+        argv.append("--detach")
+        if request.get("start_point"):
+            argv.append(request["start_point"])
+    elif request["force_create"]:
+        argv.extend(("--force-create", request["branch"]))
+        if request.get("start_point"):
+            argv.append(request["start_point"])
+    elif request["create"]:
         argv.extend(("--create", request["branch"]))
         if request.get("start_point"):
             argv.append(request["start_point"])
@@ -1425,17 +2001,43 @@ def _append_dcg_switch_args(argv: list[str], request: dict) -> None:
 
 
 def _append_dcg_worktree_add_args(argv: list[str], request: dict) -> None:
-    argv.extend(
-        (
-            "worktree",
-            "add",
-            "-b",
-            request["branch"],
-            str(request["worktree_path"]),
+    argv.extend(("worktree", "add"))
+    if request["detach"]:
+        argv.extend(("--detach", str(request["worktree_path"])))
+    elif request["create"]:
+        argv.extend(("-b", request["branch"], str(request["worktree_path"])))
+    else:
+        argv.extend(
+            ("--no-guess-remote", str(request["worktree_path"]), request["branch"])
         )
-    )
     if request.get("start_point"):
         argv.append(request["start_point"])
+
+
+# dcg blocks or misclassifies these raw command shapes. They are safe by
+# construction: restore stores a stash before discarding; a side restore is
+# restricted to committed conflict sides; branch delete uses Git's safe
+# --delete form, which refuses unmerged branches (dcg mistakes it for -D).
+_DCG_EXEMPT_OPERATION_SHAPES = frozenset(
+    {
+        ("restore", "backup"),
+        ("restore", "conflict-side"),
+        ("branch", "delete"),
+    }
+)
+
+
+def _dcg_operation_shape(request: dict) -> tuple[str, ...]:
+    if request["operation"] == "restore":
+        return ("restore", "conflict-side" if request.get("side") else "backup")
+    if request["operation"] == "branch":
+        return ("branch", request["action"])
+    return (request["operation"],)
+
+
+def _is_dcg_exempt(request: dict) -> bool:
+    """Only operation shapes made recoverable by the broker bypass dcg."""
+    return _dcg_operation_shape(request) in _DCG_EXEMPT_OPERATION_SHAPES
 
 
 def _prepare_worktree_target(request: dict, policy: dict) -> Path | None:
@@ -1507,7 +2109,9 @@ def _finish_worktree_remove(
     return 0, "[git-broker] worktree removed"
 
 
-def _set_upstream(identity: _GitIdentity, branch: str | None, policy: dict) -> str:
+def _set_upstream(
+    identity: _GitIdentity, branch: str | None, policy: dict
+) -> tuple[bool, str]:
     """Record origin/<branch> as upstream after a successful push.
 
     Runs outside the sandbox because the sandbox overlays the repository
@@ -1526,11 +2130,123 @@ def _set_upstream(identity: _GitIdentity, branch: str | None, policy: dict) -> s
             policy,
         )
         if proc.returncode != 0:
-            return (
+            return False, (
                 "[git-broker] push succeeded but recording upstream failed: "
                 + (proc.stderr or "git config failed").strip()[:300]
             )
-    return f"[git-broker] upstream set: {branch} -> origin/{branch}"
+    return True, f"[git-broker] upstream set: {branch} -> origin/{branch}"
+
+
+def _branch_exists(identity: _GitIdentity, branch: str, policy: dict) -> bool:
+    """Test one validated local ref without interpreting repository config."""
+    branch = _validate_branch(branch)
+    git = _resolve_required_executable(policy, "gitExecutable")
+    proc = _run_git_discovery(
+        [
+            git,
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-C",
+            str(identity.worktree),
+            "show-ref",
+            "--verify",
+            "--quiet",
+            f"refs/heads/{branch}",
+        ],
+        policy,
+    )
+    if proc.returncode not in {0, 1}:
+        raise RuntimeError(
+            "could not determine branch ref state: "
+            + (proc.stderr or "git show-ref failed").strip()[:300]
+        )
+    return proc.returncode == 0
+
+
+def _branch_config_section_exists(
+    identity: _GitIdentity, branch: str, policy: dict
+) -> bool:
+    branch = _validate_branch(branch)
+    git = _resolve_required_executable(policy, "gitExecutable")
+    proc = _run_git_discovery(
+        [
+            git,
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-C",
+            str(identity.worktree),
+            "config",
+            "--local",
+            "--get-regexp",
+            rf"^branch\.{re.escape(branch)}\.",
+        ],
+        policy,
+    )
+    if proc.returncode not in {0, 1}:
+        raise RuntimeError(
+            "could not determine branch config state: "
+            + (proc.stderr or "git config failed").strip()[:300]
+        )
+    return proc.returncode == 0
+
+
+def _run_local_config_update(
+    identity: _GitIdentity, policy: dict, *args: str
+) -> subprocess.CompletedProcess:
+    """Run only broker-selected local-config argv outside the masked sandbox."""
+    git = _resolve_required_executable(policy, "gitExecutable")
+    return _run_git_discovery(
+        [
+            git,
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-C",
+            str(identity.worktree),
+            "config",
+            "--local",
+            *args,
+        ],
+        policy,
+    )
+
+
+def _finish_branch_operation(
+    identity: _GitIdentity,
+    request: dict,
+    policy: dict,
+    rc: int,
+    stderr: str,
+) -> tuple[int, str]:
+    """Reconcile config only after refs prove delete or rename succeeded."""
+    action = request["action"]
+    old = request["branch"]
+    if action == "delete":
+        if _branch_exists(identity, old, policy):
+            return rc, stderr
+        if _branch_config_section_exists(identity, old, policy):
+            update = _run_local_config_update(
+                identity, policy, "--remove-section", f"branch.{old}"
+            )
+            if update.returncode != 0:
+                detail = (update.stderr or "git config failed").strip()[:300]
+                return 1, (stderr + "\n" + detail).strip()
+        return 0, (stderr + "\n[git-broker] branch deleted").strip()
+
+    new = request["new_branch"]
+    if _branch_exists(identity, old, policy) or not _branch_exists(identity, new, policy):
+        return rc, stderr
+    if _branch_config_section_exists(identity, old, policy):
+        update = _run_local_config_update(
+            identity,
+            policy,
+            "--rename-section",
+            f"branch.{old}",
+            f"branch.{new}",
+        )
+        if update.returncode != 0:
+            detail = (update.stderr or "git config failed").strip()[:300]
+            return 1, (stderr + "\n" + detail).strip()
+    return 0, (stderr + "\n[git-broker] branch renamed").strip()
 
 
 def _reject_nested_target(target: Path, roots: tuple[Path, ...], policy: dict) -> None:
@@ -2216,6 +2932,8 @@ def _run_argv(
     timeout_ms: int,
     rec: Optional[_InFlight] = None,
     pass_fds: tuple[int, ...] = (),
+    *,
+    cwd: str | None = None,
 ) -> tuple[int, str, str]:
     """Run a prevalidated argv directly; never invoke a shell."""
     timeout_s = max(1, timeout_ms) / 1000.0
@@ -2226,6 +2944,7 @@ def _run_argv(
         stderr=subprocess.PIPE,
         text=True,
         env=env,
+        cwd=cwd,
         start_new_session=True,
         pass_fds=pass_fds,
     )
@@ -2377,6 +3096,111 @@ def _compose_output(rc: int, stdout: str, stderr: str) -> str:
     return _redact_secrets(combined)
 
 
+def _auxiliary_git_argv(
+    worktree: Path, policy: dict, *subcommand: str
+) -> list[str]:
+    """Build fixed local Git argv for a broker-owned prerequisite step."""
+    git = _resolve_required_executable(policy, "gitExecutable")
+    return [
+        git,
+        *_fixed_git_config(policy),
+        "-C",
+        str(worktree),
+        *subcommand,
+    ]
+
+
+def _run_contained_git_step(
+    request: dict,
+    identity: _GitIdentity,
+    policy: dict,
+    git_argv: list[str],
+    rec: Optional[_InFlight],
+    bind_fds: list[int],
+) -> tuple[int, str, str]:
+    """Run one fixed argv under the request's standard repository sandbox."""
+    sandbox_argv, env = _build_git_sandbox(
+        request, identity, policy, git_argv, bind_fds=bind_fds
+    )
+    return _run_argv(
+        sandbox_argv, env, request["timeout"], rec, pass_fds=tuple(bind_fds)
+    )
+
+
+def _run_restore_with_backup(
+    request: dict,
+    identity: _GitIdentity,
+    policy: dict,
+    rec: Optional[_InFlight],
+    bind_fds: list[int],
+) -> tuple[int, str, str]:
+    """Store tracked work before restoring; a failed backup prevents discard."""
+    create_argv = _auxiliary_git_argv(identity.worktree, policy, "stash", "create")
+    rc, stdout, stderr = _run_contained_git_step(
+        request, identity, policy, create_argv, rec, bind_fds
+    )
+    if rc != 0:
+        return rc, stdout, stderr
+
+    backup_id = stdout.strip()
+    backup_note = ""
+    if backup_id:
+        if not re.fullmatch(r"[0-9a-f]{40,64}", backup_id):
+            return 1, stdout, "git stash create returned an invalid commit id; restore not run"
+        joined_paths = ", ".join(request["paths"])[:200]
+        message = f"git-broker restore backup: {joined_paths}"
+        store_argv = _auxiliary_git_argv(
+            identity.worktree,
+            policy,
+            "stash",
+            "store",
+            "--message",
+            message,
+            backup_id,
+        )
+        store_rc, store_stdout, store_stderr = _run_contained_git_step(
+            request, identity, policy, store_argv, rec, bind_fds
+        )
+        if store_rc != 0:
+            detail = "restore not run because storing its backup failed"
+            return store_rc, store_stdout, (store_stderr + "\n" + detail).strip()
+        backup_note = f"[git-broker] restore backup: stash@{{0}} ({backup_id})"
+
+    restore_argv = _build_git_argv(request, identity, policy)
+    rc, stdout, stderr = _run_contained_git_step(
+        request, identity, policy, restore_argv, rec, bind_fds
+    )
+    if backup_note:
+        stderr = (stderr + "\n" + backup_note).strip()
+    return rc, stdout, stderr
+
+
+def _run_worktree_remove_backup(
+    request: dict,
+    identity: _GitIdentity,
+    policy: dict,
+    rec: Optional[_InFlight],
+    bind_fds: list[int],
+) -> tuple[int, str, str, bool]:
+    """Stash the target worktree completely; failure leaves it registered."""
+    target = request["worktree_path"]
+    message = f"git-broker worktree_remove backup: {target}"
+    stash_argv = _auxiliary_git_argv(
+        target,
+        policy,
+        "stash",
+        "push",
+        "--include-untracked",
+        "--message",
+        message,
+    )
+    rc, stdout, stderr = _run_contained_git_step(
+        request, identity, policy, stash_argv, rec, bind_fds
+    )
+    created = rc == 0 and "No local changes to save" not in stdout
+    return rc, stdout, stderr, created
+
+
 def _operation_guide() -> str:
     lines = [
         f"- {operation}: " + (", ".join(sorted(fields)) or "(no extra fields)")
@@ -2397,10 +3221,13 @@ TOOLS = [
             + "\nNotes: clone's repo_path is the new checkout directory. push and pull "
             "act on the current branch; push set_upstream records origin "
             "tracking. stash action: push|pop|apply|drop|list|show (index = stash@{n}). "
-            "rebase/merge/cherry_pick action: start|continue|abort (and skip for "
-            "rebase/cherry_pick); resolve conflicts by editing files, add, then "
-            "action=continue. merge ff_mode: default|ff_only|no_ff. reset mode: "
-            "soft|mixed (no hard)."
+            "rebase/merge/cherry_pick/revert action: start|continue|abort (and skip "
+            "except for merge); resolve conflicts by editing files, add, then "
+            "action=continue. worktree_add create defaults true; detach conflicts "
+            "with branch/create. switch create, force_create and detach are exclusive. "
+            "restore stores tracked changes before replacing paths; side selects ours "
+            "or theirs for unmerged paths. branch action: delete|rename|set_upstream. "
+            "merge ff_mode: default|ff_only|no_ff. reset mode: soft|mixed (no hard)."
         ),
         "inputSchema": {
             "type": "object",
@@ -2417,7 +3244,7 @@ TOOLS = [
                 "paths": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Relative paths for add, unstage or diff",
+                    "description": "Relative paths for add, unstage, untrack, restore or diff",
                 },
                 "all": {"type": "boolean"},
                 "message": {"type": "string"},
@@ -2426,9 +3253,15 @@ TOOLS = [
                 "set_upstream": {"type": "boolean"},
                 "branch": {"type": "string"},
                 "create": {"type": "boolean"},
+                "force_create": {"type": "boolean"},
+                "detach": {"type": "boolean"},
                 "start_point": {"type": "string"},
                 "worktree_path": {"type": "string"},
                 "action": {"type": "string"},
+                "new_branch": {"type": "string"},
+                "force": {"type": "boolean"},
+                "source": {"type": "string"},
+                "side": {"type": "string", "enum": ["ours", "theirs"]},
                 "index": {"type": "integer", "minimum": 0},
                 "include_untracked": {"type": "boolean"},
                 "mode": {"type": "string", "enum": ["soft", "mixed"]},
@@ -2451,7 +3284,45 @@ TOOLS = [
             "required": ["repo_path", "operation"],
             "additionalProperties": False,
         },
-    }
+    },
+    {
+        "name": "github",
+        "description": (
+            "Runs one closed, policy-approved GitHub operation for the repository "
+            "derived from the checkout's validated origin fetch URL. Calls take "
+            "repo_path, operation and optional timeout. Extra fields by operation: "
+            "watch: kind, number, timeout_s; update_branch: number; rerun: run_id, "
+            "failed_only; repo_settings: kind, branch, ruleset_id. No caller URL, "
+            "endpoint, method, header, jq expression, or raw flag is accepted."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "repo_path": {"type": "string"},
+                "operation": {
+                    "type": "string",
+                    "enum": list(_GITHUB_OPERATION_FIELDS),
+                },
+                "timeout": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_TIMEOUT_MS,
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["pr", "run", "rulesets", "branch_protection", "branch_rules"],
+                },
+                "number": {"type": "integer", "minimum": 1, "maximum": 10**10},
+                "timeout_s": {"type": "integer", "minimum": 60, "maximum": 21600},
+                "run_id": {"type": "integer", "minimum": 1, "maximum": 10**12},
+                "failed_only": {"type": "boolean"},
+                "branch": {"type": "string"},
+                "ruleset_id": {"type": "integer", "minimum": 1},
+            },
+            "required": ["repo_path", "operation"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -2585,10 +3456,10 @@ def _dispatch_tools_call(msg_id, params, rec) -> None:
     try:
         name = params.get("name")
         arguments = params.get("arguments") or {}
-        if name != "git":
+        if name not in {"git", "github"}:
             _send_response(msg_id, error={"code": -32601, "message": f"Unknown tool: {name}"})
             return
-        text = _tool_git(arguments, rec)
+        text = _tool_git(arguments, rec) if name == "git" else _tool_github(arguments, rec)
         _send_response(msg_id, result={"content": [{"type": "text", "text": text}]})
     except Exception as e:
         _send_response(
@@ -2597,17 +3468,114 @@ def _dispatch_tools_call(msg_id, params, rec) -> None:
         )
 
 
+def _start_github_watch(
+    request: dict,
+    repo: str,
+    policy: dict,
+    registry: _WatchRegistry,
+    rec: Optional[_InFlight],
+) -> str:
+    wait_for = _resolve_required_executable(policy, "waitForExecutable")
+    gh = _resolve_required_executable(policy, "githubCliExecutable")
+    validator = _resolve_required_executable(policy, "validatorExecutable")
+    watch_argv = [
+        wait_for,
+        request["kind"],
+        str(request["number"]),
+        "-R",
+        repo,
+        "--timeout",
+        str(request["timeout_s"]),
+    ]
+    auth_argv = [gh, "api", "--method", "GET", "rate_limit", "--jq", ".rate.remaining"]
+    for argv in (watch_argv, auth_argv):
+        denial = _check_denied_by_dcg(shlex.join(argv), validator)
+        if denial is not None:
+            return f"[git-broker] {denial}"
+    rc, _stdout, _stderr = _run_argv(
+        auth_argv,
+        _github_env(),
+        request["timeout"],
+        rec,
+        cwd="/",
+    )
+    if rc != 0:
+        raise RuntimeError(
+            "GitHub auth pre-check failed; the gh-token host service may be unavailable"
+        )
+    root: Path = policy["watchStatusDir"]
+    status_path = _watch_status_path(
+        root, repo, request["kind"], request["number"]
+    )
+    _ensure_owned_watch_directory(root, status_path.parent)
+    watching = {
+        "state": "watching",
+        "kind": request["kind"],
+        "repo": repo,
+        "number": request["number"],
+        "started_at": int(time.time()),
+        "timeout_s": request["timeout_s"],
+    }
+    registry.start(
+        (repo, request["kind"], request["number"]),
+        watch_argv,
+        _github_env(),
+        root,
+        status_path,
+        watching,
+    )
+    message = (
+        f"Started host watch for {request['kind']} {request['number']} in {repo}.\n"
+        f"Status file: {status_path}\n"
+        "Next: run "
+        f"~/.claude/scripts/wait-for {request['kind']} {request['number']} -R {repo} "
+        "with Bash run_in_background; without host GitHub auth it waits on this file."
+    )
+    return _compose_output(0, message, "")
+
+
+def _tool_github(
+    args: dict,
+    rec: Optional[_InFlight] = None,
+    *,
+    registry: _WatchRegistry | None = None,
+) -> str:
+    """Authorize and run one fixed host-side GitHub operation."""
+    policy = _load_git_policy(_load_config())
+    request = _validate_github_request(args, policy)
+    identity = _discover_git_identity(request["repo_path"], policy)
+    repo = _github_repo_from_origin(identity, policy)
+    if request["operation"] == "watch":
+        return _start_github_watch(
+            request, repo, policy, registry or _watch_registry, rec
+        )
+    argv = _build_github_argv(request, repo, policy)
+    validator = _resolve_required_executable(policy, "validatorExecutable")
+    denial = _check_denied_by_dcg(shlex.join(argv), validator)
+    if denial is not None:
+        return f"[git-broker] {denial}"
+    rc, stdout, stderr = _run_argv(
+        argv,
+        _github_env(),
+        request["timeout"],
+        rec,
+        cwd="/",
+    )
+    return _compose_output(rc, stdout, stderr)
+
+
 def _tool_git(args: dict, rec: Optional[_InFlight] = None) -> str:
     """Authorize and run one structured Git operation inside bubblewrap."""
     config = _load_config()
     policy = _load_git_policy(config)
     request = _validate_git_request(args, policy)
 
-    validator = _resolve_required_executable(policy, "validatorExecutable")
     verdict_command = _dcg_command_for_git_request(request)
-    validator_reason = _check_denied_by_dcg(verdict_command, validator)
-    if validator_reason is not None:
-        return f"[git-broker] {validator_reason}"
+    if not _is_dcg_exempt(request):
+        validator = _resolve_required_executable(policy, "validatorExecutable")
+        validator_reason = _check_denied_by_dcg(verdict_command, validator)
+        if validator_reason is not None:
+            return f"[git-broker] {validator_reason}"
 
     operation = request["operation"]
     if operation == "clone":
@@ -2618,6 +3586,10 @@ def _tool_git(args: dict, rec: Optional[_InFlight] = None) -> str:
         if denial is not None:
             return denial
 
+    if operation == "branch" and request["action"] == "set_upstream":
+        success, note = _set_upstream(identity, current_branch, policy)
+        return _compose_output(0 if success else 1, "", note)
+
     if operation == "clone":
         created_target = _prepare_clone_target(request, policy)
     else:
@@ -2625,29 +3597,52 @@ def _tool_git(args: dict, rec: Optional[_InFlight] = None) -> str:
     completed = False
     bind_fds: list[int] = []
     try:
-        git_argv = _build_git_argv(
-            request,
-            identity,
-            policy,
-            remote_url=remote_url,
-            current_branch=current_branch,
-        )
-        sandbox_argv, env = _build_git_sandbox(
-            request,
-            identity,
-            policy,
-            git_argv,
-            remote_url=remote_url,
-            bind_fds=bind_fds,
-        )
-        rc, stdout, stderr = _run_argv(
-            sandbox_argv, env, request["timeout"], rec, pass_fds=tuple(bind_fds)
-        )
+        backup_note = ""
+        if operation == "worktree_remove" and request["force"]:
+            rc, stdout, stderr, backup_created = _run_worktree_remove_backup(
+                request, identity, policy, rec, bind_fds
+            )
+            if rc != 0:
+                return _compose_output(rc, stdout, stderr)
+            if backup_created:
+                backup_note = "[git-broker] worktree_remove backup: stash@{0}"
+        if operation == "restore" and not request.get("side"):
+            rc, stdout, stderr = _run_restore_with_backup(
+                request, identity, policy, rec, bind_fds
+            )
+        else:
+            git_argv = _build_git_argv(
+                request,
+                identity,
+                policy,
+                remote_url=remote_url,
+                current_branch=current_branch,
+            )
+            sandbox_argv, env = _build_git_sandbox(
+                request,
+                identity,
+                policy,
+                git_argv,
+                remote_url=remote_url,
+                bind_fds=bind_fds,
+            )
+            rc, stdout, stderr = _run_argv(
+                sandbox_argv, env, request["timeout"], rec, pass_fds=tuple(bind_fds)
+            )
         if operation == "worktree_remove":
             rc, stderr = _finish_worktree_remove(identity, request["worktree_path"], policy, rc, stderr)
+            if backup_note:
+                stderr = (stderr + "\n" + backup_note).strip()
+        elif operation == "branch":
+            rc, stderr = _finish_branch_operation(
+                identity, request, policy, rc, stderr
+            )
         completed = rc == 0
         if completed and operation == "push" and request["set_upstream"]:
-            stderr = (stderr + "\n" + _set_upstream(identity, current_branch, policy)).strip()
+            _upstream_recorded, note = _set_upstream(
+                identity, current_branch, policy
+            )
+            stderr = (stderr + "\n" + note).strip()
         return _compose_output(rc, stdout, stderr)
     finally:
         for fd in bind_fds:
@@ -2673,6 +3668,13 @@ def _prepare_existing_operation(
     if operation == "worktree_remove":
         _check_removable_worktree(identity, request["worktree_path"], policy)
     remote_url, current_branch = _network_git_context(request, identity, policy)
+    if operation == "branch" and request["action"] == "set_upstream":
+        current_branch = request.get("branch") or _discover_current_branch(
+            _resolve_required_executable(policy, "gitExecutable"),
+            identity,
+            policy,
+            operation,
+        )
     return identity, remote_url, current_branch, None
 
 
@@ -2787,23 +3789,33 @@ def _drain_in_flight(timeout_s: float = 30.0) -> None:
 
 
 def main() -> None:
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            msg = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        try:
-            _handle(msg)
-        except Exception as e:
-            sys.stderr.write(f"[git-broker] unhandled error: {e}\n")
-            sys.stderr.flush()
-    # Stdin closed. Workers may still be running. Drain so any
-    # already-dispatched tool call gets its response on stdout before
-    # the process exits.
-    _drain_in_flight(timeout_s=30.0)
+    def stop_on_signal(signum: int, _frame: object) -> None:
+        _watch_registry.shutdown()
+        raise SystemExit(128 + signum)
+
+    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(signum, stop_on_signal)
+
+    try:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            try:
+                _handle(msg)
+            except Exception as e:
+                sys.stderr.write(f"[git-broker] unhandled error: {e}\n")
+                sys.stderr.flush()
+        # Stdin closed. Workers may still be running. Drain so any
+        # already-dispatched tool call gets its response on stdout before
+        # the process exits.
+        _drain_in_flight(timeout_s=30.0)
+    finally:
+        _watch_registry.shutdown()
 
 
 if __name__ == "__main__":

@@ -3,7 +3,8 @@
     "version": 1,
     "repositoryRoots": [
       "/home/jonathan/Repos",
-      "/home/jonathan/worktrees"
+      "/home/jonathan/worktrees",
+      "/home/jonathan/.claude"
     ],
     "metadataRoots": [
       "/home/jonathan/Repos",
@@ -15,7 +16,8 @@
       "/home/jonathan/.claude"
     ],
     "worktreeCreationRoots": [
-      "/home/jonathan/worktrees"
+      "/home/jonathan/worktrees",
+      "/home/jonathan/Repos/nixos-config-worktrees"
     ],
     "allowedRemoteHosts": [
       "github.com"
@@ -28,6 +30,9 @@
     "bubblewrapExecutable": "bwrap",
     "validatorExecutable": "dcg",
     "credentialHelperExecutable": "/etc/profiles/per-user/jonathan/bin/gh",
+    "githubCliExecutable": "/etc/profiles/per-user/jonathan/bin/gh",
+    "waitForExecutable": "/home/jonathan/.claude/scripts/wait-for",
+    "watchStatusDir": "%t/git-broker/watch",
     "githubHostTokenDir": "/home/jonathan/.cache/gh-tokens/host",
     "sshKnownHostsFile": "/home/jonathan/.ssh/known_hosts",
     "trustedHooksDir": "/home/jonathan/.config/git/hooks",
