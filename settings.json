@@ -206,7 +206,8 @@
       "/etc/nixos",
       "/nix/store",
       "/home/jonathan/worktrees",
-      "/home/jonathan/Repos/research-agent/reports"
+      "/home/jonathan/Repos/research-agent/reports",
+      "/home/jonathan/.local/state/ai-router"
     ]
   },
   "model": "opus[1m]",
