@@ -41,6 +41,15 @@
     "args": [],
     "env": {}
   },
+  "klaffat-app-runner": {
+    "type": "stdio",
+    "command": "/run/current-system/sw/bin/python3",
+    "args": [
+      "/home/jonathan/.claude/mcps/klaffat-app-runner/server.py"
+    ],
+    "env": {},
+    "timeout": 1900000
+  },
   "reddit": {
     "command": "/etc/profiles/per-user/jonathan/bin/uvx",
     "args": [
@@ -50,6 +59,12 @@
       "mcp-server-reddit==0.2.1",
       "mcp-server-reddit"
     ],
+    "env": {}
+  },
+  "home-assistant": {
+    "type": "stdio",
+    "command": "ha-mcp",
+    "args": [],
     "env": {}
   }
 }
