@@ -6,9 +6,10 @@
 # re-invokes the session when it exits, so one call replaces a sleep-poll loop
 # (bash-guard denies `sleep N; <status snapshot>` in the foreground).
 #
-# In a sandbox where gh cannot authenticate, pr/run mode reads the latest
-# host watch started by the git-broker `github` tool from its protected status
-# file; authenticated host behavior is unchanged.
+# In a sandbox where gh cannot authenticate, pr/run mode reads a host watch
+# started by the git-broker `github` tool from its protected status file. Each
+# completed watch is reported once; later calls require a fresh host watch.
+# Authenticated host behavior is unchanged.
 #
 #   wait-for pr <N> [-R owner/repo]        CI settled and GitHub's mergeability
 #                                          computed (or the PR merged/closed);
@@ -30,7 +31,7 @@
 # call, never in a foreground turn.
 set -uo pipefail
 
-usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
+usage() { sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
 
 [ $# -ge 2 ] || usage
 mode=$1 target=$2
@@ -82,7 +83,9 @@ github_repo() {
 
 wait_host_watch() {
   case $target in ''|*[!0-9]*) usage ;; esac
-  local selected script_path policy status_dir status_file state exit_code line
+  local selected script_path policy status_dir status_file snapshot state exit_code line
+  local line_encoded started_at finished_at finished_utc marker_dir marker_file
+  local marker_temp reported
   selected=$(github_repo) || exit 1
   script_path=$(readlink -f -- "$0") || {
     echo "wait-for: cannot resolve script path" >&2; exit 1;
@@ -102,12 +105,62 @@ wait_host_watch() {
     exit 1
   fi
   while :; do
-    state=$(jq -r 'if type == "object" then (.state // "") else "" end' "$status_file" 2>/dev/null) || state=""
+    snapshot=$(jq -er '
+      def uint: type == "number" and . >= 0 and . == floor;
+      if type != "object" then
+        ["invalid", "", "", "", ""]
+      elif .state == "watching" then
+        ["watching", "", "", "", ""]
+      elif (.state == "done"
+            and ((.exit | type) == "number")
+            and .exit >= 0 and .exit <= 255 and .exit == (.exit | floor)
+            and (.started_at | uint) and (.finished_at | uint)
+            and ((.line | type) == "string")) then
+        ["done", (.exit | tostring), (.started_at | tostring),
+         (.finished_at | tostring), (.line | @base64)]
+      else
+        ["invalid", "", "", "", ""]
+      end | join("|")
+    ' "$status_file" 2>/dev/null) || snapshot="invalid||||"
+    IFS='|' read -r state exit_code started_at finished_at line_encoded <<< "$snapshot"
     case $state in
       done)
-        exit_code=$(jq -r 'if ((.exit | type) == "number" and .exit >= 0 and .exit <= 255 and .exit == (.exit | floor)) then .exit else "" end' "$status_file" 2>/dev/null) || exit_code=""
         case $exit_code in ''|*[!0-9]*) echo "wait-for: invalid host watch result for $mode $target"; exit 1 ;; esac
-        line=$(jq -r 'if (.line | type) == "string" then .line else "" end' "$status_file" 2>/dev/null) || line=""
+        case $started_at:$finished_at in *[!0-9:]*) echo "wait-for: invalid host watch result for $mode $target"; exit 1 ;; esac
+        [ -n "$started_at" ] && [ -n "$finished_at" ] || { echo "wait-for: invalid host watch result for $mode $target"; exit 1; }
+        line=$(printf '%s' "$line_encoded" | base64 --decode 2>/dev/null) || {
+          echo "wait-for: invalid host watch result for $mode $target"; exit 1;
+        }
+        [ -n "${HOME:-}" ] || { echo "wait-for: HOME is unavailable for host watch freshness tracking"; exit 1; }
+        marker_dir=$HOME/.cache/git-broker/watch-reported/${selected%/*}/${selected#*/}
+        marker_file=$marker_dir/$mode-$target
+        mkdir -p -- "$marker_dir" || { echo "wait-for: cannot record host watch freshness"; exit 1; }
+        if [ -L "$marker_file" ] || { [ -e "$marker_file" ] && [ ! -f "$marker_file" ]; }; then
+          echo "wait-for: cannot record host watch freshness"
+          exit 1
+        fi
+        reported=""
+        if [ -f "$marker_file" ]; then
+          IFS= read -r reported < "$marker_file" || reported=""
+        fi
+        if [ "$reported" = "$started_at" ]; then
+          finished_utc=$(date -u -d "@$finished_at" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null) || {
+            echo "wait-for: invalid host watch result for $mode $target"; exit 1;
+          }
+          echo "wait-for: the host watch result for $mode $target in $selected (finished $finished_utc) was already reported; start a new watch for a fresh result"
+          exit 1
+        fi
+        marker_temp=$(mktemp "$marker_dir/.watch-reported.XXXXXX") || {
+          echo "wait-for: cannot record host watch freshness"; exit 1;
+        }
+        printf '%s\n' "$started_at" > "$marker_temp" || {
+          rm -f -- "$marker_temp"
+          echo "wait-for: cannot record host watch freshness"; exit 1;
+        }
+        mv -f -- "$marker_temp" "$marker_file" || {
+          rm -f -- "$marker_temp"
+          echo "wait-for: cannot record host watch freshness"; exit 1;
+        }
         printf '%s\n' "$line"
         exit "$exit_code" ;;
       watching) nap 10 ;;

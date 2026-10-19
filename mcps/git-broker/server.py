@@ -682,12 +682,12 @@ def _validate_github_request(args: object, policy: dict) -> dict:
         request["kind"] = _validate_choice(
             args, "kind", frozenset({"pr", "run"}), ""
         )
-        request["number"] = _validate_int(args, "number", 1, 10**10)
+        request["number"] = _validate_int(args, "number", 1, 10**12)
         request["timeout_s"] = _validate_int(
             args, "timeout_s", 60, 21_600, 3_600
         )
     elif operation == "update_branch":
-        request["number"] = _validate_int(args, "number", 1, 10**10)
+        request["number"] = _validate_int(args, "number", 1, 10**12)
     elif operation == "rerun":
         request["run_id"] = _validate_int(args, "run_id", 1, 10**12)
         request["failed_only"] = _validate_bool(args, "failed_only")
@@ -3128,7 +3128,59 @@ def _run_restore_with_backup(
     rec: Optional[_InFlight],
     bind_fds: list[int],
 ) -> tuple[int, str, str]:
-    """Store tracked work before restoring; a failed backup prevents discard."""
+    """Validate restore targets and back up tracked work before replacement."""
+    if request.get("side"):
+        unmerged_argv = _auxiliary_git_argv(
+            identity.worktree,
+            policy,
+            "ls-files",
+            "--unmerged",
+            "-z",
+            "--",
+            *request["paths"],
+        )
+        rc, stdout, stderr = _run_contained_git_step(
+            request, identity, policy, unmerged_argv, rec, bind_fds
+        )
+        if rc != 0:
+            return rc, stdout, stderr
+        unmerged = {
+            record.split("\t", 1)[1]
+            for record in stdout.split("\0")
+            if "\t" in record
+        }
+        not_unmerged = [path for path in request["paths"] if path not in unmerged]
+        if not_unmerged:
+            names = ", ".join(repr(path) for path in not_unmerged)
+            return 1, "", f"restore side refused paths that are not unmerged: {names}"
+        restore_argv = _build_git_argv(request, identity, policy)
+        return _run_contained_git_step(
+            request, identity, policy, restore_argv, rec, bind_fds
+        )
+
+    untracked_argv = _auxiliary_git_argv(
+        identity.worktree,
+        policy,
+        "ls-files",
+        "--others",
+        "-z",
+        "--",
+        *request["paths"],
+    )
+    rc, stdout, stderr = _run_contained_git_step(
+        request, identity, policy, untracked_argv, rec, bind_fds
+    )
+    if rc != 0:
+        return rc, stdout, stderr
+    untracked = [path for path in stdout.split("\0") if path]
+    if untracked:
+        names = ", ".join(repr(path) for path in untracked)
+        return (
+            1,
+            "",
+            f"restore would overwrite untracked files: {names}; move or add them first",
+        )
+
     create_argv = _auxiliary_git_argv(identity.worktree, policy, "stash", "create")
     rc, stdout, stderr = _run_contained_git_step(
         request, identity, policy, create_argv, rec, bind_fds
@@ -3169,6 +3221,56 @@ def _run_restore_with_backup(
     return rc, stdout, stderr
 
 
+def _trusted_worktree_admin_dir(identity: _GitIdentity, target: Path) -> Path:
+    """Resolve a linked worktree's administrative directory from common state."""
+    registry = identity.common_dir / "worktrees"
+    expected_gitdir = str(target / ".git")
+    try:
+        candidates = list(registry.iterdir())
+    except OSError as exc:
+        raise RuntimeError("could not read linked-worktree administrative state") from exc
+
+    matches: list[Path] = []
+    for candidate in candidates:
+        try:
+            candidate_info = candidate.lstat()
+            gitdir_file = candidate / "gitdir"
+            gitdir_info = gitdir_file.lstat()
+            if not stat.S_ISDIR(candidate_info.st_mode) or not stat.S_ISREG(
+                gitdir_info.st_mode
+            ):
+                continue
+            if gitdir_file.read_text(encoding="utf-8").strip() == expected_gitdir:
+                matches.append(candidate)
+        except (OSError, UnicodeDecodeError):
+            continue
+    if len(matches) != 1:
+        raise RuntimeError(
+            "worktree_remove could not identify exactly one trusted administrative directory"
+        )
+    admin_dir = matches[0]
+
+    pointer_file = target / ".git"
+    try:
+        pointer_info = pointer_file.lstat()
+        pointer = pointer_file.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise RuntimeError("worktree .git pointer is missing or unreadable") from exc
+    if not stat.S_ISREG(pointer_info.st_mode) or not pointer.startswith("gitdir: "):
+        raise RuntimeError("worktree .git must be a regular non-symlink pointer file")
+    pointed = Path(pointer.removeprefix("gitdir: "))
+    if not pointed.is_absolute():
+        pointed = pointer_file.parent / pointed
+    try:
+        pointed = pointed.resolve(strict=True)
+        trusted = admin_dir.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError("worktree .git pointer does not resolve") from exc
+    if pointed != trusted:
+        raise RuntimeError("worktree .git pointer disagrees with trusted administrative state")
+    return admin_dir
+
+
 def _run_worktree_remove_backup(
     request: dict,
     identity: _GitIdentity,
@@ -3178,16 +3280,20 @@ def _run_worktree_remove_backup(
 ) -> tuple[int, str, str, bool]:
     """Stash the target worktree completely; failure leaves it registered."""
     target = request["worktree_path"]
+    admin_dir = _trusted_worktree_admin_dir(identity, target)
     message = f"git-broker worktree_remove backup: {target}"
-    stash_argv = _auxiliary_git_argv(
-        target,
-        policy,
+    git = _resolve_required_executable(policy, "gitExecutable")
+    stash_argv = [
+        git,
+        *_fixed_git_config(policy),
+        f"--git-dir={admin_dir}",
+        f"--work-tree={target}",
         "stash",
         "push",
         "--include-untracked",
         "--message",
         message,
-    )
+    ]
     rc, stdout, stderr = _run_contained_git_step(
         request, identity, policy, stash_argv, rec, bind_fds
     )
@@ -3306,7 +3412,7 @@ TOOLS = [
                     "type": "string",
                     "enum": ["pr", "run", "rulesets", "branch_protection", "branch_rules"],
                 },
-                "number": {"type": "integer", "minimum": 1, "maximum": 10**10},
+                "number": {"type": "integer", "minimum": 1, "maximum": 10**12},
                 "timeout_s": {"type": "integer", "minimum": 60, "maximum": 21600},
                 "run_id": {"type": "integer", "minimum": 1, "maximum": 10**12},
                 "failed_only": {"type": "boolean"},
@@ -3600,7 +3706,7 @@ def _tool_git(args: dict, rec: Optional[_InFlight] = None) -> str:
                 return _compose_output(rc, stdout, stderr)
             if backup_created:
                 backup_note = "[git-broker] worktree_remove backup: stash@{0}"
-        if operation == "restore" and not request.get("side"):
+        if operation == "restore":
             rc, stdout, stderr = _run_restore_with_backup(
                 request, identity, policy, rec, bind_fds
             )

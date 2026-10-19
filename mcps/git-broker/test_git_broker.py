@@ -536,6 +536,26 @@ class GithubRequestTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.validate("rerun", run_id=1, url="https://example.test")
 
+    def test_watch_and_update_branch_accept_real_actions_sized_numbers(self) -> None:
+        number = 39_258_364_226
+        try:
+            watch = self.validate("watch", kind="run", number=number)
+            update = self.validate("update_branch", number=number)
+        except RuntimeError as exc:
+            self.fail(f"real GitHub-sized number was refused: {exc}")
+        self.assertEqual(watch["number"], number)
+        self.assertEqual(update["number"], number)
+        self.assertEqual(
+            self.server.TOOLS[1]["inputSchema"]["properties"]["number"]["maximum"],
+            10**12,
+        )
+        for operation, fields in (
+            ("watch", {"kind": "run", "number": 10**12 + 1}),
+            ("update_branch", {"number": 10**12 + 1}),
+        ):
+            with self.subTest(operation=operation), self.assertRaises(RuntimeError):
+                self.validate(operation, **fields)
+
 
 class GithubRepositoryTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -1501,6 +1521,174 @@ class ContainmentArgvTests(unittest.TestCase):
         )
 
 
+class DestructiveOperationSafetyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server = load_server()
+        self.temp = tempfile.TemporaryDirectory(
+            prefix="git-broker-safety-", dir="/home/jonathan/worktrees"
+        )
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.repo = self.root / "repo"
+        self.target = self.root / "target"
+        subprocess.run(
+            ["git", "init", "-q", "-b", "main", str(self.repo)], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(self.repo), "config", "user.name", "Broker Test"],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.repo),
+                "config",
+                "user.email",
+                "broker@example.test",
+            ],
+            check=True,
+        )
+        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(self.repo), "add", "tracked.txt"], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(self.repo), "commit", "-qm", "base"], check=True
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.repo),
+                "worktree",
+                "add",
+                "-qb",
+                "target",
+                str(self.target),
+            ],
+            check=True,
+        )
+        raw_policy = valid_policy()
+        raw_policy["repositoryRoots"] = [str(self.root)]
+        raw_policy["metadataRoots"] = [str(self.root)]
+        raw_policy["protectedWorktrees"] = [str(self.repo)]
+        raw_policy["worktreeCreationRoots"] = [str(self.root)]
+        self.policy = self.server._load_git_policy({"gitBroker": raw_policy})
+        self.identity = self.server._discover_git_identity(self.repo, self.policy)
+        self.request = self.server._validate_git_request(
+            {
+                "repo_path": str(self.repo),
+                "operation": "worktree_remove",
+                "worktree_path": str(self.target),
+                "force": True,
+            },
+            self.policy,
+        )
+
+    def test_force_backup_uses_trusted_admin_dir_not_target_discovery(self) -> None:
+        admin_dirs = list((self.identity.common_dir / "worktrees").iterdir())
+        self.assertEqual(len(admin_dirs), 1)
+        with mock.patch.object(
+            self.server,
+            "_run_contained_git_step",
+            return_value=(0, "Saved working directory\n", ""),
+        ) as run:
+            self.server._run_worktree_remove_backup(
+                self.request, self.identity, self.policy, None, []
+            )
+
+        argv = run.call_args.args[3]
+        self.assertIn(f"--git-dir={admin_dirs[0]}", argv)
+        self.assertIn(f"--work-tree={self.target}", argv)
+        self.assertNotIn("-C", argv)
+
+    def test_force_backup_refuses_replaced_target_git_metadata(self) -> None:
+        (self.target / ".git").unlink()
+        subprocess.run(["git", "init", "-q", str(self.target)], check=True)
+        with mock.patch.object(
+            self.server, "_run_contained_git_step", return_value=(0, "", "")
+        ) as run:
+            with self.assertRaisesRegex(RuntimeError, r"administrative|\.git"):
+                self.server._run_worktree_remove_backup(
+                    self.request, self.identity, self.policy, None, []
+                )
+        run.assert_not_called()
+
+
+class RestoreSafetyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server = load_server()
+        self.identity = self.server._GitIdentity(
+            Path("/home/jonathan/worktrees/project-topic"),
+            Path("/home/jonathan/Repos/project/.git/worktrees/project-topic"),
+            Path("/home/jonathan/Repos/project/.git"),
+            True,
+        )
+
+    def run_restore(self, fields: dict, fake_run) -> tuple[str, list[list[str]]]:
+        seen: list[list[str]] = []
+
+        def fake_sandbox(_request, _identity, _policy, git_argv, **_kwargs):
+            seen.append(git_argv)
+            return git_argv, {}
+
+        with (
+            mock.patch.object(
+                self.server,
+                "_load_config",
+                return_value={"gitBroker": valid_policy()},
+            ),
+            mock.patch.object(self.server, "_check_denied_by_dcg", return_value=None),
+            mock.patch.object(
+                self.server,
+                "_prepare_existing_operation",
+                return_value=(self.identity, None, None, None),
+            ),
+            mock.patch.object(
+                self.server, "_build_git_sandbox", side_effect=fake_sandbox
+            ),
+            mock.patch.object(self.server, "_run_argv", side_effect=fake_run),
+        ):
+            output = self.server._tool_git(
+                {
+                    "repo_path": str(self.identity.worktree),
+                    "operation": "restore",
+                    **fields,
+                }
+            )
+        return output, seen
+
+    def test_side_restore_refuses_path_without_unmerged_index_entry(self) -> None:
+        def fake_run(_argv, *_args, **_kwargs):
+            return 0, "", ""
+
+        output, seen = self.run_restore(
+            {"paths": ["tracked.txt"], "side": "ours"}, fake_run
+        )
+
+        self.assertIn("--- exit 1 ---", output)
+        self.assertIn("not unmerged", output)
+        self.assertTrue(any("ls-files" in argv for argv in seen))
+        self.assertFalse(any("checkout" in argv for argv in seen))
+
+    def test_restore_refuses_untracked_target_before_backup(self) -> None:
+        def fake_run(argv, *_args, **_kwargs):
+            if "ls-files" in argv and "--others" in argv:
+                return 0, "notes.md\0", ""
+            return 0, "", ""
+
+        output, seen = self.run_restore(
+            {"paths": ["notes.md"], "source": "HEAD~1"}, fake_run
+        )
+
+        self.assertIn("--- exit 1 ---", output)
+        self.assertIn("notes.md", output)
+        self.assertIn("move or add them first", output)
+        self.assertTrue(any("ls-files" in argv for argv in seen))
+        self.assertFalse(any("stash" in argv for argv in seen))
+
+
 class ToolExecutionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.server = load_server()
@@ -1735,6 +1923,7 @@ class ToolExecutionTests(unittest.TestCase):
                 self.server,
                 "_run_argv",
                 side_effect=[
+                    (0, "", ""),
                     (0, commit_id + "\n", ""),
                     (0, "", ""),
                     (0, "", ""),
@@ -1745,9 +1934,13 @@ class ToolExecutionTests(unittest.TestCase):
 
         dcg.assert_not_called()
         commands = [argv[argv.index(str(self.identity.worktree)) + 1 :] for argv in seen]
-        self.assertEqual(commands[0], ["stash", "create"])
-        self.assertEqual(commands[1][-1], commit_id)
-        self.assertEqual(commands[2][0], "restore")
+        self.assertEqual(
+            commands[0],
+            ["ls-files", "--others", "-z", "--", "tracked.txt"],
+        )
+        self.assertEqual(commands[1], ["stash", "create"])
+        self.assertEqual(commands[2][-1], commit_id)
+        self.assertEqual(commands[3][0], "restore")
         self.assertIn("stash@{0}", output)
         self.assertIn(commit_id, output)
 
@@ -2782,6 +2975,36 @@ class BlackBoxParityTests(unittest.TestCase):
         self.ok("merge", action="continue")
         self.assertEqual(len(self.git("log", "-1", "--format=%P").split()), 2)
 
+    def test_restore_side_refuses_non_conflicted_path_and_preserves_edit(self) -> None:
+        self.write("base.txt", "precious unstaged edit\n")
+
+        output = self.tool("restore", paths=["base.txt"], side="ours")
+
+        self.assertNotIn("--- exit 0 ---", output)
+        self.assertIn("not unmerged", output)
+        self.assertEqual(
+            (self.repo / "base.txt").read_text(encoding="utf-8"),
+            "precious unstaged edit\n",
+        )
+        self.assertEqual(self.git("stash", "list"), "")
+
+    def test_restore_refuses_to_overwrite_untracked_target(self) -> None:
+        self.write("notes.md", "historical\n")
+        self.ok("add", paths=["notes.md"])
+        self.ok("commit", message="track notes")
+        self.ok("untrack", paths=["notes.md"])
+        self.ok("commit", message="untrack notes")
+        self.write("notes.md", "precious untracked edit\n")
+
+        output = self.tool("restore", paths=["notes.md"], source="HEAD~1")
+
+        self.assertNotIn("--- exit 0 ---", output)
+        self.assertIn("move or add them first", output)
+        self.assertEqual(
+            (self.repo / "notes.md").read_text(encoding="utf-8"),
+            "precious untracked edit\n",
+        )
+
     def test_restore_clean_worktree_creates_no_stash(self) -> None:
         before = self.git("stash", "list")
         self.ok("restore", paths=["base.txt"])
@@ -2908,6 +3131,63 @@ class BlackBoxParityTests(unittest.TestCase):
         patch = self.git("stash", "show", "--include-untracked", "-p", "stash@{0}")
         self.assertIn("tracked backup", patch)
         self.assertIn("untracked backup", patch)
+
+    def test_forced_worktree_remove_refuses_replaced_git_dir_with_filter(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="git-broker-filter-target-", dir="/home/jonathan/worktrees"
+        ) as td:
+            target = Path(td) / "worktree"
+            self.ok("worktree_add", worktree_path=str(target), branch="filter-target")
+            canary = self.repo / ".git" / "filter-canary"
+            (target / ".git").unlink()
+            subprocess.run(["git", "init", "-q", str(target)], check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(target),
+                    "config",
+                    "filter.x.clean",
+                    f"sh -c 'echo pwned > {canary}; cat'",
+                ],
+                check=True,
+            )
+            (target / ".gitattributes").write_text("*.txt filter=x\n", encoding="utf-8")
+            (target / "payload.txt").write_text("payload\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, r"administrative|\.git"):
+                self.tool("worktree_remove", worktree_path=str(target), force=True)
+
+            self.assertFalse(canary.exists())
+            self.assertTrue((self.repo / ".git" / "HEAD").is_file())
+
+    def test_forced_worktree_remove_refuses_replaced_core_worktree(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="git-broker-core-worktree-target-",
+            dir="/home/jonathan/worktrees",
+        ) as td:
+            target = Path(td) / "worktree"
+            self.ok("worktree_add", worktree_path=str(target), branch="core-target")
+            (target / ".git").unlink()
+            subprocess.run(["git", "init", "-q", str(target)], check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(target),
+                    "config",
+                    "core.worktree",
+                    str(self.repo / ".git"),
+                ],
+                check=True,
+            )
+            before = sorted(path.name for path in (self.repo / ".git").iterdir())
+
+            with self.assertRaisesRegex(RuntimeError, r"administrative|\.git"):
+                self.tool("worktree_remove", worktree_path=str(target), force=True)
+
+            after = sorted(path.name for path in (self.repo / ".git").iterdir())
+            self.assertEqual(after, before)
 
     def test_set_upstream_writes_only_fixed_tracking_keys(self) -> None:
         identity = self.server._discover_git_identity(

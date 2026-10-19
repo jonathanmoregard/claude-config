@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -27,6 +28,7 @@ def run_wait_for(
     wait_for: Path = WAIT_FOR,
     cwd: Path | None = None,
     timeout: str = "600",
+    extra_env: dict[str, str] | None = None,
 ) -> tuple[int, str, list[str]]:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
@@ -42,10 +44,13 @@ def run_wait_for(
     log.touch()
     env = {
         **os.environ,
+        "HOME": str(tmp_path / "home"),
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "FAKE_SCRIPT": str(state),
         "FAKE_LOG": str(log),
     }
+    env.update(extra_env or {})
+    (tmp_path / "home").mkdir(exist_ok=True)
     proc = subprocess.run(
         ["bash", str(wait_for), *args, "--timeout", timeout],
         capture_output=True, text=True, env=env, cwd=cwd, timeout=60, check=False,
@@ -77,13 +82,21 @@ def write_status(
     repo: str = "owner/repo",
     kind: str = "pr",
     number: int = 7,
+    started_at: int = 1_700_000_000,
+    finished_at: int = 1_700_000_100,
 ) -> Path:
     owner, name = repo.split("/")
     path = root / owner / name / f"{kind}-{number}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    data = {"state": state, "kind": kind, "repo": repo, "number": number}
+    data = {
+        "state": state,
+        "kind": kind,
+        "repo": repo,
+        "number": number,
+        "started_at": started_at,
+    }
     if exit_code is not None:
-        data.update({"exit": exit_code, "line": line})
+        data.update({"exit": exit_code, "line": line, "finished_at": finished_at})
     path.write_text(json.dumps(data), encoding="utf-8")
     return path
 
@@ -188,7 +201,13 @@ def test_sandbox_done_status_returns_host_line_and_exit(tmp_path: Path) -> None:
     status_root = tmp_path / "status"
     copied = sandbox_layout(tmp_path, status_root)
     for exit_code in (0, 1, 2):
-        write_status(status_root, state="done", exit_code=exit_code, line=f"host {exit_code}")
+        write_status(
+            status_root,
+            state="done",
+            exit_code=exit_code,
+            line=f"host {exit_code}",
+            started_at=1_700_000_000 + exit_code,
+        )
         rc, out, calls = run_wait_for(
             tmp_path,
             {"gh": {"auth token": [{"rc": 1}]}},
@@ -206,6 +225,7 @@ def test_sandbox_watching_then_done_waits_and_reports(tmp_path: Path) -> None:
     copied = sandbox_layout(tmp_path, status_root)
     status = write_status(status_root, state="watching")
     done = {"state": "done", "kind": "pr", "repo": "owner/repo", "number": 7,
+            "started_at": 1_700_000_000, "finished_at": 1_700_000_100,
             "exit": 0, "line": "host finished"}
     script = {
         "gh": {"auth token": [{"rc": 1}]},
@@ -266,3 +286,251 @@ def test_sandbox_repo_is_derived_from_origin_without_dash_r(tmp_path: Path) -> N
     )
     assert rc == 0, out
     assert "derived" in out
+
+
+def test_sandbox_done_result_is_reported_once_per_watch(tmp_path: Path) -> None:
+    status_root = tmp_path / "status"
+    copied = sandbox_layout(tmp_path, status_root)
+    status = write_status(
+        status_root,
+        state="done",
+        exit_code=2,
+        line="first result",
+        finished_at=1_700_000_100,
+    )
+    script = {"gh": {"auth token": [{"rc": 1}]}}
+
+    first_rc, first_out, _ = run_wait_for(
+        tmp_path, script, "pr", "7", "-R", "owner/repo", wait_for=copied
+    )
+    marker = (
+        tmp_path
+        / "home"
+        / ".cache"
+        / "git-broker"
+        / "watch-reported"
+        / "owner"
+        / "repo"
+        / "pr-7"
+    )
+    assert marker.read_text(encoding="utf-8") == "1700000000\n"
+    second_rc, second_out, _ = run_wait_for(
+        tmp_path, script, "pr", "7", "-R", "owner/repo", wait_for=copied
+    )
+
+    assert first_rc == 2, first_out
+    assert "first result" in first_out
+    assert second_rc == 1, second_out
+    assert (
+        "the host watch result for pr 7 in owner/repo "
+        "(finished 2023-11-14T22:15:00Z) was already reported; "
+        "start a new watch for a fresh result"
+    ) in second_out
+
+    write_status(
+        status_root,
+        state="done",
+        exit_code=0,
+        line="fresh result",
+        started_at=1_700_000_001,
+        finished_at=1_700_000_200,
+    )
+    third_rc, third_out, _ = run_wait_for(
+        tmp_path, script, "pr", "7", "-R", "owner/repo", wait_for=copied
+    )
+    assert third_rc == 0, third_out
+    assert "fresh result" in third_out
+    assert marker.read_text(encoding="utf-8") == "1700000001\n"
+
+
+def test_sandbox_reads_each_status_generation_as_one_snapshot(tmp_path: Path) -> None:
+    status_root = tmp_path / "status"
+    copied = sandbox_layout(tmp_path, status_root)
+    status = write_status(
+        status_root, state="done", exit_code=0, line="old success"
+    )
+    replacement = {
+        "state": "done",
+        "kind": "pr",
+        "repo": "owner/repo",
+        "number": 7,
+        "started_at": 1_700_000_001,
+        "finished_at": 1_700_000_200,
+        "exit": 1,
+        "line": "new failure",
+    }
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    jq_log = tmp_path / "jq-status-calls"
+    jq_wrapper = bin_dir / "jq"
+    jq_wrapper.write_text(
+        """#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+result = subprocess.run(
+    [os.environ["REAL_JQ"], *sys.argv[1:]], capture_output=True, check=False
+)
+if Path(sys.argv[-1]) == Path(os.environ["STATUS_FILE"]):
+    log = Path(os.environ["JQ_STATUS_LOG"])
+    count = int(log.read_text() or "0") + 1 if log.exists() else 1
+    log.write_text(str(count))
+    if count == 2:
+        target = Path(os.environ["STATUS_FILE"])
+        temporary = target.with_suffix(".replacement")
+        temporary.write_text(os.environ["REPLACEMENT"])
+        os.replace(temporary, target)
+sys.stdout.buffer.write(result.stdout)
+sys.stderr.buffer.write(result.stderr)
+raise SystemExit(result.returncode)
+""",
+        encoding="utf-8",
+    )
+    jq_wrapper.chmod(0o755)
+    real_jq = shutil.which("jq")
+    assert real_jq is not None
+    rc, out, _ = run_wait_for(
+        tmp_path,
+        {"gh": {"auth token": [{"rc": 1}]}},
+        "pr", "7", "-R", "owner/repo",
+        wait_for=copied,
+        extra_env={
+            "REAL_JQ": real_jq,
+            "STATUS_FILE": str(status),
+            "JQ_STATUS_LOG": str(jq_log),
+            "REPLACEMENT": json.dumps(replacement),
+        },
+    )
+
+    assert jq_log.read_text(encoding="utf-8") == "1"
+    assert rc == 0, out
+    assert "old success" in out
+    assert "new failure" not in out
+
+
+def test_sandbox_concurrent_callers_keep_atomic_marker(tmp_path: Path) -> None:
+    status_root = tmp_path / "status"
+    copied = sandbox_layout(tmp_path, status_root)
+    write_status(status_root, state="done", exit_code=2, line="one result")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+    gh.chmod(0o755)
+    ready = tmp_path / "mv-ready"
+    release = tmp_path / "mv-release"
+    mv_wrapper = bin_dir / "mv"
+    mv_wrapper.write_text(
+        """#!/usr/bin/env python3
+import os
+from pathlib import Path
+import time
+
+ready = Path(os.environ["MV_READY"])
+if not ready.exists():
+    ready.touch()
+    release = Path(os.environ["MV_RELEASE"])
+    while not release.exists():
+        time.sleep(0.01)
+os.execv(os.environ["REAL_MV"], [os.environ["REAL_MV"], *os.sys.argv[1:]])
+""",
+        encoding="utf-8",
+    )
+    mv_wrapper.chmod(0o755)
+    real_mv = shutil.which("mv")
+    assert real_mv is not None
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "MV_READY": str(ready),
+        "MV_RELEASE": str(release),
+        "REAL_MV": real_mv,
+    }
+    argv = [
+        "bash", str(copied), "pr", "7", "-R", "owner/repo", "--timeout", "30"
+    ]
+    first = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             text=True, env=env)
+    second: subprocess.Popen[str] | None = None
+    try:
+        limit = time.monotonic() + 2
+        while not ready.exists() and first.poll() is None and time.monotonic() < limit:
+            time.sleep(0.01)
+        assert ready.exists(), "first caller did not reach the atomic marker update"
+        second = subprocess.Popen(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env
+        )
+        second_out, _ = second.communicate(timeout=5)
+        release.touch()
+        first_out, _ = first.communicate(timeout=5)
+    finally:
+        release.touch(exist_ok=True)
+        if first.poll() is None:
+            first.terminate()
+            first.wait(timeout=5)
+        if second is not None and second.poll() is None:
+            second.terminate()
+            second.wait(timeout=5)
+
+    assert first.returncode == 2, first_out
+    assert "one result" in first_out
+    assert second.returncode == 2, second_out
+    assert "one result" in second_out
+    marker = home / ".cache/git-broker/watch-reported/owner/repo/pr-7"
+    assert marker.read_text(encoding="utf-8") == "1700000000\n"
+
+
+def test_sandbox_stale_lock_directory_does_not_block_result(tmp_path: Path) -> None:
+    status_root = tmp_path / "status"
+    copied = sandbox_layout(tmp_path, status_root)
+    write_status(status_root, state="done", exit_code=0, line="still report")
+    marker_dir = (
+        tmp_path / "home" / ".cache" / "git-broker" / "watch-reported"
+        / "owner" / "repo"
+    )
+    marker_dir.mkdir(parents=True)
+    stale_lock = marker_dir / "pr-7.lock"
+    stale_lock.mkdir()
+
+    rc, out, _ = run_wait_for(
+        tmp_path,
+        {"gh": {"auth token": [{"rc": 1}]}},
+        "pr", "7", "-R", "owner/repo",
+        wait_for=copied,
+    )
+
+    assert rc == 0, out
+    assert "still report" in out
+    assert (marker_dir / "pr-7").read_text(encoding="utf-8") == "1700000000\n"
+    assert stale_lock.is_dir()
+
+
+def test_sandbox_refuses_symlinked_report_marker(tmp_path: Path) -> None:
+    status_root = tmp_path / "status"
+    copied = sandbox_layout(tmp_path, status_root)
+    write_status(status_root, state="done", exit_code=0, line="must not report")
+    marker_dir = (
+        tmp_path / "home" / ".cache" / "git-broker" / "watch-reported"
+        / "owner" / "repo"
+    )
+    marker_dir.mkdir(parents=True)
+    victim = tmp_path / "victim"
+    victim.write_text("keep me\n", encoding="utf-8")
+    (marker_dir / "pr-7").symlink_to(victim)
+
+    rc, out, _ = run_wait_for(
+        tmp_path,
+        {"gh": {"auth token": [{"rc": 1}]}},
+        "pr", "7", "-R", "owner/repo",
+        wait_for=copied,
+    )
+
+    assert rc == 1, out
+    assert "must not report" not in out
+    assert victim.read_text(encoding="utf-8") == "keep me\n"
