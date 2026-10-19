@@ -3,15 +3,15 @@
 UserPromptSubmit hook: injects a pending date-night suggestion once per session.
 Uses session_id to fire on the first message of each new session only.
 
-State: ~/.claude/dates/state.json
+Config: ~/.config/claude-dates/config.json (personal data, never in the repo)
+State:  ~/.local/state/claude-dates/state.json
 """
 import json
 import os
 import sys
 
-DATES_DIR = os.path.expanduser("~/.claude/dates")
-CONFIG_FILE = os.path.join(DATES_DIR, "config.json")
-STATE_FILE  = os.path.join(DATES_DIR, "state.json")
+CONFIG_FILE = os.path.expanduser("~/.config/claude-dates/config.json")
+STATE_FILE  = os.path.expanduser("~/.local/state/claude-dates/state.json")
 
 DEFAULT_STATE = {"last_checked": None, "pending_suggestion": None}
 
@@ -32,7 +32,7 @@ def main():
 
     session_id = hook_input.get("session_id", "")
 
-    os.makedirs(DATES_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     state = load_json(STATE_FILE, DEFAULT_STATE)
 
     suggestion = state.get("pending_suggestion")

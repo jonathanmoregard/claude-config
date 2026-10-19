@@ -23,7 +23,7 @@ classifier = import_module("continue-nudge-classifier")
 detector = import_module("continue-nudge-detector")
 
 PROJECTS = Path.home() / ".claude" / "projects"
-DEFAULT_OUT = Path.home() / ".claude" / "continue-nudge" / "labels.jsonl"
+DEFAULT_OUT = Path.home() / ".local" / "share" / "continue-nudge" / "labels.jsonl"
 
 FAST_GATE_RE = detector.FAST_GATE_RE
 
