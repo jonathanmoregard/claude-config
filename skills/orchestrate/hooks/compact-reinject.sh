@@ -11,8 +11,15 @@ set -euo pipefail
 # A notes-dir mission*.md only counts as THIS session's live work if touched within
 # this window; older ones are leftovers of earlier sessions (a long-lived project dir
 # accumulates them) and reminding about them wastes tokens and misleads. Does not
-# apply to the session-reflect resolved handoff, which is session-keyed already.
+# apply to the session-reflect resolved handoff, which counts by session id instead.
 MISSION_FRESH_MINUTES=1440
+
+# The SessionStart payload names THIS session. Empty or invalid stdin (or no jq)
+# leaves it empty, which only means no resolved handoff can be proven ours.
+HOOK_SESSION=""
+if [[ ! -t 0 ]] && command -v jq >/dev/null 2>&1; then
+  HOOK_SESSION="$(jq -r '.session_id // "" | strings' 2>/dev/null || true)"
+fi
 
 # Resolved relative to THIS script, never via $HOME: the tests redirect HOME to
 # a fake home to assert the no-notes-anywhere cases, and a $HOME-anchored source
@@ -60,11 +67,21 @@ mission_exists() {
 # and nowhere else: this hook only injects a "re-read your handoff" reminder into
 # an interactive session whose human owns this cwd. It never drives an unattended
 # fork, which is why idle-handoff.sh has no such fallback.
+#
+# The resolver returns the NEWEST handoff for this project dir — any session, any
+# age — so it counts only when its <sid> (…/<sid>/handoff/mission.md) is this
+# session's: a /compact keeps the session id, so that is the handoff this context
+# was working from. Another session's handoff is not named either. A cross-session
+# continuation needs no reminder: the in-place reset's pickup message and the
+# idle-handoff fork's prompt both name their handoff explicitly.
 RESOLVE="$HOME/.claude/skills/session-reflect/reflect.sh"
 MISSION="${LIVE_NOTES:-$NOTES_SHOWN}/mission.md"
-if [[ -x "$RESOLVE" || -f "$RESOLVE" ]]; then
+if [[ -n "$HOOK_SESSION" && ( -x "$RESOLVE" || -f "$RESOLVE" ) ]]; then
   RESOLVED="$(bash "$RESOLVE" --mission-path "$PWD" </dev/null 2>/dev/null || true)"
-  [[ -n "$RESOLVED" && -f "$RESOLVED" ]] && { MISSION="$RESOLVED"; RESOLVED_LIVE=1; }
+  if [[ -n "$RESOLVED" && -f "$RESOLVED" ]]; then
+    RESOLVED_SID="$(basename -- "$(dirname -- "$(dirname -- "$RESOLVED")")")"
+    [[ "$RESOLVED_SID" == "$HOOK_SESSION" ]] && { MISSION="$RESOLVED"; RESOLVED_LIVE=1; }
+  fi
 fi
 
 # Two independent reminders. Neither depends on the other; exit 0 if neither

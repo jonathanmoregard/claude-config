@@ -11,7 +11,7 @@ WHY `Stop`
     Stop is the only hook event that recurs WITHOUT a human turn, and autonomy
     is the whole point: a trigger on UserPromptSubmit can only ever nudge,
     because it needs someone to type first. PreCompact is too late (it fires
-    only if a compaction happens at all, and the 90% nudge means the user
+    only if a compaction happens at all, and the advisory nudge means the user
     usually hands off instead). PostToolUse recurs but fires tens of times per
     turn for no extra signal. So: Stop, once per assistant turn.
 
@@ -127,7 +127,7 @@ import context_usage  # noqa: E402  (path shim must precede the import)
 import inplace_reset  # noqa: E402  (same shim; ships beside this file)
 
 # --- Fixed values, not settings ----------------------------------------------
-# Fire at 350k tokens. Deliberately ahead of the 90% advisory nudge in
+# Fire at 350k tokens. Deliberately ahead of the advisory nudge in
 # context-baggage.py (both are live and independent): the point is to hand off
 # while there is still runway, before Claude Code's own auto-compact.
 #

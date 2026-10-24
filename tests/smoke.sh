@@ -2701,9 +2701,9 @@ sc_wait_marker() {
 }
 
 # ============================================================================
-# TEST 20: B1 — occupancy math lives in ONE place and keeps the 90% nudge
+# TEST 20: B1 — occupancy math lives in ONE place and keeps the advisory nudge
 # ============================================================================
-test_begin "TEST 20: B1 — shared context-occupancy module, 90% nudge preserved"
+test_begin "TEST 20: B1 — shared context-occupancy module, advisory nudge preserved"
 [[ -f "$SC_USAGE" ]] || fail "20: shared occupancy module missing at $SC_USAGE"
 B1_DIR="$(mktemp -d -t reflect-b1-XXXXXX)"
 
@@ -2744,12 +2744,13 @@ grep -q 'context_usage' "$WORKTREE/context-baggage.py" \
 [[ "$(grep -c 'ONE_M_MODEL_PREFIXES *= *(' "$WORKTREE/context-baggage.py")" == "0" ]] \
   || fail "20: context-baggage.py still defines its own window-detection table (copy-paste)"
 
-# Behavioural: the 90% nudge is a separate, still-wanted feature.
+# Behavioural: the advisory nudge is a separate, still-wanted feature. 950k of a
+# 1M window is 98% of the 967k Claude Code holds before it auto-compacts.
 mk_context_transcript "$B1_DIR/t70.jsonl" "claude-opus-5" 950000
 B1_OUT="$(jq -cn --arg tp "$B1_DIR/t70.jsonl" '{transcript_path:$tp}' \
   | uncapped python3 "$WORKTREE/context-baggage.py")" || fail "20: context-baggage.py rc!=0"
-grep -q 'Context is 95% full' <<<"$B1_OUT" \
-  || fail "20: 90% nudge stopped firing at 95% (out='$B1_OUT')"
+grep -q "Context is 98% full: 950k of the 967k tokens" <<<"$B1_OUT" \
+  || fail "20: the nudge stopped firing at 98% of usable capacity (out='$B1_OUT')"
 # ...and it must send the human at a HUMAN-owned path. tasks/mission.md is a
 # machine-owned symlink to the copy of the out-of-repo handoff, so a write-through
 # would clobber the copy and the next mission run would overwrite the model's work.
@@ -2761,8 +2762,8 @@ fi
 B1_OUT31="$(jq -cn --arg tp "$B1_DIR/t1.jsonl" '{transcript_path:$tp}' \
   | uncapped python3 "$WORKTREE/context-baggage.py")" || fail "20: context-baggage.py rc!=0 at 31%"
 [[ -z "$B1_OUT31" ]] \
-  || fail "20: the self-compact threshold leaked into the 90% nudge (out='$B1_OUT31')"
-info "one occupancy implementation; 1M/[1m]/observed/estimate all correct; 90% nudge intact"
+  || fail "20: the self-compact threshold leaked into the advisory nudge (out='$B1_OUT31')"
+info "one occupancy implementation; 1M/[1m]/observed/estimate all correct; advisory nudge intact"
 
 # ============================================================================
 # TEST 21: there is NO SWITCH, and no config file can turn the feature off
@@ -4350,8 +4351,8 @@ PY
 F8_NUDGE="$(jq -cn --arg tp "$F8_BAD/mixed.jsonl" '{transcript_path:$tp}' \
   | uncapped python3 "$WORKTREE/context-baggage.py")" \
   || fail "33c: the UserPromptSubmit hook exited non-zero on a malformed transcript line"
-grep -q 'Context is 95% full' <<<"$F8_NUDGE" \
-  || fail "33c: the 90% nudge stopped working with a malformed line present (out='$F8_NUDGE')"
+grep -q "Context is 98% full" <<<"$F8_NUDGE" \
+  || fail "33c: the nudge stopped working with a malformed line present (out='$F8_NUDGE')"
 # A usage block that is ENTIRELY non-numeric contributes nothing rather than raising.
 python3 - <<'PY' || fail "33c: usage_total did not coerce a fully non-numeric block"
 import sys, os

@@ -6,7 +6,7 @@ there are now three consumers and a fourth copy of the window-detection table
 is how this stopped working the last time (the prefix list went stale and the
 nudge reported 89% full during a session at 18% of a 1M window):
 
-  * ``context-baggage.py``       UserPromptSubmit nudge at 90% — advisory, human-facing.
+  * ``context-baggage.py``       UserPromptSubmit nudge near auto-compact — advisory, human-facing.
   * ``self-compact-trigger.py``  Stop-hook self-compact trigger at 30% — autonomous.
   * ``scripts/idle-handoff.sh``  re-measures a self-compact request against the
                                  transcript before it widens its idle gate, via
@@ -117,6 +117,27 @@ BYTES_PER_TOKEN = 4
 AUTO_COMPACT_ENV = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"
 AUTO_COMPACT_MIN = 100_000
 AUTO_COMPACT_MAX = 1_000_000
+
+# Claude Code's own reserves below that window (2.1.310 binary, confirmed by
+# headless `--debug-file` runs 2026-10-24): effectiveWindow = window -
+# min(maxOutputTokens, 20000), and auto-compact fires at effectiveWindow - 13000.
+# The output reserve is shorter only when maxOutputTokens is set below 20000;
+# Claude Code then compacts LATER, so using 20000 keeps every point computed
+# from it on the early, safe side.
+CLAUDE_OUTPUT_RESERVE = 20_000
+CLAUDE_COMPACT_BUFFER = 13_000
+
+
+def usable_capacity(window: int) -> int:
+    """Tokens a session can hold before Claude Code auto-compacts it.
+
+    ``window`` is the measured window (min(model window, cap), see
+    detect_window). Anything meant to happen before Claude Code's own
+    compaction has to be placed below this, not below ``window``.
+    """
+    # Floor of 1: a window at or under the reserves (only a nonsense
+    # CLAUDE_CONTEXT_MAX gets there) means Claude Code compacts at once.
+    return max(1, window - CLAUDE_OUTPUT_RESERVE - CLAUDE_COMPACT_BUFFER)
 
 
 def user_settings_path() -> Path:
@@ -237,7 +258,7 @@ def usage_total(usage: dict[str, Any] | None) -> int:
     ``"input_tokens": null`` (or a string, or a dict) used to raise TypeError
     here, and ``context-baggage.py`` calls occupancy() with no try/except — so a
     single malformed line made the UserPromptSubmit hook traceback and exit 1,
-    taking the 90% nudge down with it. A non-numeric value contributes nothing;
+    taking the advisory nudge down with it. A non-numeric value contributes nothing;
     the rest of the block still counts.
     """
     if not isinstance(usage, dict):

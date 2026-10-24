@@ -43,14 +43,10 @@ CB_SPEC = importlib.util.spec_from_file_location(
 cb = importlib.util.module_from_spec(CB_SPEC)
 CB_SPEC.loader.exec_module(cb)
 
-# Claude Code 2.1.310: MJ() subtracts min(maxOutputTokens, 20000) from the
-# window, GQ() subtracts a further 13000 to get the compact threshold.
-CLAUDE_OUTPUT_RESERVE = 20_000
-CLAUDE_COMPACT_BUFFER = 13_000
-
-
 def claude_auto_compact_point(window: int) -> int:
-    return window - CLAUDE_OUTPUT_RESERVE - CLAUDE_COMPACT_BUFFER
+    # Claude Code's reserves have one home (context_usage); the arithmetic here
+    # is the test's own statement of where Claude Code compacts.
+    return window - context_usage.CLAUDE_OUTPUT_RESERVE - context_usage.CLAUDE_COMPACT_BUFFER
 
 
 def write_settings(home: Path, settings: dict) -> Path:
@@ -150,18 +146,19 @@ def run_hook(script: str, payload: dict, home: Path, env_extra: dict | None = No
 
 def test_nudge_fires_at_threshold_of_the_capped_window(tmp_path):
     write_settings(tmp_path, {"autoCompactWindow": 400_000})
-    t = write_transcript(tmp_path / "t.jsonl", "claude-opus-5[1m]", 370_000)
+    t = write_transcript(tmp_path / "t.jsonl", "claude-opus-5[1m]", 360_000)
     out = run_hook("context-baggage.py", {"transcript_path": str(t)}, tmp_path)
     assert out.returncode == 0, out.stderr
-    assert "Context is 92% full" in out.stdout
+    # 360k of the 367k Claude Code holds under a 400k cap.
+    assert "Context is 98% full: 360k of the 367k tokens" in out.stdout
     assert "window: 400k" in out.stdout
 
 
 def test_nudge_honours_the_env_cap(tmp_path):
-    t = write_transcript(tmp_path / "t.jsonl", "claude-opus-5[1m]", 290_000)
+    t = write_transcript(tmp_path / "t.jsonl", "claude-opus-5[1m]", 260_000)
     out = run_hook("context-baggage.py", {"transcript_path": str(t)}, tmp_path,
                    {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "300k"})
-    assert "Context is 96% full" in out.stdout
+    assert "Context is 97% full: 260k of the 267k tokens" in out.stdout
 
 
 def test_nudge_silent_below_threshold_without_a_cap(tmp_path):
@@ -222,5 +219,42 @@ def test_nudge_falls_between_self_compact_and_auto_compact():
     """Self-compact hands off unattended first; the human nudge is the fallback
     for when it did not, and must still land before Claude Code compacts."""
     cap = context_usage.auto_compact_window(REPO / "settings.json", {})
-    nudge_at = cb.THRESHOLD * cap
+    nudge_at = cb.THRESHOLD * context_usage.usable_capacity(cap)
     assert sct.FIRE_AT_TOKENS < nudge_at < claude_auto_compact_point(cap)
+
+
+# Each shape: (model, settings cap, env cap, the window Claude Code compacts against).
+WINDOW_SHAPES = {
+    "200k model": ("claude-haiku-4-5", None, None, 200_000),
+    "300k env cap": ("claude-opus-5[1m]", None, "300k", 300_000),
+    "420k settings cap": ("claude-opus-5[1m]", 420_000, None, 420_000),
+    "1M uncapped": ("claude-opus-5[1m]", None, None, 1_000_000),
+}
+
+
+def nudge_output(tmp_path, shape, tokens):
+    model, settings_cap, env_cap, _ = WINDOW_SHAPES[shape]
+    home = tmp_path / "home"
+    write_settings(home, {"autoCompactWindow": settings_cap} if settings_cap else {})
+    t = write_transcript(tmp_path / "t.jsonl", model, tokens)
+    out = run_hook("context-baggage.py", {"transcript_path": str(t)}, home,
+                   {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": env_cap} if env_cap else None)
+    assert out.returncode == 0, out.stderr
+    return out.stdout
+
+
+@pytest.mark.parametrize("shape", sorted(WINDOW_SHAPES))
+def test_nudge_fires_before_claude_code_auto_compacts(tmp_path, shape):
+    """A nudge that can only fire past Claude Code's auto-compact point never
+    reaches the human: the context is compacted under it first."""
+    window = WINDOW_SHAPES[shape][3]
+    assert "Context is" in nudge_output(tmp_path, shape, claude_auto_compact_point(window) - 1)
+
+
+def test_repo_config_nudge_is_silent_where_self_compact_fires(tmp_path):
+    """With the repo's cap, self-compact (FIRE_AT_TOKENS) hands off before the
+    human nudge appears; together with the test above, self-compact < nudge <
+    auto-compact holds for the configuration this repo ships."""
+    cap = context_usage.auto_compact_window(REPO / "settings.json", {})
+    assert cap == WINDOW_SHAPES["420k settings cap"][1], "update WINDOW_SHAPES to the repo cap"
+    assert nudge_output(tmp_path, "420k settings cap", sct.FIRE_AT_TOKENS) == ""

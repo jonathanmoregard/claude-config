@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT="$(cd "$(dirname "$0")" && pwd)/compact-reinject.sh"
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 cd "$TMP"
+exec </dev/null  # the hook reads its payload on stdin; cases without one never inherit the caller's
 
 # Ralph state is session-keyed in USERSPACE, not a file in the project. Every
 # case below therefore redirects HOME and plants state under
@@ -133,13 +134,48 @@ OUT=$(run)
 echo "$OUT" | grep -q 'iteration 4' || { echo "FAIL: armed loop lost its doctrine with stale missions"; exit 1; }
 rm -f "$STATE"; rm -r tasks
 
-# Case 10: a session-reflect resolved handoff counts regardless of file age.
+# Case 10: the session-reflect resolver returns the NEWEST handoff whose cwd sidecar
+# matches this project — any session, any age. It is THIS session's live work only
+# when its <sid> is the SessionStart payload's session_id (a /compact keeps the id).
+# Any other session's handoff is history: a cross-session continuation (in-place
+# reset after /clear, idle-handoff fork) names its handoff in its own prompt.
 RES_HOME="$TMP/home-resolved"
 mkdir -p "$RES_HOME/.claude/skills/session-reflect"
-: > "$TMP/handoff-mission.md"; touch -d '3 days ago' "$TMP/handoff-mission.md"
-printf '#!/usr/bin/env bash\necho "%s"\n' "$TMP/handoff-mission.md" > "$RES_HOME/.claude/skills/session-reflect/reflect.sh"
-OUT=$(HOME="$RES_HOME" bash "$SCRIPT")
-echo "$OUT" | grep -qF "$TMP/handoff-mission.md" || { echo "FAIL: resolved handoff gave no reminder; got: $OUT"; exit 1; }
+HANDOFF="$TMP/sessions/sid-owner-1111/handoff/mission.md"
+mkdir -p "${HANDOFF%/mission.md}"
+: > "$HANDOFF"; touch -d '3 days ago' "$HANDOFF"
+printf '#!/usr/bin/env bash\necho "%s"\n' "$HANDOFF" > "$RES_HOME/.claude/skills/session-reflect/reflect.sh"
+payload() { printf '{"session_id":"%s","hook_event_name":"SessionStart","source":"%s"}' "$1" "${2:-compact}"; }
+
+# 10a: same session (post-compact) → reminder naming the handoff, regardless of age.
+OUT=$(payload sid-owner-1111 | HOME="$RES_HOME" bash "$SCRIPT")
+echo "$OUT" | grep -qF "$HANDOFF" || { echo "FAIL: own-session handoff gave no reminder; got: $OUT"; exit 1; }
+
+# 10b: another session's handoff (fresh startup) → silent: no live mission here.
+OUT=$(payload sid-fresh-2222 startup | HOME="$RES_HOME" bash "$SCRIPT")
+[[ -z "$OUT" ]] || { echo "FAIL: another session's handoff produced a reminder; got: $OUT"; exit 1; }
+
+# 10c: empty / invalid stdin → ownership unprovable → silent, exit 0.
+OUT=$(HOME="$RES_HOME" bash "$SCRIPT" </dev/null) || { echo "FAIL: empty stdin crashed the hook"; exit 1; }
+[[ -z "$OUT" ]] || { echo "FAIL: empty stdin trusted an unowned handoff; got: $OUT"; exit 1; }
+OUT=$(printf 'not json{' | HOME="$RES_HOME" bash "$SCRIPT") || { echo "FAIL: invalid stdin crashed the hook"; exit 1; }
+[[ -z "$OUT" ]] || { echo "FAIL: invalid stdin trusted an unowned handoff; got: $OUT"; exit 1; }
+
+# 10d: another session's handoff beside a FRESH notes-dir mission → the 24h rule still
+# applies, and the reminder names the notes mission, never the foreign handoff.
+RES_NOTES="$RES_HOME/.local/state/claude-tasks/${TMP##*/}"
+mkdir -p "$RES_NOTES"; : > "$RES_NOTES/mission.md"
+OUT=$(payload sid-fresh-2222 | HOME="$RES_HOME" bash "$SCRIPT")
+echo "$OUT" | grep -qF "$RES_NOTES/mission.md" || { echo "FAIL: fresh notes mission lost its reminder; got: $OUT"; exit 1; }
+echo "$OUT" | grep -qF "$HANDOFF" && { echo "FAIL: reminder named another session's handoff; got: $OUT"; exit 1; }
+
+# 10e: an armed ralph loop beside another session's handoff → doctrine still fires
+# but points at this project's notes, never the foreign handoff.
+arm 6 '"x"' "$NOW_TS"
+OUT=$(payload sid-fresh-2222 | HOME="$RES_HOME" CLAUDE_RALPH_STATE_DIR="$RALPH_DIR" bash "$SCRIPT")
+echo "$OUT" | grep -q 'iteration 6' || { echo "FAIL: armed loop lost its doctrine; got: $OUT"; exit 1; }
+echo "$OUT" | grep -qF "$HANDOFF" && { echo "FAIL: doctrine named another session's handoff; got: $OUT"; exit 1; }
+rm -f "$STATE"; rm -r "$RES_NOTES"
 
 # Case 11: tasks/ as a SYMLINK to a notes dir whose name differs from the cwd basename
 # (the CLAUDE.md shape in a worktree): a fresh mission behind the link still counts.
