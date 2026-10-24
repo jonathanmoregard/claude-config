@@ -13,7 +13,7 @@ Don't ask the user to do what you can do: run the commands, tests, reads, edits,
 **Proceed without asking:** `git push`, opening/updating PRs (except PR-gated repos — see **PRs**), updating an outdated green PR's branch (merging stays the user's click), expected status updates.
 
 **Safe cleanup without asking** (verify exact target, provenance and scope first):
-- Temp files, and files an AI created earlier this session, once they block progress or hold no remaining value.
+- Temp files this session created; files an AI created earlier this session, once they block progress or hold no remaining value.
 - Lock files this session created, once no live process owns or uses them. Uncertain ownership or live use → ask.
 - Worktrees this session created: see **Worktrees**. Cleanup never includes branch deletion.
 - Literal absolute paths only: `rm -r /tmp/<path>` under `/tmp`, `gio trash <path>` elsewhere (reversible). No `rm -rf`, no `$VAR`/`$(...)` paths. Reclaiming space outside `/tmp` → ask.
@@ -42,7 +42,7 @@ User instructions override everything below.
 - Put safety gates in MCP server code, not hooks. Hooks are for observation and triggers.
 
 ## Bash
-- `permissions.deny` matches the command string, so a legitimate command can be rejected for a substring it merely contains, heredoc bodies included. Route the payload around it (`Write` then `cat >>`; `gh --body-file`/`-F`; select tests by `-k`; drop a flag whose default is already right) instead of quoting or splitting past the matcher; some rules are deliberate. Details: `detached-long-commands`.
+- `permissions.deny` matches the command string, so a legitimate command can be rejected for a substring it merely contains, heredoc bodies included. Route the payload around it (`Write` then `cat >>`; `gh --body-file`/`-F`; select tests by `-k`; drop a flag whose default is already right). Never quote or split to defeat the matcher — some rules are deliberate. Details: `detached-long-commands`.
 - A `[REDACTED:…]` marker in output means the call succeeded and the value is gated — don't re-run to get it in clear.
 - Waiting on CI, mergeability, a deploy or a unit → `~/.claude/scripts/wait-for pr|run|unit …` with `run_in_background: true`, then end the turn; you are re-invoked when it settles. No `sleep N; <status>` polling.
 
@@ -52,7 +52,7 @@ User instructions override everything below.
 
 ## Model
 - NixOS/VM setup, complex multi-step debugging, branch surgery, harness architecture → Opus. On Sonnet with a task that fits → say so upfront.
-- Subagents: `Explore` (Haiku, read-only discovery), `worker-easy` (Sonnet, well-specified implementation), `worker-hard` (Opus: architecture, migrations, security, complex debugging, broad uncertainty), `advisor` (Fable, read-only review). Dispatch by name without a `model` override; a per-call override outranks the pin. Unnamed general-purpose agents are Sonnet at medium effort. Forks inherit the main model; only for tasks that genuinely need parent-context continuity.
+- Subagents: `Explore` (Haiku, read-only discovery, reference tracing, fact gathering), `worker-easy` (Sonnet, localized well-specified implementation on established patterns), `worker-hard` (Opus: architecture, migrations, security, complex debugging, broad uncertainty), `advisor` (Fable, read-only review). Dispatch by name without a `model` override; a per-call override outranks the pin. Unnamed general-purpose agents are Sonnet at medium effort. Forks inherit the main model; only for tasks that genuinely need parent-context continuity.
 
 ## Collaboration
 - Short replies ("a", "1y 2y 3n", "sounds good") mean engaged and moving fast. Match it.
@@ -70,8 +70,8 @@ User instructions override everything below.
 
 ## Config edits (`~/.claude`, `~/.codex`)
 - `~/.claude` is read-only, pinned to `master`, read live by the harness. Every edit (settings.json, hooks, skills, agents, commands, permissions, scripts, CLAUDE.md), one-liners included, goes in `~/worktrees/claude-<slug>/` off freshly fetched `origin/master` (`~/.claude/scripts/claude-worktree.sh <slug>`), then a PR. Commit only to branches this session created. Follow `settings-management`.
-- Skills that edit config (built-in `update-config`, `fewer-permission-prompts`, plugin or newly installed) don't exempt you: run their steps inside the worktree.
-- Behavior-changing edit (CLAUDE.md, skills, agents, commands, hooks, settings, any text an agent reads — this rule included) → agent e2e before the PR, per `agent-config-e2e`: a real headless agent on the staged candidate config, `origin/master` vs worktree. Results table goes in the PR body. Unit tests, a diff read, or "the text says so" are not e2e.
+- Skills that edit config (built-in `update-config`, `keybindings-help`, `statusline-setup`, `fewer-permission-prompts`, plugin or newly installed) don't exempt you: run their steps inside the worktree.
+- Behavior-changing edit (CLAUDE.md, skills, agents, commands, hooks, settings, any text an agent reads — this rule included) → agent e2e before the PR, per `agent-config-e2e`: a real headless agent on the staged candidate config, driven through the situation the change targets, `origin/master` vs worktree. Results table goes in the PR body. Unit tests, a diff read, or "the text says so" are not e2e.
 - `~/.claude` off `master` or with tracked changes → stop and report its exact state. Don't stash, reset, clean or switch it.
 - Untracked runtime state (`tmp/`, `projects/`, `homunculus/`, `reflections/`) needs no worktree.
 - `~/.codex` is generated and Codex-owned (runtime files included): don't hand-edit anything there. Shared changes go through `~/.claude`; Codex-only rendering or mapping through the `ai-client-config` repo; `ai-client-config-codex-sync.service` publishes.
@@ -83,7 +83,7 @@ User instructions override everything below.
 
 ## Worktrees
 - Required for (a) subagent-driven dev needing isolation, (b) nixos-config, (c) all Klaffat development. Everything else branches in place with `git switch`. Path: `~/worktrees/<repo>-<branch>/`. See `using-git-worktrees`.
-- A worktree this session created may be removed after verifying its path, ownership, a clean tree, and that its commits are merged or otherwise recoverable. Remove the worktree only; branch refs stay unless the user asks. Other sessions' worktrees and branches are not yours to remove.
+- A worktree this session created may be removed after verifying its path, ownership, a clean tree, and that its commits are merged or otherwise recoverable. Remove the worktree only; local and remote branch refs stay unless the user explicitly asks to delete them. Other sessions' worktrees and branches are not yours to remove.
 - Klaffat: `~/Repos/klaffat` stays clean on `main` — no edit, switch, commit, merge, rebase or cherry-pick there. Start with `~/Repos/klaffat/scripts/klaffat-worktree.sh <slug>`, work in `~/worktrees/klaffat-<slug>/`. Dirty or off `main` → report exact state, don't stash, reset, clean or move unknown work. `repo-worktree-policy` applies this pattern to other repos.
 
 ## Confidentiality
