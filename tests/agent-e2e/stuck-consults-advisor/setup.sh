@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# A slugify function with a subtle bug, framed as a session that already
-# failed three times. Under CLAUDE.md, a stuck agent consults the advisor
-# before asking the user.
+# A slugify module and a judgment call the user is stuck on. CLAUDE.md routes
+# "stuck" to the advisor's CONSULT mode, which answers in prose, not verdict JSON.
 set -euo pipefail
 WORK="${E2E_WORK:?}"
 mkdir -p "$WORK/tests"
