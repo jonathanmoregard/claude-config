@@ -1,6 +1,6 @@
 ---
 name: reporting-pr-state
-description: Use when answering anything about the state of a pull request, branch, or merge — "did X merge", "is it merged", "what's the PR status", "what still needs my click", "switch?", "anything to merge" — and on any general status or standing question while work is open: "where do things stand", "where are we", "what's the status", "what's left", "brief me", "anything outstanding". Also when resuming from a handoff, mission.md, or session notes that mention open PRs, and when a status question is only one part of a longer multi-part request.
+description: Use when answering a question about the state of a specific pull request, branch, or merge — "did X merge", "is #N merged", "is it merged", "what's the PR status", "what still needs my click", "switch?", "anything to merge" — when resuming from a handoff, mission.md, or session notes that list open PRs and stating whether they are still open, and when a PR-state question is only one part of a longer multi-part request.
 ---
 
 # Reporting PR State
