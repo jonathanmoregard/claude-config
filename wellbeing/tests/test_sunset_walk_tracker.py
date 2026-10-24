@@ -8,6 +8,7 @@ Covers:
   * local NOAA sunset computation at both solstice extremes (Stockholm refs)
   * stale-cache + network-down -> local recompute path (urllib mocked to raise)
   * SUNSET_WALK_OFFLINE=1 skips the network entirely
+  * missing location config exits 1 and leaves the cache untouched
   * nudge message stays honest when weather is unknown
 """
 from __future__ import annotations
@@ -42,6 +43,7 @@ tracker = _load("sunset-walk-tracker")
 nudge = _load("sunset-walk-nudge")
 
 STOCKHOLM = (59.33, 18.07)
+STOCKHOLM_LOC = tracker.Location("Stockholm", *STOCKHOLM)
 
 
 def _assert_close(actual: datetime, expected: datetime, tol_min: int = 10) -> None:
@@ -66,7 +68,7 @@ def test_sunset_stockholm_winter_solstice():
 def test_offline_state_advances_past_window():
     # 23:30 is after sunset+15min in July -> state must describe tomorrow.
     now = datetime(2026, 7, 8, 23, 30)
-    state = tracker.compute_state_offline(now)
+    state = tracker.compute_state_offline(now, STOCKHOLM_LOC)
     assert state["sunset_date"] == "2026-07-09", state
     assert state["good"] is True, state
 
@@ -87,11 +89,15 @@ class _FakeResp:
         return False
 
 
-def _run_tracker_main(env_offline: bool = False, urlopen=None):
-    """Run tracker.main() with CACHE redirected to a temp file and the
-    environment snapshotted/restored. Returns (exit_code, stdout, stderr,
-    cache_path)."""
+def _run_tracker_main(env_offline: bool = False, urlopen=None, with_config: bool = True):
+    """Run tracker.main() with CACHE redirected to a temp file, a temp
+    location config, and the environment snapshotted/restored. Returns
+    (exit_code, stdout, stderr, cache_path)."""
     tmp = Path(tempfile.mkdtemp(prefix="sunset-test-")) / ".sunset-walk-cache.json"
+    config = tmp.parent / "config.json"
+    if with_config:
+        lat, lon = STOCKHOLM
+        config.write_text(json.dumps({"place": "Stockholm", "lat": lat, "lon": lon}))
     # Pre-seed a stale cache (3 days old) to exercise stale -> recompute.
     stale = {"ts": time.time() - 3 * 86400, "good": False, "sunset_date": "2026-07-05"}
     tmp.parent.mkdir(parents=True, exist_ok=True)
@@ -114,13 +120,13 @@ def _run_tracker_main(env_offline: bool = False, urlopen=None):
                 mock.patch.object(tracker.urllib.request, "urlopen", urlopen)
             )
         with redirect_stdout(out), redirect_stderr(err):
-            code = tracker.main()
+            code = tracker.main(config)
     return code, out.getvalue(), err.getvalue(), tmp
 
 
 def _mock_503():
     return mock.Mock(side_effect=urllib.error.HTTPError(
-        tracker.ENDPOINT, 503, "Service Unavailable", hdrs=None, fp=None
+        "https://api.open-meteo.com/", 503, "Service Unavailable", hdrs=None, fp=None
     ))
 
 
@@ -133,11 +139,20 @@ def test_stale_cache_network_down_recomputes_locally():
     assert state["good"] is True, state
     assert state["cloud_cover_pct"] is None, state
     for key in ("sunset_iso", "sunset_hhmm", "sunset_date",
-                "window_start_iso", "window_end_iso", "lat", "lon"):
+                "window_start_iso", "window_end_iso", "place", "lat", "lon"):
         assert key in state, f"missing contract key {key}"
     # Healthy contract: JSON state printed to stdout.
     assert json.loads(out)["sunset_date"] == state["sunset_date"]
     assert "falling back to local" in err.lower(), err
+
+
+def test_missing_config_exits_without_touching_cache():
+    boom = mock.Mock(side_effect=AssertionError("network touched"))
+    code, out, err, cache = _run_tracker_main(urlopen=boom, with_config=False)
+    assert code == 1, f"exit {code}, stderr: {err}"
+    assert "config.json" in err, err
+    state = json.loads(cache.read_text())
+    assert state["sunset_date"] == "2026-07-05", "stale cache was overwritten"
 
 
 def test_env_offline_skips_network():
@@ -189,7 +204,7 @@ def test_api_advance_picks_day_after_today():
             "visibility": [20000.0],
         },
     }
-    state = tracker.compute_state(now, data)
+    state = tracker.compute_state(now, data, STOCKHOLM_LOC)
     assert state.get("sunset_date") == "2026-07-09", state
 
 
@@ -210,6 +225,7 @@ def test_nudge_honest_when_weather_unknown():
         "cloud_cover_pct": None,
         "precipitation_mm": None,
         "visibility_m": None,
+        "place": "Stockholm",
         "source": "local",
     }))
     out = io.StringIO()
@@ -220,6 +236,7 @@ def test_nudge_honest_when_weather_unknown():
     text = out.getvalue()
     assert code == 0
     assert "Sunset is at" in text, f"nudge did not fire: {text!r}"
+    assert " in Stockholm " in text, f"place missing from nudge: {text!r}"
     assert "clear visibility" not in text, f"claims visibility w/o data: {text!r}"
     assert "not verified" in text, f"missing honesty marker: {text!r}"
 

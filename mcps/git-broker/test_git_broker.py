@@ -61,7 +61,7 @@ def valid_policy() -> dict:
         "sshKnownHostsFile": "/home/jonathan/.ssh/known_hosts",
         "trustedHooksDir": "/home/jonathan/.config/git/hooks",
         "commitUserName": "jonathanmoregard",
-        "commitUserEmail": "10191435+jonathanmoregard@users.noreply.github.com",
+        "commitUserEmail": "agent@example.invalid",
         "discoveryTimeoutMs": 5000,
         "maxTimeoutMs": 600000,
         "outputLimitChars": 60000,

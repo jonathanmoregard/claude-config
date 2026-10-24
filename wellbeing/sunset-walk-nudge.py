@@ -97,8 +97,10 @@ def main() -> int:
         # weather was not verified, so don't claim it.
         weather_str = "weather not verified (tracker offline)"
 
+    place = cache.get("place")
+    where = f" in {place}" if place else ""
     print(
-        f"Sunset is at {sunset_hhmm} in the configured place — {weather_str}, "
+        f"Sunset is at {sunset_hhmm}{where} — {weather_str}, "
         f"walk window {window_start.strftime('%H:%M')}-"
         f"{window_end.strftime('%H:%M')}. Gently nudge the user to step outside "
         "for the sunset light. This is a wellbeing nudge, not an order."
