@@ -44,7 +44,7 @@ def fire(home: Path, session: str) -> bool:
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         home = Path(tmp)
-        dates = home / ".claude" / "dates"
+        dates = home / ".local" / "state" / "claude-dates"
         dates.mkdir(parents=True)
         state = dates / "state.json"
         idea = {"idea": "a walk", "created_at": "2026-10-01"}

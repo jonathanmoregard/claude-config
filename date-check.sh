@@ -12,14 +12,14 @@ set -euo pipefail
 # not reflect on it into the corpus the RSI review reads.
 export CLAUDE_PIPELINE_INTERNAL=1
 
-DATES_DIR="$HOME/.claude/dates"
-CONFIG_FILE="$DATES_DIR/config.json"
-STATE_FILE="$DATES_DIR/state.json"
-IDEAS_FILE="$DATES_DIR/ideas.md"
+# Personal data (partner, city, ideas) lives outside the config repo.
+CONFIG_FILE="$HOME/.config/claude-dates/config.json"
+IDEAS_FILE="$HOME/.config/claude-dates/ideas.md"
+STATE_FILE="$HOME/.local/state/claude-dates/state.json"
 LOG_FILE="$HOME/.claude/tmp/date-check.log"
 CLAUDE="$HOME/.local/bin/claude"
 
-mkdir -p "$(dirname "$LOG_FILE")"
+mkdir -p "$(dirname "$LOG_FILE")" "$(dirname "$STATE_FILE")"
 exec >> "$LOG_FILE" 2>&1
 echo "--- $(date '+%Y-%m-%d %H:%M:%S') ---"
 
