@@ -1,0 +1,25 @@
+{
+  "appRunner": {
+    "version": 1,
+    "worktreeRoot": "/home/jonathan/worktrees",
+    "klaffatPrimary": "/home/jonathan/Repos/klaffat",
+    "allowedOrigins": [
+      "git@github.com:klaffat/klaffat.git",
+      "https://github.com/klaffat/klaffat.git"
+    ],
+    "stateRoot": "/home/jonathan/.local/state/klaffat-app-runner",
+    "nixExecutable": "/run/current-system/sw/bin/nix",
+    "bashExecutable": "/run/current-system/sw/bin/bash",
+    "pythonExecutable": "/run/current-system/sw/bin/python3",
+    "systemdRunExecutable": "/run/current-system/sw/bin/systemd-run",
+    "systemctlExecutable": "/run/current-system/sw/bin/systemctl",
+    "journalctlExecutable": "/run/current-system/sw/bin/journalctl",
+    "realCalendarExecutable": "/run/current-system/sw/bin/klaffat-local-google",
+    "userBusSocket": "%t/bus",
+    "unitPrefix": "klaffat-app-runner",
+    "commandTimeoutMs": 30000,
+    "realStartTimeoutMs": 1800000,
+    "maxLogLines": 1000,
+    "maxOutputChars": 60000
+  }
+}

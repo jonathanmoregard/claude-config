@@ -102,6 +102,25 @@ def open_entries(text: str) -> list[str]:
     return titles
 
 
+def grouped(titles: list[str]) -> list[str]:
+    """One line per recurring blocker: titles differing only by a date or a
+    trailing "(N things)" count collapse to "title ×N (first … last)", so a
+    timer that re-logs the same blocker daily costs one line, not ten."""
+    groups: dict[str, list[str]] = {}
+    for title in titles:
+        key = re.sub(r"\s*\([^()]*\)\s*$", "", DATE.sub("", title)).strip(" :–-")
+        groups.setdefault(key or title, []).append(title)
+    out = []
+    for key, members in groups.items():
+        if len(members) == 1:
+            out.append(members[0])
+            continue
+        dates = sorted(d for t in members for d in DATE.findall(t)[:1])
+        span = f" ({dates[0]} … {dates[-1]})" if dates else ""
+        out.append(f"{key} ×{len(members)}{span}")
+    return out
+
+
 def main() -> int:
     try:
         data = json.loads(sys.stdin.read() or "{}")
@@ -137,11 +156,12 @@ def main() -> int:
     ]
     for path, titles in found:
         lines.append(f"{path} ({len(titles)} open):")
-        for title in titles[:MAX_LISTED]:
+        rows = grouped(titles)
+        for title in rows[:MAX_LISTED]:
             short = title if len(title) <= MAX_TITLE else title[: MAX_TITLE - 1] + "…"
             lines.append(f"  - {short}")
-        if len(titles) > MAX_LISTED:
-            lines.append(f"  - … {len(titles) - MAX_LISTED} more in the file")
+        if len(rows) > MAX_LISTED:
+            lines.append(f"  - … {len(rows) - MAX_LISTED} more in the file")
 
     out: dict = {
         "hookSpecificOutput": {

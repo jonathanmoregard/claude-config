@@ -4,8 +4,21 @@
 
 [ -f /etc/NIXOS ] || exit 0
 
-cat <<'EOF'
-[nixos] Host is NixOS (dellan), migrated from Linux Mint. Treat every
+host=$(hostname 2>/dev/null || echo unknown)
+cwd=$(jq -r '.cwd // empty' 2>/dev/null)
+
+# Full briefing only where NixOS config work happens; elsewhere one line, so
+# the ~1k-token pipeline text is not paid by every unrelated session.
+case "$cwd" in
+  /etc/nixos | /etc/nixos/* | "$HOME"/Repos/nixos-config*) ;;
+  *)
+    echo "[nixos] Host is NixOS ($host). Before changing anything on the host itself — packages, services, systemd timers or cron jobs, user config files and dotfiles, secrets — invoke the nixos-config-dev skill, from any repo: such changes are declared in nixos-config via a worktree under ~/Repos/nixos-config-worktrees/ and a PR, never made in place. A project's tooling goes in its own flake/devShell. No /etc edits outside /etc/nixos, no crontab, no global pip/npm/cargo/go installs: use 'nix shell nixpkgs#<pkg>' or declare the package."
+    exit 0
+    ;;
+esac
+
+sed "s/@HOST@/$host/g" <<'EOF'
+[nixos] Host is NixOS (@HOST@), migrated from Linux Mint. Treat every
 change to system config as a production-code contribution: write it
 declaratively, test it before shipping, and ship through the same
 CI/CD pipeline a human would. Do not ask the user whether to test —
@@ -36,7 +49,7 @@ Pipeline (memorize this; it gates every change):
     ▼
   GitHub Actions on PR (ubuntu-latest, KVM nested-virt):
     preflight, verify fork-guards, flake check (eval), docs (eval),
-    discover (picks the lanes), build dellan toplevel,
+    discover (picks the lanes), build @HOST@ toplevel,
     vm-minimal (matrix — one job per selected lane),
     vm-graphical (path-conditional)
     │
@@ -45,10 +58,10 @@ Pipeline (memorize this; it gates every change):
   layer — merging is always a deliberate gesture)
     │
     ▼
-  push:main webhook over Tailscale Funnel → nixos-deploy.service on
-  dellan: git fetch + reset --hard + nixos-rebuild switch --flake
-  /etc/nixos#dellan → libnotify desktop notification (success low /
-  failure CRITICAL with rollback command)
+  nixos-auto-deploy on @HOST@: pull-based poll of origin/main (the
+  push:main webhook over Tailscale Funnel only cuts latency) →
+  nixos-rebuild switch --flake /etc/nixos#@HOST@ → libnotify desktop
+  notification (success low / failure CRITICAL with rollback command)
 
 Rules of engagement when something breaks: FIX AT THE ROOT with
 NixOS best practices. Do not patch with imperative workarounds (no
