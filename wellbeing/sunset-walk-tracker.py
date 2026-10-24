@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-Cron-friendly tracker for tonight's sunset-walk window in the configured place.
+Cron-friendly tracker for tonight's sunset-walk window at the configured place.
+
+Location: ~/.config/sunset-walk/config.json (personal data, never in the repo)
+    {"place": "<name shown in the nudge>", "lat": <float>, "lon": <float>}
+Missing or malformed config exits 1 without touching the cache, so the nudge
+hook reports a stale cache instead of nudging for the wrong place.
 
 Primary path: fetch Open-Meteo (free, no API key) for sunset time + weather,
 compute whether tonight qualifies as "good weather for a sunset walk", and
@@ -33,20 +38,12 @@ import urllib.error
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from typing import NamedTuple
 from zoneinfo import ZoneInfo
 
-LAT = 0.0
-LON = 0.0
 TIMEZONE = "Europe/Stockholm"
+CONFIG = Path.home() / ".config" / "sunset-walk" / "config.json"
 CACHE = Path.home() / ".claude" / "tmp" / ".sunset-walk-cache.json"
-ENDPOINT = (
-    "https://api.open-meteo.com/v1/forecast"
-    f"?latitude={LAT}&longitude={LON}"
-    "&hourly=cloud_cover,precipitation,visibility"
-    "&daily=sunset"
-    f"&timezone={TIMEZONE.replace('/', '%2F')}"
-    "&forecast_days=2"
-)
 
 CLOUD_MAX_PCT = 40
 VIS_MIN_M = 5000
@@ -54,8 +51,34 @@ WINDOW_BEFORE_MIN = 30
 WINDOW_AFTER_MIN = 15
 
 
-def _fetch() -> dict:
-    req = urllib.request.Request(ENDPOINT, headers={"User-Agent": "claude-sunset-walk/1.0"})
+class Location(NamedTuple):
+    place: str
+    lat: float
+    lon: float
+
+
+def load_location(config: Path) -> Location:
+    """Read the walk location. Raises OSError, ValueError or KeyError when
+    the config is missing or malformed."""
+    d = json.loads(config.read_text())
+    return Location(str(d["place"]), float(d["lat"]), float(d["lon"]))
+
+
+def _endpoint(lat: float, lon: float) -> str:
+    return (
+        "https://api.open-meteo.com/v1/forecast"
+        f"?latitude={lat}&longitude={lon}"
+        "&hourly=cloud_cover,precipitation,visibility"
+        "&daily=sunset"
+        f"&timezone={TIMEZONE.replace('/', '%2F')}"
+        "&forecast_days=2"
+    )
+
+
+def _fetch(loc: Location) -> dict:
+    req = urllib.request.Request(
+        _endpoint(loc.lat, loc.lon), headers={"User-Agent": "claude-sunset-walk/1.0"}
+    )
     with urllib.request.urlopen(req, timeout=15) as r:
         return json.loads(r.read().decode())
 
@@ -111,8 +134,7 @@ def sunset_utc(d: date, lat: float, lon: float) -> datetime | None:
     return base + timedelta(minutes=sunset_minutes_utc)
 
 
-def sunset_local(d: date, lat: float = LAT, lon: float = LON,
-                 tz: str = TIMEZONE) -> datetime | None:
+def sunset_local(d: date, lat: float, lon: float, tz: str = TIMEZONE) -> datetime | None:
     """Sunset on date *d* as a naive local-time datetime (same shape as the
     Open-Meteo daily.sunset strings). None during polar day/night."""
     utc = sunset_utc(d, lat, lon)
@@ -121,12 +143,12 @@ def sunset_local(d: date, lat: float = LAT, lon: float = LON,
     return utc.astimezone(ZoneInfo(tz)).replace(tzinfo=None)
 
 
-def compute_state_offline(now: datetime, lat: float = LAT, lon: float = LON) -> dict:
+def compute_state_offline(now: datetime, loc: Location) -> dict:
     """Cache state from local computation only. Weather is unknown, so weather
     fields are None and good=True (optimistic — see module docstring)."""
-    sunset_dt = sunset_local(now.date(), lat, lon)
+    sunset_dt = sunset_local(now.date(), loc.lat, loc.lon)
     if sunset_dt is not None and now > sunset_dt + timedelta(minutes=WINDOW_AFTER_MIN):
-        sunset_dt = sunset_local(now.date() + timedelta(days=1), lat, lon)
+        sunset_dt = sunset_local(now.date() + timedelta(days=1), loc.lat, loc.lon)
     if sunset_dt is None:
         return {
             "ts": time.time(),
@@ -148,8 +170,9 @@ def compute_state_offline(now: datetime, lat: float = LAT, lon: float = LON) -> 
         "cloud_cover_pct": None,
         "precipitation_mm": None,
         "visibility_m": None,
-        "lat": lat,
-        "lon": lon,
+        "place": loc.place,
+        "lat": loc.lat,
+        "lon": loc.lon,
         "source": "local",
     }
 
@@ -162,7 +185,7 @@ def _hour_index(times: list[str], target: datetime) -> int | None:
         return None
 
 
-def compute_state(now: datetime, data: dict) -> dict:
+def compute_state(now: datetime, data: dict, loc: Location) -> dict:
     daily = data.get("daily", {})
     sunsets = daily.get("sunset", [])
     days = daily.get("time", [])
@@ -216,18 +239,29 @@ def compute_state(now: datetime, data: dict) -> dict:
         "cloud_cover_pct": c,
         "precipitation_mm": p,
         "visibility_m": v,
-        "lat": LAT,
-        "lon": LON,
+        "place": loc.place,
+        "lat": loc.lat,
+        "lon": loc.lon,
         "source": "api",
     }
 
 
-def main() -> int:
+def main(config: Path = CONFIG) -> int:
+    try:
+        loc = load_location(config)
+    except (OSError, ValueError, KeyError) as e:
+        print(
+            f"[sunset-walk-tracker] cannot read location from {config}: "
+            f"{type(e).__name__}: {e}; cache left untouched",
+            file=sys.stderr,
+        )
+        return 1
+
     now = datetime.now()
     data = None
     if os.environ.get("SUNSET_WALK_OFFLINE") != "1":
         try:
-            data = _fetch()
+            data = _fetch(loc)
         except OSError as e:
             # URLError/HTTPError/TimeoutError are OSError subclasses; bare
             # OSErrors (e.g. ConnectionResetError mid-read) land here too.
@@ -246,7 +280,7 @@ def main() -> int:
     state = None
     if data is not None:
         try:
-            state = compute_state(now, data)
+            state = compute_state(now, data, loc)
         except Exception as e:
             # A 200 with a degenerate payload (null sunsets, short arrays,
             # malformed ISO strings) must never leave the cache stale.
@@ -257,7 +291,7 @@ def main() -> int:
             )
     if state is None or "sunset_iso" not in state:
         # API down, offline mode, or API data unusable -> local computation.
-        state = compute_state_offline(now)
+        state = compute_state_offline(now, loc)
 
     CACHE.parent.mkdir(parents=True, exist_ok=True)
     CACHE.write_text(json.dumps(state, indent=2))
