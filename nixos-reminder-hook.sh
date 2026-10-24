@@ -12,7 +12,7 @@ cwd=$(jq -r '.cwd // empty' 2>/dev/null)
 case "$cwd" in
   /etc/nixos | /etc/nixos/* | "$HOME"/Repos/nixos-config*) ;;
   *)
-    echo "[nixos] Host is NixOS ($host). System config changes go through a worktree under ~/Repos/nixos-config-worktrees/ and a PR (nixos-config-dev skill; the full briefing prints in sessions started there). No /etc edits outside /etc/nixos, no global pip/npm/cargo/go installs: use 'nix shell nixpkgs#<pkg>' or declare the package."
+    echo "[nixos] Host is NixOS ($host). Before changing anything on the host itself — packages, services, systemd timers or cron jobs, user config files and dotfiles, secrets — invoke the nixos-config-dev skill, from any repo: such changes are declared in nixos-config via a worktree under ~/Repos/nixos-config-worktrees/ and a PR, never made in place. A project's tooling goes in its own flake/devShell. No /etc edits outside /etc/nixos, no crontab, no global pip/npm/cargo/go installs: use 'nix shell nixpkgs#<pkg>' or declare the package."
     exit 0
     ;;
 esac
