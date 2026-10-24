@@ -6,8 +6,8 @@ Feature work happens in worktrees (`~/worktrees/<repo>-<slug>/`, or wherever
 touch them without a permission prompt per file, which is friction on exactly
 the flow that's supposed to be frictionless.
 
-So: enumerate the worktrees of the repo this session was started in, and write
-them into `<project>/.claude/settings.local.json` under
+So: enumerate the worktrees of the repo this session was started in that still
+hold work (dirty, or commits not on the default branch), and write them into `<project>/.claude/settings.local.json` under
 `permissions.additionalDirectories`. That file is gitignored globally
 (`~/.config/git/ignore`), so nothing lands in the repo.
 
@@ -18,6 +18,7 @@ forever. Directories added by hand are never touched.
 Always exits 0 — a broken hook must not be able to stop a session starting.
 """
 
+import concurrent.futures
 import json
 import os
 import pathlib
@@ -54,7 +55,44 @@ def worktrees_of(repo: pathlib.Path) -> list[str]:
         if resolved == here:
             continue  # the checkout we're already in
         found.append(str(resolved))
-    return sorted(set(found))
+    base = default_ref(repo)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        live = list(pool.map(lambda p: has_work(p, base), found))
+    return sorted({p for p, keep in zip(found, live) if keep})
+
+
+def git(path: str, *args: str) -> str | None:
+    try:
+        out = subprocess.run(["git", "-C", path, *args], capture_output=True,
+                             text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+def default_ref(repo: pathlib.Path) -> str | None:
+    """`origin/<default>` of the repo, or None when it can't be told."""
+    ref = git(str(repo), "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD")
+    if ref and ref.strip():
+        return ref.strip()
+    for name in ("origin/main", "origin/master"):
+        if git(str(repo), "rev-parse", "-q", "--verify", name) is not None:
+            return name
+    return None
+
+
+def has_work(path: str, base: str | None) -> bool:
+    """Keep a worktree in scope while it holds work: uncommitted changes, or
+    commits not yet on the default branch. A clean worktree whose branch is
+    merged only costs environment-block tokens in every session. Unknown ->
+    keep, so a git hiccup never hides live work."""
+    status = git(path, "status", "--porcelain")
+    if status is None or status.strip():
+        return True
+    if base is None:
+        return True
+    ahead = git(path, "rev-list", "--count", f"{base}..HEAD")
+    return ahead is None or ahead.strip() != "0"
 
 
 def main() -> int:
