@@ -69,8 +69,6 @@ Relevance is stated, not implied by listing. If you cannot say in a clause why a
 
 ## Report Format
 
-For a general status question ("where are we", "brief me"), the reply takes the `reporting-state` shape; this per-PR format is for questions about the PRs themselves.
-
 Every PR mentioned in a report carries its **full URL on its own line**. Not the bare number, not `#178`, not a markdown label — the link, so it is one click away.
 
 **Links go at the BOTTOM of the reply.** Not in the opening line, not buried mid-prose. Jonathan scrolls to the end to click, so that is where the clickable thing belongs. Say what happened first, then hand over the link last.

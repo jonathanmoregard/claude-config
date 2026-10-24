@@ -6,13 +6,13 @@ description: Use when the user asks a general status or orientation question abo
 # Reporting State
 
 A general status question gets an executive summary: report at the level of
-the work, not the PRs. A question about one PR goes to `reporting-pr-state`.
+the work, not the PRs.
 
 ## Gather first
 
 Read the handoff (`mission.md`, notes) and git state. Before calling any PR
-open or waiting on the user, query its live `.state`; `reporting-pr-state` is
-the rule for PR facts and for which PRs belong to the work.
+open or waiting on the user, query its live `.state` (`gh pr view <n> --json
+state`). Name only PRs this work produced or depends on.
 
 ## The reply
 
