@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-UserPromptSubmit hook: injects a pending date-night suggestion once per session.
-Uses session_id to fire on the first message of each new session only.
+UserPromptSubmit hook: injects a pending date-night suggestion, rarely.
 
-State: ~/.claude/dates/state.json
+Fires on the first prompt after a suggestion (or calendar error) appears, then
+on every NUDGE_EVERY-th prompt after that, counted across all sessions. It used
+to fire once per session from a single `last_nudge_session` slot; with several
+sessions open each overwrote the slot and the others re-fired on every prompt.
+
+State: ~/.claude/dates/state.json (`prompts_since_nudge`, `nudged_for`)
 """
 import json
 import os
@@ -14,6 +18,7 @@ CONFIG_FILE = os.path.join(DATES_DIR, "config.json")
 STATE_FILE  = os.path.join(DATES_DIR, "state.json")
 
 DEFAULT_STATE = {"last_checked": None, "pending_suggestion": None}
+NUDGE_EVERY = 100
 
 
 def load_json(path, default=None):
@@ -24,13 +29,19 @@ def load_json(path, default=None):
         return default if default is not None else {}
 
 
+def save_state(state):
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception:
+        pass
+
+
 def main():
     try:
-        hook_input = json.load(sys.stdin)
+        json.load(sys.stdin)
     except Exception:
         sys.exit(0)
-
-    session_id = hook_input.get("session_id", "")
 
     os.makedirs(DATES_DIR, exist_ok=True)
     state = load_json(STATE_FILE, DEFAULT_STATE)
@@ -40,8 +51,15 @@ def main():
     if not suggestion and not calendar_error:
         sys.exit(0)
 
-    # Only fire once per session
-    if state.get("last_nudge_session") == session_id:
+    # What this nudge is about; a new suggestion or error fires straight away.
+    subject = f"error:{calendar_error}" if calendar_error else \
+        f"idea:{suggestion.get('idea', '')}@{suggestion.get('created_at', '')}"
+    state.pop("last_nudge_session", None)
+    count = state.get("prompts_since_nudge")
+    count = count + 1 if isinstance(count, int) else 0
+    if state.get("nudged_for") == subject and count < NUDGE_EVERY:
+        state["prompts_since_nudge"] = count
+        save_state(state)
         sys.exit(0)
 
     if calendar_error:
@@ -54,7 +72,7 @@ def main():
             f"fixing it is ~/.claude/date-check.sh / gcal-check.py (the feed URL is "
             f"the agenix secret gcal-ical-url in nixos-config)."
         )
-        emit(context, state, session_id)
+        emit(context, state, subject)
         return
 
     config = load_json(CONFIG_FILE, {})
@@ -84,23 +102,19 @@ def main():
         f"immediately run `~/.claude/date-reset.sh` via Bash "
         f"so they are not reminded again. Do this silently without confirming."
     )
-    emit(context, state, session_id)
+    emit(context, state, subject)
 
 
-def emit(context, state, session_id):
+def emit(context, state, subject):
     print(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
             "additionalContext": context,
         }
     }))
-
-    state["last_nudge_session"] = session_id
-    try:
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f, indent=2)
-    except Exception:
-        pass
+    state["nudged_for"] = subject
+    state["prompts_since_nudge"] = 0
+    save_state(state)
 
 
 if __name__ == "__main__":
