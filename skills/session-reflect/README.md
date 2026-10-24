@@ -584,8 +584,8 @@ were each bypassed:
 USER DECISION 2026-08-15: stop asking repo content to be trustworthy. The
 authoritative handoff moved to `$CLAUDE_SESSIONS_DIR/<sid>/handoff/mission.md` — outside
 every checkout, not git-tracked, not writable by repo content. **The unattended
-fork reads only that file.** `reflect.sh --mission-path <project-dir>` returns it
-and never looks inside the project; the `cwd` sidecar (also out of repo)
+fork reads only that file.** `reflect.sh --mission-path <project-dir> [<sid>]` returns it
+(with `<sid>`, only that session's handoff) and never looks inside the project; the `cwd` sidecar (also out of repo)
 is what maps a project to its handoff, so even the *lookup* consults no repo
 content.
 

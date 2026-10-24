@@ -64,7 +64,7 @@ def harness(tmp_path, monkeypatch):
             total_tokens=tokens, window=1_000_000,
             fill_pct=tokens / 1_000_000, user_messages=5,
             model="claude-opus-5", estimated=False)
-        monkeypatch.setattr(sct.context_usage, "occupancy", lambda tp: occ)
+        monkeypatch.setattr(sct.context_usage, "occupancy", lambda tp, cap=None: occ)
         return sct.main()
 
     def state():

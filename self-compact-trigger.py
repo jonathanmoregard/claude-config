@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Stop hook: self-compact threshold trigger.
 
-At 30% of the DETECTED context window (~300k on a 1M model) this writes a durable
+At FIRE_AT_TOKENS (350k, 35% of a 1M window) this writes a durable
 mission handoff and records a self-compact *request*. `scripts/idle-handoff.sh`
 consumes the request and does the reset+resume with its existing guard chain (fork
 ledger, per-cwd 24h budget, staleness DENY-when-uncheckable, live-cwd collision
@@ -11,7 +11,7 @@ WHY `Stop`
     Stop is the only hook event that recurs WITHOUT a human turn, and autonomy
     is the whole point: a trigger on UserPromptSubmit can only ever nudge,
     because it needs someone to type first. PreCompact is too late (it fires
-    only if a compaction happens at all, and the 70% nudge means the user
+    only if a compaction happens at all, and the advisory nudge means the user
     usually hands off instead). PostToolUse recurs but fires tens of times per
     turn for no extra signal. So: Stop, once per assistant turn.
 
@@ -127,17 +127,17 @@ import context_usage  # noqa: E402  (path shim must precede the import)
 import inplace_reset  # noqa: E402  (same shim; ships beside this file)
 
 # --- Fixed values, not settings ----------------------------------------------
-# Fire at 30% of the DETECTED context window — ~300k tokens on a 1M model, ~60k on
-# a 200k one. Deliberately aggressive relative to the 70% advisory nudge in
+# Fire at 350k tokens. Deliberately ahead of the advisory nudge in
 # context-baggage.py (both are live and independent): the point is to hand off
-# while there is still ample runway, not at the ~92% auto-compact cliff.
+# while there is still runway, before Claude Code's own auto-compact.
 #
 # Hardcoded, and NOT readable from config. It was a config key; that key is gone
 # along with the on/off switch it lived beside. Changing this number is a code
 # change with a test run behind it, which is the correct amount of friction for a
 # value that decides when a machine spends usage.
-# Fire when the session is holding this many tokens. 300k is 30% of a 1M
-# window, which is the size this is for.
+# Fire when the session is holding this many tokens. 350k (user choice
+# 2026-10-24) with the autoCompactWindow cap at 420k leaves ~37k before Claude
+# Code compacts at ~387k: about two large turns of headroom.
 #
 # ABSOLUTE, not a percentage, and that is the point. A percentage needs a window
 # to divide by, and the window was the least trustworthy number in the whole
@@ -146,7 +146,18 @@ import inplace_reset  # noqa: E402  (same shim; ships beside this file)
 # a session resets itself. Set that to 200000 on a 1M model and the old code
 # fired at 10% real occupancy. Tokens are read from the transcript's own
 # recorded usage and cannot be talked into being something else.
-FIRE_AT_TOKENS = 300_000
+#
+# MUST STAY BELOW CLAUDE CODE'S AUTO-COMPACT POINT. settings.json caps the
+# window with `autoCompactWindow` (the backstop), and Claude Code 2.1.310
+# compacts at cap - 20k output reserve - 13k buffer: 387k at a 420k cap.
+# Claude also starts a background pre-summary near 0.8 x (cap - 20k) ~= 320k;
+# that costs a summary call but does not compact, so firing after it is fine. If
+# Claude compacts first, the session never reaches this number and self-compact
+# never fires, so the warm-cache handoff silently becomes a summary-compact.
+# Absolute rather than derived from the cap, for the reason above; the coupling
+# is held by tests/test_context_window_cap.py, which reads settings.json and
+# fails if the cap is retuned below this plus Claude's reserves.
+FIRE_AT_TOKENS = 350_000
 
 # Ceiling on fires per session, for a session that oscillates across the
 # threshold: each crossing re-arms (see LOOP BOUND above), so without a cap a
@@ -607,7 +618,10 @@ def main() -> int:
     if not cwd or not os.path.isdir(cwd):
         return 0
 
-    occ = context_usage.occupancy(transcript)
+    # The cap only shapes the recorded window/fill; the fire decision below is
+    # on absolute tokens (see FIRE_AT_TOKENS).
+    cap = context_usage.auto_compact_window(context_usage.user_settings_path(os.environ), os.environ)
+    occ = context_usage.occupancy(transcript, cap)
     if occ is None:
         return 0
     if occ.estimated:
@@ -776,7 +790,9 @@ def manual(instructions: str) -> int:
     state["last_manual_at"] = now
     write_json_atomic(state_path(sid), state)
 
-    occ = context_usage.occupancy(transcript)
+    occ = context_usage.occupancy(
+        transcript,
+        context_usage.auto_compact_window(context_usage.user_settings_path(os.environ), os.environ))
     request = {
         "session_id": sid,
         "cwd": cwd,

@@ -93,11 +93,20 @@ if command -v jq >/dev/null 2>&1; then
       if $value == null then empty
       else (($value | round | tostring) + "% " + $label)
       end;
+    def num: if type == "number" then . else 0 end;
+    def cache:
+      (.context_window.current_usage? // null) as $u
+      | if ($u | type) != "object" then empty else
+          ($u.cache_read_input_tokens | num) as $r
+          | ($r + ($u.cache_creation_input_tokens | num) + ($u.input_tokens | num)) as $t
+          | if $t > 0 then ("cache " + (($r * 100 / $t) | round | tostring) + "%") else empty end
+        end;
     [
       (.model.display_name // .model.id // "Claude"),
       pct("ctx"; .context_window.used_percentage?),
       pct("5h"; .rate_limits.five_hour.used_percentage?),
-      pct("week"; .rate_limits.seven_day.used_percentage?)
+      pct("week"; .rate_limits.seven_day.used_percentage?),
+      cache
     ] | join(" · ")
   ' "$tmp_in" 2>/dev/null || true
 else
@@ -121,6 +130,14 @@ for label, path in (
         value = value.get(key) if isinstance(value, dict) else None
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         parts.append(f"{round(value)}% {label}")
+usage = (data.get("context_window") or {}).get("current_usage")
+if isinstance(usage, dict):
+    def num(k):
+        v = usage.get(k)
+        return v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+    total = num("cache_read_input_tokens") + num("cache_creation_input_tokens") + num("input_tokens")
+    if total > 0:
+        parts.append(f"cache {round(num('cache_read_input_tokens') * 100 / total)}%")
 print(" · ".join(parts))
 PY
 fi

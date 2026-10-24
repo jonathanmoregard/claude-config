@@ -195,13 +195,13 @@ is_valid_sid() {
 # was never exercised in the configuration that matters.
 #
 # The threshold is a VALUE, not a setting: hardcoded here and hardcoded in
-# self-compact-trigger.py (THRESHOLD = 0.30), the two deliberately identical.
+# self-compact-trigger.py (FIRE_AT_TOKENS), the two deliberately identical.
 # It used to be config-readable at both ends by two different code paths, which is
 # how they came to disagree in silence. One number, changed in code, tested.
 # MUST equal FIRE_AT_TOKENS in self-compact-trigger.py. TEST 21 asserts the two
 # agree, because a consumer that re-measures against a different bar than the
 # producer used is worse than one that does not re-measure at all.
-SELF_COMPACT_FIRE_AT_TOKENS="300000"
+SELF_COMPACT_FIRE_AT_TOKENS="350000"
 
 # A request marker is a NOTIFICATION, never authority. It says "this session
 # crossed the threshold"; we re-measure the transcript here before widening the

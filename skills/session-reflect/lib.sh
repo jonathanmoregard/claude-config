@@ -1022,8 +1022,10 @@ mission_handoff_dir()      { printf '%s' "$CLAUDE_SESSIONS_DIR/${1:-}/handoff"; 
 mission_handoff_path()     { printf '%s' "$CLAUDE_SESSIONS_DIR/${1:-}/handoff/mission.md"; }
 mission_handoff_cwd_path() { printf '%s' "$CLAUDE_SESSIONS_DIR/${1:-}/cwd"; }
 
-# mission_resolve_handoff <project_cwd> — print the AUTHORITATIVE handoff for that
-# project, or return 1.
+# mission_resolve_handoff <project_cwd> [sid] — print the AUTHORITATIVE handoff for
+# that project, or return 1. With <sid>, only that session's handoff is a candidate:
+# a caller asking "is there a handoff for THIS session" must not have a newer
+# handoff from another session shadow its own.
 #
 # ARGUMENT UNIT: the PROJECT ROOT, as it appeared in the hook payload's `cwd`
 # (both ends read it from the same place: mission mode records the payload cwd,
@@ -1047,7 +1049,7 @@ mission_handoff_cwd_path() { printf '%s' "$CLAUDE_SESSIONS_DIR/${1:-}/cwd"; }
 #
 # Read-only, and every decision is logged to stderr so a choice is never silent.
 mission_resolve_handoff() {
-  local want="${1:-}"
+  local want="${1:-}" want_sid="${2:-}"
   if [[ -z "$want" ]]; then
     echo "reflect: mission handoff resolution needs a project cwd" >&2
     return 1
@@ -1067,6 +1069,7 @@ mission_resolve_handoff() {
     session_dir_="$(dirname -- "$grant_dir")"
     sid="$(basename -- "$session_dir_")"
     is_valid_sid "$sid" || continue
+    [[ -z "$want_sid" || "$sid" == "$want_sid" ]] || continue
     # The sidecar is read from the SESSION dir, never from the grant.
     cwdfile="$session_dir_/cwd"
     [[ -f "$cwdfile" ]] || continue
@@ -1080,7 +1083,7 @@ mission_resolve_handoff() {
   done < <(find "$sessions_root" -mindepth 3 -maxdepth 3 -type f -name mission.md \
              -path '*/handoff/mission.md' \
              -printf '%T@\t%p\n' 2>/dev/null | sort -rn | cut -f2- || true)
-  echo "reflect: no mission handoff under $sessions_root/*/handoff/mission.md records cwd='$want' ($seen candidate handoff(s) examined). Nothing in the project tree is consulted: tasks/mission*.md are human copies, never a read source." >&2
+  echo "reflect: no mission handoff under $sessions_root/${want_sid:-*}/handoff/mission.md records cwd='$want' ($seen candidate handoff(s) examined). Nothing in the project tree is consulted: tasks/mission*.md are human copies, never a read source." >&2
   return 1
 }
 

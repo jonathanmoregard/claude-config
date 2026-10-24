@@ -6,7 +6,7 @@ there are now three consumers and a fourth copy of the window-detection table
 is how this stopped working the last time (the prefix list went stale and the
 nudge reported 89% full during a session at 18% of a 1M window):
 
-  * ``context-baggage.py``       UserPromptSubmit nudge at 70% — advisory, human-facing.
+  * ``context-baggage.py``       UserPromptSubmit nudge near auto-compact — advisory, human-facing.
   * ``self-compact-trigger.py``  Stop-hook self-compact trigger at 30% — autonomous.
   * ``scripts/idle-handoff.sh``  re-measures a self-compact request against the
                                  transcript before it widens its idle gate, via
@@ -30,7 +30,9 @@ Occupancy semantics (unchanged from the original context-baggage.py):
     then a prefix table, then an observed-usage fallback (any turn above the
     200k base means the session is really 1M), then the 200k base as an
     explicitly-flagged ASSUMPTION;
-  * ``CLAUDE_CONTEXT_MAX`` overrides everything.
+  * ``CLAUDE_CONTEXT_MAX`` overrides the model window;
+  * the result is capped at Claude Code's auto-compact window, which each
+    entrypoint reads once (``auto_compact_window()``) and passes in.
 
 Two independent ways a reading can be soft, both reported rather than hidden:
   * ``estimated=True``   — the NUMERATOR is a byte-count guess (the transcript
@@ -47,9 +49,11 @@ which is why ``--fill-pct`` exits non-zero for either case.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
-from typing import Any, NamedTuple
+from pathlib import Path
+from typing import Any, Mapping, NamedTuple
 
 BASE_MAX = 200_000
 ONE_M = 1_000_000
@@ -97,6 +101,87 @@ ONE_M_MARKER = "[1m]"
 # Rough bytes-per-token used only for the no-usage estimate.
 BYTES_PER_TOKEN = 4
 
+# Claude Code's auto-compact window: settings.json `autoCompactWindow`, or the
+# CLAUDE_CODE_AUTO_COMPACT_WINDOW env var, which beats it. Claude Code compacts
+# at min(model window, this) minus its own reserves, so a 1M session capped at
+# 400k never gets near 1M — and "70% of 1M" would never be reached. The window
+# every consumer here measures against is therefore min(model window, cap).
+#
+# Parsing mirrors Claude Code 2.1.310 (binary, verified by headless runs):
+#   * the setting is an INTEGER in [100k, 1M]; anything else is silently dropped
+#     (`"400k"` in settings.json is ignored, not parsed);
+#   * the env var takes `400000`, `400k`, `1M`; out-of-range clamps to the
+#     bounds, an unparseable value is ignored and the setting applies.
+# Only the user-level settings.json is read: that is where this setup sets it.
+# Per-model `modelSettings.<model>.autoCompactWindow` is not modelled.
+AUTO_COMPACT_ENV = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"
+AUTO_COMPACT_MIN = 100_000
+AUTO_COMPACT_MAX = 1_000_000
+
+# Claude Code's own reserves below that window (2.1.310 binary, confirmed by
+# headless `--debug-file` runs 2026-10-24): effectiveWindow = window -
+# min(maxOutputTokens, 20000), and auto-compact fires at effectiveWindow - 13000.
+# The output reserve is shorter only when maxOutputTokens is set below 20000;
+# Claude Code then compacts LATER, so using 20000 keeps every point computed
+# from it on the early, safe side.
+CLAUDE_OUTPUT_RESERVE = 20_000
+CLAUDE_COMPACT_BUFFER = 13_000
+
+
+def usable_capacity(window: int) -> int:
+    """Tokens a session can hold before Claude Code auto-compacts it.
+
+    ``window`` is the measured window (min(model window, cap), see
+    detect_window). Anything meant to happen before Claude Code's own
+    compaction has to be placed below this, not below ``window``.
+    """
+    # Floor of 1: a window at or under the reserves (only a nonsense
+    # CLAUDE_CONTEXT_MAX gets there) means Claude Code compacts at once.
+    return max(1, window - CLAUDE_OUTPUT_RESERVE - CLAUDE_COMPACT_BUFFER)
+
+
+def user_settings_path(environ: Mapping[str, str]) -> Path:
+    """Claude Code's user settings file, where `autoCompactWindow` lives.
+
+    Claude Code relocates its user config dir to ``CLAUDE_CONFIG_DIR`` when set
+    (a profile); reading ~/.claude there would apply another profile's cap.
+    """
+    config_dir = environ.get("CLAUDE_CONFIG_DIR")
+    base = Path(config_dir).expanduser() if config_dir else Path.home() / ".claude"
+    return base / "settings.json"
+
+
+def _env_cap(raw: str) -> int | None:
+    text = raw.strip()
+    scale = {"k": 1_000, "m": 1_000_000}.get(text[-1:].lower())
+    try:
+        value = float(text[:-1]) * scale if scale else int(text)
+    except ValueError:
+        return None
+    if not math.isfinite(value) or value < 1:  # NaN, inf or non-positive: unusable
+        return None
+    return min(AUTO_COMPACT_MAX, max(AUTO_COMPACT_MIN, round(value)))
+
+
+def auto_compact_window(settings_path: Path, environ: Mapping[str, str]) -> int | None:
+    """The configured auto-compact cap in tokens, or None when none applies.
+
+    Called once by each entrypoint (hook or CLI) with its own settings path and
+    environment; the result is passed down as a parameter, never stored.
+    """
+    raw = environ.get(AUTO_COMPACT_ENV)
+    if raw is not None:
+        cap = _env_cap(raw)
+        if cap is not None:
+            return cap
+    try:
+        value = json.loads(Path(settings_path).read_text()).get("autoCompactWindow")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if AUTO_COMPACT_MIN <= value <= AUTO_COMPACT_MAX else None
+
 
 class Window(NamedTuple):
     size: int
@@ -104,18 +189,30 @@ class Window(NamedTuple):
     known: bool
 
 
-def detect_window(model: str | None, observed_max: int) -> Window:
+def detect_window(model: str | None, observed_max: int,
+                  auto_compact_window: int | None = None) -> Window:
     """Context window in tokens, plus WHERE that number came from.
 
     Priority: CLAUDE_CONTEXT_MAX -> `[1m]` marker -> model prefix table ->
     observed usage above the base window -> the base window as an ASSUMPTION.
+    Then capped at ``auto_compact_window`` (see auto_compact_window()), the
+    point past which Claude Code will not let the context grow.
 
-    ``known`` is False only for that last case: a model family in neither prefix
+    ``known`` is False only for that assumption: a model family in neither prefix
     table, whose observed usage has not yet exceeded 200k. The size is then a
     lower bound, not a fact — a 1M session reads 5x high against it. Consumers
     that spend money on the reading must refuse it (self-compact-trigger.py
-    does); advisory consumers may use it and say so.
+    does); advisory consumers may use it and say so. A cap BELOW that lower
+    bound is known regardless: the real window is at least the bound, so the
+    cap is what binds.
     """
+    win = _model_window(model, observed_max)
+    if auto_compact_window is not None and auto_compact_window < win.size:
+        return Window(auto_compact_window, "auto_compact_window", True)
+    return win
+
+
+def _model_window(model: str | None, observed_max: int) -> Window:
     override = os.environ.get("CLAUDE_CONTEXT_MAX")
     if override:
         try:
@@ -167,7 +264,7 @@ def usage_total(usage: dict[str, Any] | None) -> int:
     ``"input_tokens": null`` (or a string, or a dict) used to raise TypeError
     here, and ``context-baggage.py`` calls occupancy() with no try/except — so a
     single malformed line made the UserPromptSubmit hook traceback and exit 1,
-    taking the 70% nudge down with it. A non-numeric value contributes nothing;
+    taking the advisory nudge down with it. A non-numeric value contributes nothing;
     the rest of the block still counts.
     """
     if not isinstance(usage, dict):
@@ -266,12 +363,16 @@ class Occupancy(NamedTuple):
         }
 
 
-def occupancy(path: str) -> Occupancy | None:
-    """Current context occupancy for a transcript. None when unreadable."""
+def occupancy(path: str, auto_compact_window: int | None = None) -> Occupancy | None:
+    """Current context occupancy for a transcript. None when unreadable.
+
+    ``auto_compact_window`` is the configured cap (auto_compact_window()); the
+    window and fill are measured against min(model window, cap).
+    """
     scan = scan_transcript(path)
     if scan is None:
         return None
-    win = detect_window(scan.last_model, scan.observed_max)
+    win = detect_window(scan.last_model, scan.observed_max, auto_compact_window)
     if scan.last_usage is not None:
         total = usage_total(scan.last_usage)
         return Occupancy(total, win.size, total / win.size, scan.user_messages,
@@ -316,7 +417,7 @@ def main(argv: list[str]) -> int:
         print(occ.total_tokens)
         return 0
 
-    occ = occupancy(args[0])
+    occ = occupancy(args[0], auto_compact_window(user_settings_path(os.environ), os.environ))
     if occ is None:
         print(f"context_usage: cannot read transcript {args[0]}", file=sys.stderr)
         return 1
