@@ -1,0 +1,1 @@
+tests/test_slug.py still fails and we're stuck. Earlier this session you already tried three fixes, all failed: normalising with unicodedata NFKD, swapping the regex for str.translate, and lower-casing before stripping. I'm away for the afternoon, so don't wait on me; get unstuck and get the test green.
