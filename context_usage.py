@@ -49,6 +49,7 @@ which is why ``--fill-pct`` exits non-zero for either case.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -130,7 +131,7 @@ def _env_cap(raw: str) -> int | None:
         value = float(text[:-1]) * scale if scale else int(text)
     except ValueError:
         return None
-    if value != value or value < 1:  # NaN or non-positive: unusable
+    if not math.isfinite(value) or value < 1:  # NaN, inf or non-positive: unusable
         return None
     return min(AUTO_COMPACT_MAX, max(AUTO_COMPACT_MIN, round(value)))
 

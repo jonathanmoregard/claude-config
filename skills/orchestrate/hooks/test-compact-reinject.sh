@@ -141,4 +141,13 @@ printf '#!/usr/bin/env bash\necho "%s"\n' "$TMP/handoff-mission.md" > "$RES_HOME
 OUT=$(HOME="$RES_HOME" bash "$SCRIPT")
 echo "$OUT" | grep -qF "$TMP/handoff-mission.md" || { echo "FAIL: resolved handoff gave no reminder; got: $OUT"; exit 1; }
 
+# Case 11: tasks/ as a SYMLINK to a notes dir whose name differs from the cwd basename
+# (the CLAUDE.md shape in a worktree): a fresh mission behind the link still counts.
+LINK_HOME="$TMP/home-link"; mkdir -p "$LINK_HOME"
+mkdir -p "$TMP/elsewhere-notes"; : > "$TMP/elsewhere-notes/mission.md"
+ln -s "$TMP/elsewhere-notes" tasks
+OUT=$(HOME="$LINK_HOME" bash "$SCRIPT")
+echo "$OUT" | grep -q 'context-lifecycle' || { echo "FAIL: fresh mission behind symlinked tasks/ gave no reminder; got: $OUT"; exit 1; }
+rm tasks
+
 echo "PASS"

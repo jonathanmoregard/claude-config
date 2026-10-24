@@ -40,7 +40,7 @@ for _d in "tasks" "$NOTES_USERSPACE"; do
   # the authoritative handoff lives outside the repo — so this must never be read
   # as content, only counted.
   if [[ -z "$NOTES" ]] && compgen -G "$_d/mission*.md" >/dev/null 2>&1; then NOTES="$_d"; fi
-  if [[ -z "$LIVE_NOTES" && -n "$(find "$_d" -maxdepth 1 -name 'mission*.md' -mmin "-$MISSION_FRESH_MINUTES" -print -quit 2>/dev/null)" ]]; then
+  if [[ -z "$LIVE_NOTES" && -n "$(find -H "$_d" -maxdepth 1 -name 'mission*.md' -mmin "-$MISSION_FRESH_MINUTES" -print -quit 2>/dev/null)" ]]; then
     LIVE_NOTES="$_d"
   fi
 done

@@ -103,7 +103,7 @@ def test_env_beats_settings(tmp_path, raw, expected):
     assert context_usage.auto_compact_window(path, env) == expected
 
 
-@pytest.mark.parametrize("raw", ["junk", "", "0"])
+@pytest.mark.parametrize("raw", ["junk", "", "0", "infk", "1e999k", "nanm"])
 def test_unusable_env_falls_back_to_settings(tmp_path, raw):
     path = write_settings(tmp_path, {"autoCompactWindow": 400_000})
     env = {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": raw}
