@@ -9,7 +9,9 @@ Protocol: MCP 2024-11-05 over stdio, JSON-RPC 2.0 line-delimited.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
+import fcntl
 import json
 import os
 import re
@@ -23,7 +25,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 from urllib.parse import quote, urlparse
 from uuid import uuid4
 
@@ -83,7 +85,7 @@ class _WatchRegistry:
             if old is not None:
                 _terminate_process_group(old.proc)
                 del self._entries[key]
-            _write_watch_status(status_root, status_path, watching)
+            _claim_watch_status(status_root, status_path, watching)
             try:
                 proc = subprocess.Popen(
                     argv,
@@ -101,7 +103,7 @@ class _WatchRegistry:
                     1,
                     f"wait-for: could not start host watch: {type(exc).__name__}",
                 )
-                _write_watch_status(status_root, status_path, failed)
+                _publish_watch_result(status_root, status_path, failed)
                 raise RuntimeError("could not start host wait-for watcher") from exc
             record = _WatchRecord(
                 proc, generation, status_root, status_path, dict(watching)
@@ -126,7 +128,7 @@ class _WatchRegistry:
         with self._lock:
             if self._entries.get(key) is not record:
                 return
-            _write_watch_status(
+            _publish_watch_result(
                 record.status_root,
                 record.status_path,
                 _finished_watch_status(record.watching, record.proc.returncode, line),
@@ -144,7 +146,7 @@ class _WatchRegistry:
         )
         for record in records:
             _terminate_process_group(record.proc)
-            _write_watch_status(
+            _publish_watch_result(
                 record.status_root,
                 record.status_path,
                 _finished_watch_status(record.watching, 1, line),
@@ -1262,8 +1264,44 @@ def _ensure_owned_watch_directory(root: Path, directory: Path) -> None:
         raise RuntimeError("watch status directory traverses a symlink")
 
 
-def _write_watch_status(root: Path, path: Path, data: dict[str, Any]) -> None:
+@contextmanager
+def _locked_watch_status(root: Path, path: Path) -> Iterator[None]:
+    """Hold the lock every broker process takes before writing ``path``."""
     _ensure_owned_watch_directory(root, path.parent)
+    fd = os.open(
+        path.with_name(f".{path.name}.lock"),
+        os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o600,
+    )
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _claim_watch_status(root: Path, path: Path, watching: dict[str, Any]) -> None:
+    """Record a newly started watch; the newest start always owns the file."""
+    with _locked_watch_status(root, path):
+        _replace_watch_status(path, watching)
+
+
+def _publish_watch_result(root: Path, path: Path, result: dict[str, Any]) -> None:
+    """Publish a watch result only while the file still names that watch.
+
+    A watch replaced by a later start, in this or any other broker process,
+    has its result dropped, so the file never regresses to an older watch.
+    """
+    with _locked_watch_status(root, path):
+        try:
+            current = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if isinstance(current, dict) and current.get("watch_id") == result["watch_id"]:
+            _replace_watch_status(path, result)
+
+
+def _replace_watch_status(path: Path, data: dict[str, Any]) -> None:
     temp_name: str | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -3092,17 +3130,19 @@ def _compose_output(rc: int, stdout: str, stderr: str) -> str:
 
 
 def _auxiliary_git_argv(
-    worktree: Path, policy: dict, *subcommand: str
+    worktree: Path, policy: dict, *subcommand: str, git_dir: Path | None = None
 ) -> list[str]:
-    """Build fixed local Git argv for a broker-owned prerequisite step."""
+    """Build fixed local Git argv for a broker-owned prerequisite step.
+
+    With ``git_dir`` the repository is named explicitly and never discovered
+    from ``worktree``, so a ``.git`` planted in the worktree is not read.
+    """
     git = _resolve_required_executable(policy, "gitExecutable")
-    return [
-        git,
-        *_fixed_git_config(policy),
-        "-C",
-        str(worktree),
-        *subcommand,
-    ]
+    if git_dir is None:
+        location = ["-C", str(worktree)]
+    else:
+        location = [f"--git-dir={git_dir}", f"--work-tree={worktree}"]
+    return [git, *_fixed_git_config(policy), *location, *subcommand]
 
 
 def _run_contained_git_step(
@@ -3283,25 +3323,23 @@ def _run_worktree_remove_backup(
     request: dict,
     identity: _GitIdentity,
     policy: dict,
+    admin_dir: Path,
     rec: Optional[_InFlight],
     bind_fds: list[int],
 ) -> tuple[int, str, str, bool]:
     """Back up tracked and untracked changes visible to Git's stash machinery."""
     target = request["worktree_path"]
-    admin_dir = _trusted_worktree_admin_dir(identity, target)
     message = f"git-broker worktree_remove backup: {target}"
-    git = _resolve_required_executable(policy, "gitExecutable")
-    stash_argv = [
-        git,
-        *_fixed_git_config(policy),
-        f"--git-dir={admin_dir}",
-        f"--work-tree={target}",
+    stash_argv = _auxiliary_git_argv(
+        target,
+        policy,
         "stash",
         "push",
         "--include-untracked",
         "--message",
         message,
-    ]
+        git_dir=admin_dir,
+    )
     rc, stdout, stderr = _run_contained_git_step(
         request, identity, policy, stash_argv, rec, bind_fds
     )
@@ -3318,13 +3356,16 @@ def _check_index_flags(
     policy: dict,
     rec: Optional[_InFlight],
     bind_fds: list[int],
+    git_dir: Path | None = None,
 ) -> tuple[int, str, str]:
     """Refuse paths whose edits git stash cannot see.
 
     assume-unchanged and skip-worktree hide working-tree edits from stash, so
     a backup taken before an overwrite would silently miss them.
     """
-    argv = _auxiliary_git_argv(worktree, policy, "ls-files", "-v", "-z", "--", *paths)
+    argv = _auxiliary_git_argv(
+        worktree, policy, "ls-files", "-v", "-z", "--", *paths, git_dir=git_dir
+    )
     rc, stdout, stderr = _run_contained_git_step(
         request, identity, policy, argv, rec, bind_fds
     )
@@ -3354,6 +3395,7 @@ def _check_worktree_remove_ignored(
     request: dict,
     identity: _GitIdentity,
     policy: dict,
+    admin_dir: Path,
     rec: Optional[_InFlight],
     bind_fds: list[int],
 ) -> tuple[int, str, str]:
@@ -3366,6 +3408,7 @@ def _check_worktree_remove_ignored(
         "--ignored",
         "--untracked-files=all",
         "-z",
+        git_dir=admin_dir,
     )
     rc, stdout, stderr = _run_contained_git_step(
         request, identity, policy, status_argv, rec, bind_fds
@@ -3788,20 +3831,23 @@ def _tool_git(args: dict, rec: Optional[_InFlight] = None) -> str:
     try:
         backup_note = ""
         if operation == "worktree_remove":
+            # Validated before any Git command touches the target, and every
+            # prerequisite names this trusted repository explicitly.
+            admin_dir = _trusted_worktree_admin_dir(identity, request["worktree_path"])
             rc, stdout, stderr = _check_worktree_remove_ignored(
-                request, identity, policy, rec, bind_fds
+                request, identity, policy, admin_dir, rec, bind_fds
             )
             if rc != 0:
                 return _compose_output(rc, stdout, stderr)
             rc, stdout, stderr = _check_index_flags(
                 "worktree_remove", request["worktree_path"], [],
-                request, identity, policy, rec, bind_fds,
+                request, identity, policy, rec, bind_fds, git_dir=admin_dir,
             )
             if rc != 0:
                 return _compose_output(rc, stdout, stderr)
         if operation == "worktree_remove" and request["force"]:
             rc, stdout, stderr, backup_created = _run_worktree_remove_backup(
-                request, identity, policy, rec, bind_fds
+                request, identity, policy, admin_dir, rec, bind_fds
             )
             if rc != 0:
                 return _compose_output(rc, stdout, stderr)
