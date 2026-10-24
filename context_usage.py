@@ -6,7 +6,7 @@ there are now three consumers and a fourth copy of the window-detection table
 is how this stopped working the last time (the prefix list went stale and the
 nudge reported 89% full during a session at 18% of a 1M window):
 
-  * ``context-baggage.py``       UserPromptSubmit nudge at 80% — advisory, human-facing.
+  * ``context-baggage.py``       UserPromptSubmit nudge at 90% — advisory, human-facing.
   * ``self-compact-trigger.py``  Stop-hook self-compact trigger at 30% — autonomous.
   * ``scripts/idle-handoff.sh``  re-measures a self-compact request against the
                                  transcript before it widens its idle gate, via
@@ -237,7 +237,7 @@ def usage_total(usage: dict[str, Any] | None) -> int:
     ``"input_tokens": null`` (or a string, or a dict) used to raise TypeError
     here, and ``context-baggage.py`` calls occupancy() with no try/except — so a
     single malformed line made the UserPromptSubmit hook traceback and exit 1,
-    taking the 80% nudge down with it. A non-numeric value contributes nothing;
+    taking the 90% nudge down with it. A non-numeric value contributes nothing;
     the rest of the block still counts.
     """
     if not isinstance(usage, dict):

@@ -150,10 +150,10 @@ def run_hook(script: str, payload: dict, home: Path, env_extra: dict | None = No
 
 def test_nudge_fires_at_threshold_of_the_capped_window(tmp_path):
     write_settings(tmp_path, {"autoCompactWindow": 400_000})
-    t = write_transcript(tmp_path / "t.jsonl", "claude-opus-5[1m]", 330_000)
+    t = write_transcript(tmp_path / "t.jsonl", "claude-opus-5[1m]", 370_000)
     out = run_hook("context-baggage.py", {"transcript_path": str(t)}, tmp_path)
     assert out.returncode == 0, out.stderr
-    assert "Context is 82% full" in out.stdout
+    assert "Context is 92% full" in out.stdout
     assert "window: 400k" in out.stdout
 
 

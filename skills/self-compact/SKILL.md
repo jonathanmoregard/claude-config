@@ -107,7 +107,7 @@ the two happened; do not imply a reset that did not occur.
 ## Notes
 
 - **The threshold does not apply to a manual request.** The automatic path fires
-  at 300,000 tokens and re-measures that claim before acting. A person asking to
+  at 350,000 tokens and re-measures that claim before acting. A person asking to
   hand off asserts nothing about occupancy, so it is honoured at any size.
 - **It refuses rather than guesses.** The window is matched on the session's own
   pid via process ancestry, and re-verified immediately before every send —

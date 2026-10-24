@@ -2701,9 +2701,9 @@ sc_wait_marker() {
 }
 
 # ============================================================================
-# TEST 20: B1 — occupancy math lives in ONE place and keeps the 80% nudge
+# TEST 20: B1 — occupancy math lives in ONE place and keeps the 90% nudge
 # ============================================================================
-test_begin "TEST 20: B1 — shared context-occupancy module, 80% nudge preserved"
+test_begin "TEST 20: B1 — shared context-occupancy module, 90% nudge preserved"
 [[ -f "$SC_USAGE" ]] || fail "20: shared occupancy module missing at $SC_USAGE"
 B1_DIR="$(mktemp -d -t reflect-b1-XXXXXX)"
 
@@ -2744,12 +2744,12 @@ grep -q 'context_usage' "$WORKTREE/context-baggage.py" \
 [[ "$(grep -c 'ONE_M_MODEL_PREFIXES *= *(' "$WORKTREE/context-baggage.py")" == "0" ]] \
   || fail "20: context-baggage.py still defines its own window-detection table (copy-paste)"
 
-# Behavioural: the 80% nudge is a separate, still-wanted feature.
-mk_context_transcript "$B1_DIR/t70.jsonl" "claude-opus-5" 850000
+# Behavioural: the 90% nudge is a separate, still-wanted feature.
+mk_context_transcript "$B1_DIR/t70.jsonl" "claude-opus-5" 950000
 B1_OUT="$(jq -cn --arg tp "$B1_DIR/t70.jsonl" '{transcript_path:$tp}' \
   | uncapped python3 "$WORKTREE/context-baggage.py")" || fail "20: context-baggage.py rc!=0"
-grep -q 'Context is 85% full' <<<"$B1_OUT" \
-  || fail "20: 80% nudge stopped firing at 85% (out='$B1_OUT')"
+grep -q 'Context is 95% full' <<<"$B1_OUT" \
+  || fail "20: 90% nudge stopped firing at 95% (out='$B1_OUT')"
 # ...and it must send the human at a HUMAN-owned path. tasks/mission.md is a
 # machine-owned symlink to the copy of the out-of-repo handoff, so a write-through
 # would clobber the copy and the next mission run would overwrite the model's work.
@@ -2761,8 +2761,8 @@ fi
 B1_OUT31="$(jq -cn --arg tp "$B1_DIR/t1.jsonl" '{transcript_path:$tp}' \
   | uncapped python3 "$WORKTREE/context-baggage.py")" || fail "20: context-baggage.py rc!=0 at 31%"
 [[ -z "$B1_OUT31" ]] \
-  || fail "20: the 30% self-compact threshold leaked into the 80% nudge (out='$B1_OUT31')"
-info "one occupancy implementation; 1M/[1m]/observed/estimate all correct; 80% nudge intact"
+  || fail "20: the self-compact threshold leaked into the 90% nudge (out='$B1_OUT31')"
+info "one occupancy implementation; 1M/[1m]/observed/estimate all correct; 90% nudge intact"
 
 # ============================================================================
 # TEST 21: there is NO SWITCH, and no config file can turn the feature off
@@ -2801,7 +2801,7 @@ fi
 if grep -qE '^[^#]*components\.self_compact' "$WORKTREE/scripts/idle-handoff.sh"; then
   fail "21: idle-handoff.sh still reads components.self_compact"
 fi
-grep -qE '^FIRE_AT_TOKENS = 300_000$' "$SC_TRIGGER" \
+grep -qE '^FIRE_AT_TOKENS = 350_000$' "$SC_TRIGGER" \
   || fail "21: the fire point is not a hardcoded module constant in $SC_TRIGGER"
 grep -qE '^MAX_FIRES_PER_SESSION = [0-9]+$' "$SC_TRIGGER" \
   || fail "21: the per-session fire cap is not a hardcoded module constant"
@@ -2826,7 +2826,7 @@ for mode in absent malformed nokey normal; do
   done
   [[ -e "$SC_STATE_DIR/$B5_SID/request.json" ]] \
     || fail "21: config=$mode suppressed the trigger — no config shape may act as an off switch"
-  jq -e '.fire_at_tokens == 300000' "$SC_STATE_DIR/$B5_SID/request.json" >/dev/null \
+  jq -e '.fire_at_tokens == 350000' "$SC_STATE_DIR/$B5_SID/request.json" >/dev/null \
     || fail "21: config=$mode changed the recorded fire point ($(jq -r .fire_at_tokens "$SC_STATE_DIR/$B5_SID/request.json"))"
 done
 
@@ -2842,7 +2842,7 @@ for _ in $(seq 1 40); do
 done
 [[ -e "$SC_STATE_DIR/test-sid-b5-explicit-false/request.json" ]] \
   || fail "21: the trigger did not fire with a leftover self_compact block present — something in that block is still being read (the false switch, or the 0.99 threshold)"
-jq -e '.fire_at_tokens == 300000' "$SC_STATE_DIR/test-sid-b5-explicit-false/request.json" >/dev/null \
+jq -e '.fire_at_tokens == 350000' "$SC_STATE_DIR/test-sid-b5-explicit-false/request.json" >/dev/null \
   || fail "21: a leftover self_compact.threshold=0.99 was honoured — the fire point is still config-readable"
 info "no config shape (absent/malformed/nokey/normal/explicit-false) can disable it or move the threshold"
 
@@ -2935,7 +2935,7 @@ spawn_wait_quiescent 60 \
 
 # At/over threshold: fire.
 B2_SID="test-sid-b2-fire"
-mk_context_transcript "$B2_H/over.jsonl" "claude-opus-5" 310000 "$B2_CWD"
+mk_context_transcript "$B2_H/over.jsonl" "claude-opus-5" 360000 "$B2_CWD"
 t0=$(date +%s%N)
 rc=0
 B2_OUT="$(sc_fire "$B2_H" "$B2_SID" "$B2_CWD" "$B2_H/over.jsonl")" || rc=$?
@@ -2958,8 +2958,8 @@ sc_wait_marker "$B2_SID" || fail "22: the trigger produced no request marker or 
 
 B2_REQ="$SC_STATE_DIR/$B2_SID/request.json"
 [[ -f "$B2_REQ" ]] || fail "22: no persisted self-compact request marker at $B2_REQ"
-jq -e --arg c "$B2_CWD" '.cwd == $c and .window == 1000000 and .tokens == 310000
-                          and .fire_at_tokens == 300000 and (.requested_at_epoch|type) == "number"' \
+jq -e --arg c "$B2_CWD" '.cwd == $c and .window == 1000000 and .tokens == 360000
+                          and .fire_at_tokens == 350000 and (.requested_at_epoch|type) == "number"' \
   "$B2_REQ" >/dev/null || fail "22: request marker incomplete: $(cat "$B2_REQ")"
 jq -e '.fires == 1 and .armed == false' "$SC_STATE_DIR/$B2_SID/state.json" >/dev/null \
   || fail "22: state after one fire wrong: $(cat "$SC_STATE_DIR/$B2_SID/state.json")"
@@ -3000,14 +3000,14 @@ B6_TP="$B6_H/t.jsonl"
 
 sc_fires() { jq -r '.fires // 0' "$CLAUDE_SESSIONS_DIR/$B6_SID/state.json" 2>/dev/null || echo 0; }
 
-mk_context_transcript "$B6_TP" "claude-opus-5" 320000 "$B6_CWD"
+mk_context_transcript "$B6_TP" "claude-opus-5" 370000 "$B6_CWD"
 sc_fire "$B6_H" "$B6_SID" "$B6_CWD" "$B6_TP" >/dev/null || fail "23: first fire rc!=0"
 sc_wait_marker "$B6_SID" || fail "23: first fire produced no marker"
 (( $(sc_fires) == 1 )) || fail "23: first crossing recorded $(sc_fires) fires, expected 1"
 
 # Same crossing, three more Stop events: must be silent.
 for _ in 1 2 3; do
-  mk_context_transcript "$B6_TP" "claude-opus-5" 340000 "$B6_CWD"
+  mk_context_transcript "$B6_TP" "claude-opus-5" 390000 "$B6_CWD"
   sc_fire "$B6_H" "$B6_SID" "$B6_CWD" "$B6_TP" >/dev/null || fail "23: repeat fire rc!=0"
 done
 sleep 1.5
@@ -3100,7 +3100,7 @@ B7_SID="test-sid-b7-context"
 B7_PROJ="$B7_H/.claude/projects/-tmp-b7"
 mkdir -p "$B7_PROJ"
 B7_TP="$B7_PROJ/$B7_SID.jsonl"
-mk_context_transcript "$B7_TP" "claude-opus-5" 330000 "$B7_CWD" 25
+mk_context_transcript "$B7_TP" "claude-opus-5" 380000 "$B7_CWD" 25
 
 # Control: same shape, same idleness, same fresh handoff with a real ## Next —
 # everything EXCEPT a self-compact request. It is deliberately fork-ready, so if
@@ -3112,7 +3112,7 @@ assert_isolated_cwd "$B7_CTRL_CWD"
 mk_candidate_repo "$B7_CTRL_CWD" || fail "24: could not build control repo"
 B7_CTRL_PROJ="$B7_H/.claude/projects/-tmp-b7ctrl"
 mkdir -p "$B7_CTRL_PROJ"
-mk_context_transcript "$B7_CTRL_PROJ/$B7_CTRL_SID.jsonl" "claude-opus-5" 330000 "$B7_CTRL_CWD" 25
+mk_context_transcript "$B7_CTRL_PROJ/$B7_CTRL_SID.jsonl" "claude-opus-5" 380000 "$B7_CTRL_CWD" 25
 mk_mission_handoff "$B7_CTRL_SID" "$B7_CTRL_CWD" "$(cat "$SC_MISSION_FILE")" >/dev/null
 mk_mission_copy "$B7_CTRL_CWD/tasks" "$B7_CTRL_SID" "$(cat "$SC_MISSION_FILE")" >/dev/null
 ln -sfn "mission.$B7_CTRL_SID.md" "$B7_CTRL_CWD/tasks/mission.md"
@@ -3364,7 +3364,7 @@ B7L_SID="test-sid-b7-live"
 B7L_PROJ="$B7L_H/.claude/projects/-tmp-b7live"
 mkdir -p "$B7L_PROJ"
 B7L_TP="$B7L_PROJ/$B7L_SID.jsonl"
-mk_context_transcript "$B7L_TP" "claude-opus-5" 330000 "$B7L_CWD" 25
+mk_context_transcript "$B7L_TP" "claude-opus-5" 380000 "$B7L_CWD" 25
 
 counting_stub "$B7L_H/calls" "$SC_MISSION_FILE"
 sc_fire "$B7L_H" "$B7L_SID" "$B7L_CWD" "$B7L_TP" >/dev/null || fail "24b: Stop-hook fire rc!=0"
@@ -3486,7 +3486,7 @@ jq -e '.manual == true' "$MAN_MARKER" >/dev/null \
   || fail "24c: the operator's instructions were not recorded in the marker"
 # The measurement is recorded for the audit trail, and is deliberately BELOW the
 # gate — that is the whole point of the test.
-awk -v f="$(jq -r '.tokens' "$MAN_MARKER")" 'BEGIN{exit !(f+0 < 300000)}' \
+awk -v f="$(jq -r '.tokens' "$MAN_MARKER")" 'BEGIN{exit !(f+0 < 350000)}' \
   || fail "24c: fixture is not below the fire point, so it cannot show the gate is bypassed"
 
 sc_wait_marker "$MAN_SID" || fail "24c: --manual produced no request marker"
@@ -3556,8 +3556,8 @@ sc_plant_request() {
   # $1=sid $2=cwd $3=transcript
   mkdir -p "$SC_STATE_DIR/$1"
   jq -n --arg sid "$1" --arg cwd "$2" --arg tp "$3" --argjson now "$(date +%s)" \
-    '{session_id:$sid,cwd:$cwd,transcript_path:$tp,tokens:330000,window:1000000,
-      fill_pct:0.33,fire_at_tokens:300000,requested_at_epoch:$now}' \
+    '{session_id:$sid,cwd:$cwd,transcript_path:$tp,tokens:380000,window:1000000,
+      fill_pct:0.38,fire_at_tokens:350000,requested_at_epoch:$now}' \
     > "$SC_STATE_DIR/$1/request.json"
 }
 
@@ -3625,7 +3625,7 @@ commit_as_old "$B8_CWD" "tasks/mission.md" "tasks/mission.$B8_SID.md" \
 B8_PROJ="$B8_H/.claude/projects/-tmp-b8"
 mkdir -p "$B8_PROJ"
 B8_TP="$B8_PROJ/$B8_SID.jsonl"
-mk_context_transcript "$B8_TP" "claude-opus-5" 330000 "$B8_CWD" 25
+mk_context_transcript "$B8_TP" "claude-opus-5" 380000 "$B8_CWD" 25
 touch -d '2 minutes ago' "$B8_TP"
 sc_plant_request "$B8_SID" "$B8_CWD" "$B8_TP"
 
@@ -3688,7 +3688,7 @@ B9_SID="test-sid-b8-nopayload"
 B9_PROJ="$B9_H/.claude/projects/-tmp-b9"
 mkdir -p "$B9_PROJ"
 B9_TP="$B9_PROJ/$B9_SID.jsonl"
-mk_context_transcript "$B9_TP" "claude-opus-5" 330000 "$B9_CWD" 25
+mk_context_transcript "$B9_TP" "claude-opus-5" 380000 "$B9_CWD" 25
 touch -d '2 minutes ago' "$B9_TP"
 sc_plant_request "$B9_SID" "$B9_CWD" "$B9_TP"
 # Stub records argv but returns an EMPTY result, so mission mode writes no handoff.
@@ -3743,7 +3743,7 @@ BB_COPIES="$(ls "$BB_CWD/tasks" | grep -c '^mission\..*\.md$')"
 BB_PROJ="$BB_H/.claude/projects/-tmp-bb"
 mkdir -p "$BB_PROJ"
 BB_TP="$BB_PROJ/$BB_SID.jsonl"
-mk_context_transcript "$BB_TP" "claude-opus-5" 330000 "$BB_CWD" 25
+mk_context_transcript "$BB_TP" "claude-opus-5" 380000 "$BB_CWD" 25
 touch -d '2 minutes ago' "$BB_TP"
 sc_plant_request "$BB_SID" "$BB_CWD" "$BB_TP"
 combo_stub "$BB_ARGV" "$SC_MISSION_FILE"
@@ -3813,7 +3813,7 @@ F1_SID="test-sid-f1-planted"
 F1_PROJ="$F1_H/.claude/projects/-tmp-f1"
 mkdir -p "$F1_PROJ"
 F1_TP="$F1_PROJ/$F1_SID.jsonl"
-mk_context_transcript "$F1_TP" "claude-opus-5" 330000 "$F1_CWD" 25
+mk_context_transcript "$F1_TP" "claude-opus-5" 380000 "$F1_CWD" 25
 touch -d '2 minutes ago' "$F1_TP"
 sc_plant_request "$F1_SID" "$F1_CWD" "$F1_TP"
 # Records argv but returns an EMPTY result, so the mission write produces no
@@ -3874,7 +3874,7 @@ touch -d '30 minutes ago' "$F1B_PLANTED"
 F1B_PROJ="$F1B_H/.claude/projects/-tmp-f1b"
 mkdir -p "$F1B_PROJ"
 F1B_TP="$F1B_PROJ/$F1B_SID.jsonl"
-mk_context_transcript "$F1B_TP" "claude-opus-5" 330000 "$F1B_CWD" 25
+mk_context_transcript "$F1B_TP" "claude-opus-5" 380000 "$F1B_CWD" 25
 touch -d '2 minutes ago' "$F1B_TP"
 sc_plant_request "$F1B_SID" "$F1B_CWD" "$F1B_TP"
 combo_stub "$F1B_ARGV" "$SC_MISSION_FILE"
@@ -3920,11 +3920,11 @@ F2_DIR="$(mktemp -d -t reflect-f2-XXXXXX)"
 grep -q '"claude-fable-5"' "$SC_USAGE" \
   || fail "27: claude-fable-5 missing from context_usage.py's 1M prefix table"
 
-mk_context_transcript "$F2_DIR/fable.jsonl" "claude-fable-5" 310000
+mk_context_transcript "$F2_DIR/fable.jsonl" "claude-fable-5" 360000
 F2_J="$(uncapped python3 "$SC_USAGE" "$F2_DIR/fable.jsonl")" || fail "27: context_usage.py rc!=0"
 jq -e '.window == 1000000 and .window_known == true and .window_source == "prefix_1m"' <<<"$F2_J" >/dev/null \
   || fail "27: fable-5 must detect a 1M window (got $F2_J)"
-jq -e '.fill_pct > 0.3099 and .fill_pct < 0.3101' <<<"$F2_J" >/dev/null \
+jq -e '.fill_pct > 0.3599 and .fill_pct < 0.3601' <<<"$F2_J" >/dev/null \
   || fail "27: fable-5 fill against 1M is wrong (got $(jq -c .fill_pct <<<"$F2_J")) — a 200k denominator reads ~5x high"
 
 # Known-200k branch stays known (so the unknown branch below is narrow).
@@ -3951,22 +3951,22 @@ F2_H="$(sc_home)"
 F2_CWD="$(mktemp -d -t reflect-f2cwd-XXXXXX)"
 assert_isolated_cwd "$F2_CWD"
 counting_stub "$F2_H/calls" "$SC_MISSION_FILE"
-mk_context_transcript "$F2_H/fable.jsonl" "claude-fable-5" 310000 "$F2_CWD"
+mk_context_transcript "$F2_H/fable.jsonl" "claude-fable-5" 360000 "$F2_CWD"
 sc_fire "$F2_H" "test-sid-f2-fable" "$F2_CWD" "$F2_H/fable.jsonl" >/dev/null \
   || fail "27: fable-5 fire rc!=0"
 sc_wait_marker "test-sid-f2-fable" || fail "27: a 1M fable session at 31% did not fire"
 
 mk_context_transcript "$F2_H/unknown.jsonl" "claude-zeta-9-20991231" 61000 "$F2_CWD"
-mk_context_transcript "$F2_H/unknownbig.jsonl" "claude-zeta-9-20991231" 310000 "$F2_CWD"
+mk_context_transcript "$F2_H/unknownbig.jsonl" "claude-zeta-9-20991231" 360000 "$F2_CWD"
 sc_fire "$F2_H" "test-sid-f2-unknown" "$F2_CWD" "$F2_H/unknown.jsonl" >/dev/null \
   || fail "27: unknown-model fire rc!=0"
 sleep 0.5
 # An unfamiliar model name is no longer a reason to refuse. The fire point is an
 # absolute token count, so there is no denominator to guess at and nothing for a
-# stale prefix table to get wrong. 61000 tokens is below 300000, so this one does
+# stale prefix table to get wrong. 61000 tokens is below 350000, so this one does
 # not fire for the ordinary reason.
 [[ ! -e "$SC_STATE_DIR/test-sid-f2-unknown/request.json" ]] \
-  || fail "27: fired at 61k tokens, under the 300k fire point"
+  || fail "27: fired at 61k tokens, under the 350k fire point"
 sc_fire "$F2_H" "test-sid-f2-unknown-big" "$F2_CWD" "$F2_H/unknownbig.jsonl" >/dev/null \
   || fail "27: unknown-model big fire rc!=0"
 sc_wait_marker "test-sid-f2-unknown-big" \
@@ -4057,7 +4057,7 @@ F4_H="$(sc_home)"
 F4_CWD="$(mktemp -d -t reflect-f4cwd-XXXXXX)"
 assert_isolated_cwd "$F4_CWD"
 canonical_stub   # the precompact half parses the reply as reflection JSON
-mk_context_transcript "$F4_H/t.jsonl" "claude-opus-5" 320000 "$F4_CWD"
+mk_context_transcript "$F4_H/t.jsonl" "claude-opus-5" 370000 "$F4_CWD"
 
 f4_fire() {
   # $1=label $2=sid $3..=env assignments ("" for none)
@@ -4169,10 +4169,10 @@ F7_CONS_THR="$(grep -oP '^SELF_COMPACT_FIRE_AT_TOKENS="\K[0-9]+' "$WORKTREE/scri
 [[ -n "$F7_CONS_THR" ]] || fail "31: no hardcoded SELF_COMPACT_FIRE_AT_TOKENS in idle-handoff.sh"
 [[ "$F7_PROD_THR" == "$F7_CONS_THR" ]] \
   || fail "31: producer fires at $F7_PROD_THR tokens, consumer re-measures against $F7_CONS_THR"
-# 300k is 30% of a 1M window, which is the size this is for. Pinned so a silent
+# 350k is the user-chosen fire point (2026-10-24), under the 400k cap. Pinned so a silent
 # retune shows up as a test change.
-[[ "$F7_PROD_THR" == "300000" ]] \
-  || fail "31: the fire point is $F7_PROD_THR, not the intended 300000 (30% of 1M)"
+[[ "$F7_PROD_THR" == "350000" ]] \
+  || fail "31: the fire point is $F7_PROD_THR, not the intended 350000 (35% of 1M)"
 # Neither may read it from a file any more.
 if grep -q 'recursive-self-improvement' "$SC_TRIGGER"; then
   fail "31: the producer reads the RSI config again — the threshold is config-readable"
@@ -4242,7 +4242,7 @@ F5_SID="test-sid-f5-asyncenv"
 F5_PROJ="$F5_H/.claude/projects/-tmp-f5"
 mkdir -p "$F5_PROJ"
 F5_TP="$F5_PROJ/$F5_SID.jsonl"
-mk_context_transcript "$F5_TP" "claude-opus-5" 330000 "$F5_CWD" 25
+mk_context_transcript "$F5_TP" "claude-opus-5" 380000 "$F5_CWD" 25
 touch -d '2 minutes ago' "$F5_TP"
 sc_plant_request "$F5_SID" "$F5_CWD" "$F5_TP"
 # No payload on disk, so this candidate must take the mission-WRITE path — the
@@ -4281,7 +4281,7 @@ F8_PAYLOAD="$(mk_mission_handoff "$F8_SID" "$F8_CWD" "$(cat "$SC_MISSION_FILE")"
 F8_PROJ="$F8_H/.claude/projects/-tmp-f8"
 mkdir -p "$F8_PROJ"
 F8_TP="$F8_PROJ/$F8_SID.jsonl"
-mk_context_transcript "$F8_TP" "claude-opus-5" 330000 "$F8_CWD" 25
+mk_context_transcript "$F8_TP" "claude-opus-5" 380000 "$F8_CWD" 25
 touch -d '2 minutes ago' "$F8_TP"
 sc_plant_request "$F8_SID" "$F8_CWD" "$F8_TP"
 combo_stub "$F8_ARGV" "$SC_MISSION_FILE"
@@ -4330,9 +4330,9 @@ grep -qE 'fresh=[1-9]' <<<"$F8_TAIL" \
 # (c) usage_total raised TypeError on a null/non-numeric usage value, and
 #     context-baggage.py calls occupancy() with no try/except — so ONE malformed
 #     transcript line made the UserPromptSubmit hook traceback and exit 1,
-#     taking the 80% nudge down with it.
+#     taking the 90% nudge down with it.
 F8_BAD="$(mktemp -d -t reflect-f8bad-XXXXXX)"
-mk_context_transcript "$F8_BAD/t.jsonl" "claude-opus-5" 850000
+mk_context_transcript "$F8_BAD/t.jsonl" "claude-opus-5" 950000
 # Malformed lines AHEAD of the good one: null, string, list, and a null block.
 {
   printf '%s\n' '{"type":"assistant","message":{"role":"assistant","model":"claude-opus-5","usage":{"input_tokens":null,"cache_read_input_tokens":"lots","cache_creation_input_tokens":[1,2]}}}'
@@ -4345,13 +4345,13 @@ sys.path.insert(0, os.environ["WORKTREE"])
 import context_usage
 occ = context_usage.occupancy(sys.argv[1])
 assert occ is not None, "unreadable"
-assert occ.total_tokens == 850000, occ.total_tokens
+assert occ.total_tokens == 950000, occ.total_tokens
 PY
 F8_NUDGE="$(jq -cn --arg tp "$F8_BAD/mixed.jsonl" '{transcript_path:$tp}' \
   | uncapped python3 "$WORKTREE/context-baggage.py")" \
   || fail "33c: the UserPromptSubmit hook exited non-zero on a malformed transcript line"
-grep -q 'Context is 85% full' <<<"$F8_NUDGE" \
-  || fail "33c: the 80% nudge stopped working with a malformed line present (out='$F8_NUDGE')"
+grep -q 'Context is 95% full' <<<"$F8_NUDGE" \
+  || fail "33c: the 90% nudge stopped working with a malformed line present (out='$F8_NUDGE')"
 # A usage block that is ENTIRELY non-numeric contributes nothing rather than raising.
 python3 - <<'PY' || fail "33c: usage_total did not coerce a fully non-numeric block"
 import sys, os
@@ -4444,7 +4444,7 @@ mk_mission_handoff "$D6_SID" "$D6_CWD" "$(cat "$SC_MISSION_FILE")" >/dev/null
 D6_PROJ="$D6_H/.claude/projects/-tmp-d6"
 mkdir -p "$D6_PROJ"
 D6_TP="$D6_PROJ/$D6_SID.jsonl"
-mk_context_transcript "$D6_TP" "claude-opus-5" 330000 "$D6_CWD" 25
+mk_context_transcript "$D6_TP" "claude-opus-5" 380000 "$D6_CWD" 25
 touch -d '2 minutes ago' "$D6_TP"
 sc_plant_request "$D6_SID" "$D6_CWD" "$D6_TP"
 D6_ARGV="$D6_H/argv.txt"
@@ -4699,7 +4699,7 @@ R2_HANDOFF="$(mk_mission_handoff "$R2_SID" "$R2_CWD" "$(cat "$SC_MISSION_FILE")"
 R2_PROJ="$R2_H/.claude/projects/-tmp-r2"
 mkdir -p "$R2_PROJ"
 R2_TP="$R2_PROJ/$R2_SID.jsonl"
-mk_context_transcript "$R2_TP" "claude-opus-5" 330000 "$R2_CWD" 25
+mk_context_transcript "$R2_TP" "claude-opus-5" 380000 "$R2_CWD" 25
 combo_stub "$R2_ARGV" "$SC_MISSION_FILE"
 R2_LOG="$REFLECT_ROOT/idle-handoff-logs/handoff.log"
 
@@ -5058,7 +5058,7 @@ mk_mission_handoff "$S1_SID" "$S1_CWD" "$(cat "$SC_MISSION_FILE")" >/dev/null
 S1_PROJ="$S1_H/.claude/projects/-tmp-s1"
 mkdir -p "$S1_PROJ"
 S1_TP="$S1_PROJ/$S1_SID.jsonl"
-mk_context_transcript "$S1_TP" "claude-opus-5" 330000 "$S1_CWD" 25
+mk_context_transcript "$S1_TP" "claude-opus-5" 380000 "$S1_CWD" 25
 combo_stub "$S1_ARGV" "$SC_MISSION_FILE"
 S1_LOG="$REFLECT_ROOT/idle-handoff-logs/handoff.log"
 S1_FSDIR="$REFLECT_ROOT/idle-handoff-state/fork-settings"
@@ -5154,7 +5154,7 @@ mk_mission_handoff "$S3_SID" "$S3_CWD" "$(cat "$SC_MISSION_FILE")" >/dev/null
 S3_PROJ="$S3_H/.claude/projects/-tmp-s3"
 mkdir -p "$S3_PROJ"
 S3_TP="$S3_PROJ/$S3_SID.jsonl"
-mk_context_transcript "$S3_TP" "claude-opus-5" 330000 "$S3_CWD" 25
+mk_context_transcript "$S3_TP" "claude-opus-5" 380000 "$S3_CWD" 25
 combo_stub "$S3_ARGV" "$SC_MISSION_FILE"
 S3_LOG="$REFLECT_ROOT/idle-handoff-logs/handoff.log"
 
@@ -5219,7 +5219,7 @@ mk_mission_handoff "$S3_NOGIT_SID" "$S3_NOGIT_CWD" "$(cat "$SC_MISSION_FILE")" >
 S3_NOGIT_PROJ="$S3_H/.claude/projects/-tmp-s3-nogit"
 mkdir -p "$S3_NOGIT_PROJ"
 S3_NOGIT_TP="$S3_NOGIT_PROJ/$S3_NOGIT_SID.jsonl"
-mk_context_transcript "$S3_NOGIT_TP" "claude-opus-5" 330000 "$S3_NOGIT_CWD" 25
+mk_context_transcript "$S3_NOGIT_TP" "claude-opus-5" 380000 "$S3_NOGIT_CWD" 25
 touch -d '2 minutes ago' "$S3_NOGIT_TP"
 sc_plant_request "$S3_NOGIT_SID" "$S3_NOGIT_CWD" "$S3_NOGIT_TP"
 S3_LINES="$(wc -l < "$S3_LOG")"
@@ -5335,7 +5335,7 @@ t1_case() {
   combo_stub "$T1_ARGV" "$SC_MISSION_FILE"
   proj="$h/.claude/projects/-tmp-$sid"
   mkdir -p "$proj"
-  mk_context_transcript "$proj/$sid.jsonl" "claude-opus-5" 330000 "$T1_CWD_USED" "$nlines"
+  mk_context_transcript "$proj/$sid.jsonl" "claude-opus-5" 380000 "$T1_CWD_USED" "$nlines"
   mk_mission_handoff "$sid" "$T1_CWD_USED" "$(cat "$SC_MISSION_FILE")" >/dev/null
   sc_plant_request "$sid" "$T1_CWD_USED" "$proj/$sid.jsonl"
   # THE FIXTURE HAS TO BE FORK-READY, INCLUDING THE GIT GATE. `~/.claude` is a git repo
@@ -5458,7 +5458,7 @@ mk_mission_handoff "$T2_SID" "$T2_CWD" "$(cat "$SC_MISSION_FILE")" >/dev/null
 T2_PROJ="$T2_H/.claude/projects/-tmp-t2"
 mkdir -p "$T2_PROJ"
 T2_TP="$T2_PROJ/$T2_SID.jsonl"
-mk_context_transcript "$T2_TP" "claude-opus-5" 330000 "$T2_CWD" 25
+mk_context_transcript "$T2_TP" "claude-opus-5" 380000 "$T2_CWD" 25
 combo_stub "$T2_ARGV" "$SC_MISSION_FILE"
 T2_LOG="$REFLECT_ROOT/idle-handoff-logs/handoff.log"
 
@@ -5545,7 +5545,7 @@ mk_mission_handoff "$T3_SID" "$T3_CWD" "$(cat "$SC_MISSION_FILE")" >/dev/null
 T3_PROJ="$T3_H/.claude/projects/-tmp-t3"
 mkdir -p "$T3_PROJ"
 T3_TP="$T3_PROJ/$T3_SID.jsonl"
-mk_context_transcript "$T3_TP" "claude-opus-5" 330000 "$T3_CWD" 25
+mk_context_transcript "$T3_TP" "claude-opus-5" 380000 "$T3_CWD" 25
 combo_stub "$T3_ARGV" "$SC_MISSION_FILE"
 T3_LOG="$REFLECT_ROOT/idle-handoff-logs/handoff.log"
 
@@ -5753,7 +5753,7 @@ mk_mission_handoff "$T4_SID" "$T4_CWD" "$(cat "$SC_MISSION_FILE")" >/dev/null
 T4_PROJ="$T4_H/.claude/projects/-tmp-t4"
 mkdir -p "$T4_PROJ"
 T4_TP="$T4_PROJ/$T4_SID.jsonl"
-mk_context_transcript "$T4_TP" "claude-opus-5" 330000 "$T4_CWD" 25
+mk_context_transcript "$T4_TP" "claude-opus-5" 380000 "$T4_CWD" 25
 combo_stub "$T4_ARGV" "$SC_MISSION_FILE"
 T4_LOG="$REFLECT_ROOT/idle-handoff-logs/handoff.log"
 T4_LEDGER="$REFLECT_ROOT/idle-handoff-state/fork-ledger.log"
@@ -5846,7 +5846,7 @@ mk_mission_handoff "$T5A_SID" "$T5A_CWD" "$(cat "$SC_MISSION_FILE")" >/dev/null
 T5A_PROJ="$T5A_H/.claude/projects/-tmp-t5a"
 mkdir -p "$T5A_PROJ"
 T5A_TP="$T5A_PROJ/$T5A_SID.jsonl"
-mk_context_transcript "$T5A_TP" "claude-opus-5" 330000 "$T5A_CWD" 25
+mk_context_transcript "$T5A_TP" "claude-opus-5" 380000 "$T5A_CWD" 25
 touch -d '2 minutes ago' "$T5A_TP"
 combo_stub "$T5A_ARGV" "$SC_MISSION_FILE"
 sc_plant_request "$T5A_SID" "$T5A_CWD" "$T5A_TP"
@@ -5885,7 +5885,7 @@ mk_mission_handoff "$T5B_SID" "$T5B_PARENT" "$(cat "$SC_MISSION_FILE")" >/dev/nu
 T5B_PROJ="$T5B_H/.claude/projects/-tmp-t5b"
 mkdir -p "$T5B_PROJ"
 T5B_TP="$T5B_PROJ/$T5B_SID.jsonl"
-mk_context_transcript "$T5B_TP" "claude-opus-5" 330000 "$T5B_CWD" 25
+mk_context_transcript "$T5B_TP" "claude-opus-5" 380000 "$T5B_CWD" 25
 touch -d '2 minutes ago' "$T5B_TP"
 combo_stub "$T5B_ARGV" "$SC_MISSION_FILE"
 sc_plant_request "$T5B_SID" "$T5B_PARENT" "$T5B_TP"
@@ -5915,7 +5915,7 @@ T5C_CWD="$(mktemp -d -t reflect-t5ccwd-XXXXXX)"
 assert_isolated_cwd "$T5C_CWD"
 T5C_SID="test-sid-t5-marker-unwritable"
 T5C_TP="$T5C_H/t5c.jsonl"
-mk_context_transcript "$T5C_TP" "claude-opus-5" 330000 "$T5C_CWD" 25
+mk_context_transcript "$T5C_TP" "claude-opus-5" 380000 "$T5C_CWD" 25
 counting_stub "$T5C_H/calls" "$SC_MISSION_FILE"
 mkdir -p "$SC_STATE_DIR"
 # A DIRECTORY where the marker file must go: os.replace onto it fails, and only for
