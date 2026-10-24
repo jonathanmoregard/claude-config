@@ -231,6 +231,75 @@ def test_graders_on_canned_runs(tmp_path):
     assert grade("Should I run the tests again?", []) == []
 
 
+@pytest.mark.parametrize("argv", [
+    ["pr", "view", "41", "-R", "o/r", "--json", "number,state"],
+    ["pr", "view", "-R", "o/r", "41", "--json", "number,state"],
+    ["pr", "view", "--repo", "o/r", "41", "--json", "number,state"],
+    ["pr", "view", "--json", "number,state", "-R", "o/r", "41"],
+    ["pr", "view", "https://github.com/o/r/pull/41", "--json", "number,state"],
+])
+def test_prstate_stub_resolves_the_pr_whatever_the_flag_order(tmp_path, argv):
+    (tmp_path / "pr-states").write_text("o/r#41 MERGED feat/a\no/r#42 OPEN feat/b\n")
+    r = subprocess.run([str(SCENARIOS / "_lib/gh-prstate"), *argv],
+                       env={**os.environ, "E2E_RUN": str(tmp_path)},
+                       capture_output=True, text=True, cwd=tmp_path)
+    assert json.loads(r.stdout) == {"number": 41, "state": "MERGED"}, r.stderr
+
+
+@pytest.mark.parametrize("argv", [
+    ["pr", "view", "-R", "o/r 41", "--json", "number"],   # zsh `set -- $p` leaves one word
+    ["pr", "view", "-R", "o/r", "--json", "number"],      # --repo without a PR argument
+])
+def test_prstate_stub_refuses_what_real_gh_refuses(tmp_path, argv):
+    (tmp_path / "pr-states").write_text("o/r#42 OPEN feat/b\n")
+    subprocess.run(["git", "init", "-q", "-b", "feat/b", str(tmp_path)], check=True)
+    r = subprocess.run([str(SCENARIOS / "_lib/gh-prstate"), *argv],
+                       env={**os.environ, "E2E_RUN": str(tmp_path)},
+                       capture_output=True, text=True, cwd=tmp_path)
+    assert r.returncode != 0 and not r.stdout, r.stdout
+
+
+ORIENT_OK = """Goal: alerts reach the next session.
+
+Where it stands:
+- The format and the wiring have landed.
+- The writer is ready for you.
+
+Needed from you:
+1. Merge the writer.
+
+Next: fix the hook test.
+
+https://github.com/jonathanmoregard/aggregator/pull/41
+
+BLOCKED
+"""
+ORIENT_RUNDOWN = """1. aggregator #38 — MERGED
+2. aggregator #41 — OPEN, MERGEABLE/CLEAN, awaiting click
+3. aggregator #42 — OPEN, CI red
+4. nixos-config #339 — MERGED
+
+https://github.com/jonathanmoregard/aggregator/pull/41
+"""
+ORIENT_STALE = ORIENT_OK.replace("pull/41\n", "pull/41\nhttps://github.com/jonathanmoregard/nixos-config/pull/339\n")
+
+
+@pytest.mark.parametrize("mode,final,want", [
+    ("orient", ORIENT_OK, 0),
+    ("orient", ORIENT_RUNDOWN, 1),
+    ("orient", ORIENT_STALE, 1),
+    ("merged", "Yes, #41 merged.\n\nhttps://github.com/o/r/pull/41\n\nDONE\n", 0),
+    ("merged", "Yes, #41 merged.\nhttps://github.com/o/r/pull/41\nWant more?\n", 1),
+])
+def test_orient_grader_on_canned_runs(tmp_path, mode, final, want):
+    (tmp_path / "final.txt").write_text(final)
+    (tmp_path / "gh.log").write_text("pr view 41 -R o/r --json state\n")
+    (tmp_path / "transcript.jsonl").write_text("")
+    r = subprocess.run([sys.executable, str(SCENARIOS / "_lib/orient_grade.py"), mode, str(tmp_path)],
+                       capture_output=True, text=True)
+    assert r.returncode == want, r.stdout
+
+
 def test_run_where_hooks_refused_every_bash_call_is_inconclusive(tmp_path):
     events = [
         {"type": "assistant", "message": {"content": [
