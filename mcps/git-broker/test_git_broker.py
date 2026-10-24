@@ -4,12 +4,17 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 from pathlib import Path
+import select
 import signal
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -49,6 +54,9 @@ def valid_policy() -> dict:
         "bubblewrapExecutable": "bwrap",
         "validatorExecutable": "dcg",
         "credentialHelperExecutable": "/etc/profiles/per-user/jonathan/bin/gh",
+        "githubCliExecutable": "/etc/profiles/per-user/jonathan/bin/gh",
+        "waitForExecutable": "/home/jonathan/.claude/scripts/wait-for",
+        "watchStatusDir": "%t/git-broker/watch",
         "githubHostTokenDir": "/home/jonathan/.cache/gh-tokens/host",
         "sshKnownHostsFile": "/home/jonathan/.ssh/known_hosts",
         "trustedHooksDir": "/home/jonathan/.config/git/hooks",
@@ -61,10 +69,10 @@ def valid_policy() -> dict:
 
 
 class ToolSurfaceTests(unittest.TestCase):
-    def test_dedicated_server_exposes_only_structured_git(self) -> None:
+    def test_dedicated_server_exposes_structured_git_and_github(self) -> None:
         server = load_server()
         self.assertEqual(server.SERVER_INFO["name"], "git-broker")
-        self.assertEqual([tool["name"] for tool in server.TOOLS], ["git"])
+        self.assertEqual([tool["name"] for tool in server.TOOLS], ["git", "github"])
         schema = server.TOOLS[0]["inputSchema"]
         self.assertEqual(schema["required"], ["repo_path", "operation"])
         self.assertEqual(
@@ -82,6 +90,36 @@ class ToolSurfaceTests(unittest.TestCase):
         self.assertNotIn("pr_merge", server._GIT_OPERATION_FIELDS)
         self.assertNotIn("command", schema["properties"])
         self.assertFalse(hasattr(server, "_tool_exec"))
+
+        github = server.TOOLS[1]["inputSchema"]
+        self.assertEqual(github["required"], ["repo_path", "operation"])
+        self.assertEqual(
+            set(github["properties"]),
+            {
+                "repo_path", "operation", "timeout", "kind", "number",
+                "timeout_s", "run_id", "failed_only", "branch", "ruleset_id",
+            },
+        )
+        self.assertFalse(github["additionalProperties"])
+
+    def test_dispatch_routes_both_tools_and_rejects_unknown(self) -> None:
+        server = load_server()
+        responses = []
+        with (
+            mock.patch.object(server, "_tool_git", return_value="git") as git,
+            mock.patch.object(server, "_tool_github", return_value="github") as github,
+            mock.patch.object(
+                server,
+                "_send_response",
+                side_effect=lambda *a, **k: responses.append((a, k)),
+            ),
+        ):
+            server._dispatch_tools_call(1, {"name": "git", "arguments": {}}, server._InFlight())
+            server._dispatch_tools_call(2, {"name": "github", "arguments": {}}, server._InFlight())
+            server._dispatch_tools_call(3, {"name": "exec", "arguments": {}}, server._InFlight())
+        git.assert_called_once()
+        github.assert_called_once()
+        self.assertEqual(responses[-1][1]["error"]["code"], -32601)
 
 
 class PolicySchemaTests(unittest.TestCase):
@@ -138,12 +176,38 @@ class PolicySchemaTests(unittest.TestCase):
             loaded["githubHostTokenDir"],
             Path(f"/run/user/{os.getuid()}/gh-host-token"),
         )
+        self.assertEqual(
+            loaded["watchStatusDir"],
+            Path(f"/run/user/{os.getuid()}/git-broker/watch"),
+        )
 
     def test_runtime_dir_token_must_be_a_whole_path_component(self) -> None:
         policy = valid_policy()
         policy["githubHostTokenDir"] = "%tx/gh-host-token"
         with self.assertRaisesRegex(RuntimeError, "githubHostTokenDir"):
             self.server._load_git_policy({"gitBroker": policy})
+
+    def test_wait_for_executable_must_be_absolute(self) -> None:
+        policy = valid_policy()
+        policy["waitForExecutable"] = "wait-for"
+        with self.assertRaisesRegex(RuntimeError, "waitForExecutable"):
+            self.server._load_git_policy({"gitBroker": policy})
+
+    def test_real_policy_reaches_claude_and_nixos_worktree_roots(self) -> None:
+        policy = self.server._load_git_policy(self.server._load_config())
+        self.assertIn(Path("/home/jonathan/.claude"), policy["repositoryRoots"])
+        self.assertIn(
+            Path("/home/jonathan/Repos/nixos-config-worktrees"),
+            policy["worktreeCreationRoots"],
+        )
+
+        identity = self.server._discover_git_identity(
+            Path("/home/jonathan/.claude"), policy
+        )
+        self.assertEqual(identity.worktree, Path("/home/jonathan/.claude"))
+        self.server._authorize_git_operation(identity, "fetch", policy)
+        with self.assertRaisesRegex(RuntimeError, "protected primary"):
+            self.server._authorize_git_operation(identity, "commit", policy)
 
 
 class RequestSchemaTests(unittest.TestCase):
@@ -197,6 +261,14 @@ class RequestSchemaTests(unittest.TestCase):
             ):
                 self.validate(operation="commit", message=message)
 
+    def test_commit_all_is_strict_boolean_and_defaults_false(self) -> None:
+        self.assertFalse(self.validate(operation="commit", message="m")["all"])
+        self.assertTrue(
+            self.validate(operation="commit", message="m", all=True)["all"]
+        )
+        with self.assertRaisesRegex(RuntimeError, "all must be a boolean"):
+            self.validate(operation="commit", message="m", all="yes")
+
     def test_remote_operations_accept_only_origin(self) -> None:
         self.assertEqual(self.validate(operation="fetch")["remote"], "origin")
         self.assertEqual(self.validate(operation="push")["remote"], "origin")
@@ -216,6 +288,28 @@ class RequestSchemaTests(unittest.TestCase):
                 self.validate(operation="switch", branch=branch)
         with self.assertRaisesRegex(RuntimeError, "start_point"):
             self.validate(operation="switch", branch="main", start_point="origin/main")
+
+    def test_switch_force_create_and_detach_are_exclusive_modes(self) -> None:
+        forced = self.validate(
+            operation="switch",
+            branch="feat/reset",
+            force_create=True,
+            start_point="HEAD~1",
+        )
+        self.assertTrue(forced["force_create"])
+        detached = self.validate(
+            operation="switch", detach=True, start_point="HEAD~0"
+        )
+        self.assertTrue(detached["detach"])
+        for fields in (
+            {"branch": "x", "create": True, "force_create": True},
+            {"detach": True, "branch": "x"},
+            {"detach": True, "create": False},
+            {"detach": True, "force_create": False},
+            {"force_create": "yes", "branch": "x"},
+        ):
+            with self.subTest(fields=fields), self.assertRaises(RuntimeError):
+                self.validate(operation="switch", **fields)
 
     def test_worktree_add_requires_absolute_allowed_target(self) -> None:
         request = self.validate(
@@ -239,6 +333,34 @@ class RequestSchemaTests(unittest.TestCase):
                     operation="worktree_add",
                     worktree_path=target,
                     branch="feat/topic",
+                )
+
+    def test_worktree_add_modes_reject_conflicting_fields(self) -> None:
+        existing = self.validate(
+            operation="worktree_add",
+            worktree_path="/home/jonathan/worktrees/existing",
+            branch="feat/existing",
+            create=False,
+        )
+        self.assertFalse(existing["create"])
+        detached = self.validate(
+            operation="worktree_add",
+            worktree_path="/home/jonathan/worktrees/detached",
+            detach=True,
+            start_point="HEAD~0",
+        )
+        self.assertTrue(detached["detach"])
+        for fields in (
+            {"branch": "feat/x", "create": False, "start_point": "HEAD"},
+            {"detach": True, "branch": "feat/x"},
+            {"detach": True, "create": False},
+            {"detach": "yes"},
+        ):
+            with self.subTest(fields=fields), self.assertRaises(RuntimeError):
+                self.validate(
+                    operation="worktree_add",
+                    worktree_path="/home/jonathan/worktrees/new",
+                    **fields,
                 )
 
     def test_timeout_is_strict_not_coerced(self) -> None:
@@ -343,6 +465,642 @@ class RepositoryIdentityTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "symlink"):
             self.server._discover_git_identity(forged, self.policy)
+
+    def test_repository_root_does_not_authorize_external_git_metadata(self) -> None:
+        claude_root = Path(self.temp.name) / ".claude"
+        external = Path(self.temp.name) / "plugin-metadata"
+        checkout = claude_root / "plugins" / "example"
+        claude_root.mkdir()
+        subprocess.run(["git", "init", "-q", "--separate-git-dir", str(external), str(checkout)], check=True)
+        policy = valid_policy()
+        policy["repositoryRoots"] = [str(claude_root)]
+        policy["metadataRoots"] = [str(claude_root / ".git")]
+        policy["protectedWorktrees"] = [str(claude_root)]
+        policy["worktreeCreationRoots"] = [str(self.worktrees)]
+        loaded = self.server._load_git_policy({"gitBroker": policy})
+
+        with self.assertRaisesRegex(RuntimeError, "outside approved metadata roots"):
+            self.server._discover_git_identity(checkout, loaded)
+
+
+class GithubRequestTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server = load_server()
+        self.policy = self.server._load_git_policy({"gitBroker": valid_policy()})
+
+    def validate(self, operation: str, **fields):
+        return self.server._validate_github_request(
+            {
+                "repo_path": "/home/jonathan/Repos/example",
+                "operation": operation,
+                **fields,
+            },
+            self.policy,
+        )
+
+    def test_each_operation_accepts_only_its_declared_shape(self) -> None:
+        self.assertEqual(self.validate("watch", kind="pr", number=1)["timeout_s"], 3600)
+        self.assertEqual(self.validate("update_branch", number=2)["number"], 2)
+        self.assertFalse(self.validate("rerun", run_id=3)["failed_only"])
+        self.assertEqual(self.validate("repo_settings", kind="rulesets")["kind"], "rulesets")
+        self.assertEqual(
+            self.validate("repo_settings", kind="rulesets", ruleset_id=9)["ruleset_id"], 9
+        )
+        self.assertEqual(
+            self.validate("repo_settings", kind="branch_protection", branch="feat/x")["branch"],
+            "feat/x",
+        )
+        invalid = (
+            ("watch", {}),
+            ("watch", {"kind": "issue", "number": 1}),
+            ("watch", {"kind": "pr", "number": True}),
+            ("watch", {"kind": "run", "number": 1, "timeout_s": 59}),
+            ("update_branch", {}),
+            ("update_branch", {"number": 1, "failed_only": True}),
+            ("rerun", {"run_id": 0}),
+            ("rerun", {"run_id": 1, "failed_only": "yes"}),
+            ("repo_settings", {"kind": "rulesets", "branch": "main"}),
+            ("repo_settings", {"kind": "rulesets", "ruleset_id": 0}),
+            ("repo_settings", {"kind": "branch_rules"}),
+            ("repo_settings", {"kind": "branch_protection", "branch": "../main"}),
+            ("repo_settings", {"kind": "branch_rules", "branch": "main", "ruleset_id": 1}),
+        )
+        for operation, fields in invalid:
+            with self.subTest(operation=operation, fields=fields), self.assertRaises(RuntimeError):
+                self.validate(operation, **fields)
+
+    def test_timeout_and_base_fields_are_strict(self) -> None:
+        with self.assertRaises(RuntimeError):
+            self.server._validate_github_request({"operation": "rerun", "run_id": 1}, self.policy)
+        with self.assertRaises(RuntimeError):
+            self.validate("rerun", run_id=1, timeout=0)
+        with self.assertRaises(RuntimeError):
+            self.validate("rerun", run_id=1, url="https://example.test")
+
+    def test_watch_and_update_branch_accept_real_actions_sized_numbers(self) -> None:
+        number = 39_258_364_226
+        try:
+            watch = self.validate("watch", kind="run", number=number)
+            update = self.validate("update_branch", number=number)
+        except RuntimeError as exc:
+            self.fail(f"real GitHub-sized number was refused: {exc}")
+        self.assertEqual(watch["number"], number)
+        self.assertEqual(update["number"], number)
+        self.assertEqual(
+            self.server.TOOLS[1]["inputSchema"]["properties"]["number"]["maximum"],
+            10**12,
+        )
+        for operation, fields in (
+            ("watch", {"kind": "run", "number": 10**12 + 1}),
+            ("update_branch", {"number": 10**12 + 1}),
+        ):
+            with self.subTest(operation=operation), self.assertRaises(RuntimeError):
+                self.validate(operation, **fields)
+
+
+class GithubRepositoryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server = load_server()
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.repo = root / "Repos" / "project"
+        self.repo.parent.mkdir()
+        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
+        policy = valid_policy()
+        policy["repositoryRoots"] = [str(self.repo.parent)]
+        policy["metadataRoots"] = [str(self.repo.parent)]
+        policy["protectedWorktrees"] = [str(self.repo)]
+        self.policy = self.server._load_git_policy({"gitBroker": policy})
+        self.identity = self.server._discover_git_identity(self.repo, self.policy)
+
+    def set_origin(self, url: str) -> None:
+        subprocess.run(
+            ["git", "-C", str(self.repo), "remote", "remove", "origin"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(["git", "-C", str(self.repo), "remote", "add", "origin", url], check=True)
+
+    def test_repo_is_derived_from_validated_origin_and_lowercased(self) -> None:
+        for url in (
+            "https://github.com/Owner/Repo.Name.git",
+            "git@github.com:Owner/Repo.Name.git",
+        ):
+            with self.subTest(url=url):
+                self.set_origin(url)
+                self.assertEqual(
+                    self.server._github_repo_from_origin(self.identity, self.policy),
+                    "owner/repo.name",
+                )
+
+    def test_missing_non_github_and_dot_segment_origins_are_refused(self) -> None:
+        with self.assertRaises(RuntimeError):
+            self.server._github_repo_from_origin(self.identity, self.policy)
+        for url in (
+            "https://example.com/owner/repo.git",
+            "https://github.com/owner/...git",
+        ):
+            with self.subTest(url=url):
+                self.set_origin(url)
+                with self.assertRaises(RuntimeError):
+                    self.server._github_repo_from_origin(self.identity, self.policy)
+
+
+class GithubArgvAndExecutionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server = load_server()
+        self.identity = self.server._GitIdentity(
+            Path("/home/jonathan/Repos/example"),
+            Path("/home/jonathan/Repos/example/.git"),
+            Path("/home/jonathan/Repos/example/.git"),
+            False,
+        )
+
+    def run_case(self, fields: dict, expected: list[str]) -> None:
+        policy = valid_policy()
+        policy["githubCliExecutable"] = "/bin/true"
+        policy["validatorExecutable"] = "/bin/true"
+        seen_commands: list[str] = []
+        with (
+            mock.patch.object(self.server, "_load_config", return_value={"gitBroker": policy}),
+            mock.patch.object(self.server, "_discover_git_identity", return_value=self.identity),
+            mock.patch.object(self.server, "_github_repo_from_origin", return_value="owner/repo"),
+            mock.patch.object(
+                self.server,
+                "_resolve_required_executable",
+                side_effect=lambda _policy, key: f"/host/{key}",
+            ),
+            mock.patch.object(
+                self.server,
+                "_check_denied_by_dcg",
+                side_effect=lambda command, _path: seen_commands.append(command) or None,
+            ),
+            mock.patch.object(self.server, "_run_argv", return_value=(0, "ok\n", "")) as run,
+        ):
+            output = self.server._tool_github(
+                {"repo_path": str(self.identity.worktree), **fields}
+            )
+        self.assertIn("--- exit 0 ---", output)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv, ["/host/githubCliExecutable", *expected])
+        self.assertEqual(seen_commands, [self.server.shlex.join(argv)])
+        self.assertEqual(run.call_args.kwargs["cwd"], "/")
+
+    def test_exact_argv_for_every_non_watch_operation(self) -> None:
+        cases = (
+            ({"operation": "update_branch", "number": 12}, ["pr", "update-branch", "12", "-R", "owner/repo"]),
+            ({"operation": "rerun", "run_id": 34}, ["run", "rerun", "34", "-R", "owner/repo"]),
+            ({"operation": "rerun", "run_id": 34, "failed_only": True}, ["run", "rerun", "34", "--failed", "-R", "owner/repo"]),
+            ({"operation": "repo_settings", "kind": "rulesets"}, ["api", "--method", "GET", "repos/owner/repo/rulesets"]),
+            ({"operation": "repo_settings", "kind": "rulesets", "ruleset_id": 7}, ["api", "--method", "GET", "repos/owner/repo/rulesets/7"]),
+            ({"operation": "repo_settings", "kind": "branch_protection", "branch": "feat/x"}, ["api", "--method", "GET", "repos/owner/repo/branches/feat%2Fx/protection"]),
+            ({"operation": "repo_settings", "kind": "branch_rules", "branch": "feat/x"}, ["api", "--method", "GET", "repos/owner/repo/rules/branches/feat%2Fx"]),
+        )
+        for fields, expected in cases:
+            with self.subTest(fields=fields):
+                self.run_case(fields, expected)
+
+    def test_dcg_denial_stops_runner(self) -> None:
+        policy = valid_policy()
+        policy["githubCliExecutable"] = "/bin/true"
+        policy["validatorExecutable"] = "/bin/true"
+        with (
+            mock.patch.object(self.server, "_load_config", return_value={"gitBroker": policy}),
+            mock.patch.object(self.server, "_discover_git_identity", return_value=self.identity),
+            mock.patch.object(self.server, "_github_repo_from_origin", return_value="owner/repo"),
+            mock.patch.object(
+                self.server,
+                "_resolve_required_executable",
+                side_effect=lambda _policy, key: f"/host/{key}",
+            ),
+            mock.patch.object(self.server, "_check_denied_by_dcg", return_value="denied"),
+            mock.patch.object(self.server, "_run_argv") as run,
+        ):
+            output = self.server._tool_github(
+                {"repo_path": str(self.identity.worktree), "operation": "rerun", "run_id": 1}
+            )
+        self.assertIn("denied", output)
+        run.assert_not_called()
+
+
+class GithubWatcherTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server = load_server()
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.status_root = self.root / "status"
+        self.fast = self.make_waiter("final ghp_" + "A" * 40, 2)
+        self.slow = self.make_waiter("old result", 0, sleep=30)
+        self.policy = valid_policy()
+        self.policy["githubCliExecutable"] = sys.executable
+        self.policy["validatorExecutable"] = sys.executable
+        self.policy["waitForExecutable"] = str(self.fast)
+        self.policy["watchStatusDir"] = str(self.status_root)
+        self.identity = self.server._GitIdentity(
+            Path("/home/jonathan/Repos/example"),
+            Path("/home/jonathan/Repos/example/.git"),
+            Path("/home/jonathan/Repos/example/.git"),
+            False,
+        )
+        self.registry = self.server._WatchRegistry()
+        self.addCleanup(self.registry.shutdown)
+
+    def make_waiter(self, line: str, rc: int, *, sleep: int = 0) -> Path:
+        path = self.root / f"wait-{len(list(self.root.glob('wait-*')))}"
+        path.write_text(
+            "#!/bin/sh\n"
+            + (f"sleep {sleep}\n" if sleep else "")
+            + f"printf '%s\\n' {json.dumps(line)}\nexit {rc}\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o700)
+        return path
+
+    def make_released_waiter(self, line: str, release: Path) -> Path:
+        """A waiter that prints ``line`` and exits 0 once ``release`` exists."""
+        path = self.root / f"wait-{len(list(self.root.glob('wait-*')))}"
+        path.write_text(
+            "#!/bin/sh\n"
+            f"while [ ! -e {shlex.quote(str(release))} ]; do sleep 0.02; done\n"
+            f"printf '%s\\n' {shlex.quote(line)}\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o700)
+        return path
+
+    def raw_status(self, number: int = 1) -> dict:
+        path = self.status_root / "owner" / "repo" / f"pr-{number}.json"
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def wait_until_idle(self, registry) -> None:
+        deadline = time.monotonic() + 5
+        while registry._entries and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(registry._entries, "watch did not finish")
+
+    def two_instance_watches(self) -> tuple[object, Path, Path]:
+        """Start watch A in this broker, then watch B in a separate broker instance."""
+        other = load_server()
+        other_registry = other._WatchRegistry()
+        self.addCleanup(other_registry.shutdown)
+        release_a, release_b = self.root / "release-a", self.root / "release-b"
+        self.policy["waitForExecutable"] = str(self.make_released_waiter("A result", release_a))
+        self.watch()
+        self.policy["waitForExecutable"] = str(self.make_released_waiter("B result", release_b))
+        self.watch(server=other, registry=other_registry)
+        return other_registry, release_a, release_b
+
+    def test_older_watch_from_other_instance_cannot_overwrite_newer_watch(self) -> None:
+        other_registry, release_a, release_b = self.two_instance_watches()
+        b_id = self.raw_status()["watch_id"]
+
+        release_a.touch()
+        self.wait_until_idle(self.registry)
+        current = self.raw_status()
+        self.assertEqual(current["state"], "watching")
+        self.assertEqual(current["watch_id"], b_id)
+
+        release_b.touch()
+        self.wait_until_idle(other_registry)
+        current = self.raw_status()
+        self.assertEqual(current["state"], "done")
+        self.assertEqual(current["watch_id"], b_id)
+        self.assertEqual(current["line"], "B result")
+
+    def test_shutdown_cannot_overwrite_newer_watch_from_other_instance(self) -> None:
+        _other_registry, _release_a, _release_b = self.two_instance_watches()
+        b_id = self.raw_status()["watch_id"]
+
+        self.registry.shutdown()
+
+        current = self.raw_status()
+        self.assertEqual(current["state"], "watching")
+        self.assertEqual(current["watch_id"], b_id)
+
+    def watch(
+        self, number: int = 1, *, auth=(0, "10\n", ""), server=None, registry=None
+    ) -> str:
+        server = server or self.server
+        with (
+            mock.patch.object(
+                server, "_load_config", return_value={"gitBroker": self.policy}
+            ),
+            mock.patch.object(
+                server, "_discover_git_identity", return_value=self.identity
+            ),
+            mock.patch.object(
+                server, "_github_repo_from_origin", return_value="owner/repo"
+            ),
+            mock.patch.object(server, "_check_denied_by_dcg", return_value=None),
+            mock.patch.object(server, "_run_argv", return_value=auth),
+        ):
+            return server._tool_github(
+                {
+                    "repo_path": str(self.identity.worktree),
+                    "operation": "watch",
+                    "kind": "pr",
+                    "number": number,
+                    "timeout_s": 60,
+                },
+                registry=registry or self.registry,
+            )
+
+    def status(self, number: int = 1) -> dict:
+        path = self.status_root / "owner" / "repo" / f"pr-{number}.json"
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if data.get("state") == "done":
+                    return data
+            time.sleep(0.01)
+        self.fail(f"watch did not finish: {path}")
+
+    def test_watch_writes_watching_then_redacted_done_status(self) -> None:
+        output = self.watch()
+        self.assertIn(str(self.status_root / "owner" / "repo" / "pr-1.json"), output)
+        self.assertIn(
+            "~/.claude/scripts/wait-for pr 1 -R owner/repo",
+            output,
+        )
+        data = self.status()
+        self.assertEqual(data["exit"], 2)
+        self.assertIn("[REDACTED:github-token:", data["line"])
+        self.assertNotIn("ghp_", data["line"])
+        self.assertEqual(data["kind"], "pr")
+        self.assertEqual(data["repo"], "owner/repo")
+
+    def test_second_watch_replaces_first_and_old_thread_cannot_overwrite(self) -> None:
+        self.policy["waitForExecutable"] = str(self.slow)
+        self.watch()
+        old = next(iter(self.registry._entries.values())).proc
+        watching_path = self.status_root / "owner" / "repo" / "pr-1.json"
+        self.assertEqual(
+            json.loads(watching_path.read_text(encoding="utf-8"))["state"],
+            "watching",
+        )
+        self.policy["waitForExecutable"] = str(self.fast)
+        self.watch()
+        data = self.status()
+        self.assertIsNotNone(old.poll())
+        self.assertEqual(data["exit"], 2)
+        self.assertNotIn("old result", data["line"])
+
+    def test_watches_started_in_same_second_have_distinct_identities(self) -> None:
+        with mock.patch.object(self.server.time, "time", return_value=1_700_000_000):
+            self.watch()
+            first = self.status()
+            self.watch()
+            second = self.status()
+
+        self.assertIn("watch_id", first)
+        self.assertIn("watch_id", second)
+        self.assertNotEqual(first["watch_id"], second["watch_id"])
+        self.assertEqual(first["started_at"], second["started_at"])
+
+    def test_seventeenth_live_watch_is_refused(self) -> None:
+        self.policy["waitForExecutable"] = str(self.slow)
+        for number in range(1, 17):
+            self.watch(number)
+        with self.assertRaisesRegex(RuntimeError, "16"):
+            self.watch(17)
+
+    def test_shutdown_marks_live_watch_done(self) -> None:
+        self.policy["waitForExecutable"] = str(self.slow)
+        self.watch()
+        self.registry.shutdown()
+        self.registry.shutdown()
+        data = self.status()
+        self.assertEqual(data["exit"], 1)
+        self.assertEqual(
+            data["line"],
+            "wait-for: host watch stopped because the git broker exited; start a new watch",
+        )
+
+    def test_symlinked_status_component_is_refused(self) -> None:
+        self.status_root.mkdir()
+        (self.status_root / "owner").symlink_to(self.root)
+        with self.assertRaisesRegex(RuntimeError, "symlink"):
+            self.watch()
+        self.assertFalse(self.registry._entries)
+
+    def test_auth_precheck_failure_starts_nothing(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "GitHub auth|token"):
+            self.watch(auth=(1, "", "not logged in"))
+        self.assertFalse(self.registry._entries)
+        self.assertFalse((self.status_root / "owner" / "repo" / "pr-1.json").exists())
+
+    def test_watch_dcg_and_auth_runner_see_complete_exact_argv(self) -> None:
+        self.policy["waitForExecutable"] = str(self.slow)
+        commands: list[str] = []
+        with (
+            mock.patch.object(
+                self.server, "_load_config", return_value={"gitBroker": self.policy}
+            ),
+            mock.patch.object(
+                self.server, "_discover_git_identity", return_value=self.identity
+            ),
+            mock.patch.object(
+                self.server, "_github_repo_from_origin", return_value="owner/repo"
+            ),
+            mock.patch.object(
+                self.server,
+                "_check_denied_by_dcg",
+                side_effect=lambda command, _validator: commands.append(command) or None,
+            ),
+            mock.patch.object(
+                self.server, "_run_argv", return_value=(0, "10\n", "")
+            ) as run,
+        ):
+            self.server._tool_github(
+                {
+                    "repo_path": str(self.identity.worktree),
+                    "operation": "watch",
+                    "kind": "pr",
+                    "number": 7,
+                    "timeout_s": 60,
+                },
+                registry=self.registry,
+            )
+        expected_watch = [
+            str(self.slow.resolve()), "pr", "7", "-R", "owner/repo", "--timeout", "60"
+        ]
+        expected_auth = [
+            str(Path(sys.executable).resolve()),
+            "api", "--method", "GET", "rate_limit", "--jq", ".rate.remaining",
+        ]
+        self.assertEqual(commands, [self.server.shlex.join(expected_watch), self.server.shlex.join(expected_auth)])
+        self.assertEqual(run.call_args.args[0], expected_auth)
+
+
+class GithubWatcherSignalTests(unittest.TestCase):
+    def test_sigterm_finalizes_watch_and_terminates_child(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="git-broker-signal-") as td:
+            root = Path(td)
+            broker_dir = root / "mcps" / "git-broker"
+            broker_dir.mkdir(parents=True)
+            copied_server = broker_dir / "server.py"
+            shutil.copyfile(SERVER, copied_server)
+
+            repo = root / "repo"
+            subprocess.run(
+                ["git", "init", "-q", "-b", "main", str(repo)], check=True
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://github.com/Owner/Repo.git",
+                ],
+                check=True,
+            )
+
+            fake_gh = root / "fake-gh"
+            fake_gh.write_text("#!/bin/sh\nprintf '10\\n'\n", encoding="utf-8")
+            fake_gh.chmod(0o700)
+
+            watcher_pid_file = root / "watcher.pid"
+            fake_wait = root / "fake-wait-for"
+            fake_wait.write_text(
+                f"#!{sys.executable}\n"
+                "import os\n"
+                "from pathlib import Path\n"
+                "import time\n"
+                f"Path({str(watcher_pid_file)!r}).write_text(str(os.getpid()))\n"
+                "time.sleep(600)\n",
+                encoding="utf-8",
+            )
+            fake_wait.chmod(0o700)
+
+            fake_dcg = root / "fake-dcg"
+            fake_dcg.write_text(
+                f"#!{sys.executable}\n"
+                "import json\n"
+                "import sys\n"
+                "if len(sys.argv) > 1 and sys.argv[1] == 'config':\n"
+                "    print('- user: /tmp/dcg.toml [loaded; test]')\n"
+                "else:\n"
+                "    print(json.dumps({'hookSpecificOutput': "
+                "{'permissionDecision': 'allow'}}))\n",
+                encoding="utf-8",
+            )
+            fake_dcg.chmod(0o700)
+
+            status_root = root / "status"
+            policy = valid_policy()
+            policy.update(
+                {
+                    "repositoryRoots": [str(root)],
+                    "metadataRoots": [str(root)],
+                    "protectedWorktrees": [str(repo)],
+                    "worktreeCreationRoots": [str(root / "worktrees")],
+                    "gitExecutable": shutil.which("git") or "git",
+                    "bubblewrapExecutable": sys.executable,
+                    "validatorExecutable": str(fake_dcg),
+                    "credentialHelperExecutable": sys.executable,
+                    "githubCliExecutable": str(fake_gh),
+                    "waitForExecutable": str(fake_wait),
+                    "watchStatusDir": str(status_root),
+                    "githubHostTokenDir": str(root / "tokens"),
+                    "sshKnownHostsFile": str(root / "known_hosts"),
+                    "trustedHooksDir": str(root / "hooks"),
+                }
+            )
+            (broker_dir / "config.json").write_text(
+                json.dumps({"gitBroker": policy}), encoding="utf-8"
+            )
+
+            server_proc = subprocess.Popen(
+                [sys.executable, str(copied_server)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd="/",
+            )
+            watcher_pid: int | None = None
+            try:
+                request = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "github",
+                        "arguments": {
+                            "repo_path": str(repo),
+                            "operation": "watch",
+                            "kind": "pr",
+                            "number": 7,
+                            "timeout_s": 60,
+                        },
+                    },
+                }
+                assert server_proc.stdin is not None
+                server_proc.stdin.write(json.dumps(request) + "\n")
+                server_proc.stdin.flush()
+                assert server_proc.stdout is not None
+                ready, _unused_w, _unused_x = select.select(
+                    [server_proc.stdout], [], [], 10
+                )
+                self.assertTrue(ready, "broker did not answer the MCP watch request")
+                response = json.loads(server_proc.stdout.readline())
+                self.assertNotIn("isError", response["result"])
+
+                status_path = status_root / "owner" / "repo" / "pr-7.json"
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    if watcher_pid_file.exists() and status_path.exists():
+                        watcher_pid = int(watcher_pid_file.read_text(encoding="utf-8"))
+                        if json.loads(status_path.read_text(encoding="utf-8"))["state"] == "watching":
+                            break
+                    time.sleep(0.01)
+                else:
+                    self.fail("watcher did not reach the watching state")
+
+                server_proc.send_signal(signal.SIGTERM)
+                returncode = server_proc.wait(timeout=10)
+                status = json.loads(status_path.read_text(encoding="utf-8"))
+                child_is_alive = True
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(watcher_pid, 0)
+                    except ProcessLookupError:
+                        child_is_alive = False
+                        break
+                    time.sleep(0.01)
+            finally:
+                if server_proc.poll() is None:
+                    server_proc.terminate()
+                    server_proc.wait(timeout=5)
+                if watcher_pid is not None:
+                    try:
+                        os.kill(watcher_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass  # arftl-allow: swallowed-exception watcher may already be gone
+                for stream in (
+                    server_proc.stdin,
+                    server_proc.stdout,
+                    server_proc.stderr,
+                ):
+                    if stream is not None:
+                        stream.close()
+
+            self.assertEqual(returncode, 128 + signal.SIGTERM)
+            self.assertEqual(status["state"], "done")
+            self.assertEqual(status["exit"], 1)
+            self.assertEqual(
+                status["line"],
+                "wait-for: host watch stopped because the git broker exited; start a new watch",
+            )
+            self.assertFalse(child_is_alive)
 
 
 class NixosPushGateSafetyTests(unittest.TestCase):
@@ -704,6 +1462,45 @@ class ContainmentArgvTests(unittest.TestCase):
             )
         )
 
+    def test_reflog_mounts_worktree_read_only(self) -> None:
+        request = self.server._validate_git_request(
+            {"repo_path": str(self.identity.worktree), "operation": "reflog"},
+            self.policy,
+        )
+        argv, _env = self.server._build_git_sandbox(
+            request,
+            self.identity,
+            self.policy,
+            ["git", "reflog"],
+            existing_only=False,
+        )
+        worktree = str(self.identity.worktree)
+        self.assertTrue(
+            any(
+                argv[i : i + 3] == ["--ro-bind", worktree, worktree]
+                for i in range(len(argv))
+            )
+        )
+
+    def test_forced_worktree_remove_stash_supports_untracked_files(self) -> None:
+        request = self.server._validate_git_request(
+            {
+                "repo_path": str(self.identity.worktree),
+                "operation": "worktree_remove",
+                "worktree_path": "/home/jonathan/worktrees/other",
+                "force": True,
+            },
+            self.policy,
+        )
+        _argv, env = self.server._build_git_sandbox(
+            request,
+            self.identity,
+            self.policy,
+            ["git", "stash", "push", "--include-untracked"],
+            existing_only=False,
+        )
+        self.assertNotIn("GIT_LITERAL_PATHSPECS", env)
+
     def test_missing_broker_owned_empty_config_fails_closed(self) -> None:
         request = self.server._validate_git_request(
             {"repo_path": str(self.identity.worktree), "operation": "status"},
@@ -801,6 +1598,401 @@ class ContainmentArgvTests(unittest.TestCase):
         )
 
 
+class DestructiveOperationSafetyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server = load_server()
+        self.temp = tempfile.TemporaryDirectory(
+            prefix="git-broker-safety-", dir="/home/jonathan/worktrees"
+        )
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.repo = self.root / "repo"
+        self.target = self.root / "target"
+        subprocess.run(
+            ["git", "init", "-q", "-b", "main", str(self.repo)], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(self.repo), "config", "user.name", "Broker Test"],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.repo),
+                "config",
+                "user.email",
+                "broker@example.test",
+            ],
+            check=True,
+        )
+        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(self.repo), "add", "tracked.txt"], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(self.repo), "commit", "-qm", "base"], check=True
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.repo),
+                "worktree",
+                "add",
+                "-qb",
+                "target",
+                str(self.target),
+            ],
+            check=True,
+        )
+        raw_policy = valid_policy()
+        raw_policy["repositoryRoots"] = [str(self.root)]
+        raw_policy["metadataRoots"] = [str(self.root)]
+        raw_policy["protectedWorktrees"] = [str(self.repo)]
+        raw_policy["worktreeCreationRoots"] = [str(self.root)]
+        self.raw_policy = raw_policy
+
+    def remove_recording_steps(self, steps: list[list[str]], *, force: bool) -> str:
+        """Run worktree_remove, recording each prerequisite argv instead of running it."""
+
+        def record(_request, _identity, _policy, argv, _rec, _bind_fds):
+            steps.append(argv)
+            return 0, "Saved working directory\n", ""
+
+        with (
+            mock.patch.object(
+                self.server, "_load_config", return_value={"gitBroker": self.raw_policy}
+            ),
+            mock.patch.object(self.server, "_check_denied_by_dcg", return_value=None),
+            mock.patch.object(self.server, "_run_contained_git_step", side_effect=record),
+            mock.patch.object(
+                self.server, "_build_git_sandbox", return_value=(["true"], {})
+            ),
+            mock.patch.object(self.server, "_run_argv", return_value=(0, "", "")),
+        ):
+            return self.server._tool_git(
+                {
+                    "repo_path": str(self.repo),
+                    "operation": "worktree_remove",
+                    "worktree_path": str(self.target),
+                    "force": force,
+                }
+            )
+
+    def test_remove_prerequisites_name_trusted_admin_dir_not_target_discovery(self) -> None:
+        admin_dirs = list((self.repo / ".git" / "worktrees").iterdir())
+        self.assertEqual(len(admin_dirs), 1)
+        for force in (False, True):
+            with self.subTest(force=force):
+                steps: list[list[str]] = []
+                self.remove_recording_steps(steps, force=force)
+                self.assertEqual(len(steps), 3 if force else 2)
+                for argv in steps:
+                    self.assertIn(f"--git-dir={admin_dirs[0]}", argv)
+                    self.assertIn(f"--work-tree={self.target}", argv)
+                    self.assertNotIn("-C", argv)
+
+    def test_remove_runs_no_git_step_when_target_git_metadata_is_replaced(self) -> None:
+        (self.target / ".git").unlink()
+        subprocess.run(["git", "init", "-q", str(self.target)], check=True)
+        for force in (False, True):
+            with self.subTest(force=force):
+                steps: list[list[str]] = []
+                with self.assertRaisesRegex(RuntimeError, r"administrative|\.git"):
+                    self.remove_recording_steps(steps, force=force)
+                self.assertEqual(steps, [])
+
+
+class IgnoredWorktreeRemovalTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server = load_server()
+        self.temp = tempfile.TemporaryDirectory(prefix="git-broker-ignored-worktree-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.repo = self.root / "repo"
+        self.target = self.root / "target"
+        subprocess.run(
+            ["git", "init", "-q", "-b", "main", str(self.repo)], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(self.repo), "config", "user.name", "Broker Test"],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.repo),
+                "config",
+                "user.email",
+                "broker@example.test",
+            ],
+            check=True,
+        )
+        (self.repo / ".gitignore").write_text("*.secret\n", encoding="utf-8")
+        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.repo), "commit", "-qm", "base"], check=True
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.repo),
+                "worktree",
+                "add",
+                "-qb",
+                "target",
+                str(self.target),
+            ],
+            check=True,
+        )
+        raw_policy = valid_policy()
+        raw_policy["repositoryRoots"] = [str(self.root)]
+        raw_policy["metadataRoots"] = [str(self.root)]
+        raw_policy["protectedWorktrees"] = [str(self.repo)]
+        raw_policy["worktreeCreationRoots"] = [str(self.root)]
+        self.raw_policy = raw_policy
+
+    def remove(self, *, force: bool) -> str:
+        def direct_sandbox(_request, _identity, _policy, argv, **_kwargs):
+            return argv, {}
+
+        def run_directly(argv, *_args, **_kwargs):
+            proc = subprocess.run(argv, capture_output=True, text=True, check=False)
+            return proc.returncode, proc.stdout, proc.stderr
+
+        with (
+            mock.patch.object(
+                self.server,
+                "_load_config",
+                return_value={"gitBroker": self.raw_policy},
+            ),
+            mock.patch.object(self.server, "_check_denied_by_dcg", return_value=None),
+            mock.patch.object(
+                self.server, "_build_git_sandbox", side_effect=direct_sandbox
+            ),
+            mock.patch.object(self.server, "_run_argv", side_effect=run_directly),
+        ):
+            return self.server._tool_git(
+                {
+                    "repo_path": str(self.repo),
+                    "operation": "worktree_remove",
+                    "worktree_path": str(self.target),
+                    "force": force,
+                }
+            )
+
+    def test_forced_remove_refuses_ignored_file_before_stashing_tracked_edit(self) -> None:
+        (self.target / "tracked.txt").write_text("edited\n", encoding="utf-8")
+        (self.target / "data.secret").write_text("ignored\n", encoding="utf-8")
+
+        output = self.remove(force=True)
+
+        self.assertIn("--- exit 1 ---", output)
+        self.assertIn("data.secret", output)
+        self.assertIn("delete ignored files first", output)
+        self.assertEqual(
+            (self.target / "tracked.txt").read_text(encoding="utf-8"), "edited\n"
+        )
+        self.assertTrue((self.target / "data.secret").is_file())
+
+    def test_nonforced_remove_refuses_ignored_file(self) -> None:
+        (self.target / "data.secret").write_text("ignored\n", encoding="utf-8")
+
+        output = self.remove(force=False)
+
+        self.assertIn("--- exit 1 ---", output)
+        self.assertIn("data.secret", output)
+        self.assertIn("delete ignored files first", output)
+        self.assertTrue((self.target / "data.secret").is_file())
+
+    def test_remove_refuses_edit_hidden_by_index_flag(self) -> None:
+        for flag in ("--assume-unchanged", "--skip-worktree"):
+            for force in (True, False):
+                with self.subTest(flag=flag, force=force):
+                    subprocess.run(
+                        ["git", "-C", str(self.target), "update-index", flag, "tracked.txt"],
+                        check=True,
+                    )
+                    (self.target / "tracked.txt").write_text("hidden\n", encoding="utf-8")
+
+                    output = self.remove(force=force)
+
+                    self.assertIn("--- exit 1 ---", output)
+                    self.assertIn("assume-unchanged or skip-worktree", output)
+                    self.assertEqual(
+                        (self.target / "tracked.txt").read_text(encoding="utf-8"),
+                        "hidden\n",
+                    )
+                    subprocess.run(
+                        ["git", "-C", str(self.target), "update-index",
+                         flag.replace("--", "--no-", 1), "tracked.txt"],
+                        check=True,
+                    )
+
+
+class RestoreSafetyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server = load_server()
+        self.identity = self.server._GitIdentity(
+            Path("/home/jonathan/worktrees/project-topic"),
+            Path("/home/jonathan/Repos/project/.git/worktrees/project-topic"),
+            Path("/home/jonathan/Repos/project/.git"),
+            True,
+        )
+
+    def run_restore(self, fields: dict, fake_run) -> tuple[str, list[list[str]]]:
+        seen: list[list[str]] = []
+
+        def fake_sandbox(_request, _identity, _policy, git_argv, **_kwargs):
+            seen.append(git_argv)
+            return git_argv, {}
+
+        with (
+            mock.patch.object(
+                self.server,
+                "_load_config",
+                return_value={"gitBroker": valid_policy()},
+            ),
+            mock.patch.object(self.server, "_check_denied_by_dcg", return_value=None),
+            mock.patch.object(
+                self.server,
+                "_prepare_existing_operation",
+                return_value=(self.identity, None, None, None),
+            ),
+            mock.patch.object(
+                self.server, "_build_git_sandbox", side_effect=fake_sandbox
+            ),
+            mock.patch.object(self.server, "_run_argv", side_effect=fake_run),
+        ):
+            output = self.server._tool_git(
+                {
+                    "repo_path": str(self.identity.worktree),
+                    "operation": "restore",
+                    **fields,
+                }
+            )
+        return output, seen
+
+    def test_side_restore_refuses_path_without_unmerged_index_entry(self) -> None:
+        def fake_run(_argv, *_args, **_kwargs):
+            return 0, "", ""
+
+        output, seen = self.run_restore(
+            {"paths": ["tracked.txt"], "side": "ours"}, fake_run
+        )
+
+        self.assertIn("--- exit 1 ---", output)
+        self.assertIn("not unmerged", output)
+        self.assertTrue(any("ls-files" in argv for argv in seen))
+        self.assertFalse(any("checkout" in argv for argv in seen))
+
+    def test_restore_refuses_untracked_target_before_backup(self) -> None:
+        def fake_run(argv, *_args, **_kwargs):
+            if "ls-files" in argv and "--others" in argv:
+                return 0, "notes.md\0", ""
+            return 0, "", ""
+
+        output, seen = self.run_restore(
+            {"paths": ["notes.md"], "source": "HEAD~1"}, fake_run
+        )
+
+        self.assertIn("--- exit 1 ---", output)
+        self.assertIn("notes.md", output)
+        self.assertIn("move or add them first", output)
+        self.assertTrue(any("ls-files" in argv for argv in seen))
+        self.assertFalse(any("stash" in argv for argv in seen))
+
+    def test_restore_refuses_assume_unchanged_edit_hidden_from_backup(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="git-broker-restore-flags-") as td:
+            root = Path(td)
+            repo = root / "repo"
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Broker Test"],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "config",
+                    "user.email",
+                    "broker@example.test",
+                ],
+                check=True,
+            )
+            (repo / "assumed.txt").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "-qm", "base"], check=True
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "update-index",
+                    "--assume-unchanged",
+                    "assumed.txt",
+                ],
+                check=True,
+            )
+            (repo / "assumed.txt").write_text("edited\n", encoding="utf-8")
+
+            raw_policy = valid_policy()
+            raw_policy["repositoryRoots"] = [str(root)]
+            raw_policy["metadataRoots"] = [str(root)]
+            raw_policy["protectedWorktrees"] = [str(root / "protected")]
+            raw_policy["worktreeCreationRoots"] = [str(root)]
+            policy = self.server._load_git_policy({"gitBroker": raw_policy})
+            identity = self.server._discover_git_identity(repo, policy)
+            request = self.server._validate_git_request(
+                {
+                    "repo_path": str(repo),
+                    "operation": "restore",
+                    "paths": ["assumed.txt"],
+                },
+                policy,
+            )
+
+            def run_directly(_request, _identity, _policy, argv, *_args):
+                proc = subprocess.run(argv, capture_output=True, text=True, check=False)
+                return proc.returncode, proc.stdout, proc.stderr
+
+            with mock.patch.object(
+                self.server, "_run_contained_git_step", side_effect=run_directly
+            ):
+                rc, _stdout, stderr = self.server._run_restore_with_backup(
+                    request, identity, policy, None, []
+                )
+
+            self.assertNotEqual(rc, 0)
+            self.assertIn("assumed.txt", stderr)
+            self.assertIn("assume-unchanged or skip-worktree", stderr)
+            self.assertEqual(
+                (repo / "assumed.txt").read_text(encoding="utf-8"), "edited\n"
+            )
+
+    def test_restore_refuses_skip_worktree_path_before_backup(self) -> None:
+        def fake_run(argv, *_args, **_kwargs):
+            if "ls-files" in argv and "-v" in argv:
+                return 0, "S sparse.txt\0", ""
+            return 0, "", ""
+
+        output, seen = self.run_restore({"paths": ["sparse.txt"]}, fake_run)
+
+        self.assertIn("--- exit 1 ---", output)
+        self.assertIn("sparse.txt", output)
+        self.assertIn("assume-unchanged or skip-worktree", output)
+        self.assertTrue(any("-v" in argv for argv in seen))
+        self.assertFalse(any("stash" in argv for argv in seen))
+
+
 class ToolExecutionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.server = load_server()
@@ -869,6 +2061,197 @@ class ToolExecutionTests(unittest.TestCase):
         command = self.server._dcg_command_for_git_request(request)
         self.assertIn(" worktree add ", command)
         self.assertNotIn("worktree_add", command)
+
+    def test_restore_exemption_keeps_truthful_discard_rendering(self) -> None:
+        request = self.server._validate_git_request(
+            {
+                "repo_path": "/home/jonathan/Repos/example",
+                "operation": "restore",
+                "paths": ["tracked.txt"],
+            },
+            self.policy,
+        )
+        command = self.server._dcg_command_for_git_request(request)
+        self.assertIn("restore --source=HEAD --staged --worktree -- tracked.txt", command)
+        self.assertTrue(self.server._is_dcg_exempt(request))
+
+        side = self.server._validate_git_request(
+            {
+                "repo_path": "/home/jonathan/Repos/example",
+                "operation": "restore",
+                "paths": ["tracked.txt"],
+                "side": "theirs",
+            },
+            self.policy,
+        )
+        self.assertIn("checkout --theirs -- tracked.txt", self.server._dcg_command_for_git_request(side))
+        self.assertTrue(self.server._is_dcg_exempt(side))
+
+    def test_branch_delete_exemption_is_narrow_and_truthful(self) -> None:
+        delete = self.server._validate_git_request(
+            {
+                "repo_path": "/home/jonathan/Repos/example",
+                "operation": "branch",
+                "action": "delete",
+                "branch": "feat/old",
+            },
+            self.policy,
+        )
+        self.assertTrue(
+            self.server._dcg_command_for_git_request(delete).endswith(
+                "branch --delete feat/old"
+            )
+        )
+        self.assertTrue(self.server._is_dcg_exempt(delete))
+
+        rename = self.server._validate_git_request(
+            {
+                "repo_path": "/home/jonathan/Repos/example",
+                "operation": "branch",
+                "action": "rename",
+                "branch": "feat/old",
+                "new_branch": "feat/new",
+            },
+            self.policy,
+        )
+        self.assertFalse(self.server._is_dcg_exempt(rename))
+
+    def test_branch_reconciliation_fails_closed_on_probe_errors(self) -> None:
+        broken = subprocess.CompletedProcess(["git"], 2, "", "probe failed")
+        with mock.patch.object(self.server, "_run_git_discovery", return_value=broken):
+            with self.assertRaisesRegex(RuntimeError, "branch ref state"):
+                self.server._branch_exists(self.identity, "feat/x", self.policy)
+            with self.assertRaisesRegex(RuntimeError, "branch config state"):
+                self.server._branch_config_section_exists(
+                    self.identity, "feat/x", self.policy
+                )
+
+    def test_branch_set_upstream_config_failure_exits_one(self) -> None:
+        args = {
+            "repo_path": str(self.identity.worktree),
+            "operation": "branch",
+            "action": "set_upstream",
+        }
+        failed = subprocess.CompletedProcess(
+            ["git", "config"], 1, "", "could not lock config"
+        )
+        with (
+            mock.patch.object(
+                self.server,
+                "_load_config",
+                return_value={"gitBroker": valid_policy()},
+            ),
+            mock.patch.object(self.server, "_check_denied_by_dcg", return_value=None),
+            mock.patch.object(
+                self.server,
+                "_prepare_existing_operation",
+                return_value=(self.identity, None, "feat/test", None),
+            ),
+            mock.patch.object(
+                self.server, "_run_git_discovery", return_value=failed
+            ) as run_config,
+        ):
+            output = self.server._tool_git(args)
+
+        self.assertIn("--- exit 1 ---", output)
+        self.assertIn("recording upstream failed", output)
+        run_config.assert_called_once()
+
+    def test_push_keeps_success_when_recording_upstream_fails(self) -> None:
+        args = {
+            "repo_path": str(self.identity.worktree),
+            "operation": "push",
+            "set_upstream": True,
+        }
+        failed = subprocess.CompletedProcess(
+            ["git", "config"], 1, "", "could not lock config"
+        )
+        with (
+            mock.patch.object(
+                self.server,
+                "_load_config",
+                return_value={"gitBroker": valid_policy()},
+            ),
+            mock.patch.object(self.server, "_check_denied_by_dcg", return_value=None),
+            mock.patch.object(
+                self.server,
+                "_prepare_existing_operation",
+                return_value=(
+                    self.identity,
+                    "https://github.com/owner/repo.git",
+                    "feat/test",
+                    None,
+                ),
+            ),
+            mock.patch.object(
+                self.server, "_build_git_argv", return_value=["git", "push"]
+            ),
+            mock.patch.object(
+                self.server,
+                "_build_git_sandbox",
+                return_value=(["bwrap", "--", "git", "push"], {}),
+            ),
+            mock.patch.object(
+                self.server, "_run_argv", return_value=(0, "pushed\n", "")
+            ),
+            mock.patch.object(
+                self.server, "_run_git_discovery", return_value=failed
+            ) as run_config,
+        ):
+            output = self.server._tool_git(args)
+
+        self.assertIn("pushed", output)
+        self.assertIn("recording upstream failed", output)
+        self.assertIn("--- exit 0 ---", output)
+        run_config.assert_called_once()
+
+    def test_restore_stores_backup_before_discarding(self) -> None:
+        args = {
+            "repo_path": str(self.identity.worktree),
+            "operation": "restore",
+            "paths": ["tracked.txt"],
+        }
+        commit_id = "a" * 40
+        seen: list[list[str]] = []
+
+        def fake_sandbox(request, identity, policy, git_argv, **kwargs):
+            seen.append(git_argv)
+            return (["bwrap", "--", *git_argv], {"HOME": "/home/jonathan"})
+
+        with (
+            mock.patch.object(self.server, "_load_config", return_value={"gitBroker": valid_policy()}),
+            mock.patch.object(self.server, "_check_denied_by_dcg") as dcg,
+            mock.patch.object(self.server, "_discover_git_identity", return_value=self.identity),
+            mock.patch.object(self.server, "_build_git_sandbox", side_effect=fake_sandbox),
+            mock.patch.object(
+                self.server,
+                "_run_argv",
+                side_effect=[
+                    (0, "", ""),
+                    (0, "", ""),
+                    (0, commit_id + "\n", ""),
+                    (0, "", ""),
+                    (0, "", ""),
+                ],
+            ),
+        ):
+            output = self.server._tool_git(args)
+
+        dcg.assert_not_called()
+        commands = [argv[argv.index(str(self.identity.worktree)) + 1 :] for argv in seen]
+        self.assertEqual(
+            commands[0],
+            ["ls-files", "-v", "-z", "--", "tracked.txt"],
+        )
+        self.assertEqual(
+            commands[1],
+            ["ls-files", "--others", "-z", "--", "tracked.txt"],
+        )
+        self.assertEqual(commands[2], ["stash", "create"])
+        self.assertEqual(commands[3][-1], commit_id)
+        self.assertEqual(commands[4][0], "restore")
+        self.assertIn("stash@{0}", output)
+        self.assertIn(commit_id, output)
 
     def test_missing_git_policy_refuses_before_discovery_or_spawn(self) -> None:
         args = {"repo_path": str(self.identity.worktree), "operation": "status"}
@@ -1164,9 +2547,10 @@ class ParityOperationSchemaTests(unittest.TestCase):
 
     def test_unexpected_field_error_lists_accepted_fields(self) -> None:
         with self.assertRaisesRegex(
-            RuntimeError, "unexpected fields for worktree_add: create; it accepts: branch, start_point, worktree_path"
+            RuntimeError,
+            "unexpected fields for worktree_add: force; it accepts: branch, create, detach, start_point, worktree_path",
         ):
-            self.validate(operation="worktree_add", create=True)
+            self.validate(operation="worktree_add", force=True)
 
     def test_revisions_allow_ancestry_but_not_ranges_or_options(self) -> None:
         for good in ("HEAD~1", "origin/master", "abc1234", "feat/x^2", "HEAD^^"):
@@ -1175,6 +2559,81 @@ class ParityOperationSchemaTests(unittest.TestCase):
         for bad in ("-h", "a..b", "HEAD@{1}", "x:y", "a b", "", "--soft", "a//b"):
             with self.subTest(bad=bad), self.assertRaises(RuntimeError):
                 self.validate(operation="reset", target=bad)
+
+    def test_untrack_requires_safe_nonempty_paths(self) -> None:
+        self.assertEqual(
+            self.validate(operation="untrack", paths=["a.txt", "dir/b.txt"])["paths"],
+            ("a.txt", "dir/b.txt"),
+        )
+        for paths in (None, [], ["../escape"], [".git/config"]):
+            with self.subTest(paths=paths), self.assertRaises(RuntimeError):
+                fields = {} if paths is None else {"paths": paths}
+                self.validate(operation="untrack", **fields)
+
+    def test_restore_validates_source_side_and_paths(self) -> None:
+        self.assertEqual(
+            self.validate(operation="restore", paths=["a.txt"], source="HEAD~1")["source"],
+            "HEAD~1",
+        )
+        self.assertEqual(
+            self.validate(operation="restore", paths=["a.txt"], side="ours")["side"],
+            "ours",
+        )
+        for fields in (
+            {},
+            {"paths": []},
+            {"paths": ["../escape"]},
+            {"paths": ["a"], "source": "a..b"},
+            {"paths": ["a"], "side": "base"},
+            {"paths": ["a"], "source": "HEAD", "side": "ours"},
+        ):
+            with self.subTest(fields=fields), self.assertRaises(RuntimeError):
+                self.validate(operation="restore", **fields)
+
+    def test_reflog_validates_optional_ref_and_count(self) -> None:
+        default = self.validate(operation="reflog")
+        self.assertEqual(default["max_count"], 20)
+        self.assertNotIn("ref", default)
+        selected = self.validate(operation="reflog", ref="HEAD~1", max_count=200)
+        self.assertEqual(selected["ref"], "HEAD~1")
+        for fields in (
+            {"ref": "a..b"},
+            {"max_count": 0},
+            {"max_count": 201},
+            {"max_count": True},
+        ):
+            with self.subTest(fields=fields), self.assertRaises(RuntimeError):
+                self.validate(operation="reflog", **fields)
+
+    def test_branch_actions_validate_required_and_conflicting_fields(self) -> None:
+        self.assertEqual(
+            self.validate(operation="branch", action="delete", branch="feat/old")["branch"],
+            "feat/old",
+        )
+        renamed = self.validate(
+            operation="branch",
+            action="rename",
+            branch="feat/old",
+            new_branch="feat/new",
+        )
+        self.assertEqual(renamed["new_branch"], "feat/new")
+        self.assertEqual(
+            self.validate(operation="branch", action="set_upstream")["action"],
+            "set_upstream",
+        )
+        for fields in (
+            {},
+            {"action": "delete"},
+            {"action": "delete", "branch": "main"},
+            {"action": "delete", "branch": "feat/x", "new_branch": "feat/y"},
+            {"action": "rename", "branch": "master", "new_branch": "feat/y"},
+            {"action": "rename", "branch": "feat/x", "new_branch": "main"},
+            {"action": "rename", "branch": "feat/x"},
+            {"action": "set_upstream", "new_branch": "feat/y"},
+            {"action": "force-delete", "branch": "feat/x"},
+        ):
+            with self.subTest(fields=fields), self.assertRaises(RuntimeError):
+                self.validate(operation="branch", **fields)
 
     def test_reset_has_no_hard_mode(self) -> None:
         self.assertEqual(self.validate(operation="reset", target="HEAD~1")["mode"], "mixed")
@@ -1203,6 +2662,10 @@ class ParityOperationSchemaTests(unittest.TestCase):
             self.validate(operation="cherry_pick", commits=["abc123", "HEAD~2"])["commits"],
             ("abc123", "HEAD~2"),
         )
+        self.assertEqual(
+            self.validate(operation="revert", commits=["HEAD"])["commits"],
+            ("HEAD",),
+        )
         for operation, fields in (
             ("rebase", {}),
             ("rebase", {"action": "continue", "onto": "x"}),
@@ -1213,6 +2676,9 @@ class ParityOperationSchemaTests(unittest.TestCase):
             ("cherry_pick", {"commits": []}),
             ("cherry_pick", {"commits": ["-n"]}),
             ("cherry_pick", {"action": "abort", "commits": ["x"]}),
+            ("revert", {"commits": []}),
+            ("revert", {"action": "continue", "commits": ["HEAD"]}),
+            ("revert", {"action": "edit", "commits": ["HEAD"]}),
         ):
             with self.subTest(operation=operation, fields=fields), self.assertRaises(RuntimeError):
                 self.validate(operation=operation, **fields)
@@ -1243,6 +2709,53 @@ class ParityOperationSchemaTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(RuntimeError):
                 self.validate(operation="worktree_remove", worktree_path=bad)
 
+    def test_worktree_remove_force_is_strict_boolean(self) -> None:
+        fields = {
+            "operation": "worktree_remove",
+            "worktree_path": "/home/jonathan/worktrees/other",
+        }
+        self.assertFalse(self.validate(**fields)["force"])
+        self.assertTrue(self.validate(**fields, force=True)["force"])
+        with self.assertRaisesRegex(RuntimeError, "force must be a boolean"):
+            self.validate(**fields, force="yes")
+
+    def test_nixos_worktree_creation_root_accepts_only_child_paths(self) -> None:
+        policy = valid_policy()
+        policy["worktreeCreationRoots"].append(
+            "/home/jonathan/Repos/nixos-config-worktrees"
+        )
+        loaded = self.server._load_git_policy({"gitBroker": policy})
+        request = self.server._validate_git_request(
+            {
+                "repo_path": "/home/jonathan/Repos/example",
+                "operation": "worktree_add",
+                "worktree_path": "/home/jonathan/Repos/nixos-config-worktrees/topic",
+                "branch": "feat/topic",
+            },
+            loaded,
+        )
+        self.assertEqual(
+            request["worktree_path"],
+            Path("/home/jonathan/Repos/nixos-config-worktrees/topic"),
+        )
+        for target in (
+            "/home/jonathan/Repos/nixos-config-worktrees",
+            "/home/jonathan/Repos/elsewhere/topic",
+            "/tmp/topic",
+        ):
+            with self.subTest(target=target), self.assertRaisesRegex(
+                RuntimeError, "worktree_path"
+            ):
+                self.server._validate_git_request(
+                    {
+                        "repo_path": "/home/jonathan/Repos/example",
+                        "operation": "worktree_add",
+                        "worktree_path": target,
+                        "branch": "feat/topic",
+                    },
+                    loaded,
+                )
+
     def test_protected_primary_allows_worktree_removal_but_not_new_mutations(self) -> None:
         identity = self.server._GitIdentity(
             Path("/home/jonathan/.claude"),
@@ -1251,6 +2764,7 @@ class ParityOperationSchemaTests(unittest.TestCase):
             False,
         )
         self.server._authorize_git_operation(identity, "worktree_remove", self.policy)
+        self.server._authorize_git_operation(identity, "reflog", self.policy)
         for operation in (
             "stash", "reset", "rebase", "merge", "cherry_pick", "tag", "pull",
             "remote_branch_delete", "unstage",
@@ -1302,6 +2816,8 @@ class ParityOperationArgvTests(unittest.TestCase):
             (("merge", {"ref": "feat/x", "message": "m"}), ["merge", "--message", "m", "feat/x"]),
             (("cherry_pick", {"commits": ["abc", "def"]}), ["cherry-pick", "abc", "def"]),
             (("cherry_pick", {"action": "abort"}), ["cherry-pick", "--abort"]),
+            (("revert", {"commits": ["HEAD", "HEAD~2"]}), ["revert", "--no-edit", "HEAD", "HEAD~2"]),
+            (("revert", {"action": "skip"}), ["revert", "--skip"]),
             (("tag", {"name": "v1", "target": "HEAD~1", "message": "rel"}),
              ["tag", "--annotate", "--message", "rel", "v1", "HEAD~1"]),
             (("worktree_remove", {"worktree_path": "/home/jonathan/worktrees/other"}),
@@ -1312,6 +2828,103 @@ class ParityOperationArgvTests(unittest.TestCase):
         for (operation, fields), expected in cases:
             with self.subTest(operation=operation, fields=fields):
                 self.assertEqual(self.argv(operation, **fields), expected)
+
+    def test_commit_all_precedes_message(self) -> None:
+        self.assertEqual(
+            self.argv("commit", message="tracked", all=True),
+            ["commit", "--all", "--message", "tracked"],
+        )
+
+    def test_untrack_removes_only_from_index_recursively(self) -> None:
+        self.assertEqual(
+            self.argv("untrack", paths=["a.txt", "dir"]),
+            ["rm", "--cached", "-r", "--quiet", "--", "a.txt", "dir"],
+        )
+
+    def test_worktree_add_existing_and_detached_argv(self) -> None:
+        target = "/home/jonathan/worktrees/project-existing"
+        self.assertEqual(
+            self.argv(
+                "worktree_add", worktree_path=target, branch="feat/existing", create=False
+            ),
+            ["worktree", "add", "--no-guess-remote", target, "feat/existing"],
+        )
+        self.assertEqual(
+            self.argv(
+                "worktree_add", worktree_path=target, detach=True, start_point="HEAD~0"
+            ),
+            ["worktree", "add", "--detach", target, "HEAD~0"],
+        )
+        request = self.server._validate_git_request(
+            {
+                "repo_path": str(self.identity.worktree),
+                "operation": "worktree_add",
+                "worktree_path": target,
+                "branch": "feat/existing",
+                "create": False,
+            },
+            self.policy,
+        )
+        self.assertIn(
+            "worktree add --no-guess-remote",
+            self.server._dcg_command_for_git_request(request),
+        )
+
+    def test_switch_force_create_and_detach_argv(self) -> None:
+        self.assertEqual(
+            self.argv(
+                "switch", branch="feat/reset", force_create=True, start_point="HEAD~1"
+            ),
+            ["switch", "--no-track", "--force-create", "feat/reset", "HEAD~1"],
+        )
+        self.assertEqual(
+            self.argv("switch", detach=True, start_point="HEAD~0"),
+            ["switch", "--detach", "HEAD~0"],
+        )
+
+    def test_restore_argv_replaces_index_and_worktree_or_selects_conflict_side(self) -> None:
+        self.assertEqual(
+            self.argv("restore", paths=["a.txt"], source="HEAD~1"),
+            ["restore", "--source=HEAD~1", "--staged", "--worktree", "--", "a.txt"],
+        )
+        self.assertEqual(
+            self.argv("restore", paths=["a.txt"], side="theirs"),
+            ["checkout", "--theirs", "--", "a.txt"],
+        )
+
+    def test_forced_worktree_remove_never_passes_force_to_git_remove(self) -> None:
+        self.assertEqual(
+            self.argv(
+                "worktree_remove",
+                worktree_path="/home/jonathan/worktrees/other",
+                force=True,
+            ),
+            ["worktree", "remove", "/home/jonathan/worktrees/other"],
+        )
+
+    def test_reflog_argv_has_bounded_count_and_optional_ref(self) -> None:
+        self.assertEqual(
+            self.argv("reflog"), ["reflog", "show", "--max-count=20"]
+        )
+        self.assertEqual(
+            self.argv("reflog", ref="main", max_count=3),
+            ["reflog", "show", "--max-count=3", "main"],
+        )
+
+    def test_branch_delete_and_rename_argv_use_safe_forms(self) -> None:
+        self.assertEqual(
+            self.argv("branch", action="delete", branch="feat/old"),
+            ["branch", "--delete", "feat/old"],
+        )
+        self.assertEqual(
+            self.argv(
+                "branch",
+                action="rename",
+                branch="feat/old",
+                new_branch="feat/new",
+            ),
+            ["branch", "--move", "feat/old", "feat/new"],
+        )
 
     def test_pull_is_fast_forward_only_from_same_named_origin_branch(self) -> None:
         self.assertEqual(
@@ -1520,6 +3133,239 @@ class BlackBoxParityTests(unittest.TestCase):
         self.ok("tag", name="v0", message="tagged")
         self.assertEqual(self.git("tag", "--list"), "v0")
 
+    def test_commit_all_commits_an_unstaged_tracked_change(self) -> None:
+        self.write("base.txt", "changed without add\n")
+        self.ok("commit", message="tracked change", all=True)
+        self.assertEqual(self.git("show", "HEAD:base.txt"), "changed without add")
+        self.assertEqual(self.git("status", "--short"), "")
+
+    def test_untrack_keeps_files_on_disk(self) -> None:
+        self.write("tracked.txt", "keep me\n")
+        self.ok("add", paths=["tracked.txt"])
+        self.ok("commit", message="track file")
+        self.ok("untrack", paths=["tracked.txt"])
+        self.assertTrue((self.repo / "tracked.txt").is_file())
+        self.assertEqual(self.git("ls-files", "--", "tracked.txt"), "")
+
+    def test_worktree_add_existing_branch_and_detached_commit(self) -> None:
+        existing = Path("/home/jonathan/worktrees") / f"git-broker-existing-{os.getpid()}"
+        detached = Path("/home/jonathan/worktrees") / f"git-broker-detached-{os.getpid()}"
+        for target in (existing, detached):
+            self.addCleanup(
+                subprocess.run,
+                ["git", "-C", str(self.repo), "worktree", "remove", "--force", str(target)],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        self.ok("switch", branch="existing", create=True)
+        self.ok("switch", branch="main")
+        self.ok(
+            "worktree_add",
+            worktree_path=str(existing),
+            branch="existing",
+            create=False,
+        )
+        self.ok(
+            "worktree_add",
+            worktree_path=str(detached),
+            detach=True,
+            start_point="HEAD~0",
+        )
+        listing = self.git("worktree", "list", "--porcelain")
+        self.assertIn(f"worktree {existing}", listing)
+        self.assertIn(f"worktree {detached}", listing)
+        self.assertEqual(
+            subprocess.run(
+                ["git", "-C", str(detached), "symbolic-ref", "-q", "HEAD"],
+                check=False,
+            ).returncode,
+            1,
+        )
+
+    def test_worktree_add_does_not_create_branch_from_remote_tracking_ref(self) -> None:
+        target = Path("/home/jonathan/worktrees") / f"git-broker-remote-only-{os.getpid()}"
+        self.addCleanup(
+            subprocess.run,
+            ["git", "-C", str(self.repo), "worktree", "remove", "--force", str(target)],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        commit = self.git("rev-parse", "HEAD")
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.repo),
+                "update-ref",
+                "refs/remotes/origin/only-remote",
+                commit,
+            ],
+            check=True,
+        )
+
+        output = self.tool(
+            "worktree_add",
+            worktree_path=str(target),
+            branch="only-remote",
+            create=False,
+        )
+
+        self.assertNotIn("--- exit 0 ---", output)
+        self.assertFalse(target.exists())
+        self.assertNotEqual(
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(self.repo),
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    "refs/heads/only-remote",
+                ],
+                check=False,
+            ).returncode,
+            0,
+        )
+
+    def test_switch_force_create_resets_branch_and_detach_has_no_branch(self) -> None:
+        self.write("later.txt", "later\n")
+        self.ok("add", paths=["later.txt"])
+        self.ok("commit", message="later")
+        parent = self.git("rev-parse", "HEAD~1")
+        self.ok(
+            "switch",
+            branch="reset-here",
+            force_create=True,
+            start_point="HEAD~1",
+        )
+        self.assertEqual(self.git("rev-parse", "HEAD"), parent)
+        self.assertFalse((self.repo / "later.txt").exists())
+        self.ok("switch", detach=True, start_point="HEAD~0")
+        self.assertEqual(
+            subprocess.run(
+                ["git", "-C", str(self.repo), "symbolic-ref", "-q", "HEAD"],
+                check=False,
+            ).returncode,
+            1,
+        )
+
+    def test_restore_backs_up_discarded_tracked_change(self) -> None:
+        self.write("base.txt", "discarded change\n")
+        output = self.ok("restore", paths=["base.txt"])
+        self.assertEqual((self.repo / "base.txt").read_text(), "base\n")
+        self.assertIn("stash@{0}", output)
+        self.assertIn("git-broker restore backup: base.txt", self.git("stash", "list"))
+        self.assertIn("discarded change", self.git("stash", "show", "-p", "stash@{0}"))
+
+    def test_restore_from_source_uses_historical_content(self) -> None:
+        self.write("base.txt", "newer\n")
+        self.ok("add", paths=["base.txt"])
+        self.ok("commit", message="newer")
+        self.ok("restore", paths=["base.txt"], source="HEAD~1")
+        self.assertEqual((self.repo / "base.txt").read_text(), "base\n")
+
+    def test_restore_theirs_resolves_merge_conflict(self) -> None:
+        self.ok("switch", branch="other", create=True)
+        self.write("base.txt", "theirs\n")
+        self.ok("add", paths=["base.txt"])
+        self.ok("commit", message="theirs")
+        self.ok("switch", branch="main")
+        self.write("base.txt", "ours\n")
+        self.ok("add", paths=["base.txt"])
+        self.ok("commit", message="ours")
+        conflict = self.tool("merge", ref="other")
+        self.assertNotIn("--- exit 0 ---", conflict)
+        self.ok("restore", paths=["base.txt"], side="theirs")
+        self.assertEqual((self.repo / "base.txt").read_text(), "theirs\n")
+        self.ok("add", paths=["base.txt"])
+        self.ok("merge", action="continue")
+        self.assertEqual(len(self.git("log", "-1", "--format=%P").split()), 2)
+
+    def test_restore_side_refuses_non_conflicted_path_and_preserves_edit(self) -> None:
+        self.write("base.txt", "precious unstaged edit\n")
+
+        output = self.tool("restore", paths=["base.txt"], side="ours")
+
+        self.assertNotIn("--- exit 0 ---", output)
+        self.assertIn("not unmerged", output)
+        self.assertEqual(
+            (self.repo / "base.txt").read_text(encoding="utf-8"),
+            "precious unstaged edit\n",
+        )
+        self.assertEqual(self.git("stash", "list"), "")
+
+    def test_restore_refuses_to_overwrite_untracked_target(self) -> None:
+        self.write("notes.md", "historical\n")
+        self.ok("add", paths=["notes.md"])
+        self.ok("commit", message="track notes")
+        self.ok("untrack", paths=["notes.md"])
+        self.ok("commit", message="untrack notes")
+        self.write("notes.md", "precious untracked edit\n")
+
+        output = self.tool("restore", paths=["notes.md"], source="HEAD~1")
+
+        self.assertNotIn("--- exit 0 ---", output)
+        self.assertIn("move or add them first", output)
+        self.assertEqual(
+            (self.repo / "notes.md").read_text(encoding="utf-8"),
+            "precious untracked edit\n",
+        )
+
+    def test_restore_clean_worktree_creates_no_stash(self) -> None:
+        before = self.git("stash", "list")
+        self.ok("restore", paths=["base.txt"])
+        self.assertEqual(self.git("stash", "list"), before)
+
+    def test_reflog_reads_recent_entries(self) -> None:
+        output = self.ok("reflog", ref="HEAD", max_count=1)
+        self.assertIn("commit (initial): base", output)
+
+    def test_branch_delete_and_rename_reconcile_local_config(self) -> None:
+        self.ok("switch", branch="delete-me", create=True)
+        self.ok("switch", branch="main")
+        subprocess.run(
+            ["git", "-C", str(self.repo), "config", "branch.delete-me.remote", "origin"],
+            check=True,
+        )
+        self.ok("branch", action="delete", branch="delete-me")
+        self.assertNotIn("delete-me", self.git("branch", "--format=%(refname:short)"))
+        self.assertNotEqual(
+            subprocess.run(
+                ["git", "-C", str(self.repo), "config", "--get", "branch.delete-me.remote"],
+                check=False,
+            ).returncode,
+            0,
+        )
+
+        self.ok("switch", branch="rename-me", create=True)
+        self.ok("switch", branch="main")
+        subprocess.run(
+            ["git", "-C", str(self.repo), "config", "branch.rename-me.remote", "origin"],
+            check=True,
+        )
+        self.ok("branch", action="rename", branch="rename-me", new_branch="renamed")
+        branches = self.git("branch", "--format=%(refname:short)").splitlines()
+        self.assertIn("renamed", branches)
+        self.assertNotIn("rename-me", branches)
+        self.assertEqual(self.git("config", "branch.renamed.remote"), "origin")
+
+    def test_branch_set_upstream_uses_current_branch_host_side(self) -> None:
+        output = self.ok("branch", action="set_upstream")
+        self.assertIn("main -> origin/main", output)
+        self.assertEqual(self.git("config", "branch.main.remote"), "origin")
+        self.assertEqual(self.git("config", "branch.main.merge"), "refs/heads/main")
+
+    def test_revert_last_commit_restores_parent_content(self) -> None:
+        self.write("base.txt", "changed\n")
+        self.ok("add", paths=["base.txt"])
+        self.ok("commit", message="change to revert")
+        self.ok("revert", commits=["HEAD"])
+        self.assertEqual((self.repo / "base.txt").read_text(), "base\n")
+        self.assertEqual(self.git("log", "-1", "--format=%s"), "Revert \"change to revert\"")
+
     def test_stash_push_list_pop(self) -> None:
         self.write("base.txt", "changed\n")
         self.write("new.txt", "untracked\n")
@@ -1575,13 +3421,124 @@ class BlackBoxParityTests(unittest.TestCase):
         self.ok("worktree_remove", worktree_path=str(target))
         self.assertFalse(target.exists())
 
+    def test_forced_worktree_remove_preserves_dirty_files_in_shared_stash(self) -> None:
+        target = Path("/home/jonathan/worktrees") / f"git-broker-force-wt-{os.getpid()}"
+        self.addCleanup(
+            subprocess.run,
+            ["git", "-C", str(self.repo), "worktree", "remove", "--force", str(target)],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.ok("worktree_add", worktree_path=str(target), branch="force-wt")
+        (target / "base.txt").write_text("tracked backup\n", encoding="utf-8")
+        (target / "untracked.txt").write_text("untracked backup\n", encoding="utf-8")
+        output = self.ok("worktree_remove", worktree_path=str(target), force=True)
+        self.assertFalse(target.exists())
+        self.assertIn("stash@{0}", output)
+        self.assertIn("git-broker worktree_remove backup", self.git("stash", "list"))
+        patch = self.git("stash", "show", "--include-untracked", "-p", "stash@{0}")
+        self.assertIn("tracked backup", patch)
+        self.assertIn("untracked backup", patch)
+
+    def test_forced_worktree_remove_refuses_replaced_git_dir_with_filter(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="git-broker-filter-target-", dir="/home/jonathan/worktrees"
+        ) as td:
+            target = Path(td) / "worktree"
+            self.ok("worktree_add", worktree_path=str(target), branch="filter-target")
+            canary = self.repo / ".git" / "filter-canary"
+            (target / ".git").unlink()
+            subprocess.run(["git", "init", "-q", str(target)], check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(target),
+                    "config",
+                    "filter.x.clean",
+                    f"sh -c 'echo pwned > {canary}; cat'",
+                ],
+                check=True,
+            )
+            (target / ".gitattributes").write_text("*.txt filter=x\n", encoding="utf-8")
+            (target / "payload.txt").write_text("payload\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, r"administrative|\.git"):
+                self.tool("worktree_remove", worktree_path=str(target), force=True)
+
+            self.assertFalse(canary.exists())
+            self.assertTrue((self.repo / ".git" / "HEAD").is_file())
+
+    def test_worktree_remove_refuses_replaced_repo_before_running_its_filter(self) -> None:
+        """A replacement target repository's config never runs, in either mode."""
+        for force in (False, True):
+            with self.subTest(force=force), tempfile.TemporaryDirectory(
+                prefix="git-broker-tracked-filter-", dir="/home/jonathan/worktrees"
+            ) as td:
+                target = Path(td) / "worktree"
+                self.ok("worktree_add", worktree_path=str(target), branch=f"tracked-{force}")
+                canary = self.repo / ".git" / f"tracked-filter-canary-{force}"
+                (target / ".git").unlink()
+                replacement = ["git", "-C", str(target)]
+                subprocess.run(["git", "init", "-q", str(target)], check=True)
+                (target / ".gitattributes").write_text("*.txt filter=x\n", encoding="utf-8")
+                (target / "payload.txt").write_text("payload\n", encoding="utf-8")
+                subprocess.run([*replacement, "add", "-A"], check=True)
+                subprocess.run(
+                    [*replacement, "-c", "user.name=t", "-c", "user.email=t@t",
+                     "commit", "-qm", "payload"],
+                    check=True,
+                )
+                subprocess.run(
+                    [*replacement, "config", "filter.x.clean",
+                     f"sh -c 'echo pwned > {canary}; cat'"],
+                    check=True,
+                )
+                (target / "payload.txt").write_text("modified tracked\n", encoding="utf-8")
+
+                with self.assertRaisesRegex(RuntimeError, r"administrative|\.git"):
+                    self.tool("worktree_remove", worktree_path=str(target), force=force)
+
+                self.assertFalse(canary.exists(), "replacement repo clean filter ran")
+                self.assertTrue((target / "payload.txt").exists())
+
+    def test_forced_worktree_remove_refuses_replaced_core_worktree(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="git-broker-core-worktree-target-",
+            dir="/home/jonathan/worktrees",
+        ) as td:
+            target = Path(td) / "worktree"
+            self.ok("worktree_add", worktree_path=str(target), branch="core-target")
+            (target / ".git").unlink()
+            subprocess.run(["git", "init", "-q", str(target)], check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(target),
+                    "config",
+                    "core.worktree",
+                    str(self.repo / ".git"),
+                ],
+                check=True,
+            )
+            before = sorted(path.name for path in (self.repo / ".git").iterdir())
+
+            with self.assertRaisesRegex(RuntimeError, r"administrative|\.git"):
+                self.tool("worktree_remove", worktree_path=str(target), force=True)
+
+            after = sorted(path.name for path in (self.repo / ".git").iterdir())
+            self.assertEqual(after, before)
+
     def test_set_upstream_writes_only_fixed_tracking_keys(self) -> None:
         identity = self.server._discover_git_identity(
             self.repo, self.server._load_git_policy(self.server._load_config())
         )
-        note = self.server._set_upstream(
+        success, note = self.server._set_upstream(
             identity, "main", self.server._load_git_policy(self.server._load_config())
         )
+        self.assertTrue(success)
         self.assertIn("upstream set", note)
         self.assertEqual(self.git("config", "branch.main.remote"), "origin")
         self.assertEqual(self.git("config", "branch.main.merge"), "refs/heads/main")

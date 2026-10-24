@@ -19,6 +19,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 
 def _state() -> tuple[dict, str]:
@@ -78,6 +79,20 @@ def fake_systemctl(argv: list[str]) -> int:
     return 0
 
 
+def fake_sleep() -> int:
+    script, _ = _state()
+    seq = script.get("sleep", [])
+    if not seq:
+        return 0
+    action = seq[min(_bump("sleep"), len(seq) - 1)]
+    if action.get("write_json"):
+        with open(action["write_json"], "w", encoding="utf-8") as fh:
+            json.dump(action.get("value"), fh)
+    if action.get("delay"):
+        time.sleep(float(action["delay"]))
+    return int(action.get("rc", 0))
+
+
 def main() -> int:
     name = os.path.basename(sys.argv[0])
     argv = sys.argv[1:]
@@ -87,7 +102,7 @@ def main() -> int:
     if name == "systemctl":
         return fake_systemctl(argv)
     if name == "sleep":
-        return 0
+        return fake_sleep()
     sys.stderr.write(f"fake: unknown name {name}\n")
     return 98
 
