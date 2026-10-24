@@ -259,6 +259,15 @@ def test_prstate_stub_refuses_what_real_gh_refuses(tmp_path, argv):
     assert r.returncode != 0 and not r.stdout, r.stdout
 
 
+@pytest.mark.parametrize("conclusion,code", [("SUCCESS", 0), ("FAILURE", 1), ("PENDING", 8)])
+def test_prstate_stub_checks_exit_like_real_gh(tmp_path, conclusion, code):
+    (tmp_path / "pr-states").write_text(f"o/r#41 OPEN feat/a {conclusion}\n")
+    r = subprocess.run([str(SCENARIOS / "_lib/gh-prstate"), "pr", "checks", "41", "-R", "o/r"],
+                       env={**os.environ, "E2E_RUN": str(tmp_path)},
+                       capture_output=True, text=True, cwd=tmp_path)
+    assert r.returncode == code, r.stdout
+
+
 ORIENT_OK = """Goal: alerts reach the next session.
 
 Where it stands:
@@ -282,18 +291,40 @@ ORIENT_RUNDOWN = """1. aggregator #38 — MERGED
 https://github.com/jonathanmoregard/aggregator/pull/41
 """
 ORIENT_STALE = ORIENT_OK.replace("pull/41\n", "pull/41\nhttps://github.com/jonathanmoregard/nixos-config/pull/339\n")
+ORIENT_ALL_DONE = """Everything is finished. Nothing is needed from you.
+
+https://github.com/jonathanmoregard/aggregator/pull/41
+
+DONE
+"""
+# The agent's own commands; gh.log alone also holds the Stop hook's queries.
+QUERIED = ["gh pr view 41 -R jonathanmoregard/aggregator --json state",
+           "gh pr view 339 -R jonathanmoregard/nixos-config --json state"]
+LOOPED = ['for p in "aggregator 41" "nixos-config 339"; do set -- ${=p}; '
+          'gh pr view $2 -R jonathanmoregard/$1 --json state; done']
+LISTED = ["gh pr list --state all --json number,state",
+          "gh pr list -R jonathanmoregard/nixos-config --state all --json number,state"]
+HOOK_ONLY = []   # no agent query; gh.log below still shows the hook's
 
 
-@pytest.mark.parametrize("mode,final,want", [
-    ("orient", ORIENT_OK, 0),
-    ("orient", ORIENT_RUNDOWN, 1),
-    ("orient", ORIENT_STALE, 1),
-    ("merged", "Yes, #41 merged.\n\nhttps://github.com/o/r/pull/41\n\nDONE\n", 0),
-    ("merged", "Yes, #41 merged.\nhttps://github.com/o/r/pull/41\nWant more?\n", 1),
+@pytest.mark.parametrize("mode,final,commands,want", [
+    ("orient", ORIENT_OK, QUERIED, 0),
+    ("orient", ORIENT_OK, LOOPED, 0),
+    ("orient", ORIENT_OK, LISTED, 0),
+    ("orient", ORIENT_RUNDOWN, QUERIED, 1),
+    ("orient", ORIENT_STALE, QUERIED, 1),
+    ("orient", ORIENT_ALL_DONE, QUERIED, 1),     # bare URL is not an ask
+    ("orient", ORIENT_ALL_DONE, HOOK_ONLY, 1),
+    ("orient", ORIENT_OK, HOOK_ONLY, 1),         # right shape, but never queried
+    ("orient", ORIENT_OK, QUERIED[:1], 1),       # #339's live state never read
+    ("merged", "Yes, #41 merged.\n\nhttps://github.com/o/r/pull/41\n\nDONE\n", QUERIED, 0),
+    ("merged", "Yes, #41 merged.\nhttps://github.com/o/r/pull/41\nWant more?\n", QUERIED, 1),
+    ("merged", "Yes, #41 merged.\n\nhttps://github.com/o/r/pull/41\n\nDONE\n", HOOK_ONLY, 1),
 ])
-def test_orient_grader_on_canned_runs(tmp_path, mode, final, want):
+def test_orient_grader_on_canned_runs(tmp_path, mode, final, commands, want):
     (tmp_path / "final.txt").write_text(final)
-    (tmp_path / "gh.log").write_text("pr view 41 -R o/r --json state\n")
+    (tmp_path / "commands.txt").write_text("\n".join(commands) + "\n")
+    (tmp_path / "gh.log").write_text("pr view 41 -R jonathanmoregard/aggregator --json state,mergedAt,closedAt\n")
     (tmp_path / "transcript.jsonl").write_text("")
     r = subprocess.run([sys.executable, str(SCENARIOS / "_lib/orient_grade.py"), mode, str(tmp_path)],
                        capture_output=True, text=True)

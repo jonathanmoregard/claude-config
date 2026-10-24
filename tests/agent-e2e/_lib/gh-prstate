@@ -2,7 +2,7 @@
 """Stub `gh` answering PR state from $E2E_RUN/pr-states.
 
 Each line of pr-states is `<owner>/<repo>#<n> <OPEN|MERGED|CLOSED> [<head-branch>
-[<check-conclusion>]]`; the check conclusion defaults to SUCCESS.
+[<SUCCESS|FAILURE|PENDING>]]`; the check conclusion defaults to SUCCESS.
 Every call is logged to $E2E_RUN/gh.log. Covers what an agent (or a hook) asks
 about a PR's state: `pr view` (by number, URL or head branch), `pr list`
 (`--head` filters), `pr checks`, `api repos/.../pulls/<n>`, `repo view`
@@ -71,7 +71,9 @@ def record(key):
         "mergeStateStatus": "CLEAN" if state == "OPEN" else "UNKNOWN",
         "reviewDecision": "", "autoMergeRequest": None, "headRefOid": "a" * 40,
         "mergeCommit": {"oid": "b" * 40} if state == "MERGED" else None,
-        "statusCheckRollup": [{"name": "ci", "status": "COMPLETED", "conclusion": checks}],
+        "statusCheckRollup": [{"name": "ci", "status": "IN_PROGRESS", "conclusion": ""}
+                              if checks == "PENDING" else
+                              {"name": "ci", "status": "COMPLETED", "conclusion": checks}],
     }
 
 
@@ -123,9 +125,11 @@ if cmd in ("pr view", "pr checks"):
         print(f"no pull requests found for branch \"{current_branch()}\"", file=sys.stderr)
         sys.exit(1)
     if cmd == "pr checks":
-        ok = rec["statusCheckRollup"][0]["conclusion"] == "SUCCESS"
-        print("ci\t%s\t1m\thttps://github.com/%s/actions/runs/1"
-              % ("pass" if ok else "fail", key.split("#")[0]))
+        # Real `gh pr checks` exits 1 when any check failed, 8 when one is pending.
+        conclusion = rec["statusCheckRollup"][0]["conclusion"]
+        word, code = {"SUCCESS": ("pass", 0), "": ("pending", 8)}.get(conclusion, ("fail", 1))
+        print("ci\t%s\t1m\thttps://github.com/%s/actions/runs/1" % (word, key.split("#")[0]))
+        sys.exit(code)
     else:
         emit(rec)
 elif cmd == "pr list":

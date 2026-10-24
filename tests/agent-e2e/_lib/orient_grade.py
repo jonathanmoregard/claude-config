@@ -7,10 +7,17 @@ not a per-PR rundown. PASS needs all of:
   - no merge-state jargon (MERGEABLE, CLEAN, mergeStateStatus, N/N checks);
   - PR URLs only for PRs that need the user's click (#41);
   - stale handoff caught: #339 (MERGED live, "awaiting" in mission.md) is not
-    presented as awaiting, and #41 (OPEN) still is.
-MODE `merged`: "did #41 merge?" with #41 MERGED live. PASS needs a gh call
-that could read #41's state, the reply saying it merged, and the #41 URL at
-the bottom (only blank lines, other URLs or the state marker after it).
+    presented as awaiting, and #41 (OPEN) still is;
+  - the agent itself queried the live state of #41 and #339;
+  - the "needed from you" part asks for an action (merge/click/approve); the
+    #41 URL alone is not an ask.
+MODE `merged`: "did #41 merge?" with #41 MERGED live. PASS needs the agent to
+have queried #41's state, the reply saying it merged, and the #41 URL at the
+bottom (only blank lines, other URLs or the state marker after it).
+
+"Queried" reads the agent's own commands (commands.txt), not gh.log: gh.log
+also logs the pr-state-guard Stop hook, which queries every PR the final reply
+links whether or not the agent ever looked.
 
 The last stdout line is the verdict reason plus metrics (words, prs, urls,
 marker, queried, skills) for the PR-body table.
@@ -24,7 +31,8 @@ import sys
 mode, run = sys.argv[1], pathlib.Path(sys.argv[2])
 final = (run / "final.txt").read_text(encoding="utf-8")
 lines = [l.rstrip() for l in final.splitlines()]
-gh_log = (run / "gh.log").read_text(encoding="utf-8") if (run / "gh.log").exists() else ""
+cmds_file = run / "commands.txt"
+commands = cmds_file.read_text(encoding="utf-8").splitlines() if cmds_file.exists() else []
 MARKERS = {"DONE", "QUESTION", "BLOCKED", "RUNNING", "FAILED"}
 URL = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/(\d+)")
 
@@ -40,7 +48,36 @@ urls = sorted({int(n) for n in URL.findall(final)})
 prose = [l for l in lines if not re.fullmatch(r"\s*[-*\d.]*\s*<?" + URL.pattern + r">?\s*", l)]
 named = sorted({int(n) for l in prose for n in re.findall(r"(?:#|pull/)(\d+)\b", URL.sub("", l))}
                | {int(n) for l in prose for n in URL.findall(l)})
-queried = "yes" if re.search(r"^(pr (view|list|checks)|api)\b", gh_log, re.M) else "no"
+
+
+def agent_queried(n, repo):
+    """Did one of the agent's commands read PR n (in repo) live?"""
+    for c in commands:
+        if re.search(r"\bgh\s+(pr\s+(view|checks)|api)\b", c) and re.search(rf"(?<![\w/.-]){n}\b|pulls?/{n}\b", c):
+            return True
+        if re.search(r"\bgh\s+pr\s+list\b", c) and re.search(r"(--state|-s)[ =]all\b", c):
+            if repo in c or (repo == "aggregator" and not re.search(r"\s(-R|--repo)\b", c)):
+                return True
+    return False
+
+
+needed = {"orient": [(41, "aggregator"), (339, "nixos-config")], "merged": [(41, "aggregator")]}
+queried = "yes" if all(agent_queried(n, r) for n, r in needed.get(mode, [])) else "no"
+
+
+def asks_for_action():
+    """A merge/click/approve line inside the "needed from you" part."""
+    start = next((i for i, l in enumerate(lines) if re.search(r"from you|needs? you", l, re.I)), None)
+    if start is None:
+        return False
+    for l in lines[start:]:
+        if l is not lines[start] and (re.match(r"\W*next\b", l, re.I) or URL.search(l)):
+            break
+        if re.search(r"\b(merge|click|approve)\b", l, re.I):
+            return True
+    return False
+
+
 skills = []
 for raw in (run / "transcript.jsonl").read_text(encoding="utf-8").splitlines():
     try:
@@ -71,9 +108,13 @@ def prstate(*specs):
 
 
 if mode == "orient":
+    if queried != "yes":
+        verdict(False, "did not query live state of #41 and #339")
     ok, why = prstate("339:finished", "41:awaiting")
     if not ok:
         verdict(False, f"PR state wrong ({why})")
+    if not asks_for_action():
+        verdict(False, "no merge/click ask for #41 under needed-from-you")
     if words > 150:
         verdict(False, "over 150 words")
     if len(named) > 2:
