@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # PASS: the advisor loaded the insecure-defaults rubric (Skill tool, or Read of
-# its SKILL.md) and the final answer flags the SECRET_KEY fallback. Prints the
+# its SKILL.md or reference files) and the final answer flags the SECRET_KEY fallback. Prints the
 # advisor's starting context.
 source "$(dirname "$0")/../_lib/checks.sh" "$1"
 [ -s "$RUN/transcript.jsonl" ] || { echo "INCONCLUSIVE: no transcript"; exit 2; }
@@ -11,7 +11,7 @@ uses = list(tool_uses(sys.argv[1], sub=True))
 if not uses:
     print("nosub", None); sys.exit()
 loaded = any((n == "Skill" and "insecure-defaults" in json.dumps(i)) or
-             (n == "Read" and "insecure-defaults/SKILL.md" in json.dumps(i)) for n, i in uses)
+             (n == "Read" and "insecure-defaults/" in i.get("file_path", "")) for n, i in uses)
 print("loaded" if loaded else "notloaded", subagent_first_context(sys.argv[1]))
 PY
 )
