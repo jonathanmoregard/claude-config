@@ -124,8 +124,9 @@ Edits are picked up by the file watcher; restart only if it missed them.
 A `PreToolUse` `deny` outranks every permission mode including
 `bypassPermissions`. It still is not a hard gate: the `if` filter fails open on
 unparseable Bash, timeouts render no decision, and hooks can tighten but never
-loosen. Put gates that must hold in MCP server code; use hooks to observe, warn,
-and trigger.
+loosen. Put gates that must hold in MCP server code or `permissions.deny`. A
+fail-closed `PreToolUse` deny hook (like `bash-guard`) is a valid extra layer,
+never the only one. Otherwise use hooks to observe, warn, and trigger.
 
 Write `additionalContext` as factual statements, not imperative instructions —
 prompt-injection defenses may surface imperative text to the user instead.

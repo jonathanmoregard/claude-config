@@ -1,0 +1,1 @@
+I'm torn on slug.py and stuck going back and forth: should slugify strip a trailing hyphen (e.g. from "foo_"), or is that the caller's problem? Get the advisor's take on it and tell me what it says. Don't change code.
