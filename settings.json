@@ -274,6 +274,7 @@
     ]
   },
   "model": "opus[1m]",
+  "autoCompactWindow": 400000,
   "enableAllProjectMcpServers": false,
   "hooks": {
     "PermissionDenied": [

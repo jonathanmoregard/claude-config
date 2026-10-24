@@ -11,7 +11,7 @@ WHY `Stop`
     Stop is the only hook event that recurs WITHOUT a human turn, and autonomy
     is the whole point: a trigger on UserPromptSubmit can only ever nudge,
     because it needs someone to type first. PreCompact is too late (it fires
-    only if a compaction happens at all, and the 70% nudge means the user
+    only if a compaction happens at all, and the 80% nudge means the user
     usually hands off instead). PostToolUse recurs but fires tens of times per
     turn for no extra signal. So: Stop, once per assistant turn.
 
@@ -128,7 +128,7 @@ import inplace_reset  # noqa: E402  (same shim; ships beside this file)
 
 # --- Fixed values, not settings ----------------------------------------------
 # Fire at 30% of the DETECTED context window — ~300k tokens on a 1M model, ~60k on
-# a 200k one. Deliberately aggressive relative to the 70% advisory nudge in
+# a 200k one. Deliberately aggressive relative to the 80% advisory nudge in
 # context-baggage.py (both are live and independent): the point is to hand off
 # while there is still ample runway, not at the ~92% auto-compact cliff.
 #
@@ -146,6 +146,15 @@ import inplace_reset  # noqa: E402  (same shim; ships beside this file)
 # a session resets itself. Set that to 200000 on a 1M model and the old code
 # fired at 10% real occupancy. Tokens are read from the transcript's own
 # recorded usage and cannot be talked into being something else.
+#
+# MUST STAY BELOW CLAUDE CODE'S AUTO-COMPACT POINT. settings.json caps the
+# window with `autoCompactWindow` (the backstop), and Claude Code 2.1.310
+# compacts at cap - 20k output reserve - 13k buffer: 367k at a 400k cap. If
+# Claude compacts first, the session never reaches this number and self-compact
+# never fires, so the warm-cache handoff silently becomes a summary-compact.
+# Absolute rather than derived from the cap, for the reason above; the coupling
+# is held by tests/test_context_window_cap.py, which reads settings.json and
+# fails if the cap is retuned below this plus Claude's reserves.
 FIRE_AT_TOKENS = 300_000
 
 # Ceiling on fires per session, for a session that oscillates across the
@@ -607,7 +616,10 @@ def main() -> int:
     if not cwd or not os.path.isdir(cwd):
         return 0
 
-    occ = context_usage.occupancy(transcript)
+    # The cap only shapes the recorded window/fill; the fire decision below is
+    # on absolute tokens (see FIRE_AT_TOKENS).
+    cap = context_usage.auto_compact_window(context_usage.user_settings_path(), os.environ)
+    occ = context_usage.occupancy(transcript, cap)
     if occ is None:
         return 0
     if occ.estimated:
@@ -776,7 +788,9 @@ def manual(instructions: str) -> int:
     state["last_manual_at"] = now
     write_json_atomic(state_path(sid), state)
 
-    occ = context_usage.occupancy(transcript)
+    occ = context_usage.occupancy(
+        transcript,
+        context_usage.auto_compact_window(context_usage.user_settings_path(), os.environ))
     request = {
         "session_id": sid,
         "cwd": cwd,

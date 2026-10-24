@@ -2592,6 +2592,17 @@ mk_context_transcript() {
              cache_read_input_tokens:$r,output_tokens:10}}}' >> "$path"
 }
 
+uncapped() {
+  # Run a context-occupancy entrypoint against the MODEL window only. The
+  # entrypoints read Claude Code's autoCompactWindow cap from
+  # $HOME/.claude/settings.json and CLAUDE_CODE_AUTO_COMPACT_WINDOW, so on the
+  # live host every window here would read 400k. The cap has its own tests
+  # (tests/test_context_window_cap.py); these pin the model-window detection.
+  local h
+  h="$(mktemp -d -t reflect-uncapped-XXXXXX)"
+  env -u CLAUDE_CODE_AUTO_COMPACT_WINDOW HOME="$h" "$@"
+}
+
 sc_home() {
   # An isolated $HOME wired to THIS worktree, so the hook and idle-handoff.sh
   # resolve their $HOME-derived paths into the code under test instead of the
@@ -2690,14 +2701,14 @@ sc_wait_marker() {
 }
 
 # ============================================================================
-# TEST 20: B1 — occupancy math lives in ONE place and keeps the 70% nudge
+# TEST 20: B1 — occupancy math lives in ONE place and keeps the 80% nudge
 # ============================================================================
-test_begin "TEST 20: B1 — shared context-occupancy module, 70% nudge preserved"
+test_begin "TEST 20: B1 — shared context-occupancy module, 80% nudge preserved"
 [[ -f "$SC_USAGE" ]] || fail "20: shared occupancy module missing at $SC_USAGE"
 B1_DIR="$(mktemp -d -t reflect-b1-XXXXXX)"
 
 mk_context_transcript "$B1_DIR/t1.jsonl" "claude-opus-5" 310000
-B1_J="$(python3 "$SC_USAGE" "$B1_DIR/t1.jsonl")" || fail "20: context_usage.py rc!=0"
+B1_J="$(uncapped python3 "$SC_USAGE" "$B1_DIR/t1.jsonl")" || fail "20: context_usage.py rc!=0"
 jq -e '.window == 1000000' <<<"$B1_J" >/dev/null \
   || fail "20: opus-5 must detect a 1M window (got $(jq -c .window <<<"$B1_J"))"
 jq -e '.total_tokens == 310000' <<<"$B1_J" >/dev/null \
@@ -2709,22 +2720,22 @@ jq -e '.estimated == false' <<<"$B1_J" >/dev/null || fail "20: reading from real
 # The `[1m]` marker must win over an unknown model name — that marker going
 # unread is exactly how the nudge once reported 89% during an 18% session.
 mk_context_transcript "$B1_DIR/t2.jsonl" "claude-zeta-9-20991231[1m]" 250000
-jq -e '.window == 1000000' <<<"$(python3 "$SC_USAGE" "$B1_DIR/t2.jsonl")" >/dev/null \
+jq -e '.window == 1000000' <<<"$(uncapped python3 "$SC_USAGE" "$B1_DIR/t2.jsonl")" >/dev/null \
   || fail "20: [1m] marker not honoured for an unknown model id"
 # 200k model stays 200k...
 mk_context_transcript "$B1_DIR/t3.jsonl" "claude-3-5-haiku-20241022" 100000
-jq -e '.window == 200000' <<<"$(python3 "$SC_USAGE" "$B1_DIR/t3.jsonl")" >/dev/null \
+jq -e '.window == 200000' <<<"$(uncapped python3 "$SC_USAGE" "$B1_DIR/t3.jsonl")" >/dev/null \
   || fail "20: unknown/legacy model must default to the 200k base window"
 # ...unless observed usage already exceeded it.
 mk_context_transcript "$B1_DIR/t4.jsonl" "claude-3-5-haiku-20241022" 250000
-jq -e '.window == 1000000' <<<"$(python3 "$SC_USAGE" "$B1_DIR/t4.jsonl")" >/dev/null \
+jq -e '.window == 1000000' <<<"$(uncapped python3 "$SC_USAGE" "$B1_DIR/t4.jsonl")" >/dev/null \
   || fail "20: observed-usage fallback must promote the window to 1M"
 # No usage at all -> estimate, and the CLI must refuse to hand a number to the
 # trigger (firing an expensive path off a byte-count guess is not acceptable).
 printf '%s\n' '{"type":"user","message":{"role":"user","content":"hi"}}' > "$B1_DIR/t5.jsonl"
-jq -e '.estimated == true' <<<"$(python3 "$SC_USAGE" "$B1_DIR/t5.jsonl")" >/dev/null \
+jq -e '.estimated == true' <<<"$(uncapped python3 "$SC_USAGE" "$B1_DIR/t5.jsonl")" >/dev/null \
   || fail "20: a usage-free transcript must be flagged estimated"
-python3 "$SC_USAGE" --fill-pct "$B1_DIR/t5.jsonl" >/dev/null 2>&1 \
+uncapped python3 "$SC_USAGE" --fill-pct "$B1_DIR/t5.jsonl" >/dev/null 2>&1 \
   && fail "20: --fill-pct must FAIL on an estimated reading"
 
 # Structural: context-baggage.py must consume the module, not carry a second copy.
@@ -2733,12 +2744,12 @@ grep -q 'context_usage' "$WORKTREE/context-baggage.py" \
 [[ "$(grep -c 'ONE_M_MODEL_PREFIXES *= *(' "$WORKTREE/context-baggage.py")" == "0" ]] \
   || fail "20: context-baggage.py still defines its own window-detection table (copy-paste)"
 
-# Behavioural: the 70% nudge is a separate, still-wanted feature.
-mk_context_transcript "$B1_DIR/t70.jsonl" "claude-opus-5" 750000
+# Behavioural: the 80% nudge is a separate, still-wanted feature.
+mk_context_transcript "$B1_DIR/t70.jsonl" "claude-opus-5" 850000
 B1_OUT="$(jq -cn --arg tp "$B1_DIR/t70.jsonl" '{transcript_path:$tp}' \
-  | python3 "$WORKTREE/context-baggage.py")" || fail "20: context-baggage.py rc!=0"
-grep -q 'Context is 75% full' <<<"$B1_OUT" \
-  || fail "20: 70% nudge stopped firing at 75% (out='$B1_OUT')"
+  | uncapped python3 "$WORKTREE/context-baggage.py")" || fail "20: context-baggage.py rc!=0"
+grep -q 'Context is 85% full' <<<"$B1_OUT" \
+  || fail "20: 80% nudge stopped firing at 85% (out='$B1_OUT')"
 # ...and it must send the human at a HUMAN-owned path. tasks/mission.md is a
 # machine-owned symlink to the copy of the out-of-repo handoff, so a write-through
 # would clobber the copy and the next mission run would overwrite the model's work.
@@ -2748,10 +2759,10 @@ if grep -q 'tasks/mission.md' <<<"$B1_OUT"; then
   fail "20: the nudge still tells the model to write tasks/mission.md — a machine-owned symlink"
 fi
 B1_OUT31="$(jq -cn --arg tp "$B1_DIR/t1.jsonl" '{transcript_path:$tp}' \
-  | python3 "$WORKTREE/context-baggage.py")" || fail "20: context-baggage.py rc!=0 at 31%"
+  | uncapped python3 "$WORKTREE/context-baggage.py")" || fail "20: context-baggage.py rc!=0 at 31%"
 [[ -z "$B1_OUT31" ]] \
-  || fail "20: the 30% self-compact threshold leaked into the 70% nudge (out='$B1_OUT31')"
-info "one occupancy implementation; 1M/[1m]/observed/estimate all correct; 70% nudge intact"
+  || fail "20: the 30% self-compact threshold leaked into the 80% nudge (out='$B1_OUT31')"
+info "one occupancy implementation; 1M/[1m]/observed/estimate all correct; 80% nudge intact"
 
 # ============================================================================
 # TEST 21: there is NO SWITCH, and no config file can turn the feature off
@@ -3910,7 +3921,7 @@ grep -q '"claude-fable-5"' "$SC_USAGE" \
   || fail "27: claude-fable-5 missing from context_usage.py's 1M prefix table"
 
 mk_context_transcript "$F2_DIR/fable.jsonl" "claude-fable-5" 310000
-F2_J="$(python3 "$SC_USAGE" "$F2_DIR/fable.jsonl")" || fail "27: context_usage.py rc!=0"
+F2_J="$(uncapped python3 "$SC_USAGE" "$F2_DIR/fable.jsonl")" || fail "27: context_usage.py rc!=0"
 jq -e '.window == 1000000 and .window_known == true and .window_source == "prefix_1m"' <<<"$F2_J" >/dev/null \
   || fail "27: fable-5 must detect a 1M window (got $F2_J)"
 jq -e '.fill_pct > 0.3099 and .fill_pct < 0.3101' <<<"$F2_J" >/dev/null \
@@ -3919,19 +3930,19 @@ jq -e '.fill_pct > 0.3099 and .fill_pct < 0.3101' <<<"$F2_J" >/dev/null \
 # Known-200k branch stays known (so the unknown branch below is narrow).
 mk_context_transcript "$F2_DIR/haiku.jsonl" "claude-haiku-4-5" 100000
 jq -e '.window == 200000 and .window_known == true and .window_source == "prefix_base"' \
-  <<<"$(python3 "$SC_USAGE" "$F2_DIR/haiku.jsonl")" >/dev/null \
+  <<<"$(uncapped python3 "$SC_USAGE" "$F2_DIR/haiku.jsonl")" >/dev/null \
   || fail "27: a known-200k family must report window_known=true"
 
 # Unknown branch: the denominator is a guess and says so.
 mk_context_transcript "$F2_DIR/unknown.jsonl" "claude-zeta-9-20991231" 61000
-F2_U="$(python3 "$SC_USAGE" "$F2_DIR/unknown.jsonl")" || fail "27: context_usage.py rc!=0 (unknown model)"
+F2_U="$(uncapped python3 "$SC_USAGE" "$F2_DIR/unknown.jsonl")" || fail "27: context_usage.py rc!=0 (unknown model)"
 jq -e '.window_known == false and .window_source == "assumed_base_unknown_model"' <<<"$F2_U" >/dev/null \
   || fail "27: an unheard-of model must report window_known=false (got $F2_U)"
 # ...and the money-spending CLI refuses it, exactly as it refuses an estimate.
-if python3 "$SC_USAGE" --fill-pct "$F2_DIR/unknown.jsonl" >/dev/null 2>&1; then
+if uncapped python3 "$SC_USAGE" --fill-pct "$F2_DIR/unknown.jsonl" >/dev/null 2>&1; then
   fail "27: --fill-pct handed out a reading whose denominator is a guess"
 fi
-python3 "$SC_USAGE" --fill-pct "$F2_DIR/fable.jsonl" >/dev/null \
+uncapped python3 "$SC_USAGE" --fill-pct "$F2_DIR/fable.jsonl" >/dev/null \
   || fail "27: --fill-pct must still work for a known window"
 
 # End to end: the trigger fires on fable-5 and REFUSES on the unknown window,
@@ -4319,9 +4330,9 @@ grep -qE 'fresh=[1-9]' <<<"$F8_TAIL" \
 # (c) usage_total raised TypeError on a null/non-numeric usage value, and
 #     context-baggage.py calls occupancy() with no try/except — so ONE malformed
 #     transcript line made the UserPromptSubmit hook traceback and exit 1,
-#     taking the 70% nudge down with it.
+#     taking the 80% nudge down with it.
 F8_BAD="$(mktemp -d -t reflect-f8bad-XXXXXX)"
-mk_context_transcript "$F8_BAD/t.jsonl" "claude-opus-5" 750000
+mk_context_transcript "$F8_BAD/t.jsonl" "claude-opus-5" 850000
 # Malformed lines AHEAD of the good one: null, string, list, and a null block.
 {
   printf '%s\n' '{"type":"assistant","message":{"role":"assistant","model":"claude-opus-5","usage":{"input_tokens":null,"cache_read_input_tokens":"lots","cache_creation_input_tokens":[1,2]}}}'
@@ -4334,13 +4345,13 @@ sys.path.insert(0, os.environ["WORKTREE"])
 import context_usage
 occ = context_usage.occupancy(sys.argv[1])
 assert occ is not None, "unreadable"
-assert occ.total_tokens == 750000, occ.total_tokens
+assert occ.total_tokens == 850000, occ.total_tokens
 PY
 F8_NUDGE="$(jq -cn --arg tp "$F8_BAD/mixed.jsonl" '{transcript_path:$tp}' \
-  | python3 "$WORKTREE/context-baggage.py")" \
+  | uncapped python3 "$WORKTREE/context-baggage.py")" \
   || fail "33c: the UserPromptSubmit hook exited non-zero on a malformed transcript line"
-grep -q 'Context is 75% full' <<<"$F8_NUDGE" \
-  || fail "33c: the 70% nudge stopped working with a malformed line present (out='$F8_NUDGE')"
+grep -q 'Context is 85% full' <<<"$F8_NUDGE" \
+  || fail "33c: the 80% nudge stopped working with a malformed line present (out='$F8_NUDGE')"
 # A usage block that is ENTIRELY non-numeric contributes nothing rather than raising.
 python3 - <<'PY' || fail "33c: usage_total did not coerce a fully non-numeric block"
 import sys, os

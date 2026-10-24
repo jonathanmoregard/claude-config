@@ -4,14 +4,14 @@ UserPromptSubmit hook: warns when context is over THRESHOLD with potentially
 stale/off-topic content. Fires every MESSAGE_INTERVAL user messages once
 threshold is met.
 
-This is the ADVISORY half of the context lifecycle: it nudges a human at 70%.
+This is the ADVISORY half of the context lifecycle: it nudges a human at 80%.
 The autonomous half is `self-compact-trigger.py`, a Stop hook that fires at 30% and
 runs UNCONDITIONALLY — there is no switch and no config key for it (USER DECISION
 2026-08-16; `components.self_compact` and `SELF_COMPACT_CONFIG` were deleted). What
 bounds it is idle-handoff.sh's guard chain, not an on/off setting.
 
 The two halves are independent in the only sense that matters here: separate hooks,
-separate thresholds (0.70 here, 0.30 there), and neither reads the other's state.
+separate thresholds (0.80 here, 300k there), and neither reads the other's state.
 Both read occupancy from `context_usage.py`, which owns the window-detection
 priority order:
     1. CLAUDE_CONTEXT_MAX env var (explicit override, in tokens)
@@ -20,6 +20,9 @@ priority order:
     4. Observed usage — if any assistant turn has exceeded 200k tokens,
        the session is 1M, regardless of model name
     5. Default 200k
+then capped at Claude Code's auto-compact window (settings.json
+`autoCompactWindow`, or CLAUDE_CODE_AUTO_COMPACT_WINDOW), read here at the edge
+and passed in.
 """
 import json
 import os
@@ -33,7 +36,11 @@ import context_usage  # noqa: E402  (path shim must precede the import)
 # hit ratio, holding baggage is cheap and resetting is expensive
 # (cache_write ~$5-10 per cold event). Nudge should fire when handoff to
 # a fresh session starts to pay off, not on any drift.
-THRESHOLD = 0.70
+# 0.70 -> 0.80 on 2026-10-24 when the autoCompactWindow cap (400k) made this
+# a fraction of 400k, not 1M: 0.70 (280k) would nudge before self-compact's
+# unattended handoff at 300k. 0.80 (320k) keeps the order self-compact ->
+# nudge -> Claude Code auto-compact (~367k); a test pins that order.
+THRESHOLD = 0.80
 MESSAGE_INTERVAL = 5
 
 
@@ -47,7 +54,11 @@ def main():
     if not transcript_path or not os.path.exists(transcript_path):
         sys.exit(0)
 
-    occ = context_usage.occupancy(transcript_path)
+    # THRESHOLD of the window Claude Code will actually let fill: with the
+    # settings.json autoCompactWindow cap (400k) a 1M session compacts long
+    # before 700k, so the uncapped window would make this nudge unreachable.
+    cap = context_usage.auto_compact_window(context_usage.user_settings_path(), os.environ)
+    occ = context_usage.occupancy(transcript_path, cap)
     if occ is None:
         sys.exit(0)
 
