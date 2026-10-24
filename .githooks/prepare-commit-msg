@@ -35,7 +35,7 @@ fi
 [ -n "$git_dir" ] && [ -n "$common_dir" ] || exit 0
 
 is_dot_claude_url() {
-  [[ "$1" =~ [:/]jonathanmoregard/\.claude(\.git)?/?$ ]]
+  [[ "$1" =~ [:/]jonathanmoregard/(\.claude|claude-config)(\.git)?/?$ ]]
 }
 
 origin_url="$(git config --local --get remote.origin.url 2>/dev/null || true)"

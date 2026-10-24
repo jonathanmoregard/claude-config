@@ -21,7 +21,7 @@ esac
 
 repo=$work/claude
 git clone -q --depth 1 --branch master file:///home/jonathan/.claude "$repo"
-git -C "$repo" remote set-url origin https://github.com/jonathanmoregard/.claude.git
+git -C "$repo" remote set-url origin https://github.com/jonathanmoregard/claude-config.git
 token="$(basename "$(dirname "$run")")-$(basename "$run")-$(date +%s)"
 printf 'e2e/git-broker-%s\n' "$token" >"$work/branch.txt"
 printf 'Scratch file from the git-broker agent e2e (%s). The PR is closed by the grader.\n' \

@@ -41,8 +41,8 @@ top="$(git -C "$target" rev-parse --show-toplevel 2>/dev/null)" \
 # not filesystem path: relocated checkouts still work; similarly named repos
 # do not.
 origin_url="$(git -C "$top" config --local --get remote.origin.url 2>/dev/null)"
-if ! [[ "$origin_url" =~ [:/]jonathanmoregard/\.claude(\.git)?/?$ ]]; then
-  die "refusing: $top origin does not point at jonathanmoregard/.claude.
+if ! [[ "$origin_url" =~ [:/]jonathanmoregard/(\.claude|claude-config)(\.git)?/?$ ]]; then
+  die "refusing: $top origin does not point at jonathanmoregard/claude-config.
   These hooks pin a branch and refuse ref updates; installing them on the
   wrong repository would be far worse than not installing them at all."
 fi

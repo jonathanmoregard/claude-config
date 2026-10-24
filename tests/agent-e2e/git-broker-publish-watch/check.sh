@@ -8,7 +8,7 @@ source "$(dirname "$0")/../_lib/checks.sh" "$1"
 arm=$(basename "$(dirname "$RUN")")
 final=$(tr -d '\r' <"$RUN/final.txt" | grep -E '^BROKER_E2E_' | tail -n 1)
 branch=$(cat "$RUN/work/branch.txt")
-repo=jonathanmoregard/.claude
+repo=jonathanmoregard/claude-config
 # The grader runs with the harness's throwaway HOME; gh finds the host token
 # from the real one.
 ghr() { HOME=/home/jonathan gh "$@"; }
@@ -36,7 +36,7 @@ line=${BASH_REMATCH[2]}
 view=$(ghr pr view "$pr" -R "$repo" --json isDraft,baseRefName,files \
   --jq '"\(.isDraft) \(.baseRefName) \([.files[].path] | join(","))"')
 [[ $view == "true master e2e-git-broker-probe.txt" ]] || fail "PR #$pr is '$view'"
-status=/run/user/$(id -u)/git-broker/watch/jonathanmoregard/.claude/pr-$pr.json
+status=/run/user/$(id -u)/git-broker/watch/jonathanmoregard/claude-config/pr-$pr.json
 [[ -f $status ]] || fail "no host watch status for PR #$pr"
 watched=$(jq -r '"\(.state) \(.exit) \(.line)"' "$status")
 [[ $watched == "done 0 "* ]] || fail "host watch for PR #$pr: $watched"

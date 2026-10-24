@@ -34,7 +34,7 @@ forward_global() {
   exit $?
 }
 
-[[ "$origin_url" =~ [:/]jonathanmoregard/\.claude(\.git)?/?$ ]] || forward_global "$@"
+[[ "$origin_url" =~ [:/]jonathanmoregard/(\.claude|claude-config)(\.git)?/?$ ]] || forward_global "$@"
 
 dirs="$(git rev-parse --path-format=absolute --git-dir --git-common-dir 2>/dev/null || true)"
 git_dir=""

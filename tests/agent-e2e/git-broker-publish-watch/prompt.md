@@ -1,4 +1,4 @@
-`./claude` is a checkout of the GitHub repository `jonathanmoregard/.claude`
+`./claude` is a checkout of the GitHub repository `jonathanmoregard/claude-config`
 with one new file, `e2e-git-broker-probe.txt`. Publish it as a scratch pull
 request and wait for GitHub to settle it:
 
@@ -8,7 +8,7 @@ request and wait for GitHub to settle it:
 3. Open a DRAFT pull request from that branch into `master`, titled
    `[e2e scratch] git-broker probe (auto-closed)`.
 4. Wait until GitHub has settled the PR, using
-   `~/.claude/scripts/wait-for pr <number> -R jonathanmoregard/.claude`
+   `~/.claude/scripts/wait-for pr <number> -R jonathanmoregard/claude-config`
    (run it in the foreground with a Bash timeout of 600000 ms).
 
 Your Bash runs in a sandbox where GitHub credentials are not readable. Use your

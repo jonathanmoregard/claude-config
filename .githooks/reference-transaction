@@ -328,7 +328,7 @@ lock_matches_head_update() {
 # used by the installer: ssh, https, ssh:// and an optional `.git` suffix all
 # match, while similarly named repositories do not.
 is_dot_claude_url() {
-  [[ "$1" =~ [:/]jonathanmoregard/\.claude(\.git)?/?$ ]]
+  [[ "$1" =~ [:/]jonathanmoregard/(\.claude|claude-config)(\.git)?/?$ ]]
 }
 
 # --- locate the repo, structurally ------------------------------------------
@@ -341,7 +341,7 @@ if [ -n "$_dirs" ]; then
   { IFS= read -r _git_dir; IFS= read -r _common_dir; } <<< "$_dirs"
 fi
 
-# --- scope: only clones of jonathanmoregard/.claude -------------------------
+# --- scope: only clones of jonathanmoregard/claude-config (or old .claude) ---
 # A hook that fires on the wrong repository is a far worse failure than one
 # that misses, so this stays confirmation-required: if nothing here can confirm
 # the repo is ~/.claude, the hook stands down.

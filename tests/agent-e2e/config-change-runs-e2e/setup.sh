@@ -10,7 +10,7 @@ LIB="$(cd "$(dirname "$0")/../_lib" && pwd)"
 
 cp "$LIB/gh" "$BIN/gh"; chmod +x "$BIN/gh"
 echo PRIVATE > "$RUN/visibility"
-echo jonathanmoregard/.claude > "$RUN/repo"
+echo jonathanmoregard/claude-config > "$RUN/repo"
 echo master > "$RUN/default-branch"
 : > "$RUN/gh.log"
 # The log goes to $E2E_SHARED, baked in at setup: an inner agent_e2e.py run
@@ -27,7 +27,7 @@ STUB
 chmod +x "$BIN/claude"
 
 cfg="$HOME/.claude"
-url=https://github.com/jonathanmoregard/.claude.git
+url=https://github.com/jonathanmoregard/claude-config.git
 git init -q --bare "$RUN/origin.git"
 git -C "$cfg" init -q -b master
 git -C "$cfg" config url."$RUN/origin.git".insteadOf "$url"

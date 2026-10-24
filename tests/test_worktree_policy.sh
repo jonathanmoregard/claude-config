@@ -13,7 +13,7 @@
 #     adds/removes worktrees, and can always get back onto master;
 #   * linked worktrees on feature branches behave like any other git repo;
 #   * every machine-wide hook still runs, with its exit status intact;
-#   * repositories that are not jonathanmoregard/.claude are untouched.
+#   * repositories that are not jonathanmoregard/claude-config are untouched.
 #
 # Run:  tests/test_worktree_policy.sh
 set -uo pipefail
@@ -81,8 +81,8 @@ settle() { git -C "$PRIMARY" reset -q --hard HEAD >/dev/null 2>&1; }
 head_of() { git -C "$1" rev-parse "${2:-HEAD}"; }
 branch_of() { git -C "$1" symbolic-ref --quiet --short HEAD || printf '(detached)'; }
 
-# --- an origin that looks like jonathanmoregard/.claude ----------------------
-ORIGIN="$ROOT/remote/jonathanmoregard/.claude.git"
+# --- an origin that looks like jonathanmoregard/claude-config ---------------
+ORIGIN="$ROOT/remote/jonathanmoregard/claude-config.git"
 PRIMARY="$ROOT/home/.claude"
 WT_ROOT="$ROOT/worktrees"
 export CLAUDE_WORKTREE_ROOT="$WT_ROOT"
@@ -135,7 +135,7 @@ if [ "$RC" -eq 0 ]; then ok "baseline: without the pin, a commit lands on the pa
 else bad "baseline: without the pin, a commit lands on the parked branch" "rc=$RC $OUT"; fi
 git -C "$PRIMARY" switch -q master
 
-expect_ok "installer activates on a jonathanmoregard/.claude clone" \
+expect_ok "installer activates on a jonathanmoregard/claude-config clone" \
   "$PRIMARY/scripts/install-worktree-policy.sh" "$PRIMARY"
 if [ "$(git -C "$PRIMARY" config --get core.hooksPath)" = "$PRIMARY/.githooks" ]; then
   ok "hooksPath is the absolute primary .githooks"
@@ -315,10 +315,10 @@ try env GLOBAL_FAIL_HOOK=pre-push git -C "$LINKED" push -q origin feat/policy-te
 OTHER="$ROOT/other"
 git init -q -b master "$OTHER"
 git -C "$OTHER" remote add origin git@github.com:someone/.claude-fork.git
-git -C "$OTHER" remote add mine git@github.com:jonathanmoregard/.claude.git
+git -C "$OTHER" remote add mine git@github.com:jonathanmoregard/claude-config.git
 git -C "$OTHER" config core.hooksPath "$PRIMARY/.githooks"
-expect_refused "installer rejects a repo whose origin is not jonathanmoregard/.claude" \
-  'origin does not point at jonathanmoregard/.claude' "$PRIMARY/scripts/install-worktree-policy.sh" "$OTHER"
+expect_refused "installer rejects a repo whose origin is not jonathanmoregard/claude-config" \
+  'origin does not point at jonathanmoregard/claude-config' "$PRIMARY/scripts/install-worktree-policy.sh" "$OTHER"
 expect_ok "hooks are inert in another repo (commit, switch, push)" bash -c "
   git -C '$OTHER' commit -q --allow-empty -m a && git -C '$OTHER' switch -q -c feat/x &&
   git -C '$OTHER' commit -q --allow-empty -m b && git -C '$OTHER' reset -q --hard HEAD~1"
