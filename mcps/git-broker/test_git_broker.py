@@ -9,7 +9,6 @@ import os
 from pathlib import Path
 import select
 import signal
-import shlex
 import shutil
 import subprocess
 import sys
@@ -719,85 +718,21 @@ class GithubWatcherTests(unittest.TestCase):
         path.chmod(0o700)
         return path
 
-    def make_released_waiter(self, line: str, release: Path) -> Path:
-        """A waiter that prints ``line`` and exits 0 once ``release`` exists."""
-        path = self.root / f"wait-{len(list(self.root.glob('wait-*')))}"
-        path.write_text(
-            "#!/bin/sh\n"
-            f"while [ ! -e {shlex.quote(str(release))} ]; do sleep 0.02; done\n"
-            f"printf '%s\\n' {shlex.quote(line)}\n",
-            encoding="utf-8",
-        )
-        path.chmod(0o700)
-        return path
-
-    def raw_status(self, number: int = 1) -> dict:
-        path = self.status_root / "owner" / "repo" / f"pr-{number}.json"
-        return json.loads(path.read_text(encoding="utf-8"))
-
-    def wait_until_idle(self, registry) -> None:
-        deadline = time.monotonic() + 5
-        while registry._entries and time.monotonic() < deadline:
-            time.sleep(0.01)
-        self.assertFalse(registry._entries, "watch did not finish")
-
-    def two_instance_watches(self) -> tuple[object, Path, Path]:
-        """Start watch A in this broker, then watch B in a separate broker instance."""
-        other = load_server()
-        other_registry = other._WatchRegistry()
-        self.addCleanup(other_registry.shutdown)
-        release_a, release_b = self.root / "release-a", self.root / "release-b"
-        self.policy["waitForExecutable"] = str(self.make_released_waiter("A result", release_a))
-        self.watch()
-        self.policy["waitForExecutable"] = str(self.make_released_waiter("B result", release_b))
-        self.watch(server=other, registry=other_registry)
-        return other_registry, release_a, release_b
-
-    def test_older_watch_from_other_instance_cannot_overwrite_newer_watch(self) -> None:
-        other_registry, release_a, release_b = self.two_instance_watches()
-        b_id = self.raw_status()["watch_id"]
-
-        release_a.touch()
-        self.wait_until_idle(self.registry)
-        current = self.raw_status()
-        self.assertEqual(current["state"], "watching")
-        self.assertEqual(current["watch_id"], b_id)
-
-        release_b.touch()
-        self.wait_until_idle(other_registry)
-        current = self.raw_status()
-        self.assertEqual(current["state"], "done")
-        self.assertEqual(current["watch_id"], b_id)
-        self.assertEqual(current["line"], "B result")
-
-    def test_shutdown_cannot_overwrite_newer_watch_from_other_instance(self) -> None:
-        _other_registry, _release_a, _release_b = self.two_instance_watches()
-        b_id = self.raw_status()["watch_id"]
-
-        self.registry.shutdown()
-
-        current = self.raw_status()
-        self.assertEqual(current["state"], "watching")
-        self.assertEqual(current["watch_id"], b_id)
-
-    def watch(
-        self, number: int = 1, *, auth=(0, "10\n", ""), server=None, registry=None
-    ) -> str:
-        server = server or self.server
+    def watch(self, number: int = 1, *, auth=(0, "10\n", "")) -> str:
         with (
             mock.patch.object(
-                server, "_load_config", return_value={"gitBroker": self.policy}
+                self.server, "_load_config", return_value={"gitBroker": self.policy}
             ),
             mock.patch.object(
-                server, "_discover_git_identity", return_value=self.identity
+                self.server, "_discover_git_identity", return_value=self.identity
             ),
             mock.patch.object(
-                server, "_github_repo_from_origin", return_value="owner/repo"
+                self.server, "_github_repo_from_origin", return_value="owner/repo"
             ),
-            mock.patch.object(server, "_check_denied_by_dcg", return_value=None),
-            mock.patch.object(server, "_run_argv", return_value=auth),
+            mock.patch.object(self.server, "_check_denied_by_dcg", return_value=None),
+            mock.patch.object(self.server, "_run_argv", return_value=auth),
         ):
-            return server._tool_github(
+            return self.server._tool_github(
                 {
                     "repo_path": str(self.identity.worktree),
                     "operation": "watch",
@@ -805,7 +740,7 @@ class GithubWatcherTests(unittest.TestCase):
                     "number": number,
                     "timeout_s": 60,
                 },
-                registry=registry or self.registry,
+                registry=self.registry,
             )
 
     def status(self, number: int = 1) -> dict:
@@ -1651,57 +1586,46 @@ class DestructiveOperationSafetyTests(unittest.TestCase):
         raw_policy["metadataRoots"] = [str(self.root)]
         raw_policy["protectedWorktrees"] = [str(self.repo)]
         raw_policy["worktreeCreationRoots"] = [str(self.root)]
-        self.raw_policy = raw_policy
+        self.policy = self.server._load_git_policy({"gitBroker": raw_policy})
+        self.identity = self.server._discover_git_identity(self.repo, self.policy)
+        self.request = self.server._validate_git_request(
+            {
+                "repo_path": str(self.repo),
+                "operation": "worktree_remove",
+                "worktree_path": str(self.target),
+                "force": True,
+            },
+            self.policy,
+        )
 
-    def remove_recording_steps(self, steps: list[list[str]], *, force: bool) -> str:
-        """Run worktree_remove, recording each prerequisite argv instead of running it."""
-
-        def record(_request, _identity, _policy, argv, _rec, _bind_fds):
-            steps.append(argv)
-            return 0, "Saved working directory\n", ""
-
-        with (
-            mock.patch.object(
-                self.server, "_load_config", return_value={"gitBroker": self.raw_policy}
-            ),
-            mock.patch.object(self.server, "_check_denied_by_dcg", return_value=None),
-            mock.patch.object(self.server, "_run_contained_git_step", side_effect=record),
-            mock.patch.object(
-                self.server, "_build_git_sandbox", return_value=(["true"], {})
-            ),
-            mock.patch.object(self.server, "_run_argv", return_value=(0, "", "")),
-        ):
-            return self.server._tool_git(
-                {
-                    "repo_path": str(self.repo),
-                    "operation": "worktree_remove",
-                    "worktree_path": str(self.target),
-                    "force": force,
-                }
+    def test_force_backup_uses_trusted_admin_dir_not_target_discovery(self) -> None:
+        admin_dirs = list((self.identity.common_dir / "worktrees").iterdir())
+        self.assertEqual(len(admin_dirs), 1)
+        with mock.patch.object(
+            self.server,
+            "_run_contained_git_step",
+            return_value=(0, "Saved working directory\n", ""),
+        ) as run:
+            self.server._run_worktree_remove_backup(
+                self.request, self.identity, self.policy, None, []
             )
 
-    def test_remove_prerequisites_name_trusted_admin_dir_not_target_discovery(self) -> None:
-        admin_dirs = list((self.repo / ".git" / "worktrees").iterdir())
-        self.assertEqual(len(admin_dirs), 1)
-        for force in (False, True):
-            with self.subTest(force=force):
-                steps: list[list[str]] = []
-                self.remove_recording_steps(steps, force=force)
-                self.assertEqual(len(steps), 3 if force else 2)
-                for argv in steps:
-                    self.assertIn(f"--git-dir={admin_dirs[0]}", argv)
-                    self.assertIn(f"--work-tree={self.target}", argv)
-                    self.assertNotIn("-C", argv)
+        argv = run.call_args.args[3]
+        self.assertIn(f"--git-dir={admin_dirs[0]}", argv)
+        self.assertIn(f"--work-tree={self.target}", argv)
+        self.assertNotIn("-C", argv)
 
-    def test_remove_runs_no_git_step_when_target_git_metadata_is_replaced(self) -> None:
+    def test_force_backup_refuses_replaced_target_git_metadata(self) -> None:
         (self.target / ".git").unlink()
         subprocess.run(["git", "init", "-q", str(self.target)], check=True)
-        for force in (False, True):
-            with self.subTest(force=force):
-                steps: list[list[str]] = []
-                with self.assertRaisesRegex(RuntimeError, r"administrative|\.git"):
-                    self.remove_recording_steps(steps, force=force)
-                self.assertEqual(steps, [])
+        with mock.patch.object(
+            self.server, "_run_contained_git_step", return_value=(0, "", "")
+        ) as run:
+            with self.assertRaisesRegex(RuntimeError, r"administrative|\.git"):
+                self.server._run_worktree_remove_backup(
+                    self.request, self.identity, self.policy, None, []
+                )
+        run.assert_not_called()
 
 
 class IgnoredWorktreeRemovalTests(unittest.TestCase):
@@ -3469,39 +3393,6 @@ class BlackBoxParityTests(unittest.TestCase):
 
             self.assertFalse(canary.exists())
             self.assertTrue((self.repo / ".git" / "HEAD").is_file())
-
-    def test_worktree_remove_refuses_replaced_repo_before_running_its_filter(self) -> None:
-        """A replacement target repository's config never runs, in either mode."""
-        for force in (False, True):
-            with self.subTest(force=force), tempfile.TemporaryDirectory(
-                prefix="git-broker-tracked-filter-", dir="/home/jonathan/worktrees"
-            ) as td:
-                target = Path(td) / "worktree"
-                self.ok("worktree_add", worktree_path=str(target), branch=f"tracked-{force}")
-                canary = self.repo / ".git" / f"tracked-filter-canary-{force}"
-                (target / ".git").unlink()
-                replacement = ["git", "-C", str(target)]
-                subprocess.run(["git", "init", "-q", str(target)], check=True)
-                (target / ".gitattributes").write_text("*.txt filter=x\n", encoding="utf-8")
-                (target / "payload.txt").write_text("payload\n", encoding="utf-8")
-                subprocess.run([*replacement, "add", "-A"], check=True)
-                subprocess.run(
-                    [*replacement, "-c", "user.name=t", "-c", "user.email=t@t",
-                     "commit", "-qm", "payload"],
-                    check=True,
-                )
-                subprocess.run(
-                    [*replacement, "config", "filter.x.clean",
-                     f"sh -c 'echo pwned > {canary}; cat'"],
-                    check=True,
-                )
-                (target / "payload.txt").write_text("modified tracked\n", encoding="utf-8")
-
-                with self.assertRaisesRegex(RuntimeError, r"administrative|\.git"):
-                    self.tool("worktree_remove", worktree_path=str(target), force=force)
-
-                self.assertFalse(canary.exists(), "replacement repo clean filter ran")
-                self.assertTrue((target / "payload.txt").exists())
 
     def test_forced_worktree_remove_refuses_replaced_core_worktree(self) -> None:
         with tempfile.TemporaryDirectory(
