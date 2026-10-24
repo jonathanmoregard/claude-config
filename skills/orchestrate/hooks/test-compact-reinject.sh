@@ -111,4 +111,34 @@ echo "$OUT" | grep -qE '(^| )tasks/(mission|session-constraints)\.md' \
 OUT=$(HOME="$TMP/empty-home" bash "$SCRIPT")
 [[ -z "$OUT" ]] || { echo "FAIL: expected silence with no notes anywhere; got: $OUT"; exit 1; }
 
+# Case 8: STALE mission files (old session's leftovers) are not this session's work:
+# no mission reminder, in either location. A fresh one alongside revives it.
+STALE_HOME="$TMP/home-stale"
+STALE_DIR="$STALE_HOME/.local/state/claude-tasks/${TMP##*/}"
+mkdir -p "$STALE_DIR"
+touch -d '3 days ago' "$STALE_DIR/mission-old-topic.md"
+OUT=$(HOME="$STALE_HOME" bash "$SCRIPT")
+[[ -z "$OUT" ]] || { echo "FAIL: stale userspace mission produced a reminder; got: $OUT"; exit 1; }
+mkdir -p tasks; touch -d '3 days ago' tasks/mission.md
+OUT=$(HOME="$STALE_HOME" bash "$SCRIPT")
+[[ -z "$OUT" ]] || { echo "FAIL: stale tasks/ mission produced a reminder; got: $OUT"; exit 1; }
+: > "$STALE_DIR/mission.md"
+OUT=$(HOME="$STALE_HOME" bash "$SCRIPT")
+echo "$OUT" | grep -q 'context-lifecycle' || { echo "FAIL: fresh mission beside stale ones gave no reminder"; exit 1; }
+
+# Case 9: an armed ralph loop still gets its doctrine when every mission file is stale.
+rm -f "$STALE_DIR/mission.md"
+arm 4 '"x"' "$NOW_TS"
+OUT=$(run)
+echo "$OUT" | grep -q 'iteration 4' || { echo "FAIL: armed loop lost its doctrine with stale missions"; exit 1; }
+rm -f "$STATE"; rm -r tasks
+
+# Case 10: a session-reflect resolved handoff counts regardless of file age.
+RES_HOME="$TMP/home-resolved"
+mkdir -p "$RES_HOME/.claude/skills/session-reflect"
+: > "$TMP/handoff-mission.md"; touch -d '3 days ago' "$TMP/handoff-mission.md"
+printf '#!/usr/bin/env bash\necho "%s"\n' "$TMP/handoff-mission.md" > "$RES_HOME/.claude/skills/session-reflect/reflect.sh"
+OUT=$(HOME="$RES_HOME" bash "$SCRIPT")
+echo "$OUT" | grep -qF "$TMP/handoff-mission.md" || { echo "FAIL: resolved handoff gave no reminder; got: $OUT"; exit 1; }
+
 echo "PASS"

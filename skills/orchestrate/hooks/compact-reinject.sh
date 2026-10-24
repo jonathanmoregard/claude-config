@@ -8,6 +8,12 @@
 #   interpolation so a corrupted file cannot execute via $(…) expansion.
 set -euo pipefail
 
+# A notes-dir mission*.md only counts as THIS session's live work if touched within
+# this window; older ones are leftovers of earlier sessions (a long-lived project dir
+# accumulates them) and reminding about them wastes tokens and misleads. Does not
+# apply to the session-reflect resolved handoff, which is session-keyed already.
+MISSION_FRESH_MINUTES=1440
+
 # Resolved relative to THIS script, never via $HOME: the tests redirect HOME to
 # a fake home to assert the no-notes-anywhere cases, and a $HOME-anchored source
 # path would vanish under them.
@@ -27,19 +33,25 @@ STATE="$(ralph_state_for_dir "$PWD" || true)"
 # to any more is worse than no reminder at all.
 NOTES_USERSPACE="$HOME/.local/state/claude-tasks/${PWD##*/}"
 NOTES=""
+LIVE_NOTES=""  # first dir holding a RECENT mission*.md (see MISSION_FRESH_MINUTES)
 for _d in "tasks" "$NOTES_USERSPACE"; do
   # EXISTENCE CHECK ONLY, and deliberately a GLOB: "does this project use the
   # mission convention at all". The files it matches are human-readable copies —
   # the authoritative handoff lives outside the repo — so this must never be read
   # as content, only counted.
-  if compgen -G "$_d/mission*.md" >/dev/null 2>&1; then NOTES="$_d"; break; fi
+  if [[ -z "$NOTES" ]] && compgen -G "$_d/mission*.md" >/dev/null 2>&1; then NOTES="$_d"; fi
+  if [[ -z "$LIVE_NOTES" && -n "$(find "$_d" -maxdepth 1 -name 'mission*.md' -mmin "-$MISSION_FRESH_MINUTES" -print -quit 2>/dev/null)" ]]; then
+    LIVE_NOTES="$_d"
+  fi
 done
 # What the reminders NAME. With no notes anywhere yet, name userspace: that is where
 # this project's notes are supposed to go.
 NOTES_SHOWN="${NOTES:-$NOTES_USERSPACE}"
 
+# Set below once the session-reflect handoff is resolved.
+RESOLVED_LIVE=0
 mission_exists() {
-  [[ -n "$NOTES" ]]
+  [[ -n "$LIVE_NOTES" || "$RESOLVED_LIVE" == 1 ]]
 }
 
 # Name the AUTHORITATIVE handoff when session-reflect can resolve one
@@ -49,10 +61,10 @@ mission_exists() {
 # an interactive session whose human owns this cwd. It never drives an unattended
 # fork, which is why idle-handoff.sh has no such fallback.
 RESOLVE="$HOME/.claude/skills/session-reflect/reflect.sh"
-MISSION="$NOTES_SHOWN/mission.md"
+MISSION="${LIVE_NOTES:-$NOTES_SHOWN}/mission.md"
 if [[ -x "$RESOLVE" || -f "$RESOLVE" ]]; then
   RESOLVED="$(bash "$RESOLVE" --mission-path "$PWD" </dev/null 2>/dev/null || true)"
-  [[ -n "$RESOLVED" && -f "$RESOLVED" ]] && MISSION="$RESOLVED"
+  [[ -n "$RESOLVED" && -f "$RESOLVED" ]] && { MISSION="$RESOLVED"; RESOLVED_LIVE=1; }
 fi
 
 # Two independent reminders. Neither depends on the other; exit 0 if neither
