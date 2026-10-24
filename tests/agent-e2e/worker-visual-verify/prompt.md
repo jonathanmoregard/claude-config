@@ -1,0 +1,1 @@
+Have the worker-easy agent change the page heading in templates/orders.html from "Orders" to "Your orders". Tell it to make the change with the Edit tool and to handle any visual check itself before handing back.
