@@ -90,6 +90,31 @@ def test_native_statusline_is_passive_and_compact(tmp_path):
     assert snap["rate_limits"] == STATUSLINE_STDIN["rate_limits"]
 
 
+def _with_usage(usage):
+    doc = json.loads(json.dumps(STATUSLINE_STDIN))
+    doc["context_window"]["current_usage"] = usage
+    return json.dumps(doc).encode()
+
+
+def test_native_statusline_shows_cache_hit_ratio(tmp_path):
+    usage = {"input_tokens": 2, "cache_creation_input_tokens": 4169,
+             "cache_read_input_tokens": 102530, "output_tokens": 313}
+    proc = run_tee(_with_usage(usage), base_env(tmp_path))
+    assert proc.returncode == 0
+    assert proc.stdout.decode().strip().endswith("38% week \u00b7 cache 96%")
+
+
+@pytest.mark.parametrize("usage", [
+    None, {}, {"input_tokens": 0, "cache_creation_input_tokens": 0,
+              "cache_read_input_tokens": 0},
+    {"input_tokens": "x", "cache_read_input_tokens": []},
+])
+def test_native_statusline_omits_cache_segment_without_usable_usage(tmp_path, usage):
+    proc = run_tee(_with_usage(usage), base_env(tmp_path))
+    assert proc.returncode == 0
+    assert proc.stdout == b"Fable 5.1 \xc2\xb7 27% ctx \xc2\xb7 12% 5h \xc2\xb7 38% week\n"
+
+
 def test_native_statusline_survives_garbage_stdin(tmp_path):
     proc = run_tee(b"not json", base_env(tmp_path))
     assert proc.returncode == 0
