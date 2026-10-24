@@ -3,7 +3,7 @@ name: worker-easy
 description: Implements localized, well-specified changes that follow an established pattern and have clear checks. Use for routine work; not architecture, security-sensitive changes, migrations, or complex debugging.
 model: claude-sonnet-5-5
 effort: medium
-disallowedTools: ["Agent", "Skill"]
+disallowedTools: ["Agent", "Skill", "Artifact", "Workflow", "CronCreate", "CronDelete", "CronList", "RemoteTrigger", "ScheduleWakeup", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode", "EnterWorktree", "ExitWorktree", "DesignSync", "ListAgents", "SendMessage", "ReportFindings"]
 skills: ["test-driven-development", "verification-before-completion"]
 ---
 
