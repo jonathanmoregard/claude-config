@@ -145,6 +145,19 @@ def main() -> int:
         check("human sees a one-line notice", sm and "\n" not in sm and "2 open" in sm, sm)
         check("oldest date is reported", "2026-09-08" in sm, sm)
 
+        section("recurring blocker collapses to one line")
+        recurring = "".join(
+            f"## {d}: ranking evidence disagrees with pins ({n})\n\nbody\n\n"
+            for d, n in (("2026-10-20", "2 models"), ("2026-09-15", "1 model"), ("2026-10-01", "1 model")))
+        pf.write_text("# Pending for human\n\n" + recurring + ENTRY_A, encoding="utf-8")
+        c = ctx(parsed(run_hook(notes, payload(repo))))
+        check("count still covers every entry", "4 open" in c, c)
+        check("one grouped line with ×3 and date span",
+              c.count("ranking evidence") == 1 and "×3 (2026-09-15 … 2026-10-20)" in c, c)
+        check("distinct blocker kept as its own line", "Deployer hung" in c, c)
+        pf.write_text("# Pending for human\n\n" + ENTRY_B + "\n" + RESOLVED + "\n" + ENTRY_A,
+                      encoding="utf-8")
+
         section("compact re-injects for Claude without re-notifying the human")
         out = parsed(run_hook(notes, payload(repo, "compact")))
         check("compact: context present", "Deployer hung" in ctx(out), str(out))
