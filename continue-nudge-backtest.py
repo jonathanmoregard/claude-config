@@ -20,7 +20,7 @@ from importlib import import_module  # noqa: E402
 
 classifier = import_module("continue-nudge-classifier")
 
-DEFAULT_IN = Path.home() / ".claude" / "continue-nudge" / "labels.jsonl"
+DEFAULT_IN = Path.home() / ".local" / "share" / "continue-nudge" / "labels.jsonl"
 
 # Map ground-truth label strings to the verdict token we'd expect.
 LABEL_TO_VERDICT = {

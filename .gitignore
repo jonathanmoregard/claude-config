@@ -9,7 +9,12 @@
 # Ephemeral state
 history.jsonl
 mcp-needs-auth-cache.json
-dates/state.json
+# Personal data moved out of the repo (now ~/.config/claude-dates,
+# ~/.local/share/continue-nudge, notes archive); never re-track it here.
+dates/
+continue-nudge/
+logs/
+/pending_for_human.md
 last-statusline.json
 
 # Plugin runtime data

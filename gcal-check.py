@@ -14,7 +14,7 @@ Needs the icalendar and recurring-ical-events packages; date-check.sh runs
 this under a nix-provided python that has them.
 
 Usage:
-  python3 ~/.claude/gcal-check.py --partner "the partner" --days 31
+  python3 ~/.claude/gcal-check.py --partner "<name>" --days 31
 """
 import argparse
 import urllib.request

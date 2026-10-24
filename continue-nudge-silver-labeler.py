@@ -19,9 +19,9 @@ import sys
 import time
 from pathlib import Path
 
-DEFAULT_IN = Path.home() / ".claude" / "continue-nudge" / "labels.jsonl"
+DEFAULT_IN = Path.home() / ".local" / "share" / "continue-nudge" / "labels.jsonl"
 FABLE_TIMEOUT = 90
-CWD = str(Path.home() / ".claude" / "continue-nudge")
+CWD = str(Path.home() / ".local" / "share" / "continue-nudge")
 
 # Different phrasing from the classifier prompt on purpose.
 # The classifier is asked "should we nudge Claude?"; the silver labeler is
