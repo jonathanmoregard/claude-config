@@ -140,9 +140,15 @@ def usable_capacity(window: int) -> int:
     return max(1, window - CLAUDE_OUTPUT_RESERVE - CLAUDE_COMPACT_BUFFER)
 
 
-def user_settings_path() -> Path:
-    """Claude Code's user settings file, where `autoCompactWindow` lives."""
-    return Path.home() / ".claude" / "settings.json"
+def user_settings_path(environ: Mapping[str, str]) -> Path:
+    """Claude Code's user settings file, where `autoCompactWindow` lives.
+
+    Claude Code relocates its user config dir to ``CLAUDE_CONFIG_DIR`` when set
+    (a profile); reading ~/.claude there would apply another profile's cap.
+    """
+    config_dir = environ.get("CLAUDE_CONFIG_DIR")
+    base = Path(config_dir).expanduser() if config_dir else Path.home() / ".claude"
+    return base / "settings.json"
 
 
 def _env_cap(raw: str) -> int | None:
@@ -411,7 +417,7 @@ def main(argv: list[str]) -> int:
         print(occ.total_tokens)
         return 0
 
-    occ = occupancy(args[0], auto_compact_window(user_settings_path(), os.environ))
+    occ = occupancy(args[0], auto_compact_window(user_settings_path(os.environ), os.environ))
     if occ is None:
         print(f"context_usage: cannot read transcript {args[0]}", file=sys.stderr)
         return 1

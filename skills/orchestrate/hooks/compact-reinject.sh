@@ -68,16 +68,18 @@ mission_exists() {
 # an interactive session whose human owns this cwd. It never drives an unattended
 # fork, which is why idle-handoff.sh has no such fallback.
 #
-# The resolver returns the NEWEST handoff for this project dir — any session, any
-# age — so it counts only when its <sid> (…/<sid>/handoff/mission.md) is this
-# session's: a /compact keeps the session id, so that is the handoff this context
-# was working from. Another session's handoff is not named either. A cross-session
+# The resolver is asked for THIS session's handoff for this project dir, any age:
+# a /compact keeps the session id, so that is the handoff this context was working
+# from. Filtering by session BEFORE selection matters — the unfiltered resolver
+# returns the newest handoff across all sessions, so a newer foreign one would
+# hide ours. The <sid> (…/<sid>/handoff/mission.md) is re-checked on the way out.
+# Another session's handoff is never named. A cross-session
 # continuation needs no reminder: the in-place reset's pickup message and the
 # idle-handoff fork's prompt both name their handoff explicitly.
 RESOLVE="$HOME/.claude/skills/session-reflect/reflect.sh"
 MISSION="${LIVE_NOTES:-$NOTES_SHOWN}/mission.md"
 if [[ -n "$HOOK_SESSION" && ( -x "$RESOLVE" || -f "$RESOLVE" ) ]]; then
-  RESOLVED="$(bash "$RESOLVE" --mission-path "$PWD" </dev/null 2>/dev/null || true)"
+  RESOLVED="$(bash "$RESOLVE" --mission-path "$PWD" "$HOOK_SESSION" </dev/null 2>/dev/null || true)"
   if [[ -n "$RESOLVED" && -f "$RESOLVED" ]]; then
     RESOLVED_SID="$(basename -- "$(dirname -- "$(dirname -- "$RESOLVED")")")"
     [[ "$RESOLVED_SID" == "$HOOK_SESSION" ]] && { MISSION="$RESOLVED"; RESOLVED_LIVE=1; }

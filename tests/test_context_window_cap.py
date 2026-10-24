@@ -137,7 +137,7 @@ def test_occupancy_fill_is_relative_to_the_capped_window(tmp_path):
 
 def run_hook(script: str, payload: dict, home: Path, env_extra: dict | None = None):
     env = {k: v for k, v in os.environ.items()
-           if k not in ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "CLAUDE_CONTEXT_MAX")}
+           if k not in ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "CLAUDE_CONTEXT_MAX", "CLAUDE_CONFIG_DIR")}
     env.update({"HOME": str(home)}, **(env_extra or {}))
     return subprocess.run([sys.executable, str(REPO / script)],
                           input=json.dumps(payload), capture_output=True,
@@ -161,6 +161,27 @@ def test_nudge_honours_the_env_cap(tmp_path):
     assert "Context is 97% full: 260k of the 267k tokens" in out.stdout
 
 
+def test_settings_path_follows_claude_config_dir(tmp_path):
+    assert context_usage.user_settings_path({"CLAUDE_CONFIG_DIR": str(tmp_path / "p")}) \
+        == tmp_path / "p" / "settings.json"
+    assert context_usage.user_settings_path({}) == Path.home() / ".claude" / "settings.json"
+    assert context_usage.user_settings_path({"CLAUDE_CONFIG_DIR": ""}) \
+        == Path.home() / ".claude" / "settings.json"
+
+
+def test_nudge_reads_the_profile_settings_under_claude_config_dir(tmp_path):
+    # Default settings cap at 420k (silent at 260k); the active profile caps at 300k.
+    write_settings(tmp_path, {"autoCompactWindow": 420_000})
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    (profile / "settings.json").write_text(json.dumps({"autoCompactWindow": 300_000}))
+    t = write_transcript(tmp_path / "t.jsonl", "claude-opus-5[1m]", 260_000)
+    out = run_hook("context-baggage.py", {"transcript_path": str(t)}, tmp_path,
+                   {"CLAUDE_CONFIG_DIR": str(profile)})
+    assert out.returncode == 0, out.stderr
+    assert "Context is 97% full: 260k of the 267k tokens" in out.stdout
+
+
 def test_nudge_silent_below_threshold_without_a_cap(tmp_path):
     t = write_transcript(tmp_path / "t.jsonl", "claude-opus-5[1m]", 290_000)
     out = run_hook("context-baggage.py", {"transcript_path": str(t)}, tmp_path)
@@ -172,7 +193,7 @@ def test_cli_reports_the_capped_window(tmp_path):
     write_settings(tmp_path, {"autoCompactWindow": 400_000})
     t = write_transcript(tmp_path / "t.jsonl", "claude-opus-5", 200_000)
     env = {k: v for k, v in os.environ.items()
-           if k not in ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "CLAUDE_CONTEXT_MAX")}
+           if k not in ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "CLAUDE_CONTEXT_MAX", "CLAUDE_CONFIG_DIR")}
     env["HOME"] = str(tmp_path)
     out = subprocess.run([sys.executable, str(REPO / "context_usage.py"), str(t)],
                          capture_output=True, text=True, env=env, timeout=30)
@@ -186,6 +207,7 @@ def test_self_compact_request_records_the_capped_window(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", raising=False)
     monkeypatch.delenv("CLAUDE_CONTEXT_MAX", raising=False)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("REFLECT_SUBPROCESS", raising=False)
     monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "cli")
     monkeypatch.setenv("CLAUDE_SESSIONS_DIR", str(tmp_path / "sessions"))

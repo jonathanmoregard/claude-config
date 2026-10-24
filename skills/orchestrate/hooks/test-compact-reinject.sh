@@ -186,4 +186,32 @@ OUT=$(HOME="$LINK_HOME" bash "$SCRIPT")
 echo "$OUT" | grep -q 'context-lifecycle' || { echo "FAIL: fresh mission behind symlinked tasks/ gave no reminder; got: $OUT"; exit 1; }
 rm tasks
 
+# Case 12: the REAL resolver, with a NEWER handoff from another session for the same
+# cwd. This session's older handoff must still be found: the session filter applies
+# before newest-first selection, not after it. The foreign one is never named.
+REAL_HOME="$TMP/home-real"; mkdir -p "$REAL_HOME/.claude/skills"
+ln -s "$(cd "$(dirname "$SCRIPT")/../../session-reflect" && pwd)" "$REAL_HOME/.claude/skills/session-reflect"
+REAL_SESSIONS="$TMP/real-sessions"
+plant() {  # $1=sid  $2=recorded cwd  $3=handoff age (touch -d)
+  mkdir -p "$REAL_SESSIONS/$1/handoff"
+  printf '%s\n' "$2" > "$REAL_SESSIONS/$1/cwd"
+  : > "$REAL_SESSIONS/$1/handoff/mission.md"; touch -d "$3" "$REAL_SESSIONS/$1/handoff/mission.md"
+}
+plant sid-mine-3333 "$TMP" '2 days ago'
+plant sid-other-4444 "$TMP" '1 hour ago'
+plant sid-elsewhere-5555 "/nonexistent/elsewhere" '3 days ago'
+real() { HOME="$REAL_HOME" CLAUDE_SESSIONS_DIR="$REAL_SESSIONS" bash "$SCRIPT"; }
+OUT=$(payload sid-mine-3333 | real)
+echo "$OUT" | grep -qF "$REAL_SESSIONS/sid-mine-3333/handoff/mission.md" \
+  || { echo "FAIL: newer foreign handoff hid this session's handoff; got: $OUT"; exit 1; }
+echo "$OUT" | grep -qF "sid-other-4444" && { echo "FAIL: reminder named another session's handoff; got: $OUT"; exit 1; }
+
+# 12b: a session with no handoff of its own stays silent beside foreign ones.
+OUT=$(payload sid-none-6666 | real)
+[[ -z "$OUT" ]] || { echo "FAIL: session without a handoff got a reminder; got: $OUT"; exit 1; }
+
+# 12c: this session's handoff recorded for ANOTHER cwd is not this project's.
+OUT=$(payload sid-elsewhere-5555 | real)
+[[ -z "$OUT" ]] || { echo "FAIL: handoff recorded for another cwd produced a reminder; got: $OUT"; exit 1; }
+
 echo "PASS"

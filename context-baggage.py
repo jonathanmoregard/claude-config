@@ -65,7 +65,7 @@ def main():
     # THRESHOLD of the window Claude Code will actually let fill: with the
     # settings.json autoCompactWindow cap (420k) a 1M session compacts long
     # before 700k, so the uncapped window would make this nudge unreachable.
-    cap = context_usage.auto_compact_window(context_usage.user_settings_path(), os.environ)
+    cap = context_usage.auto_compact_window(context_usage.user_settings_path(os.environ), os.environ)
     occ = context_usage.occupancy(transcript_path, cap)
     if occ is None:
         sys.exit(0)

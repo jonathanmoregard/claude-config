@@ -51,6 +51,7 @@ source "$SCRIPT_DIR/lib.sh"
 
 ARG1="${1:-}"
 ARG2="${2:-}"
+ARG3="${3:-}"
 
 # --- Recursion break: reflection subprocess itself fires hooks ---------------
 # The reflection worker invokes `claude -p --resume <sid> --fork-session ...`.
@@ -201,9 +202,11 @@ Modes:
 
 Introspection:
   --budgets           print the effective timeout budgets + hook-cap arithmetic
-  --mission-path DIR  resolve the AUTHORITATIVE mission handoff for project DIR:
+  --mission-path DIR [SID]
+                      resolve the AUTHORITATIVE mission handoff for project DIR:
                       \$CLAUDE_SESSIONS_DIR/<sid>/handoff/mission.md, out of
-                      repo, or nothing (exit 1). Never looks inside DIR
+                      repo, or nothing (exit 1). Never looks inside DIR.
+                      With SID, only that session's handoff is a candidate.
 
 Mission artifact layout:
   \$CLAUDE_SESSIONS_DIR/<sid>/handoff/mission.md
@@ -251,14 +254,14 @@ fi
 # ARGUMENT UNIT: the PROJECT ROOT, exactly as it appeared in the hook payload's
 # `cwd` field. Matched literally against the `cwd` sidecar mission mode
 # wrote; a mismatch fails closed, with the candidate count on stderr so it is
-# diagnosable.
+# diagnosable. An optional SID restricts the candidates to that session's handoff.
 if [[ "$ARG1" == "--mission-path" ]]; then
   _mp_project_cwd="${ARG2:-}"
   if [[ -z "$_mp_project_cwd" || ! -d "$_mp_project_cwd" ]]; then
     echo "reflect.sh --mission-path: need an existing project dir (got '$_mp_project_cwd')" >&2
     exit 2
   fi
-  if _mp_resolved="$(mission_resolve_handoff "$_mp_project_cwd")"; then
+  if _mp_resolved="$(mission_resolve_handoff "$_mp_project_cwd" "$ARG3")"; then
     printf '%s\n' "$_mp_resolved"
     exit 0
   fi

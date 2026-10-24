@@ -620,7 +620,7 @@ def main() -> int:
 
     # The cap only shapes the recorded window/fill; the fire decision below is
     # on absolute tokens (see FIRE_AT_TOKENS).
-    cap = context_usage.auto_compact_window(context_usage.user_settings_path(), os.environ)
+    cap = context_usage.auto_compact_window(context_usage.user_settings_path(os.environ), os.environ)
     occ = context_usage.occupancy(transcript, cap)
     if occ is None:
         return 0
@@ -792,7 +792,7 @@ def manual(instructions: str) -> int:
 
     occ = context_usage.occupancy(
         transcript,
-        context_usage.auto_compact_window(context_usage.user_settings_path(), os.environ))
+        context_usage.auto_compact_window(context_usage.user_settings_path(os.environ), os.environ))
     request = {
         "session_id": sid,
         "cwd": cwd,
