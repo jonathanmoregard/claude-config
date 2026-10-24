@@ -19,6 +19,8 @@
     "command": "uv",
     "args": [
       "run",
+      "--env-file",
+      "/home/jonathan/.config/gdocs-review-mcp/env",
       "--directory",
       "/home/jonathan/Repos/gdocs-review-mcp",
       "python",
@@ -31,7 +33,6 @@
       "docs_preview"
     ],
     "env": {
-      "USER_GOOGLE_EMAIL": "agent@example.invalid",
       "WORKSPACE_MCP_CREDENTIALS_DIR": "/home/jonathan/.google_workspace_mcp/credentials"
     }
   },

@@ -3,7 +3,7 @@
     "version": 1,
     "host": "home-server",
     "user": "jonathan",
-    "knownHostsFile": "known_hosts",
+    "knownHostsFile": "/home/jonathan/.config/smarthome-ssh/known_hosts",
     "sshExecutable": "/run/current-system/sw/bin/ssh",
     "identityAgent": "%t/gcr/ssh",
     "identityAgentRoot": "%t",

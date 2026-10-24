@@ -111,6 +111,14 @@ class PolicyTests(Fixture):
         with self.assertRaisesRegex(RuntimeError, "known_hosts"):
             self.policy()
 
+    def test_missing_known_hosts_fails_closed_naming_the_local_file(self) -> None:
+        self.known_hosts.unlink()
+        with self.assertRaises(RuntimeError) as caught:
+            self.policy()
+        message = str(caught.exception)
+        self.assertIn("known_hosts is missing", message)
+        self.assertIn(str(self.known_hosts), message)
+
     def test_relative_known_hosts_resolves_next_to_server(self) -> None:
         policy = self.server._load_policy(
             {"smarthomeSsh": self.raw_policy(knownHostsFile="known_hosts")},
@@ -253,8 +261,15 @@ class ShippedConfigTests(unittest.TestCase):
         self.assertEqual(raw["host"], "home-server")
         self.assertEqual(raw["user"], "jonathan")
         with mock.patch.object(server, "_require_agent_socket", lambda policy: None), \
-                mock.patch.object(server, "_require_executable", lambda path, key: path):
-            server._load_policy(data, base_dir=HERE)
+                mock.patch.object(server, "_require_executable", lambda path, key: path), \
+                mock.patch.object(server, "_known_hosts_pins", lambda path, host: True):
+            policy = server._load_policy(data, base_dir=HERE)
+        # The host pin is machine-local config, never a file shipped in the repo.
+        repo = HERE.parents[1]
+        self.assertFalse(
+            server._path_within(policy["knownHostsFile"], repo),
+            f"knownHostsFile resolves inside the repo: {policy['knownHostsFile']}",
+        )
 
 
 class StdioTests(unittest.TestCase):

@@ -99,6 +99,11 @@ def _require_agent_socket(policy: dict) -> None:
 def _known_hosts_pins(path: Path, host: str) -> bool:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"BROKEN safety boundary: known_hosts is missing: {path} "
+            "(machine-local, untracked; it must pin the host key of the configured host)"
+        ) from exc
     except (OSError, UnicodeDecodeError) as exc:
         raise RuntimeError(f"BROKEN safety boundary: known_hosts is unreadable: {path}") from exc
     for line in lines:
