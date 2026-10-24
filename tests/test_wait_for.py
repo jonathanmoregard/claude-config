@@ -82,6 +82,7 @@ def write_status(
     repo: str = "owner/repo",
     kind: str = "pr",
     number: int = 7,
+    watch_id: str = "a" * 32,
     started_at: int = 1_700_000_000,
     finished_at: int = 1_700_000_100,
 ) -> Path:
@@ -93,6 +94,7 @@ def write_status(
         "kind": kind,
         "repo": repo,
         "number": number,
+        "watch_id": watch_id,
         "started_at": started_at,
     }
     if exit_code is not None:
@@ -206,6 +208,7 @@ def test_sandbox_done_status_returns_host_line_and_exit(tmp_path: Path) -> None:
             state="done",
             exit_code=exit_code,
             line=f"host {exit_code}",
+            watch_id=str(exit_code + 1) * 32,
             started_at=1_700_000_000 + exit_code,
         )
         rc, out, calls = run_wait_for(
@@ -225,6 +228,7 @@ def test_sandbox_watching_then_done_waits_and_reports(tmp_path: Path) -> None:
     copied = sandbox_layout(tmp_path, status_root)
     status = write_status(status_root, state="watching")
     done = {"state": "done", "kind": "pr", "repo": "owner/repo", "number": 7,
+            "watch_id": "a" * 32,
             "started_at": 1_700_000_000, "finished_at": 1_700_000_100,
             "exit": 0, "line": "host finished"}
     script = {
@@ -313,7 +317,7 @@ def test_sandbox_done_result_is_reported_once_per_watch(tmp_path: Path) -> None:
         / "repo"
         / "pr-7"
     )
-    assert marker.read_text(encoding="utf-8") == "1700000000\n"
+    assert marker.read_text(encoding="utf-8") == f"{'a' * 32}\n"
     second_rc, second_out, _ = run_wait_for(
         tmp_path, script, "pr", "7", "-R", "owner/repo", wait_for=copied
     )
@@ -332,6 +336,7 @@ def test_sandbox_done_result_is_reported_once_per_watch(tmp_path: Path) -> None:
         state="done",
         exit_code=0,
         line="fresh result",
+        watch_id="b" * 32,
         started_at=1_700_000_001,
         finished_at=1_700_000_200,
     )
@@ -340,7 +345,39 @@ def test_sandbox_done_result_is_reported_once_per_watch(tmp_path: Path) -> None:
     )
     assert third_rc == 0, third_out
     assert "fresh result" in third_out
-    assert marker.read_text(encoding="utf-8") == "1700000001\n"
+    assert marker.read_text(encoding="utf-8") == f"{'b' * 32}\n"
+
+
+def test_sandbox_distinguishes_watches_started_in_same_second(tmp_path: Path) -> None:
+    status_root = tmp_path / "status"
+    copied = sandbox_layout(tmp_path, status_root)
+    script = {"gh": {"auth token": [{"rc": 1}]}}
+    write_status(
+        status_root,
+        state="done",
+        exit_code=0,
+        line="first result",
+        watch_id="1" * 32,
+    )
+    first_rc, first_out, _ = run_wait_for(
+        tmp_path, script, "pr", "7", "-R", "owner/repo", wait_for=copied
+    )
+
+    write_status(
+        status_root,
+        state="done",
+        exit_code=0,
+        line="second result",
+        watch_id="2" * 32,
+    )
+    second_rc, second_out, _ = run_wait_for(
+        tmp_path, script, "pr", "7", "-R", "owner/repo", wait_for=copied
+    )
+
+    assert first_rc == 0, first_out
+    assert "first result" in first_out
+    assert second_rc == 0, second_out
+    assert "second result" in second_out
 
 
 def test_sandbox_reads_each_status_generation_as_one_snapshot(tmp_path: Path) -> None:
@@ -354,6 +391,7 @@ def test_sandbox_reads_each_status_generation_as_one_snapshot(tmp_path: Path) ->
         "kind": "pr",
         "repo": "owner/repo",
         "number": 7,
+        "watch_id": "b" * 32,
         "started_at": 1_700_000_001,
         "finished_at": 1_700_000_200,
         "exit": 1,
@@ -483,7 +521,7 @@ os.execv(os.environ["REAL_MV"], [os.environ["REAL_MV"], *os.sys.argv[1:]])
     assert second.returncode == 2, second_out
     assert "one result" in second_out
     marker = home / ".cache/git-broker/watch-reported/owner/repo/pr-7"
-    assert marker.read_text(encoding="utf-8") == "1700000000\n"
+    assert marker.read_text(encoding="utf-8") == f"{'a' * 32}\n"
 
 
 def test_sandbox_stale_lock_directory_does_not_block_result(tmp_path: Path) -> None:
@@ -507,7 +545,7 @@ def test_sandbox_stale_lock_directory_does_not_block_result(tmp_path: Path) -> N
 
     assert rc == 0, out
     assert "still report" in out
-    assert (marker_dir / "pr-7").read_text(encoding="utf-8") == "1700000000\n"
+    assert (marker_dir / "pr-7").read_text(encoding="utf-8") == f"{'a' * 32}\n"
     assert stale_lock.is_dir()
 
 

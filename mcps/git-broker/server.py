@@ -25,6 +25,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote, urlparse
+from uuid import uuid4
 
 
 class _InFlight:
@@ -3128,7 +3129,7 @@ def _run_restore_with_backup(
     rec: Optional[_InFlight],
     bind_fds: list[int],
 ) -> tuple[int, str, str]:
-    """Validate restore targets and back up tracked work before replacement."""
+    """Refuse unbacked targets and store tracked changes before replacement."""
     if request.get("side"):
         unmerged_argv = _auxiliary_git_argv(
             identity.worktree,
@@ -3157,6 +3158,13 @@ def _run_restore_with_backup(
         return _run_contained_git_step(
             request, identity, policy, restore_argv, rec, bind_fds
         )
+
+    rc, stdout, stderr = _check_index_flags(
+        "restore", identity.worktree, request["paths"],
+        request, identity, policy, rec, bind_fds,
+    )
+    if rc != 0:
+        return rc, stdout, stderr
 
     untracked_argv = _auxiliary_git_argv(
         identity.worktree,
@@ -3278,7 +3286,7 @@ def _run_worktree_remove_backup(
     rec: Optional[_InFlight],
     bind_fds: list[int],
 ) -> tuple[int, str, str, bool]:
-    """Stash the target worktree completely; failure leaves it registered."""
+    """Back up tracked and untracked changes visible to Git's stash machinery."""
     target = request["worktree_path"]
     admin_dir = _trusted_worktree_admin_dir(identity, target)
     message = f"git-broker worktree_remove backup: {target}"
@@ -3299,6 +3307,86 @@ def _run_worktree_remove_backup(
     )
     created = rc == 0 and "No local changes to save" not in stdout
     return rc, stdout, stderr, created
+
+
+def _check_index_flags(
+    operation: str,
+    worktree: str,
+    paths: list[str],
+    request: dict,
+    identity: _GitIdentity,
+    policy: dict,
+    rec: Optional[_InFlight],
+    bind_fds: list[int],
+) -> tuple[int, str, str]:
+    """Refuse paths whose edits git stash cannot see.
+
+    assume-unchanged and skip-worktree hide working-tree edits from stash, so
+    a backup taken before an overwrite would silently miss them.
+    """
+    argv = _auxiliary_git_argv(worktree, policy, "ls-files", "-v", "-z", "--", *paths)
+    rc, stdout, stderr = _run_contained_git_step(
+        request, identity, policy, argv, rec, bind_fds
+    )
+    if rc != 0:
+        return rc, stdout, stderr
+    flagged = [
+        record[2:]
+        for record in stdout.split("\0")
+        if len(record) >= 3
+        and record[1] == " "
+        and (record[0].islower() or record[0] == "S")
+    ]
+    if not flagged:
+        return 0, "", ""
+    names = ", ".join(repr(path) for path in flagged[:20])
+    if len(flagged) > 20:
+        names += f", and {len(flagged) - 20} more"
+    return (
+        1,
+        "",
+        f"{operation} refuses paths marked assume-unchanged or skip-worktree: "
+        f"{names}; clear the index flags first",
+    )
+
+
+def _check_worktree_remove_ignored(
+    request: dict,
+    identity: _GitIdentity,
+    policy: dict,
+    rec: Optional[_InFlight],
+    bind_fds: list[int],
+) -> tuple[int, str, str]:
+    """Refuse target worktrees that contain ignored files."""
+    status_argv = _auxiliary_git_argv(
+        request["worktree_path"],
+        policy,
+        "status",
+        "--porcelain",
+        "--ignored",
+        "--untracked-files=all",
+        "-z",
+    )
+    rc, stdout, stderr = _run_contained_git_step(
+        request, identity, policy, status_argv, rec, bind_fds
+    )
+    if rc != 0:
+        return rc, stdout, stderr
+    ignored = [
+        record[3:]
+        for record in stdout.split("\0")
+        if record.startswith("!! ")
+    ]
+    if not ignored:
+        return 0, "", ""
+    shown = ", ".join(repr(path) for path in ignored[:20])
+    if len(ignored) > 20:
+        shown += f", and {len(ignored) - 20} more"
+    return (
+        1,
+        "",
+        f"worktree_remove refuses ignored files: {shown}; delete ignored files first",
+    )
 
 
 def _operation_guide() -> str:
@@ -3613,6 +3701,7 @@ def _start_github_watch(
         "kind": request["kind"],
         "repo": repo,
         "number": request["number"],
+        "watch_id": uuid4().hex,
         "started_at": int(time.time()),
         "timeout_s": request["timeout_s"],
     }
@@ -3698,6 +3787,18 @@ def _tool_git(args: dict, rec: Optional[_InFlight] = None) -> str:
     bind_fds: list[int] = []
     try:
         backup_note = ""
+        if operation == "worktree_remove":
+            rc, stdout, stderr = _check_worktree_remove_ignored(
+                request, identity, policy, rec, bind_fds
+            )
+            if rc != 0:
+                return _compose_output(rc, stdout, stderr)
+            rc, stdout, stderr = _check_index_flags(
+                "worktree_remove", request["worktree_path"], [],
+                request, identity, policy, rec, bind_fds,
+            )
+            if rc != 0:
+                return _compose_output(rc, stdout, stderr)
         if operation == "worktree_remove" and request["force"]:
             rc, stdout, stderr, backup_created = _run_worktree_remove_backup(
                 request, identity, policy, rec, bind_fds

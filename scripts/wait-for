@@ -84,7 +84,7 @@ github_repo() {
 wait_host_watch() {
   case $target in ''|*[!0-9]*) usage ;; esac
   local selected script_path policy status_dir status_file snapshot state exit_code line
-  local line_encoded started_at finished_at finished_utc marker_dir marker_file
+  local line_encoded watch_id finished_at finished_utc marker_dir marker_file
   local marker_temp reported
   selected=$(github_repo) || exit 1
   script_path=$(readlink -f -- "$0") || {
@@ -115,19 +115,21 @@ wait_host_watch() {
             and ((.exit | type) == "number")
             and .exit >= 0 and .exit <= 255 and .exit == (.exit | floor)
             and (.started_at | uint) and (.finished_at | uint)
+            and ((.watch_id | type) == "string")
+            and (.watch_id | test("^[0-9a-f]{32}$"))
             and ((.line | type) == "string")) then
-        ["done", (.exit | tostring), (.started_at | tostring),
+        ["done", (.exit | tostring), .watch_id,
          (.finished_at | tostring), (.line | @base64)]
       else
         ["invalid", "", "", "", ""]
       end | join("|")
     ' "$status_file" 2>/dev/null) || snapshot="invalid||||"
-    IFS='|' read -r state exit_code started_at finished_at line_encoded <<< "$snapshot"
+    IFS='|' read -r state exit_code watch_id finished_at line_encoded <<< "$snapshot"
     case $state in
       done)
         case $exit_code in ''|*[!0-9]*) echo "wait-for: invalid host watch result for $mode $target"; exit 1 ;; esac
-        case $started_at:$finished_at in *[!0-9:]*) echo "wait-for: invalid host watch result for $mode $target"; exit 1 ;; esac
-        [ -n "$started_at" ] && [ -n "$finished_at" ] || { echo "wait-for: invalid host watch result for $mode $target"; exit 1; }
+        case $finished_at in ''|*[!0-9]*) echo "wait-for: invalid host watch result for $mode $target"; exit 1 ;; esac
+        [ -n "$watch_id" ] || { echo "wait-for: invalid host watch result for $mode $target"; exit 1; }
         line=$(printf '%s' "$line_encoded" | base64 --decode 2>/dev/null) || {
           echo "wait-for: invalid host watch result for $mode $target"; exit 1;
         }
@@ -143,7 +145,7 @@ wait_host_watch() {
         if [ -f "$marker_file" ]; then
           IFS= read -r reported < "$marker_file" || reported=""
         fi
-        if [ "$reported" = "$started_at" ]; then
+        if [ "$reported" = "$watch_id" ]; then
           finished_utc=$(date -u -d "@$finished_at" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null) || {
             echo "wait-for: invalid host watch result for $mode $target"; exit 1;
           }
@@ -153,7 +155,7 @@ wait_host_watch() {
         marker_temp=$(mktemp "$marker_dir/.watch-reported.XXXXXX") || {
           echo "wait-for: cannot record host watch freshness"; exit 1;
         }
-        printf '%s\n' "$started_at" > "$marker_temp" || {
+        printf '%s\n' "$watch_id" > "$marker_temp" || {
           rm -f -- "$marker_temp"
           echo "wait-for: cannot record host watch freshness"; exit 1;
         }

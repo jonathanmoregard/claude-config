@@ -784,6 +784,18 @@ class GithubWatcherTests(unittest.TestCase):
         self.assertEqual(data["exit"], 2)
         self.assertNotIn("old result", data["line"])
 
+    def test_watches_started_in_same_second_have_distinct_identities(self) -> None:
+        with mock.patch.object(self.server.time, "time", return_value=1_700_000_000):
+            self.watch()
+            first = self.status()
+            self.watch()
+            second = self.status()
+
+        self.assertIn("watch_id", first)
+        self.assertIn("watch_id", second)
+        self.assertNotEqual(first["watch_id"], second["watch_id"])
+        self.assertEqual(first["started_at"], second["started_at"])
+
     def test_seventeenth_live_watch_is_refused(self) -> None:
         self.policy["waitForExecutable"] = str(self.slow)
         for number in range(1, 17):
@@ -1616,6 +1628,136 @@ class DestructiveOperationSafetyTests(unittest.TestCase):
         run.assert_not_called()
 
 
+class IgnoredWorktreeRemovalTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server = load_server()
+        self.temp = tempfile.TemporaryDirectory(prefix="git-broker-ignored-worktree-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.repo = self.root / "repo"
+        self.target = self.root / "target"
+        subprocess.run(
+            ["git", "init", "-q", "-b", "main", str(self.repo)], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(self.repo), "config", "user.name", "Broker Test"],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.repo),
+                "config",
+                "user.email",
+                "broker@example.test",
+            ],
+            check=True,
+        )
+        (self.repo / ".gitignore").write_text("*.secret\n", encoding="utf-8")
+        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.repo), "commit", "-qm", "base"], check=True
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.repo),
+                "worktree",
+                "add",
+                "-qb",
+                "target",
+                str(self.target),
+            ],
+            check=True,
+        )
+        raw_policy = valid_policy()
+        raw_policy["repositoryRoots"] = [str(self.root)]
+        raw_policy["metadataRoots"] = [str(self.root)]
+        raw_policy["protectedWorktrees"] = [str(self.repo)]
+        raw_policy["worktreeCreationRoots"] = [str(self.root)]
+        self.raw_policy = raw_policy
+
+    def remove(self, *, force: bool) -> str:
+        def direct_sandbox(_request, _identity, _policy, argv, **_kwargs):
+            return argv, {}
+
+        def run_directly(argv, *_args, **_kwargs):
+            proc = subprocess.run(argv, capture_output=True, text=True, check=False)
+            return proc.returncode, proc.stdout, proc.stderr
+
+        with (
+            mock.patch.object(
+                self.server,
+                "_load_config",
+                return_value={"gitBroker": self.raw_policy},
+            ),
+            mock.patch.object(self.server, "_check_denied_by_dcg", return_value=None),
+            mock.patch.object(
+                self.server, "_build_git_sandbox", side_effect=direct_sandbox
+            ),
+            mock.patch.object(self.server, "_run_argv", side_effect=run_directly),
+        ):
+            return self.server._tool_git(
+                {
+                    "repo_path": str(self.repo),
+                    "operation": "worktree_remove",
+                    "worktree_path": str(self.target),
+                    "force": force,
+                }
+            )
+
+    def test_forced_remove_refuses_ignored_file_before_stashing_tracked_edit(self) -> None:
+        (self.target / "tracked.txt").write_text("edited\n", encoding="utf-8")
+        (self.target / "data.secret").write_text("ignored\n", encoding="utf-8")
+
+        output = self.remove(force=True)
+
+        self.assertIn("--- exit 1 ---", output)
+        self.assertIn("data.secret", output)
+        self.assertIn("delete ignored files first", output)
+        self.assertEqual(
+            (self.target / "tracked.txt").read_text(encoding="utf-8"), "edited\n"
+        )
+        self.assertTrue((self.target / "data.secret").is_file())
+
+    def test_nonforced_remove_refuses_ignored_file(self) -> None:
+        (self.target / "data.secret").write_text("ignored\n", encoding="utf-8")
+
+        output = self.remove(force=False)
+
+        self.assertIn("--- exit 1 ---", output)
+        self.assertIn("data.secret", output)
+        self.assertIn("delete ignored files first", output)
+        self.assertTrue((self.target / "data.secret").is_file())
+
+    def test_remove_refuses_edit_hidden_by_index_flag(self) -> None:
+        for flag in ("--assume-unchanged", "--skip-worktree"):
+            for force in (True, False):
+                with self.subTest(flag=flag, force=force):
+                    subprocess.run(
+                        ["git", "-C", str(self.target), "update-index", flag, "tracked.txt"],
+                        check=True,
+                    )
+                    (self.target / "tracked.txt").write_text("hidden\n", encoding="utf-8")
+
+                    output = self.remove(force=force)
+
+                    self.assertIn("--- exit 1 ---", output)
+                    self.assertIn("assume-unchanged or skip-worktree", output)
+                    self.assertEqual(
+                        (self.target / "tracked.txt").read_text(encoding="utf-8"),
+                        "hidden\n",
+                    )
+                    subprocess.run(
+                        ["git", "-C", str(self.target), "update-index",
+                         flag.replace("--", "--no-", 1), "tracked.txt"],
+                        check=True,
+                    )
+
+
 class RestoreSafetyTests(unittest.TestCase):
     def setUp(self) -> None:
         self.server = load_server()
@@ -1686,6 +1828,92 @@ class RestoreSafetyTests(unittest.TestCase):
         self.assertIn("notes.md", output)
         self.assertIn("move or add them first", output)
         self.assertTrue(any("ls-files" in argv for argv in seen))
+        self.assertFalse(any("stash" in argv for argv in seen))
+
+    def test_restore_refuses_assume_unchanged_edit_hidden_from_backup(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="git-broker-restore-flags-") as td:
+            root = Path(td)
+            repo = root / "repo"
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Broker Test"],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "config",
+                    "user.email",
+                    "broker@example.test",
+                ],
+                check=True,
+            )
+            (repo / "assumed.txt").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "-qm", "base"], check=True
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "update-index",
+                    "--assume-unchanged",
+                    "assumed.txt",
+                ],
+                check=True,
+            )
+            (repo / "assumed.txt").write_text("edited\n", encoding="utf-8")
+
+            raw_policy = valid_policy()
+            raw_policy["repositoryRoots"] = [str(root)]
+            raw_policy["metadataRoots"] = [str(root)]
+            raw_policy["protectedWorktrees"] = [str(root / "protected")]
+            raw_policy["worktreeCreationRoots"] = [str(root)]
+            policy = self.server._load_git_policy({"gitBroker": raw_policy})
+            identity = self.server._discover_git_identity(repo, policy)
+            request = self.server._validate_git_request(
+                {
+                    "repo_path": str(repo),
+                    "operation": "restore",
+                    "paths": ["assumed.txt"],
+                },
+                policy,
+            )
+
+            def run_directly(_request, _identity, _policy, argv, *_args):
+                proc = subprocess.run(argv, capture_output=True, text=True, check=False)
+                return proc.returncode, proc.stdout, proc.stderr
+
+            with mock.patch.object(
+                self.server, "_run_contained_git_step", side_effect=run_directly
+            ):
+                rc, _stdout, stderr = self.server._run_restore_with_backup(
+                    request, identity, policy, None, []
+                )
+
+            self.assertNotEqual(rc, 0)
+            self.assertIn("assumed.txt", stderr)
+            self.assertIn("assume-unchanged or skip-worktree", stderr)
+            self.assertEqual(
+                (repo / "assumed.txt").read_text(encoding="utf-8"), "edited\n"
+            )
+
+    def test_restore_refuses_skip_worktree_path_before_backup(self) -> None:
+        def fake_run(argv, *_args, **_kwargs):
+            if "ls-files" in argv and "-v" in argv:
+                return 0, "S sparse.txt\0", ""
+            return 0, "", ""
+
+        output, seen = self.run_restore({"paths": ["sparse.txt"]}, fake_run)
+
+        self.assertIn("--- exit 1 ---", output)
+        self.assertIn("sparse.txt", output)
+        self.assertIn("assume-unchanged or skip-worktree", output)
+        self.assertTrue(any("-v" in argv for argv in seen))
         self.assertFalse(any("stash" in argv for argv in seen))
 
 
@@ -1924,6 +2152,7 @@ class ToolExecutionTests(unittest.TestCase):
                 "_run_argv",
                 side_effect=[
                     (0, "", ""),
+                    (0, "", ""),
                     (0, commit_id + "\n", ""),
                     (0, "", ""),
                     (0, "", ""),
@@ -1936,11 +2165,15 @@ class ToolExecutionTests(unittest.TestCase):
         commands = [argv[argv.index(str(self.identity.worktree)) + 1 :] for argv in seen]
         self.assertEqual(
             commands[0],
+            ["ls-files", "-v", "-z", "--", "tracked.txt"],
+        )
+        self.assertEqual(
+            commands[1],
             ["ls-files", "--others", "-z", "--", "tracked.txt"],
         )
-        self.assertEqual(commands[1], ["stash", "create"])
-        self.assertEqual(commands[2][-1], commit_id)
-        self.assertEqual(commands[3][0], "restore")
+        self.assertEqual(commands[2], ["stash", "create"])
+        self.assertEqual(commands[3][-1], commit_id)
+        self.assertEqual(commands[4][0], "restore")
         self.assertIn("stash@{0}", output)
         self.assertIn(commit_id, output)
 
