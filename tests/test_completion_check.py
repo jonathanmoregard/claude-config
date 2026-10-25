@@ -414,6 +414,27 @@ def test_n1_successful_worktree_add_still_claims(w):
     assert "uncommitted changes in a worktree this session created" in w.run()["reason"]
 
 
+def test_worktree_add_does_not_claim_the_anchor_checkouts_branch(w):
+    """Adding a worktree from a checkout that sits on someone else's pushed
+    branch claims only the new worktree, not the anchor's branch."""
+    repo = w.repo()
+    w.feature(repo)
+    w.gh(visibility="PUBLIC")
+    wt = w.tmp / "wt-scratch"
+    w.bash(f"git worktree add -b scratch {wt} origin/main", repo,
+           output="Preparing worktree (new branch 'scratch')")
+    assert w.run() is None
+
+
+def test_git_broker_worktree_add_does_not_claim_the_anchor(w):
+    repo = w.repo()
+    w.feature(repo)
+    w.gh(visibility="PUBLIC")
+    w.tool("mcp__git-broker__git", {"repo_path": str(repo), "operation": "worktree_add",
+                                    "worktree_path": str(w.tmp / "wt-b")}, "/")
+    assert w.run() is None
+
+
 def _inherited_upstream_worktree(w):
     """A worktree branched from origin/main: its upstream is origin/main, not origin/feat/x."""
     repo = w.repo()
@@ -533,7 +554,7 @@ def test_git_broker_mcp_push_counts(w):
     ("cd /a && git push", "/r", ["/a"], []),
     ("cd ~/w; git -C sub commit -qm 'a && b'", "/r", ["/h/w/sub"], []),
     ("FOO=1 timeout 30 git push origin x", "/r", ["/r"], []),
-    ("git -C /r worktree add -b feat/z ../wt origin/main", "/x", ["/r", "/wt"], ["/wt"]),
+    ("git -C /r worktree add -b feat/z ../wt origin/main", "/x", ["/wt"], ["/wt"]),
     ("bash $HOME/.claude/scripts/claude-worktree.sh my-slug", "/r",
      ["/h/worktrees/claude-my-slug"], ["/h/worktrees/claude-my-slug"]),
     ("gh pr create --fill", "/r", ["/r"], []),
