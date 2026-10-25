@@ -1,11 +1,7 @@
 {
   "cleanupPeriodDays": 99999,
   "claudeMdExcludes": [
-    "**/.claude/vendor/**",
-    "**/.claude/tests/**",
-    "**/.claude/docs/**",
-    "**/.claude/experiments/**",
-    "**/.claude/research/**"
+    "**/vendor/**"
   ],
   "skillOverrides": {
     "ab-testing-prompt-changes": "name-only",
