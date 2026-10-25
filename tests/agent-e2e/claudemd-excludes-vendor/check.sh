@@ -52,7 +52,15 @@ opened=${state:1:1}
 # from a tool result rather than from loaded memory, and proves nothing.
 [ "$opened" = 0 ] || inconclusive "the agent opened vendor/thirdparty/CLAUDE.md itself"
 
+# Two witnesses, because one is not enough. Quoting the token is the
+# strongest, but an agent that loaded the file and paraphrased it ("it tells me
+# to start every reply with a fixed token") passed the token grep while plainly
+# having read it -- 1 of 5 control runs did exactly that. Naming the file it was
+# never asked about and never opened is the second witness.
 if grep -q 'ZEBRAFISH-7781' "$RUN/final.txt"; then
-  fail "the vendored CLAUDE.md reached the agent's context"
+  fail "the vendored CLAUDE.md reached the agent's context (quoted its token)"
+fi
+if grep -q 'thirdparty/CLAUDE.md' "$RUN/final.txt"; then
+  fail "the vendored CLAUDE.md reached the agent's context (named the file)"
 fi
 pass "a vendored CLAUDE.md did not reach the agent's context"
