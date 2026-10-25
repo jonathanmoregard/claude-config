@@ -17,7 +17,9 @@ Stateless. Every Stop re-derives everything:
    `scripts/claude-worktree.sh` / `scripts/klaffat-worktree.sh` (which create
    `~/worktrees/{claude,klaffat}-<slug>`), or the git-broker MCP operations
    commit / push / worktree_add / pr_create. The directory comes from
-   `git -C`, a preceding `cd`, or the entry's `cwd`. Worktrees created by
+   `git -C`, a preceding `cd`, or the entry's `cwd`; a worktree add claims
+   only the new worktree, never the checkout it was run from (whose current
+   branch may be another session's). Worktrees created by
    `git worktree add`, the two helper scripts or the broker are "created by
    this session" only when, in addition, the output shows no creation failure
    ("already exists", `fatal:`): a failed add never claims someone's worktree.
@@ -181,7 +183,8 @@ def scan_bash(command: str, cwd: str, home: str, t: Touched) -> None:
             elif sub == "worktree":
                 path = _worktree_add_path(rest)
                 if path:
-                    t.dirs.append(d)
+                    # Only the new worktree is this session's: the anchor
+                    # checkout's current branch may be anyone's.
                     new = _resolve(path, d, home)
                     t.created.add(new)
                     t.dirs.append(new)
@@ -217,7 +220,7 @@ def scan_entry(entry: dict, home: str) -> list[tuple[str, Touched]]:
             scan_bash(inp["command"], cwd, home, t)
         elif item.get("name") == BROKER_TOOL and isinstance(inp.get("repo_path"), str):
             op, repo = inp.get("operation"), inp["repo_path"]
-            if op in ("commit", "push", "pr_create", "worktree_add"):
+            if op in ("commit", "push", "pr_create"):
                 t.dirs.append(repo)
             if op == "worktree_add" and isinstance(inp.get("worktree_path"), str):
                 new = _resolve(inp["worktree_path"], repo, home)
