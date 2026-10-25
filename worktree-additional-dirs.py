@@ -7,7 +7,7 @@ touch them without a permission prompt per file, which is friction on exactly
 the flow that's supposed to be frictionless.
 
 So: enumerate the worktrees of the repo this session was started in that still
-hold work (dirty, or commits not on the default branch), and write them into `<project>/.claude/settings.local.json` under
+hold work (dirty, or commits on no remote's default branch), and write them into `<project>/.claude/settings.local.json` under
 `permissions.additionalDirectories`. That file is gitignored globally
 (`~/.config/git/ignore`), so nothing lands in the repo.
 
@@ -55,9 +55,9 @@ def worktrees_of(repo: pathlib.Path) -> list[str]:
         if resolved == here:
             continue  # the checkout we're already in
         found.append(str(resolved))
-    base = default_ref(repo)
+    bases = default_refs(repo)
     with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
-        live = list(pool.map(lambda p: has_work(p, base), found))
+        live = list(pool.map(lambda p: has_work(p, bases), found))
     return sorted({p for p, keep in zip(found, live) if keep})
 
 
@@ -70,28 +70,33 @@ def git(path: str, *args: str) -> str | None:
     return out.stdout if out.returncode == 0 else None
 
 
-def default_ref(repo: pathlib.Path) -> str | None:
-    """`origin/<default>` of the repo, or None when it can't be told."""
-    ref = git(str(repo), "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD")
-    if ref and ref.strip():
-        return ref.strip()
-    for name in ("origin/main", "origin/master"):
-        if git(str(repo), "rev-parse", "-q", "--verify", name) is not None:
-            return name
-    return None
+def default_refs(repo: pathlib.Path) -> list[str]:
+    """`<remote>/<default>` for every remote that has one. A repo renamed with
+    rewritten history keeps its old remote, whose merged work is still merged."""
+    refs = []
+    for remote in (git(str(repo), "remote") or "").split():
+        ref = git(str(repo), "symbolic-ref", "-q", "--short", f"refs/remotes/{remote}/HEAD")
+        if ref and ref.strip():
+            refs.append(ref.strip())
+            continue
+        for name in (f"{remote}/main", f"{remote}/master"):
+            if git(str(repo), "rev-parse", "-q", "--verify", name) is not None:
+                refs.append(name)
+                break
+    return refs
 
 
-def has_work(path: str, base: str | None) -> bool:
+def has_work(path: str, bases: list[str]) -> bool:
     """Keep a worktree in scope while it holds work: uncommitted changes, or
-    commits not yet on the default branch. A clean worktree whose branch is
+    commits on no remote's default branch. A clean worktree whose branch is
     merged only costs environment-block tokens in every session. Unknown ->
     keep, so a git hiccup never hides live work."""
     status = git(path, "status", "--porcelain")
     if status is None or status.strip():
         return True
-    if base is None:
+    if not bases:
         return True
-    ahead = git(path, "rev-list", "--count", f"{base}..HEAD")
+    ahead = git(path, "rev-list", "--count", "HEAD", "--not", *bases)
     return ahead is None or ahead.strip() != "0"
 
 
