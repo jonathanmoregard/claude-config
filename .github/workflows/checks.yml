@@ -1,0 +1,38 @@
+# Keeps dev-only code off the agent's execution path on every change.
+#
+# `pull_request` only, never `pull_request_target`: this repository's own
+# branches are not forks and do get secrets, and GitHub Security Lab names
+# "write their payload as a new test that will be run with others" as the
+# matching attack. So the job takes no secrets, declares read-only
+# permissions, and never fetches the vendored submodules -- the gate reads
+# tracked text, nothing from the scanned tree executes.
+name: checks
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dev-path-isolation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The live tree keeps the runtime off dev-only trees
+        run: python3 scripts/check-dev-path-isolation.py
+
+      - name: The gate itself still detects what it is for
+        run: |
+          python3 -m pip install --disable-pip-version-check --quiet 'pytest>=8,<9'
+          python3 -m pytest tests/test_check_dev_path_isolation.py -q
+
+      - name: The master pin and the push-time gate hold
+        run: bash tests/test_worktree_policy.sh
