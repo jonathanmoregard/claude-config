@@ -1,4 +1,4 @@
-"""hooks/completion-check.py: a Stop names the delivery gaps the agent can close.
+"""hooks/completion-check.py: each prompt tells the agent which delivery gaps it left.
 
 Real temp git repos (origin = a local bare repo behind a github.com URL via
 insteadOf), fixture transcripts, a stub `gh` first on PATH, a throwaway HOME.
@@ -120,8 +120,9 @@ class World:
     def run_with_path(self, path, **payload):
         if not self.transcript.exists():
             self.transcript.write_text("")
-        stdin = json.dumps({"session_id": "sess-1", "hook_event_name": "Stop",
-                            "transcript_path": str(self.transcript), **payload})
+        stdin = json.dumps({"session_id": "sess-1", "hook_event_name": "UserPromptSubmit",
+                            "prompt": "carry on", "transcript_path": str(self.transcript),
+                            **payload})
         p = subprocess.run([sys.executable, str(HOOK)], input=stdin, capture_output=True,
                            text=True, timeout=60,
                            env={"PATH": path, "HOME": str(self.home),
@@ -135,40 +136,43 @@ def w(tmp_path):
     return World(tmp_path)
 
 
+def ctx(out):
+    """The context the hook handed the agent."""
+    return out["hookSpecificOutput"]["additionalContext"]
+
+
 def pr(state, checks=()):
     return {"number": 7, "url": f"https://github.com/{NWO}/pull/7", "state": state,
             "statusCheckRollup": [{"name": n, "status": "COMPLETED" if c else "IN_PROGRESS",
                                    "conclusion": c} for n, c in checks]}
 
 
-# ------------------------------------------------------------ gaps that block
+# ----------------------------------------------------------- gaps it reports
 
-def test_branch_never_pushed_blocks(w):
+def test_branch_never_pushed_is_reported(w):
     repo = w.repo()
     w.feature(repo, push=False)
     w.bash("git commit -m work", repo)
     out = w.run()
-    assert out["decision"] == "block"
-    assert "never pushed" in out["reason"] and "push -u origin feat/x" in out["reason"]
+    assert "never pushed" in ctx(out) and "push -u origin feat/x" in ctx(out)
 
 
-def test_unpushed_commit_on_pushed_branch_blocks(w):
+def test_unpushed_commit_on_pushed_branch_is_reported(w):
     repo = w.repo()
     w.feature(repo)
     sh(repo, "commit", "-q", "--allow-empty", "-m", "more")
     w.bash(f"git -C {repo} commit -m more", w.home)
     out = w.run()
-    assert "1 commit(s) on feat/x not pushed" in out["reason"]
+    assert "1 commit(s) on feat/x not pushed" in ctx(out)
 
 
-def test_pushed_branch_without_pr_in_public_repo_blocks(w):
+def test_pushed_branch_without_pr_in_public_repo_is_reported(w):
     repo = w.repo()
     w.feature(repo)
     w.bash("git push -u origin feat/x", repo)
     w.gh(visibility="PUBLIC")
     out = w.run()
-    assert out["decision"] == "block"
-    assert f"gh pr create -R {NWO} --head feat/x --fill" in out["reason"]
+    assert f"gh pr create -R {NWO} --head feat/x --fill" in ctx(out)
 
 
 def test_private_repo_without_pr_ci_still_needs_a_pr(w):
@@ -176,26 +180,25 @@ def test_private_repo_without_pr_ci_still_needs_a_pr(w):
     w.feature(repo)
     w.bash("git push", repo)
     w.gh(visibility="PRIVATE")
-    assert "has no PR" in w.run()["reason"]
+    assert "has no PR" in ctx(w.run())
 
 
-def test_open_pr_with_failed_check_blocks(w):
+def test_open_pr_with_failed_check_is_reported(w):
     repo = w.repo()
     w.feature(repo)
     w.bash("gh pr create --fill", repo)
     w.gh(prs={"feat/x": [pr("OPEN", [("lint", "SUCCESS"), ("tests", "FAILURE")])]})
     out = w.run()
-    assert "failing checks: tests" in out["reason"] and "gh pr checks 7" in out["reason"]
+    assert "failing checks: tests" in ctx(out) and "gh pr checks 7" in ctx(out)
 
 
-def test_merged_pr_with_primary_still_on_feature_branch_blocks(w):
+def test_merged_pr_with_primary_still_on_feature_branch_is_reported(w):
     repo = w.repo()
     w.feature(repo)
     w.bash("git push", repo)
     w.gh(prs={"feat/x": [pr("MERGED")]})
     out = w.run()
-    assert out["decision"] == "block"
-    assert "switch main" in out["reason"] and "pull --ff-only" in out["reason"]
+    assert "switch main" in ctx(out) and "pull --ff-only" in ctx(out)
 
 
 def test_merged_pr_after_remote_branch_deleted_still_says_switch(w):
@@ -206,11 +209,11 @@ def test_merged_pr_after_remote_branch_deleted_still_says_switch(w):
     sh(repo, "fetch", "-q", "--prune")
     w.bash("git push", repo)
     w.gh(prs={"feat/x": [pr("MERGED")]})
-    reason = w.run()["reason"]
+    reason = ctx(w.run())
     assert "switch main" in reason and "never pushed" not in reason
 
 
-def test_primary_on_default_behind_origin_blocks(w):
+def test_primary_on_default_behind_origin_is_reported(w):
     repo = w.repo()
     w.bash("git push", repo)
     other = w.tmp / "other"
@@ -218,17 +221,17 @@ def test_primary_on_default_behind_origin_blocks(w):
     sh(other, "commit", "-q", "--allow-empty", "-m", "someone merged")
     sh(other, "push", "-q", "origin", "main")
     out = w.run()
-    assert "behind origin" in out["reason"] and "pull --ff-only" in out["reason"]
+    assert "behind origin" in ctx(out) and "pull --ff-only" in ctx(out)
 
 
-def test_dirty_worktree_created_by_session_blocks(w):
+def test_dirty_worktree_created_by_session_is_reported(w):
     repo = w.repo()
     wt = w.tmp / "wt"
     sh(repo, "worktree", "add", "-q", "-b", "feat/y", str(wt))
     (wt / "scratch.txt").write_text("wip\n")
     w.bash(f"git worktree add -b feat/y {wt}", repo)
     out = w.run()
-    assert "uncommitted changes in a worktree this session created" in out["reason"]
+    assert "uncommitted changes in a worktree this session created" in ctx(out)
 
 
 # ------------------------------------------------------------ never a gap
@@ -315,22 +318,22 @@ def test_no_git_activity_makes_no_calls(w):
     assert w.gh_calls() == []
 
 
-# ------------------------------------------------------------ loop guard, fail open
+# --------------------------------------------------------- informs, never forces
 
-def test_stop_hook_active_gives_notice_not_block(w):
+def test_output_carries_no_way_to_block_a_turn(w):
+    """Jonathan, 2026-10-25: the delivery-state hook informs, it never forces.
+
+    Whatever the payload says, the only thing the hook may hand back is context.
+    """
     repo = w.repo()
     w.feature(repo, push=False)
     w.bash("git commit -m work", repo)
-    out = w.run(stop_hook_active=True)
-    assert "decision" not in out and "never pushed" in out["systemMessage"]
-
-
-def test_background_work_in_flight_gives_notice_not_block(w):
-    repo = w.repo()
-    w.feature(repo, push=False)
-    w.bash("git commit -m work", repo)
-    out = w.run(background_tasks=[{"id": "b1"}])
-    assert "decision" not in out and "never pushed" in out["systemMessage"]
+    for payload in ({}, {"stop_hook_active": True}, {"background_tasks": [{"id": "b1"}]},
+                    {"session_crons": [{"id": "c1"}]}):
+        out = w.run(**payload)
+        assert set(out) == {"hookSpecificOutput"}, out
+        assert out["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
+        assert "never pushed" in ctx(out)
 
 
 def test_gh_failure_fails_open_with_notice(w):
@@ -338,8 +341,7 @@ def test_gh_failure_fails_open_with_notice(w):
     w.feature(repo)
     w.bash("git push", repo)
     w.gh(fail=True)
-    out = w.run()
-    assert "decision" not in out and "could not measure" in out["systemMessage"]
+    assert "could not measure" in ctx(w.run())
 
 
 @pytest.mark.parametrize("raw", ["", "nope", "[]", '{"transcript_path": 3}'])
@@ -411,7 +413,7 @@ def test_n1_successful_worktree_add_still_claims(w):
     sh(repo, "worktree", "add", "-q", "-b", "feat/y", str(wt))
     (wt / "wip.txt").write_text("ours\n")
     w.bash(f"git worktree add -b feat/y {wt}", repo, output=f"Preparing worktree (new branch 'feat/y')")
-    assert "uncommitted changes in a worktree this session created" in w.run()["reason"]
+    assert "uncommitted changes in a worktree this session created" in ctx(w.run())
 
 
 def test_worktree_add_does_not_claim_the_anchor_checkouts_branch(w):
@@ -457,7 +459,7 @@ def test_n2_inherited_upstream_failing_pr_is_still_checked(w):
     wt = _inherited_upstream_worktree(w)
     w.bash("git push origin feat/x", wt)
     w.gh(prs={"feat/x": [pr("OPEN", [("tests", "FAILURE")])]})
-    assert "failing checks: tests" in w.run()["reason"]
+    assert "failing checks: tests" in ctx(w.run())
 
 
 def test_n2_unpushed_commit_command_actually_works(w):
@@ -465,7 +467,7 @@ def test_n2_unpushed_commit_command_actually_works(w):
     wt = _inherited_upstream_worktree(w)
     sh(wt, "commit", "-q", "--allow-empty", "-m", "more")
     w.bash("git commit -m more", wt)
-    reason = w.run()["reason"]
+    reason = ctx(w.run())
     assert "1 commit(s) on feat/x not pushed" in reason
     cmd = next(l.split("next: ", 1)[1] for l in reason.splitlines() if "next: " in l)
     subprocess.run(cmd, shell=True, check=True, capture_output=True,
@@ -499,11 +501,11 @@ def test_n3_private_repo_with_only_push_workflow_still_needs_pr(w):
     (repo / ".github/workflows/ci.yml").write_text('on: ["push"]\njobs: {}\n')
     w.bash("git push", repo)
     w.gh(visibility="PRIVATE")
-    assert "has no PR" in w.run()["reason"]
+    assert "has no PR" in ctx(w.run())
 
 
 def test_n3_yq_missing_fails_open_for_private_repo(w):
-    """Without a YAML parser the gate cannot be decided: notice, never a block."""
+    """Without a YAML parser the gate cannot be decided: say so, claim no gap."""
     import shutil as _sh
     repo = w.repo()
     w.feature(repo)
@@ -515,8 +517,7 @@ def test_n3_yq_missing_fails_open_for_private_repo(w):
     tools.mkdir()
     (tools / "git").symlink_to(_sh.which("git"))
     (tools / "python3").symlink_to(sys.executable)  # the stub gh's interpreter
-    out = w.run_with_path(f"{w.bin}:{tools}")
-    assert "decision" not in out and "yq is not on PATH" in out["systemMessage"]
+    assert "yq is not on PATH" in ctx(w.run_with_path(f"{w.bin}:{tools}"))
 
 
 def test_n4_merged_pr_with_dirty_primary_is_not_a_gap(w):
@@ -537,7 +538,7 @@ def test_subagent_transcript_counts(w):
     sub = w.transcript.parent / "sess-1" / "subagents"
     sub.mkdir(parents=True)
     w.bash("git commit -m work", repo, transcript=sub / "agent-a1.jsonl")
-    assert "never pushed" in w.run()["reason"]
+    assert "never pushed" in ctx(w.run())
 
 
 def test_git_broker_mcp_push_counts(w):
@@ -546,7 +547,7 @@ def test_git_broker_mcp_push_counts(w):
     w.gh(visibility="PUBLIC")
     w.tool("mcp__git-broker__git", {"repo_path": str(repo), "operation": "push",
                                     "branch": "feat/x"}, "/")
-    assert "has no PR" in w.run()["reason"]
+    assert "has no PR" in ctx(w.run())
 
 
 @pytest.mark.parametrize("command,cwd,dirs,created", [
