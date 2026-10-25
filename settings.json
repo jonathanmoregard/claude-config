@@ -104,7 +104,6 @@
       "mcp__klaffat-app-runner__*",
       "mcp__git_broker__*",
       "mcp__github__*",
-      "mcp__github_klaffat__*",
       "mcp__home-assistant__ha_call_service",
       "mcp__home-assistant__ha_config_set_automation",
       "mcp__home-assistant__ha_config_set_dashboard",

@@ -40,6 +40,11 @@ for name in ("git_broker", "github"):
     cfg = dict(servers[name])
     if name == "git_broker":
         cfg["args"] = [str(home / ".claude" / "mcps" / "git-broker" / "server.py")]
+    else:
+        # github-mux: run the arm's own server.py and config.json.
+        live = "/home/jonathan/.claude/"
+        cfg["args"] = [str(home / ".claude" / arg[len(live):]) if arg.startswith(live) else arg
+                       for arg in cfg.get("args", [])]
     cfg["env"] = {**(cfg.get("env") or {}), "HOME": "/home/jonathan"}
     chosen[name] = cfg
 if chosen:

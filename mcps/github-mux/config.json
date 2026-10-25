@@ -1,0 +1,13 @@
+{
+  "command": "/etc/profiles/per-user/jonathan/bin/github-app-mcp-server",
+  "sharedArgs": [
+    "--toolsets",
+    "context,repos,issues,pull_requests,actions",
+    "--exclude-tools",
+    "merge_pull_request,pull_request_review_write,delete_file,create_repository,fork_repository,create_branch,create_or_update_file,push_files,update_pull_request_branch,actions_run_trigger"
+  ],
+  "defaultOwners": ["jonathanmoregard"],
+  "ownerChildren": {
+    "klaffat": ["--owner", "klaffat"]
+  }
+}

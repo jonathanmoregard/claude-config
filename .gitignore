@@ -325,6 +325,8 @@ automation-review/
 !Cargo.lock
 !poetry.lock
 !uv.lock
+# uv's lockfile for a PEP 723 script (`uv lock --script x.py`)
+!*.py.lock
 !Gemfile.lock
 
 # Auto-sync runtime log (see sync-agent.sh)

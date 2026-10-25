@@ -62,26 +62,15 @@
   },
   "github": {
     "type": "stdio",
-    "command": "/etc/profiles/per-user/jonathan/bin/github-app-mcp-server",
+    "command": "/etc/profiles/per-user/jonathan/bin/uv",
     "args": [
-      "--toolsets",
-      "context,repos,issues,pull_requests,actions",
-      "--exclude-tools",
-      "merge_pull_request,pull_request_review_write,delete_file,create_repository,fork_repository,create_branch,create_or_update_file,push_files,update_pull_request_branch,actions_run_trigger"
-    ],
-    "env": {},
-    "timeout": 600000
-  },
-  "github_klaffat": {
-    "type": "stdio",
-    "command": "/etc/profiles/per-user/jonathan/bin/github-app-mcp-server",
-    "args": [
-      "--owner",
-      "klaffat",
-      "--toolsets",
-      "context,repos,issues,pull_requests,actions",
-      "--exclude-tools",
-      "merge_pull_request,pull_request_review_write,delete_file,create_repository,fork_repository,create_branch,create_or_update_file,push_files,update_pull_request_branch,actions_run_trigger"
+      "run",
+      "--quiet",
+      "--locked",
+      "--script",
+      "/home/jonathan/.claude/mcps/github-mux/server.py",
+      "--config",
+      "/home/jonathan/.claude/mcps/github-mux/config.json"
     ],
     "env": {},
     "timeout": 600000
