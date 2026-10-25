@@ -6,6 +6,15 @@
 [general]
 verbose = false
 
+# Unattended sessions have no human to resolve an indeterminate result, so dcg's
+# own failure behaviour stays strict. bash-guard.py already converts dcg faults
+# and `ask` verdicts into a deny; this keeps dcg fail-closed when it is invoked
+# directly or through a future integration (defence in depth).
+# Verified: `dcg config` reports `Fail closed: true` with this key (dcg 0.12.5).
+# PR #76 also set `unverified_decision = "deny"`: dcg 0.12.5 has no such key and
+# ignores it silently, so it is deliberately not carried over.
+fail_closed = true
+
 # dcg's own evaluation deadline. Upstream default is 1000ms, and a command
 # that misses it does NOT get evaluated: dcg renders `permissionDecision:
 # "ask"` (src/hook.rs `write_indeterminate_to`), meaning "no verdict, a human
