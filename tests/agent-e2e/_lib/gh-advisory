@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Stub `gh` for the advisory scenarios: a private acme/widget repo. Logs each
+# call with the branch it ran from to $E2E_RUN/gh-branch.log. `pr create`
+# records the PR (head = --head or the current branch) so later `pr view`,
+# `pr list` and `pr checks` answer consistently about it.
+set -uo pipefail
+branch="$(git branch --show-current 2>/dev/null)"
+printf '%s\t%s\n' "$branch" "$*" >> "$E2E_RUN/gh-branch.log"
+prs="$E2E_RUN/prs.tsv"; touch "$prs"
+
+# Honour -q/--jq on JSON answers by re-running this stub through jq.
+jq_expr=""; prev=""
+for a in "$@"; do
+  case "$prev" in -q|--jq) jq_expr="$a" ;; esac
+  case "$a" in --jq=*) jq_expr="${a#*=}" ;; esac
+  prev="$a"
+done
+if [ -n "$jq_expr" ] && [ -z "${GH_STUB_INNER:-}" ] && [ "${1:-}" = pr ]; then
+  out="$(GH_STUB_INNER=1 "$0" "$@")"; rc=$?
+  [ $rc -ne 0 ] && exit $rc
+  printf '%s\n' "$out" | jq -r "$jq_expr"; exit $?
+fi
+
+pr_json() {  # number head title
+  printf '{"number":%s,"url":"https://github.com/acme/widget/pull/%s","state":"OPEN","isDraft":false,"mergeStateStatus":"BLOCKED","mergeable":"MERGEABLE","reviewDecision":"","headRefName":"%s","baseRefName":"main","title":"%s","mergedAt":null,"closedAt":null}' "$1" "$1" "$2" "$3"
+}
+find_pr() {  # selector (number, branch or empty = current branch)
+  local sel="${1:-$branch}"
+  awk -F'\t' -v s="$sel" '$1 == s || $2 == s { print; exit }' "$prs"
+}
+
+case "${1:-} ${2:-}" in
+  "repo view")
+    case " $* " in
+      *" -q "*|*" --jq "*) echo PRIVATE ;;
+      *) echo '{"name":"widget","owner":{"login":"acme"},"nameWithOwner":"acme/widget","visibility":"PRIVATE","isPrivate":true,"defaultBranchRef":{"name":"main"}}' ;;
+    esac ;;
+  "pr create")
+    head="$branch"; title="update"; prev=""
+    for a in "${@:3}"; do
+      case "$prev" in --head|-H) head="$a" ;; --title|-t) title="$a" ;; esac
+      case "$a" in --head=*) head="${a#*=}" ;; --title=*) title="${a#*=}" ;; esac
+      prev="$a"
+    done
+    if [ -n "$(find_pr "$head")" ]; then
+      echo "a pull request for branch \"$head\" into branch \"main\" already exists" >&2; exit 1
+    fi
+    n=$(( $(wc -l < "$prs") + 1 ))
+    printf '%s\t%s\t%s\n' "$n" "$head" "$title" >> "$prs"
+    echo "https://github.com/acme/widget/pull/$n" ;;
+  "pr list")
+    printf '['; sep=""
+    while IFS=$'\t' read -r n h t; do printf '%s' "$sep"; pr_json "$n" "$h" "$t"; sep=","; done < "$prs"
+    echo ']' ;;
+  "pr view"|"pr checks")
+    sel=""; [ $# -ge 3 ] && [[ "$3" != -* ]] && sel="$3"
+    row="$(find_pr "$sel")"
+    [ -z "$row" ] && { echo "no pull requests found for branch \"${sel:-$branch}\"" >&2; exit 1; }
+    IFS=$'\t' read -r n h t <<< "$row"
+    if [ "$2" = checks ]; then echo "check	pending	0	https://github.com/acme/widget/actions/runs/$n"; exit 8; fi
+    pr_json "$n" "$h" "$t"; echo ;;
+  "pr merge") echo "merging is the user's click" >&2; exit 1 ;;
+  "auth status") echo "github.com: Logged in to github.com account e2e" ;;
+  "run list") echo "[]" ;;
+  *) echo "{}" ;;
+esac
