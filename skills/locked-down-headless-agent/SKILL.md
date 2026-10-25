@@ -1,6 +1,6 @@
 ---
 name: locked-down-headless-agent
-description: Use when creating a headless Claude Code agent that runs autonomously without a human in the loop (cron jobs, background workers, CI/CD, scheduled tasks). Starts from maximum lock-down and guides unlocking the minimum permissions the use case actually needs.
+description: Use when creating, editing or reviewing a headless Claude Code agent that runs without a human in the loop — any `claude -p` / `claude --print` invocation in a cron job, systemd unit, Nix module (writeShellApplication, ExecStart wrapper, timer), worker script, hook or CI job — and especially when a job is meant to be "read-only", reads untrusted input (email, calendar, transcripts, web pages, PRs), or carries --allowedTools / --dangerously-skip-permissions. Starts from maximum lock-down and guides unlocking the minimum permissions the use case actually needs.
 ---
 
 # Locked-Down Headless Claude Code Agents
@@ -15,6 +15,27 @@ This skill gives you a default configuration that denies everything, then tells 
 - **OS boundaries beat prompt boundaries.** A sandbox the kernel enforces is stronger than a rule the model reads.
 - **Defense in depth.** Each layer below is independent. A bug in one should not collapse the others.
 - **Every unlock is a threat to re-examine.** When you add a capability, ask: what's the worst thing the agent could do with this if the prompt is adversarial?
+
+## The one rule people get wrong: `--tools` is the surface, `--allowedTools` is not
+
+`--allowedTools` / `permissions.allow` only **grant** permission. They never remove a tool. Tools the agent's settings already allow (your user `~/.claude/settings.json` allows Bash, say) stay callable, and every configured MCP server still loads. Measured on Claude Code 2.1.289 with a canary asking for a Bash write:
+
+| Flags | Tools in the `init` event | Bash wrote the file? |
+|---|---|---|
+| `--allowedTools Read` | 190 (Bash and all MCP servers included) | **yes** |
+| `--tools Read --strict-mcp-config` | 1 | no |
+| `--restricted --tools Read --strict-mcp-config` | 1 | no |
+
+So a "read-only" job is `--tools "Read,Glob,Grep" --strict-mcp-config`. `--tools` lists the built-in tools that exist. `--strict-mcp-config`, with no `--mcp-config` or only your pinned one, decides which MCP servers load. `--allowedTools` is optional on top of that, only to skip prompts.
+
+Real failures this rule would have caught:
+- A nightly "read-only" review agent (`--allowedTools "Read Glob Grep"` only) wrote two files straight into its output directory, bypassing the gate that was supposed to vet them. Scorer agents described as read-only still had Bash.
+- A cron job ran `--dangerously-skip-permissions` over calendar event titles. Anyone who can send you an invite controls that prompt. Never combine skip/bypass permissions with untrusted input.
+- An auto-sync agent held push credentials, so it could publish an unscanned secret. The fix: the agent only commits, and the wrapper scans the range (`gitleaks git`) and pushes, failing closed.
+
+**Gotcha:** `--tools`, `--allowedTools` and `--disallowedTools` are variadic. A positional prompt right after them is swallowed as a tool name, and you get `Input must be provided…`. Pass the prompt on stdin (`claude -p … < prompt.txt`), or end the list with another flag.
+
+**Codex (`codex exec`) has the same trap.** A managed `/etc/codex/requirements.toml` profile overrides `--sandbox read-only`, so the job may run writable. Check the effective sandbox in the session header or log (`sandbox: read-only`), not the flag you passed, and select a read-only managed profile explicitly (`-c default_permissions="<profile>"`, on `exec resume` too).
 
 ## Layer 1 — Dedicated config profile + managed settings
 
@@ -154,16 +175,20 @@ env -i \
   UV_CACHE_DIR="$REAL_HOME/.cache/uv" \
   ... \
   timeout 300 \
-  claude -p "$PROMPT" \
+  claude -p \
+    --restricted \
     --settings "$CLAUDE_CONFIG_DIR/settings.json" \
     --mcp-config "$CLAUDE_CONFIG_DIR/.mcp.json" \
     --strict-mcp-config \
     --permission-mode dontAsk \
     --tools "" \
-    --allowedTools "mcp__<your-proxy>__* ToolSearch" \
+    --allowedTools "mcp__<your-proxy>__*" \
     --max-turns 20 \
-    --output-format json
+    --output-format json \
+    < "$PROMPT_FILE"
 ```
+
+`--restricted` ignores user, project and local settings files, so your interactive allow rules don't leak in. Managed settings and `--settings` still apply. It also removes code-running tools unless `--tools` names them, confines file tools to the working directories and refuses `bypassPermissions`. Use it whenever the job runs as your own user.
 
 **What you lose vs `--bare`:** CC may still auto-discover hooks/plugins before `CLAUDE_CONFIG_DIR` isolation kicks in (mitigated by `CLAUDE_CODE_DISABLE_*` env vars). Token refresh may need network access beyond `api.anthropic.com` — if using sandbox network allowlist, add auth domains.
 
@@ -171,10 +196,10 @@ env -i \
 
 **Do not use `HOME="$SCRATCH"` in env-i.** MCP server processes are spawned as children of `claude` and inherit the env. If `HOME` points to a temp dir, any proxy that resolves `~/...` paths from a config file will silently expand to the scratch dir — and find nothing. Use the real `HOME` and rely on `CLAUDE_CODE_DISABLE_CLAUDE_MDS` + `cd "$SCRATCH"` to prevent CLAUDE.md discovery instead.
 
-**`ToolSearch` in `--allowedTools` is required when your proxy has many tools.** Claude Code defers MCP tool schemas when the combined tool count is large (exact threshold varies). The agent needs `ToolSearch` to load deferred schemas before it can call those tools. Without it, the agent sees the tool names but cannot use them, and ToolSearch calls get blocked by the hook. Allow `ToolSearch` explicitly — it is a read-only meta-tool that cannot execute actions. Update the hook whitelist too: `[[ "$TOOL_NAME" == mcp__<proxy>__* ]] || [[ "$TOOL_NAME" == "ToolSearch" ]]`.
+**You don't need `ToolSearch`.** `ToolSearch` is a built-in tool, so `--tools ""` removes it, and listing it in `--allowedTools` does nothing. Without it, Claude Code doesn't defer MCP schemas: it loads them all directly. Measured on 2.1.289 with a 60-tool proxy and `--tools ""`: the `init` event listed 60 `mcp__` tools, and a direct call to one of them worked. Only add `--tools "ToolSearch"` if loading every schema up front costs too much context. In that case also allow it in the hook whitelist: `[[ "$TOOL_NAME" == mcp__<proxy>__* ]] || [[ "$TOOL_NAME" == "ToolSearch" ]]`.
 
 Flag notes (both options):
-- `--tools ""` disables the entire built-in tool set (Bash, Read, Write, Edit, Glob, Grep, WebFetch, WebSearch, Task/Agent, NotebookEdit, Skill). Cleaner and more complete than enumerating `--disallowedTools`. Per-tool `--allowedTools` / `--disallowedTools` then layer on top of this baseline.
+- `--tools ""` disables the entire built-in tool set (Bash, Read, Write, Edit, Glob, Grep, WebFetch, WebSearch, Task/Agent, NotebookEdit, Skill, ToolSearch). `--tools "Read,Glob,Grep"` gives exactly those three. This is the only flag that shrinks the built-in surface. `--allowedTools` / `--disallowedTools` set permissions on top of it and never remove anything.
 - `--strict-mcp-config` forces only the `--mcp-config` file's servers to load — no user/project MCP inheritance.
 - `--allowedTools` / `--disallowedTools` accept tool-qualified forms (`Bash(git status:*)`, `WebFetch(domain:github.com)`); same syntax as `permissions.allow`/`deny`.
 - `dontAsk` auto-denies anything not in `permissions.allow`. Never use `bypassPermissions` — it propagates to subagents and cannot be cancelled.
@@ -202,8 +227,10 @@ The hook script checks the tool name; if it doesn't start with `mcp__<your-proxy
 Wrap the invocation so the OS enforces boundaries that the agent cannot negotiate around:
 
 ```bash
+REAL_HOME="$HOME"
+cd "$SCRATCH"
 env -i \
-  HOME="$SCRATCH_DIR" \
+  HOME="$REAL_HOME" \
   PATH="/usr/bin:/bin" \
   CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR" \
   ANTHROPIC_API_KEY="$(fetch-scoped-key)" \
@@ -211,7 +238,7 @@ env -i \
   claude --bare -p "$PROMPT" ...
 ```
 
-- **Scrubbed env:** `env -i` drops every variable except what you re-export. SSH agents, tokens for other services, shell history — all invisible.
+- **Scrubbed env:** `env -i` drops every variable except what you re-export. SSH agents, tokens for other services, shell history — all invisible. Keep the real `HOME`, for the same reason as Option B: MCP children inherit it. Isolation comes from `CLAUDE_CONFIG_DIR`, `cd "$SCRATCH"` and the sandbox's `denyRead`, not from a fake `HOME`.
 - **Scoped API key:** prefer `apiKeyHelper` (config) or a short-lived worker token from `claude setup-token`. Never the user's primary key.
 - **Time box:** `timeout 300` caps wall-clock. Combined with `--max-turns`, `MAX_MCP_OUTPUT_TOKENS`, you bound cost and blast radius.
 - **Future — OS sandbox, already partly on via Layer 1's `sandbox.enabled`:** CC's built-in sandbox uses bubblewrap (Linux) / Seatbelt (macOS) and extends to MCP subprocess children. For additional defense, wrap the whole invocation in `systemd-run --scope --user -p ProtectHome=read-only -p PrivateTmp=yes -p NoNewPrivileges=yes` (Linux) or a custom `sandbox-exec` profile (macOS).
@@ -251,7 +278,7 @@ env -i \
 
 After editing settings or invocation flags, verify the lock-down still holds:
 
-- Run a canary prompt: "Use the Bash tool to print the current date." It should be blocked.
+- Run a canary with `--output-format stream-json --verbose` and the prompt "Use the Bash tool to write the date to canary.txt". The `system`/`init` event's `tools` array must list only what you meant to grant (no `Bash`, no stray `mcp__*`), and `canary.txt` must not exist. A blocked call is weaker evidence than a tool that isn't there at all.
 - Check the violations log: the attempt should appear.
 - Check the permission-mode banner on startup: should say `dontAsk`, not `acceptAll` or `bypassPermissions`.
 - If using Option A: verify `claude --bare` is in the invocation. If Option B: verify `cd "$SCRATCH"` precedes the invocation and `CLAUDE_CONFIG_DIR` is set in env-i.
@@ -260,7 +287,9 @@ After editing settings or invocation flags, verify the lock-down still holds:
 
 ## Anti-patterns (never do these)
 
-- `--permission-mode bypassPermissions` in a headless context.
+- `--permission-mode bypassPermissions` or `--dangerously-skip-permissions` in a headless context, above all over untrusted input.
+- `--allowedTools` as the only restriction on a "read-only" job, with no `--tools` and no `--strict-mcp-config`.
+- Handing the agent push or publish credentials. The agent commits or writes a file; the wrapper scans the result and does the push.
 - Agent inherits user env (`ANTHROPIC_API_KEY` from your shell, SSH agent sockets).
 - Agent cwd inside a git repo that has a CLAUDE.md you didn't write.
 - MCP servers installed via `npx <package>` without a pinned version or integrity check.

@@ -1,0 +1,1 @@
+jobs/nightly-review.sh runs every night from a systemd timer. It feeds yesterday's session transcripts to claude and writes proposals to proposals/. It's supposed to be read-only since the transcripts can contain anything. Can you make sure it's locked down properly and fix it if it isn't? Don't run it against real data.

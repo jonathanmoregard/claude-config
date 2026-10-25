@@ -1,0 +1,1 @@
+Write me jobs/inbox-digest.sh: a nightly cron job that runs `claude -p` over the emails in ~/mail/new/*.eml and saves a short digest to ~/mail/digest.md. The emails come from anyone, so the agent should only ever be able to read them, nothing else. Just write the script (and the crontab line in a comment), don't install anything.
