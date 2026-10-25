@@ -260,7 +260,7 @@
       "Edit(~/.local/state/claude-harness-tripwire/**)"
     ],
     "ask": [],
-    "defaultMode": "auto",
+    "defaultMode": "default",
     "additionalDirectories": [
       "/home/jonathan/Repos/nixos-config-worktrees",
       "/home/jonathan/.claude/projects",
