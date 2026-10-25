@@ -1,11 +1,11 @@
 ---
 name: ai-router
-description: Use when choosing between Claude and Codex providers, delegating work across providers, handling a usage cap or rate limit ("You've hit your", "usage limit", weekly limit, 5-hour limit), checking quota headroom, load-spreading between the ChatGPT Pro and Claude Max plans, or running a job on gpt-5.6-sol/terra/luna from Claude. Native Claude-to-Claude subagents use the pinned role agents instead.
+description: Use when choosing between Claude and Codex providers, delegating work across providers (including from a sandboxed Codex host), running Klaffat gates from Codex, handling a usage cap or rate limit ("You've hit your", "usage limit", weekly limit, 5-hour limit), checking quota headroom, load-spreading between the ChatGPT Pro and Claude Max plans, or running a job on gpt-5.6-sol/terra/luna from Claude. Native Claude-to-Claude subagents use the pinned role agents instead.
 ---
 
 # ai-router — cross-provider subagent routing
 
-One CLI, absolute path, works from both Claude Code and Codex without PATH:
+Claude Code uses the absolute CLI path:
 
 ```
 /home/jonathan/.claude/bin/ai-router <subcommand> --json
@@ -23,13 +23,21 @@ full model IDs are pinned in `~/.claude/agents/`; do not override them per
 call. Use ai-router when provider selection or quota escape is actually part
 of the task.
 
+Sandboxed Codex sessions use the host-side `mcp__ai_router__ai_router` tool,
+not the CLI directly. A nested `codex exec` started inside the managed Codex
+sandbox cannot initialize or reach the provider. The MCP server runs on the
+host, writes the supplied prompt to the job prompt file through the real CLI,
+and returns a detached job ID. It exposes only `delegate`, `status`, bounded
+`wait`, `result`, and bounded `log`; it never exposes `--force`,
+`--allow-downgrade`, raw flags, shell text, or environment overrides.
+
 Pins (2026-09-14): `gpt-5.6-sol` > `claude-fable-5-1` > `claude-opus-5` >
 `gpt-5.6-terra` > `claude-sonnet-5` > `gpt-5.6-luna` >
 `claude-haiku-4-5-20251001`. Tiers: strongest = sol/fable/opus, standard =
 terra/sonnet, fast = luna/haiku. A provider is skipped when any of its
 usage buckets sits under its floor — the 15 % reserve for most of the
 window, descending to 0 over the final stretch before that bucket resets —
-or when it has been rejected (quota error, rate-limit stop); a rejection
+or when it has been rejected by a quota exhaustion; a rejection
 lapses at its reset time or as soon as a newer live snapshot shows every
 bucket above its floor again. Among eligible providers `pick` paces:
 `surplus` is how many points a provider sits ahead (+) or behind (−) the
@@ -54,13 +62,13 @@ never guessed.
    - `ok: false` → nothing eligible in that tier; add `--allow-downgrade` or
      wait for the reset shown in `candidates[].why`.
 Codex hosts: Codex→Codex is NEVER native (subagent model pinning is
-unreliable there); run `delegate --provider codex` or `--model` explicitly so
-the model is pinned per process. Pass `--host codex` when autodetection is in
-doubt.
+unreliable there). Call the structured host MCP `delegate` operation with an
+explicit `model` (or a `tier`) so the new process is pinned; the broker always
+passes `--host codex` itself.
 
 ## Delegate a job (cross-provider)
 
-Write the task to a file (prompt = the whole file, verbatim), then:
+From Claude, write the task to a file (prompt = the whole file, verbatim), then:
 
 ```
 /home/jonathan/.claude/bin/ai-router delegate --tier standard \
@@ -68,22 +76,29 @@ Write the task to a file (prompt = the whole file, verbatim), then:
   --sandbox read-only --json
 ```
 
-- `--tier` picks by ranking + headroom; `--model <id|alias>` pins (still
-  subject to eligibility; `--force` overrides and is recorded in the job).
+- `--tier` picks by ranking + headroom and may retry once on another model
+  after quota exhaustion. `--model <id|alias>` pins the exact model/provider:
+  quota, capacity, or rate-limit failures never switch it (eligibility still
+  applies; `--force` overrides eligibility and is recorded in the job).
 - `--sandbox read-only` (default) or `workspace-write`. Codex gets its OS
   sandbox; Claude gets `--permission-mode default --tools Read,Glob,Grep`
   for read-only and `acceptEdits` + file/Bash tools for workspace-write.
   There is no flag that bypasses either sandbox.
-- Codex `workspace-write` jobs explicitly disable network access and, for a
-  Git worktree, add only its canonical Git common dir so commits can update
-  linked-worktree metadata. `--dev-gates` is an explicit Codex-only
-  `workspace-write` opt-in for Klaffat gates: it also adds
-  `$HOME/.cache/nix`, `$XDG_RUNTIME_DIR/klaffat`, and
-  `$HOME/.local/state/klaffat`, then enables network access. Codex 0.146 has
-  no loopback-only network scope, so this means all network access. The exact
-  roots and network flag are in the job's `meta.json` `effective_sandbox`.
-  `send` and quota fallback are disabled for a `--dev-gates` job because
-  Codex resume cannot reproduce its `--add-dir` sandbox.
+- This host uses managed permission profiles. Under them Codex ignores
+  `--sandbox`, `--add-dir`, and
+  `sandbox_workspace_write.network_access=true`. Read-only delegates therefore
+  pass `-c default_permissions="repos_readonly"` explicitly (including resume),
+  while workspace-write uses the host's `repos_dev` profile. `meta.json`
+  records the effective managed profile and states that CLI overrides are
+  inert.
+- `--dev-gates` is rejected because it cannot make Nix or network available
+  under `repos_dev`. From Codex, run Klaffat gates through
+  `mcp__klaffat-app-runner__klaffat_app` with `operation=start`, `mode=check`,
+  the linked `worktree_path`, and one of `check_kind=affected|focused|full|rust_test`.
+  Poll `status` with `wait_s<=600`, then inspect bounded `logs`. `focused`
+  also requires `focused_target`: an existing `tests/e2e/tests/*.spec.ts`, a
+  workspace Cargo package, or a `scripts/test-lanes.json` focused-test ID.
+  `rust_test` requires `crate` and optionally `filter`.
 - `--schema schema.json` forces structured output (Codex `--output-schema`,
   Claude `--json-schema`); `result` then carries `result_json`.
 - `--effort low|medium|high|xhigh|max` (Codex also `ultra`). `--need
@@ -134,11 +149,13 @@ ai-router quota --fresh           # bypass the 60 s Codex cache
 ```
 
 Failure classes on jobs: `quota` (provider marked rejected until its reset;
-`delegate` retries ONCE on the next eligible model and records `retried_as`),
-`rejected` (model/request refused — deterministic, not retried), `stalled`
-(no output for 10 min), `timeout`, `unparseable`, `error`. Exit codes: 0 ok ·
-1 job failed (error) or cancelled · 2 usage/setup · 3 quota · 4 rejected ·
-5 stalled/timeout · 6 unparseable · 7 job not found/not finished.
+tier-picked jobs retry ONCE and record `retried_as`, while explicit `--model`
+jobs keep that model and record a retry note), `rate_limit` (terminal for this
+attempt; provider stays eligible and no cross-model retry), `rejected`
+(model/request refused — deterministic, not retried), `stalled` (no output
+for 10 min), `timeout`, `unparseable`, `error`. Exit codes: 0 ok · 1 job failed
+(error) or cancelled · 2 usage/setup · 3 quota · 4 rejected · 5
+rate-limit/stalled/timeout · 6 unparseable · 7 job not found/not finished.
 
 ## Ranking evidence
 

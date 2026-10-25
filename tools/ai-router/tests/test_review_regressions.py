@@ -56,8 +56,8 @@ def _codex_success_with_transient_429() -> list[dict]:
 def test_classify_success_beats_transient_429_event():
     events = _codex_success_with_transient_429()
     assert adapters.classify("codex", 0, events, "") == "done"
-    # the same stream with a failing exit is still a quota failure
-    assert adapters.classify("codex", 1, events, "") == "quota"
+    # the same stream with a failing exit is a transient rate limit, not quota
+    assert adapters.classify("codex", 1, events, "") == "rate_limit"
 
 
 def test_classify_claude_error_result_is_not_done_even_on_exit_zero():

@@ -4,7 +4,7 @@
 
 Behaviour is chosen by a `MODE:<mode>` token in the prompt (so it survives a
 detached launch without env plumbing):
-  ok (default) · quota · quota@<model> (quota only for that -m) · rejected ·
+  ok (default) · quota · quota@<model> (quota only for that -m) · rate_limit · rejected ·
   stall (one event then silence) · slow (events for ~20 s) · unparseable ·
   crash (exit 1, generic stderr) · overloaded
 Env FAKE_CODEX_APPSERVER=hang makes app-server never answer.
@@ -76,6 +76,11 @@ def exec_cmd(argv: list[str]) -> int:
     if mode == "quota":
         emit({"type": "error", "message": "You've hit your usage limit. Try again later."})
         emit({"type": "turn.failed", "error": {"message": "usage limit reached"}})
+        return 1
+    if mode == "rate_limit":
+        emit({"type": "turn.failed", "error": {
+            "message": "exceeded retry limit, last status: 429 Too Many Requests"
+        }})
         return 1
     if mode == "rejected":
         sys.stderr.write('ERROR: unexpected status 400 Bad Request: {"error":{"message":"model_not_found"}}\n')

@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -25,6 +24,7 @@ from .sanitize import clean
 from .selection import detect_host, pick
 
 EXIT_BY_CLASS = {"ok": 0, "usage": 2, "setup": 2, "quota": 3, "rejected": 4, "stalled": 5, "timeout": 5,
+                 "rate_limit": 5,
                  "overloaded": 5, "unparseable": 6, "not_found": 7, "not_finished": 7, "error": 1, "cancelled": 1}
 
 
@@ -95,7 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--cwd", default=None, metavar="D")
     sp.add_argument("--sandbox", choices=SANDBOXES, default="read-only")
     sp.add_argument("--dev-gates", action="store_true",
-                    help="opt into verified Klaffat development-gate roots and network for a Codex job")
+                    help="unsupported with managed Codex profiles; use the klaffat-app-runner check mode")
     sp.add_argument("--schema", metavar="S.json")
     sp.add_argument("--timeout-s", type=float, default=None)
     sp.add_argument("--effort", metavar="E")
@@ -177,54 +177,41 @@ def _abs_dir(path: str | None) -> str:
     return d
 
 
-def _existing_dir(path: Path, label: str) -> str:
-    resolved = path.resolve()
-    if not resolved.is_dir():
-        raise CliError("usage", f"{label} is not an existing directory: {resolved}")
-    return str(resolved)
-
-
-def _git_common_dir(cwd: str, env: dict[str, str]) -> str | None:
-    git_env = dict(env)
-    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
-        git_env.pop(name, None)
-    try:
-        result = subprocess.run(
-            ["git", "-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"],
-            check=False, capture_output=True, env=git_env, text=True,
-        )
-    except OSError as exc:
-        raise CliError("setup", f"could not resolve Git common directory: {exc}") from exc
-    if result.returncode != 0:
-        return None
-    value = result.stdout.strip()
-    if not value:
-        raise CliError("usage", "Git returned an empty common directory")
-    return _existing_dir(Path(value), "Git common directory")
-
-
 def _codex_effective_sandbox(cwd: str, sandbox: str, dev_gates: bool,
                              env: dict[str, str]) -> tuple[dict[str, Any], tuple[str, ...]]:
-    if sandbox != "workspace-write":
-        return {"mode": sandbox, "writable_roots": [], "network_access": False}, ()
-    roots = [cwd]
-    common_dir = _git_common_dir(cwd, env)
-    if common_dir and common_dir != cwd:
-        roots.append(common_dir)
+    """Describe the host-managed profile, not inert Codex CLI overrides.
+
+    `/etc/codex/requirements.toml` selects managed permission profiles on this
+    host. In that mode `--sandbox`, `--add-dir`, and
+    `sandbox_workspace_write.network_access` do not widen the profile. Keep the
+    metadata honest and never hand inert roots to the adapter.
+    """
+    del cwd, env
     if dev_gates:
-        home = Path(env.get("HOME") or Path.home())
-        runtime_parent = Path(env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
-        roots.extend([
-            _existing_dir(home / ".cache" / "nix", "Nix fetcher cache"),
-            _existing_dir(runtime_parent / "klaffat", "Klaffat runtime directory"),
-            _existing_dir(home / ".local" / "state" / "klaffat", "Klaffat state directory"),
-        ])
-    unique_roots = list(dict.fromkeys(roots))
+        raise CliError(
+            "usage",
+            "--dev-gates is ineffective under the managed Codex permission profile; "
+            "run Klaffat gates with the klaffat-app-runner check mode",
+        )
+    if sandbox == "read-only":
+        return {
+            "mode": "read-only",
+            "managed_profile": "repos_readonly",
+            "writable_roots": [],
+            "network_access": False,
+            "cli_overrides_effective": False,
+        }, ()
     return {
-        "mode": sandbox,
-        "writable_roots": unique_roots,
-        "network_access": dev_gates,
-    }, tuple(unique_roots[1:])
+        "mode": "workspace-write",
+        "managed_profile": "repos_dev",
+        "writable_roots": [
+            "/home/jonathan/Repos",
+            "/home/jonathan/worktrees",
+            "/home/jonathan/.local/state/ai-router",
+        ],
+        "network_access": False,
+        "cli_overrides_effective": False,
+    }, ()
 
 
 def _check_effort(ctx: Ctx, provider: str, effort: str | None) -> None:
@@ -328,6 +315,12 @@ def _choose_for_delegate(ctx: Ctx, args: argparse.Namespace, host: str | None) -
 def cmd_delegate(ctx: Ctx, args: argparse.Namespace, out: Out, launcher: str) -> int:
     prompt = _read_prompt(args.prompt_file)
     cwd = _abs_dir(args.cwd)
+    if args.dev_gates:
+        raise CliError(
+            "usage",
+            "--dev-gates is ineffective under the managed Codex permission profile; "
+            "run Klaffat gates with the klaffat-app-runner check mode",
+        )
     schema = None
     if args.schema:
         schema = os.path.abspath(args.schema)
@@ -335,8 +328,6 @@ def cmd_delegate(ctx: Ctx, args: argparse.Namespace, out: Out, launcher: str) ->
             raise CliError("usage", f"schema file not found: {schema}")
     host = args.host or detect_host(ctx.env)
     provider, model, effort, tier, forced = _choose_for_delegate(ctx, args, host)
-    if args.dev_gates and (provider != "codex" or args.sandbox != "workspace-write"):
-        raise CliError("usage", "--dev-gates requires a Codex workspace-write delegate")
     binary = adapters.resolve_binary(provider, ctx.env)
     if binary is None:
         raise CliError("setup", f"{provider} binary not found (set AI_ROUTER_{provider.upper()}_BIN or PATH)")
@@ -347,7 +338,8 @@ def cmd_delegate(ctx: Ctx, args: argparse.Namespace, out: Out, launcher: str) ->
     spec = jobs.JobSpec(provider=provider, model=model, effort=effort, tier=tier, cwd=cwd, sandbox=args.sandbox,
                         prompt=prompt, timeout_s=timeout_s, stall_min=ctx.cfg.settings.job_stall_min,
                         bare=not args.no_bare, schema=schema, host=host, name=args.name, need=list(args.need),
-                        forced=forced, argv=[])
+                        forced=forced, model_pinned=args.model is not None,
+                        provider_constraint=args.provider, argv=[])
     job_id, d = jobs.create_job(ctx.state, spec, now=ctx.now)
     # argv needs the job dir (codex `-o <job_dir>/last_message.md`), so it is built after create
     spec.argv = adapters.build_argv(provider, binary, model=model, effort=effort, sandbox=args.sandbox, cwd=cwd,
@@ -434,7 +426,9 @@ def cmd_send(ctx: Ctx, args: argparse.Namespace, out: Out, launcher: str) -> int
     spec = jobs.JobSpec(provider=meta["provider"], model=meta["model"], effort=meta.get("effort"), tier=meta["tier"],
                         cwd=meta["cwd"], sandbox=meta["sandbox"], prompt=prompt, timeout_s=timeout_s,
                         stall_min=meta["stall_min"], bare=bool(meta.get("bare", True)), host=meta.get("host"),
-                        name=meta.get("name"), parent_job=args.job_id, argv=argv)
+                        name=meta.get("name"), model_pinned=bool(meta.get("model_pinned")),
+                        provider_constraint=meta.get("provider_constraint"),
+                        parent_job=args.job_id, argv=argv)
     started = _start_job(ctx, spec, launcher)
     if args.wait:
         return _wait_and_report(ctx, out, started["job_id"], timeout_s)

@@ -20,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 import urllib.error
 import urllib.request
 
@@ -70,7 +71,8 @@ _PATH_KEYS = (
 _UNIT_PREFIX = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,63})$")
 _RUN_ID = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{16}$")
 _OPERATIONS = frozenset({"start", "status", "logs", "http_get", "stop", "current"})
-_MODES = frozenset({"app", "e2e", "claude_design_export", "real_calendar"})
+_MODES = frozenset({"app", "e2e", "check", "claude_design_export", "real_calendar"})
+_CHECK_KINDS = frozenset({"affected", "focused", "full", "rust_test"})
 _STATE_KEYS = frozenset(
     {
         "version",
@@ -163,7 +165,16 @@ def _validate_request(args: dict, policy: dict) -> dict:
         raise RuntimeError("operation must be start, status, logs, http_get, stop, or current")
 
     allowed = {
-        "start": {"operation", "mode", "worktree_path", "spec"},
+        "start": {
+            "operation",
+            "mode",
+            "worktree_path",
+            "spec",
+            "check_kind",
+            "focused_target",
+            "crate",
+            "filter",
+        },
         "status": {"operation", "run_id", "wait_s"},
         "logs": {"operation", "run_id", "tail_lines"},
         "http_get": {"operation", "run_id", "path"},
@@ -203,6 +214,45 @@ def _validate_request(args: dict, policy: dict) -> dict:
             ):
                 raise RuntimeError("spec must be a bounded non-empty string")
             request["spec"] = spec
+        check_fields = {"check_kind", "focused_target", "crate", "filter"} & set(args)
+        if mode != "check" and check_fields:
+            raise RuntimeError("check fields are accepted only for check mode")
+        if mode == "check":
+            kind = args.get("check_kind")
+            if not isinstance(kind, str) or kind not in _CHECK_KINDS:
+                raise RuntimeError(
+                    "check_kind must be affected, focused, full, or rust_test"
+                )
+            request["check_kind"] = kind
+            required = {
+                "affected": set(),
+                "full": set(),
+                "focused": {"focused_target"},
+                "rust_test": {"crate"},
+            }[kind]
+            permitted = {
+                "affected": set(),
+                "full": set(),
+                "focused": {"focused_target"},
+                "rust_test": {"crate", "filter"},
+            }[kind]
+            present = {"focused_target", "crate", "filter"} & set(args)
+            if not required <= present or not present <= permitted:
+                raise RuntimeError(
+                    f"{kind} check accepts exactly: "
+                    + (", ".join(sorted(required)) if required else "no extra fields")
+                    + (" (filter is optional)" if kind == "rust_test" else "")
+                )
+            for field in present:
+                value = args[field]
+                if (
+                    not isinstance(value, str)
+                    or not value
+                    or "\x00" in value
+                    or len(value) > 512
+                ):
+                    raise RuntimeError(f"{field} must be a bounded non-empty string")
+                request[field] = value
         return request
 
     if operation == "current":
@@ -406,6 +456,140 @@ def _validate_spec(worktree: Path, raw_spec: str) -> str:
     return f"tests/{parts[3]}"
 
 
+def _validate_check(worktree: Path, request: dict) -> dict[str, str]:
+    """Validate one fixed check selection after the worktree is authenticated."""
+    kind = request["check_kind"]
+    if kind in {"affected", "full"}:
+        return {"kind": kind}
+    if kind == "rust_test":
+        crate = request["crate"]
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", crate) is None:
+            raise RuntimeError("crate must be a Cargo package name without flags")
+        result = {"kind": kind, "crate": crate}
+        if "filter" in request:
+            test_filter = request["filter"]
+            if (
+                test_filter.startswith("-")
+                or re.fullmatch(r"[A-Za-z0-9_:.=-]{1,256}", test_filter) is None
+            ):
+                raise RuntimeError("filter contains unsupported characters or starts with -")
+            result["filter"] = test_filter
+        return result
+
+    target = request["focused_target"]
+    target_error = (
+        "focused_target must be an existing canonical tests/e2e/tests/*.spec.ts file, "
+        "a Cargo package name from crates/*/Cargo.toml, or a focused_tests[].id "
+        "from scripts/test-lanes.json"
+    )
+
+    relative = PurePosixPath(target)
+    if (
+        not relative.is_absolute()
+        and len(relative.parts) == 4
+        and relative.parts[:3] == ("tests", "e2e", "tests")
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.spec\.ts", relative.parts[3])
+    ):
+        spec_root = worktree / "tests" / "e2e" / "tests"
+        candidate = spec_root / relative.parts[3]
+        try:
+            root_resolved = spec_root.resolve(strict=True)
+            candidate_resolved = candidate.resolve(strict=True)
+            info = candidate.lstat()
+        except OSError as exc:
+            raise RuntimeError(target_error) from exc
+        if (
+            root_resolved != spec_root
+            or spec_root.is_symlink()
+            or candidate_resolved != candidate
+            or candidate.is_symlink()
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+        ):
+            raise RuntimeError(target_error)
+        return {"kind": kind, "target": relative.as_posix()}
+
+    if re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", target) is None:
+        raise RuntimeError(target_error)
+
+    crates_root = worktree / "crates"
+    try:
+        crates_info = crates_root.lstat()
+        crates_resolved = crates_root.resolve(strict=True)
+        manifests = sorted(crates_root.glob("*/Cargo.toml"))
+    except OSError as exc:
+        raise RuntimeError("could not inspect workspace Cargo packages") from exc
+    if (
+        crates_resolved != crates_root
+        or crates_root.is_symlink()
+        or not stat.S_ISDIR(crates_info.st_mode)
+    ):
+        raise RuntimeError("workspace crates directory is not canonical")
+    for manifest in manifests:
+        try:
+            resolved = manifest.resolve(strict=True)
+            info = manifest.lstat()
+            crate_dir_resolved = manifest.parent.resolve(strict=True)
+            crate_dir_info = manifest.parent.lstat()
+        except OSError as exc:
+            raise RuntimeError("could not inspect workspace Cargo package metadata") from exc
+        if (
+            resolved != manifest
+            or manifest.is_symlink()
+            or not stat.S_ISREG(info.st_mode)
+            or manifest.parent.parent != crates_root
+            or crate_dir_resolved != manifest.parent
+            or manifest.parent.is_symlink()
+            or not stat.S_ISDIR(crate_dir_info.st_mode)
+        ):
+            raise RuntimeError("workspace Cargo package metadata is not canonical")
+        try:
+            data = tomllib.loads(
+                _read_owned_regular_text(manifest, "workspace Cargo package metadata")
+            )
+        except tomllib.TOMLDecodeError as exc:
+            raise RuntimeError("could not parse workspace Cargo package metadata") from exc
+        package = data.get("package")
+        if isinstance(package, dict) and package.get("name") == target:
+            return {"kind": kind, "target": target}
+
+    lanes_path = worktree / "scripts" / "test-lanes.json"
+    try:
+        scripts_dir = lanes_path.parent
+        scripts_resolved = scripts_dir.resolve(strict=True)
+        scripts_info = scripts_dir.lstat()
+        lanes_resolved = lanes_path.resolve(strict=True)
+        lanes_info = lanes_path.lstat()
+    except OSError as exc:
+        raise RuntimeError("could not inspect scripts/test-lanes.json") from exc
+    if (
+        scripts_resolved != scripts_dir
+        or scripts_dir.is_symlink()
+        or not stat.S_ISDIR(scripts_info.st_mode)
+        or lanes_resolved != lanes_path
+        or lanes_path.is_symlink()
+        or not stat.S_ISREG(lanes_info.st_mode)
+    ):
+        raise RuntimeError("scripts/test-lanes.json is not canonical")
+    try:
+        lanes = json.loads(
+            _read_owned_regular_text(lanes_path, "scripts/test-lanes.json")
+        )
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("could not parse scripts/test-lanes.json") from exc
+    if not isinstance(lanes, dict):
+        raise RuntimeError("scripts/test-lanes.json must contain a JSON object")
+    focused_tests = lanes.get("focused_tests")
+    if not isinstance(focused_tests, list) or any(
+        not isinstance(entry, dict) or not isinstance(entry.get("id"), str)
+        for entry in focused_tests
+    ):
+        raise RuntimeError("scripts/test-lanes.json focused_tests must contain string ids")
+    if any(entry["id"] == target for entry in focused_tests):
+        return {"kind": kind, "target": target}
+    raise RuntimeError(target_error)
+
+
 def _new_run_id() -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"{timestamp}-{secrets.token_hex(8)}"
@@ -575,7 +759,13 @@ def _unit_home(worktree: Path) -> Path:
     return worktree / "target" / "klaffat-app-runner" / "home"
 
 
-def _build_start_argv(state: dict, policy: dict, *, spec: str | None = None) -> list[str]:
+def _build_start_argv(
+    state: dict,
+    policy: dict,
+    *,
+    spec: str | None = None,
+    check: dict[str, str] | None = None,
+) -> list[str]:
     """Map validated state to one fixed launcher argv; never invoke a shell parser.
 
     Units share the host network namespace. A user service manager cannot
@@ -592,6 +782,8 @@ def _build_start_argv(state: dict, policy: dict, *, spec: str | None = None) -> 
         return [str(policy["realCalendarExecutable"]), "start", str(worktree)]
 
     e2e_script = worktree / "scripts" / "e2e-run"
+    check_script = worktree / "scripts" / "check"
+    rust_test_script = worktree / "scripts" / "rust-test-run"
     export_script = worktree / "scripts" / "export-claude-design.sh"
     runner_dir = Path(__file__).resolve().parent
     hold_helper = runner_dir / "hold.py"
@@ -600,11 +792,20 @@ def _build_start_argv(state: dict, policy: dict, *, spec: str | None = None) -> 
     _validated_script(sandbox_exec, "sandbox exec helper", executable=False)
     if mode in {"app", "e2e"}:
         _validated_script(e2e_script, "Klaffat E2E runner", executable=True)
+    if mode == "check":
+        if check is None:
+            raise RuntimeError("check mode requires one validated check selection")
+        if check.get("kind") == "rust_test":
+            _validated_script(rust_test_script, "Klaffat Rust test runner", executable=True)
+        else:
+            _validated_script(check_script, "Klaffat check runner", executable=True)
     if mode == "claude_design_export":
         _validated_script(export_script, "Claude Design exporter", executable=True)
     if mode == "app":
         _validated_script(hold_helper, "app hold helper", executable=False)
-    else:
+    elif mode in {"e2e", "claude_design_export"} or (
+        mode == "check" and check is not None and check.get("kind") != "rust_test"
+    ):
         _validated_script(deps_helper, "E2E dependency helper", executable=False)
 
     python = str(policy["pythonExecutable"])
@@ -617,6 +818,37 @@ def _build_start_argv(state: dict, policy: dict, *, spec: str | None = None) -> 
             if re.fullmatch(r"tests/[A-Za-z0-9][A-Za-z0-9_.-]*\.spec\.ts", spec) is None:
                 raise RuntimeError("internal E2E spec path is malformed")
             command += ["--", spec]
+    elif mode == "check":
+        if spec is not None or check is None:
+            raise RuntimeError("check mode requires one validated check selection")
+        kind = check.get("kind")
+        if kind == "affected":
+            check_command = [bash, str(check_script), "affected", "--base", "origin/main"]
+        elif kind == "focused":
+            check_command = [bash, str(check_script), "focused", check["target"]]
+        elif kind == "full":
+            check_command = [bash, str(check_script), "full"]
+        elif kind == "rust_test":
+            check_command = [
+                bash,
+                str(rust_test_script),
+                "--",
+                "cargo",
+                "test",
+                "-p",
+                check["crate"],
+            ]
+            if check.get("filter"):
+                check_command.append(check["filter"])
+        else:
+            raise RuntimeError("validated check selection is malformed")
+        if kind == "rust_test":
+            command = check_command
+        else:
+            # scripts/check may select Playwright. A fresh linked worktree has
+            # no tests/e2e/node_modules, so install the committed lockfile into
+            # the isolated per-worktree HOME before executing the exact check.
+            command = [python, str(deps_helper), "--", *check_command]
     elif mode == "claude_design_export":
         if spec is not None:
             raise RuntimeError("claude_design_export does not accept a spec")
@@ -932,10 +1164,11 @@ def _start_run(request: dict, policy: dict, *, runner, rec=None) -> dict:
     spec = None
     if "spec" in request:
         spec = _validate_spec(worktree, request["spec"])
+    check = _validate_check(worktree, request) if mode == "check" else None
     run_id = _new_run_id()
     state = _initial_state(run_id, mode, worktree, policy)
     _write_state(state, policy, create=True)
-    argv = _build_start_argv(state, policy, spec=spec)
+    argv = _build_start_argv(state, policy, spec=spec, check=check)
     timeout = (
         policy["realStartTimeoutMs"]
         if mode == "real_calendar"
@@ -1708,7 +1941,9 @@ TOOLS = [
             "(mock-OAuth app kept running; ready when status phase=running with a "
             "url), e2e (whole Playwright suite, or one spec "
             "tests/e2e/tests/<name>.spec.ts; done at phase=succeeded or failed), "
-            "claude_design_export (bundle under target/claude-design), and "
+            "check (affected, focused target, full, or one crate/filter Rust test; "
+            "one-shot and host-side), claude_design_export (bundle under "
+            "target/claude-design), and "
             "real_calendar (installed real-provider service). logs returns the "
             "redacted journal tail; http_get fetches a path from a running app "
             "(no loopback network needed). E2E failure artifacts land under the "
@@ -1730,7 +1965,7 @@ TOOLS = [
                 },
                 "mode": {
                     "type": "string",
-                    "enum": ["app", "e2e", "claude_design_export", "real_calendar"],
+                    "enum": ["app", "e2e", "check", "claude_design_export", "real_calendar"],
                     "description": "Required only for start; selects the fixed Klaffat workflow.",
                 },
                 "worktree_path": {
@@ -1740,6 +1975,26 @@ TOOLS = [
                 "spec": {
                     "type": "string",
                     "description": "Optional only for e2e start; one tests/e2e/tests/*.spec.ts path.",
+                },
+                "check_kind": {
+                    "type": "string",
+                    "enum": ["affected", "focused", "full", "rust_test"],
+                    "description": "Required only for check mode; selects one fixed gate command.",
+                },
+                "focused_target": {
+                    "type": "string",
+                    "description": (
+                        "Required only for focused check; an existing tests/e2e/tests/*.spec.ts file, "
+                        "workspace Cargo package name, or scripts/test-lanes.json focused_tests id."
+                    ),
+                },
+                "crate": {
+                    "type": "string",
+                    "description": "Required only for rust_test check; Cargo package name.",
+                },
+                "filter": {
+                    "type": "string",
+                    "description": "Optional only for rust_test check; one Cargo test-name filter.",
                 },
                 "run_id": {
                     "type": "string",
