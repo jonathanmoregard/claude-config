@@ -33,12 +33,12 @@ def env(state_dir: Path, tmp_path: Path) -> dict[str, str]:
 
 def spec_for(provider: str, model: str, prompt: str, tmp_path: Path, env: dict[str, str], *,
              timeout_s: float = 30, stall_min: float = 0.5, sandbox: str = "read-only", schema: str | None = None,
-             effort: str | None = "low", tier: str = "fast") -> jobs.JobSpec:
+             effort: str | None = "low", tier: str = "fast", model_pinned: bool = False) -> jobs.JobSpec:
     binary = adapters.resolve_binary(provider, env)
     assert binary
     return jobs.JobSpec(provider=provider, model=model, effort=effort, tier=tier, cwd=str(tmp_path),
                         sandbox=sandbox, prompt=prompt, timeout_s=timeout_s, stall_min=stall_min, schema=schema,
-                        argv=[], host="claude")
+                        argv=[], host="claude", model_pinned=model_pinned)
 
 
 def start(state: Path, spec: jobs.JobSpec, env: dict[str, str], now: float | None = None) -> tuple[str, Path]:
@@ -64,6 +64,7 @@ def test_create_job_layout(state_dir: Path, tmp_path: Path, env):
     meta = jobs.read_meta(d)
     assert set(jobs.META_KEYS) <= set(meta)
     assert meta["retry_of"] is None and meta["forced"] is False and meta["stall_min"] == 0.5
+    assert meta["model_pinned"] is False
     assert (d.stat().st_mode & 0o777) == 0o700
     with pytest.raises(jobs.JobNotFound):
         jobs.job_dir(state_dir, "nope")
@@ -119,13 +120,33 @@ def test_quota_failure_writes_rejected_and_retries_once(state_dir: Path, tmp_pat
     assert jobs.raw_status(d) == "failed:quota" and old["error_class"] == "quota"
     rej = json.loads((state_dir / "quota" / "codex.rejected.json").read_text())
     assert rej["provider"] == "codex" and rej["source"] == f"job:{job_id}" and "usage limit" in rej["reason"]
-    assert rej["until"] == 1789805383  # blocking bucket resets_at from the stub app-server snapshot
+    # The captured provider reset is historical once this fixture is older
+    # than its original week. ai-router must not park a provider until a time
+    # already in the past; before that instant it preserves the exact reset.
+    expected_until = 1789805383 if time.time() < 1789805383 else None
+    assert rej["until"] == expected_until
     assert old["retried_as"] and old["retried_as"] != job_id
     assert fid == old["retried_as"] and status == "done"
     new = jobs.read_meta(jobs.job_dir(state_dir, fid))
     assert new["retry_of"] == job_id and new["provider"] == "claude" and new["model"] == "claude-haiku-4-5-20251001"
     assert new["effort"] == "low" and new["forced"] is False
     assert jobs.status_obj(state_dir, job_id)["retried_as"] == fid
+
+
+def test_provider_constrained_quota_failure_never_retries_on_claude(
+    state_dir: Path, tmp_path: Path, env
+):
+    spec = spec_for("codex", "gpt-5.6-luna", "MODE:quota", tmp_path, env)
+    spec.provider_constraint = "codex"
+    job_id, d = start(state_dir, spec, env)
+
+    fid, status = finish(state_dir, job_id)
+
+    meta = jobs.read_meta(d)
+    assert fid == job_id and status == "failed:quota"
+    assert meta["provider_constraint"] == "codex"
+    assert meta["retried_as"] is None
+    assert "no eligible fast model for provider codex" in meta["retry_note"]
 
 
 def test_quota_twice_stops_after_one_retry(state_dir: Path, tmp_path: Path, env):
@@ -137,6 +158,41 @@ def test_quota_twice_stops_after_one_retry(state_dir: Path, tmp_path: Path, env)
     assert retry["retry_note"].startswith("already a retry")
     assert (state_dir / "quota" / "claude.rejected.json").exists()
     assert (state_dir / "quota" / "codex.rejected.json").exists()
+
+
+def test_pinned_model_quota_failure_never_cross_retries(state_dir: Path, tmp_path: Path, env):
+    job_id, d = start(
+        state_dir,
+        spec_for(
+            "codex",
+            "gpt-5.6-luna",
+            "MODE:quota",
+            tmp_path,
+            env,
+            model_pinned=True,
+        ),
+        env,
+    )
+    fid, status = finish(state_dir, job_id)
+    meta = jobs.read_meta(d)
+    assert fid == job_id and status == "failed:quota"
+    assert meta["retried_as"] is None
+    assert meta["retry_note"] == "no retry: model pinned (--model); retry the same model later"
+    assert (state_dir / "quota" / "codex.rejected.json").exists()
+
+
+def test_rate_limit_never_rejects_provider_or_cross_retries(state_dir: Path, tmp_path: Path, env):
+    job_id, d = start(
+        state_dir,
+        spec_for("codex", "gpt-5.6-luna", "MODE:rate_limit", tmp_path, env),
+        env,
+    )
+    fid, status = finish(state_dir, job_id)
+    meta = jobs.read_meta(d)
+    assert fid == job_id and status == "failed:rate_limit"
+    assert meta["error_class"] == "rate_limit" and meta["retried_as"] is None
+    assert not (state_dir / "quota" / "codex.rejected.json").exists()
+    assert len(jobs.list_jobs(state_dir, all_jobs=True)) == 1
 
 
 def test_stall_watchdog(state_dir: Path, tmp_path: Path, env):

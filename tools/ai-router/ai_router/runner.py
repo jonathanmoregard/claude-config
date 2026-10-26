@@ -7,9 +7,11 @@ CLI with stdout → ``events.jsonl`` (one flushed line per event) and stderr →
 the wall clock (``timeout_s``), classifies the exit via ``adapters.classify``
 and writes ``result.txt`` / ``result.json`` / ``exit_code`` / ``status``.
 
-On a ``quota`` failure it writes ``quota/<provider>.rejected.json`` and, if
-this job is not itself a retry, picks the next eligible model in the same
-tier and launches exactly one retry (``retry_of`` / ``retried_as``).
+On a ``quota`` failure it writes ``quota/<provider>.rejected.json`` and, for
+tier-picked jobs that are not themselves retries, picks the next eligible
+model in the same tier and launches exactly one retry. Explicitly pinned
+models never change model/provider. ``rate_limit`` failures do not reject the
+provider or trigger a cross-model retry.
 """
 
 from __future__ import annotations
@@ -106,12 +108,16 @@ def _retry_after_quota(state: Path, d: Path, meta: dict[str, Any], diag: str, no
         until = None
     rejected = quota.mark_rejected(state, provider, until=until, reason=diag.strip()[:300] or "quota",
                                    source=f"job:{d.name}", now=now)
+    if meta.get("model_pinned"):
+        jobs.update_meta(d, retry_note="no retry: model pinned (--model); retry the same model later")
+        return
     if meta.get("retry_of"):
         jobs.update_meta(d, retry_note="already a retry; not retried again")
         return
     if provider in snapshots:
         snapshots[provider].update(status="rejected", rejected_until=rejected["until"], reason=rejected["reason"])
-    choice = pick(cfg, snapshots, meta["tier"], need=tuple(meta.get("need") or ()), host=meta.get("host"), now=now)
+    choice = pick(cfg, snapshots, meta["tier"], need=tuple(meta.get("need") or ()),
+                  provider=meta.get("provider_constraint"), host=meta.get("host"), now=now)
     if not choice["ok"]:
         jobs.update_meta(d, retry_note=f"no retry: {choice['reason']}")
         return
@@ -126,7 +132,7 @@ def _retry_after_quota(state: Path, d: Path, meta: dict[str, Any], diag: str, no
         sandbox=meta["sandbox"], prompt=prompt, timeout_s=meta["timeout_s"], stall_min=meta["stall_min"],
         bare=bool(meta.get("bare", True)), schema=meta.get("schema"), host=meta.get("host"), name=meta.get("name"),
         need=list(meta.get("need") or []), forced=False, retry_of=d.name, parent_job=meta.get("parent_job"),
-        argv=[]), now=now)
+        provider_constraint=meta.get("provider_constraint"), argv=[]), now=now)
     argv = adapters.build_argv(choice["provider"], binary, model=choice["model"], effort=effort,
                                sandbox=meta["sandbox"], cwd=meta["cwd"], schema=meta.get("schema"),
                                bare=bool(meta.get("bare", True)), job_dir=new_dir)

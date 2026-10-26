@@ -36,6 +36,15 @@
     "args": [],
     "env": {}
   },
+  "ai_router": {
+    "type": "stdio",
+    "command": "/run/current-system/sw/bin/python3",
+    "args": [
+      "/home/jonathan/.claude/mcps/ai-router/server.py"
+    ],
+    "env": {},
+    "timeout": 620000
+  },
   "klaffat-app-runner": {
     "type": "stdio",
     "command": "/run/current-system/sw/bin/python3",

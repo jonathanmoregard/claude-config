@@ -5,9 +5,10 @@ Date: 2026-10-05
 ## Outcome
 
 Claude Code and Codex can start a Klaffat development app, run mock-backed
-Playwright E2E tests, export the Claude Design bundle, and start the existing
-real-calendar test service from a Klaffat linked worktree. The tools work from
-an agent sandbox because the MCP server itself runs on the host.
+Playwright E2E tests, run the repository's development checks, export the
+Claude Design bundle, and start the existing real-calendar test service from
+a Klaffat linked worktree. The tools work from an agent sandbox because the
+MCP server itself runs on the host.
 
 The capability is intentionally Klaffat-specific. It is not a general command
 runner.
@@ -40,6 +41,7 @@ One structured tool, `klaffat_app`, exposes these operations:
 1. `start` accepts an absolute `worktree_path` and a fixed `mode`:
    - `app`: mock-backed Klaffat kept alive for browser or agent smoke tests;
    - `e2e`: the complete Playwright suite or one validated test spec;
+   - `check`: one affected, focused, full, or crate-filtered Rust check;
    - `claude_design_export`: the repository's fixed design-export workflow;
    - `real_calendar`: the installed real Google/optional Microsoft service.
 2. `status` accepts a runner-issued `run_id` and reports lifecycle state, URL,
@@ -62,6 +64,14 @@ One structured tool, `klaffat_app`, exposes these operations:
 `tests/e2e/tests/` ending in `.spec.ts`. No Playwright flags, grep expressions,
 shell text, environment assignments, or arbitrary arguments are accepted.
 
+`check` requires one `check_kind`. `affected` always runs against
+`origin/main`; `full` has no extra input; `focused` requires one
+`focused_target`: either a canonical existing `tests/e2e/tests/*.spec.ts`
+file, a package name read from `crates/*/Cargo.toml`, or a `focused_tests` ID
+from `scripts/test-lanes.json`. `rust_test` accepts one Cargo package name and
+optional test-name filter. The surface cannot express flags, traversal, shell
+metacharacters, or another command.
+
 Every start returns a random opaque run ID. The ID maps to runner-owned state
 under the user's private state directory. App and one-shot modes run as
 transient user-systemd services so they survive individual MCP calls and their
@@ -73,9 +83,12 @@ Units get a per-worktree `HOME` at `target/klaffat-app-runner/home` (inside
 the worktree's ignored build directory, created by the unit itself), so
 Cargo and npm caches survive between runs and E2E failure artifacts stay
 readable from the worktree after the unit and its runtime directory are gone.
-`e2e` and `claude_design_export` run `npm ci` in `tests/e2e` first: a fresh
-linked worktree has no `node_modules`, and the committed lockfile decides
-what Playwright runs.
+`e2e`, `claude_design_export`, and selector-based `check` runs execute
+`npm ci --no-audit --no-fund --prefer-offline` in `tests/e2e` first: a fresh
+linked worktree has no `node_modules`, and an affected/full/focused selector
+may reach Playwright. The committed lockfile decides what Playwright runs.
+The unit does not expose the real HOME; system Nix configuration remains
+available and Cargo/npm state lives under the per-worktree HOME.
 
 ## Validation and security boundary
 
@@ -128,6 +141,24 @@ server, and disposable database when stopped.
 The service runs `scripts/e2e-run` with either no argument or the single
 validated `tests/e2e/tests/*.spec.ts` path. This keeps Google and Microsoft
 mocked and produces the repository's normal durable E2E artifact directory.
+
+### `check`
+
+The service executes exactly one fixed repository entry point after dependency
+setup:
+
+- `scripts/check affected --base origin/main`;
+- `scripts/check focused <validated-target>`;
+- `scripts/check full`; or
+- `scripts/rust-test-run -- cargo test -p <validated-crate> [<validated-filter>]`.
+
+`scripts/check` validates its lane manifest and wraps heavy Cargo commands with
+the per-worktree `scripts/with-cargo-lock` followed by
+`scripts/heavy-test-lease`. `scripts/rust-test-run` independently requires and
+uses the same Cargo lock/host lease order while owning its PostgreSQL fixture.
+The broker composes those reviewed mechanisms rather than duplicating locks.
+Status uses the same running/succeeded/failed phases and exit code reporting as
+E2E; logs remain bounded and redacted.
 
 ### `claude_design_export`
 

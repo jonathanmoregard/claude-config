@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Stub `claude -p --output-format stream-json` for the unit suite.
 
-Mode via `MODE:<mode>` in the prompt: ok (default) · quota · quota@<model> ·
+Mode via `MODE:<mode>` in the prompt: ok (default) · quota · quota@<model> · rate_limit ·
 overloaded · max_turns (result error) · stall · unparseable · crash.
 """
 
@@ -46,6 +46,10 @@ def main() -> int:
     if mode == "quota":
         emit({"type": "result", "subtype": "error_during_execution", "is_error": True,
               "result": "You've hit your limit · resets 3pm (Europe/Stockholm)", "session_id": session})
+        return 1
+    if mode == "rate_limit":
+        emit({"type": "result", "subtype": "error_during_execution", "is_error": True,
+              "result": "rate_limit_error: 429 Too Many Requests", "session_id": session})
         return 1
     if mode == "overloaded":
         sys.stderr.write("API Error: 529 overloaded_error\n")

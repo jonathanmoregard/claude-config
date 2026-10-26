@@ -79,7 +79,7 @@ class ToolSurfaceTests(unittest.TestCase):
         self.assertEqual(server.SERVER_INFO["name"], "klaffat-app-runner")
         self.assertEqual([tool["name"] for tool in server.TOOLS], ["klaffat_app"])
         tool = server.TOOLS[0]
-        for term in ("start", "mode", "worktree_path", "run_id", "spec"):
+        for term in ("start", "mode", "worktree_path", "run_id", "spec", "check"):
             self.assertIn(term, tool["description"])
         schema = tool["inputSchema"]
         self.assertEqual(schema["required"], ["operation"])
@@ -90,8 +90,10 @@ class ToolSurfaceTests(unittest.TestCase):
         )
         self.assertEqual(
             schema["properties"]["mode"]["enum"],
-            ["app", "e2e", "claude_design_export", "real_calendar"],
+            ["app", "e2e", "check", "claude_design_export", "real_calendar"],
         )
+        self.assertIn("focused_target", schema["properties"])
+        self.assertNotIn("check_path", schema["properties"])
         for escape_field in (
             "command",
             "args",
@@ -263,6 +265,41 @@ class RequestSchemaTests(unittest.TestCase):
             with self.subTest(request=bad), self.assertRaises(RuntimeError):
                 self.validate(bad)
 
+    def test_check_mode_accepts_only_one_fixed_selection(self) -> None:
+        base = {
+            "operation": "start",
+            "mode": "check",
+            "worktree_path": "/home/jonathan/worktrees/klaffat-topic",
+        }
+        self.assertEqual(
+            self.validate({**base, "check_kind": "affected"})["check_kind"],
+            "affected",
+        )
+        focused = self.validate(
+            {**base, "check_kind": "focused", "focused_target": "tests/e2e/tests/a.spec.ts"}
+        )
+        self.assertEqual(focused["focused_target"], "tests/e2e/tests/a.spec.ts")
+        rust = self.validate(
+            {**base, "check_kind": "rust_test", "crate": "klaffat-web", "filter": "auth::works"}
+        )
+        self.assertEqual((rust["crate"], rust["filter"]), ("klaffat-web", "auth::works"))
+        for bad in (
+            base,
+            {**base, "check_kind": "shell"},
+            {**base, "check_kind": "full", "focused_target": "klaffat-web"},
+            {**base, "check_kind": "focused"},
+            {**base, "check_kind": "focused", "check_path": "tests/e2e/tests/a.spec.ts"},
+            {**base, "check_kind": "rust_test", "crate": "x", "focused_target": "klaffat-web"},
+            {
+                "operation": "start",
+                "mode": "app",
+                "worktree_path": "/home/jonathan/worktrees/klaffat-topic",
+                "check_kind": "full",
+            },
+        ):
+            with self.subTest(request=bad), self.assertRaises(RuntimeError):
+                self.validate(bad)
+
     def test_status_and_stop_accept_only_a_canonical_run_id(self) -> None:
         for operation in ("status", "stop"):
             self.assertEqual(
@@ -345,6 +382,27 @@ class WorktreeValidationTests(unittest.TestCase):
         self.spec_root.mkdir(parents=True)
         self.spec_file = self.spec_root / "calendar.spec.ts"
         self.spec_file.write_text("// fixture\n", encoding="utf-8")
+        crate_dir = self.worktree / "crates" / "klaffat-web"
+        crate_dir.mkdir(parents=True)
+        (crate_dir / "Cargo.toml").write_text(
+            '[package]\nname = "klaffat-web"\nversion = "0.1.0"\n',
+            encoding="utf-8",
+        )
+        scripts_dir = self.worktree / "scripts"
+        scripts_dir.mkdir()
+        (scripts_dir / "test-lanes.json").write_text(
+            json.dumps(
+                {
+                    "focused_tests": [
+                        {
+                            "id": "ui-static-lints",
+                            "argv": ["cargo", "test", "-p", "klaffat-web"],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
         policy = valid_policy()
         policy["worktreeRoot"] = str(self.root)
         policy["klaffatPrimary"] = str(self.primary)
@@ -362,8 +420,65 @@ class WorktreeValidationTests(unittest.TestCase):
         self.assertTrue(hasattr(self.server, "_validate_spec"), "missing spec validator")
         return self.server._validate_spec(self.worktree, spec)
 
+    def validate_check(self, **fields):
+        request = {"check_kind": "focused", "focused_target": "klaffat-web"}
+        request.update(fields)
+        return self.server._validate_check(self.worktree, request)
+
     def test_accepts_expected_linked_klaffat_worktree(self) -> None:
         self.assertEqual(self.validate(self.worktree), self.worktree)
+
+    def test_focused_target_accepts_e2e_package_and_real_test_lane_id(self) -> None:
+        for target in (
+            "tests/e2e/tests/calendar.spec.ts",
+            "klaffat-web",
+            "ui-static-lints",
+        ):
+            with self.subTest(target=target):
+                self.assertEqual(
+                    self.validate_check(focused_target=target),
+                    {"kind": "focused", "target": target},
+                )
+
+    def test_focused_target_rejects_other_paths_flags_and_metacharacters(self) -> None:
+        alias = self.worktree / "alias.rs"
+        alias.symlink_to(self.spec_file)
+        for value in (
+            "crates/klaffat-web/tests/js_budget.rs",
+            "../secret",
+            "/etc/passwd",
+            "-p",
+            "unknown-target",
+            "tests/e2e/tests/missing.spec.ts",
+            "src/has space.rs",
+            "src/a;id",
+            "alias.rs",
+            "Uppercase",
+            "dotted.id",
+            "a" * 65,
+        ):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                RuntimeError,
+                r"tests/e2e/tests/\*\.spec\.ts.*Cargo package.*focused_tests\[\]\.id",
+            ):
+                self.validate_check(focused_target=value)
+
+    def test_rust_check_accepts_only_package_and_optional_filter(self) -> None:
+        self.assertEqual(
+            self.server._validate_check(
+                self.worktree,
+                {"check_kind": "rust_test", "crate": "klaffat-web", "filter": "auth::works"},
+            ),
+            {"kind": "rust_test", "crate": "klaffat-web", "filter": "auth::works"},
+        )
+        for request in (
+            {"check_kind": "rust_test", "crate": "--workspace"},
+            {"check_kind": "rust_test", "crate": "klaffat/web"},
+            {"check_kind": "rust_test", "crate": "klaffat-web", "filter": "--nocapture"},
+            {"check_kind": "rust_test", "crate": "klaffat-web", "filter": "x;id"},
+        ):
+            with self.subTest(request=request), self.assertRaises(RuntimeError):
+                self.server._validate_check(self.worktree, request)
 
     def test_rejects_primary_nested_lookalike_and_symlink_paths(self) -> None:
         nested = self.worktree / "nested"
@@ -556,7 +671,7 @@ class ModeArgvTests(unittest.TestCase):
         self.worktree = base / "worktrees" / "klaffat-topic"
         scripts = self.worktree / "scripts"
         scripts.mkdir(parents=True)
-        for name in ("e2e-run", "export-claude-design.sh"):
+        for name in ("e2e-run", "check", "rust-test-run", "export-claude-design.sh"):
             path = scripts / name
             path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             path.chmod(0o700)
@@ -583,9 +698,16 @@ class ModeArgvTests(unittest.TestCase):
             "artifact_path": None,
         }
 
-    def build(self, mode: str, spec: str | None = None) -> list[str]:
+    def build(
+        self,
+        mode: str,
+        spec: str | None = None,
+        check: dict[str, str] | None = None,
+    ) -> list[str]:
         self.assertTrue(hasattr(self.server, "_build_start_argv"), "missing argv builder")
-        return self.server._build_start_argv(self.state(mode), self.policy, spec=spec)
+        return self.server._build_start_argv(
+            self.state(mode), self.policy, spec=spec, check=check
+        )
 
     def test_real_calendar_uses_only_fixed_launcher_and_selected_worktree(self) -> None:
         self.assertEqual(
@@ -648,6 +770,50 @@ class ModeArgvTests(unittest.TestCase):
                 "--",
                 str(self.policy["bashExecutable"]),
                 str(self.worktree / "scripts" / "export-claude-design.sh"),
+            ],
+        )
+
+    def test_check_modes_map_to_fixed_gate_argv(self) -> None:
+        cases = {
+            "affected": ["affected", "--base", "origin/main"],
+            "focused": ["focused", "tests/e2e/tests/calendar.spec.ts"],
+            "full": ["full"],
+        }
+        for kind, suffix in cases.items():
+            check = {"kind": kind}
+            if kind == "focused":
+                check["target"] = suffix[-1]
+            argv = self.build("check", check=check)
+            self.assertEqual(
+                argv[argv.index("--") + 1 :],
+                self.dev_shell_prefix()
+                + [
+                    str(self.policy["pythonExecutable"]),
+                    str(E2E_DEPS),
+                    "--",
+                    str(self.policy["bashExecutable"]),
+                    str(self.worktree / "scripts" / "check"),
+                    *suffix,
+                ],
+            )
+
+    def test_rust_test_check_maps_only_crate_and_filter(self) -> None:
+        argv = self.build(
+            "check",
+            check={"kind": "rust_test", "crate": "klaffat-web", "filter": "auth::works"},
+        )
+        self.assertEqual(
+            argv[argv.index("--") + 1 :],
+            self.dev_shell_prefix()
+            + [
+                str(self.policy["bashExecutable"]),
+                str(self.worktree / "scripts" / "rust-test-run"),
+                "--",
+                "cargo",
+                "test",
+                "-p",
+                "klaffat-web",
+                "auth::works",
             ],
         )
 

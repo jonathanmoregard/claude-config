@@ -28,13 +28,14 @@ DANGEROUS = re.compile(r"^--(dangerously|allow-dangerously)|^--full-auto$|^--yol
 # 2026-08-27 against codex-cli 0.146.0): QUOTA is that script's quota grep,
 # REJECT_PATTERN is verbatim and, as there, is consulted only on a non-zero
 # exit so a successful run that merely mentions a 4xx is not misread.
-CODEX_QUOTA = re.compile(r"usage limit|quota exceeded|rate limit|\b429\b", re.I)
+CODEX_QUOTA = re.compile(r"usage limit|quota exceeded", re.I)
 REJECT_PATTERN = re.compile(
     r'"status"[[:space:]]*:[[:space:]]*4[0-9][0-9]|unexpected status 4[0-9][0-9]|\bHTTP 4[0-9][0-9]\b|'
     r"invalid_request_error|invalid_api_key|model_not_found|unsupported[_ ]model|not supported when using Codex|"
     r"is not supported (with|when|for)|no such model|unknown model|does not exist or you do not have access"
     .replace("[[:space:]]", r"\s"), re.I)
-CLAUDE_QUOTA = re.compile(r"You've hit your|You've used|You're out of extra usage|rate_limit_error|rate limit|\b429\b", re.I)
+CLAUDE_QUOTA = re.compile(r"You've hit your|You've used|You're out of extra usage|quota exceeded", re.I)
+RATE_LIMIT = re.compile(r"rate[_ -]?limit|too many requests|\b429\b", re.I)
 OVERLOADED = re.compile(r"overloaded|\b529\b", re.I)
 
 CLAUDE_TOOLS_READ_ONLY = "Read,Glob,Grep"
@@ -109,6 +110,11 @@ def build_argv(provider: str, binary: str, *, model: str, effort: str | None, sa
     if provider == "codex":
         argv = [binary, "exec", "--json", "-m", model, "-c", f"model_reasoning_effort={effort or 'medium'}",
                 "--sandbox", sandbox, "-C", cwd, "--skip-git-repo-check", "-o", str(job_dir / "last_message.md")]
+        if sandbox == "read-only":
+            # This host has managed permission profiles. Under that policy
+            # Codex ignores --sandbox and uses the configured default profile,
+            # so the read-only profile must be selected explicitly.
+            argv += ["-c", 'default_permissions="repos_readonly"']
         argv += ["-c", f"sandbox_workspace_write.network_access={str(network_access).lower()}"]
         for root in writable_roots:
             argv += ["--add-dir", root]
@@ -134,6 +140,10 @@ def build_resume_argv(provider: str, binary: str, *, thread_id: str, model: str,
     if provider == "codex":
         argv = [binary, "exec", "resume", thread_id, "--json", "-m", model,
                 "-c", f"model_reasoning_effort={effort or 'medium'}", "--skip-git-repo-check", "--", PROMPT_PLACEHOLDER]
+        if sandbox == "read-only":
+            # `exec resume` also falls back to repos_dev unless the managed
+            # read-only profile is repeated.
+            argv[-2:-2] = ["-c", 'default_permissions="repos_readonly"']
     else:
         argv = [binary] + _claude_common(model, effort, sandbox, None, bare)
         argv += ["--resume", thread_id, "--max-turns", CLAUDE_MAX_TURNS, "--", PROMPT_PLACEHOLDER]
@@ -300,7 +310,7 @@ def _finished_ok(provider: str, events: list[dict[str, Any]]) -> bool:
 
 def classify(provider: str, exit_code: int, events: list[dict[str, Any]], stderr: str,
              last_message_path: Path | None = None) -> str:
-    """done | quota | rejected | overloaded | unparseable | error (contract §Jobs)."""
+    """done | quota | rate_limit | rejected | overloaded | unparseable | error."""
     diag = _diagnostics(provider, events, stderr)
     quota_re = CODEX_QUOTA if provider == "codex" else CLAUDE_QUOTA
     # A run that exited 0 AND finished with a result is done, whatever its
@@ -312,8 +322,12 @@ def classify(provider: str, exit_code: int, events: list[dict[str, Any]], stderr
     if exit_code == 0 and not claude_error and _finished_ok(provider, events) \
             and final_message(provider, events, last_message_path) is not None:
         return "done"
+    # Quota exhaustion often arrives inside an HTTP 429 diagnostic. Preserve
+    # the stronger signal so the runner rejects the provider and can fall back.
     if quota_re.search(diag):
         return "quota"
+    if RATE_LIMIT.search(diag):
+        return "rate_limit"
     if exit_code != 0:
         if OVERLOADED.search(diag):
             return "overloaded"

@@ -34,7 +34,8 @@ DEFAULT_LIST = 20
 META_KEYS = ("job_id", "name", "created_at", "provider", "model", "effort", "tier", "host", "cwd", "sandbox",
              "schema", "timeout_s", "stall_min", "bare", "need", "argv", "launcher", "unit", "runner_pid",
              "child_pid", "thread_id", "session_id", "forced", "retry_of", "retried_as", "parent_job",
-             "started_at", "finished_at", "exit_code", "error_class", "dev_gates", "effective_sandbox")
+             "started_at", "finished_at", "exit_code", "error_class", "dev_gates", "effective_sandbox",
+             "model_pinned", "provider_constraint")
 
 
 class JobNotFound(LookupError):
@@ -59,6 +60,8 @@ class JobSpec:
     name: str | None = None
     need: list[str] = field(default_factory=list)
     forced: bool = False
+    model_pinned: bool = False
+    provider_constraint: str | None = None
     retry_of: str | None = None
     parent_job: str | None = None
 
@@ -168,6 +171,7 @@ def create_job(state: Path, spec: JobSpec, *, now: float) -> tuple[str, Path]:
         "model": spec.model, "effort": spec.effort, "tier": spec.tier, "host": spec.host, "cwd": spec.cwd,
         "sandbox": spec.sandbox, "schema": spec.schema, "timeout_s": spec.timeout_s, "stall_min": spec.stall_min,
         "bare": spec.bare, "need": list(spec.need), "argv": list(spec.argv), "forced": spec.forced,
+        "model_pinned": spec.model_pinned, "provider_constraint": spec.provider_constraint,
         "retry_of": spec.retry_of, "parent_job": spec.parent_job,
     })
     write_meta(d, meta)

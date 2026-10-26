@@ -16,47 +16,52 @@ human line.
 |---|---|
 | `quota [--fresh] [--provider codex\|claude]` | Normalised usage snapshots per provider (buckets, headroom, staleness, rejection). |
 | `pick --tier strongest\|standard\|fast [--need CAP …] [--provider P] [--host H] [--allow-downgrade] [--fresh]` | Choose a model. `native: true` means the picked provider is the host CLI: use its own subagent tool. |
-| `delegate (--tier T \| --model M) --prompt-file F [--cwd D] [--sandbox read-only\|workspace-write] [--dev-gates] [--schema S.json] [--timeout-s N] [--effort E] [--wait] [--force] [--no-bare] [--host H] [--name NAME] [--allow-downgrade]` | Start a headless job (always headless, even on the host provider). `--model` keeps the eligibility check unless `--force`. |
+| `delegate (--tier T \| --model M) --prompt-file F [--cwd D] [--sandbox read-only\|workspace-write] [--dev-gates] [--schema S.json] [--timeout-s N] [--effort E] [--wait] [--force] [--no-bare] [--host H] [--name NAME] [--allow-downgrade]` | Start a headless job (always headless, even on the host provider). `--model` pins that exact model/provider and keeps the eligibility check unless `--force`; `--dev-gates` is rejected on this managed-profile host. |
 | `wait <job_id> [--timeout-s N]` | Block until terminal, following an automatic retry; prints the result. |
 | `status [<job_id>]` · `list [--all]` | One job or all jobs (newest first, 20 by default). |
 | `peek <job_id>` · `log <job_id> [--tail N]` · `result <job_id>` | Newest agent message · summarised events + stderr · final result (exit 7 while running). |
 | `send <job_id> --prompt-file F [--wait]` | Post-hoc follow-up: `codex exec resume <thread>` / `claude -p --resume <session>`. |
 | `cancel <job_id>` · `version` | |
 
-Quota failure handling: a job that fails on a quota class writes
+Quota failure handling: a tier-picked job that fails on a quota class writes
 `quota/<provider>.rejected.json` (until the blocking bucket resets, or a newer
-live snapshot shows headroom again) and is retried exactly once on the next eligible model of the same tier
-(`retry_of` / `retried_as` in `meta.json`; `wait` follows the chain).
+live snapshot shows headroom again) and is retried exactly once on the next
+eligible model of the same tier (`retry_of` / `retried_as` in `meta.json`;
+`wait` follows the chain). An explicit `--model` job never changes model or
+provider; it fails with a note to retry that same model later. A transient
+`rate_limit` failure neither rejects the provider nor cross-retries.
 
 Claude jobs never pass `--bare`: on 2.1.270 `--bare` refuses OAuth
 credentials, which is how this machine authenticates. "Bare" is spelled
 `--setting-sources "" --strict-mcp-config` (no hooks, no MCP, no user
 permission rules); `--no-bare` loads settings normally.
 
-## Codex workspace-write scope
+## Codex managed profiles and host broker
 
-Every Codex job explicitly sets `sandbox_workspace_write.network_access=false`.
-For a `workspace-write` job inside a Git worktree, ai-router also adds Git's
-canonical common directory through `--add-dir`; this permits commits from a
-linked worktree without granting the parent repository wholesale.
+This host selects permission profiles in `/etc/codex/requirements.toml`.
+While profiles are active Codex ignores `--sandbox`, `--add-dir`, and
+`sandbox_workspace_write.network_access`. The router therefore passes
+`-c default_permissions="repos_readonly"` for every read-only Codex start and
+resume. Workspace-write jobs use the default `repos_dev` profile. Their
+`effective_sandbox` metadata records the managed profile, its actual roots and
+network=false, plus `cli_overrides_effective=false`.
 
-`--dev-gates` is an explicit Codex `workspace-write` opt-in for Klaffat's
-development gates. It adds these existing directories through `--add-dir`:
+`--dev-gates` fails with an actionable message instead of claiming that inert
+CLI flags enabled Nix/network. Sandboxed Codex sessions run Klaffat checks via
+the host-side `klaffat-app-runner` MCP `check` mode.
 
-- Git common directory for `--cwd`
-- `$HOME/.cache/nix` (Nix fetcher cache)
-- `$XDG_RUNTIME_DIR/klaffat` (normally `/run/user/$UID/klaffat`)
-- `$HOME/.local/state/klaffat` (E2E artifacts)
-
-It also sets `sandbox_workspace_write.network_access=true`. Codex CLI 0.146
-has no loopback-only network flag, so this is all network access, not merely
-localhost; it is never granted by default. `meta.json` records the complete
-effective writable-root list and network flag under `effective_sandbox`.
-
-Codex 0.146 `exec resume` has no `--sandbox` or `--add-dir`; `send` rejects a
-completed `--dev-gates` job rather than resume it with different privileges.
-Likewise, a quota failure does not fall back to another provider for such a
-job, because its sandbox cannot be reproduced there.
+The shared MCP manifest also registers `mcps/ai-router/server.py`. From a
+sandboxed Codex host, use its structured `ai_router` tool for `delegate`,
+`status`, bounded `wait`, `result`, and bounded `log`. The broker invokes this
+CLI outside the tool sandbox, strips inherited `CODEX_SANDBOX*` markers,
+forces host detection to Codex, and never offers force/downgrade or raw flags.
+Until Claude jobs have equivalent host-enforced filesystem and network
+isolation, broker delegates are constrained to the Codex provider. Explicit
+Claude model ids and aliases are rejected, and tier selection plus quota retry
+consider only Codex models. This constraint applies only to the broker;
+direct CLI use remains cross-provider.
+The CLI's existing user-systemd launcher, with `start_new_session=True`
+fallback, owns the detached job after the MCP request or server exits.
 
 ## Selection
 
@@ -114,7 +119,7 @@ All writes are atomic (`<file>.tmp` then rename).
 
 `0` ok · `1` job error / cancelled · `2` usage or setup (missing binary, bad
 args) · `3` quota (no eligible model, or job failed on quota after its retry)
-· `4` rejected / unavailable · `5` stalled / timeout / overloaded · `6`
+· `4` rejected / unavailable · `5` rate-limit / stalled / timeout / overloaded · `6`
 unparseable · `7` job not found / not finished.
 
 ## Test-only environment

@@ -48,6 +48,7 @@ def test_codex_argv_shape(tmp_path: Path):
     assert argv[argv.index("-C") + 1] == "/work"
     assert "--skip-git-repo-check" in argv
     assert argv[argv.index("-o") + 1] == str(tmp_path / "last_message.md")
+    assert 'default_permissions="repos_readonly"' in argv
     assert argv[-2:] == ["--", PROMPT_PLACEHOLDER]
     assert "--output-schema" not in argv
 
@@ -61,7 +62,7 @@ def test_codex_argv_with_schema(tmp_path: Path):
     assert argv[-2:] == ["--", PROMPT_PLACEHOLDER]
 
 
-def test_codex_argv_adds_explicit_writable_roots_and_network_opt_in(tmp_path: Path):
+def test_codex_argv_can_render_explicit_writable_roots_and_network_opt_in(tmp_path: Path):
     argv = build_argv("codex", "/bin/codex", model="gpt-5.6-sol", effort="high",
                       sandbox="workspace-write", cwd="/work", schema=None, bare=True, job_dir=tmp_path,
                       writable_roots=("/git/common", "/state/klaffat"), network_access=True)
@@ -125,6 +126,7 @@ def test_resume_argv():
                           sandbox="read-only", cwd="/w", bare=True)
     assert c[:4] == ["/bin/codex", "exec", "resume", "t-1"] and c[-2:] == ["--", PROMPT_PLACEHOLDER]
     assert "--json" in c and "-m" in c
+    assert 'default_permissions="repos_readonly"' in c
     a = build_resume_argv("claude", "/bin/claude", thread_id="s-1", model="claude-sonnet-5", effort=None,
                           sandbox="read-only", cwd="/w", bare=True)
     assert a[a.index("--resume") + 1] == "s-1" and a[-1] == PROMPT_PLACEHOLDER
@@ -197,12 +199,31 @@ def test_classify_done_requires_zero_exit_and_message():
 
 def test_classify_quota_on_either_stream():
     assert classify("codex", 1, [{"type": "error", "message": "You've hit your usage limit"}], "") == "quota"
-    assert classify("codex", 1, [], "HTTP 429 Too Many Requests") == "quota"
     assert classify("claude", 1, [{"type": "result", "subtype": "error_during_execution", "is_error": True,
                                    "result": "You've used all your weekly limit"}], "") == "quota"
-    assert classify("claude", 1, [], "rate_limit_error: slow down") == "quota"
-    # Quota beats reject when both match (429 is a quota error, not a rejection)
-    assert classify("codex", 1, [], 'unexpected status 429 rate limit') == "quota"
+
+
+def test_classify_rate_limit_separately_from_quota_and_rejection():
+    assert classify("codex", 1, [], "HTTP 429 Too Many Requests") == "rate_limit"
+    assert classify("claude", 1, [], "rate_limit_error: slow down") == "rate_limit"
+    assert classify("codex", 1, [], "unexpected status 429 rate limit") == "rate_limit"
+    assert classify(
+        "codex", 1, [], "exceeded retry limit, last status: 429 Too Many Requests"
+    ) == "rate_limit"
+
+
+def test_classify_explicit_quota_before_generic_rate_limit():
+    assert classify("codex", 1, [], "HTTP 429 Too Many Requests: usage limit reached") == "quota"
+
+
+def test_retry_exhaustion_is_not_rate_limit_evidence_by_itself():
+    assert classify("codex", 1, [], "exceeded retry limit") == "error"
+    assert classify(
+        "codex", 1, [], "exceeded retry limit, last status: HTTP 401 Unauthorized"
+    ) == "rejected"
+    assert classify(
+        "codex", 1, [], "exceeded retry limit, last status: HTTP 503 Service Unavailable"
+    ) == "error"
 
 
 def test_classify_rejected_only_on_nonzero_exit():

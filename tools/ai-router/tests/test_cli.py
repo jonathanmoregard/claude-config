@@ -14,6 +14,7 @@ import pytest
 from ai_router import cli, jobs
 
 pytestmark = pytest.mark.usefixtures("stub_providers")
+FIXTURE_NOW = 1_789_400_000
 
 
 @pytest.fixture
@@ -34,7 +35,13 @@ def prompt(tmp_path: Path) -> Path:
 
 
 def run(capsys, argv: list[str], env: dict[str, str], **kw) -> tuple[int, dict | None, str, str]:
-    rc = cli.main(argv, env=env, launcher=kw.pop("launcher", "setsid"), **kw)
+    rc = cli.main(
+        argv,
+        env=env,
+        now=kw.pop("now", FIXTURE_NOW),
+        launcher=kw.pop("launcher", "setsid"),
+        **kw,
+    )
     cap = capsys.readouterr()
     obj = None
     if "--json" in argv and cap.out.strip():
@@ -146,88 +153,35 @@ def test_delegate_model_quota_gate_and_force(capsys, env, prompt, tmp_path, stat
     assert res["thread_id"] == "thread-fake-0001"
 
 
-def test_workspace_write_codex_adds_linked_git_common_dir(capsys, env, prompt, tmp_path, state_dir):
-    worktree, common_dir = linked_worktree(tmp_path)
+def test_workspace_write_codex_records_managed_profile_truthfully(capsys, env, prompt, tmp_path, state_dir):
+    worktree, _common_dir = linked_worktree(tmp_path)
     rc, started, *_ = run(capsys, ["delegate", "--model", "luna", "--force", "--prompt-file", str(prompt),
                                    "--cwd", str(worktree), "--sandbox", "workspace-write", "--json"], env)
     assert rc == 0 and started["provider"] == "codex"
     meta = jobs.read_meta(jobs.job_dir(state_dir, started["job_id"]))
     assert meta["effective_sandbox"] == {
         "mode": "workspace-write",
-        "writable_roots": [str(worktree), str(common_dir)],
+        "managed_profile": "repos_dev",
+        "writable_roots": [
+            "/home/jonathan/Repos",
+            "/home/jonathan/worktrees",
+            "/home/jonathan/.local/state/ai-router",
+        ],
         "network_access": False,
+        "cli_overrides_effective": False,
     }
     argv = meta["argv"]
-    assert argv[argv.index("--add-dir") + 1] == str(common_dir)
+    assert "--add-dir" not in argv
     assert "sandbox_workspace_write.network_access=true" not in argv
 
 
-def test_dev_gates_records_only_required_roots_and_network_opt_in(capsys, env, prompt, tmp_path, state_dir):
-    worktree, common_dir = linked_worktree(tmp_path)
-    home = Path(env["HOME"])
-    runtime = tmp_path / "runtime"
-    env["XDG_RUNTIME_DIR"] = str(runtime)
-    nix_cache = home / ".cache" / "nix"
-    state = home / ".local" / "state" / "klaffat"
-    runtime_klaffat = runtime / "klaffat"
-    for root in (nix_cache, state, runtime_klaffat):
-        root.mkdir(parents=True)
-    rc, started, *_ = run(capsys, ["delegate", "--model", "luna", "--force", "--prompt-file", str(prompt),
-                                   "--cwd", str(worktree), "--sandbox", "workspace-write", "--dev-gates",
-                                   "--json"], env)
-    assert rc == 0 and started["provider"] == "codex"
-    meta = jobs.read_meta(jobs.job_dir(state_dir, started["job_id"]))
-    expected_roots = [str(worktree), str(common_dir), str(nix_cache), str(runtime_klaffat), str(state)]
-    assert meta["effective_sandbox"] == {
-        "mode": "workspace-write",
-        "writable_roots": expected_roots,
-        "network_access": True,
-    }
-    argv = meta["argv"]
-    assert [argv[index + 1] for index, value in enumerate(argv) if value == "--add-dir"] == expected_roots[1:]
-    assert "sandbox_workspace_write.network_access=true" in argv
-
-
-def test_dev_gates_rejects_non_workspace_write_delegate(capsys, env, prompt, tmp_path):
+def test_dev_gates_rejects_managed_profile_instead_of_claiming_inert_overrides(capsys, env, prompt, tmp_path):
     rc, obj, _, err = run(capsys, ["delegate", "--model", "luna", "--force", "--prompt-file", str(prompt),
-                                   "--dev-gates", "--json"], env)
-    assert rc == 2 and obj["error_class"] == "usage" and "workspace-write" in obj["message"]
+                                   "--sandbox", "workspace-write", "--dev-gates", "--json"], env)
+    assert rc == 2 and obj["error_class"] == "usage"
+    assert "managed Codex permission profile" in obj["message"]
+    assert "klaffat-app-runner check mode" in obj["message"]
     assert err == ""
-
-
-def test_dev_gates_job_cannot_resume_without_its_writable_roots(capsys, env, prompt, tmp_path, state_dir):
-    worktree, _ = linked_worktree(tmp_path)
-    home = Path(env["HOME"])
-    runtime = tmp_path / "runtime"
-    env["XDG_RUNTIME_DIR"] = str(runtime)
-    for root in (home / ".cache" / "nix", home / ".local" / "state" / "klaffat", runtime / "klaffat"):
-        root.mkdir(parents=True)
-    rc, result, *_ = run(capsys, ["delegate", "--model", "luna", "--force", "--prompt-file", str(prompt),
-                                  "--cwd", str(worktree), "--sandbox", "workspace-write", "--dev-gates",
-                                  "--wait", "--json"], env)
-    assert rc == 0 and result["status"] == "done"
-    follow_up = tmp_path / "follow.md"
-    follow_up.write_text("continue\n")
-    rc, obj, _, err = run(capsys, ["send", result["job_id"], "--prompt-file", str(follow_up), "--json"], env)
-    assert rc == 2 and obj["error_class"] == "usage" and "does not support --add-dir" in obj["message"]
-    assert err == ""
-
-
-def test_dev_gates_quota_does_not_fallback_to_another_provider(capsys, env, tmp_path, state_dir):
-    worktree, _ = linked_worktree(tmp_path)
-    home = Path(env["HOME"])
-    runtime = tmp_path / "runtime"
-    env["XDG_RUNTIME_DIR"] = str(runtime)
-    for root in (home / ".cache" / "nix", home / ".local" / "state" / "klaffat", runtime / "klaffat"):
-        root.mkdir(parents=True)
-    quota_prompt = tmp_path / "quota.md"
-    quota_prompt.write_text("MODE:quota\n")
-    rc, result, *_ = run(capsys, ["delegate", "--model", "luna", "--force", "--prompt-file", str(quota_prompt),
-                                  "--cwd", str(worktree), "--sandbox", "workspace-write", "--dev-gates",
-                                  "--wait", "--json"], env)
-    assert rc == 3 and result["status"] == "failed:quota" and "retried_as" not in result
-    meta = jobs.read_meta(jobs.job_dir(state_dir, result["job_id"]))
-    assert meta["retry_note"] == "no retry: --dev-gates must not fall back to a different sandbox"
 
 
 def test_delegate_setup_and_usage_errors(capsys, env, prompt, tmp_path):
@@ -247,21 +201,45 @@ def test_delegate_setup_and_usage_errors(capsys, env, prompt, tmp_path):
     assert run(capsys, ["delegate", "--tier", "fast", "--prompt-file", str(prompt), "--sandbox", "yolo"], env)[0] == 2
 
 
-def test_delegate_quota_retry_via_cli(capsys, env, tmp_path, state_dir):
+def test_tier_picked_delegate_quota_retry_via_cli(capsys, env, tmp_path, state_dir):
     p = tmp_path / "p.md"
-    p.write_text("MODE:quota@gpt-5.6-luna\n")
-    rc, res, *_ = run(capsys, ["delegate", "--model", "luna", "--force", "--prompt-file", str(p), "--cwd",
+    p.write_text("MODE:quota\n")
+    rc, res, *_ = run(capsys, ["delegate", "--tier", "fast", "--prompt-file", str(p), "--cwd",
                                str(tmp_path), "--wait", "--json"], env)
-    assert rc == 0 and res["provider"] == "claude" and res["status"] == "done"
-    first = jobs.list_jobs(state_dir, all_jobs=True)[-1]
+    assert rc == 3 and res["status"] == "failed:quota" and res["error_class"] == "quota"
+    first = next(
+        row
+        for row in jobs.list_jobs(state_dir, all_jobs=True)
+        if row["retried_as"] == res["job_id"]
+    )
     assert first["retried_as"] == res["job_id"] and first["status"] == "failed:quota"
     rc, obj, *_ = run(capsys, ["status", first["job_id"], "--json"], env)
     assert obj["retried_as"] == res["job_id"]
-    # exhausted on both → exit 3 with the retry's result
+
+
+def test_explicit_model_quota_failure_does_not_cross_retry(capsys, env, tmp_path, state_dir):
+    p = tmp_path / "p.md"
     p.write_text("MODE:quota\n")
-    rc, res, *_ = run(capsys, ["delegate", "--tier", "fast", "--prompt-file", str(p), "--cwd", str(tmp_path),
-                               "--wait", "--json"], env)
-    assert rc == 3 and res["status"] == "failed:quota" and res["error_class"] == "quota"
+    rc, res, *_ = run(
+        capsys,
+        [
+            "delegate",
+            "--model",
+            "luna",
+            "--force",
+            "--prompt-file",
+            str(p),
+            "--cwd",
+            str(tmp_path),
+            "--wait",
+            "--json",
+        ],
+        env,
+    )
+    assert rc == 3 and res["status"] == "failed:quota"
+    meta = jobs.read_meta(jobs.job_dir(state_dir, res["job_id"]))
+    assert meta["model_pinned"] is True and meta["retried_as"] is None
+    assert meta["retry_note"] == "no retry: model pinned (--model); retry the same model later"
 
 
 def test_result_not_finished_and_not_found(capsys, env, tmp_path, state_dir):
@@ -285,7 +263,13 @@ def test_result_not_finished_and_not_found(capsys, env, tmp_path, state_dir):
 
 def test_exit_codes_per_failure_class(capsys, env, tmp_path):
     p = tmp_path / "p.md"
-    expected = {"unparseable": 6, "rejected": 4, "overloaded": 5, "crash": 1}
+    expected = {
+        "unparseable": 6,
+        "rejected": 4,
+        "rate_limit": 5,
+        "overloaded": 5,
+        "crash": 1,
+    }
     for mode, code in expected.items():
         p.write_text(f"MODE:{mode}\n")
         rc, res, *_ = run(capsys, ["delegate", "--model", "haiku", "--prompt-file", str(p), "--cwd", str(tmp_path),
