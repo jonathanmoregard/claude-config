@@ -1,0 +1,31 @@
+{
+  "enabled": true,
+  "allowUnsandboxedCommands": true,
+  "autoAllowBashIfSandboxed": true,
+  "filesystem": {
+    "allowWrite": ["~/.local/state", "~/.cache", "~/worktrees", "/tmp", "~/.nix-memory-pressure"]
+  },
+  "network": {
+    "allowedDomains": ["github.com", "api.github.com", "cache.nixos.org", "channels.nixos.org"],
+    "allowAllUnixSockets": true
+  },
+  "_backcheck": {
+    "_comment": "Ignored by Claude Code. Empirical facts about config C, consumed by scripts/sandbox-backcheck.py.",
+    "dbus_user_bus": "broken",
+    "dbus_note": "User D-Bus is unreachable even with allowAllUnixSockets: systemctl/journalctl/systemd-run/busctl --user, notify-send, gdbus, secret-tool, gio all fail.",
+    "nix_wrapper_uses_systemd_run_user": true,
+    "nix_note": "nix and nix-* go through the nix-memory-run wrapper, which calls systemd-run --user, so they inherit the D-Bus break.",
+    "gh_auth": "broken",
+    "gh_note": "gh reads its token from the keyring over D-Bus secret-service (unreachable) and ~/.config/gh is Read-denied, so gh is unauthenticated.",
+    "git_https_auth": "broken",
+    "git_https_note": "Derived, not separately measured: git's https credential helper is 'gh auth git-credential', so authenticated https git (push; fetch of private repos) inherits the gh break.",
+    "private_github_owners": ["jonathanmoregard"],
+    "read_deny_not_in_sandbox": ["//**/.git/**"],
+    "read_deny_note": "Assumption, unverified: Read(//**/.git/**) is not enforced inside the sandbox, since enforcing it would break every git command. All other Read() deny rules are treated as enforced.",
+    "ssh_dir_readable": false,
+    "ssh_note": "~/.ssh is unreadable (Read deny rules carry into the sandbox), so ssh, scp, sftp, ssh-transport rsync and git@ remotes break.",
+    "writes_outside_allowed": "read-only filesystem outside cwd + allowWrite",
+    "network_mode": "egress only to allowedDomains via proxy; no raw DNS, no localhost services",
+    "always_writable": ["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty", "/dev/fd", "/proc/self/fd", "/dev/shm"]
+  }
+}
