@@ -8,12 +8,6 @@
     },
     "timeout": 6000000
   },
-  "futuresearch-gate": {
-    "type": "stdio",
-    "command": "futuresearch-gate-mcp",
-    "args": [],
-    "env": {}
-  },
   "gdocs-review": {
     "type": "stdio",
     "command": "uv",
