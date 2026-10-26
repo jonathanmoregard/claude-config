@@ -107,6 +107,34 @@ WRITTEN_AT_RUNTIME = ("settings.json",)
 # Those links must become absolute.
 HOME = "/home/jonathan"
 
+# The only absolute targets a tracked symlink may have.
+#
+# Absolute is not a loophole, it is the spelling for "this deliberately leaves
+# the projection". Two things do:
+#
+#   skills-hm/      home-manager owns four skills -- nixos-config-dev,
+#                   nixos-automated-testing, nixos-agent-testing,
+#                   nixos-agenix-secret -- because they exist to go through
+#                   nixos-config's PR -> CI -> auto-deploy gate. `skills/` is
+#                   projected read-only, so home-manager cannot write inside it
+#                   and a `home.file` target there fails the next
+#                   `nixos-rebuild switch`. It writes to ~/.claude/skills-hm/
+#                   instead, which no mount covers, and this repository links
+#                   into it. See home/claude-skills.nix in nixos-config.
+#   Repos/router-agent/
+#                   `skills/review-inbox` and `hooks/router-nudge-hook` load
+#                   live config out of another repository. Same hazard class as
+#                   this whole mission, one repo over, and not settled here.
+#
+# Checked as a prefix allowlist rather than waved through, because the previous
+# version passed *any* absolute target: a typo'd or stale absolute link counted
+# as "not checkable here" and was reported in the clean summary. Containment is
+# answerable from the index even when existence is not.
+ALLOWED_ABSOLUTE = (
+    f"{HOME}/.claude/skills-hm",
+    f"{HOME}/Repos/router-agent",
+)
+
 
 def git(*args: str, cwd: Path) -> str:
     return subprocess.run(["git", *args], cwd=cwd, capture_output=True,
@@ -309,10 +337,33 @@ def verify(root: Path) -> int:
         exists = (root / path).exists()  # follows the link; False if dangling
 
         if target.startswith("/"):
-            if not exists:
-                unverifiable.append(f"{path} -> {target} (absolute, absent here)")
-            else:
+            # Prefix-match the NORMALISED target, and reject `..` outright.
+            # A raw prefix check on the spelling accepts
+            # <allowed>/../../Repos/claude-config/tests, which escapes into a
+            # dev tree while reading as an allowlisted path — the one thing
+            # this check exists to catch. normpath collapses `..` lexically
+            # (it cannot resolve symlinks, which is why the component check
+            # stays as well: a path that needs `..` to land inside the
+            # allowlist is not a path anyone meant to write).
+            normalised = posixpath.normpath(target)
+            if ".." in target.split("/"):
+                failures.append(
+                    f"{path} -> {target} is absolute and contains a `..` "
+                    f"component (normalises to {normalised}); spell the "
+                    "target directly instead")
+                continue
+            declared = next((a for a in ALLOWED_ABSOLUTE
+                             if normalised == a or normalised.startswith(a + "/")),
+                            None)
+            if not declared:
+                failures.append(
+                    f"{path} -> {target} is absolute but points outside every "
+                    "path declared as deliberately leaving the projection "
+                    "(ALLOWED_ABSOLUTE)")
+            elif exists:
                 checked += 1
+            else:
+                unverifiable.append(f"{path} -> {target} (absolute, absent here)")
             continue
 
         resolved = posixpath.normpath(

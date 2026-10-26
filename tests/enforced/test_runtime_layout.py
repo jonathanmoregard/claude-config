@@ -320,3 +320,131 @@ def test_verify_catches_a_symlink_that_leaves_the_projection(tmp_path):
     proc = run(root, "--verify")
     assert proc.returncode == 1
     assert "experiments" in proc.stderr
+
+
+# --------------------------------------------------- deliberately out of reach
+
+def test_an_undeclared_absolute_target_fails_verify(tmp_path):
+    """The tightening, tested on the case it exists to catch.
+
+    Absolute used to be a blanket pass: the verifier could not check existence
+    on another machine, so it filed *any* absolute target under "not checkable
+    here" and still printed a clean summary. A typo'd or stale absolute link was
+    therefore indistinguishable from a correct one. Containment is answerable
+    from the index even when existence is not, so it is now answered.
+    """
+    root = make_repo(
+        tmp_path,
+        {"runtime/hooks/guard.py": "pass\n"},
+        {"runtime/skills/stray": "/home/jonathan/Repos/somewhere-else/skill"},
+    )
+    proc = run(root, "--verify")
+    assert proc.returncode == 1
+    assert "ALLOWED_ABSOLUTE" in proc.stderr, proc.stderr
+
+
+def test_an_absolute_target_cannot_traverse_out_of_the_allowlist(tmp_path):
+    """The allowlist is a containment check, so spelling must not defeat it.
+
+    The check matched the raw target string against each allowed prefix, so
+    `<allowed>/../../Repos/claude-config/tests` passed it while resolving into
+    a dev tree -- precisely the escape the allowlist exists to refuse, wearing
+    an allowlisted prefix. Reported by review with a reproduction: `--verify`
+    returned 0. Now the prefix match runs on the normalised path, and a `..`
+    component is refused outright with the normalised form quoted, because a
+    target that needs `..` to land inside the allowlist is not one anyone
+    meant to write.
+    """
+    root = make_repo(
+        tmp_path,
+        {"runtime/hooks/guard.py": "pass\n"},
+        {"runtime/skills/stray":
+         "/home/jonathan/.claude/skills-hm/../../Repos/claude-config/tests"},
+    )
+    proc = run(root, "--verify")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert ".." in proc.stderr, proc.stderr
+    # The message has to name where it actually lands, or the reader is left
+    # re-deriving the traversal by hand.
+    assert "/home/jonathan/Repos/claude-config/tests" in proc.stderr, proc.stderr
+
+
+def test_a_skills_hm_target_is_declared_and_merely_unverifiable(tmp_path):
+    """The second legitimate way out of the projection, next to vendor/.
+
+    home-manager owns four skills so they go through nixos-config's gate, and
+    `skills/` is read-only once the mounts are up -- so it writes them to
+    ~/.claude/skills-hm/ and this repo links in. The link is absolute because
+    that is the only spelling correct both on disk and under the mounts.
+
+    Absent on this machine until that nixos-config change deploys, so the
+    expected outcome is the named third outcome, not a pass and not a failure.
+    """
+    root = make_repo(
+        tmp_path,
+        {"runtime/hooks/guard.py": "pass\n"},
+        {"runtime/skills/nixos-config-dev":
+            f"{layout.HOME}/.claude/skills-hm/nixos-config-dev"},
+    )
+    proc = run(root, "--verify")
+    assert proc.returncode == 0, proc.stderr
+    assert "not checkable here" in proc.stdout
+    assert "skills-hm/nixos-config-dev" in proc.stdout
+
+
+HOME_MANAGER_SKILLS = (
+    "nixos-config-dev",
+    "nixos-automated-testing",
+    "nixos-agent-testing",
+    "nixos-agenix-secret",
+)
+
+
+@pytest.mark.parametrize("name", HOME_MANAGER_SKILLS)
+def test_the_home_manager_skills_link_into_skills_hm(name):
+    """Pinned so the four cannot be dropped or quietly retargeted.
+
+    They are the live half of the arrangement above. A link retargeted back
+    into `skills/` would fail the next `nixos-rebuild switch`, and at rebuild
+    time rather than here -- so assert the target text, from the index.
+    """
+    path = f"{layout.RUNTIME_DIR}/skills/{name}"
+    target = subprocess.run(["git", "cat-file", "-p", f":{path}"],
+                            cwd=REPO_ROOT, capture_output=True, text=True)
+    assert target.returncode == 0, f"{path} is not tracked: {target.stderr}"
+    assert target.stdout.strip() == f"{layout.HOME}/.claude/skills-hm/{name}"
+
+
+@pytest.mark.parametrize("name", HOME_MANAGER_SKILLS)
+def test_the_skills_hm_links_are_not_swallowed_by_gitignore(name):
+    """These links must stay addable, and .gitignore is the way that breaks.
+
+    The repo already ignores `skills/nixos-config-dev` and friends, for
+    home-manager's /nix/store symlinks in the live ~/.claude checkout. That
+    looks like it would swallow `runtime/skills/nixos-config-dev` too, and the
+    assumption here was that it did -- it does not: a pattern with a slash
+    anywhere but the end is relative to the .gitignore's own directory
+    (gitignore(5)), so those five are root-anchored already.
+
+    What *would* reach these links is a bare `nixos-config-dev` or a
+    `**/nixos-config-dev`. Tracked content survives a later ignore rule, so such
+    a rule would not unstage anything; it would make the next link of this kind
+    impossible to add, with `git add` silently doing nothing. Asked of git
+    rather than by grepping for a leading slash, so any rule shape that reaches
+    them fails this regardless of how it is spelled.
+    """
+    # --no-index is load-bearing, not tidiness: without it `git check-ignore`
+    # skips paths that are in the index and reports no match, so this test
+    # passed for every tracked link no matter what rules existed. Proven by
+    # simulating an unanchored rule through core.excludesFile: without the
+    # flag the probe returns 1 (test passes), with it 0 (test fails). These
+    # five links are tracked by definition, which is what made the blind spot
+    # total. The sibling probes in tests/test_harness_runtime_dirs_ignored.py
+    # already used the flag.
+    proc = subprocess.run(
+        ["git", "check-ignore", "-q", "--no-index", "--",
+         f"{layout.RUNTIME_DIR}/skills/{name}"],
+        cwd=REPO_ROOT)
+    assert proc.returncode == 1, (
+        f"{layout.RUNTIME_DIR}/skills/{name} is matched by a .gitignore rule; "
+        "an unanchored skills/nixos-* rule is back")
