@@ -47,6 +47,15 @@ class Unparseable(Exception):
     """The command cannot be tokenized reliably. Always maps to unknown."""
 
 
+class PolicyUnsupported(Exception):
+    """The policy uses a restriction this tool cannot model. Refuse to measure.
+
+    Reporting a break rate against a policy whose restrictions are silently
+    ignored is worse than reporting nothing: the number looks like evidence
+    that enabling the policy is safe.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Pre-scanner: quote-aware pass that strips heredoc bodies and comments,
 # replaces substitutions/expansions with markers, normalises redirections,
@@ -142,7 +151,34 @@ class Scan:
     heredocs: list  # list of dict(body, quoted)
 
 
-def prescan(text: str) -> Scan:
+_SUB_START = re.compile(r"\$\(|`")
+_MAX_SUBSTITUTION_SCAN_DEPTH = 32
+
+
+def _collect_substitutions(text: str, subs: list, where: str, depth: int = 0) -> None:
+    """Append every command substitution in `text` to `subs`.
+
+    For places whose *value* the classifier does not model but whose embedded
+    `$( )` and backticks still run: arithmetic expressions and unquoted heredoc
+    bodies. Scanning that text as shell is the cheapest way to find them, and
+    the result's own segments are thrown away.
+
+    Anything that will not scan becomes unknown rather than ok: a substitution
+    that cannot be found is not the same as there being none.
+    """
+    if not _SUB_START.search(text):
+        return
+    if depth >= _MAX_SUBSTITUTION_SCAN_DEPTH:
+        raise Unparseable(f"{where}-substitution-too-deep")
+    try:
+        subs.extend(prescan(text, depth + 1).subs)
+    except Unparseable as exc:
+        raise Unparseable(f"{where}-with-unscannable-substitution:{exc}") from exc
+    except RecursionError as exc:
+        raise Unparseable(f"{where}-substitution-too-deep") from exc
+
+
+def prescan(text: str, substitution_scan_depth: int = 0) -> Scan:
     segs: list = []
     subs: list = []
     heredocs: list = []
@@ -176,6 +212,11 @@ def prescan(text: str) -> Scan:
             j = _match_paren(text, i + 3)  # matches the inner '('
             if text[j + 1:j + 2] != ")":
                 raise Unparseable("unbalanced-arithmetic")
+            # The value is not interesting, but `$(( $(touch /x) + 1 ))` runs
+            # that touch. Collapsing the whole expression to "0" dropped it.
+            _collect_substitutions(
+                text[i + 3:j], subs, "arithmetic", substitution_scan_depth
+            )
             cur.append("0")
             return j + 2
         if nxt == "(":
@@ -404,6 +445,11 @@ def prescan(text: str) -> Scan:
     if q is not None:
         raise Unparseable("unbalanced-quote")
     flush("")
+    for heredoc in heredocs:
+        if not heredoc["quoted"]:
+            _collect_substitutions(
+                heredoc["body"], subs, "heredoc", substitution_scan_depth
+            )
     return Scan(segs, funcs, subs, heredocs)
 
 
@@ -472,10 +518,25 @@ class Policy:
         self.bc = bc
         fs = raw.get("filesystem", {})
         self.allow_write = [os.path.normpath(_expand_user(p)) for p in fs.get("allowWrite", [])]
+        self.deny_write = [os.path.normpath(_expand_user(p)) for p in fs.get("denyWrite", [])]
         self.always_writable = bc.get("always_writable", ["/dev/null"])
         net = raw.get("network", {})
         self.domains = [d.lower() for d in net.get("allowedDomains", [])]
         self.unix_sockets = bool(net.get("allowAllUnixSockets"))
+        # Socket reachability is not modelled per call: the seccomp filter
+        # blocks socket(AF_UNIX, ...) wholesale, which reaches the nix daemon,
+        # the user bus, ssh-agent and anything else over a socket, and this
+        # tool cannot tell from a command line which of those a program will
+        # open. Refuse the policy rather than measure it wrong -- the policy
+        # shape actually in use keeps sockets on and masks the ones it does not
+        # want through denyRead, which IS modelled.
+        if not self.unix_sockets:
+            raise PolicyUnsupported(
+                "network.allowAllUnixSockets is false: this back-check cannot model "
+                "per-call socket use, and would report calls as ok that the sandbox "
+                "would block. Express socket restrictions as filesystem.denyRead on "
+                "the socket paths instead."
+            )
         self.dbus_broken = bc.get("dbus_user_bus") == "broken"
         self.nix_dbus = bool(bc.get("nix_wrapper_uses_systemd_run_user")) and self.dbus_broken
         self.gh_broken = bc.get("gh_auth") == "broken"
@@ -516,15 +577,24 @@ class Policy:
                 return label
         return None
 
+    @staticmethod
+    def _under(path: str, root: str) -> bool:
+        return path == root or path.startswith(root.rstrip("/") + "/")
+
     def write_allowed(self, path: str, root: str | None) -> bool:
+        # denyWrite wins over allowWrite and over the cwd: it exists to carve a
+        # hole out of an allowed root, so checking it first is the whole point.
+        for d in self.deny_write:
+            if self._under(path, d):
+                return False
         roots = list(self.allow_write)
         if root:
             roots.append(root)
         for a in self.always_writable:
-            if path == a or path.startswith(a.rstrip("/") + "/"):
+            if self._under(path, a):
                 return True
         for r in roots:
-            if path == r or path.startswith(r.rstrip("/") + "/"):
+            if self._under(path, r):
                 return True
         return False
 
@@ -1941,7 +2011,11 @@ def main(argv=None) -> int:
             deny = json.load(f).get("permissions", {}).get("deny", [])
     except (OSError, ValueError):
         pass
-    policy = Policy(raw, deny)
+    try:
+        policy = Policy(raw, deny)
+    except PolicyUnsupported as exc:
+        print(f"error: unsupported policy: {exc}", file=sys.stderr)
+        return 2
     now = _parse_ts(a.now) if a.now else dt.datetime.now(dt.timezone.utc)
     cutoff = now - dt.timedelta(days=a.days)
 
