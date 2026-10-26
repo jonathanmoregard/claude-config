@@ -309,6 +309,70 @@ def test_env_is_an_execution_path(tmp_path, name):
     assert run_lint(root).returncode == 1, name
 
 
+@pytest.mark.parametrize("value", [
+    # Reported by review against 549cfe0; both scanned clean. `env` is the
+    # surface this lint explicitly claims to cover, and a search path is the
+    # ordinary shape of that surface -- so the hole was in the common case,
+    # not an exotic one.
+    "$HOME/.claude/tests:/usr/lib/python3",
+    "$HOME/.claude/tests:$HOME/.claude/hooks",
+    # The same list read the other way round. The first of these was already
+    # caught before the fix, by accident: the resolver kept only the final
+    # config-dir marker, so a dev-only entry survived exactly when it came
+    # last. Keep both, so a regression cannot pass by catching one order.
+    "$HOME/.claude/hooks:$HOME/.claude/tests",
+    "/usr/lib/python3:$HOME/.claude/tests",
+    # Three entries, dev-only in the middle: no end of the list is special.
+    "/usr/lib/python3:$HOME/.claude/tests:$HOME/.claude/hooks",
+])
+def test_a_dev_tree_anywhere_in_a_path_list_is_found(tmp_path, value):
+    """A path list is one token until `:` is treated as the separator it is."""
+    root = make_repo(tmp_path, {
+        "settings.json": json.dumps({"env": {"PYTHONPATH": value}}, indent=2),
+        "tests/helper.py": "pass\n",
+        "hooks/ok.py": "pass\n",
+    })
+    proc = run_lint(root)
+    assert proc.returncode == 1, value
+    # The report names the offending entry, not the whole list, or a reviewer
+    # has to find it again by eye.
+    assert "'$HOME/.claude/tests'" in proc.stderr, proc.stderr
+
+
+def test_a_path_list_of_runtime_trees_is_still_clean(tmp_path):
+    """The separator fix must not make every list look guilty.
+
+    Splitting on `:` only matters if the entries are then judged on their own
+    merits -- this is the case that would fail if the split turned into a
+    substring search.
+    """
+    root = make_repo(tmp_path, {
+        "settings.json": json.dumps({"env": {
+            "PYTHONPATH": "$HOME/.claude/hooks:/usr/lib/python3:$HOME/.claude/mcps",
+        }}, indent=2),
+        "hooks/ok.py": "pass\n",
+        "mcps/.keep": "",
+    })
+    proc = run_lint(root)
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_an_mcp_server_env_path_list_is_checked(tmp_path):
+    """Same hole, same fix, on the other side of check B."""
+    root = make_repo(tmp_path, {
+        "settings.json": settings("python3 $HOME/.claude/hooks/ok.py"),
+        "hooks/ok.py": "pass\n",
+        "mcp-servers.json": json.dumps({"mcpServers": {"broker": {
+            "command": "python3",
+            "args": ["$HOME/.claude/mcps/broker/server.py"],
+            "env": {"PYTHONPATH": "$HOME/.claude/tests/stubs:/usr/lib/python3"},
+        }}}, indent=2),
+        "mcps/broker/server.py": "pass\n",
+        "tests/stubs/.keep": "",
+    })
+    assert run_lint(root).returncode == 1
+
+
 def test_a_marketplace_source_path_is_checked(tmp_path):
     """A marketplace source path is loaded as plugin code."""
     root = make_repo(tmp_path, {

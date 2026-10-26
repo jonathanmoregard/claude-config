@@ -109,7 +109,13 @@ _CONFIG_DIR_RE = re.compile(r"(?:\.claude|\$\{?CLAUDE_CONFIG_DIR\}?)\}*/+")
 # so any pattern anchored on a non-path character before `tests/` silently
 # matches nothing at all. `=` and `,` are separators too, so an assignment or a
 # comma-joined list yields the path on its own.
-_TOKEN_SPLIT = re.compile(r"[\s;|&()<>=,]+")
+#
+# `:` is a separator for the same reason, and its absence was a real hole: an
+# ordinary `PYTHONPATH` of `$HOME/.claude/tests:/usr/lib/python3` arrived as a
+# single token, so the segment compared against `tests` was `tests:` and the
+# lint stayed quiet about a dev-only entry on the import path. A path list is
+# the common shape of exactly the field most worth reading.
+_TOKEN_SPLIT = re.compile(r"[\s;|&()<>=,:]+")
 
 
 class Violation:
@@ -120,22 +126,43 @@ class Violation:
         return f"{self.path}:{self.line}: {self.message}"
 
 
-def to_repo_relative(token: str) -> tuple[str | None, bool]:
-    """Resolve a token to `(repo-relative path, named the config dir)`.
+def _inside_config_dir(rest: str) -> str | None:
+    """Normalise the part of a token that follows a config-dir marker.
 
     Normalisation is load-bearing, not tidiness: `hooks/../tests/x.sh`,
     `./tests/x.sh` and `tests//x.sh` all name the file `tests/x.sh` names, and
     a check comparing the first path segment literally sees four unrelated
     strings.
 
-    The second element says whether the token named the config dir explicitly.
-    That distinction is what lets `$HOME/.claude/tests` count while a bare
-    `tests` does not: the first can only mean the directory, the second is
-    usually a word (`--tools docs`).
+    `None` when the remainder climbs back out of the config dir, because it
+    then names some other tree.
+    """
+    if not rest:
+        return None
+    normalised = posixpath.normpath(rest)
+    if normalised == ".." or normalised.startswith("../"):
+        return None
+    return normalised
 
-    `(None, False)` for anything that is not a path inside the config dir: an
-    absolute system path, a variable-rooted path pointing elsewhere, or a `..`
-    that climbs out of the config dir.
+
+def to_repo_relative(token: str) -> list[tuple[str, bool]]:
+    """Every way this token can be read as a path inside the config dir.
+
+    Each element is `(repo-relative path, named the config dir)`. The second
+    field is what lets `$HOME/.claude/tests` count while a bare `tests` does
+    not: the first can only mean the directory, the second is usually a word
+    (`--tools docs`).
+
+    A list rather than one answer because a token may name the config dir more
+    than once. Resolving only the last marker reads the token as its author's
+    final word, which is right for a single path but wrong for anything that
+    concatenates two of them -- the earlier path is then invisible. Reporting
+    on any reading is the conservative direction: the cost of a surplus reading
+    is a line of review, the cost of a missed one is silence.
+
+    Empty for anything that is not a path inside the config dir: an absolute
+    system path, a variable-rooted path pointing elsewhere, or a `..` that
+    climbs out.
     """
     token = token.strip()
     for ch in "\"'\\":
@@ -143,18 +170,12 @@ def to_repo_relative(token: str) -> tuple[str | None, bool]:
 
     markers = list(_CONFIG_DIR_RE.finditer(token))
     if markers:
-        rest, anchored = token[markers[-1].end():], True
-    elif token.startswith(("/", "~")) or "$" in token:
-        return None, False
-    else:
-        rest, anchored = token, False
-
-    if not rest:
-        return None, False
-    normalised = posixpath.normpath(rest)
-    if normalised == ".." or normalised.startswith("../"):
-        return None, False
-    return normalised, anchored
+        readings = [_inside_config_dir(token[m.end():]) for m in markers]
+        return [(rel, True) for rel in readings if rel is not None]
+    if token.startswith(("/", "~")) or "$" in token:
+        return []
+    rel = _inside_config_dir(token)
+    return [(rel, False)] if rel is not None else []
 
 
 def is_dev_only(rel: str | None, anchored: bool = False) -> bool:
@@ -179,8 +200,7 @@ def dev_paths_in(text: str) -> list[str]:
         bare = token.strip()
         if not bare:
             continue
-        rel, anchored = to_repo_relative(bare)
-        if is_dev_only(rel, anchored):
+        if any(is_dev_only(rel, anchored) for rel, anchored in to_repo_relative(bare)):
             out.append(bare)
     return out
 
