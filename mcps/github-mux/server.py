@@ -70,8 +70,9 @@ QUALIFIER_RE = re.compile(
     re.IGNORECASE,
 )
 CONFIG_KEYS = frozenset(
-    {"command", "sharedArgs", "defaultOwners", "ownerChildren", "allowedBases"}
+    {"command", "sharedArgs", "defaultOwners", "ownerChildren", "defaultBranches"}
 )
+REPO_KEY_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+\Z")
 # Tools that choose or change a pull request's base branch. `create_pull_request`
 # requires `base`; `update_pull_request` can retarget an open one, and neither is
 # in --exclude-tools. Bash's `gh pr create --base` is denied outright, so without
@@ -93,7 +94,7 @@ class MuxConfig:
     shared_args: tuple[str, ...]
     default_owners: frozenset[str]
     owner_children: dict[str, tuple[str, ...]]
-    allowed_bases: frozenset[str]
+    default_branches: dict[str, str]
 
 
 def _login(value: object, where: str) -> str:
@@ -106,6 +107,27 @@ def _string_list(value: object, where: str) -> tuple[str, ...]:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ConfigError(f"{where} must be a list of strings")
     return tuple(value)
+
+
+def _default_branches(value: object) -> dict[str, str]:
+    """`owner/repo` -> that repository's default branch, exactly as GitHub spells it.
+
+    Owner and repository names are case-insensitive on GitHub, so keys are
+    lowercased. Branch names are not, so values are kept verbatim and compared
+    byte for byte.
+    """
+    if not isinstance(value, dict):
+        raise ConfigError("defaultBranches must be an object")
+    branches: dict[str, str] = {}
+    for repo, branch in value.items():
+        if not isinstance(repo, str) or not REPO_KEY_RE.match(repo):
+            raise ConfigError(f"defaultBranches: {repo!r} is not an owner/repo key")
+        if not isinstance(branch, str) or not branch:
+            raise ConfigError(f"defaultBranches[{repo}]: {branch!r} is not a branch name")
+        if repo.lower() in branches:
+            raise ConfigError(f"defaultBranches lists {repo!r} twice (case-insensitively)")
+        branches[repo.lower()] = branch
+    return branches
 
 
 def parse_config(raw: object) -> MuxConfig:
@@ -138,9 +160,7 @@ def parse_config(raw: object) -> MuxConfig:
         shared_args=_string_list(raw["sharedArgs"], "sharedArgs"),
         default_owners=default_owners,
         owner_children=owner_children,
-        allowed_bases=frozenset(
-            base.lower() for base in _string_list(raw["allowedBases"], "allowedBases")
-        ),
+        default_branches=_default_branches(raw["defaultBranches"]),
     )
 
 
@@ -317,10 +337,18 @@ def stop_children(children: dict[str | None, Child], stop: anyio.Event) -> None:
 def base_refusal(name: str, arguments: dict[str, Any], config: MuxConfig) -> str | None:
     """Why this call may not set a pull request's base; None when it may.
 
-    Only the value is gated: a PR whose base is the repository's default branch
-    is ordinary work, and one aimed anywhere else is the caller choosing a merge
-    target for someone else. That choice stays with the human, who can retarget
-    the PR in GitHub's own UI.
+    A pull request aimed at the repository's own default branch is ordinary
+    work. One aimed anywhere else is the caller choosing a merge target for
+    someone else, and that choice stays with the human, who can retarget the
+    pull request in GitHub's UI.
+
+    "Default branch" means *this* repository's, not a guess from a list of
+    common names: `claude-config` defaults to `master` and `nixos-config` to
+    `main`, so a shared allow-list would let a pull request into whichever of
+    the two happened to also exist. The comparison is case-sensitive because
+    git refs are: `Main` and `main` can both exist and are different branches.
+
+    A repository the config does not name is refused rather than waved through.
     """
     if name not in BASE_ARGUMENT_TOOLS or "base" not in arguments:
         return None
@@ -330,13 +358,26 @@ def base_refusal(name: str, arguments: dict[str, Any], config: MuxConfig) -> str
             f"{name}: base must be a non-empty string, got {base!r}. "
             "A base that cannot be read cannot be checked."
         )
-    if base.lower() in config.allowed_bases:
+    owner, repo = arguments.get("owner"), arguments.get("repo")
+    if not isinstance(owner, str) or not isinstance(repo, str) or not owner or not repo:
+        return (
+            f"{name}: owner and repo must both be non-empty strings to check the "
+            f"base branch, got {owner!r}/{repo!r}."
+        )
+    key = f"{owner}/{repo}".lower()
+    default = config.default_branches.get(key)
+    if default is None:
+        return (
+            f"{name}: {owner}/{repo} has no recorded default branch, so base "
+            f"{base!r} cannot be checked. Add it by running "
+            "mcps/github-mux/refresh-default-branches.py and committing the result."
+        )
+    if base == default:
         return None
-    allowed = ", ".join(sorted(config.allowed_bases)) or "(none)"
     return (
-        f"{name}: base {base!r} is not an allowed default branch ({allowed}). "
-        "Target the default branch; retargeting a pull request elsewhere is the "
-        "repository owner's call, made in GitHub's UI."
+        f"{name}: base {base!r} is not {owner}/{repo}'s default branch "
+        f"({default!r}). Target the default branch; retargeting a pull request "
+        "elsewhere is the repository owner's call, made in GitHub's UI."
     )
 
 

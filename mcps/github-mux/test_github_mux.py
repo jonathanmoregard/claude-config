@@ -75,27 +75,61 @@ def config(**overrides):
         "sharedArgs": ["--toolsets", "repos"],
         "defaultOwners": ["jonathanmoregard"],
         "ownerChildren": {"klaffat": ["--owner", "klaffat"]},
-        "allowedBases": ["main", "master"],
+        # Two repositories that disagree about their default branch, because
+        # that disagreement is what the guard exists for.
+        "defaultBranches": {
+            "jonathanmoregard/on-main": "main",
+            "jonathanmoregard/on-master": "master",
+        },
     }
     raw.update(overrides)
     return mux.parse_config(raw)
 
 
 class BaseGuardTest(unittest.TestCase):
-    """`base` is a required argument, so the only gate is its value."""
+    """`base` is required on create, so the gate is its value per repository."""
 
     def setUp(self) -> None:
         self.cfg = config()
 
-    def refusal(self, name, arguments):
-        return mux.base_refusal(name, arguments, self.cfg)
+    def refusal(self, name, arguments, **extra):
+        return mux.base_refusal(
+            name,
+            {"owner": "jonathanmoregard", "repo": "on-master", **arguments, **extra},
+            self.cfg,
+        )
 
-    def test_default_base_is_allowed(self) -> None:
-        self.assertIsNone(self.refusal("create_pull_request", {"base": "main"}))
+    def test_the_repositorys_own_default_branch_is_allowed(self) -> None:
         self.assertIsNone(self.refusal("create_pull_request", {"base": "master"}))
+        self.assertIsNone(
+            self.refusal("create_pull_request", {"base": "main"}, repo="on-main")
+        )
 
-    def test_base_match_is_case_insensitive(self) -> None:
-        self.assertIsNone(self.refusal("create_pull_request", {"base": "Main"}))
+    def test_another_repositorys_default_is_not_this_ones(self) -> None:
+        # The hole a shared {main, master} allow-list leaves: `main` often also
+        # exists in a master-default repository, and a pull request into it
+        # would never be merged by the maintainer who expected master.
+        message = self.refusal("create_pull_request", {"base": "main"})
+        self.assertIsNotNone(message)
+        self.assertIn("master", message)
+        self.assertIsNotNone(
+            self.refusal("create_pull_request", {"base": "master"}, repo="on-main")
+        )
+
+    def test_the_match_is_case_sensitive_because_git_refs_are(self) -> None:
+        # `Main` and `main` can both exist and are different branches.
+        self.assertIsNotNone(self.refusal("create_pull_request", {"base": "Master"}))
+
+    def test_owner_and_repo_are_matched_case_insensitively(self) -> None:
+        # GitHub owner and repository names are not case-sensitive.
+        self.assertIsNone(
+            self.refusal(
+                "create_pull_request",
+                {"base": "master"},
+                owner="JonathanMoregard",
+                repo="On-Master",
+            )
+        )
 
     def test_feature_branch_base_is_refused(self) -> None:
         message = self.refusal("create_pull_request", {"base": "feat/something"})
@@ -105,12 +139,16 @@ class BaseGuardTest(unittest.TestCase):
     def test_retargeting_an_existing_pr_is_refused_too(self) -> None:
         # update_pull_request is not in --exclude-tools and takes a new base,
         # so without this the guard is one API call away from useless.
-        message = self.refusal("update_pull_request", {"pullNumber": 1, "base": "release/1.x"})
+        message = self.refusal(
+            "update_pull_request", {"pullNumber": 1, "base": "release/1.x"}
+        )
         self.assertIsNotNone(message)
         self.assertIn("release/1.x", message)
 
     def test_update_without_a_base_is_untouched(self) -> None:
-        self.assertIsNone(self.refusal("update_pull_request", {"pullNumber": 1, "title": "x"}))
+        self.assertIsNone(
+            self.refusal("update_pull_request", {"pullNumber": 1, "title": "x"})
+        )
 
     def test_a_non_string_base_is_refused_rather_than_coerced(self) -> None:
         self.assertIsNotNone(self.refusal("create_pull_request", {"base": ["main"]}))
@@ -118,20 +156,21 @@ class BaseGuardTest(unittest.TestCase):
     def test_an_empty_base_is_refused(self) -> None:
         self.assertIsNotNone(self.refusal("create_pull_request", {"base": ""}))
 
+    def test_a_missing_owner_or_repo_is_refused(self) -> None:
+        # Without them the base cannot be checked at all, so it is not allowed.
+        self.assertIsNotNone(
+            mux.base_refusal("create_pull_request", {"base": "master"}, self.cfg)
+        )
+
+    def test_an_unknown_repository_is_refused_not_waved_through(self) -> None:
+        message = self.refusal("create_pull_request", {"base": "main"}, repo="brand-new")
+        self.assertIsNotNone(message)
+        self.assertIn("refresh-default-branches.py", message)
+
     def test_other_tools_are_not_touched(self) -> None:
         self.assertIsNone(self.refusal("list_pull_requests", {"base": "feat/x"}))
 
-    def test_allowed_bases_come_from_the_config(self) -> None:
-        cfg = config(allowedBases=["trunk"])
-        self.assertIsNone(mux.base_refusal("create_pull_request", {"base": "trunk"}, cfg))
-        self.assertIsNotNone(mux.base_refusal("create_pull_request", {"base": "main"}, cfg))
-
-    def test_an_empty_allowed_list_refuses_every_base(self) -> None:
-        # Fail closed: a config that names no base does not mean "any base".
-        cfg = config(allowedBases=[])
-        self.assertIsNotNone(mux.base_refusal("create_pull_request", {"base": "main"}, cfg))
-
-    def test_allowed_bases_is_required(self) -> None:
+    def test_default_branches_is_required(self) -> None:
         raw = {
             "command": "/bin/true",
             "sharedArgs": [],
@@ -141,9 +180,21 @@ class BaseGuardTest(unittest.TestCase):
         with self.assertRaises(mux.ConfigError):
             mux.parse_config(raw)
 
-    def test_tracked_config_allows_the_default_branches_only(self) -> None:
-        cfg = mux.load_config(TRACKED_CONFIG)
-        self.assertEqual(cfg.allowed_bases, frozenset({"main", "master"}))
+    def test_a_malformed_default_branches_entry_is_rejected(self) -> None:
+        for bad in (
+            {"not-an-owner-repo": "main"},
+            {"owner/repo": ""},
+            {"owner/repo": ["main"]},
+            ["owner/repo"],
+        ):
+            with self.subTest(bad=bad), self.assertRaises(mux.ConfigError):
+                config(defaultBranches=bad)
+
+    def test_tracked_config_records_both_default_branch_spellings(self) -> None:
+        branches = mux.load_config(TRACKED_CONFIG).default_branches
+        self.assertEqual(branches["jonathanmoregard/claude-config"], "master")
+        self.assertEqual(branches["jonathanmoregard/nixos-config"], "main")
+        self.assertEqual(branches["klaffat/klaffat"], "main")
 
 
 class RouteTest(unittest.TestCase):
@@ -371,7 +422,7 @@ class MuxIntegrationTest(unittest.IsolatedAsyncioTestCase):
                     "sharedArgs": ["--tools", FAKE_TOOLS, "--instructions", "fake guidance"],
                     "defaultOwners": ["jonathanmoregard"],
                     "ownerChildren": {"klaffat": klaffat_args},
-                    "allowedBases": ["main"],
+                    "defaultBranches": {"jonathanmoregard/x": "main"},
                 }
             ),
             encoding="utf-8",
