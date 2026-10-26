@@ -1,0 +1,52 @@
+# Runs the repository's quick deterministic checks on every change.
+#
+# `pull_request` only, never `pull_request_target`: this repository's own
+# branches are not forks and do get secrets, and GitHub Security Lab names
+# "write their payload as a new test that will be run with others" as the
+# matching attack. So the job takes no secrets, declares read-only
+# permissions, and never fetches the vendored submodules.
+#
+# This is the enforcement point on purpose. A client-side git hook is not one:
+# `git push --no-verify` skips it, and `core.hooksPath` is local config any
+# worktree can change. Making `checks` a required status check on master is a
+# repository setting, and the only step here that is not in the diff.
+name: checks
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.ref }}
+  # Superseded pull-request runs are waste; a master run is the record of
+  # whether master is clean, so it is never cancelled.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Stdlib only, and deliberately before any install step: nothing fetched
+      # from a package index can change this step's verdict.
+      - name: No declared entrypoint names a dev-only tree
+        run: python3 scripts/lint-runtime-entrypoints.py
+
+      # The whole directory, never a list of files. A suite that guards one of
+      # this repository's own guards is itself a measuring instrument, and an
+      # instrument CI does not run is not protected by requiring this job --
+      # which is exactly what an enumerated list produces, silently, the first
+      # time someone adds a suite and forgets this file. `tests/enforced/` is
+      # the convention: land a suite there and it is enforced from that commit.
+      - name: The guards still detect what they are for
+        run: |
+          python3 -m pip install --disable-pip-version-check --quiet 'pytest>=8,<9'
+          python3 -m pytest tests/enforced -q
+
+      - name: The master pin holds
+        run: bash tests/test_worktree_policy.sh
