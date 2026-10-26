@@ -70,6 +70,9 @@ def main() -> int:
         for wt, br in ((legacy_merged, "legacy-merged"), (legacy_ahead, "legacy-ahead")):
             git(repo, "worktree", "add", "-q", "-b", br, str(wt), "legacy/master")
         git(legacy_ahead, "commit", "-q", "--allow-empty", "-m", "unmerged on legacy")
+        # A remote HEAD left dangling (default branch renamed, then pruned)
+        # must neither poison the other refs nor hide legacy/master.
+        git(repo, "symbolic-ref", "refs/remotes/legacy/HEAD", "refs/remotes/legacy/gone")
 
         manual = str(root / "hand-added")
         (repo / ".claude").mkdir()

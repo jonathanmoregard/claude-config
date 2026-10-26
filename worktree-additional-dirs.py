@@ -72,15 +72,16 @@ def git(path: str, *args: str) -> str | None:
 
 def default_refs(repo: pathlib.Path) -> list[str]:
     """`<remote>/<default>` for every remote that has one. A repo renamed with
-    rewritten history keeps its old remote, whose merged work is still merged."""
+    rewritten history keeps its old remote, whose merged work is still merged.
+    A candidate counts only if it resolves to a commit: a remote HEAD left
+    dangling by a renamed, pruned branch would fail the whole rev-list."""
     refs = []
     for remote in (git(str(repo), "remote") or "").split():
-        ref = git(str(repo), "symbolic-ref", "-q", "--short", f"refs/remotes/{remote}/HEAD")
-        if ref and ref.strip():
-            refs.append(ref.strip())
-            continue
-        for name in (f"{remote}/main", f"{remote}/master"):
-            if git(str(repo), "rev-parse", "-q", "--verify", name) is not None:
+        head = git(str(repo), "symbolic-ref", "-q", "--short", f"refs/remotes/{remote}/HEAD")
+        candidates = [head.strip()] if head and head.strip() else []
+        candidates += [f"{remote}/main", f"{remote}/master"]
+        for name in candidates:
+            if git(str(repo), "rev-parse", "-q", "--verify", f"{name}^{{commit}}") is not None:
                 refs.append(name)
                 break
     return refs
