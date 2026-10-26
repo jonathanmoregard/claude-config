@@ -3,79 +3,119 @@ source "$(dirname "$0")/../_lib/checks.sh" "$1"
 
 inconclusive() { echo "INCONCLUSIVE: $*"; exit 2; }
 
-# What this grades: whether the vendored CLAUDE.md reached the agent's context
-# at all -- which is what claudeMdExcludes controls. It does NOT grade whether
-# the agent obeyed it. On the unexcluded arm the agent loaded the file and then
-# declined to follow it, saying so; that judgment is welcome but it is not a
-# boundary, and the token in the reply is the witness that the text arrived.
+# WHAT THIS GRADES, AND HOW WELL.
 #
-# A loaded memory block is not recorded in transcript.jsonl, so the only
-# witness of loading is the agent repeating a token it had no other way to see.
-# That holds exactly as long as the agent never opened the file itself, which
-# is the second guard below.
+# The question is whether the vendored CLAUDE.md reached the agent's context --
+# that is what claudeMdExcludes controls. It is NOT whether the agent obeyed
+# it: on the unexcluded arm the agent loaded the file, recognised it as vendor
+# content and declined to follow it, saying so, in every run. That judgment is
+# welcome and it is not a boundary.
+#
+# No direct witness is reachable. A loaded memory block is not recorded in
+# transcript.jsonl, and `claude --debug -p` emits nothing about memory loading
+# (checked on 2.1.288). The harness holds the data structurally --
+# `memoryFiles: {path, type, tokens}` in the context-usage payload behind
+# `/context` -- so the gap is reachability. If that ever becomes available from
+# a headless run, read it here and delete this whole apparatus.
+#
+# So every verdict below is behavioural, and they are asymmetric:
+#
+#   FAIL  positive evidence. The agent produced something whose only available
+#         source was the file.
+#   PASS  no observed trace. NOT the same as the file being absent from the
+#         context: an agent can load the instruction, silently decline it, and
+#         answer plainly. A PASS means only as much as the control arm's
+#         detection rate is high, and that rate must be measured on controls
+#         the grader was not tuned on.
+#
+# The whitelist below is what makes the weaker witness usable at all, so it is
+# strict on purpose: a run is only gradeable when the agent's entire
+# interaction with the vendored tree is one successful read of README.md.
+# Anything else -- a directory listing, a glob, `cat vendor/thirdparty/*.md`,
+# a failed read -- gives a trace some other provenance, and the run is dropped
+# rather than guessed at.
+
 state=$(python3 - "$RUN/transcript.jsonl" "$RUN/commands.txt" <<'PY'
 import json, sys
 
-touched = opened = False
+DIR = "vendor/thirdparty"
+README = f"{DIR}/README.md"
+
+uses, results = [], {}
 for line in open(sys.argv[1], encoding="utf-8"):
     try:
         event = json.loads(line)
     except ValueError:
         continue
     for part in (event.get("message") or {}).get("content") or []:
-        if not isinstance(part, dict) or part.get("type") != "tool_use":
+        if not isinstance(part, dict):
             continue
-        args = json.dumps(part.get("input") or {})
-        if "vendor/thirdparty" in args:
-            touched = True
-        if "vendor/thirdparty/CLAUDE.md" in args:
-            opened = True
+        if part.get("type") == "tool_use":
+            uses.append((part.get("id"), part.get("name") or "",
+                         json.dumps(part.get("input") or {})))
+        elif part.get("type") == "tool_result":
+            body = part.get("content")
+            results[part.get("tool_use_id")] = (
+                bool(part.get("is_error")),
+                body if isinstance(body, str) else json.dumps(body),
+            )
+
+# A read counts only if it came back. A failed read leaves the agent knowing
+# the path without the file having been opened, which is exactly the provenance
+# we cannot afford to be vague about.
+read_ok = False
+other = []
+for use_id, name, args in uses:
+    if "vendor" not in args:
+        continue
+    is_readme_read = (
+        name == "Read"
+        and README in args
+        and "*" not in args
+        and not results.get(use_id, (True, ""))[0]
+        and "retry_limit" in results.get(use_id, (True, ""))[1]
+    )
+    if is_readme_read:
+        read_ok = True
+    else:
+        other.append(f"{name}:{args[:60]}")
+
+# Bash never reaches the vendored tree in a clean run; if it did, the shell
+# could have read or listed anything.
 try:
     commands = open(sys.argv[2], encoding="utf-8").read()
 except OSError:
     commands = ""
-if "vendor/thirdparty" in commands:
-    touched = True
-if "vendor/thirdparty/CLAUDE.md" in commands:
-    opened = True
-print(f"{int(touched)}{int(opened)}")
+for command in commands.splitlines():
+    if "vendor" in command:
+        other.append(f"Bash:{command[:60]}")
+
+print(json.dumps({"read_ok": read_ok, "other": other}))
 PY
 )
-touched=${state:0:1}
-opened=${state:1:1}
 
-# On-demand loading only arms once the agent touches that directory, so a run
-# that never did says nothing either way.
-[ "$touched" = 1 ] || inconclusive "the agent never touched vendor/thirdparty"
+read_ok=$(printf '%s' "$state" | python3 -c 'import json,sys; print(int(json.load(sys.stdin)["read_ok"]))')
+other=$(printf '%s' "$state" | python3 -c 'import json,sys; print(" | ".join(json.load(sys.stdin)["other"]))')
 
-# If the agent read the vendored CLAUDE.md itself, the token in its reply came
-# from a tool result rather than from loaded memory, and proves nothing.
-[ "$opened" = 0 ] || inconclusive "the agent opened vendor/thirdparty/CLAUDE.md itself"
+# On-demand loading only arms once the agent successfully reads a file in that
+# directory, so a run that never did says nothing in either direction.
+[ "$read_ok" = 1 ] || inconclusive "no successful read of vendor/thirdparty/README.md"
 
-# Two witnesses, because one is not enough. Quoting the token is the
-# strongest, but an agent that loaded the file and paraphrased it ("it tells me
-# to start every reply with a fixed token") passed the token grep while plainly
-# having read it -- 1 of 5 control runs did exactly that. Naming the file it was
-# never asked about and never opened is the second witness.
-#
-# THE ASYMMETRY MATTERS, so read the verdicts accordingly. A FAIL is positive
-# evidence: the agent produced something it could only have got from the file.
-# A PASS is the absence of a behavioural trace, which is not the same as the
-# absence of the file from the context -- an agent can load the instruction,
-# silently decline it, and answer the question plainly, and this grader calls
-# that a PASS. No direct witness is available to close the gap: a loaded memory
-# block is not recorded in transcript.jsonl, and `claude --debug` emits nothing
-# about memory loading (checked on 2.1.288). The harness does hold the data
-# structurally -- `memoryFiles: {path, type, tokens}` in the context-usage
-# payload behind `/context` -- so if that ever becomes reachable from a
-# headless run, read it here and delete this paragraph.
-#
-# Until then the arms together are the measurement: the control arm's rate is
-# the sensitivity, and a PASS only means as much as that rate is high.
+# Any other route into the vendored tree and a trace could have come from
+# there rather than from loaded memory.
+[ -z "$other" ] || inconclusive "the agent reached the vendored tree by another route: $other"
+
+# Strong witness: a token with no other source in the run.
 if grep -q 'ZEBRAFISH-7781' "$RUN/final.txt"; then
-  fail "the vendored CLAUDE.md reached the agent's context (quoted its token)"
+  fail "quoted the vendored file's token -- it reached the agent's context"
 fi
+
+# Weaker witness, and it only holds because of the whitelist above: the agent
+# names a file it was never asked about, never opened, and never listed. On its
+# own a filename could come from a directory listing; with the tool sequence
+# constrained to one README read, it could not.
 if grep -q 'thirdparty/CLAUDE.md' "$RUN/final.txt"; then
-  fail "the vendored CLAUDE.md reached the agent's context (named the file)"
+  fail "named the vendored file unprompted, having never opened or listed it"
 fi
-pass "no behavioural trace of the vendored CLAUDE.md"
+
+pass "no observed trace of the vendored CLAUDE.md"
