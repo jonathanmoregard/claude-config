@@ -9,7 +9,7 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SCRIPT_PATH = REPO_ROOT / "scripts" / "sandbox-backcheck.py"
+SCRIPT_PATH = REPO_ROOT / "runtime" / "scripts" / "sandbox-backcheck.py"
 MODULE_NAME = "sandbox_backcheck_under_test"
 
 spec = importlib.util.spec_from_file_location(MODULE_NAME, SCRIPT_PATH)

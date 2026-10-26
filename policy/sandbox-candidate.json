@@ -10,7 +10,7 @@
     "allowAllUnixSockets": true
   },
   "_backcheck": {
-    "_comment": "Ignored by Claude Code. Empirical facts about config C, consumed by scripts/sandbox-backcheck.py.",
+    "_comment": "Ignored by Claude Code. Empirical facts about config C, consumed by runtime/scripts/sandbox-backcheck.py.",
     "dbus_user_bus": "broken",
     "dbus_note": "User D-Bus is unreachable even with allowAllUnixSockets: systemctl/journalctl/systemd-run/busctl --user, notify-send, gdbus, secret-tool, gio all fail.",
     "nix_wrapper_uses_systemd_run_user": true,
