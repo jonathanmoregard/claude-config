@@ -337,18 +337,22 @@ def stop_children(children: dict[str | None, Child], stop: anyio.Event) -> None:
 def base_refusal(name: str, arguments: dict[str, Any], config: MuxConfig) -> str | None:
     """Why this call may not set a pull request's base; None when it may.
 
-    A pull request aimed at the repository's own default branch is ordinary
-    work. One aimed anywhere else is the caller choosing a merge target for
-    someone else, and that choice stays with the human, who can retarget the
-    pull request in GitHub's UI.
+    This is a housekeeping rule, not a security control. Pull requests aimed
+    somewhere other than the default branch are noise Jonathan does not want to
+    manage, so the mux declines to open them and says where to aim instead.
+
+    It is worth being explicit that it guards nothing: anyone who can reach this
+    tool can also `git push` to any unprotected branch directly, so routing
+    commits through a pull request aimed at one grants no access they lack. The
+    branch that matters is protected by its ruleset -- required review, required
+    checks, no bypass actors, and approval dismissed on any later push -- and
+    that, not this function, is what keeps unreviewed work out.
 
     "Default branch" means *this* repository's, not a guess from a list of
     common names: `claude-config` defaults to `master` and `nixos-config` to
     `main`, so a shared allow-list would let a pull request into whichever of
     the two happened to also exist. The comparison is case-sensitive because
     git refs are: `Main` and `main` can both exist and are different branches.
-
-    A repository the config does not name is refused rather than waved through.
     """
     if name not in BASE_ARGUMENT_TOOLS or "base" not in arguments:
         return None
@@ -376,8 +380,9 @@ def base_refusal(name: str, arguments: dict[str, Any], config: MuxConfig) -> str
         return None
     return (
         f"{name}: base {base!r} is not {owner}/{repo}'s default branch "
-        f"({default!r}). Target the default branch; retargeting a pull request "
-        "elsewhere is the repository owner's call, made in GitHub's UI."
+        f"({default!r}). Open it against {default!r} instead. Pull requests "
+        "aimed at other branches are not wanted here; if one is genuinely "
+        "needed, retarget it in GitHub's UI."
     )
 
 
