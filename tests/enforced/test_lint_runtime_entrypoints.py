@@ -52,11 +52,19 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-LINT = REPO_ROOT / "scripts" / "lint-runtime-entrypoints.py"
+
+# `scripts/` is part of the runtime subset, so it moves into `runtime/` with
+# everything else. Both spellings are legitimate -- before the migration and
+# after it -- and hard-coding one is the same mistake the lint itself made by
+# looking for `settings.json` in a single place.
+_LINT_CANDIDATES = (REPO_ROOT / "runtime" / "scripts" / "lint-runtime-entrypoints.py",
+                    REPO_ROOT / "scripts" / "lint-runtime-entrypoints.py")
+LINT = next((p for p in _LINT_CANDIDATES if p.exists()), _LINT_CANDIDATES[-1])
 
 
 def make_repo(root: Path, files: dict[str, str]) -> Path:
     """A throwaway config repo."""
+    root.mkdir(parents=True, exist_ok=True)
     for rel, body in files.items():
         target = root / rel
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -104,6 +112,51 @@ def test_the_live_repo_passes():
     """The lint must be green on the tree it ships in, or it cannot be wired up."""
     proc = run_lint(REPO_ROOT)
     assert proc.returncode == 0, proc.stderr
+
+
+def test_the_relocated_config_files_are_still_read(tmp_path):
+    """Reported in review, and it had already happened.
+
+    The runtime subset moves under `runtime/`, so `settings.json` lands one
+    level deeper. Looking in one place only, the lint found nothing, read
+    nothing, and printed **clean** -- a green tick with no content behind it.
+    """
+    root = make_repo(tmp_path, {
+        "runtime/settings.json": settings("bash $HOME/.claude/tests/x.sh"),
+        "tests/x.sh": "echo hi\n",
+    })
+    proc = run_lint(root)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+
+
+def test_an_empty_input_is_an_error_not_a_pass(tmp_path):
+    """A check that cannot find its input must not report success.
+
+    This is the general form of the bug above: whatever moves next, the lint
+    says so instead of going quiet.
+    """
+    root = make_repo(tmp_path, {"hooks/guard.py": "pass\n"})
+    proc = run_lint(root)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "empty input" in proc.stderr
+
+
+def test_a_relocated_tree_is_still_checked_for_real(tmp_path):
+    """Non-vacuity, on the moved layout specifically.
+
+    The clean case and the violation case have to come from the same tree
+    shape, or "clean" means only that the file was missing again.
+    """
+    clean = make_repo(tmp_path / "clean", {
+        "runtime/settings.json": settings("bash $HOME/.claude/hooks/ok.sh"),
+        "runtime/hooks/ok.sh": "echo hi\n",
+    })
+    assert run_lint(clean).returncode == 0
+    dirty = make_repo(tmp_path / "dirty", {
+        "runtime/settings.json": settings("bash $HOME/.claude/docs/x.sh"),
+        "docs/x.sh": "echo hi\n",
+    })
+    assert run_lint(dirty).returncode == 1
 
 
 def test_not_a_config_repo_is_a_usage_error(tmp_path):

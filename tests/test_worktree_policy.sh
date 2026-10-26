@@ -93,8 +93,13 @@ git init -q -b master "$ROOT/seed"
   cd "$ROOT/seed" || exit 1
   mkdir -p .githooks scripts
   cp -a "$REPO_ROOT"/.githooks/. .githooks/
+  # `scripts/` is part of the runtime subset, so in a migrated checkout it
+  # sits at `runtime/scripts/`. Take whichever this tree has: the suite is
+  # about what these scripts do, not about where the repository keeps them.
+  src_scripts="$REPO_ROOT/scripts"
+  [ -d "$REPO_ROOT/runtime/scripts" ] && src_scripts="$REPO_ROOT/runtime/scripts"
   for s in install-worktree-policy.sh claude-worktree.sh worktree-policy-session-start.sh claude-pull.sh; do
-    cp -a "$REPO_ROOT/scripts/$s" scripts/
+    cp -a "$src_scripts/$s" scripts/
   done
   printf '{\n  "model": "upstream-model",\n  "env": {}\n}\n' > settings.json
   printf 'seed\n' > tracked.txt
@@ -403,7 +408,9 @@ OBS="$(observe)"
 [ -z "$OBS" ] && ok "observer is silent when healthy" || bad "observer is silent when healthy" "$OBS"
 
 # --- registration --------------------------------------------------------------
-if python3 - "$REPO_ROOT/settings.json" <<'PY'
+live_settings="$REPO_ROOT/settings.json"
+[ -f "$REPO_ROOT/runtime/settings.json" ] && live_settings="$REPO_ROOT/runtime/settings.json"
+if python3 - "$live_settings" <<'PY'
 import json, sys
 hooks = json.load(open(sys.argv[1]))["hooks"]["SessionStart"]
 assert any("worktree-policy-session-start.sh" in h["command"] for e in hooks for h in e["hooks"])

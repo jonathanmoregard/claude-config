@@ -14,7 +14,10 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-WAIT_FOR = REPO / "scripts" / "wait-for"
+# `runtime/` once the layout migration has landed, the repository root
+# before it. Only the projected subset moves; tests/ stays at the root.
+RUNTIME = REPO / "runtime" if (REPO / "runtime").is_dir() else REPO
+WAIT_FOR = RUNTIME / "scripts" / "wait-for"
 FAKE = REPO / "tests" / "stubs" / "wait-for-fake.py"
 
 RUN_DONE = {"status": "completed", "conclusion": "success", "name": "infra"}

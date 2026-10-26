@@ -29,7 +29,10 @@ import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-HOOK = REPO_ROOT / "hooks" / "pending-for-human.py"
+# `runtime/` once the layout migration has landed, the repository root
+# before it. Only the projected subset moves; tests/ stays at the root.
+RUNTIME = REPO_ROOT / "runtime" if (REPO_ROOT / "runtime").is_dir() else REPO_ROOT
+HOOK = RUNTIME / "hooks" / "pending-for-human.py"
 
 FAILURES: list[str] = []
 

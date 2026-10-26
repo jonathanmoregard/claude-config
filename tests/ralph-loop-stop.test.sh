@@ -8,12 +8,15 @@ set -uo pipefail
 # absolute path — that is its own guarded design — but the resolver honours
 # CLAUDE_RALPH_STATE_DIR, so the state isolation below holds either way.)
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-HOOK="$ROOT/hooks/ralph-loop-stop.sh"
+# `runtime/` once the layout migration has landed, the repo root before it.
+RUNTIME="$ROOT"
+[ -d "$ROOT/runtime" ] && RUNTIME="$ROOT/runtime"
+HOOK="$RUNTIME/hooks/ralph-loop-stop.sh"
 TMP=$(mktemp -d)
 # Isolate loop state: without this the suite writes its fake session into the
 # LIVE state dir, where a crash mid-run leaves a state file behind.
 export CLAUDE_RALPH_STATE_DIR="$TMP/state"
-source "$ROOT/scripts/ralph-loop-state.sh"
+source "$RUNTIME/scripts/ralph-loop-state.sh"
 STATE_DIR="$RALPH_STATE_DIR"
 SID="test-session-0000"
 STATE="$STATE_DIR/$SID.md"

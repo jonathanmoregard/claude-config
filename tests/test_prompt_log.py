@@ -12,8 +12,14 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+# `runtime/` once the layout migration has landed, the repository root before
+# it. Only the projected subset moves; tests/ stays at the root.
+RUNTIME = Path(__file__).resolve().parents[1]
+if (RUNTIME / "runtime").is_dir():
+    RUNTIME = RUNTIME / "runtime"
 
-HOOK_PATH = Path(__file__).parents[1] / "hooks" / "prompt-log.py"
+
+HOOK_PATH = RUNTIME / "hooks" / "prompt-log.py"
 SPEC = importlib.util.spec_from_file_location("prompt_log", HOOK_PATH)
 assert SPEC is not None and SPEC.loader is not None
 prompt_log = importlib.util.module_from_spec(SPEC)
