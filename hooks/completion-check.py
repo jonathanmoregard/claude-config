@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""Stop hook: name the delivery gaps this session left that it can close itself.
+"""UserPromptSubmit hook: tell the agent which delivery gaps it can still close.
 
 Definition of done (Jonathan, 2026-08-27): move as close to finished as
 possible; the only things left for him are bare necessities (the merge click,
 credentials, interactive logins, taste calls). A session ends on the default
 branch, clean, at latest.
 
-Stateless. Every Stop re-derives everything:
+Informs, never forces (Jonathan, 2026-10-25: "I distinctly recall asking for it
+to be non-forcing, but rather have the agent be informed of status"). The gaps
+arrive as `additionalContext` at the start of a turn — when the agent can act on
+them — and no output of this hook can block a Stop or end a turn.
+
+Stateless. Every prompt re-derives everything:
 
 1. WHAT THIS SESSION TOUCHED comes from its transcript (`transcript_path`)
    plus its subagents' transcripts (`<transcript dir>/<session>/subagents/
@@ -17,13 +22,18 @@ Stateless. Every Stop re-derives everything:
    `scripts/claude-worktree.sh` / `scripts/klaffat-worktree.sh` (which create
    `~/worktrees/{claude,klaffat}-<slug>`), or the git-broker MCP operations
    commit / push / worktree_add / pr_create. The directory comes from
-   `git -C`, a preceding `cd`, or the entry's `cwd`. Worktrees created by
+   `git -C`, a preceding `cd`, or the entry's `cwd`; a worktree add claims
+   only the new worktree, never the checkout it was run from (whose current
+   branch may be another session's). Worktrees created by
    `git worktree add`, the two helper scripts or the broker are "created by
    this session" only when, in addition, the output shows no creation failure
    ("already exists", `fatal:`): a failed add never claims someone's worktree.
 
 2. WHAT IS STILL OPEN is measured live with git and gh, per checkout, in
-   parallel (at most MAX_CHECKOUTS, most recently touched first):
+   parallel (at most MAX_CHECKOUTS, most recently touched first). This runs on
+   the prompt's critical path, so the per-call timeouts stay small and the
+   hook's own `timeout` in settings.json is the hard ceiling: killed, it says
+   nothing rather than delaying the turn. What counts as open:
    - commits not pushed: ahead of the branch's PUSH destination (`@{push}`,
      else push remote + same branch name; never an inherited `@{u}`), or a
      branch with no remote ref and no PR (never pushed);
@@ -42,12 +52,10 @@ a PR-gated repo with no PR; a closed PR; a repo with no `origin` remote
 (scratch); the `~/.claude` primary checkout (pinned live config; its dirty
 `settings.json` is the user's); a dirty primary checkout.
 
-Output: gaps on the first Stop of a chain -> one `decision: block` listing each
-gap with its next command. With `stop_hook_active` set, or background work in
-flight (`background_tasks` / `session_crons` non-empty: the turn is pausing on a
-wait, not finishing) -> a `systemMessage` only. A checkout that git or gh could
-not measure -> named in a `systemMessage`, never a block. Unparseable input ->
-silent exit 0.
+Output: one `additionalContext` naming each gap with the command that closes it,
+and naming any checkout git or gh could not measure (so an unmeasured checkout
+does not read as "all clear"). Nothing to say, or unparseable input -> silent
+exit 0. There is no blocking path: no `decision`, no `continue: false`.
 """
 from __future__ import annotations
 
@@ -181,7 +189,8 @@ def scan_bash(command: str, cwd: str, home: str, t: Touched) -> None:
             elif sub == "worktree":
                 path = _worktree_add_path(rest)
                 if path:
-                    t.dirs.append(d)
+                    # Only the new worktree is this session's: the anchor
+                    # checkout's current branch may be anyone's.
                     new = _resolve(path, d, home)
                     t.created.add(new)
                     t.dirs.append(new)
@@ -217,7 +226,7 @@ def scan_entry(entry: dict, home: str) -> list[tuple[str, Touched]]:
             scan_bash(inp["command"], cwd, home, t)
         elif item.get("name") == BROKER_TOOL and isinstance(inp.get("repo_path"), str):
             op, repo = inp.get("operation"), inp["repo_path"]
-            if op in ("commit", "push", "pr_create", "worktree_add"):
+            if op in ("commit", "push", "pr_create"):
                 t.dirs.append(repo)
             if op == "worktree_add" and isinstance(inp.get("worktree_path"), str):
                 new = _resolve(inp["worktree_path"], repo, home)
@@ -494,7 +503,8 @@ def checkouts(t: Touched, home: str) -> list[str]:
     return seen
 
 
-def decide(payload: dict, home: str, gh: str | None, yq: str | None) -> dict | None:
+def decide(payload: dict, home: str, gh: str | None, yq: str | None) -> str | None:
+    """The informer text for this prompt, or None when there is nothing to say."""
     tp, sid = payload.get("transcript_path"), payload.get("session_id")
     if not isinstance(tp, str) or not tp:
         return None
@@ -519,21 +529,16 @@ def decide(payload: dict, home: str, gh: str | None, yq: str | None) -> dict | N
     unverified = [f"{top} ({err})" for top, _, err in results if err]
     notice = ("Completion check: could not measure " + "; ".join(unverified)) if unverified else None
     if not gaps:
-        return {"systemMessage": notice} if notice else None
+        return notice
 
     lines = [f"{i}. {top}: {g}\n   next: {c}" for i, (top, g, c) in enumerate(gaps, 1)]
     facts = ("Completion check: work this session touched is not finished:\n" + "\n".join(lines))
-    pausing = payload.get("background_tasks") or payload.get("session_crons")
-    if payload.get("stop_hook_active") or pausing:
-        return {"systemMessage": facts + (("\n" + notice) if notice else "")}
-    out: dict = {"decision": "block", "reason": facts + (
+    return facts + (
         "\nDone means pushed, PR open with green checks (the merge click is the user's), "
         "and after a merge the primary checkout back on the default branch at latest. "
-        "Close these gaps, or state in the reply why one must stay open (for example the "
-        "user asked to hold it).")}
-    if notice:
-        out["systemMessage"] = notice
-    return out
+        "This is status, not an instruction: close what belongs to the current task, and "
+        "leave the rest."
+    ) + (("\n" + notice) if notice else "")
 
 
 def main() -> int:
@@ -544,11 +549,12 @@ def main() -> int:
     if not isinstance(payload, dict):
         return 0
     try:
-        out = decide(payload, str(pathlib.Path.home()), shutil.which("gh"), shutil.which("yq"))
+        text = decide(payload, str(pathlib.Path.home()), shutil.which("gh"), shutil.which("yq"))
     except Exception:  # a checker that crashes must not wedge the turn
         return 0
-    if out:
-        print(json.dumps(out))
+    if text:
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit", "additionalContext": text}}))
     return 0
 
 
