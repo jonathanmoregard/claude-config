@@ -343,6 +343,32 @@ def test_an_undeclared_absolute_target_fails_verify(tmp_path):
     assert "ALLOWED_ABSOLUTE" in proc.stderr, proc.stderr
 
 
+def test_an_absolute_target_cannot_traverse_out_of_the_allowlist(tmp_path):
+    """The allowlist is a containment check, so spelling must not defeat it.
+
+    The check matched the raw target string against each allowed prefix, so
+    `<allowed>/../../Repos/claude-config/tests` passed it while resolving into
+    a dev tree -- precisely the escape the allowlist exists to refuse, wearing
+    an allowlisted prefix. Reported by review with a reproduction: `--verify`
+    returned 0. Now the prefix match runs on the normalised path, and a `..`
+    component is refused outright with the normalised form quoted, because a
+    target that needs `..` to land inside the allowlist is not one anyone
+    meant to write.
+    """
+    root = make_repo(
+        tmp_path,
+        {"runtime/hooks/guard.py": "pass\n"},
+        {"runtime/skills/stray":
+         "/home/jonathan/.claude/skills-hm/../../Repos/claude-config/tests"},
+    )
+    proc = run(root, "--verify")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert ".." in proc.stderr, proc.stderr
+    # The message has to name where it actually lands, or the reader is left
+    # re-deriving the traversal by hand.
+    assert "/home/jonathan/Repos/claude-config/tests" in proc.stderr, proc.stderr
+
+
 def test_a_skills_hm_target_is_declared_and_merely_unverifiable(tmp_path):
     """The second legitimate way out of the projection, next to vendor/.
 
@@ -407,8 +433,17 @@ def test_the_skills_hm_links_are_not_swallowed_by_gitignore(name):
     rather than by grepping for a leading slash, so any rule shape that reaches
     them fails this regardless of how it is spelled.
     """
+    # --no-index is load-bearing, not tidiness: without it `git check-ignore`
+    # skips paths that are in the index and reports no match, so this test
+    # passed for every tracked link no matter what rules existed. Proven by
+    # simulating an unanchored rule through core.excludesFile: without the
+    # flag the probe returns 1 (test passes), with it 0 (test fails). These
+    # five links are tracked by definition, which is what made the blind spot
+    # total. The sibling probes in tests/test_harness_runtime_dirs_ignored.py
+    # already used the flag.
     proc = subprocess.run(
-        ["git", "check-ignore", "-q", f"{layout.RUNTIME_DIR}/skills/{name}"],
+        ["git", "check-ignore", "-q", "--no-index", "--",
+         f"{layout.RUNTIME_DIR}/skills/{name}"],
         cwd=REPO_ROOT)
     assert proc.returncode == 1, (
         f"{layout.RUNTIME_DIR}/skills/{name} is matched by a .gitignore rule; "

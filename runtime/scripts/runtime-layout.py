@@ -337,8 +337,24 @@ def verify(root: Path) -> int:
         exists = (root / path).exists()  # follows the link; False if dangling
 
         if target.startswith("/"):
+            # Prefix-match the NORMALISED target, and reject `..` outright.
+            # A raw prefix check on the spelling accepts
+            # <allowed>/../../Repos/claude-config/tests, which escapes into a
+            # dev tree while reading as an allowlisted path — the one thing
+            # this check exists to catch. normpath collapses `..` lexically
+            # (it cannot resolve symlinks, which is why the component check
+            # stays as well: a path that needs `..` to land inside the
+            # allowlist is not a path anyone meant to write).
+            normalised = posixpath.normpath(target)
+            if ".." in target.split("/"):
+                failures.append(
+                    f"{path} -> {target} is absolute and contains a `..` "
+                    f"component (normalises to {normalised}); spell the "
+                    "target directly instead")
+                continue
             declared = next((a for a in ALLOWED_ABSOLUTE
-                             if target == a or target.startswith(a + "/")), None)
+                             if normalised == a or normalised.startswith(a + "/")),
+                            None)
             if not declared:
                 failures.append(
                     f"{path} -> {target} is absolute but points outside every "
