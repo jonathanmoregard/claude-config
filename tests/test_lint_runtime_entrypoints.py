@@ -28,8 +28,9 @@ behaviour, in both directions, because both failure modes are silent:
 
 They establish nothing about whether dev-only code can be executed. It can:
 anything that does not name the path in these two files passes untouched. The
-boundary is the read-only bind mount that keeps those trees out of the agent's
-namespace. Do not let a green run here be read as isolation.
+boundary is those trees not being in the agent's mounted view at all --
+read-only is a separate property that stops writes, while what stops access is
+the exclusion. Do not let a green run here be read as isolation.
 
 Run:  nix shell nixpkgs#python3Packages.pytest -c pytest tests/test_lint_runtime_entrypoints.py -q
 """
@@ -166,6 +167,26 @@ def test_broken_settings_json_is_reported_not_crashed(tmp_path):
     assert "invalid JSON" in proc.stderr
 
 
+def test_a_mention_is_reported_and_called_a_mention(tmp_path):
+    """Shell semantics are not modelled, and the wording must not pretend they are.
+
+    `echo tests/x.sh` is reported exactly like `bash tests/x.sh`, because the
+    lint reads path tokens and does not work out which word is the program. The
+    conservatism is deliberate -- a declared entrypoint has no business naming a
+    dev-only path at all -- but it means the diagnostic may only claim the path
+    was *named*. Pinned so nobody later reads the message as an execution claim,
+    or "fixes" the over-report into a dataflow analysis.
+    """
+    root = make_repo(tmp_path, {
+        "settings.json": settings("echo tests/x.sh"),
+        "tests/x.sh": "echo hi\n",
+    })
+    proc = run_lint(root)
+    assert proc.returncode == 1
+    assert "names dev-only path" in proc.stderr
+    assert "executes" not in proc.stderr
+
+
 # ---------------------------------------------------------- B: mcp-servers.json
 
 def test_mcp_server_running_test_code_fails(tmp_path):
@@ -205,12 +226,28 @@ def test_registered_runtime_mcp_server_passes(tmp_path):
 # clean straight through check A.
 
 @pytest.mark.parametrize("command", [
+    # Normalisation.
     'bash $HOME/.claude/hooks/../tests/x.sh',
     'bash $HOME/.claude/./tests/x.sh',
     'bash $HOME/.claude/tests/../tests/x.sh',
     'bash $HOME/.claude/docs/../experiments/x.sh',
     'bash /home/someone/.claude/hooks/../tests/x.sh',
     'bash ~/.claude/hooks/../tests/x.sh',
+    'bash /home/someone/.claude//tests/x.sh',
+    # How the config dir gets named. Every one of these walked past the
+    # five-literal-prefix resolver the first revision shipped, because the
+    # first path segment ended up holding something like `$HOME"` or `X=$HOME`
+    # rather than `tests`.
+    'bash "$HOME"/.claude/tests/x.sh',
+    'bash ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/tests/x.sh',
+    'bash $CLAUDE_CONFIG_DIR/tests/x.sh',
+    'BASH_ENV=$HOME/.claude/tests/x.sh bash -c :',
+    # The shape settings.json already uses for vendor/, so this is the
+    # spelling most likely to appear by accident.
+    'CLAUDE_PLUGIN_ROOT=$HOME/.claude/tests python3 run.py',
+    'python3 run.py --config=$HOME/.claude/tests/x.sh',
+    # The directory itself, with no trailing separator.
+    'cd $HOME/.claude/tests && bash x.sh',
 ])
 def test_a_denormalised_hook_path_still_fails(tmp_path, command):
     root = make_repo(tmp_path, {
@@ -230,6 +267,70 @@ def test_a_denormalised_mcp_arg_still_fails(tmp_path):
             "args": ["$HOME/.claude/mcps/../tests/broker.py"],
         }}}, indent=2),
         "tests/broker.py": "pass\n",
+    })
+    assert run_lint(root).returncode == 1
+
+
+@pytest.mark.parametrize("field", [
+    "apiKeyHelper",
+    "awsAuthRefresh",
+    "awsCredentialExport",
+    "otelHeadersHelper",
+])
+def test_the_other_command_fields_are_checked(tmp_path, field):
+    """hooks and statusLine are not the only fields the harness runs.
+
+    Each of these is in the installed harness's own settings schema. The first
+    revision read two fields and called them "the two files that declare what
+    the harness will execute".
+    """
+    data = {"hooks": {}, field: "bash $HOME/.claude/tests/helper.sh"}
+    root = make_repo(tmp_path, {
+        "settings.json": json.dumps(data, indent=2),
+        "tests/helper.sh": "echo hi\n",
+    })
+    proc = run_lint(root)
+    assert proc.returncode == 1, field
+    assert field in proc.stderr
+
+
+@pytest.mark.parametrize("name", ["BASH_ENV", "PYTHONPATH"])
+def test_env_is_an_execution_path(tmp_path, name):
+    """`env` is not run directly, and reaches every hook regardless.
+
+    BASH_ENV is sourced by each non-interactive bash; PYTHONPATH decides what
+    `import` resolves to. A dev-only path in either is an execution path.
+    """
+    root = make_repo(tmp_path, {
+        "settings.json": json.dumps(
+            {"env": {name: "$HOME/.claude/tests"}}, indent=2),
+        "tests/x.sh": "echo hi\n",
+    })
+    assert run_lint(root).returncode == 1, name
+
+
+def test_a_marketplace_source_path_is_checked(tmp_path):
+    """A marketplace source path is loaded as plugin code."""
+    root = make_repo(tmp_path, {
+        "settings.json": json.dumps({"extraKnownMarketplaces": {
+            "local": {"source": {"source": "directory",
+                                 "path": "$HOME/.claude/tests/fixtures"}}}}, indent=2),
+        "tests/fixtures/.keep": "",
+    })
+    assert run_lint(root).returncode == 1
+
+
+def test_an_mcp_server_env_is_checked(tmp_path):
+    root = make_repo(tmp_path, {
+        "settings.json": settings("python3 $HOME/.claude/hooks/ok.py"),
+        "hooks/ok.py": "pass\n",
+        "mcp-servers.json": json.dumps({"mcpServers": {"broker": {
+            "command": "python3",
+            "args": ["$HOME/.claude/mcps/broker/server.py"],
+            "env": {"PYTHONPATH": "$HOME/.claude/tests/stubs"},
+        }}}, indent=2),
+        "mcps/broker/server.py": "pass\n",
+        "tests/stubs/.keep": "",
     })
     assert run_lint(root).returncode == 1
 

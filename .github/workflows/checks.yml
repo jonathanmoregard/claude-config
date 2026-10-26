@@ -22,7 +22,9 @@ permissions:
 
 concurrency:
   group: checks-${{ github.ref }}
-  cancel-in-progress: true
+  # Superseded pull-request runs are waste; a master run is the record of
+  # whether master is clean, so it is never cancelled.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   checks:
@@ -30,6 +32,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Stdlib only, and deliberately before any install step: nothing fetched
+      # from a package index can change this step's verdict.
       - name: No declared entrypoint names a dev-only tree
         run: python3 scripts/lint-runtime-entrypoints.py
 

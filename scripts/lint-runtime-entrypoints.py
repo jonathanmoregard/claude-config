@@ -8,21 +8,39 @@ built-in file tools and the Bash file commands it recognises, not arbitrary
 subprocesses, and the sandbox covers shell commands only -- hooks, local MCP
 servers and the file tools run outside it with full access.
 
-WHAT THIS IS. A lint over the two files that *declare* what the harness will
-execute on its own initiative:
+WHAT THIS IS. A lint over the command-bearing fields of two tracked files:
 
-  A  settings.json      a hook or statusLine `command`
-  B  mcp-servers.json   a server `command` / `args`
+  A  settings.json      `hooks.*[].hooks[].command`, `statusLine.command`,
+                        `apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport`,
+                        `otelHeadersHelper`, every `env` value, and
+                        `extraKnownMarketplaces.*.source.path`
+  B  mcp-servers.json   a server `command`, `args` and `env`
 
-Both are well posed. The path is a declared field of a structured document, so
-answering "does this name a dev-only tree?" needs string normalisation and
-nothing else -- no dataflow, no call graph, no guessing. A violation here is
-the realistic accident: an entrypoint edited to point at a harness under
-`tests/` would be fenced by nothing in the platform.
+Those are not the only places a path can become an execution path, and saying
+otherwise was an earlier version's mistake. NOT read here: skill and agent
+frontmatter `hooks:`, a plugin's own `hooks.json`, `settings.local.json`, and
+`~/.claude.json` -- which is where the harness actually keeps the registered
+MCP servers (all nine live ones), making tracked `mcp-servers.json` the copy
+that gets synced in rather than the source of truth. Check B is therefore a
+check on the delivery path, not on the running configuration.
+
+Both are tractable because the path is a declared field of a structured
+document rather than something to be inferred from code. A violation is the
+realistic accident: an entrypoint edited to point at a harness under `tests/`
+would be fenced by nothing in the platform.
+
+It is a **conservative lint over path mentions**, not an execution analysis,
+and the distinction is not pedantry. A `command` is a shell line, and shell
+semantics are not modelled here: quoting, substitutions and which word is the
+program all go unexamined, so `echo tests/x.sh` is reported exactly like
+`bash tests/x.sh`. That asymmetry is deliberate. A declared entrypoint has no
+business naming a dev-only path at all, so a false report costs one line of
+review while a miss is silent -- which is why the diagnostics say a path is
+*named*, never that it is executed.
 
 WHAT THIS IS NOT. It is not an isolation boundary, and it must not be read as
 one. It inspects text; the property that matters is a filesystem property.
-Anything that executes a dev-only path without naming it in these two files --
+Anything that reaches a dev-only path without naming it in these two files --
 a runtime script that shells out, a path assembled from pieces, an `importlib`
 module name, a symlink -- passes this lint untouched and always will.
 
@@ -34,8 +52,13 @@ a path), and `p = "tests/x.sh"` before `subprocess.run(["bash", p])` (one hop
 of indirection) all scanned clean. No maintained tool answers that question
 either: Semgrep's taint mode is intra-procedural and Python-only, ShellCheck
 has no dataflow, and CodeQL is a heavy instrument for a question whose real
-answer is a kernel one. The boundary is the read-only bind mount that keeps
-the dev trees out of the agent's namespace; this lint only catches the
+answer is a kernel one.
+
+The boundary is **the dev trees not being in the agent's mounted view at all**.
+Read-only is a separate property that stops writes; what stops access is the
+exclusion -- `tests/`, `docs/`, `experiments/` and `research/` are simply not
+among the paths projected into `~/.claude`, so no subprocess, hook or MCP
+server can open them however it spells the path. This lint only catches the
 entrypoint edit that would otherwise go unnoticed in review.
 
     lint-runtime-entrypoints.py [--repo-root DIR] [--quiet]
@@ -60,23 +83,33 @@ from pathlib import Path
 # agent runtime.
 DEV_ONLY = ("tests", "docs", "experiments", "research")
 
-# Prefixes an entrypoint may use to name a file inside the config dir. Each is
-# stripped to a repo-relative path before the dev-only test.
-CONFIG_DIR_PREFIXES = (
-    "$HOME/.claude/",
-    "${HOME}/.claude/",
-    "~/.claude/",
-    "$CLAUDE_CONFIG_DIR/",
-    "${CLAUDE_CONFIG_DIR}/",
-)
+# How a token says "inside the config dir". Matching the marker wherever it
+# appears, rather than testing a list of prefixes, is what makes the resolver
+# robust: an earlier version carried five literal prefixes plus an
+# absolute-path regex, and every one of these ordinary spellings walked
+# straight past it --
+#
+#   "$HOME"/.claude/tests/x.sh                      quotes inside the token
+#   ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/tests/x.sh  a default-value expansion
+#   CLAUDE_PLUGIN_ROOT=$HOME/.claude/tests/y        an assignment prefix, which
+#                                                   is the shape settings.json
+#                                                   already uses for vendor/
+#   --config=$HOME/.claude/tests/x.sh               a path glued to a flag
+#   /home/u/.claude//tests/x.sh                     a doubled separator
+#
+# so the first path segment was compared against `tests` while holding
+# something like `$HOME"` or `X=$HOME`.
+# `\}*` so a closing brace between the marker and the separator does not hide
+# it, as in `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/tests/x.sh`.
+_CONFIG_DIR_RE = re.compile(r"(?:\.claude|\$\{?CLAUDE_CONFIG_DIR\}?)\}*/+")
 
 # A command line is split into candidate path tokens before each is tested.
 # Matching with a regex over the whole string is the trap here: a dev-only
 # segment is almost always embedded in a longer path (`$HOME/.claude/tests/x`),
 # so any pattern anchored on a non-path character before `tests/` silently
-# matches nothing at all.
-_TOKEN_SPLIT = re.compile(r"[\s;|&()<>]+")
-_ABS_CONFIG_RE = re.compile(r"/home/[^/\s]+/\.claude/")
+# matches nothing at all. `=` and `,` are separators too, so an assignment or a
+# comma-joined list yields the path on its own.
+_TOKEN_SPLIT = re.compile(r"[\s;|&()<>=,]+")
 
 
 class Violation:
@@ -87,51 +120,67 @@ class Violation:
         return f"{self.path}:{self.line}: {self.message}"
 
 
-def to_repo_relative(token: str) -> str | None:
-    """Strip a config-dir prefix, returning a normalised repo-relative path.
+def to_repo_relative(token: str) -> tuple[str | None, bool]:
+    """Resolve a token to `(repo-relative path, named the config dir)`.
 
-    Normalisation is load-bearing, not tidiness: `hooks/../tests/x.sh` and
-    `./tests/x.sh` name exactly the file that `tests/x.sh` names, and a check
-    that compares the first path segment literally sees three different things.
-    A token that names no config-dir path -- an absolute system path, a bare
-    flag, or a `..` that climbs out of the config dir -- is not this lint's
-    business and yields None.
+    Normalisation is load-bearing, not tidiness: `hooks/../tests/x.sh`,
+    `./tests/x.sh` and `tests//x.sh` all name the file `tests/x.sh` names, and
+    a check comparing the first path segment literally sees four unrelated
+    strings.
+
+    The second element says whether the token named the config dir explicitly.
+    That distinction is what lets `$HOME/.claude/tests` count while a bare
+    `tests` does not: the first can only mean the directory, the second is
+    usually a word (`--tools docs`).
+
+    `(None, False)` for anything that is not a path inside the config dir: an
+    absolute system path, a variable-rooted path pointing elsewhere, or a `..`
+    that climbs out of the config dir.
     """
-    token = token.strip().strip("\"'")
-    token = _ABS_CONFIG_RE.sub("", token, count=1)
-    for prefix in CONFIG_DIR_PREFIXES:
-        if token.startswith(prefix):
-            token = token[len(prefix):]
-            break
+    token = token.strip()
+    for ch in "\"'\\":
+        token = token.replace(ch, "")
+
+    markers = list(_CONFIG_DIR_RE.finditer(token))
+    if markers:
+        rest, anchored = token[markers[-1].end():], True
+    elif token.startswith(("/", "~")) or "$" in token:
+        return None, False
     else:
-        if token.startswith(("/", "~")) or "$" in token.split("/")[0]:
-            return None
-    if not token:
-        return None
-    normalised = posixpath.normpath(token)
+        rest, anchored = token, False
+
+    if not rest:
+        return None, False
+    normalised = posixpath.normpath(rest)
     if normalised == ".." or normalised.startswith("../"):
-        return None
-    return normalised
+        return None, False
+    return normalised, anchored
 
 
-def is_dev_only(rel: str | None) -> bool:
-    """True when `rel` reaches *into* a dev-only tree.
-
-    A separator is required. The bare word is not enough and matching it is a
-    live source of noise: `mcp-servers.json` passes `--tools docs docs_preview`,
-    which are tool names.
-    """
-    if not rel or "/" not in rel.rstrip("/"):
+def is_dev_only(rel: str | None, anchored: bool = False) -> bool:
+    """True when `rel` names a dev-only tree, or something inside one."""
+    if not rel:
         return False
-    return rel.split("/")[0] in DEV_ONLY
+    if rel.split("/")[0] not in DEV_ONLY:
+        return False
+    if anchored:
+        # `$HOME/.claude/tests` is the directory, separator or not --
+        # `cd $HOME/.claude/tests && bash x.sh` is the shape this catches.
+        return True
+    # Unanchored, a separator is required. The bare word is a live source of
+    # noise: `mcp-servers.json` passes `--tools docs docs_preview`, tool names.
+    return "/" in rel.rstrip("/")
 
 
 def dev_paths_in(text: str) -> list[str]:
     """Every dev-only path token in a declared command line."""
     out = []
     for token in _TOKEN_SPLIT.split(text):
-        bare = token.strip().strip("\"'")
-        if bare and is_dev_only(to_repo_relative(bare)):
+        bare = token.strip()
+        if not bare:
+            continue
+        rel, anchored = to_repo_relative(bare)
+        if is_dev_only(rel, anchored):
             out.append(bare)
     return out
 
@@ -145,6 +194,18 @@ def line_of(text: str, needle: str) -> int:
 
 # --------------------------------------------------------------------------- A/B
 
+# Top-level settings fields the harness runs as a command. Each is present in
+# the installed harness's own settings schema (checked against claude-code
+# 2.1.288); hooks and statusLine are not the only two, and an earlier revision
+# of this lint read only those.
+HELPER_COMMAND_FIELDS = (
+    "apiKeyHelper",
+    "awsAuthRefresh",
+    "awsCredentialExport",
+    "otelHeadersHelper",
+)
+
+
 def command_strings_in_settings(data: dict) -> list[tuple[str, str]]:
     """(label, command) for every field a harness treats as a command line."""
     found: list[tuple[str, str]] = []
@@ -157,6 +218,22 @@ def command_strings_in_settings(data: dict) -> list[tuple[str, str]]:
     status = data.get("statusLine")
     if isinstance(status, dict) and isinstance(status.get("command"), str):
         found.append(("statusLine", status["command"]))
+    for field in HELPER_COMMAND_FIELDS:
+        value = data.get(field)
+        if isinstance(value, str):
+            found.append((field, value))
+    # `env` is not run directly, and reaches every hook anyway: BASH_ENV is
+    # sourced by each non-interactive bash, PYTHONPATH decides what `import`
+    # resolves to. A dev-only path here is an execution path.
+    for name, value in (data.get("env") or {}).items():
+        if isinstance(value, str):
+            found.append((f"env.{name}", value))
+    # A marketplace source path is loaded as plugin code.
+    for name, entry in (data.get("extraKnownMarketplaces") or {}).items():
+        source = entry.get("source") if isinstance(entry, dict) else None
+        path = source.get("path") if isinstance(source, dict) else None
+        if isinstance(path, str):
+            found.append((f"extraKnownMarketplaces.{name}.source.path", path))
     return found
 
 
@@ -174,7 +251,7 @@ def check_settings(root: Path) -> list[Violation]:
         for hit in dev_paths_in(command):
             out.append(Violation(
                 "settings.json", line_of(raw, hit),
-                f"{label} command executes dev-only path '{hit}' -- "
+                f"{label} command names dev-only path '{hit}' -- "
                 "hooks run outside the sandbox and outside deny rules",
             ))
     return out
@@ -195,11 +272,14 @@ def check_mcp_servers(root: Path) -> list[Violation]:
         if not isinstance(spec, dict):
             continue
         words = [spec.get("command", "")] + [str(a) for a in spec.get("args", []) or []]
+        # Same reasoning as settings `env`: the server's environment decides
+        # what its interpreter loads.
+        words += [str(v) for v in (spec.get("env") or {}).values()]
         for word in words:
             for hit in dev_paths_in(str(word)):
                 out.append(Violation(
                     "mcp-servers.json", line_of(raw, hit),
-                    f"server '{name}' runs dev-only path '{hit}' -- "
+                    f"server '{name}' names dev-only path '{hit}' -- "
                     "MCP servers run with full user access",
                 ))
     return out
