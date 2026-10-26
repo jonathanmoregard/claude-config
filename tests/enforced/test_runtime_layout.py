@@ -369,17 +369,40 @@ def test_an_absolute_target_cannot_traverse_out_of_the_allowlist(tmp_path):
     assert "/home/jonathan/Repos/claude-config/tests" in proc.stderr, proc.stderr
 
 
-def test_a_skills_hm_target_is_declared_and_merely_unverifiable(tmp_path):
-    """The second legitimate way out of the projection, next to vendor/.
+def test_a_declared_absolute_target_is_merely_unverifiable(tmp_path):
+    """The one remaining legitimate way out of the projection, next to vendor/.
 
-    home-manager owns four skills so they go through nixos-config's gate, and
-    `skills/` is read-only once the mounts are up -- so it writes them to
-    ~/.claude/skills-hm/ and this repo links in. The link is absolute because
-    that is the only spelling correct both on disk and under the mounts.
+    `skills/review-inbox` and `hooks/router-nudge-hook` load live config out of
+    ~/Repos/router-agent, which no mount covers. Absolute is the only spelling
+    correct both on disk and under the mounts, and existence is not answerable
+    from another machine -- so the expected outcome is the named third one,
+    neither a pass nor a failure.
 
-    Absent on this machine until that nixos-config change deploys, so the
-    expected outcome is the named third outcome, not a pass and not a failure.
+    There used to be a second declared prefix, ~/.claude/skills-hm, for the
+    four skills home-manager owned. They are real files in runtime/skills/ now
+    (see the test below), and the prefix went with them.
     """
+    root = make_repo(
+        tmp_path,
+        {"runtime/hooks/guard.py": "pass\n"},
+        {"runtime/skills/review-inbox":
+            f"{layout.HOME}/Repos/router-agent/skills/review-inbox"},
+    )
+    proc = run(root, "--verify")
+    assert proc.returncode == 0, proc.stderr
+    assert "not checkable here" in proc.stdout
+    assert "router-agent/skills/review-inbox" in proc.stdout
+
+
+def test_skills_hm_is_no_longer_a_declared_prefix(tmp_path):
+    """The indirection is gone, so the escape hatch for it must be gone too.
+
+    Leaving the prefix in ALLOWED_ABSOLUTE after the skills became real files
+    would keep a path out of the projection open for no reason, and the next
+    link spelled that way would pass review silently.
+    """
+    assert not any("skills-hm" in a for a in layout.ALLOWED_ABSOLUTE), \
+        layout.ALLOWED_ABSOLUTE
     root = make_repo(
         tmp_path,
         {"runtime/hooks/guard.py": "pass\n"},
@@ -387,58 +410,75 @@ def test_a_skills_hm_target_is_declared_and_merely_unverifiable(tmp_path):
             f"{layout.HOME}/.claude/skills-hm/nixos-config-dev"},
     )
     proc = run(root, "--verify")
-    assert proc.returncode == 0, proc.stderr
-    assert "not checkable here" in proc.stdout
-    assert "skills-hm/nixos-config-dev" in proc.stdout
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "ALLOWED_ABSOLUTE" in proc.stderr, proc.stderr
 
 
-HOME_MANAGER_SKILLS = (
+NIXOS_SKILLS = (
     "nixos-config-dev",
     "nixos-automated-testing",
     "nixos-agent-testing",
     "nixos-agenix-secret",
+    "nixos-binary-debug",
 )
 
 
-@pytest.mark.parametrize("name", HOME_MANAGER_SKILLS)
-def test_the_home_manager_skills_link_into_skills_hm(name):
-    """Pinned so the four cannot be dropped or quietly retargeted.
+@pytest.mark.parametrize("name", NIXOS_SKILLS)
+def test_the_nixos_skills_are_real_files_here(name):
+    """Pinned as real content, because the indirection is what got deleted.
 
-    They are the live half of the arrangement above. A link retargeted back
-    into `skills/` would fail the next `nixos-rebuild switch`, and at rebuild
-    time rather than here -- so assert the target text, from the index.
+    nixos-config used to own these as home.file targets and this repository
+    linked out to ~/.claude/skills-hm -- a second location, four absolute
+    symlinks and an allowlist entry, all of it there because a home.file
+    target inside a read-only projection fails the next `nixos-rebuild
+    switch`. Owning the files removed the premise.
+
+    Asserted from the INDEX, not the working tree: mode 100644 is a regular
+    file and 120000 is a symlink, so a change back to the old arrangement --
+    or a well-meant symlink to some other checkout -- fails here rather than
+    at cutover.
     """
-    path = f"{layout.RUNTIME_DIR}/skills/{name}"
-    target = subprocess.run(["git", "cat-file", "-p", f":{path}"],
-                            cwd=REPO_ROOT, capture_output=True, text=True)
-    assert target.returncode == 0, f"{path} is not tracked: {target.stderr}"
-    assert target.stdout.strip() == f"{layout.HOME}/.claude/skills-hm/{name}"
+    path = f"{layout.RUNTIME_DIR}/skills/{name}/SKILL.md"
+    entry = subprocess.run(["git", "ls-files", "-s", "--", path],
+                           cwd=REPO_ROOT, capture_output=True, text=True)
+    assert entry.returncode == 0, entry.stderr
+    assert entry.stdout.strip(), f"{path} is not tracked"
+    mode = entry.stdout.split()[0]
+    assert mode == "100644", f"{path} is mode {mode}, expected a regular file"
+
+    directory = subprocess.run(
+        ["git", "ls-files", "-s", "--", f"{layout.RUNTIME_DIR}/skills/{name}"],
+        cwd=REPO_ROOT, capture_output=True, text=True)
+    assert "120000" not in directory.stdout, (
+        f"{layout.RUNTIME_DIR}/skills/{name} still contains a symlink; the "
+        f"skills-hm indirection is back:\n{directory.stdout}")
 
 
-@pytest.mark.parametrize("name", HOME_MANAGER_SKILLS)
-def test_the_skills_hm_links_are_not_swallowed_by_gitignore(name):
-    """These links must stay addable, and .gitignore is the way that breaks.
+@pytest.mark.parametrize("name", NIXOS_SKILLS)
+def test_the_nixos_skills_are_not_swallowed_by_gitignore(name):
+    """These paths must stay addable, and .gitignore is the way that breaks.
 
-    The repo already ignores `skills/nixos-config-dev` and friends, for
-    home-manager's /nix/store symlinks in the live ~/.claude checkout. That
-    looks like it would swallow `runtime/skills/nixos-config-dev` too, and the
-    assumption here was that it did -- it does not: a pattern with a slash
-    anywhere but the end is relative to the .gitignore's own directory
-    (gitignore(5)), so those five are root-anchored already.
+    The repository used to ignore `skills/nixos-config-dev` and four siblings,
+    for home-manager's /nix/store symlinks in the live flat ~/.claude checkout.
+    Those rules are deleted now -- nothing writes `skills/` at the repository
+    root any more -- but the shape that would have been dangerous is unchanged,
+    so this keeps asking.
 
-    What *would* reach these links is a bare `nixos-config-dev` or a
-    `**/nixos-config-dev`. Tracked content survives a later ignore rule, so such
-    a rule would not unstage anything; it would make the next link of this kind
-    impossible to add, with `git add` silently doing nothing. Asked of git
-    rather than by grepping for a leading slash, so any rule shape that reaches
-    them fails this regardless of how it is spelled.
+    A pattern with a slash anywhere but the end is relative to the .gitignore's
+    own directory (gitignore(5)), so `skills/nixos-config-dev` never reached
+    `runtime/skills/nixos-config-dev`. A bare `nixos-config-dev` or a
+    `**/nixos-config-dev` would. Tracked content survives a later ignore rule,
+    so such a rule unstages nothing; it makes the next file here impossible to
+    add, with `git add` silently doing nothing. Asked of git rather than by
+    grepping for a leading slash, so any rule shape that reaches them fails
+    this regardless of how it is spelled.
     """
     # --no-index is load-bearing, not tidiness: without it `git check-ignore`
     # skips paths that are in the index and reports no match, so this test
-    # passed for every tracked link no matter what rules existed. Proven by
+    # passed for every tracked path no matter what rules existed. Proven by
     # simulating an unanchored rule through core.excludesFile: without the
     # flag the probe returns 1 (test passes), with it 0 (test fails). These
-    # five links are tracked by definition, which is what made the blind spot
+    # paths are tracked by definition, which is what made the blind spot
     # total. The sibling probes in tests/test_harness_runtime_dirs_ignored.py
     # already used the flag.
     proc = subprocess.run(
