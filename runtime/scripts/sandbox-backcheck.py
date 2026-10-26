@@ -178,6 +178,54 @@ def _collect_substitutions(text: str, subs: list, where: str, depth: int = 0) ->
         raise Unparseable(f"{where}-substitution-too-deep") from exc
 
 
+def _collect_heredoc_expansions(body: str, subs: list, depth: int = 0) -> None:
+    """Append every command substitution in an *unquoted* heredoc body to `subs`.
+
+    An unquoted body expands as if it were double-quoted, except that `"` is an
+    ordinary character too. So single quotes do not quote, `#` does not start a
+    comment, and only a backslash before `$`, a backtick, another backslash or a
+    newline suppresses expansion. Handing the body to `_collect_substitutions`
+    instead -- which scans it as *shell source* -- therefore walked right past
+    `'$(cmd)'` and `# $(cmd)`, both of which run, and reported ok.
+
+    The `$( )` and backtick bodies found here are shell, so they are appended as
+    substitutions for the caller to classify; only the surrounding body needs
+    these different rules.
+    """
+    if not _SUB_START.search(body):
+        return
+    if depth >= _MAX_SUBSTITUTION_SCAN_DEPTH:
+        raise Unparseable("heredoc-substitution-too-deep")
+    i = 0
+    n = len(body)
+    while i < n:
+        c = body[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "`":
+            j = _match_backtick(body, i + 1)
+            subs.append(("cmd", body[i + 1:j]))
+            i = j + 1
+            continue
+        if c != "$":
+            i += 1
+            continue
+        if body.startswith("$((", i):
+            j = _match_paren(body, i + 3)
+            if body[j + 1:j + 2] != ")":
+                raise Unparseable("unbalanced-arithmetic")
+            _collect_substitutions(body[i + 3:j], subs, "heredoc-arithmetic", depth)
+            i = j + 2
+            continue
+        if body[i + 1:i + 2] == "(":
+            j = _match_paren(body, i + 2)
+            subs.append(("cmd", body[i + 2:j]))
+            i = j + 1
+            continue
+        i += 1
+
+
 def prescan(text: str, substitution_scan_depth: int = 0) -> Scan:
     segs: list = []
     subs: list = []
@@ -227,6 +275,15 @@ def prescan(text: str, substitution_scan_depth: int = 0) -> Scan:
             j = text.find("}", i + 2)
             if j == -1:
                 raise Unparseable("unbalanced-brace-expansion")
+            # `${x:-$(touch /x)}` runs that touch when x is unset. Whether it
+            # does is not knowable here, so collect it and let it classify --
+            # the same fail-closed direction the rest of this scanner takes.
+            # Measured against bash: a backtick or $( ) in the default word
+            # runs, and single quotes inside the braces do suppress it, which
+            # is exactly what scanning the braces as shell source gets right.
+            _collect_substitutions(
+                text[i + 2:j], subs, "parameter", substitution_scan_depth
+            )
             cur.append(f"{VAR}{text[i + 2:j]}{VAR_END}")
             return j + 1
         m = _NAME_RE.match(text, i + 1)
@@ -424,6 +481,11 @@ def prescan(text: str, substitution_scan_depth: int = 0) -> Scan:
                 j = _match_paren(text, i + 2)
                 if text[j + 1:j + 2] != ")":
                     raise Unparseable("unbalanced-arithmetic")
+                # Same reason as the `$((` branch in dollar(): the value is not
+                # interesting, but `(( $(touch /x) + 1 ))` runs that touch.
+                _collect_substitutions(
+                    text[i + 2:j], subs, "arithmetic", substitution_scan_depth
+                )
                 flush(";")
                 i = j + 2
                 continue
@@ -447,8 +509,8 @@ def prescan(text: str, substitution_scan_depth: int = 0) -> Scan:
     flush("")
     for heredoc in heredocs:
         if not heredoc["quoted"]:
-            _collect_substitutions(
-                heredoc["body"], subs, "heredoc", substitution_scan_depth
+            _collect_heredoc_expansions(
+                heredoc["body"], subs, substitution_scan_depth
             )
     return Scan(segs, funcs, subs, heredocs)
 

@@ -154,10 +154,79 @@ def test_tab_stripped_heredoc_substitution_is_classified():
     assert_write_break(result, "/outside/x")
 
 
-def test_pathological_heredoc_nesting_becomes_unknown():
+def test_unquoted_heredoc_expands_substitution_inside_single_quotes():
+    command = "cat <<EOF\n'$(touch /outside/x)'\nEOF"
+
+    assert_write_break(classify(command), "/outside/x")
+
+
+def test_unquoted_heredoc_expands_substitution_after_hash():
+    command = "cat <<EOF\n# $(touch /outside/x)\nEOF"
+
+    assert_write_break(classify(command), "/outside/x")
+
+
+def test_unquoted_heredoc_expands_backtick_inside_single_quotes():
+    command = "cat <<EOF\n'`touch /outside/x`'\nEOF"
+
+    assert_write_break(classify(command), "/outside/x")
+
+
+def test_unquoted_heredoc_honours_backslash_escaped_substitution():
+    # A backslash is one of the few things that *does* suppress expansion in an
+    # unquoted body, so this must stay ok -- it is the negative control that
+    # stops the scanner from passing by grepping for "$(".
+    command = "cat <<EOF\n\\$(touch /outside/x)\nEOF"
+
+    assert classify(command)["status"] == "ok"
+
+
+def test_arithmetic_command_classifies_nested_command_substitution():
+    assert_write_break(classify("(( $(touch /outside/x) + 1 ))"), "/outside/x")
+
+
+def test_arithmetic_command_classifies_nested_backtick_substitution():
+    assert_write_break(classify("(( `touch /outside/x` + 1 ))"), "/outside/x")
+
+
+def test_parameter_default_classifies_command_substitution():
+    assert_write_break(classify("echo ${x:-$(touch /outside/x)}"), "/outside/x")
+
+
+def test_parameter_default_classifies_backtick_substitution():
+    assert_write_break(classify("echo ${x:-`touch /outside/x`}"), "/outside/x")
+
+
+def test_parameter_default_in_double_quotes_is_classified():
+    assert_write_break(classify('echo "${x:-$(touch /outside/x)}"'), "/outside/x")
+
+
+def test_parameter_default_single_quoted_does_not_expand():
+    # Single quotes inside ${...} really do suppress expansion -- checked
+    # against bash -- so this must stay ok.
+    assert classify("echo ${x:-'$(touch /outside/x)'}")["status"] == "ok"
+
+
+def test_stacked_heredoc_openers_classify_the_substitution():
+    # This shape *looks* like 40 nested heredocs, and the old body scanner read
+    # it that way and ran out of depth, returning unknown. Bash sees exactly
+    # one heredoc: EOF0's body ends at the only line equal to "EOF0", the last
+    # one, so every "cat <<EOFi" line below it is just text in that body -- and
+    # the substitution in it runs. Verified against bash before changing this
+    # expectation from unknown to breaks.
     depth = 40
     starts = "".join(f"cat <<EOF{i}\n" for i in range(depth))
     ends = "".join(f"EOF{i}\n" for i in reversed(range(depth)))
     command = starts + "$(touch /outside/x)\n" + ends
+
+    assert_write_break(classify(command), "/outside/x")
+
+
+def test_pathological_substitution_nesting_becomes_unknown():
+    # The depth cap that the test above used to exercise by accident. Nested
+    # substitutions are what actually recurse, so nest those instead: too deep
+    # to scan must stay unknown, never ok.
+    depth = 40
+    command = "echo " + "$(" * depth + "touch /outside/x" + ")" * depth
 
     assert classify(command)["status"] == "unknown"
