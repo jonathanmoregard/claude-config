@@ -28,11 +28,18 @@ behaviour, in both directions, because both failure modes are silent:
 
 They establish nothing about whether dev-only code can be executed. It can:
 anything that does not name the path in these two files passes untouched. The
-boundary is those trees not being in the agent's mounted view at all --
-read-only is a separate property that stops writes, while what stops access is
-the exclusion. Do not let a green run here be read as isolation.
+property the restructure aims at is narrower than it sounds -- the dev trees
+are not among the paths projected into `~/.claude`, so nothing the harness
+loads on its own initiative reaches them, while the repository itself stays
+readable at its new location by anyone who names it. Do not let a green run
+here be read as isolation.
 
-Run:  nix shell nixpkgs#python3Packages.pytest -c pytest tests/test_lint_runtime_entrypoints.py -q
+WHERE THIS LIVES. `tests/enforced/` is the directory the required `checks` job
+runs whole, so a suite guarding this repository's own guards is covered by
+being here rather than by being named in the workflow. A suite added here is
+enforced from its first commit; one added elsewhere is not run by CI at all.
+
+Run:  nix shell nixpkgs#python3Packages.pytest -c pytest tests/enforced -q
 """
 
 from __future__ import annotations
@@ -44,7 +51,7 @@ from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parents[2]
 LINT = REPO_ROOT / "scripts" / "lint-runtime-entrypoints.py"
 
 
@@ -358,14 +365,19 @@ def test_a_path_list_of_runtime_trees_is_still_clean(tmp_path):
 
 
 def test_an_mcp_server_env_path_list_is_checked(tmp_path):
-    """Same hole, same fix, on the other side of check B."""
+    """Same hole, same fix, on the other side of check B.
+
+    The entry is the bare directory on purpose. `$HOME/.claude/tests/stubs:...`
+    was caught even before the separator fix, because the unsplit token still
+    began `tests/` -- so writing it that way here would have tested nothing.
+    """
     root = make_repo(tmp_path, {
         "settings.json": settings("python3 $HOME/.claude/hooks/ok.py"),
         "hooks/ok.py": "pass\n",
         "mcp-servers.json": json.dumps({"mcpServers": {"broker": {
             "command": "python3",
             "args": ["$HOME/.claude/mcps/broker/server.py"],
-            "env": {"PYTHONPATH": "$HOME/.claude/tests/stubs:/usr/lib/python3"},
+            "env": {"PYTHONPATH": "$HOME/.claude/tests:/usr/lib/python3"},
         }}}, indent=2),
         "mcps/broker/server.py": "pass\n",
         "tests/stubs/.keep": "",

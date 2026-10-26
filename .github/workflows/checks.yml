@@ -37,10 +37,16 @@ jobs:
       - name: No declared entrypoint names a dev-only tree
         run: python3 scripts/lint-runtime-entrypoints.py
 
-      - name: The lint still detects what it is for
+      # The whole directory, never a list of files. A suite that guards one of
+      # this repository's own guards is itself a measuring instrument, and an
+      # instrument CI does not run is not protected by requiring this job --
+      # which is exactly what an enumerated list produces, silently, the first
+      # time someone adds a suite and forgets this file. `tests/enforced/` is
+      # the convention: land a suite there and it is enforced from that commit.
+      - name: The guards still detect what they are for
         run: |
           python3 -m pip install --disable-pip-version-check --quiet 'pytest>=8,<9'
-          python3 -m pytest tests/test_lint_runtime_entrypoints.py -q
+          python3 -m pytest tests/enforced -q
 
       - name: The master pin holds
         run: bash tests/test_worktree_policy.sh

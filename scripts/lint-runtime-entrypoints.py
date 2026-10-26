@@ -54,12 +54,23 @@ either: Semgrep's taint mode is intra-procedural and Python-only, ShellCheck
 has no dataflow, and CodeQL is a heavy instrument for a question whose real
 answer is a kernel one.
 
-The boundary is **the dev trees not being in the agent's mounted view at all**.
-Read-only is a separate property that stops writes; what stops access is the
-exclusion -- `tests/`, `docs/`, `experiments/` and `research/` are simply not
-among the paths projected into `~/.claude`, so no subprocess, hook or MCP
-server can open them however it spells the path. This lint only catches the
-entrypoint edit that would otherwise go unnoticed in review.
+What the planned restructure delivers is **controlled runtime deployment**, and
+the precise wording matters because the looser one is false. Everything the
+harness loads on its own initiative -- hooks, memory, skills, MCP servers --
+resolves under `~/.claude`, and `tests/`, `docs/`, `experiments/` and
+`research/` are not among the paths projected there, so no spelling of a path
+under `~/.claude` reaches them. Read-only is a separate property, and it only
+stops writes; what stops access is the exclusion.
+
+It is **not** filesystem isolation. The repository still exists at
+`~/Repos/claude-config`, and any agent, hook or MCP server that names that path
+reads `tests/` exactly as before -- directly, through a symlink, or through a
+worktree. Making the trees genuinely unreachable needs a deny rule over the
+checkout or a per-session namespace, which is separate work. Claim the first
+property; the second would be untrue the moment someone types the repo path.
+
+This lint catches neither. It catches the entrypoint edit that would otherwise
+go unnoticed in review.
 
     lint-runtime-entrypoints.py [--repo-root DIR] [--quiet]
 
