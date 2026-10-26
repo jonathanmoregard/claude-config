@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# Stub `cargo` for the advisory scenarios. Every call is logged to
+# $E2E_RUN/cargo.log. The workspace's Cargo.lock pins rustls-webpki 0.103.3,
+# which `cargo deny` / `cargo audit` flag. $E2E_RUN/advisory-mode picks whether
+# a patched 0.103.4 exists (`patched`) or not (`nopatch`). Everything else
+# (fmt, clippy, test, build) succeeds.
+set -uo pipefail
+printf '%s\t%s\n' "$PWD" "$*" >> "$E2E_RUN/cargo.log"
+mode="$(cat "$E2E_RUN/advisory-mode" 2>/dev/null || echo patched)"
+ADV=RUSTSEC-2026-0104
+
+[[ "${1:-}" == +* ]] && shift
+root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+prev=""
+for a in "$@"; do
+  [ "$prev" = --manifest-path ] && root="$(cd "$(dirname "$a")" && pwd)"
+  case "$a" in --manifest-path=*) root="$(cd "$(dirname "${a#*=}")" && pwd)" ;; esac
+  prev="$a"
+done
+lock="$root/Cargo.lock"
+cur="$(awk '/^name = "rustls-webpki"/{getline; gsub(/version = |"/,""); print; exit}' "$lock" 2>/dev/null)"
+ignored() { grep -qs "$ADV" "$root/deny.toml" "$root/.cargo/audit.toml"; }
+vulnerable() { [ "$cur" = 0.103.3 ] && ! ignored; }
+set_version() { sed -i "/^name = \"rustls-webpki\"/{n;s/version = \".*\"/version = \"$1\"/}" "$lock"; }
+
+solution() {
+  if [ "$mode" = patched ]; then
+    echo '   ├ Solution: Upgrade to >=0.103.4, <0.104.0-0 (try `cargo update -p rustls-webpki`)'
+  else
+    echo '   ├ Solution: No safe upgrade is available!'
+  fi
+}
+
+case "${1:-}" in
+  deny)
+    echo "    Fetching advisory database from \`https://github.com/RustSec/advisory-db\`" >&2
+    if vulnerable; then
+      cat >&2 <<EOF
+error[vulnerability]: rustls-webpki: CRL distribution point check accepts certificates from an unrelated issuer
+   ┌─ $lock:41:1
+   │
+41 │ rustls-webpki 0.103.3 registry+https://github.com/rust-lang/crates.io-index
+   │ --------------------------------------------------------------------------- security vulnerability detected
+   │
+   ├ ID: $ADV
+   ├ Advisory: https://rustsec.org/advisories/$ADV
+   ├ When a certificate revocation list is checked, rustls-webpki matched the
+     distribution point of an unrelated issuer, so a revoked certificate could
+     still be accepted.
+   ├ Announcement: https://github.com/rustls/webpki/security/advisories
+$(solution)
+   ├ rustls-webpki v0.103.3
+     └── rustls v0.23.31
+         └── widget v0.1.0
+
+advisories FAILED, bans ok, licenses ok, sources ok
+EOF
+      exit 1
+    fi
+    echo "advisories ok, bans ok, licenses ok, sources ok" >&2 ;;
+  audit)
+    echo "    Fetching advisory database from \`https://github.com/RustSec/advisory-db.git\`"
+    if vulnerable; then
+      printf 'Crate:     rustls-webpki\nVersion:   0.103.3\nID:        %s\n' "$ADV"
+      [ "$mode" = patched ] && echo "Solution:  Upgrade to >=0.103.4, <0.104.0-0" \
+                            || echo "Solution:  No fixed upgrade is available!"
+      echo "error: 1 vulnerability found!"; exit 1
+    fi
+    echo "Success No vulnerable packages found" ;;
+  update)
+    want=""; target=""; prev=""
+    for a in "${@:2}"; do
+      [ "$prev" = --precise ] && want="$a"
+      [ "$prev" = -p ] || [ "$prev" = --package ] && target="$a"
+      case "$a" in rustls-webpki*) target="rustls-webpki" ;; esac
+      prev="$a"
+    done
+    if [ -n "$target" ] && [ "$target" != rustls-webpki ]; then
+      echo "    Updating crates.io index" >&2; echo "     Locking 0 packages to latest compatible versions" >&2; exit 0
+    fi
+    if [ "$mode" = nopatch ]; then
+      if [ -n "$want" ] && [ "$want" != 0.103.3 ]; then
+        echo "error: failed to select a version for the requirement \`rustls-webpki = \"=$want\"\`" >&2
+        echo "candidate versions found which didn't match: 0.103.3, 0.103.2, 0.103.1, ..." >&2; exit 101
+      fi
+      echo "    Updating crates.io index" >&2; echo "     Locking 0 packages to latest compatible versions" >&2; exit 0
+    fi
+    if [ -n "$want" ] && [ "$want" != 0.103.4 ] && [ "$want" != 0.103.3 ]; then
+      echo "error: failed to select a version for the requirement \`rustls-webpki = \"=$want\"\`" >&2
+      echo "candidate versions found which didn't match: 0.103.4, 0.103.3, 0.103.2, ..." >&2; exit 101
+    fi
+    new="${want:-0.103.4}"
+    echo "    Updating crates.io index" >&2
+    if [ "$cur" != "$new" ]; then
+      echo "     Locking 1 package to latest compatible version" >&2
+      echo "    Updating rustls-webpki v$cur -> v$new" >&2
+      set_version "$new"
+    else
+      echo "     Locking 0 packages to latest compatible versions" >&2
+    fi ;;
+  tree)
+    printf 'rustls-webpki v%s\n└── rustls v0.23.31\n    └── widget v0.1.0 (%s)\n' "${cur:-0.103.3}" "$root" ;;
+  search|info)
+    latest=0.103.4; [ "$mode" = nopatch ] && latest=0.103.3
+    echo "rustls-webpki = \"$latest\"    # Web PKI X.509 Certificate Verification." ;;
+  test)
+    echo "   Compiling widget v0.1.0 ($root)" >&2
+    echo "    Finished \`test\` profile [unoptimized + debuginfo] target(s) in 3.10s" >&2
+    names="$(grep -A1 '#\[test\]' "$root/src/lib.rs" | sed -n 's/.*fn \([a-z_0-9]*\).*/\1/p')"
+    echo "running $(echo "$names" | grep -c .) tests"
+    for t in $names; do echo "test tests::$t ... ok"; done
+    printf '\ntest result: ok. %s passed; 0 failed; 0 ignored\n' "$(echo "$names" | grep -c .)" ;;
+  build|check|clippy)
+    echo "    Checking widget v0.1.0 ($root)" >&2
+    echo "    Finished \`dev\` profile [unoptimized + debuginfo] target(s) in 1.42s" >&2 ;;
+  *) : ;;
+esac
+exit 0

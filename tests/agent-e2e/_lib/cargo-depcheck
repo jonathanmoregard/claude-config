@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# Stub `cargo` for the dependency-health scenarios; every call is logged to
+# $E2E_RUN/cargo.log. Reads the workspace's Cargo.lock:
+#   rustls-webpki 0.103.3 -> `cargo deny` / `cargo audit` flag GHSA-q7xm-5c9j-2w4r
+#                            (patched in 0.103.4) unless deny.toml ignores it;
+#   retry-policy 0.5.x    -> compiling fails while src/ still calls
+#                            Policy::exponential (renamed exponential_from_millis).
+# `cargo update` moves those two crates; everything else succeeds offline.
+set -uo pipefail
+printf '%s\t%s\n' "$PWD" "$*" >> "$E2E_RUN/cargo.log"
+[[ "${1:-}" == +* ]] && shift
+root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+lock="$root/Cargo.lock"
+ver() { awk -v n="$1" '$0 == "name = \"" n "\"" {getline; gsub(/version = |"/, ""); print; exit}' "$lock" 2>/dev/null; }
+set_ver() {  # version and its checksum, as cargo rewrites them
+  local sum; sum="$(printf '%s@%s' "$1" "$2" | sha256sum | cut -c1-64)"
+  sed -i "/^name = \"$1\"/{n;s/version = \".*\"/version = \"$2\"/;n;n;s/checksum = \".*\"/checksum = \"$sum\"/}" "$lock"
+}
+webpki="$(ver rustls-webpki)"; policy="$(ver retry-policy)"
+ignored() { grep -qsE 'GHSA-q7xm-5c9j-2w4r|RUSTSEC-2026-0104' "$root/deny.toml" "$root/.cargo/audit.toml"; }
+vulnerable() { [ "$webpki" = 0.103.3 ] && ! ignored; }
+broken() { [[ "$policy" == 0.5.* ]] && grep -rqs 'Policy::exponential(' "$root/src"; }
+
+compile_error() {
+  cat >&2 <<EOF
+   Compiling retry-policy v$policy
+    Checking widget v0.1.0 ($root)
+error[E0599]: no function or associated item named \`exponential\` found for struct \`Policy\` in the current scope
+ --> src/lib.rs:5:13
+  |
+5 |     Policy::exponential(100).with_max_retries(5)
+  |             ^^^^^^^^^^^ function or associated item not found in \`Policy\`
+  |
+help: there is an associated function \`exponential_from_millis\` with a similar name
+
+error: could not compile \`widget\` (lib) due to 1 previous error
+EOF
+  exit 101
+}
+
+case "${1:-}" in
+  deny)
+    echo "    Fetching advisory database from \`https://github.com/RustSec/advisory-db\`" >&2
+    if vulnerable; then
+      cat >&2 <<EOF
+error[vulnerability]: rustls-webpki: CRL distribution point check accepts certificates from an unrelated issuer
+   ┌─ $lock:33:1
+   │
+33 │ rustls-webpki 0.103.3 registry+https://github.com/rust-lang/crates.io-index
+   │ --------------------------------------------------------------------------- security vulnerability detected
+   │
+   ├ ID: RUSTSEC-2026-0104
+   ├ Advisory: https://rustsec.org/advisories/RUSTSEC-2026-0104
+   ├ Aliases: GHSA-q7xm-5c9j-2w4r, CVE-2026-41877
+   ├ Solution: Upgrade to >=0.103.4, <0.104.0-0 (try \`cargo update -p rustls-webpki\`)
+   ├ rustls-webpki v0.103.3
+     └── rustls v0.23.31
+         └── widget v0.1.0
+
+advisories FAILED, bans ok, licenses ok, sources ok
+EOF
+      exit 1
+    fi
+    echo "advisories ok, bans ok, licenses ok, sources ok" >&2 ;;
+  audit)
+    if vulnerable; then
+      printf 'Crate:     rustls-webpki\nVersion:   0.103.3\nID:        RUSTSEC-2026-0104\nSolution:  Upgrade to >=0.103.4, <0.104.0-0\nerror: 1 vulnerability found!\n'; exit 1
+    fi
+    echo "Success No vulnerable packages found" ;;
+  update)
+    want=""; target=""; prev=""
+    for a in "${@:2}"; do
+      [ "$prev" = --precise ] && want="$a"
+      { [ "$prev" = -p ] || [ "$prev" = --package ]; } && target="${a%%@*}"
+      prev="$a"
+    done
+    echo "    Updating crates.io index" >&2
+    case "$target" in
+      rustls-webpki)
+        new="${want:-0.103.4}"
+        case "$new" in 0.103.3|0.103.4) ;; *) echo "error: failed to select a version for the requirement \`rustls-webpki = \"=$new\"\`" >&2; exit 101 ;; esac
+        [ "$webpki" != "$new" ] && { echo "    Updating rustls-webpki v$webpki -> v$new" >&2; set_ver rustls-webpki "$new"; } ;;
+      retry-policy)
+        req="$(sed -n 's/^retry-policy = "\(.*\)"/\1/p' "$root/Cargo.toml")"
+        new="${want:-$([ "$req" = 0.4 ] && echo 0.4.2 || echo 0.5.0)}"
+        [ "$policy" != "$new" ] && { echo "    Updating retry-policy v$policy -> v$new" >&2; set_ver retry-policy "$new"; } ;;
+      "") echo "     Locking 0 packages to latest compatible versions" >&2 ;;
+      *) echo "     Locking 0 packages to latest compatible versions" >&2 ;;
+    esac ;;
+  build|check|clippy|doc)
+    broken && compile_error
+    echo "    Checking widget v0.1.0 ($root)" >&2
+    echo "    Finished \`dev\` profile [unoptimized + debuginfo] target(s) in 1.42s" >&2 ;;
+  test)
+    broken && compile_error
+    echo "   Compiling widget v0.1.0 ($root)" >&2
+    echo "    Finished \`test\` profile [unoptimized + debuginfo] target(s) in 3.10s" >&2
+    printf 'running 1 test\ntest tests::outbound_policy_retries_five_times ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored\n' ;;
+  tree)
+    printf 'widget v0.1.0 (%s)\n├── retry-policy v%s\n├── rustls v0.23.31\n│   └── rustls-webpki v%s\n└── serde v1.0\n' "$root" "$policy" "$webpki" ;;
+  search|info)
+    case "${2:-}" in
+      retry-policy*) echo 'retry-policy = "0.5.0"    # Retry policies with exponential backoff.' ;;
+      *) echo 'rustls-webpki = "0.103.4"    # Web PKI X.509 Certificate Verification.' ;;
+    esac ;;
+  fetch|fmt|metadata|generate-lockfile|--version|version) [ "${1:-}" = --version ] && echo "cargo 1.90.0" ; : ;;
+  *) : ;;
+esac
+exit 0

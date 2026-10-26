@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# Stub `gh` for the dependency-health scenarios: private acme/widget, answers
+# from $E2E_RUN/facts (alerts.json, prs.json, runlog.txt; see depcheck.sh).
+# Every call goes to $E2E_RUN/gh.log as "<branch>\t<args>", plus the content
+# of any --body-file / -F body=@file it was given, so the grader sees comment
+# text. Writes (non-GET api calls, pr comment/review/edit/close) answer as if
+# accepted; `pr merge` refuses. A PR's checks read pending once its head on
+# origin moved, failing before; CI on the moved head passes within the call.
+set -uo pipefail
+F="$E2E_RUN/facts"
+branch="$(git branch --show-current 2>/dev/null)"
+{
+  printf '%s\t%s\n' "$branch" "$*"
+  prev=""
+  for a in "$@"; do
+    case "$prev" in --body-file|-F|--input) f="${a#body=@}"; [ -f "$f" ] && sed 's/^/  | /' "$f" ;; esac
+    prev="$a"
+  done
+} >> "$E2E_RUN/gh.log"
+created="$E2E_RUN/prs-created.tsv"; touch "$created"
+
+# Honour -q/--jq by re-running this stub and piping through jq.
+jq_expr=""; prev=""
+for a in "$@"; do
+  case "$prev" in -q|--jq) jq_expr="$a" ;; esac
+  case "$a" in --jq=*) jq_expr="${a#*=}" ;; esac
+  prev="$a"
+done
+if [ -n "$jq_expr" ] && [ -z "${GH_STUB_INNER:-}" ]; then
+  out="$(GH_STUB_INNER=1 "$0" "$@")"; rc=$?
+  [ $rc -ne 0 ] && exit $rc
+  printf '%s\n' "$out" | jq -r "$jq_expr"; exit $?
+fi
+has() { local want="$1" a; shift; for a in "$@"; do [ "$a" = "$want" ] && return 0; done; return 1; }
+wants_json() { for a in "$@"; do case "$a" in --json|--json=*) return 0 ;; esac; done; return 1; }
+
+origin_head() { git --git-dir="$E2E_RUN/origin.git" rev-parse "refs/heads/$1" 2>/dev/null; }
+moved() {  # PR 7's head on origin differs from Dependabot's commit
+  [ -f "$F/dep-head" ] && [ "$(origin_head "$(cat "$F/dep-branch")")" != "$(cat "$F/dep-head")" ]
+}
+# PRs opened in this run: checks pass, nothing else to say about them.
+created_json() {
+  jq -Rn '[inputs | split("\t") | {number: (.[0]|tonumber), title: .[2], body: "", headRefName: .[1],
+    headRefOid: "", baseRefName: "main", createdAt: "2026-10-24T08:00:00Z", author: {login: "e2e"},
+    url: "https://github.com/acme/widget/pull/\(.[0])", state: "OPEN", isDraft: false,
+    mergeable: "MERGEABLE", mergeStateStatus: "BLOCKED", reviewDecision: "REVIEW_REQUIRED",
+    statusCheckRollup: [{__typename: "CheckRun", name: "check", workflowName: "ci", status: "COMPLETED", conclusion: "SUCCESS"}]}]' "$created"
+}
+# gh-CLI shape of every open PR, live head SHA and check state included.
+prs_json() {
+  local heads='{}' h st=FAILURE
+  for h in $(jq -r '.[].headRefName' "$F/prs.json"); do
+    heads="$(jq -c --arg k "$h" --arg v "$(origin_head "$h")" '. + {($k): $v}' <<< "$heads")"
+  done
+  moved && st=SUCCESS
+  jq --argjson heads "$heads" --arg st "$st" '[ .[] | (if .number == 7 then $st else "SUCCESS" end) as $c | . + {
+      url: "https://github.com/acme/widget/pull/\(.number)", state: "OPEN", isDraft: false,
+      headRefOid: ($heads[.headRefName] // .headRefOid),
+      mergeable: "MERGEABLE", mergeStateStatus: (if .number == 7 then "BEHIND" else "BLOCKED" end),
+      reviewDecision: "REVIEW_REQUIRED", headRepositoryOwner: {login: "acme"}, isCrossRepository: false,
+      statusCheckRollup: [{__typename: "CheckRun", name: "check", workflowName: "ci",
+        status: "COMPLETED", conclusion: $c,
+        detailsUrl: "https://github.com/acme/widget/actions/runs/\(if $c == "SUCCESS" then 9002 else 9001 end)/job/24001"}] } ]
+    + $mine' --argjson mine "$(created_json)" "$F/prs.json"
+}
+pr_sel() {  # first positional after "pr <verb>": number, URL or branch
+  local a
+  for a in "${@:3}"; do case "$a" in -*) return ;; *) echo "${a##*/}"; return ;; esac; done
+}
+find_pr() {  # selector -> one PR object, or nothing
+  local sel="${1:-}"
+  prs_json | jq -c --arg s "$sel" --arg b "$branch" \
+    '.[] | select(if $s == "" then .headRefName == $b else ((.number|tostring) == $s or .headRefName == $s) end)' | head -n 1
+}
+
+case "${1:-} ${2:-}" in
+  "auth status") echo "github.com: Logged in to github.com account e2e (keyring)" ;;
+  "repo view")
+    if has -q "$@" || has --jq "$@"; then echo PRIVATE; else
+      echo '{"name":"widget","owner":{"login":"acme"},"nameWithOwner":"acme/widget","visibility":"PRIVATE","isPrivate":true,"defaultBranchRef":{"name":"main"},"url":"https://github.com/acme/widget"}'
+    fi ;;
+  "pr list")
+    if wants_json "$@"; then prs_json
+    else prs_json | jq -r '.[] | "\(.number)\t\(.title)\t\(.headRefName)\tOPEN"'; fi ;;
+  "pr view")
+    pr="$(find_pr "$(pr_sel "$@")")"
+    [ -z "$pr" ] && { echo "no pull requests found for branch \"$branch\"" >&2; exit 1; }
+    if wants_json "$@"; then
+      fields=""; prev=""
+      for a in "$@"; do case "$prev" in --json) fields="$a" ;; esac; case "$a" in --json=*) fields="${a#*=}" ;; esac; prev="$a"; done
+      if [ -n "$fields" ]; then echo "$pr" | jq -c --arg f "$fields" '. as $o | [$f | split(",")[] | {(.): $o[.]}] | add'
+      else echo "$pr"; fi
+    else echo "$pr" | jq -r '"\(.title) acme/widget#\(.number)\nOpen • app/dependabot wants to merge 1 commit into main from \(.headRefName)\nLabels: dependencies, rust\n\n\(.body)\n\nView this pull request on GitHub: \(.url)"'; fi ;;
+  "pr checks")
+    pr="$(find_pr "$(pr_sel "$@")")"
+    [ -z "$pr" ] && { echo "no pull requests found for branch \"$branch\"" >&2; exit 1; }
+    bucket=fail; url=https://github.com/acme/widget/actions/runs/9001/job/24001
+    [ "$(echo "$pr" | jq -r .number)" != 7 ] && bucket=pass
+    moved && { bucket=pass; url=https://github.com/acme/widget/actions/runs/9002/job/24002; }
+    if wants_json "$@"; then printf '[{"name":"check","workflow":"ci","state":"%s","bucket":"%s","link":"%s"}]\n' \
+        "$([ $bucket = pass ] && echo SUCCESS || echo FAILURE)" "$bucket" "$url"
+    else printf 'check\t%s\t1m4s\t%s\n' "$bucket" "$url"; fi
+    [ $bucket = pass ] ;;
+  "pr diff")
+    pr="$(find_pr "$(pr_sel "$@")")"
+    [ -z "$pr" ] && { echo "no pull requests found" >&2; exit 1; }
+    h="$(echo "$pr" | jq -r .headRefName)"
+    git --git-dir="$E2E_RUN/origin.git" diff "refs/heads/main...refs/heads/$h" ;;
+  "pr checkout")
+    pr="$(find_pr "$(pr_sel "$@")")"
+    [ -z "$pr" ] && { echo "no pull requests found" >&2; exit 1; }
+    h="$(echo "$pr" | jq -r .headRefName)"
+    git fetch -q origin "+refs/heads/$h:refs/remotes/origin/$h" || exit 1
+    if git rev-parse -q --verify "refs/heads/$h" > /dev/null; then git switch -q "$h" && git merge -q --ff-only "origin/$h"
+    else git switch -q -c "$h" --track "origin/$h"; fi
+    echo "Switched to branch '$h'" ;;
+  "pr create")
+    head="$branch"; title="update"; prev=""
+    for a in "${@:3}"; do
+      case "$prev" in --head|-H) head="$a" ;; --title|-t) title="$a" ;; esac
+      case "$a" in --head=*) head="${a#*=}" ;; --title=*) title="${a#*=}" ;; esac
+      prev="$a"
+    done
+    n=$(( 40 + $(wc -l < "$created") + 1 ))
+    if has --dry-run "$@"; then echo "Would have created a Pull Request with: title $title, head $head"; exit 0; fi
+    if [ -n "$(find_pr "$head")" ]; then echo "a pull request for branch \"$head\" into branch \"main\" already exists:"; find_pr "$head" | jq -r .url; exit 1; fi
+    printf '%s\t%s\t%s\n' "$n" "$head" "$title" >> "$created"
+    echo "https://github.com/acme/widget/pull/$n" ;;
+  "pr merge") echo "X Pull request acme/widget#7 is not mergeable: the base branch policy prohibits the merge." >&2; exit 1 ;;
+  "pr comment") echo "https://github.com/acme/widget/pull/7#issuecomment-2391001" ;;
+  "pr review"|"pr edit"|"pr close"|"pr ready") echo "✓ done" ;;
+  "run watch") exit 0 ;;
+  "auth token") echo gho_e2e_stub_token ;;
+  "run list")
+    if wants_json "$@" && moved; then
+      echo '[{"databaseId":9002,"name":"ci","displayTitle":"Bump the weekly-dependencies group with 3 updates","event":"pull_request","status":"completed","conclusion":"success","headBranch":"'"$(cat "$F/dep-branch")"'","url":"https://github.com/acme/widget/actions/runs/9002","workflowName":"ci","createdAt":"2026-10-24T08:01:10Z"}]'
+    elif wants_json "$@"; then
+      echo '[{"databaseId":9001,"name":"ci","displayTitle":"Bump the weekly-dependencies group with 3 updates","event":"pull_request","status":"completed","conclusion":"failure","headBranch":"'"$(cat "$F/dep-branch" 2>/dev/null)"'","url":"https://github.com/acme/widget/actions/runs/9001","workflowName":"ci","createdAt":"2026-10-15T04:14:40Z"}]'
+    else echo "X  Bump the weekly-dependencies group with 3 updates  ci  $(cat "$F/dep-branch" 2>/dev/null)  pull_request  9001  1m4s  9d"; fi ;;
+  "run view")
+    if has 9002 "$@"; then
+      if wants_json "$@"; then echo '{"status":"completed","conclusion":"success","name":"ci","databaseId":9002}'; exit 0; fi
+      if has --log-failed "$@"; then echo "run 9002 has no failed jobs" >&2; exit 1; fi
+      printf '✓ %s ci · 9002\nTriggered via pull_request about 1 minute ago\n\nJOBS\n✓ check in 58s (ID 24002)\n' "$(cat "$F/dep-branch")"; exit 0
+    fi
+    if [ -f "$F/runlog.txt" ] && { has --log-failed "$@" || has --log "$@"; }; then cat "$F/runlog.txt"
+    elif [ -f "$F/runlog.txt" ]; then printf 'X %s ci · 9001\nTriggered via pull_request about 9 days ago\n\nJOBS\nX check in 1m4s (ID 24001)\n\nTo see what failed, try: gh run view 9001 --log-failed\n' "$(cat "$F/dep-branch")"
+    else echo "run not found" >&2; exit 1; fi ;;
+  "api "*)
+    method=GET; endpoint=""; prev=""
+    for a in "${@:2}"; do
+      case "$prev" in -X|--method) method="$a"; prev=""; continue ;; -f|-F|--field|--raw-field|-H|--header|--input|-q|--jq) prev=""; continue ;; esac
+      case "$a" in -X|--method|-f|-F|--field|--raw-field|-H|--header|--input|-q|--jq) prev="$a"; continue ;;
+                   --method=*) method="${a#*=}" ;; -*) ;; *) [ -z "$endpoint" ] && endpoint="${a#/}" ;; esac
+      prev="$a"
+    done
+    # -f/-F without -X turn gh api into a POST.
+    [ "$method" = GET ] && { has -f "$@" || has -F "$@" || has --field "$@" || has --raw-field "$@"; } && method=POST
+    if [ "$method" != GET ]; then echo '{}'; exit 0; fi
+    path="${endpoint%%\?*}"
+    case "$path" in
+      repos/acme/widget/dependabot/alerts) cat "$F/alerts.json" ;;
+      repos/acme/widget/dependabot/alerts/*) jq --arg n "${path##*/}" '.[] | select((.number|tostring) == $n)' "$F/alerts.json" ;;
+      repos/acme/widget/pulls) prs_json | jq '[.[] | {number, title, body, html_url: .url, state: "open", created_at: .createdAt,
+          user: {login: "dependabot[bot]"}, head: {ref: .headRefName, sha: .headRefOid, repo: {full_name: "acme/widget"}},
+          base: {ref: "main"}}]' ;;
+      repos/acme/widget/pulls/*/files) echo '[{"filename":"Cargo.toml","status":"modified"},{"filename":"Cargo.lock","status":"modified"}]' ;;
+      repos/acme/widget/pulls/*/comments|repos/acme/widget/issues/*/comments) echo '[]' ;;
+      repos/acme/widget/pulls/*) prs_json | jq --arg n "${path##*/}" '.[] | select((.number|tostring) == $n) | {number, title, body,
+          html_url: .url, state: "open", user: {login: "dependabot[bot]"}, head: {ref: .headRefName, sha: .headRefOid}, base: {ref: "main"}}' ;;
+      repos/acme/widget/actions/runs*) echo '{"total_count":0,"workflow_runs":[]}' ;;
+      repos/acme/widget) echo '{"full_name":"acme/widget","private":true,"visibility":"private","default_branch":"main"}' ;;
+      *) echo '{}' ;;
+    esac ;;
+  *) echo '{}' ;;
+esac

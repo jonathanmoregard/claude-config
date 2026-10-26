@@ -18,7 +18,8 @@ plain directory: copied whole) or a git ref of this repository (`origin/master`
 is the usual "before" arm).
 
 SCENARIO is a directory holding:
-    prompt.md   the user's message, verbatim
+    prompt.md   the user's message, verbatim except that {{E2E_RUN}} and
+                {{E2E_WORK}} become this run's RUN and WORK directories
     setup.sh    `setup.sh WORK RUN` builds the workspace in WORK. Stubs it puts
                 in $E2E_BIN shadow real tools (on PATH first); logs go to RUN,
                 or to $E2E_SHARED (RUN/shared at the top level) when a stub
@@ -335,6 +336,7 @@ def run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
         (run / "verdict.json").write_text(json.dumps(verdict, indent=2), encoding="utf-8")
         return verdict
     prompt = (scenario / "prompt.md").read_text(encoding="utf-8")
+    prompt = prompt.replace("{{E2E_RUN}}", str(run)).replace("{{E2E_WORK}}", str(work))
     argv = [args.claude, "-p", prompt, "--output-format", "stream-json", "--verbose",
             "--strict-mcp-config", "--max-budget-usd", f"{args.budget:g}"]
     # Sessions are not persisted by default, so a hook reading `transcript_path`
