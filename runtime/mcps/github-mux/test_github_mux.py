@@ -28,7 +28,7 @@ if __name__ != "__main__" and importlib.util.find_spec("mcp") is None:
 
     pytest.skip("needs mcp: run with uv run --script", allow_module_level=True)
 
-from mcp import ClientSession, StdioServerParameters
+from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 
 HERE = Path(__file__).resolve().parent
@@ -78,6 +78,175 @@ def config(**overrides):
     }
     raw.update(overrides)
     return mux.parse_config(raw)
+
+
+class BaseGuardTest(unittest.TestCase):
+    """`base` is required on create, so the gate is its value per repository."""
+
+    def refusal(self, name, arguments, default="master"):
+        return mux.base_refusal(name, arguments, default)
+
+    def test_the_repositorys_own_default_branch_is_allowed(self) -> None:
+        self.assertIsNone(self.refusal("create_pull_request", {"base": "master"}))
+        self.assertIsNone(
+            self.refusal("create_pull_request", {"base": "main"}, default="main")
+        )
+
+    def test_another_repositorys_default_is_not_this_ones(self) -> None:
+        # Why a shared {main, master} list will not do: `main` often also exists
+        # in a master-default repository, so a list of common names would admit
+        # a pull request the maintainer who expected master never wanted.
+        message = self.refusal("create_pull_request", {"base": "main"})
+        self.assertIsNotNone(message)
+        self.assertIn("master", message)
+        self.assertIsNotNone(
+            self.refusal("create_pull_request", {"base": "master"}, default="main")
+        )
+
+    def test_the_match_is_case_sensitive_because_git_refs_are(self) -> None:
+        # `Main` and `main` can both exist and are different branches.
+        self.assertIsNotNone(self.refusal("create_pull_request", {"base": "Master"}))
+
+    def test_feature_branch_base_is_refused(self) -> None:
+        message = self.refusal("create_pull_request", {"base": "feat/something"})
+        self.assertIsNotNone(message)
+        self.assertIn("feat/something", message)
+
+    def test_retargeting_an_existing_pr_is_refused_too(self) -> None:
+        # update_pull_request takes a new base, so leaving it out would let a
+        # pull request drift off the default branch right after being opened.
+        message = self.refusal(
+            "update_pull_request", {"pullNumber": 1, "base": "release/1.x"}
+        )
+        self.assertIsNotNone(message)
+        self.assertIn("release/1.x", message)
+
+    def test_update_without_a_base_is_untouched(self) -> None:
+        self.assertIsNone(
+            self.refusal("update_pull_request", {"pullNumber": 1, "title": "x"})
+        )
+
+    def test_a_non_string_base_is_refused_rather_than_coerced(self) -> None:
+        self.assertIsNotNone(self.refusal("create_pull_request", {"base": ["main"]}))
+
+    def test_an_empty_base_is_refused(self) -> None:
+        self.assertIsNotNone(self.refusal("create_pull_request", {"base": ""}))
+
+    def test_an_unresolved_default_branch_allows_the_call(self) -> None:
+        # A convenience rule fails open: a brand-new repository, a rate limit or
+        # an offline moment must not block ordinary work. This is the arm that
+        # replaced "refuse anything not in the list".
+        self.assertIsNone(
+            self.refusal("create_pull_request", {"base": "feat/x"}, default=None)
+        )
+
+    def test_other_tools_are_not_touched(self) -> None:
+        self.assertIsNone(self.refusal("list_pull_requests", {"base": "feat/x"}))
+
+
+
+class DefaultBranchCacheTest(unittest.IsolatedAsyncioTestCase):
+    """What the lookup remembers, and what it refuses to remember."""
+
+    class Session:
+        """A child that fails its first lookup and answers every one after."""
+
+        def __init__(self, fail_first: int = 1, branches: list[str] | None = None) -> None:
+            self.calls = 0
+            self.fail_first = fail_first
+            self.seen: list[tuple[str, dict]] = []
+            self.branches = branches or []
+
+        async def call_tool(self, name: str, arguments: dict):
+            self.calls += 1
+            self.seen.append((name, arguments))
+            if self.calls <= self.fail_first:
+                raise RuntimeError("rate limited")
+            branch = (
+                self.branches[min(len(self.branches) - 1, self.calls - 1)]
+                if self.branches
+                else "main"
+            )
+            payload = json.dumps(
+                {"items": [{"full_name": "o/r", "default_branch": branch}]}
+            )
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=payload)]
+            )
+
+    async def test_a_transient_failure_is_not_remembered(self) -> None:
+        # The bug this replaces: one failed lookup cached None, so every later
+        # call in that repository skipped the check for the whole process.
+        session, cache = self.Session(), {}
+        self.assertIsNone(await mux.lookup_default_branch("o", "r", session, cache))
+        self.assertEqual(cache, {})
+        self.assertEqual(
+            await mux.lookup_default_branch("o", "r", session, cache), "main"
+        )
+        self.assertEqual(session.calls, 2)
+
+    async def test_a_success_is_remembered_and_not_re_asked(self) -> None:
+        session, cache = self.Session(fail_first=0), {}
+        for _ in range(3):
+            self.assertEqual(
+                await mux.lookup_default_branch("o", "r", session, cache), "main"
+            )
+        self.assertEqual(session.calls, 1)
+
+    async def test_the_cache_key_ignores_owner_and_repo_case(self) -> None:
+        session, cache = self.Session(fail_first=0), {}
+        await mux.lookup_default_branch("O", "R", session, cache)
+        await mux.lookup_default_branch("o", "r", session, cache)
+        self.assertEqual(session.calls, 1)
+
+    async def test_the_lookup_query_names_exactly_one_repository(self) -> None:
+        # The shape the real child is asked for. Without this nothing pins it,
+        # so a wrong query would resolve nothing, fail open, and still pass.
+        session, cache = self.Session(fail_first=0), {}
+        await mux.lookup_default_branch("Owner", "Repo", session, cache)
+        name, arguments = session.seen[0]
+        self.assertEqual(name, "search_repositories")
+        self.assertEqual(arguments["query"], "repo:Owner/Repo")
+        self.assertIs(arguments["minimal_output"], False)
+        self.assertEqual(arguments["perPage"], 1)
+
+    async def test_force_re_asks_and_replaces_a_remembered_answer(self) -> None:
+        # A renamed default branch: cached "master", now really "main".
+        session = self.Session(fail_first=0, branches=["master", "main"])
+        cache: dict = {}
+        self.assertEqual(
+            await mux.lookup_default_branch("o", "r", session, cache), "master"
+        )
+        self.assertEqual(
+            await mux.lookup_default_branch("o", "r", session, cache, force=True),
+            "main",
+        )
+        self.assertEqual(cache["o/r"], "main")
+        self.assertEqual(session.calls, 2)
+
+
+class DefaultBranchLookupTest(unittest.TestCase):
+    """Reading `default_branch` out of what the child returns."""
+
+    def test_a_single_repository_result_yields_its_default_branch(self) -> None:
+        payload = json.dumps(
+            {"total_count": 1, "items": [{"full_name": "o/r", "default_branch": "master"}]}
+        )
+        self.assertEqual(mux._default_branch_of(payload), "master")
+
+    def test_anything_ambiguous_or_malformed_yields_none(self) -> None:
+        for payload in (
+            "",
+            "not json",
+            json.dumps({"items": []}),
+            json.dumps({"items": [{"default_branch": "a"}, {"default_branch": "b"}]}),
+            json.dumps({"items": [{"full_name": "o/r"}]}),
+            json.dumps({"items": [{"default_branch": ""}]}),
+            json.dumps({"items": "nope"}),
+            json.dumps(["items"]),
+        ):
+            with self.subTest(payload=payload[:40]):
+                self.assertIsNone(mux._default_branch_of(payload))
 
 
 class RouteTest(unittest.TestCase):
@@ -280,7 +449,10 @@ def write_launcher(directory: Path) -> Path:
     return launcher
 
 
-FAKE_TOOLS = "get_me,list_pull_requests,search_issues,crash"
+FAKE_TOOLS = (
+    "get_me,list_pull_requests,search_issues,create_pull_request,"
+    "search_repositories,crash"
+)
 
 
 class MuxIntegrationTest(unittest.IsolatedAsyncioTestCase):
@@ -294,7 +466,7 @@ class MuxIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.errlog.close)
 
     @asynccontextmanager
-    async def open_mux(self, klaffat_args: list[str]):
+    async def open_mux(self, klaffat_args: list[str], shared_extra: list[str] = []):
         # The SDK's task groups must be entered and exited in the test's own
         # task; enterAsyncContext would close them from a cleanup task.
         config_path = Path(self.tmp.name) / "config.json"
@@ -302,7 +474,13 @@ class MuxIntegrationTest(unittest.IsolatedAsyncioTestCase):
             json.dumps(
                 {
                     "command": str(self.launcher),
-                    "sharedArgs": ["--tools", FAKE_TOOLS, "--instructions", "fake guidance"],
+                    "sharedArgs": [
+                        "--tools",
+                        FAKE_TOOLS,
+                        "--instructions",
+                        "fake guidance",
+                        *shared_extra,
+                    ],
                     "defaultOwners": ["jonathanmoregard"],
                     "ownerChildren": {"klaffat": klaffat_args},
                 }
@@ -444,6 +622,45 @@ class MuxIntegrationTest(unittest.IsolatedAsyncioTestCase):
             )
         self.assertTrue(result.isError)
         self.assertNotIn('"label"', text)
+
+    async def test_a_non_default_base_never_reaches_the_child(self) -> None:
+        async with self.open_mux(["--label", "klaffat"]) as session:
+            # The default child echoes whatever it is sent, so a forwarded call
+            # is visible in the reply. Nothing but the mux can stop this one.
+            result, text = await self.call(
+                session,
+                "create_pull_request",
+                {"owner": "jonathanmoregard", "repo": "x", "base": "feat/sneaky"},
+            )
+        self.assertTrue(result.isError)
+        self.assertIn("feat/sneaky", text)
+        self.assertNotIn('"label"', text)
+
+    async def test_an_unresolvable_default_branch_forwards_the_call(self) -> None:
+        # A child that cannot answer the lookup is what a brand-new repository,
+        # a rate limit or an offline moment looks like from here. The call must
+        # go through: this rule is convenience,
+        # and it is also the control proving the arm above refused for the right
+        # reason rather than because the lookup happened to fail.
+        async with self.open_mux(
+            ["--label", "klaffat"], shared_extra=["--no-repo-search"]
+        ) as session:
+            text = await self.answered_by(
+                session,
+                "create_pull_request",
+                {"owner": "jonathanmoregard", "repo": "brand-new", "base": "feat/x"},
+            )
+        self.assertEqual(text, "personal")
+
+    async def test_the_default_base_is_forwarded_as_before(self) -> None:
+        async with self.open_mux(["--label", "klaffat"]) as session:
+            text = await self.answered_by(
+                session,
+                "create_pull_request",
+                {"owner": "jonathanmoregard", "repo": "x", "base": "main"},
+            )
+        # The default child answers with its own label, so the call was forwarded.
+        self.assertEqual(text, "personal")
 
     async def test_child_with_different_tool_set_is_fenced_off(self) -> None:
         async with self.open_mux(
