@@ -333,9 +333,10 @@ async def lookup_default_branch(
 ) -> str | None:
     """Ask the child for `owner/repo`'s default branch. None if it cannot be told.
 
-    Cached per process, negative results included: a repository that could not
-    be resolved once is not worth re-asking on every call, and the answer only
-    changes when someone renames a default branch.
+    Successful answers are cached for the life of the process -- they only
+    change when someone renames a default branch. Failures are *not* cached, so
+    a transient one does not leave the rule switched off for that repository
+    until the mux restarts.
     """
     key = f"{owner}/{repo}".lower()
     if key in cache:
@@ -353,7 +354,12 @@ async def lookup_default_branch(
                     break
     except Exception as exc:  # noqa: BLE001 - a failed lookup must not block the call
         _log(f"default-branch lookup for {key} failed: {type(exc).__name__}: {exc}")
-    cache[key] = branch
+    # Only successes are cached. A failure is usually transient -- a rate limit,
+    # a child still waking, a network blip -- and caching it would make one bad
+    # moment permit every non-default base in that repository for the rest of
+    # the process. Re-asking costs one call on a path that opens pull requests.
+    if branch:
+        cache[key] = branch
     return branch
 
 

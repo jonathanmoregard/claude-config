@@ -28,7 +28,7 @@ if __name__ != "__main__" and importlib.util.find_spec("mcp") is None:
 
     pytest.skip("needs mcp: run with uv run --script", allow_module_level=True)
 
-from mcp import ClientSession, StdioServerParameters
+from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 
 HERE = Path(__file__).resolve().parent
@@ -149,6 +149,53 @@ class BaseGuardTest(unittest.TestCase):
         self.assertFalse(
             (TRACKED_CONFIG.parent / "refresh-default-branches.py").exists()
         )
+
+
+class DefaultBranchCacheTest(unittest.IsolatedAsyncioTestCase):
+    """What the lookup remembers, and what it refuses to remember."""
+
+    class Session:
+        """A child that fails its first lookup and answers every one after."""
+
+        def __init__(self, fail_first: int = 1) -> None:
+            self.calls = 0
+            self.fail_first = fail_first
+
+        async def call_tool(self, name: str, arguments: dict):
+            self.calls += 1
+            if self.calls <= self.fail_first:
+                raise RuntimeError("rate limited")
+            payload = json.dumps(
+                {"items": [{"full_name": "o/r", "default_branch": "main"}]}
+            )
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=payload)]
+            )
+
+    async def test_a_transient_failure_is_not_remembered(self) -> None:
+        # The bug this replaces: one failed lookup cached None, so every later
+        # call in that repository skipped the check for the whole process.
+        session, cache = self.Session(), {}
+        self.assertIsNone(await mux.lookup_default_branch("o", "r", session, cache))
+        self.assertEqual(cache, {})
+        self.assertEqual(
+            await mux.lookup_default_branch("o", "r", session, cache), "main"
+        )
+        self.assertEqual(session.calls, 2)
+
+    async def test_a_success_is_remembered_and_not_re_asked(self) -> None:
+        session, cache = self.Session(fail_first=0), {}
+        for _ in range(3):
+            self.assertEqual(
+                await mux.lookup_default_branch("o", "r", session, cache), "main"
+            )
+        self.assertEqual(session.calls, 1)
+
+    async def test_the_cache_key_ignores_owner_and_repo_case(self) -> None:
+        session, cache = self.Session(fail_first=0), {}
+        await mux.lookup_default_branch("O", "R", session, cache)
+        await mux.lookup_default_branch("o", "r", session, cache)
+        self.assertEqual(session.calls, 1)
 
 
 class DefaultBranchLookupTest(unittest.TestCase):
