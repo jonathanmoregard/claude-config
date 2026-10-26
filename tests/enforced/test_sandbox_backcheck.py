@@ -202,9 +202,27 @@ def test_parameter_default_in_double_quotes_is_classified():
 
 
 def test_parameter_default_single_quoted_does_not_expand():
-    # Single quotes inside ${...} really do suppress expansion -- checked
-    # against bash -- so this must stay ok.
+    # Single quotes inside a *bare* ${...} really do suppress expansion --
+    # checked against bash -- so this must stay ok. Contrast the test below:
+    # the outer quote context is what decides, and these two must not agree.
     assert classify("echo ${x:-'$(touch /outside/x)'}")["status"] == "ok"
+
+
+def test_parameter_default_single_quoted_in_double_quotes_does_expand():
+    # `echo "${x:-'$(cmd)'}"` runs the substitution: inside double quotes the
+    # single quotes are ordinary characters. Verified against bash.
+    assert_write_break(
+        classify("""echo "${x:-'$(touch /outside/x)'}\""""), "/outside/x"
+    )
+
+
+def test_parameter_default_single_quoted_in_heredoc_does_expand():
+    # A heredoc body is quote-blind inside ${...} as well, so this runs. An
+    # earlier version of this test asserted ok on a contaminated measurement:
+    # the arms shared one shell and `x` was still set from the arm before.
+    command = "cat <<EOF\n${x:-'$(touch /outside/x)'}\nEOF"
+
+    assert_write_break(classify(command), "/outside/x")
 
 
 def test_stacked_heredoc_openers_classify_the_substitution():

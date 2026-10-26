@@ -178,24 +178,34 @@ def _collect_substitutions(text: str, subs: list, where: str, depth: int = 0) ->
         raise Unparseable(f"{where}-substitution-too-deep") from exc
 
 
-def _collect_heredoc_expansions(body: str, subs: list, depth: int = 0) -> None:
-    """Append every command substitution in an *unquoted* heredoc body to `subs`.
+def _collect_literal_expansions(body: str, subs: list, depth: int = 0) -> None:
+    """Append every command substitution in `body` to `subs`, quotes and all.
 
-    An unquoted body expands as if it were double-quoted, except that `"` is an
-    ordinary character too. So single quotes do not quote, `#` does not start a
-    comment, and only a backslash before `$`, a backtick, another backslash or a
-    newline suppresses expansion. Handing the body to `_collect_substitutions`
-    instead -- which scans it as *shell source* -- therefore walked right past
-    `'$(cmd)'` and `# $(cmd)`, both of which run, and reported ok.
+    For the places where a quote is just a character: an unquoted heredoc body,
+    and the inside of a `${...}` that sits in double quotes. In both, single
+    quotes do not quote and `#` does not start a comment, so only a backslash
+    before `$`, a backtick, another backslash or a newline suppresses expansion.
+    Handing such text to `_collect_substitutions` -- which scans it as *shell
+    source* -- walked straight past `'$(cmd)'` and `# $(cmd)`, both of which
+    run, and reported ok.
+
+    This holds inside a nested `${...}` too, so one scanner covers both callers.
+    The bare, unquoted `${...}` is the odd one out and stays on the shell-source
+    scanner, because there the single quotes do quote. Measured, each arm in its
+    own shell:
+
+        echo ${x:-'$(cmd)'}      -> does not run
+        echo "${x:-'$(cmd)'}"    -> runs
+        heredoc ${x:-'$(cmd)'}   -> runs
 
     The `$( )` and backtick bodies found here are shell, so they are appended as
-    substitutions for the caller to classify; only the surrounding body needs
+    substitutions for the caller to classify; only the surrounding text needs
     these different rules.
     """
     if not _SUB_START.search(body):
         return
     if depth >= _MAX_SUBSTITUTION_SCAN_DEPTH:
-        raise Unparseable("heredoc-substitution-too-deep")
+        raise Unparseable("literal-substitution-too-deep")
     i = 0
     n = len(body)
     while i < n:
@@ -215,12 +225,19 @@ def _collect_heredoc_expansions(body: str, subs: list, depth: int = 0) -> None:
             j = _match_paren(body, i + 3)
             if body[j + 1:j + 2] != ")":
                 raise Unparseable("unbalanced-arithmetic")
-            _collect_substitutions(body[i + 3:j], subs, "heredoc-arithmetic", depth)
+            _collect_substitutions(body[i + 3:j], subs, "literal-arithmetic", depth)
             i = j + 2
             continue
         if body[i + 1:i + 2] == "(":
             j = _match_paren(body, i + 2)
             subs.append(("cmd", body[i + 2:j]))
+            i = j + 1
+            continue
+        if body[i + 1:i + 2] == "{":
+            j = body.find("}", i + 2)
+            if j == -1:
+                raise Unparseable("unbalanced-brace-expansion")
+            _collect_literal_expansions(body[i + 2:j], subs, depth + 1)
             i = j + 1
             continue
         i += 1
@@ -278,12 +295,21 @@ def prescan(text: str, substitution_scan_depth: int = 0) -> Scan:
             # `${x:-$(touch /x)}` runs that touch when x is unset. Whether it
             # does is not knowable here, so collect it and let it classify --
             # the same fail-closed direction the rest of this scanner takes.
-            # Measured against bash: a backtick or $( ) in the default word
-            # runs, and single quotes inside the braces do suppress it, which
-            # is exactly what scanning the braces as shell source gets right.
-            _collect_substitutions(
-                text[i + 2:j], subs, "parameter", substitution_scan_depth
-            )
+            #
+            # The outer quote context decides whether single quotes inside the
+            # braces still quote, and it was measured, not reasoned about:
+            #   echo ${x:-'$(cmd)'}    -> does NOT run
+            #   echo "${x:-'$(cmd)'}"  -> DOES run
+            # So in double quotes the braces are scanned with quotes treated as
+            # ordinary characters; bare, they are scanned as shell source.
+            if q == '"':
+                _collect_literal_expansions(
+                    text[i + 2:j], subs, substitution_scan_depth
+                )
+            else:
+                _collect_substitutions(
+                    text[i + 2:j], subs, "parameter", substitution_scan_depth
+                )
             cur.append(f"{VAR}{text[i + 2:j]}{VAR_END}")
             return j + 1
         m = _NAME_RE.match(text, i + 1)
@@ -509,7 +535,7 @@ def prescan(text: str, substitution_scan_depth: int = 0) -> Scan:
     flush("")
     for heredoc in heredocs:
         if not heredoc["quoted"]:
-            _collect_heredoc_expansions(
+            _collect_literal_expansions(
                 heredoc["body"], subs, substitution_scan_depth
             )
     return Scan(segs, funcs, subs, heredocs)
