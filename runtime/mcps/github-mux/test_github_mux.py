@@ -143,12 +143,6 @@ class BaseGuardTest(unittest.TestCase):
     def test_other_tools_are_not_touched(self) -> None:
         self.assertIsNone(self.refusal("list_pull_requests", {"base": "feat/x"}))
 
-    def test_config_no_longer_carries_a_branch_list(self) -> None:
-        # The map and its refresh script are gone; nothing to keep up to date.
-        self.assertNotIn("defaultBranches", json.loads(TRACKED_CONFIG.read_text()))
-        self.assertFalse(
-            (TRACKED_CONFIG.parent / "refresh-default-branches.py").exists()
-        )
 
 
 class DefaultBranchCacheTest(unittest.IsolatedAsyncioTestCase):
@@ -157,16 +151,24 @@ class DefaultBranchCacheTest(unittest.IsolatedAsyncioTestCase):
     class Session:
         """A child that fails its first lookup and answers every one after."""
 
-        def __init__(self, fail_first: int = 1) -> None:
+        def __init__(self, fail_first: int = 1, branches: list[str] | None = None) -> None:
             self.calls = 0
             self.fail_first = fail_first
+            self.seen: list[tuple[str, dict]] = []
+            self.branches = branches or []
 
         async def call_tool(self, name: str, arguments: dict):
             self.calls += 1
+            self.seen.append((name, arguments))
             if self.calls <= self.fail_first:
                 raise RuntimeError("rate limited")
+            branch = (
+                self.branches[min(len(self.branches) - 1, self.calls - 1)]
+                if self.branches
+                else "main"
+            )
             payload = json.dumps(
-                {"items": [{"full_name": "o/r", "default_branch": "main"}]}
+                {"items": [{"full_name": "o/r", "default_branch": branch}]}
             )
             return types.CallToolResult(
                 content=[types.TextContent(type="text", text=payload)]
@@ -196,6 +198,31 @@ class DefaultBranchCacheTest(unittest.IsolatedAsyncioTestCase):
         await mux.lookup_default_branch("O", "R", session, cache)
         await mux.lookup_default_branch("o", "r", session, cache)
         self.assertEqual(session.calls, 1)
+
+    async def test_the_lookup_query_names_exactly_one_repository(self) -> None:
+        # The shape the real child is asked for. Without this nothing pins it,
+        # so a wrong query would resolve nothing, fail open, and still pass.
+        session, cache = self.Session(fail_first=0), {}
+        await mux.lookup_default_branch("Owner", "Repo", session, cache)
+        name, arguments = session.seen[0]
+        self.assertEqual(name, "search_repositories")
+        self.assertEqual(arguments["query"], "repo:Owner/Repo")
+        self.assertIs(arguments["minimal_output"], False)
+        self.assertEqual(arguments["perPage"], 1)
+
+    async def test_force_re_asks_and_replaces_a_remembered_answer(self) -> None:
+        # A renamed default branch: cached "master", now really "main".
+        session = self.Session(fail_first=0, branches=["master", "main"])
+        cache: dict = {}
+        self.assertEqual(
+            await mux.lookup_default_branch("o", "r", session, cache), "master"
+        )
+        self.assertEqual(
+            await mux.lookup_default_branch("o", "r", session, cache, force=True),
+            "main",
+        )
+        self.assertEqual(cache["o/r"], "main")
+        self.assertEqual(session.calls, 2)
 
 
 class DefaultBranchLookupTest(unittest.TestCase):

@@ -329,7 +329,11 @@ def _default_branch_of(payload: str) -> str | None:
 
 
 async def lookup_default_branch(
-    owner: str, repo: str, session: Any, cache: dict[str, str | None]
+    owner: str,
+    repo: str,
+    session: Any,
+    cache: dict[str, str | None],
+    force: bool = False,
 ) -> str | None:
     """Ask the child for `owner/repo`'s default branch. None if it cannot be told.
 
@@ -339,7 +343,7 @@ async def lookup_default_branch(
     until the mux restarts.
     """
     key = f"{owner}/{repo}".lower()
-    if key in cache:
+    if key in cache and not force:
         return cache[key]
     branch: str | None = None
     try:
@@ -347,11 +351,20 @@ async def lookup_default_branch(
             REPO_LOOKUP_TOOL,
             {"query": f"repo:{owner}/{repo}", "minimal_output": False, "perPage": 1},
         )
-        if not result.isError:
+        if result.isError:
+            # How the child reports a rate limit, a 4xx, or a tool it does not
+            # have. This is the *common* failure, far more likely than a
+            # transport exception, and it used to pass silently -- so a rule
+            # that had quietly stopped working looked identical to one with
+            # nothing to say.
+            _log(f"default-branch lookup for {key} returned an error result")
+        else:
             for block in result.content:
                 branch = _default_branch_of(getattr(block, "text", "") or "")
                 if branch:
                     break
+            if branch is None:
+                _log(f"default-branch lookup for {key} returned no usable branch")
     except Exception as exc:  # noqa: BLE001 - a failed lookup must not block the call
         _log(f"default-branch lookup for {key} failed: {type(exc).__name__}: {exc}")
     # Only successes are cached. A failure is usually transient -- a rate limit,
@@ -436,12 +449,22 @@ async def dispatch(
     # repository's default branch rather than reading it from a list.
     if name in BASE_ARGUMENT_TOOLS and "base" in arguments:
         repo_owner, repo = arguments.get("owner"), arguments.get("repo")
+        cache = branch_cache if branch_cache is not None else {}
         default = None
         if isinstance(repo_owner, str) and isinstance(repo, str) and repo_owner and repo:
             default = await lookup_default_branch(
-                repo_owner, repo, child.session, branch_cache if branch_cache is not None else {}
+                repo_owner, repo, child.session, cache
             )
         refusal = base_refusal(name, arguments, default)
+        if refusal is not None and default is not None:
+            # Never refuse on a remembered answer without checking it first: a
+            # default branch that was renamed since it was cached would other-
+            # wise refuse every pull request in that repository, naming the old
+            # branch, until the mux restarts. Costs one call, on the rare path.
+            default = await lookup_default_branch(
+                repo_owner, repo, child.session, cache, force=True
+            )
+            refusal = base_refusal(name, arguments, default)
         if refusal is not None:
             return _error(refusal)
     try:
