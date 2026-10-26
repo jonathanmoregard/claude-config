@@ -9,7 +9,10 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RUNNER = ROOT / "mcps" / "klaffat-app-runner"
+# `runtime/` once the layout migration has landed, the repository root
+# before it. Only the projected subset moves; tests/ stays at the root.
+RUNTIME = ROOT / "runtime" if (ROOT / "runtime").is_dir() else ROOT
+RUNNER = RUNTIME / "mcps" / "klaffat-app-runner"
 HOST_SETUP = ROOT / "tests" / "agent-e2e" / "klaffat-app-runner-host-smoke" / "setup.sh"
 
 
@@ -26,7 +29,7 @@ class KlaffatAppRunnerAssetTests(unittest.TestCase):
         self.assertNotIn("shell=True", source)
 
     def test_shared_manifest_registers_fixed_host_server_without_bootstrap(self) -> None:
-        servers = json.loads((ROOT / "mcp-servers.json").read_text(encoding="utf-8"))
+        servers = json.loads((RUNTIME / "mcp-servers.json").read_text(encoding="utf-8"))
         self.assertIn("klaffat-app-runner", servers)
         config = servers["klaffat-app-runner"]
         self.assertEqual(
@@ -46,7 +49,7 @@ class KlaffatAppRunnerAssetTests(unittest.TestCase):
             self.assertNotIn(bootstrap, serialized)
 
     def test_shared_permissions_allow_the_structured_runner_without_shell_escape(self) -> None:
-        settings = json.loads((ROOT / "settings.json").read_text(encoding="utf-8"))
+        settings = json.loads((RUNTIME / "settings.json").read_text(encoding="utf-8"))
         allow = settings["permissions"]["allow"]
         self.assertIn("mcp__klaffat-app-runner__*", allow)
         self.assertNotIn("mcp__klaffat-app-runner__exec", allow)

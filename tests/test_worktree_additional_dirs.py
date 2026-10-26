@@ -8,6 +8,8 @@ repo with an origin:
   * a dirty worktree is kept;
   * a worktree with commits not on origin's default branch is kept;
   * a clean worktree whose branch is merged is dropped;
+  * merged means on any remote's default branch, so a renamed repo's old
+    remote (`legacy`, unrelated history) still counts;
   * hand-added additionalDirectories survive.
 
 Run: python3 tests/test_worktree_additional_dirs.py
@@ -21,7 +23,13 @@ import sys
 import tempfile
 from pathlib import Path
 
-HOOK = Path(__file__).resolve().parent.parent / "worktree-additional-dirs.py"
+# `runtime/` once the layout migration has landed, the repository root before
+# it. Only the projected subset moves; tests/ stays at the root.
+RUNTIME = Path(__file__).resolve().parents[1]
+if (RUNTIME / "runtime").is_dir():
+    RUNTIME = RUNTIME / "runtime"
+
+HOOK = RUNTIME / "worktree-additional-dirs.py"
 FAILURES: list[str] = []
 ENV = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
@@ -54,6 +62,24 @@ def main() -> int:
         (dirty / "wip.txt").write_text("x")
         git(ahead, "commit", "-q", "--allow-empty", "-m", "unpushed")
 
+        # A renamed repo with rewritten history: the old remote stays as
+        # `legacy`, sharing no commits with origin. Work merged there is merged.
+        legacy = root / "legacy.git"
+        git(root, "init", "-q", "--bare", "-b", "master", str(legacy))
+        old = root / "old"
+        git(root, "clone", "-q", str(legacy), str(old))
+        git(old, "commit", "-q", "--allow-empty", "-m", "old history")
+        git(old, "push", "-q", "origin", "HEAD:master")
+        git(repo, "remote", "add", "legacy", str(legacy))
+        git(repo, "fetch", "-q", "legacy")
+        legacy_merged, legacy_ahead = root / "wt-legacy-merged", root / "wt-legacy-ahead"
+        for wt, br in ((legacy_merged, "legacy-merged"), (legacy_ahead, "legacy-ahead")):
+            git(repo, "worktree", "add", "-q", "-b", br, str(wt), "legacy/master")
+        git(legacy_ahead, "commit", "-q", "--allow-empty", "-m", "unmerged on legacy")
+        # A remote HEAD left dangling (default branch renamed, then pruned)
+        # must neither poison the other refs nor hide legacy/master.
+        git(repo, "symbolic-ref", "refs/remotes/legacy/HEAD", "refs/remotes/legacy/gone")
+
         manual = str(root / "hand-added")
         (repo / ".claude").mkdir()
         settings = repo / ".claude" / "settings.local.json"
@@ -66,6 +92,10 @@ def main() -> int:
         check("worktree with unpushed commits kept", str(ahead) in dirs, str(dirs))
         check("clean merged worktree dropped", str(merged) not in dirs, str(dirs))
         check("hand-added entry survives", manual in dirs, str(dirs))
+        check("worktree merged on another remote's default branch dropped",
+              str(legacy_merged) not in dirs, str(dirs))
+        check("worktree ahead of every remote's default branch kept",
+              str(legacy_ahead) in dirs, str(dirs))
 
     print("all passed" if not FAILURES else f"{len(FAILURES)} failed")
     return 1 if FAILURES else 0
