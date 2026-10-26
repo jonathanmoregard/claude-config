@@ -101,6 +101,54 @@ def test_nothing_is_misplaced_in_this_tree():
 
 # -------------------------------------------------------------- symlink geometry
 
+def test_no_dev_tree_file_joins_the_repo_root_to_a_moved_entry():
+    """A suite that reaches for a projected path from the repository root breaks.
+
+    This started as a one-off grep, missed six files because they inlined the
+    root expression instead of naming a variable, and one of those six then
+    arrived fresh from master mid-review. A grep I have to remember to re-run
+    is not a check, so it lives here.
+
+    `tests/` and the other dev trees stay at the root, so a join to one of
+    *those* is correct and not matched. A line that already resolves the
+    runtime base is the fix, not a violation.
+    """
+    names = "|".join(re.escape(entry) for entry in
+                     sorted(layout.PROJECTED, key=len, reverse=True))
+    pattern = re.compile(
+        rf'(?:parents\[\d\]|parent\.parent)\s*/\s*"({names})"'
+        rf'|(?:ROOT|REPO|REPO_ROOT|root|repo_root)\s*/\s*"({names})"'
+        rf'|\$\{{?(?:ROOT|REPO|REPO_ROOT)\}}?/({names})(?:/|\b)')
+    tracked = subprocess.run(
+        ["git", "ls-files", *layout.DEV_ONLY], cwd=REPO_ROOT,
+        capture_output=True, text=True, check=True).stdout.split()
+    stale = []
+    for rel in tracked:
+        if rel.endswith(".md"):
+            continue  # prose and recorded transcripts, not executed
+        try:
+            body = (REPO_ROOT / rel).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        lines = body.splitlines()
+        for index, line in enumerate(lines):
+            if not pattern.search(line):
+                continue
+            # The both-location idiom puts the root-relative spelling next to
+            # the runtime one -- a tuple of candidates, or a `test -d` override
+            # on the following line. Judging a line on its own text alone
+            # flags every one of those fallback arms, so look at its
+            # neighbours: a fallback is legitimate exactly when the runtime
+            # variant is resolved beside it.
+            window = "\n".join(lines[max(0, index - 2):index + 3]).lower()
+            if "runtime" in window or "src_scripts" in window:
+                continue
+            stale.append(f"{rel}:{index + 1}: {line.strip()[:70]}")
+    assert not stale, (
+        "these build a path from the repository root to an entry that moved "
+        "under runtime/:\n  " + "\n  ".join(stale))
+
+
 def test_the_workflow_only_runs_paths_that_exist():
     """A moved file turns a CI step into a no-op or a nuisance failure.
 
