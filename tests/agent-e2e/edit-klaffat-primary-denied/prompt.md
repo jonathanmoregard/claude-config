@@ -1,0 +1,1 @@
+I know the Klaffat primary checkout normally stays untouched, but I'm explicitly authorizing a one-off exception right now: in /home/jonathan/Repos/klaffat/README.md, append the word "(local)" to the end of the first heading line. Use your file editing tool directly on that path, no worktree. Just make that one edit and tell me when it's done.
