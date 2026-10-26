@@ -75,12 +75,6 @@ def config(**overrides):
         "sharedArgs": ["--toolsets", "repos"],
         "defaultOwners": ["jonathanmoregard"],
         "ownerChildren": {"klaffat": ["--owner", "klaffat"]},
-        # Two repositories that disagree about their default branch, because
-        # that disagreement is what the guard exists for.
-        "defaultBranches": {
-            "jonathanmoregard/on-main": "main",
-            "jonathanmoregard/on-master": "master",
-        },
     }
     raw.update(overrides)
     return mux.parse_config(raw)
@@ -89,47 +83,29 @@ def config(**overrides):
 class BaseGuardTest(unittest.TestCase):
     """`base` is required on create, so the gate is its value per repository."""
 
-    def setUp(self) -> None:
-        self.cfg = config()
-
-    def refusal(self, name, arguments, **extra):
-        return mux.base_refusal(
-            name,
-            {"owner": "jonathanmoregard", "repo": "on-master", **arguments, **extra},
-            self.cfg,
-        )
+    def refusal(self, name, arguments, default="master"):
+        return mux.base_refusal(name, arguments, default)
 
     def test_the_repositorys_own_default_branch_is_allowed(self) -> None:
         self.assertIsNone(self.refusal("create_pull_request", {"base": "master"}))
         self.assertIsNone(
-            self.refusal("create_pull_request", {"base": "main"}, repo="on-main")
+            self.refusal("create_pull_request", {"base": "main"}, default="main")
         )
 
     def test_another_repositorys_default_is_not_this_ones(self) -> None:
-        # The hole a shared {main, master} allow-list leaves: `main` often also
-        # exists in a master-default repository, and a pull request into it
-        # would never be merged by the maintainer who expected master.
+        # Why a shared {main, master} list will not do: `main` often also exists
+        # in a master-default repository, so a list of common names would admit
+        # a pull request the maintainer who expected master never wanted.
         message = self.refusal("create_pull_request", {"base": "main"})
         self.assertIsNotNone(message)
         self.assertIn("master", message)
         self.assertIsNotNone(
-            self.refusal("create_pull_request", {"base": "master"}, repo="on-main")
+            self.refusal("create_pull_request", {"base": "master"}, default="main")
         )
 
     def test_the_match_is_case_sensitive_because_git_refs_are(self) -> None:
         # `Main` and `main` can both exist and are different branches.
         self.assertIsNotNone(self.refusal("create_pull_request", {"base": "Master"}))
-
-    def test_owner_and_repo_are_matched_case_insensitively(self) -> None:
-        # GitHub owner and repository names are not case-sensitive.
-        self.assertIsNone(
-            self.refusal(
-                "create_pull_request",
-                {"base": "master"},
-                owner="JonathanMoregard",
-                repo="On-Master",
-            )
-        )
 
     def test_feature_branch_base_is_refused(self) -> None:
         message = self.refusal("create_pull_request", {"base": "feat/something"})
@@ -137,8 +113,8 @@ class BaseGuardTest(unittest.TestCase):
         self.assertIn("feat/something", message)
 
     def test_retargeting_an_existing_pr_is_refused_too(self) -> None:
-        # update_pull_request is not in --exclude-tools and takes a new base,
-        # so without this the guard is one API call away from useless.
+        # update_pull_request takes a new base, so leaving it out would let a
+        # pull request drift off the default branch right after being opened.
         message = self.refusal(
             "update_pull_request", {"pullNumber": 1, "base": "release/1.x"}
         )
@@ -156,45 +132,47 @@ class BaseGuardTest(unittest.TestCase):
     def test_an_empty_base_is_refused(self) -> None:
         self.assertIsNotNone(self.refusal("create_pull_request", {"base": ""}))
 
-    def test_a_missing_owner_or_repo_is_refused(self) -> None:
-        # Without them the base cannot be checked at all, so it is not allowed.
-        self.assertIsNotNone(
-            mux.base_refusal("create_pull_request", {"base": "master"}, self.cfg)
+    def test_an_unresolved_default_branch_allows_the_call(self) -> None:
+        # A convenience rule fails open: a brand-new repository, a rate limit or
+        # an offline moment must not block ordinary work. This is the arm that
+        # replaced "refuse anything not in the list".
+        self.assertIsNone(
+            self.refusal("create_pull_request", {"base": "feat/x"}, default=None)
         )
-
-    def test_an_unknown_repository_is_refused_not_waved_through(self) -> None:
-        message = self.refusal("create_pull_request", {"base": "main"}, repo="brand-new")
-        self.assertIsNotNone(message)
-        self.assertIn("refresh-default-branches.py", message)
 
     def test_other_tools_are_not_touched(self) -> None:
         self.assertIsNone(self.refusal("list_pull_requests", {"base": "feat/x"}))
 
-    def test_default_branches_is_required(self) -> None:
-        raw = {
-            "command": "/bin/true",
-            "sharedArgs": [],
-            "defaultOwners": ["jonathanmoregard"],
-            "ownerChildren": {},
-        }
-        with self.assertRaises(mux.ConfigError):
-            mux.parse_config(raw)
+    def test_config_no_longer_carries_a_branch_list(self) -> None:
+        # The map and its refresh script are gone; nothing to keep up to date.
+        self.assertNotIn("defaultBranches", json.loads(TRACKED_CONFIG.read_text()))
+        self.assertFalse(
+            (TRACKED_CONFIG.parent / "refresh-default-branches.py").exists()
+        )
 
-    def test_a_malformed_default_branches_entry_is_rejected(self) -> None:
-        for bad in (
-            {"not-an-owner-repo": "main"},
-            {"owner/repo": ""},
-            {"owner/repo": ["main"]},
-            ["owner/repo"],
+
+class DefaultBranchLookupTest(unittest.TestCase):
+    """Reading `default_branch` out of what the child returns."""
+
+    def test_a_single_repository_result_yields_its_default_branch(self) -> None:
+        payload = json.dumps(
+            {"total_count": 1, "items": [{"full_name": "o/r", "default_branch": "master"}]}
+        )
+        self.assertEqual(mux._default_branch_of(payload), "master")
+
+    def test_anything_ambiguous_or_malformed_yields_none(self) -> None:
+        for payload in (
+            "",
+            "not json",
+            json.dumps({"items": []}),
+            json.dumps({"items": [{"default_branch": "a"}, {"default_branch": "b"}]}),
+            json.dumps({"items": [{"full_name": "o/r"}]}),
+            json.dumps({"items": [{"default_branch": ""}]}),
+            json.dumps({"items": "nope"}),
+            json.dumps(["items"]),
         ):
-            with self.subTest(bad=bad), self.assertRaises(mux.ConfigError):
-                config(defaultBranches=bad)
-
-    def test_tracked_config_records_both_default_branch_spellings(self) -> None:
-        branches = mux.load_config(TRACKED_CONFIG).default_branches
-        self.assertEqual(branches["jonathanmoregard/claude-config"], "master")
-        self.assertEqual(branches["jonathanmoregard/nixos-config"], "main")
-        self.assertEqual(branches["klaffat/klaffat"], "main")
+            with self.subTest(payload=payload[:40]):
+                self.assertIsNone(mux._default_branch_of(payload))
 
 
 class RouteTest(unittest.TestCase):
@@ -397,7 +375,10 @@ def write_launcher(directory: Path) -> Path:
     return launcher
 
 
-FAKE_TOOLS = "get_me,list_pull_requests,search_issues,create_pull_request,crash"
+FAKE_TOOLS = (
+    "get_me,list_pull_requests,search_issues,create_pull_request,"
+    "search_repositories,crash"
+)
 
 
 class MuxIntegrationTest(unittest.IsolatedAsyncioTestCase):
@@ -411,7 +392,7 @@ class MuxIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.errlog.close)
 
     @asynccontextmanager
-    async def open_mux(self, klaffat_args: list[str]):
+    async def open_mux(self, klaffat_args: list[str], shared_extra: list[str] = []):
         # The SDK's task groups must be entered and exited in the test's own
         # task; enterAsyncContext would close them from a cleanup task.
         config_path = Path(self.tmp.name) / "config.json"
@@ -419,10 +400,15 @@ class MuxIntegrationTest(unittest.IsolatedAsyncioTestCase):
             json.dumps(
                 {
                     "command": str(self.launcher),
-                    "sharedArgs": ["--tools", FAKE_TOOLS, "--instructions", "fake guidance"],
+                    "sharedArgs": [
+                        "--tools",
+                        FAKE_TOOLS,
+                        "--instructions",
+                        "fake guidance",
+                        *shared_extra,
+                    ],
                     "defaultOwners": ["jonathanmoregard"],
                     "ownerChildren": {"klaffat": klaffat_args},
-                    "defaultBranches": {"jonathanmoregard/x": "main"},
                 }
             ),
             encoding="utf-8",
@@ -575,6 +561,22 @@ class MuxIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.isError)
         self.assertIn("feat/sneaky", text)
         self.assertNotIn('"label"', text)
+
+    async def test_an_unresolvable_default_branch_forwards_the_call(self) -> None:
+        # A child that cannot answer the lookup is what a brand-new repository,
+        # a rate limit or an offline moment looks like from here. The call must
+        # go through: this rule is convenience,
+        # and it is also the control proving the arm above refused for the right
+        # reason rather than because the lookup happened to fail.
+        async with self.open_mux(
+            ["--label", "klaffat"], shared_extra=["--no-repo-search"]
+        ) as session:
+            text = await self.answered_by(
+                session,
+                "create_pull_request",
+                {"owner": "jonathanmoregard", "repo": "brand-new", "base": "feat/x"},
+            )
+        self.assertEqual(text, "personal")
 
     async def test_the_default_base_is_forwarded_as_before(self) -> None:
         async with self.open_mux(["--label", "klaffat"]) as session:
