@@ -240,11 +240,65 @@ def test_stacked_heredoc_openers_classify_the_substitution():
     assert_write_break(classify(command), "/outside/x")
 
 
-def test_pathological_substitution_nesting_becomes_unknown():
-    # The depth cap that the test above used to exercise by accident. Nested
-    # substitutions are what actually recurse, so nest those instead: too deep
-    # to scan must stay unknown, never ok.
+def test_deeply_nested_substitution_is_classified():
+    # 40 levels of $( ) used to exhaust the hand-rolled scanner's depth cap and
+    # report unknown. bash runs it (checked: rc 0, the file is created), and the
+    # grammar has no trouble with it, so the honest answer is the break.
     depth = 40
     command = "echo " + "$(" * depth + "touch /outside/x" + ")" * depth
 
-    assert classify(command)["status"] == "unknown"
+    assert_write_break(classify(command), "/outside/x")
+
+
+def test_a_command_the_shell_grammar_rejects_is_unknown():
+    # The fail-closed guarantee that replaced the depth cap, and the whole
+    # reason the parser is the authority: anything it cannot read is unknown,
+    # never ok. An unbalanced substitution is the simplest such command.
+    result = classify("echo $(touch /outside/x")
+
+    assert result["status"] == "unknown"
+    assert "unknown:shell-unparseable" in result["reasons"]
+
+
+def test_an_interpreter_heredoc_body_is_still_inspected():
+    # mvdan/sh ends a statement span at the heredoc *operator*, so this
+    # pipeline's span is just its first line and the script -- where the whole
+    # point of the command lives -- falls outside it. Classifying by spans
+    # alone turned this real break into an ok; the full-command scan is what
+    # keeps it, and the parser only ever adds to that.
+    command = (
+        "python3 -B - <<'EOF' 2>&1 | head -30\n"
+        "import urllib.request\n"
+        'urllib.request.urlopen("http://127.0.0.1:8718/search?pattern=antenna")\n'
+        "EOF"
+    )
+
+    result = classify(command)
+
+    assert result["status"] == "breaks"
+    assert "breaks:network(localhost)" in result["reasons"]
+
+
+def test_a_statement_after_a_partly_quoted_heredoc_delimiter_is_classified():
+    # The other direction, and why the spans are needed at all: bash resolves
+    # `<<'EO'F` to the delimiter EOF, so the body is one line and the touch is
+    # a statement that runs. The scanner reads the word literally, never
+    # matches it, and swallows the rest of the input -- a false ok without the
+    # parser's statement list. Verified against bash.
+    command = "cat <<'EO'F\nx\nEOF\ntouch /outside/x"
+
+    assert_write_break(classify(command), "/outside/x")
+
+
+def test_a_missing_parser_is_an_error_not_a_pass():
+    # "The parser is absent" must never look like "the parser found nothing",
+    # which is exactly how a false ok would get manufactured at deploy time.
+    original = sandbox_backcheck.SHFMT
+    sandbox_backcheck.SHFMT = "/nonexistent/shfmt-does-not-exist"
+    try:
+        result = classify("touch /outside/x")
+    finally:
+        sandbox_backcheck.SHFMT = original
+
+    assert result["status"] == "unknown"
+    assert any("shfmt-unavailable" in r for r in result["reasons"])

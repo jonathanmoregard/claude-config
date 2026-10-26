@@ -178,6 +178,129 @@ def _collect_substitutions(text: str, subs: list, where: str, depth: int = 0) ->
         raise Unparseable(f"{where}-substitution-too-deep") from exc
 
 
+SHFMT = os.environ.get("SANDBOX_BACKCHECK_SHFMT", "shfmt")
+_MAX_AST_REQUOTE_DEPTH = 8
+# Quote forms whose *contents* are expanded again by the shell despite looking
+# quoted, so a substitution inside one still runs. mvdan/sh parses the quoting
+# structurally and correctly -- `'$(cmd)'` is a SglQuoted either way -- but
+# whether it runs depends on what encloses it, which is this rule:
+#   echo ${x:-'$(cmd)'}      SglQuoted in ParamExp          does not run
+#   echo "${x:-'$(cmd)'}"    the same, inside DblQuoted      runs
+#   echo $(( '$(cmd)' + 1 )) the same, inside ArithmExp      runs
+# Heredocs need no rule: mvdan/sh already yields CmdSubst inside an unquoted
+# body and a plain literal inside a quoted one, which is what bash does.
+_REQUOTING_CONTEXTS = ("DblQuoted", "ArithmExp", "ArithmCmd")
+
+
+def _shfmt_tree(command: str):
+    """mvdan/sh's parse tree for `command`, or None when it will not parse.
+
+    None is the caller's cue to answer unknown. A missing or broken `shfmt` is
+    not None but `Unparseable`: "the parser is absent" must never look like
+    "the parser found nothing", which is how a false ok gets made.
+    """
+    try:
+        proc = subprocess.run(
+            [SHFMT, "--to-json"],
+            input=command,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise Unparseable(f"shfmt-unavailable:{type(exc).__name__}") from exc
+    if proc.returncode != 0:
+        return None
+    try:
+        return json.loads(proc.stdout)
+    except ValueError:
+        return None
+
+
+def _ast_view(command: str, depth: int = 0) -> tuple | None:
+    """`(statements, substitutions)` as mvdan/sh sees them, or None if unparsed.
+
+    Both halves are things the hand-rolled scanner got wrong, and both were
+    wrong for the same reason -- it approximates shell quoting rather than
+    implementing a grammar:
+
+    * `statements` are the top-level statement texts. The scanner mis-reads a
+      partly quoted heredoc word (`<<'EO'F`, whose real delimiter is `EOF`),
+      so the body swallows every following line and the commands on them are
+      never classified at all. Note a span ends at the heredoc *operator*, not
+      past the body, which is why these supplement a full-command scan rather
+      than replacing it.
+    * `substitutions` are the inner texts of every command substitution at any
+      depth, which the scanner missed in each context where a quote is not
+      really a quote.
+
+    Returns inner command texts flattened, not nested, because the tree has
+    already done the nesting.
+    """
+    tree = _shfmt_tree(command)
+    if tree is None:
+        return None
+    raw = command.encode("utf-8")  # mvdan/sh offsets are byte offsets
+    out: list = []
+
+    def span_of(node) -> str | None:
+        start = node.get("Pos", {}).get("Offset")
+        end = node.get("End", {}).get("Offset")
+        if start is None or end is None or not 0 <= start < end <= len(raw):
+            return None
+        return raw[start:end].decode("utf-8", "replace")
+
+    def inner_of(node) -> str | None:
+        start = node.get("Pos", {}).get("Offset")
+        end = node.get("End", {}).get("Offset")
+        if start is None or end is None or not 0 <= start < end <= len(raw):
+            return None
+        span = raw[start:end]
+        if span.startswith(b"`") and span.endswith(b"`"):
+            body = span[1:-1]
+        elif span.startswith(b"$(") and span.endswith(b")"):
+            body = span[2:-1]
+        else:
+            return None
+        return body.decode("utf-8", "replace")
+
+    def walk(node, requoting: bool) -> None:
+        if isinstance(node, list):
+            for item in node:
+                walk(item, requoting)
+            return
+        if not isinstance(node, dict):
+            return
+        kind = node.get("Type")
+        if kind == "CmdSubst":
+            text = inner_of(node)
+            if text is None:
+                # A substitution whose own text cannot be recovered is a gap,
+                # and a gap must read as unknown rather than as nothing.
+                raise Unparseable("ast-substitution-span-unreadable")
+            out.append(text)
+        elif kind == "SglQuoted" and requoting:
+            value = node.get("Value") or ""
+            if _SUB_START.search(value) and depth < _MAX_AST_REQUOTE_DEPTH:
+                nested = _ast_view(value, depth + 1)
+                if nested is None:
+                    raise Unparseable("ast-requoted-text-unparseable")
+                out.extend(nested[1])
+        if kind in _REQUOTING_CONTEXTS:
+            requoting = True
+        for key, value in node.items():
+            if key not in ("Type", "Pos", "End"):
+                walk(value, requoting)
+
+    walk(tree, False)
+    statements = []
+    for stmt in tree.get("Stmts") or []:
+        text = span_of(stmt) if isinstance(stmt, dict) else None
+        if text and text.strip():
+            statements.append(text)
+    return statements, out
+
+
 def _collect_literal_expansions(body: str, subs: list, depth: int = 0) -> None:
     """Append every command substitution in `body` to `subs`, quotes and all.
 
@@ -858,10 +981,14 @@ class Ctx:
     subs: list | None = None
     funcs: set = field(default_factory=set)
     files: dict = field(default_factory=dict)
+    # Inner texts of every substitution the hand-rolled scanner recursed into,
+    # shared across the whole classification so `classify` can tell what the
+    # parser found that the scanner did not. One set per command, not per depth.
+    seen_subs: set | None = None
 
     def child(self) -> "Ctx":
         return Ctx(self.cwd, self.root, self.policy, self.git, dict(self.vars), self.depth + 1,
-                   self.script_cache, None, set(self.funcs), self.files)
+                   self.script_cache, None, set(self.funcs), self.files, self.seen_subs)
 
 
 @dataclass
@@ -949,6 +1076,8 @@ def classify_text(text: str, ctx: Ctx) -> list:
     results: list = []
     # Substitutions: classify their inner commands as part of this call.
     for kind, inner in scan.subs:
+        if ctx.seen_subs is not None:
+            ctx.seen_subs.add(inner.strip())
         sub_ctx = ctx.child()
         results.extend(classify_text(inner, sub_ctx))
     ctx.subs = scan.subs
@@ -1848,9 +1977,56 @@ def git_analyse(args: list, ctx: Ctx, reasons: list) -> Simple:
 def classify(command: str, cwd: str | None, policy: Policy, git: GitInfo | None = None,
              script_cache: dict | None = None) -> dict:
     ctx = Ctx(cwd=cwd, root=cwd, policy=policy, git=git or GitInfo(),
-              script_cache=script_cache if script_cache is not None else {})
+              script_cache=script_cache if script_cache is not None else {},
+              seen_subs=set())
     try:
-        simples = classify_text(command, ctx)
+        # mvdan/sh decides what substitutions exist. The hand-rolled scanner
+        # below still segments the command into words, which is not where it
+        # went wrong -- it went wrong on quoting, and a real grammar does that
+        # correctly. A command the parser cannot read is unknown, never ok.
+        view = _ast_view(command)
+        if view is None:
+            return {
+                "status": "unknown",
+                "reasons": ["unknown:shell-unparseable"],
+                "simples": [("(unparseable)", ["unknown:shell-unparseable"])],
+            }
+        ast_statements, ast_subs = view
+        # The whole command, not the parser's per-statement spans. mvdan/sh ends
+        # a statement at the heredoc *operator*, so `python3 - <<'EOF' ... EOF`
+        # spans only the first line; the body -- the actual script, with its
+        # network calls and writes -- lies outside every span. Segmenting by
+        # spans alone silently dropped it.
+        simples = list(classify_text(command, ctx))
+
+        def add_missed(texts, make_ctx):
+            """Classify `texts`, keeping only what the full scan did not find.
+
+            Both extra passes exist for the same reason and are additive, never
+            a replacement: where the scanner's approximation of quoting hides
+            something, the grammar still sees it, so it arrives by this path
+            instead of becoming a false ok.
+            """
+            for text in texts:
+                for s in classify_text(text, make_ctx()):
+                    if any(r not in reasons_seen for r in s.reasons):
+                        reasons_seen.update(s.reasons)
+                        simples.append(s)
+
+        reasons_seen = {r for s in simples for r in s.reasons}
+        # Statements the scanner never reached: it mis-reads a partly quoted
+        # heredoc word (`<<'EO'F`, whose real delimiter is EOF), so the body
+        # swallows every following line and the commands on them vanish.
+        add_missed(
+            (t for t in ast_statements if t.strip() != command.strip()),
+            lambda: ctx,
+        )
+        # Substitutions the scanner never recursed into, for the same reason in
+        # each context where a quote is not really a quote.
+        add_missed(
+            (t for t in ast_subs if t.strip() and t.strip() not in ctx.seen_subs),
+            ctx.child,
+        )
     except Unparseable as e:
         return {"status": "unknown", "reasons": [f"unknown:{e}"], "simples": [("(unparseable)", [f"unknown:{e}"])]}
     except RecursionError:
