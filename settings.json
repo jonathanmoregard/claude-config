@@ -96,7 +96,6 @@
       "Edit(//home/jonathan/Repos/nixos-config-worktrees/**)",
       "Edit(//home/jonathan/worktrees/**)",
       "Edit(//home/jonathan/.claude/projects/**)",
-      "Edit(//home/jonathan/.claude/skills/**)",
       "Edit(//home/jonathan/.claude/loops/**)",
       "Edit(//home/jonathan/.local/state/claude-self-compact/**)",
       "Edit(//home/jonathan/.local/state/claude-tasks/**)",
@@ -854,7 +853,8 @@
   "sandbox": {
     "enabled": false,
     "autoAllowBashIfSandboxed": true,
-    "allowUnsandboxedCommands": false
+    "allowUnsandboxedCommands": false,
+    "failIfUnavailable": true
   },
   "effortLevel": "xhigh",
   "advisorModel": "opus",
