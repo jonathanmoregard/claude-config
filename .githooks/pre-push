@@ -10,10 +10,6 @@
 # rewrites and stages mcp-servers.json, and running it for a push that is then
 # refused would leave the live checkout dirty. `git push --no-verify` skips this hook (git
 # offers no unskippable push hook); the commit and ref guards are the floor.
-#
-# A push that is allowed also has to pass the dev-path isolation gate: no
-# runtime config on the tree being pushed may execute from a dev-only tree.
-# The gate is read-only, so it keeps the no-side-effects property above.
 
 set -uo pipefail
 
@@ -30,49 +26,15 @@ while IFS= read -r line; do
 done
 
 origin_url="$(git config --local --get remote.origin.url 2>/dev/null || true)"
-hook_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-
-# Set once the remote is known to be this config repo, so the gate below runs
-# for our pushes and never for an unrelated repository that merely forwards.
-ours=0
-
-# Runtime config must not execute from tests/, docs/, experiments/ or
-# research/. The gate ships beside these hooks, and core.hooksPath is the
-# primary checkout's .githooks, so this is always master's gate measuring the
-# tree actually being pushed. Refuse when it cannot run: a gate that is
-# installed but unable to answer is not a reason to let the push through.
-isolation_gate() {
-  local gate="$hook_dir/../scripts/check-dev-path-isolation.py" top rc=0
-  if [ ! -f "$gate" ]; then
-    printf 'worktree-policy: no dev-path isolation gate installed at %s\n' "$gate" >&2
-    return 0
-  fi
-  if ! command -v python3 >/dev/null 2>&1; then
-    printf '\nREFUSED — no python3 on PATH, so the dev-path isolation gate cannot run.\n\n  gate: %s\n\nInstall python3, or push with --no-verify to override.\n' "$gate" >&2
-    return 1
-  fi
-  top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
-  [ -n "$top" ] || return 0
-  python3 "$gate" --repo-root "$top" --quiet || rc=$?
-  case "$rc" in
-    0) return 0 ;;
-    1) printf '\nREFUSED — dev-only code is on the agent runtime path (violations above).\n\n  tree: %s\n\nFix the violations, or push with --no-verify to override.\n' "$top" >&2 ;;
-    *) printf '\nREFUSED — the dev-path isolation gate failed to run (exit %s, see above).\n\n  gate: %s\n\nFix the gate, or push with --no-verify to override.\n' "$rc" "$gate" >&2 ;;
-  esac
-  return 1
-}
-
 forward_global() {
-  if [ "$ours" -eq 1 ]; then
-    isolation_gate || exit 1
-  fi
+  local hook_dir
+  hook_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
   printf '%s' "$payload" \
     | WORKTREE_POLICY_FORWARD_HOOK=pre-push "$hook_dir/_forward-global-hook" "$@"
   exit $?
 }
 
 [[ "$origin_url" =~ [:/]jonathanmoregard/(\.claude|claude-config)(\.git)?/?$ ]] || forward_global "$@"
-ours=1
 
 dirs="$(git rev-parse --path-format=absolute --git-dir --git-common-dir 2>/dev/null || true)"
 git_dir=""

@@ -1,11 +1,15 @@
-# Keeps dev-only code off the agent's execution path on every change.
+# Runs the repository's quick deterministic checks on every change.
 #
 # `pull_request` only, never `pull_request_target`: this repository's own
 # branches are not forks and do get secrets, and GitHub Security Lab names
 # "write their payload as a new test that will be run with others" as the
 # matching attack. So the job takes no secrets, declares read-only
-# permissions, and never fetches the vendored submodules -- the gate reads
-# tracked text, nothing from the scanned tree executes.
+# permissions, and never fetches the vendored submodules.
+#
+# This is the enforcement point on purpose. A client-side git hook is not one:
+# `git push --no-verify` skips it, and `core.hooksPath` is local config any
+# worktree can change. Making `checks` a required status check on master is a
+# repository setting, and the only step here that is not in the diff.
 name: checks
 
 on:
@@ -21,18 +25,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  dev-path-isolation:
+  checks:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: The live tree keeps the runtime off dev-only trees
-        run: python3 scripts/check-dev-path-isolation.py
+      - name: No declared entrypoint names a dev-only tree
+        run: python3 scripts/lint-runtime-entrypoints.py
 
-      - name: The gate itself still detects what it is for
+      - name: The lint still detects what it is for
         run: |
           python3 -m pip install --disable-pip-version-check --quiet 'pytest>=8,<9'
-          python3 -m pytest tests/test_check_dev_path_isolation.py -q
+          python3 -m pytest tests/test_lint_runtime_entrypoints.py -q
 
-      - name: The master pin and the push-time gate hold
+      - name: The master pin holds
         run: bash tests/test_worktree_policy.sh

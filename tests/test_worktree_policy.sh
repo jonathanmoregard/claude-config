@@ -93,8 +93,7 @@ git init -q -b master "$ROOT/seed"
   cd "$ROOT/seed" || exit 1
   mkdir -p .githooks scripts
   cp -a "$REPO_ROOT"/.githooks/. .githooks/
-  for s in install-worktree-policy.sh claude-worktree.sh worktree-policy-session-start.sh claude-pull.sh \
-           check-dev-path-isolation.py; do
+  for s in install-worktree-policy.sh claude-worktree.sh worktree-policy-session-start.sh claude-pull.sh; do
     cp -a "$REPO_ROOT/scripts/$s" scripts/
   done
   printf '{\n  "model": "upstream-model",\n  "env": {}\n}\n' > settings.json
@@ -311,27 +310,6 @@ try env GLOBAL_FAIL_HOOK=pre-commit git -C "$LINKED" commit -qm blocked
 git -C "$LINKED" restore --staged tracked.txt; git -C "$LINKED" restore tracked.txt
 try env GLOBAL_FAIL_HOOK=pre-push git -C "$LINKED" push -q origin feat/policy-test:feat/x
 [ "$RC" -ne 0 ] && ok "a blocking global pre-push still blocks" || bad "a blocking global pre-push still blocks" "rc=$RC"
-
-# --- the dev-path isolation gate runs on push --------------------------------
-# A push publishes a whole tree, so the gate measures the tree being pushed:
-# runtime config that executes from a dev-only tree never reaches origin, while
-# ordinary work inside those trees is untouched.
-printf '#!/usr/bin/env bash\nbash "$HOME/.claude/tests/helper.sh"\n' > "$LINKED/runtime-hook.sh"
-git -C "$LINKED" add runtime-hook.sh
-git -C "$LINKED" commit -qm "a runtime script reaching into tests/"
-expect_refused "push is refused when runtime config executes from a dev-only tree" \
-  'dev-only code is on the agent runtime path' \
-  git -C "$LINKED" push -q origin feat/policy-test
-git -C "$LINKED" rm -q runtime-hook.sh
-git -C "$LINKED" commit -qm "drop the runtime script"
-expect_ok "push is allowed once the violation is gone" \
-  git -C "$LINKED" push -q origin feat/policy-test
-mkdir -p "$LINKED/tests"
-printf '#!/usr/bin/env bash\necho dev-only\n' > "$LINKED/tests/scratch.sh"
-git -C "$LINKED" add tests/scratch.sh
-git -C "$LINKED" commit -qm "ordinary work inside tests/"
-expect_ok "push of ordinary dev-only work is not blocked" \
-  git -C "$LINKED" push -q origin feat/policy-test
 
 # --- other repositories are untouched ----------------------------------------
 OTHER="$ROOT/other"
