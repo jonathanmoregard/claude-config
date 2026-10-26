@@ -14,7 +14,13 @@ Each fixture is a run the naive grader would have scored, carrying BOTH
 witnesses in its final message, so any verdict other than INCONCLUSIVE means
 the guard under test did not fire.
 
-Run:  nix shell nixpkgs#python3Packages.pytest -c pytest tests/test_claudemd_excludes_grader.py -q
+`tests/enforced/` is the directory the required `checks` job runs whole, so
+this suite is covered by living here rather than by being named in the
+workflow. That matters for this file in particular: the guards it pins are the
+only reason the scenario's weaker witness is sound, and a guard that quietly
+stops firing turns dropped runs into confident verdicts.
+
+Run:  nix shell nixpkgs#python3Packages.pytest -c pytest tests/enforced -q
 """
 
 from __future__ import annotations
@@ -25,7 +31,7 @@ from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parents[2]
 CHECK = REPO_ROOT / "tests" / "agent-e2e" / "claudemd-excludes-vendor" / "check.sh"
 
 PASS, FAIL, INCONCLUSIVE = 0, 1, 2
