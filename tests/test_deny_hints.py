@@ -22,7 +22,10 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-HOOK = REPO / "hooks" / "deny-hints.py"
+# `runtime/` once the layout migration has landed, the repository root
+# before it. Only the projected subset moves; tests/ stays at the root.
+RUNTIME = REPO / "runtime" if (REPO / "runtime").is_dir() else REPO
+HOOK = RUNTIME / "hooks" / "deny-hints.py"
 
 _spec = importlib.util.spec_from_file_location("deny_hints", HOOK)
 deny_hints = importlib.util.module_from_spec(_spec)
@@ -51,7 +54,7 @@ _nodes = [
 ]
 assert len(_nodes) == 7, f"oracle extraction found {len(_nodes)} nodes, wanted 7"
 _bg_spec = importlib.util.spec_from_file_location(
-    "bash_guard_for_deny_hints", REPO / "hooks" / "bash-guard.py"
+    "bash_guard_for_deny_hints", RUNTIME / "hooks" / "bash-guard.py"
 )
 _bash_guard = importlib.util.module_from_spec(_bg_spec)
 _bg_spec.loader.exec_module(_bash_guard)
@@ -79,7 +82,7 @@ def _bash_payload(command: str) -> str:
 
 
 def _settings_deny() -> list[str]:
-    return json.load(open(REPO / "settings.json"))["permissions"]["deny"]
+    return json.load(open(RUNTIME / "settings.json"))["permissions"]["deny"]
 
 
 # --- contract 1: no ghost rules -------------------------------------------

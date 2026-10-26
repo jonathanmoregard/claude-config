@@ -47,7 +47,10 @@ import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-HOOK = REPO_ROOT / "hooks" / "claude-pull-health.py"
+# `runtime/` once the layout migration has landed, the repository root
+# before it. Only the projected subset moves; tests/ stays at the root.
+RUNTIME = REPO_ROOT / "runtime" if (REPO_ROOT / "runtime").is_dir() else REPO_ROOT
+HOOK = RUNTIME / "hooks" / "claude-pull-health.py"
 
 # Mirrored from the hook. Twelve hours is chosen against the machine this runs
 # on: a laptop that suspends overnight, whose claude-pull.timer is

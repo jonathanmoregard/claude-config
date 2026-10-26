@@ -24,7 +24,13 @@ import sys
 import tempfile
 from pathlib import Path
 
-HOOK = Path(__file__).resolve().parent.parent / "date-reminder-hook.py"
+# `runtime/` once the layout migration has landed, the repository root before
+# it. Only the projected subset moves; tests/ stays at the root.
+RUNTIME = Path(__file__).resolve().parents[1]
+if (RUNTIME / "runtime").is_dir():
+    RUNTIME = RUNTIME / "runtime"
+
+HOOK = RUNTIME / "date-reminder-hook.py"
 FAILURES: list[str] = []
 
 

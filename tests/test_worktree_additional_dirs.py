@@ -23,7 +23,13 @@ import sys
 import tempfile
 from pathlib import Path
 
-HOOK = Path(__file__).resolve().parent.parent / "worktree-additional-dirs.py"
+# `runtime/` once the layout migration has landed, the repository root before
+# it. Only the projected subset moves; tests/ stays at the root.
+RUNTIME = Path(__file__).resolve().parents[1]
+if (RUNTIME / "runtime").is_dir():
+    RUNTIME = RUNTIME / "runtime"
+
+HOOK = RUNTIME / "worktree-additional-dirs.py"
 FAILURES: list[str] = []
 ENV = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
