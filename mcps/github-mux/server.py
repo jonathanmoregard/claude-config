@@ -69,7 +69,14 @@ QUALIFIER_RE = re.compile(
     r'(?P<value>"[^"]*"|[^\s()]+)',
     re.IGNORECASE,
 )
-CONFIG_KEYS = frozenset({"command", "sharedArgs", "defaultOwners", "ownerChildren"})
+CONFIG_KEYS = frozenset(
+    {"command", "sharedArgs", "defaultOwners", "ownerChildren", "allowedBases"}
+)
+# Tools that choose or change a pull request's base branch. `create_pull_request`
+# requires `base`; `update_pull_request` can retarget an open one, and neither is
+# in --exclude-tools. Bash's `gh pr create --base` is denied outright, so without
+# this the MCP path is the way around that rule.
+BASE_ARGUMENT_TOOLS = frozenset({"create_pull_request", "update_pull_request"})
 
 
 class ConfigError(ValueError):
@@ -86,6 +93,7 @@ class MuxConfig:
     shared_args: tuple[str, ...]
     default_owners: frozenset[str]
     owner_children: dict[str, tuple[str, ...]]
+    allowed_bases: frozenset[str]
 
 
 def _login(value: object, where: str) -> str:
@@ -130,6 +138,9 @@ def parse_config(raw: object) -> MuxConfig:
         shared_args=_string_list(raw["sharedArgs"], "sharedArgs"),
         default_owners=default_owners,
         owner_children=owner_children,
+        allowed_bases=frozenset(
+            base.lower() for base in _string_list(raw["allowedBases"], "allowedBases")
+        ),
     )
 
 
@@ -303,6 +314,32 @@ def stop_children(children: dict[str | None, Child], stop: anyio.Event) -> None:
             child.start_scope.cancel()
 
 
+def base_refusal(name: str, arguments: dict[str, Any], config: MuxConfig) -> str | None:
+    """Why this call may not set a pull request's base; None when it may.
+
+    Only the value is gated: a PR whose base is the repository's default branch
+    is ordinary work, and one aimed anywhere else is the caller choosing a merge
+    target for someone else. That choice stays with the human, who can retarget
+    the PR in GitHub's own UI.
+    """
+    if name not in BASE_ARGUMENT_TOOLS or "base" not in arguments:
+        return None
+    base = arguments["base"]
+    if not isinstance(base, str) or not base:
+        return (
+            f"{name}: base must be a non-empty string, got {base!r}. "
+            "A base that cannot be read cannot be checked."
+        )
+    if base.lower() in config.allowed_bases:
+        return None
+    allowed = ", ".join(sorted(config.allowed_bases)) or "(none)"
+    return (
+        f"{name}: base {base!r} is not an allowed default branch ({allowed}). "
+        "Target the default branch; retargeting a pull request elsewhere is the "
+        "repository owner's call, made in GitHub's UI."
+    )
+
+
 def _error(message: str) -> types.CallToolResult:
     return types.CallToolResult(
         content=[types.TextContent(type="text", text=f"github-mux: {message}")], isError=True
@@ -318,6 +355,9 @@ async def dispatch(
 ) -> types.CallToolResult:
     if name not in tool_names:
         return _error(f"unknown tool {name!r}")
+    refusal = base_refusal(name, arguments, config)
+    if refusal is not None:
+        return _error(refusal)
     try:
         owner = route(arguments, config)
     except RoutingError as exc:

@@ -75,9 +75,75 @@ def config(**overrides):
         "sharedArgs": ["--toolsets", "repos"],
         "defaultOwners": ["jonathanmoregard"],
         "ownerChildren": {"klaffat": ["--owner", "klaffat"]},
+        "allowedBases": ["main", "master"],
     }
     raw.update(overrides)
     return mux.parse_config(raw)
+
+
+class BaseGuardTest(unittest.TestCase):
+    """`base` is a required argument, so the only gate is its value."""
+
+    def setUp(self) -> None:
+        self.cfg = config()
+
+    def refusal(self, name, arguments):
+        return mux.base_refusal(name, arguments, self.cfg)
+
+    def test_default_base_is_allowed(self) -> None:
+        self.assertIsNone(self.refusal("create_pull_request", {"base": "main"}))
+        self.assertIsNone(self.refusal("create_pull_request", {"base": "master"}))
+
+    def test_base_match_is_case_insensitive(self) -> None:
+        self.assertIsNone(self.refusal("create_pull_request", {"base": "Main"}))
+
+    def test_feature_branch_base_is_refused(self) -> None:
+        message = self.refusal("create_pull_request", {"base": "feat/something"})
+        self.assertIsNotNone(message)
+        self.assertIn("feat/something", message)
+
+    def test_retargeting_an_existing_pr_is_refused_too(self) -> None:
+        # update_pull_request is not in --exclude-tools and takes a new base,
+        # so without this the guard is one API call away from useless.
+        message = self.refusal("update_pull_request", {"pullNumber": 1, "base": "release/1.x"})
+        self.assertIsNotNone(message)
+        self.assertIn("release/1.x", message)
+
+    def test_update_without_a_base_is_untouched(self) -> None:
+        self.assertIsNone(self.refusal("update_pull_request", {"pullNumber": 1, "title": "x"}))
+
+    def test_a_non_string_base_is_refused_rather_than_coerced(self) -> None:
+        self.assertIsNotNone(self.refusal("create_pull_request", {"base": ["main"]}))
+
+    def test_an_empty_base_is_refused(self) -> None:
+        self.assertIsNotNone(self.refusal("create_pull_request", {"base": ""}))
+
+    def test_other_tools_are_not_touched(self) -> None:
+        self.assertIsNone(self.refusal("list_pull_requests", {"base": "feat/x"}))
+
+    def test_allowed_bases_come_from_the_config(self) -> None:
+        cfg = config(allowedBases=["trunk"])
+        self.assertIsNone(mux.base_refusal("create_pull_request", {"base": "trunk"}, cfg))
+        self.assertIsNotNone(mux.base_refusal("create_pull_request", {"base": "main"}, cfg))
+
+    def test_an_empty_allowed_list_refuses_every_base(self) -> None:
+        # Fail closed: a config that names no base does not mean "any base".
+        cfg = config(allowedBases=[])
+        self.assertIsNotNone(mux.base_refusal("create_pull_request", {"base": "main"}, cfg))
+
+    def test_allowed_bases_is_required(self) -> None:
+        raw = {
+            "command": "/bin/true",
+            "sharedArgs": [],
+            "defaultOwners": ["jonathanmoregard"],
+            "ownerChildren": {},
+        }
+        with self.assertRaises(mux.ConfigError):
+            mux.parse_config(raw)
+
+    def test_tracked_config_allows_the_default_branches_only(self) -> None:
+        cfg = mux.load_config(TRACKED_CONFIG)
+        self.assertEqual(cfg.allowed_bases, frozenset({"main", "master"}))
 
 
 class RouteTest(unittest.TestCase):
@@ -280,7 +346,7 @@ def write_launcher(directory: Path) -> Path:
     return launcher
 
 
-FAKE_TOOLS = "get_me,list_pull_requests,search_issues,crash"
+FAKE_TOOLS = "get_me,list_pull_requests,search_issues,create_pull_request,crash"
 
 
 class MuxIntegrationTest(unittest.IsolatedAsyncioTestCase):
@@ -305,6 +371,7 @@ class MuxIntegrationTest(unittest.IsolatedAsyncioTestCase):
                     "sharedArgs": ["--tools", FAKE_TOOLS, "--instructions", "fake guidance"],
                     "defaultOwners": ["jonathanmoregard"],
                     "ownerChildren": {"klaffat": klaffat_args},
+                    "allowedBases": ["main"],
                 }
             ),
             encoding="utf-8",
@@ -444,6 +511,29 @@ class MuxIntegrationTest(unittest.IsolatedAsyncioTestCase):
             )
         self.assertTrue(result.isError)
         self.assertNotIn('"label"', text)
+
+    async def test_a_non_default_base_never_reaches_the_child(self) -> None:
+        async with self.open_mux(["--label", "klaffat"]) as session:
+            # The default child echoes whatever it is sent, so a forwarded call
+            # is visible in the reply. Nothing but the mux can stop this one.
+            result, text = await self.call(
+                session,
+                "create_pull_request",
+                {"owner": "jonathanmoregard", "repo": "x", "base": "feat/sneaky"},
+            )
+        self.assertTrue(result.isError)
+        self.assertIn("feat/sneaky", text)
+        self.assertNotIn('"label"', text)
+
+    async def test_the_default_base_is_forwarded_as_before(self) -> None:
+        async with self.open_mux(["--label", "klaffat"]) as session:
+            text = await self.answered_by(
+                session,
+                "create_pull_request",
+                {"owner": "jonathanmoregard", "repo": "x", "base": "main"},
+            )
+        # The default child answers with its own label, so the call was forwarded.
+        self.assertEqual(text, "personal")
 
     async def test_child_with_different_tool_set_is_fenced_off(self) -> None:
         async with self.open_mux(
