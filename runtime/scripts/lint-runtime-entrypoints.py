@@ -268,9 +268,25 @@ def command_strings_in_settings(data: dict) -> list[tuple[str, str]]:
     return found
 
 
+# The declared-entrypoint files are projected into `~/.claude`, so once the
+# runtime subset moves under `runtime/` they live one level deeper. Looking in
+# one place only is how this lint went quiet: on a restructured tree it found
+# no `settings.json`, read nothing, and reported **clean**. A check that
+# reports success because it could not find its input is worse than no check,
+# so `main` refuses to pass when it finds neither file.
+CONFIG_SUBDIR = "runtime"
+
+
+def locate(root: Path, name: str) -> Path | None:
+    for candidate in (root / CONFIG_SUBDIR / name, root / name):
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def check_settings(root: Path) -> list[Violation]:
-    path = root / "settings.json"
-    if not path.exists():
+    path = locate(root, "settings.json")
+    if path is None:
         return []
     raw = path.read_text()
     try:
@@ -289,8 +305,8 @@ def check_settings(root: Path) -> list[Violation]:
 
 
 def check_mcp_servers(root: Path) -> list[Violation]:
-    path = root / "mcp-servers.json"
-    if not path.exists():
+    path = locate(root, "mcp-servers.json")
+    if path is None:
         return []
     raw = path.read_text()
     try:
@@ -336,8 +352,23 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         root = Path(top)
     root = root.resolve()
-    if not (root / ".git").exists() and not (root / "settings.json").exists():
+    if not (root / ".git").exists() and locate(root, "settings.json") is None:
         print(f"lint-runtime-entrypoints: {root} is not a config repo", file=sys.stderr)
+        return 2
+
+    # Fail closed on an empty input. Both files absent means this run examined
+    # nothing, and a lint that prints "clean" after reading nothing is a green
+    # tick with no content behind it -- which is precisely what happened when
+    # the runtime subset moved and the paths were not updated.
+    found = [name for name in ("settings.json", "mcp-servers.json")
+             if locate(root, name) is not None]
+    if not found:
+        print(
+            f"lint-runtime-entrypoints: found neither settings.json nor "
+            f"mcp-servers.json under {root} or {root / CONFIG_SUBDIR} -- "
+            "refusing to report clean on an empty input",
+            file=sys.stderr,
+        )
         return 2
 
     violations = check_settings(root) + check_mcp_servers(root)

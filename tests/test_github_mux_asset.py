@@ -12,13 +12,16 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+# `runtime/` once the layout migration has landed, the repository root
+# before it. Only the projected subset moves; tests/ stays at the root.
+RUNTIME = ROOT / "runtime" if (ROOT / "runtime").is_dir() else ROOT
 WRAPPER = "github-app-mcp-server"
 MUX_SERVER = "/home/jonathan/.claude/mcps/github-mux/server.py"
 MUX_CONFIG = "/home/jonathan/.claude/mcps/github-mux/config.json"
 
 
 def servers() -> dict:
-    return json.loads((ROOT / "mcp-servers.json").read_text(encoding="utf-8"))
+    return json.loads((RUNTIME / "mcp-servers.json").read_text(encoding="utf-8"))
 
 
 class GithubMuxAssetTest(unittest.TestCase):
@@ -37,10 +40,10 @@ class GithubMuxAssetTest(unittest.TestCase):
         self.assertEqual(args[args.index("--script") + 1], MUX_SERVER)
         self.assertEqual(args[args.index("--config") + 1], MUX_CONFIG)
         for path in (MUX_SERVER, MUX_CONFIG):
-            self.assertTrue((ROOT / Path(path).relative_to("/home/jonathan/.claude")).is_file())
+            self.assertTrue((RUNTIME / Path(path).relative_to("/home/jonathan/.claude")).is_file())
 
     def test_github_permissions_name_the_mux_only(self) -> None:
-        settings = json.loads((ROOT / "settings.json").read_text(encoding="utf-8"))
+        settings = json.loads((RUNTIME / "settings.json").read_text(encoding="utf-8"))
         permissions = settings.get("permissions") or {}
         for rule in [*(permissions.get("allow") or []), *(permissions.get("deny") or [])]:
             if not rule.startswith("mcp__github"):

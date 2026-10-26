@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -100,6 +101,24 @@ def test_nothing_is_misplaced_in_this_tree():
 
 # -------------------------------------------------------------- symlink geometry
 
+def test_the_workflow_only_runs_paths_that_exist():
+    """A moved file turns a CI step into a no-op or a nuisance failure.
+
+    The layout change relocated `scripts/`, and the workflow kept naming the
+    old path. That is the whole class: a check wired to a path nothing
+    occupies. Parsing the `run:` lines for repo-relative arguments catches it
+    on the branch that moves the file, rather than after the merge.
+    """
+    workflow = (REPO_ROOT / ".github" / "workflows" / "checks.yml").read_text()
+    referenced = set(re.findall(
+        r"(?:python3|bash|python3 -m pytest)\s+(?:-m pytest\s+)?"
+        r"([A-Za-z0-9_][A-Za-z0-9_./-]*\.(?:py|sh)|tests/[A-Za-z0-9_./-]+)",
+        workflow))
+    assert referenced, "parsed no paths out of the workflow -- the regex rotted"
+    missing = sorted(p for p in referenced if not (REPO_ROOT / p).exists())
+    assert not missing, f"the workflow runs paths that do not exist: {missing}"
+
+
 @pytest.mark.parametrize("path,target,expected", [
     # The 33-entry skill farm. One extra `..` is right on both sides at once:
     # on disk it reaches `<repo>/vendor/y`, and under the mounts it reaches
@@ -119,6 +138,56 @@ def test_nothing_is_misplaced_in_this_tree():
 ])
 def test_retarget(path, target, expected):
     assert layout.retarget(path, target) == expected
+
+
+@pytest.mark.parametrize("path,target", [
+    # Reported in review. Both ends are projected, so both descend into
+    # runtime/ together and the hop is already correct. The first version
+    # added a `..` and pointed the link at <repo>/hooks/example, where nothing
+    # will ever be. No link of this shape exists in the tree today, which is
+    # exactly why it needed a test rather than a glance at the diff.
+    ("skills/example", "../hooks/example"),
+    ("agents/reviewer", "../templates/reviewer.md"),
+    ("commands/x", "../scripts/x.sh"),
+])
+def test_a_hop_between_two_projected_entries_is_left_alone(path, target):
+    assert layout.retarget(path, target) is None
+
+
+def test_a_hop_to_something_that_stays_put_climbs_one_more():
+    """The distinction the previous rule missed: vendor/ does not move."""
+    assert layout.retarget("skills/x", "../vendor/superpowers/skills/x") == \
+        "../../vendor/superpowers/skills/x"
+
+
+def test_a_dangling_link_inside_the_projection_fails_verify(tmp_path):
+    """Reported in review: the verifier said "no unresolvable symlink" for this.
+
+    It was checking where the target pointed and never whether anything was
+    there, so a link into a projected path that resolved to nothing passed.
+    A dangling skill is a skill that silently stops loading.
+    """
+    root = make_repo(tmp_path, {"runtime/hooks/guard.py": "pass\n"},
+                     {"runtime/skills/ghost": "../hooks/missing"})
+    proc = run(root, "--verify")
+    assert proc.returncode == 1
+    assert "dangles" in proc.stderr, proc.stderr
+
+
+def test_an_unverifiable_link_is_named_rather_than_passed(tmp_path):
+    """Not every target can be checked here, so those are counted, not claimed.
+
+    `git worktree add` does not initialise submodules, so the vendored trees
+    are empty in most checkouts and CI never fetches them. That is a real
+    limit, and the summary has to say so instead of reporting a clean run.
+    """
+    root = make_repo(tmp_path, {"runtime/hooks/guard.py": "pass\n"},
+                     {"runtime/skills/x": "../../vendor/superpowers/skills/x"})
+    proc = run(root, "--verify")
+    assert proc.returncode == 0
+    assert "not checkable here" in proc.stdout
+    assert "unchecked:" in proc.stdout
+    assert "no unresolvable symlink" not in proc.stdout
 
 
 def test_the_live_farm_retargets_without_leaving_runtime():

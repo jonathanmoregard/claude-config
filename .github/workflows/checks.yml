@@ -34,8 +34,12 @@ jobs:
 
       # Stdlib only, and deliberately before any install step: nothing fetched
       # from a package index can change this step's verdict.
+      # `runtime/scripts/`, not `scripts/`: the runtime subset moved one level
+      # down. The lint now locates the declared-entrypoint files in either
+      # place and refuses to report clean when it finds neither, because this
+      # step previously kept passing against a tree it could no longer read.
       - name: No declared entrypoint names a dev-only tree
-        run: python3 scripts/lint-runtime-entrypoints.py
+        run: python3 runtime/scripts/lint-runtime-entrypoints.py
 
       # The whole directory, never a list of files. A suite that guards one of
       # this repository's own guards is itself a measuring instrument, and an

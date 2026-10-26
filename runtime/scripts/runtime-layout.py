@@ -170,8 +170,24 @@ def misplaced(root: Path) -> list[str]:
 def retarget(path: str, target: str) -> str | None:
     """The target `path` needs once it has moved one level deeper.
 
-    `None` when it does not change. Absolute targets already resolve the same
-    from anywhere; a hop that stays inside the moved entry moves with it.
+    `None` when it does not change, which is the common case and the one that
+    is easy to get wrong. What decides it is whether the *other end* of the
+    link moves too:
+
+      skills/x -> ../hooks/y     both ends are projected, so both descend into
+                                 runtime/ together and the hop is unchanged.
+                                 Adding a `..` here points at <repo>/hooks/y,
+                                 which nothing will occupy.
+      skills/x -> ../vendor/y    vendor/ stays at the repository root, so the
+                                 link has one more level to climb. `../../`
+                                 is then right on disk *and* under the mounts,
+                                 because runtime/ sits exactly one level down
+                                 and the mount reproduces that.
+
+    A hop that stays inside the moved entry moves with it. Absolute targets
+    resolve the same from any depth. A relative target that leaves the
+    repository has no spelling that is right in both geometries, so it becomes
+    absolute.
     """
     if target.startswith("/"):
         return None
@@ -179,12 +195,11 @@ def retarget(path: str, target: str) -> str | None:
     resolved = posixpath.normpath(posixpath.join(posixpath.dirname(path), target))
     if resolved == entry or resolved.startswith(entry + "/"):
         return None
-    if not resolved.startswith(".."):
-        # Elsewhere in the repository: one more level to climb, and the mounted
-        # view has the same shape.
-        return "../" + target
-    # Out of the repository. No relative spelling is right in both geometries.
-    return posixpath.normpath(posixpath.join(HOME, resolved.lstrip("./")))
+    if resolved.startswith(".."):
+        return posixpath.normpath(posixpath.join(HOME, resolved.lstrip("./")))
+    if resolved.split("/", 1)[0] in set(PROJECTED):
+        return None
+    return "../" + target
 
 
 def plan(root: Path) -> tuple[list[tuple[str, str]], list[tuple[str, str, str]]]:
@@ -266,28 +281,61 @@ def verify(root: Path) -> int:
     if unclassified:
         failures.append("unclassified: " + ", ".join(unclassified))
 
-    # A symlink that leaves `runtime/` without landing on one of the four
-    # vendor projections is a path the mounted view cannot resolve.
+    # Two separate questions per symlink, and an earlier version asked only the
+    # first while reporting as though it had asked both:
+    #
+    #   where does the target point?  a path outside the projection cannot
+    #                                 resolve under the mounts at all;
+    #   is anything there?            a link into a projected path can still
+    #                                 dangle, and a dangling skill is a skill
+    #                                 that silently stops loading.
+    #
+    # Existence is not always answerable here, so the third outcome is named
+    # rather than folded into a pass: an absolute target is machine-specific,
+    # and the vendored submodules are empty in every `git worktree add` tree
+    # because that command does not initialise them. Those are reported and
+    # counted, never counted as verified.
     allowed_outside = (
         "vendor/superpowers/hooks", "vendor/superpowers/skills",
         "vendor/superpowers/package.json", "vendor/everything-claude-code/skills",
     )
+    checked = 0
+    unverifiable: list[str] = []
     for line in git("ls-files", "-s", RUNTIME_DIR, cwd=root).splitlines():
         if not line.startswith("120000"):
             continue
         path = line.split("\t", 1)[1]
         target = git("cat-file", "-p", f":{path}", cwd=root).strip()
+        exists = (root / path).exists()  # follows the link; False if dangling
+
         if target.startswith("/"):
+            if not exists:
+                unverifiable.append(f"{path} -> {target} (absolute, absent here)")
+            else:
+                checked += 1
             continue
+
         resolved = posixpath.normpath(
             posixpath.join(posixpath.dirname(path), target))
-        if resolved.startswith(RUNTIME_DIR + "/") or resolved == RUNTIME_DIR:
+        in_runtime = resolved == RUNTIME_DIR or resolved.startswith(RUNTIME_DIR + "/")
+        vendored = next((a for a in allowed_outside
+                         if resolved == a or resolved.startswith(a + "/")), None)
+        if not in_runtime and not vendored:
+            failures.append(
+                f"{path} -> {target} leaves {RUNTIME_DIR}/ for {resolved}, which "
+                "is not a projected path")
             continue
-        if any(resolved == a or resolved.startswith(a + "/") for a in allowed_outside):
+        if exists:
+            checked += 1
             continue
-        failures.append(
-            f"{path} -> {target} leaves {RUNTIME_DIR}/ for {resolved}, which is "
-            "not a projected path")
+        if vendored:
+            submodule = root / "/".join(vendored.split("/")[:2])
+            uninitialised = not submodule.is_dir() or not any(submodule.iterdir())
+            if uninitialised:
+                unverifiable.append(
+                    f"{path} -> {target} ({submodule.name} is not initialised)")
+                continue
+        failures.append(f"{path} -> {target} dangles: nothing at {resolved}")
 
     # Only entries this repository actually tracks -- the manifest lists what
     # is projected *if present*, so a tree with no `wellbeing/` is not broken.
@@ -301,8 +349,14 @@ def verify(root: Path) -> int:
         for failure in failures:
             print(f"  {failure}", file=sys.stderr)
         return 1
-    print(f"runtime-layout: {RUNTIME_DIR}/ holds {len(top)} projected entries; "
-          "no dev-only tree, no unresolvable symlink")
+    # Say what was actually established. The earlier wording claimed "no
+    # unresolvable symlink" on the strength of a containment check alone, which
+    # passed a link pointing at a target that did not exist.
+    print(f"runtime-layout: {RUNTIME_DIR}/ holds {len(top)} projected entries, "
+          f"no dev-only tree; {checked} symlink(s) resolve to something that "
+          f"exists, {len(unverifiable)} not checkable here")
+    for note in unverifiable:
+        print(f"  unchecked: {note}")
     return 0
 
 
