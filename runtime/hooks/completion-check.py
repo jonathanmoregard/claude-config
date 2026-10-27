@@ -40,7 +40,9 @@ Stateless. Every prompt re-derives everything:
    - a pushed feature branch with commits and no PR, in a repo that is not
      PR-gated (non-public + a workflow whose `on:` includes `pull_request` or
      `pull_request_target`, read with yq: there the PR waits for the user's
-     "Open the PR?" answer, which is not a gap);
+     "Open the PR?" answer, which is not a gap). The gap names the measured
+     visibility ("repo is PUBLIC, not PR-gated"), so the agent reads the fact
+     instead of guessing it;
    - an open PR with a failed check;
    - a merged PR whose clean PRIMARY checkout still sits on the branch, or a
      clean primary checkout on the default branch that is behind origin
@@ -361,14 +363,19 @@ def workflow_events(yq: str | None, path: pathlib.Path) -> set[str]:
     return set()
 
 
-def pr_gated(top: str, gh: str, nwo: str, yq: str | None) -> bool:
-    """CLAUDE.md: non-public repo whose workflows run on pull_request."""
-    vis = gh_json(gh, "repo", "view", nwo, "--json", "visibility").get("visibility")
+def pr_gated(top: str, gh: str, nwo: str, yq: str | None) -> tuple[bool, str]:
+    """CLAUDE.md: non-public repo whose workflows run on pull_request.
+
+    Returns (gated, measured visibility). The visibility goes into the gap
+    text: an agent that only read "pushed but has no PR" still called a
+    public repo private and asked permission to open the PR (2026-10-27).
+    """
+    vis = gh_json(gh, "repo", "view", nwo, "--json", "visibility").get("visibility") or "UNKNOWN"
     if vis == "PUBLIC":
-        return False
+        return False, vis
     wf = pathlib.Path(top, ".github", "workflows")
     files = sorted(list(wf.glob("*.yml")) + list(wf.glob("*.yaml")))
-    return any(workflow_events(yq, f) & PR_EVENTS for f in files)
+    return any(workflow_events(yq, f) & PR_EVENTS for f in files), vis
 
 
 def push_target(top: str, branch: str) -> tuple[str, str, str]:
@@ -470,9 +477,12 @@ def inspect(top: str, created: bool, gh: str | None, yq: str | None) -> list[tup
         prs = pr_list(gh, nwo, branch)
     if not prs:
         has_commits = int(git(top, "rev-list", "--count", f"origin/{default}..HEAD") or 0)
-        if has_commits and not pr_gated(top, gh, nwo, yq):
-            gaps.append((f"{branch} is pushed but has no PR",
-                         f"gh pr create -R {nwo} --head {shlex.quote(branch)} --fill"))
+        if has_commits:
+            gated, vis = pr_gated(top, gh, nwo, yq)
+            if not gated:
+                why = "" if vis == "PUBLIC" else ", no pull_request workflow"
+                gaps.append((f"{branch} is pushed but has no PR (repo is {vis}{why}, not PR-gated)",
+                             f"gh pr create -R {nwo} --head {shlex.quote(branch)} --fill"))
         return gaps
     pr = max(prs, key=lambda p: p.get("number", 0))
     if pr.get("state") == "OPEN":

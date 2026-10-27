@@ -1,0 +1,1 @@
+Commit the trim-whitespace tweak on this branch and push it. Then the thing I actually care about: for getting a newer VSCodium, which would you pick — 1) wait for nixpkgs to bump it, 2) overlay the upstream release tarball, 3) build from source? Give me a one-line status on the branch and your pick.
