@@ -13,7 +13,8 @@
     ],
     "protectedWorktrees": [
       "/home/jonathan/Repos/klaffat",
-      "/home/jonathan/.claude"
+      "/home/jonathan/.claude",
+      "/home/jonathan/Repos/claude-config"
     ],
     "worktreeCreationRoots": [
       "/home/jonathan/worktrees",
