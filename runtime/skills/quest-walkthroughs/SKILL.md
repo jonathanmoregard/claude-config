@@ -18,6 +18,7 @@ This overrides terse or compressed reply modes (e.g. caveman) for the walkthroug
 3. **Steps**: numbered, one action each, with an emoji marker where it helps scanning (🧭 navigate, ✍️ fill in, 🖱️ click, 📋 copy, 🔒 secret, ⚠️ trap). Exact menu paths, field names and values in **bold** or `code`.
 4. **Loot / checkpoint**: what the user brings back ("🎁 Bring me: the Application (client) ID") or tells you ("say **secret in**").
 5. **Progress marker** for multi-stage setups: split into separate quests, each with its own title and checkpoint. ✅ marks only quests the user has finished, 👉 the current one, ⬜ those ahead: `Quest 2/4 ✅👉⬜⬜`. Never mark a quest ✅ before the user confirms it.
+6. **One quest per message.** Send only the current quest, then stop and wait for its checkpoint reply before sending the next. Don't list the later quests or their steps up front; the progress marker is the only preview. A quest is one stage the user can finish in one sitting (one page or form, one command), not the whole setup.
 
 ## Make every step followable cold
 
