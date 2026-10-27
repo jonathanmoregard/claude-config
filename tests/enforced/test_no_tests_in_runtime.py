@@ -15,11 +15,18 @@ code at a live path is test code a hook, a skill or an MCP server can name.
 HOW IT DECIDES, and the limit of that. The check is a filename and directory
 heuristic, so it recognises the shapes this repository actually uses rather
 than proving a file is a test. A name nobody anticipated slips past: an
-`empirics-harness/run.sh` is a harness by content and `run.sh` by name. The
-heuristic is therefore paired with `ALLOWED`, which is empty — the same bargain
-`runtime-layout.py` strikes by refusing an entry it does not recognise. Adding
-an entry there is a decision someone has to write down and defend in review,
-and that, not the regex, is what keeps this honest.
+`empirics-harness/run.sh` is a harness by content and `run.sh` by name, and
+`mcps/github-mux/fake_child.py` was a stand-in child named like production
+code, which review caught here and not this guard.
+
+That limit is deliberate and the regex is NOT the place to fix it. The
+invariant is that test code lives under `tests/`, and what holds it is moving
+the files, not a classifier that grows a branch per surprise — each branch
+added is one more thing to be wrong about, and the next surprise will not match
+it either. The heuristic is paired with `ALLOWED`, which is empty: the same
+bargain `runtime-layout.py` strikes by refusing an entry it does not recognise.
+Adding an entry there is a decision someone has to write down and defend in
+review, and that, not the regex, is what keeps this honest.
 
 A directory component has to BE one of the reserved names, not merely contain
 one: `advice-refine-test-loop` and `ab-testing-prompt-changes` are live skills
@@ -45,7 +52,6 @@ TEST_FILENAME = re.compile(
       | ^.+[_-]test\.(py|sh)$      # codex-advise-test.sh, foo_test.py
       | ^conftest\.py$
       | ^.+\.test\.[^.]+$          # foo.test.ts
-      | ^(fake|stub|mock)[_-]      # fake_child.py, a stand-in for a real child
     """,
     re.VERBOSE,
 )
@@ -108,7 +114,6 @@ def test_the_heuristic_still_recognises_the_shapes_it_is_for():
         "runtime/skills/x/scripts/codex-advise-test.sh",
         "runtime/tools/ai-router/conftest.py",
         "runtime/mcps/x/server.test.ts",
-        "runtime/mcps/github-mux/fake_child.py",   # a stand-in, not a test_*
         "runtime/skills/x/tests/anything.py",      # by directory, any name
         "runtime/tools/x/fixtures/sample.json",
     ):
