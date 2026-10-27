@@ -155,4 +155,5 @@ never reorders the pins; changing them is an edit to `models.toml` through the
 `hooks/ai-router-*`, `hooks/statusline-quota-tee.sh` or this skill go through
 `~/worktrees/claude-<slug>/` off fresh `origin/master`, then a PR. Tests
 (pytest is nix-provided, not in the base python):
-`nix shell nixpkgs#python3Packages.pytest -c pytest -q tools/ai-router/tests tests/test_ai_router_hooks.py tests/test_ai_router_health.py tests/test_native_agent_routing.py`.
+`nix shell nixpkgs#python3Packages.pytest -c pytest -q tests/ai-router tests/test_ai_router_hooks.py tests/test_ai_router_health.py tests/test_native_agent_routing.py`.
+The suites live beside the other tests in the checkout, not under this tool.

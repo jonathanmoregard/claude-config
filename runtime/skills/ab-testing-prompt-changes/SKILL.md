@@ -98,7 +98,9 @@ arms, the task prompt and the rubric, say so.
 ## Files
 
 `ab_harness.py` (`contamination | worktrees | probe | run | grade`, one JSON
-config — read `--help`), `test_ab_harness.py`, `config.example.json`,
-`PREREGISTRATION-template.md`, `RESULTS-template.md`. Two real worked examples,
+config — read `--help`), `config.example.json`,
+`PREREGISTRATION-template.md`, `RESULTS-template.md`. The harness's own suite
+is `tests/ab-testing-prompt-changes/` in the claude-config checkout, outside
+what this skill ships. Two real worked examples,
 both null: `~/Repos/skill-ab/RESULTS.md` and, there,
 `experiments/recurrence-escalation/RESULTS.md`.

@@ -368,12 +368,13 @@ Fridays, declared in nixos-config):
   hook `hooks/reflect-backfill-health.py` speaks when a run crashed, failed
   closed, or hung.
 
-Tests: `bash skills/session-reflect/tests/backfill.sh`.
+Tests: `bash tests/session-reflect/backfill.sh`, from the claude-config
+checkout root.
 
 ### Tests
 
 ```bash
-bash skills/session-reflect/tests/run.sh fast
+bash tests/session-reflect/run.sh fast
 ```
 
 Offline by construction — a stub `claude` on `PATH`, no API spend, no writes
