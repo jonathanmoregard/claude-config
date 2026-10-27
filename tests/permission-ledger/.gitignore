@@ -1,0 +1,18 @@
+# Everything this suite writes, which is now beside the suite rather than
+# beside the subject. These rules have to live here: repo-autosync commits
+# whatever is untracked in this repository, so an unignored artifact is an
+# artifact committed back in.
+#
+# crontab.* is the one to keep in mind. run-tests.sh dumps the REAL user
+# crontab to crontab.before to prove it put it back unchanged, and this is a
+# public repository.
+crontab.*
+pass*.out
+settings.after*.json
+fake-crontab.txt
+stage/
+.testhome/
+# run-edge-cases.sh builds one fake HOME per case at .edge-<case>. No rule
+# covered these before the suite moved; they were untracked and visible.
+.edge-*/
+__pycache__/
