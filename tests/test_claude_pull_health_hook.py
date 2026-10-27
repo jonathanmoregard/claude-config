@@ -93,9 +93,26 @@ def write_status(state_root: Path, repo: Path, **fields) -> Path:
     return p
 
 
-def run_hook(state_root, targets, claude_home=None, home=None) -> subprocess.CompletedProcess:
+def run_hook(
+    state_root,
+    targets,
+    claude_home=None,
+    home=None,
+    system_state_root=None,
+    deploy_checkout=None,
+) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env["CLAUDE_PULL_STATE_ROOT"] = str(state_root)
+    # The config repo's puller is a SYSTEM unit writing a system state root, so
+    # the hook reads two roots. Both seams are pinned in every run: left to the
+    # real defaults, a test would read /var/lib/claude-runtime on the host and
+    # pass or fail on whatever that machine happens to hold.
+    env["CLAUDE_PULL_SYSTEM_STATE_ROOT"] = str(
+        system_state_root if system_state_root is not None else state_root / "no-system-root"
+    )
+    env["CLAUDE_DEPLOY_CHECKOUT"] = str(
+        deploy_checkout if deploy_checkout is not None else state_root / "no-deploy-checkout"
+    )
     # `home` is the seam for the post-cutover arm: with no CLAUDE_HOME set, the
     # hook derives both the config directory and the checkout it falls back to
     # from HOME, exactly as it does on the host.
@@ -460,12 +477,23 @@ section("The config repo is followed, not the path")
 
 # The runtime-projection cutover splits the config DIRECTORY from the config
 # CHECKOUT: ~/.claude keeps Claude Code's own state and receives read-only bind
-# mounts, while the repository the puller fast-forwards moves to
-# ~/Repos/claude-config. A hook that keeps naming ~/.claude unconditionally
-# would report the config repo as never-pulled every session for the rest of
-# time — a permanent false alarm in the one channel that reports a broken sync.
-# So the unconditional target follows the repository, and `.git` is what tells
-# the two eras apart without a flag to keep in sync.
+# mounts, while the repository the puller fast-forwards lives elsewhere. A hook
+# that keeps naming ~/.claude unconditionally would report the config repo as
+# never-pulled every session for the rest of time — a permanent false alarm in
+# the one channel that reports a broken sync. So the unconditional target
+# follows the repository, and `.git` is what tells the two eras apart without a
+# flag to keep in sync.
+#
+# WHICH repository that is changed again on 2026-10-27, and these assertions
+# changed with it. The served tree is now a DEPLOY clone under
+# /var/lib/claude-runtime, fast-forwarded every ten minutes by a system unit
+# that publishes to a system state root; ~/Repos/claude-config went back to
+# being the DEV checkout and is pulled by nothing, because branches and
+# worktrees live there and an unattended fast-forward of a tree someone may be
+# mid-rebase on is not a service. Naming the dev checkout would therefore be
+# the same permanent false alarm with a different path in it — truthful and
+# useless. Jonathan's framing: "Repos/claude-config is the dev version, and
+# .claude is the deployed artefact."
 
 with Sandbox() as sb:
     home = sb.repo("home")                       # pre-cutover: .claude IS the repo
@@ -482,24 +510,81 @@ with Sandbox() as sb:
     home = sb.repo("home")
     claude_home = home / ".claude"
     claude_home.mkdir()                          # no .git: post-cutover
-    checkout = home / "Repos" / "claude-config"
-    checkout.mkdir(parents=True)
-    (checkout / ".git").mkdir()
-    write_status(sb.state_root, checkout)
-    proc = run_hook(sb.state_root, None, home=home)
-    check("after the cutover a healthy ~/Repos/claude-config is what satisfies it",
+    deploy = sb.root / "deploy" / "checkout"
+    deploy.mkdir(parents=True)
+    (deploy / ".git").mkdir()
+    system_root = sb.root / "deploy" / "state"
+    system_root.mkdir(parents=True)
+    write_status(system_root, deploy)
+    proc = run_hook(
+        sb.state_root, None, home=home,
+        system_state_root=system_root, deploy_checkout=deploy,
+    )
+    check("after the cutover a healthy deploy clone is what satisfies it",
           proc.stdout == "", detail=repr(proc.stdout))
+
+# The record lives ONLY in the system root here, which is the half that would
+# silently not work if the hook still read one root: the deploy puller does not
+# run as Jonathan and never writes his state directory.
+with Sandbox() as sb:
+    home = sb.repo("home")
+    claude_home = home / ".claude"
+    claude_home.mkdir()
+    deploy = sb.root / "deploy" / "checkout"
+    deploy.mkdir(parents=True)
+    (deploy / ".git").mkdir()
+    system_root = sb.root / "deploy" / "state"
+    system_root.mkdir(parents=True)
+    write_status(system_root, deploy,
+                 checked_at_epoch=int(time.time()) - STALE_S - 600,
+                 last_ok_epoch=int(time.time()) - STALE_S - 600)
+    msg = announcement(run_hook(
+        sb.state_root, None, home=home,
+        system_state_root=system_root, deploy_checkout=deploy,
+    )).get("systemMessage", "")
+    check("a stale record in the SYSTEM state root is read and announced",
+          str(deploy) in msg, detail=msg[:250])
 
 with Sandbox() as sb:
     home = sb.repo("home")
     claude_home = home / ".claude"
     claude_home.mkdir()                          # post-cutover
-    checkout = home / "Repos" / "claude-config"
-    checkout.mkdir(parents=True)
-    (checkout / ".git").mkdir()
-    msg = announcement(run_hook(sb.state_root, None, home=home)).get("systemMessage", "")
-    check("after the cutover an unpulled ~/Repos/claude-config is the finding",
-          str(checkout) in msg and str(claude_home) not in msg, detail=msg[:250])
+    deploy = sb.root / "deploy" / "checkout"
+    deploy.mkdir(parents=True)
+    (deploy / ".git").mkdir()
+    msg = announcement(run_hook(
+        sb.state_root, None, home=home, deploy_checkout=deploy,
+    )).get("systemMessage", "")
+    check("after the cutover an unpulled deploy clone is the finding",
+          str(deploy) in msg and str(claude_home) not in msg, detail=msg[:250])
+
+# The dev checkout is NOT a target, and the test that proves it has to be the
+# one with a leftover state directory: the retired user timer wrote one, and
+# ordinary coverage would resurrect it as permanently stale. A repo that was
+# synced and then stopped normally SHOULD speak — this is the narrow exception
+# for the two paths whose repo is already named by where it moved to.
+with Sandbox() as sb:
+    home = sb.repo("home")
+    claude_home = home / ".claude"
+    claude_home.mkdir()
+    dev = home / "Repos" / "claude-config"
+    dev.mkdir(parents=True)
+    (dev / ".git").mkdir()
+    deploy = sb.root / "deploy" / "checkout"
+    deploy.mkdir(parents=True)
+    (deploy / ".git").mkdir()
+    system_root = sb.root / "deploy" / "state"
+    system_root.mkdir(parents=True)
+    write_status(system_root, deploy)
+    write_status(sb.state_root, dev,             # the retired timer's leftover
+                 checked_at_epoch=int(time.time()) - STALE_S - 600,
+                 last_ok_epoch=int(time.time()) - STALE_S - 600)
+    proc = run_hook(
+        sb.state_root, None, home=home,
+        system_state_root=system_root, deploy_checkout=deploy,
+    )
+    check("a leftover state directory for the DEV checkout does not speak",
+          proc.stdout == "", detail=repr(proc.stdout))
 
 # The state directory the puller wrote before the cutover keeps naming
 # ~/.claude. Coverage normally outlives a puller on purpose, so discovery would
@@ -509,14 +594,19 @@ with Sandbox() as sb:
     home = sb.repo("home")
     claude_home = home / ".claude"
     claude_home.mkdir()                          # post-cutover
-    checkout = home / "Repos" / "claude-config"
-    checkout.mkdir(parents=True)
-    (checkout / ".git").mkdir()
-    write_status(sb.state_root, checkout)
+    deploy = sb.root / "deploy" / "checkout"
+    deploy.mkdir(parents=True)
+    (deploy / ".git").mkdir()
+    system_root = sb.root / "deploy" / "state"
+    system_root.mkdir(parents=True)
+    write_status(system_root, deploy)
     write_status(sb.state_root, claude_home,     # the pre-cutover leftover
                  checked_at_epoch=int(time.time()) - STALE_S - 600,
                  last_ok_epoch=int(time.time()) - STALE_S - 600)
-    proc = run_hook(sb.state_root, None, home=home)
+    proc = run_hook(
+        sb.state_root, None, home=home,
+        system_state_root=system_root, deploy_checkout=deploy,
+    )
     check("a pre-cutover state directory for ~/.claude does not speak",
           proc.stdout == "", detail=repr(proc.stdout))
 
