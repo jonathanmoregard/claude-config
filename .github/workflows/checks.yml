@@ -41,6 +41,26 @@ jobs:
       - name: No declared entrypoint names a dev-only tree
         run: python3 runtime/scripts/lint-runtime-entrypoints.py
 
+      # `shfmt` is mvdan/sh's CLI, and the backcheck's shell parser. Without it
+      # every `classify()` answers `unknown:shfmt-unavailable` -- correct, by
+      # design, and indistinguishable from the suite being broken. The parser
+      # is provisioned rather than the test degraded: a classifier that decides
+      # sandbox policy is exactly the thing whose guard must not be allowed to
+      # pass on a machine that cannot run it.
+      #
+      # From Ubuntu's archive, not a pinned GitHub release: apt verifies its
+      # own signatures, so this file does not grow a checksum that someone has
+      # to remember to bump. Its own step, and a version print, so "the parser
+      # is absent" fails here and reads as itself instead of as a hundred
+      # unrelated-looking assertion failures in the step below. Not
+      # `shellcheck` -- a different project and a different binary, which does
+      # not bring `shfmt` with it.
+      - name: The shell parser the backcheck depends on is present
+        run: |
+          sudo apt-get update --quiet
+          sudo apt-get install --quiet --yes shfmt
+          shfmt --version
+
       # The whole directory, never a list of files. A suite that guards one of
       # this repository's own guards is itself a measuring instrument, and an
       # instrument CI does not run is not protected by requiring this job --

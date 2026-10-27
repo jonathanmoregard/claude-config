@@ -72,6 +72,10 @@ PROJECTED = (
 # whole mission is that it cannot.
 DEV_ONLY = (
     "tests", "docs", "experiments", "research", "improvements",
+    # Candidate sandbox policies, measured against history by
+    # runtime/scripts/sandbox-backcheck.py. Inputs to a decision, never loaded by the
+    # harness — a policy the agent could read is a policy it could edit.
+    "policy",
     ".github", ".githooks", ".gitleaks.toml", ".secrets.baseline",
 )
 
