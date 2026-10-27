@@ -269,10 +269,13 @@ expect_ok "pack-refs and gc still run" \
 expect_ok "feature-branch deletion still works" git -C "$PRIMARY" branch -q -D feat/side feat/diverge
 
 # --- helper + linked worktrees ----------------------------------------------
-expect_refused "helper rejects an invalid slug" 'invalid slug' "$PRIMARY/scripts/claude-worktree.sh" 'a/b'
+# A HOME with no dev checkout, so the caller's own clone is the only anchor and
+# the real ~/Repos/claude-config can never leak into these runs.
+mkdir -p "$ROOT/bare-home"
+expect_refused "helper rejects an invalid slug" 'invalid slug' env HOME="$ROOT/bare-home" "$PRIMARY/scripts/claude-worktree.sh" 'a/b'
 advance_origin upstream.txt three
 STALE="$(head_of "$PRIMARY" master)"
-expect_ok "helper creates a worktree" "$PRIMARY/scripts/claude-worktree.sh" policy-test
+expect_ok "helper creates a worktree" env HOME="$ROOT/bare-home" "$PRIMARY/scripts/claude-worktree.sh" policy-test
 LINKED="$WT_ROOT/claude-policy-test"
 if [ "$(branch_of "$LINKED")" = feat/policy-test ] && [ "$(head_of "$LINKED")" = "$(head_of "$PRIMARY" origin/master)" ] \
   && [ "$(head_of "$LINKED")" != "$STALE" ]; then
@@ -280,7 +283,7 @@ if [ "$(branch_of "$LINKED")" = feat/policy-test ] && [ "$(head_of "$LINKED")" =
 else
   bad "helper branches off freshly fetched origin/master" "branch=$(branch_of "$LINKED")"
 fi
-expect_refused "helper refuses an existing path" 'already exists' "$PRIMARY/scripts/claude-worktree.sh" policy-test
+expect_refused "helper refuses an existing path" 'already exists' env HOME="$ROOT/bare-home" "$PRIMARY/scripts/claude-worktree.sh" policy-test
 expect_ok "plain git worktree add -b from the primary works" \
   git -C "$PRIMARY" worktree add -q -b feat/plain "$WT_ROOT/plain" origin/master
 printf 'linked\n' >> "$LINKED/tracked.txt"
@@ -355,17 +358,62 @@ mkdir -p "$ROOT/bare-home"
 expect_refused "helper names the checkout it looked for when none resolves" \
   'claude-config' env HOME="$ROOT/bare-home" "$CUT_LIVE/scripts/claude-worktree.sh" nowhere
 
-# Pre-cutover the script's own checkout still decides, so a worktree of the
-# repo keeps working as its own anchor.
-expect_ok "helper still anchors on its own checkout when it has one" \
-  env HOME="$CUT_HOME" "$PRIMARY/scripts/claude-worktree.sh" anchored
+# The caller's own location is the LAST resort: it is how a developer running
+# the script from inside some other clone still gets that clone, but only when
+# the dev checkout is not there to answer.
+expect_ok "helper still anchors on its own checkout when there is no dev checkout" \
+  env HOME="$ROOT/bare-home" "$PRIMARY/scripts/claude-worktree.sh" anchored
 if printf '%s' "$(git -C "$WT_ROOT/claude-anchored" rev-parse --git-common-dir 2>&1)" \
   | grep -q "$PRIMARY"; then
-  ok "the script's own checkout outranks the by-name fallback"
+  ok "the script's own checkout is the answer when the dev checkout is absent"
 else
-  bad "the script's own checkout outranks the by-name fallback" \
+  bad "the script's own checkout is the answer when the dev checkout is absent" \
     "gitdir=$(git -C "$WT_ROOT/claude-anchored" rev-parse --git-common-dir 2>&1)"
 fi
+
+# --- resolution precedence: dev operations resolve to the DEV checkout --------
+# The resolver is driven directly. Three distinct clones so the answer names
+# which one won: the dev checkout (~/Repos/claude-config), the caller's own
+# clone, and a stand-in for the deploy-only clone that serves ~/.claude.
+RES_HOME="$ROOT/res-home"
+RES_DEV="$RES_HOME/Repos/claude-config"
+RES_CALLER="$ROOT/res-caller"
+RES_DEPLOY="$ROOT/res-deploy-root/checkout"
+mkdir -p "$RES_HOME/Repos"
+git clone -q "$ORIGIN" "$RES_DEV"
+git clone -q "$ORIGIN" "$RES_CALLER"
+mkdir -p "$(dirname "$RES_DEPLOY")"
+git clone -q "$ORIGIN" "$RES_DEPLOY"
+# resolve <hint> [VAR=value...]: print what claude_config_repo answers.
+resolve() {
+  local hint="$1"; shift
+  env -u CLAUDE_CONFIG_REPO HOME="$RES_HOME" CLAUDE_DEPLOY_CHECKOUT="$RES_DEPLOY" "$@" \
+    bash -c 'source "$1/config-repo.sh"; claude_config_repo "$2"' _ "$SRC_SCRIPTS" "$hint"
+}
+expect_resolves() {
+  local name="$1" want="$2"; shift 2
+  try resolve "$@"
+  if [ "$RC" -eq 0 ] && [ "$OUT" = "$want" ]; then ok "$name"
+  else bad "$name" "rc=$RC want=$want got=$(printf '%s' "$OUT" | head -4 | tr '\n' ' ')"; fi
+}
+
+expect_resolves "dev checkout outranks the caller's own clone" "$RES_DEV" "$RES_CALLER"
+expect_resolves "CLAUDE_CONFIG_REPO outranks the dev checkout" "$ROOT/alt-config" \
+  "$RES_CALLER" CLAUDE_CONFIG_REPO="$ROOT/alt-config"
+expect_resolves "a caller inside the deploy clone resolves to the dev checkout" "$RES_DEV" "$RES_DEPLOY"
+expect_resolves "a caller inside the deploy clone's subtree resolves to the dev checkout" "$RES_DEV" \
+  "$RES_DEPLOY/.githooks"
+expect_resolves "no dev checkout: the caller's own clone is the answer" "$RES_CALLER" "$RES_CALLER" \
+  HOME="$ROOT/bare-home"
+
+# Never the deploy clone, however it is reached: a bug, not a result.
+expect_refused "deploy clone as the only candidate is refused, not returned" \
+  'CLAUDE_CONFIG_REPO' resolve "$RES_DEPLOY" HOME="$ROOT/bare-home"
+if printf '%s' "$OUT" | grep -q "^$RES_DEPLOY\$"; then
+  bad "the refusal prints no deploy-clone path on stdout" "stdout=$OUT"
+else ok "the refusal prints no deploy-clone path on stdout"; fi
+expect_refused "CLAUDE_CONFIG_REPO naming the deploy clone is refused" \
+  'deploy' resolve "$RES_CALLER" CLAUDE_CONFIG_REPO="$RES_DEPLOY"
 
 # --- the quiet caller: update-submodules.sh ----------------------------------
 # It runs from cron on Mondays, nothing watches its exit status, and its output
