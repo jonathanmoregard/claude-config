@@ -290,6 +290,92 @@ def test_a_statement_after_a_partly_quoted_heredoc_delimiter_is_classified():
     assert_write_break(classify(command), "/outside/x")
 
 
+# --- arithmetic evaluation re-expands its operand -------------------------
+#
+# Eight of these were false oks of the version that listed three requoting node
+# types. The rule is a category, not a list of accidents: anything bash
+# evaluates as arithmetic re-expands whatever quoting it arrived in. Each case
+# was executed under bash in its own shell before its expectation was written.
+
+
+def test_let_evaluates_a_substitution_in_an_array_subscript():
+    assert_write_break(classify("let 'a[$(touch /outside/x)]=1'"), "/outside/x")
+
+
+def test_an_arithmetic_test_operand_is_evaluated():
+    assert_write_break(
+        classify("[[ 'a[$(touch /outside/x)]' -eq 0 ]]"), "/outside/x"
+    )
+
+
+def test_a_string_comparison_is_not_arithmetic():
+    # The negative control that keeps the rule honest: `[[ x == y ]]` compares
+    # strings and expands nothing, so widening the rule to every BinaryTest
+    # would invent a break bash never performs. The operator is read from the
+    # source text, not from mvdan/sh's numeric `Op` -- those values are an
+    # internal enum and CI resolves a different shfmt release than this host.
+    assert classify("[[ 'a' == '$(touch /outside/x)' ]]")["status"] == "ok"
+
+
+def test_a_parameter_index_is_evaluated():
+    assert_write_break(classify("echo ${a['$(touch /outside/x)']}"), "/outside/x")
+
+
+def test_a_parameter_slice_offset_is_evaluated():
+    assert_write_break(
+        classify("a=12345; echo ${a:'$(touch /outside/x)':1}"), "/outside/x"
+    )
+
+
+def test_an_indexed_assignment_target_is_evaluated():
+    assert_write_break(classify("a['$(touch /outside/x)']=1"), "/outside/x")
+
+
+def test_declare_dash_i_makes_its_value_arithmetic():
+    assert_write_break(
+        classify("declare -i 'v=a[$(touch /outside/x)]'"), "/outside/x"
+    )
+
+
+def test_plain_declare_is_not_arithmetic():
+    # Second negative control. Without the `-i` check every `declare x='...'`
+    # would report a break, and assignments like that are ordinary.
+    assert classify("declare v='$(touch /outside/x)'")["status"] == "ok"
+
+
+def test_a_hash_inside_arithmetic_does_not_hide_the_substitution():
+    # Requoted text is expanded by bash as a *word*, where `#` is an ordinary
+    # character. Re-parsing it as a program made `#` a Comment node and the
+    # substitution vanished into it, which is why this is scanned with the
+    # word-level collector instead.
+    assert_write_break(
+        classify("echo $(( '# $(touch /outside/x)' + 1 ))"), "/outside/x"
+    )
+
+
+def test_prompt_expansion_is_unknown_because_nothing_in_the_syntax_shows_it():
+    # `${x@P}` runs prompt expansion over the variable's value, so a
+    # substitution stored as a plain literal executes with no substitution
+    # anywhere in the command's own syntax. No tree can show that; unknown is
+    # the only honest answer. Verified against bash: the file is created.
+    result = classify("x='$(touch /outside/x)'; echo \"${x@P}\"")
+
+    assert result["status"] == "unknown"
+    assert "unknown:ast-prompt-expansion" in result["reasons"]
+
+
+def test_nested_shell_source_gets_the_grammar_too():
+    # A grammar authoritative only for the outermost string is not
+    # authoritative. `bash -c` carries shell source one level down, and the
+    # scanner's quoting blind spots were still reachable there while this path
+    # called the scanner directly. Fail-closed is enough for the assertion that
+    # matters -- what must never happen is ok.
+    assert classify("bash -c 'echo $(touch /outside/x)'")["status"] == "breaks"
+    assert classify(
+        r"""bash -c "echo \$(( '\$(touch /outside/x)' + 1 ))" """
+    )["status"] != "ok"
+
+
 def test_a_missing_parser_is_an_error_not_a_pass():
     # "The parser is absent" must never look like "the parser found nothing",
     # which is exactly how a false ok would get manufactured at deploy time.
