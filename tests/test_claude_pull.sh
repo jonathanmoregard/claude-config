@@ -10,7 +10,7 @@
 # Run:  tests/test_claude_pull.sh
 set -uo pipefail
 
-SCRIPT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)/scripts/claude-pull.sh"
+SCRIPT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)/runtime/scripts/claude-pull.sh"
 ROOT=$(mktemp -d)
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 # Per-run state root, so nothing here can read or clobber the real one under
@@ -319,6 +319,38 @@ sleep 0.5
 run
 check "held lock skips the tick" 0 "$rc" "holds the lock" "$out"
 wait
+
+# 9a. flock ABSENT -> loud failure, not a skipped tick.
+#
+# `flock -n` not found exits 127, and the skip branch above accepts any
+# non-zero, so a PATH without flock reported "another sync/pull run holds the
+# lock" and exited 0 — forever, on every tick, while systemd and the health
+# record both said success. Found 2026-10-27 by running the script from the
+# system unit that deploys the served tree (nixos-config
+# modules/nixos/claude-runtime-deploy.nix): a systemd SYSTEM service inherits
+# util-linux-MINIMAL, which ships no flock, and nothing in the PATH chain puts
+# the real one back.
+#
+# A PATH holding everything the script needs EXCEPT flock, so this tests the
+# missing-binary case rather than a shadowed one.
+mkdir -p "$ROOT/noflockbin"
+for t in bash sh env git sed grep date mktemp readlink dirname basename cat cp \
+  mv rm mkdir rmdir head tail tr cut printf timeout python3 id sleep hostname \
+  getent sort uniq wc stat find; do
+  tp="$(command -v "$t" 2>/dev/null)" && ln -sf "$tp" "$ROOT/noflockbin/$t"
+done
+command -v flock >/dev/null 2>&1 \
+  || { echo "FAIL noflock: the harness host has no flock to hide"; fail=$((fail+1)); }
+fresh noflock; advance_origin new.txt hello
+out=$(PATH="$ROOT/fakebin:$ROOT/noflockbin" "$SCRIPT" 2>&1); rc=$?
+check "a missing flock fails loudly instead of claiming a held lock" 1 "$rc" \
+  "flock" "$out"
+if printf '%s' "$out" | grep -qE "holds the lock"; then
+  echo "FAIL noflock: reported a contended lock when flock was simply absent"
+  fail=$((fail+1))
+fi
+# And it must not look like a successful tick to the health hook either.
+expect_status "a missing flock is an alert in the health record" state alert
 
 # 10. fetch failure -> counts, no notification until 6 in a row
 fresh fetchfail

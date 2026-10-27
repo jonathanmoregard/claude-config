@@ -157,6 +157,25 @@ if ! GIT_DIR_PATH="$(git rev-parse --absolute-git-dir 2>/dev/null)"; then
   exit 1
 fi
 
+# A missing flock is NOT a contended lock, and the skip below cannot tell them
+# apart: `flock -n` not found exits 127, the skip accepts any non-zero, and the
+# tick then exits 0 having pulled nothing. That is silent for as long as it
+# lasts — no alert, no status record (a contended tick deliberately writes
+# none), and `systemctl status` green every ten minutes.
+#
+# Measured 2026-10-27, running this script from the systemd SYSTEM unit that
+# deploys the tree ~/.claude is served from (nixos-config
+# modules/nixos/claude-runtime-deploy.nix). A system service inherits
+# util-linux-MINIMAL on PATH, which ships no flock, so the very first real
+# tick logged "flock: command not found" immediately followed by "another
+# sync/pull run holds the lock; skipping tick" and reported success. The unit
+# now pins its own dependencies, and this check is what makes the same mistake
+# anywhere else loud instead of green.
+command -v flock >/dev/null 2>&1 || {
+  alert "flock is not on PATH, so this tick cannot take the sync lock — refusing, because a missing flock is indistinguishable from a contended one and would otherwise report success without pulling."
+  exit 1
+}
+
 # Shared with sync-agent.sh so a pull can never land halfway through the
 # commit-and-push agent's run (or vice versa). Non-blocking: skipping a tick
 # costs 10 minutes, waiting could hold the lock behind a multi-minute agent.
