@@ -300,6 +300,73 @@ expect_refused "linked worktree: commit on local master is refused" 'local maste
 git -C "$WT_ROOT/plain" -c core.hooksPath=/dev/null switch -q --detach feat/plain
 expect_ok "git worktree remove from the primary works" git -C "$PRIMARY" worktree remove "$WT_ROOT/plain"
 
+# --- the helper after the runtime-projection cutover -------------------------
+# Post-cutover, ~/.claude/scripts is a symlink into ~/.claude/runtime, a bind
+# mount exposing the checkout's runtime/ subtree alone, and ~/.claude/.git has
+# moved to the backing checkout at ~/Repos/claude-config. So the directory the
+# script resolves to has no .git above it, and the helper has to find the
+# checkout by name rather than by its own location. The fixture reproduces that
+# shape with a copy: what matters is that nothing up the tree is a checkout.
+SRC_SCRIPTS="$REPO_ROOT/scripts"
+[ -d "$REPO_ROOT/runtime/scripts" ] && SRC_SCRIPTS="$REPO_ROOT/runtime/scripts"
+CUT_HOME="$ROOT/cutover-home"
+CUT_LIVE="$CUT_HOME/.claude"
+mkdir -p "$CUT_LIVE/runtime/scripts" "$CUT_HOME/Repos"
+for s in install-worktree-policy.sh claude-worktree.sh; do
+  cp -a "$SRC_SCRIPTS/$s" "$CUT_LIVE/runtime/scripts/"
+done
+ln -s runtime/scripts "$CUT_LIVE/scripts"
+if [ -z "$(git -C "$CUT_LIVE/scripts" rev-parse --show-toplevel 2>/dev/null)" ]; then
+  ok "fixture: the projected scripts directory is outside any checkout"
+else
+  bad "fixture: the projected scripts directory is outside any checkout" \
+    "git found $(git -C "$CUT_LIVE/scripts" rev-parse --show-toplevel 2>/dev/null)"
+fi
+git clone -q "$ORIGIN" "$CUT_HOME/Repos/claude-config"
+
+expect_ok "helper works when reached through the projection" \
+  env HOME="$CUT_HOME" "$CUT_LIVE/scripts/claude-worktree.sh" projected
+PROJECTED="$WT_ROOT/claude-projected"
+if [ "$(branch_of "$PROJECTED")" = feat/projected ] \
+  && printf '%s' "$(git -C "$PROJECTED" rev-parse --git-common-dir)" \
+     | grep -q "$CUT_HOME/Repos/claude-config"; then
+  ok "helper branches in the backing checkout, not the live path"
+else
+  bad "helper branches in the backing checkout, not the live path" \
+    "branch=$(branch_of "$PROJECTED") gitdir=$(git -C "$PROJECTED" rev-parse --git-common-dir 2>&1)"
+fi
+
+# An explicit override wins over both, so a second checkout can be addressed
+# without moving the live tree.
+git clone -q "$ORIGIN" "$ROOT/alt-config"
+expect_ok "helper honours CLAUDE_CONFIG_REPO" \
+  env HOME="$CUT_HOME" CLAUDE_CONFIG_REPO="$ROOT/alt-config" \
+  "$CUT_LIVE/scripts/claude-worktree.sh" projected-alt
+if printf '%s' "$(git -C "$WT_ROOT/claude-projected-alt" rev-parse --git-common-dir 2>&1)" \
+  | grep -q "$ROOT/alt-config"; then
+  ok "CLAUDE_CONFIG_REPO decides which checkout the worktree belongs to"
+else
+  bad "CLAUDE_CONFIG_REPO decides which checkout the worktree belongs to" \
+    "gitdir=$(git -C "$WT_ROOT/claude-projected-alt" rev-parse --git-common-dir 2>&1)"
+fi
+
+# Nothing to resolve must name what it looked for, not leak a raw git error.
+mkdir -p "$ROOT/bare-home"
+expect_refused "helper names the checkout it looked for when none resolves" \
+  'claude-config' env HOME="$ROOT/bare-home" "$CUT_LIVE/scripts/claude-worktree.sh" nowhere
+
+# Pre-cutover the script's own checkout still decides, so a worktree of the
+# repo keeps working as its own anchor.
+expect_ok "helper still anchors on its own checkout when it has one" \
+  env HOME="$CUT_HOME" "$PRIMARY/scripts/claude-worktree.sh" anchored
+if printf '%s' "$(git -C "$WT_ROOT/claude-anchored" rev-parse --git-common-dir 2>&1)" \
+  | grep -q "$PRIMARY"; then
+  ok "the script's own checkout outranks the by-name fallback"
+else
+  bad "the script's own checkout outranks the by-name fallback" \
+    "gitdir=$(git -C "$WT_ROOT/claude-anchored" rev-parse --git-common-dir 2>&1)"
+fi
+
 # --- global hooks stay chained and keep their teeth ---------------------------
 for h in pre-commit prepare-commit-msg pre-push reference-transaction; do
   grep -q "GLOBAL-$h:" "$WITNESS" && ok "global $h still runs" || bad "global $h still runs" "no witness"
