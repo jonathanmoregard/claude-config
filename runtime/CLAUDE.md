@@ -94,6 +94,6 @@ User instructions override everything below.
 
 ## PRs
 - Target the repo's default branch. Non-default only when asked, then re-target before merge.
-- **PR-gated repo** = private/internal with workflows on `pull_request` (check: `gh repo view --json visibility` + `grep pull_request .github/workflows/*`). Opening the PR and every push to it bill Actions minutes; pushing the branch alone doesn't, unless a workflow runs on `push` to any branch (then batch pushes too).
+- **PR-gated repo** = private/internal with workflows on `pull_request` (check: `gh repo view --json visibility` + `grep pull_request .github/workflows/*`). Never assume it: cite that check or the completion-check line naming the visibility; check failed → "visibility unchecked", never "private". Opening the PR and every push to it bill Actions minutes; pushing the branch alone doesn't, unless a workflow runs on `push` to any branch (then batch pushes too).
 - PR-gated → push the branch for backup, get local gates green (`scripts/check` etc.) and the user's review settled, then ask one closed question — "Open the PR?" — and wait. Only the user's yes, or an explicit "open a PR", authorizes `gh pr create`. Drafts run CI too; no draft workaround. Details: `finishing-up`.
 - Public, or private with no PR-triggered CI → open PRs as before.
