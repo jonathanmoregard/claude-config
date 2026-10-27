@@ -98,7 +98,7 @@ git init -q -b master "$ROOT/seed"
   # about what these scripts do, not about where the repository keeps them.
   src_scripts="$REPO_ROOT/scripts"
   [ -d "$REPO_ROOT/runtime/scripts" ] && src_scripts="$REPO_ROOT/runtime/scripts"
-  for s in install-worktree-policy.sh claude-worktree.sh worktree-policy-session-start.sh claude-pull.sh; do
+  for s in install-worktree-policy.sh claude-worktree.sh worktree-policy-session-start.sh claude-pull.sh config-repo.sh; do
     cp -a "$src_scripts/$s" scripts/
   done
   printf '{\n  "model": "upstream-model",\n  "env": {}\n}\n' > settings.json
@@ -312,7 +312,7 @@ SRC_SCRIPTS="$REPO_ROOT/scripts"
 CUT_HOME="$ROOT/cutover-home"
 CUT_LIVE="$CUT_HOME/.claude"
 mkdir -p "$CUT_LIVE/runtime/scripts" "$CUT_HOME/Repos"
-for s in install-worktree-policy.sh claude-worktree.sh; do
+for s in install-worktree-policy.sh claude-worktree.sh config-repo.sh; do
   cp -a "$SRC_SCRIPTS/$s" "$CUT_LIVE/runtime/scripts/"
 done
 ln -s runtime/scripts "$CUT_LIVE/scripts"
@@ -365,6 +365,72 @@ if printf '%s' "$(git -C "$WT_ROOT/claude-anchored" rev-parse --git-common-dir 2
 else
   bad "the script's own checkout outranks the by-name fallback" \
     "gitdir=$(git -C "$WT_ROOT/claude-anchored" rev-parse --git-common-dir 2>&1)"
+fi
+
+# --- the quiet caller: update-submodules.sh ----------------------------------
+# It runs from cron on Mondays, nothing watches its exit status, and its output
+# goes to a log nobody opens — so a wrong repository here fails silently. Its
+# own origin, because the fixture needs a .gitmodules on origin/master and the
+# shared one must stay as the other sections left it.
+SUB_ORIGIN="$ROOT/remote/sub/claude-config.git"
+SUB_HOME="$ROOT/sub-home"
+mkdir -p "$(dirname "$SUB_ORIGIN")" "$SUB_HOME/Repos"
+git init -q --bare -b master "$SUB_ORIGIN"
+git init -q -b master "$ROOT/sub-seed"
+(
+  cd "$ROOT/sub-seed" || exit 1
+  # A submodule entry with a path and no url: the script reads .gitmodules from
+  # origin/master as a blob, logs that it is skipping, and stops before
+  # anything that would reach the network. Only the repository this fixture
+  # built can produce that line, so the log says WHICH checkout it resolved.
+  printf '[submodule "fixture-only"]\n\tpath = vendor/fixture-only\n' > .gitmodules
+  git add -A
+  git commit -qm seed
+  git remote add origin "$SUB_ORIGIN"
+  git push -q -u origin master
+)
+git clone -q "$SUB_ORIGIN" "$SUB_HOME/Repos/claude-config"
+mkdir -p "$SUB_HOME/.claude/runtime/scripts"
+for s in update-submodules.sh config-repo.sh; do
+  cp -a "$SRC_SCRIPTS/$s" "$SUB_HOME/.claude/runtime/scripts/"
+done
+ln -s runtime/scripts "$SUB_HOME/.claude/scripts"
+
+SUB_LOG="$ROOT/submodule-run.log"
+expect_ok "update-submodules runs when reached through the projection" \
+  env HOME="$SUB_HOME" CLAUDE_SUBMODULE_LOG="$SUB_LOG" \
+  "$SUB_HOME/.claude/scripts/update-submodules.sh"
+if grep -q 'fixture-only' "$SUB_LOG" 2>/dev/null && grep -q 'no url in .gitmodules' "$SUB_LOG" 2>/dev/null; then
+  ok "update-submodules read the backing checkout's own origin/master"
+else
+  bad "update-submodules read the backing checkout's own origin/master" \
+    "log=$(tail -3 "$SUB_LOG" 2>&1 | tr '\n' ' ')"
+fi
+
+# The log must not follow the repository: post-cutover that would write an
+# un-ignored file inside a checkout automation commits from.
+rm -f "$SUB_HOME/.claude/logs/submodule-update.log"
+expect_ok "update-submodules runs with the default log path" \
+  env HOME="$SUB_HOME" "$SUB_HOME/.claude/scripts/update-submodules.sh"
+if [ -s "$SUB_HOME/.claude/logs/submodule-update.log" ] && [ ! -e "$SUB_HOME/Repos/claude-config/logs" ]; then
+  ok "the default log stays at ~/.claude/logs, outside the resolved checkout"
+else
+  bad "the default log stays at ~/.claude/logs, outside the resolved checkout" \
+    "live=$(ls -d "$SUB_HOME/.claude/logs/submodule-update.log" 2>&1) in-repo=$(ls -d "$SUB_HOME/Repos/claude-config/logs" 2>&1)"
+fi
+
+# The long-standing override still outranks resolution: pointed at a checkout
+# whose origin/master has no .gitmodules, the run must find no submodule.
+OVERRIDE_LOG="$ROOT/submodule-override.log"
+expect_ok "update-submodules honours CLAUDE_SUBMODULE_REPO" \
+  env HOME="$SUB_HOME" CLAUDE_SUBMODULE_REPO="$ROOT/alt-config" \
+  CLAUDE_SUBMODULE_LOG="$OVERRIDE_LOG" \
+  "$SUB_HOME/.claude/scripts/update-submodules.sh"
+if grep -q 'Done' "$OVERRIDE_LOG" 2>/dev/null && ! grep -q 'fixture-only' "$OVERRIDE_LOG" 2>/dev/null; then
+  ok "CLAUDE_SUBMODULE_REPO outranks the resolved checkout"
+else
+  bad "CLAUDE_SUBMODULE_REPO outranks the resolved checkout" \
+    "log=$(tail -3 "$OVERRIDE_LOG" 2>&1 | tr '\n' ' ')"
 fi
 
 # --- global hooks stay chained and keep their teeth ---------------------------

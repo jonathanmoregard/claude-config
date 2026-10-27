@@ -14,8 +14,28 @@
 # that already has a branch on origin (PR open or merged) is skipped.
 set -euo pipefail
 
-REPO_DIR="${CLAUDE_SUBMODULE_REPO:-/home/jonathan/.claude}"
-LOG="${CLAUDE_SUBMODULE_LOG:-$REPO_DIR/logs/submodule-update.log}"
+# Where the checkout is: `~/.claude` before the runtime-projection cutover, the
+# backing clone after it. scripts/config-repo.sh owns that rule and explains
+# why the script's own location stops answering. CLAUDE_SUBMODULE_REPO stays
+# the override this script has always honoured.
+#
+# This one fails QUIETLY if it gets the answer wrong, which is why it matters:
+# it runs from cron (Mondays 10:00), nothing watches its exit status, and its
+# only output goes to a log file nobody opens.
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$script_dir/config-repo.sh"
+if [ -n "${CLAUDE_SUBMODULE_REPO:-}" ]; then
+  REPO_DIR="$CLAUDE_SUBMODULE_REPO"
+else
+  REPO_DIR="$(claude_config_repo "$script_dir")" || exit 1
+fi
+
+# The log stays at ~/.claude/logs, NOT $REPO_DIR/logs. Post-cutover REPO_DIR is
+# a git worktree, and `logs/` is not ignored there, so deriving the log path
+# from it would start writing an un-ignored file inside a repository that
+# automation commits from. `logs` is not part of the runtime subset, so the
+# live path stays an ordinary local directory that home-manager creates.
+LOG="${CLAUDE_SUBMODULE_LOG:-$HOME/.claude/logs/submodule-update.log}"
 WT_PARENT="${CLAUDE_SUBMODULE_WORKTREE_PARENT:-${TMPDIR:-/tmp}}"
 mkdir -p "$(dirname "$LOG")"
 

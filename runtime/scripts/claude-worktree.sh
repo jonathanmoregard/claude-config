@@ -36,30 +36,14 @@ git check-ref-format "refs/heads/$branch" >/dev/null 2>&1 \
 # Anchor on the repo this script lives in. Refs live in the shared git dir, so
 # any worktree of the repo is an equally valid anchor for fetch + worktree add.
 #
-# That anchor disappears once ~/.claude is a runtime projection: `scripts` is
-# then a symlink into `runtime`, a bind mount exposing the checkout's runtime/
-# subtree alone, and the checkout's .git sits at the root of the backing
-# clone — above the mount, where walking up from the resolved path never
-# reaches it. Discovery would fail outright rather than quietly pick the wrong
-# repo, which is the better half of the failure, but this is the mandated entry
-# point for every config change, so it has to keep working. Hence: resolve the
-# repository by name when the script's own location cannot answer.
+# That anchor disappears once ~/.claude is a runtime projection, and this is
+# the mandated entry point for every change to the repository — including the
+# ones that would fix it — so it has to keep working across the cutover.
+# scripts/config-repo.sh owns the resolution rule and explains the mechanism.
 script_dir="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
-fallback_repo="${CLAUDE_CONFIG_REPO:-$HOME/Repos/claude-config}"
-toplevel_of() { git -C "$1" rev-parse --show-toplevel 2>/dev/null; }
-
-if [ -n "${CLAUDE_CONFIG_REPO:-}" ]; then
-  # An explicit override outranks both, so a second checkout can be addressed
-  # without touching the live tree.
-  repo="$(toplevel_of "$CLAUDE_CONFIG_REPO")" \
-    || die "CLAUDE_CONFIG_REPO is not a git checkout: $CLAUDE_CONFIG_REPO"
-else
-  repo="$(toplevel_of "$script_dir")" || repo=""
-  if [ -z "$repo" ]; then
-    repo="$(toplevel_of "$fallback_repo")" \
-      || die "no claude-config checkout found — $script_dir is not inside one (expected after the runtime-projection cutover) and neither is $fallback_repo; set CLAUDE_CONFIG_REPO to the checkout"
-  fi
-fi
+source "$script_dir/config-repo.sh"
+repo="$(claude_config_repo "$script_dir")" \
+  || die "could not locate the claude-config checkout (diagnostic above)"
 
 # A clone or freshly merged checkout may not have installed its local hooks
 # yet. Activate them before touching refs so this helper cannot create a
