@@ -540,6 +540,41 @@ OBS="$(observe)"
 OBS="$(observe)"
 [ -z "$OBS" ] && ok "observer is silent when healthy" || bad "observer is silent when healthy" "$OBS"
 
+# The observer must survive the cutover too, and this is the one that fails by
+# saying NOTHING: reached through the projection, with no CLAUDE_PRIMARY_CHECKOUT
+# set, the old script resolved to a directory with no .git and exited 0.
+cp -a "$SRC_SCRIPTS/worktree-policy-session-start.sh" "$CUT_LIVE/runtime/scripts/"
+CUT_REPO="$CUT_HOME/Repos/claude-config"
+git -C "$CUT_REPO" config --unset core.hooksPath 2>/dev/null || true
+printf 'local edit\n' >> "$CUT_REPO/tracked.txt"
+PROJ_OBS="$(env HOME="$CUT_HOME" "$CUT_LIVE/scripts/worktree-policy-session-start.sh" 2>&1)"
+PROJ_RC=$?
+if [ "$PROJ_RC" -eq 0 ] && printf '%s' "$PROJ_OBS" | grep -q 'stop and report exact state'; then
+  ok "observer reports the backing checkout when reached through the projection"
+else
+  bad "observer reports the backing checkout when reached through the projection" \
+    "rc=$PROJ_RC out=${PROJ_OBS:-<silence — the fail-open this check exists for>}"
+fi
+printf '%s' "$PROJ_OBS" | grep -q "$CUT_REPO" \
+  && ok "observer names the resolved checkout, not the live path" \
+  || bad "observer names the resolved checkout, not the live path" "${PROJ_OBS:-<silence>}"
+git -C "$CUT_REPO" restore tracked.txt
+# The historical seam still outranks resolution.
+printf 'local edit\n' >> "$PRIMARY/tracked.txt"
+PROJ_OBS="$(env HOME="$CUT_HOME" CLAUDE_PRIMARY_CHECKOUT="$PRIMARY" \
+  "$CUT_LIVE/scripts/worktree-policy-session-start.sh" 2>&1)"
+printf '%s' "$PROJ_OBS" | grep -q "$PRIMARY" \
+  && ok "CLAUDE_PRIMARY_CHECKOUT outranks resolution for the observer" \
+  || bad "CLAUDE_PRIMARY_CHECKOUT outranks resolution for the observer" "${PROJ_OBS:-<silence>}"
+git -C "$PRIMARY" restore tracked.txt
+# A machine with no checkout anywhere stays silent: this runs at every
+# SessionStart in every project, and absence is not a condition to report.
+QUIET_OBS="$(env HOME="$ROOT/bare-home" "$CUT_LIVE/scripts/worktree-policy-session-start.sh" 2>&1)"
+QUIET_RC=$?
+[ "$QUIET_RC" -eq 0 ] && [ -z "$QUIET_OBS" ] \
+  && ok "observer stays silent where there is no checkout at all" \
+  || bad "observer stays silent where there is no checkout at all" "rc=$QUIET_RC out=$QUIET_OBS"
+
 # --- registration --------------------------------------------------------------
 live_settings="$REPO_ROOT/settings.json"
 [ -f "$REPO_ROOT/runtime/settings.json" ] && live_settings="$REPO_ROOT/runtime/settings.json"
