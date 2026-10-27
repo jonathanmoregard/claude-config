@@ -260,29 +260,19 @@ scheduled_tasks.lock
 # Auto-updater outcome stamp (runtime)
 .last-update-result.json
 
-# Home-manager-managed skill symlinks (point into /nix/store).
+# Removed: five `skills/nixos-*` rules that hid home-manager's /nix/store
+# symlinks back when nixos-config owned those skills and wrote them into the
+# flat `~/.claude/skills/`. This repository owns them outright now, as real
+# files under `runtime/skills/`, and nothing writes `skills/` at the repository
+# root any more.
 #
-# These five already only match at the repository root, with no leading slash
-# needed: a pattern with a slash anywhere but the end is relative to the
-# .gitignore's own directory (gitignore(5)). So they do NOT touch the tracked
-# `runtime/skills/nixos-*` links below. Verified, because the opposite was
-# assumed first:
-#
-#   rule skills/nixos-config-dev     runtime/skills/..=ok  skills/..=IGNORED
-#   rule /skills/nixos-config-dev    runtime/skills/..=ok  skills/..=IGNORED
-#   rule nixos-config-dev            runtime/skills/..=IGNORED
-#   rule **/nixos-config-dev         runtime/skills/..=IGNORED
-#
-# A future rule in either of the last two shapes would silently make those
-# links unaddable, so tests/enforced/test_runtime_layout.py asks git directly.
-#
-# `nixos-vm-test-gate` is no longer one of the four and is kept only so an old
-# checkout does not suddenly report it.
-skills/nixos-config-dev
-skills/nixos-vm-test-gate
-skills/nixos-agent-testing
-skills/nixos-automated-testing
-skills/nixos-agenix-secret
+# The shape of those rules still matters, which is why
+# tests/enforced/test_runtime_layout.py keeps asking git whether anything
+# ignores `runtime/skills/nixos-*`: a pattern with a slash anywhere but the end
+# is relative to the .gitignore's own directory (gitignore(5)), so
+# `skills/nixos-config-dev` never reached them -- but a bare
+# `nixos-config-dev` or `**/nixos-config-dev` would, and would silently make
+# the skills unaddable.
 
 # The same four skills' new home, and the one rule this change actually needed.
 # home-manager moved its `home.file` targets from .claude/skills/<name> to
