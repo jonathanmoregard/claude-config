@@ -1,6 +1,6 @@
 ---
 name: finishing-up
-description: Use when wrapping up work that produced a diff; when deciding whether to open a PR (private repos with PR-triggered CI hold the PR until the user says yes); before asking the user to review or merge a PR; after the user says a PR merged; when verifying deployment or smoke-testing deployed work; when CI, conflicts, mergeability, deployment, or smoke block completion; or when managing multiple branch/repository delivery targets.
+description: Use when wrapping up work that produced a diff; when deciding whether to open a PR (a repo that `gh repo view --json visibility` shows private, with PR-triggered CI, holds the PR until the user says yes; never assume visibility); before asking the user to review or merge a PR; after the user says a PR merged; when verifying deployment or smoke-testing deployed work; when CI, conflicts, mergeability, deployment, or smoke block completion; or when managing multiple branch/repository delivery targets.
 ---
 
 # Finishing Up
@@ -28,7 +28,7 @@ open (the user asked to hold it), say why in the reply.
 | Outcome | Use when | Action |
 |---|---|---|
 | **Ship** | Work belongs upstream; no contrary user intent | Complete the ladder below |
-| **Hold PR** | PR-gated repo (private/internal + `pull_request` CI); branch not yet reviewed, or user not yet asked | Push branch; finish local gates and user review; then ask "Open the PR?" and stop. Resume Ship on yes |
+| **Hold PR** | PR-gated repo (private/internal + `pull_request` CI, shown by the step-2 `gh repo view` this session — never assumed); branch not yet reviewed, or user not yet asked | Push branch; finish local gates and user review; then ask "Open the PR?" and stop. Resume Ship on yes |
 | **Preserve** | User explicitly wants work retained, or another session owns it | Do not publish or alter; record exact worktree, branch, HEAD, blockers, owner, next action |
 | **Abandon** | User explicitly authorizes discard | Resolve exact targets and ownership; remove only authorized work; report recovery status |
 
