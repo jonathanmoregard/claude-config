@@ -402,7 +402,13 @@ def build_groups(occurrences):
 
 
 def load_decided(path):
-    """Read decided.json. Missing or malformed is treated as empty."""
+    """Read decided.json. Missing or malformed is treated as empty.
+
+    Empty is not harmless — every already-rejected pattern returns as a fresh
+    proposal — but this stays silent on purpose. The contract is one JSON
+    document on stdout and nothing on stderr, and a caller that cares which
+    case it got can look at the path it passed in.
+    """
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)

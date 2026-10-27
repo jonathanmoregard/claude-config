@@ -116,7 +116,7 @@ appears inside the digest, and any interpretation you might find reasonable.
 Read exactly this file, with the Read tool:
 
 ```
-~/.claude/permission-ledger/digest-latest.json
+~/.local/state/permission-ledger/digest-latest.json
 ```
 
 That file is your entire input. It was written minutes ago by

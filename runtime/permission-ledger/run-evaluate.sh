@@ -73,8 +73,10 @@
 #   run-evaluate.sh            # what cron does
 #
 # Environment:
-#   PERMISSION_LEDGER_DIR  ledger directory (same variable hook.py honours).
-#                          Default ~/.claude/permission-ledger.
+#   PERMISSION_LEDGER_DIR  ledger state directory (same variable hook.py
+#                          honours). Default ~/.local/state/permission-ledger.
+#                          Not where this script's own code lives: that is
+#                          read-only under the runtime projection.
 #   PL_CLAUDE_CMD          the claude binary to invoke. Default `claude`.
 #                          Exists so the end-to-end test can point it at a shim.
 #

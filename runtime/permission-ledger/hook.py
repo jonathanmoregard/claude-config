@@ -20,7 +20,7 @@ Contract, in order of importance:
      opened O_APPEND|O_CREAT|O_WRONLY, so concurrent sessions interleave
      without tearing.
 
-Ledger dir: $PERMISSION_LEDGER_DIR, default ~/.claude/permission-ledger.
+Ledger dir: $PERMISSION_LEDGER_DIR, default ~/.local/state/permission-ledger.
 """
 
 import hashlib

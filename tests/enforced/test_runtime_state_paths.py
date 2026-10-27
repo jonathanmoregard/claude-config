@@ -112,6 +112,30 @@ def test_run_evaluate_finds_its_code_independently_of_the_state_dir():
         )
 
 
+def test_prompt_names_the_digest_that_run_evaluate_publishes():
+    """Stage 3's prompt is handed to the agent verbatim, so a drifted path is silent.
+
+    run-evaluate.sh runs `claude -p "$(cat prompt.md)"`, and the prompt tells
+    the agent that one named file is its entire input. If that name and the
+    path the digest is published to ever part company, the agent reads a stale
+    file or none at all, finds nothing to act on and exits 0 — no unit red, no
+    failure line, the nightly pass simply stops meaning anything.
+    """
+    ledger_dir = shell_assignment(LEDGER / "run-evaluate.sh", "LEDGER_DIR")
+    published = os.path.join(ledger_dir, "digest-latest.json")
+    tilde = published.replace(os.path.expanduser("~"), "~", 1)
+    prompt = (LEDGER / "prompt.md").read_text(encoding="utf-8")
+
+    assert tilde in prompt or published in prompt, (
+        f"prompt.md does not name {tilde}, which is where run-evaluate.sh "
+        "publishes the digest"
+    )
+    assert "/.claude/permission-ledger/digest" not in prompt, (
+        "prompt.md still sends the agent to a digest under ~/.claude, which is "
+        "read-only under the projection and is not where the digest is written"
+    )
+
+
 def test_ghostty_state_defaults_outside_claude_home():
     assert_outside(
         shell_assignment(

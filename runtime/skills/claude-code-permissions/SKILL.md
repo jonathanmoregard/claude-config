@@ -203,7 +203,7 @@ is **skipped with a warning and grants nothing**. **[docs]**
 ## Measuring instead of guessing
 
 This machine runs a permission ledger that records every call that actually had to
-ask: `~/.claude/permission-ledger/2026-08.jsonl`, one JSON object per request, with
+ask: `~/.local/state/permission-ledger/2026-08.jsonl`, one JSON object per request, with
 `pattern_key`, `cwd`, `permission_mode`, `agent_type` and the vendor's own
 `suggestions`. A rule that works leaves **no** records for its paths.
 
