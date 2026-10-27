@@ -45,6 +45,7 @@ TEST_FILENAME = re.compile(
       | ^.+[_-]test\.(py|sh)$      # codex-advise-test.sh, foo_test.py
       | ^conftest\.py$
       | ^.+\.test\.[^.]+$          # foo.test.ts
+      | ^(fake|stub|mock)[_-]      # fake_child.py, a stand-in for a real child
     """,
     re.VERBOSE,
 )
@@ -63,19 +64,30 @@ def tracked_runtime_paths() -> list[Path]:
     return [Path(line) for line in result.stdout.splitlines() if line]
 
 
+def is_test_path(path: Path) -> bool:
+    """The whole decision, so the control below can exercise it directly."""
+    if path.as_posix() in ALLOWED:
+        return False
+    return bool(RESERVED_DIRS.intersection(path.parts[:-1])
+                or TEST_FILENAME.match(path.name))
+
+
 def offenders() -> list[str]:
-    found = []
-    for path in tracked_runtime_paths():
-        rel = path.as_posix()
-        if rel in ALLOWED:
-            continue
-        in_reserved_dir = RESERVED_DIRS.intersection(path.parts[:-1])
-        if in_reserved_dir or TEST_FILENAME.match(path.name):
-            found.append(rel)
-    return sorted(found)
+    return sorted(p.as_posix() for p in tracked_runtime_paths() if is_test_path(p))
 
 
 def test_runtime_holds_no_test_code():
+    # "Found nothing" and "scanned nothing" must not look alike. `git ls-files
+    # runtime` answers empty for a tree that is untracked, for a REPO_ROOT that
+    # resolved somewhere else, and for a clean one -- and only the last of
+    # those is a pass. `lint-runtime-entrypoints.py` grew the same assertion
+    # after it kept reporting clean against a tree it could no longer read.
+    scanned = tracked_runtime_paths()
+    assert len(scanned) > 100, (
+        f"only {len(scanned)} tracked path(s) under runtime/ from "
+        f"{REPO_ROOT} -- the scan did not reach the tree, so a clean result "
+        "here would mean nothing"
+    )
     found = offenders()
     assert not found, (
         f"{len(found)} test file(s) tracked under runtime/, which the projection "
@@ -90,13 +102,25 @@ def test_the_heuristic_still_recognises_the_shapes_it_is_for():
     for the wrong reason, and the only symptom would be test code drifting
     back into the live tree unnoticed.
     """
-    for name in ("test_hook.py", "test-compact-reinject.sh",
-                 "codex-advise-test.sh", "conftest.py", "server.test.ts"):
-        assert TEST_FILENAME.match(name), f"heuristic stopped recognising {name}"
-    for name in ("hook.py", "run-evaluate.sh", "agent_e2e.py",
-                 "deterministic-gate.sh", "SKILL.md"):
-        assert not TEST_FILENAME.match(name), f"heuristic now flags {name}"
-    assert RESERVED_DIRS.intersection(Path("runtime/x/tests/y.py").parts[:-1])
-    assert not RESERVED_DIRS.intersection(
-        Path("runtime/skills/advice-refine-test-loop/SKILL.md").parts[:-1]
-    )
+    for flagged in (
+        "runtime/permission-ledger/test_hook.py",
+        "runtime/skills/orchestrate/hooks/test-compact-reinject.sh",
+        "runtime/skills/x/scripts/codex-advise-test.sh",
+        "runtime/tools/ai-router/conftest.py",
+        "runtime/mcps/x/server.test.ts",
+        "runtime/mcps/github-mux/fake_child.py",   # a stand-in, not a test_*
+        "runtime/skills/x/tests/anything.py",      # by directory, any name
+        "runtime/tools/x/fixtures/sample.json",
+    ):
+        assert is_test_path(Path(flagged)), f"guard stopped flagging {flagged}"
+    for kept in (
+        "runtime/permission-ledger/hook.py",
+        "runtime/permission-ledger/run-evaluate.sh",
+        "runtime/scripts/agent-e2e/agent_e2e.py",
+        "runtime/skills/advice-refine-test-loop/scripts/deterministic-gate.sh",
+        # Live skills whose own names carry a reserved word: a directory
+        # component has to BE one, not merely contain one.
+        "runtime/skills/advice-refine-test-loop/SKILL.md",
+        "runtime/skills/ab-testing-prompt-changes/ab_harness.py",
+    ):
+        assert not is_test_path(Path(kept)), f"guard now flags {kept}"

@@ -11,7 +11,7 @@ the fix (advice-refine-test-loop, findings F2–F4, F6).
       was still being decided (seen as an intermittent test failure).
   F6  The skill documented `delegate --provider codex`; the flag did not exist.
 
-Run: nix shell nixpkgs#python3Packages.pytest -c pytest -q tools/ai-router/tests/test_review_regressions.py
+Run: nix shell nixpkgs#python3Packages.pytest -c pytest -q tests/ai-router/test_review_regressions.py
 """
 from __future__ import annotations
 

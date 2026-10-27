@@ -2,7 +2,7 @@
 """
 Plain-assert tests for sunset-walk-tracker.py (no pytest on this machine).
 
-Run:  python3 ~/.claude/wellbeing/tests/test_sunset_walk_tracker.py
+Run:  python3 tests/wellbeing/test_sunset_walk_tracker.py
 
 Covers:
   * local NOAA sunset computation at both solstice extremes (Stockholm refs)

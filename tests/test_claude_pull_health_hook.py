@@ -34,7 +34,7 @@ Exits 0 on success; 1 with a failure list otherwise.
 
 Plain asserts rather than pytest: there is no pytest on this machine, and the
 repo's other direct suites (tests/test_bash_guards.py,
-permission-ledger/tests/) use this same check/section harness.
+tests/permission-ledger/) use this same check/section harness.
 """
 from __future__ import annotations
 

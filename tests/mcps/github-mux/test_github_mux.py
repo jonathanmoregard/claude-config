@@ -4,7 +4,7 @@
 # ///
 """Contract tests for the github-mux MCP server.
 
-Run: uv run --script mcps/github-mux/test_github_mux.py
+Run: uv run --script tests/mcps/github-mux/test_github_mux.py
 """
 
 from __future__ import annotations
@@ -36,7 +36,9 @@ from mcp.client.stdio import stdio_client
 # directory, not this file's, so every path derived from it still resolves.
 HERE = Path(__file__).resolve().parents[3] / "runtime" / "mcps" / "github-mux"
 SERVER = HERE / "server.py"
-FAKE_CHILD = HERE / "fake_child.py"
+# The stand-in child is test-only, so it lives beside this suite rather
+# than under runtime/, where it would be projected into ~/.claude.
+FAKE_CHILD = Path(__file__).resolve().parent / "fake_child.py"
 TRACKED_CONFIG = HERE / "config.json"
 
 # Write tools no agent may reach: merging, review approval, branch updates,

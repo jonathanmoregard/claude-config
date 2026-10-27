@@ -2,7 +2,7 @@
 """
 Plain-assert tests for work-hours-nudge.py (no pytest on this machine).
 
-Run:  python3 ~/.claude/wellbeing/tests/test_work_hours_nudge.py
+Run:  python3 tests/wellbeing/test_work_hours_nudge.py
 
 Invariants:
   * prompts typed in an interactive Codex session count toward today's hours

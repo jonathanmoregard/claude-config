@@ -3,7 +3,7 @@
 Plain-assert tests for the Claude-transcript reader in work-hours-nudge.py
 (no pytest on this machine).
 
-Run:  python3 ~/.claude/wellbeing/tests/test_work_hours_claude_reader.py
+Run:  python3 tests/wellbeing/test_work_hours_claude_reader.py
 
 Invariant: a malformed transcript never takes the hook down. A file that ends
 mid-UTF-8 character (a session still being appended to) or holds a JSON value

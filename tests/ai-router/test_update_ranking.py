@@ -2,7 +2,7 @@
 
 Run from the worktree root (pytest is nix-provided, not in the base python3):
 
-    nix shell nixpkgs#python3Packages.pytest -c pytest -q tools/ai-router/tests/test_update_ranking.py
+    nix shell nixpkgs#python3Packages.pytest -c pytest -q tests/ai-router/test_update_ranking.py
 
 Every run is offline: `--offline-fixture` payloads under fixtures/ranking/, and
 the network / app-server paths get injected fakes (`urlopen`, `spawn`).

@@ -14,15 +14,21 @@ ROOT = Path(__file__).resolve().parents[1]
 RUNTIME = ROOT / "runtime" if (ROOT / "runtime").is_dir() else ROOT
 RUNNER = RUNTIME / "mcps" / "klaffat-app-runner"
 HOST_SETUP = ROOT / "tests" / "agent-e2e" / "klaffat-app-runner-host-smoke" / "setup.sh"
+# The server's own suite is still part of the asset, but it is test code, so it
+# is tracked beside the other tests rather than under the projected tree.
+RUNNER_SUITE = ROOT / "tests" / "mcps" / "klaffat-app-runner" / "test_server.py"
 
 
 class KlaffatAppRunnerAssetTests(unittest.TestCase):
     def test_complete_stdlib_server_asset_is_tracked(self) -> None:
         for name in (
-            "server.py", "config.json", "hold.py", "sandbox_exec.py", "e2e_deps.py", "test_server.py"
+            "server.py", "config.json", "hold.py", "sandbox_exec.py", "e2e_deps.py"
         ):
             with self.subTest(name=name):
                 self.assertTrue((RUNNER / name).is_file(), f"missing {name}")
+        self.assertTrue(RUNNER_SUITE.is_file(), f"missing {RUNNER_SUITE}")
+        self.assertFalse((RUNNER / "test_server.py").exists(),
+                         "the suite is back under the projected tree")
         source = (RUNNER / "server.py").read_text(encoding="utf-8")
         self.assertIn('SERVER_INFO = {"name": "klaffat-app-runner"', source)
         self.assertNotIn("FastMCP", source)

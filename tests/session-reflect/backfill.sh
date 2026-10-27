@@ -5,7 +5,7 @@
 # Stub `claude` on PATH, scratch REFLECT_ROOT, fixed clock, fixture quota
 # readings and /proc files. No API spend, no writes outside the mktemp root.
 #
-#     bash skills/session-reflect/tests/backfill.sh
+#     bash tests/session-reflect/backfill.sh
 #
 # Exit: 0 all passed · 1 a case failed.
 # shellcheck disable=SC2319
