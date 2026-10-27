@@ -114,28 +114,27 @@ HOME = "/home/jonathan"
 # The only absolute targets a tracked symlink may have.
 #
 # Absolute is not a loophole, it is the spelling for "this deliberately leaves
-# the projection". Two things do:
+# the projection". One thing does:
 #
-#   skills-hm/      home-manager owns four skills -- nixos-config-dev,
-#                   nixos-automated-testing, nixos-agent-testing,
-#                   nixos-agenix-secret -- because they exist to go through
-#                   nixos-config's PR -> CI -> auto-deploy gate. `skills/` is
-#                   projected read-only, so home-manager cannot write inside it
-#                   and a `home.file` target there fails the next
-#                   `nixos-rebuild switch`. It writes to ~/.claude/skills-hm/
-#                   instead, which no mount covers, and this repository links
-#                   into it. See home/claude-skills.nix in nixos-config.
 #   Repos/router-agent/
 #                   `skills/review-inbox` and `hooks/router-nudge-hook` load
 #                   live config out of another repository. Same hazard class as
 #                   this whole mission, one repo over, and not settled here.
+#
+# There was a second, ~/.claude/skills-hm, and its removal is the point of the
+# commit that added these five nixos-* skills as real files. home-manager used
+# to own four of them -- so they would go through nixos-config's PR -> CI ->
+# auto-deploy gate -- but `skills/` is projected read-only, so a `home.file`
+# target inside it fails the next `nixos-rebuild switch`. The workaround was a
+# second location no mount covers, plus an absolute link per skill pointing
+# into it. Owning the files here deletes the premise, the location, the links
+# and the allowlist entry together.
 #
 # Checked as a prefix allowlist rather than waved through, because the previous
 # version passed *any* absolute target: a typo'd or stale absolute link counted
 # as "not checkable here" and was reported in the clean summary. Containment is
 # answerable from the index even when existence is not.
 ALLOWED_ABSOLUTE = (
-    f"{HOME}/.claude/skills-hm",
     f"{HOME}/Repos/router-agent",
 )
 
