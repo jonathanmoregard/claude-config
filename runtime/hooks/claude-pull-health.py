@@ -38,8 +38,8 @@ never "could not tell", or it stops carrying information.
 
 TARGETS FIND THEMSELVES
 
-The expected set is ``~/.claude`` plus every repository some sync unit has
-declared itself responsible for, read off the state root: the producers
+The expected set is the config repo's checkout plus every repository some sync
+unit has declared itself responsible for, read off the state root: the producers
 ``mkdir -p`` their state directory at the top of every run, before they can
 fail at anything, so that directory IS the declaration of coverage — recorded
 by the producer rather than guessed at by the reader. Deriving the set rather
@@ -137,6 +137,34 @@ def _claude_home() -> Path:
     return Path(override).expanduser() if override else Path.home() / ".claude"
 
 
+def _config_checkout() -> Path:
+    """Where the config repository's checkout is, which is not always the
+    config DIRECTORY.
+
+    The one unconditional target is the config repo, because a timer has pulled
+    it since 2026-04 and the session needs to hear if that stops. For most of
+    this hook's life the repo and the directory were the same path, so naming
+    ``~/.claude`` said both things at once.
+
+    The runtime projection splits them: the checkout moves to
+    ``~/Repos/claude-config`` and ``~/.claude`` becomes Claude Code's own state
+    plus read-only bind mounts of that checkout's ``runtime/`` subtree. Keeping
+    ``~/.claude`` named unconditionally after that would report the config repo
+    as never-pulled every single session, forever — a permanent false alarm in
+    the one channel that reports a broken sync, which is how this channel stops
+    being read at all. Silence is the budget.
+
+    So follow the repository, by the only marker that distinguishes the two
+    eras without a flag to keep in sync: a checkout has a ``.git``. While
+    ``~/.claude`` has one it IS the config repo and is named as before; once it
+    does not, the checkout is where the puller was repointed.
+    """
+    home = _claude_home()
+    if (home / ".git").exists():
+        return home
+    return Path.home() / "Repos" / "claude-config"
+
+
 def _covered(state_root: Path, repo: Path) -> bool:
     """Has anything ever pointed the puller at this repo?
 
@@ -151,8 +179,10 @@ def _covered(state_root: Path, repo: Path) -> bool:
 def _targets(state_root: Path) -> list[Path]:
     """Every repository whose sync this machine claims to maintain.
 
-    ``~/.claude`` is unconditional: it is the config repo, a timer has pulled
-    it since 2026-04, and if that ever stops the session needs to hear so.
+    The config repo is unconditional: a timer has pulled it since 2026-04, and
+    if that ever stops the session needs to hear so. Which PATH that is comes
+    from ``_config_checkout()`` — it is ``~/.claude`` only while ``~/.claude``
+    is still a checkout.
 
     Everything else is discovered from the state root, because the failure
     being fixed is a checkout nobody was watching — a hook that only watches
@@ -182,7 +212,8 @@ def _targets(state_root: Path) -> list[Path]:
         return [Path(p).expanduser() for p in override.split(os.pathsep) if p]
 
     home = _claude_home()
-    found = [home]
+    config = _config_checkout()
+    found = [config]
     try:
         children = sorted(state_root.iterdir())
     except OSError:
@@ -194,7 +225,16 @@ def _targets(state_root: Path) -> list[Path]:
         # producers write and what _covered() reads back. Anything that does
         # not decode to an absolute path was not written by them.
         repo = Path(child.name.replace("%", "/"))
-        if not repo.is_absolute() or repo == home or repo in found:
+        if not repo.is_absolute() or repo in found:
+            continue
+        # Coverage normally outlives a puller on purpose — a repo that WAS
+        # synced keeps its state directory, so losing a puller is noticed. The
+        # one exception is the config directory after it stops being the config
+        # checkout: the pre-cutover state directory still names ``~/.claude``,
+        # which nothing will ever pull again, and discovery would otherwise
+        # resurrect it as permanently stale. The repo it used to stand for is
+        # already named above, by the path it moved to.
+        if repo == home and home != config:
             continue
         found.append(repo)
     return found

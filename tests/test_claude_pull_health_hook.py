@@ -93,9 +93,14 @@ def write_status(state_root: Path, repo: Path, **fields) -> Path:
     return p
 
 
-def run_hook(state_root, targets, claude_home=None) -> subprocess.CompletedProcess:
+def run_hook(state_root, targets, claude_home=None, home=None) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env["CLAUDE_PULL_STATE_ROOT"] = str(state_root)
+    # `home` is the seam for the post-cutover arm: with no CLAUDE_HOME set, the
+    # hook derives both the config directory and the checkout it falls back to
+    # from HOME, exactly as it does on the host.
+    if home is not None:
+        env["HOME"] = str(home)
     if targets is not None:
         env["CLAUDE_PULL_HEALTH_TARGETS"] = os.pathsep.join(str(t) for t in targets)
     else:
@@ -132,8 +137,16 @@ class Sandbox:
         self.state_root.mkdir()
 
     def repo(self, name: str = "checkout") -> Path:
+        """A fake checkout — with a `.git`, because that is what makes it one.
+
+        The hook reads that marker to tell whether the config DIRECTORY is
+        still the config CHECKOUT (see `_config_checkout`), so a fake checkout
+        without one is a fake of the wrong thing: it would stand for a
+        post-cutover `~/.claude` in every test that only means "a repo".
+        """
         d = self.root / name
         d.mkdir(parents=True, exist_ok=True)
+        (d / ".git").mkdir(exist_ok=True)
         return d
 
     def __enter__(self):
@@ -439,6 +452,87 @@ with Sandbox() as sb:
         write_status(sb.state_root, repo, **kwargs)
         codes.append(run_hook(sb.state_root, [repo]).returncode)
     check("every path exits 0", codes == [0, 0, 0], detail=str(codes))
+
+
+# ----------------------------------------------------------------------
+section("The config repo is followed, not the path")
+# ----------------------------------------------------------------------
+
+# The runtime-projection cutover splits the config DIRECTORY from the config
+# CHECKOUT: ~/.claude keeps Claude Code's own state and receives read-only bind
+# mounts, while the repository the puller fast-forwards moves to
+# ~/Repos/claude-config. A hook that keeps naming ~/.claude unconditionally
+# would report the config repo as never-pulled every session for the rest of
+# time — a permanent false alarm in the one channel that reports a broken sync.
+# So the unconditional target follows the repository, and `.git` is what tells
+# the two eras apart without a flag to keep in sync.
+
+with Sandbox() as sb:
+    home = sb.repo("home")                       # pre-cutover: .claude IS the repo
+    claude_home = home / ".claude"
+    claude_home.mkdir()
+    (claude_home / ".git").mkdir()
+    (home / "Repos" / "claude-config").mkdir(parents=True)
+    write_status(sb.state_root, claude_home)
+    proc = run_hook(sb.state_root, None, home=home)
+    check("while ~/.claude is a checkout it is still the named target",
+          proc.stdout == "", detail=repr(proc.stdout))
+
+with Sandbox() as sb:
+    home = sb.repo("home")
+    claude_home = home / ".claude"
+    claude_home.mkdir()                          # no .git: post-cutover
+    checkout = home / "Repos" / "claude-config"
+    checkout.mkdir(parents=True)
+    (checkout / ".git").mkdir()
+    write_status(sb.state_root, checkout)
+    proc = run_hook(sb.state_root, None, home=home)
+    check("after the cutover a healthy ~/Repos/claude-config is what satisfies it",
+          proc.stdout == "", detail=repr(proc.stdout))
+
+with Sandbox() as sb:
+    home = sb.repo("home")
+    claude_home = home / ".claude"
+    claude_home.mkdir()                          # post-cutover
+    checkout = home / "Repos" / "claude-config"
+    checkout.mkdir(parents=True)
+    (checkout / ".git").mkdir()
+    msg = announcement(run_hook(sb.state_root, None, home=home)).get("systemMessage", "")
+    check("after the cutover an unpulled ~/Repos/claude-config is the finding",
+          str(checkout) in msg and str(claude_home) not in msg, detail=msg[:250])
+
+# The state directory the puller wrote before the cutover keeps naming
+# ~/.claude. Coverage normally outlives a puller on purpose, so discovery would
+# resurrect that leftover as a repo nothing will ever pull again — the same
+# permanent false alarm, reached by the other road.
+with Sandbox() as sb:
+    home = sb.repo("home")
+    claude_home = home / ".claude"
+    claude_home.mkdir()                          # post-cutover
+    checkout = home / "Repos" / "claude-config"
+    checkout.mkdir(parents=True)
+    (checkout / ".git").mkdir()
+    write_status(sb.state_root, checkout)
+    write_status(sb.state_root, claude_home,     # the pre-cutover leftover
+                 checked_at_epoch=int(time.time()) - STALE_S - 600,
+                 last_ok_epoch=int(time.time()) - STALE_S - 600)
+    proc = run_hook(sb.state_root, None, home=home)
+    check("a pre-cutover state directory for ~/.claude does not speak",
+          proc.stdout == "", detail=repr(proc.stdout))
+
+# ...and that exclusion is narrow. While ~/.claude IS the checkout, a stale
+# record for it is exactly what this hook exists to announce.
+with Sandbox() as sb:
+    home = sb.repo("home")
+    claude_home = home / ".claude"
+    claude_home.mkdir()
+    (claude_home / ".git").mkdir()               # pre-cutover
+    write_status(sb.state_root, claude_home,
+                 checked_at_epoch=int(time.time()) - STALE_S - 600,
+                 last_ok_epoch=int(time.time()) - STALE_S - 600)
+    msg = announcement(run_hook(sb.state_root, None, home=home)).get("systemMessage", "")
+    check("a stale record for a still-checked-out ~/.claude is announced",
+          str(claude_home) in msg, detail=msg[:250])
 
 
 # ----------------------------------------------------------------------
