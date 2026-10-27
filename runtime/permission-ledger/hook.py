@@ -30,7 +30,9 @@ import re
 import sys
 from datetime import datetime, timezone
 
-DEFAULT_LEDGER_DIR = "~/.claude/permission-ledger"
+# State, not config: ~/.claude is mounted read-only by the runtime projection,
+# so a ledger defaulting there would append nothing and raise EROFS instead.
+DEFAULT_LEDGER_DIR = "~/.local/state/permission-ledger"
 ERROR_LOG_NAME = "hook-errors.log"
 
 # Tools recorded by nobody: no filesystem, network or execution reach, so no

@@ -91,7 +91,12 @@ set -uo pipefail   # deliberately not -e: every failure branch is handled here
 
 CLAUDE_HOME="$HOME/.claude"
 
-LEDGER_DIR="${PERMISSION_LEDGER_DIR:-$CLAUDE_HOME/permission-ledger}"
+# Two directories, because they have two lifetimes. CODE_DIR is wherever this
+# script was installed and is read-only under the runtime projection; LEDGER_DIR
+# is state and must stay writable, so it cannot be inside ~/.claude.
+CODE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+
+LEDGER_DIR="${PERMISSION_LEDGER_DIR:-$HOME/.local/state/permission-ledger}"
 LEDGER_DIR="${LEDGER_DIR/#\~/$HOME}"
 
 LOG_DIR="$CLAUDE_HOME/logs"
@@ -105,9 +110,9 @@ LOG_FILE="$LOG_DIR/permission-ledger.log"
 # samples and has no business inside the config the harness reads. State dir.
 RAW_KEEP_DIR="$HOME/.local/state/permission-ledger"
 
-AGGREGATE="$LEDGER_DIR/aggregate.py"
-PROMPT_FILE="$LEDGER_DIR/prompt.md"
-SINK="$LEDGER_DIR/proposal-sink.py"
+AGGREGATE="$CODE_DIR/aggregate.py"
+PROMPT_FILE="$CODE_DIR/prompt.md"
+SINK="$CODE_DIR/proposal-sink.py"
 DIGEST="$LEDGER_DIR/digest-latest.json"
 DIGEST_PREV="$LEDGER_DIR/digest-prev.json"
 RSI_CONFIG="$CLAUDE_HOME/recursive-self-improvement/config/config.json"

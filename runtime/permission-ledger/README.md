@@ -96,20 +96,24 @@ pass per night. Cheap-and-visible fails on, expensive fails off.
 
 ## Where things live
 
+Code and state live apart. The runtime projection mounts `~/.claude`
+read-only, so anything written while the ledger runs has to sit outside it.
+
 ```
-~/.claude/permission-ledger/
+~/.claude/permission-ledger/        code, read-only under the projection
 ├── hook.py            stage 1
 ├── aggregate.py       stage 2
 ├── run-evaluate.sh    the cron entrypoint: stage 2 + stage 3 + retention
 ├── prompt.md          stage 3 — the evaluator prompt
 ├── proposal-sink.py   stage 3 — parses the agent's stdout blocks into files
-├── README.md          this file
+├── record-decision.py records a drained pattern so it stops coming back
+├── on-decision        the /review-improvements callback; calls record-decision.py
+└── README.md          this file
+~/.local/state/permission-ledger/   state, writable ($PERMISSION_LEDGER_DIR)
 ├── YYYY-MM.jsonl      the ledger, one month per file, 0600
 ├── digest-latest.json what the nightly agent reads, 0600
 ├── digest-prev.json   the run before that, kept for diffing
 ├── decided.json       pattern_key -> your decision, written by record-decision.py
-├── record-decision.py records a drained pattern so it stops coming back
-├── on-decision        the /review-improvements callback; calls record-decision.py
 └── hook-errors.log    anything the hook swallowed
 ~/.local/state/claude-proposals/permissions/   (the sink; ~/.claude/proposals is a symlink to its parent)
 ├── YYYY-MM-DD-<slug>.md     pending proposals
@@ -117,31 +121,31 @@ pass per night. Cheap-and-visible fails on, expensive fails off.
 ~/.claude/_backups/settings.json.<timestamp>.bak
 ```
 
-The ledger directory is `0700`; ledger files are `0600`.
+The state directory is `0700`; ledger files are `0600`.
 
 ## Inspecting it by hand
 
 ```sh
 # what fired today
-grep "$(date +%F)" ~/.claude/permission-ledger/$(date +%Y-%m).jsonl | jq -c '{ts,tool_name,pattern_key,event}'
+grep "$(date +%F)" ~/.local/state/permission-ledger/$(date +%Y-%m).jsonl | jq -c '{ts,tool_name,pattern_key,event}'
 
 # top friction, last month, no model involved
-jq -r .pattern_key ~/.claude/permission-ledger/$(date +%Y-%m).jsonl | sort | uniq -c | sort -rn | head -20
+jq -r .pattern_key ~/.local/state/permission-ledger/$(date +%Y-%m).jsonl | sort | uniq -c | sort -rn | head -20
 
 # what you actually declined
-jq -c 'select(.event=="denied") | {ts,pattern_key,reason}' ~/.claude/permission-ledger/*.jsonl
+jq -c 'select(.event=="denied") | {ts,pattern_key,reason}' ~/.local/state/permission-ledger/*.jsonl
 
 # what the nightly run would see, right now
 python3 ~/.claude/permission-ledger/aggregate.py | jq .
 
 # what last night's run actually handed the agent
-jq . ~/.claude/permission-ledger/digest-latest.json
+jq . ~/.local/state/permission-ledger/digest-latest.json
 
 # what the nightly job did, and whether it even called the model
 grep permission-ledger ~/.claude/logs/permission-ledger.log | tail -20
 
 # did the hook ever fail
-cat ~/.claude/permission-ledger/hook-errors.log
+cat ~/.local/state/permission-ledger/hook-errors.log
 ```
 
 Run the whole nightly job by hand — aggregation, digest, model call and all:
@@ -213,7 +217,7 @@ and the error log stay.
 To do it by hand anyway:
 
 ```sh
-find ~/.claude/permission-ledger -name '*.jsonl' -mtime +180 -delete
+find ~/.local/state/permission-ledger -name '*.jsonl' -mtime +180 -delete
 ```
 
 Deleting the whole ledger at any time is safe — it only costs you history.
@@ -226,8 +230,8 @@ bash /path/to/permission-ledger/uninstall.sh
 
 Removes both hook entries from `settings.json` (leaving every other hook
 intact), removes the cron line by its `# permission-ledger-evaluate` tag, and
-leaves the ledger and your proposals alone. `--purge` also deletes
-`~/.claude/permission-ledger/`; proposals are never deleted.
+leaves the ledger and your proposals alone. `--purge` also deletes the
+installed code directory; proposals are never deleted.
 
 `settings.json` is snapshotted to `~/.claude/_backups/settings.json.<ts>.bak`
 before either script touches it, so the blunt rollback is:

@@ -20,7 +20,15 @@ import json
 import os
 import sys
 
-DEFAULT_PATH = os.path.expanduser("~/.claude/permission-ledger/decided.json")
+# Same directory hook.py and aggregate.py use, and for the same reason: the
+# decisions file is state, and ~/.claude is read-only under the projection.
+DEFAULT_LEDGER_DIR = "~/.local/state/permission-ledger"
+DEFAULT_PATH = os.path.join(
+    os.path.expanduser(
+        os.environ.get("PERMISSION_LEDGER_DIR") or DEFAULT_LEDGER_DIR
+    ),
+    "decided.json",
+)
 
 
 def main(argv=None):

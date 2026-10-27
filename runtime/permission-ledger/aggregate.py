@@ -34,7 +34,9 @@ import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 
-DEFAULT_LEDGER_DIR = "~/.claude/permission-ledger"
+# Matches hook.py: the ledger is state, and ~/.claude is read-only under the
+# runtime projection.
+DEFAULT_LEDGER_DIR = "~/.local/state/permission-ledger"
 
 # Ordered candidates for RSI's scan_content.py; the first one that exists wins.
 # There is no single canonical location: a direct RSI install puts it under
