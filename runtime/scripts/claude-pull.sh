@@ -141,6 +141,40 @@ Log:  journalctl --user -u $PULL_UNIT" ||
 # SessionStart hook can tell "checked and healthy" from "nobody has checked".
 clear_alert() { rm -f "$STATE/last-alert"; write_status ok ""; }
 
+# ── Required tools, checked once, up front ───────────────────────────────────
+#
+# Two separate branches below read a non-zero exit as a BENIGN condition, and
+# "command not found" is non-zero:
+#
+#   * `flock -n` failing means "another run holds the lock; skipping tick",
+#     exit 0, no status record at all;
+#   * `getent ahosts` failing means "this host is offline", exit 0, and the
+#     fetch-failure counter that drives the six-strike alert is never touched.
+#
+# So a missing binary does not fail here — it impersonates a healthy skip, for
+# as long as nobody looks. Both were measured on 2026-10-28, running this
+# script from the systemd SYSTEM unit that deploys the tree ~/.claude is served
+# from (nixos-config modules/nixos/claude-runtime-deploy.nix). A system service
+# inherits systemd's compiled-in PATH — e2fsprogs, btrfs-progs, dosfstools,
+# util-linux-MINIMAL, openssh, systemd — which has neither flock nor getent.
+# The first real tick logged "flock: command not found" and then "another
+# sync/pull run holds the lock; skipping tick", and the unit reported success.
+#
+# A preflight is the fix rather than a guard per call site, because the pattern
+# generalises: every one of these branches is a "benign non-zero", and the next
+# one added would inherit the same hole. The unit pins the dependencies too —
+# this is what makes the same mistake anywhere else loud instead of green.
+#
+# python3 is deliberately NOT here: its one use site is already guarded by a
+# `command -v` test and degrades to "skip the settings carry", which is a
+# behaviour change rather than a lie about the result.
+for tool in flock getent git; do
+  command -v "$tool" >/dev/null 2>&1 || {
+    alert "$tool is not on PATH, so this tick cannot run — refusing, because the branches that read its failure as 'lock held' or 'host offline' would otherwise report a healthy skip without pulling anything." "missing-tool-$tool"
+    exit 1
+  }
+done
+
 # Everything above this line works on a path, not on a repository, so a target
 # that has been deleted or corrupted is still reportable. From here down it has
 # to be a real checkout.
@@ -156,25 +190,6 @@ if ! GIT_DIR_PATH="$(git rev-parse --absolute-git-dir 2>/dev/null)"; then
   alert "$REPO is not a git checkout — auto-pull has nothing to fast-forward there."
   exit 1
 fi
-
-# A missing flock is NOT a contended lock, and the skip below cannot tell them
-# apart: `flock -n` not found exits 127, the skip accepts any non-zero, and the
-# tick then exits 0 having pulled nothing. That is silent for as long as it
-# lasts — no alert, no status record (a contended tick deliberately writes
-# none), and `systemctl status` green every ten minutes.
-#
-# Measured 2026-10-27, running this script from the systemd SYSTEM unit that
-# deploys the tree ~/.claude is served from (nixos-config
-# modules/nixos/claude-runtime-deploy.nix). A system service inherits
-# util-linux-MINIMAL on PATH, which ships no flock, so the very first real
-# tick logged "flock: command not found" immediately followed by "another
-# sync/pull run holds the lock; skipping tick" and reported success. The unit
-# now pins its own dependencies, and this check is what makes the same mistake
-# anywhere else loud instead of green.
-command -v flock >/dev/null 2>&1 || {
-  alert "flock is not on PATH, so this tick cannot take the sync lock — refusing, because a missing flock is indistinguishable from a contended one and would otherwise report success without pulling."
-  exit 1
-}
 
 # Shared with sync-agent.sh so a pull can never land halfway through the
 # commit-and-push agent's run (or vice versa). Non-blocking: skipping a tick

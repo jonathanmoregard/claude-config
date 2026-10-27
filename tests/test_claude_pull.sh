@@ -320,7 +320,7 @@ run
 check "held lock skips the tick" 0 "$rc" "holds the lock" "$out"
 wait
 
-# 9a. flock ABSENT -> loud failure, not a skipped tick.
+# 9a. A REQUIRED TOOL ABSENT -> loud failure, not a skipped tick.
 #
 # `flock -n` not found exits 127, and the skip branch above accepts any
 # non-zero, so a PATH without flock reported "another sync/pull run holds the
@@ -339,18 +339,35 @@ for t in bash sh env git sed grep date mktemp readlink dirname basename cat cp \
   getent sort uniq wc stat find; do
   tp="$(command -v "$t" 2>/dev/null)" && ln -sf "$tp" "$ROOT/noflockbin/$t"
 done
-command -v flock >/dev/null 2>&1 \
-  || { echo "FAIL noflock: the harness host has no flock to hide"; fail=$((fail+1)); }
-fresh noflock; advance_origin new.txt hello
-out=$(PATH="$ROOT/fakebin:$ROOT/noflockbin" "$SCRIPT" 2>&1); rc=$?
-check "a missing flock fails loudly instead of claiming a held lock" 1 "$rc" \
-  "flock" "$out"
-if printf '%s' "$out" | grep -qE "holds the lock"; then
-  echo "FAIL noflock: reported a contended lock when flock was simply absent"
-  fail=$((fail+1))
-fi
-# And it must not look like a successful tick to the health hook either.
-expect_status "a missing flock is an alert in the health record" state alert
+# Every tool whose failure some branch reads as benign. `getent` is the second
+# one and the reason this is a loop rather than a flock special case: a failed
+# `getent ahosts` means "this host is offline", which exits 0 AND skips the
+# fetch-failure counter that drives the six-strike alert — so an absent getent
+# silently makes a genuinely broken remote unreportable. Found in review
+# 2026-10-28, same shape as the flock case.
+for missing in flock getent; do
+  command -v "$missing" >/dev/null 2>&1 \
+    || { echo "FAIL $missing: the harness host has no $missing to hide"; fail=$((fail+1)); continue; }
+  rm -f "$ROOT/noflockbin/$missing"
+  for t in flock getent; do
+    [ "$t" = "$missing" ] && continue
+    tp="$(command -v "$t" 2>/dev/null)" && ln -sf "$tp" "$ROOT/noflockbin/$t"
+  done
+  fresh "no-$missing"; advance_origin new.txt hello
+  out=$(PATH="$ROOT/fakebin:$ROOT/noflockbin" "$SCRIPT" 2>&1); rc=$?
+  check "a missing $missing fails loudly instead of claiming a benign skip" 1 "$rc" \
+    "$missing" "$out"
+  if printf '%s' "$out" | grep -qE "holds the lock|while offline"; then
+    echo "FAIL no-$missing: reported a benign skip when $missing was simply absent"
+    fail=$((fail+1))
+  fi
+  # And it must not look like a successful tick to the health hook either.
+  expect_status "a missing $missing is an alert in the health record" state alert
+done
+# Restore the probe PATH for anything later that reuses it.
+for t in flock getent; do
+  tp="$(command -v "$t" 2>/dev/null)" && ln -sf "$tp" "$ROOT/noflockbin/$t"
+done
 
 # 10. fetch failure -> counts, no notification until 6 in a row
 fresh fetchfail
