@@ -10,7 +10,7 @@
 # Run:  tests/test_claude_pull.sh
 set -uo pipefail
 
-SCRIPT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)/scripts/claude-pull.sh"
+SCRIPT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)/runtime/scripts/claude-pull.sh"
 ROOT=$(mktemp -d)
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 # Per-run state root, so nothing here can read or clobber the real one under
@@ -320,6 +320,55 @@ run
 check "held lock skips the tick" 0 "$rc" "holds the lock" "$out"
 wait
 
+# 9a. A REQUIRED TOOL ABSENT -> loud failure, not a skipped tick.
+#
+# `flock -n` not found exits 127, and the skip branch above accepts any
+# non-zero, so a PATH without flock reported "another sync/pull run holds the
+# lock" and exited 0 — forever, on every tick, while systemd and the health
+# record both said success. Found 2026-10-27 by running the script from the
+# system unit that deploys the served tree (nixos-config
+# modules/nixos/claude-runtime-deploy.nix): a systemd SYSTEM service inherits
+# util-linux-MINIMAL, which ships no flock, and nothing in the PATH chain puts
+# the real one back.
+#
+# A PATH holding everything the script needs EXCEPT flock, so this tests the
+# missing-binary case rather than a shadowed one.
+mkdir -p "$ROOT/noflockbin"
+for t in bash sh env git sed grep date mktemp readlink dirname basename cat cp \
+  mv rm mkdir rmdir head tail tr cut printf timeout python3 id sleep hostname \
+  getent sort uniq wc stat find; do
+  tp="$(command -v "$t" 2>/dev/null)" && ln -sf "$tp" "$ROOT/noflockbin/$t"
+done
+# Every tool whose failure some branch reads as benign. `getent` is the second
+# one and the reason this is a loop rather than a flock special case: a failed
+# `getent ahosts` means "this host is offline", which exits 0 AND skips the
+# fetch-failure counter that drives the six-strike alert — so an absent getent
+# silently makes a genuinely broken remote unreportable. Found in review
+# 2026-10-28, same shape as the flock case.
+for missing in flock getent; do
+  command -v "$missing" >/dev/null 2>&1 \
+    || { echo "FAIL $missing: the harness host has no $missing to hide"; fail=$((fail+1)); continue; }
+  rm -f "$ROOT/noflockbin/$missing"
+  for t in flock getent; do
+    [ "$t" = "$missing" ] && continue
+    tp="$(command -v "$t" 2>/dev/null)" && ln -sf "$tp" "$ROOT/noflockbin/$t"
+  done
+  fresh "no-$missing"; advance_origin new.txt hello
+  out=$(PATH="$ROOT/fakebin:$ROOT/noflockbin" "$SCRIPT" 2>&1); rc=$?
+  check "a missing $missing fails loudly instead of claiming a benign skip" 1 "$rc" \
+    "$missing" "$out"
+  if printf '%s' "$out" | grep -qE "holds the lock|while offline"; then
+    echo "FAIL no-$missing: reported a benign skip when $missing was simply absent"
+    fail=$((fail+1))
+  fi
+  # And it must not look like a successful tick to the health hook either.
+  expect_status "a missing $missing is an alert in the health record" state alert
+done
+# Restore the probe PATH for anything later that reuses it.
+for t in flock getent; do
+  tp="$(command -v "$t" 2>/dev/null)" && ln -sf "$tp" "$ROOT/noflockbin/$t"
+done
+
 # 10. fetch failure -> counts, no notification until 6 in a row
 fresh fetchfail
 git -C "$CLONE" remote set-url origin "$ROOT/does-not-exist.git"
@@ -556,6 +605,68 @@ expect_status "status is ok once the submodule is checked out" state ok
 [ -f "$CLONE/vendor/sub/SKILL.md" ] \
   && { echo "PASS empty submodule is populated on the next tick"; pass=$((pass+1)); } \
   || { echo "FAIL subretry: vendor/sub still empty on the tick after a failed clone"; fail=$((fail+1)); }
+
+# 16. A submodule that IS checked out but sits at the wrong commit. The
+#     superproject fast-forwards, the submodule's own remote is unavailable, so
+#     `git submodule update` fails and the submodule stays at the pin the
+#     parent used to name. `git submodule status` marks that `+`, not `-`, so
+#     the empty-submodule check in case 15 does not see it: before this case
+#     the tick exited 0 and recorded `ok` over a checkout whose vendored skills
+#     were a commit behind what master pins, and no later tick repaired it
+#     because the retry gate only fired on `-`. Stale forever, reported
+#     healthy.
+export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=protocol.file.allow GIT_CONFIG_VALUE_0=always
+fresh substale
+SUB="$ROOT/substale/sub.git"
+git init --quiet --bare -b main "$SUB"
+git init --quiet -b main "$ROOT/substale/subseed"
+echo "skill v1" > "$ROOT/substale/subseed/SKILL.md"
+git -C "$ROOT/substale/subseed" add -A >/dev/null
+git -C "$ROOT/substale/subseed" commit --quiet -m "sub v1"
+git -C "$ROOT/substale/subseed" push --quiet "$SUB" main
+w="$ROOT/pushwork"; rm -rf "$w"; git clone --quiet "$ORIGIN" "$w"
+git -C "$w" submodule --quiet add "$SUB" vendor/sub
+git -C "$w" commit --quiet -m "add submodule"
+git -C "$w" push --quiet origin master
+run
+check "baseline: the submodule starts in sync" 0 "$rc"
+sub_v1="$(git -C "$CLONE/vendor/sub" rev-parse HEAD)"
+
+# Advance the submodule, then move the superproject's pin onto the new commit.
+echo "skill v2" > "$ROOT/substale/subseed/SKILL.md"
+git -C "$ROOT/substale/subseed" commit --quiet -am "sub v2"
+git -C "$ROOT/substale/subseed" push --quiet "$SUB" main
+sub_v2="$(git -C "$ROOT/substale/subseed" rev-parse HEAD)"
+rm -rf "$w"; git clone --quiet "$ORIGIN" "$w"
+git -C "$w" submodule --quiet update --init
+git -C "$w" -C vendor/sub fetch --quiet origin main
+git -C "$w" -C vendor/sub checkout --quiet "$sub_v2"
+git -C "$w" commit --quiet -am "bump submodule pin"
+git -C "$w" push --quiet origin master
+
+# The submodule's remote is gone, so the checkout of the new pin cannot happen.
+mv "$SUB" "$SUB.away"
+run
+check "a submodule stuck at the wrong commit is not a healthy tick" 1 "$rc" \
+  "Submodule\(s\) not at the commit master pins" "$out"
+printf '%s' "$out" | grep -q "fast-forwarded master" \
+  && { echo "PASS stale submodule still fast-forwards the superproject"; pass=$((pass+1)); } \
+  || { echo "FAIL substale: superproject was not fast-forwarded"; fail=$((fail+1)); }
+expect_status "a stale submodule records alert, not ok" state alert
+expect_equal "the submodule really is still at the old commit" \
+  "$sub_v1" "$(git -C "$CLONE/vendor/sub" rev-parse HEAD)"
+
+# The superproject now needs no update at all, so this is the tick that used to
+# do nothing: the repair must not wait for the next master commit.
+mv "$SUB.away" "$SUB"
+run
+check "the next tick repairs the stale submodule" 0 "$rc"
+expect_status "status is ok once the submodule matches its pin" state ok
+expect_equal "the submodule was moved onto the pinned commit" \
+  "$sub_v2" "$(git -C "$CLONE/vendor/sub" rev-parse HEAD)"
+grep -q "skill v2" "$CLONE/vendor/sub/SKILL.md" \
+  && { echo "PASS the pinned content is what is served"; pass=$((pass+1)); } \
+  || { echo "FAIL substale: vendor/sub/SKILL.md is not the pinned revision"; fail=$((fail+1)); }
 unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
 
 echo
