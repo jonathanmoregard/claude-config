@@ -38,8 +38,8 @@ never "could not tell", or it stops carrying information.
 
 TARGETS FIND THEMSELVES
 
-The expected set is ``~/.claude`` plus every repository some sync unit has
-declared itself responsible for, read off the state root: the producers
+The expected set is the config repo's checkout plus every repository some sync
+unit has declared itself responsible for, read off the state root: the producers
 ``mkdir -p`` their state directory at the top of every run, before they can
 fail at anything, so that directory IS the declaration of coverage — recorded
 by the producer rather than guessed at by the reader. Deriving the set rather
@@ -109,6 +109,13 @@ OK = "ok"
 ALERT = "alert"
 UNVERIFIED = "unverified"
 
+# The system-owned half of the deployment, from nixos-config's
+# claude-runtime-deploy module: `<root>/checkout` is the tree ~/.claude is
+# served from and `<root>/state` is where its puller publishes. Named here as
+# one literal because the two always move together, and read through the
+# helpers below so tests can point them elsewhere.
+SYSTEM_RUNTIME_ROOT = "/var/lib/claude-runtime"
+
 # Which way the repo is meant to move. Absent means PULL — every record
 # claude-pull.sh wrote before the field existed, and the field must not turn
 # those into unrecognised ones.
@@ -118,18 +125,57 @@ PUSH = "push"
 # Journal to send the reader to, per direction. Both pullers (claude-pull,
 # claude-marketplace-pull) share one script and one unit prefix.
 JOURNAL = {
-    PULL: "journalctl --user -u claude-pull",
+    PULL: "journalctl --user -u claude-pull (or, for the config repo, journalctl -u claude-runtime-deploy)",
     PUSH: "journalctl --user -u claude-proposals-push",
 }
 
 
-def _state_root() -> Path:
+def _state_roots() -> list[Path]:
+    """Every place a puller publishes its health records, nearest first.
+
+    There are two as of 2026-10-27, and the second one is why this is a list.
+    The pullers that run as Jonathan write under his own state directory. The
+    puller for the CONFIG repo does not run as Jonathan any more: the tree
+    ~/.claude is served from is a deploy-only clone owned by a claude-deploy
+    system user, updated by claude-runtime-deploy.service, and it publishes to
+    a system path (nixos-config, modules/nixos/claude-runtime-deploy.nix).
+
+    A reader that only knew the user root would report the config repo as
+    "nothing is auto-pulling it" every single session — a permanent false alarm
+    in the one channel that reports a broken sync, which is exactly how this
+    channel stops being read. Silence is the budget.
+
+    The system root is published 0755 by that module's tmpfiles rules
+    specifically so this hook can read it without privilege and without
+    reaching into anybody's .git.
+    """
     override = os.environ.get("CLAUDE_PULL_STATE_ROOT")
     if override:
+        user_root = Path(override).expanduser()
+    else:
+        xdg = os.environ.get("XDG_STATE_HOME")
+        base = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "state"
+        user_root = base / "claude-pull"
+    return [user_root, _system_state_root()]
+
+
+def _system_state_root() -> Path:
+    """Where the deploy puller publishes. Overridable for tests only."""
+    override = os.environ.get("CLAUDE_PULL_SYSTEM_STATE_ROOT")
+    if override:
         return Path(override).expanduser()
-    xdg = os.environ.get("XDG_STATE_HOME")
-    base = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "state"
-    return base / "claude-pull"
+    return Path(SYSTEM_RUNTIME_ROOT) / "state"
+
+
+def _deploy_checkout() -> Path:
+    """The clone the projection is served from, i.e. the one that IS pulled.
+
+    Overridable for tests, like every other path in this module.
+    """
+    override = os.environ.get("CLAUDE_DEPLOY_CHECKOUT")
+    if override:
+        return Path(override).expanduser()
+    return Path(SYSTEM_RUNTIME_ROOT) / "checkout"
 
 
 def _claude_home() -> Path:
@@ -137,22 +183,80 @@ def _claude_home() -> Path:
     return Path(override).expanduser() if override else Path.home() / ".claude"
 
 
-def _covered(state_root: Path, repo: Path) -> bool:
-    """Has anything ever pointed the puller at this repo?
+def _config_checkout() -> Path:
+    """Where the config repository's checkout is, which is not always the
+    config DIRECTORY.
+
+    The one unconditional target is the config repo, because a timer has pulled
+    it since 2026-04 and the session needs to hear if that stops. For most of
+    this hook's life the repo and the directory were the same path, so naming
+    ``~/.claude`` said both things at once.
+
+    The runtime projection splits them: ``~/.claude`` becomes Claude Code's
+    own state plus read-only bind mounts of a checkout's ``runtime/`` subtree.
+    Which checkout changed again on 2026-10-27, and the distinction matters
+    here more than anywhere: the served tree is a DEPLOY clone under
+    ``/var/lib/claude-runtime``, pulled every ten minutes by a system unit,
+    while ``~/Repos/claude-config`` is the DEV checkout and is pulled by
+    NOTHING — branches and worktrees live there and an unattended
+    fast-forward of a tree someone may be mid-rebase on is not a service.
+
+    So the unconditional target is the deploy clone. Naming the dev checkout
+    instead would report "nothing is auto-pulling it" forever, truthfully and
+    uselessly, about a tree that is not supposed to be pulled. Keeping
+    ``~/.claude`` named unconditionally after that would report the config repo
+    as never-pulled every single session, forever — a permanent false alarm in
+    the one channel that reports a broken sync, which is how this channel stops
+    being read at all. Silence is the budget.
+
+    So follow the repository, by the only marker that distinguishes the two
+    eras without a flag to keep in sync: a checkout has a ``.git``. While
+    ``~/.claude`` has one it IS the config repo and is named as before; once it
+    does not, the checkout is where the puller was repointed.
+    """
+    home = _claude_home()
+    if (home / ".git").exists():
+        return home
+    return _deploy_checkout()
+
+
+def _slug(repo: Path) -> str:
+    """The directory name a puller writes for a repo: path with '/' -> '%'.
+
+    The shape `systemd-escape -p` produces, and the contract between the bash
+    producer and this reader.
+    """
+    return str(repo).replace("/", "%")
+
+
+def _record_dir(state_roots: list[Path], repo: Path) -> Path | None:
+    """The state directory for a repo, in the first root that has one."""
+    for root in state_roots:
+        candidate = root / _slug(repo)
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def _covered(state_roots: list[Path], repo: Path) -> bool:
+    """Has anything ever pointed a puller at this repo?
 
     claude-pull.sh creates the state directory at the top of every run, before
     it can fail at anything, so the directory's existence is the puller's own
     declaration of "this repo is mine" — recorded by the producer rather than
-    guessed at by the reader.
+    guessed at by the reader. Either root counts: which one a repo publishes to
+    is a fact about which identity pulls it, not about whether it is covered.
     """
-    return (state_root / str(repo).replace("/", "%")).is_dir()
+    return _record_dir(state_roots, repo) is not None
 
 
-def _targets(state_root: Path) -> list[Path]:
+def _targets(state_roots: list[Path]) -> list[Path]:
     """Every repository whose sync this machine claims to maintain.
 
-    ``~/.claude`` is unconditional: it is the config repo, a timer has pulled
-    it since 2026-04, and if that ever stops the session needs to hear so.
+    The config repo is unconditional: a timer has pulled it since 2026-04, and
+    if that ever stops the session needs to hear so. Which PATH that is comes
+    from ``_config_checkout()`` — it is ``~/.claude`` only while ``~/.claude``
+    is still a checkout.
 
     Everything else is discovered from the state root, because the failure
     being fixed is a checkout nobody was watching — a hook that only watches
@@ -182,11 +286,25 @@ def _targets(state_root: Path) -> list[Path]:
         return [Path(p).expanduser() for p in override.split(os.pathsep) if p]
 
     home = _claude_home()
-    found = [home]
-    try:
-        children = sorted(state_root.iterdir())
-    except OSError:
-        children = []
+    config = _config_checkout()
+    # Paths that USED to be pulled and deliberately are not any more. Each one
+    # keeps its state directory, and ordinary coverage would resurrect it as
+    # permanently stale: a repo that was covered and then stopped being synced
+    # is normally worth shouting about, which is the direction that matters.
+    # These two are the exception, because the repo they stood for is already
+    # named above by the path it moved to:
+    #
+    #   * ~/.claude, once it stops being the config checkout;
+    #   * ~/Repos/claude-config, once the serving tree moved out of it — its
+    #     state directory is left behind by the retired user timer.
+    retired = {home, Path.home() / "Repos" / "claude-config"}
+    found = [config]
+    children: list[Path] = []
+    for root in state_roots:
+        try:
+            children.extend(sorted(root.iterdir()))
+        except OSError:
+            continue
     for child in children:
         if not child.is_dir():
             continue
@@ -194,7 +312,9 @@ def _targets(state_root: Path) -> list[Path]:
         # producers write and what _covered() reads back. Anything that does
         # not decode to an absolute path was not written by them.
         repo = Path(child.name.replace("%", "/"))
-        if not repo.is_absolute() or repo == home or repo in found:
+        if not repo.is_absolute() or repo in found:
+            continue
+        if repo in retired and repo != config:
             continue
         found.append(repo)
     return found
@@ -209,9 +329,12 @@ def _direction(doc) -> str:
     return PULL
 
 
-def _record(state_root: Path, repo: Path):
+def _record(state_roots: list[Path], repo: Path):
     """(state, reason) for one target. ``None`` state means 'no verdict'."""
-    path = state_root / str(repo).replace("/", "%") / "status.json"
+    record_dir = _record_dir(state_roots, repo)
+    # A repo with no state directory anywhere has no record to read; point at
+    # the nearest root so the OSError branch below produces the right verdict.
+    path = (record_dir or state_roots[0] / _slug(repo)) / "status.json"
     try:
         raw = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -219,7 +342,7 @@ def _record(state_root: Path, repo: Path):
         # puller can fail at anything. Its presence without a status.json is
         # therefore a different fact from its absence: "pointed at, never
         # reached a verdict" versus "nothing pulls this at all".
-        if _covered(state_root, repo):
+        if _covered(state_roots, repo):
             return None, (
                 "the puller has been pointed at it but has never reached a "
                 "verdict, so it may not have run since it was set up"
@@ -260,7 +383,7 @@ def _clip(text: str) -> str:
     return text
 
 
-def _verdict(state_root: Path, repo: Path) -> tuple[str, str] | None:
+def _verdict(state_roots: list[Path], repo: Path) -> tuple[str, str] | None:
     """(direction, one line of finding) for a target, or None when healthy.
 
     Every branch below is worded for what the failure actually COSTS, which is
@@ -269,7 +392,7 @@ def _verdict(state_root: Path, repo: Path) -> tuple[str, str] | None:
     checkout is not being updated" about a repo nothing reads would send the
     reader looking for a problem that is not there.
     """
-    state, doc = _record(state_root, repo)
+    state, doc = _record(state_roots, repo)
 
     if state is None:
         # doc is the diagnostic string in this branch, and there is no record
@@ -396,12 +519,12 @@ def main() -> int:
     except (OSError, ValueError):
         pass
 
-    state_root = _state_root()
+    state_roots = _state_roots()
     findings: list[str] = []
     directions: set[str] = set()
     blocked = False
-    for repo in _targets(state_root):
-        verdict = _verdict(state_root, repo)
+    for repo in _targets(state_roots):
+        verdict = _verdict(state_roots, repo)
         if verdict:
             direction, text = verdict
             findings.append(text)
