@@ -289,23 +289,52 @@ sync_submodules() {
   fi
 }
 
-# Report ok only when every submodule is checked out: skills link into
-# vendor/, so an empty submodule is missing skills, not a healthy checkout.
+# Report ok only when every submodule is checked out AT THE PINNED COMMIT.
+# Skills link into vendor/, so an empty submodule is missing skills and a
+# submodule a commit behind the pin is serving the wrong skills — neither is a
+# healthy checkout. `git submodule status` distinguishes them: `-` for never
+# initialized, `+` for initialized but not at the commit the superproject
+# records. Checking only `-` is what let a failed `git submodule update` pass
+# as ok while the superproject went on fast-forwarding past it.
+#
+# The end state is the authority here, not the exit code of the update that was
+# supposed to produce it: sync_submodules logs its own failure and returns 0 on
+# purpose, so a submodule with local edits cannot fail a pull that succeeded,
+# and this function is what decides whether the result deserves `ok`.
 finish_ok() {
-  local missing
-  missing="$(git submodule status --recursive 2>/dev/null | sed -n 's/^-[0-9a-f]* \([^ ]*\).*/\1/p')"
+  local status_lines missing stale odd
+  status_lines="$(git submodule status --recursive 2>/dev/null)"
+  missing="$(printf '%s\n' "$status_lines" | sed -n 's/^-[0-9a-f]* \([^ ]*\).*/\1/p')"
+  stale="$(printf '%s\n' "$status_lines" | sed -n 's/^+[0-9a-f]* \([^ ]*\).*/\1/p')"
+  # Anything that is neither in sync (leading space) nor one of the two states
+  # above — `U` for a conflicted submodule today, whatever git adds tomorrow.
+  # An unrecognised state is not evidence of health, so it alerts rather than
+  # falling through to clear_alert.
+  odd="$(printf '%s\n' "$status_lines" | sed -n 's/^[^ +-][0-9a-f]* \([^ ]*\).*/\1/p')"
   if [ -n "$missing" ]; then
     alert "Submodule(s) not checked out, so skills that link into them are missing: $(printf '%s' "$missing" | tr '\n' ' ')"
+    exit 1
+  fi
+  if [ -n "$stale" ]; then
+    alert "Submodule(s) not at the commit master pins, so the skills under them are a different revision than this checkout claims: $(printf '%s' "$stale" | tr '\n' ' ')"
+    exit 1
+  fi
+  if [ -n "$odd" ]; then
+    alert "Submodule(s) in a state this script does not recognise, so the checkout cannot be called healthy: $(printf '%s' "$odd" | tr '\n' ' ')"
     exit 1
   fi
   clear_alert
 }
 
-# A submodule whose first clone failed stays empty until it is retried, and
+# A submodule whose checkout failed stays wrong until something retries it, and
 # skills load through vendor/superpowers. So a tick with nothing to pull still
-# retries any submodule that was never checked out (`-` in submodule status).
-# Initialized submodules are left alone here; only a pull moves them.
-if [ -f .gitmodules ] && git submodule status --recursive 2>/dev/null | grep -q '^-'; then
+# retries any submodule that is not where the superproject pins it: `-` for one
+# that was never checked out, `+` for one left at an older commit by a failed
+# `git submodule update`. The `+` case is why this cannot gate on `-` alone —
+# once the superproject is current, no later tick fast-forwards, so without
+# this the mismatch would never be revisited and the alert from finish_ok would
+# repeat every ten minutes with nothing acting on it.
+if [ -f .gitmodules ] && git submodule status --recursive 2>/dev/null | grep -q '^[-+]'; then
   sync_submodules
 fi
 

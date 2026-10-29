@@ -605,6 +605,68 @@ expect_status "status is ok once the submodule is checked out" state ok
 [ -f "$CLONE/vendor/sub/SKILL.md" ] \
   && { echo "PASS empty submodule is populated on the next tick"; pass=$((pass+1)); } \
   || { echo "FAIL subretry: vendor/sub still empty on the tick after a failed clone"; fail=$((fail+1)); }
+
+# 16. A submodule that IS checked out but sits at the wrong commit. The
+#     superproject fast-forwards, the submodule's own remote is unavailable, so
+#     `git submodule update` fails and the submodule stays at the pin the
+#     parent used to name. `git submodule status` marks that `+`, not `-`, so
+#     the empty-submodule check in case 15 does not see it: before this case
+#     the tick exited 0 and recorded `ok` over a checkout whose vendored skills
+#     were a commit behind what master pins, and no later tick repaired it
+#     because the retry gate only fired on `-`. Stale forever, reported
+#     healthy.
+export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=protocol.file.allow GIT_CONFIG_VALUE_0=always
+fresh substale
+SUB="$ROOT/substale/sub.git"
+git init --quiet --bare -b main "$SUB"
+git init --quiet -b main "$ROOT/substale/subseed"
+echo "skill v1" > "$ROOT/substale/subseed/SKILL.md"
+git -C "$ROOT/substale/subseed" add -A >/dev/null
+git -C "$ROOT/substale/subseed" commit --quiet -m "sub v1"
+git -C "$ROOT/substale/subseed" push --quiet "$SUB" main
+w="$ROOT/pushwork"; rm -rf "$w"; git clone --quiet "$ORIGIN" "$w"
+git -C "$w" submodule --quiet add "$SUB" vendor/sub
+git -C "$w" commit --quiet -m "add submodule"
+git -C "$w" push --quiet origin master
+run
+check "baseline: the submodule starts in sync" 0 "$rc"
+sub_v1="$(git -C "$CLONE/vendor/sub" rev-parse HEAD)"
+
+# Advance the submodule, then move the superproject's pin onto the new commit.
+echo "skill v2" > "$ROOT/substale/subseed/SKILL.md"
+git -C "$ROOT/substale/subseed" commit --quiet -am "sub v2"
+git -C "$ROOT/substale/subseed" push --quiet "$SUB" main
+sub_v2="$(git -C "$ROOT/substale/subseed" rev-parse HEAD)"
+rm -rf "$w"; git clone --quiet "$ORIGIN" "$w"
+git -C "$w" submodule --quiet update --init
+git -C "$w" -C vendor/sub fetch --quiet origin main
+git -C "$w" -C vendor/sub checkout --quiet "$sub_v2"
+git -C "$w" commit --quiet -am "bump submodule pin"
+git -C "$w" push --quiet origin master
+
+# The submodule's remote is gone, so the checkout of the new pin cannot happen.
+mv "$SUB" "$SUB.away"
+run
+check "a submodule stuck at the wrong commit is not a healthy tick" 1 "$rc" \
+  "Submodule\(s\) not at the commit master pins" "$out"
+printf '%s' "$out" | grep -q "fast-forwarded master" \
+  && { echo "PASS stale submodule still fast-forwards the superproject"; pass=$((pass+1)); } \
+  || { echo "FAIL substale: superproject was not fast-forwarded"; fail=$((fail+1)); }
+expect_status "a stale submodule records alert, not ok" state alert
+expect_equal "the submodule really is still at the old commit" \
+  "$sub_v1" "$(git -C "$CLONE/vendor/sub" rev-parse HEAD)"
+
+# The superproject now needs no update at all, so this is the tick that used to
+# do nothing: the repair must not wait for the next master commit.
+mv "$SUB.away" "$SUB"
+run
+check "the next tick repairs the stale submodule" 0 "$rc"
+expect_status "status is ok once the submodule matches its pin" state ok
+expect_equal "the submodule was moved onto the pinned commit" \
+  "$sub_v2" "$(git -C "$CLONE/vendor/sub" rev-parse HEAD)"
+grep -q "skill v2" "$CLONE/vendor/sub/SKILL.md" \
+  && { echo "PASS the pinned content is what is served"; pass=$((pass+1)); } \
+  || { echo "FAIL substale: vendor/sub/SKILL.md is not the pinned revision"; fail=$((fail+1)); }
 unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
 
 echo
