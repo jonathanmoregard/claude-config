@@ -98,7 +98,7 @@ git init -q -b master "$ROOT/seed"
   # about what these scripts do, not about where the repository keeps them.
   src_scripts="$REPO_ROOT/scripts"
   [ -d "$REPO_ROOT/runtime/scripts" ] && src_scripts="$REPO_ROOT/runtime/scripts"
-  for s in install-worktree-policy.sh claude-worktree.sh worktree-policy-session-start.sh claude-pull.sh; do
+  for s in install-worktree-policy.sh claude-worktree.sh worktree-policy-session-start.sh claude-pull.sh config-repo.sh; do
     cp -a "$src_scripts/$s" scripts/
   done
   printf '{\n  "model": "upstream-model",\n  "env": {}\n}\n' > settings.json
@@ -269,10 +269,13 @@ expect_ok "pack-refs and gc still run" \
 expect_ok "feature-branch deletion still works" git -C "$PRIMARY" branch -q -D feat/side feat/diverge
 
 # --- helper + linked worktrees ----------------------------------------------
-expect_refused "helper rejects an invalid slug" 'invalid slug' "$PRIMARY/scripts/claude-worktree.sh" 'a/b'
+# A HOME with no dev checkout, so the caller's own clone is the only anchor and
+# the real ~/Repos/claude-config can never leak into these runs.
+mkdir -p "$ROOT/bare-home"
+expect_refused "helper rejects an invalid slug" 'invalid slug' env HOME="$ROOT/bare-home" "$PRIMARY/scripts/claude-worktree.sh" 'a/b'
 advance_origin upstream.txt three
 STALE="$(head_of "$PRIMARY" master)"
-expect_ok "helper creates a worktree" "$PRIMARY/scripts/claude-worktree.sh" policy-test
+expect_ok "helper creates a worktree" env HOME="$ROOT/bare-home" "$PRIMARY/scripts/claude-worktree.sh" policy-test
 LINKED="$WT_ROOT/claude-policy-test"
 if [ "$(branch_of "$LINKED")" = feat/policy-test ] && [ "$(head_of "$LINKED")" = "$(head_of "$PRIMARY" origin/master)" ] \
   && [ "$(head_of "$LINKED")" != "$STALE" ]; then
@@ -280,7 +283,7 @@ if [ "$(branch_of "$LINKED")" = feat/policy-test ] && [ "$(head_of "$LINKED")" =
 else
   bad "helper branches off freshly fetched origin/master" "branch=$(branch_of "$LINKED")"
 fi
-expect_refused "helper refuses an existing path" 'already exists' "$PRIMARY/scripts/claude-worktree.sh" policy-test
+expect_refused "helper refuses an existing path" 'already exists' env HOME="$ROOT/bare-home" "$PRIMARY/scripts/claude-worktree.sh" policy-test
 expect_ok "plain git worktree add -b from the primary works" \
   git -C "$PRIMARY" worktree add -q -b feat/plain "$WT_ROOT/plain" origin/master
 printf 'linked\n' >> "$LINKED/tracked.txt"
@@ -299,6 +302,184 @@ expect_refused "linked worktree: commit on local master is refused" 'local maste
   bash -c "git -C '$WT_ROOT/plain' -c core.hooksPath=/dev/null checkout -q --ignore-other-worktrees master && git -C '$WT_ROOT/plain' commit -q --allow-empty -m nope"
 git -C "$WT_ROOT/plain" -c core.hooksPath=/dev/null switch -q --detach feat/plain
 expect_ok "git worktree remove from the primary works" git -C "$PRIMARY" worktree remove "$WT_ROOT/plain"
+
+# --- the helper after the runtime-projection cutover -------------------------
+# Post-cutover, ~/.claude/scripts is a symlink into ~/.claude/runtime, a bind
+# mount exposing the checkout's runtime/ subtree alone, and ~/.claude/.git has
+# moved to the backing checkout at ~/Repos/claude-config. So the directory the
+# script resolves to has no .git above it, and the helper has to find the
+# checkout by name rather than by its own location. The fixture reproduces that
+# shape with a copy: what matters is that nothing up the tree is a checkout.
+SRC_SCRIPTS="$REPO_ROOT/scripts"
+[ -d "$REPO_ROOT/runtime/scripts" ] && SRC_SCRIPTS="$REPO_ROOT/runtime/scripts"
+CUT_HOME="$ROOT/cutover-home"
+CUT_LIVE="$CUT_HOME/.claude"
+mkdir -p "$CUT_LIVE/runtime/scripts" "$CUT_HOME/Repos"
+for s in install-worktree-policy.sh claude-worktree.sh config-repo.sh; do
+  cp -a "$SRC_SCRIPTS/$s" "$CUT_LIVE/runtime/scripts/"
+done
+ln -s runtime/scripts "$CUT_LIVE/scripts"
+if [ -z "$(git -C "$CUT_LIVE/scripts" rev-parse --show-toplevel 2>/dev/null)" ]; then
+  ok "fixture: the projected scripts directory is outside any checkout"
+else
+  bad "fixture: the projected scripts directory is outside any checkout" \
+    "git found $(git -C "$CUT_LIVE/scripts" rev-parse --show-toplevel 2>/dev/null)"
+fi
+git clone -q "$ORIGIN" "$CUT_HOME/Repos/claude-config"
+
+expect_ok "helper works when reached through the projection" \
+  env HOME="$CUT_HOME" "$CUT_LIVE/scripts/claude-worktree.sh" projected
+PROJECTED="$WT_ROOT/claude-projected"
+if [ "$(branch_of "$PROJECTED")" = feat/projected ] \
+  && printf '%s' "$(git -C "$PROJECTED" rev-parse --git-common-dir)" \
+     | grep -q "$CUT_HOME/Repos/claude-config"; then
+  ok "helper branches in the backing checkout, not the live path"
+else
+  bad "helper branches in the backing checkout, not the live path" \
+    "branch=$(branch_of "$PROJECTED") gitdir=$(git -C "$PROJECTED" rev-parse --git-common-dir 2>&1)"
+fi
+
+# An explicit override wins over both, so a second checkout can be addressed
+# without moving the live tree.
+git clone -q "$ORIGIN" "$ROOT/alt-config"
+expect_ok "helper honours CLAUDE_CONFIG_REPO" \
+  env HOME="$CUT_HOME" CLAUDE_CONFIG_REPO="$ROOT/alt-config" \
+  "$CUT_LIVE/scripts/claude-worktree.sh" projected-alt
+if printf '%s' "$(git -C "$WT_ROOT/claude-projected-alt" rev-parse --git-common-dir 2>&1)" \
+  | grep -q "$ROOT/alt-config"; then
+  ok "CLAUDE_CONFIG_REPO decides which checkout the worktree belongs to"
+else
+  bad "CLAUDE_CONFIG_REPO decides which checkout the worktree belongs to" \
+    "gitdir=$(git -C "$WT_ROOT/claude-projected-alt" rev-parse --git-common-dir 2>&1)"
+fi
+
+# Nothing to resolve must name what it looked for, not leak a raw git error.
+mkdir -p "$ROOT/bare-home"
+expect_refused "helper names the checkout it looked for when none resolves" \
+  'claude-config' env HOME="$ROOT/bare-home" "$CUT_LIVE/scripts/claude-worktree.sh" nowhere
+
+# The caller's own location is the LAST resort: it is how a developer running
+# the script from inside some other clone still gets that clone, but only when
+# the dev checkout is not there to answer.
+expect_ok "helper still anchors on its own checkout when there is no dev checkout" \
+  env HOME="$ROOT/bare-home" "$PRIMARY/scripts/claude-worktree.sh" anchored
+if printf '%s' "$(git -C "$WT_ROOT/claude-anchored" rev-parse --git-common-dir 2>&1)" \
+  | grep -q "$PRIMARY"; then
+  ok "the script's own checkout is the answer when the dev checkout is absent"
+else
+  bad "the script's own checkout is the answer when the dev checkout is absent" \
+    "gitdir=$(git -C "$WT_ROOT/claude-anchored" rev-parse --git-common-dir 2>&1)"
+fi
+
+# --- resolution precedence: dev operations resolve to the DEV checkout --------
+# The resolver is driven directly. Three distinct clones so the answer names
+# which one won: the dev checkout (~/Repos/claude-config), the caller's own
+# clone, and a stand-in for the deploy-only clone that serves ~/.claude.
+RES_HOME="$ROOT/res-home"
+RES_DEV="$RES_HOME/Repos/claude-config"
+RES_CALLER="$ROOT/res-caller"
+RES_DEPLOY="$ROOT/res-deploy-root/checkout"
+mkdir -p "$RES_HOME/Repos"
+git clone -q "$ORIGIN" "$RES_DEV"
+git clone -q "$ORIGIN" "$RES_CALLER"
+mkdir -p "$(dirname "$RES_DEPLOY")"
+git clone -q "$ORIGIN" "$RES_DEPLOY"
+# resolve <hint> [VAR=value...]: print what claude_config_repo answers.
+resolve() {
+  local hint="$1"; shift
+  env -u CLAUDE_CONFIG_REPO HOME="$RES_HOME" CLAUDE_DEPLOY_CHECKOUT="$RES_DEPLOY" "$@" \
+    bash -c 'source "$1/config-repo.sh"; claude_config_repo "$2"' _ "$SRC_SCRIPTS" "$hint"
+}
+expect_resolves() {
+  local name="$1" want="$2"; shift 2
+  try resolve "$@"
+  if [ "$RC" -eq 0 ] && [ "$OUT" = "$want" ]; then ok "$name"
+  else bad "$name" "rc=$RC want=$want got=$(printf '%s' "$OUT" | head -4 | tr '\n' ' ')"; fi
+}
+
+expect_resolves "dev checkout outranks the caller's own clone" "$RES_DEV" "$RES_CALLER"
+expect_resolves "CLAUDE_CONFIG_REPO outranks the dev checkout" "$ROOT/alt-config" \
+  "$RES_CALLER" CLAUDE_CONFIG_REPO="$ROOT/alt-config"
+expect_resolves "a caller inside the deploy clone resolves to the dev checkout" "$RES_DEV" "$RES_DEPLOY"
+expect_resolves "a caller inside the deploy clone's subtree resolves to the dev checkout" "$RES_DEV" \
+  "$RES_DEPLOY/.githooks"
+expect_resolves "no dev checkout: the caller's own clone is the answer" "$RES_CALLER" "$RES_CALLER" \
+  HOME="$ROOT/bare-home"
+
+# Never the deploy clone, however it is reached: a bug, not a result.
+expect_refused "deploy clone as the only candidate is refused, not returned" \
+  'CLAUDE_CONFIG_REPO' resolve "$RES_DEPLOY" HOME="$ROOT/bare-home"
+if printf '%s' "$OUT" | grep -q "^$RES_DEPLOY\$"; then
+  bad "the refusal prints no deploy-clone path on stdout" "stdout=$OUT"
+else ok "the refusal prints no deploy-clone path on stdout"; fi
+expect_refused "CLAUDE_CONFIG_REPO naming the deploy clone is refused" \
+  'deploy' resolve "$RES_CALLER" CLAUDE_CONFIG_REPO="$RES_DEPLOY"
+
+# --- the quiet caller: update-submodules.sh ----------------------------------
+# It runs from cron on Mondays, nothing watches its exit status, and its output
+# goes to a log nobody opens — so a wrong repository here fails silently. Its
+# own origin, because the fixture needs a .gitmodules on origin/master and the
+# shared one must stay as the other sections left it.
+SUB_ORIGIN="$ROOT/remote/sub/claude-config.git"
+SUB_HOME="$ROOT/sub-home"
+mkdir -p "$(dirname "$SUB_ORIGIN")" "$SUB_HOME/Repos"
+git init -q --bare -b master "$SUB_ORIGIN"
+git init -q -b master "$ROOT/sub-seed"
+(
+  cd "$ROOT/sub-seed" || exit 1
+  # A submodule entry with a path and no url: the script reads .gitmodules from
+  # origin/master as a blob, logs that it is skipping, and stops before
+  # anything that would reach the network. Only the repository this fixture
+  # built can produce that line, so the log says WHICH checkout it resolved.
+  printf '[submodule "fixture-only"]\n\tpath = vendor/fixture-only\n' > .gitmodules
+  git add -A
+  git commit -qm seed
+  git remote add origin "$SUB_ORIGIN"
+  git push -q -u origin master
+)
+git clone -q "$SUB_ORIGIN" "$SUB_HOME/Repos/claude-config"
+mkdir -p "$SUB_HOME/.claude/runtime/scripts"
+for s in update-submodules.sh config-repo.sh; do
+  cp -a "$SRC_SCRIPTS/$s" "$SUB_HOME/.claude/runtime/scripts/"
+done
+ln -s runtime/scripts "$SUB_HOME/.claude/scripts"
+
+SUB_LOG="$ROOT/submodule-run.log"
+expect_ok "update-submodules runs when reached through the projection" \
+  env HOME="$SUB_HOME" CLAUDE_SUBMODULE_LOG="$SUB_LOG" \
+  "$SUB_HOME/.claude/scripts/update-submodules.sh"
+if grep -q 'fixture-only' "$SUB_LOG" 2>/dev/null && grep -q 'no url in .gitmodules' "$SUB_LOG" 2>/dev/null; then
+  ok "update-submodules read the backing checkout's own origin/master"
+else
+  bad "update-submodules read the backing checkout's own origin/master" \
+    "log=$(tail -3 "$SUB_LOG" 2>&1 | tr '\n' ' ')"
+fi
+
+# The log must not follow the repository: post-cutover that would write an
+# un-ignored file inside a checkout automation commits from.
+rm -f "$SUB_HOME/.claude/logs/submodule-update.log"
+expect_ok "update-submodules runs with the default log path" \
+  env HOME="$SUB_HOME" "$SUB_HOME/.claude/scripts/update-submodules.sh"
+if [ -s "$SUB_HOME/.claude/logs/submodule-update.log" ] && [ ! -e "$SUB_HOME/Repos/claude-config/logs" ]; then
+  ok "the default log stays at ~/.claude/logs, outside the resolved checkout"
+else
+  bad "the default log stays at ~/.claude/logs, outside the resolved checkout" \
+    "live=$(ls -d "$SUB_HOME/.claude/logs/submodule-update.log" 2>&1) in-repo=$(ls -d "$SUB_HOME/Repos/claude-config/logs" 2>&1)"
+fi
+
+# The long-standing override still outranks resolution: pointed at a checkout
+# whose origin/master has no .gitmodules, the run must find no submodule.
+OVERRIDE_LOG="$ROOT/submodule-override.log"
+expect_ok "update-submodules honours CLAUDE_SUBMODULE_REPO" \
+  env HOME="$SUB_HOME" CLAUDE_SUBMODULE_REPO="$ROOT/alt-config" \
+  CLAUDE_SUBMODULE_LOG="$OVERRIDE_LOG" \
+  "$SUB_HOME/.claude/scripts/update-submodules.sh"
+if grep -q 'Done' "$OVERRIDE_LOG" 2>/dev/null && ! grep -q 'fixture-only' "$OVERRIDE_LOG" 2>/dev/null; then
+  ok "CLAUDE_SUBMODULE_REPO outranks the resolved checkout"
+else
+  bad "CLAUDE_SUBMODULE_REPO outranks the resolved checkout" \
+    "log=$(tail -3 "$OVERRIDE_LOG" 2>&1 | tr '\n' ' ')"
+fi
 
 # --- global hooks stay chained and keep their teeth ---------------------------
 for h in pre-commit prepare-commit-msg pre-push reference-transaction; do
@@ -406,6 +587,41 @@ OBS="$(observe)"
   && ok "observer self-heals activation on a clean primary" || bad "observer self-heals activation on a clean primary" "$OBS"
 OBS="$(observe)"
 [ -z "$OBS" ] && ok "observer is silent when healthy" || bad "observer is silent when healthy" "$OBS"
+
+# The observer must survive the cutover too, and this is the one that fails by
+# saying NOTHING: reached through the projection, with no CLAUDE_PRIMARY_CHECKOUT
+# set, the old script resolved to a directory with no .git and exited 0.
+cp -a "$SRC_SCRIPTS/worktree-policy-session-start.sh" "$CUT_LIVE/runtime/scripts/"
+CUT_REPO="$CUT_HOME/Repos/claude-config"
+git -C "$CUT_REPO" config --unset core.hooksPath 2>/dev/null || true
+printf 'local edit\n' >> "$CUT_REPO/tracked.txt"
+PROJ_OBS="$(env HOME="$CUT_HOME" "$CUT_LIVE/scripts/worktree-policy-session-start.sh" 2>&1)"
+PROJ_RC=$?
+if [ "$PROJ_RC" -eq 0 ] && printf '%s' "$PROJ_OBS" | grep -q 'stop and report exact state'; then
+  ok "observer reports the backing checkout when reached through the projection"
+else
+  bad "observer reports the backing checkout when reached through the projection" \
+    "rc=$PROJ_RC out=${PROJ_OBS:-<silence — the fail-open this check exists for>}"
+fi
+printf '%s' "$PROJ_OBS" | grep -q "$CUT_REPO" \
+  && ok "observer names the resolved checkout, not the live path" \
+  || bad "observer names the resolved checkout, not the live path" "${PROJ_OBS:-<silence>}"
+git -C "$CUT_REPO" restore tracked.txt
+# The historical seam still outranks resolution.
+printf 'local edit\n' >> "$PRIMARY/tracked.txt"
+PROJ_OBS="$(env HOME="$CUT_HOME" CLAUDE_PRIMARY_CHECKOUT="$PRIMARY" \
+  "$CUT_LIVE/scripts/worktree-policy-session-start.sh" 2>&1)"
+printf '%s' "$PROJ_OBS" | grep -q "$PRIMARY" \
+  && ok "CLAUDE_PRIMARY_CHECKOUT outranks resolution for the observer" \
+  || bad "CLAUDE_PRIMARY_CHECKOUT outranks resolution for the observer" "${PROJ_OBS:-<silence>}"
+git -C "$PRIMARY" restore tracked.txt
+# A machine with no checkout anywhere stays silent: this runs at every
+# SessionStart in every project, and absence is not a condition to report.
+QUIET_OBS="$(env HOME="$ROOT/bare-home" "$CUT_LIVE/scripts/worktree-policy-session-start.sh" 2>&1)"
+QUIET_RC=$?
+[ "$QUIET_RC" -eq 0 ] && [ -z "$QUIET_OBS" ] \
+  && ok "observer stays silent where there is no checkout at all" \
+  || bad "observer stays silent where there is no checkout at all" "rc=$QUIET_RC out=$QUIET_OBS"
 
 # --- registration --------------------------------------------------------------
 live_settings="$REPO_ROOT/settings.json"

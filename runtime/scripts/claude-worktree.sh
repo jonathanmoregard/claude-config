@@ -35,9 +35,15 @@ git check-ref-format "refs/heads/$branch" >/dev/null 2>&1 \
 
 # Anchor on the repo this script lives in. Refs live in the shared git dir, so
 # any worktree of the repo is an equally valid anchor for fetch + worktree add.
+#
+# That anchor disappears once ~/.claude is a runtime projection, and this is
+# the mandated entry point for every change to the repository — including the
+# ones that would fix it — so it has to keep working across the cutover.
+# scripts/config-repo.sh owns the resolution rule and explains the mechanism.
 script_dir="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
-repo="$(git -C "$script_dir" rev-parse --show-toplevel 2>/dev/null)" \
-  || die "not inside a git checkout: $script_dir"
+source "$script_dir/config-repo.sh"
+repo="$(claude_config_repo "$script_dir")" \
+  || die "could not locate the claude-config checkout (diagnostic above)"
 
 # A clone or freshly merged checkout may not have installed its local hooks
 # yet. Activate them before touching refs so this helper cannot create a
