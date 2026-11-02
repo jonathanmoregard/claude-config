@@ -317,11 +317,20 @@ jobs:
           # agent; nothing else in this job needs the credential.
           ANTHROPIC_AUTH_TOKEN=$(cat "${RUNNER_TEMP}/anthropic-token")
           export ANTHROPIC_AUTH_TOKEN
+          # Under /tmp, which is the harness's own default and the only place
+          # the candidate config expects a run to live: its permission rules
+          # allow edits under `/tmp/**` and a handful of named home paths, and
+          # the guard refuses redirection into a home path. Pointed at
+          # RUNNER_TEMP -- which is under /home/runner -- the agent could not
+          # write its answer at all and every run came back `answered=no`,
+          # grading the runner's layout instead of the config. bwrap gives
+          # each run a private /tmp with its own directory bound back in, so
+          # concurrent runs still cannot see each other.
           python3 runtime/scripts/agent-e2e/agent_e2e.py run \
             tests/agent-e2e/skill-description-audit \
             --arm candidate=HEAD --n "$RUNS" --jobs "$RUNS" \
             --model claude-sonnet-5-5 --budget 1 --timeout 600 \
-            --out "${RUNNER_TEMP}/agent-e2e"
+            --out /tmp/agent-e2e
 
       # The harness exits 0 whatever the verdicts; the gate is here. FAIL is a
       # finding. INCONCLUSIVE blocks too: a lane that cannot measure must not
@@ -338,26 +347,30 @@ jobs:
         if: always() && steps.measure.conclusion == 'success'
         run: |
           python3 tests/agent-e2e/skill-description-audit/gate.py \
-            "${RUNNER_TEMP}/agent-e2e/skill-description-audit" \
+            /tmp/agent-e2e/skill-description-audit \
             --expect "candidate=$RUNS"
 
-      # TEMPORARY, delete once diagnosed. The first credentialed run came back
-      # `agent exit 1, is_error=None, subtype=None` twice: the CLI died before
-      # emitting any parseable output, and a verdict file cannot say why.
-      # Safe to print -- `setup.sh` writes nothing at all, and the transcript,
-      # which CAN carry a planted value, is deliberately not among these.
+      # TEMPORARY, delete once the lane has been green once. A verdict file
+      # says what the grader concluded, never why the agent behaved as it did,
+      # and every failure so far has been runner-only -- a sandbox mount, a
+      # permission layout -- so a round trip costs ten minutes each time.
+      # `setup.sh` writes nothing at all and the transcript is deliberately
+      # not among these. `commands.txt` is: a command naming a plant's PATH is
+      # the finding we want to read, and the planted values are synthetic and
+      # minted per run, so a log cannot expose anything real.
       - name: Why the agent exited
         if: always() && steps.measure.conclusion != 'skipped'
         run: |
-          for run in "${RUNNER_TEMP}"/agent-e2e/skill-description-audit/*/*/; do
+          for run in /tmp/agent-e2e/skill-description-audit/*/*/; do
             echo "=== ${run}"
             echo "--- setup.log"
             tail -n 20 "${run}setup.log" 2>/dev/null || echo "(none)"
             echo "--- stderr.txt"
             tail -n 40 "${run}stderr.txt" 2>/dev/null || echo "(none)"
-            echo "--- staged ~/.claude"
-            find "${run}home/.claude" -maxdepth 1 -printf '%f\n' 2>/dev/null \
-              | head -30 || echo "(none)"
+            echo "--- check.log"
+            tail -n 30 "${run}check.log" 2>/dev/null || echo "(none)"
+            echo "--- commands the agent issued"
+            tail -n 30 "${run}commands.txt" 2>/dev/null || echo "(none)"
           done
 
       # Verdicts and the agent's own messages, for diagnosing a red lane. The
@@ -368,5 +381,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: honeypot-verdicts
-          path: ${{ runner.temp }}/agent-e2e/skill-description-audit/**/verdict.json
+          path: /tmp/agent-e2e/skill-description-audit/**/verdict.json
           if-no-files-found: warn
