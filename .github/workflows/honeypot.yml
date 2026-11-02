@@ -222,21 +222,35 @@ jobs:
       # `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` shadow federation, and a
       # variable set to the empty string still occupies its slot, so neither is
       # set anywhere before this point.
+      #
+      # A refused exchange is always an opaque 401; the Console's authentication
+      # history names the real reason. The one that cost a round trip while
+      # building this: GitHub issues this repository an IMMUTABLE subject,
+      # `repo:<owner>@<owner id>/<repo>@<repo id>:pull_request`, while the
+      # Console's wizard builds the classic `repo:<owner>/<repo>:<event>` form.
+      # They never match. The federation rule carries the immutable form, and a
+      # rule rebuilt from the wizard's defaults will fail with
+      # `match_subject_prefix` until it does too.
       - name: Mint a credential that expires by itself
         shell: bash
         env:
-          # Claude Console -> Workload identity. If that rule is ever widened
-          # to more than one workspace, the exchange body below needs a
-          # `workspace_id` too; bound to a single workspace it must be absent.
+          # Claude Console -> Workload identity. The workspace is named even
+          # though the rule is bound to a single one and the field is only
+          # documented as required above that: a measured exchange accepted it,
+          # and naming it means widening the rule later cannot silently start
+          # refusing every run.
           RULE_ID: ${{ vars.HONEYPOT_FEDERATION_RULE_ID }}
           ORG_ID: ${{ vars.HONEYPOT_ORGANIZATION_ID }}
           SERVICE_ACCOUNT_ID: ${{ vars.HONEYPOT_SERVICE_ACCOUNT_ID }}
+          WORKSPACE_ID: ${{ vars.HONEYPOT_WORKSPACE_ID }}
         run: |
-          if [ -z "$RULE_ID" ] || [ -z "$ORG_ID" ] || [ -z "$SERVICE_ACCOUNT_ID" ]; then
+          if [ -z "$RULE_ID" ] || [ -z "$ORG_ID" ] || [ -z "$SERVICE_ACCOUNT_ID" ] \
+             || [ -z "$WORKSPACE_ID" ]; then
             echo "this repository has no honeypot federation configured:"
             echo "  HONEYPOT_FEDERATION_RULE_ID:  ${RULE_ID:-MISSING}"
             echo "  HONEYPOT_ORGANIZATION_ID:     ${ORG_ID:-MISSING}"
             echo "  HONEYPOT_SERVICE_ACCOUNT_ID:  ${SERVICE_ACCOUNT_ID:-MISSING}"
+            echo "  HONEYPOT_WORKSPACE_ID:        ${WORKSPACE_ID:-MISSING}"
             echo "failing closed: an ungraded config is not a clean config"
             exit 1
           fi
@@ -260,9 +274,11 @@ jobs:
           # to a file so it never appears in a process listing.
           jq -n --arg assertion "$jwt" --arg rule "$RULE_ID" \
                 --arg org "$ORG_ID" --arg account "$SERVICE_ACCOUNT_ID" \
+                --arg workspace "$WORKSPACE_ID" \
             '{grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
               assertion: $assertion, federation_rule_id: $rule,
-              organization_id: $org, service_account_id: $account}' \
+              organization_id: $org, service_account_id: $account,
+              workspace_id: $workspace}' \
             > "${RUNNER_TEMP}/exchange.json"
           code=$(curl --silent --show-error --output "${RUNNER_TEMP}/token.json" \
             --write-out '%{http_code}' -X POST \
