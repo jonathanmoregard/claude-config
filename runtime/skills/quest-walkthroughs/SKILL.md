@@ -28,6 +28,7 @@ This overrides terse or compressed reply modes (e.g. caveman) for the walkthroug
 - **Keep anything the user pastes short.** If a command has more than one step, long paths or chained `&&`, write it into a small script (`/tmp/<task>.sh`, chmod 700, syntax-checked, no secrets inside) and hand over a single line: `bash /tmp/<task>.sh`. Mention `! bash /tmp/<task>.sh` so the output lands in the chat, and how to read the script first. Make the script fail-safe: `set -euo pipefail`, and destroy plaintext secrets only after the encrypted result is verified.
 - **Check what you can before handing over**: file names in `~/Downloads`, file permissions, that the target directory exists. Fill real values into the steps instead of placeholders.
 - If the user asks you to restate a quest, repeat it in full, not as a summary.
+- **No punctuation directly after a code span, anywhere in the walkthrough.** Never write `` `X`. `` `` `X`, `` `` `X`: `` or `` `X`; ``. Copying grabs the trailing character, and a secret saved as `GUARD_MERGER_PRIVATE_KEY.` breaks the setup silently. Reword so the span ends the line or is followed by a word ("Name it `FOO_KEY` exactly" / "run `bash /tmp/x.sh` in your terminal"), and give every value the user pastes into a form or terminal its own fenced block. Check your draft for a backtick followed by `.` `,` `:` or `;` before sending.
 
 ## Keep it light
 
@@ -57,7 +58,10 @@ calendar, and an Outlook user is just as welcome at the table as a Gmail user �
 2. ✍️ Description: anything. Expires: **6 months** → **Add**
 3. 📋 Copy the **Value** column. ⚠️ It is shown only once, and Secret ID is the wrong one.
 4. 🔒 Run `bash /tmp/edit-klaffat-env.sh` in your terminal (don't send me the value). It opens the encrypted env file in your editor.
-5. ✍️ Add `KLAFFAT_MS_CLIENT_SECRET=<value>`, save, quit.
+5. ✍️ Add this line with the value filled in, then save and quit:
+   ```
+   KLAFFAT_MS_CLIENT_SECRET=<value>
+   ```
 
 🎁 Checkpoint: say **secret in**.
 ```

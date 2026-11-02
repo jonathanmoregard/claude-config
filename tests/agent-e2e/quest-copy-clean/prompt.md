@@ -1,0 +1,1 @@
+I've created a GitHub App and downloaded its private key. Walk me through storing it for my repo jonathanmoregard/demo as two Dependabot secrets: DEMO_APP_CLIENT_ID (value Iv23liExample0000) and DEMO_APP_PRIVATE_KEY (the .pem contents), then deleting the .pem from ~/Downloads.
