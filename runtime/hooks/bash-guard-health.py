@@ -76,11 +76,23 @@ header names this hook as the reader and fixes the contract:
     "unparseable, therefore fine"
 
 The marker is corroboration, not a substitute: it is a snapshot from the
-last activation while dcg's loader answers for right now. The two can
-therefore legitimately disagree — restored file, no rebuild yet — and that
-transitional state is announced too, because until the operator
-re-activates, nothing else says the declarative state and the running state
-have come apart.
+last activation while dcg's loader answers for right now. When the loader
+answers, the LOADER DECIDES. A marker never raises the fallback alarm on its
+own: it is quoted as a further signal only when a live reading already says
+fallback, and a marker the live reading contradicts — restored file, no
+re-activation yet — is stale and says nothing. That last case used to be
+announced, and on 2026-11-02 a marker left over from the cutover
+(observed 2026-10-29) put "dcg is running the BOOTSTRAP FALLBACK" on every
+session start while dcg had all 20 tracked rules loaded. A banner that is
+false most of the times it is read is a banner nobody reads the one time it
+is true. The dangerous disagreement — no marker, fallback live — is caught
+by the live readings regardless.
+
+When the loader cannot be asked (dcg absent, not executable, its config
+missing, `dcg config` timing out or unreadable), that is itself announced
+under the DOWN headline — see below — and the marker rides along as an
+explicitly UNCONFIRMED hint, never as the fact "dcg is running the
+fallback".
 
 WHAT THE PATH AND STATUS FIELDS CANNOT DO
 
@@ -95,6 +107,17 @@ Silence must mean "verified", never "could not tell". If ``dcg config``
 will not run, will not answer in time, or answers in a shape this file
 cannot read, that is announced — under the DOWN headline, because
 ``bash-guard.py`` is refusing commands in most of those states anyway.
+
+Why REPORT an unobtainable verdict rather than stay quiet, given that this
+file's last bug was crying wolf: an unobtainable verdict is not a guess
+about the guard, it is a true statement about it. ``bash-guard.py`` asks the
+same loader before it trusts a non-deny and fails closed when it cannot, so
+"dcg could not be asked" is also "Bash is being refused" — a fault the
+operator will hit on the next command, not a phantom. What WAS phantom was
+the claim built on top of it from the marker alone, and that claim is now
+labelled unconfirmed. The wait is bounded (``DCG_CONFIG_TIMEOUT_S`` inside
+``HOOK_BUDGET_S``, inside the harness's 10s), so the report costs at most a
+few seconds of session start and can never hang it.
 """
 from __future__ import annotations
 
@@ -338,20 +361,23 @@ def _marker_signal(path: str, doc: dict) -> str:
     )
 
 
-def _stale_marker_fault(path: str, doc: dict) -> tuple[str, str]:
+def _unconfirmed_marker_hint(path: str, doc: dict) -> tuple[str, str]:
+    """The marker, when dcg's loader could not be asked to confirm it.
+
+    Only ever emitted beside a DOWN fault that says why the loader could not
+    answer, so it never sets the headline. Worded as a lead to check, not a
+    finding: the marker is a snapshot from the last activation, and one left
+    over from a cutover is exactly what produced the 2026-11-02 false alarm.
+    """
+    observed = doc.get("observed_at") or "an unstated time"
+    lost = "; ".join(label for label, _ in FULL_ONLY_CLASSES)
     return REDUCED, (
-        f"nixos-config's activation marker {path} says the dcg BOOTSTRAP "
-        f"FALLBACK was in force as of {doc.get('observed_at')}, but dcg is "
-        "loading a full rule set right now. The likeliest reading is that "
-        "~/.claude/dcg.toml has been restored and the host has not been "
-        "re-activated since — home-manager deletes this marker on the first "
-        "activation that finds the fallback gone. Re-activate "
-        "(`nixos-rebuild switch`, or `systemctl restart "
-        "home-manager-jonathan.service`) so the declarative state and the "
-        "running state agree; until then this is the only thing telling you "
-        "they do not."
-        + (f" The marker's own remedy line: {doc.get('remedy')}"
-           if doc.get("remedy") else "")
+        f"UNCONFIRMED: nixos-config's activation marker {path} records the "
+        f"dcg BOOTSTRAP FALLBACK as in force as of {observed}. dcg could not "
+        "be asked what it has loaded right now (see above), so this may be "
+        "stale — once dcg answers, `dcg config --format json` is the "
+        "authority. If the marker is current, these rule classes are NOT IN "
+        f"FORCE: {lost}. " + _RESTORE_STEPS
     )
 
 
@@ -450,14 +476,10 @@ def _dcg_rule_set_faults(dcg_path: str, cfg_path: str, marker_path: str,
     if kind == "unusable":
         out: list[tuple[str, str]] = [(DOWN, str(payload))]
         # The loader is silent, so the marker is the only thing left that
-        # knows this host was seeded. Report it rather than losing it behind
-        # the loader's own failure.
+        # may know this host was seeded. Pass it on rather than lose it behind
+        # the loader's own failure — but as an unconfirmed lead, not a fact.
         if marker_says_fallback:
-            out.append(_fallback_fault(
-                [_marker_signal(marker_path, marker_doc)],
-                [label for label, _ in FULL_ONLY_CLASSES],
-                0,
-            ))
+            out.append(_unconfirmed_marker_hint(marker_path, marker_doc))
         return out
 
     file_sentinel = _config_file_has_sentinel(cfg_path)
@@ -505,8 +527,10 @@ def _dcg_rule_set_faults(dcg_path: str, cfg_path: str, marker_path: str,
                 f"the config file at {cfg_path!r} names itself as the "
                 f"bootstrap seed ({FALLBACK_SENTINEL!r})"
             )
-        if marker_says_fallback:
-            signals.append(_marker_signal(marker_path, marker_doc))
+            # Corroboration only: the file read just now is the live
+            # reading; a marker it does not back up is stale.
+            if marker_says_fallback:
+                signals.append(_marker_signal(marker_path, marker_doc))
         if signals:
             return [_fallback_fault(
                 signals, [label for label, _ in FULL_ONLY_CLASSES], 0
@@ -568,20 +592,21 @@ def _dcg_rule_set_faults(dcg_path: str, cfg_path: str, marker_path: str,
         signals.append(
             f"the config file at {cfg_path!r} carries the same marker"
         )
-    if marker_says_fallback:
-        signals.append(_marker_signal(marker_path, marker_doc))
     if full_only_covered == 0 and SHARED_CLASS[0] in covered:
         signals.append(
             "none of the rule classes your tracked list carries are in force, "
             "while the fallback's curl rules are — the seed's exact shape"
         )
+    # The activation marker corroborates a live reading; it is never one.
+    # dcg answered, so what dcg loaded decides: a marker with no live signal
+    # behind it is stale (restored file, no re-activation yet — the next
+    # activation deletes it) and the rules that guard is enforcing are the
+    # full ones. Announcing it anyway was the 2026-11-02 false alarm.
+    if signals and marker_says_fallback:
+        signals.append(_marker_signal(marker_path, marker_doc))
 
     if signals:
         faults.append(_fallback_fault(signals, missing, uninspectable))
-    elif marker_says_fallback:
-        # The marker and the loader disagree, and the loader wins on
-        # currency. Not a fault in either — a transition nobody else reports.
-        faults.append(_stale_marker_fault(marker_path, marker_doc))
     elif full_only_covered == 0:
         # Not the seed — the seed at least blocks curl — but not the tracked
         # list either. A loaded config with no destructive-HTTP rule in it is
@@ -669,12 +694,9 @@ def _faults() -> list[tuple[str, str]]:
             dcg, dcg_config, marker_path, marker_state, marker_doc
         ))
     elif marker_state == "fallback":
-        # No loader answer available, but the marker still knows.
-        out.append(_fallback_fault(
-            [_marker_signal(marker_path, marker_doc)],
-            [label for label, _ in FULL_ONLY_CLASSES],
-            0,
-        ))
+        # No loader answer available — the DOWN fault above says why — so
+        # the marker is passed on, labelled as the unconfirmed lead it is.
+        out.append(_unconfirmed_marker_hint(marker_path, marker_doc))
 
     ingress = os.environ.get("BASH_GUARD_CONFIG") or DEFAULT_INGRESS_CONFIG
     if not os.path.exists(ingress):
