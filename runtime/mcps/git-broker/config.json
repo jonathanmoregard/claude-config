@@ -3,13 +3,11 @@
     "version": 1,
     "repositoryRoots": [
       "/home/jonathan/Repos",
-      "/home/jonathan/worktrees",
-      "/home/jonathan/.claude"
+      "/home/jonathan/worktrees"
     ],
     "metadataRoots": [
       "/home/jonathan/Repos",
-      "/home/jonathan/worktrees",
-      "/home/jonathan/.claude/.git"
+      "/home/jonathan/worktrees"
     ],
     "protectedWorktrees": [
       "/home/jonathan/Repos/klaffat",

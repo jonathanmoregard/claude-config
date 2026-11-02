@@ -150,6 +150,51 @@ def test_the_pusher_passes_the_config_to_every_scan():
         "the pusher does not reference GITLEAKS_CONFIG")
 
 
+def test_the_commit_carries_the_config_to_the_global_hook():
+    """The two scans passing is not enough; the commit itself is gated too.
+
+    There is a second, ambient gate: the global pre-commit hook at
+    `~/.config/git/hooks/pre-commit` (nixos-config `home/jonathan.nix`) runs
+    `gitleaks git --staged` with NO `--config`. So after the allowlist landed
+    and both of this script's own scans went green, the hook re-blocked the very
+    commit they had just cleared, on the same public GHSA advisory ID, and the
+    sink still did not back up. Measured on this host:
+
+        plain `git commit`, GHSA fixture staged        -> blocked
+        `GITLEAKS_CONFIG=... git commit`, same fixture -> commits, hook scans
+        `GITLEAKS_CONFIG=... git commit`, real api_key -> still blocked
+
+    The third line is the one that matters: this is not `--no-verify`. The hook
+    still runs, on the same staged content, with the full default ruleset. It
+    just reads the same config the script already scanned with, so the two
+    gates agree instead of contradicting each other.
+
+    Asserted on the text because exercising it for real means committing.
+    """
+    body = PUSHER.read_text(encoding="utf-8")
+    commits = [line for line in body.splitlines()
+               if "git commit" in line and not line.lstrip().startswith("#")]
+    assert commits, "no git commit invocation found in the pusher"
+    unscoped = [line for line in commits if "GITLEAKS_CONFIG" not in line]
+    assert not unscoped, (
+        "these commit without passing GITLEAKS_CONFIG, so the global "
+        "pre-commit hook will scan with the stock ruleset and re-block the "
+        "advisory IDs this sink's config allowlists:\n  "
+        + "\n  ".join(line.strip()[:80] for line in unscoped))
+    # Code only. This script discusses `--no-verify` at length in its header
+    # and in the comment above the second scan -- explaining that a hand which
+    # used it is exactly why the shipped-commits scan exists -- so matching the
+    # whole file flags the prose that argues against the thing it is checking
+    # for, including this fix's own comment.
+    code = [line for line in body.splitlines()
+            if not line.lstrip().startswith("#")]
+    bypassing = [line for line in code if "--no-verify" in line]
+    assert not bypassing, (
+        "the pusher skips the global hook instead of giving it the right "
+        "config; the hook must still run:\n  "
+        + "\n  ".join(line.strip()[:80] for line in bypassing))
+
+
 def test_the_pusher_refuses_when_the_config_is_unreadable():
     """Fail closed, and legibly.
 
