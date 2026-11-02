@@ -1,0 +1,38 @@
+# gitleaks configuration for the proposals sink scan in
+# claude-proposals-push.sh. Not this repository's own `.gitleaks.toml` at the
+# root -- that one guards this repo's commits; this one guards
+# ~/.local/state/claude-proposals, which holds machine-written proposals.
+#
+# WHY THIS FILE EXISTS
+# Proposals are generated from session transcripts, and the security-themed
+# ones (sota-watch) routinely cite public advisory identifiers. A GHSA ID is 19
+# characters of mixed-case-free base32 with no vowels, which is
+# indistinguishable from an API key to an entropy heuristic: gitleaks'
+# `generic-api-key` rule matched `GHSA-qx49-fqc8-xw99` in
+# rsi/2026-10-29-sota-watch-prompt-injection.md:10 at entropy 3.54. The pusher
+# refuses the whole push on any finding, so from 2026-10-29 the sink stopped
+# backing up entirely -- 56 proposals existed on one disk only -- over a
+# reference to a published advisory. It will recur on every security watch.
+
+# ---------------------------------------------------------------------------
+# LOAD-BEARING. Without it the default ruleset is REPLACED rather than
+# extended, and the scan detects NOTHING: a file containing a real
+# `api_key = "<32 high-entropy chars>"` exits 0 and the push proceeds. Measured,
+# not assumed -- see tests/enforced/test_proposals_gitleaks_config.py, which
+# fails if this flips, because a secret-scanner config that silently scans for
+# no secrets is worse than the block it was written to remove.
+[extend]
+useDefault = true
+
+# Anchored, and matched against the detected secret rather than the line, so
+# this allowlists an identifier that is the ENTIRE finding and nothing else. An
+# unanchored pattern would also excuse any real credential that happened to
+# contain a GHSA-shaped substring.
+#
+# The character class is GHSA's own alphabet (base32 minus vowels and the
+# ambiguous glyphs), not `[a-z0-9]`, so the pattern cannot drift into matching
+# arbitrary 4-character groups. CVE IDs are deliberately absent: they are
+# numeric and short, and nothing has ever flagged one.
+[[allowlists]]
+description = "GHSA advisory identifiers are public references, not credentials"
+regexes = ['''^GHSA(-[23456789cfghjmpqrvwx]{4}){3}$''']
