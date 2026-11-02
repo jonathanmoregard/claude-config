@@ -149,6 +149,60 @@ def test_no_dev_tree_file_joins_the_repo_root_to_a_moved_entry():
         "under runtime/:\n  " + "\n  ".join(stale))
 
 
+def test_no_runtime_script_reaches_a_sibling_through_the_repo_root():
+    """A script under runtime/scripts/ must find its siblings beside itself.
+
+    The test above only scans the dev trees, so it cannot see this: a script
+    that already lives under `runtime/` and reaches back out to `$repo/scripts/`
+    for a neighbour. `claude-worktree.sh` did exactly that for the policy
+    installer, and because it is the mandated entry point for every change to
+    this repository, the one command that could land the fix was the command
+    that was broken. It failed closed with a clear message, which is the only
+    reason it was merely annoying rather than silent.
+
+    Not folded into the dev-tree scan above: inside `runtime/`, a self-relative
+    join (`parents[1]`, `parent.parent`) resolves to the runtime base and is
+    correct, so widening that scan reports `upstream-drift.py` and
+    `deny-hints.py` as violations when both are right. The bug has a narrower
+    shape than the general one -- a repo-root variable joined to a *projected*
+    entry, from a file that is itself already inside the projection.
+
+    Shell only, and deliberately. The Python spelling cannot be judged from the
+    text: `upstream-drift.py` assigns `REPO_ROOT = parents[1]`, which from
+    `runtime/scripts/` *is* the runtime base, so the name says "repository
+    root" while the value does not. Matching on the name flags a correct line,
+    and the first draft of this test did exactly that. Deciding it properly
+    means resolving the variable, which a regex cannot do; the shell idiom that
+    actually broke is checkable, so that is what this pins.
+    """
+    projected = "|".join(re.escape(entry) for entry in
+                         sorted(layout.PROJECTED, key=len, reverse=True))
+    # `$repo/runtime/scripts/...` is the other valid fix and does not match,
+    # because `runtime` is not itself a projected entry.
+    pattern = re.compile(
+        rf'\$\{{?(?:repo|REPO|repo_root|REPO_ROOT|root|ROOT)\}}?/({projected})(?:/|\b)')
+    tracked = subprocess.run(
+        ["git", "ls-files", "runtime"], cwd=REPO_ROOT,
+        capture_output=True, text=True, check=True).stdout.split()
+    stale = []
+    for rel in tracked:
+        if rel.endswith(".md"):
+            continue
+        try:
+            body = (REPO_ROOT / rel).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for index, line in enumerate(body.splitlines()):
+            if line.lstrip().startswith("#"):
+                continue  # prose about the bug, including this fix's own note
+            if pattern.search(line):
+                stale.append(f"{rel}:{index + 1}: {line.strip()[:70]}")
+    assert not stale, (
+        "these are inside runtime/ but build a path to a projected entry via "
+        "the repository root; resolve it beside the script instead "
+        "(e.g. \"$script_dir/<name>\"):\n  " + "\n  ".join(stale))
+
+
 def test_the_workflow_only_runs_paths_that_exist():
     """A moved file turns a CI step into a no-op or a nuisance failure.
 

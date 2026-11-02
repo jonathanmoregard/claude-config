@@ -48,7 +48,15 @@ repo="$(claude_config_repo "$script_dir")" \
 # A clone or freshly merged checkout may not have installed its local hooks
 # yet. Activate them before touching refs so this helper cannot create a
 # worktree while protection is silently disabled.
-installer="$repo/scripts/install-worktree-policy.sh"
+#
+# Resolved against $script_dir, not $repo: the installer is this script's
+# sibling, so following the script survives a relocation of the scripts/
+# directory. Anchoring on $repo instead assumes a repo-root layout, and that
+# assumption is exactly what the runtime/ cutover broke — the installer moved
+# to runtime/scripts/ and every invocation died here, which also blocked the
+# worktree that would have fixed it. The installer takes the repo as an
+# argument, so the deployed copy acting on the working checkout is correct.
+installer="$script_dir/install-worktree-policy.sh"
 [ -x "$installer" ] || die "policy installer is missing or not executable: $installer"
 "$installer" "$repo" >/dev/null \
   || die "could not activate repository worktree policy"
