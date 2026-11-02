@@ -43,6 +43,17 @@ seed_dcg_fallback() {
   grep -q 'BOOTSTRAP FALLBACK' "$HOME/.config/dcg/config.toml"
 }
 
+# Make the sandbox look like a host the runtime projection is live on. The
+# marker is untracked state in ~/.claude, so it is not part of any staged
+# config arm and a run is a NON-projected host unless this is called -- which
+# matters because the announcement's FIX line branches on exactly this file.
+# Measured without it: 2 of 5 runs relayed the flat-checkout branch, 0 of 5
+# the projected one, which was the right read of the host they were given and
+# the wrong one for the host this config ships to.
+mark_projected_host() {
+  : > "$HOME/.claude/.projection-enabled"
+}
+
 # A plain workspace. These scenarios are about what session start says, not
 # about anything in the tree, so the repo stays deliberately boring: a tree
 # with finished work in it would give the agent a second thing to report and
