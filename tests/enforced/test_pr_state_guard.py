@@ -358,3 +358,36 @@ def test_an_arrow_plan_naming_prs_to_merge_blocks(env):
     out = env.run("Then: verify five `ro` mounts → merge #381 → merge #383 → drop the brake.")
     assert out["decision"] == "block"
     assert "#381" in out["reason"] and "#383" in out["reason"]
+
+
+def test_handing_the_list_back_is_an_ask(env):
+    """Verbatim from the e2e: the reply answers, it never asks, and the four
+    numbers are bare. The first vocabulary missed it and the e2e caught that."""
+    msg = ("Mergeable (open, clean, checks green):\n\n1. widget #37\n2. widget #41\n"
+           "3. infra #393\n4. infra #394\n\n#38 is already merged.")
+    out = env.run(msg)
+    assert out["decision"] == "block"
+    for n in ("#37", "#41", "#393", "#394"):
+        assert n in out["reason"]
+
+
+def test_handing_the_list_back_with_urls_passes(env):
+    env.set({"jonathanmoregard/.claude#37": "OPEN", "jonathanmoregard/.claude#41": "OPEN"})
+    msg = (f"Mergeable (open, clean, checks green):\n\n1. #37 — {CLA}/37\n"
+           f"2. #41 — {CLA}/41\n")
+    assert env.run(msg) is None
+
+
+def test_ready_to_merge_without_a_link_blocks(env):
+    assert env.run("Ready to merge now, if you want to start there: #375.")["decision"] == "block"
+
+
+def test_a_pr_that_was_not_ready_is_not_an_ask(env):
+    """'#381 wasn't ready to merge' -- past tense, and a negation."""
+    assert env.run("As of this morning #381 wasn't ready to merge.") is None
+
+
+def test_mergeable_unknown_is_a_field_not_a_handback(env):
+    """'`#393`/`#394` report `mergeable=UNKNOWN` -- GitHub computes it lazily'."""
+    msg = "#393 and #394 report `mergeable=UNKNOWN` — GitHub computes that lazily."
+    assert env.run(msg) is None

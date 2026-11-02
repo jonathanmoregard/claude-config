@@ -146,7 +146,13 @@ MERGE_ASK = re.compile(
     r"|\bready for (?:your )?(?:merge|review)\b"
     r"|\bfor you to (?:merge|review)\b|\byours to (?:merge|click)\b"
     r"|\b(?:merge|click|review)s? (?:is|are) (?:all )?yours\b"
-    r"|\ball yours\b)",
+    r"|\ball yours\b"
+    # Handing the list back is the same moment as asking, and the measured
+    # reply did not ask: "Mergeable (open, clean, checks green):" over four
+    # bare numbers, in answer to "just the numbers of what's mergeable". The
+    # user is about to click something either way.
+    r"|\bmergeable\b|\bready to merge\b|\bcan merge\b|\bcould merge\b"
+    r"|\bsafe to merge\b|\bgood to merge\b|\bmergeable now\b)",
     re.I,
 )
 # "Merge #37 first" is an ask too, but the bare verb cannot be: "I need to
@@ -175,8 +181,13 @@ DATA_LINE_RE = re.compile(r"^\s*[|\[{\"]")
 # and it carries an ask phrase verbatim. Negation is tested per segment, not
 # per line, so "Don't merge #41 yet; #37 is ready for your merge" still has an
 # ask in it.
+# `UNKNOWN` belongs here because of what the handback words cost: measured,
+# "`#393`/`#394` report `mergeable=UNKNOWN` -- GitHub computes that lazily" is
+# a sentence about the field, and a PR whose mergeability is UNKNOWN is not one
+# being handed over to click.
 NOT_ASKING = re.compile(
-    r"\b(?:nothing|none|nobody|no longer|not|never|isn't|aren't|won't|don't)\b",
+    r"\b(?:nothing|none|nobody|no longer|not|never|isn't|aren't|won't|don't"
+    r"|wasn't|weren't|hasn't|haven't|can't|couldn't|cannot|UNKNOWN)\b",
     re.I,
 )
 SEGMENT_RE = re.compile(r"[;.]")
@@ -322,13 +333,19 @@ def ask_scope(lines: list[str]) -> list[str]:
         if not is_ask(line):
             continue
         scope.append(line)
+        # A lead-in ends in a colon and its list may start after a blank line
+        # ("Mergeable (open, clean, checks green):\n\n1. widget #37"). Without
+        # the colon a blank line ends the ask, so an unrelated bullet list
+        # further down the reply is not read as part of it.
+        lead_in = line.rstrip().endswith(":")
         j = i + 1
         while j < len(lines):
             if not lines[j].strip():
                 k = j
                 while k < len(lines) and not lines[k].strip():
                     k += 1
-                if k < len(lines) and LINK_ONLY_RE.match(lines[k]):
+                if k < len(lines) and (LINK_ONLY_RE.match(lines[k])
+                                       or (lead_in and LIST_ITEM_RE.match(lines[k]))):
                     j = k
                     continue
                 break
