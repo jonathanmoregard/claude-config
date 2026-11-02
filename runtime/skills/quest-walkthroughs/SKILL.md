@@ -23,6 +23,7 @@ This overrides terse or compressed reply modes (e.g. caveman) for the walkthroug
 ## Make every step followable cold
 
 - **Give the direct URL** for every page (`https://github.com/settings/apps/new`), plus the menu path as a fallback. Never just "go to the settings".
+- **Console layouts drift faster than their docs.** For any section you have not seen on the live page, give a Ctrl+F word as well as the section name, and say "if it isn't there, send me a screenshot". Don't guess a different spot. Example: in Nov 2026, the GitHub App key button was under **Credentials → Key pairs**, not under **Private keys** on the **General** tab, where the docs put it.
 - **Spell out every field on the form**, including the ones to leave alone ("leave Callback URL empty") and the defaults to flip ("uncheck **Active**, it is on by default"). List exact permission levels, and name the ones that must stay off, with the reason.
 - **Say where the loot appears and what it looks like**: "App ID, a number under **About**, not the Client ID"; "downloads `<name>.private-key.pem` into `~/Downloads`".
 - **Keep anything the user pastes short.** If a command has more than one step, long paths or chained `&&`, write it into a small script (`/tmp/<task>.sh`, chmod 700, syntax-checked, no secrets inside) and hand over a single line: `bash /tmp/<task>.sh`. Mention `! bash /tmp/<task>.sh` so the output lands in the chat, and how to read the script first. Make the script fail-safe: `set -euo pipefail`, and destroy plaintext secrets only after the encrypted result is verified.
