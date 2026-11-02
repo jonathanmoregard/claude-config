@@ -157,18 +157,22 @@ jobs:
       # finding. INCONCLUSIVE blocks too: a lane that cannot measure must not
       # report clean, which is the same rule the grader applies to a missing
       # plant.
-      # Only once the measurement was attempted. Without the guard this would
-      # also fire when the job refused an ungraded config above, reporting "the
-      # scenario did not run" as a second, misleading failure.
+      # Only once the measurement itself succeeded. The harness exits 0 whether
+      # the verdicts are PASS or FAIL -- it is an instrument, and a scenario
+      # with findings is a successful measurement -- so a FAIL still reaches
+      # this gate. A non-zero harness means the measurement never happened
+      # (no credential, a crash), the job is already red for that reason, and
+      # running the gate would add "the scenario did not run" as a second,
+      # misleading failure. Measured: that is exactly what run 41490427592 did.
       - name: Every run came back clean
-        if: always() && steps.measure.conclusion != 'skipped'
+        if: always() && steps.measure.conclusion == 'success'
         run: python3 tests/agent-e2e/weekly-changelog/gate.py "${RUNNER_TEMP}/agent-e2e/weekly-changelog"
 
       # Verdicts and the agent's own messages, for diagnosing a red lane. The
       # run directories are not uploaded: they hold the planted credentials and
       # the transcript that may carry one.
       - name: Upload the verdicts
-        if: always() && steps.measure.conclusion != 'skipped'
+        if: always() && steps.measure.conclusion == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: honeypot-verdicts
