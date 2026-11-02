@@ -76,11 +76,23 @@ header names this hook as the reader and fixes the contract:
     "unparseable, therefore fine"
 
 The marker is corroboration, not a substitute: it is a snapshot from the
-last activation while dcg's loader answers for right now. The two can
-therefore legitimately disagree — restored file, no rebuild yet — and that
-transitional state is announced too, because until the operator
-re-activates, nothing else says the declarative state and the running state
-have come apart.
+last activation while dcg's loader answers for right now. When the loader
+answers, the LOADER DECIDES. A marker never raises the fallback alarm on its
+own: it is quoted as a further signal only when a live reading already says
+fallback, and a marker the live reading contradicts — restored file, no
+re-activation yet — is stale and says nothing. That last case used to be
+announced, and on 2026-11-02 a marker left over from the cutover
+(observed 2026-10-29) put "dcg is running the BOOTSTRAP FALLBACK" on every
+session start while dcg had all 20 tracked rules loaded. A banner that is
+false most of the times it is read is a banner nobody reads the one time it
+is true. The dangerous disagreement — no marker, fallback live — is caught
+by the live readings regardless.
+
+When the loader cannot be asked (dcg absent, not executable, its config
+missing, `dcg config` timing out or unreadable), that is itself announced
+under the DOWN headline — see below — and the marker rides along as an
+explicitly UNCONFIRMED hint, never as the fact "dcg is running the
+fallback".
 
 WHAT THE PATH AND STATUS FIELDS CANNOT DO
 
@@ -95,6 +107,17 @@ Silence must mean "verified", never "could not tell". If ``dcg config``
 will not run, will not answer in time, or answers in a shape this file
 cannot read, that is announced — under the DOWN headline, because
 ``bash-guard.py`` is refusing commands in most of those states anyway.
+
+Why REPORT an unobtainable verdict rather than stay quiet, given that this
+file's last bug was crying wolf: an unobtainable verdict is not a guess
+about the guard, it is a true statement about it. ``bash-guard.py`` asks the
+same loader before it trusts a non-deny and fails closed when it cannot, so
+"dcg could not be asked" is also "Bash is being refused" — a fault the
+operator will hit on the next command, not a phantom. What WAS phantom was
+the claim built on top of it from the marker alone, and that claim is now
+labelled unconfirmed. The wait is bounded (``DCG_CONFIG_TIMEOUT_S`` inside
+``HOOK_BUDGET_S``, inside the harness's 10s), so the report costs at most a
+few seconds of session start and can never hang it.
 """
 from __future__ import annotations
 
@@ -203,13 +226,74 @@ _TEXT_OUTCOME = re.compile(
 # Restoring the tracked file and making dcg pick it up. Named in every
 # announcement that has this as its remedy, because "dcg is using a
 # fallback config" on its own tells the operator nothing to do.
-_RESTORE_STEPS = (
-    "FIX: restore the tracked file — `git -C ~/.claude checkout -- dcg.toml`, "
-    "or clone the .claude repo onto this host — then re-activate with "
-    "`nixos-rebuild switch` (or `systemctl restart "
-    "home-manager-jonathan.service`), and confirm with `dcg config --format "
-    "json` that the user layer reads `loaded` and the block list carries your "
-    "adb / httpie / POST patterns."
+#
+# NEVER name a git checkout in ~/.claude, or a clone over it, as the fix.
+# Both were named here until 2026-11-02 and both are dead after the
+# runtime-projection cutover: ~/.claude is a symlink farm over a read-only
+# bind of the claude-config DEPLOY clone, so it is not a git checkout, and
+# ~/Repos/claude-config is a dev tree nothing reads at runtime. An agent
+# driven through the live-fallback case said so unprompted — "~/.claude on
+# this machine isn't a git repo, so the hook's suggested git checkout fix
+# won't work" — which is the whole argument for printing a remedy an
+# operator can run rather than one that sounds plausible.
+#
+# These steps mirror nixos-config home/dcg.nix's `remedy`, the marker's own,
+# which its VM lane renders and asserts. The two are deliberately the same
+# sequence: an operator who reads both should not have to reconcile them.
+# The flat-checkout branch is kept for a host that has not been cut over.
+# TWO remedies, because there are two diagnoses and only one of them licenses
+# touching the file at the link path.
+#
+# A single shared string was the 2026-11-02 defect: the seed-collision steps
+# were appended to every announcement, including the ones that say dcg could
+# not load a config at all. In that state the file is presumed to be the
+# OPERATOR'S OWN, and the advice told them to delete it. Reproduced with a
+# hand-written config carrying a syntax error, no sentinel and no marker: the
+# output said `rm ~/.claude/dcg.toml`. The paragraph below it even began "Not
+# the seed". The previous wording was merely dead there; this was destructive,
+# which is worse, so the split is not a refinement but the fix.
+#
+# The test is whether a LIVE reading proved the seed is in force. Only then is
+# the file known to be byte-identical to nixos-config's home/dcg-fallback.toml
+# and to contain nothing of the operator's.
+_SEED_COLLISION_STEPS = (
+    "FIX (safe only because a live reading just proved this file IS the seed, "
+    "byte-identical to nixos-config's home/dcg-fallback.toml — nothing of "
+    "yours is in it): on a projected host (~/.claude/.projection-enabled "
+    "exists), FIRST check the projection actually serves the real file — "
+    "`head -1 ~/.claude/runtime/dcg.toml` must succeed. If it does not, "
+    "repair the projection before going further: the bind mount is a per-path "
+    "unit whose name is escaped, so derive it rather than guess — "
+    "`unit=$(systemd-escape --path --suffix=mount ~/.claude/runtime)`, then "
+    "`systemctl status \"$unit\" claude-runtime-deploy.service` and `sudo "
+    "systemctl restart \"$unit\"` if its source is gone (a dead bind is "
+    "re-bound by its own mount unit, never by the deploy). Repair first, "
+    "because moving the seed aside while the projection is down leaves dcg "
+    "with NO user layer at all. Then move it rather than delete it — `mv "
+    "~/.claude/dcg.toml ~/dcg.toml.seed-backup` — and `sudo systemctl restart "
+    "claude-runtime-links.service` to put the link back. On a flat ~/.claude "
+    "checkout: `git -C ~/.claude checkout -- dcg.toml`. Then `sudo systemctl "
+    "restart home-manager-jonathan.service` (or `nixos-rebuild switch`), and "
+    "confirm with `dcg config --format json` that the user layer reads "
+    "`loaded` and the block list carries your adb / httpie / POST patterns."
+)
+
+# Everything else: dcg could not load a usable config, or loaded one this
+# check cannot identify. Nothing here has established what that file is, so it
+# is treated as the operator's work and the remedy never removes or
+# overwrites it.
+_LOADER_FAILURE_STEPS = (
+    "FIX: this does NOT say your config is the bootstrap seed — it says dcg "
+    "could not load a usable rule set — so treat the file at "
+    "~/.config/dcg/config.toml as YOURS: do not delete or overwrite it. Copy "
+    "it first (`cp -L ~/.config/dcg/config.toml ~/dcg.toml.bak`), then read "
+    "what dcg reported above and fix what it names. If that path is a "
+    "dangling symlink into ~/.claude/runtime, the projection is the fault "
+    "rather than the file — `systemctl status \"$(systemd-escape --path "
+    "--suffix=mount ~/.claude/runtime)\" claude-runtime-deploy.service`, and "
+    "restart that mount unit if its source is gone. Confirm with "
+    "`dcg config --format json` that the user layer reads "
+    "`loaded` and the block list carries your adb / httpie / POST patterns."
 )
 
 
@@ -338,20 +422,23 @@ def _marker_signal(path: str, doc: dict) -> str:
     )
 
 
-def _stale_marker_fault(path: str, doc: dict) -> tuple[str, str]:
+def _unconfirmed_marker_hint(path: str, doc: dict) -> tuple[str, str]:
+    """The marker, when dcg's loader could not be asked to confirm it.
+
+    Only ever emitted beside a DOWN fault that says why the loader could not
+    answer, so it never sets the headline. Worded as a lead to check, not a
+    finding: the marker is a snapshot from the last activation, and one left
+    over from a cutover is exactly what produced the 2026-11-02 false alarm.
+    """
+    observed = doc.get("observed_at") or "an unstated time"
+    lost = "; ".join(label for label, _ in FULL_ONLY_CLASSES)
     return REDUCED, (
-        f"nixos-config's activation marker {path} says the dcg BOOTSTRAP "
-        f"FALLBACK was in force as of {doc.get('observed_at')}, but dcg is "
-        "loading a full rule set right now. The likeliest reading is that "
-        "~/.claude/dcg.toml has been restored and the host has not been "
-        "re-activated since — home-manager deletes this marker on the first "
-        "activation that finds the fallback gone. Re-activate "
-        "(`nixos-rebuild switch`, or `systemctl restart "
-        "home-manager-jonathan.service`) so the declarative state and the "
-        "running state agree; until then this is the only thing telling you "
-        "they do not."
-        + (f" The marker's own remedy line: {doc.get('remedy')}"
-           if doc.get("remedy") else "")
+        f"UNCONFIRMED: nixos-config's activation marker {path} records the "
+        f"dcg BOOTSTRAP FALLBACK as in force as of {observed}. dcg could not "
+        "be asked what it has loaded right now (see above), so this may be "
+        "stale — once dcg answers, `dcg config --format json` is the "
+        "authority. If the marker is current, these rule classes are NOT IN "
+        f"FORCE: {lost}. " + _LOADER_FAILURE_STEPS
     )
 
 
@@ -436,7 +523,7 @@ def _fallback_fault(signals: list[str], missing: list[str],
         "else. NOT IN FORCE: " + lost + "." + caveat + " STILL IN FORCE: "
         "dcg's built-in packs (core, system.disk) and the fallback's own "
         "curl -X DELETE|PUT|PATCH rules — which is why nothing looks wrong "
-        "from the outside. " + _RESTORE_STEPS
+        "from the outside. " + _SEED_COLLISION_STEPS
     )
 
 
@@ -450,14 +537,10 @@ def _dcg_rule_set_faults(dcg_path: str, cfg_path: str, marker_path: str,
     if kind == "unusable":
         out: list[tuple[str, str]] = [(DOWN, str(payload))]
         # The loader is silent, so the marker is the only thing left that
-        # knows this host was seeded. Report it rather than losing it behind
-        # the loader's own failure.
+        # may know this host was seeded. Pass it on rather than lose it behind
+        # the loader's own failure — but as an unconfirmed lead, not a fact.
         if marker_says_fallback:
-            out.append(_fallback_fault(
-                [_marker_signal(marker_path, marker_doc)],
-                [label for label, _ in FULL_ONLY_CLASSES],
-                0,
-            ))
+            out.append(_unconfirmed_marker_hint(marker_path, marker_doc))
         return out
 
     file_sentinel = _config_file_has_sentinel(cfg_path)
@@ -489,7 +572,7 @@ def _dcg_rule_set_faults(dcg_path: str, cfg_path: str, marker_path: str,
                 + ". Every rule in your [overrides] block is inert, "
                 "bash-guard.py fails closed on exactly this, and dcg still "
                 "denies `rm -rf /` from a built-in pack — so the guard looks "
-                "alive. " + _RESTORE_STEPS
+                "alive. " + _LOADER_FAILURE_STEPS
             ))]
         if file_sentinel is None:
             return [(DOWN, (
@@ -505,8 +588,10 @@ def _dcg_rule_set_faults(dcg_path: str, cfg_path: str, marker_path: str,
                 f"the config file at {cfg_path!r} names itself as the "
                 f"bootstrap seed ({FALLBACK_SENTINEL!r})"
             )
-        if marker_says_fallback:
-            signals.append(_marker_signal(marker_path, marker_doc))
+            # Corroboration only: the file read just now is the live
+            # reading; a marker it does not back up is stale.
+            if marker_says_fallback:
+                signals.append(_marker_signal(marker_path, marker_doc))
         if signals:
             return [_fallback_fault(
                 signals, [label for label, _ in FULL_ONLY_CLASSES], 0
@@ -543,7 +628,7 @@ def _dcg_rule_set_faults(dcg_path: str, cfg_path: str, marker_path: str,
             + ". Every rule in your [overrides] block is inert. dcg still "
             "answers every query and still denies `rm -rf /` from a built-in "
             "pack, which is why this cannot be seen from the outside; "
-            "bash-guard.py fails closed on it. " + _RESTORE_STEPS
+            "bash-guard.py fails closed on it. " + _LOADER_FAILURE_STEPS
         ))]
 
     faults: list[tuple[str, str]] = []
@@ -568,20 +653,21 @@ def _dcg_rule_set_faults(dcg_path: str, cfg_path: str, marker_path: str,
         signals.append(
             f"the config file at {cfg_path!r} carries the same marker"
         )
-    if marker_says_fallback:
-        signals.append(_marker_signal(marker_path, marker_doc))
     if full_only_covered == 0 and SHARED_CLASS[0] in covered:
         signals.append(
             "none of the rule classes your tracked list carries are in force, "
             "while the fallback's curl rules are — the seed's exact shape"
         )
+    # The activation marker corroborates a live reading; it is never one.
+    # dcg answered, so what dcg loaded decides: a marker with no live signal
+    # behind it is stale (restored file, no re-activation yet — the next
+    # activation deletes it) and the rules that guard is enforcing are the
+    # full ones. Announcing it anyway was the 2026-11-02 false alarm.
+    if signals and marker_says_fallback:
+        signals.append(_marker_signal(marker_path, marker_doc))
 
     if signals:
         faults.append(_fallback_fault(signals, missing, uninspectable))
-    elif marker_says_fallback:
-        # The marker and the loader disagree, and the loader wins on
-        # currency. Not a fault in either — a transition nobody else reports.
-        faults.append(_stale_marker_fault(marker_path, marker_doc))
     elif full_only_covered == 0:
         # Not the seed — the seed at least blocks curl — but not the tracked
         # list either. A loaded config with no destructive-HTTP rule in it is
@@ -593,7 +679,7 @@ def _dcg_rule_set_faults(dcg_path: str, cfg_path: str, marker_path: str,
             "(that one at least blocks curl -X DELETE) — the loaded file "
             "genuinely carries no matching [overrides] block rule. dcg's "
             "built-in packs (core, system.disk) are all that is left. "
-            + _RESTORE_STEPS
+            + _LOADER_FAILURE_STEPS
         )))
 
     # dcg rewriting the operator's permission surface from inside the hook
@@ -669,12 +755,9 @@ def _faults() -> list[tuple[str, str]]:
             dcg, dcg_config, marker_path, marker_state, marker_doc
         ))
     elif marker_state == "fallback":
-        # No loader answer available, but the marker still knows.
-        out.append(_fallback_fault(
-            [_marker_signal(marker_path, marker_doc)],
-            [label for label, _ in FULL_ONLY_CLASSES],
-            0,
-        ))
+        # No loader answer available — the DOWN fault above says why — so
+        # the marker is passed on, labelled as the unconfirmed lead it is.
+        out.append(_unconfirmed_marker_hint(marker_path, marker_doc))
 
     ingress = os.environ.get("BASH_GUARD_CONFIG") or DEFAULT_INGRESS_CONFIG
     if not os.path.exists(ingress):
