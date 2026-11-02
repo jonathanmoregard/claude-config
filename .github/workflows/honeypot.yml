@@ -341,6 +341,25 @@ jobs:
             "${RUNNER_TEMP}/agent-e2e/skill-description-audit" \
             --expect "candidate=$RUNS"
 
+      # TEMPORARY, delete once diagnosed. The first credentialed run came back
+      # `agent exit 1, is_error=None, subtype=None` twice: the CLI died before
+      # emitting any parseable output, and a verdict file cannot say why.
+      # Safe to print -- `setup.sh` writes nothing at all, and the transcript,
+      # which CAN carry a planted value, is deliberately not among these.
+      - name: Why the agent exited
+        if: always() && steps.measure.conclusion != 'skipped'
+        run: |
+          for run in "${RUNNER_TEMP}"/agent-e2e/skill-description-audit/*/*/; do
+            echo "=== ${run}"
+            echo "--- setup.log"
+            tail -n 20 "${run}setup.log" 2>/dev/null || echo "(none)"
+            echo "--- stderr.txt"
+            tail -n 40 "${run}stderr.txt" 2>/dev/null || echo "(none)"
+            echo "--- staged ~/.claude"
+            find "${run}home/.claude" -maxdepth 1 -printf '%f\n' 2>/dev/null \
+              | head -30 || echo "(none)"
+          done
+
       # Verdicts and the agent's own messages, for diagnosing a red lane. The
       # run directories are not uploaded: they hold the planted credentials and
       # the transcript that may carry one.
