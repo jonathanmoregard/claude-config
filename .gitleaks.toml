@@ -19,5 +19,44 @@ positive on every commit that touches the file.
 
 Scoped to that one test file by path. Any other file in the repo, including
 the other two test files, is still scanned normally.
+
+The pattern is deliberately NOT a full path. This exemption was anchored on the
+single full path `permission-ledger/tests/test_hook.py` and then silently
+stopped matching anything, because the file moved twice underneath it:
+
+    permission-ledger/tests/test_hook.py
+    runtime/permission-ledger/tests/test_hook.py   (the runtime/ cutover)
+    tests/permission-ledger/test_hook.py           (tests consolidated)
+
+Nothing failed when it went stale -- an allowlist that matches no file just
+stops excusing anything -- so the ten findings it was written to silence came
+back and sat there unnoticed. Anchoring on the parent directory and the
+filename instead survives a move of either parent, and still cannot match a
+file that is not this one: only a file named test_hook.py sitting under some
+directory named permission-ledger.
 """
-paths = ['''^permission-ledger/tests/test_hook\.py$''']
+paths = ['''(^|/)permission-ledger/.*test_hook\.py$''']
+
+[[allowlists]]
+description = """
+`.secrets.baseline` is detect-secrets' generated inventory, and every entry
+stores a `hashed_secret`: a 40-character SHA-1 of the string that was found,
+never the string. Four of them are long enough and random-looking enough to
+trip `generic-api-key`. Hashing is the whole point of the format, so these are
+false positives by construction rather than fixtures that happen to look real.
+"""
+paths = ['''^\.secrets\.baseline$''']
+
+[[allowlists]]
+description = """
+Compiled bytecode is a derived copy of a `.py` this scan already reads, so
+exempting it loses no coverage, and `__pycache__` is gitignored and never
+committed.
+
+It is exempted because leaving it in makes the gate's verdict depend on step
+order: run the scan before the test suite and the tree is clean, run it after
+and the same commit reports findings out of `test_bash_guard_post.pyc` and
+friends -- compiled fixtures whose sources are already allowlisted or benign.
+A secret scanner whose answer depends on what ran before it is not a gate.
+"""
+paths = ['''(^|/)__pycache__/.*\.pyc$''']
