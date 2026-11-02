@@ -178,6 +178,70 @@ def test_the_seed_remedy_checks_the_projection_before_moving_anything(hook):
     assert steps.index("runtime/dcg.toml") < steps.index("mv "), (
         "the seed remedy moves the seed aside before checking that the "
         "projection serves a replacement")
-    assert "claude-runtime-mounts" in steps, (
-        "the seed remedy does not name the mount unit, which is what repairs "
-        "a dead bind source -- the deploy alone does not")
+    assert "systemd-escape" in steps, (
+        "the seed remedy does not derive the mount unit's name. A dead bind "
+        "source is re-bound by its own per-path .mount unit and by nothing "
+        "else, and that unit's name is escaped, so the remedy has to compute "
+        "it rather than print one")
+
+
+@pytest.mark.parametrize("which", ["_SEED_COLLISION_STEPS",
+                                   "_LOADER_FAILURE_STEPS"])
+def test_every_unit_a_remedy_names_is_spelled_like_a_unit(hook, which):
+    """A remedy may not invent a systemd unit.
+
+    Both remedies said `systemctl status claude-runtime-mounts ...` until
+    review caught it. There is no such unit: `claude-runtime-mounts` is the
+    name of a Nix MODULE file, and the units it generates are per-path mounts
+    (`home-jonathan-.claude-runtime.mount`). `systemctl list-units --all |
+    grep -c claude-runtime-mounts` returns 0 on the live host, so the one step
+    that repairs a dead projection could not be run as printed -- and the test
+    that was supposed to cover it asserted the wrong string, so it was green.
+
+    Checked structurally rather than against a list of known units, because a
+    hard-coded list is the same mistake one level up: it would have to be
+    maintained by whoever adds a unit, which is exactly who got it wrong. The
+    rule is that a literal unit token carries its suffix -- `.service`,
+    `.mount`, `.timer`, `.path`, `.socket`, `.target` -- or is derived at run
+    time by a shell expansion. `claude-runtime-mounts` satisfies neither;
+    `claude-runtime-deploy.service` and `"$unit"` both do.
+
+    A suffixless name that happens to BE a real service is flagged too, and
+    that is the point rather than collateral: `systemctl status foo` resolves
+    to `foo.service` implicitly, which is precisely what hid this bug.
+    `claude-runtime-mounts` looked like a unit, failed with "could not be
+    found", and read as a missing unit rather than as the wrong KIND of unit.
+    Requiring the suffix forces the question "which kind is this?" -- whose
+    answer here is a per-path `.mount`, reachable by no `.service` default.
+
+    This cannot confirm a suffixed unit actually EXISTS -- the `checks` job has
+    no such units and no systemd to ask. nixos-config's vm-base lane does that
+    half, inside a VM, against the real generated units.
+    """
+    import re
+
+    steps = getattr(hook, which)
+    _SUFFIXES = (".service", ".mount", ".timer", ".path", ".socket", ".target")
+    bad = []
+    # Tokens after a systemctl verb, up to the end of the backticked command.
+    for match in re.finditer(
+            r"systemctl\s+(?:status|restart|start|stop|reload)\s+([^`]+)",
+            steps):
+        args = match.group(1)
+        # Delete shell expansions BEFORE splitting on whitespace. A command
+        # substitution contains spaces of its own, so tokenising first leaves
+        # its tail (`~/.claude/runtime)"`) looking like a bare unit name --
+        # which is how the first version of this check failed.
+        args = re.sub(r'"?\$\([^)]*\)"?', " ", args)
+        args = re.sub(r'"?\$\{?\w+\}?"?', " ", args)
+        for token in args.split():
+            if token.startswith("-"):
+                continue            # a flag
+            if token.endswith(_SUFFIXES):
+                continue
+            bad.append(token)
+    assert not bad, (
+        f"{which} names these as systemd units, with no unit suffix and no "
+        f"derivation: {bad}. Either spell the unit in full, or compute it "
+        "(`systemd-escape --path --suffix=mount <path>`). A module filename "
+        "is not a unit.")
