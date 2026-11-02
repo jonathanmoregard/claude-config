@@ -89,7 +89,15 @@ backstop for this check, not a replacement.
 Every message that asks the user to merge or review also carries each PR's full
 URL, one per line at the bottom (`reporting-pr-state`): never `#37, #38`, a
 title, or a markdown label alone. This binds in any reply shape, a one-line
-"merge clicks" included, not only inside a status-report template.
+"merge clicks" included, not only inside a status-report template. "Short as
+you like" and "just the numbers" do not lift it — a reply can be both short and
+clickable.
+
+The same hook enforces that half too: a merge or review ask carrying a bare
+`#41` with no `/pull/41` URL in the reply is sent back, naming the numbers to
+link. It is why this rule holds when prose did not — measured over a week of
+replies, the prose was followed about 95% of the time and the misses all looked
+like a hurry.
 
 ## 3. Hand off for review
 
