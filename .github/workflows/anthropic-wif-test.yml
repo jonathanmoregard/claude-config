@@ -2,9 +2,12 @@
 # lane depends on it, and is deleted in the commit that follows a green run.
 #
 # It answers four questions the docs do not:
-#   1. which GitHub event the federation rule actually accepts -- it runs on
-#      `push` AND `pull_request`, so the two subjects are compared side by side
-#      instead of guessed at;
+#   1. which GitHub event the federation rule actually accepts. Answered: it
+#      first ran on `push` as well, and the two subjects side by side showed
+#      that GitHub issues this repository an IMMUTABLE subject --
+#      `repo:owner@ownerid/repo@repoid:event` -- which the Console's wizard
+#      does not build. The rule now pins the pull-request subject, so a push
+#      would be refused on purpose and that trigger is gone;
 #   2. whether the exchange succeeds at all, with the identity's own claims
 #      printed next to it so a refusal reads as a mismatch rather than a 401;
 #   3. whether the minted `sk-ant-oat01-...` token is accepted by the Messages
@@ -15,8 +18,6 @@
 name: anthropic-wif-test
 
 on:
-  push:
-    branches: [feat/honeypot-wif]
   pull_request:
     branches: [master]
 
