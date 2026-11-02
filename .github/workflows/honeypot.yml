@@ -50,6 +50,12 @@ jobs:
   honeypot:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # One source for how many runs there are, so the number the harness
+      # performs and the number the gate demands cannot drift apart. The gate
+      # grades an expected SET: a run that wrote no verdict blocks exactly
+      # like a failing one, which a verdict-file glob did not.
+      RUNS: 2
     steps:
       # Deliberately NOT a job-level `if:`. A job skipped by its own condition
       # is reported as SUCCESSFUL to a required status check -- the same gotcha
@@ -124,15 +130,35 @@ jobs:
           claude --version
           bwrap --version
 
-      # Without a dcg config, bash-guard fails closed and refuses every Bash
-      # call the agent makes. The harness copies this file from the developer's
-      # real HOME, which does not exist here, so CI provides the tracked copy.
-      # A run where every command was refused measured the sandbox, not the
-      # config, and the harness reports it INCONCLUSIVE.
-      - name: Provide the config the guard hooks need
+      # `bash-guard.py` needs BOTH dcg's config and the dcg EXECUTABLE. With
+      # the binary absent it denies every Bash call with "the safety guard is
+      # BROKEN", and says plainly that there is no bypass flag. Measured by
+      # running the guard with dcg off PATH.
+      #
+      # The config is tracked here, so CI can supply it. The binary is a Rust
+      # program packaged declaratively in the private nixos-config, published
+      # nowhere, so a runner cannot obtain it at all. Until it can, this step
+      # is where the install goes.
+      #
+      # Deliberately NOT worked around. A permissive dcg stub would change the
+      # config under test and manufacture a clean verdict from a broken guard,
+      # which is the exact failure this lane exists to catch. A scenario that
+      # avoids Bash would hide the same thing. Both are rejected; the step
+      # fails instead, naming the cause, so a red lane reads as itself rather
+      # than as a drift of unexplained INCONCLUSIVE runs.
+      - name: The guard's dependencies are present and answering
         run: |
           mkdir -p "$HOME/.config/dcg"
           cp runtime/dcg.toml "$HOME/.config/dcg/config.toml"
+          if ! command -v dcg >/dev/null 2>&1; then
+            echo "dcg is not available on this runner, so bash-guard denies every"
+            echo "Bash call and no run can measure the config. This lane cannot"
+            echo "grade anything until dcg is obtainable here -- see the pull"
+            echo "request that introduced this workflow for the options."
+            exit 1
+          fi
+          dcg --version
+          dcg config
 
       # HEAD is the merge commit GitHub built for this pull request, so the
       # graded config is the tree that would land. `agent_e2e.py` resolves the
@@ -149,7 +175,7 @@ jobs:
           fi
           python3 runtime/scripts/agent-e2e/agent_e2e.py run \
             tests/agent-e2e/skill-description-audit \
-            --arm candidate=HEAD --n 2 --jobs 2 \
+            --arm candidate=HEAD --n "$RUNS" --jobs "$RUNS" \
             --model claude-sonnet-5-5 --budget 1 --timeout 600 \
             --out "${RUNNER_TEMP}/agent-e2e"
 
@@ -166,7 +192,10 @@ jobs:
       # misleading failure. Measured: that is exactly what run 41490427592 did.
       - name: Every run came back clean
         if: always() && steps.measure.conclusion == 'success'
-        run: python3 tests/agent-e2e/skill-description-audit/gate.py "${RUNNER_TEMP}/agent-e2e/skill-description-audit"
+        run: |
+          python3 tests/agent-e2e/skill-description-audit/gate.py \
+            "${RUNNER_TEMP}/agent-e2e/skill-description-audit" \
+            --expect "candidate=$RUNS"
 
       # Verdicts and the agent's own messages, for diagnosing a red lane. The
       # run directories are not uploaded: they hold the planted credentials and

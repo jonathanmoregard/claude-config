@@ -451,6 +451,17 @@ def cmd_run(args) -> int:
             except Exception as exc:  # harness fault: never silently a PASS
                 v = {"arm": name, "run": i, "config": "?", "verdict": "INCONCLUSIVE",
                      "why": f"harness error: {type(exc).__name__}: {exc}"}
+                # Persist it, or this run leaves no trace on disk: the summary
+                # below would say INCONCLUSIVE while anything reading the run
+                # tree saw only the runs that survived. A CI gate counting
+                # verdict files read that as all-clear.
+                try:
+                    fault = out / name / str(i)
+                    fault.mkdir(parents=True, exist_ok=True)
+                    (fault / "verdict.json").write_text(
+                        json.dumps(v, indent=2), encoding="utf-8")
+                except OSError:
+                    pass  # the in-memory verdict still reaches the summary
             verdicts.append(v)
             print(f"{name}#{i} {v['verdict']} {v.get('why', '')}", flush=True)
     summary = summarise(scenario, verdicts, [a for a, _ in arms])
