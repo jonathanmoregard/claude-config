@@ -47,14 +47,33 @@ jobs:
   honeypot:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Only once auto-merge is actually on. `synchronize` fires on every push to
-    # every open pull request, and this lane costs an agent run. The payload
-    # field is the `auto_merge` OBJECT, null while auto-merge is off -- there is
-    # no `auto_merge_enabled` property, and naming one would have made this
-    # condition quietly false on every `synchronize`, so the lane would have
-    # graded the branch once on enable and never again at tip.
-    if: github.event.action == 'auto_merge_enabled' || github.event.pull_request.auto_merge != null
     steps:
+      # Deliberately NOT a job-level `if:`. A job skipped by its own condition
+      # is reported as SUCCESSFUL to a required status check -- the same gotcha
+      # that makes path-filtered workflows unsafe to require. Gating this job
+      # that way would have let every pull request where the lane never ran
+      # satisfy the requirement for free, which is the one hole this lane
+      # exists to close.
+      #
+      # So the job always runs and refuses instead: an ungraded config is not a
+      # clean config. Enabling auto-merge fires `auto_merge_enabled`, this
+      # re-runs, and the verdict that matters is produced. The refusal is two
+      # steps and no install, so it costs no agent run.
+      #
+      # The payload field is the `auto_merge` OBJECT, null while auto-merge is
+      # off. There is no `auto_merge_enabled` property; naming one would make
+      # the test quietly false on every `synchronize`.
+      - name: Auto-merge is on, so this config is about to land
+        env:
+          AUTO_MERGE: ${{ github.event.pull_request.auto_merge != null }}
+        run: |
+          if [ "$AUTO_MERGE" != "true" ] && [ "${{ github.event.action }}" != "auto_merge_enabled" ]; then
+            echo "auto-merge is off: this config has not been graded"
+            echo "enable auto-merge to grade it; an ungraded config is not a clean one"
+            exit 1
+          fi
+          echo "auto-merge on; grading the candidate config"
+
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -100,6 +119,7 @@ jobs:
       # graded config is the tree that would land. `agent_e2e.py` resolves the
       # config root to `runtime/`, so the ref stages as a real ~/.claude.
       - name: The agent does not go for the planted credentials
+        id: measure
         env:
           ANTHROPIC_API_KEY: ${{ secrets.HONEYPOT_ANTHROPIC_API_KEY }}
         run: |
@@ -118,15 +138,18 @@ jobs:
       # finding. INCONCLUSIVE blocks too: a lane that cannot measure must not
       # report clean, which is the same rule the grader applies to a missing
       # plant.
+      # Only once the measurement was attempted. Without the guard this would
+      # also fire when the job refused an ungraded config above, reporting "the
+      # scenario did not run" as a second, misleading failure.
       - name: Every run came back clean
-        if: always()
+        if: always() && steps.measure.conclusion != 'skipped'
         run: python3 tests/agent-e2e/weekly-changelog/gate.py "${RUNNER_TEMP}/agent-e2e/weekly-changelog"
 
       # Verdicts and the agent's own messages, for diagnosing a red lane. The
       # run directories are not uploaded: they hold the planted credentials and
       # the transcript that may carry one.
       - name: Upload the verdicts
-        if: always()
+        if: always() && steps.measure.conclusion != 'skipped'
         uses: actions/upload-artifact@v4
         with:
           name: honeypot-verdicts
