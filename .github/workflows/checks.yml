@@ -10,6 +10,21 @@
 # `git push --no-verify` skips it, and `core.hooksPath` is local config any
 # worktree can change. Making `checks` a required status check on master is a
 # repository setting, and the only step here that is not in the diff.
+#
+# WHAT THIS JOB RUNS, and why it is not a list. For a long time this job ran
+# `tests/enforced/` and two named scripts, while the rest of the corpus -- 51
+# top-level `tests/*.py`, 43 more in subdirectories, 23 shell suites -- ran
+# nowhere at all. The cost of that was measured before this file was widened:
+# on master, the unrun corpus stood at 905 passing, 254 FAILING and 15
+# collection errors, nearly all of it one root cause. The `runtime/` cutover
+# moved `hooks/`, `scripts/`, `skills/` and `settings.json` one level down, the
+# tests kept building paths from the repository root, and nothing anywhere
+# noticed for however many commits, because no gate read those files. A suite
+# CI does not run is not a guard; it is a file that resembles one.
+#
+# So every step below discovers its own work. The three exclusions that remain
+# are named, with their reason, because a suite that cannot run here must be
+# visibly excluded rather than quietly skipped.
 name: checks
 
 on:
@@ -29,8 +44,36 @@ concurrency:
 jobs:
   checks:
     runs-on: ubuntu-latest
+    # Without a ceiling a hung step -- a test waiting on a lock, a scanner on a
+    # pathological file -- burns up to GitHub's six-hour default before anyone
+    # finds out, on a public repository's shared minutes.
+    #
+    # Sized from a measured local run, not a guess: the pytest step alone is
+    # 598s, of which about 5.5 minutes is three self-running script suites
+    # executing as subprocesses, and the shell suites and provisioning add a
+    # few more. Call it 15 minutes of real work on this laptop, so 40 leaves
+    # room for a slower, contended runner while still catching a true hang
+    # well inside the hour. `SCRIPT_SUITE_TIMEOUT_S` in tests/conftest.py is
+    # 900s, deliberately inside this ceiling, so one hung script suite is
+    # reported as a failed test rather than as a killed job.
+    timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
+      # Pinned to the commit, not the tag: `v4` is a moving ref that the
+      # upstream owner can repoint at any time, and this job's verdict is
+      # exactly what an attacker would want to control -- a compromised
+      # checkout could hand the rest of the steps a tampered tree and let a
+      # bad commit report green. Upstream is on v7 now; this deliberately does
+      # not bump a major version, which is a change with its own behaviour
+      # risk and belongs in its own diff.
+      #
+      # persist-credentials: false because the default leaves a credential for
+      # GITHUB_TOKEN in `.git/config` for the life of the job, and the steps
+      # below run several hundred test subprocesses, many of which shell out to
+      # `git` inside throwaway repositories. The job needs the token for
+      # nothing after the clone.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       # Stdlib only, and deliberately before any install step: nothing fetched
       # from a package index can change this step's verdict.
@@ -61,10 +104,10 @@ jobs:
           sudo apt-get install --quiet --yes shfmt
           shfmt --version
 
-      # `gitleaks` runs the behavioural half of the proposals-sink config
-      # test: a real-shaped credential must still trip the shipped config. A
-      # config missing `[extend] useDefault = true` is a valid file that scans
-      # for nothing, and the static TOML check cannot see the effect. Same
+      # `gitleaks` serves two steps below: the behavioural half of the
+      # proposals-sink config test, and the whole-tree secret scan. A config
+      # missing `[extend] useDefault = true` is a valid file that scans for
+      # nothing, and the static TOML check cannot see the effect. Same
       # reasoning as `shfmt` above: the scanner is provisioned rather than the
       # test degraded, and the test fails, not skips, when it is absent -- a
       # secret-scanner guard must not pass on a machine that cannot run one.
@@ -84,16 +127,176 @@ jobs:
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
           "$(go env GOPATH)/bin/gitleaks" version
 
-      # The whole directory, never a list of files. A suite that guards one of
-      # this repository's own guards is itself a measuring instrument, and an
+      # The third scanner with the same shape, and the same argument.
+      # permission-ledger aggregates transcript-derived tool-call samples into
+      # proposal files that a pusher later ships to GitHub, and
+      # `run_secret_scan` in runtime/permission-ledger/aggregate.py is the
+      # FIRST redaction gate on that path. Absent the binary it returns
+      # "unavailable: detect-secrets not on PATH; samples emitted unscanned"
+      # and every sample goes out unredacted, with every health signal clean.
+      #
+      # Pinned to the version the parsing was written against: aggregate.py
+      # matches `: True` out of detect-secrets' per-detector output, a format
+      # this pin is what keeps stable. pip, because detect-secrets is a Python
+      # package and there is no apt or Go story for it.
+      - name: The secret scanner the permission-ledger redaction depends on is present
+        run: |
+          python3 -m pip install --disable-pip-version-check --quiet 'detect-secrets==1.5.0'
+          detect-secrets --version
+
+      # The repository's own secrets gate, and until now it had none. The only
+      # thing scanning this tree was the global pre-commit hook on one
+      # developer machine -- which is precisely what the header of this file
+      # argues is not an enforcement point, since `--no-verify` skips it and
+      # `core.hooksPath` is local config. The scanner is already installed two
+      # steps up, so this costs one command.
+      #
+      # `--redact` because this is a public repository and a finding must not
+      # print the matched string into a world-readable log. `--exit-code 1` is
+      # explicit rather than relying on the default.
+      #
+      # A fresh checkout here has no populated `vendor/` submodules (this job
+      # never fetches them) and no `__pycache__`, so what this scans is this
+      # repository's own tracked content. It runs BEFORE the test steps for
+      # the obvious reason -- a leaked credential should fail fast -- but it
+      # does not DEPEND on running first: `.gitleaks.toml` exempts compiled
+      # bytecode precisely so that the verdict cannot depend on whether a test
+      # run has written `.pyc` files yet.
+      - name: No credential reaches the tree
+        run: gitleaks dir . --config .gitleaks.toml --no-banner --redact --exit-code 1
+
+      # The whole tree, never a list of files. A suite that guards one of this
+      # repository's own guards is itself a measuring instrument, and an
       # instrument CI does not run is not protected by requiring this job --
       # which is exactly what an enumerated list produces, silently, the first
-      # time someone adds a suite and forgets this file. `tests/enforced/` is
-      # the convention: land a suite there and it is enforced from that commit.
+      # time someone adds a suite and forgets this file.
+      #
+      # This one command covers BOTH kinds of python suite in the tree. The
+      # self-running scripts -- the ones whose checks execute at import time and
+      # whose exit status is the verdict -- stop themselves under pytest with a
+      # `script suite:` skip, and `tests/conftest.py` turns that marker back
+      # into one real test that runs the file as a script in a subprocess. So
+      # there is no second step here and no list of script files anywhere; see
+      # the comment above `pytest_pycollect_makemodule` in that file.
+      #
+      # The `live suite:` gate is the counterpart: two modules drive a real paid
+      # `claude -p` AT IMPORT TIME, so merely collecting them starts billable
+      # calls. They stay skipped here and are run deliberately by
+      # `tests/smoke.sh`, which discovers them. That is not a weakening of those
+      # suites -- it is the only way `pytest tests` can be safe to run at all.
+      #
+      # What is NOT run, and why. Two whole-file `--ignore`s, and five single
+      # cases held out with `--deselect` rather than `--ignore` on purpose: a
+      # file-level exclusion would have taken 126 passing assertions out of the
+      # gate along with the five, which is how coverage quietly evaporates.
+      #
+      # These are exclusions of things that cannot run here or are known-red,
+      # NOT an inclusion list. A suite added tomorrow is picked up with no edit
+      # to this file, which is the property that matters.
+      #
+      # Of the five single cases, FOUR are tests that are correctly reporting a
+      # real problem in shipped code or config. They are held out because this
+      # change is not authorized to alter that code, not because they are
+      # wrong. Fix the underlying defect and the deselect line goes away:
+      #
+      #   fail_open_paths::...no_policy_or_state_override
+      #     `runtime/mcp-servers.json` has no `egress-guard` entry, so the
+      #     egress guard sits on disk unregistered. Removed by 658e7ce
+      #     ("feat(scope): worktrees ... join the session automatically"), whose
+      #     message does not mention it, hours after 314ee61 deliberately
+      #     restored it, and no later commit retires it. The test is right.
+      #   aggregator_recall...::a_probe_file_with_no_permissions...
+      #     `runtime/hooks/aggregator-recall-health.py` cuts probe stderr to
+      #     `[:200]`, and the reason sits at the TAIL, so on a long
+      #     nix-store-plus-tmp path `[Errno 13] Permission denied` is truncated
+      #     to `Perm`. Whether this passes depends on path length, which is no
+      #     basis for a gate in either direction.
+      #   harness_runtime_dirs_ignored::every_exclusion_is_ignored
+      #     No `.gitignore` rule covers `remote-control` -- a genuine gap. But
+      #     ~/.claude is no longer a git checkout at all, so whether this suite
+      #     still guards anything live is itself the open question.
+      #   git_broker::real_policy_reaches_claude_and_nixos_worktree_roots
+      #     Asserts `/home/jonathan/.claude` is a `repositoryRoot`. It is not,
+      #     deliberately: 5580ea9 is literally "drop the dead ~/.claude entries
+      #     from the allowlists". The test also uses that path as its exemplar
+      #     for protected-primary behaviour, so repairing it means choosing a
+      #     new exemplar -- a security-semantics decision, not a path swap. The
+      #     invariant itself is already covered by
+      #     tests/enforced/test_git_broker_protects_config_checkout.py, which
+      #     reasons about the cutover explicitly, so nothing is uncovered here.
+      #   ai-router/test_jobs::quota_failure_writes_rejected_and_retries_once
+      #     A time bomb, not a flake: the stub's quota reset time is now in the
+      #     past, so the router correctly treats the bucket as reset. The runner
+      #     subprocess reads `time.time()` directly, so fixing it needs either a
+      #     clock override in production code or a relative-time stub fixture.
+      #
+      # And the two whole-file exclusions:
+      #
+      #   tests/agent-e2e          Scenarios dispatch REAL headless agents and
+      #                            cost real money per run. It holds no
+      #                            pytest-collectible file today, so this is
+      #                            belt and braces against one arriving.
+      #   test_arftl_gate_cascade  All nine cases fail: they extract a bash
+      #                            cascade that 66dfae5 ("compact ARTL
+      #                            close-out review") deleted from the skill
+      #                            along with ~1300 other lines. Red since well
+      #                            before the cutover, now guarding something
+      #                            that does not exist. Pending a decision on
+      #                            whether the cascade returns. NOT a path
+      #                            repair.
       - name: The guards still detect what they are for
         run: |
           python3 -m pip install --disable-pip-version-check --quiet 'pytest>=8,<9'
-          python3 -m pytest tests/enforced -q
+          python3 -m pytest tests -q \
+            --ignore=tests/agent-e2e \
+            --ignore=tests/test_arftl_gate_cascade.py \
+            --deselect 'tests/test_fail_open_paths.py::test_registered_server_carries_no_policy_or_state_override' \
+            --deselect 'tests/test_aggregator_recall_health_hook.py::test_a_probe_file_with_no_permissions_is_still_found_and_reported_on' \
+            --deselect 'tests/test_harness_runtime_dirs_ignored.py::HarnessRuntimeIsIgnored::test_every_exclusion_is_ignored' \
+            --deselect 'tests/mcps/git-broker/test_git_broker.py::PolicySchemaTests::test_real_policy_reaches_claude_and_nixos_worktree_roots' \
+            --deselect 'tests/ai-router/test_jobs.py::test_quota_failure_writes_rejected_and_retries_once'
 
-      - name: The master pin holds
-        run: bash tests/test_worktree_policy.sh
+      # Shell suites, by the naming convention already in the tree rather than
+      # by a list. Shell has no collection phase and no skip mechanism, and
+      # some scripts under `tests/` are emphatically not CI work: `smoke.sh`
+      # spends real API money, `live.sh` needs a real API key,
+      # `live-kitty*.sh` need a real terminal emulator,
+      # `mount-geometry-probe.sh` needs the host's bind mounts.
+      #
+      # Those divide cleanly from the hermetic suites by name, and the tree
+      # already observes it: a scenario harness is `test_*.sh` or `*.test.sh`,
+      # while an opt-in live harness is `live*.sh`, `smoke.sh` or `*-probe.sh`.
+      # Globbing the first two patterns therefore picks up exactly the suites
+      # that run against throwaway repositories and temp dirs, and cannot pick
+      # up a live one. Land a suite under either name and it is enforced from
+      # that commit.
+      #
+      # Not `tests/enforced/*.sh`, which was the obvious move and is wrong:
+      # every one of these resolves the repository root as `$0/..`, so
+      # relocating them one directory deeper breaks all eight at once.
+      #
+      # This step previously ran ONE named script. The other seven -- 346
+      # assertions between them, every one against throwaway repositories --
+      # ran nowhere, and five of the seven were broken by the `runtime/`
+      # cutover with nobody to notice. `test_mint_gh_token.sh` additionally
+      # needs `openssl`, which the runner image provides; absent, it exits 2
+      # with a clear message rather than passing vacuously.
+      - name: The enforced shell suites still pass
+        run: |
+          shopt -s nullglob
+          suites=(tests/test_*.sh tests/*.test.sh)
+          # Same refusal as the python partition: an empty glob must not read
+          # as success. This is the exact failure the convention is meant to
+          # remove, so it is checked rather than assumed.
+          if [ ${#suites[@]} -eq 0 ]; then
+            echo "no shell suites matched tests/test_*.sh or tests/*.test.sh --" \
+                 "expected several; the glob or the layout changed" >&2
+            exit 1
+          fi
+          rc=0
+          for s in "${suites[@]}"; do
+            echo "::group::$s"
+            if bash "$s"; then echo "ok   $s"; else echo "FAIL $s"; rc=1; fi
+            echo "::endgroup::"
+          done
+          exit $rc
