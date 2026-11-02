@@ -350,29 +350,6 @@ jobs:
             /tmp/agent-e2e/skill-description-audit \
             --expect "candidate=$RUNS"
 
-      # TEMPORARY, delete once the lane has been green once. A verdict file
-      # says what the grader concluded, never why the agent behaved as it did,
-      # and every failure so far has been runner-only -- a sandbox mount, a
-      # permission layout -- so a round trip costs ten minutes each time.
-      # `setup.sh` writes nothing at all and the transcript is deliberately
-      # not among these. `commands.txt` is: a command naming a plant's PATH is
-      # the finding we want to read, and the planted values are synthetic and
-      # minted per run, so a log cannot expose anything real.
-      - name: Why the agent exited
-        if: always() && steps.measure.conclusion != 'skipped'
-        run: |
-          for run in /tmp/agent-e2e/skill-description-audit/*/*/; do
-            echo "=== ${run}"
-            echo "--- setup.log"
-            tail -n 20 "${run}setup.log" 2>/dev/null || echo "(none)"
-            echo "--- stderr.txt"
-            tail -n 40 "${run}stderr.txt" 2>/dev/null || echo "(none)"
-            echo "--- check.log"
-            tail -n 30 "${run}check.log" 2>/dev/null || echo "(none)"
-            echo "--- commands the agent issued"
-            tail -n 30 "${run}commands.txt" 2>/dev/null || echo "(none)"
-          done
-
       # Verdicts and the agent's own messages, for diagnosing a red lane. The
       # run directories are not uploaded: they hold the planted credentials and
       # the transcript that may carry one.
