@@ -46,6 +46,18 @@ import tempfile
 import time
 from pathlib import Path
 
+# A script suite, not a pytest module. Every check runs at import time and the
+# file ends in `sys.exit`, so a pytest import would run the whole suite inside
+# collection and then raise SystemExit, which aborts the ENTIRE pytest session
+# with INTERNALERROR. Under pytest the module therefore stops here with a
+# visible skip naming the real invocation. The verdict is this script's exit
+# status; CI runs it as a script.
+if __name__ != "__main__":
+    import pytest
+    pytest.skip("script suite: run `python3 tests/test_claude_pull_health_hook.py` "
+                "(exit 0 = all green); pytest cannot import it",
+                allow_module_level=True)
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 # `runtime/` once the layout migration has landed, the repository root
 # before it. Only the projected subset moves; tests/ stays at the root.

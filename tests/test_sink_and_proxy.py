@@ -15,12 +15,21 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
-from conftest import REPO_ROOT
-from egress_guard.limiter import EgressGuard
-from egress_guard.sink import SinkRegistry, normalize_host
+# Anchored here, not imported from `conftest`: tests/ and tests/ai-router/ both
+# hold a module named `conftest`, and in a whole-tree run `from conftest import`
+# resolves to whichever was imported last. `egress_guard` and bin/ ship under
+# runtime/.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RUNTIME = (os.path.join(REPO_ROOT, "runtime")
+           if os.path.isdir(os.path.join(REPO_ROOT, "runtime")) else REPO_ROOT)
+if RUNTIME not in sys.path:
+    sys.path.insert(0, RUNTIME)
 
-CLI = os.path.join(REPO_ROOT, "bin", "egress-sink")
-LINT = os.path.join(REPO_ROOT, "bin", "lint-direct-egress")
+from egress_guard.limiter import EgressGuard  # noqa: E402
+from egress_guard.sink import SinkRegistry, normalize_host  # noqa: E402
+
+CLI = os.path.join(RUNTIME, "bin", "egress-sink")
+LINT = os.path.join(RUNTIME, "bin", "lint-direct-egress")
 
 
 # -- host normalisation ----------------------------------------------------

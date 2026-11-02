@@ -10,9 +10,20 @@ large one.
 
 from __future__ import annotations
 
+import os
+import sys
+
 import pytest
 
-from egress_guard.limiter import EgressGuard, PreflightRequired, Undeclared
+# `egress_guard` ships under runtime/ since the layout cutover; the shared
+# conftest only puts the repository root on sys.path.
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_RUNTIME = (os.path.join(_REPO, "runtime")
+            if os.path.isdir(os.path.join(_REPO, "runtime")) else _REPO)
+if _RUNTIME not in sys.path:
+    sys.path.insert(0, _RUNTIME)
+
+from egress_guard.limiter import EgressGuard, PreflightRequired, Undeclared  # noqa: E402
 
 
 def guard(state_dir, policy) -> EgressGuard:

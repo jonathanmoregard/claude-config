@@ -35,6 +35,18 @@ import sys
 import tempfile
 import time
 
+# A script suite, not a pytest module. Every check runs at import time and the
+# file ends in `sys.exit`, so a pytest import would run the whole suite inside
+# collection (minutes, even for --collect-only) and then raise SystemExit,
+# which aborts the ENTIRE pytest session with INTERNALERROR. Under pytest the
+# module therefore stops here with a visible skip naming the real invocation.
+# The verdict is this script's exit status; CI runs it as a script.
+if __name__ != "__main__":
+    import pytest
+    pytest.skip("script suite: run `python3 tests/test_bash_guards.py` "
+                "(exit 0 = all green); pytest cannot import it",
+                allow_module_level=True)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
 # The deployed subset moved under runtime/; same fallback idiom as the other

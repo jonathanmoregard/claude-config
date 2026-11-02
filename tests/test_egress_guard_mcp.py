@@ -16,9 +16,16 @@ import time
 
 import pytest
 
-from conftest import REPO_ROOT  # noqa: E402
+# Anchored here, not imported from `conftest`: tests/ and tests/ai-router/ both
+# hold a module named `conftest`, and in a whole-tree run `from conftest import`
+# resolves to whichever was imported last.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-SERVER = os.path.join(REPO_ROOT, "mcps", "egress-guard", "server.py")
+# `runtime/` once the layout migration has landed, the repository root
+# before it. Only the projected subset moves; tests/ stays at the root.
+RUNTIME = os.path.join(REPO_ROOT, "runtime") if os.path.isdir(
+    os.path.join(REPO_ROOT, "runtime")) else REPO_ROOT
+SERVER = os.path.join(RUNTIME, "mcps", "egress-guard", "server.py")
 RESOURCE = "forum.example.test"
 
 
@@ -362,7 +369,7 @@ def test_failing_preflight_is_refused_over_the_wire(state_dir, policy_file):
 
 def test_shipped_policy_file_is_valid_json_and_conservative():
     """The policy that ships with the server must parse and must not be permissive."""
-    path = os.path.join(REPO_ROOT, "mcps", "egress-guard", "egress-policy.json")
+    path = os.path.join(RUNTIME, "mcps", "egress-guard", "egress-policy.json")
     with open(path, "r", encoding="utf-8") as fh:
         doc = json.load(fh)
     defaults = doc["defaults"]

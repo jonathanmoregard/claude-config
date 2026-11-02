@@ -19,9 +19,16 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from conftest import REPO_ROOT
+# Anchored here, not imported from `conftest`: tests/ and tests/ai-router/ both
+# hold a module named `conftest`, and in a whole-tree run `from conftest import`
+# resolves to whichever was imported last.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-HOOK = Path(REPO_ROOT) / "hooks" / "offline-ai-smoke-health.py"
+# The shipped config lives one level down in runtime/ since the runtime cutover;
+# tolerate both layouts, same anchor as the other top-level suites.
+RUNTIME = Path(REPO_ROOT) / "runtime" if (Path(REPO_ROOT) / "runtime").is_dir() else Path(REPO_ROOT)
+
+HOOK = RUNTIME / "hooks" / "offline-ai-smoke-health.py"
 
 
 def _run(tmp_path: Path, state) -> subprocess.CompletedProcess:
@@ -118,7 +125,7 @@ def test_never_passed_but_young_is_silent(tmp_path):
 
 def test_hook_is_registered_once_in_session_start():
     """The registration is the half most likely to be lost in a merge."""
-    settings = json.loads((Path(REPO_ROOT) / "settings.json").read_text())
+    settings = json.loads((RUNTIME / "settings.json").read_text())
     commands = [
         h.get("command", "")
         for entry in settings["hooks"]["SessionStart"]

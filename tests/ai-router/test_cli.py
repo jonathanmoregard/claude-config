@@ -15,6 +15,14 @@ from ai_router import cli, jobs
 
 pytestmark = pytest.mark.usefixtures("stub_providers")
 
+# The clock the CLI decides against. The stub snapshots carry absolute reset
+# times (codex's 98 % weekly bucket resets at 1_789_805_383, 2026-09-19), so
+# deciding against the wall clock made these tests expire: past that instant
+# the bucket has correctly reset and luna becomes eligible. Pinned on the same
+# fixture timeline as test_quota_rejection_supersede.py, per the conftest's
+# "the clock is injected wherever the code under test accepts `now`".
+NOW = 1_789_400_000
+
 
 @pytest.fixture
 def env(state_dir: Path, tmp_path: Path) -> dict[str, str]:
@@ -34,6 +42,7 @@ def prompt(tmp_path: Path) -> Path:
 
 
 def run(capsys, argv: list[str], env: dict[str, str], **kw) -> tuple[int, dict | None, str, str]:
+    kw.setdefault("now", NOW)
     rc = cli.main(argv, env=env, launcher=kw.pop("launcher", "setsid"), **kw)
     cap = capsys.readouterr()
     obj = None

@@ -21,8 +21,15 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
-SCRIPT="$SCRIPT_DIR/scripts/claude-proposals-push.sh"
-PUSH_PROPOSALS="$SCRIPT_DIR/push-proposals.sh"
+# `runtime/` once the layout migration has landed, the repository root before it
+# -- the same fallback the sibling harnesses use. Without it both paths below
+# resolved to files that no longer exist and 34 of 52 cases failed on
+# `claude-proposals-push.sh: No such file or directory`, which reads as the
+# pusher misbehaving rather than as the harness pointing at the wrong tree.
+RUNTIME="$SCRIPT_DIR"
+[ -d "$SCRIPT_DIR/runtime" ] && RUNTIME="$SCRIPT_DIR/runtime"
+SCRIPT="$RUNTIME/scripts/claude-proposals-push.sh"
+PUSH_PROPOSALS="$RUNTIME/push-proposals.sh"
 ROOT=$(mktemp -d)
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 # Per-run state root, so nothing here reads or clobbers the real one under

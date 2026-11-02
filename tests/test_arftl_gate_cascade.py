@@ -16,13 +16,21 @@ cascade said "continue" while the loop ate itself.
 from __future__ import annotations
 
 import os
+import functools
 import re
 import subprocess
 import tempfile
 
-from conftest import REPO_ROOT
+# Anchored here, not imported from `conftest`: tests/ and tests/ai-router/ both
+# hold a module named `conftest`, and in a whole-tree run `from conftest import`
+# resolves to whichever was imported last.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-SKILL = os.path.join(REPO_ROOT, "skills", "advice-refine-test-loop", "SKILL.md")
+# `runtime/` once the layout migration has landed, the repository root
+# before it. Only the projected subset moves; tests/ stays at the root.
+RUNTIME = os.path.join(REPO_ROOT, "runtime") if os.path.isdir(
+    os.path.join(REPO_ROOT, "runtime")) else REPO_ROOT
+SKILL = os.path.join(RUNTIME, "skills", "advice-refine-test-loop", "SKILL.md")
 
 # The six variables the cascade reads. `selfinflicted_r` / `selfinflicted_prev`
 # are strings because "null" (attribution unavailable) is a legal value.
@@ -63,6 +71,7 @@ def extract_cascade() -> str:
     return body
 
 
+@functools.lru_cache(maxsize=None)
 def make_script() -> str:
     path = os.path.join(tempfile.mkdtemp(), "gate.sh")
     with open(path, "w", encoding="utf-8") as fh:
@@ -70,12 +79,13 @@ def make_script() -> str:
     return path
 
 
-SCRIPT = make_script()
+# Built on first use, not at import: a missing cascade must fail the tests that
+# need it, not abort collection of the whole tree.
 
 
 def gate(new_r, repro_r, regressed_r, selfinflicted_r="null", selfinflicted_prev="null", n=3):
     r = subprocess.run(
-        ["bash", SCRIPT, str(new_r), str(repro_r), str(regressed_r),
+        ["bash", make_script(), str(new_r), str(repro_r), str(regressed_r),
          str(selfinflicted_r), str(selfinflicted_prev), str(n)],
         capture_output=True, text=True, check=True,
     )
@@ -142,7 +152,7 @@ for new_r in 0 1 2 3 4 5; do
    for self in null 0 1 2 3; do
     for prev in null 0 1 2; do
      for n in 1 8; do
-       out=$(bash {SCRIPT} "$new_r" "$repro_r" "$regressed_r" "$self" "$prev" "$n")
+       out=$(bash {make_script()} "$new_r" "$repro_r" "$regressed_r" "$self" "$prev" "$n")
        case "$out" in
          {'|'.join(sorted(VALID_STOPS))}) ;;
          *) echo "UNCLASSIFIED $new_r $repro_r $regressed_r $self $prev $n -> $out" ;;

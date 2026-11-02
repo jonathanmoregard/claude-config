@@ -17,7 +17,10 @@ import sys
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-HARNESS = ROOT / "scripts/agent-e2e/agent_e2e.py"
+# `runtime/` once the layout migration has landed, the repository root
+# before it. Only the projected subset moves; tests/ stays at the root.
+RUNTIME = ROOT / "runtime" if (ROOT / "runtime").is_dir() else ROOT
+HARNESS = RUNTIME / "scripts/agent-e2e/agent_e2e.py"
 SCENARIOS = ROOT / "tests/agent-e2e"
 
 

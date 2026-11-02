@@ -35,9 +35,18 @@ from pathlib import Path
 
 import pytest
 
-from conftest import REPO_ROOT
+# Defined here rather than imported from `conftest`: two directories in this
+# tree hold a module by that name, and in a whole-tree run
+# `from conftest import REPO_ROOT` resolves against tests/ai-router/conftest.py
+# and dies with an ImportError that aborts collection for the entire run. The
+# suite passed standalone the whole time, which is what hid it.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-HOOK = Path(REPO_ROOT) / "hooks" / "aggregator-recall-health.py"
+# The shipped config lives one level down in runtime/ since the runtime cutover;
+# tolerate both layouts, same anchor as the other top-level suites.
+RUNTIME = Path(REPO_ROOT) / "runtime" if (Path(REPO_ROOT) / "runtime").is_dir() else Path(REPO_ROOT)
+
+HOOK = RUNTIME / "hooks" / "aggregator-recall-health.py"
 
 # The probe the hook drives. It ships in the aggregator repo, beside the schema
 # it describes, so a schema bump and the check that understands it move in one
@@ -238,7 +247,7 @@ def test_hook_is_registered_and_enforcing():
     a merge — the hook file would survive review while the thing that runs it
     quietly did not.
     """
-    settings = json.loads((Path(REPO_ROOT) / "settings.json").read_text())
+    settings = json.loads((RUNTIME / "settings.json").read_text())
     commands = [
         h.get("command", "")
         for entry in settings["hooks"]["SessionStart"]
