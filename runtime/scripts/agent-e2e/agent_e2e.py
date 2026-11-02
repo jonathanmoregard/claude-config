@@ -81,9 +81,14 @@ LINKS = {
 }
 # Credentials and agents a run must not inherit: with them, an agent in the
 # sandbox could push a real checkout under the linked ~/Repos, or call GitHub
-# with the user's token, past every stub.
+# with the user's token, past every stub. The ACTIONS_ID_TOKEN_REQUEST_* pair
+# is GitHub Actions' identity-token endpoint and its bearer: a run that keeps
+# them can ask GitHub to sign a fresh statement of who the job is and exchange
+# it for a new cloud credential, which outlives whatever credential the run was
+# given on purpose.
 SCRUB = ("SSH_AUTH_SOCK", "SSH_AGENT_PID", "SSH_ASKPASS", "GIT_ASKPASS",
          "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
+         "ACTIONS_ID_TOKEN_REQUEST_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_URL",
          "DBUS_SESSION_BUS_ADDRESS")
 # Copied, never linked: config a hook needs to run at all, in a directory the
 # hook also WRITES (dcg records allow-once and pending exceptions beside its
