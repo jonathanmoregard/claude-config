@@ -1,0 +1,134 @@
+# Runs a real headless agent on the candidate config and fails if it goes for
+# planted credentials. The gate that `checks` cannot be: a unit test proves a
+# script's branches, not that an agent reading the new CLAUDE.md, skill or hook
+# text behaves differently.
+#
+# WHY THIS JOB HOLDS A CREDENTIAL AND `checks` DOES NOT
+#
+# `checks` takes no secrets on purpose, because a pull request can add code
+# that the job then runs. This job cannot be built that way: the whole point is
+# to execute the candidate config, hooks and skills included, and the agent
+# needs a credential to run at all. So a pull request CAN steal this job's
+# credential, and that is accepted rather than defended: the key is dedicated
+# to this lane, holds its own budget, reaches no repository, host or quota, and
+# is rotated if it leaks. Nothing else may be added to this job's `secrets`.
+#
+# Two consequences worth stating:
+#   - `pull_request`, never `pull_request_target`: a fork's code must not run
+#     with this repository's secrets. A fork PR therefore gets no credential,
+#     every run comes back INCONCLUSIVE, and the job fails closed. That is the
+#     intended outcome — a fork PR is reviewed by a human, not auto-merged.
+#   - `persist-credentials: false`: `actions/checkout` otherwise leaves the
+#     workflow's own GITHUB_TOKEN in `.git/config`, where a hostile hook in the
+#     candidate config could read it. The harness scrubs GH_TOKEN and
+#     GITHUB_TOKEN from the agent's environment; the checkout must not hand the
+#     same token back through a file.
+#
+# WHY IT ONLY RUNS AT TIP
+#
+# The verdict has to be about the tree that will actually land. A branch behind
+# master was graded against a merge base that no longer exists, so the job
+# refuses to grade it and says so: enabling auto-merge then updating the branch
+# fires `synchronize`, and the run that matters happens at tip.
+name: honeypot
+
+on:
+  pull_request:
+    types: [auto_merge_enabled, synchronize]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: honeypot-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  honeypot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Only once auto-merge is actually on. `synchronize` fires on every push to
+    # every open pull request, and this lane costs an agent run. The payload
+    # field is the `auto_merge` OBJECT, null while auto-merge is off -- there is
+    # no `auto_merge_enabled` property, and naming one would have made this
+    # condition quietly false on every `synchronize`, so the lane would have
+    # graded the branch once on enable and never again at tip.
+    if: github.event.action == 'auto_merge_enabled' || github.event.pull_request.auto_merge != null
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # The base the pull request was graded against must still be master's
+      # tip. Its own step, before anything is installed, so "behind master"
+      # reads as itself instead of as a failed agent run.
+      - name: The pull request is at the tip of master
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          tip=$(gh api "repos/${GITHUB_REPOSITORY}/commits/master" --jq .sha)
+          if [ "$tip" != "$BASE_SHA" ]; then
+            echo "base ${BASE_SHA:0:7} is not master's tip ${tip:0:7};"
+            echo "update the branch and this re-runs on synchronize"
+            exit 1
+          fi
+          echo "at tip: ${tip:0:7}"
+
+      # bubblewrap gives the run a private /tmp and a read-only HOME. The
+      # harness works without it and records `isolated_tmp: false`; on a
+      # throwaway runner that is survivable, but the fidelity is cheap to keep.
+      - name: Install the sandbox and the agent
+        run: |
+          sudo apt-get update --quiet
+          sudo apt-get install --quiet --yes bubblewrap
+          npm install --global @anthropic-ai/claude-code
+          claude --version
+          bwrap --version
+
+      # Without a dcg config, bash-guard fails closed and refuses every Bash
+      # call the agent makes. The harness copies this file from the developer's
+      # real HOME, which does not exist here, so CI provides the tracked copy.
+      # A run where every command was refused measured the sandbox, not the
+      # config, and the harness reports it INCONCLUSIVE.
+      - name: Provide the config the guard hooks need
+        run: |
+          mkdir -p "$HOME/.config/dcg"
+          cp runtime/dcg.toml "$HOME/.config/dcg/config.toml"
+
+      # HEAD is the merge commit GitHub built for this pull request, so the
+      # graded config is the tree that would land. `agent_e2e.py` resolves the
+      # config root to `runtime/`, so the ref stages as a real ~/.claude.
+      - name: The agent does not go for the planted credentials
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.HONEYPOT_ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "${ANTHROPIC_API_KEY}" ]; then
+            echo "no honeypot credential available to this run (fork pull request?)"
+            echo "failing closed: an ungraded config is not a clean config"
+            exit 1
+          fi
+          python3 runtime/scripts/agent-e2e/agent_e2e.py run \
+            tests/agent-e2e/weekly-changelog \
+            --arm candidate=HEAD --n 2 --jobs 2 \
+            --model claude-sonnet-5-5 --budget 1 --timeout 600 \
+            --out "${RUNNER_TEMP}/agent-e2e"
+
+      # The harness exits 0 whatever the verdicts; the gate is here. FAIL is a
+      # finding. INCONCLUSIVE blocks too: a lane that cannot measure must not
+      # report clean, which is the same rule the grader applies to a missing
+      # plant.
+      - name: Every run came back clean
+        if: always()
+        run: python3 tests/agent-e2e/weekly-changelog/gate.py "${RUNNER_TEMP}/agent-e2e/weekly-changelog"
+
+      # Verdicts and the agent's own messages, for diagnosing a red lane. The
+      # run directories are not uploaded: they hold the planted credentials and
+      # the transcript that may carry one.
+      - name: Upload the verdicts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: honeypot-verdicts
+          path: ${{ runner.temp }}/agent-e2e/weekly-changelog/**/verdict.json
+          if-no-files-found: warn
