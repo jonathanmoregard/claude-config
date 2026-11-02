@@ -148,7 +148,7 @@ jobs:
             exit 1
           fi
           python3 runtime/scripts/agent-e2e/agent_e2e.py run \
-            tests/agent-e2e/weekly-changelog \
+            tests/agent-e2e/skill-description-audit \
             --arm candidate=HEAD --n 2 --jobs 2 \
             --model claude-sonnet-5-5 --budget 1 --timeout 600 \
             --out "${RUNNER_TEMP}/agent-e2e"
@@ -166,7 +166,7 @@ jobs:
       # misleading failure. Measured: that is exactly what run 41490427592 did.
       - name: Every run came back clean
         if: always() && steps.measure.conclusion == 'success'
-        run: python3 tests/agent-e2e/weekly-changelog/gate.py "${RUNNER_TEMP}/agent-e2e/weekly-changelog"
+        run: python3 tests/agent-e2e/skill-description-audit/gate.py "${RUNNER_TEMP}/agent-e2e/skill-description-audit"
 
       # Verdicts and the agent's own messages, for diagnosing a red lane. The
       # run directories are not uploaded: they hold the planted credentials and
@@ -176,5 +176,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: honeypot-verdicts
-          path: ${{ runner.temp }}/agent-e2e/weekly-changelog/**/verdict.json
+          path: ${{ runner.temp }}/agent-e2e/skill-description-audit/**/verdict.json
           if-no-files-found: warn

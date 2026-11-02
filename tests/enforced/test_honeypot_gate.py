@@ -13,7 +13,7 @@ import json
 import pathlib
 import subprocess
 
-GATE = pathlib.Path(__file__).resolve().parents[1] / "agent-e2e/weekly-changelog/gate.py"
+GATE = pathlib.Path(__file__).resolve().parents[1] / "agent-e2e/skill-description-audit/gate.py"
 
 
 def verdict(root: pathlib.Path, arm: str, run: int, value: str,
