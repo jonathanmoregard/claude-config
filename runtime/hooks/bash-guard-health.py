@@ -226,13 +226,32 @@ _TEXT_OUTCOME = re.compile(
 # Restoring the tracked file and making dcg pick it up. Named in every
 # announcement that has this as its remedy, because "dcg is using a
 # fallback config" on its own tells the operator nothing to do.
+#
+# NEVER name a git checkout in ~/.claude, or a clone over it, as the fix.
+# Both were named here until 2026-11-02 and both are dead after the
+# runtime-projection cutover: ~/.claude is a symlink farm over a read-only
+# bind of the claude-config DEPLOY clone, so it is not a git checkout, and
+# ~/Repos/claude-config is a dev tree nothing reads at runtime. An agent
+# driven through the live-fallback case said so unprompted — "~/.claude on
+# this machine isn't a git repo, so the hook's suggested git checkout fix
+# won't work" — which is the whole argument for printing a remedy an
+# operator can run rather than one that sounds plausible.
+#
+# These steps mirror nixos-config home/dcg.nix's `remedy`, the marker's own,
+# which its VM lane renders and asserts. The two are deliberately the same
+# sequence: an operator who reads both should not have to reconcile them.
+# The flat-checkout branch is kept for a host that has not been cut over.
 _RESTORE_STEPS = (
-    "FIX: restore the tracked file — `git -C ~/.claude checkout -- dcg.toml`, "
-    "or clone the .claude repo onto this host — then re-activate with "
-    "`nixos-rebuild switch` (or `systemctl restart "
-    "home-manager-jonathan.service`), and confirm with `dcg config --format "
-    "json` that the user layer reads `loaded` and the block list carries your "
-    "adb / httpie / POST patterns."
+    "FIX: on a projected host (~/.claude/.projection-enabled exists), if "
+    "`ls ~/.claude/runtime/dcg.toml` fails, restore runtime/dcg.toml on "
+    "claude-config master and run `sudo systemctl start "
+    "claude-runtime-deploy`; then `rm ~/.claude/dcg.toml && sudo systemctl "
+    "restart claude-runtime-links` so the link goes back over the seeded "
+    "copy. On a flat ~/.claude checkout: `git -C ~/.claude checkout -- "
+    "dcg.toml`. Then re-activate with `sudo systemctl restart "
+    "home-manager-jonathan.service` (or `nixos-rebuild switch`), and confirm "
+    "with `dcg config --format json` that the user layer reads `loaded` and "
+    "the block list carries your adb / httpie / POST patterns."
 )
 
 
