@@ -369,8 +369,15 @@ def run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
         # included) and ~/.ssh is hidden; only the run, the shared log dir and
         # the credentials file (token refresh) stay writable.
         creds = REAL_HOME / ".claude/.credentials.json"
-        home_guard = ["--ro-bind", str(REAL_HOME), str(REAL_HOME),
-                      "--tmpfs", str(REAL_HOME / ".ssh")]
+        home_guard = ["--ro-bind", str(REAL_HOME), str(REAL_HOME)]
+        # Hiding ~/.ssh only when there is one. bwrap creates a mount point
+        # before mounting, and the read-only bind above makes that mkdir fail
+        # on a host without the directory -- a CI runner -- taking down every
+        # run with "Can't mkdir: Read-only file system". Nothing is left
+        # unguarded by skipping it: that same read-only bind means no ~/.ssh
+        # can appear during the run either.
+        if (REAL_HOME / ".ssh").is_dir():
+            home_guard += ["--tmpfs", str(REAL_HOME / ".ssh")]
         if creds.is_file():
             home_guard += ["--bind", str(creds), str(creds)]
         argv = [bwrap, "--dev-bind", "/", "/", *home_guard, "--tmpfs", "/tmp",
