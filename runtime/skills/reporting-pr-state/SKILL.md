@@ -37,6 +37,8 @@ gh pr list --repo <owner>/<repo> --state all \
 
 The `pr-state-guard` Stop hook queries every PR linked in a final reply and sends the reply back when it presents a MERGED or CLOSED PR as open or awaiting action. It is a backstop that fires after the mistake is written; the query above is what prevents it.
 
+The same hook also sends back a merge or review ask that names a PR as a bare `#41` with no `/pull/41` URL anywhere in the reply, and names the numbers that need linking. A number is not a link, and neither is `owner/repo#41`.
+
 ## The UNKNOWN Trap
 
 `mergeable` / `mergeStateStatus` return `UNKNOWN` for **two unrelated reasons**:
