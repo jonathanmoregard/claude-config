@@ -18,6 +18,10 @@ Layers, in order:
      ``echo``/``printf``, so its completion notice always reads exit code 0
   4. the nixos-config push gate (``Pre-push checklist:`` trailer, with its
      claim-vs-diff and merge-base cross-checks)
+  4b. foreground hand-rolled waits: ``sleep`` plus a CI/unit status snapshot
+     (``_check_ci_poll``), then ``sleep`` in a wait loop or next to a read of
+     local state (``_check_local_poll``) — the background form is allowed.
+     The one FAIL-OPEN layer: a heuristic about style, not safety
   5. allow — by emitting NOTHING
 
 Layer 5 is silent on purpose. ``PreToolUse`` fires BEFORE the permission
@@ -2416,6 +2420,257 @@ def _check_ci_poll(command: str, background: bool) -> str | None:
     return _CI_POLL_HINT if has_sleep and has_snapshot else None
 
 
+# ----------------------------------------------------------------------
+# Layer 5b: foreground waits on LOCAL state
+# ----------------------------------------------------------------------
+# The same hand-rolled wait, aimed at a log, a marker file or a process
+# instead of CI: `until grep -q DONE log; do sleep 15; done`, `sleep 60; tail
+# log`. Live 2026-11-02: a worker-hard subagent waited out its own job that
+# way, in the foreground. The sanctioned shape is the identical loop with
+# run_in_background: true, which exits once and re-invokes the session, so
+# only the foreground form is denied.
+#
+# Matching is structural, not a list of spellings: denying one spelling just
+# renames the symptom (anthropics/claude-code#77873). So a sleep inside ANY
+# while/until loop counts, as does a sleep inside a for loop that breaks or
+# reads state, and a long sleep next to any local status read. What stays
+# allowed is what is not a wait: a settle of <= _UNIT_SETTLE_S before one look,
+# a for loop provably bounded to <= _LOCAL_RETRY_S (a short retry), a pause
+# between items of an iteration (`for x in …; do act; sleep 1; done`, `while
+# read …`), and the shape quoted as data.
+#
+# The deny reason carries the replacement, because the reason text is what
+# redirects the model; prompt text alone was reported not to hold (#77873,
+# #44957). Subagents are told explicitly that ending the turn does not end
+# their task — they were re-invoked by their own background command's exit in
+# the 2026-11-02 klaffat session. Except under headless `claude -p`, where
+# that is false for a subagent; see `_local_poll_applies`.
+_LOCAL_POLL_HINT = (
+    "bash-guard: foreground wait denied — this command sleeps in a loop, or "
+    "sleeps and then reads a log, file or process, to wait for local work. A "
+    "foreground wait holds your turn and usually returns \"not yet\", so it "
+    "gets repeated.\n"
+    "Instead, run the wait ONCE with Bash run_in_background: true — an "
+    "until-loop that exits when the work is done, for example:\n"
+    "  until grep -q DONE job.log; do sleep 5; done; tail -20 job.log\n"
+    "(or start the job itself with run_in_background: true; Monitor follows a "
+    "stream line by line) — then end your turn. You are re-invoked when the "
+    "background command exits. Ending your turn does not end a subagent's "
+    "task: a subagent is re-invoked by its own background command the same "
+    "way. Do not poll the output file, and do not background a bare `sleep` "
+    "as a timer (each one wakes you).\n"
+    "Allowed in the foreground: a single look without sleep, and a settle of "
+    f"<= {_UNIT_SETTLE_S}s before one look."
+)
+
+# Heads that only LOOK at local state: a log, a marker file, a process, a
+# worktree. `X status …` covers job runners (`ai-router status <id>`).
+_LOCAL_READ_HEADS = frozenset({
+    "tail", "cat", "head", "less", "grep", "egrep", "fgrep", "rg", "jq",
+    "test", "[", "[[", "ls", "stat", "wc", "du", "pgrep", "pidof", "ps",
+})
+_GIT_READ_VERBS = frozenset({"status", "log", "show", "diff", "rev-parse"})
+# Heads that do nothing a wait could be "for": `sleep 300 && echo waited`.
+_NOOP_HEADS = frozenset({"echo", "printf", "true", ":", "date"})
+_STRUCTURE_HEADS = frozenset({"break", "fi", "esac", "}", ")"})
+_SHELL_C_HEADS = frozenset({"bash", "sh", "zsh", "dash"})
+_LAUNCH_HEADS = frozenset({"systemd-run", "nohup", "setsid"})
+# A bounded for-loop retry this short is a settle, not a wait. Right after the
+# same command starts its target, the bound is the Bash foreground timeout
+# (120 s): such a call cannot hold the turn past it and is never re-issued as
+# a poll — `systemctl restart x && for i in $(seq 60); do curl …/health &&
+# break; sleep 1; done`. An unbounded while/until stays a wait either way.
+_LOCAL_RETRY_S = 30
+_LAUNCH_SETTLE_S = 120
+_MAX_LOCAL_UNITS = 16
+
+
+def _strip_wrappers(toks: list[str]) -> list[str]:
+    """Drop what hides the real head word: a `(` glued to it, a case-arm
+    pattern (`*running*) sleep 30`), and a `timeout [-k 5] 600` prefix."""
+    if toks and toks[0].startswith("(") and toks[0] != "(":
+        toks = [toks[0].lstrip("("), *toks[1:]]
+    if toks[:1] == ["case"] and "in" in toks:  # `case "$s" in *running*) sleep 30`
+        arm = toks[toks.index("in") + 1 :]
+        if len(arm) > 1 and arm[0].endswith(")"):
+            toks = arm[1:]
+    elif len(toks) > 1 and toks[0].endswith(")") and "(" not in toks[0]:
+        toks = toks[1:]
+    if toks and toks[0] == "timeout":
+        i = 1
+        while i < len(toks) and toks[i].startswith("-"):
+            i += 2 if toks[i] in ("-k", "-s", "--kill-after", "--signal") else 1
+        toks = toks[i + 1 :]
+    return toks
+
+
+def _is_local_read(toks: list[str]) -> bool:
+    if not toks:
+        return False
+    if toks[0] == "kill" and "-0" in toks:
+        return True
+    if toks[0] in ("cat", "tee") and any(t.startswith(">") for t in toks):
+        return False  # `cat > f <<EOF` writes
+    if toks[0] == "git":
+        i = 1
+        while i < len(toks) and toks[i].startswith("-"):
+            i += 2 if toks[i] in ("-C", "-c") else 1
+        return i < len(toks) and toks[i] in _GIT_READ_VERBS
+    return toks[0] in _LOCAL_READ_HEADS or toks[1:2] == ["status"]
+
+
+def _for_iterations(seg: str) -> tuple[float, bool]:
+    """(how many times `for VAR in WORDS` runs, or inf when not provable;
+    whether WORDS is a counter rather than a list of items)."""
+    m = re.match(r"\s*for\s+\w+\s+in\s+(.*)$", seg, re.S)
+    if not m:
+        return float("inf"), False
+    words = m.group(1).strip()
+    # `seq LAST` / `seq FIRST LAST` / `seq FIRST INCREMENT LAST`
+    seq = re.fullmatch(r"\$\(\s*seq\s+(?:(\d+)\s+)?(?:(\d+)\s+)?(\d+)\s*\)", words)
+    if seq:
+        lo, inc, hi = int(seq.group(1) or 1), int(seq.group(2) or 1), int(seq.group(3))
+        return max(0, (hi - lo) // max(inc, 1) + 1), True
+    brace = re.fullmatch(r"\{(\d+)\.\.(\d+)\}", words)
+    if brace:
+        return abs(int(brace.group(2)) - int(brace.group(1))) + 1, True
+    if re.search(r"[$`*?\[{]", words):
+        return float("inf"), False
+    try:
+        items = shlex.split(words)
+    except ValueError:
+        return float("inf"), False
+    # `1 2 3 … 8` counts tries; `11 12 13` (PR numbers) or file names are items.
+    counter = bool(items) and all(w.isdigit() for w in items) and int(items[0]) in (0, 1) and all(
+        int(b) == int(a) + 1 for a, b in zip(items, items[1:])
+    )
+    return len(items), counter
+
+
+def _local_units(command: str) -> list[str]:
+    """The shell texts one command runs: itself with heredoc bodies removed,
+    its command substitutions, and `bash -c '…'` bodies, recursively."""
+    shell_text, live_bodies = _split_heredocs(command)
+    units = [shell_text]
+    for src in (_mask_single_quotes(shell_text), *live_bodies):
+        units.extend(_command_substitutions(src))
+    i = 0
+    while i < len(units) and len(units) < _MAX_LOCAL_UNITS:
+        for seg in _pipeline_subcommands(units[i]):
+            toks = _strip_wrappers(_segment_tokens(seg))
+            if toks and toks[0] in _SHELL_C_HEADS and "-c" in toks[:-1]:
+                units.append(toks[toks.index("-c") + 1])
+        i += 1
+    return units
+
+
+def _launches(unit: str) -> bool:
+    """Whether this shell text starts something it could then wait for: a
+    `cmd &` job (not `2>&1` / `&>`), `systemd-run`, `nohup`, a unit start."""
+    parts = _split_operators(unit)
+    for idx, (seg, op) in enumerate(parts):
+        nxt = parts[idx + 1][0] if idx + 1 < len(parts) else ""
+        if op == "&" and seg and not seg.endswith((">", "<")) and not nxt.startswith(">"):
+            return True
+        toks = _strip_wrappers(_segment_tokens(seg))
+        if toks and (toks[0] in _LAUNCH_HEADS or (
+            _systemctl_verb(toks) in _UNIT_ACTION_VERBS and _systemctl_verb(toks) != "stop"
+        )):
+            return True
+    return False
+
+
+def _is_wait_loop(loop: dict, launched: bool) -> bool:
+    """A loop holding a sleep waits for something unless it is a short bounded
+    retry or walks a list of items with a pause between them."""
+    budget = _LAUNCH_SETTLE_S if launched else _LOCAL_RETRY_S
+    if loop["kind"] == "for" and loop["count"] * loop["sleep"] <= budget:
+        return False
+    if loop["kind"] == "for" and not loop["counter"]:
+        return loop["break"] or loop["read"]
+    if loop["kind"] == "while" and loop["reads_lines"]:
+        return loop["break"]
+    return True
+
+
+def _local_poll_applies(payload: dict, entrypoint: str | None) -> bool:
+    """Whether the deny's promise — "end your turn, you are re-invoked" — holds.
+
+    It does for the main session (interactive or headless: `claude -p` stays
+    open while main-conversation background commands run) and for an
+    interactive subagent (re-invoked by its own background command; 112 of
+    119 parked subagents in real transcripts were). It does NOT for a subagent
+    under headless `claude -p` (CLAUDE_CODE_ENTRYPOINT=sdk-cli): that process
+    exits once the main conversation is idle and kills subagent-owned
+    background commands (agent e2e, 2026-11-02). Denying a foreground wait
+    there would strand the job, so the layer stays silent.
+    """
+    if not payload.get("agent_id"):
+        return True
+    return (entrypoint or "cli") == "cli"
+
+
+def _check_local_poll(command: str, background: bool) -> str | None:
+    if background:
+        return None
+    units = _local_units(command)
+    launched = any(_launches(u) for u in units)
+    free_sleep = 0.0
+    # Work only excuses a long sleep when it comes AFTER it ("wait, then
+    # act"); a note written first does not turn the timer after it into work.
+    has_read = work_after_sleep = False
+    for unit in units:
+        loops: list[dict] = []
+        unit_sleep = 0.0  # order is only known inside one shell text
+        for seg in _pipeline_subcommands(unit):
+            try:
+                raw = shlex.split(seg)
+            except ValueError:
+                raw = seg.split()
+            if raw and raw[0] in _LOOP_KEYWORDS:
+                count, counter = _for_iterations(seg) if raw[0] == "for" else (float("inf"), False)
+                cond = _strip_wrappers(_segment_tokens(seg))
+                loops.append({
+                    "kind": raw[0], "sleep": 0.0, "break": False, "read": False,
+                    "count": count, "counter": counter,
+                    "reads_lines": raw[0] == "while" and cond[:1] == ["read"],
+                })
+                if raw[0] == "for":
+                    continue  # its word list is data, not a command
+            elif raw[:1] == ["done"]:
+                loop = loops.pop() if loops else None
+                if loop and loop["sleep"] and _is_wait_loop(loop, launched):
+                    return _LOCAL_POLL_HINT
+                continue
+            toks = _strip_wrappers(_segment_tokens(seg))
+            if not toks or toks[0].startswith("#"):
+                continue
+            loop = loops[-1] if loops else None
+            if toks[0] == "sleep":
+                # `(printf …; sleep 2) | srv`: the `)` closes the subshell.
+                secs = _sleep_seconds([t.rstrip(")") for t in toks])
+                if loop is not None:
+                    loop["sleep"] += secs
+                else:
+                    unit_sleep = max(unit_sleep, secs)
+                    free_sleep = max(free_sleep, secs)
+                continue
+            if toks[0] in ("break", "exit", "return") and loop is not None:
+                loop["break"] = True
+            if _is_local_read(toks):
+                has_read = True
+                if loop is not None:
+                    loop["read"] = True
+            elif toks[0] not in _NOOP_HEADS and toks[0] not in _STRUCTURE_HEADS and toks[0] != "cd":
+                work_after_sleep = work_after_sleep or unit_sleep > _UNIT_SETTLE_S
+        # An unterminated loop (a truncated command) is judged as written.
+        if any(lp["sleep"] and _is_wait_loop(lp, launched) for lp in loops):
+            return _LOCAL_POLL_HINT
+    if free_sleep > _UNIT_SETTLE_S and (has_read or not work_after_sleep):
+        return _LOCAL_POLL_HINT
+    return None
+
+
 _REDACTION_MARKER_HINT = (
     "bash-guard: this command contains a redaction marker. A marker stands in "
     "for a secret you were never shown; the real value is still on disk, and "
@@ -2498,6 +2753,16 @@ def main() -> int:
             reason = "bash-guard: " + reason
     if reason is None:
         reason = _check_ci_poll(command, tool_input.get("run_in_background") is True)
+    if reason is None:
+        # After the CI layer, so a CI poll keeps its more specific wait-for hint.
+        # Fail-open, unlike the rest of this file: it judges how to wait, not
+        # whether a command is safe, so its own parse bug must not become the
+        # guard's deny-everything.
+        try:
+            if _local_poll_applies(payload, os.environ.get("CLAUDE_CODE_ENTRYPOINT")):
+                reason = _check_local_poll(command, tool_input.get("run_in_background") is True)
+        except Exception:  # noqa: BLE001
+            reason = None
     if reason is None:
         reason = _check_redaction_marker(command)
 
