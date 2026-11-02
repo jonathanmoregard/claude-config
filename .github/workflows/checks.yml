@@ -61,6 +61,29 @@ jobs:
           sudo apt-get install --quiet --yes shfmt
           shfmt --version
 
+      # `gitleaks` runs the behavioural half of the proposals-sink config
+      # test: a real-shaped credential must still trip the shipped config. A
+      # config missing `[extend] useDefault = true` is a valid file that scans
+      # for nothing, and the static TOML check cannot see the effect. Same
+      # reasoning as `shfmt` above: the scanner is provisioned rather than the
+      # test degraded, and the test fails, not skips, when it is absent -- a
+      # secret-scanner guard must not pass on a machine that cannot run one.
+      #
+      # Not Ubuntu's archive, unlike `shfmt`: noble ships gitleaks 8.16.0,
+      # which predates the `git`/`dir` subcommands and `useDefault` that the
+      # pusher and this config rely on, so it would test a different scanner
+      # than production runs. Not a pinned release tarball either: that needs
+      # a checksum someone has to remember to bump. `go install ...@version`
+      # is verified against the Go checksum database by the toolchain itself,
+      # so the only thing to bump is the version, which should track the one
+      # in nixos-config. Its own step, and a version print, for the same
+      # reason as above.
+      - name: The secret scanner the proposals-sink guard depends on is present
+        run: |
+          go install github.com/zricethezav/gitleaks/v8@v8.30.1
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          "$(go env GOPATH)/bin/gitleaks" version
+
       # The whole directory, never a list of files. A suite that guards one of
       # this repository's own guards is itself a measuring instrument, and an
       # instrument CI does not run is not protected by requiring this job --

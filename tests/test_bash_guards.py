@@ -37,7 +37,11 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
-HOOKS = os.path.join(REPO_ROOT, "hooks")
+# The deployed subset moved under runtime/; same fallback idiom as the other
+# suites (tests/test_deny_hints.py, tests/test_wait_for.py).
+RUNTIME = (os.path.join(REPO_ROOT, "runtime")
+           if os.path.isdir(os.path.join(REPO_ROOT, "runtime")) else REPO_ROOT)
+HOOKS = os.path.join(RUNTIME, "hooks")
 
 FAILURES: list[str] = []
 
@@ -60,10 +64,7 @@ SCRATCH = tempfile.mkdtemp(prefix="bash-guards-test-")
 # Fault-injected copies of bash-output-guard.py are written here and load the
 # shared redaction module from beside themselves.
 for _shared in ("secret_redaction.py",):
-    __import__("shutil").copy(
-        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks", _shared),
-        SCRATCH,
-    )
+    __import__("shutil").copy(os.path.join(HOOKS, _shared), SCRATCH)
 
 
 def _write_stub(name: str, body: str, executable: bool = True) -> str:
@@ -441,7 +442,7 @@ check(
     f"{bash_guard.NIXOS_GIT_TIMEOUT_S} / {bash_guard.GUARD_DEADLINE_S}",
 )
 
-with open(os.path.join(REPO_ROOT, "settings.json"), encoding="utf-8") as fh:
+with open(os.path.join(RUNTIME, "settings.json"), encoding="utf-8") as fh:
     SETTINGS = json.load(fh)
 
 
@@ -517,7 +518,7 @@ check(
 
 # L4/L10. Nothing in the live settings surface may still name the retired
 # tool — not a matcher, not a permission rule, not a hook command line.
-with open(os.path.join(REPO_ROOT, "settings.json"), encoding="utf-8") as fh:
+with open(os.path.join(RUNTIME, "settings.json"), encoding="utf-8") as fh:
     _settings_text = fh.read()
 check(
     "no matcher, rule or hook command in settings.json names the retired MCP",
@@ -529,7 +530,7 @@ check(
 # server removes the only place DCG_PATH was exported to the guard, so the
 # fallback chain in `_dcg_path()` is what keeps dcg resolvable — asserted
 # behaviourally by the DCG_PATH-unset rows further down (parity row B3).
-_mcp_servers_path = os.path.join(REPO_ROOT, "mcp-servers.json")
+_mcp_servers_path = os.path.join(RUNTIME, "mcp-servers.json")
 with open(_mcp_servers_path, encoding="utf-8") as fh:
     _MCP_SERVERS = json.load(fh)
 check(
@@ -550,13 +551,13 @@ check(
 # cannot silently break the downstream renderer.
 check(
     "mcps/git-broker/ exists only as a dormant Codex broker asset",
-    os.path.isfile(os.path.join(REPO_ROOT, "mcps", "git-broker", "server.py")),
+    os.path.isfile(os.path.join(RUNTIME, "mcps", "git-broker", "server.py")),
     "ai-client-config consumes this source for Codex; Claude remains on native "
     "Bash because settings.json and mcp-servers.json do not register it",
 )
 check(
     "the sibling MCP tree is untouched",
-    os.path.isdir(os.path.join(REPO_ROOT, "mcps", "egress-guard")),
+    os.path.isdir(os.path.join(RUNTIME, "mcps", "egress-guard")),
     "the dedicated broker must not displace sibling MCPs",
 )
 
@@ -1737,6 +1738,11 @@ def health(dcg: str, dcg_config: str, ingress: str = INGRESS_CONFIG):
             "DCG_PATH": dcg,
             "DCG_CONFIG": dcg_config,
             "BASH_GUARD_CONFIG": ingress,
+            # Never the host's real ~/.local/state/dcg/fallback-active.json:
+            # these cases are not about the marker, and left unset their
+            # verdict would depend on this machine's last activation. The
+            # marker cases live in tests/test_bash_guard_pre.py.
+            "DCG_FALLBACK_MARKER": os.path.join(SCRATCH, "absent-marker.json"),
         },
     )
     msg = ""
@@ -2346,7 +2352,7 @@ check(
 # ----------------------------------------------------------------------
 section("permission-ledger: the nightly agent cannot reach a shell")
 
-_LEDGER = os.path.join(REPO_ROOT, "permission-ledger")
+_LEDGER = os.path.join(RUNTIME, "permission-ledger")
 with open(os.path.join(_LEDGER, "run-evaluate.sh"), encoding="utf-8") as fh:
     _RUNEVAL_SRC = fh.read()
 
