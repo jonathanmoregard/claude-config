@@ -3,6 +3,9 @@
 # script's branches, not that an agent reading the new CLAUDE.md, skill or hook
 # text behaves differently.
 #
+# Asked for by adding the `grade` label to the pull request, which is also what
+# makes this safe to require: see the first step.
+#
 # WHY THIS JOB HOLDS A CREDENTIAL AND `checks` DOES NOT
 #
 # `checks` takes no secrets on purpose, because a pull request can add code
@@ -17,7 +20,7 @@
 #   - `pull_request`, never `pull_request_target`: a fork's code must not run
 #     with this repository's secrets. A fork PR therefore gets no credential,
 #     every run comes back INCONCLUSIVE, and the job fails closed. That is the
-#     intended outcome — a fork PR is reviewed by a human, not auto-merged.
+#     intended outcome — a fork PR gets a human reading the diff, not a grade.
 #   - `persist-credentials: false`: `actions/checkout` otherwise leaves the
 #     workflow's own GITHUB_TOKEN in `.git/config`, where a hostile hook in the
 #     candidate config could read it. The harness scrubs GH_TOKEN and
@@ -28,13 +31,13 @@
 #
 # The verdict has to be about the tree that will actually land. A branch behind
 # master was graded against a merge base that no longer exists, so the job
-# refuses to grade it and says so: enabling auto-merge then updating the branch
-# fires `synchronize`, and the run that matters happens at tip.
+# refuses to grade it and says so: updating the branch fires `synchronize`, and
+# the run that matters happens at tip.
 name: honeypot
 
 on:
   pull_request:
-    types: [auto_merge_enabled, synchronize]
+    types: [labeled, auto_merge_enabled, synchronize]
 
 permissions:
   contents: read
@@ -60,19 +63,35 @@ jobs:
       # re-runs, and the verdict that matters is produced. The refusal is two
       # steps and no install, so it costs no agent run.
       #
-      # The payload field is the `auto_merge` OBJECT, null while auto-merge is
-      # off. There is no `auto_merge_enabled` property; naming one would make
-      # the test quietly false on every `synchronize`.
-      - name: Auto-merge is on, so this config is about to land
+      # Asking for the grade is a label, from the pull request's own sidebar.
+      # `workflow_dispatch` would be the obvious button, but its runs are not
+      # attached to a pull request and so can never satisfy a required status
+      # check. The label keeps this in the `pull_request` event family, so the
+      # check attaches to the head commit exactly as `checks` does, with the
+      # same secret rules for forks.
+      #
+      # Checks are per commit, so the guarantee survives a push: `synchronize`
+      # re-grades while the label is on, and a pull request whose label was
+      # removed produces no run at all, leaving the required check unsatisfied.
+      # Both directions fail closed, and an ordinary merge click still works
+      # once the grade is green.
+      #
+      # Auto-merge counts too. The payload field is the `auto_merge` OBJECT,
+      # null while auto-merge is off; there is no `auto_merge_enabled`
+      # property, and naming one would make the test quietly false on every
+      # `synchronize`.
+      - name: A grade was asked for, so this config is about to land
         env:
-          AUTO_MERGE: ${{ github.event.pull_request.auto_merge != null }}
+          ASKED: ${{ contains(github.event.pull_request.labels.*.name, 'grade')
+            || github.event.pull_request.auto_merge != null
+            || github.event.action == 'auto_merge_enabled' }}
         run: |
-          if [ "$AUTO_MERGE" != "true" ] && [ "${{ github.event.action }}" != "auto_merge_enabled" ]; then
-            echo "auto-merge is off: this config has not been graded"
-            echo "enable auto-merge to grade it; an ungraded config is not a clean one"
+          if [ "$ASKED" != "true" ]; then
+            echo "this config has not been graded"
+            echo "add the 'grade' label to grade it; an ungraded config is not a clean one"
             exit 1
           fi
-          echo "auto-merge on; grading the candidate config"
+          echo "grade asked for; grading the candidate config"
 
       - uses: actions/checkout@v4
         with:
