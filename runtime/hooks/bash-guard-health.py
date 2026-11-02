@@ -241,17 +241,55 @@ _TEXT_OUTCOME = re.compile(
 # which its VM lane renders and asserts. The two are deliberately the same
 # sequence: an operator who reads both should not have to reconcile them.
 # The flat-checkout branch is kept for a host that has not been cut over.
-_RESTORE_STEPS = (
-    "FIX: on a projected host (~/.claude/.projection-enabled exists), if "
-    "`ls ~/.claude/runtime/dcg.toml` fails, restore runtime/dcg.toml on "
-    "claude-config master and run `sudo systemctl start "
-    "claude-runtime-deploy`; then `rm ~/.claude/dcg.toml && sudo systemctl "
-    "restart claude-runtime-links` so the link goes back over the seeded "
-    "copy. On a flat ~/.claude checkout: `git -C ~/.claude checkout -- "
-    "dcg.toml`. Then re-activate with `sudo systemctl restart "
-    "home-manager-jonathan.service` (or `nixos-rebuild switch`), and confirm "
-    "with `dcg config --format json` that the user layer reads `loaded` and "
-    "the block list carries your adb / httpie / POST patterns."
+# TWO remedies, because there are two diagnoses and only one of them licenses
+# touching the file at the link path.
+#
+# A single shared string was the 2026-11-02 defect: the seed-collision steps
+# were appended to every announcement, including the ones that say dcg could
+# not load a config at all. In that state the file is presumed to be the
+# OPERATOR'S OWN, and the advice told them to delete it. Reproduced with a
+# hand-written config carrying a syntax error, no sentinel and no marker: the
+# output said `rm ~/.claude/dcg.toml`. The paragraph below it even began "Not
+# the seed". The previous wording was merely dead there; this was destructive,
+# which is worse, so the split is not a refinement but the fix.
+#
+# The test is whether a LIVE reading proved the seed is in force. Only then is
+# the file known to be byte-identical to nixos-config's home/dcg-fallback.toml
+# and to contain nothing of the operator's.
+_SEED_COLLISION_STEPS = (
+    "FIX (safe only because a live reading just proved this file IS the seed, "
+    "byte-identical to nixos-config's home/dcg-fallback.toml — nothing of "
+    "yours is in it): on a projected host (~/.claude/.projection-enabled "
+    "exists), FIRST check the projection actually serves the real file — "
+    "`head -1 ~/.claude/runtime/dcg.toml` must succeed. If it does not, "
+    "repair the projection before going further (`systemctl status "
+    "claude-runtime-mounts claude-runtime-deploy`; a dead bind mount is "
+    "re-bound by restarting its mount unit, not by the deploy), because "
+    "moving the seed aside while the projection is down leaves dcg with NO "
+    "user layer at all. Then move it rather than delete it — `mv "
+    "~/.claude/dcg.toml ~/dcg.toml.seed-backup` — and `sudo systemctl restart "
+    "claude-runtime-links` to put the link back. On a flat ~/.claude "
+    "checkout: `git -C ~/.claude checkout -- dcg.toml`. Then `sudo systemctl "
+    "restart home-manager-jonathan.service` (or `nixos-rebuild switch`), and "
+    "confirm with `dcg config --format json` that the user layer reads "
+    "`loaded` and the block list carries your adb / httpie / POST patterns."
+)
+
+# Everything else: dcg could not load a usable config, or loaded one this
+# check cannot identify. Nothing here has established what that file is, so it
+# is treated as the operator's work and the remedy never removes or
+# overwrites it.
+_LOADER_FAILURE_STEPS = (
+    "FIX: this does NOT say your config is the bootstrap seed — it says dcg "
+    "could not load a usable rule set — so treat the file at "
+    "~/.config/dcg/config.toml as YOURS: do not delete or overwrite it. Copy "
+    "it first (`cp -L ~/.config/dcg/config.toml ~/dcg.toml.bak`), then read "
+    "what dcg reported above and fix what it names. If that path is a "
+    "dangling symlink into ~/.claude/runtime, the projection is the fault "
+    "rather than the file — `systemctl status claude-runtime-mounts "
+    "claude-runtime-deploy`, and restart the mount unit if its source is "
+    "gone. Confirm with `dcg config --format json` that the user layer reads "
+    "`loaded` and the block list carries your adb / httpie / POST patterns."
 )
 
 
@@ -396,7 +434,7 @@ def _unconfirmed_marker_hint(path: str, doc: dict) -> tuple[str, str]:
         "be asked what it has loaded right now (see above), so this may be "
         "stale — once dcg answers, `dcg config --format json` is the "
         "authority. If the marker is current, these rule classes are NOT IN "
-        f"FORCE: {lost}. " + _RESTORE_STEPS
+        f"FORCE: {lost}. " + _LOADER_FAILURE_STEPS
     )
 
 
@@ -481,7 +519,7 @@ def _fallback_fault(signals: list[str], missing: list[str],
         "else. NOT IN FORCE: " + lost + "." + caveat + " STILL IN FORCE: "
         "dcg's built-in packs (core, system.disk) and the fallback's own "
         "curl -X DELETE|PUT|PATCH rules — which is why nothing looks wrong "
-        "from the outside. " + _RESTORE_STEPS
+        "from the outside. " + _SEED_COLLISION_STEPS
     )
 
 
@@ -530,7 +568,7 @@ def _dcg_rule_set_faults(dcg_path: str, cfg_path: str, marker_path: str,
                 + ". Every rule in your [overrides] block is inert, "
                 "bash-guard.py fails closed on exactly this, and dcg still "
                 "denies `rm -rf /` from a built-in pack — so the guard looks "
-                "alive. " + _RESTORE_STEPS
+                "alive. " + _LOADER_FAILURE_STEPS
             ))]
         if file_sentinel is None:
             return [(DOWN, (
@@ -586,7 +624,7 @@ def _dcg_rule_set_faults(dcg_path: str, cfg_path: str, marker_path: str,
             + ". Every rule in your [overrides] block is inert. dcg still "
             "answers every query and still denies `rm -rf /` from a built-in "
             "pack, which is why this cannot be seen from the outside; "
-            "bash-guard.py fails closed on it. " + _RESTORE_STEPS
+            "bash-guard.py fails closed on it. " + _LOADER_FAILURE_STEPS
         ))]
 
     faults: list[tuple[str, str]] = []
@@ -637,7 +675,7 @@ def _dcg_rule_set_faults(dcg_path: str, cfg_path: str, marker_path: str,
             "(that one at least blocks curl -X DELETE) — the loaded file "
             "genuinely carries no matching [overrides] block rule. dcg's "
             "built-in packs (core, system.disk) are all that is left. "
-            + _RESTORE_STEPS
+            + _LOADER_FAILURE_STEPS
         )))
 
     # dcg rewriting the operator's permission surface from inside the hook
