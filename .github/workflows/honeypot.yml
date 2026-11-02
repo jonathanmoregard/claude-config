@@ -132,32 +132,50 @@ jobs:
 
       # `bash-guard.py` needs BOTH dcg's config and the dcg EXECUTABLE. With
       # the binary absent it denies every Bash call with "the safety guard is
-      # BROKEN", and says plainly that there is no bypass flag. Measured by
+      # BROKEN, not because the command is", and says plainly that there is no
+      # bypass flag -- so every run would come back INCONCLUSIVE. Measured by
       # running the guard with dcg off PATH.
       #
-      # The config is tracked here, so CI can supply it. The binary is a Rust
-      # program packaged declaratively in the private nixos-config, published
-      # nowhere, so a runner cannot obtain it at all. Until it can, this step
-      # is where the install goes.
+      # dcg is third-party and public, so CI builds the SAME revision the host
+      # runs rather than some release that drifts from it. The pin lives in
+      # `overlays/dcg.nix` in nixos-config; these two values must be bumped
+      # with it, and the version assertion below is what makes a silent drift
+      # loud. A mismatch means CI measured the config against a different
+      # guard than the machine will.
       #
-      # Deliberately NOT worked around. A permissive dcg stub would change the
-      # config under test and manufacture a clean verdict from a broken guard,
-      # which is the exact failure this lane exists to catch. A scenario that
-      # avoids Bash would hide the same thing. Both are rejected; the step
-      # fails instead, naming the cause, so a red lane reads as itself rather
-      # than as a drift of unexplained INCONCLUSIVE runs.
-      - name: The guard's dependencies are present and answering
+      # Deliberately NOT stubbed. A permissive dcg would change the config
+      # under test and manufacture a clean verdict from a broken guard, which
+      # is the exact failure this lane exists to catch; a scenario that avoids
+      # Bash would hide the same thing.
+      - name: Build the guard the config depends on
+        env:
+          # github.com/Dicklesworthstone/destructive_command_guard
+          DCG_REV: d921fe84f7bbf56438e7b930047ab41e0dcb292d
+          DCG_VERSION: 0.12.5
+        run: |
+          # The PACKAGE is `destructive_command_guard`; `dcg` is only the name
+          # of the binary it produces ([[bin]] in its Cargo.toml). Passing
+          # `dcg` here fails -- cargo resolves the positional argument as a
+          # package name.
+          cargo install --locked --git \
+            https://github.com/Dicklesworthstone/destructive_command_guard \
+            --rev "$DCG_REV" destructive_command_guard
+          dcg --version
+          if ! dcg --version | grep -qF "$DCG_VERSION"; then
+            echo "dcg reports a version other than the pinned $DCG_VERSION:"
+            echo "the pin here and the one in nixos-config overlays/dcg.nix"
+            echo "have drifted, so this lane would measure the config against"
+            echo "a guard the machine does not run."
+            exit 1
+          fi
+
+      # The harness copies this from the developer's real HOME, which does not
+      # exist here. Without it dcg falls back to built-in packs and the guard
+      # reports a config fault, which is also a deny.
+      - name: Provide the config the guard loads
         run: |
           mkdir -p "$HOME/.config/dcg"
           cp runtime/dcg.toml "$HOME/.config/dcg/config.toml"
-          if ! command -v dcg >/dev/null 2>&1; then
-            echo "dcg is not available on this runner, so bash-guard denies every"
-            echo "Bash call and no run can measure the config. This lane cannot"
-            echo "grade anything until dcg is obtainable here -- see the pull"
-            echo "request that introduced this workflow for the options."
-            exit 1
-          fi
-          dcg --version
           dcg config
 
       # HEAD is the merge commit GitHub built for this pull request, so the
