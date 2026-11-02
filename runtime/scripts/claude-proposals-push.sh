@@ -312,7 +312,27 @@ if ! git diff --cached --quiet; then
     exit 1
   fi
   staged_count="$(git diff --cached --name-only | wc -l)"
-  git commit -q -m "proposals: $(date +%Y-%m-%d)"
+  # GITLEAKS_CONFIG is exported for this one command, for the GLOBAL pre-commit
+  # hook rather than for us. That hook (~/.config/git/hooks/pre-commit, from
+  # nixos-config home/jonathan.nix) runs `gitleaks git --staged` with no
+  # `--config`, so it scans with the stock ruleset and knows nothing about this
+  # sink's allowlist. It therefore re-blocked the very commit the two scans
+  # above had just cleared, on the same public GHSA advisory ID, and the sink
+  # went on not backing up after the allowlist landed. Measured: with the
+  # variable set, the hook's exact command exits 0 on that fixture; without it,
+  # 1.
+  #
+  # This is NOT `--no-verify` and not a weakening. The hook still runs, on the
+  # same staged content, with the full default ruleset -- it simply reads the
+  # same config this script already scanned with, so the two agree instead of
+  # contradicting each other. Any real credential still blocks in both.
+  #
+  # Scoped to this invocation deliberately: a global export would change what
+  # every other repository's commits are scanned against, and this allowlist is
+  # for this sink alone. A hand `git commit` in the sink is still subject to the
+  # stock hook, which is correct -- it tells the human, and the fix is to run
+  # this script rather than to widen the rules for everyone.
+  GITLEAKS_CONFIG="$GITLEAKS_CONFIG" git commit -q -m "proposals: $(date +%Y-%m-%d)"
   log "committed $staged_count change(s) in $SINK"
 fi
 
