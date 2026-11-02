@@ -143,6 +143,41 @@ def _path_lists() -> dict[str, list[str]]:
     return found
 
 
+def test_live_config_dir_is_named_only_as_protection() -> None:
+    """The projection root grants nothing; it only withholds.
+
+    `repositoryRoots`, `metadataRoots` and `worktreeCreationRoots` are
+    allowlists -- the broker admits a path by asking `_path_within(target,
+    policy[key])`. `protectedWorktrees` is the opposite: an exact-match refusal
+    (`identity.worktree in policy["protectedWorktrees"]`).
+
+    After the cutover `~/.claude` holds no `.git`, so as an allowlist entry it
+    permits nothing and is dead weight -- but dead weight on an allowlist is
+    still allowlist surface, and it would come back to life the moment anything
+    under that path became a repository again. As a protection entry the same
+    staleness is harmless, which is why PR #33 deliberately kept it there.
+
+    So the asymmetry is the invariant, not "remove every mention": this path
+    belongs in the refusal list and nowhere else.
+    """
+    offenders = {
+        key: values
+        for key, values in _path_lists().items()
+        if key.split(".")[-1] != "protectedWorktrees"
+        and any(
+            value == LIVE_CONFIG_DIR or value.startswith(LIVE_CONFIG_DIR + "/")
+            for value in values
+        )
+    }
+    assert not offenders, (
+        f"{LIVE_CONFIG_DIR} appears in {offenders}. Those keys are allowlists, "
+        "and that path is a tree of symlinks and read-only bind mounts holding "
+        "no repository of its own, so the entry permits nothing today and "
+        "widens the permitted surface if that ever changes. It belongs in "
+        "protectedWorktrees, which refuses rather than admits."
+    )
+
+
 def test_serving_tree_is_in_no_path_list() -> None:
     offenders = {
         key: values
