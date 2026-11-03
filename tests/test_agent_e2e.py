@@ -139,13 +139,18 @@ def _scenario(tmp_path, check_body: str) -> pathlib.Path:
 # Whether a sandbox can ACTUALLY be created here, probed once.
 #
 # `shutil.which("bwrap")` is not the same question, and the difference is not
-# academic: ubuntu-latest ships the bubblewrap binary but restricts
-# unprivileged user namespaces, so every guard that asked only whether the
-# binary exists let these cases run on a GitHub runner and fail INCONCLUSIVE --
-# measured, nine of them, the first time this workflow ran the whole corpus.
-# A case that cannot sandbox must say so, not report the harness broken.
+# academic: every guard that asked only whether the binary exists let these
+# cases run on a GitHub runner and fail INCONCLUSIVE -- measured, nine of them,
+# the first time this workflow ran the whole corpus. A case that cannot sandbox
+# must say so, not report the harness broken.
 #
-# The probe is the cheapest possible real sandbox: unshare everything and exit.
+# The probe builds the harness's own mount shape rather than a trivial sandbox,
+# because a machine that can unshare can still refuse a mount. Asking
+# `--dev-bind / / --unshare-all` was measured succeeding on a runner that then
+# failed all eleven cases a second time: the binary is there, namespaces work,
+# and what the runner lacked was a `~/.ssh` for the harness to shadow. That was
+# the harness's defect, fixed where it lives; the probe now at least covers the
+# read-only bind of the real HOME that the shadowing stacks on.
 # Cached, because nine call sites would otherwise fork nine times.
 _SANDBOX_OK = None
 
@@ -154,18 +159,22 @@ def _require_sandbox():
     """Skip unless bubblewrap can really build a sandbox on this machine."""
     global _SANDBOX_OK
     if _SANDBOX_OK is None:
+        import pwd as _pwd
         import shutil as _sh
         bwrap = _sh.which("bwrap")
+        home = _pwd.getpwuid(os.getuid()).pw_dir
         if bwrap is None:
             _SANDBOX_OK = (False, "bubblewrap not on PATH")
         else:
             try:
-                p = subprocess.run([bwrap, "--dev-bind", "/", "/", "--unshare-all",
+                p = subprocess.run([bwrap, "--dev-bind", "/", "/",
+                                    "--ro-bind", home, home, "--tmpfs", "/tmp",
                                     "true"], capture_output=True, text=True, timeout=30)
                 _SANDBOX_OK = (
                     p.returncode == 0,
-                    "bubblewrap is present but cannot create a sandbox here "
-                    "(unprivileged user namespaces are usually the reason): "
+                    "bubblewrap is present but cannot build the harness's "
+                    "sandbox here (restricted user namespaces, or a mount it "
+                    "refuses): "
                     + (p.stderr.strip().splitlines() or ["no stderr"])[-1],
                 )
             except (OSError, subprocess.SubprocessError) as exc:

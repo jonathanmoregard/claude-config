@@ -364,8 +364,16 @@ def run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
         # included) and ~/.ssh is hidden; only the run, the shared log dir and
         # the credentials file (token refresh) stay writable.
         creds = REAL_HOME / ".claude/.credentials.json"
-        home_guard = ["--ro-bind", str(REAL_HOME), str(REAL_HOME),
-                      "--tmpfs", str(REAL_HOME / ".ssh")]
+        home_guard = ["--ro-bind", str(REAL_HOME), str(REAL_HOME)]
+        # Only when there is something to hide. bwrap creates a missing mount
+        # destination, and this one would have to be created inside the
+        # read-only bind above, which fails: "Can't create file
+        # /home/<user>/.ssh: Read-only file system", exit 1, before the agent
+        # ever starts. A machine with no ~/.ssh -- a fresh CI runner -- could
+        # therefore not run a single sandboxed scenario, and the failure
+        # surfaced only as "agent exit 1" with no transcript.
+        if (REAL_HOME / ".ssh").exists():
+            home_guard += ["--tmpfs", str(REAL_HOME / ".ssh")]
         if creds.is_file():
             home_guard += ["--bind", str(creds), str(creds)]
         argv = [bwrap, "--dev-bind", "/", "/", *home_guard, "--tmpfs", "/tmp",

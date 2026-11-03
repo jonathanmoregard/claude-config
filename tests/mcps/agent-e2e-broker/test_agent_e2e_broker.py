@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import pwd
 import shutil
 import subprocess
 import sys
@@ -46,10 +47,12 @@ def git(cwd: Path, *argv: str) -> str:
 # Fifteen duplicated lines are cheaper than that failure.
 #
 # Asking `shutil.which("bwrap")` is a different question from asking whether
-# bubblewrap works, and the difference is what made these two cases red:
-# ubuntu-latest ships the binary but restricts unprivileged user namespaces, so
-# the harness started, could not sandbox, and the case reported "stub claude
-# never started" as though the broker were broken.
+# bubblewrap works, and the difference is what made these two cases red: the
+# binary is on a runner, the harness started, it could not sandbox, and the case
+# reported "stub claude never started" as though the broker were broken.
+# `--unshare-all` was still the wrong question -- that succeeds on a runner.
+# The probe therefore builds the harness's own mount shape, including the
+# read-only bind of the real HOME that the ssh shadowing stacks on.
 _SANDBOX_OK = None
 
 
@@ -58,16 +61,19 @@ def require_sandbox(case: unittest.TestCase) -> None:
     global _SANDBOX_OK
     if _SANDBOX_OK is None:
         bwrap = shutil.which("bwrap")
+        home = pwd.getpwuid(os.getuid()).pw_dir
         if bwrap is None:
             _SANDBOX_OK = (False, "bubblewrap not on PATH")
         else:
             try:
-                p = subprocess.run([bwrap, "--dev-bind", "/", "/", "--unshare-all",
+                p = subprocess.run([bwrap, "--dev-bind", "/", "/",
+                                    "--ro-bind", home, home, "--tmpfs", "/tmp",
                                     "true"], capture_output=True, text=True, timeout=30)
                 _SANDBOX_OK = (
                     p.returncode == 0,
-                    "bubblewrap is present but cannot create a sandbox here "
-                    "(unprivileged user namespaces are usually the reason): "
+                    "bubblewrap is present but cannot build the harness's "
+                    "sandbox here (restricted user namespaces, or a mount it "
+                    "refuses): "
                     + (p.stderr.strip().splitlines() or ["no stderr"])[-1],
                 )
             except (OSError, subprocess.SubprocessError) as exc:

@@ -229,13 +229,18 @@ jobs:
       #                              measuring a guard that cannot run.
       #                              test_bash_guard_post additionally resolves
       #                              a sibling hook through `agent-activity`.
-      #   git-broker (12 entries)    `dcg` (37 cases) and `bwrap` (8). The
-      #                              broker refuses to build a sandbox when
-      #                              either is missing -- "BROKEN safety
-      #                              boundary", server.py:949 -- which is the
-      #                              right behaviour and leaves nothing to
-      #                              test. Six whole classes plus six single
-      #                              cases, so 103 of the file's 152 stay
+      #   git-broker (12 entries)    `dcg`, for 37 cases: the broker refuses to
+      #                              build a sandbox without its validator --
+      #                              "BROKEN safety boundary", server.py:949 --
+      #                              which is the right behaviour and leaves
+      #                              nothing to test. The other 8 were first
+      #                              held out as needing `bwrap`, which a runner
+      #                              in fact has; what they really need is
+      #                              /home/jonathan/worktrees, since every
+      #                              black-box class builds its fixture there
+      #                              with an explicit `dir=`. Either way they
+      #                              cannot run here. Six whole classes plus six
+      #                              single cases, so 103 of the file's 152 stay
       #                              enforced here. The better fix is for the
       #                              suite to resolve those two the way it
       #                              already resolves `git`
