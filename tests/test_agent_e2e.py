@@ -480,9 +480,14 @@ def test_nested_run_reaches_shared_dir(tmp_path):
     leaf = fake_claude(tmp_path, 'echo nested >> "$E2E_SHARED/log"\n'
                        "cat <<'EOF'\n" + stream("leaf", []) + "\nEOF\n", name="leaf")
     # The outer "agent" runs the harness itself, as the dogfood agent does.
+    # It also hands the inner run's stderr out: that file sits in this run's
+    # private /tmp and dies with it, so when the nested agent fails -- the one
+    # thing this case can fail on that is not about the shared dir -- the
+    # reason is otherwise unrecoverable.
     outer = fake_claude(tmp_path,
                         f"{sys.executable} {HARNESS} run {inner_sc} --arm a=HEAD --n 1 "
                         f"--jobs 1 --out /tmp/inner-out --claude {leaf} >&2\n"
+                        "find /tmp/inner-out -name stderr.txt -print -exec cat {} + >&2\n"
                         "cat <<'EOF'\n" + stream("outer", []) + "\nEOF\n", name="outer")
     sc = _scenario(tmp_path, 'grep -qx nested "$1/shared/log"')
     _, out, verdicts = _run(tmp_path, sc, outer)
