@@ -184,6 +184,41 @@ def _require_sandbox():
         pytest.skip(why)
 
 
+# Whether a sandbox can be built INSIDE a sandbox, which is a third question
+# again. ubuntu-latest grants the first user namespace and refuses the second:
+# the outer run started, the nested harness staged its config and printed its
+# report, and the inner agent exited 1 carrying
+#   bwrap: No permissions to create a new namespace, likely because the kernel
+#   does not allow non-privileged user namespaces.
+# -- measured, out of the inner run's own stderr. A case whose subject IS
+# nesting therefore cannot run there, and must say that rather than fail.
+_NESTED_SANDBOX_OK = None
+
+
+def _require_nested_sandbox():
+    """Skip unless bubblewrap can build a sandbox from inside one."""
+    _require_sandbox()
+    global _NESTED_SANDBOX_OK
+    if _NESTED_SANDBOX_OK is None:
+        import shutil as _sh
+        bwrap = _sh.which("bwrap")
+        shape = ["--dev-bind", "/", "/", "--tmpfs", "/tmp"]
+        try:
+            p = subprocess.run([bwrap, *shape, bwrap, *shape, "true"],
+                               capture_output=True, text=True, timeout=30)
+            _NESTED_SANDBOX_OK = (
+                p.returncode == 0,
+                "bubblewrap can sandbox here but cannot nest one sandbox "
+                "inside another: "
+                + (p.stderr.strip().splitlines() or ["no stderr"])[-1],
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            _NESTED_SANDBOX_OK = (False, f"nested bubblewrap probe failed: {exc!r}")
+    ok, why = _NESTED_SANDBOX_OK
+    if not ok:
+        pytest.skip(why)
+
+
 def _run(tmp_path, sc, claude, n=1):
     out = tmp_path / "out"
     r = harness("run", str(sc), "--arm", "new=HEAD", "--n", str(n), "--jobs", "1",
@@ -469,7 +504,7 @@ def test_runs_get_a_private_tmp(tmp_path):
 
 def test_nested_run_reaches_shared_dir(tmp_path):
     """A stub called from a NESTED harness run must still reach the outer log."""
-    _require_sandbox()
+    _require_nested_sandbox()
     inner_sc = tmp_path / "inner"
     inner_sc.mkdir()
     (inner_sc / "prompt.md").write_text("x\n")
