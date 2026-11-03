@@ -289,16 +289,24 @@ jobs:
           token=$(jq -r '.access_token // empty' "${RUNNER_TEMP}/token.json")
           expires=$(jq -r '.expires_in // empty' "${RUNNER_TEMP}/token.json")
           rm -f "${RUNNER_TEMP}/token.json"
+          # Masked the instant it exists, before any branch that might print.
+          # Masking after the error path below is how `${token:+present}` came
+          # to sit next to `${token:-MISSING}`: when the token was present and
+          # only the lifetime was missing, the first expanded to "present" and
+          # the second to the token itself, unmasked, in a public log.
+          [ -z "$token" ] || echo "::add-mask::$token"
           if [ -z "$token" ] || [ -z "$expires" ]; then
+            # Presence only. Never interpolate the credential itself, not even
+            # in a branch that "cannot" be reached with it set.
+            if [ -n "$token" ]; then has_token=present; else has_token=MISSING; fi
             echo "the exchange returned no usable credential (HTTP $code):"
-            echo "  access_token: ${token:+present}${token:-MISSING}"
+            echo "  access_token: ${has_token}"
             echo "  expires_in:   ${expires:-MISSING}"
             echo "a refused exchange is always an opaque 401; the reason is in"
             echo "the Console's Workload identity page, under its history tab."
             echo "failing closed: an ungraded config is not a clean config"
             exit 1
           fi
-          echo "::add-mask::$token"
           # Not an output and not GITHUB_ENV: a step output is stored by the
           # runner for the whole job and GITHUB_ENV would put the credential in
           # the environment of every later step, including the upload.
@@ -322,6 +330,17 @@ jobs:
           # consequence, printed rather than chosen. Observed staging is a few
           # seconds, so this is roughly twenty times the measured need.
           STARTUP_RESERVE: 120
+          # Taken away from every step that runs pull-request-authored code,
+          # which is this one and the gate. The harness also drops this pair
+          # from the agent's own environment, but that only ever covered the
+          # AGENT: the scenario's setup.sh and check.sh are authored by the
+          # pull request too and run OUTSIDE the sandbox, as children of the
+          # harness, where /proc/<harness>/environ hands them back. Measured:
+          # an unsandboxed child reads its parent's environ on these hosts,
+          # since yama gates PTRACE_MODE_ATTACH and not reads. Emptied here,
+          # there is nothing left to read; the minting already happened.
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
         run: |
           if [ ! -s "${RUNNER_TEMP}/anthropic-token" ]; then
             echo "no honeypot credential available to this run"
@@ -375,6 +394,11 @@ jobs:
       # misleading failure. Measured: that is exactly what run 41490427592 did.
       - name: Every run came back clean
         if: always() && steps.measure.conclusion == 'success'
+        env:
+          # gate.py comes from the pull request as well -- see the measure
+          # step's note.
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
         run: |
           python3 tests/agent-e2e/skill-description-audit/gate.py \
             /tmp/agent-e2e/skill-description-audit \

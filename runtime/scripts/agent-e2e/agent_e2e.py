@@ -256,12 +256,21 @@ def sandboxed(argv: list[str], *, claude: str, run: pathlib.Path,
     # the child's environment is not isolation while the child can read it
     # back out of an ancestor's /proc entry: the harness itself holds what the
     # run must not have, GitHub Actions' identity-token endpoint and bearer
-    # among it. `kernel.yama.ptrace_scope` is 1 on the hosts measured, which
-    # already refuses a descendant that read, but a sandbox must not rest on a
-    # sysctl it does not set. It also drops the host's process list from view
-    # -- 933 entries to 4, measured here.
+    # among it.
+    #
+    # Measured, because the obvious explanation was the wrong one. An
+    # unsandboxed child CAN read its parent's environ on these hosts:
+    # `kernel.yama.ptrace_scope` is 1 here, but yama gates PTRACE_MODE_ATTACH
+    # and not a read, so what refuses that read from inside the sandbox is
+    # bubblewrap's user namespace. The pid namespace is what stops the
+    # guarantee resting on one mechanism, and it drops the host's process list
+    # from view besides -- some 900 entries to 4.
+    #
+    # --die-with-parent because a run must not outlive the credential it was
+    # given. Killing the launcher at the deadline left the sandbox running
+    # with the token in hand; measured with a 3s timeout against `sleep 300`.
     return [shutil.which("bwrap"), "--dev-bind", "/", "/",
-            "--unshare-pid", "--proc", "/proc",
+            "--unshare-pid", "--proc", "/proc", "--die-with-parent",
             *home_guard, "--tmpfs", "/tmp",
             *binds, "--chdir", str(work), "--", *argv]
 
@@ -436,8 +445,18 @@ def run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
         chk = subprocess.run(["bash", str(scenario / "check.sh"), str(run)],
                              env=env, capture_output=True, text=True)
         (run / "check.log").write_text(chk.stdout + chk.stderr, encoding="utf-8")
-        verdict["verdict"] = {0: "PASS", 1: "FAIL"}.get(chk.returncode, "INCONCLUSIVE")
-        verdict["why"] = (chk.stdout.strip().splitlines() or [""])[-1][:300]
+        why = (chk.stdout.strip().splitlines() or [""])[-1][:300]
+        outcome = {0: "PASS", 1: "FAIL"}.get(chk.returncode, "INCONCLUSIVE")
+        # A FAIL always carries its reason, because every grader prints one
+        # before exiting 1. Exit 1 with nothing on stdout therefore means the
+        # grader died before it could grade -- a parse error in the script
+        # beats any excepthook the script installs -- and a crash must not be
+        # reported as the config having gone for the credentials.
+        if outcome == "FAIL" and not why:
+            outcome = "INCONCLUSIVE"
+            why = "grader exited 1 without a verdict; see check.log"
+        verdict["verdict"] = outcome
+        verdict["why"] = why
     (run / "verdict.json").write_text(json.dumps(verdict, indent=2), encoding="utf-8")
     return verdict
 

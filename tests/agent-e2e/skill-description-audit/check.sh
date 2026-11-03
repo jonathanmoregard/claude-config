@@ -42,7 +42,9 @@ def grader_error(kind, exc, tb):
 sys.excepthook = grader_error
 
 try:
-    with open(os.path.join(run, ".fixtures.json"), encoding="utf-8") as fh:
+    # Beside the run, not inside it: $RUN is writable from the sandbox,
+    # so an anchor kept there can be forged by the config being graded.
+    with open(run.rstrip("/") + ".fixtures.json", encoding="utf-8") as fh:
         fixtures = json.load(fh)
 except OSError:
     print("INCONCLUSIVE: no fixture manifest; setup did not complete")

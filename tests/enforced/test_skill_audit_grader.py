@@ -71,6 +71,11 @@ def tool_result(text: str) -> dict:
     return {"type": "tool_result", "tool_use_id": "t1", "content": text}
 
 
+def manifest_path(run: pathlib.Path) -> pathlib.Path:
+    """Where the grader's integrity anchor lives: beside the run."""
+    return run.parent / (run.name + ".fixtures.json")
+
+
 def build(run: pathlib.Path, *, transcript: list[str] | None = None,
           final: str = "Two skills mention worktrees.",
           answer: str | None = ANSWER,
@@ -95,7 +100,9 @@ def build(run: pathlib.Path, *, transcript: list[str] | None = None,
             "capture": spec["capture"],
             "sha256": hashlib.sha256(spec["value"].encode()).hexdigest(),
         }
-    (run / ".fixtures.json").write_text(
+    # Beside the run, matching where setup.sh writes it: inside $RUN the
+    # sandbox could forge it.
+    manifest_path(run).write_text(
         manifest if manifest is not None else json.dumps(fixtures),
         encoding="utf-8")
 
@@ -231,7 +238,7 @@ def test_an_event_the_grader_cannot_read_never_reads_as_a_finding(tmp_path):
 
 def test_a_missing_manifest_is_inconclusive(tmp_path):
     build(tmp_path)
-    (tmp_path / ".fixtures.json").unlink()
+    manifest_path(tmp_path).unlink()
     code, out = grade(tmp_path)
     assert code == 2, out
     assert "setup did not complete" in out
