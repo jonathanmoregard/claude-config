@@ -136,6 +136,45 @@ def _scenario(tmp_path, check_body: str) -> pathlib.Path:
     return sc
 
 
+# Whether a sandbox can ACTUALLY be created here, probed once.
+#
+# `shutil.which("bwrap")` is not the same question, and the difference is not
+# academic: ubuntu-latest ships the bubblewrap binary but restricts
+# unprivileged user namespaces, so every guard that asked only whether the
+# binary exists let these cases run on a GitHub runner and fail INCONCLUSIVE --
+# measured, nine of them, the first time this workflow ran the whole corpus.
+# A case that cannot sandbox must say so, not report the harness broken.
+#
+# The probe is the cheapest possible real sandbox: unshare everything and exit.
+# Cached, because nine call sites would otherwise fork nine times.
+_SANDBOX_OK = None
+
+
+def _require_sandbox():
+    """Skip unless bubblewrap can really build a sandbox on this machine."""
+    global _SANDBOX_OK
+    if _SANDBOX_OK is None:
+        import shutil as _sh
+        bwrap = _sh.which("bwrap")
+        if bwrap is None:
+            _SANDBOX_OK = (False, "bubblewrap not on PATH")
+        else:
+            try:
+                p = subprocess.run([bwrap, "--dev-bind", "/", "/", "--unshare-all",
+                                    "true"], capture_output=True, text=True, timeout=30)
+                _SANDBOX_OK = (
+                    p.returncode == 0,
+                    "bubblewrap is present but cannot create a sandbox here "
+                    "(unprivileged user namespaces are usually the reason): "
+                    + (p.stderr.strip().splitlines() or ["no stderr"])[-1],
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                _SANDBOX_OK = (False, f"bubblewrap probe failed: {exc!r}")
+    ok, why = _SANDBOX_OK
+    if not ok:
+        pytest.skip(why)
+
+
 def _run(tmp_path, sc, claude, n=1):
     out = tmp_path / "out"
     r = harness("run", str(sc), "--arm", "new=HEAD", "--n", str(n), "--jobs", "1",
@@ -146,6 +185,7 @@ def _run(tmp_path, sc, claude, n=1):
 
 
 def test_agent_sees_staged_home_and_check_gets_its_commands(tmp_path):
+    _require_sandbox()
     claude = fake_claude(tmp_path, f"""
 test -f "$HOME/.claude/CLAUDE.md" || exit 3
 cat <<'EOF'
@@ -159,6 +199,7 @@ EOF
 
 
 def test_check_failure_is_fail(tmp_path):
+    _require_sandbox()
     claude = fake_claude(tmp_path, f"cat <<'EOF'\n{stream('done', [])}\nEOF\n")
     sc = _scenario(tmp_path, 'echo "FAIL: nope"; exit 1')
     _, _, verdicts = _run(tmp_path, sc, claude)
@@ -179,6 +220,7 @@ def test_broken_runs_are_inconclusive_never_pass(tmp_path, body):
 
 
 def test_finished_runs_are_not_re_spent(tmp_path):
+    _require_sandbox()
     # Inside the run dir: the only path a sandboxed run can write that outlives it.
     claude = fake_claude(tmp_path, f"echo x >> \"$E2E_RUN/calls\"\ncat <<'EOF'\n{stream('ok', [])}\nEOF\n")
     sc = _scenario(tmp_path, "exit 0")
@@ -335,6 +377,7 @@ def test_orient_grader_on_canned_runs(tmp_path, mode, final, commands, want):
 
 
 def test_run_where_hooks_refused_every_bash_call_is_inconclusive(tmp_path):
+    _require_sandbox()
     events = [
         {"type": "assistant", "message": {"content": [
             {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "gh pr view"}}]}},
@@ -401,9 +444,7 @@ def test_dogfood_grader(tmp_path, commands, claude_ran, want):
 
 def test_runs_get_a_private_tmp(tmp_path):
     """Concurrent runs must not see each other's /tmp (dogfood batch 1 leak)."""
-    import shutil as _sh
-    if not _sh.which("bwrap"):
-        pytest.skip("bubblewrap not on PATH")
+    _require_sandbox()
     probe = pathlib.Path("/tmp") / f"agent-e2e-leak-{os.getpid()}"
     probe.write_text("outside")
     try:
@@ -419,9 +460,7 @@ def test_runs_get_a_private_tmp(tmp_path):
 
 def test_nested_run_reaches_shared_dir(tmp_path):
     """A stub called from a NESTED harness run must still reach the outer log."""
-    import shutil as _sh
-    if not _sh.which("bwrap"):
-        pytest.skip("bubblewrap not on PATH")
+    _require_sandbox()
     inner_sc = tmp_path / "inner"
     inner_sc.mkdir()
     (inner_sc / "prompt.md").write_text("x\n")
@@ -443,9 +482,7 @@ def test_nested_run_reaches_shared_dir(tmp_path):
 
 def test_run_cannot_reach_ssh_agent_keys_or_write_real_home(tmp_path):
     """Review H2: credentials and real checkouts must be out of an agent's reach."""
-    import shutil as _sh
-    if not _sh.which("bwrap"):
-        pytest.skip("bubblewrap not on PATH")
+    _require_sandbox()
     import pwd as _pwd
     real = _pwd.getpwuid(os.getuid()).pw_dir
     body = (
@@ -501,6 +538,7 @@ def test_headless_permission_denials_count_as_blocked(tmp_path):
 def test_scenario_stub_mcp_config_is_passed_only_when_written(tmp_path):
     """A setup.sh that writes RUN/mcp.json gets --mcp-config RUN/mcp.json (and
     still --strict-mcp-config); one that does not gets no --mcp-config."""
+    _require_sandbox()
     body = ('printf \'%s\\n\' "$@" > "$E2E_RUN/argv"\n'
             "cat <<'EOF'\n" + stream("ok", []) + "\nEOF\n")
     claude = fake_claude(tmp_path, body)
@@ -525,6 +563,7 @@ def test_scenario_stub_mcp_config_is_passed_only_when_written(tmp_path):
 def test_resume_reuses_a_verdict_only_for_the_same_config(tmp_path):
     """A finished run is resumed only when its arm still names the same commit;
     pointing the arm elsewhere re-runs it instead of reporting the old verdict."""
+    _require_sandbox()
     # The agent's /tmp is private, so it leaves its mark in its own run dir.
     claude = fake_claude(tmp_path, 'date +%s%N > "$E2E_RUN/called"\ncat <<\'EOF\'\n'
                                    + stream("ok", []) + "\nEOF\n")

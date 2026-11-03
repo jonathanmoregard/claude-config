@@ -56,8 +56,16 @@ def valid_policy() -> dict:
         "gitExecutable": "git",
         "bubblewrapExecutable": "bwrap",
         "validatorExecutable": "dcg",
-        "credentialHelperExecutable": "/etc/profiles/per-user/jonathan/bin/gh",
-        "githubCliExecutable": "/etc/profiles/per-user/jonathan/bin/gh",
+        # Resolved from PATH, with this machine's path as the fallback, exactly
+        # as `gitExecutable` is resolved further down. Pinned to the absolute
+        # Nix-profile path these fixtures used to carry, 25 cases could only
+        # ever pass on one laptop: server.py fails closed on an executable it
+        # cannot find ("BROKEN safety boundary"), so on a GitHub runner they all
+        # died before reaching the argv they exist to check -- measured, in this
+        # branch's first CI run. No assertion reads this value literally; the
+        # argv checks substitute a placeholder for it.
+        "credentialHelperExecutable": shutil.which("gh") or "/etc/profiles/per-user/jonathan/bin/gh",
+        "githubCliExecutable": shutil.which("gh") or "/etc/profiles/per-user/jonathan/bin/gh",
         "waitForExecutable": "/home/jonathan/.claude/scripts/wait-for",
         "watchStatusDir": "%t/git-broker/watch",
         "githubHostTokenDir": "/home/jonathan/.cache/gh-tokens/host",
