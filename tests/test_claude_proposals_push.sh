@@ -30,6 +30,17 @@ RUNTIME="$SCRIPT_DIR"
 [ -d "$SCRIPT_DIR/runtime" ] && RUNTIME="$SCRIPT_DIR/runtime"
 SCRIPT="$RUNTIME/scripts/claude-proposals-push.sh"
 PUSH_PROPOSALS="$RUNTIME/push-proposals.sh"
+# The scanner config, from THIS tree rather than from the deployed one. Without
+# it the pusher falls back to `$CLAUDE_HOME/scripts/proposals-gitleaks.toml`,
+# i.e. ~/.claude, and these cases quietly measured the deployment instead of the
+# repository: on a machine with no ~/.claude the pusher correctly refuses to
+# push an unscannable tree, and 10 cases failed with "the gitleaks config is
+# missing or unreadable" -- which reads as the pusher misbehaving rather than as
+# the harness having no config to give it. Measured on a GitHub runner's shape
+# (empty HOME) before this line existed. `GITLEAKS_CONFIG` is the override the
+# script documents for exactly this, and pointing it at runtime/scripts/ makes
+# the suite's own "nothing here touches the real ~/.claude" claim true.
+export GITLEAKS_CONFIG="$RUNTIME/scripts/proposals-gitleaks.toml"
 ROOT=$(mktemp -d)
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 # Per-run state root, so nothing here reads or clobbers the real one under

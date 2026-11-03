@@ -578,7 +578,22 @@ expect_settings "unrelated pull keeps the rest of settings" permissions.allow '[
 #     when the superproject is already current. Skills load through
 #     vendor/superpowers, so an empty submodule must not wait for the next
 #     master commit to heal.
-export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=protocol.file.allow GIT_CONFIG_VALUE_0=always
+# protocol.file.allow: these submodule fixtures live at local paths, which git
+# refuses by default since CVE-2022-39253.
+# fetch.recurseSubmodules=false: NOT a preference, a hermeticity fix. Left to
+# git's default (`on-demand`) the superproject fetch recurses into the
+# file-path submodule, that transitive fetch is refused, `Errors during
+# submodule fetch` fails the whole fetch, and the superproject never
+# fast-forwards -- so three cases below reported the script mishandling a
+# stale submodule when in fact it never got to run. It passed on this
+# developer's machine only because their global config happens to set
+# `submodule.recurse = false`; measured 105/105 with it and 102/3 without,
+# via `GIT_CONFIG_GLOBAL=/dev/null`. The script does its own explicit
+# `git submodule update --init --recursive`, so a non-recursing fetch is
+# also the shape it is written against.
+export GIT_CONFIG_COUNT=2 \
+  GIT_CONFIG_KEY_0=protocol.file.allow GIT_CONFIG_VALUE_0=always \
+  GIT_CONFIG_KEY_1=fetch.recurseSubmodules GIT_CONFIG_VALUE_1=false
 fresh subretry
 SUB="$ROOT/subretry/sub.git"
 git init --quiet --bare -b main "$SUB"
@@ -615,7 +630,22 @@ expect_status "status is ok once the submodule is checked out" state ok
 #     were a commit behind what master pins, and no later tick repaired it
 #     because the retry gate only fired on `-`. Stale forever, reported
 #     healthy.
-export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=protocol.file.allow GIT_CONFIG_VALUE_0=always
+# protocol.file.allow: these submodule fixtures live at local paths, which git
+# refuses by default since CVE-2022-39253.
+# fetch.recurseSubmodules=false: NOT a preference, a hermeticity fix. Left to
+# git's default (`on-demand`) the superproject fetch recurses into the
+# file-path submodule, that transitive fetch is refused, `Errors during
+# submodule fetch` fails the whole fetch, and the superproject never
+# fast-forwards -- so three cases below reported the script mishandling a
+# stale submodule when in fact it never got to run. It passed on this
+# developer's machine only because their global config happens to set
+# `submodule.recurse = false`; measured 105/105 with it and 102/3 without,
+# via `GIT_CONFIG_GLOBAL=/dev/null`. The script does its own explicit
+# `git submodule update --init --recursive`, so a non-recursing fetch is
+# also the shape it is written against.
+export GIT_CONFIG_COUNT=2 \
+  GIT_CONFIG_KEY_0=protocol.file.allow GIT_CONFIG_VALUE_0=always \
+  GIT_CONFIG_KEY_1=fetch.recurseSubmodules GIT_CONFIG_VALUE_1=false
 fresh substale
 SUB="$ROOT/substale/sub.git"
 git init --quiet --bare -b main "$SUB"
@@ -667,7 +697,8 @@ expect_equal "the submodule was moved onto the pinned commit" \
 grep -q "skill v2" "$CLONE/vendor/sub/SKILL.md" \
   && { echo "PASS the pinned content is what is served"; pass=$((pass+1)); } \
   || { echo "FAIL substale: vendor/sub/SKILL.md is not the pinned revision"; fail=$((fail+1)); }
-unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 \
+  GIT_CONFIG_KEY_1 GIT_CONFIG_VALUE_1
 
 echo
 echo "passed: $pass  failed: $fail"
