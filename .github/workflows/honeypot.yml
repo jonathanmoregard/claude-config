@@ -289,8 +289,10 @@ jobs:
           token=$(jq -r '.access_token // empty' "${RUNNER_TEMP}/token.json")
           expires=$(jq -r '.expires_in // empty' "${RUNNER_TEMP}/token.json")
           rm -f "${RUNNER_TEMP}/token.json"
-          if [ -z "$token" ]; then
-            echo "the exchange returned no access token (HTTP $code)."
+          if [ -z "$token" ] || [ -z "$expires" ]; then
+            echo "the exchange returned no usable credential (HTTP $code):"
+            echo "  access_token: ${token:+present}${token:-MISSING}"
+            echo "  expires_in:   ${expires:-MISSING}"
             echo "a refused exchange is always an opaque 401; the reason is in"
             echo "the Console's Workload identity page, under its history tab."
             echo "failing closed: an ungraded config is not a clean config"
@@ -302,16 +304,44 @@ jobs:
           # the environment of every later step, including the upload.
           printf '%s' "$token" > "${RUNNER_TEMP}/anthropic-token"
           chmod 600 "${RUNNER_TEMP}/anthropic-token"
-          echo "minted a workspace token, valid for ${expires:-unknown}s"
+          # The lifetime is not ours to choose -- it is the lesser of the
+          # rule's setting and twice what is left of the identity token -- so
+          # the run deadline is derived from what was actually granted rather
+          # than guessed. 597s against a 600s agent timeout left a slow but
+          # honest run able to lose authentication before reaching its own
+          # limit, which would read as INCONCLUSIVE and redden the lane.
+          echo "HONEYPOT_TOKEN_TTL=${expires}" >> "$GITHUB_ENV"
+          echo "minted a workspace token, valid for ${expires}s"
 
       - name: The agent does not go for the planted credentials
         id: measure
+        env:
+          # What a run needs BEFORE its first API call -- staging the config
+          # out of git, building the sandbox home, planting the fixtures --
+          # plus margin. Set here as the input; the deadline below is the
+          # consequence, printed rather than chosen. Observed staging is a few
+          # seconds, so this is roughly twenty times the measured need.
+          STARTUP_RESERVE: 120
         run: |
           if [ ! -s "${RUNNER_TEMP}/anthropic-token" ]; then
             echo "no honeypot credential available to this run"
             echo "failing closed: an ungraded config is not a clean config"
             exit 1
           fi
+          # A run must not outlive the credential it was given: losing
+          # authentication mid-run reads as INCONCLUSIVE, which is a red lane
+          # for no reason anyone can act on. Runs start together under
+          # --jobs, so one deadline serves them all.
+          deadline=$((HONEYPOT_TOKEN_TTL - STARTUP_RESERVE))
+          if [ "$deadline" -lt 60 ]; then
+            echo "the minted token lives ${HONEYPOT_TOKEN_TTL}s, leaving"
+            echo "${deadline}s after a ${STARTUP_RESERVE}s startup reserve --"
+            echo "too little to measure anything. Raise the federation rule's"
+            echo "token lifetime in the Claude Console."
+            exit 1
+          fi
+          echo "token ${HONEYPOT_TOKEN_TTL}s - reserve ${STARTUP_RESERVE}s" \
+               "=> per-run deadline ${deadline}s"
           # The federated token is a bearer token, so it travels in
           # ANTHROPIC_AUTH_TOKEN. The harness passes its environment to the
           # agent; nothing else in this job needs the credential.
@@ -329,7 +359,7 @@ jobs:
           python3 runtime/scripts/agent-e2e/agent_e2e.py run \
             tests/agent-e2e/skill-description-audit \
             --arm candidate=HEAD --n "$RUNS" --jobs "$RUNS" \
-            --model claude-sonnet-5-5 --budget 1 --timeout 600 \
+            --model claude-sonnet-5-5 --budget 1 --timeout "$deadline" \
             --out /tmp/agent-e2e
 
       # The harness exits 0 whatever the verdicts; the gate is here. FAIL is a

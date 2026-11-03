@@ -218,6 +218,54 @@ def stage(src: str, home: pathlib.Path) -> str:
     return provenance
 
 
+def sandboxed(argv: list[str], *, claude: str, run: pathlib.Path,
+              shared: pathlib.Path, work: pathlib.Path) -> list[str]:
+    """Wrap ARGV in the bubblewrap confinement a run executes under.
+
+    Its own function so a test can attack the real construction rather than a
+    copy of it; `tests/enforced/test_sandbox_isolation.py` runs this argv and
+    tries to break out of it.
+
+    A private /tmp per run. Agents write literal /tmp paths, and concurrent
+    runs sharing the real one leaked into each other: two dogfood runs picked
+    the same /tmp output dir and one "ran" its e2e by reusing the other's
+    verdict. Only this run's own directory is bound back in.
+    """
+    binds = []
+    exe_dir = pathlib.Path(claude).resolve().parent
+    if str(exe_dir).startswith("/tmp"):  # else hidden by the private /tmp
+        binds += ["--ro-bind", str(exe_dir), str(exe_dir)]
+    # Last, so a read-only ancestor bind above cannot shadow them.
+    binds += ["--bind", str(run), str(run), "--bind", str(shared), str(shared)]
+    # The real HOME is read-only (linked ~/Repos and ~/.claude/plugins
+    # included) and ~/.ssh is hidden; only the run, the shared log dir and
+    # the credentials file (token refresh) stay writable.
+    creds = REAL_HOME / ".claude/.credentials.json"
+    home_guard = ["--ro-bind", str(REAL_HOME), str(REAL_HOME)]
+    # Hiding ~/.ssh only when there is one. bwrap creates a mount point
+    # before mounting, and the read-only bind above makes that mkdir fail
+    # on a host without the directory -- a CI runner -- taking down every
+    # run with "Can't mkdir: Read-only file system". Nothing is left
+    # unguarded by skipping it: that same read-only bind means no ~/.ssh
+    # can appear during the run either.
+    if (REAL_HOME / ".ssh").is_dir():
+        home_guard += ["--tmpfs", str(REAL_HOME / ".ssh")]
+    if creds.is_file():
+        home_guard += ["--bind", str(creds), str(creds)]
+    # A private pid namespace with its own procfs. Dropping a variable from
+    # the child's environment is not isolation while the child can read it
+    # back out of an ancestor's /proc entry: the harness itself holds what the
+    # run must not have, GitHub Actions' identity-token endpoint and bearer
+    # among it. `kernel.yama.ptrace_scope` is 1 on the hosts measured, which
+    # already refuses a descendant that read, but a sandbox must not rest on a
+    # sysctl it does not set. It also drops the host's process list from view
+    # -- 933 entries to 4, measured here.
+    return [shutil.which("bwrap"), "--dev-bind", "/", "/",
+            "--unshare-pid", "--proc", "/proc",
+            *home_guard, "--tmpfs", "/tmp",
+            *binds, "--chdir", str(work), "--", *argv]
+
+
 def events_of(text: str) -> list[dict]:
     out = []
     for line in text.splitlines():
@@ -353,35 +401,9 @@ def run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
     # --strict-mcp-config: nothing from the real HOME's MCP config loads.
     if (run / "mcp.json").is_file():
         argv += ["--mcp-config", str(run / "mcp.json")]
-    # A private /tmp per run. Agents write literal /tmp paths, and concurrent
-    # runs sharing the real one leaked into each other: two dogfood runs picked
-    # the same /tmp output dir and one "ran" its e2e by reusing the other's
-    # verdict. Only this run's own directory is bound back in.
     bwrap = shutil.which("bwrap")
     if bwrap:
-        binds = []
-        exe_dir = pathlib.Path(args.claude).resolve().parent
-        if str(exe_dir).startswith("/tmp"):  # else hidden by the private /tmp
-            binds += ["--ro-bind", str(exe_dir), str(exe_dir)]
-        # Last, so a read-only ancestor bind above cannot shadow them.
-        binds += ["--bind", str(run), str(run), "--bind", str(shared), str(shared)]
-        # The real HOME is read-only (linked ~/Repos and ~/.claude/plugins
-        # included) and ~/.ssh is hidden; only the run, the shared log dir and
-        # the credentials file (token refresh) stay writable.
-        creds = REAL_HOME / ".claude/.credentials.json"
-        home_guard = ["--ro-bind", str(REAL_HOME), str(REAL_HOME)]
-        # Hiding ~/.ssh only when there is one. bwrap creates a mount point
-        # before mounting, and the read-only bind above makes that mkdir fail
-        # on a host without the directory -- a CI runner -- taking down every
-        # run with "Can't mkdir: Read-only file system". Nothing is left
-        # unguarded by skipping it: that same read-only bind means no ~/.ssh
-        # can appear during the run either.
-        if (REAL_HOME / ".ssh").is_dir():
-            home_guard += ["--tmpfs", str(REAL_HOME / ".ssh")]
-        if creds.is_file():
-            home_guard += ["--bind", str(creds), str(creds)]
-        argv = [bwrap, "--dev-bind", "/", "/", *home_guard, "--tmpfs", "/tmp",
-                *binds, "--chdir", str(work), "--", *argv]
+        argv = sandboxed(argv, claude=args.claude, run=run, shared=shared, work=work)
     verdict["isolated_tmp"] = bool(bwrap)
     t0 = time.monotonic()
     try:
