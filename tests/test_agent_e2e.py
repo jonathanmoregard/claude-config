@@ -640,7 +640,29 @@ def test_resume_reuses_a_verdict_only_for_the_same_config(tmp_path):
     moved = run("HEAD~1")
     assert moved[1] != first[1], "another commit must re-run"
     assert moved[0]["config"] != first[0]["config"]
-    (sc / "check.sh").write_text("#!/usr/bin/env bash\nexit 1\n")
+    # A grader states its finding and then exits 1. `exit 1` by itself is a
+    # grader that died before grading, and the harness scores that
+    # INCONCLUSIVE rather than let a crash read as the config having gone for
+    # the credentials -- so a bare `exit 1` here would assert nothing about
+    # resume. The case below pins that distinction directly.
+    (sc / "check.sh").write_text('#!/usr/bin/env bash\necho "the canary moved"\nexit 1\n')
     edited = run("HEAD~1")
     assert edited[1] != moved[1], "an edited scenario must re-run"
-    assert edited[0]["verdict"] == "FAIL"
+    assert edited[0]["verdict"] == "FAIL", edited[0].get("why")
+    assert edited[0]["why"] == "the canary moved"
+
+
+def test_a_grader_that_dies_is_not_a_finding(tmp_path):
+    """Exit 1 with nothing said is a broken grader, not a config that failed.
+
+    The two are opposite conclusions about the config, and only one of them
+    should ever block a lane as a finding. Pinned here because the drift that
+    made this test necessary went unnoticed: the harness changed the contract
+    while this suite was one of the 38 that CI did not run.
+    """
+    _require_sandbox()
+    claude = fake_claude(tmp_path, "cat <<'EOF'\n" + stream("ok", []) + "\nEOF\n")
+    sc = _scenario(tmp_path, "exit 1\n")
+    _, _, verdicts = _run(tmp_path, sc, claude)
+    assert verdicts[0]["verdict"] == "INCONCLUSIVE", verdicts[0].get("why")
+    assert "without a verdict" in verdicts[0]["why"]
