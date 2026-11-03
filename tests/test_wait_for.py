@@ -23,6 +23,13 @@ FAKE = REPO / "tests" / "stubs" / "wait-for-fake.py"
 RUN_DONE = {"status": "completed", "conclusion": "success", "name": "infra"}
 RUN_BUSY = {"status": "in_progress", "conclusion": "", "name": "infra"}
 
+# The scripted `ExecMainStartTimestamp`s below are what systemd prints on a
+# Europe/Stockholm host, abbreviation included, so the run reads them in that
+# zone. Pinning it is not what makes the timestamp cases correct — `host_epoch`
+# is — but it keeps every run in one zone instead of the runner's, which is one
+# fewer thing that differs between this laptop and CI.
+TEST_TZ = {"TZ": "Europe/Stockholm"}
+
 
 def run_wait_for(
     tmp_path: Path,
@@ -51,20 +58,7 @@ def run_wait_for(
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "FAKE_SCRIPT": str(state),
         "FAKE_LOG": str(log),
-        # Every scripted `ExecMainStartTimestamp` below is what systemd prints
-        # on a Europe/Stockholm host, abbreviation included, so the run must
-        # happen in that zone. In production the zone in systemd's output and
-        # the zone `date -d` reads it in are the same by construction; a test
-        # host is the only place they can differ, and then the parse shifts by
-        # the offset. Measured: on the GitHub runner (TZ=UTC) `08:00:00 CEST`
-        # came back as 08:00Z rather than 06:00Z, which is one hour past a
-        # record stamped 07:00Z, so a failure the run could not account for
-        # was cleared as superseded and
-        # test_success_keeps_a_failure_record_it_cannot_account_for failed
-        # there while passing on this laptop. Pinning the zone fixes it either
-        # way: 08:00 local on 2026-10-04 in Stockholm IS 06:00Z whether the
-        # abbreviation is honoured or ignored.
-        "TZ": "Europe/Stockholm",
+        **TEST_TZ,
     }
     env.update(extra_env or {})
     (tmp_path / "home").mkdir(exist_ok=True)
@@ -337,9 +331,32 @@ SUCCEEDED_UNIT = {
     "LoadState": "loaded", "ActiveState": "active", "SubState": "exited",
     "Type": "simple", "Transient": "yes", "CollectMode": "none",
     "InvocationID": "run-job", "Result": "success", "ExecMainStatus": "0",
-    # 06:00:00Z
     "ExecMainStartTimestamp": "Sat 2026-10-04 08:00:00 CEST",
 }
+
+
+def host_epoch(stamp: str) -> int:
+    """What `wait-for`'s own `to_epoch` makes of a systemd timestamp, here.
+
+    These two cases turn on whether a failure record is older or newer than the
+    verified run, so they need the run's instant as THIS host reads it, not as
+    the fixture's zone implies. Hard-coding the offset measured the host's
+    `date` instead: a GitHub runner cleared a record stamped an hour after
+    `08:00:00 CEST`, so it had resolved that string to a different instant than
+    this laptop does, and the case failed there while passing here. Asking the
+    same `date` the script will ask removes the question — the ordering under
+    test is then exact wherever this runs, and no zone table has to agree with
+    anyone's.
+    """
+    out = subprocess.run(["date", "-d", stamp, "+%s"],
+                         capture_output=True, text=True, env={**os.environ, **TEST_TZ})
+    assert out.returncode == 0, f"this host cannot read a systemd timestamp: {out.stderr}"
+    return int(out.stdout.strip())
+
+
+def utc_stamp(epoch: int) -> str:
+    """The recorder's own format: ISO-8601 in UTC, which parses unambiguously."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
 
 
 def write_record(tmp_path: Path, slug: str, body: dict) -> Path:
@@ -353,8 +370,9 @@ def test_success_clears_a_failure_record_it_supersedes(tmp_path: Path) -> None:
     # Nothing else can clear it: RemainAfterExit keeps the successful unit
     # active, so its own ExecStopPost has not run. Measured without this fix,
     # every SessionStart kept announcing a job that had since been fixed.
+    run_at = host_epoch(SUCCEEDED_UNIT["ExecMainStartTimestamp"])
     record = write_record(tmp_path, "gate", {"unit": "gate.service",
-                                             "failed_at": "2026-10-04T05:00:00Z"})
+                                             "failed_at": utc_stamp(run_at - 3600)})
     rc, out, _ = run_wait_for(
         tmp_path, {"systemctl": [SUCCEEDED_UNIT]}, "unit", "gate", "--user"
     )
@@ -366,7 +384,8 @@ def test_success_keeps_a_failure_record_it_cannot_account_for(tmp_path: Path) ->
     # A record newer than the verified run, or one whose timestamp cannot be
     # read, is kept. A stale announcement is noise; dropping a real failure is
     # silence, which is the failure mode this script exists to remove.
-    for body in ({"failed_at": "2026-10-04T07:00:00Z"},
+    run_at = host_epoch(SUCCEEDED_UNIT["ExecMainStartTimestamp"])
+    for body in ({"failed_at": utc_stamp(run_at + 3600)},
                  {"failed_at": "not a timestamp"},
                  {"unit": "gate.service"}):
         record = write_record(tmp_path, "gate", body)
