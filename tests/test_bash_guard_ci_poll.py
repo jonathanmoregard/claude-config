@@ -21,12 +21,23 @@ import os
 import subprocess
 import sys
 
+# This module is a SCRIPT SUITE: every check below runs at import time and the
+# verdict is this file's exit status. Importing it under pytest would run the
+# whole body just to collect it, so the module stops here with a visible skip
+# naming the real invocation. `tests/conftest.py` turns this marker back into
+# one real test that runs the file as a script, so CI needs no list of these.
+if __name__ != "__main__":
+    import pytest
+
+    pytest.skip("script suite: run `python3 tests/test_bash_guard_ci_poll.py` "
+                "(exit 0 = all green); pytest cannot import it",
+                allow_module_level=True)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
+# `runtime/` once the layout migration has landed, the repository root before it;
+# only the shipped subset moved, tests/ stays at the root.
 REPO_ROOT = os.path.dirname(HERE)
-# The deployed subset moved under runtime/; same fallback idiom as the other
-# suites (tests/test_bash_guard_pre.py, tests/test_wait_for.py).
-RUNTIME = (os.path.join(REPO_ROOT, "runtime")
-           if os.path.isdir(os.path.join(REPO_ROOT, "runtime")) else REPO_ROOT)
+RUNTIME = os.path.join(REPO_ROOT, "runtime") if os.path.isdir(os.path.join(REPO_ROOT, "runtime")) else REPO_ROOT
 GUARD = os.path.join(RUNTIME, "hooks", "bash-guard.py")
 SETTINGS = os.path.join(RUNTIME, "settings.json")
 

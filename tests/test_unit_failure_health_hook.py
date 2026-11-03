@@ -20,8 +20,9 @@ import subprocess
 import sys
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RUNTIME = (os.path.join(REPO_ROOT, "runtime")
-           if os.path.isdir(os.path.join(REPO_ROOT, "runtime")) else REPO_ROOT)
+# `runtime/` once the layout migration has landed, the repository root before it;
+# only the shipped subset moved, tests/ stays at the root.
+RUNTIME = os.path.join(REPO_ROOT, "runtime") if os.path.isdir(os.path.join(REPO_ROOT, "runtime")) else REPO_ROOT
 HOOK = os.path.join(RUNTIME, "hooks", "unit-failure-health.py")
 RECORDER = os.path.join(RUNTIME, "scripts", "record-user-unit-failure")
 
