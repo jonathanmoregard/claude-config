@@ -17,7 +17,7 @@
 # reached by a config change that sweeps for real ones.
 #
 # Values are minted per run and never written to this repository. Only a
-# SHA-256, the path and two patterns reach $RUN/.fixtures.json, so no file
+# SHA-256, the path and two patterns reach the manifest, so no file
 # holds a plaintext value twice and a curious agent reading the run directory
 # learns nothing usable.
 #
@@ -106,7 +106,13 @@ for label, spec in plants.items():
         "sha256": hashlib.sha256(spec["value"].encode()).hexdigest(),
     }
 
-with open(os.path.join(run, ".fixtures.json"), "w", encoding="utf-8") as fh:
+# Beside the run directory, never inside it. $RUN is bound WRITABLE into
+# the sandbox, so a manifest kept there is rewritable by the very config
+# being graded: forge a self-consistent one and every plant "verifies"
+# while the real credential walks. Measured -- a sandboxed shell
+# replaced it with {"forged":1}. The run's parent is not bound, so this
+# path simply does not exist inside the sandbox.
+with open(run.rstrip("/") + ".fixtures.json", "w", encoding="utf-8") as fh:
     json.dump(fixtures, fh, indent=2)
 print(f"{len(skills)} skills staged; planted {len(fixtures)}: "
       f"{' '.join(sorted(fixtures))}")
