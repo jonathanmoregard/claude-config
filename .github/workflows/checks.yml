@@ -48,14 +48,17 @@ jobs:
     # pathological file -- burns up to GitHub's six-hour default before anyone
     # finds out, on a public repository's shared minutes.
     #
-    # Sized from a measured local run, not a guess: the pytest step alone is
-    # 598s, of which about 5.5 minutes is three self-running script suites
-    # executing as subprocesses, and the shell suites and provisioning add a
-    # few more. Call it 15 minutes of real work on this laptop, so 40 leaves
-    # room for a slower, contended runner while still catching a true hang
-    # well inside the hour. `SCRIPT_SUITE_TIMEOUT_S` in tests/conftest.py is
-    # 900s, deliberately inside this ceiling, so one hung script suite is
-    # reported as a failed test rather than as a killed job.
+    # Sized from measured local runs, not a guess, and the spread is the point:
+    # the pytest step is 344s on an idle machine and 832s on the same tree with
+    # other work competing for the cores -- a factor of 2.4 from contention
+    # alone, which is exactly what a shared runner serves up. The shell suites
+    # and the four provisioning steps add a few minutes. So 40 is built on the
+    # CONTENDED figure rather than the fast one, and still catches a true hang
+    # well inside the hour.
+    #
+    # `SCRIPT_SUITE_TIMEOUT_S` in tests/conftest.py is 900s, deliberately
+    # inside this ceiling, so one hung script suite is reported as a failed
+    # test rather than as a killed job.
     timeout-minutes: 40
     steps:
       # Pinned to the commit, not the tag: `v4` is a moving ref that the
@@ -181,23 +184,74 @@ jobs:
       #
       # The `live suite:` gate is the counterpart: two modules drive a real paid
       # `claude -p` AT IMPORT TIME, so merely collecting them starts billable
-      # calls. They stay skipped here and are run deliberately by
-      # `tests/smoke.sh`, which discovers them. That is not a weakening of those
-      # suites -- it is the only way `pytest tests` can be safe to run at all.
+      # calls. Gating them is the only way `pytest tests` can be safe to run at
+      # all, here or on a laptop. Their proofs are not weakened -- run as
+      # `python3 tests/<module>.py` every probe still fires -- but they now have
+      # no automatic runner, and that is a real gap rather than a tidy
+      # separation. `tests/smoke.sh` was the only thing that ever invoked them,
+      # and its TEST 50 discovery greps `$WORKTREE/hooks`, a directory the
+      # `runtime/` cutover emptied, so it hard-fails at discovery. Repairing
+      # smoke.sh is its own job: 63 of its path references point into the old
+      # layout, and no part of it can be verified without a paid run.
       #
-      # What is NOT run, and why. Two whole-file `--ignore`s, and five single
-      # cases held out with `--deselect` rather than `--ignore` on purpose: a
-      # file-level exclusion would have taken 126 passing assertions out of the
-      # gate along with the five, which is how coverage quietly evaporates.
+      # What is NOT run, and why. These are exclusions of things that cannot run
+      # here or are known-red, NOT an inclusion list. A suite added tomorrow is
+      # picked up with no edit to this file, which is the property that matters.
       #
-      # These are exclusions of things that cannot run here or are known-red,
-      # NOT an inclusion list. A suite added tomorrow is picked up with no edit
-      # to this file, which is the property that matters.
+      # Single cases are held out with `--deselect` rather than `--ignore`
+      # wherever the rest of the file passes: a file-level exclusion would have
+      # taken 229 passing assertions out of the gate along with them, which is
+      # how coverage quietly evaporates.
       #
-      # Of the five single cases, FOUR are tests that are correctly reporting a
-      # real problem in shipped code or config. They are held out because this
-      # change is not authorized to alter that code, not because they are
-      # wrong. Fix the underlying defect and the deselect line goes away:
+      # Say plainly what kind of thing this list is. It IS a hand-maintained
+      # list, the one thing the rest of this file argues against -- so the
+      # distinction that matters is the failure mode. The stale list this change
+      # replaced failed SILENTLY: a suite nobody ran reported nothing. This one
+      # fails LOUDLY: add a dcg-dependent case to a class below and it goes red
+      # here, because the exclusions name what exists today rather than
+      # describing a category. Red is a signal; silence was not.
+      #
+      # GROUP 1 -- requires a host binary a GitHub runner cannot have.
+      # These were measured, not assumed. The local gate for this change was
+      # green only because this developer's machine carries `secret-redact`,
+      # `agent-activity` and `dcg` in its user profile; a sweep under a PATH
+      # holding exactly what the steps above provision found 52 failures that a
+      # runner would have hit on every pull request. None of the three is
+      # provisionable: unlike `shfmt`, `gitleaks` and `detect-secrets`, they are
+      # nixos-config packages with no apt, pip or Go story, so the argument
+      # those three steps make ("provision the tool rather than degrade the
+      # test") has nowhere to land here.
+      #
+      #   test_tool_output_redact   `secret-redact`. Absent, the suite exits 1
+      #   test_bash_guards           and in two of the three also dies on an
+      #   test_bash_guard_post       uncaught traceback -- the guard reports
+      #                              itself BROKEN, correctly, and the suite is
+      #                              measuring a guard that cannot run.
+      #                              test_bash_guard_post additionally resolves
+      #                              a sibling hook through `agent-activity`.
+      #   git-broker (12 entries)    `dcg` (37 cases) and `bwrap` (8). The
+      #                              broker refuses to build a sandbox when
+      #                              either is missing -- "BROKEN safety
+      #                              boundary", server.py:949 -- which is the
+      #                              right behaviour and leaves nothing to
+      #                              test. Six whole classes plus six single
+      #                              cases, so 103 of the file's 152 stay
+      #                              enforced here. The better fix is for the
+      #                              suite to resolve those two the way it
+      #                              already resolves `git`
+      #                              (`shutil.which(...) or ...`, line 1007) and
+      #                              stubs the validator elsewhere; that is a
+      #                              rework of argv assertions across 49
+      #                              containment cases, not a path repair, so it
+      #                              is a follow-up rather than part of this
+      #                              change.
+      #
+      # GROUP 2 -- correctly reporting a real defect in shipped code or config.
+      #
+      # Of the five, FOUR are tests correctly reporting a real problem in
+      # shipped code or config. They are held out because this change is not
+      # authorized to alter that code, not because they are wrong. Fix the
+      # underlying defect and the deselect line goes away:
       #
       #   fail_open_paths::...no_policy_or_state_override
       #     `runtime/mcp-servers.json` has no `egress-guard` entry, so the
@@ -230,7 +284,7 @@ jobs:
       #     subprocess reads `time.time()` directly, so fixing it needs either a
       #     clock override in production code or a relative-time stub fixture.
       #
-      # And the two whole-file exclusions:
+      # GROUP 3 -- whole-file, for reasons that are not about a missing binary:
       #
       #   tests/agent-e2e          Scenarios dispatch REAL headless agents and
       #                            cost real money per run. It holds no
@@ -244,16 +298,43 @@ jobs:
       #                            that does not exist. Pending a decision on
       #                            whether the cascade returns. NOT a path
       #                            repair.
+      #
+      # Nothing is excluded for flaking. One case did flake in this branch's own
+      # gate -- permission-ledger/test_aggregate::...hung_scanner_is_killed...,
+      # in the whole-corpus run that took 832s where an isolated run takes 2s --
+      # and it was hardened rather than held out, because a suite excluded for
+      # being flaky is a suite that stops reporting. It sampled a pid once at
+      # the instant the call returned, which races the kernel's reaping of the
+      # orphan; it now polls the condition. Hardening it also showed that the
+      # liveness check could not observe the regression it exists for at all,
+      # so the case now asserts the elapsed time, which is where that defect is
+      # actually visible. See the commit for the measurements.
       - name: The guards still detect what they are for
         run: |
           python3 -m pip install --disable-pip-version-check --quiet 'pytest>=8,<9'
+          GB=tests/mcps/git-broker/test_git_broker.py
           python3 -m pytest tests -q \
             --ignore=tests/agent-e2e \
             --ignore=tests/test_arftl_gate_cascade.py \
+            --ignore=tests/test_tool_output_redact.py \
+            --ignore=tests/test_bash_guards.py \
+            --ignore=tests/test_bash_guard_post.py \
+            --deselect "$GB::BlackBoxBrokerTests" \
+            --deselect "$GB::BlackBoxParityTests" \
+            --deselect "$GB::ContainmentArgvTests" \
+            --deselect "$GB::IgnoredWorktreeRemovalTests" \
+            --deselect "$GB::DestructiveOperationSafetyTests" \
+            --deselect "$GB::CloneDispatchTests" \
+            --deselect "$GB::ToolExecutionTests::test_branch_set_upstream_config_failure_exits_one" \
+            --deselect "$GB::ToolExecutionTests::test_git_tool_validates_every_boundary_before_running" \
+            --deselect "$GB::ToolExecutionTests::test_push_keeps_success_when_recording_upstream_fails" \
+            --deselect "$GB::ToolExecutionTests::test_validator_refusal_prevents_sandbox_build_and_spawn" \
+            --deselect "$GB::ParityOperationArgvTests::test_clone_sandbox_binds_only_the_new_target_writable" \
+            --deselect "$GB::ParityOperationArgvTests::test_local_sequencer_runs_offline_with_editor_disabled" \
+            --deselect "$GB::PolicySchemaTests::test_real_policy_reaches_claude_and_nixos_worktree_roots" \
             --deselect 'tests/test_fail_open_paths.py::test_registered_server_carries_no_policy_or_state_override' \
             --deselect 'tests/test_aggregator_recall_health_hook.py::test_a_probe_file_with_no_permissions_is_still_found_and_reported_on' \
             --deselect 'tests/test_harness_runtime_dirs_ignored.py::HarnessRuntimeIsIgnored::test_every_exclusion_is_ignored' \
-            --deselect 'tests/mcps/git-broker/test_git_broker.py::PolicySchemaTests::test_real_policy_reaches_claude_and_nixos_worktree_roots' \
             --deselect 'tests/ai-router/test_jobs.py::test_quota_failure_writes_rejected_and_retries_once'
 
       # Shell suites, by the naming convention already in the tree rather than

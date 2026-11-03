@@ -218,12 +218,19 @@ from concurrent.futures import ThreadPoolExecutor
 # stale path was acting as an accidental interlock, and repairing the path
 # removed it.
 #
-# The gate is on IMPORT, not on the suite. `tests/smoke.sh` discovers and runs
-# this file as `python3 tests/test_deny_globs.py`, where `__name__` is
-# `__main__` and every probe still runs. So the guarantee the suite was written
-# to enforce is untouched -- and deliberately so: making the deny-glob proof
-# opt-in behind an env var was once the bug, because the gate then ran its
-# offline half only and proved nothing about the CLI's permission surface.
+# The gate is on IMPORT, not on the suite: run as `python3 tests/test_deny_globs.py`
+# this file still has `__name__ == "__main__"` and every probe runs exactly as
+# before. Nothing about the proof itself is weakened -- and deliberately so,
+# because making the deny-glob proof opt-in behind an env var was once the bug:
+# the gate then ran its offline half only and proved nothing about the CLI's
+# permission surface.
+#
+# But that leaves the suite with no automatic runner, which is worth stating
+# plainly rather than implying CI covers it. `tests/smoke.sh` TEST 50 was the
+# only thing that ever invoked this file, and its discovery greps
+# `$WORKTREE/hooks` -- emptied by the `runtime/` cutover -- so it now hits
+# `fail "50: DISCOVERY FAILED"` instead. Until smoke.sh is repaired, this proof
+# runs only when somebody runs it.
 #
 # `live suite:`, not `script suite:` -- tests/conftest.py converts the latter
 # into a subprocess run, which is exactly what must NOT happen here.
@@ -231,8 +238,8 @@ if __name__ != "__main__":
     import pytest
 
     pytest.skip("live suite: drives a real `claude -p` at import time and costs "
-                "real money; run `python3 tests/test_deny_globs.py`, or "
-                "`bash tests/smoke.sh`, which discovers it",
+                "real money; run it deliberately with "
+                "`python3 tests/test_deny_globs.py` (exit 0 = all green)",
                 allow_module_level=True)
 
 HERE = os.path.dirname(os.path.abspath(__file__))

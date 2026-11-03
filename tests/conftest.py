@@ -100,8 +100,8 @@ def state_dir(tmp_path):
 #
 #   * pytest modules, which define `test_*` functions;
 #   * self-running scripts, which run every check at IMPORT time and whose
-#     exit status is the verdict. `tests/smoke.sh` has always invoked these as
-#     `python3 tests/<module>.py`, by discovery rather than by a list.
+#     exit status is the verdict. The established way to run one is
+#     `python3 tests/<module>.py`, where exit 0 means every check passed.
 #
 # Pointing pytest at the tree used to mishandle the second kind in three
 # different ways, all of them silent or worse: a module that merely collects
@@ -123,8 +123,18 @@ def state_dir(tmp_path):
 # failure mode of a stale list is silence.
 #
 # A `live suite:` gate is deliberately NOT matched here. Those modules drive a
-# real paid CLI, and they must stay skipped under pytest while `smoke.sh`
-# continues to run them standalone.
+# real paid CLI at import time, so a subprocess run of one spends money; they
+# must stay skipped under pytest and be invoked by hand, deliberately.
+#
+# Be clear about what that costs, because it is a real gap and not a tidy
+# separation of concerns: `tests/smoke.sh` is the only thing that ever ran them
+# automatically, and its TEST 50 discovery greps `$WORKTREE/hooks` -- a
+# directory the `runtime/` cutover emptied. It therefore reaches
+# `fail "50: DISCOVERY FAILED"` before running anything, so the two live suites
+# at present run NOWHERE. Loudly, at least: that block asserts a non-empty
+# discovery precisely so an empty result cannot read as a pass. Repairing
+# smoke.sh is a separate job -- 63 of its path references point into the old
+# layout -- and it cannot be verified without a paid run.
 SCRIPT_SUITE_SENTINEL = 'pytest.skip("script suite:'
 
 # Well under the `checks` job's own timeout-minutes, so a hung suite is
