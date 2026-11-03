@@ -16,7 +16,9 @@ Exit: 0 = all green, 1 = at least one failure.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
+import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -26,6 +28,7 @@ REPO_ROOT = os.path.dirname(HERE)
 RUNTIME = (os.path.join(REPO_ROOT, "runtime")
            if os.path.isdir(os.path.join(REPO_ROOT, "runtime")) else REPO_ROOT)
 GUARD = os.path.join(RUNTIME, "hooks", "bash-guard.py")
+SETTINGS = os.path.join(RUNTIME, "settings.json")
 
 spec = importlib.util.spec_from_file_location("bash_guard", GUARD)
 bg = importlib.util.module_from_spec(spec)
@@ -178,10 +181,17 @@ LOCAL_ALLOW = [
     # a short, bounded retry
     "for i in 1 2 3; do curl -sf http://localhost:3000 && break; sleep 2; done",
     "for i in $(seq 1 5); do test -S /tmp/pg/.s.PGSQL.5432 && break; sleep 1; done",
+    # A bounded measurement script samples state; it does not wait for a
+    # completion condition and must be allowed even when the sample interval
+    # exceeds the short-retry budget.
+    "for sample in $(seq 1 6); do sleep 10; systemctl --user show probe.service -p ActiveState -p Result; done",
     # a readiness settle right after starting the target, bounded by the
     # command itself to the foreground timeout (real, 2026-10)
     "systemctl --user restart llm-guard-daemon.service && sleep 2 && for i in $(seq 1 60); do\n  if curl -fsS --max-time 2 http://127.0.0.1:8787/health >/dev/null 2>&1; then echo ok; break; fi\n  sleep 1\ndone; tail -3 ~/.claude/logs/llm-guard-daemon.log",
     "(python3 -m http.server 8765 >/dev/null 2>&1 &) ; for i in $(seq 1 20); do curl -sf localhost:8765 && break; sleep 0.5; done",
+    # The readiness loop taught by detached-long-commands probes an SSH
+    # banner after launch. It is not a completion poll.
+    "systemd-run --user --unit=probe-vm vm-launch; for i in $(seq 1 60); do timeout 5 ssh-keyscan -p 2222 -T 5 127.0.0.1 | head -1 && break; sleep 1; done",
     # a sleep keeping a pipe's stdin open is not a wait (real, MCP smoke tests)
     "(printf '{\"jsonrpc\":\"2.0\",\"id\":1}\\n'; sleep 2) | timeout 5 uv run python -m srv.main 2>&1 | tail -5",
     # the shape quoted as data
@@ -199,21 +209,20 @@ def main() -> int:
         reason = bg._check_local_poll(cmd, background=False)
         check(f"deny: {cmd[:70]!r}", reason is not None)
         if reason is not None:
-            check("  reason says run_in_background", "run_in_background" in reason)
-            check("  reason says end the turn", "end your turn" in reason)
-            check("  reason says a subagent's task survives", "subagent" in reason)
+            check("  reason names durable job primitive", "wait-for job <slug> -- <cmd>" in reason)
+            check("  reason ranks background wait first", "run_in_background" in reason)
 
     print("== local: legitimate shapes pass ==")
     for cmd in LOCAL_ALLOW:
         check(f"allow: {cmd[:70]!r}", bg._check_local_poll(cmd, background=False) is None)
+    measurement = next(cmd for cmd in LOCAL_ALLOW if "probe.service" in cmd)
+    check("systemd measurement also passes the earlier CI/unit layer",
+          bg._check_ci_poll(measurement, background=False) is None)
 
     print("== local: the sanctioned wait is the same loop in the background ==")
     for cmd in LOCAL_DENY:
         check(f"bg allow: {cmd[:60]!r}", bg._check_local_poll(cmd, background=True) is None)
 
-    # Headless `claude -p` exits once the main conversation is idle and kills
-    # subagent-owned background commands (agent e2e, 2026-11-02), so a
-    # subagent there is never re-invoked: the layer stays out of its way.
     print("== local: who the layer applies to ==")
     applies = bg._local_poll_applies
     check("main session, interactive", applies({}, "cli"))
@@ -221,8 +230,27 @@ def main() -> int:
     check("subagent, interactive (re-invoked by its own bg command)",
           applies({"agent_id": "a1", "agent_type": "worker-hard"}, "cli"))
     check("subagent, entrypoint unset counts as interactive", applies({"agent_id": "a1"}, None))
-    check("subagent, headless: not re-invoked, so not denied",
-          not applies({"agent_id": "a1", "agent_type": "worker-hard"}, "sdk-cli"))
+    check("subagent, headless: durable systemd job replaces the exemption",
+          applies({"agent_id": "a1", "agent_type": "worker-hard"}, "sdk-cli"))
+
+    print("== local: Monitor cannot bypass the same wait gate ==")
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Monitor",
+        "tool_input": {"command": LOCAL_DENY[0]},
+    }
+    proc = subprocess.run(
+        [sys.executable, "-S", "-E", GUARD], input=json.dumps(payload),
+        capture_output=True, text=True, timeout=10,
+    )
+    check("Monitor loop is denied", '"permissionDecision": "deny"' in proc.stdout)
+    configured = json.load(open(SETTINGS, encoding="utf-8"))
+    guard_entries = [
+        entry for entry in configured["hooks"]["PreToolUse"]
+        if any("bash-guard.py" in hook.get("command", "") for hook in entry.get("hooks", []))
+    ]
+    check("settings offers Bash and Monitor to bash-guard",
+          len(guard_entries) == 1 and guard_entries[0].get("matcher") == "^(Bash|Monitor)$")
 
     print("== foreground sleep + one-shot CI snapshot is denied ==")
     for cmd in DENY:

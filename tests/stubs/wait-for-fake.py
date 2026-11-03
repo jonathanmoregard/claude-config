@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Scripted stand-in for `gh` and `systemctl` in the wait-for tests.
+"""Scripted stand-in for external commands in the wait-for tests.
 
 Installed on PATH under both names. `FAKE_SCRIPT` names a JSON file:
 
     {"gh": {"run watch": [<response>, ...], "run view": [...], ...},
-     "systemctl": [{"LoadState": "loaded", "ActiveState": "active", ...}, ...]}
+     "systemctl": [{"LoadState": "loaded", "ActiveState": "active", ...}, ...],
+     "journalctl": [{"stdout": [{...}], "rc": 0}],
+     "systemd-run": [{"stdout": "Running as unit: x.service", "rc": 0}]}
 
 A gh response is `{"rc": 0, "stdout": <json value or str>, "stderr": ""}`;
 each call to a subcommand consumes the next response and the last one repeats.
@@ -65,18 +67,56 @@ def fake_gh(argv: list[str]) -> int:
     return int(resp.get("rc", 0))
 
 
+def _counter_path(key: str) -> str:
+    return os.environ["FAKE_SCRIPT"] + "." + key.replace(" ", "_") + ".n"
+
+
+def _read_counter(key: str) -> int:
+    path = _counter_path(key)
+    return int(open(path).read()) if os.path.exists(path) else 0
+
+
+def _write_counter(key: str, value: int) -> None:
+    with open(_counter_path(key), "w") as fh:
+        fh.write(str(value))
+
+
 def fake_systemctl(argv: list[str]) -> int:
     script, _ = _state()
     phases = script["systemctl"]
+    if "show" not in argv:
+        return 0
     prop = argv[argv.index("-p") + 1]
+    idx = _read_counter("systemctl")
     if prop == "ActiveState":
-        idx = _bump("systemctl")
-    else:
-        counter = os.environ["FAKE_SCRIPT"] + ".systemctl.n"
-        idx = max(int(open(counter).read()) - 1, 0) if os.path.exists(counter) else 0
+        _write_counter("systemctl", idx + 1)
     phase = phases[min(idx, len(phases) - 1)]
     print(phase.get(prop, ""))
     return 0
+
+
+def fake_response(name: str) -> int:
+    script, _ = _state()
+    seq = script.get(name, [])
+    if not seq:
+        sys.stderr.write(f"fake {name}: no scripted response\n")
+        return 99
+    resp = seq[min(_bump(name), len(seq) - 1)]
+    out = resp.get("stdout", "")
+    if isinstance(out, list):
+        out = "\n".join(json.dumps(item) for item in out)
+    if out:
+        print(out)
+    if resp.get("stderr"):
+        sys.stderr.write(resp["stderr"] + "\n")
+    return int(resp.get("rc", 0))
+
+
+def fake_systemd_run() -> int:
+    rc = fake_response("systemd-run")
+    if rc == 0:
+        _write_counter("systemctl", 1)
+    return rc
 
 
 def fake_sleep() -> int:
@@ -101,6 +141,10 @@ def main() -> int:
         return fake_gh(argv)
     if name == "systemctl":
         return fake_systemctl(argv)
+    if name == "journalctl":
+        return fake_response("journalctl")
+    if name == "systemd-run":
+        return fake_systemd_run()
     if name == "sleep":
         return fake_sleep()
     sys.stderr.write(f"fake: unknown name {name}\n")

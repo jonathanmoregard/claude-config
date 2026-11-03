@@ -8,9 +8,10 @@ WAIT is a foreground Bash call that bash-guard's `_check_local_poll` (this
 checkout's) classifies as a wait; the same classifier grades both arms, so
 the old arm is measured by the new definition. Writes RUN/wait-metrics.json.
 
-PASS: the reported RESULT token is the job's real one, and the main session
-EXECUTED no foreground wait (one attempted and denied is the hook working), and — in subagent
-mode — the job ran inside the subagent, not the main session.
+PASS: the reported RESULT token is the job's real one, the main session
+EXECUTED no foreground wait, and the responsible agent used a background
+`wait-for job` for new work or `wait-for unit` for an existing run. One
+attempted foreground wait that the hook denied is the guard working.
 `running`(`-subagent`) grade like `main`, for a job started before the agent; a run whose
 job started on the launcher's fallback deadline (nothing read job.log) is INCONCLUSIVE.
 Exit 0 PASS, 1 FAIL, 2 INCONCLUSIVE (the job never ran, or was already done).
@@ -83,6 +84,12 @@ for who in ("main", "subagent"):
         "fg_wait_refused_otherwise": len(blocked),
         "fg_wait_executed": len(waits) - len(denied) - len(blocked),
         "ran_job": any("job.sh" in c["cmd"] for c in mine.values()),
+        "wait_for_job_bg": sum(
+            "wait-for job" in c["cmd"] and c["bg"] for c in mine.values()
+        ),
+        "wait_for_unit_bg": sum(
+            "wait-for unit" in c["cmd"] and c["bg"] for c in mine.values()
+        ),
         "fg_wait_cmds": [mine[k]["cmd"][:160] for k in waits],
     }
 
@@ -96,9 +103,9 @@ print(json.dumps({k: v for k, v in m.items() if k not in ("main", "subagent")}))
 for who in ("main", "subagent"):
     print(who, {k: v for k, v in m[who].items() if k != "fg_wait_cmds"})
 
-# Headless `claude -p` kills a subagent's background commands once the main
-# session is idle, so there a subagent's one foreground wait is correct and is
-# reported, not failed. The main session must never hold a foreground wait.
+# A headless subagent may lose its waiter, but the user unit remains durable;
+# the main session can adopt the same unit. No agent should hold a foreground
+# sleep-poll.
 executed = m["main"]["fg_wait_executed"]
 if not tokens and not m["main"]["ran_job"] and not m["subagent"]["ran_job"]:
     print("INCONCLUSIVE: the job never ran")
@@ -117,6 +124,11 @@ if executed:
     problems.append(f"{executed} foreground wait(s) executed")
 if mode == "subagent" and (m["main"]["ran_job"] or not m["subagent"]["ran_job"]):
     problems.append("the job did not run inside the subagent alone")
+owner = "subagent" if mode.endswith("subagent") else "main"
+primitive = "wait_for_unit_bg" if mode.startswith("running") else "wait_for_job_bg"
+if not m[owner][primitive]:
+    expected = "wait-for unit" if mode.startswith("running") else "wait-for job"
+    problems.append(f"{owner} did not use background {expected}")
 if problems:
     print("FAIL: " + "; ".join(problems))
     sys.exit(1)

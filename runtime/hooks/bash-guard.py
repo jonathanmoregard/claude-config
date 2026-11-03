@@ -2379,6 +2379,8 @@ def _check_ci_poll(command: str, background: bool) -> str | None:
     if background:
         return None
     has_sleep = has_snapshot = has_unit_read = acts_on_unit = in_loop = False
+    has_systemd_show = has_break = False
+    loop_kinds: set[str] = set()
     longest_sleep = 0.0
     shell_text, live_bodies = _split_heredocs(command)
     segments = _pipeline_subcommands(shell_text)
@@ -2394,12 +2396,14 @@ def _check_ci_poll(command: str, background: bool) -> str | None:
             raw = seg.split()
         if raw and raw[0] in _LOOP_KEYWORDS:
             in_loop = True
+            loop_kinds.add(raw[0])
         toks = _segment_tokens(seg)
         if not toks:
             continue
         verb = _systemctl_verb(toks)
         if verb in _UNIT_STATUS_VERBS:
             has_unit_read = True
+            has_systemd_show = has_systemd_show or verb == "show"
             continue
         if verb in _UNIT_ACTION_VERBS:
             acts_on_unit = True
@@ -2413,6 +2417,11 @@ def _check_ci_poll(command: str, background: bool) -> str | None:
             return None
         elif _is_ci_snapshot(toks):
             has_snapshot = True
+        has_break = has_break or toks[0] in ("break", "exit", "return")
+    # A finite for-loop that samples systemd without an outcome-dependent
+    # break is a measurement, not a completion wait.
+    if has_systemd_show and loop_kinds == {"for"} and not has_break:
+        return None
     if has_sleep and has_unit_read and not acts_on_unit and (
         in_loop or longest_sleep > _UNIT_SETTLE_S
     ):
@@ -2423,12 +2432,11 @@ def _check_ci_poll(command: str, background: bool) -> str | None:
 # ----------------------------------------------------------------------
 # Layer 5b: foreground waits on LOCAL state
 # ----------------------------------------------------------------------
-# The same hand-rolled wait, aimed at a log, a marker file or a process
-# instead of CI: `until grep -q DONE log; do sleep 15; done`, `sleep 60; tail
-# log`. Live 2026-11-02: a worker-hard subagent waited out its own job that
-# way, in the foreground. The sanctioned shape is the identical loop with
-# run_in_background: true, which exits once and re-invokes the session, so
-# only the foreground form is denied.
+# The same hand-rolled wait, aimed at a log, a marker file or a process instead
+# of CI: `until grep -q DONE log; do sleep 15; done`, `sleep 60; tail log`.
+# Durable jobs belong to `wait-for job`; an already-launched unit belongs to
+# `wait-for unit`. Both are run in the background so the unit, rather than the
+# agent process, owns the work.
 #
 # Matching is structural, not a list of spellings: denying one spelling just
 # renames the symptom (anthropics/claude-code#77873). So a sleep inside ANY
@@ -2441,24 +2449,21 @@ def _check_ci_poll(command: str, background: bool) -> str | None:
 #
 # The deny reason carries the replacement, because the reason text is what
 # redirects the model; prompt text alone was reported not to hold (#77873,
-# #44957). Subagents are told explicitly that ending the turn does not end
-# their task — they were re-invoked by their own background command's exit in
-# the 2026-11-02 klaffat session. Except under headless `claude -p`, where
-# that is false for a subagent; see `_local_poll_applies`.
+# #44957). It promises durable state, not subagent reinvocation.
 _LOCAL_POLL_HINT = (
     "bash-guard: foreground wait denied — this command sleeps in a loop, or "
     "sleeps and then reads a log, file or process, to wait for local work. A "
     "foreground wait holds your turn and usually returns \"not yet\", so it "
     "gets repeated.\n"
-    "Instead, run the wait ONCE with Bash run_in_background: true — an "
-    "until-loop that exits when the work is done, for example:\n"
-    "  until grep -q DONE job.log; do sleep 5; done; tail -20 job.log\n"
-    "(or start the job itself with run_in_background: true; Monitor follows a "
-    "stream line by line) — then end your turn. You are re-invoked when the "
-    "background command exits. Ending your turn does not end a subagent's "
-    "task: a subagent is re-invoked by its own background command the same "
-    "way. Do not poll the output file, and do not background a bare `sleep` "
-    "as a timer (each one wakes you).\n"
+    "Instead, start new work once with `wait-for job <slug> -- <cmd>` using "
+    "Bash run_in_background: true, then end your turn. For a unit already "
+    "launched, use `wait-for unit <slug> --user` the same way. The retained "
+    "unit result survives interruption; re-run the wait when a session "
+    "resumes. A headless subagent should launch the durable job and not wait "
+    "locally; an unobserved failure reaches the next SessionStart. Monitor is "
+    "only for streaming a log you actively want to watch, not for waiting. "
+    "Do not poll the output file, and do not background a bare `sleep` as a "
+    "timer.\n"
     "Allowed in the foreground: a single look without sleep, and a settle of "
     f"<= {_UNIT_SETTLE_S}s before one look."
 )
@@ -2582,7 +2587,9 @@ def _launches(unit: str) -> bool:
 
 def _is_wait_loop(loop: dict, launched: bool) -> bool:
     """A loop holding a sleep waits for something unless it is a short bounded
-    retry or walks a list of items with a pause between them."""
+    retry, a finite systemd measurement, or walks items with a pause."""
+    if loop["kind"] == "for" and loop["systemd_probe"] and not loop["break"]:
+        return False
     budget = _LAUNCH_SETTLE_S if launched else _LOCAL_RETRY_S
     if loop["kind"] == "for" and loop["count"] * loop["sleep"] <= budget:
         return False
@@ -2594,20 +2601,8 @@ def _is_wait_loop(loop: dict, launched: bool) -> bool:
 
 
 def _local_poll_applies(payload: dict, entrypoint: str | None) -> bool:
-    """Whether the deny's promise — "end your turn, you are re-invoked" — holds.
-
-    It does for the main session (interactive or headless: `claude -p` stays
-    open while main-conversation background commands run) and for an
-    interactive subagent (re-invoked by its own background command; 112 of
-    119 parked subagents in real transcripts were). It does NOT for a subagent
-    under headless `claude -p` (CLAUDE_CODE_ENTRYPOINT=sdk-cli): that process
-    exits once the main conversation is idle and kills subagent-owned
-    background commands (agent e2e, 2026-11-02). Denying a foreground wait
-    there would strand the job, so the layer stays silent.
-    """
-    if not payload.get("agent_id"):
-        return True
-    return (entrypoint or "cli") == "cli"
+    """Durable systemd ownership makes the local-poll gate universal."""
+    return True
 
 
 def _check_local_poll(command: str, background: bool) -> str | None:
@@ -2633,6 +2628,7 @@ def _check_local_poll(command: str, background: bool) -> str | None:
                 loops.append({
                     "kind": raw[0], "sleep": 0.0, "break": False, "read": False,
                     "count": count, "counter": counter,
+                    "systemd_probe": False,
                     "reads_lines": raw[0] == "while" and cond[:1] == ["read"],
                 })
                 if raw[0] == "for":
@@ -2657,6 +2653,8 @@ def _check_local_poll(command: str, background: bool) -> str | None:
                 continue
             if toks[0] in ("break", "exit", "return") and loop is not None:
                 loop["break"] = True
+            if loop is not None and _systemctl_verb(toks) == "show":
+                loop["systemd_probe"] = True
             if _is_local_read(toks):
                 has_read = True
                 if loop is not None:
@@ -2723,20 +2721,25 @@ def main() -> int:
     if not isinstance(payload, dict):
         _fail_closed("hook stdin was JSON but not an object")
 
-    # Registered with matcher `Bash`; anything else reaching us is not ours
-    # to judge, and denying it would be a guard overstepping its scope.
-    if payload.get("tool_name") != "Bash":
+    # Registered for shell-bearing Bash and Monitor calls. Anything else is
+    # outside this guard's scope.
+    tool_name = payload.get("tool_name")
+    if tool_name not in ("Bash", "Monitor"):
         _disarm_watchdog()
         return 0
 
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict):
-        _fail_closed("Bash tool_input was missing or not an object")
+        _fail_closed(f"{tool_name} tool_input was missing or not an object")
     command = tool_input.get("command")
     if not isinstance(command, str) or not command.strip():
+        if tool_name == "Monitor":
+            _disarm_watchdog()
+            return 0
         _fail_closed("Bash call carried no command string to inspect")
 
     cwd = payload.get("cwd")
+    background = tool_name == "Bash" and tool_input.get("run_in_background") is True
 
     reason = _check_dcg(command)
     if reason is None:
@@ -2744,15 +2747,13 @@ def main() -> int:
     if reason is None:
         reason = _check_pipe_to_shell(command)
     if reason is None:
-        reason = _check_bg_status_masked(
-            command, tool_input.get("run_in_background") is True
-        )
+        reason = _check_bg_status_masked(command, background)
     if reason is None:
         reason = _check_nixos_push(command, cwd if isinstance(cwd, str) else None)
         if reason is not None:
             reason = "bash-guard: " + reason
     if reason is None:
-        reason = _check_ci_poll(command, tool_input.get("run_in_background") is True)
+        reason = _check_ci_poll(command, background)
     if reason is None:
         # After the CI layer, so a CI poll keeps its more specific wait-for hint.
         # Fail-open, unlike the rest of this file: it judges how to wait, not
@@ -2760,7 +2761,7 @@ def main() -> int:
         # guard's deny-everything.
         try:
             if _local_poll_applies(payload, os.environ.get("CLAUDE_CODE_ENTRYPOINT")):
-                reason = _check_local_poll(command, tool_input.get("run_in_background") is True)
+                reason = _check_local_poll(command, background)
         except Exception:  # noqa: BLE001
             reason = None
     if reason is None:

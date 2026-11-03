@@ -13,18 +13,26 @@ ingests):
 
 ## Launch — detached systemd user unit + sentinel markers
 
+The unit retains the command's real exit status: `ExecMainStatus` equals the
+command's exit code even after the process exits.
+
 ```bash
 systemctl --user reset-failed <slug>.service 2>/dev/null  # if reusing the name
-systemd-run --user --unit=<slug> --working-directory=<dir> bash -c \
-  '<cmd> > /tmp/<slug>.log 2>&1 && echo MARKER_OK >> /tmp/<slug>.log \
-   || echo MARKER_FAILED >> /tmp/<slug>.log'
+systemd-run --user --unit=<slug> --working-directory=<dir> \
+  -p RemainAfterExit=yes \
+  -p 'ExecStopPost=%h/.claude/scripts/record-user-unit-failure <slug> /tmp/<slug>.log' \
+  bash -c \
+  '<cmd> > /tmp/<slug>.log 2>&1; rc=$?;
+   [ "$rc" = 0 ] && echo MARKER_OK >> /tmp/<slug>.log \
+                   || echo "MARKER_FAILED rc=$rc" >> /tmp/<slug>.log;
+   exit "$rc"'
 ```
 
-- **Always append sentinel markers** (`GATE_ALL_GREEN`/`GATE_FAILED`
-  style). Polling greps for them — never infer success from silence or
-  an empty log.
+- **Always append sentinel markers** (`GATE_ALL_GREEN`/`GATE_FAILED` style).
+  They show progress and make the log readable to a human. The retained unit
+  status is the verdict; never infer success from silence or an empty log.
 - The unit name is the rerun handle; `reset-failed` before reuse.
-- **Never add `--collect` to a unit you intend to poll.** Without `--wait`
+- **Never add `--collect` to a unit whose result you intend to read.** Without `--wait`
   it garbage-collects the unit the moment it exits, and `systemctl --user
   show` then answers about a unit that no longer exists — reporting
   `Result=success ExecMainStatus=0` for a run that failed. Measured on this
@@ -36,24 +44,33 @@ systemd-run --user --unit=<slug> --working-directory=<dir> bash -c \
   | (neither) | `LoadState=loaded` `Result=exit-code` `ExecMainStatus=7` |
   | `--wait --pipe` | `LoadState=loaded` `Result=exit-code` `ExecMainStatus=7` |
 
-  A detached lane polled that way cannot see its own failure, and the
-  failure looks exactly like a pass. The launch recipe above uses neither
-  flag, so it is not exposed today — keep it that way. If you want the unit
+  A detached lane read that way cannot see its own failure, and the failure
+  looks exactly like a pass. The launch recipe above uses neither flag, so it
+  is not exposed. `wait-for job` refuses `--collect` instead of relying on the
+  caller to remember. If you want the unit
   cleaned up, pair `--collect` with `--wait --pipe` (which propagates the
   status correctly) and accept that the call then blocks, or drop
   `--collect` and `reset-failed` on the next run. Either way the sentinel
-  markers, not the unit's exit status, are what you actually poll.
+  markers are still useful log annotations, but the blocking wait reads the
+  unit's exit status.
 
-## Poll — bounded loops, tail for visibility, never kill
+## Wait once — durable unit, blocking primitive, end the turn
 
 ```bash
-for i in $(seq 1 58); do
-  grep -qE 'MARKER_OK|MARKER_FAILED' /tmp/<slug>.log && break; sleep 10
-done; tail -3 /tmp/<slug>.log
+# New work: launch exactly once, or adopt the retained result after interruption.
+~/.claude/scripts/wait-for job <slug> -- <cmd> [args...]
+
+# A unit already launched by the manual recipe above:
+~/.claude/scripts/wait-for unit <slug> --user
 ```
 
-- ~10 min per poll call (fits the cap); repeat calls as needed. Tail the
-  log each round so progress is visible between polls.
+- Run the applicable command with Bash `run_in_background: true`, then end the
+  turn. After an interruption, run the same wait again; the unit retains its
+  result. The job default timeout is four hours; set `--timeout <seconds>`
+  before `--` when a longer bound is intentional.
+- Read or tail `/tmp/<slug>.log` for progress. `MARKER_OK` and
+  `MARKER_FAILED rc=N` help a human scan the log, but the unit status is the
+  verdict.
 - **Do NOT kill a slow build to retry** — killing wastes every finished
   derivation. Nix builds with big artifacts look wedged while the cachix
   post-build-hook pushes (each push has its own 600 s cap and re-fires
@@ -61,7 +78,8 @@ done; tail -3 /tmp/<slug>.log
 
 ## Readiness variant (services/VMs instead of builds)
 
-Poll a real probe, not elapsed time: SSH banner
+Readiness is not completion polling: it asks whether a service is ready to use,
+not whether a finite job has settled. Probe the real condition, not elapsed time: SSH banner
 (`ssh-keyscan -p <port> -T 5 127.0.0.1 | head -1`), a TCP connect, or a
 file's existence — each wrapped in `timeout N …` so one hung probe can't
 eat the loop. A launcher log's last line ("building …drv") tells you
@@ -94,7 +112,7 @@ setsid nohup bash -c '<cmd> > /tmp/<slug>.log 2>&1; echo $? > /tmp/<slug>.done' 
 The tool waits on its pipes, not on the process, so a child still holding stdout
 or stdin keeps the call alive after the shell has returned. Symptom: the command
 prints its final `echo`, then the call times out anyway. The `.done` file holding
-the exit code is what you poll — never infer the result from the log's tail.
+the exit code is the verdict — never infer the result from the log's tail.
 
 ## When a deny rule refuses the command outright
 
@@ -131,4 +149,4 @@ such a rule reads as protection while stopping zero commands.
 - `--collect` on a unit whose exit status you intend to read
 - Concluding failure from an empty/quiet log without the FAILED marker
 - Killing an in-progress nix build out of impatience
-- `sleep 600` with no grep — poll loops must be able to exit early
+- A foreground sleep-loop around log or marker state

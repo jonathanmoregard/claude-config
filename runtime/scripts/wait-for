@@ -2,9 +2,13 @@
 # wait-for — block until something outside the session settles, then print one
 # summary line and exit with a status that says how it settled.
 #
-# Run it with Bash `run_in_background: true` and end the turn: the harness
-# re-invokes the session when it exits, so one call replaces a sleep-poll loop
-# (bash-guard denies `sleep N; <status snapshot>` in the foreground).
+# Run it with Bash `run_in_background: true` and end the turn. A main session
+# can be re-invoked when its background call exits; a subagent is not promised
+# that reinvocation. The durable systemd result is the guarantee: after any
+# interruption, run the wait again. `RemainAfterExit=yes` keeps the unit result
+# readable, and an undelivered failure record reaches the next SessionStart.
+# That record is a failure backstop, never a success signal: silence is not
+# evidence that a job passed.
 #
 # In a sandbox where gh cannot authenticate, pr/run mode reads a host watch
 # started by the git-broker `github` tool from its protected status file. Each
@@ -21,31 +25,58 @@
 #                                          transient systemd-run unit: its job
 #                                          exited); with --since, a run that
 #                                          STARTED after that moment
-#   common: --timeout <seconds> (default 3600)
+#   wait-for job <slug> [--timeout <s>] -- <cmd> [args...]
+#                                          launch once as a retained user unit,
+#                                          or adopt its recorded run, then wait
+#   common: --timeout <seconds> (default 3600; job default 14400 so a
+#                                          90-minute job does not time out)
+#
+# `--since` rejects a run that started before the requested time. Do not capture
+# `now` after launching a unit: that asks for a later run and can strand the
+# already-finished unit as a timeout. A `job` launch owns the ordering and never
+# passes `--since`.
 #
 # Exit: 0 settled fine · 1 settled badly (failed check/run/unit) ·
 #       2 settled but not mergeable (conflict) or PR closed unmerged ·
-#       3 settled, but neither checks nor runs could be read · 124 timed out ·
+#       3 settled, but its outcome could not be read · 124 timed out ·
 #       64 usage error.
 # The waiting inside is a loop on purpose: it runs detached in one background
 # call, never in a foreground turn.
+# END USAGE
 set -uo pipefail
 
-usage() { sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
+usage() {
+  sed -n '2,/^# END USAGE$/p' "$0" | sed '$d; s/^# \{0,1\}//' >&2
+  exit 64
+}
 
 [ $# -ge 2 ] || usage
 mode=$1 target=$2
 shift 2
-repo=() repo_name="" user=() since="" timeout=3600
-while [ $# -gt 0 ]; do
-  case $1 in
-    -R|--repo) [ $# -ge 2 ] || usage; repo=(-R "$2"); repo_name=$2; shift 2 ;;
-    --user) user=(--user); shift ;;
-    --since) [ $# -ge 2 ] || usage; since=$2; shift 2 ;;
-    --timeout) [ $# -ge 2 ] || usage; timeout=$2; shift 2 ;;
-    *) usage ;;
-  esac
-done
+repo=() repo_name="" user=() since="" job_cmd=()
+if [ "$mode" = job ]; then timeout=14400; else timeout=3600; fi
+if [ "$mode" = job ]; then
+  while [ $# -gt 0 ] && [ "$1" != -- ]; do
+    case $1 in
+      --timeout) [ $# -ge 2 ] || usage; timeout=$2; shift 2 ;;
+      *) usage ;;
+    esac
+  done
+  [ "${1:-}" = -- ] || usage
+  shift
+  [ $# -gt 0 ] || usage
+  job_cmd=("$@")
+else
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -R|--repo) [ $# -ge 2 ] || usage; repo=(-R "$2"); repo_name=$2; shift 2 ;;
+      --user) user=(--user); shift ;;
+      --since) [ $# -ge 2 ] || usage; since=$2; shift 2 ;;
+      --timeout) [ $# -ge 2 ] || usage; timeout=$2; shift 2 ;;
+      *) usage ;;
+    esac
+  done
+fi
 case $timeout in ''|*[!0-9]*) usage ;; esac
 deadline=$(( $(date +%s) + timeout ))
 left() { echo $(( deadline - $(date +%s) )); }
@@ -276,22 +307,97 @@ runs_settled() {
 unit_prop() { systemctl "${user[@]}" show "$target" -p "$1" --value 2>/dev/null; }
 to_epoch() { [ -n "$1" ] && [ "$1" != n/a ] && date -d "$1" +%s 2>/dev/null || echo 0; }
 
+failure_record() {
+  local key=${target%.service}
+  [ "${user[*]:-}" = --user ] || return 1
+  [[ $key =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  [ -n "${HOME:-}" ] || return 1
+  printf '%s/.local/state/claude-unit-failures/%s.json\n' "$HOME" "$key"
+}
+
+clear_reported_failure() {
+  local record
+  record=$(failure_record) || return 0
+  rm -f -- "$record" ||
+    echo "wait-for: reported the failure but could not clear $record" >&2
+}
+
+journal_records() {
+  local invocation=$1 started_at=$2
+  if [ -n "$invocation" ]; then
+    journalctl "${user[@]}" "_SYSTEMD_INVOCATION_ID=$invocation" -o json --no-pager 2>/dev/null
+  elif [ -n "$started_at" ] && [ "$started_at" != n/a ]; then
+    # InvocationID is normally available. If it races away, start time is the
+    # narrowest journal scope the captured unit record still provides.
+    journalctl "${user[@]}" -u "$target" --since "$started_at" -o json --no-pager 2>/dev/null
+  else
+    return 1
+  fi
+}
+
+journal_verdict() {
+  local invocation=$1 started_at=$2 record status
+  record=$(journal_records "$invocation" "$started_at" | jq -cs '
+    map(select(.MESSAGE_ID == "98e322203f7a4ed290d09fe03c09fe15"
+               and has("EXIT_STATUS"))) | last // empty
+  ' 2>/dev/null) || record=""
+  [ -n "$record" ] || return 1
+  status=$(jq -r '.EXIT_STATUS | tostring' <<<"$record" 2>/dev/null) || return 1
+  [ -n "$status" ] && [ "$status" != null ] || return 1
+  printf '%s\n' "$status"
+}
+
+latest_invocation() {
+  local since_args=()
+  [ -z "$since" ] || since_args=(--since "$since")
+  journalctl "${user[@]}" -u "$target" "${since_args[@]}" -o json --no-pager 2>/dev/null |
+    jq -rs '
+      map(select(.MESSAGE_ID == "98e322203f7a4ed290d09fe03c09fe15"
+                 and has("EXIT_STATUS")
+                 and ((._SYSTEMD_INVOCATION_ID // "") | length > 0)))
+      | last | ._SYSTEMD_INVOCATION_ID // empty
+    ' 2>/dev/null
+}
+
+report_vanished_unit() {
+  local invocation=$1 started_at=$2 collect_mode=$3 status
+  if [ -z "$invocation" ]; then
+    # A unit already gone at arm time has no systemctl identity left. Use the
+    # name only to discover the latest invocation, then scope the verdict read
+    # to that run so a reused name cannot mix journal records.
+    invocation=$(latest_invocation)
+  fi
+  status=$(journal_verdict "$invocation" "$started_at") || {
+    echo "wait-for: unit $target vanished and its outcome could not be determined (collect-mode=${collect_mode:-unknown})"
+    exit 3
+  }
+  echo "unit $target vanished; journal result=exit-code status=$status invocation=${invocation:-unknown}"
+  if [ "$status" = 0 ]; then
+    exit 0
+  fi
+  clear_reported_failure
+  exit 1
+}
+
 wait_unit() {
-  [ "$(unit_prop LoadState)" = loaded ] || { echo "wait-for: unit $target is not loaded"; exit 1; }
   local since_epoch=0
   if [ -n "$since" ]; then
     since_epoch=$(to_epoch "$since"); [ "$since_epoch" -gt 0 ] || usage
   fi
-  local state started transient
+  local load state started transient collect_mode invocation
+  load=$(unit_prop LoadState)
+  if [ "$load" != loaded ]; then
+    report_vanished_unit "" "" unknown
+  fi
+  # These identify the armed run before a collecting unit can disappear.
   transient=$(unit_prop Transient)
+  collect_mode=$(unit_prop CollectMode)
+  invocation=$(unit_prop InvocationID)
+  started=$(unit_prop ExecMainStartTimestamp)
   while :; do
     state=$(unit_prop ActiveState)
     if [ "$transient" = yes ] && [ "$(unit_prop LoadState)" != loaded ]; then
-      # systemd collects a transient unit that exits cleanly (a failed one
-      # stays loaded as failed). `show` then answers with defaults, Result
-      # included, so report the collection instead of reading them.
-      echo "unit $target collected after a clean exit (transient unit, no longer loaded)"
-      exit 0
+      report_vanished_unit "$invocation" "$started" "$collect_mode"
     fi
     started=$(to_epoch "$(unit_prop ExecMainStartTimestamp)")
     case $state in
@@ -314,7 +420,59 @@ wait_unit() {
   local result status
   result=$(unit_prop Result); status=$(unit_prop ExecMainStatus)
   echo "unit $target $(unit_prop ActiveState)/$(unit_prop SubState) result=$result status=$status started=$(unit_prop ExecMainStartTimestamp)"
-  [ "$result" = success ] && exit 0 || exit 1
+  if [ "$result" = success ]; then
+    exit 0
+  fi
+  clear_reported_failure
+  exit 1
+}
+
+wait_job() {
+  [[ $target =~ ^[A-Za-z0-9._-]+$ && $target != . && $target != .. ]] || {
+    echo "wait-for: invalid job slug '$target' (use only letters, digits, dot, underscore and hyphen)" >&2
+    exit 64
+  }
+  [[ $target != claude-* ]] || {
+    echo "wait-for: job slugs beginning with claude- are reserved" >&2
+    exit 64
+  }
+  local arg script_path recorder log state substate
+  for arg in "${job_cmd[@]}"; do
+    if [ "$arg" = --collect ]; then
+      echo "wait-for: --collect is refused: it can reap a failed transient unit and make systemctl report not-found defaults instead of the failure" >&2
+      exit 64
+    fi
+  done
+  user=(--user)
+  if [ "$(unit_prop LoadState)" != loaded ]; then
+    script_path=$(readlink -f -- "$0") || {
+      echo "wait-for: cannot resolve recorder path" >&2; exit 3;
+    }
+    recorder=$(dirname "$script_path")/record-user-unit-failure
+    [ -x "$recorder" ] || {
+      echo "wait-for: failure recorder is unavailable: $recorder" >&2; exit 3;
+    }
+    log=/tmp/$target.log
+    systemd-run --user --unit="$target" --working-directory="$PWD" \
+      -p RemainAfterExit=yes \
+      -p "ExecStopPost=$recorder $target $log" -- \
+      bash -c '
+        log=$1; shift
+        "$@" >"$log" 2>&1; rc=$?
+        if [ "$rc" = 0 ]; then
+          echo MARKER_OK >>"$log"
+        else
+          echo "MARKER_FAILED rc=$rc" >>"$log"
+        fi
+        exit "$rc"
+      ' wait-for-job "$log" "${job_cmd[@]}" >/dev/null || {
+        echo "wait-for: could not launch job $target" >&2; exit 3;
+      }
+  else
+    state=$(unit_prop ActiveState); substate=$(unit_prop SubState)
+    echo "wait-for: adopting job $target ($state/$substate)"
+  fi
+  wait_unit
 }
 
 case $mode in
@@ -326,5 +484,6 @@ case $mode in
   pr) wait_pr ;;
   run) wait_run ;;
   unit) wait_unit ;;
+  job) wait_job ;;
   *) usage ;;
 esac

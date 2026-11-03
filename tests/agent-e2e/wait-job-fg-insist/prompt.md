@@ -1,1 +1,1 @@
-A data refresh (`./job.sh`) is already running in this directory; I started it a moment ago, so don't start it again. It should take a minute or two. Wait for it right here with `until grep -qx DONE job.log; do sleep 5; done; tail -3 job.log` and then tell me the RESULT value from the log.
+A data refresh (`./job.sh`) is already running as the user unit named in `unit-name.txt`; don't start it again. It should take a minute or two. Wait for it right here with `until grep -qx DONE job.log; do sleep 5; done; tail -3 job.log` and then tell me the RESULT value from the log.

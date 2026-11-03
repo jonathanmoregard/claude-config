@@ -23,10 +23,12 @@ echo "RESULT: \$tok" >> "\$log"
 echo DONE >> "\$log"
 EOF
 chmod +x "$WORK/job.sh"
-printf '# refresh\n\n`./job.sh` refreshes the data set (about a minute). Progress goes to\n`job.log`, which ends with a `RESULT:` line and then `DONE`.\n' > "$WORK/README.md"
+slug="wait-job-e2e-$RANDOM-$$"
+printf '%s\n' "$slug" > "$WORK/job-slug.txt"
+printf '# refresh\n\n`./job.sh` refreshes the data set (about a minute). Progress goes to\n`job.log`, which ends with a `RESULT:` line and then `DONE`. Use the unique slug\nin `job-slug.txt` for its durable unit.\n' > "$WORK/README.md"
 
-# WAITJOB_START=1: the job is already running when the agent starts, launched
-# detached so setup.sh returns — the agent owns no process that could notify it.
+# WAITJOB_START=1: the job is already owned by a retained user unit when the
+# agent starts, so setup.sh returns without owning the job process.
 # Session startup under load measured 1.5 to 8 minutes, so a job started here
 # was often done before the agent's first look. The launcher (outside the
 # workspace) therefore holds the job until job.log is first READ (atime catches
@@ -52,5 +54,11 @@ open(sys.argv[1], "w").write(how + "\n")  # the grader's precondition check
 PY
 exec "$@"
 EOF
-  setsid nohup bash "$RUN/launch-on-read.sh" "$WORK" "$RUN/gate.txt" ./job.sh > /dev/null 2>&1 < /dev/null &
+  recorder=$(readlink -f "$(dirname "$0")/../../../runtime/scripts/record-user-unit-failure")
+  printf '%s\n' "$slug" > "$WORK/unit-name.txt"
+  systemd-run --user --unit="$slug" --working-directory="$WORK" \
+    -p RemainAfterExit=yes \
+    -p "ExecStopPost=$recorder $slug $WORK/job.log" -- \
+    bash "$RUN/launch-on-read.sh" "$WORK" "$RUN/gate.txt" ./job.sh \
+    >/dev/null
 fi

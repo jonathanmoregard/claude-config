@@ -35,7 +35,7 @@ def run_wait_for(
 ) -> tuple[int, str, list[str]]:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
-    for name in ("gh", "systemctl", "sleep"):
+    for name in ("gh", "journalctl", "sleep", "systemctl", "systemd-run"):
         link = bin_dir / name
         if not link.exists():
             link.symlink_to(FAKE)
@@ -54,8 +54,14 @@ def run_wait_for(
     }
     env.update(extra_env or {})
     (tmp_path / "home").mkdir(exist_ok=True)
+    argv = list(args)
+    if argv[:1] == ["job"] and "--" in argv:
+        separator = argv.index("--")
+        argv[separator:separator] = ["--timeout", timeout]
+    else:
+        argv.extend(["--timeout", timeout])
     proc = subprocess.run(
-        ["bash", str(wait_for), *args, "--timeout", timeout],
+        ["bash", str(wait_for), *argv],
         capture_output=True, text=True, env=env, cwd=cwd, timeout=60, check=False,
     )
     return proc.returncode, proc.stdout + proc.stderr, log.read_text().splitlines()
@@ -179,18 +185,149 @@ def test_transient_unit_is_not_done_while_its_job_runs(tmp_path: Path) -> None:
     assert rc == 1, out
 
 
-def test_collected_transient_unit_reports_success_without_defaults(tmp_path: Path) -> None:
-    # A transient unit that exits 0 is garbage-collected; `systemctl show` then
-    # answers with defaults (LoadState=not-found, Result=success). Only report
-    # success because the unit was seen loaded and then vanished.
+def exit_record(status: int, invocation: str = "run-abc") -> dict[str, str]:
+    return {
+        "MESSAGE_ID": "98e322203f7a4ed290d09fe03c09fe15",
+        "EXIT_CODE": "exited",
+        "EXIT_STATUS": str(status),
+        "_SYSTEMD_INVOCATION_ID": invocation,
+        "USER_UNIT": "gate.service",
+    }
+
+
+def test_collected_failed_unit_never_becomes_success(tmp_path: Path) -> None:
+    # Regression: --collect reaps failures too, and systemctl's not-found
+    # defaults say success. The journal record is the verdict.
     running = {"LoadState": "loaded", "ActiveState": "active", "SubState": "running",
-               "Type": "simple", "Transient": "yes", "ExecMainStartTimestamp": "Sat 2026-10-04 08:00:00 CEST"}
+               "Type": "simple", "Transient": "yes", "CollectMode": "inactive-or-failed",
+               "InvocationID": "run-abc",
+               "ExecMainStartTimestamp": "Sat 2026-10-04 08:00:00 CEST"}
     gone = {"LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead",
             "Result": "success", "ExecMainStatus": "0"}
-    script = {"systemctl": [running, running, gone]}
+    script = {"systemctl": [running, gone],
+              "journalctl": [{"stdout": [exit_record(7)]}]}
+    rc, out, _ = run_wait_for(tmp_path, script, "unit", "gate", "--user")
+    assert rc == 1, out
+    assert "status=7" in out, out
+
+
+def test_fast_collected_success_never_becomes_failure(tmp_path: Path) -> None:
+    # The waiter arms after a successful transient unit has already vanished.
+    gone = {"LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead",
+            "Result": "success", "ExecMainStatus": "0"}
+    script = {
+        "systemctl": [gone],
+        "journalctl": [
+            {"stdout": [exit_record(0)]},
+            {"stdout": [exit_record(0)]},
+        ],
+    }
     rc, out, _ = run_wait_for(tmp_path, script, "unit", "gate", "--user")
     assert rc == 0, out
-    assert "collected" in out, out
+    assert "status=0" in out, out
+
+
+def test_vanished_unit_without_journal_record_is_unknown(tmp_path: Path) -> None:
+    gone = {"LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead"}
+    script = {"systemctl": [gone], "journalctl": [{"stdout": []}]}
+    rc, out, _ = run_wait_for(tmp_path, script, "unit", "gate", "--user")
+    assert rc == 3, out
+    assert "could not determine" in out, out
+
+
+def test_since_after_launch_waits_for_a_newer_run(tmp_path: Path) -> None:
+    # --since is a freshness filter, not a way to timestamp a launch after the
+    # fact. A terminal run that started earlier must not be mistaken for a new one.
+    failed = {"LoadState": "loaded", "ActiveState": "failed", "SubState": "failed",
+              "Type": "simple", "Transient": "yes", "CollectMode": "none",
+              "InvocationID": "run-abc", "Result": "exit-code", "ExecMainStatus": "7",
+              "ExecMainStartTimestamp": "Sat 2026-10-04 08:00:00 CEST"}
+    rc, out, _ = run_wait_for(
+        tmp_path, {"systemctl": [failed]}, "unit", "gate", "--user",
+        "--since", "Sat 2026-10-04 08:00:01 CEST", timeout="1",
+    )
+    assert rc == 124, out
+    assert "timed out" in out, out
+
+
+def test_job_launches_once_and_preserves_recorded_success(tmp_path: Path) -> None:
+    absent = {"LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead"}
+    finished = {"LoadState": "loaded", "ActiveState": "active", "SubState": "exited",
+                "Type": "simple", "Transient": "yes", "CollectMode": "none",
+                "InvocationID": "run-job", "Result": "success", "ExecMainStatus": "0",
+                "ExecMainStartTimestamp": "Sat 2026-10-04 08:00:00 CEST"}
+    script = {"systemctl": [absent, finished],
+              "systemd-run": [{"stdout": "Running as unit: durable.service"}]}
+
+    first_rc, first_out, first_calls = run_wait_for(
+        tmp_path, script, "job", "durable", "--", "bash", "-c", "exit 0"
+    )
+    second_rc, second_out, second_calls = run_wait_for(
+        tmp_path, script, "job", "durable", "--", "bash", "-c", "exit 9"
+    )
+
+    assert first_rc == 0, first_out
+    assert second_rc == 0, second_out
+    launches = [call for call in second_calls if call.startswith("systemd-run ")]
+    assert len(launches) == 1, launches
+    assert "RemainAfterExit=yes" in launches[0]
+    assert "ExecStopPost=" in launches[0]
+    assert "--collect" not in launches[0]
+
+
+def test_job_launches_once_and_preserves_recorded_failure(tmp_path: Path) -> None:
+    absent = {"LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead"}
+    failed = {"LoadState": "loaded", "ActiveState": "failed", "SubState": "failed",
+              "Type": "simple", "Transient": "yes", "CollectMode": "none",
+              "InvocationID": "run-job", "Result": "exit-code", "ExecMainStatus": "7",
+              "ExecMainStartTimestamp": "Sat 2026-10-04 08:00:00 CEST"}
+    script = {"systemctl": [absent, failed],
+              "systemd-run": [{"stdout": "Running as unit: durable.service"}]}
+    failure_record = tmp_path / "home/.local/state/claude-unit-failures/durable.json"
+    failure_record.parent.mkdir(parents=True)
+    failure_record.write_text("{}", encoding="utf-8")
+
+    first_rc, first_out, _ = run_wait_for(
+        tmp_path, script, "job", "durable", "--", "bash", "-c", "exit 7"
+    )
+    assert not failure_record.exists()
+    second_rc, second_out, calls = run_wait_for(
+        tmp_path, script, "job", "durable", "--", "true"
+    )
+
+    assert first_rc == 1, first_out
+    assert second_rc == 1, second_out
+    assert len([call for call in calls if call.startswith("systemd-run ")]) == 1, calls
+
+
+def test_job_adopts_running_unit_instead_of_relaunching(tmp_path: Path) -> None:
+    running = {"LoadState": "loaded", "ActiveState": "active", "SubState": "running",
+               "Type": "simple", "Transient": "yes", "CollectMode": "none",
+               "InvocationID": "run-job", "Result": "success", "ExecMainStatus": "0",
+               "ExecMainStartTimestamp": "Sat 2026-10-04 08:00:00 CEST"}
+    finished = {**running, "ActiveState": "active", "SubState": "exited"}
+    rc, out, calls = run_wait_for(
+        tmp_path, {"systemctl": [running, running, finished]},
+        "job", "durable", "--", "bash", "-c", "exit 9",
+    )
+    assert rc == 0, out
+    assert not any(call.startswith("systemd-run ") for call in calls), calls
+
+
+def test_job_rejects_unsafe_slugs_and_collect(tmp_path: Path) -> None:
+    for slug in ("../escape", ".", "..", "claude-autofork-7"):
+        rc, out, calls = run_wait_for(
+            tmp_path, {}, "job", slug, "--", "true"
+        )
+        assert rc == 64, out
+        assert not any(call.startswith("systemd-run ") for call in calls), calls
+
+    rc, out, calls = run_wait_for(
+        tmp_path, {}, "job", "safe", "--", "runner", "--collect"
+    )
+    assert rc == 64, out
+    assert "--collect" in out and "reap" in out, out
+    assert not any(call.startswith("systemd-run ") for call in calls), calls
 
 
 def test_long_running_service_still_counts_as_up(tmp_path: Path) -> None:
