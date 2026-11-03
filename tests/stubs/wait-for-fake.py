@@ -99,9 +99,15 @@ def fake_systemctl(argv: list[str]) -> int:
         return 0
     props = [argv[i + 1] for i, arg in enumerate(argv) if arg == "-p"]
     idx = _read_counter("systemctl")
+    phase = phases[min(idx, len(phases) - 1)]
+    # A phase may carry `rc` to script systemctl ITSELF failing — no user bus,
+    # no systemd. Real systemctl then exits non-zero with empty output, which is
+    # not the same as answering `LoadState=not-found` with exit 0. Such a phase
+    # prints nothing and does not advance: nothing was observed.
+    if phase.get("rc"):
+        return int(phase["rc"])
     if "Type" in props:
         _write_counter("systemctl", idx + 1)
-    phase = phases[min(idx, len(phases) - 1)]
     for prop in props:
         value = phase.get(prop, "")
         print(value if "--value" in argv else f"{prop}={value}")

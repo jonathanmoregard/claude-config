@@ -309,7 +309,6 @@ runs_settled() {
   done
 }
 
-unit_prop() { systemctl "${user[@]}" show "$target" -p "$1" --value 2>/dev/null; }
 to_epoch() { [ -n "$1" ] && [ "$1" != n/a ] && date -d "$1" +%s 2>/dev/null || echo 0; }
 
 # Read several properties in ONE `systemctl show`, so they all describe the same
@@ -334,6 +333,42 @@ snapshot_field() {
     case $line in "$key="*) printf '%s\n' "${line#"$key="}"; return 0 ;; esac
   done <<<"$snapshot"
   return 0
+}
+
+# `systemctl` failing to answer is NOT the unit being absent, and conflating the
+# two turned a running job into a clean pass. Measured in the agent-e2e sandbox,
+# which has no user bus: `systemctl --user show` exits 1 with EMPTY output, so
+# every property reads as its default and LoadState is not `loaded`; journald's
+# files stay readable without the bus, so the run's "Started" record is still
+# found; and a job still on step 1 of 9 was reported as `rc=0 vanished after a
+# clean exit`.
+#
+# The discriminator is the exit STATUS, not the text: `systemctl show` on a
+# genuinely missing unit exits 0 and says `LoadState=not-found` (measured). A
+# non-zero exit, or no output at all, means the service manager could not be
+# reached — which is exit 3's case and never a verdict. "A Started record and no
+# failure record" is sound only where absence was OBSERVED; it is not evidence
+# that a run has ended.
+#
+# Three attempts, because a manager restart is survivable and a four-hour wait
+# should not abort on one blip. `nap` keeps the retries inside the timeout.
+unit_snapshot() {
+  local attempt snapshot
+  for attempt in 1 2 3; do
+    if snapshot=$(unit_prop_snapshot "$@") && [ -n "$snapshot" ]; then
+      printf '%s\n' "$snapshot"
+      return 0
+    fi
+    [ "$attempt" = 3 ] || nap 2
+  done
+  return 1
+}
+
+unreadable_manager() {
+  local hint="is there a systemd here?"
+  [ "${user[*]:-}" = --user ] && hint="a --user wait needs a reachable user bus"
+  echo "wait-for: systemctl could not answer about unit $target, so its outcome is unknown ($hint)"
+  exit 3
 }
 
 failure_record() {
@@ -486,8 +521,8 @@ wait_unit() {
   # `started_at` keeps the systemd timestamp STRING for the journal fallback's
   # `--since`; `started` below is an epoch integer for the `--since` comparison.
   # They are deliberately separate: feeding an epoch to `--since` is not a date.
-  armed=$(unit_prop_snapshot LoadState Transient CollectMode InvocationID \
-                             ExecMainStartTimestamp)
+  armed=$(unit_snapshot LoadState Transient CollectMode InvocationID \
+                        ExecMainStartTimestamp) || unreadable_manager
   load=$(snapshot_field "$armed" LoadState)
   transient=$(snapshot_field "$armed" Transient)
   collect_mode=$(snapshot_field "$armed" CollectMode)
@@ -500,8 +535,8 @@ wait_unit() {
     report_vanished_unit "" "" unknown
   fi
   while :; do
-    iter=$(unit_prop_snapshot LoadState ActiveState SubState Type \
-                              ExecMainStartTimestamp)
+    iter=$(unit_snapshot LoadState ActiveState SubState Type \
+                         ExecMainStartTimestamp) || unreadable_manager
     # A unit that stops being loaded cannot be read through systemctl at all;
     # every property in this snapshot would be a not-found default, and those
     # defaults read exactly like a pass. The journal decides instead.
@@ -538,8 +573,8 @@ wait_unit() {
   # The verdict is read as one snapshot too, and re-checks LoadState: a unit
   # reaped between breaking out of the loop and reading its result would
   # otherwise be reported from the not-found defaults.
-  final=$(unit_prop_snapshot LoadState ActiveState SubState Result \
-                             ExecMainStatus ExecMainStartTimestamp)
+  final=$(unit_snapshot LoadState ActiveState SubState Result \
+                        ExecMainStatus ExecMainStartTimestamp) || unreadable_manager
   if [ "$(snapshot_field "$final" LoadState)" != loaded ]; then
     report_vanished_unit "$invocation" "$started_at" "$collect_mode"
   fi
@@ -564,7 +599,7 @@ wait_job() {
     echo "wait-for: job slugs beginning with claude- are reserved" >&2
     exit 64
   }
-  local arg script_path recorder log state substate
+  local arg script_path recorder log probe state substate
   for arg in "${job_cmd[@]}"; do
     if [ "$arg" = --collect ]; then
       echo "wait-for: --collect is refused: it can reap a failed transient unit and make systemctl report not-found defaults instead of the failure" >&2
@@ -572,7 +607,8 @@ wait_job() {
     fi
   done
   user=(--user)
-  if [ "$(unit_prop LoadState)" != loaded ]; then
+  probe=$(unit_snapshot LoadState ActiveState SubState) || unreadable_manager
+  if [ "$(snapshot_field "$probe" LoadState)" != loaded ]; then
     script_path=$(readlink -f -- "$0") || {
       echo "wait-for: cannot resolve recorder path" >&2; exit 3;
     }
@@ -597,7 +633,8 @@ wait_job() {
         echo "wait-for: could not launch job $target" >&2; exit 3;
       }
   else
-    state=$(unit_prop ActiveState); substate=$(unit_prop SubState)
+    state=$(snapshot_field "$probe" ActiveState)
+    substate=$(snapshot_field "$probe" SubState)
     echo "wait-for: adopting job $target ($state/$substate)"
   fi
   wait_unit

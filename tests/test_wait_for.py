@@ -292,6 +292,33 @@ def test_unit_reaped_after_the_loop_breaks_is_journal_read(tmp_path: Path) -> No
     assert "status=7" in out, out
 
 
+def test_unreadable_service_manager_is_never_a_clean_exit(tmp_path: Path) -> None:
+    # Found by this PR's own agent-e2e. The sandbox has no user bus, so
+    # `systemctl --user show` exits 1 with EMPTY output while journald's files
+    # stay readable — and a unit still on step 1 of 9 was reported as
+    # `rc=0 vanished after a clean exit`, because its "Started" record was
+    # there and no failure record was. Absence has to be OBSERVED: a manager
+    # that cannot answer is exit 3, and the discriminator is systemctl's exit
+    # status, since a genuinely missing unit exits 0 saying `not-found`.
+    script = {"systemctl": [{"rc": 1}],
+              "journalctl": [{"stdout": [started_record()]}]}
+    rc, out, _ = run_wait_for(tmp_path, script, "unit", "gate", "--user", timeout="5")
+    assert rc == 3, out
+    assert "could not answer" in out, out
+
+
+def test_unreadable_service_manager_blocks_a_job_launch(tmp_path: Path) -> None:
+    # Same for `job`: without a reachable manager, "the unit is not loaded" is
+    # not a reason to launch — the answer is unknown, not absent.
+    script = {"systemctl": [{"rc": 1}],
+              "systemd-run": [{"stdout": "Running as unit: durable.service"}]}
+    rc, out, calls = run_wait_for(
+        tmp_path, script, "job", "durable", "--", "true", timeout="5"
+    )
+    assert rc == 3, out
+    assert not any(call.startswith("systemd-run ") for call in calls), calls
+
+
 SUCCEEDED_UNIT = {
     "LoadState": "loaded", "ActiveState": "active", "SubState": "exited",
     "Type": "simple", "Transient": "yes", "CollectMode": "none",
