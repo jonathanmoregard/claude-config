@@ -47,7 +47,7 @@ This overrides terse or compressed reply modes (e.g. caveman) for the walkthroug
 
 ## Example
 
-```markdown
+````markdown
 ## 🗝️ Quest 2/4: Forge the secret  ✅👉⬜⬜
 
 Klaffat needs a secret handshake with Microsoft before it can read anyone's
@@ -63,4 +63,4 @@ calendar, and an Outlook user is just as welcome at the table as a Gmail user �
    ```
 
 🎁 Checkpoint: say **secret in**.
-```
+````

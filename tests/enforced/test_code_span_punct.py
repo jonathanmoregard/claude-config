@@ -15,7 +15,7 @@ import sys
 import uuid
 from pathlib import Path
 
-HOOK = Path(__file__).resolve().parents[1] / "runtime" / "hooks" / "code-span-punct.py"
+HOOK = Path(__file__).resolve().parents[2] / "runtime" / "hooks" / "code-span-punct.py"
 
 
 def flush(delta: str, message_id: str = "m", final: bool = True, index: int = 0) -> str | None:
@@ -45,6 +45,29 @@ def test_fenced_block_untouched_across_flushes():
     assert flush("echo `x`.\n", mid, final=False, index=1) is None
     assert flush("```\n", mid, final=False, index=2) is None
     assert flush("see `y`.\n", mid, final=True, index=3) == "see `y` \n"
+
+
+def test_longer_fence_contains_shorter_fence_lines():
+    text = "````\n```\nsee `x`.\n```\n````\nafter `y`.\n"
+    assert flush(text) == "````\n```\nsee `x`.\n```\n````\nafter `y` \n"
+
+
+def test_tilde_fence_not_closed_by_backticks():
+    assert flush("~~~\n```\nsee `x`.\n") is None
+
+
+def test_blockquoted_and_indented_fences():
+    assert flush("> ```\n> see `x`.\n> ```\n") is None
+    assert flush("5. Add:\n   ```\n   KEY=`v`.\n   ```\n") is None
+
+
+def test_double_backtick_span_keeps_inner_punctuation():
+    assert flush("run ``echo `x`. done`` now\n") is None
+    assert flush("run ``echo `x`. done``.\n") == "run ``echo `x`. done`` \n"
+
+
+def test_unmatched_backtick_run_left_alone():
+    assert flush("a stray ` tick `x. here\n") is None
 
 
 def test_malformed_input_prints_nothing():

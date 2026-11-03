@@ -2,13 +2,20 @@
 """MessageDisplay hook: show a space instead of punctuation glued to a code span.
 
 A copy of `FOO_KEY`. by double-click carries the dot into a secret name or
-command. On screen, `X`. `X`, `X`; `X`: become `X` followed by a space; the
-stored message and what the model sees are unchanged (MessageDisplay is
-display-only). Lines inside fenced code blocks are never touched. Deltas arrive
-as whole lines per flush, so the open-fence state of each message is kept in a
-small per-message file until its final flush.
+command. On screen, a . , ; or : directly after an inline code span (optionally
+after closing ** * or _) becomes a space; the stored message and what the model
+sees are unchanged (MessageDisplay is display-only).
 
-Any parse or I/O problem prints nothing, so the original text is displayed.
+Invariants:
+- Text inside a fenced block is never touched. A fence opens on a run of 3+
+  backticks or tildes (after any blockquote markers and indentation) and closes
+  only on a run of the same character at least as long with nothing after it,
+  so a ```` block may contain ``` lines. The open fence of each message is kept
+  in a small per-message file across flushes until the final flush.
+- Inline code spans are delimited by equal-length backtick runs, so text inside
+  a ``span with `ticks`. inside`` is never touched.
+- When in doubt nothing is rewritten. Any parse or I/O problem prints nothing,
+  so the original text is displayed.
 """
 import json
 import os
@@ -16,19 +23,58 @@ import re
 import sys
 import tempfile
 
-GLUED = re.compile(r"(`[^`\n]+`(?:\*\*|\*|_)?)[.,;:](?=\s|$)")
-FENCE = re.compile(r"^\s*(```|~~~)")
+FENCE = re.compile(r"^(?:[ \t]*>)*[ \t]*(`{3,}|~{3,})(.*)$")
+TICKS = re.compile(r"`+")
+GLUED = re.compile(r"((?:\*\*|\*|_)?)[.,;:](?=\s|$)")
 
 
-def rewrite(delta: str, in_fence: bool) -> tuple[str, bool]:
+def fence_line(line: str, fence: str | None) -> tuple[bool, str | None]:
+    """Return (is_fence_line, fence_after_line) for one line."""
+    match = FENCE.match(line.rstrip("\n"))
+    if not match:
+        return False, fence
+    run, rest = match.groups()
+    if fence is None:
+        if run[0] == "`" and "`" in rest:
+            return False, None  # not a fence: a backtick info string has no backticks
+        return True, run
+    if run[0] == fence[0] and len(run) >= len(fence) and not rest.strip():
+        return True, None
+    return False, fence
+
+
+def rewrite_inline(line: str) -> str:
+    out, pos = [], 0
+    while True:
+        opener = TICKS.search(line, pos)
+        if not opener:
+            break
+        closer = opener
+        while True:
+            closer = TICKS.search(line, closer.end())
+            if not closer or len(closer.group()) == len(opener.group()):
+                break
+        if not closer:
+            break  # unmatched run: the rest of the line is literal text
+        out.append(line[pos:closer.end()])
+        pos = closer.end()
+        glued = GLUED.match(line, pos)
+        if glued:
+            out.append(glued.group(1) + " ")
+            pos = glued.end()
+    out.append(line[pos:])
+    return "".join(out)
+
+
+def rewrite(delta: str, fence: str | None) -> tuple[str, str | None]:
     out = []
     for line in delta.splitlines(keepends=True):
-        if FENCE.match(line):
-            in_fence = not in_fence
-        elif not in_fence:
-            line = GLUED.sub(r"\1 ", line)
+        is_fence, after = fence_line(line, fence)
+        if not is_fence and fence is None:
+            line = rewrite_inline(line)
+        fence = after
         out.append(line)
-    return "".join(out), in_fence
+    return "".join(out), fence
 
 
 def main() -> None:
@@ -41,13 +87,14 @@ def main() -> None:
         return
     state = os.path.join(tempfile.gettempdir(), f"code-span-punct-{os.getuid()}-{message_id}")
     try:
-        in_fence = os.path.exists(state)
-        shown, in_fence = rewrite(delta, in_fence)
-        if final or not in_fence:
+        fence = open(state).read() or None if os.path.exists(state) else None
+        shown, fence = rewrite(delta, fence)
+        if final or fence is None:
             if os.path.exists(state):
                 os.remove(state)
         else:
-            open(state, "w").close()
+            with open(state, "w") as handle:
+                handle.write(fence)
     except OSError:
         return
     if shown != delta:
