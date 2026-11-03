@@ -42,6 +42,46 @@
 # master was graded against a merge base that no longer exists, so the job
 # refuses to grade it and says so: updating the branch fires `synchronize`, and
 # the run that matters happens at tip.
+#
+# WHY A PULL REQUEST THAT CHANGES NO CONFIG IS NOT GRADED
+#
+# An agent run costs real money, and a pull request touching only the test
+# corpus or this directory has no candidate config to grade: the agent would
+# read exactly master's text, so the verdict would be about master. The first
+# step therefore asks what the pull request changes and passes WITHOUT grading
+# when the answer is nothing a running agent reads.
+#
+# That test is a STEP. Not a workflow-level `paths:` filter and not a
+# job-level `if:`, because both are the gotcha this lane exists to avoid, in
+# opposite directions: a path-filtered workflow produces no check run at all,
+# so a required check sits pending and the pull request is blocked forever,
+# while a job skipped by its own condition is reported to a required check as
+# SUCCESSFUL -- handing every pull request a free pass the moment that
+# condition goes wrong. A step that runs, decides and says so keeps the check
+# attached to the head commit in every case, and a decision step that errors
+# takes the job red with it.
+#
+# What counts as config is an EXCLUSION list rather than an inclusion list,
+# and that direction is the whole point: a directory added tomorrow is graded
+# without anyone editing this file, where an allowlist would silently exempt
+# it. Only what provably cannot reach a running agent is excluded.
+#
+# `vendor/` is NOT excluded, and that is not an oversight. Sixteen skills
+# under `runtime/skills/` are symlinks into `vendor/superpowers` and
+# `vendor/everything-claude-code` -- `using-superpowers`, which every session
+# reads, among them -- so moving a submodule pin changes skill text under the
+# agent while touching no file beneath `runtime/`. `.gitmodules` is in for the
+# same reason, and `policy/` is in because a sandbox policy is config whatever
+# reads it today.
+#
+# The label still overrides, so a grade can always be ASKED for. That is not
+# symmetry for its own sake: this lane's own scenario lives in
+# `tests/agent-e2e/skill-description-audit/`, whose `check.sh` and `setup.sh`
+# master changed in the same week this was written. Without the override a
+# change to the instrument could never be measured by the instrument. What
+# keeps that from being a hole is that the grader has unit coverage in
+# `checks` (`tests/enforced/test_skill_audit_grader.py`), so a broken grader
+# is caught there rather than silently here.
 name: honeypot
 
 on:
@@ -50,6 +90,12 @@ on:
 
 permissions:
   contents: read
+  # Reading which files the pull request changes, for the scope decision in
+  # the first step. It authorises nothing: this repository is public and that
+  # list is already world-readable. Declared because naming any permission
+  # drops every unnamed one to none, so `contents: read` alone would not
+  # cover the pulls endpoint.
+  pull-requests: read
   # GitHub only issues an identity token to a job that asks for it, and that
   # token is this lane's entire credential path -- see the credential step.
   id-token: write
@@ -98,20 +144,83 @@ jobs:
       # null while auto-merge is off; there is no `auto_merge_enabled`
       # property, and naming one would make the test quietly false on every
       # `synchronize`.
-      - name: A grade was asked for, so this config is about to land
+      - name: There is a config here, and a grade was asked for
+        id: scope
         env:
           ASKED: ${{ contains(github.event.pull_request.labels.*.name, 'grade')
             || github.event.pull_request.auto_merge != null
             || github.event.action == 'auto_merge_enabled' }}
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
         run: |
-          if [ "$ASKED" != "true" ]; then
-            echo "this config has not been graded"
-            echo "add the 'grade' label to grade it; an ungraded config is not a clean one"
+          # The label first, so an explicit ask never has to get past the
+          # scope test -- see the header on why the override exists.
+          if [ "$ASKED" = "true" ]; then
+            echo "grade asked for; grading the candidate config"
+            echo "grade=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Asked of the API rather than of a checkout, so the whole decision
+          # is two requests and happens before anything is cloned or
+          # installed. The field is `filename`: this endpoint has no `path`,
+          # and `--jq '.[].path'` yields a column of nulls that match no
+          # prefix -- which reads as "no config changed" and would pass every
+          # pull request for free.
+          files=$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files" --jq '.[].filename')
+          # A hard API failure aborts the step on its own -- the exit status of
+          # an assignment is the substitution's, and this shell runs with -e.
+          # An empty list is the case that does not abort, and it must not be
+          # read as "no config changed": that is how a lane passes for free.
+          # Nothing is lost by refusing, since a pull request changing no file
+          # is not one anybody merges.
+          if [ -z "$files" ]; then
+            echo "the pull request reports no changed files at all, so there"
+            echo "is nothing here to draw a conclusion from."
+            echo "failing closed: an ungraded config is not a clean config"
             exit 1
           fi
-          echo "grade asked for; grading the candidate config"
+          want=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR}" --jq .changed_files)
+          case "$want" in
+            '' | *[!0-9]*)
+              echo "the pull request does not say how many files it changes,"
+              echo "so the list below cannot be checked for completeness."
+              echo "failing closed: an ungraded config is not a clean config"
+              exit 1
+              ;;
+          esac
+          got=$(printf '%s\n' "$files" | grep -c . || true)
+          # Only the under-reporting direction is fatal, because only it is
+          # dangerous: this endpoint stops at 3000 files, and a short list can
+          # just as well be a `runtime/` file that never arrived, which would
+          # read as nothing to grade. Fail rather than conclude.
+          if [ "$got" -lt "$want" ]; then
+            echo "the changed-file list is incomplete: $got of $want."
+            echo "a partial list can only under-report what changed, and"
+            echo "under-reporting here grades nothing and passes."
+            echo "failing closed: an ungraded config is not a clean config"
+            exit 1
+          fi
+          # grep exits 1 when every line is filtered out. That is the
+          # nothing-to-grade case, not an error.
+          config=$(printf '%s\n' "$files" | grep -vE \
+            '^(tests/|docs/|research/|experiments/|improvements/|\.github/|\.githooks/|\.gitignore$|\.gitleaks\.toml$|\.secrets\.baseline$)' \
+            || true)
+          if [ -z "$config" ]; then
+            echo "nothing to grade: no file here is read by a running agent."
+            echo "all $got of them:"
+            printf '%s\n' "$files" | sed 's/^/  /'
+            echo "grade=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "this pull request changes the live config:"
+          printf '%s\n' "$config" | sed 's/^/  /'
+          echo "this config has not been graded"
+          echo "add the 'grade' label to grade it; an ungraded config is not a clean one"
+          exit 1
 
       - uses: actions/checkout@v4
+        if: steps.scope.outputs.grade == 'true'
         with:
           persist-credentials: false
 
@@ -119,6 +228,7 @@ jobs:
       # tip. Its own step, before anything is installed, so "behind master"
       # reads as itself instead of as a failed agent run.
       - name: The pull request is at the tip of master
+        if: steps.scope.outputs.grade == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -135,6 +245,7 @@ jobs:
       # harness works without it and records `isolated_tmp: false`; on a
       # throwaway runner that is survivable, but the fidelity is cheap to keep.
       - name: Install the sandbox and the agent
+        if: steps.scope.outputs.grade == 'true'
         run: |
           sudo apt-get update --quiet
           sudo apt-get install --quiet --yes bubblewrap
@@ -160,6 +271,7 @@ jobs:
       # is the exact failure this lane exists to catch; a scenario that avoids
       # Bash would hide the same thing.
       - name: Build the guard the config depends on
+        if: steps.scope.outputs.grade == 'true'
         env:
           # github.com/Dicklesworthstone/destructive_command_guard
           DCG_REV: d921fe84f7bbf56438e7b930047ab41e0dcb292d
@@ -185,6 +297,7 @@ jobs:
       # exist here. Without it dcg falls back to built-in packs and the guard
       # reports a config fault, which is also a deny.
       - name: Provide the config the guard loads
+        if: steps.scope.outputs.grade == 'true'
         run: |
           mkdir -p "$HOME/.config/dcg"
           cp runtime/dcg.toml "$HOME/.config/dcg/config.toml"
@@ -232,6 +345,7 @@ jobs:
       # rule rebuilt from the wizard's defaults will fail with
       # `match_subject_prefix` until it does too.
       - name: Mint a credential that expires by itself
+        if: steps.scope.outputs.grade == 'true'
         shell: bash
         env:
           # Claude Console -> Workload identity. The workspace is named even
@@ -323,6 +437,7 @@ jobs:
 
       - name: The agent does not go for the planted credentials
         id: measure
+        if: steps.scope.outputs.grade == 'true'
         env:
           # What a run needs BEFORE its first API call -- staging the config
           # out of git, building the sandbox home, planting the fixtures --
