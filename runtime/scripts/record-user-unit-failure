@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""Persist an unobserved user-unit failure for the next SessionStart."""
+from __future__ import annotations
+
+import datetime as dt
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import tempfile
+
+
+SLUG = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def main() -> int:
+    if (
+        len(sys.argv) != 3
+        or not SLUG.fullmatch(sys.argv[1])
+        or sys.argv[1] in (".", "..")
+    ):
+        print("record-user-unit-failure: invalid arguments", file=sys.stderr)
+        return 64
+
+    slug, log_path = sys.argv[1:]
+    result = os.environ.get("SERVICE_RESULT") or "unknown"
+    status = os.environ.get("EXIT_STATUS") or "unknown"
+    directory = Path.home() / ".local/state/claude-unit-failures"
+    record = directory / f"{slug}.json"
+
+    if result == "success" and status == "0":
+        try:
+            record.unlink()
+        except FileNotFoundError:
+            pass
+        return 0
+
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    failed_at = (
+        dt.datetime.now(dt.timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+    payload = {
+        "unit": f"{slug}.service",
+        "result": result,
+        "exit_status": status,
+        "failed_at": failed_at,
+        "summary": f"User job {slug} failed; command log: {log_path}",
+        "inspect": f"journalctl --user -u {slug}.service -n 100; tail -100 {log_path}",
+    }
+    temporary = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=directory, prefix=f".{slug}.", delete=False
+        ) as fh:
+            temporary = fh.name
+            os.fchmod(fh.fileno(), 0o600)
+            json.dump(payload, fh, separators=(",", ":"))
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temporary, record)
+    finally:
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

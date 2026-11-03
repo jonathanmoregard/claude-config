@@ -26,11 +26,47 @@ def emit(obj: dict) -> None:
     sys.stdout.flush()
 
 
+def _resets(obj, fn):
+    if isinstance(obj, dict):
+        return {k: (fn(v) if k == "resetsAt" and isinstance(v, (int, float)) else _resets(v, fn))
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_resets(v, fn) for v in obj]
+    return obj
+
+
+def _future_resets(result: dict) -> dict:
+    """The recorded sample, with every reset slid forward of now.
+
+    `codex-app-server-rate-limits.json` is a real response captured on
+    2026-09-14, so its resets are fixed epochs that have since gone by.
+    `runner.py` treats a reset already in the past as no block at all and
+    writes `until: null`, which turned the recorded sample into a time bomb:
+    the end-to-end quota case asserted the literal 1789805383 and started
+    failing when that moment passed on 2026-09-19. CI deselected the case
+    rather than fixing it, so the retry path it covers has not been measured
+    since.
+
+    The file itself is left alone -- it is the evidence the parser cases read
+    directly, and editing it would weaken them. The whole sample is shifted by
+    one delta instead, so the windows keep their recorded ORDER and spacing and
+    only the origin moves: the latest reset lands a week out. Nothing here
+    hardcodes an epoch, and the case asserts the link between the blocking
+    bucket and `rejected.json` instead of a constant.
+    """
+    found = []
+    _resets(result, lambda v: found.append(v) or v)
+    if not found:
+        return result
+    delta = int(time.time()) + 7 * 86400 - int(max(found))
+    return _resets(result, lambda v: int(v) + delta)
+
+
 def app_server() -> int:
     if os.environ.get("FAKE_CODEX_APPSERVER") == "hang":
         time.sleep(60)
         return 0
-    rl = json.load(open(os.path.join(HERE, "codex-app-server-rate-limits.json")))["result"]
+    rl = _future_resets(json.load(open(os.path.join(HERE, "codex-app-server-rate-limits.json")))["result"])
     ml = json.load(open(os.path.join(HERE, "codex-app-server-model-list.json")))["result"]
     for line in sys.stdin:
         try:

@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from ai_router import adapters, jobs, quota
-from ai_router.config import load_config
+from ai_router.config import atomic_write_json, load_config
 
 pytestmark = pytest.mark.usefixtures("stub_providers")
 
@@ -119,7 +119,18 @@ def test_quota_failure_writes_rejected_and_retries_once(state_dir: Path, tmp_pat
     assert jobs.raw_status(d) == "failed:quota" and old["error_class"] == "quota"
     rej = json.loads((state_dir / "quota" / "codex.rejected.json").read_text())
     assert rej["provider"] == "codex" and rej["source"] == f"job:{job_id}" and "usage limit" in rej["reason"]
-    assert rej["until"] == 1789805383  # blocking bucket resets_at from the stub app-server snapshot
+    # `until` is the resets_at of the fullest bucket that applies, and it has to
+    # be in the future or it is not a block: `runner.py` drops a reset already
+    # past and writes null. Asserted as that LINK rather than as the epoch the
+    # recorded sample happens to carry -- the literal 1789805383 was true until
+    # 2026-09-19 and false after, and CI deselected this case instead of fixing
+    # it, which left the retry path unmeasured. The stub slides the sample
+    # forward of now; see `_future_resets` in fixtures/fake_codex.py.
+    snap = json.loads((state_dir / "quota" / "codex.json").read_text())
+    blocking = max((b for b in snap["buckets"] if "*" in (b["applies_to"] or [])),
+                   key=lambda b: b["used_pct"])
+    assert rej["until"] == blocking["resets_at"], (rej, blocking)
+    assert rej["until"] > time.time(), "a reset already past is not a block"
     assert old["retried_as"] and old["retried_as"] != job_id
     assert fid == old["retried_as"] and status == "done"
     new = jobs.read_meta(jobs.job_dir(state_dir, fid))
@@ -240,3 +251,63 @@ def test_systemd_launcher_when_available(state_dir: Path, tmp_path: Path, env):
     assert status == "done"
     meta = jobs.read_meta(d)
     assert meta["launcher"] == "systemd-run" and meta["runner_pid"]
+
+
+def _hammer(path: Path, marker: str, deadline: float, size: int) -> None:
+    """Publish one path over and over, as a second process would.
+
+    Bounded by a shared CLOCK_MONOTONIC deadline rather than a round count, so
+    the two writers are guaranteed to overlap: with a count, whichever started
+    first could finish before the other was forked, and the case then measured
+    nothing. It passed 2 of 3 runs against the known-broken writer that way.
+    """
+    from ai_router.config import atomic_write_json
+    i = 0
+    while time.monotonic() < deadline:
+        atomic_write_json(path, {"who": marker, "i": i, "pad": marker * size})
+        i += 1
+
+
+def test_two_writers_never_tear_the_file_they_publish(tmp_path: Path):
+    # One job's meta.json has two writers by design: `launch` records the
+    # runner's pid in the parent process while that runner's first act is to
+    # record its own pid and start time. With a FIXED `<name>.tmp` they shared
+    # one scratch file, and that costs both halves of the atomicity:
+    #
+    #   * the loser's `os.replace` finds its scratch file already moved by the
+    #     winner and raises FileNotFoundError -- measured on the very first
+    #     round, so `update_meta` dies inside a runner or inside a wait;
+    #   * a writer that opened the shared file truncates the inode the winner
+    #     has just published, so a reader sees a meta.json that does not parse
+    #     -- measured at 16 torn reads in 2013. `read_json` answers None and
+    #     `read_meta` raises JobNotFound for a job that exists and is healthy,
+    #     which is how test_exit_codes_per_failure_class died on a contended CI
+    #     runner while passing 5/5 on an idle laptop.
+    #
+    # Two real processes, because one process with a lock would not show this,
+    # and a reader asking only what every reader needs: whatever is on disk
+    # parses. A unique scratch name makes both measurements zero.
+    import multiprocessing as mp
+
+    path = tmp_path / "meta.json"
+    atomic_write_json(path, {"who": "seed", "i": -1, "pad": ""})
+    deadline = time.monotonic() + 2.0
+    writers = [mp.Process(target=_hammer, args=(path, name, deadline, 8))
+               for name in ("alpha", "beta")]
+    for w in writers:
+        w.start()
+    torn = reads = 0
+    while any(w.is_alive() for w in writers):
+        reads += 1
+        try:
+            json.loads(path.read_text(encoding="utf-8"))
+        except ValueError:
+            torn += 1
+    for w in writers:
+        w.join(60)
+    # A writer that raised FileNotFoundError on its own scratch file shows up
+    # here; the published file is a separate question, asserted next.
+    assert [w.exitcode for w in writers] == [0, 0], "a writer died publishing"
+    assert torn == 0, f"{torn} of {reads} reads saw a file that does not parse"
+    assert not [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")], \
+        list(tmp_path.iterdir())
