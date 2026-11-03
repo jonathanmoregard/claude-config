@@ -82,16 +82,29 @@ def _write_counter(key: str, value: int) -> None:
 
 
 def fake_systemctl(argv: list[str]) -> int:
+    """`systemctl show` with one or several `-p`, matching real output shape.
+
+    Without `--value`, real systemd prints `KEY=value` lines in ITS OWN property
+    order, not the requested one, so callers must read values back by key; the
+    stub prints the same shape. With `--value` it prints bare values.
+
+    One phase is one iteration of wait-for's wait loop. The loop's snapshot is
+    the only one that asks for `Type`, so that request is what advances the
+    phase: the arming snapshot and the final verdict snapshot then read the
+    unit as it was when the loop decided, which is how a real unit behaves.
+    """
     script, _ = _state()
     phases = script["systemctl"]
     if "show" not in argv:
         return 0
-    prop = argv[argv.index("-p") + 1]
+    props = [argv[i + 1] for i, arg in enumerate(argv) if arg == "-p"]
     idx = _read_counter("systemctl")
-    if prop == "ActiveState":
+    if "Type" in props:
         _write_counter("systemctl", idx + 1)
     phase = phases[min(idx, len(phases) - 1)]
-    print(phase.get(prop, ""))
+    for prop in props:
+        value = phase.get(prop, "")
+        print(value if "--value" in argv else f"{prop}={value}")
     return 0
 
 

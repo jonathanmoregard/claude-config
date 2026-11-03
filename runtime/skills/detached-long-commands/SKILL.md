@@ -16,8 +16,12 @@ ingests):
 The unit retains the command's real exit status: `ExecMainStatus` equals the
 command's exit code even after the process exits.
 
+Prefer a fresh slug. To deliberately reuse one, the retained unit must be
+**unloaded** first, and `reset-failed` alone will not do it:
+
 ```bash
-systemctl --user reset-failed <slug>.service 2>/dev/null  # if reusing the name
+systemctl --user stop <slug>.service 2>/dev/null         # unloads a FINISHED unit
+systemctl --user reset-failed <slug>.service 2>/dev/null # clears a FAILED one
 systemd-run --user --unit=<slug> --working-directory=<dir> \
   -p RemainAfterExit=yes \
   -p 'ExecStopPost=%h/.claude/scripts/record-user-unit-failure <slug> /tmp/<slug>.log' \
@@ -31,7 +35,23 @@ systemd-run --user --unit=<slug> --working-directory=<dir> \
 - **Always append sentinel markers** (`GATE_ALL_GREEN`/`GATE_FAILED` style).
   They show progress and make the log readable to a human. The retained unit
   status is the verdict; never infer success from silence or an empty log.
-- The unit name is the rerun handle; `reset-failed` before reuse.
+- The unit name is the rerun handle, and `RemainAfterExit` is what keeps the
+  result readable — which also keeps the unit **loaded** after it finishes, a
+  successful one as `active/exited`. `reset-failed` does not unload that, so on
+  its own it does not free the name. Measured on this host, one successful
+  retained run:
+
+  | step | `LoadState/ActiveState/SubState` | relaunch with the same name |
+  |---|---|---|
+  | after the run | `loaded/active/exited` | `Unit <slug>.service was already loaded or has a fragment file` |
+  | after `reset-failed` | `loaded/active/exited` — unchanged | same failure |
+  | after `stop` | `not-found/inactive` | succeeds |
+
+  So `stop` frees the name and `reset-failed` clears a failed unit's state; do
+  both, in that order, or use a new slug. `wait-for job` never hits this: it
+  adopts a retained unit and reports its recorded result instead of
+  relaunching, which is also why an intentional rerun of the same slug needs
+  the `stop` first.
 - **Never add `--collect` to a unit whose result you intend to read.** Without `--wait`
   it garbage-collects the unit the moment it exits, and `systemctl --user
   show` then answers about a unit that no longer exists — reporting

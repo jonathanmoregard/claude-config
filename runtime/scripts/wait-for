@@ -31,6 +31,11 @@
 #   common: --timeout <seconds> (default 3600; job default 14400 so a
 #                                          90-minute job does not time out)
 #
+# A retained unit keeps its result AND its name: `job` adopts it rather than
+# relaunching, so a deliberate rerun of the same slug needs `systemctl --user
+# stop <slug>.service` first. `reset-failed` does not unload a unit that
+# finished successfully, and the relaunch then fails as "already loaded".
+#
 # `--since` rejects a run that started before the requested time. Do not capture
 # `now` after launching a unit: that asks for a later run and can strand the
 # already-finished unit as a timeout. A `job` launch owns the ordering and never
@@ -307,6 +312,30 @@ runs_settled() {
 unit_prop() { systemctl "${user[@]}" show "$target" -p "$1" --value 2>/dev/null; }
 to_epoch() { [ -n "$1" ] && [ "$1" != n/a ] && date -d "$1" +%s 2>/dev/null || echo 0; }
 
+# Read several properties in ONE `systemctl show`, so they all describe the same
+# instant. Reading them one at a time leaves a window — measured 7 ms per pair
+# on this host — in which a collecting unit vanishes between two reads, after
+# which the later reads answer with not-found DEFAULTS. Those defaults are
+# `LoadState=not-found Transient=no CollectMode=inactive Result=success
+# ExecMainStatus=0`: a mix of instants can therefore make a failed run look like
+# a clean one, which is the entire class of bug this script exists to remove.
+# `--value` is deliberately unused: with several `-p` flags systemd prints the
+# values in its own property order, not the requested one, so they must be read
+# back by key.
+unit_prop_snapshot() {
+  local args=() p
+  for p in "$@"; do args+=(-p "$p"); done
+  systemctl "${user[@]}" show "$target" "${args[@]}" 2>/dev/null
+}
+
+snapshot_field() {
+  local snapshot=$1 key=$2 line
+  while IFS= read -r line; do
+    case $line in "$key="*) printf '%s\n' "${line#"$key="}"; return 0 ;; esac
+  done <<<"$snapshot"
+  return 0
+}
+
 failure_record() {
   local key=${target%.service}
   [ "${user[*]:-}" = --user ] || return 1
@@ -320,6 +349,29 @@ clear_reported_failure() {
   record=$(failure_record) || return 0
   rm -f -- "$record" ||
     echo "wait-for: reported the failure but could not clear $record" >&2
+}
+
+# A success supersedes an older undelivered failure for the same unit name.
+# Nothing else can clear it: `RemainAfterExit=yes` keeps the successful unit
+# active, so that unit's own `ExecStopPost` has not run and will not run until
+# someone stops it. Measured without this: after a failed run, a `stop` and a
+# successful rerun, every SessionStart kept announcing the fixed job.
+#
+# Only a record OLDER than the run just verified is cleared. If it is newer, or
+# either timestamp is unreadable, the record is KEPT: a stale announcement is
+# noise, while dropping a real failure is silence, and silence is the failure
+# mode this script exists to remove.
+clear_superseded_failure() {
+  local run_started=$1 record record_at record_epoch run_epoch
+  record=$(failure_record) || return 0
+  [ -f "$record" ] || return 0
+  record_at=$(jq -r '.failed_at // empty' "$record" 2>/dev/null)
+  record_epoch=$(to_epoch "$record_at")
+  run_epoch=$(to_epoch "$run_started")
+  [ "$record_epoch" -gt 0 ] && [ "$run_epoch" -gt 0 ] || return 0
+  [ "$record_epoch" -le "$run_epoch" ] || return 0
+  rm -f -- "$record" ||
+    echo "wait-for: $target succeeded but its superseded failure record $record could not be cleared" >&2
 }
 
 # A vanished unit's outcome is read from the journal, never inferred from its
@@ -405,6 +457,7 @@ report_vanished_unit() {
   case $verdict in
     ok)
       echo "unit $target vanished after a clean exit; journal shows no failure for invocation=${invocation:-unknown}"
+      clear_superseded_failure "$started_at"
       exit 0 ;;
     failed)
       echo "unit $target vanished; journal result=failed status=unknown invocation=${invocation:-unknown}"
@@ -412,6 +465,7 @@ report_vanished_unit() {
       exit 1 ;;
     0)
       echo "unit $target vanished; journal result=success status=0 invocation=${invocation:-unknown}"
+      clear_superseded_failure "$started_at"
       exit 0 ;;
     *)
       echo "unit $target vanished; journal result=exit-code status=$verdict invocation=${invocation:-unknown}"
@@ -425,46 +479,76 @@ wait_unit() {
   if [ -n "$since" ]; then
     since_epoch=$(to_epoch "$since"); [ "$since_epoch" -gt 0 ] || usage
   fi
-  local load state started started_at transient collect_mode invocation
-  load=$(unit_prop LoadState)
-  if [ "$load" != loaded ]; then
-    report_vanished_unit "" "" unknown
-  fi
-  # These identify the armed run before a collecting unit can disappear.
+  local armed iter final load state started started_at transient collect_mode
+  local invocation result status
+  # One snapshot, so the identity used for the journal fallback describes the
+  # same instant as the LoadState that admitted it.
   # `started_at` keeps the systemd timestamp STRING for the journal fallback's
   # `--since`; `started` below is an epoch integer for the `--since` comparison.
   # They are deliberately separate: feeding an epoch to `--since` is not a date.
-  transient=$(unit_prop Transient)
-  collect_mode=$(unit_prop CollectMode)
-  invocation=$(unit_prop InvocationID)
-  started_at=$(unit_prop ExecMainStartTimestamp)
+  armed=$(unit_prop_snapshot LoadState Transient CollectMode InvocationID \
+                             ExecMainStartTimestamp)
+  load=$(snapshot_field "$armed" LoadState)
+  transient=$(snapshot_field "$armed" Transient)
+  collect_mode=$(snapshot_field "$armed" CollectMode)
+  invocation=$(snapshot_field "$armed" InvocationID)
+  started_at=$(snapshot_field "$armed" ExecMainStartTimestamp)
+  if [ "$load" != loaded ]; then
+    # Nothing in this snapshot is a fact about a real unit: every field is a
+    # not-found default, CollectMode included. Say unknown rather than repeat
+    # a default as an observation.
+    report_vanished_unit "" "" unknown
+  fi
   while :; do
-    state=$(unit_prop ActiveState)
-    if [ "$transient" = yes ] && [ "$(unit_prop LoadState)" != loaded ]; then
+    iter=$(unit_prop_snapshot LoadState ActiveState SubState Type \
+                              ExecMainStartTimestamp)
+    # A unit that stops being loaded cannot be read through systemctl at all;
+    # every property in this snapshot would be a not-found default, and those
+    # defaults read exactly like a pass. The journal decides instead.
+    #
+    # The cached `transient` flag is deliberately NOT part of this condition.
+    # It used to gate the check, which made the bug self-concealing: if the
+    # unit vanished while the arming reads were in flight, `Transient` answered
+    # with its own default `no`, the gate could never fire, and the run was
+    # reported from `Result=success ExecMainStatus=0`. Whether a unit is
+    # transient is irrelevant here — being unloaded is what makes its
+    # properties unreadable.
+    if [ "$(snapshot_field "$iter" LoadState)" != loaded ]; then
       report_vanished_unit "$invocation" "$started_at" "$collect_mode"
     fi
-    started=$(to_epoch "$(unit_prop ExecMainStartTimestamp)")
+    state=$(snapshot_field "$iter" ActiveState)
+    started=$(to_epoch "$(snapshot_field "$iter" ExecMainStartTimestamp)")
     case $state in
       activating|deactivating|reloading|refreshing) ;;
       active)
         # A oneshot is active/start while it runs and active/exited after it
         # (RemainAfterExit). A transient unit (systemd-run) is a job, so active
         # means still running. Any other type is "up" once active.
-        if [ "$transient" != yes ] && { [ "$(unit_prop Type)" != oneshot ] ||
-          [ "$(unit_prop SubState)" = exited ]; }; then
+        if [ "$transient" != yes ] && { [ "$(snapshot_field "$iter" Type)" != oneshot ] ||
+          [ "$(snapshot_field "$iter" SubState)" = exited ]; }; then
           [ "$started" -ge "$since_epoch" ] && break
         fi
-        [ "$transient" = yes ] && [ "$(unit_prop SubState)" = exited ] && break ;;
+        [ "$transient" = yes ] && [ "$(snapshot_field "$iter" SubState)" = exited ] && break ;;
       *)
         # inactive/failed: done, unless --since asks for a run not yet begun.
         if [ "$since_epoch" = 0 ] || [ "$started" -ge "$since_epoch" ]; then break; fi ;;
     esac
     nap 5
   done
-  local result status
-  result=$(unit_prop Result); status=$(unit_prop ExecMainStatus)
-  echo "unit $target $(unit_prop ActiveState)/$(unit_prop SubState) result=$result status=$status started=$(unit_prop ExecMainStartTimestamp)"
+  # The verdict is read as one snapshot too, and re-checks LoadState: a unit
+  # reaped between breaking out of the loop and reading its result would
+  # otherwise be reported from the not-found defaults.
+  final=$(unit_prop_snapshot LoadState ActiveState SubState Result \
+                             ExecMainStatus ExecMainStartTimestamp)
+  if [ "$(snapshot_field "$final" LoadState)" != loaded ]; then
+    report_vanished_unit "$invocation" "$started_at" "$collect_mode"
+  fi
+  result=$(snapshot_field "$final" Result)
+  status=$(snapshot_field "$final" ExecMainStatus)
+  started_at=$(snapshot_field "$final" ExecMainStartTimestamp)
+  echo "unit $target $(snapshot_field "$final" ActiveState)/$(snapshot_field "$final" SubState) result=$result status=$status started=$started_at"
   if [ "$result" = success ]; then
+    clear_superseded_failure "$started_at"
     exit 0
   fi
   clear_reported_failure

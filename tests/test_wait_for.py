@@ -251,6 +251,91 @@ def test_vanished_unit_without_journal_record_is_unknown(tmp_path: Path) -> None
     assert "could not be determined" in out, out
 
 
+def test_unit_vanishing_mid_wait_is_journal_read_whatever_transient_said(
+    tmp_path: Path,
+) -> None:
+    # The arming reads can lose a race with collection: once the unit is gone,
+    # `systemctl show -p Transient` answers with its own default `no` (measured
+    # on this host, alongside `Result=success ExecMainStatus=0`). Gating the
+    # mid-wait vanish check on that cached flag made the bug self-concealing —
+    # the gate could not fire precisely when it was needed. Being unloaded, not
+    # being transient, is what makes a unit's properties unreadable.
+    miscached = {"LoadState": "loaded", "ActiveState": "activating",
+                 "SubState": "start", "Type": "simple", "Transient": "no",
+                 "CollectMode": "inactive", "InvocationID": "run-abc",
+                 "ExecMainStartTimestamp": "Sat 2026-10-04 08:00:00 CEST"}
+    gone = {"LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead",
+            "Result": "success", "ExecMainStatus": "0"}
+    script = {"systemctl": [miscached, gone],
+              "journalctl": [{"stdout": [started_record(), exit_record(7)]}]}
+    rc, out, _ = run_wait_for(tmp_path, script, "unit", "gate", "--user")
+    assert rc == 1, out
+    assert "status=7" in out, out
+
+
+def test_unit_reaped_after_the_loop_breaks_is_journal_read(tmp_path: Path) -> None:
+    # A guard, not a reproduction: a6c6a1e also passes this fixture, because its
+    # in-loop check happened to run before the break. What is pinned here is the
+    # structure — the verdict snapshot re-checks LoadState, so the ~7 ms between
+    # "the loop saw it finish" and "read its Result" cannot be answered by
+    # not-found defaults. Dropping that re-check must fail a test.
+    finished = {"LoadState": "loaded", "ActiveState": "failed", "SubState": "failed",
+                "Type": "simple", "Transient": "yes", "CollectMode": "inactive-or-failed",
+                "InvocationID": "run-abc",
+                "ExecMainStartTimestamp": "Sat 2026-10-04 08:00:00 CEST"}
+    gone = {"LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead",
+            "Result": "success", "ExecMainStatus": "0"}
+    script = {"systemctl": [finished, gone],
+              "journalctl": [{"stdout": [started_record(), exit_record(7)]}]}
+    rc, out, _ = run_wait_for(tmp_path, script, "unit", "gate", "--user")
+    assert rc == 1, out
+    assert "status=7" in out, out
+
+
+SUCCEEDED_UNIT = {
+    "LoadState": "loaded", "ActiveState": "active", "SubState": "exited",
+    "Type": "simple", "Transient": "yes", "CollectMode": "none",
+    "InvocationID": "run-job", "Result": "success", "ExecMainStatus": "0",
+    # 06:00:00Z
+    "ExecMainStartTimestamp": "Sat 2026-10-04 08:00:00 CEST",
+}
+
+
+def write_record(tmp_path: Path, slug: str, body: dict) -> Path:
+    record = tmp_path / "home/.local/state/claude-unit-failures" / f"{slug}.json"
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(json.dumps(body), encoding="utf-8")
+    return record
+
+
+def test_success_clears_a_failure_record_it_supersedes(tmp_path: Path) -> None:
+    # Nothing else can clear it: RemainAfterExit keeps the successful unit
+    # active, so its own ExecStopPost has not run. Measured without this fix,
+    # every SessionStart kept announcing a job that had since been fixed.
+    record = write_record(tmp_path, "gate", {"unit": "gate.service",
+                                             "failed_at": "2026-10-04T05:00:00Z"})
+    rc, out, _ = run_wait_for(
+        tmp_path, {"systemctl": [SUCCEEDED_UNIT]}, "unit", "gate", "--user"
+    )
+    assert rc == 0, out
+    assert not record.exists(), record.read_text()
+
+
+def test_success_keeps_a_failure_record_it_cannot_account_for(tmp_path: Path) -> None:
+    # A record newer than the verified run, or one whose timestamp cannot be
+    # read, is kept. A stale announcement is noise; dropping a real failure is
+    # silence, which is the failure mode this script exists to remove.
+    for body in ({"failed_at": "2026-10-04T07:00:00Z"},
+                 {"failed_at": "not a timestamp"},
+                 {"unit": "gate.service"}):
+        record = write_record(tmp_path, "gate", body)
+        rc, out, _ = run_wait_for(
+            tmp_path, {"systemctl": [SUCCEEDED_UNIT]}, "unit", "gate", "--user"
+        )
+        assert rc == 0, out
+        assert record.exists(), f"{body} was cleared: {out}"
+
+
 def test_since_after_launch_waits_for_a_newer_run(tmp_path: Path) -> None:
     # --since is a freshness filter, not a way to timestamp a launch after the
     # fact. A terminal run that started earlier must not be mistaken for a new one.
