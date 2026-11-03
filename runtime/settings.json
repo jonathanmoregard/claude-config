@@ -789,6 +789,17 @@
           }
         ]
       }
+    ],
+    "MessageDisplay": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/hooks/code-span-punct.py",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   },
   "statusLine": {
