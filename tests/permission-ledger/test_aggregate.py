@@ -13,6 +13,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -929,21 +930,75 @@ class AggregateTestCase(unittest.TestCase):
         old = aggregate.SCAN_CONTENT_TIMEOUT
         aggregate.SCAN_CONTENT_TIMEOUT = 2
         self.addCleanup(setattr, aggregate, "SCAN_CONTENT_TIMEOUT", old)
+        started = time.monotonic()
         code, out, err = self.run_aggregate("--scan-script", script, scan=True)
+        elapsed = time.monotonic() - started
         self.assertEqual(code, 0, err)
         status = json.loads(out)["scan_status"]["scan_content"]
         self.assertTrue(status.startswith("error"), status)
         self.assertNotIn(payload, status)
+        # THE DEFECT IS OBSERVABLE HERE, not in the liveness check below.
+        # aggregate.py kills the process GROUP and then calls proc.communicate()
+        # a second time, unbounded (aggregate.py:650). When the group kill works
+        # the orphan dies, the pipes close and that call returns at once. When it
+        # does NOT -- the regression this case exists for, a classifier left
+        # holding a model in memory -- the orphan keeps the inherited stdout pipe
+        # open and the second communicate() blocks until the orphan exits BY
+        # ITSELF, here after its full 300s sleep. So in the broken case the scan
+        # returns 300s late and the orphan is already gone when it does: measured
+        # at 303s with the group kill replaced by a direct-child kill, and BOTH
+        # this assertion's absence and a liveness check alone let that pass.
+        #
+        # 60s against a 300s sleep, so the threshold is an order of magnitude
+        # clear of any load this can see, and it is a ceiling on the TEST's own
+        # wait -- SCAN_CONTENT_TIMEOUT, which production shares, is untouched.
+        self.assertLess(
+            elapsed, 60.0,
+            f"the scan took {elapsed:.0f}s against a {aggregate.SCAN_CONTENT_TIMEOUT}s "
+            f"timeout, so it did not return when the timeout fired -- it waited "
+            f"on a pipe an orphaned child still held open, i.e. the kill did not "
+            f"take the process group with it",
+        )
         with open(pidfile) as fh:
             pid = int(fh.read())
-        try:
-            os.kill(pid, 0)
-            alive = True
-        except ProcessLookupError:
-            alive = False
+        # POLLED, not sampled once. The kill and the kernel's reaping of the
+        # grandchild are asynchronous with respect to run_aggregate() returning:
+        # the grandchild is reparented when its own parent dies, and until it is
+        # reaped `kill(pid, 0)` still succeeds on the zombie. A single sample the
+        # instant the call returns therefore reports "outlived the timeout" on a
+        # process that is already dead -- measured twice on a loaded machine,
+        # against a whole-corpus run that took 832s where an isolated one takes
+        # 4s, and it passes every time in isolation.
+        #
+        # The claim is unchanged and the budget is untouched: the child sleeps
+        # 300s, so a 30s ceiling still separates "killed with its parent" from
+        # "orphaned for five minutes" by an order of magnitude, and
+        # SCAN_CONTENT_TIMEOUT -- which production shares -- is not widened to
+        # make a test pass.
+        deadline = time.monotonic() + 30.0
+        waited = 0.0
+        while True:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                alive = False
+                break
+            waited = time.monotonic() - (deadline - 30.0)
+            if waited >= 30.0:
+                alive = True
+                break
+            time.sleep(0.05)
         if alive:
             os.kill(pid, 9)
-        self.assertFalse(alive, "scanner's child outlived the timeout")
+        # Names which of the two things went wrong: a child that is still there
+        # after a generous wait is the scanner failing to take its process group
+        # with it, not the test looking too early.
+        self.assertFalse(
+            alive,
+            f"scanner's child (pid {pid}) was still alive {waited:.1f}s after "
+            f"the scan returned, so the timeout did not take the process group "
+            f"with it; it was sleeping 300s",
+        )
 
     def test_detect_secrets_absent_is_reported(self):
         for _ in range(3):

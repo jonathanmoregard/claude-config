@@ -53,21 +53,25 @@ import tempfile
 import unittest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# `runtime/` once the layout migration has landed, the repository root
+# before it. Only the projected subset moves; tests/ stays at the root.
+RUNTIME = os.path.join(REPO_ROOT, "runtime") if os.path.isdir(
+    os.path.join(REPO_ROOT, "runtime")) else REPO_ROOT
 
 SINK_LITERAL = "~/.local/state/claude-proposals"
 SINK_ABS = "/home/jonathan/.local/state/claude-proposals"
 
-GATE_PATH = os.path.join(REPO_ROOT, "scripts", "proposal-intake-gate.py")
-SINK_PY_PATH = os.path.join(REPO_ROOT, "permission-ledger", "proposal-sink.py")
+GATE_PATH = os.path.join(RUNTIME, "scripts", "proposal-intake-gate.py")
+SINK_PY_PATH = os.path.join(RUNTIME, "permission-ledger", "proposal-sink.py")
 RSI_CONFIG_PATH = os.path.join(
-    REPO_ROOT, "recursive-self-improvement", "config", "config.json")
+    RUNTIME, "recursive-self-improvement", "config", "config.json")
 RSI_PROMPT_PATH = os.path.join(
-    REPO_ROOT, "recursive-self-improvement", "config", "prompt.md")
-PUSH_SCRIPT = os.path.join(REPO_ROOT, "push-proposals.sh")
-PUSHER_PATH = os.path.join(REPO_ROOT, "scripts", "claude-proposals-push.sh")
-CUTOVER_SCRIPT = os.path.join(REPO_ROOT, "scripts", "cutover-proposals.sh")
-ON_DECISION = os.path.join(REPO_ROOT, "permission-ledger", "on-decision")
-RUN_EVALUATE = os.path.join(REPO_ROOT, "permission-ledger", "run-evaluate.sh")
+    RUNTIME, "recursive-self-improvement", "config", "prompt.md")
+PUSH_SCRIPT = os.path.join(RUNTIME, "push-proposals.sh")
+PUSHER_PATH = os.path.join(RUNTIME, "scripts", "claude-proposals-push.sh")
+CUTOVER_SCRIPT = os.path.join(RUNTIME, "scripts", "cutover-proposals.sh")
+ON_DECISION = os.path.join(RUNTIME, "permission-ledger", "on-decision")
+RUN_EVALUATE = os.path.join(RUNTIME, "permission-ledger", "run-evaluate.sh")
 
 
 def load_module(name, path):
@@ -163,6 +167,11 @@ class FixtureHome:
         pusher = os.path.join(self.claude, "scripts", "claude-proposals-push.sh")
         shutil.copy2(PUSHER_PATH, pusher)
         os.chmod(pusher, 0o755)
+        # The pusher refuses to push without its gitleaks allowlist config
+        # (it expects it beside itself in $CLAUDE_HOME/scripts), so carry the
+        # real one: the push tests must scan with the config that ships.
+        shutil.copy2(os.path.join(RUNTIME, "scripts", "proposals-gitleaks.toml"),
+                     os.path.join(self.claude, "scripts", "proposals-gitleaks.toml"))
         # The repo's REAL ignore rules, so "the live checkout stays clean
         # after the cutover" is tested against what actually ships.
         shutil.copy2(os.path.join(REPO_ROOT, ".gitignore"),
@@ -1877,7 +1886,7 @@ class TestCutoverNodeClassification(FixtureCase):
 # `rsi-proposal-sink` script, and golden vectors captured by running that
 # binary.
 # --------------------------------------------------------------------------
-BACKFILL_PATH = os.path.join(REPO_ROOT, "scripts", "backfill-proposal-index.py")
+BACKFILL_PATH = os.path.join(RUNTIME, "scripts", "backfill-proposal-index.py")
 backfill = load_module("backfill_proposal_index", BACKFILL_PATH)
 
 

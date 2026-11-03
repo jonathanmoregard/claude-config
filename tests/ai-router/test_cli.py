@@ -15,6 +15,14 @@ from ai_router import cli, jobs
 
 pytestmark = pytest.mark.usefixtures("stub_providers")
 
+# The clock the CLI decides against. The stub snapshots carry absolute reset
+# times (codex's 98 % weekly bucket resets at 1_789_805_383, 2026-09-19), so
+# deciding against the wall clock made these tests expire: past that instant
+# the bucket has correctly reset and luna becomes eligible. Pinned on the same
+# fixture timeline as test_quota_rejection_supersede.py, per the conftest's
+# "the clock is injected wherever the code under test accepts `now`".
+NOW = 1_789_400_000
+
 
 @pytest.fixture
 def env(state_dir: Path, tmp_path: Path) -> dict[str, str]:
@@ -34,6 +42,7 @@ def prompt(tmp_path: Path) -> Path:
 
 
 def run(capsys, argv: list[str], env: dict[str, str], **kw) -> tuple[int, dict | None, str, str]:
+    kw.setdefault("now", NOW)
     rc = cli.main(argv, env=env, launcher=kw.pop("launcher", "setsid"), **kw)
     cap = capsys.readouterr()
     obj = None
@@ -295,21 +304,68 @@ def test_exit_codes_per_failure_class(capsys, env, tmp_path):
         assert rc == code, (mode, res)
 
 
+def diagnose(label: str, state_dir: Path, outcome: tuple) -> str:
+    """Why a job command came back the way it did.
+
+    A bare `assert rc == 0 and ...` on a job result reports `assert (1 == 0)`
+    and nothing else, which cannot tell a wrong answer from no answer at all
+    -- a job the router declared dead, a launch that lost a race, a stub that
+    refused a flag. These runs are detached processes polled for completion,
+    so the difference is the whole diagnosis, and it is unrecoverable once the
+    temporary state directory is gone. Observed: one CI failure here that said
+    only `assert (1 == 0)`, with no way to tell which.
+    """
+    rc, res, out, err = outcome
+    lines = [f"{label}: rc={rc}"]
+    if isinstance(res, dict):
+        for k in ("status", "exit_code", "error_class", "session_id", "thread_id",
+                  "result_text", "error", "message", "detail"):
+            if res.get(k) is not None:
+                lines.append(f"  {k} = {res[k]!r}")
+        if res.get("job_id"):
+            try:
+                meta = jobs.read_meta(jobs.job_dir(state_dir, res["job_id"]))
+            except Exception as exc:  # noqa: BLE001 — diagnosing, not asserting
+                lines.append(f"  meta unreadable: {type(exc).__name__}: {exc}")
+            else:
+                for k in ("runner_note", "runner_pid", "created_at", "finished_at",
+                          "retry_note", "parent_job"):
+                    if meta.get(k) is not None:
+                        lines.append(f"  meta.{k} = {meta[k]!r}")
+    else:
+        lines.append(f"  no JSON object on stdout: {out[-400:]!r}")
+    if err.strip():
+        lines.append(f"  stderr = {err[-400:]!r}")
+    return "\n".join(lines)
+
+
 def test_send_resumes_finished_job(capsys, env, prompt, tmp_path, state_dir):
-    rc, res, *_ = run(capsys, ["delegate", "--model", "luna", "--force", "--prompt-file", str(prompt), "--cwd",
-                               str(tmp_path), "--wait", "--json"], env)
+    first = run(capsys, ["delegate", "--model", "luna", "--force", "--prompt-file", str(prompt), "--cwd",
+                         str(tmp_path), "--wait", "--json"], env)
+    rc, res, *_ = first
+    assert rc == 0, diagnose("codex delegate", state_dir, first)
     jid = res["job_id"]
     p2 = tmp_path / "follow.md"
     p2.write_text("and now?\n")
-    rc, res2, *_ = run(capsys, ["send", jid, "--prompt-file", str(p2), "--wait", "--json"], env)
-    assert rc == 0 and res2["result_text"].startswith("RESUMED: OK and now?")
+    second = run(capsys, ["send", jid, "--prompt-file", str(p2), "--wait", "--json"], env)
+    rc, res2, *_ = second
+    assert rc == 0, diagnose("codex send", state_dir, second)
+    assert res2["result_text"].startswith("RESUMED: OK and now?"), \
+        diagnose("codex send", state_dir, second)
     meta = jobs.read_meta(jobs.job_dir(state_dir, res2["job_id"]))
     assert meta["parent_job"] == jid and meta["argv"][2:4] == ["resume", "thread-fake-0001"]
     # claude side
-    rc, res3, *_ = run(capsys, ["delegate", "--model", "haiku", "--prompt-file", str(prompt), "--cwd",
-                                str(tmp_path), "--wait", "--json"], env)
-    rc, res4, *_ = run(capsys, ["send", res3["job_id"], "--prompt-file", str(p2), "--wait", "--json"], env)
-    assert rc == 0 and res4["session_id"] == "session-fake-0001" and "RESUMED" in res4["result_text"]
+    third = run(capsys, ["delegate", "--model", "haiku", "--prompt-file", str(prompt), "--cwd",
+                         str(tmp_path), "--wait", "--json"], env)
+    rc, res3, *_ = third
+    # Checked on its own: a `send` cannot resume what never finished, so an
+    # unchecked delegate here reported itself as the send's failure.
+    assert rc == 0, diagnose("claude delegate", state_dir, third)
+    fourth = run(capsys, ["send", res3["job_id"], "--prompt-file", str(p2), "--wait", "--json"], env)
+    rc, res4, *_ = fourth
+    assert rc == 0, diagnose("claude send", state_dir, fourth)
+    assert res4["session_id"] == "session-fake-0001" and "RESUMED" in res4["result_text"], \
+        diagnose("claude send", state_dir, fourth)
     meta4 = jobs.read_meta(jobs.job_dir(state_dir, res4["job_id"]))
     assert meta4["argv"][meta4["argv"].index("--resume") + 1] == "session-fake-0001"
 
