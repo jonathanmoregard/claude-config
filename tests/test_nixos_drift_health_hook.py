@@ -29,9 +29,16 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from conftest import REPO_ROOT
+# Anchored here, not imported from `conftest`: tests/ and tests/ai-router/ both
+# hold a module named `conftest`, and in a whole-tree run `from conftest import`
+# resolves to whichever was imported last.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-HOOK = Path(REPO_ROOT) / "hooks" / "nixos-drift-health.py"
+# The shipped config lives one level down in runtime/ since the runtime cutover;
+# tolerate both layouts, same anchor as the other top-level suites.
+RUNTIME = Path(REPO_ROOT) / "runtime" if (Path(REPO_ROOT) / "runtime").is_dir() else Path(REPO_ROOT)
+
+HOOK = RUNTIME / "hooks" / "nixos-drift-health.py"
 
 
 def _section(heading: str, items: list[str]) -> str:
@@ -172,6 +179,6 @@ def test_unreadable_report_does_not_break_startup(tmp_path):
 
 
 def test_registered_on_session_start():
-    settings = json.loads((Path(REPO_ROOT) / "settings.json").read_text())
+    settings = json.loads((RUNTIME / "settings.json").read_text())
     cmds = [h["command"] for e in settings["hooks"]["SessionStart"] for h in e["hooks"]]
     assert any("hooks/nixos-drift-health.py" in c for c in cmds), cmds

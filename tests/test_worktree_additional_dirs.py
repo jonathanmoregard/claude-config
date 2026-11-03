@@ -101,5 +101,14 @@ def main() -> int:
     return 1 if FAILURES else 0
 
 
+def test_scopes_only_worktrees_that_still_hold_work() -> None:
+    """pytest entry point: the same sandbox, the same checks, one verdict.
+
+    Without it pytest collects nothing here and reports a green that asserted
+    nothing."""
+    FAILURES.clear()
+    assert main() == 0, f"failed checks: {FAILURES}"
+
+
 if __name__ == "__main__":
     sys.exit(main())

@@ -7,7 +7,12 @@ cat > "$BIN/gh" <<'STUB'
 #!/usr/bin/env bash
 log="$E2E_RUN/gh.log"
 printf '%s\n' "$*" >> "$log"
-jqf() { local i; for ((i = 1; i <= $#; i++)); do [ "${!i}" = --jq ] && { j=$((i + 1)); echo "${!j}"; return; }; done; echo .; }
+# Real `gh` accepts the filter as either `--jq` or `-q`; honour both, or a
+# caller written the short way gets the whole object where it asked for one
+# field. That is what `gh repo view --json visibility -q .visibility` hit: the
+# stub returned the entire JSON document and the visibility check compared it
+# against a bare `PRIVATE`.
+jqf() { local i j; for ((i = 1; i <= $#; i++)); do case "${!i}" in --jq|-q) j=$((i + 1)); echo "${!j}"; return ;; esac; done; echo .; }
 case "$1 $2" in
   "pr view")
     printf '{"number":42,"url":"https://github.com/acme/widget/pull/42","state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"BLOCKED","headRefOid":"4b1d6f0c2a9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c","headRefName":"fix/backoff"}\n' \
@@ -27,7 +32,9 @@ case "$1 $2" in
   "run view"|"run watch")
     echo "run view is not part of this scenario; use run list" >&2; exit 1 ;;
   "auth status") echo "github.com: Logged in to github.com account e2e" ;;
-  "repo view") echo '{"nameWithOwner":"acme/widget","visibility":"PRIVATE"}' ;;
+  "repo view")
+    echo '{"nameWithOwner":"acme/widget","visibility":"PRIVATE"}' \
+      | jq -r "$(jqf "$@")" ;;
   *) echo "{}" ;;
 esac
 STUB

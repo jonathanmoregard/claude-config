@@ -56,8 +56,16 @@ def valid_policy() -> dict:
         "gitExecutable": "git",
         "bubblewrapExecutable": "bwrap",
         "validatorExecutable": "dcg",
-        "credentialHelperExecutable": "/etc/profiles/per-user/jonathan/bin/gh",
-        "githubCliExecutable": "/etc/profiles/per-user/jonathan/bin/gh",
+        # Resolved from PATH, with this machine's path as the fallback, exactly
+        # as `gitExecutable` is resolved further down. Pinned to the absolute
+        # Nix-profile path these fixtures used to carry, 25 cases could only
+        # ever pass on one laptop: server.py fails closed on an executable it
+        # cannot find ("BROKEN safety boundary"), so on a GitHub runner they all
+        # died before reaching the argv they exist to check -- measured, in this
+        # branch's first CI run. No assertion reads this value literally; the
+        # argv checks substitute a placeholder for it.
+        "credentialHelperExecutable": shutil.which("gh") or "/etc/profiles/per-user/jonathan/bin/gh",
+        "githubCliExecutable": shutil.which("gh") or "/etc/profiles/per-user/jonathan/bin/gh",
         "waitForExecutable": "/home/jonathan/.claude/scripts/wait-for",
         "watchStatusDir": "%t/git-broker/watch",
         "githubHostTokenDir": "/home/jonathan/.cache/gh-tokens/host",
@@ -69,6 +77,23 @@ def valid_policy() -> dict:
         "maxTimeoutMs": 600000,
         "outputLimitChars": 60000,
     }
+
+
+def policy_rooted_at(root: Path) -> dict:
+    """`valid_policy()`, plus `root` as a repository and creation root.
+
+    The roots above are this machine's real directories, and a case that only
+    reads them as strings does not care. A case that CREATES a target below a
+    creation root does: it needs a root that exists wherever the suite runs.
+    Declaring the temporary directory is not cosmetic -- `_reject_nested_target`
+    stops walking as soon as an ancestor leaves the declared roots, so a target
+    in an undeclared directory is never examined and the case would pass
+    without exercising the check it names.
+    """
+    doc = valid_policy()
+    for key in ("repositoryRoots", "metadataRoots", "worktreeCreationRoots"):
+        doc[key] = [*doc[key], str(root)]
+    return doc
 
 
 class ToolSurfaceTests(unittest.TestCase):
@@ -2341,10 +2366,9 @@ class ToolExecutionTests(unittest.TestCase):
         fake_proc.terminate.assert_called_once_with()
 
     def test_unsafe_worktree_target_cleanup_failure_is_not_swallowed(self) -> None:
-        with tempfile.TemporaryDirectory(
-            prefix="git-broker-target-", dir="/home/jonathan/worktrees"
-        ) as td:
-            target = Path(td) / "target"
+        with tempfile.TemporaryDirectory(prefix="git-broker-target-") as td:
+            root = Path(td).resolve(strict=True)
+            target = root / "target"
             original_resolve = Path.resolve
 
             def noncanonical(path: Path, strict: bool = False) -> Path:
@@ -2361,7 +2385,9 @@ class ToolExecutionTests(unittest.TestCase):
             ):
                 self.server._prepare_worktree_target(
                     {"operation": "worktree_add", "worktree_path": target},
-                    self.server._load_git_policy({"gitBroker": valid_policy()}),
+                    self.server._load_git_policy(
+                        {"gitBroker": policy_rooted_at(root)}
+                    ),
                 )
 
 
@@ -3053,12 +3079,12 @@ class CloneDispatchTests(unittest.TestCase):
 class TargetContainmentTests(unittest.TestCase):
     def setUp(self) -> None:
         self.server = load_server()
-        self.policy = self.server._load_git_policy({"gitBroker": valid_policy()})
-        self.temp = tempfile.TemporaryDirectory(
-            prefix="git-broker-target-", dir="/home/jonathan/worktrees"
-        )
+        self.temp = tempfile.TemporaryDirectory(prefix="git-broker-target-")
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve(strict=True)
+        self.policy = self.server._load_git_policy(
+            {"gitBroker": policy_rooted_at(self.root)}
+        )
 
     def test_targets_inside_git_metadata_or_another_checkout_are_refused(self) -> None:
         subprocess.run(["git", "init", "-q", str(self.root / "repo")], check=True)

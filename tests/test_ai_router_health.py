@@ -33,7 +33,10 @@ import time
 import pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-HOOK = os.path.join(REPO_ROOT, "hooks", "ai-router-health.py")
+# The shipped config lives one level down in runtime/ since the runtime cutover;
+# tolerate both layouts, same anchor as the other top-level suites.
+RUNTIME = os.path.join(REPO_ROOT, "runtime") if os.path.isdir(os.path.join(REPO_ROOT, "runtime")) else REPO_ROOT
+HOOK = os.path.join(RUNTIME, "hooks", "ai-router-health.py")
 
 
 def run_hook(state_dir: str, now: float | None = None) -> subprocess.CompletedProcess[str]:
@@ -220,7 +223,7 @@ def test_rejection_without_until_uses_default_ttl(tmp_path):
 
 
 def test_settings_wires_hook_at_session_start():
-    with open(os.path.join(REPO_ROOT, "settings.json"), encoding="utf-8") as fh:
+    with open(os.path.join(RUNTIME, "settings.json"), encoding="utf-8") as fh:
         settings = json.load(fh)
     commands = [
         hook.get("command", "")

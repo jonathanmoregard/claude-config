@@ -31,9 +31,24 @@ import tempfile
 import time
 from typing import NamedTuple
 
+# This module is a SCRIPT SUITE: every check below runs at import time and the
+# verdict is this file's exit status. Importing it under pytest would run the
+# whole body just to collect it, so the module stops here with a visible skip
+# naming the real invocation. `tests/conftest.py` turns this marker back into
+# one real test that runs the file as a script, so CI needs no list of these.
+if __name__ != "__main__":
+    import pytest
+
+    pytest.skip("script suite: run `python3 tests/test_tool_output_redact.py` "
+                "(exit 0 = all green); pytest cannot import it",
+                allow_module_level=True)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
-HOOKS = os.path.join(REPO_ROOT, "hooks")
+# `runtime/` once the layout migration has landed, the repository root before it;
+# only the shipped subset moved, tests/ stays at the root.
+RUNTIME = os.path.join(REPO_ROOT, "runtime") if os.path.isdir(os.path.join(REPO_ROOT, "runtime")) else REPO_ROOT
+HOOKS = os.path.join(RUNTIME, "hooks")
 HOOK = os.path.join(HOOKS, "tool-output-redact.py")
 BASH_GUARD = os.path.join(HOOKS, "bash-output-guard.py")
 WRITE_GUARD = os.path.join(HOOKS, "redaction-marker-write-guard.py")
@@ -49,7 +64,7 @@ _spec.loader.exec_module(hook)
 sys.path.insert(0, HOOKS)
 import secret_redaction as sr  # noqa: E402
 
-with open(os.path.join(REPO_ROOT, "settings.json"), encoding="utf-8") as _fh:
+with open(os.path.join(RUNTIME, "settings.json"), encoding="utf-8") as _fh:
     SETTINGS = json.load(_fh)
 
 # ---- reporting ---------------------------------------------------------

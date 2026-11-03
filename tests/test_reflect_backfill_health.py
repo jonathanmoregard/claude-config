@@ -10,7 +10,10 @@ import sys
 import pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-HOOK = os.path.join(REPO_ROOT, "hooks", "reflect-backfill-health.py")
+# The shipped config lives one level down in runtime/ since the runtime cutover;
+# tolerate both layouts, same anchor as the other top-level suites.
+RUNTIME = os.path.join(REPO_ROOT, "runtime") if os.path.isdir(os.path.join(REPO_ROOT, "runtime")) else REPO_ROOT
+HOOK = os.path.join(RUNTIME, "hooks", "reflect-backfill-health.py")
 NOW = 1790974800.0  # 2026-10-02T21:00:00Z
 
 
