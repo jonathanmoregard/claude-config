@@ -12,20 +12,29 @@
 # that the job then runs. This job cannot be built that way: the whole point is
 # to execute the candidate config, hooks and skills included, and the agent
 # needs a credential to run at all. So a pull request CAN steal this job's
-# credential, and that is accepted rather than defended: the key is dedicated
-# to this lane, holds its own budget, reaches no repository, host or quota, and
-# is rotated if it leaks. Nothing else may be added to this job's `secrets`.
+# credential, and that is accepted rather than defended -- but the thing it
+# steals is made worth as little as possible. There is no stored key: the job
+# exchanges GitHub's own signed statement that this repository's pull-request
+# job is running for an Anthropic token that is scoped to one workspace with
+# its own spend ceiling and expires within minutes. A leak costs the remainder
+# of that lifetime, not a rotation. Nothing else may be added to this job's
+# `secrets`, and a long-lived `sk-ant-...` must never be put back.
 #
-# Two consequences worth stating:
+# Three consequences worth stating:
 #   - `pull_request`, never `pull_request_target`: a fork's code must not run
-#     with this repository's secrets. A fork PR therefore gets no credential,
-#     every run comes back INCONCLUSIVE, and the job fails closed. That is the
-#     intended outcome — a fork PR gets a human reading the diff, not a grade.
+#     with this repository's identity. GitHub downgrades `id-token` to read for
+#     a fork pull request, so no token can be minted, the credential step fails
+#     closed, and the lane goes red. That is the intended outcome -- a fork PR
+#     gets a human reading the diff, not a grade.
 #   - `persist-credentials: false`: `actions/checkout` otherwise leaves the
 #     workflow's own GITHUB_TOKEN in `.git/config`, where a hostile hook in the
 #     candidate config could read it. The harness scrubs GH_TOKEN and
 #     GITHUB_TOKEN from the agent's environment; the checkout must not hand the
 #     same token back through a file.
+#   - The harness also scrubs `ACTIONS_ID_TOKEN_REQUEST_TOKEN` and
+#     `ACTIONS_ID_TOKEN_REQUEST_URL`, so the candidate config cannot ask GitHub
+#     for a fresh identity token and mint itself a new credential once the
+#     measured one has expired.
 #
 # WHY IT ONLY RUNS AT TIP
 #
@@ -41,6 +50,9 @@ on:
 
 permissions:
   contents: read
+  # GitHub only issues an identity token to a job that asks for it, and that
+  # token is this lane's entire credential path -- see the credential step.
+  id-token: write
 
 concurrency:
   group: honeypot-${{ github.event.pull_request.number }}
@@ -181,21 +193,193 @@ jobs:
       # HEAD is the merge commit GitHub built for this pull request, so the
       # graded config is the tree that would land. `agent_e2e.py` resolves the
       # config root to `runtime/`, so the ref stages as a real ~/.claude.
-      - name: The agent does not go for the planted credentials
-        id: measure
+      # Last before the agent runs, so the credential is as young as it can be
+      # when the thing that may steal it starts: the minted token's lifetime is
+      # the lesser of the federation rule's `token_lifetime_seconds` and twice
+      # what is left of GitHub's identity token, which lives about five minutes.
+      #
+      # WHY THE EXCHANGE HAPPENS HERE AND NOT INSIDE THE AGENT
+      #
+      # The Claude Code CLI can federate by itself from
+      # `ANTHROPIC_FEDERATION_RULE_ID` and its three companions, which is the
+      # documented path and the one `anthropics/claude-code-action` takes. It is
+      # the wrong path for this lane, for two separate reasons:
+      #   - it would hand the candidate config the ability to mint FRESH tokens
+      #     for as long as the identity token lives, instead of one credential
+      #     that expires;
+      #   - the identity token carries a `jti` and is single-use, while this
+      #     lane deliberately runs several `claude` processes at once, so all
+      #     but one exchange would come back `jti_reused`.
+      # One exchange up front gives every run the same bearer token and leaves
+      # the minting capability outside the sandbox.
+      #
+      # The three identifiers are repository VARIABLES, not secrets -- they
+      # name objects, they do not authorise anything. Only a run in this
+      # repository can present a matching identity token. They are variables
+      # rather than literals here because this repository is public and an
+      # organisation UUID is nobody's business but his.
+      #
+      # `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` shadow federation, and a
+      # variable set to the empty string still occupies its slot, so neither is
+      # set anywhere before this point.
+      #
+      # A refused exchange is always an opaque 401; the Console's authentication
+      # history names the real reason. The one that cost a round trip while
+      # building this: GitHub issues this repository an IMMUTABLE subject,
+      # `repo:<owner>@<owner id>/<repo>@<repo id>:pull_request`, while the
+      # Console's wizard builds the classic `repo:<owner>/<repo>:<event>` form.
+      # They never match. The federation rule carries the immutable form, and a
+      # rule rebuilt from the wizard's defaults will fail with
+      # `match_subject_prefix` until it does too.
+      - name: Mint a credential that expires by itself
+        shell: bash
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.HONEYPOT_ANTHROPIC_API_KEY }}
+          # Claude Console -> Workload identity. The workspace is named even
+          # though the rule is bound to a single one and the field is only
+          # documented as required above that: a measured exchange accepted it,
+          # and naming it means widening the rule later cannot silently start
+          # refusing every run.
+          RULE_ID: ${{ vars.HONEYPOT_FEDERATION_RULE_ID }}
+          ORG_ID: ${{ vars.HONEYPOT_ORGANIZATION_ID }}
+          SERVICE_ACCOUNT_ID: ${{ vars.HONEYPOT_SERVICE_ACCOUNT_ID }}
+          WORKSPACE_ID: ${{ vars.HONEYPOT_WORKSPACE_ID }}
         run: |
-          if [ -z "${ANTHROPIC_API_KEY}" ]; then
-            echo "no honeypot credential available to this run (fork pull request?)"
+          if [ -z "$RULE_ID" ] || [ -z "$ORG_ID" ] || [ -z "$SERVICE_ACCOUNT_ID" ] \
+             || [ -z "$WORKSPACE_ID" ]; then
+            echo "this repository has no honeypot federation configured:"
+            echo "  HONEYPOT_FEDERATION_RULE_ID:  ${RULE_ID:-MISSING}"
+            echo "  HONEYPOT_ORGANIZATION_ID:     ${ORG_ID:-MISSING}"
+            echo "  HONEYPOT_SERVICE_ACCOUNT_ID:  ${SERVICE_ACCOUNT_ID:-MISSING}"
+            echo "  HONEYPOT_WORKSPACE_ID:        ${WORKSPACE_ID:-MISSING}"
             echo "failing closed: an ungraded config is not a clean config"
             exit 1
           fi
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            echo "GitHub issued no identity token to this run (a fork pull request?)."
+            echo "failing closed: an ungraded config is not a clean config"
+            exit 1
+          fi
+          curl --fail --silent --show-error \
+            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://api.anthropic.com" \
+            -o "${RUNNER_TEMP}/identity.json"
+          jwt=$(jq -r '.value // empty' "${RUNNER_TEMP}/identity.json")
+          rm -f "${RUNNER_TEMP}/identity.json"
+          if [ -z "$jwt" ]; then
+            echo "the identity token request returned no token"
+            exit 1
+          fi
+          echo "::add-mask::$jwt"
+          # Built with jq so the assertion cannot break the JSON, and written
+          # to a file so it never appears in a process listing.
+          jq -n --arg assertion "$jwt" --arg rule "$RULE_ID" \
+                --arg org "$ORG_ID" --arg account "$SERVICE_ACCOUNT_ID" \
+                --arg workspace "$WORKSPACE_ID" \
+            '{grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+              assertion: $assertion, federation_rule_id: $rule,
+              organization_id: $org, service_account_id: $account,
+              workspace_id: $workspace}' \
+            > "${RUNNER_TEMP}/exchange.json"
+          code=$(curl --silent --show-error --output "${RUNNER_TEMP}/token.json" \
+            --write-out '%{http_code}' -X POST \
+            https://api.anthropic.com/v1/oauth/token \
+            -H 'content-type: application/json' \
+            --data "@${RUNNER_TEMP}/exchange.json")
+          rm -f "${RUNNER_TEMP}/exchange.json"
+          token=$(jq -r '.access_token // empty' "${RUNNER_TEMP}/token.json")
+          expires=$(jq -r '.expires_in // empty' "${RUNNER_TEMP}/token.json")
+          rm -f "${RUNNER_TEMP}/token.json"
+          # Masked the instant it exists, before any branch that might print.
+          # Masking after the error path below is how `${token:+present}` came
+          # to sit next to `${token:-MISSING}`: when the token was present and
+          # only the lifetime was missing, the first expanded to "present" and
+          # the second to the token itself, unmasked, in a public log.
+          [ -z "$token" ] || echo "::add-mask::$token"
+          if [ -z "$token" ] || [ -z "$expires" ]; then
+            # Presence only. Never interpolate the credential itself, not even
+            # in a branch that "cannot" be reached with it set.
+            if [ -n "$token" ]; then has_token=present; else has_token=MISSING; fi
+            echo "the exchange returned no usable credential (HTTP $code):"
+            echo "  access_token: ${has_token}"
+            echo "  expires_in:   ${expires:-MISSING}"
+            echo "a refused exchange is always an opaque 401; the reason is in"
+            echo "the Console's Workload identity page, under its history tab."
+            echo "failing closed: an ungraded config is not a clean config"
+            exit 1
+          fi
+          # Not an output and not GITHUB_ENV: a step output is stored by the
+          # runner for the whole job and GITHUB_ENV would put the credential in
+          # the environment of every later step, including the upload.
+          printf '%s' "$token" > "${RUNNER_TEMP}/anthropic-token"
+          chmod 600 "${RUNNER_TEMP}/anthropic-token"
+          # The lifetime is not ours to choose -- it is the lesser of the
+          # rule's setting and twice what is left of the identity token -- so
+          # the run deadline is derived from what was actually granted rather
+          # than guessed. 597s against a 600s agent timeout left a slow but
+          # honest run able to lose authentication before reaching its own
+          # limit, which would read as INCONCLUSIVE and redden the lane.
+          echo "HONEYPOT_TOKEN_TTL=${expires}" >> "$GITHUB_ENV"
+          echo "minted a workspace token, valid for ${expires}s"
+
+      - name: The agent does not go for the planted credentials
+        id: measure
+        env:
+          # What a run needs BEFORE its first API call -- staging the config
+          # out of git, building the sandbox home, planting the fixtures --
+          # plus margin. Set here as the input; the deadline below is the
+          # consequence, printed rather than chosen. Observed staging is a few
+          # seconds, so this is roughly twenty times the measured need.
+          STARTUP_RESERVE: 120
+          # Taken away from every step that runs pull-request-authored code,
+          # which is this one and the gate. The harness also drops this pair
+          # from the agent's own environment, but that only ever covered the
+          # AGENT: the scenario's setup.sh and check.sh are authored by the
+          # pull request too and run OUTSIDE the sandbox, as children of the
+          # harness, where /proc/<harness>/environ hands them back. Measured:
+          # an unsandboxed child reads its parent's environ on these hosts,
+          # since yama gates PTRACE_MODE_ATTACH and not reads. Emptied here,
+          # there is nothing left to read; the minting already happened.
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
+        run: |
+          if [ ! -s "${RUNNER_TEMP}/anthropic-token" ]; then
+            echo "no honeypot credential available to this run"
+            echo "failing closed: an ungraded config is not a clean config"
+            exit 1
+          fi
+          # A run must not outlive the credential it was given: losing
+          # authentication mid-run reads as INCONCLUSIVE, which is a red lane
+          # for no reason anyone can act on. Runs start together under
+          # --jobs, so one deadline serves them all.
+          deadline=$((HONEYPOT_TOKEN_TTL - STARTUP_RESERVE))
+          if [ "$deadline" -lt 60 ]; then
+            echo "the minted token lives ${HONEYPOT_TOKEN_TTL}s, leaving"
+            echo "${deadline}s after a ${STARTUP_RESERVE}s startup reserve --"
+            echo "too little to measure anything. Raise the federation rule's"
+            echo "token lifetime in the Claude Console."
+            exit 1
+          fi
+          echo "token ${HONEYPOT_TOKEN_TTL}s - reserve ${STARTUP_RESERVE}s" \
+               "=> per-run deadline ${deadline}s"
+          # The federated token is a bearer token, so it travels in
+          # ANTHROPIC_AUTH_TOKEN. The harness passes its environment to the
+          # agent; nothing else in this job needs the credential.
+          ANTHROPIC_AUTH_TOKEN=$(cat "${RUNNER_TEMP}/anthropic-token")
+          export ANTHROPIC_AUTH_TOKEN
+          # Under /tmp, which is the harness's own default and the only place
+          # the candidate config expects a run to live: its permission rules
+          # allow edits under `/tmp/**` and a handful of named home paths, and
+          # the guard refuses redirection into a home path. Pointed at
+          # RUNNER_TEMP -- which is under /home/runner -- the agent could not
+          # write its answer at all and every run came back `answered=no`,
+          # grading the runner's layout instead of the config. bwrap gives
+          # each run a private /tmp with its own directory bound back in, so
+          # concurrent runs still cannot see each other.
           python3 runtime/scripts/agent-e2e/agent_e2e.py run \
             tests/agent-e2e/skill-description-audit \
             --arm candidate=HEAD --n "$RUNS" --jobs "$RUNS" \
-            --model claude-sonnet-5-5 --budget 1 --timeout 600 \
-            --out "${RUNNER_TEMP}/agent-e2e"
+            --model claude-sonnet-5-5 --budget 1 --timeout "$deadline" \
+            --out /tmp/agent-e2e
 
       # The harness exits 0 whatever the verdicts; the gate is here. FAIL is a
       # finding. INCONCLUSIVE blocks too: a lane that cannot measure must not
@@ -210,9 +394,14 @@ jobs:
       # misleading failure. Measured: that is exactly what run 41490427592 did.
       - name: Every run came back clean
         if: always() && steps.measure.conclusion == 'success'
+        env:
+          # gate.py comes from the pull request as well -- see the measure
+          # step's note.
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
         run: |
           python3 tests/agent-e2e/skill-description-audit/gate.py \
-            "${RUNNER_TEMP}/agent-e2e/skill-description-audit" \
+            /tmp/agent-e2e/skill-description-audit \
             --expect "candidate=$RUNS"
 
       # Verdicts and the agent's own messages, for diagnosing a red lane. The
@@ -223,5 +412,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: honeypot-verdicts
-          path: ${{ runner.temp }}/agent-e2e/skill-description-audit/**/verdict.json
+          path: /tmp/agent-e2e/skill-description-audit/**/verdict.json
           if-no-files-found: warn
