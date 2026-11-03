@@ -64,7 +64,10 @@
 # What counts as config is an EXCLUSION list rather than an inclusion list,
 # and that direction is the whole point: a directory added tomorrow is graded
 # without anyone editing this file, where an allowlist would silently exempt
-# it. Only what provably cannot reach a running agent is excluded.
+# it. Only what provably cannot reach a running agent is excluded. A rename is
+# classified on BOTH its names, because moving a live hook into an excluded
+# directory removes it from the running config while showing a filter that
+# reads one name only the excluded path it landed on.
 #
 # `vendor/` is NOT excluded, and that is not an oversight. Sixteen skills
 # under `runtime/skills/` are symlinks into `vendor/superpowers` and
@@ -86,7 +89,16 @@ name: honeypot
 
 on:
   pull_request:
-    types: [labeled, auto_merge_enabled, synchronize]
+    # `opened` is here because of the scope test below, and was not needed
+    # before it. While the only two outcomes were "grade" and "refuse", a
+    # pull request with no run at all was indistinguishable from one that had
+    # refused: a required check was unsatisfied either way, so failing to
+    # trigger failed closed. The scope test adds a third outcome -- a PASS for
+    # a pull request with no config in it -- and that one a newly opened pull
+    # request can never reach by waiting. Without `opened` it would sit
+    # blocked on a check that qualifies for the exemption and never runs,
+    # until something else pushed or labelled it.
+    types: [opened, labeled, auto_merge_enabled, synchronize]
 
 permissions:
   contents: read
@@ -166,15 +178,32 @@ jobs:
           # and `--jq '.[].path'` yields a column of nulls that match no
           # prefix -- which reads as "no config changed" and would pass every
           # pull request for free.
-          files=$(gh api --paginate \
-            "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files" --jq '.[].filename')
+          #
+          # BOTH names of every record, because a rename reports the
+          # DESTINATION in `filename` and the source in `previous_filename`.
+          # Moving a live hook into `docs/` takes it out of the running config
+          # while showing a filter that reads one name only the excluded path
+          # it landed on -- measured: exit 0, `grade=false`, a hook deleted
+          # from the config and graded by nobody. A plain deletion was never
+          # affected, since `filename` stays the runtime path; only a rename
+          # out of the config could launder itself this way.
+          #
+          # @tsv keeps one record per line -- it escapes a tab or a newline
+          # inside a path rather than emitting it -- which is what lets the
+          # completeness check below count RECORDS while the classification
+          # reads paths. Counting the classification list instead would let a
+          # pull request full of renames hide a truncated page behind its own
+          # second column.
+          records=$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files" \
+            --jq '.[] | [.filename, (.previous_filename // empty)] | @tsv')
           # A hard API failure aborts the step on its own -- the exit status of
           # an assignment is the substitution's, and this shell runs with -e.
           # An empty list is the case that does not abort, and it must not be
           # read as "no config changed": that is how a lane passes for free.
           # Nothing is lost by refusing, since a pull request changing no file
           # is not one anybody merges.
-          if [ -z "$files" ]; then
+          if [ -z "$records" ]; then
             echo "the pull request reports no changed files at all, so there"
             echo "is nothing here to draw a conclusion from."
             echo "failing closed: an ungraded config is not a clean config"
@@ -189,7 +218,10 @@ jobs:
               exit 1
               ;;
           esac
-          got=$(printf '%s\n' "$files" | grep -c . || true)
+          # Records, one per line, so this compares like with like against
+          # `changed_files`. The classification list below is longer whenever
+          # anything was renamed.
+          got=$(printf '%s\n' "$records" | grep -c . || true)
           # Only the under-reporting direction is fatal, because only it is
           # dangerous: this endpoint stops at 3000 files, and a short list can
           # just as well be a `runtime/` file that never arrived, which would
@@ -201,6 +233,9 @@ jobs:
             echo "failing closed: an ungraded config is not a clean config"
             exit 1
           fi
+          # Every path either name mentions, one per line, so a rename is
+          # judged on where it came FROM as well as where it went.
+          files=$(printf '%s\n' "$records" | tr '\t' '\n' | grep -v '^$' || true)
           # grep exits 1 when every line is filtered out. That is the
           # nothing-to-grade case, not an error.
           config=$(printf '%s\n' "$files" | grep -vE \
@@ -208,8 +243,8 @@ jobs:
             || true)
           if [ -z "$config" ]; then
             echo "nothing to grade: no file here is read by a running agent."
-            echo "all $got of them:"
-            printf '%s\n' "$files" | sed 's/^/  /'
+            echo "all $got of them, a rename shown as 'new <- old':"
+            printf '%s\n' "$records" | sed 's/\t/ <- /' | sed 's/^/  /'
             echo "grade=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
