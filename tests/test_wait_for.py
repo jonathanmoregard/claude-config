@@ -185,12 +185,26 @@ def test_transient_unit_is_not_done_while_its_job_runs(tmp_path: Path) -> None:
     assert rc == 1, out
 
 
+# Journal shapes below mirror what this host actually logs, measured
+# 2026-11-03. The unit's own InvocationID appears as USER_INVOCATION_ID (the
+# exit line is written by the service manager, so _SYSTEMD_INVOCATION_ID is the
+# manager's id, not the unit's). A clean exit logs ONLY the "Started" record:
+# there is no exit record carrying EXIT_STATUS=0, so a success is established by
+# locating the run and finding no failure, never by reading a zero status.
+def started_record(invocation: str = "run-abc") -> dict[str, str]:
+    return {
+        "MESSAGE_ID": "39f53479d3a045ac8e11786248231fbf",
+        "USER_INVOCATION_ID": invocation,
+        "USER_UNIT": "gate.service",
+    }
+
+
 def exit_record(status: int, invocation: str = "run-abc") -> dict[str, str]:
     return {
         "MESSAGE_ID": "98e322203f7a4ed290d09fe03c09fe15",
         "EXIT_CODE": "exited",
         "EXIT_STATUS": str(status),
-        "_SYSTEMD_INVOCATION_ID": invocation,
+        "USER_INVOCATION_ID": invocation,
         "USER_UNIT": "gate.service",
     }
 
@@ -205,7 +219,7 @@ def test_collected_failed_unit_never_becomes_success(tmp_path: Path) -> None:
     gone = {"LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead",
             "Result": "success", "ExecMainStatus": "0"}
     script = {"systemctl": [running, gone],
-              "journalctl": [{"stdout": [exit_record(7)]}]}
+              "journalctl": [{"stdout": [started_record(), exit_record(7)]}]}
     rc, out, _ = run_wait_for(tmp_path, script, "unit", "gate", "--user")
     assert rc == 1, out
     assert "status=7" in out, out
@@ -213,18 +227,20 @@ def test_collected_failed_unit_never_becomes_success(tmp_path: Path) -> None:
 
 def test_fast_collected_success_never_becomes_failure(tmp_path: Path) -> None:
     # The waiter arms after a successful transient unit has already vanished.
+    # A clean exit leaves only the "Started" record, so the verdict rests on
+    # locating that run and finding no failure for it.
     gone = {"LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead",
             "Result": "success", "ExecMainStatus": "0"}
     script = {
         "systemctl": [gone],
         "journalctl": [
-            {"stdout": [exit_record(0)]},
-            {"stdout": [exit_record(0)]},
+            {"stdout": [started_record()]},
+            {"stdout": [started_record()]},
         ],
     }
     rc, out, _ = run_wait_for(tmp_path, script, "unit", "gate", "--user")
     assert rc == 0, out
-    assert "status=0" in out, out
+    assert "clean exit" in out, out
 
 
 def test_vanished_unit_without_journal_record_is_unknown(tmp_path: Path) -> None:
@@ -232,7 +248,7 @@ def test_vanished_unit_without_journal_record_is_unknown(tmp_path: Path) -> None
     script = {"systemctl": [gone], "journalctl": [{"stdout": []}]}
     rc, out, _ = run_wait_for(tmp_path, script, "unit", "gate", "--user")
     assert rc == 3, out
-    assert "could not determine" in out, out
+    assert "could not be determined" in out, out
 
 
 def test_since_after_launch_waits_for_a_newer_run(tmp_path: Path) -> None:

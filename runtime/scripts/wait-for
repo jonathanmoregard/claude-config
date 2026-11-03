@@ -322,61 +322,102 @@ clear_reported_failure() {
     echo "wait-for: reported the failure but could not clear $record" >&2
 }
 
+# A vanished unit's outcome is read from the journal, never inferred from its
+# absence. Measured on this host (2026-11-03), systemd logs, per run:
+#   39f5…  "Started …"                    — every run, success or failure
+#   98e3…  "Main process exited, …"        — failures only, carries EXIT_STATUS
+#   d9b3…  "Failed with result '…'"        — failures only
+# A clean exit logs ONLY the "Started" record. So that record is the presence
+# proof that separates "ran and succeeded" from "the journal cannot be read":
+# a failure verdict needs a failure record, and a success verdict needs the
+# Started record for the same run. Neither is absence-as-evidence.
+JOURNAL_STARTED_ID=39f53479d3a045ac8e11786248231fbf
+JOURNAL_EXITED_ID=98e322203f7a4ed290d09fe03c09fe15
+JOURNAL_FAILED_ID=d9b373ed55a64feb8242e02dbe79a49c
+
+# The exit record is written by the service MANAGER, not by the unit's own
+# process, so `_SYSTEMD_INVOCATION_ID` is the manager's. The unit's own
+# InvocationID appears as USER_INVOCATION_ID for --user units and
+# INVOCATION_ID for system units. Measured: equal to `systemctl show
+# -p InvocationID`.
+invocation_field() {
+  [ "${user[*]:-}" = --user ] && echo USER_INVOCATION_ID || echo INVOCATION_ID
+}
+
 journal_records() {
   local invocation=$1 started_at=$2
   if [ -n "$invocation" ]; then
-    journalctl "${user[@]}" "_SYSTEMD_INVOCATION_ID=$invocation" -o json --no-pager 2>/dev/null
+    journalctl "${user[@]}" "$(invocation_field)=$invocation" -o json --no-pager 2>/dev/null
   elif [ -n "$started_at" ] && [ "$started_at" != n/a ]; then
-    # InvocationID is normally available. If it races away, start time is the
-    # narrowest journal scope the captured unit record still provides.
+    # InvocationID is normally available. If it races away, the captured start
+    # TIMESTAMP (a date string, not an epoch) is the narrowest scope left.
     journalctl "${user[@]}" -u "$target" --since "$started_at" -o json --no-pager 2>/dev/null
   else
     return 1
   fi
 }
 
+# Prints "<exit status>", "failed", or "ok"; returns 1 when nothing is readable.
+# Two jq details matter here and are easy to get wrong:
+#   1. `empty as $x | …` emits NOTHING, so a missing exit record must bind to
+#      null (via `[…] | last`) and be tested with `!= null`, never bound with
+#      `// empty`. Getting that wrong silently turns every success into
+#      "could not determine".
+#   2. Input is slurped (`-s`), so membership tests need `any(.[]; cond)`.
 journal_verdict() {
-  local invocation=$1 started_at=$2 record status
-  record=$(journal_records "$invocation" "$started_at" | jq -cs '
-    map(select(.MESSAGE_ID == "98e322203f7a4ed290d09fe03c09fe15"
-               and has("EXIT_STATUS"))) | last // empty
-  ' 2>/dev/null) || record=""
-  [ -n "$record" ] || return 1
-  status=$(jq -r '.EXIT_STATUS | tostring' <<<"$record" 2>/dev/null) || return 1
-  [ -n "$status" ] && [ "$status" != null ] || return 1
-  printf '%s\n' "$status"
+  local invocation=$1 started_at=$2
+  journal_records "$invocation" "$started_at" | jq -rs \
+    --arg started "$JOURNAL_STARTED_ID" \
+    --arg exited "$JOURNAL_EXITED_ID" \
+    --arg failed "$JOURNAL_FAILED_ID" '
+      ([.[] | select(.MESSAGE_ID == $exited and has("EXIT_STATUS"))
+             | .EXIT_STATUS] | last)     as $status
+    | any(.[]; .MESSAGE_ID == $failed)   as $didfail
+    | any(.[]; .MESSAGE_ID == $started)  as $didstart
+    | if   $status != null then ($status | tostring)
+      elif $didfail        then "failed"
+      elif $didstart       then "ok"
+      else empty end
+    ' 2>/dev/null | grep . || return 1
 }
 
 latest_invocation() {
   local since_args=()
   [ -z "$since" ] || since_args=(--since "$since")
   journalctl "${user[@]}" -u "$target" "${since_args[@]}" -o json --no-pager 2>/dev/null |
-    jq -rs '
-      map(select(.MESSAGE_ID == "98e322203f7a4ed290d09fe03c09fe15"
-                 and has("EXIT_STATUS")
-                 and ((._SYSTEMD_INVOCATION_ID // "") | length > 0)))
-      | last | ._SYSTEMD_INVOCATION_ID // empty
+    jq -rs --arg field "$(invocation_field)" '
+      map(select((.[$field] // "") | length > 0)) | last | .[$field] // empty
     ' 2>/dev/null
 }
 
 report_vanished_unit() {
-  local invocation=$1 started_at=$2 collect_mode=$3 status
+  local invocation=$1 started_at=$2 collect_mode=$3 verdict
   if [ -z "$invocation" ]; then
     # A unit already gone at arm time has no systemctl identity left. Use the
     # name only to discover the latest invocation, then scope the verdict read
     # to that run so a reused name cannot mix journal records.
     invocation=$(latest_invocation)
   fi
-  status=$(journal_verdict "$invocation" "$started_at") || {
+  verdict=$(journal_verdict "$invocation" "$started_at") || {
     echo "wait-for: unit $target vanished and its outcome could not be determined (collect-mode=${collect_mode:-unknown})"
     exit 3
   }
-  echo "unit $target vanished; journal result=exit-code status=$status invocation=${invocation:-unknown}"
-  if [ "$status" = 0 ]; then
-    exit 0
-  fi
-  clear_reported_failure
-  exit 1
+  case $verdict in
+    ok)
+      echo "unit $target vanished after a clean exit; journal shows no failure for invocation=${invocation:-unknown}"
+      exit 0 ;;
+    failed)
+      echo "unit $target vanished; journal result=failed status=unknown invocation=${invocation:-unknown}"
+      clear_reported_failure
+      exit 1 ;;
+    0)
+      echo "unit $target vanished; journal result=success status=0 invocation=${invocation:-unknown}"
+      exit 0 ;;
+    *)
+      echo "unit $target vanished; journal result=exit-code status=$verdict invocation=${invocation:-unknown}"
+      clear_reported_failure
+      exit 1 ;;
+  esac
 }
 
 wait_unit() {
@@ -384,20 +425,23 @@ wait_unit() {
   if [ -n "$since" ]; then
     since_epoch=$(to_epoch "$since"); [ "$since_epoch" -gt 0 ] || usage
   fi
-  local load state started transient collect_mode invocation
+  local load state started started_at transient collect_mode invocation
   load=$(unit_prop LoadState)
   if [ "$load" != loaded ]; then
     report_vanished_unit "" "" unknown
   fi
   # These identify the armed run before a collecting unit can disappear.
+  # `started_at` keeps the systemd timestamp STRING for the journal fallback's
+  # `--since`; `started` below is an epoch integer for the `--since` comparison.
+  # They are deliberately separate: feeding an epoch to `--since` is not a date.
   transient=$(unit_prop Transient)
   collect_mode=$(unit_prop CollectMode)
   invocation=$(unit_prop InvocationID)
-  started=$(unit_prop ExecMainStartTimestamp)
+  started_at=$(unit_prop ExecMainStartTimestamp)
   while :; do
     state=$(unit_prop ActiveState)
     if [ "$transient" = yes ] && [ "$(unit_prop LoadState)" != loaded ]; then
-      report_vanished_unit "$invocation" "$started" "$collect_mode"
+      report_vanished_unit "$invocation" "$started_at" "$collect_mode"
     fi
     started=$(to_epoch "$(unit_prop ExecMainStartTimestamp)")
     case $state in
