@@ -34,8 +34,20 @@ back and sat there unnoticed. Anchoring on the parent directory and the
 filename instead survives a move of either parent, and still cannot match a
 file that is not this one: only a file named test_hook.py sitting under some
 directory named permission-ledger.
+
+The basename is anchored behind its own separator rather than left open. Open,
+the pattern matched any file whose name merely ENDS in those characters --
+latest_hook.py was measured being exempted by it -- which is how a path-scoped
+exemption quietly becomes a suffix-scoped one. The intervening-directory group
+is optional because permission-ledger is this file's direct parent today;
+requiring a directory between them would make the exemption stale again on the
+very next move.
+
+Note for whoever edits this next: a backslash inside one of these triple-quoted
+descriptions is an INVALID TOML escape and gitleaks refuses to load the file.
+Only the single-quoted pattern literals below may carry one.
 """
-paths = ['''(^|/)permission-ledger/.*test_hook\.py$''']
+paths = ['''(^|/)permission-ledger/(.*/)?test_hook\.py$''']
 
 [[allowlists]]
 description = """
