@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import pwd
 import shutil
 import subprocess
 import sys
@@ -34,6 +35,52 @@ def load_server():
 def git(cwd: Path, *argv: str) -> str:
     return subprocess.run(["git", "-C", str(cwd), *argv], check=True, capture_output=True,
                           text=True).stdout.strip()
+
+
+# Whether a sandbox can ACTUALLY be created here, probed once.
+#
+# Twin of `_require_sandbox` in tests/test_agent_e2e.py -- deliberately copied
+# rather than shared, because the only import path the two have in common is a
+# `conftest` module, and importing across suites that way already broke this
+# tree once: two directories here hold a module called `conftest`, so in a
+# whole-tree run the wrong one wins and collection dies for everything.
+# Fifteen duplicated lines are cheaper than that failure.
+#
+# Asking `shutil.which("bwrap")` is a different question from asking whether
+# bubblewrap works, and the difference is what made these two cases red: the
+# binary is on a runner, the harness started, it could not sandbox, and the case
+# reported "stub claude never started" as though the broker were broken.
+# `--unshare-all` was still the wrong question -- that succeeds on a runner.
+# The probe therefore builds the harness's own mount shape, including the
+# read-only bind of the real HOME that the ssh shadowing stacks on.
+_SANDBOX_OK = None
+
+
+def require_sandbox(case: unittest.TestCase) -> None:
+    """Skip `case` unless bubblewrap can really build a sandbox here."""
+    global _SANDBOX_OK
+    if _SANDBOX_OK is None:
+        bwrap = shutil.which("bwrap")
+        home = pwd.getpwuid(os.getuid()).pw_dir
+        if bwrap is None:
+            _SANDBOX_OK = (False, "bubblewrap not on PATH")
+        else:
+            try:
+                p = subprocess.run([bwrap, "--dev-bind", "/", "/",
+                                    "--ro-bind", home, home, "--tmpfs", "/tmp",
+                                    "true"], capture_output=True, text=True, timeout=30)
+                _SANDBOX_OK = (
+                    p.returncode == 0,
+                    "bubblewrap is present but cannot build the harness's "
+                    "sandbox here (restricted user namespaces, or a mount it "
+                    "refuses): "
+                    + (p.stderr.strip().splitlines() or ["no stderr"])[-1],
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                _SANDBOX_OK = (False, f"bubblewrap probe failed: {exc!r}")
+    ok, why = _SANDBOX_OK
+    if not ok:
+        case.skipTest(why)
 
 
 class Fixture(unittest.TestCase):
@@ -157,6 +204,7 @@ class RefPolicyTests(Fixture):
 
 class RunTests(Fixture):
     def test_runs_old_vs_new_from_pushed_refs(self) -> None:
+        require_sandbox(self)
         text = self.server._tool_run(self.req())
         self.assertIn("harness exit 0", text)
         self.assertRegex(text, r"\| old \| .* \| 0 \| 1 \| 0 \|")
@@ -217,6 +265,7 @@ class ReviewFindingTests(Fixture):
         self.assertNotIn("AKIA" + "A" * 16, out)
 
     def test_broker_death_stops_harness_and_keeps_lock_until_then(self) -> None:
+        require_sandbox(self)
         import fcntl, signal, time
         root = Path(self.tmp.name)
         # The run dir is the one path bwrap binds back into its private /tmp.

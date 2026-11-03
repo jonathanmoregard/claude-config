@@ -8,7 +8,11 @@ import tempfile
 import unittest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-GATE_PATH = os.path.join(REPO_ROOT, "scripts", "proposal-intake-gate.py")
+# `runtime/` once the layout migration has landed, the repository root
+# before it. Only the projected subset moves; tests/ stays at the root.
+RUNTIME = os.path.join(REPO_ROOT, "runtime") if os.path.isdir(
+    os.path.join(REPO_ROOT, "runtime")) else REPO_ROOT
+GATE_PATH = os.path.join(RUNTIME, "scripts", "proposal-intake-gate.py")
 spec = importlib.util.spec_from_file_location("proposal_intake_gate", GATE_PATH)
 gate = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gate)

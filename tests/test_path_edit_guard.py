@@ -18,17 +18,20 @@ import sys
 import pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-HOOK = os.path.join(REPO_ROOT, "hooks", "path-edit-guard.py")
+# `runtime/` once the layout migration has landed, the repository root before it;
+# only the shipped subset moved, tests/ stays at the root.
+RUNTIME = os.path.join(REPO_ROOT, "runtime") if os.path.isdir(os.path.join(REPO_ROOT, "runtime")) else REPO_ROOT
+HOOK = os.path.join(RUNTIME, "hooks", "path-edit-guard.py")
 LIVE = os.path.join(os.path.expanduser("~"), ".claude")
 CODEX = os.path.join(os.path.expanduser("~"), ".codex")
 
 
 def test_guard_has_general_path_edit_name():
-    general_hook = os.path.join(REPO_ROOT, "hooks", "path-edit-guard.py")
+    general_hook = os.path.join(RUNTIME, "hooks", "path-edit-guard.py")
     legacy_hook = os.path.join(
-        REPO_ROOT, "hooks", "dot-claude-config-write-guard.py"
+        RUNTIME, "hooks", "dot-claude-config-write-guard.py"
     )
-    settings_path = os.path.join(REPO_ROOT, "settings.json")
+    settings_path = os.path.join(RUNTIME, "settings.json")
 
     assert os.path.isfile(general_hook)
     assert not os.path.exists(legacy_hook)

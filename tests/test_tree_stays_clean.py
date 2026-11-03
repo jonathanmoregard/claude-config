@@ -50,6 +50,12 @@ import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
+# `runtime/` once the layout migration has landed, the repository root
+# before it. Only the projected subset moves; tests/ stays at the root.
+RUNTIME = REPO / "runtime" if (REPO / "runtime").is_dir() else REPO
+# The same anchor as a repo-relative prefix, for `git check-ignore`, which is
+# asked about paths and answers from the ignore files that sit beside them.
+RT = "runtime/" if RUNTIME != REPO else ""
 
 # Registry entries that are genuine user config and MUST stay trackable. The
 # harness reads them from the same directory it drops state into, so the two
@@ -117,13 +123,13 @@ STATE_DIR_RE = re.compile(r"^STATE_DIR\s*=\s*(.+)$", re.M)
 MUST_BE_IGNORED = [
     # Same-directory tmp file of an atomic rename — it cannot move out of the
     # repo without breaking the rename, so here gitignore IS the fix.
-    "permission-ledger/decided.json.tmp",
+    RT + "permission-ledger/decided.json.tmp",
     # run-evaluate.sh's per-process scratch. The EXIT trap removes these on
     # every path except the ones that matter (SIGKILL, OOM, reboot).
-    "permission-ledger/.digest-latest.json.12345",
-    "permission-ledger/.digest-prev.json.12345",
-    "permission-ledger/.digest-latest.err.12345",
-    "permission-ledger/.agent-raw.12345",
+    RT + "permission-ledger/.digest-latest.json.12345",
+    RT + "permission-ledger/.digest-prev.json.12345",
+    RT + "permission-ledger/.digest-latest.err.12345",
+    RT + "permission-ledger/.agent-raw.12345",
     # Runtime logs the cron entries append to.
     "logs/permission-ledger.log",
     "logs/habit-tracker.log",
@@ -273,14 +279,14 @@ class OwnWritersAreRelocated(unittest.TestCase):
     def test_relocated_writers_name_the_state_dir(self):
         for rel, marker, state_root, _forbidden in RELOCATED_WRITERS:
             with self.subTest(source=rel, emits=marker):
-                text = (REPO / rel).read_text(encoding="utf-8")
+                text = (RUNTIME / rel).read_text(encoding="utf-8")
                 self.assertIn(
                     state_root, text,
                     "%s emits %s* but never names %s" % (rel, marker, state_root))
 
     def test_relocated_writers_do_not_target_the_repo(self):
         for rel, marker, _state_root, forbidden in RELOCATED_WRITERS:
-            text = (REPO / rel).read_text(encoding="utf-8")
+            text = (RUNTIME / rel).read_text(encoding="utf-8")
             hits = 0
             for lineno, line in enumerate(text.splitlines(), 1):
                 if marker not in line or line.lstrip().startswith("#"):
@@ -301,7 +307,7 @@ class OwnWritersAreRelocated(unittest.TestCase):
     def test_continue_nudge_state_dirs_stay_identical(self):
         values = {}
         for rel in STATE_DIR_PAIR:
-            text = (REPO / rel).read_text(encoding="utf-8")
+            text = (RUNTIME / rel).read_text(encoding="utf-8")
             found = STATE_DIR_RE.search(text)
             self.assertIsNotNone(found, "%s no longer defines STATE_DIR" % rel)
             values[rel] = found.group(1).strip()
@@ -329,7 +335,8 @@ class LogsDirRuleStaysHonest(unittest.TestCase):
                     # Trailing sentence punctuation: these paths turn up in
                     # prose ("check ~/.claude/logs/foo.log.") as often as in
                     # code, and a full stop is never part of a filename.
-                    base = name.rstrip('"\'`,;:).')
+                    # A closing brace is the same: `${VAR:-$HOME/.claude/logs/x.log}`.
+                    base = name.rstrip('"\'`,;:).}')
                     if base.endswith(".log") or base in ("", "/"):
                         continue
                     offenders.append(

@@ -17,6 +17,9 @@ import os
 import unittest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# The shipped config lives one level down in runtime/ since the runtime cutover;
+# tolerate both layouts, same anchor as the other top-level suites.
+RUNTIME = os.path.join(REPO_ROOT, "runtime") if os.path.isdir(os.path.join(REPO_ROOT, "runtime")) else REPO_ROOT
 HOME = "/home/jonathan"
 
 CREDENTIAL_PATHS = [
@@ -49,7 +52,7 @@ def covered(path, globs):
 
 class CredentialReadDenyTest(unittest.TestCase):
     def test_each_credential_file_is_read_denied(self):
-        with open(os.path.join(REPO_ROOT, "settings.json"), encoding="utf-8") as fh:
+        with open(os.path.join(RUNTIME, "settings.json"), encoding="utf-8") as fh:
             deny = json.load(fh)["permissions"]["deny"]
         globs = list(rule_globs(deny))
         for path in CREDENTIAL_PATHS:

@@ -24,6 +24,18 @@ import sys
 import tempfile
 from pathlib import Path
 
+# This module is a SCRIPT SUITE: every check below runs at import time and the
+# verdict is this file's exit status. Importing it under pytest would run the
+# whole body just to collect it, so the module stops here with a visible skip
+# naming the real invocation. `tests/conftest.py` turns this marker back into
+# one real test that runs the file as a script, so CI needs no list of these.
+if __name__ != "__main__":
+    import pytest
+
+    pytest.skip("script suite: run `python3 tests/test_date_reminder_hook.py` "
+                "(exit 0 = all green); pytest cannot import it",
+                allow_module_level=True)
+
 # `runtime/` once the layout migration has landed, the repository root before
 # it. Only the projected subset moves; tests/ stays at the root.
 RUNTIME = Path(__file__).resolve().parents[1]
