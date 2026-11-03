@@ -51,6 +51,20 @@ def run_wait_for(
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "FAKE_SCRIPT": str(state),
         "FAKE_LOG": str(log),
+        # Every scripted `ExecMainStartTimestamp` below is what systemd prints
+        # on a Europe/Stockholm host, abbreviation included, so the run must
+        # happen in that zone. In production the zone in systemd's output and
+        # the zone `date -d` reads it in are the same by construction; a test
+        # host is the only place they can differ, and then the parse shifts by
+        # the offset. Measured: on the GitHub runner (TZ=UTC) `08:00:00 CEST`
+        # came back as 08:00Z rather than 06:00Z, which is one hour past a
+        # record stamped 07:00Z, so a failure the run could not account for
+        # was cleared as superseded and
+        # test_success_keeps_a_failure_record_it_cannot_account_for failed
+        # there while passing on this laptop. Pinning the zone fixes it either
+        # way: 08:00 local on 2026-10-04 in Stockholm IS 06:00Z whether the
+        # abbreviation is honoured or ignored.
+        "TZ": "Europe/Stockholm",
     }
     env.update(extra_env or {})
     (tmp_path / "home").mkdir(exist_ok=True)
