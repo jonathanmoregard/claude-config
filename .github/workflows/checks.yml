@@ -77,6 +77,15 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+          # The default shallow clone has HEAD and nothing behind it, and the
+          # agent-e2e harness stages a config by `git archive`-ing a revision:
+          # test_resume_reuses_a_verdict_only_for_the_same_config points an arm
+          # at HEAD~1 on purpose, to prove a moved arm is re-run rather than
+          # resumed from the old verdict. At depth 1 that object is absent,
+          # `rev-parse HEAD~1` reports "Needed a single revision", and the case
+          # fails having never exercised what it names -- measured. Two is what
+          # it needs; 0 would fetch the whole history for nothing.
+          fetch-depth: 2
 
       # Stdlib only, and deliberately before any install step: nothing fetched
       # from a package index can change this step's verdict.

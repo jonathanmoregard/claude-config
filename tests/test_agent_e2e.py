@@ -485,8 +485,16 @@ def test_nested_run_reaches_shared_dir(tmp_path):
                         f"--jobs 1 --out /tmp/inner-out --claude {leaf} >&2\n"
                         "cat <<'EOF'\n" + stream("outer", []) + "\nEOF\n", name="outer")
     sc = _scenario(tmp_path, 'grep -qx nested "$1/shared/log"')
-    _, _, verdicts = _run(tmp_path, sc, outer)
-    assert verdicts[0]["verdict"] == "PASS", verdicts
+    _, out, verdicts = _run(tmp_path, sc, outer)
+    # `grep -q` prints nothing, so the verdict's own `why` is empty here and a
+    # failure says only INCONCLUSIVE. What went wrong is in the outer agent's
+    # stderr, where the nested harness's output lands (the stub redirects it),
+    # so quote the tail of that instead of a dict repr pytest truncates.
+    log = next(out.glob("*/*/*/stderr.txt"), None)
+    assert verdicts[0]["verdict"] == "PASS", (
+        f'{verdicts[0]["verdict"]}: {verdicts[0].get("why") or "(check printed nothing)"}\n'
+        f'--- nested harness stderr ---\n'
+        f'{log.read_text()[-2000:] if log else "(no stderr.txt)"}')
 
 
 def test_run_cannot_reach_ssh_agent_keys_or_write_real_home(tmp_path):
