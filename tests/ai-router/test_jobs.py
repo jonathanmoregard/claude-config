@@ -119,7 +119,18 @@ def test_quota_failure_writes_rejected_and_retries_once(state_dir: Path, tmp_pat
     assert jobs.raw_status(d) == "failed:quota" and old["error_class"] == "quota"
     rej = json.loads((state_dir / "quota" / "codex.rejected.json").read_text())
     assert rej["provider"] == "codex" and rej["source"] == f"job:{job_id}" and "usage limit" in rej["reason"]
-    assert rej["until"] == 1789805383  # blocking bucket resets_at from the stub app-server snapshot
+    # `until` is the resets_at of the fullest bucket that applies, and it has to
+    # be in the future or it is not a block: `runner.py` drops a reset already
+    # past and writes null. Asserted as that LINK rather than as the epoch the
+    # recorded sample happens to carry -- the literal 1789805383 was true until
+    # 2026-09-19 and false after, and CI deselected this case instead of fixing
+    # it, which left the retry path unmeasured. The stub slides the sample
+    # forward of now; see `_future_resets` in fixtures/fake_codex.py.
+    snap = json.loads((state_dir / "quota" / "codex.json").read_text())
+    blocking = max((b for b in snap["buckets"] if "*" in (b["applies_to"] or [])),
+                   key=lambda b: b["used_pct"])
+    assert rej["until"] == blocking["resets_at"], (rej, blocking)
+    assert rej["until"] > time.time(), "a reset already past is not a block"
     assert old["retried_as"] and old["retried_as"] != job_id
     assert fid == old["retried_as"] and status == "done"
     new = jobs.read_meta(jobs.job_dir(state_dir, fid))
