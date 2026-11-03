@@ -4,14 +4,16 @@
 ``load_config`` parses ``tools/ai-router/models.toml`` into typed records;
 ``state_dir`` resolves ``$AI_ROUTER_STATE`` (default
 ``~/.local/state/ai-router``) and creates it mode 0700. ``atomic_write_*``
-implement the "write ``<file>.tmp`` then ``os.replace``" rule every writer in
-the package follows.
+implement the "write a uniquely named scratch file, then ``os.replace``" rule
+every writer in the package follows — unique because two processes write one
+job's ``meta.json`` concurrently by design; see ``atomic_write_text``.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import secrets
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -171,10 +173,42 @@ def state_dir(env: dict[str, str] | None = None) -> Path:
 
 
 def atomic_write_text(path: Path, text: str) -> None:
+    """Replace `path` with `text` in one step, leaving no partial file behind.
+
+    The scratch file's name carries the writer's pid and random hex. A fixed
+    `<name>.tmp` makes the write atomic against a READER and not against
+    another WRITER, which is the harder half here: two processes write one job's
+    `meta.json` at the same moment by design. `launch` starts the runner
+    detached and then records its pid, while that runner's first act is to
+    record its own pid and start time -- `jobs.py` `launch` and `runner.py`
+    around the `runner_pid` update. Sharing one scratch file, both truncate it,
+    their bytes interleave, and whichever replaces last publishes the mixture.
+    The file that lands is then valid-looking but unparseable, `read_json`
+    answers None, and `read_meta` raises `JobNotFound` for a job that exists and
+    is perfectly healthy -- a wait that dies on a job it was watching.
+
+    Measured as an intermittent CI failure of
+    tests/ai-router/test_cli.py::test_exit_codes_per_failure_class (2026-11-03),
+    passing 5/5 locally and on a second CI run of the same tree: the window is
+    the few milliseconds between `Popen` returning and the runner's first write,
+    so it opens under contention and closes on an idle machine.
+
+    A unique name makes concurrent writers independent again. `os.replace` is
+    still what publishes, so a reader continues to see either the whole old file
+    or the whole new one; the last writer wins, which is what a lost-update
+    race on read-modify-write meant before this and still means now.
+    """
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except BaseException:
+        # Nothing was published, so the scratch file is litter rather than
+        # state. The fixed name used to be overwritten by the next attempt;
+        # a unique one would accumulate.
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def atomic_write_json(path: Path, obj: Any) -> None:

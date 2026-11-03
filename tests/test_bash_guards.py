@@ -639,8 +639,8 @@ if _guard_entries:
         f"HARNESS_HOOK_TIMEOUT_S={bash_guard.HARNESS_HOOK_TIMEOUT_S}",
     )
     check(
-        "matcher targets the native Bash tool",
-        entry.get("matcher") == "Bash",
+        "matcher targets Bash and Monitor",
+        entry.get("matcher") == "^(Bash|Monitor)$",
         f"matcher={entry.get('matcher')!r}",
     )
     check(
