@@ -1,0 +1,1 @@
+A data refresh (`./job.sh`) is already running in this directory; I started it a moment ago, so don't start it again. It logs progress to `job.log`, and when it has finished (a minute or two from now) the log ends with a `RESULT:` line and then `DONE`. Wait for it to finish and tell me the RESULT value.

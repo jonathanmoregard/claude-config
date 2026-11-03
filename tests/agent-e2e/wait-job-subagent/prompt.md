@@ -1,0 +1,1 @@
+Have the `worker-hard` subagent run `./job.sh` in this directory and report back its RESULT value; don't run the job yourself. The job takes about a minute and logs progress to `job.log`; when it has finished, the log ends with a `RESULT:` line and then `DONE`. Then tell me the RESULT value.
