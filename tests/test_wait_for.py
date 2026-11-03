@@ -23,6 +23,13 @@ FAKE = REPO / "tests" / "stubs" / "wait-for-fake.py"
 RUN_DONE = {"status": "completed", "conclusion": "success", "name": "infra"}
 RUN_BUSY = {"status": "in_progress", "conclusion": "", "name": "infra"}
 
+# The scripted `ExecMainStartTimestamp`s below are what systemd prints on a
+# Europe/Stockholm host, abbreviation included, so the run reads them in that
+# zone. Pinning it is not what makes the timestamp cases correct — `host_epoch`
+# is — but it keeps every run in one zone instead of the runner's, which is one
+# fewer thing that differs between this laptop and CI.
+TEST_TZ = {"TZ": "Europe/Stockholm"}
+
 
 def run_wait_for(
     tmp_path: Path,
@@ -35,7 +42,7 @@ def run_wait_for(
 ) -> tuple[int, str, list[str]]:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
-    for name in ("gh", "systemctl", "sleep"):
+    for name in ("gh", "journalctl", "sleep", "systemctl", "systemd-run"):
         link = bin_dir / name
         if not link.exists():
             link.symlink_to(FAKE)
@@ -51,11 +58,18 @@ def run_wait_for(
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "FAKE_SCRIPT": str(state),
         "FAKE_LOG": str(log),
+        **TEST_TZ,
     }
     env.update(extra_env or {})
     (tmp_path / "home").mkdir(exist_ok=True)
+    argv = list(args)
+    if argv[:1] == ["job"] and "--" in argv:
+        separator = argv.index("--")
+        argv[separator:separator] = ["--timeout", timeout]
+    else:
+        argv.extend(["--timeout", timeout])
     proc = subprocess.run(
-        ["bash", str(wait_for), *args, "--timeout", timeout],
+        ["bash", str(wait_for), *argv],
         capture_output=True, text=True, env=env, cwd=cwd, timeout=60, check=False,
     )
     return proc.returncode, proc.stdout + proc.stderr, log.read_text().splitlines()
@@ -179,18 +193,302 @@ def test_transient_unit_is_not_done_while_its_job_runs(tmp_path: Path) -> None:
     assert rc == 1, out
 
 
-def test_collected_transient_unit_reports_success_without_defaults(tmp_path: Path) -> None:
-    # A transient unit that exits 0 is garbage-collected; `systemctl show` then
-    # answers with defaults (LoadState=not-found, Result=success). Only report
-    # success because the unit was seen loaded and then vanished.
+# Journal shapes below mirror what this host actually logs, measured
+# 2026-11-03. The unit's own InvocationID appears as USER_INVOCATION_ID (the
+# exit line is written by the service manager, so _SYSTEMD_INVOCATION_ID is the
+# manager's id, not the unit's). A clean exit logs ONLY the "Started" record:
+# there is no exit record carrying EXIT_STATUS=0, so a success is established by
+# locating the run and finding no failure, never by reading a zero status.
+def started_record(invocation: str = "run-abc") -> dict[str, str]:
+    return {
+        "MESSAGE_ID": "39f53479d3a045ac8e11786248231fbf",
+        "USER_INVOCATION_ID": invocation,
+        "USER_UNIT": "gate.service",
+    }
+
+
+def exit_record(status: int, invocation: str = "run-abc") -> dict[str, str]:
+    return {
+        "MESSAGE_ID": "98e322203f7a4ed290d09fe03c09fe15",
+        "EXIT_CODE": "exited",
+        "EXIT_STATUS": str(status),
+        "USER_INVOCATION_ID": invocation,
+        "USER_UNIT": "gate.service",
+    }
+
+
+def test_collected_failed_unit_never_becomes_success(tmp_path: Path) -> None:
+    # Regression: --collect reaps failures too, and systemctl's not-found
+    # defaults say success. The journal record is the verdict.
     running = {"LoadState": "loaded", "ActiveState": "active", "SubState": "running",
-               "Type": "simple", "Transient": "yes", "ExecMainStartTimestamp": "Sat 2026-10-04 08:00:00 CEST"}
+               "Type": "simple", "Transient": "yes", "CollectMode": "inactive-or-failed",
+               "InvocationID": "run-abc",
+               "ExecMainStartTimestamp": "Sat 2026-10-04 08:00:00 CEST"}
     gone = {"LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead",
             "Result": "success", "ExecMainStatus": "0"}
-    script = {"systemctl": [running, running, gone]}
+    script = {"systemctl": [running, gone],
+              "journalctl": [{"stdout": [started_record(), exit_record(7)]}]}
+    rc, out, _ = run_wait_for(tmp_path, script, "unit", "gate", "--user")
+    assert rc == 1, out
+    assert "status=7" in out, out
+
+
+def test_fast_collected_success_never_becomes_failure(tmp_path: Path) -> None:
+    # The waiter arms after a successful transient unit has already vanished.
+    # A clean exit leaves only the "Started" record, so the verdict rests on
+    # locating that run and finding no failure for it.
+    gone = {"LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead",
+            "Result": "success", "ExecMainStatus": "0"}
+    script = {
+        "systemctl": [gone],
+        "journalctl": [
+            {"stdout": [started_record()]},
+            {"stdout": [started_record()]},
+        ],
+    }
     rc, out, _ = run_wait_for(tmp_path, script, "unit", "gate", "--user")
     assert rc == 0, out
-    assert "collected" in out, out
+    assert "clean exit" in out, out
+
+
+def test_vanished_unit_without_journal_record_is_unknown(tmp_path: Path) -> None:
+    gone = {"LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead"}
+    script = {"systemctl": [gone], "journalctl": [{"stdout": []}]}
+    rc, out, _ = run_wait_for(tmp_path, script, "unit", "gate", "--user")
+    assert rc == 3, out
+    assert "could not be determined" in out, out
+
+
+def test_unit_vanishing_mid_wait_is_journal_read_whatever_transient_said(
+    tmp_path: Path,
+) -> None:
+    # The arming reads can lose a race with collection: once the unit is gone,
+    # `systemctl show -p Transient` answers with its own default `no` (measured
+    # on this host, alongside `Result=success ExecMainStatus=0`). Gating the
+    # mid-wait vanish check on that cached flag made the bug self-concealing —
+    # the gate could not fire precisely when it was needed. Being unloaded, not
+    # being transient, is what makes a unit's properties unreadable.
+    miscached = {"LoadState": "loaded", "ActiveState": "activating",
+                 "SubState": "start", "Type": "simple", "Transient": "no",
+                 "CollectMode": "inactive", "InvocationID": "run-abc",
+                 "ExecMainStartTimestamp": "Sat 2026-10-04 08:00:00 CEST"}
+    gone = {"LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead",
+            "Result": "success", "ExecMainStatus": "0"}
+    script = {"systemctl": [miscached, gone],
+              "journalctl": [{"stdout": [started_record(), exit_record(7)]}]}
+    rc, out, _ = run_wait_for(tmp_path, script, "unit", "gate", "--user")
+    assert rc == 1, out
+    assert "status=7" in out, out
+
+
+def test_unit_reaped_after_the_loop_breaks_is_journal_read(tmp_path: Path) -> None:
+    # A guard, not a reproduction: a6c6a1e also passes this fixture, because its
+    # in-loop check happened to run before the break. What is pinned here is the
+    # structure — the verdict snapshot re-checks LoadState, so the ~7 ms between
+    # "the loop saw it finish" and "read its Result" cannot be answered by
+    # not-found defaults. Dropping that re-check must fail a test.
+    finished = {"LoadState": "loaded", "ActiveState": "failed", "SubState": "failed",
+                "Type": "simple", "Transient": "yes", "CollectMode": "inactive-or-failed",
+                "InvocationID": "run-abc",
+                "ExecMainStartTimestamp": "Sat 2026-10-04 08:00:00 CEST"}
+    gone = {"LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead",
+            "Result": "success", "ExecMainStatus": "0"}
+    script = {"systemctl": [finished, gone],
+              "journalctl": [{"stdout": [started_record(), exit_record(7)]}]}
+    rc, out, _ = run_wait_for(tmp_path, script, "unit", "gate", "--user")
+    assert rc == 1, out
+    assert "status=7" in out, out
+
+
+def test_unreadable_service_manager_is_never_a_clean_exit(tmp_path: Path) -> None:
+    # Found by this PR's own agent-e2e. The sandbox has no user bus, so
+    # `systemctl --user show` exits 1 with EMPTY output while journald's files
+    # stay readable — and a unit still on step 1 of 9 was reported as
+    # `rc=0 vanished after a clean exit`, because its "Started" record was
+    # there and no failure record was. Absence has to be OBSERVED: a manager
+    # that cannot answer is exit 3, and the discriminator is systemctl's exit
+    # status, since a genuinely missing unit exits 0 saying `not-found`.
+    script = {"systemctl": [{"rc": 1}],
+              "journalctl": [{"stdout": [started_record()]}]}
+    rc, out, _ = run_wait_for(tmp_path, script, "unit", "gate", "--user", timeout="5")
+    assert rc == 3, out
+    assert "could not answer" in out, out
+
+
+def test_unreadable_service_manager_blocks_a_job_launch(tmp_path: Path) -> None:
+    # Same for `job`: without a reachable manager, "the unit is not loaded" is
+    # not a reason to launch — the answer is unknown, not absent.
+    script = {"systemctl": [{"rc": 1}],
+              "systemd-run": [{"stdout": "Running as unit: durable.service"}]}
+    rc, out, calls = run_wait_for(
+        tmp_path, script, "job", "durable", "--", "true", timeout="5"
+    )
+    assert rc == 3, out
+    assert not any(call.startswith("systemd-run ") for call in calls), calls
+
+
+SUCCEEDED_UNIT = {
+    "LoadState": "loaded", "ActiveState": "active", "SubState": "exited",
+    "Type": "simple", "Transient": "yes", "CollectMode": "none",
+    "InvocationID": "run-job", "Result": "success", "ExecMainStatus": "0",
+    "ExecMainStartTimestamp": "Sat 2026-10-04 08:00:00 CEST",
+}
+
+
+def host_epoch(stamp: str) -> int:
+    """What `wait-for`'s own `to_epoch` makes of a systemd timestamp, here.
+
+    These two cases turn on whether a failure record is older or newer than the
+    verified run, so they need the run's instant as THIS host reads it, not as
+    the fixture's zone implies. Hard-coding the offset measured the host's
+    `date` instead: a GitHub runner cleared a record stamped an hour after
+    `08:00:00 CEST`, so it had resolved that string to a different instant than
+    this laptop does, and the case failed there while passing here. Asking the
+    same `date` the script will ask removes the question — the ordering under
+    test is then exact wherever this runs, and no zone table has to agree with
+    anyone's.
+    """
+    out = subprocess.run(["date", "-d", stamp, "+%s"],
+                         capture_output=True, text=True, env={**os.environ, **TEST_TZ})
+    assert out.returncode == 0, f"this host cannot read a systemd timestamp: {out.stderr}"
+    return int(out.stdout.strip())
+
+
+def utc_stamp(epoch: int) -> str:
+    """The recorder's own format: ISO-8601 in UTC, which parses unambiguously."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
+def write_record(tmp_path: Path, slug: str, body: dict) -> Path:
+    record = tmp_path / "home/.local/state/claude-unit-failures" / f"{slug}.json"
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(json.dumps(body), encoding="utf-8")
+    return record
+
+
+def test_success_clears_a_failure_record_it_supersedes(tmp_path: Path) -> None:
+    # Nothing else can clear it: RemainAfterExit keeps the successful unit
+    # active, so its own ExecStopPost has not run. Measured without this fix,
+    # every SessionStart kept announcing a job that had since been fixed.
+    run_at = host_epoch(SUCCEEDED_UNIT["ExecMainStartTimestamp"])
+    record = write_record(tmp_path, "gate", {"unit": "gate.service",
+                                             "failed_at": utc_stamp(run_at - 3600)})
+    rc, out, _ = run_wait_for(
+        tmp_path, {"systemctl": [SUCCEEDED_UNIT]}, "unit", "gate", "--user"
+    )
+    assert rc == 0, out
+    assert not record.exists(), record.read_text()
+
+
+def test_success_keeps_a_failure_record_it_cannot_account_for(tmp_path: Path) -> None:
+    # A record newer than the verified run, or one whose timestamp cannot be
+    # read, is kept. A stale announcement is noise; dropping a real failure is
+    # silence, which is the failure mode this script exists to remove.
+    run_at = host_epoch(SUCCEEDED_UNIT["ExecMainStartTimestamp"])
+    for body in ({"failed_at": utc_stamp(run_at + 3600)},
+                 {"failed_at": "not a timestamp"},
+                 {"unit": "gate.service"}):
+        record = write_record(tmp_path, "gate", body)
+        rc, out, _ = run_wait_for(
+            tmp_path, {"systemctl": [SUCCEEDED_UNIT]}, "unit", "gate", "--user"
+        )
+        assert rc == 0, out
+        assert record.exists(), f"{body} was cleared: {out}"
+
+
+def test_since_after_launch_waits_for_a_newer_run(tmp_path: Path) -> None:
+    # --since is a freshness filter, not a way to timestamp a launch after the
+    # fact. A terminal run that started earlier must not be mistaken for a new one.
+    failed = {"LoadState": "loaded", "ActiveState": "failed", "SubState": "failed",
+              "Type": "simple", "Transient": "yes", "CollectMode": "none",
+              "InvocationID": "run-abc", "Result": "exit-code", "ExecMainStatus": "7",
+              "ExecMainStartTimestamp": "Sat 2026-10-04 08:00:00 CEST"}
+    rc, out, _ = run_wait_for(
+        tmp_path, {"systemctl": [failed]}, "unit", "gate", "--user",
+        "--since", "Sat 2026-10-04 08:00:01 CEST", timeout="1",
+    )
+    assert rc == 124, out
+    assert "timed out" in out, out
+
+
+def test_job_launches_once_and_preserves_recorded_success(tmp_path: Path) -> None:
+    absent = {"LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead"}
+    finished = {"LoadState": "loaded", "ActiveState": "active", "SubState": "exited",
+                "Type": "simple", "Transient": "yes", "CollectMode": "none",
+                "InvocationID": "run-job", "Result": "success", "ExecMainStatus": "0",
+                "ExecMainStartTimestamp": "Sat 2026-10-04 08:00:00 CEST"}
+    script = {"systemctl": [absent, finished],
+              "systemd-run": [{"stdout": "Running as unit: durable.service"}]}
+
+    first_rc, first_out, first_calls = run_wait_for(
+        tmp_path, script, "job", "durable", "--", "bash", "-c", "exit 0"
+    )
+    second_rc, second_out, second_calls = run_wait_for(
+        tmp_path, script, "job", "durable", "--", "bash", "-c", "exit 9"
+    )
+
+    assert first_rc == 0, first_out
+    assert second_rc == 0, second_out
+    launches = [call for call in second_calls if call.startswith("systemd-run ")]
+    assert len(launches) == 1, launches
+    assert "RemainAfterExit=yes" in launches[0]
+    assert "ExecStopPost=" in launches[0]
+    assert "--collect" not in launches[0]
+
+
+def test_job_launches_once_and_preserves_recorded_failure(tmp_path: Path) -> None:
+    absent = {"LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead"}
+    failed = {"LoadState": "loaded", "ActiveState": "failed", "SubState": "failed",
+              "Type": "simple", "Transient": "yes", "CollectMode": "none",
+              "InvocationID": "run-job", "Result": "exit-code", "ExecMainStatus": "7",
+              "ExecMainStartTimestamp": "Sat 2026-10-04 08:00:00 CEST"}
+    script = {"systemctl": [absent, failed],
+              "systemd-run": [{"stdout": "Running as unit: durable.service"}]}
+    failure_record = tmp_path / "home/.local/state/claude-unit-failures/durable.json"
+    failure_record.parent.mkdir(parents=True)
+    failure_record.write_text("{}", encoding="utf-8")
+
+    first_rc, first_out, _ = run_wait_for(
+        tmp_path, script, "job", "durable", "--", "bash", "-c", "exit 7"
+    )
+    assert not failure_record.exists()
+    second_rc, second_out, calls = run_wait_for(
+        tmp_path, script, "job", "durable", "--", "true"
+    )
+
+    assert first_rc == 1, first_out
+    assert second_rc == 1, second_out
+    assert len([call for call in calls if call.startswith("systemd-run ")]) == 1, calls
+
+
+def test_job_adopts_running_unit_instead_of_relaunching(tmp_path: Path) -> None:
+    running = {"LoadState": "loaded", "ActiveState": "active", "SubState": "running",
+               "Type": "simple", "Transient": "yes", "CollectMode": "none",
+               "InvocationID": "run-job", "Result": "success", "ExecMainStatus": "0",
+               "ExecMainStartTimestamp": "Sat 2026-10-04 08:00:00 CEST"}
+    finished = {**running, "ActiveState": "active", "SubState": "exited"}
+    rc, out, calls = run_wait_for(
+        tmp_path, {"systemctl": [running, running, finished]},
+        "job", "durable", "--", "bash", "-c", "exit 9",
+    )
+    assert rc == 0, out
+    assert not any(call.startswith("systemd-run ") for call in calls), calls
+
+
+def test_job_rejects_unsafe_slugs_and_collect(tmp_path: Path) -> None:
+    for slug in ("../escape", ".", "..", "claude-autofork-7"):
+        rc, out, calls = run_wait_for(
+            tmp_path, {}, "job", slug, "--", "true"
+        )
+        assert rc == 64, out
+        assert not any(call.startswith("systemd-run ") for call in calls), calls
+
+    rc, out, calls = run_wait_for(
+        tmp_path, {}, "job", "safe", "--", "runner", "--collect"
+    )
+    assert rc == 64, out
+    assert "--collect" in out and "reap" in out, out
+    assert not any(call.startswith("systemd-run ") for call in calls), calls
 
 
 def test_long_running_service_still_counts_as_up(tmp_path: Path) -> None:
