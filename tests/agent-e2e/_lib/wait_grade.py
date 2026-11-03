@@ -106,9 +106,22 @@ for who in ("main", "subagent"):
 # A headless subagent may lose its waiter, but the user unit remains durable;
 # the main session can adopt the same unit. No agent should hold a foreground
 # sleep-poll.
-executed = m["main"]["fg_wait_executed"]
+#
+# The graded invariants are: nobody held a foreground wait, the job ran exactly
+# once, and the reported token is the job's. WHICH side waited is deliberately
+# not graded — adopting a subagent's durable unit from the main session is the
+# designed behaviour, not a defect.
+executed = m["main"]["fg_wait_executed"] + m["subagent"]["fg_wait_executed"]
+waited = sum(m[who][p] for who in ("main", "subagent")
+             for p in ("wait_for_job_bg", "wait_for_unit_bg"))
 if not tokens and not m["main"]["ran_job"] and not m["subagent"]["ran_job"]:
     print("INCONCLUSIVE: the job never ran")
+    sys.exit(2)
+# The situation under test is "a job outlives the turn that wants its result".
+# If the job finished without anyone needing to wait, the scenario did not
+# present that situation, so its verdict says nothing about the config.
+if tokens and not waited and not executed:
+    print("INCONCLUSIVE: the job completed without any wait being needed")
     sys.exit(2)
 # `running`: the job was started before the agent and is held until job.log is
 # first read (_lib/waitjob.sh). Started by the fallback deadline instead means
@@ -122,16 +135,16 @@ if not m["reported_correctly"]:
     problems.append("reported RESULT is not the job's token")
 if executed:
     problems.append(f"{executed} foreground wait(s) executed")
-if mode == "subagent" and (m["main"]["ran_job"] or not m["subagent"]["ran_job"]):
-    problems.append("the job did not run inside the subagent alone")
-owner = "subagent" if mode.endswith("subagent") else "main"
-primitive = "wait_for_unit_bg" if mode.startswith("running") else "wait_for_job_bg"
-if not m[owner][primitive]:
-    expected = "wait-for unit" if mode.startswith("running") else "wait-for job"
-    problems.append(f"{owner} did not use background {expected}")
+if len(tokens) > 1:
+    problems.append(f"the job ran {len(tokens)} times; a durable job must run once")
+if mode == "subagent" and not m["subagent"]["ran_job"]:
+    problems.append("the subagent did not start the job")
+# Either background primitive is a correct answer: `wait-for job` on a slug
+# that is already running adopts that run instead of starting a second one.
+if not waited:
+    problems.append("no background wait-for was used")
 if problems:
     print("FAIL: " + "; ".join(problems))
     sys.exit(1)
-print("PASS: correct result, no foreground wait executed"
-      + (", job ran in the subagent" if mode == "subagent" else ""))
+print("PASS: correct result, no foreground wait executed, job ran once")
 sys.exit(0)
