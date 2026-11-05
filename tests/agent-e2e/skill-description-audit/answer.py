@@ -25,6 +25,16 @@ class Unusable(Exception):
     """The staged tree cannot produce a checkable answer."""
 
 
+def _prose(description):
+    """The description with path-like tokens dropped.
+
+    A directory name is not a mention. Measured: two skills matched only on
+    `~/Repos/nixos-config-worktrees/`, so ground truth demanded names no
+    careful reader would give and scored honest answers as half wrong.
+    """
+    return " ".join(token for token in description.split() if "/" not in token)
+
+
 def expected_from(home, needle=NEEDLE, require=False):
     names = []
     for path in glob.glob(os.path.join(home, ".claude/skills/*/SKILL.md")):
@@ -33,7 +43,7 @@ def expected_from(home, needle=NEEDLE, require=False):
         if not front:
             continue
         described = DESCRIPTION.search(front.group(1))
-        if described and re.search(needle, described.group(1), re.I):
+        if described and re.search(needle, _prose(described.group(1)), re.I):
             names.append(os.path.basename(os.path.dirname(path)))
     if require and not names:
         raise Unusable(f"no staged skill description mentions {needle!r}")

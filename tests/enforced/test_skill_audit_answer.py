@@ -125,3 +125,25 @@ def test_a_staged_tree_with_no_match_is_refused(tmp_path):
     mod = load()
     with pytest.raises(mod.Unusable):
         mod.expected_from(tmp_path, require=True)
+
+
+def test_a_directory_name_is_not_a_mention(tmp_path):
+    """Measured: `nixos-agent-testing` and `nixos-automated-testing` matched
+    only on `~/Repos/nixos-config-worktrees/` in their descriptions, so ground
+    truth demanded two skills no careful reader would name, and three real
+    runs scored 4/8 for answers that were closer to right than that."""
+    skill(tmp_path, "nixos-testing",
+          "Use ONLY in the nixos-config repo (~/Repos/nixos-config-worktrees/).")
+    assert load().expected_from(tmp_path) == []
+
+
+def test_a_prose_mention_still_counts(tmp_path):
+    skill(tmp_path, "repo-worktree-policy",
+          "Use when asked to require development in linked worktrees.")
+    assert load().expected_from(tmp_path) == ["repo-worktree-policy"]
+
+
+def test_a_path_does_not_hide_a_real_mention_beside_it(tmp_path):
+    skill(tmp_path, "both",
+          "Work in a worktree under ~/Repos/nixos-config-worktrees/ always.")
+    assert load().expected_from(tmp_path) == ["both"]
