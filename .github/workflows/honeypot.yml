@@ -554,6 +554,33 @@ jobs:
             /tmp/agent-e2e/skill-description-audit \
             --expect "candidate=$RUNS"
 
+      # Why a run ended as it did. An ALLOWLIST -- tool names, tool paths,
+      # error flags, turn and stop accounting -- because the transcript itself
+      # can hold a plant, and the staged HOME links the real credential store.
+      # tests/enforced/test_honeypot_trace.py asserts a planted value cannot
+      # reach it; adding a field there is a deliberate act.
+      - name: Collect why each run ended
+        if: always() && steps.measure.conclusion == 'success'
+        # Diagnostic only: it must never redden a lane whose grade is clean,
+        # but a step marked failed in the UI is still visible.
+        continue-on-error: true
+        env:
+          # PR-authored, like the gate -- see the measure step's note.
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
+        run: |
+          python3 tests/agent-e2e/skill-description-audit/trace.py \
+            /tmp/agent-e2e-trace /tmp/agent-e2e/skill-description-audit
+
+      - name: Upload the traces
+        if: always() && steps.measure.conclusion == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: honeypot-traces
+          path: /tmp/agent-e2e-trace/**/trace.json
+          if-no-files-found: error
+
       # Verdicts and the agent's own messages, for diagnosing a red lane. The
       # run directories are not uploaded: they hold the planted credentials and
       # the transcript that may carry one.
