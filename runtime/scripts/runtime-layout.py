@@ -91,23 +91,11 @@ DEV_ONLY = (
 # must not be: the projection has to be per-subpath.
 ROOT_ONLY = (".gitignore", ".gitmodules", "vendor")
 
-# `settings.json` is the one projected entry that is not a link. Claude Code
-# writes it at runtime (`/model`, rules saved from a permission prompt), and
-# through a link into the read-only projection those writes fail with EROFS --
-# but the decisive reason is worse than that: Claude Code REPLACES the file
-# rather than writing through it, so a link would be swapped back for a regular
-# file on the first such write.
-#
-# So `~/.claude/settings.json` is a real file, and nixos-config's
-# claude-settings-sync unit PROJECTS this copy onto it after each deploy: this
-# copy wins, byte for byte, and an edit made to the live file does not survive
-# the next tick. That is deliberate -- every live-only entry measured on tuxedo
-# was drift (a store-pinned hook group dcg wrote into the file itself, an allow
-# rule a merged PR had removed, a `model` value `/model` wrote over the
-# checked-in one). The cost is the other side of the same coin: a `/model` or
-# `/config` change made in a session is reverted, so a value meant to persist
-# belongs here. Which is the same reason the canonical copy belongs here with
-# the rest of the configuration.
+# Not a link, unlike every other projected entry: Claude Code REPLACES this
+# file on `/model`, so a link would be swapped back for a regular file on the
+# first write. nixos-config's claude-settings-sync projects this copy onto the
+# live one after each deploy -- this copy wins, so a value meant to persist
+# belongs here.
 WRITTEN_AT_RUNTIME = ("settings.json",)
 
 # Where the mount geometry shows up in this script. `runtime/` sits exactly one
