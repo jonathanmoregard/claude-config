@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import posixpath
 import re
 import subprocess
 import sys
@@ -191,14 +192,22 @@ def test_every_vendored_skill_link_is_tracked():
     upstream changes to that skill would never surface as drift."""
     entries = json.loads(CONFIG.read_text())["entries"]
     for entry in entries:
-        # Match on the pin, not on a fixed number of `..` hops. The farm is
-        # spelled `../vendor/x` while skills/ sits at the repository root and
-        # `../../vendor/x` once it has moved under runtime/, and both name the
-        # same submodule -- which is all this assertion is about.
-        marker = f"/{entry['pin']}/"
-        linked = {os.readlink(p).split(marker, 1)[1]
-                  for p in (RUNTIME / "skills").iterdir()
-                  if p.is_symlink() and marker in os.readlink(p)}
+        # Resolve each link against its own directory and compare to the pin,
+        # rather than looking for the pin inside the link text. The farm is
+        # spelled relatively (`../vendor/x`), so the pin's own prefix --
+        # `runtime/` -- never appears in it.
+        root = posixpath.join(
+            RUNTIME.relative_to(REPO_ROOT).as_posix(), "skills")
+        linked = set()
+        for p in (RUNTIME / "skills").iterdir():
+            if not p.is_symlink():
+                continue
+            target = os.readlink(p)
+            if target.startswith("/"):
+                continue
+            resolved = posixpath.normpath(posixpath.join(root, target))
+            if resolved.startswith(entry["pin"] + "/"):
+                linked.add(resolved[len(entry["pin"]) + 1:])
         assert linked, f"no skills link into {entry['pin']}"
         assert linked <= set(entry["tracked_paths"]), linked - set(entry["tracked_paths"])
         assert set(entry["customized_paths"]) <= set(entry["tracked_paths"])

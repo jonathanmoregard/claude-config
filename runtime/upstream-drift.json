@@ -7,7 +7,7 @@
       "fork_branch": "main",
       "upstream_url": "https://github.com/obra/superpowers.git",
       "upstream_branch": "main",
-      "pin": "vendor/superpowers",
+      "pin": "runtime/vendor/superpowers",
       "tracked_paths": [
         "hooks",
         "skills/brainstorming",
@@ -42,7 +42,7 @@
       "fork_branch": "main",
       "upstream_url": "https://github.com/affaan-m/ECC.git",
       "upstream_branch": "main",
-      "pin": "vendor/everything-claude-code",
+      "pin": "runtime/vendor/everything-claude-code",
       "tracked_paths": [
         "skills/accessibility",
         "skills/brand-voice",

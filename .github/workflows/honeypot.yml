@@ -61,21 +61,25 @@
 # attached to the head commit in every case, and a decision step that errors
 # takes the job red with it.
 #
-# What counts as config is an EXCLUSION list rather than an inclusion list,
-# and that direction is the whole point: a directory added tomorrow is graded
-# without anyone editing this file, where an allowlist would silently exempt
-# it. Only what provably cannot reach a running agent is excluded. A rename is
-# classified on BOTH its names, because moving a live hook into an excluded
-# directory removes it from the running config while showing a filter that
-# reads one name only the excluded path it landed on.
+# What counts as config is `runtime/`, and nothing else. That is not a
+# hand-kept allowlist: the deploy serves `runtime/` and only `runtime/` into
+# `~/.claude`, so the filter and the deployment are the same statement, and a
+# directory added tomorrow is graded or ignored according to where it lands
+# rather than according to this file. `tests/enforced/test_runtime_layout.py`
+# is what keeps the two in step.
 #
-# `vendor/` is NOT excluded, and that is not an oversight. Sixteen skills
-# under `runtime/skills/` are symlinks into `vendor/superpowers` and
-# `vendor/everything-claude-code` -- `using-superpowers`, which every session
-# reads, among them -- so moving a submodule pin changes skill text under the
-# agent while touching no file beneath `runtime/`. `.gitmodules` is in for the
-# same reason, and `policy/` is in because a sandbox policy is config whatever
-# reads it today.
+# This replaced an exclusion list, which was the right shape while the live
+# config was spread across the tree. It had a hole the move closed: 33 skills
+# under `runtime/skills/` are symlinks into the vendored submodules --
+# `using-superpowers`, which every session reads, among them -- and while
+# those submodules sat at the repository root a pin bump changed skill text
+# under the agent while touching no file beneath `runtime/`. The submodules
+# now live at `runtime/vendor/`, so a pin bump is a change under `runtime/`
+# and is graded like any other.
+#
+# A rename is still classified on BOTH its names, because moving a live hook
+# out of `runtime/` removes it from the running config and a filter reading
+# one name only would see whichever side it was shown.
 #
 # The label still overrides, so a grade can always be ASKED for. That is not
 # symmetry for its own sake: this lane's own scenario lives in
@@ -238,9 +242,7 @@ jobs:
           files=$(printf '%s\n' "$records" | tr '\t' '\n' | grep -v '^$' || true)
           # grep exits 1 when every line is filtered out. That is the
           # nothing-to-grade case, not an error.
-          config=$(printf '%s\n' "$files" | grep -vE \
-            '^(tests/|docs/|research/|experiments/|improvements/|\.github/|\.githooks/|\.gitignore$|\.gitleaks\.toml$|\.secrets\.baseline$)' \
-            || true)
+          config=$(printf '%s\n' "$files" | grep -E '^runtime/' || true)
           if [ -z "$config" ]; then
             echo "nothing to grade: no file here is read by a running agent."
             echo "all $got of them, a rename shown as 'new <- old':"
