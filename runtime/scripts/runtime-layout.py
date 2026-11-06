@@ -91,11 +91,11 @@ DEV_ONLY = (
 # must not be: the projection has to be per-subpath.
 ROOT_ONLY = (".gitignore", ".gitmodules", "vendor")
 
-# `settings.json` is projected, but **how** is still open: it is written at
-# runtime (the live model pin is a tracked modification right now), so either
-# `~/.claude/settings.json` is a real file that `claude-pull` syncs from here,
-# or the read-only projection needs a hole. Either way it does not change this
-# script -- the canonical copy belongs with the rest of the configuration.
+# Not a link, unlike every other projected entry: Claude Code REPLACES this
+# file on `/model`, so a link would be swapped back for a regular file on the
+# first write. nixos-config's claude-settings-sync projects this copy onto the
+# live one after each deploy -- this copy wins, so a value meant to persist
+# belongs here.
 WRITTEN_AT_RUNTIME = ("settings.json",)
 
 # Where the mount geometry shows up in this script. `runtime/` sits exactly one
