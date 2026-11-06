@@ -80,7 +80,7 @@ DEV_ONLY = (
 )
 
 # Stays at the repository root and is not part of `runtime/`.
-ROOT_ONLY = (".gitignore", ".gitmodules")
+ROOT_ONLY = (".gitignore",)
 
 # `settings.json` is projected, but **how** is still open: it is written at
 # runtime (the live model pin is a tracked modification right now), so either
@@ -193,9 +193,9 @@ def retarget(path: str, target: str) -> str | None:
                                  runtime/ together and the hop is unchanged.
                                  Adding a `..` here points at <repo>/hooks/y,
                                  which nothing will occupy.
-      skills/x -> ../vendor/y    same: `vendor/` is projected too, so the
-                                 submodules descend with everything else and
-                                 the hop is unchanged.
+      skills/x -> ../vendor/y    same: `vendor/` is projected too, so it
+                                 descends with everything else and the hop is
+                                 unchanged.
 
     A hop that stays inside the moved entry moves with it. Absolute targets
     resolve the same from any depth. A relative target that leaves the
@@ -304,16 +304,8 @@ def verify(root: Path) -> int:
     #                                 that silently stops loading.
     #
     # Existence is not always answerable here, so the third outcome is named
-    # rather than folded into a pass: an absolute target is machine-specific,
-    # and the vendored submodules are empty in every `git worktree add` tree
-    # because that command does not initialise them. Those are reported and
-    # counted, never counted as verified.
-    # Read from the index rather than listed, so adding a submodule needs no
-    # edit here.
-    submodules = tuple(
-        line.split("\t", 1)[1]
-        for line in git("ls-files", "-s", RUNTIME_DIR, cwd=root).splitlines()
-        if line.startswith("160000"))
+    # rather than folded into a pass: an absolute target is machine-specific.
+    # Those are reported and counted, never counted as verified.
     checked = 0
     unverifiable: list[str] = []
     for line in git("ls-files", "-s", RUNTIME_DIR, cwd=root).splitlines():
@@ -364,14 +356,6 @@ def verify(root: Path) -> int:
         if exists:
             checked += 1
             continue
-        holder = next((s for s in submodules
-                       if resolved == s or resolved.startswith(s + "/")), None)
-        if holder:
-            submodule = root / holder
-            if not submodule.is_dir() or not any(submodule.iterdir()):
-                unverifiable.append(
-                    f"{path} -> {target} ({submodule.name} is not initialised)")
-                continue
         failures.append(f"{path} -> {target} dangles: nothing at {resolved}")
 
     # Only entries this repository actually tracks -- the manifest lists what

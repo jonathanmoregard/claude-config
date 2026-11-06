@@ -136,9 +136,12 @@ def gitlinks(repo: pathlib.Path, rev: str | None) -> list[tuple[str, str]]:
 
 def stage_submodules(repo: pathlib.Path, rev: str | None, dest: pathlib.Path) -> list[str]:
     """Copy each submodule's content under DEST: its working tree when staging
-    a worktree (REV None), its pinned commit when staging a git ref. Skill
-    symlinks into vendor/ dangle without this. Returns a note per submodule
-    that could not be staged."""
+    a worktree (REV None), its pinned commit when staging a git ref. Returns a
+    note per submodule that could not be staged.
+
+    Inert for this repository as of the vendor move -- runtime/vendor/ holds
+    plain files, which `git archive` already carries -- and that is why the
+    vendored skills now stage on a runner that has never fetched a fork."""
     notes = []
     for path, pin in gitlinks(repo, rev):
         sub = repo / path

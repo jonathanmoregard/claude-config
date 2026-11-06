@@ -148,7 +148,7 @@ def render(entry: dict, commits: list[Commit], base: str, fork_sha: str,
     else:
         lines.append("None: no upstream commit touches a customized path.")
     customized = ", ".join(f"`{p}`" for p in entry["customized_paths"])
-    pin = entry.get("pin")
+    vendor_path = entry.get("vendor_path")
     lines += [
         "",
         "## How to act",
@@ -161,8 +161,9 @@ def render(entry: dict, commits: list[Commit], base: str, fork_sha: str,
          "our version rather than picking one side."),
         "3. Push the branch and open a PR on the fork; the merge click is Jonathan's.",
         (f"4. Once merged, scripts/update-submodules.sh opens the ~/.claude PR that "
-         f"moves the `{pin}` pin (weekly), or bump it by hand in a ~/.claude worktree."
-         if pin else "4. Once merged, move whatever pins the fork to the new commit."),
+         f"syncs `{vendor_path}` to the fork's new commit (weekly), or sync it by hand "
+         "in a ~/.claude worktree."
+         if vendor_path else "4. Once merged, re-vendor the fork at its new commit."),
         ("5. Mark this proposal `status: implemented` with a `resolution:` naming the "
          "fork PR. The next run proposes again only when upstream moves on a tracked path."),
         "",

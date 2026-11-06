@@ -418,8 +418,8 @@ expect_refused "CLAUDE_CONFIG_REPO naming the deploy clone is refused" \
 # --- the quiet caller: update-submodules.sh ----------------------------------
 # It runs from cron on Mondays, nothing watches its exit status, and its output
 # goes to a log nobody opens — so a wrong repository here fails silently. Its
-# own origin, because the fixture needs a .gitmodules on origin/master and the
-# shared one must stay as the other sections left it.
+# own origin, because the fixture needs an upstream-drift.json on origin/master
+# and the shared one must stay as the other sections left it.
 SUB_ORIGIN="$ROOT/remote/sub/claude-config.git"
 SUB_HOME="$ROOT/sub-home"
 mkdir -p "$(dirname "$SUB_ORIGIN")" "$SUB_HOME/Repos"
@@ -427,11 +427,14 @@ git init -q --bare -b master "$SUB_ORIGIN"
 git init -q -b master "$ROOT/sub-seed"
 (
   cd "$ROOT/sub-seed" || exit 1
-  # A submodule entry with a path and no url: the script reads .gitmodules from
-  # origin/master as a blob, logs that it is skipping, and stops before
-  # anything that would reach the network. Only the repository this fixture
-  # built can produce that line, so the log says WHICH checkout it resolved.
-  printf '[submodule "fixture-only"]\n\tpath = vendor/fixture-only\n' > .gitmodules
+  # An entry with a vendor_path and no fork_repo: the script reads
+  # upstream-drift.json from origin/master as a blob, logs that it is skipping,
+  # and stops before anything that would reach the network. Only the repository
+  # this fixture built can produce that line, so the log says WHICH checkout it
+  # resolved.
+  mkdir -p runtime
+  printf '{"entries": [{"name": "fixture-only", "vendor_path": "runtime/vendor/fixture-only"}]}\n' \
+    > runtime/upstream-drift.json
   git add -A
   git commit -qm seed
   git remote add origin "$SUB_ORIGIN"
@@ -448,7 +451,7 @@ SUB_LOG="$ROOT/submodule-run.log"
 expect_ok "update-submodules runs when reached through the projection" \
   env HOME="$SUB_HOME" CLAUDE_SUBMODULE_LOG="$SUB_LOG" \
   "$SUB_HOME/.claude/scripts/update-submodules.sh"
-if grep -q 'fixture-only' "$SUB_LOG" 2>/dev/null && grep -q 'no url in .gitmodules' "$SUB_LOG" 2>/dev/null; then
+if grep -q 'fixture-only' "$SUB_LOG" 2>/dev/null && grep -q 'is missing fork_repo' "$SUB_LOG" 2>/dev/null; then
   ok "update-submodules read the backing checkout's own origin/master"
 else
   bad "update-submodules read the backing checkout's own origin/master" \
@@ -468,7 +471,7 @@ else
 fi
 
 # The long-standing override still outranks resolution: pointed at a checkout
-# whose origin/master has no .gitmodules, the run must find no submodule.
+# whose origin/master has no upstream-drift.json, the run must find no entry.
 OVERRIDE_LOG="$ROOT/submodule-override.log"
 expect_ok "update-submodules honours CLAUDE_SUBMODULE_REPO" \
   env HOME="$SUB_HOME" CLAUDE_SUBMODULE_REPO="$ROOT/alt-config" \

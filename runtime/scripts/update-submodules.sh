@@ -1,18 +1,27 @@
 #!/usr/bin/env bash
-# Weekly submodule updater — checks deps.dev before pinning new commits.
+# Weekly vendor updater — checks deps.dev before syncing new fork content.
 #
-# The live checkout (~/.claude) is pinned to master at the git layer
-# (.githooks/): nothing may be committed or pushed from it. So a bump is
-# proposed the same way every other change is: in a throwaway linked worktree
-# off freshly fetched origin/master, committed there, pushed as its own branch,
-# and opened as a PR. The live checkout is only READ (its .gitmodules and the
-# shared object store); its HEAD, index and working tree are never touched.
-# Once the PR merges, claude-pull.sh fast-forwards the checkout and runs
-# `git submodule update --init`, which moves the submodule itself.
+# The forks are vendored as plain files under runtime/vendor/, not as
+# submodules: a projected tree has to carry its own content, because the live
+# ~/.claude is a read-only mount of runtime/ and a gitlink projects as an empty
+# directory. So an update is a file diff, and this script produces it by
+# fetching the fork and replacing each of its tracked_paths in the tree.
 #
-# Idempotent across runs: the branch name encodes the target commit, so a bump
-# that already has a branch on origin (PR open or merged) is skipped.
+# The live checkout is pinned to master at the git layer (.githooks/): nothing
+# may be committed or pushed from it. So an update is proposed the same way
+# every other change is: in a throwaway linked worktree off freshly fetched
+# origin/master, committed there, pushed as its own branch, and opened as a PR.
+# The live checkout is only READ (its config blob and the shared object store);
+# its HEAD, index and working tree are never touched.
+#
+# Idempotent across runs: the branch name encodes the target commit, so an
+# update that already has a branch on origin (PR open or merged) is skipped.
+#
+# The filename says submodules because the weekly cron entry in nixos-config
+# names it by path. Renaming it needs that repo to move first.
 set -euo pipefail
+
+CONFIG_PATH="runtime/upstream-drift.json"
 
 # Where the checkout is: `~/.claude` before the runtime-projection cutover, the
 # backing clone after it. scripts/config-repo.sh owns that rule and explains
@@ -66,37 +75,119 @@ deps_dev_ok() {
   return 0
 }
 
-# Worktrees this run created; removed on every exit path.
+# Worktrees and fetch caches this run created; removed on every exit path.
 CREATED_WT=()
+CREATED_TMP=()
 cleanup() {
-  local wt
+  local wt dir
   for wt in "${CREATED_WT[@]+"${CREATED_WT[@]}"}"; do
     git -C "$REPO_DIR" worktree remove --force "$wt" >/dev/null 2>&1 || true
+  done
+  for dir in "${CREATED_TMP[@]+"${CREATED_TMP[@]}"}"; do
+    rm -rf -- "$dir" || true
   done
 }
 trap cleanup EXIT
 
-update_submodule() {
-  local name="$1" path="$2" url="$3"   # from origin/master's .gitmodules
+# The fork's tracked paths, as a tar stream, extracted over the vendor
+# directory. `git rm` first so a path deleted upstream disappears here too
+# instead of being left behind as a file nothing updates again.
+sync_vendor() {
+  local wt="$1" fork="$2" branch="$3" vendor_path="$4" latest="$5" excluded="$6"
+  shift 6
+  local cache
+  cache=$(mktemp -d "$WT_PARENT/claude-vendor-fetch.XXXXXX") || return 1
+  CREATED_TMP+=("$cache")
+
+  if ! git init --quiet --bare "$cache" \
+    || ! git -C "$cache" fetch --quiet --depth 1 "$fork" "refs/heads/$branch"; then
+    log "  could not fetch $branch from $fork"
+    return 1
+  fi
+  # Fetch the branch, then check it is still the commit this run decided on:
+  # fetching $latest directly needs the server to allow a SHA in want, and a
+  # branch that moved mid-run would otherwise be vendored under the wrong
+  # commit in the branch name and the recorded one.
+  local fetched
+  fetched=$(git -C "$cache" rev-parse FETCH_HEAD) || return 1
+  if [ "$fetched" != "$latest" ]; then
+    log "  $branch moved mid-run (${latest:0:8} → ${fetched:0:8}) — the next run picks it up"
+    return 2
+  fi
+
+  if ! git -C "$wt" rm -r --quiet -- "$vendor_path"; then
+    log "  could not clear $vendor_path in the worktree"
+    return 1
+  fi
+  mkdir -p "$wt/$vendor_path" || return 1
+  # A tracked path that no longer exists upstream makes git archive fail, which
+  # fails the run: a skill we consume vanishing is a thing to look at, not to
+  # vendor away silently.
+  if ! git -C "$cache" archive --format=tar FETCH_HEAD -- "$@" | tar -x -C "$wt/$vendor_path"; then
+    log "  could not extract the tracked paths of $latest"
+    return 1
+  fi
+
+  # A fork's own dev tree, dropped after extraction rather than carved out of
+  # tracked_paths: the deploy must not serve it (tests/enforced refuses test
+  # code under runtime/), but upstream's new runtime files still arrive without
+  # anyone editing this list. Absent is fine — upstream deleting its own tests
+  # is not something to look at.
+  local drops=() drop
+  [ -n "$excluded" ] && IFS=$'\x1f' read -r -a drops <<<"$excluded"
+  for drop in "${drops[@]+"${drops[@]}"}"; do
+    # An empty or climbing entry would aim this at the vendor directory itself,
+    # or above it.
+    case "$drop" in
+      "" | /* | *..*) log "  refusing to drop '$drop'"; return 1 ;;
+    esac
+    rm -rf -- "$wt/$vendor_path/$drop" || return 1
+  done
+}
+
+record_commit() {
+  local wt="$1" name="$2" old="$3" new="$4"
+  python3 - "$wt/$CONFIG_PATH" "$name" "$old" "$new" <<'PY'
+import json, sys
+
+path, name, old, new = sys.argv[1:]
+with open(path, encoding="utf-8") as fh:
+    text = fh.read()
+# Replace the commit as text rather than re-serialising: a json.dump would
+# reformat the whole file, burying the one line that changed.
+if text.count(old) != 1:
+    sys.exit(f"{old} appears {text.count(old)} time(s) in {path}; expected 1")
+with open(path, "w", encoding="utf-8") as fh:
+    fh.write(text.replace(old, new))
+with open(path, encoding="utf-8") as fh:
+    entries = json.load(fh)["entries"]
+if not any(e.get("name") == name and e.get("vendored_commit") == new for e in entries):
+    sys.exit(f"{path} does not record {new} for {name} after the edit")
+PY
+}
+
+update_entry() {
+  local name="$1" fork="$2" branch="$3" vendor_path="$4" current="$5" packed="$6" excluded="$7"
   local short
-  short=$(basename "$path")
+  short=$(basename "${vendor_path:-$name}")
 
   log "--- $short ---"
+  if [ -z "$fork" ] || [ -z "$branch" ] || [ -z "$vendor_path" ] \
+    || [ -z "$current" ] || [ -z "$packed" ]; then
+    log "  $CONFIG_PATH entry is missing fork_repo, fork_branch, vendor_path, vendored_commit or tracked_paths — skipping"
+    return 0
+  fi
+  local paths
+  IFS=$'\x1f' read -r -a paths <<<"$packed"
 
   # Extract owner/repo from https://github.com/owner/repo.git or git@github.com:owner/repo.git
   local owner_repo
-  owner_repo=$(echo "$url" | sed -E 's|.*github\.com[:/]||; s|\.git$||')
+  owner_repo=$(echo "$fork" | sed -E 's|.*github\.com[:/]||; s|\.git$||')
 
-  local current latest
-  current=$(git -C "$REPO_DIR" ls-tree origin/master -- "$path" | awk '$2 == "commit" {print $3}')
-  if [ -z "$current" ]; then
-    log "  .gitmodules lists $path but origin/master has no gitlink there — skipping"
-    return 0
-  fi
-  latest=$(git ls-remote "$url" HEAD 2>/dev/null | awk '{print $1}')
-
+  local latest
+  latest=$(git ls-remote "$fork" "refs/heads/$branch" 2>/dev/null | awk '{print $1}')
   if [ -z "$latest" ]; then
-    log "  Could not resolve upstream HEAD — skipping"
+    log "  could not resolve $branch on $fork — skipping"
     return 0
   fi
 
@@ -111,91 +202,110 @@ update_submodule() {
     return 0
   fi
 
-  local branch="chore/auto-update-${short}-${latest:0:8}"
+  local branch_name="chore/auto-update-${short}-${latest:0:8}"
   local title="chore: auto-update $short to ${latest:0:8}"
-  local body="Automated weekly bump of \`$path\` from \`${current:0:8}\` to \`${latest:0:8}\` (upstream HEAD of $url). deps.dev reported no critical/high advisories.
+  local body="Automated weekly sync of \`$vendor_path\` from \`${current:0:8}\` to \`${latest:0:8}\` (head of \`$branch\` on $fork). deps.dev reported no critical/high advisories.
 
-Opened by scripts/update-submodules.sh from a throwaway worktree; the live ~/.claude checkout was not touched. After merge, claude-pull.sh fast-forwards it and runs \`git submodule update --init\`."
+The tracked paths in \`$CONFIG_PATH\` are replaced with the fork's copy and \`vendored_commit\` records the new commit. Nothing is pinned by reference: the live ~/.claude is a read-only mount of \`runtime/\`, where a gitlink would project as an empty directory.
 
-  # This function runs as `update_submodule ... || rc=1`, a context in which
-  # bash ignores `set -e`; every step below therefore checks its own status.
-  # Without that, a commit blocked by the gitleaks pre-commit would fall
-  # through to pushing an empty branch.
-  if git -C "$REPO_DIR" ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+Opened by scripts/update-submodules.sh from a throwaway worktree; the live ~/.claude checkout was not touched."
+
+  # This function runs as `update_entry ... || rc=1`, a context in which bash
+  # ignores `set -e`; every step below therefore checks its own status. Without
+  # that, a commit blocked by the gitleaks pre-commit would fall through to
+  # pushing an empty branch.
+  if git -C "$REPO_DIR" ls-remote --exit-code --heads origin "$branch_name" >/dev/null 2>&1; then
     # The branch alone does not prove a PR exists: an earlier run may have
     # pushed it and then failed at `gh pr create`. Skipping on the branch
-    # would make that bump invisible forever, so ask GitHub.
+    # would make that update invisible forever, so ask GitHub.
     local prs
-    prs=$(cd "$REPO_DIR" && gh pr list --head "$branch" --state all --json number --jq length 2>/dev/null)
+    prs=$(cd "$REPO_DIR" && gh pr list --head "$branch_name" --state all --json number --jq length 2>/dev/null)
     if ! [[ "$prs" =~ ^[0-9]+$ ]]; then
-      log "  $branch is on origin but its PR state could not be read (gh pr list failed)"
+      log "  $branch_name is on origin but its PR state could not be read (gh pr list failed)"
       return 1
     fi
     if [ "$prs" != 0 ]; then
-      log "  $branch already on origin (PR open or merged) — nothing to do"
+      log "  $branch_name already on origin (PR open or merged) — nothing to do"
       return 0
     fi
     local pr_url
-    if pr_url=$(cd "$REPO_DIR" && gh pr create --head "$branch" --title "$title" --body "$body" 2>&1); then
-      log "  $branch was on origin without a PR (earlier run failed); opened $pr_url"
+    if pr_url=$(cd "$REPO_DIR" && gh pr create --head "$branch_name" --title "$title" --body "$body" 2>&1); then
+      log "  $branch_name was on origin without a PR (earlier run failed); opened $pr_url"
       return 0
     fi
-    log "  $branch is on origin but still has no PR: $pr_url"
+    log "  $branch_name is on origin but still has no PR: $pr_url"
     return 1
   fi
 
   # Throwaway linked worktree off fresh origin/master. A pre-existing local
   # branch of that name is a leftover of an earlier failed run of this script.
   local wt
-  wt=$(mktemp -d "$WT_PARENT/claude-submodule-bump.XXXXXX") || return 1   # empty dir: worktree add accepts it
-  git -C "$REPO_DIR" branch -D "$branch" >/dev/null 2>&1 || true
-  if ! git -C "$REPO_DIR" worktree add --quiet --no-track -b "$branch" "$wt" origin/master; then
+  wt=$(mktemp -d "$WT_PARENT/claude-vendor-bump.XXXXXX") || return 1   # empty dir: worktree add accepts it
+  git -C "$REPO_DIR" branch -D "$branch_name" >/dev/null 2>&1 || true
+  if ! git -C "$REPO_DIR" worktree add --quiet --no-track -b "$branch_name" "$wt" origin/master; then
     log "  could not create the throwaway worktree $wt"
     rmdir "$wt" 2>/dev/null || true
     return 1
   fi
   CREATED_WT+=("$wt")
 
-  # Move the gitlink without cloning the submodule: the pin is just the commit
-  # id recorded in the superproject's tree.
-  if ! git -C "$wt" update-index --cacheinfo "160000,$latest,$path" \
-    || ! git -C "$wt" commit --quiet -m "$title"; then
-    log "  could not commit the bump in $wt — nothing pushed"
+  sync_vendor "$wt" "$fork" "$branch" "$vendor_path" "$latest" "$excluded" "${paths[@]}"
+  case $? in
+    0) ;;
+    2) return 0 ;;   # the branch moved under us; nothing committed
+    *) return 1 ;;
+  esac
+  if ! record_commit "$wt" "$name" "$current" "$latest"; then
+    log "  could not record ${latest:0:8} in $CONFIG_PATH — nothing pushed"
     return 1
   fi
-  if ! git -C "$wt" push --quiet -u origin "$branch"; then
-    log "  could not push $branch"
+  if ! git -C "$wt" add -A -- "$vendor_path" "$CONFIG_PATH" \
+    || ! git -C "$wt" commit --quiet -m "$title"; then
+    log "  could not commit the update in $wt — nothing pushed"
+    return 1
+  fi
+  if ! git -C "$wt" push --quiet -u origin "$branch_name"; then
+    log "  could not push $branch_name"
     return 1
   fi
 
   local pr_url
-  if pr_url=$(cd "$wt" && gh pr create --head "$branch" --title "$title" --body "$body" 2>&1); then
-    log "  Pushed $branch and opened $pr_url"
+  if pr_url=$(cd "$wt" && gh pr create --head "$branch_name" --title "$title" --body "$body" 2>&1); then
+    log "  Pushed $branch_name and opened $pr_url"
   else
-    log "  Pushed $branch but could not open the PR (the next run retries): $pr_url"
+    log "  Pushed $branch_name but could not open the PR (the next run retries): $pr_url"
     return 1
   fi
 
   git -C "$REPO_DIR" worktree remove --force "$wt"
   CREATED_WT=()
-  git -C "$REPO_DIR" branch -D "$branch" >/dev/null 2>&1 || true
+  git -C "$REPO_DIR" branch -D "$branch_name" >/dev/null 2>&1 || true
 }
 
-log "====== Submodule update run ======"
+log "====== Vendor update run ======"
 
 # Fetch only refs/remotes/origin/master; the checkout's own refs do not move.
 git -C "$REPO_DIR" fetch --quiet origin master
 
-# Enumerate submodules from origin/master's .gitmodules, not the live working
-# tree, so an uninitialised or stale checkout cannot hide (or invent) one.
+# Enumerate from origin/master's config blob, not the live working tree, so a
+# stale or half-written checkout cannot hide (or invent) an entry.
 rc=0
-while IFS= read -r key; do
-  name=${key#submodule.}; name=${name%.path}
-  path=$(git -C "$REPO_DIR" config --blob origin/master:.gitmodules "submodule.$name.path")
-  url=$(git -C "$REPO_DIR" config --blob origin/master:.gitmodules "submodule.$name.url" || true)
-  [ -n "$url" ] || { log "--- $name --- no url in .gitmodules — skipping"; continue; }
-  update_submodule "$name" "$path" "$url" || rc=1
-done < <(git -C "$REPO_DIR" config --blob origin/master:.gitmodules --name-only --get-regexp '^submodule\..*\.path$' 2>/dev/null || true)
+while IFS=$'\t' read -r name fork branch vendor_path current packed excluded; do
+  update_entry "$name" "$fork" "$branch" "$vendor_path" "$current" "$packed" "$excluded" || rc=1
+done < <(git -C "$REPO_DIR" show "origin/master:$CONFIG_PATH" 2>/dev/null | python3 -c '
+import json, sys
+
+for entry in json.load(sys.stdin)["entries"]:
+    print("\t".join([
+        entry.get("name", ""),
+        entry.get("fork_repo", ""),
+        entry.get("fork_branch", ""),
+        entry.get("vendor_path", ""),
+        entry.get("vendored_commit", ""),
+        "\x1f".join(entry.get("tracked_paths", [])),
+        "\x1f".join(entry.get("excluded_paths", [])),
+    ]))
+' || true)
 
 log "====== Done ======"
 exit "$rc"

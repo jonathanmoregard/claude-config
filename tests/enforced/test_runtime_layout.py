@@ -52,8 +52,7 @@ def run(root: Path, *args: str) -> subprocess.CompletedProcess:
 
 
 def make_repo(root: Path, files: dict[str, str],
-              links: dict[str, str] | None = None,
-              submodules: tuple[str, ...] = ()) -> Path:
+              links: dict[str, str] | None = None) -> Path:
     for rel, body in files.items():
         target = root / rel
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -64,12 +63,6 @@ def make_repo(root: Path, files: dict[str, str],
         target.symlink_to(dest)
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
     subprocess.run(["git", "add", "-A"], cwd=root, check=True)
-    # A real gitlink, because the verifier now reads submodule paths out of the
-    # index rather than matching a hardcoded list of them.
-    for rel in submodules:
-        subprocess.run(
-            ["git", "update-index", "--add", "--cacheinfo",
-             f"160000,{'0' * 39}1,{rel}"], cwd=root, check=True)
     return root
 
 
@@ -288,13 +281,13 @@ def test_a_dangling_link_inside_the_projection_fails_verify(tmp_path):
 def test_an_unverifiable_link_is_named_rather_than_passed(tmp_path):
     """Not every target can be checked here, so those are counted, not claimed.
 
-    `git worktree add` does not initialise submodules, so the vendored trees
-    are empty in most checkouts and CI never fetches them. That is a real
+    An absolute target is machine-specific: the allowlisted checkout is present
+    on the one machine and absent everywhere else, CI included. That is a real
     limit, and the summary has to say so instead of reporting a clean run.
     """
     root = make_repo(tmp_path, {"runtime/hooks/guard.py": "pass\n"},
-                     {"runtime/skills/x": "../vendor/superpowers/skills/x"},
-                     submodules=("runtime/vendor/superpowers",))
+                     {"runtime/skills/x":
+                      f"{layout.ALLOWED_ABSOLUTE[0]}/skills/absent-here"})
     proc = run(root, "--verify")
     assert proc.returncode == 0
     assert "not checkable here" in proc.stdout

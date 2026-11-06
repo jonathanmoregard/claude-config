@@ -1,9 +1,0 @@
-[submodule "skills/prompt-master"]
-	path = skills/prompt-master
-	url = https://github.com/nidhinjs/prompt-master.git
-[submodule "vendor/superpowers"]
-	path = runtime/vendor/superpowers
-	url = https://github.com/jonathanmoregard/superpowers.git
-[submodule "vendor/everything-claude-code"]
-	path = runtime/vendor/everything-claude-code
-	url = https://github.com/jonathanmoregard/everything-claude-code.git

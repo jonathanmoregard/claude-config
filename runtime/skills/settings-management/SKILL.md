@@ -48,13 +48,14 @@ of the diff is not the criterion, the ownership of the branch is.
 | `CLAUDE.md` | global instructions |
 
 A `skills/<name>` entry that is a **symlink** belongs to another repo
-(`~/Repos/router-agent`, `/nix/store`), or to a pinned submodule under
+(`~/Repos/router-agent`, `/nix/store`), or to a vendored copy under
 `vendor/` (`vendor/superpowers` = github.com/jonathanmoregard/superpowers,
 `vendor/everything-claude-code` =
 github.com/jonathanmoregard/everything-claude-code). Editing it
 from here lands the change in that repo, fails on a read-only store path, or
-edits a pinned copy. Route it through the owning repo's own PR flow; a
-`vendor/` pin then moves by a `~/.claude` PR.
+edits a vendored copy the next sync overwrites. Route it through the owning
+repo's own PR flow; `scripts/update-submodules.sh` then opens the `~/.claude`
+PR that re-vendors it.
 
 ## Ephemeral files → `tmp/`
 
