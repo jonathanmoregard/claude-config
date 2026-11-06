@@ -182,16 +182,28 @@ def test_vscodium_drift_classes_speak_and_name_items(tmp_path):
     # nixos-config's home/vscodium.nix merges declared over live, so undeclared
     # keys survive reboot and deploy but not a fresh install, and declared keys
     # edited in the UI get reverted. Both are promotable by the session.
+    # Each case carries the phrase that makes its hint actionable, because
+    # the three say different things. An undeclared cosmetic key is lost on
+    # a fresh install; an undeclared SECURITY key is the opposite problem --
+    # it survives every deploy -- so a hint about fresh installs would be
+    # the wrong advice there.
     cases = {
-        "VSCodium settings live but not declared": "editor.minimap.enabled",
+        "VSCodium settings live but not declared":
+            ("editor.minimap.enabled", "fresh install"),
         "VSCodium settings overwritten by the declared config":
-            "editor.fontSize  (scalar, discarded 3x, first 2026-11-01)",
+            ("editor.fontSize  (scalar, discarded 3x, first 2026-11-01)",
+             "change the declaration"),
+        # The escalated variant: an undeclared key that disarms a guard is
+        # the same shape on disk as an undeclared font size, and the merge
+        # preserves both, so it needs its own heading to be its own finding.
+        "VSCodium security settings live but not declared":
+            ("security.workspace.trust.enabled", "PRESERVES"),
     }
-    for i, (heading, item) in enumerate(cases.items()):
+    for i, (heading, (item, phrase)) in enumerate(cases.items()):
         ctx = _context(_run(_setup(tmp_path / f"v{i}", [_section(heading, [item])])))
         assert heading in ctx, (heading, ctx)
         assert item in ctx, (heading, ctx)
-        assert "fresh install" in ctx or "declaration" in ctx, ctx
+        assert phrase in ctx, (heading, phrase, ctx)
 
 
 def _failure_section(heading: str) -> str:
@@ -242,6 +254,28 @@ def test_vscodium_failure_and_drift_are_reported_under_distinct_headlines(tmp_pa
     assert "reported a failure" in ctx
     assert "lost or unreproducible on rebuild" in ctx
     assert ctx.index("reported a failure") < ctx.index("lost or unreproducible")
+
+
+def test_a_report_hitting_every_class_stays_under_the_output_cap():
+    # Hook output strings cap at 10,000 characters and over it the payload is
+    # dropped, not truncated -- a silent total failure of the channel. Relaying
+    # twelve headings instead of six halves the headroom, so pin it: every
+    # class at once, each with more items than MAX_ITEMS.
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("drift_health", HOOK)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    worst = sum(
+        len(f"  - {heading}: {shown}{more} — {hint}\n")
+        for classes in (mod.CLASSES, mod.FAILURES)
+        for heading, hint in classes.items()
+        for shown in [", ".join("some.rather.long.setting.path" for _ in range(mod.MAX_ITEMS))]
+        for more in [" (+99 more)"]
+    )
+    # Two headlines, the report path, and the additionalContext preamble.
+    worst += 400
+    assert worst < 10000, worst
 
 
 def test_registered_on_session_start():

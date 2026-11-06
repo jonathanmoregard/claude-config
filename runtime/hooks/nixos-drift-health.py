@@ -71,6 +71,12 @@ CLASSES: dict[str, str] = {
     "Imperative nix-env packages":
         "installed with nix-env; declare in home.packages or "
         "environment.systemPackages",
+    "VSCodium security settings live but not declared":
+        "live-only keys that decide what is allowed to run or what gets "
+        "verified (security.*, task.allowAutomaticTasks, git.allow*, "
+        "telemetry.*, chat.tools.autoApprove); the merge PRESERVES them, so "
+        "a value set once outlasts every deploy — declare it in nixos-config "
+        "home/vscodium.nix so the declared value wins, or clear it in the UI",
     "VSCodium settings live but not declared":
         "set in VSCodium's UI and kept by the merge in nixos-config "
         "home/vscodium.nix (declared wins, undeclared survives reboot and "
