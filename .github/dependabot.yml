@@ -12,9 +12,13 @@ multi-ecosystem-groups:
       time: "05:17"
       timezone: "Europe/Stockholm"
 
+# Both roots sit under `runtime/` because that is the only tree the deploy
+# serves. Dependabot reports a bad `directory` on the repository's Dependabot
+# page and opens nothing, so a stale path here is silently inert rather than
+# loud: re-check these against the tree whenever the layout moves.
 updates:
   - package-ecosystem: "pip"
-    directory: "/tools/ghostty-mcp"
+    directory: "/runtime/tools/ghostty-mcp"
     patterns: ["*"]
     multi-ecosystem-group: "weekly-dependencies"
     rebase-strategy: "disabled"
@@ -24,7 +28,7 @@ updates:
       semver-patch-days: 3
 
   - package-ecosystem: "nix"
-    directory: "/skills/visual-verify"
+    directory: "/runtime/skills/visual-verify"
     patterns: ["*"]
     multi-ecosystem-group: "weekly-dependencies"
     rebase-strategy: "disabled"
