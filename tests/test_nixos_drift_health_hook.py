@@ -178,6 +178,72 @@ def test_unreadable_report_does_not_break_startup(tmp_path):
         assert "UNVERIFIED" in _context(proc)
 
 
+def test_vscodium_drift_classes_speak_and_name_items(tmp_path):
+    # nixos-config's home/vscodium.nix merges declared over live, so undeclared
+    # keys survive reboot and deploy but not a fresh install, and declared keys
+    # edited in the UI get reverted. Both are promotable by the session.
+    cases = {
+        "VSCodium settings live but not declared": "editor.minimap.enabled",
+        "VSCodium settings overwritten by the declared config":
+            "editor.fontSize  (scalar, discarded 3x, first 2026-11-01)",
+    }
+    for i, (heading, item) in enumerate(cases.items()):
+        ctx = _context(_run(_setup(tmp_path / f"v{i}", [_section(heading, [item])])))
+        assert heading in ctx, (heading, ctx)
+        assert item in ctx, (heading, ctx)
+        assert "fresh install" in ctx or "declaration" in ctx, ctx
+
+
+def _failure_section(heading: str) -> str:
+    # Shape the tool actually emits: key/value metadata then a prose paragraph.
+    return _section(heading, [
+        "at:     2026-11-06T09:00:00+01:00",
+        "status: 1",
+        "",
+        "Declared settings were NOT applied and the live file was left as it "
+        "was. Inspect: journalctl --user -u home-manager-$USER.service",
+    ])
+
+
+def test_each_vscodium_mechanism_failure_speaks(tmp_path):
+    # These four were invisible before: CLASSES is an allowlist, so a merge
+    # that failed outright reached no session. A desktop toast is the only
+    # other channel and it is gone by the next session.
+    headings = [
+        "VSCodium settings merge failed at activation",
+        "VSCodium settings file does not parse",
+        "VSCodium drift recorder failed during activation",
+        "VSCodium settings could not be compared",
+    ]
+    for i, heading in enumerate(headings):
+        ctx = _context(_run(_setup(tmp_path / f"f{i}", [_failure_section(heading)])))
+        assert heading in ctx, (heading, ctx)
+        assert "reported a failure" in ctx, (heading, ctx)
+
+
+def test_vscodium_failure_does_not_echo_its_prose_body(tmp_path):
+    # The hint carries the meaning; echoing the section body would paste a
+    # whole paragraph into every session's context as one smushed line.
+    heading = "VSCodium settings merge failed at activation"
+    ctx = _context(_run(_setup(tmp_path, [_failure_section(heading)])))
+    assert "status: 1" not in ctx, ctx
+    assert "Inspect: journalctl --user" not in ctx, ctx
+    assert "declared settings were NOT applied" in ctx, ctx
+
+
+def test_vscodium_failure_and_drift_are_reported_under_distinct_headlines(tmp_path):
+    # A failed merge did not "drift"; the declaration may never have applied.
+    # One headline cannot carry both sentences truthfully.
+    env = _setup(tmp_path, [
+        _failure_section("VSCodium settings merge failed at activation"),
+        _section("VSCodium settings live but not declared", ["editor.wordWrap"]),
+    ])
+    ctx = _context(_run(env))
+    assert "reported a failure" in ctx
+    assert "lost or unreproducible on rebuild" in ctx
+    assert ctx.index("reported a failure") < ctx.index("lost or unreproducible")
+
+
 def test_registered_on_session_start():
     settings = json.loads((RUNTIME / "settings.json").read_text())
     cmds = [h["command"] for e in settings["hooks"]["SessionStart"] for h in e["hooks"]]
