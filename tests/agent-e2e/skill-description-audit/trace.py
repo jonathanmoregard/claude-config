@@ -71,10 +71,17 @@ PROGRAMS = frozenset((
 # closed-set discipline as FILES and PROGRAMS. An unrecognised value becomes
 # `other` rather than None, so a wall is still visible in the accounting
 # without the exported string ever being one the agent chose.
+#
+# `completed` is in here because a clean live run exported `terminal_reason:
+# other` without it -- measured, not guessed. Values this set does not name
+# still read as `other`, which is the intended outcome rather than a gap to
+# keep patching: it says "something unusual" without saying what the agent
+# wrote.
 OUTCOMES = frozenset((
-    "success", "error", "error_max_turns", "error_during_execution",
-    "end_turn", "max_tokens", "stop_sequence", "tool_use", "refusal",
-    "pause_turn", "budget", "timeout", "cancelled", "wall", "model_error",
+    "success", "completed", "error", "error_max_turns",
+    "error_during_execution", "end_turn", "max_tokens", "stop_sequence",
+    "tool_use", "refusal", "pause_turn", "budget", "timeout", "cancelled",
+    "wall", "model_error",
 ))
 LABELS = ("subtype", "stop_reason", "terminal_reason")
 COUNTS = ("num_turns", "duration_ms")
