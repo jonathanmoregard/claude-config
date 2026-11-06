@@ -179,6 +179,98 @@ def test_pr_unreadable_checks_and_green_runs_exit_zero(tmp_path: Path) -> None:
     assert "failed=0" in out, out
 
 
+NO_CHECKS = {"rc": 1, "stderr": "no checks reported on the 'feat/x' branch"}
+
+
+def test_pr_no_checks_yet_keeps_waiting_while_a_run_is_live(tmp_path: Path) -> None:
+    # 2026-11-05: pushing to PR #404 moved its head, so the old run's checks
+    # stopped attaching and the new run had not registered yet. `gh pr checks`
+    # said "no checks reported" for longer than the 3-retry grace, and wait-for
+    # reported `checks=none` and EXIT 0 -- which reads as "CI passed".
+    # Actions still had a queued run for the head the whole time.
+    script = {"gh": {
+        "pr view": [{"stdout": {"state": "OPEN", "mergeable": "MERGEABLE",
+                                "mergeStateStatus": "CLEAN", "headRefOid": "abc123"}}],
+        "pr checks": [NO_CHECKS] * 5 + [{"stdout": [{"bucket": "pass"}]}],
+        "run list": [{"stdout": [{"status": "queued", "conclusion": "", "name": "ci"}]}],
+    }}
+    rc, out, calls = run_wait_for(tmp_path, script, "pr", "404", "-R", "o/r")
+    assert sum(c.startswith("gh pr checks") for c in calls) >= 6, calls
+    assert "checks=present" in out, out
+    assert "failed=0" in out, out
+    assert rc == 0, out
+
+
+def test_pr_no_checks_waits_past_the_grace_window_while_a_run_is_live(
+    tmp_path: Path,
+) -> None:
+    # The case above is satisfied by any longer fixed grace, so it does not
+    # constrain WHY the wait continues -- verified by mutation: forcing the
+    # liveness probe to false left it green. This one cannot be: 15 "no
+    # checks" replies outlast the 12-step grace, so only resetting the
+    # countdown on a live run gets to the checks. A queued run on a contended
+    # runner really does sit this long.
+    script = {"gh": {
+        "pr view": [{"stdout": {"state": "OPEN", "mergeable": "MERGEABLE",
+                                "mergeStateStatus": "CLEAN", "headRefOid": "abc123"}}],
+        "pr checks": [NO_CHECKS] * 15 + [{"stdout": [{"bucket": "pass"}]}],
+        "run list": [{"stdout": [{"status": "in_progress", "conclusion": "",
+                                  "name": "ci"}]}],
+    }}
+    rc, out, calls = run_wait_for(tmp_path, script, "pr", "404", "-R", "o/r")
+    assert sum(c.startswith("gh pr checks") for c in calls) >= 16, calls
+    assert "checks=present" in out, out
+    assert rc == 0, out
+
+
+def test_pr_no_checks_gives_up_once_no_run_is_live(tmp_path: Path) -> None:
+    # The counterpart: the countdown must still expire when nothing is live,
+    # so a PR that genuinely never gets CI does not hang until --timeout.
+    script = {"gh": {
+        "pr view": [{"stdout": {"state": "OPEN", "mergeable": "MERGEABLE",
+                                "mergeStateStatus": "CLEAN", "headRefOid": "abc123"}}],
+        "pr checks": [NO_CHECKS] * 15 + [{"stdout": [{"bucket": "pass"}]}],
+        "run list": [{"stdout": [{"status": "completed", "conclusion": "success",
+                                  "name": "ci"}]}],
+    }}
+    rc, out, calls = run_wait_for(tmp_path, script, "pr", "404", "-R", "o/r")
+    assert sum(c.startswith("gh pr checks") for c in calls) <= 13, calls
+    assert "checks=none" in out, out
+    assert rc == 3, out
+
+
+def test_pr_no_checks_and_no_runs_is_not_reported_as_a_pass(tmp_path: Path) -> None:
+    # The same line with nothing live behind it: no checks AND no run for the
+    # head. That is not evidence CI passed, so it must not exit 0.
+    script = {"gh": {
+        "pr view": [{"stdout": {"state": "OPEN", "mergeable": "MERGEABLE",
+                                "mergeStateStatus": "CLEAN", "headRefOid": "abc123"}}],
+        "pr checks": [NO_CHECKS],
+        "run list": [{"stdout": []}],
+    }}
+    rc, out, _ = run_wait_for(tmp_path, script, "pr", "404", "-R", "o/r")
+    assert "checks=none" in out, out
+    assert rc == 3, out
+
+
+def test_pr_unreadable_failure_count_is_not_reported_as_a_pass(tmp_path: Path) -> None:
+    # Checks exist, but the bucket query that produces the verdict fails, so
+    # `failed=?`. The watch exit code is not consulted for the verdict, so a
+    # `?` left this returning 0 as well.
+    script = {"gh": {
+        "pr view": [{"stdout": {"state": "OPEN", "mergeable": "MERGEABLE",
+                                "mergeStateStatus": "CLEAN", "headRefOid": "abc123"}}],
+        "pr checks": [
+            {"stdout": [{"bucket": "pass"}]},
+            {"rc": 0},
+            {"rc": 1, "stderr": "GraphQL: something transient"},
+        ],
+    }}
+    rc, out, _ = run_wait_for(tmp_path, script, "pr", "404", "-R", "o/r")
+    assert "failed=?" in out, out
+    assert rc == 3, out
+
+
 def test_transient_unit_is_not_done_while_its_job_runs(tmp_path: Path) -> None:
     # 2026-10-03: a `systemd-run --user` gate (Type=simple, Transient=yes)
     # counted as "up" the moment it was active.
