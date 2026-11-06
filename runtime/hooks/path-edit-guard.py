@@ -99,11 +99,11 @@ REASON = (
     "`gh pr create`. The merge click is Jonathan's. Never commit to a branch "
     "this session did not create.\n\n"
     "If {rel} is a symlink into another repo (~/Repos/router-agent, "
-    "/nix/store, ...) or sits in a vendored submodule (vendor/superpowers, "
-    "vendor/everything-claude-code, pinned from the jonathanmoregard forks "
-    "on GitHub), edit it in that "
-    "repo and route it through that repo's own PR flow; a submodule pin "
-    "moves only by a ~/.claude PR."
+    "/nix/store, ...) or sits in a vendored copy (vendor/superpowers, "
+    "vendor/everything-claude-code, synced from the jonathanmoregard forks "
+    "on GitHub), edit it in that repo and route it through that repo's own PR "
+    "flow; the vendored copy moves only by a ~/.claude PR, and an edit made "
+    "here is overwritten by the next sync."
 )
 
 CODEX_REASON = (

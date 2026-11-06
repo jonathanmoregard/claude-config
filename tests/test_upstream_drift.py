@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import posixpath
 import re
 import subprocess
 import sys
@@ -53,7 +54,8 @@ class Repos:
             "name": "sp",
             "fork_repo": str(self.fork), "fork_branch": "main",
             "upstream_url": str(self.upstream), "upstream_branch": "main",
-            "pin": "vendor/sp",
+            "vendor_path": "vendor/sp",
+            "vendored_commit": "0" * 40,
             "tracked_paths": ["hooks", "skills/brainstorming"],
             "customized_paths": ["skills/brainstorming"],
         }]}))
@@ -187,18 +189,78 @@ def test_unreachable_fork_fails_loudly(repos):
 
 
 def test_every_vendored_skill_link_is_tracked():
-    """A skills/ symlink into an entry's pin must be on its tracked paths, or
-    upstream changes to that skill would never surface as drift."""
+    """A skills/ symlink into an entry's vendor_path must be on its tracked
+    paths, or upstream changes to that skill would never surface as drift."""
     entries = json.loads(CONFIG.read_text())["entries"]
     for entry in entries:
-        # Match on the pin, not on a fixed number of `..` hops. The farm is
-        # spelled `../vendor/x` while skills/ sits at the repository root and
-        # `../../vendor/x` once it has moved under runtime/, and both name the
-        # same submodule -- which is all this assertion is about.
-        marker = f"/{entry['pin']}/"
-        linked = {os.readlink(p).split(marker, 1)[1]
-                  for p in (RUNTIME / "skills").iterdir()
-                  if p.is_symlink() and marker in os.readlink(p)}
-        assert linked, f"no skills link into {entry['pin']}"
+        # Resolve each link against its own directory and compare to the vendor
+        # path, rather than looking for that path inside the link text. The farm
+        # is spelled relatively (`../vendor/x`), so the vendor path's own prefix
+        # -- `runtime/` -- never appears in it.
+        root = posixpath.join(
+            RUNTIME.relative_to(REPO_ROOT).as_posix(), "skills")
+        vendor = entry["vendor_path"]
+        linked = set()
+        for p in (RUNTIME / "skills").iterdir():
+            if not p.is_symlink():
+                continue
+            target = os.readlink(p)
+            if target.startswith("/"):
+                continue
+            resolved = posixpath.normpath(posixpath.join(root, target))
+            if resolved.startswith(vendor + "/"):
+                linked.add(resolved[len(vendor) + 1:])
+        assert linked, f"no skills link into {vendor}"
         assert linked <= set(entry["tracked_paths"]), linked - set(entry["tracked_paths"])
         assert set(entry["customized_paths"]) <= set(entry["tracked_paths"])
+
+
+def test_tracked_paths_are_exactly_what_is_vendored():
+    """scripts/update-submodules.sh syncs tracked_paths and nothing else, so a
+    vendored path missing from the list would stop being updated while still
+    being served, and a listed path absent from the tree would fail the sync."""
+    for entry in json.loads(CONFIG.read_text())["entries"]:
+        vendor = REPO_ROOT / entry["vendor_path"]
+        tracked = set(entry["tracked_paths"])
+        on_disk = set()
+        excluded = entry.get("excluded_paths", [])
+        for path in vendor.rglob("*"):
+            rel = path.relative_to(vendor).as_posix()
+            assert not any(rel == x or rel.startswith(x + "/") for x in excluded), \
+                f"{entry['name']} vendors an excluded path: {rel}"
+            # The list is a mix of depths (`LICENSE`, `hooks`, `skills/x`), so a
+            # path counts as covered by a listed ancestor, and a directory also
+            # counts when it merely leads to one (`skills/` itself).
+            if any(rel == t or rel.startswith(t + "/") or t.startswith(rel + "/")
+                   for t in tracked):
+                continue
+            on_disk.add(rel)
+        assert not on_disk, f"{entry['name']} vendors untracked paths: {sorted(on_disk)[:5]}"
+        assert all((vendor / t).exists() for t in tracked
+                   if not any(t == x or t.startswith(x + "/") for x in excluded)), \
+            [t for t in sorted(tracked) if not (vendor / t).exists()]
+        # An exclusion outside tracked_paths drops nothing and reads as if it
+        # did, which is the failure mode of a deny list nobody rechecks.
+        assert all(any(x.startswith(t + "/") or x == t for t in tracked)
+                   for x in excluded), excluded
+
+
+def test_every_vendored_file_is_tracked():
+    """runtime/vendor/ is the forks' only copy here, so a repo-wide .gitignore
+    pattern matching one of their files would serve a half-skill and no sync
+    would ever restore it. `*.jsonl` did exactly that to two skill-comply
+    fixtures until the vendor tree was negated back in."""
+    for entry in json.loads(CONFIG.read_text())["entries"]:
+        vendor = entry["vendor_path"]
+        listed = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "ls-files", "-z", "--", vendor],
+            check=True, capture_output=True, text=True).stdout
+        tracked = set(filter(None, listed.split("\0")))
+        on_disk = {p.relative_to(REPO_ROOT).as_posix()
+                   for p in (REPO_ROOT / vendor).rglob("*") if p.is_file()}
+        assert not on_disk - tracked, sorted(on_disk - tracked)
+
+
+def test_every_entry_records_the_commit_it_was_vendored_from():
+    for entry in json.loads(CONFIG.read_text())["entries"]:
+        assert re.fullmatch(r"[0-9a-f]{40}", entry["vendored_commit"]), entry["name"]

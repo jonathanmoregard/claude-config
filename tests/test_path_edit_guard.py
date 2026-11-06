@@ -147,11 +147,17 @@ def test_symlinked_skill_entry_is_refused_and_redirected():
     assert "symlink" in reason
 
 
-def test_vendored_submodule_is_refused_and_redirected():
-    """A vendor/ submodule is a pinned copy of another repo: edit it there."""
+def test_vendored_copy_is_refused_and_redirected():
+    """A vendor/ tree is a synced copy of another repo: edit it there.
+
+    The redirect has to say the next sync overwrites a local edit, which is the
+    part a reader cannot infer from the files -- they are ordinary tracked files
+    now, not a gitlink that visibly belongs elsewhere.
+    """
     reason = assert_denied(write_payload(
         os.path.join(LIVE, "vendor/superpowers/skills/brainstorming/SKILL.md")))
-    assert "submodule" in reason
+    assert "vendored copy" in reason
+    assert "next sync" in reason
 
 
 # --- live Codex tree is sync/runtime-owned, never agent-edited --------------

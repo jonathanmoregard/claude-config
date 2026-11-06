@@ -51,7 +51,7 @@ PROJECTED = (
     "agents", "bin", "commands", "dev-container", "ecc", "egress_guard",
     "hooks", "mcp-configs", "mcps", "permission-ledger",
     "recursive-self-improvement", "scripts", "skills", "templates", "todo",
-    "tools", "wellbeing", "workers",
+    "tools", "vendor", "wellbeing", "workers",
     # configuration the harness reads
     "CLAUDE.md", ".claude-powerline.json", "claude-powerline.json", "dcg.toml",
     "egress-sinks.json", "mcp-servers.json", "settings.json",
@@ -80,16 +80,7 @@ DEV_ONLY = (
 )
 
 # Stays at the repository root and is not part of `runtime/`.
-#
-# `vendor/` is the interesting one: two git submodules, and only four subpaths
-# inside them are projected (`superpowers/{hooks,skills,package.json}` and
-# `everything-claude-code/skills`), each by its own bind mount at
-# `~/.claude/vendor/...`. The rest -- a nested `.claude/` with its own skills,
-# rules and commands, plus `tests/`, `examples/`, `src/` and some 455 further
-# instruction files -- stays out of the namespace entirely. A gitlink cannot be
-# moved under `runtime/` without rewriting `.gitmodules` for no gain, and it
-# must not be: the projection has to be per-subpath.
-ROOT_ONLY = (".gitignore", ".gitmodules", "vendor")
+ROOT_ONLY = (".gitignore",)
 
 # `settings.json` is projected, but **how** is still open: it is written at
 # runtime (the live model pin is a tracked modification right now), so either
@@ -98,17 +89,10 @@ ROOT_ONLY = (".gitignore", ".gitmodules", "vendor")
 # script -- the canonical copy belongs with the rest of the configuration.
 WRITTEN_AT_RUNTIME = ("settings.json",)
 
-# Where the mount geometry shows up in this script. `runtime/` sits exactly one
-# level below the repository root, and the mounted view reproduces that: a
-# symlink at `runtime/skills/x` pointing `../../vendor/y` resolves to
-# `<repo>/vendor/y` on disk and to `~/.claude/vendor/y` under the mounts, which
-# is where the four vendor binds are. So one extra `..` is the whole fix for
-# the 33-entry skill farm, and it is correct on both sides at once.
-#
-# A relative target that escapes the repository cannot have that property --
-# `skills/review-inbox -> ../../Repos/router-agent/...` would resolve to
+# A relative target that escapes the repository cannot resolve on both sides:
+# `skills/review-inbox -> ../../Repos/router-agent/...` would reach
 # `~/Repos/router-agent/...` on disk and `~/router-agent/...` under the mounts.
-# Those links must become absolute.
+# Those links must be absolute.
 HOME = "/home/jonathan"
 
 # The only absolute targets a tracked symlink may have.
@@ -209,11 +193,9 @@ def retarget(path: str, target: str) -> str | None:
                                  runtime/ together and the hop is unchanged.
                                  Adding a `..` here points at <repo>/hooks/y,
                                  which nothing will occupy.
-      skills/x -> ../vendor/y    vendor/ stays at the repository root, so the
-                                 link has one more level to climb. `../../`
-                                 is then right on disk *and* under the mounts,
-                                 because runtime/ sits exactly one level down
-                                 and the mount reproduces that.
+      skills/x -> ../vendor/y    same: `vendor/` is projected too, so it
+                                 descends with everything else and the hop is
+                                 unchanged.
 
     A hop that stays inside the moved entry moves with it. Absolute targets
     resolve the same from any depth. A relative target that leaves the
@@ -322,14 +304,8 @@ def verify(root: Path) -> int:
     #                                 that silently stops loading.
     #
     # Existence is not always answerable here, so the third outcome is named
-    # rather than folded into a pass: an absolute target is machine-specific,
-    # and the vendored submodules are empty in every `git worktree add` tree
-    # because that command does not initialise them. Those are reported and
-    # counted, never counted as verified.
-    allowed_outside = (
-        "vendor/superpowers/hooks", "vendor/superpowers/skills",
-        "vendor/superpowers/package.json", "vendor/everything-claude-code/skills",
-    )
+    # rather than folded into a pass: an absolute target is machine-specific.
+    # Those are reported and counted, never counted as verified.
     checked = 0
     unverifiable: list[str] = []
     for line in git("ls-files", "-s", RUNTIME_DIR, cwd=root).splitlines():
@@ -372,9 +348,7 @@ def verify(root: Path) -> int:
         resolved = posixpath.normpath(
             posixpath.join(posixpath.dirname(path), target))
         in_runtime = resolved == RUNTIME_DIR or resolved.startswith(RUNTIME_DIR + "/")
-        vendored = next((a for a in allowed_outside
-                         if resolved == a or resolved.startswith(a + "/")), None)
-        if not in_runtime and not vendored:
+        if not in_runtime:
             failures.append(
                 f"{path} -> {target} leaves {RUNTIME_DIR}/ for {resolved}, which "
                 "is not a projected path")
@@ -382,13 +356,6 @@ def verify(root: Path) -> int:
         if exists:
             checked += 1
             continue
-        if vendored:
-            submodule = root / "/".join(vendored.split("/")[:2])
-            uninitialised = not submodule.is_dir() or not any(submodule.iterdir())
-            if uninitialised:
-                unverifiable.append(
-                    f"{path} -> {target} ({submodule.name} is not initialised)")
-                continue
         failures.append(f"{path} -> {target} dangles: nothing at {resolved}")
 
     # Only entries this repository actually tracks -- the manifest lists what

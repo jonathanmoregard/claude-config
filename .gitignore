@@ -392,3 +392,9 @@ tasks
 # is untracked here, so an unignored spine would be committed straight back in.
 /proposals
 /recursive-self-improvement/proposals
+
+# The vendored forks are content, not local state: runtime/vendor/ is their
+# only copy here, so a repo-wide pattern eating part of one would silently
+# serve a half-skill. `*.jsonl` already did, to two skill-comply fixtures.
+# Last rule wins, so this has to stay at the end of the file.
+!runtime/vendor/**

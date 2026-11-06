@@ -3,8 +3,8 @@
 # `pull_request` only, never `pull_request_target`: this repository's own
 # branches are not forks and do get secrets, and GitHub Security Lab names
 # "write their payload as a new test that will be run with others" as the
-# matching attack. So the job takes no secrets, declares read-only
-# permissions, and never fetches the vendored submodules.
+# matching attack. So the job takes no secrets and declares read-only
+# permissions.
 #
 # This is the enforcement point on purpose. A client-side git hook is not one:
 # `git push --no-verify` skips it, and `core.hooksPath` is local config any
@@ -167,9 +167,10 @@ jobs:
       # print the matched string into a world-readable log. `--exit-code 1` is
       # explicit rather than relying on the default.
       #
-      # A fresh checkout here has no populated `vendor/` submodules (this job
-      # never fetches them) and no `__pycache__`, so what this scans is this
-      # repository's own tracked content. It runs BEFORE the test steps for
+      # A fresh checkout has no `__pycache__`, so what this scans is this
+      # repository's tracked content -- which now includes the vendored forks
+      # under `runtime/vendor/`, since those are plain files rather than
+      # unfetched submodules. It runs BEFORE the test steps for
       # the obvious reason -- a leaked credential should fail fast -- but it
       # does not DEPEND on running first: `.gitleaks.toml` exempts compiled
       # bytecode precisely so that the verdict cannot depend on whether a test

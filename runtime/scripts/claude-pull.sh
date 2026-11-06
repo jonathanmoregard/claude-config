@@ -290,9 +290,11 @@ sync_submodules() {
 }
 
 # Report ok only when every submodule is checked out AT THE PINNED COMMIT.
-# Skills link into vendor/, so an empty submodule is missing skills and a
-# submodule a commit behind the pin is serving the wrong skills — neither is a
-# healthy checkout. `git submodule status` distinguishes them: `-` for never
+# Nothing in this repository is a submodule any more (runtime/vendor/ holds
+# plain files, because a gitlink projects into ~/.claude as an empty
+# directory), so this is inert here and stays for the next one: an empty
+# submodule is missing content and one a commit behind the pin is serving the
+# wrong content. `git submodule status` distinguishes them: `-` for never
 # initialized, `+` for initialized but not at the commit the superproject
 # records. Checking only `-` is what let a failed `git submodule update` pass
 # as ok while the superproject went on fast-forwarding past it.
@@ -326,9 +328,9 @@ finish_ok() {
   clear_alert
 }
 
-# A submodule whose checkout failed stays wrong until something retries it, and
-# skills load through vendor/superpowers. So a tick with nothing to pull still
-# retries any submodule that is not where the superproject pins it: `-` for one
+# A submodule whose checkout failed stays wrong until something retries it, so
+# a tick with nothing to pull still retries any submodule that is not where the
+# superproject pins it: `-` for one
 # that was never checked out, `+` for one left at an older commit by a failed
 # `git submodule update`. The `+` case is why this cannot gate on `-` alone —
 # once the superproject is current, no later tick fast-forwards, so without

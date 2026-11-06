@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Does the projected layout actually resolve once it is mounted?
 #
-# The layout rests on one geometric claim: `runtime/` sits exactly one level
-# below the repository root, and the mounted view reproduces that, so a skill
-# symlink spelled `../../vendor/y` reaches `<repo>/vendor/y` on disk and
-# `~/.claude/vendor/y` under the mounts. If that is wrong, 33 skills break at
-# cutover and the mistake is invisible in the diff.
+# Everything the deploy serves lives under `runtime/`, submodules included, so
+# a skill symlink spelled `../vendor/y` reaches `runtime/vendor/y` on disk and
+# `~/.claude/vendor/y` under the mounts -- one hop, both sides, no dependence
+# on where `runtime/` sits. If that is wrong, 33 skills break and the mistake
+# is invisible in the diff.
 #
 # So this builds the real thing in miniature -- bind mounts, not symlinks,
 # because a symlink would resolve `..` against the target and quietly give the
@@ -43,8 +43,8 @@ RIG=$(mktemp -d)
 trap 'chmod -R u+w "$RIG" 2>/dev/null; command rm -rf -- "$RIG"' EXIT
 
 mkdir -p "$RIG/mnt/runtime" \
-         "$RIG/mnt/vendor/superpowers/skills" \
-         "$RIG/mnt/vendor/everything-claude-code/skills" \
+         "$RIG/mnt/runtime/vendor/superpowers/skills" \
+         "$RIG/mnt/runtime/vendor/everything-claude-code/skills" \
          "$RIG/stub/superpowers/skills/brainstorming" \
          "$RIG/stub/ecc/skills/accessibility"
 echo SUPERPOWERS > "$RIG/stub/superpowers/skills/brainstorming/SKILL.md"
@@ -53,7 +53,7 @@ echo ECC         > "$RIG/stub/ecc/skills/accessibility/SKILL.md"
 # `~/.claude/<entry>` is a declared symlink into the single runtime mount. This
 # is the shape home-manager will write, so the probe uses it rather than
 # mounting each entry separately.
-for entry in skills hooks scripts agents commands; do
+for entry in skills hooks scripts agents commands vendor; do
   ln -sfn "runtime/$entry" "$RIG/mnt/$entry"
 done
 
@@ -103,8 +103,10 @@ PROBE
 
 bwrap --dev-bind / / \
   --bind "$REPO/runtime" "$RIG/mnt/runtime" \
-  --bind "$RIG/stub/superpowers/skills" "$RIG/mnt/vendor/superpowers/skills" \
-  --bind "$RIG/stub/ecc/skills" "$RIG/mnt/vendor/everything-claude-code/skills" \
+  --bind "$RIG/stub/superpowers/skills" \
+         "$RIG/mnt/runtime/vendor/superpowers/skills" \
+  --bind "$RIG/stub/ecc/skills" \
+         "$RIG/mnt/runtime/vendor/everything-claude-code/skills" \
   -- bash "$RIG/probe.sh" "$RIG/mnt" "$REPO"
 status=$?
 

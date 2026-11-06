@@ -129,20 +129,29 @@ NOT_CONFIG = [
     # A rename whose BOTH ends are outside the config is still nothing to
     # grade; reading two names must not make the filter paranoid.
     pytest.param("docs/b.md\tdocs/a.md", id="a-rename-within-the-docs"),
+    # These three WERE graded under the exclusion list this replaced, and are
+    # deliberately not any more: the deploy serves `runtime/` and nothing
+    # else, so nothing outside it reaches a running agent.
+    #
+    # `policy/` is read by the sandbox, never loaded by the harness.
+    pytest.param("policy/sandbox-candidate.json", id="a-sandbox-policy"),
+    # The cost of an inclusion list, paid deliberately. A new top-level
+    # directory is not graded here, and cannot quietly become live config
+    # either: `test_every_tracked_entry_is_classified` fails until it is
+    # declared PROJECTED, DEV_ONLY or ROOT_ONLY, and PROJECTED means moving
+    # it under `runtime/` where this filter sees it.
+    pytest.param("somethingnew/x.json", id="a-directory-nobody-foresaw"),
 ]
 
 # Changes that DO reach a running agent, and so must not pass ungraded.
 IS_CONFIG = [
     pytest.param("runtime/CLAUDE.md\ntests/t.py", id="runtime-config"),
-    # The hole a `runtime/**`-only filter would have left: sixteen skills under
-    # runtime/skills are symlinks into these submodules, `using-superpowers`
-    # among them, so a pin bump changes text every session reads while
-    # touching no file beneath runtime/.
-    pytest.param("vendor/superpowers", id="a-vendored-skill-pin"),
-    pytest.param(".gitmodules", id="which-submodules-exist"),
-    pytest.param("policy/sandbox-candidate.json", id="a-sandbox-policy"),
-    # The property that makes this an exclusion list rather than an allowlist.
-    pytest.param("somethingnew/x.json", id="a-directory-nobody-foresaw"),
+    # The hole that used to need an exclusion list: 33 skills under
+    # runtime/skills are symlinks into the vendored forks, `using-superpowers`
+    # among them, so a sync changes text every session reads. The vendored
+    # copies live under runtime/ now, so the plain filter sees it.
+    pytest.param("runtime/vendor/superpowers/skills/using-superpowers/SKILL.md",
+                 id="a-vendored-skill"),
     # Reading only `filename` graded this as nothing: the hook is GONE from
     # the running config, and all the destination says is "docs". A plain
     # deletion was never affected -- `filename` stays the runtime path -- so

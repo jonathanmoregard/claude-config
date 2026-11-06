@@ -1,5 +1,5 @@
 {
-  "_comment": "Forks whose upstream scripts/upstream-drift.py watches. Per entry: fork_repo/fork_branch and upstream_url/upstream_branch are fetched into a private cache; tracked_paths are the upstream paths we consume (a commit touching none of them is not drift); customized_paths are the subset we changed in the fork, where an upstream commit is a merge-collision risk; pin is where ~/.claude vendors the fork.",
+  "_comment": "Forks whose upstream scripts/upstream-drift.py watches, and whose content scripts/update-submodules.sh vendors into this repository. Per entry: fork_repo/fork_branch and upstream_url/upstream_branch are fetched into a private cache; tracked_paths are the upstream paths we consume (a commit touching none of them is not drift, and they are exactly what gets vendored); customized_paths are the subset we changed in the fork, where an upstream commit is a merge-collision risk; excluded_paths are dropped after extraction, for a fork's own dev tree that the deploy must not serve; vendor_path holds the vendored copy and vendored_commit is the fork commit it was taken from.",
   "entries": [
     {
       "name": "superpowers",
@@ -7,9 +7,12 @@
       "fork_branch": "main",
       "upstream_url": "https://github.com/obra/superpowers.git",
       "upstream_branch": "main",
-      "pin": "vendor/superpowers",
+      "vendor_path": "runtime/vendor/superpowers",
+      "vendored_commit": "d7c52689c9c40898ceac265b76d01aa6abb0933f",
       "tracked_paths": [
+        "LICENSE",
         "hooks",
+        "package.json",
         "skills/brainstorming",
         "skills/diagnosing-superpowers",
         "skills/dispatching-parallel-agents",
@@ -42,8 +45,10 @@
       "fork_branch": "main",
       "upstream_url": "https://github.com/affaan-m/ECC.git",
       "upstream_branch": "main",
-      "pin": "vendor/everything-claude-code",
+      "vendor_path": "runtime/vendor/everything-claude-code",
+      "vendored_commit": "81b8096775551b9522f74f54064a21ea105e11f7",
       "tracked_paths": [
+        "LICENSE",
         "skills/accessibility",
         "skills/brand-voice",
         "skills/codebase-onboarding",
@@ -61,6 +66,10 @@
         "skills/skill-comply",
         "skills/skill-stocktake",
         "skills/strategic-compact"
+      ],
+      "excluded_paths": [
+        "skills/skill-comply/fixtures",
+        "skills/skill-comply/tests"
       ],
       "customized_paths": [
         "skills/brand-voice",

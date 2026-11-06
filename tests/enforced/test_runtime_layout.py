@@ -222,11 +222,9 @@ def test_the_workflow_only_runs_paths_that_exist():
 
 
 @pytest.mark.parametrize("path,target,expected", [
-    # The 33-entry skill farm. One extra `..` is right on both sides at once:
-    # on disk it reaches `<repo>/vendor/y`, and under the mounts it reaches
-    # `~/.claude/vendor/y`, which is where the four vendor binds are.
-    ("skills/brainstorming", "../vendor/superpowers/skills/brainstorming",
-     "../../vendor/superpowers/skills/brainstorming"),
+    # The 33-entry skill farm. `vendor/` is projected too, so the submodules
+    # descend with the skills and the hop does not change.
+    ("skills/brainstorming", "../vendor/superpowers/skills/brainstorming", None),
     # Already absolute: resolves the same from any depth.
     ("hooks/router-nudge-hook", "/home/jonathan/Repos/router-agent/x", None),
     # Inside the entry being moved, so it moves with it.
@@ -256,10 +254,14 @@ def test_a_hop_between_two_projected_entries_is_left_alone(path, target):
     assert layout.retarget(path, target) is None
 
 
-def test_a_hop_to_something_that_stays_put_climbs_one_more():
-    """The distinction the previous rule missed: vendor/ does not move."""
-    assert layout.retarget("skills/x", "../vendor/superpowers/skills/x") == \
-        "../../vendor/superpowers/skills/x"
+def test_a_hop_into_vendor_is_left_alone_now_that_it_descends():
+    """This asserted the opposite while `vendor/` sat at the repository root.
+
+    Everything the deploy serves is under `runtime/`, submodules included, so
+    a link into vendor is an ordinary hop between two projected entries.
+    """
+    assert layout.retarget("skills/x", "../vendor/superpowers/skills/x") is None
+    assert "vendor" in set(layout.PROJECTED)
 
 
 def test_a_dangling_link_inside_the_projection_fails_verify(tmp_path):
@@ -279,12 +281,13 @@ def test_a_dangling_link_inside_the_projection_fails_verify(tmp_path):
 def test_an_unverifiable_link_is_named_rather_than_passed(tmp_path):
     """Not every target can be checked here, so those are counted, not claimed.
 
-    `git worktree add` does not initialise submodules, so the vendored trees
-    are empty in most checkouts and CI never fetches them. That is a real
+    An absolute target is machine-specific: the allowlisted checkout is present
+    on the one machine and absent everywhere else, CI included. That is a real
     limit, and the summary has to say so instead of reporting a clean run.
     """
     root = make_repo(tmp_path, {"runtime/hooks/guard.py": "pass\n"},
-                     {"runtime/skills/x": "../../vendor/superpowers/skills/x"})
+                     {"runtime/skills/x":
+                      f"{layout.ALLOWED_ABSOLUTE[0]}/skills/absent-here"})
     proc = run(root, "--verify")
     assert proc.returncode == 0
     assert "not checkable here" in proc.stdout
@@ -333,14 +336,16 @@ def test_apply_moves_the_projected_and_leaves_the_rest(tmp_path):
     assert (root / "tests" / "test_x.py").exists()
     assert (root / "docs" / "readme.md").exists()
     assert not (root / "runtime" / "tests").exists()
-    # The submodule parent is not moved: the projection is per-subpath.
-    assert (root / "vendor").is_dir()
-    assert not (root / "runtime" / "vendor").exists()
+    # Everything the deploy serves lives under runtime/, submodules included,
+    # so the honeypot's scope test needs no list beyond `runtime/`.
+    assert (root / "runtime" / "vendor").is_dir()
+    assert not (root / "vendor").exists()
 
     link = root / "runtime" / "skills" / "brainstorming"
     assert link.is_symlink()
+    # Unchanged by the move: both ends descended together.
     assert link.readlink().as_posix() == (
-        "../../vendor/superpowers/skills/brainstorming")
+        "../vendor/superpowers/skills/brainstorming")
     # And it still resolves on disk, which is the repo-side half of the claim.
     assert link.resolve().is_dir()
 

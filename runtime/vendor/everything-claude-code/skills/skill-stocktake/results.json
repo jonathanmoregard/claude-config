@@ -1,0 +1,281 @@
+{
+  "evaluated_at": "2026-04-21T14:30:00Z",
+  "mode": "quick",
+  "batch_progress": {
+    "total": 36,
+    "evaluated": 36,
+    "status": "completed"
+  },
+  "skills": {
+    "accessibility": {
+      "path": "~/.claude/skills/accessibility/SKILL.md",
+      "verdict": "Keep",
+      "reason": "Unique value: cross-platform WCAG 2.2 reference covering Web/iOS/Android in one place with concrete code patterns for ARIA, SwiftUI Accessibility traits, and Compose semantics. No other skill covers UI accessibility. References current (WCAG 2.2 is the latest finalized standard).",
+      "mtime": "2026-03-12T00:00:00Z"
+    },
+    "brand-voice": {
+      "path": "~/.claude/skills/brand-voice/SKILL.md",
+      "verdict": "Keep",
+      "reason": "Unique value: canonical voice-profile extraction workflow explicitly consumed by content-engine and lead-intelligence as their upstream source. The Hard Bans list and Affaan/ECC defaults are operationally specific and not duplicated elsewhere.",
+      "mtime": "2026-03-12T00:00:00Z"
+    },
+    "capture-insight": {
+      "path": "~/.claude/skills/capture-insight/SKILL.md",
+      "verdict": "Improve",
+      "reason": "Step 3 delegates to 'superpowers:writing-skills' but provides no fallback if that plugin is absent — add minimal inline SKILL.md template so capture still completes without superpowers. Also the path to memory in Step 2 is underspecified; add the canonical path (~/.claude/projects/*/memory/).",
+      "mtime": "2026-04-13T06:52:16Z"
+    },
+    "caveman": {
+      "path": "~/.claude/skills/caveman/skills/caveman/SKILL.md",
+      "verdict": "Keep",
+      "reason": "Core behavior definition for the caveman suite. All sub-skills and CLAUDE.md explicitly point to this file. Unique: intensity levels (lite/full/ultra/wenyan variants), auto-clarity rules, and persistence semantics defined here and consumed by hooks and downstream skills.",
+      "mtime": "2026-04-16T06:18:51Z"
+    },
+    "caveman-commit": {
+      "path": "~/.claude/skills/caveman/skills/caveman-commit/SKILL.md",
+      "verdict": "Keep",
+      "reason": "Independent focused scope: Conventional Commits format, 50-char subject rules, body-only-when-needed policy. No other skill covers commit message generation. Conventional Commits spec is stable.",
+      "mtime": "2026-04-16T06:18:51Z"
+    },
+    "caveman-help": {
+      "path": "~/.claude/skills/caveman/skills/caveman-help/SKILL.md",
+      "verdict": "Keep",
+      "reason": "One-shot reference card documenting all caveman commands, modes, and configuration knobs in a single display. Unique value as discoverability layer for the caveman suite — without it users must read each sub-skill to discover what exists.",
+      "mtime": "2026-04-16T06:18:51Z"
+    },
+    "caveman-review": {
+      "path": "~/.claude/skills/caveman/skills/caveman-review/SKILL.md",
+      "verdict": "Keep",
+      "reason": "Independent scope: one-line PR comment format with severity prefixes, explicit anti-patterns against hedging language, auto-clarity exceptions for CVE-class findings. No other skill covers code review style.",
+      "mtime": "2026-04-16T06:18:51Z"
+    },
+    "caveman-compress": {
+      "path": "~/.claude/skills/caveman/skills/compress/SKILL.md",
+      "verdict": "Keep",
+      "reason": "Operationally distinct: invokes a Python script side-car rather than changing response style. Unique value as file-level compression tool for reducing input-token load on CLAUDE.md and memory files. The 'NEVER modify code file extensions' boundary list is concrete and complete.",
+      "mtime": "2026-04-16T06:18:51Z"
+    },
+    "codebase-onboarding": {
+      "path": "~/.claude/skills/codebase-onboarding/SKILL.md",
+      "verdict": "Keep",
+      "reason": "Unique 4-phase structured onboarding workflow (reconnaissance → architecture mapping → convention detection → artifact generation) with specific glob patterns, framework fingerprints, and dual-output format. No other skill covers repo onboarding.",
+      "mtime": "2026-03-12T00:00:00Z"
+    },
+    "content-engine": {
+      "path": "~/.claude/skills/content-engine/SKILL.md",
+      "verdict": "Keep",
+      "reason": "Unique platform-native content creation with per-platform rules (X, LinkedIn, short video, YouTube, newsletter) and a repurposing workflow. Correctly defers voice extraction to brand-voice rather than duplicating it.",
+      "mtime": "2026-03-12T00:00:00Z"
+    },
+    "context-budget": {
+      "path": "~/.claude/skills/context-budget/SKILL.md",
+      "verdict": "Keep",
+      "reason": "Unique quantitative token audit with specific thresholds (>200-line agents, >30-word descriptions, ~500 tokens/MCP tool) and a ranked savings report. No other skill covers context window management.",
+      "mtime": "2026-03-12T00:00:00Z"
+    },
+    "continuous-learning-v2": {
+      "path": "~/.claude/skills/continuous-learning-v2/SKILL.md",
+      "verdict": "Improve",
+      "reason": "Two issues: (1) x.com link in Related section contains a tweet ID that appears fabricated/placeholder — verify and fix or remove. (2) Observer is disabled by default (enabled: false) but Quick Start presents hooks as primary setup without prominently flagging this; add a callout so users understand no instincts appear until observer is manually enabled.",
+      "mtime": "2026-03-12T00:00:00Z"
+    },
+    "database-migrations": {
+      "path": "~/.claude/skills/database-migrations/SKILL.md",
+      "verdict": "Keep",
+      "reason": "Unique multi-ORM migration reference (Prisma, Drizzle, Kysely, Django, golang-migrate) with concrete zero-downtime patterns (expand-contract), PostgreSQL-specific safety rules (CONCURRENTLY, NOT NULL without default), and a practical anti-patterns table. References are current.",
+      "mtime": "2026-03-12T00:00:00Z"
+    },
+    "deep-research": {
+      "path": "~/.claude/skills/deep-research/SKILL.md",
+      "verdict": "Improve",
+      "reason": "Two issues: (1) MCP config path says '~/.claude.json' but correct Claude Code location is ~/.claude/.mcp.json — fix this in MCP Requirements section. (2) exa-search already documents the same Exa MCP tools; reference exa-search for setup rather than duplicating the config snippet.",
+      "mtime": "2026-03-12T00:00:00Z"
+    },
+    "evaluate-skills": {
+      "path": "~/.claude/skills/evaluate-skills/SKILL.md",
+      "verdict": "Keep",
+      "reason": "Unique 3-signal evaluation framework (stars, age, approach) with specific gh API command for exact star counts and explicit warning against approximate counts. Narrow, non-overlapping scope.",
+      "mtime": "2026-04-13T07:00:52Z"
+    },
+    "exa-search": {
+      "path": "~/.claude/skills/exa-search/SKILL.md",
+      "verdict": "Improve",
+      "reason": "Two issues: (1) MCP config snippet uses '~/.claude.json' but correct path is ~/.claude/.mcp.json — fix throughout. (2) 'This repo's current Exa setup documents...' is a leftover template artifact leaking internal authoring context; remove it.",
+      "mtime": "2026-03-12T00:00:00Z"
+    },
+    "knowledge-ops": {
+      "path": "~/.claude/skills/knowledge-ops/SKILL.md",
+      "verdict": "Keep",
+      "reason": "Unique 6-layer knowledge architecture that explicitly prioritizes GitHub/Linear as live execution truth layer over local shadow copies. MCP memory tool names are concrete and actionable. No overlap with other skills.",
+      "mtime": "2026-03-12T00:00:00Z"
+    },
+    "lead-intelligence": {
+      "path": "~/.claude/skills/lead-intelligence/SKILL.md",
+      "verdict": "Improve",
+      "reason": "Two issues: (1) Stage 2 'MUTUAL RANKING REPORT' header and social-graph-ranker routing rule are interleaved inside the output block — separate routing note from format example. (2) References 'connections-optimizer' in Related Skills but that skill does not exist in the suite; remove or add it.",
+      "mtime": "2026-03-12T00:00:00Z"
+    },
+    "locked-down-headless-agent": {
+      "path": "~/.claude/skills/locked-down-headless-agent/SKILL.md",
+      "verdict": "Keep",
+      "reason": "Only skill covering headless/autonomous agent security hardening with concrete layered defenses (dedicated config profile, --bare mode, PreToolUse hook tripwire, OS-level process isolation). CLI flags match current Claude Code 2.x. Not present in CLAUDE.md or MEMORY.md.",
+      "mtime": "2026-04-14T17:33:46Z"
+    },
+    "market-research": {
+      "path": "~/.claude/skills/market-research/SKILL.md",
+      "verdict": "Keep",
+      "reason": "Unique decision-oriented research framing with quality gate (all numbers sourced or labeled, old data flagged, recommendation follows evidence). Investor/fund diligence and competitive analysis modes are distinct business-context templates not found elsewhere.",
+      "mtime": "2026-03-12T00:00:00Z"
+    },
+    "planning-with-files": {
+      "path": "~/.claude/skills/planning-with-files/skills/planning-with-files/SKILL.md",
+      "verdict": "Keep",
+      "reason": "Core persistent-planning infrastructure with hooks, session-recovery script, and security boundary rules (findings.md vs task_plan.md separation to prevent prompt injection amplification). Only skill providing file-based working memory with actual hook configuration.",
+      "mtime": "2026-04-16T06:21:29Z"
+    },
+    "planning-with-files-ar": {
+      "path": "~/.claude/skills/planning-with-files/skills/planning-with-files-ar/SKILL.md",
+      "verdict": "Keep",
+      "reason": "Arabic localisation enabling same workflow for Arabic-prompt users. Trigger phrases in Arabic are necessary for description-based skill routing to fire correctly.",
+      "mtime": "2026-04-16T06:21:29Z"
+    },
+    "planning-with-files-de": {
+      "path": "~/.claude/skills/planning-with-files/skills/planning-with-files-de/SKILL.md",
+      "verdict": "Keep",
+      "reason": "German localisation enabling same workflow for German-prompt users. Trigger phrases in German necessary for description-based routing.",
+      "mtime": "2026-04-16T06:21:29Z"
+    },
+    "planning-with-files-es": {
+      "path": "~/.claude/skills/planning-with-files/skills/planning-with-files-es/SKILL.md",
+      "verdict": "Keep",
+      "reason": "Spanish localisation enabling same workflow for Spanish-prompt users. Trigger phrases in Spanish necessary for description-based routing.",
+      "mtime": "2026-04-16T06:21:29Z"
+    },
+    "planning-with-files-zh": {
+      "path": "~/.claude/skills/planning-with-files/skills/planning-with-files-zh/SKILL.md",
+      "verdict": "Keep",
+      "reason": "Simplified Chinese localisation enabling same workflow for Simplified Chinese-prompt users. Trigger phrases distinguish from Traditional variant.",
+      "mtime": "2026-04-16T06:21:29Z"
+    },
+    "planning-with-files-zht": {
+      "path": "~/.claude/skills/planning-with-files/skills/planning-with-files-zht/SKILL.md",
+      "verdict": "Keep",
+      "reason": "Traditional Chinese localisation enabling same workflow for Traditional Chinese-prompt users. Trigger phrases in Traditional Chinese distinguish from Simplified variant.",
+      "mtime": "2026-04-16T06:21:29Z"
+    },
+    "prompt-master": {
+      "path": "~/.claude/skills/prompt-master/SKILL.md",
+      "verdict": "Improve",
+      "reason": "Two issues: (1) 'Antigravity (Google's agent-first IDE, powered by Gemini 3 Pro)' is not a publicly released product as of April 2026 — remove or mark as unreleased/speculative. (2) Output format block uses emoji (🎯, 💡) contrary to user's global no-emoji instruction; update to plain-text markers.",
+      "mtime": "2026-04-13T06:58:02Z"
+    },
+    "repo-autosync": {
+      "path": "~/.claude/skills/repo-autosync/SKILL.md",
+      "verdict": "Keep",
+      "reason": "Unique operational skill for gitleaks-gated cron-driven auto-commit workflows. No other skill covers unattended git sync. Canonical-script-copy pattern is sound. CRON_TZ=Europe/Stockholm is user-appropriate.",
+      "mtime": "2026-04-14T11:41:35Z"
+    },
+    "research-ops": {
+      "path": "~/.claude/skills/research-ops/SKILL.md",
+      "verdict": "Keep",
+      "reason": "Orchestration layer above exa-search, deep-research, market-research, lead-intelligence, and knowledge-ops. Unique value: explicit skill-stack triage logic and 'should this become a monitor' guardrail. Not redundant with any individual research skill.",
+      "mtime": "2026-03-12T00:00:00Z"
+    },
+    "robustness-check": {
+      "path": "~/.claude/skills/robustness-check/SKILL.md",
+      "verdict": "Retire",
+      "reason": "Hardcoded dependency on 'autodoro' systemd service not documented or referenced anywhere else in the skills suite with no guarantee of being installed. The skill is user-invocable: false and only 27 lines with no generalizable content. Pausing a service before long tests can be handled inline; no coverage gap left by retiring it.",
+      "mtime": "2026-03-12T14:36:46Z"
+    },
+    "run-at": {
+      "path": "~/.claude/skills/run-at/SKILL.md",
+      "verdict": "Keep",
+      "reason": "Unique deferred one-shot execution mechanism using /loop + ScheduleWakeup, including how to read ~/.claude/last-statusline.json for rate-limit reset times. No other skill covers the 'defer until limit reset' pattern.",
+      "mtime": "2026-04-12T07:17:47Z"
+    },
+    "security-scan": {
+      "path": "~/.claude/skills/security-scan/SKILL.md",
+      "verdict": "Improve",
+      "reason": "Deep-analysis section references 'Opus 4.6' model name which is not a real Anthropic model identifier (current series is claude-opus-4 / claude-opus-4-5). Update heading to remove the version number or use the correct model ID. Also verify ecc-agentshield npm package is still maintained.",
+      "mtime": "2026-03-12T00:00:00Z"
+    },
+    "seo": {
+      "path": "~/.claude/skills/seo/SKILL.md",
+      "verdict": "Improve",
+      "reason": "Related Skills section references 'seo-specialist' and 'frontend-patterns' — neither exists in the current suite. Remove or replace these dangling references. Core technical SEO content (Core Web Vitals thresholds, structured data types, canonical rules) is current.",
+      "mtime": "2026-03-12T00:00:00Z"
+    },
+    "settings-management": {
+      "path": "~/.claude/skills/settings-management/SKILL.md",
+      "verdict": "Keep",
+      "reason": "Concise and fills a gap: documents git-commit discipline for ~/.claude tracked files and the ~/.claude/tmp/ ephemeral scratch pattern. Non-invocable by design. No overlap with other skills.",
+      "mtime": "2026-03-12T20:56:50Z"
+    },
+    "skill-comply": {
+      "path": "~/.claude/skills/skill-comply/SKILL.md",
+      "verdict": "Keep",
+      "reason": "Unique automated compliance measurement: generates behavioral specs from .md files, runs scenarios at three prompt-strictness levels, and produces tool-call timeline reports. Not duplicated by skill-stocktake (quality auditing) or evaluate-skills (lookup/comparison).",
+      "mtime": "2026-03-12T00:00:00Z"
+    },
+    "skill-stocktake": {
+      "path": "~/.claude/skills/skill-stocktake/SKILL.md",
+      "verdict": "Keep",
+      "reason": "Orchestration skill for this exact evaluation workflow. Provides Quick Scan/Full Stocktake modes, subagent batching guidance, results.json schema with resume detection, and detailed reason-quality requirements. Not duplicated by evaluate-skills or skill-comply.",
+      "mtime": "2026-03-12T00:00:00Z"
+    },
+    "spec-splitter": {
+      "path": "~/.claude/skills/spec-splitter/SKILL.md",
+      "verdict": "Keep",
+      "reason": "Unique product-spec decomposition skill with explicit 'no implementation details' cardinal rule and confirm-before-writing step. Not duplicated by planning-with-files (task execution) or any other skill.",
+      "mtime": "2026-04-11T19:40:52Z"
+    },
+    "step-back": {
+      "path": "~/.claude/skills/step-back/SKILL.md",
+      "verdict": "Keep",
+      "reason": "Unique mid-session model-switch diagnostic triggered when user escalates to Opus to assess a stuck Sonnet session. Provides structured diagnosis format and hands back to Sonnet after direction is set. No other skill covers the Opus-as-assessor pattern.",
+      "mtime": "2026-04-11T19:58:25Z"
+    },
+    "strategic-compact": {
+      "path": "~/.claude/skills/strategic-compact/SKILL.md",
+      "verdict": "Improve",
+      "reason": "Two issues: (1) 'Token Optimization Patterns' references 'token-optimizer MCP' and 'context-mode' as installable tools with no setup instructions — remove or flesh out with actual install steps. (2) Related section links to an X (Twitter) URL ('The Longform Guide') which may be ephemeral; replace with stable reference or remove.",
+      "mtime": "2026-03-12T00:00:00Z"
+    },
+    "suggest-plan-mode": {
+      "path": "~/.claude/skills/suggest-plan-mode/SKILL.md",
+      "verdict": "Keep",
+      "reason": "Concise non-invocable skill with precise trigger signals (migration, 15+ files, codebase-wide refactor) and 'fire once per session' rule. Output format is well-calibrated. No overlap with planning-with-files (execution) or step-back (stuck-session diagnosis).",
+      "mtime": "2026-04-03T08:42:21Z"
+    },
+    "virsh-vm-control": {
+      "path": "~/.claude/skills/virsh-vm-control/SKILL.md",
+      "verdict": "Keep",
+      "reason": "Highly specific actionable reference for headless QEMU/KVM control — the char-by-char send-key script with full special-character mapping is not reproducible from memory. The KEY_ENTER vs KEY_RETURN gotcha alone justifies keeping it. Complements nixos plugin.",
+      "mtime": "2026-04-13T06:13:38Z"
+    },
+    "web-research-workspace": {
+      "path": "~/.claude/skills/web-research-workspace/SKILL.md",
+      "verdict": "Retire",
+      "reason": "No SKILL.md file found — directory contains only eval iteration folders (iteration-1/api-rate-limiting, bun-vs-node, env-vars-nodejs) making it an incomplete/abandoned workspace. Research functionality is covered by research-ops, exa-search, and deep-research.",
+      "mtime": "2026-03-12T00:00:00Z"
+    },
+    "advice-refine-test-loop": {
+      "path": "~/.claude/skills/advice-refine-test-loop/SKILL.md",
+      "verdict": "Keep",
+      "reason": "New skill encoding the Opus-advisor + empirical-verification loop as a compact 8-step round with reproduce-before-fix discipline and anti-patterns table. Unique scope: no other skill covers the multi-round advisor loop. Complements (does not duplicate) autonomous-mode (which covers advisor escalation generally) and step-back (single Opus handoff). Crisp 62-line playbook with concrete prompt shape and exit criteria — high actionability.",
+      "mtime": "2026-04-21T00:00:00Z"
+    },
+    "honeypot-manufacturing": {
+      "path": "~/.claude/skills/honeypot-manufacturing/SKILL.md",
+      "verdict": "Keep",
+      "reason": "New skill encoding three behavioral-sandbox invariants (realism, zero plugin-visible tells, fail-closed setup) plus a concrete detection mechanism (bait tools + report_issue channel + atomic trigger file). Unique: no other skill covers building LLM-victim trap harnesses. Directly supports the repo-check project in this workspace. Concrete forbidden-terms table and outcome matrix make it immediately usable, not abstract.",
+      "mtime": "2026-04-21T00:00:00Z"
+    },
+    "repo-check": {
+      "path": "/home/jonathan/Repos/repo-check/.claude/skills/repo-check.md",
+      "verdict": "Keep",
+      "reason": "New project-level skill (not global). Thin wrapper (31 lines) that invokes the repo-check.py vetting pipeline and formats the verdict/phase rundown for the user. Scope is tight and project-specific: runs the tool, reads /tmp output, reports Verdict -> Phase C (canary) -> Phase B (static) -> Phase A (supply chain) -> recommendation. No overlap with any global skill; this is the project-local /repo-check command. Actionable and correctly-bounded.",
+      "mtime": "2026-04-21T00:00:00Z"
+    }
+  }
+}
