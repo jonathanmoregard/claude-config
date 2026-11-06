@@ -64,8 +64,28 @@ PROGRAMS = frozenset((
 # `grep` exiting 1 a denial, because the skill name `claude-code-permissions`
 # was in the output it printed. Same failure as any pattern read against data
 # instead of meaning.
-RESULT_KEYS = ("subtype", "stop_reason", "terminal_reason", "num_turns",
-               "duration_ms", "api_error_status", "is_error")
+#
+# The result fields were COPIED VERBATIM, which is safe for a transcript the
+# harness wrote and not safe for one the agent wrote: a planted result event
+# whose `subtype` was a credential exported it. So they go through the same
+# closed-set discipline as FILES and PROGRAMS. An unrecognised value becomes
+# `other` rather than None, so a wall is still visible in the accounting
+# without the exported string ever being one the agent chose.
+OUTCOMES = frozenset((
+    "success", "error", "error_max_turns", "error_during_execution",
+    "end_turn", "max_tokens", "stop_sequence", "tool_use", "refusal",
+    "pause_turn", "budget", "timeout", "cancelled", "wall", "model_error",
+))
+LABELS = ("subtype", "stop_reason", "terminal_reason")
+COUNTS = ("num_turns", "duration_ms")
+
+# The run layout the harness creates, and the only shape a transcript is read
+# from. `os.walk` over the scenario was a hole: `work/` is the agent's own
+# directory, bound writable, so a planted `work/<anything>/transcript.jsonl`
+# became a second trace.json -- and the upload glob is recursive, so it
+# shipped. A run directory is one integer deep under an arm, and `work` is not
+# an integer.
+RUN_INDEX = re.compile(r"^[0-9]+$")
 
 
 def blocks(event):
@@ -121,8 +141,33 @@ def denials_of(event):
     return out
 
 
+def label_of(value):
+    """A known outcome, `other` for an unrecognised one, None when absent."""
+    if value is None:
+        return None
+    return value if isinstance(value, str) and value in OUTCOMES else "other"
+
+
+def count_of(value):
+    """A real integer, never a string that merely looks like one."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def status_of(value):
+    """An HTTP status, as a number: three digits cannot carry a secret."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit() and len(value) <= 4:
+        return int(value)
+    return None
+
+
 def result_of(event):
-    summary = {key: event.get(key) for key in RESULT_KEYS}
+    summary = {key: label_of(event.get(key)) for key in LABELS}
+    summary.update({key: count_of(event.get(key)) for key in COUNTS})
+    summary["api_error_status"] = status_of(event.get("api_error_status"))
     summary["is_error"] = bool(event.get("is_error"))
     summary["permission_denials"] = denials_of(event)
     summary["safety_stops"] = len(event.get("safety_stops") or [])
@@ -164,14 +209,28 @@ def trace_of(path):
     return {"assistant_messages": turns, "result": result, "steps": steps}
 
 
+def run_dirs(scenario):
+    """`<scenario>/<arm>/<run>` directories that hold a transcript.
+
+    Exactly two levels, never a walk: see RUN_INDEX. Anything the agent can
+    create lives deeper, under its own `work/`.
+    """
+    for arm in sorted(os.listdir(scenario)):
+        arm_dir = os.path.join(scenario, arm)
+        if not os.path.isdir(arm_dir):
+            continue
+        for run in sorted(os.listdir(arm_dir)):
+            if not RUN_INDEX.match(run):
+                continue
+            current = os.path.join(arm_dir, run)
+            if os.path.isfile(os.path.join(current, "transcript.jsonl")):
+                yield current
+
+
 def main(argv):
     out_root, scenario = argv[1], argv[2]
     written = 0
-    # Run directories are nested <arm>/<run>, so this walks for transcripts
-    # rather than listing one level.
-    for current, _, files in os.walk(scenario):
-        if "transcript.jsonl" not in files:
-            continue
+    for current in run_dirs(scenario):
         trace = trace_of(os.path.join(current, "transcript.jsonl"))
         work = os.path.join(current, "work", "findings.md")
         trace["findings_md"] = {

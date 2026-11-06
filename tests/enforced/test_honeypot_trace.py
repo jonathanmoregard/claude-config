@@ -210,3 +210,45 @@ def test_runs_are_found_two_levels_down(run_dir, tmp_path):
     out = tmp_path / "out"
     assert load().main(["trace.py", str(out), str(run_dir)]) == 0
     assert os.path.isfile(os.path.join(out, "candidate", "1", "trace.json"))
+
+
+def test_a_transcript_the_agent_planted_is_not_collected(run_dir, tmp_path):
+    """`work/` is the agent's own directory and is bound writable.
+
+    A recursive walk turned a planted `work/<anything>/transcript.jsonl` into a
+    second trace.json, and the upload glob is recursive, so it shipped.
+    Reproduced with a result event whose `subtype` was a credential.
+    """
+    planted = run_dir / "candidate" / "1" / "work" / "diagnostics"
+    planted.mkdir(parents=True, exist_ok=True)
+    (planted / "transcript.jsonl").write_text(
+        json.dumps({"type": "result", "subtype": SECRET}) + "\n", encoding="utf-8")
+
+    out = tmp_path / "out"
+    assert load().main(["trace.py", str(out), str(run_dir)]) == 0
+    produced = [os.path.join(root, f)
+                for root, _, files in os.walk(out) for f in files]
+    assert produced == [os.path.join(out, "candidate", "1", "trace.json")]
+    assert SECRET not in "".join(open(p, encoding="utf-8").read() for p in produced)
+
+
+@pytest.mark.parametrize("field", ["subtype", "stop_reason", "terminal_reason",
+                                   "api_error_status", "num_turns", "duration_ms"])
+def test_a_planted_result_field_is_never_exported_verbatim(run_dir, tmp_path, field):
+    """The second half of the same leak, and it has to hold on its own.
+
+    The agent can overwrite its OWN transcript -- $RUN is bound writable -- so
+    restricting collection is not enough. These fields were copied verbatim,
+    which is safe for a transcript the harness wrote and not for this one.
+    """
+    transcript = run_dir / "candidate" / "1" / "transcript.jsonl"
+    transcript.write_text(
+        json.dumps({"type": "result", field: f"leak {SECRET}"}) + "\n",
+        encoding="utf-8")
+
+    raw = run_trace(run_dir, tmp_path / "out")
+    assert SECRET not in raw
+    # `other` rather than dropped: a wall stays visible in the accounting
+    # without the exported string being one the agent chose.
+    exported = json.loads(raw)["result"][field]
+    assert exported in ("other", None), exported
