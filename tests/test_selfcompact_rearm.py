@@ -23,9 +23,15 @@ from pathlib import Path
 
 import pytest
 
+# `runtime/` once the layout migration has landed, the repository root before
+# it. Only the projected subset moves; tests/ stays at the root.
+RUNTIME = Path(__file__).resolve().parents[1]
+if (RUNTIME / "runtime").is_dir():
+    RUNTIME = RUNTIME / "runtime"
+
 SPEC = importlib.util.spec_from_file_location(
     "self_compact_trigger",
-    Path(__file__).resolve().parent.parent / "self-compact-trigger.py")
+    RUNTIME / "self-compact-trigger.py")
 sct = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(sct)
 

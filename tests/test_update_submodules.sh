@@ -59,7 +59,18 @@ SEED="$ROOT/seed"
 git init -q -b master "$SEED"
 mkdir -p "$SEED/.githooks" "$SEED/scripts" "$SEED/logs"
 cp -a "$REPO_ROOT"/.githooks/. "$SEED/.githooks/"
-cp -a "$REPO_ROOT/scripts/install-worktree-policy.sh" "$REPO_ROOT/scripts/update-submodules.sh" "$SEED/scripts/"
+# `runtime/scripts/` once the layout migration has landed.
+SRC_SCRIPTS="$REPO_ROOT/scripts"
+[ -d "$REPO_ROOT/runtime/scripts" ] && SRC_SCRIPTS="$REPO_ROOT/runtime/scripts"
+# config-repo.sh is sourced by update-submodules.sh (as `$script_dir/config-repo.sh`),
+# a dependency it acquired in the layout cutover: the repository checkout can no
+# longer be assumed to sit at a fixed place relative to the script, so resolving
+# it moved into a shared sibling. Staging the two scripts without it left seven
+# cases failing with `config-repo.sh: No such file or directory` -- the script
+# under test dying on line 26 before reaching any behaviour, which reads as seven
+# unrelated assertion failures rather than one missing fixture file.
+cp -a "$SRC_SCRIPTS/install-worktree-policy.sh" "$SRC_SCRIPTS/update-submodules.sh" \
+      "$SRC_SCRIPTS/config-repo.sh" "$SEED/scripts/"
 printf 'logs/\n' > "$SEED/.gitignore"
 printf '[submodule "skills/prompt-master"]\n\tpath = skills/prompt-master\n\turl = %s\n' "$UP" > "$SEED/.gitmodules"
 git -C "$SEED" add -A

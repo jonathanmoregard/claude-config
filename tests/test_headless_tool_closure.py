@@ -24,6 +24,10 @@ import unittest
 from unittest import mock
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# `runtime/` once the layout migration has landed, the repository root
+# before it. Only the projected subset moves; tests/ stays at the root.
+RUNTIME = os.path.join(REPO_ROOT, "runtime") if os.path.isdir(
+    os.path.join(REPO_ROOT, "runtime")) else REPO_ROOT
 READ_ONLY = {"Read", "Grep", "Glob"}
 
 
@@ -51,7 +55,7 @@ class ProposalScorerClosureTest(unittest.TestCase):
     """C2: the proposal-intake scorer reads agent-written proposal bodies."""
 
     def setUp(self):
-        path = os.path.join(REPO_ROOT, "scripts", "proposal-intake-gate.py")
+        path = os.path.join(RUNTIME, "scripts", "proposal-intake-gate.py")
         spec = importlib.util.spec_from_file_location("proposal_intake_gate", path)
         self.gate = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.gate)
@@ -79,7 +83,7 @@ class DateCheckClosureTest(unittest.TestCase):
     weekly unattended agent. It needs no tools at all: inputs are inlined."""
 
     def test_agent_call_offers_no_tools(self):
-        src = open(os.path.join(REPO_ROOT, "date-check.sh"), encoding="utf-8").read()
+        src = open(os.path.join(RUNTIME, "date-check.sh"), encoding="utf-8").read()
         calls = re.findall(r'"\$CLAUDE"((?:[^\n]*\\\n)*[^\n]*)', src)
         self.assertEqual(len(calls), 1, "expected exactly one claude call")
         argv = shlex.split(calls[0].replace("\\\n", " ").rstrip(")"))

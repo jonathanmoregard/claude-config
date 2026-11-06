@@ -9,8 +9,11 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BROKER = ROOT / "mcps" / "git-broker"
-LEGACY = ROOT / "mcps" / "safe-bash"
+# `runtime/` once the layout migration has landed, the repository root
+# before it. Only the projected subset moves; tests/ stays at the root.
+RUNTIME = ROOT / "runtime" if (ROOT / "runtime").is_dir() else ROOT
+BROKER = RUNTIME / "mcps" / "git-broker"
+LEGACY = RUNTIME / "mcps" / "safe-bash"
 
 
 class DedicatedGitBrokerAssetTests(unittest.TestCase):
@@ -37,8 +40,8 @@ class DedicatedGitBrokerAssetTests(unittest.TestCase):
         self.assertIsInstance(config["gitBroker"], dict)
 
     def test_claude_registers_and_allows_git_broker_under_canonical_name(self) -> None:
-        servers = json.loads((ROOT / "mcp-servers.json").read_text(encoding="utf-8"))
-        settings = json.loads((ROOT / "settings.json").read_text(encoding="utf-8"))
+        servers = json.loads((RUNTIME / "mcp-servers.json").read_text(encoding="utf-8"))
+        settings = json.loads((RUNTIME / "settings.json").read_text(encoding="utf-8"))
         self.assertNotIn("git-broker", servers)
         self.assertIn("git_broker", servers)
         broker = servers["git_broker"]

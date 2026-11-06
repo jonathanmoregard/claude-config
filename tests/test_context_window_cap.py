@@ -30,16 +30,19 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO))
+# `runtime/` once the layout migration has landed, the repository root
+# before it. Only the projected subset moves; tests/ stays at the root.
+RUNTIME = REPO / "runtime" if (REPO / "runtime").is_dir() else REPO
+sys.path.insert(0, str(RUNTIME))
 import context_usage  # noqa: E402
 
 SPEC = importlib.util.spec_from_file_location(
-    "self_compact_trigger", REPO / "self-compact-trigger.py")
+    "self_compact_trigger", RUNTIME / "self-compact-trigger.py")
 sct = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(sct)
 
 CB_SPEC = importlib.util.spec_from_file_location(
-    "context_baggage", REPO / "context-baggage.py")
+    "context_baggage", RUNTIME / "context-baggage.py")
 cb = importlib.util.module_from_spec(CB_SPEC)
 CB_SPEC.loader.exec_module(cb)
 
@@ -139,7 +142,7 @@ def run_hook(script: str, payload: dict, home: Path, env_extra: dict | None = No
     env = {k: v for k, v in os.environ.items()
            if k not in ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "CLAUDE_CONTEXT_MAX", "CLAUDE_CONFIG_DIR")}
     env.update({"HOME": str(home)}, **(env_extra or {}))
-    return subprocess.run([sys.executable, str(REPO / script)],
+    return subprocess.run([sys.executable, str(RUNTIME / script)],
                           input=json.dumps(payload), capture_output=True,
                           text=True, env=env, timeout=30)
 
@@ -195,7 +198,7 @@ def test_cli_reports_the_capped_window(tmp_path):
     env = {k: v for k, v in os.environ.items()
            if k not in ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "CLAUDE_CONTEXT_MAX", "CLAUDE_CONFIG_DIR")}
     env["HOME"] = str(tmp_path)
-    out = subprocess.run([sys.executable, str(REPO / "context_usage.py"), str(t)],
+    out = subprocess.run([sys.executable, str(RUNTIME / "context_usage.py"), str(t)],
                          capture_output=True, text=True, env=env, timeout=30)
     assert out.returncode == 0, out.stderr
     assert json.loads(out.stdout)["window"] == 400_000
@@ -232,7 +235,7 @@ def test_self_compact_fires_before_claude_code_auto_compacts():
     self-compact never fires on a capped session. Read from the repo's own
     settings.json, so retuning the cap and FIRE_AT_TOKENS stay one decision.
     """
-    cap = context_usage.auto_compact_window(REPO / "settings.json", {})
+    cap = context_usage.auto_compact_window(RUNTIME / "settings.json", {})
     assert cap is not None, "settings.json must set autoCompactWindow (the backstop)"
     assert sct.FIRE_AT_TOKENS < claude_auto_compact_point(cap)
 
@@ -240,7 +243,7 @@ def test_self_compact_fires_before_claude_code_auto_compacts():
 def test_nudge_falls_between_self_compact_and_auto_compact():
     """Self-compact hands off unattended first; the human nudge is the fallback
     for when it did not, and must still land before Claude Code compacts."""
-    cap = context_usage.auto_compact_window(REPO / "settings.json", {})
+    cap = context_usage.auto_compact_window(RUNTIME / "settings.json", {})
     nudge_at = cb.THRESHOLD * context_usage.usable_capacity(cap)
     assert sct.FIRE_AT_TOKENS < nudge_at < claude_auto_compact_point(cap)
 
@@ -277,6 +280,6 @@ def test_repo_config_nudge_is_silent_where_self_compact_fires(tmp_path):
     """With the repo's cap, self-compact (FIRE_AT_TOKENS) hands off before the
     human nudge appears; together with the test above, self-compact < nudge <
     auto-compact holds for the configuration this repo ships."""
-    cap = context_usage.auto_compact_window(REPO / "settings.json", {})
+    cap = context_usage.auto_compact_window(RUNTIME / "settings.json", {})
     assert cap == WINDOW_SHAPES["420k settings cap"][1], "update WINDOW_SHAPES to the repo cap"
     assert nudge_output(tmp_path, "420k settings cap", sct.FIRE_AT_TOKENS) == ""

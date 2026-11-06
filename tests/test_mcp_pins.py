@@ -9,6 +9,10 @@ import os
 import unittest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# `runtime/` once the layout migration has landed, the repository root
+# before it. Only the projected subset moves; tests/ stays at the root.
+RUNTIME = os.path.join(REPO_ROOT, "runtime") if os.path.isdir(
+    os.path.join(REPO_ROOT, "runtime")) else REPO_ROOT
 
 
 def uvx_requirements(args):
@@ -24,7 +28,7 @@ def uvx_requirements(args):
 
 class McpPinsTest(unittest.TestCase):
     def test_uvx_servers_pin_exact_versions(self):
-        with open(os.path.join(REPO_ROOT, "mcp-servers.json"), encoding="utf-8") as fh:
+        with open(os.path.join(RUNTIME, "mcp-servers.json"), encoding="utf-8") as fh:
             servers = json.load(fh)
         checked = 0
         for name, cfg in servers.items():

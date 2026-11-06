@@ -9,24 +9,33 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RUNNER = ROOT / "mcps" / "klaffat-app-runner"
+# `runtime/` once the layout migration has landed, the repository root
+# before it. Only the projected subset moves; tests/ stays at the root.
+RUNTIME = ROOT / "runtime" if (ROOT / "runtime").is_dir() else ROOT
+RUNNER = RUNTIME / "mcps" / "klaffat-app-runner"
 HOST_SETUP = ROOT / "tests" / "agent-e2e" / "klaffat-app-runner-host-smoke" / "setup.sh"
+# The server's own suite is still part of the asset, but it is test code, so it
+# is tracked beside the other tests rather than under the projected tree.
+RUNNER_SUITE = ROOT / "tests" / "mcps" / "klaffat-app-runner" / "test_server.py"
 
 
 class KlaffatAppRunnerAssetTests(unittest.TestCase):
     def test_complete_stdlib_server_asset_is_tracked(self) -> None:
         for name in (
-            "server.py", "config.json", "hold.py", "sandbox_exec.py", "e2e_deps.py", "test_server.py"
+            "server.py", "config.json", "hold.py", "sandbox_exec.py", "e2e_deps.py"
         ):
             with self.subTest(name=name):
                 self.assertTrue((RUNNER / name).is_file(), f"missing {name}")
+        self.assertTrue(RUNNER_SUITE.is_file(), f"missing {RUNNER_SUITE}")
+        self.assertFalse((RUNNER / "test_server.py").exists(),
+                         "the suite is back under the projected tree")
         source = (RUNNER / "server.py").read_text(encoding="utf-8")
         self.assertIn('SERVER_INFO = {"name": "klaffat-app-runner"', source)
         self.assertNotIn("FastMCP", source)
         self.assertNotIn("shell=True", source)
 
     def test_shared_manifest_registers_fixed_host_server_without_bootstrap(self) -> None:
-        servers = json.loads((ROOT / "mcp-servers.json").read_text(encoding="utf-8"))
+        servers = json.loads((RUNTIME / "mcp-servers.json").read_text(encoding="utf-8"))
         self.assertIn("klaffat-app-runner", servers)
         config = servers["klaffat-app-runner"]
         self.assertEqual(
@@ -46,7 +55,7 @@ class KlaffatAppRunnerAssetTests(unittest.TestCase):
             self.assertNotIn(bootstrap, serialized)
 
     def test_shared_permissions_allow_the_structured_runner_without_shell_escape(self) -> None:
-        settings = json.loads((ROOT / "settings.json").read_text(encoding="utf-8"))
+        settings = json.loads((RUNTIME / "settings.json").read_text(encoding="utf-8"))
         allow = settings["permissions"]["allow"]
         self.assertIn("mcp__klaffat-app-runner__*", allow)
         self.assertNotIn("mcp__klaffat-app-runner__exec", allow)

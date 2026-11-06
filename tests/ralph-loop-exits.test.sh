@@ -18,12 +18,15 @@ trap 'rm -rf "$SD"' EXIT  # arftl-allow: destructive-shell — this run's own mk
 export CLAUDE_RALPH_STATE_DIR="$SD/ralph"
 mkdir -p "$CLAUDE_RALPH_STATE_DIR"
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
-RALPH_HOOK="$ROOT/hooks/ralph-loop-stop.sh"
+# `runtime/` once the layout migration has landed, the repo root before it.
+RUNTIME="$ROOT"
+[ -d "$ROOT/runtime" ] && RUNTIME="$ROOT/runtime"
+RALPH_HOOK="$RUNTIME/hooks/ralph-loop-stop.sh"
 # The hook sources $HOME/.claude/scripts/ralph-loop-state.sh; point HOME at a
 # fake one holding THIS checkout's resolver.
 RALPH_TEST_HOME="$SD/ralph-home"
 mkdir -p "$RALPH_TEST_HOME/.claude/scripts"
-ln -s "$ROOT/scripts/ralph-loop-state.sh" "$RALPH_TEST_HOME/.claude/scripts/ralph-loop-state.sh"
+ln -s "$RUNTIME/scripts/ralph-loop-state.sh" "$RALPH_TEST_HOME/.claude/scripts/ralph-loop-state.sh"
 
 pass=0; fail=0
 ck() {
@@ -219,7 +222,7 @@ echo "== a loop is found however its directory is spelled =="
 # trailing slash or a symlinked spelling of the same directory missed — and a
 # miss means compact-reinject and idle-handoff conclude no loop is armed here.
 # shellcheck source=/dev/null
-. "$ROOT/scripts/ralph-loop-state.sh"
+. "$RUNTIME/scripts/ralph-loop-state.sh"
 WTREAL="$SD/wt-real"; mkdir -p "$WTREAL"
 ln -sfn "$WTREAL" "$SD/wt-link"
 LSID2="spelling-$RANDOM"

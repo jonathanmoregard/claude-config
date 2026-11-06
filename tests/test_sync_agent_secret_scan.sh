@@ -14,7 +14,14 @@
 # Run:  tests/test_sync_agent_secret_scan.sh
 set -uo pipefail
 
-SCRIPT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)/skills/repo-autosync/sync-agent.sh"
+REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+# `runtime/` once the layout migration has landed, the repository root before
+# it. Without the fallback every `bash "$SCRIPT"` exited 127 and the harness
+# reported "clean commits were not pushed" and "no secret-scan notification" --
+# i.e. the sync agent failing to scan, when in fact there was no script there.
+RUNTIME="$REPO_ROOT"
+[ -d "$REPO_ROOT/runtime" ] && RUNTIME="$REPO_ROOT/runtime"
+SCRIPT="$RUNTIME/skills/repo-autosync/sync-agent.sh"
 SCRIPT="${SYNC_AGENT_UNDER_TEST:-$SCRIPT}"
 ROOT=$(mktemp -d)
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t

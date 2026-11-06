@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Stub `gh` whose visibility lookups fail (GitHub API down), for scenarios
+# testing what an agent says when it cannot run the check. Logs like _lib/gh;
+# every other call goes to the ordinary stub installed beside it as gh-base.
+printf '%s\n' "$*" >> "$E2E_RUN/gh.log"
+case "$1" in
+  repo|api)
+    echo "HTTP 503: Service Unavailable (https://api.github.com/graphql)" >&2
+    exit 1 ;;
+esac
+sed -i '$d' "$E2E_RUN/gh.log"   # gh-base logs this call itself
+exec "$(dirname "$0")/gh-base" "$@"

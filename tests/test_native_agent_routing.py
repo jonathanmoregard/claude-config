@@ -11,8 +11,11 @@ import sys
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SETTINGS = REPO_ROOT / "settings.json"
-OBSERVER = REPO_ROOT / "hooks" / "native-agent-route-observer.py"
+# `runtime/` once the layout migration has landed, the repository root
+# before it. Only the projected subset moves; tests/ stays at the root.
+RUNTIME = REPO_ROOT / "runtime" if (REPO_ROOT / "runtime").is_dir() else REPO_ROOT
+SETTINGS = RUNTIME / "settings.json"
+OBSERVER = RUNTIME / "hooks" / "native-agent-route-observer.py"
 
 
 def settings() -> dict:
@@ -88,13 +91,13 @@ def test_named_roles_pin_full_model_ids():
         "advisor.md": ("advisor", "claude-fable-5-1"),
     }
     for filename, (name, model) in expected.items():
-        metadata = frontmatter(REPO_ROOT / "agents" / filename)
+        metadata = frontmatter(RUNTIME / "agents" / filename)
         assert metadata["name"] == name
         assert metadata["model"] == model
 
 
 def test_default_general_purpose_agent_does_not_inherit_xhigh_effort():
-    metadata = frontmatter(REPO_ROOT / "agents" / "general-purpose.md")
+    metadata = frontmatter(RUNTIME / "agents" / "general-purpose.md")
     assert metadata["effort"] == "medium"
 
 
@@ -145,7 +148,7 @@ def test_observer_whitelists_models_used_to_strings(tmp_path):
 
 
 def test_ai_router_native_path_does_not_override_named_agent_models():
-    skill = (REPO_ROOT / "skills" / "ai-router" / "SKILL.md").read_text(encoding="utf-8")
+    skill = (RUNTIME / "skills" / "ai-router" / "SKILL.md").read_text(encoding="utf-8")
     assert "pass `model: <pick.model>`" not in skill
     assert "without a per-call model override" in skill
 

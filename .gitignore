@@ -260,12 +260,30 @@ scheduled_tasks.lock
 # Auto-updater outcome stamp (runtime)
 .last-update-result.json
 
-# Home-manager-managed skill symlinks (point into /nix/store)
-skills/nixos-config-dev
-skills/nixos-vm-test-gate
-skills/nixos-agent-testing
-skills/nixos-automated-testing
-skills/nixos-agenix-secret
+# Removed: five `skills/nixos-*` rules that hid home-manager's /nix/store
+# symlinks back when nixos-config owned those skills and wrote them into the
+# flat `~/.claude/skills/`. This repository owns them outright now, as real
+# files under `runtime/skills/`, and nothing writes `skills/` at the repository
+# root any more.
+#
+# The shape of those rules still matters, which is why
+# tests/enforced/test_runtime_layout.py keeps asking git whether anything
+# ignores `runtime/skills/nixos-*`: a pattern with a slash anywhere but the end
+# is relative to the .gitignore's own directory (gitignore(5)), so
+# `skills/nixos-config-dev` never reached them -- but a bare
+# `nixos-config-dev` or `**/nixos-config-dev` would, and would silently make
+# the skills unaddable.
+
+# The same four skills' new home, and the one rule this change actually needed.
+# home-manager moved its `home.file` targets from .claude/skills/<name> to
+# .claude/skills-hm/<name> because `skills/` is a read-only projection after the
+# runtime-layout cutover and a write inside it fails the next
+# `nixos-rebuild switch`. While ~/.claude is still this checkout, that directory
+# is untracked content in the repo root, and repo-autosync commits whatever is
+# untracked -- so ignore it rather than leave it merely unstaged.
+# runtime/skills/<name> links into it; see ALLOWED_ABSOLUTE in
+# runtime/scripts/runtime-layout.py.
+/skills-hm/
 
 # CI-stability monitoring runtime (per-PR logs + state)
 loops/

@@ -16,9 +16,16 @@ import time
 
 import pytest
 
-from conftest import REPO_ROOT  # noqa: E402
+# Anchored here, not imported from `conftest`: tests/ and tests/ai-router/ both
+# hold a module named `conftest`, and in a whole-tree run `from conftest import`
+# resolves to whichever was imported last.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-SERVER = os.path.join(REPO_ROOT, "mcps", "egress-guard", "server.py")
+# `runtime/` once the layout migration has landed, the repository root
+# before it. Only the projected subset moves; tests/ stays at the root.
+RUNTIME = os.path.join(REPO_ROOT, "runtime") if os.path.isdir(
+    os.path.join(REPO_ROOT, "runtime")) else REPO_ROOT
+SERVER = os.path.join(RUNTIME, "mcps", "egress-guard", "server.py")
 RESOURCE = "forum.example.test"
 
 
@@ -185,10 +192,22 @@ def test_acquire_enforces_the_floor_across_calls(state_dir, policy_file):
     # The guarantee is on the RESERVED slot: it is assigned under the lock, so
     # it is exact and is what spaces concurrent processes.
     assert second["slot_at"] - first["slot_at"] >= 5.0 - 1e-9
-    # Wall-clock spacing inherits lock + IPC jitter on the un-waited first call
-    # (its slot is stamped a few ms before it returns), so allow for that.
-    assert second["granted_at"] - first["granted_at"] >= 5.0 - 0.05
-    assert second["waited_s"] >= 5.0 - 0.05
+    # A grant is never handed out before its own slot: `_sleep_until` loops
+    # until the clock reaches it, so this holds exactly, for both calls.
+    assert first["granted_at"] >= first["slot_at"]
+    assert second["granted_at"] >= second["slot_at"]
+    # Therefore the second request really does go out a full floor after the
+    # first one's reserved slot. Measured against that slot and not against
+    # `first["granted_at"]`, which is stamped after the first call's own state
+    # write and so trails its slot by however long an fsync took: the 50ms this
+    # line used to allow for that was exceeded (86ms) under a loaded
+    # whole-corpus run, and no fixed allowance is sound here.
+    assert second["granted_at"] - first["slot_at"] >= 5.0 - 1e-9
+    # The second call parked rather than being granted straight away. Its
+    # `waited_s` counts from its own arrival, which is an unbounded IPC delay
+    # after the first call returned, so it carries no floor of its own -- the
+    # spacing claim above is the one with teeth.
+    assert second["waited_s"] > 0
 
 
 def test_cooldown_makes_acquire_an_error_not_a_grant(state_dir, policy_file):
@@ -362,7 +381,7 @@ def test_failing_preflight_is_refused_over_the_wire(state_dir, policy_file):
 
 def test_shipped_policy_file_is_valid_json_and_conservative():
     """The policy that ships with the server must parse and must not be permissive."""
-    path = os.path.join(REPO_ROOT, "mcps", "egress-guard", "egress-policy.json")
+    path = os.path.join(RUNTIME, "mcps", "egress-guard", "egress-policy.json")
     with open(path, "r", encoding="utf-8") as fh:
         doc = json.load(fh)
     defaults = doc["defaults"]

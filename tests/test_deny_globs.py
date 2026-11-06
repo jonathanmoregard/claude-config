@@ -206,9 +206,48 @@ import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
+# This module is a LIVE SUITE: the probes below drive a real `claude -p` and
+# cost real money (measured at roughly $0.10 for the core scope), and they run
+# at IMPORT time -- so merely collecting this file under pytest starts paid API
+# calls. That is not hypothetical: it happened twice while this corpus was
+# being repaired, because `pytest tests` and even `pytest --collect-only`
+# import every module they collect.
+#
+# Until the runtime/ cutover it was masked. This file read a `settings.json`
+# that had moved, so the import died early and the probes never started; the
+# stale path was acting as an accidental interlock, and repairing the path
+# removed it.
+#
+# The gate is on IMPORT, not on the suite: run as `python3 tests/test_deny_globs.py`
+# this file still has `__name__ == "__main__"` and every probe runs exactly as
+# before. Nothing about the proof itself is weakened -- and deliberately so,
+# because making the deny-glob proof opt-in behind an env var was once the bug:
+# the gate then ran its offline half only and proved nothing about the CLI's
+# permission surface.
+#
+# But that leaves the suite with no automatic runner, which is worth stating
+# plainly rather than implying CI covers it. `tests/smoke.sh` TEST 50 was the
+# only thing that ever invoked this file, and its discovery greps
+# `$WORKTREE/hooks` -- emptied by the `runtime/` cutover -- so it now hits
+# `fail "50: DISCOVERY FAILED"` instead. Until smoke.sh is repaired, this proof
+# runs only when somebody runs it.
+#
+# `live suite:`, not `script suite:` -- tests/conftest.py converts the latter
+# into a subprocess run, which is exactly what must NOT happen here.
+if __name__ != "__main__":
+    import pytest
+
+    pytest.skip("live suite: drives a real `claude -p` at import time and costs "
+                "real money; run it deliberately with "
+                "`python3 tests/test_deny_globs.py` (exit 0 = all green)",
+                allow_module_level=True)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
-HOOKS = os.path.join(REPO_ROOT, "hooks")
+# The shipped config lives one level down in runtime/ since the runtime cutover;
+# tolerate both layouts, same anchor as the other top-level suites.
+RUNTIME = os.path.join(REPO_ROOT, "runtime") if os.path.isdir(os.path.join(REPO_ROOT, "runtime")) else REPO_ROOT
+HOOKS = os.path.join(RUNTIME, "hooks")
 
 FAILURES: list[str] = []
 SKIPS: list[str] = []
@@ -426,7 +465,7 @@ if _bundle_ok:
 # ----------------------------------------------------------------------
 # The rule set under test.
 # ----------------------------------------------------------------------
-with open(os.path.join(REPO_ROOT, "settings.json"), encoding="utf-8") as _fh:
+with open(os.path.join(RUNTIME, "settings.json"), encoding="utf-8") as _fh:
     SETTINGS = json.load(_fh)
 DENY = SETTINGS.get("permissions", {}).get("deny", [])
 BASH_RULES = [r for r in DENY if r.startswith("Bash(") and r != "Bash"]

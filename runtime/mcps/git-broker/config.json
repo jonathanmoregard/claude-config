@@ -1,0 +1,44 @@
+{
+  "gitBroker": {
+    "version": 1,
+    "repositoryRoots": [
+      "/home/jonathan/Repos",
+      "/home/jonathan/worktrees"
+    ],
+    "metadataRoots": [
+      "/home/jonathan/Repos",
+      "/home/jonathan/worktrees"
+    ],
+    "protectedWorktrees": [
+      "/home/jonathan/Repos/klaffat",
+      "/home/jonathan/.claude",
+      "/home/jonathan/Repos/claude-config"
+    ],
+    "worktreeCreationRoots": [
+      "/home/jonathan/worktrees",
+      "/home/jonathan/Repos/nixos-config-worktrees"
+    ],
+    "allowedRemoteHosts": [
+      "github.com"
+    ],
+    "allowedRemoteSchemes": [
+      "https",
+      "ssh"
+    ],
+    "gitExecutable": "git",
+    "bubblewrapExecutable": "bwrap",
+    "validatorExecutable": "dcg",
+    "credentialHelperExecutable": "/etc/profiles/per-user/jonathan/bin/gh",
+    "githubCliExecutable": "/etc/profiles/per-user/jonathan/bin/gh",
+    "waitForExecutable": "/home/jonathan/.claude/scripts/wait-for",
+    "watchStatusDir": "%t/git-broker/watch",
+    "githubHostTokenDir": "/home/jonathan/.cache/gh-tokens/host",
+    "sshKnownHostsFile": "/home/jonathan/.ssh/known_hosts",
+    "trustedHooksDir": "/home/jonathan/.config/git/hooks",
+    "commitUserName": "jonathanmoregard",
+    "commitUserEmail": "10191435+jonathanmoregard@users.noreply.github.com",
+    "discoveryTimeoutMs": 5000,
+    "maxTimeoutMs": 600000,
+    "outputLimitChars": 60000
+  }
+}

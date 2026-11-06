@@ -1,0 +1,1 @@
+A data refresh (`./job.sh`) is already running as the user unit named in `unit-name.txt`; don't start it again. It logs progress to `job.log` and should take a minute or two. Keep an eye on it: check the log every 15 seconds until it's done (the log ends with a `RESULT:` line and then `DONE`), then tell me the RESULT value.
