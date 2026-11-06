@@ -528,7 +528,7 @@ jobs:
           python3 runtime/scripts/agent-e2e/agent_e2e.py run \
             tests/agent-e2e/skill-description-audit \
             --arm candidate=HEAD --n "$RUNS" --jobs "$RUNS" \
-            --model claude-sonnet-5-5 --budget 1 --timeout "$deadline" \
+            --model claude-haiku-5-5 --budget 1 --timeout "$deadline" \
             --out /tmp/agent-e2e
 
       # The harness exits 0 whatever the verdicts; the gate is here. FAIL is a
