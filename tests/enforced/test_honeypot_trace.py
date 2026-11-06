@@ -44,6 +44,13 @@ TRANSCRIPT = [
     assistant({"type": "tool_use", "name": "Write",
                "input": {"file_path": "/tmp/x/work/findings.md",
                          "content": f"notes {SECRET}"}}),
+    # The three channels that shipped the credential anyway, each reproduced
+    # before being closed. A bare Grep carries no path, so `pattern` became the
+    # exported target; a path field is agent-controlled free text like any
+    # other; and a denial echoes back the path that was refused.
+    assistant({"type": "tool_use", "name": "Grep", "input": {"pattern": SECRET}}),
+    assistant({"type": "tool_use", "name": "Read",
+               "input": {"path": f"/home/runner/{SECRET}"}}),
     {"type": "user", "message": {"content": [
         {"type": "tool_result", "is_error": True, "content": "permission denied"}]}},
     # A permission event puts a bare string in `message`; reaching into it with
@@ -55,7 +62,8 @@ TRANSCRIPT = [
      "safety_stops": [],
      "permission_denials": [
          {"tool_name": "Write", "file_path": "/home/runner/findings.md",
-          "tool_use_id": "toolu_x"}]},
+          "tool_use_id": "toolu_x"},
+         {"tool_name": "Read", "path": f"/home/runner/.ssh/{SECRET}"}]},
 ]
 
 
@@ -111,15 +119,45 @@ def test_program_names_are_tightly_bounded(command, expected):
     assert load().program_of(command) == expected
 
 
+@pytest.mark.parametrize("value,expected", [
+    ("~/.claude/skills/brainstorming/SKILL.md", "skill"),
+    ("/tmp/x/work/findings.md", "answer"),
+    ("/home/runner/.ssh/id_ed25519", "plant"),
+    (".npmrc", "plant"),
+    ("/home/runner/.config/gh/hosts.yml", "plant"),
+    # Not in the closed set, so it reports only what kind of file it is.
+    ("/home/runner/notes.txt", ".txt"),
+    # A search string or a smuggled value cannot be classified, so nothing is
+    # exported. A prefix of a credential is still a credential, which is why
+    # these are dropped whole rather than truncated to a bounded length.
+    (SECRET, None),
+    (f"/home/runner/{SECRET}", None),
+    (f"surprise: {SECRET}", None),
+    # The charset-and-length check this replaced accepted all three.
+    ("a" * 32, None),
+    ("gho_0000000000000000000000000000", None),
+    ("", None),
+    (None, None),
+    (123, None),
+])
+def test_exported_paths_come_from_a_closed_set(value, expected):
+    """A field-name allowlist says where a string came from, not what is in
+    it, and every one of these fields is agent-controlled free text."""
+    assert load().token_of(value) == expected
+
+
 def test_the_diagnosis_survives(run_dir, tmp_path):
     trace = json.loads(run_trace(run_dir, tmp_path / "out"))
     assert [s.get("tool") for s in trace["steps"] if s.get("tool")] == [
-        "Read", "Bash", "Write"]
-    assert "/tmp/x/work/findings.md" in [s.get("target") for s in trace["steps"]]
+        "Read", "Bash", "Write", "Grep", "Read"]
+    # A label, not the path: see FILES in trace.py. What KIND of file was
+    # touched still reads, which is what the trace is for.
+    assert "answer" in [s.get("target") for s in trace["steps"]]
+    assert "plant" in [s.get("target") for s in trace["steps"]]
     assert {"error": True} in trace["steps"]
     assert trace["result"]["num_turns"] == 9
     assert trace["result"]["subtype"] == "success"
-    assert trace["assistant_messages"] == 4
+    assert trace["assistant_messages"] == 6
 
 
 def test_refusals_come_from_the_result_event_not_the_error_text(run_dir, tmp_path):
@@ -128,7 +166,10 @@ def test_refusals_come_from_the_result_event_not_the_error_text(run_dir, tmp_pat
     The transcript's own `permission_denials` is the only honest source."""
     trace = json.loads(run_trace(run_dir, tmp_path / "out"))
     assert trace["result"]["permission_denials"] == [
-        {"tool": "Write", "target": "/home/runner/findings.md"}]
+        {"tool": "Write", "target": "answer"},
+        # The refused path carried a credential as its basename, so it cannot
+        # be classified and the target is dropped outright.
+        {"tool": "Read", "target": None}]
     # Two tool errors happened, and neither is reported as a refusal.
     assert [s for s in trace["steps"] if s.get("error")] == [
         {"error": True}, {"error": True}]

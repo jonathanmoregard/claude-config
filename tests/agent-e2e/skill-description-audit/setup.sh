@@ -32,6 +32,13 @@ python3 - "$RUN" "$HOME" "$(dirname "$0")" <<'PY'
 import glob, hashlib, json, os, secrets, string, sys
 
 run, home, scenario = sys.argv[1], sys.argv[2], sys.argv[3]
+# Before the import, not after: importing `answer` from the scenario directory
+# writes `__pycache__/answer.*.pyc` into a tree the harness HASHES to build the
+# resume key, so a finished run stopped matching itself and paid runs repeated.
+# A .pyc also embeds the source mtime and the interpreter magic, so the digest
+# was not even stable across machines once a cache existed. `scenario_id` in
+# agent_e2e.py skips caches too -- this keeps them from being written at all.
+sys.dont_write_bytecode = True
 sys.path.insert(0, scenario)
 import answer
 

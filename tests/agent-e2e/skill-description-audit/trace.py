@@ -16,16 +16,48 @@ import os
 import re
 import sys
 
-# Keys that name a file or command target. Everything else in a tool_use input
-# is dropped: `content`, `old_string`, a Bash `command` and a WebFetch `prompt`
+# Keys that name a file target. Everything else in a tool_use input is
+# dropped: `content`, `old_string`, a Bash `command` and a WebFetch `prompt`
 # all quote what the agent read.
-PATH_KEYS = ("file_path", "path", "notebook_path", "pattern")
+#
+# `pattern` was here and had to go: a bare `Grep` carries no path, so the
+# search string became the exported target, and a run that grepped for a
+# credential published it into an artifact CI uploads even when grading fails.
+# Reproduced with `Grep({"pattern": <value>})`.
+PATH_KEYS = ("file_path", "path", "notebook_path")
 
-# Measured: a real run drives everything through Bash, so without this the
-# whole trace is `Bash, error, Bash` and diagnoses nothing. Only the program
-# name is taken, and only when it looks like one -- anything else is dropped,
-# so a command cannot smuggle its arguments through this field.
-PROGRAM = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
+# Exported values come from CLOSED SETS and are never copied out of the
+# transcript. A field-name allowlist says where a string came from and nothing
+# about what is in it, and every one of these fields is agent-controlled free
+# text: a bare `Grep` has no path, so its search string became the exported
+# target and a run that grepped for a credential published it.
+#
+# A charset-and-length check was tried first and is NOT enough -- the trace
+# suite's own fixture credential is 32 characters of `[A-Za-z0-9_]` and
+# satisfies one. Any such rule is a redaction pattern, which is the thing this
+# file exists to avoid. So a file is reported as a label or an extension, and a
+# command as a program name only if it is one named here.
+#
+# What this costs: the trace says `skill`, not which skill. The step count and
+# the verdict's own `recall=` carry that, and neither is agent-controlled.
+FILES = {
+    "SKILL.md": "skill",
+    "findings.md": "answer",
+    "hosts.yml": "plant",
+    ".npmrc": "plant",
+    "id_ed25519": "plant",
+    "id_ed25519.pub": "plant",
+}
+EXTENSION = re.compile(r"^\.[A-Za-z0-9]{1,8}$")
+
+# Measured: a real run drives everything through Bash, so without the program
+# name the whole trace is `Bash, error, Bash` and diagnoses nothing.
+PROGRAMS = frozenset((
+    "awk", "bash", "cat", "chmod", "cp", "curl", "cut", "echo", "env", "find",
+    "gh", "git", "grep", "head", "jq", "ls", "mv", "nc", "node", "npm",
+    "printf", "python", "python3", "readlink", "realpath", "rg", "rm", "scp",
+    "sed", "sh", "sort", "ssh", "tail", "tr", "uniq", "wc", "wget", "xargs",
+))
 
 # Refusals come from the result event's `permission_denials`, never from
 # matching the error text. Tried and rejected: a regex over tool output called
@@ -42,12 +74,35 @@ def blocks(event):
     return content if isinstance(content, list) else []
 
 
-def program_of(command):
-    token = command.strip().split(maxsplit=1)
-    if not token:
+def token_of(value):
+    """What kind of file VALUE names: a label, an extension, or None.
+
+    None whenever the answer is not in a closed set, because a value that
+    cannot be classified is a value whose contents are unknown.
+    """
+    if not isinstance(value, str):
         return None
-    name = os.path.basename(token[0])
-    return name if PROGRAM.match(name) else None
+    name = os.path.basename(value.strip().rstrip("/"))
+    if name in FILES:
+        return FILES[name]
+    suffix = os.path.splitext(name)[1]
+    return suffix if EXTENSION.match(suffix) else None
+
+
+def tool_of(name):
+    """A tool name comes from the harness's registry, not from the model, but
+    it is exported the same way: unchanged only if it is a bare word."""
+    return name if isinstance(name, str) and name.isalnum() else None
+
+
+def program_of(command):
+    if not isinstance(command, str):
+        return None
+    first = command.strip().split(maxsplit=1)
+    if not first:
+        return None
+    name = os.path.basename(first[0])
+    return name if name in PROGRAMS else None
 
 
 def denials_of(event):
@@ -56,8 +111,11 @@ def denials_of(event):
     out = []
     for entry in raw if isinstance(raw, list) else []:
         if isinstance(entry, dict):
-            out.append({"tool": entry.get("tool_name") or entry.get("tool"),
-                        "target": entry.get("path") or entry.get("file_path")})
+            # Through token_of like every other exported value: a denial echoes
+            # back the path the agent asked for, so this field is as
+            # agent-controlled as the tool input it refused.
+            out.append({"tool": tool_of(entry.get("tool_name") or entry.get("tool")),
+                        "target": token_of(entry.get("path") or entry.get("file_path"))})
         else:
             out.append({"tool": None, "target": None})
     return out
@@ -77,11 +135,11 @@ def tool_step(block):
     if isinstance(data, dict):
         for key in PATH_KEYS:
             if isinstance(data.get(key), str):
-                target = data[key]
+                target = token_of(data[key])
                 break
         if target is None and isinstance(data.get("command"), str):
             target = program_of(data["command"])
-    return {"tool": block.get("name"), "target": target}
+    return {"tool": tool_of(block.get("name")), "target": target}
 
 
 def trace_of(path):

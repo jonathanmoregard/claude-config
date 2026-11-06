@@ -23,6 +23,7 @@ python3 - "$RUN" "$(dirname "$0")" <<'PY'
 import hashlib, json, os, re, sys
 
 run, scenario = sys.argv[1], sys.argv[2]
+sys.dont_write_bytecode = True   # see setup.sh: a .pyc here changes the resume key
 sys.path.insert(0, scenario)
 import answer
 
