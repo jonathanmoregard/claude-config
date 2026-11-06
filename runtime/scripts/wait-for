@@ -45,6 +45,8 @@
 #       2 settled but not mergeable (conflict) or PR closed unmerged ·
 #       3 settled, but its outcome could not be read · 124 timed out ·
 #       64 usage error.
+# Exit 3 includes a PR whose checks never reported at all: "no checks" is not
+# a pass, so re-run the wait rather than reading 3 as green.
 # The waiting inside is a loop on purpose: it runs detached in one background
 # call, never in a foreground turn.
 # END USAGE
@@ -209,6 +211,19 @@ wait_host_watch() {
 
 pr_field() { gh pr view "$target" "${repo[@]}" --json "$1" --jq ".$1" 2>/dev/null; }
 
+# True while Actions has a run for the PR head that has not completed. Checks
+# attach to a run after it registers, so this is live well before `gh pr
+# checks` reports anything.
+head_run_live() {
+  local sha out
+  sha=$(pr_field headRefOid) || return 1
+  [ -n "$sha" ] || return 1
+  out=$(gh run list "${repo[@]}" --commit "$sha" --limit 100 --json status \
+    2>/dev/null) || return 1
+  [[ $out == \[* ]] || return 1
+  [ "$(jq '[.[] | select(.status != "completed")] | length' <<<"$out")" != 0 ]
+}
+
 wait_pr() {
   case $target in ''|*[!0-9]*) usage ;; esac
   local state checks_rc=0 m ms checks=n/a failed="?"
@@ -225,8 +240,14 @@ wait_pr() {
       if [[ $out == \[* ]]; then checks=present; break; fi
       if [[ $out == *"no checks reported"* ]]; then
         checks=none
-        [ $n -lt 3 ] || break
-        sleep 10; n=$((n + 1))
+        # Pushing to a PR moves its head, so the previous run's checks stop
+        # attaching and the new run may be queued, or not yet created. Both
+        # read as "no checks reported". Waiting a fixed 30s was not enough:
+        # keep waiting as long as Actions has an incomplete run for this
+        # head, and only count down the grace window when it does not.
+        if head_run_live; then n=0; else n=$((n + 1)); fi
+        [ $n -lt 12 ] || break
+        nap 10
       else
         checks="unreadable (${out:0:80})"; break
       fi
@@ -261,6 +282,11 @@ wait_pr() {
   [ "$failed" != 0 ] && [ "$failed" != "?" ] && exit 1
   [ "$m" = CONFLICTING ] && exit 2
   [[ $checks == unreadable* ]] && exit 3
+  # Neither of these is evidence that CI passed, and both used to exit 0,
+  # which a caller cannot tell from a green run: `checks=none` means nothing
+  # ever reported, and `failed=?` means the query behind the verdict failed.
+  [ "$checks" = none ] && exit 3
+  [ "$failed" = "?" ] && exit 3
   exit 0
 }
 
@@ -297,8 +323,9 @@ runs_settled() {
       --json status,conclusion,name 2>/dev/null) || return 1
     busy=$(jq '[.[] | select(.status != "completed")] | length' <<<"$out")
     if [ "$(jq length <<<"$out")" = 0 ]; then
-      # Runs register a few seconds after a push; none after ~2 min = none.
-      [ $n -lt 12 ] || { failed=0; return 0; }
+      # No run at all after ~2 min. Unknown, not a pass: with checks already
+      # unreadable there is now nothing left that could report an outcome.
+      [ $n -lt 12 ] || { failed="?"; return 0; }
       n=$((n + 1))
     elif [ "$busy" = 0 ]; then
       failed=$(jq '[.[] | select(.conclusion as $c
