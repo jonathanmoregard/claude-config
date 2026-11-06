@@ -11,11 +11,18 @@ import re
 import subprocess
 import sys
 
-from conftest import REPO_ROOT
+# Anchored here, not imported from `conftest`: tests/ and tests/ai-router/ both
+# hold a module named `conftest`, and in a whole-tree run `from conftest import`
+# resolves to whichever was imported last.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-SKILL = os.path.join(REPO_ROOT, "skills", "adopting-an-external-api", "SKILL.md")
-CLI = os.path.join(REPO_ROOT, "bin", "egress-sink")
-LINT = os.path.join(REPO_ROOT, "bin", "lint-direct-egress")
+# `runtime/` once the layout migration has landed, the repository root
+# before it. Only the projected subset moves; tests/ stays at the root.
+RUNTIME = os.path.join(REPO_ROOT, "runtime") if os.path.isdir(
+    os.path.join(REPO_ROOT, "runtime")) else REPO_ROOT
+SKILL = os.path.join(RUNTIME, "skills", "adopting-an-external-api", "SKILL.md")
+CLI = os.path.join(RUNTIME, "bin", "egress-sink")
+LINT = os.path.join(RUNTIME, "bin", "lint-direct-egress")
 
 
 def read_skill() -> str:
@@ -61,7 +68,7 @@ def test_skill_carries_no_incident_provenance():
 
 def test_systemd_unit_restarts_always():
     """The 'proxy is down so I used the real URL' bypass is closed by restarting."""
-    path = os.path.join(REPO_ROOT, "mcps", "egress-guard", "egress-sink.service")
+    path = os.path.join(RUNTIME, "mcps", "egress-guard", "egress-sink.service")
     with open(path, "r", encoding="utf-8") as fh:
         unit = fh.read()
     assert "Restart=always" in unit

@@ -1,17 +1,9 @@
 #!/usr/bin/env python3
-"""SessionStart check: tell the session which system units are failing.
+"""SessionStart check: tell the session which units are recorded as failing.
 
-A system unit's `OnFailure=` notifier reaches the journal and a desktop toast,
-neither of which a Claude session reads (2026-08-31 constraint: failure
-notifications must reach Claude). nixos-config therefore has failing system
-units write a durable record, `/var/lib/unit-failures/<unit>.json`, and
-delete it on the next successful run. First producer: nix-gc.service
-(nixos-config modules/nixos/nix-gc.nix), whose keep-recent pin step fails
-closed — so a broken `nix path-info` stops every scheduled GC.
-
-Same shape as `claude-pull-health.py` / `ai-router-health.py`, but generic
-over units: any system unit that writes the record shape below is covered
-without a new hook.
+System and user units write the same durable record shape. The system directory
+is root-owned; the user directory is writable by the desktop user and therefore
+has a stricter trust boundary.
 
 Record (JSON object): unit, result, exit_status, failed_at, summary, inspect.
 
@@ -20,9 +12,9 @@ present speaks; an unreadable record speaks too, because silence must mean
 "nothing recorded as failing", never "could not tell". Dot-prefixed files are
 the writer's in-flight temp files and are skipped.
 
-Record content is untrusted text from a root service: each announcement is
-collapsed to one line and length-capped. Stdlib only, `python3 -S -E` safe,
-fail-open but never silent. Test: tests/test_unit_failure_health_hook.py.
+Record content is collapsed to one line and length-capped. User records never
+provide executable inspection guidance. Stdlib only, `python3 -S -E` safe,
+fail-open but never silent.
 """
 from __future__ import annotations
 
@@ -33,6 +25,7 @@ import re
 import sys
 
 DEFAULT_DIR = "/var/lib/unit-failures"
+DEFAULT_USER_DIR = os.path.expanduser("~/.local/state/claude-unit-failures")
 FIELD_MAX = 300
 LINE_MAX = 900
 
@@ -47,7 +40,7 @@ def one_line(value: object, limit: int = FIELD_MAX) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def describe(path: str) -> str:
+def describe(path: str, *, trusted_inspect: bool) -> str:
     name = os.path.basename(path)[: -len(".json")]
     try:
         with open(path, encoding="utf-8") as fh:
@@ -61,7 +54,15 @@ def describe(path: str) -> str:
     result = one_line(rec.get("result") or "?", 40)
     status = one_line(rec.get("exit_status") or "?", 40)
     summary = one_line(rec.get("summary") or "")
-    inspect = one_line(rec.get("inspect") or f"journalctl -u {unit} -n 100", 120)
+    if trusted_inspect:
+        inspect = one_line(rec.get("inspect") or f"journalctl -u {unit} -n 100", 120)
+    else:
+        record_name = os.path.basename(path)[: -len(".json")]
+        if re.fullmatch(r"[A-Za-z0-9._-]+", record_name):
+            safe_unit = record_name if record_name.endswith(".service") else record_name + ".service"
+            inspect = f"journalctl --user -u {safe_unit} -n 100"
+        else:
+            inspect = "systemctl --user --failed"
     line = f"{unit} FAILED at {when} (result={result} status={status})"
     if summary:
         line += f": {summary}"
@@ -69,19 +70,28 @@ def describe(path: str) -> str:
     return line
 
 
-def main() -> int:
-    with contextlib.suppress(OSError):  # hook stdin is informational only
-        sys.stdin.read()
-    directory = os.environ.get("UNIT_FAILURES_DIR") or DEFAULT_DIR
+def read_directory(directory: str, *, trusted_inspect: bool) -> list[str]:
+    """A missing directory is empty; every other read failure must speak."""
     try:
-        if not os.path.isdir(directory):
-            return 0
         names = sorted(
             n for n in os.listdir(directory) if n.endswith(".json") and not n.startswith(".")
         )
-        lines = [describe(os.path.join(directory, n)) for n in names]
+    except FileNotFoundError:
+        return []
     except Exception as exc:  # fail-open, but never silently
-        lines = [f"could not read {directory}: {type(exc).__name__}"]
+        return [f"could not read {directory}: {type(exc).__name__}"]
+    return [
+        describe(os.path.join(directory, name), trusted_inspect=trusted_inspect)
+        for name in names
+    ]
+
+
+def main() -> int:
+    with contextlib.suppress(OSError):  # hook stdin is informational only
+        sys.stdin.read()
+    system_directory = os.environ.get("UNIT_FAILURES_DIR") or DEFAULT_DIR
+    lines = read_directory(system_directory, trusted_inspect=True)
+    lines.extend(read_directory(DEFAULT_USER_DIR, trusted_inspect=False))
     for line in lines:
         print(f"[unit-failure] {one_line(line, LINE_MAX)}")
     return 0

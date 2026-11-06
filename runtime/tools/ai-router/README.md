@@ -120,7 +120,7 @@ unparseable · `7` job not found / not finished.
 ## Test-only environment
 
 `AI_ROUTER_CODEX_BIN` / `AI_ROUTER_CLAUDE_BIN` override binary resolution;
-the unit suite points them at `tests/fixtures/fake_codex.py` and
+the unit suite points them at `tests/ai-router/fixtures/fake_codex.py` and
 `fake_claude.py`. No test performs a network or real provider call.
 
 ## Running the tests
@@ -128,5 +128,5 @@ the unit suite points them at `tests/fixtures/fake_codex.py` and
 pytest is not in the base `python3`; use the nix-provided one:
 
 ```
-nix shell nixpkgs#python3Packages.pytest -c pytest -q tools/ai-router/tests
+nix shell nixpkgs#python3Packages.pytest -c pytest -q tests/ai-router
 ```

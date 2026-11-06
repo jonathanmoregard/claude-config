@@ -14,8 +14,17 @@ import sys
 
 import pytest
 
-from conftest import REPO_ROOT
-from egress_guard.limiter import (
+# Anchored here, not imported from `conftest`: tests/ and tests/ai-router/ both
+# hold a module named `conftest`, and in a whole-tree run `from conftest import`
+# resolves to whichever was imported last. `egress_guard` and the registry and
+# policy files ship under runtime/.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RUNTIME = (os.path.join(REPO_ROOT, "runtime")
+           if os.path.isdir(os.path.join(REPO_ROOT, "runtime")) else REPO_ROOT)
+if RUNTIME not in sys.path:
+    sys.path.insert(0, RUNTIME)
+
+from egress_guard.limiter import (  # noqa: E402
     BudgetExhausted,
     CooldownActive,
     EgressGuard,
@@ -188,7 +197,7 @@ def test_recorded_block_survives_state_deletion(state_dir, policy_file):
 
 def test_shipped_policy_arms_both_gates_for_the_incident_host():
     """A gate that ships disabled is documentation, not a gate."""
-    path = os.path.join(REPO_ROOT, "mcps", "egress-guard", "egress-policy.json")
+    path = os.path.join(RUNTIME, "mcps", "egress-guard", "egress-policy.json")
     with open(path, "r", encoding="utf-8") as fh:
         doc = json.load(fh)
     assert doc["defaults"]["require_declaration"] is True
@@ -290,9 +299,9 @@ def test_block_recorded_while_parked_cancels_the_grant(state_dir, policy_file):
                 "EgressGuard(state_dir=%r,policy_path=%r).record_block("
                 "'host.test', reason='bot challenge')\n"
             )
-            % (REPO_ROOT, state_dir, policy),
+            % (RUNTIME, state_dir, policy),
         ],
-        cwd=REPO_ROOT,
+        cwd=RUNTIME,
     )
     try:
         with pytest.raises(CooldownActive) as exc:
@@ -320,11 +329,11 @@ def test_declared_floor_propagates_to_other_processes(state_dir, policy_file):
         "g=EgressGuard(state_dir=%r,policy_path=%r)\n"
         "for _ in range(2):\n"
         "    print(g.acquire('host.test', min_interval_s=0.01).slot_at, flush=True)\n"
-    ) % (REPO_ROOT, state_dir, policy)
+    ) % (RUNTIME, state_dir, policy)
 
     procs = [
         subprocess.Popen(
-            [sys.executable, "-c", code], cwd=REPO_ROOT, stdout=subprocess.PIPE, text=True
+            [sys.executable, "-c", code], cwd=RUNTIME, stdout=subprocess.PIPE, text=True
         )
         for _ in range(2)
     ]
@@ -336,7 +345,7 @@ def test_declared_floor_propagates_to_other_processes(state_dir, policy_file):
 
 def test_registered_server_carries_no_policy_or_state_override():
     """The env vars that could point the gate at a permissive policy stay unset."""
-    path = os.path.join(REPO_ROOT, "mcp-servers.json")
+    path = os.path.join(RUNTIME, "mcp-servers.json")
     with open(path, "r", encoding="utf-8") as fh:
         registry = json.load(fh)
     entry = registry["egress-guard"]
@@ -346,7 +355,7 @@ def test_registered_server_carries_no_policy_or_state_override():
 
 def test_shipped_policy_documents_every_honoured_key():
     """A key the limiter honours but the policy file never mentions is invisible."""
-    path = os.path.join(REPO_ROOT, "mcps", "egress-guard", "egress-policy.json")
+    path = os.path.join(RUNTIME, "mcps", "egress-guard", "egress-policy.json")
     with open(path, "r", encoding="utf-8") as fh:
         doc = json.load(fh)
     readme = " ".join(doc.get("_README") or [])

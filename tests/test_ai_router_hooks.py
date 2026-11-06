@@ -25,12 +25,15 @@ import zoneinfo
 import pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-HOOKS = os.path.join(REPO_ROOT, "hooks")
+# The shipped config lives one level down in runtime/ since the runtime cutover;
+# tolerate both layouts, same anchor as the other top-level suites.
+RUNTIME = os.path.join(REPO_ROOT, "runtime") if os.path.isdir(os.path.join(REPO_ROOT, "runtime")) else REPO_ROOT
+HOOKS = os.path.join(RUNTIME, "hooks")
 TEE = os.path.join(HOOKS, "statusline-quota-tee.sh")
 STOP_FAILURE = os.path.join(HOOKS, "ai-router-stop-failure.py")
 GATE = os.path.join(HOOKS, "ai-router-agent-gate.py")
 STUB = os.path.join(REPO_ROOT, "tests", "stubs", "ai-router-stub.py")
-SETTINGS = os.path.join(REPO_ROOT, "settings.json")
+SETTINGS = os.path.join(RUNTIME, "settings.json")
 BASH = shutil.which("bash")
 
 STATUSLINE_STDIN = {

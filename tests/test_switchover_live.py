@@ -85,9 +85,24 @@ import sys
 import tempfile
 import uuid
 
+# LIVE and PAID: the probes below run a real, logged-in `claude -p` against the
+# model API, from module level. A pytest import would fire them during
+# collection (even --collect-only), and the file ends in `sys.exit`, which
+# aborts the whole pytest session. So under pytest it stops here, before the
+# CLI is even resolved. Run it deliberately, on the host, as a script.
+if __name__ != "__main__":
+    import pytest
+    pytest.skip("live suite: drives a real logged-in headless Claude Code (paid "
+                "API calls); run deliberately as `python3 tests/test_switchover_live.py`",
+                allow_module_level=True)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
-HOOKS = os.path.join(REPO_ROOT, "hooks")
+# `$HOME/.claude/` is a projection of `runtime/` since the layout cutover, so
+# that is what hook commands repoint at and where settings.json lives.
+RUNTIME = (os.path.join(REPO_ROOT, "runtime")
+           if os.path.isdir(os.path.join(REPO_ROOT, "runtime")) else REPO_ROOT)
+HOOKS = os.path.join(RUNTIME, "hooks")
 
 FAILURES: list[str] = []
 
@@ -142,7 +157,7 @@ if _EXPECT and _EXPECT != CLI_VERSION:
 # ----------------------------------------------------------------------
 SCRATCH = tempfile.mkdtemp(prefix="switchover-live-")
 
-with open(os.path.join(REPO_ROOT, "settings.json"), encoding="utf-8") as _fh:
+with open(os.path.join(RUNTIME, "settings.json"), encoding="utf-8") as _fh:
     SETTINGS = json.load(_fh)
 
 _GUARD_BASENAMES = ("bash-guard.py", "bash-output-guard.py", "bash-guard-health.py")
@@ -152,7 +167,7 @@ def _repoint(command: str) -> str:
     """Point a hook command at THIS worktree instead of the live install."""
     out = command
     for prefix in ("$HOME/.claude/", "~/.claude/", os.path.expanduser("~/.claude/")):
-        out = out.replace(prefix, REPO_ROOT + "/")
+        out = out.replace(prefix, RUNTIME + "/")
     return out
 
 

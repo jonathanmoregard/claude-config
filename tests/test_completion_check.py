@@ -16,7 +16,7 @@ import sys
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-HOOK = ROOT / "hooks/completion-check.py"
+HOOK = ROOT / "runtime/hooks/completion-check.py"
 NWO = "acme/widget"
 URL = f"https://github.com/{NWO}.git"
 GENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
@@ -181,6 +181,38 @@ def test_private_repo_without_pr_ci_still_needs_a_pr(w):
     w.bash("git push", repo)
     w.gh(visibility="PRIVATE")
     assert "has no PR" in ctx(w.run())
+
+
+# The measured visibility goes in the sentence the agent reads. 2026-10-27: an
+# agent read "pushed but has no PR" eight times on a public repo, called it
+# "private" anyway, and asked permission to open the PR.
+
+def test_no_pr_gap_names_public_visibility(w):
+    repo = w.repo()
+    w.feature(repo)
+    (repo / ".github/workflows").mkdir(parents=True)
+    (repo / ".github/workflows/ci.yml").write_text("on:\n  pull_request:\n")
+    w.bash("git push", repo)
+    w.gh(visibility="PUBLIC")
+    assert "feat/x is pushed but has no PR (repo is PUBLIC, not PR-gated)" in ctx(w.run())
+
+
+def test_no_pr_gap_names_private_visibility_and_why_not_gated(w):
+    repo = w.repo()
+    w.feature(repo)
+    w.bash("git push", repo)
+    w.gh(visibility="PRIVATE")
+    assert ("feat/x is pushed but has no PR "
+            "(repo is PRIVATE, no pull_request workflow, not PR-gated)") in ctx(w.run())
+
+
+def test_visibility_is_looked_up_once(w):
+    repo = w.repo()
+    w.feature(repo)
+    w.bash("git push", repo)
+    w.gh(visibility="PUBLIC")
+    w.run()
+    assert sum(c.startswith("repo view") for c in w.gh_calls()) == 1
 
 
 def test_open_pr_with_failed_check_is_reported(w):

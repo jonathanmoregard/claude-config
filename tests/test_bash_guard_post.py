@@ -55,9 +55,24 @@ import sys
 import tempfile
 import time
 
+# This module is a SCRIPT SUITE: every check below runs at import time and the
+# verdict is this file's exit status. Importing it under pytest would run the
+# whole body just to collect it, so the module stops here with a visible skip
+# naming the real invocation. `tests/conftest.py` turns this marker back into
+# one real test that runs the file as a script, so CI needs no list of these.
+if __name__ != "__main__":
+    import pytest
+
+    pytest.skip("script suite: run `python3 tests/test_bash_guard_post.py` "
+                "(exit 0 = all green); pytest cannot import it",
+                allow_module_level=True)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
-HOOKS = os.path.join(REPO_ROOT, "hooks")
+# `runtime/` once the layout migration has landed, the repository root before it;
+# only the shipped subset moved, tests/ stays at the root.
+RUNTIME = os.path.join(REPO_ROOT, "runtime") if os.path.isdir(os.path.join(REPO_ROOT, "runtime")) else REPO_ROOT
+HOOKS = os.path.join(RUNTIME, "hooks")
 GUARD = os.path.join(HOOKS, "bash-output-guard.py")
 INGRESS_CONFIG = os.path.join(HOOKS, "bash-guard-config.json")
 
@@ -80,7 +95,7 @@ SCRATCH = tempfile.mkdtemp(prefix="bash-output-guard-test-")
 # shared redaction module from beside themselves.
 for _shared in ("secret_redaction.py",):
     __import__("shutil").copy(
-        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks", _shared),
+        os.path.join(HOOKS, _shared),
         SCRATCH,
     )
 
@@ -1932,7 +1947,7 @@ check("a non-Bash tool result exits clean", rc == 0, f"rc={rc}")
 # ----------------------------------------------------------------------
 section("bash-output-guard: no sibling PostToolUse hook can clobber the rewrite")
 
-with open(os.path.join(REPO_ROOT, "settings.json"), encoding="utf-8") as _fh:
+with open(os.path.join(RUNTIME, "settings.json"), encoding="utf-8") as _fh:
     _SETTINGS = json.load(_fh)
 
 

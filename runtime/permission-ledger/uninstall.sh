@@ -185,7 +185,10 @@ fi
 if [[ "$PURGE" == true ]]; then
   if [[ -d "$LEDGER_DIR" ]]; then
     rm -rf "$LEDGER_DIR"
-    note "purged $LEDGER_DIR (ledger data, decided.json, installed scripts)"
+    # Scripts only. The ledger, decided.json and the digests live in the state
+    # directory and are NOT touched here, so --purge is not a data erase.
+    note "purged $LEDGER_DIR (installed scripts)"
+    note "ledger data left in ${PERMISSION_LEDGER_DIR:-$HOME/.local/state/permission-ledger} — delete it by hand if you mean to"
   else
     note "purge requested but $LEDGER_DIR does not exist"
   fi

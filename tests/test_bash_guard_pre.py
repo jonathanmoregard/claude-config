@@ -27,9 +27,25 @@ import sys
 import tempfile
 import time
 
+# A script suite, not a pytest module. Every check runs at import time and the
+# file ends in `sys.exit`, so a pytest import would run the whole suite inside
+# collection (minutes, even for --collect-only) and then raise SystemExit,
+# which aborts the ENTIRE pytest session with INTERNALERROR. Under pytest the
+# module therefore stops here with a visible skip naming the real invocation.
+# The verdict is this script's exit status; CI runs it as a script.
+if __name__ != "__main__":
+    import pytest
+    pytest.skip("script suite: run `python3 tests/test_bash_guard_pre.py` "
+                "(exit 0 = all green); pytest cannot import it",
+                allow_module_level=True)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
-HOOKS = os.path.join(REPO_ROOT, "hooks")
+# The deployed subset moved under runtime/; same fallback idiom as the other
+# suites (tests/test_deny_hints.py, tests/test_wait_for.py).
+RUNTIME = (os.path.join(REPO_ROOT, "runtime")
+           if os.path.isdir(os.path.join(REPO_ROOT, "runtime")) else REPO_ROOT)
+HOOKS = os.path.join(RUNTIME, "hooks")
 
 FAILURES: list[str] = []
 
@@ -591,7 +607,7 @@ check(
 # that provably stops nothing still reads as coverage to every future auditor,
 # and this repo has already lost four months to a control that was absent
 # while looking present.
-with open(os.path.join(REPO_ROOT, "settings.json"), encoding="utf-8") as _fh:
+with open(os.path.join(RUNTIME, "settings.json"), encoding="utf-8") as _fh:
     _SETTINGS_FOR_PIPE = json.load(_fh)
 _DENY_FOR_PIPE = _SETTINGS_FOR_PIPE.get("permissions", {}).get("deny", [])
 for _rule in [
@@ -2556,16 +2572,27 @@ MARKER_FUTURE = _marker("marker-future.json", dict(MARKER_DOC, schema=99))
 MARKER_GARBLED = _marker("marker-garbled.json", "{not json at all")
 MARKER_ODD_STATE = _marker("marker-odd.json", dict(MARKER_DOC, state="who-knows"))
 
+# ── A STALE marker against a healthy live loader → SILENT ────────────────
+# Regression for 2026-11-02. The marker said fallback (observed
+# 2026-10-29T11:57:54Z, mid-cutover); `dcg config` said user layer
+# loaded/full with all 20 tracked block rules live. The hook counted the
+# marker as a fallback SIGNAL on its own and printed "dcg is ARMED but running
+# the BOOTSTRAP FALLBACK ... Signals: <the marker> ... NOT IN FORCE: (none
+# identified)" at every session start — a false alarm, and the kind that
+# trains the reader to skip the one banner that matters. dcg's loader is the
+# thing enforcing the rules; when it answers, it decides. The marker is a
+# snapshot from the last activation and only corroborates.
 rc, msg_mk, ctx_mk, out_mk, _ = health(STUB_FULL, marker=MARKER_GOOD)
-check("marker present but dcg is loading the full list: announced as a "
-      "STALE marker, not swallowed",
-      out_mk.strip() != "",
-      "silent — the declarative state says fallback and the running state "
-      "says full, and nobody is told they disagree")
-check("stale marker: quotes when the fallback was last observed",
-      "2026-08-24T09:11:22Z" in msg_mk, msg_mk[:600])
-check("stale marker: says to re-activate so the two agree",
-      "activat" in msg_mk.lower() or "rebuild" in msg_mk.lower(), msg_mk[:600])
+check("stale marker + live loader on the full list: SILENT (the loader "
+      "decides, the marker only corroborates)",
+      out_mk.strip() == "", out_mk[:600])
+
+# Same with the plain-text loader: the config file dcg was pointed at is read
+# live and does not name itself as the seed, so the marker alone is not
+# enough to claim the fallback is in force.
+rc, _, _, out_mkt, _ = health(STUB_TEXT_LOADED, marker=MARKER_GOOD)
+check("stale marker + text loader + a clean config file: SILENT",
+      out_mkt.strip() == "", out_mkt[:600])
 
 rc, msg_mb, _, out_mb, _ = health(STUB_FALLBACK, marker=MARKER_GOOD)
 check("marker + loader agree: still one announcement, and the marker is "
@@ -2599,6 +2626,32 @@ check("no marker + full config: still silent (absence is the healthy case, "
 rc, msg_ma, _, out_ma, _ = health(STUB_CONFIG_GARBAGE, marker=MARKER_GOOD)
 check("loader unreadable + marker present: the fallback is still reported",
       "fallback" in msg_ma.lower(), msg_ma[:700])
+# ... but as what it is: a hint nothing live has confirmed. The unreadable
+# loader is the alarm (DOWN headline); the marker must not be promoted to
+# the fact "dcg is running the fallback", or a stale marker plus one slow
+# `dcg config` under load reproduces the 2026-11-02 false banner.
+check("loader unreadable + marker: still the DOWN headline",
+      "not fully armed" in msg_ma, msg_ma[:300])
+check("loader unreadable + marker: the marker is reported as UNCONFIRMED",
+      "unconfirmed" in msg_ma.lower() or "not confirmed" in msg_ma.lower(),
+      msg_ma[:900])
+check("loader unreadable + marker: does not assert the fallback as fact",
+      "running the BOOTSTRAP FALLBACK" not in msg_ma, msg_ma[:900])
+
+rc, msg_mh, _, out_mh, _ = health(STUB_CONFIG_HANG, marker=MARKER_GOOD)
+check("loader hangs + marker: announced under DOWN, marker unconfirmed",
+      "not fully armed" in msg_mh
+      and ("unconfirmed" in msg_mh.lower() or "not confirmed" in msg_mh.lower())
+      and "running the BOOTSTRAP FALLBACK" not in msg_mh,
+      msg_mh[:900])
+
+rc, msg_mx, _, out_mx, _ = health(
+    os.path.join(SCRATCH, "health", "no-such-dcg", "dcg"), marker=MARKER_GOOD)
+check("dcg absent + marker: DOWN, marker reported as unconfirmed, not as fact",
+      "ABSENT" in msg_mx
+      and ("unconfirmed" in msg_mx.lower() or "not confirmed" in msg_mx.lower())
+      and "running the BOOTSTRAP FALLBACK" not in msg_mx,
+      msg_mx[:900])
 
 # ── The real binary, when this host has it ────────────────────────────────
 # Everything above is a stub speaking a transcribed protocol. This lane runs
@@ -2644,6 +2697,94 @@ if os.access(REAL_DCG, os.X_OK):
 else:
     check("no dcg on this host — live lane NOT exercised (read as 'not "
           "checked', never as 'passed')", True, REAL_DCG)
+
+
+# ── The real binary, on the DEFAULT path, under an isolated HOME ──────────
+# The lane above points dcg at a file through DCG_CONFIG. Measured on the
+# packaged binary: DCG_CONFIG adds an `explicit` layer ON TOP of the host's
+# own ~/.config/dcg/config.toml, which still reports `loaded` — so that lane
+# is never really isolated from this machine's config. This one runs the
+# way a session start does (no DCG_CONFIG, the user layer at
+# $HOME/.config/dcg/config.toml) with HOME pointed at a scratch tree, so each
+# case owns the only full-authority layer dcg can see.
+def health_home(home, marker=NO_MARKER, dcg=REAL_DCG):
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("DCG_CONFIG", "XDG_CONFIG_HOME")}
+    env.update({"HOME": home, "DCG_PATH": dcg,
+                "BASH_GUARD_CONFIG": HEALTH_INGRESS,
+                "DCG_FALLBACK_MARKER": marker})
+    t0 = time.time()
+    proc = subprocess.run(
+        [sys.executable, os.path.join(HOOKS, "bash-guard-health.py")],
+        input="{}", capture_output=True, text=True, timeout=60, env=env,
+        cwd=home,
+    )
+    elapsed = time.time() - t0
+    msg = ""
+    try:
+        msg = json.loads(proc.stdout).get("systemMessage") or ""
+    except ValueError:
+        pass
+    return proc.returncode, msg, proc.stdout, elapsed
+
+
+def _home_with(rel, config_text):
+    home = os.path.join(SCRATCH, "health-home", rel)
+    os.makedirs(os.path.join(home, ".config", "dcg"), exist_ok=True)
+    if config_text is not None:
+        with open(os.path.join(home, ".config", "dcg", "config.toml"), "w",
+                  encoding="utf-8") as fh:
+            fh.write(config_text)
+    return home
+
+
+if os.access(REAL_DCG, os.X_OK):
+    with open(LIVE_FULL_TOML, encoding="utf-8") as _fh:
+        _live_full_text = _fh.read()
+    _seed_text = (
+        "[overrides]\nallow = []\nblock = [\n"
+        + "".join("    {{ pattern = '{0}', reason = '{1}' }},\n".format(
+            e["pattern"], e["reason"]) for e in FALLBACK_BLOCK)
+        + "]\n"
+    )
+
+    # The 2026-11-02 machine state: healthy user layer, stale marker.
+    rc, msg_h1, out_h1, _ = health_home(_home_with("full", _live_full_text),
+                                        marker=MARKER_GOOD)
+    check("LIVE dcg, isolated HOME, full rule set + STALE marker: silent",
+          rc == 0 and out_h1.strip() == "", out_h1[:600])
+
+    # Genuinely degraded, three ways. Each must still alarm.
+    rc, msg_h2, out_h2, _ = health_home(_home_with("seed", _seed_text))
+    check("LIVE dcg, isolated HOME, the seed rule set: announced as the "
+          "fallback, naming the lost adb class",
+          "BOOTSTRAP FALLBACK" in msg_h2 and "adb" in msg_h2.lower(),
+          (out_h2 or "silent")[:600])
+
+    rc, msg_h3, out_h3, _ = health_home(
+        _home_with("invalid", "[overrides\nblock = ["), marker=MARKER_GOOD)
+    check("LIVE dcg, isolated HOME, user layer INVALID: DOWN, quoting dcg's "
+          "own status",
+          "not fully armed" in msg_h3 and "invalid" in msg_h3.lower(),
+          (out_h3 or "silent")[:600])
+
+    rc, msg_h4, out_h4, _ = health_home(_home_with("absent", None))
+    check("LIVE dcg, isolated HOME, user layer MISSING: DOWN",
+          "not fully armed" in msg_h4 and "MISSING" in msg_h4,
+          (out_h4 or "silent")[:600])
+
+    # dcg unavailable at all, stale marker present: reported, fast, exit 0.
+    rc, msg_h5, out_h5, el_h5 = health_home(
+        _home_with("no-dcg", _live_full_text), marker=MARKER_GOOD,
+        dcg=os.path.join(SCRATCH, "health-home", "nowhere", "dcg"))
+    check("dcg unavailable + stale marker: exit 0, DOWN, inside budget, and "
+          "the marker is not promoted to a fact",
+          rc == 0 and "ABSENT" in msg_h5 and el_h5 < 10.0
+          and "running the BOOTSTRAP FALLBACK" not in msg_h5,
+          f"{el_h5:.1f}s :: {(out_h5 or 'silent')[:600]}")
+else:
+    check("no dcg on this host — isolated-HOME live lane NOT exercised (read "
+          "as 'not checked', never as 'passed')", True, REAL_DCG)
 
 
 # ----------------------------------------------------------------------

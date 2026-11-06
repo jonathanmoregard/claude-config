@@ -18,6 +18,7 @@ This overrides terse or compressed reply modes (e.g. caveman) for the walkthroug
 3. **Steps**: numbered, one action each, with an emoji marker where it helps scanning (🧭 navigate, ✍️ fill in, 🖱️ click, 📋 copy, 🔒 secret, ⚠️ trap). Exact menu paths, field names and values in **bold** or `code`.
 4. **Loot / checkpoint**: what the user brings back ("🎁 Bring me: the Application (client) ID") or tells you ("say **secret in**").
 5. **Progress marker** for multi-stage setups: split into separate quests, each with its own title and checkpoint. ✅ marks only quests the user has finished, 👉 the current one, ⬜ those ahead: `Quest 2/4 ✅👉⬜⬜`. Never mark a quest ✅ before the user confirms it.
+6. **One quest per message.** Send only the current quest, then stop and wait for its checkpoint reply before sending the next. Don't list the later quests or their steps up front; the progress marker is the only preview. A quest is one stage the user can finish in one sitting (one page or form, one command), not the whole setup.
 
 ## Make every step followable cold
 
@@ -46,7 +47,7 @@ This overrides terse or compressed reply modes (e.g. caveman) for the walkthroug
 
 ## Example
 
-```markdown
+````markdown
 ## 🗝️ Quest 2/4: Forge the secret  ✅👉⬜⬜
 
 Klaffat needs a secret handshake with Microsoft before it can read anyone's
@@ -56,7 +57,10 @@ calendar, and an Outlook user is just as welcome at the table as a Gmail user �
 2. ✍️ Description: anything. Expires: **6 months** → **Add**
 3. 📋 Copy the **Value** column. ⚠️ It is shown only once, and Secret ID is the wrong one.
 4. 🔒 Run `bash /tmp/edit-klaffat-env.sh` in your terminal (don't send me the value). It opens the encrypted env file in your editor.
-5. ✍️ Add `KLAFFAT_MS_CLIENT_SECRET=<value>`, save, quit.
+5. ✍️ Add this line with the value filled in, then save and quit:
+   ```
+   KLAFFAT_MS_CLIENT_SECRET=<value>
+   ```
 
 🎁 Checkpoint: say **secret in**.
-```
+````

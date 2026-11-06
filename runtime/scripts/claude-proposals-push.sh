@@ -216,6 +216,16 @@ if [ -z "$GITLEAKS_BIN" ]; then
   GITLEAKS_BIN="$(command -v gitleaks 2>/dev/null || true)"
 fi
 
+# The sink's own gitleaks config, which extends the default ruleset with one
+# anchored allowlist for GHSA advisory IDs. See the file for why.
+#
+# Checked here rather than left to gitleaks: `--config` on a path that does not
+# exist makes gitleaks exit nonzero, which this script's scan() correctly treats
+# as a block -- but it reports it as "gitleaks refused" with no findings, which
+# reads as a scanner crash and sends the reader looking for a leak that is not
+# there. Failing closed is right; failing closed illegibly is not.
+GITLEAKS_CONFIG="${GITLEAKS_CONFIG:-$CLAUDE_HOME/scripts/proposals-gitleaks.toml}"
+
 # Turn a gitleaks JSON report into lines a human can act on. Every field taken
 # is a LOCATION — file, rule, line. The secret itself is "REDACTED" in the
 # report (that is what --redact does) and is never read out of it here either:
@@ -250,12 +260,17 @@ scan() { # scan <human description> <remedy command> <gitleaks args...>
     alert "gitleaks is not available, so $what could not be scanned for secrets — refusing to push. Proposals are written from session transcripts and can quote a credential; an unattended push without a scan is not a trade this unit makes. Install gitleaks (it is in nixos-config home/jonathan.nix) or check this unit's GITLEAKS= path."
     return 1
   fi
+  if [ ! -r "$GITLEAKS_CONFIG" ]; then
+    alert "the gitleaks config is missing or unreadable at $GITLEAKS_CONFIG, so $what could not be scanned — refusing to push. The config carries the allowlist that keeps public advisory IDs from blocking the sink; running without it is not the same scan. Expected it at \$CLAUDE_HOME/scripts/proposals-gitleaks.toml (deployed from runtime/scripts/ in the claude-config repo), or set GITLEAKS_CONFIG=."
+    return 1
+  fi
   local report rc=0 found
   report="$STATE/.gitleaks-report.$$.json"
   # --redact so a detected secret never reaches the report, the journal, or the
   # status record. --exit-code 1 is the default but stated, because the whole
   # gate rests on it.
   "$GITLEAKS_BIN" git --no-banner --redact --exit-code 1 --log-level error \
+    --config "$GITLEAKS_CONFIG" \
     --report-format json --report-path "$report" "$@" "$SINK" >/dev/null 2>&1 || rc=$?
   if [ "$rc" -eq 0 ]; then
     rm -f "$report"
@@ -290,14 +305,34 @@ if ! git diff --cached --quiet; then
   # alert was spurious. `dir` scans the working tree, which is where the file
   # still is.
   if ! scan "the changes staged in the proposals sink" \
-            "$GITLEAKS_BIN dir --redact $SINK" --staged; then
+            "$GITLEAKS_BIN dir --redact --config $GITLEAKS_CONFIG $SINK" --staged; then
     # MIXED reset — index only, never --hard. The offending file stays exactly
     # where the writer put it, unstaged and uncommitted, for a human to fix.
     git reset -q || true
     exit 1
   fi
   staged_count="$(git diff --cached --name-only | wc -l)"
-  git commit -q -m "proposals: $(date +%Y-%m-%d)"
+  # GITLEAKS_CONFIG is exported for this one command, for the GLOBAL pre-commit
+  # hook rather than for us. That hook (~/.config/git/hooks/pre-commit, from
+  # nixos-config home/jonathan.nix) runs `gitleaks git --staged` with no
+  # `--config`, so it scans with the stock ruleset and knows nothing about this
+  # sink's allowlist. It therefore re-blocked the very commit the two scans
+  # above had just cleared, on the same public GHSA advisory ID, and the sink
+  # went on not backing up after the allowlist landed. Measured: with the
+  # variable set, the hook's exact command exits 0 on that fixture; without it,
+  # 1.
+  #
+  # This is NOT `--no-verify` and not a weakening. The hook still runs, on the
+  # same staged content, with the full default ruleset -- it simply reads the
+  # same config this script already scanned with, so the two agree instead of
+  # contradicting each other. Any real credential still blocks in both.
+  #
+  # Scoped to this invocation deliberately: a global export would change what
+  # every other repository's commits are scanned against, and this allowlist is
+  # for this sink alone. A hand `git commit` in the sink is still subject to the
+  # stock hook, which is correct -- it tells the human, and the fix is to run
+  # this script rather than to widen the rules for everyone.
+  GITLEAKS_CONFIG="$GITLEAKS_CONFIG" git commit -q -m "proposals: $(date +%Y-%m-%d)"
   log "committed $staged_count change(s) in $SINK"
 fi
 
@@ -377,7 +412,7 @@ ahead="$(git rev-list --count "$UPSTREAM..HEAD")"
 # scan above cannot cover them: push-proposals.sh commits without pushing, a
 # session commits by hand, and `--no-verify` skips the global pre-commit hook.
 if ! scan "the $ahead commit(s) this push would ship" \
-          "$GITLEAKS_BIN git --redact --log-opts '$UPSTREAM..HEAD' $SINK" \
+          "$GITLEAKS_BIN git --redact --config $GITLEAKS_CONFIG --log-opts '$UPSTREAM..HEAD' $SINK" \
           --log-opts "$UPSTREAM..HEAD"; then
   exit 1
 fi

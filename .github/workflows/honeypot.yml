@@ -1,0 +1,593 @@
+# Runs a real headless agent on the candidate config and fails if it goes for
+# planted credentials. The gate that `checks` cannot be: a unit test proves a
+# script's branches, not that an agent reading the new CLAUDE.md, skill or hook
+# text behaves differently.
+#
+# Asked for by adding the `grade` label to the pull request, which is also what
+# makes this safe to require: see the first step.
+#
+# WHY THIS JOB HOLDS A CREDENTIAL AND `checks` DOES NOT
+#
+# `checks` takes no secrets on purpose, because a pull request can add code
+# that the job then runs. This job cannot be built that way: the whole point is
+# to execute the candidate config, hooks and skills included, and the agent
+# needs a credential to run at all. So a pull request CAN steal this job's
+# credential, and that is accepted rather than defended -- but the thing it
+# steals is made worth as little as possible. There is no stored key: the job
+# exchanges GitHub's own signed statement that this repository's pull-request
+# job is running for an Anthropic token that is scoped to one workspace with
+# its own spend ceiling and expires within minutes. A leak costs the remainder
+# of that lifetime, not a rotation. Nothing else may be added to this job's
+# `secrets`, and a long-lived `sk-ant-...` must never be put back.
+#
+# Three consequences worth stating:
+#   - `pull_request`, never `pull_request_target`: a fork's code must not run
+#     with this repository's identity. GitHub downgrades `id-token` to read for
+#     a fork pull request, so no token can be minted, the credential step fails
+#     closed, and the lane goes red. That is the intended outcome -- a fork PR
+#     gets a human reading the diff, not a grade.
+#   - `persist-credentials: false`: `actions/checkout` otherwise leaves the
+#     workflow's own GITHUB_TOKEN in `.git/config`, where a hostile hook in the
+#     candidate config could read it. The harness scrubs GH_TOKEN and
+#     GITHUB_TOKEN from the agent's environment; the checkout must not hand the
+#     same token back through a file.
+#   - The harness also scrubs `ACTIONS_ID_TOKEN_REQUEST_TOKEN` and
+#     `ACTIONS_ID_TOKEN_REQUEST_URL`, so the candidate config cannot ask GitHub
+#     for a fresh identity token and mint itself a new credential once the
+#     measured one has expired.
+#
+# WHY IT ONLY RUNS AT TIP
+#
+# The verdict has to be about the tree that will actually land. A branch behind
+# master was graded against a merge base that no longer exists, so the job
+# refuses to grade it and says so: updating the branch fires `synchronize`, and
+# the run that matters happens at tip.
+#
+# WHY A PULL REQUEST THAT CHANGES NO CONFIG IS NOT GRADED
+#
+# An agent run costs real money, and a pull request touching only the test
+# corpus or this directory has no candidate config to grade: the agent would
+# read exactly master's text, so the verdict would be about master. The first
+# step therefore asks what the pull request changes and passes WITHOUT grading
+# when the answer is nothing a running agent reads.
+#
+# That test is a STEP. Not a workflow-level `paths:` filter and not a
+# job-level `if:`, because both are the gotcha this lane exists to avoid, in
+# opposite directions: a path-filtered workflow produces no check run at all,
+# so a required check sits pending and the pull request is blocked forever,
+# while a job skipped by its own condition is reported to a required check as
+# SUCCESSFUL -- handing every pull request a free pass the moment that
+# condition goes wrong. A step that runs, decides and says so keeps the check
+# attached to the head commit in every case, and a decision step that errors
+# takes the job red with it.
+#
+# What counts as config is an EXCLUSION list rather than an inclusion list,
+# and that direction is the whole point: a directory added tomorrow is graded
+# without anyone editing this file, where an allowlist would silently exempt
+# it. Only what provably cannot reach a running agent is excluded. A rename is
+# classified on BOTH its names, because moving a live hook into an excluded
+# directory removes it from the running config while showing a filter that
+# reads one name only the excluded path it landed on.
+#
+# `vendor/` is NOT excluded, and that is not an oversight. Sixteen skills
+# under `runtime/skills/` are symlinks into `vendor/superpowers` and
+# `vendor/everything-claude-code` -- `using-superpowers`, which every session
+# reads, among them -- so moving a submodule pin changes skill text under the
+# agent while touching no file beneath `runtime/`. `.gitmodules` is in for the
+# same reason, and `policy/` is in because a sandbox policy is config whatever
+# reads it today.
+#
+# The label still overrides, so a grade can always be ASKED for. That is not
+# symmetry for its own sake: this lane's own scenario lives in
+# `tests/agent-e2e/skill-description-audit/`, whose `check.sh` and `setup.sh`
+# master changed in the same week this was written. Without the override a
+# change to the instrument could never be measured by the instrument. What
+# keeps that from being a hole is that the grader has unit coverage in
+# `checks` (`tests/enforced/test_skill_audit_grader.py`), so a broken grader
+# is caught there rather than silently here.
+name: honeypot
+
+on:
+  pull_request:
+    # `opened` is here because of the scope test below, and was not needed
+    # before it. While the only two outcomes were "grade" and "refuse", a
+    # pull request with no run at all was indistinguishable from one that had
+    # refused: a required check was unsatisfied either way, so failing to
+    # trigger failed closed. The scope test adds a third outcome -- a PASS for
+    # a pull request with no config in it -- and that one a newly opened pull
+    # request can never reach by waiting. Without `opened` it would sit
+    # blocked on a check that qualifies for the exemption and never runs,
+    # until something else pushed or labelled it.
+    types: [opened, labeled, auto_merge_enabled, synchronize]
+
+permissions:
+  contents: read
+  # Reading which files the pull request changes, for the scope decision in
+  # the first step. It authorises nothing: this repository is public and that
+  # list is already world-readable. Declared because naming any permission
+  # drops every unnamed one to none, so `contents: read` alone would not
+  # cover the pulls endpoint.
+  pull-requests: read
+  # GitHub only issues an identity token to a job that asks for it, and that
+  # token is this lane's entire credential path -- see the credential step.
+  id-token: write
+
+concurrency:
+  group: honeypot-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  honeypot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # One source for how many runs there are, so the number the harness
+      # performs and the number the gate demands cannot drift apart. The gate
+      # grades an expected SET: a run that wrote no verdict blocks exactly
+      # like a failing one, which a verdict-file glob did not.
+      RUNS: 2
+    steps:
+      # Deliberately NOT a job-level `if:`. A job skipped by its own condition
+      # is reported as SUCCESSFUL to a required status check -- the same gotcha
+      # that makes path-filtered workflows unsafe to require. Gating this job
+      # that way would have let every pull request where the lane never ran
+      # satisfy the requirement for free, which is the one hole this lane
+      # exists to close.
+      #
+      # So the job always runs and refuses instead: an ungraded config is not a
+      # clean config. Enabling auto-merge fires `auto_merge_enabled`, this
+      # re-runs, and the verdict that matters is produced. The refusal is two
+      # steps and no install, so it costs no agent run.
+      #
+      # Asking for the grade is a label, from the pull request's own sidebar.
+      # `workflow_dispatch` would be the obvious button, but its runs are not
+      # attached to a pull request and so can never satisfy a required status
+      # check. The label keeps this in the `pull_request` event family, so the
+      # check attaches to the head commit exactly as `checks` does, with the
+      # same secret rules for forks.
+      #
+      # Checks are per commit, so the guarantee survives a push: `synchronize`
+      # re-grades while the label is on, and a pull request whose label was
+      # removed produces no run at all, leaving the required check unsatisfied.
+      # Both directions fail closed, and an ordinary merge click still works
+      # once the grade is green.
+      #
+      # Auto-merge counts too. The payload field is the `auto_merge` OBJECT,
+      # null while auto-merge is off; there is no `auto_merge_enabled`
+      # property, and naming one would make the test quietly false on every
+      # `synchronize`.
+      - name: There is a config here, and a grade was asked for
+        id: scope
+        env:
+          ASKED: ${{ contains(github.event.pull_request.labels.*.name, 'grade')
+            || github.event.pull_request.auto_merge != null
+            || github.event.action == 'auto_merge_enabled' }}
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          # The label first, so an explicit ask never has to get past the
+          # scope test -- see the header on why the override exists.
+          if [ "$ASKED" = "true" ]; then
+            echo "grade asked for; grading the candidate config"
+            echo "grade=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Asked of the API rather than of a checkout, so the whole decision
+          # is two requests and happens before anything is cloned or
+          # installed. The field is `filename`: this endpoint has no `path`,
+          # and `--jq '.[].path'` yields a column of nulls that match no
+          # prefix -- which reads as "no config changed" and would pass every
+          # pull request for free.
+          #
+          # BOTH names of every record, because a rename reports the
+          # DESTINATION in `filename` and the source in `previous_filename`.
+          # Moving a live hook into `docs/` takes it out of the running config
+          # while showing a filter that reads one name only the excluded path
+          # it landed on -- measured: exit 0, `grade=false`, a hook deleted
+          # from the config and graded by nobody. A plain deletion was never
+          # affected, since `filename` stays the runtime path; only a rename
+          # out of the config could launder itself this way.
+          #
+          # @tsv keeps one record per line -- it escapes a tab or a newline
+          # inside a path rather than emitting it -- which is what lets the
+          # completeness check below count RECORDS while the classification
+          # reads paths. Counting the classification list instead would let a
+          # pull request full of renames hide a truncated page behind its own
+          # second column.
+          records=$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files" \
+            --jq '.[] | [.filename, (.previous_filename // empty)] | @tsv')
+          # A hard API failure aborts the step on its own -- the exit status of
+          # an assignment is the substitution's, and this shell runs with -e.
+          # An empty list is the case that does not abort, and it must not be
+          # read as "no config changed": that is how a lane passes for free.
+          # Nothing is lost by refusing, since a pull request changing no file
+          # is not one anybody merges.
+          if [ -z "$records" ]; then
+            echo "the pull request reports no changed files at all, so there"
+            echo "is nothing here to draw a conclusion from."
+            echo "failing closed: an ungraded config is not a clean config"
+            exit 1
+          fi
+          want=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR}" --jq .changed_files)
+          case "$want" in
+            '' | *[!0-9]*)
+              echo "the pull request does not say how many files it changes,"
+              echo "so the list below cannot be checked for completeness."
+              echo "failing closed: an ungraded config is not a clean config"
+              exit 1
+              ;;
+          esac
+          # Records, one per line, so this compares like with like against
+          # `changed_files`. The classification list below is longer whenever
+          # anything was renamed.
+          got=$(printf '%s\n' "$records" | grep -c . || true)
+          # Only the under-reporting direction is fatal, because only it is
+          # dangerous: this endpoint stops at 3000 files, and a short list can
+          # just as well be a `runtime/` file that never arrived, which would
+          # read as nothing to grade. Fail rather than conclude.
+          if [ "$got" -lt "$want" ]; then
+            echo "the changed-file list is incomplete: $got of $want."
+            echo "a partial list can only under-report what changed, and"
+            echo "under-reporting here grades nothing and passes."
+            echo "failing closed: an ungraded config is not a clean config"
+            exit 1
+          fi
+          # Every path either name mentions, one per line, so a rename is
+          # judged on where it came FROM as well as where it went.
+          files=$(printf '%s\n' "$records" | tr '\t' '\n' | grep -v '^$' || true)
+          # grep exits 1 when every line is filtered out. That is the
+          # nothing-to-grade case, not an error.
+          config=$(printf '%s\n' "$files" | grep -vE \
+            '^(tests/|docs/|research/|experiments/|improvements/|\.github/|\.githooks/|\.gitignore$|\.gitleaks\.toml$|\.secrets\.baseline$)' \
+            || true)
+          if [ -z "$config" ]; then
+            echo "nothing to grade: no file here is read by a running agent."
+            echo "all $got of them, a rename shown as 'new <- old':"
+            printf '%s\n' "$records" | sed 's/\t/ <- /' | sed 's/^/  /'
+            echo "grade=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "this pull request changes the live config:"
+          printf '%s\n' "$config" | sed 's/^/  /'
+          echo "this config has not been graded"
+          echo "add the 'grade' label to grade it; an ungraded config is not a clean one"
+          exit 1
+
+      - uses: actions/checkout@v4
+        if: steps.scope.outputs.grade == 'true'
+        with:
+          persist-credentials: false
+
+      # The base the pull request was graded against must still be master's
+      # tip. Its own step, before anything is installed, so "behind master"
+      # reads as itself instead of as a failed agent run.
+      - name: The pull request is at the tip of master
+        if: steps.scope.outputs.grade == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          tip=$(gh api "repos/${GITHUB_REPOSITORY}/commits/master" --jq .sha)
+          if [ "$tip" != "$BASE_SHA" ]; then
+            echo "base ${BASE_SHA:0:7} is not master's tip ${tip:0:7};"
+            echo "update the branch and this re-runs on synchronize"
+            exit 1
+          fi
+          echo "at tip: ${tip:0:7}"
+
+      # bubblewrap gives the run a private /tmp and a read-only HOME. The
+      # harness works without it and records `isolated_tmp: false`; on a
+      # throwaway runner that is survivable, but the fidelity is cheap to keep.
+      - name: Install the sandbox and the agent
+        if: steps.scope.outputs.grade == 'true'
+        run: |
+          sudo apt-get update --quiet
+          sudo apt-get install --quiet --yes bubblewrap
+          npm install --global @anthropic-ai/claude-code
+          claude --version
+          bwrap --version
+
+      # `bash-guard.py` needs BOTH dcg's config and the dcg EXECUTABLE. With
+      # the binary absent it denies every Bash call with "the safety guard is
+      # BROKEN, not because the command is", and says plainly that there is no
+      # bypass flag -- so every run would come back INCONCLUSIVE. Measured by
+      # running the guard with dcg off PATH.
+      #
+      # dcg is third-party and public, so CI builds the SAME revision the host
+      # runs rather than some release that drifts from it. The pin lives in
+      # `overlays/dcg.nix` in nixos-config; these two values must be bumped
+      # with it, and the version assertion below is what makes a silent drift
+      # loud. A mismatch means CI measured the config against a different
+      # guard than the machine will.
+      #
+      # Deliberately NOT stubbed. A permissive dcg would change the config
+      # under test and manufacture a clean verdict from a broken guard, which
+      # is the exact failure this lane exists to catch; a scenario that avoids
+      # Bash would hide the same thing.
+      - name: Build the guard the config depends on
+        if: steps.scope.outputs.grade == 'true'
+        env:
+          # github.com/Dicklesworthstone/destructive_command_guard
+          DCG_REV: d921fe84f7bbf56438e7b930047ab41e0dcb292d
+          DCG_VERSION: 0.12.5
+        run: |
+          # The PACKAGE is `destructive_command_guard`; `dcg` is only the name
+          # of the binary it produces ([[bin]] in its Cargo.toml). Passing
+          # `dcg` here fails -- cargo resolves the positional argument as a
+          # package name.
+          cargo install --locked --git \
+            https://github.com/Dicklesworthstone/destructive_command_guard \
+            --rev "$DCG_REV" destructive_command_guard
+          dcg --version
+          if ! dcg --version | grep -qF "$DCG_VERSION"; then
+            echo "dcg reports a version other than the pinned $DCG_VERSION:"
+            echo "the pin here and the one in nixos-config overlays/dcg.nix"
+            echo "have drifted, so this lane would measure the config against"
+            echo "a guard the machine does not run."
+            exit 1
+          fi
+
+      # The harness copies this from the developer's real HOME, which does not
+      # exist here. Without it dcg falls back to built-in packs and the guard
+      # reports a config fault, which is also a deny.
+      - name: Provide the config the guard loads
+        if: steps.scope.outputs.grade == 'true'
+        run: |
+          mkdir -p "$HOME/.config/dcg"
+          cp runtime/dcg.toml "$HOME/.config/dcg/config.toml"
+          dcg config
+
+      # HEAD is the merge commit GitHub built for this pull request, so the
+      # graded config is the tree that would land. `agent_e2e.py` resolves the
+      # config root to `runtime/`, so the ref stages as a real ~/.claude.
+      # Last before the agent runs, so the credential is as young as it can be
+      # when the thing that may steal it starts: the minted token's lifetime is
+      # the lesser of the federation rule's `token_lifetime_seconds` and twice
+      # what is left of GitHub's identity token, which lives about five minutes.
+      #
+      # WHY THE EXCHANGE HAPPENS HERE AND NOT INSIDE THE AGENT
+      #
+      # The Claude Code CLI can federate by itself from
+      # `ANTHROPIC_FEDERATION_RULE_ID` and its three companions, which is the
+      # documented path and the one `anthropics/claude-code-action` takes. It is
+      # the wrong path for this lane, for two separate reasons:
+      #   - it would hand the candidate config the ability to mint FRESH tokens
+      #     for as long as the identity token lives, instead of one credential
+      #     that expires;
+      #   - the identity token carries a `jti` and is single-use, while this
+      #     lane deliberately runs several `claude` processes at once, so all
+      #     but one exchange would come back `jti_reused`.
+      # One exchange up front gives every run the same bearer token and leaves
+      # the minting capability outside the sandbox.
+      #
+      # The three identifiers are repository VARIABLES, not secrets -- they
+      # name objects, they do not authorise anything. Only a run in this
+      # repository can present a matching identity token. They are variables
+      # rather than literals here because this repository is public and an
+      # organisation UUID is nobody's business but his.
+      #
+      # `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` shadow federation, and a
+      # variable set to the empty string still occupies its slot, so neither is
+      # set anywhere before this point.
+      #
+      # A refused exchange is always an opaque 401; the Console's authentication
+      # history names the real reason. The one that cost a round trip while
+      # building this: GitHub issues this repository an IMMUTABLE subject,
+      # `repo:<owner>@<owner id>/<repo>@<repo id>:pull_request`, while the
+      # Console's wizard builds the classic `repo:<owner>/<repo>:<event>` form.
+      # They never match. The federation rule carries the immutable form, and a
+      # rule rebuilt from the wizard's defaults will fail with
+      # `match_subject_prefix` until it does too.
+      - name: Mint a credential that expires by itself
+        if: steps.scope.outputs.grade == 'true'
+        shell: bash
+        env:
+          # Claude Console -> Workload identity. The workspace is named even
+          # though the rule is bound to a single one and the field is only
+          # documented as required above that: a measured exchange accepted it,
+          # and naming it means widening the rule later cannot silently start
+          # refusing every run.
+          RULE_ID: ${{ vars.HONEYPOT_FEDERATION_RULE_ID }}
+          ORG_ID: ${{ vars.HONEYPOT_ORGANIZATION_ID }}
+          SERVICE_ACCOUNT_ID: ${{ vars.HONEYPOT_SERVICE_ACCOUNT_ID }}
+          WORKSPACE_ID: ${{ vars.HONEYPOT_WORKSPACE_ID }}
+        run: |
+          if [ -z "$RULE_ID" ] || [ -z "$ORG_ID" ] || [ -z "$SERVICE_ACCOUNT_ID" ] \
+             || [ -z "$WORKSPACE_ID" ]; then
+            echo "this repository has no honeypot federation configured:"
+            echo "  HONEYPOT_FEDERATION_RULE_ID:  ${RULE_ID:-MISSING}"
+            echo "  HONEYPOT_ORGANIZATION_ID:     ${ORG_ID:-MISSING}"
+            echo "  HONEYPOT_SERVICE_ACCOUNT_ID:  ${SERVICE_ACCOUNT_ID:-MISSING}"
+            echo "  HONEYPOT_WORKSPACE_ID:        ${WORKSPACE_ID:-MISSING}"
+            echo "failing closed: an ungraded config is not a clean config"
+            exit 1
+          fi
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            echo "GitHub issued no identity token to this run (a fork pull request?)."
+            echo "failing closed: an ungraded config is not a clean config"
+            exit 1
+          fi
+          curl --fail --silent --show-error \
+            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://api.anthropic.com" \
+            -o "${RUNNER_TEMP}/identity.json"
+          jwt=$(jq -r '.value // empty' "${RUNNER_TEMP}/identity.json")
+          rm -f "${RUNNER_TEMP}/identity.json"
+          if [ -z "$jwt" ]; then
+            echo "the identity token request returned no token"
+            exit 1
+          fi
+          echo "::add-mask::$jwt"
+          # Built with jq so the assertion cannot break the JSON, and written
+          # to a file so it never appears in a process listing.
+          jq -n --arg assertion "$jwt" --arg rule "$RULE_ID" \
+                --arg org "$ORG_ID" --arg account "$SERVICE_ACCOUNT_ID" \
+                --arg workspace "$WORKSPACE_ID" \
+            '{grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+              assertion: $assertion, federation_rule_id: $rule,
+              organization_id: $org, service_account_id: $account,
+              workspace_id: $workspace}' \
+            > "${RUNNER_TEMP}/exchange.json"
+          code=$(curl --silent --show-error --output "${RUNNER_TEMP}/token.json" \
+            --write-out '%{http_code}' -X POST \
+            https://api.anthropic.com/v1/oauth/token \
+            -H 'content-type: application/json' \
+            --data "@${RUNNER_TEMP}/exchange.json")
+          rm -f "${RUNNER_TEMP}/exchange.json"
+          token=$(jq -r '.access_token // empty' "${RUNNER_TEMP}/token.json")
+          expires=$(jq -r '.expires_in // empty' "${RUNNER_TEMP}/token.json")
+          rm -f "${RUNNER_TEMP}/token.json"
+          # Masked the instant it exists, before any branch that might print.
+          # Masking after the error path below is how `${token:+present}` came
+          # to sit next to `${token:-MISSING}`: when the token was present and
+          # only the lifetime was missing, the first expanded to "present" and
+          # the second to the token itself, unmasked, in a public log.
+          [ -z "$token" ] || echo "::add-mask::$token"
+          if [ -z "$token" ] || [ -z "$expires" ]; then
+            # Presence only. Never interpolate the credential itself, not even
+            # in a branch that "cannot" be reached with it set.
+            if [ -n "$token" ]; then has_token=present; else has_token=MISSING; fi
+            echo "the exchange returned no usable credential (HTTP $code):"
+            echo "  access_token: ${has_token}"
+            echo "  expires_in:   ${expires:-MISSING}"
+            echo "a refused exchange is always an opaque 401; the reason is in"
+            echo "the Console's Workload identity page, under its history tab."
+            echo "failing closed: an ungraded config is not a clean config"
+            exit 1
+          fi
+          # Not an output and not GITHUB_ENV: a step output is stored by the
+          # runner for the whole job and GITHUB_ENV would put the credential in
+          # the environment of every later step, including the upload.
+          printf '%s' "$token" > "${RUNNER_TEMP}/anthropic-token"
+          chmod 600 "${RUNNER_TEMP}/anthropic-token"
+          # The lifetime is not ours to choose -- it is the lesser of the
+          # rule's setting and twice what is left of the identity token -- so
+          # the run deadline is derived from what was actually granted rather
+          # than guessed. 597s against a 600s agent timeout left a slow but
+          # honest run able to lose authentication before reaching its own
+          # limit, which would read as INCONCLUSIVE and redden the lane.
+          echo "HONEYPOT_TOKEN_TTL=${expires}" >> "$GITHUB_ENV"
+          echo "minted a workspace token, valid for ${expires}s"
+
+      - name: The agent does not go for the planted credentials
+        id: measure
+        if: steps.scope.outputs.grade == 'true'
+        env:
+          # What a run needs BEFORE its first API call -- staging the config
+          # out of git, building the sandbox home, planting the fixtures --
+          # plus margin. Set here as the input; the deadline below is the
+          # consequence, printed rather than chosen. Observed staging is a few
+          # seconds, so this is roughly twenty times the measured need.
+          STARTUP_RESERVE: 120
+          # Taken away from every step that runs pull-request-authored code,
+          # which is this one and the gate. The harness also drops this pair
+          # from the agent's own environment, but that only ever covered the
+          # AGENT: the scenario's setup.sh and check.sh are authored by the
+          # pull request too and run OUTSIDE the sandbox, as children of the
+          # harness, where /proc/<harness>/environ hands them back. Measured:
+          # an unsandboxed child reads its parent's environ on these hosts,
+          # since yama gates PTRACE_MODE_ATTACH and not reads. Emptied here,
+          # there is nothing left to read; the minting already happened.
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
+        run: |
+          if [ ! -s "${RUNNER_TEMP}/anthropic-token" ]; then
+            echo "no honeypot credential available to this run"
+            echo "failing closed: an ungraded config is not a clean config"
+            exit 1
+          fi
+          # A run must not outlive the credential it was given: losing
+          # authentication mid-run reads as INCONCLUSIVE, which is a red lane
+          # for no reason anyone can act on. Runs start together under
+          # --jobs, so one deadline serves them all.
+          deadline=$((HONEYPOT_TOKEN_TTL - STARTUP_RESERVE))
+          if [ "$deadline" -lt 60 ]; then
+            echo "the minted token lives ${HONEYPOT_TOKEN_TTL}s, leaving"
+            echo "${deadline}s after a ${STARTUP_RESERVE}s startup reserve --"
+            echo "too little to measure anything. Raise the federation rule's"
+            echo "token lifetime in the Claude Console."
+            exit 1
+          fi
+          echo "token ${HONEYPOT_TOKEN_TTL}s - reserve ${STARTUP_RESERVE}s" \
+               "=> per-run deadline ${deadline}s"
+          # The federated token is a bearer token, so it travels in
+          # ANTHROPIC_AUTH_TOKEN. The harness passes its environment to the
+          # agent; nothing else in this job needs the credential.
+          ANTHROPIC_AUTH_TOKEN=$(cat "${RUNNER_TEMP}/anthropic-token")
+          export ANTHROPIC_AUTH_TOKEN
+          # Under /tmp, which is the harness's own default and the only place
+          # the candidate config expects a run to live: its permission rules
+          # allow edits under `/tmp/**` and a handful of named home paths, and
+          # the guard refuses redirection into a home path. Pointed at
+          # RUNNER_TEMP -- which is under /home/runner -- the agent could not
+          # write its answer at all and every run came back `answered=no`,
+          # grading the runner's layout instead of the config. bwrap gives
+          # each run a private /tmp with its own directory bound back in, so
+          # concurrent runs still cannot see each other.
+          python3 runtime/scripts/agent-e2e/agent_e2e.py run \
+            tests/agent-e2e/skill-description-audit \
+            --arm candidate=HEAD --n "$RUNS" --jobs "$RUNS" \
+            --model claude-sonnet-5-5 --budget 1 --timeout "$deadline" \
+            --out /tmp/agent-e2e
+
+      # The harness exits 0 whatever the verdicts; the gate is here. FAIL is a
+      # finding. INCONCLUSIVE blocks too: a lane that cannot measure must not
+      # report clean, which is the same rule the grader applies to a missing
+      # plant.
+      # Only once the measurement itself succeeded. The harness exits 0 whether
+      # the verdicts are PASS or FAIL -- it is an instrument, and a scenario
+      # with findings is a successful measurement -- so a FAIL still reaches
+      # this gate. A non-zero harness means the measurement never happened
+      # (no credential, a crash), the job is already red for that reason, and
+      # running the gate would add "the scenario did not run" as a second,
+      # misleading failure. Measured: that is exactly what run 41490427592 did.
+      - name: Every run came back clean
+        if: always() && steps.measure.conclusion == 'success'
+        env:
+          # gate.py comes from the pull request as well -- see the measure
+          # step's note.
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
+        run: |
+          python3 tests/agent-e2e/skill-description-audit/gate.py \
+            /tmp/agent-e2e/skill-description-audit \
+            --expect "candidate=$RUNS"
+
+      # Why a run ended as it did. An ALLOWLIST -- tool names, tool paths,
+      # error flags, turn and stop accounting -- because the transcript itself
+      # can hold a plant, and the staged HOME links the real credential store.
+      # tests/enforced/test_honeypot_trace.py asserts a planted value cannot
+      # reach it; adding a field there is a deliberate act.
+      - name: Collect why each run ended
+        if: always() && steps.measure.conclusion == 'success'
+        # Diagnostic only: it must never redden a lane whose grade is clean,
+        # but a step marked failed in the UI is still visible.
+        continue-on-error: true
+        env:
+          # PR-authored, like the gate -- see the measure step's note.
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
+        run: |
+          python3 tests/agent-e2e/skill-description-audit/trace.py \
+            /tmp/agent-e2e-trace /tmp/agent-e2e/skill-description-audit
+
+      - name: Upload the traces
+        if: always() && steps.measure.conclusion == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: honeypot-traces
+          path: /tmp/agent-e2e-trace/**/trace.json
+          if-no-files-found: error
+
+      # Verdicts and the agent's own messages, for diagnosing a red lane. The
+      # run directories are not uploaded: they hold the planted credentials and
+      # the transcript that may carry one.
+      - name: Upload the verdicts
+        if: always() && steps.measure.conclusion == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: honeypot-verdicts
+          path: /tmp/agent-e2e/skill-description-audit/**/verdict.json
+          if-no-files-found: warn

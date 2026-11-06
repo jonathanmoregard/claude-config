@@ -17,7 +17,10 @@ import sys
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-HARNESS = ROOT / "scripts/agent-e2e/agent_e2e.py"
+# `runtime/` once the layout migration has landed, the repository root
+# before it. Only the projected subset moves; tests/ stays at the root.
+RUNTIME = ROOT / "runtime" if (ROOT / "runtime").is_dir() else ROOT
+HARNESS = RUNTIME / "scripts/agent-e2e/agent_e2e.py"
 SCENARIOS = ROOT / "tests/agent-e2e"
 
 
@@ -133,6 +136,89 @@ def _scenario(tmp_path, check_body: str) -> pathlib.Path:
     return sc
 
 
+# Whether a sandbox can ACTUALLY be created here, probed once.
+#
+# `shutil.which("bwrap")` is not the same question, and the difference is not
+# academic: every guard that asked only whether the binary exists let these
+# cases run on a GitHub runner and fail INCONCLUSIVE -- measured, nine of them,
+# the first time this workflow ran the whole corpus. A case that cannot sandbox
+# must say so, not report the harness broken.
+#
+# The probe builds the harness's own mount shape rather than a trivial sandbox,
+# because a machine that can unshare can still refuse a mount. Asking
+# `--dev-bind / / --unshare-all` was measured succeeding on a runner that then
+# failed all eleven cases a second time: the binary is there, namespaces work,
+# and what the runner lacked was a `~/.ssh` for the harness to shadow. That was
+# the harness's defect, fixed where it lives; the probe now at least covers the
+# read-only bind of the real HOME that the shadowing stacks on.
+# Cached, because nine call sites would otherwise fork nine times.
+_SANDBOX_OK = None
+
+
+def _require_sandbox():
+    """Skip unless bubblewrap can really build a sandbox on this machine."""
+    global _SANDBOX_OK
+    if _SANDBOX_OK is None:
+        import pwd as _pwd
+        import shutil as _sh
+        bwrap = _sh.which("bwrap")
+        home = _pwd.getpwuid(os.getuid()).pw_dir
+        if bwrap is None:
+            _SANDBOX_OK = (False, "bubblewrap not on PATH")
+        else:
+            try:
+                p = subprocess.run([bwrap, "--dev-bind", "/", "/",
+                                    "--ro-bind", home, home, "--tmpfs", "/tmp",
+                                    "true"], capture_output=True, text=True, timeout=30)
+                _SANDBOX_OK = (
+                    p.returncode == 0,
+                    "bubblewrap is present but cannot build the harness's "
+                    "sandbox here (restricted user namespaces, or a mount it "
+                    "refuses): "
+                    + (p.stderr.strip().splitlines() or ["no stderr"])[-1],
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                _SANDBOX_OK = (False, f"bubblewrap probe failed: {exc!r}")
+    ok, why = _SANDBOX_OK
+    if not ok:
+        pytest.skip(why)
+
+
+# Whether a sandbox can be built INSIDE a sandbox, which is a third question
+# again. ubuntu-latest grants the first user namespace and refuses the second:
+# the outer run started, the nested harness staged its config and printed its
+# report, and the inner agent exited 1 carrying
+#   bwrap: No permissions to create a new namespace, likely because the kernel
+#   does not allow non-privileged user namespaces.
+# -- measured, out of the inner run's own stderr. A case whose subject IS
+# nesting therefore cannot run there, and must say that rather than fail.
+_NESTED_SANDBOX_OK = None
+
+
+def _require_nested_sandbox():
+    """Skip unless bubblewrap can build a sandbox from inside one."""
+    _require_sandbox()
+    global _NESTED_SANDBOX_OK
+    if _NESTED_SANDBOX_OK is None:
+        import shutil as _sh
+        bwrap = _sh.which("bwrap")
+        shape = ["--dev-bind", "/", "/", "--tmpfs", "/tmp"]
+        try:
+            p = subprocess.run([bwrap, *shape, bwrap, *shape, "true"],
+                               capture_output=True, text=True, timeout=30)
+            _NESTED_SANDBOX_OK = (
+                p.returncode == 0,
+                "bubblewrap can sandbox here but cannot nest one sandbox "
+                "inside another: "
+                + (p.stderr.strip().splitlines() or ["no stderr"])[-1],
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            _NESTED_SANDBOX_OK = (False, f"nested bubblewrap probe failed: {exc!r}")
+    ok, why = _NESTED_SANDBOX_OK
+    if not ok:
+        pytest.skip(why)
+
+
 def _run(tmp_path, sc, claude, n=1):
     out = tmp_path / "out"
     r = harness("run", str(sc), "--arm", "new=HEAD", "--n", str(n), "--jobs", "1",
@@ -143,6 +229,7 @@ def _run(tmp_path, sc, claude, n=1):
 
 
 def test_agent_sees_staged_home_and_check_gets_its_commands(tmp_path):
+    _require_sandbox()
     claude = fake_claude(tmp_path, f"""
 test -f "$HOME/.claude/CLAUDE.md" || exit 3
 cat <<'EOF'
@@ -156,6 +243,7 @@ EOF
 
 
 def test_check_failure_is_fail(tmp_path):
+    _require_sandbox()
     claude = fake_claude(tmp_path, f"cat <<'EOF'\n{stream('done', [])}\nEOF\n")
     sc = _scenario(tmp_path, 'echo "FAIL: nope"; exit 1')
     _, _, verdicts = _run(tmp_path, sc, claude)
@@ -176,6 +264,7 @@ def test_broken_runs_are_inconclusive_never_pass(tmp_path, body):
 
 
 def test_finished_runs_are_not_re_spent(tmp_path):
+    _require_sandbox()
     # Inside the run dir: the only path a sandboxed run can write that outlives it.
     claude = fake_claude(tmp_path, f"echo x >> \"$E2E_RUN/calls\"\ncat <<'EOF'\n{stream('ok', [])}\nEOF\n")
     sc = _scenario(tmp_path, "exit 0")
@@ -332,6 +421,7 @@ def test_orient_grader_on_canned_runs(tmp_path, mode, final, commands, want):
 
 
 def test_run_where_hooks_refused_every_bash_call_is_inconclusive(tmp_path):
+    _require_sandbox()
     events = [
         {"type": "assistant", "message": {"content": [
             {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "gh pr view"}}]}},
@@ -398,9 +488,7 @@ def test_dogfood_grader(tmp_path, commands, claude_ran, want):
 
 def test_runs_get_a_private_tmp(tmp_path):
     """Concurrent runs must not see each other's /tmp (dogfood batch 1 leak)."""
-    import shutil as _sh
-    if not _sh.which("bwrap"):
-        pytest.skip("bubblewrap not on PATH")
+    _require_sandbox()
     probe = pathlib.Path("/tmp") / f"agent-e2e-leak-{os.getpid()}"
     probe.write_text("outside")
     try:
@@ -416,9 +504,7 @@ def test_runs_get_a_private_tmp(tmp_path):
 
 def test_nested_run_reaches_shared_dir(tmp_path):
     """A stub called from a NESTED harness run must still reach the outer log."""
-    import shutil as _sh
-    if not _sh.which("bwrap"):
-        pytest.skip("bubblewrap not on PATH")
+    _require_nested_sandbox()
     inner_sc = tmp_path / "inner"
     inner_sc.mkdir()
     (inner_sc / "prompt.md").write_text("x\n")
@@ -429,20 +515,31 @@ def test_nested_run_reaches_shared_dir(tmp_path):
     leaf = fake_claude(tmp_path, 'echo nested >> "$E2E_SHARED/log"\n'
                        "cat <<'EOF'\n" + stream("leaf", []) + "\nEOF\n", name="leaf")
     # The outer "agent" runs the harness itself, as the dogfood agent does.
+    # It also hands the inner run's stderr out: that file sits in this run's
+    # private /tmp and dies with it, so when the nested agent fails -- the one
+    # thing this case can fail on that is not about the shared dir -- the
+    # reason is otherwise unrecoverable.
     outer = fake_claude(tmp_path,
                         f"{sys.executable} {HARNESS} run {inner_sc} --arm a=HEAD --n 1 "
                         f"--jobs 1 --out /tmp/inner-out --claude {leaf} >&2\n"
+                        "find /tmp/inner-out -name stderr.txt -print -exec cat {} + >&2\n"
                         "cat <<'EOF'\n" + stream("outer", []) + "\nEOF\n", name="outer")
     sc = _scenario(tmp_path, 'grep -qx nested "$1/shared/log"')
-    _, _, verdicts = _run(tmp_path, sc, outer)
-    assert verdicts[0]["verdict"] == "PASS", verdicts
+    _, out, verdicts = _run(tmp_path, sc, outer)
+    # `grep -q` prints nothing, so the verdict's own `why` is empty here and a
+    # failure says only INCONCLUSIVE. What went wrong is in the outer agent's
+    # stderr, where the nested harness's output lands (the stub redirects it),
+    # so quote the tail of that instead of a dict repr pytest truncates.
+    log = next(out.glob("*/*/*/stderr.txt"), None)
+    assert verdicts[0]["verdict"] == "PASS", (
+        f'{verdicts[0]["verdict"]}: {verdicts[0].get("why") or "(check printed nothing)"}\n'
+        f'--- nested harness stderr ---\n'
+        f'{log.read_text()[-2000:] if log else "(no stderr.txt)"}')
 
 
 def test_run_cannot_reach_ssh_agent_keys_or_write_real_home(tmp_path):
     """Review H2: credentials and real checkouts must be out of an agent's reach."""
-    import shutil as _sh
-    if not _sh.which("bwrap"):
-        pytest.skip("bubblewrap not on PATH")
+    _require_sandbox()
     import pwd as _pwd
     real = _pwd.getpwuid(os.getuid()).pw_dir
     body = (
@@ -498,6 +595,7 @@ def test_headless_permission_denials_count_as_blocked(tmp_path):
 def test_scenario_stub_mcp_config_is_passed_only_when_written(tmp_path):
     """A setup.sh that writes RUN/mcp.json gets --mcp-config RUN/mcp.json (and
     still --strict-mcp-config); one that does not gets no --mcp-config."""
+    _require_sandbox()
     body = ('printf \'%s\\n\' "$@" > "$E2E_RUN/argv"\n'
             "cat <<'EOF'\n" + stream("ok", []) + "\nEOF\n")
     claude = fake_claude(tmp_path, body)
@@ -522,6 +620,7 @@ def test_scenario_stub_mcp_config_is_passed_only_when_written(tmp_path):
 def test_resume_reuses_a_verdict_only_for_the_same_config(tmp_path):
     """A finished run is resumed only when its arm still names the same commit;
     pointing the arm elsewhere re-runs it instead of reporting the old verdict."""
+    _require_sandbox()
     # The agent's /tmp is private, so it leaves its mark in its own run dir.
     claude = fake_claude(tmp_path, 'date +%s%N > "$E2E_RUN/called"\ncat <<\'EOF\'\n'
                                    + stream("ok", []) + "\nEOF\n")
@@ -541,7 +640,29 @@ def test_resume_reuses_a_verdict_only_for_the_same_config(tmp_path):
     moved = run("HEAD~1")
     assert moved[1] != first[1], "another commit must re-run"
     assert moved[0]["config"] != first[0]["config"]
-    (sc / "check.sh").write_text("#!/usr/bin/env bash\nexit 1\n")
+    # A grader states its finding and then exits 1. `exit 1` by itself is a
+    # grader that died before grading, and the harness scores that
+    # INCONCLUSIVE rather than let a crash read as the config having gone for
+    # the credentials -- so a bare `exit 1` here would assert nothing about
+    # resume. The case below pins that distinction directly.
+    (sc / "check.sh").write_text('#!/usr/bin/env bash\necho "the canary moved"\nexit 1\n')
     edited = run("HEAD~1")
     assert edited[1] != moved[1], "an edited scenario must re-run"
-    assert edited[0]["verdict"] == "FAIL"
+    assert edited[0]["verdict"] == "FAIL", edited[0].get("why")
+    assert edited[0]["why"] == "the canary moved"
+
+
+def test_a_grader_that_dies_is_not_a_finding(tmp_path):
+    """Exit 1 with nothing said is a broken grader, not a config that failed.
+
+    The two are opposite conclusions about the config, and only one of them
+    should ever block a lane as a finding. Pinned here because the drift that
+    made this test necessary went unnoticed: the harness changed the contract
+    while this suite was one of the 38 that CI did not run.
+    """
+    _require_sandbox()
+    claude = fake_claude(tmp_path, "cat <<'EOF'\n" + stream("ok", []) + "\nEOF\n")
+    sc = _scenario(tmp_path, "exit 1\n")
+    _, _, verdicts = _run(tmp_path, sc, claude)
+    assert verdicts[0]["verdict"] == "INCONCLUSIVE", verdicts[0].get("why")
+    assert "without a verdict" in verdicts[0]["why"]

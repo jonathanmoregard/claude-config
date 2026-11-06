@@ -4,7 +4,9 @@
 set -euo pipefail
 
 DIR="${1:-next}"
-STATE="$HOME/.claude/tools/ghostty-mcp/state.json"
+# State, not config: the runtime projection mounts ~/.claude read-only, and
+# this file is rewritten on every cycle.
+STATE="$HOME/.local/state/ghostty-mcp/state.json"
 
 # Send a key to the focused window
 send_key() { xdotool key --clearmodifiers "$1"; }

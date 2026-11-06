@@ -86,6 +86,19 @@ The `pr-state-guard` Stop hook queries every PR linked in a reply and sends the
 reply back when it presents a merged or closed PR as awaiting action. It is a
 backstop for this check, not a replacement.
 
+Every message that asks the user to merge or review also carries each PR's full
+URL, one per line at the bottom (`reporting-pr-state`): never `#37, #38`, a
+title, or a markdown label alone. This binds in any reply shape, a one-line
+"merge clicks" included, not only inside a status-report template. "Short as
+you like" and "just the numbers" do not lift it — a reply can be both short and
+clickable.
+
+The same hook enforces that half too: a merge or review ask carrying a bare
+`#41` with no `/pull/41` URL in the reply is sent back, naming the numbers to
+link. It is why this rule holds when prose did not — measured over a week of
+replies, the prose was followed about 95% of the time and the misses all looked
+like a hurry.
+
 ## 3. Hand off for review
 
 Before asking for the merge, state how deployment will be verified: the command
@@ -137,6 +150,7 @@ Treat every branch/repository independently:
 - Calling a green, mergeable PR done
 - Trusting "merged" without a same-turn `gh pr view`
 - Asking for a merge or review without a same-turn live `gh pr view` of that PR
+- Asking for a merge or review with a bare `#N` and no full URL for each PR
 - Opening a PR in a PR-gated repo before the user's review and explicit yes
 - Using the reviewed branch SHA as the deployed merge SHA
 - Smoke-testing the source tree, a stub, a mock, or a changed artifact

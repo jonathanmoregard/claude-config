@@ -69,10 +69,10 @@ User instructions override everything below.
 - Skill misses a trigger clearly in its scope → add that phrasing to its `description` the same session. Store-symlinked skills (`skills/<name>` is a symlink) → edit in the owning repo, via its PR flow.
 
 ## Config edits (`~/.claude`, `~/.codex`)
-- `~/.claude` is read-only, pinned to `master`, read live by the harness. Every edit (settings.json, hooks, skills, agents, commands, permissions, scripts, CLAUDE.md), one-liners included, goes in `~/worktrees/claude-<slug>/` off freshly fetched `origin/master` (`~/.claude/scripts/claude-worktree.sh <slug>`), then a PR. Commit only to branches this session created. Follow `settings-management`.
+- `~/.claude` is a read-only projection of `runtime/` in the config repo `~/Repos/claude-config`, read live by the harness; it is not a git checkout. Every edit (settings.json, hooks, skills, agents, commands, permissions, scripts, CLAUDE.md), one-liners included, goes under `runtime/` in a `~/worktrees/claude-<slug>/` worktree of `~/Repos/claude-config` off freshly fetched `origin/master` (`~/.claude/scripts/claude-worktree.sh <slug>`), then a PR. Commit only to branches this session created. Follow `settings-management`.
 - Skills that edit config (built-in `update-config`, `keybindings-help`, `statusline-setup`, `fewer-permission-prompts`, plugin or newly installed) don't exempt you: run their steps inside the worktree.
 - Behavior-changing edit (CLAUDE.md, skills, agents, commands, hooks, settings, any text an agent reads — this rule included) → agent e2e before the PR, per `agent-config-e2e`: a real headless agent on the staged candidate config, driven through the situation the change targets, `origin/master` vs worktree. Results table goes in the PR body. Unit tests, a diff read, or "the text says so" are not e2e.
-- `~/.claude` off `master` or with tracked changes → stop and report its exact state. Don't stash, reset, clean or switch it.
+- `~/Repos/claude-config` off `master` or with tracked changes → stop and report its exact state. Don't stash, reset, clean or switch it.
 - Untracked runtime state (`tmp/`, `projects/`, `homunculus/`, `reflections/`) needs no worktree.
 - `~/.codex` is generated and Codex-owned (runtime files included): don't hand-edit anything there. Shared changes go through `~/.claude`; Codex-only rendering or mapping through the `ai-client-config` repo; `ai-client-config-codex-sync.service` publishes.
 
@@ -94,6 +94,6 @@ User instructions override everything below.
 
 ## PRs
 - Target the repo's default branch. Non-default only when asked, then re-target before merge.
-- **PR-gated repo** = private/internal with workflows on `pull_request` (check: `gh repo view --json visibility` + `grep pull_request .github/workflows/*`). Opening the PR and every push to it bill Actions minutes; pushing the branch alone doesn't, unless a workflow runs on `push` to any branch (then batch pushes too).
+- **PR-gated repo** = private/internal with workflows on `pull_request` (check: `gh repo view --json visibility` + `grep pull_request .github/workflows/*`). Never assume it: cite that check or the completion-check line naming the visibility; check failed → "visibility unchecked", never "private". Opening the PR and every push to it bill Actions minutes; pushing the branch alone doesn't, unless a workflow runs on `push` to any branch (then batch pushes too).
 - PR-gated → push the branch for backup, get local gates green (`scripts/check` etc.) and the user's review settled, then ask one closed question — "Open the PR?" — and wait. Only the user's yes, or an explicit "open a PR", authorizes `gh pr create`. Drafts run CI too; no draft workaround. Details: `finishing-up`.
 - Public, or private with no PR-triggered CI → open PRs as before.

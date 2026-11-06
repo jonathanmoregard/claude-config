@@ -24,7 +24,10 @@ import subprocess
 import pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-HOOK = os.path.join(REPO_ROOT, "hooks", "visual-verify-trigger.sh")
+# `runtime/` once the layout migration has landed, the repository root before it;
+# only the shipped subset moved, tests/ stays at the root.
+RUNTIME = os.path.join(REPO_ROOT, "runtime") if os.path.isdir(os.path.join(REPO_ROOT, "runtime")) else REPO_ROOT
+HOOK = os.path.join(RUNTIME, "hooks", "visual-verify-trigger.sh")
 
 HANDLER = """use axum::response::Html;
 

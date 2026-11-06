@@ -90,6 +90,10 @@
       "Read(//home/jonathan/.claude/settings.json)",
       "Read(//home/jonathan/.claude/templates/**)",
       "Read(//home/jonathan/.claude/hooks/**)",
+      "Read(//home/jonathan/.claude/scripts/**)",
+      "Read(//home/jonathan/.claude/runtime/**)",
+      "Read(//home/jonathan/.claude/proposals/**)",
+      "Read(//home/jonathan/.local/state/claude-proposals/**)",
       "Read(//home/jonathan/.local/state/claude-tasks/**)",
       "Read(//home/jonathan/.local/state/klaffat/e2e-artifacts/**)",
       "Edit(//tmp/**)",
@@ -379,7 +383,7 @@
         ]
       },
       {
-        "matcher": "Bash",
+        "matcher": "^(Bash|Monitor)$",
         "hooks": [
           {
             "type": "command",
@@ -782,6 +786,17 @@
             "type": "command",
             "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark SubagentStart",
             "timeout": 10
+          }
+        ]
+      }
+    ],
+    "MessageDisplay": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/hooks/code-span-punct.py",
+            "timeout": 5
           }
         ]
       }

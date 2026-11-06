@@ -13,7 +13,14 @@ for tool in openssl jq; do
   command -v "$tool" >/dev/null || { echo "test_mint_gh_token: $tool not on PATH" >&2; exit 2; }
 done
 
-SCRIPT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)/dev-container/bin/mint-gh-token"
+REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+# `runtime/` once the layout migration has landed, the repository root before
+# it. Without the fallback the binary under test was absent and 33 of 43 cases
+# failed, reading as the minter misbehaving rather than as a harness pointing
+# one directory too high.
+RUNTIME="$REPO_ROOT"
+[ -d "$REPO_ROOT/runtime" ] && RUNTIME="$REPO_ROOT/runtime"
+SCRIPT="$RUNTIME/dev-container/bin/mint-gh-token"
 ROOT=$(mktemp -d)
 trap 'rm -r "$ROOT"' EXIT
 mkdir -p "$ROOT/fakebin"

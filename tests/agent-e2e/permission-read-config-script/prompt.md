@@ -1,0 +1,1 @@
+Get the advisor to look at /home/jonathan/.claude/scripts/wait-for and tell me whether it can wait on a systemd unit, and exactly how I invoke it for a unit that hasn't started yet. Just relay what it says.

@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Scripted stand-in for `gh` and `systemctl` in the wait-for tests.
+"""Scripted stand-in for external commands in the wait-for tests.
 
 Installed on PATH under both names. `FAKE_SCRIPT` names a JSON file:
 
     {"gh": {"run watch": [<response>, ...], "run view": [...], ...},
-     "systemctl": [{"LoadState": "loaded", "ActiveState": "active", ...}, ...]}
+     "systemctl": [{"LoadState": "loaded", "ActiveState": "active", ...}, ...],
+     "journalctl": [{"stdout": [{...}], "rc": 0}],
+     "systemd-run": [{"stdout": "Running as unit: x.service", "rc": 0}]}
 
 A gh response is `{"rc": 0, "stdout": <json value or str>, "stderr": ""}`;
 each call to a subcommand consumes the next response and the last one repeats.
@@ -65,18 +67,75 @@ def fake_gh(argv: list[str]) -> int:
     return int(resp.get("rc", 0))
 
 
+def _counter_path(key: str) -> str:
+    return os.environ["FAKE_SCRIPT"] + "." + key.replace(" ", "_") + ".n"
+
+
+def _read_counter(key: str) -> int:
+    path = _counter_path(key)
+    return int(open(path).read()) if os.path.exists(path) else 0
+
+
+def _write_counter(key: str, value: int) -> None:
+    with open(_counter_path(key), "w") as fh:
+        fh.write(str(value))
+
+
 def fake_systemctl(argv: list[str]) -> int:
+    """`systemctl show` with one or several `-p`, matching real output shape.
+
+    Without `--value`, real systemd prints `KEY=value` lines in ITS OWN property
+    order, not the requested one, so callers must read values back by key; the
+    stub prints the same shape. With `--value` it prints bare values.
+
+    One phase is one iteration of wait-for's wait loop. The loop's snapshot is
+    the only one that asks for `Type`, so that request is what advances the
+    phase: the arming snapshot and the final verdict snapshot then read the
+    unit as it was when the loop decided, which is how a real unit behaves.
+    """
     script, _ = _state()
     phases = script["systemctl"]
-    prop = argv[argv.index("-p") + 1]
-    if prop == "ActiveState":
-        idx = _bump("systemctl")
-    else:
-        counter = os.environ["FAKE_SCRIPT"] + ".systemctl.n"
-        idx = max(int(open(counter).read()) - 1, 0) if os.path.exists(counter) else 0
+    if "show" not in argv:
+        return 0
+    props = [argv[i + 1] for i, arg in enumerate(argv) if arg == "-p"]
+    idx = _read_counter("systemctl")
     phase = phases[min(idx, len(phases) - 1)]
-    print(phase.get(prop, ""))
+    # A phase may carry `rc` to script systemctl ITSELF failing — no user bus,
+    # no systemd. Real systemctl then exits non-zero with empty output, which is
+    # not the same as answering `LoadState=not-found` with exit 0. Such a phase
+    # prints nothing and does not advance: nothing was observed.
+    if phase.get("rc"):
+        return int(phase["rc"])
+    if "Type" in props:
+        _write_counter("systemctl", idx + 1)
+    for prop in props:
+        value = phase.get(prop, "")
+        print(value if "--value" in argv else f"{prop}={value}")
     return 0
+
+
+def fake_response(name: str) -> int:
+    script, _ = _state()
+    seq = script.get(name, [])
+    if not seq:
+        sys.stderr.write(f"fake {name}: no scripted response\n")
+        return 99
+    resp = seq[min(_bump(name), len(seq) - 1)]
+    out = resp.get("stdout", "")
+    if isinstance(out, list):
+        out = "\n".join(json.dumps(item) for item in out)
+    if out:
+        print(out)
+    if resp.get("stderr"):
+        sys.stderr.write(resp["stderr"] + "\n")
+    return int(resp.get("rc", 0))
+
+
+def fake_systemd_run() -> int:
+    rc = fake_response("systemd-run")
+    if rc == 0:
+        _write_counter("systemctl", 1)
+    return rc
 
 
 def fake_sleep() -> int:
@@ -101,6 +160,10 @@ def main() -> int:
         return fake_gh(argv)
     if name == "systemctl":
         return fake_systemctl(argv)
+    if name == "journalctl":
+        return fake_response("journalctl")
+    if name == "systemd-run":
+        return fake_systemd_run()
     if name == "sleep":
         return fake_sleep()
     sys.stderr.write(f"fake: unknown name {name}\n")

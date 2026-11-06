@@ -17,10 +17,21 @@ import subprocess
 import sys
 import textwrap
 import time
+from typing import TYPE_CHECKING
 
 import pytest
 
-from conftest import REPO_ROOT, FakeClock  # noqa: E402
+# Anchored here, not imported from `conftest`: tests/ and tests/ai-router/ both
+# hold a module named `conftest`, and in a whole-tree run `from conftest import`
+# resolves to whichever was imported last. `egress_guard` ships under runtime/.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RUNTIME = (os.path.join(REPO_ROOT, "runtime")
+           if os.path.isdir(os.path.join(REPO_ROOT, "runtime")) else REPO_ROOT)
+if RUNTIME not in sys.path:
+    sys.path.insert(0, RUNTIME)
+
+if TYPE_CHECKING:
+    from conftest import FakeClock
 
 from egress_guard.limiter import (  # noqa: E402
     BudgetExhausted,
@@ -506,7 +517,7 @@ def _run_child(state_dir, policy, n, declared, resource):
             sys.executable,
             "-c",
             _CHILD_ACQUIRE.format(
-                repo=REPO_ROOT,
+                repo=RUNTIME,
                 state=state_dir,
                 policy=policy,
                 n=n,
@@ -568,7 +579,7 @@ def test_killed_lock_holder_does_not_wedge_the_limiter(state_dir, policy_file):
     child_src = textwrap.dedent(
         f"""
         import sys, time
-        sys.path.insert(0, {REPO_ROOT!r})
+        sys.path.insert(0, {RUNTIME!r})
         from egress_guard.limiter import EgressGuard
         guard = EgressGuard(state_dir={state_dir!r}, policy_path={policy!r})
         with guard.locked("stale.example"):

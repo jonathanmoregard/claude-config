@@ -12,8 +12,30 @@
 
 set -uo pipefail
 
-MAIN="${CLAUDE_PRIMARY_CHECKOUT:-$HOME/.claude}"
+# Where the pinned checkout is. `$HOME/.claude` was the whole answer until the
+# runtime-projection cutover; after it, that path holds no `.git` and the guard
+# below would exit 0 — this observer, whose entire job is reporting the state of
+# the pin, going silently mute at exactly the moment the layout changed under
+# it. scripts/config-repo.sh owns the resolution rule.
+#
+# Sourced defensively, like hooks/ralph-loop-stop.sh does: a missing library
+# must not take a SessionStart hook down, so it falls back to the historical
+# path and keeps observing.
+script_dir="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+# shellcheck source=/dev/null
+source "$script_dir/config-repo.sh" 2>/dev/null || true
+if [ -n "${CLAUDE_PRIMARY_CHECKOUT:-}" ]; then
+  MAIN="$CLAUDE_PRIMARY_CHECKOUT"
+elif declare -f claude_config_repo >/dev/null 2>&1; then
+  MAIN="$(claude_config_repo "$script_dir" 2>/dev/null || true)"
+else
+  MAIN="$HOME/.claude"
+fi
 
+# Still silent when there is no checkout to observe — this runs at every
+# SessionStart in every project, and a machine without the repository is not a
+# condition to report on.
+[ -n "$MAIN" ] || exit 0
 git -C "$MAIN" rev-parse --show-toplevel >/dev/null 2>&1 || exit 0
 
 # Only the MAIN worktree is pinned. In a linked worktree `--git-dir` is

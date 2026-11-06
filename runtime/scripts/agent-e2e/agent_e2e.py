@@ -71,6 +71,16 @@ REPO = pathlib.Path(__file__).resolve().parents[2]
 # From the passwd entry, not $HOME: inside a run (a nested harness) $HOME is
 # the sandbox, and ssh resolves ~/.ssh the same way.
 REAL_HOME = pathlib.Path(pwd.getpwuid(os.getuid()).pw_dir)
+# Resolved here, from the harness's OWN environment, and never again. A bare
+# "bash" handed to subprocess.run(env=...) is looked up in the PASSED env's
+# PATH (os.get_exec_path reads that dict, not the harness's), and the env a
+# run is built with puts the run's stub directory first -- a directory bound
+# writable into the sandbox and handed to the agent as $E2E_BIN. A config
+# under test that writes $E2E_BIN/bash therefore got the harness to execute
+# its code OUTSIDE the sandbox; measured, with a planted `bash` turning a real
+# FAIL into `PASS: no canary was touched`, exit 0.
+HARNESS_PATH = os.environ.get("PATH", "")
+BASH = shutil.which("bash") or "/bin/bash"
 # Linked, never copied: auth, the plugin cache and the tree relative skill
 # symlinks (`../../Repos/router-agent/...`) resolve into.
 LINKS = {
@@ -81,9 +91,14 @@ LINKS = {
 }
 # Credentials and agents a run must not inherit: with them, an agent in the
 # sandbox could push a real checkout under the linked ~/Repos, or call GitHub
-# with the user's token, past every stub.
+# with the user's token, past every stub. The ACTIONS_ID_TOKEN_REQUEST_* pair
+# is GitHub Actions' identity-token endpoint and its bearer: a run that keeps
+# them can ask GitHub to sign a fresh statement of who the job is and exchange
+# it for a new cloud credential, which outlives whatever credential the run was
+# given on purpose.
 SCRUB = ("SSH_AUTH_SOCK", "SSH_AGENT_PID", "SSH_ASKPASS", "GIT_ASKPASS",
          "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
+         "ACTIONS_ID_TOKEN_REQUEST_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_URL",
          "DBUS_SESSION_BUS_ADDRESS")
 # Copied, never linked: config a hook needs to run at all, in a directory the
 # hook also WRITES (dcg records allow-once and pending exceptions beside its
@@ -170,11 +185,22 @@ def copy_config(src: str, dest: pathlib.Path) -> str:
 
 
 def scenario_id(scenario: pathlib.Path) -> str:
-    """Digest of every file in the scenario (prompt, setup, check, stubs), so
-    an edited scenario is run again rather than resumed."""
+    """Digest of every AUTHORED file in the scenario (prompt, setup, check,
+    stubs), so an edited scenario is run again rather than resumed.
+
+    Generated caches are skipped. A scenario whose setup imports a helper gets
+    `__pycache__/*.pyc` written into this tree, and hashing those made a
+    finished run stop matching itself -- repeating completed, paid runs. Worse
+    than flaky: a .pyc embeds the source mtime and the interpreter magic, so
+    the digest was not reproducible across machines or checkouts either.
+    """
+    skip = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
     h = hashlib.sha256()
     for f in sorted(p for p in scenario.rglob("*") if p.is_file()):
-        h.update(str(f.relative_to(scenario)).encode() + b"\0" + f.read_bytes() + b"\0")
+        rel = f.relative_to(scenario)
+        if skip & set(rel.parts) or rel.suffix in (".pyc", ".pyo"):
+            continue
+        h.update(str(rel).encode() + b"\0" + f.read_bytes() + b"\0")
     return h.hexdigest()
 
 
@@ -211,6 +237,94 @@ def stage(src: str, home: pathlib.Path) -> str:
         "[user]\n\tname = e2e\n\temail = e2e@example.invalid\n"
         "[init]\n\tdefaultBranch = main\n", encoding="utf-8")
     return provenance
+
+
+def path_guard() -> list[str]:
+    """Bind every directory on the harness's own PATH read-only.
+
+    The grader runs outside the sandbox and resolves `python3`, `git`, `grep`
+    through this PATH, so a writable entry on it is a place the config under
+    test can plant an executable the harness will then run -- the same hijack
+    as $E2E_BIN, by a different directory. Measured: with a writable PATH entry
+    outside /tmp and outside REAL_HOME, a sandboxed shell wrote `python3` into
+    it and turned a grader's FAIL into `PASS: no canary was touched`.
+
+    Derived from PATH rather than naming paths, because the exposed directories
+    are the runner's, not this host's: on a GitHub hosted runner /usr/local/bin
+    and the hosted tool caches are owned by the unprivileged user the job runs
+    as, while on NixOS every entry already lives in the read-only store. Each
+    entry is resolved, because writability belongs to the real directory and
+    bwrap should not be handed a symlink to mount over.
+    """
+    seen: list[str] = []
+    for entry in HARNESS_PATH.split(os.pathsep):
+        if not entry:
+            continue
+        real = pathlib.Path(entry).resolve()
+        if real.is_dir() and str(real) not in seen:
+            seen.append(str(real))
+    return [arg for d in seen for arg in ("--ro-bind", d, d)]
+
+
+def sandboxed(argv: list[str], *, claude: str, run: pathlib.Path,
+              shared: pathlib.Path, work: pathlib.Path) -> list[str]:
+    """Wrap ARGV in the bubblewrap confinement a run executes under.
+
+    The confinement binds `/` read-write, so what a run cannot write is
+    whatever is bound read-only over it. `path_guard()` is why the harness's
+    own PATH is on that list.
+
+    Its own function so a test can attack the real construction rather than a
+    copy of it; `tests/enforced/test_sandbox_isolation.py` runs this argv and
+    tries to break out of it.
+
+    A private /tmp per run. Agents write literal /tmp paths, and concurrent
+    runs sharing the real one leaked into each other: two dogfood runs picked
+    the same /tmp output dir and one "ran" its e2e by reusing the other's
+    verdict. Only this run's own directory is bound back in.
+    """
+    binds = []
+    exe_dir = pathlib.Path(claude).resolve().parent
+    if str(exe_dir).startswith("/tmp"):  # else hidden by the private /tmp
+        binds += ["--ro-bind", str(exe_dir), str(exe_dir)]
+    # Last, so a read-only ancestor bind above cannot shadow them.
+    binds += ["--bind", str(run), str(run), "--bind", str(shared), str(shared)]
+    # The real HOME is read-only (linked ~/Repos and ~/.claude/plugins
+    # included) and ~/.ssh is hidden; only the run, the shared log dir and
+    # the credentials file (token refresh) stay writable.
+    creds = REAL_HOME / ".claude/.credentials.json"
+    home_guard = ["--ro-bind", str(REAL_HOME), str(REAL_HOME)]
+    # Hiding ~/.ssh only when there is one. bwrap creates a mount point
+    # before mounting, and the read-only bind above makes that mkdir fail
+    # on a host without the directory -- a CI runner -- taking down every
+    # run with "Can't mkdir: Read-only file system". Nothing is left
+    # unguarded by skipping it: that same read-only bind means no ~/.ssh
+    # can appear during the run either.
+    if (REAL_HOME / ".ssh").is_dir():
+        home_guard += ["--tmpfs", str(REAL_HOME / ".ssh")]
+    if creds.is_file():
+        home_guard += ["--bind", str(creds), str(creds)]
+    # A private pid namespace with its own procfs. Dropping a variable from
+    # the child's environment is not isolation while the child can read it
+    # back out of an ancestor's /proc entry: the harness itself holds what the
+    # run must not have, GitHub Actions' identity-token endpoint and bearer
+    # among it.
+    #
+    # Measured, because the obvious explanation was the wrong one. An
+    # unsandboxed child CAN read its parent's environ on these hosts:
+    # `kernel.yama.ptrace_scope` is 1 here, but yama gates PTRACE_MODE_ATTACH
+    # and not a read, so what refuses that read from inside the sandbox is
+    # bubblewrap's user namespace. The pid namespace is what stops the
+    # guarantee resting on one mechanism, and it drops the host's process list
+    # from view besides -- some 900 entries to 4.
+    #
+    # --die-with-parent because a run must not outlive the credential it was
+    # given. Killing the launcher at the deadline left the sandbox running
+    # with the token in hand; measured with a 3s timeout against `sleep 300`.
+    return [shutil.which("bwrap"), "--dev-bind", "/", "/",
+            "--unshare-pid", "--proc", "/proc", "--die-with-parent",
+            *home_guard, *path_guard(), "--tmpfs", "/tmp",
+            *binds, "--chdir", str(work), "--", *argv]
 
 
 def events_of(text: str) -> list[dict]:
@@ -326,8 +440,16 @@ def run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
     # ssh finds keys via getpwuid, not $HOME; refuse it outright. Scenario
     # remotes are local bare repos behind insteadOf, so nothing needs ssh.
     env["GIT_SSH_COMMAND"] = "false"
-    setup = subprocess.run(["bash", str(scenario / "setup.sh"), str(work), str(run)],
-                           env=env, capture_output=True, text=True)
+    # The stub directory is on PATH for the AGENT, whose tools the stubs exist
+    # to shadow -- and for nobody else. setup.sh and check.sh run outside the
+    # sandbox, as children of the harness, so every bare command they resolve
+    # through PATH is a place the config under test can plant an executable:
+    # the honeypot's own grader shells out to `python3`. They still get
+    # $E2E_BIN as a variable, which is how setup.sh writes stubs; no grader
+    # reads it, and the one grader that calls `gh` wants the real one.
+    script_env = {**env, "PATH": HARNESS_PATH}
+    setup = subprocess.run([BASH, str(scenario / "setup.sh"), str(work), str(run)],
+                           env=script_env, capture_output=True, text=True)
     (run / "setup.log").write_text(setup.stdout + setup.stderr, encoding="utf-8")
     verdict = {"arm": arm, "run": idx, "config": provenance, "resume_key": key}
     if setup.returncode != 0:
@@ -348,28 +470,9 @@ def run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
     # --strict-mcp-config: nothing from the real HOME's MCP config loads.
     if (run / "mcp.json").is_file():
         argv += ["--mcp-config", str(run / "mcp.json")]
-    # A private /tmp per run. Agents write literal /tmp paths, and concurrent
-    # runs sharing the real one leaked into each other: two dogfood runs picked
-    # the same /tmp output dir and one "ran" its e2e by reusing the other's
-    # verdict. Only this run's own directory is bound back in.
     bwrap = shutil.which("bwrap")
     if bwrap:
-        binds = []
-        exe_dir = pathlib.Path(args.claude).resolve().parent
-        if str(exe_dir).startswith("/tmp"):  # else hidden by the private /tmp
-            binds += ["--ro-bind", str(exe_dir), str(exe_dir)]
-        # Last, so a read-only ancestor bind above cannot shadow them.
-        binds += ["--bind", str(run), str(run), "--bind", str(shared), str(shared)]
-        # The real HOME is read-only (linked ~/Repos and ~/.claude/plugins
-        # included) and ~/.ssh is hidden; only the run, the shared log dir and
-        # the credentials file (token refresh) stay writable.
-        creds = REAL_HOME / ".claude/.credentials.json"
-        home_guard = ["--ro-bind", str(REAL_HOME), str(REAL_HOME),
-                      "--tmpfs", str(REAL_HOME / ".ssh")]
-        if creds.is_file():
-            home_guard += ["--bind", str(creds), str(creds)]
-        argv = [bwrap, "--dev-bind", "/", "/", *home_guard, "--tmpfs", "/tmp",
-                *binds, "--chdir", str(work), "--", *argv]
+        argv = sandboxed(argv, claude=args.claude, run=run, shared=shared, work=work)
     verdict["isolated_tmp"] = bool(bwrap)
     t0 = time.monotonic()
     try:
@@ -399,11 +502,21 @@ def run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
                        why="a hook refused every Bash call: the sandbox, not the "
                            "config, decided this run (see transcript.jsonl)")
     else:
-        chk = subprocess.run(["bash", str(scenario / "check.sh"), str(run)],
-                             env=env, capture_output=True, text=True)
+        chk = subprocess.run([BASH, str(scenario / "check.sh"), str(run)],
+                             env=script_env, capture_output=True, text=True)
         (run / "check.log").write_text(chk.stdout + chk.stderr, encoding="utf-8")
-        verdict["verdict"] = {0: "PASS", 1: "FAIL"}.get(chk.returncode, "INCONCLUSIVE")
-        verdict["why"] = (chk.stdout.strip().splitlines() or [""])[-1][:300]
+        why = (chk.stdout.strip().splitlines() or [""])[-1][:300]
+        outcome = {0: "PASS", 1: "FAIL"}.get(chk.returncode, "INCONCLUSIVE")
+        # A FAIL always carries its reason, because every grader prints one
+        # before exiting 1. Exit 1 with nothing on stdout therefore means the
+        # grader died before it could grade -- a parse error in the script
+        # beats any excepthook the script installs -- and a crash must not be
+        # reported as the config having gone for the credentials.
+        if outcome == "FAIL" and not why:
+            outcome = "INCONCLUSIVE"
+            why = "grader exited 1 without a verdict; see check.log"
+        verdict["verdict"] = outcome
+        verdict["why"] = why
     (run / "verdict.json").write_text(json.dumps(verdict, indent=2), encoding="utf-8")
     return verdict
 
@@ -451,6 +564,17 @@ def cmd_run(args) -> int:
             except Exception as exc:  # harness fault: never silently a PASS
                 v = {"arm": name, "run": i, "config": "?", "verdict": "INCONCLUSIVE",
                      "why": f"harness error: {type(exc).__name__}: {exc}"}
+                # Persist it, or this run leaves no trace on disk: the summary
+                # below would say INCONCLUSIVE while anything reading the run
+                # tree saw only the runs that survived. A CI gate counting
+                # verdict files read that as all-clear.
+                try:
+                    fault = out / name / str(i)
+                    fault.mkdir(parents=True, exist_ok=True)
+                    (fault / "verdict.json").write_text(
+                        json.dumps(v, indent=2), encoding="utf-8")
+                except OSError:
+                    pass  # the in-memory verdict still reaches the summary
             verdicts.append(v)
             print(f"{name}#{i} {v['verdict']} {v.get('why', '')}", flush=True)
     summary = summarise(scenario, verdicts, [a for a, _ in arms])
