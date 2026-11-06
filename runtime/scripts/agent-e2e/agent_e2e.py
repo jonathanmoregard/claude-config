@@ -185,11 +185,22 @@ def copy_config(src: str, dest: pathlib.Path) -> str:
 
 
 def scenario_id(scenario: pathlib.Path) -> str:
-    """Digest of every file in the scenario (prompt, setup, check, stubs), so
-    an edited scenario is run again rather than resumed."""
+    """Digest of every AUTHORED file in the scenario (prompt, setup, check,
+    stubs), so an edited scenario is run again rather than resumed.
+
+    Generated caches are skipped. A scenario whose setup imports a helper gets
+    `__pycache__/*.pyc` written into this tree, and hashing those made a
+    finished run stop matching itself -- repeating completed, paid runs. Worse
+    than flaky: a .pyc embeds the source mtime and the interpreter magic, so
+    the digest was not reproducible across machines or checkouts either.
+    """
+    skip = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
     h = hashlib.sha256()
     for f in sorted(p for p in scenario.rglob("*") if p.is_file()):
-        h.update(str(f.relative_to(scenario)).encode() + b"\0" + f.read_bytes() + b"\0")
+        rel = f.relative_to(scenario)
+        if skip & set(rel.parts) or rel.suffix in (".pyc", ".pyo"):
+            continue
+        h.update(str(rel).encode() + b"\0" + f.read_bytes() + b"\0")
     return h.hexdigest()
 
 
