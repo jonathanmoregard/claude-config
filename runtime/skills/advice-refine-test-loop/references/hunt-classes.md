@@ -3,7 +3,7 @@
 Reviewer B hunts a NAMED subset of these, never the whole list. Pick the
 classes whose `When` the diff actually satisfies, and paste each chosen class's
 `Hunt` line into the prompt verbatim. A class nobody picked is not a gap: a
-reviewer given twelve lenses applies none of them.
+reviewer given all fourteen lenses applies none of them.
 
 ## Reviewer B prompt
 
@@ -84,7 +84,7 @@ would tell a checked value from an unchecked one.
 **When:** every boundary a wire format enters — JSON, forms, query strings,
 headers, env vars, config files, database rows, external API replies.
 **Hunt:** A JSON value, dict, map or raw string travelling inward: read by
-business logic, forwarded down by a handler, or a field re-checked deeper.
+business logic, or forwarded down by a handler that could have parsed it.
 Untyped belongs at the outermost edge, parsed once on the way in. Name the
 boundary where that parse belongs and the type it should produce.
 

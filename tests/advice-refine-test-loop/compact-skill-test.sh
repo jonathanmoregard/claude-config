@@ -32,11 +32,15 @@ required=(
   "Never restrict inspection to changed hunks"
   "The reviewer chooses which files"
   "Record files read"
-  # The second reviewer is only worth its tokens while these four hold: it
-  # dispatches beside the first rather than after it, it cannot see the first's
-  # output, agreement between the two is not promoted to evidence, and its
-  # design findings stay out of the auto-fix path.
-  "ONE tool-use block"
+  # The second reviewer is only worth its tokens while these hold: both prompts
+  # are fixed before either dispatch, both reviewers are in flight at once (so
+  # B cannot have seen A's findings -- `Agent` dispatches are asynchronous, and
+  # one tool-use block is a way to get this, not the property itself), B's
+  # prompt is never revised once A reports, agreement between the two is not
+  # promoted to evidence, and B's design findings stay out of the auto-fix path.
+  "before dispatching either"
+  "in flight at once"
+  "never revise B's"
   "Neither sees the other"
   "Convergence is not confidence"
   "hunt-classes.md"
