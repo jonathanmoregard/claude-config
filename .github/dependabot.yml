@@ -1,0 +1,36 @@
+version: 2
+
+# One weekly pull request across every ecosystem and directory below, majors
+# included, so each repo gets at most one routine Dependabot PR per week. A
+# multi-ecosystem group bundles majors whatever per-entry `groups` say, so
+# entries define none.
+multi-ecosystem-groups:
+  weekly-dependencies:
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "05:17"
+      timezone: "Europe/Stockholm"
+
+# Both roots sit under `runtime/` because that is the only tree the deploy
+# serves. Dependabot reports a bad `directory` on the repository's Dependabot
+# page and opens nothing, so a stale path here is silently inert rather than
+# loud: re-check these against the tree whenever the layout moves.
+updates:
+  - package-ecosystem: "pip"
+    directory: "/runtime/tools/ghostty-mcp"
+    patterns: ["*"]
+    multi-ecosystem-group: "weekly-dependencies"
+    rebase-strategy: "disabled"
+    cooldown:
+      semver-major-days: 14
+      semver-minor-days: 7
+      semver-patch-days: 3
+
+  - package-ecosystem: "nix"
+    directory: "/runtime/skills/visual-verify"
+    patterns: ["*"]
+    multi-ecosystem-group: "weekly-dependencies"
+    rebase-strategy: "disabled"
+    cooldown:
+      default-days: 7
