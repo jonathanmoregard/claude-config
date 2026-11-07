@@ -72,7 +72,7 @@ Once all implementation criteria are checked:
 1. Inspect the integrated diff and run the full gate once from a settled tree.
 2. Run acceptance scenarios and app/visual verification not already covered by
    that gate.
-3. Invoke `advice-refine-test-loop once` over the finished integrated diff.
+3. Invoke `advice-refine-test-loop` once over the finished, integrated diff.
    Reproduce material findings, fix confirmed regressions, and rerun affected
    evidence plus the full gate.
 4. Invoke `finishing-up`. Run its fresh `git`/`gh` readiness checks and act on

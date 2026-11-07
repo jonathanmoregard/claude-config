@@ -5,9 +5,9 @@ description: Use when a finished, integrated non-trivial diff needs independent 
 
 # Empirical Close-out Review
 
-One fresh reviewer proposes falsifiable defects; observed behavior decides what
-gets fixed. Do not run per edit, task, or chunk. During implementation, use the
-project's tests, acceptance criteria, and real app-driving loop instead.
+Two blind fresh reviewers propose falsifiable defects; observed behavior decides
+what gets fixed. Do not run per edit, task, or chunk. During implementation, use
+the project's tests, acceptance criteria, and real app-driving loop instead.
 
 ## Entry Gate
 
@@ -38,12 +38,15 @@ unchanged invariant elsewhere in a changed file. Do not preselect or cap files
 without measured evidence that the constraint improves the review. Record files
 read and why each context expansion was relevant.
 
-## Review Once
+## Review Twice, Blind
 
-Dispatch one fresh, read-only reviewer. Route its focus to the dominant risk;
-do not dispatch broad and specialist reviewers in parallel.
+Dispatch two fresh, read-only reviewers in ONE tool-use block against the same
+settled tree. Neither sees the other's prompt, findings, or existence: one
+shared cue collapses them into a single reviewer. Merge by meaning afterwards.
+Convergence is not confidence — shared blind spots are real, so a finding both
+report still reproduces before any edit. Two reviewers is the whole budget.
 
-Prompt:
+Reviewer A, falsification:
 
 ```text
 Assume this finished change can ship broken. Try to falsify its acceptance
@@ -54,18 +57,28 @@ request, or app interaction that would demonstrate it. Do not suggest cleanup
 or edits. Return no finding that lacks an observable failure. Record files read.
 ```
 
-Use another vendor or specialist only when the user requests a deep audit, the
-first review exposes unresolved contradictory evidence, or failure could cause
+Reviewer B, targeted hunt: take its prompt and its classes from
+`~/.claude/skills/advice-refine-test-loop/references/hunt-classes.md`. Pick only
+the classes whose trigger this diff satisfies — never the whole list — and keep
+B's two finding buckets, defect and design, apart as that file defines them.
+
+Use another vendor or specialist only when the user requests a deep audit, a
+review exposes unresolved contradictory evidence, or failure could cause
 irreversible security, privacy, or data loss.
 
 ## Reproduce, Then Act
 
-Independently reproduce every finding before editing. Test the exact claimed
-path and record expected versus actual behavior. Batch findings through one
-verifier context; do not create one agent or worktree per finding unless
+Independently reproduce every defect finding before editing. Test the exact
+claimed path and record expected versus actual behavior. Batch findings through
+one verifier context; do not create one agent or worktree per finding unless
 concurrent reproducers would mutate shared state.
 
-- Unreproduced: close it without editing.
+- Unreproduced: close it without editing. Unreproduced means the claimed path
+  was exercised and the claim failed — never that the reproducer was awkward
+  to build.
+- Design finding (`unverifiable: true`): no reproducer applies. Surface it to
+  the user as a taste call with the file and line. Never auto-fix it, and never
+  let it block the ship on its own.
 - Caused by the diff or violating its acceptance contract: fix it now.
 - Confirmed but pre-existing and unrelated: record it separately; do not grow
   this branch or restart review rounds.
@@ -76,6 +89,8 @@ surface outside the original capsule. At most one such follow-up pass.
 
 ## Report
 
-Return a compact ledger: reviewer calls and model usage when available, files
-read, findings proposed/reproduced/fixed/deferred, commands run, and final gate
-status. Never claim broad audit coverage from this bounded close-out review.
+Return a compact ledger: reviewer calls and model usage when available, the
+hunt classes reviewer B was given, files read, findings
+proposed/reproduced/fixed/deferred, design findings surfaced, commands run, and
+final gate status. Never claim broad audit coverage from this bounded close-out
+review.
