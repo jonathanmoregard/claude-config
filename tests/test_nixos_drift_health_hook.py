@@ -206,6 +206,46 @@ def test_vscodium_drift_classes_speak_and_name_items(tmp_path):
         assert phrase in ctx, (heading, phrase, ctx)
 
 
+def test_codium_skill_layer_classes_speak_and_name_items(tmp_path):
+    # The skills half of the same layer (nixos-config
+    # home/claude-codium-config.nix). A skill or note written into
+    # ~/.local/state/claude-codium works immediately and survives every
+    # deploy, so it reads as reviewed config until a reinstall drops it, and
+    # nothing else on the host looks in there.
+    #
+    # Each case pins the phrase that makes its hint actionable, because the
+    # three prescribe DIFFERENT actions: promote the skill, do NOT promote a
+    # shadowing one (rename or drop it -- promoting makes the collision
+    # permanent), and promote the durable notes.
+    cases = {
+        "Codium-only skills live but not declared":
+            ("diff-review", "home/claude-codium/skills"),
+        "Codium skills shadowing a shared skill of the same name":
+            ("using-git-worktrees", "do not promote it"),
+        "Codium session notes live but not declared":
+            ("/home/j/.local/state/claude-codium/local.md",
+             "home/claude-codium/CLAUDE.md"),
+    }
+    for i, (heading, (item, phrase)) in enumerate(cases.items()):
+        ctx = _context(_run(_setup(tmp_path / f"c{i}", [_section(heading, [item])])))
+        assert heading in ctx, (heading, ctx)
+        assert item in ctx, (heading, ctx)
+        assert phrase in ctx, (heading, phrase, ctx)
+
+
+def test_codium_skill_drift_reported_alongside_vscodium_settings_drift(tmp_path):
+    # Both halves of the Codium layer in one report, which is the ordinary
+    # case once both are deployed: the editor's settings and the editor's
+    # skills drift independently and neither should mask the other.
+    env = _setup(tmp_path, [
+        _section("VSCodium settings live but not declared", ["editor.wordWrap"]),
+        _section("Codium-only skills live but not declared", ["my-skill"]),
+    ])
+    ctx = _context(_run(env))
+    assert "editor.wordWrap" in ctx, ctx
+    assert "my-skill" in ctx, ctx
+
+
 def _failure_section(heading: str) -> str:
     # Shape the tool actually emits: key/value metadata then a prose paragraph.
     return _section(heading, [
@@ -258,9 +298,12 @@ def test_vscodium_failure_and_drift_are_reported_under_distinct_headlines(tmp_pa
 
 def test_a_report_hitting_every_class_stays_under_the_output_cap():
     # Hook output strings cap at 10,000 characters and over it the payload is
-    # dropped, not truncated -- a silent total failure of the channel. Relaying
-    # twelve headings instead of six halves the headroom, so pin it: every
-    # class at once, each with more items than MAX_ITEMS.
+    # dropped, not truncated -- a silent total failure of the channel. This
+    # hook started at six headings and is now at sixteen, which puts the
+    # worst case around 7.7k: still under, but the headroom is roughly 2.2k,
+    # or about three more headings of this length. So pin it, and read the
+    # assertion value as a budget rather than a formality -- the failure mode
+    # is the whole report going missing, not a truncated one.
     import importlib.util
     spec = importlib.util.spec_from_file_location("drift_health", HOOK)
     mod = importlib.util.module_from_spec(spec)

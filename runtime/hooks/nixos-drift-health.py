@@ -86,6 +86,22 @@ CLASSES: dict[str, str] = {
         "edited live and reverted at activation because home/vscodium.nix "
         "declares them and declared wins; change the declaration in "
         "nixos-config if the live value is the wanted one",
+    "Codium-only skills live but not declared":
+        "skills written straight into ~/.local/state/claude-codium/skills, "
+        "which only editor-started sessions read. They work immediately and "
+        "survive every deploy, so nothing distinguishes them from reviewed "
+        "config until a fresh install drops them — promote into nixos-config "
+        "home/claude-codium/skills",
+    "Codium skills shadowing a shared skill of the same name":
+        "a real directory there BEATS the inherited skill of the same name, "
+        "because activation leaves it alone rather than relinking; the live "
+        "copy is what editor sessions get and the shared one is unreachable "
+        "from them — rename or drop the live copy, do not promote it",
+    "Codium session notes live but not declared":
+        "~/.local/state/claude-codium/local.md has notes beyond its seed. It "
+        "is imported by the Codium CLAUDE.md and needs no PR, so it is where "
+        "mid-session findings land; promote the durable ones into nixos-config "
+        "home/claude-codium/CLAUDE.md",
 }
 
 # Headings that mean the VSCodium settings machinery itself failed. Kept apart
