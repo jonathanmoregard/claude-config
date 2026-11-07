@@ -74,15 +74,18 @@ code. Where a test's name promises more than its assertions check, report that.
 
 ### G1 — Parse, don't validate
 
-**When:** any value a function must check before using it.
+**When:** typed code only — the fix is a type the compiler enforces, so skip
+this class where the language cannot express one. Any value a function must
+check before using it.
 **Hunt:** A value checked and then passed on in its unchecked type, so every
 later caller must trust that the check already happened. Name the type that
 would tell a checked value from an unchecked one.
 
 ### G2 — Wire format past its boundary
 
-**When:** every boundary a wire format enters — JSON, forms, query strings,
-headers, env vars, config files, database rows, external API replies.
+**When:** typed code only, for G1's reason. Every boundary a wire format
+enters — JSON, forms, query strings, headers, env vars, config files,
+database rows, external API replies.
 **Hunt:** A JSON value, dict, map or raw string travelling inward: read by
 business logic, or forwarded down by a handler that could have parsed it.
 Untyped belongs at the outermost edge, parsed once on the way in. Name the
