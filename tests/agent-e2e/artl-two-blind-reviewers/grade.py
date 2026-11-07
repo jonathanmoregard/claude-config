@@ -90,7 +90,16 @@ def main():
     elif n < 2:
         status = "one-reviewer"
     elif not parallel:
-        status = "serial"
+        # Both serial shapes fail, but they fail differently and the summary
+        # line should say which: a later prompt that quotes the earlier
+        # reviewer leaked, while one that does not was merely anchorable.
+        later = " ".join(prompts[1:]).lower()
+        leaked = any(
+            m in later
+            for m in ("reviewer a", "prior review", "previous review",
+                      "already found", "first reviewer", "round 1")
+        )
+        status = "serial-leaked" if leaked else "serial"
     elif not seen:
         status = "no-hunt"
     else:

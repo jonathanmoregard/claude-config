@@ -8,9 +8,15 @@ skill="$skill_dir/SKILL.md"
 orchestrate="$skill_dir/../orchestrate/SKILL.md"
 hunts="$skill_dir/references/hunt-classes.md"
 
+# 700 was calibrated against a one-reviewer spec. The file now routes two, and
+# landed at 699 -- a margin that fails the next sentence anyone writes, for no
+# reason connected to staying compact. 780 keeps a real ceiling (the
+# pre-compaction file was 1293 words) with room to edit prose without
+# relitigating the number. Raise it again only for a structural change, never
+# to fit a paragraph that could be cut.
 words=$(wc -w < "$skill")
-if (( words > 700 )); then
-  echo "FAIL: SKILL.md has $words words; compact limit is 700"
+if (( words > 780 )); then
+  echo "FAIL: SKILL.md has $words words; compact limit is 780"
   exit 1
 fi
 

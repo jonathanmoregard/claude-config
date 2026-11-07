@@ -18,7 +18,8 @@ case "$status" in
   nosub) echo "INCONCLUSIVE: no reviewer dispatched"; exit 2 ;;
   pass) pass "$n reviewers in one block, hunt classes: $classes" ;;
   one-reviewer) fail "single reviewer ($n dispatch), parallel=$parallel hunt=$hunt" ;;
-  serial) fail "$n reviewers but not in one block (serial, second sees the first)" ;;
+  serial) fail "$n reviewers but not in one block (serial; B quoted nothing of A, but was written after A reported)" ;;
+  serial-leaked) fail "$n reviewers serial AND B's prompt carries A's output" ;;
   no-hunt) fail "$n reviewers in one block but no named hunt class" ;;
   *) echo "INCONCLUSIVE: grader returned '$status'"; exit 2 ;;
 esac
