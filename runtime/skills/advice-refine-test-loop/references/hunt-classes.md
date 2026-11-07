@@ -74,19 +74,13 @@ code. Where a test's name promises more than its assertions check, report that.
 
 ### G1 — Parse, don't validate
 
-**When:** any new or changed function that takes a value it must first check,
-and every boundary a wire format enters through — JSON and form bodies, query
-strings, headers, env vars, config files, database rows, external API replies.
-**Hunt:** Two shapes, and the second is the one reviewers skip. (a) A value
-checked and then passed on in its unchecked type, so every later caller must
-trust that the check already happened — name the type that would tell a checked
-value from an unchecked one. (b) A wire representation travelling INWARD past
-its boundary: a JSON value, dict, map, or raw string reaching business logic, a
-handler forwarding a request body down, a domain function indexing into a blob
-or re-checking a field someone else already checked. The untyped form belongs
-as far out at the edge as it can be pushed, parsed once on the way in and never
-reconstructed deeper; name the boundary where that parse belongs and the type
-it should produce.
+**When:** any value a function must check first, and every boundary a wire
+format enters — JSON, forms, query strings, headers, env vars, config, DB rows.
+**Hunt:** Either shape. (a) A value checked, then passed on in its unchecked
+type, so every later caller must trust the check happened. (b) A wire format
+travelling inward: a JSON value, dict or raw string in business logic, a
+handler forwarding a body down, a field re-checked deeper. Untyped belongs at
+the outermost edge, parsed once on the way in. Name the boundary and the type.
 
 ### G2 — Primitive where a type belongs
 
