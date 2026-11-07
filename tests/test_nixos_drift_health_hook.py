@@ -178,6 +178,149 @@ def test_unreadable_report_does_not_break_startup(tmp_path):
         assert "UNVERIFIED" in _context(proc)
 
 
+def test_vscodium_drift_classes_speak_and_name_items(tmp_path):
+    # nixos-config's home/vscodium.nix merges declared over live, so undeclared
+    # keys survive reboot and deploy but not a fresh install, and declared keys
+    # edited in the UI get reverted. Both are promotable by the session.
+    # Each case carries the phrase that makes its hint actionable, because
+    # the three say different things. An undeclared cosmetic key is lost on
+    # a fresh install; an undeclared SECURITY key is the opposite problem --
+    # it survives every deploy -- so a hint about fresh installs would be
+    # the wrong advice there.
+    cases = {
+        "VSCodium settings live but not declared":
+            ("editor.minimap.enabled", "fresh install"),
+        "VSCodium settings overwritten by the declared config":
+            ("editor.fontSize  (scalar, discarded 3x, first 2026-11-01)",
+             "change the declaration"),
+        # The escalated variant: an undeclared key that disarms a guard is
+        # the same shape on disk as an undeclared font size, and the merge
+        # preserves both, so it needs its own heading to be its own finding.
+        "VSCodium security settings live but not declared":
+            ("security.workspace.trust.enabled", "PRESERVES"),
+    }
+    for i, (heading, (item, phrase)) in enumerate(cases.items()):
+        ctx = _context(_run(_setup(tmp_path / f"v{i}", [_section(heading, [item])])))
+        assert heading in ctx, (heading, ctx)
+        assert item in ctx, (heading, ctx)
+        assert phrase in ctx, (heading, phrase, ctx)
+
+
+def test_codium_skill_layer_classes_speak_and_name_items(tmp_path):
+    # The skills half of the same layer (nixos-config
+    # home/claude-codium-config.nix). A skill or note written into
+    # ~/.local/state/claude-codium works immediately and survives every
+    # deploy, so it reads as reviewed config until a reinstall drops it, and
+    # nothing else on the host looks in there.
+    #
+    # Each case pins the phrase that makes its hint actionable, because the
+    # three prescribe DIFFERENT actions: promote the skill, do NOT promote a
+    # shadowing one (rename or drop it -- promoting makes the collision
+    # permanent), and promote the durable notes.
+    cases = {
+        "Codium-only skills live but not declared":
+            ("diff-review", "home/claude-codium/skills"),
+        "Codium skills shadowing a shared skill of the same name":
+            ("using-git-worktrees", "do not promote it"),
+        "Codium session notes live but not declared":
+            ("/home/j/.local/state/claude-codium/local.md",
+             "home/claude-codium/CLAUDE.md"),
+    }
+    for i, (heading, (item, phrase)) in enumerate(cases.items()):
+        ctx = _context(_run(_setup(tmp_path / f"c{i}", [_section(heading, [item])])))
+        assert heading in ctx, (heading, ctx)
+        assert item in ctx, (heading, ctx)
+        assert phrase in ctx, (heading, phrase, ctx)
+
+
+def test_codium_skill_drift_reported_alongside_vscodium_settings_drift(tmp_path):
+    # Both halves of the Codium layer in one report, which is the ordinary
+    # case once both are deployed: the editor's settings and the editor's
+    # skills drift independently and neither should mask the other.
+    env = _setup(tmp_path, [
+        _section("VSCodium settings live but not declared", ["editor.wordWrap"]),
+        _section("Codium-only skills live but not declared", ["my-skill"]),
+    ])
+    ctx = _context(_run(env))
+    assert "editor.wordWrap" in ctx, ctx
+    assert "my-skill" in ctx, ctx
+
+
+def _failure_section(heading: str) -> str:
+    # Shape the tool actually emits: key/value metadata then a prose paragraph.
+    return _section(heading, [
+        "at:     2026-11-06T09:00:00+01:00",
+        "status: 1",
+        "",
+        "Declared settings were NOT applied and the live file was left as it "
+        "was. Inspect: journalctl --user -u home-manager-$USER.service",
+    ])
+
+
+def test_each_vscodium_mechanism_failure_speaks(tmp_path):
+    # These four were invisible before: CLASSES is an allowlist, so a merge
+    # that failed outright reached no session. A desktop toast is the only
+    # other channel and it is gone by the next session.
+    headings = [
+        "VSCodium settings merge failed at activation",
+        "VSCodium settings file does not parse",
+        "VSCodium drift recorder failed during activation",
+        "VSCodium settings could not be compared",
+    ]
+    for i, heading in enumerate(headings):
+        ctx = _context(_run(_setup(tmp_path / f"f{i}", [_failure_section(heading)])))
+        assert heading in ctx, (heading, ctx)
+        assert "reported a failure" in ctx, (heading, ctx)
+
+
+def test_vscodium_failure_does_not_echo_its_prose_body(tmp_path):
+    # The hint carries the meaning; echoing the section body would paste a
+    # whole paragraph into every session's context as one smushed line.
+    heading = "VSCodium settings merge failed at activation"
+    ctx = _context(_run(_setup(tmp_path, [_failure_section(heading)])))
+    assert "status: 1" not in ctx, ctx
+    assert "Inspect: journalctl --user" not in ctx, ctx
+    assert "declared settings were NOT applied" in ctx, ctx
+
+
+def test_vscodium_failure_and_drift_are_reported_under_distinct_headlines(tmp_path):
+    # A failed merge did not "drift"; the declaration may never have applied.
+    # One headline cannot carry both sentences truthfully.
+    env = _setup(tmp_path, [
+        _failure_section("VSCodium settings merge failed at activation"),
+        _section("VSCodium settings live but not declared", ["editor.wordWrap"]),
+    ])
+    ctx = _context(_run(env))
+    assert "reported a failure" in ctx
+    assert "lost or unreproducible on rebuild" in ctx
+    assert ctx.index("reported a failure") < ctx.index("lost or unreproducible")
+
+
+def test_a_report_hitting_every_class_stays_under_the_output_cap():
+    # Hook output strings cap at 10,000 characters and over it the payload is
+    # dropped, not truncated -- a silent total failure of the channel. This
+    # hook started at six headings and is now at sixteen, which puts the
+    # worst case around 7.7k: still under, but the headroom is roughly 2.2k,
+    # or about three more headings of this length. So pin it, and read the
+    # assertion value as a budget rather than a formality -- the failure mode
+    # is the whole report going missing, not a truncated one.
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("drift_health", HOOK)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    worst = sum(
+        len(f"  - {heading}: {shown}{more} — {hint}\n")
+        for classes in (mod.CLASSES, mod.FAILURES)
+        for heading, hint in classes.items()
+        for shown in [", ".join("some.rather.long.setting.path" for _ in range(mod.MAX_ITEMS))]
+        for more in [" (+99 more)"]
+    )
+    # Two headlines, the report path, and the additionalContext preamble.
+    worst += 400
+    assert worst < 10000, worst
+
+
 def test_registered_on_session_start():
     settings = json.loads((RUNTIME / "settings.json").read_text())
     cmds = [h["command"] for e in settings["hooks"]["SessionStart"] for h in e["hooks"]]
