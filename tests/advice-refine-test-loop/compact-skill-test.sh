@@ -42,8 +42,12 @@ required=(
   "hunt-classes.md"
   "Never auto-fix it"
 )
+# Case-insensitively, for the same reason backticks are stripped below: a
+# sentence that moves to the start of a clause and gains a capital letter has
+# not dropped the invariant, and a guard that reads as dropped on a
+# capitalisation teaches whoever hits it to edit the test.
 for phrase in "${required[@]}"; do
-  grep -Fq "$phrase" "$skill" || {
+  grep -Fqi "$phrase" "$skill" || {
     echo "FAIL: missing compact-loop invariant: $phrase"
     exit 1
   }

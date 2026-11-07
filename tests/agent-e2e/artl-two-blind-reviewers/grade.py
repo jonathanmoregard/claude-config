@@ -2,18 +2,22 @@
 
 Reads transcript.jsonl (stream-json) and reports, in order:
 
-  status            pass | one-reviewer | serial | no-hunt | nosub
+  status            pass | one-reviewer | leaked | no-hunt | nosub
   n                 reviewer dispatches from the main session
-  parallel          two or more reviewers in ONE assistant message (one
-                    tool-use block) -- which is what makes them blind to each
-                    other: a reviewer dispatched in the same block cannot have
-                    seen the other's findings, because they do not exist yet
+  block             all reviewers in ONE assistant message (one tool-use
+                    block). Reported, NOT required -- see below
   hunt              some reviewer prompt carries a named hunt class
   classes           the class markers seen, for the summary line
 
-A reviewer dispatched in a LATER message is graded `serial` even when the
-prompt differs, because the whole point of the wave is that neither reviewer
-is anchored on the other's output.
+What is graded is the ANCHORING CHANNEL, not the mechanism that closes it.
+The skill prefers one tool-use block because a reviewer dispatched there
+cannot have seen the other's findings -- they do not exist yet. Measured, that
+instruction is not followed: across two batches, ten runs, every single one
+dispatched the second reviewer in the NEXT message, and every single one
+carried no content from the first. So `block` is reported for the record and
+`leaked` is the failure: a later prompt that quotes, summarises or reacts to
+the earlier reviewer's output is anchored, and that is the thing the wave
+exists to prevent.
 """
 import json
 import sys
@@ -85,27 +89,29 @@ def main():
     seen = sorted({m for p in prompts for m in HUNT_MARKERS if m in p.lower()})
     parallel = any(len(w) >= 2 for w in waves)
 
+    # Only a prompt that was NOT co-dispatched can be anchored, so the leak
+    # check runs over the prompts after the first wave.
+    later = " ".join(prompts[1:]).lower() if not parallel else ""
+    leaked = any(
+        m in later
+        for m in ("reviewer a", "prior review", "previous review",
+                  "already found", "first reviewer", "round 1",
+                  "the other reviewer")
+    )
+
     if n == 0:
         status = "nosub"
     elif n < 2:
         status = "one-reviewer"
-    elif not parallel:
-        # Both serial shapes fail, but they fail differently and the summary
-        # line should say which: a later prompt that quotes the earlier
-        # reviewer leaked, while one that does not was merely anchorable.
-        later = " ".join(prompts[1:]).lower()
-        leaked = any(
-            m in later
-            for m in ("reviewer a", "prior review", "previous review",
-                      "already found", "first reviewer", "round 1")
-        )
-        status = "serial-leaked" if leaked else "serial"
+    elif leaked:
+        status = "leaked"
     elif not seen:
         status = "no-hunt"
     else:
         status = "pass"
 
-    print(f"{status} {n} {str(parallel).lower()} {str(bool(seen)).lower()} {','.join(seen) or '-'}")
+    block = "one-block" if parallel else "serial"
+    print(f"{status} {n} {block} {str(bool(seen)).lower()} {','.join(seen) or '-'}")
 
 
 if __name__ == "__main__":

@@ -41,10 +41,11 @@ read and why each context expansion was relevant.
 
 1. Pick reviewer B's hunt classes FIRST, before either dispatch, from
    `~/.claude/skills/advice-refine-test-loop/references/hunt-classes.md`.
-2. Send both reviewers — two fresh and read-only — in ONE tool-use block
-   against the settled tree. Never wait for A's result before composing B: a
-   prompt written after A reports is anchored on it even when it quotes
-   nothing. Neither sees the other's prompt, findings, or existence.
+2. Write both prompts before dispatching either, and never revise B's after A
+   reports: a prompt composed once A's findings are in context is anchored on
+   them even when it quotes nothing. Two fresh, read-only reviewers against
+   the settled tree; neither sees the other's prompt, findings, or existence.
+   Sending both in ONE tool-use block is the cleanest guarantee of that.
 3. Merge by meaning. Convergence is not confidence — shared blind spots are
    real, so a finding both report still reproduces before any edit.
 
