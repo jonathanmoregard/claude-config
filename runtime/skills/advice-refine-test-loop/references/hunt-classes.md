@@ -74,15 +74,21 @@ code. Where a test's name promises more than its assertions check, report that.
 
 ### G1 — Parse, don't validate
 
-**When:** any value a function must check first, and every boundary a wire
-format enters — JSON, forms, query strings, headers, env vars, config, DB rows.
-**Hunt:** Either shape. (a) A value checked, then passed on in its unchecked
-type, so every later caller must trust the check happened. (b) A wire format
-travelling inward: a JSON value, dict or raw string in business logic, a
-handler forwarding a body down, a field re-checked deeper. Untyped belongs at
-the outermost edge, parsed once on the way in. Name the boundary and the type.
+**When:** any value a function must check before using it.
+**Hunt:** A value checked and then passed on in its unchecked type, so every
+later caller must trust that the check already happened. Name the type that
+would tell a checked value from an unchecked one.
 
-### G2 — Primitive where a type belongs
+### G2 — Wire format past its boundary
+
+**When:** every boundary a wire format enters — JSON, forms, query strings,
+headers, env vars, config files, database rows, external API replies.
+**Hunt:** A JSON value, dict, map or raw string travelling inward: read by
+business logic, forwarded down by a handler, or a field re-checked deeper.
+Untyped belongs at the outermost edge, parsed once on the way in. Name the
+boundary where that parse belongs and the type it should produce.
+
+### G3 — Primitive where a type belongs
 
 **When:** identifiers, keys, tokens, emails, URLs, durations, money, anything
 persisted.
@@ -90,7 +96,7 @@ persisted.
 raw map — in a signature, a struct field, or a database column — where the
 schema or a newtype could carry it. Flag the definition, not every call site.
 
-### G3 — Misuse resistance
+### G4 — Misuse resistance
 
 **When:** the diff adds or changes a public API, a wrapper type, a config
 surface, or anything with a "don't call this directly" rule.
@@ -99,14 +105,14 @@ can reach, a constructor that skips the invariant, a field settable after the
 value is sealed, a correct call that differs from an unsafe one by one
 argument. Ask what stops the next caller from getting it wrong by accident.
 
-### G4 — Homeless domain concept
+### G5 — Homeless domain concept
 
 **When:** the diff repeatedly names something the codebase does not.
 **Hunt:** Find a concept the code talks about that has no type, module, or
 owner — one that lives implicitly, ambiently, or spread across call sites, and
 is reconstructed by hand wherever it is needed.
 
-### G5 — Abstraction-level bunching
+### G6 — Abstraction-level bunching
 
 **When:** changed files over a few hundred lines, or a module whose name does
 not predict its contents.
@@ -114,7 +120,7 @@ not predict its contents.
 business rules, SQL beside policy, formatting beside decisions — and name the
 concern that has no separate home.
 
-### G6 — Hand-rolled where a readymade exists
+### G7 — Hand-rolled where a readymade exists
 
 **When:** the diff implements a matcher, parser, tokenizer, cache, retry or
 backoff policy, rate limiter, date or duration handling, diff, or traversal.
@@ -123,7 +129,7 @@ behaviour the hand-rolled version gets wrong or omits. A heavy or unmaintained
 dependency is a reason to keep the hand-rolled code; say so rather than
 reporting the class.
 
-### G7 — Standards conformance
+### G8 — Standards conformance
 
 **When:** HTTP surfaces, resource semantics, status codes, headers, auth
 flows, file formats, CLI conventions.
@@ -132,7 +138,7 @@ or status code that does not mean what it is used for, a bespoke envelope over
 a specified one, an RPC shape where resource semantics are expected. Name the
 standard, then the deviation.
 
-### G8 — Weak assertions
+### G9 — Weak assertions
 
 **When:** the diff adds or changes tests.
 **Hunt:** Find a test whose assertions pass for the wrong reason — asserting
