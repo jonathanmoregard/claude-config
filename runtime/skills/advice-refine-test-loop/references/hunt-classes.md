@@ -74,16 +74,17 @@ code. Where a test's name promises more than its assertions check, report that.
 
 ### G1 — Parse, don't validate
 
-**When:** typed code only — the fix is a type the compiler enforces, so skip
-this class where the language cannot express one. Any value a function must
-check before using it.
+**When:** statically typed, type-checked code only — Rust, Haskell,
+TypeScript, Kotlin, Scala, C#, Swift; Python or JS only where a checker runs
+in CI. The fix is a type something enforces, so skip this class everywhere
+else. In such code: any value a function must check before using it.
 **Hunt:** A value checked and then passed on in its unchecked type, so every
 later caller must trust that the check already happened. Name the type that
 would tell a checked value from an unchecked one.
 
 ### G2 — Wire format past its boundary
 
-**When:** typed code only, for G1's reason. Every boundary a wire format
+**When:** typed and checked as G1 requires. Every boundary a wire format
 enters — JSON, forms, query strings, headers, env vars, config files,
 database rows, external API replies.
 **Hunt:** A JSON value, dict, map or raw string travelling inward: read by
@@ -94,7 +95,8 @@ boundary where that parse belongs and the type it should produce.
 ### G3 — Primitive where a type belongs
 
 **When:** identifiers, keys, tokens, emails, URLs, durations, money, anything
-persisted.
+persisted. The newtype route needs G1's typed-and-checked code; the column
+route applies in any language, since the schema does the enforcing.
 **Hunt:** Find a domain value carried as `String`, `i64`, `uuid`-as-text, or a
 raw map — in a signature, a struct field, or a database column — where the
 schema or a newtype could carry it. Flag the definition, not every call site.
