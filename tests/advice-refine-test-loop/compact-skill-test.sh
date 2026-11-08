@@ -34,24 +34,37 @@ required=(
   "Record files read"
   # The second reviewer is only worth its tokens while these hold: both prompts
   # are fixed before either dispatch, both reviewers are in flight at once (so
-  # B cannot have seen A's findings -- `Agent` dispatches are asynchronous, and
-  # one tool-use block is a way to get this, not the property itself), B's
-  # prompt is never revised once A reports, agreement between the two is not
-  # promoted to evidence, and B's design findings stay out of the auto-fix path.
+  # B cannot have seen A's findings), B's prompt is never revised once A
+  # reports, agreement between the two is not promoted to evidence, and B's
+  # design findings stay out of the auto-fix path.
+  #
+  # "returns before the reviewer reports" is pinned because the sentence it
+  # belongs to was once written as a flat fact -- that dispatches ARE
+  # asynchronous, so the next message is always blind. That is true of a
+  # backgrounded dispatch and false of a foreground one, and this skill is
+  # installed globally, so it runs under harnesses that were never measured.
+  # One tool-use block is the form that holds either way; the conditional is
+  # what stops the claim drifting back to a universal.
   "before dispatching either"
   "in flight at once"
+  "returns before the reviewer reports"
   "never revise B's"
   "Neither sees the other"
   "Convergence is not confidence"
   "hunt-classes.md"
   "Never auto-fix it"
 )
-# Case-insensitively, for the same reason backticks are stripped below: a
-# sentence that moves to the start of a clause and gains a capital letter has
-# not dropped the invariant, and a guard that reads as dropped on a
-# capitalisation teaches whoever hits it to edit the test.
+# Matched against a flattened copy: backticks removed, every run of
+# whitespace collapsed to one space, case ignored. Each of those three is a
+# way the prose can change while the invariant stands -- a clause moves to the
+# start of a sentence and gains a capital, a phrase gains code formatting, an
+# edit reflows a paragraph so a pinned sentence straddles a newline. All three
+# have now actually happened here, the last one while writing this very
+# commit. A guard that a reflow can void reads as "the contract was deleted"
+# and teaches whoever hits it to edit the test instead of the skill.
+flat=$(tr -d '`' < "$skill" | tr -s '[:space:]' ' ')
 for phrase in "${required[@]}"; do
-  grep -Fqi "$phrase" "$skill" || {
+  grep -Fqi -- "$phrase" <<<"$flat" || {
     echo "FAIL: missing compact-loop invariant: $phrase"
     exit 1
   }

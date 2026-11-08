@@ -3,26 +3,38 @@ seen, not by how the dispatches were packaged.
 
 Reports, in order:
 
-  status     pass | one-reviewer | late | leaked | no-hunt | nosub
+  status     pass | one-reviewer | late | leaked | no-hunt | nosub | nodata
   n          reviewer dispatches from the main session
   shape      one-block | concurrent | late -- how the wave was formed
   hunt       some reviewer prompt carries a class from hunt-classes.md
   classes    the class ids matched, for the summary line
 
 WHAT IS GRADED, AND WHY IT IS NOT THE TOOL-USE BLOCK. The skill wants the
-second reviewer's prompt fixed before the first reviewer's findings exist, so
-the second cannot be anchored on them. One tool-use block guarantees that, and
-the skill prefers it -- but `Agent` dispatches run ASYNCHRONOUSLY, so a second
-dispatch in the very next message is equally blind: the first reviewer is still
-mid-run and has reported nothing. Measured over ten runs, that is what happens
-every time, and grading the block would have failed all ten for a packaging
-detail while the property held.
+second reviewer's prompt fixed before the first reviewer's findings reach the
+main thread, so the second cannot be anchored on them. One tool-use block
+guarantees that. A later message also achieves it when the dispatch returns
+before the reviewer reports -- which is what a backgrounded `Agent` does, and
+what all ten measured runs did -- but NOT when the tool result carries the
+report itself. So the measured quantity is DELIVERY, not dispatch packaging
+and not an assumption about the harness:
 
-So concurrency is read off the transcript directly: a dispatch is blind when it
-precedes the last turn of every reviewer dispatched before it. A dispatch that
-lands AFTER an earlier reviewer's final turn is `late` -- the findings existed,
-so the prompt is anchorable -- and `leaked` when that prompt also carries the
-earlier reviewer's content. Both fail; the distinction is for the summary line.
+  backgrounded dispatch -> delivery is its `task_notification` line
+  foreground dispatch   -> delivery is its `tool_result` line
+  neither recorded      -> the last turn attributed to that reviewer
+
+A dispatch landing after an earlier reviewer's delivery line is `late` -- the
+findings were in the parent's context, so the prompt is anchorable -- and
+`leaked` when it also carries that reviewer's reported content. Both fail; the
+distinction is for the summary line. Reading delivery this way grades a
+foreground harness correctly without the skill or this file having to assert
+which kind it is running under.
+
+MISSING DATA IS NOT A PASS. If an earlier reviewer has no delivery line and no
+attributed turn, nothing here can say whether the next dispatch was blind, so
+the verdict is `nodata` and check.sh reports INCONCLUSIVE. Treating the absence
+as blindness is the fail-open pattern this very skill hunts as D1, and it would
+turn a stream-format change -- subagent events logged elsewhere, a renamed
+field -- into a silent green.
 
 HUNT MARKERS COME FROM hunt-classes.md, never from a list kept here. The file
 tells the dispatcher to paste each chosen class's `Hunt` line verbatim, so the
@@ -38,8 +50,6 @@ from pathlib import Path
 
 HUNTS = (Path(__file__).resolve().parents[3]
          / "runtime/skills/advice-refine-test-loop/references/hunt-classes.md")
-
-PREAMBLE = "hunt only the classes"
 
 # A dispatch counts as a reviewer when it asks for review and not for edits.
 REVIEW_MARKERS = ("falsify", "review", "finding", "defect", "hunt", "ship broken")
@@ -79,35 +89,62 @@ def blocks(ev):
     return [b for b in c if isinstance(b, dict)] if isinstance(c, list) else []
 
 
-def text_of(ev):
-    parts = []
-    for b in blocks(ev):
-        if b.get("type") == "text":
-            parts.append(b.get("text", ""))
-        elif b.get("type") == "tool_result":
-            parts.append(json.dumps(b.get("content")))
+def spoken_text(ev):
+    """Only what the agent SAID: text blocks, never tool results.
+
+    The overlap check below compares B's prompt against what A reported. Tool
+    results are what A READ -- whole source files, usually the same diff B was
+    handed -- so including them made any late B that quoted the code look like
+    it had quoted A.
+    """
+    parts = [b.get("text", "") for b in blocks(ev) if b.get("type") == "text"]
     c = content(ev)
     if isinstance(c, str):
         parts.append(c)
-    return " ".join(parts)
+    return " ".join(p for p in parts if p)
 
 
 def read(path):
-    """(dispatches, subagent_last_line, subagent_text) from the transcript.
+    """Everything the verdict needs, keyed by the dispatch's tool_use_id.
 
-    dispatches: [(line, tool_use_id, prompt, same_block_group)] in order.
+    dispatches  [(line, tool_use_id, prompt)] from the main session, in order
+    bg          tool_use_id -> the dispatch was backgrounded
+    notify      tool_use_id -> line where its completion was announced
+    result      tool_use_id -> line of its tool_result
+    turn_last   tool_use_id -> line of the last turn attributed to it
+    report      tool_use_id -> text of its last speaking turn (its report)
     """
-    dispatches, last, texts = [], {}, {}
+    dispatches = []
+    bg, notify, result, turn_last, report = {}, {}, {}, {}, {}
     for i, line in enumerate(open(path, encoding="utf-8")):
         try:
             ev = json.loads(line)
         except ValueError:
             continue
+
         parent = ev.get("parent_tool_use_id")
         if parent:
-            last[parent] = i
-            texts[parent] = texts.get(parent, "") + " " + text_of(ev)
+            turn_last[parent] = i
+            said = spoken_text(ev)
+            if said.strip():
+                report[parent] = said
             continue
+
+        # Main-thread bookkeeping the harness emits about each subagent.
+        tid = ev.get("tool_use_id")
+        if ev.get("type") == "system" and tid:
+            sub = ev.get("subtype")
+            if sub == "task_started" and ev.get("is_backgrounded"):
+                bg[tid] = True
+            elif sub == "task_notification" and ev.get("status") in (
+                    "completed", "failed", "error"):
+                notify.setdefault(tid, i)
+            continue
+
+        for b in blocks(ev):
+            if b.get("type") == "tool_result" and b.get("tool_use_id"):
+                result.setdefault(b["tool_use_id"], i)
+
         if ev.get("type") != "assistant":
             continue
         for b in blocks(ev):
@@ -118,12 +155,25 @@ def read(path):
                 continue
             if any(m in norm(prompt) for m in REVIEW_MARKERS):
                 dispatches.append((i, b.get("id"), prompt))
-    return dispatches, last, texts
+    return dispatches, bg, notify, result, turn_last, report
 
 
-def overlaps(earlier_text, prompt):
-    """Does the prompt carry the earlier reviewer's specific content?"""
-    e, p = norm(earlier_text), norm(prompt)
+def delivery(tid, bg, notify, result, turn_last):
+    """Line where this reviewer's findings reached the main thread, or None.
+
+    A backgrounded dispatch's tool_result is launch metadata, so its delivery
+    is the completion announcement; a foreground dispatch's tool_result IS the
+    report. Either way the fallback is the last turn attributed to it, which is
+    what older streams give. None means the transcript cannot say.
+    """
+    if bg.get(tid):
+        return notify.get(tid, turn_last.get(tid))
+    return result.get(tid, turn_last.get(tid))
+
+
+def overlaps(reported, prompt):
+    """Does the prompt carry the earlier reviewer's reported content?"""
+    e, p = norm(reported), norm(prompt)
     for pair in set(re.findall(r"[\w./-]+\.\w{1,5}:\d+", e)):
         if pair in p:
             return True
@@ -137,7 +187,7 @@ def overlaps(earlier_text, prompt):
 
 def main():
     path = sys.argv[1]
-    dispatches, last, texts = read(path)
+    dispatches, bg, notify, result, turn_last, report = read(path)
     n = len(dispatches)
 
     markers = class_markers()
@@ -146,20 +196,24 @@ def main():
     for cid, ms in markers.items():
         if any(m in joined for m in ms) or re.search(rf"\b{re.escape(cid)}\b", joined):
             seen.add(cid)
-    hunt = bool(seen) or PREAMBLE in joined
+    # Named classes only. The preamble alone used to satisfy this, which passed
+    # exactly the "B became a second A, with a header" run `no-hunt` is for.
+    hunt = bool(seen)
 
-    # Per dispatch: could it have seen any reviewer dispatched before it?
-    late = leaked = False
+    # Per dispatch: had any reviewer dispatched before it already reported?
+    late = leaked = nodata = False
     lines = [d[0] for d in dispatches]
     one_block = n >= 2 and len(set(lines)) == 1
     for idx, (line, _tid, prompt) in enumerate(dispatches):
         for prev_line, prev_tid, _ in dispatches[:idx]:
             if prev_line == line:
                 continue  # same tool-use block: nothing to have seen
-            prev_end = last.get(prev_tid)
-            if prev_end is not None and line > prev_end:
+            prev_end = delivery(prev_tid, bg, notify, result, turn_last)
+            if prev_end is None:
+                nodata = True
+            elif line > prev_end:
                 late = True
-                if overlaps(texts.get(prev_tid, ""), prompt):
+                if overlaps(report.get(prev_tid, ""), prompt):
                     leaked = True
 
     if n == 0:
@@ -170,6 +224,8 @@ def main():
         status = "leaked"
     elif late:
         status = "late"
+    elif nodata:
+        status = "nodata"
     elif not hunt:
         status = "no-hunt"
     else:

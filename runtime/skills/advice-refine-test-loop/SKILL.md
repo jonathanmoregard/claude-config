@@ -43,10 +43,12 @@ read and why each context expansion was relevant.
    `~/.claude/skills/advice-refine-test-loop/references/hunt-classes.md`.
 2. Write both prompts before dispatching either, and never revise B's after A
    reports: a prompt composed once A's findings are in context is anchored on
-   them even when it quotes nothing. Keep both reviewers in flight at once —
-   dispatch B before A has reported, in one tool-use block or the next message,
-   since dispatches are asynchronous and either is blind. Two fresh, read-only
-   reviewers; neither sees the other's prompt, findings, or existence.
+   them even when it quotes nothing. Keep both reviewers in flight at once. One
+   tool-use block always does that; a later message only where the dispatch
+   returns before the reviewer reports. If the tool result carries A's
+   findings, B in the next message is already anchored — so send both together
+   rather than assuming. Two fresh, read-only reviewers; neither sees the
+   other's prompt, findings, or existence.
 3. Merge by meaning. Convergence is not confidence — shared blind spots are
    real, so a finding both report still reproduces before any edit.
 

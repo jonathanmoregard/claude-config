@@ -24,6 +24,21 @@ mkdir -p "$STUB_DIR"
 PROMPT="$WORK/prompt.txt"
 printf 'review this diff\n' >"$PROMPT"
 
+# The subject resolves its schema as $HOME/.claude/..., the PROJECTED tree, so
+# this suite silently depended on the invoking user having the config
+# installed: on a runner with a bare HOME every case exited 2 before reaching
+# the stub, and 21 of 33 assertions failed for a reason unrelated to what they
+# test. A populated HOME was no better in kind -- it checked the INSTALLED
+# schema rather than the one in this worktree, so a schema edit under review
+# was tested against its own predecessor.
+#
+# A fixture HOME carrying this tree's schema fixes both halves: the suite is
+# hermetic, and it pins the subject to the file actually under review.
+export HOME="$WORK/home"
+mkdir -p "$HOME/.claude/skills/advice-refine-test-loop"
+cp "$(cd "$HERE/../.." && pwd)/runtime/skills/advice-refine-test-loop/verdict-schema.json" \
+   "$HOME/.claude/skills/advice-refine-test-loop/verdict-schema.json"
+
 # ── the stub ─────────────────────────────────────────────────────────────────
 cat >"$STUB_DIR/codex" <<'STUB'
 #!/usr/bin/env bash
