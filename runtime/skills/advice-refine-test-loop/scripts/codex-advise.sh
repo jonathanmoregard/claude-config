@@ -68,7 +68,13 @@
 
 set -uo pipefail
 
-SCHEMA="${HOME}/.claude/skills/advice-refine-test-loop/verdict-schema.json"
+# The schema ships in this script's own skill directory, so resolve it from
+# there rather than from $HOME. `${HOME}/.claude/skills/...` named the PROJECTED
+# tree, which made the script depend on being installed and read the installed
+# copy even when running from a worktree -- so a schema edit was validated
+# against its own predecessor. One relative path is correct in both trees.
+HERE="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCHEMA="$HERE/../verdict-schema.json"
 
 PROMPT_FILE=""
 MODEL=""
