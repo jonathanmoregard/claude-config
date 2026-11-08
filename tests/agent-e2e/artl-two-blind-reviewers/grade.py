@@ -18,9 +18,22 @@ what all ten measured runs did -- but NOT when the tool result carries the
 report itself. So the measured quantity is DELIVERY, not dispatch packaging
 and not an assumption about the harness:
 
-  backgrounded dispatch -> delivery is its `task_notification` line
-  foreground dispatch   -> delivery is its `tool_result` line
-  neither recorded      -> the last turn attributed to that reviewer
+  completion announced          -> its `task_notification` line
+  tool_result AFTER the last    -> that line: the result carries the report
+    turn attributed to it
+  tool_result BEFORE that turn  -> a launch receipt, not the report. Skip it.
+  nothing recorded              -> the last turn attributed to that reviewer
+
+NO ONE SIGNAL IS LOAD-BEARING. `task_started.is_backgrounded` used to decide
+which of the two readings applied, which made a missing event a false FAIL: a
+backgrounded run read as foreground grades `late`, because the launch receipt
+lands early by construction (measured: receipt at line 71, delivery at 155).
+Preferring the announcement, and ordering the receipt against the reviewer's
+own turns when there is none, needs neither flag. On the 26 recorded dispatches
+that ordering reproduces `is_backgrounded` exactly, 20 receipts and 6 reports,
+without reading it. `input.run_in_background` is also honoured where present,
+but it is not a substitute: the harness backgrounds on its own, so 16 of those
+20 carry no such input.
 
 A dispatch landing after an earlier reviewer's delivery line is `late` -- the
 findings were in the parent's context, so the prompt is anchorable -- and
@@ -150,9 +163,12 @@ def read(path):
         for b in blocks(ev):
             if b.get("type") != "tool_use" or b.get("name") != "Agent":
                 continue
-            prompt = str((b.get("input") or {}).get("prompt", ""))
+            inp = b.get("input") or {}
+            prompt = str(inp.get("prompt", ""))
             if norm(prompt).startswith("consult dispatch"):
                 continue
+            if inp.get("run_in_background"):
+                bg[b.get("id")] = True
             if any(m in norm(prompt) for m in REVIEW_MARKERS):
                 dispatches.append((i, b.get("id"), prompt))
     return dispatches, bg, notify, result, turn_last, report
@@ -161,14 +177,28 @@ def read(path):
 def delivery(tid, bg, notify, result, turn_last):
     """Line where this reviewer's findings reached the main thread, or None.
 
-    A backgrounded dispatch's tool_result is launch metadata, so its delivery
-    is the completion announcement; a foreground dispatch's tool_result IS the
-    report. Either way the fallback is the last turn attributed to it, which is
-    what older streams give. None means the transcript cannot say.
+    Resolved by what the stream shows rather than by which harness it came
+    from. The completion announcement is the direct record and wins outright.
+    Otherwise a tool_result counts as the report only if it could be one: a
+    result that landed BEFORE the reviewer's own last turn is a launch receipt,
+    since nothing can deliver findings the reviewer has not yet spoken. The
+    last attributed turn is the floor. None means the transcript cannot say,
+    and the caller grades that `nodata` rather than blind.
+
+    The point of the ordering is that no single harness event is load-bearing.
+    Deciding on `is_backgrounded` alone turned a missing event into a false
+    FAIL -- the receipt is early by construction, so a backgrounded run read as
+    foreground grades `late`. The flags are still honoured where present, but
+    only to skip a receipt the turn order would skip anyway.
     """
-    if bg.get(tid):
-        return notify.get(tid, turn_last.get(tid))
-    return result.get(tid, turn_last.get(tid))
+    if tid in notify:
+        return notify[tid]
+    res, last = result.get(tid), turn_last.get(tid)
+    receipt = bg.get(tid) or (res is not None and last is not None
+                              and res < last)
+    if res is not None and not receipt:
+        return res
+    return last
 
 
 def overlaps(reported, prompt):
