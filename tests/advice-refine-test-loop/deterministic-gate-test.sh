@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
 # Fixture harness for deterministic-gate.sh
 set -uo pipefail
-GATE="$1"
+
+# The gate under test. Defaulted, because checks.yml collects this file by
+# glob and runs it with no arguments; pass one to test a different gate.
+#
+# Absolutised here rather than at the call site: every fixture below `cd`s
+# into a throwaway repository, so a relative path stops resolving after the
+# first one and the suite fails in a way that reads as the gate's fault.
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GATE="${1:-$HERE/../../runtime/skills/advice-refine-test-loop/scripts/deterministic-gate.sh}"
+GATE="$(cd "$(dirname "$GATE")" && pwd)/$(basename "$GATE")"
+[[ -x $GATE ]] || { echo "no executable gate at $GATE" >&2; exit 2; }
 
 # Fixture repos must not run the INVOKING USER's global git config or hooks.
 # On this host core.hooksPath points at a gitleaks pre-commit hook, which

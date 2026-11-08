@@ -24,6 +24,22 @@ mkdir -p "$STUB_DIR"
 PROMPT="$WORK/prompt.txt"
 printf 'review this diff\n' >"$PROMPT"
 
+# An EMPTY fixture HOME, and deliberately empty. The subject used to resolve
+# its schema as $HOME/.claude/..., the projected tree, so this suite silently
+# depended on the invoking user having the config installed: on a runner with a
+# bare HOME every case exited 2 before reaching the stub, and 21 of 33
+# assertions failed for a reason unrelated to what they test. Carrying a copy of
+# the schema in here fixed that, but around the bug rather than through it --
+# the script still read an installed file, so a schema edit was validated
+# against its own predecessor in real use too. It now resolves the schema
+# beside itself, which needs nothing from HOME.
+#
+# So this stays as the guard on that: reinstate any $HOME lookup and every case
+# exits 2 again, here and in CI, instead of passing on whatever the invoking
+# user happens to have installed.
+export HOME="$WORK/home"
+mkdir -p "$HOME"
+
 # ── the stub ─────────────────────────────────────────────────────────────────
 cat >"$STUB_DIR/codex" <<'STUB'
 #!/usr/bin/env bash

@@ -379,13 +379,27 @@ jobs:
       - name: The enforced shell suites still pass
         run: |
           shopt -s nullglob
-          suites=(tests/test_*.sh tests/*.test.sh)
+          # The third pattern is one named exception to the depth rule.
+          # `tests/advice-refine-test-loop/` holds three hermetic suites under a
+          # third naming convention -- `*-test.sh` -- which the two patterns
+          # above miss on the name AND on the depth, so all three ran nowhere.
+          # That is how compact-skill-test.sh's orchestrate assertion stayed red
+          # for two months, and deterministic-gate.sh still has no other CI
+          # coverage at all.
+          #
+          # Named explicitly rather than made recursive: `tests/**/*.sh` would
+          # collect the ~170 `setup.sh`/`check.sh` files under
+          # `tests/agent-e2e/`, which are not suites. They read $E2E_WORK and
+          # $E2E_RUN and take a run directory as $1, so running them bare does
+          # something rather than reporting something. Depth stays load-bearing.
+          suites=(tests/test_*.sh tests/*.test.sh tests/advice-refine-test-loop/*-test.sh)
           # Same refusal as the python partition: an empty glob must not read
           # as success. This is the exact failure the convention is meant to
           # remove, so it is checked rather than assumed.
           if [ ${#suites[@]} -eq 0 ]; then
-            echo "no shell suites matched tests/test_*.sh or tests/*.test.sh --" \
-                 "expected several; the glob or the layout changed" >&2
+            echo "no shell suites matched tests/test_*.sh, tests/*.test.sh or" \
+                 "tests/advice-refine-test-loop/*-test.sh -- expected several;" \
+                 "the glob or the layout changed" >&2
             exit 1
           fi
           rc=0
