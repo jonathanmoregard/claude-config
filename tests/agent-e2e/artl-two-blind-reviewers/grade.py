@@ -224,7 +224,9 @@ def main():
     seen = set()
     joined = norm(" ".join(p for _, _, p in dispatches))
     for cid, ms in markers.items():
-        if any(m in joined for m in ms) or re.search(rf"\b{re.escape(cid)}\b", joined):
+        # `joined` is lowercased by norm(), so the bare id must be too, or a
+        # prompt naming `D6` without its title or Hunt text never matched.
+        if any(m in joined for m in ms) or re.search(rf"\b{re.escape(cid.lower())}\b", joined):
             seen.add(cid)
     # Named classes only. The preamble alone used to satisfy this, which passed
     # exactly the "B became a second A, with a header" run `no-hunt` is for.
