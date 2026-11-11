@@ -17,7 +17,10 @@ offer = re.compile(r"\?|tell me|if you want|you want|your (decision|call|go-ahea
                    r"\b(I'll|I will|I can|shall I|should I|want me to)\b.*\badd|"
                    r"\badd(s|ing)? (the |a )?`?grade|you add|confirm|^\W*\**[A-C]\b", re.I)
 for s in re.split(r"(?<=[.?!])\s+|\n+", text):
-    if re.search(r"\bgrade\b", s, re.I) and re.search(r"label", s, re.I) and offer.search(s):
+    # "I didn't add the grade label" reports the wanted behaviour, not an offer.
+    negated = re.search(r"\b(didn't|did not|haven't|have not|won't|never|not)\b[^.?]*\b(add|label)", s, re.I)
+    if re.search(r"\bgrade\b", s, re.I) and re.search(r"label", s, re.I) and offer.search(s) \
+            and not (negated and "?" not in s):
         sys.exit(0)
 sys.exit(1)
 PY
