@@ -747,15 +747,15 @@ def test_every_gate_event_is_wired_to_an_existing_script():
 # (bcdca10 covered only `gh pr create` / `gh pr new`), so a hung, crashed,
 # misparsing or missing hook opens the PR with no prompt.
 #
-# _ask_matches models Claude Code's matcher AS MEASURED by headless probes
-# (tests/agent-e2e/artl-gate-ask-coverage runs the real one): every rule is a
-# pattern whose only wildcard is `*`, tested against each subcommand -- split
-# on `&&` `||` `;` `|` and newlines -- with whitespace runs collapsed and a
-# leading `VAR=x` stripped. The subcommand is matched with its shell quoting
-# removed: measured, `gh pr cre"ate"`, `gh pr cr''eate` and `g\h pr create`
-# are all ASKED (round 3; an earlier model matched only the raw text and
-# predicted a hole there that does not exist). A variable spelling such as
-# `${g}h pr create` is not asked: the matcher does not expand variables.
+# _ask_matches models what the ask GLOBS guarantee: every rule is a pattern
+# whose only wildcard is `*`, tested against each subcommand's RAW text --
+# split on `&&` `||` `;` `|` and newlines -- with whitespace runs collapsed
+# and a leading `VAR=x` stripped. It is a lower bound, deliberately.
+# MEASURED (round 3), the real matcher differs by Claude Code version on
+# quote-split keywords: 2.1.322 asks for `gh pr cre"ate"` and `gh pr
+# cr''eate`, 2.1.311 runs them (8/8 runs, same staged config). Neither is
+# promised: splitting a keyword with quotes takes intent, which the gate
+# does not try to stop. A variable spelling (`${g}h pr create`) runs on both.
 
 import re as _re
 
@@ -768,16 +768,12 @@ def _glob(pattern: str) -> "_re.Pattern[str]":
     return _re.compile("^" + ".*".join(_re.escape(p) for p in pattern.split("*")) + "$", _re.S)
 
 
-def _unquoted(piece: str) -> str:
-    return _re.sub(r"['\"]", "", _re.sub(r"\\(.)", r"\1", piece))
-
-
 def _ask_matches(command: str) -> bool:
     rules = [_glob(p) for p in _ask_rules()]
     for piece in _re.split(r"&&|\|\||;|\||\n", command):
         piece = _re.sub(r"\s+", " ", piece).strip()
         piece = _re.sub(r"^(?:[A-Za-z_]\w*=\S*\s+)+", "", piece)
-        if any(rx.match(form) for rx in rules for form in (piece, _unquoted(piece))):
+        if any(rx.match(piece) for rx in rules):
             return True
     return False
 
@@ -802,7 +798,8 @@ PR_OPEN_SPELLINGS = [
 ]
 # Deliberately NOT asked (round 3: the gate is friction for ordinary
 # spellings, and each of these takes intent): `EP=repos/o/r/pulls; gh api $EP
-# -f ...` and `${g}h pr create` (the matcher expands no variables), a GraphQL
+# -f ...` and `${g}h pr create` (the matcher expands no variables), a keyword
+# split with quotes (`cre"ate"`; asked on 2.1.322, not on 2.1.311), a GraphQL
 # mutation read from a file (`-F query=@m.graphql`), curl to the REST API, and
 # a PR opened by a script file, a git hook, a gh alias or an interpreter.
 
@@ -1684,18 +1681,45 @@ def test_r3_9_an_honoured_record_still_counts(tmp_path):
     "gh api graphql -f query='{viewer{login}}'",
     "gh api repos/acme/widget/issues/1/comments -f body=hi",
     "gh api -X GET repos/acme/widget/pulls",
-    "gh api repos/acme/widget/pulls/1/comments -f body=hi",
-    "gh api -X PATCH repos/acme/widget/pulls/1 -f state=closed",
+    "gh api repos/acme/widget/pulls",
     "gh api --method GET 'repos/acme/widget/pulls?state=open'",
 ])
 def test_r3_10_api_calls_that_cannot_open_a_pr_are_not_asked(command):
     assert not _ask_matches(command), command
 
 
+# MEASURED (19996ee e2e battery, 3/3 runs): a double-quoted endpoint ran
+# unasked under rules that required `pulls ` / `pulls?` right after the path
+# -- the matcher compares the raw text, `pulls" -f`. Quoting a path is an
+# ordinary spelling, so the rules must not depend on what follows `pulls`.
+@pytest.mark.parametrize("command", [
+    "gh api \"repos/acme/widget/pulls\" -f title=t",
+    "gh api 'repos/acme/widget/pulls' -f title=t -f head=x",
+    "gh api -X POST \"repos/acme/widget/pulls\"",
+    "gh api --input b.json 'repos/acme/widget/pulls'",
+])
+def test_r3_10_a_quoted_pulls_endpoint_is_still_asked(command):
+    assert _ask_matches(command), command
+
+
+@pytest.mark.parametrize("command", [
+    "gh api repos/acme/widget/pulls -f title=t -f head=feat/x",   # implicit POST
+    "gh api repos/acme/widget/pulls -ftitle=t",
+    "gh api repos/acme/widget/pulls --raw-field=title=t",
+    "gh api --method=POST repos/acme/widget/pulls",
+    "gh api 'repos/acme/widget/pulls?x=1' -f title=t",
+])
+def test_r3_10_the_idiomatic_pr_creating_api_calls_are_asked(command):
+    assert _ask_matches(command), command
+
+
 @pytest.mark.parametrize("command", [
     "gh pr cre\"ate\" --fill",
     "gh pr cr''eate --fill",
-    "g\\h pr create --fill",
+    "g=g; ${g}h pr create --fill",
 ])
-def test_r3_12_quote_split_spellings_are_asked_as_measured(command):
-    assert _ask_matches(command), command
+def test_r3_12_keyword_splitting_is_not_promised_by_the_rules(command):
+    # Break: a model (or a doc) that claims the globs catch a deliberately
+    # split keyword. 2.1.311 runs the first two (measured); only 2.1.322's
+    # matcher asks for them, and nothing here relies on that.
+    assert not _ask_matches(command), command

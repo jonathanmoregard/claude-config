@@ -9,16 +9,17 @@ ENFORCEMENT MODEL
   ordinary way of opening a PR depend on a review, so that an honest agent
   reviews first -- not to stop an agent that sets out to evade it.
 
-  What it covers: settings.json `permissions.ask` matches the ordinary
-  spellings of a PR open -- `gh pr create` / `gh pr new` however spaced, and
-  with quotes or backslashes inside the words (measured: `gh pr cre"ate"`,
-  `gh pr cr''eate` and `g\\h pr create` are all asked), a `gh api` POST to a
-  `.../pulls` collection (explicit `-X POST` / `--method POST`, or implied by
-  `-f`/`-F`/`--field`/`--raw-field`/`--input`), a GraphQL body that names
-  `createPullRequest`, `gh alias`, and the GitHub MCP create tool. A `gh api`
-  call that cannot open a PR -- a read, a GraphQL query, a comment -- is NOT
-  asked: headless, an ask is a refusal, and refusing reads is pure cost.
-  (One over-match is accepted: `gh api -X GET .../pulls -f state=open`.)
+  What it covers: settings.json `permissions.ask` globs, matched against the
+  raw command text, catch the ordinary spellings of a PR open -- `gh pr
+  create` / `gh pr new` however spaced or wrapped; a `gh api` call whose
+  path names `pulls` and that carries a field or body flag (`-f`, `-F`,
+  `--field`, `--raw-field`, `--input`: gh then POSTs) or an explicit POST,
+  the endpoint quoted or not; a GraphQL body that names `createPullRequest`;
+  `gh alias`; and the GitHub MCP create tool. A `gh api` call that cannot
+  open a PR -- a bare or `-X GET` read, a GraphQL query, an issue comment --
+  is NOT asked: headless, an ask is a refusal, and refusing reads is pure
+  cost. Accepted over-matches: other writes under `pulls/` (a PR comment)
+  and `gh api -X GET .../pulls -f state=open`.
   `Bash` is on the allow list, so for these spellings the ask rule -- not
   this code -- is what stops an unreviewed PR open: a parser miss, a hook
   timeout, a crash, or a hook that is not installed all leave the prompt.
@@ -28,8 +29,11 @@ ENFORCEMENT MODEL
   opened from a script file (`bash ./open.sh`), a git hook or a gh alias's
   later use; argv built by an interpreter; a variable spelling (`${g}h pr
   create`, `EP=.../pulls; gh api $EP ...` -- the matcher expands nothing); a
-  GraphQL mutation read from a file (`-F query=@m.graphql`); a second PR
-  open in the same command hidden from the scanner after a judged one; and
+  keyword split with quotes or a backslash (`gh pr cre"ate"`, `cr''eate`,
+  `g\\h`) -- MEASURED: Claude Code 2.1.322 asks for these, 2.1.311 runs the
+  quoted ones, so nothing here relies on either; a GraphQL mutation read
+  from a file (`-F query=@m.graphql`); a second PR open in the same command
+  hidden from the scanner after a judged one; and
   `git push origin HEAD:reviewed && gh pr create --head reviewed`.
 
   This module's one privilege is to ANSWER the prompt "allow", through a
