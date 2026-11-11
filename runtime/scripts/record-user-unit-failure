@@ -33,7 +33,11 @@ def main() -> int:
     # is a job stopped mid-run (systemctl stop, logout, reboot) — a clean stop,
     # not a failure; recording it left durable records nothing ever cleared.
     # Real failures arrive as exit-code, signal, timeout, oom-kill, core-dump.
+    # Only a run that exited 0 supersedes an earlier failure record; a stopped
+    # run proves nothing about it, so the record is left as it is.
     if result == "success":
+        if status != "0":
+            return 0
         try:
             record.unlink()
         except FileNotFoundError:
