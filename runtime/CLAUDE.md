@@ -92,6 +92,7 @@ User instructions override everything below.
 
 ## Recall
 - Questions about the past → `mcp__aggregator__aggregator_search_memory` first, before grep or the memory dir, even when the question seems quick. `aggregator_capabilities` for live sources and DSL keys. Writes go to the memory dir.
+- Desktop notifications (toasts) are all logged: user mentions or quotes a notification → run `notifications` first (last 20; `--since`, `-n`, `--json`; log `~/.local/state/notification-log/notifications.jsonl`), before guessing its sender.
 
 ## PRs
 - Target the repo's default branch. Non-default only when asked, then re-target before merge.
