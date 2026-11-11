@@ -103,34 +103,34 @@ jobs:
       # sandbox policy is exactly the thing whose guard must not be allowed to
       # pass on a machine that cannot run it.
       #
-      # From Ubuntu's archive, not a pinned GitHub release: apt verifies its
-      # own signatures, so this file does not grow a checksum that someone has
-      # to remember to bump. Its own step, and a version print, so "the parser
-      # is absent" fails here and reads as itself instead of as a hundred
-      # unrelated-looking assertion failures in the step below. Not
-      # `shellcheck` -- a different project and a different binary, which does
-      # not bring `shfmt` with it.
-      # The fetch is retried because apt is a network dependency and the
-      # runner's DNS goes away for minutes at a time: on 2026-11-11 this step
-      # failed on `master` at 31912c7 and on two pushes to feat/artl-gate,
-      # every one of them `Temporary failure resolving 'archive.ubuntu.com'`
-      # and apt exit 100. Only the provisioning is retried, never an
-      # assertion, so a genuine shell-format regression still fails on the
-      # first attempt. The error below names which half broke: a parser that
-      # could not be installed is not a formatting failure, and reading it as
-      # one sent a reviewer hunting a code regression that did not exist.
+      # `go install ...@version`, for the same reason the gitleaks step below
+      # gives: the toolchain verifies it against the Go checksum database, so
+      # this file does not grow a checksum someone has to remember to bump,
+      # and the only thing to bump is the version. Its own step, and a version
+      # print, so "the parser is absent" fails here and reads as itself
+      # instead of as a hundred unrelated-looking assertion failures in the
+      # step below. Not `shellcheck` -- a different project and a different
+      # binary, which does not bring `shfmt` with it.
+      #
+      # Was Ubuntu's archive until 2026-11-11, when apt's mirrors went
+      # unreachable for half an hour -- `Temporary failure resolving
+      # 'archive.ubuntu.com'`, apt exit 100 -- failing this step on `master`
+      # at 31912c7 and on three pushes to feat/artl-gate. Retrying was tried
+      # first and was the wrong shape: a 15s/30s backoff cannot outlast a
+      # 30-minute outage, and the retry still failed at 539e926. The module
+      # proxy is a different network path from Ubuntu's mirrors and was up
+      # throughout, so this removes the dependency rather than waiting on it.
+      # The error names which half broke: a parser that could not be installed
+      # is not a formatting failure, and reading it as one sent a reviewer
+      # hunting a code regression that did not exist.
       - name: The shell parser the backcheck depends on is present
         run: |
-          for attempt in 1 2 3; do
-            sudo apt-get update --quiet \
-              && sudo apt-get install --quiet --yes shfmt && break
-            if [ "$attempt" = 3 ]; then
-              echo "::error::shfmt could not be provisioned after 3 attempts (apt or DNS unavailable) -- the shell-format backcheck never ran, so this is NOT a formatting failure" >&2
-              exit 1
-            fi
-            sleep $((attempt * 15))
-          done
-          shfmt --version
+          if ! go install mvdan.cc/sh/v3/cmd/shfmt@v3.12.0; then
+            echo "::error::shfmt could not be provisioned (go install failed) -- the shell-format backcheck never ran, so this is NOT a formatting failure" >&2
+            exit 1
+          fi
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          "$(go env GOPATH)/bin/shfmt" --version
 
       # `gitleaks` serves two steps below: the behavioural half of the
       # proposals-sink config test, and the whole-tree secret scan. A config
