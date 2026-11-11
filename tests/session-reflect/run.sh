@@ -229,6 +229,13 @@ unclosed_calls() {
   awk '/^=== call ===/ && !(/ --strict-mcp-config( |$)/ && / --tools  /) { n++ }
        END { print n + 0 }' "$STUB_ARGV_LOG" 2>/dev/null || echo 0
 }
+# Calls that would persist a session .jsonl into the project's transcript dir.
+# A persisted reflection becomes that project's newest session, so restore and
+# `claude --continue` resume the reflection instead of the user's work.
+persisting_calls() {
+  awk '/^=== call ===/ && !/ --no-session-persistence( |$)/ { n++ }
+       END { print n + 0 }' "$STUB_ARGV_LOG" 2>/dev/null || echo 0
+}
 codex_call_count() { grep -c '^=== call ===' "$STUB_CODEX_ARGV_LOG" 2>/dev/null || true; }
 
 # ---------------------------------------------------------------------------
@@ -372,6 +379,7 @@ jqe --arg t "$PARENT_TRANSCRIPT" '.modes.subagentstop.parent_transcript == $t' "
 # K06: `--tools ""` removes built-ins only; inherited MCP servers stay offered
 # unless --strict-mcp-config drops them. Every call must carry both.
 (( $(call_count) > 0 && $(unclosed_calls) == 0 )); assert $? "inline call carries --tools \"\" + --strict-mcp-config ($(unclosed_calls) unclosed)"
+(( $(call_count) > 0 && $(persisting_calls) == 0 )); assert $? "inline call carries --no-session-persistence ($(persisting_calls) persisting)"
 grep -qF 'FIXTURE-MARKER-AGENT-REPLY' "$STUB_PROMPT_LOG"; assert $? "agent transcript text reached the prompt"
 grep -qF 'FIXTURE-MARKER-AGENT-CONCLUSION' "$STUB_PROMPT_LOG"; assert $? "the agent's last message reached the prompt"
 grep -qF 'HEAD-OF-TOOL-RESULT' "$STUB_PROMPT_LOG"; assert $? "tool_result head excerpt is present"
@@ -533,6 +541,7 @@ jqe '(.modes.sessionend.fallback_used // false) == false' "$OK_MANIFEST"; assert
 (( $(call_count) == 1 )); assert $? "exactly one model call ($(call_count) seen)"
 (( $(resume_calls) == 1 )); assert $? "the resumed path was used"
 (( $(unclosed_calls) == 0 )); assert $? "resumed call carries --tools \"\" + --strict-mcp-config ($(unclosed_calls) unclosed)"
+(( $(persisting_calls) == 0 )); assert $? "resumed call carries --no-session-persistence ($(persisting_calls) persisting)"
 
 # ===========================================================================
 # B2 — an oversize transcript skips the doomed primary attempt
