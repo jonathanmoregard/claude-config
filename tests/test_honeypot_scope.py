@@ -65,20 +65,53 @@ def scope_step() -> str:
     return "\n".join(body) + "\n"
 
 
-def test_a_newly_opened_pull_request_reaches_the_decision():
-    """`opened` has to be a trigger, now that passing is a possible outcome.
+def workflow_text() -> str:
+    return WORKFLOW.read_text(encoding="utf-8")
 
-    While the only outcomes were "grade" and "refuse", a pull request with no
-    run was indistinguishable from one that had refused -- a required check is
-    unsatisfied either way -- so a missing trigger failed closed. The scope
-    test adds a PASS, and a newly opened pull request cannot reach it by
-    waiting: without `opened` it sits blocked on a check that qualifies for
-    the exemption and never runs.
+
+def asked_expression(text: str) -> str:
+    """The one expression that decides "a grade was asked for", whitespace-folded."""
+    m = re.search(r"ASKED: \$\{\{(.*?)\}\}", text, re.S)
+    assert m, "the scope step's ASKED expression is gone"
+    return " ".join(m.group(1).split())
+
+
+def test_the_lane_runs_only_on_auto_merge_and_pushes():
+    """No run at all until auto-merge: the required check sits Expected (yellow).
+
+    `opened` and `labeled` are gone on purpose. A run at open time had to
+    either refuse (red, which agents kept reading as something to fix by
+    asking about the billed label) or pass (a free pass). `synchronize` stays:
+    the strict up-to-date rule makes every master move a branch update, and a
+    push while auto-merge is on must re-grade.
     """
-    text = WORKFLOW.read_text(encoding="utf-8")
-    types = next(l for l in text.splitlines() if l.strip().startswith("types:"))
-    for event in ("opened", "synchronize", "labeled"):
-        assert event in types, f"{event} missing from {types.strip()}"
+    types = next(l for l in workflow_text().splitlines() if l.strip().startswith("types:"))
+    assert types.split(":", 1)[1].strip() == "[auto_merge_enabled, synchronize]", types
+
+
+def test_an_unrequested_run_reports_under_a_name_nothing_requires():
+    """The required context is the job NAME. Unrequested runs must not carry it.
+
+    Not a job-level `if:` -- a skipped job reports SUCCESS to a required check.
+    The name and ASKED come from the identical expression, so a run can never
+    be named `honeypot` while the step believes it was not asked.
+    """
+    text = workflow_text()
+    job = text[text.index("\njobs:"):]
+    head = job.split("steps:")[0]
+    assert re.search(r"^\s{4}if:", head, re.M) is None, "job-level if:"
+    m = re.search(r"^\s{4}name: \$\{\{(.*?)&& 'honeypot' \|\| 'honeypot-not-requested' \}\}",
+                  head, re.M | re.S)
+    assert m, "job name no longer derived from the ask"
+    name_expr = " ".join(m.group(1).split())
+    assert name_expr.strip("() ") == asked_expression(text).strip("() "), name_expr
+    assert "'grade'" not in asked_expression(text), "the label is no longer a trigger"
+
+
+def test_unrequested_runs_cannot_cancel_a_grade():
+    """Separate concurrency groups: a push before auto-merge must not cancel a grade."""
+    group = next(l for l in workflow_text().splitlines() if l.strip().startswith("group:"))
+    assert "auto_merge" in group, group
 
 
 def test_the_step_was_really_extracted():
@@ -89,7 +122,7 @@ def test_the_step_was_really_extracted():
         assert marker in script, f"{marker!r} missing -- extraction broke"
 
 
-def run_scope(tmp_path, records: str, *, asked: str = "false",
+def run_scope(tmp_path, records: str, *, asked: str = "true",
               count: str | None = None) -> tuple[int, str, str]:
     """Execute the real step against a stubbed API. Returns (rc, log, output)."""
     bin_dir = tmp_path / "bin"
@@ -151,6 +184,11 @@ IS_CONFIG = [
                  id="a-hook-renamed-out-of-the-config"),
     pytest.param("runtime/hooks/x.py\ttests/x.py",
                  id="a-test-renamed-into-the-config"),
+    # The lane's own instrument. With the label gone nothing else can ask for
+    # a grade of a change to it, so the scope test counts it as config.
+    pytest.param("tests/agent-e2e/skill-description-audit/check.sh",
+                 id="the-honeypot-scenario-itself"),
+    pytest.param("tests/agent-e2e/_lib/checks.sh", id="the-library-the-scenario-sources"),
 ]
 
 
@@ -163,23 +201,19 @@ def test_a_pull_request_that_changes_no_config_is_not_graded(tmp_path, records):
 
 
 @pytest.mark.parametrize("records", IS_CONFIG)
-def test_a_pull_request_that_changes_config_is_refused_until_graded(tmp_path, records):
+def test_a_pull_request_that_changes_config_is_graded_when_asked(tmp_path, records):
     rc, log, out = run_scope(tmp_path, records)
-    assert rc == 1, f"an ungraded config must not pass:\n{log}"
-    assert out.strip() == "", f"no verdict should be emitted, got {out!r}"
-    assert "has not been graded" in log
-
-
-def test_the_label_grades_whatever_it_is_put_on(tmp_path):
-    """The override, and why it exists.
-
-    This lane's own scenario lives under `tests/agent-e2e/`, which the scope
-    test excludes. Without the label a change to the instrument could never be
-    measured by the instrument.
-    """
-    rc, log, out = run_scope(tmp_path, "tests/agent-e2e/x/check.sh", asked="true")
     assert rc == 0, log
     assert out.strip() == "grade=true", f"got {out!r}\n{log}"
+
+
+@pytest.mark.parametrize("records", NOT_CONFIG + IS_CONFIG)
+def test_an_unrequested_run_grades_nothing_and_passes(tmp_path, records):
+    """It reports as `honeypot-not-requested`, which no rule requires."""
+    rc, log, out = run_scope(tmp_path, records, asked="false")
+    assert rc == 0, log
+    assert out.strip() == "grade=false", f"got {out!r}\n{log}"
+    assert "not requested" in log
 
 
 @pytest.mark.parametrize("records,count,because", [
