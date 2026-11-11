@@ -3,8 +3,8 @@
 # script's branches, not that an agent reading the new CLAUDE.md, skill or hook
 # text behaves differently.
 #
-# Asked for by adding the `grade` label to the pull request, which is also what
-# makes this safe to require: see the first step.
+# Asked for by enabling auto-merge on the pull request. Until then the required
+# `honeypot` check is Expected (yellow), never red: see `on:` and the job name.
 #
 # WHY THIS JOB HOLDS A CREDENTIAL AND `checks` DOES NOT
 #
@@ -24,8 +24,9 @@
 #   - `pull_request`, never `pull_request_target`: a fork's code must not run
 #     with this repository's identity. GitHub downgrades `id-token` to read for
 #     a fork pull request, so no token can be minted, the credential step fails
-#     closed, and the lane goes red. That is the intended outcome -- a fork PR
-#     gets a human reading the diff, not a grade.
+#     closed, and the lane goes red once auto-merge asks for the grade (yellow
+#     before that). That is the intended outcome -- a fork PR gets a human
+#     reading the diff, not a grade.
 #   - `persist-credentials: false`: `actions/checkout` otherwise leaves the
 #     workflow's own GITHUB_TOKEN in `.git/config`, where a hostile hook in the
 #     candidate config could read it. The harness scrubs GH_TOKEN and
@@ -47,9 +48,10 @@
 #
 # An agent run costs real money, and a pull request touching only the test
 # corpus or this directory has no candidate config to grade: the agent would
-# read exactly master's text, so the verdict would be about master. The first
-# step therefore asks what the pull request changes and passes WITHOUT grading
-# when the answer is nothing a running agent reads.
+# read exactly master's text, so the verdict would be about master. Once a
+# grade is asked for, the first step therefore asks what the pull request
+# changes and passes WITHOUT grading when the answer is nothing a running agent
+# reads.
 #
 # That test is a STEP. Not a workflow-level `paths:` filter and not a
 # job-level `if:`, because both are the gotcha this lane exists to avoid, in
@@ -59,7 +61,9 @@
 # SUCCESSFUL -- handing every pull request a free pass the moment that
 # condition goes wrong. A step that runs, decides and says so keeps the check
 # attached to the head commit in every case, and a decision step that errors
-# takes the job red with it.
+# takes the job red with it. (Before auto-merge the deliberate "no run under
+# this name" IS wanted: that is the yellow Expected state, cleared by the
+# auto-merge that asks for the grade.)
 #
 # What counts as config is an EXCLUSION list rather than an inclusion list,
 # and that direction is the whole point: a directory added tomorrow is graded
@@ -77,28 +81,27 @@
 # same reason, and `policy/` is in because a sandbox policy is config whatever
 # reads it today.
 #
-# The label still overrides, so a grade can always be ASKED for. That is not
-# symmetry for its own sake: this lane's own scenario lives in
-# `tests/agent-e2e/skill-description-audit/`, whose `check.sh` and `setup.sh`
-# master changed in the same week this was written. Without the override a
-# change to the instrument could never be measured by the instrument. What
-# keeps that from being a hole is that the grader has unit coverage in
+# One carve-out back IN: this lane's own scenario,
+# `tests/agent-e2e/skill-description-audit/`, and the `_lib/` it sources are
+# graded like config. A `grade` label used to be the way to measure a change
+# to the instrument with the instrument; with auto-merge as the only ask, the
+# scope test has to count it instead. The grader also has unit coverage in
 # `checks` (`tests/enforced/test_skill_audit_grader.py`), so a broken grader
 # is caught there rather than silently here.
 name: honeypot
 
 on:
   pull_request:
-    # `opened` is here because of the scope test below, and was not needed
-    # before it. While the only two outcomes were "grade" and "refuse", a
-    # pull request with no run at all was indistinguishable from one that had
-    # refused: a required check was unsatisfied either way, so failing to
-    # trigger failed closed. The scope test adds a third outcome -- a PASS for
-    # a pull request with no config in it -- and that one a newly opened pull
-    # request can never reach by waiting. Without `opened` it would sit
-    # blocked on a check that qualifies for the exemption and never runs,
-    # until something else pushed or labelled it.
-    types: [opened, labeled, auto_merge_enabled, synchronize]
+    # No `opened`, no `labeled`. Until auto-merge is enabled nothing reports
+    # under the required `honeypot` name, so the check sits Expected (yellow)
+    # and blocks the merge without looking like a failure. A run at open time
+    # could only refuse -- red, which agents kept reading as something to fix
+    # by asking about the billed grade -- or pass, which is a free pass.
+    # Enabling auto-merge is the ask. `synchronize` stays because the strict
+    # up-to-date rule makes every master move a branch update, and a push
+    # while auto-merge is on must re-grade; a push before it reports under
+    # `honeypot-not-requested` (see the job name).
+    types: [auto_merge_enabled, synchronize]
 
 permissions:
   contents: read
@@ -113,11 +116,20 @@ permissions:
   id-token: write
 
 concurrency:
-  group: honeypot-${{ github.event.pull_request.number }}
+  # Split by the ask, so an unrequested push can never cancel a grade in
+  # flight and leave the required check stuck on "cancelled".
+  group: honeypot-${{ github.event.pull_request.number }}-${{ github.event.pull_request.auto_merge != null || github.event.action == 'auto_merge_enabled' }}
   cancel-in-progress: true
 
 jobs:
   honeypot:
+    # The required status check matches this NAME. Only a run that was asked
+    # for -- auto-merge on -- may carry it; any other run reports under a name
+    # no rule requires, which keeps `honeypot` Expected. The condition is the
+    # step's ASKED expression character for character (pinned by
+    # tests/test_honeypot_scope.py), so a run can never be named `honeypot`
+    # while the step believes it was not asked.
+    name: ${{ (github.event.pull_request.auto_merge != null || github.event.action == 'auto_merge_enabled') && 'honeypot' || 'honeypot-not-requested' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -134,42 +146,39 @@ jobs:
       # satisfy the requirement for free, which is the one hole this lane
       # exists to close.
       #
-      # So the job always runs and refuses instead: an ungraded config is not a
-      # clean config. Enabling auto-merge fires `auto_merge_enabled`, this
-      # re-runs, and the verdict that matters is produced. The refusal is two
-      # steps and no install, so it costs no agent run.
+      # So the job always runs, and what keeps an unrequested run from
+      # satisfying the requirement is its NAME, not a skip: it reports as
+      # `honeypot-not-requested` and leaves `honeypot` Expected.
       #
-      # Asking for the grade is a label, from the pull request's own sidebar.
+      # Asking for the grade is enabling auto-merge -- the user's own merge
+      # intent, so nothing is graded (or paid for) before he means to land it.
       # `workflow_dispatch` would be the obvious button, but its runs are not
       # attached to a pull request and so can never satisfy a required status
-      # check. The label keeps this in the `pull_request` event family, so the
-      # check attaches to the head commit exactly as `checks` does, with the
-      # same secret rules for forks.
+      # check. `auto_merge_enabled` keeps this in the `pull_request` event
+      # family, so the check attaches to the head commit exactly as `checks`
+      # does, with the same secret rules for forks.
       #
       # Checks are per commit, so the guarantee survives a push: `synchronize`
-      # re-grades while the label is on, and a pull request whose label was
-      # removed produces no run at all, leaving the required check unsatisfied.
-      # Both directions fail closed, and an ordinary merge click still works
-      # once the grade is green.
+      # re-grades while auto-merge is on, and a push after it was turned off
+      # reports as not requested, leaving the required check Expected. Both
+      # directions fail closed.
       #
-      # Auto-merge counts too. The payload field is the `auto_merge` OBJECT,
-      # null while auto-merge is off; there is no `auto_merge_enabled`
-      # property, and naming one would make the test quietly false on every
-      # `synchronize`.
+      # The payload field is the `auto_merge` OBJECT, null while auto-merge is
+      # off; there is no `auto_merge_enabled` property, and naming one would
+      # make the test quietly false on every `synchronize`.
       - name: There is a config here, and a grade was asked for
         id: scope
         env:
-          ASKED: ${{ contains(github.event.pull_request.labels.*.name, 'grade')
-            || github.event.pull_request.auto_merge != null
-            || github.event.action == 'auto_merge_enabled' }}
+          ASKED: ${{ github.event.pull_request.auto_merge != null || github.event.action == 'auto_merge_enabled' }}
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
         run: |
-          # The label first, so an explicit ask never has to get past the
-          # scope test -- see the header on why the override exists.
-          if [ "$ASKED" = "true" ]; then
-            echo "grade asked for; grading the candidate config"
-            echo "grade=true" >> "$GITHUB_OUTPUT"
+          # Unrequested: this run carries the `honeypot-not-requested` name,
+          # so passing here satisfies nothing that is required.
+          if [ "$ASKED" != "true" ]; then
+            echo "grade not requested: auto-merge is off."
+            echo "the required 'honeypot' check stays Expected until auto-merge is enabled."
+            echo "grade=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # Asked of the API rather than of a checkout, so the whole decision
@@ -241,6 +250,11 @@ jobs:
           config=$(printf '%s\n' "$files" | grep -vE \
             '^(tests/|docs/|research/|experiments/|improvements/|\.github/|\.githooks/|\.gitignore$|\.gitleaks\.toml$|\.secrets\.baseline$)' \
             || true)
+          # This lane's own instrument is graded like config: with the label
+          # gone, nothing else could ever ask for a grade of a change to it.
+          instrument=$(printf '%s\n' "$files" | grep -E \
+            '^tests/agent-e2e/(skill-description-audit/|_lib/)' || true)
+          config=$(printf '%s\n%s\n' "$config" "$instrument" | grep -v '^$' || true)
           if [ -z "$config" ]; then
             echo "nothing to grade: no file here is read by a running agent."
             echo "all $got of them, a rename shown as 'new <- old':"
@@ -248,12 +262,9 @@ jobs:
             echo "grade=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          echo "this pull request changes the live config:"
+          echo "this pull request changes the live config; grading it:"
           printf '%s\n' "$config" | sed 's/^/  /'
-          echo "awaiting grade: this config has not been graded yet"
-          echo "the grade runs when the user enables auto-merge (or adds the 'grade' label)."
-          echo "expected before auto-merge, not a failure to fix; an ungraded config is not a clean one"
-          exit 1
+          echo "grade=true" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v4
         if: steps.scope.outputs.grade == 'true'

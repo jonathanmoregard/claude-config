@@ -4,6 +4,8 @@
 Each line of pr-states is `<owner>/<repo>#<n> <OPEN|MERGED|CLOSED> [<head-branch>
 [<SUCCESS|FAILURE|PENDING>|<name>:<CONCLUSION>,...]]`; the check conclusion
 defaults to SUCCESS, and a bare conclusion names the single check `ci`.
+An optional fifth field sets an OPEN PR's mergeStateStatus (default CLEAN),
+e.g. BLOCKED for a required check that has not reported.
 `run view` prints $E2E_RUN/run-log when it exists.
 Every call is logged to $E2E_RUN/gh.log. Covers what an agent (or a hook) asks
 about a PR's state: `pr view` (by number, URL or head branch), `pr list`
@@ -34,11 +36,14 @@ def read(name, default):
 
 states = run / "pr-states"
 prs = {}      # key -> (state, head, check conclusion)
+merge_state = {}  # key -> mergeStateStatus override
 for line in (states.read_text().splitlines() if states.exists() else []):
     parts = line.split()
     if len(parts) >= 2:
         prs[parts[0].lower()] = (parts[1], parts[2] if len(parts) > 2 else "",
                                  parts[3] if len(parts) > 3 else "SUCCESS")
+        if len(parts) > 4:
+            merge_state[parts[0].lower()] = parts[4]
 
 
 def opt(*names):
@@ -76,7 +81,7 @@ def record(key):
         "closedAt": t if state != "OPEN" else None,
         "mergedBy": {"login": "jonathanmoregard"} if state == "MERGED" else None,
         "mergeable": "MERGEABLE" if state == "OPEN" else "UNKNOWN",
-        "mergeStateStatus": "CLEAN" if state == "OPEN" else "UNKNOWN",
+        "mergeStateStatus": merge_state.get(key.lower(), "CLEAN") if state == "OPEN" else "UNKNOWN",
         "reviewDecision": "", "autoMergeRequest": None, "headRefOid": "a" * 40,
         "mergeCommit": {"oid": "b" * 40} if state == "MERGED" else None,
         "statusCheckRollup": rollup(checks),
