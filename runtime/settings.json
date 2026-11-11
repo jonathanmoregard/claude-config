@@ -256,9 +256,30 @@
       "Grep(//**/_quarantine)",
       "Edit(//etc/nixos/**)",
       "Edit(//nix/store/**)",
-      "Edit(~/.local/state/claude-harness-tripwire/**)"
+      "Edit(~/.local/state/claude-harness-tripwire/**)",
+      "Edit(~/.local/state/claude-pr-open-gate/**)",
+      "Write(~/.local/state/claude-pr-open-gate/**)",
+      "Edit(~/.local/state/claude-pr-open-gate)",
+      "Write(~/.local/state/claude-pr-open-gate)",
+      "Bash(*artl-evidence.jsonl*)",
+      "Bash(*artl-exemptions.jsonl*)",
+      "Bash(*claude-pr-open-gate*)"
     ],
-    "ask": [],
+    "ask": [
+      "Bash(*gh*pr*create*)",
+      "Bash(*gh*pr*new*)",
+      "Bash(*createPullRequest*)",
+      "Bash(*gh*api*pulls*-f*)",
+      "Bash(*gh*api*-f*pulls*)",
+      "Bash(*gh*api*pulls*-F*)",
+      "Bash(*gh*api*-F*pulls*)",
+      "Bash(*gh*api*pulls*--input*)",
+      "Bash(*gh*api*--input*pulls*)",
+      "Bash(*gh*api*pulls*POST*)",
+      "Bash(*gh*api*POST*pulls*)",
+      "Bash(*gh*alias*)",
+      "mcp__github__create_pull_request"
+    ],
     "defaultMode": "default",
     "additionalDirectories": [
       "/home/jonathan/Repos/nixos-config-worktrees",
@@ -310,6 +331,16 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "matcher": "^(Bash|mcp__github__create_pull_request)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/hooks/pr-open-gate.py",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "PostToolUse": [
@@ -357,6 +388,16 @@
             "type": "command",
             "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark PostToolUse",
             "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "^(Agent|Read|SendMessage)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/hooks/artl-evidence.py",
+            "timeout": 30
           }
         ]
       }
@@ -429,6 +470,16 @@
             "type": "command",
             "command": "python3 $HOME/.claude/aggregator-transcript-guard.py",
             "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "^(Bash|mcp__github__create_pull_request)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/hooks/pr-open-gate.py",
+            "timeout": 10
           }
         ]
       }
@@ -675,6 +726,15 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/hooks/artl-evidence.py",
+            "timeout": 30
+          }
+        ]
       }
     ],
     "UserPromptSubmit": [
@@ -746,6 +806,15 @@
             "type": "command",
             "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark UserPromptSubmit",
             "timeout": 10
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/hooks/pr-open-gate.py",
+            "timeout": 5
           }
         ]
       }
