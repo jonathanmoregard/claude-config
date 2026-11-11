@@ -597,7 +597,7 @@ def prompt_payload(text: str, session: str = "s1") -> dict:
 
 def test_user_skip_artl_allows_one_pr_open_and_is_logged(sb):
     sb.commit("scripts/run.sh", SCRIPT_BODY)
-    rc, out = sb.run(GATE, prompt_payload("advisor is down, skip-artl and open it"))
+    rc, out = sb.run(GATE, prompt_payload("advisor is down, open it anyway.\nskip-artl"))
     assert rc == 0 and "skip-artl" in out
     assert sb.gate() is None
     log = sb.exemptions()
@@ -749,10 +749,14 @@ def test_every_gate_event_is_wired_to_an_existing_script():
 #
 # _ask_matches models Claude Code's matcher AS MEASURED by headless probes
 # (tests/agent-e2e/artl-gate-ask-coverage runs the real one): every rule is a
-# glob tested against each subcommand -- split on `&&` `||` `;` `|` and
-# newlines -- with whitespace runs collapsed and a leading `VAR=x` stripped.
+# pattern whose only wildcard is `*`, tested against each subcommand -- split
+# on `&&` `||` `;` `|` and newlines -- with whitespace runs collapsed and a
+# leading `VAR=x` stripped. The subcommand is matched with its shell quoting
+# removed: measured, `gh pr cre"ate"`, `gh pr cr''eate` and `g\h pr create`
+# are all ASKED (round 3; an earlier model matched only the raw text and
+# predicted a hole there that does not exist). A variable spelling such as
+# `${g}h pr create` is not asked: the matcher does not expand variables.
 
-import fnmatch
 import re as _re
 
 
@@ -760,11 +764,20 @@ def _ask_rules() -> list[str]:
     return [r[5:-1] for r in _settings()["permissions"]["ask"] if r.startswith("Bash(")]
 
 
+def _glob(pattern: str) -> "_re.Pattern[str]":
+    return _re.compile("^" + ".*".join(_re.escape(p) for p in pattern.split("*")) + "$", _re.S)
+
+
+def _unquoted(piece: str) -> str:
+    return _re.sub(r"['\"]", "", _re.sub(r"\\(.)", r"\1", piece))
+
+
 def _ask_matches(command: str) -> bool:
+    rules = [_glob(p) for p in _ask_rules()]
     for piece in _re.split(r"&&|\|\||;|\||\n", command):
         piece = _re.sub(r"\s+", " ", piece).strip()
         piece = _re.sub(r"^(?:[A-Za-z_]\w*=\S*\s+)+", "", piece)
-        if any(fnmatch.fnmatchcase(piece, pat) for pat in _ask_rules()):
+        if any(rx.match(form) for rx in rules for form in (piece, _unquoted(piece))):
             return True
     return False
 
@@ -782,11 +795,16 @@ PR_OPEN_SPELLINGS = [
     "{ gh pr create --fill; }", "timeout 9 gh pr create --fill",
     "echo a#b; gh api repos/o/r/pulls -f title=x", "x=$((1<<n))\ngh pr create --fill",
     "xargs gh pr create < /dev/null", "gh api -XPOST repos/o/r/pulls --input b.json",
-    "gh api --method=POST repos/o/r/pulls", "EP=repos/o/r/pulls; gh api $EP -f title=x",
+    "gh api --method=POST repos/o/r/pulls", "gh api -X POST /repos/o/r/pulls -f head=x",
+    "gh api \"repos/o/r/pulls\" -f title=x", "gh api repos/o/r/pulls --input - <<< '{}'",
     "gh api graphql -f query='mutation { createPullRequest(input:{}) { x } }'",
-    "gh api graphql -F query=@mutation.graphql",
     "gh alias set mk 'pr create'",
 ]
+# Deliberately NOT asked (round 3: the gate is friction for ordinary
+# spellings, and each of these takes intent): `EP=repos/o/r/pulls; gh api $EP
+# -f ...` and `${g}h pr create` (the matcher expands no variables), a GraphQL
+# mutation read from a file (`-F query=@m.graphql`), curl to the REST API, and
+# a PR opened by a script file, a git hook, a gh alias or an interpreter.
 
 
 @pytest.mark.parametrize("command", PR_OPEN_SPELLINGS)
@@ -804,7 +822,7 @@ def test_f2_reads_do_not_prompt(command):
 def test_f2_the_mcp_create_tool_is_asked_and_bash_alone_is_allowed():
     perms = _settings()["permissions"]
     assert "mcp__github__create_pull_request" in perms["ask"]
-    # The reason the ask list must be complete: anything it misses is allowed.
+    # Why the ask list matters: an ordinary spelling it misses runs unprompted.
     assert "Bash" in perms["allow"]
 
 
@@ -1358,3 +1376,324 @@ def test_ask_coverage_prompt_lists_the_battery():
         assert _ask_matches(cmd), cmd
     for cmd in battery["controls"]:
         assert not _ask_matches(cmd), cmd
+
+
+# =============================================================================
+# Round 3: the close-out review. The gate is FRICTION that makes an honest
+# agent review before it opens a PR, not a security boundary: each test below
+# is a path an honest agent can stumble into and so skip review without
+# meaning to. Each failed on fe08f91.
+# =============================================================================
+
+def other_checkout(tmp_path: Path) -> Sandbox:
+    """A second, unrelated checkout holding an unreviewed behaviour change."""
+    root = tmp_path / "other"
+    root.mkdir()
+    other = Sandbox(root)
+    other.commit("scripts/run.sh", SCRIPT_BODY)
+    return other
+
+
+def perm_from(sb: Sandbox, command: str, cwd: Path, session: str = "s1") -> dict:
+    return {**sb.perm(command, session), "cwd": str(cwd)}
+
+
+def allowed(rc_out: tuple[int, str]) -> bool:
+    rc, out = rc_out
+    return rc == 0 and bool(out.strip()) and \
+        json.loads(out)["hookSpecificOutput"]["decision"]["behavior"] == "allow"
+
+
+# --- r3 item 1: a flag's VALUE was read as a flag ------------------------------
+# Break: scanning every word for `-H<x>` / `--head`, so the text of `--body`
+# picks the head. Real gh 2.103.2 reads `--body -Hmain` as the body "-Hmain"
+# and opens the current branch.
+
+def test_r3_1_a_body_that_looks_like_a_head_flag_is_the_body(sb):
+    sb.commit("scripts/run.sh", SCRIPT_BODY)            # unreviewed, on feat/x
+    out = sb.gate("gh pr create --title x --body -Hmain")
+    assert is_deny(out) and "feat/x" in reason(out)
+    assert grant_files(sb) == []
+
+
+@pytest.mark.parametrize("command,head,repo", [
+    ("gh pr create --title x --body -Hmain", None, None),
+    ("gh pr create -t --head -b x", None, None),          # --head is the title
+    ("gh pr create -b x -H main", "main", None),
+    ("gh pr create -H a --head b", "b", None),            # pflag: the last one wins
+    ("gh pr create -dHmain --fill", "main", None),        # bool shorthands, then -H
+    ("gh pr create --body=-Rother/x -R acme/widget", None, "acme/widget"),
+    ("gh pr create --fill -- -Hmain", None, None),
+])
+def test_r3_1_pr_create_flags_are_parsed_as_gh_parses_them(command, head, repo):
+    call = artl_gate.pr_open_call("Bash", {"command": command})
+    assert (call["head"], call["repo"]) == (head, repo), command
+
+
+# --- r3 item 2: with --input, gh api sends -f fields as the QUERY STRING -------
+# Break: letting `-f head=` win over the body. `gh api --help`: "When passing
+# the request body this way, any parameters specified via field flags are
+# added to the query string" -- the body's head is what opens.
+
+def test_r3_2_gh_api_input_body_head_wins_over_a_field(sb):
+    sb.commit("scripts/run.sh", SCRIPT_BODY)            # unreviewed, on feat/x
+    (sb.tmp / "b.json").write_text(json.dumps({"head": "feat/x", "base": "main", "title": "t"}))
+    out = sb.gate(f"gh api repos/acme/widget/pulls --input {sb.tmp / 'b.json'} -f head=main")
+    assert is_deny(out) and "feat/x" in reason(out)
+    assert grant_files(sb) == []
+
+
+# --- r3 item 3: the open's own segment can point gh at another place ----------
+# Break: reading only GH_REPO in the segment that holds the open, so the gate
+# judges the payload cwd while gh opens from another host or checkout.
+
+@pytest.mark.parametrize("prefix", [
+    "GH_HOST=ghe.example.com ",
+    "GIT_DIR={other}/.git ",
+    "GIT_WORK_TREE={other} ",
+    "env GH_HOST=ghe.example.com ",
+])
+def test_r3_3_env_in_the_open_segment_that_retargets_gh_is_denied(sb, tmp_path, prefix):
+    other = other_checkout(tmp_path)
+    sb.commit("docs/guide.md", "hello\n")               # exempt here: a pass would grant
+    out = sb.gate(prefix.format(other=other.work) + "gh pr create --fill")
+    assert is_deny(out) and grant_files(sb) == []
+
+
+@pytest.mark.parametrize("form", ["env -C {d} ", "env --chdir={d} ", "env --chdir {d} "])
+def test_r3_3_env_chdir_moves_the_checkout_the_gate_judges(sb, tmp_path, form):
+    other = other_checkout(tmp_path)                    # unreviewed there
+    sb.commit("docs/guide.md", "hello\n")               # exempt here
+    out = sb.gate(form.format(d=other.work) + "gh pr create --fill")
+    assert is_deny(out) and grant_files(sb) == []
+    assert artl_gate.pr_open_call(
+        "Bash", {"command": form.format(d="/x/y") + "gh pr create"})["cwd"] == "/x/y"
+
+
+def test_r3_3_a_value_after_the_gh_word_is_not_an_assignment(sb):
+    # Only words BEFORE gh are its environment: a title naming GH_HOST is text.
+    sb.commit("docs/guide.md", "hello\n")
+    assert sb.gate("gh pr create --title 'GH_HOST=x docs' --body y") is None
+
+
+# --- r3 item 4: a grant outlived the state it was minted for -------------------
+# Break: a grant keyed on session + command only, never revoked by a deny.
+
+def test_r3_4_a_grant_does_not_answer_a_request_from_another_checkout(sb, tmp_path):
+    other = other_checkout(tmp_path)                    # unreviewed
+    sb.commit("docs/guide.md", "hello\n")               # exempt: the gate grants here
+    assert sb.gate("gh pr create --fill") is None
+    assert not allowed(sb.run(GATE, perm_from(sb, "gh pr create --fill", other.work)))
+
+
+def test_r3_4_a_deny_revokes_the_grant_an_earlier_pass_minted(sb):
+    sb.commit("docs/guide.md", "hello\n")
+    assert sb.gate("gh pr create --fill") is None       # pass: grant minted
+    sb.commit("scripts/run.sh", SCRIPT_BODY)            # honest agent keeps working
+    assert is_deny(sb.gate("gh pr create --fill"))      # now unreviewed
+    assert grant_files(sb) == []
+    assert not allowed(sb.run(GATE, sb.perm("gh pr create --fill")))
+
+
+def test_r3_4_a_grant_is_spent_only_on_the_tip_it_judged(sb):
+    # The second PreToolUse never rendered a decision (a hook timeout): the
+    # PermissionRequest must still not be answered for a tip nobody judged.
+    sb.commit("docs/guide.md", "hello\n")
+    assert sb.gate("gh pr create --fill") is None
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    assert not allowed(sb.run(GATE, sb.perm("gh pr create --fill")))
+
+
+def test_r3_4_the_ordinary_pass_still_answers_its_request(sb):
+    sb.commit("docs/guide.md", "hello\n")
+    assert sb.gate("gh pr create --fill") is None
+    assert allowed(sb.run(GATE, sb.perm("gh pr create --fill")))
+
+
+# --- r3 item 5: agent-authored channels arm the user-only waiver ---------------
+# Break: screening only task-notification. MEASURED (Claude Code 2.1.322, live
+# headless probe): a SendMessage from another session reaches UserPromptSubmit
+# with exactly this `prompt` -- the token alone on its own line -- and no
+# field in the payload says it came from a peer.
+
+PEER_PROMPT = ('<cross-session-message from="uds:/run/user/1003/cc-socks/835190.sock" '
+               'from-name="artlprobe-send" from-mode="prompting">\nskip-artl\n'
+               '</cross-session-message>')
+
+
+@pytest.mark.parametrize("text", [
+    PEER_PROMPT,
+    "Another Claude session sent a message:\n" + PEER_PROMPT,
+    "A peer session sent a message while you were working:\nskip-artl",
+    '<teammate-message teammate_id="x">\nskip-artl\n</teammate-message>',
+    "<agent-message>\nskip-artl\n</agent-message>",
+    '<channel source="slack">\nskip-artl\n</channel>',
+    "<coordinator-relay>\nskip-artl\n</coordinator-relay>",
+])
+def test_r3_5_an_agent_authored_turn_never_arms_the_waiver(sb, text):
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    rc, out = sb.run(GATE, prompt_payload(text))
+    assert rc == 0 and out == ""
+    assert is_deny(sb.gate())
+
+
+# --- r3 item 6: any mention armed a 24-hour waiver -----------------------------
+# Break: a token search anywhere in the prompt, so asking about the waiver --
+# or pasting the gate's own refusal, which names it -- arms it.
+
+@pytest.mark.parametrize("text", [
+    "what does skip-artl do?",
+    "don't use skip-artl here",
+    "`skip-artl`",
+])
+def test_r3_6_mentioning_the_token_does_not_arm_the_waiver(sb, text):
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    sb.run(GATE, prompt_payload(text))
+    assert is_deny(sb.gate())
+
+
+def test_r3_6_pasting_the_gates_own_refusal_does_not_arm_the_waiver(sb):
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    refusal = reason(sb.gate())
+    for pasted in (refusal, "why did this happen?\n\n" + refusal,
+                   *refusal.splitlines()):
+        sb.run(GATE, prompt_payload(pasted))
+        assert is_deny(sb.gate()), pasted
+
+
+@pytest.mark.parametrize("text", ["skip-artl", "  skip-artl\n", "advisor is down.\nskip-artl\n"])
+def test_r3_6_the_token_alone_or_alone_on_a_line_arms_it(sb, text):
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    sb.run(GATE, prompt_payload(text))
+    assert sb.gate() is None
+
+
+# --- r3 item 7: a failed git call read as "no smoke trigger" -------------------
+# Break: `git(...) or ""` -- a timeout or failure becomes an empty answer, and
+# the nixos smoke requirement silently does not apply.
+
+@pytest.mark.parametrize("failing", ["config", "diff"])
+def test_r3_7_a_git_failure_in_the_smoke_check_is_a_problem(nx, monkeypatch, failing):
+    nixos_commit(nx, "home/packages.nix", None)        # no trigger by file name
+    mb = git(nx.work, "merge-base", "origin/main", "HEAD")
+    tip = git(nx.work, "rev-parse", "HEAD")
+    changes = artl_gate.numstat(str(nx.work), mb, tip)
+    real = artl_gate.git
+
+    def flaky(cwd, *args, **kw):
+        return None if args and args[0] == failing else real(cwd, *args, **kw)
+
+    monkeypatch.setattr(artl_gate, "git", flaky)
+    problem, _ = artl_gate.smoke_problem(str(nx.work), mb, tip, changes)
+    assert problem, failing
+
+
+# --- r3 item 8: the e2e grader counted a DENY as an ask -------------------------
+# Break: counting every `permission_denied` event as the ask prompt. Claude
+# Code emits that event, decision_reason_type "rule", for both; only the
+# message differs.
+
+DENY_MSG = "Permission to use Bash with command gh pr create --fill has been denied."
+
+
+def _grade_events(run: Path, scenario: str, messages: list[str | None],
+                  commands: list[str] | None = None) -> tuple[int, str]:
+    run.mkdir(parents=True, exist_ok=True)
+    commands = commands or ["gh pr create --fill"] * len(messages)
+    (run / "commands.txt").write_text("\n".join(commands) + "\n")
+    lines = []
+    for i, (cmd, msg) in enumerate(zip(commands, messages)):
+        lines.append({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": f"t{i}", "name": "Bash", "input": {"command": cmd}}]}})
+        if msg is None:
+            lines.append({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": f"t{i}", "content": "ok"}]}})
+            continue
+        lines.append({"type": "system", "subtype": "permission_denied", "tool_name": "Bash",
+                      "tool_use_id": f"t{i}", "decision_reason_type": "rule", "message": msg})
+        lines.append({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": f"t{i}", "is_error": True, "content": msg}]}})
+    (run / "transcript.jsonl").write_text("".join(json.dumps(l) + "\n" for l in lines))
+    proc = subprocess.run(["bash", str(E2E / scenario / "check.sh"), str(run)],
+                          capture_output=True, text=True, timeout=60)
+    return proc.returncode, proc.stdout
+
+
+def test_r3_8_a_deny_rule_refusal_is_not_graded_as_the_ask_prompt(tmp_path):
+    rc, out = _grade_events(tmp_path / "deny", "artl-gate-hook-removed", [DENY_MSG])
+    assert rc != 0 and "PASS" not in out, out
+    rc, out = _grade_events(tmp_path / "ask", "artl-gate-hook-removed", [ASK_REFUSAL])
+    assert rc == 0, out
+
+
+def test_r3_8_ask_coverage_does_not_count_a_deny_as_asked(tmp_path):
+    battery = json.loads((E2E / "artl-gate-ask-coverage" / "battery.json").read_text())
+    cmds = battery["opens"] + battery["controls"]
+    msgs = [DENY_MSG] * len(battery["opens"]) + [None] * len(battery["controls"])
+    rc, out = _grade_events(tmp_path / "deny", "artl-gate-ask-coverage", msgs, commands=cmds)
+    assert rc == 1 and "not asked" in out, out
+    msgs = [ASK_REFUSAL] * len(battery["opens"]) + [None] * len(battery["controls"])
+    rc, out = _grade_events(tmp_path / "ask", "artl-gate-ask-coverage", msgs, commands=cmds)
+    assert rc == 0, out
+
+
+# --- r3 item 9: reviewed_before_pr took any PASS record --------------------------
+# Break: a grader that credits a suspect record, another branch's or repo's,
+# or one under the agent-writable claude-tasks dir the gate itself ignores.
+
+def _reviewed(tmp_path: Path, record: dict, where: str = "state") -> int:
+    run = tmp_path / "run"
+    (run / "work").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(run / "work")], check=True)
+    rec = {"verdict": "PASS", "suspect": False, "branch": "feat/retry-backoff",
+           "repo": os.path.realpath(run / "work" / ".git"), "ts": 1.0, **record}
+    d = (run / "home/.local/state/claude-pr-open-gate/records/work" if where == "state"
+         else run / "home/.local/state/claude-tasks/work")
+    d.mkdir(parents=True)
+    (d / "artl-evidence.jsonl").write_text(json.dumps(rec) + "\n")
+    (run / "pr-created").write_text("")
+    script = (f'source "{E2E}/_lib/checks.sh" "{run}"; '
+              f'source "{E2E}/_lib/artl_gate_checks.sh"; reviewed_before_pr')
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                          timeout=60).returncode
+
+
+@pytest.mark.parametrize("record,where", [
+    ({"suspect": True}, "state"),
+    ({"branch": "feat/other"}, "state"),
+    ({"repo": "/elsewhere/.git"}, "state"),
+    ({}, "notes"),
+])
+def test_r3_9_reviewed_before_pr_takes_only_records_the_gate_honours(tmp_path, record, where):
+    assert _reviewed(tmp_path, record, where) == 1
+
+
+def test_r3_9_an_honoured_record_still_counts(tmp_path):
+    assert _reviewed(tmp_path, {}) == 0
+
+
+# --- r3 items 10 + 12: the ask rules, against the matcher as MEASURED -----------
+# Break (10): an ask rule on every `gh api` call with a field or a method,
+# which headless refuses -- reads, comments, and `-X GET .../pulls` included.
+# Break (12): a unit model that predicts quote-splitting slips past the
+# matcher; the real one asks for all three spellings below (measured).
+
+@pytest.mark.parametrize("command", [
+    "gh api graphql -f query='{viewer{login}}'",
+    "gh api repos/acme/widget/issues/1/comments -f body=hi",
+    "gh api -X GET repos/acme/widget/pulls",
+    "gh api repos/acme/widget/pulls/1/comments -f body=hi",
+    "gh api -X PATCH repos/acme/widget/pulls/1 -f state=closed",
+    "gh api --method GET 'repos/acme/widget/pulls?state=open'",
+])
+def test_r3_10_api_calls_that_cannot_open_a_pr_are_not_asked(command):
+    assert not _ask_matches(command), command
+
+
+@pytest.mark.parametrize("command", [
+    "gh pr cre\"ate\" --fill",
+    "gh pr cr''eate --fill",
+    "g\\h pr create --fill",
+])
+def test_r3_12_quote_split_spellings_are_asked_as_measured(command):
+    assert _ask_matches(command), command

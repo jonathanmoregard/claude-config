@@ -5,15 +5,37 @@ UserPromptSubmit) and hooks/artl-evidence.py (PostToolUse on Agent, Read and
 SendMessage; SubagentStop). Stdlib only; every git call is bounded.
 
 ENFORCEMENT MODEL
-  settings.json `permissions.ask` covers every PR-open route the gate knows
-  of: `gh pr create` / `gh pr new` however spaced or quoted, any `gh api` call
-  that can POST, GraphQL `createPullRequest`, `gh alias`, and the GitHub MCP
-  create tool. `Bash` is on the allow list, so that ask rule -- not this code
-  -- is what stops an unreviewed PR open: a parser miss, a hook timeout, a
-  crash, or a hook that is not installed all leave the prompt standing.
-  This module's one privilege is to ANSWER that prompt "allow", through a
-  one-shot grant bound to the exact call, after judging that call. It may
-  also deny with a remedy, but nothing depends on the deny firing.
+  The gate is FRICTION, not a security boundary. Its job is to make the
+  ordinary way of opening a PR depend on a review, so that an honest agent
+  reviews first -- not to stop an agent that sets out to evade it.
+
+  What it covers: settings.json `permissions.ask` matches the ordinary
+  spellings of a PR open -- `gh pr create` / `gh pr new` however spaced, and
+  with quotes or backslashes inside the words (measured: `gh pr cre"ate"`,
+  `gh pr cr''eate` and `g\\h pr create` are all asked), a `gh api` POST to a
+  `.../pulls` collection (explicit `-X POST` / `--method POST`, or implied by
+  `-f`/`-F`/`--field`/`--raw-field`/`--input`), a GraphQL body that names
+  `createPullRequest`, `gh alias`, and the GitHub MCP create tool. A `gh api`
+  call that cannot open a PR -- a read, a GraphQL query, a comment -- is NOT
+  asked: headless, an ask is a refusal, and refusing reads is pure cost.
+  (One over-match is accepted: `gh api -X GET .../pulls -f state=open`.)
+  `Bash` is on the allow list, so for these spellings the ask rule -- not
+  this code -- is what stops an unreviewed PR open: a parser miss, a hook
+  timeout, a crash, or a hook that is not installed all leave the prompt.
+
+  What it does NOT reach (measured or by construction; each takes intent,
+  and none is in scope): curl or any other HTTP client to the REST API; a PR
+  opened from a script file (`bash ./open.sh`), a git hook or a gh alias's
+  later use; argv built by an interpreter; a variable spelling (`${g}h pr
+  create`, `EP=.../pulls; gh api $EP ...` -- the matcher expands nothing); a
+  GraphQL mutation read from a file (`-F query=@m.graphql`); a second PR
+  open in the same command hidden from the scanner after a judged one; and
+  `git push origin HEAD:reviewed && gh pr create --head reviewed`.
+
+  This module's one privilege is to ANSWER the prompt "allow", through a
+  one-shot grant bound to the exact call from the exact cwd and spent only
+  on the branch tip it judged; any later deny of the same call revokes it.
+  It may also deny with a remedy, but nothing depends on the deny firing.
   So every judgement here is built to be wrong only toward a prompt: when the
   gate cannot be sure what a command opens, or against what, it refuses to
   grant (and says why).
@@ -353,8 +375,11 @@ API_VALUE_FLAGS = {"-H", "--header", "-q", "--jq", "-t", "--template", "-p",
 REST_PULLS = re.compile(r"^repos/([^/]+)/([^/]+)/pulls/?$")
 HEREDOC = re.compile(r"(?<!<)<<-?[ \t]*(\\?)(['\"]?)([A-Za-z_][\w-]*)\2")
 ARITH = re.compile(r"\(\(.*?\)\)")
-GH_ENV = re.compile(r"^(GH_REPO|GH_HOST|GH_ENTERPRISE_TOKEN|GITHUB_TOKEN|GH_TOKEN)=(.*)$",
-                    re.S)
+GH_ENV = re.compile(r"^(GH_REPO|GH_HOST|GH_ENTERPRISE_TOKEN|GITHUB_TOKEN|GH_TOKEN"
+                    r"|GIT_DIR|GIT_WORK_TREE)=(.*)$", re.S)
+# Set in the PR open's own segment, these make gh open from somewhere other
+# than the checkout the gate judges: another host, or another repository.
+OPEN_RETARGET = {"GH_HOST", "GIT_DIR", "GIT_WORK_TREE"}
 
 
 def strip_heredocs(cmd: str) -> str:
@@ -440,15 +465,44 @@ def _program(words: list[str]) -> tuple[str | None, list[str]]:
     return None, []
 
 
-def _opt_value(args: list[str], short: str | None, long: str) -> str | None:
-    for i, a in enumerate(args):
-        if a == long or (short and a == short):
-            return args[i + 1] if i + 1 < len(args) else ""
-        if a.startswith(long + "="):
-            return a.split("=", 1)[1]
-        if short and a.startswith(short) and len(a) > len(short) and not a.startswith("--"):
-            return a[len(short):]
-    return None
+# `gh pr create` flags that take a value (gh 2.103.2 `--help`, plus the
+# inherited -R/--repo). Every other flag is boolean. A value is read as a
+# value whatever it looks like: pflag reads `--body -Hmain` as the body
+# "-Hmain", so scanning every word for `-H...` judges a branch gh never opens.
+PR_CREATE_VALUE_SHORT = {"a": "assignee", "B": "base", "b": "body", "F": "body-file",
+                         "H": "head", "l": "label", "m": "milestone", "p": "project",
+                         "r": "reviewer", "T": "template", "t": "title", "R": "repo"}
+PR_CREATE_VALUE_LONG = set(PR_CREATE_VALUE_SHORT.values()) | {"attach", "recover"}
+
+
+def _pflag_values(args: list[str], shorts: dict[str, str], longs: set[str]) -> dict[str, str]:
+    """{long flag name: value} as pflag parses ARGS; the last occurrence wins.
+    Boolean shorthands may be grouped (`-dH main`); `--` ends the flags."""
+    out: dict[str, str] = {}
+    i = 0
+    while i < len(args):
+        a = args[i]
+        nxt = args[i + 1] if i + 1 < len(args) else ""
+        i += 1
+        if a == "--":
+            break
+        if a.startswith("--"):
+            name, eq, val = a[2:].partition("=")
+            if name in longs:
+                if not eq:
+                    val, i = nxt, i + 1
+                out[name] = val
+        elif a.startswith("-") and len(a) > 1:
+            for j, ch in enumerate(a[1:], 1):
+                if ch in shorts:
+                    rest = a[j + 1:]
+                    if rest.startswith("="):
+                        rest = rest[1:]
+                    elif not rest:
+                        rest, i = nxt, i + 1
+                    out[shorts[ch]] = rest
+                    break
+    return out
 
 
 def _gh_api(args: list[str]) -> dict | None:
@@ -518,16 +572,18 @@ def _gh_api(args: list[str]) -> dict | None:
         call["repo"] = f"{owner}/{repo}"
     if host and host.lower() not in ("github.com", "api.github.com"):
         call["problem"] = f"the call names another GitHub host ({host})"
+    # With --input the file IS the body and every field flag goes to the
+    # query string (`gh api --help`), so the body's head is what opens.
     head = fields.get("head", "")
-    if head is None:
-        call["problem"] = "the head field is read from a file (-F head=@...)"
-    elif head:
-        call["head"] = head
-    elif inputs:
+    if inputs:
         if inputs[-1] in ("", "-"):
             call["problem"] = "the request body is read from stdin, so its head is unknown"
         else:
             call["input"] = inputs[-1]
+    elif head is None:
+        call["problem"] = "the head field is read from a file (-F head=@...)"
+    elif head:
+        call["head"] = head
     else:
         call["problem"] = "the call names no head branch"
     return call
@@ -541,10 +597,9 @@ def _field(fields: dict, flag: str, kv: str | None) -> None:
 
 
 def _gh_pr_create(args: list[str]) -> dict:
-    head = _opt_value(args, "-H", "--head")
-    repo = _opt_value(args, "-R", "--repo")
-    return {"kind": "gh-pr-create", "head": head or None, "repo": repo or None,
-            "input": None, "problem": None}
+    flags = _pflag_values(args, PR_CREATE_VALUE_SHORT, PR_CREATE_VALUE_LONG)
+    return {"kind": "gh-pr-create", "head": flags.get("head") or None,
+            "repo": flags.get("repo") or None, "input": None, "problem": None}
 
 
 def _pre_unsafe(seg: dict) -> tuple[str | None, bool, bool]:
@@ -578,9 +633,16 @@ def _pre_unsafe(seg: dict) -> tuple[str | None, bool, bool]:
     if sub not in GIT_READ:
         return f"it runs `git {sub}` before opening the PR", False, False
     positional = [a for a in rest if not a.startswith("-")]
+    # `git push origin main:feat/x` publishes a branch other than the one
+    # checked out, and the gate judges the checkout. This catches only a
+    # named source ref; `HEAD:<other>` pushes the checked-out commits and
+    # passes -- pairing that with `--head <other>` to open a different
+    # branch than the one reviewed takes intent, which this gate does not
+    # try to stop (see the ENFORCEMENT MODEL).
     if sub == "push" and any(":" in r and r.split(":", 1)[0].lstrip("+") not in ("HEAD", r.split(":", 1)[1])
                              for r in positional[1:]):
-        return "it pushes another ref to the PR branch before opening", False, False
+        return ("it pushes a ref other than the checked-out HEAD under another name "
+                "before opening, and the gate judges only the checkout"), False, False
     if sub == "branch" and positional:
         return "it runs `git branch` with arguments before opening the PR", False, False
     if sub == "remote" and positional and positional[0] not in ("show", "get-url"):
@@ -589,6 +651,30 @@ def _pre_unsafe(seg: dict) -> tuple[str | None, bool, bool]:
                                    for a in rest):
         return "it writes git config before opening the PR", False, False
     return None, False, False
+
+
+def _open_env(prefix: list[str]) -> tuple[str | None, str | None]:
+    """(problem, chdir) from the words that precede a PR open in its own
+    segment -- its environment and its wrappers. The same variables in an
+    EARLIER segment are _pre_unsafe's; here they apply to the open itself."""
+    env_seen = False
+    chdir = None
+    for i, w in enumerate(prefix):
+        m = GH_ENV.match(w)
+        if m and m.group(1) in OPEN_RETARGET:
+            return (f"it sets {m.group(1)} for the PR open, so gh would not open the "
+                    f"branch of the checkout the gate judges"), None
+        if os.path.basename(w) == "env":
+            env_seen = True
+        elif env_seen and w in ("-C", "--chdir"):
+            chdir = prefix[i + 1] if i + 1 < len(prefix) else ""
+        elif env_seen and w.startswith("--chdir="):
+            chdir = w.split("=", 1)[1]
+        elif env_seen and w.startswith("-C") and not w.startswith("--"):
+            chdir = w[2:]
+    if chdir == "":
+        return "it runs the PR open under `env -C` with no directory", None
+    return None, chdir
 
 
 def _scan(cmd: str, depth: int, cwd: str | None) -> list[dict]:
@@ -609,24 +695,38 @@ def _scan(cmd: str, depth: int, cwd: str | None) -> list[dict]:
     for seg in _segments(tokens):
         words = seg["words"]
         found: list[dict] = []
+        first = None                       # index of the first word that opens
         for k, w in enumerate(words):
             b = os.path.basename(w)
             rest = words[k + 1:]
+            here: list[dict] = []
             if b == "gh" and rest[:1] == ["api"]:
                 hit = _gh_api(rest[1:])
                 if hit:
-                    found.append(hit)
+                    here.append(hit)
             elif b == "gh" and len(rest) > 1 and rest[0] == "pr" and rest[1] in ("create", "new"):
-                found.append(_gh_pr_create(rest[2:]))
+                here.append(_gh_pr_create(rest[2:]))
             elif b in SHELLS and "-c" in rest and depth < 3:
                 j = rest.index("-c")
                 if j + 1 < len(rest):
-                    found.extend(_scan(rest[j + 1], depth + 1, cwd))
+                    here.extend(_scan(rest[j + 1], depth + 1, cwd))
             elif b == "eval" and rest and depth < 3:
-                found.extend(_scan(" ".join(rest), depth + 1, cwd))
+                here.extend(_scan(" ".join(rest), depth + 1, cwd))
             elif ("$(" in w or "`" in w) and depth < 3:
                 inner = w.replace("$(", " ( ").replace("`", " ; ")
-                found.extend(_scan(inner, depth + 1, cwd))
+                here.extend(_scan(inner, depth + 1, cwd))
+            if here:
+                first = k if first is None else first
+                problem, chdir = _open_env(words[:k])
+                for hit in here:
+                    if problem and not hit.get("problem"):
+                        hit["problem"] = problem
+                    if chdir and hit.get("cwd", cwd) == cwd:
+                        hit["cwd"] = os.path.join(cwd, chdir) if cwd else chdir
+                found.extend(here)
+        # Only words BEFORE the open are its environment; `--title GH_REPO=x`
+        # is a title.
+        for w in words[:first]:
             m = GH_ENV.match(w)
             if m and m.group(1) == "GH_REPO" and m.group(2):
                 env_repo = m.group(2)
@@ -706,13 +806,16 @@ def pr_open_call(tool_name: str, tool_input: object) -> dict | None:
     return call
 
 
-def call_key(tool_name: str, tool_input: dict) -> str:
-    """What a grant is bound to: the exact command, or the exact MCP input."""
+def call_key(tool_name: str, tool_input: dict, cwd: object = "") -> str:
+    """Where a grant is filed: the exact command (or exact MCP input) run
+    from the exact session cwd. The same command from another checkout is
+    another call. The tip the grant was judged on is checked when it is
+    spent (pr-open-gate.on_permission)."""
     if tool_name == "Bash":
         body = str(tool_input.get("command", ""))
     else:
         body = json.dumps(tool_input, sort_keys=True)
-    return sha256(tool_name + "\0" + body)
+    return sha256(tool_name + "\0" + body + "\0" + str(cwd or ""))
 
 
 GITHUB_URL = re.compile(r"github\.com[:/]+([^/\s]+)/([^/\s]+?)(?:\.git)?/?$", re.I)
@@ -1020,19 +1123,28 @@ NA_CLAIM = re.compile(r"^n/?a\b\s*[:—–-]+\s*(\S.{3,})", re.I | re.S)
 ARTEFACT = re.compile(r"(?<![\w$])((?:~|\.{1,2})?/?[\w.@+-]+(?:/[\w.@+-]+)+)")
 
 
-def is_nixos_config(top: str) -> bool:
-    urls = git(top, "config", "--get-regexp", r"^remote\..*\.url$") or ""
+def is_nixos_config(top: str) -> bool | None:
+    """None when the remotes cannot be read. The gate reaches this only after
+    `git ls-remote origin` worked, so a remote URL exists and an empty
+    answer is a failed (or timed-out) git call, not "no remotes"."""
+    urls = git(top, "config", "--get-regexp", r"^remote\..*\.url$")
+    if urls is None:
+        return None
     return any(NIXOS_REMOTE.search(line.split(" ", 1)[-1]) for line in urls.splitlines())
 
 
 def smoke_triggers(top: str, mb: str, tip: str,
-                   changes: list[tuple[str, int | None]]) -> list[str]:
+                   changes: list[tuple[str, int | None]]) -> list[str] | None:
+    """What makes this change need a smoke claim; None when the patch could
+    not be read -- which must not pass for "nothing needs one"."""
     hits = [p for p, _ in changes
             if not p.startswith(("tests/", "docs/")) and SMOKE_PATH.search(p.rsplit("/", 1)[-1])]
     if hits:
         return hits
     patch = git(top, "diff", "--no-renames", "-U0", mb, tip, "--", ".",
-                ":(exclude)tests", ":(exclude)docs") or ""
+                ":(exclude)tests", ":(exclude)docs")
+    if patch is None:
+        return None
     added = "\n".join(l for l in patch.splitlines() if l.startswith("+") and not l.startswith("+++"))
     m = SMOKE_CONTENT.search(added)
     return [f"added line with {m.group(0)}"] if m else []
@@ -1062,9 +1174,16 @@ def smoke_field(message: str) -> str | None:
 def smoke_problem(top: str, mb: str, tip: str,
                   changes: list[tuple[str, int | None]]) -> tuple[str | None, dict | None]:
     """(problem or None, exemption-log entry or None) for nixos-config."""
-    if not is_nixos_config(top):
+    nixos = is_nixos_config(top)
+    if nixos is None:
+        return (f"could not read the remotes of {top} (git failed or timed out), so "
+                f"whether the nixos-config smoke check applies is unknown"), None
+    if not nixos:
         return None, None
     triggers = smoke_triggers(top, mb, tip, changes)
+    if triggers is None:
+        return (f"could not read the diff of {top} (git failed or timed out), so "
+                f"whether it needs an interactive smoke claim is unknown"), None
     if not triggers:
         return None, None
     why = ", ".join(triggers[:5])

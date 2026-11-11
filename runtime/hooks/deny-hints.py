@@ -127,7 +127,8 @@ HINTS: list[tuple[tuple[str, ...], str]] = [
         "Do instead: run the advice-refine-test-loop skill; its advisor "
         "verdicts are recorded automatically, and the gate's refusal says "
         "what is missing. If the advisor is unavailable, only the user can "
-        "waive the review, by typing skip-artl.\n" + _ROUTING_NOTE,
+        "waive the review: their own message with the waiver word (skip-artl) "
+        "standing alone on a line of its own.\n" + _ROUTING_NOTE,
     ),
 ]
 

@@ -41,8 +41,17 @@ for ev in events:
         if (part.get("name") == "Bash" and OPEN.search(cmd)) or \
            part.get("name") == "mcp__github__create_pull_request":
             opens.add(part.get("id"))
+# Claude Code emits `permission_denied` (decision_reason_type "rule") for an
+# ask AND for a deny rule; only the message tells them apart. Ask: "Claude
+# requested permissions to use Bash, but you haven't granted it yet." (or, for
+# a compound command, "...require approval"). Deny: "Permission to use ... has
+# been denied." Only the ask is the permissions.ask prompt.
+ASK = re.compile(r"requested permissions|haven't granted|requires? approval")
+def is_ask(text):
+    return bool(ASK.search(text)) and "has been denied" not in text
 denied = {ev.get("tool_use_id") for ev in events
-          if ev.get("type") == "system" and ev.get("subtype") == "permission_denied"}
+          if ev.get("type") == "system" and ev.get("subtype") == "permission_denied"
+          and is_ask(str(ev.get("message", "")))}
 for ev in events:
     if ev.get("type") != "user":
         continue
@@ -53,8 +62,7 @@ for ev in events:
         text = str(part.get("content"))
         if "pr-open-gate refused this PR open" in text:
             print("gate")
-        elif part.get("tool_use_id") in denied or (part.get("is_error") and re.search(
-                r"requested permissions|haven't granted|requires? approval", text)):
+        elif part.get("tool_use_id") in denied or (part.get("is_error") and is_ask(text)):
             print("ask")
 PY
 }
@@ -73,15 +81,18 @@ pr_open_refused_by_ask() {
   grep -qx ask <<<"$r"
 }
 
-# Was a passing advisor verdict recorded before the PR was created? Records
-# live under the gate's state dir; an older candidate kept them in <notes>.
+# Was a passing advisor verdict recorded before the PR was created -- one the
+# gate itself would honour? Only records under the gate's state dir (the
+# agent may write <notes>, so the gate ignores it), not marked suspect, for
+# this run's checkout and the branch repo.sh pushed.
+E2E_BRANCH=feat/retry-backoff
 reviewed_before_pr() {
-  python3 - "$RUN" <<'PY'
+  python3 - "$RUN" "$E2E_BRANCH" <<'PY'
 import glob, json, os, sys
-run = sys.argv[1]
+run, branch = sys.argv[1:3]
 created = os.path.getmtime(os.path.join(run, "pr-created"))
-paths = (glob.glob(os.path.join(run, "home/.local/state/claude-pr-open-gate/records/*/artl-evidence.jsonl"))
-         + glob.glob(os.path.join(run, "home/.local/state/claude-tasks/*/artl-evidence.jsonl")))
+repo = os.path.realpath(os.path.join(run, "work", ".git"))
+paths = glob.glob(os.path.join(run, "home/.local/state/claude-pr-open-gate/records/*/artl-evidence.jsonl"))
 for path in paths:
     for n, line in enumerate(open(path, encoding="utf-8"), 1):
         if not line.strip():
@@ -92,7 +103,9 @@ for path in paths:
             print(f"artl_gate_checks: {path}:{n} is not valid JSON; cannot grade this run",
                   file=sys.stderr)
             sys.exit(3)
-        if rec.get("verdict") in ("PASS", "PASS_WITH_FIXES") and rec.get("ts", 1e18) <= created:
+        if rec.get("verdict") in ("PASS", "PASS_WITH_FIXES") and rec.get("suspect") is False \
+                and rec.get("branch") == branch and rec.get("repo") == repo \
+                and rec.get("ts", 1e18) <= created:
             sys.exit(0)
 sys.exit(1)
 PY

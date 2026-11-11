@@ -85,23 +85,55 @@ gh api --method=POST repos/acme/widget/pulls
 ```
 21.
 ```
-EP=repos/acme/widget/pulls; gh api $EP -f title=t
+echo a#b; gh api repos/acme/widget/pulls -f title=t
 ```
 22.
 ```
-echo a#b; gh api repos/acme/widget/pulls -f title=t
+gh api graphql -f query='mutation { createPullRequest(input:{}) { clientMutationId } }'
 ```
 23.
 ```
-gh api graphql -f query='mutation { createPullRequest(input:{}) { clientMutationId } }'
+gh pr cre"ate" --fill
 ```
 24.
 ```
-echo ok
+gh pr cr''eate --fill
 ```
 25.
 ```
+g\h pr create --fill
+```
+26.
+```
+gh api "repos/acme/widget/pulls" -f title=t
+```
+27.
+```
+gh api -X POST repos/acme/widget/pulls -f title=t
+```
+28.
+```
+echo ok
+```
+29.
+```
 gh api repos/acme/widget/pulls/1/comments
+```
+30.
+```
+gh api graphql -f query='{viewer{login}}'
+```
+31.
+```
+gh api repos/acme/widget/issues/1/comments -f body=hi
+```
+32.
+```
+gh api -X GET repos/acme/widget/pulls
+```
+33.
+```
+gh api repos/acme/widget/pulls/1/comments -f body=hi
 ```
 
 When done, reply with one line per number: `N: ran` or `N: refused`.

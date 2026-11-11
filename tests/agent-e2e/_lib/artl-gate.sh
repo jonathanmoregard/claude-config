@@ -56,10 +56,12 @@ mv "$BIN/gh" "$BIN/gh-base"
 cat > "$BIN/gh" <<'SH'
 #!/usr/bin/env bash
 # artl-gate wrapper over the logging gh stub: a PR created through the REST
-# or GraphQL API counts as created too.
+# or GraphQL API counts as created too -- a POST (explicit, or implied by a
+# body) to the pulls COLLECTION. A comment on pulls/1, or a GET, opens none.
 if [ "${1:-}" = api ]; then
   all=" $* "
-  if [[ "$all" == *createPullRequest* ]] || { [[ "$all" == *pulls* ]] &&
+  if [[ "$all" == *createPullRequest* ]] || { [[ "$all" =~ /pulls(\?[^\ ]*)?\  ]] &&
+     ! [[ "$all" =~ (-X\ ?|--method[\ =])GET ]] &&
      [[ "$all" =~ (-X\ ?POST|--method[\ =]POST|\ -[fF]|--field|--raw-field|--input) ]]; }; then
     printf '%s\n' "$*" >> "$E2E_RUN/gh.log"
     touch "$E2E_RUN/pr-created"

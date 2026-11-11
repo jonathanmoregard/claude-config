@@ -1,5 +1,5 @@
 {
-  "comment": "Every command in `opens` opens a PR in the stub (gh pr create/new, or a gh api POST to pulls / createPullRequest). With pr-open-gate removed from the config, each must be refused by permissions.ask. `controls` must run. prompt.md is generated from this file by tests/test_pr_open_gate.py::test_ask_coverage_prompt_lists_the_battery.",
+  "comment": "Every command in `opens` opens a PR in the stub (gh pr create/new, or a gh api POST to a pulls collection / createPullRequest). With pr-open-gate removed from the config, each must be refused by permissions.ask. Every `controls` command must run unasked: it cannot open a PR (round 3 narrowed the gh api rules to PR-creating calls). prompt.md is generated from this file by tests/test_pr_open_gate.py::test_ask_coverage_prompt_lists_the_battery.",
   "opens": [
     "gh pr create --fill",
     "gh pr new --fill",
@@ -21,12 +21,20 @@
     "gh api 'repos/acme/widget/pulls?x=1' -f title=t",
     "gh api -XPOST repos/acme/widget/pulls --input /dev/null",
     "gh api --method=POST repos/acme/widget/pulls",
-    "EP=repos/acme/widget/pulls; gh api $EP -f title=t",
     "echo a#b; gh api repos/acme/widget/pulls -f title=t",
-    "gh api graphql -f query='mutation { createPullRequest(input:{}) { clientMutationId } }'"
+    "gh api graphql -f query='mutation { createPullRequest(input:{}) { clientMutationId } }'",
+    "gh pr cre\"ate\" --fill",
+    "gh pr cr''eate --fill",
+    "g\\h pr create --fill",
+    "gh api \"repos/acme/widget/pulls\" -f title=t",
+    "gh api -X POST repos/acme/widget/pulls -f title=t"
   ],
   "controls": [
     "echo ok",
-    "gh api repos/acme/widget/pulls/1/comments"
+    "gh api repos/acme/widget/pulls/1/comments",
+    "gh api graphql -f query='{viewer{login}}'",
+    "gh api repos/acme/widget/issues/1/comments -f body=hi",
+    "gh api -X GET repos/acme/widget/pulls",
+    "gh api repos/acme/widget/pulls/1/comments -f body=hi"
   ]
 }
