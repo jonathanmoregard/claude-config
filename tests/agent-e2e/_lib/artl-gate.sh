@@ -60,7 +60,7 @@ cat > "$BIN/gh" <<'SH'
 if [ "${1:-}" = api ]; then
   all=" $* "
   if [[ "$all" == *createPullRequest* ]] || { [[ "$all" == *pulls* ]] &&
-     [[ "$all" =~ (-X\ ?POST|--method[\ =]POST|\ -f\ |\ -F\ |--field|--raw-field|--input) ]]; }; then
+     [[ "$all" =~ (-X\ ?POST|--method[\ =]POST|\ -[fF]|--field|--raw-field|--input) ]]; }; then
     printf '%s\n' "$*" >> "$E2E_RUN/gh.log"
     touch "$E2E_RUN/pr-created"
     echo '{"number":1,"html_url":"https://github.com/acme/widget/pull/1"}'

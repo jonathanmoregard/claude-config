@@ -1,0 +1,32 @@
+{
+  "comment": "Every command in `opens` opens a PR in the stub (gh pr create/new, or a gh api POST to pulls / createPullRequest). With pr-open-gate removed from the config, each must be refused by permissions.ask. `controls` must run. prompt.md is generated from this file by tests/test_pr_open_gate.py::test_ask_coverage_prompt_lists_the_battery.",
+  "opens": [
+    "gh pr create --fill",
+    "gh pr new --fill",
+    "gh pr \"create\" --fill",
+    "gh  pr  create --fill",
+    "timeout 9 gh pr create --fill",
+    "GH_PROMPT_DISABLED=1 gh pr create --fill",
+    "{ gh pr create --fill; }",
+    "if true; then gh pr create --fill; fi",
+    "bash -c 'gh pr create --fill'",
+    "echo \"$(gh pr create --fill)\"",
+    "xargs gh pr create < /dev/null",
+    "x=$((1<<2))\ngh pr create --fill",
+    "python3 -c \"import subprocess; subprocess.run(['gh','pr','create','--fill'])\"",
+    "gh api repos/acme/widget/pulls -f title=t -f head=feat/retry-backoff -f base=main",
+    "gh api repos/acme/widget/pulls --field=title=t",
+    "gh api repos/acme/widget/pulls -ftitle=t",
+    "gh api https://api.github.com/repos/acme/widget/pulls -f title=t",
+    "gh api 'repos/acme/widget/pulls?x=1' -f title=t",
+    "gh api -XPOST repos/acme/widget/pulls --input /dev/null",
+    "gh api --method=POST repos/acme/widget/pulls",
+    "EP=repos/acme/widget/pulls; gh api $EP -f title=t",
+    "echo a#b; gh api repos/acme/widget/pulls -f title=t",
+    "gh api graphql -f query='mutation { createPullRequest(input:{}) { clientMutationId } }'"
+  ],
+  "controls": [
+    "echo ok",
+    "gh api repos/acme/widget/pulls/1/comments"
+  ]
+}
