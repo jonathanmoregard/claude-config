@@ -1484,6 +1484,8 @@ def test_r3_4_a_grant_does_not_answer_a_request_from_another_checkout(sb, tmp_pa
     sb.commit("docs/guide.md", "hello\n")               # exempt: the gate grants here
     assert sb.gate("gh pr create --fill") is None
     assert not allowed(sb.run(GATE, perm_from(sb, "gh pr create --fill", other.work)))
+    # ...and that stray request did not spend the grant of the checkout it judged.
+    assert allowed(sb.run(GATE, sb.perm("gh pr create --fill")))
 
 
 def test_r3_4_a_deny_revokes_the_grant_an_earlier_pass_minted(sb):
