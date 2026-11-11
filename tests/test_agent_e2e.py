@@ -666,3 +666,26 @@ def test_a_grader_that_dies_is_not_a_finding(tmp_path):
     _, _, verdicts = _run(tmp_path, sc, claude)
     assert verdicts[0]["verdict"] == "INCONCLUSIVE", verdicts[0].get("why")
     assert "without a verdict" in verdicts[0]["why"]
+
+
+ARTL_GRADE = SCENARIOS / "artl-two-blind-reviewers/grade.py"
+
+
+@pytest.mark.parametrize("prompt,want", [
+    # The dispatcher may name a class by id alone, without pasting its title
+    # or Hunt line. `norm()` lowercases the prompt, so an uppercase id pattern
+    # never matched and these graded as "not picked".
+    ("Review the diff and report findings. Hunt classes: D6, G9.", "D6,G9"),
+    ("Review this. Apply d6 to the proxy rules.", "D6"),
+    # An id inside a longer token is not a pick.
+    ("Review the diff; report findings. See ticket D60 and ID6.", "-"),
+])
+def test_artl_grader_matches_a_bare_class_id(tmp_path, prompt, want):
+    dispatch = {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "name": "Agent", "id": "t1",
+         "input": {"prompt": prompt}}]}}
+    path = tmp_path / "transcript.jsonl"
+    path.write_text(json.dumps(dispatch) + "\n")
+    r = subprocess.run([sys.executable, str(ARTL_GRADE), str(path)],
+                       capture_output=True, text=True, check=True)
+    assert r.stdout.split()[4] == want, r.stdout

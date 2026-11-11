@@ -3,7 +3,7 @@
 Reviewer B hunts a NAMED subset of these, never the whole list. Pick the
 classes whose `When` the diff actually satisfies, and paste each chosen class's
 `Hunt` line into the prompt verbatim. A class nobody picked is not a gap: a
-reviewer given all fourteen lenses applies none of them.
+reviewer given all fifteen lenses applies none of them.
 
 ## Reviewer B prompt
 
@@ -69,6 +69,17 @@ side can emit that the other rejects, truncates, or silently reinterprets.
 **Hunt:** Treat comments, doc strings, test names, commit messages and PR text
 as claims, never as evidence. Where the code and the claim disagree, report the
 code. Where a test's name promises more than its assertions check, report that.
+
+### D6 — Trust boundary moved
+
+**When:** the diff moves which process, service, proxy or layer decides who
+may do something — a new or changed route, socket, header, cookie, token,
+service split, proxy rule, or a check moved from one side to the other.
+**Hunt:** For each value the moved decision rests on, name who chooses it now
+and whether a party on the less-trusted side can forge, replay or strip it.
+List every check the old side made and show where the new side still makes it.
+Name the test that crosses the real boundary (proxy, socket peer, real
+database rows); a check only a mock exercises counts as untested.
 
 ## Design classes
 

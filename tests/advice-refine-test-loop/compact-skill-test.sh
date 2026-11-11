@@ -106,7 +106,7 @@ fi
 
 # The agreed class set. A class deleted silently is coverage lost with no
 # reviewer-visible trace; removing one is a decision, so it edits this list.
-for id in D1 D2 D3 D4 D5 G1 G2 G3 G4 G5 G6 G7 G8 G9; do
+for id in D1 D2 D3 D4 D5 D6 G1 G2 G3 G4 G5 G6 G7 G8 G9; do
   grep -Eq "^### $id — " "$hunts" || {
     echo "FAIL: hunt-classes.md is missing class $id"
     exit 1
