@@ -575,19 +575,25 @@ def computed_exemption(changes: list[tuple[str, int | None]]) -> str | None:
     return None
 
 
+def tree_rows(top: str, tree: object, tip: str, cache: dict) -> dict[str, int] | None:
+    """{path: lines changed} from a reviewed tree to the tip; None if unknown."""
+    if not isinstance(tree, str) or not re.fullmatch(r"[0-9a-f]{40,64}", tree):
+        return None
+    if tree not in cache:
+        rows = numstat(top, tree, tip)
+        cache[tree] = None if rows is None else {
+            p: (DRIFT_LIMIT + 1 if n is None else n) for p, n in rows}
+    return cache[tree]
+
+
 def drift(top: str, tree: object, tip: str, cache: dict, pr_paths: set[str]) -> int | None:
     """Lines changed between the reviewed tree and the tip, counted only on the
     PR's own paths. A path outside the PR diff is identical at the tip and the
     merge base, so a difference there is untracked build junk the snapshot
     picked up (measured: __pycache__/*.pyc) or reviewed work since reverted --
     neither is unreviewed code in the PR."""
-    if not isinstance(tree, str) or not re.fullmatch(r"[0-9a-f]{40,64}", tree):
-        return None
-    if tree not in cache:
-        rows = numstat(top, tree, tip)
-        cache[tree] = None if rows is None else line_total(
-            [r for r in rows if r[0] in pr_paths], DRIFT_LIMIT + 1)
-    return cache[tree]
+    rows = tree_rows(top, tree, tip, cache)
+    return None if rows is None else sum(n for p, n in rows.items() if p in pr_paths)
 
 
 def evidence_problem(records: list[dict], info: dict, branch: str, tip: str,
@@ -612,13 +618,17 @@ def evidence_problem(records: list[dict], info: dict, branch: str, tip: str,
         return (f"the code has drifted {'an unknown number of' if d is None else d} "
                 f"line(s) from the tree the latest passing review saw "
                 f"(limit {DRIFT_LIMIT}); the review no longer describes this diff")
+    # Coverage is per file: a file counts as reviewed when some non-suspect
+    # review named it and THAT file has changed at most DRIFT_LIMIT lines since.
+    # Measured in e2e: after a round of fixes the follow-up review names only
+    # the files it touched, and whole-tree drift would orphan the rest.
     covered: set[str] = set()
     for r in mine:
-        if r.get("suspect"):
+        rows = None if r.get("suspect") else tree_rows(info["top"], r.get("tree"), tip, cache)
+        if rows is None:
             continue
-        rd = drift(info["top"], r.get("tree"), tip, cache, pr_paths)
-        if rd is not None and rd <= DRIFT_LIMIT:
-            covered.update(f for f in r.get("files") or [] if isinstance(f, str))
+        covered.update(f for f in r.get("files") or []
+                       if isinstance(f, str) and rows.get(f, 0) <= DRIFT_LIMIT)
     missing = sorted(p for p, _ in changes if p not in covered)
     if missing:
         shown = ", ".join(missing[:15]) + (" …" if len(missing) > 15 else "")

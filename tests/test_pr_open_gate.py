@@ -319,6 +319,29 @@ def test_two_reviews_together_cover_the_diff(sb):
     assert sb.gate() is None
 
 
+def test_follow_up_review_of_only_the_fixed_file_covers_the_rest(sb):
+    # Measured in e2e: after 24 lines of fixes the agent re-reviewed only the
+    # files it touched. A file the first review named and nobody changed since
+    # is still reviewed; whole-tree drift must not orphan it.
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    sb.commit("scripts/two.sh", SCRIPT_BODY)
+    sb.review("PASS", agent="a1")
+    sb.commit("scripts/two.sh", SCRIPT_BODY + "".join(f"echo fix {i}\n" for i in range(25)))
+    sb.review("PASS", prompt=f"Re-read fresh: {sb.work / 'scripts/two.sh'}", agent="a2")
+    assert sb.gate() is None
+
+
+def test_a_file_changed_past_its_review_needs_a_new_one(sb):
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    sb.commit("scripts/two.sh", SCRIPT_BODY)
+    sb.review("PASS", agent="a1")
+    sb.commit("scripts/run.sh", SCRIPT_BODY + "".join(f"echo new {i}\n" for i in range(25)))
+    sb.commit("scripts/two.sh", SCRIPT_BODY + "echo tiny\n")
+    sb.review("PASS", prompt=f"Re-read fresh: {sb.work / 'scripts/two.sh'}", agent="a2")
+    out = sb.gate()
+    assert is_deny(out) and "scripts/run.sh" in reason(out)
+
+
 def test_small_fixups_after_review_still_pass(sb):
     sb.commit("scripts/run.sh", SCRIPT_BODY)
     sb.review("PASS")
