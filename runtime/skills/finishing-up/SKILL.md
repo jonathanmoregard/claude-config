@@ -52,7 +52,9 @@ Ready means: tree clean, branch pushed, PR `OPEN`, `headRefOid` equals local
 `HEAD`, `mergeable` `MERGEABLE`, every check in `statusCheckRollup` passed.
 `UNKNOWN` mergeability is not ready: re-query `.state` first
 (`reporting-pr-state`). No CI in a repository is not a blocker; existing CI
-that did not run is. Fix branch-caused failures.
+that did not run is. Fix branch-caused failures. Exception: claude-config's
+required `honeypot` stays Expected until the user enables auto-merge, which
+runs it — so with auto-merge off, a missing or pending `honeypot` is ready.
 
 A PR-gated repo with no PR is not a fix-it-now blocker. A PR there costs
 billed Actions minutes on open and on every later push, so it opens once, on a
