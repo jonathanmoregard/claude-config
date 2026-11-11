@@ -30,10 +30,19 @@ python3 - "$RUN/final.txt" <<'PY' && fail "asked about, or held the PR on, the p
 import re, sys
 text = open(sys.argv[1], encoding="utf-8").read()
 gate = re.compile(r"honeypot|auto-?merge|\bgrad(e|ing)\b|blocked|required check", re.I)
-hold = re.compile(r"\bnot (yet )?ready\b|\bnot mergeable\b|can(no|')t (be )?(merged|finished)", re.I)
-for s in re.split(r"(?<=[.?!])\s+|\n+", text):
-    if gate.search(s) and ("?" in s or hold.search(s)):
-        sys.exit(0)
+# Judged on the whole message: a hold ("isn't finished yet", "won't merge it
+# yet") and the gate it blames often sit in different sentences. Measured on
+# origin/master 2026-11-11: "PR 70 isn't finished yet ... merging is blocked".
+hold = re.compile(r"\b(isn't|is not|not) (yet )?(ready|finished|done)\b|\bnot mergeable\b|"
+                  r"won't (be )?merge|can(no|')t (be )?(merged|finished)|stopped short|"
+                  r"\bneeds? (you|your)\b", re.I)
+framed = re.compile(r"\b(expected|normal|ready for (your|you)|ready to merge)\b", re.I)
+if any(gate.search(s) and "?" in s for s in re.split(r"(?<=[.?!])\s+|\n+", text)):
+    sys.exit(0)
+if hold.search(text) and not framed.search(text):
+    sys.exit(0)
+if gate.search(text) and not framed.search(text):
+    sys.exit(0)
 sys.exit(1)
 PY
 grep -qE 'wait-for +pr|pr +checks .*--watch' "$RUN/commands.txt" \
