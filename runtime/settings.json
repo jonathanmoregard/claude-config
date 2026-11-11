@@ -257,16 +257,24 @@
       "Edit(//etc/nixos/**)",
       "Edit(//nix/store/**)",
       "Edit(~/.local/state/claude-harness-tripwire/**)",
-      "Edit(~/.local/state/claude-tasks/**/artl-evidence.jsonl)",
-      "Edit(~/.local/state/claude-tasks/**/artl-exemptions.jsonl)",
       "Edit(~/.local/state/claude-pr-open-gate/**)",
+      "Write(~/.local/state/claude-pr-open-gate/**)",
+      "Edit(~/.local/state/claude-pr-open-gate)",
+      "Write(~/.local/state/claude-pr-open-gate)",
       "Bash(*artl-evidence.jsonl*)",
       "Bash(*artl-exemptions.jsonl*)",
       "Bash(*claude-pr-open-gate*)"
     ],
     "ask": [
-      "Bash(*gh pr create*)",
-      "Bash(*gh pr new*)",
+      "Bash(*gh*pr*create*)",
+      "Bash(*gh*pr*new*)",
+      "Bash(*createPullRequest*)",
+      "Bash(*gh*api*-f*)",
+      "Bash(*gh*api*-F*)",
+      "Bash(*gh*api*--input*)",
+      "Bash(*gh*api*-X*)",
+      "Bash(*gh*api*--method*)",
+      "Bash(*gh*alias*)",
       "mcp__github__create_pull_request"
     ],
     "defaultMode": "default",
@@ -381,7 +389,7 @@
         ]
       },
       {
-        "matcher": "^Agent$",
+        "matcher": "^(Agent|Read|SendMessage)$",
         "hooks": [
           {
             "type": "command",
