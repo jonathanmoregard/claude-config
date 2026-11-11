@@ -110,10 +110,26 @@ jobs:
       # unrelated-looking assertion failures in the step below. Not
       # `shellcheck` -- a different project and a different binary, which does
       # not bring `shfmt` with it.
+      # The fetch is retried because apt is a network dependency and the
+      # runner's DNS goes away for minutes at a time: on 2026-11-11 this step
+      # failed on `master` at 31912c7 and on two pushes to feat/artl-gate,
+      # every one of them `Temporary failure resolving 'archive.ubuntu.com'`
+      # and apt exit 100. Only the provisioning is retried, never an
+      # assertion, so a genuine shell-format regression still fails on the
+      # first attempt. The error below names which half broke: a parser that
+      # could not be installed is not a formatting failure, and reading it as
+      # one sent a reviewer hunting a code regression that did not exist.
       - name: The shell parser the backcheck depends on is present
         run: |
-          sudo apt-get update --quiet
-          sudo apt-get install --quiet --yes shfmt
+          for attempt in 1 2 3; do
+            sudo apt-get update --quiet \
+              && sudo apt-get install --quiet --yes shfmt && break
+            if [ "$attempt" = 3 ]; then
+              echo "::error::shfmt could not be provisioned after 3 attempts (apt or DNS unavailable) -- the shell-format backcheck never ran, so this is NOT a formatting failure" >&2
+              exit 1
+            fi
+            sleep $((attempt * 15))
+          done
           shfmt --version
 
       # `gitleaks` serves two steps below: the behavioural half of the
