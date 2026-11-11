@@ -70,6 +70,15 @@ QUALIFIER_RE = re.compile(
     re.IGNORECASE,
 )
 CONFIG_KEYS = frozenset({"command", "sharedArgs", "defaultOwners", "ownerChildren"})
+# Tools that choose or change a pull request's base branch. `create_pull_request`
+# requires `base` -- GitHub's REST API does, so it cannot simply be stripped and
+# left to default -- and `update_pull_request` can retarget an open one.
+BASE_ARGUMENT_TOOLS = frozenset({"create_pull_request", "update_pull_request"})
+# How the default branch is discovered: `search_repositories` with a `repo:`
+# qualifier returns the full repository object, which carries `default_branch`.
+# Asking costs one call through the child that is already routed, and means a
+# new repository needs no setup -- there is no list to keep.
+REPO_LOOKUP_TOOL = "search_repositories"
 
 
 class ConfigError(ValueError):
@@ -303,6 +312,114 @@ def stop_children(children: dict[str | None, Child], stop: anyio.Event) -> None:
             child.start_scope.cancel()
 
 
+def _default_branch_of(payload: str) -> str | None:
+    """The `default_branch` of the single repository in a search result, or None.
+
+    None means "could not tell", and every caller treats that as permission.
+    """
+    try:
+        data = json.loads(payload)
+    except (TypeError, ValueError):
+        return None
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list) or len(items) != 1:
+        return None
+    branch = items[0].get("default_branch") if isinstance(items[0], dict) else None
+    return branch if isinstance(branch, str) and branch else None
+
+
+async def lookup_default_branch(
+    owner: str,
+    repo: str,
+    session: Any,
+    cache: dict[str, str | None],
+    force: bool = False,
+) -> str | None:
+    """Ask the child for `owner/repo`'s default branch. None if it cannot be told.
+
+    Successful answers are cached for the life of the process -- they only
+    change when someone renames a default branch. Failures are *not* cached, so
+    a transient one does not leave the rule switched off for that repository
+    until the mux restarts.
+    """
+    key = f"{owner}/{repo}".lower()
+    if key in cache and not force:
+        return cache[key]
+    branch: str | None = None
+    try:
+        result = await session.call_tool(
+            REPO_LOOKUP_TOOL,
+            {"query": f"repo:{owner}/{repo}", "minimal_output": False, "perPage": 1},
+        )
+        if result.isError:
+            # How the child reports a rate limit, a 4xx, or a tool it does not
+            # have. This is the *common* failure, far more likely than a
+            # transport exception, and it used to pass silently -- so a rule
+            # that had quietly stopped working looked identical to one with
+            # nothing to say.
+            _log(f"default-branch lookup for {key} returned an error result")
+        else:
+            for block in result.content:
+                branch = _default_branch_of(getattr(block, "text", "") or "")
+                if branch:
+                    break
+            if branch is None:
+                _log(f"default-branch lookup for {key} returned no usable branch")
+    except Exception as exc:  # noqa: BLE001 - a failed lookup must not block the call
+        _log(f"default-branch lookup for {key} failed: {type(exc).__name__}: {exc}")
+    # Only successes are cached. A failure is usually transient -- a rate limit,
+    # a child still waking, a network blip -- and caching it would make one bad
+    # moment permit every non-default base in that repository for the rest of
+    # the process. Re-asking costs one call on a path that opens pull requests.
+    if branch:
+        cache[key] = branch
+    return branch
+
+
+def base_refusal(name: str, arguments: dict[str, Any], default: str | None) -> str | None:
+    """Why this call may not set a pull request's base; None when it may.
+
+    This is a housekeeping rule, not a security control. Pull requests aimed
+    somewhere other than the default branch are noise Jonathan does not want to
+    manage, so the mux declines to open them and says where to aim instead.
+
+    It is worth being explicit that it guards nothing: anyone who can reach this
+    tool can also `git push` to any unprotected branch directly, so routing
+    commits through a pull request aimed at one grants no access they lack. The
+    branch that matters is protected by its ruleset -- required review, required
+    checks, no bypass actors, and approval dismissed on any later push -- and
+    that, not this function, is what keeps unreviewed work out.
+
+    "Default branch" means *this* repository's own, asked for at call time --
+    `claude-config` defaults to `master` and `nixos-config` to `main`, so a
+    shared list of common names would admit whichever of the two also existed.
+    The comparison is case-sensitive because git refs are: `Main` and `main` can
+    both exist and are different branches.
+
+    `default` of None means the lookup could not tell, and this returns None --
+    permission. Failing open is the right default for a convenience rule: the
+    cost of a wrong allow is one pull request aimed somewhere untidy, while the
+    cost of a wrong refusal is blocking ordinary work in a repository that did
+    nothing but be new.
+    """
+    if name not in BASE_ARGUMENT_TOOLS or "base" not in arguments:
+        return None
+    base = arguments["base"]
+    if not isinstance(base, str) or not base:
+        return (
+            f"{name}: base must be a non-empty string, got {base!r}. "
+            "A base that cannot be read cannot be checked."
+        )
+    if default is None or base == default:
+        return None
+    return (
+        f"{name}: base {base!r} is not this repository's default branch "
+        f"({default!r}). Open it against {default!r} instead. Pull requests "
+        "aimed at other branches are not wanted here; if one is genuinely "
+        "needed, retarget it in GitHub's UI."
+    )
+
+
 def _error(message: str) -> types.CallToolResult:
     return types.CallToolResult(
         content=[types.TextContent(type="text", text=f"github-mux: {message}")], isError=True
@@ -315,6 +432,7 @@ async def dispatch(
     config: MuxConfig,
     tool_names: frozenset[str],
     children: dict[str | None, Child],
+    branch_cache: dict[str, str | None] | None = None,
 ) -> types.CallToolResult:
     if name not in tool_names:
         return _error(f"unknown tool {name!r}")
@@ -327,6 +445,28 @@ async def dispatch(
     await child.ready.wait()
     if child.session is None:
         return _error(f"{child.label} installation unavailable: {child.unavailable}")
+    # The base check runs after routing because it asks the routed child for the
+    # repository's default branch rather than reading it from a list.
+    if name in BASE_ARGUMENT_TOOLS and "base" in arguments:
+        repo_owner, repo = arguments.get("owner"), arguments.get("repo")
+        cache = branch_cache if branch_cache is not None else {}
+        default = None
+        if isinstance(repo_owner, str) and isinstance(repo, str) and repo_owner and repo:
+            default = await lookup_default_branch(
+                repo_owner, repo, child.session, cache
+            )
+        refusal = base_refusal(name, arguments, default)
+        if refusal is not None and default is not None:
+            # Never refuse on a remembered answer without checking it first: a
+            # default branch that was renamed since it was cached would other-
+            # wise refuse every pull request in that repository, naming the old
+            # branch, until the mux restarts. Costs one call, on the rare path.
+            default = await lookup_default_branch(
+                repo_owner, repo, child.session, cache, force=True
+            )
+            refusal = base_refusal(name, arguments, default)
+        if refusal is not None:
+            return _error(refusal)
     try:
         return await child.session.call_tool(name, arguments)
     except Exception as exc:  # noqa: BLE001 - a dead child is a tool error
@@ -356,6 +496,8 @@ def build_server(
         instructions = f"{instructions}\n\n{routing}" if instructions else routing
     server: Server = Server(SERVER_NAME, instructions=instructions)
     tool_names = frozenset(tool.name for tool in tools)
+    # One cache for the process, so a repository is looked up once per run.
+    branch_cache: dict[str, str | None] = {}
 
     @server.list_tools()
     async def list_tools() -> list[types.Tool]:
@@ -365,7 +507,7 @@ def build_server(
     # a second, possibly divergent, error message.
     @server.call_tool(validate_input=False)
     async def call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResult:
-        return await dispatch(name, arguments, config, tool_names, children)
+        return await dispatch(name, arguments, config, tool_names, children, branch_cache)
 
     return server
 

@@ -21,7 +21,9 @@ from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 
 
-def build_server(label: str, tool_names: list[str], instructions: str) -> Server:
+def build_server(
+    label: str, tool_names: list[str], instructions: str, no_repo_search: bool = False
+) -> Server:
     server: Server = Server(f"fake-{label}", instructions=instructions)
 
     @server.list_tools()
@@ -35,6 +37,28 @@ def build_server(label: str, tool_names: list[str], instructions: str) -> Server
     async def call_tool(name: str, arguments: dict) -> types.CallToolResult:
         if name == "crash":
             os._exit(3)
+        if name == "search_repositories" and no_repo_search:
+            # What a repository the installation cannot see looks like.
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text="not found")], isError=True
+            )
+        if name == "search_repositories":
+            # The mux asks for a repository's default branch this way. Echoing
+            # the call back would leave it unresolvable, and the base rule would
+            # then fail open in every test, so answer it in GitHub's shape.
+            return types.CallToolResult(
+                content=[
+                    types.TextContent(
+                        type="text",
+                        text=json.dumps(
+                            {
+                                "total_count": 1,
+                                "items": [{"full_name": "fake/repo", "default_branch": "main"}],
+                            }
+                        ),
+                    )
+                ]
+            )
         payload = {"label": label, "tool": name, "arguments": arguments}
         return types.CallToolResult(
             content=[types.TextContent(type="text", text=json.dumps(payload))]
@@ -53,6 +77,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--label", default="personal")
     parser.add_argument("--tools", required=True)
     parser.add_argument("--extra-tools", default="")
+    parser.add_argument("--no-repo-search", action="store_true")
     parser.add_argument("--instructions", default="")
     parser.add_argument("--fail-start", action="store_true")
     parser.add_argument("--start-delay", type=float, default=0.0)
@@ -67,7 +92,9 @@ def main(argv: list[str]) -> int:
     # Stall before the MCP handshake, like a wrapper stuck minting a token.
     time.sleep(args.start_delay)
     names = [n for n in (args.tools + "," + args.extra_tools).split(",") if n]
-    anyio.run(serve, build_server(args.label, names, args.instructions))
+    anyio.run(
+        serve, build_server(args.label, names, args.instructions, args.no_repo_search)
+    )
     # Reached only on a graceful MCP stdio shutdown (stdin closed), not a kill.
     if args.exit_file:
         args.exit_file.write_text("clean", encoding="utf-8")
