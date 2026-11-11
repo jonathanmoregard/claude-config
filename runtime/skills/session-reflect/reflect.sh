@@ -913,6 +913,12 @@ reflect_claude_call() {
     _args+=( --resume "$_resume" --fork-session )
   fi
   _args+=( --model "$REFLECT_MODEL" --output-format json --tools "" --strict-mcp-config )
+  # Never write the reflection's own session .jsonl into the project transcript
+  # dir. It would be that project's NEWEST session, so restart-restore and
+  # `claude --continue` resumed the reflection instead of the user's work. The
+  # flag changes nothing sent to the API, so the fork-resume's prompt-cache hit
+  # is unaffected; the result is read from the stdout envelope, not the file.
+  _args+=( --no-session-persistence )
 
   local _cwd="${CWD:-}"
   if [[ -z "$_cwd" || ! -d "$_cwd" ]]; then
