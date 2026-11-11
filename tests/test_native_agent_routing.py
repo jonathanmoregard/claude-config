@@ -88,7 +88,7 @@ def test_named_roles_pin_full_model_ids():
         "general-purpose.md": ("general-purpose", "claude-sonnet-5-5"),
         "worker-easy.md": ("worker-easy", "claude-sonnet-5-5"),
         "worker-hard.md": ("worker-hard", "claude-opus-5-5"),
-        "advisor.md": ("advisor", "claude-fable-5-1"),
+        "advisor.md": ("advisor", "claude-fable-5-2"),
     }
     for filename, (name, model) in expected.items():
         metadata = frontmatter(RUNTIME / "agents" / filename)
