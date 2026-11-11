@@ -146,6 +146,40 @@ def test_user_failure_recorder_writes_shape_and_success_clears_it(tmp_path):
     assert not path.exists()
 
 
+def test_user_failure_recorder_treats_clean_stop_as_success(tmp_path):
+    # A job still running when `systemctl --user stop` (or logout/reboot) stops
+    # it ends with SERVICE_RESULT=success EXIT_STATUS=TERM: systemd's own
+    # verdict is success, so it must not leave a record.
+    path = tmp_path / ".local/state/claude-unit-failures/refresh.json"
+    stopped = run_recorder(str(tmp_path), "success", "TERM")
+    assert stopped.returncode == 0, stopped.stderr
+    assert not path.exists()
+
+
+def test_user_failure_recorder_clean_stop_keeps_an_earlier_failure(tmp_path):
+    # A stopped rerun proves nothing about the earlier run's failure, so the
+    # record stays; only a run that exits 0 supersedes it.
+    path = tmp_path / ".local/state/claude-unit-failures/refresh.json"
+    run_recorder(str(tmp_path), "exit-code", "7")
+    before = path.read_text(encoding="utf-8")
+    stopped = run_recorder(str(tmp_path), "success", "TERM")
+    assert stopped.returncode == 0, stopped.stderr
+    assert path.read_text(encoding="utf-8") == before
+
+    succeeded = run_recorder(str(tmp_path), "success", "0")
+    assert succeeded.returncode == 0, succeeded.stderr
+    assert not path.exists()
+
+
+def test_user_failure_recorder_still_records_signal_and_timeout_kills(tmp_path):
+    path = tmp_path / ".local/state/claude-unit-failures/refresh.json"
+    for result, status in (("signal", "KILL"), ("timeout", "TERM"), ("oom-kill", "KILL")):
+        out = run_recorder(str(tmp_path), result, status)
+        assert out.returncode == 0, out.stderr
+        rec = json.loads(path.read_text(encoding="utf-8"))
+        assert (rec["result"], rec["exit_status"]) == (result, status)
+
+
 def test_missing_user_directory_is_silent_while_system_records_still_speak(tmp_path):
     system_dir = tmp_path / "system"
     system_dir.mkdir()

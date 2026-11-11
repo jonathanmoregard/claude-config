@@ -29,7 +29,15 @@ def main() -> int:
     directory = Path.home() / ".local/state/claude-unit-failures"
     record = directory / f"{slug}.json"
 
-    if result == "success" and status == "0":
+    # systemd's SERVICE_RESULT is the verdict. "success" with EXIT_STATUS=TERM
+    # is a job stopped mid-run (systemctl stop, logout, reboot) — a clean stop,
+    # not a failure; recording it left durable records nothing ever cleared.
+    # Real failures arrive as exit-code, signal, timeout, oom-kill, core-dump.
+    # Only a run that exited 0 supersedes an earlier failure record; a stopped
+    # run proves nothing about it, so the record is left as it is.
+    if result == "success":
+        if status != "0":
+            return 0
         try:
             record.unlink()
         except FileNotFoundError:
