@@ -252,7 +252,11 @@ def on_pretool(payload: dict) -> None:
 
     if smoke_log:
         log_exemption(payload, {**smoke_log, **where})
-    g.prune(g.state_dir() / "grants", g.GRANT_TTL_S, now)
+    stale = g.prune(g.state_dir() / "grants", g.GRANT_TTL_S, now)
+    if stale:
+        print(f"pr-open-gate: could not remove {stale} expired grant file(s); "
+              "they are already unspendable, but the state dir is not writable "
+              "as expected", file=sys.stderr)
     g.write_json(grant_path(session, g.call_key(tool, tool_input)), {"ts": now, **where})
 
 

@@ -242,13 +242,30 @@ def read_json(path: Path) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def prune(directory: Path, ttl: float, now: float) -> None:
+def prune(directory: Path, ttl: float, now: float) -> int:
+    """Delete expired files in `directory`. Returns how many it could not remove.
+
+    Housekeeping only, and deliberately not load-bearing: expiry is enforced
+    where a grant is CONSUMED — pr-open-gate.on_permission unlinks the grant
+    and only then compares its `ts` against GRANT_TTL_S — so a failure here
+    leaves litter on disk, never a grant anyone can still spend. The count is
+    returned rather than swallowed so a caller can say so out loud; a gate
+    that quietly ignores its own IO errors is how a fail-open starts.
+    """
+    failed = 0
     try:
-        for f in directory.iterdir():
+        entries = list(directory.iterdir())
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        return 1
+    for f in entries:
+        try:
             if now - f.stat().st_mtime > ttl:
                 f.unlink(missing_ok=True)
-    except OSError:
-        pass
+        except OSError:
+            failed += 1
+    return failed
 
 
 # --- what counts as opening a PR ------------------------------------------------

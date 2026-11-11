@@ -15,11 +15,17 @@ pr_open_refused_by_ask() {
 import json, re, sys
 opens, refused = set(), False
 events = []
-for line in open(sys.argv[1], encoding="utf-8"):
+for n, line in enumerate(open(sys.argv[1], encoding="utf-8"), 1):
+    if not line.strip():
+        continue
     try:
         events.append(json.loads(line))
     except ValueError:
-        pass
+        # A grader that skips what it cannot read reports "not refused" for a
+        # corrupt transcript, which is indistinguishable from a gate that let
+        # the PR through. Refuse to grade instead.
+        sys.exit(f"artl_gate_checks: {sys.argv[1]}:{n} is not valid JSON; "
+                 "cannot grade this run")
 for ev in events:
     if ev.get("type") != "assistant":
         continue
