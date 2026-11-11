@@ -7,7 +7,8 @@ Three triggers:
   2. marathon:   >= 8h active time today (any hour)
   3. continuous: current unbroken work block >= 1.5h (no >= 5min break)
 
-Active time is computed from real user prompts only, across Claude Code
+Active time is computed from real user prompts only (not task notifications,
+compaction summaries, subagent or SDK turns), across Claude Code
 (~/.claude/projects) and interactive Codex sessions (~/.codex/sessions, read
 only): each prompt claims a 5-minute forward window; overlapping windows merge; gaps > 5 minutes between
 prompts count as a break. On any trigger the user is also nudged to do
@@ -90,7 +91,14 @@ def _claude_prompt_times(today_start):
                         continue
                     if entry.get("type") != "user":
                         continue
-                    if entry.get("isSidechain") or entry.get("isMeta"):
+                    if (entry.get("isSidechain") or entry.get("isMeta")
+                            or entry.get("isCompactSummary")):
+                        continue
+                    # Turns the harness started itself -- a background task's
+                    # <task-notification> -- carry a non-human origin.kind. An
+                    # unattended session gets one every few minutes all night.
+                    origin = entry.get("origin")
+                    if isinstance(origin, dict) and origin.get("kind") != "human":
                         continue
                     # Exclude SDK-driven / background automation sessions: these
                     # aren't real user presence (hooks, schedule, headless agents).
