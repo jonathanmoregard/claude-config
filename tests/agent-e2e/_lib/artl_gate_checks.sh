@@ -41,6 +41,8 @@ for ev in events:
         if (part.get("name") == "Bash" and OPEN.search(cmd)) or \
            part.get("name") == "mcp__github__create_pull_request":
             opens.add(part.get("id"))
+denied = {ev.get("tool_use_id") for ev in events
+          if ev.get("type") == "system" and ev.get("subtype") == "permission_denied"}
 for ev in events:
     if ev.get("type") != "user":
         continue
@@ -51,7 +53,8 @@ for ev in events:
         text = str(part.get("content"))
         if "pr-open-gate refused this PR open" in text:
             print("gate")
-        elif part.get("is_error") and re.search(r"requested permissions|haven't granted", text):
+        elif part.get("tool_use_id") in denied or (part.get("is_error") and re.search(
+                r"requested permissions|haven't granted|requires? approval", text)):
             print("ask")
 PY
 }
