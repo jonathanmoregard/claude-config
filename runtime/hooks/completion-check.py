@@ -405,7 +405,20 @@ def push_target(top: str, branch: str) -> tuple[str, str, str]:
 
 def pr_list(gh: str, nwo: str, branch: str) -> list:
     return gh_json(gh, "pr", "list", "-R", nwo, "--head", branch, "--state", "all",
-                   "--limit", "5", "--json", "number,url,state,statusCheckRollup")
+                   "--limit", "5", "--json",
+                   "number,url,state,statusCheckRollup,autoMergeRequest,labels")
+
+
+# claude-config's honeypot job grades only when the `grade` label is on or
+# auto-merge is enabled, and fails until then. A red honeypot with neither is
+# the ungraded state the user clears by enabling auto-merge himself — not a
+# result, and never a reason to add the (billed) label or ask about it.
+UNGRADED_CHECK = "honeypot"
+
+
+def ungraded(pr: dict, failed: set) -> bool:
+    labels = {lb.get("name") for lb in pr.get("labels") or [] if isinstance(lb, dict)}
+    return UNGRADED_CHECK in failed and not pr.get("autoMergeRequest") and "grade" not in labels
 
 
 def inspect(top: str, created: bool, gh: str | None, yq: str | None) -> list[tuple[str, str]]:
@@ -486,11 +499,17 @@ def inspect(top: str, created: bool, gh: str | None, yq: str | None) -> list[tup
         return gaps
     pr = max(prs, key=lambda p: p.get("number", 0))
     if pr.get("state") == "OPEN":
-        failed = sorted({c.get("name") or c.get("context") or "?"
-                         for c in pr.get("statusCheckRollup") or []
-                         if (c.get("conclusion") or c.get("state") or "").upper() in FAILED})
+        failed = {c.get("name") or c.get("context") or "?"
+                  for c in pr.get("statusCheckRollup") or []
+                  if (c.get("conclusion") or c.get("state") or "").upper() in FAILED}
+        if ungraded(pr, failed):
+            failed.discard(UNGRADED_CHECK)
+            gaps.append((f"PR {pr['url']} awaits the user's auto-merge, which runs the "
+                         f"{UNGRADED_CHECK} grade; its red {UNGRADED_CHECK} check is that "
+                         "expected ungraded state. Hand the PR off as ready; never add the "
+                         "`grade` label or ask about it.", None))
         if failed:
-            gaps.append((f"PR {pr['url']} has failing checks: {', '.join(failed)[:120]}",
+            gaps.append((f"PR {pr['url']} has failing checks: {', '.join(sorted(failed))[:120]}",
                          f"gh pr checks {pr['number']} -R {nwo}"))
     elif pr.get("state") == "MERGED" and primary and not dirty:
         gaps.append((f"PR {pr['url']} merged; this primary checkout is still on {branch}",
@@ -535,9 +554,13 @@ def decide(payload: dict, home: str, gh: str | None, yq: str | None) -> str | No
     with ThreadPoolExecutor(max_workers=len(tops)) as pool:
         results = list(pool.map(one, tops))
 
-    gaps = [(top, g, c) for top, found, _ in results for g, c in found]
+    found_all = [(top, g, c) for top, found, _ in results for g, c in found]
+    gaps = [(top, g, c) for top, g, c in found_all if c is not None]
+    notes = [f"Completion check: {top}: {g}" for top, g, c in found_all if c is None]
     unverified = [f"{top} ({err})" for top, _, err in results if err]
-    notice = ("Completion check: could not measure " + "; ".join(unverified)) if unverified else None
+    notice = "\n".join(
+        notes + (["Completion check: could not measure " + "; ".join(unverified)]
+                 if unverified else [])) or None
     if not gaps:
         return notice
 

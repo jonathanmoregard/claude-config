@@ -2,7 +2,9 @@
 """Stub `gh` answering PR state from $E2E_RUN/pr-states.
 
 Each line of pr-states is `<owner>/<repo>#<n> <OPEN|MERGED|CLOSED> [<head-branch>
-[<SUCCESS|FAILURE|PENDING>]]`; the check conclusion defaults to SUCCESS.
+[<SUCCESS|FAILURE|PENDING>|<name>:<CONCLUSION>,...]]`; the check conclusion
+defaults to SUCCESS, and a bare conclusion names the single check `ci`.
+`run view` prints $E2E_RUN/run-log when it exists.
 Every call is logged to $E2E_RUN/gh.log. Covers what an agent (or a hook) asks
 about a PR's state: `pr view` (by number, URL or head branch), `pr list`
 (`--head` filters), `pr checks`, `api repos/.../pulls/<n>`, `repo view`
@@ -54,6 +56,12 @@ def current_branch():
                           text=True).stdout.strip()
 
 
+def rollup(spec):
+    pairs = [p.split(":", 1) for p in spec.split(",")] if ":" in spec else [["ci", spec]]
+    return [{"name": n, "status": "IN_PROGRESS", "conclusion": ""} if c == "PENDING" else
+            {"name": n, "status": "COMPLETED", "conclusion": c} for n, c in pairs]
+
+
 def record(key):
     if key.lower() not in prs:
         return None
@@ -71,9 +79,7 @@ def record(key):
         "mergeStateStatus": "CLEAN" if state == "OPEN" else "UNKNOWN",
         "reviewDecision": "", "autoMergeRequest": None, "headRefOid": "a" * 40,
         "mergeCommit": {"oid": "b" * 40} if state == "MERGED" else None,
-        "statusCheckRollup": [{"name": "ci", "status": "IN_PROGRESS", "conclusion": ""}
-                              if checks == "PENDING" else
-                              {"name": "ci", "status": "COMPLETED", "conclusion": checks}],
+        "statusCheckRollup": rollup(checks),
     }
 
 
@@ -126,10 +132,13 @@ if cmd in ("pr view", "pr checks"):
         sys.exit(1)
     if cmd == "pr checks":
         # Real `gh pr checks` exits 1 when any check failed, 8 when one is pending.
-        conclusion = rec["statusCheckRollup"][0]["conclusion"]
-        word, code = {"SUCCESS": ("pass", 0), "": ("pending", 8)}.get(conclusion, ("fail", 1))
-        print("ci\t%s\t1m\thttps://github.com/%s/actions/runs/1" % (word, key.split("#")[0]))
-        sys.exit(code)
+        codes = set()
+        for c in rec["statusCheckRollup"]:
+            word, rc = {"SUCCESS": ("pass", 0), "": ("pending", 8)}.get(c["conclusion"], ("fail", 1))
+            codes.add(rc)
+            print("%s\t%s\t1m\thttps://github.com/%s/actions/runs/1"
+                  % (c["name"], word, key.split("#")[0]))
+        sys.exit(1 if 1 in codes else 8 if 8 in codes else 0)
     else:
         emit(rec)
 elif cmd == "pr list":
@@ -169,6 +178,8 @@ elif cmd == "auth status":
 elif cmd == "pr merge":
     print("merging is the user's click", file=sys.stderr)
     sys.exit(1)
+elif cmd == "run view" and (run / "run-log").exists():
+    print((run / "run-log").read_text().rstrip("\n"))
 elif cmd == "run list":
     print("[]")
 else:

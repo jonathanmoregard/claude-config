@@ -224,6 +224,50 @@ def test_open_pr_with_failed_check_is_reported(w):
     assert "failing checks: tests" in ctx(out) and "gh pr checks 7" in ctx(out)
 
 
+# honeypot only grades when the `grade` label is on or auto-merge is enabled,
+# so a red honeypot with neither is the ungraded state, not a result. The user
+# enables auto-merge himself; agents asking "add the grade label?" (it bills)
+# was the friction. 2026-11-11.
+
+def honeypot_pr(checks, auto_merge=False, labels=()):
+    p = pr("OPEN", checks)
+    p["autoMergeRequest"] = {"enabledAt": "2026-11-11T12:00:00Z"} if auto_merge else None
+    p["labels"] = [{"name": n} for n in labels]
+    return p
+
+
+def test_ungraded_honeypot_is_a_note_not_a_gap(w):
+    repo = w.repo()
+    w.feature(repo)
+    w.bash("gh pr create --fill", repo)
+    w.gh(prs={"feat/x": [honeypot_pr([("checks", "SUCCESS"), ("honeypot", "FAILURE")])]})
+    text = ctx(w.run())
+    assert "not finished" not in text and "failing checks" not in text
+    assert "awaits the user's auto-merge" in text
+    assert "never add the `grade` label or ask about it" in text
+
+
+def test_ungraded_honeypot_beside_a_real_failure_reports_only_the_real_one(w):
+    repo = w.repo()
+    w.feature(repo)
+    w.bash("gh pr create --fill", repo)
+    w.gh(prs={"feat/x": [honeypot_pr([("checks", "FAILURE"), ("honeypot", "FAILURE")])]})
+    text = ctx(w.run())
+    assert "failing checks: checks" in text and "failing checks: checks, honeypot" not in text
+
+
+@pytest.mark.parametrize("kwargs", [{"auto_merge": True}, {"labels": ("grade",)}])
+def test_graded_honeypot_failure_is_still_a_failing_check(w, kwargs):
+    repo = w.repo()
+    w.feature(repo)
+    w.bash("gh pr create --fill", repo)
+    w.gh(prs={"feat/x": [honeypot_pr([("checks", "SUCCESS"), ("honeypot", "FAILURE")],
+                                     **kwargs)]})
+    text = ctx(w.run())
+    assert "failing checks: honeypot" in text
+    assert "awaits the user's auto-merge" not in text
+
+
 def test_merged_pr_with_primary_still_on_feature_branch_is_reported(w):
     repo = w.repo()
     w.feature(repo)

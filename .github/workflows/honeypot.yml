@@ -250,8 +250,9 @@ jobs:
           fi
           echo "this pull request changes the live config:"
           printf '%s\n' "$config" | sed 's/^/  /'
-          echo "this config has not been graded"
-          echo "add the 'grade' label to grade it; an ungraded config is not a clean one"
+          echo "awaiting grade: this config has not been graded yet"
+          echo "the grade runs when the user enables auto-merge (or adds the 'grade' label)."
+          echo "expected before auto-merge, not a failure to fix; an ungraded config is not a clean one"
           exit 1
 
       - uses: actions/checkout@v4
