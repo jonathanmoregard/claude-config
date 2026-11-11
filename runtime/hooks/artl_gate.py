@@ -352,8 +352,10 @@ def _scan(cmd: str, depth: int) -> dict | None:
     except ValueError:
         # Unbalanced quoting: no reliable parse, so the raw text decides, and
         # it errs toward treating a mention as an open (fail closed).
-        return {"kind": "unparsed", "cwd": None, "head": None} if FALLBACK.search(cmd) else None
+        return ({"kind": "unparsed", "cwd": None, "head": None, "commits": "commit" in cmd}
+                if FALLBACK.search(cmd) else None)
     cwd = None
+    commits = False
     for words in _segments(tokens):
         i = 0
         while i < len(words) and (re.match(r"^[A-Za-z_]\w*=", words[i]) or words[i] in WRAPPERS):
@@ -367,34 +369,41 @@ def _scan(cmd: str, depth: int) -> dict | None:
         prog, args = os.path.basename(words[i]), words[i + 1:]
         if prog == "cd" and args:
             cwd = args[0]
+        elif prog == "git" and "commit" in [a for a in args if not a.startswith("-")][:3]:
+            commits = True
         elif prog in SHELLS and "-c" in args and depth < 3:
             j = args.index("-c")
             if j + 1 < len(args):
                 inner = _scan(args[j + 1], depth + 1)
                 if inner:
                     inner["cwd"] = inner["cwd"] or cwd
+                    inner["commits"] = inner["commits"] or commits
                     return inner
         elif prog == "eval" and args and depth < 3:
             inner = _scan(" ".join(args), depth + 1)
             if inner:
                 inner["cwd"] = inner["cwd"] or cwd
+                inner["commits"] = inner["commits"] or commits
                 return inner
         elif prog == "gh" and args:
             if args[0] == "pr" and len(args) > 1 and args[1] in ("create", "new"):
                 head = _flag_value(args, ("--head", "-H"))
-                return {"kind": "gh-pr-create", "cwd": cwd, "head": head}
+                return {"kind": "gh-pr-create", "cwd": cwd, "head": head, "commits": commits}
             if args[0] == "api" and _gh_api_opens_pr(args[1:]):
-                return {"kind": "gh-api-pulls", "cwd": cwd, "head": None}
+                return {"kind": "gh-api-pulls", "cwd": cwd, "head": None, "commits": commits}
     return None
 
 
 def pr_open_call(tool_name: str, tool_input: object) -> dict | None:
-    """{"kind", "cwd", "head"} when this tool call opens a PR, else None."""
+    """{"kind", "cwd", "head", "commits"} when this tool call opens a PR, else None.
+    `commits`: the same command runs `git commit` before the PR open, so the
+    gate (which runs first) must also judge what that commit will add."""
     if not isinstance(tool_input, dict):
         return None
     if tool_name == "mcp__github__create_pull_request":
         head = tool_input.get("head")
-        return {"kind": "mcp", "cwd": None, "head": head if isinstance(head, str) else None}
+        return {"kind": "mcp", "cwd": None, "head": head if isinstance(head, str) else None,
+                "commits": False}
     if tool_name != "Bash":
         return None
     cmd = tool_input.get("command")

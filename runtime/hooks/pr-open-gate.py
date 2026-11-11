@@ -29,6 +29,10 @@ EVENTS (one script, dispatched on hook_event_name):
          open, logged).
     Fail -> permissionDecision "deny" with every reason. Pass -> no output, and
     a one-shot grant for the PermissionRequest below.
+    When the same Bash command runs `git commit` before the PR open, the
+    gate (which runs first) also judges the tracked working-tree edits that
+    commit will add, so a fix committed and opened in one command is not
+    judged by the stale, reviewed tip.
     A checkout the hook cannot locate (a `cd` it cannot follow, a detached
     HEAD, no base branch) is a deny: an unverifiable PR open is not a pass.
 
@@ -178,6 +182,26 @@ def locate(payload: dict, call: dict) -> tuple[dict | None, str | None, str | No
     return info, branch, tip, "" if tip else f"cannot resolve HEAD in {top}"
 
 
+def pending_commit_view(call: dict, info: dict, branch: str, mb: str,
+                        changes: list) -> list[tuple[str, list]]:
+    """A second view for `git commit ... && gh pr create`: the gate runs before
+    that commit, so the committed tip still looks reviewed. Measured in e2e.
+    The view is the working tree's tracked edits (staged or not) on top of the
+    tip; untracked files are left out, as `commit -a` leaves them out."""
+    top = info["top"]
+    if not call.get("commits") or g.current_branch(top) != branch:
+        return []
+    pending = set((g.git(top, "diff", "--name-only", "-z", "HEAD") or "").split("\0")) - {""}
+    if not pending:
+        return []
+    work = g.snapshot_tree(top)
+    rows = g.numstat(top, mb, work) if work else None
+    if rows is None:
+        return []
+    keep = {p for p, _ in changes} | pending
+    return [(work, [r for r in rows if r[0] in keep])]
+
+
 def on_pretool(payload: dict) -> None:
     tool, tool_input = payload.get("tool_name"), payload.get("tool_input")
     call = g.pr_open_call(tool, tool_input)
@@ -203,14 +227,23 @@ def on_pretool(payload: dict) -> None:
         return
 
     where = {"repo": info["repo"], "top": top, "branch": branch, "head": tip}
-    exempt = g.computed_exemption(changes)
+    views = [(tip, changes)] + pending_commit_view(call, info, branch, mb, changes)
+    exempt = None
+    for _, view_changes in views:
+        exempt = g.computed_exemption(view_changes)
+        if not exempt:
+            break
     if exempt:
         log_exemption(payload, {"kind": "computed", "why": exempt, **where})
     else:
         records: list[dict] = []
         for d in g.read_notes_dirs(payload, info):
             records.extend(g.read_jsonl(d / g.EVIDENCE_FILE))
-        problem = g.evidence_problem(records, info, branch, tip, changes)
+        problem = None
+        for view_tip, view_changes in views:
+            problem = g.evidence_problem(records, info, branch, view_tip, view_changes)
+            if problem:
+                break
         if problem:
             if not take_override(session, now):
                 deny([problem], with_remedy=True)

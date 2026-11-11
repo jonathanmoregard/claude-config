@@ -334,6 +334,39 @@ def test_large_drift_after_review_denies(sb):
     assert is_deny(out) and "drift" in reason(out).lower()
 
 
+def test_commit_in_the_same_command_counts_toward_drift(sb):
+    # Measured in e2e: `git commit ... && git push && gh pr create` is gated
+    # BEFORE the commit runs, so the committed tip is still the reviewed one.
+    # The edits that command is about to commit are part of the PR.
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    sb.review("PASS")
+    write(sb.work / "scripts" / "run.sh",
+          SCRIPT_BODY + "".join(f"echo unreviewed {i}\n" for i in range(25)))
+    out = sb.gate("git commit -qam 'fix' && git push && gh pr create --fill")
+    assert is_deny(out) and "drift" in reason(out).lower()
+
+
+def test_small_fix_committed_in_the_same_command_passes(sb):
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    sb.review("PASS")
+    write(sb.work / "scripts" / "run.sh", SCRIPT_BODY + "echo fixed\n")
+    assert sb.gate("git commit -qam 'fix' && gh pr create --fill") is None
+
+
+def test_uncommitted_edits_a_command_does_not_commit_are_not_the_pr(sb):
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    sb.review("PASS")
+    write(sb.work / "scripts" / "run.sh",
+          SCRIPT_BODY + "".join(f"echo scratch {i}\n" for i in range(25)))
+    assert sb.gate("gh pr create --fill") is None
+
+
+def test_commit_detection():
+    call = artl_gate.pr_open_call("Bash", {"command": "git add -A && git commit -m x && gh pr create"})
+    assert call["commits"] is True
+    assert artl_gate.pr_open_call("Bash", {"command": "gh pr create"})["commits"] is False
+
+
 def test_review_of_uncommitted_work_counts_once_committed(sb):
     write(sb.work / "scripts" / "run.sh", SCRIPT_BODY)
     git(sb.work, "add", "-A")
