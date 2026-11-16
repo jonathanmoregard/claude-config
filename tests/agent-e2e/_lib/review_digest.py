@@ -32,6 +32,23 @@ def text_of(content):
     return ""
 
 
+def unframe(text):
+    """The subagent's own report out of a hand-back tool_result: the harness
+    wraps it in a preamble ending "The report follows:", indents every line,
+    and appends `agentId:` / <usage> lines. Text without the frame is
+    returned as is."""
+    marker = "The report follows:"
+    if marker not in text:
+        return text
+    body = text.split(marker, 1)[1]
+    lines = []
+    for line in body.splitlines():
+        if line.startswith("agentId:") or line.startswith("<usage>"):
+            break
+        lines.append(line[2:] if line.startswith("  ") else line)
+    return "\n".join(lines).strip() + "\n"
+
+
 def main(run):
     run = Path(run)
     out = run / "digest"
@@ -69,7 +86,7 @@ def main(run):
     rows = []
     for n, (tid, kind, prompt) in enumerate(dispatches, 1):
         (out / f"dispatch-{n:02d}.prompt").write_text(prompt, encoding="utf-8")
-        reply = spoken.get(tid) or results.get(tid, "")
+        reply = spoken.get(tid) or unframe(results.get(tid, ""))
         (out / f"dispatch-{n:02d}.reply").write_text(reply, encoding="utf-8")
         first = next((l for l in prompt.splitlines() if l.strip()), "")[:100]
         rows.append(f"{n:02d}\t{kind}\t{first}")
