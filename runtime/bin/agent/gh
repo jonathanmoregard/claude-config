@@ -43,7 +43,7 @@ HOOKS = Path(__file__).resolve().parents[2] / "hooks"
 SKILL = "~/.claude/skills/advice-refine-test-loop/SKILL.md"
 
 
-def refuse(argv: list[str], reasons: list[str], with_remedy: bool) -> int:
+def refuse(argv: list[str], reasons: list[str], with_remedy: bool, more: str = "") -> int:
     cmd = shlex.join(["gh", *argv])
     lines = [f"gh: pr-open-gate refused this PR open (`{cmd}`), checked by the gh "
              f"wrapper on the agent's PATH:"]
@@ -52,7 +52,7 @@ def refuse(argv: list[str], reasons: list[str], with_remedy: bool) -> int:
         lines.append(
             f"What to run: the advice-refine-test-loop skill on this branch's finished "
             f"diff (the Skill tool, or Read {SKILL} and follow it). Fix what its advisor "
-            f"finds, then run `{cmd}` again.")
+            f"finds, then run `{cmd}` again." + more)
     else:
         lines.append(f"Resolve that, then run `{cmd}` again.")
     sys.stderr.write("\n".join(lines) + "\n")
@@ -102,7 +102,8 @@ def judge(argv: list[str]) -> int | None:
     except Exception as exc:  # noqa: BLE001 -- refuse, never open unjudged
         return refuse(argv, [f"the gate failed while judging this PR open "
                              f"({type(exc).__name__}: {exc})"], with_remedy=False)
-    return refuse(argv, reasons, with_remedy) if reasons else None
+    # The hook's own remedy tail (drift allowance, the user-only waiver).
+    return refuse(argv, reasons, with_remedy, gate.REMEDY) if reasons else None
 
 
 def real_gh() -> str | None:

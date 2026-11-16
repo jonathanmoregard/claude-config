@@ -240,6 +240,7 @@ def test_an_unreviewed_pr_open_is_refused_with_what_to_run(sb, fake, argv):
     assert REFUSED in err
     assert "no advisor verdict" in err
     assert "advice-refine-test-loop" in err and "SKILL.md" in err
+    assert "skip-artl" in err     # the hook's remedy tail: only the user can waive
     assert shlex.join(["gh", *argv]) in err   # names the command to re-run
 
 
