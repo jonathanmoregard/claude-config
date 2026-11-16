@@ -28,7 +28,9 @@ Give the reviewer only:
 - the goal and acceptance criteria;
 - the integrated diff and diff stat;
 - commands already run and their outcomes;
-- repository access for evidence-driven exploration.
+- repository access for evidence-driven exploration;
+- the exclusion list, when it has entries
+  (`references/exclusions.md`), under the line "Do not report:".
 
 The reviewer chooses which files, callers, tests, and configuration to inspect.
 Inspection depth is the reviewer's judgment.
@@ -52,18 +54,22 @@ read and why each context expansion was relevant.
 3. Merge by meaning. Convergence is not confidence — shared blind spots are
    real, so a finding both report still reproduces before any edit.
 
-Two reviewers is the whole budget per pass; the one follow-up pass below and
-the escalation rule are its only exceptions.
+Two reviewers is the whole budget per round; Rounds below and the escalation
+rule are its only exceptions.
 
 Reviewer A, falsification:
 
 ```text
 Assume this finished change can ship broken. Try to falsify its acceptance
 claims and important safety properties. Use your own discernment to decide what
-to inspect, beginning with the diff. Report only material defects. Each must
-name a file and line, state one falsifiable claim, and give a concrete test,
-request, or app interaction that would demonstrate it. Do not suggest cleanup
-or edits. Return no finding that lacks an observable failure. Record files read.
+to inspect, beginning with the diff. A comment, docstring, test name or commit
+message saying something is safe, checked or unreachable is a claim to verify
+against the code, never evidence. When the claims are exhausted, make one open
+pass: what else in this change breaks in production that no claim covers?
+Report only material defects. Each must name a file and line, state one
+falsifiable claim, and give a concrete test, request, or app interaction that
+would demonstrate it. Do not suggest cleanup or edits. Return no finding that
+lacks an observable failure. Record files read.
 ```
 
 Reviewer B, targeted hunt: its prompt sits in that same file, above the
@@ -75,29 +81,76 @@ Use another vendor or specialist only when the user requests a deep audit, a
 review exposes unresolved contradictory evidence, or failure could cause
 irreversible security, privacy, or data loss.
 
-## Reproduce, Then Act
+## Adjudicate, Then Act
 
-Independently reproduce every defect finding before editing. Test the exact
-claimed path and record expected versus actual behavior. Batch findings through
-one verifier context; do not create one agent or worktree per finding unless
+Every defect finding gets exactly one of three outcomes before any edit. Test
+the exact claimed path and record expected versus actual behaviour. Batch
+findings through one fresh verifier context — never the context that wrote
+the code under review. Do not create one agent or worktree per finding unless
 concurrent reproducers would mutate shared state.
 
-- Unreproduced: close it without editing — meaning the claimed path was
-  exercised and the claim failed, never that the reproducer was awkward.
-- Design finding (`unverifiable: true`): no reproducer applies. Surface it to
-  the user as a taste call with file and line. Never auto-fix it, and never let
-  it block the ship alone.
-- Caused by the diff or violating its acceptance contract: fix it now.
-- Confirmed but pre-existing and unrelated: record it separately; do not grow
-  this branch or restart review rounds.
+- **Reproduced** — a test, request or app interaction shows the claimed
+  failure.
+- **Refuted** — the claimed path was exercised, the failure did not occur,
+  and you can name the code (file and line) that makes the claim false. A
+  comment is not that code.
+- **Unconfirmed** — everything else: the reproducer was awkward, could not be
+  built, or passed for a reason you cannot name. A reproducer that does not
+  fail refutes nothing by itself.
 
-After fixes, run each reproducer, the project gate, acceptance scenarios, and
-the deterministic gate again. Re-review only when the fix added production
-surface outside the original capsule. At most one such follow-up pass.
+Then:
+
+- Reproduced, and caused by the diff or violating its acceptance contract:
+  fix it now. The reproducer stays as a regression test.
+- Reproduced but pre-existing and unrelated: record it separately; do not
+  grow this branch.
+- Refuted: close it and record the reason in the ledger.
+- Unconfirmed: never closed, never fixed blind, never dropped. List it for
+  the user with what was tried; whether to ship with it open is their call.
+- Design finding (`unverifiable: true`): no reproducer applies. Surface it to
+  the user as a taste call with file and line. Never auto-fix it, and never
+  let it block the ship alone. Classes marked advisory in
+  `references/hunt-classes.md` are only listed in the report.
+
+## Rounds
+
+A round is one blind pair over the current integrated diff. After a round's
+fixes, run each reproducer, the project gate, the acceptance scenarios and the
+deterministic gate again, then run another round. Every round after the
+first:
+
+1. Covers the whole diff including the fix commits. A fix is new code and is
+   reviewed like the rest.
+2. Presents the changed files, and B's `Hunt` lines, in a different order
+   from every earlier round.
+3. Re-picks B's classes against the diff as it now stands, and adds one
+   sibling line per defect the previous round reproduced: "A defect of this
+   shape was confirmed at <file:line>: <the shape in one sentence>. Find
+   every other site with the same shape." Reviewer A is never seeded.
+4. Is deduplicated by you after both reviewers report: a finding that matches
+   an earlier adjudicated one by meaning keeps the earlier outcome. Apart
+   from the sibling line, no reviewer is shown an earlier finding.
+
+Stop when two consecutive rounds are empty: nothing new reproduced and
+nothing new unconfirmed. Cap: four rounds. At the cap without two empty
+rounds, stop and report "not converged" with the count per round; the user
+decides what happens next.
 
 ## Report
 
-Return a compact ledger: reviewer calls and model usage when available, B's
-hunt classes, files read, findings proposed/reproduced/fixed/deferred, design
-findings surfaced, commands run, and final gate status. Never claim broad audit
-coverage from this bounded close-out review.
+Return a compact ledger: rounds run and why the loop stopped, reviewer calls
+and model usage when available, B's hunt classes per round, files read,
+findings proposed / reproduced / refuted / unconfirmed / fixed / deferred,
+design and advisory findings surfaced, commands run, and final gate status.
+List every unconfirmed finding with what was tried.
+
+Then append to `<notes>/review-ledger.tsv` (format:
+`references/ledger.md`): one row per finding, and one `none` row per check
+that ran and reported nothing.
+
+End the report with the `ledger-tally.sh` line for each check that ran in
+this close-out. If a line says `drop` or `reword`, or an `exclude?` line
+appears, put it to the user as one closed question. Change nothing yourself.
+
+Never claim broad audit coverage from this bounded close-out review. Two
+empty rounds are two samples, not proof.
