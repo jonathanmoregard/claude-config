@@ -130,6 +130,17 @@ HINTS: list[tuple[tuple[str, ...], str]] = [
         "waive the review: their own message with the waiver word (skip-artl) "
         "standing alone on a line of its own.\n" + _ROUTING_NOTE,
     ),
+    (
+        ("/nix/store/*/bin/gh *", "/nix/store/*/bin/.gh-wrapped *"),
+        "Why the rule exists: in agent sessions `gh` on PATH is "
+        "~/.claude/bin/agent/gh, a wrapper that checks a PR open for an "
+        "advice-refine-test-loop review and passes every other call straight "
+        "to the real gh. Calling the store binary by path skips that check.\n"
+        "Do instead: run plain `gh ...`. If the wrapper refused a PR open, its "
+        "message says what to run (the advice-refine-test-loop skill, then "
+        "the same gh command again). If the wrapper itself is broken, say so "
+        "to the user rather than routing around it.\n" + _ROUTING_NOTE,
+    ),
 ]
 
 _GENERIC = (

@@ -24,6 +24,7 @@ This spec grants git push access while keeping blast radius bounded and long-liv
 - Supply-chain integrity for npm/pip/cargo — any token reachable by the main sandbox process is reachable by its children.
 - Container escape via kernel 0-day — out of scope.
 - Branch protection, commit signing, secret scanning — **explicitly out of scope.** User manages per-repo workflow rules (CI/CD repos have branch protection already; personal drafts push to main). Nothing sandbox-related should impose branch conventions or signing on how the user works.
+- Stopping the agent from opening pull requests — **explicitly not a goal** (D7). The agent is meant to open PRs. Making it review first is the PR-open gate's job (`hooks/pr-open-gate.py`, `bin/agent/gh`), not the credential's.
 
 ## 3. Threat model (scoped to git access)
 
@@ -35,6 +36,8 @@ In scope:
 
 Out of scope: exfiltration of non-git secrets; destructive action on non-git parts of host/container; SSH keys or other host credentials; adversarial code landing on main via feature branch + PR review (that's a review-discipline concern, not this spec's).
 
+Not a threat: the agent opening a pull request. It is an intended capability (D7). A PR changes nothing on the default branch until someone merges it, and review-before-open is scaffolding the PR-open gate provides, not a property of the credential.
+
 ## 4. Approach
 
 Two layers.
@@ -42,7 +45,8 @@ Two layers.
 ### Layer 1 — Credential issuance: GitHub App + per-sandbox rotating token
 
 - One GitHub App installed on the account, "Only select repositories" = allowlist.
-- App permissions: `Contents: R/W`, `Metadata: R`. Nothing else. The credential is physically incapable of touching Administration, Deploy keys, Webhooks, Secrets, Actions, Pages, Pull requests, Issues.
+- App permissions: `Contents: R/W`, `Metadata: R`, `Pull requests: R/W`. Nothing else. The credential is physically incapable of touching Administration, Deploy keys, Webhooks, Secrets, Actions, Pages, Issues.
+- `Pull requests: R/W` was added deliberately on 2026-11-16 (D7); this spec originally omitted it. The agent should be able to create pull requests. The PR-open gate's job is to make it run a review first, not to make PR creation impossible. The permission is used on the host, through the GitHub MCP server and the host `gh`. A sandbox token cannot use it, because the sandbox cannot reach `api.github.com` (Layer 2).
 - Private key `.pem` lives on host only: `~/.config/github-app/app.pem` mode 0600. Never enters sandbox.
 - **Per-sandbox per-repo scoped installation tokens.** Each sandbox at launch resolves its target repo to `repository_id`; tokens minted with `{"repository_ids": [<id>]}`. Exfiltrated token works only against that one repo for ≤60min.
 - **Rotation via systemd user timer** every 50min (Shape Z). Timer walks `~/.cache/gh-tokens/*/repo_id`, mints per-sandbox tokens, atomic write.
@@ -60,7 +64,7 @@ Sandbox egress firewall allows only:
 - `objects.githubusercontent.com` (LFS, release assets — if used)
 - Language registries required by repos using this sandbox (`registry.npmjs.org`, `pypi.org`, `crates.io`, etc.)
 
-Explicitly **not** allowed: `api.github.com`. No `gh` CLI in sandbox. PR operations happen on host. This removes the attack surface of "agent uses GitHub REST API with the token."
+Explicitly **not** allowed: `api.github.com`. No `gh` CLI in sandbox. PR operations happen on host, where the agent may open PRs (D7) behind the PR-open gate. This removes the attack surface of "agent uses GitHub REST API with the sandbox token."
 
 IPs pinned at firewall setup time (not runtime DNS) to avoid CNAME/DNS tricks. Assumes ToB `init-firewall.sh` behavior; verify before shipping.
 
@@ -93,7 +97,7 @@ systemd user timer ─── mint-gh-token ──►  git-credential-ghapp-file
 | Agent in sandbox A can't push to repo of sandbox B | Per-sandbox `repository_ids` scoping |
 | Agent never accesses long-lived credential | Private key on host, rotating tokens only in sandbox |
 | Exfiltrated credential expires on its own | ≤60min token TTL |
-| Agent can't touch repo admin/settings | App permissions omit everything except Contents R/W + Metadata R |
+| Agent can't touch repo admin/settings | App permissions omit everything except Contents R/W, Metadata R and Pull requests R/W (D7) |
 | Central kill switch | App uninstall |
 | No per-repo credential setup | Single App install, add repos via GitHub UI |
 | No rotation calendar | Installation tokens auto-refresh; App private key is long-lived |
@@ -106,6 +110,7 @@ systemd user timer ─── mint-gh-token ──►  git-credential-ghapp-file
 | Protection against malicious commits landing on main | Out of scope; manage via your existing workflow (CI/CD repos have branch protection already) |
 | Protection against supply-chain attacks via npm/pip post-install | Any token reachable by main sandbox process is reachable by its children |
 | Protection against exfiltration of non-git secrets | Out of scope |
+| Agent unable to open pull requests | Deliberately not a property (D7): the App holds Pull requests R/W, and the PR-open gate asks for a review rather than blocking PRs |
 
 ## 8. Implementation phases
 
@@ -121,7 +126,7 @@ sudo apt install docker.io git openssl curl jq uuid-runtime
    - Settings → Developer settings → GitHub Apps → New GitHub App
    - Name: `claude-code-<username>`
    - Webhook: disabled
-   - Repository permissions: `Contents: Read and write`, `Metadata: Read-only`. Nothing else.
+   - Repository permissions: `Contents: Read and write`, `Metadata: Read-only`, `Pull requests: Read and write` (D7). Nothing else.
    - Where can this App be installed: only on this account.
    - Save → note **App ID**.
    - Generate private key → download `.pem`.
@@ -303,6 +308,7 @@ Phase 1: 15m, Phase 2: 45m, Phase 3: 45m, Phase 4: 30m, Phase 5: 10m. **~2.5 hou
 | D4 | Separate `claude-run` user | No on Mint; revisit on NixOS | Out of this spec's scope |
 | D5 | Branch protection / signing / secret scanning | Not imposed by this spec | User manages per-repo workflow. CI/CD repos handle their own rules; drafts push to main freely |
 | D6 | Delivery shape | Shape Z (rotating file, per-sandbox dir) | Standard systemd, no bespoke daemon/socket, inode-safe via directory bind |
+| D7 | `Pull requests` App permission | R/W (changed 2026-11-16; originally omitted) | Jonathan's decision: the agent should be able to create PRs, including through the GitHub MCP server. The PR-open gate exists to make the agent run a review first, not to make PR creation impossible. A PR changes nothing on main until it is merged. The sandbox still has no `api.github.com` (D2), so PRs are opened from the host |
 
 ## 11. Known weakest links within this spec
 

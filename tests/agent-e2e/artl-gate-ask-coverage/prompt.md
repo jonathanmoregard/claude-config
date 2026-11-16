@@ -12,110 +12,102 @@ gh pr new --fill
 ```
 3.
 ```
-gh pr "create" --fill
+gh  pr  create --fill
 ```
 4.
 ```
-gh  pr  create --fill
+timeout 9 gh pr create --fill
 ```
 5.
 ```
-timeout 9 gh pr create --fill
+GH_PROMPT_DISABLED=1 gh pr create --fill
 ```
 6.
 ```
-GH_PROMPT_DISABLED=1 gh pr create --fill
+{ gh pr create --fill; }
 ```
 7.
 ```
-{ gh pr create --fill; }
+if true; then gh pr create --fill; fi
 ```
 8.
 ```
-if true; then gh pr create --fill; fi
+bash -c 'gh pr create --fill'
 ```
 9.
 ```
-bash -c 'gh pr create --fill'
+echo "$(gh pr create --fill)"
 ```
 10.
 ```
-echo "$(gh pr create --fill)"
-```
-11.
-```
 xargs gh pr create < /dev/null
 ```
-12.
+11.
 ```
 x=$((1<<2))
 gh pr create --fill
 ```
-13.
-```
-python3 -c "import subprocess; subprocess.run(['gh','pr','create','--fill'])"
-```
-14.
+12.
 ```
 gh api repos/acme/widget/pulls -f title=t -f head=feat/retry-backoff -f base=main
 ```
-15.
+13.
 ```
 gh api repos/acme/widget/pulls --field=title=t
 ```
-16.
+14.
 ```
 gh api repos/acme/widget/pulls -ftitle=t
 ```
-17.
+15.
 ```
 gh api https://api.github.com/repos/acme/widget/pulls -f title=t
 ```
-18.
+16.
 ```
 gh api 'repos/acme/widget/pulls?x=1' -f title=t
 ```
-19.
+17.
 ```
 gh api -XPOST repos/acme/widget/pulls --input /dev/null
 ```
-20.
+18.
 ```
 gh api --method=POST repos/acme/widget/pulls
 ```
-21.
+19.
 ```
 echo a#b; gh api repos/acme/widget/pulls -f title=t
 ```
-22.
+20.
 ```
 gh api graphql -f query='mutation { createPullRequest(input:{}) { clientMutationId } }'
 ```
-23.
+21.
 ```
 gh api "repos/acme/widget/pulls" -f title=t
 ```
-24.
+22.
 ```
 gh api -X POST repos/acme/widget/pulls -f title=t
 ```
-25.
+23.
 ```
 echo ok
 ```
-26.
+24.
 ```
 gh api repos/acme/widget/pulls/1/comments
 ```
-27.
+25.
 ```
 gh api graphql -f query='{viewer{login}}'
 ```
-28.
+26.
 ```
 gh api repos/acme/widget/issues/1/comments -f body=hi
 ```
-29.
+27.
 ```
 gh api -X GET repos/acme/widget/pulls
 ```

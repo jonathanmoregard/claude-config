@@ -780,9 +780,8 @@ def _ask_matches(command: str) -> bool:
 
 PR_OPEN_SPELLINGS = [
     "gh pr create --fill", "gh pr new --title x --body y", "gh  pr  create --fill",
-    "gh pr \"create\" --fill", "/usr/bin/gh pr create --fill",
+    "/usr/bin/gh pr create --fill",
     "cd /tmp && GH_REPO=a/b timeout 5 nice gh pr create --fill",
-    "python3 -c \"import subprocess; subprocess.run(['gh','pr','create','--fill'])\"",
     "bash -c 'gh pr create --fill'", "echo \"$(gh pr create --fill)\"",
     "gh api repos/o/r/pulls -f title=x -f head=feat/x",
     "gh api repos/o/r/pulls --field=title=x", "gh api repos/o/r/pulls -ftitle=x",
@@ -795,6 +794,17 @@ PR_OPEN_SPELLINGS = [
     "gh api \"repos/o/r/pulls\" -f title=x", "gh api repos/o/r/pulls --input - <<< '{}'",
     "gh api graphql -f query='mutation { createPullRequest(input:{}) { x } }'",
     "gh alias set mk 'pr create'",
+]
+# Not guaranteed by the globs since they were narrowed to `*gh pr create*` /
+# `*gh pr new*` (the wider `*gh*pr*create*` also matched file paths and
+# refused them headless). The agent-PATH gh wrapper (runtime/bin/agent/gh)
+# catches these from argv; tests/test_gh_shim.py runs every spelling in both
+# lists through a real bash and asserts one layer or the other refuses it.
+WRAPPER_ONLY_SPELLINGS = [
+    "gh pr \"create\" --fill",
+    "python3 -c \"import subprocess; subprocess.run(['gh','pr','create','--fill'])\"",
+    "gh -R acme/widget pr create --fill",
+    "bash scripts/open-pr.sh",       # the checkout's own script runs `gh pr create`
 ]
 # Deliberately NOT asked (round 3: the gate is friction for ordinary
 # spellings, and each of these takes intent): `EP=repos/o/r/pulls; gh api $EP

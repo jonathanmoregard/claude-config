@@ -15,12 +15,13 @@ a script file or git hook or gh alias, an interpreter, a variable spelling
 such as `${g}h pr create`). The checks below are built against the paths an
 honest agent stumbles into, not against those.
 
-WHAT ENFORCES IT. Not this hook. For the ordinary PR-open spellings,
-settings.json `permissions.ask` prompts, and with `Bash` allowed it is that
-rule which stops an unreviewed open: this hook timing out, crashing,
-misparsing a command or not being installed all leave the prompt in place.
-This hook's privilege is to ANSWER the prompt "allow" -- once, for the exact
-call it judged -- and to deny with a remedy. Nothing depends on the deny.
+WHAT ENFORCES IT. Not this hook. The agent-PATH gh wrapper (bin/agent/gh)
+judges every gh process by its real argv, through judge() below; for the
+literal PR-open spellings, settings.json `permissions.ask` prompts as a text
+backstop, so this hook timing out, crashing, misparsing a command or not
+being installed all leave the prompt in place. This hook's privilege is to
+ANSWER the prompt "allow" -- once, for the exact call it judged -- and to
+deny with a remedy. Nothing depends on the deny.
 
 EVENTS (one script, dispatched on hook_event_name):
 
@@ -293,48 +294,52 @@ def pending_commit_view(call: dict, info: dict, branch: str,
     return [(work, rows)], ""
 
 
-def on_pretool(payload: dict) -> None:
-    tool, tool_input = payload.get("tool_name"), payload.get("tool_input")
-    call = g.pr_open_call(tool, tool_input)
-    if call is None:
-        return
-    session = g.safe_id(payload.get("session_id")) or "unknown"
-    slot = grant_path(session, payload)
+def recent_waiver(payload: dict, info: dict, session: str, where: dict, now: float) -> bool:
+    """Did this session's skip-artl already let THIS open (same repo, branch
+    and tip) through, within GRANT_TTL_S? `gh pr create` meets the ask rule,
+    so the PreToolUse judgement spends the waiver and grants; the same
+    command then runs the gh wrapper, which must not refuse what the user
+    just allowed. Only a waiver THIS hook spent counts (its records carry no
+    `layer`): one the wrapper spent itself must not cover a second open."""
+    for d in g.read_records_dirs(payload, info):
+        for rec in g.read_jsonl(d / g.EXEMPTIONS_FILE):
+            if rec.get("kind") == "user-override" and rec.get("session") == session \
+                    and not rec.get("layer") \
+                    and now - float(rec.get("ts", 0)) <= g.GRANT_TTL_S \
+                    and all(rec.get(k) == where[k] for k in ("repo", "branch", "head")):
+                return True
+    return False
 
-    def deny(reasons: list[str], with_remedy: bool) -> None:
-        revoke(slot)
-        refuse(reasons, with_remedy)
 
+def judge(payload: dict, call: dict, session: str, now: float,
+          layer: str | None = None) -> tuple[list[str], bool, dict | None]:
+    """(reasons, with_remedy, where): may this PR open go ahead? No reasons
+    means yes, and any exemption it rests on is logged (tagged with `layer`
+    when it is not this hook). Shared by on_pretool and the gh wrapper."""
     if call.get("problem"):
-        deny([call["problem"]], with_remedy=False)
-        return
-    now = time.time()
+        return [call["problem"]], False, None
     info, branch, tip, problem = locate(payload, call)
     if problem:
-        deny([problem], with_remedy=False)
-        return
+        return [problem], False, None
     top = info["top"]
     base, problem = g.remote_base(top)
     if problem:
-        deny([problem], with_remedy=False)
-        return
+        return [problem], False, None
     mb = g.git(top, "merge-base", base, tip)
     changes = g.numstat(top, mb, tip) if mb else None
     if changes is None:
-        deny([f"no merge base with the remote default branch could be found in {top}"],
-             with_remedy=False)
-        return
+        return [f"no merge base with the remote default branch could be found in {top}"], \
+            False, None
 
     smoke, smoke_log = g.smoke_problem(top, mb, tip, changes)
     if smoke:
-        deny([smoke], with_remedy=False)
-        return
+        return [smoke], False, None
 
     where = {"repo": info["repo"], "top": top, "branch": branch, "head": tip}
+    tag = {"layer": layer} if layer else {}
     pending, problem = pending_commit_view(call, info, branch, mb)
     if problem:
-        deny([problem], with_remedy=False)
-        return
+        return [problem], False, None
     views = [(tip, changes)] + pending
     exempt = None
     for _, view_changes in views:
@@ -342,7 +347,7 @@ def on_pretool(payload: dict) -> None:
         if not exempt:
             break
     if exempt:
-        log_exemption(payload, {"kind": "computed", "why": exempt, **where})
+        log_exemption(payload, {"kind": "computed", "why": exempt, **where, **tag})
     else:
         records: list[dict] = []
         for d in g.read_records_dirs(payload, info):
@@ -353,13 +358,33 @@ def on_pretool(payload: dict) -> None:
             if problem:
                 break
         if problem:
-            if not take_override(session, now):
-                deny([problem], with_remedy=True)
-                return
-            log_exemption(payload, {"kind": "user-override", "why": problem, **where})
+            if layer and recent_waiver(payload, info, session, where, now):
+                pass
+            elif take_override(session, now):
+                log_exemption(payload, {"kind": "user-override", "why": problem,
+                                        **where, **tag})
+            else:
+                return [problem], True, None
 
     if smoke_log:
-        log_exemption(payload, {**smoke_log, **where})
+        log_exemption(payload, {**smoke_log, **where, **tag})
+    return [], False, where
+
+
+def on_pretool(payload: dict) -> None:
+    tool, tool_input = payload.get("tool_name"), payload.get("tool_input")
+    call = g.pr_open_call(tool, tool_input)
+    if call is None:
+        return
+    session = g.safe_id(payload.get("session_id")) or "unknown"
+    slot = grant_path(session, payload)
+    now = time.time()
+    reasons, with_remedy, where = judge(payload, call, session, now)
+    if reasons:
+        # A deny takes back any grant an earlier pass of the same call minted.
+        revoke(slot)
+        refuse(reasons, with_remedy)
+        return
     stale = g.prune(g.state_dir() / "grants", g.GRANT_TTL_S, now)
     if stale:
         print(f"pr-open-gate: could not remove {stale} expired grant file(s); "

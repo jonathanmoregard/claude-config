@@ -263,11 +263,13 @@
       "Write(~/.local/state/claude-pr-open-gate)",
       "Bash(*artl-evidence.jsonl*)",
       "Bash(*artl-exemptions.jsonl*)",
-      "Bash(*claude-pr-open-gate*)"
+      "Bash(*claude-pr-open-gate*)",
+      "Bash(/nix/store/*/bin/gh *)",
+      "Bash(/nix/store/*/bin/.gh-wrapped *)"
     ],
     "ask": [
-      "Bash(*gh*pr*create*)",
-      "Bash(*gh*pr*new*)",
+      "Bash(*gh pr create*)",
+      "Bash(*gh pr new*)",
       "Bash(*createPullRequest*)",
       "Bash(*gh*api*pulls*-f*)",
       "Bash(*gh*api*-f*pulls*)",
@@ -571,6 +573,15 @@
             "command": "python3 -S -E $HOME/.claude/hooks/unit-failure-health.py",
             "timeout": 5,
             "statusMessage": "Checking failed system units..."
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/hooks/gh-shim-path.sh",
+            "timeout": 5
           }
         ]
       },

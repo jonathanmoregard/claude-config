@@ -9,32 +9,33 @@ ENFORCEMENT MODEL
   ordinary way of opening a PR depend on a review, so that an honest agent
   reviews first -- not to stop an agent that sets out to evade it.
 
-  What it covers: settings.json `permissions.ask` globs, matched against the
-  raw command text, catch the ordinary spellings of a PR open -- `gh pr
-  create` / `gh pr new` however spaced or wrapped; a `gh api` call whose
-  path names `pulls` and that carries a field or body flag (`-f`, `-F`,
-  `--field`, `--raw-field`, `--input`: gh then POSTs) or an explicit POST,
-  the endpoint quoted or not; a GraphQL body that names `createPullRequest`;
-  `gh alias`; and the GitHub MCP create tool. A `gh api` call that cannot
-  open a PR -- a bare or `-X GET` read, a GraphQL query, an issue comment --
-  is NOT asked: headless, an ask is a refusal, and refusing reads is pure
-  cost. Accepted over-matches: other writes under `pulls/` (a PR comment)
-  and `gh api -X GET .../pulls -f state=open`.
-  `Bash` is on the allow list, so for these spellings the ask rule -- not
-  this code -- is what stops an unreviewed PR open: a parser miss, a hook
-  timeout, a crash, or a hook that is not installed all leave the prompt.
+  What it covers, in two layers:
+  1. ARGV (primary): bin/agent/gh, first on PATH in agent sessions (hooks/
+     gh-shim-path.sh), sees the argv of every gh process the session starts
+     -- typed, from a script file, a git hook, an interpreter, a variable or
+     quote-split spelling -- and judges a PR open (gh_argv_open) with the
+     same code as the hook below. It refuses with the remedy or execs the
+     real gh untouched. permissions.deny covers gh's /nix/store path.
+  2. TEXT (backstop): settings.json `permissions.ask` globs, matched against
+     the raw command text: `gh pr create` / `gh pr new` written literally
+     (narrowed from `*gh*pr*create*`, which matched file paths and refused
+     them headless); a `gh api` call whose path names `pulls` with a field
+     or body flag or an explicit POST; a GraphQL body naming
+     `createPullRequest`; `gh alias`; and the GitHub MCP create tool, which
+     has no argv to wrap. For these the ask rule stands even when this code
+     misparses, times out, crashes or is not installed. A `gh api` read, a
+     GraphQL query or an issue comment is NOT asked: headless, an ask is a
+     refusal. Accepted over-matches: other writes under `pulls/` and
+     `gh api -X GET .../pulls -f state=open`.
 
-  What it does NOT reach (measured or by construction; each takes intent,
-  and none is in scope): curl or any other HTTP client to the REST API; a PR
-  opened from a script file (`bash ./open.sh`), a git hook or a gh alias's
-  later use; argv built by an interpreter; a variable spelling (`${g}h pr
-  create`, `EP=.../pulls; gh api $EP ...` -- the matcher expands nothing); a
-  keyword split with quotes or a backslash (`gh pr cre"ate"`, `cr''eate`,
-  `g\\h`) -- MEASURED: Claude Code 2.1.322 asks for these, 2.1.311 runs the
-  quoted ones, so nothing here relies on either; a GraphQL mutation read
-  from a file (`-F query=@m.graphql`); a second PR open in the same command
-  hidden from the scanner after a judged one; and
-  `git push origin HEAD:reviewed && gh pr create --head reviewed`.
+  What it does NOT reach (by construction; each takes intent, and none is in
+  scope): curl or any other HTTP client to the REST API; gh run by another
+  absolute path (a profile symlink) or from a process the Bash tool did not
+  start; a gh alias's later use (gh expands it internally; `gh alias` itself
+  is asked); a GraphQL mutation read from a file (`-F query=@m.graphql`); a
+  second PR open in the same command hidden from the text scanner after a
+  judged one; and `git push origin HEAD:reviewed && gh pr create --head
+  reviewed`.
 
   This module's one privilege is to ANSWER the prompt "allow", through a
   one-shot grant bound to the exact call from the exact cwd and spent only
@@ -604,6 +605,43 @@ def _gh_pr_create(args: list[str]) -> dict:
     flags = _pflag_values(args, PR_CREATE_VALUE_SHORT, PR_CREATE_VALUE_LONG)
     return {"kind": "gh-pr-create", "head": flags.get("head") or None,
             "repo": flags.get("repo") or None, "input": None, "problem": None}
+
+
+def gh_argv_open(argv: list[str]) -> dict | None:
+    """The PR open gh's own ARGV makes (argv[0], the program, excluded), or
+    None. Used by the agent-PATH gh wrapper (bin/agent/gh), which sees the
+    argv the shell actually built, so none of _scan's text reconstruction is
+    needed. `gh -R x pr create` and `gh pr -R x create` both run (cobra finds
+    the subcommand past flags); `--help` and `--dry-run` open nothing."""
+    words: list[tuple[int, str]] = []
+    i = 0
+    while i < len(argv) and len(words) < 2:
+        a = argv[i]
+        if a == "--":
+            break
+        if a in ("-R", "--repo"):
+            i += 2
+            continue
+        if not a.startswith("-"):
+            words.append((i, a))
+        i += 1
+    if not words:
+        return None
+    rest = [a for j, a in enumerate(argv) if j not in {k for k, _ in words[:2]}]
+    if words[0][1] == "api":
+        # Flags before `api` are still gh api's; only the `api` word goes.
+        call = _gh_api([a for j, a in enumerate(argv) if j != words[0][0]])
+    elif len(words) == 2 and words[0][1] == "pr" and words[1][1] in ("create", "new"):
+        flags = rest[:rest.index("--")] if "--" in rest else rest
+        if any(f in ("-h", "--help", "--dry-run", "--dry-run=true") for f in flags):
+            return None
+        call = _gh_pr_create(rest)
+    else:
+        return None
+    if call is None:
+        return None
+    return {"cwd": None, "input": None, "commits": False, "adds": False,
+            "writes": [], "count": 1, **call}
 
 
 def _pre_unsafe(seg: dict) -> tuple[str | None, bool, bool]:

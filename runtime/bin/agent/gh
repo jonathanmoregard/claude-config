@@ -1,0 +1,136 @@
+#!/usr/bin/env -S python3 -S -E
+"""gh, as agent sessions see it: the argv-level PR-open gate.
+
+WHY. permissions.ask / deny rules match the Bash tool's command TEXT. Every
+defect three review rounds of the PR-open gate found came from that layer:
+an unenumerated `gh api .../pulls`, `--body -Hmain` misparsed, the same
+quoting asked on one Claude Code version and not the next, `*gh*pr*new*`
+refusing a test command whose path held those letters. This wrapper sees
+the argv the shell actually built, so none of that applies here.
+
+WHAT. First on PATH for agent sessions only: hooks/gh-shim-path.sh, a
+SessionStart hook, appends the export to $CLAUDE_ENV_FILE, which Claude Code
+sources before every Bash command (subagents' too). Not settings.json `env`:
+that field does not interpolate ${PATH} (measured, 2.1.322) and a literal
+PATH there breaks every hook. Jonathan's own shells never see this file:
+~/.claude/bin is on his login PATH, which is why it lives in bin/agent/.
+
+  * A PR open -- `gh pr create` / `gh pr new`, a POST (explicit or implied by
+    -f/-F/--field/--raw-field/--input) to a pulls collection, a GraphQL
+    createPullRequest; artl_gate.gh_argv_open decides -- is judged by the
+    same code as the PreToolUse hook (pr-open-gate.judge). Refused: exit 1,
+    the reasons and what to run on stderr, the real gh never started.
+  * Everything else, and a PR open that passes, execs the real gh: same
+    argv, same stdin/stdout/stderr (it is the same process), its exit code.
+
+The real gh is the first `gh` on PATH outside this wrapper's own directory
+(compared resolved, so a symlinked copy of the directory is skipped too). No
+store path is hard-coded: it changes on every rebuild.
+
+Scaffolding, not a security boundary: the point is that the default path
+reminds the agent to review first. A determined agent can call the real
+binary another way; permissions.deny covers its /nix/store path, and the
+narrowed ask rules remain as a text-level backstop.
+"""
+import importlib.util
+import os
+import shlex
+import sys
+import time
+from pathlib import Path
+
+HOOKS = Path(__file__).resolve().parents[2] / "hooks"
+SKILL = "~/.claude/skills/advice-refine-test-loop/SKILL.md"
+
+
+def refuse(argv: list[str], reasons: list[str], with_remedy: bool) -> int:
+    cmd = shlex.join(["gh", *argv])
+    lines = [f"gh: pr-open-gate refused this PR open (`{cmd}`), checked by the gh "
+             f"wrapper on the agent's PATH:"]
+    lines += [f"- {r}" for r in reasons]
+    if with_remedy:
+        lines.append(
+            f"What to run: the advice-refine-test-loop skill on this branch's finished "
+            f"diff (the Skill tool, or Read {SKILL} and follow it). Fix what its advisor "
+            f"finds, then run `{cmd}` again.")
+    else:
+        lines.append(f"Resolve that, then run `{cmd}` again.")
+    sys.stderr.write("\n".join(lines) + "\n")
+    sys.stderr.flush()
+    return 1
+
+
+def load(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def crude_open(argv: list[str]) -> bool:
+    """Used only when the gate's code cannot be loaded: a broken config must
+    not wave through what is plainly a PR open."""
+    words = [a for a in argv if not a.startswith("-")]
+    if words[:1] == ["pr"] and words[1:2] in (["create"], ["new"]):
+        return True
+    return words[:1] == ["api"] and any("pulls" in a or "createPullRequest" in a
+                                        for a in argv)
+
+
+def judge(argv: list[str]) -> int | None:
+    """Exit status of a refusal, or None to exec the real gh."""
+    try:
+        sys.path.insert(0, str(HOOKS))
+        g = load("artl_gate", HOOKS / "artl_gate.py")
+        sys.modules["artl_gate"] = g
+        call = g.gh_argv_open(argv)
+    except Exception as exc:  # noqa: BLE001 -- any load failure
+        if crude_open(argv):
+            return refuse(argv, [f"the gate's code could not be loaded from {HOOKS} "
+                                 f"({type(exc).__name__}: {exc})"], with_remedy=False)
+        return None
+    if call is None:
+        return None
+    try:
+        gate = load("pr_open_gate", HOOKS / "pr-open-gate.py")
+        if os.environ.get("GH_REPO") and not call.get("repo"):
+            call["repo"] = os.environ["GH_REPO"]      # gh reads it as the target
+        session = g.safe_id(os.environ.get("CLAUDE_CODE_SESSION_ID")) or "unknown"
+        payload = {"cwd": os.getcwd(), "session_id": session}
+        reasons, with_remedy, _ = gate.judge(payload, call, session, time.time(),
+                                             layer="gh-wrapper")
+    except Exception as exc:  # noqa: BLE001 -- refuse, never open unjudged
+        return refuse(argv, [f"the gate failed while judging this PR open "
+                             f"({type(exc).__name__}: {exc})"], with_remedy=False)
+    return refuse(argv, reasons, with_remedy) if reasons else None
+
+
+def real_gh() -> str | None:
+    me = os.path.realpath(__file__)
+    here = os.path.dirname(me)
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not entry or os.path.realpath(entry) == here:
+            continue
+        cand = os.path.join(entry, "gh")
+        if os.path.isfile(cand) and os.access(cand, os.X_OK) \
+                and os.path.realpath(cand) != me:
+            return cand
+    return None
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    status = judge(argv)
+    if status is not None:
+        return status
+    real = real_gh()
+    if real is None:
+        sys.stderr.write("gh (agent wrapper): no gh found on PATH outside "
+                         f"{os.path.dirname(os.path.realpath(__file__))}\n")
+        return 127
+    os.execv(real, [real, *argv])
+    return 127  # not reached
+
+
+if __name__ == "__main__":
+    sys.exit(main())
