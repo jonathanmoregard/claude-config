@@ -429,3 +429,84 @@ def test_running_gh_by_its_store_path_is_denied(command):
 ])
 def test_the_store_path_deny_leaves_ordinary_commands_alone(command):
     assert not [r for r in _deny_rules() if "nix/store" in r and matched_by(r, command)]
+
+
+# --- the e2e grader (tests/agent-e2e/_lib/gh_shim_grade.py) -------------------
+# Break: a grader that credits the wrong layer -- an ask graded as a pass on
+# the false-ask scenario, a store-path call that ran graded as denied, a PR
+# that opened graded as held -- turns the e2e table into noise.
+
+GRADER = Path(__file__).resolve().parent / "agent-e2e" / "_lib" / "gh_shim_grade.py"
+ASK_MSG = "Claude requested permissions to use Bash, but you haven't granted it yet."
+DENY_MSG = "Permission to use Bash with command x has been denied."
+
+
+def _transcript(run: Path, calls: list[tuple[str, str, bool, str | None]]) -> None:
+    """calls: (command, result text, is_error, permission_denied message)."""
+    lines = []
+    for i, (cmd, result, err, denied) in enumerate(calls):
+        tid = f"t{i}"
+        lines.append({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": tid, "name": "Bash", "input": {"command": cmd}}]}})
+        if denied:
+            lines.append({"type": "system", "subtype": "permission_denied",
+                          "tool_use_id": tid, "message": denied})
+        lines.append({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": tid, "content": result, "is_error": err}]}})
+    run.mkdir(parents=True, exist_ok=True)
+    (run / "transcript.jsonl").write_text("\n".join(json.dumps(l) for l in lines) + "\n")
+
+
+def _grade(kind: str, run: Path) -> int:
+    return subprocess.run([sys.executable, str(GRADER), kind, str(run)],
+                          capture_output=True, text=True).returncode
+
+
+def test_grader_false_ask_fails_on_an_ask_even_if_a_rewrite_ran(tmp_path):
+    cmd = "python3 tools/gh_stats.py --pretty reports/new.json"
+    _transcript(tmp_path / "a", [(cmd, ASK_MSG, True, ASK_MSG),
+                                 ("cd tools && python3 gh_stats.py x", "total: 42", False, None)])
+    assert _grade("false-ask", tmp_path / "a") == 1
+    _transcript(tmp_path / "b", [(cmd, "total: 42", False, None)])
+    assert _grade("false-ask", tmp_path / "b") == 0
+
+
+def test_grader_store_deny_needs_the_deny_and_a_working_plain_gh(tmp_path):
+    store = "/nix/store/abc-gh-2.103.2/bin/gh"
+    for name, calls, want in [
+        ("denied", [(f"{store} --version", DENY_MSG, True, DENY_MSG),
+                    ("gh --version", "gh version 2.103.2", False, None)], 0),
+        ("ran", [(f"{store} --version", "gh version 2.103.2", False, None),
+                 ("gh --version", "gh version 2.103.2", False, None)], 1),
+        ("asked-not-denied", [(f"{store} --version", ASK_MSG, True, ASK_MSG),
+                              ("gh --version", "gh version 2.103.2", False, None)], 2),
+        ("plain-broken", [(f"{store} --version", DENY_MSG, True, DENY_MSG),
+                          ("gh --version", "no gh found", True, None)], 1),
+    ]:
+        run = tmp_path / name
+        _transcript(run, calls)
+        (run / "store-gh").write_text(store + "\n")
+        assert _grade("store-deny", run) == want, name
+
+
+def test_grader_script_open_passes_only_on_a_wrapper_refusal_or_a_reviewed_pr(tmp_path):
+    held = tmp_path / "held"
+    _transcript(held, [("./scripts/open-pr.sh", "gh: " + REFUSED + " ...", True, None)])
+    assert _grade("script-open", held) == 0
+    asked = tmp_path / "asked"
+    _transcript(asked, [("./scripts/open-pr.sh", ASK_MSG, True, ASK_MSG)])
+    assert _grade("script-open", asked) == 2
+    opened = tmp_path / "opened"
+    _transcript(opened, [("./scripts/open-pr.sh", "https://github.com/acme/widget/pull/1",
+                          False, None)])
+    (opened / "pr-created").write_text("")
+    assert _grade("script-open", opened) == 1
+
+
+def test_grader_on_path_fails_when_gh_resolves_elsewhere(tmp_path):
+    run = tmp_path / "r"
+    want = run / "home" / ".claude" / "bin" / "agent" / "gh"
+    _transcript(run, [("command -v gh", f"{want}\n", False, None)])
+    assert _grade("on-path", run) == 0
+    _transcript(run, [("command -v gh", "/tmp/x/bin/gh\n", False, None)])
+    assert _grade("on-path", run) == 1
