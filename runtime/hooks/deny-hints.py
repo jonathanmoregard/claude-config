@@ -116,6 +116,20 @@ HINTS: list[tuple[tuple[str, ...], str]] = [
         "Do instead: leave it alone; if the task genuinely needs it, ask the "
         "user.\n" + _ROUTING_NOTE,
     ),
+    (
+        ("*artl-evidence.jsonl*", "*artl-exemptions.jsonl*", "*claude-pr-open-gate*"),
+        "Why the rule exists: ~/.local/state/claude-pr-open-gate/ holds the "
+        "PR-open gate's records -- advisor verdicts, the files each advisor "
+        "read, exemptions, one-shot grants and the user's skip-artl override. "
+        "Only hooks/pr-open-gate.py and hooks/artl-evidence.py write them; a "
+        "shell command that touches them can forge the review the gate asks "
+        "for.\n"
+        "Do instead: run the advice-refine-test-loop skill; its advisor "
+        "verdicts are recorded automatically, and the gate's refusal says "
+        "what is missing. If the advisor is unavailable, only the user can "
+        "waive the review: their own message with the waiver word (skip-artl) "
+        "standing alone on a line of its own.\n" + _ROUTING_NOTE,
+    ),
 ]
 
 _GENERIC = (
