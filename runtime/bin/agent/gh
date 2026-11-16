@@ -8,7 +8,7 @@ quoting asked on one Claude Code version and not the next, `*gh*pr*new*`
 refusing a test command whose path held those letters. This wrapper sees
 the argv the shell actually built, so none of that applies here.
 
-WHAT. First on PATH for agent sessions only: hooks/gh-shim-path.sh, a
+WHAT. First on PATH for agent sessions only: hooks/argv-gate-path.sh, a
 SessionStart hook, appends the export to $CLAUDE_ENV_FILE, which Claude Code
 sources before every Bash command (subagents' too). Not settings.json `env`:
 that field does not interpolate ${PATH} (measured, 2.1.322) and a literal

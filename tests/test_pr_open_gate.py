@@ -798,7 +798,7 @@ PR_OPEN_SPELLINGS = [
 # Not guaranteed by the globs since they were narrowed to `*gh pr create*` /
 # `*gh pr new*` (the wider `*gh*pr*create*` also matched file paths and
 # refused them headless). The agent-PATH gh wrapper (runtime/bin/agent/gh)
-# catches these from argv; tests/test_gh_shim.py runs every spelling in both
+# catches these from argv; tests/test_argv_gate.py runs every spelling in both
 # lists through a real bash and asserts one layer or the other refuses it.
 WRAPPER_ONLY_SPELLINGS = [
     "gh pr \"create\" --fill",

@@ -580,7 +580,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash $HOME/.claude/hooks/gh-shim-path.sh",
+            "command": "bash $HOME/.claude/hooks/argv-gate-path.sh",
             "timeout": 5
           }
         ]

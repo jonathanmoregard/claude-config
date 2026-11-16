@@ -11,7 +11,7 @@ ENFORCEMENT MODEL
 
   What it covers, in two layers:
   1. ARGV (primary): bin/agent/gh, first on PATH in agent sessions (hooks/
-     gh-shim-path.sh), sees the argv of every gh process the session starts
+     argv-gate-path.sh), sees the argv of every gh process the session starts
      -- typed, from a script file, a git hook, an interpreter, a variable or
      quote-split spelling -- and judges a PR open (gh_argv_open) with the
      same code as the hook below. It refuses with the remedy or execs the

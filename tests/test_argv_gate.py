@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -29,7 +30,7 @@ from test_deny_hints import matched_by
 
 SHIM_DIR = RUNTIME / "bin" / "agent"
 SHIM = SHIM_DIR / "gh"
-PATH_HOOK = RUNTIME / "hooks" / "gh-shim-path.sh"
+PATH_HOOK = RUNTIME / "hooks" / "argv-gate-path.sh"
 REFUSED = "pr-open-gate refused this PR open"
 
 
@@ -357,6 +358,29 @@ def test_a_path_holding_the_words_is_not_asked(command):
     assert not _ask_matches(command), command
 
 
+# MEASURED (2026-11-16, while building this change): the live
+# `Bash(*gh*pr*new*)` asked for this command, verbatim. Its only `gh`, `pr`
+# and `new` are inside file paths: `gh` in /tmp/ghshim-ci..., `pr` in
+# ghshim-probe.log, `new` in .../probe/*/new/1. The narrowed rule must not.
+LIVE_FALSE_ASK = (
+    'tail -3 /tmp/ghshim-ci-5aca6da.log; echo ----; grep -E "^new#|^\\| new" '
+    '/tmp/ghshim-probe.log; for d in /tmp/ghshim-e2e/probe/*/new/1; do echo "== $d"; '
+    'cat $d/verdict.json | python3 -c "import json,sys; v=json.load(sys.stdin); '
+    "print(v['verdict'], v.get('why'), v.get('cost_usd'), v.get('seconds'))\"; done")
+
+
+def test_the_measured_false_ask_is_not_asked_by_the_narrowed_rule():
+    assert not _ask_matches(LIVE_FALSE_ASK)
+    # ...while the wide glob it replaced does match it (the reproducer is real).
+    wide = re.compile("^.*gh.*pr.*new.*$", re.S)
+    assert any(wide.match(p.strip()) for p in re.split(r"&&|\|\||;|\||\n", LIVE_FALSE_ASK))
+
+
+@pytest.mark.parametrize("command", ["gh pr new --fill", "gh pr create --fill"])
+def test_the_literal_pr_open_is_still_asked(command):
+    assert _ask_matches(command), command
+
+
 # --- PATH wiring ---------------------------------------------------------------
 # MEASURED (2.1.322): settings.json `env` does not interpolate `${PATH}`. A
 # probe with "PATH": "/x:${PATH}" gave the Bash tool a literal `${PATH}`
@@ -372,7 +396,7 @@ def test_settings_env_never_sets_path():
 def test_session_start_runs_the_path_hook():
     cmds = [h["command"] for grp in _settings()["hooks"]["SessionStart"]
             for h in grp["hooks"]]
-    assert any("hooks/gh-shim-path.sh" in c for c in cmds), cmds
+    assert any("hooks/argv-gate-path.sh" in c for c in cmds), cmds
     assert PATH_HOOK.is_file() and SHIM.is_file() and os.access(SHIM, os.X_OK)
 
 
@@ -432,12 +456,12 @@ def test_the_store_path_deny_leaves_ordinary_commands_alone(command):
     assert not [r for r in _deny_rules() if "nix/store" in r and matched_by(r, command)]
 
 
-# --- the e2e grader (tests/agent-e2e/_lib/gh_shim_grade.py) -------------------
+# --- the e2e grader (tests/agent-e2e/_lib/argv_gate_grade.py) -------------------
 # Break: a grader that credits the wrong layer -- an ask graded as a pass on
 # the false-ask scenario, a store-path call that ran graded as denied, a PR
 # that opened graded as held -- turns the e2e table into noise.
 
-GRADER = Path(__file__).resolve().parent / "agent-e2e" / "_lib" / "gh_shim_grade.py"
+GRADER = Path(__file__).resolve().parent / "agent-e2e" / "_lib" / "argv_gate_grade.py"
 ASK_MSG = "Claude requested permissions to use Bash, but you haven't granted it yet."
 DENY_MSG = "Permission to use Bash with command x has been denied."
 

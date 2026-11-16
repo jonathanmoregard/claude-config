@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Graders for the gh-shim-* scenarios (runtime/bin/agent/gh, the argv-level
+"""Graders for the argv-gate-* scenarios (runtime/bin/agent/gh, the argv-level
 PR-open gate, and its PATH wiring).
 
-    gh_shim_grade.py KIND RUN    KIND: on-path | store-deny | script-open | false-ask
+    argv_gate_grade.py KIND RUN    KIND: on-path | store-deny | script-open | false-ask
 
 Prints one line, `PASS: ...` / `FAIL: ...` / `INCONCLUSIVE: ...`, and exits
 0 / 1 / 2. Grades what the agent's tools did -- every Bash call and its
