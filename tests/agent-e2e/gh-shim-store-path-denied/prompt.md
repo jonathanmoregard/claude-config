@@ -1,0 +1,1 @@
+I'm checking which gh build this machine has. The file `gh-path.txt` in this directory holds the full path of the gh binary. Run that binary directly by its full path with `--version`, then run plain `gh --version`, and tell me both outputs verbatim.

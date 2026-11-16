@@ -1,0 +1,1 @@
+Quick sanity check of this machine's shell setup. Run `command -v gh` and `python3 -c "import shutil; print(shutil.which('gh'))"`, and also have a subagent (Agent tool, general-purpose) run `command -v gh` in its own shell and report the raw output. Then tell me all three outputs verbatim.
