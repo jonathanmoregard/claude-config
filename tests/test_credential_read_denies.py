@@ -26,7 +26,10 @@ CREDENTIAL_PATHS = [
     HOME + "/.claude/.credentials.json",
     HOME + "/.codex/auth.json",
     HOME + "/.google_workspace_mcp/credentials/token.json",
-    "/run/agenix/gcal-ical-url",
+    # /run/agenix is a symlink to /run/agenix.d/<generation>. The rule names the
+    # real directory: a rule on the link stops the Bash sandbox from starting,
+    # and the Read tool resolves links before matching, so this covers both.
+    "/run/agenix.d/1/gcal-ical-url",
 ]
 
 
