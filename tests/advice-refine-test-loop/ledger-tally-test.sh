@@ -66,7 +66,12 @@ mkdir -p "$ROOT/repo1" "$ROOT/repo2"
   # two rows over two runs -> one below the row threshold.
   row g/r1 X2 refuted - "two rows only"
   row g/r2 X2 refuted - "two rows only"
+  # A lens name with a space, whose sweep items are `confirmed`; a stray line.
+  for r in 1 2 3 4 5; do row h/r$r "Defect classes" confirmed open -; done
+  echo "a stray line"
 } > "$ROOT/repo2/review-ledger.tsv"
+mkdir -p "$ROOT/repo3"   # a ledger written without its header row
+row i/r1 nohdr reproduced yes - > "$ROOT/repo3/review-ledger.tsv"
 
 T=$'\t'
 out=$("$TALLY" --root "$ROOT"); rc=$?
@@ -91,6 +96,12 @@ expect "exclude only the reason meeting both thresholds" \
 out=$("$TALLY" --root "$ROOT" D3 A)
 checks=$(grep -vE "^exclude\?${T}" <<<"$out" | cut -f1 | tr '\n' ' ')
 expect "arguments restrict per-check lines" "A D3 " "$checks"
+
+expect "a lens name with a space is selectable; confirmed counts as reproduced" \
+  "Defect classes${T}5${T}5${T}5${T}0${T}0${T}0${T}-" "$("$TALLY" --root "$ROOT" "Defect classes" | grep -v '^exclude')"
+out=$("$TALLY" --root "$ROOT")
+expect "first row of a headerless ledger is counted" "nohdr${T}1${T}1${T}1${T}1${T}0${T}0${T}-" "$(line nohdr)"
+expect "a line without ten fields is ignored" "" "$(grep -E "^(a stray line)?${T}" <<<"$out")"
 
 if (( fails )); then echo "FAIL: $fails ledger-tally assertion(s)"; exit 1; fi
 echo "PASS: ledger-tally"

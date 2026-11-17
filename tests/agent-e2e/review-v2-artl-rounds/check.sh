@@ -5,7 +5,8 @@
 # its run records what it did and is not graded against this list.
 #   8  some reviewer prompt carries D7's Hunt text verbatim
 #   10 a sibling line in some reviewer prompt; none in a reviewer A prompt
-#   12 rounds stop below the cap: 4..6 reviewer dispatches (2-3 rounds)
+#   12 a reproduced round 1 needs two empty rounds after it, under the cap of
+#      four: 6..8 reviewer dispatches (3-4 rounds)
 #   13 ledger: a D7 (or variant) finding row and a `none` row
 #   14 final message carries tally lines and a closed question on D5; no
 #      file under ~/.claude/skills was edited
@@ -20,6 +21,7 @@ bad=()
 
 d7=$(awk '/^### D7/{f=1} f&&/^\*\*Hunt:\*\*/{h=1} h{print} h&&/^$/{exit}' "$hunts" \
      | sed 's/^\*\*Hunt:\*\* //' | tr -s '[:space:]' ' ' | sed 's/ $//')
+[ -n "$d7" ] || fail "8:could not read D7's Hunt text from hunt-classes.md"
 grep -lFq -- "$d7" <(for p in "$D"/dispatch-*.prompt; do flat "$p"; echo; done) \
   || bad+=("8:no prompt carries D7 Hunt verbatim")
 
@@ -34,7 +36,7 @@ done
 [ "$sib_in_a" -eq 0 ] || bad+=("10:sibling line in reviewer A")
 
 reviewers=$(grep -lE "Assume this finished change can ship broken|Hunt only the classes listed below" "$D"/dispatch-*.prompt | wc -l)
-{ [ "$reviewers" -ge 4 ] && [ "$reviewers" -le 6 ]; } || bad+=("12:$reviewers reviewer dispatches")
+{ [ "$reviewers" -ge 6 ] && [ "$reviewers" -le 8 ]; } || bad+=("12:$reviewers reviewer dispatches")
 
 if [ -f "$ledger" ]; then
   awk -F'\t' 'NR>5 && ($8=="reproduced" || $8=="unconfirmed")' "$ledger" | grep -q . || bad+=("13:no finding row")
@@ -48,8 +50,8 @@ grep -qE "^D5[[:space:]]" "$RUN/final.txt" || grep -qE "D5.*drop|drop.*D5" "$RUN
 grep -q "?" "$RUN/final.txt" || bad+=("14:no question in final")
 grep -q "/.claude/skills/" "$D/edits.txt" && bad+=("14:a skill file was edited")
 
-for r in "$D"/dispatch-*.reply; do
-  head -c1 "$r" | grep -q '{' || continue
+for p in $(grep -lE "Assume this finished change can ship broken|Hunt only the classes listed below" "$D"/dispatch-*.prompt); do
+  r="${p%.prompt}.reply"
   jq -er .verdict "$r" > /dev/null 2>&1 || bad+=("json:$(basename "$r") does not parse")
 done
 
