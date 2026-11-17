@@ -977,6 +977,10 @@ def _read_paths(p: str) -> list[str]:
     """What one read covers: the file it resolves to, and each symlink named
     along its path -- a tracked symlink is a changed file of its own."""
     paths = [os.path.realpath(p)]
+    # `..` after a link leaves through the link's target, so the names such a
+    # path spells are not the ones it visits; it covers its resolved file only.
+    if ".." in p.split(os.sep):
+        return paths
     link = os.path.abspath(p)
     while link != os.path.dirname(link):
         if os.path.islink(link):
