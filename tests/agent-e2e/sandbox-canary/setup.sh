@@ -10,9 +10,11 @@ run=$2
 uid=$(id -u)
 canary=canary-value-not-a-secret
 
-runtime_dir=/run/user/$uid/e2e-sandbox-canary/$(basename "$run")-$$
+# Derived from RUN so check.sh removes it without trusting a file the agent can write.
+runtime_dir=/run/user/$uid/e2e-sandbox-canary/$(printf %s "$run" | sha256sum | cut -c1-16)
 mkdir -p "$HOME/.ssh" "$HOME/.codex" "$HOME/.cache/gh-tokens/host" \
-  "$run/vault.d/1" "$runtime_dir"
+  "$HOME/.cache/uv" "$HOME/.cache/nix" "$HOME/.cargo" \
+  "$run/vault.d/1" "$runtime_dir" "$work/sealed.d/1" "$work/plain.d/1"
 printf '%s\n' "$canary" >"$HOME/.ssh/id_ed25519"
 printf '%s\n' "$canary" >"$HOME/.codex/auth.json"
 printf '%s\n' "$canary" >"$HOME/.cache/gh-tokens/host/token"
@@ -20,7 +22,13 @@ printf '%s\n' "$canary" >"$run/vault.d/1/secret"
 printf '%s\n' "$canary" >"$runtime_dir/secret"
 # The /run/agenix shape: a deny rule on the real directory, reached by a link.
 ln -s "$run/vault.d/1" "$run/vault"
-echo "$runtime_dir" >"$run/runtime-dir"
+# The same shape for the Read tool, which the sandbox does not cover: the
+# permission rule alone must refuse sealed/note. plain/note is the control.
+# Neither value is in probe.sh, so the transcript shows one only if it was read.
+printf 'read-tool-sealed-plant\n' >"$work/sealed.d/1/note"
+printf 'read-tool-plain-plant\n' >"$work/plain.d/1/note"
+ln -s sealed.d/1 "$work/sealed"
+ln -s plain.d/1 "$work/plain"
 
 ident=(-c user.name=e2e -c user.email=e2e@example.invalid)
 git init -q "$work/repo"
@@ -49,6 +57,7 @@ secret linked-deny "$run/vault/secret"
 secret runtime-dir "$runtime_dir/secret"
 if [ "\${KITTY_LISTEN_ON:-}" = "$canary" ]; then echo denied-env=exposed; else echo denied-env=hidden; fi >>"\$out"
 works cwd-write sh -c ': >wrote.txt'
+works cache-roots sh -c ': >"\$HOME/.cache/uv/p" && : >"\$HOME/.cache/nix/p" && : >"\$HOME/.cargo/p"'
 works git-commit git -C repo -c user.name=e2e -c user.email=e2e@example.invalid commit -q --allow-empty -m probe
 works nix-eval sh -c '[ "\$(nix-instantiate --eval -E 1+1)" = 2 ]'
 works nix-daemon nix store info
@@ -56,14 +65,14 @@ works github sh -c '[ "\$(curl -s -o /dev/null -m 20 -w "%{http_code}" https://g
 cat "\$out"
 EOF
 
-python3 - "$HOME/.claude/settings.json" "$run" "$canary" "${SANDBOX_ENABLE:-1}" <<'PY'
+python3 - "$HOME/.claude/settings.json" "$run" "$canary" "${SANDBOX_ENABLE:-1}" "$work" <<'PY'
 import json, sys
-path, run, canary, enable = sys.argv[1:5]
+path, run, canary, enable, work = sys.argv[1:6]
 settings = json.load(open(path, encoding="utf-8"))
 # Not CLAUDE_CODE_MESSAGING_TOKEN: Claude Code never passes a settings.env
 # value for it to Bash, so that plant reads hidden with the sandbox off too.
 settings.setdefault("env", {})["KITTY_LISTEN_ON"] = canary
-settings["permissions"]["deny"].append(f"Read(/{run}/vault.d/**)")
+settings["permissions"]["deny"] += [f"Read(/{run}/vault.d/**)", f"Read(/{work}/sealed.d/**)"]
 if enable == "1":
     settings.setdefault("sandbox", {})["enabled"] = True
 open(path, "w", encoding="utf-8").write(json.dumps(settings, indent=2) + "\n")
