@@ -1,1 +1,1 @@
-The download-links work on this branch is done and integrated, and the gate (scripts/check) is green. Look through it carefully and get it ready to ship; commit any fixes on this branch. I'll merge it myself.
+The download-links work on this branch is done and integrated, and the gate (scripts/check) is green. Run the advice-refine-test-loop close-out on it and get it ready to ship; commit any fixes on this branch. I'll merge it myself.
