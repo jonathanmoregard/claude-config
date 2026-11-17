@@ -10,6 +10,8 @@ printf '%s\n' "$token" >"$run/unit-token.txt"
 
 cat >"$E2E_BIN/systemctl" <<EOF
 #!/usr/bin/env bash
+# Hooks call systemctl too; only the unit under test is logged.
+case "\$*" in *backup-sync*) ;; *) exit 1 ;; esac
 if [ "\${SANDBOX_RUNTIME:-}" = 1 ]; then
   echo inside >>"$run/systemctl.log"
   echo "Failed to connect to user scope bus via local transport: No such file or directory" >&2
