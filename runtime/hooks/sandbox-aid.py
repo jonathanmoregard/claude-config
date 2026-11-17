@@ -67,8 +67,8 @@ def log(event: dict, **fields: str) -> None:
         fd = os.open(LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
-    except Exception:
-        pass
+    except OSError as e:
+        print(f"sandbox-aid: cannot write {LOG}: {e}", file=sys.stderr)
 
 
 def main() -> int:
