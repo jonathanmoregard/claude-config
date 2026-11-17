@@ -63,12 +63,6 @@ import json, sys
 path = sys.argv[1]
 settings = json.load(open(path, encoding="utf-8"))
 settings.setdefault("sandbox", {})["enabled"] = True
-# Claude resolves /run/agenix (a symlink) to /run/agenix.d/<generation> for
-# the sandbox read mask, and bwrap cannot create that mount point, so with
-# this rule present every sandboxed command dies before it runs. Dropped in
-# every arm alike: it is a read rule and has no bearing on write roots.
-deny = settings.get("permissions", {}).get("deny", [])
-settings["permissions"]["deny"] = [r for r in deny if r != "Read(//run/agenix/**)"]
 open(path, "w", encoding="utf-8").write(json.dumps(settings, indent=2) + "\n")
 PY
 fi
