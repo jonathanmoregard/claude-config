@@ -42,7 +42,7 @@ Fill one row per method. Mark `n/a` where the repository has nothing for the
 method to act on (no migrations, no second store). Name the project's own
 tool where one exists; the table names categories only.
 
-| # | Method | Minimal baseline to ADD | Effort |
+| # | Method | Minimal baseline | Effort |
 |---|---|---|---|
 | 1 | Static checks in the gate: type checker, linter, exhaustiveness | the stack's standard checker switched on in the project gate | S–M |
 | 2 | Dependency auditor | one audit command in the gate: advisories, licences, unknown packages | S |
@@ -62,7 +62,7 @@ tool where one exists; the table names categories only.
 | 16 | Review ledger | `<notes>/review-ledger.tsv` with its header row | S |
 
 A baseline that needs a new dependency, a gate change or a paid service
-says so in its ADD item.
+says so where it is named.
 
 No ledger and no recorded defects: fill section 3 from fix and revert
 commits and mark row 16 absent.

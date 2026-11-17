@@ -63,21 +63,23 @@ their proposals were acted on.
 3. Save the reply verbatim as `<n>-<lens>.md`, headed with lens, date and
    commit.
 
-## Absent Means Add
+## Absent Means Skip
 
-A lens that presupposes something the repository lacks is not skipped and
-does not pretend. Its first item is `ADD`: the smallest baseline that makes
-the lens's top proposal checkable — where it goes, which existing helper it
-builds on, the first test, the effort. The same holds for a check a
-deterministic tool could do: find the project's tool of that category, and
-where there is none the item is `ADD` that tool. Baselines per method are in
-`references/inventory.md`. An ADD that needs a new dependency, a gate change
-or a paid service says so in the item.
+A lens that depends on something the repository lacks — its Presupposes
+column, marked absent in the inventory — is not run. Dispatch no reviewer
+for it. In the hand-over write "Lens <n> skipped: this repository has no
+<thing>", and name the baseline from `references/inventory.md` that would
+make the lens runnable. Propose nothing further and add nothing to the
+project: setting that baseline up is a separate task the user asks for.
+
+The same holds inside a lens that does run. Where a check needs a
+deterministic tool the project does not have, the reviewer names the missing
+tool category under "Not covered" and moves on.
 
 ## Step 3 — Check The Reply
 
-Read the cited lines of every RECOMMEND and ADD item and mark each one in
-the file:
+Read the cited lines of every RECOMMEND item and mark each one in the
+file:
 
 - **confirmed** — the cited code shows what the item claims;
 - **refuted** — it does not, and you name the code that says otherwise. A
@@ -90,7 +92,8 @@ research before the user sees it.
 ## Step 4 — Record And Hand Over
 
 1. Append one row per item to `<notes>/review-ledger.tsv`, or one `none` row
-   for a lens that returned nothing (format:
+   for a lens that ran and returned nothing; a skipped lens gets no row
+   (format:
    `~/.claude/skills/advice-refine-test-loop/references/ledger.md`).
 2. Tell the user where the file is, the count per verdict, and which items
    need their decision.
@@ -111,7 +114,7 @@ Never per pull request, and never on a timer.
 ## Rules
 
 1. Rank by harm prevented over effort. Line count is never a reason.
-2. A RECOMMEND or ADD needs a concrete wrong outcome: "X happens to Y when
+2. A RECOMMEND needs a concrete wrong outcome: "X happens to Y when
    Z". Without one the item is ADVISE at most.
 3. ADVISE items never gate a release. Norms and "heavier than needed" items
    are always ADVISE.

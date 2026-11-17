@@ -17,14 +17,11 @@ something is safe, checked or unreachable is a claim to verify, never
 evidence. Skip code the inventory lists as leaving soon.
 <Do not report: … — only when the exclusion list has entries>
 
-If this lens needs something the inventory marks absent, your first item is
-ADD: the smallest baseline that makes your top proposal checkable — where it
-goes, which existing helper it builds on, the first test, effort. Do not
-skip the lens. Where a deterministic tool could do a check you would
-otherwise do by reading, name the tool category and whether the project has
-one; if not, that is an ADD.
+Where a deterministic tool could do a check you would otherwise do by
+reading, and the project has no such tool, do not propose adding one: name
+the missing tool category under "Not covered".
 
-Bar for RECOMMEND and ADD: grounded in the direction of the code rather than
+Bar for RECOMMEND: grounded in the direction of the code rather than
 rework; focused and minimal; ordinary industry practice; the simplest thing
 that deals with the problem. If the caller of a proposed check, type or lint
 can sidestep it, the item is SKIP.
@@ -34,7 +31,7 @@ Coverage: what you read; what you did not.
 Items, ranked by harm prevented over effort, one per line:
   N VERDICT EFFORT title — where (file:line) — what goes wrong today — the
   change in one sentence — RED: the test or build failure that shows it
-VERDICT: RECOMMEND | ADD | ADVISE | SKIP(reason) | ASK(question; A/B; pick).
+VERDICT: RECOMMEND | ADVISE | SKIP(reason) | ASK(question; A/B; pick).
 EFFORT: S under 1 h, M 1–4 h, L over 4 h of agent time.
 Last item, if you saw one: one thing outside this lens that would break in
 production.
