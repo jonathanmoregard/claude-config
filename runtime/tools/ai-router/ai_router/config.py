@@ -11,6 +11,7 @@ job's ``meta.json`` concurrently by design; see ``atomic_write_text``.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import secrets
@@ -29,6 +30,10 @@ DEFAULT_MODELS_TOML = PACKAGE_DIR.parent / "models.toml"
 
 class ConfigError(ValueError):
     """models.toml is missing, malformed or internally inconsistent."""
+
+
+class SymlinkRefused(Exception):
+    """A job file or job directory is a symlink."""
 
 
 POLICIES = ("rank-first", "headroom-weighted", "pace")
@@ -215,9 +220,27 @@ def atomic_write_json(path: Path, obj: Any) -> None:
     atomic_write_text(path, json.dumps(obj, indent=1, sort_keys=True) + "\n")
 
 
-def read_json(path: Path) -> Any | None:
+def read_json(path: Path, *, nofollow: bool = False) -> Any | None:
     """Best-effort JSON read: missing or corrupt file → None."""
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(read_text_nofollow(path) if nofollow else path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+
+
+def _open_nofollow(path: Path, flags: int) -> int:
+    try:
+        return os.open(path, flags | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise SymlinkRefused(f"refusing symlinked job file: {path}") from None
+        raise
+
+
+def read_text_nofollow(path: Path, errors: str = "strict") -> str:
+    with open(_open_nofollow(path, os.O_RDONLY), encoding="utf-8", errors=errors) as fh:
+        return fh.read()
+
+
+def open_append_nofollow(path: Path) -> Any:
+    return open(_open_nofollow(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT), "ab")

@@ -112,7 +112,7 @@ def test_delegate_wait_and_inspect(capsys, env, prompt, state_dir, tmp_path):
     jid = res["job_id"]
     meta = jobs.read_meta(jobs.job_dir(state_dir, jid))
     assert meta["name"] == "smoke" and meta["bare"] is True and meta["launcher"] == "setsid"
-    assert "--setting-sources" in meta["argv"] and meta["argv"][-1] == "<prompt.md>"
+    assert meta["argv"][-1] == "<prompt.md>"
 
     rc, obj, *_ = run(capsys, ["status", jid, "--json"], env)
     assert rc == 0 and obj["status"] == "done" and obj["name"] == "smoke"
@@ -397,3 +397,63 @@ def test_output_is_sanitised(capsys, env, tmp_path):
     assert "\x1b" not in out and "OK" in out
     rc, _, out, _ = run(capsys, ["log", res["job_id"]], env)
     assert "\x1b" not in out
+
+
+OUTSIDE_FILE = os.__file__
+CANARY = "SECRET-CANARY"
+
+
+@pytest.mark.parametrize("flag", ["--prompt-file", "--schema", "--cwd"])
+def test_delegate_refuses_paths_outside_allowed_roots(capsys, env, prompt, tmp_path, state_dir, flag):
+    link = tmp_path / "link"
+    link.symlink_to(os.path.dirname(OUTSIDE_FILE) if flag == "--cwd" else OUTSIDE_FILE)
+    paths = {"--prompt-file": str(prompt), "--cwd": str(tmp_path), flag: str(link)}
+    argv = ["delegate", "--model", "haiku", "--json"] + [x for kv in paths.items() for x in kv]
+    rc, obj, *_ = run(capsys, argv, env)
+    assert rc == 2 and obj["error_class"] == "usage"
+    assert not list((state_dir / "jobs").glob("*"))
+
+
+def test_send_refuses_stored_cwd_outside_allowed_roots(capsys, env, prompt, tmp_path, state_dir):
+    rc, res, *_ = run(capsys, ["delegate", "--model", "haiku", "--prompt-file", str(prompt), "--cwd",
+                               str(tmp_path), "--wait", "--json"], env)
+    assert rc == 0
+    jobs.update_meta(jobs.job_dir(state_dir, res["job_id"]), cwd=os.path.dirname(OUTSIDE_FILE))
+    rc, obj, *_ = run(capsys, ["send", res["job_id"], "--prompt-file", str(prompt), "--json"], env)
+    assert rc == 2 and obj["error_class"] == "usage"
+    assert len(list((state_dir / "jobs").glob("*"))) == 1
+
+
+def _finished_claude_job(capsys, env, prompt, tmp_path, state_dir) -> tuple[str, Path]:
+    rc, res, *_ = run(capsys, ["delegate", "--model", "haiku", "--prompt-file", str(prompt), "--cwd",
+                               str(tmp_path), "--wait", "--json"], env)
+    assert rc == 0
+    return res["job_id"], jobs.job_dir(state_dir, res["job_id"])
+
+
+def _canary_file(tmp_path: Path) -> Path:
+    secret = tmp_path / "secret.json"
+    secret.write_text(json.dumps({"type": "result", "result": CANARY, "provider": "claude", "model": CANARY}) + "\n")
+    return secret
+
+
+@pytest.mark.parametrize("name,cmd", [("result.txt", "result"), ("result.json", "result"), ("meta.json", "result"),
+                                      ("status", "result"), ("events.jsonl", "log"), ("stderr.log", "log")])
+def test_symlinked_job_file_is_reported_not_followed(capsys, env, prompt, tmp_path, state_dir, name, cmd):
+    job_id, d = _finished_claude_job(capsys, env, prompt, tmp_path, state_dir)
+    (d / name).unlink(missing_ok=True)
+    (d / name).symlink_to(_canary_file(tmp_path))
+    rc, obj, out, err = run(capsys, [cmd, job_id, "--json"], env)
+    assert CANARY not in out + err
+    assert rc == 1 and obj["error_class"] == "error"
+
+
+def test_symlinked_job_dir_is_refused(capsys, env, prompt, tmp_path, state_dir):
+    job_id, d = _finished_claude_job(capsys, env, prompt, tmp_path, state_dir)
+    elsewhere = tmp_path / "elsewhere"
+    d.rename(elsewhere)
+    (elsewhere / "result.txt").write_text(CANARY + "\n")
+    d.symlink_to(elsewhere)
+    rc, obj, out, err = run(capsys, ["result", job_id, "--json"], env)
+    assert CANARY not in out + err
+    assert rc == 1 and obj["error_class"] == "error"

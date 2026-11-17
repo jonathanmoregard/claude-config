@@ -28,7 +28,8 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ai_router import adapters, jobs, quota  # noqa: E402
-from ai_router.config import atomic_write_text, load_config, read_json  # noqa: E402
+from ai_router.config import (atomic_write_text, load_config, open_append_nofollow,  # noqa: E402
+                              read_text_nofollow)
 from ai_router.selection import pick  # noqa: E402
 
 KILL_GRACE_S = 10.0
@@ -38,15 +39,15 @@ TICK_S = 0.25
 class Pump:
     """Copy child stdout to events.jsonl line by line; remember when bytes last arrived."""
 
-    def __init__(self, stream: Any, path: Path, on_event: Any) -> None:
+    def __init__(self, stream: Any, out: Any, on_event: Any) -> None:
         self.stream = stream
-        self.path = path
+        self.out = out
         self.on_event = on_event
         self.last = time.monotonic()
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def _run(self) -> None:
-        with open(self.path, "ab") as fh:
+        with self.out as fh:
             for raw in self.stream:
                 self.last = time.monotonic()
                 fh.write(raw if raw.endswith(b"\n") else raw + b"\n")
@@ -120,7 +121,7 @@ def _retry_after_quota(state: Path, d: Path, meta: dict[str, Any], diag: str, no
         jobs.update_meta(d, retry_note=f"no retry: {choice['provider']} binary not found")
         return
     effort = meta.get("effort") if meta.get("effort") in cfg.efforts.get(choice["provider"], ()) else choice["effort"]
-    prompt = (d / "prompt.md").read_text(encoding="utf-8")
+    prompt = read_text_nofollow(d / "prompt.md")
     new_id, new_dir = jobs.create_job(state, jobs.JobSpec(
         provider=choice["provider"], model=choice["model"], effort=effort, tier=choice["tier"], cwd=meta["cwd"],
         sandbox=meta["sandbox"], prompt=prompt, timeout_s=meta["timeout_s"], stall_min=meta["stall_min"],
@@ -141,7 +142,7 @@ def run(d: Path) -> int:
     meta = jobs.update_meta(d, runner_pid=os.getpid(), started_at=int(time.time()))
     jobs.write_status(d, "running")
     provider = meta["provider"]
-    prompt = (d / "prompt.md").read_text(encoding="utf-8")
+    prompt = read_text_nofollow(d / "prompt.md")
     try:
         argv = adapters.materialize(meta["argv"], prompt)
         adapters.refuse_dangerous(argv)
@@ -151,13 +152,15 @@ def run(d: Path) -> int:
         jobs.update_meta(d, finished_at=int(time.time()), error_class="error", exit_code=None)
         return 2
 
-    stderr_f = open(d / "stderr.log", "ab")
+    stderr_f = open_append_nofollow(d / "stderr.log")
+    events_f = open_append_nofollow(d / "events.jsonl")
     try:
         child = subprocess.Popen(argv, cwd=meta["cwd"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                  stderr=stderr_f, start_new_session=True)
     except OSError as exc:
         stderr_f.write(f"launch failed: {exc}\n".encode())
         stderr_f.close()
+        events_f.close()
         jobs.write_status(d, "failed:error")
         jobs.update_meta(d, finished_at=int(time.time()), error_class="error", exit_code=None)
         return 2
@@ -175,7 +178,7 @@ def run(d: Path) -> int:
             jobs.update_meta(d, **{"thread_id" if provider == "codex" else "session_id": cid})
 
     assert child.stdout is not None
-    pump = Pump(child.stdout, d / "events.jsonl", on_event)
+    pump = Pump(child.stdout, events_f, on_event)
     pump.start()
     outcome: dict[str, str | None] = {"forced": None}
 
@@ -205,7 +208,7 @@ def run(d: Path) -> int:
 
     exit_code = child.returncode
     events = adapters.read_events(d / "events.jsonl")
-    stderr_text = (d / "stderr.log").read_text(encoding="utf-8", errors="replace")
+    stderr_text = read_text_nofollow(d / "stderr.log", errors="replace")
     text = _write_results(d, provider, events, meta.get("schema"))
     atomic_write_text(d / "exit_code", f"{exit_code}\n")
 
@@ -246,7 +249,10 @@ def main(argv: list[str] | None = None) -> int:
     if len(args) != 1:
         sys.stderr.write("usage: runner.py <job_dir>\n")
         return 2
-    d = Path(args[0]).resolve()
+    d = Path(args[0]).absolute()
+    if d.is_symlink():
+        sys.stderr.write(f"runner: refusing symlinked job directory {d}\n")
+        return 2
     if not (d / "meta.json").exists():
         sys.stderr.write(f"runner: no meta.json in {d}\n")
         return 2

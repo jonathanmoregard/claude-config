@@ -28,10 +28,17 @@ Quota failure handling: a job that fails on a quota class writes
 live snapshot shows headroom again) and is retried exactly once on the next eligible model of the same tier
 (`retry_of` / `retried_as` in `meta.json`; `wait` follows the chain).
 
-Claude jobs never pass `--bare`: on 2.1.270 `--bare` refuses OAuth
-credentials, which is how this machine authenticates. "Bare" is spelled
-`--setting-sources "" --strict-mcp-config` (no hooks, no MCP, no user
-permission rules); `--no-bare` loads settings normally.
+Claude jobs load the user's settings with
+`--settings '{"sandbox":{"enabled":true,"allowUnsandboxedCommands":false}}' --strict-mcp-config`:
+the router runs outside Claude Code's sandbox, so the job must bring its own
+(Read deny rules, sandboxed Bash, no unsandboxed retry). `--no-bare` is
+accepted and has no effect. `--bare` is never passed: it refuses OAuth
+credentials.
+
+Prompt files, `--schema` files and `--cwd` (also the stored cwd `send`
+reuses) must resolve under `~/Repos`, `~/worktrees`, `/tmp` or
+`~/.local/state/ai-router`. Job files are opened with `O_NOFOLLOW` and a
+symlinked job directory is refused.
 
 ## Codex workspace-write scope
 

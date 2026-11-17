@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pwd
 import subprocess
 import sys
 import time
@@ -20,7 +21,8 @@ from pathlib import Path
 from typing import Any
 
 from . import VERSION, adapters, jobs, quota
-from .config import PROVIDERS, SANDBOXES, TIERS, Config, ConfigError, load_config, state_dir
+from .config import (PROVIDERS, SANDBOXES, TIERS, Config, ConfigError, SymlinkRefused, load_config,
+                     state_dir)
 from .sanitize import clean
 from .selection import detect_host, pick
 
@@ -160,9 +162,29 @@ class Ctx:
             raise CliError("not_found", f"job not found: {job_id}") from None
 
 
+ALLOWED_HOME_ROOTS = ("Repos", "worktrees", ".local/state/ai-router")
+
+
+def _allowed_roots() -> list[str]:
+    # The account's home, not $HOME: the caller controls its environment.
+    home = pwd.getpwuid(os.getuid()).pw_dir
+    return [os.path.realpath(r) for r in ("/tmp", *(os.path.join(home, h) for h in ALLOWED_HOME_ROOTS))]
+
+
+def _confined(path: str, label: str) -> str:
+    real = os.path.realpath(path)
+    roots = _allowed_roots()
+    if not any(real == r or real.startswith(r + os.sep) for r in roots):
+        raise CliError("usage", f"{label} resolves outside {', '.join(roots)}: {real}")
+    return real
+
+
 def _read_prompt(path: str) -> str:
     try:
-        text = Path(path).read_text(encoding="utf-8")
+        with open(path, encoding="utf-8") as fh:
+            # Checked through the open fd, so a path swapped after the check is never read.
+            _confined(f"/proc/self/fd/{fh.fileno()}", f"prompt file {path}")
+            text = fh.read()
     except OSError as exc:
         raise CliError("usage", f"cannot read prompt file: {exc}") from None
     if not text.strip():
@@ -171,7 +193,7 @@ def _read_prompt(path: str) -> str:
 
 
 def _abs_dir(path: str | None) -> str:
-    d = os.path.abspath(path or os.getcwd())
+    d = _confined(path or os.getcwd(), "cwd")
     if not os.path.isdir(d):
         raise CliError("usage", f"cwd is not a directory: {d}")
     return d
@@ -330,7 +352,7 @@ def cmd_delegate(ctx: Ctx, args: argparse.Namespace, out: Out, launcher: str) ->
     cwd = _abs_dir(args.cwd)
     schema = None
     if args.schema:
-        schema = os.path.abspath(args.schema)
+        schema = _confined(args.schema, "schema file")
         if not os.path.isfile(schema):
             raise CliError("usage", f"schema file not found: {schema}")
     host = args.host or detect_host(ctx.env)
@@ -418,6 +440,7 @@ def cmd_send(ctx: Ctx, args: argparse.Namespace, out: Out, launcher: str) -> int
         raise CliError("not_finished", f"job {args.job_id} is {status}; send is post-hoc only")
     if meta["provider"] == "codex" and meta.get("dev_gates"):
         raise CliError("usage", "Codex 0.146 resume does not support --add-dir; rerun the dev-gates job")
+    cwd = _confined(meta["cwd"], "job cwd")
     key = "thread_id" if meta["provider"] == "codex" else "session_id"
     conv = meta.get(key)
     if not conv:
@@ -427,12 +450,12 @@ def cmd_send(ctx: Ctx, args: argparse.Namespace, out: Out, launcher: str) -> int
     if binary is None:
         raise CliError("setup", f"{meta['provider']} binary not found")
     argv = adapters.build_resume_argv(meta["provider"], binary, thread_id=conv, model=meta["model"],
-                                      effort=meta.get("effort"), sandbox=meta["sandbox"], cwd=meta["cwd"],
+                                      effort=meta.get("effort"), sandbox=meta["sandbox"], cwd=cwd,
                                       bare=bool(meta.get("bare", True)))
     timeout_s = args.timeout_s if args.timeout_s is not None else float(meta.get("timeout_s") or
                                                                         ctx.cfg.settings.job_timeout_s)
     spec = jobs.JobSpec(provider=meta["provider"], model=meta["model"], effort=meta.get("effort"), tier=meta["tier"],
-                        cwd=meta["cwd"], sandbox=meta["sandbox"], prompt=prompt, timeout_s=timeout_s,
+                        cwd=cwd, sandbox=meta["sandbox"], prompt=prompt, timeout_s=timeout_s,
                         stall_min=meta["stall_min"], bare=bool(meta.get("bare", True)), host=meta.get("host"),
                         name=meta.get("name"), parent_job=args.job_id, argv=argv)
     started = _start_job(ctx, spec, launcher)
@@ -502,3 +525,5 @@ def main(argv: list[str] | None = None, *, config_path: Path | None = None, env:
         return out.error(CliError("setup", str(exc)))
     except adapters.DangerousFlag as exc:
         return out.error(CliError("usage", str(exc)))
+    except SymlinkRefused as exc:
+        return out.error(CliError("error", str(exc)))

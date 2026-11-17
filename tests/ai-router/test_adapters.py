@@ -79,11 +79,7 @@ def test_claude_argv_read_only_and_bare(tmp_path: Path):
     assert argv[argv.index("--effort") + 1] == "low"
     assert argv[argv.index("--permission-mode") + 1] == "default"
     assert argv[argv.index("--tools") + 1] == "Read,Glob,Grep"
-    # OAuth-safe "bare": --bare itself never reads OAuth creds (claude --help),
-    # so lean mode is expressed as no settings + no MCP.
     assert "--bare" not in argv
-    assert argv[argv.index("--setting-sources") + 1] == ""
-    assert "--strict-mcp-config" in argv
     assert argv[-4:] == ["--max-turns", "60", "--", PROMPT_PLACEHOLDER]
 
 
@@ -97,7 +93,6 @@ def test_claude_argv_workspace_write_no_bare_with_schema(tmp_path: Path):
     assert argv[argv.index("--disallowedTools") + 1] == "Agent"
     assert argv[argv.index("--json-schema") + 1] == '{"type":"object"}'
     assert "--effort" not in argv
-    assert "--setting-sources" not in argv and "--strict-mcp-config" not in argv
     # arftl-allow: permission-widened — asserting these flags are ABSENT from the argv
     for bad in ("--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--bare"):
         assert bad not in argv
@@ -228,3 +223,17 @@ def test_parse_event_line_tolerates_garbage():
     assert adapters.parse_event_line("garbage") is None
     assert adapters.parse_event_line("") is None
     assert adapters.parse_event_line(json.dumps([1, 2])) is None
+
+
+@pytest.mark.parametrize("sandbox", ["read-only", "workspace-write"])
+@pytest.mark.parametrize("bare", [True, False])
+def test_claude_jobs_load_user_settings_inside_an_enforced_sandbox(tmp_path: Path, sandbox: str, bare: bool):
+    fresh = build_argv("claude", "/bin/claude", model="claude-sonnet-5", effort=None, sandbox=sandbox, cwd="/w",
+                       schema=None, bare=bare, job_dir=tmp_path)
+    resume = build_resume_argv("claude", "/bin/claude", thread_id="s-1", model="claude-sonnet-5", effort=None,
+                               sandbox=sandbox, cwd="/w", bare=bare)
+    for argv in (fresh, resume):
+        assert "--setting-sources" not in argv and "--strict-mcp-config" in argv
+        settings = json.loads(argv[argv.index("--settings") + 1])
+        assert settings["sandbox"]["enabled"] is True
+        assert settings["sandbox"]["allowUnsandboxedCommands"] is False

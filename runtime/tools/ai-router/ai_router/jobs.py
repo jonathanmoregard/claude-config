@@ -22,7 +22,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import adapters
-from .config import atomic_write_json, atomic_write_text, read_json
+from .config import (SymlinkRefused, atomic_write_json, atomic_write_text, open_append_nofollow, read_json,
+                     read_text_nofollow)
 from .sanitize import clean
 
 RUNNER = Path(__file__).resolve().parent / "runner.py"
@@ -75,6 +76,8 @@ def job_dir(state: Path, job_id: str) -> Path:
     if not job_id or "/" in job_id or job_id.startswith("."):
         raise JobNotFound(job_id)
     d = jobs_root(state) / job_id
+    if d.is_symlink():
+        raise SymlinkRefused(f"refusing symlinked job directory: {d}")
     if not d.is_dir():
         raise JobNotFound(job_id)
     return d
@@ -85,7 +88,7 @@ def new_job_id(now: float) -> str:
 
 
 def read_meta(d: Path) -> dict[str, Any]:
-    meta = read_json(d / "meta.json")
+    meta = read_json(d / "meta.json", nofollow=True)
     if not isinstance(meta, dict):
         raise JobNotFound(d.name)
     return meta
@@ -108,7 +111,7 @@ def write_status(d: Path, status: str) -> None:
 
 def raw_status(d: Path) -> str:
     try:
-        return (d / "status").read_text(encoding="utf-8").strip() or "queued"
+        return read_text_nofollow(d / "status").strip() or "queued"
     except OSError:
         return "queued"
 
@@ -201,7 +204,7 @@ def launch(d: Path, *, env: dict[str, str] | None = None, launcher: str = "auto"
         if rc == 0:
             update_meta(d, launcher="systemd-run", unit=unit)
             return {"launcher": "systemd-run", "unit": unit, "runner_pid": None}
-    log = open(d / "runner.log", "ab")
+    log = open_append_nofollow(d / "runner.log")
     try:
         proc = subprocess.Popen(cmd, cwd=meta["cwd"], env=e, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                                 start_new_session=True)
@@ -296,7 +299,7 @@ def peek(d: Path) -> str | None:
     text = adapters.latest_agent_text(meta["provider"], events)
     if text is None:
         try:
-            text = clean((d / "result.txt").read_text(encoding="utf-8")).strip() or None
+            text = clean(read_text_nofollow(d / "result.txt")).strip() or None
         except OSError:
             text = None
     return text
@@ -306,7 +309,7 @@ def log_lines(d: Path, tail: int) -> list[str]:
     meta = read_meta(d)
     lines = [adapters.summarize_event(meta["provider"], e) for e in adapters.read_events(d / "events.jsonl")]
     try:
-        err = (d / "stderr.log").read_text(encoding="utf-8", errors="replace")
+        err = read_text_nofollow(d / "stderr.log", errors="replace")
     except OSError:
         err = ""
     lines += ["stderr: " + clean(l) for l in err.splitlines() if l.strip()]
@@ -317,7 +320,7 @@ def result_obj(d: Path, now: float | None = None) -> dict[str, Any]:
     meta = read_meta(d)
     status = status_of(d, meta, now)
     try:
-        text: str | None = clean((d / "result.txt").read_text(encoding="utf-8")).rstrip("\n")
+        text: str | None = clean(read_text_nofollow(d / "result.txt")).rstrip("\n")
     except OSError:
         text = None
     started, finished = meta.get("started_at"), meta.get("finished_at")
@@ -325,7 +328,7 @@ def result_obj(d: Path, now: float | None = None) -> dict[str, Any]:
     obj: dict[str, Any] = {
         "ok": status == "done", "job_id": d.name, "status": status, "exit_code": meta.get("exit_code"),
         "provider": meta["provider"], "model": meta["model"], "result_text": text,
-        "result_json": read_json(d / "result.json"), "usage": adapters.usage(meta["provider"], events),
+        "result_json": read_json(d / "result.json", nofollow=True), "usage": adapters.usage(meta["provider"], events),
         "duration_s": (int(finished) - int(started)) if started and finished else None,
         "error_class": meta.get("error_class"),
     }

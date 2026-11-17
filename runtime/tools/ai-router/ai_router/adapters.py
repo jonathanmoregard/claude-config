@@ -16,6 +16,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from .config import read_text_nofollow
 from .sanitize import clean
 
 PROMPT_PLACEHOLDER = "<prompt.md>"
@@ -40,6 +41,7 @@ OVERLOADED = re.compile(r"overloaded|\b529\b", re.I)
 CLAUDE_TOOLS_READ_ONLY = "Read,Glob,Grep"
 CLAUDE_TOOLS_WRITE = "Read,Glob,Grep,Edit,Write,MultiEdit,Bash"
 CLAUDE_MAX_TURNS = "60"
+CLAUDE_SANDBOX_SETTINGS = json.dumps({"sandbox": {"enabled": True, "allowUnsandboxedCommands": False}})
 
 
 class DangerousFlag(ValueError):
@@ -83,7 +85,7 @@ def refuse_dangerous(argv: list[str]) -> None:
             raise DangerousFlag(f"refusing sandbox-escaping flag: {a}")
 
 
-def _claude_common(model: str, effort: str | None, sandbox: str, schema: str | None, bare: bool) -> list[str]:
+def _claude_common(model: str, effort: str | None, sandbox: str, schema: str | None) -> list[str]:
     argv = ["-p", "--output-format", "stream-json", "--verbose", "--model", model]
     if effort:
         argv += ["--effort", effort]
@@ -94,11 +96,10 @@ def _claude_common(model: str, effort: str | None, sandbox: str, schema: str | N
                  "--disallowedTools", "Agent"]
     if schema:
         argv += ["--json-schema", Path(schema).read_text(encoding="utf-8").strip()]
-    if bare:
-        # `--bare` never reads OAuth credentials (claude --help, 2.1.270) and this
-        # machine authenticates via Max OAuth, so "bare" is spelled as: no
-        # settings files (→ no hooks, no user permission rules) and no MCP.
-        argv += ["--setting-sources", "", "--strict-mcp-config"]
+    # The router runs outside Claude Code's sandbox, so the job must load the
+    # user's settings (Read deny rules, sandbox profile) and may not fall back
+    # to unsandboxed Bash: --allowedTools Bash would approve the retry.
+    argv += ["--settings", CLAUDE_SANDBOX_SETTINGS, "--strict-mcp-config"]
     return argv
 
 
@@ -118,7 +119,7 @@ def build_argv(provider: str, binary: str, *, model: str, effort: str | None, sa
         # positional prompt (see codex-advise.sh, measured 2026-08-27).
         argv += ["--", PROMPT_PLACEHOLDER]
     else:
-        argv = [binary] + _claude_common(model, effort, sandbox, schema, bare)
+        argv = [binary] + _claude_common(model, effort, sandbox, schema)
         # `--` ends option parsing: a prompt whose first character is `-` (a
         # markdown bullet, say) is otherwise reported as "unknown option" by
         # the CLI's parser and never reaches the model (measured 2026-09-14 on
@@ -135,7 +136,7 @@ def build_resume_argv(provider: str, binary: str, *, thread_id: str, model: str,
         argv = [binary, "exec", "resume", thread_id, "--json", "-m", model,
                 "-c", f"model_reasoning_effort={effort or 'medium'}", "--skip-git-repo-check", "--", PROMPT_PLACEHOLDER]
     else:
-        argv = [binary] + _claude_common(model, effort, sandbox, None, bare)
+        argv = [binary] + _claude_common(model, effort, sandbox, None)
         argv += ["--resume", thread_id, "--max-turns", CLAUDE_MAX_TURNS, "--", PROMPT_PLACEHOLDER]
     refuse_dangerous(argv)
     return argv
@@ -161,7 +162,7 @@ def parse_event_line(line: str) -> dict[str, Any] | None:
 
 def read_events(path: Path) -> list[dict[str, Any]]:
     try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        lines = read_text_nofollow(path, errors="replace").splitlines()
     except OSError:
         return []
     return [e for e in (parse_event_line(l) for l in lines) if e is not None]
@@ -201,7 +202,7 @@ def final_message(provider: str, events: list[dict[str, Any]], last_message_path
     """The run's final answer: codex `-o` file if written, claude `result`, else last agent text."""
     if provider == "codex" and last_message_path is not None:
         try:
-            text = last_message_path.read_text(encoding="utf-8").strip()
+            text = read_text_nofollow(last_message_path).strip()
         except OSError:
             text = ""  # -o file absent or unreadable: fall through to the event stream
         if text:

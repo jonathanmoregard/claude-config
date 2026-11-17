@@ -12,8 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from ai_router import adapters, jobs, quota
-from ai_router.config import atomic_write_json, load_config
+from ai_router import adapters, jobs, quota, runner
+from ai_router.config import SymlinkRefused, atomic_write_json, load_config
 
 pytestmark = pytest.mark.usefixtures("stub_providers")
 
@@ -311,3 +311,41 @@ def test_two_writers_never_tear_the_file_they_publish(tmp_path: Path):
     assert torn == 0, f"{torn} of {reads} reads saw a file that does not parse"
     assert not [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")], \
         list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("name,mode", [("stderr.log", "crash"), ("events.jsonl", "ok")])
+def test_runner_does_not_append_through_a_symlinked_log(state_dir: Path, tmp_path: Path, env, name, mode):
+    victim = tmp_path / "victim"
+    victim.write_text("untouched\n")
+    job_id, d = jobs.create_job(state_dir, spec_for("claude", "claude-haiku-4-5-20251001", f"MODE:{mode}",
+                                                    tmp_path, env), now=time.time())
+    jobs.update_meta(d, argv=adapters.build_argv("claude", adapters.resolve_binary("claude", env) or "",
+                                                 model="claude-haiku-4-5-20251001", effort=None, sandbox="read-only",
+                                                 cwd=str(tmp_path), schema=None, bare=True, job_dir=d))
+    (d / name).symlink_to(victim)
+    jobs.launch(d, env=env, launcher="setsid")
+    _, status = finish(state_dir, job_id)
+    assert victim.read_text() == "untouched\n"
+    assert status == "failed:error"
+
+
+def test_launch_refuses_a_symlinked_runner_log(state_dir: Path, tmp_path: Path, env):
+    victim = tmp_path / "victim"
+    victim.write_text("untouched\n")
+    _, d = jobs.create_job(state_dir, spec_for("codex", "gpt-5.6-luna", "hi", tmp_path, env), now=time.time())
+    (d / "runner.log").symlink_to(victim)
+    with pytest.raises(SymlinkRefused):
+        jobs.launch(d, env=env, launcher="setsid")
+    assert victim.read_text() == "untouched\n"
+
+
+def test_runner_refuses_a_symlinked_job_dir(state_dir: Path, tmp_path: Path, env):
+    spec = spec_for("codex", "gpt-5.6-luna", "hi", tmp_path, env)
+    _, d = jobs.create_job(state_dir, spec, now=time.time())
+    jobs.update_meta(d, argv=adapters.build_argv("codex", adapters.resolve_binary("codex", env) or "",
+                                                 model=spec.model, effort=spec.effort, sandbox=spec.sandbox,
+                                                 cwd=spec.cwd, schema=None, bare=True, job_dir=d))
+    link = tmp_path / "link"
+    link.symlink_to(d)
+    assert runner.main([str(link)]) == 2
+    assert jobs.raw_status(d) == "queued"

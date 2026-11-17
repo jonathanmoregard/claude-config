@@ -68,6 +68,9 @@ Write the task to a file (prompt = the whole file, verbatim), then:
   --sandbox read-only --json
 ```
 
+- The prompt file, `--schema` file and `--cwd` must resolve (symlinks
+  followed) under `~/Repos`, `~/worktrees`, `/tmp` or
+  `~/.local/state/ai-router`; anything else is a usage error.
 - `--tier` picks by ranking + headroom; `--model <id|alias>` pins (still
   subject to eligibility; `--force` overrides and is recorded in the job).
 - `--sandbox read-only` (default) or `workspace-write`. Codex gets its OS
@@ -88,10 +91,9 @@ Write the task to a file (prompt = the whole file, verbatim), then:
   Claude `--json-schema`); `result` then carries `result_json`.
 - `--effort low|medium|high|xhigh|max` (Codex also `ultra`). `--need
   vision|write|long-context` constrains a `--tier` pick.
-- Claude jobs run hermetic by default: no settings files, hooks or MCP
-  (`--setting-sources "" --strict-mcp-config`; Claude's own `--bare` is not
-  used because on 2.1.270 it refuses OAuth credentials). `--no-bare` loads
-  settings, hooks and CLAUDE.md normally.
+- Claude jobs load your settings (hooks, permission rules, CLAUDE.md) with
+  Claude Code's sandbox forced on and no unsandboxed fallback, and no MCP
+  (`--strict-mcp-config`). `--no-bare` is accepted and has no effect.
 - `--wait` blocks until the job is terminal and prints the result. Without
   it the command returns `{job_id, job_dir, events, result_path, …}` at once.
 
