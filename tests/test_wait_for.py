@@ -60,6 +60,7 @@ def run_wait_for(
         "FAKE_LOG": str(log),
         **TEST_TZ,
     }
+    env.pop("SANDBOX_RUNTIME", None)
     env.update(extra_env or {})
     (tmp_path / "home").mkdir(exist_ok=True)
     argv = list(args)
@@ -965,3 +966,33 @@ def test_sandbox_refuses_symlinked_report_marker(tmp_path: Path) -> None:
     assert rc == 1, out
     assert "must not report" not in out
     assert victim.read_text(encoding="utf-8") == "keep me\n"
+
+
+def test_sandboxed_job_runs_in_this_call_without_a_unit(tmp_path: Path) -> None:
+    slug = f"sandboxed-job-{os.getpid()}"
+    log = Path("/tmp") / f"{slug}.log"
+    try:
+        rc, out, calls = run_wait_for(
+            tmp_path, {}, "job", slug, "--", "bash", "-c", "echo ran; exit 0",
+            extra_env={"SANDBOX_RUNTIME": "1"},
+        )
+        assert rc == 0, out
+        assert "result=success" in out, out
+        assert log.read_text().splitlines() == ["ran", "MARKER_OK"]
+        assert not any(c.startswith(("systemd-run", "systemctl")) for c in calls), calls
+
+        rc, out, _ = run_wait_for(
+            tmp_path, {}, "job", slug, "--", "bash", "-c", "echo bad; exit 7",
+            extra_env={"SANDBOX_RUNTIME": "1"},
+        )
+        assert rc == 1, out
+        assert "status=7" in out, out
+        assert log.read_text().splitlines() == ["bad", "MARKER_FAILED rc=7"]
+    finally:
+        log.unlink(missing_ok=True)
+
+
+def test_target_that_looks_like_an_option_is_refused(tmp_path: Path) -> None:
+    rc, _, calls = run_wait_for(tmp_path, {}, "unit", "--host=example.invalid", "--user")
+    assert rc == 64
+    assert calls == []

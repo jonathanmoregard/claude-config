@@ -28,6 +28,8 @@
 #   wait-for job <slug> [--timeout <s>] -- <cmd> [args...]
 #                                          launch once as a retained user unit,
 #                                          or adopt its recorded run, then wait
+#                                          (inside the Claude Code sandbox: run
+#                                          it in this call; it ends with the call)
 #   common: --timeout <seconds> (default 3600; job default 14400 so a
 #                                          90-minute job does not time out)
 #
@@ -60,6 +62,7 @@ usage() {
 [ $# -ge 2 ] || usage
 mode=$1 target=$2
 shift 2
+case $target in -*) usage ;; esac
 repo=() repo_name="" user=() since="" job_cmd=()
 if [ "$mode" = job ]; then timeout=14400; else timeout=3600; fi
 if [ "$mode" = job ]; then
@@ -617,6 +620,22 @@ wait_unit() {
   exit 1
 }
 
+# The Claude Code sandbox hides the user bus on purpose (a transient unit would
+# run outside it), so there the job is a child of this call and ends with it.
+run_job_in_sandbox() {
+  local log=/tmp/$target.log rc
+  command timeout "$timeout" "${job_cmd[@]}" >"$log" 2>&1; rc=$?
+  if [ "$rc" = 0 ]; then
+    echo MARKER_OK >>"$log"
+    echo "job $target ran inside the sandbox result=success status=0 log=$log"
+    exit 0
+  fi
+  echo "MARKER_FAILED rc=$rc" >>"$log"
+  [ "$rc" != 124 ] || timed_out
+  echo "job $target ran inside the sandbox result=exit-code status=$rc log=$log"
+  exit 1
+}
+
 wait_job() {
   [[ $target =~ ^[A-Za-z0-9._-]+$ && $target != . && $target != .. ]] || {
     echo "wait-for: invalid job slug '$target' (use only letters, digits, dot, underscore and hyphen)" >&2
@@ -633,6 +652,7 @@ wait_job() {
       exit 64
     fi
   done
+  [ "${SANDBOX_RUNTIME:-}" != 1 ] || run_job_in_sandbox
   user=(--user)
   probe=$(unit_snapshot LoadState ActiveState SubState) || unreadable_manager
   if [ "$(snapshot_field "$probe" LoadState)" != loaded ]; then

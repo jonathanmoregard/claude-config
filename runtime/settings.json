@@ -122,6 +122,10 @@
     "deny": [
       "WebFetch",
       "WebSearch",
+      "Bash(systemctl *-H*)",
+      "Bash(systemctl *--host*)",
+      "Bash(systemctl *-M*)",
+      "Bash(systemctl *--machine*)",
       "Bash(sudo)",
       "Bash(sudo *)",
       "Bash(rm -rf *)",
@@ -374,6 +378,16 @@
         ]
       },
       {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/hooks/sandbox-aid.py",
+            "timeout": 5
+          }
+        ]
+      },
+      {
         "hooks": [
           {
             "type": "command",
@@ -439,6 +453,16 @@
           {
             "type": "command",
             "command": "python3 -S -E $HOME/.claude/hooks/deny-hints.py",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/hooks/sandbox-aid.py",
             "timeout": 5
           }
         ]
@@ -928,8 +952,35 @@
   "sandbox": {
     "enabled": false,
     "autoAllowBashIfSandboxed": true,
-    "allowUnsandboxedCommands": false,
+    "allowUnsandboxedCommands": true,
     "failIfUnavailable": true,
+    "excludedCommands": [
+      "systemctl --user is-active *",
+      "systemctl --user is-failed *",
+      "systemctl --user is-enabled *",
+      "systemctl --user is-system-running *",
+      "systemctl --user show *",
+      "systemctl --user status *",
+      "systemctl --user list-units *",
+      "systemctl --user list-timers *",
+      "systemctl --user list-unit-files *",
+      "systemctl --user list-dependencies *",
+      "systemctl --user cat *",
+      "systemctl is-active *",
+      "systemctl is-failed *",
+      "systemctl is-enabled *",
+      "systemctl is-system-running *",
+      "systemctl show *",
+      "systemctl status *",
+      "systemctl list-units *",
+      "systemctl list-timers *",
+      "systemctl list-unit-files *",
+      "systemctl list-dependencies *",
+      "systemctl cat *",
+      "~/.claude/scripts/wait-for unit *",
+      "/home/jonathan/.claude/scripts/wait-for unit *",
+      "gio trash *"
+    ],
     "network": {
       "allowAllUnixSockets": true,
       "tlsTerminate": {},
@@ -958,6 +1009,10 @@
         "~/.cache/nix",
         "~/.cache/uv",
         "~/.cargo"
+      ],
+      "denyWrite": [
+        "/home/jonathan/.local/state/ai-router/jobs",
+        "/home/jonathan/.local/state/ai-router/quota"
       ],
       "denyRead": [
         "/run/user/1003",
