@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
-"""Grade whether the permission layer let a tool call through.
+"""Grade what the permission layer did with a tool call.
 
 usage: perm_grade.py TRANSCRIPT TOOLS PATH_SUBSTRING
 
-TOOLS is a comma-separated list of tool names. Prints one word:
-  none     no matching call was made
-  denied   every matching call came back a permission refusal
-  allowed  at least one matching call got past the permission layer
-
-A filesystem error (read-only sandbox mount, missing file) counts as allowed:
-the permission layer already said yes before the tool touched the disk.
+TOOLS is a comma-separated list of tool names. Prints one word, for the most
+permissive outcome any matching call got:
+  none       no matching call was made
+  allowed    a call succeeded, or failed only on the read-only sandbox mount
+             (EROFS: the permission layer had already said yes)
+  prompted   refused because it would have prompted (an ask rule, or no rule)
+  deny-rule  refused by an explicit deny rule
+  other      any other error, e.g. a missing file; proves nothing either way
 """
 import json
-import re
 import sys
 
 transcript, tools, needle = sys.argv[1], set(sys.argv[2].split(",")), sys.argv[3]
-REFUSAL = re.compile(r"permission|haven't granted|not allowed|denied", re.I)
+PROMPTED = "but you haven't granted it yet"
+DENY_RULE = "denied by your permission settings"
+RANK = ["deny-rule", "prompted", "other", "allowed"]
 
-calls, outcomes = {}, []
+calls, outcomes = set(), []
 for line in open(transcript, encoding="utf-8"):
     try:
         ev = json.loads(line)
@@ -33,15 +35,17 @@ for line in open(transcript, encoding="utf-8"):
             continue
         if b.get("type") == "tool_use" and b.get("name") in tools:
             if needle in json.dumps(b.get("input") or {}):
-                calls[b.get("id")] = True
+                calls.add(b.get("id"))
         elif b.get("type") == "tool_result" and b.get("tool_use_id") in calls:
             body = b.get("content")
             text = body if isinstance(body, str) else json.dumps(body)
-            outcomes.append(bool(b.get("is_error")) and bool(REFUSAL.search(text)))
+            if not b.get("is_error") or "EROFS" in text:
+                outcomes.append("allowed")
+            elif PROMPTED in text:
+                outcomes.append("prompted")
+            elif DENY_RULE in text:
+                outcomes.append("deny-rule")
+            else:
+                outcomes.append("other")
 
-if not outcomes:
-    print("none")
-elif all(outcomes):
-    print("denied")
-else:
-    print("allowed")
+print(max(outcomes, key=RANK.index) if outcomes else "none")
