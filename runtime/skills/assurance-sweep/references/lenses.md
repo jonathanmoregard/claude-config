@@ -21,8 +21,8 @@ Where a deterministic tool could do a check you would otherwise do by
 reading, and the project has no such tool, do not propose adding one: name
 the missing tool category under "Not covered".
 
-Bar for RECOMMEND: grounded in the direction of the code rather than
-rework; focused and minimal; ordinary industry practice; the simplest thing
+Bar for RECOMMEND: builds on how the code already works instead of
+reworking it; focused and minimal; ordinary industry practice; the simplest thing
 that deals with the problem. If the caller of a proposed check, type or lint
 can sidestep it, the item is SKIP.
 

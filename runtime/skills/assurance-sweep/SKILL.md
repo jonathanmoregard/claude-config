@@ -7,7 +7,7 @@ description: Use when a whole repository or long-lived branch needs a robustness
 
 Six whole-repository lenses, one at a time, each read by one strongest-tier
 read-only reviewer. A lens returns ranked proposals; you check them and hand
-them to the user. The sweep proposes and edits no source. Building what the
+them to the user. The sweep only proposes; it edits no source. Building what the
 user picks is ordinary work under the project's usual flow, and no part of
 this skill.
 
@@ -51,8 +51,8 @@ and method: `references/inventory.md`. Four sections:
 | 6 | Venues | Which assurance method that would have caught past defects is unused or weaker than claimed? | defect history; the assurance table |
 
 Run the lenses the user asked for; with no preference, in this order. Lenses
-1 and 2 can lead to deleted code, so say when a later lens was read before
-their proposals were acted on.
+1 and 2 can lead to code being deleted. If a later lens ran before their
+proposals were acted on, say so: it may have read code that is about to go.
 
 1. Compose the prompt from `references/lenses.md`: the shared preamble, then
    that lens's block. Fill in the paths. Add no suspicions of your own: a

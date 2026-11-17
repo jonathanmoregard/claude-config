@@ -54,8 +54,8 @@ read and why each context expansion was relevant.
 3. Merge by meaning. Convergence is not confidence — shared blind spots are
    real, so a finding both report still reproduces before any edit.
 
-Two reviewers is the whole budget per round; Rounds below and the escalation
-rule are its only exceptions.
+Two reviewers is the whole budget per round. Further rounds (see Rounds) and
+the escalation rule are the only ways to add reviewers.
 
 Reviewer A, falsification:
 
@@ -126,7 +126,7 @@ first:
 3. Re-picks B's classes against the diff as it now stands, and adds one
    sibling line per defect the previous round reproduced: "A defect of this
    shape was confirmed at <file:line>: <the shape in one sentence>. Find
-   every other site with the same shape." Reviewer A is never seeded.
+   every other site with the same shape." Reviewer A never gets a sibling line.
 4. Is deduplicated by you after both reviewers report: a finding that matches
    an earlier adjudicated one by meaning keeps the earlier outcome. Apart
    from the sibling line, no reviewer is shown an earlier finding.

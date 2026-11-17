@@ -86,9 +86,10 @@ transaction — two services, a database and an external API, a database and a
 queue or mailer — or the diff changes the order of such writes.
 **Hunt:** Stop the operation between the two writes — crash, timeout, error,
 retry — in each order. Name what is left on each side, what that leftover
-lets anyone do or see, and which one reader notices it and cleans up. Report
-a leftover that grants or exposes something, one that nothing ever removes,
-and an irreversible success answered as a failure.
+lets anyone do or see, and which code later notices it and removes it.
+Report a leftover that grants or exposes something, a leftover nothing ever
+removes, and an operation that cannot be undone but reports failure to its
+caller.
 
 ### D7 — Authority outside its scope
 
@@ -188,8 +189,8 @@ the test should pin instead.
 **When:** the diff adds or changes a field, parameter, header, form value,
 column or message, or stores a value another component already owns.
 **Hunt:** Find a value one side sends and the other drops, overwrites or
-re-derives: it should leave the sender and the contract, not be ignored on
-arrival. Find a fact kept in two places that can disagree. Name the owner,
+re-derives: the sender should stop sending it and it should come out of the
+interface, instead of being ignored on arrival. Find a fact kept in two places that can disagree. Name the owner,
 the copy, and who reads the copy.
 
 ### G11 — Control that does not control
@@ -200,10 +201,10 @@ service, or a careless future caller.
 **Hunt:** Name who the control is meant to stop, then find the way around
 that party still has: not calling it, reaching the same data or effect by
 another route it already has, discarding the result, constructing the
-guarded value directly. A control with a way around is ceremony: say whether
-to remove it or name the one place it would hold. A way around that breaks a
-property the change claims is a defect; report it in that bucket with its
-reproducer.
+guarded value directly. A control that can be bypassed protects nothing: say
+whether to remove it, or name the one place where it could not be bypassed.
+A way around that breaks a property the change claims is a defect; report it
+in that bucket with its reproducer.
 
 ### G12 — Over-built
 
@@ -213,6 +214,6 @@ one implementation.
 **Hunt:** Ask what is the least this problem needs. Name the part already in
 this codebase that would cover it with one more case, or the ordinary way
 such systems handle it, and say what the new part does that the smaller
-option cannot. If that is nothing you can name, or only a failure nobody has
-observed, report it as over-built. A measured need or a cited standard
+option cannot. If you can name nothing, or it only guards against a failure
+nobody has observed, report it as over-built. A measured need or a cited standard
 justifies the part: say so and report nothing. Advisory.

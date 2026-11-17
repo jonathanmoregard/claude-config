@@ -63,7 +63,7 @@ required=(
   "A reproducer that does not fail refutes nothing by itself"
   "two consecutive rounds are empty"
   "Cap: four rounds"
-  "Reviewer A is never seeded"
+  "Reviewer A never gets a sibling line"
   "review-ledger.tsv"
   "ledger-tally.sh"
 )

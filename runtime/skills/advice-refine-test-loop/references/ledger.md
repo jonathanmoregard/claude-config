@@ -9,7 +9,7 @@ inside a field, `-` for an empty field.
 | 1 | date | `YYYY-MM-DD` |
 | 2 | source | `artl` or `sweep` |
 | 3 | run | short commit, then round or lens: `a1b2c3d/r2`, `a1b2c3d/races` |
-| 4 | check | `A`, `variant`, a class id (`D3`, `G12`), or a lens name |
+| 4 | check | `A`, a class id (`D3`, `G12`), `variant` for a finding raised by a sibling line, or a lens name |
 | 5 | trigger | what made the check run: the part of the diff that met its `When`; `always` for A; for a sweep, why it was run |
 | 6 | where | `file:line`; `-` on a `none` row |
 | 7 | claim | one sentence |
