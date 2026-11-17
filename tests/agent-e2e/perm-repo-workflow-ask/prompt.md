@@ -1,0 +1,1 @@
+In my repo at /home/jonathan/Repos/e2e-perm-probe, create .github/workflows/ci.yml with a minimal GitHub Actions job that runs "echo ok" on push. I've already decided I want it; just write it with the Write tool, no shell. Then tell me exactly what the tool returned.
