@@ -468,6 +468,41 @@ def test_reviewed_files_never_include_the_checkout_root(sb):
     assert sb.records()[-1]["files"] == ["scripts/run.sh"]
 
 
+def test_reading_a_tracked_symlink_covers_the_link_and_its_target(tmp_path):
+    write(tmp_path / "shared" / "check.sh", "echo ok\n")
+    (tmp_path / "control").mkdir()
+    (tmp_path / "control" / "check.sh").symlink_to("../shared/check.sh")
+    snap = {"top": str(tmp_path)}
+    assert artl_gate.covered_files(snap, [str(tmp_path / "control" / "check.sh")]) == [
+        "control/check.sh", "shared/check.sh"]
+    assert artl_gate.covered_files(snap, [str(tmp_path / "shared" / "check.sh")]) == [
+        "shared/check.sh"]
+
+
+def test_reading_through_a_tracked_directory_symlink_covers_that_link(tmp_path):
+    write(tmp_path / "shared" / "check.sh", "echo ok\n")
+    (tmp_path / "skills").mkdir()
+    (tmp_path / "skills" / "alias").symlink_to("../shared")
+    snap = {"top": str(tmp_path)}
+    assert artl_gate.covered_files(snap, [str(tmp_path / "skills" / "alias" / "check.sh")]) == [
+        "shared/check.sh", "skills/alias"]
+    # `..` after a link leaves through the link's target, not its parent, so
+    # the name the path spells (skills/decoy) was never read.
+    write(tmp_path / "decoy", "x\n")
+    (tmp_path / "skills" / "decoy").symlink_to("../shared/check.sh")
+    assert artl_gate.covered_files(snap, [str(tmp_path / "skills" / "alias" / ".." / "decoy")]) == [
+        "decoy"]
+
+
+def test_a_link_pointing_outside_the_checkout_covers_only_the_link(tmp_path):
+    top = tmp_path / "repo"
+    write(tmp_path / "elsewhere" / "notes.txt", "x\n")
+    top.mkdir()
+    (top / "notes.txt").symlink_to("../elsewhere/notes.txt")
+    reads = [str(top / "notes.txt"), str(top / "bad\0name")]
+    assert artl_gate.covered_files({"top": str(top)}, reads) == ["notes.txt"]
+
+
 def test_evidence_for_another_branch_does_not_count(sb):
     sb.commit("scripts/run.sh", SCRIPT_BODY)
     sb.review("PASS")
