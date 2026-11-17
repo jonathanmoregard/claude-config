@@ -240,7 +240,7 @@
       "Read(~/.claude/.credentials.json)",
       "Read(~/.codex/auth.json)",
       "Read(~/.google_workspace_mcp/**)",
-      "Read(//run/agenix/**)",
+      "Read(//run/agenix.d/**)",
       "Read(//**/quarantine/**)",
       "Read(//**/quarantine)",
       "Edit(//**/quarantine/**)",
@@ -930,11 +930,64 @@
     "autoAllowBashIfSandboxed": true,
     "allowUnsandboxedCommands": false,
     "failIfUnavailable": true,
+    "network": {
+      "allowAllUnixSockets": true,
+      "tlsTerminate": {},
+      "allowedDomains": [
+        "github.com",
+        "api.github.com",
+        "codeload.github.com",
+        "uploads.github.com",
+        "objects.githubusercontent.com",
+        "raw.githubusercontent.com",
+        "cache.nixos.org",
+        "channels.nixos.org",
+        "registry.npmjs.org",
+        "crates.io",
+        "index.crates.io",
+        "static.crates.io",
+        "pypi.org",
+        "files.pythonhosted.org"
+      ]
+    },
     "filesystem": {
       "allowWrite": [
         "/home/jonathan/Repos",
         "/home/jonathan/worktrees",
-        "/home/jonathan/.local/state/ai-router"
+        "/home/jonathan/.local/state/ai-router",
+        "~/.cache/nix",
+        "~/.cache/uv",
+        "~/.cargo"
+      ],
+      "denyRead": [
+        "/run/user/1003",
+        "/run/dbus",
+        "/run/github-app",
+        "/tmp/.X11-unix",
+        "/tmp/.ICE-unix",
+        "/tmp/cc-socks",
+        "/tmp/keepassxc-jonathan.socket",
+        "/tmp/kitty.sock-*"
+      ]
+    },
+    "credentials": {
+      "files": [
+        {
+          "path": "~/.cache/gh-tokens/host/token",
+          "mode": "mask",
+          "injectHosts": ["github.com", "api.github.com", "uploads.github.com", "codeload.github.com"]
+        },
+        {
+          "path": "~/.cache/gh-tokens/host/klaffat/token",
+          "mode": "mask",
+          "injectHosts": ["github.com", "api.github.com", "uploads.github.com", "codeload.github.com"]
+        }
+      ],
+      "envVars": [
+        {"name": "CLAUDE_CODE_MESSAGING_TOKEN", "mode": "deny"},
+        {"name": "KITTY_LISTEN_ON", "mode": "deny"},
+        {"name": "SSH_AUTH_SOCK", "mode": "deny"},
+        {"name": "DBUS_SESSION_BUS_ADDRESS", "mode": "deny"}
       ]
     }
   },

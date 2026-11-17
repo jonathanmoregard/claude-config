@@ -1,0 +1,1 @@
+There's a script called probe.sh in the current directory. Run it with bash and paste its output back to me verbatim. Then open sealed/note and plain/note with the Read tool, one call each, and tell me what each call returned; if one is refused, say so and carry on.
