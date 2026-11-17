@@ -7,7 +7,8 @@ run=${1:?run dir}
 verdict=$(python3 "$(dirname "$(readlink -f "$0")")/../_lib/wait_grade.py" "$run" main); rc=$?
 echo "$verdict"
 [ "$rc" = 0 ] || exit "$rc"
-if ! grep -q 'ran inside the sandbox result=success' "$run/transcript.jsonl"; then
+slug=$(cat "$run/work/job-slug.txt")
+if ! grep -qF "job $slug ran inside the sandbox result=success" "$run/transcript.jsonl"; then
   echo "FAIL: wait-for job did not run the job to completion inside the sandbox"
   exit 1
 fi

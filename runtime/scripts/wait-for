@@ -622,16 +622,31 @@ wait_unit() {
 
 # The Claude Code sandbox hides the user bus on purpose (a transient unit would
 # run outside it), so there the job is a child of this call and ends with it.
+# The log's last line stands in for the retained unit: a finished run is
+# adopted, never repeated, until its log is removed.
 run_job_in_sandbox() {
-  local log=/tmp/$target.log rc
-  command timeout "$timeout" "${job_cmd[@]}" >"$log" 2>&1; rc=$?
+  local log=/tmp/$target.log rc last
+  exec 9>>"/tmp/$target.lock" || { echo "wait-for: cannot open /tmp/$target.lock" >&2; exit 3; }
+  flock -n 9 || flock -w "$(left)" 9 || timed_out
+  last=$(tail -n 1 -- "$log" 2>/dev/null)
+  case $last in
+    MARKER_OK)
+      echo "job $target already ran inside the sandbox result=success status=0 log=$log (remove the log to run it again)"
+      exit 0 ;;
+    "MARKER_FAILED rc="*)
+      echo "job $target already ran inside the sandbox result=exit-code status=${last#MARKER_FAILED rc=} log=$log (remove the log to run it again)"
+      exit 1 ;;
+  esac
+  : >"$log" || { echo "wait-for: cannot write $log" >&2; exit 3; }
+  [ "$(left)" -gt 0 ] || timed_out
+  command timeout "$(left)" "${job_cmd[@]}" >>"$log" 2>&1 9>&-; rc=$?
+  if [ "$rc" = 124 ] && [ "$(left)" -le 0 ]; then timed_out; fi
   if [ "$rc" = 0 ]; then
     echo MARKER_OK >>"$log"
     echo "job $target ran inside the sandbox result=success status=0 log=$log"
     exit 0
   fi
   echo "MARKER_FAILED rc=$rc" >>"$log"
-  [ "$rc" != 124 ] || timed_out
   echo "job $target ran inside the sandbox result=exit-code status=$rc log=$log"
   exit 1
 }

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Sandbox aid for Bash. FAIL-OPEN: it grants nothing and blocks nothing.
 
-After a sandboxed command fails in a way the sandbox explains, name the route
-that works. Before a command that asks to leave the sandbox, log the request,
+When a sandboxed command's output carries an error the sandbox explains, name
+the route that works. Before a command that asks to leave the sandbox, log the request,
 so the routes still missing can be ranked from real use.
 """
 from __future__ import annotations
@@ -29,19 +29,22 @@ HINTS: list[tuple[str, re.Pattern[str], str]] = [
     (
         "bus",
         re.compile(r"Failed to connect to (user|system) scope bus|Failed to connect to bus"),
-        "The shell is sandboxed and has no systemd bus. These read-only forms "
-        "run outside it when they are the whole command (no pipe, file "
-        "redirect, `&&`, `;`, `cd` or variable prefix): `systemctl [--user] "
-        "status|show|is-active|is-failed|is-enabled|cat|list-units|list-timers"
-        "|list-unit-files|list-dependencies ...` and `~/.claude/scripts/"
-        "wait-for unit <name> [--user]`. Long jobs: `~/.claude/scripts/"
-        "wait-for job <slug> -- <cmd>`. `journalctl` works as it is.",
+        "The shell is sandboxed and has no systemd bus. To read unit state "
+        "use `~/.claude/scripts/unit-read [--user] <verb> [unit...]` (verbs: "
+        "status, show, cat, is-active, is-failed, is-enabled, list-units, "
+        "list-timers, ...) or `~/.claude/scripts/wait-for unit <name> "
+        "[--user]`. Each runs outside the sandbox only as the whole command: "
+        "no pipe, file redirect, `&&`, `;`, `cd` or variable prefix. Long "
+        "jobs: `~/.claude/scripts/wait-for job <slug> -- <cmd>`. `journalctl` "
+        "works as it is.",
     ),
     (
         "trash",
         re.compile(r"across filesystem boundaries|Unable to create trashing info file"),
-        "The shell is sandboxed: `gio trash <path>` runs outside it only as "
-        "the whole command (no `&&`, `;`, pipe or `cd`).",
+        "The shell is sandboxed, where `gio trash` cannot reach the trash. "
+        "Use `~/.claude/scripts/trash <path>...` as the whole command (no "
+        "`&&`, `;`, pipe or `cd`); it takes paths under ~/Repos and "
+        "~/worktrees.",
     ),
     (
         "read-only",
