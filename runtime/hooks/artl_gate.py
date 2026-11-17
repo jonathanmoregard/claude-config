@@ -973,6 +973,23 @@ def snapshot(info: dict) -> dict | None:
             "head": head, "tree": tree}
 
 
+def _read_paths(p: str) -> list[str]:
+    """What one read covers: the file it resolves to, and each symlink named
+    along its path -- a tracked symlink is a changed file of its own."""
+    paths = [os.path.realpath(p)]
+    # `..` after a link leaves through the link's target, so the names such a
+    # path spells are not the ones it visits; it covers its resolved file only.
+    if ".." in p.split(os.sep):
+        return paths
+    link = os.path.abspath(p)
+    while link != os.path.dirname(link):
+        if os.path.islink(link):
+            paths.append(os.path.join(os.path.realpath(os.path.dirname(link)),
+                                      os.path.basename(link)))
+        link = os.path.dirname(link)
+    return paths
+
+
 def covered_files(snap: dict, reads: list[str]) -> list[str]:
     """The files the advisor itself Read inside this checkout, repo-relative.
     Coverage comes from the advisor's own tool calls, never from the dispatch
@@ -981,11 +998,10 @@ def covered_files(snap: dict, reads: list[str]) -> list[str]:
     out = set()
     for p in reads:
         try:
-            rel = os.path.relpath(os.path.realpath(p), top)
+            rels = [os.path.relpath(path, top) for path in _read_paths(p)]
         except ValueError:
             continue
-        if rel != "." and not rel.startswith(".."):
-            out.add(rel)
+        out.update(rel for rel in rels if rel != "." and not rel.startswith(".."))
     return sorted(out)
 
 
