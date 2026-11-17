@@ -26,7 +26,10 @@ only=$(IFS=$'\t'; echo "$*")      # tab-joined: a lens name may hold spaces
 awk -F'\t' -v only="$only" '
 BEGIN { n = split(only, w, "\t"); for (i = 1; i <= n; i++) want[w[i]] = 1 }
 FNR == 1 && $1 == "date" { next }                   # header row
-NF != 10 { next }                                   # not a ledger row
+NF != 10 {                                          # not a ledger row: say so
+  printf "ledger-tally: %s:%d: skipped, not ten fields\n", FILENAME, FNR > "/dev/stderr"
+  next
+}
 {
   if ($8 == "confirmed") $8 = "reproduced"          # assurance-sweep verdict
   check = $4; run = FILENAME SUBSEP $3; outcome = $8; fixed = $9; reason = $10

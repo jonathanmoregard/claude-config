@@ -102,6 +102,8 @@ expect "a lens name with a space is selectable; confirmed counts as reproduced" 
 out=$("$TALLY" --root "$ROOT")
 expect "first row of a headerless ledger is counted" "nohdr${T}1${T}1${T}1${T}1${T}0${T}0${T}-" "$(line nohdr)"
 expect "a line without ten fields is ignored" "" "$(grep -E "^(a stray line)?${T}" <<<"$out")"
+expect "and reported on stderr" "ledger-tally: $ROOT/repo2/review-ledger.tsv:11: skipped, not ten fields" \
+  "$("$TALLY" --root "$ROOT" 2>&1 >/dev/null)"
 
 if (( fails )); then echo "FAIL: $fails ledger-tally assertion(s)"; exit 1; fi
 echo "PASS: ledger-tally"
