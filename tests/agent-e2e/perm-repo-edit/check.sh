@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Edit(//home/jonathan/Repos/**) lets an in-place edit of a ~/Repos checkout
-# through. A read-only sandbox mount error still counts: permission said yes.
-PERM_TOOLS=Write,Edit PERM_PATH=/home/jonathan/Repos/e2e-perm-probe/NOTES.md PERM_EXPECT=allowed
+# An allow-listed ~/Repos checkout accepts an in-place edit without a prompt.
+# The sandbox mounts HOME read-only, so the write ends in EROFS after the
+# permission layer said yes, and the real checkout is untouched.
+PERM_TOOLS=Write,Edit PERM_PATH=/home/jonathan/Repos/dependency-guard/E2E_NOTES.md PERM_EXPECT=allowed
 source "$(dirname "$0")/../_lib/perm_scenario.sh" "$1"
