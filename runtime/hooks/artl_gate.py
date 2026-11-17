@@ -973,6 +973,19 @@ def snapshot(info: dict) -> dict | None:
             "head": head, "tree": tree}
 
 
+def _read_paths(p: str) -> list[str]:
+    """What one read covers: the file it resolves to, and each symlink named
+    along its path -- a tracked symlink is a changed file of its own."""
+    paths = [os.path.realpath(p)]
+    link = os.path.abspath(p)
+    while link != os.path.dirname(link):
+        if os.path.islink(link):
+            paths.append(os.path.join(os.path.realpath(os.path.dirname(link)),
+                                      os.path.basename(link)))
+        link = os.path.dirname(link)
+    return paths
+
+
 def covered_files(snap: dict, reads: list[str]) -> list[str]:
     """The files the advisor itself Read inside this checkout, repo-relative.
     Coverage comes from the advisor's own tool calls, never from the dispatch
@@ -980,16 +993,11 @@ def covered_files(snap: dict, reads: list[str]) -> list[str]:
     top = os.path.realpath(snap["top"])
     out = set()
     for p in reads:
-        # A tracked symlink is a changed file of its own, so a read through it
-        # covers the link as named as well as the file it resolves to.
-        named = os.path.join(os.path.realpath(os.path.dirname(p)), os.path.basename(p))
-        for path in (os.path.realpath(p), named):
-            try:
-                rel = os.path.relpath(path, top)
-            except ValueError:
-                continue
-            if rel != "." and not rel.startswith(".."):
-                out.add(rel)
+        try:
+            rels = [os.path.relpath(path, top) for path in _read_paths(p)]
+        except ValueError:
+            continue
+        out.update(rel for rel in rels if rel != "." and not rel.startswith(".."))
     return sorted(out)
 
 

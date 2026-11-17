@@ -479,6 +479,24 @@ def test_reading_a_tracked_symlink_covers_the_link_and_its_target(tmp_path):
         "shared/check.sh"]
 
 
+def test_reading_through_a_tracked_directory_symlink_covers_that_link(tmp_path):
+    write(tmp_path / "shared" / "check.sh", "echo ok\n")
+    (tmp_path / "skills").mkdir()
+    (tmp_path / "skills" / "alias").symlink_to("../shared")
+    snap = {"top": str(tmp_path)}
+    assert artl_gate.covered_files(snap, [str(tmp_path / "skills" / "alias" / "check.sh")]) == [
+        "shared/check.sh", "skills/alias"]
+
+
+def test_a_link_pointing_outside_the_checkout_covers_only_the_link(tmp_path):
+    top = tmp_path / "repo"
+    write(tmp_path / "elsewhere" / "notes.txt", "x\n")
+    top.mkdir()
+    (top / "notes.txt").symlink_to("../elsewhere/notes.txt")
+    reads = [str(top / "notes.txt"), str(top / "bad\0name")]
+    assert artl_gate.covered_files({"top": str(top)}, reads) == ["notes.txt"]
+
+
 def test_evidence_for_another_branch_does_not_count(sb):
     sb.commit("scripts/run.sh", SCRIPT_BODY)
     sb.review("PASS")
