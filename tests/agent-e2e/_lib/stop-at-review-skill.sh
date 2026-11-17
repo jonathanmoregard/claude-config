@@ -18,7 +18,7 @@ in=\$(cat)
 printf '%s\n' "\$in" >> "$RUN/skill-calls.jsonl"
 skill=\$(printf '%s' "\$in" | jq -r '.tool_input.skill // ""')
 case "\$skill" in
-  advice-refine-test-loop|assurance-sweep|code-review|code-review:*|requesting-code-review|differential-review*|simplify)
+  advice-refine-test-loop|assurance-sweep|code-review|code-review:*|requesting-code-review|*:requesting-code-review|differential-review*|*:diff-review|review|simplify)
     jq -n --arg s "\$skill" '{hookSpecificOutput: {hookEventName: "PreToolUse",
       permissionDecision: "deny",
       permissionDecisionReason: ("E2E harness: the choice of skill " + \$s + " is recorded and this run ends here. Do not continue the task by other means. Reply with the single word: stopped.")}}'
