@@ -382,7 +382,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -S -E $HOME/.claude/hooks/sandbox-aid.py",
+            "command": "[ -f $HOME/.claude/hooks/sandbox-aid.py ] || exit 0; python3 -S -E $HOME/.claude/hooks/sandbox-aid.py",
             "timeout": 5
           }
         ]
@@ -462,7 +462,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -S -E $HOME/.claude/hooks/sandbox-aid.py",
+            "command": "[ -f $HOME/.claude/hooks/sandbox-aid.py ] || exit 0; python3 -S -E $HOME/.claude/hooks/sandbox-aid.py",
             "timeout": 5
           }
         ]
