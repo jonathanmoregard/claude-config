@@ -21,8 +21,14 @@ if ! grep -qx 'ran=yes' "$out" 2>/dev/null; then
   exit 2
 fi
 
-if ! grep -q 'read-tool-plain-plant' "$run/transcript.jsonl" 2>/dev/null; then
-  echo "INCONCLUSIVE: the agent never read plain/note, so the Read-tool check has no control"
+for f in sealed plain; do
+  if ! grep -q "\"name\":\"Read\",\"input\":{\"file_path\":\"[^\"]*$f/note\"" "$run/transcript.jsonl" 2>/dev/null; then
+    echo "INCONCLUSIVE: the agent never called Read on $f/note"
+    exit 2
+  fi
+done
+if ! grep -q 'read-tool-plain-plant' "$run/transcript.jsonl"; then
+  echo "INCONCLUSIVE: Read of plain/note returned nothing, so the Read-tool check has no control"
   exit 2
 fi
 if grep -q 'read-tool-sealed-plant' "$run/transcript.jsonl"; then

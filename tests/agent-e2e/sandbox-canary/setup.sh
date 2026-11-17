@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Plants a known value at each kind of place the sandbox profile hides, plus a
 # probe reporting what is exposed and whether ordinary work still runs.
-# SANDBOX_ENABLE=0 (the -off control) must read every plant back: that is what
+# A third argument of 0 (the -off control) must read every plant back: that is what
 # makes "hidden" in the enabled run the sandbox's doing, not the harness's.
 set -euo pipefail
 
@@ -63,7 +63,7 @@ works github sh -c '[ "\$(curl -s -o /dev/null -m 20 -w "%{http_code}" https://g
 cat "\$out"
 EOF
 
-python3 - "$HOME/.claude/settings.json" "$run" "$canary" "${SANDBOX_ENABLE:-1}" "$work" <<'PY'
+python3 - "$HOME/.claude/settings.json" "$run" "$canary" "${3:-1}" "$work" <<'PY'
 import json, sys
 path, run, canary, enable, work = sys.argv[1:6]
 settings = json.load(open(path, encoding="utf-8"))
@@ -75,4 +75,4 @@ if enable == "1":
     settings.setdefault("sandbox", {})["enabled"] = True
 open(path, "w", encoding="utf-8").write(json.dumps(settings, indent=2) + "\n")
 PY
-echo "sandbox_enable=${SANDBOX_ENABLE:-1}" >"$run/mode"
+echo "sandbox_enable=${3:-1}" >"$run/mode"
