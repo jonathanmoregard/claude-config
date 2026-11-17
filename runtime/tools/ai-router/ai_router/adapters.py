@@ -104,7 +104,7 @@ def _claude_common(model: str, effort: str | None, sandbox: str, schema: str | N
 
 
 def build_argv(provider: str, binary: str, *, model: str, effort: str | None, sandbox: str, cwd: str,
-               schema: str | None, bare: bool, job_dir: Path, writable_roots: tuple[str, ...] = (),
+               schema: str | None, job_dir: Path, writable_roots: tuple[str, ...] = (),
                network_access: bool = False) -> list[str]:
     """argv for a fresh job; the prompt is PROMPT_PLACEHOLDER (contract §Jobs)."""
     if provider == "codex":
@@ -130,7 +130,7 @@ def build_argv(provider: str, binary: str, *, model: str, effort: str | None, sa
 
 
 def build_resume_argv(provider: str, binary: str, *, thread_id: str, model: str, effort: str | None,
-                      sandbox: str, cwd: str, bare: bool) -> list[str]:
+                      sandbox: str, cwd: str) -> list[str]:
     """argv for `send`: codex `exec resume <thread>`, claude `-p --resume <session>`."""
     if provider == "codex":
         argv = [binary, "exec", "resume", thread_id, "--json", "-m", model,

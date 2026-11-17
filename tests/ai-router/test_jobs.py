@@ -45,7 +45,7 @@ def start(state: Path, spec: jobs.JobSpec, env: dict[str, str], now: float | Non
     job_id, d = jobs.create_job(state, spec, now=now or time.time())
     argv = adapters.build_argv(spec.provider, adapters.resolve_binary(spec.provider, env) or "", model=spec.model,
                                effort=spec.effort, sandbox=spec.sandbox, cwd=spec.cwd, schema=spec.schema,
-                               bare=spec.bare, job_dir=d)
+                               job_dir=d)
     jobs.update_meta(d, argv=argv)
     jobs.launch(d, env=env, launcher="setsid")
     return job_id, d
@@ -240,7 +240,7 @@ def test_systemd_launcher_when_available(state_dir: Path, tmp_path: Path, env):
     spec = spec_for("codex", "gpt-5.6-luna", "MODE:ok via systemd", tmp_path, env)
     job_id, d = jobs.create_job(state_dir, spec, now=time.time())
     argv = adapters.build_argv("codex", adapters.resolve_binary("codex", env) or "", model=spec.model,
-                               effort=spec.effort, sandbox=spec.sandbox, cwd=spec.cwd, schema=None, bare=True,
+                               effort=spec.effort, sandbox=spec.sandbox, cwd=spec.cwd, schema=None,
                                job_dir=d)
     jobs.update_meta(d, argv=argv)
     info = jobs.launch(d, env=env, launcher="auto")
@@ -321,7 +321,7 @@ def test_runner_does_not_append_through_a_symlinked_log(state_dir: Path, tmp_pat
                                                     tmp_path, env), now=time.time())
     jobs.update_meta(d, argv=adapters.build_argv("claude", adapters.resolve_binary("claude", env) or "",
                                                  model="claude-haiku-4-5-20251001", effort=None, sandbox="read-only",
-                                                 cwd=str(tmp_path), schema=None, bare=True, job_dir=d))
+                                                 cwd=str(tmp_path), schema=None, job_dir=d))
     (d / name).symlink_to(victim)
     jobs.launch(d, env=env, launcher="setsid")
     _, status = finish(state_dir, job_id)
@@ -344,7 +344,7 @@ def test_runner_refuses_a_symlinked_job_dir(state_dir: Path, tmp_path: Path, env
     _, d = jobs.create_job(state_dir, spec, now=time.time())
     jobs.update_meta(d, argv=adapters.build_argv("codex", adapters.resolve_binary("codex", env) or "",
                                                  model=spec.model, effort=spec.effort, sandbox=spec.sandbox,
-                                                 cwd=spec.cwd, schema=None, bare=True, job_dir=d))
+                                                 cwd=spec.cwd, schema=None, job_dir=d))
     link = tmp_path / "link"
     link.symlink_to(d)
     assert runner.main([str(link)]) == 2

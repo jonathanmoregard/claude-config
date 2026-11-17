@@ -21,8 +21,8 @@ from pathlib import Path
 from typing import Any
 
 from . import VERSION, adapters, jobs, quota
-from .config import (PROVIDERS, SANDBOXES, TIERS, Config, ConfigError, SymlinkRefused, load_config,
-                     state_dir)
+from .config import (PROVIDERS, SANDBOXES, TIERS, Config, ConfigError, SymlinkRefused, atomic_write_text,
+                     load_config, state_dir)
 from .sanitize import clean
 from .selection import detect_host, pick
 
@@ -179,14 +179,18 @@ def _confined(path: str, label: str) -> str:
     return real
 
 
-def _read_prompt(path: str) -> str:
+def _read_confined(path: str, label: str) -> str:
     try:
         with open(path, encoding="utf-8") as fh:
             # Checked through the open fd, so a path swapped after the check is never read.
-            _confined(f"/proc/self/fd/{fh.fileno()}", f"prompt file {path}")
-            text = fh.read()
+            _confined(f"/proc/self/fd/{fh.fileno()}", f"{label} {path}")
+            return fh.read()
     except OSError as exc:
-        raise CliError("usage", f"cannot read prompt file: {exc}") from None
+        raise CliError("usage", f"cannot read {label}: {exc}") from None
+
+
+def _read_prompt(path: str) -> str:
+    text = _read_confined(path, "prompt file")
     if not text.strip():
         raise CliError("usage", f"prompt file is empty: {path}")
     return text
@@ -232,7 +236,7 @@ def _codex_effective_sandbox(cwd: str, sandbox: str, dev_gates: bool,
     roots = [cwd]
     common_dir = _git_common_dir(cwd, env)
     if common_dir and common_dir != cwd:
-        roots.append(common_dir)
+        roots.append(_confined(common_dir, "Git common directory"))
     if dev_gates:
         home = Path(env.get("HOME") or Path.home())
         runtime_parent = Path(env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
@@ -350,11 +354,7 @@ def _choose_for_delegate(ctx: Ctx, args: argparse.Namespace, host: str | None) -
 def cmd_delegate(ctx: Ctx, args: argparse.Namespace, out: Out, launcher: str) -> int:
     prompt = _read_prompt(args.prompt_file)
     cwd = _abs_dir(args.cwd)
-    schema = None
-    if args.schema:
-        schema = _confined(args.schema, "schema file")
-        if not os.path.isfile(schema):
-            raise CliError("usage", f"schema file not found: {schema}")
+    schema_text = _read_confined(args.schema, "schema file") if args.schema else None
     host = args.host or detect_host(ctx.env)
     provider, model, effort, tier, forced = _choose_for_delegate(ctx, args, host)
     if args.dev_gates and (provider != "codex" or args.sandbox != "workspace-write"):
@@ -368,14 +368,20 @@ def cmd_delegate(ctx: Ctx, args: argparse.Namespace, out: Out, launcher: str) ->
     ) if provider == "codex" else ({}, ())
     spec = jobs.JobSpec(provider=provider, model=model, effort=effort, tier=tier, cwd=cwd, sandbox=args.sandbox,
                         prompt=prompt, timeout_s=timeout_s, stall_min=ctx.cfg.settings.job_stall_min,
-                        bare=not args.no_bare, schema=schema, host=host, name=args.name, need=list(args.need),
+                        bare=not args.no_bare, host=host, name=args.name, need=list(args.need),
                         forced=forced, argv=[])
     job_id, d = jobs.create_job(ctx.state, spec, now=ctx.now)
+    schema = None
+    if schema_text is not None:
+        # Providers read the schema later; a router-owned copy cannot be swapped by the caller.
+        schema = str(d / "schema.json")
+        atomic_write_text(Path(schema), schema_text)
     # argv needs the job dir (codex `-o <job_dir>/last_message.md`), so it is built after create
     spec.argv = adapters.build_argv(provider, binary, model=model, effort=effort, sandbox=args.sandbox, cwd=cwd,
-                                    schema=schema, bare=spec.bare, job_dir=d, writable_roots=writable_roots,
+                                    schema=schema, job_dir=d, writable_roots=writable_roots,
                                     network_access=bool(effective_sandbox.get("network_access")))
-    jobs.update_meta(d, argv=spec.argv, dev_gates=bool(args.dev_gates), effective_sandbox=effective_sandbox)
+    jobs.update_meta(d, argv=spec.argv, schema=schema, dev_gates=bool(args.dev_gates),
+                     effective_sandbox=effective_sandbox)
     info = jobs.launch(d, env=ctx.env, launcher=launcher)
     started = {"ok": True, "job_id": job_id, "provider": provider, "model": model, "effort": effort,
                "job_dir": str(d), "events": str(d / "events.jsonl"), "result_path": str(d / "result.txt"),
@@ -450,8 +456,7 @@ def cmd_send(ctx: Ctx, args: argparse.Namespace, out: Out, launcher: str) -> int
     if binary is None:
         raise CliError("setup", f"{meta['provider']} binary not found")
     argv = adapters.build_resume_argv(meta["provider"], binary, thread_id=conv, model=meta["model"],
-                                      effort=meta.get("effort"), sandbox=meta["sandbox"], cwd=cwd,
-                                      bare=bool(meta.get("bare", True)))
+                                      effort=meta.get("effort"), sandbox=meta["sandbox"], cwd=cwd)
     timeout_s = args.timeout_s if args.timeout_s is not None else float(meta.get("timeout_s") or
                                                                         ctx.cfg.settings.job_timeout_s)
     spec = jobs.JobSpec(provider=meta["provider"], model=meta["model"], effort=meta.get("effort"), tier=meta["tier"],

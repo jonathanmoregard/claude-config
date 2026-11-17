@@ -31,10 +31,10 @@ pytestmark = pytest.mark.usefixtures("stub_providers")
 
 def test_claude_argv_ends_options_before_prompt(tmp_path: Path):
     argv = adapters.build_argv("claude", "/bin/claude", model="claude-haiku-4-5-20251001", effort=None,
-                               sandbox="read-only", cwd=str(tmp_path), schema=None, bare=True, job_dir=tmp_path)
+                               sandbox="read-only", cwd=str(tmp_path), schema=None, job_dir=tmp_path)
     assert argv[-2:] == ["--", PROMPT_PLACEHOLDER]
     resume = adapters.build_resume_argv("claude", "/bin/claude", thread_id="sess-1", model="claude-haiku-4-5-20251001",
-                                        effort=None, sandbox="read-only", cwd=str(tmp_path), bare=True)
+                                        effort=None, sandbox="read-only", cwd=str(tmp_path))
     assert resume[-2:] == ["--", PROMPT_PLACEHOLDER]
     bullet = adapters.materialize(argv, "- a\n- b")
     assert bullet[-1] == "- a\n- b" and bullet[-2] == "--"
@@ -82,7 +82,7 @@ def test_quota_retry_is_linked_before_terminal_status(state_dir: Path, tmp_path:
                         argv=[], host="claude")
     job_id, d = jobs.create_job(state_dir, spec, now=time.time())
     jobs.update_meta(d, argv=adapters.build_argv("codex", binary, model=spec.model, effort=spec.effort,
-                                                 sandbox=spec.sandbox, cwd=spec.cwd, schema=None, bare=True,
+                                                 sandbox=spec.sandbox, cwd=spec.cwd, schema=None,
                                                  job_dir=d))
     seen: dict[str, str] = {}
 

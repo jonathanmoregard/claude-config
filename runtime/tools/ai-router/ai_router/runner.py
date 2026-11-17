@@ -130,7 +130,7 @@ def _retry_after_quota(state: Path, d: Path, meta: dict[str, Any], diag: str, no
         argv=[]), now=now)
     argv = adapters.build_argv(choice["provider"], binary, model=choice["model"], effort=effort,
                                sandbox=meta["sandbox"], cwd=meta["cwd"], schema=meta.get("schema"),
-                               bare=bool(meta.get("bare", True)), job_dir=new_dir)
+                               job_dir=new_dir)
     jobs.update_meta(new_dir, argv=argv)
     jobs.update_meta(d, retried_as=new_id)
     # the retry follows the parent's launch path (setsid stays setsid; systemd stays auto)

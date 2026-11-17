@@ -40,7 +40,7 @@ def test_resolve_binary_prefers_env_override(tmp_path: Path):
 
 def test_codex_argv_shape(tmp_path: Path):
     argv = build_argv("codex", "/bin/codex", model="gpt-5.6-luna", effort="low",
-                      sandbox="read-only", cwd="/work", schema=None, bare=True, job_dir=tmp_path)
+                      sandbox="read-only", cwd="/work", schema=None, job_dir=tmp_path)
     assert argv[:3] == ["/bin/codex", "exec", "--json"]
     assert argv[argv.index("-m") + 1] == "gpt-5.6-luna"
     assert "model_reasoning_effort=low" in argv
@@ -56,14 +56,14 @@ def test_codex_argv_with_schema(tmp_path: Path):
     schema = tmp_path / "s.json"
     schema.write_text("{}")
     argv = build_argv("codex", "/bin/codex", model="gpt-5.6-sol", effort="high",
-                      sandbox="workspace-write", cwd="/w", schema=str(schema), bare=True, job_dir=tmp_path)
+                      sandbox="workspace-write", cwd="/w", schema=str(schema), job_dir=tmp_path)
     assert argv[argv.index("--output-schema") + 1] == str(schema)
     assert argv[-2:] == ["--", PROMPT_PLACEHOLDER]
 
 
 def test_codex_argv_adds_explicit_writable_roots_and_network_opt_in(tmp_path: Path):
     argv = build_argv("codex", "/bin/codex", model="gpt-5.6-sol", effort="high",
-                      sandbox="workspace-write", cwd="/work", schema=None, bare=True, job_dir=tmp_path,
+                      sandbox="workspace-write", cwd="/work", schema=None, job_dir=tmp_path,
                       writable_roots=("/git/common", "/state/klaffat"), network_access=True)
     assert argv.count("--add-dir") == 2
     assert argv[argv.index("--add-dir") + 1] == "/git/common"
@@ -73,7 +73,7 @@ def test_codex_argv_adds_explicit_writable_roots_and_network_opt_in(tmp_path: Pa
 
 def test_claude_argv_read_only_and_bare(tmp_path: Path):
     argv = build_argv("claude", "/bin/claude", model="claude-haiku-4-5-20251001", effort="low",
-                      sandbox="read-only", cwd="/w", schema=None, bare=True, job_dir=tmp_path)
+                      sandbox="read-only", cwd="/w", schema=None, job_dir=tmp_path)
     assert argv[:5] == ["/bin/claude", "-p", "--output-format", "stream-json", "--verbose"]
     assert argv[argv.index("--model") + 1] == "claude-haiku-4-5-20251001"
     assert argv[argv.index("--effort") + 1] == "low"
@@ -87,7 +87,7 @@ def test_claude_argv_workspace_write_no_bare_with_schema(tmp_path: Path):
     schema = tmp_path / "s.json"
     schema.write_text('{"type":"object"}')
     argv = build_argv("claude", "/bin/claude", model="claude-sonnet-5", effort=None,
-                      sandbox="workspace-write", cwd="/w", schema=str(schema), bare=False, job_dir=tmp_path)
+                      sandbox="workspace-write", cwd="/w", schema=str(schema), job_dir=tmp_path)
     assert argv[argv.index("--permission-mode") + 1] == "acceptEdits"
     assert argv[argv.index("--allowedTools") + 1] == "Read,Glob,Grep,Edit,Write,MultiEdit,Bash"
     assert argv[argv.index("--disallowedTools") + 1] == "Agent"
@@ -117,11 +117,11 @@ def test_refuse_dangerous_flags(flag: str):
 
 def test_resume_argv():
     c = build_resume_argv("codex", "/bin/codex", thread_id="t-1", model="gpt-5.6-luna", effort="low",
-                          sandbox="read-only", cwd="/w", bare=True)
+                          sandbox="read-only", cwd="/w")
     assert c[:4] == ["/bin/codex", "exec", "resume", "t-1"] and c[-2:] == ["--", PROMPT_PLACEHOLDER]
     assert "--json" in c and "-m" in c
     a = build_resume_argv("claude", "/bin/claude", thread_id="s-1", model="claude-sonnet-5", effort=None,
-                          sandbox="read-only", cwd="/w", bare=True)
+                          sandbox="read-only", cwd="/w")
     assert a[a.index("--resume") + 1] == "s-1" and a[-1] == PROMPT_PLACEHOLDER
 
 
@@ -226,12 +226,11 @@ def test_parse_event_line_tolerates_garbage():
 
 
 @pytest.mark.parametrize("sandbox", ["read-only", "workspace-write"])
-@pytest.mark.parametrize("bare", [True, False])
-def test_claude_jobs_load_user_settings_inside_an_enforced_sandbox(tmp_path: Path, sandbox: str, bare: bool):
+def test_claude_jobs_load_user_settings_inside_an_enforced_sandbox(tmp_path: Path, sandbox: str):
     fresh = build_argv("claude", "/bin/claude", model="claude-sonnet-5", effort=None, sandbox=sandbox, cwd="/w",
-                       schema=None, bare=bare, job_dir=tmp_path)
+                       schema=None, job_dir=tmp_path)
     resume = build_resume_argv("claude", "/bin/claude", thread_id="s-1", model="claude-sonnet-5", effort=None,
-                               sandbox=sandbox, cwd="/w", bare=bare)
+                               sandbox=sandbox, cwd="/w")
     for argv in (fresh, resume):
         assert "--setting-sources" not in argv and "--strict-mcp-config" in argv
         settings = json.loads(argv[argv.index("--settings") + 1])

@@ -380,8 +380,9 @@ def test_schema_and_workspace_write(capsys, env, tmp_path, state_dir):
                                "--schema", str(schema), "--sandbox", "workspace-write", "--no-bare", "--wait",
                                "--json"], env)
     assert rc == 0 and res["result_json"] == {"answer": 42, "model": "claude-haiku-4-5-20251001"}
-    meta = jobs.read_meta(jobs.job_dir(state_dir, res["job_id"]))
-    assert meta["schema"] == str(schema) and meta["bare"] is False and meta["sandbox"] == "workspace-write"
+    d = jobs.job_dir(state_dir, res["job_id"])
+    meta = jobs.read_meta(d)
+    assert meta["schema"] == str(d / "schema.json") and meta["bare"] is False and meta["sandbox"] == "workspace-write"
     argv = meta["argv"]
     assert argv[argv.index("--permission-mode") + 1] == "acceptEdits" and "--json-schema" in argv
     assert "--setting-sources" not in argv
@@ -457,3 +458,27 @@ def test_symlinked_job_dir_is_refused(capsys, env, prompt, tmp_path, state_dir):
     rc, obj, out, err = run(capsys, ["result", job_id, "--json"], env)
     assert CANARY not in out + err
     assert rc == 1 and obj["error_class"] == "error"
+
+
+def test_workspace_write_refuses_git_common_dir_outside_allowed_roots(capsys, env, prompt, tmp_path, state_dir,
+                                                                       monkeypatch):
+    worktree, _ = linked_worktree(tmp_path)
+    monkeypatch.setattr(cli, "_allowed_roots", lambda: [str(worktree), str(prompt)])
+    rc, obj, *_ = run(capsys, ["delegate", "--model", "luna", "--force", "--prompt-file", str(prompt), "--cwd",
+                               str(worktree), "--sandbox", "workspace-write", "--json"], env)
+    assert rc == 2 and obj["error_class"] == "usage"
+    assert not list((state_dir / "jobs").glob("*"))
+
+
+def test_job_uses_the_schema_content_read_at_delegate_time(capsys, env, prompt, tmp_path, state_dir):
+    schema = tmp_path / "s.json"
+    schema.write_text('{"type":"object"}')
+    rc, started, *_ = run(capsys, ["delegate", "--model", "luna", "--force", "--prompt-file", str(prompt), "--cwd",
+                                   str(tmp_path), "--schema", str(schema), "--json"], env)
+    assert rc == 0
+    schema.unlink()
+    schema.symlink_to(OUTSIDE_FILE)
+    d = jobs.job_dir(state_dir, started["job_id"])
+    argv = jobs.read_meta(d)["argv"]
+    used = Path(argv[argv.index("--output-schema") + 1])
+    assert used.parent == d and used.read_text() == '{"type":"object"}'

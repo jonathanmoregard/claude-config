@@ -35,9 +35,10 @@ the router runs outside Claude Code's sandbox, so the job must bring its own
 accepted and has no effect. `--bare` is never passed: it refuses OAuth
 credentials.
 
-Prompt files, `--schema` files and `--cwd` (also the stored cwd `send`
-reuses) must resolve under `~/Repos`, `~/worktrees`, `/tmp` or
-`~/.local/state/ai-router`. Job files are opened with `O_NOFOLLOW` and a
+Prompt files, `--schema` files, `--cwd` (also the stored cwd `send`
+reuses) and the Git common dir a `workspace-write` job adds must resolve under
+`~/Repos`, `~/worktrees`, `/tmp` or `~/.local/state/ai-router`. Providers get
+the schema from a copy in the job dir. Job files are opened with `O_NOFOLLOW` and a
 symlinked job directory is refused.
 
 ## Codex workspace-write scope
