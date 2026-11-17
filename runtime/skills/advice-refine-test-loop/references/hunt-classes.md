@@ -105,14 +105,14 @@ it should not.
 
 **When:** code a type checker runs on as part of the project gate. Skip this
 class everywhere else: the fix is a type something enforces. In such code:
-any value a function must check before using it, and any closed set — enum,
-status, kind — the diff adds a case to or branches on.
+any value a function must check before using it, and any enum, status or
+kind that the diff adds a case to or branches on.
 **Hunt:** A value checked and then passed on in its unchecked type, so every
 later caller must trust that the check already happened. Name the type that
-would tell a checked value from an unchecked one. Likewise a closed set
-consumed so that a new case would build and run unhandled — an equality
-chain, a string compare, a default branch. Name the consumer and the case it
-would swallow.
+would tell a checked value from an unchecked one. Also look for a set of
+cases that should be a sum type matched exhaustively but is not: a string or
+integer compared against literals, or an enum handled with a wildcard or
+`default` branch. Name the code and the new case it would silently accept.
 
 ### G2 — Wire format past its boundary
 
