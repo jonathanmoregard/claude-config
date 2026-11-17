@@ -468,6 +468,17 @@ def test_reviewed_files_never_include_the_checkout_root(sb):
     assert sb.records()[-1]["files"] == ["scripts/run.sh"]
 
 
+def test_reading_a_tracked_symlink_covers_the_link_and_its_target(tmp_path):
+    write(tmp_path / "shared" / "check.sh", "echo ok\n")
+    (tmp_path / "control").mkdir()
+    (tmp_path / "control" / "check.sh").symlink_to("../shared/check.sh")
+    snap = {"top": str(tmp_path)}
+    assert artl_gate.covered_files(snap, [str(tmp_path / "control" / "check.sh")]) == [
+        "control/check.sh", "shared/check.sh"]
+    assert artl_gate.covered_files(snap, [str(tmp_path / "shared" / "check.sh")]) == [
+        "shared/check.sh"]
+
+
 def test_evidence_for_another_branch_does_not_count(sb):
     sb.commit("scripts/run.sh", SCRIPT_BODY)
     sb.review("PASS")

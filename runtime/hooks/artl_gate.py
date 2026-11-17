@@ -980,12 +980,16 @@ def covered_files(snap: dict, reads: list[str]) -> list[str]:
     top = os.path.realpath(snap["top"])
     out = set()
     for p in reads:
-        try:
-            rel = os.path.relpath(os.path.realpath(p), top)
-        except ValueError:
-            continue
-        if rel != "." and not rel.startswith(".."):
-            out.add(rel)
+        # A tracked symlink is a changed file of its own, so a read through it
+        # covers the link as named as well as the file it resolves to.
+        named = os.path.join(os.path.realpath(os.path.dirname(p)), os.path.basename(p))
+        for path in (os.path.realpath(p), named):
+            try:
+                rel = os.path.relpath(path, top)
+            except ValueError:
+                continue
+            if rel != "." and not rel.startswith(".."):
+                out.add(rel)
     return sorted(out)
 
 
