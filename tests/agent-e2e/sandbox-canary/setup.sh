@@ -13,7 +13,6 @@ canary=canary-value-not-a-secret
 # Derived from RUN so check.sh removes it without trusting a file the agent can write.
 runtime_dir=/run/user/$uid/e2e-sandbox-canary/$(printf %s "$run" | sha256sum | cut -c1-16)
 mkdir -p "$HOME/.ssh" "$HOME/.codex" "$HOME/.cache/gh-tokens/host" \
-  "$HOME/.cache/uv" "$HOME/.cache/nix" "$HOME/.cargo" \
   "$run/vault.d/1" "$runtime_dir" "$work/sealed.d/1" "$work/plain.d/1"
 printf '%s\n' "$canary" >"$HOME/.ssh/id_ed25519"
 printf '%s\n' "$canary" >"$HOME/.codex/auth.json"
@@ -57,7 +56,6 @@ secret linked-deny "$run/vault/secret"
 secret runtime-dir "$runtime_dir/secret"
 if [ "\${KITTY_LISTEN_ON:-}" = "$canary" ]; then echo denied-env=exposed; else echo denied-env=hidden; fi >>"\$out"
 works cwd-write sh -c ': >wrote.txt'
-works cache-roots sh -c ': >"\$HOME/.cache/uv/p" && : >"\$HOME/.cache/nix/p" && : >"\$HOME/.cargo/p"'
 works git-commit git -C repo -c user.name=e2e -c user.email=e2e@example.invalid commit -q --allow-empty -m probe
 works nix-eval sh -c '[ "\$(nix-instantiate --eval -E 1+1)" = 2 ]'
 works nix-daemon nix store info

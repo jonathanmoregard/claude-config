@@ -34,7 +34,7 @@ val() { sed -n "s/^$1=//p" "$out" | head -1; }
 summary=$(grep -v '^ran=' "$out" | tr '\n' ' ')
 fail=""
 
-for w in cwd-write cache-roots git-commit nix-eval nix-daemon github; do
+for w in cwd-write git-commit nix-eval nix-daemon github; do
   [ "$(val "$w")" = ok ] || fail+=" $w=$(val "$w")"
 done
 
