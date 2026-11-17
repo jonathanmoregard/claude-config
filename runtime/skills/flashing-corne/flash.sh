@@ -16,6 +16,7 @@ fi
 
 : >"$LOG"
 HEX=".build/crkbd_rev1_${KEYMAP}.hex"
+echo "⏳ Compiling $KEYMAP…"
 qmk compile -kb crkbd/rev1 -km "$KEYMAP" >>"$LOG" 2>&1 || { echo "❌ compile failed, see $LOG"; exit 1; }
 [ -f "$HEX" ] || { echo "❌ no $HEX after compile, see $LOG"; exit 1; }
 
@@ -29,6 +30,7 @@ for half in LEFT RIGHT; do
     ports=(/dev/ttyACM*)
     if (( ${#ports[@]} )); then
       port=${ports[-1]}
+      echo "⏳ ${half^} half in bootloader, writing… keep the cable in."
       sleep 0.7   # let udev apply uaccess
       if timeout 40 avrdude -p atmega32u4 -c avr109 -P "$port" -U "flash:w:$HEX:i" >>"$LOG" 2>&1; then
         ok=1; break
