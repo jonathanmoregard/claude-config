@@ -14,9 +14,13 @@ hunts="$skill_dir/references/hunt-classes.md"
 # pre-compaction file was 1293 words) with room to edit prose without
 # relitigating the number. Raise it again only for a structural change, never
 # to fit a paragraph that could be cut.
+#
+# 1250: review-perspectives v2 was such a change -- three-outcome adjudication
+# replaced reproduce-or-close, and rounds-until-two-empty replaced the single
+# follow-up pass, landing at 1205. Still under the pre-compaction 1293.
 words=$(wc -w < "$skill")
-if (( words > 780 )); then
-  echo "FAIL: SKILL.md has $words words; compact limit is 780"
+if (( words > 1250 )); then
+  echo "FAIL: SKILL.md has $words words; compact limit is 1250"
   exit 1
 fi
 
@@ -53,6 +57,15 @@ required=(
   "Convergence is not confidence"
   "hunt-classes.md"
   "Never auto-fix it"
+  # A reproducer that passes is not a refutation; only cited code is. And one
+  # empty round is not convergence. Both rules exist because the old loop
+  # closed findings on a naive reproducer and stopped after one quiet pass.
+  "A reproducer that does not fail refutes nothing by itself"
+  "two consecutive rounds are empty"
+  "Cap: four rounds"
+  "Reviewer A never gets a sibling line"
+  "review-ledger.tsv"
+  "ledger-tally.sh"
 )
 # Matched against a flattened copy: backticks removed, every run of
 # whitespace collapsed to one space, case ignored. Each of those three is a
@@ -106,7 +119,7 @@ fi
 
 # The agreed class set. A class deleted silently is coverage lost with no
 # reviewer-visible trace; removing one is a decision, so it edits this list.
-for id in D1 D2 D3 D4 D5 G1 G2 G3 G4 G5 G6 G7 G8 G9; do
+for id in D1 D2 D3 D4 D5 D6 D7 G1 G2 G3 G4 G5 G6 G7 G8 G9 G10 G11 G12; do
   grep -Eq "^### $id — " "$hunts" || {
     echo "FAIL: hunt-classes.md is missing class $id"
     exit 1
