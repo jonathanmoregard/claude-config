@@ -16,7 +16,7 @@ Don't ask the user to do what you can do: run the commands, tests, reads, edits,
 - Temp files this session created; files an AI created earlier this session, once they block progress or hold no remaining value.
 - Lock files this session created, once no live process owns or uses them. Uncertain ownership or live use → ask.
 - Worktrees this session created: see **Worktrees**. Cleanup never includes branch deletion.
-- Literal absolute paths only: `rm -r /tmp/<path>` under `/tmp`, `~/.claude/scripts/trash <path>` elsewhere (reversible; `gio trash` fails in the sandbox). No `rm -rf`, no `$VAR`/`$(...)` paths. Reclaiming space outside `/tmp` → ask.
+- Literal absolute paths only: `rm -r /tmp/<path>` under `/tmp`; `~/.claude/scripts/trash <path>` under `~/Repos` and `~/worktrees`; `gio trash <path>` elsewhere (reversible; it has to leave the sandbox, so it prompts). No `rm -rf`, no `$VAR`/`$(...)` paths. Reclaiming space outside `/tmp` → ask.
 
 **Defaults:**
 
@@ -43,7 +43,7 @@ User instructions override everything below.
 
 ## Bash
 - `permissions.deny` matches the command string, so a legitimate command can be rejected for a substring it merely contains, heredoc bodies included. Route the payload around it (`Write` then `cat >>`; `gh --body-file`/`-F`; select tests by `-k`; drop a flag whose default is already right). Never quote or split to defeat the matcher — some rules are deliberate. Details: `detached-long-commands`.
-- Bash is sandboxed: writes only under the working directory, `~/Repos`, `~/worktrees`, `/tmp` and `~/.local/state/claude-tasks`; no user bus, no SSH agent, no git credentials. Routes that work without a prompt: `git fetch|pull|push` → `mcp__git_broker__git`; unit state → `~/.claude/scripts/unit-read [--user] <verb> [unit]`; unit waits → `~/.claude/scripts/wait-for unit`; trash → `~/.claude/scripts/trash <path>`. Run those scripts as the whole command: a pipe, `&&`, `;` or file redirect keeps them inside the sandbox, where they fail. `dangerouslyDisableSandbox` prompts the user every time — only when no route above fits.
+- Bash is sandboxed: writes only under the working directory, `~/Repos`, `~/worktrees`, `/tmp` and `~/.local/state/claude-tasks`; no user bus, no SSH agent, no git credentials. Routes that work without a prompt: `git fetch|pull|push` → `mcp__git_broker__git`; unit state → `~/.claude/scripts/unit-read [--user] <verb> [unit]`; unit waits → `~/.claude/scripts/wait-for unit`; trash → `~/.claude/scripts/trash <path>`. Run those scripts as the whole command: a pipe, `&&`, `;` or file redirect keeps them inside the sandbox, where they fail. `dangerouslyDisableSandbox` prompts the user every time — only for what has no route above: `ai-router delegate`, `agent_e2e.py`, `systemd-run`, `systemctl --user` writes, `ssh`, `gio trash` outside `~/Repos` and `~/worktrees`.
 - A `[REDACTED:…]` marker in output means the call succeeded and the value is gated — don't re-run to get it in clear.
 - Waiting on CI, mergeability, a deploy or a unit → `~/.claude/scripts/wait-for pr|run|unit …` with `run_in_background: true`, then end the turn; you are re-invoked when it settles. No `sleep N; <status>` polling.
 

@@ -64,9 +64,13 @@ for line in sys.stdin:
         send({"jsonrpc": "2.0", "id": mid, "result": {"tools": TOOLS}})
     elif method == "tools/call":
         args = msg.get("params", {}).get("arguments") or {}
-        log.write(json.dumps(args) + "\n"); log.flush()
         text = "--- exit 0 ---"
-        if args.get("operation") == "push":
+        if not str(args.get("repo_path", "")).startswith("/"):
+            # The real broker refuses a relative repo_path.
+            text = "error: repo_path must be an absolute path"
+        else:
+            log.write(json.dumps(args) + "\n"); log.flush()
+        if text.startswith("---") and args.get("operation") == "push":
             # A push that worked moves the tracking ref; the agent checks.
             subprocess.run(["git", "-C", args.get("repo_path", "."), "update-ref",
                             "refs/remotes/origin/main", "HEAD"], check=False)
