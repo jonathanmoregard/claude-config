@@ -625,7 +625,7 @@ wait_unit() {
 # The log's last line stands in for the retained unit: a finished run is
 # adopted, never repeated, until its log is removed.
 run_job_in_sandbox() {
-  local log=/tmp/$target.log rc last
+  local log=/tmp/$target.log rc last remaining
   exec 9>>"/tmp/$target.lock" || { echo "wait-for: cannot open /tmp/$target.lock" >&2; exit 3; }
   flock -n 9 || flock -w "$(left)" 9 || timed_out
   last=$(tail -n 1 -- "$log" 2>/dev/null)
@@ -638,9 +638,12 @@ run_job_in_sandbox() {
       exit 1 ;;
   esac
   : >"$log" || { echo "wait-for: cannot write $log" >&2; exit 3; }
-  [ "$(left)" -gt 0 ] || timed_out
-  command timeout "$(left)" "${job_cmd[@]}" >>"$log" 2>&1 9>&-; rc=$?
-  if [ "$rc" = 124 ] && [ "$(left)" -le 0 ]; then timed_out; fi
+  # `timeout 0` would mean no limit at all.
+  remaining=$(left)
+  [ "$remaining" -gt 0 ] || timed_out
+  command timeout --kill-after=5 "$remaining" "${job_cmd[@]}" >>"$log" 2>&1 9>&-; rc=$?
+  # 137 is how GNU timeout reports the KILL after the grace period.
+  case $rc in 124|137) [ "$(left)" -gt 0 ] || timed_out ;; esac
   [ "$(tail -c 1 -- "$log" | od -An -tx1 | tr -d ' ')" = 0a ] || echo >>"$log"
   if [ "$rc" = 0 ]; then
     echo MARKER_OK >>"$log"

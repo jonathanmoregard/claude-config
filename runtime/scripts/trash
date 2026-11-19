@@ -4,25 +4,73 @@
 # `gio trash` cannot work inside the Claude Code sandbox (the trash is on
 # another mount there), so the sandbox runs this outside itself, without a
 # prompt. It therefore takes paths only — no `--empty`, no `--restore` — and
-# only paths under ~/Repos or ~/worktrees, which the sandbox may delete anyway.
+# only paths under ~/Repos or ~/worktrees that hold nothing the sandbox protects.
 set -uo pipefail
 
 [ $# -gt 0 ] || { sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
 home=$(getent passwd "$(id -u)" | cut -d: -f6)
 [ -n "$home" ] || { echo "trash: cannot resolve the home directory" >&2; exit 3; }
 
+protected=(
+  .claude/settings.json .claude/settings.local.json .claude/hooks .claude/skills
+  .claude/agents .claude/commands .claude/workflows .claude/routines
+  .claude/output-styles .claude/launch.json .claude/scheduled_tasks.json
+  .claude/loop.md .mcp.json .gitconfig .gitmodules .bashrc .bash_profile
+  .zshrc .zprofile .profile .ripgreprc .vscode .idea .git
+)
+# A symlinked .claude would carry the protected entries under it away unseen.
+find_protected=(\( -type l -name .claude)
+for p in "${protected[@]}"; do
+  case $p in */*) find_protected+=(-o -path "*/$p") ;; *) find_protected+=(-o -name "$p") ;; esac
+done
+find_protected+=(\))
+
+settings=$(dirname -- "$(realpath -e -- "$0")")/../settings.json
+entries=$(jq -r '.sandbox.filesystem.denyWrite // [] | .[]' -- "$settings") ||
+  { echo "trash: cannot read denyWrite from $settings" >&2; exit 3; }
+denied=()
+while IFS= read -r entry; do
+  case $entry in
+    "") continue ;;
+    \~/*) entry=$home/${entry#\~/} ;;
+    /*) ;;
+    *) echo "trash: cannot interpret denyWrite entry $entry" >&2; exit 3 ;;
+  esac
+  # Both the entry as named and what it resolves to: a target is compared by
+  # its real parent plus its own name.
+  denied+=("$(realpath -m -- "$(dirname -- "$entry")")/$(basename -- "$entry")"
+           "$(realpath -m -- "$entry")")
+done <<<"$entries"
+
+refuse() { echo "trash: $1" >&2; exit 1; }
+
 targets=()
 for path in "$@"; do
   case $path in -*) echo "trash: options are not accepted: $path" >&2; exit 64 ;; esac
   parent=$(realpath -e -- "$(dirname -- "$path")") || exit 1
   name=$(basename -- "$path")
-  case $name in ""|.|..) echo "trash: name the directory itself, not $path" >&2; exit 1 ;; esac
+  case $name in ""|.|..) refuse "name the directory itself, not $path" ;; esac
   target=$parent/$name
   case $target in
     "$home"/Repos/?*|"$home"/worktrees/?*) ;;
-    *) echo "trash: $target is outside ~/Repos and ~/worktrees" >&2; exit 1 ;;
+    *) refuse "$target is outside ~/Repos and ~/worktrees" ;;
   esac
-  [ -e "$target" ] || [ -L "$target" ] || { echo "trash: no such file: $target" >&2; exit 1; }
+  [ -e "$target" ] || [ -L "$target" ] || refuse "no such file: $target"
+  [ -L "$target" ] && [ "$name" = .claude ] && refuse "$target is protected by the sandbox"
+  for p in "${protected[@]}"; do
+    case $target/ in */"$p"/*) refuse "$target is protected by the sandbox" ;; esac
+  done
+  for d in "${denied[@]}"; do
+    case $target in "$d"|"$d"/*) refuse "$target is denied to the sandbox" ;; esac
+    case $d in
+      "$target"/*) { [ -e "$d" ] || [ -L "$d" ]; } && refuse "$target holds $d, denied to the sandbox" ;;
+    esac
+  done
+  if [ -d "$target" ] && [ ! -L "$target" ]; then
+    hit=$(find "$target" -mindepth 1 "${find_protected[@]}" -print -quit) ||
+      refuse "cannot inspect all of $target"
+    [ -z "$hit" ] || refuse "$target holds $hit, protected by the sandbox"
+  fi
   targets+=("$target")
 done
 exec gio trash -- "${targets[@]}"
