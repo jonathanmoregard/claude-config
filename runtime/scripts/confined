@@ -35,6 +35,7 @@ import signal
 import stat
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -304,7 +305,7 @@ class Stubs:
                     fail(3, f"cannot place a guard at {path}")
                 fcntl.flock(fd, fcntl.LOCK_SH)
                 self.held.append((parent, name, fd))
-        except SystemExit:
+        except BaseException:
             self.remove()
             raise
 
@@ -488,6 +489,7 @@ class Network:
     def __init__(self, tools: dict[str, str]) -> None:
         ready_r, ready_w = os.pipe()
         self.hold_r, self.hold = os.pipe()
+        self.pasta: list[int] = []
         self.pid = os.fork()
         if self.pid == 0:
             try:
@@ -516,6 +518,11 @@ class Network:
                                    "--netns", f"{ns}/net"], capture_output=True, text=True, env={})
             if link.returncode != 0:
                 fail(3, f"pasta cannot connect the jail: {link.stderr.strip()}")
+            # pasta went to the background and, this process being the
+            # subreaper, is now its child. Left alone it notices the namespace
+            # is gone only after a second.
+            children = Path(f"/proc/self/task/{os.getpid()}/children").read_text().split()
+            self.pasta = [int(c) for c in children if int(c) != self.pid]
         except BaseException:
             self.close()
             raise
@@ -529,6 +536,27 @@ class Network:
     def close(self) -> None:
         os.close(self.hold)
         os.waitpid(self.pid, 0)
+        for pid in self.pasta:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+
+def jail_is_empty(patience: float = 10.0) -> bool:
+    """Whether every process of the jail is gone. As the subreaper this
+    process inherits whatever outlives bwrap; a guard removed under a survivor
+    would let it create the protected path."""
+    deadline = time.monotonic() + patience
+    while True:
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return True
+        if pid == 0:
+            if time.monotonic() > deadline:
+                return False
+            time.sleep(0.01)
 
 
 def supervise(argv: list[str], fds: list[int], net: Network) -> int:
@@ -578,6 +606,7 @@ def main() -> None:
     tools = {name: find(name, entry.pw_name) for name in ("pasta", "bwrap", "iptables-restore")}
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, lambda signum, _frame: sys.exit(128 + signum))
+    ctypes.CDLL(None, use_errno=True).prctl(36, 1)  # PR_SET_CHILD_SUBREAPER
     stubs = Stubs(repo.stubs)
     try:
         bwrap_args, fds = jail(profile, repo, cwd, entry.pw_dir, tmp)
@@ -589,7 +618,8 @@ def main() -> None:
         finally:
             net.close()
     finally:
-        stubs.remove()
+        if jail_is_empty():
+            stubs.remove()
     sys.exit(status)
 
 

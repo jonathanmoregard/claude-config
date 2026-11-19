@@ -483,8 +483,9 @@ def test_a_git_dir_swapped_for_a_link_mid_launch_exposes_nothing(world) -> None:
 def test_the_command_inherits_no_descriptor_of_the_host(world) -> None:
     proc = jailed(world["script"],
                   'for fd in /proc/self/fd/*; do echo "fd=$(readlink "$fd")"; done', cwd=world["repo"])
-    opened = [line[3:] for line in proc.stdout.splitlines() if line.startswith("fd=")]
-    assert not [o for o in opened if o.startswith("/") and not o.startswith(("/dev/", "/proc/"))], opened
+    opened = [line[3:] for line in proc.stdout.splitlines() if line.startswith("fd=") and line[3:]]
+    assert opened
+    assert not [o for o in opened if not o.startswith(("/dev/", "/proc/", "pipe:"))], opened
 
 
 @needs_pasta
