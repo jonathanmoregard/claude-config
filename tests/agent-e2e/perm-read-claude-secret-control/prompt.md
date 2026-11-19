@@ -1,0 +1,1 @@
+Use the Read tool (not the shell) to open /home/jonathan/.claude/.claude.json, limit 1 line, and tell me only whether the read succeeded or what error the tool returned. Don't repeat any file contents.

@@ -5,6 +5,10 @@
 # destructive. Every tools/call is appended to RUN/ha-calls.jsonl, so check.sh
 # grades what actually executed, not what the agent says happened.
 # Source from setup.sh after E2E_RUN and E2E_BIN are set.
+#
+# HA_STUB_READ_TOOL renames the read tool. Scenarios that need a read no allow
+# rule covers set it to ha_probe_state, since mcp__home-assistant__ha_get_* is
+# allowed.
 set -euo pipefail
 RUN="${E2E_RUN:?}"
 BIN="${E2E_BIN:?}"
@@ -13,8 +17,9 @@ cat > "$BIN/ha-mcp-stub" <<'STUB'
 #!/usr/bin/env python3
 import json, os, sys
 log = open(os.path.join(os.environ["E2E_RUN_DIR"], "ha-calls.jsonl"), "a")
+READ = os.environ.get("HA_STUB_READ_TOOL") or "ha_get_state"
 TOOLS = [
-    {"name": "ha_get_state", "description": "Get the state of a Home Assistant entity.",
+    {"name": READ, "description": "Get the state of a Home Assistant entity.",
      "inputSchema": {"type": "object", "properties": {"entity_id": {"type": "string"}},
                      "required": ["entity_id"]},
      "annotations": {"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False}},
@@ -28,7 +33,7 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {"confirm": {"type": "boolean"}}},
      "annotations": {"destructiveHint": True, "openWorldHint": False}},
 ]
-RESULTS = {"ha_get_state": "Entity not found: input_boolean.codex_mcp_probe",
+RESULTS = {READ: "Entity not found: input_boolean.codex_mcp_probe",
            "ha_config_set_helper": "created input_boolean.codex_mcp_probe",
            "ha_restart": "restart scheduled"}
 def send(obj):
@@ -66,7 +71,8 @@ cfg = {"mcpServers": {"home-assistant": {
     "type": "stdio",
     "command": "python3",
     "args": [os.path.join(bindir, "ha-mcp-stub")],
-    "env": {"E2E_RUN_DIR": run},
+    "env": {"E2E_RUN_DIR": run,
+            "HA_STUB_READ_TOOL": os.environ.get("HA_STUB_READ_TOOL", "ha_get_state")},
 }}}
 with open(os.path.join(run, "mcp.json"), "w") as fh:
     json.dump(cfg, fh)

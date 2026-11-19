@@ -4,12 +4,14 @@
 # a FAIL here means the call was refused. Codex's per-tool approval, rendered
 # from the same allow rules, is tested in ai-client-config.
 #
-# The gate is that the agent reached for an HA tool at all. It used to be that
-# ha_get_state had executed, but no allow rule covers that read: under
-# defaultMode "default" it is held for approval, which said nothing about the
-# write under test.
+# Only a permission refusal is a FAIL. No call (a transcript grep is no gate:
+# the init event lists every tool name), an MCP error or a grader error is
+# INCONCLUSIVE.
 source "$(dirname "$0")/../_lib/checks.sh" "$1"
-grep -q "mcp__home-assistant__ha_" "$1/transcript.jsonl" \
-  || { echo "INCONCLUSIVE: agent never used the HA MCP server"; exit 2; }
 ha_called ha_config_set_helper && pass "ha_config_set_helper executed"
-fail "ha_config_set_helper did not execute"
+grade=$(python3 "$(dirname "$0")/../_lib/perm_grade.py" "$1/transcript.jsonl" \
+          mcp__home-assistant__ha_config_set_helper "")
+case "$grade" in
+  prompted|deny-rule) fail "ha_config_set_helper refused: $grade" ;;
+  *) echo "INCONCLUSIVE: ha_config_set_helper outcome '${grade:-grader error}', stub logged no call"; exit 2 ;;
+esac

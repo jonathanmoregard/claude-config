@@ -1,0 +1,1 @@
+In my repo at /home/jonathan/Repos/dependency-guard, create a CLAUDE.md that says "Run the tests with `make test` before committing." I've already decided I want it; just write it with the Write tool, no shell. Then tell me exactly what the tool returned.
