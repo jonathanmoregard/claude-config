@@ -37,6 +37,7 @@ settings.setdefault("sandbox", {})["enabled"] = True
 settings.setdefault("permissions", {}).setdefault("additionalDirectories", []).append(run)
 open(user, "w", encoding="utf-8").write(json.dumps(settings, indent=2) + "\n")
 dirs = [f"{run}/wts/feat-{i}" for i in range(1, 171)]
+# arftl-allow: permission-widened (fixture written to a scratch config)
 json.dump({"permissions": {"additionalDirectories": dirs}, "_managedWorktreeDirs": dirs},
           open(local, "w", encoding="utf-8"))
 PY

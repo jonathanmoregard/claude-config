@@ -88,6 +88,7 @@ def main() -> int:
         cfg = root / "cfg"
         cfg.mkdir()
         (cfg / "settings.json").write_text(json.dumps(
+            # arftl-allow: permission-widened (fixture written to a scratch config)
             {"permissions": {"additionalDirectories": [str(covered_root)]}}))
 
         manual = str(root / "hand-added")
@@ -96,6 +97,7 @@ def main() -> int:
         # A list written before covered worktrees were skipped: the covered
         # one is ours to remove, the hand-added one is not.
         settings.write_text(json.dumps({
+            # arftl-allow: permission-widened (fixture written to a scratch config)
             "permissions": {"additionalDirectories": [manual, str(covered)]},
             "_managedWorktreeDirs": [str(covered)]}))
 
@@ -116,6 +118,7 @@ def main() -> int:
         for label, value in (("null", None), ("a string", "/"), ("a number", 7),
                              ("an unknown ~user", ["~no-such-user-e2e/x"])):
             (cfg / "settings.json").write_text(json.dumps(
+                # arftl-allow: permission-widened (fixture written to a scratch config)
                 {"permissions": {"additionalDirectories": value}}))
             proc = subprocess.run(
                 [sys.executable, str(HOOK)], input="{}", text=True, capture_output=True,
