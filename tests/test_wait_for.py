@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -48,6 +49,16 @@ def run_wait_for(
         link = bin_dir / name
         if not link.exists():
             link.symlink_to(FAKE)
+    # The failure records live under the passwd home, not $HOME.
+    getent = bin_dir / "getent"
+    getent.write_text(f'#!/bin/sh\necho "u:x:0:0::{tmp_path / "home"}:/bin/sh"\n')
+    getent.chmod(0o755)
+    if args[:1] == ("unit",):
+        source, n = re.subn(r"\bPATH=/run/current-system/sw/bin:",
+                            f"PATH={bin_dir}:/run/current-system/sw/bin:", wait_for.read_text())
+        assert n == 1
+        wait_for = tmp_path / "wait-for"
+        wait_for.write_text(source)
     state = tmp_path / "script.json"
     scripted = json.loads(json.dumps(script))
     scripted.setdefault("gh", {}).setdefault("auth token", [{"rc": 0}])
@@ -489,6 +500,42 @@ def test_success_keeps_a_failure_record_it_cannot_account_for(tmp_path: Path) ->
         )
         assert rc == 0, out
         assert record.exists(), f"{body} was cleared: {out}"
+
+
+FAILED_UNIT = {**SUCCEEDED_UNIT, "ActiveState": "failed", "SubState": "failed",
+               "Result": "exit-code", "ExecMainStatus": "1"}
+
+
+def test_unit_wait_deletes_nothing_through_a_linked_record_dir(tmp_path: Path) -> None:
+    project = tmp_path / "decoy-project"
+    (project / ".claude").mkdir(parents=True)
+    settings = project / ".claude" / "settings.json"
+    settings.write_text("{}")
+    state = tmp_path / "home" / ".local" / "state"
+    state.mkdir(parents=True)
+    (state / "claude-unit-failures").symlink_to(project / ".claude")
+    rc, out, _ = run_wait_for(tmp_path, {"systemctl": [FAILED_UNIT]},
+                              "unit", "settings.service", "--user")
+    assert rc == 1, out
+    assert settings.exists(), out
+
+
+def test_unit_wait_refuses_a_unit_name_with_a_slash(tmp_path: Path) -> None:
+    rc, out, calls = run_wait_for(tmp_path, {"systemctl": [FAILED_UNIT]}, "unit",
+                                  "../../.claude/settings", "--user")
+    assert (rc, calls) == (64, []), out
+
+
+def test_unit_wait_deletes_nothing_the_callers_home_names(tmp_path: Path) -> None:
+    caller_home = tmp_path / "caller-home"
+    planted = caller_home / ".local/state/claude-unit-failures/settings.json"
+    planted.parent.mkdir(parents=True)
+    planted.write_text("{}")
+    rc, out, _ = run_wait_for(tmp_path, {"systemctl": [FAILED_UNIT]}, "unit",
+                              "settings.service", "--user",
+                              extra_env={"HOME": str(caller_home)})
+    assert rc == 1, out
+    assert planted.exists(), out
 
 
 def test_since_after_launch_waits_for_a_newer_run(tmp_path: Path) -> None:

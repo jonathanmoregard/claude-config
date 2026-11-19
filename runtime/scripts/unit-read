@@ -1,17 +1,18 @@
-#!/usr/bin/env bash
+#!/run/current-system/sw/bin/bash -p
 # unit-read — read-only systemctl with every argument checked.
 #
 #   unit-read [--user] <verb> [options] [unit...]
 #   verbs:   status show cat is-active is-failed is-enabled is-system-running
 #            list-units list-timers list-unit-files list-dependencies
 #   options: -p <Property[,Property]>  -n <lines>  --all  --failed
-#            --state=<s[,s]>  --type=<t[,t]>
+#            --state=<s[,s]>  --type=<t[,t]>       (no unit's Environment)
 #
 # The Claude Code sandbox runs this outside itself, without a prompt, so it
 # must not be steerable: systemctl accepts clustered and abbreviated options
 # (`-aH host`, `--ho=host`), which no pattern over the command text can rule
 # out. Hence an allowlist of whole arguments, and units after `--`.
 set -uo pipefail
+PATH=/run/current-system/sw/bin:/usr/bin:/bin
 
 usage() { sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
 
@@ -28,7 +29,8 @@ esac
 options=() units=()
 while [ $# -gt 0 ]; do
   case $1 in
-    -p) [[ ${2:-} =~ ^[A-Za-z]+(,[A-Za-z]+)*$ ]] || usage; options+=(-p "$2"); shift 2 ;;
+    -p) [[ ${2:-} =~ ^[A-Za-z]+(,[A-Za-z]+)*$ && ,$2, != *,Environment,* ]] || usage
+        options+=(-p "$2"); shift 2 ;;
     -n) [[ ${2:-} =~ ^[0-9]+$ ]] || usage; options+=(-n "$2"); shift 2 ;;
     --all|--failed|--no-pager) options+=("$1"); shift ;;
     --state=*|--type=*) [[ $1 =~ ^--(state|type)=[a-z]+(,[a-z-]+)*$ ]] || usage; options+=("$1"); shift ;;
@@ -37,4 +39,10 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-exec systemctl "${scope[@]}" --no-pager "$verb" "${options[@]}" -- "${units[@]}"
+case $verb in
+  show|cat)
+    # A unit file continues an Environment= line with a trailing backslash.
+    systemctl "${scope[@]}" --no-pager "$verb" "${options[@]}" -- "${units[@]}" |
+      sed '/^[[:space:]]*Environment=/{:a;/\\$/{N;ba};d}' ;;
+  *) exec systemctl "${scope[@]}" --no-pager "$verb" "${options[@]}" -- "${units[@]}" ;;
+esac

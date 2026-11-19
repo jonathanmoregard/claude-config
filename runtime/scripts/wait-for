@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/run/current-system/sw/bin/bash -p
 # wait-for — block until something outside the session settles, then print one
 # summary line and exit with a status that says how it settled.
 #
@@ -88,6 +88,11 @@ else
   done
 fi
 case $timeout in ''|*[!0-9]*) usage ;; esac
+# The Claude Code sandbox runs `wait-for unit` outside itself without a prompt.
+if [ "$mode" = unit ]; then
+  case $target in */*) usage ;; esac
+  PATH=/run/current-system/sw/bin:/usr/bin:/bin
+fi
 deadline=$(( $(date +%s) + timeout ))
 left() { echo $(( deadline - $(date +%s) )); }
 # nap <step>: sleep up to <step> seconds, never past the deadline.
@@ -402,11 +407,15 @@ unreadable_manager() {
 }
 
 failure_record() {
-  local key=${target%.service}
+  local key=${target%.service} home dir
   [ "${user[*]:-}" = --user ] || return 1
   [[ $key =~ ^[A-Za-z0-9._-]+$ ]] || return 1
-  [ -n "${HOME:-}" ] || return 1
-  printf '%s/.local/state/claude-unit-failures/%s.json\n' "$HOME" "$key"
+  home=$(getent passwd "$(id -u)" | cut -d: -f6)
+  [ -n "$home" ] || return 1
+  dir=$home/.local/state/claude-unit-failures
+  # The record is deleted by name: through a link that would be some other file.
+  [ ! -L "$dir" ] && [ ! -L "$dir/$key.json" ] || return 1
+  printf '%s/%s.json\n' "$dir" "$key"
 }
 
 clear_reported_failure() {

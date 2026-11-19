@@ -1,76 +1,207 @@
-#!/usr/bin/env bash
-# trash <path>... — move files to the trash, for a sandboxed session.
-#
-# `gio trash` cannot work inside the Claude Code sandbox (the trash is on
-# another mount there), so the sandbox runs this outside itself, without a
-# prompt. It therefore takes paths only — no `--empty`, no `--restore` — and
-# only paths under ~/Repos or ~/worktrees that hold nothing the sandbox protects.
-set -uo pipefail
+#!/run/current-system/sw/bin/python3 -I
+"""trash <path>... — move files to the trash, for a sandboxed session.
 
-[ $# -gt 0 ] || { sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
-home=$(getent passwd "$(id -u)" | cut -d: -f6)
-[ -n "$home" ] || { echo "trash: cannot resolve the home directory" >&2; exit 3; }
+`gio trash` cannot work inside the Claude Code sandbox (the trash is on
+another mount there), so the sandbox runs this outside itself, without a
+prompt. It therefore takes paths only — no `--empty`, no `--restore` — and
+only paths under ~/Repos or ~/worktrees that hold nothing the sandbox protects.
+Entries go to the home trash; one on another filesystem is refused.
+"""
+from __future__ import annotations
 
-protected=(
-  .claude/settings.json .claude/settings.local.json .claude/hooks .claude/skills
-  .claude/agents .claude/commands .claude/workflows .claude/routines
-  .claude/output-styles .claude/launch.json .claude/scheduled_tasks.json
-  .claude/loop.md .mcp.json .gitconfig .gitmodules .bashrc .bash_profile
-  .zshrc .zprofile .profile .ripgreprc .vscode .idea .git
-)
-# A symlinked .claude would carry the protected entries under it away unseen.
-find_protected=(\( -type l -name .claude)
-for p in "${protected[@]}"; do
-  case $p in */*) find_protected+=(-o -path "*/$p") ;; *) find_protected+=(-o -name "$p") ;; esac
-done
-find_protected+=(\))
+import errno
+import itertools
+import json
+import os
+import pwd
+import stat
+import sys
+import time
+from dataclasses import dataclass
+from typing import NoReturn
+from urllib.parse import quote
 
-settings=$(dirname -- "$(realpath -e -- "$0")")/../settings.json
-entries=$(jq -r '.sandbox.filesystem.denyWrite // [] | .[]' -- "$settings") ||
-  { echo "trash: cannot read denyWrite from $settings" >&2; exit 3; }
-denied=()
-while IFS= read -r entry; do
-  case $entry in
-    "") continue ;;
-    \~/*) entry=$home/${entry#\~/} ;;
-    /*) ;;
-    *) echo "trash: cannot interpret denyWrite entry $entry" >&2; exit 3 ;;
-  esac
-  # Both the entry as named and what it resolves to: a target is compared by
-  # its real parent plus its own name.
-  denied+=("$(realpath -m -- "$(dirname -- "$entry")")/$(basename -- "$entry")"
-           "$(realpath -m -- "$entry")")
-done <<<"$entries"
+PROTECTED_NAMES = {
+    ".mcp.json", ".gitconfig", ".gitmodules", ".bashrc", ".bash_profile", ".zshrc",
+    ".zprofile", ".profile", ".ripgreprc", ".vscode", ".idea", ".git",
+}
+PROTECTED_IN_CLAUDE = {
+    "settings.json", "settings.local.json", "hooks", "skills", "agents", "commands",
+    "workflows", "routines", "output-styles", "launch.json", "scheduled_tasks.json", "loop.md",
+}
+DIR_FLAGS = os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
-refuse() { echo "trash: $1" >&2; exit 1; }
 
-targets=()
-for path in "$@"; do
-  case $path in -*) echo "trash: options are not accepted: $path" >&2; exit 64 ;; esac
-  parent=$(realpath -e -- "$(dirname -- "$path")") || exit 1
-  name=$(basename -- "$path")
-  case $name in ""|.|..) refuse "name the directory itself, not $path" ;; esac
-  target=$parent/$name
-  case $target in
-    "$home"/Repos/?*|"$home"/worktrees/?*) ;;
-    *) refuse "$target is outside ~/Repos and ~/worktrees" ;;
-  esac
-  [ -e "$target" ] || [ -L "$target" ] || refuse "no such file: $target"
-  [ -L "$target" ] && [ "$name" = .claude ] && refuse "$target is protected by the sandbox"
-  for p in "${protected[@]}"; do
-    case $target/ in */"$p"/*) refuse "$target is protected by the sandbox" ;; esac
-  done
-  for d in "${denied[@]}"; do
-    case $target in "$d"|"$d"/*) refuse "$target is denied to the sandbox" ;; esac
-    case $d in
-      "$target"/*) { [ -e "$d" ] || [ -L "$d" ]; } && refuse "$target holds $d, denied to the sandbox" ;;
-    esac
-  done
-  if [ -d "$target" ] && [ ! -L "$target" ]; then
-    hit=$(find "$target" -mindepth 1 "${find_protected[@]}" -print -quit) ||
-      refuse "cannot inspect all of $target"
-    [ -z "$hit" ] || refuse "$target holds $hit, protected by the sandbox"
-  fi
-  targets+=("$target")
-done
-exec gio trash -- "${targets[@]}"
+@dataclass
+class Target:
+    path: str
+    parent_fd: int
+    name: str
+    identity: tuple[int, int]
+
+
+def fail(code: int, message: str) -> NoReturn:
+    print(f"trash: {message}", file=sys.stderr)
+    sys.exit(code)
+
+
+def protected(parent: str, name: str, is_link: bool) -> bool:
+    # A symlinked .claude would carry the protected entries under it away unseen.
+    return (name in PROTECTED_NAMES or (parent == ".claude" and name in PROTECTED_IN_CLAUDE)
+            or (name == ".claude" and is_link))
+
+
+def denied_paths(home: str) -> list[str]:
+    settings = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "settings.json")
+    try:
+        with open(settings) as f:
+            entries = json.load(f).get("sandbox", {}).get("filesystem", {}).get("denyWrite", [])
+    except (OSError, ValueError, AttributeError) as e:
+        fail(3, f"cannot read denyWrite from {settings}: {e}")
+    denied = []
+    for entry in entries:
+        if entry.startswith("~/"):
+            entry = os.path.join(home, entry[2:])
+        elif not entry.startswith("/"):
+            fail(3, f"cannot interpret denyWrite entry {entry}")
+        # Both the entry as named and what it resolves to: a target is compared by
+        # its real parent plus its own name.
+        head, tail = os.path.split(entry.rstrip("/"))
+        denied += [os.path.join(os.path.realpath(head), tail), os.path.realpath(entry)]
+    return denied
+
+
+def pinned_dir(path: str) -> int:
+    fd = os.open(path, os.O_PATH | DIR_FLAGS)
+    if os.readlink(f"/proc/self/fd/{fd}") != path:
+        fail(1, f"{path} changed while it was being checked")
+    return fd
+
+
+def present(name: str, dir_fd: int) -> bool:
+    try:
+        os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def subdir(fd: int, name: str) -> int:
+    if not present(name, fd):
+        os.mkdir(name, 0o700, dir_fd=fd)
+    return os.open(name, os.O_PATH | DIR_FLAGS, dir_fd=fd)
+
+
+def walk_finds_protected(fd: int, top: str) -> str | None:
+    def raise_it(error: OSError) -> None:
+        raise error
+
+    for dirpath, dirnames, filenames, dirfd in os.fwalk(".", dir_fd=fd, onerror=raise_it):
+        parent = os.path.basename(dirpath) if dirpath != "." else top
+        for name in dirnames + filenames:
+            is_link = name == ".claude" and stat.S_ISLNK(
+                os.stat(name, dir_fd=dirfd, follow_symlinks=False).st_mode)
+            if protected(parent, name, is_link):
+                return os.path.normpath(os.path.join(dirpath, name))
+    return None
+
+
+def check(path: str, home: str, denied: list[str], trash_dev: int) -> Target:
+    head, name = os.path.split(path.rstrip("/") or "/")
+    if name in ("", ".", ".."):
+        fail(1, f"name the directory itself, not {path}")
+    try:
+        parent = os.path.realpath(head or ".", strict=True)
+        parent_fd = pinned_dir(parent)
+    except OSError as e:
+        fail(1, f"{path}: {e.strerror}")
+    target = os.path.join(parent, name)
+    if not target.startswith((f"{home}/Repos/", f"{home}/worktrees/")):
+        fail(1, f"{target} is outside ~/Repos and ~/worktrees")
+    try:
+        st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        fail(1, f"no such file: {target}")
+    parts = target.split("/")
+    if any(protected(parts[i - 1], parts[i], i == len(parts) - 1 and stat.S_ISLNK(st.st_mode))
+           for i in range(1, len(parts))):
+        fail(1, f"{target} is protected by the sandbox")
+    for d in denied:
+        if target == d or target.startswith(f"{d}/"):
+            fail(1, f"{target} is denied to the sandbox")
+        if d.startswith(f"{target}/") and os.path.lexists(d):
+            fail(1, f"{target} holds {d}, denied to the sandbox")
+    if st.st_dev != trash_dev:
+        fail(1, f"{target} is on another filesystem than the trash; use gio trash outside the sandbox")
+    if stat.S_ISDIR(st.st_mode):
+        try:
+            fd = os.open(name, os.O_RDONLY | DIR_FLAGS, dir_fd=parent_fd)
+            opened = os.fstat(fd)
+            if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
+                fail(1, f"{target} changed while it was being checked")
+            hit = walk_finds_protected(fd, name)
+        except OSError:
+            fail(1, f"cannot inspect all of {target}")
+        if hit:
+            fail(1, f"{target} holds {os.path.join(target, hit)}, protected by the sandbox")
+        os.close(fd)
+    return Target(target, parent_fd, name, (st.st_dev, st.st_ino))
+
+
+def reserve(info_fd: int, files_fd: int, target: Target) -> str:
+    """Claims a name under Trash/info, as the FreeDesktop spec asks, before the move."""
+    deleted = time.strftime("%Y-%m-%dT%H:%M:%S")
+    for n in itertools.count(1):
+        unique = target.name if n == 1 else f"{target.name}.{n}"
+        try:
+            fd = os.open(f"{unique}.trashinfo",
+                         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         0o600, dir_fd=info_fd)
+        except FileExistsError:
+            continue
+        if present(unique, files_fd):
+            os.close(fd)
+            os.unlink(f"{unique}.trashinfo", dir_fd=info_fd)
+            continue
+        with os.fdopen(fd, "w") as f:
+            f.write(f"[Trash Info]\nPath={quote(target.path)}\nDeletionDate={deleted}\n")
+        return unique
+    raise AssertionError("unreachable")
+
+
+def move(target: Target, info_fd: int, files_fd: int) -> None:
+    unique = reserve(info_fd, files_fd, target)
+    try:
+        os.rename(target.name, unique, src_dir_fd=target.parent_fd, dst_dir_fd=files_fd)
+    except OSError as e:
+        os.unlink(f"{unique}.trashinfo", dir_fd=info_fd)
+        if e.errno == errno.EXDEV:
+            fail(1, f"{target.path} is on another filesystem than the trash; not moved")
+        fail(1, f"cannot move {target.path}: {e.strerror}")
+    moved = os.stat(unique, dir_fd=files_fd, follow_symlinks=False)
+    if (moved.st_dev, moved.st_ino) != target.identity:
+        os.rename(unique, target.name, src_dir_fd=files_fd, dst_dir_fd=target.parent_fd)
+        os.unlink(f"{unique}.trashinfo", dir_fd=info_fd)
+        fail(1, f"{target.path} changed while it was being checked; put back")
+
+
+def main(args: list[str]) -> None:
+    if not args:
+        print(__doc__.strip(), file=sys.stderr)
+        sys.exit(64)
+    for arg in args:
+        if arg.startswith("-"):
+            fail(64, f"options are not accepted: {arg}")
+    home = pwd.getpwuid(os.getuid()).pw_dir
+    denied = denied_paths(home)
+    # $XDG_DATA_HOME is the caller's to set; the trash is where the passwd home puts it.
+    trash_fd = os.open(home, os.O_PATH | DIR_FLAGS)
+    for part in (".local", "share", "Trash"):
+        trash_fd = subdir(trash_fd, part)
+    files_fd, info_fd = subdir(trash_fd, "files"), subdir(trash_fd, "info")
+    targets = [check(arg, home, denied, os.fstat(files_fd).st_dev) for arg in args]
+    for target in targets:
+        move(target, info_fd, files_fd)
+
+
+main(sys.argv[1:])
