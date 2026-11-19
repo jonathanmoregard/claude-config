@@ -14,8 +14,6 @@ if [ -z "${IN_QMK_SHELL:-}" ]; then
   { : >"$LOG"; } 2>/dev/null || { echo "❌ can't write log $LOG"; exit 1; }
   echo "⏳ Loading qmk + avrdude…"
   export IN_QMK_SHELL=1 LOG
-  # If Monitor kills us, take the nix shell, compile and avrdude down too.
-  trap 'trap - TERM INT HUP; kill 0' TERM INT HUP
   # Relay the inner run's events. Any failure that didn't end on its own ❌
   # (nix failing to load, an abort mid-script) still gets one, so stdout is
   # never silent on failure. Upstream QMK dropped shell.nix; use nixpkgs.
