@@ -380,9 +380,7 @@ def test_refuses_a_repo_whose_protected_entry_is_a_symlink(world, entry: str) ->
 
 
 @pytest.mark.parametrize("case", ["write_root", "planted_git_above_root", "outside_roots",
-                                  "deny_write", "tmp_itself", "gitdir_outside_roots",
-                                  "commondir_to_another_repo", "gitfile_to_another_repo",
-                                  "gitfile_to_a_foreign_worktree_entry"])
+                                  "deny_write", "tmp_itself", "gitdir_outside_roots"])
 @needs_pasta
 def test_refuses_a_working_directory_it_cannot_confine_to_one_repo(world, case: str) -> None:
     rw, home = world["rw"], world["home"]
@@ -399,21 +397,6 @@ def test_refuses_a_working_directory_it_cannot_confine_to_one_repo(world, case: 
         cwd = world["repo"] / "locked"
     elif case == "tmp_itself":
         cwd = Path("/tmp")
-    elif case == "commondir_to_another_repo":
-        cwd = rw / "planted"
-        (cwd / ".git").mkdir(parents=True)
-        (cwd / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
-        (cwd / ".git" / "commondir").write_text(f"{world['other']}/.git\n")
-    elif case == "gitfile_to_another_repo":
-        cwd = rw / "planted"
-        cwd.mkdir()
-        (cwd / ".git").write_text(f"gitdir: {world['other']}/.git\n")
-    elif case == "gitfile_to_a_foreign_worktree_entry":
-        subprocess.run(["git", "-C", str(world["other"]), "worktree", "add", "-q",
-                        str(rw / "other-wt")], check=True)
-        cwd = rw / "planted"
-        cwd.mkdir()
-        (cwd / ".git").write_text(f"gitdir: {world['other']}/.git/worktrees/other-wt\n")
     else:
         stray = git_repo(home / "outside" / "stray")
         (rw / "pointer").mkdir()
@@ -422,6 +405,39 @@ def test_refuses_a_working_directory_it_cannot_confine_to_one_repo(world, case: 
     proc = run(world["script"], "--", "touch", str(marker), cwd=cwd)
     assert proc.returncode == 64, proc.stderr
     assert not marker.exists()
+
+
+@pytest.mark.parametrize("plant", ["commondir", "gitfile", "worktree_entry", "bare_layout"])
+@needs_pasta
+def test_a_planted_git_pointer_makes_no_other_repository_writable(world, plant: str) -> None:
+    rw, other = world["rw"], world["other"]
+    cwd = rw / "planted"
+    cwd.mkdir()
+    if plant == "commondir":
+        (cwd / ".git").mkdir()
+        (cwd / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+        (cwd / ".git" / "commondir").write_text(f"{other}/.git\n")
+    elif plant == "gitfile":
+        (cwd / ".git").write_text(f"gitdir: {other}/.git\n")
+    elif plant == "worktree_entry":
+        subprocess.run(["git", "-C", str(other), "worktree", "add", "-q", str(rw / "other-wt")],
+                       check=True)
+        (cwd / ".git").write_text(f"gitdir: {other}/.git/worktrees/other-wt\n")
+    else:
+        entry = other / "worktrees" / "n"
+        entry.mkdir(parents=True)
+        (entry / "HEAD").write_text("ref: refs/heads/main\n")
+        (entry / "commondir").write_text("../..\n")
+        (entry / "gitdir").write_text(f"{cwd}/.git\n")
+        (cwd / ".git").write_text(f"gitdir: {entry}\n")
+    targets = [other / "tracked.txt", other / ".claude" / "settings.local.json",
+               other / ".git" / "hooks" / "pre-commit", other / ".git" / "config",
+               other / ".git" / "refs" / "heads" / "planted", other / ".mcp.json"]
+    before = {t: t.read_bytes() if t.exists() else None for t in targets}
+    proc = run(world["script"], "--", "bash", "-c",
+               "\n".join(f"echo x >>{t} 2>/dev/null" for t in targets) + f"\necho {RAN}", cwd=cwd)
+    assert proc.returncode == 64 or proc.stdout.rstrip().endswith(RAN), proc.stderr
+    assert {t: t.read_bytes() if t.exists() else None for t in targets} == before
 
 
 @pytest.mark.parametrize("mutate", [

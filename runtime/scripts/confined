@@ -5,8 +5,9 @@ confined [--chdir DIR] --detach <slug> [--max-runtime 4h] -- <command> [args...]
 Run a command outside the Claude Code sandbox, in a bubblewrap jail of its own
 that leaves user namespaces enabled, so nested sandboxes work.
 
-Writable: the repository around the working directory (its git dirs too, but
-not their hooks and config) and $TMPDIR, /tmp/confined-<uid>, shared between
+Writable: the repository around the working directory (a .git directory in it
+too, but not its hooks and config; a linked worktree's git dir is read-only, so
+commit outside the jail) and $TMPDIR, /tmp/confined-<uid>, shared between
 jails. Home, /tmp, /run and /var are empty but for that repository, Claude's
 credentials file and SHOWN. Agent and git config in the repository cannot be
 written or created. What the `sandbox` block and Read deny rules of the
@@ -205,24 +206,10 @@ class Profile:
 @dataclass
 class Repo:
     top: str
-    git: list[str]          # gitdir, then the common dir when it differs
+    git: list[str]          # the git dir, when it is inside top
+    outside: list[str]      # git dirs elsewhere, read-only in the jail
     frozen: list[str]       # read-only, created as a stub when absent
     stubs: dict[str, str]   # absent protected path -> stub content (None: a directory)
-
-
-def owns(top: str, gitdir: str) -> bool:
-    """Whether gitdir is top's own: its .git directory, a linked worktree's
-    entry that points back at top, or a submodule's directory under modules/."""
-    own, entry = os.path.join(top, ".git"), Path(gitdir)
-    common = read_pointer(entry / "commondir")
-    if gitdir == own:
-        return common in (None, ".")
-    if entry.parent.name == "worktrees":
-        back = read_pointer(entry / "gitdir")
-        return (common is not None and back is not None
-                and os.path.realpath(entry / common) == str(entry.parent.parent)
-                and os.path.realpath(back) == own)
-    return "modules" in entry.parts[:-1] and common is None
 
 
 def repository(cwd: str, profile: Profile) -> Repo:
@@ -241,41 +228,42 @@ def repository(cwd: str, profile: Profile) -> Repo:
     if any(under(cwd, d) for d in profile.deny_write):
         fail(64, f"{cwd} is under a denyWrite path of the sandbox profile")
     dot = Path(top, ".git")
-    git, frozen = [], [os.path.join(top, name) for name in PROTECTED]
-    if dot.is_file() and not dot.is_symlink():
-        frozen.append(str(dot))
-        pointer = read_pointer(dot, "gitdir:")
-        git.append(os.path.realpath(dot.parent / pointer) if pointer else "")
-    elif dot.exists():
-        git.append(str(dot))
-    if git and not owns(top, git[0]):
-        fail(64, f"the git dir {git[0]} does not belong to {top}; a pointer to another "
-                 "repository would make that one writable")
+    own, outside, frozen = [], [], [os.path.join(top, name) for name in PROTECTED]
     # A stub in the worktree is an empty directory: git status does not list
     # it, and no file can be written in its place. Inside a git dir it is the
     # file git expects.
     content: dict[str, str] = {}
-    if git:
-        gitdir = git[0]
+    # Only a git dir inside the repository is writable. One a pointer names
+    # (a linked worktree's, or whatever was planted) is shown read-only, so no
+    # pointer can make another repository writable.
+    if dot.is_file() and not dot.is_symlink():
+        frozen.append(str(dot))
+        pointer = read_pointer(dot, "gitdir:")
+        gitdir = os.path.realpath(dot.parent / pointer) if pointer else ""
         if not os.path.isfile(os.path.join(gitdir, "HEAD")):
             fail(64, f"cannot resolve the git dir of {top}")
         pointer = read_pointer(Path(gitdir, "commondir"))
-        common = os.path.realpath(os.path.join(gitdir, pointer)) if pointer else gitdir
-        git += [common] if common != gitdir else []
-        for d in git:
-            check(d, "the git dir")
-            frozen += [os.path.join(d, "commondir"), os.path.join(d, "config.worktree")]
-            # git dies on an empty commondir; "." names the git dir itself.
-            content[os.path.join(d, "commondir")] = "."
-            content[os.path.join(d, "config.worktree")] = ""
-        frozen += [os.path.join(common, "hooks"), os.path.join(common, "config")]
-        content[os.path.join(common, "config")] = ""
-        frozen += glob.glob(os.path.join(common, "worktrees", "*", "commondir"))
-        frozen += glob.glob(os.path.join(common, "worktrees", "*", "config.worktree"))
-        for root, dirs, files in os.walk(os.path.join(common, "modules")):
+        outside = [gitdir, os.path.realpath(os.path.join(gitdir, pointer)) if pointer else gitdir]
+    elif dot.exists():
+        gitdir = str(dot)
+        own = [gitdir]
+        pointer = read_pointer(Path(gitdir, "commondir"))
+        if pointer not in (None, "."):
+            outside = [os.path.realpath(os.path.join(gitdir, pointer))]
+        frozen += [os.path.join(gitdir, name) for name in ("commondir", "config.worktree",
+                                                           "hooks", "config")]
+        # git dies on an empty commondir; "." names the git dir itself.
+        content = {os.path.join(gitdir, "commondir"): ".", os.path.join(gitdir, "config"): "",
+                   os.path.join(gitdir, "config.worktree"): ""}
+        frozen += glob.glob(os.path.join(gitdir, "worktrees", "*", "commondir"))
+        frozen += glob.glob(os.path.join(gitdir, "worktrees", "*", "config.worktree"))
+        for root, dirs, files in os.walk(os.path.join(gitdir, "modules")):
             if "HEAD" in files:
                 frozen += [os.path.join(root, "hooks"), os.path.join(root, "config")]
                 dirs[:] = [d for d in dirs if d == "modules"]
+    outside = [d for d in dict.fromkeys(outside) if not under(d, top)]
+    for d in outside:
+        check(d, "the git dir")
     for path in [os.path.join(top, ".claude"), os.path.join(top, ".git"), *frozen]:
         if os.path.islink(path):
             fail(64, f"{path} is a symlink; a jail could repoint it, so refusing to run here")
@@ -289,7 +277,8 @@ def repository(cwd: str, profile: Profile) -> Repo:
                 stubs[str(first)] = content.get(path) if first == Path(path) else None
         elif Stubs.marked(str(first)):
             stubs[str(first)] = None
-    return Repo(top, git, [p for p in frozen if os.path.exists(p) and p not in stubs], stubs)
+    return Repo(top, own, outside,
+                [p for p in frozen if os.path.exists(p) and p not in stubs], stubs)
 
 
 class Stubs:
@@ -401,6 +390,7 @@ def jail(profile: Profile, repo: Repo, cwd: str, home: str, tmp: str) -> list[st
     replaced = {"home": home, "/tmp": "/tmp", "/run": "/run", "/var": "/var"}
     reads = [os.path.join(replaced[top], rel) for top, rels in SHOWN.items() for rel in rels
              if os.path.exists(os.path.join(replaced[top], rel))]
+    reads += repo.outside
     writes = [tmp, repo.top, *repo.git]
     bound = [*reads, *writes, creds]
 
