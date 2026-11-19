@@ -229,20 +229,6 @@ def test_a_refused_launch_leaves_the_checkout_as_it_was(world) -> None:
     assert sorted(str(p) for p in world["repo"].rglob("*")) == before
 
 
-@pytest.mark.skipif(not CLAUDE_CREDS.is_file(), reason="no Claude credentials file here")
-@pytest.mark.parametrize("where", ["denyRead", "credentials"])
-@needs_pasta
-def test_claude_credentials_hidden_when_the_sandbox_block_hides_them(world, where: str) -> None:
-    sandbox = world["settings"]["sandbox"]
-    if where == "denyRead":
-        sandbox["filesystem"]["denyRead"].append("~/.claude")
-    else:
-        sandbox["credentials"]["files"].append({"path": "~/.claude/.credentials.json", "mode": "mask"})
-    script = make_tree(world["var"] / "tree2", world["settings"])
-    proc = jailed(script, CREDS_PROBE, cwd=world["repo"], flags=("--claude-login",))
-    assert re.search(r"^size=0?$", proc.stdout, re.M), proc.stdout
-
-
 @needs_pasta
 def test_has_its_own_pid_and_ipc_namespaces(world) -> None:
     ns = {k: os.readlink(f"/proc/self/ns/{k}") for k in ("pid", "ipc")}
@@ -376,7 +362,9 @@ def test_absent_protected_paths_cannot_be_created_and_leave_no_stub(world, claud
     proc = jailed(world["script"], "\n".join(
         f'( mkdir -p "$(dirname {repo}/{rel})" && echo x >{repo}/{rel} ) 2>/dev/null '
         f'&& echo "{rel}=created"'
-        for rel in ABSENT) + f'\n( echo x >{repo}/ordinary ) && echo ordinary=yes',
+        for rel in ABSENT) +
+        f'\n( mv {repo}/.claude {repo}/.claude.moved ) 2>/dev/null && echo ".claude=created"'
+        f'\n( echo x >{repo}/ordinary ) && echo ordinary=yes',
         cwd=repo)
     assert "=created" not in proc.stdout and "ordinary=yes" in proc.stdout, proc.stdout
     (repo / "ordinary").unlink()
@@ -593,6 +581,93 @@ def test_git_reads_work_from_a_linked_worktree_but_its_git_dir_is_read_only(worl
     got = answers(proc)
     assert (got["status"], got["log"]) == ("0", "0"), proc.stdout
     assert got["ref"] != "0" and not (common / "refs" / "heads" / "planted").exists()
+
+
+@needs_pasta
+def test_worktree_and_module_guards_survive_renaming_their_parent(world, worktrees) -> None:
+    git = worktrees["common"]
+    admin = git / "worktrees" / "wt"
+    module = git / "modules" / "m"
+    nested = module / "modules" / "n"
+    for gitdir in (module, nested):
+        (gitdir / "hooks").mkdir(parents=True)
+        (gitdir / "HEAD").write_text("ref: refs/heads/main\n")
+        (gitdir / "config").write_text("[core]\n")
+    guarded = [admin / "commondir", admin / "config.worktree", module / "config",
+               module / "hooks" / "post-checkout", nested / "config"]
+    before = {p: p.read_bytes() if p.exists() else None for p in guarded}
+    parents = [admin, git / "worktrees", nested, module / "modules", module, git / "modules"]
+    proc = jailed(world["script"], "\n".join(
+        [f"( mv {d} {d}.moved ) 2>/dev/null && echo moved={d}" for d in parents] +
+        [f"( mkdir -p {p.parent} && echo planted >{p} ) 2>/dev/null" for p in guarded]),
+        cwd=worktrees["main"])
+    assert "moved=" not in proc.stdout, proc.stdout
+    assert {p: p.read_bytes() if p.exists() else None for p in guarded} == before
+
+
+@needs_pasta
+def test_git_commits_in_the_checkout_and_its_submodule_but_not_their_hooks_or_config(
+        world, worktrees) -> None:
+    main, module = worktrees["main"], worktrees["common"] / "modules" / "lib"
+    subprocess.run(["git", "-C", str(main), "-c", "protocol.file.allow=always", "submodule",
+                    "add", "-q", str(world["other"]), "lib"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(main), *GIT_ID, "commit", "-qm", "lib"], check=True)
+    git = "git " + " ".join(GIT_ID)
+    attempts = {
+        "status": "git status --porcelain >/dev/null",
+        "commit": f"echo a >a.txt && git add a.txt && {git} commit -qm a",
+        "sub_commit": f"echo b >lib/b.txt && git -C lib add b.txt && {git} -C lib commit -qm b",
+        "sub_hook": f": >{module}/hooks/post-commit",
+        "sub_config": f"echo x >>{module}/config",
+    }
+    proc = jailed(world["script"], "\n".join(
+        f"( {cmd} ) 2>/dev/null && echo {name}=yes || echo {name}=no"
+        for name, cmd in attempts.items()), cwd=main)
+    assert {"status=yes", "commit=yes", "sub_commit=yes", "sub_hook=no",
+            "sub_config=no"} <= set(proc.stdout.split()), proc.stdout
+
+
+@pytest.mark.parametrize("span, status", [
+    ("24h", 3), ("1440min", 3), ("86400s", 3), ("25h", 64), ("1441min", 64), ("86401s", 64),
+    ("999999999h", 64)])
+def test_max_runtime_is_bounded(world, span: str, status: int) -> None:
+    """Without a settings file an accepted span gets as far as reading it: 3."""
+    script = make_tree(world["var"] / "tree2", None)
+    proc = run(script, "--detach", "ok-slug", "--max-runtime", span, "--", "true",
+               cwd=world["repo"])
+    assert proc.returncode == status, proc.stderr
+
+
+@pytest.mark.skipif(not CLAUDE_CREDS.is_file(), reason="no Claude credentials file here")
+@pytest.mark.parametrize("where", ["denyRead", "credentials", "absent"])
+@needs_pasta
+def test_claude_login_says_so_when_the_profile_hides_the_credentials(world, where: str) -> None:
+    sandbox = world["settings"]["sandbox"]
+    if where == "denyRead":
+        sandbox["filesystem"]["denyRead"].append("~/.claude")
+    elif where == "credentials":
+        sandbox["credentials"]["files"].append({"path": "~/.claude/.credentials.json", "mode": "mask"})
+    script = make_tree(world["var"] / "tree2", world["settings"])
+    if where == "absent":
+        source = script.read_text()
+        assert source.count(".claude/.credentials.json") == 1
+        script.write_text(source.replace(".claude/.credentials.json", ".claude/.confined-absent"))
+    marker = world["var"] / "should-not-exist"
+    proc = run(script, "--claude-login", "--", "touch", str(marker), cwd=world["repo"])
+    assert proc.returncode == 3 and "credentials" in proc.stderr, proc.stderr
+    assert not marker.exists()
+
+
+@needs_pasta
+def test_bwrap_starts_without_the_callers_loader_variables(world) -> None:
+    """The interpreter has loaded a caller's LD_PRELOAD before the script runs;
+    bwrap, outside the jail too, must not load it again. Pid 1 is bwrap."""
+    preload = "/nonexistent/confined-test-preload.so"
+    proc = jailed(world["script"],
+                  'echo "bwrap=$(tr "\\0" "\\n" </proc/1/environ | grep -c ^LD_)"\n'
+                  'echo "command=$LD_PRELOAD"', cwd=world["repo"],
+                  env=base_env(LD_PRELOAD=preload, LD_LIBRARY_PATH="/nonexistent"))
+    assert answers(proc) == {"bwrap": "0", "command": preload}, proc.stdout
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")

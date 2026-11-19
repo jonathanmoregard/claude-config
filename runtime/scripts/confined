@@ -1,13 +1,13 @@
 #!/run/current-system/sw/bin/python3 -I
 """confined [--chdir DIR] -- <command> [args...]
-confined [--chdir DIR] --detach <slug> [--max-runtime 4h] -- <command> [args...]
+confined [--chdir DIR] --detach <slug> [--max-runtime 4h, at most 24h] -- <command> [args...]
 confined --claude-login [the same] -- <command> [args...]
 
 Run a command outside the Claude Code sandbox, in a bubblewrap jail of its own
 that leaves user namespaces enabled, so nested sandboxes work.
 
 Writable: the repository around the working directory (a .git directory in it
-too, but not its hooks and config; a git dir elsewhere, such as a linked
+too, but not its hooks, config and other worktrees' entries; a git dir elsewhere, such as a linked
 worktree's, is read-only, so commit outside the jail) and $TMPDIR, /tmp/confined-<uid>, shared between
 jails. Home, /tmp, /run and /var are empty but for that repository and SHOWN. Agent and git config at the top of the repository
 cannot be written or created. A launch from a Claude Code session whose project
@@ -48,7 +48,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
-SPAN = re.compile(r"^[1-9][0-9]*(s|min|h)$")
+SPAN = re.compile(r"^([1-9][0-9]*)(s|min|h)$")
+SECONDS = {"s": 1, "min": 60, "h": 3600}
+MAX_RUNTIME = 24 * 3600
 GLOB_CHARS = re.compile(r"[*?\[]")
 # A fixed search, not PATH: this runs outside the sandbox without a prompt.
 SEARCH = ("/run/current-system/sw/bin", "/etc/profiles/per-user/{user}/bin", "/usr/sbin",
@@ -70,6 +72,7 @@ PROTECTED = (
     ".zshrc", ".zprofile", ".profile", ".ripgreprc", ".vscode", ".idea",
 )
 STUB_MARK = "user.confined-stub"
+LOADER = ("LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT")
 JOB_WRAPPER = """
 log=$1; shift
 "$@" >"$log" 2>&1; rc=$?
@@ -114,7 +117,8 @@ def parse(argv: list[str]) -> Args:
             if value.startswith("claude-"):
                 fail(64, "slugs beginning with claude- are reserved")
             args.slug = value
-        elif flag == "--max-runtime" and args.max_runtime is None and SPAN.fullmatch(value):
+        elif (flag == "--max-runtime" and args.max_runtime is None and (span := SPAN.fullmatch(value))
+              and int(span[1]) * SECONDS[span[2]] <= MAX_RUNTIME):
             args.max_runtime = value
         else:
             usage()
@@ -292,8 +296,7 @@ def repository(cwd: str, profile: Profile, sessions: list[str]) -> Repo:
         # git dies on an empty commondir; "." names the git dir itself.
         content = {os.path.join(gitdir, "commondir"): ".", os.path.join(gitdir, "config"): "",
                    os.path.join(gitdir, "config.worktree"): ""}
-        frozen += glob.glob(os.path.join(gitdir, "worktrees", "*", "commondir"))
-        frozen += glob.glob(os.path.join(gitdir, "worktrees", "*", "config.worktree"))
+        frozen += glob.glob(os.path.join(gitdir, "worktrees", "*"))
         for root, dirs, files in os.walk(os.path.join(gitdir, "modules")):
             if "HEAD" in files:
                 frozen += [os.path.join(root, "hooks"), os.path.join(root, "config")]
@@ -501,7 +504,11 @@ def jail(profile: Profile, repo: Repo, cwd: str, home: str, tmp: str, login: boo
         if any(under(w, path) for w in writes):
             fail(64, f"{path} is hidden by the sandbox profile and holds the working repository")
     blocked = existing([b for b in profile.blocked if not GLOB_CHARS.search(b)])
-    if not login or not os.path.isfile(creds) or any(under(real_creds, h) for h in hide + blocked):
+    if login and not os.path.isfile(creds):
+        fail(3, f"--claude-login, but the credentials file {creds} does not exist")
+    if login and any(under(real_creds, h) for h in hide + blocked):
+        fail(3, f"--claude-login, but the sandbox profile hides the credentials file {creds}")
+    if not login:
         creds = None
     args = ["--unshare-user", "--uid", str(os.getuid()), "--gid", str(os.getgid()),
             "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
@@ -519,7 +526,9 @@ def jail(profile: Profile, repo: Repo, cwd: str, home: str, tmp: str, login: boo
 
     for path in repo.outside:
         bind("--ro-bind-fd", path, path)
-    pins = [p for p in [os.path.join(repo.top, ".claude")] if os.path.isdir(p)]
+    # A mount point cannot be renamed, but its parent can, carrying it along.
+    pins = {str(a) for g in [*repo.frozen, *repo.stubs] for a in Path(g).parents
+            if str(a) not in writes and any(under(str(a), w) for w in writes)}
     # Outer first: a later bind of an ancestor would cover a pin inside it.
     for path in sorted({*writes, *pins}, key=lambda p: p.count("/")):
         bind("--bind-fd", path, path)
@@ -534,6 +543,10 @@ def jail(profile: Profile, repo: Repo, cwd: str, home: str, tmp: str, login: boo
         else:
             # --ro-bind would mount it nodev: reads fail EACCES instead of empty.
             args += ["--dev-bind", "/dev/null", path]
+    # bwrap starts without these, on the host side; the command gets them back.
+    for name in LOADER:
+        if name in os.environ:
+            args += ["--setenv", name, os.environ[name]]
     for name in profile.deny_env:
         args += ["--unsetenv", name]
     return args + ["--setenv", "SANDBOX_RUNTIME", "1", "--setenv", "TMPDIR", tmp,
@@ -626,6 +639,7 @@ def jail_is_empty(patience: float = 10.0) -> bool:
 
 def supervise(argv: list[str], fds: list[int], net: Network) -> int:
     child = subprocess.Popen(argv, pass_fds=fds,
+                             env={k: v for k, v in os.environ.items() if k not in LOADER},
                              preexec_fn=lambda: (die_with_parent(), net.enter()))
     try:
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
