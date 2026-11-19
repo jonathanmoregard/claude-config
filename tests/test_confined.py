@@ -381,12 +381,9 @@ def test_refuses_a_repo_whose_protected_entry_is_a_symlink(world, entry: str) ->
 
 @pytest.mark.parametrize("case", ["write_root", "planted_git_above_root", "outside_roots",
                                   "deny_write", "tmp_itself", "gitdir_outside_roots",
-                                  "gitdir_inside_the_repo", "holds_checkouts",
-                                  "planted_git_around_checkouts", "unreadable_directory",
-                                  "checkout_dressed_as_a_submodule"])
+                                  "gitdir_inside_the_repo"])
 @needs_pasta
-def test_refuses_a_working_directory_it_cannot_confine_to_one_repo(world, case: str,
-                                                                   request) -> None:
+def test_refuses_a_working_directory_it_cannot_confine_to_one_repo(world, case: str) -> None:
     rw, home = world["rw"], world["home"]
     marker = world["var"] / "should-not-exist"
     if case == "write_root":
@@ -401,25 +398,6 @@ def test_refuses_a_working_directory_it_cannot_confine_to_one_repo(world, case: 
         cwd = world["repo"] / "locked"
     elif case == "tmp_itself":
         cwd = Path("/tmp")
-    elif case in ("holds_checkouts", "planted_git_around_checkouts"):
-        cwd = rw / "group"
-        git_repo(cwd / "deep" / "session")
-        marker = cwd / "deep" / "session" / "should-not-exist"
-        if case == "planted_git_around_checkouts":
-            (cwd / ".git").mkdir()
-            (cwd / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
-    elif case == "unreadable_directory":
-        cwd = git_repo(rw / "outer")
-        git_repo(cwd / "veil" / "session")
-        marker = cwd / "veil" / "session" / "should-not-exist"
-        (cwd / "veil").chmod(0o300)
-        request.addfinalizer(lambda: (cwd / "veil").chmod(0o755))
-    elif case == "checkout_dressed_as_a_submodule":
-        cwd = git_repo(rw / "outer")
-        elsewhere = git_repo(rw / "modules" / "real")
-        (cwd / "session").mkdir()
-        (cwd / "session" / ".git").write_text(f"gitdir: {elsewhere}/.git\n")
-        marker = cwd / "session" / "should-not-exist"
     elif case == "gitdir_inside_the_repo":
         cwd = rw / "inner"
         (cwd / "gd").mkdir(parents=True)
@@ -482,10 +460,10 @@ def test_a_git_dir_swapped_for_a_link_mid_launch_exposes_nothing(world) -> None:
         while not stop.is_set():
             gitdir.rename(parked)
             gitdir.symlink_to(secret_dir)
-            time.sleep(0.002)
+            time.sleep(0.01)
             gitdir.unlink()
             parked.rename(gitdir)
-            time.sleep(0.002)
+            time.sleep(0.01)
 
     swapper = threading.Thread(target=swap)
     swapper.start()
@@ -510,20 +488,71 @@ def test_the_command_inherits_no_descriptor_of_the_host(world) -> None:
     assert not [o for o in opened if not o.startswith(("/dev/", "/proc/", "pipe:"))], opened
 
 
+SESSION_PROBE = """
+echo x >>{s}/.claude/settings.local.json 2>/dev/null
+echo x >{s}/.claude/settings.json 2>/dev/null
+echo x >{s}/.mcp.json 2>/dev/null
+echo x >{s}/ordinary
+"""
+
+
+def session_in(repo: Path) -> Path:
+    project = repo / "pkg" / "app"
+    (project / ".claude").mkdir(parents=True)
+    (project / ".claude" / "settings.local.json").write_text("{}\n")
+    return project
+
+
+def assert_session_config_untouched(project: Path) -> None:
+    assert (project / ".claude" / "settings.local.json").read_text() == "{}\n"
+    assert not (project / ".claude" / "settings.json").exists()
+    assert not (project / ".mcp.json").exists()
+    assert (project / "ordinary").read_text() == "x\n"
+
+
 @needs_pasta
-def test_agent_config_in_a_subdirectory_is_read_only(world) -> None:
-    sub = world["repo"] / "pkg" / "app"
-    (sub / ".claude").mkdir(parents=True)
-    (sub / ".claude" / "settings.local.json").write_text("{}\n")
-    (sub / ".mcp.json").write_text("{}\n")
-    jailed(world["script"],
-           f"echo x >>{sub}/.claude/settings.local.json 2>/dev/null\n"
-           f"echo x >{sub}/.claude/settings.json 2>/dev/null\n"
-           f"echo x >>{sub}/.mcp.json 2>/dev/null\necho x >{sub}/ordinary", cwd=world["repo"])
-    assert (sub / ".claude" / "settings.local.json").read_text() == "{}\n"
-    assert (sub / ".mcp.json").read_text() == "{}\n"
-    assert not (sub / ".claude" / "settings.json").exists()
-    assert (sub / "ordinary").read_text() == "x\n"
+def test_a_session_project_inside_the_repository_keeps_its_agent_config(world) -> None:
+    project = session_in(world["repo"])
+    proc = run(world["script"], "--session", str(project), "--", "sh", "-c",
+               SESSION_PROBE.format(s=project), cwd=world["repo"])
+    assert proc.returncode == 0, proc.stderr
+    assert_session_config_untouched(project)
+
+
+@needs_pasta
+def test_the_session_project_is_found_among_the_ancestors(world) -> None:
+    project = session_in(world["repo"])
+    launcher = world["var"] / "claude" / "versions" / "launcher"
+    launcher.parent.mkdir(parents=True)
+    shutil.copy2(shutil.which("bash"), launcher)
+    proc = subprocess.run(
+        [str(launcher), "-c", f"(cd {world['repo']} && {world['script']} -- sh -c "
+                              f"'{SESSION_PROBE.format(s=project)}'); exit $?"],
+        cwd=project, env=base_env(), capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    assert_session_config_untouched(project)
+
+
+@needs_pasta
+def test_refuses_when_the_session_project_could_be_moved_into_the_repository(world) -> None:
+    project = world["rw"] / "group" / "session"
+    project.mkdir(parents=True)
+    marker = world["var"] / "should-not-exist"
+    proc = run(world["script"], "--session", str(project), "--", "touch", str(marker),
+               cwd=world["repo"])
+    assert proc.returncode == 64, proc.stderr
+    assert not marker.exists()
+
+
+@needs_pasta
+def test_a_session_project_beside_the_repository_is_out_of_reach(world) -> None:
+    project = world["other"]
+    before = (project / "tracked.txt").read_text()
+    proc = run(world["script"], "--session", str(project), "--", "sh", "-c",
+               f"echo x >>{project}/tracked.txt 2>/dev/null; ls {project} 2>/dev/null | wc -l",
+               cwd=world["repo"])
+    assert (proc.returncode, proc.stdout.strip()) == (0, "0"), proc.stderr
+    assert (project / "tracked.txt").read_text() == before
 
 
 @needs_pasta

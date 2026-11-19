@@ -9,13 +9,16 @@ Writable: the repository around the working directory (a .git directory in it
 too, but not its hooks and config; a git dir elsewhere, such as a linked
 worktree's, is read-only, so commit outside the jail) and $TMPDIR, /tmp/confined-<uid>, shared between
 jails. Home, /tmp, /run and /var are empty but for that repository, Claude's
-credentials file and SHOWN. Agent and git config at the top of the repository
-cannot be written or created; in its subdirectories, not written. A directory
-holding other checkouts is refused, except under /tmp. What the `sandbox` block and Read deny rules of the
+credentials file and SHOWN. Agent and git config at the top of the repository,
+and in the launching Claude Code session's project when that lies inside it,
+cannot be written or created. What the `sandbox` block and Read deny rules of the
 settings.json beside this config hide stays hidden.
 Network: its own namespace, IPv4 only. The host, private, link-local and
 tailnet ranges are refused, except DNS to the configured resolvers; the rest of
 the internet is reachable, without a domain filter.
+
+--session DIR names a session project to protect besides the one found among
+the ancestors; --detach hands it to the unit, which has no such ancestor.
 
 --detach runs it as the user unit <slug>.service, stopped after --max-runtime,
 logging to $TMPDIR/<slug>.log. `wait-for unit <slug>.service --user` observes
@@ -85,6 +88,7 @@ def usage() -> None:
 class Args:
     command: list[str] = field(default_factory=list)
     chdir: str | None = None
+    session: str | None = None
     slug: str | None = None
     max_runtime: str | None = None
 
@@ -97,6 +101,8 @@ def parse(argv: list[str]) -> Args:
         flag, value, argv = argv[0], argv[1], argv[2:]
         if flag == "--chdir" and args.chdir is None and value != "--":
             args.chdir = value
+        elif flag == "--session" and args.session is None and value != "--":
+            args.session = value
         elif flag == "--detach" and args.slug is None and SLUG.fullmatch(value):
             if value.startswith("claude-"):
                 fail(64, "slugs beginning with claude- are reserved")
@@ -214,33 +220,29 @@ class Repo:
     stubs: dict[str, str | None]  # absent protected path -> content (None: a directory)
 
 
-def nested(top: str, gitdir: str | None) -> tuple[list[str], list[str]]:
-    """Other checkouts below top, and agent config in its subdirectories: a
-    session working in either has them protected, so the jail must too.
-    A submodule kept under top's own git dir is not another checkout."""
-    checkouts, config, stack = [], [], [top]
-    while stack:
-        here = stack.pop()
+def session_project() -> str | None:
+    """The project directory of the Claude Code session this was launched
+    from: the working directory of the nearest ancestor that is Claude Code.
+    Its sandbox protects that directory's agent config whatever the shell's
+    directory is, so the jail has to as well."""
+    pid = os.getppid()
+    while pid > 1:
         try:
-            entries = list(os.scandir(here))
-        except OSError as e:
-            fail(64, f"cannot look for checkouts in {here}: {e.strerror}")
-        names = {e.name: e for e in entries}
-        if here != top and ".git" in names:
-            pointer = read_pointer(Path(here, ".git"), "gitdir:")
-            target = os.path.realpath(os.path.join(here, pointer)) if pointer else ""
-            if not (gitdir and under(target, os.path.join(gitdir, "modules"))):
-                checkouts.append(here)
-                continue
-        if here != top:
-            config += [e.path for e in entries if e.name in (".claude", ".mcp.json")
-                       and not e.is_symlink()]
-        stack += [e.path for e in entries
-                  if e.name not in (".git", ".claude") and e.is_dir(follow_symlinks=False)]
-    return checkouts, config
+            exe = Path(os.readlink(f"/proc/{pid}/exe"))
+            if "claude" in exe.parts or exe.name.startswith("claude"):
+                return os.path.realpath(os.readlink(f"/proc/{pid}/cwd"))
+            stat_line = Path(f"/proc/{pid}/stat").read_text()
+            pid = int(stat_line[stat_line.rindex(")") + 2:].split()[1])
+        except (OSError, ValueError):
+            break
+    # Inside another jail the ancestors are out of sight, and that jail
+    # already bounds this one.
+    if os.environ.get("CLAUDECODE") and os.environ.get("SANDBOX_RUNTIME") != "1":
+        fail(3, "launched from Claude Code, but its process was not found among the ancestors")
+    return None
 
 
-def repository(cwd: str, profile: Profile) -> Repo:
+def repository(cwd: str, profile: Profile, sessions: list[str]) -> Repo:
     start = Path(cwd)
     top = str(next((p for p in (start, *start.parents) if os.path.lexists(p / ".git")), start))
 
@@ -257,7 +259,6 @@ def repository(cwd: str, profile: Profile) -> Repo:
         fail(64, f"{cwd} is under a denyWrite path of the sandbox profile")
     dot = Path(top, ".git")
     own, outside, frozen = [], [], [os.path.join(top, name) for name in PROTECTED]
-    gitdir = None
     # A stub in the worktree is an empty directory: git status does not list
     # it, and no file can be written in its place. Inside a git dir it is the
     # file git expects.
@@ -268,8 +269,8 @@ def repository(cwd: str, profile: Profile) -> Repo:
     if dot.is_file() and not dot.is_symlink():
         frozen.append(str(dot))
         pointer = read_pointer(dot, "gitdir:")
-        gitdir = os.path.realpath(dot.parent / pointer) if pointer else ""
-        if not os.path.isfile(os.path.join(gitdir, "HEAD")):
+        gitdir = os.path.realpath(dot.parent / pointer) if pointer else None
+        if not gitdir or not os.path.isfile(os.path.join(gitdir, "HEAD")):
             fail(64, f"cannot resolve the git dir of {top}")
         pointer = read_pointer(Path(gitdir, "commondir"))
         outside = [gitdir, os.path.realpath(os.path.join(gitdir, pointer)) if pointer else gitdir]
@@ -290,11 +291,16 @@ def repository(cwd: str, profile: Profile) -> Repo:
             if "HEAD" in files:
                 frozen += [os.path.join(root, "hooks"), os.path.join(root, "config")]
                 dirs[:] = [d for d in dirs if d == "modules"]
-    checkouts, config = nested(top, gitdir)
-    # Under /tmp they are allowed, unguarded: the agent-e2e harness works there.
-    if checkouts and not under(top, "/tmp"):
-        fail(64, f"{top} holds another checkout, {checkouts[0]}; work in one repository")
-    frozen += config
+    for project in sessions:
+        if under(project, top):
+            frozen += [os.path.join(project, name) for name in PROTECTED]
+        elif (os.stat(project).st_dev == os.stat(top).st_dev
+              and any(under(project, r) for r in [*profile.roots, "/tmp"])
+              and os.path.dirname(project) not in [*profile.roots, "/tmp"]):
+            # The session cannot move its own project, but could move a
+            # directory above it into the repository while the jail runs.
+            fail(64, f"the session's project {project} is below a directory that could be "
+                     f"moved into {top}; make its parent an allowWrite root")
     outside = list(dict.fromkeys(outside))
     for d in outside:
         if under(d, top):
@@ -606,7 +612,7 @@ def supervise(argv: list[str], fds: list[int], net: Network) -> int:
     return 128 - status if status < 0 else status
 
 
-def detach(args: Args, cwd: str, user: str, here: Path, tmp: str) -> None:
+def detach(args: Args, cwd: str, sessions: list[str], user: str, here: Path, tmp: str) -> None:
     systemd_run, bash = find("systemd-run", user), find("bash", user)
     recorder = here / "record-user-unit-failure"
     if not os.access(recorder, os.X_OK):
@@ -617,7 +623,8 @@ def detach(args: Args, cwd: str, user: str, here: Path, tmp: str) -> None:
         [systemd_run, "--user", "--quiet", "--expand-environment=no", f"--unit={args.slug}", f"--working-directory={cwd}",
          "-p", "RemainAfterExit=yes", "-p", f"RuntimeMaxSec={args.max_runtime or '4h'}",
          "-p", f"ExecStopPost={recorder} {args.slug} {log}",
-         "--", sys.executable, "-I", str(here / "confined"), "--chdir", cwd, "--",
+         "--", sys.executable, "-I", str(here / "confined"), "--chdir", cwd,
+         *(arg for s in sessions for arg in ("--session", s)), "--",
          bash, "-c", JOB_WRAPPER, "confined-job", log, *args.command],
         env={"XDG_RUNTIME_DIR": runtime, "DBUS_SESSION_BUS_ADDRESS": f"unix:path={runtime}/bus"},
         stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False)
@@ -639,7 +646,9 @@ def main() -> None:
         cwd = os.path.realpath(args.chdir or os.getcwd(), strict=True)
     except OSError as e:
         fail(64, f"cannot resolve the working directory: {e}")
-    repo = repository(cwd, profile)
+    sessions = [os.path.realpath(s) for s in (session_project(), args.session)
+                if s and os.path.isdir(s)]
+    repo = repository(cwd, profile, sessions)
     tmp = shared_tmp()
     tools = {name: find(name, entry.pw_name) for name in ("pasta", "bwrap", "iptables-restore")}
     for sig in (signal.SIGTERM, signal.SIGHUP):
@@ -650,7 +659,7 @@ def main() -> None:
     try:
         bwrap_args, fds = jail(profile, repo, cwd, entry.pw_dir, tmp)
         if args.slug:
-            detach(args, cwd, entry.pw_name, here, tmp)
+            detach(args, cwd, sessions, entry.pw_name, here, tmp)
         net = Network(tools)
         try:
             status = supervise([tools["bwrap"], *bwrap_args, "--", *args.command], fds, net)
