@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import pwd
+import re
 import shutil
 import subprocess
 import time
@@ -104,6 +105,7 @@ def world(tmp_path: Path, home_scratch: Path):
             f"Read(~/{home_rel}/sealed/**)",
             f"Read(/{tmp_path}/pla*)",
             "Read(~/.confined-test-missing-file)",
+            "Read(~/.claude/.credentials.json)",
             "Bash(rm -rf *)",
         ]},
     }
@@ -138,6 +140,32 @@ def test_hides_denied_env_and_real_home_secrets(world) -> None:
         assert "ssh=0" in proc.stdout
     if codex.is_file():
         assert "codex=0" in proc.stdout
+
+
+CLAUDE_CREDS = REAL_HOME / ".claude" / ".credentials.json"
+# Sizes and access(2) only: neither test reads the credential.
+CREDS_PROBE = (f'printf "size=%s\\n" "$(wc -c <{CLAUDE_CREDS} 2>/dev/null)"\n'
+               f'[ -w {CLAUDE_CREDS} ] && echo writable=yes || echo writable=no')
+
+
+@pytest.mark.skipif(not CLAUDE_CREDS.is_file(), reason="no Claude credentials file here")
+def test_claude_credentials_stay_usable_despite_a_read_rule(world) -> None:
+    proc = jailed(world["script"], CREDS_PROBE, cwd=world["rw"])
+    assert "writable=yes" in proc.stdout
+    assert re.search(r"^size=[1-9]", proc.stdout, re.M), proc.stdout
+
+
+@pytest.mark.skipif(not CLAUDE_CREDS.is_file(), reason="no Claude credentials file here")
+@pytest.mark.parametrize("where", ["denyRead", "credentials"])
+def test_claude_credentials_hidden_when_the_sandbox_block_hides_them(tmp_path: Path, where: str) -> None:
+    sandbox: dict = {"filesystem": {"allowWrite": [], "denyRead": []}, "credentials": {"files": []}}
+    if where == "denyRead":
+        sandbox["filesystem"]["denyRead"].append("~/.claude")
+    else:
+        sandbox["credentials"]["files"].append({"path": "~/.claude/.credentials.json", "mode": "mask"})
+    script = make_tree(tmp_path / "tree", {"sandbox": sandbox})
+    proc = jailed(script, CREDS_PROBE, cwd=tmp_path)
+    assert re.search(r"^size=0?$", proc.stdout, re.M), proc.stdout
 
 
 def test_has_its_own_pid_and_ipc_namespaces(world) -> None:

@@ -97,15 +97,23 @@ class Profile:
 
             self.allow = existing(paths(fs.get("allowWrite", []))) + ["/tmp"]
             self.deny_write = existing(paths(fs.get("denyWrite", [])))
-            hide = existing(paths(fs.get("denyRead", [])), expand_globs=True)
-            hide += existing(paths([c["path"] for c in creds.get("files", [])]))
-            hide += existing(paths(["~/.ssh", "~/.codex/auth.json"]))
+            blocked = existing(paths(fs.get("denyRead", [])), expand_globs=True)
+            blocked += existing(paths([c["path"] for c in creds.get("files", [])]))
+            hide = blocked + existing(paths(["~/.ssh", "~/.codex/auth.json"]))
             hide += existing(self.read_rules(settings, home, settings_path.parent))
             self.deny_env = sorted({v["name"] for v in creds.get("envVars", [])
                                     if v.get("mode") == "deny"})
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
             fail(3, f"cannot read the sandbox profile from {settings_path}: {e!r}")
         self.hide = self.outermost(hide)
+        # Claude's sandbox leaves this readable despite its Read rule; agent e2e
+        # needs it, writable for token refresh. The sandbox block still wins.
+        claude_creds = os.path.realpath(os.path.join(home, ".claude/.credentials.json"))
+        self.refresh = []
+        covering = blocked + [h for h in self.hide if h != claude_creds]
+        if os.path.isfile(claude_creds) and not any(under(claude_creds, h) for h in covering):
+            self.hide = [h for h in self.hide if h != claude_creds]
+            self.refresh = [claude_creds]
 
     @staticmethod
     def read_rules(settings: dict, home: str, config_dir: Path) -> list[str]:
@@ -143,7 +151,7 @@ class Profile:
                 "--unshare-pid", "--unshare-ipc", "--new-session"]
         if foreground:
             args.append("--die-with-parent")
-        for root in self.allow:
+        for root in self.allow + self.refresh:
             args += ["--bind", root, root]
         for path in self.deny_write:
             args += ["--ro-bind", path, path]
