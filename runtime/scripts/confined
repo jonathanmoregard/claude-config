@@ -5,7 +5,9 @@ confined --detach <slug> -- <command> [args...]
 Run a command outside the Claude Code sandbox, in a bubblewrap jail of its own
 that hides and protects what the `sandbox` block of the settings.json beside
 this config hides and protects, but leaves user namespaces enabled so nested
-bwrap works. Network is NOT restricted: bwrap cannot filter by domain.
+bwrap works. The jail has its own network namespace (pasta): outbound traffic
+is NOT domain-filtered; host loopback and abstract sockets are not reachable.
+Agent and git config in the working directory's repository is read-only.
 
 --detach starts the jailed command as the user unit <slug>.service, logging to
 /tmp/<slug>.log, the way `wait-for job` does, so `wait-for unit <slug>.service
@@ -26,6 +28,17 @@ from pathlib import Path
 
 SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
 GLOB_CHARS = re.compile(r"[*?\[]")
+# A fixed search, not PATH: this runs outside the sandbox without a prompt.
+SEARCH = ("/run/current-system/sw/bin", "/etc/profiles/per-user/{user}/bin", "/usr/bin", "/bin")
+PASTA = ["--quiet", "--config-net", "--no-map-gw", "-t", "none", "-u", "none", "-T", "none",
+         "-U", "none"]
+PROTECTED = (
+    ".claude/settings.json", ".claude/settings.local.json", ".claude/hooks", ".claude/skills",
+    ".claude/agents", ".claude/commands", ".claude/workflows", ".claude/routines",
+    ".claude/output-styles", ".claude/launch.json", ".claude/scheduled_tasks.json",
+    ".claude/loop.md", ".mcp.json", ".gitconfig", ".gitmodules", ".bashrc", ".bash_profile",
+    ".zshrc", ".zprofile", ".profile", ".ripgreprc", ".vscode", ".idea",
+)
 JOB_WRAPPER = """
 log=$1; shift
 "$@" >"$log" 2>&1; rc=$?
@@ -58,10 +71,8 @@ def parse(argv: list[str]) -> tuple[str | None, list[str]]:
 
 
 def find(name: str, user: str) -> str | None:
-    # A fixed search, not PATH: this runs outside the sandbox without a prompt.
-    for directory in ("/run/current-system/sw/bin", f"/etc/profiles/per-user/{user}/bin",
-                      "/usr/bin", "/bin"):
-        candidate = os.path.join(directory, name)
+    for directory in SEARCH:
+        candidate = os.path.join(directory.format(user=user), name)
         if os.access(candidate, os.X_OK):
             return candidate
     return None
@@ -83,6 +94,41 @@ def existing(paths: list[str], expand_globs: bool = False) -> list[str]:
         matches = glob.glob(path) if expand_globs and GLOB_CHARS.search(path) else [path]
         out += [os.path.realpath(m) for m in matches if os.path.exists(m)]
     return out
+
+
+def read_pointer(path: Path, prefix: str = "") -> str | None:
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read(4096).strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not text.startswith(prefix):
+        return None
+    return text[len(prefix):].strip() or None
+
+
+def repo_guard(cwd: str) -> tuple[list[str], list[str]]:
+    """Directories to pin as mount points (so they cannot be renamed and
+    replaced) and paths to make read-only, for the repository holding cwd."""
+    start = Path(cwd)
+    top = next((p for p in (start, *start.parents) if os.path.lexists(p / ".git")), start)
+    pinned, frozen = [top, top / ".claude"], [top / name for name in PROTECTED]
+    dot, gitdir = top / ".git", None
+    if dot.is_dir():
+        gitdir = dot
+    elif dot.is_file():
+        frozen.append(dot)
+        pointer = read_pointer(dot, "gitdir:")
+        gitdir = top / pointer if pointer else None
+    if gitdir is not None and gitdir.is_dir():
+        common = gitdir
+        pointer = read_pointer(gitdir / "commondir")
+        if pointer:
+            frozen.append(gitdir / "commondir")
+            common = gitdir / pointer
+        pinned += [gitdir, common]
+        frozen += [common / "hooks", common / "config", gitdir / "config.worktree"]
+    return existing([str(p) for p in pinned]), existing([str(p) for p in frozen])
 
 
 class Profile:
@@ -147,13 +193,16 @@ class Profile:
                 and not any(under(path, d) for d in self.deny_write))
 
     def bwrap_args(self, cwd: str, foreground: bool) -> list[str]:
-        args = ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+        # pasta's user namespace makes us uid 0; map the real ids back.
+        args = ["--unshare-user", "--uid", str(os.getuid()), "--gid", str(os.getgid()),
+                "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
                 "--unshare-pid", "--unshare-ipc", "--new-session"]
         if foreground:
             args.append("--die-with-parent")
-        for root in self.allow + self.refresh:
+        pinned, frozen = repo_guard(cwd)
+        for root in self.allow + self.refresh + [p for p in pinned if self.writable(p)]:
             args += ["--bind", root, root]
-        for path in self.deny_write:
+        for path in self.deny_write + frozen:
             args += ["--ro-bind", path, path]
         for path in self.hide:
             if os.path.isdir(path):
@@ -193,19 +242,19 @@ def main() -> None:
     entry = pwd.getpwuid(os.getuid())
     here = Path(__file__).resolve().parent
     profile = Profile(here.parent / "settings.json", entry.pw_dir)
-    bwrap = find("bwrap", entry.pw_name)
-    if not bwrap:
-        fail(3, "bwrap not found")
     try:
         cwd = os.path.realpath(os.getcwd())
     except OSError as e:
         fail(64, f"cannot resolve the working directory: {e}")
     if not profile.writable(cwd):
         fail(64, f"{cwd} is not under a writable root of the sandbox profile")
-    jail = [bwrap, *profile.bwrap_args(cwd, foreground=slug is None)]
+    bwrap, pasta = find("bwrap", entry.pw_name), find("pasta", entry.pw_name)
+    if not bwrap or not pasta:
+        fail(3, "bwrap or pasta not found; refusing to run without a jail and its own network")
+    jail = [pasta, *PASTA, "--", bwrap, *profile.bwrap_args(cwd, foreground=slug is None)]
     if slug:
         detach(slug, jail, command, cwd, entry.pw_name, here)
-    os.execv(bwrap, [*jail, "--", *command])
+    os.execv(pasta, [*jail, "--", *command])
 
 
 if __name__ == "__main__":
