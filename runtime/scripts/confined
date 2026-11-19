@@ -388,7 +388,7 @@ class Stubs:
             # Unmarked, no later run would know it for a guard.
             try:
                 (os.rmdir if content is None else os.unlink)(name, dir_fd=parent)
-            except OSError:
+            except OSError:  # arftl-allow: swallowed-exception
                 pass
             fail(3, f"cannot place a guard named {name}: {e}")
 
@@ -425,7 +425,7 @@ class Stubs:
                     os.rmdir(name, dir_fd=parent)
                 elif held.st_size <= 1:
                     os.unlink(name, dir_fd=parent)
-            except OSError:
+            except OSError:  # arftl-allow: swallowed-exception
                 pass
             os.close(fd)
             os.close(parent)
@@ -457,7 +457,7 @@ def shared_tmp() -> str:
     path = f"/tmp/confined-{os.getuid()}"
     try:
         os.mkdir(path, 0o700)
-    except FileExistsError:
+    except FileExistsError:  # arftl-allow: swallowed-exception
         pass
     except OSError as e:
         fail(3, f"cannot create {path}: {e}")
@@ -604,7 +604,7 @@ class Network:
         for pid in self.pasta:
             try:
                 os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
+            except ProcessLookupError:  # arftl-allow: swallowed-exception
                 pass
 
 

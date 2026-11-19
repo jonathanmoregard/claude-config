@@ -140,14 +140,14 @@ def world(scratch):
                 "envVars": [{"name": "CONFINED_TEST_DENIED", "mode": "deny"}],
             },
         },
-        "permissions": {"deny": [
+        "permissions": {"deny": [  # arftl-allow: permission-widened
             f"Read(/{var}/vault.d/**)",
             f"Read(/{var}/rule-*)",
             f"Read(/{repo}/.env*)",
             "Read(//**/.git/**)",
             "Read(~/.confined-test-missing-file)",
             "Read(~/.claude/.credentials.json)",
-            "Bash(rm -rf *)",
+            "Bash(rm -rf *)",  # arftl-allow: destructive-rm
         ]},
     }
     script = make_tree(var / "tree", settings)
@@ -839,6 +839,7 @@ def test_refuses_without_readable_settings(world, state: str) -> None:
     elif state == "malformed":
         settings.write_text("{not json")
     elif state == "no-sandbox-block":
+        # arftl-allow: permission-widened
         settings.write_text(json.dumps({"permissions": {"deny": []}}))
     marker = world["var"] / "should-not-exist"
     proc = run(script, "--", "touch", str(marker), cwd=world["repo"])
