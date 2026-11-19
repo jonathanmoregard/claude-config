@@ -8,7 +8,7 @@ QMK_DIR="${QMK_DIR:-$HOME/Repos/qmk_firmware}"
 KEYMAP="${KEYMAP:-hands-down-se}"
 WAIT_S="${WAIT_S:-600}"
 LOG="${LOG:-${TMPDIR:-/tmp}/flash-corne.log}"
-LOG=$(realpath -m -- "$LOG")   # absolute: the script cds into QMK_DIR later
+[[ $LOG = /* ]] || LOG="$PWD/$LOG"   # absolute: the script cds into QMK_DIR later
 
 # Every failure ends in exactly one ❌: failed() prints its own, and any other
 # non-zero exit (an abort mid-script) gets a generic one from the EXIT trap.
@@ -28,8 +28,9 @@ for tool in qmk avrdude; do
 done
 cd "$QMK_DIR" || failed "no qmk_firmware at $QMK_DIR"
 
-HEX=".build/crkbd_rev1_${KEYMAP}.hex"
+HEX="$PWD/.build/crkbd_rev1_${KEYMAP}.hex"
 rm -f "$HEX"   # so the check below can't pass on a stale build
+[ ! -e "$HEX" ] || failed "can't remove old $HEX, see $LOG"
 echo "⏳ Compiling $KEYMAP…"
 qmk compile -kb crkbd/rev1 -km "$KEYMAP" >>"$LOG" 2>&1 || failed "compile failed, see $LOG"
 [ -f "$HEX" ] || failed "no $HEX after compile, see $LOG"
