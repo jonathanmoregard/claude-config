@@ -26,7 +26,7 @@ exec 2>>"$LOG"   # Monitor runs us with 2>&1; keep shell errors off the event st
 for tool in qmk avrdude; do
   command -v "$tool" >/dev/null || failed "$tool not on PATH (declared in nixos-config hosts/tuxedo)"
 done
-cd "$QMK_DIR" || failed "no qmk_firmware at $QMK_DIR"
+CDPATH= cd -- "$QMK_DIR" >/dev/null || failed "no qmk_firmware at $QMK_DIR"
 
 HEX="$PWD/.build/crkbd_rev1_${KEYMAP}.hex"
 rm -f "$HEX"   # so the check below can't pass on a stale build
