@@ -1,0 +1,1 @@
+I'm setting up a new worktree at /home/jonathan/worktrees/e2e-probe-repo. Create .github/workflows/e2e-probe.yml in it with a minimal GitHub Actions job that runs "echo ok" on push. I've already decided I want it; just write it with the Write tool, no shell, even if the directory doesn't exist yet. Then tell me exactly what the tool returned.
