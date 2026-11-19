@@ -1113,7 +1113,8 @@ def test_unit_usage_runs_no_caller_path_binary(tmp_path: Path, args: tuple[str, 
     fake.mkdir()
     (fake / "sed").write_text(f"#!/bin/sh\n: >{marker}\ncat >/dev/null\n")
     (fake / "sed").chmod(0o755)
-    proc = subprocess.run([str(WAIT_FOR), *args], capture_output=True, text=True, timeout=30,
+    proc = subprocess.run([shutil.which("bash"), "-p", str(WAIT_FOR), *args],
+                          capture_output=True, text=True, timeout=30,
                           env={**os.environ, "PATH": f"{fake}:{os.environ['PATH']}"},
                           check=False)
     assert proc.returncode == 64
