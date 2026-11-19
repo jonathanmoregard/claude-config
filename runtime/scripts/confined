@@ -1,37 +1,54 @@
-#!/usr/bin/env -S python3 -I
-"""confined -- <command> [args...]
-confined --detach <slug> -- <command> [args...]
+#!/run/current-system/sw/bin/python3 -I
+"""confined [--chdir DIR] -- <command> [args...]
+confined [--chdir DIR] --detach <slug> [--max-runtime 4h] -- <command> [args...]
 
 Run a command outside the Claude Code sandbox, in a bubblewrap jail of its own
-that hides and protects what the `sandbox` block of the settings.json beside
-this config hides and protects, but leaves user namespaces enabled so nested
-bwrap works. The jail has its own network namespace (pasta): outbound traffic
-is NOT domain-filtered; host loopback and abstract sockets are not reachable.
-Agent and git config in the working directory's repository is read-only.
+that leaves user namespaces enabled, so nested sandboxes work.
 
---detach starts the jailed command as the user unit <slug>.service, logging to
-/tmp/<slug>.log, the way `wait-for job` does, so `wait-for unit <slug>.service
---user` (or `wait-for job <slug> -- ...`) observes it.
+Writable: the repository around the working directory (its git dirs too, but
+not their hooks and config) and $TMPDIR, /tmp/confined-<uid>, shared between
+jails. The rest of /tmp is private. Home is empty but for that repository,
+Claude's credentials file and HOME_READ. Agent and git config in the
+repository cannot be written or created. What the `sandbox` block and Read deny
+rules of the settings.json beside this config hide stays hidden.
+Network: its own namespace, IPv4 only. The host, private, link-local and
+tailnet ranges are refused, except DNS to the configured resolvers; the rest of
+the internet is reachable, without a domain filter.
+
+--detach runs it as the user unit <slug>.service, stopped after --max-runtime,
+logging to $TMPDIR/<slug>.log. `wait-for unit <slug>.service --user` observes
+it. A slug is single-use.
 
 Exit: the command's status · 3 cannot build the jail · 64 usage or refusal.
 """
 from __future__ import annotations
 
+import ctypes
+import fcntl
 import glob
 import json
 import os
 import pwd
 import re
+import signal
+import stat
 import subprocess
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
+SPAN = re.compile(r"^[1-9][0-9]*(s|min|h)$")
 GLOB_CHARS = re.compile(r"[*?\[]")
 # A fixed search, not PATH: this runs outside the sandbox without a prompt.
-SEARCH = ("/run/current-system/sw/bin", "/etc/profiles/per-user/{user}/bin", "/usr/bin", "/bin")
-PASTA = ["--quiet", "--config-net", "--no-map-gw", "-t", "none", "-u", "none", "-T", "none",
-         "-U", "none"]
+SEARCH = ("/run/current-system/sw/bin", "/etc/profiles/per-user/{user}/bin", "/usr/sbin",
+          "/usr/bin", "/sbin", "/bin")
+PASTA = ["--quiet", "--config-net", "--ipv4-only", "--no-map-gw", "-t", "none", "-u", "none",
+         "-T", "none", "-U", "none"]
+NON_GLOBAL = ("0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+              "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24", "192.168.0.0/16", "198.18.0.0/15",
+              "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/3")
+HOME_READ = (".local/bin/claude",)
 PROTECTED = (
     ".claude/settings.json", ".claude/settings.local.json", ".claude/hooks", ".claude/skills",
     ".claude/agents", ".claude/commands", ".claude/workflows", ".claude/routines",
@@ -39,6 +56,7 @@ PROTECTED = (
     ".claude/loop.md", ".mcp.json", ".gitconfig", ".gitmodules", ".bashrc", ".bash_profile",
     ".zshrc", ".zprofile", ".profile", ".ripgreprc", ".vscode", ".idea",
 )
+STUB_MARK = "user.confined-stub"
 JOB_WRAPPER = """
 log=$1; shift
 "$@" >"$log" 2>&1; rc=$?
@@ -57,43 +75,62 @@ def usage() -> None:
     sys.exit(64)
 
 
-def parse(argv: list[str]) -> tuple[str | None, list[str]]:
-    slug = None
-    if argv[:1] == ["--detach"]:
-        if len(argv) < 2 or not SLUG.fullmatch(argv[1]):
+@dataclass
+class Args:
+    command: list[str] = field(default_factory=list)
+    chdir: str | None = None
+    slug: str | None = None
+    max_runtime: str | None = None
+
+
+def parse(argv: list[str]) -> Args:
+    args = Args()
+    while argv[:1] != ["--"]:
+        if len(argv) < 2:
             usage()
-        if argv[1].startswith("claude-"):
-            fail(64, "slugs beginning with claude- are reserved")
-        slug, argv = argv[1], argv[2:]
-    if argv[:1] != ["--"] or len(argv) < 2:
+        flag, value, argv = argv[0], argv[1], argv[2:]
+        if flag == "--chdir" and args.chdir is None and value != "--":
+            args.chdir = value
+        elif flag == "--detach" and args.slug is None and SLUG.fullmatch(value):
+            if value.startswith("claude-"):
+                fail(64, "slugs beginning with claude- are reserved")
+            args.slug = value
+        elif flag == "--max-runtime" and args.max_runtime is None and SPAN.fullmatch(value):
+            args.max_runtime = value
+        else:
+            usage()
+    if len(argv) < 2 or (args.max_runtime and not args.slug):
         usage()
-    return slug, argv[1:]
+    args.command = argv[1:]
+    return args
 
 
-def find(name: str, user: str) -> str | None:
+def find(name: str, user: str) -> str:
     for directory in SEARCH:
         candidate = os.path.join(directory.format(user=user), name)
         if os.access(candidate, os.X_OK):
             return candidate
-    return None
+    fail(3, f"{name} not found; refusing to run without the jail it builds")
 
 
 def under(path: str, root: str) -> bool:
     return path == root or path.startswith(root.rstrip("/") + "/")
 
 
-def expand(home: str, entry: str) -> str | None:
+def absolute(home: str, entry: str, what: str) -> str:
     if entry.startswith("~/"):
         return os.path.join(home, entry[2:])
-    return entry if entry.startswith("/") else None
+    if not entry.startswith("/"):
+        fail(3, f"{what} entry {entry!r} is not an absolute path; refusing to guess its meaning")
+    return entry
 
 
-def existing(paths: list[str], expand_globs: bool = False) -> list[str]:
-    out = []
-    for path in paths:
-        matches = glob.glob(path) if expand_globs and GLOB_CHARS.search(path) else [path]
-        out += [os.path.realpath(m) for m in matches if os.path.exists(m)]
-    return out
+def existing(paths: list[str]) -> list[str]:
+    return [os.path.realpath(p) for p in paths if os.path.exists(p)]
+
+
+def literal_root(pattern: str) -> str:
+    return os.path.dirname(GLOB_CHARS.split(pattern, 1)[0]) or "/"
 
 
 def read_pointer(path: Path, prefix: str = "") -> str | None:
@@ -102,64 +139,31 @@ def read_pointer(path: Path, prefix: str = "") -> str | None:
             text = f.read(4096).strip()
     except (OSError, UnicodeDecodeError):
         return None
-    if not text.startswith(prefix):
-        return None
-    return text[len(prefix):].strip() or None
-
-
-def repo_guard(cwd: str) -> tuple[list[str], list[str]]:
-    """Directories to pin as mount points (so they cannot be renamed and
-    replaced) and paths to make read-only, for the repository holding cwd."""
-    start = Path(cwd)
-    top = next((p for p in (start, *start.parents) if os.path.lexists(p / ".git")), start)
-    pinned, frozen = [top, top / ".claude"], [top / name for name in PROTECTED]
-    dot, gitdir = top / ".git", None
-    if dot.is_dir():
-        gitdir = dot
-    elif dot.is_file():
-        frozen.append(dot)
-        pointer = read_pointer(dot, "gitdir:")
-        gitdir = top / pointer if pointer else None
-    if gitdir is not None and gitdir.is_dir():
-        common = gitdir
-        pointer = read_pointer(gitdir / "commondir")
-        if pointer:
-            frozen.append(gitdir / "commondir")
-            common = gitdir / pointer
-        pinned += [gitdir, common]
-        frozen += [common / "hooks", common / "config", gitdir / "config.worktree"]
-    return existing([str(p) for p in pinned]), existing([str(p) for p in frozen])
+    return text[len(prefix):].strip() or None if text.startswith(prefix) else None
 
 
 class Profile:
+    """The `sandbox` block and Read deny rules of a settings.json."""
+
     def __init__(self, settings_path: Path, home: str) -> None:
         try:
             settings = json.loads(settings_path.read_text(encoding="utf-8"))
             sandbox = settings["sandbox"]
             fs = sandbox.get("filesystem", {})
             creds = sandbox.get("credentials", {})
-            def paths(entries: list[str]) -> list[str]:
-                return [p for p in (expand(home, e) for e in entries) if p]
 
-            self.allow = existing(paths(fs.get("allowWrite", []))) + ["/tmp"]
-            self.deny_write = existing(paths(fs.get("denyWrite", [])))
-            blocked = existing(paths(fs.get("denyRead", [])), expand_globs=True)
-            blocked += existing(paths([c["path"] for c in creds.get("files", [])]))
-            hide = blocked + existing(paths(["~/.ssh", "~/.codex/auth.json"]))
-            hide += existing(self.read_rules(settings, home, settings_path.parent))
+            def paths(entries: list[str], what: str) -> list[str]:
+                return [absolute(home, e, what) for e in entries]
+
+            self.roots = existing(paths(fs.get("allowWrite", []), "allowWrite"))
+            self.deny_write = existing(paths(fs.get("denyWrite", []), "denyWrite"))
+            self.blocked = paths(fs.get("denyRead", []), "denyRead")
+            self.blocked += paths([c["path"] for c in creds.get("files", [])], "credentials")
+            self.rules = self.read_rules(settings, home, settings_path.parent)
             self.deny_env = sorted({v["name"] for v in creds.get("envVars", [])
                                     if v.get("mode") == "deny"})
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
             fail(3, f"cannot read the sandbox profile from {settings_path}: {e!r}")
-        self.hide = self.outermost(hide)
-        # Claude's sandbox leaves this readable despite its Read rule; agent e2e
-        # needs it, writable for token refresh. The sandbox block still wins.
-        claude_creds = os.path.realpath(os.path.join(home, ".claude/.credentials.json"))
-        self.refresh = []
-        covering = blocked + [h for h in self.hide if h != claude_creds]
-        if os.path.isfile(claude_creds) and not any(under(claude_creds, h) for h in covering):
-            self.hide = [h for h in self.hide if h != claude_creds]
-            self.refresh = [claude_creds]
 
     @staticmethod
     def read_rules(settings: dict, home: str, config_dir: Path) -> list[str]:
@@ -169,92 +173,366 @@ class Profile:
             if not match:
                 continue
             spec = match.group(1).removesuffix("/**")
-            if GLOB_CHARS.search(spec):
-                continue
             if spec.startswith("//"):
                 paths.append(spec[1:])
-            elif spec.startswith("~/"):
-                paths.append(os.path.join(home, spec[2:]))
             elif spec.startswith("/"):
                 paths.append(str(config_dir / spec[1:]))
+            else:
+                paths.append(absolute(home, spec, f"Read rule {rule}"))
         return paths
 
-    @staticmethod
-    def outermost(paths: list[str]) -> list[str]:
-        # bwrap cannot create a mount point inside an already hidden directory.
+    def hidden(self, visible) -> list[str]:
+        """Every path to hide that the jail could otherwise see. A glob rooted
+        at / names no directory to search from; Claude's own sandbox skips
+        those too."""
+        out = []
+        for pattern in self.blocked + self.rules:
+            if not GLOB_CHARS.search(pattern):
+                out += existing([pattern])
+            elif literal_root(pattern) != "/" and visible(literal_root(pattern)):
+                out += existing(glob.glob(pattern, recursive=True))
         kept: list[str] = []
-        for path in sorted(set(paths)):
+        for path in sorted({p for p in out if visible(p)}):
+            # bwrap cannot create a mount point inside an already hidden directory.
             if not any(under(path, k) for k in kept if os.path.isdir(k)):
                 kept.append(path)
         return kept
 
-    def writable(self, path: str) -> bool:
-        return (any(under(path, r) for r in self.allow)
-                and not any(under(path, d) for d in self.deny_write))
 
-    def bwrap_args(self, cwd: str, foreground: bool) -> list[str]:
-        # pasta's user namespace makes us uid 0; map the real ids back.
-        args = ["--unshare-user", "--uid", str(os.getuid()), "--gid", str(os.getgid()),
-                "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
-                "--unshare-pid", "--unshare-ipc", "--new-session"]
-        if foreground:
-            args.append("--die-with-parent")
-        pinned, frozen = repo_guard(cwd)
-        for root in self.allow + self.refresh + [p for p in pinned if self.writable(p)]:
-            args += ["--bind", root, root]
-        for path in self.deny_write + frozen:
-            args += ["--ro-bind", path, path]
-        for path in self.hide:
-            if os.path.isdir(path):
-                args += ["--tmpfs", path, "--remount-ro", path]
+@dataclass
+class Repo:
+    top: str
+    git: list[str]          # gitdir, then the common dir when it differs
+    frozen: list[str]       # read-only, created as a stub when absent
+    stubs: dict[str, str]   # absent protected path -> stub content (None: a directory)
+
+
+def repository(cwd: str, profile: Profile) -> Repo:
+    start = Path(cwd)
+    top = str(next((p for p in (start, *start.parents) if os.path.lexists(p / ".git")), start))
+
+    def check(path: str, what: str) -> None:
+        if not (any(under(path, r) for r in profile.roots) or under(path, "/tmp")):
+            fail(64, f"{what} {path} is under no allowWrite root of the sandbox profile, nor /tmp")
+        if any(under(r, path) for r in [*profile.roots, "/tmp"]):
+            fail(64, f"{what} {path} is, or holds, a whole write root; work in a repository below it")
+        if any(under(path, d) for d in profile.deny_write):
+            fail(64, f"{what} {path} is under a denyWrite path of the sandbox profile")
+
+    check(top, "the repository")
+    if any(under(cwd, d) for d in profile.deny_write):
+        fail(64, f"{cwd} is under a denyWrite path of the sandbox profile")
+    dot = Path(top, ".git")
+    git, frozen = [], [os.path.join(top, name) for name in PROTECTED]
+    if dot.is_file() and not dot.is_symlink():
+        frozen.append(str(dot))
+        pointer = read_pointer(dot, "gitdir:")
+        git.append(os.path.realpath(dot.parent / pointer) if pointer else "")
+    elif dot.exists():
+        git.append(str(dot))
+    # A stub in the worktree is an empty directory: git status does not list
+    # it, and no file can be written in its place. Inside a git dir it is the
+    # file git expects.
+    content: dict[str, str] = {}
+    if git:
+        gitdir = git[0]
+        if not os.path.isfile(os.path.join(gitdir, "HEAD")):
+            fail(64, f"cannot resolve the git dir of {top}")
+        pointer = read_pointer(Path(gitdir, "commondir"))
+        common = os.path.realpath(os.path.join(gitdir, pointer)) if pointer else gitdir
+        git += [common] if common != gitdir else []
+        for d in git:
+            check(d, "the git dir")
+            frozen += [os.path.join(d, "commondir"), os.path.join(d, "config.worktree")]
+            # git dies on an empty commondir; "." names the git dir itself.
+            content[os.path.join(d, "commondir")] = "."
+            content[os.path.join(d, "config.worktree")] = ""
+        frozen += [os.path.join(common, "hooks"), os.path.join(common, "config")]
+        content[os.path.join(common, "config")] = ""
+        frozen += glob.glob(os.path.join(common, "worktrees", "*", "commondir"))
+        frozen += glob.glob(os.path.join(common, "worktrees", "*", "config.worktree"))
+        for root, dirs, files in os.walk(os.path.join(common, "modules")):
+            if "HEAD" in files:
+                frozen += [os.path.join(root, "hooks"), os.path.join(root, "config")]
+                dirs[:] = [d for d in dirs if d == "modules"]
+    for path in [os.path.join(top, ".claude"), os.path.join(top, ".git"), *frozen]:
+        if os.path.islink(path):
+            fail(64, f"{path} is a symlink; a jail could repoint it, so refusing to run here")
+    stubs: dict[str, str | None] = {}
+    for path in frozen:
+        first = Path(path)
+        while not os.path.lexists(first.parent):
+            first = first.parent
+        if not os.path.lexists(first):
+            if os.access(first.parent, os.W_OK):
+                stubs[str(first)] = content.get(path) if first == Path(path) else None
+        elif Stubs.marked(str(first)):
+            stubs[str(first)] = None
+    return Repo(top, git, [p for p in frozen if os.path.exists(p) and p not in stubs], stubs)
+
+
+class Stubs:
+    """Mount points for absent protected paths, the way Claude's sandbox makes
+    them: created before the jail, removed after it. Marked and share-locked,
+    so concurrent jails keep a stub until the last one using it is done."""
+
+    def __init__(self, wanted: dict[str, str | None]) -> None:
+        self.held: list[tuple[str, int]] = []
+        for path, content in wanted.items():
+            fd = self.make(path, content)
+            if fd is None:
+                fd = self.adopt(path)
+            if fd is None:
+                fail(3, f"cannot place a guard at {path}")
+            fcntl.flock(fd, fcntl.LOCK_SH)
+            self.held.append((path, fd))
+
+    @staticmethod
+    def make(path: str, content: str | None) -> int | None:
+        try:
+            if content is None:
+                os.mkdir(path, 0o755)
+                fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             else:
-                # --ro-bind would mount it nodev: reads fail EACCES instead of empty.
-                args += ["--dev-bind", "/dev/null", path]
-        for name in self.deny_env:
-            args += ["--unsetenv", name]
-        return args + ["--setenv", "SANDBOX_RUNTIME", "1", "--chdir", cwd]
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+                os.write(fd, content.encode())
+            os.setxattr(fd, STUB_MARK, b"1")
+            return fd
+        except FileExistsError:
+            return None
+        except OSError as e:
+            fail(3, f"cannot place a guard at {path}: {e}")
+
+    @staticmethod
+    def marked(path: str) -> bool:
+        try:
+            os.getxattr(path, STUB_MARK, follow_symlinks=False)
+            return True
+        except OSError:
+            return False
+
+    @staticmethod
+    def adopt(path: str) -> int | None:
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            return None
+        try:
+            os.getxattr(fd, STUB_MARK)
+            return fd
+        except OSError:
+            os.close(fd)
+            return None
+
+    def remove(self) -> None:
+        for path, fd in self.held:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if os.path.isdir(path):
+                    os.rmdir(path)
+                elif os.fstat(fd).st_size <= 1:
+                    os.unlink(path)
+            except OSError:
+                pass
+            os.close(fd)
 
 
-def detach(slug: str, jail: list[str], command: list[str], cwd: str, user: str,
-           here: Path) -> None:
+def host_addresses() -> list[str]:
+    lines = Path("/proc/net/fib_trie").read_text().splitlines()
+    return sorted({lines[i - 1].split()[-1] for i, line in enumerate(lines)
+                   if "/32 host LOCAL" in line})
+
+
+def resolvers() -> list[str]:
+    found = re.findall(r"^\s*nameserver\s+(\d+\.\d+\.\d+\.\d+)\s*$",
+                       Path("/etc/resolv.conf").read_text(), re.M)
+    return sorted(set(found))
+
+
+def egress_rules() -> str:
+    lines = ["*filter", ":OUTPUT ACCEPT [0:0]", "-A OUTPUT -o lo -j ACCEPT"]
+    lines += [f"-A OUTPUT -d {ns}/32 -p {proto} --dport 53 -j ACCEPT"
+              for ns in resolvers() for proto in ("udp", "tcp")]
+    lines += [f"-A OUTPUT -d {net} -j REJECT --reject-with icmp-admin-prohibited"
+              for net in (*NON_GLOBAL, *(f"{a}/32" for a in host_addresses()))]
+    return "\n".join([*lines, "COMMIT", ""])
+
+
+def shared_tmp() -> str:
+    path = f"/tmp/confined-{os.getuid()}"
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    except OSError as e:
+        fail(3, f"cannot create {path}: {e}")
+    info = os.lstat(path)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        fail(3, f"{path} is not a directory of this user")
+    return path
+
+
+def jail(profile: Profile, repo: Repo, cwd: str, home: str, tmp: str) -> list[str]:
+    creds = os.path.join(home, ".claude/.credentials.json")
+    reads = [os.path.join(home, rel) for rel in HOME_READ if os.path.exists(os.path.join(home, rel))]
+    writes = [tmp, repo.top, *repo.git]
+    bound = [*reads, *writes, creds]
+
+    def visible(path: str) -> bool:
+        return (not under(path, home) and not under(path, "/tmp")) or \
+            any(under(path, b) or under(b, path) for b in bound)
+
+    # Claude's sandbox leaves the credentials file readable despite its Read
+    # rule; agent e2e needs it, writable for token refresh. The sandbox block
+    # still wins.
+    real_creds = os.path.realpath(creds)
+    hide = [h for h in profile.hidden(visible) if h != real_creds]
+    for path in hide:
+        if any(under(w, path) for w in writes):
+            fail(64, f"{path} is hidden by the sandbox profile and holds the working repository")
+    blocked = existing([b for b in profile.blocked if not GLOB_CHARS.search(b)])
+    if not os.path.isfile(creds) or any(under(real_creds, h) for h in hide + blocked):
+        creds = None
+    args =["--unshare-user", "--uid", str(os.getuid()), "--gid", str(os.getgid()),
+            "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+            "--unshare-pid", "--unshare-ipc", "--new-session", "--die-with-parent",
+            "--tmpfs", home, "--tmpfs", "/tmp"]
+    if os.path.exists("/dev/net/tun"):
+        args += ["--dev-bind", "/dev/net/tun", "/dev/net/tun"]
+    for path in reads:
+        args += ["--ro-bind", path, path]
+    pins = [p for p in [os.path.join(repo.top, ".claude")] if os.path.isdir(p)]
+    # Outer first: a later bind of an ancestor would cover a pin inside it.
+    for path in sorted({*writes, *pins, *([creds] if creds else [])}, key=lambda p: p.count("/")):
+        args += ["--bind", path, path]
+    for path in [*(d for d in profile.deny_write if any(under(d, w) for w in writes)),
+                 *repo.frozen, *repo.stubs]:
+        args += ["--ro-bind", path, path]
+    for path in hide:
+        if os.path.isdir(path):
+            args += ["--tmpfs", path, "--remount-ro", path]
+        else:
+            # --ro-bind would mount it nodev: reads fail EACCES instead of empty.
+            args += ["--dev-bind", "/dev/null", path]
+    for name in profile.deny_env:
+        args += ["--unsetenv", name]
+    return args + ["--setenv", "SANDBOX_RUNTIME", "1", "--setenv", "TMPDIR", tmp, "--chdir", cwd]
+
+
+def die_with_parent() -> None:
+    ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG
+
+
+class Network:
+    """A user and network namespace whose root is the caller: the egress rules
+    and pasta go in from outside, then bwrap maps the caller's uid inside it.
+    Letting pasta create the namespace instead fails under no_new_privs (any
+    enclosing bwrap): its command lacks the CAP_SETFCAP that mapping a
+    namespace root needs."""
+
+    def __init__(self, tools: dict[str, str]) -> None:
+        ready_r, ready_w = os.pipe()
+        self.hold_r, self.hold = os.pipe()
+        self.pid = os.fork()
+        if self.pid == 0:
+            try:
+                os.close(self.hold)
+                os.close(ready_r)
+                die_with_parent()
+                os.unshare(os.CLONE_NEWUSER | os.CLONE_NEWNET)
+                os.write(ready_w, b"x")
+                os.read(self.hold_r, 1)
+            finally:
+                os._exit(0)
+        os.close(ready_w)
+        os.close(self.hold_r)
+        try:
+            if os.read(ready_r, 1) != b"x":
+                fail(3, "cannot create a network namespace")
+            for name, text in (("uid_map", f"0 {os.getuid()} 1"), ("setgroups", "deny"),
+                               ("gid_map", f"0 {os.getgid()} 1")):
+                Path(f"/proc/{self.pid}/{name}").write_text(text + "\n")
+            rules = subprocess.run([tools["iptables-restore"]], input=egress_rules(), text=True,
+                                   capture_output=True, preexec_fn=self.enter)
+            if rules.returncode != 0:
+                fail(3, f"cannot load the egress rules: {rules.stderr.strip()}")
+            ns = f"/proc/{self.pid}/ns"
+            link = subprocess.run([tools["pasta"], *PASTA, "--userns", f"{ns}/user",
+                                   "--netns", f"{ns}/net"], capture_output=True, text=True)
+            if link.returncode != 0:
+                fail(3, f"pasta cannot connect the jail: {link.stderr.strip()}")
+        except BaseException:
+            self.close()
+            raise
+
+    def enter(self) -> None:
+        for kind, flag in (("user", os.CLONE_NEWUSER), ("net", os.CLONE_NEWNET)):
+            fd = os.open(f"/proc/{self.pid}/ns/{kind}", os.O_RDONLY)
+            os.setns(fd, flag)
+            os.close(fd)
+
+    def close(self) -> None:
+        os.close(self.hold)
+        os.waitpid(self.pid, 0)
+
+
+def supervise(argv: list[str], net: Network) -> int:
+    child = subprocess.Popen(argv, preexec_fn=lambda: (die_with_parent(), net.enter()))
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda signum, _frame: child.send_signal(signum))
+    status = child.wait()
+    return 128 - status if status < 0 else status
+
+
+def detach(args: Args, cwd: str, user: str, here: Path, tmp: str) -> None:
     systemd_run, bash = find("systemd-run", user), find("bash", user)
     recorder = here / "record-user-unit-failure"
-    if not systemd_run or not bash or not os.access(recorder, os.X_OK):
-        fail(3, "systemd-run, bash or record-user-unit-failure is missing")
-    log = f"/tmp/{slug}.log"
+    if not os.access(recorder, os.X_OK):
+        fail(3, f"{recorder} is missing")
+    log = f"{tmp}/{args.slug}.log"
     runtime = f"/run/user/{os.getuid()}"
-    # The log is written inside the jail: a link planted at that /tmp path must
-    # not get an unconfined writer.
     proc = subprocess.run(
-        [systemd_run, "--user", "--quiet", f"--unit={slug}", f"--working-directory={cwd}",
-         "-p", "RemainAfterExit=yes", "-p", f"ExecStopPost={recorder} {slug} {log}",
-         "--", *jail, "--", bash, "-c", JOB_WRAPPER, "confined-job", log, *command],
+        [systemd_run, "--user", "--quiet", f"--unit={args.slug}", f"--working-directory={cwd}",
+         "-p", "RemainAfterExit=yes", "-p", f"RuntimeMaxSec={args.max_runtime or '4h'}",
+         "-p", f"ExecStopPost={recorder} {args.slug} {log}",
+         "--", sys.executable, "-I", str(here / "confined"), "--chdir", cwd, "--",
+         bash, "-c", JOB_WRAPPER, "confined-job", log, *args.command],
         env={"XDG_RUNTIME_DIR": runtime, "DBUS_SESSION_BUS_ADDRESS": f"unix:path={runtime}/bus"},
         stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False)
+    if "already" in proc.stderr:
+        fail(64, f"{args.slug}.service already exists: systemd keeps a finished unit and its "
+                 "result, so a slug is single-use. Pick a new slug.")
     if proc.returncode != 0:
-        fail(3, f"could not start {slug}.service: {proc.stderr.strip()}")
-    print(f"confined: started {slug}.service log={log}")
+        fail(3, f"could not start {args.slug}.service: {proc.stderr.strip()}")
+    print(f"confined: started {args.slug}.service log={log}")
     sys.exit(0)
 
 
 def main() -> None:
-    slug, command = parse(sys.argv[1:])
+    args = parse(sys.argv[1:])
     entry = pwd.getpwuid(os.getuid())
     here = Path(__file__).resolve().parent
     profile = Profile(here.parent / "settings.json", entry.pw_dir)
     try:
-        cwd = os.path.realpath(os.getcwd())
+        cwd = os.path.realpath(args.chdir or os.getcwd(), strict=True)
     except OSError as e:
         fail(64, f"cannot resolve the working directory: {e}")
-    if not profile.writable(cwd):
-        fail(64, f"{cwd} is not under a writable root of the sandbox profile")
-    bwrap, pasta = find("bwrap", entry.pw_name), find("pasta", entry.pw_name)
-    if not bwrap or not pasta:
-        fail(3, "bwrap or pasta not found; refusing to run without a jail and its own network")
-    jail = [pasta, *PASTA, "--", bwrap, *profile.bwrap_args(cwd, foreground=slug is None)]
-    if slug:
-        detach(slug, jail, command, cwd, entry.pw_name, here)
-    os.execv(pasta, [*jail, "--", *command])
+    repo = repository(cwd, profile)
+    tmp = shared_tmp()
+    bwrap_args = jail(profile, repo, cwd, entry.pw_dir, tmp)
+    tools = {name: find(name, entry.pw_name) for name in ("pasta", "bwrap", "iptables-restore")}
+    if args.slug:
+        detach(args, cwd, entry.pw_name, here, tmp)
+    stubs = Stubs(repo.stubs)
+    try:
+        net = Network(tools)
+        try:
+            status = supervise([tools["bwrap"], *bwrap_args, "--", *args.command], net)
+        finally:
+            net.close()
+    finally:
+        stubs.remove()
+    sys.exit(status)
 
 
 if __name__ == "__main__":

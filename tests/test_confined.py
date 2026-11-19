@@ -1,21 +1,23 @@
 """`confined` runs outside the Claude Code sandbox without a prompt, so its own
-jail is the only thing between agent-written code and the host. Real bwrap,
-no mocks. Every jailed script ends by printing RAN: a jail that never started
-prints nothing, and "the secret is not in the output" would pass on that.
+jail is the only thing between agent-written code and the host. Real bwrap and
+pasta, no mocks. Every jailed script ends by printing RAN: a jail that never
+started prints nothing, and "the secret is not in the output" would pass on that.
 
 The script reads the settings.json beside its own config tree, so each test
-copies it into a scratch tree with a scratch settings.json."""
+copies it into a scratch tree with a scratch settings.json. The tree lives in
+/var/tmp: visible inside the jail (a nested call needs it), outside home and
+/tmp, which the jail replaces."""
 from __future__ import annotations
 
-import functools
 import hashlib
 import json
-import socket
 import os
 import pwd
 import re
 import shutil
+import socket
 import subprocess
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -25,43 +27,25 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO / "runtime" / "scripts"
 REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
+SHARED_TMP = Path(f"/tmp/confined-{os.getuid()}")
 BWRAP = shutil.which("bwrap")
+PASTA = shutil.which("pasta")
 RAN = "confined-ran-marker"
 CANARY = "confined-canary-not-a-secret"
+GIT_ID = ["-c", "user.name=t", "-c", "user.email=t@example.invalid"]
 
 pytestmark = pytest.mark.skipif(BWRAP is None, reason="bubblewrap is not installed here")
-SEARCH_LINE = re.compile(r"^SEARCH = \(", re.M)
-
-
-@functools.cache
-def passt_bin() -> str | None:
-    try:
-        out = subprocess.run(["nix", "build", "--no-link", "--print-out-paths", "nixpkgs#passt"],
-                             capture_output=True, text=True, timeout=900)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    lines = out.stdout.split()
-    if out.returncode != 0 or not lines or not os.access(f"{lines[-1]}/bin/pasta", os.X_OK):
-        return None
-    return f"{lines[-1]}/bin"
-
-
-needs_pasta = pytest.mark.skipif(
-    passt_bin() is None,
-    reason="`nix build nixpkgs#passt` is unavailable: confined refuses to run without pasta")
+needs_pasta = pytest.mark.skipif(PASTA is None, reason="pasta is not installed here")
 
 
 def make_tree(config: Path, settings: dict | None, search: tuple[str, ...] | None = None) -> Path:
-    """The one substitution: pasta is not installed on the host yet, so the
-    copy searches the passt store path first (or `search` replaces the tuple)."""
     (config / "scripts").mkdir(parents=True)
     shutil.copy2(SCRIPTS / "record-user-unit-failure", config / "scripts")
     source = (SCRIPTS / "confined").read_text()
-    assert len(SEARCH_LINE.findall(source)) == 1
     if search is not None:
-        source = re.sub(r"^SEARCH = \(.*\)$", f"SEARCH = {search!r}", source, flags=re.M)
-    elif passt_bin():
-        source = SEARCH_LINE.sub(f'SEARCH = ("{passt_bin()}", ', source)
+        source, n = re.subn(r"^SEARCH = \(.*?\)$", f"SEARCH = {search!r}", source,
+                            flags=re.M | re.S)
+        assert n == 1
     (config / "scripts" / "confined").write_text(source)
     (config / "scripts" / "confined").chmod(0o755)
     if settings is not None:
@@ -88,42 +72,64 @@ def jailed(script: Path, body: str, *, cwd: Path, env: dict[str, str] | None = N
     return proc
 
 
-@pytest.fixture
-def home_scratch():
-    """A directory in the real home, outside /tmp, so a write there proves the
-    allowWrite bind and not the /tmp one."""
-    root = REAL_HOME / "worktrees" / f".confined-test-{uuid.uuid4().hex[:12]}"
-    root.mkdir(parents=True)
-    yield root
-    shutil.rmtree(root)
+def answers(proc: subprocess.CompletedProcess[str]) -> dict[str, str]:
+    return dict(line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line)
+
+
+def git_repo(path: Path) -> Path:
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    (path / "tracked.txt").write_text("v1\n")
+    subprocess.run(["git", "-C", str(path), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(path), *GIT_ID, "commit", "-qm", "init"], check=True)
+    return path
 
 
 @pytest.fixture
-def world(tmp_path: Path, home_scratch: Path):
-    rw, other = home_scratch / "rw", home_scratch / "other"
-    for d in (rw / "locked", other, tmp_path / "denied", tmp_path / "vault.d" / "1",
-              tmp_path / "cred", home_scratch / "sealed"):
+def scratch():
+    """One directory in the real home (under a real write root, so a write
+    there proves the bind) and one in /var/tmp (outside home and /tmp)."""
+    tag = uuid.uuid4().hex[:12]
+    home, var = REAL_HOME / "worktrees" / f".confined-test-{tag}", Path(f"/var/tmp/confined-test-{tag}")
+    home.mkdir(parents=True)
+    var.mkdir()
+    yield home, var
+    shutil.rmtree(home)
+    shutil.rmtree(var)
+
+
+@pytest.fixture
+def world(scratch):
+    home, var = scratch
+    rw = home / "rw"
+    rw.mkdir()
+    repo = git_repo(rw / "proj")
+    other = git_repo(rw / "other")
+    for d in (repo / "locked", other / ".claude", home / "outside", var / "denied",
+              var / "vault.d" / "1", var / "cred"):
         d.mkdir(parents=True)
+    (other / ".claude" / "settings.local.json").write_text("{}\n")
     plants = {
-        "denied_dir": tmp_path / "denied" / "secret",
-        "denied_file": tmp_path / "denied-file",
-        "glob_file": tmp_path / "sock-1",
-        "cred": tmp_path / "cred" / "token",
-        "vault": tmp_path / "vault.d" / "1" / "secret",
-        "home_rule": home_scratch / "sealed" / "secret",
-        "plain": tmp_path / "plain",
+        "denied_dir": var / "denied" / "secret",
+        "denied_file": var / "denied-file",
+        "glob_file": var / "sock-1",
+        "cred": var / "cred" / "token",
+        "vault": var / "vault.d" / "1" / "secret",
+        "read_glob": var / "rule-1",
+        "repo_env": repo / ".env.local",
+        "home_outside": home / "outside" / "secret",
+        "other_repo": other / "tracked.txt",
+        "plain": var / "plain",
     }
     for path in plants.values():
         path.write_text(CANARY + "\n")
-    (tmp_path / "vault").symlink_to(tmp_path / "vault.d")
-    home_rel = home_scratch.relative_to(REAL_HOME)
+    (var / "vault").symlink_to(var / "vault.d")
     settings = {
         "sandbox": {
             "filesystem": {
                 "allowWrite": [str(rw), "~/.confined-test-missing-root"],
-                "denyWrite": [str(rw / "locked")],
-                "denyRead": [str(tmp_path / "denied"), str(tmp_path / "denied-file"),
-                             str(tmp_path / "sock-*"), "/nonexistent/confined-test"],
+                "denyWrite": [str(repo / "locked")],
+                "denyRead": [str(var / "denied"), str(var / "denied-file"),
+                             str(var / "sock-*"), "/nonexistent/confined-test"],
             },
             "credentials": {
                 "files": [{"path": str(plants["cred"]), "mode": "mask"}],
@@ -131,47 +137,50 @@ def world(tmp_path: Path, home_scratch: Path):
             },
         },
         "permissions": {"deny": [
-            f"Read(/{tmp_path}/vault.d/**)",
-            f"Read(~/{home_rel}/sealed/**)",
-            f"Read(/{tmp_path}/pla*)",
+            f"Read(/{var}/vault.d/**)",
+            f"Read(/{var}/rule-*)",
+            f"Read(/{repo}/.env*)",
+            "Read(//**/.git/**)",
             "Read(~/.confined-test-missing-file)",
             "Read(~/.claude/.credentials.json)",
             "Bash(rm -rf *)",
         ]},
     }
-    script = make_tree(tmp_path / "tree", settings)
-    return {"script": script, "tmp": tmp_path, "rw": rw, "other": other,
-            "home": home_scratch, "plants": plants}
+    script = make_tree(var / "tree", settings)
+    return {"script": script, "settings": settings, "var": var, "home": home, "rw": rw,
+            "repo": repo, "other": other, "plants": plants}
 
 
 @needs_pasta
-def test_hides_denied_paths_credentials_and_read_rules(world) -> None:
+def test_hides_denied_paths_credentials_read_rules_and_home(world) -> None:
     p = world["plants"]
     proc = jailed(world["script"], "\n".join(
         f'printf "{name}=%s\\n" "$(cat {path} 2>/dev/null)"' for name, path in p.items()
-    ) + f'\nprintf "vault_ls=%s\\n" "$(ls -A {world["tmp"]}/vault.d)"'
-        f'\nprintf "link=%s\\n" "$(cat {world["tmp"]}/vault/1/secret 2>/dev/null)"',
-        cwd=world["rw"])
-    lines = dict(line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line)
+    ) + f'\nprintf "vault_ls=%s\\n" "$(ls -A {world["var"]}/vault.d)"'
+        f'\nprintf "link=%s\\n" "$(cat {world["var"]}/vault/1/secret 2>/dev/null)"',
+        cwd=world["repo"])
+    lines = answers(proc)
     assert lines.pop("plain") == CANARY, "control: an ordinary file must stay readable"
-    assert lines == {"denied_dir": "", "denied_file": "", "glob_file": "", "cred": "",
-                     "vault": "", "home_rule": "", "vault_ls": "", "link": ""}
+    assert set(lines.values()) == {""}, lines
 
 
 @needs_pasta
-def test_hides_denied_env_and_real_home_secrets(world) -> None:
-    ssh, codex = REAL_HOME / ".ssh", REAL_HOME / ".codex" / "auth.json"
+def test_home_keeps_only_what_the_jail_needs(world) -> None:
+    sensitive = [REAL_HOME / rel for rel in (".zsh_history", ".bash_history", ".ssh",
+                                             ".claude/projects", ".config/gh", "Repos")]
+    proc = jailed(world["script"], "\n".join(
+        f'[ -e "{path}" ] && echo "{path}=visible"' for path in sensitive),
+        cwd=world["repo"])
+    assert "=visible" not in proc.stdout, proc.stdout
+
+
+@needs_pasta
+def test_hides_denied_env(world) -> None:
     proc = jailed(world["script"],
-                  'printf "denied=%s kept=%s\\n" "${CONFINED_TEST_DENIED:-}" "${CONFINED_TEST_KEPT:-}"\n'
-                  f'printf "ssh=%s\\n" "$(ls -A {ssh} 2>/dev/null | wc -l)"\n'
-                  f'printf "codex=%s\\n" "$(wc -c <{codex} 2>/dev/null)"',
-                  cwd=world["rw"],
+                  'printf "denied=%s kept=%s\\n" "${CONFINED_TEST_DENIED:-}" "${CONFINED_TEST_KEPT:-}"',
+                  cwd=world["repo"],
                   env=base_env(CONFINED_TEST_DENIED=CANARY, CONFINED_TEST_KEPT="kept"))
     assert "denied= kept=kept" in proc.stdout
-    if ssh.is_dir():
-        assert "ssh=0" in proc.stdout
-    if codex.is_file():
-        assert "codex=0" in proc.stdout
 
 
 CLAUDE_CREDS = REAL_HOME / ".claude" / ".credentials.json"
@@ -183,7 +192,7 @@ CREDS_PROBE = (f'printf "size=%s\\n" "$(wc -c <{CLAUDE_CREDS} 2>/dev/null)"\n'
 @pytest.mark.skipif(not CLAUDE_CREDS.is_file(), reason="no Claude credentials file here")
 @needs_pasta
 def test_claude_credentials_stay_usable_despite_a_read_rule(world) -> None:
-    proc = jailed(world["script"], CREDS_PROBE, cwd=world["rw"])
+    proc = jailed(world["script"], CREDS_PROBE, cwd=world["repo"])
     assert "writable=yes" in proc.stdout
     assert re.search(r"^size=[1-9]", proc.stdout, re.M), proc.stdout
 
@@ -191,14 +200,14 @@ def test_claude_credentials_stay_usable_despite_a_read_rule(world) -> None:
 @pytest.mark.skipif(not CLAUDE_CREDS.is_file(), reason="no Claude credentials file here")
 @pytest.mark.parametrize("where", ["denyRead", "credentials"])
 @needs_pasta
-def test_claude_credentials_hidden_when_the_sandbox_block_hides_them(tmp_path: Path, where: str) -> None:
-    sandbox: dict = {"filesystem": {"allowWrite": [], "denyRead": []}, "credentials": {"files": []}}
+def test_claude_credentials_hidden_when_the_sandbox_block_hides_them(world, where: str) -> None:
+    sandbox = world["settings"]["sandbox"]
     if where == "denyRead":
         sandbox["filesystem"]["denyRead"].append("~/.claude")
     else:
         sandbox["credentials"]["files"].append({"path": "~/.claude/.credentials.json", "mode": "mask"})
-    script = make_tree(tmp_path / "tree", {"sandbox": sandbox})
-    proc = jailed(script, CREDS_PROBE, cwd=tmp_path)
+    script = make_tree(world["var"] / "tree2", world["settings"])
+    proc = jailed(script, CREDS_PROBE, cwd=world["repo"])
     assert re.search(r"^size=0?$", proc.stdout, re.M), proc.stdout
 
 
@@ -208,49 +217,81 @@ def test_has_its_own_pid_and_ipc_namespaces(world) -> None:
     proc = jailed(world["script"],
                   f'[ -e /proc/{os.getpid()} ] && echo sees-host-pid\n'
                   'echo "pid=$(readlink /proc/self/ns/pid) ipc=$(readlink /proc/self/ns/ipc)"',
-                  cwd=world["rw"])
+                  cwd=world["repo"])
     assert "sees-host-pid" not in proc.stdout
     assert ns["pid"] not in proc.stdout and ns["ipc"] not in proc.stdout
 
 
 @needs_pasta
-def test_writes_only_under_allow_write_and_tmp(world) -> None:
-    rw, tag = world["rw"], uuid.uuid4().hex[:8]
+def test_writes_reach_only_the_working_repo_and_the_shared_tmp(world) -> None:
+    rw, repo, tag = world["rw"], world["repo"], uuid.uuid4().hex[:8]
     targets = {
-        "allow": rw / "new",
-        "tmp": world["tmp"] / f"new-{tag}",
-        "deny_write": rw / "locked" / "new",
-        "home_elsewhere": world["other"] / "new",
+        "repo": repo / f"new-{tag}",
+        "shared_tmp": SHARED_TMP / f"new-{tag}",
+        "write_root": rw / f"new-{tag}",
+        "other_repo": world["other"] / "tracked.txt",
+        "other_settings": world["other"] / ".claude" / "settings.local.json",
+        "deny_write": repo / "locked" / "new",
+        "var_tmp": world["var"] / f"new-{tag}",
         "home_top": REAL_HOME / f".confined-test-{tag}",
+        "host_tmp": Path(f"/tmp/confined-test-{tag}"),
     }
     try:
-        proc = jailed(world["script"], "\n".join(
-            f'(: >{path}) 2>/dev/null && echo {name}=yes || echo {name}=no'
-            for name, path in targets.items()), cwd=rw)
+        jailed(world["script"], "\n".join(f'echo x >>{path} 2>/dev/null' for path in targets.values()),
+               cwd=repo)
+        landed = {name for name, path in targets.items()
+                  if path.exists() and "x" in path.read_text()}
     finally:
-        targets["home_top"].unlink(missing_ok=True)
-    assert {"allow=yes", "tmp=yes", "deny_write=no", "home_elsewhere=no",
-            "home_top=no"} <= set(proc.stdout.split())
+        for name in ("shared_tmp", "home_top", "host_tmp"):
+            targets[name].unlink(missing_ok=True)
+    assert landed == {"repo", "shared_tmp"}
 
 
-GIT_ID = ["-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+@needs_pasta
+def test_host_tmp_is_not_visible_even_entries_created_later(world) -> None:
+    tag = uuid.uuid4().hex[:8]
+    early, late = Path(f"/tmp/confined-early-{tag}"), Path(f"/tmp/confined-late-{tag}.sock")
+    early.write_text(CANARY)
+    listener = socket.socket(socket.AF_UNIX)
+    try:
+        proc = subprocess.Popen(
+            [str(world["script"]), "--", "bash", "-c",
+             f'sleep 3; ls -A /tmp; [ -e {early} ] && echo early=seen; [ -e {late} ] && echo late=seen; '
+             f'echo {RAN}'],
+            cwd=world["repo"], env=base_env(), stdout=subprocess.PIPE, text=True)
+        time.sleep(1)
+        listener.bind(str(late))
+        out, _ = proc.communicate(timeout=60)
+    finally:
+        listener.close()
+        early.unlink()
+        late.unlink(missing_ok=True)
+    assert out.rstrip().endswith(RAN), out
+    assert "=seen" not in out, out
+
+
+PROTECTED_ATTEMPTS = {
+    "settings": "echo x >>{checkout}/.claude/settings.local.json",
+    "settings_mv": "echo {{}} >{checkout}/.claude/new && mv {checkout}/.claude/new "
+                   "{checkout}/.claude/settings.local.json",
+    "hook": "echo x >>{common}/hooks/pre-commit",
+    "new_hook": ": >{common}/hooks/post-checkout",
+    "config": "echo x >>{common}/config",
+    "tracked": "echo v2 >>{checkout}/tracked.txt",
+}
 
 
 @pytest.fixture
-def repo(world):
-    main, wt = world["rw"] / "main", world["rw"] / "wt"
-    subprocess.run(["git", "init", "-q", str(main)], check=True)
+def worktrees(world):
+    main = world["repo"]
+    wt = world["rw"] / "wt"
     (main / "sub").mkdir()
-    (main / "sub" / "keep").write_text("")
-    (main / "tracked.txt").write_text("v1\n")
     (main / ".claude").mkdir()
     (main / ".claude" / "settings.local.json").write_text("{}\n")
-    hook = main / ".git" / "hooks" / "pre-commit"
-    hook.parent.mkdir(exist_ok=True)
-    hook.write_text("#!/bin/sh\n")
-    subprocess.run(["git", "-C", str(main), "add", "-A"], check=True)
-    subprocess.run(["git", "-C", str(main), *GIT_ID, "commit", "-qm", "init"], check=True)
+    (main / ".git" / "hooks").mkdir(exist_ok=True)
+    (main / ".git" / "hooks" / "pre-commit").write_text("#!/bin/sh\n")
     subprocess.run(["git", "-C", str(main), "worktree", "add", "-q", str(wt)], check=True)
+    (wt / "sub").mkdir()
     (wt / ".claude").mkdir(exist_ok=True)
     (wt / ".claude" / "settings.local.json").write_text("{}\n")
     return {"main": main, "wt": wt, "common": main / ".git"}
@@ -258,33 +299,22 @@ def repo(world):
 
 @pytest.mark.parametrize("where", ["main", "main/sub", "wt", "wt/sub"])
 @needs_pasta
-def test_protects_agent_and_git_config_in_the_cwd_repo(world, repo, where: str) -> None:
-    checkout = repo[where.split("/")[0]]
-    common = repo["common"]
-    attempts = {
-        "settings": f"echo x >>{checkout}/.claude/settings.local.json",
-        "settings_mv": f"echo {{}} >{checkout}/.claude/new && mv {checkout}/.claude/new "
-                       f"{checkout}/.claude/settings.local.json",
-        "hook": f"echo x >>{common}/hooks/pre-commit",
-        "new_hook": f": >{common}/hooks/post-checkout",
-        "config": f"echo x >>{common}/config",
-        "tracked": f"echo v2 >>{checkout}/tracked.txt",
-    }
+def test_protects_agent_and_git_config_in_the_cwd_repo(world, worktrees, where: str) -> None:
+    checkout = worktrees[where.split("/")[0]]
     proc = jailed(world["script"], "\n".join(
-        f'( {cmd} ) 2>/dev/null && echo {name}=yes || echo {name}=no'
-        for name, cmd in attempts.items()
-    ) + f'\n[ -e {checkout}/.mcp.json ] && echo mcp=present || echo mcp=absent',
-        cwd=world["rw"] / where)
+        f'( {cmd.format(checkout=checkout, common=worktrees["common"])} ) 2>/dev/null '
+        f'&& echo {name}=yes || echo {name}=no'
+        for name, cmd in PROTECTED_ATTEMPTS.items()), cwd=checkout / where.partition("/")[2])
     assert {"settings=no", "settings_mv=no", "hook=no", "new_hook=no", "config=no",
-            "tracked=yes", "mcp=absent"} <= set(proc.stdout.split()), proc.stdout
+            "tracked=yes"} <= set(proc.stdout.split()), proc.stdout
 
 
 @pytest.mark.parametrize("where", ["main", "wt"])
 @needs_pasta
-def test_protected_directories_cannot_be_renamed_away(world, repo, where: str) -> None:
+def test_protected_directories_cannot_be_renamed_away(world, worktrees, where: str) -> None:
     """Moving a protected entry's parent aside and recreating it would undo
     the protection; so would repointing a worktree at another git dir."""
-    checkout, common = repo[where], repo["common"]
+    checkout, common = worktrees[where], worktrees["common"]
     targets = {"top": checkout, "claude": checkout / ".claude", "dotgit": checkout / ".git",
                "common": common}
     edits = {}
@@ -300,98 +330,244 @@ def test_protected_directories_cannot_be_renamed_away(world, repo, where: str) -
     assert "=moved" not in proc.stdout, proc.stdout
 
 
+ABSENT = [".mcp.json", ".claude/settings.json", ".claude/hooks/x", ".claude/skills/x/SKILL.md",
+          ".vscode/settings.json", ".git/commondir", ".git/config.worktree"]
+
+
+@pytest.mark.parametrize("claude_dir", [False, True])
 @needs_pasta
-def test_identity_is_the_real_user_and_git_works(world, repo) -> None:
+def test_absent_protected_paths_cannot_be_created_and_leave_no_stub(world, claude_dir: bool) -> None:
+    repo = world["repo"]
+    if claude_dir:
+        (repo / ".claude").mkdir()
+    before = sorted(p.relative_to(repo) for p in repo.rglob("*"))
+    proc = jailed(world["script"], "\n".join(
+        f'( mkdir -p "$(dirname {repo}/{rel})" && echo x >{repo}/{rel} ) 2>/dev/null '
+        f'&& echo "{rel}=created"'
+        for rel in ABSENT) + f'\n( echo x >{repo}/ordinary ) && echo ordinary=yes',
+        cwd=repo)
+    assert "=created" not in proc.stdout and "ordinary=yes" in proc.stdout, proc.stdout
+    (repo / "ordinary").unlink()
+    assert sorted(p.relative_to(repo) for p in repo.rglob("*")) == before
+
+
+@needs_pasta
+def test_a_guard_outlives_a_shorter_concurrent_jail(world) -> None:
+    repo = world["repo"]
+    long = subprocess.Popen(
+        [str(world["script"]), "--", "bash", "-c",
+         f'sleep 4; ( echo x >{repo}/.mcp.json ) 2>/dev/null && echo created; echo {RAN}'],
+        cwd=repo, env=base_env(), stdout=subprocess.PIPE, text=True)
+    time.sleep(1.5)
+    short = run(world["script"], "--", "true", cwd=repo)
+    out, _ = long.communicate(timeout=60)
+    assert short.returncode == 0, short.stderr
+    assert out.rstrip().endswith(RAN) and "created" not in out, out
+    assert not (repo / ".mcp.json").exists()
+
+
+@pytest.mark.parametrize("entry", [".claude", ".claude/settings.json", ".mcp.json"])
+@needs_pasta
+def test_refuses_a_repo_whose_protected_entry_is_a_symlink(world, entry: str) -> None:
+    repo, marker = world["repo"], world["var"] / "should-not-exist"
+    target = world["home"] / "outside" / "target"
+    target.mkdir()
+    (repo / entry).parent.mkdir(parents=True, exist_ok=True)
+    (repo / entry).symlink_to(target)
+    proc = run(world["script"], "--", "touch", str(marker), cwd=repo)
+    assert proc.returncode == 64, proc.stderr
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("case", ["write_root", "planted_git_above_root", "outside_roots",
+                                  "deny_write", "tmp_itself", "gitdir_outside_roots"])
+@needs_pasta
+def test_refuses_a_working_directory_it_cannot_confine_to_one_repo(world, case: str) -> None:
+    rw, home = world["rw"], world["home"]
+    marker = world["var"] / "should-not-exist"
+    if case == "write_root":
+        cwd = rw
+    elif case == "planted_git_above_root":
+        (home / ".git").mkdir()
+        (rw / "plain").mkdir()
+        cwd = rw / "plain"
+    elif case == "outside_roots":
+        cwd = git_repo(home / "outside" / "repo")
+    elif case == "deny_write":
+        cwd = world["repo"] / "locked"
+    elif case == "tmp_itself":
+        cwd = Path("/tmp")
+    else:
+        stray = git_repo(home / "outside" / "stray")
+        (rw / "pointer").mkdir()
+        (rw / "pointer" / ".git").write_text(f"gitdir: {stray}/.git\n")
+        cwd = rw / "pointer"
+    proc = run(world["script"], "--", "touch", str(marker), cwd=cwd)
+    assert proc.returncode == 64, proc.stderr
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda s: s["sandbox"]["filesystem"]["allowWrite"].append("relative/dir"),
+    lambda s: s["sandbox"]["filesystem"]["denyRead"].append("relative"),
+    lambda s: s["sandbox"]["filesystem"]["denyWrite"].append("relative"),
+    lambda s: s["sandbox"]["credentials"]["files"].append({"path": "rel/token", "mode": "mask"}),
+    lambda s: s["permissions"]["deny"].append("Read(relative/**)"),
+    lambda s: s["permissions"]["deny"].append("Read(**/secrets)"),
+], ids=["allowWrite", "denyRead", "denyWrite", "credentials", "read_relative", "read_relative_glob"])
+@needs_pasta
+def test_an_entry_it_cannot_honour_fails_closed(world, mutate) -> None:
+    mutate(world["settings"])
+    script = make_tree(world["var"] / "tree2", world["settings"])
+    marker = world["var"] / "should-not-exist"
+    proc = run(script, "--", "touch", str(marker), cwd=world["repo"])
+    assert proc.returncode == 3, proc.stderr
+    assert not marker.exists()
+
+
+@needs_pasta
+def test_identity_is_the_real_user_and_git_sees_no_guards(world) -> None:
+    world["plants"]["repo_env"].unlink()
     proc = jailed(world["script"],
                   'echo "uid=$(id -u) gid=$(id -g)"\n'
-                  f'out=$(git -C {repo["main"]} status --porcelain 2>&1); echo "git=$?[$out]"',
-                  cwd=repo["main"])
+                  f'out=$(git -C {world["repo"]} status --porcelain 2>&1); echo "git=$?[$out]"',
+                  cwd=world["repo"])
     assert f"uid={os.getuid()} gid={os.getgid()}" in proc.stdout
     assert "git=0[]" in proc.stdout, proc.stdout
 
 
+@needs_pasta
+def test_chdir_targets_another_repo(world, tmp_path: Path) -> None:
+    proc = run(world["script"], "--chdir", str(world["repo"]), "--", "bash", "-c",
+               "pwd; echo x >chdir-proof", cwd=tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.splitlines()[0] == str(world["repo"])
+    assert (world["repo"] / "chdir-proof").read_text() == "x\n"
+
+
+def host_ipv4_addresses() -> set[str]:
+    lines = Path("/proc/net/fib_trie").read_text().splitlines()
+    return {lines[i - 1].split()[-1] for i, line in enumerate(lines)
+            if "/32 host LOCAL" in line} - {"127.0.0.1"}
+
+
+def default_gateway() -> str | None:
+    for line in Path("/proc/net/route").read_text().splitlines()[1:]:
+        f = line.split()
+        if f[1] == "00000000":
+            return socket.inet_ntoa(int(f[2], 16).to_bytes(4, "little"))
+    return None
+
+
 NET_PROBE = """
-import socket, struct, sys
-port = int(sys.argv[1])
-def reach(host, p):
+import socket, sys
+port, hosts = int(sys.argv[1]), sys.argv[2:]
+for host in hosts:
     try:
-        socket.create_connection((host, p), timeout=5).close()
-        return "reachable"
-    except OSError:
-        return "unreachable"
-gw = None
-for line in open("/proc/net/route").readlines()[1:]:
-    f = line.split()
-    if f[1] == "00000000":
-        gw = socket.inet_ntoa(struct.pack("<L", int(f[2], 16)))
-print("abstract=%d" % sum(" @" in l for l in open("/proc/net/unix")))
-print("loopback=" + reach("127.0.0.1", port))
-print("gateway=" + (reach(gw, port) if gw else "none"))
-print("outbound=" + reach("github.com", 443))
+        socket.create_connection((host, port), timeout=4).close()
+        print(f"{host}=reachable")
+    except ConnectionRefusedError:
+        print(f"{host}=refused")
+    except OSError as e:
+        print(f"{host}=blocked:{e.errno}")
+try:
+    socket.create_connection(("github.com", 443), timeout=10).close()
+    print("outbound=reachable")
+except OSError as e:
+    print(f"outbound=blocked:{e!r}")
 """
 
 
-@pytest.fixture
-def net_probe(world):
-    if not any(" @" in line for line in open("/proc/net/unix")):
-        pytest.skip("the host has no abstract sockets to hide")
-    with socket.socket() as srv:
-        srv.bind(("127.0.0.1", 0))
-        srv.listen(8)
-        port = srv.getsockname()[1]
-        socket.create_connection(("127.0.0.1", port), timeout=3).close()
-        proc = jailed(world["script"], f"python3 -c '{NET_PROBE}' {port}", cwd=world["rw"])
-    return dict(line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line)
+@needs_pasta
+def test_host_and_private_networks_are_out_of_reach_but_the_internet_is_not(world) -> None:
+    accepted: list[tuple] = []
+    srv = socket.socket()
+    srv.bind(("0.0.0.0", 0))
+    srv.listen(16)
+    srv.settimeout(0.5)
+    port = srv.getsockname()[1]
+    stop = threading.Event()
+
+    def serve() -> None:
+        while not stop.is_set():
+            try:
+                conn, peer = srv.accept()
+            except OSError:
+                continue
+            accepted.append(peer)
+            conn.close()
+
+    thread = threading.Thread(target=serve)
+    thread.start()
+    gateway = default_gateway()
+    hosts = sorted(host_ipv4_addresses()) + ["127.0.0.1"] + ([gateway] if gateway else [])
+    try:
+        proc = jailed(world["script"],
+                      'iptables -F OUTPUT 2>/dev/null; ip route flush table main 2>/dev/null\n'
+                      f"python3 -c '{NET_PROBE}' {port} {' '.join(hosts)}", cwd=world["repo"])
+    finally:
+        stop.set()
+        thread.join()
+        srv.close()
+    out = answers(proc)
+    assert accepted == [], f"the host listener accepted {accepted} from the jail: {out}"
+    if gateway:
+        assert out[gateway].startswith("blocked"), out
+    assert out["outbound"] == "reachable", out
+    assert sum(" @" in line for line in proc.stdout.splitlines()) == 0
 
 
 @needs_pasta
-def test_host_loopback_and_abstract_sockets_are_out_of_reach(net_probe) -> None:
-    assert (net_probe["abstract"], net_probe["loopback"], net_probe["gateway"]) == \
-        ("0", "unreachable", "unreachable"), net_probe
-
-
-@needs_pasta
-def test_outbound_network_still_works(net_probe) -> None:
-    assert net_probe["outbound"] == "reachable", net_probe
+def test_abstract_sockets_are_out_of_reach(world) -> None:
+    proc = jailed(world["script"], 'echo "abstract=$(grep -c " @" /proc/net/unix)"', cwd=world["repo"])
+    assert answers(proc)["abstract"] == "0"
 
 
 @needs_pasta
 def test_nested_bwrap_works(world) -> None:
-    proc = run(world["script"], "--", BWRAP, "--ro-bind", "/", "/", "true", cwd=world["rw"])
+    proc = run(world["script"], "--", BWRAP, "--ro-bind", "/", "/", "true", cwd=world["repo"])
     assert proc.returncode == 0, proc.stderr
+
+
+@needs_pasta
+def test_confined_runs_inside_confined(world) -> None:
+    proc = run(world["script"], "--", str(world["script"]), "--", "sh", "-c",
+               "echo inner=$SANDBOX_RUNTIME", cwd=world["repo"])
+    assert (proc.returncode, proc.stdout) == (0, "inner=1\n"), proc.stderr
 
 
 @pytest.mark.parametrize("status", [0, 7])
 @needs_pasta
 def test_status_stdout_and_sandbox_runtime_pass_through(world, status: int) -> None:
     proc = run(world["script"], "--", "sh", "-c",
-               f'echo "out SANDBOX_RUNTIME=$SANDBOX_RUNTIME"; exit {status}', cwd=world["rw"])
+               f'echo "out SANDBOX_RUNTIME=$SANDBOX_RUNTIME"; exit {status}', cwd=world["repo"])
     assert (proc.returncode, proc.stdout) == (status, "out SANDBOX_RUNTIME=1\n")
 
 
 @needs_pasta
-def test_path_does_not_choose_bwrap_or_pasta(world, tmp_path: Path) -> None:
-    fake = tmp_path / "fakebin"
+def test_path_does_not_choose_the_jail_tools(world) -> None:
+    fake = world["var"] / "fakebin"
     fake.mkdir()
-    hit = tmp_path / "fake-ran"
-    for name in ("bwrap", "pasta"):
+    hit = world["var"] / "fake-ran"
+    for name in ("bwrap", "pasta", "iptables-restore"):
         (fake / name).write_text(f"#!/bin/sh\ntouch {hit}\nexit 0\n")
         (fake / name).chmod(0o755)
     env = base_env(PATH=f"{fake}:{os.environ['PATH']}")
-    proc = run(world["script"], "--", "sh", "-c", "echo $SANDBOX_RUNTIME", cwd=world["rw"], env=env)
+    proc = run(world["script"], "--", "sh", "-c", "echo $SANDBOX_RUNTIME", cwd=world["repo"], env=env)
     assert proc.stdout == "1\n" and not hit.exists()
 
 
-@pytest.mark.parametrize("missing", ["pasta", "bwrap"])
-def test_refuses_without_pasta_or_bwrap(tmp_path: Path, missing: str) -> None:
-    only = tmp_path / "only"
+@pytest.mark.parametrize("missing", ["pasta", "bwrap", "iptables-restore"])
+def test_refuses_without_a_jail_tool(world, missing: str) -> None:
+    only = world["var"] / "only"
     only.mkdir()
-    present = {"pasta": BWRAP, "bwrap": f"{passt_bin()}/pasta" if passt_bin() else None}[missing]
-    if present:
-        (only / Path(present).name).symlink_to(present)
-    script = make_tree(tmp_path / "tree", {"sandbox": {}}, search=(str(only),))
-    marker = tmp_path / "should-not-exist"
-    proc = run(script, "--", "touch", str(marker), cwd=tmp_path)
+    for name in {"pasta", "bwrap", "iptables-restore", "bash"} - {missing}:
+        found = shutil.which(name)
+        if found:
+            (only / name).symlink_to(found)
+    script = make_tree(world["var"] / "tree2", world["settings"], search=(str(only),))
+    marker = world["var"] / "should-not-exist"
+    proc = run(script, "--", "touch", str(marker), cwd=world["repo"])
     assert proc.returncode == 3, proc.stderr
     assert not marker.exists()
 
@@ -407,28 +583,24 @@ def test_refuses_without_pasta_or_bwrap(tmp_path: Path, missing: str) -> None:
     ("--detach", "ok-slug", "touch", "{marker}"),
     ("--detach", "ok-slug", "--"),
     ("--detach",),
+    ("--chdir",),
+    ("--chdir", "--", "touch", "{marker}"),
+    ("--max-runtime", "1h", "--", "touch", "{marker}"),
+    ("--detach", "ok-slug", "--max-runtime", "forever", "--", "touch", "{marker}"),
+    ("--detach", "ok-slug", "--max-runtime", "0", "--", "touch", "{marker}"),
     (),
 ])
 def test_refuses_bad_usage(world, args: tuple[str, ...]) -> None:
-    marker = world["tmp"] / "should-not-exist"
-    proc = run(world["script"], *(a.format(marker=marker) for a in args), cwd=world["rw"])
-    assert proc.returncode == 64, proc.stderr
-    assert not marker.exists()
-
-
-@pytest.mark.parametrize("where", ["other", "locked", "home"])
-def test_refuses_cwd_outside_writable_roots(world, where: str) -> None:
-    cwd = {"other": world["other"], "locked": world["rw"] / "locked", "home": REAL_HOME}[where]
-    marker = world["tmp"] / "should-not-exist"
-    proc = run(world["script"], "--", "touch", str(marker), cwd=cwd)
+    marker = world["var"] / "should-not-exist"
+    proc = run(world["script"], *(a.format(marker=marker) for a in args), cwd=world["repo"])
     assert proc.returncode == 64, proc.stderr
     assert not marker.exists()
 
 
 @pytest.mark.parametrize("state", ["missing", "unreadable", "malformed", "no-sandbox-block"])
-def test_refuses_without_readable_settings(tmp_path: Path, state: str) -> None:
-    script = make_tree(tmp_path / "tree", None)
-    settings = tmp_path / "tree" / "settings.json"
+def test_refuses_without_readable_settings(world, state: str) -> None:
+    script = make_tree(world["var"] / "tree2", None)
+    settings = world["var"] / "tree2" / "settings.json"
     if state == "unreadable":
         settings.write_text("{}")
         settings.chmod(0)
@@ -436,8 +608,8 @@ def test_refuses_without_readable_settings(tmp_path: Path, state: str) -> None:
         settings.write_text("{not json")
     elif state == "no-sandbox-block":
         settings.write_text(json.dumps({"permissions": {"deny": []}}))
-    marker = tmp_path / "should-not-exist"
-    proc = run(script, "--", "touch", str(marker), cwd=tmp_path)
+    marker = world["var"] / "should-not-exist"
+    proc = run(script, "--", "touch", str(marker), cwd=world["repo"])
     assert proc.returncode == 3, proc.stderr
     assert not marker.exists()
 
@@ -450,75 +622,126 @@ def user_bus() -> bool:
         return False
 
 
-def unit_state(unit: str) -> str:
-    return subprocess.run(["systemctl", "--user", "show", "-p", "ActiveState", "-p", "SubState",
-                           "--value", unit], capture_output=True, text=True).stdout.split()
+def unit_props(unit: str) -> dict[str, str]:
+    out = subprocess.run(["systemctl", "--user", "show", "-p", "ActiveState", "-p", "SubState",
+                          "-p", "Result", unit], capture_output=True, text=True).stdout
+    return dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
 
 
-@pytest.mark.skipif(not user_bus(), reason="no systemd user bus in this environment")
+def settle(unit: str, timeout: float = 60) -> dict[str, str]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        props = unit_props(unit)
+        if props.get("ActiveState") in ("failed", "inactive") or props.get("SubState") == "exited":
+            return props
+        time.sleep(0.5)
+    return unit_props(unit)
+
+
+@pytest.fixture
+def detached():
+    slugs: list[str] = []
+
+    def new() -> tuple[str, Path]:
+        slug = f"confined-test-{uuid.uuid4().hex[:8]}"
+        slugs.append(slug)
+        return slug, SHARED_TMP / f"{slug}.log"
+
+    yield new
+    for slug in slugs:
+        subprocess.run(["systemctl", "--user", "stop", f"{slug}.service"], capture_output=True)
+        subprocess.run(["systemctl", "--user", "reset-failed", f"{slug}.service"], capture_output=True)
+        (SHARED_TMP / f"{slug}.log").unlink(missing_ok=True)
+        (REAL_HOME / ".local/state/claude-unit-failures" / f"{slug}.json").unlink(missing_ok=True)
+
+
+needs_bus = pytest.mark.skipif(not user_bus(), reason="no systemd user bus in this environment")
+
+
+@needs_bus
 @needs_pasta
-def test_detach_runs_jailed_and_outlives_the_launcher(world) -> None:
-    slug = f"confined-test-{uuid.uuid4().hex[:8]}"
-    unit, log = f"{slug}.service", Path(f"/tmp/{slug}.log")
-    marker = world["tmp"] / "detached"
+def test_detach_runs_jailed_and_outlives_the_launcher(world, detached) -> None:
+    slug, log = detached()
+    marker = world["repo"] / "detached"
     body = (f'sleep 3; (: >{world["other"]}/escape) 2>/dev/null && e=yes || e=no; '
-            f'printf "runtime=%s escape=%s cred=%s abstract=%s\\n" "$SANDBOX_RUNTIME" "$e" '
-            f'"$(cat {world["plants"]["cred"]} 2>/dev/null)" "$(grep -c " @" /proc/net/unix)" >{marker}')
-    try:
-        proc = run(world["script"], "--detach", slug, "--", "bash", "-c", body, cwd=world["rw"])
-        assert proc.returncode == 0, proc.stderr
-        assert unit in proc.stdout and str(log) in proc.stdout
-        assert not marker.exists(), "the launcher must return before the job ends"
-        deadline = time.monotonic() + 60
-        while unit_state(unit) != ["active", "exited"] and time.monotonic() < deadline:
-            time.sleep(0.5)
-        assert marker.read_text() == "runtime=1 escape=no cred= abstract=0\n"
-        assert log.read_text().splitlines()[-1] == "MARKER_OK"
-        lingering = subprocess.run(["pgrep", "-f", slug], capture_output=True, text=True).stdout
-        assert lingering == "", "pasta or the jail outlived the job"
-        waited = subprocess.run([str(SCRIPTS / "wait-for"), "unit", unit, "--user", "--timeout", "30"],
-                                capture_output=True, text=True, timeout=60)
-        assert waited.returncode == 0 and "result=success" in waited.stdout, waited.stdout
-    finally:
-        subprocess.run(["systemctl", "--user", "stop", unit], capture_output=True)
-        subprocess.run(["systemctl", "--user", "reset-failed", unit], capture_output=True)
-        log.unlink(missing_ok=True)
+            f'printf "runtime=%s escape=%s cred=%s pwd=%s\\n" "$SANDBOX_RUNTIME" "$e" '
+            f'"$(cat {world["plants"]["cred"]} 2>/dev/null)" "$PWD" >{marker}')
+    proc = run(world["script"], "--detach", slug, "--", "bash", "-c", body, cwd=world["repo"])
+    assert proc.returncode == 0, proc.stderr
+    assert f"{slug}.service" in proc.stdout and str(log) in proc.stdout
+    assert not marker.exists(), "the launcher must return before the job ends"
+    assert settle(f"{slug}.service")["Result"] == "success"
+    assert marker.read_text() == f"runtime=1 escape=no cred= pwd={world['repo']}\n"
+    assert log.read_text().splitlines()[-1] == "MARKER_OK"
+    assert subprocess.run(["pgrep", "-f", slug], capture_output=True, text=True).stdout == ""
+    waited = subprocess.run([str(SCRIPTS / "wait-for"), "unit", f"{slug}.service", "--user",
+                             "--timeout", "30"], capture_output=True, text=True, timeout=60)
+    assert waited.returncode == 0 and "result=success" in waited.stdout, waited.stdout
+
+
+@needs_bus
+@needs_pasta
+def test_detach_failure_is_the_unit_result(world, detached) -> None:
+    slug, log = detached()
+    proc = run(world["script"], "--detach", slug, "--", "sh", "-c", "exit 7", cwd=world["repo"])
+    assert proc.returncode == 0, proc.stderr
+    assert settle(f"{slug}.service")["Result"] == "exit-code"
+    assert log.read_text().splitlines()[-1] == "MARKER_FAILED rc=7"
+    waited = subprocess.run([str(SCRIPTS / "wait-for"), "unit", f"{slug}.service", "--user",
+                             "--timeout", "30"], capture_output=True, text=True, timeout=60)
+    assert waited.returncode == 1, waited.stdout
+
+
+@needs_bus
+@needs_pasta
+def test_detach_is_bounded_in_time(world, detached) -> None:
+    slug, _ = detached()
+    proc = run(world["script"], "--chdir", str(world["repo"]), "--detach", slug,
+               "--max-runtime", "3s", "--", "sleep", "300", cwd=world["var"])
+    assert proc.returncode == 0, proc.stderr
+    assert settle(f"{slug}.service", timeout=30)["Result"] == "timeout"
+    assert subprocess.run(["pgrep", "-f", slug], capture_output=True, text=True).stdout == ""
+
+
+@needs_bus
+@needs_pasta
+def test_detach_refuses_a_used_slug_and_says_so(world, detached) -> None:
+    slug, log = detached()
+    assert run(world["script"], "--detach", slug, "--", "true", cwd=world["repo"]).returncode == 0
+    settle(f"{slug}.service")
+    again = run(world["script"], "--detach", slug, "--", "touch", str(world["repo"] / "second"),
+                cwd=world["repo"])
+    assert again.returncode == 64, again.stderr
+    assert "already" in again.stderr and "new slug" in again.stderr, again.stderr
+    assert log.read_text().splitlines()[-1] == "MARKER_OK"
+    time.sleep(1)
+    assert not (world["repo"] / "second").exists()
 
 
 @needs_pasta
-def test_sandbox_canary_probe_parity(tmp_path: Path) -> None:
-    """The agent-e2e canary's own setup.sh and probe.sh, graded against its
-    check.sh's sandbox-on expectations, with two deliberate differences:
-    the gh token reads `hidden`, not `masked` (no proxy here swaps a masked
-    value back in), and the home plants are declared in the scratch settings
-    because confined takes ~ from passwd while setup.sh plants under $HOME."""
+def test_sandbox_canary_probe_still_runs_ordinary_work(tmp_path: Path) -> None:
+    """The agent-e2e canary's own setup.sh and probe.sh against the shipped
+    sandbox block: every plant reads hidden, ordinary work still runs."""
     canary_dir = REPO / "tests" / "agent-e2e" / "sandbox-canary"
     home, work, rundir = tmp_path / "home", tmp_path / "work", tmp_path / "run"
     for d in (home / ".claude", work, rundir):
         d.mkdir(parents=True)
     shutil.copy2(REPO / "runtime" / "settings.json", home / ".claude" / "settings.json")
     script = make_tree(home / ".claude", None)
-    env = base_env(HOME=str(home))
     setup = subprocess.run(["bash", str(canary_dir / "setup.sh"), str(work), str(rundir)],
-                           env=env, capture_output=True, text=True, timeout=60)
+                           env=base_env(HOME=str(home)), capture_output=True, text=True, timeout=60)
     assert setup.returncode == 0, setup.stderr
     runtime_plant = Path(f"/run/user/{os.getuid()}/e2e-sandbox-canary") / \
         hashlib.sha256(str(rundir).encode()).hexdigest()[:16]
+    settings = json.loads((home / ".claude" / "settings.json").read_text())
     try:
-        settings_path = home / ".claude" / "settings.json"
-        settings = json.loads(settings_path.read_text())
-        settings["sandbox"]["filesystem"]["denyRead"] += [str(home / ".ssh"),
-                                                          str(home / ".codex" / "auth.json")]
-        settings["sandbox"]["credentials"]["files"].append(
-            {"path": str(home / ".cache/gh-tokens/host/token"), "mode": "mask"})
-        settings_path.write_text(json.dumps(settings))
         probe = run(script, "--", "bash", "probe.sh", cwd=work,
                     env=base_env(HOME=str(home), KITTY_LISTEN_ON=settings["env"]["KITTY_LISTEN_ON"]),
                     timeout=300)
     finally:
         if runtime_plant.is_dir():
             shutil.rmtree(runtime_plant)
-    out = dict(line.split("=", 1) for line in probe.stdout.splitlines() if "=" in line)
+    out = answers(probe)
     assert out == {
         "ran": "yes", "ssh-key": "hidden", "codex-auth": "hidden", "gh-token": "hidden",
         "linked-deny": "hidden", "runtime-dir": "hidden", "denied-env": "hidden",
