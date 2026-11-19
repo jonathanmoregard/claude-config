@@ -9,24 +9,27 @@ WAIT_S="${WAIT_S:-600}"
 LOG="${LOG:-${TMPDIR:-/tmp}/flash-corne.log}"
 
 if [ -z "${IN_QMK_SHELL:-}" ]; then
+  self=$(readlink -f "$0")
   cd "$QMK_DIR" || { echo "❌ no qmk_firmware at $QMK_DIR"; exit 1; }
-  : >"$LOG"
+  { : >"$LOG"; } 2>/dev/null || { echo "❌ can't write log $LOG"; exit 1; }
   echo "⏳ Loading qmk + avrdude…"
-  # The inner run deletes this marker first thing; if it survives, nix itself failed.
-  STARTED_MARK=$(mktemp)
-  export IN_QMK_SHELL=1 LOG STARTED_MARK
-  # Upstream QMK dropped shell.nix; take qmk + avrdude from nixpkgs instead.
-  nix shell nixpkgs#qmk nixpkgs#avrdude -c bash "$0" 2>>"$LOG"
-  rc=$?
-  if [ -e "$STARTED_MARK" ]; then
-    rm -f "$STARTED_MARK"
-    echo "❌ couldn't load qmk + avrdude with nix, see $LOG"
-    exit 1
+  export IN_QMK_SHELL=1 LOG
+  # Relay the inner run's events. Any failure that didn't end on its own ❌
+  # (nix failing to load, an abort mid-script) still gets one, so stdout is
+  # never silent on failure. Upstream QMK dropped shell.nix; use nixpkgs.
+  last=""
+  while IFS= read -r line; do
+    case $line in
+      __rc=*) rc=${line#__rc=} ;;
+      *) echo "$line"; last=$line ;;
+    esac
+  done < <(nix shell nixpkgs#qmk nixpkgs#avrdude -c bash "$self" 2>>"$LOG"; echo "__rc=$?")
+  if [ "${rc:-1}" != 0 ] && [ "${last#❌}" = "$last" ]; then
+    echo "❌ flash stopped (exit ${rc:-?}), see $LOG"
   fi
-  exit "$rc"
+  exit "${rc:-1}"
 fi
 
-rm -f "${STARTED_MARK:-}"
 HEX=".build/crkbd_rev1_${KEYMAP}.hex"
 echo "⏳ Compiling $KEYMAP…"
 qmk compile -kb crkbd/rev1 -km "$KEYMAP" >>"$LOG" 2>&1 || { echo "❌ compile failed, see $LOG"; exit 1; }
