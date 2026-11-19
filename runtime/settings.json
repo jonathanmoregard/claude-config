@@ -958,7 +958,7 @@
     }
   },
   "sandbox": {
-    "enabled": false,
+    "enabled": true,
     "autoAllowBashIfSandboxed": true,
     "allowUnsandboxedCommands": true,
     "failIfUnavailable": true,
@@ -995,6 +995,7 @@
         "/home/jonathan/Repos",
         "/home/jonathan/worktrees",
         "/home/jonathan/.local/state/ai-router",
+      "/home/jonathan/.local/state/claude-tasks",
         "~/.cache/nix",
         "~/.cache/uv",
         "~/.cargo"
