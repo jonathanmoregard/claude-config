@@ -15,12 +15,12 @@ a script file or git hook or gh alias, an interpreter, a variable spelling
 such as `${g}h pr create`). The checks below are built against the paths an
 honest agent stumbles into, not against those.
 
-WHAT ENFORCES IT. Not this hook. For the ordinary PR-open spellings,
-settings.json `permissions.ask` prompts, and with `Bash` allowed it is that
-rule which stops an unreviewed open: this hook timing out, crashing,
-misparsing a command or not being installed all leave the prompt in place.
-This hook's privilege is to ANSWER the prompt "allow" -- once, for the exact
-call it judged -- and to deny with a remedy. Nothing depends on the deny.
+WHAT ENFORCES IT. This hook alone, by the user's choice. There is no
+`permissions.ask` rule behind it: globs over the whole command string
+prompted on commit messages, greps and paths that merely contained the
+words. `Bash` and the GitHub MCP tools are allowed, so a pass (no output)
+lets the call run, and a hook that times out, crashes, misparses or is not
+installed lets it run too. That fail-open is accepted.
 
 EVENTS (one script, dispatched on hook_event_name):
 
@@ -43,27 +43,15 @@ EVENTS (one script, dispatched on hook_event_name):
          most 20 lines since, and the whole tree at most 20 lines; OR
       4. the user waived it in this session with `skip-artl` (consumed by this
          one PR open, logged; see UserPromptSubmit).
-    Fail -> permissionDecision "deny" with every reason. Pass -> no output, and
-    a one-shot grant for the PermissionRequest below.
+    Fail -> permissionDecision "deny" with every reason. Pass -> no output.
     When the same Bash command runs `git commit` before the PR open, the gate
     (which runs first) also judges what that commit will add -- tracked edits,
     and untracked files too when the command runs `git add`.
-    Anything the hook cannot pin down is a deny and no grant: a `cd` it cannot
-    follow, a detached HEAD, a body it cannot read, another repository, two PR
-    opens in one command, an earlier step that could move the branch, an
-    unreachable remote, an environment in the open's own segment that points
-    gh elsewhere (GH_HOST, GIT_DIR, GIT_WORK_TREE). `env -C DIR` is followed.
-    A deny also revokes any grant an earlier pass of the same call minted.
-
-  PermissionRequest (same matcher)
-    Fires because permissions.ask matched. When the gate passed this exact
-    call, from this session's cwd, within GRANT_TTL_S, and the branch it
-    judged is still at the tip it judged, the request is answered "allow" and
-    the grant is spent. Otherwise no output -> the ordinary prompt. (So the
-    agent that committed after a passing check, and whose re-check was denied
-    or never rendered, meets the prompt, not the stale pass.)
-    Measured on Claude Code 2.1.322: a PreToolUse "allow" does NOT lift an ask
-    rule, so without this the user would be prompted for every PR.
+    Anything the hook cannot pin down is a deny: a `cd` it cannot follow, a
+    detached HEAD, a body it cannot read, another repository, two PR opens in
+    one command, an earlier step that could move the branch, an unreachable
+    remote, an environment in the open's own segment that points gh elsewhere
+    (GH_HOST, GIT_DIR, GIT_WORK_TREE). `env -C DIR` is followed.
 
   UserPromptSubmit
     The user arms a one-shot override for this session by sending a message
@@ -81,8 +69,8 @@ EVENTS (one script, dispatched on hook_event_name):
     surgery on an agent's channel. A user who wants to waive sends a clean
     message.
 
-Fail-open on unparseable input (exit 0, no output), per writing-hooks; the
-ask rule covers the gate itself failing. Test: tests/test_pr_open_gate.py
+Fail-open on unparseable input (exit 0, no output), per writing-hooks.
+Test: tests/test_pr_open_gate.py
 """
 from __future__ import annotations
 
@@ -132,22 +120,6 @@ def refuse(reasons: list[str], with_remedy: bool) -> None:
                                 "permissionDecisionReason": text + (REMEDY if with_remedy else "")}})
 
 
-def grant_path(session: str, payload: dict) -> Path:
-    """The one grant slot for this call: session, exact command, session cwd."""
-    key = g.call_key(payload.get("tool_name"), payload.get("tool_input"), payload.get("cwd"))
-    return g.state_dir() / "grants" / f"{session}.{key}.json"
-
-
-def revoke(path: Path) -> None:
-    """A deny takes back any grant an earlier pass of the same call minted:
-    the honest agent that kept committing after a passing check must not
-    find that pass still spendable."""
-    try:
-        path.unlink(missing_ok=True)
-    except OSError as exc:
-        print(f"pr-open-gate: could not revoke {path.name}: {exc}", file=sys.stderr)
-
-
 def override_path(session: str) -> Path:
     return g.state_dir() / "override" / f"{session}.json"
 
@@ -184,35 +156,6 @@ def take_override(session: str, now: float) -> bool:
     except OSError:
         return False
     return now - float(data.get("ts", 0)) <= g.OVERRIDE_TTL_S
-
-
-# --- PermissionRequest --------------------------------------------------------
-
-def on_permission(payload: dict) -> None:
-    session = g.safe_id(payload.get("session_id"))
-    tool, tool_input = payload.get("tool_name"), payload.get("tool_input")
-    call = g.pr_open_call(tool, tool_input) if session else None
-    if call is None or call.get("problem"):
-        return
-    path = grant_path(session, payload)
-    data = g.read_json(path)
-    if not data:
-        return
-    try:
-        path.unlink()
-    except OSError:
-        return
-    if time.time() - float(data.get("ts", 0)) > g.GRANT_TTL_S:
-        return
-    # Spent only on the state it judged: the same branch at the same tip. A
-    # commit since then (and no fresh PreToolUse verdict -- a hook timeout,
-    # say) leaves the prompt standing.
-    info, branch, tip, problem = locate(payload, call)
-    if problem or not info or (info["top"], branch, tip) != \
-            (data.get("top"), data.get("branch"), data.get("head")):
-        return
-    out({"hookSpecificOutput": {"hookEventName": "PermissionRequest",
-                                "decision": {"behavior": "allow"}}})
 
 
 # --- PreToolUse ---------------------------------------------------------------
@@ -299,41 +242,35 @@ def on_pretool(payload: dict) -> None:
     if call is None:
         return
     session = g.safe_id(payload.get("session_id")) or "unknown"
-    slot = grant_path(session, payload)
-
-    def deny(reasons: list[str], with_remedy: bool) -> None:
-        revoke(slot)
-        refuse(reasons, with_remedy)
-
     if call.get("problem"):
-        deny([call["problem"]], with_remedy=False)
+        refuse([call["problem"]], with_remedy=False)
         return
     now = time.time()
     info, branch, tip, problem = locate(payload, call)
     if problem:
-        deny([problem], with_remedy=False)
+        refuse([problem], with_remedy=False)
         return
     top = info["top"]
     base, problem = g.remote_base(top)
     if problem:
-        deny([problem], with_remedy=False)
+        refuse([problem], with_remedy=False)
         return
     mb = g.git(top, "merge-base", base, tip)
     changes = g.numstat(top, mb, tip) if mb else None
     if changes is None:
-        deny([f"no merge base with the remote default branch could be found in {top}"],
-             with_remedy=False)
+        refuse([f"no merge base with the remote default branch could be found in {top}"],
+               with_remedy=False)
         return
 
     smoke, smoke_log = g.smoke_problem(top, mb, tip, changes)
     if smoke:
-        deny([smoke], with_remedy=False)
+        refuse([smoke], with_remedy=False)
         return
 
     where = {"repo": info["repo"], "top": top, "branch": branch, "head": tip}
     pending, problem = pending_commit_view(call, info, branch, mb)
     if problem:
-        deny([problem], with_remedy=False)
+        refuse([problem], with_remedy=False)
         return
     views = [(tip, changes)] + pending
     exempt = None
@@ -354,18 +291,12 @@ def on_pretool(payload: dict) -> None:
                 break
         if problem:
             if not take_override(session, now):
-                deny([problem], with_remedy=True)
+                refuse([problem], with_remedy=True)
                 return
             log_exemption(payload, {"kind": "user-override", "why": problem, **where})
 
     if smoke_log:
         log_exemption(payload, {**smoke_log, **where})
-    stale = g.prune(g.state_dir() / "grants", g.GRANT_TTL_S, now)
-    if stale:
-        print(f"pr-open-gate: could not remove {stale} expired grant file(s); "
-              "they are already unspendable, but the state dir is not writable "
-              "as expected", file=sys.stderr)
-    g.write_json(slot, {"ts": now, **where})
 
 
 def main() -> int:
@@ -378,8 +309,6 @@ def main() -> int:
     event = payload.get("hook_event_name")
     if event == "PreToolUse":
         on_pretool(payload)
-    elif event == "PermissionRequest":
-        on_permission(payload)
     elif event == "UserPromptSubmit":
         on_prompt(payload)
     return 0
@@ -391,5 +320,5 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except BaseException:
-        # A crash renders no decision; the permissions.ask rule then prompts.
+        # A crash renders no decision, so the call runs: hook-only, by choice.
         sys.exit(0)
