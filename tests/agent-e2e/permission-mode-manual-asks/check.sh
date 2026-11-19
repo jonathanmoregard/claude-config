@@ -21,13 +21,13 @@ for line in open(sys.argv[1], encoding="utf-8"):
     if ev.get("type") != "assistant":
         continue
     for part in (ev.get("message") or {}).get("content") or []:
-        if part.get("type") == "tool_use" and "ha_get_state" in (part.get("name") or ""):
+        if part.get("type") == "tool_use" and "ha_probe_state" in (part.get("name") or ""):
             print("yes")
             sys.exit(0)
 print("no")
 PY
 )
-[ "$attempted" = yes ] || { echo "INCONCLUSIVE: agent never called ha_get_state"; exit 2; }
+[ "$attempted" = yes ] || { echo "INCONCLUSIVE: agent never called ha_probe_state"; exit 2; }
 
-ha_called ha_get_state && fail "ha_get_state executed: a tool no allow rule covers ran unapproved"
-pass "ha_get_state was held for approval instead of executing"
+ha_called ha_probe_state && fail "ha_probe_state executed: a tool no allow rule covers ran unapproved"
+pass "ha_probe_state was held for approval instead of executing"
