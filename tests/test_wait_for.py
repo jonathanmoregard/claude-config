@@ -1010,6 +1010,22 @@ def test_sandboxed_job_past_its_deadline_times_out(tmp_path: Path, slug: str) ->
     assert "timed out" in out, out
 
 
+def test_sandboxed_job_ignoring_sigterm_is_killed_soon_after_its_deadline(
+    tmp_path: Path, slug: str
+) -> None:
+    pid_file = tmp_path / "pid"
+    child = ("import os, signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+             f"open({str(pid_file)!r}, 'w').write(str(os.getpid())); time.sleep(40)")
+    started = time.monotonic()
+    rc, out, _ = sandboxed_job(tmp_path, slug, f"exec python3 -c {json.dumps(child)}",
+                               timeout="1")
+    elapsed = time.monotonic() - started
+    assert rc == 124 and "timed out" in out, out
+    assert elapsed < 15, elapsed
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pid_file.read_text()), 0)
+
+
 def test_repeating_a_sandboxed_wait_adopts_the_finished_run(tmp_path: Path, slug: str) -> None:
     counter = tmp_path / "count"
     script = f"echo x >>{counter}"

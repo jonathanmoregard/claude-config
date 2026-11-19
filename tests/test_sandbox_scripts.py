@@ -2,8 +2,10 @@
 neither may pass on an argument that steers the tool underneath it."""
 from __future__ import annotations
 
+import json
 import os
 import pwd
+import shutil
 import subprocess
 import uuid
 from pathlib import Path
@@ -98,3 +100,59 @@ def test_trash_refuses_options_and_paths_elsewhere(tmp_path: Path, scratch: Path
     ]:
         rc, calls = run(TRASH, tmp_path, *args)
         assert (rc, calls) == (code, []), args
+
+
+def project(root: Path) -> Path:
+    repo = root / "repo"
+    for rel in (".git/hooks/pre-commit", ".git/config", ".git/objects/ab/cd",
+                ".claude/settings.json", ".claude/hooks/guard.sh", ".claude/notes.md",
+                ".mcp.json", "sub/ordinary.txt", "nested/deep/.zshrc"):
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        (repo / rel).write_text("x")
+    (root / "wt").mkdir()
+    (root / "wt" / ".git").write_text(f"gitdir: {repo}/.git\n")
+    (root / "to-claude").symlink_to(repo / ".claude")
+    (root / "linked").mkdir()
+    (root / "linked" / ".claude").symlink_to(repo / ".claude")
+    return repo
+
+
+@pytest.mark.parametrize("rel", [
+    "repo", "repo/.git", "repo/.git/hooks", "repo/.git/hooks/pre-commit", "repo/.git/config",
+    "repo/.git/objects/ab", "wt", "wt/.git", "repo/.claude", "repo/.claude/settings.json",
+    "repo/.claude/hooks", "repo/.claude/hooks/guard.sh", "repo/.mcp.json", "repo/nested",
+    "repo/nested/deep/.zshrc", "to-claude/settings.json", "to-claude/hooks/guard.sh",
+    "linked/.claude", "linked",
+])
+def test_trash_refuses_what_the_sandbox_protects(tmp_path: Path, scratch: Path, rel: str) -> None:
+    project(scratch)
+    rc, calls = run(TRASH, tmp_path, str(scratch / rel))
+    assert (rc, calls) == (1, []), rel
+    assert (scratch / rel).exists()
+
+
+@pytest.mark.parametrize("rel", ["repo/sub", "repo/sub/ordinary.txt", "repo/.claude/notes.md",
+                                 "to-claude"])
+def test_trash_still_takes_ordinary_project_content(tmp_path: Path, scratch: Path,
+                                                    rel: str) -> None:
+    project(scratch)
+    rc, calls = run(TRASH, tmp_path, str(scratch / rel))
+    assert (rc, calls) == (0, [f"gio trash -- {scratch}/{rel}"])
+
+
+def test_trash_honours_the_profile_deny_write(tmp_path: Path, scratch: Path) -> None:
+    layout = tmp_path / "layout"
+    (layout / "scripts").mkdir(parents=True)
+    script = layout / "scripts" / "trash"
+    shutil.copy2(TRASH, script)
+    held = scratch / "outer" / "held"
+    (held / "inner").mkdir(parents=True)
+    (scratch / "outer" / "free").write_text("x")
+    (scratch / "tilde").write_text("x")
+    tilde = f"~/{scratch.relative_to(REAL_HOME)}/tilde"
+    (layout / "settings.json").write_text(json.dumps(
+        {"sandbox": {"filesystem": {"denyWrite": [str(held), tilde]}}}))
+    for target in (held, held / "inner", scratch / "outer", scratch / "tilde"):
+        assert run(script, tmp_path, str(target)) == (1, []), target
+    assert run(script, tmp_path, str(scratch / "outer" / "free")) == (
+        0, [f"gio trash -- {scratch}/outer/free"])
