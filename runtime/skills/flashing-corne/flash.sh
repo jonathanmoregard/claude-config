@@ -9,12 +9,27 @@ WAIT_S="${WAIT_S:-600}"
 LOG="${LOG:-${TMPDIR:-/tmp}/flash-corne.log}"
 
 if [ -z "${IN_QMK_SHELL:-}" ]; then
+  self=$(readlink -f "$0")
   cd "$QMK_DIR" || { echo "❌ no qmk_firmware at $QMK_DIR"; exit 1; }
+  { : >"$LOG"; } 2>/dev/null || { echo "❌ can't write log $LOG"; exit 1; }
+  echo "⏳ Loading qmk + avrdude…"
   export IN_QMK_SHELL=1 LOG
-  exec nix-shell shell.nix --run "bash '$0'" 2>>"$LOG"
+  # Relay the inner run's events. Any failure that didn't end on its own ❌
+  # (nix failing to load, an abort mid-script) still gets one, so stdout is
+  # never silent on failure. Upstream QMK dropped shell.nix; use nixpkgs.
+  last=""
+  while IFS= read -r line; do
+    case $line in
+      __rc=*) rc=${line#__rc=} ;;
+      *) echo "$line"; last=$line ;;
+    esac
+  done < <(nix shell nixpkgs#qmk nixpkgs#avrdude -c bash "$self" 2>>"$LOG"; echo "__rc=$?")
+  if [ "${rc:-1}" != 0 ] && [ "${last#❌}" = "$last" ]; then
+    echo "❌ flash stopped (exit ${rc:-?}), see $LOG"
+  fi
+  exit "${rc:-1}"
 fi
 
-: >"$LOG"
 HEX=".build/crkbd_rev1_${KEYMAP}.hex"
 echo "⏳ Compiling $KEYMAP…"
 qmk compile -kb crkbd/rev1 -km "$KEYMAP" >>"$LOG" 2>&1 || { echo "❌ compile failed, see $LOG"; exit 1; }
@@ -35,7 +50,7 @@ for half in LEFT RIGHT; do
       if timeout 40 avrdude -p atmega32u4 -c avr109 -P "$port" -U "flash:w:$HEX:i" >>"$LOG" 2>&1; then
         ok=1; break
       fi
-      echo "❌ $half write failed, press reset again."
+      echo "👉 $half write failed, press reset again."   # retryable: not a final ❌
       while [ -e "$port" ]; do sleep 0.2; done
     fi
     sleep 0.2
