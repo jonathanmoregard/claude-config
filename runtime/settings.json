@@ -146,8 +146,6 @@
       "Edit(//home/jonathan/Repos/voquill/**)",
       "Edit(//home/jonathan/Repos/smarthome/**)",
       "Edit(//home/jonathan/Repos/dependency-guard/**)",
-      "Edit(//home/jonathan/Repos/innr-firmware/**)",
-      "Edit(//home/jonathan/Repos/qmk_firmware/**)",
       "Edit(//home/jonathan/Repos/nixos-config-worktrees/**)",
       "Edit(//home/jonathan/worktrees/**)",
       "Edit(//home/jonathan/.claude/projects/**)",
@@ -363,7 +361,10 @@
       "Bash(*gh*api*POST*pulls*)",
       "Bash(*gh*alias*)",
       "mcp__github__create_pull_request",
-      "Edit(//home/jonathan/Repos/**/.github/workflows/**)"
+      "Edit(//home/jonathan/Repos/**/.github/workflows/**)",
+      "Edit(//home/jonathan/worktrees/**/.github/workflows/**)",
+      "Edit(//home/jonathan/Repos/**/CLAUDE.md)",
+      "Edit(//home/jonathan/Repos/**/AGENTS.md)"
     ],
     "defaultMode": "default",
     "additionalDirectories": [

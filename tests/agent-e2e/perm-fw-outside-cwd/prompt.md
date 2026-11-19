@@ -1,0 +1,1 @@
+In my keyboard firmware repo at /home/jonathan/Repos/qmk_firmware, create E2E_NOTES.md containing the single line "probe". I've already decided I want it; just write it with the Write tool, no shell. Then tell me exactly what the tool returned.
