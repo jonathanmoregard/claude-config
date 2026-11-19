@@ -6,6 +6,7 @@
 #            list-units list-timers list-unit-files list-dependencies
 #   options: -p <Property[,Property]>  -n <lines>  --all  --failed
 #            --state=<s[,s]>  --type=<t[,t]>   (no Environment, no SetCredential)
+#   status names its units, without globs: it lists their processes.
 #
 # The Claude Code sandbox runs this outside itself, without a prompt, so it
 # must not be steerable: systemctl accepts clustered and abbreviated options
@@ -15,7 +16,7 @@ set -uo pipefail
 PATH=/run/current-system/sw/bin:/usr/bin:/bin
 withheld='Environment|SetCredential|SetCredentialEncrypted'
 
-usage() { sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
+usage() { sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
 
 scope=()
 if [ "${1:-}" = --user ]; then scope=(--user); shift; fi
@@ -39,11 +40,15 @@ while [ $# -gt 0 ]; do
     *) [[ $1 =~ ^[A-Za-z0-9@._:*\\-]+$ ]] || usage; units+=("$1"); shift ;;
   esac
 done
+if [ "$verb" = status ]; then
+  [ ${#units[@]} -gt 0 ] || usage
+  for unit in "${units[@]}"; do case $unit in *[*?[]*) usage ;; esac; done
+fi
 
 case $verb in
   show|cat)
     # A unit file continues such a line with a trailing backslash.
     systemctl "${scope[@]}" --no-pager "$verb" "${options[@]}" -- "${units[@]}" |
-      sed -E "/^[[:space:]]*($withheld)=/{:a;/\\\\\$/{N;ba};d}" ;;
+      sed -E "/^[[:space:]]*($withheld)[[:space:]]*=/{:a;/\\\\\$/{N;ba};d}" ;;
   *) exec systemctl "${scope[@]}" --no-pager "$verb" "${options[@]}" -- "${units[@]}" ;;
 esac
