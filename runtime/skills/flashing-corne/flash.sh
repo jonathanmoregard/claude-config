@@ -10,12 +10,23 @@ LOG="${LOG:-${TMPDIR:-/tmp}/flash-corne.log}"
 
 if [ -z "${IN_QMK_SHELL:-}" ]; then
   cd "$QMK_DIR" || { echo "❌ no qmk_firmware at $QMK_DIR"; exit 1; }
-  export IN_QMK_SHELL=1 LOG
+  : >"$LOG"
+  echo "⏳ Loading qmk + avrdude…"
+  # The inner run deletes this marker first thing; if it survives, nix itself failed.
+  STARTED_MARK=$(mktemp)
+  export IN_QMK_SHELL=1 LOG STARTED_MARK
   # Upstream QMK dropped shell.nix; take qmk + avrdude from nixpkgs instead.
-  exec nix shell nixpkgs#qmk nixpkgs#avrdude -c bash "$0" 2>>"$LOG"
+  nix shell nixpkgs#qmk nixpkgs#avrdude -c bash "$0" 2>>"$LOG"
+  rc=$?
+  if [ -e "$STARTED_MARK" ]; then
+    rm -f "$STARTED_MARK"
+    echo "❌ couldn't load qmk + avrdude with nix, see $LOG"
+    exit 1
+  fi
+  exit "$rc"
 fi
 
-: >"$LOG"
+rm -f "${STARTED_MARK:-}"
 HEX=".build/crkbd_rev1_${KEYMAP}.hex"
 echo "⏳ Compiling $KEYMAP…"
 qmk compile -kb crkbd/rev1 -km "$KEYMAP" >>"$LOG" 2>&1 || { echo "❌ compile failed, see $LOG"; exit 1; }
