@@ -116,13 +116,25 @@ def test_unit_read_status_names_its_units(tmp_path: Path, args: tuple[str, ...])
     assert (rc, calls) == (64, [])
 
 
-def test_unit_read_status_of_a_named_unit_keeps_its_processes(tmp_path: Path) -> None:
-    output = "● x.service\n     CGroup: /user.slice/x.service\n             └─42 sleep 9\n"
-    rc, calls, out = run_unit_read(tmp_path, "--user", "status", "x.service", output=output)
-    assert (rc, out) == (0, output)
-    assert calls == ["systemctl --user --no-pager status -- x.service"]
-    rc, _, _ = run_unit_read(tmp_path, "--user", "list-units", "gh-*")
+STATUS = """\u25cf app.slice - User Application Slice
+     Active: active since Thu
+     CGroup: /user.slice/app.slice
+             \u251c\u2500app-x.scope
+             \u2502 \u2514\u250012 /bin/tool --token leaked
+             \u2514\u250013 /bin/other leaked
+             |-14 /bin/ascii leaked
+             `-15 /bin/ascii leaked
+
+Nov 19 10:00:00 host tool[12]: started
+"""
+
+
+def test_unit_read_status_shows_no_process_tree(tmp_path: Path) -> None:
+    rc, _, out = run_unit_read(tmp_path, "--user", "status", "app.slice", output=STATUS)
     assert rc == 0
+    assert "leaked" not in out
+    assert out.splitlines()[0] == STATUS.splitlines()[0]
+    assert out.splitlines()[-1] == STATUS.splitlines()[-1]
 
 
 def interpreter(script: Path) -> str:

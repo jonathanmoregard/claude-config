@@ -50,5 +50,9 @@ case $verb in
     # A unit file continues such a line with a trailing backslash.
     systemctl "${scope[@]}" --no-pager "$verb" "${options[@]}" -- "${units[@]}" |
       sed -E "/^[[:space:]]*($withheld)[[:space:]]*=/{:a;/\\\\\$/{N;ba};d}" ;;
+  status)
+    # A slice's control group tree lists every process below it with its arguments.
+    systemctl "${scope[@]}" --no-pager "$verb" "${options[@]}" -- "${units[@]}" |
+      sed -E '/^[[:space:]]*(├|└|│|\|-|`-|\|[[:space:]])/d' ;;
   *) exec systemctl "${scope[@]}" --no-pager "$verb" "${options[@]}" -- "${units[@]}" ;;
 esac
