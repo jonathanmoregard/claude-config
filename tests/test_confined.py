@@ -380,7 +380,9 @@ def test_refuses_a_repo_whose_protected_entry_is_a_symlink(world, entry: str) ->
 
 
 @pytest.mark.parametrize("case", ["write_root", "planted_git_above_root", "outside_roots",
-                                  "deny_write", "tmp_itself", "gitdir_outside_roots"])
+                                  "deny_write", "tmp_itself", "gitdir_outside_roots",
+                                  "commondir_to_another_repo", "gitfile_to_another_repo",
+                                  "gitfile_to_a_foreign_worktree_entry"])
 @needs_pasta
 def test_refuses_a_working_directory_it_cannot_confine_to_one_repo(world, case: str) -> None:
     rw, home = world["rw"], world["home"]
@@ -397,6 +399,21 @@ def test_refuses_a_working_directory_it_cannot_confine_to_one_repo(world, case: 
         cwd = world["repo"] / "locked"
     elif case == "tmp_itself":
         cwd = Path("/tmp")
+    elif case == "commondir_to_another_repo":
+        cwd = rw / "planted"
+        (cwd / ".git").mkdir(parents=True)
+        (cwd / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+        (cwd / ".git" / "commondir").write_text(f"{world['other']}/.git\n")
+    elif case == "gitfile_to_another_repo":
+        cwd = rw / "planted"
+        cwd.mkdir()
+        (cwd / ".git").write_text(f"gitdir: {world['other']}/.git\n")
+    elif case == "gitfile_to_a_foreign_worktree_entry":
+        subprocess.run(["git", "-C", str(world["other"]), "worktree", "add", "-q",
+                        str(rw / "other-wt")], check=True)
+        cwd = rw / "planted"
+        cwd.mkdir()
+        (cwd / ".git").write_text(f"gitdir: {world['other']}/.git/worktrees/other-wt\n")
     else:
         stray = git_repo(home / "outside" / "stray")
         (rw / "pointer").mkdir()

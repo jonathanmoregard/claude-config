@@ -89,6 +89,9 @@ text, such as "asked a question".
 - No MCP servers (`--strict-mcp-config`). Credentials, the plugin cache,
   `~/Repos` and caveman config are linked from the real HOME. dcg's config is
   copied.
+- Run through `confined`, those links dangle (only credentials and dcg's
+  config are visible): a scenario that depends on a plugin or a skill
+  symlinked into `~/Repos` tests its absence. Run such a scenario unconfined.
 - Isolation needs bubblewrap: a private `/tmp`, the real HOME read-only,
   `~/.ssh` hidden, and credential env vars (`SSH_AUTH_SOCK`, `GH_TOKEN`, …)
   scrubbed. Without `bwrap`, verdicts say `isolated_tmp: false`. Don't run

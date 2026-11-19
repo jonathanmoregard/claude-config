@@ -210,6 +210,21 @@ class Repo:
     stubs: dict[str, str]   # absent protected path -> stub content (None: a directory)
 
 
+def owns(top: str, gitdir: str) -> bool:
+    """Whether gitdir is top's own: its .git directory, a linked worktree's
+    entry that points back at top, or a submodule's directory under modules/."""
+    own, entry = os.path.join(top, ".git"), Path(gitdir)
+    common = read_pointer(entry / "commondir")
+    if gitdir == own:
+        return common in (None, ".")
+    if entry.parent.name == "worktrees":
+        back = read_pointer(entry / "gitdir")
+        return (common is not None and back is not None
+                and os.path.realpath(entry / common) == str(entry.parent.parent)
+                and os.path.realpath(back) == own)
+    return "modules" in entry.parts[:-1] and common is None
+
+
 def repository(cwd: str, profile: Profile) -> Repo:
     start = Path(cwd)
     top = str(next((p for p in (start, *start.parents) if os.path.lexists(p / ".git")), start))
@@ -233,6 +248,9 @@ def repository(cwd: str, profile: Profile) -> Repo:
         git.append(os.path.realpath(dot.parent / pointer) if pointer else "")
     elif dot.exists():
         git.append(str(dot))
+    if git and not owns(top, git[0]):
+        fail(64, f"the git dir {git[0]} does not belong to {top}; a pointer to another "
+                 "repository would make that one writable")
     # A stub in the worktree is an empty directory: git status does not list
     # it, and no file can be written in its place. Inside a git dir it is the
     # file git expects.
@@ -331,9 +349,12 @@ class Stubs:
         for path, fd in self.held:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                if os.path.isdir(path):
+                held, now = os.fstat(fd), os.lstat(path)
+                if (held.st_dev, held.st_ino) != (now.st_dev, now.st_ino):
+                    pass
+                elif stat.S_ISDIR(now.st_mode):
                     os.rmdir(path)
-                elif os.fstat(fd).st_size <= 1:
+                elif held.st_size <= 1:
                     os.unlink(path)
             except OSError:
                 pass
@@ -458,12 +479,12 @@ class Network:
                                ("gid_map", f"0 {os.getgid()} 1")):
                 Path(f"/proc/{self.pid}/{name}").write_text(text + "\n")
             rules = subprocess.run([tools["iptables-restore"]], input=egress_rules(), text=True,
-                                   capture_output=True, preexec_fn=self.enter)
+                                   capture_output=True, preexec_fn=self.enter, env={})
             if rules.returncode != 0:
                 fail(3, f"cannot load the egress rules: {rules.stderr.strip()}")
             ns = f"/proc/{self.pid}/ns"
             link = subprocess.run([tools["pasta"], *PASTA, "--userns", f"{ns}/user",
-                                   "--netns", f"{ns}/net"], capture_output=True, text=True)
+                                   "--netns", f"{ns}/net"], capture_output=True, text=True, env={})
             if link.returncode != 0:
                 fail(3, f"pasta cannot connect the jail: {link.stderr.strip()}")
         except BaseException:
@@ -497,7 +518,7 @@ def detach(args: Args, cwd: str, user: str, here: Path, tmp: str) -> None:
     log = f"{tmp}/{args.slug}.log"
     runtime = f"/run/user/{os.getuid()}"
     proc = subprocess.run(
-        [systemd_run, "--user", "--quiet", f"--unit={args.slug}", f"--working-directory={cwd}",
+        [systemd_run, "--user", "--quiet", "--expand-environment=no", f"--unit={args.slug}", f"--working-directory={cwd}",
          "-p", "RemainAfterExit=yes", "-p", f"RuntimeMaxSec={args.max_runtime or '4h'}",
          "-p", f"ExecStopPost={recorder} {args.slug} {log}",
          "--", sys.executable, "-I", str(here / "confined"), "--chdir", cwd, "--",
