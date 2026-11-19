@@ -1103,3 +1103,32 @@ def test_target_that_looks_like_an_option_is_refused(tmp_path: Path) -> None:
     rc, _, calls = run_wait_for(tmp_path, {}, "unit", "--host=example.invalid", "--user")
     assert rc == 64
     assert calls == []
+
+
+@pytest.mark.parametrize("args", [("unit", "x", "--bogus"), ("unit", "a/b"),
+                                  ("unit", "x", "--timeout", "soon")])
+def test_unit_usage_runs_no_caller_path_binary(tmp_path: Path, args: tuple[str, ...]) -> None:
+    marker = tmp_path / "sed-ran"
+    fake = tmp_path / "fake-bin"
+    fake.mkdir()
+    (fake / "sed").write_text(f"#!/bin/sh\n: >{marker}\ncat >/dev/null\n")
+    (fake / "sed").chmod(0o755)
+    proc = subprocess.run([str(WAIT_FOR), *args], capture_output=True, text=True, timeout=30,
+                          env={**os.environ, "PATH": f"{fake}:{os.environ['PATH']}"},
+                          check=False)
+    assert proc.returncode == 64
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("value, expected", [("08", 1), ("86400", 1), ("0086400", 1),
+                                             ("86401", 64), ("18446744073709551615", 64)])
+def test_unit_timeout_that_bash_cannot_add_is_not_an_instant_timeout(
+    tmp_path: Path, value: str, expected: int
+) -> None:
+    running = {**SUCCEEDED_UNIT, "SubState": "running"}
+    rc, out, calls = run_wait_for(tmp_path, {"systemctl": [running, running, FAILED_UNIT]},
+                                  "unit", "gate", "--user", timeout=value)
+    assert rc == expected, out
+    assert not re.search(r"line \d+:", out), out
+    if expected == 64:
+        assert calls == []

@@ -9,6 +9,7 @@ Entries go to the home trash; one on another filesystem is refused.
 """
 from __future__ import annotations
 
+import ctypes
 import errno
 import itertools
 import json
@@ -17,6 +18,7 @@ import pwd
 import stat
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from typing import NoReturn
 from urllib.parse import quote
@@ -30,6 +32,7 @@ PROTECTED_IN_CLAUDE = {
     "workflows", "routines", "output-styles", "launch.json", "scheduled_tasks.json", "loop.md",
 }
 DIR_FLAGS = os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+RENAME_NOREPLACE = 1
 
 
 @dataclass
@@ -122,6 +125,8 @@ def check(path: str, home: str, denied: list[str], trash_dev: int) -> Target:
         st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except FileNotFoundError:
         fail(1, f"no such file: {target}")
+    except OSError as e:
+        fail(1, f"{target}: {e.strerror}")
     parts = target.split("/")
     if any(protected(parts[i - 1], parts[i], i == len(parts) - 1 and stat.S_ISLNK(st.st_mode))
            for i in range(1, len(parts))):
@@ -169,6 +174,43 @@ def reserve(info_fd: int, files_fd: int, target: Target) -> str:
     raise AssertionError("unreachable")
 
 
+def rename_noreplace(src_fd: int, src: str, dst_fd: int, dst: str) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.renameat2(src_fd, os.fsencode(src), dst_fd, os.fsencode(dst), RENAME_NOREPLACE):
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code), dst)
+
+
+def put_back(target: Target, unique: str, info_fd: int, files_fd: int, reason: str) -> NoReturn:
+    dest = target.name
+    while True:
+        try:
+            rename_noreplace(files_fd, unique, target.parent_fd, dest)
+            break
+        except FileExistsError:
+            dest = f"{target.name}.restored-{uuid.uuid4().hex[:8]}"
+        except OSError as e:
+            fail(1, f"{target.path} {reason}; it could not be put back ({e.strerror}) "
+                    f"and stays in the trash as {unique}")
+    os.unlink(f"{unique}.trashinfo", dir_fd=info_fd)
+    fail(1, f"{target.path} {reason}; put back as {os.path.dirname(target.path)}/{dest}")
+
+
+def recheck(unique: str, files_fd: int, target: Target) -> str | None:
+    try:
+        fd = os.open(unique, os.O_RDONLY | DIR_FLAGS, dir_fd=files_fd)
+        try:
+            opened = os.fstat(fd)
+            if (opened.st_dev, opened.st_ino) != target.identity:
+                return "changed while it was being moved"
+            hit = walk_finds_protected(fd, target.name)
+        finally:
+            os.close(fd)
+    except OSError:
+        return "could not be inspected again after the move"
+    return f"gained {os.path.join(target.path, hit)}, protected by the sandbox" if hit else None
+
+
 def move(target: Target, info_fd: int, files_fd: int) -> None:
     unique = reserve(info_fd, files_fd, target)
     try:
@@ -180,9 +222,10 @@ def move(target: Target, info_fd: int, files_fd: int) -> None:
         fail(1, f"cannot move {target.path}: {e.strerror}")
     moved = os.stat(unique, dir_fd=files_fd, follow_symlinks=False)
     if (moved.st_dev, moved.st_ino) != target.identity:
-        os.rename(unique, target.name, src_dir_fd=files_fd, dst_dir_fd=target.parent_fd)
-        os.unlink(f"{unique}.trashinfo", dir_fd=info_fd)
-        fail(1, f"{target.path} changed while it was being checked; put back")
+        put_back(target, unique, info_fd, files_fd, "changed while it was being checked")
+    # Content renamed in between the walk and the move came along; only this side can see it.
+    if stat.S_ISDIR(moved.st_mode) and (reason := recheck(unique, files_fd, target)):
+        put_back(target, unique, info_fd, files_fd, reason)
 
 
 def main(args: list[str]) -> None:
@@ -199,9 +242,11 @@ def main(args: list[str]) -> None:
     for part in (".local", "share", "Trash"):
         trash_fd = subdir(trash_fd, part)
     files_fd, info_fd = subdir(trash_fd, "files"), subdir(trash_fd, "info")
-    targets = [check(arg, home, denied, os.fstat(files_fd).st_dev) for arg in args]
-    for target in targets:
-        move(target, info_fd, files_fd)
+    for arg in args:
+        move(check(arg, home, denied, os.fstat(files_fd).st_dev), info_fd, files_fd)
 
 
-main(sys.argv[1:])
+try:
+    main(sys.argv[1:])
+except OSError as e:
+    fail(1, f"{e.filename}: {e.strerror}" if e.filename else str(e))

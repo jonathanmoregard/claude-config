@@ -98,6 +98,7 @@ def test_unit_read_shows_no_environment(tmp_path: Path, args: tuple[str, ...]) -
     ("cat", "[Service]\nSetCredential=db:leaked\nExecStart=/bin/true\n"),
     ("cat", "[Service]\nEnvironment=\"TOKEN=leaked\" \\\n  \"MORE=leaked\"\n"
             "  Environment=TOKEN=leaked\nExecStart=/bin/true\n"),
+    ("cat", "[Service]\nEnvironment = TOKEN=leaked\nExecStart=/bin/true\n"),
 ])
 def test_unit_read_drops_environment_lines(tmp_path: Path, verb: str, output: str) -> None:
     rc, _, out = run_unit_read(tmp_path, "--user", verb, "x.service", output=output)
@@ -105,6 +106,35 @@ def test_unit_read_drops_environment_lines(tmp_path: Path, verb: str, output: st
     assert "leaked" not in out
     assert out.splitlines()[0] == output.splitlines()[0]
     assert out.splitlines()[-1] == output.splitlines()[-1]
+
+
+@pytest.mark.parametrize("args", [("--user", "status"), ("status", "-n", "5"),
+                                  ("--user", "status", "*"),
+                                  ("--user", "status", "x.service", "gh-*.service")])
+def test_unit_read_status_names_its_units(tmp_path: Path, args: tuple[str, ...]) -> None:
+    rc, calls, _ = run_unit_read(tmp_path, *args)
+    assert (rc, calls) == (64, [])
+
+
+STATUS = """\u25cf app.slice - User Application Slice
+     Active: active since Thu
+     CGroup: /user.slice/app.slice
+             \u251c\u2500app-x.scope
+             \u2502 \u2514\u250012 /bin/tool --token leaked
+             \u2514\u250013 /bin/other leaked
+             |-14 /bin/ascii leaked
+             `-15 /bin/ascii leaked
+
+Nov 19 10:00:00 host tool[12]: started
+"""
+
+
+def test_unit_read_status_shows_no_process_tree(tmp_path: Path) -> None:
+    rc, _, out = run_unit_read(tmp_path, "--user", "status", "app.slice", output=STATUS)
+    assert rc == 0
+    assert "leaked" not in out
+    assert out.splitlines()[0] == STATUS.splitlines()[0]
+    assert out.splitlines()[-1] == STATUS.splitlines()[-1]
 
 
 def interpreter(script: Path) -> str:
@@ -270,7 +300,7 @@ def test_trash_still_takes_ordinary_project_content(scratch: Path, rel: str) -> 
     assert not os.path.lexists(scratch / rel)
 
 
-def walking(pid: int, root: Path) -> bool:
+def walking(pid: int, root: Path, inside: bool = False) -> bool:
     try:
         fds = list(Path(f"/proc/{pid}/fd").iterdir())
     except OSError:
@@ -280,9 +310,23 @@ def walking(pid: int, root: Path) -> bool:
             target = os.readlink(fd)
         except OSError:
             continue
-        if target == str(root) or target.startswith(f"{root}/"):
+        if (target == str(root) and not inside) or target.startswith(f"{root}/"):
             return True
     return False
+
+
+def await_walk(proc: subprocess.Popen, root: Path, inside: bool = False) -> None:
+    deadline = time.monotonic() + 30
+    while (proc.poll() is None and not walking(proc.pid, root, inside)
+           and time.monotonic() < deadline):
+        pass
+
+
+def populate(tree: Path) -> None:
+    for i in range(200):
+        (tree / str(i)).mkdir(parents=True)
+        for j in range(100):
+            (tree / str(i) / str(j)).touch()
 
 
 @pytest.mark.parametrize("victim", ["outside_home_ssh", "project_claude"])
@@ -296,20 +340,14 @@ def test_trash_moves_only_what_it_checked_despite_a_parent_swap(
     (decoy_project / ".claude" / "settings.json").write_text("{}")
     swap_to, name = {"outside_home_ssh": (decoy_home, ".ssh"),
                      "project_claude": (decoy_project, ".claude")}[victim]
-    big = scratch / "big"
-    for i in range(200):
-        (big / str(i)).mkdir(parents=True)
-        for j in range(100):
-            (big / str(i) / str(j)).touch()
     parent = scratch / "a"
-    (parent / name).mkdir(parents=True)
+    tree = parent / name
+    populate(tree)
 
-    proc = subprocess.Popen([sys.executable, "-I", str(TRASH), str(parent / name), str(big)],
+    proc = subprocess.Popen([sys.executable, "-I", str(TRASH), str(tree)],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
-        deadline = time.monotonic() + 30
-        while proc.poll() is None and not walking(proc.pid, big) and time.monotonic() < deadline:
-            pass
+        await_walk(proc, tree)
         swapped_mid_run = proc.poll() is None
         parent.rename(scratch / "a.real")
         parent.symlink_to(swap_to)
@@ -321,6 +359,102 @@ def test_trash_moves_only_what_it_checked_despite_a_parent_swap(
     assert (swap_to / name).is_dir(), err
     assert list((swap_to / name).iterdir()), err
     assert not (scratch / "a.real" / name).exists(), err
+
+
+@pytest.mark.parametrize("rel", [".git/config", ".claude/settings.json"])
+def test_trash_takes_nothing_protected_moved_in_after_its_check(
+        scratch: Path, rel: str) -> None:
+    big = scratch / "big"
+    populate(big)
+    checked = scratch / "a"
+    checked.mkdir()
+    victim = scratch / "victim"
+    (victim / rel).parent.mkdir(parents=True)
+    (victim / rel).write_text("decoy")
+
+    proc = subprocess.Popen([sys.executable, "-I", str(TRASH), str(checked), str(big)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    await_walk(proc, big)
+    moved_mid_run = proc.poll() is None
+    if checked.exists():
+        victim.rename(checked / "victim")
+    _, err = proc.communicate(timeout=60)
+    assert moved_mid_run
+    assert (victim / rel).exists() or (checked / "victim" / rel).exists(), err
+
+
+@pytest.mark.parametrize("rel", [".git/config", ".claude/settings.json"])
+def test_trash_puts_back_a_tree_that_gained_something_protected_during_its_walk(
+        scratch: Path, rel: str) -> None:
+    big = scratch / "big"
+    populate(big)
+    victim = scratch / "victim"
+    (victim / rel).parent.mkdir(parents=True)
+    (victim / rel).write_text("decoy")
+
+    before = trash_names()
+    proc = subprocess.Popen([sys.executable, "-I", str(TRASH), str(big)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    await_walk(proc, big, inside=True)
+    moved_mid_run = proc.poll() is None
+    victim.rename(big / "victim")
+    _, err = proc.communicate(timeout=60)
+    assert moved_mid_run
+    assert trashed_since(before) == [], err
+    assert (big / "victim" / rel).exists(), err
+    assert proc.returncode == 1, err
+
+
+@pytest.mark.parametrize("occupied", [True, False])
+def test_trash_put_back_onto_a_recreated_directory_leaves_no_entry(
+        tmp_path: Path, scratch: Path, occupied: bool) -> None:
+    layout = tmp_path / "layout"
+    (layout / "scripts").mkdir(parents=True)
+    shutil.copy2(SCRIPTS.parent / "settings.json", layout / "settings.json")
+    gate = tmp_path / "gate"
+    gate.mkdir()
+
+    def pause(step: str) -> str:
+        return (f"open({str(gate / step)!r} + '.ready', 'w').close()\n"
+                f"    while not os.path.exists({str(gate / step)!r} + '.go'): time.sleep(0.01)\n    ")
+
+    source = TRASH.read_text()
+    first = "    unique = reserve(info_fd, files_fd, target)\n"
+    second = "    moved = os.stat(unique, dir_fd=files_fd, follow_symlinks=False)\n"
+    assert source.count(first) == source.count(second) == 1
+    source = source.replace(first, "    " + pause("swap") + first.lstrip())
+    source = source.replace(second, "    " + pause("recreate") + second.lstrip())
+    script = layout / "scripts" / "trash"
+    script.write_text(source)
+
+    def await_step(step: str) -> None:
+        deadline = time.monotonic() + 30
+        while not (gate / f"{step}.ready").exists() and proc.poll() is None:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert proc.poll() is None
+
+    target = scratch / "a"
+    target.mkdir()
+    before = trash_names()
+    proc = subprocess.Popen([sys.executable, "-I", str(script), str(target)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    await_step("swap")
+    target.rename(scratch / "a.checked")
+    target.mkdir()
+    (gate / "swap.go").touch()
+    await_step("recreate")
+    target.mkdir()
+    if occupied:
+        (target / "occupant").write_text("x")
+    recreated = target.stat().st_ino
+    (gate / "recreate.go").touch()
+    _, err = proc.communicate(timeout=30)
+    assert trashed_since(before) == [], err
+    assert "Traceback" not in err, err
+    assert proc.returncode == 1, err
+    assert target.stat().st_ino == recreated, err
+    assert len(list(scratch.glob("a.restored-*"))) == 1, err
 
 
 def test_trash_honours_the_profile_deny_write(tmp_path: Path, scratch: Path) -> None:

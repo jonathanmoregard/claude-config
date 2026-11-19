@@ -30,8 +30,9 @@
 #                                          or adopt its recorded run, then wait
 #                                          (inside the Claude Code sandbox: run
 #                                          it in this call; it ends with the call)
-#   common: --timeout <seconds> (default 3600; job default 14400 so a
-#                                          90-minute job does not time out)
+#   common: --timeout <seconds> (default 3600, at most 86400; job default
+#                                          14400 so a 90-minute job does not
+#                                          time out)
 #
 # A retained unit keeps its result AND its name: `job` adopts it rather than
 # relaunching, so a deliberate rerun of the same slug needs `systemctl --user
@@ -53,6 +54,9 @@
 # call, never in a foreground turn.
 # END USAGE
 set -uo pipefail
+# The Claude Code sandbox runs `wait-for unit` outside itself without a prompt,
+# so not even its usage exit may run a binary from the caller's PATH.
+[ "${1:-}" = unit ] && PATH=/run/current-system/sw/bin:/usr/bin:/bin
 
 usage() {
   sed -n '2,/^# END USAGE$/p' "$0" | sed '$d; s/^# \{0,1\}//' >&2
@@ -87,11 +91,11 @@ else
     esac
   done
 fi
-case $timeout in ''|*[!0-9]*) usage ;; esac
-# The Claude Code sandbox runs `wait-for unit` outside itself without a prompt.
+# Base 10 and bounded before any arithmetic: bash reads 08 as octal and wraps past 2^63.
+[[ $timeout =~ ^0*[0-9]{1,5}$ ]] && (( 10#$timeout <= 86400 )) || usage
+timeout=$(( 10#$timeout ))
 if [ "$mode" = unit ]; then
   case $target in */*) usage ;; esac
-  PATH=/run/current-system/sw/bin:/usr/bin:/bin
 fi
 deadline=$(( $(date +%s) + timeout ))
 left() { echo $(( deadline - $(date +%s) )); }
