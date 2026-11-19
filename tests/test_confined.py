@@ -69,9 +69,9 @@ def run(script: Path, *args: str, cwd: Path, env: dict[str, str] | None = None,
                           capture_output=True, text=True, timeout=timeout, check=False)
 
 
-def jailed(script: Path, body: str, *, cwd: Path, env: dict[str, str] | None = None
-           ) -> subprocess.CompletedProcess[str]:
-    proc = run(script, "--", "bash", "-c", f"{body}\necho {RAN}", cwd=cwd, env=env)
+def jailed(script: Path, body: str, *, cwd: Path, env: dict[str, str] | None = None,
+           flags: tuple[str, ...] = ()) -> subprocess.CompletedProcess[str]:
+    proc = run(script, *flags, "--", "bash", "-c", f"{body}\necho {RAN}", cwd=cwd, env=env)
     assert proc.stdout.rstrip().endswith(RAN), (proc.returncode, proc.stdout, proc.stderr)
     return proc
 
@@ -195,10 +195,38 @@ CREDS_PROBE = (f'printf "size=%s\\n" "$(wc -c <{CLAUDE_CREDS} 2>/dev/null)"\n'
 
 @pytest.mark.skipif(not CLAUDE_CREDS.is_file(), reason="no Claude credentials file here")
 @needs_pasta
-def test_claude_credentials_stay_usable_despite_a_read_rule(world) -> None:
-    proc = jailed(world["script"], CREDS_PROBE, cwd=world["repo"])
+def test_claude_login_makes_the_credentials_usable_despite_a_read_rule(world) -> None:
+    proc = jailed(world["script"], CREDS_PROBE, cwd=world["repo"], flags=("--claude-login",))
     assert "writable=yes" in proc.stdout
     assert re.search(r"^size=[1-9]", proc.stdout, re.M), proc.stdout
+
+
+@pytest.mark.skipif(not CLAUDE_CREDS.is_file(), reason="no Claude credentials file here")
+@needs_pasta
+def test_a_command_gets_no_claude_credentials_unless_asked(world) -> None:
+    proc = jailed(world["script"], CREDS_PROBE, cwd=world["repo"])
+    assert "writable=no" in proc.stdout
+    assert re.search(r"^size=0?$", proc.stdout, re.M), proc.stdout
+
+
+@needs_pasta
+def test_claude_login_is_only_accepted_as_the_first_argument(world) -> None:
+    proc = run(world["script"], "--chdir", str(world["repo"]), "--claude-login", "--", "true",
+               cwd=world["repo"])
+    assert proc.returncode == 64, proc.stderr
+
+
+@needs_pasta
+def test_a_refused_launch_leaves_the_checkout_as_it_was(world) -> None:
+    script = make_tree(world["var"] / "tree2", world["settings"])
+    source = script.read_text()
+    marking = 'os.setxattr(fd, STUB_MARK, b"1")'
+    assert source.count(marking) == 1
+    script.write_text(source.replace(marking, 'raise OSError(95, "injected")'))
+    before = sorted(str(p) for p in world["repo"].rglob("*"))
+    proc = run(script, "--", "true", cwd=world["repo"])
+    assert proc.returncode == 3, proc.stderr
+    assert sorted(str(p) for p in world["repo"].rglob("*")) == before
 
 
 @pytest.mark.skipif(not CLAUDE_CREDS.is_file(), reason="no Claude credentials file here")
@@ -211,7 +239,7 @@ def test_claude_credentials_hidden_when_the_sandbox_block_hides_them(world, wher
     else:
         sandbox["credentials"]["files"].append({"path": "~/.claude/.credentials.json", "mode": "mask"})
     script = make_tree(world["var"] / "tree2", world["settings"])
-    proc = jailed(script, CREDS_PROBE, cwd=world["repo"])
+    proc = jailed(script, CREDS_PROBE, cwd=world["repo"], flags=("--claude-login",))
     assert re.search(r"^size=0?$", proc.stdout, re.M), proc.stdout
 
 

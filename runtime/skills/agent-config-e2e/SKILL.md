@@ -37,7 +37,10 @@ python3 runtime/scripts/agent-e2e/agent_e2e.py run tests/agent-e2e/<scenario> \
 In a sandboxed session, run the harness through the confined runner. It must
 be the whole command, on one line: `--chdir` in place of `cd`, the arm's SHA
 written out, no `$(…)`:
-`~/.claude/scripts/confined --chdir ~/worktrees/claude-<slug> -- python3 runtime/scripts/agent-e2e/agent_e2e.py run tests/agent-e2e/<scenario> --arm old=origin/master --arm new=<sha> --n 5`.
+`~/.claude/scripts/confined --claude-login --chdir ~/worktrees/claude-<slug> -- python3 runtime/scripts/agent-e2e/agent_e2e.py run tests/agent-e2e/<scenario> --arm old=origin/master --arm new=<sha> --n 5`.
+`--claude-login` hands the jail the Claude login the agents under test need, so
+this form is not prompt-free: run that one call with the sandbox disabled and
+let the permission prompt decide.
 
 Run it with `run_in_background: true`, since a batch takes minutes. Finished
 runs are skipped on re-run, so a killed batch never re-spends.

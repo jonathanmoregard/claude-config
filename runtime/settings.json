@@ -1046,8 +1046,12 @@
       "/home/jonathan/.claude/scripts/wait-for unit *",
       "~/.claude/scripts/trash *",
       "/home/jonathan/.claude/scripts/trash *",
-      "~/.claude/scripts/confined *",
-      "/home/jonathan/.claude/scripts/confined *"
+      "~/.claude/scripts/confined -- *",
+      "/home/jonathan/.claude/scripts/confined -- *",
+      "~/.claude/scripts/confined --chdir *",
+      "/home/jonathan/.claude/scripts/confined --chdir *",
+      "~/.claude/scripts/confined --detach *",
+      "/home/jonathan/.claude/scripts/confined --detach *"
     ],
     "network": {
       "allowAllUnixSockets": true,

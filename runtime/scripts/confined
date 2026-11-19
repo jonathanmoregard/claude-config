@@ -1,6 +1,7 @@
 #!/run/current-system/sw/bin/python3 -I
 """confined [--chdir DIR] -- <command> [args...]
 confined [--chdir DIR] --detach <slug> [--max-runtime 4h] -- <command> [args...]
+confined --claude-login [the same] -- <command> [args...]
 
 Run a command outside the Claude Code sandbox, in a bubblewrap jail of its own
 that leaves user namespaces enabled, so nested sandboxes work.
@@ -8,14 +9,17 @@ that leaves user namespaces enabled, so nested sandboxes work.
 Writable: the repository around the working directory (a .git directory in it
 too, but not its hooks and config; a git dir elsewhere, such as a linked
 worktree's, is read-only, so commit outside the jail) and $TMPDIR, /tmp/confined-<uid>, shared between
-jails. Home, /tmp, /run and /var are empty but for that repository, Claude's
-credentials file and SHOWN. Agent and git config at the top of the repository
+jails. Home, /tmp, /run and /var are empty but for that repository and SHOWN. Agent and git config at the top of the repository
 cannot be written or created. A launch from a Claude Code session whose project
 lies inside the repository below its top, or around the repository, is refused. What the `sandbox` block and Read deny rules of the
 settings.json beside this config hide stays hidden.
 Network: its own namespace, IPv4 only. The host, private, link-local and
 tailnet ranges are refused, except DNS to the configured resolvers; the rest of
 the internet is reachable, without a domain filter.
+
+--claude-login, first or not at all, adds Claude's credentials file, writable:
+the command can then use and send out the login. It is not among the forms the
+sandbox lets through without a prompt.
 
 --session DIR names a session project to protect besides the one found among
 the ancestors; --detach hands it to the unit, which has no such ancestor.
@@ -91,10 +95,13 @@ class Args:
     sessions: list[str] = field(default_factory=list)
     slug: str | None = None
     max_runtime: str | None = None
+    login: bool = False
 
 
 def parse(argv: list[str]) -> Args:
     args = Args()
+    if argv[:1] == ["--claude-login"]:
+        args.login, argv = True, argv[1:]
     while argv[:1] != ["--"]:
         if len(argv) < 2:
             usage()
@@ -359,19 +366,30 @@ class Stubs:
 
     @staticmethod
     def make(parent: int, name: str, content: str | None) -> int | None:
+        fd = None
         try:
             if content is None:
                 os.mkdir(name, 0o755, dir_fd=parent)
-                fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
             else:
                 fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644,
                              dir_fd=parent)
-                os.write(fd, content.encode())
-            os.setxattr(fd, STUB_MARK, b"1")
-            return fd
         except FileExistsError:
             return None
         except OSError as e:
+            fail(3, f"cannot place a guard named {name}: {e}")
+        try:
+            if fd is None:
+                fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            else:
+                os.write(fd, content.encode())
+            os.setxattr(fd, STUB_MARK, b"1")
+            return fd
+        except OSError as e:
+            # Unmarked, no later run would know it for a guard.
+            try:
+                (os.rmdir if content is None else os.unlink)(name, dir_fd=parent)
+            except OSError:
+                pass
             fail(3, f"cannot place a guard named {name}: {e}")
 
     @staticmethod
@@ -461,7 +479,7 @@ def pinned(path: str) -> int:
     return fd
 
 
-def jail(profile: Profile, repo: Repo, cwd: str, home: str, tmp: str
+def jail(profile: Profile, repo: Repo, cwd: str, home: str, tmp: str, login: bool
          ) -> tuple[list[str], list[int]]:
     """bwrap's arguments and the descriptors they name."""
     creds = os.path.join(home, ".claude/.credentials.json")
@@ -475,16 +493,15 @@ def jail(profile: Profile, repo: Repo, cwd: str, home: str, tmp: str
         return not any(under(path, r) for r in replaced.values()) or \
             any(under(path, b) or under(b, path) for b in bound)
 
-    # Claude's sandbox leaves the credentials file readable despite its Read
-    # rule; agent e2e needs it, writable for token refresh. The sandbox block
-    # still wins.
+    # Writable for token refresh. The Read rule on it does not apply, as in
+    # Claude's sandbox; the sandbox block still wins.
     real_creds = os.path.realpath(creds)
     hide = [h for h in profile.hidden(visible) if h != real_creds]
     for path in hide:
         if any(under(w, path) for w in writes):
             fail(64, f"{path} is hidden by the sandbox profile and holds the working repository")
     blocked = existing([b for b in profile.blocked if not GLOB_CHARS.search(b)])
-    if not os.path.isfile(creds) or any(under(real_creds, h) for h in hide + blocked):
+    if not login or not os.path.isfile(creds) or any(under(real_creds, h) for h in hide + blocked):
         creds = None
     args = ["--unshare-user", "--uid", str(os.getuid()), "--gid", str(os.getgid()),
             "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
@@ -632,7 +649,8 @@ def detach(args: Args, cwd: str, sessions: list[str], user: str, here: Path, tmp
         [systemd_run, "--user", "--quiet", "--expand-environment=no", f"--unit={args.slug}", f"--working-directory={cwd}",
          "-p", "RemainAfterExit=yes", "-p", f"RuntimeMaxSec={args.max_runtime or '4h'}",
          "-p", f"ExecStopPost={recorder} {args.slug} {log}",
-         "--", sys.executable, "-I", str(here / "confined"), "--chdir", cwd,
+         "--", sys.executable, "-I", str(here / "confined"),
+         *(["--claude-login"] if args.login else []), "--chdir", cwd,
          *(arg for s in sessions for arg in ("--session", s)), "--",
          bash, "-c", JOB_WRAPPER, "confined-job", log, *args.command],
         env={"XDG_RUNTIME_DIR": runtime, "DBUS_SESSION_BUS_ADDRESS": f"unix:path={runtime}/bus"},
@@ -669,7 +687,7 @@ def main() -> None:
         fail(3, "cannot become the subreaper that outlives the jail's processes")
     stubs = Stubs(repo.stubs)
     try:
-        bwrap_args, fds = jail(profile, repo, cwd, entry.pw_dir, tmp)
+        bwrap_args, fds = jail(profile, repo, cwd, entry.pw_dir, tmp, args.login)
         if args.slug:
             detach(args, cwd, sessions, entry.pw_name, here, tmp)
         net = Network(tools)
