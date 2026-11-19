@@ -13,6 +13,8 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[1]
 # `runtime/` once the layout migration has landed, the repository root
 # before it. Only the projected subset moves; tests/ stays at the root.
@@ -60,6 +62,7 @@ def run_wait_for(
         "FAKE_LOG": str(log),
         **TEST_TZ,
     }
+    env.pop("SANDBOX_RUNTIME", None)
     env.update(extra_env or {})
     (tmp_path / "home").mkdir(exist_ok=True)
     argv = list(args)
@@ -965,3 +968,75 @@ def test_sandbox_refuses_symlinked_report_marker(tmp_path: Path) -> None:
     assert rc == 1, out
     assert "must not report" not in out
     assert victim.read_text(encoding="utf-8") == "keep me\n"
+
+
+def sandboxed_job(tmp_path: Path, slug: str, script: str, **kwargs):
+    return run_wait_for(tmp_path, {}, "job", slug, "--", "bash", "-c", script,
+                        extra_env={"SANDBOX_RUNTIME": "1"}, **kwargs)
+
+
+@pytest.fixture
+def slug():
+    name = f"sandboxed-job-{os.getpid()}-{time.monotonic_ns()}"
+    yield name
+    for suffix in ("log", "lock"):
+        Path(f"/tmp/{name}.{suffix}").unlink(missing_ok=True)
+
+
+def test_sandboxed_job_runs_in_this_call_without_a_unit(tmp_path: Path, slug: str) -> None:
+    rc, out, calls = sandboxed_job(tmp_path, slug, "echo ran; exit 0")
+    assert rc == 0, out
+    assert f"job {slug} ran inside the sandbox result=success" in out, out
+    assert Path(f"/tmp/{slug}.log").read_text().splitlines() == ["ran", "MARKER_OK"]
+    assert not any(c.startswith(("systemd-run", "systemctl")) for c in calls), calls
+
+
+def test_sandboxed_job_failure_is_reported_with_its_status(tmp_path: Path, slug: str) -> None:
+    rc, out, _ = sandboxed_job(tmp_path, slug, "echo bad; exit 7")
+    assert rc == 1, out
+    assert "status=7" in out, out
+    assert Path(f"/tmp/{slug}.log").read_text().splitlines() == ["bad", "MARKER_FAILED rc=7"]
+
+
+def test_sandboxed_job_that_exits_124_is_not_called_a_timeout(tmp_path: Path, slug: str) -> None:
+    rc, out, _ = sandboxed_job(tmp_path, slug, "exit 124")
+    assert rc == 1, out
+    assert "status=124" in out and "timed out" not in out, out
+
+
+def test_sandboxed_job_past_its_deadline_times_out(tmp_path: Path, slug: str) -> None:
+    rc, out, _ = sandboxed_job(tmp_path, slug, "exec python3 -c \"import time; time.sleep(8)\"", timeout="3")
+    assert rc == 124, out
+    assert "timed out" in out, out
+
+
+def test_repeating_a_sandboxed_wait_adopts_the_finished_run(tmp_path: Path, slug: str) -> None:
+    counter = tmp_path / "count"
+    script = f"echo x >>{counter}"
+    assert sandboxed_job(tmp_path, slug, script)[0] == 0
+    rc, out, _ = sandboxed_job(tmp_path, slug, script)
+    assert rc == 0, out
+    assert "already ran" in out, out
+    assert counter.read_text() == "x\n"
+
+    Path(f"/tmp/{slug}.log").write_text("bad\nMARKER_FAILED rc=7\n")
+    rc, out, _ = sandboxed_job(tmp_path, slug, script)
+    assert rc == 1 and "status=7" in out, out
+    assert counter.read_text() == "x\n"
+
+
+def test_sandboxed_job_output_without_a_final_newline_is_still_adopted(
+    tmp_path: Path, slug: str
+) -> None:
+    counter = tmp_path / "count"
+    script = f"echo x >>{counter}; printf unterminated"
+    assert sandboxed_job(tmp_path, slug, script)[0] == 0
+    rc, out, _ = sandboxed_job(tmp_path, slug, script)
+    assert rc == 0 and "already ran" in out, out
+    assert counter.read_text() == "x\n"
+
+
+def test_target_that_looks_like_an_option_is_refused(tmp_path: Path) -> None:
+    rc, _, calls = run_wait_for(tmp_path, {}, "unit", "--host=example.invalid", "--user")
+    assert rc == 64
+    assert calls == []

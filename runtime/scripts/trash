@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# trash <path>... — move files to the trash, for a sandboxed session.
+#
+# `gio trash` cannot work inside the Claude Code sandbox (the trash is on
+# another mount there), so the sandbox runs this outside itself, without a
+# prompt. It therefore takes paths only — no `--empty`, no `--restore` — and
+# only paths under ~/Repos or ~/worktrees, which the sandbox may delete anyway.
+set -uo pipefail
+
+[ $# -gt 0 ] || { sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
+home=$(getent passwd "$(id -u)" | cut -d: -f6)
+[ -n "$home" ] || { echo "trash: cannot resolve the home directory" >&2; exit 3; }
+
+targets=()
+for path in "$@"; do
+  case $path in -*) echo "trash: options are not accepted: $path" >&2; exit 64 ;; esac
+  parent=$(realpath -e -- "$(dirname -- "$path")") || exit 1
+  name=$(basename -- "$path")
+  case $name in .|..) echo "trash: name the directory itself, not $path" >&2; exit 1 ;; esac
+  target=$parent/$name
+  case $target in
+    "$home"/Repos/?*|"$home"/worktrees/?*) ;;
+    *) echo "trash: $target is outside ~/Repos and ~/worktrees" >&2; exit 1 ;;
+  esac
+  [ -e "$target" ] || [ -L "$target" ] || { echo "trash: no such file: $target" >&2; exit 1; }
+  targets+=("$target")
+done
+exec gio trash -- "${targets[@]}"
