@@ -39,7 +39,7 @@ systemd-run --user --unit=<slug> --working-directory=<dir> \
   `~/.claude/scripts/confined --detach <slug> [--max-runtime 4h] -- <cmd> [args...]`
   as the whole command (`--chdir <dir>` instead of `cd`). It prints the unit
   and log path, appends the same markers and stops the job after
-  `--max-runtime` (default 4h). Observe it with
+  `--max-runtime` (default 4h, at most 24h). Observe it with
   `~/.claude/scripts/wait-for unit <slug>.service --user`. To rerun, pick a new
   slug. The job has no `gh`, brokers or host-local services.
 - The unit name is the rerun handle, and `RemainAfterExit` is what keeps the
