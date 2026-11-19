@@ -1025,6 +1025,17 @@ def test_repeating_a_sandboxed_wait_adopts_the_finished_run(tmp_path: Path, slug
     assert counter.read_text() == "x\n"
 
 
+def test_sandboxed_job_output_without_a_final_newline_is_still_adopted(
+    tmp_path: Path, slug: str
+) -> None:
+    counter = tmp_path / "count"
+    script = f"echo x >>{counter}; printf unterminated"
+    assert sandboxed_job(tmp_path, slug, script)[0] == 0
+    rc, out, _ = sandboxed_job(tmp_path, slug, script)
+    assert rc == 0 and "already ran" in out, out
+    assert counter.read_text() == "x\n"
+
+
 def test_target_that_looks_like_an_option_is_refused(tmp_path: Path) -> None:
     rc, _, calls = run_wait_for(tmp_path, {}, "unit", "--host=example.invalid", "--user")
     assert rc == 64

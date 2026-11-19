@@ -641,6 +641,7 @@ run_job_in_sandbox() {
   [ "$(left)" -gt 0 ] || timed_out
   command timeout "$(left)" "${job_cmd[@]}" >>"$log" 2>&1 9>&-; rc=$?
   if [ "$rc" = 124 ] && [ "$(left)" -le 0 ]; then timed_out; fi
+  [ -z "$(tail -c 1 -- "$log")" ] || echo >>"$log"
   if [ "$rc" = 0 ]; then
     echo MARKER_OK >>"$log"
     echo "job $target ran inside the sandbox result=success status=0 log=$log"
