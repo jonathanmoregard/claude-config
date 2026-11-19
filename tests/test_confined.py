@@ -468,12 +468,23 @@ def test_a_git_dir_swapped_for_a_link_mid_launch_exposes_nothing(world) -> None:
     swapper = threading.Thread(target=swap)
     swapper.start()
     try:
-        seen = [run(world["script"], "--", "sh", "-c", f"cat {gitdir}/secret 2>/dev/null; true",
-                    cwd=cwd).stdout for _ in range(25)]
+        seen = [run(world["script"], "--", "sh", "-c",
+                    f"cat {gitdir}/secret 2>/dev/null; echo {RAN}", cwd=cwd).stdout
+                for _ in range(25)]
+        assert swapper.is_alive()
     finally:
         stop.set()
         swapper.join()
     assert CANARY not in "".join(seen)
+    assert any(RAN in out for out in seen)
+
+
+@needs_pasta
+def test_the_command_inherits_no_descriptor_of_the_host(world) -> None:
+    proc = jailed(world["script"],
+                  'for fd in /proc/self/fd/*; do echo "fd=$(readlink "$fd")"; done', cwd=world["repo"])
+    opened = [line[3:] for line in proc.stdout.splitlines() if line.startswith("fd=")]
+    assert not [o for o in opened if o.startswith("/") and not o.startswith(("/dev/", "/proc/"))], opened
 
 
 @needs_pasta
@@ -488,6 +499,7 @@ def test_git_reads_work_from_a_linked_worktree_but_its_git_dir_is_read_only(worl
     assert got["ref"] != "0" and not (common / "refs" / "heads" / "planted").exists()
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
 @needs_pasta
 def test_refuses_when_a_guard_cannot_be_placed(world) -> None:
     repo = world["repo"]

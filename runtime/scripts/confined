@@ -6,8 +6,8 @@ Run a command outside the Claude Code sandbox, in a bubblewrap jail of its own
 that leaves user namespaces enabled, so nested sandboxes work.
 
 Writable: the repository around the working directory (a .git directory in it
-too, but not its hooks and config; a linked worktree's git dir is read-only, so
-commit outside the jail) and $TMPDIR, /tmp/confined-<uid>, shared between
+too, but not its hooks and config; a git dir elsewhere, such as a linked
+worktree's, is read-only, so commit outside the jail) and $TMPDIR, /tmp/confined-<uid>, shared between
 jails. Home, /tmp, /run and /var are empty but for that repository, Claude's
 credentials file and SHOWN. Agent and git config in the repository cannot be
 written or created. What the `sandbox` block and Read deny rules of the
@@ -288,34 +288,42 @@ def repository(cwd: str, profile: Profile) -> Repo:
 class Stubs:
     """Mount points for absent protected paths, the way Claude's sandbox makes
     them: created before the jail, removed after it. Marked and share-locked,
-    so concurrent jails keep a stub until the last one using it is done."""
+    so concurrent jails keep a stub until the last one using it is done.
+    Created and removed through a descriptor of the checked parent, never by
+    path: the caller may swap any directory above for a link meanwhile."""
 
     def __init__(self, wanted: dict[str, str | None]) -> None:
-        self.held: list[tuple[str, int]] = []
-        for path, content in wanted.items():
-            fd = self.make(path, content)
-            if fd is None:
-                fd = self.adopt(path)
-            if fd is None:
-                fail(3, f"cannot place a guard at {path}")
-            fcntl.flock(fd, fcntl.LOCK_SH)
-            self.held.append((path, fd))
+        self.held: list[tuple[int, str, int]] = []
+        try:
+            for path, content in wanted.items():
+                parent, name = pinned(os.path.dirname(path)), os.path.basename(path)
+                fd = self.make(parent, name, content)
+                if fd is None:
+                    fd = self.adopt(parent, name)
+                if fd is None:
+                    fail(3, f"cannot place a guard at {path}")
+                fcntl.flock(fd, fcntl.LOCK_SH)
+                self.held.append((parent, name, fd))
+        except SystemExit:
+            self.remove()
+            raise
 
     @staticmethod
-    def make(path: str, content: str | None) -> int | None:
+    def make(parent: int, name: str, content: str | None) -> int | None:
         try:
             if content is None:
-                os.mkdir(path, 0o755)
-                fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                os.mkdir(name, 0o755, dir_fd=parent)
+                fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
             else:
-                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+                fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644,
+                             dir_fd=parent)
                 os.write(fd, content.encode())
             os.setxattr(fd, STUB_MARK, b"1")
             return fd
         except FileExistsError:
             return None
         except OSError as e:
-            fail(3, f"cannot place a guard at {path}: {e}")
+            fail(3, f"cannot place a guard named {name}: {e}")
 
     @staticmethod
     def marked(path: str) -> bool:
@@ -326,9 +334,9 @@ class Stubs:
             return False
 
     @staticmethod
-    def adopt(path: str) -> int | None:
+    def adopt(parent: int, name: str) -> int | None:
         try:
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
         except OSError:
             return None
         try:
@@ -339,19 +347,22 @@ class Stubs:
             return None
 
     def remove(self) -> None:
-        for path, fd in self.held:
+        for parent, name, fd in self.held:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                held, now = os.fstat(fd), os.lstat(path)
+                held = os.fstat(fd)
+                now = os.stat(name, dir_fd=parent, follow_symlinks=False)
                 if (held.st_dev, held.st_ino) != (now.st_dev, now.st_ino):
                     pass
                 elif stat.S_ISDIR(now.st_mode):
-                    os.rmdir(path)
+                    os.rmdir(name, dir_fd=parent)
                 elif held.st_size <= 1:
-                    os.unlink(path)
+                    os.unlink(name, dir_fd=parent)
             except OSError:
                 pass
             os.close(fd)
+            os.close(parent)
+        self.held = []
 
 
 def host_addresses() -> list[str]:
@@ -426,7 +437,7 @@ def jail(profile: Profile, repo: Repo, cwd: str, home: str, tmp: str
     blocked = existing([b for b in profile.blocked if not GLOB_CHARS.search(b)])
     if not os.path.isfile(creds) or any(under(real_creds, h) for h in hide + blocked):
         creds = None
-    args =["--unshare-user", "--uid", str(os.getuid()), "--gid", str(os.getgid()),
+    args = ["--unshare-user", "--uid", str(os.getuid()), "--gid", str(os.getgid()),
             "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
             "--unshare-pid", "--unshare-ipc", "--new-session", "--die-with-parent",
             *(arg for r in replaced.values() for arg in ("--tmpfs", r))]
@@ -565,6 +576,8 @@ def main() -> None:
     repo = repository(cwd, profile)
     tmp = shared_tmp()
     tools = {name: find(name, entry.pw_name) for name in ("pasta", "bwrap", "iptables-restore")}
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda signum, _frame: sys.exit(128 + signum))
     stubs = Stubs(repo.stubs)
     try:
         bwrap_args, fds = jail(profile, repo, cwd, entry.pw_dir, tmp)
