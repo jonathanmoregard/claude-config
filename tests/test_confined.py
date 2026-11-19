@@ -30,13 +30,13 @@ CANARY = "confined-canary-not-a-secret"
 pytestmark = pytest.mark.skipif(BWRAP is None, reason="bubblewrap is not installed here")
 
 
-def make_tree(root: Path, settings: dict | None) -> Path:
-    (root / "scripts").mkdir(parents=True)
+def make_tree(config: Path, settings: dict | None) -> Path:
+    (config / "scripts").mkdir(parents=True)
     for name in ("confined", "record-user-unit-failure"):
-        shutil.copy2(SCRIPTS / name, root / "scripts" / name)
+        shutil.copy2(SCRIPTS / name, config / "scripts" / name)
     if settings is not None:
-        (root / "settings.json").write_text(json.dumps(settings))
-    return root / "scripts" / "confined"
+        (config / "settings.json").write_text(json.dumps(settings))
+    return config / "scripts" / "confined"
 
 
 def base_env(**extra: str) -> dict[str, str]:
