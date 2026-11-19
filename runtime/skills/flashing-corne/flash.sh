@@ -14,13 +14,15 @@ LOG="${LOG:-${TMPDIR:-/tmp}/flash-corne.log}"
 reported=0
 failed() { echo "❌ $*"; reported=1; exit 1; }
 trap 'rc=$?; if [ "$rc" != 0 ] && [ "$reported" = 0 ]; then echo "❌ flash stopped (exit $rc), see $LOG"; fi' EXIT
+# Signals bypass the EXIT trap unless turned into an exit.
+trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
 
+{ : >"$LOG"; } 2>/dev/null || failed "can't write log $LOG"
+exec 2>>"$LOG"   # Monitor runs us with 2>&1; keep shell errors off the event stream
 for tool in qmk avrdude; do
   command -v "$tool" >/dev/null || failed "$tool not on PATH (declared in nixos-config hosts/tuxedo)"
 done
 cd "$QMK_DIR" || failed "no qmk_firmware at $QMK_DIR"
-{ : >"$LOG"; } 2>/dev/null || failed "can't write log $LOG"
-exec 2>>"$LOG"   # Monitor runs us with 2>&1; keep shell errors off the event stream
 
 HEX=".build/crkbd_rev1_${KEYMAP}.hex"
 echo "⏳ Compiling $KEYMAP…"
