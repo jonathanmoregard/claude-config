@@ -95,7 +95,8 @@ systemd-run --user --unit=<slug> --working-directory=<dir> \
   turn. After an interruption, run the same wait again; the unit retains its
   result. The job default timeout is four hours; set `--timeout <seconds>`
   before `--` when a longer bound is intentional.
-- Read or tail `/tmp/<slug>.log` for progress. `MARKER_OK` and
+- Read or tail `/tmp/<slug>.log` for progress (a `confined --detach` job: the
+  log path it printed). `MARKER_OK` and
   `MARKER_FAILED rc=N` help a human scan the log, but the unit status is the
   verdict.
 - **Do NOT kill a slow build to retry** — killing wastes every finished

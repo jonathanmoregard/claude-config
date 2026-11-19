@@ -382,9 +382,11 @@ def test_refuses_a_repo_whose_protected_entry_is_a_symlink(world, entry: str) ->
 @pytest.mark.parametrize("case", ["write_root", "planted_git_above_root", "outside_roots",
                                   "deny_write", "tmp_itself", "gitdir_outside_roots",
                                   "gitdir_inside_the_repo", "holds_checkouts",
-                                  "planted_git_around_checkouts"])
+                                  "planted_git_around_checkouts", "unreadable_directory",
+                                  "checkout_dressed_as_a_submodule"])
 @needs_pasta
-def test_refuses_a_working_directory_it_cannot_confine_to_one_repo(world, case: str) -> None:
+def test_refuses_a_working_directory_it_cannot_confine_to_one_repo(world, case: str,
+                                                                   request) -> None:
     rw, home = world["rw"], world["home"]
     marker = world["var"] / "should-not-exist"
     if case == "write_root":
@@ -406,6 +408,18 @@ def test_refuses_a_working_directory_it_cannot_confine_to_one_repo(world, case: 
         if case == "planted_git_around_checkouts":
             (cwd / ".git").mkdir()
             (cwd / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    elif case == "unreadable_directory":
+        cwd = git_repo(rw / "outer")
+        git_repo(cwd / "veil" / "session")
+        marker = cwd / "veil" / "session" / "should-not-exist"
+        (cwd / "veil").chmod(0o300)
+        request.addfinalizer(lambda: (cwd / "veil").chmod(0o755))
+    elif case == "checkout_dressed_as_a_submodule":
+        cwd = git_repo(rw / "outer")
+        elsewhere = git_repo(rw / "modules" / "real")
+        (cwd / "session").mkdir()
+        (cwd / "session" / ".git").write_text(f"gitdir: {elsewhere}/.git\n")
+        marker = cwd / "session" / "should-not-exist"
     elif case == "gitdir_inside_the_repo":
         cwd = rw / "inner"
         (cwd / "gd").mkdir(parents=True)
