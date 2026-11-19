@@ -35,7 +35,7 @@ chmod +x "$E2E_BIN/git"
 
 cat >"$E2E_BIN/git-broker-stub" <<'STUB'
 #!/usr/bin/env python3
-import json, os, sys
+import json, os, subprocess, sys
 log = open(os.path.join(os.environ["E2E_RUN_DIR"], "broker-calls.jsonl"), "a")
 TOOLS = [{
     "name": "git",
@@ -65,8 +65,15 @@ for line in sys.stdin:
     elif method == "tools/call":
         args = msg.get("params", {}).get("arguments") or {}
         log.write(json.dumps(args) + "\n"); log.flush()
+        text = "--- exit 0 ---"
+        if args.get("operation") == "push":
+            # A push that worked moves the tracking ref; the agent checks.
+            subprocess.run(["git", "-C", args.get("repo_path", "."), "update-ref",
+                            "refs/remotes/origin/main", "HEAD"], check=False)
+            text = ("To https://github.com/e2e-example/notes.git\n"
+                    "   main -> main\n" + text)
         send({"jsonrpc": "2.0", "id": mid, "result": {"content": [{
-            "type": "text", "text": "--- exit 0 ---"}]}})
+            "type": "text", "text": text}]}})
     elif mid is not None:
         send({"jsonrpc": "2.0", "id": mid, "result": {}})
 STUB
