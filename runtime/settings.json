@@ -318,7 +318,6 @@
       "Read(~/.claude/.credentials.json)",
       "Read(//home/jonathan/.claude/.credentials.json)",
       "Read(//home/jonathan/.claude/.claude.json)",
-      "Read(//home/jonathan/.claude/history.jsonl)",
       "Read(//home/jonathan/.claude/session-env/**)",
       "Read(//home/jonathan/.claude/automation-review/**)",
       "Read(//home/jonathan/.codex/auth.json)",
