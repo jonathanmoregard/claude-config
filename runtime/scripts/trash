@@ -16,7 +16,7 @@ for path in "$@"; do
   case $path in -*) echo "trash: options are not accepted: $path" >&2; exit 64 ;; esac
   parent=$(realpath -e -- "$(dirname -- "$path")") || exit 1
   name=$(basename -- "$path")
-  case $name in .|..) echo "trash: name the directory itself, not $path" >&2; exit 1 ;; esac
+  case $name in ""|.|..) echo "trash: name the directory itself, not $path" >&2; exit 1 ;; esac
   target=$parent/$name
   case $target in
     "$home"/Repos/?*|"$home"/worktrees/?*) ;;

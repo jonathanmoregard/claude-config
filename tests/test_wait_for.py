@@ -1029,7 +1029,7 @@ def test_sandboxed_job_output_without_a_final_newline_is_still_adopted(
     tmp_path: Path, slug: str
 ) -> None:
     counter = tmp_path / "count"
-    script = f"echo x >>{counter}; printf unterminated"
+    script = f"echo x >>{counter}; printf 'unterminated\\0'"
     assert sandboxed_job(tmp_path, slug, script)[0] == 0
     rc, out, _ = sandboxed_job(tmp_path, slug, script)
     assert rc == 0 and "already ran" in out, out
