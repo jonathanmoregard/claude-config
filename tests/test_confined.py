@@ -34,7 +34,11 @@ RAN = "confined-ran-marker"
 CANARY = "confined-canary-not-a-secret"
 GIT_ID = ["-c", "user.name=t", "-c", "user.email=t@example.invalid"]
 
-pytestmark = pytest.mark.skipif(BWRAP is None, reason="bubblewrap is not installed here")
+INTERPRETER = (SCRIPTS / "confined").read_text().splitlines()[0].removeprefix("#!").split()[0]
+
+pytestmark = pytest.mark.skipif(
+    BWRAP is None or not os.path.exists(INTERPRETER),
+    reason="bubblewrap or the launcher's interpreter is not installed here")
 needs_pasta = pytest.mark.skipif(PASTA is None, reason="pasta is not installed here")
 
 
