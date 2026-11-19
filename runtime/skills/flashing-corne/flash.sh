@@ -58,7 +58,7 @@ for half in LEFT RIGHT; do
     fi
     sleep 0.2
   done
-  (( ok )) || failed "$half: no bootloader within ${WAIT_S}s, stopped."
+  (( ok )) || failed "$half: no bootloader within ${WAIT_S}s, stopped, see $LOG"
   while compgen -G '/dev/ttyACM*' >/dev/null; do sleep 0.2; done
   if [ "$half" = LEFT ]; then echo "✅ Left flashed. $prompt_right"; sleep 2; fi
 done
