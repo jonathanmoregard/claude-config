@@ -14,6 +14,8 @@ if [ -z "${IN_QMK_SHELL:-}" ]; then
   { : >"$LOG"; } 2>/dev/null || { echo "❌ can't write log $LOG"; exit 1; }
   echo "⏳ Loading qmk + avrdude…"
   export IN_QMK_SHELL=1 LOG
+  # If Monitor kills us, take the nix shell, compile and avrdude down too.
+  trap 'trap - TERM INT HUP; kill 0' TERM INT HUP
   # Relay the inner run's events. Any failure that didn't end on its own ❌
   # (nix failing to load, an abort mid-script) still gets one, so stdout is
   # never silent on failure. Upstream QMK dropped shell.nix; use nixpkgs.
@@ -50,7 +52,7 @@ for half in LEFT RIGHT; do
       if timeout 40 avrdude -p atmega32u4 -c avr109 -P "$port" -U "flash:w:$HEX:i" >>"$LOG" 2>&1; then
         ok=1; break
       fi
-      echo "❌ $half write failed, press reset again."
+      echo "👉 $half write failed, press reset again."   # retryable: not a final ❌
       while [ -e "$port" ]; do sleep 0.2; done
     fi
     sleep 0.2
