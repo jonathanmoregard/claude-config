@@ -563,6 +563,16 @@ def test_run_cannot_reach_ssh_agent_keys_or_write_real_home(tmp_path):
     assert verdicts[0]["verdict"] == "PASS", verdicts
 
 
+def test_agent_is_not_told_it_is_sandboxed_by_the_harness_environment(tmp_path, monkeypatch):
+    """Launched through `confined`, the harness inherits SANDBOX_RUNTIME=1. The
+    agent's hooks would then read every unsandboxed call as sandboxed."""
+    monkeypatch.setenv("SANDBOX_RUNTIME", "1")
+    claude = fake_claude(tmp_path, '[ -z "${SANDBOX_RUNTIME:-}" ] || exit 15\n'
+                                   "cat <<'EOF'\n" + stream("ok", []) + "\nEOF\n")
+    _, _, verdicts = _run(tmp_path, _scenario(tmp_path, "exit 0"), claude)
+    assert verdicts[0]["verdict"] == "PASS", verdicts
+
+
 def test_nested_default_out_stays_inside_the_run(tmp_path):
     """Review H1: a nested harness must not default into the outer --out tree."""
     outer_run = tmp_path / "outer-run"
