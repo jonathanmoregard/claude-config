@@ -349,6 +349,19 @@
       "Bash(*claude-pr-open-gate*)"
     ],
     "ask": [
+      "Bash(*gh*pr*create*)",
+      "Bash(*gh*pr*new*)",
+      "Bash(*createPullRequest*)",
+      "Bash(*gh*api*pulls*-f*)",
+      "Bash(*gh*api*-f*pulls*)",
+      "Bash(*gh*api*pulls*-F*)",
+      "Bash(*gh*api*-F*pulls*)",
+      "Bash(*gh*api*pulls*--input*)",
+      "Bash(*gh*api*--input*pulls*)",
+      "Bash(*gh*api*pulls*POST*)",
+      "Bash(*gh*api*POST*pulls*)",
+      "Bash(*gh*alias*)",
+      "mcp__github__create_pull_request",
       "Edit(//home/jonathan/Repos/**/.github/workflows/**)",
       "Edit(//home/jonathan/worktrees/**/.github/workflows/**)",
       "Edit(//home/jonathan/Repos/**/.github/actions/**)",
@@ -405,6 +418,16 @@
           {
             "type": "command",
             "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark PermissionRequest",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "^(Bash|mcp__github__create_pull_request)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/hooks/pr-open-gate.py",
             "timeout": 10
           }
         ]

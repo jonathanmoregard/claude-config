@@ -1,37 +1,48 @@
 """Shared logic for the ARTL PR-open gate.
 
-Imported by hooks/pr-open-gate.py (PreToolUse, UserPromptSubmit) and
-hooks/artl-evidence.py (PostToolUse on Agent, Read and SendMessage;
-SubagentStop). Stdlib only; every git call is bounded.
+Imported by hooks/pr-open-gate.py (PreToolUse, PermissionRequest,
+UserPromptSubmit) and hooks/artl-evidence.py (PostToolUse on Agent, Read and
+SendMessage; SubagentStop). Stdlib only; every git call is bounded.
 
 ENFORCEMENT MODEL
   The gate is FRICTION, not a security boundary. Its job is to make the
   ordinary way of opening a PR depend on a review, so that an honest agent
   reviews first -- not to stop an agent that sets out to evade it.
 
-  What it covers: the scanner below finds the ordinary spellings of a PR
-  open -- `gh pr create` / `gh pr new` however spaced, quoted or wrapped; a
-  `gh api` call whose path is the `pulls` collection and that POSTs (a field
-  or body flag, or an explicit method); a GraphQL body that names
-  `createPullRequest`; and the GitHub MCP create tool. Reads, PR comments
-  and text that merely contains the words (a commit message, a grep) are
-  not PR opens and pass silently.
-  The hook is the only gate, by the user's choice: no `permissions.ask` rule
-  backs it, because globs over the raw command text prompted on every such
-  mention. `Bash` is allowed, so a parser miss, a hook timeout, a crash or a
-  hook that is not installed lets the PR open run.
+  What it covers: settings.json `permissions.ask` globs, matched against the
+  raw command text, catch the ordinary spellings of a PR open -- `gh pr
+  create` / `gh pr new` however spaced or wrapped; a `gh api` call whose
+  path names `pulls` and that carries a field or body flag (`-f`, `-F`,
+  `--field`, `--raw-field`, `--input`: gh then POSTs) or an explicit POST,
+  the endpoint quoted or not; a GraphQL body that names `createPullRequest`;
+  `gh alias`; and the GitHub MCP create tool. A `gh api` call that cannot
+  open a PR -- a bare or `-X GET` read, a GraphQL query, an issue comment --
+  is NOT asked: headless, an ask is a refusal, and refusing reads is pure
+  cost. Accepted over-matches: other writes under `pulls/` (a PR comment)
+  and `gh api -X GET .../pulls -f state=open`.
+  `Bash` is on the allow list, so for these spellings the ask rule -- not
+  this code -- is what stops an unreviewed PR open: a parser miss, a hook
+  timeout, a crash, or a hook that is not installed all leave the prompt.
 
-  What it does NOT reach (by construction; each takes intent, and none is in
-  scope): curl or any other HTTP client to the REST API; a PR opened from a
-  script file (`bash ./open.sh`), a git hook or a gh alias's later use; argv
-  built by an interpreter; a variable spelling (`${g}h pr create`,
-  `EP=.../pulls; gh api $EP ...` -- the scanner expands nothing); a GraphQL
-  mutation read from a file (`-F query=@m.graphql`); a second PR open in the
-  same command hidden from the scanner after a judged one; and
+  What it does NOT reach (measured or by construction; each takes intent,
+  and none is in scope): curl or any other HTTP client to the REST API; a PR
+  opened from a script file (`bash ./open.sh`), a git hook or a gh alias's
+  later use; argv built by an interpreter; a variable spelling (`${g}h pr
+  create`, `EP=.../pulls; gh api $EP ...` -- the matcher expands nothing); a
+  keyword split with quotes or a backslash (`gh pr cre"ate"`, `cr''eate`,
+  `g\\h`) -- MEASURED: Claude Code 2.1.322 asks for these, 2.1.311 runs the
+  quoted ones, so nothing here relies on either; a GraphQL mutation read
+  from a file (`-F query=@m.graphql`); a second PR open in the same command
+  hidden from the scanner after a judged one; and
   `git push origin HEAD:reviewed && gh pr create --head reviewed`.
 
-  When the gate cannot be sure what a command opens, or against what, it
-  denies and says why.
+  This module's one privilege is to ANSWER the prompt "allow", through a
+  one-shot grant bound to the exact call from the exact cwd and spent only
+  on the branch tip it judged; any later deny of the same call revokes it.
+  It may also deny with a remedy, but nothing depends on the deny firing.
+  So every judgement here is built to be wrong only toward a prompt: when the
+  gate cannot be sure what a command opens, or against what, it refuses to
+  grant (and says why).
 
 WHERE THINGS LIVE -- all under ~/.local/state/claude-pr-open-gate/, which
 settings.json denies to the Edit and Write tools and to any Bash command
@@ -42,6 +53,7 @@ by the same rule):
                                         passing review: computed exemptions,
                                         the user's skip-artl, nixos `n/a`
   pending/   advisor dispatch halves, and the files each advisor Read
+  grants/    one-shot answers for the permissions.ask prompt
   override/  a user-typed skip-artl, per session, until consumed
 
 <name> follows CLAUDE.md's <notes> naming: the basename of the session's
@@ -76,6 +88,7 @@ LS_REMOTE_TIMEOUT_S = 6
 SNAPSHOT_TIMEOUT_S = 10
 DRIFT_LIMIT = 20          # lines changed since the reviewed tree that still count
 SMALL_LIMIT = 15          # a change this small, outside SENSITIVE paths, is exempt
+GRANT_TTL_S = 120
 OVERRIDE_TTL_S = 24 * 3600
 PENDING_TTL_S = 24 * 3600
 MAX_READ_BYTES = 4_000_000
@@ -178,7 +191,7 @@ def remote_base(top: str) -> tuple[str | None, str]:
     every branch are one `git symbolic-ref` / `git update-ref` away from
     pointing at the PR's own tip, which turns any diff into an empty,
     exempt one (finding 8). The remote's answer costs a network round trip;
-    when it cannot be had, the gate denies."""
+    when it cannot be had, there is no grant -- the ask prompt stands."""
     out = git(top, "ls-remote", "--symref", "origin", "HEAD", "refs/heads/main",
               "refs/heads/master", timeout=LS_REMOTE_TIMEOUT_S)
     if out is None:
@@ -305,9 +318,15 @@ def read_json(path: Path) -> dict | None:
 
 
 def prune(directory: Path, ttl: float, now: float) -> int:
-    """Delete expired files in `directory`. Returns how many it could not
-    remove, so a caller can say so out loud rather than swallow its own IO
-    errors."""
+    """Delete expired files in `directory`. Returns how many it could not remove.
+
+    Housekeeping only, and deliberately not load-bearing: expiry is enforced
+    where a grant is CONSUMED — pr-open-gate.on_permission unlinks the grant
+    and only then compares its `ts` against GRANT_TTL_S — so a failure here
+    leaves litter on disk, never a grant anyone can still spend. The count is
+    returned rather than swallowed so a caller can say so out loud; a gate
+    that quietly ignores its own IO errors is how a fail-open starts.
+    """
     failed = 0
     try:
         entries = list(directory.iterdir())
@@ -326,11 +345,11 @@ def prune(directory: Path, ttl: float, now: float) -> int:
 
 # --- what counts as opening a PR ------------------------------------------------
 #
-# The scanner finds the ordinary spellings, not every spelling (a miss lets
-# the open run; see ENFORCEMENT MODEL). What it must never do is pass a
-# command whose PR open it misjudged: the wrong branch, the wrong repository,
-# a second open it did not see, or a commit/checkout earlier in the same
-# command it did not account for. So it
+# The scanner's job is narrower than it looks. A miss costs a prompt (the ask
+# rule still matches), so it does not have to find every spelling. What it
+# must never do is mint a grant for a command whose PR open it misjudged: the
+# wrong branch, the wrong repository, a second open it did not see, or a
+# commit/checkout earlier in the same command it did not account for. So it
 # finds a `gh` word ANYWHERE in a segment (wrappers, keywords, xargs), keeps
 # `#` literal (the shell only comments at word start; shlex does not know
 # that), and reports a `problem` for anything it cannot follow.
@@ -763,8 +782,8 @@ def pr_open_call(tool_name: str, tool_input: object) -> dict | None:
      "count", "problem"}. `commits`/`adds`: the same command runs `git commit`
     / `git add` before the open, so the gate (which runs first) must judge
     what that commit will add. `problem`: why the call cannot be judged at
-    all -- the gate denies it. A command with more than one PR open is a
-    problem: the gate judges one open per command."""
+    all -- the gate denies it and mints no grant. A command with more than
+    one PR open is a problem: one grant must cover one judged open."""
     if not isinstance(tool_input, dict):
         return None
     if tool_name == "mcp__github__create_pull_request":
@@ -786,9 +805,21 @@ def pr_open_call(tool_name: str, tool_input: object) -> dict | None:
     call = dict(opens[0])
     call["count"] = len(opens)
     if len(opens) > 1:
-        call["problem"] = (f"this command opens {len(opens)} PRs; the gate judges one "
-                           "PR open per command, so run each on its own")
+        call["problem"] = (f"this command opens {len(opens)} PRs; one grant covers one "
+                           "judged PR open, so run each on its own")
     return call
+
+
+def call_key(tool_name: str, tool_input: dict, cwd: object = "") -> str:
+    """Where a grant is filed: the exact command (or exact MCP input) run
+    from the exact session cwd. The same command from another checkout is
+    another call. The tip the grant was judged on is checked when it is
+    spent (pr-open-gate.on_permission)."""
+    if tool_name == "Bash":
+        body = str(tool_input.get("command", ""))
+    else:
+        body = json.dumps(tool_input, sort_keys=True)
+    return sha256(tool_name + "\0" + body + "\0" + str(cwd or ""))
 
 
 GITHUB_URL = re.compile(r"github\.com[:/]+([^/\s]+)/([^/\s]+?)(?:\.git)?/?$", re.I)

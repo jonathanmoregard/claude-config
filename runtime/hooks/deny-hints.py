@@ -120,7 +120,7 @@ HINTS: list[tuple[tuple[str, ...], str]] = [
         ("*artl-evidence.jsonl*", "*artl-exemptions.jsonl*", "*claude-pr-open-gate*"),
         "Why the rule exists: ~/.local/state/claude-pr-open-gate/ holds the "
         "PR-open gate's records -- advisor verdicts, the files each advisor "
-        "read, exemptions and the user's skip-artl override. "
+        "read, exemptions, one-shot grants and the user's skip-artl override. "
         "Only hooks/pr-open-gate.py and hooks/artl-evidence.py write them; a "
         "shell command that touches them can forge the review the gate asks "
         "for.\n"
