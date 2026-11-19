@@ -39,7 +39,13 @@ def user_scope_roots() -> list[pathlib.Path]:
         dirs = data["permissions"]["additionalDirectories"]
     except (OSError, ValueError, KeyError, TypeError):
         return []
-    return [pathlib.Path(d).expanduser().resolve() for d in dirs if isinstance(d, str)]
+    roots = []
+    for d in dirs if isinstance(dirs, list) else []:
+        try:
+            roots.append(pathlib.Path(d).expanduser().resolve())
+        except (TypeError, RuntimeError, OSError):
+            continue
+    return roots
 
 
 def covered(path: str, roots: list[pathlib.Path]) -> bool:

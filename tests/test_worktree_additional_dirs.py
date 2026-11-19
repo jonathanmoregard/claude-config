@@ -93,7 +93,11 @@ def main() -> int:
         manual = str(root / "hand-added")
         (repo / ".claude").mkdir()
         settings = repo / ".claude" / "settings.local.json"
-        settings.write_text(json.dumps({"permissions": {"additionalDirectories": [manual]}}))
+        # A list written before covered worktrees were skipped: the covered
+        # one is ours to remove, the hand-added one is not.
+        settings.write_text(json.dumps({
+            "permissions": {"additionalDirectories": [manual, str(covered)]},
+            "_managedWorktreeDirs": [str(covered)]}))
 
         subprocess.run([sys.executable, str(HOOK)], input="{}", text=True, capture_output=True,
                        env={**ENV, "CLAUDE_PROJECT_DIR": str(repo), "CLAUDE_CONFIG_DIR": str(cfg)}, timeout=60)
@@ -108,6 +112,19 @@ def main() -> int:
               str(legacy_merged) not in dirs, str(dirs))
         check("worktree ahead of every remote's default branch kept",
               str(legacy_ahead) in dirs, str(dirs))
+
+        for label, value in (("null", None), ("a string", "/"), ("a number", 7),
+                             ("an unknown ~user", ["~no-such-user-e2e/x"])):
+            (cfg / "settings.json").write_text(json.dumps(
+                {"permissions": {"additionalDirectories": value}}))
+            proc = subprocess.run(
+                [sys.executable, str(HOOK)], input="{}", text=True, capture_output=True,
+                env={**ENV, "CLAUDE_PROJECT_DIR": str(repo), "CLAUDE_CONFIG_DIR": str(cfg)},
+                timeout=60)
+            dirs = json.loads(settings.read_text())["permissions"]["additionalDirectories"]
+            check(f"user-level list that is {label}: exits 0 and drops nothing",
+                  proc.returncode == 0 and str(dirty) in dirs and str(covered) in dirs,
+                  f"rc={proc.returncode} {proc.stderr[-200:]} {dirs}")
 
     print("all passed" if not FAILURES else f"{len(FAILURES)} failed")
     return 1 if FAILURES else 0
