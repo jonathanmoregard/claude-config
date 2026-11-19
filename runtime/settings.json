@@ -363,7 +363,10 @@
       "mcp__github__create_pull_request",
       "Edit(//home/jonathan/Repos/**/.github/workflows/**)",
       "Edit(//home/jonathan/worktrees/**/.github/workflows/**)",
+      "Edit(//home/jonathan/Repos/**/.github/actions/**)",
+      "Edit(//home/jonathan/worktrees/**/.github/actions/**)",
       "Edit(//home/jonathan/Repos/**/CLAUDE.md)",
+      "Edit(//home/jonathan/Repos/**/CLAUDE.local.md)",
       "Edit(//home/jonathan/Repos/**/AGENTS.md)"
     ],
     "defaultMode": "default",
