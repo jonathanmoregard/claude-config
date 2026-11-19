@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Compile and flash both Corne halves (crkbd/rev1, Pro Micro caterina).
 # stdout carries only user-facing prompts (one per step); everything else goes to $LOG.
+# qmk + avrdude come from PATH (declared in nixos-config hosts/tuxedo).
 # Env: QMK_DIR (~/Repos/qmk_firmware), KEYMAP (hands-down-se), WAIT_S per half (600).
 set -uo pipefail
 QMK_DIR="${QMK_DIR:-$HOME/Repos/qmk_firmware}"
@@ -8,32 +9,23 @@ KEYMAP="${KEYMAP:-hands-down-se}"
 WAIT_S="${WAIT_S:-600}"
 LOG="${LOG:-${TMPDIR:-/tmp}/flash-corne.log}"
 
-if [ -z "${IN_QMK_SHELL:-}" ]; then
-  self=$(readlink -f "$0")
-  cd "$QMK_DIR" || { echo "❌ no qmk_firmware at $QMK_DIR"; exit 1; }
-  { : >"$LOG"; } 2>/dev/null || { echo "❌ can't write log $LOG"; exit 1; }
-  echo "⏳ Loading qmk + avrdude…"
-  export IN_QMK_SHELL=1 LOG
-  # Relay the inner run's events. Any failure that didn't end on its own ❌
-  # (nix failing to load, an abort mid-script) still gets one, so stdout is
-  # never silent on failure. Upstream QMK dropped shell.nix; use nixpkgs.
-  last=""
-  while IFS= read -r line; do
-    case $line in
-      __rc=*) rc=${line#__rc=} ;;
-      *) echo "$line"; last=$line ;;
-    esac
-  done < <(nix shell nixpkgs#qmk nixpkgs#avrdude -c bash "$self" 2>>"$LOG"; echo "__rc=$?")
-  if [ "${rc:-1}" != 0 ] && [ "${last#❌}" = "$last" ]; then
-    echo "❌ flash stopped (exit ${rc:-?}), see $LOG"
-  fi
-  exit "${rc:-1}"
-fi
+# Every failure ends in exactly one ❌: failed() prints its own, and any other
+# non-zero exit (an abort mid-script) gets a generic one from the EXIT trap.
+reported=0
+failed() { echo "❌ $*"; reported=1; exit 1; }
+trap 'rc=$?; if [ "$rc" != 0 ] && [ "$reported" = 0 ]; then echo "❌ flash stopped (exit $rc), see $LOG"; fi' EXIT
+
+for tool in qmk avrdude; do
+  command -v "$tool" >/dev/null || failed "$tool not on PATH (declared in nixos-config hosts/tuxedo)"
+done
+cd "$QMK_DIR" || failed "no qmk_firmware at $QMK_DIR"
+{ : >"$LOG"; } 2>/dev/null || failed "can't write log $LOG"
+exec 2>>"$LOG"   # Monitor runs us with 2>&1; keep shell errors off the event stream
 
 HEX=".build/crkbd_rev1_${KEYMAP}.hex"
 echo "⏳ Compiling $KEYMAP…"
-qmk compile -kb crkbd/rev1 -km "$KEYMAP" >>"$LOG" 2>&1 || { echo "❌ compile failed, see $LOG"; exit 1; }
-[ -f "$HEX" ] || { echo "❌ no $HEX after compile, see $LOG"; exit 1; }
+qmk compile -kb crkbd/rev1 -km "$KEYMAP" >>"$LOG" 2>&1 || failed "compile failed, see $LOG"
+[ -f "$HEX" ] || failed "no $HEX after compile, see $LOG"
 
 shopt -s nullglob
 prompt_left="👉 Cable in LEFT half, press reset."
@@ -55,7 +47,7 @@ for half in LEFT RIGHT; do
     fi
     sleep 0.2
   done
-  (( ok )) || { echo "❌ $half: no bootloader within ${WAIT_S}s, stopped."; exit 1; }
+  (( ok )) || failed "$half: no bootloader within ${WAIT_S}s, stopped."
   while compgen -G '/dev/ttyACM*' >/dev/null; do sleep 0.2; done
   if [ "$half" = LEFT ]; then echo "✅ Left flashed. $prompt_right"; sleep 2; fi
 done
