@@ -30,13 +30,13 @@ non-agent script with its own tests, a formatting-only diff.
 ```bash
 cd ~/worktrees/claude-<slug>
 git add -A && git commit -m wip   # arm is a ref; -A so new skills/scenarios are in it
-python3 scripts/agent-e2e/agent_e2e.py run tests/agent-e2e/<scenario> \
+python3 runtime/scripts/agent-e2e/agent_e2e.py run tests/agent-e2e/<scenario> \
   --arm old=origin/master --arm new=$(git rev-parse --short HEAD) --n 5
 ```
 
-In a sandboxed session the harness cannot start its own jail. Launch it
-through the confined runner, as the whole command:
-`~/.claude/scripts/confined -- python3 scripts/agent-e2e/agent_e2e.py run …`.
+In a sandboxed session, run the harness from the worktree through the
+confined runner, as the whole command:
+`~/.claude/scripts/confined -- python3 runtime/scripts/agent-e2e/agent_e2e.py run …`.
 
 Run it with `run_in_background: true`, since a batch takes minutes. Finished
 runs are skipped on re-run, so a killed batch never re-spends.

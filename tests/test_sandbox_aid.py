@@ -2,7 +2,9 @@
 logs requests to leave the sandbox. It must stay silent everywhere else."""
 from __future__ import annotations
 
+import fnmatch
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -47,8 +49,19 @@ def test_nested_sandbox_failure_points_at_confined(tmp_path: Path) -> None:
         "bwrap: Creating new namespace failed: nesting depth or "
         "/proc/sys/user/max_*_namespaces exceeded (ENOSPC)"))
     assert proc.returncode == 2
-    assert "scripts/confined -- " in proc.stderr
     assert [(r["kind"], r["hint"]) for r in records] == [("hint", "nested")]
+    assert_routes_run_unsandboxed(proc.stderr, "confined -- ")
+
+
+def assert_routes_run_unsandboxed(hint: str, route: str) -> None:
+    """The command form a hint offers must be one the sandbox lets out, or the
+    agent follows it straight back into the failure."""
+    settings = json.loads((REPO / "runtime" / "settings.json").read_text())
+    excluded = settings["sandbox"]["excludedCommands"]
+    offered = [c for c in re.findall(r"`([^`]+)`", hint) if route in c]
+    assert offered, hint
+    for command in offered:
+        assert any(fnmatch.fnmatchcase(command, pattern) for pattern in excluded), command
 
 
 def test_hint_also_reads_a_completed_call(tmp_path: Path) -> None:
@@ -58,6 +71,7 @@ def test_hint_also_reads_a_completed_call(tmp_path: Path) -> None:
                                "stderr": "Failed to connect to user scope bus via local transport"}}
     proc, _ = run_hook(tmp_path, event)
     assert proc.returncode == 2
+    assert_routes_run_unsandboxed(proc.stderr, "confined --detach")
     assert "wait-for unit" in proc.stderr
 
 
