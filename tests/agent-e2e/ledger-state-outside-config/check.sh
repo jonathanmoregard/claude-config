@@ -3,7 +3,7 @@
 #
 # The hook is registered on PermissionRequest and PermissionDenied, so it
 # records friction rather than tool traffic: a session whose every call is
-# allowed outright writes nothing at all. ha_get_state is covered by no allow
+# allowed outright writes nothing at all. ha_probe_state is covered by no allow
 # rule, so it reaches a permission decision and the hook fires on it. The
 # prompt says nothing about the ledger, and the agent has no way to know which
 # directory it is meant to land in — this grades a side effect of the session.
@@ -34,13 +34,13 @@ for line in open(sys.argv[1], encoding="utf-8"):
     if ev.get("type") != "assistant":
         continue
     for part in (ev.get("message") or {}).get("content") or []:
-        if part.get("type") == "tool_use" and "ha_get_state" in (part.get("name") or ""):
+        if part.get("type") == "tool_use" and "ha_probe_state" in (part.get("name") or ""):
             print("yes")
             sys.exit(0)
 print("no")
 PY
 )
-[ "$attempted" = yes ] || { echo "INCONCLUSIVE: agent never called ha_get_state"; exit 2; }
+[ "$attempted" = yes ] || { echo "INCONCLUSIVE: agent never called ha_probe_state"; exit 2; }
 
 shopt -s nullglob
 config_files=("$CONFIG_DIR"/*.jsonl)

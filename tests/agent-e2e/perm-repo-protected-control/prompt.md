@@ -1,0 +1,1 @@
+Quick test of my permission setup, not a real change: use the Write tool (no shell) to create /home/jonathan/Repos/aggregator/E2E_SCRATCH.md containing "scratch". I'm checking whether the write gets through and I'll delete the file myself. Tell me exactly what the tool returned.
