@@ -4,9 +4,9 @@ pasta, no mocks. Every jailed script ends by printing RAN: a jail that never
 started prints nothing, and "the secret is not in the output" would pass on that.
 
 The script reads the settings.json beside its own config tree, so each test
-copies it into a scratch tree with a scratch settings.json. The tree lives in
-/var/tmp: visible inside the jail (a nested call needs it), outside home and
-/tmp, which the jail replaces."""
+copies it into a scratch tree with a scratch settings.json. Trees and plants
+live in the working repository: home, /tmp, /run and /var are replaced inside
+the jail, and a nested call must still see its tree."""
 from __future__ import annotations
 
 import hashlib
@@ -86,24 +86,24 @@ def git_repo(path: Path) -> Path:
 
 @pytest.fixture
 def scratch():
-    """One directory in the real home (under a real write root, so a write
-    there proves the bind) and one in /var/tmp (outside home and /tmp)."""
-    tag = uuid.uuid4().hex[:12]
-    home, var = REAL_HOME / "worktrees" / f".confined-test-{tag}", Path(f"/var/tmp/confined-test-{tag}")
+    """A directory in the real home, under a real write root, so a write
+    there proves the bind."""
+    home = REAL_HOME / "worktrees" / f".confined-test-{uuid.uuid4().hex[:12]}"
     home.mkdir(parents=True)
-    var.mkdir()
-    yield home, var
+    yield home
     shutil.rmtree(home)
-    shutil.rmtree(var)
 
 
 @pytest.fixture
 def world(scratch):
-    home, var = scratch
+    home = scratch
     rw = home / "rw"
     rw.mkdir()
     repo = git_repo(rw / "proj")
     other = git_repo(rw / "other")
+    var = repo / "data"
+    (repo / ".git" / "info").mkdir(exist_ok=True)
+    (repo / ".git" / "info" / "exclude").write_text("data/\n.env.local\n")
     for d in (repo / "locked", other / ".claude", home / "outside", var / "denied",
               var / "vault.d" / "1", var / "cred"):
         d.mkdir(parents=True)
@@ -232,7 +232,7 @@ def test_writes_reach_only_the_working_repo_and_the_shared_tmp(world) -> None:
         "other_repo": world["other"] / "tracked.txt",
         "other_settings": world["other"] / ".claude" / "settings.local.json",
         "deny_write": repo / "locked" / "new",
-        "var_tmp": world["var"] / f"new-{tag}",
+        "var_tmp": Path(f"/var/tmp/confined-test-{tag}"),
         "home_top": REAL_HOME / f".confined-test-{tag}",
         "host_tmp": Path(f"/tmp/confined-test-{tag}"),
     }
@@ -242,7 +242,7 @@ def test_writes_reach_only_the_working_repo_and_the_shared_tmp(world) -> None:
         landed = {name for name, path in targets.items()
                   if path.exists() and "x" in path.read_text()}
     finally:
-        for name in ("shared_tmp", "home_top", "host_tmp"):
+        for name in ("shared_tmp", "home_top", "host_tmp", "var_tmp"):
             targets[name].unlink(missing_ok=True)
     assert landed == {"repo", "shared_tmp"}
 
@@ -515,6 +515,36 @@ def test_host_and_private_networks_are_out_of_reach_but_the_internet_is_not(worl
         assert out[gateway].startswith("blocked"), out
     assert out["outbound"] == "reachable", out
     assert sum(" @" in line for line in proc.stdout.splitlines()) == 0
+
+
+@needs_pasta
+def test_host_unix_sockets_are_out_of_reach_but_the_nix_daemon(world) -> None:
+    tag = uuid.uuid4().hex[:8]
+    places = [Path(f"/run/user/{os.getuid()}"), world["home"], Path("/dev/shm")]
+    paths = [place / f"confined-test-{tag}.sock" for place in places if place.is_dir()]
+    listeners = []
+    try:
+        for path in paths:
+            listener = socket.socket(socket.AF_UNIX)
+            listener.bind(str(path))
+            listener.listen(1)
+            listeners.append(listener)
+        probe = ("import socket, sys\nfor p in sys.argv[1:]:\n"
+                 "    s = socket.socket(socket.AF_UNIX)\n"
+                 "    try:\n        s.connect(p); print(p + '=connected')\n"
+                 "    except OSError:\n        print(p + '=unreachable')\n")
+        proc = jailed(world["script"],
+                      f"python3 -c \"{probe}\" {' '.join(map(str, paths))} "
+                      "/nix/var/nix/daemon-socket/socket", cwd=world["repo"])
+    finally:
+        for listener in listeners:
+            listener.close()
+        for path in paths:
+            path.unlink(missing_ok=True)
+    out = answers(proc)
+    assert {out[str(p)] for p in paths} == {"unreachable"}, out
+    if Path("/nix/var/nix/daemon-socket/socket").exists():
+        assert out["/nix/var/nix/daemon-socket/socket"] == "connected", out
 
 
 @needs_pasta

@@ -7,10 +7,10 @@ that leaves user namespaces enabled, so nested sandboxes work.
 
 Writable: the repository around the working directory (its git dirs too, but
 not their hooks and config) and $TMPDIR, /tmp/confined-<uid>, shared between
-jails. The rest of /tmp is private. Home is empty but for that repository,
-Claude's credentials file and HOME_READ. Agent and git config in the
-repository cannot be written or created. What the `sandbox` block and Read deny
-rules of the settings.json beside this config hide stays hidden.
+jails. Home, /tmp, /run and /var are empty but for that repository, Claude's
+credentials file and SHOWN. Agent and git config in the repository cannot be
+written or created. What the `sandbox` block and Read deny rules of the
+settings.json beside this config hide stays hidden.
 Network: its own namespace, IPv4 only. The host, private, link-local and
 tailnet ranges are refused, except DNS to the configured resolvers; the rest of
 the internet is reachable, without a domain filter.
@@ -48,7 +48,10 @@ PASTA = ["--quiet", "--config-net", "--ipv4-only", "--no-map-gw", "-t", "none", 
 NON_GLOBAL = ("0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
               "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24", "192.168.0.0/16", "198.18.0.0/15",
               "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/3")
-HOME_READ = (".local/bin/claude",)
+# Home, /tmp, /run and /var start empty in the jail; these come back read-only.
+# /run and /var hold host service sockets (tailscaled, libvirt, VM shares).
+SHOWN = {"home": (".local/bin/claude", ".config/dcg/config.toml"), "/run": ("current-system",),
+         "/var": ()}
 PROTECTED = (
     ".claude/settings.json", ".claude/settings.local.json", ".claude/hooks", ".claude/skills",
     ".claude/agents", ".claude/commands", ".claude/workflows", ".claude/routines",
@@ -374,12 +377,14 @@ def shared_tmp() -> str:
 
 def jail(profile: Profile, repo: Repo, cwd: str, home: str, tmp: str) -> list[str]:
     creds = os.path.join(home, ".claude/.credentials.json")
-    reads = [os.path.join(home, rel) for rel in HOME_READ if os.path.exists(os.path.join(home, rel))]
+    replaced = {"home": home, "/tmp": "/tmp", "/run": "/run", "/var": "/var"}
+    reads = [os.path.join(replaced[top], rel) for top, rels in SHOWN.items() for rel in rels
+             if os.path.exists(os.path.join(replaced[top], rel))]
     writes = [tmp, repo.top, *repo.git]
     bound = [*reads, *writes, creds]
 
     def visible(path: str) -> bool:
-        return (not under(path, home) and not under(path, "/tmp")) or \
+        return not any(under(path, r) for r in replaced.values()) or \
             any(under(path, b) or under(b, path) for b in bound)
 
     # Claude's sandbox leaves the credentials file readable despite its Read
@@ -396,7 +401,7 @@ def jail(profile: Profile, repo: Repo, cwd: str, home: str, tmp: str) -> list[st
     args =["--unshare-user", "--uid", str(os.getuid()), "--gid", str(os.getgid()),
             "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
             "--unshare-pid", "--unshare-ipc", "--new-session", "--die-with-parent",
-            "--tmpfs", home, "--tmpfs", "/tmp"]
+            *(arg for r in replaced.values() for arg in ("--tmpfs", r))]
     if os.path.exists("/dev/net/tun"):
         args += ["--dev-bind", "/dev/net/tun", "/dev/net/tun"]
     for path in reads:
