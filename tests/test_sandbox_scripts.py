@@ -84,6 +84,8 @@ def test_unit_read_refuses_everything_else(tmp_path: Path, args: tuple[str, ...]
 @pytest.mark.parametrize("args", [("--user", "show", "-p", "Environment"),
                                   ("--user", "show", "-p", "Id,Environment", "x.service"),
                                   ("show", "--property=Environment", "x.service"),
+                                  ("show", "-p", "SetCredential", "x.service"),
+                                  ("show", "-p", "Id,SetCredentialEncrypted", "x.service"),
                                   ("--user", "show-environment")])
 def test_unit_read_shows_no_environment(tmp_path: Path, args: tuple[str, ...]) -> None:
     rc, calls, _ = run_unit_read(tmp_path, *args)
@@ -92,6 +94,8 @@ def test_unit_read_shows_no_environment(tmp_path: Path, args: tuple[str, ...]) -
 
 @pytest.mark.parametrize("verb, output", [
     ("show", "Id=x.service\nEnvironment=TOKEN=leaked\nActiveState=active\n"),
+    ("show", "Id=x.service\nSetCredential=db:leaked\nSetCredentialEncrypted=k:leaked\nActiveState=active\n"),
+    ("cat", "[Service]\nSetCredential=db:leaked\nExecStart=/bin/true\n"),
     ("cat", "[Service]\nEnvironment=\"TOKEN=leaked\" \\\n  \"MORE=leaked\"\n"
             "  Environment=TOKEN=leaked\nExecStart=/bin/true\n"),
 ])
