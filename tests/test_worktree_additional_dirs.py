@@ -116,7 +116,8 @@ def main() -> int:
               str(legacy_ahead) in dirs, str(dirs))
 
         for label, value in (("null", None), ("a string", "/"), ("a number", 7),
-                             ("an unknown ~user", ["~no-such-user-e2e/x"])):
+                             ("an unknown ~user", ["~no-such-user-e2e/x"]),
+                             ("a path with a NUL", ["a\x00b"])):
             (cfg / "settings.json").write_text(json.dumps(
                 # arftl-allow: permission-widened (fixture written to a scratch config)
                 {"permissions": {"additionalDirectories": value}}))

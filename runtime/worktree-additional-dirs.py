@@ -43,7 +43,7 @@ def user_scope_roots() -> list[pathlib.Path]:
     for d in dirs if isinstance(dirs, list) else []:
         try:
             roots.append(pathlib.Path(d).expanduser().resolve())
-        except (TypeError, RuntimeError, OSError):
+        except (TypeError, ValueError, RuntimeError, OSError):
             continue
     return roots
 
