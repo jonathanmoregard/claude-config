@@ -42,6 +42,15 @@ def test_git_auth_failure_points_at_the_broker(tmp_path: Path) -> None:
     assert [(r["kind"], r["hint"]) for r in records] == [("hint", "git-auth")]
 
 
+def test_nested_sandbox_failure_points_at_confined(tmp_path: Path) -> None:
+    proc, records = run_hook(tmp_path, failed(
+        "bwrap: Creating new namespace failed: nesting depth or "
+        "/proc/sys/user/max_*_namespaces exceeded (ENOSPC)"))
+    assert proc.returncode == 2
+    assert "scripts/confined -- " in proc.stderr
+    assert [(r["kind"], r["hint"]) for r in records] == [("hint", "nested")]
+
+
 def test_hint_also_reads_a_completed_call(tmp_path: Path) -> None:
     event = {"hook_event_name": "PostToolUse", "tool_name": "Bash",
              "tool_input": {"command": "systemctl --user status x | head"},

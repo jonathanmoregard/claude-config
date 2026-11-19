@@ -33,6 +33,10 @@ systemd-run --user --unit=<slug> --working-directory=<dir> \
 ```
 
 - **Always append sentinel markers** (`GATE_ALL_GREEN`/`GATE_FAILED` style).
+- **In a sandboxed session** `systemd-run` has no bus. Launch with
+  `~/.claude/scripts/confined --detach <slug> -- <cmd> [args...]` as the whole
+  command: same unit name, log path and markers, and the job runs in a jail of
+  its own (no `gh`, no brokers, no host-local services).
   They show progress and make the log readable to a human. The retained unit
   status is the verdict; never infer success from silence or an empty log.
 - The unit name is the rerun handle, and `RemainAfterExit` is what keeps the

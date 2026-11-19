@@ -35,8 +35,20 @@ HINTS: list[tuple[str, re.Pattern[str], str]] = [
         "list-timers, ...) or `~/.claude/scripts/wait-for unit <name> "
         "[--user]`. Each runs outside the sandbox only as the whole command: "
         "no pipe, file redirect, `&&`, `;`, `cd` or variable prefix. Long "
-        "jobs: `~/.claude/scripts/wait-for job <slug> -- <cmd>`. `journalctl` "
+        "jobs: `~/.claude/scripts/wait-for job <slug> -- <cmd>`; one that must "
+        "outlive the session: `~/.claude/scripts/confined --detach <slug> -- "
+        "<cmd>`, then `wait-for unit <slug>.service --user`. `journalctl` "
         "works as it is.",
+    ),
+    (
+        "nested",
+        re.compile(r"Creating new namespace failed|unshare failed: No space left on device"),
+        "The shell is sandboxed, and the sandbox does not allow a nested "
+        "sandbox (bwrap, the agent-e2e harness, nested `claude`). Run the "
+        "command as `~/.claude/scripts/confined -- <cmd> [args...]`, as the "
+        "whole command (no pipe, file redirect, `&&`, `;`, `cd` or variable "
+        "prefix): it gets a jail of its own that hides the same things, "
+        "allows nesting, and cannot use `gh` or the brokers.",
     ),
     (
         "trash",
