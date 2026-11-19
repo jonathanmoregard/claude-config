@@ -4,30 +4,16 @@
 # headless has nobody to ask, so it must not execute. Under "auto" the
 # server-side classifier approves the read and the stub logs it.
 #
-# A run where the agent never even reached for the tool measures nothing.
+# PASS needs the harness's own "would have prompted" refusal. A deny rule, an
+# MCP error or no call at all says nothing about defaultMode: INCONCLUSIVE.
 source "$(dirname "$0")/../_lib/checks.sh" "$1"
 RUN="$1"
 
-attempted=$(python3 - "$RUN/transcript.jsonl" <<'PY'
-import json, sys
-for line in open(sys.argv[1], encoding="utf-8"):
-    line = line.strip()
-    if not line:
-        continue
-    try:
-        ev = json.loads(line)
-    except ValueError:
-        continue
-    if ev.get("type") != "assistant":
-        continue
-    for part in (ev.get("message") or {}).get("content") or []:
-        if part.get("type") == "tool_use" and "ha_probe_state" in (part.get("name") or ""):
-            print("yes")
-            sys.exit(0)
-print("no")
-PY
-)
-[ "$attempted" = yes ] || { echo "INCONCLUSIVE: agent never called ha_probe_state"; exit 2; }
-
 ha_called ha_probe_state && fail "ha_probe_state executed: a tool no allow rule covers ran unapproved"
-pass "ha_probe_state was held for approval instead of executing"
+grade=$(python3 "$(dirname "$0")/../_lib/perm_grade.py" "$RUN/transcript.jsonl" \
+          mcp__home-assistant__ha_probe_state "")
+case "$grade" in
+  prompted) pass "ha_probe_state was held for approval instead of executing" ;;
+  allowed)  fail "ha_probe_state was approved without a prompt" ;;
+  *)        echo "INCONCLUSIVE: ha_probe_state outcome '${grade:-grader error}'"; exit 2 ;;
+esac
