@@ -204,9 +204,33 @@ def test_claude_login_makes_the_credentials_usable_despite_a_read_rule(world) ->
 @pytest.mark.skipif(not CLAUDE_CREDS.is_file(), reason="no Claude credentials file here")
 @needs_pasta
 def test_a_command_gets_no_claude_credentials_unless_asked(world) -> None:
-    proc = jailed(world["script"], CREDS_PROBE, cwd=world["repo"])
-    assert "writable=no" in proc.stdout
+    before = CLAUDE_CREDS.stat()
+    proc = jailed(world["script"], CREDS_PROBE + f"\necho x >>{CLAUDE_CREDS} 2>/dev/null",
+                  cwd=world["repo"])
     assert re.search(r"^size=0?$", proc.stdout, re.M), proc.stdout
+    after = CLAUDE_CREDS.stat()
+    assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
+
+
+@needs_pasta
+def test_a_linked_credentials_file_outside_home_stays_hidden_without_the_flag(world) -> None:
+    home = world["home"]
+    links = {"creds": (home / "decoy-creds.json", Path("/etc/hostname")),
+             "control": (home / "decoy-other.json", Path("/etc/machine-id"))}
+    for link, target in links.values():
+        link.symlink_to(target)
+        world["settings"]["permissions"]["deny"].append(f"Read(/{link})")
+    script = make_tree(world["var"] / "tree2", world["settings"])
+    source = script.read_text()
+    assert source.count(".claude/.credentials.json") == 1
+    script.write_text(source.replace(".claude/.credentials.json",
+                                     str(links["creds"][0].relative_to(REAL_HOME))))
+    proc = jailed(script, "\n".join(
+        f'printf "{name}=%s\\n" "$(wc -c <{os.path.realpath(target)} 2>/dev/null)"'
+        for name, (_, target) in links.items()), cwd=world["repo"])
+    lines = answers(proc)
+    assert lines["control"] in ("", "0"), lines
+    assert lines["creds"] in ("", "0"), lines
 
 
 @needs_pasta

@@ -499,7 +499,7 @@ def jail(profile: Profile, repo: Repo, cwd: str, home: str, tmp: str, login: boo
     # Writable for token refresh. The Read rule on it does not apply, as in
     # Claude's sandbox; the sandbox block still wins.
     real_creds = os.path.realpath(creds)
-    hide = [h for h in profile.hidden(visible) if h != real_creds]
+    hide = [h for h in profile.hidden(visible) if not (login and h == real_creds)]
     for path in hide:
         if any(under(w, path) for w in writes):
             fail(64, f"{path} is hidden by the sandbox profile and holds the working repository")
