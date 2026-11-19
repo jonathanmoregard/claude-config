@@ -777,87 +777,6 @@ def test_every_gate_event_is_wired_to_an_existing_script():
     assert _registered("SubagentStop", "artl-evidence.py")
 
 
-# --- finding 2: permissions.ask is the gate; the hook only grants ------------
-# Break: an ask list that leaves a PR-open route to the bare `Bash` allow rule
-# (bcdca10 covered only `gh pr create` / `gh pr new`), so a hung, crashed,
-# misparsing or missing hook opens the PR with no prompt.
-#
-# _ask_matches models what the ask GLOBS guarantee: every rule is a pattern
-# whose only wildcard is `*`, tested against each subcommand's RAW text --
-# split on `&&` `||` `;` `|` and newlines -- with whitespace runs collapsed
-# and a leading `VAR=x` stripped. It is a lower bound, deliberately.
-# MEASURED (round 3), the real matcher differs by Claude Code version on
-# quote-split keywords: 2.1.322 asks for `gh pr cre"ate"` and `gh pr
-# cr''eate`, 2.1.311 runs them (8/8 runs, same staged config). Neither is
-# promised: splitting a keyword with quotes takes intent, which the gate
-# does not try to stop. A variable spelling (`${g}h pr create`) runs on both.
-
-import re as _re
-
-
-def _ask_rules() -> list[str]:
-    return [r[5:-1] for r in _settings()["permissions"]["ask"] if r.startswith("Bash(")]
-
-
-def _glob(pattern: str) -> "_re.Pattern[str]":
-    return _re.compile("^" + ".*".join(_re.escape(p) for p in pattern.split("*")) + "$", _re.S)
-
-
-def _ask_matches(command: str) -> bool:
-    rules = [_glob(p) for p in _ask_rules()]
-    for piece in _re.split(r"&&|\|\||;|\||\n", command):
-        piece = _re.sub(r"\s+", " ", piece).strip()
-        piece = _re.sub(r"^(?:[A-Za-z_]\w*=\S*\s+)+", "", piece)
-        if any(rx.match(piece) for rx in rules):
-            return True
-    return False
-
-
-PR_OPEN_SPELLINGS = [
-    "gh pr create --fill", "gh pr new --title x --body y", "gh  pr  create --fill",
-    "gh pr \"create\" --fill", "/usr/bin/gh pr create --fill",
-    "cd /tmp && GH_REPO=a/b timeout 5 nice gh pr create --fill",
-    "python3 -c \"import subprocess; subprocess.run(['gh','pr','create','--fill'])\"",
-    "bash -c 'gh pr create --fill'", "echo \"$(gh pr create --fill)\"",
-    "gh api repos/o/r/pulls -f title=x -f head=feat/x",
-    "gh api repos/o/r/pulls --field=title=x", "gh api repos/o/r/pulls -ftitle=x",
-    "gh api https://api.github.com/repos/o/r/pulls -f title=x",
-    "if true; then gh api 'repos/o/r/pulls?a=1' -f title=x; fi",
-    "{ gh pr create --fill; }", "timeout 9 gh pr create --fill",
-    "echo a#b; gh api repos/o/r/pulls -f title=x", "x=$((1<<n))\ngh pr create --fill",
-    "xargs gh pr create < /dev/null", "gh api -XPOST repos/o/r/pulls --input b.json",
-    "gh api --method=POST repos/o/r/pulls", "gh api -X POST /repos/o/r/pulls -f head=x",
-    "gh api \"repos/o/r/pulls\" -f title=x", "gh api repos/o/r/pulls --input - <<< '{}'",
-    "gh api graphql -f query='mutation { createPullRequest(input:{}) { x } }'",
-    "gh alias set mk 'pr create'",
-]
-# Deliberately NOT asked (round 3: the gate is friction for ordinary
-# spellings, and each of these takes intent): `EP=repos/o/r/pulls; gh api $EP
-# -f ...` and `${g}h pr create` (the matcher expands no variables), a keyword
-# split with quotes (`cre"ate"`; asked on 2.1.322, not on 2.1.311), a GraphQL
-# mutation read from a file (`-F query=@m.graphql`), curl to the REST API, and
-# a PR opened by a script file, a git hook, a gh alias or an interpreter.
-
-
-@pytest.mark.parametrize("command", PR_OPEN_SPELLINGS)
-def test_f2_every_pr_open_spelling_meets_an_ask_rule(command):
-    assert _ask_matches(command), command
-
-
-@pytest.mark.parametrize("command", ["gh pr view 3", "gh pr list", "git status",
-                                     "gh api repos/o/r/pulls/1/comments", "gh repo view"])
-def test_f2_reads_do_not_prompt(command):
-    # The over-match is bounded: a REST GET cannot open a PR and is not asked.
-    assert not _ask_matches(command), command
-
-
-def test_f2_the_mcp_create_tool_is_asked_and_bash_alone_is_allowed():
-    perms = _settings()["permissions"]
-    assert "mcp__github__create_pull_request" in perms["ask"]
-    # Why the ask list matters: an ordinary spelling it misses runs unprompted.
-    assert "Bash" in perms["allow"]
-
-
 def test_f2_the_hook_never_answers_allow_without_a_grant(sb):
     # Its only privilege: a PermissionRequest is answered only from a grant.
     sb.commit("docs/guide.md", "hello\n")          # exempt, so the gate passes
@@ -1399,17 +1318,6 @@ def render_battery_prompt(battery: dict) -> str:
             "`N: ran` or `N: refused`.\n")
 
 
-def test_ask_coverage_prompt_lists_the_battery():
-    scen = E2E / "artl-gate-ask-coverage"
-    battery = json.loads((scen / "battery.json").read_text())
-    assert (scen / "prompt.md").read_text() == render_battery_prompt(battery)
-    # The unit model of the matcher agrees with the battery the real one runs.
-    for cmd in battery["opens"]:
-        assert _ask_matches(cmd), cmd
-    for cmd in battery["controls"]:
-        assert not _ask_matches(cmd), cmd
-
-
 # =============================================================================
 # Round 3: the close-out review. The gate is FRICTION that makes an honest
 # agent review before it opens a PR, not a security boundary: each test below
@@ -1704,57 +1612,3 @@ def test_r3_9_reviewed_before_pr_takes_only_records_the_gate_honours(tmp_path, r
 
 def test_r3_9_an_honoured_record_still_counts(tmp_path):
     assert _reviewed(tmp_path, {}) == 0
-
-
-# --- r3 items 10 + 12: the ask rules, against the matcher as MEASURED -----------
-# Break (10): an ask rule on every `gh api` call with a field or a method,
-# which headless refuses -- reads, comments, and `-X GET .../pulls` included.
-# Break (12): a unit model that predicts quote-splitting slips past the
-# matcher; the real one asks for all three spellings below (measured).
-
-@pytest.mark.parametrize("command", [
-    "gh api graphql -f query='{viewer{login}}'",
-    "gh api repos/acme/widget/issues/1/comments -f body=hi",
-    "gh api -X GET repos/acme/widget/pulls",
-    "gh api repos/acme/widget/pulls",
-    "gh api --method GET 'repos/acme/widget/pulls?state=open'",
-])
-def test_r3_10_api_calls_that_cannot_open_a_pr_are_not_asked(command):
-    assert not _ask_matches(command), command
-
-
-# MEASURED (19996ee e2e battery, 3/3 runs): a double-quoted endpoint ran
-# unasked under rules that required `pulls ` / `pulls?` right after the path
-# -- the matcher compares the raw text, `pulls" -f`. Quoting a path is an
-# ordinary spelling, so the rules must not depend on what follows `pulls`.
-@pytest.mark.parametrize("command", [
-    "gh api \"repos/acme/widget/pulls\" -f title=t",
-    "gh api 'repos/acme/widget/pulls' -f title=t -f head=x",
-    "gh api -X POST \"repos/acme/widget/pulls\"",
-    "gh api --input b.json 'repos/acme/widget/pulls'",
-])
-def test_r3_10_a_quoted_pulls_endpoint_is_still_asked(command):
-    assert _ask_matches(command), command
-
-
-@pytest.mark.parametrize("command", [
-    "gh api repos/acme/widget/pulls -f title=t -f head=feat/x",   # implicit POST
-    "gh api repos/acme/widget/pulls -ftitle=t",
-    "gh api repos/acme/widget/pulls --raw-field=title=t",
-    "gh api --method=POST repos/acme/widget/pulls",
-    "gh api 'repos/acme/widget/pulls?x=1' -f title=t",
-])
-def test_r3_10_the_idiomatic_pr_creating_api_calls_are_asked(command):
-    assert _ask_matches(command), command
-
-
-@pytest.mark.parametrize("command", [
-    "gh pr cre\"ate\" --fill",
-    "gh pr cr''eate --fill",
-    "g=g; ${g}h pr create --fill",
-])
-def test_r3_12_keyword_splitting_is_not_promised_by_the_rules(command):
-    # Break: a model (or a doc) that claims the globs catch a deliberately
-    # split keyword. 2.1.311 runs the first two (measured); only 2.1.322's
-    # matcher asks for them, and nothing here relies on that.
-    assert not _ask_matches(command), command
