@@ -8,7 +8,9 @@ QMK_DIR="${QMK_DIR:-$HOME/Repos/qmk_firmware}"
 KEYMAP="${KEYMAP:-hands-down-se}"
 WAIT_S="${WAIT_S:-600}"
 LOG="${LOG:-${TMPDIR:-/tmp}/flash-corne.log}"
-[[ $LOG = /* ]] || LOG="$PWD/$LOG"   # absolute: the script cds into QMK_DIR later
+# Absolute paths: the script cds into QMK_DIR, and every ❌ names full paths.
+[[ $LOG = /* ]] || LOG="$PWD/$LOG"
+[[ $QMK_DIR = /* ]] || QMK_DIR="$PWD/$QMK_DIR"
 
 # Every failure ends in exactly one ❌: failed() prints its own, and any other
 # non-zero exit (an abort mid-script) gets a generic one from the EXIT trap.
