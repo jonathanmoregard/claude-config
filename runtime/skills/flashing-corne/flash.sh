@@ -8,6 +8,7 @@ QMK_DIR="${QMK_DIR:-$HOME/Repos/qmk_firmware}"
 KEYMAP="${KEYMAP:-hands-down-se}"
 WAIT_S="${WAIT_S:-600}"
 LOG="${LOG:-${TMPDIR:-/tmp}/flash-corne.log}"
+LOG=$(realpath -m -- "$LOG")   # absolute: the script cds into QMK_DIR later
 
 # Every failure ends in exactly one ❌: failed() prints its own, and any other
 # non-zero exit (an abort mid-script) gets a generic one from the EXIT trap.
@@ -21,13 +22,14 @@ trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
 
 { : >"$LOG"; } 2>/dev/null || failed "can't write log $LOG"
 exec 2>>"$LOG"   # Monitor runs us with 2>&1; keep shell errors off the event stream
-[[ $WAIT_S =~ ^[1-9][0-9]*$ ]] || failed "WAIT_S must be a whole number of seconds, got '$WAIT_S'"
+[[ $WAIT_S =~ ^[1-9][0-9]{0,5}$ ]] || failed "WAIT_S must be a whole number of seconds, got '$WAIT_S'"
 for tool in qmk avrdude; do
   command -v "$tool" >/dev/null || failed "$tool not on PATH (declared in nixos-config hosts/tuxedo)"
 done
 cd "$QMK_DIR" || failed "no qmk_firmware at $QMK_DIR"
 
 HEX=".build/crkbd_rev1_${KEYMAP}.hex"
+rm -f "$HEX"   # so the check below can't pass on a stale build
 echo "⏳ Compiling $KEYMAP…"
 qmk compile -kb crkbd/rev1 -km "$KEYMAP" >>"$LOG" 2>&1 || failed "compile failed, see $LOG"
 [ -f "$HEX" ] || failed "no $HEX after compile, see $LOG"
@@ -42,7 +44,8 @@ for half in LEFT RIGHT; do
     ports=(/dev/ttyACM*)
     if (( ${#ports[@]} )); then
       port=${ports[-1]}
-      echo "⏳ ${half^} half in bootloader, writing… keep the cable in."
+      name=${half,,}
+      echo "⏳ ${name^} half in bootloader, writing… keep the cable in."
       sleep 0.7   # let udev apply uaccess
       if timeout 40 avrdude -p atmega32u4 -c avr109 -P "$port" -U "flash:w:$HEX:i" >>"$LOG" 2>&1; then
         ok=1; break
