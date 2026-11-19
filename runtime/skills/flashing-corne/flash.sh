@@ -14,11 +14,14 @@ LOG="${LOG:-${TMPDIR:-/tmp}/flash-corne.log}"
 reported=0
 failed() { echo "❌ $*"; reported=1; exit 1; }
 trap 'rc=$?; if [ "$rc" != 0 ] && [ "$reported" = 0 ]; then echo "❌ flash stopped (exit $rc), see $LOG"; fi' EXIT
-# Signals bypass the EXIT trap unless turned into an exit.
+# Signals bypass the EXIT trap unless turned into an exit. bash runs these
+# only once a running foreground step (compile, avrdude) returns, so a ❌
+# after a kill can lag by that step's duration.
 trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
 
 { : >"$LOG"; } 2>/dev/null || failed "can't write log $LOG"
 exec 2>>"$LOG"   # Monitor runs us with 2>&1; keep shell errors off the event stream
+[[ $WAIT_S =~ ^[1-9][0-9]*$ ]] || failed "WAIT_S must be a whole number of seconds, got '$WAIT_S'"
 for tool in qmk avrdude; do
   command -v "$tool" >/dev/null || failed "$tool not on PATH (declared in nixos-config hosts/tuxedo)"
 done
