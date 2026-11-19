@@ -209,7 +209,7 @@ class Repo:
     git: list[str]          # the git dir, when it is inside top
     outside: list[str]      # git dirs elsewhere, read-only in the jail
     frozen: list[str]       # read-only, created as a stub when absent
-    stubs: dict[str, str]   # absent protected path -> stub content (None: a directory)
+    stubs: dict[str, str | None]  # absent protected path -> content (None: a directory)
 
 
 def repository(cwd: str, profile: Profile) -> Repo:
@@ -261,8 +261,11 @@ def repository(cwd: str, profile: Profile) -> Repo:
             if "HEAD" in files:
                 frozen += [os.path.join(root, "hooks"), os.path.join(root, "config")]
                 dirs[:] = [d for d in dirs if d == "modules"]
-    outside = [d for d in dict.fromkeys(outside) if not under(d, top)]
+    outside = list(dict.fromkeys(outside))
     for d in outside:
+        if under(d, top):
+            fail(64, f"the git pointer in {top} names {d}, inside the repository; its hooks "
+                     "and config could not be protected")
         check(d, "the git dir")
     for path in [os.path.join(top, ".claude"), os.path.join(top, ".git"), *frozen]:
         if os.path.islink(path):
@@ -272,9 +275,10 @@ def repository(cwd: str, profile: Profile) -> Repo:
         first = Path(path)
         while not os.path.lexists(first.parent):
             first = first.parent
-        if not os.path.lexists(first):
-            if os.access(first.parent, os.W_OK):
-                stubs[str(first)] = content.get(path) if first == Path(path) else None
+        if Stubs.marked(str(first.parent)):
+            stubs[str(first.parent)] = None
+        elif not os.path.lexists(first):
+            stubs[str(first)] = content.get(path) if first == Path(path) else None
         elif Stubs.marked(str(first)):
             stubs[str(first)] = None
     return Repo(top, own, outside,
@@ -385,14 +389,27 @@ def shared_tmp() -> str:
     return path
 
 
-def jail(profile: Profile, repo: Repo, cwd: str, home: str, tmp: str) -> list[str]:
+def pinned(path: str) -> int:
+    """A descriptor for path, proven to be what was checked: bwrap binds it
+    even if the caller swaps a directory for a symlink in the meantime."""
+    try:
+        fd = os.open(path, os.O_PATH | os.O_NOFOLLOW)
+    except OSError as e:
+        fail(64, f"cannot open {path}: {e}")
+    if os.readlink(f"/proc/self/fd/{fd}") != path or stat.S_ISLNK(os.fstat(fd).st_mode):
+        fail(64, f"{path} changed while it was being checked")
+    return fd
+
+
+def jail(profile: Profile, repo: Repo, cwd: str, home: str, tmp: str
+         ) -> tuple[list[str], list[int]]:
+    """bwrap's arguments and the descriptors they name."""
     creds = os.path.join(home, ".claude/.credentials.json")
     replaced = {"home": home, "/tmp": "/tmp", "/run": "/run", "/var": "/var"}
     reads = [os.path.join(replaced[top], rel) for top, rels in SHOWN.items() for rel in rels
              if os.path.exists(os.path.join(replaced[top], rel))]
-    reads += repo.outside
     writes = [tmp, repo.top, *repo.git]
-    bound = [*reads, *writes, creds]
+    bound = [*reads, *repo.outside, *writes, creds]
 
     def visible(path: str) -> bool:
         return not any(under(path, r) for r in replaced.values()) or \
@@ -417,13 +434,23 @@ def jail(profile: Profile, repo: Repo, cwd: str, home: str, tmp: str) -> list[st
         args += ["--dev-bind", "/dev/net/tun", "/dev/net/tun"]
     for path in reads:
         args += ["--ro-bind", path, path]
+    fds: list[int] = []
+
+    def bind(option: str, source: str, dest: str) -> None:
+        fds.append(pinned(source))
+        args.extend([option, str(fds[-1]), dest])
+
+    for path in repo.outside:
+        bind("--ro-bind-fd", path, path)
     pins = [p for p in [os.path.join(repo.top, ".claude")] if os.path.isdir(p)]
     # Outer first: a later bind of an ancestor would cover a pin inside it.
-    for path in sorted({*writes, *pins, *([creds] if creds else [])}, key=lambda p: p.count("/")):
-        args += ["--bind", path, path]
+    for path in sorted({*writes, *pins}, key=lambda p: p.count("/")):
+        bind("--bind-fd", path, path)
+    if creds:
+        bind("--bind-fd", real_creds, creds)
     for path in [*(d for d in profile.deny_write if any(under(d, w) for w in writes)),
                  *repo.frozen, *repo.stubs]:
-        args += ["--ro-bind", path, path]
+        bind("--ro-bind-fd", path, path)
     for path in hide:
         if os.path.isdir(path):
             args += ["--tmpfs", path, "--remount-ro", path]
@@ -432,7 +459,8 @@ def jail(profile: Profile, repo: Repo, cwd: str, home: str, tmp: str) -> list[st
             args += ["--dev-bind", "/dev/null", path]
     for name in profile.deny_env:
         args += ["--unsetenv", name]
-    return args + ["--setenv", "SANDBOX_RUNTIME", "1", "--setenv", "TMPDIR", tmp, "--chdir", cwd]
+    return args + ["--setenv", "SANDBOX_RUNTIME", "1", "--setenv", "TMPDIR", tmp,
+                   "--chdir", cwd], fds
 
 
 def die_with_parent() -> None:
@@ -492,8 +520,9 @@ class Network:
         os.waitpid(self.pid, 0)
 
 
-def supervise(argv: list[str], net: Network) -> int:
-    child = subprocess.Popen(argv, preexec_fn=lambda: (die_with_parent(), net.enter()))
+def supervise(argv: list[str], fds: list[int], net: Network) -> int:
+    child = subprocess.Popen(argv, pass_fds=fds,
+                             preexec_fn=lambda: (die_with_parent(), net.enter()))
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, lambda signum, _frame: child.send_signal(signum))
     status = child.wait()
@@ -535,15 +564,15 @@ def main() -> None:
         fail(64, f"cannot resolve the working directory: {e}")
     repo = repository(cwd, profile)
     tmp = shared_tmp()
-    bwrap_args = jail(profile, repo, cwd, entry.pw_dir, tmp)
     tools = {name: find(name, entry.pw_name) for name in ("pasta", "bwrap", "iptables-restore")}
-    if args.slug:
-        detach(args, cwd, entry.pw_name, here, tmp)
     stubs = Stubs(repo.stubs)
     try:
+        bwrap_args, fds = jail(profile, repo, cwd, entry.pw_dir, tmp)
+        if args.slug:
+            detach(args, cwd, entry.pw_name, here, tmp)
         net = Network(tools)
         try:
-            status = supervise([tools["bwrap"], *bwrap_args, "--", *args.command], net)
+            status = supervise([tools["bwrap"], *bwrap_args, "--", *args.command], fds, net)
         finally:
             net.close()
     finally:

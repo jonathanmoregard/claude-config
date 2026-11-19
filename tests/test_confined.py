@@ -380,7 +380,8 @@ def test_refuses_a_repo_whose_protected_entry_is_a_symlink(world, entry: str) ->
 
 
 @pytest.mark.parametrize("case", ["write_root", "planted_git_above_root", "outside_roots",
-                                  "deny_write", "tmp_itself", "gitdir_outside_roots"])
+                                  "deny_write", "tmp_itself", "gitdir_outside_roots",
+                                  "gitdir_inside_the_repo"])
 @needs_pasta
 def test_refuses_a_working_directory_it_cannot_confine_to_one_repo(world, case: str) -> None:
     rw, home = world["rw"], world["home"]
@@ -397,6 +398,11 @@ def test_refuses_a_working_directory_it_cannot_confine_to_one_repo(world, case: 
         cwd = world["repo"] / "locked"
     elif case == "tmp_itself":
         cwd = Path("/tmp")
+    elif case == "gitdir_inside_the_repo":
+        cwd = rw / "inner"
+        (cwd / "gd").mkdir(parents=True)
+        (cwd / "gd" / "HEAD").write_text("ref: refs/heads/main\n")
+        (cwd / ".git").write_text(f"gitdir: {cwd}/gd\n")
     else:
         stray = git_repo(home / "outside" / "stray")
         (rw / "pointer").mkdir()
@@ -438,6 +444,62 @@ def test_a_planted_git_pointer_makes_no_other_repository_writable(world, plant: 
                "\n".join(f"echo x >>{t} 2>/dev/null" for t in targets) + f"\necho {RAN}", cwd=cwd)
     assert proc.returncode == 64 or proc.stdout.rstrip().endswith(RAN), proc.stderr
     assert {t: t.read_bytes() if t.exists() else None for t in targets} == before
+
+
+@needs_pasta
+def test_a_git_dir_swapped_for_a_link_mid_launch_exposes_nothing(world) -> None:
+    rw, secret_dir = world["rw"], world["plants"]["denied_dir"].parent
+    cwd, gitdir, parked = rw / "planted", rw / "gd", rw / "gd.real"
+    cwd.mkdir()
+    gitdir.mkdir()
+    (gitdir / "HEAD").write_text("ref: refs/heads/main\n")
+    (cwd / ".git").write_text(f"gitdir: {gitdir}\n")
+    stop = threading.Event()
+
+    def swap() -> None:
+        while not stop.is_set():
+            gitdir.rename(parked)
+            gitdir.symlink_to(secret_dir)
+            time.sleep(0.002)
+            gitdir.unlink()
+            parked.rename(gitdir)
+            time.sleep(0.002)
+
+    swapper = threading.Thread(target=swap)
+    swapper.start()
+    try:
+        seen = [run(world["script"], "--", "sh", "-c", f"cat {gitdir}/secret 2>/dev/null; true",
+                    cwd=cwd).stdout for _ in range(25)]
+    finally:
+        stop.set()
+        swapper.join()
+    assert CANARY not in "".join(seen)
+
+
+@needs_pasta
+def test_git_reads_work_from_a_linked_worktree_but_its_git_dir_is_read_only(world, worktrees) -> None:
+    wt, common = worktrees["wt"], worktrees["common"]
+    proc = jailed(world["script"],
+                  'echo "status=$(git status --porcelain >/dev/null 2>&1; echo $?)"\n'
+                  'echo "log=$(git log --oneline -1 >/dev/null 2>&1; echo $?)"\n'
+                  f'echo x >>{common}/refs/heads/planted 2>/dev/null\necho "ref=$?"', cwd=wt)
+    got = answers(proc)
+    assert (got["status"], got["log"]) == ("0", "0"), proc.stdout
+    assert got["ref"] != "0" and not (common / "refs" / "heads" / "planted").exists()
+
+
+@needs_pasta
+def test_refuses_when_a_guard_cannot_be_placed(world) -> None:
+    repo = world["repo"]
+    (repo / ".claude").mkdir()
+    (repo / ".claude").chmod(0o555)
+    try:
+        proc = run(world["script"], "--", "sh", "-c",
+                   f"chmod u+w {repo}/.claude; echo x >{repo}/.claude/settings.json", cwd=repo)
+    finally:
+        (repo / ".claude").chmod(0o755)
+    assert proc.returncode == 3, proc.stderr
+    assert not (repo / ".claude" / "settings.json").exists()
 
 
 @pytest.mark.parametrize("mutate", [
