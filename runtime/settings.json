@@ -128,6 +128,8 @@
       "Read(//home/jonathan/.claude/plugins/marketplaces/**)",
       "Read(//home/jonathan/.claude/plugins/store/**)",
       "Read(//home/jonathan/.claude/vendor/**)",
+      "Read(//var/lib/claude-runtime/checkout/vendor/**)",
+      "Read(//home/jonathan/plugins/claude-mirror/**)",
       "Read(//home/jonathan/.codex/AGENTS.md)",
       "Read(//home/jonathan/.codex/config.toml)",
       "Read(//home/jonathan/.codex/hooks.json)",
