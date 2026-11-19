@@ -296,7 +296,12 @@ def repository(cwd: str, profile: Profile, sessions: list[str]) -> Repo:
     # can carry into the repository while the jail runs, is safe.
     fixed = [*profile.roots, "/tmp"]
     for project in sessions:
-        if project == top or not any(under(project, r) for r in fixed):
+        if project == top:
+            continue
+        if under(top, project):
+            fail(64, f"{top} is inside the session's project {project}, whose agent and git "
+                     "config it could hold; work in a repository beside the project")
+        if not any(under(project, r) for r in fixed):
             continue
         if under(project, top):
             fail(64, f"the session's project {project} is inside {top}; start the session "

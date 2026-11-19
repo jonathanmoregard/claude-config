@@ -503,6 +503,18 @@ def test_refuses_a_session_project_below_the_top_of_the_repository(world) -> Non
     assert not marker.exists()
 
 
+@needs_pasta
+def test_refuses_a_repository_inside_the_session_project(world) -> None:
+    project = world["repo"]
+    inner = project / ".claude"
+    (inner / ".git").mkdir(parents=True)
+    (inner / "settings.local.json").write_text("{}\n")
+    proc = run(world["script"], "--session", str(project), "--", "sh", "-c",
+               "echo x >>settings.local.json", cwd=inner)
+    assert proc.returncode == 64, proc.stderr
+    assert (inner / "settings.local.json").read_text() == "{}\n"
+
+
 @pytest.mark.parametrize("where, status", [("project", 64), ("repo", 0)])
 @needs_pasta
 def test_the_session_project_is_found_among_the_ancestors(world, where: str, status: int) -> None:
