@@ -54,7 +54,7 @@ def make_tree(config: Path, settings: dict | None, search: tuple[str, ...] | Non
 
 
 def base_env(**extra: str) -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if k != "SANDBOX_RUNTIME"}
+    env = {k: v for k, v in os.environ.items() if k not in ("SANDBOX_RUNTIME", "CLAUDECODE")}
     env.update(extra)
     return env
 
@@ -488,49 +488,33 @@ def test_the_command_inherits_no_descriptor_of_the_host(world) -> None:
     assert not [o for o in opened if not o.startswith(("/dev/", "/proc/", "pipe:"))], opened
 
 
-SESSION_PROBE = """
-echo x >>{s}/.claude/settings.local.json 2>/dev/null
-echo x >{s}/.claude/settings.json 2>/dev/null
-echo x >{s}/.mcp.json 2>/dev/null
-echo x >{s}/ordinary
-"""
-
-
 def session_in(repo: Path) -> Path:
     project = repo / "pkg" / "app"
-    (project / ".claude").mkdir(parents=True)
-    (project / ".claude" / "settings.local.json").write_text("{}\n")
+    project.mkdir(parents=True)
     return project
 
 
-def assert_session_config_untouched(project: Path) -> None:
-    assert (project / ".claude" / "settings.local.json").read_text() == "{}\n"
-    assert not (project / ".claude" / "settings.json").exists()
-    assert not (project / ".mcp.json").exists()
-    assert (project / "ordinary").read_text() == "x\n"
-
-
 @needs_pasta
-def test_a_session_project_inside_the_repository_keeps_its_agent_config(world) -> None:
-    project = session_in(world["repo"])
-    proc = run(world["script"], "--session", str(project), "--", "sh", "-c",
-               SESSION_PROBE.format(s=project), cwd=world["repo"])
-    assert proc.returncode == 0, proc.stderr
-    assert_session_config_untouched(project)
+def test_refuses_a_session_project_below_the_top_of_the_repository(world) -> None:
+    project, marker = session_in(world["repo"]), world["var"] / "should-not-exist"
+    proc = run(world["script"], "--session", str(project), "--", "touch", str(marker),
+               cwd=world["repo"])
+    assert proc.returncode == 64, proc.stderr
+    assert not marker.exists()
 
 
+@pytest.mark.parametrize("where, status", [("project", 64), ("repo", 0)])
 @needs_pasta
-def test_the_session_project_is_found_among_the_ancestors(world) -> None:
+def test_the_session_project_is_found_among_the_ancestors(world, where: str, status: int) -> None:
     project = session_in(world["repo"])
     launcher = world["var"] / "claude" / "versions" / "launcher"
     launcher.parent.mkdir(parents=True)
     shutil.copy2(shutil.which("bash"), launcher)
     proc = subprocess.run(
-        [str(launcher), "-c", f"(cd {world['repo']} && {world['script']} -- sh -c "
-                              f"'{SESSION_PROBE.format(s=project)}'); exit $?"],
-        cwd=project, env=base_env(), capture_output=True, text=True, timeout=120)
-    assert proc.returncode == 0, proc.stderr
-    assert_session_config_untouched(project)
+        [str(launcher), "-c", f"(cd {world['repo']} && {world['script']} -- true); exit $?"],
+        cwd=project if where == "project" else world["repo"], env=base_env(),
+        capture_output=True, text=True, timeout=120)
+    assert proc.returncode == status, proc.stderr
 
 
 @needs_pasta
