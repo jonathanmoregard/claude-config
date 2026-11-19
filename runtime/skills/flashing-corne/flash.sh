@@ -11,7 +11,8 @@ LOG="${LOG:-${TMPDIR:-/tmp}/flash-corne.log}"
 if [ -z "${IN_QMK_SHELL:-}" ]; then
   cd "$QMK_DIR" || { echo "❌ no qmk_firmware at $QMK_DIR"; exit 1; }
   export IN_QMK_SHELL=1 LOG
-  exec nix-shell shell.nix --run "bash '$0'" 2>>"$LOG"
+  # Upstream QMK dropped shell.nix; take qmk + avrdude from nixpkgs instead.
+  exec nix shell nixpkgs#qmk nixpkgs#avrdude -c bash "$0" 2>>"$LOG"
 fi
 
 : >"$LOG"
