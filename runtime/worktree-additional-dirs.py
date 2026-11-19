@@ -32,6 +32,24 @@ def project_dir() -> pathlib.Path:
     return pathlib.Path(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
 
 
+def user_scope_roots() -> list[pathlib.Path]:
+    config = pathlib.Path(os.environ.get("CLAUDE_CONFIG_DIR") or pathlib.Path.home() / ".claude")
+    try:
+        data = json.loads((config / "settings.json").read_text(encoding="utf-8"))
+        dirs = data["permissions"]["additionalDirectories"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+    return [pathlib.Path(d).expanduser().resolve() for d in dirs if isinstance(d, str)]
+
+
+def covered(path: str, roots: list[pathlib.Path]) -> bool:
+    # Each listed directory costs ~60 bwrap arguments of per-directory write
+    # protection, and bwrap takes at most 9000: one already in scope through a
+    # user-level root adds no access, only arguments.
+    p = pathlib.Path(path)
+    return any(p == r or r in p.parents for r in roots)
+
+
 def worktrees_of(repo: pathlib.Path) -> list[str]:
     """Absolute paths of every worktree of `repo`, excluding `repo` itself."""
     try:
@@ -108,7 +126,8 @@ def main() -> int:
         pass
 
     repo = project_dir()
-    wanted = worktrees_of(repo)
+    roots = user_scope_roots()
+    wanted = [d for d in worktrees_of(repo) if not covered(d, roots)]
 
     settings_path = repo / ".claude" / "settings.local.json"
     try:

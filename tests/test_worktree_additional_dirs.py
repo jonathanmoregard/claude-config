@@ -80,18 +80,30 @@ def main() -> int:
         # must neither poison the other refs nor hide legacy/master.
         git(repo, "symbolic-ref", "refs/remotes/legacy/HEAD", "refs/remotes/legacy/gone")
 
+        covered_root = root / "covered"
+        covered_root.mkdir()
+        covered = covered_root / "wt-covered"
+        git(repo, "worktree", "add", "-q", "-b", "covered", str(covered), "origin/main")
+        (covered / "wip.txt").write_text("x")
+        cfg = root / "cfg"
+        cfg.mkdir()
+        (cfg / "settings.json").write_text(json.dumps(
+            {"permissions": {"additionalDirectories": [str(covered_root)]}}))
+
         manual = str(root / "hand-added")
         (repo / ".claude").mkdir()
         settings = repo / ".claude" / "settings.local.json"
         settings.write_text(json.dumps({"permissions": {"additionalDirectories": [manual]}}))
 
         subprocess.run([sys.executable, str(HOOK)], input="{}", text=True, capture_output=True,
-                       env={**ENV, "CLAUDE_PROJECT_DIR": str(repo)}, timeout=60)
+                       env={**ENV, "CLAUDE_PROJECT_DIR": str(repo), "CLAUDE_CONFIG_DIR": str(cfg)}, timeout=60)
         dirs = json.loads(settings.read_text())["permissions"]["additionalDirectories"]
         check("dirty worktree kept", str(dirty) in dirs, str(dirs))
         check("worktree with unpushed commits kept", str(ahead) in dirs, str(dirs))
         check("clean merged worktree dropped", str(merged) not in dirs, str(dirs))
         check("hand-added entry survives", manual in dirs, str(dirs))
+        check("worktree under a user-level additionalDirectories root not listed",
+              str(covered) not in dirs, str(dirs))
         check("worktree merged on another remote's default branch dropped",
               str(legacy_merged) not in dirs, str(dirs))
         check("worktree ahead of every remote's default branch kept",
