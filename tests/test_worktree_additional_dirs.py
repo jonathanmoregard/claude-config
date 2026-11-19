@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -101,8 +102,21 @@ def main() -> int:
             "permissions": {"additionalDirectories": [manual, str(covered)]},
             "_managedWorktreeDirs": [str(covered)]}))
 
+        shim_dir = root / "shim"
+        shim_dir.mkdir()
+        git_log = root / "git-calls.log"
+        shim = shim_dir / "git"
+        shim.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{git_log}"\n'
+                        f'exec "{shutil.which("git")}" "$@"\n')
+        shim.chmod(0o755)
         subprocess.run([sys.executable, str(HOOK)], input="{}", text=True, capture_output=True,
-                       env={**ENV, "CLAUDE_PROJECT_DIR": str(repo), "CLAUDE_CONFIG_DIR": str(cfg)}, timeout=60)
+                       env={**ENV, "CLAUDE_PROJECT_DIR": str(repo), "CLAUDE_CONFIG_DIR": str(cfg),
+                            "PATH": f"{shim_dir}{os.pathsep}{ENV.get('PATH', '')}"}, timeout=60)
+        calls = git_log.read_text().splitlines() if git_log.exists() else []
+        covered_checks = [c for c in calls if str(covered) in c and (" status" in c or " rev-list" in c)]
+        check("hook ran git through the shim", any(" worktree list" in c for c in calls), str(calls))
+        check("worktree under a user-level root costs no per-worktree git check",
+              not covered_checks, str(covered_checks))
         dirs = json.loads(settings.read_text())["permissions"]["additionalDirectories"]
         check("dirty worktree kept", str(dirty) in dirs, str(dirs))
         check("worktree with unpushed commits kept", str(ahead) in dirs, str(dirs))
