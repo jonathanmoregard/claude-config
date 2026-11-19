@@ -213,6 +213,30 @@ class Repo:
     stubs: dict[str, str | None]  # absent protected path -> content (None: a directory)
 
 
+def nested(top: str) -> tuple[list[str], list[str]]:
+    """Other checkouts below top, and agent config in its subdirectories: a
+    session working in either has them protected, so the jail must too."""
+    checkouts, config, stack = [], [], [top]
+    while stack:
+        here = stack.pop()
+        try:
+            entries = list(os.scandir(here))
+        except OSError:
+            continue
+        names = {e.name: e for e in entries}
+        if here != top:
+            dot = names.get(".git")
+            pointer = read_pointer(Path(dot.path), "gitdir:") if dot and dot.is_file() else None
+            if dot and "modules" not in Path(pointer or "").parts:
+                checkouts.append(here)
+                continue
+            config += [e.path for e in entries if e.name in (".claude", ".mcp.json")
+                       and not e.is_symlink()]
+        stack += [e.path for e in entries
+                  if e.name not in (".git", ".claude") and e.is_dir(follow_symlinks=False)]
+    return checkouts, config
+
+
 def repository(cwd: str, profile: Profile) -> Repo:
     start = Path(cwd)
     top = str(next((p for p in (start, *start.parents) if os.path.lexists(p / ".git")), start))
@@ -228,8 +252,12 @@ def repository(cwd: str, profile: Profile) -> Repo:
     check(top, "the repository")
     if any(under(cwd, d) for d in profile.deny_write):
         fail(64, f"{cwd} is under a denyWrite path of the sandbox profile")
+    checkouts, config = nested(top)
+    # Under /tmp they are allowed, unguarded: the agent-e2e harness works there.
+    if checkouts and not under(top, "/tmp"):
+        fail(64, f"{top} holds another checkout, {checkouts[0]}; work in one repository")
     dot = Path(top, ".git")
-    own, outside, frozen = [], [], [os.path.join(top, name) for name in PROTECTED]
+    own, outside, frozen = [], [], [*(os.path.join(top, name) for name in PROTECTED), *config]
     # A stub in the worktree is an empty directory: git status does not list
     # it, and no file can be written in its place. Inside a git dir it is the
     # file git expects.
@@ -281,7 +309,7 @@ def repository(cwd: str, profile: Profile) -> Repo:
         elif not os.path.lexists(first):
             stubs[str(first)] = content.get(path) if first == Path(path) else None
         elif Stubs.marked(str(first)):
-            stubs[str(first)] = None
+            stubs[str(first)] = content.get(path) if first == Path(path) else None
     return Repo(top, own, outside,
                 [p for p in frozen if os.path.exists(p) and p not in stubs], stubs)
 
@@ -562,9 +590,14 @@ def jail_is_empty(patience: float = 10.0) -> bool:
 def supervise(argv: list[str], fds: list[int], net: Network) -> int:
     child = subprocess.Popen(argv, pass_fds=fds,
                              preexec_fn=lambda: (die_with_parent(), net.enter()))
-    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, lambda signum, _frame: child.send_signal(signum))
-    status = child.wait()
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, lambda signum, _frame: child.send_signal(signum))
+        status = child.wait()
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
     return 128 - status if status < 0 else status
 
 
@@ -606,7 +639,8 @@ def main() -> None:
     tools = {name: find(name, entry.pw_name) for name in ("pasta", "bwrap", "iptables-restore")}
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, lambda signum, _frame: sys.exit(128 + signum))
-    ctypes.CDLL(None, use_errno=True).prctl(36, 1)  # PR_SET_CHILD_SUBREAPER
+    if ctypes.CDLL(None, use_errno=True).prctl(36, 1) != 0:  # PR_SET_CHILD_SUBREAPER
+        fail(3, "cannot become the subreaper that outlives the jail's processes")
     stubs = Stubs(repo.stubs)
     try:
         bwrap_args, fds = jail(profile, repo, cwd, entry.pw_dir, tmp)

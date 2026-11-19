@@ -38,7 +38,8 @@ HINTS: list[tuple[str, re.Pattern[str], str]] = [
         "jobs: `~/.claude/scripts/wait-for job <slug> -- <cmd>`. A job that "
         "must outlive the session has a configured, pre-approved route: "
         "`~/.claude/scripts/confined --detach <slug> -- <cmd>`, then "
-        "`wait-for unit <slug>.service --user`. `journalctl` works as it is.",
+        "`~/.claude/scripts/wait-for unit <slug>.service --user`. `journalctl` "
+        "works as it is.",
     ),
     (
         "nested",

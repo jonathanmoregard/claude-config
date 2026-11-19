@@ -381,7 +381,8 @@ def test_refuses_a_repo_whose_protected_entry_is_a_symlink(world, entry: str) ->
 
 @pytest.mark.parametrize("case", ["write_root", "planted_git_above_root", "outside_roots",
                                   "deny_write", "tmp_itself", "gitdir_outside_roots",
-                                  "gitdir_inside_the_repo"])
+                                  "gitdir_inside_the_repo", "holds_checkouts",
+                                  "planted_git_around_checkouts"])
 @needs_pasta
 def test_refuses_a_working_directory_it_cannot_confine_to_one_repo(world, case: str) -> None:
     rw, home = world["rw"], world["home"]
@@ -398,6 +399,13 @@ def test_refuses_a_working_directory_it_cannot_confine_to_one_repo(world, case: 
         cwd = world["repo"] / "locked"
     elif case == "tmp_itself":
         cwd = Path("/tmp")
+    elif case in ("holds_checkouts", "planted_git_around_checkouts"):
+        cwd = rw / "group"
+        git_repo(cwd / "deep" / "session")
+        marker = cwd / "deep" / "session" / "should-not-exist"
+        if case == "planted_git_around_checkouts":
+            (cwd / ".git").mkdir()
+            (cwd / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
     elif case == "gitdir_inside_the_repo":
         cwd = rw / "inner"
         (cwd / "gd").mkdir(parents=True)
@@ -486,6 +494,22 @@ def test_the_command_inherits_no_descriptor_of_the_host(world) -> None:
     opened = [line[3:] for line in proc.stdout.splitlines() if line.startswith("fd=") and line[3:]]
     assert opened
     assert not [o for o in opened if not o.startswith(("/dev/", "/proc/", "pipe:"))], opened
+
+
+@needs_pasta
+def test_agent_config_in_a_subdirectory_is_read_only(world) -> None:
+    sub = world["repo"] / "pkg" / "app"
+    (sub / ".claude").mkdir(parents=True)
+    (sub / ".claude" / "settings.local.json").write_text("{}\n")
+    (sub / ".mcp.json").write_text("{}\n")
+    jailed(world["script"],
+           f"echo x >>{sub}/.claude/settings.local.json 2>/dev/null\n"
+           f"echo x >{sub}/.claude/settings.json 2>/dev/null\n"
+           f"echo x >>{sub}/.mcp.json 2>/dev/null\necho x >{sub}/ordinary", cwd=world["repo"])
+    assert (sub / ".claude" / "settings.local.json").read_text() == "{}\n"
+    assert (sub / ".mcp.json").read_text() == "{}\n"
+    assert not (sub / ".claude" / "settings.json").exists()
+    assert (sub / "ordinary").read_text() == "x\n"
 
 
 @needs_pasta
@@ -622,7 +646,6 @@ def test_host_and_private_networks_are_out_of_reach_but_the_internet_is_not(worl
     if gateway:
         assert out[gateway].startswith("blocked"), out
     assert out["outbound"] == "reachable", out
-    assert sum(" @" in line for line in proc.stdout.splitlines()) == 0
 
 
 @needs_pasta

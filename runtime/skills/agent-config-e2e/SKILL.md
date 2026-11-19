@@ -34,9 +34,10 @@ python3 runtime/scripts/agent-e2e/agent_e2e.py run tests/agent-e2e/<scenario> \
   --arm old=origin/master --arm new=$(git rev-parse --short HEAD) --n 5
 ```
 
-In a sandboxed session, run the harness from the worktree through the
-confined runner, as the whole command:
-`~/.claude/scripts/confined -- python3 runtime/scripts/agent-e2e/agent_e2e.py run …`.
+In a sandboxed session, run the harness through the confined runner. It must
+be the whole command, on one line: `--chdir` in place of `cd`, the arm's SHA
+written out, no `$(…)`:
+`~/.claude/scripts/confined --chdir ~/worktrees/claude-<slug> -- python3 runtime/scripts/agent-e2e/agent_e2e.py run tests/agent-e2e/<scenario> --arm old=origin/master --arm new=<sha> --n 5`.
 
 Run it with `run_in_background: true`, since a batch takes minutes. Finished
 runs are skipped on re-run, so a killed batch never re-spends.
