@@ -98,7 +98,7 @@ class Fixture(unittest.TestCase):
         self.repo = root / "repo"
         subprocess.run(["git", "clone", "-q", str(self.origin), str(self.repo)], check=True,
                        capture_output=True)
-        harness = self.repo / "scripts/agent-e2e/agent_e2e.py"
+        harness = self.repo / "runtime/scripts/agent-e2e/agent_e2e.py"
         harness.parent.mkdir(parents=True)
         shutil.copy(HARNESS, harness)
         scen = self.repo / "tests/agent-e2e/demo"
@@ -108,12 +108,12 @@ class Fixture(unittest.TestCase):
         (scen / "check.sh").write_text(
             "#!/usr/bin/env bash\ngrep -q CANDIDATE \"$1/home/.claude/CLAUDE.md\" "
             "&& { echo cand; exit 0; } || { echo base; exit 1; }\n")
-        (self.repo / "CLAUDE.md").write_text("base\n")
+        (self.repo / "runtime/CLAUDE.md").write_text("base\n")
         git(self.repo, "add", "-A")
         git(self.repo, "commit", "-qm", "base")
         git(self.repo, "push", "-q", "origin", "master")
         git(self.repo, "switch", "-qc", "feat/x")
-        (self.repo / "CLAUDE.md").write_text("CANDIDATE\n")
+        (self.repo / "runtime/CLAUDE.md").write_text("CANDIDATE\n")
         git(self.repo, "commit", "-qam", "cand")
         git(self.repo, "push", "-q", "origin", "feat/x")
         git(self.repo, "switch", "-q", "master")
@@ -125,7 +125,8 @@ class Fixture(unittest.TestCase):
         self.claude.chmod(0o755)
         self.out = root / "out"
         self.raw = {
-            "version": 1, "repo": str(self.repo), "harness": "scripts/agent-e2e/agent_e2e.py",
+            "version": 1, "repo": str(self.repo),
+            "harness": "runtime/scripts/agent-e2e/agent_e2e.py",
             "scenarioRoot": "tests/agent-e2e", "claudeExecutable": str(self.claude),
             "outputRoot": str(self.out), "path": os.environ["PATH"].split(":"),
             "models": ["haiku", "sonnet"], "maxSamples": 2, "maxJobs": 2,
@@ -172,6 +173,12 @@ class ValidationTests(Fixture):
         with self.assertRaisesRegex(RuntimeError, "worst-case"):
             self.server._validate_request(self.req(n=2, jobs=1, timeout_sec=900), policy)
 
+    def test_shipped_config_names_paths_of_this_repo(self) -> None:
+        policy = self.server._load_policy(json.loads((HERE / "config.json").read_text()))
+        root = HERE.parents[2]
+        self.assertTrue((root / policy["harness"]).is_file(), policy["harness"])
+        self.assertTrue((root / policy["scenarioRoot"]).is_dir(), policy["scenarioRoot"])
+
     def test_policy_rejects_unknown_keys(self) -> None:
         with self.assertRaises(RuntimeError):
             self.server._load_policy({"agentE2eBroker": {**self.raw, "extra": 1}})
@@ -180,7 +187,7 @@ class ValidationTests(Fixture):
 class RefPolicyTests(Fixture):
     def test_unpushed_commit_refused(self) -> None:
         git(self.repo, "switch", "-qc", "local")
-        (self.repo / "CLAUDE.md").write_text("local\n")
+        (self.repo / "runtime/CLAUDE.md").write_text("local\n")
         git(self.repo, "commit", "-qam", "local")
         sha = git(self.repo, "rev-parse", "HEAD")
         git(self.repo, "switch", "-q", "master")
@@ -191,15 +198,15 @@ class RefPolicyTests(Fixture):
         with self.assertRaisesRegex(RuntimeError, "does not exist"):
             self.server._resolve(self.policy, "origin/nope")
 
-    def test_harness_must_be_master_and_clean(self) -> None:
-        self.server._check_harness(self.policy)
-        (self.repo / "scripts/agent-e2e/agent_e2e.py").write_text("print('pwn')\n")
-        with self.assertRaisesRegex(RuntimeError, "differs"):
-            self.server._check_harness(self.policy)
-        git(self.repo, "checkout", "-q", "--", ".")
+    def test_harness_comes_from_origin_master_not_the_working_tree(self) -> None:
+        require_sandbox(self)
         git(self.repo, "switch", "-q", "feat/x")
-        with self.assertRaisesRegex(RuntimeError, "not on master"):
-            self.server._check_harness(self.policy)
+        (self.repo / "runtime/scripts/agent-e2e/agent_e2e.py").write_text("print('planted')\n")
+        text = self.server._tool_run(self.req())
+        self.assertNotIn("planted", text)
+        self.assertRegex(text, r"\| new \| .* \| 1 \| 0 \| 0 \|")
+        self.assertIn(f"harness = origin/master = {git(self.repo, 'rev-parse', 'origin/master')}",
+                      text)
 
 
 class RunTests(Fixture):
@@ -236,7 +243,7 @@ class RunTests(Fixture):
 class ReviewFindingTests(Fixture):
     def test_planted_remote_tracking_ref_refused(self) -> None:
         git(self.repo, "switch", "-qc", "unpushed")
-        (self.repo / "CLAUDE.md").write_text("CANDIDATE planted\n")
+        (self.repo / "runtime/CLAUDE.md").write_text("CANDIDATE planted\n")
         git(self.repo, "commit", "-qam", "planted")
         sha = git(self.repo, "rev-parse", "HEAD")
         git(self.repo, "switch", "-q", "master")
@@ -250,11 +257,18 @@ class ReviewFindingTests(Fixture):
         with self.assertRaisesRegex(RuntimeError, "fetch"):
             self.server._tool_run(self.req())
 
-    def test_unpushed_harness_commit_on_master_refused(self) -> None:
-        (self.repo / "scripts/agent-e2e/agent_e2e.py").write_text("print('local')\n")
+    def test_unpushed_harness_commit_on_master_is_not_run(self) -> None:
+        require_sandbox(self)
+        (self.repo / "runtime/scripts/agent-e2e/agent_e2e.py").write_text("print('local')\n")
         git(self.repo, "commit", "-qam", "local harness")
-        with self.assertRaisesRegex(RuntimeError, "origin/master"):
-            self.server._tool_run(self.req())
+        text = self.server._tool_run(self.req())
+        self.assertRegex(text, r"\| new \| .* \| 1 \| 0 \| 0 \|")
+        self.assertIn("harness exit 0", text)
+
+    def test_harness_checkout_removed_after_run(self) -> None:
+        require_sandbox(self)
+        self.server._tool_run(self.req())
+        self.assertEqual(list(self.out.glob("*/harness")), [])
 
     def test_redacts_private_and_age_keys(self) -> None:
         key = "AGE-SECRET-KEY-1" + "Q" * 58

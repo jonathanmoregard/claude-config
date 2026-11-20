@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Structured agent-config e2e broker over stdio MCP.
 
-Codex runs inside a sandbox with no network, so the real headless agent that
-scripts/agent-e2e/agent_e2e.py drives cannot reach the model API from there
-(getaddrinfo EAI_AGAIN). This server runs outside that sandbox and exposes one
-``run`` tool: an old/new campaign of one scenario, nothing else.
+A sandboxed agent session cannot run the real headless agent that
+scripts/agent-e2e/agent_e2e.py drives (Codex: no network, getaddrinfo
+EAI_AGAIN). This server runs outside the sandbox and exposes one ``run`` tool:
+an old/new campaign of one scenario, nothing else.
 
-- The harness is the merged one in the live ~/.claude checkout, which must be
-  on master with the harness unmodified. A candidate ref cannot replace it.
+- The harness is origin/master's, checked out fresh per campaign from the
+  config repo; neither a candidate ref nor that repo's working tree replaces it.
 - Both arms are refs on origin (``origin/<branch>`` or a commit reachable from
   one), resolved to full SHAs before the run: only pushed, reviewable config is
   ever staged.
@@ -166,17 +166,21 @@ def _git(policy: dict, *argv: str, timeout: int = 60, env: Optional[dict] = None
                           stdin=subprocess.DEVNULL)
 
 
-def _check_harness(policy: dict) -> Path:
-    """The harness runs from the live checkout: master, harness as merged on origin/master."""
-    head = _git(policy, "symbolic-ref", "--short", "HEAD")
-    if head.returncode != 0 or head.stdout.strip() != "master":
-        raise RuntimeError(f"BROKEN safety boundary: {policy['repo']} is not on master")
-    rel = policy["harness"]
-    if _git(policy, "ls-files", "--error-unmatch", "--", rel).returncode != 0 \
-            or _git(policy, "diff", "--quiet", "origin/master", "--", rel).returncode != 0:
-        raise RuntimeError(f"BROKEN safety boundary: harness {rel} is untracked or differs "
-                           "from origin/master")
-    return policy["repo"] / rel
+def _checkout_harness(policy: dict, sha: str, dest: Path) -> Path:
+    """A fresh checkout of SHA at DEST: the harness stages arms with `git archive`, so it
+    must sit in a repository, and the config repo's own working tree never runs."""
+    if _git(policy, "cat-file", "-e", f"{sha}:{policy['harness']}").returncode != 0:
+        raise RuntimeError(f"BROKEN safety boundary: origin/master has no {policy['harness']}")
+    no_hooks = ("-c", "core.hooksPath=/dev/null")
+    for argv in (["git", *no_hooks, "clone", "--quiet", "--shared", "--no-checkout",
+                  str(policy["repo"]), str(dest)],
+                 ["git", *no_hooks, "-C", str(dest), "checkout", "--quiet", "--detach", sha]):
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=120,
+                              env=_env(policy), stdin=subprocess.DEVNULL)
+        if done.returncode != 0:
+            raise RuntimeError(f"could not check out the harness at {sha}: "
+                               f"{done.stderr.strip()[:300]}")
+    return dest / policy["harness"]
 
 
 def _resolve(policy: dict, ref: str) -> str:
@@ -328,7 +332,7 @@ def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
         # in for what origin holds now.
         if fetch.returncode != 0:
             raise RuntimeError(f"git fetch origin failed: {fetch.stderr.strip()[:300]}")
-        harness = _check_harness(policy)
+        master = _resolve(policy, "origin/master")
         old = _resolve(policy, req["old_ref"])
         new = _resolve(policy, req["new_ref"])
         scen_rel = f"{policy['scenarioRoot']}/{req['scenario']}"
@@ -338,15 +342,21 @@ def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
         out = root / f"{stamp}-{req['scenario']}-{new[:8]}-{os.getpid()}"
         _extract_scenarios(policy, new, out / "scenarios")
-        argv = [sys.executable, "-I", str(harness), "run", str(out / "scenarios" / scen_rel),
-                "--arm", f"old={old}", "--arm", f"new={new}",
-                "--n", str(req["n"]), "--jobs", str(req["jobs"]), "--model", req["model"],
-                "--budget", f"{req['budget']:g}", "--timeout", str(req["timeout"]),
-                "--out", str(out / "runs"), "--claude", str(exe)]
-        rc, stdout, stderr = _run_argv(_supervised(argv, policy), _env(policy),
-                                       req["call_timeout"], rec, lock.fileno())
+        try:
+            harness = _checkout_harness(policy, master, out / "harness")
+            argv = [sys.executable, "-I", str(harness), "run",
+                    str(out / "scenarios" / scen_rel),
+                    "--arm", f"old={old}", "--arm", f"new={new}",
+                    "--n", str(req["n"]), "--jobs", str(req["jobs"]), "--model", req["model"],
+                    "--budget", f"{req['budget']:g}", "--timeout", str(req["timeout"]),
+                    "--out", str(out / "runs"), "--claude", str(exe)]
+            rc, stdout, stderr = _run_argv(_supervised(argv, policy), _env(policy),
+                                           req["call_timeout"], rec, lock.fileno())
+        finally:
+            shutil.rmtree(out / "harness", ignore_errors=True)
     header = (f"agent-e2e campaign `{req['scenario']}` model={req['model']} n={req['n']} "
               f"jobs={req['jobs']} budget=${req['budget']:g} timeout={req['timeout']}s\n"
+              f"harness = origin/master = {master}\n"
               f"old = {req['old_ref']} = {old}\nnew = {req['new_ref']} = {new}\n"
               f"output: {out}\n")
     body = "\n".join([header, stdout.rstrip(), "--- per run ---",
@@ -363,7 +373,7 @@ TOOLS = [{
     "description": (
         "Runs one agent-config e2e scenario (tests/agent-e2e/<scenario> from new_ref) "
         "through scripts/agent-e2e/agent_e2e.py with a real headless Claude agent, arm "
-        "old=old_ref vs arm new=new_ref, outside the Codex sandbox. Refs must be on origin "
+        "old=old_ref vs arm new=new_ref, outside the caller's sandbox. Refs must be on origin "
         "(origin/<branch> or a pushed 40-hex commit). One campaign at a time; it blocks "
         "until done (up to an hour). Returns the harness summary table, every run's "
         "verdict and final.txt, and the output directory holding transcripts. Every PASS, "

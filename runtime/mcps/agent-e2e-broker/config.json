@@ -1,8 +1,8 @@
 {
   "agentE2eBroker": {
     "version": 1,
-    "repo": "/home/jonathan/.claude",
-    "harness": "scripts/agent-e2e/agent_e2e.py",
+    "repo": "/home/jonathan/Repos/claude-config",
+    "harness": "runtime/scripts/agent-e2e/agent_e2e.py",
     "scenarioRoot": "tests/agent-e2e",
     "claudeExecutable": "/home/jonathan/.local/bin/claude",
     "outputRoot": "/tmp/agent-e2e-broker",
