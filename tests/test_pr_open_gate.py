@@ -604,6 +604,16 @@ def test_every_binary_is_named_and_logged(sb):
     assert sb.exemptions()[-1]["files"] == names
 
 
+def test_a_refusal_logs_the_binaries_it_lists(sb):
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    commit_bytes(sb, "build/candle.bin", FIRMWARE)
+    sb.review("PASS", reads=[])
+    assert is_deny(sb.gate())
+    logged = [e for e in sb.exemptions() if e["kind"] == "binary-not-read"]
+    assert logged and logged[-1]["files"] == ["build/candle.bin"]
+    assert logged[-1]["outcome"] == "refused"
+
+
 def test_binary_probing_does_not_scale_git_calls_with_binary_count(sb, tmp_path):
     # Break: a git process (or three) per binary per reviewed tree; 800
     # rebuilt binaries measured 10.3 s against the hook's 10 s timeout.

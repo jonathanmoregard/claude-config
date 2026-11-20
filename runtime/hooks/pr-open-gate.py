@@ -163,6 +163,13 @@ def log_exemption(payload: dict, entry: dict) -> None:
                    {"ts": time.time(), "session": payload.get("session_id"), **entry})
 
 
+def log_binary(payload: dict, binary: list[str], outcome: str, where: dict) -> None:
+    """The binaries the gate did not require read, on a refusal as on a pass."""
+    if binary:
+        log_exemption(payload, {"kind": "binary-not-read", "why": g.BINARY_NOTE,
+                                "outcome": outcome, "files": binary, **where})
+
+
 # --- UserPromptSubmit ---------------------------------------------------------
 
 def on_prompt(payload: dict) -> None:
@@ -363,15 +370,14 @@ def on_pretool(payload: dict) -> None:
                 break
         if problem:
             if not take_override(session, now):
+                log_binary(payload, binary, "refused", where)
                 deny([problem], with_remedy=True, binary=binary)
                 return
             log_exemption(payload, {"kind": "user-override", "why": problem, **where})
 
     if smoke_log:
         log_exemption(payload, {**smoke_log, **where})
-    if binary:
-        log_exemption(payload, {"kind": "binary-not-read", "why": g.BINARY_NOTE,
-                                "files": binary, **where})
+    log_binary(payload, binary, "passed", where)
     stale = g.prune(g.state_dir() / "grants", g.GRANT_TTL_S, now)
     if stale:
         print(f"pr-open-gate: could not remove {stale} expired grant file(s); "
