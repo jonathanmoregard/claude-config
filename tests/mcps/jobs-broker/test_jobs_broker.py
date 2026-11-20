@@ -46,6 +46,7 @@ class Home(unittest.TestCase):
         for d in ("Repos/main/.git", "worktrees/wt", ".ssh", ".config/git", ".cache/nix"):
             (self.home / d).mkdir(parents=True)
         self.repo = self.home / "Repos" / "main"
+        (self.repo / ".git" / "config").write_text("")
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -116,20 +117,30 @@ class RepoPathTests(Home):
         (self.home / "worktrees" / "esc").symlink_to(self.home)
         self.refused(str(self.home / "worktrees" / "esc" / ".ssh"))
 
-    def test_plain_repo_binds_only_itself(self) -> None:
-        target = self.server.confine_repo(str(self.repo), self.home)
-        self.assertEqual(target.repo, self.repo)
-        self.assertEqual(target.binds, [(self.repo, ident(self.repo))])
+    def writable(self, raw: Path) -> set:
+        target = self.server.confine_repo(str(raw), self.home)
+        self.assertEqual(target.repo, raw)
+        return {path for path, _ in target.writable}
 
-    def test_linked_worktree_also_binds_main_git_dir(self) -> None:
+    def test_plain_repo_writes_only_inside_itself(self) -> None:
+        self.assertEqual({p for p in self.writable(self.repo) if p != self.repo and
+                          self.repo not in p.parents}, set())
+
+    def test_linked_worktree_also_writes_main_git_dir(self) -> None:
         wt = self.home / "worktrees" / "wt"
         admin = self.repo / ".git" / "worktrees" / "wt"
         admin.mkdir(parents=True)
         (admin / "commondir").write_text("../..\n")
         (wt / ".git").write_text(f"gitdir: {admin}\n")
-        target = self.server.confine_repo(str(wt), self.home)
         main_git = self.repo / ".git"
-        self.assertEqual(target.binds, [(wt, ident(wt)), (main_git, ident(main_git))])
+        self.assertIn(main_git, self.writable(wt))
+        self.assertEqual({p for p in self.writable(wt) if p != wt and main_git != p
+                          and main_git not in p.parents}, set())
+
+    def test_symlinked_dot_git_refused(self) -> None:
+        wt = self.home / "worktrees" / "wt"
+        (wt / ".git").symlink_to(self.repo / ".git")
+        self.refused(str(wt))
 
     def test_worktree_git_dir_outside_roots_refused(self) -> None:
         wt = self.home / "worktrees" / "wt"
@@ -186,14 +197,15 @@ class PropertyTests(Home):
 
     def test_repo_profile_writes_only_the_repo(self) -> None:
         props = self.props("repo")
-        self.assertEqual(values(props, "BindPaths"), [str(self.repo)])
-        self.assertEqual(values(props, "BindReadOnlyPaths"), [f"-{self.home}/.config/git"])
+        self.assertEqual([p for p in values(props, "BindPaths")
+                          if p != str(self.repo) and not p.startswith(f"{self.repo}/")], [])
+        self.assertIn(f"-{self.home}/.config/git", values(props, "BindReadOnlyPaths"))
         self.assertEqual(values(props, "WorkingDirectory"), [str(self.repo)])
         self.assertNotIn("Slice=ram-heavy.slice", props)
 
     def test_nix_profile_adds_store_cache_and_heavy_slice(self) -> None:
         props = self.props("nix")
-        self.assertEqual(values(props, "BindPaths"), [str(self.repo), f"{self.home}/.cache/nix"])
+        self.assertIn(f"{self.home}/.cache/nix", values(props, "BindPaths"))
         self.assertIn(f"-{self.home}/.nix-memory-pressure", values(props, "BindReadOnlyPaths"))
         self.assertIn("Slice=ram-heavy.slice", props)
         self.assertIn("OOMPolicy=kill", props)
@@ -206,6 +218,23 @@ class PropertyTests(Home):
         [post] = values(props, "ExecStopPost")
         self.assertTrue(post.startswith("+"), post)
         self.assertTrue(post.endswith(f"record-user-unit-failure claude-job-check {log}"), post)
+
+    def test_every_bound_repo_path_is_identity_checked(self) -> None:
+        wt = self.home / "worktrees" / "wt"
+        admin = self.repo / ".git" / "worktrees" / "wt"
+        admin.mkdir(parents=True)
+        (admin / "commondir").write_text("../..\n")
+        (self.repo / ".git" / "config").write_text("")
+        (wt / ".git").write_text(f"gitdir: {admin}\n")
+        job = self.job(repo=str(wt))
+        props = self.server.properties(job, self.home)
+        bound = {v.lstrip("-") for key in ("BindPaths", "BindReadOnlyPaths") for v in values(props, key)}
+        cmd = self.server.start_argv(job, self.home)
+        checked = set(cmd[cmd.index("jobs-broker") + 1:cmd.index("--", cmd.index("jobs-broker")):2])
+        under_roots = {p for p in bound if p.startswith((str(self.home / "Repos"),
+                                                         str(self.home / "worktrees")))}
+        self.assertTrue(under_roots)
+        self.assertEqual(under_roots, checked)
 
     def test_caller_argv_never_reaches_properties(self) -> None:
         argv = ["sh", "-c", "PrivateNetwork=no", "BindPaths=/"]
@@ -362,9 +391,29 @@ class RealUnitTests(unittest.TestCase):
             leftover.unlink(missing_ok=True)
         shutil.rmtree(self.dir)
 
-    def start(self, script: str, runtime: int = 120) -> str:
-        return self.server.tool_start({"repo": str(self.repo), "argv": ["sh", "-c", script],
+    def start(self, script: str, runtime: int = 120, repo: Path | None = None) -> str:
+        return self.server.tool_start({"repo": str(repo or self.repo), "argv": ["sh", "-c", script],
                                        "slug": self.slug, "max_runtime_sec": runtime}, self.home)
+
+    def run_job(self, script: str, repo: Path | None = None) -> str:
+        self.start(script, repo=repo)
+        return self.status() + "\n" + self.server.tool_log({"slug": self.slug}, self.home)
+
+    def git(self, *args: str, cwd: Path) -> str:
+        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=cwd,
+                              check=True, capture_output=True, text=True,
+                              env={**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null"}).stdout
+
+    def main_and_worktree(self) -> Path:
+        self.git("init", "-q", cwd=self.repo)
+        self.git("commit", "-q", "--allow-empty", "-m", "init", cwd=self.repo)
+        wt = self.dir / "wt"
+        self.git("worktree", "add", "-q", str(wt), cwd=self.repo)
+        return wt
+
+    def snapshot(self, *paths: Path) -> dict:
+        return {p: p.read_bytes() if p.is_file() else sorted(os.listdir(p)) if p.is_dir() else None
+                for p in paths}
 
     def record(self) -> Path:
         return self.home / ".local/state/claude-unit-failures" / f"{self.unit}.json"
@@ -415,6 +464,43 @@ class RealUnitTests(unittest.TestCase):
             self.assertFalse(canary.exists(), "the job wrote into the real home")
         finally:
             canary.unlink(missing_ok=True)
+
+    def test_job_cannot_plant_hooks_or_rewrite_git_config(self) -> None:
+        self.git("init", "-q", cwd=self.repo)
+        shutil.rmtree(self.repo / ".git/hooks")
+        before = self.snapshot(self.repo / ".git/config")
+        out = self.run_job(
+            "mkdir -p .git/hooks; echo planted > .git/hooks/pre-commit; "
+            "git config core.hooksPath /tmp; echo '[core]' >> .git/config; "
+            "mv .git .git-old && cp -a .git-old .git && echo planted > .git/hooks/pre-commit; exit 0")
+        self.assertIn("MARKER_OK", out)
+        self.assertFalse((self.repo / ".git/hooks/pre-commit").exists(), out)
+        self.assertFalse((self.repo / ".git-old").exists(), out)
+        self.assertEqual(self.snapshot(self.repo / ".git/config"), before, out)
+
+    def test_worktree_job_cannot_redirect_or_plant_into_the_main_repo(self) -> None:
+        wt = self.main_and_worktree()
+        main_git = self.repo / ".git"
+        watched = (main_git / "hooks", main_git / "config", main_git / "worktrees/wt/commondir",
+                   wt / ".git")
+        before = self.snapshot(*watched)
+        out = self.run_job(
+            f"echo planted > {main_git}/hooks/post-checkout; echo '[core]' >> {main_git}/config; "
+            f"echo /tmp > {main_git}/worktrees/wt/commondir; echo 'gitdir: /tmp' > .git; "
+            f"git config core.hooksPath /tmp; exit 0", repo=wt)
+        self.assertIn("MARKER_OK", out)
+        self.assertEqual(self.snapshot(*watched), before, out)
+
+    def test_git_still_commits_in_a_repo_and_in_a_worktree(self) -> None:
+        wt = self.main_and_worktree()
+        commit = ("echo x > f && git add f && git -c user.name=t -c user.email=t@t "
+                  "commit -q -m from-job && git status --short")
+        for where in (self.repo, wt):
+            with self.subTest(where=where.name):
+                out = self.run_job(commit, repo=where)
+                self.assertIn("MARKER_OK", out)
+                self.assertIn("from-job", self.git("log", "-1", "--format=%s", cwd=where))
+                self.server.tool_stop({"slug": self.slug}, self.home)
 
     def test_stop_ends_a_running_job_without_a_failure_record(self) -> None:
         self.start("sleep 300")

@@ -88,7 +88,8 @@ exit "$rc"
 
 class Target(NamedTuple):
     repo: Path
-    binds: list
+    writable: list
+    readonly: list
 
 
 class Job(NamedTuple):
@@ -125,7 +126,7 @@ def log_path(home: Path, unit: str) -> Path:
     return home / ".local/state/claude-jobs" / f"{unit}.log"
 
 
-def _confined_dir(path: Path, home: Path) -> tuple:
+def _confined(path: Path, home: Path, kind=stat.S_ISDIR) -> tuple:
     candidate = Path(os.path.realpath(path.parent)) / path.name
     try:
         st = os.lstat(candidate)
@@ -133,41 +134,73 @@ def _confined_dir(path: Path, home: Path) -> tuple:
         raise RuntimeError(f"{path} does not exist") from None
     if not _PLAIN_PATH_RE.fullmatch(str(candidate)):
         raise RuntimeError(f"{candidate!r} has characters other than [A-Za-z0-9._@+/-]")
-    if not stat.S_ISDIR(st.st_mode):
-        raise RuntimeError(f"{path} is not a directory (a symlink is refused)")
+    if not kind(st.st_mode):
+        raise RuntimeError(f"{path} is not a {'directory' if kind is stat.S_ISDIR else 'file'}"
+                           " (a symlink is refused)")
     roots = [Path(os.path.realpath(home / r)) for r in ROOTS]
     if not any(root in candidate.parents for root in roots):
         raise RuntimeError(f"{path} is not inside ~/Repos or ~/worktrees")
     return candidate, f"{st.st_dev}:{st.st_ino}"
 
 
-def _common_git_dir(repo: Path) -> Path | None:
-    dotgit = repo / ".git"
+def _gitdir_pointer(dotgit: Path, repo: Path) -> Path | None:
     try:
-        if not stat.S_ISREG(os.lstat(dotgit).st_mode):
-            return None
         match = re.fullmatch(r"gitdir: (.+)\n?", dotgit.read_text()[:MAX_ARG_CHARS])
-        if not match:
-            return None
-        gitdir = Path(os.path.realpath(repo / match.group(1)))
-        commondir = gitdir / "commondir"
-        if commondir.is_file():
-            return Path(os.path.realpath(gitdir / commondir.read_text().strip()))
     except (OSError, UnicodeDecodeError):
         return None
-    return gitdir
+    return Path(os.path.realpath(repo / match.group(1))) if match else None
+
+
+def _common_dir(gitdir: Path) -> Path:
+    try:
+        return Path(os.path.realpath(gitdir / (gitdir / "commondir").read_text().strip()))
+    except (OSError, UnicodeDecodeError):
+        return gitdir
+
+
+# Claude Code's sandbox keeps .git/hooks, .git/config and a worktree's .git
+# file read-only; jobs get the same for every git dir they can write. Each
+# protected path is also a mount point inside the job, so it cannot be renamed
+# away and recreated, and a missing hooks dir is made first for that reason.
+def _git_binds(repo: Path, home: Path) -> tuple:
+    dotgit = repo / ".git"
+    try:
+        mode = os.lstat(dotgit).st_mode
+    except FileNotFoundError:
+        return [], []
+    if stat.S_ISDIR(mode):
+        writable, readonly, admin, common = [_confined(dotgit, home)], [], None, dotgit
+    elif stat.S_ISREG(mode):
+        writable, readonly = [], [_confined(dotgit, home, stat.S_ISREG)]
+        admin = _gitdir_pointer(dotgit, repo)
+        if admin is None:
+            return writable, readonly
+        common = _common_dir(admin)
+        if common != repo:
+            writable.append(_confined(common, home))
+    else:
+        raise RuntimeError(f"{dotgit} is neither a directory nor a gitdir file")
+    try:
+        os.mkdir(common / "hooks", 0o755)
+    except FileExistsError:
+        pass
+    readonly += [_confined(common / "hooks", home), _confined(common / "config", home, stat.S_ISREG)]
+    worktrees = common / "worktrees"
+    if os.path.lexists(worktrees):
+        readonly.append(_confined(worktrees, home))
+        if admin is not None and admin.parent == worktrees:
+            writable.append(_confined(admin, home))
+            readonly.append(_confined(admin / "commondir", home, stat.S_ISREG))
+    return writable, readonly
 
 
 def confine_repo(raw: object, home: Path) -> Target:
     if not isinstance(raw, str) or not os.path.isabs(raw) or "\0" in raw \
             or len(raw) > MAX_ARG_CHARS or ".." in raw.split("/"):
         raise RuntimeError("repo must be an absolute path without '..'")
-    repo, repo_id = _confined_dir(Path(raw), home)
-    binds = [(repo, repo_id)]
-    common = _common_git_dir(repo)
-    if common is not None and common != repo and repo not in common.parents:
-        binds.append(_confined_dir(common, home))
-    return Target(repo, binds)
+    repo = _confined(Path(raw), home)
+    writable, readonly = _git_binds(repo[0], home)
+    return Target(repo[0], [repo, *writable], readonly)
 
 
 def validate_start(args: object, home: Path) -> Job:
@@ -198,7 +231,8 @@ def properties(job: Job, home: Path) -> list:
         # TemporaryFileSystem= there would make the "+" recorder fail at NAMESPACE.
         *HARDENING,
         *(f"InaccessiblePaths=-{p}" for p in HIDDEN),
-        *(f"BindPaths={path}" for path, _ in job.target.binds),
+        *(f"BindPaths={path}" for path, _ in job.target.writable),
+        *(f"BindReadOnlyPaths={path}" for path, _ in job.target.readonly),
         f"BindReadOnlyPaths=-{home}/.config/git",
     ]
     if job.profile == "nix":
@@ -216,7 +250,7 @@ def start_argv(job: Job, home: Path) -> list:
         cmd += ["-p", prop]
     cmd += ["--", f"{SYSTEM_BIN}/env", "-i", *env, f"{SYSTEM_BIN}/bash", "-c", WRAPPER,
             "jobs-broker"]
-    for path, ident in job.target.binds:
+    for path, ident in [*job.target.writable, *job.target.readonly]:
         cmd += [str(path), ident]
     return [*cmd, "--", *job.argv]
 
