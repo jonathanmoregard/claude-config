@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
-# Print the inventory's "Decided, not done" rows: every decision file under
-# <notes>/decisions/ whose front matter says kind: change, status: pending.
-# Selection reads the YAML front matter with yq; no prose is parsed. A file
-# missing either field prints as "unlabelled" so the runner labels it. A file
-# whose front matter is not valid YAML stops the script (nonzero exit).
-# Usage: pending-decisions.sh <notes dir>
-set -euo pipefail
+# List the decisions in <notes>/decisions/ that are still work: one markdown
+# table row per file, selected by its YAML front matter (yq), never by prose.
+#   pending      kind: change, status: pending
+#   unlabelled   any other kind/status that is not a finished state, missing
+#                fields included: label it, then run again
+#   unparseable  the front matter does not parse: fix it, then run again
+# Left out: kind: keep (whatever its status), and kind: change, status: done.
+# One bad file never hides the others.
+set -uo pipefail
 dir="${1:?usage: pending-decisions.sh <notes dir>}/decisions"
 [ -d "$dir" ] || exit 0
 for f in "$dir"/*.md; do
   [ -e "$f" ] || continue
   yq --front-matter=extract '
-    select((.kind == "change" and .status == "pending") or .kind == null or .status == null)
+    select(.kind != "keep" and (.kind != "change" or .status != "done"))
     | "| " + ((.date // "-") | tostring) + " | " + ((.title // "-") | tostring)
       + " | " + ((.where // []) | join(", "))
-      + " | " + (if .kind == null or .status == null then "unlabelled" else "pending" end)
-      + " | " + filename + " |"' "$f"
+      + " | " + (if .kind == "change" and .status == "pending" then "pending" else "unlabelled" end)
+      + " | " + filename + " |"' "$f" 2>/dev/null \
+    || echo "| - | - | - | unparseable | $f |"
 done

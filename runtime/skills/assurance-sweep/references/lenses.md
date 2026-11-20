@@ -13,8 +13,8 @@ rehearsals, leak checks, growth measurement — mark those methods n/a, and
 judge "would break" by the owner's own use, not by production load. Neat
 types, clear structure and working tests still apply in full.
 Read first, in full and in this order: <dir>/inventory.md; <recorded
-rules file>; the decision files the inventory's "Decided, not done" section
-lists; every earlier lens file in <dir> (do not repeat their items).
+rules file>; every decision file in <notes>/decisions/ (keep decisions
+included); every earlier lens file in <dir> (do not repeat their items).
 
 A recorded rule, or a decision to keep something, is not a finding. A
 decision listed under "Decided, not done" is work still to do: report it in
