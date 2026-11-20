@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -80,22 +81,98 @@ def main() -> int:
         # must neither poison the other refs nor hide legacy/master.
         git(repo, "symbolic-ref", "refs/remotes/legacy/HEAD", "refs/remotes/legacy/gone")
 
+        covered_root = root / "covered"
+        covered_root.mkdir()
+        covered = covered_root / "wt-covered"
+        git(repo, "worktree", "add", "-q", "-b", "covered", str(covered), "origin/main")
+        (covered / "wip.txt").write_text("x")
+        cfg = root / "cfg"
+        cfg.mkdir()
+        (cfg / "settings.json").write_text(json.dumps(
+            # arftl-allow: permission-widened (fixture written to a scratch config)
+            {"permissions": {"additionalDirectories": [str(covered_root)]}}))
+
         manual = str(root / "hand-added")
         (repo / ".claude").mkdir()
         settings = repo / ".claude" / "settings.local.json"
-        settings.write_text(json.dumps({"permissions": {"additionalDirectories": [manual]}}))
+        # A list written before covered worktrees were skipped: the covered
+        # one is ours to remove, the hand-added one is not.
+        settings.write_text(json.dumps({
+            # arftl-allow: permission-widened (fixture written to a scratch config)
+            "permissions": {"additionalDirectories": [manual, str(covered)]},
+            "_managedWorktreeDirs": [str(covered)]}))
 
+        shim_dir = root / "shim"
+        shim_dir.mkdir()
+        git_log = root / "git-calls.log"
+        shim = shim_dir / "git"
+        shim.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{git_log}"\n'
+                        f'exec "{shutil.which("git")}" "$@"\n')
+        shim.chmod(0o755)
         subprocess.run([sys.executable, str(HOOK)], input="{}", text=True, capture_output=True,
-                       env={**ENV, "CLAUDE_PROJECT_DIR": str(repo)}, timeout=60)
+                       env={**ENV, "CLAUDE_PROJECT_DIR": str(repo), "CLAUDE_CONFIG_DIR": str(cfg),
+                            "PATH": f"{shim_dir}{os.pathsep}{ENV.get('PATH', '')}"}, timeout=60)
+        calls = git_log.read_text().splitlines() if git_log.exists() else []
+        covered_checks = [c for c in calls if str(covered) in c and (" status" in c or " rev-list" in c)]
+        check("hook ran git through the shim", any(" worktree list" in c for c in calls), str(calls))
+        check("worktree under a user-level root costs no per-worktree git check",
+              not covered_checks, str(covered_checks))
         dirs = json.loads(settings.read_text())["permissions"]["additionalDirectories"]
         check("dirty worktree kept", str(dirty) in dirs, str(dirs))
         check("worktree with unpushed commits kept", str(ahead) in dirs, str(dirs))
         check("clean merged worktree dropped", str(merged) not in dirs, str(dirs))
         check("hand-added entry survives", manual in dirs, str(dirs))
+        check("worktree under a user-level additionalDirectories root not listed",
+              str(covered) not in dirs, str(dirs))
         check("worktree merged on another remote's default branch dropped",
               str(legacy_merged) not in dirs, str(dirs))
         check("worktree ahead of every remote's default branch kept",
               str(legacy_ahead) in dirs, str(dirs))
+
+        (cfg / "settings.json").write_text(json.dumps(
+            # arftl-allow: permission-widened (fixture written to a scratch config)
+            {"permissions": {"additionalDirectories": [str(root)]}}))
+        git_log.unlink()
+        subprocess.run([sys.executable, str(HOOK)], input="{}", text=True, capture_output=True,
+                       env={**ENV, "CLAUDE_PROJECT_DIR": str(repo), "CLAUDE_CONFIG_DIR": str(cfg),
+                            "PATH": f"{shim_dir}{os.pathsep}{ENV.get('PATH', '')}"}, timeout=60)
+        calls = git_log.read_text().splitlines() if git_log.exists() else []
+        check("every worktree covered: no git call beyond the worktree list",
+              [c for c in calls if " worktree list" not in c] == [], str(calls))
+
+        local = root / "local"
+        git(root, "init", "-q", str(local))
+        git(local, "commit", "-q", "--allow-empty", "-m", "init")
+        local_wts = [root / f"local-wt{i}" for i in range(3)]
+        for i, wt in enumerate(local_wts):
+            git(local, "worktree", "add", "-q", "-b", f"l{i}", str(wt))
+        (local_wts[0] / "wip.txt").write_text("x")
+        (cfg / "settings.json").write_text("{}")
+        git_log.unlink()
+        subprocess.run([sys.executable, str(HOOK)], input="{}", text=True, capture_output=True,
+                       env={**ENV, "CLAUDE_PROJECT_DIR": str(local), "CLAUDE_CONFIG_DIR": str(cfg),
+                            "PATH": f"{shim_dir}{os.pathsep}{ENV.get('PATH', '')}"}, timeout=60)
+        calls = git_log.read_text().splitlines()
+        dirs = json.loads((local / ".claude" / "settings.local.json").read_text())
+        check("no remote: every worktree kept",
+              dirs["permissions"]["additionalDirectories"] == sorted(map(str, local_wts)), str(dirs))
+        check("no remote: no status check, which could not change that",
+              not [c for c in calls if " status" in c], str(calls))
+
+        for label, value in (("null", None), ("a string", "/"), ("a number", 7),
+                             ("an unknown ~user", ["~no-such-user-e2e/x"]),
+                             ("a path with a NUL", ["a\x00b"])):
+            (cfg / "settings.json").write_text(json.dumps(
+                # arftl-allow: permission-widened (fixture written to a scratch config)
+                {"permissions": {"additionalDirectories": value}}))
+            proc = subprocess.run(
+                [sys.executable, str(HOOK)], input="{}", text=True, capture_output=True,
+                env={**ENV, "CLAUDE_PROJECT_DIR": str(repo), "CLAUDE_CONFIG_DIR": str(cfg)},
+                timeout=60)
+            dirs = json.loads(settings.read_text())["permissions"]["additionalDirectories"]
+            check(f"user-level list that is {label}: exits 0 and drops nothing",
+                  proc.returncode == 0 and str(dirty) in dirs and str(covered) in dirs,
+                  f"rc={proc.returncode} {proc.stderr[-200:]} {dirs}")
 
     print("all passed" if not FAILURES else f"{len(FAILURES)} failed")
     return 1 if FAILURES else 0
