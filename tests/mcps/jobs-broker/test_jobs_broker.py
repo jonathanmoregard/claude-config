@@ -126,16 +126,13 @@ class RepoPathTests(Home):
         self.assertEqual({p for p in self.writable(self.repo) if p != self.repo and
                           self.repo not in p.parents}, set())
 
-    def test_linked_worktree_also_writes_main_git_dir(self) -> None:
+    def test_linked_worktree_writes_only_its_working_tree(self) -> None:
         wt = self.home / "worktrees" / "wt"
         admin = self.repo / ".git" / "worktrees" / "wt"
         admin.mkdir(parents=True)
         (admin / "commondir").write_text("../..\n")
         (wt / ".git").write_text(f"gitdir: {admin}\n")
-        main_git = self.repo / ".git"
-        self.assertIn(main_git, self.writable(wt))
-        self.assertEqual({p for p in self.writable(wt) if p != wt and main_git != p
-                          and main_git not in p.parents}, set())
+        self.assertEqual({p for p in self.writable(wt) if p != wt and wt not in p.parents}, set())
 
     def test_symlinked_dot_git_refused(self) -> None:
         wt = self.home / "worktrees" / "wt"
@@ -159,6 +156,48 @@ class RepoPathTests(Home):
         (spaced / "r").mkdir(parents=True)
         (self.home / "Repos" / "clean").symlink_to(spaced)
         self.refused(str(self.home / "Repos" / "clean" / "r"))
+
+    def make_git_dir(self, path: Path) -> Path:
+        for d in ("objects", "refs", "hooks"):
+            (path / d).mkdir(parents=True, exist_ok=True)
+        (path / "HEAD").write_text("ref: refs/heads/main\n")
+        return path
+
+    def test_refuses_any_path_inside_a_git_dir(self) -> None:
+        bare = self.make_git_dir(self.home / "Repos" / "bare")
+        self.make_git_dir(self.repo / ".git")
+        (self.home / "Repos" / "into-git").symlink_to(self.repo / ".git")
+        for raw in [self.repo / ".git", self.repo / ".git" / "hooks", bare, bare / "hooks",
+                    self.home / "Repos" / "into-git" / "hooks"]:
+            with self.subTest(raw=raw):
+                self.refused(str(raw))
+
+    def test_every_git_dir_in_reach_is_read_only(self) -> None:
+        main_git = self.make_git_dir(self.repo / ".git")
+        nested = self.make_git_dir(self.repo / "vendor" / "inner" / ".git")
+        modules = self.make_git_dir(main_git / "modules" / "sub")
+        (self.repo / "sub").mkdir()
+        (self.repo / "sub" / ".git").write_text("gitdir: ../.git/modules/sub\n")
+        wt = self.home / "worktrees" / "wt"
+        admin = self.make_git_dir(main_git / "worktrees" / "wt")
+        (admin / "commondir").write_text("../..\n")
+        (wt / ".git").write_text(f"gitdir: {admin}\n")
+        reachable = {self.repo: [main_git, nested, modules, self.repo / "sub" / ".git", admin],
+                     wt: [main_git, modules, admin, wt / ".git"]}
+        for where, git_paths in reachable.items():
+            target = self.server.confine_repo(str(where), self.home)
+            ro = [p for p, _ in target.readonly]
+            rw = [p for p, _ in target.writable]
+            with self.subTest(where=where.name):
+                for g in git_paths:
+                    self.assertTrue(any(g == p or p in g.parents for p in ro), g)
+                for w in rw:
+                    self.assertFalse(any(w == g or g in w.parents for g in git_paths), w)
+
+    def test_symlinked_nested_dot_git_refused(self) -> None:
+        (self.repo / "vendor").mkdir()
+        (self.repo / "vendor" / ".git").symlink_to(self.repo / ".git")
+        self.refused(str(self.repo))
 
     def test_refuses_a_worktree_whose_common_dir_path_is_not_clean(self) -> None:
         main = self.home / "Repos" / "ma in"
@@ -382,10 +421,13 @@ class RealUnitTests(unittest.TestCase):
         self.slug = f"test-{uuid.uuid4().hex[:12]}"
         self.unit = f"claude-job-{self.slug}"
 
-    def tearDown(self) -> None:
+    def reset_unit(self) -> None:
         subprocess.run(["systemctl", "--user", "stop", f"{self.unit}.service"], capture_output=True)
         subprocess.run(["systemctl", "--user", "reset-failed", f"{self.unit}.service"],
                        capture_output=True)
+
+    def tearDown(self) -> None:
+        self.reset_unit()
         for leftover in (self.home / ".local/state/claude-jobs" / f"{self.unit}.log",
                          self.home / ".local/state/claude-unit-failures" / f"{self.unit}.json"):
             leftover.unlink(missing_ok=True)
@@ -492,16 +534,90 @@ class RealUnitTests(unittest.TestCase):
         self.assertIn("MARKER_OK", out)
         self.assertEqual(self.snapshot(*watched), before, out)
 
-    def test_git_still_commits_in_a_repo_and_in_a_worktree(self) -> None:
+    def test_git_dir_as_repo_is_refused(self) -> None:
+        self.git("init", "-q", cwd=self.repo)
+        with self.assertRaises(RuntimeError):
+            self.start("echo planted > hooks/x", repo=self.repo / ".git")
+        self.assertFalse((self.repo / ".git/hooks/x").exists())
+
+    def test_job_cannot_write_submodule_or_worktree_git_state(self) -> None:
+        sub_src = self.dir / "subsrc"
+        sub_src.mkdir()
+        self.git("init", "-q", cwd=sub_src)
+        self.git("commit", "-q", "--allow-empty", "-m", "sub", cwd=sub_src)
         wt = self.main_and_worktree()
-        commit = ("echo x > f && git add f && git -c user.name=t -c user.email=t@t "
-                  "commit -q -m from-job && git status --short")
+        self.git("-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub_src), "sub",
+                 cwd=self.repo)
+        self.git("config", "extensions.worktreeConfig", "true", cwd=self.repo)
+        self.git("config", "--worktree", "core.x", "main", cwd=self.repo)
+        self.git("config", "--worktree", "core.x", "wt", cwd=wt)
+        common = self.repo / ".git"
+        admin = common / "worktrees/wt"
+        watched = (common / "modules/sub/config", common / "modules/sub/hooks",
+                   common / "config.worktree", admin / "config.worktree", self.repo / "sub/.git")
+        before = self.snapshot(*watched)
+        attack = (f"echo '[core]' >> {common}/modules/sub/config; "
+                  f"echo planted > {common}/modules/sub/hooks/post-checkout; "
+                  f"echo '[core]' >> {common}/config.worktree; "
+                  f"echo '[core]' >> {admin}/config.worktree; "
+                  "echo 'gitdir: /tmp' > sub/.git; exit 0")
         for where in (self.repo, wt):
+            self.reset_unit()
             with self.subTest(where=where.name):
-                out = self.run_job(commit, repo=where)
+                out = self.run_job(attack, repo=where)
                 self.assertIn("MARKER_OK", out)
-                self.assertIn("from-job", self.git("log", "-1", "--format=%s", cwd=where))
-                self.server.tool_stop({"slug": self.slug}, self.home)
+                self.assertEqual(self.snapshot(*watched), before, out)
+
+    def test_nested_repo_git_dir_cannot_be_written_or_swapped(self) -> None:
+        self.git("init", "-q", cwd=self.repo)
+        inner = self.repo / "vendor/inner"
+        inner.mkdir(parents=True)
+        self.git("init", "-q", cwd=inner)
+        before = self.snapshot(inner / ".git/hooks", inner / ".git/config")
+        out = self.run_job(
+            "echo planted > vendor/inner/.git/hooks/post-checkout; "
+            "echo '[core]' >> vendor/inner/.git/config; "
+            "mv vendor vendor2 && mkdir -p vendor/inner/.git/hooks && "
+            "echo planted > vendor/inner/.git/hooks/post-checkout; exit 0")
+        self.assertIn("MARKER_OK", out)
+        self.assertFalse((self.repo / "vendor2").exists(), out)
+        self.assertEqual(self.snapshot(inner / ".git/hooks", inner / ".git/config"), before, out)
+
+    def test_git_reads_work_and_commit_fails_in_a_repo_and_in_a_worktree(self) -> None:
+        wt = self.main_and_worktree()
+        for where in (self.repo, wt):
+            (where / "f").write_text("a\n")
+            self.git("add", "f", cwd=where)
+            self.git("commit", "-q", "-m", "base", cwd=where)
+        script = ("echo b >> f && git status --short && git diff --stat && "
+                  "if git -c user.name=t -c user.email=t@t commit -qam from-job; "
+                  "then echo COMMITTED; else echo COMMIT-REFUSED; fi")
+        for where in (self.repo, wt):
+            self.reset_unit()
+            with self.subTest(where=where.name):
+                out = self.run_job(script, repo=where)
+                self.assertIn("MARKER_OK", out)
+                self.assertIn(" M f", out)
+                self.assertIn("1 file changed", out)
+                self.assertIn("COMMIT-REFUSED", out)
+                self.assertEqual(self.git("log", "-1", "--format=%s", cwd=where).strip(), "base")
+
+    def test_nix_build_of_a_flake_in_a_worktree(self) -> None:
+        wt = self.main_and_worktree()
+        (wt / "flake.nix").write_text(
+            '{ outputs = { self }: { packages.x86_64-linux.default = derivation {\n'
+            '  name = "jobs-broker-test"; system = "x86_64-linux"; builder = "/bin/sh";\n'
+            '  args = [ "-c" "echo ok > $out" ]; }; }; }\n')
+        self.git("add", "flake.nix", cwd=wt)
+        self.git("commit", "-q", "-m", "flake", cwd=wt)
+        self.server.tool_start({"repo": str(wt), "slug": self.slug, "max_runtime_sec": 300,
+                                "profile": "nix",
+                                "argv": ["nix", "build", "--no-link", "--print-out-paths", ".#default"]},
+                               self.home)
+        out = self.server.tool_status({"slug": self.slug, "wait_sec": 240}, self.home)
+        out += self.server.tool_log({"slug": self.slug}, self.home)
+        self.assertIn("MARKER_OK", out)
+        self.assertIn("-jobs-broker-test", out)
 
     def test_concurrent_starts_of_one_slug_start_one_job_and_keep_its_log(self) -> None:
         import itertools

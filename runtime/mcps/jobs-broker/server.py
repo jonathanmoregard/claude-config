@@ -14,7 +14,6 @@ import json
 import os
 import pwd
 import re
-import stat
 import subprocess
 import sys
 import threading
@@ -23,11 +22,12 @@ from pathlib import Path
 from typing import NamedTuple
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
+from broker_paths import canonical  # noqa: E402
 RECORDER = HERE.parents[1] / "scripts" / "record-user-unit-failure"
 SYSTEM_BIN = "/run/current-system/sw/bin"
 PYTHON = f"{SYSTEM_BIN}/python3"
 PREFIX = "claude-job-"
-ROOTS = ("Repos", "worktrees")
 PROFILES = ("repo", "nix")
 MIN_RUNTIME_SEC = 10
 DEFAULT_RUNTIME_SEC = 4 * 3600
@@ -38,11 +38,9 @@ DEFAULT_LOG_LINES = 100
 MAX_LOG_LINES = 500
 MAX_LOG_BYTES = 64 * 1024
 MAX_WAIT_SEC = 540
+MAX_SCAN_ENTRIES = 2_000_000
 
 _SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,47}")
-# systemd splits and unquotes path-list properties (BindPaths=, ...) and
-# expands % specifiers, so a path is used only when nothing in it is special.
-_PLAIN_PATH_RE = re.compile(r"/[A-Za-z0-9._@+/-]*")
 _SHOW = ("LoadState", "ActiveState", "SubState", "Result", "ExecMainStatus",
          "ExecMainStartTimestamp", "ExecMainExitTimestamp")
 
@@ -127,29 +125,13 @@ def log_path(home: Path, unit: str) -> Path:
     return home / ".local/state/claude-jobs" / f"{unit}.log"
 
 
-def _confined(path: Path, home: Path, kind=stat.S_ISDIR) -> tuple:
-    candidate = Path(os.path.realpath(path.parent)) / path.name
+def _gitdir_pointer(gitfile: Path) -> Path | None:
     try:
-        st = os.lstat(candidate)
-    except OSError:
-        raise RuntimeError(f"{path} does not exist") from None
-    if not _PLAIN_PATH_RE.fullmatch(str(candidate)):
-        raise RuntimeError(f"{candidate!r} has characters other than [A-Za-z0-9._@+/-]")
-    if not kind(st.st_mode):
-        raise RuntimeError(f"{path} is not a {'directory' if kind is stat.S_ISDIR else 'file'}"
-                           " (a symlink is refused)")
-    roots = [Path(os.path.realpath(home / r)) for r in ROOTS]
-    if not any(root in candidate.parents for root in roots):
-        raise RuntimeError(f"{path} is not inside ~/Repos or ~/worktrees")
-    return candidate, f"{st.st_dev}:{st.st_ino}"
-
-
-def _gitdir_pointer(dotgit: Path, repo: Path) -> Path | None:
-    try:
-        match = re.fullmatch(r"gitdir: (.+)\n?", dotgit.read_text()[:MAX_ARG_CHARS])
+        with open(gitfile, encoding="utf-8") as fh:
+            match = re.fullmatch(r"gitdir: (.+)\n?", fh.read(MAX_ARG_CHARS))
     except (OSError, UnicodeDecodeError):
         return None
-    return Path(os.path.realpath(repo / match.group(1))) if match else None
+    return Path(os.path.realpath(gitfile.parent / match.group(1))) if match else None
 
 
 def _common_dir(gitdir: Path) -> Path:
@@ -159,47 +141,52 @@ def _common_dir(gitdir: Path) -> Path:
         return gitdir
 
 
-# Claude Code's sandbox keeps .git/hooks, .git/config and a worktree's .git
-# file read-only; jobs get the same for every git dir they can write. Each
-# protected path is also a mount point inside the job, so it cannot be renamed
-# away and recreated, and a missing hooks dir is made first for that reason.
-def _git_binds(repo: Path, home: Path) -> tuple:
-    dotgit = repo / ".git"
-    try:
-        mode = os.lstat(dotgit).st_mode
-    except FileNotFoundError:
-        return [], []
-    if stat.S_ISDIR(mode):
-        writable, readonly, admin, common = [_confined(dotgit, home)], [], None, dotgit
-    elif stat.S_ISREG(mode):
-        writable, readonly = [], [_confined(dotgit, home, stat.S_ISREG)]
-        admin = _gitdir_pointer(dotgit, repo)
-        if admin is None:
-            return writable, readonly
-        common = _common_dir(admin)
-        if common != repo:
-            writable.append(_confined(common, home))
-    else:
-        raise RuntimeError(f"{dotgit} is neither a directory nor a gitdir file")
-    if not os.path.lexists(common / "hooks"):
-        os.mkdir(common / "hooks", 0o755)
-    readonly += [_confined(common / "hooks", home), _confined(common / "config", home, stat.S_ISREG)]
-    worktrees = common / "worktrees"
-    if os.path.lexists(worktrees):
-        readonly.append(_confined(worktrees, home))
-        if admin is not None and admin.parent == worktrees:
-            writable.append(_confined(admin, home))
-            readonly.append(_confined(admin / "commondir", home, stat.S_ISREG))
-    return writable, readonly
+def _dot_git_entries(repo: Path) -> list:
+    found, pending, seen = [], [repo], 0
+    while pending:
+        try:
+            with os.scandir(pending.pop()) as entries:
+                for entry in entries:
+                    seen += 1
+                    if seen > MAX_SCAN_ENTRIES:
+                        raise RuntimeError(f"{repo} has over {MAX_SCAN_ENTRIES} entries to scan")
+                    if entry.name == ".git":
+                        if entry.is_symlink():
+                            raise RuntimeError(f"{entry.path} is a symlink")
+                        found.append(Path(entry.path))
+                    elif entry.is_dir(follow_symlinks=False):
+                        pending.append(entry.path)
+        except OSError as e:
+            raise RuntimeError(f"cannot scan {repo} for git dirs: {e}") from None
+    return found
+
+
+# Every git dir a job could reach is bound read-only: the repo's own, its
+# common dir, and every nested repo's or submodule's. Each is a mount point,
+# and so is every directory between the repo and it, so none can be renamed
+# away and replaced by one the job wrote.
+def _git_binds(repo: Path, home: Path) -> list:
+    readonly = []
+    for entry in _dot_git_entries(repo):
+        if entry.is_dir():
+            gitdir = entry
+        else:
+            readonly.append(canonical(str(entry), home, "file", git_ok=True))
+            gitdir = _gitdir_pointer(entry)
+            if gitdir is None:
+                continue
+        for path in {gitdir, _common_dir(gitdir)}:
+            readonly.append(canonical(str(path), home, git_ok=True))
+    unique = sorted(set(readonly))
+    return [(p, i) for p, i in unique if not any(q in p.parents for q, _ in unique)]
 
 
 def confine_repo(raw: object, home: Path) -> Target:
-    if not isinstance(raw, str) or not os.path.isabs(raw) or "\0" in raw \
-            or len(raw) > MAX_ARG_CHARS or ".." in raw.split("/"):
-        raise RuntimeError("repo must be an absolute path without '..'")
-    repo = _confined(Path(raw), home)
-    writable, readonly = _git_binds(repo[0], home)
-    return Target(repo[0], [repo, *writable], readonly)
+    repo = canonical(raw, home)
+    readonly = _git_binds(repo[0], home)
+    between = {a for p, _ in readonly for a in p.parents if repo[0] in a.parents}
+    writable = [repo, *(canonical(str(a), home) for a in sorted(between))]
+    return Target(repo[0], writable, readonly)
 
 
 def validate_start(args: object, home: Path) -> Job:
@@ -361,7 +348,7 @@ TOOLS = [
          "Starts a long job (nix build, VM test gate, long test suite) as a detached, hardened "
          "systemd user unit that outlives this session. It runs argv in repo with: repo "
          "writable, the rest of home hidden, no network (nix builds still fetch through the "
-         "nix daemon), secrets hidden, git hooks and config read-only, killed after "
+         "nix daemon), secrets hidden, every git dir read-only (git commit fails), killed after "
          "max_runtime_sec. Profile nix also binds the nix cache and uses the ram-heavy slice. "
          "Read the outcome later with status (wait_sec blocks until it settles) and log."),
      "inputSchema": {"type": "object", "properties": {
