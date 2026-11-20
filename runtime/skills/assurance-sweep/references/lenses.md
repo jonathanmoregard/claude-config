@@ -66,7 +66,45 @@ ordinary practice comes from memory. SKIP where a recorded decision chose
 the unusual way.
 ```
 
-## 3 — Defect classes
+## 3 — Domain model
+
+```text
+Read the core: the code that decides what the application does, as opposed
+to the adapters that talk to storage, networks, devices, UIs and other
+systems. The inventory says which is which; with no such split, say so and
+treat the whole as core. Report every site, with per-file counts where
+there are many, in these categories:
+1. A value whose set is closed carried as a string, integer or boolean. It
+   should be a sum type whose labels say what each value means — not 0..4,
+   not 'a' | 'b' codes — matched exhaustively.
+2. A bounded number carried as a plain number. It should be a range type
+   only a parser can build.
+3. An identifier carried as a plain string. Each kind gets its own id type,
+   so two kinds cannot be mixed.
+4. A sentinel for "none" or "unknown" (-1, '', 0, an invented default). It
+   should be an explicit case.
+5. A check, default, cast or non-null assertion inside the core on a value
+   an edge parser should already have settled. Parse once at the edge.
+6. Adapter vocabulary in the core: table, topic, entity, service or endpoint
+   names; wire documents passed through unread; lists of actions or calls
+   for something else to perform. The core holds state, pure updates (an
+   event and the state give the new state) and derivations from state; the
+   adapter reads the world in, saves what changed, and makes the world match.
+7. Names that describe mechanism (plan, args, parts, data, info, manager,
+   handle) where a domain word exists. Take domain words from the user's own
+   words in the recorded decisions and conversation records the inventory
+   names. Return a vocabulary table, each term with where the user used it;
+   mark a term with no such source.
+For each category give the target type as a short sketch, where its parser
+belongs, and one guard that keeps it from coming back: a lint or
+compiler-API check over the core's exported signatures, with an allowlist
+whose every entry needs a reason. A genuinely open value — text shown to a
+person, real-number arithmetic — is SKIP with that reason. Types narrow what
+the code accepts; they add no runtime machinery, and wire formats stay as
+they are.
+```
+
+## 4 — Defect classes
 
 ```text
 From the defect history, group defects into classes: the same root shape at
@@ -87,7 +125,7 @@ how many signatures and call sites it touches, and the failing build or test
 that is the RED.
 ```
 
-## 4 — Races
+## 5 — Races
 
 ```text
 List the operations that change shared state and the invariant each must
@@ -104,7 +142,7 @@ pairs serialised by a lock you can cite, and three-way combinations unless
 no pairwise test can express the bug.
 ```
 
-## 5 — Extrapolation
+## 6 — Extrapolation
 
 ```text
 Find existing tests that would cover materially more for a small edit: a
@@ -117,7 +155,7 @@ it would then catch. New test suites belong to the Venues lens: SKIP them
 here.
 ```
 
-## 6 — Venues
+## 7 — Venues
 
 ```text
 From the defect history: name the recurring classes and how each instance

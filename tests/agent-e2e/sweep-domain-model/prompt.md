@@ -1,0 +1,1 @@
+Review comments on this repo keep coming back to lax typing: strings and plain numbers where I expect proper types, and the core not really saying what the app is about. Can you run an assurance sweep over the repo for that? The cost is fine, no need to check with me first.

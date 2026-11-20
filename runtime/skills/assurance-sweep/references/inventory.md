@@ -5,6 +5,8 @@ Write `<notes>/assurance-sweep/<date>/inventory.md` in this shape.
 ```markdown
 # Inventory — <repo> @ <commit>, <date>
 
+Tier: production | personal. Core: <dirs>. Adapters: <dirs>.
+
 ## 1. Mechanisms
 | # | Job | Homes (file:line) | Relied on by |
 
@@ -39,7 +41,8 @@ listed.
 ## Assurance methods, and the baseline when absent
 
 Fill one row per method. Mark `n/a` where the repository has nothing for the
-method to act on (no migrations, no second store). Name the project's own
+method to act on (no migrations, no second store), and for production-only
+methods on a personal project. Name the project's own
 tool where one exists; the table names categories only.
 
 | # | Method | Minimal baseline | Effort |
@@ -55,10 +58,10 @@ tool where one exists; the table names categories only.
 | 9 | Fuzzing | one fuzz target for the parser taking the least-trusted input, seeded from existing test inputs, time-boxed | M |
 | 10 | Mutation testing | a manual run scoped to one critical module or to a diff; survivors become tests | M |
 | 11 | Gate self-test | each gate lane trips on one planted defect | S per lane |
-| 12 | Leak check | distinctive values planted through real flows in an end-to-end run, then searched for in logs and dumps | M |
-| 13 | Growth measurement | row, memory and handle counts before and after one load run | S |
-| 14 | Alerting | failure of each long-running unit reaches a person | S–M |
-| 15 | Restore rehearsal | one scripted restore of the newest backup into a scratch instance | M–L |
+| 12 | Leak check (production only) | distinctive values planted through real flows in an end-to-end run, then searched for in logs and dumps | M |
+| 13 | Growth measurement (production only) | row, memory and handle counts before and after one load run | S |
+| 14 | Alerting (production only) | failure of each long-running unit reaches a person | S–M |
+| 15 | Restore rehearsal (production only) | one scripted restore of the newest backup into a scratch instance | M–L |
 | 16 | Review ledger | `<notes>/review-ledger.tsv` with its header row | S |
 
 A baseline that needs a new dependency, a gate change or a paid service

@@ -1,11 +1,11 @@
 ---
 name: assurance-sweep
-description: Use when a whole repository or long-lived branch needs a robustness pass beyond diff review — before a release or cutover, after a large merge or rewrite, when the same kind of defect keeps coming back, or on asks like "what more can we do to make this safe", "is anything implemented twice", "is the race coverage complete", "can this class of bug be ruled out", "can existing tests cover more", "is this how it's normally done". Not for close-out review of one diff (advice-refine-test-loop).
+description: Use when a whole repository or long-lived branch needs a robustness pass beyond diff review — before a release or cutover, after a large merge or rewrite, when the same kind of defect keeps coming back, or on asks like "what more can we do to make this safe", "is anything implemented twice", "is the race coverage complete", "can this class of bug be ruled out", "can existing tests cover more", "is this how it's normally done", "is the domain typed properly", "too many strings and integers", "parse don't validate across the repo", "does the core speak the domain". Not for close-out review of one diff (advice-refine-test-loop).
 ---
 
 # Assurance Sweep
 
-Six whole-repository lenses, one at a time, each read by one strongest-tier
+Seven whole-repository lenses, one at a time, each read by one strongest-tier
 read-only reviewer. A lens returns ranked proposals; you check them and hand
 them to the user. The sweep only proposes; it edits no source. Building what the
 user picks is ordinary work under the project's usual flow, and no part of
@@ -22,6 +22,12 @@ still lets through, and what the cheapest thing is that would stop it.
 3. Read the user's recorded decisions. A recorded decision is never a finding.
 4. Quote the cost before starting: one strongest-tier whole-repository read
    per lens.
+5. Note the project's tier in the inventory: **production** (outside users,
+   their data, uptime) or **personal** (the owner's own tool or home setup).
+   On a personal project no lens proposes production machinery —
+   observability, alerting, restore rehearsals, leak checks, growth
+   measurement — and the Venues lens marks those methods `n/a`. Neat types,
+   clear structure and working tests still apply in full.
 
 ## Step 1 — Inventory
 
@@ -45,13 +51,14 @@ and method: `references/inventory.md`. Four sections:
 |---|---|---|---|
 | 1 | Duplicates | Which job is done in more than one place, and what breaks when the copies diverge? | the mechanism list |
 | 2 | Norms | Which mechanism is unusual or heavier than the ordinary way? (advisory) | the mechanism list |
-| 3 | Defect classes | Which past defects have siblings still in the code, and what would rule the class out? | defect history |
-| 4 | Races | Which pairs of concurrent operations have no test that runs them together? | a way to run two operations at once in a test |
-| 5 | Extrapolation | Which existing test covers much more for a small edit? | property tests; a model or scenario test |
-| 6 | Venues | Which assurance method that would have caught past defects is unused or weaker than claimed? | defect history; the assurance table |
+| 3 | Domain model | Where does the core carry plain strings, numbers, sentinels or adapter vocabulary instead of domain types and domain words? | a type checker in the project gate |
+| 4 | Defect classes | Which past defects have siblings still in the code, and what would rule the class out? | defect history |
+| 5 | Races | Which pairs of concurrent operations have no test that runs them together? | a way to run two operations at once in a test |
+| 6 | Extrapolation | Which existing test covers much more for a small edit? | property tests; a model or scenario test |
+| 7 | Venues | Which assurance method that would have caught past defects is unused or weaker than claimed? | defect history; the assurance table |
 
 Run the lenses the user asked for; with no preference, in this order. Lenses
-1 and 2 can lead to code being deleted. If a later lens ran before their
+1 to 3 can lead to code being deleted or restructured. If a later lens ran before their
 proposals were acted on, say so: it may have read code that is about to go.
 
 1. Compose the prompt from `references/lenses.md`: the shared preamble, then
