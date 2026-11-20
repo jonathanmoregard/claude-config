@@ -58,12 +58,14 @@ class Home(unittest.TestCase):
         self.repo = self.home / "Repos" / "main"
         (self.repo / ".git" / "config").write_text("")
         self.write_settings({"sandbox": SANDBOX})
+        self.sources = [(self.home / ".claude" / "settings.json", True)]
+        self.server.settings_sources = lambda home: self.sources
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def write_settings(self, settings: dict) -> None:
-        (self.home / ".claude" / "settings.json").write_text(json.dumps(settings))
+    def write_settings(self, settings: dict, path: Path | None = None) -> None:
+        (path or self.home / ".claude" / "settings.json").write_text(json.dumps(settings))
 
     def start_args(self, **over) -> dict:
         return {"repo": str(self.repo), "argv": ["make", "check"], "slug": "check", **over}
@@ -109,7 +111,7 @@ class StartValidationTests(Home):
 class RepoPathTests(Home):
     def refused(self, raw) -> None:
         with self.assertRaises(RuntimeError):
-            self.server.confine_repo(raw, self.home)
+            self.job(repo=raw)
 
     def test_refuses_home_roots_and_outside(self) -> None:
         for raw in [str(self.home), str(self.home / "Repos"), str(self.home / "worktrees"),
@@ -213,6 +215,73 @@ class SrtPolicyTests(Home):
             (path / d).mkdir(parents=True, exist_ok=True)
         (path / "HEAD").write_text("ref: refs/heads/main\n")
         return path
+
+    def with_deny(self, *rules: str, extra: dict | None = None) -> dict:
+        self.write_settings({"sandbox": SANDBOX, "permissions": {"deny": list(rules)}, **(extra or {})})
+        return self.policy()
+
+    def test_read_deny_rules_are_denied_reads_as_claude_resolves_them(self) -> None:
+        fs = self.with_deny("Read(//srv/secret)", "Read(~/.aws/**)", "Read(.env)",
+                            "Read(/private/x)", "Read(**/*.pem)")["filesystem"]
+        for path in ("/srv/secret", f"{self.home}/.aws/**", f"{self.repo}/.env",
+                     f"{self.home}/.claude/private/x", f"{self.repo}/**/*.pem"):
+            with self.subTest(path=path):
+                self.assertIn(path, fs["denyRead"])
+        self.assertNotIn("/srv/secret", fs["denyWrite"])
+
+    def test_edit_and_write_deny_rules_are_denied_writes(self) -> None:
+        fs = self.with_deny("Edit(//srv/locked)", "Write(~/.zshrc)", "Edit(build/out.txt)")["filesystem"]
+        for path in ("/srv/locked", f"{self.home}/.zshrc", f"{self.repo}/build/out.txt"):
+            with self.subTest(path=path):
+                self.assertIn(path, fs["denyWrite"])
+        self.assertNotIn("/srv/locked", fs["denyRead"])
+
+    def test_other_tools_rules_do_not_reach_the_filesystem_policy(self) -> None:
+        fs = self.with_deny("Bash(rm *)", "Grep(//srv/g)", "mcp__x__y", "WebSearch")["filesystem"]
+        self.assertEqual(fs["denyRead"], SANDBOX["filesystem"]["denyRead"])
+        self.assertNotIn("/srv/g", fs["denyWrite"])
+
+    def test_webfetch_domain_deny_rules_are_denied_domains(self) -> None:
+        net = self.with_deny("WebFetch(domain:evil.example)", "WebFetch")["network"]
+        self.assertIn("evil.example", net["deniedDomains"])
+
+    def test_deny_write_globs_become_the_paths_they_match_in_the_repo(self) -> None:
+        for d in ("a/held", "b/c/held", "b/keep"):
+            (self.repo / d).mkdir(parents=True)
+        (self.repo / "b/keep/x.lock").write_text("")
+        deny = self.with_deny("Edit(//**/held/**)", "Edit(**/*.lock)")["filesystem"]["denyWrite"]
+        for path in (self.repo / "a/held", self.repo / "b/c/held", self.repo / "b/keep/x.lock"):
+            with self.subTest(path=path):
+                self.assertIn(str(path), deny)
+        self.assertNotIn(str(self.repo / "b/keep"), deny)
+        self.assertFalse([p for p in deny if any(c in p for c in "*?[")], deny)
+
+    def test_managed_settings_denies_are_merged(self) -> None:
+        managed = self.home / "managed-settings.json"
+        self.write_settings({"permissions": {"deny": ["Read(//srv/managed)"]},
+                             "sandbox": {"filesystem": {"denyWrite": ["/srv/mw"]}}}, managed)
+        self.sources = [*self.sources, (managed, False), (self.home / "absent.json", False)]
+        fs = self.policy()["filesystem"]
+        self.assertIn("/srv/managed", fs["denyRead"])
+        self.assertIn("/srv/mw", fs["denyWrite"])
+
+    def test_untranslatable_settings_refuse_to_start(self) -> None:
+        cases = {"bare Read": ["Read"], "empty Edit": ["Edit()"], "escape": ["Read(a\\*b)"],
+                 "not a string": [{"Read": "x"}], "bare Edit": ["Edit"]}
+        for name, deny in cases.items():
+            self.write_settings({"sandbox": SANDBOX, "permissions": {"deny": deny}})
+            with self.subTest(name), self.assertRaises(RuntimeError):
+                self.job()
+        self.write_settings({"sandbox": SANDBOX, "permissions": {"deny": "Read(x)"}})
+        with self.assertRaises(RuntimeError):
+            self.job()
+
+    def test_unreadable_managed_settings_refuse_to_start(self) -> None:
+        managed = self.home / "managed-settings.json"
+        managed.write_text("{not json")
+        self.sources = [*self.sources, (managed, False)]
+        with self.assertRaisesRegex(RuntimeError, "managed-settings"):
+            self.job()
 
     def test_nothing_starts_without_the_sessions_sandbox_policy(self) -> None:
         settings = self.home / ".claude" / "settings.json"
@@ -459,6 +528,14 @@ class RealUnitTests(unittest.TestCase):
         self.canary.write_text("CANARY-OUTSIDE-REPO\n")
         self.slug = f"test-{uuid.uuid4().hex[:12]}"
         self.unit = f"claude-job-{self.slug}"
+        self.use_settings()
+
+    def use_settings(self, deny: tuple = (), **filesystem) -> None:
+        live = json.loads((self.home / ".claude/settings.json").read_text())["sandbox"]
+        sandbox = {**live, "filesystem": {**live.get("filesystem", {}), **filesystem}}
+        settings = self.dir / "settings.json"
+        settings.write_text(json.dumps({"sandbox": sandbox, "permissions": {"deny": list(deny)}}))
+        self.server.settings_sources = lambda home: [(settings, True)]
 
     def reset_unit(self) -> None:
         subprocess.run(["systemctl", "--user", "stop", f"{self.unit}.service"], capture_output=True)
@@ -556,6 +633,24 @@ class RealUnitTests(unittest.TestCase):
             canary.unlink()
         self.assertIn("MARKER_OK", out)
         self.assertNotIn("CANARY-DENIED-READ", out)
+
+    def test_job_cannot_read_what_a_read_deny_rule_names(self) -> None:
+        (self.repo / "abs.txt").write_text("CANARY-ABS-RULE\n")
+        (self.repo / "rel.txt").write_text("CANARY-REL-RULE\n")
+        self.use_settings(deny=(f"Read(/{self.repo}/abs.txt)", "Read(rel.txt)"))
+        out = self.run_job("cat abs.txt; cat rel.txt; echo readable > visible.txt; cat visible.txt; exit 0")
+        self.assertIn("MARKER_OK", out)
+        self.assertIn("readable", out)
+        self.assertNotIn("CANARY-ABS-RULE", out)
+        self.assertNotIn("CANARY-REL-RULE", out)
+
+    def test_job_cannot_write_what_an_edit_deny_glob_names(self) -> None:
+        (self.repo / "sub/held").mkdir(parents=True)
+        self.use_settings(deny=("Edit(//**/held/**)",))
+        out = self.run_job("echo planted > sub/held/x; echo kept > sub/y; exit 0")
+        self.assertIn("MARKER_OK", out)
+        self.assertEqual((self.repo / "sub/y").read_text(), "kept\n")
+        self.assertFalse((self.repo / "sub/held/x").exists(), out)
 
     def test_nix_build_fetches_a_new_github_input(self) -> None:
         self.git("init", "-q", cwd=self.repo)

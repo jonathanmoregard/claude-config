@@ -12,6 +12,7 @@ Protocol: MCP 2024-11-05 over stdio, JSON-RPC 2.0 line-delimited.
 from __future__ import annotations
 
 import fcntl
+import fnmatch
 import json
 import os
 import pwd
@@ -20,7 +21,7 @@ import subprocess
 import sys
 import threading
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import NamedTuple
 
 HERE = Path(__file__).resolve().parent
@@ -32,6 +33,7 @@ PYTHON = f"{SYSTEM_BIN}/python3"
 SRT = f"{SYSTEM_BIN}/srt"
 RIPGREP = f"{SYSTEM_BIN}/rg"
 NIX_CACHE = ".cache/nix"
+MANAGED = Path("/etc/claude-code")
 PREFIX = "claude-job-"
 PROFILES = ("repo", "nix")
 MIN_RUNTIME_SEC = 10
@@ -46,6 +48,7 @@ MAX_WAIT_SEC = 540
 MAX_SCAN_ENTRIES = 2_000_000
 
 _SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,47}")
+_RULE_RE = re.compile(r"([A-Za-z]+)(?:\((.*)\))?", re.DOTALL)
 _SHOW = ("LoadState", "ActiveState", "SubState", "Result", "ExecMainStatus",
          "ExecMainStartTimestamp", "ExecMainExitTimestamp")
 
@@ -135,11 +138,18 @@ def policy_path(home: Path, unit: str) -> Path:
     return home / ".local/state/claude-jobs" / f"{unit}.srt.json"
 
 
+class Scan(NamedTuple):
+    git_state: list
+    globbed: list
+
+
 # srt protects only hooks and config of a `.git` dir, and no bare repo; a
 # commondir, a submodule's config or a worktree's config.worktree is as good a
 # plant. So every git dir and gitfile in the tree is write-denied whole.
-def _git_state(repo: Path) -> list:
-    found, pending, seen = [], [repo], 0
+def _scan(repo: Path, globs: list) -> Scan:
+    found, globbed, pending, seen = [], [], [repo], 0
+    if any(_glob_match(g, repo.parts) for g in globs):
+        globbed.append(repo)
     while pending:
         try:
             with os.scandir(pending.pop()) as entries:
@@ -147,18 +157,21 @@ def _git_state(repo: Path) -> list:
                     seen += 1
                     if seen > MAX_SCAN_ENTRIES:
                         raise RuntimeError(f"{repo} has over {MAX_SCAN_ENTRIES} entries to scan")
+                    path = Path(entry.path)
                     if entry.name == ".git":
                         if entry.is_symlink():
                             raise RuntimeError(f"{entry.path} is a symlink")
-                        found.append(Path(entry.path))
+                        found.append(path)
+                    elif any(_glob_match(g, path.parts) for g in globs):
+                        globbed.append(path)
                     elif entry.is_dir(follow_symlinks=False):
-                        if is_git_dir(Path(entry.path)):
-                            found.append(Path(entry.path))
+                        if is_git_dir(path):
+                            found.append(path)
                         else:
                             pending.append(entry.path)
         except OSError as e:
             raise RuntimeError(f"cannot scan {repo} for git dirs: {e}") from None
-    return found
+    return Scan(found, globbed)
 
 
 def _gitdir_pointer(gitfile: Path) -> Path | None:
@@ -190,38 +203,134 @@ def _outside_git_dirs(repo: Path, git_state: list, home: Path) -> list:
     return [(p, i) for p, i in unique if not any(q in p.parents for q, _ in unique)]
 
 
-def confine_repo(raw: object, home: Path) -> tuple:
-    repo, ident = canonical(raw, home)
-    git_state = _git_state(repo)
-    return repo, ident, git_state, _outside_git_dirs(repo, git_state, home)
-
-
-def _session_sandbox(home: Path) -> dict:
+def settings_sources(home: Path) -> list:
+    """(file, must exist) for each settings file Claude Code merges for this
+    user; the repo's own .claude/settings*.json are never trusted here."""
+    dropins = MANAGED / "managed-settings.d"
     try:
-        settings = json.loads((home / ".claude/settings.json").read_text())
+        extra = sorted(p for p in dropins.iterdir() if p.suffix == ".json")
+    except FileNotFoundError:
+        extra = []
+    except OSError as e:
+        raise RuntimeError(f"cannot list {dropins}: {e}") from None
+    return [(home / ".claude/settings.json", True), (MANAGED / "managed-settings.json", False),
+            *((p, True) for p in extra)]
+
+
+def _read_settings(path: Path, required: bool) -> dict | None:
+    try:
+        settings = json.loads(path.read_text())
+    except FileNotFoundError:
+        if required:
+            raise RuntimeError(f"{path} is missing; no job runs without the session's "
+                               "sandbox policy") from None
+        return None
     except (OSError, ValueError) as e:
-        raise RuntimeError(f"cannot read the session's sandbox policy: {e}") from None
-    sandbox = settings.get("sandbox") if isinstance(settings, dict) else None
+        raise RuntimeError(f"cannot read {path}: {e}") from None
+    if not isinstance(settings, dict):
+        raise RuntimeError(f"{path} is not a settings object")
+    return settings
+
+
+# Claude Code's own reading of a rule's path when it builds its sandbox.
+def _rule_path(content: str, settings_dir: Path, repo: Path, home: Path) -> str:
+    if "\\" in content:
+        raise RuntimeError(f"rule path {content!r} has an escape this broker does not translate")
+    if content.startswith("//"):
+        return content[1:]
+    if content.startswith("/"):
+        return str(settings_dir / content[1:])
+    if content == "~" or content.startswith("~/"):
+        return str(home / content[2:])
+    return str(repo / content)
+
+
+class SessionPolicy(NamedTuple):
+    sandbox: dict
+    deny_read: list
+    deny_write: list
+    denied_domains: list
+
+
+def _merge_source(path: Path, settings: dict, repo: Path, home: Path, base: bool,
+                  into: SessionPolicy) -> None:
+    sandbox = settings.get("sandbox", {})
     if not isinstance(sandbox, dict):
+        raise RuntimeError(f"{path}: sandbox is not an object")
+    fs, net = sandbox.get("filesystem") or {}, sandbox.get("network") or {}
+    if not base and (set(sandbox) - {"filesystem", "network"} or set(fs) - {"denyRead", "denyWrite"}
+                     or set(net) - {"deniedDomains"}):
+        raise RuntimeError(f"{path}: only deny entries of a sandbox block are understood here")
+    into.deny_read.extend(fs.get("denyRead", []))
+    into.deny_write.extend(fs.get("denyWrite", []))
+    into.denied_domains.extend(net.get("deniedDomains", []))
+    rules = (settings.get("permissions") or {}).get("deny", [])
+    if not isinstance(rules, list):
+        raise RuntimeError(f"{path}: permissions.deny is not a list")
+    for rule in rules:
+        if not isinstance(rule, str):
+            raise RuntimeError(f"{path}: deny rule {rule!r} is not a string")
+        match = _RULE_RE.fullmatch(rule.strip())
+        tool, content = match.groups() if match else (None, None)
+        if tool == "WebFetch" and content and content.startswith("domain:"):
+            into.denied_domains.append(content[len("domain:"):])
+        elif tool in ("Read", "Edit", "Write"):
+            if not content:
+                raise RuntimeError(f"{path}: deny rule {rule!r} names no path")
+            target = into.deny_read if tool == "Read" else into.deny_write
+            target.append(_rule_path(content, path.parent, repo, home))
+
+
+def session_policy(repo: Path, home: Path) -> SessionPolicy:
+    """The sandbox the session runs under, from sandbox settings and permission
+    deny rules of every trusted scope, as Claude Code composes it."""
+    loaded = [(p, s) for p, required in settings_sources(home)
+              if (s := _read_settings(p, required)) is not None]
+    user = loaded[0][1]
+    if not isinstance(user.get("sandbox"), dict):
         raise RuntimeError("~/.claude/settings.json has no sandbox block; no job runs without it")
-    return sandbox
+    policy = SessionPolicy(user["sandbox"], [], [], [])
+    for i, (path, settings) in enumerate(loaded):
+        _merge_source(path, settings, repo, home, i == 0, policy)
+    return policy
 
 
-def srt_policy(repo: Path, git_state: list, profile: str, home: Path) -> dict:
-    sandbox = _session_sandbox(home)
-    fs = sandbox.get("filesystem") or {}
-    session_writes = {str(home / p[2:]) if p.startswith("~/") else p
-                      for p in fs.get("allowWrite", [])}
+def _expand_home(p: str, home: Path) -> str:
+    return str(home / p[2:]) if p.startswith("~/") else p
+
+
+def _glob(p: str) -> tuple | None:
+    while p.endswith("/**"):
+        p = p[:-3]
+    return PurePosixPath(p).parts if any(c in p for c in "*?[") else None
+
+
+def _glob_match(pattern: tuple, parts: tuple) -> bool:
+    if not pattern:
+        return not parts
+    if pattern[0] == "**":
+        return any(_glob_match(pattern[1:], parts[i:]) for i in range(len(parts) + 1))
+    return bool(parts) and fnmatch.fnmatchcase(parts[0], pattern[0]) \
+        and _glob_match(pattern[1:], parts[1:])
+
+
+def srt_policy(repo: Path, scan: Scan, profile: str, home: Path, session: SessionPolicy) -> dict:
+    fs = session.sandbox.get("filesystem") or {}
+    session_writes = {_expand_home(p, home) for p in fs.get("allowWrite", [])}
     writes = [str(repo)]
     if profile == "nix" and str(home / NIX_CACHE) in session_writes:
         writes.append(str(home / NIX_CACHE))
+    net = session.sandbox.get("network") or {}
     return {
-        "network": {"deniedDomains": [], **(sandbox.get("network") or {})},
+        "network": {**net, "deniedDomains": [*net.get("deniedDomains", []),
+                                             *session.denied_domains]},
         "filesystem": {
-            "denyRead": fs.get("denyRead", []), "allowRead": fs.get("allowRead", []),
+            "denyRead": session.deny_read, "allowRead": fs.get("allowRead", []),
             "allowWrite": writes,
             # Claude Code itself, not srt, denies the project's .claude/ files.
-            "denyWrite": [*fs.get("denyWrite", []), str(repo / ".claude"), *map(str, git_state)],
+            "denyWrite": [*(p for p in session.deny_write if _glob(p) is None),
+                          *map(str, scan.globbed), str(repo / ".claude"),
+                          *map(str, scan.git_state)],
         },
         "ripgrep": {"command": RIPGREP},
     }
@@ -238,9 +347,14 @@ def validate_start(args: object, home: Path) -> Job:
     profile = args.get("profile", "repo")
     if profile not in PROFILES:
         raise RuntimeError(f"profile must be one of: {', '.join(PROFILES)}")
-    repo, ident, git_state, readonly = confine_repo(args.get("repo"), home)
-    return Job(unit, repo, ident, readonly, list(argv), runtime, profile,
-               srt_policy(repo, git_state, profile, home))
+    repo, ident = canonical(args.get("repo"), home)
+    session = session_policy(repo, home)
+    # srt drops a write glob on Linux, as bwrap binds only concrete paths, so the
+    # broker expands each to what it matches in the repo when the job starts.
+    globs = [g for p in session.deny_write if (g := _glob(_expand_home(p, home)))]
+    scan = _scan(repo, globs)
+    return Job(unit, repo, ident, _outside_git_dirs(repo, scan.git_state, home), list(argv),
+               runtime, profile, srt_policy(repo, scan, profile, home, session))
 
 
 def properties(job: Job, home: Path) -> list:
