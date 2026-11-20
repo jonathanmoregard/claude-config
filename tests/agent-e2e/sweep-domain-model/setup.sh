@@ -7,7 +7,8 @@
 #   P4 adapter vocabulary in the core: Home Assistant entity and service names
 #      ('input_number.remote_preset', 'light.turn_on') and a list of service
 #      calls returned from the core (`plan`)
-#   P5 a mechanism name where a domain word exists: `Plan`, `Args`
+#   P5 a mechanism name where a domain word exists: `Plan`, `Args` (graded:
+#      `Plan` renamed with the README's "lighting state")
 # The README is the user's recorded vocabulary: "rooms", "lamps", "remote",
 # "presets", "lighting state".
 set -euo pipefail
@@ -102,7 +103,8 @@ test('placeholder: the suite runs', () => { assert.ok(true); });
 J
 echo 'node_modules/' >> "$WORK/.gitignore"
 # The installed toolchain: the real tsc, as `npm install` would leave it.
-TSC=$(ls -d /nix/store/*-typescript-5.9.3 | head -n1)
+TSC=$(ls -d /nix/store/*-typescript-5.9.3 2>/dev/null | head -n1 || true)
+[ -n "$TSC" ] || { echo "setup: typescript-5.9.3 is not in /nix/store (nix build nixpkgs#typescript)" >&2; exit 3; }
 mkdir -p "$WORK/node_modules/.bin"
 ln -s "$TSC/bin/tsc" "$WORK/node_modules/.bin/tsc"
 git -C "$WORK" add -A

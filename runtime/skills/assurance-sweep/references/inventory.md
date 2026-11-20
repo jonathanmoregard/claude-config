@@ -6,6 +6,8 @@ Write `<notes>/assurance-sweep/<date>/inventory.md` in this shape.
 # Inventory — <repo> @ <commit>, <date>
 
 Tier: production | personal. Core: <dirs>. Adapters: <dirs>.
+User's words: <recorded decisions file, README, conversation records the
+sweep may read for domain vocabulary>.
 
 ## 1. Mechanisms
 | # | Job | Homes (file:line) | Relied on by |

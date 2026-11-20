@@ -7,6 +7,10 @@ Send the shared preamble, then exactly one lens block.
 ```text
 REPORT dispatch
 Lens: <name>. Repository (read-only): <absolute path> @ <commit>.
+Tier: <production | personal, from the inventory>. On a personal project
+propose no production machinery — observability, alerting, restore
+rehearsals, leak checks, growth measurement — and judge "would break" by
+the owner's own use, not by production load.
 Read first, in full and in this order: <dir>/inventory.md; <recorded
 decisions file>; every earlier lens file in <dir> (do not repeat their
 items).
@@ -19,14 +23,16 @@ evidence. Skip code the inventory lists as leaving soon.
 
 Where a deterministic tool could do a check you would otherwise do by
 reading, and the project has no such tool, do not propose adding one: name
-the missing tool category under "Not covered".
+the missing tool category under "Not covered". A lens block that names its
+own guard overrides this for that guard only.
 
 Bar for RECOMMEND: builds on how the code already works instead of
 reworking it; focused and minimal; ordinary industry practice; the simplest thing
 that deals with the problem. If the caller of a proposed check, type or lint
-can sidestep it, the item is SKIP.
+can sidestep it, the item is SKIP. A type only a parser can build, with a
+guard that rejects casts to it elsewhere, is not sidestepped by a cast.
 
-Output, at most 700 words, in this shape:
+Output, at most 700 words unless the lens block sets its own cap, in this shape:
 Coverage: what you read; what you did not.
 Items, ranked by harm prevented over effort, one per line:
   N VERDICT EFFORT title — where (file:line) — what goes wrong today — the
@@ -102,6 +108,17 @@ whose every entry needs a reason. A genuinely open value — text shown to a
 person, real-number arithmetic — is SKIP with that reason. Types narrow what
 the code accepts; they add no runtime machinery, and wire formats stay as
 they are.
+
+The guard needs no new tool: it is one test in the existing suite that uses
+the project's own type checker to read the core's exported signatures, and
+it also rejects casts to the new types outside their parsers. That is why a
+type it protects is not SKIP for being castable. Recommend the guard as its
+own item.
+
+Output: one item per category, not per site — per-file counts and at most
+three representative file:line sites — plus one item for the vocabulary
+table and one for the guard. Every item carries a VERDICT. At most 1200
+words.
 ```
 
 ## 4 — Defect classes
@@ -164,8 +181,8 @@ each class, which method would have caught it mechanically, and is that
 method present, weak (say how: few cases, happy path only, cannot fail), or
 absent. Rank methods by classes covered over effort. Also check: gates that
 cannot fail (does each trip on a planted defect?); evidence older than the
-code it covers; critical machinery no test touches; growth nobody measured;
-failures nobody is told about. For the top items give first steps: where,
+code it covers; critical machinery no test touches; and, on a production
+project only, growth nobody measured and failures nobody is told about. For the top items give first steps: where,
 how, the invariants, effort, and any decision the user must make. SKIP
 surfaces a trusted third party owns.
 ```
