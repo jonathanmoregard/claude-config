@@ -1,6 +1,6 @@
 ---
 date: YYYY-MM-DD
-title: One line in the user's words
+title: "One line in the user's words"   # keep the quotes: unquoted, " #" starts a YAML comment
 kind: change        # change: to be done later | keep: stays as it is on purpose
 status: pending     # pending | done (set done when the change lands)
 where:              # files, modules or areas the decision covers
