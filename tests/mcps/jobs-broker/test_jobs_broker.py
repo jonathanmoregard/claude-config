@@ -48,6 +48,11 @@ SANDBOX = {
 }
 
 
+def deny_rules(deny: object) -> dict:
+    # arftl-allow: permission-widened (deny rules only: what a job must not touch)
+    return {"permissions": {"deny": deny}}
+
+
 class Home(unittest.TestCase):
     def setUp(self) -> None:
         self.server = load_server()
@@ -236,7 +241,7 @@ class SrtPolicyTests(Home):
         return path
 
     def with_deny(self, *rules: str, extra: dict | None = None) -> dict:
-        self.write_settings({"sandbox": SANDBOX, "permissions": {"deny": list(rules)}, **(extra or {})})
+        self.write_settings({"sandbox": SANDBOX, **deny_rules(list(rules)), **(extra or {})})
         return self.policy()
 
     def test_read_deny_rules_are_denied_reads_as_claude_resolves_them(self) -> None:
@@ -277,7 +282,7 @@ class SrtPolicyTests(Home):
 
     def test_managed_settings_denies_are_merged(self) -> None:
         managed = self.home / "managed-settings.json"
-        self.write_settings({"permissions": {"deny": ["Read(//srv/managed)"]},
+        self.write_settings({**deny_rules(["Read(//srv/managed)"]),
                              "sandbox": {"filesystem": {"denyWrite": ["/srv/mw"]}}}, managed)
         self.sources = [*self.sources, (managed, False), (self.home / "absent.json", False)]
         fs = self.policy()["filesystem"]
@@ -288,10 +293,10 @@ class SrtPolicyTests(Home):
         cases = {"bare Read": ["Read"], "empty Edit": ["Edit()"], "escape": ["Read(a\\*b)"],
                  "not a string": [{"Read": "x"}], "bare Edit": ["Edit"]}
         for name, deny in cases.items():
-            self.write_settings({"sandbox": SANDBOX, "permissions": {"deny": deny}})
+            self.write_settings({"sandbox": SANDBOX, **deny_rules(deny)})
             with self.subTest(name), self.assertRaises(RuntimeError):
                 self.job()
-        self.write_settings({"sandbox": SANDBOX, "permissions": {"deny": "Read(x)"}})
+        self.write_settings({"sandbox": SANDBOX, **deny_rules("Read(x)")})
         with self.assertRaises(RuntimeError):
             self.job()
 
@@ -586,7 +591,7 @@ class RealUnitTests(unittest.TestCase):
         live = json.loads((self.home / ".claude/settings.json").read_text())["sandbox"]
         sandbox = {**live, "filesystem": {**live.get("filesystem", {}), **filesystem}}
         settings = self.dir / "settings.json"
-        settings.write_text(json.dumps({"sandbox": sandbox, "permissions": {"deny": list(deny)}}))
+        settings.write_text(json.dumps({"sandbox": sandbox, **deny_rules(list(deny))}))
         self.server.settings_sources = lambda home: [(settings, True)]
 
     def reset_unit(self) -> None:

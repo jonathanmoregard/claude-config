@@ -402,10 +402,8 @@ class UntrustedCheckoutTests(Fixture):
         git(self.repo, "update-ref", "-d", "refs/remotes/origin/feat/x")
         git(self.repo, "config", "core.hooksPath", str(hooks))
         git(self.repo, "config", "core.fsmonitor", f"touch {canary}; false")
-        try:
+        with self.assertRaises(RuntimeError):
             self.server._tool_run(self.req(scenario="absent"))
-        except RuntimeError:
-            pass
         self.assertFalse(canary.exists(), "the broker ran git config planted in the checkout")
 
 
