@@ -19,7 +19,11 @@ still lets through, and what the cheapest thing is that would stop it.
 1. The tree is settled: no agent is editing it and the project gate is green.
    A sweep of code in mid-rewrite hardens what is about to be deleted.
 2. Output goes to `<notes>/assurance-sweep/<YYYY-MM-DD>/`, never the repo.
-3. Read the user's recorded decisions. A recorded decision is never a finding.
+3. Read the user's recorded rules (`<notes>/session-constraints.md`) and
+   decisions (`<notes>/decisions/*.md`). A rule, or a decision to keep
+   something, is never a finding. A decision to change something that has
+   not landed is work still to do: the inventory lists it, and lenses report
+   its sites.
 4. Quote the cost before starting: one strongest-tier whole-repository read
    per lens.
 5. Note the project's tier in the inventory: **production** (outside users,
@@ -32,7 +36,7 @@ still lets through, and what the cheapest thing is that would stop it.
 ## Step 1 — Inventory
 
 You write `inventory.md`; you have the shell the reviewer lacks. Template
-and method: `references/inventory.md`. Four sections:
+and method: `references/inventory.md`. Five sections:
 
 1. **Mechanisms.** The jobs this application does at more than one call
    site, found from its own manifests, modules, scripts, tests and deployment
@@ -46,6 +50,12 @@ and method: `references/inventory.md`. Four sections:
    code. Lenses skip it. Code that stays and is planned to be re-typed,
    renamed or restructured in place is not leaving: list it nowhere in this
    section, so the lenses still read it.
+5. **Decided, not done.** The rows
+   `~/.claude/skills/assurance-sweep/scripts/pending-decisions.sh <notes>`
+   prints: decision files whose front matter says `kind: change`,
+   `status: pending`, selected by their front matter alone. Paste them as
+   printed. A row it marks `unlabelled` gets its `kind` and `status` set in
+   that file's front matter before the lenses run; then run it again.
 
 ## Step 2 — Run One Lens
 

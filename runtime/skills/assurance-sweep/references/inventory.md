@@ -6,7 +6,7 @@ Write `<notes>/assurance-sweep/<date>/inventory.md` in this shape.
 # Inventory — <repo> @ <commit>, <date>
 
 Tier: production | personal. Core: <dirs>. Adapters: <dirs>.
-User's words: <recorded decisions file, README, conversation records the
+User's words: <recorded rules file, decision files, README, conversation records the
 sweep may read for domain vocabulary>.
 
 ## 1. Mechanisms
@@ -20,6 +20,9 @@ sweep may read for domain vocabulary>.
 
 ## 4. Leaving soon
 | # | Code | Why, and when |
+
+## 5. Decided, not done
+| Date | Decision | Where | State | File |
 ```
 
 ## Finding the mechanisms

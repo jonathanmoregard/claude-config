@@ -13,10 +13,13 @@ rehearsals, leak checks, growth measurement — mark those methods n/a, and
 judge "would break" by the owner's own use, not by production load. Neat
 types, clear structure and working tests still apply in full.
 Read first, in full and in this order: <dir>/inventory.md; <recorded
-decisions file>; every earlier lens file in <dir> (do not repeat their
-items).
+rules file>; the decision files the inventory's "Decided, not done" section
+lists; every earlier lens file in <dir> (do not repeat their items).
 
-A recorded user decision is not a finding. Verify each item by reading the
+A recorded rule, or a decision to keep something, is not a finding. A
+decision listed under "Decided, not done" is work still to do: report it in
+your lens with its sites and counts, marked `decided`; never SKIP it as
+already decided. Verify each item by reading the
 code path it names; cite file:line. A comment, docstring or test name saying
 something is safe, checked or unreachable is a claim to verify, never
 evidence. Skip code the inventory lists as leaving soon.
@@ -58,7 +61,7 @@ of something a dependency already in use provides. Look in scripts, test
 helpers, client code and deployment config as well as the main source.
 For each, answer: what happens when the copies diverge? Diverging with harm:
 RECOMMEND one home. Identical but redundant: RECOMMEND only at effort S.
-Separate on purpose — a different trust domain, a recorded decision: SKIP
+Separate on purpose — a different trust domain, a recorded rule or keep decision: SKIP
 with the reason.
 ```
 
@@ -72,7 +75,7 @@ second instance running. For each: name the ordinary way, what adopting it
 removes, and what it costs. Prefer extending a pattern already in this
 codebase over importing a new one. Every item is ADVISE unless it has a
 concrete wrong outcome today. Mark an item CONFIRM when your claim about
-ordinary practice comes from memory. SKIP where a recorded decision chose
+ordinary practice comes from memory. SKIP where a recorded rule or keep decision chose
 the unusual way.
 ```
 
@@ -104,7 +107,7 @@ treat the whole as core. Count every site, per file, in these categories
    adapter reads the world in, saves what changed, and makes the world match.
 7. Names that describe mechanism (plan, args, parts, data, info, manager,
    handle) where a domain word exists. Take domain words from the user's own
-   words in the recorded decisions and conversation records the inventory
+   words in the recorded rules, decision files and conversation records the inventory
    names. Return a vocabulary table: each mechanism name, the domain term
    that replaces it, and where the user used that term; mark a term with no
    such source.
