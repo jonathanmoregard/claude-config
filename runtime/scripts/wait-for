@@ -637,8 +637,17 @@ wait_unit() {
 # run outside it), so there the job is a child of this call and ends with it.
 # The log's last line stands in for the retained unit: a finished run is
 # adopted, never repeated, until its log is removed.
+stop_job() {
+  trap '' TERM INT HUP
+  if [ -n "$child" ]; then
+    kill -TERM "$child" 2>/dev/null
+    wait "$child"
+  fi
+  exit $(( 128 + $(kill -l "$1") ))
+}
+
 run_job_in_sandbox() {
-  local log=/tmp/$target.log rc last remaining
+  local log=/tmp/$target.log rc last remaining sig
   exec 9>>"/tmp/$target.lock" || { echo "wait-for: cannot open /tmp/$target.lock" >&2; exit 3; }
   flock -n 9 || flock -w "$(left)" 9 || timed_out
   last=$(tail -n 1 -- "$log" 2>/dev/null)
@@ -654,7 +663,14 @@ run_job_in_sandbox() {
   # `timeout 0` would mean no limit at all.
   remaining=$(left)
   [ "$remaining" -gt 0 ] || timed_out
-  command timeout --kill-after=5 "$remaining" "${job_cmd[@]}" >>"$log" 2>&1 9>&-; rc=$?
+  # Bash runs a trap only once a foreground child exits, so the child runs in
+  # the background; `<&0` keeps its stdin, which `&` would make /dev/null.
+  child=""
+  for sig in TERM INT HUP; do trap "stop_job $sig" "$sig"; done
+  command timeout --kill-after=5 "$remaining" "${job_cmd[@]}" <&0 >>"$log" 2>&1 9>&- &
+  child=$!
+  wait "$child"; rc=$?
+  trap - TERM INT HUP
   # 137 is how GNU timeout reports the KILL after the grace period.
   case $rc in 124|137) [ "$(left)" -gt 0 ] || timed_out ;; esac
   [ "$(tail -c 1 -- "$log" | od -An -tx1 | tr -d ' ')" = 0a ] || echo >>"$log"

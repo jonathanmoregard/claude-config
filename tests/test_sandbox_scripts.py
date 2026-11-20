@@ -13,7 +13,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import unquote, unquote_to_bytes
 
 import pytest
 
@@ -61,6 +61,15 @@ def test_unit_read_passes_a_checked_read_through(tmp_path: Path) -> None:
     assert calls[-1] == "systemctl --no-pager list-timers --all --"
 
 
+@pytest.mark.parametrize("given, passed", [("08", "8"), ("010", "10"), ("0", "0"),
+                                           ("99999999999999999999", "10000")])
+def test_unit_read_passes_line_counts_as_decimal_within_a_ceiling(
+        tmp_path: Path, given: str, passed: str) -> None:
+    rc, calls, _ = run_unit_read(tmp_path, "--user", "status", "-n", given, "x.service")
+    assert rc == 0
+    assert calls == [f"systemctl --user --no-pager status -n {passed} -- x.service"]
+
+
 @pytest.mark.parametrize("args", [
     ("--user", "start", "x.service"),
     ("--user", "status", "-H", "example.invalid", "x"),
@@ -99,6 +108,8 @@ def test_unit_read_shows_no_environment(tmp_path: Path, args: tuple[str, ...]) -
     ("cat", "[Service]\nEnvironment=\"TOKEN=leaked\" \\\n  \"MORE=leaked\"\n"
             "  Environment=TOKEN=leaked\nExecStart=/bin/true\n"),
     ("cat", "[Service]\nEnvironment = TOKEN=leaked\nExecStart=/bin/true\n"),
+    ("cat", "[Service]\nEnvironment=A=1 \\\n# c\n SECRET=leaked\nExecStart=/bin/true\n"),
+    ("cat", "[Service]\nSetCredential=a:b \\\n  ; c \\\n\t# d\n leaked \\\n leaked\nExecStart=/bin/true\n"),
 ])
 def test_unit_read_drops_environment_lines(tmp_path: Path, verb: str, output: str) -> None:
     rc, _, out = run_unit_read(tmp_path, "--user", verb, "x.service", output=output)
@@ -226,6 +237,28 @@ def test_trash_records_where_each_entry_came_from(scratch: Path) -> None:
                               r"DeletionDate=\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\n", info)
         assert parsed, info
         assert unquote(parsed[1]) == str(entry)
+
+
+def test_trash_records_a_name_that_is_not_utf8(scratch: Path) -> None:
+    name = os.fsdecode(b"\xff" + uuid.uuid4().hex.encode())
+    entry = scratch / name
+    entry.write_text("x")
+    before = trash_names()
+    try:
+        proc = subprocess.run([sys.executable, "-I", str(TRASH), str(entry)],
+                              capture_output=True, text=True, check=False)
+        new = [n for n in trash_names() - before if n.startswith(name)]
+        assert (proc.returncode, proc.stderr, len(new)) == (0, "", 1)
+        info = (TRASH_DIR / "info" / new[0]).read_bytes()
+        recorded = re.search(rb"^Path=(\S+)$", info, re.M)
+        assert recorded and unquote_to_bytes(recorded[1]) == os.fsencode(entry)
+        assert (TRASH_DIR / "files" / new[0].removesuffix(".trashinfo")).read_text() == "x"
+        assert not entry.exists()
+    finally:
+        for n in trash_names() - before:
+            if n.startswith(name):
+                remove(TRASH_DIR / "files" / n.removesuffix(".trashinfo"))
+                (TRASH_DIR / "info" / n).unlink()
 
 
 def test_trash_refuses_options_and_paths_elsewhere(scratch: Path) -> None:

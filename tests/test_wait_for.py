@@ -6,10 +6,12 @@ whole wait finishes in well under a second.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -1071,6 +1073,32 @@ def test_sandboxed_job_ignoring_sigterm_is_killed_soon_after_its_deadline(
     assert elapsed < 15, elapsed
     with pytest.raises(ProcessLookupError):
         os.kill(int(pid_file.read_text()), 0)
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP])
+def test_stopping_a_sandboxed_wait_stops_its_job_before_freeing_the_slug(
+    tmp_path: Path, slug: str, sig: signal.Signals
+) -> None:
+    pid_file = tmp_path / "pid"
+    child = f"import os, time; open({str(pid_file)!r}, 'w').write(str(os.getpid())); time.sleep(60)"
+    proc = subprocess.Popen(["bash", str(WAIT_FOR), "job", slug, "--timeout", "120", "--",
+                             "python3", "-c", child],
+                            env={**os.environ, "SANDBOX_RUNTIME": "1"},
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    started = time.monotonic()
+    while not (pid_file.exists() and pid_file.read_text()):
+        assert proc.poll() is None and time.monotonic() - started < 20
+        time.sleep(0.05)
+    job = int(pid_file.read_text())
+    try:
+        proc.send_signal(sig)
+        assert proc.wait(timeout=20) != 0
+        with pytest.raises(ProcessLookupError):
+            os.kill(job, 0)
+        assert subprocess.run(["flock", "-n", f"/tmp/{slug}.lock", "true"]).returncode == 0
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(job, signal.SIGKILL)
 
 
 def test_repeating_a_sandboxed_wait_adopts_the_finished_run(tmp_path: Path, slug: str) -> None:
