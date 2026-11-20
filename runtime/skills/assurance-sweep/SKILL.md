@@ -42,8 +42,10 @@ and method: `references/inventory.md`. Four sections:
    absent or not applicable, with the command that runs it.
 3. **Defect history.** `<notes>/review-ledger.tsv` first, then fix and revert
    commits and the issue tracker.
-4. **Leaving soon.** Code scheduled for deletion or replacement. Lenses skip
-   it.
+4. **Leaving soon.** Code scheduled for deletion, or for replacement by other
+   code. Lenses skip it. Code that stays and is planned to be re-typed,
+   renamed or restructured in place is not leaving: list it nowhere in this
+   section, so the lenses still read it.
 
 ## Step 2 — Run One Lens
 
