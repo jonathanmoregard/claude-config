@@ -10,12 +10,15 @@ path is in <root>/.trash/info/<name>.trashinfo.
 from __future__ import annotations
 
 import os
+import pwd
 import shutil
 import sys
 import time
 from pathlib import Path
 from urllib.parse import quote
 
+# Not $HOME: agent-e2e runs sessions with a staged one, on the same real roots.
+HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
 ROOTS = ("Repos", "worktrees")
 KEEP_DAYS = 30
 DATE = "%Y-%m-%dT%H:%M:%S"
@@ -105,7 +108,7 @@ def main(args: list[str]) -> None:
         if arg.startswith("-"):
             print(f"trash: options are not accepted: {arg}", file=sys.stderr)
             sys.exit(64)
-    home = Path.home()
+    home = HOME
     for arg in args:
         move(arg, home)
     empty_old(home)

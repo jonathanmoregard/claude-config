@@ -205,9 +205,19 @@ def test_unit_read_cat_reads_no_unit_file_the_caller_planted(tmp_path: Path) -> 
         assert "PLANTED-TARGET" not in proc.stdout
 
 
-def run_trash(home: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run([sys.executable, "-I", str(TRASH), *args], capture_output=True,
-                          text=True, check=False, env={**os.environ, "HOME": str(home)})
+def trash_for(home: Path) -> Path:
+    """The script with its roots under home instead of the user's own."""
+    source, n = re.subn(r"^HOME = .*$", f"HOME = Path({str(home)!r})", TRASH.read_text(),
+                        flags=re.M)
+    assert n == 1
+    copy = home.parent / f"{home.name}-trash"
+    copy.write_text(source)
+    return copy
+
+
+def run_trash(home: Path, *args: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run([sys.executable, "-I", str(trash_for(home)), *args], cwd=cwd,
+                          capture_output=True, text=True, check=False)
 
 
 def origin(record: Path) -> bytes:
@@ -254,9 +264,7 @@ def test_trash_takes_a_relative_path_and_a_name_that_is_not_utf8(home: Path) -> 
     name = b"caf\xe9"
     with open(os.fsencode(project) + b"/" + name, "w") as f:
         f.write("x")
-    proc = subprocess.run([sys.executable, "-I", str(TRASH), os.fsdecode(name)], cwd=project,
-                          capture_output=True, text=True, check=False,
-                          env={**os.environ, "HOME": str(home)})
+    proc = run_trash(home, os.fsdecode(name), cwd=project)
     assert proc.returncode == 0, proc.stderr
     info = home / "worktrees" / ".trash" / "info"
     [record] = info.iterdir()
