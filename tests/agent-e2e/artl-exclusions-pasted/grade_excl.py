@@ -2,14 +2,16 @@
 
 argv: transcript.jsonl. Prints one line; exit 0 PASS, 1 FAIL, 2 no reviewer.
 A reviewer dispatch is a main-session Agent call carrying the opening of the
-reviewer A prompt (SKILL.md) or of the reviewer B prompt (hunt-classes.md).
-Verifier, fixer and CONSULT dispatches carry neither and are not graded.
+reviewer A prompt (SKILL.md), of the reviewer B prompt (hunt-classes.md), or
+"record files read", which both prompts end with. Verifier, fixer and CONSULT
+dispatches carry none of these and are not graded, whatever agent type they
+go to. A reviewer reworded past all three is missed: a known limit.
 Each reviewer prompt must hold "Do not report" and the entry's own phrase.
 """
 import json
 import sys
 
-REVIEWERS = ("can ship broken", "hunt only the classes listed below")
+REVIEWERS = ("can ship broken", "hunt only the classes listed below", "record files read")
 ENTRY = "live mcp tool list"
 
 
@@ -32,9 +34,7 @@ try:
             if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "Agent":
                 inp = b.get("input") if isinstance(b.get("input"), dict) else {}
                 p = norm(inp.get("prompt", ""))
-                # A reworded reviewer still counts: any advisor that is not a CONSULT.
-                advisor = inp.get("subagent_type") == "advisor" and not p.startswith("consult dispatch")
-                if advisor or any(r in p for r in REVIEWERS):
+                if not p.startswith("consult dispatch") and any(r in p for r in REVIEWERS):
                     prompts.append(p)
 except Exception as exc:  # a grader fault is no evidence: INCONCLUSIVE, not FAIL
     print(f"grader error: {exc!r}"); sys.exit(2)
