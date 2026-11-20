@@ -24,9 +24,11 @@ import fcntl
 import json
 import math
 import os
+import pwd
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -48,13 +50,15 @@ _in_flight_lock = threading.Lock()
 _in_flight: dict[Any, _InFlight] = {}
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
+from broker_paths import canonical  # noqa: E402
 CONFIG_PATH = str(HERE / "config.json")
 TAG = "[agent-e2e-broker]"
 
 _POLICY_KEYS = frozenset({
     "version", "repo", "harness", "scenarioRoot", "claudeExecutable",
     "outputRoot", "path", "models", "maxSamples", "maxJobs", "maxBudgetUsd",
-    "maxTimeoutSec", "maxCallSec", "outputLimitChars",
+    "maxTimeoutSec", "maxCallSec", "outputLimitChars", "readOnlyPaths",
 })
 _POSITIVE_INTS = ("maxSamples", "maxJobs", "maxTimeoutSec", "maxCallSec", "outputLimitChars")
 _ARGS = frozenset({"scenario", "old_ref", "new_ref", "model", "n", "jobs",
@@ -63,6 +67,7 @@ _SCENARIO_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _BRANCH_RE = re.compile(r"^origin/[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _RUN_FILES = ("prompt.md", "setup.sh", "check.sh")
+MAX_READ_BYTES = 256 * 1024
 
 
 def _abs(value: object, key: str) -> Path:
@@ -102,8 +107,14 @@ def _load_policy(config: dict) -> dict:
         rel = raw[key]
         if not isinstance(rel, str) or not rel or os.path.isabs(rel) or ".." in rel.split("/"):
             raise RuntimeError(f"policy {key} must be a repo-relative path")
+    extra = raw["readOnlyPaths"]
+    if not isinstance(extra, list):
+        raise RuntimeError("policy readOnlyPaths must be a list of absolute paths")
+    home = _passwd_home()
     policy = dict(raw)
-    policy["repo"] = _abs(raw["repo"], "repo")
+    policy["repo"] = canonical(raw["repo"], home)[0]
+    policy["readOnlyPaths"] = [canonical(p, home)[0] for p in extra
+                               if not isinstance(p, str) or os.path.lexists(p)]
     policy["claudeExecutable"] = _abs(raw["claudeExecutable"], "claudeExecutable")
     policy["outputRoot"] = _abs(raw["outputRoot"], "outputRoot")
     return policy
@@ -209,11 +220,39 @@ def _manager_env(policy: dict) -> dict[str, str]:
     return {**_env(policy), "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"}
 
 
-def _read_text(path: Path) -> str:
+def _passwd_home() -> Path:
+    return Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+
+# Everything under a campaign's output dir was writable by scenario code, so
+# no component is followed if it is a symlink, only a regular file is read,
+# and at most LIMIT bytes of it.
+def _read_beneath(root: Path, rel: str, limit: int = MAX_READ_BYTES, tail: bool = True) -> str:
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+    fds: list[int] = []
     try:
-        return path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+        fds.append(os.open(root, flags | os.O_DIRECTORY))
+        *dirs, name = rel.split("/")
+        for d in dirs:
+            fds.append(os.open(d, flags | os.O_DIRECTORY, dir_fd=fds[-1]))
+        fds.append(os.open(name, flags | os.O_NONBLOCK, dir_fd=fds[-1]))
+        st = os.fstat(fds[-1])
+        if not stat.S_ISREG(st.st_mode):
+            return f"[{rel}: not a regular file; not read]"
+        if tail:
+            os.lseek(fds[-1], max(0, st.st_size - limit), os.SEEK_SET)
+        chunks, left = [], limit
+        while left and (chunk := os.read(fds[-1], left)):
+            chunks.append(chunk)
+            left -= len(chunk)
+    except FileNotFoundError:
         return ""
+    except OSError as e:
+        return f"[{rel}: not read: {e.strerror}]"
+    finally:
+        for fd in fds:
+            os.close(fd)
+    return b"".join(chunks).decode("utf-8", "replace")
 
 
 def _extract_scenarios(policy: dict, sha: str, dest: Path) -> None:
@@ -230,9 +269,10 @@ def _extract_scenarios(policy: dict, sha: str, dest: Path) -> None:
 
 # The harness runs in a hardened user unit, because scenario setup.sh and
 # check.sh come from a pushed branch and run as the owner. What stays reachable
-# is what a campaign needs: its output dir, the Claude login, ~/Repos and the
-# config repo read-only, and the network. bwrap, which the harness puts the
-# agent under, must still mount a fresh /proc; ProtectKernelTunables=,
+# is what a campaign needs: its output dir, the Claude login, the config repo
+# and readOnlyPaths (targets of its skill symlinks) read-only, and the
+# network. bwrap, which the harness puts the agent under, must still mount a
+# fresh /proc; ProtectKernelTunables=,
 # ProtectKernelLogs= and ProtectHostname= overmount /proc and make the kernel
 # refuse that (measured), so they are left out. Under PrivatePIDs= the harness
 # is PID 1 and ignores SIGTERM, hence KillSignal=SIGKILL.
@@ -261,9 +301,9 @@ def _unit_properties(policy: dict, out: Path, runtime: int) -> list[str]:
         *HARDENING,
         *(f"InaccessiblePaths=-{p}" for p in HIDDEN),
         f"BindPaths={out}", f"BindPaths=-{home}/.claude/.credentials.json",
-        f"BindReadOnlyPaths={policy['repo']}",
+        *(f"BindReadOnlyPaths={p}" for p in (policy["repo"], *policy["readOnlyPaths"])),
         *(f"BindReadOnlyPaths=-{p}" for p in (
-            home / "Repos", home / ".claude/plugins", home / ".config/caveman",
+            home / ".claude/plugins", home / ".config/caveman",
             home / ".config/dcg", exe.parent, Path(os.path.realpath(exe)).parent)),
     ]
 
@@ -349,18 +389,21 @@ def _redact(body: str) -> str:
     return body
 
 
-def _report(out: Path, scenario: str) -> str:
+def _report(out: Path, scenario: str, n: int) -> str:
     lines = []
-    for verdict in sorted((out / scenario).glob("*/*/verdict.json")):
-        try:
-            v = json.loads(verdict.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        final = verdict.parent / "final.txt"
-        text = final.read_text(encoding="utf-8", errors="replace").strip() if final.is_file() else ""
-        lines.append(f"- {v.get('arm')}#{v.get('run')} {v.get('verdict')} "
-                     f"(${v.get('cost_usd')}, {v.get('seconds')}s): {v.get('why', '')}\n"
-                     f"  run dir: {verdict.parent}\n  final.txt: {text[:600]!r}")
+    for arm in ("new", "old"):
+        for i in range(1, n + 1):
+            run = f"runs/{scenario}/{arm}/{i}"
+            try:
+                v = json.loads(_read_beneath(out, f"{run}/verdict.json", tail=False))
+            except ValueError:
+                continue
+            if not isinstance(v, dict):
+                continue
+            text = _read_beneath(out, f"{run}/final.txt", limit=4096, tail=False).strip()
+            lines.append(f"- {v.get('arm')}#{v.get('run')} {v.get('verdict')} "
+                         f"(${v.get('cost_usd')}, {v.get('seconds')}s): {v.get('why', '')}\n"
+                         f"  run dir: {out / run}\n  final.txt: {text[:600]!r}")
     return "\n".join(lines)
 
 
@@ -412,7 +455,7 @@ def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
             rc, _, client = _run_argv(_supervised(argv, policy, out, req["call_timeout"]),
                                       _manager_env(policy), req["call_timeout"] + 60, rec,
                                       lock.fileno())
-            stdout, stderr = (_read_text(out / name) for name in ("harness.out", "harness.err"))
+            stdout, stderr = (_read_beneath(out, name) for name in ("harness.out", "harness.err"))
             stderr = "\n".join(part for part in (stderr.rstrip(), client.strip()) if part)
         finally:
             shutil.rmtree(out / "harness", ignore_errors=True)
@@ -422,7 +465,7 @@ def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
               f"old = {req['old_ref']} = {old}\nnew = {req['new_ref']} = {new}\n"
               f"output: {out}\n")
     body = "\n".join([header, stdout.rstrip(), "--- per run ---",
-                      _report(out / "runs", req["scenario"]),
+                      _report(out, req["scenario"], req["n"]),
                       *(["--- stderr ---", stderr.rstrip()[-4000:]] if stderr.strip() else []),
                       f"--- harness exit {rc} ---"])
     body = _redact(body)

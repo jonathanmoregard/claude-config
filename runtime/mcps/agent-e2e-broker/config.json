@@ -17,6 +17,7 @@
     "maxBudgetUsd": 3.0,
     "maxTimeoutSec": 900,
     "maxCallSec": 3600,
-    "outputLimitChars": 20000
+    "outputLimitChars": 20000,
+    "readOnlyPaths": ["/home/jonathan/Repos/router-agent"]
   }
 }

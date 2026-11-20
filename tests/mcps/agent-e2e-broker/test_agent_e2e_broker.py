@@ -88,7 +88,9 @@ class Fixture(unittest.TestCase):
 
     def setUp(self) -> None:
         self.server = load_server()
-        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        self.tmp = tempfile.TemporaryDirectory(prefix=".agent-e2e-broker-test-",
+                                               dir=self.home / "worktrees")
         root = Path(self.tmp.name)
         os.environ["GIT_CONFIG_GLOBAL"] = str(root / "gitconfig")
         (root / "gitconfig").write_text("[user]\n\tname=t\n\temail=t@t\n"
@@ -131,7 +133,7 @@ class Fixture(unittest.TestCase):
             "outputRoot": str(self.out), "path": os.environ["PATH"].split(":"),
             "models": ["haiku", "sonnet"], "maxSamples": 2, "maxJobs": 2,
             "maxBudgetUsd": 3.0, "maxTimeoutSec": 900, "maxCallSec": 3600,
-            "outputLimitChars": 20000,
+            "outputLimitChars": 20000, "readOnlyPaths": [],
         }
         self.server._load_config = lambda: {"agentE2eBroker": dict(self.raw)}
         self.policy = self.server._load_policy({"agentE2eBroker": dict(self.raw)})
@@ -240,6 +242,101 @@ class RunTests(Fixture):
         self.assertEqual([t["name"] for t in tools], ["run"])
 
 
+class RunDirReadTests(Fixture):
+    """Scenario code writes the run dir; the broker reads it back outside the unit."""
+
+    def push_setup(self, body: str) -> str:
+        git(self.repo, "switch", "-qc", "feat/hostile-setup")
+        (self.repo / "tests/agent-e2e/demo/setup.sh").write_text("#!/usr/bin/env bash\n" + body)
+        git(self.repo, "commit", "-qam", "hostile setup")
+        git(self.repo, "push", "-q", "origin", "feat/hostile-setup")
+        git(self.repo, "switch", "-q", "master")
+        return "origin/feat/hostile-setup"
+
+    def isolated_run(self, req: dict, timeout: int = 180) -> str:
+        import multiprocessing
+        import resource
+        ctx = multiprocessing.get_context("fork")
+        recv, send = ctx.Pipe(duplex=False)
+
+        def child() -> None:
+            resource.setrlimit(resource.RLIMIT_AS, (2 << 30, 2 << 30))
+            try:
+                send.send(self.server._tool_run(req))
+            except BaseException as e:
+                send.send(f"CHILD-RAISED {type(e).__name__}: {e}")
+
+        proc = ctx.Process(target=child)
+        proc.start()
+        ready = recv.poll(timeout)
+        text = recv.recv() if ready else None
+        proc.kill()
+        proc.join()
+        self.assertIsNotNone(text, f"broker still reading after {timeout}s")
+        self.assertNotIn("CHILD-RAISED", text)
+        return text
+
+    def test_symlinks_out_of_the_run_dir_are_not_followed(self) -> None:
+        require_sandbox(self)
+        canary = Path(self.tmp.name) / "canary"
+        canary.write_text("CANARY-OUTSIDE-RUN-DIR\n")
+        ref = self.push_setup(f'ln -sf {canary} "$2/final.txt"\n'
+                              f'ln -sf {canary} "$2/../../../../harness.out"\n'
+                              f'ln -sf {canary} "$2/../../../../harness.err"\n')
+        text = self.server._tool_run(self.req(new_ref=ref))
+        self.assertIn("harness exit", text)
+        self.assertNotIn("CANARY-OUTSIDE-RUN-DIR", text)
+
+    def test_endless_and_huge_run_files_are_read_bounded(self) -> None:
+        require_sandbox(self)
+        ref = self.push_setup('out="$2/../../../.."; ln -sf /dev/zero "$out/harness.err"; '
+                              'truncate -s 3G "$out/harness.out"\n')
+        text = self.isolated_run(self.req(new_ref=ref))
+        self.assertLess(len(text), self.raw["outputLimitChars"] + 1000)
+        self.assertIn("agent-e2e campaign `demo`", text)
+
+    def test_fifo_in_the_run_dir_does_not_block(self) -> None:
+        require_sandbox(self)
+        ref = self.push_setup('out="$2/../../../.."; rm -f "$out/harness.out"; '
+                              'mkfifo "$out/harness.out"\n')
+        text = self.isolated_run(self.req(new_ref=ref))
+        self.assertIn("harness exit", text)
+
+
+class UnitBindTests(Fixture):
+    def test_scenario_code_reads_only_the_repos_a_campaign_needs(self) -> None:
+        require_sandbox(self)
+        import uuid
+        tag = uuid.uuid4().hex[:8]
+        other = self.home / "Repos" / f".agent-e2e-broker-other-{tag}"
+        needed = self.home / "Repos" / f".agent-e2e-broker-needed-{tag}"
+        try:
+            for d, word in ((other, "OTHER-REPO-CANARY"), (needed, "NEEDED-REPO-READ")):
+                d.mkdir()
+                (d / "f").write_text(word + "\n")
+            self.raw["readOnlyPaths"] = [str(needed)]
+            git(self.repo, "switch", "-qc", "feat/reads-repos")
+            (self.repo / "tests/agent-e2e/demo/setup.sh").write_text(
+                f"#!/usr/bin/env bash\ncat {other}/f; cat {needed}/f; exit 0\n")
+            git(self.repo, "commit", "-qam", "reads repos")
+            git(self.repo, "push", "-q", "origin", "feat/reads-repos")
+            git(self.repo, "switch", "-q", "master")
+            text = self.server._tool_run(self.req(new_ref="origin/feat/reads-repos"))
+            [log] = self.out.glob("*/runs/demo/new/1/setup.log")
+            setup = log.read_text()
+            self.assertIn("NEEDED-REPO-READ", setup, text)
+            self.assertNotIn("OTHER-REPO-CANARY", setup, text)
+        finally:
+            shutil.rmtree(other, ignore_errors=True)
+            shutil.rmtree(needed, ignore_errors=True)
+
+    def test_policy_paths_go_through_the_canonicaliser(self) -> None:
+        for key, bad in (("repo", str(self.repo / ".git")), ("repo", "/etc"),
+                         ("readOnlyPaths", [str(self.home / ".ssh")])):
+            with self.subTest(key=key, bad=bad), self.assertRaises(RuntimeError):
+                self.server._load_policy({"agentE2eBroker": {**self.raw, key: bad}})
+
+
 class ReviewFindingTests(Fixture):
     def test_planted_remote_tracking_ref_refused(self) -> None:
         git(self.repo, "switch", "-qc", "unpushed")
@@ -322,6 +419,7 @@ class ReviewFindingTests(Fixture):
         broker = root / "broker"
         broker.mkdir()
         shutil.copy(SERVER, broker / "server.py")
+        shutil.copy(HERE.parent / "broker_paths.py", root / "broker_paths.py")
         (broker / "config.json").write_text(json.dumps({"agentE2eBroker": self.raw}))
         proc = subprocess.Popen([sys.executable, str(broker / "server.py")],
                                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
