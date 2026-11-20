@@ -17,8 +17,14 @@ pick() { # $1 file-name substring, $2 output path
   if [ -n "$f" ]; then cp "$f" "$2" || { echo "INCONCLUSIVE: copy failed"; exit 2; }
   else python3 -I "$here/file_from_transcript.py" "$RUN/transcript.jsonl" "$1" "$2"; fi
 }
-pick inventory "$out/inventory.md" || fail "no inventory written"
-pick domain-model "$out/lens3.md" || fail "no Domain model lens file written"
+pick inventory "$out/inventory.md"; rc=$?
+[ $rc -eq 1 ] && fail "no inventory written"; [ $rc -eq 0 ] || { echo "INCONCLUSIVE: reading the inventory failed"; exit 2; }
+pick domain-model "$out/lens3.md"; rc=$?
+[ $rc -eq 1 ] && fail "no Domain model lens file written"; [ $rc -eq 0 ] || { echo "INCONCLUSIVE: reading the lens failed"; exit 2; }
+# The sweep never edits decision files (setup.sh recorded their hashes;
+# runs from before that have no hash file and skip this check).
+[ ! -f "$RUN/decisions.sha256" ] || ( cd "$RUN/home/.local/state/claude-tasks/work/decisions" && sha256sum --quiet -c "$RUN/decisions.sha256" ) >/dev/null 2>&1 \
+  || fail "a decision file was changed or removed"
 res=$(python3 -I "$here/grade.py" "$out/inventory.md" "$out/lens3.md"); code=$?
 case $code in 0) pass "$res" ;; 1) fail "$res" ;; esac
 echo "INCONCLUSIVE: grader exit $code: $res"; exit 2

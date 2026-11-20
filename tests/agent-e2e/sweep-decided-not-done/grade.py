@@ -13,8 +13,8 @@ D2  the lens's items (lenses.md: one line each, "N VERDICT EFFORT title —
     field; prose wording is not graded.
 K1  "Decided, not done" leaves out the finished decision (scripts/check) and
     the keep decision (brightness).
-K2  no item about brightness (and not the ids) has RECOMMEND or ADVISE as
-    its verdict: a keep decision is not a finding.
+K2  no item whose title (the text before the first "—") names brightness
+    has RECOMMEND or ADVISE as its verdict: a keep decision is not a finding.
 """
 import re
 import sys
@@ -28,9 +28,14 @@ def section(doc, name):
 VERDICT = re.compile(r'\b(RECOMMEND|ADVISE|SKIP|ASK)\b')
 
 
+ITEM = re.compile(r'^\s*(\|\s*)?\d+\.?\s')  # "N VERDICT ..." or a "| N | ..." table row
+
+
 def verdict_items(doc):
-    """(verdict, line) for each line that carries a verdict word."""
-    return [(m.group(1), l) for l in doc.splitlines() for m in [VERDICT.search(l)] if m]
+    """(verdict, line) for each item line: it starts with the item's number,
+    and its verdict is the first verdict word on it."""
+    return [(m.group(1), l) for l in doc.splitlines() if ITEM.match(l)
+            for m in [VERDICT.search(l)] if m]
 
 
 def grade(inv, lens):
@@ -46,15 +51,17 @@ def grade(inv, lens):
     if re.search(r'scripts/check|brightness', decided, re.I):
         return 1, 'K1: a done or keep decision is listed as not done'
     found = verdict_items(lens)
+    # The id item may be titled by the decision rather than the ids: match
+    # "identifiers", "room ... string", or the decision's date.
     about_ids = [(v, l) for v, l in found
-                 if ids.search(l) or re.search(r'\broom\b.*\bstring\b|\bstring\b.*\broom\b', l, re.I)]
+                 if ids.search(l) or re.search(r'\bidentifiers?\b|2026-11-19|\broom\b.*\bstring\b|\bstring\b.*\broom\b', l, re.I)]
     skipped = [l for v, l in about_ids if v == 'SKIP']
     if skipped:
         return 1, f'D2: ids SKIPped: {skipped[0].strip()[:100]}'
     if not any(v in ('RECOMMEND', 'ADVISE') for v, _ in about_ids):
         return 1, 'D2: no RECOMMEND or ADVISE item reports the room/lamp ids'
     kept = [l for v, l in found
-            if v in ('RECOMMEND', 'ADVISE') and re.search(r'brightness', l, re.I) and not ids.search(l)]
+            if v in ('RECOMMEND', 'ADVISE') and re.search(r'brightness', l.split('—')[0], re.I)]
     if kept:
         return 1, f'K2: keep decision reported: {kept[0].strip()[:100]}'
     return 0, 'L1, L2, D1, D2, K1, K2'

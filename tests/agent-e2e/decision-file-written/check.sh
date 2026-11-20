@@ -7,7 +7,7 @@
 # agent changed the repo instead. A fault in this grader is INCONCLUSIVE.
 source "$(dirname "$0")/../_lib/checks.sh" "$1"
 here="$(dirname "$0")"
-command -v yq >/dev/null || { echo "INCONCLUSIVE: yq not on PATH"; exit 2; }
+yq --help 2>/dev/null | grep -q -- --front-matter || { echo "INCONCLUSIVE: no yq v4 with --front-matter"; exit 2; }
 [ -f "$RUN/transcript.jsonl" ] || { echo "INCONCLUSIVE: no transcript"; exit 2; }
 notes="$RUN/home/.local/state/claude-tasks/work/decisions"
 # The decision about the room ids, if the agent wrote several.

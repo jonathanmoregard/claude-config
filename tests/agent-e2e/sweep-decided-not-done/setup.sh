@@ -82,3 +82,5 @@ User, verbatim: "put the gate in one script"
 
 Reading: `scripts/check` runs the type check and the tests. Landed.
 M
+# For check.sh: the sweep must leave every decision file as it is.
+( cd "$notes/decisions" && sha256sum ./*.md ) > "${E2E_RUN:?}/decisions.sha256"

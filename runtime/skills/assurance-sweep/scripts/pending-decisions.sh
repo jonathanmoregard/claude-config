@@ -18,8 +18,8 @@ for f in "$dir"/*.md; do
   [ -e "$f" ] || continue
   F="$f" yq --front-matter=extract '
     select(.kind != "keep" and (.kind != "change" or .status != "done"))
-    | "| " + ((.date // "-") | tostring) + " | " + ((.title // "-") | tostring)
-      + " | " + ([.where // []] | flatten | join(", "))
+    | "| " + ((.date // "-") | tostring) + " | " + ((.title // "-") | tostring | sub("\\|"; "\\|"))
+      + " | " + ([.where // []] | flatten | join(", ") | sub("\\|"; "\\|"))
       + " | " + (if .kind == "change" and .status == "pending" then "pending" else "unlabelled" end)
       + " | " + strenv(F) + " |"' "$f" 2>/dev/null \
     || echo "| - | - | - | unparseable | $f |"
