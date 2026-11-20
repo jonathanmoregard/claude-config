@@ -9,8 +9,9 @@ REPORT dispatch
 Lens: <name>. Repository (read-only): <absolute path> @ <commit>.
 Tier: <production | personal, from the inventory>. On a personal project
 propose no production machinery — observability, alerting, restore
-rehearsals, leak checks, growth measurement — and judge "would break" by
-the owner's own use, not by production load.
+rehearsals, leak checks, growth measurement — mark those methods n/a, and
+judge "would break" by the owner's own use, not by production load. Neat
+types, clear structure and working tests still apply in full.
 Read first, in full and in this order: <dir>/inventory.md; <recorded
 decisions file>; every earlier lens file in <dir> (do not repeat their
 items).
@@ -30,7 +31,8 @@ Bar for RECOMMEND: builds on how the code already works instead of
 reworking it; focused and minimal; ordinary industry practice; the simplest thing
 that deals with the problem. If the caller of a proposed check, type or lint
 can sidestep it, the item is SKIP. A type only a parser can build, with a
-guard that rejects casts to it elsewhere, is not sidestepped by a cast.
+guard that rejects casts and untyped values flowing into it elsewhere, is
+not sidestepped.
 
 Output, at most 700 words unless the lens block sets its own cap, in this shape:
 Coverage: what you read; what you did not.
@@ -111,8 +113,9 @@ they are.
 
 The guard needs no new tool: it is one test in the existing suite that uses
 the project's own type checker to read the core's exported signatures, and
-it also rejects casts to the new types outside their parsers. That is why a
-type it protects is not SKIP for being castable. Recommend the guard as its
+it also rejects, outside their parsers, casts to the new types and `any` or
+`unknown` values flowing into them. That is why a type it protects is not
+SKIP for being castable. Recommend the guard as its
 own item.
 
 Output: one item per category, not per site — per-file counts and at most
@@ -182,7 +185,9 @@ method present, weak (say how: few cases, happy path only, cannot fail), or
 absent. Rank methods by classes covered over effort. Also check: gates that
 cannot fail (does each trip on a planted defect?); evidence older than the
 code it covers; critical machinery no test touches; and, on a production
-project only, growth nobody measured and failures nobody is told about. For the top items give first steps: where,
+project only, growth nobody measured and failures nobody is told about; on a personal
+project mark observability, alerting, restore rehearsals, leak checks and
+growth measurement n/a and propose none of them. For the top items give first steps: where,
 how, the invariants, effort, and any decision the user must make. SKIP
 surfaces a trusted third party owns.
 ```

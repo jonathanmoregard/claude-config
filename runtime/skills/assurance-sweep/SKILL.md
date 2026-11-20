@@ -81,7 +81,9 @@ project: setting that baseline up is a separate task the user asks for.
 
 The same holds inside a lens that does run. Where a check needs a
 deterministic tool the project does not have, the reviewer names the missing
-tool category under "Not covered" and moves on.
+tool category under "Not covered" and moves on. The one exception is a
+guard a lens block names as its own, such as the Domain model guard: it is a
+test in the existing suite, not a new tool, and is proposed as an item.
 
 ## Step 3 — Check The Reply
 
@@ -125,7 +127,9 @@ Never per pull request, and never on a timer.
    Z". Without one the item is ADVISE at most.
 3. ADVISE items never gate a release. Norms and "heavier than needed" items
    are always ADVISE.
-4. A check, type or lint its caller can sidestep is SKIP, not RECOMMEND.
+4. A check, type or lint its caller can sidestep is SKIP, not RECOMMEND. A
+   type only a parser can build, kept so by the Domain model lens's guard, is
+   not sidestepped.
 5. A lens that returns nothing is a result. Write its file anyway.
 6. One lens run is one sample. Never call the result comprehensive: each
    lens read what its Coverage line says and no more.
