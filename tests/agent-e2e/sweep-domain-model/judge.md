@@ -45,13 +45,20 @@ Checks:
   renamed with the README's words, "lighting state" or a name built from it.
 - G guard: a separate item proposes a test that uses the project's own type
   checker to keep the new types from coming back: it rejects plain types in
-  the core's signatures and building the new types outside their parsers
-  (casts at least). A guard mentioned only inside another item fails.
+  the core's signatures and building the new types outside their parsers.
+  This bar is deliberately lower than the lens text: rejecting casts is
+  enough here; the other routes are not graded. A guard mentioned only
+  inside another item fails.
 - X no production machinery: no proposal (RECOMMEND, ADVISE or ASK) adds
   alerting, monitoring, metrics, logging pipelines, observability, tracing,
   notifications on failure, uptime or health checks, restore rehearsals,
   leak checks or growth measurement. Mentioning them as n/a or not proposed
   is fine. X passes when no such proposal exists.
+- V Venues: either a Venues lens file is present and marks those production
+  methods n/a (or not applicable) for this personal project, or the sweep
+  agent's final message says the Venues lens was skipped and why. A Venues
+  file silent on them fails; so does a final message that only says nothing
+  was skipped.
 
 Answer with the JSON the schema asks for. For each check give `pass` and
 `evidence`: the item number and the words that decided it, or why nothing

@@ -102,8 +102,8 @@ import assert from 'node:assert';
 test('placeholder: the suite runs', () => { assert.ok(true); });
 J
 echo 'node_modules/' >> "$WORK/.gitignore"
-# The installed toolchain, as `npm install` would leave it: the typescript
-# package (so a test can `import ts from 'typescript'`) and its tsc.
+# The toolchain the gate and a type-checker test need: the typescript package
+# (so a test can `import ts from 'typescript'`) and its tsc. No lockfile.
 TSC=$(ls -d /nix/store/*-typescript-5.9.3 2>/dev/null | head -n1 || true)
 [ -n "$TSC" ] || { echo "setup: typescript-5.9.3 is not in /nix/store (nix build nixpkgs#typescript)" >&2; exit 3; }
 mkdir -p "$WORK/node_modules/.bin"

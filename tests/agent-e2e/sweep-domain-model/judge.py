@@ -1,34 +1,46 @@
 """Model-graded checks for sweep-domain-model: an Opus judge reads the sweep's
-lens files against judge.md (the planted problems) and returns pass/evidence
-per check. Prints "PASS ..." or "missing/bad: ..."; exits 2 when the judge
-itself fails, so the harness reports INCONCLUSIVE instead of a verdict.
+lens files and final message against judge.md (the planted problems) and
+returns pass/evidence per check. Prints "PASS ..." or "missing/bad: ...";
+exits 2 when the judge itself fails, so the harness reports INCONCLUSIVE
+instead of a verdict.
 
-usage: judge.py SWEEP_DIR JUDGE_HOME CREDENTIALS_FILE
-The judge runs in JUDGE_HOME, a fresh HOME holding only the credentials, with
-no tools, no settings, no MCP and no skills: the config under test must not
-shape its own grade.
+usage: judge.py SWEEP_DIR OUT_DIR CREDENTIALS_FILE [FINAL_TXT]
+The judge runs with a fresh HOME and working directory created here, outside
+the run directory the agent under test could write to. The HOME holds only a
+link to the credentials; the judge has no tools, no settings, no MCP and no
+skills, so the config under test cannot shape its own grade. Its raw output
+lands in OUT_DIR/judge.out.
 """
 import glob
 import json
 import os
 import subprocess
 import sys
+import tempfile
 
-CHECKS = ['P1', 'P2', 'P3', 'P4', 'P5', 'G', 'X']
+CHECKS = ['P1', 'P2', 'P3', 'P4', 'P5', 'G', 'X', 'V']
 here = os.path.dirname(os.path.abspath(__file__))
-sweep_dir, judge_home, creds = sys.argv[1:4]
+sweep_dir, out_dir, creds = sys.argv[1:4]
+final_path = sys.argv[4] if len(sys.argv) > 4 else ''
+
+
+def inconclusive(why):
+    print(f'judge failed ({why}); see {out_dir}/judge.out')
+    sys.exit(2)
+
+
+def read(path):
+    return open(path, encoding='utf-8', errors='replace').read()
+
 
 files = sorted(f for f in glob.glob(os.path.join(sweep_dir, '*', '*.md')) if not f.endswith('inventory.md'))
 if not files:
     print('missing/bad: no lens files')
     sys.exit(1)
-output = '\n\n'.join(f'--- {os.path.basename(f)} ---\n' + open(f, encoding='utf-8').read() for f in files)
-prompt = open(os.path.join(here, 'judge.md'), encoding='utf-8').read() + output
-
-os.makedirs(os.path.join(judge_home, '.claude'), exist_ok=True)
-link = os.path.join(judge_home, '.claude', '.credentials.json')
-if not os.path.lexists(link):
-    os.symlink(creds, link)
+prompt = (read(os.path.join(here, 'judge.md'))
+          + '\n\n'.join(f'--- {os.path.basename(f)} ---\n' + read(f) for f in files)
+          + "\n\n=== THE SWEEP AGENT'S FINAL MESSAGE ===\n"
+          + (read(final_path) if final_path and os.path.exists(final_path) else ''))
 
 schema = {
     'type': 'object', 'additionalProperties': False, 'required': CHECKS,
@@ -36,20 +48,28 @@ schema = {
                        'properties': {'pass': {'type': 'boolean'}, 'evidence': {'type': 'string'}}}
                    for c in CHECKS},
 }
-claude = os.environ.get('E2E_JUDGE_CLAUDE', 'claude')
-argv = [claude, '-p', '--model', os.environ.get('E2E_JUDGE_MODEL', 'opus'), '--output-format', 'json',
-        '--json-schema', json.dumps(schema), '--tools', '', '--strict-mcp-config', '--setting-sources', '',
-        '--disable-slash-commands', '--no-session-persistence']
-env = {k: v for k, v in os.environ.items() if not k.startswith('CLAUDE')}
-env['HOME'] = judge_home
-proc = subprocess.run(argv, input=prompt, capture_output=True, text=True, env=env, cwd=judge_home, timeout=600)
-open(os.path.join(judge_home, 'judge.out'), 'w', encoding='utf-8').write(proc.stdout + proc.stderr)
+argv = [os.environ.get('E2E_JUDGE_CLAUDE', 'claude'), '-p', '--model', os.environ.get('E2E_JUDGE_MODEL', 'opus'),
+        '--output-format', 'json', '--json-schema', json.dumps(schema), '--tools', '', '--strict-mcp-config',
+        '--setting-sources', '', '--disable-slash-commands', '--no-session-persistence']
 try:
-    result = json.loads(proc.stdout)
-    verdicts = result.get('structured_output') or json.loads(result['result'])
-    missing = [f"{c}:{verdicts[c]['evidence'][:160]}" for c in CHECKS if not verdicts[c]['pass']]
+    os.makedirs(out_dir, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='sweep-judge-') as fresh:
+        home, cwd = os.path.join(fresh, 'home'), os.path.join(fresh, 'cwd')
+        os.makedirs(os.path.join(home, '.claude'))
+        os.makedirs(cwd)
+        os.symlink(creds, os.path.join(home, '.claude', '.credentials.json'))
+        env = {k: v for k, v in os.environ.items() if not k.startswith('CLAUDE')}
+        env['HOME'] = home
+        proc = subprocess.run(argv, input=prompt, capture_output=True, text=True, env=env, cwd=cwd, timeout=600)
+    open(os.path.join(out_dir, 'judge.out'), 'w', encoding='utf-8').write(proc.stdout + proc.stderr)
+except (OSError, subprocess.SubprocessError) as exc:
+    inconclusive(exc.__class__.__name__)
+try:
+    verdicts = json.loads(proc.stdout)['structured_output']
+    if not all(type(verdicts[c]['pass']) is bool and isinstance(verdicts[c]['evidence'], str) for c in CHECKS):
+        inconclusive('malformed verdict')
 except (ValueError, KeyError, TypeError) as exc:
-    print(f'judge failed ({exc.__class__.__name__}); see {judge_home}/judge.out')
-    sys.exit(2)
+    inconclusive(exc.__class__.__name__)
+missing = [f"{c}:{verdicts[c]['evidence'][:160]}" for c in CHECKS if not verdicts[c]['pass']]
 print('PASS ' + ', '.join(CHECKS) + ' hold' if not missing else 'missing/bad: ' + ' | '.join(missing))
 sys.exit(0 if not missing else 1)

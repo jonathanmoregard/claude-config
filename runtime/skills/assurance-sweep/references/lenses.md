@@ -30,8 +30,10 @@ own guard overrides this for that guard only.
 Bar for RECOMMEND: builds on how the code already works instead of
 reworking it; focused and minimal; ordinary industry practice; the simplest thing
 that deals with the problem. If the caller of a proposed check, type or lint
-can sidestep it, the item is SKIP. A type only a parser can build, kept so by a
-guard of the kind the Domain model lens describes, is not sidestepped.
+can sidestep it, the item is SKIP. A type only a parser can build is not sidestepped
+when a guard keeps it so: one test in the existing suite, using the
+project's own type checker, that fails for every way the language allows to
+build the type outside its parser. Without that guard, the type is SKIP.
 
 Output, at most 700 words unless the lens block sets its own cap, in this shape:
 Coverage: what you read; what you did not.
@@ -117,8 +119,10 @@ List the ways the language allows and plant one of each as the RED: in
 TypeScript, casts (also through a generic helper), `any` or `unknown`
 flowing in, type predicates and assertion functions, overloads whose
 implementation returns the plain type, `declare` and `.d.ts` declarations,
-`@ts-ignore` / `@ts-expect-error` / `@ts-nocheck`, and JSDoc casts in
-JavaScript files. The checker's configuration covers every file that can
+`@ts-ignore` / `@ts-expect-error` / `@ts-nocheck`, JSDoc casts in
+JavaScript files, numeric `enum`s (any number assigns to one: use
+string-literal unions), and brands an object literal can spell (brand with
+an unexported `unique symbol`). The checker's configuration covers every file that can
 call the core, tests and scripts included. That is why a type it protects is
 not SKIP for being castable. Recommend the guard as its own item.
 
