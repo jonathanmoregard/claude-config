@@ -37,17 +37,19 @@ def staged(script: Path, tmp_path: Path, bin_dir: Path) -> Path:
     return copy
 
 
-def run_unit_read(tmp_path: Path, *args: str, output: str = "") -> tuple[int, list[str], str]:
+def run_unit_read(tmp_path: Path, *args: str, output: str = "",
+                  env: dict[str, str] | None = None) -> tuple[int, list[str], str]:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
     calls = tmp_path / "calls.log"
     printed = tmp_path / "systemctl-output"
     printed.write_text(output)
     stub = bin_dir / "systemctl"
-    stub.write_text(f'#!/bin/sh\nprintf "%s\\n" "systemctl $*" >>"{calls}"\ncat "{printed}"\n')
+    stub.write_text(f'#!/bin/sh\nprintf "%s\\n" "systemctl $*" >>"{calls}"\n'
+                    f'env -0 >"{tmp_path}/systemctl-env"\ncat "{printed}"\n')
     stub.chmod(0o755)
     proc = subprocess.run(["bash", str(staged(UNIT_READ, tmp_path, bin_dir)), *args],
-                          capture_output=True, text=True, check=False)
+                          capture_output=True, text=True, check=False, env=env)
     return (proc.returncode, calls.read_text().splitlines() if calls.exists() else [],
             proc.stdout)
 
@@ -166,6 +168,45 @@ def test_scripts_run_no_caller_bash_env(tmp_path: Path, script: Path) -> None:
                    env={**os.environ, "BASH_ENV": str(payload), "ENV": str(payload)},
                    check=False)
     assert not marker.exists()
+
+
+def caller_env(tmp_path: Path) -> dict[str, str]:
+    """What a caller could point systemctl at: its own unit files, bus and manager."""
+    return {**os.environ, "SYSTEMD_UNIT_PATH": str(tmp_path),
+            "DBUS_SYSTEM_BUS_ADDRESS": f"unix:path={tmp_path}/sys",
+            "DBUS_SESSION_BUS_ADDRESS": f"unix:path={tmp_path}/bus",
+            "XDG_RUNTIME_DIR": str(tmp_path), "XDG_CONFIG_HOME": str(tmp_path),
+            "HOME": str(tmp_path), "UID": "0"}
+
+
+@pytest.mark.parametrize("scope, expected", [
+    ((), {}), (("--user",), {"XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"}),
+], ids=["system", "user"])
+def test_unit_read_gives_systemctl_none_of_the_callers_environment(
+        tmp_path: Path, scope: tuple[str, ...], expected: dict[str, str]) -> None:
+    rc, _, _ = run_unit_read(tmp_path, *scope, "cat", "x.service", env=caller_env(tmp_path))
+    assert rc == 0
+    pairs = (tmp_path / "systemctl-env").read_text().split("\0")
+    seen = dict(p.split("=", 1) for p in pairs if p)
+    for name in ("PWD", "SHLVL", "_", "SHELLOPTS", "BASHOPTS", "PATH"):
+        seen.pop(name, None)
+    assert seen == expected
+
+
+@pytest.mark.skipif(not os.path.exists(interpreter(UNIT_READ)) or not shutil.which("systemctl"),
+                    reason="needs NixOS and systemd")
+def test_unit_read_cat_reads_no_unit_file_the_caller_planted(tmp_path: Path) -> None:
+    secret = tmp_path / "not-a-unit.txt"
+    secret.write_text("PLANTED-TARGET\n")
+    unit = f"unitreadprobe{uuid.uuid4().hex[:8]}@.service"
+    (tmp_path / unit).write_text("[Unit]\n")
+    (tmp_path / f"{unit}.d").mkdir()
+    (tmp_path / f"{unit}.d" / "10-x.conf").symlink_to(secret)
+    for scope in ((), ("--user",)):
+        proc = subprocess.run([str(UNIT_READ), *scope, "cat", unit], capture_output=True,
+                              text=True, timeout=30, check=False,
+                              env={**os.environ, "SYSTEMD_UNIT_PATH": str(tmp_path)})
+        assert "PLANTED-TARGET" not in proc.stdout
 
 
 def trash_names() -> set[str]:

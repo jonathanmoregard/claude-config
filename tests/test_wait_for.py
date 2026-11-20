@@ -540,6 +540,38 @@ def test_unit_wait_deletes_nothing_the_callers_home_names(tmp_path: Path) -> Non
     assert planted.exists(), out
 
 
+def test_unit_wait_verdict_is_not_the_callers_jq_library(tmp_path: Path) -> None:
+    caller_home = tmp_path / "caller-home"
+    caller_home.mkdir()
+    (caller_home / ".jq").write_text('def last: {"USER_INVOCATION_ID": "0123abcd"};\n')
+    gone = {"LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead"}
+    rc, out, _ = run_wait_for(tmp_path, {"systemctl": [gone], "journalctl": [{"stdout": []}]},
+                              "unit", "gate", "--user", extra_env={"HOME": str(caller_home)})
+    assert rc == 3, out
+
+
+@pytest.mark.parametrize("scope, expected", [
+    ((), {}), (("--user",), {"XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"}),
+], ids=["system", "user"])
+def test_unit_wait_gives_systemctl_none_of_the_callers_environment(
+    tmp_path: Path, scope: tuple[str, ...], expected: dict[str, str]
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    dump = tmp_path / "systemctl-env"
+    (bin_dir / "systemctl").write_text(f'#!/bin/sh\nenv -0 >"{dump}"\necho LoadState=not-found\n')
+    (bin_dir / "systemctl").chmod(0o755)
+    run_wait_for(tmp_path, {"journalctl": [{"stdout": []}]}, "unit", "gate", *scope,
+                 extra_env={"SYSTEMD_UNIT_PATH": str(tmp_path), "XDG_RUNTIME_DIR": str(tmp_path),
+                            "DBUS_SYSTEM_BUS_ADDRESS": f"unix:path={tmp_path}/sys",
+                            "DBUS_SESSION_BUS_ADDRESS": f"unix:path={tmp_path}/bus",
+                            "UID": "0"})
+    seen = dict(p.split("=", 1) for p in dump.read_text().split("\0") if p)
+    for name in ("PWD", "SHLVL", "_", "SHELLOPTS", "BASHOPTS", "PATH"):
+        seen.pop(name, None)
+    assert seen == expected
+
+
 def test_since_after_launch_waits_for_a_newer_run(tmp_path: Path) -> None:
     # --since is a freshness filter, not a way to timestamp a launch after the
     # fact. A terminal run that started earlier must not be mistaken for a new one.
