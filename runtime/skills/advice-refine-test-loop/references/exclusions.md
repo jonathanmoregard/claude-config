@@ -12,4 +12,4 @@ and only with the user's yes. Never add an entry for a category that has a
 
 ## Entries
 
-1. An MCP tool name (`mcp__<server>__<tool>`) in settings or permissions "matches no real tool" — reviewers cannot see the live MCP tool list, and every such claim named a tool that exists there. Built-in tool names and rule syntax stay reportable (3 rows, 2026-11-20)
+1. An MCP tool name (`mcp__<server>__<tool>`) in an allow or ask rule "matches no real tool" — reviewers cannot see the live MCP tool list, and every such claim named a tool that exists there; a wrong name there only costs a prompt. Deny rules, built-in tool names and rule syntax stay reportable (3 rows, 2026-11-20)
