@@ -55,11 +55,11 @@ HINTS: list[tuple[str, re.Pattern[str], str]] = [
     ),
     (
         "trash",
-        re.compile(r"across filesystem boundaries|Unable to create trashing info file"),
+        re.compile(r"across filesystem boundaries|Unable to create trashing info file"
+                   r"|Trashing on system internal mounts"),
         "The shell is sandboxed, where `gio trash` cannot reach the trash. "
-        "Use `~/.claude/scripts/trash <path>...` as the whole command (no "
-        "`&&`, `;`, pipe or `cd`); it takes paths under ~/Repos and "
-        "~/worktrees.",
+        "Use `~/.claude/scripts/trash <path>...`: it moves paths under ~/Repos "
+        "or ~/worktrees into that root's `.trash/`.",
     ),
     (
         "read-only",

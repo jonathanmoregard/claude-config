@@ -1,21 +1,18 @@
-"""unit-read, trash and `wait-for unit` run outside the Claude Code sandbox
-without a prompt, so none may pass on an argument that steers the tool
-underneath it, nor act on anything but what it checked."""
+"""unit-read and `wait-for unit` run outside the Claude Code sandbox without a
+prompt, so neither may pass on an argument that steers the tool underneath it.
+`trash` runs inside it."""
 from __future__ import annotations
 
-import json
 import os
 import pwd
 import re
-import resource
-import shlex
 import shutil
 import subprocess
 import sys
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import unquote, unquote_to_bytes
+from urllib.parse import unquote_to_bytes
 
 import pytest
 
@@ -24,8 +21,6 @@ SCRIPTS = REPO / "runtime" / "scripts"
 UNIT_READ = SCRIPTS / "unit-read"
 TRASH = SCRIPTS / "trash"
 REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
-TRASH_DIR = REAL_HOME / ".local" / "share" / "Trash"
-SCRATCH_PREFIX = f"{REAL_HOME}/worktrees/.trash-test-"
 
 
 def staged(script: Path, tmp_path: Path, bin_dir: Path) -> Path:
@@ -210,450 +205,106 @@ def test_unit_read_cat_reads_no_unit_file_the_caller_planted(tmp_path: Path) -> 
         assert "PLANTED-TARGET" not in proc.stdout
 
 
-def trash_names() -> set[str]:
-    info = TRASH_DIR / "info"
-    return set(os.listdir(info)) if info.is_dir() else set()
+def trash_for(home: Path) -> Path:
+    """The script with its roots under home instead of the user's own."""
+    source, n = re.subn(r"^HOME = .*$", f"HOME = Path({str(home)!r})", TRASH.read_text(),
+                        flags=re.M)
+    assert n == 1
+    copy = home.parent / f"{home.name}-trash"
+    copy.write_text(source)
+    return copy
 
 
-def trashed_since(before: set[str]) -> list[tuple[str, str]]:
-    """(original path, name under Trash/files), for this module's scratch trees only;
-    other processes may be trashing concurrently."""
-    moved = []
-    for name in trash_names() - before:
-        text = (TRASH_DIR / "info" / name).read_text()
-        found = re.search(r"^Path=(.*)$", text, re.M)
-        if found and unquote(found[1]).startswith(SCRATCH_PREFIX):
-            moved.append((unquote(found[1]), name.removesuffix(".trashinfo")))
-    return moved
+def run_trash(home: Path, *args: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run([sys.executable, "-I", str(trash_for(home)), *args], cwd=cwd,
+                          capture_output=True, text=True, check=False)
 
 
-def run_trash(*args: str, script: Path = TRASH) -> tuple[int, dict[str, str]]:
-    before = trash_names()
-    proc = subprocess.run([sys.executable, "-I", str(script), *args], capture_output=True,
-                          text=True, check=False)
-    return proc.returncode, dict(trashed_since(before))
-
-
-def remove(path: Path) -> None:
-    if path.is_dir() and not path.is_symlink():
-        shutil.rmtree(path)
-    else:
-        path.unlink(missing_ok=True)
+def origin(record: Path) -> bytes:
+    found = re.search(r"^Path=(.*)$", record.read_text(), re.M)
+    assert found
+    return unquote_to_bytes(found[1])
 
 
 @pytest.fixture
-def scratch():
-    root = Path(f"{SCRATCH_PREFIX}{uuid.uuid4().hex}")
-    root.mkdir(parents=True)
-    before = trash_names()
-    yield root
-    for original, name in trashed_since(before):
-        if original.startswith(f"{root}/"):
-            remove(TRASH_DIR / "files" / name)
-            (TRASH_DIR / "info" / f"{name}.trashinfo").unlink()
-    remove(root)
+def home(tmp_path: Path) -> Path:
+    for root in ("Repos", "worktrees"):
+        (tmp_path / root / "project").mkdir(parents=True)
+    return tmp_path
 
 
-def test_trash_moves_paths_under_the_write_roots(scratch: Path) -> None:
-    (scratch / "f").write_text("x")
-    (scratch / "link").symlink_to("/etc/hostname")
-    rc, moved = run_trash(str(scratch / "f"), str(scratch / "link"))
-    assert rc == 0
-    assert sorted(moved) == [f"{scratch}/f", f"{scratch}/link"]
-    assert (TRASH_DIR / "files" / moved[f"{scratch}/f"]).read_text() == "x"
-    assert os.readlink(TRASH_DIR / "files" / moved[f"{scratch}/link"]) == "/etc/hostname"
-    assert not (scratch / "f").exists() and not (scratch / "link").is_symlink()
+def test_trash_moves_into_the_trash_of_its_root_and_records_the_origin(home: Path) -> None:
+    for root in ("Repos", "worktrees"):
+        project = home / root / "project"
+        (project / "f").write_text("x")
+        (project / "d").mkdir()
+        (project / "d" / "g").write_text("y")
+        (project / "link").symlink_to("/etc/hostname")
+        proc = run_trash(home, str(project / "f"), str(project / "d"), str(project / "link"))
+        assert proc.returncode == 0, proc.stderr
+        trash = home / root / ".trash"
+        assert (trash / "files" / "f").read_text() == "x"
+        assert (trash / "files" / "d" / "g").read_text() == "y"
+        assert os.readlink(trash / "files" / "link") == "/etc/hostname"
+        assert origin(trash / "info" / "d.trashinfo") == os.fsencode(project / "d")
+        assert sorted(os.listdir(project)) == []
 
 
-def test_trash_moves_more_paths_than_it_may_hold_open(scratch: Path) -> None:
-    files = [scratch / f"f{n}" for n in range(60)]
-    for f in files:
-        f.write_text("x")
-    proc = subprocess.run(
-        [sys.executable, "-I", str(TRASH), *map(str, files)], capture_output=True, text=True,
-        check=False,
-        preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (32, 32)))
-    assert proc.returncode == 0, proc.stderr
-    assert not any(f.exists() for f in files)
-
-
-def test_trash_records_where_each_entry_came_from(scratch: Path) -> None:
-    entry = scratch / "same name%"
-    names = []
+def test_trash_keeps_both_entries_of_the_same_name(home: Path) -> None:
+    project = home / "worktrees" / "project"
     for content in ("one", "two"):
-        entry.write_text(content)
-        rc, moved = run_trash(str(entry))
-        assert rc == 0
-        names.append(moved[str(entry)])
-    assert [(TRASH_DIR / "files" / n).read_text() for n in names] == ["one", "two"]
-    for name in names:
-        info = (TRASH_DIR / "info" / f"{name}.trashinfo").read_text()
-        parsed = re.fullmatch(r"\[Trash Info\]\nPath=(\S+)\n"
-                              r"DeletionDate=\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\n", info)
-        assert parsed, info
-        assert unquote(parsed[1]) == str(entry)
+        (project / "same").write_text(content)
+        assert run_trash(home, str(project / "same")).returncode == 0
+    files = home / "worktrees" / ".trash" / "files"
+    assert sorted(p.read_text() for p in files.iterdir()) == ["one", "two"]
 
 
-def test_trash_records_a_name_that_is_not_utf8(scratch: Path) -> None:
-    name = os.fsdecode(b"\xff" + uuid.uuid4().hex.encode())
-    entry = scratch / name
-    entry.write_text("x")
-    before = trash_names()
-    try:
-        proc = subprocess.run([sys.executable, "-I", str(TRASH), str(entry)],
-                              capture_output=True, text=True, check=False)
-        new = [n for n in trash_names() - before if n.startswith(name)]
-        assert (proc.returncode, proc.stderr, len(new)) == (0, "", 1)
-        info = (TRASH_DIR / "info" / new[0]).read_bytes()
-        recorded = re.search(rb"^Path=(\S+)$", info, re.M)
-        assert recorded and unquote_to_bytes(recorded[1]) == os.fsencode(entry)
-        assert (TRASH_DIR / "files" / new[0].removesuffix(".trashinfo")).read_text() == "x"
-        assert not entry.exists()
-    finally:
-        for n in trash_names() - before:
-            if n.startswith(name):
-                remove(TRASH_DIR / "files" / n.removesuffix(".trashinfo"))
-                (TRASH_DIR / "info" / n).unlink()
+def test_trash_takes_a_relative_path_and_a_name_that_is_not_utf8(home: Path) -> None:
+    project = home / "worktrees" / "project"
+    name = b"caf\xe9"
+    with open(os.fsencode(project) + b"/" + name, "w") as f:
+        f.write("x")
+    proc = run_trash(home, os.fsdecode(name), cwd=project)
+    assert proc.returncode == 0, proc.stderr
+    info = home / "worktrees" / ".trash" / "info"
+    [record] = info.iterdir()
+    assert origin(record) == os.fsencode(project) + b"/" + name
 
 
-def test_trash_refuses_options_and_paths_elsewhere(scratch: Path) -> None:
-    (scratch / "out").symlink_to(REAL_HOME)
-    (scratch / "f").write_text("x")
-    for args, code in [
-        (("--empty",), 64),
-        (("--restore", "trash:///f"), 64),
-        ((str(scratch / "f"), "--force"), 64),
-        ((str(REAL_HOME / ".bashrc"),), 1),
-        ((str(scratch / "out" / ".bashrc"),), 1),
-        ((str(REAL_HOME / "worktrees"),), 1),
-        ((f"{REAL_HOME}/worktrees/.",), 1),
-        ((f"{scratch}/\n",), 1),
-        ((str(REAL_HOME / "Repos" / ".."),), 1),
-        ((str(scratch / ".."),), 1),
-        ((str(scratch / "missing"),), 1),
-        ((), 64),
-    ]:
-        assert run_trash(*args) == (code, {}), args
-    assert (scratch / "f").exists()
+@pytest.mark.parametrize("args, status", [
+    ((), 64), (("--empty",), 64), (("-r", "x"), 64),
+    (("{home}/elsewhere",), 1), (("{home}/worktrees",), 1),
+    (("{home}/worktrees/project/absent",), 1), (("{home}/worktrees/.trash",), 1),
+], ids=["none", "empty", "option", "outside", "root", "absent", "trash"])
+def test_trash_refuses(home: Path, args: tuple[str, ...], status: int) -> None:
+    (home / "elsewhere").write_text("x")
+    (home / "worktrees" / ".trash").mkdir()
+    before = sorted(str(p) for p in home.rglob("*"))
+    proc = run_trash(home, *(a.format(home=home) for a in args))
+    assert proc.returncode == status, proc.stderr
+    assert sorted(str(p) for p in home.rglob("*")) == before
 
 
-def test_trash_refuses_another_filesystem(scratch: Path) -> None:
-    volume = scratch / "volume"
-    if not shutil.which("btrfs") or subprocess.run(
-            ["btrfs", "subvolume", "create", str(volume)], capture_output=True).returncode:
-        pytest.skip("needs an unprivileged btrfs subvolume")
-    try:
-        (volume / "f").write_text("x")
-        assert run_trash(str(volume / "f")) == (1, {})
-        assert (volume / "f").exists()
-    finally:
-        (volume / "f").unlink(missing_ok=True)
-        volume.rmdir()
+def test_trash_refuses_what_is_already_in_the_trash(home: Path) -> None:
+    project = home / "worktrees" / "project"
+    (project / "f").write_text("x")
+    assert run_trash(home, str(project / "f")).returncode == 0
+    proc = run_trash(home, str(home / "worktrees" / ".trash" / "files" / "f"))
+    assert proc.returncode == 1
+    assert (home / "worktrees" / ".trash" / "files" / "f").exists()
 
 
-def project(root: Path) -> Path:
-    repo = root / "repo"
-    for rel in (".git/hooks/pre-commit", ".git/config", ".git/objects/ab/cd",
-                ".claude/settings.json", ".claude/hooks/guard.sh", ".claude/notes.md",
-                ".mcp.json", "sub/ordinary.txt", "nested/deep/.zshrc"):
-        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
-        (repo / rel).write_text("x")
-    (root / "wt").mkdir()
-    (root / "wt" / ".git").write_text(f"gitdir: {repo}/.git\n")
-    (root / "to-claude").symlink_to(repo / ".claude")
-    (root / "linked").mkdir()
-    (root / "linked" / ".claude").symlink_to(repo / ".claude")
-    (root / "stand-in" / ".claude").mkdir(parents=True)
-    return repo
-
-
-@pytest.mark.parametrize("rel", [
-    "repo", "repo/.git", "repo/.git/hooks", "repo/.git/hooks/pre-commit", "repo/.git/config",
-    "repo/.git/objects/ab", "wt", "wt/.git", "repo/.claude", "repo/.claude/settings.json",
-    "repo/.claude/hooks", "repo/.claude/hooks/guard.sh", "repo/.mcp.json", "repo/nested",
-    "repo/nested/deep/.zshrc", "to-claude/settings.json", "to-claude/hooks/guard.sh",
-    "linked/.claude", "linked", "stand-in/.claude", "stand-in", "repo/.claude/notes.md",
-])
-def test_trash_refuses_what_the_sandbox_protects(scratch: Path, rel: str) -> None:
-    project(scratch)
-    assert run_trash(str(scratch / rel)) == (1, {}), rel
-    assert (scratch / rel).exists()
-
-
-@pytest.mark.parametrize("rel", ["repo/sub", "repo/sub/ordinary.txt", "to-claude"])
-def test_trash_still_takes_ordinary_project_content(scratch: Path, rel: str) -> None:
-    project(scratch)
-    rc, moved = run_trash(str(scratch / rel))
-    assert (rc, sorted(moved)) == (0, [f"{scratch}/{rel}"])
-    assert not os.path.lexists(scratch / rel)
-
-
-@pytest.mark.parametrize("rel", ["guard", "guard/f", "tree", "tree/sub"])
-def test_trash_refuses_a_confined_guard_whatever_its_name(scratch: Path, rel: str) -> None:
-    (scratch / "guard").mkdir()
-    (scratch / "guard" / "f").write_text("x")
-    (scratch / "tree" / "sub" / "f").parent.mkdir(parents=True)
-    (scratch / "tree" / "sub" / "f").write_text("x")
-    for marked in ("guard", "guard/f", "tree/sub/f"):
-        os.setxattr(scratch / marked, "user.confined-stub", b"1")
-    rc, moved = run_trash(str(scratch / rel))
-    assert (rc, moved) == (1, {}), rel
-    assert (scratch / rel).exists()
-
-
-def walking(pid: int, root: Path, inside: bool = False) -> bool:
-    try:
-        fds = list(Path(f"/proc/{pid}/fd").iterdir())
-    except OSError:
-        return False
-    for fd in fds:
-        try:
-            target = os.readlink(fd)
-        except OSError:
-            continue
-        if (target == str(root) and not inside) or target.startswith(f"{root}/"):
-            return True
-    return False
-
-
-def await_walk(proc: subprocess.Popen, root: Path, inside: bool = False) -> None:
-    deadline = time.monotonic() + 30
-    while (proc.poll() is None and not walking(proc.pid, root, inside)
-           and time.monotonic() < deadline):
-        pass
-
-
-def populate(tree: Path) -> None:
-    for i in range(200):
-        (tree / str(i)).mkdir(parents=True)
-        for j in range(100):
-            (tree / str(i) / str(j)).touch()
-
-
-@pytest.mark.parametrize("victim", ["outside_home_ssh", "other_project"])
-def test_trash_moves_only_what_it_checked_despite_a_parent_swap(
-        tmp_path: Path, scratch: Path, victim: str) -> None:
-    decoy_home = tmp_path / "decoy-home"
-    (decoy_home / ".ssh").mkdir(parents=True)
-    (decoy_home / ".ssh" / "id_decoy").write_text("decoy")
-    decoy_project = scratch / "decoy-project"
-    (decoy_project / "src").mkdir(parents=True)
-    (decoy_project / "src" / "main.py").write_text("decoy")
-    swap_to, name = {"outside_home_ssh": (decoy_home, ".ssh"),
-                     "other_project": (decoy_project, "src")}[victim]
-    parent = scratch / "a"
-    tree = parent / name
-    populate(tree)
-
-    proc = subprocess.Popen([sys.executable, "-I", str(TRASH), str(tree)],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    try:
-        await_walk(proc, tree)
-        swapped_mid_run = proc.poll() is None
-        parent.rename(scratch / "a.real")
-        parent.symlink_to(swap_to)
-        _, err = proc.communicate(timeout=60)
-    finally:
-        if parent.is_symlink():
-            parent.unlink()
-    assert swapped_mid_run
-    assert (swap_to / name).is_dir(), err
-    assert list((swap_to / name).iterdir()), err
-    assert not (scratch / "a.real" / name).exists(), err
-
-
-@pytest.mark.parametrize("rel", [".git/config", ".claude/settings.json"])
-def test_trash_takes_nothing_protected_moved_in_after_its_check(
-        tmp_path: Path, scratch: Path, rel: str) -> None:
-    layout, gate = tmp_path / "layout", tmp_path / "gate"
-    (layout / "scripts").mkdir(parents=True)
-    gate.mkdir()
-    shutil.copy2(SCRIPTS.parent / "settings.json", layout / "settings.json")
-    source = TRASH.read_text()
-    moving = "    unique = reserve(info_fd, files_fd, target)\n"
-    assert source.count(moving) == 1
-    script = layout / "scripts" / "trash"
-    script.write_text(source.replace(moving, (
-        f"    open({str(gate / 'ready')!r}, 'w').close()\n"
-        f"    while not os.path.exists({str(gate / 'go')!r}): time.sleep(0.01)\n") + moving))
-    checked = scratch / "a"
-    checked.mkdir()
-    victim = scratch / "victim"
-    (victim / rel).parent.mkdir(parents=True)
-    (victim / rel).write_text("decoy")
-
-    before = trash_names()
-    proc = subprocess.Popen([sys.executable, "-I", str(script), str(checked)],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    deadline = time.monotonic() + 30
-    while not (gate / "ready").exists():
-        assert proc.poll() is None and time.monotonic() < deadline
-        time.sleep(0.01)
-    victim.rename(checked / "victim")
-    (gate / "go").touch()
-    _, err = proc.communicate(timeout=30)
-    assert trashed_since(before) == [], err
-    assert (checked / "victim" / rel).exists(), err
-    assert proc.returncode == 1, err
-
-
-@pytest.mark.parametrize("rel", [".git/config", ".claude/settings.json"])
-def test_trash_puts_back_a_tree_that_gained_something_protected_during_its_walk(
-        scratch: Path, rel: str) -> None:
-    big = scratch / "big"
-    populate(big)
-    victim = scratch / "victim"
-    (victim / rel).parent.mkdir(parents=True)
-    (victim / rel).write_text("decoy")
-
-    before = trash_names()
-    proc = subprocess.Popen([sys.executable, "-I", str(TRASH), str(big)],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    await_walk(proc, big, inside=True)
-    moved_mid_run = proc.poll() is None
-    victim.rename(big / "victim")
-    _, err = proc.communicate(timeout=60)
-    assert moved_mid_run
-    assert trashed_since(before) == [], err
-    assert (big / "victim" / rel).exists(), err
-    assert proc.returncode == 1, err
-
-
-@pytest.mark.parametrize("occupied", [True, False])
-def test_trash_put_back_onto_a_recreated_directory_leaves_no_entry(
-        tmp_path: Path, scratch: Path, occupied: bool) -> None:
-    layout = tmp_path / "layout"
-    (layout / "scripts").mkdir(parents=True)
-    shutil.copy2(SCRIPTS.parent / "settings.json", layout / "settings.json")
-    gate = tmp_path / "gate"
-    gate.mkdir()
-
-    def pause(step: str) -> str:
-        return (f"open({str(gate / step)!r} + '.ready', 'w').close()\n"
-                f"    while not os.path.exists({str(gate / step)!r} + '.go'): time.sleep(0.01)\n    ")
-
-    source = TRASH.read_text()
-    first = "    unique = reserve(info_fd, files_fd, target)\n"
-    second = "    moved = os.stat(unique, dir_fd=files_fd, follow_symlinks=False)\n"
-    assert source.count(first) == source.count(second) == 1
-    source = source.replace(first, "    " + pause("swap") + first.lstrip())
-    source = source.replace(second, "    " + pause("recreate") + second.lstrip())
-    script = layout / "scripts" / "trash"
-    script.write_text(source)
-
-    def await_step(step: str) -> None:
-        deadline = time.monotonic() + 30
-        while not (gate / f"{step}.ready").exists() and proc.poll() is None:
-            assert time.monotonic() < deadline
-            time.sleep(0.01)
-        assert proc.poll() is None
-
-    target = scratch / "a"
-    target.mkdir()
-    before = trash_names()
-    proc = subprocess.Popen([sys.executable, "-I", str(script), str(target)],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    await_step("swap")
-    target.rename(scratch / "a.checked")
-    target.mkdir()
-    (gate / "swap.go").touch()
-    await_step("recreate")
-    target.mkdir()
-    if occupied:
-        (target / "occupant").write_text("x")
-    recreated = target.stat().st_ino
-    (gate / "recreate.go").touch()
-    _, err = proc.communicate(timeout=30)
-    assert trashed_since(before) == [], err
-    assert "Traceback" not in err, err
-    assert proc.returncode == 1, err
-    assert target.stat().st_ino == recreated, err
-    assert len(list(scratch.glob("a.restored-*"))) == 1, err
-
-
-def test_trash_honours_the_profile_deny_write(tmp_path: Path, scratch: Path) -> None:
-    layout = tmp_path / "layout"
-    (layout / "scripts").mkdir(parents=True)
-    script = layout / "scripts" / "trash"
-    shutil.copy2(TRASH, script)
-    held = scratch / "outer" / "held"
-    (held / "inner").mkdir(parents=True)
-    (scratch / "outer" / "free").write_text("x")
-    (scratch / "tilde").write_text("x")
-    tilde = f"~/{scratch.relative_to(REAL_HOME)}/tilde"
-    (layout / "settings.json").write_text(json.dumps(
-        {"sandbox": {"filesystem": {"denyWrite": [str(held), tilde]}}}))
-    for target in (held, held / "inner", scratch / "outer", scratch / "tilde"):
-        assert run_trash(str(target), script=script) == (1, {}), target
-    rc, moved = run_trash(str(scratch / "outer" / "free"), script=script)
-    assert (rc, sorted(moved)) == (0, [f"{scratch}/outer/free"])
-
-
-def test_trash_moves_nothing_the_profile_hides_from_reading(tmp_path: Path,
-                                                            scratch: Path) -> None:
-    # In the trash a hidden file would be under no rule, so readable.
-    layout = tmp_path / "layout"
-    (layout / "scripts").mkdir(parents=True)
-    script = layout / "scripts" / "trash"
-    shutil.copy2(TRASH, script)
-    for rel in ("held/inner/f", "proj/.env.local", "proj/free", "a/b/vault/f", "c/vault"):
-        (scratch / rel).parent.mkdir(parents=True, exist_ok=True)
-        (scratch / rel).write_text("x")
-    (layout / "settings.json").write_text(json.dumps({
-        "sandbox": {"filesystem": {"denyRead": [str(scratch / "held")]}},
-        "permissions": {"deny": [  # arftl-allow: permission-widened
-            f"Read(/{scratch}/proj/.env.*)", "Read(//**/vault/**)", "Bash(rm *)"]},
-    }))
-    for rel in ("held", "held/inner", "held/inner/f", "proj", "proj/.env.local", "a",
-                "a/b/vault", "a/b/vault/f", "c/vault"):
-        assert run_trash(str(scratch / rel), script=script) == (1, {}), rel
-    rc, moved = run_trash(str(scratch / "proj" / "free"), script=script)
-    assert (rc, sorted(moved)) == (0, [f"{scratch}/proj/free"])
-
-
-def run_trash_in_session(project: Path, *args: str) -> tuple[int, dict[str, str]]:
-    """As called from a Claude Code session started in project: the nearest
-    ancestor whose executable lies under a claude directory."""
-    launcher = project.parent / "claude" / "versions" / "launcher"
-    if not launcher.exists():
-        launcher.parent.mkdir(parents=True)
-        shutil.copy2(shutil.which("bash"), launcher)
-    before = trash_names()
-    call = " ".join(map(shlex.quote, [sys.executable, "-I", str(TRASH), *args]))
-    proc = subprocess.run([str(launcher), "-c", f"{call}; exit $?"], cwd=project,
-                          capture_output=True, text=True, check=False)
-    return proc.returncode, dict(trashed_since(before))
-
-
-def test_trash_moves_nothing_the_session_projects_settings_deny(scratch: Path) -> None:
-    proj = scratch / "proj"
-    (proj / ".claude").mkdir(parents=True)
-    (proj / ".claude" / "settings.json").write_text(json.dumps({
-        "permissions": {"deny": ["Read(./dot/**)", "Read(bare/**)",  # arftl-allow: permission-widened
-                                 "Read(/slash/**)"]},
-        "sandbox": {"filesystem": {"denyRead": ["./fsdeny"], "denyWrite": ["./fswrite"]}}}))
-    (proj / ".claude" / "settings.local.json").write_text(json.dumps(
-        {"permissions": {"deny": ["Read(./local/**)"]}}))  # arftl-allow: permission-widened
-    for name in ("dot", "bare", "slash", "fsdeny", "fswrite", "local", "free"):
-        (proj / name).mkdir()
-        (proj / name / "f").write_text("x")
-    for name in ("dot", "bare", "slash", "fsdeny", "fswrite", "local", "local/f"):
-        assert run_trash_in_session(proj, str(proj / name)) == (1, {}), name
-    rc, moved = run_trash_in_session(proj, str(proj / "free"))
-    assert (rc, sorted(moved)) == (0, [f"{proj}/free"])
-
-
-@pytest.mark.parametrize("settings, status", [("{not json", 3), (None, 0)])
-def test_trash_fails_closed_on_session_project_settings_it_cannot_read(
-        scratch: Path, settings: str | None, status: int) -> None:
-    proj = scratch / "proj"
-    (proj / ".claude").mkdir(parents=True)
-    entry = proj / ".claude" / "settings.local.json"
-    if settings is None:
-        entry.mkdir()
-        os.setxattr(entry, "user.confined-stub", b"1")
-    else:
-        entry.write_text(settings)
-    (proj / "free").write_text("x")
-    rc, moved = run_trash_in_session(proj, str(proj / "free"))
-    assert (rc, sorted(moved)) == (status, [f"{proj}/free"] if status == 0 else [])
+def test_trash_empties_entries_older_than_thirty_days(home: Path) -> None:
+    trash = home / "Repos" / ".trash"
+    (trash / "files" / "old-dir").mkdir(parents=True)
+    (trash / "files" / "old-dir" / "x").write_text("x")
+    (trash / "files" / "recent").write_text("x")
+    (trash / "info").mkdir()
+    for name, days in (("old-dir", 31), ("recent", 29)):
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - days * 86400))
+        (trash / "info" / f"{name}.trashinfo").write_text(
+            f"[Trash Info]\nPath=/x/{name}\nDeletionDate={stamp}\n")
+    (home / "worktrees" / "project" / "f").write_text("x")
+    assert run_trash(home, str(home / "worktrees" / "project" / "f")).returncode == 0
+    assert sorted(os.listdir(trash / "files")) == ["recent"]
+    assert sorted(os.listdir(trash / "info")) == ["recent.trashinfo"]
