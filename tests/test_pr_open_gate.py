@@ -587,6 +587,47 @@ def test_wide_text_or_any_behaviour_file_still_needs_its_read(sb, rel, data):
     assert "Listed, not refused" not in reason(out)
 
 
+def test_binary_probing_does_not_scale_git_calls_with_binary_count(sb, tmp_path):
+    # Break: a git process (or three) per binary per reviewed tree; 800
+    # rebuilt binaries measured 10.3 s against the hook's 10 s timeout.
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    for i in range(300):
+        p = sb.work / "build" / f"o{i}.bin"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(FIRMWARE + bytes([i % 256]))
+        junk = sb.work / "junk" / f"j{i}.o"                   # untracked, outside the PR
+        junk.parent.mkdir(parents=True, exist_ok=True)
+        junk.write_bytes(FIRMWARE + bytes([i % 256]))
+    git(sb.work, "add", "build")
+    git(sb.work, "commit", "-qm", "build")
+    sb.review("PASS", reads=["scripts/run.sh"])
+    for i in range(300):
+        (sb.work / "build" / f"o{i}.bin").write_bytes(FIRMWARE * 2 + bytes([i % 256]))
+    git(sb.work, "add", "build")
+    git(sb.work, "commit", "-qm", "rebuild")
+    shim, calls = tmp_path / "shim", tmp_path / "git-calls"
+    shim.mkdir()
+    real = subprocess.run(["sh", "-c", "command -v git"], capture_output=True,
+                          text=True, check=True).stdout.strip()
+    (shim / "git").write_text(f'#!/bin/sh\necho x >> "{calls}"\nexec "{real}" "$@"\n')
+    (shim / "git").chmod(0o755)
+    path = os.environ["PATH"]
+    sb.env = lambda: {**Sandbox.env(sb), "PATH": f"{shim}:{path}"}
+    out = sb.gate()
+    assert not is_deny(out) and "300 file(s)" in out["systemMessage"]
+    assert len(calls.read_text().splitlines()) < 60
+
+
+def test_blob_heads_streams_past_large_blobs(sb):
+    # Break: the rest of a blob left in the pipe, so the next header is misread.
+    big, small = FIRMWARE * 20 + b"tail", b"\0small"          # big spans many reads
+    commit_bytes(sb, "build/big.bin", big)
+    commit_bytes(sb, "build/small.bin", small)
+    oids = [git(sb.work, "rev-parse", f"HEAD:build/{n}") for n in ("big.bin", "small.bin")]
+    heads = artl_gate.blob_heads(str(sb.work), oids)
+    assert heads == {oids[0]: big[:artl_gate.GIT_BINARY_PROBE], oids[1]: small}
+
+
 def test_reading_a_tracked_symlink_covers_the_link_and_its_target(tmp_path):
     write(tmp_path / "shared" / "check.sh", "echo ok\n")
     (tmp_path / "control").mkdir()

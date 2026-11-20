@@ -81,9 +81,9 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
-from typing import Literal
 
 GIT_TIMEOUT_S = 5
 LS_REMOTE_TIMEOUT_S = 6
@@ -278,35 +278,80 @@ def binary_head(head: bytes) -> bool:
     return b"\0" in head and not wide_text(head)
 
 
-def blob_kind(top: str, rev: str, path: str) -> Literal["binary", "text", "absent"]:
-    """PATH at REV by content (binary_head). Attributes are not consulted --
-    `.git/info/attributes` and core.attributesFile can mark any text binary
-    from outside the diff a reviewer sees. A git failure reads as text, which
-    still needs a Read."""
-    try:
-        proc = subprocess.run(["git", "-C", str(top), "cat-file", "blob", f"{rev}:{path}"],
-                              capture_output=True, timeout=GIT_TIMEOUT_S)
-    except (OSError, subprocess.SubprocessError):
-        return "text"
-    if proc.returncode == 0:
-        return "binary" if binary_head(proc.stdout) else "text"
-    return "absent" if git(top, "ls-tree", "--name-only", rev, "--", path) == "" else "text"
+def blob_heads(top: str, oids: list[str]) -> dict[str, bytes] | None:
+    """{oid: its first GIT_BINARY_PROBE bytes} for every blob, from ONE
+    `git cat-file --batch` read as a stream, so a large blob costs pipe time,
+    not memory. None when git fails, names a non-blob, or outlives
+    GIT_TIMEOUT_S."""
+    if not oids:
+        return {}
+    heads: dict[str, bytes] = {}
+    with tempfile.TemporaryFile() as request:
+        request.write("".join(f"{oid}\n" for oid in oids).encode())
+        request.seek(0)
+        try:
+            proc = subprocess.Popen(["git", "-C", str(top), "cat-file", "--batch"],
+                                    stdin=request, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL)
+        except OSError:
+            return None
+        timer = threading.Timer(GIT_TIMEOUT_S, proc.kill)
+        timer.start()
+        try:
+            for oid in oids:
+                header = proc.stdout.readline().split()
+                if len(header) != 3 or header[0] != oid.encode() or header[1] != b"blob":
+                    return None
+                left, head = int(header[2]), b""
+                while left:
+                    chunk = proc.stdout.read(min(left, 1 << 16))
+                    if not chunk:
+                        return None
+                    head += chunk[:max(0, GIT_BINARY_PROBE - len(head))]
+                    left -= len(chunk)
+                if proc.stdout.read(1) != b"\n":
+                    return None
+                heads[oid] = head
+        except (OSError, ValueError):
+            return None
+        finally:
+            timer.cancel()
+            proc.kill()
+            proc.stdout.close()
+            proc.wait()
+    return heads
 
 
-def binary_paths(top: str, a: str, b: str, rows: list[tuple[str, int | None]]) -> set[str]:
-    """Paths git diffs as binary (numstat `-`) whose content is binary at every
-    side that has them, outside every behaviour path. A file that is text on
-    one side is not binary: making a reviewed file binary must not take its
-    changes out of the review. Under a behaviour path (is_behaviour) even a
-    real binary is something the harness runs or reads, so it needs its Read."""
-    out = set()
-    for path, lines in rows:
-        if lines is not None or is_behaviour(path):
+def binary_paths(top: str, a: str, b: str, rows: list[tuple[str, int | None]],
+                 within: set[str] | None = None) -> set[str]:
+    """Paths git diffs as binary (numstat `-`) whose content is binary
+    (binary_head) at every side that has them, outside every behaviour path.
+    Attributes are not consulted -- `.git/info/attributes` and
+    core.attributesFile can mark any text binary from outside the diff a
+    reviewer sees. A file that is text on one side is not binary: making a
+    reviewed file binary must not take its changes out of the review. Under a
+    behaviour path (is_behaviour) even a real binary is something the harness
+    runs or reads, so it needs its Read. Only paths in `within` (default: all)
+    are probed, in two git calls whatever their number; a git failure spares
+    nothing."""
+    wanted = {p for p, n in rows
+              if n is None and not is_behaviour(p) and (within is None or p in within)}
+    if not wanted:
+        return set()
+    raw = git(top, "diff", "--raw", "-z", "--no-renames", "--no-abbrev", a, b)
+    if raw is None:
+        return set()
+    sides: dict[str, list[str]] = {}
+    fields = raw.split("\0")
+    for meta, path in zip(fields[0::2], fields[1::2]):
+        parts = meta.lstrip(":").split()
+        if path not in wanted or len(parts) != 5 or "160000" in parts[:2]:
             continue
-        kinds = {blob_kind(top, rev, path) for rev in (a, b)} - {"absent"}
-        if kinds == {"binary"}:
-            out.add(path)
-    return out
+        sides[path] = [oid for mode, oid in zip(parts[:2], parts[2:4]) if mode != "000000"]
+    heads = blob_heads(top, sorted({oid for oids in sides.values() for oid in oids}))
+    if heads is None:
+        return set()
+    return {p for p, oids in sides.items() if oids and all(binary_head(heads[o]) for o in oids)}
 
 
 def snapshot_tree(top: str, untracked: bool = True) -> str | None:
@@ -1110,11 +1155,13 @@ def computed_exemption(changes: list[tuple[str, int | None]]) -> str | None:
     return None
 
 
-def tree_rows(top: str, tree: object, tip: str, cache: dict) -> dict[str, int] | None:
+def tree_rows(top: str, tree: object, tip: str, cache: dict,
+              pr_paths: set[str]) -> dict[str, int] | None:
     """{path: text lines changed} from a reviewed tree to the tip; None if
-    unknown. A binary-to-binary change is 0 lines: no review read it, so it
-    cannot have gone stale. Any other change git will not count is over the
-    limit."""
+    unknown. A binary-to-binary change on a PR path is 0 lines: no review read
+    it, so it cannot have gone stale. Any other change git will not count is
+    over the limit; off the PR's paths nothing reads the count, so nothing is
+    probed there. One `cache` per pr_paths."""
     if not isinstance(tree, str) or not SHA_RE.fullmatch(tree):
         return None
     if tree not in cache:
@@ -1122,7 +1169,7 @@ def tree_rows(top: str, tree: object, tip: str, cache: dict) -> dict[str, int] |
         if rows is None:
             cache[tree] = None
         else:
-            binary = binary_paths(top, tree, tip, rows)
+            binary = binary_paths(top, tree, tip, rows, within=pr_paths)
             cache[tree] = {p: 0 if p in binary else (DRIFT_LIMIT + 1 if n is None else n)
                            for p, n in rows}
     return cache[tree]
@@ -1134,7 +1181,7 @@ def drift(top: str, tree: object, tip: str, cache: dict, pr_paths: set[str]) -> 
     merge base, so a difference there is untracked build junk the snapshot
     picked up (measured: __pycache__/*.pyc) or reviewed work since reverted --
     neither is unreviewed code in the PR."""
-    rows = tree_rows(top, tree, tip, cache)
+    rows = tree_rows(top, tree, tip, cache, pr_paths)
     return None if rows is None else sum(n for p, n in rows.items() if p in pr_paths)
 
 
@@ -1188,7 +1235,7 @@ def evidence_problem(records: list[dict], info: dict, branch: str, tip: str,
         elif last.get("verdict") not in PASSING:
             blocked.append(path)
         else:
-            rows = tree_rows(info["top"], last.get("tree"), tip, cache)
+            rows = tree_rows(info["top"], last.get("tree"), tip, cache, pr_paths)
             if rows is None or rows.get(path, 0) > DRIFT_LIMIT:
                 changed.append(path)
     problems = []
