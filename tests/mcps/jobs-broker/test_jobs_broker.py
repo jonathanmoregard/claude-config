@@ -200,11 +200,16 @@ class SrtPolicyTests(Home):
         self.assertEqual(self.policy()["filesystem"]["denyRead"],
                          SANDBOX["filesystem"]["denyRead"])
 
-    def test_writes_reach_only_the_repo_job_caches_and_for_nix_its_cache(self) -> None:
+    def test_writes_reach_only_the_repo_and_job_caches_in_every_profile(self) -> None:
         caches = [str(p) for p in self.server.job_caches(self.home).values()]
-        self.assertEqual(self.policy()["filesystem"]["allowWrite"], [str(self.repo), *caches])
-        self.assertEqual(self.policy(profile="nix")["filesystem"]["allowWrite"],
-                         [str(self.repo), *caches, str(self.home / ".cache/nix")])
+        for profile in self.server.PROFILES:
+            with self.subTest(profile=profile):
+                self.assertEqual(self.policy(profile=profile)["filesystem"]["allowWrite"],
+                                 [str(self.repo), *caches])
+
+    def test_job_caches_include_an_xdg_cache_home_of_their_own(self) -> None:
+        caches = self.server.job_caches(self.home)
+        self.assertEqual(caches["XDG_CACHE_HOME"].parent, self.home / ".cache/claude-jobs")
 
     def test_job_caches_are_never_the_hosts_or_the_sessions(self) -> None:
         fs = {**SANDBOX["filesystem"], "allowWrite": [*SANDBOX["filesystem"]["allowWrite"],
@@ -215,12 +220,6 @@ class SrtPolicyTests(Home):
             with self.subTest(cache=cache):
                 self.assertFalse([s for s in session if s == cache or s in cache.parents])
                 self.assertFalse([s for s in session if cache in s.parents])
-
-    def test_nix_cache_is_writable_only_where_the_session_may_write_it(self) -> None:
-        fs = {**SANDBOX["filesystem"], "allowWrite": ["~/Repos"]}
-        self.write_settings({"sandbox": {**SANDBOX, "filesystem": fs}})
-        self.assertNotIn(str(self.home / ".cache/nix"),
-                         self.policy(profile="nix")["filesystem"]["allowWrite"])
 
     def test_project_claude_config_and_every_git_dir_are_write_denied(self) -> None:
         nested = self.make_git_dir(self.repo / "vendor" / "inner" / ".git")
@@ -280,6 +279,18 @@ class SrtPolicyTests(Home):
         self.assertNotIn(str(self.repo / "b/keep"), deny)
         self.assertFalse([p for p in deny if any(c in p for c in "*?[")], deny)
 
+    def test_read_deny_globs_srt_cannot_walk_are_denied_where_they_match_in_the_repo(self) -> None:
+        (self.repo / "a/held").mkdir(parents=True)
+        (self.repo / "a/keep").mkdir(parents=True)
+        deny = self.with_deny("Read(//**/held/**)", "Read(//**/.git/**)")["filesystem"]["denyRead"]
+        self.assertIn(str(self.repo / "a/held"), deny)
+        self.assertNotIn(str(self.repo / "a/keep"), deny)
+        self.assertFalse([p for p in deny if p.startswith(f"{self.repo}/.git")], deny)
+
+    def test_read_deny_globs_srt_drops_are_named_not_silently_passed(self) -> None:
+        self.write_settings({"sandbox": SANDBOX, **deny_rules(["Read(//**/.git/**)", "Read(**/*.pem)"])})
+        self.assertEqual(self.job().unenforced, ["/**/.git/**"])
+
     def test_managed_settings_denies_are_merged(self) -> None:
         managed = self.home / "managed-settings.json"
         self.write_settings({**deny_rules(["Read(//srv/managed)"]),
@@ -288,6 +299,42 @@ class SrtPolicyTests(Home):
         fs = self.policy()["filesystem"]
         self.assertIn("/srv/managed", fs["denyRead"])
         self.assertIn("/srv/mw", fs["denyWrite"])
+
+    def test_project_deny_rules_are_merged_and_project_allows_never_widen(self) -> None:
+        (self.repo / ".claude").mkdir()
+        self.write_settings({"permissions": {
+            "deny": ["Read(./reports/held/**)", "Edit(build/locked)", "Read(/abs-looking)"],
+            "allow": ["Edit(//srv/widened/**)"]},
+            "sandbox": {"filesystem": {"allowWrite": ["/srv/widened"], "denyRead": ["/srv/pd"]},
+                        "network": {"allowedDomains": ["evil.example"]}}},
+            self.repo / ".claude/settings.local.json")
+        self.write_settings(deny_rules(["Read(//srv/shared)"]), self.repo / ".claude/settings.json")
+        policy = self.policy()
+        fs = policy["filesystem"]
+        for path in (f"{self.repo}/reports/held", "/srv/shared", "/srv/pd",
+                     f"{self.repo}/abs-looking", f"{self.repo}/.claude/abs-looking"):
+            with self.subTest(path=path):
+                self.assertIn(path, [p.removesuffix("/**") for p in fs["denyRead"]])
+        self.assertIn(f"{self.repo}/build/locked", fs["denyWrite"])
+        self.assertNotIn("/srv/widened", fs["allowWrite"])
+        self.assertNotIn("evil.example", policy["network"]["allowedDomains"])
+
+    def test_unreadable_project_settings_refuse_to_start(self) -> None:
+        (self.repo / ".claude").mkdir()
+        (self.repo / ".claude/settings.local.json").write_text("{not json")
+        with self.assertRaisesRegex(RuntimeError, "settings.local.json"):
+            self.job()
+
+    def test_deny_write_globs_match_as_gitignore_does(self) -> None:
+        (self.repo / "docs").mkdir()
+        for name in ("v1.txt", "va.txt", "Notes.md", "notes.md"):
+            (self.repo / "docs" / name).write_text("")
+        deny = self.with_deny("Edit(**/v[[:digit:]].txt)", "Edit(docs/[[:upper:]]*.md)"
+                              )["filesystem"]["denyWrite"]
+        self.assertIn(str(self.repo / "docs/v1.txt"), deny)
+        self.assertIn(str(self.repo / "docs/Notes.md"), deny)
+        self.assertNotIn(str(self.repo / "docs/va.txt"), deny)
+        self.assertNotIn(str(self.repo / "docs/notes.md"), deny)
 
     def test_untranslatable_settings_refuse_to_start(self) -> None:
         cases = {"bare Read": ["Read"], "empty Edit": ["Edit()"], "escape": ["Read(a\\*b)"],
@@ -351,9 +398,9 @@ class PropertyTests(Home):
         self.assertEqual(values(props, "WorkingDirectory"), [str(self.repo)])
         self.assertNotIn("Slice=ram-heavy.slice", props)
 
-    def test_nix_profile_adds_store_cache_and_heavy_slice(self) -> None:
+    def test_nix_profile_adds_the_heavy_slice_and_no_host_cache(self) -> None:
         props = self.props("nix")
-        self.assertIn(f"{self.home}/.cache/nix", values(props, "BindPaths"))
+        self.assertEqual(values(props, "BindPaths"), values(self.props("repo"), "BindPaths"))
         self.assertIn(f"-{self.home}/.nix-memory-pressure", values(props, "BindReadOnlyPaths"))
         self.assertIn("Slice=ram-heavy.slice", props)
         self.assertIn("OOMPolicy=kill", props)
@@ -399,8 +446,10 @@ class PropertyTests(Home):
         from unittest import mock
         started = []
         self.server._show = lambda unit: {"LoadState": "not-found"}
+        real_run = subprocess.run
         with mock.patch.object(self.server.subprocess, "run", lambda argv, **kw: (
-                started.append(argv) or subprocess.CompletedProcess(argv, 0, "", ""))):
+                started.append(argv) or subprocess.CompletedProcess(argv, 0, "", "")
+                if argv[0] == "systemd-run" else real_run(argv, **kw))):
             self.server.tool_start(self.start_args(), self.home)
         job = self.job()
         written = self.server.policy_path(self.home, job.unit)
@@ -438,6 +487,32 @@ class SweepTests(Home):
         self.assertTrue((self.repo / ".git").is_dir())
         for path in kept:
             self.assertTrue(path.exists(), path)
+
+    def test_names_created_where_the_job_could_not_write_are_left_in_place(self) -> None:
+        job = self.job()
+        self.server.write_baseline(job, self.home)
+        owner_made = [".claude/settings.local.json", ".envrc", ".git/modules/x/config"]
+        for rel in owner_made:
+            (self.repo / rel).parent.mkdir(parents=True, exist_ok=True)
+            (self.repo / rel).write_text("owner\n")
+        self.assertEqual(self.server.sweep(job.unit, self.home), [])
+        for rel in owner_made:
+            with self.subTest(rel=rel):
+                self.assertEqual((self.repo / rel).read_text(), "owner\n")
+
+    def test_moved_files_stay_readable_and_restorable(self) -> None:
+        job = self.job()
+        self.server.write_baseline(job, self.home)
+        (self.repo / "deep/.claude").mkdir(parents=True)
+        (self.repo / "deep/.claude/settings.json").write_text("planted\n")
+        self.assertEqual(self.server.sweep(job.unit, self.home), ["deep/.claude"])
+        [held] = (self.home / self.server.HELD).glob(f"{job.unit}.*")
+        self.assertNotIn("quarantine", str(held))
+        self.assertEqual((held / "deep/.claude/settings.json").read_text(), "planted\n")
+        restore = self.server.restore_hint(job.unit, self.home)
+        self.assertIn(str(held), restore)
+        subprocess.run(["sh", "-c", restore.split("restore: ", 1)[1]], check=True)
+        self.assertEqual((self.repo / "deep/.claude/settings.json").read_text(), "planted\n")
 
     def test_a_missing_baseline_moves_nothing(self) -> None:
         job = self.job()
@@ -606,12 +681,12 @@ class RealUnitTests(unittest.TestCase):
                          *state.glob(f"{self.unit}.*"),
                          self.home / ".local/state/claude-unit-failures" / f"{self.unit}.json"):
             leftover.unlink(missing_ok=True)
-        for held in (state / "quarantine").glob(f"{self.unit}.*"):
+        for held in (self.home / self.server.HELD).glob(f"{self.unit}.*"):
             shutil.rmtree(held)
         shutil.rmtree(self.dir)
 
     def held(self) -> list:
-        root = self.home / ".local/state/claude-jobs/quarantine"
+        root = self.home / self.server.HELD
         return sorted(str(p.relative_to(d)) for d in root.glob(f"{self.unit}.*")
                       for p in d.rglob("*") if p.is_file())
 
@@ -713,6 +788,50 @@ class RealUnitTests(unittest.TestCase):
         self.assertEqual((self.repo / "sub/y").read_text(), "kept\n")
         self.assertFalse((self.repo / "sub/held/x").exists(), out)
 
+    def test_job_cannot_read_what_a_read_deny_glob_names(self) -> None:
+        (self.repo / ".env.local").write_text("CANARY-GLOB-DENIED\n")
+        (self.repo / "env.txt").write_text("CANARY-NOT-DENIED\n")
+        self.use_settings(deny=(f"Read(/{self.repo}/.env.*)",))
+        out = self.run_job("cat .env.local; cat env.txt; exit 0")
+        self.assertIn("MARKER_OK", out)
+        self.assertIn("CANARY-NOT-DENIED", out)
+        self.assertNotIn("CANARY-GLOB-DENIED", out)
+
+    def test_root_anchored_read_deny_globs_hold_in_the_repo_and_git_still_reads(self) -> None:
+        (self.repo / "sub/held").mkdir(parents=True)
+        (self.repo / "sub/held/f").write_text("CANARY-ROOT-GLOB\n")
+        self.git("commit", "-q", "--allow-empty", "-m", "init", cwd=self.repo)
+        self.use_settings(deny=("Read(//**/held/**)", "Read(//**/.git/**)"))
+        out = self.run_job("cat sub/held/f; git log --format=LOGGED-%s; exit 0")
+        self.assertIn("MARKER_OK", out)
+        self.assertIn("LOGGED-init", out)
+        self.assertNotIn("CANARY-ROOT-GLOB", out)
+
+    def test_nix_profile_job_cannot_write_the_hosts_nix_cache(self) -> None:
+        canary = self.home / ".cache/nix" / f"jobs-broker-test-{uuid.uuid4().hex[:8]}"
+        try:
+            self.server.tool_start({"repo": str(self.repo), "slug": self.slug, "profile": "nix",
+                                    "argv": ["sh", "-c", f"echo planted > {canary}; exit 0"]},
+                                   self.home)
+            self.assertIn("result=success", self.status())
+            self.assertFalse(canary.exists())
+        finally:
+            canary.unlink(missing_ok=True)
+
+    def test_files_the_owner_creates_mid_job_where_the_job_cannot_write_stay(self) -> None:
+        self.git("commit", "-q", "--allow-empty", "-m", "init", cwd=self.repo)
+        self.start("sleep 4; exit 0")
+        deadline = time.monotonic() + 10
+        while "activating" not in self.server.tool_status({"slug": self.slug}, self.home):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.2)
+        time.sleep(1)
+        (self.repo / ".claude").mkdir(exist_ok=True)
+        (self.repo / ".claude/settings.local.json").write_text('{"owner": true}\n')
+        self.assertIn("result=success", self.status())
+        self.assertEqual((self.repo / ".claude/settings.local.json").read_text(), '{"owner": true}\n')
+        self.assertEqual(self.held(), [])
+
     def plant(self, *paths: str) -> str:
         return "".join(f"mkdir -p $(dirname {p}) 2>/dev/null; (echo planted > {p}) 2>/dev/null "
                        f"&& echo WROTE-{p}; " for p in paths)
@@ -754,7 +873,7 @@ class RealUnitTests(unittest.TestCase):
                 self.assertIn("deep/.envrc", self.server.tool_log({"slug": self.slug}, self.home))
                 self.assertIn("3 files that run later", self.status())
                 self.assertTrue((self.repo / ".git/HEAD").is_file())
-                for held_dir in (self.home / ".local/state/claude-jobs/quarantine").glob(f"{self.unit}.*"):
+                for held_dir in (self.home / self.server.HELD).glob(f"{self.unit}.*"):
                     shutil.rmtree(held_dir)
 
     def test_cargo_test_runs_as_a_job(self) -> None:
@@ -788,7 +907,7 @@ class RealUnitTests(unittest.TestCase):
         (self.repo / "flake.lock").write_text(
             '{"nodes": {"root": {}}, "root": "root", "version": 7}\n')
         (self.repo / "flake.nix").write_text(
-            '{ inputs.systems.url = "github:nix-systems/x86_64-linux";\n'
+            '{ inputs.systems.url = "git+https://github.com/nix-systems/x86_64-linux";\n'
             '  outputs = { self, systems }: { packages.x86_64-linux.default = derivation {\n'
             '    name = "jobs-broker-net-test"; system = "x86_64-linux"; builder = "/bin/sh";\n'
             '    args = [ "-c" "echo ${toString (import systems)} > $out" ]; }; }; }\n')

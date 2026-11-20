@@ -12,17 +12,18 @@ Protocol: MCP 2024-11-05 over stdio, JSON-RPC 2.0 line-delimited.
 from __future__ import annotations
 
 import fcntl
-import fnmatch
 import json
 import os
 import pwd
 import re
+import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import NamedTuple
 
 HERE = Path(__file__).resolve().parent
@@ -34,15 +35,17 @@ PYTHON = f"{SYSTEM_BIN}/python3"
 SRT = f"{SYSTEM_BIN}/srt"
 SRT_TMPDIR = "/tmp/claude"
 RIPGREP = f"{SYSTEM_BIN}/rg"
-NIX_CACHE = ".cache/nix"
+GIT = f"{SYSTEM_BIN}/git"
 # Jobs are a trust tier of their own: they get caches only jobs write and
 # nothing more privileged reads, never the host's ~/.cargo (config and
-# credentials live there) or ~/.cache/uv.
+# credentials live there), ~/.cache/uv or ~/.cache/nix (whose gitv3 repos the
+# owner's nix runs git in).
 JOB_CACHES = {"CARGO_HOME": "cargo", "UV_CACHE_DIR": "uv", "npm_config_cache": "npm",
-              "PIP_CACHE_DIR": "pip"}
+              "PIP_CACHE_DIR": "pip", "XDG_CACHE_HOME": "xdg"}
 MANAGED = Path("/etc/claude-code")
+PROJECT_SETTINGS = (".claude/settings.json", ".claude/settings.local.json")
 STATE = ".local/state/claude-jobs"
-HELD = f"{STATE}/quarantine"
+HELD = f"{STATE}/moved-out"
 # What Claude Code, srt, Codex and Cursor protect, together: config an agent,
 # editor, shell, direnv or git reads and runs later.
 PROTECTED_NAMES = frozenset({
@@ -128,6 +131,7 @@ class Job(NamedTuple):
     profile: str
     policy: dict
     baseline: dict
+    unenforced: list
 
 
 def _fields(args: object, allowed: set) -> dict:
@@ -167,20 +171,50 @@ def job_caches(home: Path) -> dict:
 class Scan(NamedTuple):
     git_state: list
     protected: list
+    read_denied: list
 
 
-def _protected_name(name: str, parts: tuple, globs: list) -> bool:
-    return name.lower() in PROTECTED_NAMES or any(_glob_match(g, parts) for g in globs)
+def _protected_name(name: str) -> bool:
+    return name.lower() in PROTECTED_NAMES
+
+
+# The paths among PATHS that a deny pattern matches, decided by git's wildmatch:
+# Claude Code's Read and Edit rules follow gitignore syntax. git runs in an
+# empty work tree of the broker's own, so no repo config or .gitignore of the
+# job's takes part.
+def gitignore_matches(patterns: list, paths: list, home: Path) -> set:
+    if not patterns or not paths:
+        return set()
+    for p in patterns:
+        if not p.startswith("/") or p != p.strip() or any(c in p for c in "\\\n\r"):
+            raise RuntimeError(f"deny pattern {p!r} cannot be matched as a gitignore pattern")
+    (home / STATE).mkdir(mode=0o700, parents=True, exist_ok=True)
+    scratch = Path(tempfile.mkdtemp(prefix="match-", dir=home / STATE))
+    try:
+        (scratch / "exclude").write_text("".join(f"{p.rstrip('/')}\n" for p in patterns))
+        env = {"PATH": SYSTEM_BIN, "HOME": str(scratch), "LANG": "C.UTF-8",
+               "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
+        argv = [GIT, "-c", f"core.excludesFile={scratch / 'exclude'}", "-C", str(scratch / "wt")]
+        subprocess.run([GIT, "init", "-q", "--template=", str(scratch / "wt")], check=True,
+                       env=env, capture_output=True, timeout=60, stdin=subprocess.DEVNULL)
+        done = subprocess.run([*argv, "check-ignore", "--no-index", "--stdin", "-z"],
+                              input=b"\0".join(os.fsencode(str(p))[1:] for p in paths),
+                              env=env, capture_output=True, timeout=600)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise RuntimeError(f"cannot match deny patterns: {e}") from None
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    if done.returncode not in (0, 1):
+        raise RuntimeError(f"cannot match deny patterns: {done.stderr.decode(errors='replace')[:300]}")
+    return {Path("/" + os.fsdecode(m)) for m in done.stdout.split(b"\0") if m}
 
 
 # srt protects only hooks and config of a `.git` dir, and no bare repo; a
 # commondir, a submodule's config or a worktree's config.worktree is as good a
 # plant. So every git dir and gitfile in the tree is write-denied whole, as is
 # every other name that runs later, at any depth.
-def _scan(repo: Path, globs: list) -> Scan:
-    found, protected, pending, seen = [], [], [repo], 0
-    if any(_glob_match(g, repo.parts) for g in globs):
-        protected.append(repo)
+def _scan(repo: Path, write_globs: list, read_globs: list, home: Path) -> Scan:
+    found, protected, pending, walked, seen = [], [], [repo], [repo], 0
     while pending:
         try:
             with os.scandir(pending.pop()) as entries:
@@ -193,16 +227,20 @@ def _scan(repo: Path, globs: list) -> Scan:
                         if entry.is_symlink():
                             raise RuntimeError(f"{entry.path} is a symlink")
                         found.append(path)
-                    elif _protected_name(entry.name, path.parts, globs):
+                        continue
+                    if entry.is_dir(follow_symlinks=False) and is_git_dir(path):
+                        found.append(path)
+                        continue
+                    walked.append(path)
+                    if _protected_name(entry.name):
                         protected.append(path)
                     elif entry.is_dir(follow_symlinks=False):
-                        if is_git_dir(path):
-                            found.append(path)
-                        else:
-                            pending.append(entry.path)
+                        pending.append(entry.path)
         except OSError as e:
             raise RuntimeError(f"cannot scan {repo} for git dirs: {e}") from None
-    return Scan(found, protected)
+    matched = gitignore_matches(write_globs, walked, home)
+    return Scan(found, [*protected, *sorted(matched - set(protected))],
+                sorted(gitignore_matches(read_globs, walked, home)))
 
 
 def baseline_path(home: Path, unit: str) -> Path:
@@ -232,40 +270,65 @@ def _git_dir_at(dir_fd: int, name: str) -> bool:
     return stat.S_ISREG(kinds[0]) and stat.S_ISDIR(kinds[1]) and stat.S_ISDIR(kinds[2])
 
 
+def moved_path(home: Path, unit: str) -> Path:
+    return home / STATE / f"{unit}.moved"
+
+
 # Claude Code quarantines what a sandboxed command leaves behind that runs
 # later; this is that step for a job. It runs as the owner outside every
 # sandbox, so it walks by directory fd and moves with renameat: a directory
 # swapped for a symlink mid-walk is neither followed nor moved through.
+#
+# Only what the job could have made is moved: nothing at or under a path its
+# policy denied it writing, which is where the owner's own session puts
+# .claude/settings.local.json or git its modules. A new name where the job could
+# write may still be the owner's; it is moved, listed and restorable.
 def sweep(unit: str, home: Path) -> list:
     try:
         base = json.loads(baseline_path(home, unit).read_text())
-        repo, ident = Path(base["repo"]), base["ident"]
-        existing, globs = set(base["existing"]), [tuple(g) for g in base["globs"]]
+        repo, ident, denied = Path(base["repo"]), base["ident"], set(base["denied"])
         st = os.lstat(repo)
     except (OSError, ValueError, KeyError, TypeError) as e:
         raise RuntimeError(f"no usable baseline for {unit}; nothing moved: {e}") from None
     if not stat.S_ISDIR(st.st_mode) or f"{st.st_dev}:{st.st_ino}" != ident:
         raise RuntimeError(f"{repo} is not the directory the job ran in; nothing moved")
+    if "." in denied:
+        return []
     dest, moved = home / HELD / f"{unit}.{time.time_ns()}", []
     for top, dirs, files, fd in os.fwalk(repo, follow_symlinks=False):
         rel_top = os.path.relpath(top, repo)
         for name in [*dirs, *files]:
             rel = os.path.normpath(os.path.join(rel_top, name))
-            if not (_protected_name(name, (*repo.parts, *Path(rel).parts), globs)
-                    or (name in dirs and _git_dir_at(fd, name))):
+            if rel in denied:
+                if name in dirs:
+                    dirs.remove(name)
+                continue
+            if not (_protected_name(name) or (name in dirs and _git_dir_at(fd, name))):
                 continue
             if name in dirs:
                 dirs.remove(name)
-            if rel in existing:
-                continue
             (dest / rel).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             os.rename(name, dest / rel, src_dir_fd=fd)
             moved.append(rel)
             print(f"jobs-broker: {rel} appeared during the job; moved out of the repo to {dest / rel}")
     if moved:
-        with open(home / STATE / f"{unit}.moved", "a") as fh:
-            fh.writelines(f"{rel}\n" for rel in moved)
+        with open(moved_path(home, unit), "a") as fh:
+            fh.writelines(f"{dest}\t{rel}\n" for rel in moved)
+        print(f"jobs-broker: {restore_hint(unit, home)}")
     return moved
+
+
+def restore_hint(unit: str, home: Path) -> str:
+    try:
+        lines = moved_path(home, unit).read_text().splitlines()
+        repo = json.loads(baseline_path(home, unit).read_text())["repo"]
+    except (OSError, ValueError, KeyError):
+        return ""
+    dests = sorted({line.split("\t", 1)[0] for line in lines})
+    cmd = " && ".join(f"cp -a --update=none {d}/. {repo}/" for d in dests)
+    return (f"{len(lines)} files that run later appeared in the repo during the job and were moved "
+            f"to {', '.join(dests)} (listed in the log; run the restore as the owner outside the "
+            f"sandbox, which protects these names); restore: {cmd}")
 
 
 def _gitdir_pointer(gitfile: Path) -> Path | None:
@@ -347,7 +410,7 @@ class SessionPolicy(NamedTuple):
 
 
 def _merge_source(path: Path, settings: dict, repo: Path, home: Path, base: bool,
-                  into: SessionPolicy) -> None:
+                  into: SessionPolicy, settings_dir: Path | None = None) -> None:
     sandbox = settings.get("sandbox", {})
     if not isinstance(sandbox, dict):
         raise RuntimeError(f"{path}: sandbox is not an object")
@@ -372,12 +435,36 @@ def _merge_source(path: Path, settings: dict, repo: Path, home: Path, base: bool
             if not content:
                 raise RuntimeError(f"{path}: deny rule {rule!r} names no path")
             target = into.deny_read if tool == "Read" else into.deny_write
-            target.append(_rule_path(content, path.parent, repo, home))
+            target.append(_rule_path(content, settings_dir or path.parent, repo, home))
+
+
+# A deny only narrows, so Claude Code takes one from any scope, the repo's own
+# settings files included; nothing else in those files is trusted here.
+def _merge_project(path: Path, settings: dict, repo: Path, home: Path, into: SessionPolicy) -> None:
+    sandbox = settings.get("sandbox") or {}
+    fs = (sandbox.get("filesystem") or {}) if isinstance(sandbox, dict) else None
+    net = (sandbox.get("network") or {}) if isinstance(sandbox, dict) else None
+    perms = settings.get("permissions") or {}
+    if not isinstance(fs, dict) or not isinstance(net, dict) or not isinstance(perms, dict):
+        raise RuntimeError(f"{path}: sandbox or permissions is not an object")
+    for key, target in (("denyRead", into.deny_read), ("denyWrite", into.deny_write)):
+        entries = fs.get(key, [])
+        if not isinstance(entries, list) or not all(isinstance(e, str) for e in entries):
+            raise RuntimeError(f"{path}: sandbox.filesystem.{key} is not a list of paths")
+        target.extend(e if e.startswith(("/", "~/")) else str(repo / e) for e in entries)
+    into.denied_domains.extend(net.get("deniedDomains", []))
+    deny = perms.get("deny", [])
+    _merge_source(path, {"permissions": {"deny": deny}}, repo, home, False, into)
+    # Read as relative to the project root as well as to the settings file: the
+    # two readings Claude Code has documented for a single leading slash.
+    _merge_source(path, {"permissions": {"deny": [r for r in deny if isinstance(r, str)
+                                                  and re.fullmatch(r"\w+\(/[^/].*\)", r.strip())]}},
+                  repo, home, False, into, settings_dir=repo)
 
 
 def session_policy(repo: Path, home: Path) -> SessionPolicy:
     """The sandbox the session runs under, from sandbox settings and permission
-    deny rules of every trusted scope, as Claude Code composes it."""
+    deny rules of every scope, as Claude Code composes it."""
     loaded = [(p, s) for p, required in settings_sources(home)
               if (s := _read_settings(p, required)) is not None]
     user = loaded[0][1]
@@ -386,6 +473,9 @@ def session_policy(repo: Path, home: Path) -> SessionPolicy:
     policy = SessionPolicy(user["sandbox"], [], [], [])
     for i, (path, settings) in enumerate(loaded):
         _merge_source(path, settings, repo, home, i == 0, policy)
+    for name in PROJECT_SETTINGS:
+        if (settings := _read_settings(repo / name, False)) is not None:
+            _merge_project(repo / name, settings, repo, home, policy)
     return policy
 
 
@@ -393,33 +483,29 @@ def _expand_home(p: str, home: Path) -> str:
     return str(home / p[2:]) if p.startswith("~/") else p
 
 
-def _glob(p: str) -> tuple | None:
+def _glob(p: str) -> str | None:
     while p.endswith("/**"):
         p = p[:-3]
-    return PurePosixPath(p).parts if any(c in p for c in "*?[") else None
+    return p if any(c in p for c in "*?[") else None
 
 
-def _glob_match(pattern: tuple, parts: tuple) -> bool:
-    if not pattern:
-        return not parts
-    if pattern[0] == "**":
-        return any(_glob_match(pattern[1:], parts[i:]) for i in range(len(parts) + 1))
-    return bool(parts) and fnmatch.fnmatchcase(parts[0], pattern[0]) \
-        and _glob_match(pattern[1:], parts[1:])
+# srt walks a read-deny glob from its first literal directory, so one whose
+# first component is already a wildcard (//**/x) denies nothing, in the
+# session's own sandbox as here (measured, srt 0.0.81).
+def _root_anchored(p: str) -> bool:
+    return any(c in p.split("/")[1] for c in "*?[") if p.startswith("/") else False
 
 
-def srt_policy(repo: Path, scan: Scan, profile: str, home: Path, session: SessionPolicy) -> dict:
+def srt_policy(repo: Path, scan: Scan, home: Path, session: SessionPolicy) -> dict:
     fs = session.sandbox.get("filesystem") or {}
-    session_writes = {_expand_home(p, home) for p in fs.get("allowWrite", [])}
     writes = [str(repo), *map(str, job_caches(home).values())]
-    if profile == "nix" and str(home / NIX_CACHE) in session_writes:
-        writes.append(str(home / NIX_CACHE))
     net = session.sandbox.get("network") or {}
     return {
         "network": {**net, "deniedDomains": [*net.get("deniedDomains", []),
                                              *session.denied_domains]},
         "filesystem": {
-            "denyRead": session.deny_read, "allowRead": fs.get("allowRead", []),
+            "denyRead": [*session.deny_read, *map(str, scan.read_denied)],
+            "allowRead": fs.get("allowRead", []),
             "allowWrite": writes,
             # A name absent at the top level is denied too: srt holds it with
             # an empty file, so it cannot be created.
@@ -452,15 +538,20 @@ def validate_start(args: object, home: Path) -> Job:
     if not (stat.S_ISDIR(dot_git) or stat.S_ISREG(dot_git)):
         raise RuntimeError(f"{repo} is not the top level of a git work tree")
     session = session_policy(repo, home)
-    # srt drops a write glob on Linux, as bwrap binds only concrete paths, so the
-    # broker expands each to what it matches in the repo when the job starts.
-    globs = [g for p in session.deny_write if (g := _glob(_expand_home(p, home)))]
-    scan = _scan(repo, globs)
-    baseline = {"repo": str(repo), "ident": ident, "globs": globs,
-                "existing": [str(p.relative_to(repo)) for p in (*scan.git_state, *scan.protected)
-                             if p != repo]}
+    # srt drops a write glob on Linux, as bwrap binds only concrete paths, and a
+    # read glob it cannot walk, so the broker expands each to what it matches in
+    # the repo's work tree when the job starts. Git dirs are not walked: git reads
+    # them, and srt never denied the session that either.
+    write_globs, read_globs = ([g for p in entries if (g := _glob(_expand_home(p, home)))]
+                               for entries in (session.deny_write, session.deny_read))
+    scan = _scan(repo, write_globs, read_globs, home)
+    policy = srt_policy(repo, scan, home, session)
+    denied = [Path(_expand_home(p, home)) for p in policy["filesystem"]["denyWrite"]]
+    baseline = {"repo": str(repo), "ident": ident,
+                "denied": [os.path.relpath(p, repo) for p in denied if p == repo or repo in p.parents]}
+    unenforced = [p for p in session.deny_read if _root_anchored(_expand_home(p, home))]
     return Job(unit, repo, ident, _outside_git_dirs(repo, scan.git_state, home), list(argv),
-               runtime, profile, srt_policy(repo, scan, profile, home, session), baseline)
+               runtime, profile, policy, baseline, unenforced)
 
 
 def properties(job: Job, home: Path) -> list:
@@ -487,8 +578,7 @@ def properties(job: Job, home: Path) -> list:
         f"BindReadOnlyPaths=-{home}/.config/git",
     ]
     if job.profile == "nix":
-        props += [f"BindPaths={home / NIX_CACHE}",
-                  f"BindReadOnlyPaths=-{home}/.nix-memory-pressure",
+        props += [f"BindReadOnlyPaths=-{home}/.nix-memory-pressure",
                   "Slice=ram-heavy.slice", "OOMPolicy=kill"]
     return props
 
@@ -553,7 +643,7 @@ def tool_start(args: object, home: Path) -> str:
                                0o600), "w") as fh:
             json.dump(job.policy, fh)
         write_baseline(job, home)
-        (home / STATE / f"{job.unit}.moved").unlink(missing_ok=True)
+        moved_path(home, job.unit).unlink(missing_ok=True)
         done = subprocess.run(start_argv(job, home), capture_output=True, text=True, timeout=120,
                               env=_env(home), stdin=subprocess.DEVNULL)
     finally:
@@ -562,8 +652,10 @@ def tool_start(args: object, home: Path) -> str:
         raise RuntimeError(f"systemd-run could not start {job.unit}.service: "
                            f"{done.stderr.strip()[:500]}")
     slug = job.unit[len(PREFIX):]
+    unenforced = (f"read-deny globs srt cannot walk, applied to this repo's work tree only "
+                  f"(not its git dirs): {', '.join(job.unenforced)}\n" if job.unenforced else "")
     return (f"started {job.unit}.service in {job.repo} "
-            f"(profile {job.profile}, stopped after {job.runtime}s)\nlog: {log}\n"
+            f"(profile {job.profile}, stopped after {job.runtime}s)\nlog: {log}\n{unenforced}"
             f"outcome: status slug={slug} wait_sec<={MAX_WAIT_SEC}; "
             f"host side: wait-for unit {job.unit} --user")
 
@@ -579,16 +671,12 @@ def tool_status(args: object, home: Path) -> str:
         if _settled(snap) or time.monotonic() >= deadline:
             break
         time.sleep(2)
-    try:
-        moved = len((home / STATE / f"{unit}.moved").read_text().splitlines())
-    except FileNotFoundError:
-        moved = 0
+    moved = restore_hint(unit, home)
     return (f"unit {unit}.service {snap.get('ActiveState')}/{snap.get('SubState')} "
             f"result={snap.get('Result')} status={snap.get('ExecMainStatus')} "
             f"started={snap.get('ExecMainStartTimestamp')} "
             f"exited={snap.get('ExecMainExitTimestamp')}\n"
-            + (f"{moved} files that run later appeared in the repo and were moved out "
-               f"after the job (listed in the log)\n" if moved else "")
+            + (f"{moved}\n" if moved else "")
             + f"{'settled' if _settled(snap) else 'running'}; log: {log_path(home, unit)}")
 
 
@@ -632,7 +720,8 @@ TOOLS = [
          "home and secrets are hidden, every git dir and agent/editor/shell config file is "
          "read-only (git commit fails), and it is killed after max_runtime_sec. Such files the "
          "job creates (a new .git, .claude/, .envrc, ...) are moved out of the repo when it "
-         "ends. Profile nix also lets it write the nix cache and uses the ram-heavy slice. "
+         "ends; status names them and the restore command. Caches (nix, cargo, uv, npm, pip) "
+         "are the jobs' own, never the host's. Profile nix uses the ram-heavy slice. "
          "Read the outcome later with status (wait_sec blocks until it settles) and log."),
      "inputSchema": {"type": "object", "properties": {
          "repo": {"type": "string",
