@@ -651,9 +651,14 @@ stop_job() {
 
 run_job_in_sandbox() {
   local log=/tmp/$target.log rc last remaining sig pending
-  exec 9>>"/tmp/$target.lock" || { echo "wait-for: cannot open /tmp/$target.lock" >&2; exit 3; }
+  # Opened read-write, a FIFO does not block; each is then used only through
+  # its descriptor, so nothing swapped in under the name later is opened.
+  exec 9<>"/tmp/$target.lock" && [ -f /dev/fd/9 ] || {
+    echo "wait-for: cannot use /tmp/$target.lock as a lock file" >&2; exit 3;
+  }
   flock -n 9 || flock -w "$(left)" 9 || timed_out
-  last=$(tail -n 1 -- "$log" 2>/dev/null)
+  exec 8<>"$log" && [ -f /dev/fd/8 ] || { echo "wait-for: cannot use $log as a log file" >&2; exit 3; }
+  last=$(tail -n 1 -- /dev/fd/8 2>/dev/null)
   case $last in
     MARKER_OK)
       echo "job $target already ran inside the sandbox result=success status=0 log=$log (remove the log to run it again)"
@@ -662,7 +667,7 @@ run_job_in_sandbox() {
       echo "job $target already ran inside the sandbox result=exit-code status=${last#MARKER_FAILED rc=} log=$log (remove the log to run it again)"
       exit 1 ;;
   esac
-  : >"$log" || { echo "wait-for: cannot write $log" >&2; exit 3; }
+  : >/dev/fd/8 || { echo "wait-for: cannot write $log" >&2; exit 3; }
   # `timeout 0` would mean no limit at all.
   remaining=$(left)
   [ "$remaining" -gt 0 ] || timed_out
@@ -671,7 +676,7 @@ run_job_in_sandbox() {
   # A stop arriving before $! is known is held until it is.
   pending=""
   for sig in TERM INT HUP; do trap "pending=\${pending:-$sig}" "$sig"; done
-  command timeout --kill-after=5 "$remaining" "${job_cmd[@]}" <&0 >>"$log" 2>&1 9>&- &
+  command timeout --kill-after=5 "$remaining" "${job_cmd[@]}" <&0 >>/dev/fd/8 2>&1 8>&- 9>&- &
   child=$!
   for sig in TERM INT HUP; do trap "stop_job $sig" "$sig"; done
   [ -z "$pending" ] || stop_job "$pending"
@@ -679,13 +684,13 @@ run_job_in_sandbox() {
   trap - TERM INT HUP
   # 137 is how GNU timeout reports the KILL after the grace period.
   case $rc in 124|137) [ "$(left)" -gt 0 ] || timed_out ;; esac
-  [ "$(tail -c 1 -- "$log" | od -An -tx1 | tr -d ' ')" = 0a ] || echo >>"$log"
+  [ "$(tail -c 1 -- /dev/fd/8 | od -An -tx1 | tr -d ' ')" = 0a ] || echo >>/dev/fd/8
   if [ "$rc" = 0 ]; then
-    echo MARKER_OK >>"$log"
+    echo MARKER_OK >>/dev/fd/8
     echo "job $target ran inside the sandbox result=success status=0 log=$log"
     exit 0
   fi
-  echo "MARKER_FAILED rc=$rc" >>"$log"
+  echo "MARKER_FAILED rc=$rc" >>/dev/fd/8
   echo "job $target ran inside the sandbox result=exit-code status=$rc log=$log"
   exit 1
 }
