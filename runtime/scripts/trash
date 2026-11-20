@@ -168,8 +168,13 @@ def reserve(info_fd: int, files_fd: int, target: Target) -> str:
             os.close(fd)
             os.unlink(f"{unique}.trashinfo", dir_fd=info_fd)
             continue
-        with os.fdopen(fd, "w") as f:
-            f.write(f"[Trash Info]\nPath={quote(target.path)}\nDeletionDate={deleted}\n")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(f"[Trash Info]\nPath={quote(os.fsencode(target.path))}\n"
+                        f"DeletionDate={deleted}\n")
+        except BaseException:
+            os.unlink(f"{unique}.trashinfo", dir_fd=info_fd)
+            raise
         return unique
     raise AssertionError("unreachable")
 

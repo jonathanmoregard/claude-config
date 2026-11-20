@@ -33,7 +33,9 @@ while [ $# -gt 0 ]; do
   case $1 in
     -p) [[ ${2:-} =~ ^[A-Za-z]+(,[A-Za-z]+)*$ && ! ,$2, =~ ,($withheld), ]] || usage
         options+=(-p "$2"); shift 2 ;;
-    -n) [[ ${2:-} =~ ^[0-9]+$ ]] || usage; options+=(-n "$2"); shift 2 ;;
+    -n) [[ ${2:-} =~ ^[0-9]+$ ]] || usage
+        [[ $2 =~ ^0*([0-9]{1,5})$ ]] && lines=$((10#${BASH_REMATCH[1]})) || lines=10000
+        options+=(-n "$((lines < 10000 ? lines : 10000))"); shift 2 ;;
     --all|--failed|--no-pager) options+=("$1"); shift ;;
     --state=*|--type=*) [[ $1 =~ ^--(state|type)=[a-z]+(,[a-z-]+)*$ ]] || usage; options+=("$1"); shift ;;
     -*) usage ;;
@@ -47,9 +49,12 @@ fi
 
 case $verb in
   show|cat)
-    # A unit file continues such a line with a trailing backslash.
+    # systemd.syntax: a trailing backslash continues the line, past comment lines.
     systemctl "${scope[@]}" --no-pager "$verb" "${options[@]}" -- "${units[@]}" |
-      sed -E "/^[[:space:]]*($withheld)[[:space:]]*=/{:a;/\\\\\$/{N;ba};d}" ;;
+      awk -v key="^[[:space:]]*($withheld)[[:space:]]*=" '
+        held && /^[[:space:]]*[#;]/ { next }
+        held || $0 ~ key { held = /\\$/; next }
+        { print }' ;;
   status)
     # A slice's control group tree lists every process below it with its arguments.
     systemctl "${scope[@]}" --no-pager "$verb" "${options[@]}" -- "${units[@]}" |
