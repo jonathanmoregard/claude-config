@@ -13,13 +13,19 @@
 # (`-aH host`, `--ho=host`), which no pattern over the command text can rule
 # out. Hence an allowlist of whole arguments, and units after `--`.
 set -uo pipefail
-PATH=/run/current-system/sw/bin:/usr/bin:/bin
+# The caller's environment can name unit files, a bus or a manager of its own
+# (SYSTEMD_UNIT_PATH, DBUS_*, XDG_RUNTIME_DIR); even $UID is taken from it.
+unset $(compgen -e) 2>/dev/null
+export PATH=/run/current-system/sw/bin:/usr/bin:/bin
 withheld='Environment|SetCredential|SetCredentialEncrypted'
 
 usage() { sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
 
 scope=()
-if [ "${1:-}" = --user ]; then scope=(--user); shift; fi
+if [ "${1:-}" = --user ]; then
+  scope=(--user); shift
+  export XDG_RUNTIME_DIR=/run/user/$(id -u)
+fi
 verb=${1:-}
 [ $# -gt 0 ] && shift
 case $verb in

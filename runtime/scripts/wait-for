@@ -55,8 +55,12 @@
 # END USAGE
 set -uo pipefail
 # The Claude Code sandbox runs `wait-for unit` outside itself without a prompt,
-# so not even its usage exit may run a binary from the caller's PATH.
-[ "${1:-}" = unit ] && PATH=/run/current-system/sw/bin:/usr/bin:/bin
+# so nothing of the caller's environment may steer it: not PATH, not a bus or
+# manager (DBUS_*, XDG_RUNTIME_DIR), not jq's $HOME/.jq. Even $UID is the caller's.
+if [ "${1:-}" = unit ]; then
+  unset $(compgen -e) 2>/dev/null
+  export PATH=/run/current-system/sw/bin:/usr/bin:/bin
+fi
 
 usage() {
   sed -n '2,/^# END USAGE$/p' "$0" | sed '$d; s/^# \{0,1\}//' >&2
@@ -96,6 +100,7 @@ fi
 timeout=$(( 10#$timeout ))
 if [ "$mode" = unit ]; then
   case $target in */*) usage ;; esac
+  [ "${user[*]:-}" = --user ] && export XDG_RUNTIME_DIR=/run/user/$(id -u)
 fi
 deadline=$(( $(date +%s) + timeout ))
 left() { echo $(( deadline - $(date +%s) )); }
