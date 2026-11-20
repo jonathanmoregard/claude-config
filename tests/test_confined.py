@@ -189,6 +189,54 @@ def test_hides_denied_env(world) -> None:
     assert "denied= kept=kept" in proc.stdout
 
 
+def session_settings(project: Path) -> dict[str, Path]:
+    """The rule forms a project's settings use, each measured in Claude's own
+    sandbox to hide the path planted for it."""
+    (project / ".claude").mkdir(exist_ok=True)
+    (project / ".claude" / "settings.json").write_text(json.dumps({
+        "permissions": {"deny": ["Read(./data/dot/**)", "Read(data/bare/**)",  # arftl-allow: permission-widened
+                                 "Read(/data/slash/**)"]},
+        "sandbox": {"filesystem": {"denyRead": ["./data/fsdeny"],
+                                   "denyWrite": ["./data/fswrite"]}}}))
+    (project / ".claude" / "settings.local.json").write_text(json.dumps(
+        {"permissions": {"deny": ["Read(./data/local/**)"]}}))  # arftl-allow: permission-widened
+    plants = {name: project / "data" / name / "f" for name in
+              ("dot", "bare", "slash", "fsdeny", "local", "open")}
+    for path in plants.values():
+        path.parent.mkdir(parents=True)
+        path.write_text(CANARY + "\n")
+    (project / "data" / "fswrite").mkdir()
+    return plants
+
+
+@needs_pasta
+def test_hides_what_the_session_projects_settings_deny(world) -> None:
+    repo = world["repo"]
+    plants = session_settings(repo)
+    proc = jailed(world["script"], "\n".join(
+        f'printf "{name}=%s\\n" "$(cat {path} 2>/dev/null)"' for name, path in plants.items()
+    ) + f'\n( : >{repo}/data/fswrite/new ) 2>/dev/null && echo fswrite=written',
+        cwd=repo, flags=("--session", str(repo)))
+    lines = answers(proc)
+    assert lines.pop("open") == CANARY, "control: an ordinary file must stay readable"
+    assert set(lines.values()) == {""}, lines
+
+
+@pytest.mark.parametrize("settings, status", [("{not json", 3), (None, 0)])
+@needs_pasta
+def test_session_project_settings_it_cannot_read_fail_closed(world, settings, status) -> None:
+    repo = world["repo"]
+    (repo / ".claude").mkdir()
+    entry = repo / ".claude" / "settings.local.json"
+    if settings is None:
+        entry.mkdir()
+        os.setxattr(entry, "user.confined-stub", b"1")
+    else:
+        entry.write_text(settings)
+    proc = run(world["script"], "--session", str(repo), "--", "true", cwd=repo)
+    assert proc.returncode == status, proc.stderr
+
+
 CLAUDE_CREDS = REAL_HOME / ".claude" / ".credentials.json"
 # Sizes and access(2) only: neither test reads the credential.
 CREDS_PROBE = (f'printf "size=%s\\n" "$(wc -c <{CLAUDE_CREDS} 2>/dev/null)"\n'
@@ -558,6 +606,18 @@ def test_a_guard_another_process_keeps_locked_fails_the_launch_in_bounded_time(w
         os.close(held)
     assert proc.returncode == 3, proc.stderr
     assert (repo / ".vscode").is_dir()
+
+
+@needs_pasta
+def test_a_new_guard_locked_by_another_process_is_not_left_behind(world) -> None:
+    repo = world["repo"]
+    placed = "            if rename_noreplace(parent, tmp, name):\n"
+    script = injected(world, "racer", placed, placed + (
+        '                name == ".mcp.json" and subprocess.Popen(["flock", "-n", "-x", '
+        'f"/proc/{os.getpid()}/fd/{fd}", "sleep", "8"]) and time.sleep(0.5)\n'))
+    before = sorted(str(p) for p in repo.rglob("*"))
+    proc = run(script, "--", "true", cwd=repo, timeout=30)
+    assert sorted(str(p) for p in repo.rglob("*")) == before, proc.stderr
 
 
 @needs_pasta

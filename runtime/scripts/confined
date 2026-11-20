@@ -12,7 +12,7 @@ worktree's, is read-only, so commit outside the jail) and $TMPDIR, /tmp/confined
 jails. Home, /tmp, /run and /var are empty but for that repository and SHOWN. Agent and git config at the top of the repository
 cannot be written or created. A launch from a Claude Code session whose project
 lies inside the repository below its top, or around the repository, is refused. What the `sandbox` block and Read deny rules of the
-settings.json beside this config hide stays hidden.
+settings.json beside this config, and the denials in that project's own settings, hide stays hidden.
 Network: its own namespace, IPv4 only. The host, private, link-local and
 tailnet ranges are refused, except DNS to the configured resolvers; the rest of
 the internet is reachable, without a domain filter.
@@ -150,6 +150,12 @@ def absolute(home: str, entry: str, what: str) -> str:
     return entry
 
 
+def within(project: str | None, home: str, entry: str, what: str) -> str:
+    if project and not entry.startswith(("/", "~/")):
+        return os.path.join(project, entry.removeprefix("./"))
+    return absolute(home, entry, what)
+
+
 def existing(paths: list[str]) -> list[str]:
     return [os.path.realpath(p) for p in paths if os.path.exists(p)]
 
@@ -174,10 +180,28 @@ def read_pointer(path: Path, prefix: str = "") -> str | None:
     return text[len(prefix):].strip() or None if text.startswith(prefix) else None
 
 
-class Profile:
-    """The `sandbox` block and Read deny rules of a settings.json."""
+def project_settings(project: str) -> list[dict]:
+    out = []
+    for name in (".claude/settings.json", ".claude/settings.local.json"):
+        try:
+            fd = os.open(os.path.join(project, name), os.O_RDONLY | os.O_NONBLOCK)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        # A guard directory stands in for an absent file.
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            continue
+        with open(fd, encoding="utf-8") as f:
+            out.append(json.load(f))
+    return out
 
-    def __init__(self, settings_path: Path, home: str) -> None:
+
+class Profile:
+    """The `sandbox` block and Read deny rules of a settings.json, and the
+    denials of each session project's settings, which that session's sandbox
+    adds."""
+
+    def __init__(self, settings_path: Path, home: str, projects: list[str]) -> None:
         try:
             settings = json.loads(settings_path.read_text(encoding="utf-8"))
             sandbox = settings["sandbox"]
@@ -196,9 +220,21 @@ class Profile:
                                     if v.get("mode") == "deny"})
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
             fail(3, f"cannot read the sandbox profile from {settings_path}: {e!r}")
+        for project in projects:
+            try:
+                for settings in project_settings(project):
+                    fs = settings.get("sandbox", {}).get("filesystem", {})
+                    self.deny_write += existing([within(project, home, e, "denyWrite")
+                                                 for e in fs.get("denyWrite", [])])
+                    self.blocked += [within(project, home, e, "denyRead")
+                                     for e in fs.get("denyRead", [])]
+                    self.rules += self.read_rules(settings, home, Path(project), project)
+            except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+                fail(3, f"cannot read the settings of the session's project {project}: {e!r}")
 
     @staticmethod
-    def read_rules(settings: dict, home: str, config_dir: Path) -> list[str]:
+    def read_rules(settings: dict, home: str, config_dir: Path,
+                   project: str | None = None) -> list[str]:
         paths = []
         for rule in settings.get("permissions", {}).get("deny", []):
             match = re.fullmatch(r"Read\((.+)\)", rule)
@@ -210,7 +246,7 @@ class Profile:
             elif spec.startswith("/"):
                 paths.append(str(config_dir / spec[1:]))
             else:
-                paths.append(absolute(home, spec, f"Read rule {rule}"))
+                paths.append(within(project, home, spec, f"Read rule {rule}"))
         return paths
 
     def hidden(self, visible) -> list[str]:
@@ -412,6 +448,9 @@ class Stubs:
                              dir_fd=parent)
                 os.write(fd, content.encode())
             os.setxattr(fd, STUB_MARK, b"1")
+            # Locked before it gets its name: no process can then hold it
+            # exclusively and make this run leave it behind.
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
             if rename_noreplace(parent, tmp, name):
                 return fd
         except OSError as e:
@@ -751,7 +790,6 @@ def main() -> None:
     args = parse(sys.argv[1:])
     entry = pwd.getpwuid(os.getuid())
     here = Path(__file__).resolve().parent
-    profile = Profile(here.parent / "settings.json", entry.pw_dir)
     try:
         cwd = os.path.realpath(args.chdir or os.getcwd(), strict=True)
     except OSError as e:
@@ -761,6 +799,7 @@ def main() -> None:
     for project in sessions:
         if not os.path.isdir(project):
             fail(64, f"the session's project {project} is not a directory")
+    profile = Profile(here.parent / "settings.json", entry.pw_dir, sessions)
     repo = repository(cwd, profile, sessions)
     tmp = shared_tmp()
     tools = {name: find(name, entry.pw_name) for name in ("pasta", "bwrap", "iptables-restore")}
