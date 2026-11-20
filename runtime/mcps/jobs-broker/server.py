@@ -39,6 +39,9 @@ MAX_LOG_BYTES = 64 * 1024
 MAX_WAIT_SEC = 540
 
 _SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,47}")
+# systemd splits and unquotes path-list properties (BindPaths=, ...) and
+# expands % specifiers, so a path is used only when nothing in it is special.
+_PLAIN_PATH_RE = re.compile(r"/[A-Za-z0-9._@+/-]*")
 _SHOW = ("LoadState", "ActiveState", "SubState", "Result", "ExecMainStatus",
          "ExecMainStartTimestamp", "ExecMainExitTimestamp")
 
@@ -128,6 +131,8 @@ def _confined_dir(path: Path, home: Path) -> tuple:
         st = os.lstat(candidate)
     except OSError:
         raise RuntimeError(f"{path} does not exist") from None
+    if not _PLAIN_PATH_RE.fullmatch(str(candidate)):
+        raise RuntimeError(f"{candidate!r} has characters other than [A-Za-z0-9._@+/-]")
     if not stat.S_ISDIR(st.st_mode):
         raise RuntimeError(f"{path} is not a directory (a symlink is refused)")
     roots = [Path(os.path.realpath(home / r)) for r in ROOTS]

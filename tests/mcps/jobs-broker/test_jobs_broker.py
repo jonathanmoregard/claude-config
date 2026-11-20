@@ -136,6 +136,28 @@ class RepoPathTests(Home):
         (wt / ".git").write_text(f"gitdir: {self.home / '.ssh'}\n")
         self.refused(str(wt))
 
+    def test_refuses_characters_systemd_parses_in_a_path_list(self) -> None:
+        for char in (" ", "\t", "\n", '"', "'", "\\", ":", "%", ";", "$"):
+            repo = self.home / "Repos" / f"a{char}b"
+            repo.mkdir()
+            with self.subTest(char=char):
+                self.refused(str(repo))
+
+    def test_refuses_a_clean_argument_whose_real_path_is_not(self) -> None:
+        spaced = self.home / "Repos" / "sp ace"
+        (spaced / "r").mkdir(parents=True)
+        (self.home / "Repos" / "clean").symlink_to(spaced)
+        self.refused(str(self.home / "Repos" / "clean" / "r"))
+
+    def test_refuses_a_worktree_whose_common_dir_path_is_not_clean(self) -> None:
+        main = self.home / "Repos" / "ma in"
+        admin = main / ".git" / "worktrees" / "wt"
+        admin.mkdir(parents=True)
+        (admin / "commondir").write_text("../..\n")
+        wt = self.home / "worktrees" / "wt"
+        (wt / ".git").write_text(f"gitdir: {admin}\n")
+        self.refused(str(wt))
+
 
 HARDENING = {
     "ProtectSystem=strict", "ProtectHome=tmpfs", "PrivateTmp=yes", "PrivateUsers=self",
@@ -376,6 +398,23 @@ class RealUnitTests(unittest.TestCase):
         self.start("sleep 300", runtime=10)
         self.assertIn("result=timeout", self.status())
         self.assertEqual(self.wait_record()["result"], "timeout")
+
+    def test_repo_path_with_whitespace_never_binds_home(self) -> None:
+        (self.dir / "x").mkdir()
+        repo = Path(f"{self.dir}/x {self.home}")
+        repo.mkdir(parents=True)
+        canary = self.home / f".jobs-broker-test-canary-{uuid.uuid4().hex[:8]}"
+        try:
+            try:
+                self.server.tool_start({"repo": str(repo), "slug": self.slug, "max_runtime_sec": 60,
+                                        "argv": ["sh", "-c", 'echo ESCAPED > "$1"', "sh", str(canary)]},
+                                       self.home)
+                self.status()
+            except RuntimeError:
+                pass
+            self.assertFalse(canary.exists(), "the job wrote into the real home")
+        finally:
+            canary.unlink(missing_ok=True)
 
     def test_stop_ends_a_running_job_without_a_failure_record(self) -> None:
         self.start("sleep 300")
