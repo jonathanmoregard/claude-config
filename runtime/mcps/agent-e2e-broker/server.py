@@ -32,6 +32,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -59,7 +60,7 @@ PROTOCOL = "https"
 
 _POLICY_KEYS = frozenset({
     "version", "remoteUrl", "stateDir", "harness", "scenarioRoot", "claudeExecutable",
-    "outputRoot", "path", "models", "maxSamples", "maxJobs", "maxBudgetUsd",
+    "path", "models", "maxSamples", "maxJobs", "maxBudgetUsd",
     "maxTimeoutSec", "maxCallSec", "outputLimitChars", "readOnlyPaths",
 })
 _POSITIVE_INTS = ("maxSamples", "maxJobs", "maxTimeoutSec", "maxCallSec", "outputLimitChars")
@@ -70,6 +71,7 @@ _BRANCH_RE = re.compile(r"^origin/[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _RUN_FILES = ("prompt.md", "setup.sh", "check.sh")
 MAX_READ_BYTES = 256 * 1024
+RETAIN_SEC = 7 * 86400
 
 
 def _abs(value: object, key: str) -> Path:
@@ -121,10 +123,11 @@ def _load_policy(config: dict) -> dict:
     if any(r == policy["stateDir"] or r in policy["stateDir"].parents for r in roots(home)):
         raise RuntimeError("policy stateDir must lie outside ~/Repos and ~/worktrees")
     policy["mirror"] = policy["stateDir"] / "mirror.git"
+    policy["lock"] = policy["stateDir"] / "lock"
+    policy["campaigns"] = policy["stateDir"] / "campaigns"
     policy["readOnlyPaths"] = [canonical(p, home)[0] for p in extra
                                if not isinstance(p, str) or os.path.lexists(p)]
     policy["claudeExecutable"] = _abs(raw["claudeExecutable"], "claudeExecutable")
-    policy["outputRoot"] = _abs(raw["outputRoot"], "outputRoot")
     return policy
 
 
@@ -211,10 +214,20 @@ def _git(policy: dict, *argv: str, timeout: int = 60) -> subprocess.CompletedPro
     return _git_run(policy, [f"--git-dir={policy['mirror']}", *argv], timeout)
 
 
+# Every path the broker or the systemd manager writes lies in stateDir, outside
+# every sandbox write root: in a shared root such as /tmp, a planted symlink or
+# a guessed campaign name redirected those writes into the owner's files.
+def _private_dir(path: Path) -> Path:
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        raise RuntimeError(f"BROKEN safety boundary: {path} is not a private directory of this user")
+    return path
+
+
 def _update_mirror(policy: dict) -> None:
-    state = policy["stateDir"]
-    for d in (state, state / "home"):
-        d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    state = _private_dir(policy["stateDir"])
+    _private_dir(state / "home")
     (state / "gitconfig").write_text("[safe]\n\tbareRepository = explicit\n")
     if not policy["mirror"].exists():
         init = _git_run(policy, ["init", "--quiet", "--bare", "--template=", str(policy["mirror"])])
@@ -309,7 +322,7 @@ def _read_beneath(root: Path, rel: str, limit: int = MAX_READ_BYTES, tail: bool 
 
 
 def _extract_scenarios(policy: dict, sha: str, dest: Path) -> None:
-    dest.mkdir(parents=True)
+    dest.mkdir(mode=0o700)
     archive = subprocess.Popen(["git", *_GIT_OVERRIDES, f"--git-dir={policy['mirror']}", "archive",
                                 sha, "--", policy["scenarioRoot"]], stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL, env=_git_env(policy, "file"),
@@ -323,10 +336,10 @@ def _extract_scenarios(policy: dict, sha: str, dest: Path) -> None:
 
 # The harness runs in a hardened user unit, because scenario setup.sh and
 # check.sh come from a pushed branch and run as the owner. What stays reachable
-# is what a campaign needs: its output dir, the Claude login, the mirror
-# and readOnlyPaths (targets of its skill symlinks) read-only, and the
-# network. bwrap, which the harness puts the agent under, must still mount a
-# fresh /proc; ProtectKernelTunables=,
+# is what a campaign needs: its output dir, the Claude login, the harness
+# checkout, scenarios, mirror and readOnlyPaths (targets of its skill
+# symlinks) read-only, and the network. bwrap, which the harness puts the
+# agent under, must still mount a fresh /proc; ProtectKernelTunables=,
 # ProtectKernelLogs= and ProtectHostname= overmount /proc and make the kernel
 # refuse that (measured), so they are left out. Under PrivatePIDs= the harness
 # is PID 1 and ignores SIGTERM, hence KillSignal=SIGKILL.
@@ -344,19 +357,21 @@ HIDDEN = ("/run/github-app", "/run/dbus", "/run/nscd", "/run/agenix", "/run/agen
 UNIT_PREFIX = "claude-agent-e2e-"
 
 
-def _unit_properties(policy: dict, out: Path, runtime: int) -> list[str]:
+def _unit_properties(policy: dict, campaign: Path, runtime: int) -> list[str]:
     home = Path.home()
     exe = policy["claudeExecutable"]
+    out = campaign / "out"
     return [
         "Type=exec", "Description=agent-e2e campaign", f"RuntimeMaxSec={runtime}",
         "KillSignal=SIGKILL",
-        f"WorkingDirectory={out}", f"StandardOutput=file:{out}/harness.out",
-        f"StandardError=file:{out}/harness.err",
+        f"WorkingDirectory={out}", f"StandardOutput=append:{campaign}/harness.out",
+        f"StandardError=append:{campaign}/harness.err",
         *HARDENING,
         *(f"InaccessiblePaths=-{p}" for p in HIDDEN),
         f"BindPaths={out}", f"BindPaths=-{home}/.claude/.credentials.json",
         # The harness checkout borrows the mirror's objects (clone --shared).
-        *(f"BindReadOnlyPaths={p}" for p in (policy["mirror"], *policy["readOnlyPaths"])),
+        *(f"BindReadOnlyPaths={p}" for p in (campaign / "harness", campaign / "scenarios",
+                                             policy["mirror"], *policy["readOnlyPaths"])),
         *(f"BindReadOnlyPaths=-{p}" for p in (
             home / ".claude/plugins", home / ".config/caveman",
             # dcg's config.toml links through the nix store back to this one.
@@ -387,17 +402,17 @@ _SUPERVISOR = ('unit=$1; systemctl=$2; shift 2; '
                'trap "$systemctl --user stop $unit.service; kill -KILL 0" TERM; "$@" & wait $!')
 
 
-def _supervised(argv: list[str], policy: dict, out: Path, runtime: int) -> list[str]:
+def _supervised(argv: list[str], policy: dict, campaign: Path, runtime: int) -> list[str]:
     path = ":".join(policy["path"])
     tools = {name: shutil.which(name, path=path)
              for name in ("setpriv", "bash", "env", "systemd-run", "systemctl", "python3")}
     missing = [name for name, found in tools.items() if not found]
     if missing:
         raise RuntimeError(f"BROKEN safety boundary: not on policy path: {', '.join(missing)}")
-    unit = UNIT_PREFIX + out.name
+    unit = UNIT_PREFIX + campaign.name
     start = [tools["systemd-run"], "--user", f"--unit={unit}", "--wait", "--collect",
              "--expand-environment=no"]
-    for prop in _unit_properties(policy, out, runtime):
+    for prop in _unit_properties(policy, campaign, runtime):
         start += ["-p", prop]
     env = [f"{k}={v}" for k, v in _env(policy).items()]
     return [tools["setpriv"], "--pdeathsig", "TERM", "--", tools["bash"], "-c", _SUPERVISOR,
@@ -480,15 +495,22 @@ def _report(out: Path, scenario: str, n: int) -> str:
     return "\n".join(lines)
 
 
+def _prune(campaigns: Path) -> None:
+    cutoff = time.time() - RETAIN_SEC
+    for entry in os.scandir(campaigns):
+        if entry.is_dir(follow_symlinks=False) and entry.stat(follow_symlinks=False).st_mtime < cutoff:
+            shutil.rmtree(entry.path, ignore_errors=True)
+
+
 def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
     policy = _load_policy(_load_config())
     req = _validate_request(args, policy)
     exe = policy["claudeExecutable"]
     if not os.access(exe, os.X_OK):
         raise RuntimeError(f"BROKEN safety boundary: claude is not executable: {exe}")
-    root = policy["outputRoot"]
-    root.mkdir(mode=0o755, parents=True, exist_ok=True)
-    with open(root / ".lock", "w") as lock:
+    _private_dir(policy["stateDir"])
+    lock = os.open(policy["lock"], os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -501,24 +523,33 @@ def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
         for name in _RUN_FILES:
             if _git(policy, "cat-file", "-e", f"{new}:{scen_rel}/{name}").returncode != 0:
                 raise RuntimeError(f"{req['new_ref']} has no {scen_rel}/{name}")
+        campaigns = _private_dir(policy["campaigns"])
+        _prune(campaigns)
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-        out = root / f"{stamp}-{req['scenario']}-{new[:8]}-{os.getpid()}"
-        _extract_scenarios(policy, new, out / "scenarios")
+        campaign = Path(tempfile.mkdtemp(prefix=f"{stamp}-{req['scenario']}-{new[:8]}-",
+                                         dir=campaigns))
+        out = campaign / "out"
+        out.mkdir(mode=0o700)
+        for name in ("harness.out", "harness.err"):
+            os.close(os.open(campaign / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                             | os.O_CLOEXEC, 0o600))
+        _extract_scenarios(policy, new, campaign / "scenarios")
         try:
-            harness = _checkout_harness(policy, master, out / "harness")
+            harness = _checkout_harness(policy, master, campaign / "harness")
             argv = [sys.executable, "-I", str(harness), "run",
-                    str(out / "scenarios" / scen_rel),
+                    str(campaign / "scenarios" / scen_rel),
                     "--arm", f"old={old}", "--arm", f"new={new}",
                     "--n", str(req["n"]), "--jobs", str(req["jobs"]), "--model", req["model"],
                     "--budget", f"{req['budget']:g}", "--timeout", str(req["timeout"]),
                     "--out", str(out / "runs"), "--claude", str(exe)]
-            rc, _, client = _run_argv(_supervised(argv, policy, out, req["call_timeout"]),
-                                      _manager_env(policy), req["call_timeout"] + 60, rec,
-                                      lock.fileno())
-            stdout, stderr = (_read_beneath(out, name) for name in ("harness.out", "harness.err"))
+            rc, _, client = _run_argv(_supervised(argv, policy, campaign, req["call_timeout"]),
+                                      _manager_env(policy), req["call_timeout"] + 60, rec, lock)
+            stdout, stderr = (_read_beneath(campaign, name) for name in ("harness.out", "harness.err"))
             stderr = "\n".join(part for part in (stderr.rstrip(), client.strip()) if part)
         finally:
-            shutil.rmtree(out / "harness", ignore_errors=True)
+            shutil.rmtree(campaign / "harness", ignore_errors=True)
+    finally:
+        os.close(lock)
     header = (f"agent-e2e campaign `{req['scenario']}` model={req['model']} n={req['n']} "
               f"jobs={req['jobs']} budget=${req['budget']:g} timeout={req['timeout']}s\n"
               f"harness = origin/master = {master}\n"

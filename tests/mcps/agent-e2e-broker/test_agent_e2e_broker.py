@@ -125,17 +125,17 @@ class Fixture(unittest.TestCase):
             "echo '{\"type\":\"result\",\"result\":\"hi\",\"is_error\":false,"
             "\"total_cost_usd\":0.01}'\n")
         self.claude.chmod(0o755)
-        self.out = root / "out"
-        # The mirror must lie outside ~/Repos and ~/worktrees, like the real one.
+        # Broker state must lie outside every sandbox write root, like the real one.
         self.state = tempfile.TemporaryDirectory(prefix="agent-e2e-broker-test-",
                                                  dir=self.home / ".local/state")
+        self.out = Path(self.state.name) / "broker/campaigns"
         self.server.PROTOCOL = "file"
         self.raw = {
             "version": 1, "remoteUrl": f"file://{self.origin}",
             "stateDir": f"{self.state.name}/broker",
             "harness": "runtime/scripts/agent-e2e/agent_e2e.py",
             "scenarioRoot": "tests/agent-e2e", "claudeExecutable": str(self.claude),
-            "outputRoot": str(self.out), "path": os.environ["PATH"].split(":"),
+            "path": os.environ["PATH"].split(":"),
             "models": ["haiku", "sonnet"], "maxSamples": 2, "maxJobs": 2,
             "maxBudgetUsd": 3.0, "maxTimeoutSec": 900, "maxCallSec": 3600,
             "outputLimitChars": 20000, "readOnlyPaths": [],
@@ -188,14 +188,24 @@ class ValidationTests(Fixture):
         self.assertTrue((root / policy["harness"]).is_file(), policy["harness"])
         self.assertTrue((root / policy["scenarioRoot"]).is_dir(), policy["scenarioRoot"])
 
-    def test_shipped_mirror_is_outside_every_sandbox_write_root(self) -> None:
+    def test_shipped_broker_state_is_outside_every_sandbox_write_root(self) -> None:
         self.server.PROTOCOL = "https"
         policy = self.server._load_policy(json.loads((HERE / "config.json").read_text()))
         settings = json.loads((HERE.parents[2] / "runtime/settings.json").read_text())
-        for entry in settings["sandbox"]["filesystem"]["allowWrite"]:
-            root = Path(os.path.realpath(os.path.expanduser(entry)))
-            with self.subTest(entry=entry):
-                self.assertFalse(policy["mirror"] == root or root in policy["mirror"].parents)
+        perms = settings["permissions"]
+        writable = [*settings["sandbox"]["filesystem"]["allowWrite"],
+                    *perms.get("additionalDirectories", []), "/tmp",
+                    *(rule[rule.index("(") + 1:-1] for rule in perms["allow"]
+                      if rule.startswith(("Edit(", "Write(")))]
+        roots = {Path(os.path.realpath(os.path.expanduser(
+            e.removeprefix("/") if e.startswith("//") else e).removesuffix("/**")))
+                 for e in writable}
+        state = {k: v for k, v in policy.items() if isinstance(v, Path) and k != "claudeExecutable"}
+        self.assertIn("stateDir", state)
+        for key, path in state.items():
+            for root in roots:
+                with self.subTest(key=key, root=root):
+                    self.assertFalse(path == root or root in path.parents)
         self.assertTrue(policy["remoteUrl"].startswith("https://"))
 
     def test_policy_rejects_unknown_keys(self) -> None:
@@ -246,11 +256,20 @@ class RunTests(Fixture):
 
     def test_one_campaign_at_a_time(self) -> None:
         import fcntl
-        self.out.mkdir()
-        with open(self.out / ".lock", "w") as held:
+        self.policy["lock"].parent.mkdir(mode=0o700)
+        with open(self.policy["lock"], "w") as held:
             fcntl.flock(held, fcntl.LOCK_EX)
             with self.assertRaisesRegex(RuntimeError, "one at a time"):
                 self.server._tool_run(self.req())
+
+    def test_lock_is_never_opened_through_a_symlink(self) -> None:
+        owner_file = Path(self.tmp.name) / "owner-file"
+        owner_file.write_text("OWNER-DATA\n")
+        self.policy["lock"].parent.mkdir(mode=0o700)
+        self.policy["lock"].symlink_to(owner_file)
+        with self.assertRaises(OSError):
+            self.server._tool_run(self.req())
+        self.assertEqual(owner_file.read_text(), "OWNER-DATA\n")
 
     def test_tools_list_over_stdio(self) -> None:
         msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
@@ -264,13 +283,14 @@ class RunTests(Fixture):
 class RunDirReadTests(Fixture):
     """Scenario code writes the run dir; the broker reads it back outside the unit."""
 
-    def push_setup(self, body: str) -> str:
-        git(self.repo, "switch", "-qc", "feat/hostile-setup")
-        (self.repo / "tests/agent-e2e/demo/setup.sh").write_text("#!/usr/bin/env bash\n" + body)
-        git(self.repo, "commit", "-qam", "hostile setup")
-        git(self.repo, "push", "-q", "origin", "feat/hostile-setup")
+    def push_script(self, name: str, body: str) -> str:
+        git(self.repo, "switch", "-qc", "feat/hostile")
+        script = self.repo / "tests/agent-e2e/demo" / name
+        script.write_text("#!/usr/bin/env bash\n" + body + script.read_text())
+        git(self.repo, "commit", "-qam", "hostile")
+        git(self.repo, "push", "-q", "origin", "feat/hostile")
         git(self.repo, "switch", "-q", "master")
-        return "origin/feat/hostile-setup"
+        return "origin/feat/hostile"
 
     def isolated_run(self, req: dict, timeout: int = 180) -> str:
         import multiprocessing
@@ -299,27 +319,33 @@ class RunDirReadTests(Fixture):
         require_sandbox(self)
         canary = Path(self.tmp.name) / "canary"
         canary.write_text("CANARY-OUTSIDE-RUN-DIR\n")
-        ref = self.push_setup(f'ln -sf {canary} "$2/final.txt"\n'
-                              f'ln -sf {canary} "$2/../../../../harness.out"\n'
-                              f'ln -sf {canary} "$2/../../../../harness.err"\n')
+        ref = self.push_script("check.sh", f'ln -sf {canary} "$1/final.txt"\n')
         text = self.server._tool_run(self.req(new_ref=ref))
-        self.assertIn("harness exit", text)
+        self.assertIn("harness exit 0", text)
         self.assertNotIn("CANARY-OUTSIDE-RUN-DIR", text)
 
     def test_endless_and_huge_run_files_are_read_bounded(self) -> None:
         require_sandbox(self)
-        ref = self.push_setup('out="$2/../../../.."; ln -sf /dev/zero "$out/harness.err"; '
-                              'truncate -s 3G "$out/harness.out"\n')
+        ref = self.push_script("check.sh", 'truncate -s 3G "$1/final.txt"\n')
         text = self.isolated_run(self.req(new_ref=ref))
         self.assertLess(len(text), self.raw["outputLimitChars"] + 1000)
         self.assertIn("agent-e2e campaign `demo`", text)
 
     def test_fifo_in_the_run_dir_does_not_block(self) -> None:
         require_sandbox(self)
-        ref = self.push_setup('out="$2/../../../.."; rm -f "$out/harness.out"; '
-                              'mkfifo "$out/harness.out"\n')
+        ref = self.push_script("check.sh", 'rm -f "$1/final.txt"; mkfifo "$1/final.txt"\n')
         text = self.isolated_run(self.req(new_ref=ref))
-        self.assertIn("harness exit", text)
+        self.assertIn("harness exit 0", text)
+
+    def test_scenario_code_cannot_reach_what_the_manager_writes_or_the_harness(self) -> None:
+        require_sandbox(self)
+        ref = self.push_script("setup.sh", 'c="$2/../../../../.."; '
+                               'for f in harness.out harness.err harness/x scenarios/x; do '
+                               'echo PLANTED-$f >> "$c/$f" && echo "WROTE $f"; done\n')
+        text = self.server._tool_run(self.req(new_ref=ref))
+        [log] = self.out.glob("*/out/runs/demo/new/1/setup.log")
+        self.assertNotIn("WROTE", log.read_text(), text)
+        self.assertNotIn("PLANTED", text)
 
 
 class UnitBindTests(Fixture):
@@ -341,7 +367,7 @@ class UnitBindTests(Fixture):
             git(self.repo, "push", "-q", "origin", "feat/reads-repos")
             git(self.repo, "switch", "-q", "master")
             text = self.server._tool_run(self.req(new_ref="origin/feat/reads-repos"))
-            [log] = self.out.glob("*/runs/demo/new/1/setup.log")
+            [log] = self.out.glob("*/out/runs/demo/new/1/setup.log")
             setup = log.read_text()
             self.assertIn("NEEDED-REPO-READ", setup, text)
             self.assertNotIn("OTHER-REPO-CANARY", setup, text)
@@ -361,7 +387,7 @@ class UnitBindTests(Fixture):
         git(self.repo, "push", "-q", "origin", "feat/reads-dcg")
         git(self.repo, "switch", "-q", "master")
         text = self.server._tool_run(self.req(new_ref="origin/feat/reads-dcg"))
-        [log] = self.out.glob("*/runs/demo/new/1/setup.log")
+        [log] = self.out.glob("*/out/runs/demo/new/1/setup.log")
         self.assertIn("DCG-CONFIG-READ", log.read_text(), text)
 
     def test_agent_bash_sandbox_can_start_inside_the_unit(self) -> None:
@@ -375,7 +401,7 @@ class UnitBindTests(Fixture):
         git(self.repo, "push", "-q", "origin", "feat/nested-sandbox")
         git(self.repo, "switch", "-q", "master")
         text = self.server._tool_run(self.req(new_ref="origin/feat/nested-sandbox"))
-        [log] = self.out.glob("*/runs/demo/new/1/setup.log")
+        [log] = self.out.glob("*/out/runs/demo/new/1/setup.log")
         self.assertIn("SANDBOX-STARTED", log.read_text(), text)
 
     def test_policy_paths_and_remote_are_checked(self) -> None:
@@ -436,6 +462,7 @@ class ReviewFindingTests(Fixture):
         require_sandbox(self)
         self.server._tool_run(self.req())
         self.assertEqual(list(self.out.glob("*/harness")), [])
+        self.assertTrue(list(self.out.glob("*/out/runs/demo/new/1/verdict.json")))
 
     def test_redacts_private_and_age_keys(self) -> None:
         key = "AGE-SECRET-KEY-1" + "Q" * 58
@@ -469,7 +496,7 @@ class ReviewFindingTests(Fixture):
         git(self.repo, "switch", "-q", "master")
         try:
             text = self.server._tool_run(self.req(new_ref="origin/feat/pushed-by-sandboxed-agent"))
-            [log] = self.out.glob("*/runs/demo/new/1/setup.log")
+            [log] = self.out.glob("*/out/runs/demo/new/1/setup.log")
             setup = log.read_text()
             self.assertIn("WROTE-RUN", setup, text)
             for leak in ("TOKEN-READABLE", "TOKEN-DIR-VISIBLE", "AGENIX-VISIBLE",
@@ -512,7 +539,7 @@ class ReviewFindingTests(Fixture):
         git(self.repo, "switch", "-q", "master")
         try:
             text = self.server._tool_run(self.req(new_ref="origin/feat/abstract-socket"))
-            [log] = self.out.glob("*/runs/demo/new/1/setup.log")
+            [log] = self.out.glob("*/out/runs/demo/new/1/setup.log")
             setup = log.read_text()
             self.assertIn("ABSTRACT-REFUSED", setup, text)
             self.assertNotIn("ABSTRACT-REACHED", setup, text)
@@ -540,10 +567,10 @@ class ReviewFindingTests(Fixture):
         proc.stdin.write(json.dumps(call) + "\n")
         proc.stdin.flush()
         deadline = time.monotonic() + 30
-        while not list(self.out.glob("*/runs/demo/*/*/started")) \
+        while not list(self.out.glob("*/out/runs/demo/*/*/started")) \
                 and time.monotonic() < deadline:
             time.sleep(0.1)
-        self.assertTrue(list(self.out.glob("*/runs/demo/*/*/started")),
+        self.assertTrue(list(self.out.glob("*/out/runs/demo/*/*/started")),
                         "stub claude never started")
         proc.kill()
         proc.wait()
@@ -552,7 +579,7 @@ class ReviewFindingTests(Fixture):
         while time.monotonic() < deadline:
             harness = subprocess.run(["pgrep", "-f", f"{self.out}/.*runs"],
                                      capture_output=True, text=True).stdout.split()
-            with open(self.out / ".lock", "w") as fh:
+            with open(self.policy["lock"], "w") as fh:
                 try:
                     fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     locked = False
