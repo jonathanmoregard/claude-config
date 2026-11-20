@@ -7,7 +7,8 @@ EAI_AGAIN). This server runs outside the sandbox and exposes one ``run`` tool:
 an old/new campaign of one scenario, nothing else.
 
 - The harness is origin/master's, checked out fresh per campaign from the
-  config repo; neither a candidate ref nor that repo's working tree replaces it.
+  broker's own mirror of the canonical remote; neither a candidate ref nor any
+  local checkout replaces it, and git never runs in a local checkout.
 - Both arms are refs on origin (``origin/<branch>`` or a commit reachable from
   one), resolved to full SHAs before the run: only pushed, reviewable config is
   ever staged.
@@ -51,12 +52,13 @@ _in_flight: dict[Any, _InFlight] = {}
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
-from broker_paths import canonical  # noqa: E402
+from broker_paths import canonical, roots  # noqa: E402
 CONFIG_PATH = str(HERE / "config.json")
 TAG = "[agent-e2e-broker]"
+PROTOCOL = "https"
 
 _POLICY_KEYS = frozenset({
-    "version", "repo", "harness", "scenarioRoot", "claudeExecutable",
+    "version", "remoteUrl", "stateDir", "harness", "scenarioRoot", "claudeExecutable",
     "outputRoot", "path", "models", "maxSamples", "maxJobs", "maxBudgetUsd",
     "maxTimeoutSec", "maxCallSec", "outputLimitChars", "readOnlyPaths",
 })
@@ -110,9 +112,15 @@ def _load_policy(config: dict) -> dict:
     extra = raw["readOnlyPaths"]
     if not isinstance(extra, list):
         raise RuntimeError("policy readOnlyPaths must be a list of absolute paths")
+    url = raw["remoteUrl"]
+    if not isinstance(url, str) or not re.fullmatch(rf"{PROTOCOL}://[A-Za-z0-9._@:/-]+", url):
+        raise RuntimeError(f"policy remoteUrl must be a plain {PROTOCOL}:// URL")
     home = _passwd_home()
     policy = dict(raw)
-    policy["repo"] = canonical(raw["repo"], home)[0]
+    policy["stateDir"] = Path(os.path.realpath(_abs(raw["stateDir"], "stateDir")))
+    if any(r == policy["stateDir"] or r in policy["stateDir"].parents for r in roots(home)):
+        raise RuntimeError("policy stateDir must lie outside ~/Repos and ~/worktrees")
+    policy["mirror"] = policy["stateDir"] / "mirror.git"
     policy["readOnlyPaths"] = [canonical(p, home)[0] for p in extra
                                if not isinstance(p, str) or os.path.lexists(p)]
     policy["claudeExecutable"] = _abs(raw["claudeExecutable"], "claudeExecutable")
@@ -170,11 +178,58 @@ def _validate_request(args: object, policy: dict) -> dict:
             "timeout": timeout, "budget": float(budget), "call_timeout": worst + 120}
 
 
-def _git(policy: dict, *argv: str, timeout: int = 60, env: Optional[dict] = None
-         ) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(policy["repo"]), *argv], capture_output=True,
-                          text=True, timeout=timeout, env=env or _env(policy),
+# Sandboxed sessions can write the config checkout, and git runs programs its
+# config names, so the broker never runs git there (gitsecurityboundary(7)).
+# It keeps its own bare mirror outside every sandbox write root, fetched from
+# the canonical remote by URL and refspec, with no agent socket, a scrubbed
+# environment, and command-line overrides of what config could make git run.
+_GIT_OVERRIDES = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+                  "-c", "credential.helper=", "-c", "core.pager=cat", "-c", "gc.auto=0",
+                  "-c", "maintenance.auto=false", "-c", "fetch.recurseSubmodules=false")
+
+
+def _git_env(policy: dict, protocol: str) -> dict[str, str]:
+    state = policy["stateDir"]
+    return {"PATH": ":".join(policy["path"]), "LANG": "C.UTF-8", "HOME": str(state / "home"),
+            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": str(state / "gitconfig"),
+            "GIT_TERMINAL_PROMPT": "0", "GIT_ALLOW_PROTOCOL": protocol,
+            "GIT_PROTOCOL_FROM_USER": "0", "GIT_NO_LAZY_FETCH": "1"}
+
+
+def _remote_protocol(policy: dict) -> str:
+    return policy["remoteUrl"].split("://", 1)[0]
+
+
+def _git_run(policy: dict, argv: list, timeout: int = 60, protocol: str = "file"
+             ) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *_GIT_OVERRIDES, *argv], capture_output=True, text=True,
+                          timeout=timeout, env=_git_env(policy, protocol),
                           stdin=subprocess.DEVNULL)
+
+
+def _git(policy: dict, *argv: str, timeout: int = 60) -> subprocess.CompletedProcess:
+    return _git_run(policy, [f"--git-dir={policy['mirror']}", *argv], timeout)
+
+
+def _update_mirror(policy: dict) -> None:
+    state = policy["stateDir"]
+    for d in (state, state / "home"):
+        d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (state / "gitconfig").write_text("[safe]\n\tbareRepository = explicit\n")
+    if not policy["mirror"].exists():
+        init = _git_run(policy, ["init", "--quiet", "--bare", "--template=", str(policy["mirror"])])
+        if init.returncode != 0:
+            raise RuntimeError(f"could not create the mirror: {init.stderr.strip()[:300]}")
+    try:
+        fetch = _git_run(policy, [f"--git-dir={policy['mirror']}", "fetch", "--quiet", "--prune",
+                                  "--no-tags", "--no-recurse-submodules", policy["remoteUrl"],
+                                  "+refs/heads/*:refs/remotes/origin/*"],
+                         timeout=300, protocol=_remote_protocol(policy))
+    except subprocess.TimeoutExpired:
+        fetch = subprocess.CompletedProcess([], 124, "", "timed out")
+    # Fail closed: stale refs must never stand in for what origin holds now.
+    if fetch.returncode != 0:
+        raise RuntimeError(f"git fetch {policy['remoteUrl']} failed: {fetch.stderr.strip()[:300]}")
 
 
 def _checkout_harness(policy: dict, sha: str, dest: Path) -> Path:
@@ -182,12 +237,10 @@ def _checkout_harness(policy: dict, sha: str, dest: Path) -> Path:
     must sit in a repository, and the config repo's own working tree never runs."""
     if _git(policy, "cat-file", "-e", f"{sha}:{policy['harness']}").returncode != 0:
         raise RuntimeError(f"BROKEN safety boundary: origin/master has no {policy['harness']}")
-    no_hooks = ("-c", "core.hooksPath=/dev/null")
-    for argv in (["git", *no_hooks, "clone", "--quiet", "--shared", "--no-checkout",
-                  str(policy["repo"]), str(dest)],
-                 ["git", *no_hooks, "-C", str(dest), "checkout", "--quiet", "--detach", sha]):
-        done = subprocess.run(argv, capture_output=True, text=True, timeout=120,
-                              env=_env(policy), stdin=subprocess.DEVNULL)
+    for argv in (["clone", "--quiet", "--shared", "--no-checkout", "--template=",
+                  str(policy["mirror"]), str(dest)],
+                 ["-C", str(dest), "checkout", "--quiet", "--detach", sha]):
+        done = _git_run(policy, argv, timeout=120)
         if done.returncode != 0:
             raise RuntimeError(f"could not check out the harness at {sha}: "
                                f"{done.stderr.strip()[:300]}")
@@ -197,7 +250,7 @@ def _checkout_harness(policy: dict, sha: str, dest: Path) -> Path:
 def _resolve(policy: dict, ref: str) -> str:
     if _SHA_RE.fullmatch(ref):
         if _git(policy, "cat-file", "-e", f"{ref}^{{commit}}").returncode != 0:
-            raise RuntimeError(f"{ref} is not a commit in {policy['repo']}")
+            raise RuntimeError(f"{ref} is not a commit on origin (after fetch)")
         held = _git(policy, "branch", "-r", "--contains", ref)
         if held.returncode != 0 or not held.stdout.strip():
             raise RuntimeError(f"{ref} is not reachable from any origin branch; push it first")
@@ -257,9 +310,10 @@ def _read_beneath(root: Path, rel: str, limit: int = MAX_READ_BYTES, tail: bool 
 
 def _extract_scenarios(policy: dict, sha: str, dest: Path) -> None:
     dest.mkdir(parents=True)
-    archive = subprocess.Popen(["git", "-C", str(policy["repo"]), "archive", sha, "--",
-                                policy["scenarioRoot"]], stdout=subprocess.PIPE,
-                               stderr=subprocess.DEVNULL, env=_env(policy), stdin=subprocess.DEVNULL)
+    archive = subprocess.Popen(["git", *_GIT_OVERRIDES, f"--git-dir={policy['mirror']}", "archive",
+                                sha, "--", policy["scenarioRoot"]], stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, env=_git_env(policy, "file"),
+                               stdin=subprocess.DEVNULL)
     tar = subprocess.run(["tar", "-xf", "-", "-C", str(dest)], stdin=archive.stdout,
                          capture_output=True, env=_env(policy), timeout=120)
     archive.stdout.close()
@@ -269,7 +323,7 @@ def _extract_scenarios(policy: dict, sha: str, dest: Path) -> None:
 
 # The harness runs in a hardened user unit, because scenario setup.sh and
 # check.sh come from a pushed branch and run as the owner. What stays reachable
-# is what a campaign needs: its output dir, the Claude login, the config repo
+# is what a campaign needs: its output dir, the Claude login, the mirror
 # and readOnlyPaths (targets of its skill symlinks) read-only, and the
 # network. bwrap, which the harness puts the agent under, must still mount a
 # fresh /proc; ProtectKernelTunables=,
@@ -301,7 +355,8 @@ def _unit_properties(policy: dict, out: Path, runtime: int) -> list[str]:
         *HARDENING,
         *(f"InaccessiblePaths=-{p}" for p in HIDDEN),
         f"BindPaths={out}", f"BindPaths=-{home}/.claude/.credentials.json",
-        *(f"BindReadOnlyPaths={p}" for p in (policy["repo"], *policy["readOnlyPaths"])),
+        # The harness checkout borrows the mirror's objects (clone --shared).
+        *(f"BindReadOnlyPaths={p}" for p in (policy["mirror"], *policy["readOnlyPaths"])),
         *(f"BindReadOnlyPaths=-{p}" for p in (
             home / ".claude/plugins", home / ".config/caveman",
             # dcg's config.toml links through the nix store back to this one.
@@ -438,20 +493,7 @@ def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise RuntimeError("another agent-e2e campaign is running; one at a time") from None
-        # The fetch alone gets the SSH agent (origin is an ssh remote); the
-        # harness and the agent under test never do.
-        fetch_env = dict(_env(policy), GIT_TERMINAL_PROMPT="0")
-        if os.environ.get("SSH_AUTH_SOCK"):
-            fetch_env["SSH_AUTH_SOCK"] = os.environ["SSH_AUTH_SOCK"]
-        try:
-            fetch = _git(policy, "fetch", "--quiet", "--prune", "origin", timeout=120,
-                         env=fetch_env)
-        except subprocess.TimeoutExpired:
-            fetch = subprocess.CompletedProcess([], 124, "", "timed out")
-        # Fail closed: stale or planted remote-tracking refs must never stand
-        # in for what origin holds now.
-        if fetch.returncode != 0:
-            raise RuntimeError(f"git fetch origin failed: {fetch.stderr.strip()[:300]}")
+        _update_mirror(policy)
         master = _resolve(policy, "origin/master")
         old = _resolve(policy, req["old_ref"])
         new = _resolve(policy, req["new_ref"])

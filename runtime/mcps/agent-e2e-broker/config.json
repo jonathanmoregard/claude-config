@@ -1,7 +1,8 @@
 {
   "agentE2eBroker": {
     "version": 1,
-    "repo": "/home/jonathan/Repos/claude-config",
+    "remoteUrl": "https://github.com/jonathanmoregard/claude-config.git",
+    "stateDir": "/home/jonathan/.local/state/agent-e2e-broker",
     "harness": "runtime/scripts/agent-e2e/agent_e2e.py",
     "scenarioRoot": "tests/agent-e2e",
     "claudeExecutable": "/home/jonathan/.local/bin/claude",

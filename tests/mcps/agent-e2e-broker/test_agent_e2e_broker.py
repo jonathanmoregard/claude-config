@@ -126,8 +126,13 @@ class Fixture(unittest.TestCase):
             "\"total_cost_usd\":0.01}'\n")
         self.claude.chmod(0o755)
         self.out = root / "out"
+        # The mirror must lie outside ~/Repos and ~/worktrees, like the real one.
+        self.state = tempfile.TemporaryDirectory(prefix="agent-e2e-broker-test-",
+                                                 dir=self.home / ".local/state")
+        self.server.PROTOCOL = "file"
         self.raw = {
-            "version": 1, "repo": str(self.repo),
+            "version": 1, "remoteUrl": f"file://{self.origin}",
+            "stateDir": f"{self.state.name}/broker",
             "harness": "runtime/scripts/agent-e2e/agent_e2e.py",
             "scenarioRoot": "tests/agent-e2e", "claudeExecutable": str(self.claude),
             "outputRoot": str(self.out), "path": os.environ["PATH"].split(":"),
@@ -141,6 +146,7 @@ class Fixture(unittest.TestCase):
     def tearDown(self) -> None:
         os.environ.pop("GIT_CONFIG_GLOBAL", None)
         self.tmp.cleanup()
+        self.state.cleanup()
 
     def req(self, **over) -> dict:
         return {"scenario": "demo", "old_ref": "origin/master", "new_ref": "origin/feat/x",
@@ -176,10 +182,21 @@ class ValidationTests(Fixture):
             self.server._validate_request(self.req(n=2, jobs=1, timeout_sec=900), policy)
 
     def test_shipped_config_names_paths_of_this_repo(self) -> None:
+        self.server.PROTOCOL = "https"
         policy = self.server._load_policy(json.loads((HERE / "config.json").read_text()))
         root = HERE.parents[2]
         self.assertTrue((root / policy["harness"]).is_file(), policy["harness"])
         self.assertTrue((root / policy["scenarioRoot"]).is_dir(), policy["scenarioRoot"])
+
+    def test_shipped_mirror_is_outside_every_sandbox_write_root(self) -> None:
+        self.server.PROTOCOL = "https"
+        policy = self.server._load_policy(json.loads((HERE / "config.json").read_text()))
+        settings = json.loads((HERE.parents[2] / "runtime/settings.json").read_text())
+        for entry in settings["sandbox"]["filesystem"]["allowWrite"]:
+            root = Path(os.path.realpath(os.path.expanduser(entry)))
+            with self.subTest(entry=entry):
+                self.assertFalse(policy["mirror"] == root or root in policy["mirror"].parents)
+        self.assertTrue(policy["remoteUrl"].startswith("https://"))
 
     def test_policy_rejects_unknown_keys(self) -> None:
         with self.assertRaises(RuntimeError):
@@ -193,10 +210,12 @@ class RefPolicyTests(Fixture):
         git(self.repo, "commit", "-qam", "local")
         sha = git(self.repo, "rev-parse", "HEAD")
         git(self.repo, "switch", "-q", "master")
-        with self.assertRaisesRegex(RuntimeError, "not reachable"):
+        self.server._update_mirror(self.policy)
+        with self.assertRaisesRegex(RuntimeError, "not a commit on origin"):
             self.server._resolve(self.policy, sha)
 
     def test_missing_branch_refused(self) -> None:
+        self.server._update_mirror(self.policy)
         with self.assertRaisesRegex(RuntimeError, "does not exist"):
             self.server._resolve(self.policy, "origin/nope")
 
@@ -359,11 +378,35 @@ class UnitBindTests(Fixture):
         [log] = self.out.glob("*/runs/demo/new/1/setup.log")
         self.assertIn("SANDBOX-STARTED", log.read_text(), text)
 
-    def test_policy_paths_go_through_the_canonicaliser(self) -> None:
-        for key, bad in (("repo", str(self.repo / ".git")), ("repo", "/etc"),
+    def test_policy_paths_and_remote_are_checked(self) -> None:
+        for key, bad in (("stateDir", str(self.home / "worktrees/mirror")),
+                         ("stateDir", str(self.home / "Repos")), ("stateDir", "state"),
+                         ("remoteUrl", "ext::sh -c touch% /tmp/x"),
+                         ("remoteUrl", f"file://{self.origin} --upload-pack=x"),
                          ("readOnlyPaths", [str(self.home / ".ssh")])):
             with self.subTest(key=key, bad=bad), self.assertRaises(RuntimeError):
                 self.server._load_policy({"agentE2eBroker": {**self.raw, key: bad}})
+
+
+class UntrustedCheckoutTests(Fixture):
+    """The config checkout is writable by sandboxed sessions; its git config must never run."""
+
+    def test_config_planted_in_the_checkout_never_runs(self) -> None:
+        root = Path(self.tmp.name)
+        canary = root / "planted-ran"
+        hooks = root / "planted-hooks"
+        hooks.mkdir()
+        hook = hooks / "reference-transaction"
+        hook.write_text(f"#!/bin/sh\ntouch {canary}\n")
+        hook.chmod(0o755)
+        git(self.repo, "update-ref", "-d", "refs/remotes/origin/feat/x")
+        git(self.repo, "config", "core.hooksPath", str(hooks))
+        git(self.repo, "config", "core.fsmonitor", f"touch {canary}; false")
+        try:
+            self.server._tool_run(self.req(scenario="absent"))
+        except RuntimeError:
+            pass
+        self.assertFalse(canary.exists(), "the broker ran git config planted in the checkout")
 
 
 class ReviewFindingTests(Fixture):
@@ -379,7 +422,7 @@ class ReviewFindingTests(Fixture):
         self.assertIn("does not exist", str(ctx.exception))
 
     def test_unreachable_origin_fails_closed(self) -> None:
-        git(self.repo, "remote", "set-url", "origin", str(self.repo.parent / "gone.git"))
+        self.raw["remoteUrl"] = f"file://{self.repo.parent}/gone.git"
         with self.assertRaisesRegex(RuntimeError, "fetch"):
             self.server._tool_run(self.req())
 
@@ -487,7 +530,8 @@ class ReviewFindingTests(Fixture):
         self.claude.write_text("#!/usr/bin/env bash\ntouch \"$E2E_RUN/started\"\nsleep 30\n")
         broker = root / "broker"
         broker.mkdir()
-        shutil.copy(SERVER, broker / "server.py")
+        source = SERVER.read_text()
+        (broker / "server.py").write_text(source.replace('PROTOCOL = "https"', 'PROTOCOL = "file"'))
         shutil.copy(HERE.parent / "broker_paths.py", root / "broker_paths.py")
         (broker / "config.json").write_text(json.dumps({"agentE2eBroker": self.raw}))
         proc = subprocess.Popen([sys.executable, str(broker / "server.py")],
