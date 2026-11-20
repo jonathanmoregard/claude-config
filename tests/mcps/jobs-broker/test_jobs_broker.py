@@ -621,17 +621,13 @@ class RealUnitTests(unittest.TestCase):
         self.assertEqual(self.canary.read_text(), "CANARY-OUTSIDE-REPO\n")
 
     def test_job_cannot_read_a_path_the_session_sandbox_denies(self) -> None:
-        run_dir = Path(f"/run/user/{os.getuid()}")
-        settings = json.loads((self.home / ".claude/settings.json").read_text())
-        if str(run_dir) not in settings["sandbox"]["filesystem"].get("denyRead", []):
-            self.skipTest(f"{run_dir} is not a sandbox denyRead path here")
-        canary = run_dir / f"jobs-broker-canary-{uuid.uuid4().hex[:8]}"
-        canary.write_text("CANARY-DENIED-READ\n")
-        try:
-            out = self.run_job(f"cat {canary}; exit 0")
-        finally:
-            canary.unlink()
+        (self.repo / "denied").mkdir()
+        (self.repo / "denied/f").write_text("CANARY-DENIED-READ\n")
+        (self.repo / "allowed").write_text("CANARY-ALLOWED-READ\n")
+        self.use_settings(denyRead=[str(self.repo / "denied")])
+        out = self.run_job("cat denied/f; cat allowed; exit 0")
         self.assertIn("MARKER_OK", out)
+        self.assertIn("CANARY-ALLOWED-READ", out)
         self.assertNotIn("CANARY-DENIED-READ", out)
 
     def test_job_cannot_read_what_a_read_deny_rule_names(self) -> None:
