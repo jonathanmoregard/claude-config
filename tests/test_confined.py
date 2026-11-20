@@ -262,8 +262,8 @@ def test_a_refused_launch_leaves_a_file_that_replaced_its_guard(world) -> None:
     assert source.count(marking) == 1
     script.write_text(source.replace(
         marking,
-        'if content is not None: os.unlink(name, dir_fd=parent); '
-        'os.write(os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644, dir_fd=parent), '
+        'if content is not None: os.unlink(tmp, dir_fd=parent); '
+        'os.write(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644, dir_fd=parent), '
         'b"theirs"); raise OSError(95, "injected")\n'
         '            ' + marking))
     proc = run(script, "--", "true", cwd=world["repo"])
@@ -277,9 +277,110 @@ def test_a_refused_launch_leaves_a_file_that_replaced_its_guard(world) -> None:
 def test_a_stop_while_guards_are_placed_leaves_the_checkout_as_it_was(world) -> None:
     script = make_tree(world["var"] / "tree2", world["settings"])
     source = script.read_text()
-    created = "os.mkdir(name, 0o755, dir_fd=parent)"
+    created = "os.mkdir(tmp, 0o755, dir_fd=parent)"
     assert source.count(created) == 1
     script.write_text(source.replace(created, f"{created}; os.kill(os.getpid(), signal.SIGTERM)"))
+    before = sorted(str(p) for p in world["repo"].rglob("*"))
+    proc = run(script, "--", "true", cwd=world["repo"])
+    assert proc.returncode == 128 + signal.SIGTERM, proc.stderr
+    assert sorted(str(p) for p in world["repo"].rglob("*")) == before
+
+
+def injected(world, name: str, old: str, new: str) -> Path:
+    script = make_tree(world["var"] / name, world["settings"])
+    source = script.read_text()
+    assert source.count(old) == 1, old
+    script.write_text(source.replace(old, new))
+    return script
+
+
+def wait_until(condition, timeout: float = 30) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+
+
+def writes_mcp_json_later(repo: Path, delay: int) -> list[str]:
+    return ["--", "bash", "-c",
+            f'sleep {delay}; ( echo x >{repo}/.mcp.json ) 2>/dev/null && echo created; echo {RAN}']
+
+
+@needs_pasta
+def test_a_guard_still_being_placed_is_not_taken_for_real_config(world) -> None:
+    repo = world["repo"]
+    marking = 'os.setxattr(fd, STUB_MARK, b"1")'
+    slow = injected(world, "slow", marking,
+                    f'time.sleep(3 if name == ".mcp.json" else 0); {marking}')
+    placing = subprocess.Popen([str(slow), "--", "true"], cwd=repo, env=base_env(),
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    wait_until(lambda: os.path.lexists(repo / ".mcp.json"))
+    later = run(world["script"], *writes_mcp_json_later(repo, 6), cwd=repo)
+    placing.communicate(timeout=60)
+    assert later.stdout.rstrip().endswith(RAN) and "created" not in later.stdout, later.stdout
+    assert not (repo / ".mcp.json").exists()
+
+
+@needs_pasta
+def test_an_adopted_guard_replaced_before_it_is_locked_is_not_bound_unlocked(world) -> None:
+    repo = world["repo"]
+    adopting = "fd = self.adopt(parent, name)"
+    slow = injected(world, "slow", adopting,
+                    f'{adopting}; time.sleep(5 if name == ".mcp.json" else 0)')
+    first = subprocess.Popen([str(world["script"]), "--", "sleep", "2"], cwd=repo,
+                             env=base_env(), stdout=subprocess.PIPE, text=True)
+    wait_until(lambda: os.path.lexists(repo / ".mcp.json"))
+    adopter = subprocess.Popen([str(slow), *writes_mcp_json_later(repo, 10)], cwd=repo,
+                               env=base_env(), stdout=subprocess.PIPE, text=True)
+    first.communicate(timeout=60)
+    wait_until(lambda: not os.path.lexists(repo / ".mcp.json"))
+    third = run(world["script"], "--", "sleep", "4", cwd=repo)
+    out, _ = adopter.communicate(timeout=60)
+    assert third.returncode == 0, third.stderr
+    assert out.rstrip().endswith(RAN) and "created" not in out, out
+    assert not (repo / ".mcp.json").exists()
+
+
+@needs_pasta
+def test_a_guard_swapped_before_it_is_opened_is_not_removed(world) -> None:
+    repo = world["repo"]
+    created = re.search(r"os\.mkdir\((\w+), 0o755, dir_fd=parent\)",
+                        (SCRIPTS / "confined").read_text())
+    assert created
+    entry = created[1]
+    swap = (f"{created[0]}; os.rename({entry}, {entry} + '.ours', src_dir_fd=parent, "
+            f"dst_dir_fd=parent); os.mkdir({entry}, 0, dir_fd=parent)")
+    script = injected(world, "swap", created[0], swap)
+    proc = run(script, "--", "true", cwd=repo)
+    assert proc.returncode == 3, proc.stderr
+    theirs = [p for p in repo.iterdir() if p.is_dir() and p.stat().st_mode & 0o777 == 0]
+    for p in theirs:
+        p.chmod(0o755)
+    assert len(theirs) == 1, sorted(repo.iterdir())
+
+
+@needs_pasta
+def test_a_stop_just_after_the_jail_starts_leaves_the_checkout_as_it_was(world) -> None:
+    started = "preexec_fn=lambda: (die_with_parent(), net.enter()))"
+    script = injected(world, "stop", started,
+                      f"{started}\n    os.kill(os.getpid(), signal.SIGTERM)")
+    before = sorted(str(p) for p in world["repo"].rglob("*"))
+    proc = run(script, "--", "sleep", "30", cwd=world["repo"])
+    assert proc.returncode == 128 + signal.SIGTERM, proc.stderr
+    assert sorted(str(p) for p in world["repo"].rglob("*")) == before
+
+
+@needs_pasta
+def test_a_second_stop_while_guards_are_removed_leaves_the_checkout_as_it_was(world) -> None:
+    locking = "fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)"
+    script = make_tree(world["var"] / "stop2", world["settings"])
+    source = script.read_text()
+    for old, new in ((locking, f"{locking}; os.kill(os.getpid(), signal.SIGTERM)"),
+                     ("net = Network(tools)",
+                      "os.kill(os.getpid(), signal.SIGTERM); net = Network(tools)")):
+        assert source.count(old) == 1, old
+        source = source.replace(old, new)
+    script.write_text(source)
     before = sorted(str(p) for p in world["repo"].rglob("*"))
     proc = run(script, "--", "true", cwd=world["repo"])
     assert proc.returncode == 128 + signal.SIGTERM, proc.stderr

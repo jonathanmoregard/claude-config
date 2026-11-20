@@ -33,6 +33,7 @@ Exit: the command's status · 3 cannot build the jail · 64 usage or refusal.
 from __future__ import annotations
 
 import ctypes
+import errno
 import fcntl
 import glob
 import json
@@ -365,46 +366,60 @@ class Stubs:
         try:
             for path, content in wanted.items():
                 parent, name = pinned(os.path.dirname(path)), os.path.basename(path)
-                fd = self.make(parent, name, content)
-                if fd is None:
-                    fd = self.adopt(parent, name)
-                if fd is None:
-                    fail(3, f"cannot place a guard at {path}")
-                fcntl.flock(fd, fcntl.LOCK_SH)
-                self.held.append((parent, name, fd))
+                self.held.append((parent, name, self.hold(parent, name, content, path)))
         except BaseException:
             self.remove()
             raise
 
+    def hold(self, parent: int, name: str, content: str | None, path: str) -> int:
+        # The guard adopted may have been removed by its finishing owner, and
+        # another put in its place, before the lock was taken.
+        for _ in range(10):
+            fd = self.make(parent, name, content)
+            if fd is None:
+                fd = self.adopt(parent, name)
+            if fd is None:
+                continue
+            fcntl.flock(fd, fcntl.LOCK_SH)
+            try:
+                if os.path.samestat(os.fstat(fd), os.stat(name, dir_fd=parent,
+                                                          follow_symlinks=False)):
+                    return fd
+            except FileNotFoundError:  # arftl-allow: swallowed-exception
+                pass
+            os.close(fd)
+        fail(3, f"cannot place a guard at {path}")
+
     @staticmethod
     def make(parent: int, name: str, content: str | None) -> int | None:
-        fd = None
+        """A new guard, or None when the name is taken. It gets its name only
+        once marked: an unmarked entry is real config to every other run."""
+        tmp = f".confined-guard-{os.urandom(8).hex()}"
+        fd = error = None
         try:
             if content is None:
-                os.mkdir(name, 0o755, dir_fd=parent)
+                os.mkdir(tmp, 0o755, dir_fd=parent)
+                fd = os.open(tmp, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
             else:
-                fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644,
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644,
                              dir_fd=parent)
-        except FileExistsError:
-            return None
-        except OSError as e:
-            fail(3, f"cannot place a guard named {name}: {e}")
-        try:
-            if fd is None:
-                fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
-            else:
                 os.write(fd, content.encode())
             os.setxattr(fd, STUB_MARK, b"1")
-            return fd
+            if rename_noreplace(parent, tmp, name):
+                return fd
         except OSError as e:
-            # Unmarked, no later run would know it for a guard.
-            try:
-                now = os.stat(name, dir_fd=parent, follow_symlinks=False)
-                if fd is None or os.path.samestat(os.fstat(fd), now):
-                    (os.rmdir if content is None else os.unlink)(name, dir_fd=parent)
-            except OSError:  # arftl-allow: swallowed-exception
-                pass
-            fail(3, f"cannot place a guard named {name}: {e}")
+            error = e
+        try:
+            if fd is not None and os.path.samestat(
+                    os.fstat(fd), os.stat(tmp, dir_fd=parent, follow_symlinks=False)):
+                (os.rmdir if content is None else os.unlink)(tmp, dir_fd=parent)
+        except OSError:  # arftl-allow: swallowed-exception
+            pass
+        if fd is not None:
+            os.close(fd)
+        if error:
+            fail(3, f"cannot place a guard named {name}: {error}")
+        return None
 
     @staticmethod
     def marked(path: str) -> bool:
@@ -479,6 +494,17 @@ def shared_tmp() -> str:
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
         fail(3, f"{path} is not a directory of this user")
     return path
+
+
+def rename_noreplace(dir_fd: int, src: str, dst: str) -> bool:
+    """False when dst exists."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.renameat2(dir_fd, os.fsencode(src), dir_fd, os.fsencode(dst), 1) == 0:
+        return True
+    code = ctypes.get_errno()
+    if code == errno.EEXIST:
+        return False
+    raise OSError(code, os.strerror(code), dst)
 
 
 def pinned(path: str) -> int:
@@ -649,12 +675,23 @@ def jail_is_empty(patience: float = 10.0) -> bool:
 
 
 def supervise(argv: list[str], fds: list[int], net: Network) -> int:
+    # Handled before the fork: an exit raised by a stop meanwhile would skip the kill below.
+    child = None
+    stops: list[int] = []
+
+    def forward(signum: int, _frame) -> None:
+        stops.append(signum)
+        if child is not None:
+            child.send_signal(signum)
+
+    for sig in STOPS:
+        signal.signal(sig, forward)
     child = subprocess.Popen(argv, pass_fds=fds,
                              env={k: v for k, v in os.environ.items() if k not in LOADER},
                              preexec_fn=lambda: (die_with_parent(), net.enter()))
     try:
-        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-            signal.signal(sig, lambda signum, _frame: child.send_signal(signum))
+        if stops:
+            child.send_signal(stops[0])
         status = child.wait()
     finally:
         if child.poll() is None:
@@ -725,6 +762,8 @@ def main() -> None:
         finally:
             net.close()
     finally:
+        # A second stop would cut the removal short.
+        signal.pthread_sigmask(signal.SIG_BLOCK, STOPS)
         if jail_is_empty():
             stubs.remove()
     sys.exit(status)
