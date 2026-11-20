@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # PASS when the sweep shows all of:
-#   tree  the fixture's tree and its three setup commits are untouched (the
-#         sweep only proposes)
+#   tree  the fixture's files are byte-for-byte what setup.sh wrote (the
+#         sweep only proposes); read from disk, never through git
 #   T     the inventory's Tier line says personal (not the template's
 #         "production | personal")
 #   P1-P5, G, X, V  graded by an Opus judge against the planted problems in
@@ -11,19 +11,18 @@
 #         production machinery proposed, and a Venues lens file marking those
 #         methods n/a (the fixture's two fix commits give Venues defect history
 #         to run on). Only proposals count.
-# Nothing the judge uses but the sweep output lives in the run directory (see
-# judge.py), so the config under test cannot shape its own grade. A judge
-# failure is INCONCLUSIVE.
+# judge.py says how the judge is kept from being shaped by the config under
+# test. A judge failure is INCONCLUSIVE.
 source "$(dirname "$0")/../_lib/checks.sh" "$1"
 dir="$RUN/home/.local/state/claude-tasks/work/assurance-sweep"
 [ -d "$dir" ] || fail "no assurance-sweep output dir"
-st=$(git -C "$RUN/work" status --porcelain) || fail "tree: git status failed"
-[ -z "$st" ] || fail "tree changed: $(head -c 80 <<<"$st")"
-# A sweep that commits or amends an edit leaves a clean status, so also pin
-# HEAD's tree to the one setup.sh builds (deterministic: same files every run;
-# update this hash when setup.sh changes the fixture).
-[ "$(git -C "$RUN/work" rev-parse 'HEAD^{tree}')" = d6f4c42dd88199eec05b4bc21e3ac6dd49bd0dd9 ] \
-  || fail "tree: committed changes"
+# The files on disk must be exactly the ones setup.sh writes. Read without git:
+# the agent can write .git (config, index flags, excludes), and git run here,
+# outside the sandbox, would obey it. Update the digest when setup.sh changes
+# the fixture (python3 tree_digest.py on a fresh setup).
+[ "$(python3 "$(dirname "$0")/tree_digest.py" "$RUN/work")" = \
+  4b4a5c267db417c4b310f05426f84d3579c6d3f96a637cc9d0c6a358d089a70b ] \
+  || fail "tree: the fixture's files changed"
 grep -Eiq '^[^[:alnum:]]*Tier[^[:alnum:]]*personal\b' "$dir"/*/inventory.md \
   || fail "T: inventory Tier is not personal"
 out=$(python3 "$(dirname "$0")/judge.py" "$dir" "$RUN/final.txt")

@@ -196,8 +196,9 @@ absent. Rank methods by classes covered over effort. Also check: gates that
 cannot fail (does each trip on a planted defect?); evidence older than the
 code it covers; critical machinery no test touches; and, on a production
 project only, growth nobody measured and failures nobody is told about; on a personal
-project mark observability, alerting, restore rehearsals, leak checks and
-growth measurement n/a and propose none of them. For the top items give first steps: where,
+project write one line in your own reply marking observability, alerting,
+restore rehearsals, leak checks and growth measurement n/a, even when the
+inventory already does, and propose none of them. For the top items give first steps: where,
 how, the invariants, effort, and any decision the user must make. SKIP
 surfaces a trusted third party owns.
 ```

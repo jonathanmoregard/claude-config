@@ -5,12 +5,12 @@ exits 2 when the judge itself fails, so the harness reports INCONCLUSIVE
 instead of a verdict.
 
 usage: judge.py SWEEP_DIR [FINAL_TXT]
-Nothing the judge reads or writes, apart from the sweep output it grades,
-lives in the run directory the agent under test could write: its HOME and
-working directory are fresh, its credentials come from the real (passwd)
-home, and its raw output goes to a fresh directory the result names. It has
-no tools, settings, MCP or skills, so the config under test cannot shape its
-own grade.
+The judge's HOME and working directory are fresh, its raw output goes to a
+fresh directory the result names, and it has no tools, settings, MCP or
+skills, so the config under test cannot shape its grade. Its credentials are
+the real (passwd) home's file; the harness mounts that file writable into
+the sandbox for token refresh, so an agent could spoil it, but that only
+makes the judge fail to authenticate (INCONCLUSIVE), never pass.
 """
 import glob
 import json
