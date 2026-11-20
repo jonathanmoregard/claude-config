@@ -41,7 +41,7 @@ _EFFORT_RE = re.compile(r"[a-z]{1,16}")
 _JOB_RE = re.compile(r"\d{8}-\d{6}-[0-9a-f]{6}")
 
 _POLICY_KEYS = frozenset({"version", "aiRouter", "roots", "path", "host", "schemaDir",
-                          "callTimeoutSec", "maxWaitSec", "maxPromptBytes", "outputLimitChars"})
+                          "stateDir", "callTimeoutSec", "maxWaitSec", "maxPromptBytes", "outputLimitChars"})
 _POSITIVE_INTS = ("callTimeoutSec", "maxWaitSec", "maxPromptBytes", "outputLimitChars")
 
 
@@ -86,6 +86,7 @@ def load_policy(config: object) -> dict:
         raise RuntimeError("policy path entries must not contain ':'")
     return {**raw, "aiRouter": _abs(raw["aiRouter"], "aiRouter"), "path": path,
             "schemaDir": _abs(raw["schemaDir"], "schemaDir"),
+            "stateDir": _abs(raw["stateDir"], "stateDir"),
             "roots": [os.path.realpath(_abs(r, "roots")) for r in raw["roots"]]}
 
 
@@ -175,6 +176,33 @@ def _schema_file(name: str, value: object, policy: dict) -> list[str]:
     return [f"--schema={copy}"]
 
 
+def _resumable(job_id: str, policy: dict) -> None:
+    """ai-router's send rebuilds the job from meta.json, which the sandbox can write."""
+    fd = None
+    try:
+        fd = os.open(policy["stateDir"], os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        for part, flags in (("jobs", os.O_DIRECTORY), (job_id, os.O_DIRECTORY), ("meta.json", 0)):
+            child = os.open(part, os.O_RDONLY | flags | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                            dir_fd=fd)
+            os.close(fd)
+            fd = child
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file")
+        with os.fdopen(fd, "rb") as fh:
+            fd = None
+            meta = json.loads(fh.read(policy["maxPromptBytes"]))
+    except (OSError, ValueError) as exc:
+        raise Refused(f"job {job_id} has no readable meta.json: {exc}") from None
+    finally:
+        if fd is not None:
+            os.close(fd)
+    if not isinstance(meta, dict) or meta.get("provider") != "codex":
+        raise Refused(f"job {job_id} is not a Codex job; send resumes Codex jobs only")
+    if meta.get("sandbox") not in SANDBOXES:
+        raise Refused(f"job {job_id} sandbox must be one of: {', '.join(SANDBOXES)}")
+    _cwd("job cwd", meta.get("cwd"), policy)
+
+
 # --- options ---------------------------------------------------------------
 
 def _flag(name: str) -> str:
@@ -244,7 +272,7 @@ OPTIONS: dict[str, tuple[dict, Callable[[str, object, dict], list[str]] | None]]
     "timeout_s": _int_range(1, MAX_JOB_TIMEOUT_S, "Seconds. delegate/send: the job's timeout "
                             "(ai-router default 3600). wait: how long to block (default and "
                             "cap: the broker's maximum)."),
-    "provider": _choice(PROVIDERS, "Constrain to one provider."),
+    "provider": _choice(("codex",), "Only codex: this broker never starts a Claude job."),
     "host": _choice(PROVIDERS, "Host CLI for the native/cross-provider decision "
                                "(default: this broker's host)."),
     "name": _pattern(_NAME_RE, "Label recorded on the job."),
@@ -268,8 +296,9 @@ class Tool:
 
 TOOLS: dict[str, Tool] = {
     "delegate": Tool(
-        "Start a detached headless ai-router job (Codex or Claude) and return at once with its "
-        "job_id. Follow it with status/peek/log, block with wait, read it with result. "
+        "Start a detached headless Codex job via ai-router and return at once with its job_id. "
+        "Codex only: a Claude model or provider is refused; for Claude work use your own "
+        "subagents. Follow it with status/peek/log, block with wait, read it with result. "
         "Give exactly one of tier/model and one of prompt/prompt_file.",
         ("tier", "model", "prompt", "prompt_file", "cwd", "sandbox", "schema_file", "effort",
          "timeout_s", "provider", "host", "name", "need", "allow_downgrade", "fresh"),
@@ -282,14 +311,14 @@ TOOLS: dict[str, Tool] = {
                    ("job_id",), required=("job_id",)),
     "peek": Tool("Newest agent message of a job (sanitised).", ("job_id",), required=("job_id",)),
     "log": Tool("Summarised events and stderr of a job.", ("job_id", "tail"), required=("job_id",)),
-    "send": Tool("Resume a finished job's thread with a follow-up prompt, as a new job.",
+    "send": Tool("Resume a finished Codex job's thread with a follow-up prompt, as a new job.",
                  ("job_id", "prompt", "prompt_file", "timeout_s"), required=("job_id",),
                  one_of=(("prompt", "prompt_file"),)),
     "cancel": Tool("Stop a running job.", ("job_id",), required=("job_id",)),
     "list": Tool("Recent jobs, newest first.", ("all",)),
     "quota": Tool("Usage-cap snapshots per provider: buckets, headroom, rejected_until.",
                   ("fresh", "provider")),
-    "pick": Tool("Choose a model for a tier; native true means use your own subagents.",
+    "pick": Tool("Choose a Codex model for a tier.",
                  ("tier", "need", "provider", "host", "allow_downgrade", "fresh"),
                  required=("tier",)),
 }
@@ -324,6 +353,8 @@ def build_call(name: str, arguments: object, policy: dict) -> Call:
             raise Refused(f"give exactly one of {', '.join(pair)}")
     if "host" in tool.options:
         args.setdefault("host", policy["host"])
+    if name in ("delegate", "pick"):
+        args.setdefault("provider", "codex")
 
     argv = [policy["aiRouter"], name, "--json"]
     timeout = float(policy["callTimeoutSec"])
@@ -349,6 +380,8 @@ def build_call(name: str, arguments: object, policy: dict) -> Call:
     if job_id is not None:
         if not isinstance(job_id, str) or not _JOB_RE.fullmatch(job_id):
             raise Refused(f"job_id must match {_JOB_RE.pattern}")
+        if name == "send":
+            _resumable(job_id, policy)
         argv.append(job_id)
     return Call(argv=argv, stdin=stdin, timeout=timeout)
 

@@ -10,6 +10,7 @@
     ],
     "host": "claude",
     "schemaDir": "/home/jonathan/.local/state/ai-router-broker/schemas",
+    "stateDir": "/home/jonathan/.local/state/ai-router",
     "callTimeoutSec": 120,
     "maxWaitSec": 540,
     "maxPromptBytes": 1000000,

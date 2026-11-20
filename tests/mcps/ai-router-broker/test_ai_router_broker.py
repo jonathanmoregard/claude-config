@@ -13,7 +13,10 @@ import tempfile
 import time
 import unittest
 
-SERVER = Path(__file__).resolve().parents[3] / "runtime" / "mcps" / "ai-router-broker" / "server.py"
+REPO = Path(__file__).resolve().parents[3]
+SERVER = REPO / "runtime" / "mcps" / "ai-router-broker" / "server.py"
+AI_ROUTER = REPO / "runtime" / "tools" / "ai-router"
+AI_ROUTER_FIXTURES = REPO / "tests" / "ai-router" / "fixtures"
 
 STUB = """#!{python}
 import json, os, sys, time
@@ -64,7 +67,8 @@ class BrokerCase(unittest.TestCase):
         self.raw = {
             "version": 1, "aiRouter": str(self.stub), "roots": [str(self.root)],
             "path": ["/run/current-system/sw/bin", "/usr/bin", "/bin"], "host": "claude",
-            "schemaDir": str(base / "schemas"), "callTimeoutSec": 20, "maxWaitSec": 600,
+            "schemaDir": str(base / "schemas"), "stateDir": str(base / "state"),
+            "callTimeoutSec": 20, "maxWaitSec": 600,
             "maxPromptBytes": 100000, "outputLimitChars": 20000,
         }
         self.config = base / "config.json"
@@ -254,6 +258,113 @@ class PathTests(BrokerCase):
         self.refused("delegate", "outside", **self.delegate(schema_file=str(out)))
 
 
+class CodexOnlyTests(BrokerCase):
+    def test_provider_claude_refused(self) -> None:
+        self.refused("delegate", "provider", **self.delegate(provider="claude"))
+        self.refused("pick", "provider", tier="fast", provider="claude")
+
+    def test_launching_calls_always_constrain_ai_router_to_codex(self) -> None:
+        for tool, args in [("delegate", self.delegate()), ("delegate", self.delegate(tier=None, model="haiku")),
+                           ("delegate", self.delegate(provider="codex")), ("pick", {"tier": "strongest"})]:
+            with self.subTest(tool=tool, args=args):
+                argv = self.call(tool, **args).argv
+                self.assertEqual([a for a in argv if a.startswith("--provider")], ["--provider=codex"])
+
+
+class NoClaudeJobThroughAiRouterTests(BrokerCase):
+    NOW = 1_789_400_000
+
+    def setUp(self) -> None:
+        super().setUp()
+        if str(AI_ROUTER) not in sys.path:
+            sys.path.insert(0, str(AI_ROUTER))
+        from ai_router import cli, config
+        self.cli, self.models = cli, config.load_config().models
+        base = Path(self.tmp.name)
+        (base / "home").mkdir()
+        self.state = base / "router-state"
+        self.env = {"HOME": str(base / "home"), "AI_ROUTER_STATE": str(self.state),
+                    "PATH": os.environ["PATH"],
+                    "AI_ROUTER_CODEX_BIN": str(AI_ROUTER_FIXTURES / "fake_codex.py"),
+                    "AI_ROUTER_CLAUDE_BIN": str(AI_ROUTER_FIXTURES / "fake_claude.py")}
+        self.prompt = base / "prompt.md"
+        self.prompt.write_text("reply OK\n")
+
+    def ai_router(self, tool: str, **args) -> int:
+        argv = [f"--prompt-file={self.prompt}" if a == "--prompt-file=/dev/stdin" else a
+                for a in self.call(tool, **args).argv[1:]]
+        with open(os.devnull, "w") as sink:
+            saved = sys.stdout, sys.stderr
+            sys.stdout = sys.stderr = sink
+            try:
+                return self.cli.main(argv, env=self.env, now=self.NOW, launcher="setsid")
+            finally:
+                sys.stdout, sys.stderr = saved
+
+    def launched_providers(self) -> set:
+        jobs = self.state / "jobs"
+        return {json.loads((d / "meta.json").read_text())["provider"]
+                for d in (jobs.iterdir() if jobs.exists() else ())}
+
+    def test_no_model_or_tier_choice_launches_a_claude_job(self) -> None:
+        claude_names = [n for m in self.models if m.provider == "claude" for n in (m.id, *m.aliases)]
+        self.assertTrue(claude_names)
+        for name in claude_names:
+            with self.subTest(model=name):
+                self.assertNotEqual(self.ai_router("delegate", **self.delegate(tier=None, model=name)), 0)
+        for tier in self.server.TIERS:
+            with self.subTest(tier=tier):
+                self.ai_router("delegate", **self.delegate(tier=tier, allow_downgrade=True))
+        self.assertNotIn("claude", self.launched_providers())
+
+
+class SendTests(BrokerCase):
+    def finished_job(self, **meta) -> Path:
+        d = Path(self.raw["stateDir"]) / "jobs" / JOB
+        d.mkdir(parents=True)
+        (d / "meta.json").write_text(json.dumps({"provider": "codex", "cwd": str(self.repo),
+                                                 "sandbox": "read-only", **meta}))
+        return d
+
+    def send(self) -> list:
+        return self.call("send", job_id=JOB, prompt="and now?").argv
+
+    def test_codex_job_inside_the_roots_is_resumed(self) -> None:
+        self.finished_job()
+        self.assertEqual(self.send()[-1], JOB)
+
+    def test_edited_meta_is_refused(self) -> None:
+        for meta in ({"provider": "claude"}, {"provider": None}, {"cwd": str(self.outside)},
+                     {"cwd": "/"}, {"cwd": "repo"}, {"sandbox": "danger-full-access"},
+                     {"sandbox": None}):
+            with self.subTest(meta=meta):
+                d = self.finished_job(**meta)
+                with self.assertRaises(self.server.Refused):
+                    self.send()
+                (d / "meta.json").unlink()
+                d.rmdir()
+
+    def test_cwd_symlink_in_meta_refused(self) -> None:
+        (self.repo / "door").symlink_to(self.outside)
+        self.finished_job(cwd=str(self.repo / "door"))
+        self.refused("send", "symlink", job_id=JOB, prompt="x")
+
+    def test_meta_reached_through_a_symlink_refused(self) -> None:
+        real = self.outside / "meta.json"
+        real.write_text(json.dumps({"provider": "codex", "cwd": str(self.repo), "sandbox": "read-only"}))
+        d = Path(self.raw["stateDir"]) / "jobs" / JOB
+        d.mkdir(parents=True)
+        (d / "meta.json").symlink_to(real)
+        self.refused("send", "meta", job_id=JOB, prompt="x")
+        (d / "meta.json").unlink()
+        d.rmdir()
+        d.symlink_to(self.outside)
+        self.refused("send", "meta", job_id=JOB, prompt="x")
+
+    def test_unknown_job_refused(self) -> None:
+        self.refused("send", "meta", job_id=JOB, prompt="x")
+
+
 class StdioTests(BrokerCase):
     def test_tools_list_names_the_cli_subcommands(self) -> None:
         out = self.stdio({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
@@ -288,6 +399,16 @@ class StdioTests(BrokerCase):
         for name in ("GH_TOKEN", "SSH_AUTH_SOCK", "AI_ROUTER_STATE", "CLAUDECODE"):
             self.assertNotIn(name, body["env"])
         self.assertEqual(body["path"], ":".join(self.raw["path"]))
+
+    def test_shipped_state_dir_is_the_one_ai_router_uses_under_the_child_env(self) -> None:
+        if str(AI_ROUTER) not in sys.path:
+            sys.path.insert(0, str(AI_ROUTER))
+        from ai_router.config import state_dir
+        shipped = self.server.load_policy(self.server.load_config(self.server.DEFAULT_CONFIG))
+        home = Path(self.server.child_env(shipped)["HOME"])
+        self.assertEqual(Path(shipped["stateDir"]), home / ".local/state/ai-router")
+        self.assertEqual(state_dir({"HOME": str(home)}) if (home / ".local/state/ai-router").is_dir()
+                         else home / ".local/state/ai-router", Path(shipped["stateDir"]))
 
     def test_hung_cli_is_stopped_at_the_call_timeout(self) -> None:
         self.raw["callTimeoutSec"] = 1

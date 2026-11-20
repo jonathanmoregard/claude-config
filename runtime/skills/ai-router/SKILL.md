@@ -11,7 +11,9 @@ In Claude Code, run every `ai-router <subcommand>` below as the MCP tool
 broker runs ai-router outside the Bash sandbox, where `ai-router delegate`
 fails. Flags become fields: drop the dashes, `-` → `_`, `--schema` →
 `schema_file`, `--need` takes a list. `cwd`, `prompt_file` and `schema_file`
-must be absolute paths under `~/Repos` or `~/worktrees`.
+must be absolute paths under `~/Repos` or `~/worktrees`. The broker runs Codex
+jobs only and refuses a Claude model or provider; Claude work goes to your own
+subagents.
 
 Without those tools (Codex), use the CLI by absolute path:
 
