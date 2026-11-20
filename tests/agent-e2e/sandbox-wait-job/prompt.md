@@ -1,0 +1,1 @@
+Please run `./job.sh` in this directory, using the unique durable-job slug in `job-slug.txt`. It takes about a minute and logs progress to `job.log`; when it has finished, the log ends with a `RESULT:` line and then `DONE`. Tell me the RESULT value once it's done.
