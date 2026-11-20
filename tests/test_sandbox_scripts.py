@@ -308,6 +308,7 @@ def project(root: Path) -> Path:
     (root / "to-claude").symlink_to(repo / ".claude")
     (root / "linked").mkdir()
     (root / "linked" / ".claude").symlink_to(repo / ".claude")
+    (root / "stand-in" / ".claude").mkdir(parents=True)
     return repo
 
 
@@ -316,7 +317,7 @@ def project(root: Path) -> Path:
     "repo/.git/objects/ab", "wt", "wt/.git", "repo/.claude", "repo/.claude/settings.json",
     "repo/.claude/hooks", "repo/.claude/hooks/guard.sh", "repo/.mcp.json", "repo/nested",
     "repo/nested/deep/.zshrc", "to-claude/settings.json", "to-claude/hooks/guard.sh",
-    "linked/.claude", "linked",
+    "linked/.claude", "linked", "stand-in/.claude", "stand-in", "repo/.claude/notes.md",
 ])
 def test_trash_refuses_what_the_sandbox_protects(scratch: Path, rel: str) -> None:
     project(scratch)
@@ -324,13 +325,25 @@ def test_trash_refuses_what_the_sandbox_protects(scratch: Path, rel: str) -> Non
     assert (scratch / rel).exists()
 
 
-@pytest.mark.parametrize("rel", ["repo/sub", "repo/sub/ordinary.txt", "repo/.claude/notes.md",
-                                 "to-claude"])
+@pytest.mark.parametrize("rel", ["repo/sub", "repo/sub/ordinary.txt", "to-claude"])
 def test_trash_still_takes_ordinary_project_content(scratch: Path, rel: str) -> None:
     project(scratch)
     rc, moved = run_trash(str(scratch / rel))
     assert (rc, sorted(moved)) == (0, [f"{scratch}/{rel}"])
     assert not os.path.lexists(scratch / rel)
+
+
+@pytest.mark.parametrize("rel", ["guard", "guard/f", "tree", "tree/sub"])
+def test_trash_refuses_a_confined_guard_whatever_its_name(scratch: Path, rel: str) -> None:
+    (scratch / "guard").mkdir()
+    (scratch / "guard" / "f").write_text("x")
+    (scratch / "tree" / "sub" / "f").parent.mkdir(parents=True)
+    (scratch / "tree" / "sub" / "f").write_text("x")
+    for marked in ("guard", "guard/f", "tree/sub/f"):
+        os.setxattr(scratch / marked, "user.confined-stub", b"1")
+    rc, moved = run_trash(str(scratch / rel))
+    assert (rc, moved) == (1, {}), rel
+    assert (scratch / rel).exists()
 
 
 def walking(pid: int, root: Path, inside: bool = False) -> bool:
@@ -362,17 +375,17 @@ def populate(tree: Path) -> None:
             (tree / str(i) / str(j)).touch()
 
 
-@pytest.mark.parametrize("victim", ["outside_home_ssh", "project_claude"])
+@pytest.mark.parametrize("victim", ["outside_home_ssh", "other_project"])
 def test_trash_moves_only_what_it_checked_despite_a_parent_swap(
         tmp_path: Path, scratch: Path, victim: str) -> None:
     decoy_home = tmp_path / "decoy-home"
     (decoy_home / ".ssh").mkdir(parents=True)
     (decoy_home / ".ssh" / "id_decoy").write_text("decoy")
     decoy_project = scratch / "decoy-project"
-    (decoy_project / ".claude").mkdir(parents=True)
-    (decoy_project / ".claude" / "settings.json").write_text("{}")
+    (decoy_project / "src").mkdir(parents=True)
+    (decoy_project / "src" / "main.py").write_text("decoy")
     swap_to, name = {"outside_home_ssh": (decoy_home, ".ssh"),
-                     "project_claude": (decoy_project, ".claude")}[victim]
+                     "other_project": (decoy_project, "src")}[victim]
     parent = scratch / "a"
     tree = parent / name
     populate(tree)

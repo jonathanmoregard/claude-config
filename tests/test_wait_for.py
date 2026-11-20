@@ -1101,6 +1101,39 @@ def test_stopping_a_sandboxed_wait_stops_its_job_before_freeing_the_slug(
             os.kill(job, signal.SIGKILL)
 
 
+def test_a_stop_landing_before_the_job_pid_is_known_still_stops_the_job(
+    tmp_path: Path, slug: str
+) -> None:
+    gate = tmp_path / "forked"
+    source = WAIT_FOR.read_text()
+    anchor = "  child=$!\n"
+    assert source.count(anchor) == 1
+    staged = tmp_path / "wait-for"
+    staged.write_text(source.replace(anchor, f"  : >{gate}; sleep 2\n{anchor}"))
+    pid_file = tmp_path / "pid"
+    child = f"import os, time; open({str(pid_file)!r}, 'w').write(str(os.getpid())); time.sleep(60)"
+    proc = subprocess.Popen(["bash", str(staged), "job", slug, "--timeout", "120", "--",
+                             "python3", "-c", child],
+                            env={**os.environ, "SANDBOX_RUNTIME": "1"},
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    started = time.monotonic()
+    while not gate.exists():
+        assert proc.poll() is None and time.monotonic() - started < 20
+        time.sleep(0.01)
+    proc.send_signal(signal.SIGTERM)
+    assert proc.wait(timeout=20) == 128 + signal.SIGTERM
+    while not (pid_file.exists() and pid_file.read_text()) and time.monotonic() - started < 10:
+        time.sleep(0.05)
+    if pid_file.exists() and pid_file.read_text():
+        job = int(pid_file.read_text())
+        try:
+            with pytest.raises(ProcessLookupError):
+                os.kill(job, 0)
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(job, signal.SIGKILL)
+
+
 def test_repeating_a_sandboxed_wait_adopts_the_finished_run(tmp_path: Path, slug: str) -> None:
     counter = tmp_path / "count"
     script = f"echo x >>{counter}"
