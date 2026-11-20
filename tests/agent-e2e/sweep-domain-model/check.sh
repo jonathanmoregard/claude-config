@@ -23,7 +23,7 @@ dir="$RUN/home/.local/state/claude-tasks/work/assurance-sweep"
 # Update the digest when setup.sh changes the fixture (python3 tree_digest.py
 # on a fresh setup).
 [ "$(python3 -I "$(dirname "$0")/tree_digest.py" "$RUN/work")" = \
-  4b4a5c267db417c4b310f05426f84d3579c6d3f96a637cc9d0c6a358d089a70b ] \
+  797d581fa492d14f0d6a6e641c7e0c6d92141aee19f1dcddb3cc560c2f5c0237 ] \
   || fail "tree: the fixture's files changed"
 grep -Eiq '^[^[:alnum:]]*Tier[^[:alnum:]]*personal\b' "$dir"/*/inventory.md \
   || fail "T: inventory Tier is not personal"

@@ -82,8 +82,8 @@ the unusual way.
 Read the core: the code that decides what the application does, as opposed
 to the adapters that talk to storage, networks, devices, UIs and other
 systems. The inventory says which is which; with no such split, say so and
-treat the whole as core. Report every site, with per-file counts where
-there are many, in these categories:
+treat the whole as core. Count every site, per file, in these categories
+(the Output rule below says how many to cite):
 1. A value whose set is closed carried as a string, integer or boolean. It
    should be a sum type whose labels say what each value means — not 0..4,
    not 'a' | 'b' codes — matched exhaustively. Order is no reason to keep
@@ -108,10 +108,10 @@ there are many, in these categories:
    names. Return a vocabulary table: each mechanism name, the domain term
    that replaces it, and where the user used that term; mark a term with no
    such source.
-For each category give the target type as a short sketch, where its parser
-belongs, and one guard that keeps it from coming back: a lint or
-compiler-API check over the core's exported signatures, with an allowlist
-whose every entry needs a reason. A genuinely open value — text shown to a
+For each category give the target type as a short sketch and where its
+parser belongs. The guard described below keeps all of them from coming
+back; it reads the core's exported signatures, with an allowlist whose every
+entry needs a reason. A genuinely open value — text shown to a
 person, real-number arithmetic — is SKIP with that reason. Types narrow what
 the code accepts; they add no runtime machinery, and wire formats stay as
 they are.

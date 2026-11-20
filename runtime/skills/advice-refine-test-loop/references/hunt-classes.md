@@ -128,7 +128,7 @@ boundary where that parse belongs and the type it should produce.
 ### G3 — Primitive where a type belongs
 
 **When:** identifiers, keys, tokens, emails, URLs, durations, money, anything
-persisted, bounded quantities (levels, percentages), and any "none" or
+persisted, bounded quantities (brightness, percentages), and any "none" or
 "unknown" value. The newtype route needs G1's typed-and-checked code; the column
 route applies in any language, since the schema does the enforcing.
 **Hunt:** Find a domain value carried as `String`, `i64`, `uuid`-as-text, or a
