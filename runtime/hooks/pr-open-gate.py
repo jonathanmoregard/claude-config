@@ -359,9 +359,15 @@ def on_pretool(payload: dict) -> None:
     binary = sorted(views[0][2].paths)
 
     def deny_listed(reasons: list[str], with_remedy: bool) -> None:
-        log_binary(payload, binary, "refused", where)
+        # Refuse (and revoke) first: a log that raises must not leave an
+        # earlier same-tip grant spendable. The log is best effort.
         withheld = next((s.withheld for _, _, s in views if s.withheld), None)
         deny(reasons, with_remedy, binary, withheld)
+        try:
+            log_binary(payload, binary, "refused", where)
+        except OSError as exc:
+            print(f"pr-open-gate: could not log the refusal's binaries: {exc}",
+                  file=sys.stderr)
 
     smoke, smoke_log = g.smoke_problem(top, mb, tip, changes)
     if smoke:

@@ -900,6 +900,29 @@ def test_an_unrelated_info_attribute_still_spares_a_real_binary(sb):
     assert not is_deny(out) and "build/candle.bin" in out["systemMessage"]
 
 
+# Break (r3 finding 4): the refusal logging its binaries before deny(), so a
+# log that raises (ENOSPC) crashes the hook with no decision and no revoke(),
+# and the same-tip grant an earlier pass minted is still spendable.
+
+def test_a_failing_refusal_log_still_denies_and_revokes_the_grant(sb):
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    commit_bytes(sb, "build/candle.bin", FIRMWARE)
+    sb.review("PASS", reads=["scripts/run.sh"])
+    assert not is_deny(sb.gate())                       # mints the grant
+    sb.review("BLOCKS", agent="a2")                     # same tip, now refused
+    log = sb.records_dir() / "artl-exemptions.jsonl"
+    log.unlink()
+    log.mkdir()                                         # open(log, "a") raises
+    proc = subprocess.run([sys.executable, "-S", "-E", str(GATE)],
+                          input=json.dumps(sb.pre("gh pr create --fill")), capture_output=True,
+                          text=True, env=sb.env(), cwd=sb.work, timeout=60)
+    assert proc.returncode == 0
+    out = json.loads(proc.stdout)
+    assert is_deny(out) and "build/candle.bin" in reason(out)
+    assert "could not log" in proc.stderr               # best effort, not silent
+    assert not allowed(sb.run(GATE, sb.perm("gh pr create --fill")))
+
+
 # Break (r2 finding 5): one `git cat-file` per changed path per revision in
 # quotable_lines -- up to 300 calls of up to 5 s each inside artl-evidence's
 # 30 s hook timeout.
