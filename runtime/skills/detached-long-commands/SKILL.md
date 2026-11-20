@@ -19,7 +19,7 @@ retained user unit (`claude-job-<slug>`) from outside the sandbox:
 
 1. `mcp__jobs_broker__start` with `repo` (the top level of a git work tree
    under `~/Repos` or `~/worktrees`), `argv` (a list, no shell string), `slug`, and
-   `profile: "nix"` for nix builds (writable nix cache, ram-heavy slice).
+   `profile: "nix"` for nix builds (the job's own caches under `~/.cache/claude-jobs`, ram-heavy slice).
 2. `mcp__jobs_broker__status` with `wait_sec` (max 540) blocks until it
    settles; `mcp__jobs_broker__log` tails the log, which ends `MARKER_OK` or
    `MARKER_FAILED rc=N`; `mcp__jobs_broker__stop` frees the slug.

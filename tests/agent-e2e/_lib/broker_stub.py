@@ -13,7 +13,7 @@ import sys
 RUN = os.environ["E2E_RUN_DIR"]
 SERVER = sys.argv[1]
 STORE_PATH = "/nix/store/q7m2x9k4c1d8f5h3j6l0n2p4r8s1t5v9-render-atlas-2.4"
-CAMPAIGN = "/tmp/agent-e2e-broker/20261120T143005Z-commit-msg-trailer-5e1c2d9a-4242"
+CAMPAIGN = "/home/user/.local/state/agent-e2e-broker/campaigns/20261120T143005Z-commit-msg-trailer-5e1c2d9a-4242"
 
 
 def obj(props, required=()):
