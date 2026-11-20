@@ -33,7 +33,8 @@ that deals with the problem. If the caller of a proposed check, type or lint
 can sidestep it, the item is SKIP. A type only a parser can build is not sidestepped
 when a guard keeps it so: one test in the existing suite, using the
 project's own type checker, that fails for every way the language allows to
-build the type outside its parser. Without that guard, the type is SKIP.
+build the type outside its parser. Proposed together with that guard, the
+type is not SKIP; proposed without it, it is.
 
 Output, at most 700 words unless the lens block sets its own cap, in this shape:
 Coverage: what you read; what you did not.
