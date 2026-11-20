@@ -8,8 +8,11 @@
 # Left out: kind: keep (whatever its status), and kind: change, status: done.
 # One bad file never hides the others.
 set -uo pipefail
-dir="${1:?usage: pending-decisions.sh <notes dir>}/decisions"
-command -v yq >/dev/null || { echo "pending-decisions.sh: yq not found; no decision was read" >&2; exit 2; }
+notes="${1:?usage: pending-decisions.sh <notes dir>}"
+[ -d "$notes" ] || { echo "pending-decisions.sh: $notes is not a directory; no decision was read" >&2; exit 2; }
+yq --help 2>/dev/null | grep -q -- --front-matter \
+  || { echo "pending-decisions.sh: needs yq v4 (mikefarah) with --front-matter; no decision was read" >&2; exit 2; }
+dir="$notes/decisions"
 [ -d "$dir" ] || exit 0
 for f in "$dir"/*.md; do
   [ -e "$f" ] || continue

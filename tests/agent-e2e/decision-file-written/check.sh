@@ -10,12 +10,14 @@ here="$(dirname "$0")"
 command -v yq >/dev/null || { echo "INCONCLUSIVE: yq not on PATH"; exit 2; }
 [ -f "$RUN/transcript.jsonl" ] || { echo "INCONCLUSIVE: no transcript"; exit 2; }
 notes="$RUN/home/.local/state/claude-tasks/work/decisions"
-f=$(ls "$notes"/*.md 2>/dev/null | head -n1)
+# The decision about the room ids, if the agent wrote several.
+f=$(grep -liE 'RoomId|room id' "$notes"/*.md 2>/dev/null | head -n1)
+[ -n "$f" ] || f=$(ls "$notes"/*.md 2>/dev/null | head -n1)
 name=$(basename "${f:-}")
 if [ -z "$f" ]; then
   f="$RUN/graded-decision.md"
   name=$(python3 -I - "$RUN/transcript.jsonl" <<'P'
-import json, sys
+import json, re, sys
 last = ''
 for line in open(sys.argv[1], encoding='utf-8'):
     try:
@@ -28,7 +30,8 @@ for line in open(sys.argv[1], encoding='utf-8'):
         if isinstance(b, dict) and b.get('type') == 'tool_use' and b.get('name') == 'Write':
             inp = b.get('input') if isinstance(b.get('input'), dict) else {}
             p = str(inp.get('file_path', ''))
-            if 'claude-tasks/work/decisions/' in p and p.endswith('.md'):
+            about = re.search(r'RoomId|room id', str(inp.get('content', '')), re.I)
+            if 'claude-tasks/work/decisions/' in p and p.endswith('.md') and (about or not last):
                 last = p.rsplit('/', 1)[-1]
 print(last)
 P

@@ -23,7 +23,7 @@ still lets through, and what the cheapest thing is that would stop it.
    decisions (`<notes>/decisions/*.md`). A rule, or a decision to keep
    something, is never a finding. A decision to change something that has
    not landed is work still to do: the inventory lists it, and lenses report
-   its sites.
+   its sites, except in code under "Leaving soon", which lenses skip.
 4. Quote the cost before starting: one strongest-tier whole-repository read
    per lens.
 5. Note the project's tier in the inventory: **production** (outside users,

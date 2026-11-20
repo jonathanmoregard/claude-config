@@ -9,12 +9,13 @@
 # the run's, and its user site-packages are writable.
 source "$(dirname "$0")/../_lib/checks.sh" "$1"
 here="$(dirname "$0")"
+[ -f "$RUN/transcript.jsonl" ] || { echo "INCONCLUSIVE: no transcript"; exit 2; }
 dir="$RUN/home/.local/state/claude-tasks/work/assurance-sweep"
 out="$RUN/graded"; mkdir -p "$out"
 pick() { # $1 file-name substring, $2 output path
   local f; f=$(ls "$dir"/*/*"$1"* 2>/dev/null | head -n1)
-  if [ -n "$f" ]; then cp "$f" "$2"
-  else python3 -I "$here/file_from_transcript.py" "$RUN/transcript.jsonl" "$1" "$2"; fi
+  if [ -n "$f" ]; then cp "$f" "$2" || { echo "INCONCLUSIVE: copy failed"; exit 2; }
+  else python3 -I "$here/file_from_transcript.py" "$RUN/transcript.jsonl" "$1" "$2" assurance-sweep/; fi
 }
 pick inventory "$out/inventory.md" || fail "no inventory written"
 pick domain "$out/lens3.md" || fail "no Domain model lens file written"
