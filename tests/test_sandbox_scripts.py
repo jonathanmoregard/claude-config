@@ -573,3 +573,25 @@ def test_trash_honours_the_profile_deny_write(tmp_path: Path, scratch: Path) -> 
         assert run_trash(str(target), script=script) == (1, {}), target
     rc, moved = run_trash(str(scratch / "outer" / "free"), script=script)
     assert (rc, sorted(moved)) == (0, [f"{scratch}/outer/free"])
+
+
+def test_trash_moves_nothing_the_profile_hides_from_reading(tmp_path: Path,
+                                                            scratch: Path) -> None:
+    # In the trash a hidden file would be under no rule, so readable.
+    layout = tmp_path / "layout"
+    (layout / "scripts").mkdir(parents=True)
+    script = layout / "scripts" / "trash"
+    shutil.copy2(TRASH, script)
+    for rel in ("held/inner/f", "proj/.env.local", "proj/free", "a/b/vault/f", "c/vault"):
+        (scratch / rel).parent.mkdir(parents=True, exist_ok=True)
+        (scratch / rel).write_text("x")
+    (layout / "settings.json").write_text(json.dumps({
+        "sandbox": {"filesystem": {"denyRead": [str(scratch / "held")]}},
+        "permissions": {"deny": [  # arftl-allow: permission-widened
+            f"Read(/{scratch}/proj/.env.*)", "Read(//**/vault/**)", "Bash(rm *)"]},
+    }))
+    for rel in ("held", "held/inner", "held/inner/f", "proj", "proj/.env.local", "a",
+                "a/b/vault", "a/b/vault/f", "c/vault"):
+        assert run_trash(str(scratch / rel), script=script) == (1, {}), rel
+    rc, moved = run_trash(str(scratch / "proj" / "free"), script=script)
+    assert (rc, sorted(moved)) == (0, [f"{scratch}/proj/free"])

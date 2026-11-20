@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import fnmatch
 import itertools
 import json
 import os
 import pwd
+import re
 import stat
 import sys
 import time
@@ -30,6 +32,7 @@ PROTECTED_NAMES = {
     ".zprofile", ".profile", ".ripgreprc", ".vscode", ".idea", ".git", ".claude",
 }
 GUARD_MARK = "user.confined-stub"
+GLOB_CHARS = re.compile(r"[*?\[]")
 DIR_FLAGS = os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 RENAME_NOREPLACE = 1
 
@@ -57,13 +60,20 @@ def guard(path: str) -> bool:
     return True
 
 
-def denied_paths(home: str) -> list[str]:
-    settings = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "settings.json")
+def load_settings() -> tuple[str, dict]:
+    config = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..")
     try:
-        with open(settings) as f:
-            entries = json.load(f).get("sandbox", {}).get("filesystem", {}).get("denyWrite", [])
-    except (OSError, ValueError, AttributeError) as e:
-        fail(3, f"cannot read denyWrite from {settings}: {e}")
+        with open(os.path.join(config, "settings.json")) as f:
+            return os.path.realpath(config), json.load(f)
+    except (OSError, ValueError) as e:
+        fail(3, f"cannot read {config}/settings.json: {e}")
+
+
+def denied_paths(settings: dict, home: str) -> list[str]:
+    try:
+        entries = settings.get("sandbox", {}).get("filesystem", {}).get("denyWrite", [])
+    except AttributeError as e:
+        fail(3, f"cannot read denyWrite: {e}")
     denied = []
     for entry in entries:
         if entry.startswith("~/"):
@@ -75,6 +85,37 @@ def denied_paths(home: str) -> list[str]:
         head, tail = os.path.split(entry.rstrip("/"))
         denied += [os.path.join(os.path.realpath(head), tail), os.path.realpath(entry)]
     return denied
+
+
+def empty_globstars(pattern: str) -> list[str]:
+    # fnmatch's * crosses /, so ** already spans any depth but none.
+    head, sep, tail = pattern.partition("**/")
+    if not sep:
+        return [pattern]
+    return [head + form for rest in empty_globstars(tail) for form in (f"**/{rest}", rest)]
+
+
+def read_denied(settings: dict, home: str, config: str) -> re.Pattern[str]:
+    """What the profile hides from reading: in the trash it would be under no rule."""
+    try:
+        specs = list(settings.get("sandbox", {}).get("filesystem", {}).get("denyRead", []))
+        for rule in settings.get("permissions", {}).get("deny", []):
+            if match := re.fullmatch(r"Read\((.+)\)", rule):
+                spec = match[1].removesuffix("/**")
+                specs.append(spec[1:] if spec.startswith("//") else
+                             os.path.join(config, spec[1:]) if spec.startswith("/") else spec)
+    except (AttributeError, TypeError) as e:
+        fail(3, f"cannot read the Read deny rules: {e}")
+    patterns = []
+    for spec in specs:
+        if spec.startswith("~/"):
+            spec = os.path.join(home, spec[2:])
+        elif not spec.startswith("/"):
+            fail(3, f"cannot interpret Read deny entry {spec}")
+        literal = os.path.dirname(GLOB_CHARS.split(spec, 1)[0])
+        for form in {spec, os.path.realpath(literal) + spec[len(literal):]}:
+            patterns += [fnmatch.translate(f) for f in empty_globstars(form)]
+    return re.compile("|".join(patterns) or "(?!)")
 
 
 def pinned_dir(path: str) -> int:
@@ -98,18 +139,21 @@ def subdir(fd: int, name: str) -> int:
     return os.open(name, os.O_PATH | DIR_FLAGS, dir_fd=fd)
 
 
-def walk_finds_protected(fd: int) -> str | None:
+def walk_finds_protected(fd: int, origin: str, hidden: re.Pattern[str]) -> str | None:
     def raise_it(error: OSError) -> None:
         raise error
 
     for dirpath, dirnames, filenames, dirfd in os.fwalk(".", dir_fd=fd, onerror=raise_it):
         for name in dirnames + filenames:
-            if name in PROTECTED_NAMES or guard(f"/proc/self/fd/{dirfd}/{name}"):
-                return os.path.normpath(os.path.join(dirpath, name))
+            rel = os.path.normpath(os.path.join(dirpath, name))
+            if (name in PROTECTED_NAMES or guard(f"/proc/self/fd/{dirfd}/{name}")
+                    or hidden.match(os.path.join(origin, rel))):
+                return rel
     return None
 
 
-def check(path: str, home: str, denied: list[str], trash_dev: int) -> Target:
+def check(path: str, home: str, denied: list[str], hidden: re.Pattern[str],
+          trash_dev: int) -> Target:
     head, name = os.path.split(path.rstrip("/") or "/")
     if name in ("", ".", ".."):
         fail(1, f"name the directory itself, not {path}")
@@ -138,6 +182,9 @@ def check(path: str, home: str, denied: list[str], trash_dev: int) -> Target:
             fail(1, f"{target} is denied to the sandbox")
         if d.startswith(f"{target}/") and os.path.lexists(d):
             fail(1, f"{target} holds {d}, denied to the sandbox")
+    parts = target.split("/")
+    if any(hidden.match("/".join(parts[:n])) for n in range(2, len(parts) + 1)):
+        fail(1, f"{target} is hidden from the sandbox")
     if st.st_dev != trash_dev:
         fail(1, f"{target} is on another filesystem than the trash; use gio trash outside the sandbox")
     if stat.S_ISDIR(st.st_mode):
@@ -146,7 +193,7 @@ def check(path: str, home: str, denied: list[str], trash_dev: int) -> Target:
             opened = os.fstat(fd)
             if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
                 fail(1, f"{target} changed while it was being checked")
-            hit = walk_finds_protected(fd)
+            hit = walk_finds_protected(fd, target, hidden)
         except OSError:
             fail(1, f"cannot inspect all of {target}")
         if hit:
@@ -203,14 +250,14 @@ def put_back(target: Target, unique: str, info_fd: int, files_fd: int, reason: s
     fail(1, f"{target.path} {reason}; put back as {os.path.dirname(target.path)}/{dest}")
 
 
-def recheck(unique: str, files_fd: int, target: Target) -> str | None:
+def recheck(unique: str, files_fd: int, target: Target, hidden: re.Pattern[str]) -> str | None:
     try:
         fd = os.open(unique, os.O_RDONLY | DIR_FLAGS, dir_fd=files_fd)
         try:
             opened = os.fstat(fd)
             if (opened.st_dev, opened.st_ino) != target.identity:
                 return "changed while it was being moved"
-            hit = walk_finds_protected(fd)
+            hit = walk_finds_protected(fd, target.path, hidden)
         finally:
             os.close(fd)
     except OSError:
@@ -218,7 +265,7 @@ def recheck(unique: str, files_fd: int, target: Target) -> str | None:
     return f"gained {os.path.join(target.path, hit)}, protected by the sandbox" if hit else None
 
 
-def move(target: Target, info_fd: int, files_fd: int) -> None:
+def move(target: Target, info_fd: int, files_fd: int, hidden: re.Pattern[str]) -> None:
     unique = reserve(info_fd, files_fd, target)
     try:
         os.rename(target.name, unique, src_dir_fd=target.parent_fd, dst_dir_fd=files_fd)
@@ -231,7 +278,7 @@ def move(target: Target, info_fd: int, files_fd: int) -> None:
     if (moved.st_dev, moved.st_ino) != target.identity:
         put_back(target, unique, info_fd, files_fd, "changed while it was being checked")
     # Content renamed in between the walk and the move came along; only this side can see it.
-    if stat.S_ISDIR(moved.st_mode) and (reason := recheck(unique, files_fd, target)):
+    if stat.S_ISDIR(moved.st_mode) and (reason := recheck(unique, files_fd, target, hidden)):
         put_back(target, unique, info_fd, files_fd, reason)
 
 
@@ -243,16 +290,17 @@ def main(args: list[str]) -> None:
         if arg.startswith("-"):
             fail(64, f"options are not accepted: {arg}")
     home = pwd.getpwuid(os.getuid()).pw_dir
-    denied = denied_paths(home)
+    config, settings = load_settings()
+    denied, hidden = denied_paths(settings, home), read_denied(settings, home, config)
     # $XDG_DATA_HOME is the caller's to set; the trash is where the passwd home puts it.
     trash_fd = os.open(home, os.O_PATH | DIR_FLAGS)
     for part in (".local", "share", "Trash"):
         trash_fd = subdir(trash_fd, part)
     files_fd, info_fd = subdir(trash_fd, "files"), subdir(trash_fd, "info")
     for arg in args:
-        target = check(arg, home, denied, os.fstat(files_fd).st_dev)
+        target = check(arg, home, denied, hidden, os.fstat(files_fd).st_dev)
         try:
-            move(target, info_fd, files_fd)
+            move(target, info_fd, files_fd, hidden)
         finally:
             os.close(target.parent_fd)
 
