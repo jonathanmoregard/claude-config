@@ -520,13 +520,17 @@ def test_non_utf8_text_without_a_nul_byte_stays_text(sb):
 
 
 def test_a_binary_attribute_does_not_excuse_a_text_file(sb):
-    # .git/info/attributes is outside every diff a reviewer sees.
+    # .git/info/attributes is outside every diff a reviewer sees. A declared
+    # extension outside every behaviour path (r3 finding 5: `scripts/run.sh`
+    # was denied by rule (c) whatever the attribute said).
     write(sb.work / ".git" / "info" / "attributes", "* binary\n")
-    sb.commit("scripts/run.sh", SCRIPT_BODY)
-    assert dict(artl_gate.numstat(str(sb.work), "origin/main", "HEAD"))["scripts/run.sh"] is None
+    commit_bytes(sb, "assets/logo.png", SCRIPT_BODY.encode())
+    assert not artl_gate.is_behaviour("assets/logo.png")
+    assert dict(artl_gate.numstat(str(sb.work), "origin/main", "HEAD"))["assets/logo.png"] is None
     sb.review("PASS", reads=[])
     out = sb.gate()
-    assert is_deny(out) and "no advisor has read: scripts/run.sh" in reason(out)
+    assert is_deny(out) and "no advisor has read: assets/logo.png" in reason(out)
+    assert "Listed, not refused" not in reason(out)
 
 
 def test_a_rebuilt_binary_is_not_text_drift(sb):
@@ -768,6 +772,132 @@ def test_the_pending_commit_refusal_lists_and_logs_the_binaries(sb):
     logged = [e for e in sb.exemptions() if e["kind"] == "binary-not-read"]
     assert logged and logged[-1]["files"] == ["build/candle.bin"]
     assert logged[-1]["outcome"] == "refused"
+
+
+# --- r3 close-out: rule (b) reads no attribute source the agent can write ------
+# Break: classing a side by git's default attribute lookup, which reads the
+# worktree `.gitattributes` (r3 finding 1, 2), core.attributesFile and the
+# global attributes file, attr.tree, and core.bigFileThreshold (finding 3);
+# or sparing a file when `.git/info/attributes`, which no config switches
+# off, gives it a diff/text/binary attribute (finding 3), without saying so.
+
+def test_an_attribute_edit_after_review_does_not_hide_text_drift(sb):
+    # Finding 1: the reviewed text `.png` grows 25 lines; a committed one-line
+    # `.gitattributes` edit makes it binary on both sides.
+    sb.commit(".gitattributes", "*.sh text eol=lf\n")
+    commit_bytes(sb, "assets/logo.png", SCRIPT_BODY.encode())
+    sb.review("PASS")
+    sb.commit(".gitattributes", "*.sh text eol=lf\nassets/logo.png binary\n")
+    commit_bytes(sb, "assets/logo.png",
+                 (SCRIPT_BODY + "".join(f"echo late {i}\n" for i in range(25))).encode())
+    out = sb.gate()
+    assert is_deny(out) and "drift" in reason(out).lower()
+    assert "Listed, not refused" not in reason(out)
+
+
+def test_an_uncommitted_worktree_attribute_does_not_excuse_a_text_file(sb):
+    # Finding 2: the `.gitattributes` is outside the diff.
+    commit_bytes(sb, "assets/notes.png", SCRIPT_BODY.encode())
+    write(sb.work / ".gitattributes", "assets/notes.png binary\n")
+    sb.review("PASS", reads=[])
+    out = sb.gate()
+    assert is_deny(out) and "no advisor has read: assets/notes.png" in reason(out)
+    assert "Listed, not refused" not in reason(out)
+
+
+def _attributes_file(sb: Sandbox, tmp: Path) -> None:
+    write(tmp / "attrs", "assets/notes.png -diff\n")
+    git(sb.work, "config", "core.attributesFile", str(tmp / "attrs"))
+
+
+def _global_attributes(sb: Sandbox, tmp: Path) -> None:
+    write(tmp / "xdg" / "git" / "attributes", "assets/notes.png -diff\n")
+    env = sb.env
+    sb.env = lambda: {**env(), "XDG_CONFIG_HOME": str(tmp / "xdg")}
+
+
+def _attr_tree(sb: Sandbox, tmp: Path) -> None:
+    blob = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=sb.work, check=True,
+                          input="assets/notes.png -diff\n", capture_output=True,
+                          text=True).stdout.strip()
+    tree = subprocess.run(["git", "mktree"], cwd=sb.work, check=True,
+                          input=f"100644 blob {blob}\t.gitattributes\n", capture_output=True,
+                          text=True).stdout.strip()
+    git(sb.work, "config", "attr.tree", tree)
+
+
+def _big_file_threshold(sb: Sandbox, tmp: Path) -> None:
+    git(sb.work, "config", "core.bigFileThreshold", "1")
+
+
+@pytest.mark.parametrize("route", [_attributes_file, _global_attributes, _attr_tree,
+                                   _big_file_threshold],
+                         ids=["core.attributesFile", "xdg-attributes", "attr.tree",
+                              "core.bigFileThreshold"])
+def test_config_the_agent_writes_does_not_excuse_a_text_file(sb, tmp_path, route):
+    # Finding 3, the config half: each route makes the text `.png` binary for
+    # a plain `git diff`; the gate's classing must not see it.
+    commit_bytes(sb, "assets/notes.png", SCRIPT_BODY.encode())
+    route(sb, tmp_path)
+    sb.review("PASS", reads=[])
+    out = sb.gate()
+    assert is_deny(out) and "no advisor has read: assets/notes.png" in reason(out)
+    assert "Listed, not refused" not in reason(out)
+
+
+@pytest.mark.parametrize("attrs", ["assets/notes.png -diff\n",
+                                   "[attr]opaque -diff\nassets/*.png opaque\n",
+                                   "*.png diff=img\n"],
+                         ids=["-diff", "macro", "driver"])
+def test_info_attributes_spares_no_file_and_says_why(sb, attrs):
+    # Finding 3, the file half: no config switches `.git/info/attributes`
+    # off, so an attribute there that can decide (b) spares nothing -- the real
+    # binary beside the text `.png` included -- and the refusal names it.
+    git(sb.work, "config", "diff.img.binary", "true")
+    write(sb.work / ".git" / "info" / "attributes", attrs)
+    commit_bytes(sb, "assets/notes.png", SCRIPT_BODY.encode())
+    commit_bytes(sb, "build/candle.bin", FIRMWARE)
+    sb.review("PASS", reads=[])
+    out = sb.gate()
+    assert is_deny(out) and "no advisor has read: assets/notes.png" in reason(out)
+    assert "build/candle.bin" in reason(out).split("no advisor has read:")[1]
+    assert "Listed, not refused" not in reason(out)
+    assert ".git/info/attributes" in reason(out)
+
+
+def _committed_attributes(sb: Sandbox, tmp: Path) -> None:
+    sb.commit(".gitattributes", "*.png binary\n*.bin -diff\n")
+
+
+def _global_png_binary(sb: Sandbox, tmp: Path) -> None:
+    write(tmp / "xdg" / "git" / "attributes", "*.png binary\n*.bin -diff\n")
+    env = sb.env
+    sb.env = lambda: {**env(), "XDG_CONFIG_HOME": str(tmp / "xdg")}
+
+
+@pytest.mark.parametrize("route", [_committed_attributes, _global_png_binary],
+                         ids=["in-tree", "global"])
+def test_a_writable_binary_attribute_still_spares_a_real_binary(sb, tmp_path, route):
+    # The pins exist so that the common, honest `*.png binary` (in-tree or in
+    # the user's global file) neither decides (b) nor trips attribute_hold.
+    route(sb, tmp_path)
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    commit_bytes(sb, "assets/logo.png", FIRMWARE)
+    commit_bytes(sb, "build/candle.bin", FIRMWARE)
+    sb.review("PASS", reads=["scripts/run.sh", ".gitattributes"])
+    out = sb.gate()
+    assert not is_deny(out), reason(out)
+    assert "assets/logo.png" in out["systemMessage"] and "build/candle.bin" in out["systemMessage"]
+
+
+def test_an_unrelated_info_attribute_still_spares_a_real_binary(sb):
+    # The fail-closed check is per spared path: `*.c -diff` touches no `.bin`.
+    write(sb.work / ".git" / "info" / "attributes", "*.c -diff\n")
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    commit_bytes(sb, "build/candle.bin", FIRMWARE)
+    sb.review("PASS", reads=["scripts/run.sh"])
+    out = sb.gate()
+    assert not is_deny(out) and "build/candle.bin" in out["systemMessage"]
 
 
 # Break (r2 finding 5): one `git cat-file` per changed path per revision in

@@ -46,9 +46,13 @@ EVENTS (one script, dispatched on hook_event_name):
          build outputs, archives, fonts, pdf), git diffs it as binary on every
          side that has it, and it is outside every behaviour path; no content
          heuristic is applied (artl_gate.binary_paths). Such files are named in
-         every refusal and in the pass note, and logged. Known, accepted limit:
-         a text file renamed to `.png` and marked binary in
-         `.git/info/attributes` is spared; OR
+         every refusal and in the pass note, and logged. The binary class is
+         git's content rule with no `.gitattributes`, attributes file or config
+         the agent can write (artl_gate.attr_pinned); an attribute in
+         `.git/info/attributes`, which no option switches off, spares no file
+         and the refusal says so. Known, accepted limit: a text file renamed to
+         a listed extension that really holds a NUL in its first 8000 bytes
+         (or is over 512 MiB) is spared; OR
       4. the user waived it in this session with `skip-artl` (consumed by this
          one PR open, logged; see UserPromptSubmit).
     Fail -> permissionDecision "deny" with every reason. Pass -> no decision
@@ -134,10 +138,13 @@ def out(obj: dict) -> None:
     sys.stdout.flush()
 
 
-def refuse(reasons: list[str], with_remedy: bool, binary: list[str] | None = None) -> None:
+def refuse(reasons: list[str], with_remedy: bool, binary: list[str] | None = None,
+           withheld: str | None = None) -> None:
     text = "pr-open-gate refused this PR open:\n" + "\n".join(f"- {r}" for r in reasons)
     if binary:
         text += "\nListed, not refused: " + g.binary_listing(binary)
+    if withheld:
+        text += "\nNot spared as binary: " + withheld
     out({"hookSpecificOutput": {"hookEventName": "PreToolUse",
                                 "permissionDecision": "deny",
                                 "permissionDecisionReason": text + (REMEDY if with_remedy else "")}})
@@ -319,9 +326,10 @@ def on_pretool(payload: dict) -> None:
     session = g.safe_id(payload.get("session_id")) or "unknown"
     slot = grant_path(session, payload)
 
-    def deny(reasons: list[str], with_remedy: bool, binary: list[str] | None = None) -> None:
+    def deny(reasons: list[str], with_remedy: bool, binary: list[str] | None = None,
+             withheld: str | None = None) -> None:
         revoke(slot)
-        refuse(reasons, with_remedy, binary)
+        refuse(reasons, with_remedy, binary, withheld)
 
     if call.get("problem"):
         deny([call["problem"]], with_remedy=False)
@@ -348,11 +356,12 @@ def on_pretool(payload: dict) -> None:
     # read), so the tip's set is computed before anything can refuse.
     where = {"repo": info["repo"], "top": top, "branch": branch, "head": tip}
     views = [(tip, changes, g.binary_paths(top, mb, tip, changes))]
-    binary = sorted(views[0][2])
+    binary = sorted(views[0][2].paths)
 
     def deny_listed(reasons: list[str], with_remedy: bool) -> None:
         log_binary(payload, binary, "refused", where)
-        deny(reasons, with_remedy, binary)
+        withheld = next((s.withheld for _, _, s in views if s.withheld), None)
+        deny(reasons, with_remedy, binary, withheld)
 
     smoke, smoke_log = g.smoke_problem(top, mb, tip, changes)
     if smoke:
@@ -365,7 +374,7 @@ def on_pretool(payload: dict) -> None:
         return
     views += [(view_tip, view_changes, g.binary_paths(top, mb, view_tip, view_changes))
               for view_tip, view_changes in pending]
-    binary = sorted(set().union(*(view_binary for _, _, view_binary in views)))
+    binary = sorted(set().union(*(spared.paths for _, _, spared in views)))
     exempt = None
     for _, view_changes, _ in views:
         exempt = g.computed_exemption(view_changes)
@@ -378,9 +387,9 @@ def on_pretool(payload: dict) -> None:
         for d in g.read_records_dirs(payload, info):
             records.extend(g.read_jsonl(d / g.EVIDENCE_FILE))
         problem = None
-        for view_tip, view_changes, view_binary in views:
+        for view_tip, view_changes, spared in views:
             problem = g.evidence_problem(records, info, branch, view_tip, view_changes,
-                                         view_binary)
+                                         set(spared.paths))
             if problem:
                 break
         if problem:

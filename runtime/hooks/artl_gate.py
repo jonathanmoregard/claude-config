@@ -83,6 +83,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 GIT_TIMEOUT_S = 5
 LS_REMOTE_TIMEOUT_S = 6
@@ -268,15 +269,45 @@ def declared_binary(path: str) -> bool:
     return "." in name.lstrip(".") and name.rsplit(".", 1)[1].lower() in BINARY_EXTENSIONS
 
 
-def side_classes(top: str, rev: str, paths: set[str]) -> dict[str, bool] | None:
-    """{path: git diffs it as binary} for each of PATHS that exists at REV (an
-    absent path has no entry): numstat from the empty tree, so git's own rule
-    -- content and attributes -- classes that one side. None if git fails."""
-    empty = git(top, "hash-object", "-t", "tree", "/dev/null")
-    if not empty:
+def attr_pinned(empty: str) -> tuple[str, ...]:
+    """git's global options for every call that decides rule (b), so no source
+    the gated agent can write takes part: attributes from the EMPTY tree (not
+    the worktree or in-tree `.gitattributes`, and attr.tree is ignored), no
+    core.attributesFile (nor its default ~/.config/git/attributes), and git's
+    default big-file threshold (a lower one diffs every larger file as
+    binary). $GIT_DIR/info/attributes stays on: attribute_hold checks it."""
+    return (f"--attr-source={empty}", "-c", "core.attributesFile=/dev/null",
+            "-c", "core.bigFileThreshold=512m")
+
+
+CLASS_ATTRS = ("diff", "text", "binary")
+
+
+def attribute_hold(top: str, empty: str, paths: set[str]) -> str | None:
+    """Why none of PATHS may be spared, or None. Under attr_pinned the only
+    attribute files left are $GIT_DIR/info/attributes and the system file,
+    which no option switches off; a diff, text or binary attribute from them
+    (macros expanded by check-attr) on any of PATHS holds back every path."""
+    out = git(top, *attr_pinned(empty), "check-attr", "-z", *CLASS_ATTRS, "--",
+              *sorted(paths))
+    if out is None:
+        return ("git check-attr failed, so .git/info/attributes could not be ruled "
+                "out; no file was spared its Read as binary")
+    fields = out.split("\0")
+    held = sorted({p for p, value in zip(fields[0::3], fields[2::3])
+                   if value != "unspecified"})
+    if not held:
         return None
-    out = git(top, "diff", "--numstat", "-z", "--no-renames", empty, rev, "--",
-              *sorted(paths), env={"GIT_LITERAL_PATHSPECS": "1"})
+    return (".git/info/attributes (which no git option switches off) sets diff, text "
+            f"or binary on {_shown(held)}; no file was spared its Read as binary")
+
+
+def side_classes(top: str, empty: str, rev: str, paths: set[str]) -> dict[str, bool] | None:
+    """{path: git diffs it as binary} for each of PATHS that exists at REV (an
+    absent path has no entry): numstat from the EMPTY tree under attr_pinned,
+    so git's content rule classes that one side. None if git fails."""
+    out = git(top, *attr_pinned(empty), "diff", "--numstat", "-z", "--no-renames",
+              empty, rev, "--", *sorted(paths), env={"GIT_LITERAL_PATHSPECS": "1"})
     if out is None:
         return None
     classes: dict[str, bool] = {}
@@ -287,33 +318,49 @@ def side_classes(top: str, rev: str, paths: set[str]) -> dict[str, bool] | None:
     return classes
 
 
+class Spared(NamedTuple):
+    """binary_paths' answer: the paths that need no Read, and why none are
+    when attribute_hold (or a git failure) held them all back."""
+    paths: frozenset[str]
+    withheld: str | None = None
+
+
 def binary_paths(top: str, a: str, b: str, rows: list[tuple[str, int | None]],
-                 within: set[str] | None = None) -> set[str]:
+                 within: set[str] | None = None) -> Spared:
     """The paths of the A..B diff (ROWS, its numstat) that need no Read.
     Exactly those that meet all three:
       (a) the extension is in BINARY_EXTENSIONS;
       (b) git diffs the file as binary (numstat `-`) on every side, A and B,
           where it exists -- a file that is text on one side is not binary,
           since making a reviewed file binary must not take its changes out of
-          the review;
+          the review. Every git call here runs under attr_pinned, so no
+          `.gitattributes`, attributes file or config the agent writes takes
+          part; an attribute from `.git/info/attributes`, which nothing
+          switches off, spares no file at all (attribute_hold);
       (c) it is outside every behaviour path (is_behaviour): there even a real
           binary is something the harness runs or reads.
-    No blob is read: the numstat of the pair, then one per side. Known limit,
-    accepted: (b) is git's rule, so attributes and config outside the diff
-    (`.git/info/attributes`, core.attributesFile, diff.<driver>.binary) can
-    mark text binary -- a text file renamed to `.png` and marked binary there
-    is spared. Only paths in `within` (default: all) are classed; a git
-    failure spares nothing."""
+    No blob is read: the numstat of the pair, then one check-attr and one
+    numstat per side. Known limit, accepted: (b) is then git's content rule,
+    so a text file renamed to a listed extension that really holds a NUL in
+    its first 8000 bytes (or is over 512 MiB) is spared. Only paths in
+    `within` (default: all) are classed; a git failure spares nothing."""
     wanted = {p for p, n in rows
               if n is None and declared_binary(p) and not is_behaviour(p)
               and (within is None or p in within)}
     if not wanted:
-        return set()
-    sides = [side_classes(top, rev, wanted) for rev in (a, b)]
+        return Spared(frozenset())
+    empty = git(top, "hash-object", "-t", "tree", "/dev/null")
+    if not empty:
+        return Spared(frozenset())
+    hold = attribute_hold(top, empty, wanted)
+    if hold:
+        return Spared(frozenset(), hold)
+    sides = [side_classes(top, empty, rev, wanted) for rev in (a, b)]
     if None in sides:
-        return set()
-    return {p for p in wanted
-            if any(p in s for s in sides) and all(s.get(p, True) for s in sides)}
+        return Spared(frozenset())
+    return Spared(frozenset(p for p in wanted
+                            if any(p in s for s in sides)
+                            and all(s.get(p, True) for s in sides)))
 
 
 def snapshot_tree(top: str, untracked: bool = True) -> str | None:
@@ -1181,7 +1228,7 @@ def tree_rows(top: str, tree: object, tip: str, cache: dict,
         if rows is None:
             cache[tree] = None
         else:
-            binary = binary_paths(top, tree, tip, rows, within=pr_paths)
+            binary = binary_paths(top, tree, tip, rows, within=pr_paths).paths
             cache[tree] = {p: 0 if p in binary else (DRIFT_LIMIT + 1 if n is None else n)
                            for p, n in rows}
     return cache[tree]
