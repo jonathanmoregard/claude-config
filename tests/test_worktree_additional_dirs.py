@@ -129,6 +129,17 @@ def main() -> int:
         check("worktree ahead of every remote's default branch kept",
               str(legacy_ahead) in dirs, str(dirs))
 
+        (cfg / "settings.json").write_text(json.dumps(
+            # arftl-allow: permission-widened (fixture written to a scratch config)
+            {"permissions": {"additionalDirectories": [str(root)]}}))
+        git_log.unlink()
+        subprocess.run([sys.executable, str(HOOK)], input="{}", text=True, capture_output=True,
+                       env={**ENV, "CLAUDE_PROJECT_DIR": str(repo), "CLAUDE_CONFIG_DIR": str(cfg),
+                            "PATH": f"{shim_dir}{os.pathsep}{ENV.get('PATH', '')}"}, timeout=60)
+        calls = git_log.read_text().splitlines() if git_log.exists() else []
+        check("every worktree covered: no git call beyond the worktree list",
+              [c for c in calls if " worktree list" not in c] == [], str(calls))
+
         for label, value in (("null", None), ("a string", "/"), ("a number", 7),
                              ("an unknown ~user", ["~no-such-user-e2e/x"]),
                              ("a path with a NUL", ["a\x00b"])):

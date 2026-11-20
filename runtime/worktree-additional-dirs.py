@@ -82,6 +82,8 @@ def worktrees_of(repo: pathlib.Path, roots: list[pathlib.Path]) -> list[str]:
         if covered(str(resolved), roots):
             continue  # before the git checks: they are what the hook's time budget goes on
         found.append(str(resolved))
+    if not found:
+        return []
     bases = default_refs(repo)
     with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
         live = list(pool.map(lambda p: has_work(p, bases), found))
