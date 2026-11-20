@@ -4,24 +4,28 @@ returns pass/evidence per check. Prints "PASS ..." or "missing/bad: ...";
 exits 2 when the judge itself fails, so the harness reports INCONCLUSIVE
 instead of a verdict.
 
-usage: judge.py SWEEP_DIR OUT_DIR CREDENTIALS_FILE [FINAL_TXT]
-The judge runs with a fresh HOME and working directory created here, outside
-the run directory the agent under test could write to. The HOME holds only a
-link to the credentials; the judge has no tools, no settings, no MCP and no
-skills, so the config under test cannot shape its own grade. Its raw output
-lands in OUT_DIR/judge.out.
+usage: judge.py SWEEP_DIR [FINAL_TXT]
+Nothing the judge reads or writes, apart from the sweep output it grades,
+lives in the run directory the agent under test could write: its HOME and
+working directory are fresh, its credentials come from the real (passwd)
+home, and its raw output goes to a fresh directory the result names. It has
+no tools, settings, MCP or skills, so the config under test cannot shape its
+own grade.
 """
 import glob
 import json
 import os
+import pwd
 import subprocess
 import sys
 import tempfile
 
 CHECKS = ['P1', 'P2', 'P3', 'P4', 'P5', 'G', 'X', 'V']
 here = os.path.dirname(os.path.abspath(__file__))
-sweep_dir, out_dir, creds = sys.argv[1:4]
-final_path = sys.argv[4] if len(sys.argv) > 4 else ''
+sweep_dir = sys.argv[1]
+final_path = sys.argv[2] if len(sys.argv) > 2 else ''
+creds = os.path.join(pwd.getpwuid(os.getuid()).pw_dir, '.claude', '.credentials.json')
+out_dir = tempfile.mkdtemp(prefix='sweep-judge-out-')
 
 
 def inconclusive(why):
@@ -52,7 +56,6 @@ argv = [os.environ.get('E2E_JUDGE_CLAUDE', 'claude'), '-p', '--model', os.enviro
         '--output-format', 'json', '--json-schema', json.dumps(schema), '--tools', '', '--strict-mcp-config',
         '--setting-sources', '', '--disable-slash-commands', '--no-session-persistence']
 try:
-    os.makedirs(out_dir, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='sweep-judge-') as fresh:
         home, cwd = os.path.join(fresh, 'home'), os.path.join(fresh, 'cwd')
         os.makedirs(os.path.join(home, '.claude'))

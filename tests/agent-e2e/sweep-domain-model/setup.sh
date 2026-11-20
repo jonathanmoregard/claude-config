@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # A small personal home-lighting app in TypeScript with a type-checker gate.
+# Two fix commits give the sweep defect history (unrelated to the plants).
 # Planted, for the grader only (nothing in the fixture's text names them):
 #   P1 a closed set as a number: the remote preset is 0..4 (`preset: number`)
 #   P2 a sentinel: -1 means "no preset seen", '' means "no room"
@@ -56,7 +57,7 @@ export interface RemoteArgs {
 /** Which way the arrows moved: 1 right, -1 left, 0 neither. */
 export function direction(args: RemoteArgs): number {
   if (args.lastPreset === -1) return args.preset === 0 ? 1 : args.preset === 4 ? -1 : 0;
-  const d = (args.preset - args.lastPreset + 5) % 5;
+  const d = (args.preset - args.lastPreset) % 5;
   return d === 1 ? 1 : d === 4 ? -1 : 0;
 }
 
@@ -78,7 +79,7 @@ export function planRemote(args: RemoteArgs, lamps: LampArgs[]): Plan[] {
   const plans: Plan[] = [{ service: 'input_number.set_value', entity_id: 'input_number.remote_preset_' + args.room, data: { value: args.preset } }];
   for (const l of lamps) {
     if (l.room !== args.room || !l.on) continue;
-    const b = Math.max(1, Math.min(255, l.brightness + step));
+    const b = Math.max(0, Math.min(255, l.brightness + step));
     plans.push({ service: 'light.turn_on', entity_id: 'light.' + l.lamp, data: { brightness: b } });
   }
   return plans;
@@ -111,6 +112,12 @@ ln -s "$TSC/lib/node_modules/typescript" "$WORK/node_modules/typescript"
 ln -s "$TSC/bin/tsc" "$WORK/node_modules/.bin/tsc"
 git -C "$WORK" add -A
 git -C "$WORK" commit -qm "feat: remote presets step lamp brightness"
+# Defect history, so the Venues lens has something to run on: two bugs that
+# shipped and were fixed later.
+sed -i 's/(args.preset - args.lastPreset) % 5/(args.preset - args.lastPreset + 5) % 5/' "$WORK/src/core/remote.ts"
+git -C "$WORK" commit -qam "fix: left arrow from the coldest preset did nothing (negative modulo)"
+sed -i 's/Math.max(0, Math.min/Math.max(1, Math.min/' "$WORK/src/core/lighting.ts"
+git -C "$WORK" commit -qam "fix: stepping down turned lamps off at brightness 0"
 # The gate the sweep's entry check needs really is green.
 ( cd "$WORK" && ./scripts/check >> "$E2E_RUN/setup-gate.log" 2>&1 )
 

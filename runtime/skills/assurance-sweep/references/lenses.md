@@ -103,8 +103,9 @@ there are many, in these categories:
 7. Names that describe mechanism (plan, args, parts, data, info, manager,
    handle) where a domain word exists. Take domain words from the user's own
    words in the recorded decisions and conversation records the inventory
-   names. Return a vocabulary table, each term with where the user used it;
-   mark a term with no such source.
+   names. Return a vocabulary table: each mechanism name, the domain term
+   that replaces it, and where the user used that term; mark a term with no
+   such source.
 For each category give the target type as a short sketch, where its parser
 belongs, and one guard that keeps it from coming back: a lint or
 compiler-API check over the core's exported signatures, with an allowlist
