@@ -250,7 +250,11 @@ def main(args: list[str]) -> None:
         trash_fd = subdir(trash_fd, part)
     files_fd, info_fd = subdir(trash_fd, "files"), subdir(trash_fd, "info")
     for arg in args:
-        move(check(arg, home, denied, os.fstat(files_fd).st_dev), info_fd, files_fd)
+        target = check(arg, home, denied, os.fstat(files_fd).st_dev)
+        try:
+            move(target, info_fd, files_fd)
+        finally:
+            os.close(target.parent_fd)
 
 
 try:
