@@ -140,6 +140,25 @@ def main() -> int:
         check("every worktree covered: no git call beyond the worktree list",
               [c for c in calls if " worktree list" not in c] == [], str(calls))
 
+        local = root / "local"
+        git(root, "init", "-q", str(local))
+        git(local, "commit", "-q", "--allow-empty", "-m", "init")
+        local_wts = [root / f"local-wt{i}" for i in range(3)]
+        for i, wt in enumerate(local_wts):
+            git(local, "worktree", "add", "-q", "-b", f"l{i}", str(wt))
+        (local_wts[0] / "wip.txt").write_text("x")
+        (cfg / "settings.json").write_text("{}")
+        git_log.unlink()
+        subprocess.run([sys.executable, str(HOOK)], input="{}", text=True, capture_output=True,
+                       env={**ENV, "CLAUDE_PROJECT_DIR": str(local), "CLAUDE_CONFIG_DIR": str(cfg),
+                            "PATH": f"{shim_dir}{os.pathsep}{ENV.get('PATH', '')}"}, timeout=60)
+        calls = git_log.read_text().splitlines()
+        dirs = json.loads((local / ".claude" / "settings.local.json").read_text())
+        check("no remote: every worktree kept",
+              dirs["permissions"]["additionalDirectories"] == sorted(map(str, local_wts)), str(dirs))
+        check("no remote: no status check, which could not change that",
+              not [c for c in calls if " status" in c], str(calls))
+
         for label, value in (("null", None), ("a string", "/"), ("a number", 7),
                              ("an unknown ~user", ["~no-such-user-e2e/x"]),
                              ("a path with a NUL", ["a\x00b"])):

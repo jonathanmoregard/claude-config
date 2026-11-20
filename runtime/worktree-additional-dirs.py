@@ -121,10 +121,10 @@ def has_work(path: str, bases: list[str]) -> bool:
     commits on no remote's default branch. A clean worktree whose branch is
     merged only costs environment-block tokens in every session. Unknown ->
     keep, so a git hiccup never hides live work."""
+    if not bases:
+        return True
     status = git(path, "status", "--porcelain")
     if status is None or status.strip():
-        return True
-    if not bases:
         return True
     ahead = git(path, "rev-list", "--count", "HEAD", "--not", *bases)
     return ahead is None or ahead.strip() != "0"
