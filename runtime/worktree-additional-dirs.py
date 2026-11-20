@@ -32,8 +32,33 @@ def project_dir() -> pathlib.Path:
     return pathlib.Path(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
 
 
-def worktrees_of(repo: pathlib.Path) -> list[str]:
-    """Absolute paths of every worktree of `repo`, excluding `repo` itself."""
+def user_scope_roots() -> list[pathlib.Path]:
+    config = pathlib.Path(os.environ.get("CLAUDE_CONFIG_DIR") or pathlib.Path.home() / ".claude")
+    try:
+        data = json.loads((config / "settings.json").read_text(encoding="utf-8"))
+        dirs = data["permissions"]["additionalDirectories"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+    roots = []
+    for d in dirs if isinstance(dirs, list) else []:
+        try:
+            roots.append(pathlib.Path(d).expanduser().resolve())
+        except (TypeError, ValueError, RuntimeError, OSError):
+            continue
+    return roots
+
+
+def covered(path: str, roots: list[pathlib.Path]) -> bool:
+    # Each listed directory costs ~60 bwrap arguments of per-directory write
+    # protection, and bwrap takes at most 9000: one already in scope through a
+    # user-level root adds no access, only arguments.
+    p = pathlib.Path(path)
+    return any(p == r or r in p.parents for r in roots)
+
+
+def worktrees_of(repo: pathlib.Path, roots: list[pathlib.Path]) -> list[str]:
+    """Absolute paths of the worktrees of `repo` that hold work, excluding
+    `repo` itself and any already covered by `roots`."""
     try:
         out = subprocess.run(
             ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
@@ -54,7 +79,11 @@ def worktrees_of(repo: pathlib.Path) -> list[str]:
         resolved = path.resolve()
         if resolved == here:
             continue  # the checkout we're already in
+        if covered(str(resolved), roots):
+            continue  # before the git checks: they are what the hook's time budget goes on
         found.append(str(resolved))
+    if not found:
+        return []
     bases = default_refs(repo)
     with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
         live = list(pool.map(lambda p: has_work(p, bases), found))
@@ -92,10 +121,10 @@ def has_work(path: str, bases: list[str]) -> bool:
     commits on no remote's default branch. A clean worktree whose branch is
     merged only costs environment-block tokens in every session. Unknown ->
     keep, so a git hiccup never hides live work."""
+    if not bases:
+        return True
     status = git(path, "status", "--porcelain")
     if status is None or status.strip():
-        return True
-    if not bases:
         return True
     ahead = git(path, "rev-list", "--count", "HEAD", "--not", *bases)
     return ahead is None or ahead.strip() != "0"
@@ -108,7 +137,7 @@ def main() -> int:
         pass
 
     repo = project_dir()
-    wanted = worktrees_of(repo)
+    wanted = worktrees_of(repo, user_scope_roots())
 
     settings_path = repo / ".claude" / "settings.local.json"
     try:
