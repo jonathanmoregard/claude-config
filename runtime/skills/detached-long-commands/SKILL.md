@@ -13,8 +13,8 @@ ingests):
 
 ## Sandboxed session — the jobs broker
 
-Inside the sandbox `systemd-run --user` and `wait-for` fail: there is no user
-bus. Launch through the `jobs_broker` MCP tools instead; they create the same
+Inside the sandbox `systemd-run --user` and `wait-for job` fail: there is no
+user bus. Launch through the `jobs_broker` MCP tools instead; they create the same
 retained, hardened user unit (`claude-job-<slug>`) from outside the sandbox:
 
 1. `mcp__jobs_broker__start` with `repo` (absolute, under `~/Repos` or
