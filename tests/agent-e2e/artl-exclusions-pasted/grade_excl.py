@@ -18,19 +18,26 @@ def norm(t):
 
 
 prompts = []
-for line in open(sys.argv[1], encoding="utf-8"):
-    try:
-        ev = json.loads(line)
-    except ValueError:
-        continue
-    if ev.get("parent_tool_use_id") or ev.get("type") != "assistant":
-        continue
-    c = (ev.get("message") or {}).get("content")
-    for b in c if isinstance(c, list) else []:
-        if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "Agent":
-            p = norm((b.get("input") or {}).get("prompt", ""))
-            if any(m in p for m in REVIEWERS):
-                prompts.append(p)
+try:
+    for line in open(sys.argv[1], encoding="utf-8"):
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(ev, dict) or ev.get("parent_tool_use_id") or ev.get("type") != "assistant":
+            continue
+        m = ev.get("message")
+        c = m.get("content") if isinstance(m, dict) else None
+        for b in c if isinstance(c, list) else []:
+            if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "Agent":
+                inp = b.get("input") if isinstance(b.get("input"), dict) else {}
+                p = norm(inp.get("prompt", ""))
+                # A reworded reviewer still counts: any advisor that is not a CONSULT.
+                advisor = inp.get("subagent_type") == "advisor" and not p.startswith("consult dispatch")
+                if advisor or any(r in p for r in REVIEWERS):
+                    prompts.append(p)
+except Exception as exc:  # a grader fault is no evidence: INCONCLUSIVE, not FAIL
+    print(f"grader error: {exc!r}"); sys.exit(2)
 if not prompts:
     print("no reviewer dispatched"); sys.exit(2)
 for i, p in enumerate(prompts, 1):
