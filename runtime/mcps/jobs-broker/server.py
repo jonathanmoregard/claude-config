@@ -362,7 +362,8 @@ TOOLS = [
      "description": (
          "Starts a long job (nix build, VM test gate, long test suite) as a detached, hardened "
          "systemd user unit that outlives this session. It runs argv in repo with: repo "
-         "writable, the rest of home hidden, no network, secrets hidden, killed after "
+         "writable, the rest of home hidden, no network (nix builds still fetch through the "
+         "nix daemon), secrets hidden, git hooks and config read-only, killed after "
          "max_runtime_sec. Profile nix also binds the nix cache and uses the ram-heavy slice. "
          "Read the outcome later with status (wait_sec blocks until it settles) and log."),
      "inputSchema": {"type": "object", "properties": {

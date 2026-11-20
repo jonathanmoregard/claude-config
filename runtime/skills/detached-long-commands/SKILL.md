@@ -24,9 +24,10 @@ retained, hardened user unit (`claude-job-<slug>`) from outside the sandbox:
    settles; `mcp__jobs_broker__log` tails the log, which ends `MARKER_OK` or
    `MARKER_FAILED rc=N`; `mcp__jobs_broker__stop` frees the slug.
 
-Jobs have **no network** and see only that repo of your home. A job that
-needs to fetch (uncached flake inputs, `git fetch`, downloads) fails there;
-say so instead of retrying.
+Jobs have **no network** of their own and see only that repo of your home.
+Nix builds still download through the nix daemon (substitutes, fixed-output
+fetches); anything the job fetches itself (flake inputs not yet in the store,
+`git fetch`, curl, pip) fails there; say so instead of retrying.
 
 ## Launch — detached systemd user unit + sentinel markers
 
