@@ -32,6 +32,13 @@ editor, shell and git config at any depth is read-only too, and any such file a
 job creates (a new `.git`, `.claude/`, `.envrc`) is moved out of the repo when
 it ends; status and log name what was moved.
 
+A NixOS VM test gate works as a job (`profile: "nix"`, argv `nix build -L
+.#checks.x86_64-linux.<lane>`): the nix daemon boots the VM, with KVM, outside
+the job. Nothing that runs QEMU inside the job works. A job has no `/dev/kvm`,
+and the session and host cannot reach a port it listens on. Lost in a sandboxed
+session: interactive feature-vm launches with forwarded ports (`driverInteractive`,
+`nix run` of a VM). Ask the owner to launch those from an unsandboxed shell.
+
 ## Launch — detached systemd user unit + sentinel markers
 
 The unit retains the command's real exit status: `ExecMainStatus` equals the
