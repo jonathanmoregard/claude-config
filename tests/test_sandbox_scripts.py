@@ -133,6 +133,7 @@ STATUS = """\u25cf app.slice - User Application Slice
              \u2502 \u2514\u250012 /bin/tool --token leaked
              \u2514\u250013 /bin/other leaked
              |-14 /bin/ascii leaked
+             | `-16 /bin/ascii leaked
              `-15 /bin/ascii leaked
 
 Nov 19 10:00:00 host tool[12]: started
@@ -217,7 +218,7 @@ def trash_for(home: Path) -> Path:
 
 def run_trash(home: Path, *args: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run([sys.executable, "-I", str(trash_for(home)), *args], cwd=cwd,
-                          capture_output=True, text=True, check=False)
+                          capture_output=True, text=True, check=False, timeout=30)
 
 
 def origin(record: Path) -> bytes:
@@ -308,3 +309,91 @@ def test_trash_empties_entries_older_than_thirty_days(home: Path) -> None:
     assert run_trash(home, str(home / "worktrees" / "project" / "f")).returncode == 0
     assert sorted(os.listdir(trash / "files")) == ["recent"]
     assert sorted(os.listdir(trash / "info")) == ["recent.trashinfo"]
+
+
+OLD_RECORD = b"[Trash Info]\nPath=/x\nDeletionDate=2000-01-01T00:00:00\n"
+
+
+def plant_trash(home: Path, link: str) -> Path:
+    """Repos/.trash with `link` pointing at an outside copy holding an old entry."""
+    outside = home / "outside"
+    (outside / "files" / "victim").mkdir(parents=True)
+    (outside / "files" / "victim" / "x").write_text("x")
+    (outside / "info").mkdir()
+    (outside / "info" / "victim.trashinfo").write_bytes(OLD_RECORD)
+    trash = home / "Repos" / ".trash"
+    if link == ".trash":
+        trash.symlink_to(outside)
+    else:
+        trash.mkdir()
+        (trash / link).symlink_to(outside / link)
+        other = "info" if link == "files" else "files"
+        shutil.copytree(outside / other, trash / other)
+    return outside
+
+
+@pytest.mark.parametrize("link", [".trash", "files", "info"])
+def test_trash_empties_nothing_through_a_link_in_its_trash(home: Path, link: str) -> None:
+    outside = plant_trash(home, link)
+    (home / "worktrees" / "project" / "f").write_text("x")
+    run_trash(home, str(home / "worktrees" / "project" / "f"))
+    assert (outside / "files" / "victim" / "x").exists()
+    assert (outside / "info" / "victim.trashinfo").exists()
+
+
+@pytest.mark.parametrize("link", [".trash", "files", "info"])
+def test_trash_moves_nothing_through_a_link_in_its_trash(home: Path, link: str) -> None:
+    outside = plant_trash(home, link)
+    before = sorted(str(p) for p in outside.rglob("*"))
+    (home / "Repos" / "project" / "f").write_text("x")
+    proc = run_trash(home, str(home / "Repos" / "project" / "f"))
+    assert proc.returncode == 1
+    assert (home / "Repos" / "project" / "f").exists()
+    assert sorted(str(p) for p in outside.rglob("*")) == before
+
+
+@pytest.mark.parametrize("make", [os.mkfifo, os.mkdir], ids=["fifo", "dir"])
+def test_trash_skips_a_record_that_is_not_a_regular_file(home: Path, make) -> None:
+    info = home / "Repos" / ".trash" / "info"
+    info.mkdir(parents=True)
+    (home / "Repos" / ".trash" / "files").mkdir()
+    make(info / "odd.trashinfo")
+    (home / "worktrees" / "project" / "f").write_text("x")
+    proc = run_trash(home, str(home / "worktrees" / "project" / "f"))
+    assert proc.returncode == 0, proc.stderr
+
+
+@pytest.mark.parametrize("content, age_days, emptied", [
+    (b"[Trash Info]\nPath=/x/caf\xe9\nDeletionDate=2000-01-01T00:00:00\n", 0, True),
+    (b"", 31, True),
+    (b"", 29, False),
+    (b"[Trash Info]\nDeletionDate=garbage\n", 31, True),
+], ids=["not-utf8", "empty-old", "empty-recent", "malformed-old"])
+def test_trash_dates_a_record_without_a_readable_date_by_its_mtime(
+        home: Path, content: bytes, age_days: int, emptied: bool) -> None:
+    trash = home / "Repos" / ".trash"
+    (trash / "files").mkdir(parents=True)
+    (trash / "files" / "e").write_text("x")
+    (trash / "info").mkdir()
+    record = trash / "info" / "e.trashinfo"
+    record.write_bytes(content)
+    stamp = time.time() - age_days * 86400
+    os.utime(record, (stamp, stamp))
+    (home / "worktrees" / "project" / "f").write_text("x")
+    proc = run_trash(home, str(home / "worktrees" / "project" / "f"))
+    assert proc.returncode == 0, proc.stderr
+    assert (trash / "files" / "e").exists() is not emptied
+    assert record.exists() is not emptied
+
+
+@pytest.mark.parametrize("name", [".trashinfo", "..trashinfo", "...trashinfo"])
+def test_trash_empties_no_entry_for_a_record_naming_the_trash_itself(home: Path, name: str) -> None:
+    trash = home / "Repos" / ".trash"
+    (trash / "files").mkdir(parents=True)
+    (trash / "files" / "young").write_text("x")
+    (trash / "info").mkdir()
+    (trash / "info" / name).write_bytes(OLD_RECORD)
+    (home / "worktrees" / "project" / "f").write_text("x")
+    proc = run_trash(home, str(home / "worktrees" / "project" / "f"))
+    assert proc.returncode == 0, proc.stderr
+    assert (trash / "files" / "young").exists()

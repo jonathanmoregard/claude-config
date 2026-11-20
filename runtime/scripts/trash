@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import pwd
 import shutil
+import stat
 import sys
 import time
 from pathlib import Path
@@ -37,23 +38,55 @@ def root_of(path: Path, home: Path) -> Path | None:
     return None
 
 
-def reserve(info: Path, name: str, original: Path) -> str:
+def open_dir(name: str, dir_fd: int, create: bool) -> int:
+    if create:
+        try:
+            os.mkdir(name, dir_fd=dir_fd)
+        except FileExistsError:
+            pass
+    return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+
+
+def open_trash(root: Path, create: bool) -> tuple[int, int]:
+    """Descriptors, not paths: a sandboxed caller can make any of these a link, and an
+    unsandboxed run must not follow it."""
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        trash_fd = open_dir(".trash", root_fd, create)
+    finally:
+        os.close(root_fd)
+    try:
+        return open_dir("files", trash_fd, create), open_dir("info", trash_fd, create)
+    finally:
+        os.close(trash_fd)
+
+
+def lexists(name: str, dir_fd: int) -> bool:
+    try:
+        os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def reserve(files: int, info: int, name: str, original: Path) -> str:
     """Claims a name under info/ first, as the FreeDesktop trash spec does."""
     for n in range(1, 10_000):
         unique = name if n == 1 else f"{name}.{n}"
         try:
-            fd = os.open(info / f"{unique}.trashinfo", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            fd = os.open(f"{unique}.trashinfo", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
+                         dir_fd=info)
         except FileExistsError:
             continue
-        if os.path.lexists(info.parent / "files" / unique):
+        if lexists(unique, files):
             os.close(fd)
-            os.unlink(info / f"{unique}.trashinfo")
+            os.unlink(f"{unique}.trashinfo", dir_fd=info)
             continue
         with os.fdopen(fd, "w") as f:
             f.write(f"[Trash Info]\nPath={quote(os.fsencode(original))}\n"
                     f"DeletionDate={time.strftime(DATE)}\n")
         return unique
-    fail(f"no free name for {name} in {info.parent}")
+    fail(f"no free name for {name}")
     raise AssertionError
 
 
@@ -62,42 +95,70 @@ def move(arg: str, home: Path) -> None:
     if not os.path.lexists(path):
         fail(f"{arg}: no such file or directory")
     root = root_of(path, home)
-    if root is None or path.resolve() == root:
+    if root is None:
         fail(f"{arg} is not under ~/{' or ~/'.join(ROOTS)}; use rm")
     trash = root / ".trash"
     if path == trash or path.parent.resolve().is_relative_to(trash):
         fail(f"{arg} is already in the trash")
-    (trash / "files").mkdir(parents=True, exist_ok=True)
-    (trash / "info").mkdir(exist_ok=True)
-    unique = reserve(trash / "info", path.name, path)
     try:
-        os.rename(path, trash / "files" / unique)
+        files, info = open_trash(root, create=True)
     except OSError as e:
-        os.unlink(trash / "info" / f"{unique}.trashinfo")
+        fail(f"cannot use {trash}: {e.strerror}")
+    unique = reserve(files, info, path.name, path)
+    try:
+        os.rename(path, unique, dst_dir_fd=files)
+    except OSError as e:
+        os.unlink(f"{unique}.trashinfo", dir_fd=info)
         fail(f"cannot move {arg}: {e.strerror}")
+    os.close(files)
+    os.close(info)
+
+
+def deletion_time(record: str, info: int) -> float | None:
+    """Without a readable date (a killed run leaves the record empty) its mtime counts."""
+    try:
+        fd = os.open(record, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=info)
+    except OSError:
+        return None
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        os.close(fd)
+        return None
+    with os.fdopen(fd, "rb") as f:
+        lines = f.read().decode(errors="replace").splitlines()
+    for line in lines:
+        if line.startswith("DeletionDate="):
+            try:
+                return time.mktime(time.strptime(line.removeprefix("DeletionDate="), DATE))
+            except ValueError:
+                break
+    return st.st_mtime
 
 
 def empty_old(home: Path) -> None:
     cutoff = time.time() - KEEP_DAYS * 86400
     for name in ROOTS:
-        info = home / name / ".trash" / "info"
-        if not info.is_dir():
+        try:
+            files, info = open_trash((home / name).resolve(), create=False)
+        except OSError:
             continue
-        for record in info.glob("*.trashinfo"):
-            dates = [line.removeprefix("DeletionDate=") for line in record.read_text().splitlines()
-                     if line.startswith("DeletionDate=")]
+        for record in os.listdir(info):
+            entry = record.removesuffix(".trashinfo")
+            if entry == record or entry in ("", ".", ".."):
+                continue
+            deleted = deletion_time(record, info)
+            if deleted is None or deleted >= cutoff:
+                continue
             try:
-                deleted = time.mktime(time.strptime(dates[0], DATE))
-            except (IndexError, ValueError):
-                continue
-            if deleted >= cutoff:
-                continue
-            entry = info.parent / "files" / record.name.removesuffix(".trashinfo")
-            if entry.is_dir() and not entry.is_symlink():
-                shutil.rmtree(entry)
-            else:
-                entry.unlink(missing_ok=True)
-            record.unlink()
+                if stat.S_ISDIR(os.stat(entry, dir_fd=files, follow_symlinks=False).st_mode):
+                    shutil.rmtree(entry, dir_fd=files)
+                else:
+                    os.unlink(entry, dir_fd=files)
+            except FileNotFoundError:
+                pass
+            os.unlink(record, dir_fd=info)
+        os.close(files)
+        os.close(info)
 
 
 def main(args: list[str]) -> None:
