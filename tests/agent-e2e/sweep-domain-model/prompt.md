@@ -1,0 +1,1 @@
+Review comments on this repo keep coming back to lax typing: strings and plain numbers where I expect proper types, and the core not really saying what the app is about. Can you run an assurance sweep over the repo for that? Also run the Venues lens while you're at it, so I know what else would catch this kind of thing. The cost is fine, no need to check with me first.
