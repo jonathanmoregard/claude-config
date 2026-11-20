@@ -1,0 +1,118 @@
+#!/run/current-system/sw/bin/python3 -I
+"""trash <path>... — move paths under ~/Repos or ~/worktrees into that root's .trash/.
+
+Runs inside the sandbox like any command, so the sandbox decides what may be
+moved. The home trash is out of reach there: each write root is its own mount
+and a rename across mounts fails. Entries older than 30 days are emptied on
+each run. To restore one, move it back from <root>/.trash/files/; its original
+path is in <root>/.trash/info/<name>.trashinfo.
+"""
+from __future__ import annotations
+
+import os
+import pwd
+import shutil
+import sys
+import time
+from pathlib import Path
+from urllib.parse import quote
+
+# Not $HOME: agent-e2e runs sessions with a staged one, on the same real roots.
+HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
+ROOTS = ("Repos", "worktrees")
+KEEP_DAYS = 30
+DATE = "%Y-%m-%dT%H:%M:%S"
+
+
+def fail(msg: str) -> None:
+    print(f"trash: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def root_of(path: Path, home: Path) -> Path | None:
+    for name in ROOTS:
+        root = (home / name).resolve()
+        if path.parent.resolve().is_relative_to(root):
+            return root
+    return None
+
+
+def reserve(info: Path, name: str, original: Path) -> str:
+    """Claims a name under info/ first, as the FreeDesktop trash spec does."""
+    for n in range(1, 10_000):
+        unique = name if n == 1 else f"{name}.{n}"
+        try:
+            fd = os.open(info / f"{unique}.trashinfo", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            continue
+        if os.path.lexists(info.parent / "files" / unique):
+            os.close(fd)
+            os.unlink(info / f"{unique}.trashinfo")
+            continue
+        with os.fdopen(fd, "w") as f:
+            f.write(f"[Trash Info]\nPath={quote(os.fsencode(original))}\n"
+                    f"DeletionDate={time.strftime(DATE)}\n")
+        return unique
+    fail(f"no free name for {name} in {info.parent}")
+    raise AssertionError
+
+
+def move(arg: str, home: Path) -> None:
+    path = Path(os.path.abspath(arg))
+    if not os.path.lexists(path):
+        fail(f"{arg}: no such file or directory")
+    root = root_of(path, home)
+    if root is None or path.resolve() == root:
+        fail(f"{arg} is not under ~/{' or ~/'.join(ROOTS)}; use rm")
+    trash = root / ".trash"
+    if path == trash or path.parent.resolve().is_relative_to(trash):
+        fail(f"{arg} is already in the trash")
+    (trash / "files").mkdir(parents=True, exist_ok=True)
+    (trash / "info").mkdir(exist_ok=True)
+    unique = reserve(trash / "info", path.name, path)
+    try:
+        os.rename(path, trash / "files" / unique)
+    except OSError as e:
+        os.unlink(trash / "info" / f"{unique}.trashinfo")
+        fail(f"cannot move {arg}: {e.strerror}")
+
+
+def empty_old(home: Path) -> None:
+    cutoff = time.time() - KEEP_DAYS * 86400
+    for name in ROOTS:
+        info = home / name / ".trash" / "info"
+        if not info.is_dir():
+            continue
+        for record in info.glob("*.trashinfo"):
+            dates = [line.removeprefix("DeletionDate=") for line in record.read_text().splitlines()
+                     if line.startswith("DeletionDate=")]
+            try:
+                deleted = time.mktime(time.strptime(dates[0], DATE))
+            except (IndexError, ValueError):
+                continue
+            if deleted >= cutoff:
+                continue
+            entry = info.parent / "files" / record.name.removesuffix(".trashinfo")
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink(missing_ok=True)
+            record.unlink()
+
+
+def main(args: list[str]) -> None:
+    if not args:
+        print(__doc__.strip(), file=sys.stderr)
+        sys.exit(64)
+    for arg in args:
+        if arg.startswith("-"):
+            print(f"trash: options are not accepted: {arg}", file=sys.stderr)
+            sys.exit(64)
+    home = HOME
+    for arg in args:
+        move(arg, home)
+    empty_old(home)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

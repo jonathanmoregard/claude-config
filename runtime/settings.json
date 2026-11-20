@@ -451,6 +451,16 @@
         ]
       },
       {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -f $HOME/.claude/hooks/sandbox-aid.py ] || exit 0; python3 -S -E $HOME/.claude/hooks/sandbox-aid.py",
+            "timeout": 5
+          }
+        ]
+      },
+      {
         "hooks": [
           {
             "type": "command",
@@ -475,6 +485,18 @@
             "type": "command",
             "command": "python3 -S -E $HOME/.claude/hooks/artl-evidence.py",
             "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -f $HOME/.claude/hooks/sandbox-aid.py ] || exit 0; python3 -S -E $HOME/.claude/hooks/sandbox-aid.py",
+            "timeout": 5
           }
         ]
       }
@@ -516,6 +538,16 @@
           {
             "type": "command",
             "command": "python3 -S -E $HOME/.claude/hooks/deny-hints.py",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -f $HOME/.claude/hooks/sandbox-aid.py ] || exit 0; python3 -S -E $HOME/.claude/hooks/sandbox-aid.py",
             "timeout": 5
           }
         ]
@@ -1005,8 +1037,20 @@
   "sandbox": {
     "enabled": false,
     "autoAllowBashIfSandboxed": true,
-    "allowUnsandboxedCommands": false,
+    "allowUnsandboxedCommands": true,
     "failIfUnavailable": true,
+    "excludedCommands": [
+      "~/.claude/scripts/unit-read *",
+      "/home/jonathan/.claude/scripts/unit-read *",
+      "~/.claude/scripts/wait-for unit *",
+      "/home/jonathan/.claude/scripts/wait-for unit *",
+      "~/.claude/scripts/confined -- *",
+      "/home/jonathan/.claude/scripts/confined -- *",
+      "~/.claude/scripts/confined --chdir *",
+      "/home/jonathan/.claude/scripts/confined --chdir *",
+      "~/.claude/scripts/confined --detach *",
+      "/home/jonathan/.claude/scripts/confined --detach *"
+    ],
     "network": {
       "allowAllUnixSockets": true,
       "tlsTerminate": {},
@@ -1035,6 +1079,10 @@
         "~/.cache/nix",
         "~/.cache/uv",
         "~/.cargo"
+      ],
+      "denyWrite": [
+        "/home/jonathan/.local/state/ai-router/jobs",
+        "/home/jonathan/.local/state/ai-router/quota"
       ],
       "denyRead": [
         "/run/user/1003",

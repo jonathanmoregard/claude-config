@@ -30,9 +30,17 @@ non-agent script with its own tests, a formatting-only diff.
 ```bash
 cd ~/worktrees/claude-<slug>
 git add -A && git commit -m wip   # arm is a ref; -A so new skills/scenarios are in it
-python3 scripts/agent-e2e/agent_e2e.py run tests/agent-e2e/<scenario> \
+python3 runtime/scripts/agent-e2e/agent_e2e.py run tests/agent-e2e/<scenario> \
   --arm old=origin/master --arm new=$(git rev-parse --short HEAD) --n 5
 ```
+
+In a sandboxed session, run the harness through the confined runner. It must
+be the whole command, on one line: `--chdir` in place of `cd`, the arm's SHA
+written out, no `$(…)`:
+`~/.claude/scripts/confined --claude-login --chdir ~/worktrees/claude-<slug> -- python3 runtime/scripts/agent-e2e/agent_e2e.py run tests/agent-e2e/<scenario> --arm old=origin/master --arm new=<sha> --n 5`.
+`--claude-login` hands the jail the Claude login the agents under test need, so
+this form is not prompt-free: run that one call with the sandbox disabled and
+let the permission prompt decide.
 
 Run it with `run_in_background: true`, since a batch takes minutes. Finished
 runs are skipped on re-run, so a killed batch never re-spends.
@@ -85,6 +93,9 @@ text, such as "asked a question".
 - No MCP servers (`--strict-mcp-config`). Credentials, the plugin cache,
   `~/Repos` and caveman config are linked from the real HOME. dcg's config is
   copied.
+- Run through `confined`, those links dangle (only credentials and dcg's
+  config are visible): a scenario that depends on a plugin or a skill
+  symlinked into `~/Repos` tests its absence. Run such a scenario unconfined.
 - Isolation needs bubblewrap: a private `/tmp`, the real HOME read-only,
   `~/.ssh` hidden, and credential env vars (`SSH_AUTH_SOCK`, `GH_TOKEN`, …)
   scrubbed. Without `bwrap`, verdicts say `isolated_tmp: false`. Don't run

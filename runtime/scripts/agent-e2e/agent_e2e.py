@@ -434,8 +434,10 @@ def run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
         "E2E_BIN": str(bindir), "E2E_RUN": str(run), "E2E_WORK": str(work),
         "DISABLE_AUTOUPDATER": "1",
     }
+    # SANDBOX_RUNTIME arrives when the harness runs under `confined`; the
+    # agent's own sandbox sets it where it applies.
     for var in ("GIT_CONFIG_GLOBAL", "CLAUDE_CONFIG_DIR", "CLAUDECODE",
-                "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", *SCRUB):
+                "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "SANDBOX_RUNTIME", *SCRUB):
         env.pop(var, None)
     # ssh finds keys via getpwuid, not $HOME; refuse it outright. Scenario
     # remotes are local bare repos behind insteadOf, so nothing needs ssh.

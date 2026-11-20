@@ -35,6 +35,13 @@ systemd-run --user --unit=<slug> --working-directory=<dir> \
 - **Always append sentinel markers** (`GATE_ALL_GREEN`/`GATE_FAILED` style).
   They show progress and make the log readable to a human. The retained unit
   status is the verdict; never infer success from silence or an empty log.
+- **In a sandboxed session** `systemd-run` has no bus. Launch with
+  `~/.claude/scripts/confined --detach <slug> [--max-runtime 4h] -- <cmd> [args...]`
+  as the whole command (`--chdir <dir>` instead of `cd`). It prints the unit
+  and log path, appends the same markers and stops the job after
+  `--max-runtime` (default 4h, at most 24h). Observe it with
+  `~/.claude/scripts/wait-for unit <slug>.service --user`. To rerun, pick a new
+  slug. The job has no `gh`, brokers or host-local services.
 - The unit name is the rerun handle, and `RemainAfterExit` is what keeps the
   result readable — which also keeps the unit **loaded** after it finishes, a
   successful one as `active/exited`. `reset-failed` does not unload that, so on
@@ -88,7 +95,8 @@ systemd-run --user --unit=<slug> --working-directory=<dir> \
   turn. After an interruption, run the same wait again; the unit retains its
   result. The job default timeout is four hours; set `--timeout <seconds>`
   before `--` when a longer bound is intentional.
-- Read or tail `/tmp/<slug>.log` for progress. `MARKER_OK` and
+- Read or tail `/tmp/<slug>.log` for progress (a `confined --detach` job: the
+  log path it printed). `MARKER_OK` and
   `MARKER_FAILED rc=N` help a human scan the log, but the unit status is the
   verdict.
 - **Do NOT kill a slow build to retry** — killing wastes every finished
