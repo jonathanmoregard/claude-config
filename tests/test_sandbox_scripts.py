@@ -7,6 +7,7 @@ import json
 import os
 import pwd
 import re
+import resource
 import shutil
 import subprocess
 import sys
@@ -220,6 +221,18 @@ def test_trash_moves_paths_under_the_write_roots(scratch: Path) -> None:
     assert (TRASH_DIR / "files" / moved[f"{scratch}/f"]).read_text() == "x"
     assert os.readlink(TRASH_DIR / "files" / moved[f"{scratch}/link"]) == "/etc/hostname"
     assert not (scratch / "f").exists() and not (scratch / "link").is_symlink()
+
+
+def test_trash_moves_more_paths_than_it_may_hold_open(scratch: Path) -> None:
+    files = [scratch / f"f{n}" for n in range(60)]
+    for f in files:
+        f.write_text("x")
+    proc = subprocess.run(
+        [sys.executable, "-I", str(TRASH), *map(str, files)], capture_output=True, text=True,
+        check=False,
+        preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (32, 32)))
+    assert proc.returncode == 0, proc.stderr
+    assert not any(f.exists() for f in files)
 
 
 def test_trash_records_where_each_entry_came_from(scratch: Path) -> None:
