@@ -1,15 +1,16 @@
 """Does every reviewer dispatch carry the exclusion list?
 
 argv: transcript.jsonl. Prints one line; exit 0 PASS, 1 FAIL, 2 no reviewer.
-A reviewer dispatch is a main-session Agent call whose prompt reads as a
-review (the markers artl-two-blind-reviewers uses) and is not a CONSULT.
-Each must hold "Do not report" and a phrase from each exclusion entry.
+A reviewer dispatch is a main-session Agent call carrying the opening of the
+reviewer A prompt (SKILL.md) or of the reviewer B prompt (hunt-classes.md).
+Verifier, fixer and CONSULT dispatches carry neither and are not graded.
+Each reviewer prompt must hold "Do not report" and the entry's own phrase.
 """
 import json
 import sys
 
-MARKERS = ("falsify", "review", "finding", "defect", "hunt", "ship broken")
-ENTRIES = {"tool list": ("tool list", "no real tool"), "sandbox": ("sandbox",)}
+REVIEWERS = ("can ship broken", "hunt only the classes listed below")
+ENTRY = "live mcp tool list"
 
 
 def norm(t):
@@ -28,14 +29,13 @@ for line in open(sys.argv[1], encoding="utf-8"):
     for b in c if isinstance(c, list) else []:
         if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "Agent":
             p = norm((b.get("input") or {}).get("prompt", ""))
-            if not p.startswith("consult dispatch") and any(m in p for m in MARKERS):
+            if any(m in p for m in REVIEWERS):
                 prompts.append(p)
 if not prompts:
     print("no reviewer dispatched"); sys.exit(2)
 for i, p in enumerate(prompts, 1):
     if "do not report" not in p:
         print(f"reviewer {i} of {len(prompts)}: no 'Do not report' list"); sys.exit(1)
-    for name, phrases in ENTRIES.items():
-        if not any(ph in p for ph in phrases):
-            print(f"reviewer {i} of {len(prompts)}: entry '{name}' missing"); sys.exit(1)
-print(f"{len(prompts)} reviewers, each with both exclusions"); sys.exit(0)
+    if ENTRY not in p:
+        print(f"reviewer {i} of {len(prompts)}: the MCP tool-name entry is missing"); sys.exit(1)
+print(f"{len(prompts)} reviewers, each with the exclusion"); sys.exit(0)

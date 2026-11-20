@@ -12,5 +12,4 @@ and only with the user's yes. Never add an entry for a category that has a
 
 ## Entries
 
-1. A tool, MCP server or permission name in config "matches no real tool" — reviewers cannot see the live MCP tool list, and every such claim named a tool that exists there (3 rows, 2026-11-20)
-2. An attack whose first step the sandbox already blocks: renaming `.git` or `.claude` aside, or moving the project directory, from inside a confined session — the sandbox refuses that step, so the attack never starts (4 rows, 2026-11-20)
+1. An MCP tool name (`mcp__<server>__<tool>`) in settings or permissions "matches no real tool" — reviewers cannot see the live MCP tool list, and every such claim named a tool that exists there. Built-in tool names and rule syntax stay reportable (3 rows, 2026-11-20)
