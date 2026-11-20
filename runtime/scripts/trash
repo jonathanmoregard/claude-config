@@ -1,332 +1,100 @@
 #!/run/current-system/sw/bin/python3 -I
-"""trash <path>... — move files to the trash, for a sandboxed session.
+"""trash <path>... — move paths under ~/Repos or ~/worktrees into that root's .trash/.
 
-`gio trash` cannot work inside the Claude Code sandbox (the trash is on
-another mount there), so the sandbox runs this outside itself, without a
-prompt. It therefore takes paths only — no `--empty`, no `--restore` — and
-only paths under ~/Repos or ~/worktrees that hold nothing the sandbox protects.
-Entries go to the home trash; one on another filesystem is refused.
+Runs inside the sandbox like any command, so the sandbox decides what may be
+moved. The home trash is out of reach there: each write root is its own mount
+and a rename across mounts fails. Entries older than 30 days are emptied on
+each run. To restore one, move it back from <root>/.trash/files/; its original
+path is in <root>/.trash/info/<name>.trashinfo.
 """
 from __future__ import annotations
 
-import ctypes
-import errno
-import fnmatch
-import itertools
-import json
 import os
-import pwd
-import re
-import stat
+import shutil
 import sys
 import time
-import uuid
-from dataclasses import dataclass
-from typing import NoReturn
+from pathlib import Path
 from urllib.parse import quote
 
-# A whole .claude, even an empty one: `confined` guards an absent one with an
-# empty directory, and moving that aside would let its jail create the real one.
-PROTECTED_NAMES = {
-    ".mcp.json", ".gitconfig", ".gitmodules", ".bashrc", ".bash_profile", ".zshrc",
-    ".zprofile", ".profile", ".ripgreprc", ".vscode", ".idea", ".git", ".claude",
-}
-GUARD_MARK = "user.confined-stub"
-GLOB_CHARS = re.compile(r"[*?\[]")
-DIR_FLAGS = os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-RENAME_NOREPLACE = 1
+ROOTS = ("Repos", "worktrees")
+KEEP_DAYS = 30
+DATE = "%Y-%m-%dT%H:%M:%S"
 
 
-@dataclass
-class Target:
-    path: str
-    parent_fd: int
-    name: str
-    identity: tuple[int, int]
+def fail(msg: str) -> None:
+    print(f"trash: {msg}", file=sys.stderr)
+    sys.exit(1)
 
 
-def fail(code: int, message: str) -> NoReturn:
-    print(f"trash: {message}", file=sys.stderr)
-    sys.exit(code)
-
-
-def guard(path: str) -> bool:
-    try:
-        os.getxattr(path, GUARD_MARK, follow_symlinks=False)
-    except OSError as e:
-        if e.errno in (errno.ENODATA, errno.ENOTSUP):
-            return False
-        raise
-    return True
-
-
-def load_settings() -> tuple[str, dict]:
-    config = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..")
-    try:
-        with open(os.path.join(config, "settings.json")) as f:
-            return os.path.realpath(config), json.load(f)
-    except (OSError, ValueError) as e:
-        fail(3, f"cannot read {config}/settings.json: {e}")
-
-
-def session_project() -> str | None:
-    """The working directory of the nearest ancestor that is Claude Code: its
-    project's settings add to the sandbox profile."""
-    pid = os.getppid()
-    while pid > 1:
-        try:
-            exe = os.readlink(f"/proc/{pid}/exe")
-            if "claude" in exe.split("/") or os.path.basename(exe).startswith("claude"):
-                return os.path.realpath(os.readlink(f"/proc/{pid}/cwd"))
-            with open(f"/proc/{pid}/stat") as f:
-                line = f.read()
-            pid = int(line[line.rindex(")") + 2:].split()[1])
-        except (OSError, ValueError):
-            break
-    if os.environ.get("CLAUDECODE") and os.environ.get("SANDBOX_RUNTIME") != "1":
-        fail(3, "launched from Claude Code, but its process was not found among the ancestors")
+def root_of(path: Path, home: Path) -> Path | None:
+    for name in ROOTS:
+        root = (home / name).resolve()
+        if path.parent.resolve().is_relative_to(root):
+            return root
     return None
 
 
-def project_settings(project: str) -> list[dict]:
-    out = []
-    for name in (".claude/settings.json", ".claude/settings.local.json"):
+def reserve(info: Path, name: str, original: Path) -> str:
+    """Claims a name under info/ first, as the FreeDesktop trash spec does."""
+    for n in range(1, 10_000):
+        unique = name if n == 1 else f"{name}.{n}"
         try:
-            fd = os.open(os.path.join(project, name), os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
-        except (FileNotFoundError, NotADirectoryError):
-            continue
-        except OSError as e:
-            fail(3, f"cannot read {project}/{name}: {e.strerror}")
-        # A `confined` guard directory stands in for an absent file.
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            os.close(fd)
-            continue
-        try:
-            with open(fd, encoding="utf-8") as f:
-                out.append(json.load(f))
-        except (OSError, ValueError) as e:
-            fail(3, f"cannot read {project}/{name}: {e}")
-    return out
-
-
-def within(project: str | None, home: str, entry: str, what: str) -> str:
-    if entry.startswith("~/"):
-        return os.path.join(home, entry[2:])
-    if project and not entry.startswith("/"):
-        return os.path.join(project, entry.removeprefix("./"))
-    if not entry.startswith("/"):
-        fail(3, f"cannot interpret {what} entry {entry}")
-    return entry
-
-
-def denied_paths(settings: dict, home: str, project: str | None = None) -> list[str]:
-    try:
-        entries = settings.get("sandbox", {}).get("filesystem", {}).get("denyWrite", [])
-    except AttributeError as e:
-        fail(3, f"cannot read denyWrite: {e}")
-    denied = []
-    for entry in entries:
-        entry = within(project, home, entry, "denyWrite")
-        # Both the entry as named and what it resolves to: a target is compared by
-        # its real parent plus its own name.
-        head, tail = os.path.split(entry.rstrip("/"))
-        denied += [os.path.join(os.path.realpath(head), tail), os.path.realpath(entry)]
-    return denied
-
-
-def empty_globstars(pattern: str) -> list[str]:
-    # fnmatch's * crosses /, so ** already spans any depth but none.
-    head, sep, tail = pattern.partition("**/")
-    if not sep:
-        return [pattern]
-    return [head + form for rest in empty_globstars(tail) for form in (f"**/{rest}", rest)]
-
-
-def read_specs(settings: dict, home: str, config: str, project: str | None = None) -> list[str]:
-    try:
-        specs = list(settings.get("sandbox", {}).get("filesystem", {}).get("denyRead", []))
-        for rule in settings.get("permissions", {}).get("deny", []):
-            if match := re.fullmatch(r"Read\((.+)\)", rule):
-                spec = match[1].removesuffix("/**")
-                specs.append(spec[1:] if spec.startswith("//") else
-                             os.path.join(config, spec[1:]) if spec.startswith("/") else spec)
-    except (AttributeError, TypeError) as e:
-        fail(3, f"cannot read the Read deny rules: {e}")
-    return [within(project, home, spec, "Read deny") for spec in specs]
-
-
-def read_denied(specs: list[str]) -> re.Pattern[str]:
-    """What the profile hides from reading: in the trash it would be under no rule."""
-    patterns = []
-    for spec in specs:
-        literal = os.path.dirname(GLOB_CHARS.split(spec, 1)[0])
-        for form in {spec, os.path.realpath(literal) + spec[len(literal):]}:
-            patterns += [fnmatch.translate(f) for f in empty_globstars(form)]
-    return re.compile("|".join(patterns) or "(?!)")
-
-
-def pinned_dir(path: str) -> int:
-    fd = os.open(path, os.O_PATH | DIR_FLAGS)
-    if os.readlink(f"/proc/self/fd/{fd}") != path:
-        fail(1, f"{path} changed while it was being checked")
-    return fd
-
-
-def present(name: str, dir_fd: int) -> bool:
-    try:
-        os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        return False
-    return True
-
-
-def subdir(fd: int, name: str) -> int:
-    if not present(name, fd):
-        os.mkdir(name, 0o700, dir_fd=fd)
-    return os.open(name, os.O_PATH | DIR_FLAGS, dir_fd=fd)
-
-
-def walk_finds_protected(fd: int, origin: str, hidden: re.Pattern[str]) -> str | None:
-    def raise_it(error: OSError) -> None:
-        raise error
-
-    for dirpath, dirnames, filenames, dirfd in os.fwalk(".", dir_fd=fd, onerror=raise_it):
-        for name in dirnames + filenames:
-            rel = os.path.normpath(os.path.join(dirpath, name))
-            if (name in PROTECTED_NAMES or guard(f"/proc/self/fd/{dirfd}/{name}")
-                    or hidden.match(os.path.join(origin, rel))):
-                return rel
-    return None
-
-
-def check(path: str, home: str, denied: list[str], hidden: re.Pattern[str],
-          trash_dev: int) -> Target:
-    head, name = os.path.split(path.rstrip("/") or "/")
-    if name in ("", ".", ".."):
-        fail(1, f"name the directory itself, not {path}")
-    try:
-        parent = os.path.realpath(head or ".", strict=True)
-        parent_fd = pinned_dir(parent)
-    except OSError as e:
-        fail(1, f"{path}: {e.strerror}")
-    target = os.path.join(parent, name)
-    if not target.startswith((f"{home}/Repos/", f"{home}/worktrees/")):
-        fail(1, f"{target} is outside ~/Repos and ~/worktrees")
-    try:
-        st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        fail(1, f"no such file: {target}")
-    except OSError as e:
-        fail(1, f"{target}: {e.strerror}")
-    try:
-        guarded = guard(f"/proc/self/fd/{parent_fd}/{name}")
-    except OSError as e:
-        fail(1, f"{target}: {e.strerror}")
-    if guarded or PROTECTED_NAMES.intersection(target.split("/")):
-        fail(1, f"{target} is protected by the sandbox")
-    for d in denied:
-        if target == d or target.startswith(f"{d}/"):
-            fail(1, f"{target} is denied to the sandbox")
-        if d.startswith(f"{target}/") and os.path.lexists(d):
-            fail(1, f"{target} holds {d}, denied to the sandbox")
-    parts = target.split("/")
-    if any(hidden.match("/".join(parts[:n])) for n in range(2, len(parts) + 1)):
-        fail(1, f"{target} is hidden from the sandbox")
-    if st.st_dev != trash_dev:
-        fail(1, f"{target} is on another filesystem than the trash; use gio trash outside the sandbox")
-    if stat.S_ISDIR(st.st_mode):
-        try:
-            fd = os.open(name, os.O_RDONLY | DIR_FLAGS, dir_fd=parent_fd)
-            opened = os.fstat(fd)
-            if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
-                fail(1, f"{target} changed while it was being checked")
-            hit = walk_finds_protected(fd, target, hidden)
-        except OSError:
-            fail(1, f"cannot inspect all of {target}")
-        if hit:
-            fail(1, f"{target} holds {os.path.join(target, hit)}, protected by the sandbox")
-        os.close(fd)
-    return Target(target, parent_fd, name, (st.st_dev, st.st_ino))
-
-
-def reserve(info_fd: int, files_fd: int, target: Target) -> str:
-    """Claims a name under Trash/info, as the FreeDesktop spec asks, before the move."""
-    deleted = time.strftime("%Y-%m-%dT%H:%M:%S")
-    for n in itertools.count(1):
-        unique = target.name if n == 1 else f"{target.name}.{n}"
-        try:
-            fd = os.open(f"{unique}.trashinfo",
-                         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-                         0o600, dir_fd=info_fd)
+            fd = os.open(info / f"{unique}.trashinfo", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError:
             continue
-        if present(unique, files_fd):
+        if os.path.lexists(info.parent / "files" / unique):
             os.close(fd)
-            os.unlink(f"{unique}.trashinfo", dir_fd=info_fd)
+            os.unlink(info / f"{unique}.trashinfo")
             continue
-        try:
-            with os.fdopen(fd, "w") as f:
-                f.write(f"[Trash Info]\nPath={quote(os.fsencode(target.path))}\n"
-                        f"DeletionDate={deleted}\n")
-        except BaseException:
-            os.unlink(f"{unique}.trashinfo", dir_fd=info_fd)
-            raise
+        with os.fdopen(fd, "w") as f:
+            f.write(f"[Trash Info]\nPath={quote(os.fsencode(original))}\n"
+                    f"DeletionDate={time.strftime(DATE)}\n")
         return unique
-    raise AssertionError("unreachable")
+    fail(f"no free name for {name} in {info.parent}")
+    raise AssertionError
 
 
-def rename_noreplace(src_fd: int, src: str, dst_fd: int, dst: str) -> None:
-    libc = ctypes.CDLL(None, use_errno=True)
-    if libc.renameat2(src_fd, os.fsencode(src), dst_fd, os.fsencode(dst), RENAME_NOREPLACE):
-        code = ctypes.get_errno()
-        raise OSError(code, os.strerror(code), dst)
-
-
-def put_back(target: Target, unique: str, info_fd: int, files_fd: int, reason: str) -> NoReturn:
-    dest = target.name
-    while True:
-        try:
-            rename_noreplace(files_fd, unique, target.parent_fd, dest)
-            break
-        except FileExistsError:
-            dest = f"{target.name}.restored-{uuid.uuid4().hex[:8]}"
-        except OSError as e:
-            fail(1, f"{target.path} {reason}; it could not be put back ({e.strerror}) "
-                    f"and stays in the trash as {unique}")
-    os.unlink(f"{unique}.trashinfo", dir_fd=info_fd)
-    fail(1, f"{target.path} {reason}; put back as {os.path.dirname(target.path)}/{dest}")
-
-
-def recheck(unique: str, files_fd: int, target: Target, hidden: re.Pattern[str]) -> str | None:
+def move(arg: str, home: Path) -> None:
+    path = Path(os.path.abspath(arg))
+    if not os.path.lexists(path):
+        fail(f"{arg}: no such file or directory")
+    root = root_of(path, home)
+    if root is None or path.resolve() == root:
+        fail(f"{arg} is not under ~/{' or ~/'.join(ROOTS)}; use rm")
+    trash = root / ".trash"
+    if path == trash or path.parent.resolve().is_relative_to(trash):
+        fail(f"{arg} is already in the trash")
+    (trash / "files").mkdir(parents=True, exist_ok=True)
+    (trash / "info").mkdir(exist_ok=True)
+    unique = reserve(trash / "info", path.name, path)
     try:
-        fd = os.open(unique, os.O_RDONLY | DIR_FLAGS, dir_fd=files_fd)
-        try:
-            opened = os.fstat(fd)
-            if (opened.st_dev, opened.st_ino) != target.identity:
-                return "changed while it was being moved"
-            hit = walk_finds_protected(fd, target.path, hidden)
-        finally:
-            os.close(fd)
-    except OSError:
-        return "could not be inspected again after the move"
-    return f"gained {os.path.join(target.path, hit)}, protected by the sandbox" if hit else None
-
-
-def move(target: Target, info_fd: int, files_fd: int, hidden: re.Pattern[str]) -> None:
-    unique = reserve(info_fd, files_fd, target)
-    try:
-        os.rename(target.name, unique, src_dir_fd=target.parent_fd, dst_dir_fd=files_fd)
+        os.rename(path, trash / "files" / unique)
     except OSError as e:
-        os.unlink(f"{unique}.trashinfo", dir_fd=info_fd)
-        if e.errno == errno.EXDEV:
-            fail(1, f"{target.path} is on another filesystem than the trash; not moved")
-        fail(1, f"cannot move {target.path}: {e.strerror}")
-    moved = os.stat(unique, dir_fd=files_fd, follow_symlinks=False)
-    if (moved.st_dev, moved.st_ino) != target.identity:
-        put_back(target, unique, info_fd, files_fd, "changed while it was being checked")
-    # Content renamed in between the walk and the move came along; only this side can see it.
-    if stat.S_ISDIR(moved.st_mode) and (reason := recheck(unique, files_fd, target, hidden)):
-        put_back(target, unique, info_fd, files_fd, reason)
+        os.unlink(trash / "info" / f"{unique}.trashinfo")
+        fail(f"cannot move {arg}: {e.strerror}")
+
+
+def empty_old(home: Path) -> None:
+    cutoff = time.time() - KEEP_DAYS * 86400
+    for name in ROOTS:
+        info = home / name / ".trash" / "info"
+        if not info.is_dir():
+            continue
+        for record in info.glob("*.trashinfo"):
+            dates = [line.removeprefix("DeletionDate=") for line in record.read_text().splitlines()
+                     if line.startswith("DeletionDate=")]
+            try:
+                deleted = time.mktime(time.strptime(dates[0], DATE))
+            except (IndexError, ValueError):
+                continue
+            if deleted >= cutoff:
+                continue
+            entry = info.parent / "files" / record.name.removesuffix(".trashinfo")
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink(missing_ok=True)
+            record.unlink()
 
 
 def main(args: list[str]) -> None:
@@ -335,29 +103,13 @@ def main(args: list[str]) -> None:
         sys.exit(64)
     for arg in args:
         if arg.startswith("-"):
-            fail(64, f"options are not accepted: {arg}")
-    home = pwd.getpwuid(os.getuid()).pw_dir
-    config, settings = load_settings()
-    denied, specs = denied_paths(settings, home), read_specs(settings, home, config)
-    if project := session_project():
-        for extra in project_settings(project):
-            denied += denied_paths(extra, home, project)
-            specs += read_specs(extra, home, project, project)
-    hidden = read_denied(specs)
-    # $XDG_DATA_HOME is the caller's to set; the trash is where the passwd home puts it.
-    trash_fd = os.open(home, os.O_PATH | DIR_FLAGS)
-    for part in (".local", "share", "Trash"):
-        trash_fd = subdir(trash_fd, part)
-    files_fd, info_fd = subdir(trash_fd, "files"), subdir(trash_fd, "info")
+            print(f"trash: options are not accepted: {arg}", file=sys.stderr)
+            sys.exit(64)
+    home = Path.home()
     for arg in args:
-        target = check(arg, home, denied, hidden, os.fstat(files_fd).st_dev)
-        try:
-            move(target, info_fd, files_fd, hidden)
-        finally:
-            os.close(target.parent_fd)
+        move(arg, home)
+    empty_old(home)
 
 
-try:
+if __name__ == "__main__":
     main(sys.argv[1:])
-except OSError as e:
-    fail(1, f"{e.filename}: {e.strerror}" if e.filename else str(e))

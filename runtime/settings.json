@@ -1043,9 +1043,7 @@
       "~/.claude/scripts/unit-read *",
       "/home/jonathan/.claude/scripts/unit-read *",
       "~/.claude/scripts/wait-for unit *",
-      "/home/jonathan/.claude/scripts/wait-for unit *",
-      "~/.claude/scripts/trash *",
-      "/home/jonathan/.claude/scripts/trash *"
+      "/home/jonathan/.claude/scripts/wait-for unit *"
     ],
     "network": {
       "allowAllUnixSockets": true,
