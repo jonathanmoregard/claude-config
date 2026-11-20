@@ -222,6 +222,43 @@ def test_hides_what_the_session_projects_settings_deny(world) -> None:
     assert set(lines.values()) == {""}, lines
 
 
+@needs_pasta
+def test_edit_deny_rules_of_user_and_session_project_make_paths_read_only(world) -> None:
+    """Measured: Claude's sandbox adds both levels' Edit deny rules to denyWrite."""
+    repo = world["repo"]
+    names = ("edit_user", "edit_project", "open")
+    for name in names:
+        (repo / "data" / name).mkdir()
+    world["settings"]["permissions"]["deny"].append(f"Edit(/{repo}/data/edit_user/**)")
+    script = make_tree(world["var"] / "tree2", world["settings"])
+    (repo / ".claude").mkdir()
+    (repo / ".claude" / "settings.json").write_text(json.dumps(
+        {"permissions": {"deny": ["Edit(./data/edit_project/**)"]}}))  # arftl-allow: permission-widened
+    proc = jailed(script, "\n".join(
+        f'( : >{repo}/data/{name}/new ) 2>/dev/null && echo {name}=written || echo {name}=held'
+        for name in names), cwd=repo, flags=("--session", str(repo)))
+    assert answers(proc) == {"edit_user": "held", "edit_project": "held", "open": "written"}
+
+
+@needs_pasta
+def test_a_read_rule_glob_reaches_into_dot_directories(world) -> None:
+    """Measured: Claude's sandbox hides .certs/a.pem under Read(./**/*.pem)."""
+    repo = world["repo"]
+    (repo / ".claude").mkdir()
+    (repo / ".claude" / "settings.json").write_text(json.dumps(
+        {"permissions": {"deny": ["Read(./**/*.pem)"]}}))  # arftl-allow: permission-widened
+    plants = {"dot_dir": repo / "data" / ".certs" / "a.pem",
+              "plain_dir": repo / "data" / "certs" / "b.pem",
+              "open": repo / "data" / "certs" / "open.txt"}
+    for path in plants.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(CANARY + "\n")
+    proc = jailed(world["script"], "\n".join(
+        f'printf "{name}=%s\\n" "$(cat {path} 2>/dev/null)"' for name, path in plants.items()),
+        cwd=repo, flags=("--session", str(repo)))
+    assert answers(proc) == {"dot_dir": "", "plain_dir": "", "open": CANARY}
+
+
 @pytest.mark.parametrize("settings, status", [("{not json", 3), (None, 0)])
 @needs_pasta
 def test_session_project_settings_it_cannot_read_fail_closed(world, settings, status) -> None:
@@ -575,6 +612,32 @@ def test_absent_protected_paths_cannot_be_created_and_leave_no_stub(world, claud
         cwd=repo)
     assert "=created" not in proc.stdout and "ordinary=yes" in proc.stdout, proc.stdout
     (repo / "ordinary").unlink()
+    assert sorted(p.relative_to(repo) for p in repo.rglob("*")) == before
+
+
+# Measured in Claude's sandbox: it holds these nested entries, and not the free ones.
+NESTED_HELD = ["d1/.vscode/s.json", "d1/.mcp.json", "d1/d2/.mcp.json", "g1/.git/config"]
+NESTED_FREE = ["d1/d2/.vscode/s.json", "d1/d2/d3/.mcp.json", "node_modules/pkg/.gitmodules"]
+
+
+@needs_pasta
+def test_protects_nested_config_as_deep_as_claudes_sandbox_does(world) -> None:
+    repo = world["repo"]
+    for rel in NESTED_HELD + NESTED_FREE:
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        (repo / rel).write_text("x\n")
+    for name in ("g1", "g2"):
+        subprocess.run(["git", "init", "-q", str(repo / name)], check=True)
+    shutil.rmtree(repo / "g2" / ".git" / "hooks")
+    before = sorted(p.relative_to(repo) for p in repo.rglob("*"))
+    proc = jailed(world["script"], "\n".join(
+        [f'( echo y >>{repo}/{rel} ) 2>/dev/null && echo {rel}=written || echo {rel}=held'
+         for rel in NESTED_HELD + NESTED_FREE] +
+        [f'( mkdir -p {repo}/{name}/.git/hooks && echo y >{repo}/{name}/.git/hooks/new ) '
+         f'2>/dev/null && echo {name}/hook=written || echo {name}/hook=held'
+         for name in ("g1", "g2")]), cwd=repo)
+    assert answers(proc) == {**{rel: "held" for rel in [*NESTED_HELD, "g1/hook", "g2/hook"]},
+                             **{rel: "written" for rel in NESTED_FREE}}
     assert sorted(p.relative_to(repo) for p in repo.rglob("*")) == before
 
 

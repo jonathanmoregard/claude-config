@@ -72,6 +72,11 @@ PROTECTED = (
     ".claude/loop.md", ".mcp.json", ".gitconfig", ".gitmodules", ".bashrc", ".bash_profile",
     ".zshrc", ".zprofile", ".profile", ".ripgreprc", ".vscode", ".idea",
 )
+# Claude's sandbox also holds these below the top, nothing under node_modules.
+ONE_DOWN = (".vscode", ".idea", ".claude/commands", ".claude/agents", ".git/hooks",
+            ".git/config")
+TWO_DOWN = (".gitconfig", ".gitmodules", ".bashrc", ".bash_profile", ".zshrc", ".zprofile",
+            ".profile", ".ripgreprc", ".mcp.json")
 STUB_MARK = "user.confined-stub"
 STOPS = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
 LOADER = ("LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT")
@@ -212,10 +217,11 @@ class Profile:
                 return [absolute(home, e, what) for e in entries]
 
             self.roots = existing(paths(fs.get("allowWrite", []), "allowWrite"))
-            self.deny_write = existing(paths(fs.get("denyWrite", []), "denyWrite"))
+            self.deny_write = existing(paths(fs.get("denyWrite", []), "denyWrite") +
+                                       self.rule_paths("Edit", settings, home, settings_path.parent))
             self.blocked = paths(fs.get("denyRead", []), "denyRead")
             self.blocked += paths([c["path"] for c in creds.get("files", [])], "credentials")
-            self.rules = self.read_rules(settings, home, settings_path.parent)
+            self.rules = self.rule_paths("Read", settings, home, settings_path.parent)
             self.deny_env = sorted({v["name"] for v in creds.get("envVars", [])
                                     if v.get("mode") == "deny"})
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
@@ -224,20 +230,23 @@ class Profile:
             try:
                 for settings in project_settings(project):
                     fs = settings.get("sandbox", {}).get("filesystem", {})
-                    self.deny_write += existing([within(project, home, e, "denyWrite")
-                                                 for e in fs.get("denyWrite", [])])
+                    self.deny_write += existing(
+                        [within(project, home, e, "denyWrite") for e in fs.get("denyWrite", [])] +
+                        self.rule_paths("Edit", settings, home, Path(project), project))
                     self.blocked += [within(project, home, e, "denyRead")
                                      for e in fs.get("denyRead", [])]
-                    self.rules += self.read_rules(settings, home, Path(project), project)
+                    self.rules += self.rule_paths("Read", settings, home, Path(project), project)
             except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
                 fail(3, f"cannot read the settings of the session's project {project}: {e!r}")
 
     @staticmethod
-    def read_rules(settings: dict, home: str, config_dir: Path,
+    def rule_paths(tool: str, settings: dict, home: str, config_dir: Path,
                    project: str | None = None) -> list[str]:
+        """The paths of the tool's deny rules. Claude's sandbox adds Edit's to
+        denyWrite, Read's to denyRead."""
         paths = []
         for rule in settings.get("permissions", {}).get("deny", []):
-            match = re.fullmatch(r"Read\((.+)\)", rule)
+            match = re.fullmatch(rf"{tool}\((.+)\)", rule)
             if not match:
                 continue
             spec = match.group(1).removesuffix("/**")
@@ -246,7 +255,7 @@ class Profile:
             elif spec.startswith("/"):
                 paths.append(str(config_dir / spec[1:]))
             else:
-                paths.append(within(project, home, spec, f"Read rule {rule}"))
+                paths.append(within(project, home, spec, f"deny rule {rule}"))
         return paths
 
     def hidden(self, visible) -> list[str]:
@@ -258,7 +267,7 @@ class Profile:
             if not GLOB_CHARS.search(pattern):
                 out += existing([pattern])
             elif literal_root(pattern) != "/" and visible(literal_root(pattern)):
-                out += existing(glob.glob(pattern, recursive=True))
+                out += existing(glob.glob(pattern, recursive=True, include_hidden=True))
         kept: list[str] = []
         for path in sorted({p for p in out if visible(p)}):
             # bwrap cannot create a mount point inside an already hidden directory.
@@ -298,6 +307,29 @@ def session_project() -> str | None:
     return None
 
 
+def subdirs(path: str) -> list[str]:
+    try:
+        with os.scandir(path) as entries:
+            return [e.path for e in entries if e.is_dir(follow_symlinks=False)
+                    and e.name not in (".git", "node_modules")]
+    except OSError:
+        return []
+
+
+def nested(top: str) -> list[str]:
+    out = []
+    for one in subdirs(top):
+        out += [p for p in (os.path.join(one, n) for n in ONE_DOWN + TWO_DOWN)
+                if os.path.lexists(p)]
+        hooks = os.path.join(one, ".git", "hooks")
+        # Like the sandbox's: guarded even while absent.
+        if not os.path.lexists(hooks) and os.path.isfile(os.path.join(one, ".git", "HEAD")):
+            out.append(hooks)
+        for two in subdirs(one):
+            out += [p for p in (os.path.join(two, n) for n in TWO_DOWN) if os.path.lexists(p)]
+    return out
+
+
 def repository(cwd: str, profile: Profile, sessions: list[str]) -> Repo:
     start = Path(cwd)
     top = str(next((p for p in (start, *start.parents) if os.path.lexists(p / ".git")), start))
@@ -314,7 +346,7 @@ def repository(cwd: str, profile: Profile, sessions: list[str]) -> Repo:
     if any(under(cwd, d) for d in profile.deny_write):
         fail(64, f"{cwd} is under a denyWrite path of the sandbox profile")
     dot = Path(top, ".git")
-    own, outside, frozen = [], [], [os.path.join(top, name) for name in PROTECTED]
+    own, outside, frozen = [], [], [os.path.join(top, name) for name in PROTECTED] + nested(top)
     # A stub in the worktree is an empty directory: git status does not list
     # it, and no file can be written in its place. Inside a git dir it is the
     # file git expects.
