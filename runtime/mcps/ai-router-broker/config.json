@@ -1,0 +1,18 @@
+{
+  "aiRouterBroker": {
+    "version": 1,
+    "aiRouter": "/home/jonathan/.claude/bin/ai-router",
+    "roots": ["/home/jonathan/Repos", "/home/jonathan/worktrees"],
+    "path": [
+      "/home/jonathan/.local/bin",
+      "/etc/profiles/per-user/jonathan/bin",
+      "/run/current-system/sw/bin"
+    ],
+    "host": "claude",
+    "schemaDir": "/home/jonathan/.local/state/ai-router-broker/schemas",
+    "callTimeoutSec": 120,
+    "maxWaitSec": 540,
+    "maxPromptBytes": 1000000,
+    "outputLimitChars": 40000
+  }
+}

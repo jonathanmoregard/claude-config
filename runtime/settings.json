@@ -160,6 +160,7 @@
       "mcp__klaffat-app-runner__*",
       "mcp__git_broker__*",
       "mcp__agent_e2e_broker__run",
+      "mcp__ai_router_broker__*",
       "mcp__github__*",
       "mcp__home-assistant__ha_call_service",
       "mcp__home-assistant__ha_config_set_automation",
