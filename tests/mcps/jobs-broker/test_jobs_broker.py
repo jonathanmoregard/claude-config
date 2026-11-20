@@ -195,15 +195,27 @@ class SrtPolicyTests(Home):
         self.assertEqual(self.policy()["filesystem"]["denyRead"],
                          SANDBOX["filesystem"]["denyRead"])
 
-    def test_writes_reach_only_the_repo_and_for_nix_its_cache(self) -> None:
-        self.assertEqual(self.policy()["filesystem"]["allowWrite"], [str(self.repo)])
+    def test_writes_reach_only_the_repo_job_caches_and_for_nix_its_cache(self) -> None:
+        caches = [str(p) for p in self.server.job_caches(self.home).values()]
+        self.assertEqual(self.policy()["filesystem"]["allowWrite"], [str(self.repo), *caches])
         self.assertEqual(self.policy(profile="nix")["filesystem"]["allowWrite"],
-                         [str(self.repo), str(self.home / ".cache/nix")])
+                         [str(self.repo), *caches, str(self.home / ".cache/nix")])
+
+    def test_job_caches_are_never_the_hosts_or_the_sessions(self) -> None:
+        fs = {**SANDBOX["filesystem"], "allowWrite": [*SANDBOX["filesystem"]["allowWrite"],
+                                                      "~/.cargo", "~/.cache/uv"]}
+        self.write_settings({"sandbox": {**SANDBOX, "filesystem": fs}})
+        session = [Path(self.server._expand_home(p, self.home)) for p in fs["allowWrite"]]
+        for cache in self.server.job_caches(self.home).values():
+            with self.subTest(cache=cache):
+                self.assertFalse([s for s in session if s == cache or s in cache.parents])
+                self.assertFalse([s for s in session if cache in s.parents])
 
     def test_nix_cache_is_writable_only_where_the_session_may_write_it(self) -> None:
         fs = {**SANDBOX["filesystem"], "allowWrite": ["~/Repos"]}
         self.write_settings({"sandbox": {**SANDBOX, "filesystem": fs}})
-        self.assertEqual(self.policy(profile="nix")["filesystem"]["allowWrite"], [str(self.repo)])
+        self.assertNotIn(str(self.home / ".cache/nix"),
+                         self.policy(profile="nix")["filesystem"]["allowWrite"])
 
     def test_project_claude_config_and_every_git_dir_are_write_denied(self) -> None:
         nested = self.make_git_dir(self.repo / "vendor" / "inner" / ".git")
@@ -325,10 +337,11 @@ class PropertyTests(Home):
                                "/run/agenix.d", "/run/secrets"):
                     self.assertIn(f"InaccessiblePaths=-{hidden}", props)
 
-    def test_repo_profile_writes_only_the_repo(self) -> None:
+    def test_repo_profile_writes_only_the_repo_and_job_caches(self) -> None:
         props = self.props("repo")
-        self.assertEqual([p for p in values(props, "BindPaths")
-                          if p != str(self.repo) and not p.startswith(f"{self.repo}/")], [])
+        caches = {str(p) for p in self.server.job_caches(self.home).values()}
+        self.assertEqual([p for p in values(props, "BindPaths") if p not in caches
+                          and p != str(self.repo) and not p.startswith(f"{self.repo}/")], [])
         self.assertIn(f"-{self.home}/.config/git", values(props, "BindReadOnlyPaths"))
         self.assertEqual(values(props, "WorkingDirectory"), [str(self.repo)])
         self.assertNotIn("Slice=ram-heavy.slice", props)
@@ -361,7 +374,7 @@ class PropertyTests(Home):
         props = self.server.properties(job, self.home)
         bound = {v.lstrip("-") for key in ("BindPaths", "BindReadOnlyPaths") for v in values(props, key)}
         cmd = self.server.start_argv(job, self.home)
-        checked = set(cmd[cmd.index("jobs-broker") + 1:cmd.index("--", cmd.index("jobs-broker")):2])
+        checked = set(cmd[cmd.index("jobs-broker") + 2:cmd.index("--", cmd.index("jobs-broker")):2])
         under_roots = {p for p in bound if p.startswith((str(self.home / "Repos"),
                                                          str(self.home / "worktrees")))}
         self.assertTrue(under_roots)
@@ -441,12 +454,13 @@ class WrapperTests(unittest.TestCase):
 
     def run_wrapper(self, want: str, *argv: str) -> subprocess.CompletedProcess:
         return subprocess.run(["bash", "-c", self.server.WRAPPER, "jobs-broker",
-                               str(self.dir), want, "--", *argv],
+                               str(self.dir / "tmp"), str(self.dir), want, "--", *argv],
                               capture_output=True, text=True, timeout=30)
 
     def test_runs_argv_and_appends_markers(self) -> None:
         ok = self.run_wrapper(ident(self.dir), "echo", "hi")
         self.assertEqual((ok.returncode, ok.stdout), (0, "hi\nMARKER_OK\n"))
+        self.assertTrue((self.dir / "tmp").is_dir())
         bad = self.run_wrapper(ident(self.dir), "sh", "-c", "exit 3")
         self.assertEqual((bad.returncode, bad.stdout), (3, "MARKER_FAILED rc=3\n"))
 
@@ -456,7 +470,7 @@ class WrapperTests(unittest.TestCase):
 
     def test_term_reports_a_stop(self) -> None:
         import signal
-        proc = subprocess.Popen(["bash", "-c", self.server.WRAPPER, "jobs-broker",
+        proc = subprocess.Popen(["bash", "-c", self.server.WRAPPER, "jobs-broker", str(self.dir / "tmp"),
                                  str(self.dir), ident(self.dir), "--", "sleep", "30"],
                                 stdout=subprocess.PIPE, text=True, start_new_session=True)
         time.sleep(0.5)
@@ -737,6 +751,32 @@ class RealUnitTests(unittest.TestCase):
                 self.assertTrue((self.repo / ".git/HEAD").is_file())
                 for held_dir in (self.home / ".local/state/claude-jobs/quarantine").glob(f"{self.unit}.*"):
                     shutil.rmtree(held_dir)
+
+    def test_cargo_test_runs_as_a_job(self) -> None:
+        (self.repo / "src").mkdir()
+        (self.repo / "Cargo.toml").write_text(
+            '[package]\nname = "jobs_broker_probe"\nversion = "0.1.0"\nedition = "2021"\n'
+            '[dependencies]\nitoa = "1"\n')
+        (self.repo / "src/lib.rs").write_text(
+            '#[test]\nfn adds() { assert_eq!(itoa::Buffer::new().format(2), "2"); }\n')
+        self.server.tool_start({"repo": str(self.repo), "slug": self.slug, "max_runtime_sec": 600,
+                                "profile": "nix",
+                                "argv": ["nix", "shell", "nixpkgs#gcc", "--command", "cargo", "test"]},
+                               self.home)
+        out = self.server.tool_status({"slug": self.slug, "wait_sec": 540}, self.home)
+        out += self.server.tool_log({"slug": self.slug}, self.home)
+        self.assertIn("MARKER_OK", out)
+        self.assertIn("test adds ... ok", out)
+
+    def test_uv_run_of_a_script_with_a_dependency_runs_as_a_job(self) -> None:
+        (self.repo / "probe.py").write_text(
+            '# /// script\n# dependencies = ["iniconfig"]\n# ///\n'
+            'import iniconfig\nprint("UV-RAN", iniconfig.__name__)\n')
+        self.start("uv run --no-project --python python3 probe.py", runtime=300)
+        out = self.server.tool_status({"slug": self.slug, "wait_sec": 280}, self.home)
+        out += self.server.tool_log({"slug": self.slug}, self.home)
+        self.assertIn("MARKER_OK", out)
+        self.assertIn("UV-RAN iniconfig", out)
 
     def test_nix_build_fetches_a_new_github_input(self) -> None:
         self.git("init", "-q", cwd=self.repo)

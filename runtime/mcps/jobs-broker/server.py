@@ -32,8 +32,14 @@ RECORDER = HERE.parents[1] / "scripts" / "record-user-unit-failure"
 SYSTEM_BIN = "/run/current-system/sw/bin"
 PYTHON = f"{SYSTEM_BIN}/python3"
 SRT = f"{SYSTEM_BIN}/srt"
+SRT_TMPDIR = "/tmp/claude"
 RIPGREP = f"{SYSTEM_BIN}/rg"
 NIX_CACHE = ".cache/nix"
+# Jobs are a trust tier of their own: they get caches only jobs write and
+# nothing more privileged reads, never the host's ~/.cargo (config and
+# credentials live there) or ~/.cache/uv.
+JOB_CACHES = {"CARGO_HOME": "cargo", "UV_CACHE_DIR": "uv", "npm_config_cache": "npm",
+              "PIP_CACHE_DIR": "pip"}
 MANAGED = Path("/etc/claude-code")
 STATE = ".local/state/claude-jobs"
 HELD = f"{STATE}/quarantine"
@@ -84,11 +90,16 @@ HIDDEN = ("/run/github-app", "/run/dbus", "/run/nscd", "/run/agenix", "/run/agen
 # The job therefore first proves each bound path is the inode that was checked.
 #
 # Under PrivatePIDs this shell is PID 1 and cannot die of SIGTERM, so a stop
-# (systemctl stop, logout, RuntimeMaxSec) exits 143, which the unit counts as
+# (systemctl stop, logout, TimeoutStartSec) exits 143, which the unit counts as
 # a clean stop (SuccessExitStatus=143); the job's own 143 is reported as 1.
+#
+# srt hands the job TMPDIR=/tmp/claude and leaves creating it to its caller;
+# the first argument is that directory, here in the unit's private /tmp.
 WRAPPER = r'''
 stopping=
 trap stopping=1 TERM
+if ! mkdir -p -m 0700 -- "$1"; then echo "MARKER_FAILED rc=125"; exit 125; fi
+shift
 while [ "$1" != -- ]; do
   if [ "$(stat -c %d:%i -- "$1")" != "$2" ]; then
     echo "jobs-broker: $1 is not the directory that was checked; job not run"
@@ -147,6 +158,10 @@ def log_path(home: Path, unit: str) -> Path:
 
 def policy_path(home: Path, unit: str) -> Path:
     return home / ".local/state/claude-jobs" / f"{unit}.srt.json"
+
+
+def job_caches(home: Path) -> dict:
+    return {var: home / ".cache/claude-jobs" / name for var, name in JOB_CACHES.items()}
 
 
 class Scan(NamedTuple):
@@ -396,7 +411,7 @@ def _glob_match(pattern: tuple, parts: tuple) -> bool:
 def srt_policy(repo: Path, scan: Scan, profile: str, home: Path, session: SessionPolicy) -> dict:
     fs = session.sandbox.get("filesystem") or {}
     session_writes = {_expand_home(p, home) for p in fs.get("allowWrite", [])}
-    writes = [str(repo)]
+    writes = [str(repo), *map(str, job_caches(home).values())]
     if profile == "nix" and str(home / NIX_CACHE) in session_writes:
         writes.append(str(home / NIX_CACHE))
     net = session.sandbox.get("network") or {}
@@ -466,7 +481,8 @@ def properties(job: Job, home: Path) -> list:
         # TemporaryFileSystem= there would make the "+" recorder fail at NAMESPACE.
         *HARDENING,
         *(f"InaccessiblePaths=-{p}" for p in HIDDEN),
-        f"BindPaths={job.repo}", *(f"BindReadOnlyPaths={p}" for p, _ in job.readonly),
+        f"BindPaths={job.repo}", *(f"BindPaths={p}" for p in job_caches(home).values()),
+        *(f"BindReadOnlyPaths={p}" for p, _ in job.readonly),
         f"BindReadOnlyPaths={policy_path(home, job.unit)}",
         f"BindReadOnlyPaths=-{home}/.config/git",
     ]
@@ -480,12 +496,13 @@ def properties(job: Job, home: Path) -> list:
 def start_argv(job: Job, home: Path) -> list:
     user = pwd.getpwuid(os.getuid()).pw_name
     env = [f"HOME={home}", f"USER={user}", f"LOGNAME={user}", "LANG=C.UTF-8",
-           f"PATH=/etc/profiles/per-user/{user}/bin:{SYSTEM_BIN}"]
+           f"PATH=/etc/profiles/per-user/{user}/bin:{SYSTEM_BIN}",
+           *(f"{var}={path}" for var, path in job_caches(home).items())]
     cmd = ["systemd-run", "--user", "--no-block", f"--unit={job.unit}", "--expand-environment=no"]
     for prop in properties(job, home):
         cmd += ["-p", prop]
     return [*cmd, "--", f"{SYSTEM_BIN}/env", "-i", *env, f"{SYSTEM_BIN}/bash", "-c", WRAPPER,
-            "jobs-broker", str(job.repo), job.ident,
+            "jobs-broker", SRT_TMPDIR, str(job.repo), job.ident,
             *(a for p, i in job.readonly for a in (str(p), i)),
             "--", SRT, "-s", str(policy_path(home, job.unit)), "--", *job.argv]
 
@@ -521,6 +538,8 @@ def tool_start(args: object, home: Path) -> str:
     job = validate_start(args, home)
     log = log_path(home, job.unit)
     log.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for cache in job_caches(home).values():
+        cache.mkdir(mode=0o700, parents=True, exist_ok=True)
     lock = os.open(log.parent / ".start.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         fcntl.flock(lock, fcntl.LOCK_EX)
