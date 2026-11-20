@@ -399,7 +399,9 @@ class Stubs:
         except OSError as e:
             # Unmarked, no later run would know it for a guard.
             try:
-                (os.rmdir if content is None else os.unlink)(name, dir_fd=parent)
+                now = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                if fd is None or os.path.samestat(os.fstat(fd), now):
+                    (os.rmdir if content is None else os.unlink)(name, dir_fd=parent)
             except OSError:  # arftl-allow: swallowed-exception
                 pass
             fail(3, f"cannot place a guard named {name}: {e}")

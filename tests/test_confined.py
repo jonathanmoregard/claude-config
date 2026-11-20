@@ -255,6 +255,25 @@ def test_a_refused_launch_leaves_the_checkout_as_it_was(world) -> None:
 
 
 @needs_pasta
+def test_a_refused_launch_leaves_a_file_that_replaced_its_guard(world) -> None:
+    script = make_tree(world["var"] / "tree2", world["settings"])
+    source = script.read_text()
+    marking = 'os.setxattr(fd, STUB_MARK, b"1")'
+    assert source.count(marking) == 1
+    script.write_text(source.replace(
+        marking,
+        'if content is not None: os.unlink(name, dir_fd=parent); '
+        'os.write(os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644, dir_fd=parent), '
+        'b"theirs"); raise OSError(95, "injected")\n'
+        '            ' + marking))
+    proc = run(script, "--", "true", cwd=world["repo"])
+    assert proc.returncode == 3, proc.stderr
+    kept = [p for p in world["repo"].rglob("*") if p.is_file() and p.read_bytes() == b"theirs"]
+    assert len(kept) == 1, kept
+    kept[0].unlink()
+
+
+@needs_pasta
 def test_a_stop_while_guards_are_placed_leaves_the_checkout_as_it_was(world) -> None:
     script = make_tree(world["var"] / "tree2", world["settings"])
     source = script.read_text()
