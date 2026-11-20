@@ -2,9 +2,11 @@
 # The homelights fixture (sweep-domain-model/setup.sh), plus the user's
 # recorded decisions as front-matter files: legacy-sync.ts is to be deleted,
 # and the string room/lamp ids and the preset number are to be re-typed in
-# place. Neither has landed. Graded: the inventory lists both as still to do,
-# only the deletion under "Leaving soon", and the Domain model lens reports
-# the id re-typing as work instead of skipping it as already decided.
+# place. Neither has landed. Also a keep decision (brightness stays a number)
+# and a finished change (scripts/check). Graded (grade.py): only the deletion
+# under "Leaving soon", the id re-typing under "Decided, not done" and
+# reported by the Domain model lens instead of skipped as already decided;
+# the keep and the finished decision listed nowhere and not reported.
 set -euo pipefail
 bash "$(dirname "$0")/../sweep-domain-model/setup.sh"
 WORK="${E2E_WORK:?}"
@@ -53,4 +55,30 @@ where:
 User, verbatim: "room and lamp shouldn't be plain strings, and the preset shouldn't be a number. Type them properly, same code otherwise."
 
 Reading: `room` and `lamp` get their own id types and `preset` becomes a labelled type, in place in `src/core`; the functions stay.
+M
+cat > "$notes/decisions/2026-11-16-brightness-stays-a-number.md" <<'M'
+---
+date: 2026-11-16
+title: "Lamp brightness stays a plain number"
+kind: keep
+status: done
+where:
+  - src/core/lighting.ts
+---
+User, verbatim: "brightness is just Home Assistant's 0-255, leave it a number"
+
+Reading: `brightness: number` in `LampArgs` stays as it is on purpose.
+M
+cat > "$notes/decisions/2026-11-15-gate-in-scripts-check.md" <<'M'
+---
+date: 2026-11-15
+title: "The gate runs from scripts/check"
+kind: change
+status: done
+where:
+  - scripts/check
+---
+User, verbatim: "put the gate in one script"
+
+Reading: `scripts/check` runs the type check and the tests. Landed.
 M
