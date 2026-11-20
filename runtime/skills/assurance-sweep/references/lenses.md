@@ -30,9 +30,8 @@ own guard overrides this for that guard only.
 Bar for RECOMMEND: builds on how the code already works instead of
 reworking it; focused and minimal; ordinary industry practice; the simplest thing
 that deals with the problem. If the caller of a proposed check, type or lint
-can sidestep it, the item is SKIP. A type only a parser can build, with a
-guard that rejects casts and untyped values flowing into it elsewhere, is
-not sidestepped.
+can sidestep it, the item is SKIP. A type only a parser can build, kept so by a
+guard of the kind the Domain model lens describes, is not sidestepped.
 
 Output, at most 700 words unless the lens block sets its own cap, in this shape:
 Coverage: what you read; what you did not.
@@ -113,13 +112,15 @@ they are.
 
 The guard needs no new tool: it is one test in the existing suite that uses
 the project's own type checker to read the core's exported signatures, and
-outside their parsers it rejects every way to build the new types without
-them: casts (including through a generic helper), `any` or `unknown` values
-flowing in, type predicates and assertion functions targeting them, and
-`@ts-ignore` / `@ts-expect-error` (or the language's equivalent) directives.
-It covers every file the checker sees, and the checker's configuration
-includes every caller. That is why a type it protects is not SKIP for being
-castable. Recommend the guard as its own item.
+outside their parsers it makes every way of building the new types fail.
+List the ways the language allows and plant one of each as the RED: in
+TypeScript, casts (also through a generic helper), `any` or `unknown`
+flowing in, type predicates and assertion functions, overloads whose
+implementation returns the plain type, `declare` and `.d.ts` declarations,
+`@ts-ignore` / `@ts-expect-error` / `@ts-nocheck`, and JSDoc casts in
+JavaScript files. The checker's configuration covers every file that can
+call the core, tests and scripts included. That is why a type it protects is
+not SKIP for being castable. Recommend the guard as its own item.
 
 Output: one item per category, not per site — per-file counts and at most
 three representative file:line sites — plus one item for the vocabulary

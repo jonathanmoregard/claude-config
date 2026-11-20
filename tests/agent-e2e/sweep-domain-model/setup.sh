@@ -102,10 +102,12 @@ import assert from 'node:assert';
 test('placeholder: the suite runs', () => { assert.ok(true); });
 J
 echo 'node_modules/' >> "$WORK/.gitignore"
-# The installed toolchain: the real tsc, as `npm install` would leave it.
+# The installed toolchain, as `npm install` would leave it: the typescript
+# package (so a test can `import ts from 'typescript'`) and its tsc.
 TSC=$(ls -d /nix/store/*-typescript-5.9.3 2>/dev/null | head -n1 || true)
 [ -n "$TSC" ] || { echo "setup: typescript-5.9.3 is not in /nix/store (nix build nixpkgs#typescript)" >&2; exit 3; }
 mkdir -p "$WORK/node_modules/.bin"
+ln -s "$TSC/lib/node_modules/typescript" "$WORK/node_modules/typescript"
 ln -s "$TSC/bin/tsc" "$WORK/node_modules/.bin/tsc"
 git -C "$WORK" add -A
 git -C "$WORK" commit -qm "feat: remote presets step lamp brightness"
