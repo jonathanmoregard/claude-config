@@ -17,6 +17,7 @@ import json
 import os
 import pwd
 import re
+import stat
 import subprocess
 import sys
 import threading
@@ -34,6 +35,15 @@ SRT = f"{SYSTEM_BIN}/srt"
 RIPGREP = f"{SYSTEM_BIN}/rg"
 NIX_CACHE = ".cache/nix"
 MANAGED = Path("/etc/claude-code")
+STATE = ".local/state/claude-jobs"
+HELD = f"{STATE}/quarantine"
+# What Claude Code, srt, Codex and Cursor protect, together: config an agent,
+# editor, shell, direnv or git reads and runs later.
+PROTECTED_NAMES = frozenset({
+    ".git", ".claude", ".codex", ".agents", ".cursor", ".vscode", ".idea", ".mcp.json", ".envrc",
+    ".gitmodules", ".gitconfig", ".ripgreprc", ".bashrc", ".bash_profile", ".bash_login",
+    ".profile", ".zshrc", ".zprofile", ".zshenv", ".zlogin",
+})
 PREFIX = "claude-job-"
 PROFILES = ("repo", "nix")
 MIN_RUNTIME_SEC = 10
@@ -106,6 +116,7 @@ class Job(NamedTuple):
     runtime: int
     profile: str
     policy: dict
+    baseline: dict
 
 
 def _fields(args: object, allowed: set) -> dict:
@@ -140,16 +151,21 @@ def policy_path(home: Path, unit: str) -> Path:
 
 class Scan(NamedTuple):
     git_state: list
-    globbed: list
+    protected: list
+
+
+def _protected_name(name: str, parts: tuple, globs: list) -> bool:
+    return name.lower() in PROTECTED_NAMES or any(_glob_match(g, parts) for g in globs)
 
 
 # srt protects only hooks and config of a `.git` dir, and no bare repo; a
 # commondir, a submodule's config or a worktree's config.worktree is as good a
-# plant. So every git dir and gitfile in the tree is write-denied whole.
+# plant. So every git dir and gitfile in the tree is write-denied whole, as is
+# every other name that runs later, at any depth.
 def _scan(repo: Path, globs: list) -> Scan:
-    found, globbed, pending, seen = [], [], [repo], 0
+    found, protected, pending, seen = [], [], [repo], 0
     if any(_glob_match(g, repo.parts) for g in globs):
-        globbed.append(repo)
+        protected.append(repo)
     while pending:
         try:
             with os.scandir(pending.pop()) as entries:
@@ -162,8 +178,8 @@ def _scan(repo: Path, globs: list) -> Scan:
                         if entry.is_symlink():
                             raise RuntimeError(f"{entry.path} is a symlink")
                         found.append(path)
-                    elif any(_glob_match(g, path.parts) for g in globs):
-                        globbed.append(path)
+                    elif _protected_name(entry.name, path.parts, globs):
+                        protected.append(path)
                     elif entry.is_dir(follow_symlinks=False):
                         if is_git_dir(path):
                             found.append(path)
@@ -171,7 +187,70 @@ def _scan(repo: Path, globs: list) -> Scan:
                             pending.append(entry.path)
         except OSError as e:
             raise RuntimeError(f"cannot scan {repo} for git dirs: {e}") from None
-    return Scan(found, globbed)
+    return Scan(found, protected)
+
+
+def baseline_path(home: Path, unit: str) -> Path:
+    return home / STATE / f"{unit}.baseline.json"
+
+
+def write_baseline(job: Job, home: Path) -> None:
+    path = baseline_path(home, job.unit)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.unlink(missing_ok=True)
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600),
+                   "w") as fh:
+        json.dump(job.baseline, fh)
+
+
+def _git_dir_at(dir_fd: int, name: str) -> bool:
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    except OSError:
+        return False
+    try:
+        kinds = [os.stat(n, dir_fd=fd, follow_symlinks=False).st_mode for n in ("HEAD", "objects", "refs")]
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    return stat.S_ISREG(kinds[0]) and stat.S_ISDIR(kinds[1]) and stat.S_ISDIR(kinds[2])
+
+
+# Claude Code quarantines what a sandboxed command leaves behind that runs
+# later; this is that step for a job. It runs as the owner outside every
+# sandbox, so it walks by directory fd and moves with renameat: a directory
+# swapped for a symlink mid-walk is neither followed nor moved through.
+def sweep(unit: str, home: Path) -> list:
+    try:
+        base = json.loads(baseline_path(home, unit).read_text())
+        repo, ident = Path(base["repo"]), base["ident"]
+        existing, globs = set(base["existing"]), [tuple(g) for g in base["globs"]]
+        st = os.lstat(repo)
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise RuntimeError(f"no usable baseline for {unit}; nothing moved: {e}") from None
+    if not stat.S_ISDIR(st.st_mode) or f"{st.st_dev}:{st.st_ino}" != ident:
+        raise RuntimeError(f"{repo} is not the directory the job ran in; nothing moved")
+    dest, moved = home / HELD / f"{unit}.{time.time_ns()}", []
+    for top, dirs, files, fd in os.fwalk(repo, follow_symlinks=False):
+        rel_top = os.path.relpath(top, repo)
+        for name in [*dirs, *files]:
+            rel = os.path.normpath(os.path.join(rel_top, name))
+            if not (_protected_name(name, (*repo.parts, *Path(rel).parts), globs)
+                    or (name in dirs and _git_dir_at(fd, name))):
+                continue
+            if name in dirs:
+                dirs.remove(name)
+            if rel in existing:
+                continue
+            (dest / rel).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.rename(name, dest / rel, src_dir_fd=fd)
+            moved.append(rel)
+            print(f"jobs-broker: {rel} appeared during the job; moved out of the repo to {dest / rel}")
+    if moved:
+        with open(home / STATE / f"{unit}.moved", "a") as fh:
+            fh.writelines(f"{rel}\n" for rel in moved)
+    return moved
 
 
 def _gitdir_pointer(gitfile: Path) -> Path | None:
@@ -327,11 +406,14 @@ def srt_policy(repo: Path, scan: Scan, profile: str, home: Path, session: Sessio
         "filesystem": {
             "denyRead": session.deny_read, "allowRead": fs.get("allowRead", []),
             "allowWrite": writes,
-            # Claude Code itself, not srt, denies the project's .claude/ files.
-            "denyWrite": [*(p for p in session.deny_write if _glob(p) is None),
-                          *map(str, scan.globbed), str(repo / ".claude"),
-                          *map(str, scan.git_state)],
+            # A name absent at the top level is denied too: srt holds it with
+            # an empty file, so it cannot be created.
+            "denyWrite": list(dict.fromkeys([
+                *(p for p in session.deny_write if _glob(p) is None),
+                *map(str, scan.protected), *map(str, scan.git_state),
+                *(str(repo / n) for n in sorted(PROTECTED_NAMES))])),
         },
+        "mandatoryDenySearchDepth": 10,
         "ripgrep": {"command": RIPGREP},
     }
 
@@ -348,25 +430,38 @@ def validate_start(args: object, home: Path) -> Job:
     if profile not in PROFILES:
         raise RuntimeError(f"profile must be one of: {', '.join(PROFILES)}")
     repo, ident = canonical(args.get("repo"), home)
+    try:
+        dot_git = os.lstat(repo / ".git").st_mode
+    except FileNotFoundError:
+        dot_git = 0
+    if not (stat.S_ISDIR(dot_git) or stat.S_ISREG(dot_git)):
+        raise RuntimeError(f"{repo} is not the top level of a git work tree")
     session = session_policy(repo, home)
     # srt drops a write glob on Linux, as bwrap binds only concrete paths, so the
     # broker expands each to what it matches in the repo when the job starts.
     globs = [g for p in session.deny_write if (g := _glob(_expand_home(p, home)))]
     scan = _scan(repo, globs)
+    baseline = {"repo": str(repo), "ident": ident, "globs": globs,
+                "existing": [str(p.relative_to(repo)) for p in (*scan.git_state, *scan.protected)
+                             if p != repo]}
     return Job(unit, repo, ident, _outside_git_dirs(repo, scan.git_state, home), list(argv),
-               runtime, profile, srt_policy(repo, scan, profile, home, session))
+               runtime, profile, srt_policy(repo, scan, profile, home, session), baseline)
 
 
 def properties(job: Job, home: Path) -> list:
     log = log_path(home, job.unit)
+    sweep_cmd = f"+{PYTHON} -I {HERE / 'server.py'} sweep {job.unit}"
     props = [
-        "Type=exec", "RemainAfterExit=yes", "SuccessExitStatus=143",
-        f"RuntimeMaxSec={job.runtime}",
+        # oneshot: ExecStartPost= runs once argv exits 0, which a RemainAfterExit=
+        # exec unit's ExecStopPost= does only on a later stop (measured).
+        "Type=oneshot", "RemainAfterExit=yes", "SuccessExitStatus=143",
+        f"TimeoutStartSec={job.runtime}",
         f"Description=jobs-broker job in {job.repo}",
         f"WorkingDirectory={job.repo}", f"StandardOutput=append:{log}",
-        # "+": the recorder writes the real ~/.local/state, which the job's
-        # ProtectHome=tmpfs would otherwise swallow. Its arguments are fixed here.
-        f"ExecStopPost=+{PYTHON} {RECORDER} {job.unit} {log}",
+        # "+": the recorder and the sweep work on the real home, which the job's
+        # ProtectHome=tmpfs would otherwise swallow. Their arguments are fixed here.
+        f"ExecStartPost={sweep_cmd}",
+        f"ExecStopPost=+{PYTHON} {RECORDER} {job.unit} {log}", f"ExecStopPost={sweep_cmd}",
         # ProtectHome=tmpfs already empties /run/user, hiding the user bus. A
         # TemporaryFileSystem= there would make the "+" recorder fail at NAMESPACE.
         *HARDENING,
@@ -386,7 +481,7 @@ def start_argv(job: Job, home: Path) -> list:
     user = pwd.getpwuid(os.getuid()).pw_name
     env = [f"HOME={home}", f"USER={user}", f"LOGNAME={user}", "LANG=C.UTF-8",
            f"PATH=/etc/profiles/per-user/{user}/bin:{SYSTEM_BIN}"]
-    cmd = ["systemd-run", "--user", f"--unit={job.unit}", "--expand-environment=no"]
+    cmd = ["systemd-run", "--user", "--no-block", f"--unit={job.unit}", "--expand-environment=no"]
     for prop in properties(job, home):
         cmd += ["-p", prop]
     return [*cmd, "--", f"{SYSTEM_BIN}/env", "-i", *env, f"{SYSTEM_BIN}/bash", "-c", WRAPPER,
@@ -438,6 +533,8 @@ def tool_start(args: object, home: Path) -> str:
         with os.fdopen(os.open(policy, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                                0o600), "w") as fh:
             json.dump(job.policy, fh)
+        write_baseline(job, home)
+        (home / STATE / f"{job.unit}.moved").unlink(missing_ok=True)
         done = subprocess.run(start_argv(job, home), capture_output=True, text=True, timeout=120,
                               env=_env(home), stdin=subprocess.DEVNULL)
     finally:
@@ -463,11 +560,17 @@ def tool_status(args: object, home: Path) -> str:
         if _settled(snap) or time.monotonic() >= deadline:
             break
         time.sleep(2)
+    try:
+        moved = len((home / STATE / f"{unit}.moved").read_text().splitlines())
+    except FileNotFoundError:
+        moved = 0
     return (f"unit {unit}.service {snap.get('ActiveState')}/{snap.get('SubState')} "
             f"result={snap.get('Result')} status={snap.get('ExecMainStatus')} "
             f"started={snap.get('ExecMainStartTimestamp')} "
             f"exited={snap.get('ExecMainExitTimestamp')}\n"
-            f"{'settled' if _settled(snap) else 'running'}; log: {log_path(home, unit)}")
+            + (f"{moved} files that run later appeared in the repo and were moved out "
+               f"after the job (listed in the log)\n" if moved else "")
+            + f"{'settled' if _settled(snap) else 'running'}; log: {log_path(home, unit)}")
 
 
 def tool_log(args: object, home: Path) -> str:
@@ -507,12 +610,14 @@ TOOLS = [
          "Starts a long job (nix build, VM test gate, long test suite) as a detached systemd "
          "user unit that outlives this session. argv runs in repo under the session's own "
          "sandbox policy, network allowlist included, with writes limited to repo; the rest of "
-         "home and secrets are hidden, every git dir is read-only (git commit fails), and it is "
-         "killed after max_runtime_sec. Profile nix also lets it write the nix cache and uses "
-         "the ram-heavy slice. Read the outcome later with status (wait_sec blocks until it "
-         "settles) and log."),
+         "home and secrets are hidden, every git dir and agent/editor/shell config file is "
+         "read-only (git commit fails), and it is killed after max_runtime_sec. Such files the "
+         "job creates (a new .git, .claude/, .envrc, ...) are moved out of the repo when it "
+         "ends. Profile nix also lets it write the nix cache and uses the ram-heavy slice. "
+         "Read the outcome later with status (wait_sec blocks until it settles) and log."),
      "inputSchema": {"type": "object", "properties": {
-         "repo": {"type": "string", "description": "Absolute dir under ~/Repos or ~/worktrees."},
+         "repo": {"type": "string",
+                  "description": "Top level of a git work tree under ~/Repos or ~/worktrees."},
          "argv": {"type": "array", "items": {"type": "string"},
                   "description": "Command and arguments, e.g. [\"nix\", \"build\", \".#x\"]."},
          "slug": _SLUG,
@@ -583,6 +688,13 @@ def _handle(msg: dict) -> None:
 
 
 def main() -> None:
+    if sys.argv[1:2] == ["sweep"]:
+        unit = sys.argv[2] if len(sys.argv) == 3 else ""
+        try:
+            sweep(unit_name(unit.removeprefix(PREFIX)), _home())
+        except RuntimeError as e:
+            sys.exit(f"jobs-broker: sweep failed: {e}")
+        return
     threads_before = threading.active_count()
     for line in sys.stdin:
         try:

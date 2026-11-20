@@ -17,8 +17,8 @@ Inside the sandbox `systemd-run --user` and `wait-for job` fail: there is no
 user bus. Launch through the `jobs_broker` MCP tools instead; they create the same
 retained user unit (`claude-job-<slug>`) from outside the sandbox:
 
-1. `mcp__jobs_broker__start` with `repo` (absolute, under `~/Repos` or
-   `~/worktrees`), `argv` (a list, no shell string), `slug`, and
+1. `mcp__jobs_broker__start` with `repo` (the top level of a git work tree
+   under `~/Repos` or `~/worktrees`), `argv` (a list, no shell string), `slug`, and
    `profile: "nix"` for nix builds (writable nix cache, ram-heavy slice).
 2. `mcp__jobs_broker__status` with `wait_sec` (max 540) blocks until it
    settles; `mcp__jobs_broker__log` tails the log, which ends `MARKER_OK` or
@@ -27,7 +27,10 @@ retained user unit (`claude-job-<slug>`) from outside the sandbox:
 Jobs run under this session's sandbox policy, network allowlist included, but
 write only that repo and see no other part of your home. Its git dirs are
 read-only: jobs cannot commit, and nix cannot write `flake.lock` there, so
-update the lock in the session first or pass `--no-write-lock-file`.
+update the lock in the session first or pass `--no-write-lock-file`. Agent,
+editor, shell and git config at any depth is read-only too, and any such file a
+job creates (a new `.git`, `.claude/`, `.envrc`) is moved out of the repo when
+it ends; status and log name what was moved.
 
 ## Launch — detached systemd user unit + sentinel markers
 

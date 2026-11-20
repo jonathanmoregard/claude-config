@@ -171,6 +171,13 @@ class RepoPathTests(Home):
             with self.subTest(raw=raw):
                 self.refused(str(raw))
 
+    def test_repo_must_be_the_top_level_of_a_work_tree(self) -> None:
+        (self.repo / "src").mkdir()
+        (self.home / "Repos" / "plain").mkdir()
+        for raw in (self.repo / "src", self.home / "Repos" / "plain"):
+            with self.subTest(raw=raw), self.assertRaisesRegex(RuntimeError, "work tree"):
+                self.job(repo=str(raw))
+
     def test_symlinked_nested_dot_git_refused(self) -> None:
         (self.repo / "vendor").mkdir()
         (self.repo / "vendor" / ".git").symlink_to(self.repo / ".git")
@@ -301,7 +308,7 @@ HARDENING = {
     "RestrictNamespaces=user mnt pid net", "PrivateIPC=yes", "PrivateDevices=yes",
     "ProtectKernelModules=yes", "ProtectControlGroups=yes", "ProtectClock=yes",
     "LockPersonality=yes", "RestrictRealtime=yes", "RestrictSUIDSGID=yes",
-    "CapabilityBoundingSet=", "RemainAfterExit=yes", "Type=exec",
+    "CapabilityBoundingSet=", "RemainAfterExit=yes", "Type=oneshot",
 }
 
 
@@ -335,12 +342,14 @@ class PropertyTests(Home):
 
     def test_runtime_and_failure_recorder(self) -> None:
         props = self.props("repo", max_runtime_sec=600)
-        self.assertEqual(values(props, "RuntimeMaxSec"), ["600"])
+        self.assertEqual(values(props, "TimeoutStartSec"), ["600"])
         log = self.home / ".local/state/claude-jobs/claude-job-check.log"
         self.assertEqual(values(props, "StandardOutput"), [f"append:{log}"])
-        [post] = values(props, "ExecStopPost")
-        self.assertTrue(post.startswith("+"), post)
-        self.assertTrue(post.endswith(f"record-user-unit-failure claude-job-check {log}"), post)
+        record, sweep = values(props, "ExecStopPost")
+        self.assertTrue(record.startswith("+"), record)
+        self.assertTrue(record.endswith(f"record-user-unit-failure claude-job-check {log}"), record)
+        self.assertEqual(values(props, "ExecStartPost"), [sweep])
+        self.assertTrue(sweep.startswith("+") and sweep.endswith("sweep claude-job-check"), sweep)
 
     def test_every_bound_repo_path_is_identity_checked(self) -> None:
         wt = self.home / "worktrees" / "wt"
@@ -391,6 +400,34 @@ class PropertyTests(Home):
         self.assertEqual(cmd[-len(argv) - 1], "--")
         self.assertIn("--expand-environment=no", cmd)
         self.assertIn("--unit=claude-job-check", cmd)
+
+
+class SweepTests(Home):
+    def sweep(self) -> list:
+        job = self.job()
+        self.server.write_baseline(job, self.home)
+        (self.repo / "new/.claude").mkdir(parents=True)
+        (self.repo / "new/.claude/settings.json").write_text("planted\n")
+        outside = self.home / "outside"
+        (outside / ".claude").mkdir(parents=True)
+        (self.repo / "link").symlink_to(outside)
+        self.server.sweep(job.unit, self.home)
+        return [outside / ".claude", self.repo / "link"]
+
+    def test_moves_only_names_that_appeared_and_never_through_a_symlink(self) -> None:
+        kept = self.sweep()
+        self.assertFalse((self.repo / "new/.claude").exists())
+        self.assertTrue((self.repo / ".git").is_dir())
+        for path in kept:
+            self.assertTrue(path.exists(), path)
+
+    def test_a_missing_baseline_moves_nothing(self) -> None:
+        job = self.job()
+        (self.repo / "new/.claude").mkdir(parents=True)
+        with self.assertRaises(RuntimeError):
+            self.server.sweep(job.unit, self.home)
+        self.assertTrue((self.repo / "new/.claude").exists())
+        self.assertTrue((self.repo / ".git").is_dir())
 
 
 class WrapperTests(unittest.TestCase):
@@ -529,6 +566,7 @@ class RealUnitTests(unittest.TestCase):
         self.slug = f"test-{uuid.uuid4().hex[:12]}"
         self.unit = f"claude-job-{self.slug}"
         self.use_settings()
+        self.git("init", "-q", cwd=self.repo)
 
     def use_settings(self, deny: tuple = (), **filesystem) -> None:
         live = json.loads((self.home / ".claude/settings.json").read_text())["sandbox"]
@@ -544,11 +582,19 @@ class RealUnitTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.reset_unit()
-        for leftover in (self.home / ".local/state/claude-jobs" / f"{self.unit}.log",
-                         self.server.policy_path(self.home, self.unit),
+        state = self.home / ".local/state/claude-jobs"
+        for leftover in (state / f"{self.unit}.log", self.server.policy_path(self.home, self.unit),
+                         *state.glob(f"{self.unit}.*"),
                          self.home / ".local/state/claude-unit-failures" / f"{self.unit}.json"):
             leftover.unlink(missing_ok=True)
+        for held in (state / "quarantine").glob(f"{self.unit}.*"):
+            shutil.rmtree(held)
         shutil.rmtree(self.dir)
+
+    def held(self) -> list:
+        root = self.home / ".local/state/claude-jobs/quarantine"
+        return sorted(str(p.relative_to(d)) for d in root.glob(f"{self.unit}.*")
+                      for p in d.rglob("*") if p.is_file())
 
     def start(self, script: str, runtime: int = 120, repo: Path | None = None) -> str:
         return self.server.tool_start({"repo": str(repo or self.repo), "argv": ["sh", "-c", script],
@@ -647,6 +693,50 @@ class RealUnitTests(unittest.TestCase):
         self.assertIn("MARKER_OK", out)
         self.assertEqual((self.repo / "sub/y").read_text(), "kept\n")
         self.assertFalse((self.repo / "sub/held/x").exists(), out)
+
+    def plant(self, *paths: str) -> str:
+        return "".join(f"mkdir -p $(dirname {p}) 2>/dev/null; (echo planted > {p}) 2>/dev/null "
+                       f"&& echo WROTE-{p}; " for p in paths)
+
+    def test_job_cannot_write_execute_later_files_at_any_depth(self) -> None:
+        for d in ("sub/.claude/skills", "sub/.codex", "a/b/c/d/e/f/.vscode", "w/.agents", "w/.cursor"):
+            (self.repo / d).mkdir(parents=True)
+        (self.repo / "sub/.envrc").write_text("orig\n")
+        planted = ["sub/.claude/settings.json", "sub/.claude/settings.local.json",
+                   "sub/.claude/skills/x.md", "sub/.codex/hooks.json", "a/b/c/d/e/f/.vscode/tasks.json",
+                   "w/.agents/x", "w/.cursor/mcp.json", ".codex/hooks.json", ".agents/x", ".envrc"]
+        out = self.run_job(self.plant(*planted) + "echo x >> sub/.envrc; echo kept > normal.txt; exit 0")
+        self.assertIn("MARKER_OK", out)
+        self.assertEqual((self.repo / "normal.txt").read_text(), "kept\n")
+        self.assertEqual((self.repo / "sub/.envrc").read_text(), "orig\n", out)
+        for p in planted:
+            with self.subTest(path=p):
+                self.assertNotIn(f"WROTE-{p}", out)
+                self.assertFalse((self.repo / p).exists(), out)
+
+    def test_execute_later_names_a_job_creates_are_moved_out_after_it(self) -> None:
+        (self.repo / "keep").mkdir()
+        created = ("git init -q sub && echo planted > sub/.git/hooks/post-checkout && "
+                   "mkdir -p deep/x/.claude && echo planted > deep/x/.claude/settings.json && "
+                   "echo planted > deep/.envrc && echo kept > keep/f; ")
+        for rc in (0, 1):
+            self.reset_unit()
+            with self.subTest(rc=rc):
+                out = self.run_job(created + f"exit {rc}")
+                deadline = time.monotonic() + 10
+                while (self.repo / "sub/.git").exists() and time.monotonic() < deadline:
+                    time.sleep(0.2)
+                self.assertEqual((self.repo / "keep/f").read_text(), "kept\n", out)
+                for p in ("sub/.git", "deep/x/.claude", "deep/.envrc"):
+                    self.assertFalse((self.repo / p).exists(), out)
+                held = self.held()
+                for p in ("sub/.git/hooks/post-checkout", "deep/x/.claude/settings.json", "deep/.envrc"):
+                    self.assertIn(p, held)
+                self.assertIn("deep/.envrc", self.server.tool_log({"slug": self.slug}, self.home))
+                self.assertIn("3 files that run later", self.status())
+                self.assertTrue((self.repo / ".git/HEAD").is_file())
+                for held_dir in (self.home / ".local/state/claude-jobs/quarantine").glob(f"{self.unit}.*"):
+                    shutil.rmtree(held_dir)
 
     def test_nix_build_fetches_a_new_github_input(self) -> None:
         self.git("init", "-q", cwd=self.repo)
