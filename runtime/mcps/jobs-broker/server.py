@@ -410,7 +410,7 @@ class SessionPolicy(NamedTuple):
 
 
 def _merge_source(path: Path, settings: dict, repo: Path, home: Path, base: bool,
-                  into: SessionPolicy, settings_dir: Path | None = None) -> None:
+                  into: SessionPolicy) -> None:
     sandbox = settings.get("sandbox", {})
     if not isinstance(sandbox, dict):
         raise RuntimeError(f"{path}: sandbox is not an object")
@@ -421,7 +421,12 @@ def _merge_source(path: Path, settings: dict, repo: Path, home: Path, base: bool
     into.deny_read.extend(fs.get("denyRead", []))
     into.deny_write.extend(fs.get("denyWrite", []))
     into.denied_domains.extend(net.get("deniedDomains", []))
-    rules = (settings.get("permissions") or {}).get("deny", [])
+    _merge_deny_rules(path, (settings.get("permissions") or {}).get("deny", []), path.parent,
+                      repo, home, into)
+
+
+def _merge_deny_rules(path: Path, rules: object, settings_dir: Path, repo: Path, home: Path,
+                      into: SessionPolicy) -> None:
     if not isinstance(rules, list):
         raise RuntimeError(f"{path}: permissions.deny is not a list")
     for rule in rules:
@@ -435,7 +440,7 @@ def _merge_source(path: Path, settings: dict, repo: Path, home: Path, base: bool
             if not content:
                 raise RuntimeError(f"{path}: deny rule {rule!r} names no path")
             target = into.deny_read if tool == "Read" else into.deny_write
-            target.append(_rule_path(content, settings_dir or path.parent, repo, home))
+            target.append(_rule_path(content, settings_dir, repo, home))
 
 
 # A deny only narrows, so Claude Code takes one from any scope, the repo's own
@@ -454,12 +459,11 @@ def _merge_project(path: Path, settings: dict, repo: Path, home: Path, into: Ses
         target.extend(e if e.startswith(("/", "~/")) else str(repo / e) for e in entries)
     into.denied_domains.extend(net.get("deniedDomains", []))
     deny = perms.get("deny", [])
-    _merge_source(path, {"permissions": {"deny": deny}}, repo, home, False, into)
+    _merge_deny_rules(path, deny, path.parent, repo, home, into)
     # Read as relative to the project root as well as to the settings file: the
     # two readings Claude Code has documented for a single leading slash.
-    _merge_source(path, {"permissions": {"deny": [r for r in deny if isinstance(r, str)
-                                                  and re.fullmatch(r"\w+\(/[^/].*\)", r.strip())]}},
-                  repo, home, False, into, settings_dir=repo)
+    _merge_deny_rules(path, [r for r in deny if isinstance(r, str)
+                             and re.fullmatch(r"\w+\(/[^/].*\)", r.strip())], repo, repo, home, into)
 
 
 def session_policy(repo: Path, home: Path) -> SessionPolicy:

@@ -302,6 +302,7 @@ class SrtPolicyTests(Home):
 
     def test_project_deny_rules_are_merged_and_project_allows_never_widen(self) -> None:
         (self.repo / ".claude").mkdir()
+        # arftl-allow: permission-widened (a project allow the broker must ignore)
         self.write_settings({"permissions": {
             "deny": ["Read(./reports/held/**)", "Edit(build/locked)", "Read(/abs-looking)"],
             "allow": ["Edit(//srv/widened/**)"]},
