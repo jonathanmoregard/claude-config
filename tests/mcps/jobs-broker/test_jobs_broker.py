@@ -38,18 +38,32 @@ def values(props: list[str], key: str) -> list[str]:
     return [p.split("=", 1)[1] for p in props if p.split("=", 1)[0] == key]
 
 
+SANDBOX = {
+    "enabled": True, "autoAllowBashIfSandboxed": True,
+    "network": {"allowedDomains": ["github.com", "cache.nixos.org"], "allowAllUnixSockets": True,
+                "tlsTerminate": {}},
+    "filesystem": {"allowWrite": ["~/Repos", "~/worktrees", "~/.cache/nix", "/srv/other"],
+                   "denyRead": ["/run/dbus", "/tmp/kitty.sock-*"],
+                   "denyWrite": ["~/Repos/main/release.key"]},
+}
+
+
 class Home(unittest.TestCase):
     def setUp(self) -> None:
         self.server = load_server()
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name).resolve() / "home"
-        for d in ("Repos/main/.git", "worktrees/wt", ".ssh", ".config/git", ".cache/nix"):
+        for d in ("Repos/main/.git", "worktrees/wt", ".ssh", ".config/git", ".cache/nix", ".claude"):
             (self.home / d).mkdir(parents=True)
         self.repo = self.home / "Repos" / "main"
         (self.repo / ".git" / "config").write_text("")
+        self.write_settings({"sandbox": SANDBOX})
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
+
+    def write_settings(self, settings: dict) -> None:
+        (self.home / ".claude" / "settings.json").write_text(json.dumps(settings))
 
     def start_args(self, **over) -> dict:
         return {"repo": str(self.repo), "argv": ["make", "check"], "slug": "check", **over}
@@ -117,23 +131,6 @@ class RepoPathTests(Home):
         (self.home / "worktrees" / "esc").symlink_to(self.home)
         self.refused(str(self.home / "worktrees" / "esc" / ".ssh"))
 
-    def writable(self, raw: Path) -> set:
-        target = self.server.confine_repo(str(raw), self.home)
-        self.assertEqual(target.repo, raw)
-        return {path for path, _ in target.writable}
-
-    def test_plain_repo_writes_only_inside_itself(self) -> None:
-        self.assertEqual({p for p in self.writable(self.repo) if p != self.repo and
-                          self.repo not in p.parents}, set())
-
-    def test_linked_worktree_writes_only_its_working_tree(self) -> None:
-        wt = self.home / "worktrees" / "wt"
-        admin = self.repo / ".git" / "worktrees" / "wt"
-        admin.mkdir(parents=True)
-        (admin / "commondir").write_text("../..\n")
-        (wt / ".git").write_text(f"gitdir: {admin}\n")
-        self.assertEqual({p for p in self.writable(wt) if p != wt and wt not in p.parents}, set())
-
     def test_symlinked_dot_git_refused(self) -> None:
         wt = self.home / "worktrees" / "wt"
         (wt / ".git").symlink_to(self.repo / ".git")
@@ -172,50 +169,68 @@ class RepoPathTests(Home):
             with self.subTest(raw=raw):
                 self.refused(str(raw))
 
-    def test_every_git_dir_in_reach_is_read_only(self) -> None:
-        main_git = self.make_git_dir(self.repo / ".git")
-        nested = self.make_git_dir(self.repo / "vendor" / "inner" / ".git")
-        modules = self.make_git_dir(main_git / "modules" / "sub")
-        (self.repo / "sub").mkdir()
-        (self.repo / "sub" / ".git").write_text("gitdir: ../.git/modules/sub\n")
-        wt = self.home / "worktrees" / "wt"
-        admin = self.make_git_dir(main_git / "worktrees" / "wt")
-        (admin / "commondir").write_text("../..\n")
-        (wt / ".git").write_text(f"gitdir: {admin}\n")
-        reachable = {self.repo: [main_git, nested, modules, self.repo / "sub" / ".git", admin],
-                     wt: [main_git, modules, admin, wt / ".git"]}
-        for where, git_paths in reachable.items():
-            target = self.server.confine_repo(str(where), self.home)
-            ro = [p for p, _ in target.readonly]
-            rw = [p for p, _ in target.writable]
-            with self.subTest(where=where.name):
-                for g in git_paths:
-                    self.assertTrue(any(g == p or p in g.parents for p in ro), g)
-                for w in rw:
-                    self.assertFalse(any(w == g or g in w.parents for g in git_paths), w)
-
     def test_symlinked_nested_dot_git_refused(self) -> None:
         (self.repo / "vendor").mkdir()
         (self.repo / "vendor" / ".git").symlink_to(self.repo / ".git")
         self.refused(str(self.repo))
 
-    def test_refuses_a_worktree_whose_common_dir_path_is_not_clean(self) -> None:
-        main = self.home / "Repos" / "ma in"
-        admin = main / ".git" / "worktrees" / "wt"
-        admin.mkdir(parents=True)
-        (admin / "commondir").write_text("../..\n")
-        wt = self.home / "worktrees" / "wt"
-        (wt / ".git").write_text(f"gitdir: {admin}\n")
-        self.refused(str(wt))
+
+class SrtPolicyTests(Home):
+    def policy(self, **over) -> dict:
+        return self.job(**over).policy
+
+    def test_network_is_the_sessions(self) -> None:
+        self.assertEqual(self.policy()["network"], {"deniedDomains": [], **SANDBOX["network"]})
+
+    def test_reads_are_denied_as_in_the_session(self) -> None:
+        self.assertEqual(self.policy()["filesystem"]["denyRead"],
+                         SANDBOX["filesystem"]["denyRead"])
+
+    def test_writes_reach_only_the_repo_and_for_nix_its_cache(self) -> None:
+        self.assertEqual(self.policy()["filesystem"]["allowWrite"], [str(self.repo)])
+        self.assertEqual(self.policy(profile="nix")["filesystem"]["allowWrite"],
+                         [str(self.repo), str(self.home / ".cache/nix")])
+
+    def test_nix_cache_is_writable_only_where_the_session_may_write_it(self) -> None:
+        fs = {**SANDBOX["filesystem"], "allowWrite": ["~/Repos"]}
+        self.write_settings({"sandbox": {**SANDBOX, "filesystem": fs}})
+        self.assertEqual(self.policy(profile="nix")["filesystem"]["allowWrite"], [str(self.repo)])
+
+    def test_project_claude_config_and_every_git_dir_are_write_denied(self) -> None:
+        nested = self.make_git_dir(self.repo / "vendor" / "inner" / ".git")
+        bare = self.make_git_dir(self.repo / "tools" / "x.git")
+        (self.repo / "sub").mkdir()
+        (self.repo / "sub" / ".git").write_text("gitdir: ../.git/modules/sub\n")
+        deny = self.policy()["filesystem"]["denyWrite"]
+        for path in (self.repo / ".claude", self.repo / ".git", nested, bare,
+                     self.repo / "sub" / ".git"):
+            with self.subTest(path=path):
+                self.assertIn(str(path), deny)
+        self.assertIn("~/Repos/main/release.key", deny)
+
+    def make_git_dir(self, path: Path) -> Path:
+        for d in ("objects", "refs", "hooks"):
+            (path / d).mkdir(parents=True, exist_ok=True)
+        (path / "HEAD").write_text("ref: refs/heads/main\n")
+        return path
+
+    def test_nothing_starts_without_the_sessions_sandbox_policy(self) -> None:
+        settings = self.home / ".claude" / "settings.json"
+        for content in ({"permissions": {}}, {"sandbox": "on"}, None):
+            if content is None:
+                settings.unlink()
+            else:
+                self.write_settings(content)
+            with self.subTest(content=content), self.assertRaisesRegex(RuntimeError, "sandbox"):
+                self.job()
 
 
 HARDENING = {
     "ProtectSystem=strict", "ProtectHome=tmpfs", "PrivateTmp=yes", "PrivateUsers=self",
-    "NoNewPrivileges=yes", "PrivateNetwork=yes", "RestrictAddressFamilies=AF_UNIX",
-    "SystemCallFilter=@system-service", "SystemCallErrorNumber=EPERM", "PrivatePIDs=yes",
-    "RestrictNamespaces=yes", "PrivateIPC=yes", "PrivateDevices=yes",
-    "ProtectKernelTunables=yes", "ProtectKernelModules=yes", "ProtectKernelLogs=yes",
-    "ProtectControlGroups=yes", "ProtectClock=yes", "ProtectHostname=yes",
+    "NoNewPrivileges=yes", "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
+    "SystemCallFilter=@system-service @mount", "SystemCallErrorNumber=EPERM", "PrivatePIDs=yes",
+    "RestrictNamespaces=user mnt pid net", "PrivateIPC=yes", "PrivateDevices=yes",
+    "ProtectKernelModules=yes", "ProtectControlGroups=yes", "ProtectClock=yes",
     "LockPersonality=yes", "RestrictRealtime=yes", "RestrictSUIDSGID=yes",
     "CapabilityBoundingSet=", "RemainAfterExit=yes", "Type=exec",
 }
@@ -263,7 +278,6 @@ class PropertyTests(Home):
         admin = self.repo / ".git" / "worktrees" / "wt"
         admin.mkdir(parents=True)
         (admin / "commondir").write_text("../..\n")
-        (self.repo / ".git" / "config").write_text("")
         (wt / ".git").write_text(f"gitdir: {admin}\n")
         job = self.job(repo=str(wt))
         props = self.server.properties(job, self.home)
@@ -274,6 +288,29 @@ class PropertyTests(Home):
                                                          str(self.home / "worktrees")))}
         self.assertTrue(under_roots)
         self.assertEqual(under_roots, checked)
+
+    def test_argv_runs_under_srt_with_the_policy_bound_read_only(self) -> None:
+        job = self.job()
+        cmd = self.server.start_argv(job, self.home)
+        policy = self.server.policy_path(self.home, job.unit)
+        self.assertEqual(cmd[-4:], [str(policy), "--", "make", "check"])
+        self.assertEqual(cmd[-7:-4], ["--", self.server.SRT, "-s"])
+        props = self.server.properties(job, self.home)
+        self.assertIn(str(policy), values(props, "BindReadOnlyPaths"))
+        self.assertNotIn(str(policy), values(props, "BindPaths"))
+
+    def test_start_writes_the_policy_the_job_runs_under(self) -> None:
+        from unittest import mock
+        started = []
+        self.server._show = lambda unit: {"LoadState": "not-found"}
+        with mock.patch.object(self.server.subprocess, "run", lambda argv, **kw: (
+                started.append(argv) or subprocess.CompletedProcess(argv, 0, "", ""))):
+            self.server.tool_start(self.start_args(), self.home)
+        job = self.job()
+        written = self.server.policy_path(self.home, job.unit)
+        self.assertEqual(json.loads(written.read_text()), job.policy)
+        self.assertEqual(written.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(len(started), 1)
 
     def test_caller_argv_never_reaches_properties(self) -> None:
         argv = ["sh", "-c", "PrivateNetwork=no", "BindPaths=/"]
@@ -412,6 +449,8 @@ def user_manager() -> bool:
 class RealUnitTests(unittest.TestCase):
     def setUp(self) -> None:
         self.server = load_server()
+        # Lets a candidate sandbox-runtime build be proven on the real path before it deploys.
+        self.server.SRT = os.environ.get("JOBS_BROKER_TEST_SRT", self.server.SRT)
         self.home = Path(pwd.getpwuid(os.getuid()).pw_dir)
         self.dir = Path(tempfile.mkdtemp(prefix=".jobs-broker-test-", dir=self.home / "worktrees"))
         self.repo = self.dir / "repo"
@@ -429,6 +468,7 @@ class RealUnitTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.reset_unit()
         for leftover in (self.home / ".local/state/claude-jobs" / f"{self.unit}.log",
+                         self.server.policy_path(self.home, self.unit),
                          self.home / ".local/state/claude-unit-failures" / f"{self.unit}.json"):
             leftover.unlink(missing_ok=True)
         shutil.rmtree(self.dir)
@@ -479,6 +519,65 @@ class RealUnitTests(unittest.TestCase):
         self.assertIn("MARKER_OK", log)
         self.assertNotIn("CANARY-OUTSIDE-REPO", log)
         self.assertNotIn("RUNTIME-DIR-VISIBLE", log)
+
+    def test_job_cannot_write_what_the_session_sandbox_protects(self) -> None:
+        self.git("init", "-q", cwd=self.repo)
+        self.git("init", "-q", "--bare", "x.git", cwd=self.repo)
+        bare_config = self.snapshot(self.repo / "x.git/config")
+        before = sorted(os.listdir(self.repo))
+        planted = [".claude/settings.local.json", ".claude/settings.json", ".mcp.json",
+                   ".vscode/x", ".gitmodules", ".git/hooks/x", ".bashrc"]
+        script = "".join(f"mkdir -p $(dirname {p}); echo planted > {p}; " for p in planted)
+        out = self.run_job(script + "echo '[core]' >> x.git/config; echo kept > normal.txt; exit 0")
+        self.assertIn("MARKER_OK", out)
+        self.assertEqual((self.repo / "normal.txt").read_text(), "kept\n")
+        for p in planted:
+            with self.subTest(path=p):
+                self.assertFalse((self.repo / p).exists(), out)
+        self.assertEqual(self.snapshot(self.repo / "x.git/config"), bare_config, out)
+        self.assertEqual(sorted(os.listdir(self.repo)), sorted([*before, "normal.txt"]), out)
+
+    def test_job_cannot_write_outside_the_repo(self) -> None:
+        out = self.run_job(f"echo escaped > {self.dir}/outside; echo escaped >> {self.canary}; exit 0")
+        self.assertIn("MARKER_OK", out)
+        self.assertFalse((self.dir / "outside").exists(), out)
+        self.assertEqual(self.canary.read_text(), "CANARY-OUTSIDE-REPO\n")
+
+    def test_job_cannot_read_a_path_the_session_sandbox_denies(self) -> None:
+        run_dir = Path(f"/run/user/{os.getuid()}")
+        settings = json.loads((self.home / ".claude/settings.json").read_text())
+        if str(run_dir) not in settings["sandbox"]["filesystem"].get("denyRead", []):
+            self.skipTest(f"{run_dir} is not a sandbox denyRead path here")
+        canary = run_dir / f"jobs-broker-canary-{uuid.uuid4().hex[:8]}"
+        canary.write_text("CANARY-DENIED-READ\n")
+        try:
+            out = self.run_job(f"cat {canary}; exit 0")
+        finally:
+            canary.unlink()
+        self.assertIn("MARKER_OK", out)
+        self.assertNotIn("CANARY-DENIED-READ", out)
+
+    def test_nix_build_fetches_a_new_github_input(self) -> None:
+        self.git("init", "-q", cwd=self.repo)
+        (self.repo / "flake.lock").write_text(
+            '{"nodes": {"root": {}}, "root": "root", "version": 7}\n')
+        (self.repo / "flake.nix").write_text(
+            '{ inputs.systems.url = "github:nix-systems/x86_64-linux";\n'
+            '  outputs = { self, systems }: { packages.x86_64-linux.default = derivation {\n'
+            '    name = "jobs-broker-net-test"; system = "x86_64-linux"; builder = "/bin/sh";\n'
+            '    args = [ "-c" "echo ${toString (import systems)} > $out" ]; }; }; }\n')
+        self.git("add", "flake.nix", "flake.lock", cwd=self.repo)
+        self.git("commit", "-q", "-m", "flake", cwd=self.repo)
+        self.server.tool_start({"repo": str(self.repo), "slug": self.slug, "max_runtime_sec": 300,
+                                "profile": "nix",
+                                "argv": ["nix", "build", "--refresh", "--no-write-lock-file",
+                                         "--no-link", "--print-out-paths", ".#default"]},
+                               self.home)
+        out = self.server.tool_status({"slug": self.slug, "wait_sec": 280}, self.home)
+        out += self.server.tool_log({"slug": self.slug}, self.home)
+        self.assertIn("MARKER_OK", out)
+        self.assertIn("Added input 'systems'", out)
+        self.assertIn("-jobs-broker-net-test", out)
 
     def test_failure_is_reported_and_recorded(self) -> None:
         self.start("exit 3")
@@ -661,11 +760,14 @@ class RealUnitTests(unittest.TestCase):
             self.assertLess(time.monotonic(), deadline, "the started job's log was replaced")
             time.sleep(0.2)
 
-    def test_stop_ends_a_running_job_without_a_failure_record(self) -> None:
+    def test_stop_ends_a_running_job_without_a_failure_record_or_debris(self) -> None:
+        before = sorted(os.listdir(self.repo))
         self.start("sleep 300")
+        time.sleep(3)
         self.server.tool_stop({"slug": self.slug}, self.home)
         self.assertIn("no job", self.server.tool_status({"slug": self.slug}, self.home))
         self.assertFalse(self.record().exists())
+        self.assertEqual(sorted(os.listdir(self.repo)), before)
 
 
 if __name__ == "__main__":

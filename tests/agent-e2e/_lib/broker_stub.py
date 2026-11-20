@@ -38,11 +38,13 @@ AGENT_E2E = {
 
 SLUG = {"type": "string", "description": "Job name; the unit is claude-job-<slug>."}
 JOBS = {
-    "start": ("Starts a long job (nix build, VM test gate, long test suite) as a detached, hardened "
-              "systemd user unit that outlives this session. It runs argv in repo with: repo "
-              "writable, the rest of home hidden, no network, secrets hidden, killed after "
-              "max_runtime_sec. Profile nix also binds the nix cache and uses the ram-heavy slice. "
-              "Read the outcome later with status (wait_sec blocks until it settles) and log.",
+    "start": ("Starts a long job (nix build, VM test gate, long test suite) as a detached systemd "
+              "user unit that outlives this session. argv runs in repo under the session's own "
+              "sandbox policy, network allowlist included, with writes limited to repo; the rest "
+              "of home and secrets are hidden, every git dir is read-only (git commit fails), and "
+              "it is killed after max_runtime_sec. Profile nix also lets it write the nix cache "
+              "and uses the ram-heavy slice. Read the outcome later with status (wait_sec blocks "
+              "until it settles) and log.",
               obj({"repo": S, "argv": {"type": "array", "items": S}, "slug": SLUG,
                    "max_runtime_sec": I, "profile": {"type": "string", "enum": ["repo", "nix"]}},
                   ["repo", "argv", "slug"])),

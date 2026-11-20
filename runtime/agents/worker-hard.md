@@ -21,8 +21,8 @@ failure reaches the next SessionStart. Monitor is only for a log stream you
 actively want to watch, not for waiting. Do not poll the output file or
 background a bare `sleep` timer. In a sandboxed session (`systemd-run` reports
 no user bus) use the `mcp__jobs_broker__*` tools instead, per
-`detached-long-commands`; their jobs have no network, though nix builds still
-fetch through the nix daemon.
+`detached-long-commands`; their jobs run under the session's sandbox policy,
+network included, with git dirs read-only.
 
 You have no Skill tool, so the full skill listing stays out of your context.
 When a hook, the brief or a preloaded skill tells you to use another skill,

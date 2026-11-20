@@ -15,20 +15,19 @@ ingests):
 
 Inside the sandbox `systemd-run --user` and `wait-for job` fail: there is no
 user bus. Launch through the `jobs_broker` MCP tools instead; they create the same
-retained, hardened user unit (`claude-job-<slug>`) from outside the sandbox:
+retained user unit (`claude-job-<slug>`) from outside the sandbox:
 
 1. `mcp__jobs_broker__start` with `repo` (absolute, under `~/Repos` or
    `~/worktrees`), `argv` (a list, no shell string), `slug`, and
-   `profile: "nix"` for nix builds (binds the nix cache, ram-heavy slice).
+   `profile: "nix"` for nix builds (writable nix cache, ram-heavy slice).
 2. `mcp__jobs_broker__status` with `wait_sec` (max 540) blocks until it
    settles; `mcp__jobs_broker__log` tails the log, which ends `MARKER_OK` or
    `MARKER_FAILED rc=N`; `mcp__jobs_broker__stop` frees the slug.
 
-Jobs have **no network** of their own and see only that repo of your home,
-with its git dirs read-only: jobs cannot commit or change git state.
-Nix builds still download through the nix daemon (substitutes, fixed-output
-fetches); anything the job fetches itself (flake inputs not yet in the store,
-`git fetch`, curl, pip) fails there; say so instead of retrying.
+Jobs run under this session's sandbox policy, network allowlist included, but
+write only that repo and see no other part of your home. Its git dirs are
+read-only: jobs cannot commit, and nix cannot write `flake.lock` there, so
+update the lock in the session first or pass `--no-write-lock-file`.
 
 ## Launch — detached systemd user unit + sentinel markers
 

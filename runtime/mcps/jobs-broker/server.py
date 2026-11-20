@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Jobs broker over stdio MCP: long jobs as hardened systemd user units.
+"""Jobs broker over stdio MCP: long jobs as systemd user units, run under srt.
 
-The caller chooses the command. The unit properties built here are the
-boundary; the only caller inputs they take are the repo directory, the slug,
-the runtime bound and the profile name.
+The caller chooses the command. It runs under Anthropic's sandbox runtime with
+the session's own sandbox policy (the `sandbox` block of ~/.claude/settings.json),
+its writes narrowed to the repo; the unit around it adds durability and hides
+home and system secrets. The only caller inputs either takes are the repo
+directory, the slug, the runtime bound and the profile name.
 
 Protocol: MCP 2024-11-05 over stdio, JSON-RPC 2.0 line-delimited.
 """
@@ -23,10 +25,13 @@ from typing import NamedTuple
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
-from broker_paths import canonical  # noqa: E402
+from broker_paths import canonical, is_git_dir  # noqa: E402
 RECORDER = HERE.parents[1] / "scripts" / "record-user-unit-failure"
 SYSTEM_BIN = "/run/current-system/sw/bin"
 PYTHON = f"{SYSTEM_BIN}/python3"
+SRT = f"{SYSTEM_BIN}/srt"
+RIPGREP = f"{SYSTEM_BIN}/rg"
+NIX_CACHE = ".cache/nix"
 PREFIX = "claude-job-"
 PROFILES = ("repo", "nix")
 MIN_RUNTIME_SEC = 10
@@ -44,13 +49,17 @@ _SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,47}")
 _SHOW = ("LoadState", "ActiveState", "SubState", "Result", "ExecMainStatus",
          "ExecMainStartTimestamp", "ExecMainExitTimestamp")
 
+# srt needs what is let through here (measured): inet sockets and its own
+# network namespace for the domain-allowlisted proxy that replaces
+# PrivateNetwork=, user/mnt/pid namespaces and @mount for bubblewrap, and a
+# /proc it can mount, which ProtectKernelTunables=, ProtectKernelLogs= and
+# ProtectHostname= each prevent.
 HARDENING = (
     "ProtectSystem=strict", "ProtectHome=tmpfs", "PrivateTmp=yes", "PrivateUsers=self",
-    "NoNewPrivileges=yes", "PrivateNetwork=yes", "RestrictAddressFamilies=AF_UNIX",
-    "SystemCallFilter=@system-service", "SystemCallErrorNumber=EPERM", "PrivatePIDs=yes",
-    "RestrictNamespaces=yes", "PrivateIPC=yes", "PrivateDevices=yes",
-    "ProtectKernelTunables=yes", "ProtectKernelModules=yes", "ProtectKernelLogs=yes",
-    "ProtectControlGroups=yes", "ProtectClock=yes", "ProtectHostname=yes",
+    "NoNewPrivileges=yes", "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
+    "SystemCallFilter=@system-service @mount", "SystemCallErrorNumber=EPERM", "PrivatePIDs=yes",
+    "RestrictNamespaces=user mnt pid net", "PrivateIPC=yes", "PrivateDevices=yes",
+    "ProtectKernelModules=yes", "ProtectControlGroups=yes", "ProtectClock=yes",
     "LockPersonality=yes", "RestrictRealtime=yes", "RestrictSUIDSGID=yes",
     "CapabilityBoundingSet=",
 )
@@ -85,18 +94,15 @@ exit "$rc"
 '''
 
 
-class Target(NamedTuple):
-    repo: Path
-    writable: list
-    readonly: list
-
-
 class Job(NamedTuple):
     unit: str
-    target: Target
+    repo: Path
+    ident: str
+    readonly: list
     argv: list
     runtime: int
     profile: str
+    policy: dict
 
 
 def _fields(args: object, allowed: set) -> dict:
@@ -125,6 +131,36 @@ def log_path(home: Path, unit: str) -> Path:
     return home / ".local/state/claude-jobs" / f"{unit}.log"
 
 
+def policy_path(home: Path, unit: str) -> Path:
+    return home / ".local/state/claude-jobs" / f"{unit}.srt.json"
+
+
+# srt protects only hooks and config of a `.git` dir, and no bare repo; a
+# commondir, a submodule's config or a worktree's config.worktree is as good a
+# plant. So every git dir and gitfile in the tree is write-denied whole.
+def _git_state(repo: Path) -> list:
+    found, pending, seen = [], [repo], 0
+    while pending:
+        try:
+            with os.scandir(pending.pop()) as entries:
+                for entry in entries:
+                    seen += 1
+                    if seen > MAX_SCAN_ENTRIES:
+                        raise RuntimeError(f"{repo} has over {MAX_SCAN_ENTRIES} entries to scan")
+                    if entry.name == ".git":
+                        if entry.is_symlink():
+                            raise RuntimeError(f"{entry.path} is a symlink")
+                        found.append(Path(entry.path))
+                    elif entry.is_dir(follow_symlinks=False):
+                        if is_git_dir(Path(entry.path)):
+                            found.append(Path(entry.path))
+                        else:
+                            pending.append(entry.path)
+        except OSError as e:
+            raise RuntimeError(f"cannot scan {repo} for git dirs: {e}") from None
+    return found
+
+
 def _gitdir_pointer(gitfile: Path) -> Path | None:
     try:
         with open(gitfile, encoding="utf-8") as fh:
@@ -141,52 +177,54 @@ def _common_dir(gitdir: Path) -> Path:
         return gitdir
 
 
-def _dot_git_entries(repo: Path) -> list:
-    found, pending, seen = [], [repo], 0
-    while pending:
-        try:
-            with os.scandir(pending.pop()) as entries:
-                for entry in entries:
-                    seen += 1
-                    if seen > MAX_SCAN_ENTRIES:
-                        raise RuntimeError(f"{repo} has over {MAX_SCAN_ENTRIES} entries to scan")
-                    if entry.name == ".git":
-                        if entry.is_symlink():
-                            raise RuntimeError(f"{entry.path} is a symlink")
-                        found.append(Path(entry.path))
-                    elif entry.is_dir(follow_symlinks=False):
-                        pending.append(entry.path)
-        except OSError as e:
-            raise RuntimeError(f"cannot scan {repo} for git dirs: {e}") from None
-    return found
-
-
-# Every git dir a job could reach is bound read-only: the repo's own, its
-# common dir, and every nested repo's or submodule's. Each is a mount point,
-# and so is every directory between the repo and it, so none can be renamed
-# away and replaced by one the job wrote.
-def _git_binds(repo: Path, home: Path) -> list:
-    readonly = []
-    for entry in _dot_git_entries(repo):
-        if entry.is_dir():
-            gitdir = entry
-        else:
-            readonly.append(canonical(str(entry), home, "file", git_ok=True))
-            gitdir = _gitdir_pointer(entry)
-            if gitdir is None:
-                continue
-        for path in {gitdir, _common_dir(gitdir)}:
-            readonly.append(canonical(str(path), home, git_ok=True))
-    unique = sorted(set(readonly))
+# A worktree's or submodule's git dir outside the repo is hidden with the rest
+# of home, so it is bound read-only for git to read; srt never lets it be written.
+def _outside_git_dirs(repo: Path, git_state: list, home: Path) -> list:
+    found = set()
+    for gitfile in (p for p in git_state if p.is_file()):
+        gitdir = _gitdir_pointer(gitfile)
+        if gitdir is not None:
+            found.update(canonical(str(p), home, git_ok=True)
+                         for p in {gitdir, _common_dir(gitdir)} if repo not in p.parents)
+    unique = sorted(found)
     return [(p, i) for p, i in unique if not any(q in p.parents for q, _ in unique)]
 
 
-def confine_repo(raw: object, home: Path) -> Target:
-    repo = canonical(raw, home)
-    readonly = _git_binds(repo[0], home)
-    between = {a for p, _ in readonly for a in p.parents if repo[0] in a.parents}
-    writable = [repo, *(canonical(str(a), home) for a in sorted(between))]
-    return Target(repo[0], writable, readonly)
+def confine_repo(raw: object, home: Path) -> tuple:
+    repo, ident = canonical(raw, home)
+    git_state = _git_state(repo)
+    return repo, ident, git_state, _outside_git_dirs(repo, git_state, home)
+
+
+def _session_sandbox(home: Path) -> dict:
+    try:
+        settings = json.loads((home / ".claude/settings.json").read_text())
+    except (OSError, ValueError) as e:
+        raise RuntimeError(f"cannot read the session's sandbox policy: {e}") from None
+    sandbox = settings.get("sandbox") if isinstance(settings, dict) else None
+    if not isinstance(sandbox, dict):
+        raise RuntimeError("~/.claude/settings.json has no sandbox block; no job runs without it")
+    return sandbox
+
+
+def srt_policy(repo: Path, git_state: list, profile: str, home: Path) -> dict:
+    sandbox = _session_sandbox(home)
+    fs = sandbox.get("filesystem") or {}
+    session_writes = {str(home / p[2:]) if p.startswith("~/") else p
+                      for p in fs.get("allowWrite", [])}
+    writes = [str(repo)]
+    if profile == "nix" and str(home / NIX_CACHE) in session_writes:
+        writes.append(str(home / NIX_CACHE))
+    return {
+        "network": {"deniedDomains": [], **(sandbox.get("network") or {})},
+        "filesystem": {
+            "denyRead": fs.get("denyRead", []), "allowRead": fs.get("allowRead", []),
+            "allowWrite": writes,
+            # Claude Code itself, not srt, denies the project's .claude/ files.
+            "denyWrite": [*fs.get("denyWrite", []), str(repo / ".claude"), *map(str, git_state)],
+        },
+        "ripgrep": {"command": RIPGREP},
+    }
 
 
 def validate_start(args: object, home: Path) -> Job:
@@ -200,7 +238,9 @@ def validate_start(args: object, home: Path) -> Job:
     profile = args.get("profile", "repo")
     if profile not in PROFILES:
         raise RuntimeError(f"profile must be one of: {', '.join(PROFILES)}")
-    return Job(unit, confine_repo(args.get("repo"), home), list(argv), runtime, profile)
+    repo, ident, git_state, readonly = confine_repo(args.get("repo"), home)
+    return Job(unit, repo, ident, readonly, list(argv), runtime, profile,
+               srt_policy(repo, git_state, profile, home))
 
 
 def properties(job: Job, home: Path) -> list:
@@ -208,8 +248,8 @@ def properties(job: Job, home: Path) -> list:
     props = [
         "Type=exec", "RemainAfterExit=yes", "SuccessExitStatus=143",
         f"RuntimeMaxSec={job.runtime}",
-        f"Description=jobs-broker job in {job.target.repo}",
-        f"WorkingDirectory={job.target.repo}", f"StandardOutput=append:{log}",
+        f"Description=jobs-broker job in {job.repo}",
+        f"WorkingDirectory={job.repo}", f"StandardOutput=append:{log}",
         # "+": the recorder writes the real ~/.local/state, which the job's
         # ProtectHome=tmpfs would otherwise swallow. Its arguments are fixed here.
         f"ExecStopPost=+{PYTHON} {RECORDER} {job.unit} {log}",
@@ -217,12 +257,13 @@ def properties(job: Job, home: Path) -> list:
         # TemporaryFileSystem= there would make the "+" recorder fail at NAMESPACE.
         *HARDENING,
         *(f"InaccessiblePaths=-{p}" for p in HIDDEN),
-        *(f"BindPaths={path}" for path, _ in job.target.writable),
-        *(f"BindReadOnlyPaths={path}" for path, _ in job.target.readonly),
+        f"BindPaths={job.repo}", *(f"BindReadOnlyPaths={p}" for p, _ in job.readonly),
+        f"BindReadOnlyPaths={policy_path(home, job.unit)}",
         f"BindReadOnlyPaths=-{home}/.config/git",
     ]
     if job.profile == "nix":
-        props += [f"BindPaths={home}/.cache/nix", f"BindReadOnlyPaths=-{home}/.nix-memory-pressure",
+        props += [f"BindPaths={home / NIX_CACHE}",
+                  f"BindReadOnlyPaths=-{home}/.nix-memory-pressure",
                   "Slice=ram-heavy.slice", "OOMPolicy=kill"]
     return props
 
@@ -234,11 +275,10 @@ def start_argv(job: Job, home: Path) -> list:
     cmd = ["systemd-run", "--user", f"--unit={job.unit}", "--expand-environment=no"]
     for prop in properties(job, home):
         cmd += ["-p", prop]
-    cmd += ["--", f"{SYSTEM_BIN}/env", "-i", *env, f"{SYSTEM_BIN}/bash", "-c", WRAPPER,
-            "jobs-broker"]
-    for path, ident in [*job.target.writable, *job.target.readonly]:
-        cmd += [str(path), ident]
-    return [*cmd, "--", *job.argv]
+    return [*cmd, "--", f"{SYSTEM_BIN}/env", "-i", *env, f"{SYSTEM_BIN}/bash", "-c", WRAPPER,
+            "jobs-broker", str(job.repo), job.ident,
+            *(a for p, i in job.readonly for a in (str(p), i)),
+            "--", SRT, "-s", str(policy_path(home, job.unit)), "--", *job.argv]
 
 
 def _env(home: Path) -> dict:
@@ -279,6 +319,11 @@ def tool_start(args: object, home: Path) -> str:
             raise RuntimeError(f"{job.unit}.service already exists; stop it first or pick a new slug")
         log.unlink(missing_ok=True)
         os.close(os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
+        policy = policy_path(home, job.unit)
+        policy.unlink(missing_ok=True)
+        with os.fdopen(os.open(policy, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                               0o600), "w") as fh:
+            json.dump(job.policy, fh)
         done = subprocess.run(start_argv(job, home), capture_output=True, text=True, timeout=120,
                               env=_env(home), stdin=subprocess.DEVNULL)
     finally:
@@ -287,7 +332,7 @@ def tool_start(args: object, home: Path) -> str:
         raise RuntimeError(f"systemd-run could not start {job.unit}.service: "
                            f"{done.stderr.strip()[:500]}")
     slug = job.unit[len(PREFIX):]
-    return (f"started {job.unit}.service in {job.target.repo} "
+    return (f"started {job.unit}.service in {job.repo} "
             f"(profile {job.profile}, stopped after {job.runtime}s)\nlog: {log}\n"
             f"outcome: status slug={slug} wait_sec<={MAX_WAIT_SEC}; "
             f"host side: wait-for unit {job.unit} --user")
@@ -345,12 +390,13 @@ _SLUG = {"type": "string", "description": "Job name; the unit is claude-job-<slu
 TOOLS = [
     {"name": "start",
      "description": (
-         "Starts a long job (nix build, VM test gate, long test suite) as a detached, hardened "
-         "systemd user unit that outlives this session. It runs argv in repo with: repo "
-         "writable, the rest of home hidden, no network (nix builds still fetch through the "
-         "nix daemon), secrets hidden, every git dir read-only (git commit fails), killed after "
-         "max_runtime_sec. Profile nix also binds the nix cache and uses the ram-heavy slice. "
-         "Read the outcome later with status (wait_sec blocks until it settles) and log."),
+         "Starts a long job (nix build, VM test gate, long test suite) as a detached systemd "
+         "user unit that outlives this session. argv runs in repo under the session's own "
+         "sandbox policy, network allowlist included, with writes limited to repo; the rest of "
+         "home and secrets are hidden, every git dir is read-only (git commit fails), and it is "
+         "killed after max_runtime_sec. Profile nix also lets it write the nix cache and uses "
+         "the ram-heavy slice. Read the outcome later with status (wait_sec blocks until it "
+         "settles) and log."),
      "inputSchema": {"type": "object", "properties": {
          "repo": {"type": "string", "description": "Absolute dir under ~/Repos or ~/worktrees."},
          "argv": {"type": "array", "items": {"type": "string"},
