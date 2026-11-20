@@ -54,6 +54,15 @@
     "env": {},
     "timeout": 600000
   },
+  "agent_e2e_broker": {
+    "type": "stdio",
+    "command": "/run/current-system/sw/bin/python3",
+    "args": [
+      "/home/jonathan/.claude/mcps/agent-e2e-broker/server.py"
+    ],
+    "env": {},
+    "timeout": 3900000
+  },
   "github": {
     "type": "stdio",
     "command": "/etc/profiles/per-user/jonathan/bin/uv",
