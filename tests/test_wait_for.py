@@ -1166,6 +1166,24 @@ def test_a_stop_landing_before_the_job_pid_is_known_still_stops_the_job(
                 os.kill(job, signal.SIGKILL)
 
 
+@pytest.mark.parametrize("suffix", ["lock", "log"])
+def test_a_fifo_at_a_sandboxed_jobs_lock_or_log_does_not_outlast_the_deadline(
+    tmp_path: Path, slug: str, suffix: str
+) -> None:
+    planted = Path(f"/tmp/{slug}.{suffix}")
+    os.mkfifo(planted)
+    ran = tmp_path / "ran"
+    started = time.monotonic()
+    proc = subprocess.run(["bash", str(WAIT_FOR), "job", slug, "--timeout", "3", "--",
+                           "touch", str(ran)],
+                          env={**os.environ, "SANDBOX_RUNTIME": "1"},
+                          stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                          timeout=20, check=False)
+    assert time.monotonic() - started < 10
+    assert proc.returncode == 3, proc.stdout + proc.stderr
+    assert not ran.exists()
+
+
 def test_repeating_a_sandboxed_wait_adopts_the_finished_run(tmp_path: Path, slug: str) -> None:
     counter = tmp_path / "count"
     script = f"echo x >>{counter}"

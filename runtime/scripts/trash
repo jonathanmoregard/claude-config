@@ -69,17 +69,64 @@ def load_settings() -> tuple[str, dict]:
         fail(3, f"cannot read {config}/settings.json: {e}")
 
 
-def denied_paths(settings: dict, home: str) -> list[str]:
+def session_project() -> str | None:
+    """The working directory of the nearest ancestor that is Claude Code: its
+    project's settings add to the sandbox profile."""
+    pid = os.getppid()
+    while pid > 1:
+        try:
+            exe = os.readlink(f"/proc/{pid}/exe")
+            if "claude" in exe.split("/") or os.path.basename(exe).startswith("claude"):
+                return os.path.realpath(os.readlink(f"/proc/{pid}/cwd"))
+            with open(f"/proc/{pid}/stat") as f:
+                line = f.read()
+            pid = int(line[line.rindex(")") + 2:].split()[1])
+        except (OSError, ValueError):
+            break
+    if os.environ.get("CLAUDECODE") and os.environ.get("SANDBOX_RUNTIME") != "1":
+        fail(3, "launched from Claude Code, but its process was not found among the ancestors")
+    return None
+
+
+def project_settings(project: str) -> list[dict]:
+    out = []
+    for name in (".claude/settings.json", ".claude/settings.local.json"):
+        try:
+            fd = os.open(os.path.join(project, name), os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError as e:
+            fail(3, f"cannot read {project}/{name}: {e.strerror}")
+        # A `confined` guard directory stands in for an absent file.
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            continue
+        try:
+            with open(fd, encoding="utf-8") as f:
+                out.append(json.load(f))
+        except (OSError, ValueError) as e:
+            fail(3, f"cannot read {project}/{name}: {e}")
+    return out
+
+
+def within(project: str | None, home: str, entry: str, what: str) -> str:
+    if entry.startswith("~/"):
+        return os.path.join(home, entry[2:])
+    if project and not entry.startswith("/"):
+        return os.path.join(project, entry.removeprefix("./"))
+    if not entry.startswith("/"):
+        fail(3, f"cannot interpret {what} entry {entry}")
+    return entry
+
+
+def denied_paths(settings: dict, home: str, project: str | None = None) -> list[str]:
     try:
         entries = settings.get("sandbox", {}).get("filesystem", {}).get("denyWrite", [])
     except AttributeError as e:
         fail(3, f"cannot read denyWrite: {e}")
     denied = []
     for entry in entries:
-        if entry.startswith("~/"):
-            entry = os.path.join(home, entry[2:])
-        elif not entry.startswith("/"):
-            fail(3, f"cannot interpret denyWrite entry {entry}")
+        entry = within(project, home, entry, "denyWrite")
         # Both the entry as named and what it resolves to: a target is compared by
         # its real parent plus its own name.
         head, tail = os.path.split(entry.rstrip("/"))
@@ -95,8 +142,7 @@ def empty_globstars(pattern: str) -> list[str]:
     return [head + form for rest in empty_globstars(tail) for form in (f"**/{rest}", rest)]
 
 
-def read_denied(settings: dict, home: str, config: str) -> re.Pattern[str]:
-    """What the profile hides from reading: in the trash it would be under no rule."""
+def read_specs(settings: dict, home: str, config: str, project: str | None = None) -> list[str]:
     try:
         specs = list(settings.get("sandbox", {}).get("filesystem", {}).get("denyRead", []))
         for rule in settings.get("permissions", {}).get("deny", []):
@@ -106,12 +152,13 @@ def read_denied(settings: dict, home: str, config: str) -> re.Pattern[str]:
                              os.path.join(config, spec[1:]) if spec.startswith("/") else spec)
     except (AttributeError, TypeError) as e:
         fail(3, f"cannot read the Read deny rules: {e}")
+    return [within(project, home, spec, "Read deny") for spec in specs]
+
+
+def read_denied(specs: list[str]) -> re.Pattern[str]:
+    """What the profile hides from reading: in the trash it would be under no rule."""
     patterns = []
     for spec in specs:
-        if spec.startswith("~/"):
-            spec = os.path.join(home, spec[2:])
-        elif not spec.startswith("/"):
-            fail(3, f"cannot interpret Read deny entry {spec}")
         literal = os.path.dirname(GLOB_CHARS.split(spec, 1)[0])
         for form in {spec, os.path.realpath(literal) + spec[len(literal):]}:
             patterns += [fnmatch.translate(f) for f in empty_globstars(form)]
@@ -291,7 +338,12 @@ def main(args: list[str]) -> None:
             fail(64, f"options are not accepted: {arg}")
     home = pwd.getpwuid(os.getuid()).pw_dir
     config, settings = load_settings()
-    denied, hidden = denied_paths(settings, home), read_denied(settings, home, config)
+    denied, specs = denied_paths(settings, home), read_specs(settings, home, config)
+    if project := session_project():
+        for extra in project_settings(project):
+            denied += denied_paths(extra, home, project)
+            specs += read_specs(extra, home, project, project)
+    hidden = read_denied(specs)
     # $XDG_DATA_HOME is the caller's to set; the trash is where the passwd home puts it.
     trash_fd = os.open(home, os.O_PATH | DIR_FLAGS)
     for part in (".local", "share", "Trash"):

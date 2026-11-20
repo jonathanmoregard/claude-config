@@ -8,6 +8,7 @@ import os
 import pwd
 import re
 import resource
+import shlex
 import shutil
 import subprocess
 import sys
@@ -463,24 +464,37 @@ def test_trash_moves_only_what_it_checked_despite_a_parent_swap(
 
 @pytest.mark.parametrize("rel", [".git/config", ".claude/settings.json"])
 def test_trash_takes_nothing_protected_moved_in_after_its_check(
-        scratch: Path, rel: str) -> None:
-    big = scratch / "big"
-    populate(big)
+        tmp_path: Path, scratch: Path, rel: str) -> None:
+    layout, gate = tmp_path / "layout", tmp_path / "gate"
+    (layout / "scripts").mkdir(parents=True)
+    gate.mkdir()
+    shutil.copy2(SCRIPTS.parent / "settings.json", layout / "settings.json")
+    source = TRASH.read_text()
+    moving = "    unique = reserve(info_fd, files_fd, target)\n"
+    assert source.count(moving) == 1
+    script = layout / "scripts" / "trash"
+    script.write_text(source.replace(moving, (
+        f"    open({str(gate / 'ready')!r}, 'w').close()\n"
+        f"    while not os.path.exists({str(gate / 'go')!r}): time.sleep(0.01)\n") + moving))
     checked = scratch / "a"
     checked.mkdir()
     victim = scratch / "victim"
     (victim / rel).parent.mkdir(parents=True)
     (victim / rel).write_text("decoy")
 
-    proc = subprocess.Popen([sys.executable, "-I", str(TRASH), str(checked), str(big)],
+    before = trash_names()
+    proc = subprocess.Popen([sys.executable, "-I", str(script), str(checked)],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    await_walk(proc, big)
-    moved_mid_run = proc.poll() is None
-    if checked.exists():
-        victim.rename(checked / "victim")
-    _, err = proc.communicate(timeout=60)
-    assert moved_mid_run
-    assert (victim / rel).exists() or (checked / "victim" / rel).exists(), err
+    deadline = time.monotonic() + 30
+    while not (gate / "ready").exists():
+        assert proc.poll() is None and time.monotonic() < deadline
+        time.sleep(0.01)
+    victim.rename(checked / "victim")
+    (gate / "go").touch()
+    _, err = proc.communicate(timeout=30)
+    assert trashed_since(before) == [], err
+    assert (checked / "victim" / rel).exists(), err
+    assert proc.returncode == 1, err
 
 
 @pytest.mark.parametrize("rel", [".git/config", ".claude/settings.json"])
@@ -595,3 +609,51 @@ def test_trash_moves_nothing_the_profile_hides_from_reading(tmp_path: Path,
         assert run_trash(str(scratch / rel), script=script) == (1, {}), rel
     rc, moved = run_trash(str(scratch / "proj" / "free"), script=script)
     assert (rc, sorted(moved)) == (0, [f"{scratch}/proj/free"])
+
+
+def run_trash_in_session(project: Path, *args: str) -> tuple[int, dict[str, str]]:
+    """As called from a Claude Code session started in project: the nearest
+    ancestor whose executable lies under a claude directory."""
+    launcher = project.parent / "claude" / "versions" / "launcher"
+    if not launcher.exists():
+        launcher.parent.mkdir(parents=True)
+        shutil.copy2(shutil.which("bash"), launcher)
+    before = trash_names()
+    call = " ".join(map(shlex.quote, [sys.executable, "-I", str(TRASH), *args]))
+    proc = subprocess.run([str(launcher), "-c", f"{call}; exit $?"], cwd=project,
+                          capture_output=True, text=True, check=False)
+    return proc.returncode, dict(trashed_since(before))
+
+
+def test_trash_moves_nothing_the_session_projects_settings_deny(scratch: Path) -> None:
+    proj = scratch / "proj"
+    (proj / ".claude").mkdir(parents=True)
+    (proj / ".claude" / "settings.json").write_text(json.dumps({
+        "permissions": {"deny": ["Read(./dot/**)", "Read(bare/**)",  # arftl-allow: permission-widened
+                                 "Read(/slash/**)"]},
+        "sandbox": {"filesystem": {"denyRead": ["./fsdeny"], "denyWrite": ["./fswrite"]}}}))
+    (proj / ".claude" / "settings.local.json").write_text(json.dumps(
+        {"permissions": {"deny": ["Read(./local/**)"]}}))  # arftl-allow: permission-widened
+    for name in ("dot", "bare", "slash", "fsdeny", "fswrite", "local", "free"):
+        (proj / name).mkdir()
+        (proj / name / "f").write_text("x")
+    for name in ("dot", "bare", "slash", "fsdeny", "fswrite", "local", "local/f"):
+        assert run_trash_in_session(proj, str(proj / name)) == (1, {}), name
+    rc, moved = run_trash_in_session(proj, str(proj / "free"))
+    assert (rc, sorted(moved)) == (0, [f"{proj}/free"])
+
+
+@pytest.mark.parametrize("settings, status", [("{not json", 3), (None, 0)])
+def test_trash_fails_closed_on_session_project_settings_it_cannot_read(
+        scratch: Path, settings: str | None, status: int) -> None:
+    proj = scratch / "proj"
+    (proj / ".claude").mkdir(parents=True)
+    entry = proj / ".claude" / "settings.local.json"
+    if settings is None:
+        entry.mkdir()
+        os.setxattr(entry, "user.confined-stub", b"1")
+    else:
+        entry.write_text(settings)
+    (proj / "free").write_text("x")
+    rc, moved = run_trash_in_session(proj, str(proj / "free"))
+    assert (rc, sorted(moved)) == (status, [f"{proj}/free"] if status == 0 else [])
