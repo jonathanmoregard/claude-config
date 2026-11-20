@@ -216,7 +216,7 @@ class SrtPolicyTests(Home):
 
     def test_nothing_starts_without_the_sessions_sandbox_policy(self) -> None:
         settings = self.home / ".claude" / "settings.json"
-        for content in ({"permissions": {}}, {"sandbox": "on"}, None):
+        for content in ({"model": "haiku"}, {"sandbox": "on"}, None):
             if content is None:
                 settings.unlink()
             else:
