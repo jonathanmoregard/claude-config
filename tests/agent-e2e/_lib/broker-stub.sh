@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Registers broker_stub.py under each server name given (ai_router_broker,
-# agent_e2e_broker, jobs_broker) in RUN/mcp.json; calls land in RUN/broker-calls.jsonl.
+# Registers broker_stub.py under each server name given (agent_e2e_broker,
+# jobs_broker) in RUN/mcp.json; calls land in RUN/broker-calls.jsonl.
 # Copied into $E2E_BIN because a broker-run campaign keeps its scenarios under
 # /tmp, which the harness hides from the agent.
 # Usage from setup.sh:  source "$(dirname "$0")/../_lib/broker-stub.sh" NAME...

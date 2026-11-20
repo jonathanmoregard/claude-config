@@ -5,17 +5,7 @@ description: Use when choosing between Claude and Codex providers, delegating wo
 
 # ai-router — cross-provider subagent routing
 
-In Claude Code, run every `ai-router <subcommand>` below as the MCP tool
-`mcp__ai_router_broker__<subcommand>` (`delegate`, `wait`, `status`,
-`result`, `peek`, `log`, `send`, `cancel`, `list`, `quota`, `pick`). The
-broker runs ai-router outside the Bash sandbox, where `ai-router delegate`
-fails. Flags become fields: drop the dashes, `-` → `_`, `--schema` →
-`schema_file`, `--need` takes a list. `cwd`, `prompt_file` and `schema_file`
-must be absolute paths under `~/Repos` or `~/worktrees`. The broker runs Codex
-jobs only and refuses a Claude model or provider; Claude work goes to your own
-subagents.
-
-Without those tools (Codex), use the CLI by absolute path:
+One CLI, absolute path, works from both Claude Code and Codex without PATH:
 
 ```
 /home/jonathan/.claude/bin/ai-router <subcommand> --json
@@ -70,13 +60,9 @@ doubt.
 
 ## Delegate a job (cross-provider)
 
-Pass the whole task as `prompt`, or write it to a file (prompt = the whole
-file, verbatim):
+Write the task to a file (prompt = the whole file, verbatim), then:
 
 ```
-mcp__ai_router_broker__delegate {"tier": "standard", "prompt": "<task>",
-  "cwd": "/abs/repo", "sandbox": "read-only"}
-
 /home/jonathan/.claude/bin/ai-router delegate --tier standard \
   --prompt-file /abs/path/task.md --cwd /abs/repo \
   --sandbox read-only --json
@@ -108,8 +94,6 @@ mcp__ai_router_broker__delegate {"tier": "standard", "prompt": "<task>",
   settings, hooks and CLAUDE.md normally.
 - `--wait` blocks until the job is terminal and prints the result. Without
   it the command returns `{job_id, job_dir, events, result_path, …}` at once.
-  The broker's `delegate` always returns at once; follow it with `wait`.
-- `--wait`, `--force`, `--no-bare` and `--dev-gates` exist only on the CLI.
 
 Jobs are detached (`systemd-run --user`, fallback `setsid`), so they survive
 your tool call ending. Job state: `~/.local/state/ai-router/jobs/<job_id>/`
@@ -129,9 +113,10 @@ ai-router cancel <job_id>
 ai-router list
 ```
 
-In Claude Code, the broker's `wait` blocks for at most 9 minutes per call;
-call it again until the job is terminal. Longer jobs: poll `status` from a
-`/loop` or `ScheduleWakeup`.
+In Claude Code the ergonomic pattern is `Bash(run_in_background=true)` on
+`ai-router wait <job_id>` and reading the notification, or `--wait` with a
+Bash timeout ≤ 10 min. Longer jobs: poll `status` from a `/loop` or
+`ScheduleWakeup`.
 
 ### What you lose versus a native subagent
 

@@ -63,17 +63,6 @@
     "env": {},
     "timeout": 3900000
   },
-  "ai_router_broker": {
-    "type": "stdio",
-    "command": "/run/current-system/sw/bin/python3",
-    "args": [
-      "/home/jonathan/.claude/mcps/ai-router-broker/server.py",
-      "--config",
-      "/home/jonathan/.claude/mcps/ai-router-broker/config.json"
-    ],
-    "env": {},
-    "timeout": 720000
-  },
   "github": {
     "type": "stdio",
     "command": "/etc/profiles/per-user/jonathan/bin/uv",
