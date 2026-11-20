@@ -797,6 +797,17 @@ class RealUnitTests(unittest.TestCase):
         self.assertIn("CANARY-NOT-DENIED", out)
         self.assertNotIn("CANARY-GLOB-DENIED", out)
 
+    def test_a_clean_repo_stays_clean_in_a_job_and_on_the_host(self) -> None:
+        self.git("commit", "-q", "--allow-empty", "-m", "init", cwd=self.repo)
+        self.start("echo STATUS-START; git status --porcelain; echo STATUS-END; sleep 3; exit 0")
+        time.sleep(1.5)
+        host = self.git("status", "--porcelain", cwd=self.repo)
+        out = self.status() + "\n" + self.server.tool_log({"slug": self.slug}, self.home)
+        self.assertIn("MARKER_OK", out)
+        self.assertIn("STATUS-START\nSTATUS-END", out)
+        self.assertEqual(host, "")
+        self.assertEqual(self.git("status", "--porcelain", cwd=self.repo), "")
+
     def test_root_anchored_read_deny_globs_hold_in_the_repo_and_git_still_reads(self) -> None:
         (self.repo / "sub/held").mkdir(parents=True)
         (self.repo / "sub/held/f").write_text("CANARY-ROOT-GLOB\n")
