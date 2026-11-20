@@ -330,6 +330,21 @@ class UnitBindTests(Fixture):
             shutil.rmtree(other, ignore_errors=True)
             shutil.rmtree(needed, ignore_errors=True)
 
+    def test_scenario_code_reads_the_bash_guard_config_the_harness_copies(self) -> None:
+        require_sandbox(self)
+        config = self.home / ".config/dcg/config.toml"
+        if not config.is_file():
+            self.skipTest("no dcg config on this host")
+        git(self.repo, "switch", "-qc", "feat/reads-dcg")
+        (self.repo / "tests/agent-e2e/demo/setup.sh").write_text(
+            f"#!/usr/bin/env bash\nhead -c1 {config} >/dev/null && echo DCG-CONFIG-READ\nexit 0\n")
+        git(self.repo, "commit", "-qam", "reads dcg config")
+        git(self.repo, "push", "-q", "origin", "feat/reads-dcg")
+        git(self.repo, "switch", "-q", "master")
+        text = self.server._tool_run(self.req(new_ref="origin/feat/reads-dcg"))
+        [log] = self.out.glob("*/runs/demo/new/1/setup.log")
+        self.assertIn("DCG-CONFIG-READ", log.read_text(), text)
+
     def test_policy_paths_go_through_the_canonicaliser(self) -> None:
         for key, bad in (("repo", str(self.repo / ".git")), ("repo", "/etc"),
                          ("readOnlyPaths", [str(self.home / ".ssh")])):

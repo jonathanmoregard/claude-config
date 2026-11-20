@@ -304,7 +304,9 @@ def _unit_properties(policy: dict, out: Path, runtime: int) -> list[str]:
         *(f"BindReadOnlyPaths={p}" for p in (policy["repo"], *policy["readOnlyPaths"])),
         *(f"BindReadOnlyPaths=-{p}" for p in (
             home / ".claude/plugins", home / ".config/caveman",
-            home / ".config/dcg", exe.parent, Path(os.path.realpath(exe)).parent)),
+            # dcg's config.toml links through the nix store back to this one.
+            home / ".config/dcg", home / ".claude/dcg.toml",
+            exe.parent, Path(os.path.realpath(exe)).parent)),
     ]
 
 
