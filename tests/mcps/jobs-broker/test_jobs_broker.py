@@ -502,6 +502,48 @@ class RealUnitTests(unittest.TestCase):
                 self.assertIn("from-job", self.git("log", "-1", "--format=%s", cwd=where))
                 self.server.tool_stop({"slug": self.slug}, self.home)
 
+    def test_concurrent_starts_of_one_slug_start_one_job_and_keep_its_log(self) -> None:
+        import itertools
+        import threading
+        marker = f"FIRST-{uuid.uuid4().hex[:6]}"
+        real_show, order = self.server._show, itertools.count()
+        first_checked, second_checked = threading.Event(), threading.Event()
+
+        def show_holding_the_first_start_after_its_check(unit: str) -> dict:
+            snap = real_show(unit)
+            if next(order) == 0:
+                first_checked.set()
+                second_checked.wait(3)
+            else:
+                second_checked.set()
+            return snap
+
+        self.server._show = show_holding_the_first_start_after_its_check
+        outcomes: list = []
+
+        def start() -> None:
+            try:
+                outcomes.append(self.start(f"echo {marker}; sleep 30"))
+            except Exception as refused:
+                outcomes.append(refused)
+
+        threads = [threading.Thread(target=start) for _ in range(2)]
+        threads[0].start()
+        first_checked.wait(10)
+        threads[1].start()
+        for t in threads:
+            t.join(60)
+        self.server._show = real_show
+        started = [o for o in outcomes if isinstance(o, str)]
+        refused = [str(o) for o in outcomes if not isinstance(o, str)]
+        self.assertEqual(len(started), 1, outcomes)
+        self.assertEqual(len(refused), 1, outcomes)
+        self.assertIn("already exists", refused[0])
+        deadline = time.monotonic() + 10
+        while marker not in self.server.tool_log({"slug": self.slug}, self.home):
+            self.assertLess(time.monotonic(), deadline, "the started job's log was replaced")
+            time.sleep(0.2)
+
     def test_stop_ends_a_running_job_without_a_failure_record(self) -> None:
         self.start("sleep 300")
         self.server.tool_stop({"slug": self.slug}, self.home)

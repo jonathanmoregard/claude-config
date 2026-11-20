@@ -9,6 +9,7 @@ Protocol: MCP 2024-11-05 over stdio, JSON-RPC 2.0 line-delimited.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import pwd
@@ -284,14 +285,19 @@ def _settled(snap: dict) -> bool:
 
 def tool_start(args: object, home: Path) -> str:
     job = validate_start(args, home)
-    if _show(job.unit).get("LoadState") == "loaded":
-        raise RuntimeError(f"{job.unit}.service already exists; stop it first or pick a new slug")
     log = log_path(home, job.unit)
     log.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    log.unlink(missing_ok=True)
-    os.close(os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
-    done = subprocess.run(start_argv(job, home), capture_output=True, text=True, timeout=120,
-                          env=_env(home), stdin=subprocess.DEVNULL)
+    lock = os.open(log.parent / ".start.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if _show(job.unit).get("LoadState") == "loaded":
+            raise RuntimeError(f"{job.unit}.service already exists; stop it first or pick a new slug")
+        log.unlink(missing_ok=True)
+        os.close(os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
+        done = subprocess.run(start_argv(job, home), capture_output=True, text=True, timeout=120,
+                              env=_env(home), stdin=subprocess.DEVNULL)
+    finally:
+        os.close(lock)
     if done.returncode != 0:
         raise RuntimeError(f"systemd-run could not start {job.unit}.service: "
                            f"{done.stderr.strip()[:500]}")
