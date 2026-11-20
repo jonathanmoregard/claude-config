@@ -6,7 +6,7 @@ instead of a verdict.
 
 usage: judge.py SWEEP_DIR [FINAL_TXT]
 The judge's HOME and working directory are fresh, its raw output goes to a
-fresh directory the result names, and it has no tools, settings, MCP or
+fresh directory (named in an INCONCLUSIVE result), and it has no tools, settings, MCP or
 skills, so the config under test cannot shape its grade. Its credentials are
 the real (passwd) home's file; the harness mounts that file writable into
 the sandbox for token refresh, so an agent could spoil it, but that only

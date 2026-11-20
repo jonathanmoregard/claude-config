@@ -18,14 +18,16 @@ dir="$RUN/home/.local/state/claude-tasks/work/assurance-sweep"
 [ -d "$dir" ] || fail "no assurance-sweep output dir"
 # The files on disk must be exactly the ones setup.sh writes. Read without git:
 # the agent can write .git (config, index flags, excludes), and git run here,
-# outside the sandbox, would obey it. Update the digest when setup.sh changes
-# the fixture (python3 tree_digest.py on a fresh setup).
-[ "$(python3 "$(dirname "$0")/tree_digest.py" "$RUN/work")" = \
+# outside the sandbox, would obey it. Python runs isolated (-I) for the same
+# reason: HOME here is the run's, and its user site-packages are writable.
+# Update the digest when setup.sh changes the fixture (python3 tree_digest.py
+# on a fresh setup).
+[ "$(python3 -I "$(dirname "$0")/tree_digest.py" "$RUN/work")" = \
   4b4a5c267db417c4b310f05426f84d3579c6d3f96a637cc9d0c6a358d089a70b ] \
   || fail "tree: the fixture's files changed"
 grep -Eiq '^[^[:alnum:]]*Tier[^[:alnum:]]*personal\b' "$dir"/*/inventory.md \
   || fail "T: inventory Tier is not personal"
-out=$(python3 "$(dirname "$0")/judge.py" "$dir" "$RUN/final.txt")
+out=$(python3 -I "$(dirname "$0")/judge.py" "$dir" "$RUN/final.txt")
 code=$?
 case "$code" in
   0) pass "tree, T; judge: ${out#PASS }" ;;
