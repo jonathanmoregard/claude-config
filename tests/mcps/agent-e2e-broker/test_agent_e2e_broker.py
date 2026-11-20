@@ -278,6 +278,41 @@ class ReviewFindingTests(Fixture):
         self.assertNotIn("abc", out)
         self.assertNotIn("AKIA" + "A" * 16, out)
 
+    def test_pushed_scenario_code_reaches_no_token_and_writes_only_its_run(self) -> None:
+        require_sandbox(self)
+        import uuid
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        home_canary = home / ".local/state" / f"agent-e2e-broker-test-{uuid.uuid4().hex[:8]}"
+        outside = Path(self.tmp.name) / "outside-run"
+        outside.mkdir()
+        git(self.repo, "switch", "-qc", "feat/pushed-by-sandboxed-agent")
+        scen = self.repo / "tests/agent-e2e/demo"
+        (scen / "setup.sh").write_text(
+            "#!/usr/bin/env bash\n"
+            f"test -r {home}/.cache/gh-tokens/host/token && echo TOKEN-READABLE\n"
+            f"test -e {home}/.cache/gh-tokens && echo TOKEN-DIR-VISIBLE\n"
+            "ls /run/agenix >/dev/null 2>&1 && echo AGENIX-VISIBLE\n"
+            "ls /run/github-app >/dev/null 2>&1 && echo GITHUB-APP-VISIBLE\n"
+            f"echo planted > {home_canary} && echo WROTE-HOME\n"
+            f"echo planted > {outside}/x && echo WROTE-OUTSIDE\n"
+            'echo ok > "$2/inside" && echo WROTE-RUN\n'
+            "exit 0\n")
+        git(self.repo, "commit", "-qam", "scenario code")
+        git(self.repo, "push", "-q", "origin", "feat/pushed-by-sandboxed-agent")
+        git(self.repo, "switch", "-q", "master")
+        try:
+            text = self.server._tool_run(self.req(new_ref="origin/feat/pushed-by-sandboxed-agent"))
+            [log] = self.out.glob("*/runs/demo/new/1/setup.log")
+            setup = log.read_text()
+            self.assertIn("WROTE-RUN", setup, text)
+            for leak in ("TOKEN-READABLE", "TOKEN-DIR-VISIBLE", "AGENIX-VISIBLE",
+                         "GITHUB-APP-VISIBLE", "WROTE-HOME", "WROTE-OUTSIDE"):
+                self.assertNotIn(leak, setup, text)
+            self.assertFalse(home_canary.exists())
+            self.assertFalse((outside / "x").exists())
+        finally:
+            home_canary.unlink(missing_ok=True)
+
     def test_broker_death_stops_harness_and_keeps_lock_until_then(self) -> None:
         require_sandbox(self)
         import fcntl, signal, time

@@ -205,6 +205,17 @@ def _env(policy: dict) -> dict[str, str]:
             "PATH": ":".join(policy["path"]), "LANG": "C.UTF-8"}
 
 
+def _manager_env(policy: dict) -> dict[str, str]:
+    return {**_env(policy), "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"}
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
 def _extract_scenarios(policy: dict, sha: str, dest: Path) -> None:
     dest.mkdir(parents=True)
     archive = subprocess.Popen(["git", "-C", str(policy["repo"]), "archive", sha, "--",
@@ -217,21 +228,69 @@ def _extract_scenarios(policy: dict, sha: str, dest: Path) -> None:
         raise RuntimeError(f"could not extract {policy['scenarioRoot']} from {sha}")
 
 
-# The harness runs under a supervisor that the kernel signals when the broker
-# dies (pdeathsig), and that then kills its whole process group: harness,
-# bwrap and the agent under test. The supervisor and harness also hold the
-# campaign lock, so it frees only once nothing is left spending.
-_SUPERVISOR = 'trap "kill -KILL 0" TERM; "$@" & wait $!'
+# The harness runs in a hardened user unit, because scenario setup.sh and
+# check.sh come from a pushed branch and run as the owner. What stays reachable
+# is what a campaign needs: its output dir, the Claude login, ~/Repos and the
+# config repo read-only, and the network. bwrap, which the harness puts the
+# agent under, must still mount a fresh /proc; ProtectKernelTunables=,
+# ProtectKernelLogs= and ProtectHostname= overmount /proc and make the kernel
+# refuse that (measured), so they are left out. Under PrivatePIDs= the harness
+# is PID 1 and ignores SIGTERM, hence KillSignal=SIGKILL.
+HARDENING = (
+    "ProtectSystem=strict", "ProtectHome=tmpfs", "PrivateTmp=yes", "PrivateUsers=self",
+    "NoNewPrivileges=yes", "PrivatePIDs=yes", "PrivateIPC=yes", "PrivateDevices=yes",
+    "ProtectKernelModules=yes", "ProtectControlGroups=yes", "ProtectClock=yes",
+    "LockPersonality=yes", "RestrictRealtime=yes", "RestrictSUIDSGID=yes",
+    "CapabilityBoundingSet=", "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
+    "SystemCallFilter=@system-service @mount", "SystemCallErrorNumber=EPERM",
+    "RestrictNamespaces=user mnt pid",
+)
+HIDDEN = ("/run/github-app", "/run/dbus", "/run/nscd", "/run/agenix", "/run/agenix.d",
+          "/run/secrets")
+UNIT_PREFIX = "claude-agent-e2e-"
 
 
-def _supervised(argv: list[str], policy: dict) -> list[str]:
+def _unit_properties(policy: dict, out: Path, runtime: int) -> list[str]:
+    home = Path.home()
+    exe = policy["claudeExecutable"]
+    return [
+        "Type=exec", "Description=agent-e2e campaign", f"RuntimeMaxSec={runtime}",
+        "KillSignal=SIGKILL",
+        f"WorkingDirectory={out}", f"StandardOutput=file:{out}/harness.out",
+        f"StandardError=file:{out}/harness.err",
+        *HARDENING,
+        *(f"InaccessiblePaths=-{p}" for p in HIDDEN),
+        f"BindPaths={out}", f"BindPaths=-{home}/.claude/.credentials.json",
+        f"BindReadOnlyPaths={policy['repo']}",
+        *(f"BindReadOnlyPaths=-{p}" for p in (
+            home / "Repos", home / ".claude/plugins", home / ".config/caveman",
+            home / ".config/dcg", exe.parent, Path(os.path.realpath(exe)).parent)),
+    ]
+
+
+# The supervisor is signalled by the kernel when the broker dies (pdeathsig);
+# it then stops the unit and kills its own group. It also holds the campaign
+# lock, so the lock frees only once the unit has stopped.
+_SUPERVISOR = ('unit=$1; systemctl=$2; shift 2; '
+               'trap "$systemctl --user stop $unit.service; kill -KILL 0" TERM; "$@" & wait $!')
+
+
+def _supervised(argv: list[str], policy: dict, out: Path, runtime: int) -> list[str]:
     path = ":".join(policy["path"])
-    tools = {name: shutil.which(name, path=path) for name in ("setpriv", "bash")}
+    tools = {name: shutil.which(name, path=path)
+             for name in ("setpriv", "bash", "env", "systemd-run", "systemctl")}
     missing = [name for name, found in tools.items() if not found]
     if missing:
         raise RuntimeError(f"BROKEN safety boundary: not on policy path: {', '.join(missing)}")
+    unit = UNIT_PREFIX + out.name
+    start = [tools["systemd-run"], "--user", f"--unit={unit}", "--wait", "--collect",
+             "--expand-environment=no"]
+    for prop in _unit_properties(policy, out, runtime):
+        start += ["-p", prop]
+    env = [f"{k}={v}" for k, v in _env(policy).items()]
     return [tools["setpriv"], "--pdeathsig", "TERM", "--", tools["bash"], "-c", _SUPERVISOR,
-            "agent-e2e-supervisor", *argv]
+            "agent-e2e-supervisor", unit, tools["systemctl"],
+            *start, "--", tools["env"], "-i", *env, *argv]
 
 
 def _run_argv(argv: list[str], env: dict, timeout_s: int, rec: Optional[_InFlight],
@@ -350,8 +409,11 @@ def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
                     "--n", str(req["n"]), "--jobs", str(req["jobs"]), "--model", req["model"],
                     "--budget", f"{req['budget']:g}", "--timeout", str(req["timeout"]),
                     "--out", str(out / "runs"), "--claude", str(exe)]
-            rc, stdout, stderr = _run_argv(_supervised(argv, policy), _env(policy),
-                                           req["call_timeout"], rec, lock.fileno())
+            rc, _, client = _run_argv(_supervised(argv, policy, out, req["call_timeout"]),
+                                      _manager_env(policy), req["call_timeout"] + 60, rec,
+                                      lock.fileno())
+            stdout, stderr = (_read_text(out / name) for name in ("harness.out", "harness.err"))
+            stderr = "\n".join(part for part in (stderr.rstrip(), client.strip()) if part)
         finally:
             shutil.rmtree(out / "harness", ignore_errors=True)
     header = (f"agent-e2e campaign `{req['scenario']}` model={req['model']} n={req['n']} "
