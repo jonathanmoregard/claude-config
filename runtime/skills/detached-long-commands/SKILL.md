@@ -11,6 +11,23 @@ does not set), and `nohup`/`&` children die with the session. The proven
 pattern (~20 uses across VM gates, feature-vm boots, and register-index
 ingests):
 
+## Sandboxed session — the jobs broker
+
+Inside the sandbox `systemd-run --user` and `wait-for` fail: there is no user
+bus. Launch through the `jobs_broker` MCP tools instead; they create the same
+retained, hardened user unit (`claude-job-<slug>`) from outside the sandbox:
+
+1. `mcp__jobs_broker__start` with `repo` (absolute, under `~/Repos` or
+   `~/worktrees`), `argv` (a list, no shell string), `slug`, and
+   `profile: "nix"` for nix builds (binds the nix cache, ram-heavy slice).
+2. `mcp__jobs_broker__status` with `wait_sec` (max 540) blocks until it
+   settles; `mcp__jobs_broker__log` tails the log, which ends `MARKER_OK` or
+   `MARKER_FAILED rc=N`; `mcp__jobs_broker__stop` frees the slug.
+
+Jobs have **no network** and see only that repo of your home. A job that
+needs to fetch (uncached flake inputs, `git fetch`, downloads) fails there;
+say so instead of retrying.
+
 ## Launch — detached systemd user unit + sentinel markers
 
 The unit retains the command's real exit status: `ExecMainStatus` equals the

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stub stdio MCP server standing in for ai_router_broker or agent_e2e_broker.
+"""Stub stdio MCP server standing in for ai_router_broker, agent_e2e_broker or jobs_broker.
 
 Tool names, descriptions and schemas follow the real servers under
 runtime/mcps/. Every tools/call is appended to RUN/broker-calls.jsonl and gets
@@ -14,6 +14,7 @@ RUN = os.environ["E2E_RUN_DIR"]
 SERVER = sys.argv[1]
 CODENAME = "Marigold-7Q"
 JOB = "20261120-143005-a1b2c3"
+STORE_PATH = "/nix/store/q7m2x9k4c1d8f5h3j6l0n2p4r8s1t5v9-render-atlas-2.4"
 CAMPAIGN = "/tmp/agent-e2e-broker/20261120T143005Z-commit-msg-trailer-5e1c2d9a-4242"
 
 
@@ -71,6 +72,37 @@ AGENT_E2E = {
                 ["scenario", "old_ref", "new_ref", "model"])),
 }
 
+SLUG = {"type": "string", "description": "Job name; the unit is claude-job-<slug>."}
+JOBS = {
+    "start": ("Starts a long job (nix build, VM test gate, long test suite) as a detached, hardened "
+              "systemd user unit that outlives this session. It runs argv in repo with: repo "
+              "writable, the rest of home hidden, no network, secrets hidden, killed after "
+              "max_runtime_sec. Profile nix also binds the nix cache and uses the ram-heavy slice. "
+              "Read the outcome later with status (wait_sec blocks until it settles) and log.",
+              obj({"repo": S, "argv": {"type": "array", "items": S}, "slug": SLUG,
+                   "max_runtime_sec": I, "profile": {"type": "string", "enum": ["repo", "nix"]}},
+                  ["repo", "argv", "slug"])),
+    "status": ("State, result and exit status of a job this broker started.",
+               obj({"slug": SLUG, "wait_sec": I}, ["slug"])),
+    "log": ("Tail of a job's combined stdout/stderr, ending MARKER_OK or MARKER_FAILED rc=N.",
+            obj({"slug": SLUG, "lines": I}, ["slug"])),
+    "stop": ("Stops a job this broker started and unloads its unit, freeing the slug.",
+             obj({"slug": SLUG}, ["slug"])),
+}
+
+
+def jobs_reply(tool, args):
+    unit = f"claude-job-{args.get('slug', 'job')}"
+    log = f"~/.local/state/claude-jobs/{unit}.log"
+    if tool == "start":
+        return f"started {unit}.service (profile {args.get('profile', 'repo')})\nlog: {log}"
+    if tool == "status":
+        return (f"unit {unit}.service active/exited result=success status=0\nsettled; log: {log}")
+    if tool == "log":
+        return f"{log}, last 2 lines:\n{STORE_PATH}\nMARKER_OK"
+    return f"stopped and unloaded {unit}.service"
+
+
 DONE = {"duration_s": 4, "error_class": None, "exit_code": 0, "job_id": JOB,
         "model": "gpt-5.6-luna", "ok": True, "provider": "codex", "result_json": None,
         "result_text": f"{CODENAME}", "status": "done"}
@@ -110,12 +142,14 @@ def agent_e2e_reply(args):
         "--- harness exit 0 ---"])
 
 
-TOOLS = AI_ROUTER if SERVER == "ai_router_broker" else AGENT_E2E
+TOOLS = {"ai_router_broker": AI_ROUTER, "jobs_broker": JOBS}.get(SERVER, AGENT_E2E)
 
 
 def reply(tool, args):
     if SERVER == "ai_router_broker":
         return json.dumps(ai_router_reply(tool, args), indent=1)
+    if SERVER == "jobs_broker":
+        return jobs_reply(tool, args)
     return agent_e2e_reply(args)
 
 
