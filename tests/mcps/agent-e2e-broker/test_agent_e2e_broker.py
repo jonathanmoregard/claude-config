@@ -410,6 +410,46 @@ class ReviewFindingTests(Fixture):
         finally:
             home_canary.unlink(missing_ok=True)
 
+    def test_scenario_code_cannot_reach_host_abstract_sockets(self) -> None:
+        require_sandbox(self)
+        import socket
+        import threading
+        import uuid
+        name = f"agent-e2e-broker-test-{uuid.uuid4().hex[:8]}"
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind("\0" + name)
+        listener.listen(4)
+        reached = []
+
+        def accept() -> None:
+            while True:
+                try:
+                    conn, _ = listener.accept()
+                except OSError:
+                    return
+                reached.append(conn.recv(16))
+                conn.close()
+
+        threading.Thread(target=accept, daemon=True).start()
+        connect = ("import socket, sys; s = socket.socket(socket.AF_UNIX); "
+                   "s.connect(chr(0) + sys.argv[1]); s.sendall(b'x'); print('ABSTRACT-' + 'REACHED')")
+        git(self.repo, "switch", "-qc", "feat/abstract-socket")
+        (self.repo / "tests/agent-e2e/demo/setup.sh").write_text(
+            f"#!/usr/bin/env bash\n{sys.executable} -c \"{connect}\" {name} || echo ABSTRACT-REFUSED\n"
+            "exit 0\n")
+        git(self.repo, "commit", "-qam", "abstract socket")
+        git(self.repo, "push", "-q", "origin", "feat/abstract-socket")
+        git(self.repo, "switch", "-q", "master")
+        try:
+            text = self.server._tool_run(self.req(new_ref="origin/feat/abstract-socket"))
+            [log] = self.out.glob("*/runs/demo/new/1/setup.log")
+            setup = log.read_text()
+            self.assertIn("ABSTRACT-REFUSED", setup, text)
+            self.assertNotIn("ABSTRACT-REACHED", setup, text)
+            self.assertEqual(reached, [])
+        finally:
+            listener.close()
+
     def test_broker_death_stops_harness_and_keeps_lock_until_then(self) -> None:
         require_sandbox(self)
         import fcntl, signal, time

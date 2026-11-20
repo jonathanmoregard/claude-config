@@ -308,6 +308,21 @@ def _unit_properties(policy: dict, out: Path, runtime: int) -> list[str]:
     ]
 
 
+# The unit shares the host's network namespace, and with it every abstract unix
+# socket there (X11, ICE, ...). Landlock's abstract-socket scope refuses those,
+# leaving path sockets and the network the campaign needs; no Landlock, no run.
+_SCOPE_ABSTRACT_SOCKETS = r'''
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+attr = (ctypes.c_uint64 * 3)(0, 0, 1)
+fd = libc.syscall(444, ctypes.byref(attr), ctypes.sizeof(attr), 0)
+if fd < 0 or libc.prctl(38, 1, 0, 0, 0) or libc.syscall(446, fd, 0):
+    sys.exit("BROKEN safety boundary: cannot scope abstract unix sockets: "
+             + os.strerror(ctypes.get_errno()))
+os.execvp(sys.argv[1], sys.argv[1:])
+'''
+
+
 # The supervisor is signalled by the kernel when the broker dies (pdeathsig);
 # it then stops the unit and kills its own group. It also holds the campaign
 # lock, so the lock frees only once the unit has stopped.
@@ -318,7 +333,7 @@ _SUPERVISOR = ('unit=$1; systemctl=$2; shift 2; '
 def _supervised(argv: list[str], policy: dict, out: Path, runtime: int) -> list[str]:
     path = ":".join(policy["path"])
     tools = {name: shutil.which(name, path=path)
-             for name in ("setpriv", "bash", "env", "systemd-run", "systemctl")}
+             for name in ("setpriv", "bash", "env", "systemd-run", "systemctl", "python3")}
     missing = [name for name, found in tools.items() if not found]
     if missing:
         raise RuntimeError(f"BROKEN safety boundary: not on policy path: {', '.join(missing)}")
@@ -330,7 +345,8 @@ def _supervised(argv: list[str], policy: dict, out: Path, runtime: int) -> list[
     env = [f"{k}={v}" for k, v in _env(policy).items()]
     return [tools["setpriv"], "--pdeathsig", "TERM", "--", tools["bash"], "-c", _SUPERVISOR,
             "agent-e2e-supervisor", unit, tools["systemctl"],
-            *start, "--", tools["env"], "-i", *env, *argv]
+            *start, "--", tools["env"], "-i", *env,
+            tools["python3"], "-I", "-c", _SCOPE_ABSTRACT_SOCKETS, *argv]
 
 
 def _run_argv(argv: list[str], env: dict, timeout_s: int, rec: Optional[_InFlight],
