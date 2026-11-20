@@ -374,13 +374,20 @@ class Stubs:
     def hold(self, parent: int, name: str, content: str | None, path: str) -> int:
         # The guard adopted may have been removed by its finishing owner, and
         # another put in its place, before the lock was taken.
+        # Stops are held back meanwhile, so no wait here may be unbounded: a
+        # finishing owner holds its exclusive lock for an instant only.
+        deadline = time.monotonic() + 5
         for _ in range(10):
             fd = self.make(parent, name, content)
             if fd is None:
                 fd = self.adopt(parent, name)
             if fd is None:
                 continue
-            fcntl.flock(fd, fcntl.LOCK_SH)
+            while not self.share(fd):
+                if time.monotonic() > deadline:
+                    os.close(fd)
+                    fail(3, f"cannot place a guard at {path}: another process keeps it locked")
+                time.sleep(0.02)
             try:
                 if os.path.samestat(os.fstat(fd), os.stat(name, dir_fd=parent,
                                                           follow_symlinks=False)):
@@ -430,9 +437,18 @@ class Stubs:
             return False
 
     @staticmethod
+    def share(fd: int) -> bool:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            return False
+
+    @staticmethod
     def adopt(parent: int, name: str) -> int | None:
         try:
-            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+            # A FIFO raced in under the name would block a plain open.
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
         except OSError:
             return None
         try:
@@ -700,11 +716,16 @@ def supervise(argv: list[str], fds: list[int], net: Network) -> int:
     return 128 - status if status < 0 else status
 
 
-def detach(args: Args, cwd: str, sessions: list[str], user: str, here: Path, tmp: str) -> None:
-    systemd_run, bash = find("systemd-run", user), find("bash", user)
+def detach(args: Args, cwd: str, sessions: list[str], user: pwd.struct_passwd, here: Path,
+           tmp: str) -> None:
+    systemd_run, bash = find("systemd-run", user.pw_name), find("bash", user.pw_name)
     recorder = here / "record-user-unit-failure"
     if not os.access(recorder, os.X_OK):
         fail(3, f"{recorder} is missing")
+    # A success under the same name clears that record, in the recorder and in wait-for.
+    if os.path.lexists(f"{user.pw_dir}/.local/state/claude-unit-failures/{args.slug}.json"):
+        fail(64, f"an earlier {args.slug}.service failed and that is not yet read: read it with "
+                 f"`wait-for unit {args.slug}.service --user`, or pick a new slug")
     log = f"{tmp}/{args.slug}.log"
     runtime = f"/run/user/{os.getuid()}"
     proc = subprocess.run(
@@ -755,7 +776,7 @@ def main() -> None:
         signal.pthread_sigmask(signal.SIG_SETMASK, mask)
         bwrap_args, fds = jail(profile, repo, cwd, entry.pw_dir, tmp, args.login)
         if args.slug:
-            detach(args, cwd, sessions, entry.pw_name, here, tmp)
+            detach(args, cwd, sessions, entry, here, tmp)
         net = Network(tools)
         try:
             status = supervise([tools["bwrap"], *bwrap_args, "--", *args.command], fds, net)

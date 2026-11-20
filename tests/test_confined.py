@@ -9,6 +9,7 @@ live in the working repository: home, /tmp, /run and /var are replaced inside
 the jail, and a nested call must still see its tree."""
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -542,6 +543,35 @@ def test_a_guard_outlives_a_shorter_concurrent_jail(world) -> None:
     assert short.returncode == 0, short.stderr
     assert out.rstrip().endswith(RAN) and "created" not in out, out
     assert not (repo / ".mcp.json").exists()
+
+
+@needs_pasta
+def test_a_guard_another_process_keeps_locked_fails_the_launch_in_bounded_time(world) -> None:
+    repo = world["repo"]
+    (repo / ".vscode").mkdir()
+    os.setxattr(repo / ".vscode", "user.confined-stub", b"1")
+    held = os.open(repo / ".vscode", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        proc = run(world["script"], "--", "true", cwd=repo, timeout=30)
+    finally:
+        os.close(held)
+    assert proc.returncode == 3, proc.stderr
+    assert (repo / ".vscode").is_dir()
+
+
+@needs_pasta
+def test_a_fifo_raced_in_for_a_guard_fails_the_launch_in_bounded_time(world) -> None:
+    repo = world["repo"]
+    placing = "            if rename_noreplace(parent, tmp, name):"
+    script = injected(world, "fifo", placing,
+                      '            name == ".mcp.json" and not os.path.lexists('
+                      'f"/proc/self/fd/{parent}/{name}") and os.mkfifo(name, dir_fd=parent)\n'
+                      + placing)
+    proc = run(script, "--", "true", cwd=repo, timeout=30)
+    assert proc.returncode == 3, proc.stderr
+    assert (repo / ".mcp.json").is_fifo()
+    (repo / ".mcp.json").unlink()
 
 
 @pytest.mark.parametrize("entry", [".claude", ".claude/settings.json", ".mcp.json"])
@@ -1214,6 +1244,20 @@ def test_detach_refuses_a_used_slug_and_says_so(world, detached) -> None:
     assert log.read_text().splitlines()[-1] == "MARKER_OK"
     time.sleep(1)
     assert not (world["repo"] / "second").exists()
+
+
+@needs_bus
+@needs_pasta
+def test_detach_refuses_a_slug_whose_earlier_failure_is_unread(world, detached) -> None:
+    # A success under that name would clear the record, unread.
+    slug, _ = detached()
+    record = REAL_HOME / ".local/state/claude-unit-failures" / f"{slug}.json"
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text('{"failed_at": "2026-01-01T00:00:00Z"}\n')
+    proc = run(world["script"], "--detach", slug, "--", "true", cwd=world["repo"])
+    assert proc.returncode == 64, proc.stderr
+    assert "wait-for unit" in proc.stderr, proc.stderr
+    assert record.exists()
 
 
 @needs_pasta
