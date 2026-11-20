@@ -9,6 +9,7 @@ path is in <root>/.trash/info/<name>.trashinfo.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import pwd
 import shutil
@@ -40,10 +41,8 @@ def root_of(path: Path, home: Path) -> Path | None:
 
 def open_dir(name: str, dir_fd: int, create: bool) -> int:
     if create:
-        try:
+        with contextlib.suppress(FileExistsError):
             os.mkdir(name, dir_fd=dir_fd)
-        except FileExistsError:
-            pass
     return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
 
 
@@ -149,13 +148,11 @@ def empty_old(home: Path) -> None:
             deleted = deletion_time(record, info)
             if deleted is None or deleted >= cutoff:
                 continue
-            try:
+            with contextlib.suppress(FileNotFoundError):
                 if stat.S_ISDIR(os.stat(entry, dir_fd=files, follow_symlinks=False).st_mode):
                     shutil.rmtree(entry, dir_fd=files)
                 else:
                     os.unlink(entry, dir_fd=files)
-            except FileNotFoundError:
-                pass
             os.unlink(record, dir_fd=info)
         os.close(files)
         os.close(info)
