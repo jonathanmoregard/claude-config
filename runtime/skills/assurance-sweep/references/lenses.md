@@ -109,8 +109,8 @@ treat the whole as core. Count every site, per file, in these categories
    that replaces it, and where the user used that term; mark a term with no
    such source.
 For each category give the target type as a short sketch and where its
-parser belongs. The guard described below keeps all of them from coming
-back; it reads the core's exported signatures, with an allowlist whose every
+parser belongs. The guard described below keeps categories 1 to 4 from
+coming back; it reads the core's exported signatures, with an allowlist whose every
 entry needs a reason. A genuinely open value — text shown to a
 person, real-number arithmetic — is SKIP with that reason. Types narrow what
 the code accepts; they add no runtime machinery, and wire formats stay as

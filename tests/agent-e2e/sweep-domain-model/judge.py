@@ -66,6 +66,7 @@ try:
         proc = subprocess.run(argv, input=prompt, capture_output=True, text=True, env=env, cwd=cwd, timeout=600)
     open(os.path.join(out_dir, 'judge.out'), 'w', encoding='utf-8').write(proc.stdout + proc.stderr)
 except (OSError, subprocess.SubprocessError) as exc:
+    open(os.path.join(out_dir, 'judge.out'), 'w', encoding='utf-8').write(repr(exc))
     inconclusive(exc.__class__.__name__)
 try:
     verdicts = json.loads(proc.stdout)['structured_output']

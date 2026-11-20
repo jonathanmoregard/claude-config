@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # PASS when the sweep shows all of:
-#   tree  the fixture's files are byte-for-byte what setup.sh wrote (the
+#   tree  the fixture's files (node_modules aside) are what setup.sh wrote (the
 #         sweep only proposes); read from disk, never through git
 #   T     the inventory's Tier line says personal (not the template's
 #         "production | personal")
 #   P1-P5, G, X, V  graded by an Opus judge against the planted problems in
-#         judge.md: labelled preset union, explicit case for the sentinels,
+#         judge.md: labelled preset union, explicit case for a sentinel,
 #         RoomId/LampId, Home Assistant names out of the core, `Plan` renamed
 #         with the README's words, a separate type-checker guard item, no
 #         production machinery proposed, and a Venues lens file marking those
@@ -23,7 +23,7 @@ dir="$RUN/home/.local/state/claude-tasks/work/assurance-sweep"
 # Update the digest when setup.sh changes the fixture (python3 tree_digest.py
 # on a fresh setup).
 [ "$(python3 -I "$(dirname "$0")/tree_digest.py" "$RUN/work")" = \
-  797d581fa492d14f0d6a6e641c7e0c6d92141aee19f1dcddb3cc560c2f5c0237 ] \
+  50870d976c0c8c24c8469261a2a0933e74a201fed0a3e2a639fed257b2c13ae5 ] \
   || fail "tree: the fixture's files changed"
 grep -Eiq '^[^[:alnum:]]*Tier[^[:alnum:]]*personal\b' "$dir"/*/inventory.md \
   || fail "T: inventory Tier is not personal"

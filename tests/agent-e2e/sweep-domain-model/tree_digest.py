@@ -1,7 +1,7 @@
 """Digest of the fixture's files, read straight from disk: no git, so nothing
 the agent under test wrote into .git (config, index flags, excludes, hooks)
 can change what is seen or run code in the grader. Every entry counts: files
-by content and mode, symlinks (to files or directories) by target, empty
+by content and executable bit, symlinks (to files or directories) by target, empty
 directories by name. Only the top-level .git and node_modules (the links
 setup.sh makes) are skipped. usage: tree_digest.py WORK_DIR"""
 import hashlib
@@ -33,7 +33,9 @@ for dirpath, dirnames, filenames in os.walk(root):
             entry(b'D', rel)
             dirnames.append(name)
         elif stat.S_ISREG(st.st_mode):
-            entry(b'F', rel, oct(stat.S_IMODE(st.st_mode)).encode() + b'\0' + open(path, 'rb').read())
+            # the executable bit only: the rest of the mode follows the umask
+            exe = b'x' if st.st_mode & stat.S_IXUSR else b'-'
+            entry(b'F', rel, exe + b'\0' + open(path, 'rb').read())
         else:
             entry(b'?', rel)  # fifo, socket, device: never opened, still counted
     dirnames.sort()
