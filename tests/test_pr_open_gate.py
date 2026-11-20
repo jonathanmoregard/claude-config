@@ -220,7 +220,7 @@ def sb(tmp_path):
 
 
 def is_deny(out) -> bool:
-    return bool(out) and out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    return bool(out) and out["hookSpecificOutput"].get("permissionDecision") == "deny"
 
 
 def reason(out) -> str:
@@ -466,6 +466,93 @@ def test_reviewed_files_never_include_the_checkout_root(sb):
     sb.commit("scripts/run.sh", SCRIPT_BODY)
     sb.review("PASS", prompt=f"Work in {sb.work}.\nRe-read fresh: {sb.work / 'scripts/run.sh'}")
     assert sb.records()[-1]["files"] == ["scripts/run.sh"]
+
+
+# --- gate: binary files --------------------------------------------------------
+# Break (2026-11-20, firmware PR refused): requiring an advisor Read of build
+# outputs it cannot review; or an exemption wider than git's NUL-byte rule (an
+# extension list, a `binary` attribute, "not UTF-8"), or binary churn counted
+# into, or text churn hidden out of, the 20-line drift budget.
+
+FIRMWARE = b"\x7fELF\x02\x01\x01\x00" + bytes(range(256)) * 40
+
+
+def commit_bytes(sb: Sandbox, rel: str, data: bytes, msg: str = "build") -> None:
+    path = sb.work / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    git(sb.work, "add", "-A")
+    git(sb.work, "commit", "-qm", msg)
+
+
+def test_a_binary_file_needs_no_advisor_read_and_is_listed(sb):
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    commit_bytes(sb, "build/candle.bin", FIRMWARE)
+    sb.review("PASS", reads=["scripts/run.sh"])
+    out = sb.gate()
+    assert not is_deny(out)
+    assert "build/candle.bin" in out["systemMessage"]
+    assert "binary, not reviewable by reading" in out["hookSpecificOutput"]["additionalContext"]
+    logged = sb.exemptions()[-1]
+    assert logged["kind"] == "binary-not-read" and logged["files"] == ["build/candle.bin"]
+    assert allowed(sb.run(GATE, sb.perm("gh pr create --fill")))
+
+
+def test_a_text_file_beside_a_binary_still_needs_its_read(sb):
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    commit_bytes(sb, "build/candle.bin", FIRMWARE)
+    sb.review("PASS", reads=[])
+    out = sb.gate()
+    assert is_deny(out)
+    assert "1 changed file(s) no advisor has read: scripts/run.sh" in reason(out)
+    assert "binary, not reviewable by reading: build/candle.bin" in reason(out)
+    assert not allowed(sb.run(GATE, sb.perm("gh pr create --fill")))
+
+
+def test_non_utf8_text_without_a_nul_byte_stays_text(sb):
+    commit_bytes(sb, "src/latin1.cfg", b"".join(b"caf\xe9 %d\n" % i for i in range(30)))
+    git_lines = dict(artl_gate.numstat(str(sb.work), "origin/main", "HEAD"))
+    assert git_lines["src/latin1.cfg"] == 30          # git itself calls it text
+    sb.review("PASS", reads=[])
+    out = sb.gate()
+    assert is_deny(out) and "no advisor has read: src/latin1.cfg" in reason(out)
+
+
+def test_a_binary_attribute_does_not_excuse_a_text_file(sb):
+    # .git/info/attributes is outside every diff a reviewer sees.
+    write(sb.work / ".git" / "info" / "attributes", "* binary\n")
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    assert dict(artl_gate.numstat(str(sb.work), "origin/main", "HEAD"))["scripts/run.sh"] is None
+    sb.review("PASS", reads=[])
+    out = sb.gate()
+    assert is_deny(out) and "no advisor has read: scripts/run.sh" in reason(out)
+
+
+def test_a_rebuilt_binary_is_not_text_drift(sb):
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    commit_bytes(sb, "build/candle.bin", FIRMWARE)
+    sb.review("PASS", reads=["scripts/run.sh"])
+    commit_bytes(sb, "build/candle.bin", FIRMWARE * 4 + b"rebuilt")
+    sb.commit("scripts/run.sh", SCRIPT_BODY + "echo fixed\n", "fix: finding")
+    assert not is_deny(sb.gate())
+
+
+def test_text_drift_beside_a_rebuilt_binary_still_denies(sb):
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    commit_bytes(sb, "build/candle.bin", FIRMWARE)
+    sb.review("PASS", reads=["scripts/run.sh"])
+    commit_bytes(sb, "build/candle.bin", FIRMWARE * 4 + b"rebuilt")
+    sb.commit("scripts/run.sh", SCRIPT_BODY + "".join(f"echo more {i}\n" for i in range(25)))
+    out = sb.gate()
+    assert is_deny(out) and "drift" in reason(out).lower()
+
+
+def test_a_reviewed_text_file_turned_binary_is_still_drift(sb):
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    sb.review("PASS")
+    commit_bytes(sb, "scripts/run.sh", b"\0" + (SCRIPT_BODY * 3).encode())
+    out = sb.gate()
+    assert is_deny(out) and "drift" in reason(out).lower()
 
 
 def test_reading_a_tracked_symlink_covers_the_link_and_its_target(tmp_path):

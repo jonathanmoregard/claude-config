@@ -38,13 +38,16 @@ EVENTS (one script, dispatched on hook_event_name):
       2. the diff since the merge base is computed-exempt (inert docs only, or
          at most 15 changed lines with nothing in a behaviour path) -- logged; OR
       3. the latest advisor verdict recorded for the branch is PASS or
-         PASS_WITH_FIXES and not from a suspect prompt, every changed file's
-         latest review (by an advisor that READ it) passed and has drifted at
-         most 20 lines since, and the whole tree at most 20 lines; OR
+         PASS_WITH_FIXES and not from a suspect prompt, every changed text
+         file's latest review (by an advisor that READ it) passed and has
+         drifted at most 20 lines since, and the whole tree at most 20 text
+         lines. A file binary on both sides by git's NUL-byte rule needs no
+         Read and adds no drift; it is listed in the output and logged; OR
       4. the user waived it in this session with `skip-artl` (consumed by this
          one PR open, logged; see UserPromptSubmit).
-    Fail -> permissionDecision "deny" with every reason. Pass -> no output, and
-    a one-shot grant for the PermissionRequest below.
+    Fail -> permissionDecision "deny" with every reason. Pass -> no decision
+    (only the binary-file note, when there are any), and a one-shot grant for
+    the PermissionRequest below.
     When the same Bash command runs `git commit` before the PR open, the gate
     (which runs first) also judges what that commit will add -- tracked edits,
     and untracked files too when the command runs `git add`.
@@ -125,8 +128,10 @@ def out(obj: dict) -> None:
     sys.stdout.flush()
 
 
-def refuse(reasons: list[str], with_remedy: bool) -> None:
+def refuse(reasons: list[str], with_remedy: bool, binary: list[str] | None = None) -> None:
     text = "pr-open-gate refused this PR open:\n" + "\n".join(f"- {r}" for r in reasons)
+    if binary:
+        text += "\nListed, not refused: " + g.binary_listing(binary)
     out({"hookSpecificOutput": {"hookEventName": "PreToolUse",
                                 "permissionDecision": "deny",
                                 "permissionDecisionReason": text + (REMEDY if with_remedy else "")}})
@@ -301,9 +306,9 @@ def on_pretool(payload: dict) -> None:
     session = g.safe_id(payload.get("session_id")) or "unknown"
     slot = grant_path(session, payload)
 
-    def deny(reasons: list[str], with_remedy: bool) -> None:
+    def deny(reasons: list[str], with_remedy: bool, binary: list[str] | None = None) -> None:
         revoke(slot)
-        refuse(reasons, with_remedy)
+        refuse(reasons, with_remedy, binary)
 
     if call.get("problem"):
         deny([call["problem"]], with_remedy=False)
@@ -335,9 +340,11 @@ def on_pretool(payload: dict) -> None:
     if problem:
         deny([problem], with_remedy=False)
         return
-    views = [(tip, changes)] + pending
+    views = [(view_tip, view_changes, g.binary_paths(top, mb, view_tip, view_changes))
+             for view_tip, view_changes in [(tip, changes)] + pending]
+    binary = sorted(set().union(*(view_binary for _, _, view_binary in views)))
     exempt = None
-    for _, view_changes in views:
+    for _, view_changes, _ in views:
         exempt = g.computed_exemption(view_changes)
         if not exempt:
             break
@@ -348,24 +355,33 @@ def on_pretool(payload: dict) -> None:
         for d in g.read_records_dirs(payload, info):
             records.extend(g.read_jsonl(d / g.EVIDENCE_FILE))
         problem = None
-        for view_tip, view_changes in views:
-            problem = g.evidence_problem(records, info, branch, view_tip, view_changes)
+        for view_tip, view_changes, view_binary in views:
+            problem = g.evidence_problem(records, info, branch, view_tip, view_changes,
+                                         view_binary)
             if problem:
                 break
         if problem:
             if not take_override(session, now):
-                deny([problem], with_remedy=True)
+                deny([problem], with_remedy=True, binary=binary)
                 return
             log_exemption(payload, {"kind": "user-override", "why": problem, **where})
 
     if smoke_log:
         log_exemption(payload, {**smoke_log, **where})
+    if binary:
+        log_exemption(payload, {"kind": "binary-not-read", "why": g.BINARY_NOTE,
+                                "files": binary[:g.MAX_PROMPT_PATHS], **where})
     stale = g.prune(g.state_dir() / "grants", g.GRANT_TTL_S, now)
     if stale:
         print(f"pr-open-gate: could not remove {stale} expired grant file(s); "
               "they are already unspendable, but the state dir is not writable "
               "as expected", file=sys.stderr)
     g.write_json(slot, {"ts": now, **where})
+    if binary:
+        # No permissionDecision: the ask rule and the grant above still decide.
+        note = "pr-open-gate: " + g.binary_listing(binary) + "; logged to artl-exemptions.jsonl."
+        out({"systemMessage": note,
+             "hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": note}})
 
 
 def main() -> int:

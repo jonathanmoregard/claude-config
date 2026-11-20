@@ -82,6 +82,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+from typing import Literal
 
 GIT_TIMEOUT_S = 5
 LS_REMOTE_TIMEOUT_S = 6
@@ -244,6 +245,39 @@ def numstat(top: str, a: str, b: str) -> list[tuple[str, int | None]] | None:
 
 def line_total(rows: list[tuple[str, int | None]], binary_cost: int) -> int:
     return sum(binary_cost if n is None else n for _, n in rows)
+
+
+GIT_BINARY_PROBE = 8000   # git's own window (xdiff-interface.c, FIRST_FEW_BYTES)
+BINARY_NOTE = "binary, not reviewable by reading"
+
+
+def blob_kind(top: str, rev: str, path: str) -> Literal["binary", "text", "absent"]:
+    """PATH at REV by git's default content rule: a NUL in the first 8000
+    bytes. Attributes are not consulted -- `.git/info/attributes` and
+    core.attributesFile can mark any text binary from outside the diff a
+    reviewer sees. A git failure reads as text, which still needs a Read."""
+    try:
+        proc = subprocess.run(["git", "-C", str(top), "cat-file", "blob", f"{rev}:{path}"],
+                              capture_output=True, timeout=GIT_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError):
+        return "text"
+    if proc.returncode == 0:
+        return "binary" if b"\0" in proc.stdout[:GIT_BINARY_PROBE] else "text"
+    return "absent" if git(top, "ls-tree", "--name-only", rev, "--", path) == "" else "text"
+
+
+def binary_paths(top: str, a: str, b: str, rows: list[tuple[str, int | None]]) -> set[str]:
+    """Paths git diffs as binary (numstat `-`) whose content is binary at every
+    side that has them. A file that is text on one side is not binary: making
+    a reviewed file binary must not take its changes out of the review."""
+    out = set()
+    for path, lines in rows:
+        if lines is not None:
+            continue
+        kinds = {blob_kind(top, rev, path) for rev in (a, b)} - {"absent"}
+        if kinds == {"binary"}:
+            out.add(path)
+    return out
 
 
 def snapshot_tree(top: str, untracked: bool = True) -> str | None:
@@ -1048,13 +1082,20 @@ def computed_exemption(changes: list[tuple[str, int | None]]) -> str | None:
 
 
 def tree_rows(top: str, tree: object, tip: str, cache: dict) -> dict[str, int] | None:
-    """{path: lines changed} from a reviewed tree to the tip; None if unknown."""
+    """{path: text lines changed} from a reviewed tree to the tip; None if
+    unknown. A binary-to-binary change is 0 lines: no review read it, so it
+    cannot have gone stale. Any other change git will not count is over the
+    limit."""
     if not isinstance(tree, str) or not SHA_RE.fullmatch(tree):
         return None
     if tree not in cache:
         rows = numstat(top, tree, tip)
-        cache[tree] = None if rows is None else {
-            p: (DRIFT_LIMIT + 1 if n is None else n) for p, n in rows}
+        if rows is None:
+            cache[tree] = None
+        else:
+            binary = binary_paths(top, tree, tip, rows)
+            cache[tree] = {p: 0 if p in binary else (DRIFT_LIMIT + 1 if n is None else n)
+                           for p, n in rows}
     return cache[tree]
 
 
@@ -1072,9 +1113,15 @@ def _shown(paths: list[str]) -> str:
     return ", ".join(paths[:15]) + (" …" if len(paths) > 15 else "")
 
 
+def binary_listing(binary: list[str]) -> str:
+    return (f"{len(binary)} file(s) not required to be read by an advisor "
+            f"({BINARY_NOTE}: {_shown(binary)})")
+
+
 def evidence_problem(records: list[dict], info: dict, branch: str, tip: str,
-                     changes: list[tuple[str, int | None]]) -> str | None:
-    """None when the recorded reviews clear this branch, else why not."""
+                     changes: list[tuple[str, int | None]], binary: set[str]) -> str | None:
+    """None when the recorded reviews clear this branch, else why not.
+    `binary` (binary_paths of the PR diff) needs no Read; everything else does."""
     mine = [r for r in records if r.get("repo") == info["repo"] and r.get("branch") == branch]
     if not mine:
         return (f"no advisor verdict is recorded for branch {branch!r} "
@@ -1102,7 +1149,7 @@ def evidence_problem(records: list[dict], info: dict, branch: str, tip: str,
     # passing review read and nobody changed since stays covered.
     trusted = sorted((r for r in mine if not r.get("suspect")), key=lambda r: r.get("ts", 0))
     unread, blocked, changed = [], [], []
-    for path in sorted(pr_paths):
+    for path in sorted(pr_paths - binary):
         last = None
         for r in trusted:
             if path in (r.get("files") or []):
