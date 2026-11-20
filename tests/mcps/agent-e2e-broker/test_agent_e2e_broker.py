@@ -345,6 +345,20 @@ class UnitBindTests(Fixture):
         [log] = self.out.glob("*/runs/demo/new/1/setup.log")
         self.assertIn("DCG-CONFIG-READ", log.read_text(), text)
 
+    def test_agent_bash_sandbox_can_start_inside_the_unit(self) -> None:
+        require_sandbox(self)
+        bwrap = shutil.which("bwrap")
+        git(self.repo, "switch", "-qc", "feat/nested-sandbox")
+        (self.repo / "tests/agent-e2e/demo/setup.sh").write_text(
+            f"#!/usr/bin/env bash\n{bwrap} --unshare-net --unshare-user --unshare-pid "
+            "--dev-bind / / --proc /proc true && echo SANDBOX-STARTED\nexit 0\n")
+        git(self.repo, "commit", "-qam", "nested sandbox")
+        git(self.repo, "push", "-q", "origin", "feat/nested-sandbox")
+        git(self.repo, "switch", "-q", "master")
+        text = self.server._tool_run(self.req(new_ref="origin/feat/nested-sandbox"))
+        [log] = self.out.glob("*/runs/demo/new/1/setup.log")
+        self.assertIn("SANDBOX-STARTED", log.read_text(), text)
+
     def test_policy_paths_go_through_the_canonicaliser(self) -> None:
         for key, bad in (("repo", str(self.repo / ".git")), ("repo", "/etc"),
                          ("readOnlyPaths", [str(self.home / ".ssh")])):

@@ -283,7 +283,7 @@ HARDENING = (
     "LockPersonality=yes", "RestrictRealtime=yes", "RestrictSUIDSGID=yes",
     "CapabilityBoundingSet=", "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
     "SystemCallFilter=@system-service @mount", "SystemCallErrorNumber=EPERM",
-    "RestrictNamespaces=user mnt pid",
+    "RestrictNamespaces=user mnt pid net",
 )
 HIDDEN = ("/run/github-app", "/run/dbus", "/run/nscd", "/run/agenix", "/run/agenix.d",
           "/run/secrets")
