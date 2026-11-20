@@ -15,6 +15,7 @@ import os
 import pwd
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import threading
@@ -250,6 +251,19 @@ def test_a_refused_launch_leaves_the_checkout_as_it_was(world) -> None:
     before = sorted(str(p) for p in world["repo"].rglob("*"))
     proc = run(script, "--", "true", cwd=world["repo"])
     assert proc.returncode == 3, proc.stderr
+    assert sorted(str(p) for p in world["repo"].rglob("*")) == before
+
+
+@needs_pasta
+def test_a_stop_while_guards_are_placed_leaves_the_checkout_as_it_was(world) -> None:
+    script = make_tree(world["var"] / "tree2", world["settings"])
+    source = script.read_text()
+    created = "os.mkdir(name, 0o755, dir_fd=parent)"
+    assert source.count(created) == 1
+    script.write_text(source.replace(created, f"{created}; os.kill(os.getpid(), signal.SIGTERM)"))
+    before = sorted(str(p) for p in world["repo"].rglob("*"))
+    proc = run(script, "--", "true", cwd=world["repo"])
+    assert proc.returncode == 128 + signal.SIGTERM, proc.stderr
     assert sorted(str(p) for p in world["repo"].rglob("*")) == before
 
 
@@ -644,6 +658,21 @@ def test_worktree_and_module_guards_survive_renaming_their_parent(world, worktre
         cwd=worktrees["main"])
     assert "moved=" not in proc.stdout, proc.stdout
     assert {p: p.read_bytes() if p.exists() else None for p in guarded} == before
+
+
+@pytest.mark.parametrize("name", ["r[1]"])
+@needs_pasta
+def test_other_worktrees_entries_are_guarded_whatever_the_repository_is_called(
+        world, name: str) -> None:
+    main = git_repo(world["rw"] / name)
+    subprocess.run(["git", "-C", str(main), "worktree", "add", "-q", str(world["rw"] / "wt1")],
+                   check=True)
+    commondir = main / ".git" / "worktrees" / "wt1" / "commondir"
+    before = commondir.read_bytes()
+    proc = jailed(world["script"], f"echo x >>'{commondir}' 2>/dev/null && echo written=yes",
+                  cwd=main)
+    assert "written=yes" not in proc.stdout, proc.stdout
+    assert commondir.read_bytes() == before
 
 
 @needs_pasta

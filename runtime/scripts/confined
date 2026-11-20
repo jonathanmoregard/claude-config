@@ -72,6 +72,7 @@ PROTECTED = (
     ".zshrc", ".zprofile", ".profile", ".ripgreprc", ".vscode", ".idea",
 )
 STUB_MARK = "user.confined-stub"
+STOPS = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
 LOADER = ("LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT")
 JOB_WRAPPER = """
 log=$1; shift
@@ -303,7 +304,7 @@ def repository(cwd: str, profile: Profile, sessions: list[str]) -> Repo:
         # git dies on an empty commondir; "." names the git dir itself.
         content = {os.path.join(gitdir, "commondir"): ".", os.path.join(gitdir, "config"): "",
                    os.path.join(gitdir, "config.worktree"): ""}
-        frozen += glob.glob(os.path.join(gitdir, "worktrees", "*"))
+        frozen += glob.glob(os.path.join(glob.escape(gitdir), "worktrees", "*"))
         for root, dirs, files in os.walk(os.path.join(gitdir, "modules")):
             if "HEAD" in files:
                 frozen += [os.path.join(root, "hooks"), os.path.join(root, "config")]
@@ -707,8 +708,12 @@ def main() -> None:
         signal.signal(sig, lambda signum, _frame: sys.exit(128 + signum))
     if ctypes.CDLL(None, use_errno=True).prctl(36, 1) != 0:  # PR_SET_CHILD_SUBREAPER
         fail(3, "cannot become the subreaper that outlives the jail's processes")
+    # A stop before the guards are held and covered by the finally below
+    # would leave one behind; it is held back until then.
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, STOPS)
     stubs = Stubs(repo.stubs)
     try:
+        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
         bwrap_args, fds = jail(profile, repo, cwd, entry.pw_dir, tmp, args.login)
         if args.slug:
             detach(args, cwd, sessions, entry.pw_name, here, tmp)
