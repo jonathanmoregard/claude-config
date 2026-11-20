@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # PASS: every reviewer prompt in the close-out review carries "Do not report:"
-# with both exclusions.md entries. No reviewer at all is INCONCLUSIVE: both
+# with the exclusions.md entry. No reviewer at all is INCONCLUSIVE: both
 # arms instruct a dispatch, so zero is a flow fault, not evidence. Python runs
 # isolated (-I): HOME here is the run's.
 source "$(dirname "$0")/../_lib/checks.sh" "$1"
