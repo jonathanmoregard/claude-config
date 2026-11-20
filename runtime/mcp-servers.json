@@ -105,5 +105,14 @@
     "command": "ha-mcp",
     "args": [],
     "env": {}
+  },
+  "jobs_broker": {
+    "type": "stdio",
+    "command": "/run/current-system/sw/bin/python3",
+    "args": [
+      "/home/jonathan/.claude/mcps/jobs-broker/server.py"
+    ],
+    "env": {},
+    "timeout": 600000
   }
 }
