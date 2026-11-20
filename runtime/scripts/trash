@@ -23,14 +23,13 @@ from dataclasses import dataclass
 from typing import NoReturn
 from urllib.parse import quote
 
+# A whole .claude, even an empty one: `confined` guards an absent one with an
+# empty directory, and moving that aside would let its jail create the real one.
 PROTECTED_NAMES = {
     ".mcp.json", ".gitconfig", ".gitmodules", ".bashrc", ".bash_profile", ".zshrc",
-    ".zprofile", ".profile", ".ripgreprc", ".vscode", ".idea", ".git",
+    ".zprofile", ".profile", ".ripgreprc", ".vscode", ".idea", ".git", ".claude",
 }
-PROTECTED_IN_CLAUDE = {
-    "settings.json", "settings.local.json", "hooks", "skills", "agents", "commands",
-    "workflows", "routines", "output-styles", "launch.json", "scheduled_tasks.json", "loop.md",
-}
+GUARD_MARK = "user.confined-stub"
 DIR_FLAGS = os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 RENAME_NOREPLACE = 1
 
@@ -48,10 +47,14 @@ def fail(code: int, message: str) -> NoReturn:
     sys.exit(code)
 
 
-def protected(parent: str, name: str, is_link: bool) -> bool:
-    # A symlinked .claude would carry the protected entries under it away unseen.
-    return (name in PROTECTED_NAMES or (parent == ".claude" and name in PROTECTED_IN_CLAUDE)
-            or (name == ".claude" and is_link))
+def guard(path: str) -> bool:
+    try:
+        os.getxattr(path, GUARD_MARK, follow_symlinks=False)
+    except OSError as e:
+        if e.errno in (errno.ENODATA, errno.ENOTSUP):
+            return False
+        raise
+    return True
 
 
 def denied_paths(home: str) -> list[str]:
@@ -95,16 +98,13 @@ def subdir(fd: int, name: str) -> int:
     return os.open(name, os.O_PATH | DIR_FLAGS, dir_fd=fd)
 
 
-def walk_finds_protected(fd: int, top: str) -> str | None:
+def walk_finds_protected(fd: int) -> str | None:
     def raise_it(error: OSError) -> None:
         raise error
 
     for dirpath, dirnames, filenames, dirfd in os.fwalk(".", dir_fd=fd, onerror=raise_it):
-        parent = os.path.basename(dirpath) if dirpath != "." else top
         for name in dirnames + filenames:
-            is_link = name == ".claude" and stat.S_ISLNK(
-                os.stat(name, dir_fd=dirfd, follow_symlinks=False).st_mode)
-            if protected(parent, name, is_link):
+            if name in PROTECTED_NAMES or guard(f"/proc/self/fd/{dirfd}/{name}"):
                 return os.path.normpath(os.path.join(dirpath, name))
     return None
 
@@ -127,9 +127,11 @@ def check(path: str, home: str, denied: list[str], trash_dev: int) -> Target:
         fail(1, f"no such file: {target}")
     except OSError as e:
         fail(1, f"{target}: {e.strerror}")
-    parts = target.split("/")
-    if any(protected(parts[i - 1], parts[i], i == len(parts) - 1 and stat.S_ISLNK(st.st_mode))
-           for i in range(1, len(parts))):
+    try:
+        guarded = guard(f"/proc/self/fd/{parent_fd}/{name}")
+    except OSError as e:
+        fail(1, f"{target}: {e.strerror}")
+    if guarded or PROTECTED_NAMES.intersection(target.split("/")):
         fail(1, f"{target} is protected by the sandbox")
     for d in denied:
         if target == d or target.startswith(f"{d}/"):
@@ -144,7 +146,7 @@ def check(path: str, home: str, denied: list[str], trash_dev: int) -> Target:
             opened = os.fstat(fd)
             if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
                 fail(1, f"{target} changed while it was being checked")
-            hit = walk_finds_protected(fd, name)
+            hit = walk_finds_protected(fd)
         except OSError:
             fail(1, f"cannot inspect all of {target}")
         if hit:
@@ -208,7 +210,7 @@ def recheck(unique: str, files_fd: int, target: Target) -> str | None:
             opened = os.fstat(fd)
             if (opened.st_dev, opened.st_ino) != target.identity:
                 return "changed while it was being moved"
-            hit = walk_finds_protected(fd, target.name)
+            hit = walk_finds_protected(fd)
         finally:
             os.close(fd)
     except OSError:
