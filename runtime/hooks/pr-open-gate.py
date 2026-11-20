@@ -371,7 +371,7 @@ def on_pretool(payload: dict) -> None:
         log_exemption(payload, {**smoke_log, **where})
     if binary:
         log_exemption(payload, {"kind": "binary-not-read", "why": g.BINARY_NOTE,
-                                "files": binary[:g.MAX_PROMPT_PATHS], **where})
+                                "files": binary, **where})
     stale = g.prune(g.state_dir() / "grants", g.GRANT_TTL_S, now)
     if stale:
         print(f"pr-open-gate: could not remove {stale} expired grant file(s); "

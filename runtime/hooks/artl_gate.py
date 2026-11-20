@@ -1190,8 +1190,9 @@ def _shown(paths: list[str]) -> str:
 
 
 def binary_listing(binary: list[str]) -> str:
+    """Names every file: what no advisor read must all be in view (not _shown)."""
     return (f"{len(binary)} file(s) not required to be read by an advisor "
-            f"({BINARY_NOTE}: {_shown(binary)})")
+            f"({BINARY_NOTE}: {', '.join(binary)})")
 
 
 def evidence_problem(records: list[dict], info: dict, branch: str, tip: str,

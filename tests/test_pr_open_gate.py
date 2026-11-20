@@ -587,6 +587,23 @@ def test_wide_text_or_any_behaviour_file_still_needs_its_read(sb, rel, data):
     assert "Listed, not refused" not in reason(out)
 
 
+def test_every_binary_is_named_and_logged(sb):
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    names = [f"build/part{i:03}.bin" for i in range(201)]
+    for i, rel in enumerate(names):
+        p = sb.work / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(FIRMWARE + bytes([i % 256]))
+    git(sb.work, "add", "-A")
+    git(sb.work, "commit", "-qm", "build")
+    sb.review("PASS", reads=["scripts/run.sh"])
+    out = sb.gate()
+    assert not is_deny(out)
+    assert "201 file(s)" in out["systemMessage"]
+    assert all(rel in out["systemMessage"] for rel in names)
+    assert sb.exemptions()[-1]["files"] == names
+
+
 def test_binary_probing_does_not_scale_git_calls_with_binary_count(sb, tmp_path):
     # Break: a git process (or three) per binary per reviewed tree; 800
     # rebuilt binaries measured 10.3 s against the hook's 10 s timeout.
