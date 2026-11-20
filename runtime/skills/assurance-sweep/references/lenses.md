@@ -86,7 +86,9 @@ treat the whole as core. Report every site, with per-file counts where
 there are many, in these categories:
 1. A value whose set is closed carried as a string, integer or boolean. It
    should be a sum type whose labels say what each value means — not 0..4,
-   not 'a' | 'b' codes — matched exhaustively.
+   not 'a' | 'b' codes — matched exhaustively. Order is no reason to keep
+   numbers: an ordered set is an ordered list of its labels. A range type
+   (category 2) is for quantities, not for a handful of named steps.
 2. A bounded number carried as a plain number. It should be a range type
    only a parser can build.
 3. An identifier carried as a plain string. Each kind gets its own id type,
