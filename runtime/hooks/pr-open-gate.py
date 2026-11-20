@@ -41,8 +41,9 @@ EVENTS (one script, dispatched on hook_event_name):
          PASS_WITH_FIXES and not from a suspect prompt, every changed text
          file's latest review (by an advisor that READ it) passed and has
          drifted at most 20 lines since, and the whole tree at most 20 text
-         lines. A file binary on both sides by git's NUL-byte rule needs no
-         Read and adds no drift; it is listed in the output and logged; OR
+         lines. A file outside every behaviour path, binary on every side that
+         has it (a NUL in its first 8000 bytes, and not UTF-16/32 text), needs
+         no Read and adds no drift; it is listed in the output and logged; OR
       4. the user waived it in this session with `skip-artl` (consumed by this
          one PR open, logged; see UserPromptSubmit).
     Fail -> permissionDecision "deny" with every reason. Pass -> no decision

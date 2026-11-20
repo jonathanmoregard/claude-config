@@ -547,12 +547,44 @@ def test_text_drift_beside_a_rebuilt_binary_still_denies(sb):
     assert is_deny(out) and "drift" in reason(out).lower()
 
 
-def test_a_reviewed_text_file_turned_binary_is_still_drift(sb):
-    sb.commit("scripts/run.sh", SCRIPT_BODY)
+@pytest.mark.parametrize("rel", ["scripts/run.sh",   # added by the branch, behaviour path
+                                 "src/app.py"])      # text at the merge base
+def test_a_reviewed_text_file_turned_binary_is_still_drift(sb, rel):
+    sb.commit(rel, SCRIPT_BODY)
     sb.review("PASS")
-    commit_bytes(sb, "scripts/run.sh", b"\0" + (SCRIPT_BODY * 3).encode())
+    commit_bytes(sb, rel, FIRMWARE)
     out = sb.gate()
     assert is_deny(out) and "drift" in reason(out).lower()
+    assert "Listed, not refused" not in reason(out)       # not spared as binary
+    # A fresh PASS at the binary tip clears the whole-tree drift; the file's
+    # own check must still find its last Read stale.
+    sb.review("PASS", reads=[], agent="a2")
+    out = sb.gate()
+    assert is_deny(out) and f"since an advisor read them: {rel}" in reason(out)
+
+
+# Break: a NUL byte alone deciding "binary" -- UTF-16/32 text, or any content
+# under a path the harness executes or reads as instructions, escaping its Read.
+WIDE_TEXT = "".join(f"Write-Host step {i}\r\n" for i in range(30))
+
+
+@pytest.mark.parametrize("rel, data", [
+    ("hooks/x.ps1", WIDE_TEXT.encode("utf-16-le")),
+    ("src/notes.txt", WIDE_TEXT.encode("utf-16-le")),         # no BOM
+    ("src/notes.txt", WIDE_TEXT.encode("utf-16-be")),
+    ("src/notes.txt", WIDE_TEXT.encode("utf-16")),            # BOM
+    ("src/notes.txt", WIDE_TEXT.encode("utf-32")),
+    ("runtime/skills/x/SKILL.md", b"---\nname: x\n---\n\0" + SCRIPT_BODY.encode()),
+    ("scripts/x.sh", b"echo a\n\0echo b\n"),
+    ("bin/tool", FIRMWARE),                                   # a binary the harness runs
+], ids=["utf16le-hook", "utf16le", "utf16be", "utf16-bom", "utf32-bom", "skill-nul",
+        "script-nul", "bin-elf"])
+def test_wide_text_or_any_behaviour_file_still_needs_its_read(sb, rel, data):
+    commit_bytes(sb, rel, data)
+    sb.review("PASS", reads=[])
+    out = sb.gate()
+    assert is_deny(out) and f"no advisor has read: {rel}" in reason(out)
+    assert "Listed, not refused" not in reason(out)
 
 
 def test_reading_a_tracked_symlink_covers_the_link_and_its_target(tmp_path):

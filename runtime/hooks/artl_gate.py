@@ -71,6 +71,7 @@ is not stopped.
 """
 from __future__ import annotations
 
+import codecs
 import fcntl
 import hashlib
 import json
@@ -251,28 +252,56 @@ GIT_BINARY_PROBE = 8000   # git's own window (xdiff-interface.c, FIRST_FEW_BYTES
 BINARY_NOTE = "binary, not reviewable by reading"
 
 
+_AS_SPACE = str.maketrans("\t\n\r\f\v", "     ")
+
+
+def wide_text(head: bytes) -> bool:
+    """HEAD is UTF-16 or UTF-32 text: it opens with a BOM, or it decodes as one
+    of them into printable characters and whitespace only (ASCII in UTF-16 is
+    the alternating-NUL pattern; a real binary decodes to U+0000 or controls)."""
+    if head.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE, codecs.BOM_UTF32_BE)):
+        return True
+    for encoding in ("utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"):
+        try:
+            text = codecs.getincrementaldecoder(encoding)().decode(head, final=False)
+        except UnicodeDecodeError:
+            continue
+        if text and text.translate(_AS_SPACE).isprintable():
+            return True
+    return False
+
+
+def binary_head(head: bytes) -> bool:
+    """git's default content rule (a NUL in the first 8000 bytes), minus text
+    in a wide encoding, which has NULs and is still read as instructions."""
+    head = head[:GIT_BINARY_PROBE]
+    return b"\0" in head and not wide_text(head)
+
+
 def blob_kind(top: str, rev: str, path: str) -> Literal["binary", "text", "absent"]:
-    """PATH at REV by git's default content rule: a NUL in the first 8000
-    bytes. Attributes are not consulted -- `.git/info/attributes` and
-    core.attributesFile can mark any text binary from outside the diff a
-    reviewer sees. A git failure reads as text, which still needs a Read."""
+    """PATH at REV by content (binary_head). Attributes are not consulted --
+    `.git/info/attributes` and core.attributesFile can mark any text binary
+    from outside the diff a reviewer sees. A git failure reads as text, which
+    still needs a Read."""
     try:
         proc = subprocess.run(["git", "-C", str(top), "cat-file", "blob", f"{rev}:{path}"],
                               capture_output=True, timeout=GIT_TIMEOUT_S)
     except (OSError, subprocess.SubprocessError):
         return "text"
     if proc.returncode == 0:
-        return "binary" if b"\0" in proc.stdout[:GIT_BINARY_PROBE] else "text"
+        return "binary" if binary_head(proc.stdout) else "text"
     return "absent" if git(top, "ls-tree", "--name-only", rev, "--", path) == "" else "text"
 
 
 def binary_paths(top: str, a: str, b: str, rows: list[tuple[str, int | None]]) -> set[str]:
     """Paths git diffs as binary (numstat `-`) whose content is binary at every
-    side that has them. A file that is text on one side is not binary: making
-    a reviewed file binary must not take its changes out of the review."""
+    side that has them, outside every behaviour path. A file that is text on
+    one side is not binary: making a reviewed file binary must not take its
+    changes out of the review. Under a behaviour path (is_behaviour) even a
+    real binary is something the harness runs or reads, so it needs its Read."""
     out = set()
     for path, lines in rows:
-        if lines is not None:
+        if lines is not None or is_behaviour(path):
             continue
         kinds = {blob_kind(top, rev, path) for rev in (a, b)} - {"absent"}
         if kinds == {"binary"}:
