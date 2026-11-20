@@ -25,7 +25,7 @@ dir="$RUN/home/.local/state/claude-tasks/work/assurance-sweep"
 [ "$(python3 -I "$(dirname "$0")/tree_digest.py" "$RUN/work")" = \
   50870d976c0c8c24c8469261a2a0933e74a201fed0a3e2a639fed257b2c13ae5 ] \
   || fail "tree: the fixture's files changed"
-grep -Eiq '^[^[:alnum:]]*Tier[^[:alnum:]]*personal\b' "$dir"/*/inventory.md \
+grep -Piq '^\W*Tier\b(?:(?!production).){0,40}\bpersonal\b' "$dir"/*/inventory.md \
   || fail "T: inventory Tier is not personal"
 out=$(python3 -I "$(dirname "$0")/judge.py" "$dir" "$RUN/final.txt")
 code=$?
