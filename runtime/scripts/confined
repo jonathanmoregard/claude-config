@@ -157,8 +157,15 @@ def literal_root(pattern: str) -> str:
 
 
 def read_pointer(path: Path, prefix: str = "") -> str | None:
+    # Never through a link: the caller could aim one at a file the jail hides.
     try:
-        with open(path, encoding="utf-8") as f:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        with open(fd, encoding="utf-8") as f:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
             text = f.read(4096).strip()
     except (OSError, UnicodeDecodeError):
         return None
@@ -259,13 +266,13 @@ def repository(cwd: str, profile: Profile, sessions: list[str]) -> Repo:
 
     def check(path: str, what: str) -> None:
         if not (any(under(path, r) for r in profile.roots) or under(path, "/tmp")):
-            fail(64, f"{what} {path} is under no allowWrite root of the sandbox profile, nor /tmp")
+            fail(64, f"{what} is under no allowWrite root of the sandbox profile, nor /tmp")
         if any(under(r, path) for r in [*profile.roots, "/tmp"]):
-            fail(64, f"{what} {path} is, or holds, a whole write root; work in a repository below it")
+            fail(64, f"{what} is, or holds, a whole write root; work in a repository below it")
         if any(under(path, d) for d in profile.deny_write):
-            fail(64, f"{what} {path} is under a denyWrite path of the sandbox profile")
+            fail(64, f"{what} is under a denyWrite path of the sandbox profile")
 
-    check(top, "the repository")
+    check(top, f"the repository {top}")
     if any(under(cwd, d) for d in profile.deny_write):
         fail(64, f"{cwd} is under a denyWrite path of the sandbox profile")
     dot = Path(top, ".git")
@@ -323,9 +330,10 @@ def repository(cwd: str, profile: Profile, sessions: list[str]) -> Repo:
     outside = list(dict.fromkeys(outside))
     for d in outside:
         if under(d, top):
-            fail(64, f"the git pointer in {top} names {d}, inside the repository; its hooks "
-                     "and config could not be protected")
-        check(d, "the git dir")
+            fail(64, f"a git pointer in {top} names a directory inside the repository; its "
+                     "hooks and config could not be protected")
+        # What a pointer names is not printed: it is the caller's text.
+        check(d, f"the git dir a pointer in {top} names")
     for path in [os.path.join(top, ".claude"), os.path.join(top, ".git"), *frozen]:
         if os.path.islink(path):
             fail(64, f"{path} is a symlink; a jail could repoint it, so refusing to run here")

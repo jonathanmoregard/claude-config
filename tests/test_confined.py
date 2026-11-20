@@ -457,6 +457,23 @@ def test_refuses_a_working_directory_it_cannot_confine_to_one_repo(world, case: 
     assert not marker.exists()
 
 
+@pytest.mark.parametrize("layout", ["own_git_dir", "pointed_git_dir"])
+@needs_pasta
+def test_a_git_pointer_linked_to_a_hidden_file_tells_nothing_of_it(world, layout: str) -> None:
+    secret = world["plants"]["cred"]
+    assert CANARY in secret.read_text()
+    cwd = world["rw"] / "linked"
+    gitdir = cwd / ".git" if layout == "own_git_dir" else world["rw"] / "elsewhere"
+    cwd.mkdir(exist_ok=True)
+    gitdir.mkdir(exist_ok=True)
+    (gitdir / "HEAD").write_text("ref: refs/heads/main\n")
+    (gitdir / "commondir").symlink_to(secret)
+    if layout == "pointed_git_dir":
+        (cwd / ".git").write_text(f"gitdir: {gitdir}\n")
+    proc = run(world["script"], "--", "true", cwd=cwd)
+    assert CANARY not in proc.stdout + proc.stderr
+
+
 @pytest.mark.parametrize("plant", ["commondir", "gitfile", "worktree_entry", "bare_layout"])
 @needs_pasta
 def test_a_planted_git_pointer_makes_no_other_repository_writable(world, plant: str) -> None:
