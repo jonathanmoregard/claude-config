@@ -470,9 +470,10 @@ def test_reviewed_files_never_include_the_checkout_root(sb):
 
 # --- gate: binary files --------------------------------------------------------
 # Break (2026-11-20, firmware PR refused): requiring an advisor Read of build
-# outputs it cannot review; or an exemption wider than git's NUL-byte rule (an
-# extension list, a `binary` attribute, "not UTF-8"), or binary churn counted
-# into, or text churn hidden out of, the 20-line drift budget.
+# outputs it cannot review; or an exemption wider than the declared rule (an
+# extension alone, git's binary class alone, a `binary` attribute on a text
+# file, "not UTF-8"), or binary churn counted into, or text churn hidden out
+# of, the 20-line drift budget.
 
 FIRMWARE = b"\x7fELF\x02\x01\x01\x00" + bytes(range(256)) * 40
 
@@ -563,7 +564,7 @@ def test_a_reviewed_text_file_turned_binary_is_still_drift(sb, rel):
     assert is_deny(out) and f"since an advisor read them: {rel}" in reason(out)
 
 
-# Break: a NUL byte alone deciding "binary" -- UTF-16/32 text, or any content
+# Break: content alone deciding "binary" -- UTF-16/32 text, or any content
 # under a path the harness executes or reads as instructions, escaping its Read.
 WIDE_TEXT = "".join(f"Write-Host step {i}\r\n" for i in range(30))
 
@@ -645,14 +646,161 @@ def test_binary_probing_does_not_scale_git_calls_with_binary_count(sb, tmp_path)
     assert len(calls.read_text().splitlines()) < 60
 
 
-def test_blob_heads_streams_past_large_blobs(sb):
-    # Break: the rest of a blob left in the pipe, so the next header is misread.
-    big, small = FIRMWARE * 20 + b"tail", b"\0small"          # big spans many reads
-    commit_bytes(sb, "build/big.bin", big)
-    commit_bytes(sb, "build/small.bin", small)
-    oids = [git(sb.work, "rev-parse", f"HEAD:build/{n}") for n in ("big.bin", "small.bin")]
-    heads = artl_gate.blob_heads(str(sb.work), oids)
-    assert heads == {oids[0]: big[:artl_gate.GIT_BINARY_PROBE], oids[1]: small}
+# --- r2 close-out: the binary rule is declared, not a content heuristic -------
+# A file is spared its Read only when (a) its extension is in
+# BINARY_EXTENSIONS, (b) git diffs it as binary on every side where it exists,
+# and (c) it is outside every behaviour path. Each case below sits outside the
+# behaviour paths unless it tests (c), so is_behaviour cannot be what denies it.
+# Break: a content heuristic that classes real text as binary (one NUL in
+# UTF-8 code, BOM-less UTF-16 text, a root install.sh) -- r2 findings 1-3 --
+# or dropping any one of the three clauses (finding 4).
+
+UTF8_CODE_WITH_NUL = ("".join(f"const v{i} = {i};\n" for i in range(30))
+                      + "// sentinel \0 kept from a fixture\n").encode()
+INSTALL_SH_WITH_NUL = ("#!/bin/sh\nset -eu\n"
+                       + "".join(f"install -m 0755 build/tool{i} \"$PREFIX/bin/tool{i}\"\n"
+                                 for i in range(45))
+                       + "# \0\n").encode()
+
+
+@pytest.mark.parametrize("rel, data", [
+    ("src/app.js", UTF8_CODE_WITH_NUL),                          # r2 finding 1
+    ("src/n.txt", ("a b\r\n" * 30).encode("utf-16-le")),         # r2 finding 2, ASCII space
+    ("src/n.txt", ("a\u00a0b\r\n" * 30).encode("utf-16-le")),    # r2 finding 2, NBSP
+    ("src/n.txt", ("a\u200bb\r\n" * 30).encode("utf-16-le")),    # ZWSP
+    ("install.sh", INSTALL_SH_WITH_NUL),                         # r2 finding 3
+    ("src/firmware.dat", FIRMWARE),                              # (a): a real binary, unlisted extension
+], ids=["utf8-code-one-nul", "utf16le-no-bom", "utf16le-nbsp", "utf16le-zwsp", "root-install-sh", "unlisted-extension"])
+def test_a_file_whose_extension_is_not_declared_binary_needs_its_read(sb, rel, data):
+    assert not artl_gate.is_behaviour(rel)
+    commit_bytes(sb, rel, data)
+    assert dict(artl_gate.numstat(str(sb.work), "origin/main", "HEAD"))[rel] is None
+    sb.review("PASS", reads=[])
+    out = sb.gate()
+    assert is_deny(out) and f"no advisor has read: {rel}" in reason(out)
+    assert "Listed, not refused" not in reason(out)
+
+
+def test_a_declared_extension_git_diffs_as_text_needs_its_read(sb):
+    # (b), the pair: a `.png` that is text on both sides is text.
+    commit_bytes(sb, "assets/logo.png", SCRIPT_BODY.encode())
+    sb.review("PASS", reads=[])
+    out = sb.gate()
+    assert is_deny(out) and "no advisor has read: assets/logo.png" in reason(out)
+
+
+def test_a_declared_extension_that_is_text_on_one_side_needs_its_read(sb):
+    # (b), per side: text at the merge base, binary at the tip. The pair diffs
+    # as binary; the base side does not.
+    git(sb.work, "switch", "-q", "main")
+    sb.commit("assets/logo.png", SCRIPT_BODY)
+    git(sb.work, "push", "-q", "origin", "main")
+    git(sb.work, "switch", "-q", "feat/x")
+    git(sb.work, "merge", "-q", "--ff-only", "main")
+    commit_bytes(sb, "assets/logo.png", FIRMWARE)
+    assert dict(artl_gate.numstat(str(sb.work), "origin/main", "HEAD"))["assets/logo.png"] is None
+    sb.review("PASS", reads=[])
+    out = sb.gate()
+    assert is_deny(out) and "no advisor has read: assets/logo.png" in reason(out)
+    assert "Listed, not refused" not in reason(out)
+
+
+def test_a_declared_binary_under_a_behaviour_path_needs_its_read(sb):
+    # (c): an image the harness runs (bin/) or ships as a skill asset.
+    commit_bytes(sb, "bin/flash.elf", FIRMWARE)
+    sb.review("PASS", reads=[])
+    out = sb.gate()
+    assert is_deny(out) and "no advisor has read: bin/flash.elf" in reason(out)
+    assert "Listed, not refused" not in reason(out)
+
+
+@pytest.mark.parametrize("rel", ["build/backoff.elf", "assets/IMG_0001.JPG",
+                                 "fonts/body.woff2", "dist/site.tar.gz", "docs/spec.pdf"])
+def test_a_declared_binary_outside_behaviour_paths_is_spared(sb, rel):
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    commit_bytes(sb, rel, FIRMWARE)
+    sb.review("PASS", reads=["scripts/run.sh"])
+    out = sb.gate()
+    assert not is_deny(out) and rel in out["systemMessage"]
+
+
+def test_the_binary_rule_reads_no_blob_contents(sb, tmp_path):
+    # Rule 2: numstat and the diff decide; the gate pipes no blob through
+    # itself (a large image cost pipe time, and a timeout dropped them all).
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    commit_bytes(sb, "build/candle.bin", FIRMWARE)
+    sb.review("PASS", reads=["scripts/run.sh"])
+    shim, calls = tmp_path / "shim", tmp_path / "git-calls"
+    shim.mkdir()
+    real = subprocess.run(["sh", "-c", "command -v git"], capture_output=True,
+                          text=True, check=True).stdout.strip()
+    (shim / "git").write_text(f'#!/bin/sh\necho "$*" >> "{calls}"\nexec "{real}" "$@"\n')
+    (shim / "git").chmod(0o755)
+    path = os.environ["PATH"]
+    sb.env = lambda: {**Sandbox.env(sb), "PATH": f"{shim}:{path}"}
+    out = sb.gate()
+    assert not is_deny(out) and "build/candle.bin" in out["systemMessage"]
+    assert not [c for c in calls.read_text().splitlines() if "cat-file --batch" in c]
+
+
+# Break (r2 finding 6): a refusal that fires before the binaries are known,
+# so it neither lists nor logs them.
+
+def test_the_smoke_refusal_lists_and_logs_the_binaries(nx):
+    nixos_commit(nx, "home/foo-service.nix", None)
+    commit_bytes(nx, "build/candle.bin", FIRMWARE)
+    nx.review("PASS", reads=["home/foo-service.nix"])
+    out = nx.gate()
+    assert is_deny(out) and "nixos-agent-testing" in reason(out)
+    assert "Listed, not refused" in reason(out) and "build/candle.bin" in reason(out)
+    logged = [e for e in nx.exemptions() if e["kind"] == "binary-not-read"]
+    assert logged and logged[-1]["files"] == ["build/candle.bin"]
+    assert logged[-1]["outcome"] == "refused"
+
+
+def test_the_pending_commit_refusal_lists_and_logs_the_binaries(sb):
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    commit_bytes(sb, "build/candle.bin", FIRMWARE)
+    sb.review("PASS", reads=["scripts/run.sh"])
+    out = sb.gate("echo x >> scripts/run.sh && git commit -qam fix && gh pr create --fill")
+    assert is_deny(out) and "cannot be judged in advance" in reason(out)
+    assert "Listed, not refused" in reason(out) and "build/candle.bin" in reason(out)
+    logged = [e for e in sb.exemptions() if e["kind"] == "binary-not-read"]
+    assert logged and logged[-1]["files"] == ["build/candle.bin"]
+    assert logged[-1]["outcome"] == "refused"
+
+
+# Break (r2 finding 5): one `git cat-file` per changed path per revision in
+# quotable_lines -- up to 300 calls of up to 5 s each inside artl-evidence's
+# 30 s hook timeout.
+
+def test_quotable_lines_does_not_scale_git_calls_with_file_count(sb, tmp_path, monkeypatch):
+    for i in range(40):
+        write(sb.work / "src" / f"m{i}.py", f"value_{i} = {i}\n")
+    write(sb.work / "src" / "app.py", "x = 2\n")
+    git(sb.work, "add", "-A")
+    git(sb.work, "commit", "-qm", "many")
+    tree = git(sb.work, "rev-parse", "HEAD^{tree}")
+    shim, calls = tmp_path / "shim", tmp_path / "git-calls"
+    shim.mkdir()
+    real = subprocess.run(["sh", "-c", "command -v git"], capture_output=True,
+                          text=True, check=True).stdout.strip()
+    (shim / "git").write_text(f'#!/bin/sh\necho "$*" >> "{calls}"\nexec "{real}" "$@"\n')
+    (shim / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim}:{os.environ['PATH']}")
+    quoted = artl_gate.quotable_lines(str(sb.work), tree)
+    assert {"value_0 = 0", "value_39 = 39", "x = 2", "x = 1"} <= quoted   # tip and base
+    assert len(calls.read_text().splitlines()) < 12
+
+
+def test_quotable_lines_keeps_the_byte_budget(sb, monkeypatch):
+    monkeypatch.setattr(artl_gate, "MAX_QUOTE_BYTES", 100)
+    write(sb.work / "src" / "a.py", "first_file = 1\n" * 10)          # 150 bytes: spends it
+    write(sb.work / "src" / "b.py", "second_file = 2\n")
+    git(sb.work, "add", "-A")
+    git(sb.work, "commit", "-qm", "two")
+    quoted = artl_gate.quotable_lines(str(sb.work), git(sb.work, "rev-parse", "HEAD^{tree}"))
+    assert "first_file = 1" in quoted and "second_file = 2" not in quoted
 
 
 def test_reading_a_tracked_symlink_covers_the_link_and_its_target(tmp_path):

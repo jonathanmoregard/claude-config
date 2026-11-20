@@ -71,7 +71,6 @@ is not stopped.
 """
 from __future__ import annotations
 
-import codecs
 import fcntl
 import hashlib
 import json
@@ -248,110 +247,73 @@ def line_total(rows: list[tuple[str, int | None]], binary_cost: int) -> int:
     return sum(binary_cost if n is None else n for _, n in rows)
 
 
-GIT_BINARY_PROBE = 8000   # git's own window (xdiff-interface.c, FIRST_FEW_BYTES)
 BINARY_NOTE = "binary, not reviewable by reading"
 
-
-_AS_SPACE = str.maketrans("\t\n\r\f\v", "     ")
-
-
-def wide_text(head: bytes) -> bool:
-    """HEAD is UTF-16 or UTF-32 text: it opens with a BOM, or it decodes as one
-    of them into printable characters and whitespace only (ASCII in UTF-16 is
-    the alternating-NUL pattern; a real binary decodes to U+0000 or controls)."""
-    if head.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE, codecs.BOM_UTF32_BE)):
-        return True
-    for encoding in ("utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"):
-        try:
-            text = codecs.getincrementaldecoder(encoding)().decode(head, final=False)
-        except UnicodeDecodeError:
-            continue
-        if text and text.translate(_AS_SPACE).isprintable():
-            return True
-    return False
+# The binary formats a PR may carry that no advisor can review by reading. The
+# rule (binary_paths) is declared, not inferred from content: three review
+# rounds found real text a content heuristic classed as binary (one NUL in
+# UTF-8 code, BOM-less UTF-16 with an NBSP, a root install.sh). Matched on the
+# last suffix, case-insensitively (`site.tar.gz` -> gz, `IMG.JPG` -> jpg).
+BINARY_EXTENSIONS = frozenset({
+    "png", "jpg", "jpeg", "gif", "webp", "ico", "bmp",                # images
+    "bin", "elf", "ota", "hex", "o", "a", "so", "dylib",              # firmware, build outputs
+    "zip", "gz", "tgz", "xz", "zst", "bz2", "7z", "tar",              # archives
+    "ttf", "otf", "woff", "woff2",                                    # fonts
+    "pdf",
+})
 
 
-def binary_head(head: bytes) -> bool:
-    """git's default content rule (a NUL in the first 8000 bytes), minus text
-    in a wide encoding, which has NULs and is still read as instructions."""
-    head = head[:GIT_BINARY_PROBE]
-    return b"\0" in head and not wide_text(head)
+def declared_binary(path: str) -> bool:
+    name = path.rsplit("/", 1)[-1]
+    return "." in name.lstrip(".") and name.rsplit(".", 1)[1].lower() in BINARY_EXTENSIONS
 
 
-def blob_heads(top: str, oids: list[str]) -> dict[str, bytes] | None:
-    """{oid: its first GIT_BINARY_PROBE bytes} for every blob, from ONE
-    `git cat-file --batch` read as a stream, so a large blob costs pipe time,
-    not memory. None when git fails, names a non-blob, or outlives
-    GIT_TIMEOUT_S."""
-    if not oids:
-        return {}
-    heads: dict[str, bytes] = {}
-    with tempfile.TemporaryFile() as request:
-        request.write("".join(f"{oid}\n" for oid in oids).encode())
-        request.seek(0)
-        try:
-            proc = subprocess.Popen(["git", "-C", str(top), "cat-file", "--batch"],
-                                    stdin=request, stdout=subprocess.PIPE,
-                                    stderr=subprocess.DEVNULL)
-        except OSError:
-            return None
-        timer = threading.Timer(GIT_TIMEOUT_S, proc.kill)
-        timer.start()
-        try:
-            for oid in oids:
-                header = proc.stdout.readline().split()
-                if len(header) != 3 or header[0] != oid.encode() or header[1] != b"blob":
-                    return None
-                left, head = int(header[2]), b""
-                while left:
-                    chunk = proc.stdout.read(min(left, 1 << 16))
-                    if not chunk:
-                        return None
-                    head += chunk[:max(0, GIT_BINARY_PROBE - len(head))]
-                    left -= len(chunk)
-                if proc.stdout.read(1) != b"\n":
-                    return None
-                heads[oid] = head
-        except (OSError, ValueError):
-            return None
-        finally:
-            timer.cancel()
-            proc.kill()
-            proc.stdout.close()
-            proc.wait()
-    return heads
+def side_classes(top: str, rev: str, paths: set[str]) -> dict[str, bool] | None:
+    """{path: git diffs it as binary} for each of PATHS that exists at REV (an
+    absent path has no entry): numstat from the empty tree, so git's own rule
+    -- content and attributes -- classes that one side. None if git fails."""
+    empty = git(top, "hash-object", "-t", "tree", "/dev/null")
+    if not empty:
+        return None
+    out = git(top, "diff", "--numstat", "-z", "--no-renames", empty, rev, "--",
+              *sorted(paths), env={"GIT_LITERAL_PATHSPECS": "1"})
+    if out is None:
+        return None
+    classes: dict[str, bool] = {}
+    for entry in out.split("\0"):
+        parts = entry.split("\t", 2)
+        if len(parts) == 3 and parts[2] in paths:
+            classes[parts[2]] = "-" in parts[:2]
+    return classes
 
 
 def binary_paths(top: str, a: str, b: str, rows: list[tuple[str, int | None]],
                  within: set[str] | None = None) -> set[str]:
-    """Paths git diffs as binary (numstat `-`) whose content is binary
-    (binary_head) at every side that has them, outside every behaviour path.
-    Attributes are not consulted -- `.git/info/attributes` and
-    core.attributesFile can mark any text binary from outside the diff a
-    reviewer sees. A file that is text on one side is not binary: making a
-    reviewed file binary must not take its changes out of the review. Under a
-    behaviour path (is_behaviour) even a real binary is something the harness
-    runs or reads, so it needs its Read. Only paths in `within` (default: all)
-    are probed, in two git calls whatever their number; a git failure spares
-    nothing."""
+    """The paths of the A..B diff (ROWS, its numstat) that need no Read.
+    Exactly those that meet all three:
+      (a) the extension is in BINARY_EXTENSIONS;
+      (b) git diffs the file as binary (numstat `-`) on every side, A and B,
+          where it exists -- a file that is text on one side is not binary,
+          since making a reviewed file binary must not take its changes out of
+          the review;
+      (c) it is outside every behaviour path (is_behaviour): there even a real
+          binary is something the harness runs or reads.
+    No blob is read: the numstat of the pair, then one per side. Known limit,
+    accepted: (b) is git's rule, so attributes and config outside the diff
+    (`.git/info/attributes`, core.attributesFile, diff.<driver>.binary) can
+    mark text binary -- a text file renamed to `.png` and marked binary there
+    is spared. Only paths in `within` (default: all) are classed; a git
+    failure spares nothing."""
     wanted = {p for p, n in rows
-              if n is None and not is_behaviour(p) and (within is None or p in within)}
+              if n is None and declared_binary(p) and not is_behaviour(p)
+              and (within is None or p in within)}
     if not wanted:
         return set()
-    raw = git(top, "diff", "--raw", "-z", "--no-renames", "--no-abbrev", a, b)
-    if raw is None:
+    sides = [side_classes(top, rev, wanted) for rev in (a, b)]
+    if None in sides:
         return set()
-    sides: dict[str, list[str]] = {}
-    fields = raw.split("\0")
-    for meta, path in zip(fields[0::2], fields[1::2]):
-        parts = meta.lstrip(":").split()
-        if path not in wanted or len(parts) != 5 or "160000" in parts[:2]:
-            continue
-        sides[path] = [oid for mode, oid in zip(parts[:2], parts[2:4]) if mode != "000000"]
-    heads = blob_heads(top, sorted({oid for oids in sides.values() for oid in oids}))
-    if heads is None:
-        return set()
-    return {p for p, oids in sides.items() if oids and all(binary_head(heads[o]) for o in oids)}
+    return {p for p in wanted
+            if any(p in s for s in sides) and all(s.get(p, True) for s in sides)}
 
 
 def snapshot_tree(top: str, untracked: bool = True) -> str | None:
@@ -992,23 +954,72 @@ def suspect_prompt(prompt: str, quoted: set[str] | None = None) -> bool:
     return False
 
 
+def blob_texts(top: str, oids: list[str], budget: int) -> list[str]:
+    """The contents of OIDS in order, from ONE `git cat-file --batch`, while
+    fewer than BUDGET bytes have been read (the blob that crosses it is kept
+    whole). On a git failure, a non-blob or GIT_TIMEOUT_S for the whole batch
+    it stops with what it has: fewer quotable lines only make suspect_prompt
+    stricter."""
+    texts: list[str] = []
+    if not oids or budget <= 0:
+        return texts
+    with tempfile.TemporaryFile() as request:    # a file, not a pipe: no write/read deadlock
+        request.write("".join(f"{oid}\n" for oid in oids).encode())
+        request.seek(0)
+        try:
+            proc = subprocess.Popen(["git", "-C", str(top), "cat-file", "--batch"],
+                                    stdin=request, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL)
+        except OSError:
+            return texts
+        timer = threading.Timer(GIT_TIMEOUT_S, proc.kill)
+        timer.start()
+        try:
+            for oid in oids:
+                if budget <= 0:
+                    break
+                header = proc.stdout.readline().split()
+                if len(header) != 3 or header[0] != oid.encode() or header[1] != b"blob":
+                    break
+                size = int(header[2])
+                data = proc.stdout.read(size)
+                if len(data) != size or proc.stdout.read(1) != b"\n":
+                    break
+                budget -= size
+                texts.append(data.decode("utf-8", "replace"))
+        except (OSError, ValueError):
+            pass
+        finally:
+            timer.cancel()
+            proc.kill()
+            proc.stdout.close()
+            proc.wait()
+    return texts
+
+
 def quotable_lines(top: str, tree: str) -> set[str]:
     """Stripped lines of every file the branch changes, at `tree` and at the
-    (local, untrusted) base: what an honest prompt may quote verbatim."""
+    (local, untrusted) base: what an honest prompt may quote verbatim. Three
+    git calls whatever the number of files (merge-base, diff --raw, one
+    cat-file --batch), so it fits artl-evidence's hook timeout."""
     base = local_base_ref(top)
     mb = git(top, "merge-base", base, "HEAD") if base else None
     if not mb:
         return set()
-    rows = numstat(top, mb, tree) or []
+    fields = (git(top, "diff", "--raw", "-z", "--no-renames", "--no-abbrev", mb, tree)
+              or "").split("\0")
+    oids: list[str] = []
+    for meta in fields[0::2][:MAX_QUOTE_FILES]:
+        parts = meta.lstrip(":").split()
+        if len(parts) != 5:
+            continue
+        old_mode, new_mode, old_oid, new_oid = parts[:4]
+        for mode, oid in ((new_mode, new_oid), (old_mode, old_oid)):   # tree, then base
+            if mode not in ("000000", "160000"):                       # absent; a gitlink
+                oids.append(oid)
     out: set[str] = set()
-    budget = MAX_QUOTE_BYTES
-    for path, _ in rows[:MAX_QUOTE_FILES]:
-        for rev in (tree, mb):
-            text = git(top, "cat-file", "blob", f"{rev}:{path}")
-            if not text or budget <= 0:
-                continue
-            budget -= len(text)
-            out.update(s for s in (l.strip() for l in text.splitlines()) if s)
+    for text in blob_texts(top, oids, MAX_QUOTE_BYTES):
+        out.update(s for s in (l.strip() for l in text.splitlines()) if s)
     return out
 
 
@@ -1158,10 +1169,11 @@ def computed_exemption(changes: list[tuple[str, int | None]]) -> str | None:
 def tree_rows(top: str, tree: object, tip: str, cache: dict,
               pr_paths: set[str]) -> dict[str, int] | None:
     """{path: text lines changed} from a reviewed tree to the tip; None if
-    unknown. A binary-to-binary change on a PR path is 0 lines: no review read
-    it, so it cannot have gone stale. Any other change git will not count is
-    over the limit; off the PR's paths nothing reads the count, so nothing is
-    probed there. One `cache` per pr_paths."""
+    unknown. A change on a PR path that binary_paths spares (declared binary,
+    binary on both trees, no behaviour path) is 0 lines: no review read it, so
+    it cannot have gone stale. Any other change git will not count is over the
+    limit; off the PR's paths nothing reads the count, so nothing is classed
+    there. One `cache` per pr_paths."""
     if not isinstance(tree, str) or not SHA_RE.fullmatch(tree):
         return None
     if tree not in cache:

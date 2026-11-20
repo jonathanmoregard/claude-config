@@ -38,12 +38,17 @@ EVENTS (one script, dispatched on hook_event_name):
       2. the diff since the merge base is computed-exempt (inert docs only, or
          at most 15 changed lines with nothing in a behaviour path) -- logged; OR
       3. the latest advisor verdict recorded for the branch is PASS or
-         PASS_WITH_FIXES and not from a suspect prompt, every changed text
+         PASS_WITH_FIXES and not from a suspect prompt, every other changed
          file's latest review (by an advisor that READ it) passed and has
-         drifted at most 20 lines since, and the whole tree at most 20 text
-         lines. A file outside every behaviour path, binary on every side that
-         has it (a NUL in its first 8000 bytes, and not UTF-16/32 text), needs
-         no Read and adds no drift; it is listed in the output and logged; OR
+         drifted at most 20 lines since, and the whole tree at most 20 lines.
+         "Other": a file needs no Read and adds no drift exactly when its
+         extension is in the declared BINARY_EXTENSIONS (images, firmware and
+         build outputs, archives, fonts, pdf), git diffs it as binary on every
+         side that has it, and it is outside every behaviour path; no content
+         heuristic is applied (artl_gate.binary_paths). Such files are named in
+         every refusal and in the pass note, and logged. Known, accepted limit:
+         a text file renamed to `.png` and marked binary in
+         `.git/info/attributes` is spared; OR
       4. the user waived it in this session with `skip-artl` (consumed by this
          one PR open, logged; see UserPromptSubmit).
     Fail -> permissionDecision "deny" with every reason. Pass -> no decision
@@ -338,18 +343,28 @@ def on_pretool(payload: dict) -> None:
              with_remedy=False)
         return
 
+    # From here on the gate has a diff, so every refusal and the pass list the
+    # binaries it spared and log them. The rule needs only numstat (no blob is
+    # read), so the tip's set is computed before anything can refuse.
+    where = {"repo": info["repo"], "top": top, "branch": branch, "head": tip}
+    views = [(tip, changes, g.binary_paths(top, mb, tip, changes))]
+    binary = sorted(views[0][2])
+
+    def deny_listed(reasons: list[str], with_remedy: bool) -> None:
+        log_binary(payload, binary, "refused", where)
+        deny(reasons, with_remedy, binary)
+
     smoke, smoke_log = g.smoke_problem(top, mb, tip, changes)
     if smoke:
-        deny([smoke], with_remedy=False)
+        deny_listed([smoke], with_remedy=False)
         return
 
-    where = {"repo": info["repo"], "top": top, "branch": branch, "head": tip}
     pending, problem = pending_commit_view(call, info, branch, mb)
     if problem:
-        deny([problem], with_remedy=False)
+        deny_listed([problem], with_remedy=False)
         return
-    views = [(view_tip, view_changes, g.binary_paths(top, mb, view_tip, view_changes))
-             for view_tip, view_changes in [(tip, changes)] + pending]
+    views += [(view_tip, view_changes, g.binary_paths(top, mb, view_tip, view_changes))
+              for view_tip, view_changes in pending]
     binary = sorted(set().union(*(view_binary for _, _, view_binary in views)))
     exempt = None
     for _, view_changes, _ in views:
@@ -370,8 +385,7 @@ def on_pretool(payload: dict) -> None:
                 break
         if problem:
             if not take_override(session, now):
-                log_binary(payload, binary, "refused", where)
-                deny([problem], with_remedy=True, binary=binary)
+                deny_listed([problem], with_remedy=True)
                 return
             log_exemption(payload, {"kind": "user-override", "why": problem, **where})
 
