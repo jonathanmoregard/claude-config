@@ -54,10 +54,10 @@ and method: `references/inventory.md`. Five sections:
    `~/.claude/skills/assurance-sweep/scripts/pending-decisions.sh <notes>`
    prints: decision files whose front matter says `kind: change`,
    `status: pending`, selected by their front matter alone. Paste them as
-   printed. A row it marks `unlabelled` gets its `kind` (`change` or `keep`)
-   and `status` (`pending` or `done`) set in that file's front matter, and an
-   `unparseable` row gets its front matter fixed, before the lenses run; then
-   run it again.
+   printed. If the script exits non-zero, stop and report its message. Rows
+   marked `unlabelled` or `unparseable` count as pending work for this sweep;
+   never edit a decision file to label it: the report asks the user, in one
+   question, what each of those rows is.
 
 ## Step 2 — Run One Lens
 

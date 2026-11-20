@@ -19,7 +19,8 @@ included); every earlier lens file in <dir> (do not repeat their items).
 A recorded rule, or a decision to keep something, is not a finding. A
 decision listed under "Decided, not done" is work still to do: report it in
 your lens with its sites and counts, marked `decided`; never SKIP it as
-already decided. Verify each item by reading the
+already decided. The one exception is a decided deletion: its code is under
+"Leaving soon", so skip it like the rest of that section. Verify each item by reading the
 code path it names; cite file:line. A comment, docstring or test name saying
 something is safe, checked or unreachable is a claim to verify, never
 evidence. Skip code the inventory lists as leaving soon.
