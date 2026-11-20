@@ -458,9 +458,10 @@ class RealUnitTests(unittest.TestCase):
                 self.server.tool_start({"repo": str(repo), "slug": self.slug, "max_runtime_sec": 60,
                                         "argv": ["sh", "-c", 'echo ESCAPED > "$1"', "sh", str(canary)]},
                                        self.home)
+            except RuntimeError as refused:
+                self.assertIn("characters", str(refused))
+            else:
                 self.status()
-            except RuntimeError:
-                pass
             self.assertFalse(canary.exists(), "the job wrote into the real home")
         finally:
             canary.unlink(missing_ok=True)

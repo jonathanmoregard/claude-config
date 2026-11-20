@@ -181,10 +181,8 @@ def _git_binds(repo: Path, home: Path) -> tuple:
             writable.append(_confined(common, home))
     else:
         raise RuntimeError(f"{dotgit} is neither a directory nor a gitdir file")
-    try:
+    if not os.path.lexists(common / "hooks"):
         os.mkdir(common / "hooks", 0o755)
-    except FileExistsError:
-        pass
     readonly += [_confined(common / "hooks", home), _confined(common / "config", home, stat.S_ISREG)]
     worktrees = common / "worktrees"
     if os.path.lexists(worktrees):
