@@ -361,6 +361,25 @@ def test_review_that_never_named_a_changed_file_denies(sb):
     assert is_deny(out) and "scripts/run.sh" in reason(out)
 
 
+def test_binary_file_need_not_be_read_by_a_passing_review(sb):
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    (sb.work / "resources").mkdir()
+    (sb.work / "resources" / "model.bin").write_bytes(b"\0\1\2weights" * 100)
+    git(sb.work, "add", "-A")
+    git(sb.work, "commit", "-qm", "model")
+    sb.review("PASS", reads=["scripts/run.sh"])
+    assert sb.gate() is None
+
+
+def test_binary_file_still_needs_a_passing_review_on_the_branch(sb):
+    (sb.work / "resources").mkdir()
+    (sb.work / "resources" / "model.bin").write_bytes(b"\0\1\2weights" * 100)
+    git(sb.work, "add", "-A")
+    git(sb.work, "commit", "-qm", "model")
+    out = sb.gate()
+    assert is_deny(out) and "advice-refine-test-loop" in reason(out)
+
+
 def test_two_reviews_together_cover_the_diff(sb):
     sb.commit("scripts/run.sh", SCRIPT_BODY)
     sb.commit("scripts/two.sh", SCRIPT_BODY)
