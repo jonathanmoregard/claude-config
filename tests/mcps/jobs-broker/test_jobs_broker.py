@@ -234,7 +234,8 @@ class SrtPolicyTests(Home):
         fs = self.with_deny("Read(//srv/secret)", "Read(~/.aws/**)", "Read(.env)",
                             "Read(/private/x)", "Read(**/*.pem)")["filesystem"]
         for path in ("/srv/secret", f"{self.home}/.aws/**", f"{self.repo}/.env",
-                     f"{self.home}/.claude/private/x", f"{self.repo}/**/*.pem"):
+                     f"{self.home}/.claude/private/x", f"{self.repo}/private/x",
+                     f"{self.repo}/**/*.pem"):
             with self.subTest(path=path):
                 self.assertIn(path, fs["denyRead"])
         self.assertNotIn("/srv/secret", fs["denyWrite"])
@@ -305,14 +306,23 @@ class SrtPolicyTests(Home):
             self.job()
 
     def test_untranslatable_settings_refuse_to_start(self) -> None:
-        cases = {"bare Read": ["Read"], "empty Edit": ["Edit()"], "escape": ["Read(a\\*b)"],
-                 "not a string": [{"Read": "x"}], "bare Edit": ["Edit"]}
-        for name, deny in cases.items():
+        cases = {"bare Read": (["Read"], "names no path"), "empty Edit": (["Edit()"], "names no path"),
+                 "escape": (["Read(a\\*b)"], "escape"), "not a string": ([{"Read": "x"}], "not a string"),
+                 "bare Edit": (["Edit"], "names no path"), "not a list": ("Read(x)", "not a list")}
+        for name, (deny, message) in cases.items():
             self.write_settings({"sandbox": SANDBOX, **deny_rules(deny)})
-            with self.subTest(name), self.assertRaises(RuntimeError):
+            with self.subTest(name), self.assertRaisesRegex(RuntimeError, message):
                 self.job()
-        self.write_settings({"sandbox": SANDBOX, **deny_rules("Read(x)")})
-        with self.assertRaises(RuntimeError):
+
+    def test_deny_lists_that_are_not_lists_of_strings_refuse_to_start(self) -> None:
+        for key, value in (("denyRead", "/etc"), ("denyWrite", [1])):
+            sandbox = {**SANDBOX, "filesystem": {**SANDBOX.get("filesystem", {}), key: value}}
+            self.write_settings({"sandbox": sandbox})
+            with self.subTest(key), self.assertRaisesRegex(RuntimeError, key):
+                self.job()
+        sandbox = {**SANDBOX, "network": {**SANDBOX.get("network", {}), "deniedDomains": "evil.test"}}
+        self.write_settings({"sandbox": sandbox})
+        with self.assertRaisesRegex(RuntimeError, "deniedDomains"):
             self.job()
 
     def test_unreadable_managed_settings_refuse_to_start(self) -> None:

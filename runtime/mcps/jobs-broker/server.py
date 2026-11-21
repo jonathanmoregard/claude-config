@@ -244,11 +244,27 @@ def _merge_source(path: Path, settings: dict, repo: Path, home: Path, base: bool
     if not base and (set(sandbox) - {"filesystem", "network"} or set(fs) - {"denyRead", "denyWrite"}
                      or set(net) - {"deniedDomains"}):
         raise RuntimeError(f"{path}: only deny entries of a sandbox block are understood here")
-    into.deny_read.extend(fs.get("denyRead", []))
-    into.deny_write.extend(fs.get("denyWrite", []))
-    into.denied_domains.extend(net.get("deniedDomains", []))
-    _merge_deny_rules(path, (settings.get("permissions") or {}).get("deny", []), path.parent,
-                      repo, home, into)
+    into.deny_read.extend(_strings(path, fs, "denyRead"))
+    into.deny_write.extend(_strings(path, fs, "denyWrite"))
+    into.denied_domains.extend(_strings(path, net, "deniedDomains"))
+    _merge_both_readings(path, (settings.get("permissions") or {}).get("deny", []), path.parent,
+                         repo, home, into)
+
+
+def _strings(path: Path, block: dict, key: str) -> list:
+    entries = block.get(key, [])
+    if not isinstance(entries, list) or not all(isinstance(e, str) for e in entries):
+        raise RuntimeError(f"{path}: {key} is not a list of strings")
+    return entries
+
+
+def _merge_both_readings(path: Path, deny: object, settings_dir: Path, repo: Path, home: Path,
+                         into: SessionPolicy) -> None:
+    _merge_deny_rules(path, deny, settings_dir, repo, home, into)
+    # Read as relative to the project root as well as to the settings file: the
+    # two readings Claude Code has documented for a single leading slash.
+    _merge_deny_rules(path, [r for r in deny if isinstance(r, str)
+                             and re.fullmatch(r"\w+\(/[^/].*\)", r.strip())], repo, repo, home, into)
 
 
 def _merge_deny_rules(path: Path, rules: object, settings_dir: Path, repo: Path, home: Path,
@@ -283,13 +299,8 @@ def _merge_project(path: Path, settings: dict, repo: Path, home: Path, into: Ses
         if not isinstance(entries, list) or not all(isinstance(e, str) for e in entries):
             raise RuntimeError(f"{path}: sandbox.filesystem.{key} is not a list of paths")
         target.extend(e if e.startswith(("/", "~/")) else str(repo / e) for e in entries)
-    into.denied_domains.extend(net.get("deniedDomains", []))
-    deny = perms.get("deny", [])
-    _merge_deny_rules(path, deny, path.parent, repo, home, into)
-    # Read as relative to the project root as well as to the settings file: the
-    # two readings Claude Code has documented for a single leading slash.
-    _merge_deny_rules(path, [r for r in deny if isinstance(r, str)
-                             and re.fullmatch(r"\w+\(/[^/].*\)", r.strip())], repo, repo, home, into)
+    into.denied_domains.extend(_strings(path, net, "deniedDomains"))
+    _merge_both_readings(path, perms.get("deny", []), path.parent, repo, home, into)
 
 
 def session_policy(repo: Path, home: Path, project: Path, config_dir: Path) -> SessionPolicy:
