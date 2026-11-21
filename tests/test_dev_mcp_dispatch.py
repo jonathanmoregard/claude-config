@@ -160,7 +160,7 @@ def test_e2e_stub_refuses_when_no_target_is_named(run):
 
 def test_e2e_stub_refuses_when_no_run_dir_is_set(run):
     (run / "bin" / "s").write_text(ECHO)
-    refused(dispatch(**stub_env(None, run / "bin" / "s")), "E2E_RUN")
+    refused(dispatch(**stub_env(None, run / "bin" / "s")), "E2E_RUN is not set")
 
 
 @pytest.mark.parametrize("bad", ["not json", '"--flag"', "[1, 2]", '{"a": 1}'])
@@ -287,8 +287,9 @@ def test_llmux_refuses_a_subdirectory_of_the_repo(llmux):
 
 def test_llmux_refuses_without_a_repo(llmux):
     mod, _ = llmux
-    with pytest.raises(mod.Refused, match="DEV_MCP_REPO"):
+    with pytest.raises(mod.Refused) as exc:
         mod.resolve({"DEV_MCP_PROFILE": "llmux", "DEV_MCP_TOOLS": "docs"})
+    assert str(exc.value) == "DEV_MCP_REPO is not set"
 
 
 @pytest.mark.parametrize("tools", ["", "  ", "[]", "--evil", "docs --evil", '["a b"]',
@@ -313,7 +314,8 @@ def test_llmux_production_constant_is_the_real_checkout():
 
 def test_llmux_refusal_reaches_stderr_and_exit_code(tmp_path):
     other = fake_gdocs(tmp_path)
-    refused(dispatch(**llmux_env(other)), "DEV_MCP_REPO")
+    refused(dispatch(**llmux_env(other)),
+            f"DEV_MCP_REPO {other} is not /home/jonathan/Repos/gdocs-review-mcp or a worktree of it")
 
 
 # --- the scenario helper -----------------------------------------------------
@@ -362,3 +364,25 @@ def test_helper_sets_a_timeout(run, tmp_path):
     servers = write_entry(run, "a", str(run / "bin" / "a"), "--timeout", "600000",
                           served=tmp_path / "absent.py")
     assert servers["a"]["timeout"] == 600000
+
+
+def load_helper():
+    spec = importlib.util.spec_from_file_location("mcp_stub", LIB)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_helper_fails_instead_of_falling_back_when_the_policy_exists(run, tmp_path, monkeypatch):
+    mod = load_helper()
+    policy = tmp_path / "50-mcp.json"
+    policy.write_text("{}")
+    monkeypatch.setattr(mod, "POLICY", policy)
+    monkeypatch.setattr(mod, "SERVED", str(tmp_path / "absent.py"))
+    monkeypatch.setenv("E2E_RUN", str(run))
+    monkeypatch.setattr(sys, "argv", ["mcp_stub.py", "vault", str(run / "bin" / "s")])
+    with pytest.raises(SystemExit) as exc:
+        mod.main()
+    assert str(exc.value) == (f"{policy} exists but the served dispatcher {tmp_path}/absent.py "
+                              "does not; the local one would never match the allowlist")
+    assert not (run / "mcp.json").exists()

@@ -25,15 +25,18 @@ def arm_path(arg: str, home: Path) -> str:
 
 def github_entry(arm_servers: dict, home: Path, run: Path,
                  policy_file: Path = POLICY_SERVERS) -> dict | None:
-    cfg = None
+    if "github" not in arm_servers:
+        return None
     if policy_file.is_file():
         cfg = json.loads(policy_file.read_text(encoding="utf-8")).get("github")
-    if cfg is None and "github" in arm_servers:
+        if cfg is None:
+            print(f"{policy_file} has no github entry, so the allowlist would drop "
+                  "the arm's github server", file=sys.stderr)
+            sys.exit(2)
+    else:
         # Pre-policy host: the arm's own server.py and config.json, under the arm HOME.
         cfg = dict(arm_servers["github"])
         cfg["args"] = [arm_path(arg, home) for arg in cfg.get("args", [])]
-    if cfg is None:
-        return None
     cfg = dict(cfg)
     # The harness mounts the real HOME read-only, so uv's default cache is unwritable.
     cfg["env"] = {**(cfg.get("env") or {}), "HOME": LIVE_HOME,
@@ -44,10 +47,10 @@ def github_entry(arm_servers: dict, home: Path, run: Path,
 def broker_argv(cfg: dict, home: Path, mcp_stub: str) -> list[str]:
     env = {**(cfg.get("env") or {}), "HOME": LIVE_HOME}
     script, *script_args = cfg["args"]
-    argv = [sys.executable, mcp_stub, "git_broker", arm_path(script, home),
-            *(f"--env={k}={v}" for k, v in env.items())]
+    options = [f"--env={k}={v}" for k, v in env.items()]
     if "timeout" in cfg:
-        argv.append(f"--timeout={cfg['timeout']}")
+        options.append(f"--timeout={cfg['timeout']}")
+    argv = [sys.executable, mcp_stub, *options, "git_broker", arm_path(script, home)]
     if script_args:
         argv += ["--", *script_args]
     return argv

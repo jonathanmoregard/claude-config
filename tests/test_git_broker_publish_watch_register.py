@@ -4,10 +4,16 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import pathlib
+import subprocess
+
+import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "tests/agent-e2e/git-broker-publish-watch/register_mcp.py"
+
+STUB = ROOT / "tests/agent-e2e/_lib/mcp_stub.py"
 
 spec = importlib.util.spec_from_file_location("register_mcp", SCRIPT)
 reg = importlib.util.module_from_spec(spec)
@@ -30,13 +36,6 @@ def test_policy_entry_is_registered_verbatim_with_home_and_cache(tmp_path):
                            "UV_CACHE_DIR": str(tmp_path / "run/uv-cache")}}
 
 
-def test_policy_without_github_falls_back_to_the_arm_entry(tmp_path):
-    policy = tmp_path / "mcp-servers.json"
-    policy.write_text(json.dumps({"other": {}}))
-    out = reg.github_entry(ARM, tmp_path / "home", tmp_path / "run", policy)
-    assert out["args"][2] == f"{tmp_path}/home/.claude/mcps/github-mux/server.py"
-
-
 def test_no_policy_file_uses_the_arm_entry_under_the_arm_home(tmp_path):
     out = reg.github_entry(ARM, tmp_path / "home", tmp_path / "run", tmp_path / "absent")
     assert out["command"] == "uv"
@@ -52,12 +51,39 @@ def test_broker_argv_rewrites_the_script_and_passes_the_rest_after_dashes(tmp_pa
     cfg = {"args": ["/home/jonathan/.claude/mcps/git-broker/server.py", "--x", "y"],
            "env": {"K": "v"}, "timeout": 5}
     argv = reg.broker_argv(cfg, tmp_path, "stub.py")
-    assert argv[1:] == ["stub.py", "git_broker",
-                        f"{tmp_path}/.claude/mcps/git-broker/server.py",
-                        "--env=K=v", "--env=HOME=/home/jonathan", "--timeout=5",
+    assert argv[1:] == ["stub.py", "--env=K=v", "--env=HOME=/home/jonathan", "--timeout=5",
+                        "git_broker", f"{tmp_path}/.claude/mcps/git-broker/server.py",
                         "--", "--x", "y"]
 
 
 def test_broker_argv_without_extra_args_has_no_separator(tmp_path):
     cfg = {"args": ["/home/jonathan/.claude/mcps/git-broker/server.py"]}
     assert "--" not in reg.broker_argv(cfg, tmp_path, "stub.py")
+
+
+def test_arm_without_github_gets_none_even_when_the_policy_has_it(tmp_path):
+    policy = tmp_path / "mcp-servers.json"
+    policy.write_text(json.dumps(POLICY))
+    assert reg.github_entry({}, tmp_path / "home", tmp_path / "run", policy) is None
+
+
+def test_policy_lacking_github_fails_setup_when_the_arm_wants_it(tmp_path, capsys):
+    policy = tmp_path / "mcp-servers.json"
+    policy.write_text(json.dumps({"other": {}}))
+    with pytest.raises(SystemExit) as exc:
+        reg.github_entry(ARM, tmp_path / "home", tmp_path / "run", policy)
+    assert exc.value.code == 2
+    assert f"{policy} has no github entry" in capsys.readouterr().err
+
+
+def test_broker_argv_parses_with_the_stub_helper_argparse(tmp_path):
+    run = tmp_path / "run"
+    run.mkdir()
+    cfg = {"args": ["/home/jonathan/.claude/mcps/git-broker/server.py", "--x", "y"],
+           "env": {"K": "v"}, "timeout": 5}
+    argv = reg.broker_argv(cfg, tmp_path, str(STUB))
+    subprocess.run(argv, check=True, env={**os.environ, "E2E_RUN": str(run)})
+    entry = json.loads((run / "mcp.json").read_text())["mcpServers"]["git_broker"]
+    assert entry["timeout"] == 5
+    assert entry["env"]["K"] == "v"
+    assert json.loads(entry["env"]["E2E_MCP_STUB_ARGS"]) == ["--x", "y"]

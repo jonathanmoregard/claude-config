@@ -17,6 +17,7 @@ import pathlib
 
 PYTHON = "/run/current-system/sw/bin/python3"
 SERVED = "/var/lib/claude-runtime/checkout/runtime/scripts/dev-mcp/dispatch.py"
+POLICY = pathlib.Path("/etc/claude-code/managed-settings.d/50-mcp.json")
 LOCAL = pathlib.Path(__file__).resolve().parents[3] / "runtime/scripts/dev-mcp/dispatch.py"
 
 
@@ -35,6 +36,9 @@ def main() -> None:
     env.update(DEV_MCP_PROFILE="e2e-stub", E2E_RUN=str(run), E2E_MCP_STUB=opts.stub)
     if opts.args:
         env["E2E_MCP_STUB_ARGS"] = json.dumps(opts.args)
+    if not served.is_file() and POLICY.is_file():
+        raise SystemExit(f"{POLICY} exists but the served dispatcher {served} does not; "
+                         "the local one would never match the allowlist")
     entry = {"type": "stdio", "command": PYTHON,
              "args": [str(served if served.is_file() else LOCAL)], "env": env}
     if opts.timeout is not None:
