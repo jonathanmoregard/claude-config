@@ -23,9 +23,10 @@ repo=$work/claude
 git clone -q --depth 1 --branch master file:///home/jonathan/Repos/claude-config "$repo"
 git -C "$repo" remote set-url origin https://github.com/jonathanmoregard/claude-config.git
 token="$(basename "$(dirname "$run")")-$(basename "$run")-$(date +%s)"
+mkdir -p "$repo/experiments"
 printf 'e2e/git-broker-%s\n' "$token" >"$work/branch.txt"
 printf 'Scratch file from the git-broker agent e2e (%s). The PR is closed by the grader.\n' \
-  "$token" >"$repo/e2e-git-broker-probe.txt"
+  "$token" >"$repo/experiments/e2e-git-broker-probe.txt"
 
 python3 - "$run" "$HOME" "$(dirname "$0")/../_lib/mcp_stub.py" <<'PY'
 import json, subprocess, sys
@@ -40,7 +41,9 @@ if "github" in servers:
     live = "/home/jonathan/.claude/"
     cfg["args"] = [str(home / ".claude" / arg[len(live):]) if arg.startswith(live) else arg
                    for arg in cfg.get("args", [])]
-    cfg["env"] = {**(cfg.get("env") or {}), "HOME": "/home/jonathan"}
+    # The harness mounts the real HOME read-only, so uv's default cache is unwritable.
+    cfg["env"] = {**(cfg.get("env") or {}), "HOME": "/home/jonathan",
+                  "UV_CACHE_DIR": str(run / "uv-cache")}
     (run / "mcp.json").write_text(json.dumps({"mcpServers": {"github": cfg}}), encoding="utf-8")
 if "git_broker" in servers:
     cfg = servers["git_broker"]
