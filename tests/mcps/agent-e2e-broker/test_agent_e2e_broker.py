@@ -375,6 +375,40 @@ class UnitBindTests(Fixture):
             shutil.rmtree(other, ignore_errors=True)
             shutil.rmtree(needed, ignore_errors=True)
 
+    def test_read_only_path_swapped_for_a_symlink_after_the_check_is_not_bound(self) -> None:
+        require_sandbox(self)
+        import uuid
+        needed = self.home / "Repos" / f".agent-e2e-broker-needed-{uuid.uuid4().hex[:8]}"
+        secret = Path(tempfile.mkdtemp(prefix="agent-e2e-broker-test-secret-",
+                                       dir=self.home / ".local/state"))
+        try:
+            needed.mkdir()
+            (needed / "f").write_text("NEEDED-REPO-READ\n")
+            (secret / "f").write_text("SECRET-CANARY\n")
+            self.raw["readOnlyPaths"] = [str(needed)]
+            git(self.repo, "switch", "-qc", "feat/reads-swapped")
+            (self.repo / "tests/agent-e2e/demo/setup.sh").write_text(
+                f"#!/usr/bin/env bash\ncat {needed}/f; exit 0\n")
+            git(self.repo, "commit", "-qam", "reads swapped")
+            git(self.repo, "push", "-q", "origin", "feat/reads-swapped")
+            git(self.repo, "switch", "-q", "master")
+            launch = self.server._run_argv
+
+            def swap_then_launch(*a, **kw):
+                needed.rename(needed.with_name(needed.name + "-moved"))
+                needed.symlink_to(secret)
+                return launch(*a, **kw)
+
+            self.server._run_argv = swap_then_launch
+            text = self.server._tool_run(self.req(new_ref="origin/feat/reads-swapped"))
+            logs = [p.read_text() for p in self.out.glob("*/out/runs/demo/new/1/setup.log")]
+            self.assertNotIn("SECRET-CANARY", text + "".join(logs))
+            self.assertIn("not the directory that was checked", text)
+        finally:
+            needed.unlink(missing_ok=True)
+            shutil.rmtree(needed.with_name(needed.name + "-moved"), ignore_errors=True)
+            shutil.rmtree(secret, ignore_errors=True)
+
     def test_scenario_code_reads_the_bash_guard_config_the_harness_copies(self) -> None:
         require_sandbox(self)
         config = self.home / ".config/dcg/config.toml"

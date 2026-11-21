@@ -53,7 +53,7 @@ _in_flight: dict[Any, _InFlight] = {}
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
-from broker_paths import canonical, roots  # noqa: E402
+from broker_paths import VERIFY_BINDS, canonical, roots, verify_binds_args  # noqa: E402
 CONFIG_PATH = str(HERE / "config.json")
 TAG = "[agent-e2e-broker]"
 PROTOCOL = "https"
@@ -125,7 +125,7 @@ def _load_policy(config: dict) -> dict:
     policy["mirror"] = policy["stateDir"] / "mirror.git"
     policy["lock"] = policy["stateDir"] / "lock"
     policy["campaigns"] = policy["stateDir"] / "campaigns"
-    policy["readOnlyPaths"] = [canonical(p, home)[0] for p in extra
+    policy["readOnlyPaths"] = [canonical(p, home) for p in extra
                                if not isinstance(p, str) or os.path.lexists(p)]
     policy["claudeExecutable"] = _abs(raw["claudeExecutable"], "claudeExecutable")
     return policy
@@ -371,7 +371,8 @@ def _unit_properties(policy: dict, campaign: Path, runtime: int) -> list[str]:
         f"BindPaths={out}", f"BindPaths=-{home}/.claude/.credentials.json",
         # The harness checkout borrows the mirror's objects (clone --shared).
         *(f"BindReadOnlyPaths={p}" for p in (campaign / "harness", campaign / "scenarios",
-                                             policy["mirror"], *policy["readOnlyPaths"])),
+                                             policy["mirror"],
+                                             *(p for p, _ in policy["readOnlyPaths"]))),
         *(f"BindReadOnlyPaths=-{p}" for p in (
             home / ".claude/plugins", home / ".config/caveman",
             # dcg's config.toml links through the nix store back to this one.
@@ -393,6 +394,7 @@ if fd < 0 or libc.prctl(38, 1, 0, 0, 0) or libc.syscall(446, fd, 0):
              + os.strerror(ctypes.get_errno()))
 os.execvp(sys.argv[1], sys.argv[1:])
 '''
+_VERIFY_THEN_EXEC = 'refuse() { exit 125; }\n' + VERIFY_BINDS + 'exec "$@"\n'
 
 
 # The supervisor is signalled by the kernel when the broker dies (pdeathsig);
@@ -418,6 +420,8 @@ def _supervised(argv: list[str], policy: dict, campaign: Path, runtime: int) -> 
     return [tools["setpriv"], "--pdeathsig", "TERM", "--", tools["bash"], "-c", _SUPERVISOR,
             "agent-e2e-supervisor", unit, tools["systemctl"],
             *start, "--", tools["env"], "-i", *env,
+            tools["bash"], "-c", _VERIFY_THEN_EXEC, "agent-e2e-broker",
+            *verify_binds_args(policy["readOnlyPaths"]),
             tools["python3"], "-I", "-c", _SCOPE_ABSTRACT_SOCKETS, *argv]
 
 

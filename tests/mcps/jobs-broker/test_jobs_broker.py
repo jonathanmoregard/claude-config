@@ -667,6 +667,27 @@ class RealUnitTests(unittest.TestCase):
         self.assertNotIn("CANARY-OUTSIDE-REPO", log)
         self.assertNotIn("RUNTIME-DIR-VISIBLE", log)
 
+    def test_repo_swapped_for_a_symlink_after_the_check_is_not_run_in(self) -> None:
+        from unittest import mock
+        secret = Path(tempfile.mkdtemp(prefix="jobs-broker-test-secret-", dir=self.home / ".local/state"))
+        (secret / "f").write_text("SECRET-CANARY\n")
+        real_run = subprocess.run
+
+        def swap_then_run(argv, **kw):
+            if argv[0] == "systemd-run":
+                self.repo.rename(self.dir / "repo-moved")
+                self.repo.symlink_to(secret)
+            return real_run(argv, **kw)
+
+        try:
+            with mock.patch.object(self.server.subprocess, "run", swap_then_run):
+                self.start("cat f; exit 0")
+            out = self.status() + "\n" + self.server.tool_log({"slug": self.slug}, self.home)
+            self.assertNotIn("SECRET-CANARY", out)
+            self.assertIn("MARKER_FAILED rc=125", out)
+        finally:
+            shutil.rmtree(secret)
+
     # Parity: what a sandboxed session's own Bash may not write with its cwd in a
     # repo (measured, Claude Code 2.1.330), a job there may not write either.
     def test_job_gets_the_write_denies_a_session_has_in_its_repo(self) -> None:

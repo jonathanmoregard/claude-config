@@ -27,7 +27,7 @@ from typing import NamedTuple
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
-from broker_paths import canonical  # noqa: E402
+from broker_paths import VERIFY_BINDS, canonical, verify_binds_args  # noqa: E402
 RECORDER = HERE.parents[1] / "scripts" / "record-user-unit-failure"
 SYSTEM_BIN = "/run/current-system/sw/bin"
 PYTHON = f"{SYSTEM_BIN}/python3"
@@ -81,10 +81,6 @@ HARDENING = (
 HIDDEN = ("/run/github-app", "/run/dbus", "/run/nscd", "/run/agenix", "/run/agenix.d",
           "/run/secrets")
 
-# The manager resolves BindPaths= only when the unit starts, so a directory
-# swapped for a symlink after confine_repo checked it would be bound instead.
-# The job therefore first proves each bound path is the inode that was checked.
-#
 # Under PrivatePIDs this shell is PID 1 and cannot die of SIGTERM, so a stop
 # (systemctl stop, logout, TimeoutStartSec) exits 143, which the unit counts as
 # a clean stop (SuccessExitStatus=143); the job's own 143 is reported as 1.
@@ -94,17 +90,10 @@ HIDDEN = ("/run/github-app", "/run/dbus", "/run/nscd", "/run/agenix", "/run/agen
 WRAPPER = r'''
 stopping=
 trap stopping=1 TERM
-if ! mkdir -p -m 0700 -- "$1"; then echo "MARKER_FAILED rc=125"; exit 125; fi
+refuse() { echo "MARKER_FAILED rc=125"; exit 125; }
+if ! mkdir -p -m 0700 -- "$1"; then refuse; fi
 shift
-while [ "$1" != -- ]; do
-  if [ "$(stat -c %d:%i -- "$1")" != "$2" ]; then
-    echo "jobs-broker: $1 is not the directory that was checked; job not run"
-    echo "MARKER_FAILED rc=125"
-    exit 125
-  fi
-  shift 2
-done
-shift
+''' + VERIFY_BINDS + r'''
 "$@"
 rc=$?
 if [ -n "$stopping" ]; then echo "MARKER_FAILED stopped rc=$rc"; exit 143; fi
@@ -405,9 +394,9 @@ def start_argv(job: Job, home: Path) -> list:
     for prop in properties(job, home):
         cmd += ["-p", prop]
     return [*cmd, "--", f"{SYSTEM_BIN}/env", "-i", *env, f"{SYSTEM_BIN}/bash", "-c", WRAPPER,
-            "jobs-broker", SRT_TMPDIR, str(job.repo), job.ident,
-            *(a for p, i in job.readonly for a in (str(p), i)),
-            "--", SRT, "-s", str(policy_path(home, job.unit)), "--", *job.argv]
+            "jobs-broker", SRT_TMPDIR,
+            *verify_binds_args([(job.repo, job.ident), *job.readonly]),
+            SRT, "-s", str(policy_path(home, job.unit)), "--", *job.argv]
 
 
 def _env(home: Path) -> dict:

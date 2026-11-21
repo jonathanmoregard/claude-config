@@ -57,3 +57,24 @@ def canonical(raw: object, home: Path, kind: str = "dir", git_ok: bool = False) 
             is_git_dir(p) for p in (real, *real.parents) if root in p.parents)):
         raise RuntimeError(f"{path} is inside a git directory")
     return real, f"{st.st_dev}:{st.st_ino}"
+
+
+# The manager resolves Bind*Paths= only when a unit starts, so a directory
+# swapped for a symlink after canonical() checked it would be bound instead.
+# A unit's first process therefore proves each bound path is the inode that was
+# checked, from inside its own mount namespace, before anything else runs.
+# Arguments: PATH DEV:INO ... -- REST; the caller defines `refuse`.
+VERIFY_BINDS = r'''
+while [ "$1" != -- ]; do
+  if [ "$(stat -c %d:%i -- "$1")" != "$2" ]; then
+    echo "$1 is not the directory that was checked; not run"
+    refuse
+  fi
+  shift 2
+done
+shift
+'''
+
+
+def verify_binds_args(pairs) -> list:
+    return [*(a for p, ident in pairs for a in (str(p), ident)), "--"]
