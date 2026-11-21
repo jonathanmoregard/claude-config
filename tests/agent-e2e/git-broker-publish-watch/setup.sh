@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Workspace: a shallow clone of ~/.claude whose origin is the real GitHub repo,
 # plus one new file to publish. The arm's own git_broker and github MCP servers,
-# exactly as its mcp-servers.json registers them, are the agent's only MCP
-# servers (the control arm registers neither, so it gets none). Bash runs in
+# whichever its mcp-servers.json registers, are the agent's only MCP servers
+# (the control arm registers neither, so it gets none). Bash runs in
 # Claude's sandbox with the GitHub App host token unreadable (issue #165,
 # decision 2026-10-19), so publishing and waiting must go through the broker.
 #
@@ -27,28 +27,30 @@ printf 'e2e/git-broker-%s\n' "$token" >"$work/branch.txt"
 printf 'Scratch file from the git-broker agent e2e (%s). The PR is closed by the grader.\n' \
   "$token" >"$repo/e2e-git-broker-probe.txt"
 
-python3 - "$run" "$HOME" <<'PY'
-import json, sys
+python3 - "$run" "$HOME" "$(dirname "$0")/../_lib/mcp_stub.py" <<'PY'
+import json, subprocess, sys
 from pathlib import Path
 
-run, home = Path(sys.argv[1]), Path(sys.argv[2])
+run, home, mcp_stub = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
 servers = json.loads((home / ".claude" / "mcp-servers.json").read_text(encoding="utf-8"))
-chosen = {}
-for name in ("git_broker", "github"):
-    if name not in servers:
-        continue
-    cfg = dict(servers[name])
-    if name == "git_broker":
-        cfg["args"] = [str(home / ".claude" / "mcps" / "git-broker" / "server.py")]
-    else:
-        # github-mux: run the arm's own server.py and config.json.
-        live = "/home/jonathan/.claude/"
-        cfg["args"] = [str(home / ".claude" / arg[len(live):]) if arg.startswith(live) else arg
-                       for arg in cfg.get("args", [])]
+if "github" in servers:
+    # github-mux is a uv script, not a stdlib one the dispatcher can run:
+    # registered as-is, with the arm's own server.py and config.json.
+    cfg = dict(servers["github"])
+    live = "/home/jonathan/.claude/"
+    cfg["args"] = [str(home / ".claude" / arg[len(live):]) if arg.startswith(live) else arg
+                   for arg in cfg.get("args", [])]
     cfg["env"] = {**(cfg.get("env") or {}), "HOME": "/home/jonathan"}
-    chosen[name] = cfg
-if chosen:
-    (run / "mcp.json").write_text(json.dumps({"mcpServers": chosen}), encoding="utf-8")
+    (run / "mcp.json").write_text(json.dumps({"mcpServers": {"github": cfg}}), encoding="utf-8")
+if "git_broker" in servers:
+    cfg = servers["git_broker"]
+    env = {**(cfg.get("env") or {}), "HOME": "/home/jonathan"}
+    argv = [sys.executable, mcp_stub, "git_broker",
+            str(home / ".claude" / "mcps" / "git-broker" / "server.py"),
+            *(f"--env={k}={v}" for k, v in env.items())]
+    if "timeout" in cfg:
+        argv.append(f"--timeout={cfg['timeout']}")
+    subprocess.run(argv, check=True)
 
 settings_path = home / ".claude" / "settings.json"
 settings = json.loads(settings_path.read_text(encoding="utf-8"))

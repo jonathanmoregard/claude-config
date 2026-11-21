@@ -20,10 +20,5 @@ config_path = run / "runner" / "config.json"
 config = json.loads(config_path.read_text(encoding="utf-8"))
 config["appRunner"]["stateRoot"] = str(run / "state")
 config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
-mcp = {"mcpServers": {"klaffat-app-runner": {
-    "type": "stdio",
-    "command": "/run/current-system/sw/bin/python3",
-    "args": [str(run / "runner" / "server.py")],
-}}}
-(run / "mcp.json").write_text(json.dumps(mcp), encoding="utf-8")
 PY
+python3 "$(dirname "$0")/../_lib/mcp_stub.py" klaffat-app-runner "$run/runner/server.py"
