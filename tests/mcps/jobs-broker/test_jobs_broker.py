@@ -515,6 +515,18 @@ class OwnUnitTests(Home):
         self.assertEqual([argv[0] for argv in self.calls if argv[0] != "show"],
                          ["stop", "reset-failed"])
 
+    def test_a_queued_unit_is_not_settled_before_its_command_ran(self) -> None:
+        # systemd-run --no-block: the unit exists, inactive/dead, Result=success,
+        # before ExecStart has run.
+        queued = {"LoadState": "loaded", "ActiveState": "inactive", "SubState": "dead",
+                  "Result": "success", "ExecMainStatus": "0", "ExecMainStartTimestamp": "",
+                  "ExecMainExitTimestamp": ""}
+        self.assertFalse(self.server._settled(queued))
+        stopped = {**queued, "ExecMainStartTimestamp": "x", "ExecMainExitTimestamp": "y"}
+        self.assertTrue(self.server._settled(stopped))
+        self.assertTrue(self.server._settled({**queued, "ActiveState": "failed"}))
+        self.assertTrue(self.server._settled({**queued, "ActiveState": "active", "SubState": "exited"}))
+
     def test_raw_unit_names_refused(self) -> None:
         for args in ({"slug": "pull", "unit": "claude-pull"}, {"unit": "claude-pull"},
                      {"slug": "claude-pull.service"}):

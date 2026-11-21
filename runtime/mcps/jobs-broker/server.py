@@ -433,8 +433,11 @@ def _show(unit: str) -> dict:
 
 
 def _settled(snap: dict) -> bool:
-    return snap.get("ActiveState") in ("failed", "inactive") or (
-        snap.get("ActiveState") == "active" and snap.get("SubState") == "exited")
+    # A unit queued by systemd-run --no-block is inactive/dead with
+    # Result=success before ExecStart runs; only an exit timestamp ends it.
+    state = snap.get("ActiveState")
+    return state == "failed" or (state == "inactive" and bool(snap.get("ExecMainExitTimestamp"))) \
+        or (state == "active" and snap.get("SubState") == "exited")
 
 
 def tool_start(args: object, home: Path, project: Path, config_dir: Path | None = None) -> str:

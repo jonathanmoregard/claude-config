@@ -42,9 +42,9 @@ JOBS = {
               "user unit that outlives this session. argv runs in repo under the session's own "
               "sandbox, network allowlist and the write protections a session has in repo "
               "included, with writes limited to repo; the rest of home and secrets are hidden, and "
-              "it is killed after max_runtime_sec. Profile nix also lets it write the nix cache "
-              "and uses the ram-heavy slice. Read the outcome later with status (wait_sec blocks "
-              "until it settles) and log.",
+              "it is killed after max_runtime_sec. Caches (nix, cargo, uv, npm, pip) "
+              "are the jobs' own, never the host's. Profile nix uses the ram-heavy slice. "
+              "Read the outcome later with status (wait_sec blocks until it settles) and log.",
               obj({"repo": S, "argv": {"type": "array", "items": S}, "slug": SLUG,
                    "max_runtime_sec": I, "profile": {"type": "string", "enum": ["repo", "nix"]}},
                   ["repo", "argv", "slug"])),
