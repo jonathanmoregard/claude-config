@@ -83,6 +83,33 @@ def require_sandbox(case: unittest.TestCase) -> None:
         case.skipTest(why)
 
 
+_UNITS_OK = None
+
+
+def require_units(case: unittest.TestCase) -> None:
+    """Skip `case` unless the user manager can start a unit with private mounts.
+
+    Campaign units bind and hide paths, which needs a mount namespace; a CI
+    runner's user manager can lack one and fails such units with 226/NAMESPACE.
+    """
+    global _UNITS_OK
+    if _UNITS_OK is None:
+        home = pwd.getpwuid(os.getuid()).pw_dir
+        try:
+            p = subprocess.run(["systemd-run", "--user", "--wait", "--collect", "--quiet",
+                                "-p", f"BindReadOnlyPaths={home}",
+                                "-p", "InaccessiblePaths=-/nonexistent", "true"],
+                               capture_output=True, text=True, timeout=60)
+            _UNITS_OK = (p.returncode == 0,
+                         "the user manager cannot start a unit with private mounts here: "
+                         + (p.stderr.strip().splitlines() or [f"exit {p.returncode}"])[-1])
+        except (OSError, subprocess.SubprocessError) as exc:
+            _UNITS_OK = (False, f"systemd-run probe failed: {exc!r}")
+    ok, why = _UNITS_OK
+    if not ok:
+        case.skipTest(why)
+
+
 class Fixture(unittest.TestCase):
     """A repo with origin/master, a pushed candidate branch, a stub claude."""
 
@@ -232,6 +259,7 @@ class RefPolicyTests(Fixture):
             self.server._resolve(self.policy, "origin/nope")
 
     def test_harness_comes_from_origin_master_not_the_working_tree(self) -> None:
+        require_units(self)
         require_sandbox(self)
         git(self.repo, "switch", "-q", "feat/x")
         (self.repo / "runtime/scripts/agent-e2e/agent_e2e.py").write_text("print('planted')\n")
@@ -244,6 +272,7 @@ class RefPolicyTests(Fixture):
 
 class RunTests(Fixture):
     def test_runs_old_vs_new_from_pushed_refs(self) -> None:
+        require_units(self)
         require_sandbox(self)
         text = self.server._tool_run(self.req())
         self.assertIn("harness exit 0", text)
@@ -318,6 +347,7 @@ class RunDirReadTests(Fixture):
         return text
 
     def test_symlinks_out_of_the_run_dir_are_not_followed(self) -> None:
+        require_units(self)
         require_sandbox(self)
         canary = Path(self.tmp.name) / "canary"
         canary.write_text("CANARY-OUTSIDE-RUN-DIR\n")
@@ -334,12 +364,14 @@ class RunDirReadTests(Fixture):
         self.assertIn("agent-e2e campaign `demo`", text)
 
     def test_fifo_in_the_run_dir_does_not_block(self) -> None:
+        require_units(self)
         require_sandbox(self)
         ref = self.push_script("check.sh", 'rm -f "$1/final.txt"; mkfifo "$1/final.txt"\n')
         text = self.isolated_run(self.req(new_ref=ref))
         self.assertIn("harness exit 0", text)
 
     def test_scenario_code_cannot_reach_what_the_manager_writes_or_the_harness(self) -> None:
+        require_units(self)
         require_sandbox(self)
         ref = self.push_script("setup.sh", 'c="$2/../../../../.."; '
                                'for f in harness.out harness.err harness/x scenarios/x; do '
@@ -352,6 +384,7 @@ class RunDirReadTests(Fixture):
 
 class UnitBindTests(Fixture):
     def test_scenario_code_reads_only_the_repos_a_campaign_needs(self) -> None:
+        require_units(self)
         require_sandbox(self)
         import uuid
         tag = uuid.uuid4().hex[:8]
@@ -378,6 +411,7 @@ class UnitBindTests(Fixture):
             shutil.rmtree(needed, ignore_errors=True)
 
     def test_read_only_path_swapped_for_a_symlink_after_the_check_is_not_bound(self) -> None:
+        require_units(self)
         require_sandbox(self)
         import uuid
         needed = self.home / "Repos" / f".agent-e2e-broker-needed-{uuid.uuid4().hex[:8]}"
@@ -431,6 +465,7 @@ class UnitBindTests(Fixture):
         self.assertIn("DCG-CONFIG-READ", log.read_text(), text)
 
     def test_agent_bash_sandbox_can_start_inside_the_unit(self) -> None:
+        require_units(self)
         require_sandbox(self)
         bwrap = shutil.which("bwrap")
         git(self.repo, "switch", "-qc", "feat/nested-sandbox")
@@ -449,7 +484,7 @@ class UnitBindTests(Fixture):
                          ("stateDir", str(self.home / "Repos")), ("stateDir", "state"),
                          ("remoteUrl", "ext::sh -c touch% /tmp/x"),
                          ("remoteUrl", f"file://{self.origin} --upload-pack=x"),
-                         ("readOnlyPaths", [str(self.home / ".ssh")])):
+                         ("readOnlyPaths", [self.state.name])):
             with self.subTest(key=key, bad=bad), self.assertRaises(RuntimeError):
                 self.server._load_policy({"agentE2eBroker": {**self.raw, key: bad}})
 
@@ -491,6 +526,7 @@ class ReviewFindingTests(Fixture):
             self.server._tool_run(self.req())
 
     def test_unpushed_harness_commit_on_master_is_not_run(self) -> None:
+        require_units(self)
         require_sandbox(self)
         (self.repo / "runtime/scripts/agent-e2e/agent_e2e.py").write_text("print('local')\n")
         git(self.repo, "commit", "-qam", "local harness")
@@ -499,6 +535,7 @@ class ReviewFindingTests(Fixture):
         self.assertIn("harness exit 0", text)
 
     def test_harness_checkout_removed_after_run(self) -> None:
+        require_units(self)
         require_sandbox(self)
         self.server._tool_run(self.req())
         self.assertEqual(list(self.out.glob("*/harness")), [])
@@ -513,6 +550,7 @@ class ReviewFindingTests(Fixture):
         self.assertNotIn("AKIA" + "A" * 16, out)
 
     def test_pushed_scenario_code_reaches_no_token_and_writes_only_its_run(self) -> None:
+        require_units(self)
         require_sandbox(self)
         import uuid
         home = Path(pwd.getpwuid(os.getuid()).pw_dir)
@@ -548,6 +586,7 @@ class ReviewFindingTests(Fixture):
             home_canary.unlink(missing_ok=True)
 
     def test_scenario_code_cannot_reach_host_abstract_sockets(self) -> None:
+        require_units(self)
         require_sandbox(self)
         import socket
         import threading
@@ -588,6 +627,7 @@ class ReviewFindingTests(Fixture):
             listener.close()
 
     def test_broker_death_stops_harness_and_keeps_lock_until_then(self) -> None:
+        require_units(self)
         require_sandbox(self)
         import fcntl, signal, time
         root = Path(self.tmp.name)
