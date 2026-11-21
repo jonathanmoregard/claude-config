@@ -22,7 +22,7 @@ actively want to watch, not for waiting. Do not poll the output file or
 background a bare `sleep` timer. In a sandboxed session (`systemd-run` reports
 no user bus) use the `mcp__jobs_broker__*` tools instead, per
 `detached-long-commands`; their jobs run under the session's sandbox policy,
-network included, with git dirs read-only.
+network and the session's write protections in that repo included.
 
 You have no Skill tool, so the full skill listing stays out of your context.
 When a hook, the brief or a preloaded skill tells you to use another skill,

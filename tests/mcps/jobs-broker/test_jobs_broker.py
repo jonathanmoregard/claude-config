@@ -67,7 +67,7 @@ class Home(unittest.TestCase):
         (self.repo / ".git" / "config").write_text("")
         self.write_settings({"sandbox": SANDBOX})
         self.sources = [(self.home / ".claude" / "settings.json", True)]
-        self.server.settings_sources = lambda home: self.sources
+        self.server.settings_sources = lambda home, config_dir: self.sources
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -186,12 +186,6 @@ class RepoPathTests(Home):
             with self.subTest(raw=raw), self.assertRaisesRegex(RuntimeError, "work tree"):
                 self.job(repo=str(raw))
 
-    def test_symlinked_nested_dot_git_refused(self) -> None:
-        (self.repo / "vendor").mkdir()
-        (self.repo / "vendor" / ".git").symlink_to(self.repo / ".git")
-        self.refused(str(self.repo))
-
-
 class SrtPolicyTests(Home):
     def policy(self, **over) -> dict:
         return self.job(**over).policy
@@ -224,23 +218,13 @@ class SrtPolicyTests(Home):
                 self.assertFalse([s for s in session if s == cache or s in cache.parents])
                 self.assertFalse([s for s in session if cache in s.parents])
 
-    def test_project_claude_config_and_every_git_dir_are_write_denied(self) -> None:
-        nested = self.make_git_dir(self.repo / "vendor" / "inner" / ".git")
-        bare = self.make_git_dir(self.repo / "tools" / "x.git")
-        (self.repo / "sub").mkdir()
-        (self.repo / "sub" / ".git").write_text("gitdir: ../.git/modules/sub\n")
+    def test_claude_codes_own_project_config_denies_hold_in_the_repo(self) -> None:
         deny = self.policy()["filesystem"]["denyWrite"]
-        for path in (self.repo / ".claude", self.repo / ".git", nested, bare,
-                     self.repo / "sub" / ".git"):
-            with self.subTest(path=path):
-                self.assertIn(str(path), deny)
+        for rel in (".claude/settings.json", ".claude/settings.local.json", ".claude/skills",
+                    ".claude/hooks", ".claude/output-styles", ".claude/workflows"):
+            with self.subTest(rel=rel):
+                self.assertIn(str(self.repo / rel), deny)
         self.assertIn("~/Repos/main/release.key", deny)
-
-    def make_git_dir(self, path: Path) -> Path:
-        for d in ("objects", "refs", "hooks"):
-            (path / d).mkdir(parents=True, exist_ok=True)
-        (path / "HEAD").write_text("ref: refs/heads/main\n")
-        return path
 
     def with_deny(self, *rules: str, extra: dict | None = None) -> dict:
         self.write_settings({"sandbox": SANDBOX, **deny_rules(list(rules)), **(extra or {})})
@@ -270,29 +254,6 @@ class SrtPolicyTests(Home):
     def test_webfetch_domain_deny_rules_are_denied_domains(self) -> None:
         net = self.with_deny("WebFetch(domain:evil.example)", "WebFetch")["network"]
         self.assertIn("evil.example", net["deniedDomains"])
-
-    def test_deny_write_globs_become_the_paths_they_match_in_the_repo(self) -> None:
-        for d in ("a/held", "b/c/held", "b/keep"):
-            (self.repo / d).mkdir(parents=True)
-        (self.repo / "b/keep/x.lock").write_text("")
-        deny = self.with_deny("Edit(//**/held/**)", "Edit(**/*.lock)")["filesystem"]["denyWrite"]
-        for path in (self.repo / "a/held", self.repo / "b/c/held", self.repo / "b/keep/x.lock"):
-            with self.subTest(path=path):
-                self.assertIn(str(path), deny)
-        self.assertNotIn(str(self.repo / "b/keep"), deny)
-        self.assertFalse([p for p in deny if any(c in p for c in "*?[")], deny)
-
-    def test_read_deny_globs_srt_cannot_walk_are_denied_where_they_match_in_the_repo(self) -> None:
-        (self.repo / "a/held").mkdir(parents=True)
-        (self.repo / "a/keep").mkdir(parents=True)
-        deny = self.with_deny("Read(//**/held/**)", "Read(//**/.git/**)")["filesystem"]["denyRead"]
-        self.assertIn(str(self.repo / "a/held"), deny)
-        self.assertNotIn(str(self.repo / "a/keep"), deny)
-        self.assertFalse([p for p in deny if p.startswith(f"{self.repo}/.git")], deny)
-
-    def test_read_deny_globs_srt_drops_are_named_not_silently_passed(self) -> None:
-        self.write_settings({"sandbox": SANDBOX, **deny_rules(["Read(//**/.git/**)", "Read(**/*.pem)"])})
-        self.assertEqual(self.job().unenforced, ["/**/.git/**"])
 
     def test_managed_settings_denies_are_merged(self) -> None:
         managed = self.home / "managed-settings.json"
@@ -342,17 +303,6 @@ class SrtPolicyTests(Home):
         (self.repo / ".claude/settings.local.json").write_text("{not json")
         with self.assertRaisesRegex(RuntimeError, "settings.local.json"):
             self.job()
-
-    def test_deny_write_globs_match_as_gitignore_does(self) -> None:
-        (self.repo / "docs").mkdir()
-        for name in ("v1.txt", "va.txt", "Notes.md", "notes.md"):
-            (self.repo / "docs" / name).write_text("")
-        deny = self.with_deny("Edit(**/v[[:digit:]].txt)", "Edit(docs/[[:upper:]]*.md)"
-                              )["filesystem"]["denyWrite"]
-        self.assertIn(str(self.repo / "docs/v1.txt"), deny)
-        self.assertIn(str(self.repo / "docs/Notes.md"), deny)
-        self.assertNotIn(str(self.repo / "docs/va.txt"), deny)
-        self.assertNotIn(str(self.repo / "docs/notes.md"), deny)
 
     def test_untranslatable_settings_refuse_to_start(self) -> None:
         cases = {"bare Read": ["Read"], "empty Edit": ["Edit()"], "escape": ["Read(a\\*b)"],
@@ -428,11 +378,9 @@ class PropertyTests(Home):
         self.assertEqual(values(props, "TimeoutStartSec"), ["600"])
         log = self.home / ".local/state/claude-jobs/claude-job-check.log"
         self.assertEqual(values(props, "StandardOutput"), [f"append:{log}"])
-        record, sweep = values(props, "ExecStopPost")
+        [record] = values(props, "ExecStopPost")
         self.assertTrue(record.startswith("+"), record)
         self.assertTrue(record.endswith(f"record-user-unit-failure claude-job-check {log}"), record)
-        self.assertEqual(values(props, "ExecStartPost"), [sweep])
-        self.assertTrue(sweep.startswith("+") and sweep.endswith("sweep claude-job-check"), sweep)
 
     def test_every_bound_repo_path_is_identity_checked(self) -> None:
         wt = self.home / "worktrees" / "wt"
@@ -485,60 +433,6 @@ class PropertyTests(Home):
         self.assertEqual(cmd[-len(argv) - 1], "--")
         self.assertIn("--expand-environment=no", cmd)
         self.assertIn("--unit=claude-job-check", cmd)
-
-
-class SweepTests(Home):
-    def sweep(self) -> list:
-        job = self.job()
-        self.server.write_baseline(job, self.home)
-        (self.repo / "new/.claude").mkdir(parents=True)
-        (self.repo / "new/.claude/settings.json").write_text("planted\n")
-        outside = self.home / "outside"
-        (outside / ".claude").mkdir(parents=True)
-        (self.repo / "link").symlink_to(outside)
-        self.server.sweep(job.unit, self.home)
-        return [outside / ".claude", self.repo / "link"]
-
-    def test_moves_only_names_that_appeared_and_never_through_a_symlink(self) -> None:
-        kept = self.sweep()
-        self.assertFalse((self.repo / "new/.claude").exists())
-        self.assertTrue((self.repo / ".git").is_dir())
-        for path in kept:
-            self.assertTrue(path.exists(), path)
-
-    def test_names_created_where_the_job_could_not_write_are_left_in_place(self) -> None:
-        job = self.job()
-        self.server.write_baseline(job, self.home)
-        owner_made = [".claude/settings.local.json", ".envrc", ".git/modules/x/config"]
-        for rel in owner_made:
-            (self.repo / rel).parent.mkdir(parents=True, exist_ok=True)
-            (self.repo / rel).write_text("owner\n")
-        self.assertEqual(self.server.sweep(job.unit, self.home), [])
-        for rel in owner_made:
-            with self.subTest(rel=rel):
-                self.assertEqual((self.repo / rel).read_text(), "owner\n")
-
-    def test_moved_files_stay_readable_and_restorable(self) -> None:
-        job = self.job()
-        self.server.write_baseline(job, self.home)
-        (self.repo / "deep/.claude").mkdir(parents=True)
-        (self.repo / "deep/.claude/settings.json").write_text("planted\n")
-        self.assertEqual(self.server.sweep(job.unit, self.home), ["deep/.claude"])
-        [held] = (self.home / self.server.HELD).glob(f"{job.unit}.*")
-        self.assertNotIn("quarantine", str(held))
-        self.assertEqual((held / "deep/.claude/settings.json").read_text(), "planted\n")
-        restore = self.server.restore_hint(job.unit, self.home)
-        self.assertIn(str(held), restore)
-        subprocess.run(["sh", "-c", restore.split("restore: ", 1)[1]], check=True)
-        self.assertEqual((self.repo / "deep/.claude/settings.json").read_text(), "planted\n")
-
-    def test_a_missing_baseline_moves_nothing(self) -> None:
-        job = self.job()
-        (self.repo / "new/.claude").mkdir(parents=True)
-        with self.assertRaises(RuntimeError):
-            self.server.sweep(job.unit, self.home)
-        self.assertTrue((self.repo / "new/.claude").exists())
-        self.assertTrue((self.repo / ".git").is_dir())
 
 
 class WrapperTests(unittest.TestCase):
@@ -687,7 +581,7 @@ class RealUnitTests(unittest.TestCase):
         sandbox = {**live, "filesystem": {**live.get("filesystem", {}), **filesystem}}
         settings = self.dir / "settings.json"
         settings.write_text(json.dumps({"sandbox": sandbox, **deny_rules(list(deny))}))
-        self.server.settings_sources = lambda home: [(settings, True)]
+        self.server.settings_sources = lambda home, config_dir: [(settings, True)]
 
     def reset_unit(self) -> None:
         subprocess.run(["systemctl", "--user", "stop", f"{self.unit}.service"], capture_output=True)
@@ -701,16 +595,8 @@ class RealUnitTests(unittest.TestCase):
                          *state.glob(f"{self.unit}.*"),
                          self.home / ".local/state/claude-unit-failures" / f"{self.unit}.json"):
             leftover.unlink(missing_ok=True)
-        for held in (self.home / self.server.HELD).glob(f"{self.unit}.*"):
-            subprocess.run(["chmod", "-R", "u+rwx", str(held)], check=True)
-            shutil.rmtree(held)
         subprocess.run(["chmod", "-R", "u+rwx", str(self.dir)], check=True)
         shutil.rmtree(self.dir)
-
-    def held(self) -> list:
-        root = self.home / self.server.HELD
-        return sorted(str(p.relative_to(d)) for d in root.glob(f"{self.unit}.*")
-                      for p in d.rglob("*") if p.is_file())
 
     def start(self, script: str, runtime: int = 120, repo: Path | None = None) -> str:
         return self.server.tool_start({"repo": str(repo or self.repo), "argv": ["sh", "-c", script],
@@ -759,22 +645,27 @@ class RealUnitTests(unittest.TestCase):
         self.assertNotIn("CANARY-OUTSIDE-REPO", log)
         self.assertNotIn("RUNTIME-DIR-VISIBLE", log)
 
-    def test_job_cannot_write_what_the_session_sandbox_protects(self) -> None:
-        self.git("init", "-q", cwd=self.repo)
-        self.git("init", "-q", "--bare", "x.git", cwd=self.repo)
-        bare_config = self.snapshot(self.repo / "x.git/config")
-        before = sorted(os.listdir(self.repo))
-        planted = [".claude/settings.local.json", ".claude/settings.json", ".mcp.json",
-                   ".vscode/x", ".gitmodules", ".git/hooks/x", ".bashrc"]
+    # Parity: what a sandboxed session's own Bash may not write with its cwd in a
+    # repo (measured, Claude Code 2.1.330), a job there may not write either.
+    def test_job_gets_the_write_denies_a_session_has_in_its_repo(self) -> None:
+        (self.repo / ".claude").mkdir()
+        self.git("init", "-q", "n1", cwd=self.repo)
+        watched = (self.repo / ".git/config", self.repo / "n1/.git/config")
+        before, listed = self.snapshot(*watched), sorted(os.listdir(self.repo))
+        planted = [".git/hooks/x", ".claude/settings.json", ".claude/settings.local.json",
+                   *(f".claude/{d}/x" for d in ("skills", "hooks", "output-styles", "workflows",
+                                                 "agents", "commands")),
+                   ".mcp.json", ".gitconfig", ".gitmodules", ".bashrc", ".vscode/x", "n1/.git/hooks/x"]
         script = "".join(f"mkdir -p $(dirname {p}); echo planted > {p}; " for p in planted)
-        out = self.run_job(script + "echo '[core]' >> x.git/config; echo kept > normal.txt; exit 0")
+        out = self.run_job(script + "echo '[core]' >> .git/config; echo '[core]' >> n1/.git/config; "
+                           "mv .git g2; mv n1 n2; mv .claude c2; echo kept > normal.txt; exit 0")
         self.assertIn("MARKER_OK", out)
         self.assertEqual((self.repo / "normal.txt").read_text(), "kept\n")
         for p in planted:
             with self.subTest(path=p):
                 self.assertFalse((self.repo / p).exists(), out)
-        self.assertEqual(self.snapshot(self.repo / "x.git/config"), bare_config, out)
-        self.assertEqual(sorted(os.listdir(self.repo)), sorted([*before, "normal.txt"]), out)
+        self.assertEqual(self.snapshot(*watched), before, out)
+        self.assertEqual(sorted(os.listdir(self.repo)), sorted([*listed, "normal.txt"]), out)
 
     def test_job_cannot_write_outside_the_repo(self) -> None:
         out = self.run_job(f"echo escaped > {self.dir}/outside; echo escaped >> {self.canary}; exit 0")
@@ -801,14 +692,6 @@ class RealUnitTests(unittest.TestCase):
         self.assertIn("readable", out)
         self.assertNotIn("CANARY-ABS-RULE", out)
         self.assertNotIn("CANARY-REL-RULE", out)
-
-    def test_job_cannot_write_what_an_edit_deny_glob_names(self) -> None:
-        (self.repo / "sub/held").mkdir(parents=True)
-        self.use_settings(deny=("Edit(//**/held/**)",))
-        out = self.run_job("echo planted > sub/held/x; echo kept > sub/y; exit 0")
-        self.assertIn("MARKER_OK", out)
-        self.assertEqual((self.repo / "sub/y").read_text(), "kept\n")
-        self.assertFalse((self.repo / "sub/held/x").exists(), out)
 
     def test_job_cannot_read_what_a_read_deny_glob_names(self) -> None:
         (self.repo / ".env.local").write_text("CANARY-GLOB-DENIED\n")
@@ -847,16 +730,6 @@ class RealUnitTests(unittest.TestCase):
                 self.assertEqual(st.st_size, 0)
         self.assertEqual(self.git("status", "--porcelain", cwd=self.repo), "")
 
-    def test_root_anchored_read_deny_globs_hold_in_the_repo_and_git_still_reads(self) -> None:
-        (self.repo / "sub/held").mkdir(parents=True)
-        (self.repo / "sub/held/f").write_text("CANARY-ROOT-GLOB\n")
-        self.git("commit", "-q", "--allow-empty", "-m", "init", cwd=self.repo)
-        self.use_settings(deny=("Read(//**/held/**)", "Read(//**/.git/**)"))
-        out = self.run_job("cat sub/held/f; git log --format=LOGGED-%s; exit 0")
-        self.assertIn("MARKER_OK", out)
-        self.assertIn("LOGGED-init", out)
-        self.assertNotIn("CANARY-ROOT-GLOB", out)
-
     def test_nix_profile_job_cannot_write_the_hosts_nix_cache(self) -> None:
         canary = self.home / ".cache/nix" / f"jobs-broker-test-{uuid.uuid4().hex[:8]}"
         try:
@@ -867,111 +740,6 @@ class RealUnitTests(unittest.TestCase):
             self.assertFalse(canary.exists())
         finally:
             canary.unlink(missing_ok=True)
-
-    def test_files_the_owner_creates_mid_job_where_the_job_cannot_write_stay(self) -> None:
-        self.git("commit", "-q", "--allow-empty", "-m", "init", cwd=self.repo)
-        self.start("sleep 4; exit 0")
-        deadline = time.monotonic() + 10
-        while "activating" not in self.server.tool_status({"slug": self.slug}, self.home):
-            self.assertLess(time.monotonic(), deadline)
-            time.sleep(0.2)
-        time.sleep(1)
-        (self.repo / ".claude").mkdir(exist_ok=True)
-        (self.repo / ".claude/settings.local.json").write_text('{"owner": true}\n')
-        self.assertIn("result=success", self.status())
-        self.assertEqual((self.repo / ".claude/settings.local.json").read_text(), '{"owner": true}\n')
-        self.assertEqual(self.held(), [])
-
-    def plant(self, *paths: str) -> str:
-        return "".join(f"mkdir -p $(dirname {p}) 2>/dev/null; (echo planted > {p}) 2>/dev/null "
-                       f"&& echo WROTE-{p}; " for p in paths)
-
-    def test_job_cannot_write_execute_later_files_at_any_depth(self) -> None:
-        for d in ("sub/.claude/skills", "sub/.codex", "a/b/c/d/e/f/.vscode", "w/.agents", "w/.cursor"):
-            (self.repo / d).mkdir(parents=True)
-        (self.repo / "sub/.envrc").write_text("orig\n")
-        planted = ["sub/.claude/settings.json", "sub/.claude/settings.local.json",
-                   "sub/.claude/skills/x.md", "sub/.codex/hooks.json", "a/b/c/d/e/f/.vscode/tasks.json",
-                   "w/.agents/x", "w/.cursor/mcp.json", ".codex/hooks.json", ".agents/x", ".envrc"]
-        out = self.run_job(self.plant(*planted) + "echo x >> sub/.envrc; echo kept > normal.txt; exit 0")
-        self.assertIn("MARKER_OK", out)
-        self.assertEqual((self.repo / "normal.txt").read_text(), "kept\n")
-        self.assertEqual((self.repo / "sub/.envrc").read_text(), "orig\n", out)
-        for p in planted:
-            with self.subTest(path=p):
-                self.assertNotIn(f"WROTE-{p}", out)
-                self.assertFalse((self.repo / p).exists(), out)
-
-    def test_execute_later_names_a_job_creates_are_moved_out_after_it(self) -> None:
-        (self.repo / "keep").mkdir()
-        created = ("git init -q sub && echo planted > sub/.git/hooks/post-checkout && "
-                   "mkdir -p deep/x/.claude && echo planted > deep/x/.claude/settings.json && "
-                   "echo planted > deep/.envrc && echo kept > keep/f; ")
-        for rc in (0, 1):
-            self.reset_unit()
-            with self.subTest(rc=rc):
-                out = self.run_job(created + f"exit {rc}")
-                deadline = time.monotonic() + 10
-                while (self.repo / "sub/.git").exists() and time.monotonic() < deadline:
-                    time.sleep(0.2)
-                self.assertEqual((self.repo / "keep/f").read_text(), "kept\n", out)
-                for p in ("sub/.git", "deep/x/.claude", "deep/.envrc"):
-                    self.assertFalse((self.repo / p).exists(), out)
-                held = self.held()
-                for p in ("sub/.git/hooks/post-checkout", "deep/x/.claude/settings.json", "deep/.envrc"):
-                    self.assertIn(p, held)
-                self.assertIn("deep/.envrc", self.server.tool_log({"slug": self.slug}, self.home))
-                self.assertIn("3 files that run later", self.status())
-                self.assertTrue((self.repo / ".git/HEAD").is_file())
-                for held_dir in (self.home / self.server.HELD).glob(f"{self.unit}.*"):
-                    shutil.rmtree(held_dir)
-
-    def test_a_git_dir_a_job_makes_is_moved_out_however_git_would_find_it(self) -> None:
-        self.git("commit", "-q", "--allow-empty", "-m", "init", cwd=self.repo)
-        out = self.run_job(
-            "git init -q --bare linked && rm linked/HEAD && ln -s refs/heads/main linked/HEAD && "
-            "git --git-dir=linked config core.pager 'touch PWNED-linked; cat' && "
-            "mkdir common && echo 'ref: refs/heads/main' > common/HEAD && "
-            "echo ../linked > common/commondir; exit 0")
-        self.assertIn("MARKER_OK", out)
-        for name in ("linked", "common"):
-            with self.subTest(name=name):
-                self.assertFalse((self.repo / name).exists(), out)
-                self.assertIn(f"{name} appeared during the job", out)
-
-    def test_names_under_directories_the_job_closed_to_the_owner_are_moved_out(self) -> None:
-        out = self.run_job("mkdir -p d/x/.claude && echo '{\"hooks\": {}}' > d/x/.claude/settings.json "
-                           "&& chmod 0100 d && mkdir -p e/.claude && echo x > e/.claude/settings.json "
-                           "&& chmod 0500 e && mkdir -p f/.claude && echo x > f/.claude/settings.json "
-                           "&& chmod 0500 f/.claude && chmod 0500 . ; exit 0")
-        self.assertIn("result=success", out)
-        for p in ("d/x/.claude", "e/.claude", "f/.claude"):
-            with self.subTest(path=p):
-                self.assertFalse((self.repo / p).exists(), out)
-                self.assertIn(f"{p}/settings.json", self.held())
-
-    def test_a_name_the_sweep_cannot_reach_fails_the_job_and_every_move_is_recorded(self) -> None:
-        deep = "/".join(["d"] * (self.server.MAX_SWEEP_DEPTH + 2))
-        plant = "".join(f"mkdir -p a{i}/.claude && echo x > a{i}/.claude/settings.json && "
-                        for i in range(4))
-        out = self.run_job(plant + f"mkdir -p {deep}/.claude && echo x > {deep}/.claude/s; exit 0")
-        self.assertIn("result=exit-code", out)
-        self.assertIn('could not be moved out: "d/d/d/', out)
-        self.assertTrue((self.repo / deep / ".claude").exists())
-        recorded = self.server.moved_path(self.home, self.unit).read_text()
-        self.assertEqual(sorted(self.held()), [f"a{i}/.claude/settings.json" for i in range(4)])
-        for i in range(4):
-            self.assertIn(f"a{i}/.claude", recorded)
-        self.assertIn("restore:", self.server.restore_hint(self.unit, self.home))
-
-    def test_names_the_owner_makes_after_the_job_ended_survive_stop(self) -> None:
-        self.start("exit 0")
-        self.assertIn("result=success", self.status())
-        (self.repo / "sub/.claude").mkdir(parents=True)
-        (self.repo / "sub/.claude/settings.json").write_text("owner\n")
-        self.server.tool_stop({"slug": self.slug}, self.home)
-        self.assertEqual((self.repo / "sub/.claude/settings.json").read_text(), "owner\n")
-        self.assertEqual(self.held(), [])
 
     def test_a_deny_rule_of_the_sessions_own_project_holds_in_a_job_in_another_repo(self) -> None:
         (self.repo / "s.txt").write_text("SESSION-DENIED\n")
@@ -993,6 +761,21 @@ class RealUnitTests(unittest.TestCase):
         reply = json.loads(done.stdout)["result"]
         self.assertTrue(reply.get("isError"), reply)
         self.assertIn(f"{self.project}/.claude/settings.json", reply["content"][0]["text"])
+
+    def test_the_user_settings_are_those_of_the_sessions_config_dir(self) -> None:
+        config_dir = self.dir / "config"
+        config_dir.mkdir()
+        (config_dir / "settings.json").write_text("{not json")
+        msg = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+            "name": "start", "arguments": {"repo": str(self.repo), "argv": ["true"],
+                                           "slug": self.slug}}}
+        done = subprocess.run([sys.executable, str(SERVER)], input=json.dumps(msg) + "\n",
+                              capture_output=True, text=True, timeout=60, cwd=self.dir,
+                              env={**os.environ, "CLAUDE_PROJECT_DIR": str(self.project),
+                                   "CLAUDE_CONFIG_DIR": str(config_dir)})
+        reply = json.loads(done.stdout)["result"]
+        self.assertTrue(reply.get("isError"), reply)
+        self.assertIn(f"{config_dir}/settings.json", reply["content"][0]["text"])
 
     def test_a_slow_systemd_run_is_reported_as_the_unit_it_left(self) -> None:
         real = self.server.start_argv
@@ -1116,7 +899,7 @@ class RealUnitTests(unittest.TestCase):
             self.start("echo planted > hooks/x", repo=self.repo / ".git")
         self.assertFalse((self.repo / ".git/hooks/x").exists())
 
-    def test_job_cannot_write_submodule_or_worktree_git_state(self) -> None:
+    def test_worktree_job_cannot_write_the_main_repos_submodule_or_worktree_git_state(self) -> None:
         sub_src = self.dir / "subsrc"
         sub_src.mkdir()
         self.git("init", "-q", cwd=sub_src)
@@ -1136,38 +919,33 @@ class RealUnitTests(unittest.TestCase):
                   f"echo planted > {common}/modules/sub/hooks/post-checkout; "
                   f"echo '[core]' >> {common}/config.worktree; "
                   f"echo '[core]' >> {admin}/config.worktree; "
-                  "echo 'gitdir: /tmp' > sub/.git; exit 0")
-        for where in (self.repo, wt):
-            self.reset_unit()
-            with self.subTest(where=where.name):
-                out = self.run_job(attack, repo=where)
-                self.assertIn("MARKER_OK", out)
-                self.assertEqual(self.snapshot(*watched), before, out)
+                  f"echo 'gitdir: /tmp' > {self.repo}/sub/.git; exit 0")
+        out = self.run_job(attack, repo=wt)
+        self.assertIn("MARKER_OK", out)
+        self.assertEqual(self.snapshot(*watched), before, out)
 
     def test_nested_repo_git_dir_cannot_be_written_or_swapped(self) -> None:
         self.git("init", "-q", cwd=self.repo)
-        inner = self.repo / "vendor/inner"
-        inner.mkdir(parents=True)
+        inner = self.repo / "inner"
+        inner.mkdir()
         self.git("init", "-q", cwd=inner)
         before = self.snapshot(inner / ".git/hooks", inner / ".git/config")
         out = self.run_job(
-            "echo planted > vendor/inner/.git/hooks/post-checkout; "
-            "echo '[core]' >> vendor/inner/.git/config; "
-            "mv vendor vendor2 && mkdir -p vendor/inner/.git/hooks && "
-            "echo planted > vendor/inner/.git/hooks/post-checkout; exit 0")
+            "echo planted > inner/.git/hooks/post-checkout; "
+            "echo '[core]' >> inner/.git/config; "
+            "mv inner inner2 && mkdir -p inner/.git/hooks && "
+            "echo planted > inner/.git/hooks/post-checkout; exit 0")
         self.assertIn("MARKER_OK", out)
-        self.assertFalse((self.repo / "vendor2").exists(), out)
+        self.assertFalse((self.repo / "inner2").exists(), out)
         self.assertEqual(self.snapshot(inner / ".git/hooks", inner / ".git/config"), before, out)
 
-    def test_git_reads_work_and_commit_fails_in_a_repo_and_in_a_worktree(self) -> None:
+    def test_git_reads_work_in_a_repo_and_in_a_worktree(self) -> None:
         wt = self.main_and_worktree()
         for where in (self.repo, wt):
             (where / "f").write_text("a\n")
             self.git("add", "f", cwd=where)
             self.git("commit", "-q", "-m", "base", cwd=where)
-        script = ("echo b >> f && git status --short && git diff --stat && "
-                  "if git -c user.name=t -c user.email=t@t commit -qam from-job; "
-                  "then echo COMMITTED; else echo COMMIT-REFUSED; fi")
+        script = "echo b >> f && git status --short && git diff --stat"
         for where in (self.repo, wt):
             self.reset_unit()
             with self.subTest(where=where.name):
@@ -1175,8 +953,6 @@ class RealUnitTests(unittest.TestCase):
                 self.assertIn("MARKER_OK", out)
                 self.assertIn(" M f", out)
                 self.assertIn("1 file changed", out)
-                self.assertIn("COMMIT-REFUSED", out)
-                self.assertEqual(self.git("log", "-1", "--format=%s", cwd=where).strip(), "base")
 
     def test_nix_build_of_a_flake_in_a_worktree(self) -> None:
         wt = self.main_and_worktree()

@@ -24,15 +24,13 @@ retained user unit (`claude-job-<slug>`) from outside the sandbox:
    settles; `mcp__jobs_broker__log` tails the log, which ends `MARKER_OK` or
    `MARKER_FAILED rc=N`; `mcp__jobs_broker__stop` frees the slug.
 
-Jobs run under this session's sandbox policy, network allowlist included, but
-write only that repo and see no other part of your home. Its git dirs are
-read-only: jobs cannot commit, and nix cannot write `flake.lock` there, so
-update the lock in the session first or pass `--no-write-lock-file`. Agent,
-editor, shell and git config at any depth is read-only too, and any such file a
-job creates (a new `.git`, `.claude/`, `.envrc`) is moved out of the repo when
-it ends; status and log name what was moved.
+Jobs run under this session's sandbox policy, network allowlist included, with
+the same write protections the session has in that repo, but write only that
+repo and see no other part of your home. A worktree's git dir lives in the main
+repo, so a job in a worktree cannot commit, and nix fails there when it records a
+new `flake.lock`; update the lock in the session first or pass `--no-write-lock-file`.
 
-While a job runs, each of those names that does not exist yet shows in the repo
+While a job runs, each protected name that does not exist yet shows in the repo
 as an empty file (the sandbox's mount point; git lists them as untracked), so
 do not `git add -A` in that repo until the job settles. A hard-killed job can
 leave them behind: delete only empty, untracked ones.

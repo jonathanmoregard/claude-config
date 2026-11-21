@@ -40,8 +40,8 @@ SLUG = {"type": "string", "description": "Job name; the unit is claude-job-<slug
 JOBS = {
     "start": ("Starts a long job (nix build, VM test gate, long test suite) as a detached systemd "
               "user unit that outlives this session. argv runs in repo under the session's own "
-              "sandbox policy, network allowlist included, with writes limited to repo; the rest "
-              "of home and secrets are hidden, every git dir is read-only (git commit fails), and "
+              "sandbox, network allowlist and the write protections a session has in repo "
+              "included, with writes limited to repo; the rest of home and secrets are hidden, and "
               "it is killed after max_runtime_sec. Profile nix also lets it write the nix cache "
               "and uses the ram-heavy slice. Read the outcome later with status (wait_sec blocks "
               "until it settles) and log.",
