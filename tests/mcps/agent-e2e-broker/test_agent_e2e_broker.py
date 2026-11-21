@@ -87,18 +87,21 @@ _UNITS_OK = None
 
 
 def require_units(case: unittest.TestCase) -> None:
-    """Skip `case` unless the user manager can start a unit with private mounts.
+    """Skip `case` unless the user manager can start a unit hardened like a campaign.
 
-    Campaign units bind and hide paths, which needs a mount namespace; a CI
-    runner's user manager can lack one and fails such units with 226/NAMESPACE.
+    Campaign units use private users, PIDs and mounts; a CI runner's user
+    manager can lack those namespaces and fails such units with 226/NAMESPACE.
+    The probe takes the broker's own hardening, so it tracks what campaigns ask for.
     """
     global _UNITS_OK
     if _UNITS_OK is None:
+        server = case.server
         home = pwd.getpwuid(os.getuid()).pw_dir
+        props = [*server.HARDENING, *(f"InaccessiblePaths=-{p}" for p in server.HIDDEN),
+                 f"BindReadOnlyPaths={home}"]
         try:
             p = subprocess.run(["systemd-run", "--user", "--wait", "--collect", "--quiet",
-                                "-p", f"BindReadOnlyPaths={home}",
-                                "-p", "InaccessiblePaths=-/nonexistent", "true"],
+                                *(a for prop in props for a in ("-p", prop)), "true"],
                                capture_output=True, text=True, timeout=60)
             _UNITS_OK = (p.returncode == 0,
                          "the user manager cannot start a unit with private mounts here: "
