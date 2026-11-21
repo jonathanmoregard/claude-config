@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import pwd
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -798,15 +799,32 @@ class RealUnitTests(unittest.TestCase):
         self.assertIn("CANARY-NOT-DENIED", out)
         self.assertNotIn("CANARY-GLOB-DENIED", out)
 
-    def test_a_clean_repo_stays_clean_in_a_job_and_on_the_host(self) -> None:
+    # srt, like upstream and Claude Code's bundled copy, holds an absent protected
+    # name with an empty mount-point file the host sees while the job runs. The
+    # owner's git and nix must still read them; the job must not fill them.
+    def test_absent_protected_names_stay_empty_and_readable_for_the_owner_mid_job(self) -> None:
         self.git("commit", "-q", "--allow-empty", "-m", "init", cwd=self.repo)
-        self.start("echo STATUS-START; git status --porcelain; echo STATUS-END; sleep 3; exit 0")
-        time.sleep(1.5)
-        host = self.git("status", "--porcelain", cwd=self.repo)
+        self.start("(echo planted > .gitmodules) 2>/dev/null && echo WROTE; "
+                   "git status --porcelain >/dev/null || echo GIT-FAILED; sleep 3; exit 0")
+        deadline = time.monotonic() + 10
+        while "activating" not in self.server.tool_status({"slug": self.slug}, self.home):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.2)
+        time.sleep(1)
+        gitmodules = self.repo / ".gitmodules"
+        mid_job = gitmodules.read_bytes() if gitmodules.exists() else b""
+        host_status = self.git("status", "--porcelain", cwd=self.repo).splitlines()
+        sizes = {line: (self.repo / line[3:]).lstat() for line in host_status}
         out = self.status() + "\n" + self.server.tool_log({"slug": self.slug}, self.home)
         self.assertIn("MARKER_OK", out)
-        self.assertIn("STATUS-START\nSTATUS-END", out)
-        self.assertEqual(host, "")
+        self.assertNotIn("WROTE", out)
+        self.assertNotIn("GIT-FAILED", out)
+        self.assertEqual(mid_job, b"")
+        for line, st in sizes.items():
+            with self.subTest(entry=line):
+                self.assertTrue(line.startswith("?? "), host_status)
+                self.assertTrue(stat.S_ISREG(st.st_mode))
+                self.assertEqual(st.st_size, 0)
         self.assertEqual(self.git("status", "--porcelain", cwd=self.repo), "")
 
     def test_root_anchored_read_deny_globs_hold_in_the_repo_and_git_still_reads(self) -> None:

@@ -32,6 +32,11 @@ editor, shell and git config at any depth is read-only too, and any such file a
 job creates (a new `.git`, `.claude/`, `.envrc`) is moved out of the repo when
 it ends; status and log name what was moved.
 
+While a job runs, each of those names that does not exist yet shows in the repo
+as an empty file (the sandbox's mount point; git lists them as untracked), so
+do not `git add -A` in that repo until the job settles. A hard-killed job can
+leave them behind: delete only empty, untracked ones.
+
 A NixOS VM test gate works as a job (`profile: "nix"`, argv `nix build -L
 .#checks.x86_64-linux.<lane>`): the nix daemon boots the VM, with KVM, outside
 the job. Nothing that runs QEMU inside the job works. A job has no `/dev/kvm`,
