@@ -1069,8 +1069,8 @@ def drift(top: str, tree: object, tip: str, cache: dict, pr_paths: set[str]) -> 
 
 
 def is_binary_blob(top: str, tip: str, path: str) -> bool:
-    """True when PATH at TIP holds a NUL in its first 8000 bytes (git's own
-    content test). A path absent at the tip is not binary."""
+    """True when PATH at TIP holds a NUL in its first 8000 characters (close to
+    git's 8000-byte content test). A path absent at the tip is not binary."""
     blob = git(top, "cat-file", "blob", f"{tip}:{path}")
     return blob is not None and "\0" in blob[:8000]
 
