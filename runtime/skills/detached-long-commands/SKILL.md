@@ -11,6 +11,37 @@ does not set), and `nohup`/`&` children die with the session. The proven
 pattern (~20 uses across VM gates, feature-vm boots, and register-index
 ingests):
 
+## Sandboxed session — the jobs broker
+
+Inside the sandbox `systemd-run --user` and `wait-for job` fail: there is no
+user bus. Launch through the `jobs_broker` MCP tools instead; they create the same
+retained user unit (`claude-job-<slug>`) from outside the sandbox:
+
+1. `mcp__jobs_broker__start` with `repo` (the top level of a git work tree
+   under `~/Repos` or `~/worktrees`), `argv` (a list, no shell string), `slug`, and
+   `profile: "nix"` for nix builds (the job's own caches under `~/.cache/claude-jobs`, ram-heavy slice).
+2. `mcp__jobs_broker__status` with `wait_sec` (max 540) blocks until it
+   settles; `mcp__jobs_broker__log` tails the log, which ends `MARKER_OK` or
+   `MARKER_FAILED rc=N`; `mcp__jobs_broker__stop` frees the slug.
+
+Jobs run under this session's sandbox policy, network allowlist included, with
+the same write protections the session has in that repo, but write only that
+repo and see no other part of your home. A worktree's git dir lives in the main
+repo, so a job in a worktree cannot commit, and nix fails there when it records a
+new `flake.lock`; update the lock in the session first or pass `--no-write-lock-file`.
+
+While a job runs, each protected name that does not exist yet shows in the repo
+as an empty file (the sandbox's mount point; git lists them as untracked), so
+do not `git add -A` in that repo until the job settles. A hard-killed job can
+leave them behind: delete only empty, untracked ones.
+
+A NixOS VM test gate works as a job (`profile: "nix"`, argv `nix build -L
+.#checks.x86_64-linux.<lane>`): the nix daemon boots the VM, with KVM, outside
+the job. Nothing that runs QEMU inside the job works. A job has no `/dev/kvm`,
+and the session and host cannot reach a port it listens on. Lost in a sandboxed
+session: interactive feature-vm launches with forwarded ports (`driverInteractive`,
+`nix run` of a VM). Ask the owner to launch those from an unsandboxed shell.
+
 ## Launch — detached systemd user unit + sentinel markers
 
 The unit retains the command's real exit status: `ExecMainStatus` equals the
