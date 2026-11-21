@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Workspace: a shallow clone of ~/.claude whose origin is the real GitHub repo,
+# Workspace: a shallow clone of ~/Repos/claude-config whose origin is the real GitHub repo,
 # plus one new file to publish. The arm's own git_broker and github MCP servers,
 # whichever its mcp-servers.json registers, are the agent's only MCP servers
 # (the control arm registers neither, so it gets none). Bash runs in
@@ -20,7 +20,7 @@ case $run in
 esac
 
 repo=$work/claude
-git clone -q --depth 1 --branch master file:///home/jonathan/.claude "$repo"
+git clone -q --depth 1 --branch master file:///home/jonathan/Repos/claude-config "$repo"
 git -C "$repo" remote set-url origin https://github.com/jonathanmoregard/claude-config.git
 token="$(basename "$(dirname "$run")")-$(basename "$run")-$(date +%s)"
 printf 'e2e/git-broker-%s\n' "$token" >"$work/branch.txt"
