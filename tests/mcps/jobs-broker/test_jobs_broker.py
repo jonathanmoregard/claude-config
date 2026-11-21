@@ -62,6 +62,8 @@ class Home(unittest.TestCase):
         for d in ("Repos/main/.git", "worktrees/wt", ".ssh", ".config/git", ".cache/nix", ".claude"):
             (self.home / d).mkdir(parents=True)
         self.repo = self.home / "Repos" / "main"
+        self.project = self.home / "Repos" / "session"
+        self.project.mkdir()
         (self.repo / ".git" / "config").write_text("")
         self.write_settings({"sandbox": SANDBOX})
         self.sources = [(self.home / ".claude" / "settings.json", True)]
@@ -77,7 +79,7 @@ class Home(unittest.TestCase):
         return {"repo": str(self.repo), "argv": ["make", "check"], "slug": "check", **over}
 
     def job(self, **over):
-        return self.server.validate_start(self.start_args(**over), self.home)
+        return self.server.validate_start(self.start_args(**over), self.home, self.project)
 
 
 class SlugTests(Home):
@@ -321,6 +323,20 @@ class SrtPolicyTests(Home):
         self.assertNotIn("/srv/widened", fs["allowWrite"])
         self.assertNotIn("evil.example", policy["network"]["allowedDomains"])
 
+    def test_the_sessions_own_project_denies_reach_a_job_in_another_repo(self) -> None:
+        (self.project / ".claude").mkdir()
+        self.write_settings(deny_rules([f"Read(/{self.repo}/s.txt)", "Edit(build/out)"]),
+                            self.project / ".claude/settings.json")
+        fs = self.policy()["filesystem"]
+        self.assertIn(f"{self.repo}/s.txt", fs["denyRead"])
+        self.assertIn(f"{self.project}/build/out", fs["denyWrite"])
+
+    def test_unreadable_session_project_settings_refuse_to_start(self) -> None:
+        (self.project / ".claude").mkdir()
+        (self.project / ".claude/settings.local.json").write_text("{not json")
+        with self.assertRaisesRegex(RuntimeError, f"{self.project}/.claude/settings.local.json"):
+            self.job()
+
     def test_unreadable_project_settings_refuse_to_start(self) -> None:
         (self.repo / ".claude").mkdir()
         (self.repo / ".claude/settings.local.json").write_text("{not json")
@@ -452,7 +468,7 @@ class PropertyTests(Home):
         with mock.patch.object(self.server.subprocess, "run", lambda argv, **kw: (
                 started.append(argv) or subprocess.CompletedProcess(argv, 0, "", "")
                 if argv[0] == "systemd-run" else real_run(argv, **kw))):
-            self.server.tool_start(self.start_args(), self.home)
+            self.server.tool_start(self.start_args(), self.home, self.project)
         job = self.job()
         written = self.server.policy_path(self.home, job.unit)
         self.assertEqual(json.loads(written.read_text()), job.policy)
@@ -613,7 +629,7 @@ class OwnUnitTests(Home):
         log.parent.mkdir(parents=True)
         log.write_text("previous run\n")
         with self.assertRaisesRegex(RuntimeError, "already"):
-            self.server.tool_start(self.start_args(), self.home)
+            self.server.tool_start(self.start_args(), self.home, self.project)
         self.assertEqual(log.read_text(), "previous run\n")
 
     def test_log_tail_is_bounded(self) -> None:
@@ -657,6 +673,8 @@ class RealUnitTests(unittest.TestCase):
         self.dir = Path(tempfile.mkdtemp(prefix=".jobs-broker-test-", dir=self.home / "worktrees"))
         self.repo = self.dir / "repo"
         self.repo.mkdir()
+        self.project = self.dir / "session"
+        self.project.mkdir()
         self.canary = self.dir / "canary"
         self.canary.write_text("CANARY-OUTSIDE-REPO\n")
         self.slug = f"test-{uuid.uuid4().hex[:12]}"
@@ -684,7 +702,9 @@ class RealUnitTests(unittest.TestCase):
                          self.home / ".local/state/claude-unit-failures" / f"{self.unit}.json"):
             leftover.unlink(missing_ok=True)
         for held in (self.home / self.server.HELD).glob(f"{self.unit}.*"):
+            subprocess.run(["chmod", "-R", "u+rwx", str(held)], check=True)
             shutil.rmtree(held)
+        subprocess.run(["chmod", "-R", "u+rwx", str(self.dir)], check=True)
         shutil.rmtree(self.dir)
 
     def held(self) -> list:
@@ -694,7 +714,7 @@ class RealUnitTests(unittest.TestCase):
 
     def start(self, script: str, runtime: int = 120, repo: Path | None = None) -> str:
         return self.server.tool_start({"repo": str(repo or self.repo), "argv": ["sh", "-c", script],
-                                       "slug": self.slug, "max_runtime_sec": runtime}, self.home)
+                                       "slug": self.slug, "max_runtime_sec": runtime}, self.home, self.project)
 
     def run_job(self, script: str, repo: Path | None = None) -> str:
         self.start(script, repo=repo)
@@ -842,7 +862,7 @@ class RealUnitTests(unittest.TestCase):
         try:
             self.server.tool_start({"repo": str(self.repo), "slug": self.slug, "profile": "nix",
                                     "argv": ["sh", "-c", f"echo planted > {canary}; exit 0"]},
-                                   self.home)
+                                   self.home, self.project)
             self.assertIn("result=success", self.status())
             self.assertFalse(canary.exists())
         finally:
@@ -906,6 +926,88 @@ class RealUnitTests(unittest.TestCase):
                 for held_dir in (self.home / self.server.HELD).glob(f"{self.unit}.*"):
                     shutil.rmtree(held_dir)
 
+    def test_a_git_dir_a_job_makes_is_moved_out_however_git_would_find_it(self) -> None:
+        self.git("commit", "-q", "--allow-empty", "-m", "init", cwd=self.repo)
+        out = self.run_job(
+            "git init -q --bare linked && rm linked/HEAD && ln -s refs/heads/main linked/HEAD && "
+            "git --git-dir=linked config core.pager 'touch PWNED-linked; cat' && "
+            "mkdir common && echo 'ref: refs/heads/main' > common/HEAD && "
+            "echo ../linked > common/commondir; exit 0")
+        self.assertIn("MARKER_OK", out)
+        for name in ("linked", "common"):
+            with self.subTest(name=name):
+                self.assertFalse((self.repo / name).exists(), out)
+                self.assertIn(f"{name} appeared during the job", out)
+
+    def test_names_under_directories_the_job_closed_to_the_owner_are_moved_out(self) -> None:
+        out = self.run_job("mkdir -p d/x/.claude && echo '{\"hooks\": {}}' > d/x/.claude/settings.json "
+                           "&& chmod 0100 d && mkdir -p e/.claude && echo x > e/.claude/settings.json "
+                           "&& chmod 0500 e && mkdir -p f/.claude && echo x > f/.claude/settings.json "
+                           "&& chmod 0500 f/.claude && chmod 0500 . ; exit 0")
+        self.assertIn("result=success", out)
+        for p in ("d/x/.claude", "e/.claude", "f/.claude"):
+            with self.subTest(path=p):
+                self.assertFalse((self.repo / p).exists(), out)
+                self.assertIn(f"{p}/settings.json", self.held())
+
+    def test_a_name_the_sweep_cannot_reach_fails_the_job_and_every_move_is_recorded(self) -> None:
+        deep = "/".join(["d"] * (self.server.MAX_SWEEP_DEPTH + 2))
+        plant = "".join(f"mkdir -p a{i}/.claude && echo x > a{i}/.claude/settings.json && "
+                        for i in range(4))
+        out = self.run_job(plant + f"mkdir -p {deep}/.claude && echo x > {deep}/.claude/s; exit 0")
+        self.assertIn("result=exit-code", out)
+        self.assertIn('could not be moved out: "d/d/d/', out)
+        self.assertTrue((self.repo / deep / ".claude").exists())
+        recorded = self.server.moved_path(self.home, self.unit).read_text()
+        self.assertEqual(sorted(self.held()), [f"a{i}/.claude/settings.json" for i in range(4)])
+        for i in range(4):
+            self.assertIn(f"a{i}/.claude", recorded)
+        self.assertIn("restore:", self.server.restore_hint(self.unit, self.home))
+
+    def test_names_the_owner_makes_after_the_job_ended_survive_stop(self) -> None:
+        self.start("exit 0")
+        self.assertIn("result=success", self.status())
+        (self.repo / "sub/.claude").mkdir(parents=True)
+        (self.repo / "sub/.claude/settings.json").write_text("owner\n")
+        self.server.tool_stop({"slug": self.slug}, self.home)
+        self.assertEqual((self.repo / "sub/.claude/settings.json").read_text(), "owner\n")
+        self.assertEqual(self.held(), [])
+
+    def test_a_deny_rule_of_the_sessions_own_project_holds_in_a_job_in_another_repo(self) -> None:
+        (self.repo / "s.txt").write_text("SESSION-DENIED\n")
+        (self.project / ".claude").mkdir()
+        (self.project / ".claude/settings.json").write_text(
+            json.dumps(deny_rules([f"Read(/{self.repo}/s.txt)"])))
+        out = self.run_job("cat s.txt; exit 0")
+        self.assertNotIn("SESSION-DENIED", out)
+
+    def test_the_session_project_is_the_one_claude_code_names(self) -> None:
+        (self.project / ".claude").mkdir()
+        (self.project / ".claude/settings.json").write_text("{not json")
+        msgs = [{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+            "name": "start", "arguments": {"repo": str(self.repo), "argv": ["true"],
+                                           "slug": self.slug}}}]
+        done = subprocess.run([sys.executable, str(SERVER)], input=json.dumps(msgs[0]) + "\n",
+                              capture_output=True, text=True, timeout=60, cwd=self.dir,
+                              env={**os.environ, "CLAUDE_PROJECT_DIR": str(self.project)})
+        reply = json.loads(done.stdout)["result"]
+        self.assertTrue(reply.get("isError"), reply)
+        self.assertIn(f"{self.project}/.claude/settings.json", reply["content"][0]["text"])
+
+    def test_a_slow_systemd_run_is_reported_as_the_unit_it_left(self) -> None:
+        real = self.server.start_argv
+        self.server.START_TIMEOUT_SEC = 5
+        self.server.start_argv = lambda job, home: ["sh", "-c", '"$@"; exec sleep 30', "sh",
+                                                    *real(job, home)]
+        reply = self.start("sleep 20")
+        self.assertIn(f"started {self.unit}.service", reply)
+        self.assertIn("timed out", reply)
+        self.assertIn("activating", self.server.tool_status({"slug": self.slug}, self.home))
+        self.server.start_argv = lambda job, home: ["sleep", "30"]
+        self.reset_unit()
+        with self.assertRaisesRegex(RuntimeError, "not started"):
+            self.start("true")
+
     def test_cargo_test_runs_as_a_job(self) -> None:
         (self.repo / "src").mkdir()
         (self.repo / "Cargo.toml").write_text(
@@ -916,7 +1018,7 @@ class RealUnitTests(unittest.TestCase):
         self.server.tool_start({"repo": str(self.repo), "slug": self.slug, "max_runtime_sec": 600,
                                 "profile": "nix",
                                 "argv": ["nix", "shell", "nixpkgs#gcc", "--command", "cargo", "test"]},
-                               self.home)
+                               self.home, self.project)
         out = self.server.tool_status({"slug": self.slug, "wait_sec": 540}, self.home)
         out += self.server.tool_log({"slug": self.slug}, self.home)
         self.assertIn("MARKER_OK", out)
@@ -947,7 +1049,7 @@ class RealUnitTests(unittest.TestCase):
                                 "profile": "nix",
                                 "argv": ["nix", "build", "--refresh", "--no-write-lock-file",
                                          "--no-link", "--print-out-paths", ".#default"]},
-                               self.home)
+                               self.home, self.project)
         out = self.server.tool_status({"slug": self.slug, "wait_sec": 280}, self.home)
         out += self.server.tool_log({"slug": self.slug}, self.home)
         self.assertIn("MARKER_OK", out)
@@ -973,7 +1075,7 @@ class RealUnitTests(unittest.TestCase):
             try:
                 self.server.tool_start({"repo": str(repo), "slug": self.slug, "max_runtime_sec": 60,
                                         "argv": ["sh", "-c", 'echo ESCAPED > "$1"', "sh", str(canary)]},
-                                       self.home)
+                                       self.home, self.project)
             except RuntimeError as refused:
                 self.assertIn("characters", str(refused))
             else:
@@ -1087,7 +1189,7 @@ class RealUnitTests(unittest.TestCase):
         self.server.tool_start({"repo": str(wt), "slug": self.slug, "max_runtime_sec": 300,
                                 "profile": "nix",
                                 "argv": ["nix", "build", "--no-link", "--print-out-paths", ".#default"]},
-                               self.home)
+                               self.home, self.project)
         out = self.server.tool_status({"slug": self.slug, "wait_sec": 240}, self.home)
         out += self.server.tool_log({"slug": self.slug}, self.home)
         self.assertIn("MARKER_OK", out)

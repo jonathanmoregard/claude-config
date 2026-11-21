@@ -65,6 +65,8 @@ MAX_LOG_LINES = 500
 MAX_LOG_BYTES = 64 * 1024
 MAX_WAIT_SEC = 540
 MAX_SCAN_ENTRIES = 2_000_000
+MAX_SWEEP_DEPTH = 256
+START_TIMEOUT_SEC = 120
 
 _SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,47}")
 _RULE_RE = re.compile(r"([A-Za-z]+)(?:\((.*)\))?", re.DOTALL)
@@ -256,25 +258,97 @@ def write_baseline(job: Job, home: Path) -> None:
         json.dump(job.baseline, fh)
 
 
-def _git_dir_at(dir_fd: int, name: str) -> bool:
-    try:
-        fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
-    except OSError:
-        return False
-    try:
-        kinds = [os.stat(n, dir_fd=fd, follow_symlinks=False).st_mode for n in ("HEAD", "objects", "refs")]
-    except OSError:
-        return False
-    finally:
-        os.close(fd)
-    return stat.S_ISREG(kinds[0]) and stat.S_ISDIR(kinds[1]) and stat.S_ISDIR(kinds[2])
-
-
 def moved_path(home: Path, unit: str) -> Path:
     return home / STATE / f"{unit}.moved"
 
 
-# Claude Code quarantines what a sandboxed command leaves behind that runs
+def stuck_path(home: Path, unit: str) -> Path:
+    return home / STATE / f"{unit}.stuck"
+
+
+def swept_path(home: Path, unit: str) -> Path:
+    return home / STATE / f"{unit}.baseline.swept.json"
+
+
+def _open_dir(name: str, dir_fd: int, shown: str) -> int:
+    """A readable fd for directory NAME, never through a symlink. A mode that
+    keeps its owner out (the job runs as the owner) gets u+rwx back, set the
+    way glibc's fchmodat(AT_SYMLINK_NOFOLLOW) does: through an O_PATH fd."""
+    pfd = os.open(name, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    try:
+        mode = stat.S_IMODE(os.fstat(pfd).st_mode)
+        if mode & 0o700 != 0o700:
+            os.chmod(f"/proc/self/fd/{pfd}", mode | 0o700)
+            print(f"jobs-broker: {shown} was closed to its owner; gave it u+rwx back")
+        return os.open(".", os.O_RDONLY | os.O_DIRECTORY, dir_fd=pfd)
+    finally:
+        os.close(pfd)
+
+
+class _Sweep:
+    """Moves out of the repo what a finished job left that runs later.
+
+    Fails closed: what it cannot inspect or move is returned as stuck, and the
+    walk goes on. Each move is recorded as it happens.
+    """
+
+    def __init__(self, denied: set, dest: Path, record) -> None:
+        self.denied, self.dest, self.record = denied, dest, record
+
+    def walk(self, fd: int, rel: str, depth: int) -> list:
+        try:
+            names = sorted(os.listdir(fd))
+        except OSError:
+            return [rel or "."]
+        stuck = []
+        for name in names:
+            path = os.path.join(rel, name) if rel else name
+            if path in self.denied:
+                continue
+            try:
+                if self.runs_later(fd, name, path, depth, stuck) and not self.move(fd, name, path):
+                    stuck.append(path)
+            except OSError:
+                stuck.append(path)
+        return stuck
+
+    def runs_later(self, fd: int, name: str, path: str, depth: int, stuck: list) -> bool:
+        """Whether NAME is to be moved out whole; a plain directory is walked
+        instead, its stuck paths added to STUCK."""
+        if _protected_name(name):
+            return True
+        try:
+            st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISDIR(st.st_mode):
+            return False
+        if depth >= MAX_SWEEP_DEPTH:
+            raise OSError(f"deeper than {MAX_SWEEP_DEPTH} levels")
+        sub = _open_dir(name, fd, path)
+        try:
+            if is_git_dir(".", dir_fd=sub):
+                return True
+            stuck += self.walk(sub, path, depth + 1)
+            return False
+        finally:
+            os.close(sub)
+
+    def move(self, fd: int, name: str, rel: str) -> bool:
+        if any(d.startswith(rel + "/") for d in self.denied):
+            return False
+        # Moving a directory to another parent needs write access to it.
+        if stat.S_ISDIR(os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode):
+            os.close(_open_dir(name, fd, rel))
+        (self.dest / rel).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.rename(name, self.dest / rel, src_dir_fd=fd)
+        self.record.write(json.dumps([str(self.dest), rel]) + "\n")
+        self.record.flush()
+        print(f"jobs-broker: {rel} appeared during the job; moved out of the repo to {self.dest / rel}")
+        return True
+
+
+# Claude Code moves aside what a sandboxed command leaves behind that runs
 # later; this is that step for a job. It runs as the owner outside every
 # sandbox, so it walks by directory fd and moves with renameat: a directory
 # swapped for a symlink mid-walk is neither followed nor moved through.
@@ -283,52 +357,77 @@ def moved_path(home: Path, unit: str) -> Path:
 # policy denied it writing, which is where the owner's own session puts
 # .claude/settings.local.json or git its modules. A new name where the job could
 # write may still be the owner's; it is moved, listed and restorable.
+#
+# It runs once, when the job ends: the first run claims the baseline, so the
+# ExecStopPost= that a later stop or logout re-runs finds it claimed.
 def sweep(unit: str, home: Path) -> list:
     try:
-        base = json.loads(baseline_path(home, unit).read_text())
+        os.rename(baseline_path(home, unit), swept_path(home, unit))
+    except FileNotFoundError:
+        if swept_path(home, unit).exists():
+            return []
+        raise RuntimeError(f"no baseline for {unit}; nothing moved") from None
+    try:
+        base = json.loads(swept_path(home, unit).read_text())
         repo, ident, denied = Path(base["repo"]), base["ident"], set(base["denied"])
-        st = os.lstat(repo)
+        pfd = os.open(repo, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW)
     except (OSError, ValueError, KeyError, TypeError) as e:
         raise RuntimeError(f"no usable baseline for {unit}; nothing moved: {e}") from None
-    if not stat.S_ISDIR(st.st_mode) or f"{st.st_dev}:{st.st_ino}" != ident:
-        raise RuntimeError(f"{repo} is not the directory the job ran in; nothing moved")
-    if "." in denied:
-        return []
-    dest, moved = home / HELD / f"{unit}.{time.time_ns()}", []
-    for top, dirs, files, fd in os.fwalk(repo, follow_symlinks=False):
-        rel_top = os.path.relpath(top, repo)
-        for name in [*dirs, *files]:
-            rel = os.path.normpath(os.path.join(rel_top, name))
-            if rel in denied:
-                if name in dirs:
-                    dirs.remove(name)
-                continue
-            if not (_protected_name(name) or (name in dirs and _git_dir_at(fd, name))):
-                continue
-            if name in dirs:
-                dirs.remove(name)
-            (dest / rel).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            os.rename(name, dest / rel, src_dir_fd=fd)
-            moved.append(rel)
-            print(f"jobs-broker: {rel} appeared during the job; moved out of the repo to {dest / rel}")
+    try:
+        st = os.fstat(pfd)
+        if f"{st.st_dev}:{st.st_ino}" != ident:
+            raise RuntimeError(f"{repo} is not the directory the job ran in; nothing moved")
+        if "." in denied:
+            return []
+        dest = home / HELD / f"{unit}.{time.time_ns()}"
+        with open(moved_path(home, unit), "a") as record:
+            try:
+                top = _open_dir(".", pfd, str(repo))
+            except OSError:
+                stuck = ["."]
+            else:
+                try:
+                    stuck = _Sweep(denied, dest, record).walk(top, "", 0)
+                finally:
+                    os.close(top)
+    finally:
+        os.close(pfd)
+    moved = [rel for _, rel in _moved(home, unit)]
     if moved:
-        with open(moved_path(home, unit), "a") as fh:
-            fh.writelines(f"{dest}\t{rel}\n" for rel in moved)
         print(f"jobs-broker: {restore_hint(unit, home)}")
+    if stuck:
+        stuck_path(home, unit).write_text(json.dumps(stuck))
+        raise RuntimeError(stuck_warning(unit, home))
     return moved
+
+
+def _moved(home: Path, unit: str) -> list:
+    return [json.loads(line) for line in moved_path(home, unit).read_text().splitlines()]
 
 
 def restore_hint(unit: str, home: Path) -> str:
     try:
-        lines = moved_path(home, unit).read_text().splitlines()
-        repo = json.loads(baseline_path(home, unit).read_text())["repo"]
+        moved = _moved(home, unit)
+        repo = json.loads(swept_path(home, unit).read_text())["repo"]
     except (OSError, ValueError, KeyError):
         return ""
-    dests = sorted({line.split("\t", 1)[0] for line in lines})
+    if not moved:
+        return ""
+    dests = sorted({dest for dest, _ in moved})
     cmd = " && ".join(f"cp -a --update=none {d}/. {repo}/" for d in dests)
-    return (f"{len(lines)} files that run later appeared in the repo during the job and were moved "
+    return (f"{len(moved)} files that run later appeared in the repo during the job and were moved "
             f"to {', '.join(dests)} (listed in the log; run the restore as the owner outside the "
             f"sandbox, which protects these names); restore: {cmd}")
+
+
+def stuck_warning(unit: str, home: Path) -> str:
+    try:
+        stuck = json.loads(stuck_path(home, unit).read_text())
+        repo = json.loads(swept_path(home, unit).read_text())["repo"]
+    except (OSError, ValueError, KeyError):
+        return ""
+    return (f"WARNING: files the job left in {repo} that run later could not be moved out: "
+            f"{', '.join(map(json.dumps, stuck))}. Inspect and remove them as the owner before using the repo.")
 
 
 def _gitdir_pointer(gitfile: Path) -> Path | None:
@@ -466,9 +565,10 @@ def _merge_project(path: Path, settings: dict, repo: Path, home: Path, into: Ses
                              and re.fullmatch(r"\w+\(/[^/].*\)", r.strip())], repo, repo, home, into)
 
 
-def session_policy(repo: Path, home: Path) -> SessionPolicy:
-    """The sandbox the session runs under, from sandbox settings and permission
-    deny rules of every scope, as Claude Code composes it."""
+def session_policy(repo: Path, home: Path, project: Path) -> SessionPolicy:
+    """The sandbox the session in PROJECT runs under, from sandbox settings and
+    permission deny rules of every scope as Claude Code composes it, narrowed by
+    the job repo's own project denies."""
     loaded = [(p, s) for p, required in settings_sources(home)
               if (s := _read_settings(p, required)) is not None]
     user = loaded[0][1]
@@ -477,9 +577,10 @@ def session_policy(repo: Path, home: Path) -> SessionPolicy:
     policy = SessionPolicy(user["sandbox"], [], [], [])
     for i, (path, settings) in enumerate(loaded):
         _merge_source(path, settings, repo, home, i == 0, policy)
-    for name in PROJECT_SETTINGS:
-        if (settings := _read_settings(repo / name, False)) is not None:
-            _merge_project(repo / name, settings, repo, home, policy)
+    for root in dict.fromkeys((project, repo)):
+        for name in PROJECT_SETTINGS:
+            if (settings := _read_settings(root / name, False)) is not None:
+                _merge_project(root / name, settings, root, home, policy)
     return policy
 
 
@@ -523,7 +624,7 @@ def srt_policy(repo: Path, scan: Scan, home: Path, session: SessionPolicy) -> di
     }
 
 
-def validate_start(args: object, home: Path) -> Job:
+def validate_start(args: object, home: Path, project: Path) -> Job:
     args = _fields(args, {"repo", "argv", "slug", "max_runtime_sec", "profile"})
     unit = unit_name(args.get("slug"))
     argv = args.get("argv")
@@ -541,7 +642,7 @@ def validate_start(args: object, home: Path) -> Job:
         dot_git = 0
     if not (stat.S_ISDIR(dot_git) or stat.S_ISREG(dot_git)):
         raise RuntimeError(f"{repo} is not the top level of a git work tree")
-    session = session_policy(repo, home)
+    session = session_policy(repo, home, project)
     # srt drops a write glob on Linux, as bwrap binds only concrete paths, and a
     # read glob it cannot walk, so the broker expands each to what it matches in
     # the repo's work tree when the job starts. Git dirs are not walked: git reads
@@ -628,8 +729,8 @@ def _settled(snap: dict) -> bool:
         snap.get("ActiveState") == "active" and snap.get("SubState") == "exited")
 
 
-def tool_start(args: object, home: Path) -> str:
-    job = validate_start(args, home)
+def tool_start(args: object, home: Path, project: Path) -> str:
+    job = validate_start(args, home, project)
     log = log_path(home, job.unit)
     log.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     for cache in job_caches(home).values():
@@ -647,19 +748,33 @@ def tool_start(args: object, home: Path) -> str:
                                0o600), "w") as fh:
             json.dump(job.policy, fh)
         write_baseline(job, home)
-        moved_path(home, job.unit).unlink(missing_ok=True)
-        done = subprocess.run(start_argv(job, home), capture_output=True, text=True, timeout=120,
-                              env=_env(home), stdin=subprocess.DEVNULL)
+        for stale in (moved_path, stuck_path, swept_path):
+            stale(home, job.unit).unlink(missing_ok=True)
+        try:
+            done = subprocess.run(start_argv(job, home), capture_output=True, text=True,
+                                  timeout=START_TIMEOUT_SEC, env=_env(home),
+                                  stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            done = None
     finally:
         os.close(lock)
-    if done.returncode != 0:
+    late = ""
+    if done is None:
+        snap = _show(job.unit)
+        if snap.get("LoadState") != "loaded":
+            raise RuntimeError(f"systemd-run did not answer within {START_TIMEOUT_SEC}s and "
+                               f"{job.unit}.service was not loaded when checked: job not started "
+                               "(check status before reusing the slug)")
+        late = (f"systemd-run timed out after {START_TIMEOUT_SEC}s, but the unit is "
+                f"{snap.get('ActiveState')}/{snap.get('SubState')}\n")
+    elif done.returncode != 0:
         raise RuntimeError(f"systemd-run could not start {job.unit}.service: "
                            f"{done.stderr.strip()[:500]}")
     slug = job.unit[len(PREFIX):]
     unenforced = (f"read-deny globs srt cannot walk, applied to this repo's work tree only "
                   f"(not its git dirs): {', '.join(job.unenforced)}\n" if job.unenforced else "")
     return (f"started {job.unit}.service in {job.repo} "
-            f"(profile {job.profile}, stopped after {job.runtime}s)\nlog: {log}\n{unenforced}"
+            f"(profile {job.profile}, stopped after {job.runtime}s)\n{late}log: {log}\n{unenforced}"
             f"outcome: status slug={slug} wait_sec<={MAX_WAIT_SEC}; "
             f"host side: wait-for unit {job.unit} --user")
 
@@ -675,7 +790,7 @@ def tool_status(args: object, home: Path) -> str:
         if _settled(snap) or time.monotonic() >= deadline:
             break
         time.sleep(2)
-    moved = restore_hint(unit, home)
+    moved = "\n".join(filter(None, (stuck_warning(unit, home), restore_hint(unit, home))))
     return (f"unit {unit}.service {snap.get('ActiveState')}/{snap.get('SubState')} "
             f"result={snap.get('Result')} status={snap.get('ExecMainStatus')} "
             f"started={snap.get('ExecMainStartTimestamp')} "
@@ -756,7 +871,14 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {"slug": _SLUG},
                      "required": ["slug"], "additionalProperties": False}},
 ]
-_HANDLERS = {"start": tool_start, "status": tool_status, "log": tool_log, "stop": tool_stop}
+# Claude Code starts a stdio MCP server in the session's project directory and
+# names it in CLAUDE_PROJECT_DIR (measured): the project whose settings it loads.
+def _session_project() -> Path:
+    return Path(os.path.abspath(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()))
+
+
+_HANDLERS = {"start": lambda args, home: tool_start(args, home, _session_project()),
+             "status": tool_status, "log": tool_log, "stop": tool_stop}
 
 SERVER_INFO = {"name": "jobs-broker", "version": "1.0.0"}
 _write_lock = threading.Lock()

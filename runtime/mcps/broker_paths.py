@@ -18,8 +18,15 @@ def roots(home: Path) -> list[Path]:
     return [Path(os.path.realpath(home / r)) for r in ROOTS]
 
 
-def is_git_dir(path: Path) -> bool:
-    return (path / "HEAD").is_file() and (path / "objects").is_dir() and (path / "refs").is_dir()
+# git takes a directory for a git dir only if it holds HEAD itself (setup.c,
+# is_git_directory); objects and refs may live elsewhere through commondir, and
+# HEAD may be a symlink. So whatever holds a HEAD entry counts.
+def is_git_dir(path: Path | str, dir_fd: int | None = None) -> bool:
+    try:
+        os.stat(os.path.join(path, "HEAD"), dir_fd=dir_fd, follow_symlinks=False)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    return True
 
 
 def canonical(raw: object, home: Path, kind: str = "dir", git_ok: bool = False) -> tuple:
