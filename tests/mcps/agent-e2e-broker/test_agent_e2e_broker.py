@@ -404,8 +404,12 @@ class UnitBindTests(Fixture):
             logs = [p.read_text() for p in self.out.glob("*/out/runs/demo/new/1/setup.log")]
             self.assertNotIn("SECRET-CANARY", text + "".join(logs))
             self.assertIn("not the directory that was checked", text)
+            self.assertIn("harness exit 125", text)
         finally:
-            needed.unlink(missing_ok=True)
+            if needed.is_symlink():
+                needed.unlink()
+            else:
+                shutil.rmtree(needed, ignore_errors=True)
             shutil.rmtree(needed.with_name(needed.name + "-moved"), ignore_errors=True)
             shutil.rmtree(secret, ignore_errors=True)
 

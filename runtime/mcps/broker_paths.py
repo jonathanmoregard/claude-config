@@ -63,10 +63,12 @@ def canonical(raw: object, home: Path, kind: str = "dir", git_ok: bool = False) 
 # swapped for a symlink after canonical() checked it would be bound instead.
 # A unit's first process therefore proves each bound path is the inode that was
 # checked, from inside its own mount namespace, before anything else runs.
-# Arguments: PATH DEV:INO ... -- REST; the caller defines `refuse`.
+# Arguments: STAT PATH DEV:INO ... -- REST, STAT an absolute path so the
+# unit's PATH cannot pick it; the caller defines `refuse`.
 VERIFY_BINDS = r'''
+stat_bin=$1; shift
 while [ "$1" != -- ]; do
-  if [ "$(stat -c %d:%i -- "$1")" != "$2" ]; then
+  if [ "$("$stat_bin" -c %d:%i -- "$1")" != "$2" ]; then
     echo "$1 is not the directory that was checked; not run"
     refuse
   fi
@@ -76,5 +78,7 @@ shift
 '''
 
 
-def verify_binds_args(pairs) -> list:
-    return [*(a for p, ident in pairs for a in (str(p), ident)), "--"]
+def verify_binds_args(stat_bin: str, pairs) -> list:
+    if not os.path.isabs(stat_bin):
+        raise RuntimeError(f"stat must be an absolute path: {stat_bin!r}")
+    return [stat_bin, *(a for p, ident in pairs for a in (str(p), ident)), "--"]

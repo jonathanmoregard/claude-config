@@ -30,6 +30,9 @@ def load_server():
     return module
 
 
+STAT = shutil.which("stat")
+
+
 def ident(path: Path) -> str:
     st = os.stat(path)
     return f"{st.st_dev}:{st.st_ino}"
@@ -402,7 +405,9 @@ class PropertyTests(Home):
         props = self.server.properties(job, self.home)
         bound = {v.lstrip("-") for key in ("BindPaths", "BindReadOnlyPaths") for v in values(props, key)}
         cmd = self.server.start_argv(job, self.home)
-        checked = set(cmd[cmd.index("jobs-broker") + 2:cmd.index("--", cmd.index("jobs-broker")):2])
+        stat_at = cmd.index("jobs-broker") + 2
+        self.assertEqual(cmd[stat_at], f"{self.server.SYSTEM_BIN}/stat")
+        checked = set(cmd[stat_at + 1:cmd.index("--", stat_at):2])
         under_roots = {p for p in bound if p.startswith((str(self.home / "Repos"),
                                                          str(self.home / "worktrees")))}
         self.assertTrue(under_roots)
@@ -456,7 +461,7 @@ class WrapperTests(unittest.TestCase):
 
     def run_wrapper(self, want: str, *argv: str) -> subprocess.CompletedProcess:
         return subprocess.run(["bash", "-c", self.server.WRAPPER, "jobs-broker",
-                               str(self.dir / "tmp"), str(self.dir), want, "--", *argv],
+                               str(self.dir / "tmp"), STAT, str(self.dir), want, "--", *argv],
                               capture_output=True, text=True, timeout=30)
 
     def test_runs_argv_and_appends_markers(self) -> None:
@@ -473,7 +478,7 @@ class WrapperTests(unittest.TestCase):
     def test_term_reports_a_stop(self) -> None:
         import signal
         proc = subprocess.Popen(["bash", "-c", self.server.WRAPPER, "jobs-broker", str(self.dir / "tmp"),
-                                 str(self.dir), ident(self.dir), "--", "sleep", "30"],
+                                 STAT, str(self.dir), ident(self.dir), "--", "sleep", "30"],
                                 stdout=subprocess.PIPE, text=True, start_new_session=True)
         time.sleep(0.5)
         os.killpg(proc.pid, signal.SIGTERM)

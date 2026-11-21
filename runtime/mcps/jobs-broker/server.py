@@ -395,7 +395,7 @@ def start_argv(job: Job, home: Path) -> list:
         cmd += ["-p", prop]
     return [*cmd, "--", f"{SYSTEM_BIN}/env", "-i", *env, f"{SYSTEM_BIN}/bash", "-c", WRAPPER,
             "jobs-broker", SRT_TMPDIR,
-            *verify_binds_args([(job.repo, job.ident), *job.readonly]),
+            *verify_binds_args(f"{SYSTEM_BIN}/stat", [(job.repo, job.ident), *job.readonly]),
             SRT, "-s", str(policy_path(home, job.unit)), "--", *job.argv]
 
 

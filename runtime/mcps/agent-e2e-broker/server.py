@@ -407,7 +407,7 @@ _SUPERVISOR = ('unit=$1; systemctl=$2; shift 2; '
 def _supervised(argv: list[str], policy: dict, campaign: Path, runtime: int) -> list[str]:
     path = ":".join(policy["path"])
     tools = {name: shutil.which(name, path=path)
-             for name in ("setpriv", "bash", "env", "systemd-run", "systemctl", "python3")}
+             for name in ("setpriv", "bash", "env", "stat", "systemd-run", "systemctl", "python3")}
     missing = [name for name, found in tools.items() if not found]
     if missing:
         raise RuntimeError(f"BROKEN safety boundary: not on policy path: {', '.join(missing)}")
@@ -421,7 +421,7 @@ def _supervised(argv: list[str], policy: dict, campaign: Path, runtime: int) -> 
             "agent-e2e-supervisor", unit, tools["systemctl"],
             *start, "--", tools["env"], "-i", *env,
             tools["bash"], "-c", _VERIFY_THEN_EXEC, "agent-e2e-broker",
-            *verify_binds_args(policy["readOnlyPaths"]),
+            *verify_binds_args(tools["stat"], policy["readOnlyPaths"]),
             tools["python3"], "-I", "-c", _SCOPE_ABSTRACT_SOCKETS, *argv]
 
 
