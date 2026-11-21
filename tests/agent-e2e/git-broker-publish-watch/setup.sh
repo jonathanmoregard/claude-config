@@ -28,33 +28,13 @@ printf 'e2e/git-broker-%s\n' "$token" >"$work/branch.txt"
 printf 'Scratch file from the git-broker agent e2e (%s). The PR is closed by the grader.\n' \
   "$token" >"$repo/experiments/e2e-git-broker-probe.txt"
 
-python3 - "$run" "$HOME" "$(dirname "$0")/../_lib/mcp_stub.py" <<'PY'
-import json, subprocess, sys
+python3 "$(dirname "$0")/register_mcp.py" "$run" "$HOME" "$(dirname "$0")/../_lib/mcp_stub.py"
+
+python3 - "$HOME" <<'PY'
+import json, sys
 from pathlib import Path
 
-run, home, mcp_stub = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
-servers = json.loads((home / ".claude" / "mcp-servers.json").read_text(encoding="utf-8"))
-if "github" in servers:
-    # github-mux is a uv script, not a stdlib one the dispatcher can run:
-    # registered as-is, with the arm's own server.py and config.json.
-    cfg = dict(servers["github"])
-    live = "/home/jonathan/.claude/"
-    cfg["args"] = [str(home / ".claude" / arg[len(live):]) if arg.startswith(live) else arg
-                   for arg in cfg.get("args", [])]
-    # The harness mounts the real HOME read-only, so uv's default cache is unwritable.
-    cfg["env"] = {**(cfg.get("env") or {}), "HOME": "/home/jonathan",
-                  "UV_CACHE_DIR": str(run / "uv-cache")}
-    (run / "mcp.json").write_text(json.dumps({"mcpServers": {"github": cfg}}), encoding="utf-8")
-if "git_broker" in servers:
-    cfg = servers["git_broker"]
-    env = {**(cfg.get("env") or {}), "HOME": "/home/jonathan"}
-    argv = [sys.executable, mcp_stub, "git_broker",
-            str(home / ".claude" / "mcps" / "git-broker" / "server.py"),
-            *(f"--env={k}={v}" for k, v in env.items())]
-    if "timeout" in cfg:
-        argv.append(f"--timeout={cfg['timeout']}")
-    subprocess.run(argv, check=True)
-
+home = Path(sys.argv[1])
 settings_path = home / ".claude" / "settings.json"
 settings = json.loads(settings_path.read_text(encoding="utf-8"))
 settings["sandbox"] = {

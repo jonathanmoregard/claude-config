@@ -59,8 +59,9 @@ def dispatch(patched=False, input=None, **env):
 
 
 def refused(out, needle):
-    assert out.returncode != 0
+    assert out.returncode == 2
     assert out.stdout == ""
+    assert out.stderr.startswith("dev-mcp dispatch: ")
     assert needle in out.stderr
 
 
@@ -154,7 +155,7 @@ def test_e2e_stub_refuses_a_directory_target(run):
 
 
 def test_e2e_stub_refuses_when_no_target_is_named(run):
-    refused(dispatch(**stub_env(run, None)), "E2E_MCP_STUB")
+    refused(dispatch(**stub_env(run, None)), "E2E_MCP_STUB is not set")
 
 
 def test_e2e_stub_refuses_when_no_run_dir_is_set(run):
@@ -251,8 +252,9 @@ def test_llmux_refuses_a_worktree_when_no_venv_exists_anywhere(llmux, tmp_path):
     mod, repo = llmux
     (repo / ".venv" / "bin" / "python").unlink()
     wt = add_worktree(repo, tmp_path / "wt", venv=False)
-    with pytest.raises(mod.Refused, match="python"):
+    with pytest.raises(mod.Refused) as exc:
         mod.resolve(llmux_env(wt))
+    assert str(exc.value) == f"{wt}/.venv/bin/python is not a file"
 
 
 def test_llmux_accepts_a_worktree_with_a_relative_gitdir(llmux, tmp_path):
@@ -300,8 +302,9 @@ def test_llmux_refuses_tools_that_are_not_plain_names(llmux, tools):
 def test_llmux_refuses_a_repo_without_its_venv(llmux):
     mod, repo = llmux
     (repo / ".venv" / "bin" / "python").unlink()
-    with pytest.raises(mod.Refused, match="python"):
+    with pytest.raises(mod.Refused) as exc:
         mod.resolve(llmux_env(repo))
+    assert str(exc.value) == f"{repo}/.venv/bin/python is not a file"
 
 
 def test_llmux_production_constant_is_the_real_checkout():
