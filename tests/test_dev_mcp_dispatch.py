@@ -265,7 +265,7 @@ def test_llmux_accepts_a_worktree_with_a_relative_gitdir(llmux, tmp_path):
 def test_llmux_refuses_another_repo(llmux, tmp_path):
     mod, _ = llmux
     other = fake_gdocs(tmp_path / "elsewhere")
-    with pytest.raises(mod.Refused, match="not"):
+    with pytest.raises(mod.Refused, match="or a worktree of it"):
         mod.resolve(llmux_env(other))
 
 
@@ -273,13 +273,13 @@ def test_llmux_refuses_a_worktree_of_another_repo(llmux, tmp_path):
     mod, _ = llmux
     other = fake_gdocs(tmp_path / "elsewhere")
     wt = add_worktree(other, tmp_path / "wt")
-    with pytest.raises(mod.Refused, match="not"):
+    with pytest.raises(mod.Refused, match="or a worktree of it"):
         mod.resolve(llmux_env(wt))
 
 
 def test_llmux_refuses_a_subdirectory_of_the_repo(llmux):
     mod, repo = llmux
-    with pytest.raises(mod.Refused):
+    with pytest.raises(mod.Refused, match="or a worktree of it"):
         mod.resolve(llmux_env(repo / "mockdocs"))
 
 

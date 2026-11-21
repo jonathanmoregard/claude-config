@@ -21,4 +21,5 @@ config = json.loads(config_path.read_text(encoding="utf-8"))
 config["appRunner"]["stateRoot"] = str(run / "state")
 config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
 PY
-python3 "$(dirname "$0")/../_lib/mcp_stub.py" klaffat-app-runner "$run/runner/server.py"
+timeout_ms=$(jq -r '."klaffat-app-runner".timeout // 1900000' "$HOME/.claude/mcp-servers.json" 2>/dev/null || echo 1900000)
+python3 "$(dirname "$0")/../_lib/mcp_stub.py" klaffat-app-runner "$run/runner/server.py" --timeout "$timeout_ms"

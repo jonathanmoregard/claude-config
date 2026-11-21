@@ -11,7 +11,10 @@ script's argv can:
 
 The entry's `env`, which the policy does not compare, picks a row of PROFILES
 with DEV_MCP_PROFILE; each row builds exactly one argv shape and execs it with
-stdio untouched. A new dev server is a new row, through a reviewed PR.
+stdio untouched. A new argv shape is a new row, through a reviewed PR.
+`e2e-stub` runs whatever stdlib-Python script the test names (git-broker's
+scenario even runs the real broker that way): test code, reviewed with the
+test, not by this row.
 
   e2e-stub  E2E_RUN, E2E_MCP_STUB (a script under E2E_RUN), optional
             E2E_MCP_STUB_ARGS (JSON list of strings) ->
@@ -22,6 +25,7 @@ stdio untouched. A new dev server is a new row, through a reviewed PR.
                 --transport stdio --single-user --tools <tools...>
 
 The path rules keep intent legible; they are not a security boundary.
+E2E_RUN is caller-chosen; the containment check catches mistakes, not intent.
 """
 
 from __future__ import annotations
