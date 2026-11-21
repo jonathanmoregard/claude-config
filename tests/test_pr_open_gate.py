@@ -371,13 +371,21 @@ def test_binary_file_need_not_be_read_by_a_passing_review(sb):
     assert sb.gate() is None
 
 
+def test_text_file_marked_binary_by_attributes_still_needs_a_read(sb):
+    sb.commit(".gitattributes", "*.sh -diff\n")
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    sb.review("PASS", reads=[".gitattributes"])
+    out = sb.gate()
+    assert is_deny(out) and "scripts/run.sh" in reason(out)
+
+
 def test_binary_file_still_needs_a_passing_review_on_the_branch(sb):
     (sb.work / "resources").mkdir()
     (sb.work / "resources" / "model.bin").write_bytes(b"\0\1\2weights" * 100)
     git(sb.work, "add", "-A")
     git(sb.work, "commit", "-qm", "model")
     out = sb.gate()
-    assert is_deny(out) and "advice-refine-test-loop" in reason(out)
+    assert is_deny(out) and "no advisor verdict is recorded" in reason(out)
 
 
 def test_two_reviews_together_cover_the_diff(sb):

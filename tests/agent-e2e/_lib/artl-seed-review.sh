@@ -14,9 +14,11 @@ python3 - "$HOOK" "$WORK" <<'PY'
 import glob, json, os, subprocess, sys
 hook, work = sys.argv[1:3]
 # Text files only: an advisor's Read cannot review a binary (numstat "-").
-numstat = subprocess.run(["git", "-C", work, "diff", "--numstat", "origin/main...HEAD"],
-                         capture_output=True, text=True, check=True).stdout.splitlines()
-files = [row.split("\t", 2)[2] for row in numstat if not row.startswith("-\t")]
+numstat = subprocess.run(["git", "-C", work, "diff", "--numstat", "-z", "--no-renames",
+                          "origin/main...HEAD"],
+                         capture_output=True, text=True, check=True).stdout.split("\0")
+files = [row.split("\t", 2)[2] for row in numstat
+         if row.count("\t") >= 2 and not row.startswith("-\t")]
 prompt = ("Assume this finished change can ship broken. Try to falsify its acceptance "
           "claims.\nRe-read fresh:\n" + "\n".join(os.path.join(work, f) for f in files))
 verdict = json.dumps({"verdict": "PASS", "verdict_reason": "", "findings": []})
