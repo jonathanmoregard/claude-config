@@ -1,0 +1,1 @@
+Scratch file from the git-broker agent e2e (new-1-1795253202). The PR is closed by the grader.
