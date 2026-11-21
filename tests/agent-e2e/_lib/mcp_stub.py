@@ -21,6 +21,17 @@ POLICY = pathlib.Path("/etc/claude-code/managed-settings.d/50-mcp.json")
 LOCAL = pathlib.Path(__file__).resolve().parents[3] / "runtime/scripts/dev-mcp/dispatch.py"
 
 
+def require_allowed(argv: list[str]) -> None:
+    try:
+        allowed = [e.get("serverCommand") for e in
+                   json.loads(POLICY.read_text(encoding="utf-8"))["allowedMcpServers"]]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise SystemExit(f"{POLICY} is unreadable or has no allowedMcpServers list: {exc!r}")
+    if argv not in allowed:
+        raise SystemExit(f"{POLICY} has no allowedMcpServers entry with serverCommand "
+                         f"{' '.join(argv)}; the managed allowlist would drop the stub")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("name")
@@ -36,9 +47,11 @@ def main() -> None:
     env.update(DEV_MCP_PROFILE="e2e-stub", E2E_RUN=str(run), E2E_MCP_STUB=opts.stub)
     if opts.args:
         env["E2E_MCP_STUB_ARGS"] = json.dumps(opts.args)
-    if not served.is_file() and POLICY.is_file():
-        raise SystemExit(f"{POLICY} exists but the served dispatcher {served} does not; "
-                         "the local one would never match the allowlist")
+    if POLICY.is_file():
+        if not served.is_file():
+            raise SystemExit(f"{POLICY} exists but the served dispatcher {served} does not; "
+                             "the local one would never match the allowlist")
+        require_allowed([PYTHON, str(served)])
     entry = {"type": "stdio", "command": PYTHON,
              "args": [str(served if served.is_file() else LOCAL)], "env": env}
     if opts.timeout is not None:

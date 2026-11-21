@@ -16,6 +16,7 @@ from pathlib import Path
 
 LIVE_HOME = "/home/jonathan"
 POLICY_SERVERS = Path("/etc/claude-code/mcp-servers.json")
+DISPATCHER_PYTHON = "/run/current-system/sw/bin/python3"
 
 
 def arm_path(arg: str, home: Path) -> str:
@@ -45,6 +46,10 @@ def github_entry(arm_servers: dict, home: Path, run: Path,
 
 
 def broker_argv(cfg: dict, home: Path, mcp_stub: str) -> list[str]:
+    if cfg.get("command") != DISPATCHER_PYTHON:
+        print(f"git_broker command is {cfg.get('command')!r}, but the stub dispatcher "
+              f"always runs {DISPATCHER_PYTHON}", file=sys.stderr)
+        sys.exit(2)
     env = {**(cfg.get("env") or {}), "HOME": LIVE_HOME}
     script, *script_args = cfg["args"]
     options = [f"--env={k}={v}" for k, v in env.items()]

@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import os
 import pathlib
-import subprocess
 
 import pytest
 
@@ -47,8 +45,11 @@ def test_no_github_anywhere_registers_nothing(tmp_path):
     assert reg.github_entry({}, tmp_path, tmp_path, tmp_path / "absent") is None
 
 
+PYTHON = "/run/current-system/sw/bin/python3"
+
+
 def test_broker_argv_rewrites_the_script_and_passes_the_rest_after_dashes(tmp_path):
-    cfg = {"args": ["/home/jonathan/.claude/mcps/git-broker/server.py", "--x", "y"],
+    cfg = {"command": PYTHON, "args": ["/home/jonathan/.claude/mcps/git-broker/server.py", "--x", "y"],
            "env": {"K": "v"}, "timeout": 5}
     argv = reg.broker_argv(cfg, tmp_path, "stub.py")
     assert argv[1:] == ["stub.py", "--env=K=v", "--env=HOME=/home/jonathan", "--timeout=5",
@@ -57,7 +58,7 @@ def test_broker_argv_rewrites_the_script_and_passes_the_rest_after_dashes(tmp_pa
 
 
 def test_broker_argv_without_extra_args_has_no_separator(tmp_path):
-    cfg = {"args": ["/home/jonathan/.claude/mcps/git-broker/server.py"]}
+    cfg = {"command": PYTHON, "args": ["/home/jonathan/.claude/mcps/git-broker/server.py"]}
     assert "--" not in reg.broker_argv(cfg, tmp_path, "stub.py")
 
 
@@ -76,13 +77,31 @@ def test_policy_lacking_github_fails_setup_when_the_arm_wants_it(tmp_path, capsy
     assert f"{policy} has no github entry" in capsys.readouterr().err
 
 
-def test_broker_argv_parses_with_the_stub_helper_argparse(tmp_path):
+@pytest.mark.parametrize("cfg", [
+    {"args": ["/home/jonathan/.claude/mcps/git-broker/server.py"]},
+    {"command": "uv", "args": ["/home/jonathan/.claude/mcps/git-broker/server.py"]},
+    {"command": "python3", "args": ["/home/jonathan/.claude/mcps/git-broker/server.py"]},
+])
+def test_broker_argv_refuses_a_command_the_dispatcher_would_not_run(tmp_path, capsys, cfg):
+    with pytest.raises(SystemExit) as exc:
+        reg.broker_argv(cfg, tmp_path, "stub.py")
+    assert exc.value.code == 2
+    assert PYTHON in capsys.readouterr().err
+
+
+def test_broker_argv_parses_with_the_stub_helper_argparse(tmp_path, monkeypatch):
     run = tmp_path / "run"
     run.mkdir()
-    cfg = {"args": ["/home/jonathan/.claude/mcps/git-broker/server.py", "--x", "y"],
+    cfg = {"command": PYTHON, "args": ["/home/jonathan/.claude/mcps/git-broker/server.py", "--x", "y"],
            "env": {"K": "v"}, "timeout": 5}
     argv = reg.broker_argv(cfg, tmp_path, str(STUB))
-    subprocess.run(argv, check=True, env={**os.environ, "E2E_RUN": str(run)})
+    spec = importlib.util.spec_from_file_location("mcp_stub", STUB)
+    stub = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(stub)
+    monkeypatch.setattr(stub, "POLICY", tmp_path / "no-policy.json")
+    monkeypatch.setenv("E2E_RUN", str(run))
+    monkeypatch.setattr("sys.argv", argv[1:])
+    stub.main()
     entry = json.loads((run / "mcp.json").read_text())["mcpServers"]["git_broker"]
     assert entry["timeout"] == 5
     assert entry["env"]["K"] == "v"

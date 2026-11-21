@@ -320,22 +320,40 @@ def test_llmux_refusal_reaches_stderr_and_exit_code(tmp_path):
 
 # --- the scenario helper -----------------------------------------------------
 
-def write_entry(run, *argv, served=None):
-    env = {**os.environ, "E2E_RUN": str(run)}
+def load_helper():
+    spec = importlib.util.spec_from_file_location("mcp_stub", LIB)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def write_entry(run, *argv, served=None, policy=None, monkeypatch):
+    mod = load_helper()
+    monkeypatch.setattr(mod, "POLICY", policy if policy is not None else run / "no-policy.json")
+    monkeypatch.setenv("E2E_RUN", str(run))
     if served is not None:
-        env["DEV_MCP_DISPATCH_SERVED"] = str(served)
-    out = subprocess.run([sys.executable, str(LIB), *argv], env=env,
-                         capture_output=True, text=True, timeout=30)
-    assert out.returncode == 0, out.stderr
+        monkeypatch.setenv("DEV_MCP_DISPATCH_SERVED", str(served))
+    else:
+        monkeypatch.delenv("DEV_MCP_DISPATCH_SERVED", raising=False)
+    monkeypatch.setattr(sys, "argv", ["mcp_stub.py", *argv])
+    mod.main()
     return json.loads((run / "mcp.json").read_text())["mcpServers"]
 
 
-def test_helper_writes_the_fixed_dispatcher_entry(run, tmp_path):
+def policy_allowing(tmp_path, *argvs):
+    policy = tmp_path / "50-mcp.json"
+    policy.write_text(json.dumps({"allowManagedMcpServersOnly": True,
+                                  "allowedMcpServers": [{"serverCommand": a} for a in argvs]}))
+    return policy
+
+
+def test_helper_writes_the_fixed_dispatcher_entry(run, tmp_path, monkeypatch):
     served = tmp_path / "served" / "dispatch.py"
     served.parent.mkdir()
     served.write_text("")
     stub = run / "bin" / "s"
-    entry = write_entry(run, "vault", str(stub), "--", "-x", "y", served=served)["vault"]
+    entry = write_entry(run, "vault", str(stub), "--", "-x", "y", served=served,
+                        monkeypatch=monkeypatch)["vault"]
     assert entry["type"] == "stdio"
     assert entry["command"] == "/run/current-system/sw/bin/python3"
     assert entry["args"] == [str(served)]
@@ -345,44 +363,78 @@ def test_helper_writes_the_fixed_dispatcher_entry(run, tmp_path):
     assert json.loads(entry["env"]["E2E_MCP_STUB_ARGS"]) == ["-x", "y"]
 
 
-def test_helper_falls_back_to_this_checkouts_dispatcher(run, tmp_path):
-    servers = write_entry(run, "vault", str(run / "bin" / "s"), served=tmp_path / "absent.py")
+def test_helper_falls_back_to_this_checkouts_dispatcher(run, tmp_path, monkeypatch):
+    servers = write_entry(run, "vault", str(run / "bin" / "s"), served=tmp_path / "absent.py",
+                          monkeypatch=monkeypatch)
     assert servers["vault"]["args"] == [str(DISPATCH)]
 
 
-def test_helper_merges_extra_env_and_keeps_earlier_servers(run, tmp_path):
+def test_helper_merges_extra_env_and_keeps_earlier_servers(run, tmp_path, monkeypatch):
     absent = tmp_path / "absent.py"
-    write_entry(run, "a", str(run / "bin" / "a"), served=absent)
-    servers = write_entry(run, "b", str(run / "bin" / "b"), "--env", "K=v=w", served=absent)
+    write_entry(run, "a", str(run / "bin" / "a"), served=absent, monkeypatch=monkeypatch)
+    servers = write_entry(run, "b", str(run / "bin" / "b"), "--env", "K=v=w", served=absent,
+                          monkeypatch=monkeypatch)
     assert set(servers) == {"a", "b"}
     assert servers["b"]["env"]["K"] == "v=w"
     assert "E2E_MCP_STUB_ARGS" not in servers["b"]["env"]
     assert "timeout" not in servers["b"]
 
 
-def test_helper_sets_a_timeout(run, tmp_path):
+def test_helper_sets_a_timeout(run, tmp_path, monkeypatch):
     servers = write_entry(run, "a", str(run / "bin" / "a"), "--timeout", "600000",
-                          served=tmp_path / "absent.py")
+                          served=tmp_path / "absent.py", monkeypatch=monkeypatch)
     assert servers["a"]["timeout"] == 600000
 
 
-def load_helper():
-    spec = importlib.util.spec_from_file_location("mcp_stub", LIB)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
 def test_helper_fails_instead_of_falling_back_when_the_policy_exists(run, tmp_path, monkeypatch):
-    mod = load_helper()
-    policy = tmp_path / "50-mcp.json"
-    policy.write_text("{}")
-    monkeypatch.setattr(mod, "POLICY", policy)
-    monkeypatch.setattr(mod, "SERVED", str(tmp_path / "absent.py"))
-    monkeypatch.setenv("E2E_RUN", str(run))
-    monkeypatch.setattr(sys, "argv", ["mcp_stub.py", "vault", str(run / "bin" / "s")])
+    policy = policy_allowing(tmp_path)
     with pytest.raises(SystemExit) as exc:
-        mod.main()
+        write_entry(run, "vault", str(run / "bin" / "s"), served=tmp_path / "absent.py",
+                    policy=policy, monkeypatch=monkeypatch)
     assert str(exc.value) == (f"{policy} exists but the served dispatcher {tmp_path}/absent.py "
                               "does not; the local one would never match the allowlist")
+    assert not (run / "mcp.json").exists()
+
+
+def served_file(tmp_path):
+    served = tmp_path / "served" / "dispatch.py"
+    served.parent.mkdir()
+    served.write_text("")
+    return served
+
+
+def test_helper_registers_when_the_policy_allows_its_argv(run, tmp_path, monkeypatch):
+    served = served_file(tmp_path)
+    policy = policy_allowing(tmp_path, ["/other"], ["/run/current-system/sw/bin/python3", str(served)])
+    servers = write_entry(run, "vault", str(run / "bin" / "s"), served=served, policy=policy,
+                          monkeypatch=monkeypatch)
+    assert servers["vault"]["args"] == [str(served)]
+
+
+@pytest.mark.parametrize("allowed", [
+    [],
+    [["/run/current-system/sw/bin/python3", "/elsewhere/dispatch.py"]],
+    [["/usr/bin/python3", "SERVED"]],
+    [["/run/current-system/sw/bin/python3", "SERVED", "--extra"]],
+])
+def test_helper_fails_when_the_policy_lacks_its_argv(run, tmp_path, monkeypatch, allowed):
+    served = served_file(tmp_path)
+    policy = policy_allowing(tmp_path, *[[str(served) if a == "SERVED" else a for a in argv]
+                                         for argv in allowed])
+    with pytest.raises(SystemExit) as exc:
+        write_entry(run, "vault", str(run / "bin" / "s"), served=served, policy=policy,
+                    monkeypatch=monkeypatch)
+    message = str(exc.value)
+    assert str(policy) in message
+    assert f"/run/current-system/sw/bin/python3 {served}" in message
+    assert not (run / "mcp.json").exists()
+
+
+def test_helper_fails_on_an_unparseable_policy(run, tmp_path, monkeypatch):
+    policy = tmp_path / "50-mcp.json"
+    policy.write_text("not json")
+    with pytest.raises(SystemExit) as exc:
+        write_entry(run, "vault", str(run / "bin" / "s"), served=served_file(tmp_path),
+                    policy=policy, monkeypatch=monkeypatch)
+    assert str(policy) in str(exc.value)
     assert not (run / "mcp.json").exists()
