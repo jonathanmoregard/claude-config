@@ -591,6 +591,12 @@ class RealUnitTests(unittest.TestCase):
         # Lets a candidate sandbox-runtime build be proven on the real path before it deploys.
         self.server.SRT = os.environ.get("JOBS_BROKER_TEST_SRT", self.server.SRT)
         self.home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        # A CI runner has a user manager but no srt and no session settings.
+        if not os.access(self.server.SRT, os.X_OK):
+            self.skipTest(f"sandbox-runtime not at {self.server.SRT}")
+        if not (self.home / ".claude/settings.json").is_file():
+            self.skipTest("no ~/.claude/settings.json to take the session sandbox from")
+        (self.home / "worktrees").mkdir(exist_ok=True)  # absent on a CI runner
         self.dir = Path(tempfile.mkdtemp(prefix=".jobs-broker-test-", dir=self.home / "worktrees"))
         self.repo = self.dir / "repo"
         self.repo.mkdir()

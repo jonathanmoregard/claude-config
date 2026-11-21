@@ -89,6 +89,8 @@ class Fixture(unittest.TestCase):
     def setUp(self) -> None:
         self.server = load_server()
         self.home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        for root in ("Repos", "worktrees"):  # absent on a CI runner
+            (self.home / root).mkdir(exist_ok=True)
         self.tmp = tempfile.TemporaryDirectory(prefix=".agent-e2e-broker-test-",
                                                dir=self.home / "worktrees")
         root = Path(self.tmp.name)
