@@ -18,7 +18,7 @@ stdio untouched. A new dev server is a new row, through a reviewed PR.
             PYTHON <stub> <args...>
   llmux     DEV_MCP_REPO (GDOCS_REPO or a git worktree of it), DEV_MCP_TOOLS
             (names, space-separated or a JSON list) ->
-            <repo>/.venv/bin/python <repo>/mockdocs/serve.py
+            <repo or GDOCS_REPO>/.venv/bin/python <repo>/mockdocs/serve.py
                 --transport stdio --single-user --tools <tools...>
 
 The path rules keep intent legible; they are not a security boundary.
@@ -103,7 +103,10 @@ def llmux(env: Mapping[str, str]) -> list[str]:
     if repo != home and common_git_dir(repo) != home / ".git":
         raise Refused(f"DEV_MCP_REPO {given} is not {GDOCS_REPO} or a worktree of it")
     tools = tool_names(env.get("DEV_MCP_TOOLS") or "")
-    python, serve = repo / ".venv/bin/python", repo / "mockdocs/serve.py"
+    serve = repo / "mockdocs/serve.py"
+    # Worktrees carry no venv of their own; borrow the main checkout's.
+    python = next((p for p in (repo / ".venv/bin/python", home / ".venv/bin/python")
+                   if p.is_file()), repo / ".venv/bin/python")
     for path in (python, serve):
         if not path.is_file():
             raise Refused(f"{path} is not a file")

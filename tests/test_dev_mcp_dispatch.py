@@ -180,13 +180,15 @@ def fake_gdocs(root: pathlib.Path) -> pathlib.Path:
     return repo
 
 
-def add_worktree(repo: pathlib.Path, wt: pathlib.Path, gitdir_line=None) -> pathlib.Path:
+def add_worktree(repo: pathlib.Path, wt: pathlib.Path, gitdir_line=None,
+                 venv=True) -> pathlib.Path:
     admin = repo / ".git" / "worktrees" / wt.name
     admin.mkdir(parents=True)
     (admin / "commondir").write_text("../..\n")
-    (wt / ".venv" / "bin").mkdir(parents=True)
-    (wt / ".venv" / "bin" / "python").write_text("")
-    (wt / "mockdocs").mkdir()
+    if venv:
+        (wt / ".venv" / "bin").mkdir(parents=True)
+        (wt / ".venv" / "bin" / "python").write_text("")
+    (wt / "mockdocs").mkdir(parents=True)
     (wt / "mockdocs" / "serve.py").write_text("")
     (wt / ".git").write_text(f"gitdir: {gitdir_line or admin}\n")
     return wt
@@ -230,6 +232,27 @@ def test_llmux_accepts_a_worktree_of_the_repo(llmux, tmp_path):
     mod, repo = llmux
     wt = add_worktree(repo, tmp_path / "wt")
     assert mod.resolve(llmux_env(wt)) == expected(wt, "docs", "docs_preview")
+
+
+def test_llmux_worktree_without_a_venv_borrows_the_main_checkouts_python(llmux, tmp_path):
+    mod, repo = llmux
+    wt = add_worktree(repo, tmp_path / "wt", venv=False)
+    assert mod.resolve(llmux_env(wt)) == [f"{repo}/.venv/bin/python",
+                                          *expected(wt, "docs", "docs_preview")[1:]]
+
+
+def test_llmux_worktree_with_its_own_venv_uses_it(llmux, tmp_path):
+    mod, repo = llmux
+    wt = add_worktree(repo, tmp_path / "wt")
+    assert mod.resolve(llmux_env(wt))[0] == f"{wt}/.venv/bin/python"
+
+
+def test_llmux_refuses_a_worktree_when_no_venv_exists_anywhere(llmux, tmp_path):
+    mod, repo = llmux
+    (repo / ".venv" / "bin" / "python").unlink()
+    wt = add_worktree(repo, tmp_path / "wt", venv=False)
+    with pytest.raises(mod.Refused, match="python"):
+        mod.resolve(llmux_env(wt))
 
 
 def test_llmux_accepts_a_worktree_with_a_relative_gitdir(llmux, tmp_path):
