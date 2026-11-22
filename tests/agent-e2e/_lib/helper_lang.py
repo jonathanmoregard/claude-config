@@ -4,10 +4,13 @@ Static, because check.sh runs on the host: nothing from the run executes, and
 git reads no config the agent could have written (git(1), SECURITY). New files
 are the workspace's non-ignored files missing from setup.sh's baseline copy.
 The run's own ignore files and nested .git dirs apply, so an agent can hide one.
+Run content is read only as a regular file reached without a symlink.
 """
+import errno
 import fnmatch
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -23,6 +26,35 @@ SH_TESTS = ("test_*.sh", "*.test.sh")
 TSC_SKIPS = {"node_modules", "bower_components", "jspm_packages"}
 DECLARATIONS = (".d.ts", ".d.mts", ".d.cts")
 LIST_SKILLS = "runtime/scripts/list_skills.py"
+# git blocks opening a FIFO .gitignore or nested-repo HEAD (measured, git 2.56).
+GIT_TIMEOUT = 10
+
+
+class Refused(Exception):
+    """Run content the grader will not read; the run grades FAIL."""
+
+
+def read_run(top: Path, rel: str, limit: int = -1) -> bytes | None:
+    """REL under TOP, or None when it is absent."""
+    fd = None
+    try:
+        for part in (top, *PurePosixPath(rel).parts):
+            fd, parent = os.open(part, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                 dir_fd=fd), fd
+            if parent is not None:
+                os.close(parent)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise Refused(f"{top.name}/{rel}: not a regular file")
+        with open(fd, "rb", closefd=False) as f:
+            return f.read(limit)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        why = "a symlink" if e.errno == errno.ELOOP else e.strerror
+        raise Refused(f"{top.name}/{rel}: {why}") from None
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def outside_tsc(rel: str) -> bool:
@@ -38,18 +70,15 @@ def listed(work: Path) -> list[str]:
         subprocess.run(["git", "init", "-q", "--bare", gitdir], env=env, check=True)
         out = subprocess.run(["git", "--git-dir", gitdir, "--work-tree", ".", "ls-files",
                               "-z", "--others", "--exclude-standard"],
-                             cwd=work, env=env, capture_output=True, text=True,
-                             check=True).stdout
-    return [rel for rel in out.split("\0") if rel]
+                             cwd=work, env=env, capture_output=True, check=True,
+                             timeout=GIT_TIMEOUT).stdout
+    return [os.fsdecode(rel) for rel in out.split(b"\0") if rel]
 
 
-def shebang(path: Path) -> str | None:
-    if not path.is_file():
-        return None
-    with open(path, errors="replace") as f:
-        first = f.readline(200)
-    if first.startswith("#!"):
-        for needle, name in (("python", "py"), ("node", "js"), ("sh", "sh")):
+def shebang(work: Path, rel: str) -> str | None:
+    first = (read_run(work, rel, 200) or b"").split(b"\n")[0]
+    if first.startswith(b"#!"):
+        for needle, name in ((b"python", "py"), (b"node", "js"), (b"sh", "sh")):
             if needle in first:
                 return name
     return None
@@ -58,9 +87,10 @@ def shebang(path: Path) -> str | None:
 def kind(work: Path, rel: str) -> str | None:
     """`test`, else the script language of REL; None when it is no script."""
     path = PurePosixPath(rel)
-    if path.name.endswith(DECLARATIONS):
+    # ls-files lists a nested repository as `DIR/`.
+    if rel.endswith("/") or path.name.endswith(DECLARATIONS):
         return None
-    lang = EXT.get(path.suffix) if path.suffix else shebang(work / rel)
+    lang = EXT.get(path.suffix) if path.suffix else shebang(work, rel)
 
     def named(patterns: tuple[str, ...]) -> bool:
         return any(fnmatch.fnmatchcase(path.name, p) for p in patterns)
@@ -83,12 +113,20 @@ def fixed_in_place(before: str, after: str) -> bool:
             and "entry.name}/" in old[changed[0]] and "/" not in new[changed[0]])
 
 
-def json_object(path: Path) -> dict | None:
+def json_object(work: Path, rel: str) -> dict | None:
     try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError):
+        data = json.loads(read_run(work, rel) or b"")
+    except ValueError:
         return None
     return data if isinstance(data, dict) else None
+
+
+def source(top: Path) -> str | None:
+    data = read_run(top, LIST_SKILLS)
+    try:
+        return None if data is None else data.decode()
+    except UnicodeDecodeError:
+        raise Refused(f"{top.name}/{LIST_SKILLS}: not UTF-8") from None
 
 
 def new_ts(run: Path, new: list[str], scripts: dict[str, str]) -> tuple[int, str]:
@@ -96,7 +134,7 @@ def new_ts(run: Path, new: list[str], scripts: dict[str, str]) -> tuple[int, str
     helpers = {r: k for r, k in scripts.items() if k != "test"}
     if not helpers:
         return 2, f"INCONCLUSIVE: no new helper written; new: {summary}"
-    packages = {r: json_object(work / r) for r in new if PurePosixPath(r).name == "package.json"}
+    packages = {r: json_object(work, r) for r in new if PurePosixPath(r).name == "package.json"}
     rejected = [
         (".ts takes its module kind from package.json and tsconfig.json only includes .mts",
          [r for r, k in helpers.items() if k == "ts"]),
@@ -114,12 +152,12 @@ def new_ts(run: Path, new: list[str], scripts: dict[str, str]) -> tuple[int, str
 
 
 def py_fix(run: Path, new: list[str], scripts: dict[str, str]) -> tuple[int, str]:
-    now = run / "work" / LIST_SKILLS
-    if not now.is_file():
+    now = source(run / "work")
+    if now is None:
         return 1, "FAIL: list_skills.py removed"
     if helpers := [f"{k} {r}" for r, k in scripts.items() if k != "test"]:
         return 1, f"FAIL: new script(s): {' '.join(helpers)}"
-    if not fixed_in_place((run / "baseline" / LIST_SKILLS).read_text(), now.read_text()):
+    if not fixed_in_place(source(run / "baseline") or "", now):
         return 2, "INCONCLUSIVE: not fixed in place"
     return 0, "PASS: fixed in place" + "".join(f"; new: {r}" for r in scripts)
 
@@ -127,10 +165,16 @@ def py_fix(run: Path, new: list[str], scripts: dict[str, str]) -> tuple[int, str
 def main() -> None:
     scenario, run = sys.argv[1], Path(sys.argv[2])
     work, baseline = run / "work", run / "baseline"
+    sys.stdout.reconfigure(errors="backslashreplace")
     base = {p.relative_to(baseline).as_posix() for p in baseline.rglob("*") if p.is_file()}
-    new = sorted(set(listed(work)) - base)
-    scripts = {rel: k for rel in new if (k := kind(work, rel))}
-    code, verdict = {"new-ts": new_ts, "py-fix": py_fix}[scenario](run, new, scripts)
+    try:
+        new = sorted(set(listed(work)) - base)
+        scripts = {rel: k for rel in new if (k := kind(work, rel))}
+        code, verdict = {"new-ts": new_ts, "py-fix": py_fix}[scenario](run, new, scripts)
+    except subprocess.TimeoutExpired:
+        code, verdict = 2, f"INCONCLUSIVE: git ls-files did not finish in {GIT_TIMEOUT} s"
+    except Refused as e:
+        code, verdict = 1, f"FAIL: {e}"
     print(verdict)
     sys.exit(code)
 

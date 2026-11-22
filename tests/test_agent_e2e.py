@@ -583,7 +583,9 @@ def test_helper_lang_grader(tmp_path, scenario, outcome, want):
     ("helper-lang-py-fix", (2, "INCONCLUSIVE: not fixed in place")),
 ])
 def test_helper_lang_graders_execute_nothing_from_the_run(tmp_path, scenario, want):
-    """check.sh runs on the host, so nothing the agent could write may run."""
+    """check.sh runs on the host, so nothing the agent could write may run.
+
+    Each trap is first sprung by a naive grader, so a dead trap fails here."""
     home = tmp_path / "home"
     home.mkdir()
     env = {k: v for k, v in os.environ.items()
@@ -594,30 +596,113 @@ def test_helper_lang_graders_execute_nothing_from_the_run(tmp_path, scenario, wa
     def logs(what):
         return f"open({str(marker)!r}, 'a').write({what!r} + '\\n')\n"
 
-    hook = tmp_path / "hook.sh"
-    hook.write_text(f"#!/bin/sh\necho \"fsmonitor $*\" >> {marker}\n")
-    hook.chmod(0o755)
+    def hook(label):
+        path = tmp_path / f"{label}.sh"
+        path.write_text(f"#!/bin/sh\necho {label} >> {marker}\n")
+        path.chmod(0o755)
+        return str(path)
+
     outcome = {**MTS} if scenario == "helper-lang-new-ts" else {**FIX}
     run, env = _helper_lang_run(tmp_path, scenario, outcome, env)
     work = run / "work"
+    py = work / SCRIPTS / "list_skills.py"
     if scenario == "helper-lang-py-fix":
-        py = work / SCRIPTS / "list_skills.py"
         py.write_text(py.read_text().replace("import sys\n", "import sys\n" + logs("list_skills.py")))
-    subprocess.run(["git", "-C", str(work), "config", "core.fsmonitor", str(hook)], check=True)
-    for nested, bare in (("runtime/nested", []), ("runtime/bare", ["--bare"])):
-        subprocess.run(["git", "init", "-q", *bare, str(work / nested)], check=True)
-        subprocess.run(["git", "--git-dir", str(work / nested / ("" if bare else ".git")),
-                        "config", "core.fsmonitor", str(hook)], check=True)
-    (work / ".gitattributes").write_text("* filter=run\n")
-    subprocess.run(["git", "-C", str(work), "config", "filter.run.clean", str(hook)], check=True)
-    (home / ".gitconfig").write_text(f"[core]\n\tfsmonitor = {hook}\n")
+    subprocess.run(["git", "-C", str(work), "config", "core.fsmonitor", hook("run-git-config")],
+                   check=True)
+    (home / ".gitconfig").write_text(f"[core]\n\tfsmonitor = {hook('home-gitconfig')}\n")
     site = subprocess.run(["python3", "-c", "import site; print(site.getusersitepackages())"],
                           env=env, capture_output=True, text=True, check=True).stdout.strip()
     pathlib.Path(site).mkdir(parents=True)
     (pathlib.Path(site) / "usercustomize.py").write_text(logs("usercustomize"))
+
+    ls = ["ls-files", "-z", "--others", "--exclude-standard"]
+    fresh = tmp_path / "fresh.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(fresh)], env=env, check=True)
+    for naive in (["git", "-C", str(work), *ls],
+                  ["git", "--git-dir", str(fresh), "--work-tree", str(work), *ls],
+                  ["python3", str(py)]):
+        subprocess.run(naive, env=env, capture_output=True)
+    sprung = {"run-git-config", "home-gitconfig", "usercustomize"}
+    if scenario == "helper-lang-py-fix":
+        sprung.add("list_skills.py")
+    assert set(marker.read_text().split()) == sprung
+    marker.unlink()
+
     r = _grade(run, scenario, env)
     assert not marker.exists(), marker.read_text() + r.stdout
     assert (r.returncode, r.stdout.strip()) == want, r.stderr
+
+
+def _outside(work, name, body=None):
+    target = work.parent / name
+    if body is None:
+        os.mkfifo(target)
+    else:
+        target.write_text(body)
+    return target
+
+
+def _swap_for_link(path, target):
+    path.unlink()
+    path.symlink_to(target)
+
+
+def _scripts_dir_link(work):
+    moved = work.parent / "scripts"
+    (work / SCRIPTS).rename(moved)
+    (work / SCRIPTS).symlink_to(moved)
+
+
+def _unreadable_helper(work):
+    (work / SCRIPTS / "helper").write_text("#!/bin/sh\n")
+    (work / SCRIPTS / "helper").chmod(0)
+
+
+LIST_SKILLS = SCRIPTS + "list_skills.py"
+
+
+@pytest.mark.parametrize("scenario,plant,want", [
+    ("helper-lang-new-ts",
+     lambda w: (w / "runtime/package.json").symlink_to(_outside(w, "pipe")),
+     (1, "FAIL: work/runtime/package.json: a symlink")),
+    ("helper-lang-new-ts", lambda w: os.mkfifo(w / "runtime/.gitignore"),
+     (2, "INCONCLUSIVE: git ls-files did not finish")),
+    ("helper-lang-new-ts",
+     lambda w: (w / SCRIPTS / "helper").symlink_to(_outside(w, "elsewhere", "#!/bin/sh\n")),
+     (1, "FAIL: work/runtime/scripts/helper: a symlink")),
+    ("helper-lang-new-ts", _unreadable_helper,
+     (1, "FAIL: work/runtime/scripts/helper: Permission")),
+    ("helper-lang-new-ts",
+     lambda w: (w / os.fsdecode(b"runtime/scripts/caf\xe9.mts")).write_bytes(b"x"),
+     (0, "PASS: new: mts runtime/scripts/caf\\udce9.mts mts runtime/scripts/missing-desc.mts")),
+    ("helper-lang-new-ts", lambda w: subprocess.run(["git", "init", "-q", str(w / "runtime/n")],
+                                                    check=True),
+     (0, "PASS: new: mts runtime/scripts/missing-desc.mts")),
+    ("helper-lang-py-fix",
+     lambda w: _swap_for_link(w / LIST_SKILLS,
+                              _outside(w, "elsewhere.py", (w / LIST_SKILLS).read_text())),
+     (1, "FAIL: work/runtime/scripts/list_skills.py: a symlink")),
+    ("helper-lang-py-fix", _scripts_dir_link, (1, "FAIL: work/runtime/scripts: a symlink")),
+    ("helper-lang-py-fix",
+     lambda w: (w / LIST_SKILLS).write_bytes((w / LIST_SKILLS).read_bytes() + b"# \xff\n"),
+     (1, "FAIL: work/runtime/scripts/list_skills.py: not UTF-8")),
+    ("helper-lang-py-fix", lambda w: (w / LIST_SKILLS).chmod(0),
+     (1, "FAIL: work/runtime/scripts/list_skills.py: Permission")),
+])
+def test_helper_lang_graders_never_hang_or_crash_on_the_run(tmp_path, scenario, plant, want):
+    """A symlink or non-regular file is not read, odd bytes are data, and a git
+    blocked on a FIFO it opens is cut off: each run still gets a verdict."""
+    run, env = _helper_lang_run(tmp_path, scenario, MTS if "new-ts" in scenario else FIX)
+    plant(run / "work")
+    try:
+        r = subprocess.run(["bash", str(SCENARIOS / scenario / "check.sh"), str(run)],
+                           env=env, capture_output=True, text=True, errors="replace",
+                           timeout=60)
+    except subprocess.TimeoutExpired:
+        pytest.fail("the grader hung")
+    assert "Traceback" not in r.stderr, r.stderr
+    assert (r.returncode, r.stdout.startswith(want[1])) == (want[0], True), r.stdout + r.stderr
 
 
 def test_runs_get_a_private_tmp(tmp_path):
@@ -791,10 +876,11 @@ def test_resume_tracks_the_sibling_dirs_a_scenario_sources(tmp_path):
     claude = fake_claude(tmp_path, 'date +%s%N > "$E2E_RUN/called"\ncat <<\'EOF\'\n'
                                    + stream("ok", []) + "\nEOF\n")
     sc = _scenario(tmp_path, 'exec bash "$(dirname "$0")/../_lib/grade.sh"\n')
-    lib, other = tmp_path / "_lib", tmp_path / "other"
-    lib.mkdir()
-    other.mkdir()
-    (lib / "grade.sh").write_text("exit 0\n")
+    lib, deep, other = tmp_path / "_lib", tmp_path / "deep", tmp_path / "other"
+    for d in (lib, deep, other):
+        d.mkdir()
+    (lib / "grade.sh").write_text('source "$(dirname "$0")/../deep/x"\n')
+    (deep / "x").write_text("exit 0\n")
     (other / "check.sh").write_text("exit 0\n")
 
     def run():
@@ -804,9 +890,13 @@ def test_resume_tracks_the_sibling_dirs_a_scenario_sources(tmp_path):
     first = run()
     (other / "check.sh").write_text("exit 1\n")
     assert run() == first, "an unrelated sibling edit must not re-spend the run"
+    (deep / "x").write_text('echo "sourced file edited"\nexit 1\n')
+    deeper = run()
+    assert deeper[1] != first[1], "a dir _lib sources must re-run"
+    assert (deeper[0]["verdict"], deeper[0]["why"]) == ("FAIL", "sourced file edited")
     (lib / "grade.sh").write_text('echo "grader edited"\nexit 1\n')
     edited = run()
-    assert edited[1] != first[1], "an edited _lib must re-run"
+    assert edited[1] != deeper[1], "an edited _lib must re-run"
     assert (edited[0]["verdict"], edited[0]["why"]) == ("FAIL", "grader edited")
 
 

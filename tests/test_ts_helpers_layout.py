@@ -43,32 +43,47 @@ def program(root: Path) -> set[Path]:
     return {Path(line).resolve() for line in tsc.stdout.splitlines()}
 
 
-def unchecked_mts(root: Path) -> list[str]:
-    checked = program(root)
-    return [path for path in tracked(root)
-            if path.endswith(".mts") and (root / path).resolve() not in checked]
+def drift(root: Path) -> tuple[list[str], list[str]]:
+    """The .mts git tracks or would track that tsc skips, and the tsc inputs
+    besides those (an ignored file, say); type libraries in node_modules aside."""
+    root = root.resolve()
+    libs = (root / "node_modules").resolve()
+    checked = {p for p in program(root) if not p.is_relative_to(libs)}
+    mts = {(root / p).resolve() for p in tracked(root, "-co", "--exclude-standard")
+           if p.endswith(".mts")}
+
+    def rel(paths: set[Path]) -> list[str]:
+        return sorted(str(p.relative_to(root)) if p.is_relative_to(root) else str(p)
+                      for p in paths)
+
+    return rel(mts - checked), rel(checked - mts)
 
 
-def test_tsc_program_holds_no_ignored_file(tmp_path):
+def test_tsc_program_is_the_mts_git_tracks(tmp_path):
     for name in ("tsconfig.json", ".gitignore"):
         shutil.copy(REPO / name, tmp_path)
     (tmp_path / "node_modules").symlink_to(REPO / "node_modules")
-    for rel in ("tests/a.mts", "tmp/x.mts", "projects/p/x.mts", "plans/x.mts"):
+    for rel in ("tests/a.mts", "tests/tmp/x.mts", "tmp/x.mts", "projects/p/x.mts",
+                "plans/x.mts"):
         (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / rel).write_text("export {};\n")
     subprocess.run(["git", "init", "-q", "."], cwd=tmp_path, check=True)
-    ignored = [p for p in tracked(tmp_path, "-o", "-i", "--exclude-standard")
-               if p.endswith(".mts")]
-    assert len(ignored) == 3
-    assert {tmp_path / p for p in ignored} & program(tmp_path) == set()
+    assert drift(tmp_path) == ([], ["tests/tmp/x.mts"])
+    subprocess.run(["git", "add", "tests/a.mts"], cwd=tmp_path, check=True)
+    (tmp_path / "tests/tmp/x.mts").unlink()
+    (tmp_path / "tests/b.mts").write_text("export {};\n")
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs/c.mts").write_text("export {};\n")
+    assert drift(tmp_path) == (["docs/c.mts"], [])
 
 
-def test_tsc_checks_every_tracked_mts():
-    unchecked = unchecked_mts(REPO)
+def test_tsc_checks_every_tracked_mts_and_nothing_else():
+    unchecked, extra = drift(REPO)
     assert unchecked == [], (
         "outside the tsc program: excluded by tsconfig.json, or a path TypeScript's"
         " include globs skip (a dot-prefixed name, node_modules, bower_components,"
         f" jspm_packages): {unchecked}")
+    assert extra == [], f"tsc checks files git does not track (ignored?): {extra}"
 
 
 def test_tsc_program_skips_dot_names_package_dirs_and_other_roots(tmp_path):
@@ -84,7 +99,7 @@ def test_tsc_program_skips_dot_names_package_dirs_and_other_roots(tmp_path):
     subprocess.run(["git", "init", "-q", "."], cwd=tmp_path, check=True)
     subprocess.run(["git", "add", "-f", "tsconfig.json", *checked, *skipped],
                    cwd=tmp_path, check=True)
-    assert unchecked_mts(tmp_path) == skipped
+    assert drift(tmp_path) == (skipped, [])
     assert [rel for rel in checked + skipped if helper_lang.outside_tsc(rel)] == skipped
 
 
@@ -98,7 +113,7 @@ def test_tsc_config_error_is_reported_as_itself(tmp_path):
     subprocess.run(["git", "init", "-q", "."], cwd=tmp_path, check=True)
     subprocess.run(["git", "add", "-f", "."], cwd=tmp_path, check=True)
     with pytest.raises(pytest.fail.Exception, match="TS5023"):
-        unchecked_mts(tmp_path)
+        drift(tmp_path)
 
 
 def test_no_package_json_sets_type_module():
