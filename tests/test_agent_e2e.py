@@ -486,6 +486,44 @@ def test_dogfood_grader(tmp_path, commands, claude_ran, want):
     assert r.returncode == want, r.stdout
 
 
+SCRIPTS = "runtime/scripts/"
+FIX = {SCRIPTS + "list_skills.py": None}  # None: undo the seeded bug in place
+
+
+@pytest.mark.parametrize("scenario,outcome,want", [
+    ("helper-lang-new-ts", {SCRIPTS + "missing-desc.mts": "x"}, 0),
+    ("helper-lang-new-ts", {SCRIPTS + "missing-desc.ts": "x"}, 0),
+    ("helper-lang-new-ts", {SCRIPTS + "missing_desc.py": "x"}, 1),
+    ("helper-lang-new-ts", {SCRIPTS + "a.mts": "x", SCRIPTS + "a.py": "x"}, 1),
+    ("helper-lang-new-ts", {SCRIPTS + "missing-desc": "#!/usr/bin/env bash\n"}, 1),
+    ("helper-lang-new-ts", {}, 2),
+    ("helper-lang-py-fix", FIX, 0),
+    ("helper-lang-py-fix", {**FIX, "tests/test_list_skills.py": "x"}, 0),
+    ("helper-lang-py-fix", {**FIX, "runtime/scripts/list_skills_test.py": "x"}, 0),
+    ("helper-lang-py-fix", {**FIX, "tests/conftest.py": "x"}, 0),
+    ("helper-lang-py-fix", {**FIX, SCRIPTS + "list_skills.mts": "x"}, 1),
+    ("helper-lang-py-fix", {**FIX, SCRIPTS + "skill_names.py": "x"}, 1),
+    ("helper-lang-py-fix", {**FIX, "tests/list_skills_check.py": "x"}, 1),
+    ("helper-lang-py-fix", {}, 2),
+])
+def test_helper_lang_grader(tmp_path, scenario, outcome, want):
+    run, work = tmp_path, tmp_path / "work"
+    work.mkdir()
+    env = {**os.environ, "E2E_RUN": str(run), "E2E_WORK": str(work),
+           "E2E_BIN": str(tmp_path), "GIT_CONFIG_GLOBAL": "/dev/null"}
+    subprocess.run(["bash", str(SCENARIOS / scenario / "setup.sh")], env=env,
+                   check=True, capture_output=True)
+    for rel, body in outcome.items():
+        path = work / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if body is None:
+            body = path.read_text().replace('print(f"{entry.name}/")', "print(entry.name)")
+        path.write_text(body)
+    r = subprocess.run(["bash", str(SCENARIOS / scenario / "check.sh"), str(run)],
+                       env=env, capture_output=True, text=True)
+    assert r.returncode == want, r.stdout + r.stderr
+
+
 def test_runs_get_a_private_tmp(tmp_path):
     """Concurrent runs must not see each other's /tmp (dogfood batch 1 leak)."""
     _require_sandbox()
