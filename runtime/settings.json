@@ -9,7 +9,6 @@
     "brand-copy": "name-only",
     "brand-name-clearance": "name-only",
     "brand-voice": "name-only",
-    "cancel-ralph": "name-only",
     "caveman:caveman-commit": "name-only",
     "caveman:caveman-help": "name-only",
     "caveman:caveman-review": "name-only",
@@ -46,7 +45,6 @@
     "planning-with-files:status": "name-only",
     "playground-review": "name-only",
     "prompt-review-weekly": "name-only",
-    "ralph-loop": "name-only",
     "recursive-self-improvement:disable-recursive-self-improvement": "name-only",
     "recursive-self-improvement:review-improvements-help": "name-only",
     "recursive-self-improvement:setup-recursive-self-improvement": "name-only",
@@ -729,15 +727,6 @@
       }
     ],
     "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash $HOME/.claude/hooks/ralph-loop-stop.sh",
-            "statusMessage": "Checking Ralph loop gate..."
-          }
-        ]
-      },
       {
         "hooks": [
           {
