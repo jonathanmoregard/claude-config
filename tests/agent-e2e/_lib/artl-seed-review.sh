@@ -13,12 +13,8 @@ HOOK="$HOME/.claude/hooks/artl-evidence.py"
 python3 - "$HOOK" "$WORK" <<'PY'
 import glob, json, os, subprocess, sys
 hook, work = sys.argv[1:3]
-numstat = subprocess.run(["git", "-C", work, "diff", "--numstat", "origin/main...HEAD"],
-                         capture_output=True, text=True, check=True).stdout.splitlines()
-rows = [line.split("\t", 2) for line in numstat]
-files = [path for _, _, path in rows]
-# The advisor reads what it can review: a binary build output is not read.
-read = [path for added, _, path in rows if added != "-"]
+files = subprocess.run(["git", "-C", work, "diff", "--name-only", "origin/main...HEAD"],
+                       capture_output=True, text=True, check=True).stdout.split()
 prompt = ("Assume this finished change can ship broken. Try to falsify its acceptance "
           "claims.\nRe-read fresh:\n" + "\n".join(os.path.join(work, f) for f in files))
 verdict = json.dumps({"verdict": "PASS", "verdict_reason": "", "findings": []})
@@ -30,7 +26,7 @@ steps = [{"session_id": "seed", "hook_event_name": "PostToolUse", "cwd": work,
 steps += [{"session_id": "seed", "hook_event_name": "PostToolUse", "cwd": work,
            "tool_name": "Read", "tool_input": {"file_path": os.path.join(work, f)},
            "tool_response": {"type": "text"}, "agent_id": "seedreview1",
-           "agent_type": "advisor"} for f in read]
+           "agent_type": "advisor"} for f in files]
 steps.append({"session_id": "seed", "hook_event_name": "SubagentStop", "cwd": work,
               "agent_id": "seedreview1", "agent_type": "advisor",
               "last_assistant_message": verdict})
