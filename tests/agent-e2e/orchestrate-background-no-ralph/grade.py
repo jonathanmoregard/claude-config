@@ -89,6 +89,11 @@ summary = " ".join(f"{k}={v}" for k, v in metrics.items())
 if not orchestrate_loaded:
     print(f"INCONCLUSIVE: the orchestrate skill never loaded ({summary})")
     sys.exit(2)
+if notifications == 0:
+    # The session never ended its turn and got woken by the subagent's completion,
+    # so the stop-while-a-subagent-runs situation under test was never reached.
+    print(f"INCONCLUSIVE: no completion notification reached the session ({summary})")
+    sys.exit(2)
 if bg_launch == 0 or not started:
     print(f"INCONCLUSIVE: no background subagent ran the check ({summary})")
     sys.exit(2)
