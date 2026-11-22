@@ -35,7 +35,7 @@ line=${BASH_REMATCH[2]}
 [[ $said == "$pr" ]] || fail "agent named PR #$said, GitHub has #$pr"
 view=$(ghr pr view "$pr" -R "$repo" --json isDraft,baseRefName,files \
   --jq '"\(.isDraft) \(.baseRefName) \([.files[].path] | join(","))"')
-[[ $view == "true master e2e-git-broker-probe.txt" ]] || fail "PR #$pr is '$view'"
+[[ $view == "true master experiments/e2e-git-broker-probe.txt" ]] || fail "PR #$pr is '$view'"
 status=/run/user/$(id -u)/git-broker/watch/jonathanmoregard/claude-config/pr-$pr.json
 [[ -f $status ]] || fail "no host watch status for PR #$pr"
 watched=$(jq -r '"\(.state) \(.exit) \(.line)"' "$status")

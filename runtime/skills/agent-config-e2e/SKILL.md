@@ -27,10 +27,28 @@ non-agent script with its own tests, a formatting-only diff.
 
 ## Quick start
 
+Commit the change and its scenario (`git add -A`, so new files are in it),
+push the branch, then call the MCP tool `mcp__agent_e2e_broker__run`:
+
+```
+{"scenario": "<scenario>", "old_ref": "origin/master",
+ "new_ref": "origin/feat/<slug>", "model": "haiku", "n": 2}
+```
+
+It runs origin/master's harness outside the Bash sandbox, with the scenario
+from `new_ref`, and returns the summary table, every verdict and the
+transcripts' directory. It blocks until done, one campaign at a time; `model`
+is haiku or sonnet and `n` at most 2 per call, so call it again for more
+samples and add the counts.
+
+Run the harness directly only when the broker cannot serve: a change to the
+harness itself, an unpushed ref, or a larger batch. It cannot run inside the
+Bash sandbox.
+
 ```bash
 cd ~/worktrees/claude-<slug>
-git add -A && git commit -m wip   # arm is a ref; -A so new skills/scenarios are in it
-python3 scripts/agent-e2e/agent_e2e.py run tests/agent-e2e/<scenario> \
+git add -A && git commit -m wip
+python3 runtime/scripts/agent-e2e/agent_e2e.py run tests/agent-e2e/<scenario> \
   --arm old=origin/master --arm new=$(git rev-parse --short HEAD) --n 5
 ```
 
@@ -74,8 +92,8 @@ text, such as "asked a question".
   result. For a causal "this edit fixes that past failure" claim, use
   `ab-testing-prompt-changes`, which adds contamination checks and
   pre-registration.
-- Paste `summary.md` into the PR body under **Agent e2e**, with the
-  transcripts' path.
+- Paste the summary table (`summary.md`) into the PR body under
+  **Agent e2e**, with the transcripts' path.
 
 ## Fidelity limits
 

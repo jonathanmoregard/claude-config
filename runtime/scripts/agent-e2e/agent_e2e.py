@@ -193,14 +193,25 @@ def scenario_id(scenario: pathlib.Path) -> str:
     finished run stop matching itself -- repeating completed, paid runs. Worse
     than flaky: a .pyc embeds the source mtime and the interpreter magic, so
     the digest was not reproducible across machines or checkouts either.
+
+    A sibling directory any hashed file names as `../NAME` (`_lib`, another
+    scenario's setup) is hashed too, so editing a shared grader re-runs.
     """
     skip = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
     h = hashlib.sha256()
-    for f in sorted(p for p in scenario.rglob("*") if p.is_file()):
-        rel = f.relative_to(scenario)
-        if skip & set(rel.parts) or rel.suffix in (".pyc", ".pyo"):
-            continue
-        h.update(str(rel).encode() + b"\0" + f.read_bytes() + b"\0")
+    dirs = [scenario]
+    for d in dirs:
+        for f in sorted(p for p in d.rglob("*") if p.is_file()):
+            rel = f.relative_to(d)
+            if skip & set(rel.parts) or rel.suffix in (".pyc", ".pyo"):
+                continue
+            data = f.read_bytes()
+            name = rel if d == scenario else f.relative_to(scenario.parent)
+            h.update(str(name).encode() + b"\0" + data + b"\0")
+            for ref in re.findall(rb"\.\./([\w.-]*\w[\w.-]*)", data):
+                sib = scenario.parent / ref.decode()
+                if sib.is_dir() and sib not in dirs:
+                    dirs.append(sib)
     return h.hexdigest()
 
 

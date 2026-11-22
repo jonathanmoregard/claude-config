@@ -1,11 +1,11 @@
 {
   "agentE2eBroker": {
     "version": 1,
-    "repo": "/home/jonathan/.claude",
-    "harness": "scripts/agent-e2e/agent_e2e.py",
+    "remoteUrl": "https://github.com/jonathanmoregard/claude-config.git",
+    "stateDir": "/home/jonathan/.local/state/agent-e2e-broker",
+    "harness": "runtime/scripts/agent-e2e/agent_e2e.py",
     "scenarioRoot": "tests/agent-e2e",
     "claudeExecutable": "/home/jonathan/.local/bin/claude",
-    "outputRoot": "/tmp/agent-e2e-broker",
     "path": [
       "/home/jonathan/.local/bin",
       "/etc/profiles/per-user/jonathan/bin",
@@ -17,6 +17,7 @@
     "maxBudgetUsd": 3.0,
     "maxTimeoutSec": 900,
     "maxCallSec": 3600,
-    "outputLimitChars": 20000
+    "outputLimitChars": 20000,
+    "readOnlyPaths": ["/home/jonathan/Repos/router-agent"]
   }
 }

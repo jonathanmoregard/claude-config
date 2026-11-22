@@ -20,10 +20,11 @@ config_path = run / "runner" / "config.json"
 config = json.loads(config_path.read_text(encoding="utf-8"))
 config["appRunner"]["stateRoot"] = str(run / "state")
 config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
-mcp = {"mcpServers": {"klaffat-app-runner": {
-    "type": "stdio",
-    "command": "/run/current-system/sw/bin/python3",
-    "args": [str(run / "runner" / "server.py")],
-}}}
-(run / "mcp.json").write_text(json.dumps(mcp), encoding="utf-8")
 PY
+manifest=$HOME/.claude/mcp-servers.json
+timeout_ms=$(jq -r '."klaffat-app-runner".timeout // empty' "$manifest" 2>/dev/null || true)
+[[ -n $timeout_ms ]] || { echo "no klaffat-app-runner timeout in $manifest" >&2; exit 2; }
+command=$(jq -r '."klaffat-app-runner".command // empty' "$manifest" 2>/dev/null || true)
+[[ $command == /run/current-system/sw/bin/python3 ]] || {
+  echo "klaffat-app-runner command is '$command' in $manifest; the stub dispatcher always runs /run/current-system/sw/bin/python3" >&2; exit 2; }
+python3 "$(dirname "$0")/../_lib/mcp_stub.py" klaffat-app-runner "$run/runner/server.py" --timeout "$timeout_ms"

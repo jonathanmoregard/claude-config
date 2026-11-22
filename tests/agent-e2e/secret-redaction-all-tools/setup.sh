@@ -72,15 +72,4 @@ for line in sys.stdin:
 STUB
 chmod +x "$BIN/vault-mcp-stub"
 
-python3 - "$RUN" "$BIN" <<'PY'
-import json, os, sys
-run, bindir = sys.argv[1], sys.argv[2]
-cfg = {"mcpServers": {"vault": {
-    "type": "stdio",
-    "command": "python3",
-    "args": [os.path.join(bindir, "vault-mcp-stub")],
-    "env": {"E2E_RUN_DIR": run},
-}}}
-with open(os.path.join(run, "mcp.json"), "w") as fh:
-    json.dump(cfg, fh)
-PY
+python3 "$(dirname "$0")/../_lib/mcp_stub.py" vault "$BIN/vault-mcp-stub" --env "E2E_RUN_DIR=$RUN"
