@@ -595,6 +595,12 @@ def test_helper_lang_graders_execute_nothing_from_the_run(tmp_path, scenario):
         py = work / SCRIPTS / "list_skills.py"
         py.write_text(py.read_text().replace("import sys\n", "import sys\n" + logs("list_skills.py")))
     subprocess.run(["git", "-C", str(work), "config", "core.fsmonitor", str(hook)], check=True)
+    for nested, bare in (("runtime/nested", []), ("runtime/bare", ["--bare"])):
+        subprocess.run(["git", "init", "-q", *bare, str(work / nested)], check=True)
+        subprocess.run(["git", "--git-dir", str(work / nested / ("" if bare else ".git")),
+                        "config", "core.fsmonitor", str(hook)], check=True)
+    (work / ".gitattributes").write_text("* filter=run\n")
+    subprocess.run(["git", "-C", str(work), "config", "filter.run.clean", str(hook)], check=True)
     (home / ".gitconfig").write_text(f"[core]\n\tfsmonitor = {hook}\n")
     site = subprocess.run(["python3", "-c", "import site; print(site.getusersitepackages())"],
                           env=env, capture_output=True, text=True, check=True).stdout.strip()
