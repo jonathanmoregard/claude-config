@@ -1068,6 +1068,13 @@ def drift(top: str, tree: object, tip: str, cache: dict, pr_paths: set[str]) -> 
     return None if rows is None else sum(n for p, n in rows.items() if p in pr_paths)
 
 
+def is_binary_blob(top: str, tip: str, path: str) -> bool:
+    """True when PATH at TIP holds a NUL in its first 8000 characters (close to
+    git's 8000-byte content test). A path absent at the tip is not binary."""
+    blob = git(top, "cat-file", "blob", f"{tip}:{path}")
+    return blob is not None and "\0" in blob[:8000]
+
+
 def _shown(paths: list[str]) -> str:
     return ", ".join(paths[:15]) + (" …" if len(paths) > 15 else "")
 
@@ -1100,9 +1107,15 @@ def evidence_problem(records: list[dict], info: dict, branch: str, tip: str,
     # most DRIFT_LIMIT lines since. Measured in e2e: after a round of fixes the
     # follow-up review reads only the files it touched, so a file an earlier
     # passing review read and nobody changed since stays covered.
+    # A binary has no text an advisor's Read could review, so it never needs a
+    # read; the branch's passing verdict and drift still apply. Binary is judged
+    # by content at the tip, not numstat's "-", which .gitattributes (-diff,
+    # binary) can set on any text file.
     trusted = sorted((r for r in mine if not r.get("suspect")), key=lambda r: r.get("ts", 0))
+    readable = sorted(p for p, n in changes
+                      if n is not None or not is_binary_blob(info["top"], tip, p))
     unread, blocked, changed = [], [], []
-    for path in sorted(pr_paths):
+    for path in readable:
         last = None
         for r in trusted:
             if path in (r.get("files") or []):
