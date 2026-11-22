@@ -1,4 +1,4 @@
-"""TypeScript helpers are `.mts`, so no package.json has to set a module type.
+"""TypeScript helpers are `.mts`, so no package.json sets `"type": "module"`.
 
 A package.json `"type"` scopes every file below it that has no closer
 package.json. This tree is linked into `~/.claude` and served from a checkout
@@ -10,19 +10,50 @@ root, and both hold third-party CommonJS code with no package.json of its own
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[1]
+TSC = REPO / "node_modules/.bin/tsc"
 
 
-def tracked() -> list[str]:
-    out = subprocess.run(["git", "ls-files"], cwd=REPO, capture_output=True,
+def tracked(root: Path = REPO) -> list[str]:
+    out = subprocess.run(["git", "ls-files"], cwd=root, capture_output=True,
                          text=True, check=True).stdout
     return out.splitlines()
 
 
-def test_no_package_json_declares_a_module_scope():
+def unchecked_mts(root: Path) -> list[str]:
+    if not TSC.exists():
+        pytest.fail(f"{TSC} missing: run `npm ci --ignore-scripts` first")
+    out = subprocess.run([str(TSC), "-p", "tsconfig.json", "--listFilesOnly"],
+                         cwd=root, capture_output=True, text=True).stdout
+    program = {Path(line).resolve() for line in out.splitlines()}
+    return [path for path in tracked(root)
+            if path.endswith(".mts") and (root / path).resolve() not in program]
+
+
+def test_tsc_checks_every_tracked_mts():
+    # TypeScript's include globs never descend into dot-directories.
+    assert unchecked_mts(REPO) == [], "move it out of the dot-directory"
+
+
+def test_tsc_program_reaches_mts_anywhere_but_dot_directories(tmp_path):
+    shutil.copy(REPO / "tsconfig.json", tmp_path)
+    (tmp_path / "node_modules").symlink_to(REPO / "node_modules")
+    files = ["policy/a.mts", "docs/deep/b.mts", "runtime/w/.profile/c.mts"]
+    for rel in files:
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text("export {};\n")
+    subprocess.run(["git", "init", "-q", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "add", "tsconfig.json", *files], cwd=tmp_path, check=True)
+    assert unchecked_mts(tmp_path) == ["runtime/w/.profile/c.mts"]
+
+
+def test_no_package_json_sets_type_module():
     scoped = [path for path in tracked()
               if Path(path).name == "package.json"
               and json.loads((REPO / path).read_text()).get("type") == "module"]
