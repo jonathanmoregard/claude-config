@@ -56,6 +56,9 @@ PROJECTED = (
     "CLAUDE.md", ".claude-powerline.json", "claude-powerline.json", "dcg.toml",
     "egress-sinks.json", "mcp-servers.json", "settings.json",
     "settings-patch.json", "upstream-drift.json",
+    # Node's module-type scope for runtime/*.ts; the root package.json shares
+    # the name and is the dev-only toolchain manifest
+    "package.json",
     # loose entrypoints, each named by a hook or run by hand
     "aggregator-recall-hook.py", "aggregator-transcript-guard.py",
     "context-baggage.py", "context_usage.py", "continue-nudge-backtest.py",
@@ -77,6 +80,7 @@ DEV_ONLY = (
     # harness — a policy the agent could read is a policy it could edit.
     "policy",
     ".github", ".githooks", ".gitleaks.toml", ".secrets.baseline",
+    ".node-version", "package-lock.json", "tsconfig.json",
 )
 
 # Stays at the repository root and is not part of `runtime/`.
