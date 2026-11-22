@@ -1,4 +1,4 @@
-"""Grade one orchestrate-background-no-reprompt run.
+"""Grade one orchestrate-background-no-ralph run.
 
     python3 grade.py RUN
 
@@ -14,7 +14,7 @@ and RUN/expected-result.txt. Writes RUN/reprompt-metrics.json.
 PASS: a background subagent was launched, Ralph never re-prompted or armed,
 and the final message carries the token (work still continues to completion
 on the subagent's notification). FAIL: any re-prompt or arming, or the token
-missing. INCONCLUSIVE (2): the orchestrate skill text never loaded, no
+missing. INCONCLUSIVE (2): the session did not offer the orchestrate skill, no
 background subagent was launched, or the integration script never started, so
 the situation under test was not reached.
 """
@@ -45,8 +45,11 @@ for ev in events:
     raw = json.dumps(ev, ensure_ascii=False)
     if "Ralph iteration" in raw:
         reprompts += 1
-    if "# Autonomous Orchestration" in raw:
-        orchestrate_loaded = True
+    # A leading /orchestrate expands outside the stream; the init event's skill
+    # list is the evidence that the skill was available to that expansion.
+    if ev.get("type") == "system" and ev.get("subtype") == "init":
+        offered = json.dumps([ev.get("skills"), ev.get("slash_commands")])
+        orchestrate_loaded = '"orchestrate"' in offered
     if "<task-notification>" in raw or '"task_notification"' in raw:
         notifications += 1
     if ev.get("parent_tool_use_id"):
