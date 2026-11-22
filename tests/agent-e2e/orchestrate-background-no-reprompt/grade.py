@@ -14,8 +14,9 @@ and RUN/expected-result.txt. Writes RUN/reprompt-metrics.json.
 PASS: a background subagent was launched, Ralph never re-prompted or armed,
 and the final message carries the token (work still continues to completion
 on the subagent's notification). FAIL: any re-prompt or arming, or the token
-missing. INCONCLUSIVE (2): no background subagent was launched or the
-integration script never started, so the situation under test was not reached.
+missing. INCONCLUSIVE (2): the orchestrate skill text never loaded, no
+background subagent was launched, or the integration script never started, so
+the situation under test was not reached.
 """
 from __future__ import annotations
 
@@ -39,10 +40,13 @@ reprompts = 0
 armed = 0
 bg_launch = 0
 notifications = 0
+orchestrate_loaded = False
 for ev in events:
     raw = json.dumps(ev, ensure_ascii=False)
     if "Ralph iteration" in raw:
         reprompts += 1
+    if "# Autonomous Orchestration" in raw:
+        orchestrate_loaded = True
     if "<task-notification>" in raw or '"task_notification"' in raw:
         notifications += 1
     if ev.get("parent_tool_use_id"):
@@ -67,6 +71,7 @@ log = (run / "integration.log").read_text() if (run / "integration.log").exists(
 started = "start" in log
 
 metrics = {
+    "orchestrate_loaded": orchestrate_loaded,
     "reprompts": reprompts,
     "armed": armed,
     "bg_launch": bg_launch,
@@ -78,6 +83,9 @@ metrics = {
 (run / "reprompt-metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
 summary = " ".join(f"{k}={v}" for k, v in metrics.items())
 
+if not orchestrate_loaded:
+    print(f"INCONCLUSIVE: the orchestrate skill never loaded ({summary})")
+    sys.exit(2)
 if bg_launch == 0 or not started:
     print(f"INCONCLUSIVE: no background subagent ran the check ({summary})")
     sys.exit(2)
