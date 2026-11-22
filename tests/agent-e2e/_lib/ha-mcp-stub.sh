@@ -64,16 +64,5 @@ STUB
 chmod +x "$BIN/ha-mcp-stub"
 : > "$RUN/ha-calls.jsonl"
 
-python3 - "$RUN" "$BIN" <<'PY'
-import json, os, sys
-run, bindir = sys.argv[1], sys.argv[2]
-cfg = {"mcpServers": {"home-assistant": {
-    "type": "stdio",
-    "command": "python3",
-    "args": [os.path.join(bindir, "ha-mcp-stub")],
-    "env": {"E2E_RUN_DIR": run,
-            "HA_STUB_READ_TOOL": os.environ.get("HA_STUB_READ_TOOL", "ha_get_state")},
-}}}
-with open(os.path.join(run, "mcp.json"), "w") as fh:
-    json.dump(cfg, fh)
-PY
+python3 "$(dirname "${BASH_SOURCE[0]}")/mcp_stub.py" home-assistant "$BIN/ha-mcp-stub" \
+  --env "E2E_RUN_DIR=$RUN" --env "HA_STUB_READ_TOOL=${HA_STUB_READ_TOOL:-ha_get_state}"

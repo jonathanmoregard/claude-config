@@ -1,5 +1,5 @@
 `./claude` is a checkout of the GitHub repository `jonathanmoregard/claude-config`
-with one new file, `e2e-git-broker-probe.txt`. Publish it as a scratch pull
+with one new file, `experiments/e2e-git-broker-probe.txt`. Publish it as a scratch pull
 request and wait for GitHub to settle it:
 
 1. In `./claude`, create the branch named in `./branch.txt` and commit the new

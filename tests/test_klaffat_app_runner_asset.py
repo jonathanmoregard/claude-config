@@ -63,7 +63,7 @@ class KlaffatAppRunnerAssetTests(unittest.TestCase):
     def test_host_scenario_hands_the_agent_only_the_staged_runner(self) -> None:
         setup = HOST_SETUP.read_text(encoding="utf-8")
         self.assertIn("$HOME/.claude/mcps/klaffat-app-runner", setup)
-        self.assertIn("mcp.json", setup)
+        self.assertIn("_lib/mcp_stub.py", setup)
 
 
 if __name__ == "__main__":
