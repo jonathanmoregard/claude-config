@@ -220,10 +220,10 @@ def _require_nested_sandbox():
         pytest.skip(why)
 
 
-def _run(tmp_path, sc, claude, n=1):
+def _run(tmp_path, sc, claude, n=1, **kw):
     out = tmp_path / "out"
     r = harness("run", str(sc), "--arm", "new=HEAD", "--n", str(n), "--jobs", "1",
-                "--out", str(out), "--claude", str(claude))
+                "--out", str(out), "--claude", str(claude), **kw)
     assert r.returncode == 0, r.stderr
     verdicts = [json.loads(p.read_text()) for p in sorted(out.glob("*/*/*/verdict.json"))]
     return r, out, verdicts
@@ -553,6 +553,14 @@ def _grade(run, scenario, env):
     ("helper-lang-new-ts", {SCRIPTS + "missing-desc.tsx": "x"}, NOT_MTS),
     ("helper-lang-new-ts", {**MTS, "runtime/package.json": "[" * 200000},
      "FAIL: package.json is not"),
+    ("helper-lang-new-ts", {**MTS, "bin/x": "#!/usr/bin/env node\n"}, NOT_MTS),
+    ("helper-lang-new-ts", {**MTS, "bin/x": "#!/usr/bin/env bun\n"}, NOT_MTS),
+    ("helper-lang-new-ts", {**MTS, "tools/x.tsx": "x"}, NOT_MTS),
+    ("helper-lang-new-ts", {**MTS, "docs/x.md": "x", "bin/notes": "x"}, "PASS"),
+    ("helper-lang-new-ts", {**MTS, "runtime/package-lock.json": "{}",
+                            "runtime/tsconfig.json": "{}", "runtime/.node-version": "22\n"},
+     "PASS"),
+    ("helper-lang-new-ts", {SCRIPTS + "x\nPASS: ok.py": "x"}, NOT_MTS),
     ("helper-lang-py-fix", FIX, "PASS"),
     ("helper-lang-py-fix", {**FIX, "tests/test_list_skills.py": "x"}, "PASS"),
     ("helper-lang-py-fix", {**FIX, "runtime/scripts/list_skills_test.py": "x"}, "PASS"),
@@ -573,6 +581,7 @@ def _grade(run, scenario, env):
     ("helper-lang-py-fix", {**FIX, SCRIPTS + "list_skills.rb": "x"}, "FAIL: new script"),
     ("helper-lang-py-fix", {**FIX, SCRIPTS + "list_skills.zsh": "x"}, "FAIL: new script"),
     ("helper-lang-py-fix", {**FIX, SCRIPTS + "skill_names": "x"}, "FAIL: new script"),
+    ("helper-lang-py-fix", {**FIX, "tools/p.rb": "x"}, "FAIL: new script"),
     # Written by every r3 run that imported list_skills.py from a test.
     ("helper-lang-py-fix", {**FIX, SCRIPTS + "__pycache__/list_skills.cpython-314.pyc": "x"},
      "PASS"),
@@ -583,7 +592,10 @@ def _grade(run, scenario, env):
 def test_helper_lang_grader(tmp_path, scenario, outcome, want):
     run, env = _helper_lang_run(tmp_path, scenario, outcome)
     r = _grade(run, scenario, env)
-    verdict = (r.stdout.splitlines() or [""])[0]
+    # agent_e2e.py records the last stdout line as the reason.
+    lines = r.stdout.splitlines()
+    assert len(lines) == 1, r.stdout
+    verdict = lines[0]
     code = {"PASS": 0, "FAIL": 1}.get(want.split(":")[0], 2)
     assert (r.returncode, verdict.startswith(want)) == (code, True), r.stdout + r.stderr
 
@@ -705,6 +717,9 @@ def _port_in_home_excludes(work):
     ("helper-lang-new-ts",
      lambda w: (w / SCRIPTS / "helper").symlink_to(_outside(w, "elsewhere", "#!/bin/sh\n")),
      (1, "FAIL: work/runtime/scripts/helper: a symlink")),
+    ("helper-lang-new-ts",
+     lambda w: (w / SCRIPTS / "h\nPASS: ok").symlink_to(_outside(w, "elsewhere", "#!/bin/sh\n")),
+     (1, "FAIL: work/runtime/scripts/h\\nPASS: ok: a symlink")),
     ("helper-lang-new-ts", _unreadable_helper,
      (1, "FAIL: work/runtime/scripts/helper: Permission")),
     ("helper-lang-new-ts",
@@ -748,6 +763,7 @@ def test_helper_lang_graders_never_hang_or_crash_on_the_run(tmp_path, scenario, 
     finally:
         (run / "work").chmod(0o755)
     assert "Traceback" not in r.stderr, r.stderr
+    assert len(r.stdout.splitlines()) == 1, r.stdout
     assert (r.returncode, r.stdout.startswith(want[1])) == (want[0], True), r.stdout + r.stderr
 
 
@@ -926,11 +942,12 @@ def test_resume_tracks_the_sibling_dirs_a_scenario_sources(tmp_path):
     for d in (lib, deep, other):
         d.mkdir()
     (lib / "grade.sh").write_text('source "$(dirname "$0")/../deep/x"\n')
-    (deep / "x").write_text("exit 0\n")
+    # A cycle, like the real _lib/repo.sh naming ../_lib in its usage line.
+    (deep / "x").write_text("# sourced by ../_lib/grade.sh\nexit 0\n")
     (other / "check.sh").write_text("exit 0\n")
 
     def run():
-        _, _, (verdict,) = _run(tmp_path, sc, claude)
+        _, _, (verdict,) = _run(tmp_path, sc, claude, timeout=60)
         return verdict, (tmp_path / "out/sc/new/1/called").read_text()
 
     first = run()

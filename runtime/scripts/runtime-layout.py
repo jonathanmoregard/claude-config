@@ -68,6 +68,8 @@ PROJECTED = (
     "sync-agent.sh", "ticktick-login", "worktree-additional-dirs.py",
 )
 
+TOOLCHAIN = (".node-version", "package.json", "package-lock.json", "tsconfig.json")
+
 # Never projected. The agent runtime has no business reaching these, and the
 # whole mission is that it cannot.
 DEV_ONLY = (
@@ -76,8 +78,7 @@ DEV_ONLY = (
     # runtime/scripts/sandbox-backcheck.py. Inputs to a decision, never loaded by the
     # harness — a policy the agent could read is a policy it could edit.
     "policy",
-    ".github", ".githooks", ".gitleaks.toml", ".secrets.baseline",
-    ".node-version", "package.json", "package-lock.json", "tsconfig.json",
+    ".github", ".githooks", ".gitleaks.toml", ".secrets.baseline", *TOOLCHAIN,
 )
 
 # Stays at the repository root and is not part of `runtime/`.

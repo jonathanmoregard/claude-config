@@ -10,6 +10,7 @@ regular file reached without a symlink. Any other error grades INCONCLUSIVE.
 """
 import errno
 import fnmatch
+import importlib.util
 import json
 import os
 import stat
@@ -19,7 +20,9 @@ import tempfile
 from pathlib import Path, PurePosixPath
 
 EXT = {".mts": "mts", ".ts": "ts", ".cts": "ts", ".py": "py", ".js": "js",
-       ".mjs": "js", ".cjs": "js", ".sh": "sh", ".bash": "sh"}
+       ".mjs": "js", ".cjs": "js", ".sh": "sh", ".bash": "sh", ".tsx": "tsx",
+       ".jsx": "jsx", ".rb": "rb", ".pl": "pl", ".lua": "lua", ".zsh": "zsh",
+       ".fish": "fish"}
 # `node --test` defaults, measured on Node 22.23.4, plus anything under test/.
 NODE_TESTS = ("*.test.*", "*-test.*", "*_test.*", "test-*.*", "test.*")
 PY_TESTS = ("test_*.py", "*_test.py", "conftest.py")
@@ -31,6 +34,10 @@ LIST_SKILLS = "runtime/scripts/list_skills.py"
 # git blocks opening a FIFO .gitignore or nested-repo HEAD (measured, git 2.56).
 GIT_TIMEOUT = 10
 SCENARIOS = Path(__file__).resolve().parents[1]
+_layout = importlib.util.spec_from_file_location(
+    "runtime_layout", SCENARIOS.parents[1] / "runtime/scripts/runtime-layout.py")
+layout = importlib.util.module_from_spec(_layout)
+_layout.loader.exec_module(layout)
 
 
 class Refused(Exception):
@@ -92,21 +99,21 @@ def listed(work: Path, env: dict[str, str]) -> list[str]:
 
 def shebang(work: Path, rel: str) -> str | None:
     first = (read_run(work, rel, 200) or b"").split(b"\n")[0]
-    if first.startswith(b"#!"):
-        for needle, name in ((b"python", "py"), (b"node", "js"), (b"sh", "sh")):
-            if needle in first:
-                return name
-    return None
+    if not first.startswith(b"#!"):
+        return None
+    known = ((b"python", "py"), (b"node", "js"), (b"sh", "sh"))
+    return next((name for needle, name in known if needle in first), "script")
 
 
 def kind(work: Path, rel: str) -> str | None:
     """`test`, else the language of REL; None when it is no helper.
 
-    Under runtime/ every other file is a helper, so a port counts in any language.
+    Under runtime/ every other file is a helper, so a port counts in any language;
+    elsewhere a script has a script suffix or a `#!` line.
     """
     path = PurePosixPath(rel)
     # ls-files lists a nested repository as `DIR/`.
-    if (rel.endswith("/") or path.name.endswith(DECLARATIONS) or path.name == "package.json"
+    if (rel.endswith("/") or path.name.endswith(DECLARATIONS) or path.name in layout.TOOLCHAIN
             or ("__pycache__" in path.parts and path.suffix == ".pyc")):
         return None
     lang = EXT.get(path.suffix) if path.suffix else shebang(work, rel)
@@ -204,13 +211,18 @@ def grade(scenario: str, run: Path) -> tuple[int, str]:
         return 1, f"FAIL: {e}"
 
 
+def one_line(text: str) -> str:
+    """TEXT with a newline, or any other unprintable, escaped as in repr()."""
+    return "".join(c if c.isprintable() else repr(c)[1:-1] for c in text)
+
+
 def main() -> None:
     sys.stdout.reconfigure(errors="backslashreplace")
     try:
         code, verdict = grade(sys.argv[1], Path(sys.argv[2]))
     except Exception as e:
-        code, verdict = 2, f"INCONCLUSIVE: grader error: {type(e).__name__}: {' '.join(str(e).split())}"
-    print(verdict)
+        code, verdict = 2, f"INCONCLUSIVE: grader error: {type(e).__name__}: {e}"
+    print(one_line(verdict))
     sys.exit(code)
 
 

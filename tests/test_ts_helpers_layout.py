@@ -124,15 +124,15 @@ def test_no_package_json_sets_type_module():
 
 
 def loose_typescript(paths: list[str]) -> list[str]:
-    # A .ts or .cts takes its module kind from the nearest package.json, and
+    # A .ts or .tsx takes its module kind from the nearest package.json, and
     # tsconfig.json only includes .mts.
-    return [path for path in paths
-            if path.endswith((".ts", ".cts")) and not path.endswith(helper_lang.DECLARATIONS)]
+    return [path for path in paths if path.endswith((".ts", ".cts", ".tsx"))
+            and not path.endswith(helper_lang.DECLARATIONS)]
 
 
 def test_declaration_files_are_not_helpers():
-    names = ["a.d.ts", "a.d.mts", "a.d.cts", "a.ts", "a.cts", "a.mts"]
-    assert loose_typescript(names) == ["a.ts", "a.cts"]
+    names = ["a.d.ts", "a.d.mts", "a.d.cts", "a.ts", "a.cts", "a.tsx", "a.mts"]
+    assert loose_typescript(names) == ["a.ts", "a.cts", "a.tsx"]
     assert [n for n in names if helper_lang.kind(REPO, n) is None] == names[:3]
 
 
