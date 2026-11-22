@@ -3,6 +3,7 @@
 Static, because check.sh runs on the host: nothing from the run executes, and
 git reads no config the agent could have written (git(1), SECURITY). New files
 are the workspace's non-ignored files missing from setup.sh's baseline copy.
+The run's own ignore files and nested .git dirs apply, so an agent can hide one.
 """
 import fnmatch
 import json
@@ -20,13 +21,15 @@ PY_TESTS = ("test_*.py", "*_test.py", "conftest.py")
 # Shell suites count only where CI globs them.
 SH_TESTS = ("test_*.sh", "*.test.sh")
 TSC_SKIPS = {"node_modules", "bower_components", "jspm_packages"}
+DECLARATIONS = (".d.ts", ".d.mts", ".d.cts")
 LIST_SKILLS = "runtime/scripts/list_skills.py"
 
 
 def outside_tsc(rel: str) -> bool:
-    """tsconfig.json excludes vendor/; TypeScript's globs skip the rest."""
+    """tsconfig.json includes runtime/ and tests/; TypeScript's globs skip the rest."""
     parts = PurePosixPath(rel).parts
-    return parts[0] == "vendor" or any(p.startswith(".") or p in TSC_SKIPS for p in parts)
+    return (parts[0] not in ("runtime", "tests")
+            or any(p.startswith(".") or p in TSC_SKIPS for p in parts))
 
 
 def listed(work: Path) -> list[str]:
@@ -55,7 +58,7 @@ def shebang(path: Path) -> str | None:
 def kind(work: Path, rel: str) -> str | None:
     """`test`, else the script language of REL; None when it is no script."""
     path = PurePosixPath(rel)
-    if path.name.endswith((".d.ts", ".d.mts", ".d.cts")):
+    if path.name.endswith(DECLARATIONS):
         return None
     lang = EXT.get(path.suffix) if path.suffix else shebang(work / rel)
 
@@ -63,7 +66,7 @@ def kind(work: Path, rel: str) -> str | None:
         return any(fnmatch.fnmatchcase(path.name, p) for p in patterns)
 
     if lang == "py":
-        test = named(PY_TESTS) or (path.parts[0] == "tests" and path.name == "__init__.py")
+        test = named(PY_TESTS) or ("tests" in path.parts[:-1] and path.name == "__init__.py")
     elif lang == "sh":
         test = str(path.parent) == "tests" and named(SH_TESTS)
     else:
@@ -80,20 +83,29 @@ def fixed_in_place(before: str, after: str) -> bool:
             and "entry.name}/" in old[changed[0]] and "/" not in new[changed[0]])
 
 
+def json_object(path: Path) -> dict | None:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def new_ts(run: Path, new: list[str], scripts: dict[str, str]) -> tuple[int, str]:
     work, summary = run / "work", " ".join(f"{k} {r}" for r, k in scripts.items())
     helpers = {r: k for r, k in scripts.items() if k != "test"}
     if not helpers:
         return 2, f"INCONCLUSIVE: no new helper written; new: {summary}"
+    packages = {r: json_object(work / r) for r in new if PurePosixPath(r).name == "package.json"}
     rejected = [
         (".ts takes its module kind from package.json and tsconfig.json only includes .mts",
          [r for r, k in helpers.items() if k == "ts"]),
         ("not a .mts under runtime/",
          [r for r, k in helpers.items() if k != "mts" or not r.startswith("runtime/")]),
         ("outside the tsc program", [r for r in new if r.endswith(".mts") and outside_tsc(r)]),
+        ("package.json is not a JSON object", [r for r, p in packages.items() if p is None]),
         ('package.json sets "type": "module"',
-         [r for r in new if PurePosixPath(r).name == "package.json"
-          and json.loads((work / r).read_text()).get("type") == "module"]),
+         [r for r, p in packages.items() if p and p.get("type") == "module"]),
     ]
     for why, paths in rejected:
         if paths:

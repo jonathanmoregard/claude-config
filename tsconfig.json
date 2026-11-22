@@ -11,6 +11,5 @@
     "target": "es2024",
     "types": ["node"]
   },
-  "include": ["**/*.mts"],
-  "exclude": ["node_modules", "vendor"]
+  "include": ["runtime/**/*.mts", "tests/**/*.mts"]
 }

@@ -540,6 +540,9 @@ def _grade(run, scenario, env):
      "FAIL: package.json sets"),
     ("helper-lang-new-ts", {**MTS, "runtime/package.json": '{"type": "module"}'},
      "FAIL: package.json sets"),
+    ("helper-lang-new-ts", {**MTS, "runtime/package.json": "{"}, "FAIL: package.json is not"),
+    ("helper-lang-new-ts", {**MTS, "runtime/package.json": "[]"}, "FAIL: package.json is not"),
+    ("helper-lang-new-ts", {**MTS, SCRIPTS + "skill.d.cts": "x"}, "PASS"),
     ("helper-lang-new-ts", {"runtime/.local/missing-desc.mts": "x"}, "FAIL: outside the tsc"),
     ("helper-lang-new-ts", {SCRIPTS + ".missing-desc.mts": "x"}, "FAIL: outside the tsc"),
     ("helper-lang-new-ts", {**MTS, "tests/missing-desc-test.mts": "x"}, "PASS"),
@@ -551,6 +554,8 @@ def _grade(run, scenario, env):
     ("helper-lang-py-fix", {**FIX, "runtime/scripts/list_skills_test.py": "x"}, "PASS"),
     ("helper-lang-py-fix", {**FIX, "tests/conftest.py": "x"}, "PASS"),
     ("helper-lang-py-fix", {**FIX, "tests/__init__.py": "x"}, "PASS"),
+    ("helper-lang-py-fix", {**FIX, SCRIPTS + "tests/__init__.py": "x",
+                            SCRIPTS + "tests/test_list_skills.py": "x"}, "PASS"),
     ("helper-lang-py-fix", {**FIX, "tests/test_list_skills.sh": "x"}, "PASS"),
     ("helper-lang-py-fix", {**FIX, "tests/list_skills.test.sh": "x"}, "PASS"),
     ("helper-lang-py-fix", {**FIX, "tests/list_skills.test.mts": "x"}, "PASS"),
@@ -572,8 +577,12 @@ def test_helper_lang_grader(tmp_path, scenario, outcome, want):
     assert (r.returncode, verdict.startswith(want)) == (code, True), r.stdout + r.stderr
 
 
-@pytest.mark.parametrize("scenario", ["helper-lang-new-ts", "helper-lang-py-fix"])
-def test_helper_lang_graders_execute_nothing_from_the_run(tmp_path, scenario):
+@pytest.mark.parametrize("scenario,want", [
+    ("helper-lang-new-ts", (0, "PASS: new: mts runtime/scripts/missing-desc.mts")),
+    # The planted import line is a second edit, so the run is not fixed in place.
+    ("helper-lang-py-fix", (2, "INCONCLUSIVE: not fixed in place")),
+])
+def test_helper_lang_graders_execute_nothing_from_the_run(tmp_path, scenario, want):
     """check.sh runs on the host, so nothing the agent could write may run."""
     home = tmp_path / "home"
     home.mkdir()
@@ -608,6 +617,7 @@ def test_helper_lang_graders_execute_nothing_from_the_run(tmp_path, scenario):
     (pathlib.Path(site) / "usercustomize.py").write_text(logs("usercustomize"))
     r = _grade(run, scenario, env)
     assert not marker.exists(), marker.read_text() + r.stdout
+    assert (r.returncode, r.stdout.strip()) == want, r.stderr
 
 
 def test_runs_get_a_private_tmp(tmp_path):
@@ -774,6 +784,30 @@ def test_resume_reuses_a_verdict_only_for_the_same_config(tmp_path):
     assert edited[1] != moved[1], "an edited scenario must re-run"
     assert edited[0]["verdict"] == "FAIL", edited[0].get("why")
     assert edited[0]["why"] == "the canary moved"
+
+
+def test_resume_tracks_the_sibling_dirs_a_scenario_sources(tmp_path):
+    _require_sandbox()
+    claude = fake_claude(tmp_path, 'date +%s%N > "$E2E_RUN/called"\ncat <<\'EOF\'\n'
+                                   + stream("ok", []) + "\nEOF\n")
+    sc = _scenario(tmp_path, 'exec bash "$(dirname "$0")/../_lib/grade.sh"\n')
+    lib, other = tmp_path / "_lib", tmp_path / "other"
+    lib.mkdir()
+    other.mkdir()
+    (lib / "grade.sh").write_text("exit 0\n")
+    (other / "check.sh").write_text("exit 0\n")
+
+    def run():
+        _, _, (verdict,) = _run(tmp_path, sc, claude)
+        return verdict, (tmp_path / "out/sc/new/1/called").read_text()
+
+    first = run()
+    (other / "check.sh").write_text("exit 1\n")
+    assert run() == first, "an unrelated sibling edit must not re-spend the run"
+    (lib / "grade.sh").write_text('echo "grader edited"\nexit 1\n')
+    edited = run()
+    assert edited[1] != first[1], "an edited _lib must re-run"
+    assert (edited[0]["verdict"], edited[0]["why"]) == ("FAIL", "grader edited")
 
 
 def test_a_grader_that_dies_is_not_a_finding(tmp_path):
