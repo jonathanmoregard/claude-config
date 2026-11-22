@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # An orchestrated mission whose main session has nothing left to do while a
-# background subagent runs a ~60 s check. The Ralph Stop hook re-prompted the
+# background subagent runs a ~5 min check, longer than the main session's own
+# work, so the main session has to stop and wait. The Ralph Stop hook re-prompted the
 # session every few seconds in exactly that state; check.sh grades whether it
 # still does.
 set -euo pipefail
@@ -41,9 +42,9 @@ cat > integration.sh <<SH
 #!/usr/bin/env bash
 # Slow integration check. Prints one RESULT line at the end.
 printf 'start %s\n' "\$(date +%s)" >> "$RUN/integration.log"
-for i in 1 2 3 4; do
+for i in \$(seq 1 20); do
   sleep 15
-  echo "integration: step \$i/4"
+  echo "integration: step \$i/20"
 done
 printf 'done %s\n' "\$(date +%s)" >> "$RUN/integration.log"
 echo "RESULT: $token"
