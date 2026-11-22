@@ -371,6 +371,18 @@ def test_binary_file_need_not_be_read_by_a_passing_review(sb):
     assert sb.gate() is None
 
 
+def test_binary_changed_after_the_review_is_drift(sb):
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    (sb.work / "model.bin").write_bytes(b"\0\1\2weights" * 100)
+    git(sb.work, "add", "-A")
+    git(sb.work, "commit", "-qm", "model")
+    sb.review("PASS", reads=["scripts/run.sh"])
+    (sb.work / "model.bin").write_bytes(b"\0\x09\x08swapped" * 100)
+    git(sb.work, "commit", "-qam", "swap model")
+    out = sb.gate()
+    assert is_deny(out) and "drifted" in reason(out)
+
+
 def test_text_file_marked_binary_by_attributes_still_needs_a_read(sb):
     sb.commit(".gitattributes", "*.sh -diff\n")
     sb.commit("scripts/run.sh", SCRIPT_BODY)
