@@ -1,0 +1,1 @@
+This is a worktree of my claude-config repo. Add a small helper script under runtime/scripts that prints the skills in runtime/skills whose SKILL.md frontmatter has no `description:` line, one skill name per line. Check that it runs. No need to commit.

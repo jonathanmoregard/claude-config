@@ -193,6 +193,15 @@ jobs:
       - name: No credential reaches the tree
         run: gitleaks dir . --config .gitleaks.toml --no-banner --redact --exit-code 1
 
+      # After the secret scan, so gitleaks never walks node_modules/.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+      - name: The TypeScript helpers type-check
+        run: |
+          npm ci --ignore-scripts
+          npx tsc -p tsconfig.json
+
       # The whole tree, never a list of files. A suite that guards one of this
       # repository's own guards is itself a measuring instrument, and an
       # instrument CI does not run is not protected by requiring this job --

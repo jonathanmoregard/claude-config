@@ -99,6 +99,15 @@ def test_nothing_is_misplaced_in_this_tree():
     assert layout.misplaced(REPO_ROOT) == []
 
 
+def test_no_name_is_tracked_both_at_the_root_and_in_runtime():
+    """Entries are keyed by name, so the runtime/ one would mask the root one."""
+    files = subprocess.run(["git", "ls-files"], cwd=REPO_ROOT, capture_output=True,
+                           text=True, check=True).stdout.splitlines()
+    in_runtime = {f.split("/")[1] for f in files if f.startswith("runtime/")}
+    at_root = {f.split("/")[0] for f in files if not f.startswith("runtime/")}
+    assert in_runtime & at_root == set()
+
+
 # -------------------------------------------------------------- symlink geometry
 
 def test_no_dev_tree_file_joins_the_repo_root_to_a_moved_entry():

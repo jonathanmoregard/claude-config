@@ -90,6 +90,9 @@ skills/planning-with-files/
 
 # Python virtualenvs + build artefacts inside tools/
 **/.venv/
+
+# Dev-only TypeScript toolchain (root package.json)
+node_modules/
 tools/*/state.json
 
 # Token-optimizer runtime (plugin data dir + backups)

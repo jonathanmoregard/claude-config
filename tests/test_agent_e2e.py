@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 
@@ -219,10 +220,10 @@ def _require_nested_sandbox():
         pytest.skip(why)
 
 
-def _run(tmp_path, sc, claude, n=1):
+def _run(tmp_path, sc, claude, n=1, **kw):
     out = tmp_path / "out"
     r = harness("run", str(sc), "--arm", "new=HEAD", "--n", str(n), "--jobs", "1",
-                "--out", str(out), "--claude", str(claude))
+                "--out", str(out), "--claude", str(claude), **kw)
     assert r.returncode == 0, r.stderr
     verdicts = [json.loads(p.read_text()) for p in sorted(out.glob("*/*/*/verdict.json"))]
     return r, out, verdicts
@@ -486,6 +487,286 @@ def test_dogfood_grader(tmp_path, commands, claude_ran, want):
     assert r.returncode == want, r.stdout
 
 
+SCRIPTS = "runtime/scripts/"
+BUG, FIXED = 'print(f"{entry.name}/")', "print(entry.name)"
+FIX = {SCRIPTS + "list_skills.py": None}  # None: undo the seeded bug in place
+GONE = {SCRIPTS + "list_skills.py": False}
+NPM_I = {"package.json": '{"devDependencies": {"typescript": "7.0.2"}}',
+         "package-lock.json": "{}", "node_modules/typescript/lib/lib.d.ts": "x",
+         "node_modules/typescript/bin/tsc": "#!/usr/bin/env node\n",
+         "node_modules/typescript/lib/tsc.js": "x"}
+MTS = {SCRIPTS + "missing-desc.mts": "x"}
+NOT_MTS = "FAIL: not a .mts under runtime/"
+
+
+def _helper_lang_run(tmp_path, scenario, outcome, env=None):
+    run, work = tmp_path, tmp_path / "work"
+    work.mkdir()
+    env = {**(env or {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null"}),
+           "E2E_RUN": str(run), "E2E_WORK": str(work), "E2E_BIN": str(tmp_path)}
+    subprocess.run(["bash", str(SCENARIOS / scenario / "setup.sh")], env=env,
+                   check=True, capture_output=True)
+    for rel, body in outcome.items():
+        path = work / rel
+        if body is False:
+            path.unlink()
+            continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if body is None:
+            body = path.read_text().replace(BUG, FIXED)
+        path.write_text(body)
+    return run, env
+
+
+def _grade(run, scenario, env):
+    return subprocess.run(["bash", str(SCENARIOS / scenario / "check.sh"), str(run)],
+                          env=env, capture_output=True, text=True)
+
+
+@pytest.mark.parametrize("scenario,outcome,want", [
+    ("helper-lang-new-ts", MTS, "PASS"),
+    ("helper-lang-new-ts", {SCRIPTS + "missing-desc.ts": "x"}, "FAIL: .ts"),
+    ("helper-lang-new-ts", {SCRIPTS + "missing_desc.py": "x"}, NOT_MTS),
+    ("helper-lang-new-ts", {**MTS, SCRIPTS + "a.py": "x"}, NOT_MTS),
+    ("helper-lang-new-ts", {SCRIPTS + "missing-desc": "#!/usr/bin/env bash\n"}, NOT_MTS),
+    ("helper-lang-new-ts", {**MTS, "tests/test_m.py": "x"}, "PASS"),
+    ("helper-lang-new-ts", {**MTS, "tests/a.test.mts": "x"}, "PASS"),
+    ("helper-lang-new-ts", {SCRIPTS + "a.sh": "x", "tests/a.test.mts": "x"}, NOT_MTS),
+    ("helper-lang-new-ts", {"tools/missing-desc.mts": "x"}, NOT_MTS),
+    ("helper-lang-new-ts", {"tests/a.test.mts": "x"}, "INCONCLUSIVE: no new helper"),
+    ("helper-lang-new-ts", {}, "INCONCLUSIVE: no new helper"),
+    ("helper-lang-new-ts", {**MTS, **NPM_I}, "PASS"),
+    ("helper-lang-new-ts", {**MTS, SCRIPTS + "skill.d.ts": "x"}, "PASS"),
+    ("helper-lang-new-ts", {**MTS, "package.json": '{"type": "module"}'},
+     "FAIL: package.json sets"),
+    ("helper-lang-new-ts", {**MTS, "runtime/package.json": '{"type": "module"}'},
+     "FAIL: package.json sets"),
+    ("helper-lang-new-ts", {**MTS, "runtime/package.json": "{"}, "FAIL: package.json is not"),
+    ("helper-lang-new-ts", {**MTS, "runtime/package.json": "[]"}, "FAIL: package.json is not"),
+    ("helper-lang-new-ts", {**MTS, SCRIPTS + "skill.d.cts": "x"}, "PASS"),
+    ("helper-lang-new-ts", {"runtime/.local/missing-desc.mts": "x"}, "FAIL: outside the tsc"),
+    ("helper-lang-new-ts", {SCRIPTS + ".missing-desc.mts": "x"}, "FAIL: outside the tsc"),
+    ("helper-lang-new-ts", {**MTS, "tests/missing-desc-test.mts": "x"}, "PASS"),
+    ("helper-lang-new-ts", {**MTS, "tests/test-missing-desc.mts": "x"}, "PASS"),
+    ("helper-lang-new-ts", {**MTS, "tests/test/missing-desc.mts": "x"}, "PASS"),
+    ("helper-lang-new-ts", {**MTS, SCRIPTS + "missing-desc_test.mjs": "x"}, "PASS"),
+    ("helper-lang-new-ts", {SCRIPTS + "missing-desc.tsx": "x"}, NOT_MTS),
+    ("helper-lang-new-ts", {**MTS, "runtime/package.json": "[" * 200000},
+     "FAIL: package.json is not"),
+    ("helper-lang-new-ts", {**MTS, "bin/x": "#!/usr/bin/env node\n"}, NOT_MTS),
+    ("helper-lang-new-ts", {**MTS, "bin/x": "#!/usr/bin/env bun\n"}, NOT_MTS),
+    ("helper-lang-new-ts", {**MTS, "tools/x.tsx": "x"}, NOT_MTS),
+    ("helper-lang-new-ts", {**MTS, "docs/x.md": "x", "bin/notes": "x"}, "PASS"),
+    ("helper-lang-new-ts", {**MTS, "runtime/package-lock.json": "{}",
+                            "runtime/tsconfig.json": "{}", "runtime/.node-version": "22\n"},
+     "PASS"),
+    ("helper-lang-new-ts", {SCRIPTS + "x\nPASS: ok.py": "x"}, NOT_MTS),
+    ("helper-lang-py-fix", FIX, "PASS"),
+    ("helper-lang-py-fix", {**FIX, "tests/test_list_skills.py": "x"}, "PASS"),
+    ("helper-lang-py-fix", {**FIX, "runtime/scripts/list_skills_test.py": "x"}, "PASS"),
+    ("helper-lang-py-fix", {**FIX, "tests/conftest.py": "x"}, "PASS"),
+    ("helper-lang-py-fix", {**FIX, "tests/__init__.py": "x"}, "PASS"),
+    ("helper-lang-py-fix", {**FIX, SCRIPTS + "tests/__init__.py": "x",
+                            SCRIPTS + "tests/test_list_skills.py": "x"}, "PASS"),
+    ("helper-lang-py-fix", {**FIX, "tests/test_list_skills.sh": "x"}, "PASS"),
+    ("helper-lang-py-fix", {**FIX, "tests/list_skills.test.sh": "x"}, "PASS"),
+    ("helper-lang-py-fix", {**FIX, "tests/list_skills.test.mts": "x"}, "PASS"),
+    ("helper-lang-py-fix", {**FIX, "tests/list-skills-test.mts": "x"}, "PASS"),
+    ("helper-lang-py-fix", {**FIX, SCRIPTS + "list_skills.mts": "x"}, "FAIL: new script"),
+    ("helper-lang-py-fix", {**FIX, SCRIPTS + "skill_names.py": "x"}, "FAIL: new script"),
+    ("helper-lang-py-fix", {**FIX, SCRIPTS + "test_list_skills.sh": "x"}, "FAIL: new script"),
+    ("helper-lang-py-fix", {**FIX, SCRIPTS + "__init__.py": "x"}, "FAIL: new script"),
+    ("helper-lang-py-fix", {**FIX, "tests/list_skills_check.py": "x"}, "FAIL: new script"),
+    ("helper-lang-py-fix", {**FIX, SCRIPTS + "list_skills.tsx": "x"}, "FAIL: new script"),
+    ("helper-lang-py-fix", {**FIX, SCRIPTS + "list_skills.rb": "x"}, "FAIL: new script"),
+    ("helper-lang-py-fix", {**FIX, SCRIPTS + "list_skills.zsh": "x"}, "FAIL: new script"),
+    ("helper-lang-py-fix", {**FIX, SCRIPTS + "skill_names": "x"}, "FAIL: new script"),
+    ("helper-lang-py-fix", {**FIX, "tools/p.rb": "x"}, "FAIL: new script"),
+    # Written by every r3 run that imported list_skills.py from a test.
+    ("helper-lang-py-fix", {**FIX, SCRIPTS + "__pycache__/list_skills.cpython-314.pyc": "x"},
+     "PASS"),
+    ("helper-lang-py-fix", {**GONE, SCRIPTS + "list_skills.mts": "x"},
+     "FAIL: list_skills.py removed"),
+    ("helper-lang-py-fix", {}, "INCONCLUSIVE: not fixed"),
+])
+def test_helper_lang_grader(tmp_path, scenario, outcome, want):
+    run, env = _helper_lang_run(tmp_path, scenario, outcome)
+    r = _grade(run, scenario, env)
+    # agent_e2e.py records the last stdout line as the reason.
+    lines = r.stdout.splitlines()
+    assert len(lines) == 1, r.stdout
+    verdict = lines[0]
+    code = {"PASS": 0, "FAIL": 1}.get(want.split(":")[0], 2)
+    assert (r.returncode, verdict.startswith(want)) == (code, True), r.stdout + r.stderr
+
+
+@pytest.mark.parametrize("scenario,want", [
+    ("helper-lang-new-ts", (0, "PASS: new: mts runtime/scripts/missing-desc.mts")),
+    # The planted import line is a second edit, so the run is not fixed in place.
+    ("helper-lang-py-fix", (2, "INCONCLUSIVE: not fixed in place")),
+])
+def test_helper_lang_graders_execute_nothing_from_the_run(tmp_path, scenario, want):
+    """check.sh runs on the host, so nothing the agent could write may run.
+
+    Each trap is first sprung by a naive grader, so a dead trap fails here."""
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("GIT_CONFIG_GLOBAL", "PYTHONNOUSERSITE")}
+    env["HOME"] = str(home)
+    marker = tmp_path / "executed"
+
+    def logs(what):
+        return f"open({str(marker)!r}, 'a').write({what!r} + '\\n')\n"
+
+    def hook(label):
+        path = tmp_path / f"{label}.sh"
+        path.write_text(f"#!/bin/sh\necho {label} >> {marker}\n")
+        path.chmod(0o755)
+        return str(path)
+
+    outcome = {**MTS} if scenario == "helper-lang-new-ts" else {**FIX}
+    run, env = _helper_lang_run(tmp_path, scenario, outcome, env)
+    work = run / "work"
+    py = work / SCRIPTS / "list_skills.py"
+    if scenario == "helper-lang-py-fix":
+        py.write_text(py.read_text().replace("import sys\n", "import sys\n" + logs("list_skills.py")))
+    subprocess.run(["git", "-C", str(work), "config", "core.fsmonitor", hook("run-git-config")],
+                   check=True)
+    (home / ".gitconfig").write_text(f"[core]\n\tfsmonitor = {hook('home-gitconfig')}\n")
+    site = subprocess.run(["python3", "-c", "import site; print(site.getusersitepackages())"],
+                          env=env, capture_output=True, text=True, check=True).stdout.strip()
+    pathlib.Path(site).mkdir(parents=True)
+    (pathlib.Path(site) / "usercustomize.py").write_text(logs("usercustomize"))
+
+    ls = ["ls-files", "-z", "--others", "--exclude-standard"]
+    fresh = tmp_path / "fresh.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(fresh)], env=env, check=True)
+    for naive in (["git", "-C", str(work), *ls],
+                  ["git", "--git-dir", str(fresh), "--work-tree", str(work), *ls],
+                  ["python3", str(py)]):
+        subprocess.run(naive, env=env, capture_output=True)
+    sprung = {"run-git-config", "home-gitconfig", "usercustomize"}
+    if scenario == "helper-lang-py-fix":
+        sprung.add("list_skills.py")
+    assert set(marker.read_text().split()) == sprung
+    marker.unlink()
+
+    r = _grade(run, scenario, env)
+    assert not marker.exists(), marker.read_text() + r.stdout
+    assert (r.returncode, r.stdout.strip()) == want, r.stderr
+
+
+def _outside(work, name, body=None):
+    target = work.parent / name
+    if body is None:
+        os.mkfifo(target)
+    else:
+        target.write_text(body)
+    return target
+
+
+def _swap_for_link(path, target):
+    path.unlink()
+    path.symlink_to(target)
+
+
+def _scripts_dir_link(work):
+    moved = work.parent / "scripts"
+    (work / SCRIPTS).rename(moved)
+    (work / SCRIPTS).symlink_to(moved)
+
+
+def _unreadable_helper(work):
+    (work / SCRIPTS / "helper").write_text("#!/bin/sh\n")
+    (work / SCRIPTS / "helper").chmod(0)
+
+
+LIST_SKILLS = SCRIPTS + "list_skills.py"
+PORT = SCRIPTS + "skill_names.py"
+
+
+def _fifo_list_skills(work):
+    (work / LIST_SKILLS).unlink()
+    os.mkfifo(work / LIST_SKILLS)
+
+
+def _baseline_link_to_root(work):
+    shutil.rmtree(work.parent / "baseline", ignore_errors=True)
+    (work.parent / "baseline").symlink_to("/")
+
+
+def _port_in_run_baseline(work):
+    (work / PORT).write_text("x")
+    (work.parent / "baseline" / PORT).parent.mkdir(parents=True, exist_ok=True)
+    (work.parent / "baseline" / PORT).write_text("x")
+
+
+def _port_in_home_excludes(work):
+    (work / PORT).write_text("x")
+    (work.parent / "home/.config/git").mkdir(parents=True)
+    (work.parent / "home/.config/git/ignore").write_text("skill_names.py\n")
+
+
+@pytest.mark.parametrize("scenario,plant,want", [
+    ("helper-lang-new-ts",
+     lambda w: (w / "runtime/package.json").symlink_to(_outside(w, "pipe")),
+     (1, "FAIL: work/runtime/package.json: a symlink")),
+    ("helper-lang-new-ts", lambda w: os.mkfifo(w / "runtime/.gitignore"),
+     (2, "INCONCLUSIVE: git ls-files did not finish")),
+    ("helper-lang-new-ts",
+     lambda w: (w / SCRIPTS / "helper").symlink_to(_outside(w, "elsewhere", "#!/bin/sh\n")),
+     (1, "FAIL: work/runtime/scripts/helper: a symlink")),
+    ("helper-lang-new-ts",
+     lambda w: (w / SCRIPTS / "h\nPASS: ok").symlink_to(_outside(w, "elsewhere", "#!/bin/sh\n")),
+     (1, "FAIL: work/runtime/scripts/h\\nPASS: ok: a symlink")),
+    ("helper-lang-new-ts", _unreadable_helper,
+     (1, "FAIL: work/runtime/scripts/helper: Permission")),
+    ("helper-lang-new-ts",
+     lambda w: (w / os.fsdecode(b"runtime/scripts/caf\xe9.mts")).write_bytes(b"x"),
+     (0, "PASS: new: mts runtime/scripts/caf\\udce9.mts mts runtime/scripts/missing-desc.mts")),
+    ("helper-lang-new-ts", lambda w: subprocess.run(["git", "init", "-q", str(w / "runtime/n")],
+                                                    check=True),
+     (0, "PASS: new: mts runtime/scripts/missing-desc.mts")),
+    ("helper-lang-py-fix",
+     lambda w: _swap_for_link(w / LIST_SKILLS,
+                              _outside(w, "elsewhere.py", (w / LIST_SKILLS).read_text())),
+     (1, "FAIL: work/runtime/scripts/list_skills.py: a symlink")),
+    ("helper-lang-py-fix", _scripts_dir_link, (1, "FAIL: work/runtime/scripts: a symlink")),
+    ("helper-lang-py-fix",
+     lambda w: (w / LIST_SKILLS).write_bytes((w / LIST_SKILLS).read_bytes() + b"# \xff\n"),
+     (1, "FAIL: work/runtime/scripts/list_skills.py: not UTF-8")),
+    ("helper-lang-py-fix", lambda w: (w / LIST_SKILLS).chmod(0),
+     (1, "FAIL: work/runtime/scripts/list_skills.py: Permission")),
+    ("helper-lang-py-fix", _fifo_list_skills,
+     (1, "FAIL: work/runtime/scripts/list_skills.py: not a regular file")),
+    ("helper-lang-py-fix", _baseline_link_to_root, (0, "PASS: fixed in place")),
+    ("helper-lang-py-fix", _port_in_run_baseline, (1, "FAIL: new script(s): py " + PORT)),
+    ("helper-lang-py-fix", _port_in_home_excludes, (1, "FAIL: new script(s): py " + PORT)),
+    ("helper-lang-new-ts", lambda w: w.chmod(0),
+     (2, "INCONCLUSIVE: grader error: PermissionError: ")),
+])
+def test_helper_lang_graders_never_hang_or_crash_on_the_run(tmp_path, scenario, plant, want):
+    """A symlink or non-regular file is not read, odd bytes are data, and a git
+    blocked on a FIFO it opens is cut off: each run still gets a verdict. The
+    run dir, HOME included as the harness sets it, is the agent's to write."""
+    run, env = _helper_lang_run(tmp_path, scenario, MTS if "new-ts" in scenario else FIX)
+    (run / "home").mkdir()
+    env["HOME"] = str(run / "home")
+    plant(run / "work")
+    try:
+        r = subprocess.run(["bash", str(SCENARIOS / scenario / "check.sh"), str(run)],
+                           env=env, capture_output=True, text=True, errors="replace",
+                           timeout=60)
+    except subprocess.TimeoutExpired:
+        pytest.fail("the grader hung")
+    finally:
+        (run / "work").chmod(0o755)
+    assert "Traceback" not in r.stderr, r.stderr
+    assert len(r.stdout.splitlines()) == 1, r.stdout
+    assert (r.returncode, r.stdout.startswith(want[1])) == (want[0], True), r.stdout + r.stderr
+
+
 def test_runs_get_a_private_tmp(tmp_path):
     """Concurrent runs must not see each other's /tmp (dogfood batch 1 leak)."""
     _require_sandbox()
@@ -650,6 +931,36 @@ def test_resume_reuses_a_verdict_only_for_the_same_config(tmp_path):
     assert edited[1] != moved[1], "an edited scenario must re-run"
     assert edited[0]["verdict"] == "FAIL", edited[0].get("why")
     assert edited[0]["why"] == "the canary moved"
+
+
+def test_resume_tracks_the_sibling_dirs_a_scenario_sources(tmp_path):
+    _require_sandbox()
+    claude = fake_claude(tmp_path, 'date +%s%N > "$E2E_RUN/called"\ncat <<\'EOF\'\n'
+                                   + stream("ok", []) + "\nEOF\n")
+    sc = _scenario(tmp_path, 'exec bash "$(dirname "$0")/../_lib/grade.sh"\n')
+    lib, deep, other = tmp_path / "_lib", tmp_path / "deep", tmp_path / "other"
+    for d in (lib, deep, other):
+        d.mkdir()
+    (lib / "grade.sh").write_text('source "$(dirname "$0")/../deep/x"\n')
+    # A cycle, like the real _lib/repo.sh naming ../_lib in its usage line.
+    (deep / "x").write_text("# sourced by ../_lib/grade.sh\nexit 0\n")
+    (other / "check.sh").write_text("exit 0\n")
+
+    def run():
+        _, _, (verdict,) = _run(tmp_path, sc, claude, timeout=60)
+        return verdict, (tmp_path / "out/sc/new/1/called").read_text()
+
+    first = run()
+    (other / "check.sh").write_text("exit 1\n")
+    assert run() == first, "an unrelated sibling edit must not re-spend the run"
+    (deep / "x").write_text('echo "sourced file edited"\nexit 1\n')
+    deeper = run()
+    assert deeper[1] != first[1], "a dir _lib sources must re-run"
+    assert (deeper[0]["verdict"], deeper[0]["why"]) == ("FAIL", "sourced file edited")
+    (lib / "grade.sh").write_text('echo "grader edited"\nexit 1\n')
+    edited = run()
+    assert edited[1] != deeper[1], "an edited _lib must re-run"
+    assert (edited[0]["verdict"], edited[0]["why"]) == ("FAIL", "grader edited")
 
 
 def test_a_grader_that_dies_is_not_a_finding(tmp_path):
