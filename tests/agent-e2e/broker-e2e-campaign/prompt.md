@@ -1,0 +1,1 @@
+I pushed feat/tidy-commit-msgs to claude-config; it tightens the commit-messages skill. Run the agent e2e for it on the commit-msg-trailer scenario, master against my branch, with haiku and one sample per arm to keep it cheap, and tell me the pass rates.
