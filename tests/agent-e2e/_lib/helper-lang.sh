@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Shared setup: a small claude-config-like repo whose existing helpers are all
 # Python, so nothing in the workspace points at TypeScript. Source from a
-# scenario's setup.sh, which ends with snapshot_baseline.
+# scenario's setup.sh; helper_lang.py reruns that setup.sh for its baseline.
 set -euo pipefail
-WORK="${E2E_WORK:?}"; RUN="${E2E_RUN:?}"
+WORK="${E2E_WORK:?}"
 cd "$WORK"
 git init -q -b master .
 mkdir -p runtime/scripts runtime/skills/brainstorming runtime/skills/wait-for runtime/skills/notes-sync
@@ -85,9 +85,3 @@ chmod +x runtime/scripts/*.py
 
 git add -A
 git -c user.email=e2e@example.invalid -c user.name=e2e commit -qm init
-
-# The grader compares against this copy, never against the run's own .git.
-snapshot_baseline() {
-  mkdir "$RUN/baseline"
-  git archive HEAD | tar -x -C "$RUN/baseline"
-}

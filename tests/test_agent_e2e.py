@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 
@@ -549,6 +550,9 @@ def _grade(run, scenario, env):
     ("helper-lang-new-ts", {**MTS, "tests/test-missing-desc.mts": "x"}, "PASS"),
     ("helper-lang-new-ts", {**MTS, "tests/test/missing-desc.mts": "x"}, "PASS"),
     ("helper-lang-new-ts", {**MTS, SCRIPTS + "missing-desc_test.mjs": "x"}, "PASS"),
+    ("helper-lang-new-ts", {SCRIPTS + "missing-desc.tsx": "x"}, NOT_MTS),
+    ("helper-lang-new-ts", {**MTS, "runtime/package.json": "[" * 200000},
+     "FAIL: package.json is not"),
     ("helper-lang-py-fix", FIX, "PASS"),
     ("helper-lang-py-fix", {**FIX, "tests/test_list_skills.py": "x"}, "PASS"),
     ("helper-lang-py-fix", {**FIX, "runtime/scripts/list_skills_test.py": "x"}, "PASS"),
@@ -565,6 +569,13 @@ def _grade(run, scenario, env):
     ("helper-lang-py-fix", {**FIX, SCRIPTS + "test_list_skills.sh": "x"}, "FAIL: new script"),
     ("helper-lang-py-fix", {**FIX, SCRIPTS + "__init__.py": "x"}, "FAIL: new script"),
     ("helper-lang-py-fix", {**FIX, "tests/list_skills_check.py": "x"}, "FAIL: new script"),
+    ("helper-lang-py-fix", {**FIX, SCRIPTS + "list_skills.tsx": "x"}, "FAIL: new script"),
+    ("helper-lang-py-fix", {**FIX, SCRIPTS + "list_skills.rb": "x"}, "FAIL: new script"),
+    ("helper-lang-py-fix", {**FIX, SCRIPTS + "list_skills.zsh": "x"}, "FAIL: new script"),
+    ("helper-lang-py-fix", {**FIX, SCRIPTS + "skill_names": "x"}, "FAIL: new script"),
+    # Written by every r3 run that imported list_skills.py from a test.
+    ("helper-lang-py-fix", {**FIX, SCRIPTS + "__pycache__/list_skills.cpython-314.pyc": "x"},
+     "PASS"),
     ("helper-lang-py-fix", {**GONE, SCRIPTS + "list_skills.mts": "x"},
      "FAIL: list_skills.py removed"),
     ("helper-lang-py-fix", {}, "INCONCLUSIVE: not fixed"),
@@ -660,6 +671,29 @@ def _unreadable_helper(work):
 
 
 LIST_SKILLS = SCRIPTS + "list_skills.py"
+PORT = SCRIPTS + "skill_names.py"
+
+
+def _fifo_list_skills(work):
+    (work / LIST_SKILLS).unlink()
+    os.mkfifo(work / LIST_SKILLS)
+
+
+def _baseline_link_to_root(work):
+    shutil.rmtree(work.parent / "baseline", ignore_errors=True)
+    (work.parent / "baseline").symlink_to("/")
+
+
+def _port_in_run_baseline(work):
+    (work / PORT).write_text("x")
+    (work.parent / "baseline" / PORT).parent.mkdir(parents=True, exist_ok=True)
+    (work.parent / "baseline" / PORT).write_text("x")
+
+
+def _port_in_home_excludes(work):
+    (work / PORT).write_text("x")
+    (work.parent / "home/.config/git").mkdir(parents=True)
+    (work.parent / "home/.config/git/ignore").write_text("skill_names.py\n")
 
 
 @pytest.mark.parametrize("scenario,plant,want", [
@@ -689,11 +723,21 @@ LIST_SKILLS = SCRIPTS + "list_skills.py"
      (1, "FAIL: work/runtime/scripts/list_skills.py: not UTF-8")),
     ("helper-lang-py-fix", lambda w: (w / LIST_SKILLS).chmod(0),
      (1, "FAIL: work/runtime/scripts/list_skills.py: Permission")),
+    ("helper-lang-py-fix", _fifo_list_skills,
+     (1, "FAIL: work/runtime/scripts/list_skills.py: not a regular file")),
+    ("helper-lang-py-fix", _baseline_link_to_root, (0, "PASS: fixed in place")),
+    ("helper-lang-py-fix", _port_in_run_baseline, (1, "FAIL: new script(s): py " + PORT)),
+    ("helper-lang-py-fix", _port_in_home_excludes, (1, "FAIL: new script(s): py " + PORT)),
+    ("helper-lang-new-ts", lambda w: w.chmod(0),
+     (2, "INCONCLUSIVE: grader error: PermissionError: ")),
 ])
 def test_helper_lang_graders_never_hang_or_crash_on_the_run(tmp_path, scenario, plant, want):
     """A symlink or non-regular file is not read, odd bytes are data, and a git
-    blocked on a FIFO it opens is cut off: each run still gets a verdict."""
+    blocked on a FIFO it opens is cut off: each run still gets a verdict. The
+    run dir, HOME included as the harness sets it, is the agent's to write."""
     run, env = _helper_lang_run(tmp_path, scenario, MTS if "new-ts" in scenario else FIX)
+    (run / "home").mkdir()
+    env["HOME"] = str(run / "home")
     plant(run / "work")
     try:
         r = subprocess.run(["bash", str(SCENARIOS / scenario / "check.sh"), str(run)],
@@ -701,6 +745,8 @@ def test_helper_lang_graders_never_hang_or_crash_on_the_run(tmp_path, scenario, 
                            timeout=60)
     except subprocess.TimeoutExpired:
         pytest.fail("the grader hung")
+    finally:
+        (run / "work").chmod(0o755)
     assert "Traceback" not in r.stderr, r.stderr
     assert (r.returncode, r.stdout.startswith(want[1])) == (want[0], True), r.stdout + r.stderr
 

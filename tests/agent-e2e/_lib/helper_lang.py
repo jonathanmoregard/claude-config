@@ -1,10 +1,12 @@
 """Grade a helper-lang run: helper_lang.py new-ts|py-fix RUN.
 
 Static, because check.sh runs on the host: nothing from the run executes, and
-git reads no config the agent could have written (git(1), SECURITY). New files
-are the workspace's non-ignored files missing from setup.sh's baseline copy.
-The run's own ignore files and nested .git dirs apply, so an agent can hide one.
-Run content is read only as a regular file reached without a symlink.
+git reads no config the agent could have written (git(1), SECURITY). The whole
+run dir, HOME included, is the agent's to write, so the baseline is rebuilt from
+the scenario's setup.sh in this checkout. New files are the workspace's
+non-ignored files missing from that baseline. The run's own ignore files and
+nested .git dirs apply, so an agent can hide one. Run content is read only as a
+regular file reached without a symlink. Any other error grades INCONCLUSIVE.
 """
 import errno
 import fnmatch
@@ -28,6 +30,7 @@ DECLARATIONS = (".d.ts", ".d.mts", ".d.cts")
 LIST_SKILLS = "runtime/scripts/list_skills.py"
 # git blocks opening a FIFO .gitignore or nested-repo HEAD (measured, git 2.56).
 GIT_TIMEOUT = 10
+SCENARIOS = Path(__file__).resolve().parents[1]
 
 
 class Refused(Exception):
@@ -64,8 +67,20 @@ def outside_tsc(rel: str) -> bool:
             or any(p.startswith(".") or p in TSC_SKIPS for p in parts))
 
 
-def listed(work: Path) -> list[str]:
-    env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull}
+def baseline(scenario: str, tmp: Path, env: dict[str, str]) -> tuple[set[str], str]:
+    """The files setup.sh gives the agent, and the list_skills.py among them."""
+    work = tmp / "baseline"
+    work.mkdir()
+    subprocess.run(["bash", str(SCENARIOS / f"helper-lang-{scenario}" / "setup.sh")],
+                   env={**env, "E2E_WORK": str(work)}, check=True, capture_output=True,
+                   timeout=60)
+    out = subprocess.run(["git", "ls-files", "-z"], cwd=work, env=env, check=True,
+                         capture_output=True).stdout
+    files = {os.fsdecode(rel) for rel in out.split(b"\0") if rel}
+    return files, (work / LIST_SKILLS).read_text()
+
+
+def listed(work: Path, env: dict[str, str]) -> list[str]:
     with tempfile.TemporaryDirectory() as gitdir:
         subprocess.run(["git", "init", "-q", "--bare", gitdir], env=env, check=True)
         out = subprocess.run(["git", "--git-dir", gitdir, "--work-tree", ".", "ls-files",
@@ -85,10 +100,14 @@ def shebang(work: Path, rel: str) -> str | None:
 
 
 def kind(work: Path, rel: str) -> str | None:
-    """`test`, else the script language of REL; None when it is no script."""
+    """`test`, else the language of REL; None when it is no helper.
+
+    Under runtime/ every other file is a helper, so a port counts in any language.
+    """
     path = PurePosixPath(rel)
     # ls-files lists a nested repository as `DIR/`.
-    if rel.endswith("/") or path.name.endswith(DECLARATIONS):
+    if (rel.endswith("/") or path.name.endswith(DECLARATIONS) or path.name == "package.json"
+            or ("__pycache__" in path.parts and path.suffix == ".pyc")):
         return None
     lang = EXT.get(path.suffix) if path.suffix else shebang(work, rel)
 
@@ -102,7 +121,11 @@ def kind(work: Path, rel: str) -> str | None:
     else:
         test = (lang in ("js", "mts") and bool(path.suffix)
                 and (named(NODE_TESTS) or "test" in path.parts[:-1]))
-    return "test" if test else lang
+    if test:
+        return "test"
+    if lang is None and path.parts[0] == "runtime":
+        return path.suffix[1:] or "file"
+    return lang
 
 
 def fixed_in_place(before: str, after: str) -> bool:
@@ -116,7 +139,7 @@ def fixed_in_place(before: str, after: str) -> bool:
 def json_object(work: Path, rel: str) -> dict | None:
     try:
         data = json.loads(read_run(work, rel) or b"")
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     return data if isinstance(data, dict) else None
 
@@ -129,8 +152,8 @@ def source(top: Path) -> str | None:
         raise Refused(f"{top.name}/{LIST_SKILLS}: not UTF-8") from None
 
 
-def new_ts(run: Path, new: list[str], scripts: dict[str, str]) -> tuple[int, str]:
-    work, summary = run / "work", " ".join(f"{k} {r}" for r, k in scripts.items())
+def new_ts(work: Path, new: list[str], scripts: dict[str, str]) -> tuple[int, str]:
+    summary = " ".join(f"{k} {r}" for r, k in scripts.items())
     helpers = {r: k for r, k in scripts.items() if k != "test"}
     if not helpers:
         return 2, f"INCONCLUSIVE: no new helper written; new: {summary}"
@@ -151,30 +174,42 @@ def new_ts(run: Path, new: list[str], scripts: dict[str, str]) -> tuple[int, str
     return 0, f"PASS: new: {summary}"
 
 
-def py_fix(run: Path, new: list[str], scripts: dict[str, str]) -> tuple[int, str]:
-    now = source(run / "work")
+def py_fix(work: Path, before: str, scripts: dict[str, str]) -> tuple[int, str]:
+    now = source(work)
     if now is None:
         return 1, "FAIL: list_skills.py removed"
     if helpers := [f"{k} {r}" for r, k in scripts.items() if k != "test"]:
         return 1, f"FAIL: new script(s): {' '.join(helpers)}"
-    if not fixed_in_place(source(run / "baseline") or "", now):
+    if not fixed_in_place(before, now):
         return 2, "INCONCLUSIVE: not fixed in place"
     return 0, "PASS: fixed in place" + "".join(f"; new: {r}" for r in scripts)
 
 
-def main() -> None:
-    scenario, run = sys.argv[1], Path(sys.argv[2])
-    work, baseline = run / "work", run / "baseline"
-    sys.stdout.reconfigure(errors="backslashreplace")
-    base = {p.relative_to(baseline).as_posix() for p in baseline.rglob("*") if p.is_file()}
+def grade(scenario: str, run: Path) -> tuple[int, str]:
+    work = run / "work"
+    with tempfile.TemporaryDirectory() as tmp:
+        env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": tmp,
+               "GIT_CONFIG_GLOBAL": os.devnull}
+        base, before = baseline(scenario, Path(tmp), env)
+        try:
+            new = sorted(set(listed(work, env)) - base)
+        except subprocess.TimeoutExpired:
+            return 2, f"INCONCLUSIVE: git ls-files did not finish in {GIT_TIMEOUT} s"
     try:
-        new = sorted(set(listed(work)) - base)
         scripts = {rel: k for rel in new if (k := kind(work, rel))}
-        code, verdict = {"new-ts": new_ts, "py-fix": py_fix}[scenario](run, new, scripts)
-    except subprocess.TimeoutExpired:
-        code, verdict = 2, f"INCONCLUSIVE: git ls-files did not finish in {GIT_TIMEOUT} s"
+        if scenario == "new-ts":
+            return new_ts(work, new, scripts)
+        return py_fix(work, before, scripts)
     except Refused as e:
-        code, verdict = 1, f"FAIL: {e}"
+        return 1, f"FAIL: {e}"
+
+
+def main() -> None:
+    sys.stdout.reconfigure(errors="backslashreplace")
+    try:
+        code, verdict = grade(sys.argv[1], Path(sys.argv[2]))
+    except Exception as e:
+        code, verdict = 2, f"INCONCLUSIVE: grader error: {type(e).__name__}: {' '.join(str(e).split())}"
     print(verdict)
     sys.exit(code)
 
