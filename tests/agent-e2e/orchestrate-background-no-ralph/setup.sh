@@ -12,8 +12,8 @@ BIN="${E2E_BIN:?}"
 cp "$(dirname "$0")/../_lib/gh" "$BIN/gh"
 chmod +x "$BIN/gh"
 
-# Per-run token: the agent can only report it by actually waiting for the
-# background subagent's result.
+# Per-run token reported in the final message. It is readable in integration.sh,
+# so grade.py also requires the check to have finished (the "done" log line).
 token="r$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')"
 printf '%s\n' "$token" > "$RUN/expected-result.txt"
 

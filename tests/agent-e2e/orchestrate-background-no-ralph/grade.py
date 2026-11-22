@@ -98,5 +98,10 @@ if reprompts or armed:
 if not result_ok:
     print(f"FAIL: final message lacks the integration RESULT ({summary})")
     sys.exit(1)
+if "done" not in log:
+    # The token is readable in integration.sh, so a reported token alone does not
+    # prove the session waited: the check itself must have finished.
+    print(f"FAIL: RESULT reported but the integration check never finished ({summary})")
+    sys.exit(1)
 print(f"PASS: no Ralph re-prompt; background result reported ({summary})")
 sys.exit(0)
