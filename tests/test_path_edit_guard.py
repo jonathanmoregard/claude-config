@@ -95,7 +95,10 @@ def assert_codex_denied(payload):
     assert "~/.claude" in reason
     assert "codex/ in the config repo ~/Repos/claude-config" in reason
     assert "ai-client-config-codex-sync.service" in reason
-    assert "ai-client-config repo" not in reason
+    # The sync unit keeps the retired repo's name; nothing else may name it.
+    assert "ai-client-config" not in reason.replace(
+        "ai-client-config-codex-sync.service", ""
+    )
     return reason
 
 

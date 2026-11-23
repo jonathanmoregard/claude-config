@@ -14,6 +14,7 @@ from itertools import product
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import subprocess
@@ -2069,7 +2070,40 @@ def test_report_discloses_research_agent_fallback() -> None:
     assert "automatically retries with Codex" in gaps
 
 
+# Names that still carry the retired repo's name but route nothing: the sync
+# unit and its nix file, the bind-mounted clone, the probe skill, the check's
+# own report line, and this suite's temp-home prefix in rendered paths.
+RETIRED_REPO_NAMES = re.compile(
+    r"ai-client-config(?!-codex-sync|-sync|-repo|-roundtrip-|-skill-probe| check)"
+)
+
+
+def test_generated_text_never_routes_codex_changes_to_the_retired_repo() -> None:
+    with round_trip(RICH_INPUTS) as rt:
+        stale: list[str] = []
+        generated = [
+            path
+            for root in (".codex", ".agents", "plugins")
+            for path in sorted((rt.home / root).rglob("*"))
+        ]
+        assert any(path.name == "plugin.json" for path in generated)
+        for path in generated:
+            if not path.is_file() or path.is_symlink():
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            for number, line in enumerate(text.splitlines(), 1):
+                if RETIRED_REPO_NAMES.search(line):
+                    stale.append(f"{path.relative_to(rt.home)}:{number}: {line.strip()}")
+        assert stale == [], "\n".join(stale)
+        agents = (rt.home / ".codex" / "AGENTS.md").read_text(encoding="utf-8")
+        assert "`codex/` in the claude-config repo" in agents
+
+
 if __name__ == "__main__":
+    test_generated_text_never_routes_codex_changes_to_the_retired_repo()
     test_round_trip_matrix_checks_clean_and_rerenders_as_no_op()
     test_unchanged_hourly_run_from_a_staged_home_publishes_nothing()
     test_check_fails_for_every_corrupted_or_deleted_published_file()
