@@ -105,5 +105,24 @@ expect "a line without ten fields is ignored" "" "$(grep -E "^(a stray line)?${T
 expect "and reported on stderr" "ledger-tally: $ROOT/repo2/review-ledger.tsv:11: skipped, not ten fields" \
   "$("$TALLY" --root "$ROOT" 2>&1 >/dev/null)"
 
+# --- a reason the user already decided is never proposed again ----------
+DEC="$ROOT/decisions.tsv"
+printf 'fp_reason\tdecision\tdate\n' > "$DEC"
+printf 'test-only path\trejected\t2026-11-23\n' >> "$DEC"
+out=$("$TALLY" --root "$ROOT" --decided "$DEC")
+expect "a rejected reason is not proposed" "" "$(grep -E "^exclude\?${T}" <<<"$out")"
+printf 'fp_reason\tdecision\tdate\ntest-only path\taccepted\t2026-11-23\n' > "$DEC"
+out=$("$TALLY" --root "$ROOT" --decided "$DEC")
+expect "an accepted reason is not proposed" "" "$(grep -E "^exclude\?${T}" <<<"$out")"
+printf 'fp_reason\tdecision\tdate\nsome other reason\trejected\t2026-11-23\n' > "$DEC"
+out=$("$TALLY" --root "$ROOT" --decided "$DEC")
+expect "an undecided reason is still proposed" \
+  "exclude?${T}test-only path${T}3${T}2" "$(grep -E "^exclude\?${T}" <<<"$out")"
+out=$("$TALLY" --root "$ROOT" --decided "$ROOT/missing.tsv")
+expect "a missing decisions file decides nothing" \
+  "exclude?${T}test-only path${T}3${T}2" "$(grep -E "^exclude\?${T}" <<<"$out")"
+SHIPPED="$(dirname "$TALLY")/../references/exclusion-decisions.tsv"
+expect "the shipped decisions file exists" yes "$([[ -f $SHIPPED ]] && echo yes)"
+
 if (( fails )); then echo "FAIL: $fails ledger-tally assertion(s)"; exit 1; fi
 echo "PASS: ledger-tally"

@@ -53,5 +53,10 @@ Then propose, to the user, never on your own:
 3. **Exclude** a category when the same `fp_reason` appears on three or more
    rows across two or more runs: one entry in `exclusions.md`.
 
+Every answer to rule 3, yes or no, also gets a row in
+`exclusion-decisions.tsv` (`fp_reason`, `accepted` or `rejected`, date) in
+the same change. The tally never proposes a listed reason again, so a
+decided category is never put to the user twice.
+
 `A` cannot be dropped; it is reworded. A change the user accepts goes through
 the normal change process for these files, tally included.
