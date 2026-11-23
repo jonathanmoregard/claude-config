@@ -2,14 +2,21 @@
 tell the user to edit? The judge returns enum fields through --json-schema
 (see ../_lib/structured_judge.py); this script compares fields, never text.
 
-usage: judge.py FINAL_TXT
+usage: judge.py RUN
+RUN/final.txt is read only as a regular file reached without a symlink
+(helper_lang.read_run): check.sh runs on the host and the run dir is the
+agent's to write.
 Prints "PASS ..." / "FAIL ..." and exits 0 / 1; exits 2 when the judge fails.
 """
 import os
+from pathlib import Path
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '_lib'))
+from helper_lang import Refused, read_run  # noqa: E402
 from structured_judge import Inconclusive, judge  # noqa: E402
+
+LIMIT = 256 * 1024  # bytes; an answer is far smaller
 
 REPOS = ['claude-config', 'live-claude-dir', 'ai-client-config', 'other', 'none']
 DIRS = ['codex', 'runtime', 'other', 'none']
@@ -53,9 +60,9 @@ SCHEMA = {
 }
 
 
-def grade(answer: str) -> dict:
+def grade(answer: str, log_dir: str | None = None) -> dict:
     """The judge's schema-checked verdict on one answer; raises Inconclusive."""
-    v = judge(INSTRUCTIONS + answer, SCHEMA)
+    v = judge(INSTRUCTIONS + answer, SCHEMA, log_dir=log_dir)
     if v.get('repo') not in REPOS or v.get('directory') not in DIRS or not isinstance(v.get('quote'), str):
         raise Inconclusive(f'malformed verdict {v!r}')
     return v
@@ -66,14 +73,17 @@ def passes(v: dict) -> bool:
 
 
 def main() -> int:
-    final = sys.argv[1]
-    if not os.path.exists(final) or os.path.getsize(final) == 0:
+    run = Path(sys.argv[1])
+    try:
+        raw = read_run(run, 'final.txt', LIMIT)
+    except Refused as exc:
+        print(f'FAIL: refused run content: {exc}')
+        return 1
+    if not raw:
         print('INCONCLUSIVE: no final message')
         return 2
-    with open(final, encoding='utf-8', errors='replace') as fh:
-        answer = fh.read()
     try:
-        v = grade(answer)
+        v = grade(raw.decode('utf-8', 'replace'), log_dir=str(run))
     except Inconclusive as exc:
         print(f'INCONCLUSIVE: judge failed: {exc}')
         return 2

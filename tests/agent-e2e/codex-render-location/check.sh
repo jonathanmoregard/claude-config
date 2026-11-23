@@ -7,7 +7,7 @@
 # Grading compares those fields; nothing here matches the answer's text.
 # A judge failure is INCONCLUSIVE.
 RUN="${1:?run dir}"
-out=$(python3 -I "$(dirname "$0")/judge.py" "$RUN/final.txt")
+out=$(python3 -I "$(dirname "$0")/judge.py" "$RUN")
 code=$?
 echo "$out"
 exit "$code"
