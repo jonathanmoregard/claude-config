@@ -12,7 +12,7 @@ Never use `sed` (or `awk`) to read a file. Use the tool from this table:
 | Lines matching a pattern | Grep tool, or `grep 'pat' file` / `rg 'pat' file` |
 | Matches with context | Grep tool with `-C`, or `grep -C3 'pat' file` |
 | Lines N to M, to look at | Read tool with `offset: N`, `limit: M-N+1` |
-| Lines N to M, piped onward | `tail -n +N file \| head -n $((M-N+1))` |
+| Lines N to M, piped onward | `tail -n +N file \| head -n K`, K = M-N+1 as a literal number |
 | JSONL entries matching | `grep 'pat' file \| jq -c '…'`, or `jq -c 'select(tostring\|contains("pat")) \| …' file` |
 | JSONL lines N to M | `tail -n +N file \| head -n K \| jq -c '…'` |
 | First / last lines | `head -n K file` / `tail -n K file` |
