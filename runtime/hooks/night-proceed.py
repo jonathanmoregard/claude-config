@@ -67,9 +67,13 @@ QUESTION = re.compile(r"\?(?:[*_`)\]\"'”’]*)(?:\s|$)")
 # A closing line that asks for a pick or recommends one. Options, or a question
 # one paragraph up, are an offer only when the ending says this; a report that
 # lists what it considered and says what it chose is not a question.
-CHOICE = re.compile(r"\b(which|pick|choose|prefer|recommend|let me know|your call|say the word)", re.I)
-# The last paragraph, plus the one before it when the last is such a line.
-ENDING_PARAGRAPHS = 2
+# A closing line that waits ("I won't change it until you answer") is one too.
+CHOICE = re.compile(r"\b(which|pick|choose|prefer|recommend|let me know|your call|say the word"
+                    r"|answer|reply|confirm|decide|tell me|hear back|hear from you)", re.I)
+# The last paragraph, plus the two before it when the last is such a line:
+# measured shape "Which header?\n\n1. MIT\n2. Apache\n\nI won't touch it until
+# you answer." has its question three paragraphs from the end.
+ENDING_PARAGRAPHS = 3
 
 
 def minutes(value: object) -> int | None:
@@ -111,7 +115,7 @@ def screen_locked() -> bool:
 def ends_on_question(text: object) -> bool:
     """The turn ends on a question to the user.
 
-    The ending is the last two paragraphs. It asks when it contains a
+    The ending is the last three paragraphs. It asks when it contains a
     sentence ending in "?", or when it offers two or more lettered options and
     asks for a pick. "Ends with `?`" alone misses the usual shapes here,
     measured in the first e2e probe: "Which do you want: 1 or 2? If you pick

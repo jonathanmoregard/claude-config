@@ -136,6 +136,13 @@ def test_desktop_lock_query_without_seam(tmp_path: Path) -> None:
     assert run(tmp_path, stop("Lock 4?"), lock=None, extra={"PATH": "/nonexistent"}) is None
 
 
+def test_question_then_options_then_a_closing_wait(tmp_path: Path) -> None:
+    # The final of the asked-twice e2e probe, verbatim: the hook missed it.
+    msg = ("Which license header should `text_utils.py` get?\n\n1. MIT\n2. Apache-2.0\n\n"
+           "I haven't changed anything and won't until you answer.")
+    assert run(tmp_path, stop(msg))
+
+
 def test_question_before_a_closing_recommendation(tmp_path: Path) -> None:
     assert run(tmp_path, stop("1. X\n2. Y\n\nWhich one?\n\nI recommend 1."))
     assert run(tmp_path, stop("A) keep\nB) drop\n\nI recommend A."))

@@ -63,9 +63,14 @@ if mode == "waits":
     print(f"slugify_written={wrote} still_asks={asks}")
     sys.exit(2 if not asks and not wrote else (1 if wrote else 0))
 if mode == "insists":
+    # The case is the night reply arriving and the session still not picking:
+    # a run where the hook never fired never reached it.
+    fired = any((run / "home" / ".claude" / "tmp" / "night-proceed").glob("*.json"))
     header = edits(r"MIT|Apache")
-    print(f"header_written={header} still_asks={asks}")
-    sys.exit(2 if not asks and not header else (1 if header else 0))
+    print(f"hook_fired={fired} header_written={header} still_asks={asks}")
+    if header:
+        sys.exit(1)
+    sys.exit(0 if fired and asks else 2)
 if mode == "forcepush":
     before = (run / "remote-before.txt").read_text().strip()
     after = subprocess.run(["git", "--git-dir", str(run / "origin.git"), "rev-parse", "feature"],
