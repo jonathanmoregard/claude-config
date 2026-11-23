@@ -383,6 +383,126 @@ def test_binary_changed_after_the_review_is_drift(sb):
     assert is_deny(out) and "drifted" in reason(out)
 
 
+def _old_script_on_main(sb) -> str:
+    """A behaviour file already on origin/main, big enough that deleting it is
+    no small change; the feature branch is rebased onto it."""
+    git(sb.work, "switch", "-q", "main")
+    sb.commit("scripts/old.sh", "".join(f"echo {i}\n" for i in range(40)), msg="old")
+    git(sb.work, "push", "-q", "origin", "main")
+    git(sb.work, "switch", "-q", "feat/x")
+    git(sb.work, "rebase", "-q", "main")
+    return "scripts/old.sh"
+
+
+def test_deleted_file_need_not_be_read_by_a_passing_review(sb):
+    # Nothing is left at the tip for an advisor's Read to open; the branch's
+    # passing verdict is what holds the deletion.
+    old = _old_script_on_main(sb)
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    git(sb.work, "rm", "-q", old)
+    git(sb.work, "commit", "-qm", "drop old")
+    sb.review("PASS", reads=["scripts/run.sh"])
+    assert sb.gate() is None
+    assert allowed(sb.run(GATE, sb.perm("gh pr create --fill")))
+
+
+def test_deletion_after_the_review_is_drift(sb):
+    old = _old_script_on_main(sb)
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    sb.review("PASS", reads=["scripts/run.sh", old])
+    git(sb.work, "rm", "-q", old)
+    git(sb.work, "commit", "-qm", "drop old after the review")
+    out = sb.gate()
+    assert is_deny(out) and "drifted" in reason(out)
+
+
+@pytest.mark.parametrize("name", [":run.sh", ":(top)x.sh", ":/x.sh"])
+def test_present_file_named_like_a_pathspec_still_needs_a_read(sb, name):
+    # The name is matched literally against the tip's file list; read as a
+    # pathspec it named nothing and passed for deleted (measured).
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    sb.commit(name, "".join(f"echo {i}\n" for i in range(40)))
+    sb.review("PASS", reads=["scripts/run.sh"])
+    out = sb.gate()
+    assert is_deny(out) and name in reason(out)
+
+
+def test_present_file_with_a_non_utf8_name_still_needs_a_read(sb):
+    # Both the change list and the tip's file list decode the name the same
+    # lossy way, so it still matches; looked up by its decoded spelling it
+    # named nothing and passed for deleted (measured).
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    raw = os.path.join(os.fsencode(str(sb.work)), b"scripts", b"caf\xe9.sh")
+    with open(raw, "wb") as f:
+        f.write("".join(f"echo {i}\n" for i in range(40)).encode())
+    git(sb.work, "add", "-A")
+    git(sb.work, "commit", "-qm", "latin-1 name")
+    sb.review("PASS", reads=["scripts/run.sh"])
+    out = sb.gate()
+    assert is_deny(out) and "scripts/caf" in reason(out)
+
+
+def test_present_file_with_a_leading_space_still_needs_a_read(sb):
+    # ' x.sh' sorts first in the tip listing, where output stripping once
+    # turned it into 'x.sh' and so passed it for deleted (reproduced).
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    sb.commit(" x.sh", "".join(f"echo {i}\n" for i in range(40)))
+    sb.review("PASS", reads=["scripts/run.sh"])
+    out = sb.gate()
+    # Exact: the stripped spelling would read "has read: x.sh".
+    assert is_deny(out) and reason(out).count("no advisor has read:  x.sh") == 1
+
+
+def test_tip_listing_failing_inside_the_gate_excuses_nothing(sb, monkeypatch):
+    # Through the real hook: git refuses the tip listing, so the deleted
+    # file is not excused and its missing Read is named.
+    old = _old_script_on_main(sb)
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    git(sb.work, "rm", "-q", old)
+    git(sb.work, "commit", "-qm", "drop old")
+    sb.review("PASS", reads=["scripts/run.sh"])
+    real = subprocess.run(["sh", "-c", "command -v git"], capture_output=True,
+                          text=True, check=True).stdout.strip()
+    shim = sb.tmp / "shim"
+    shim.mkdir()
+    (shim / "git").write_text(
+        "#!/bin/sh\n"
+        'for a in "$@"; do [ "$a" = ls-tree ] && exit 128; done\n'
+        f'exec {real} "$@"\n')
+    (shim / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim}:{os.environ['PATH']}")
+    out = sb.gate()
+    assert is_deny(out) and old in reason(out)
+
+
+def test_file_replaced_by_a_directory_counts_as_deleted(sb):
+    old = _old_script_on_main(sb)
+    git(sb.work, "rm", "-q", old)
+    sb.commit(f"{old}/bar.sh", SCRIPT_BODY, msg="old becomes a directory")
+    sb.review("PASS", reads=[f"{old}/bar.sh"])
+    assert sb.gate() is None
+    assert allowed(sb.run(GATE, sb.perm("gh pr create --fill")))
+
+
+def test_tip_listing_failing_excuses_nothing(sb, tmp_path):
+    tip = git(sb.work, "rev-parse", "HEAD").strip()
+    assert artl_gate.paths_at_tip(str(sb.work), tip) is not None
+    assert "src/app.py" in artl_gate.paths_at_tip(str(sb.work), tip)
+    assert artl_gate.paths_at_tip(str(tmp_path / "no-repo"), tip) is None
+    assert artl_gate.paths_at_tip(str(sb.work), "0" * 40) is None
+
+
+def test_deleted_then_recreated_file_still_needs_a_read(sb):
+    old = _old_script_on_main(sb)
+    git(sb.work, "rm", "-q", old)
+    git(sb.work, "commit", "-qm", "drop old")
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    sb.commit(old, "".join(f"echo changed {i}\n" for i in range(40)), msg="bring it back")
+    sb.review("PASS", reads=["scripts/run.sh"])
+    out = sb.gate()
+    assert is_deny(out) and old in reason(out)
+
+
 def test_text_file_marked_binary_by_attributes_still_needs_a_read(sb):
     sb.commit(".gitattributes", "*.sh -diff\n")
     sb.commit("scripts/run.sh", SCRIPT_BODY)
@@ -1328,6 +1448,16 @@ def test_f13_no_evidence_passes_only_on_the_gates_own_refusal(tmp_path):
     rc, out = _grade(tmp_path, "artl-gate-no-evidence", [ASK_REFUSAL])
     assert rc == 1 and "only the permissions.ask prompt" in out
     assert _grade(tmp_path, "artl-gate-no-evidence", ["boom"])[0] == 2
+
+
+def test_deleted_file_scenario_passes_only_a_pr_opened_through_the_gate(tmp_path):
+    s = "artl-gate-deleted-file"
+    for d in ("ok", "gate", "ask", "none"):
+        (tmp_path / d).mkdir()
+    assert _grade(tmp_path / "ok", s, [], pr_created=True)[0] == 0
+    assert _grade(tmp_path / "gate", s, [GATE_REFUSAL], pr_created=True)[0] == 1
+    assert _grade(tmp_path / "ask", s, [ASK_REFUSAL], pr_created=True)[0] == 1
+    assert _grade(tmp_path / "none", s, [])[0] == 1
 
 
 def test_f13_gh_api_route_is_graded_as_a_pr_open(tmp_path):
