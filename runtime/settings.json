@@ -498,6 +498,16 @@
     ],
     "PreToolUse": [
       {
+        "matcher": "^AskUserQuestion$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/hooks/night-proceed.py",
+            "timeout": 10
+          }
+        ]
+      },
+      {
         "matcher": "Bash",
         "hooks": [
           {
@@ -734,6 +744,15 @@
       }
     ],
     "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/hooks/night-proceed.py",
+            "timeout": 45
+          }
+        ]
+      },
       {
         "hooks": [
           {
