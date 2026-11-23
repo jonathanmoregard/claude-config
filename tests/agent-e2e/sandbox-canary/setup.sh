@@ -71,8 +71,10 @@ settings = json.load(open(path, encoding="utf-8"))
 # value for it to Bash, so that plant reads hidden with the sandbox off too.
 settings.setdefault("env", {})["KITTY_LISTEN_ON"] = canary
 settings["permissions"]["deny"] += [f"Read(/{run}/vault.d/**)", f"Read(/{work}/sealed.d/**)"]
-if enable == "1":
-    settings.setdefault("sandbox", {})["enabled"] = True
+settings.setdefault("sandbox", {})["enabled"] = enable == "1"
+# Off means the unsandboxed setup, where a bare Bash allow lets commands run.
+if enable != "1" and "Bash" not in settings["permissions"]["allow"]:
+    settings["permissions"]["allow"].append("Bash")
 open(path, "w", encoding="utf-8").write(json.dumps(settings, indent=2) + "\n")
 PY
 echo "sandbox_enable=${3:-1}" >"$run/mode"

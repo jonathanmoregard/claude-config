@@ -54,7 +54,7 @@ PROJECTED = (
     "tools", "wellbeing", "workers",
     # configuration the harness reads
     "CLAUDE.md", ".claude-powerline.json", "claude-powerline.json", "dcg.toml",
-    "egress-sinks.json", "mcp-servers.json", "settings.json",
+    "egress-sinks.json", "mcp-servers.json", "sandbox-soak.json", "settings.json",
     "settings-patch.json", "upstream-drift.json",
     # loose entrypoints, each named by a hook or run by hand
     "aggregator-recall-hook.py", "aggregator-transcript-guard.py",

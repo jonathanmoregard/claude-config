@@ -13,7 +13,7 @@ HOOK = REPO / "runtime" / "hooks" / "sandbox-aid.py"
 AUTH_FAILURE = "fatal: Authentication failed for 'https://github.com/o/r.git/'"
 
 
-def run_hook(tmp_path: Path, event: dict | str, *, enabled: bool = True):
+def run_hook(tmp_path: Path, event: dict | str, *, enabled: bool = True, env: dict | None = None):
     hooks = tmp_path / "config" / "hooks"
     hooks.mkdir(parents=True, exist_ok=True)
     shutil.copy(HOOK, hooks / HOOK.name)
@@ -22,7 +22,8 @@ def run_hook(tmp_path: Path, event: dict | str, *, enabled: bool = True):
     payload = event if isinstance(event, str) else json.dumps(event)
     proc = subprocess.run(
         [sys.executable, "-S", "-E", str(hooks / HOOK.name)], input=payload,
-        capture_output=True, text=True, env={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin"},
+        capture_output=True, text=True,
+        env={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin", **(env or {})},
         check=False,
     )
     log = tmp_path / ".local" / "state" / "claude-sandbox" / "events.jsonl"
@@ -39,6 +40,25 @@ def test_git_auth_failure_points_at_the_broker(tmp_path: Path) -> None:
     proc, records = run_hook(tmp_path, failed(AUTH_FAILURE))
     assert proc.returncode == 2
     assert "mcp__git_broker__git" in proc.stderr
+    assert [(r["kind"], r["hint"]) for r in records] == [("hint", "git-auth")]
+
+
+def test_flake_eval_blocked_by_the_gitmodules_placeholder_names_the_fix(tmp_path: Path) -> None:
+    err = ("error: parsing .gitmodules file: failed open - "
+           "'/home/u/worktrees/r/.gitmodules' is locked: Permission denied")
+    proc, records = run_hook(tmp_path, failed(err, command="nix build .#x"))
+    assert proc.returncode == 2
+    assert "empty .gitmodules" in proc.stderr
+    # Inside, the path is a read-only placeholder: the fix must run outside.
+    assert "dangerouslyDisableSandbox" in proc.stderr
+    assert [r["hint"] for r in records] == ["gitmodules"]
+
+
+def test_soak_session_gets_hints_while_settings_keep_the_sandbox_off(tmp_path: Path) -> None:
+    soak = json.loads((REPO / "runtime" / "sandbox-soak.json").read_text())
+    assert soak["sandbox"]["enabled"] is True
+    proc, records = run_hook(tmp_path, failed(AUTH_FAILURE), enabled=False, env=soak["env"])
+    assert proc.returncode == 2
     assert [(r["kind"], r["hint"]) for r in records] == [("hint", "git-auth")]
 
 

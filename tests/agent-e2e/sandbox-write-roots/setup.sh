@@ -4,7 +4,7 @@
 #
 # The arm's own sandbox block is kept and only `enabled` is turned on, so
 # the arms differ exactly in the write roots they declare. SANDBOX_ENABLE=0
-# (the -off control scenario) leaves the arm's settings untouched instead.
+# (the -off control scenario) turns it off instead.
 #
 # Every target must be writable by the harness's own bubblewrap, or a
 # refusal would be the harness talking rather than Claude's sandbox. The
@@ -57,13 +57,14 @@ git -C "$work/repo" "${ident[@]}" commit -q --allow-empty -m init
   echo 'else echo "git-commit-in-cwd DENIED ${out##*: }"; fi'
 } >"$work/probe.sh"
 
-if [ "${SANDBOX_ENABLE:-1}" = 1 ]; then
-  python3 - "$HOME/.claude/settings.json" <<'PY'
+python3 - "$HOME/.claude/settings.json" "${SANDBOX_ENABLE:-1}" <<'PY'
 import json, sys
-path = sys.argv[1]
+path, enable = sys.argv[1:3]
 settings = json.load(open(path, encoding="utf-8"))
-settings.setdefault("sandbox", {})["enabled"] = True
+settings.setdefault("sandbox", {})["enabled"] = enable == "1"
+# Off means the unsandboxed setup, where a bare Bash allow lets commands run.
+if enable != "1" and "Bash" not in settings["permissions"]["allow"]:
+    settings["permissions"]["allow"].append("Bash")
 open(path, "w", encoding="utf-8").write(json.dumps(settings, indent=2) + "\n")
 PY
-fi
 echo "sandbox_enable=${SANDBOX_ENABLE:-1}" >"$run/mode"

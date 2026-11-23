@@ -47,15 +47,28 @@ HINTS: list[tuple[str, re.Pattern[str], str]] = [
         "or ~/worktrees into that root's `.trash/`.",
     ),
     (
+        "gitmodules",
+        re.compile(r"\.gitmodules' is locked: Permission denied"),
+        "The sandbox mounts a placeholder over a missing .gitmodules, which "
+        "nix's git fetcher cannot open, and that read-only placeholder cannot "
+        "be replaced from inside. Outside the sandbox (dangerouslyDisableSandbox), "
+        "commit an empty .gitmodules at the repo root: "
+        "`touch .gitmodules && git add .gitmodules && git commit -m 'chore: empty .gitmodules'`.",
+    ),
+    (
         "read-only",
         re.compile(r"Read-only file system", re.I),
         "The shell is sandboxed: it can write under ~/Repos, ~/worktrees, "
-        "/tmp and the nix, uv and cargo caches only.",
+        "/tmp, ~/.local/state/claude-tasks and the caches only.",
     ),
 ]
 
 
 def sandbox_enabled() -> bool:
+    # A soak session turns the sandbox on with --settings sandbox-soak.json,
+    # which settings.json cannot show; that file's env block sets this marker.
+    if os.environ.get("CLAUDE_SANDBOX_SOAK") == "1":
+        return True
     try:
         return json.loads(SETTINGS.read_text(encoding="utf-8"))["sandbox"]["enabled"] is True
     except Exception:
