@@ -70,6 +70,7 @@ _POLICY_KEYS = frozenset({
 _POSITIVE_INTS = ("maxSamples", "maxJobs", "maxTimeoutSec", "maxCallSec", "outputLimitChars",
                   "maxCampaigns", "maxQueueSec")
 SLOT_POLL_SEC = 2.0
+GIT_GRACE_SEC = 5
 # Worst case of the setup steps' own subprocess timeouts, in order: mirror init
 # 60, fetch 300, three refs resolved at up to 2 x 60 each, three scenario
 # cat-files at 60, harness cat-file 60 + clone 120 + checkout 120, scenario
@@ -231,8 +232,10 @@ def _git_run(policy: dict, argv: list, timeout: int = 60, protocol: str = "file"
              ) -> subprocess.CompletedProcess:
     # Own process group, killed whole on timeout. Git and its helpers also
     # inherit the mirror lock's fd, so the flock stays held while any of them
-    # lives, even past the broker's death.
-    argv = ["git", *_GIT_OVERRIDES, *argv]
+    # lives, even past the broker's death. coreutils timeout kills that group
+    # GIT_GRACE_SEC after the broker would have, so a git stalled after the
+    # broker died cannot keep the mirror locked.
+    argv = ["timeout", "-s", "KILL", str(timeout + GIT_GRACE_SEC), "git", *_GIT_OVERRIDES, *argv]
     proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                             env=_git_env(policy, protocol), stdin=subprocess.DEVNULL,
                             start_new_session=True, pass_fds=_mirror_fds(policy))
@@ -283,7 +286,7 @@ def _update_mirror(policy: dict) -> None:
         raise RuntimeError(f"git fetch {policy['remoteUrl']} failed: {fetch.stderr.strip()[:300]}")
 
 
-def _checkout_harness(policy: dict, sha: str, dest: Path) -> Path:
+def _checkout_harness(policy: dict, sha: str, dest: Path, check_cancel=lambda: None) -> Path:
     """A fresh checkout of SHA at DEST: the harness stages arms with `git archive`, so it
     must sit in a repository, and the config repo's own working tree never runs."""
     if _git(policy, "cat-file", "-e", f"{sha}:{policy['harness']}").returncode != 0:
@@ -291,6 +294,7 @@ def _checkout_harness(policy: dict, sha: str, dest: Path) -> Path:
     for argv in (["clone", "--quiet", "--shared", "--no-checkout", "--template=",
                   str(policy["mirror"]), str(dest)],
                  ["-C", str(dest), "checkout", "--quiet", "--detach", sha]):
+        check_cancel()
         done = _git_run(policy, argv, timeout=120)
         if done.returncode != 0:
             raise RuntimeError(f"could not check out the harness at {sha}: "
@@ -564,9 +568,12 @@ def _acquire(paths: list, deadline: float, rec: Optional[_InFlight], what: str,
             fd = _open_lock(path)
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return fd
-            except BlockingIOError:
+            except BaseException as exc:
                 os.close(fd)
+                if isinstance(exc, BlockingIOError):
+                    continue
+                raise
+            return fd
         if rec is not None and rec.cancelled:
             raise RuntimeError(f"cancelled while waiting for {what}")
         if time.monotonic() >= deadline:
@@ -615,8 +622,10 @@ def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
             for name in _RUN_FILES:
                 if _git(policy, "cat-file", "-e", f"{new}:{scen_rel}/{name}").returncode != 0:
                     raise RuntimeError(f"{req['new_ref']} has no {scen_rel}/{name}")
+            check_cancel()
             campaigns = _private_dir(policy["campaigns"])
             _prune(campaigns)
+            check_cancel()
             stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
             campaign = Path(tempfile.mkdtemp(prefix=f"{stamp}-{req['scenario']}-{new[:8]}-",
                                              dir=campaigns))
@@ -627,11 +636,12 @@ def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
                                  | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600))
             _extract_scenarios(policy, new, campaign / "scenarios")
             check_cancel()
-            harness = _checkout_harness(policy, master, campaign / "harness")
+            harness = _checkout_harness(policy, master, campaign / "harness", check_cancel)
             check_cancel()
         except BaseException:
+            # Nothing ran yet: the whole campaign dir goes, not only the harness.
             if campaign is not None:
-                shutil.rmtree(campaign / "harness", ignore_errors=True)
+                shutil.rmtree(campaign, ignore_errors=True)
             raise
         finally:
             policy.pop("mirror_fd", None)

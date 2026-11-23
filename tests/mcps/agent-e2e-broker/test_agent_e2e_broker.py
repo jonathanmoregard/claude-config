@@ -309,15 +309,27 @@ class RunTests(Fixture):
             fcntl.flock(fh, fcntl.LOCK_EX)
         return stack
 
+    def _assert_slots_free(self) -> None:
+        # Non-blocking: a slot fd left open fails here instead of hanging the suite.
+        import fcntl
+        for slot in self.policy["slots"]:
+            with open(slot, "w") as fh:
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    self.fail(f"{slot.name} was not given back")
+
     def test_pre_slot_broker_lock_counts_as_a_slot(self) -> None:
         legacy = self.policy["stateDir"] / "lock"
         self.assertEqual(self.policy["slots"][0], legacy)
         self.assertNotEqual(self.policy["lock"], legacy)
-        with self._hold([legacy]):   # an old broker mid-campaign
-            self.assertIn("harness exit 0", self.server._tool_run(self.req()))
         with self._hold([legacy, *self.policy["slots"][1:]]):
             with self.assertRaisesRegex(RuntimeError, "slots stayed busy"):
                 self.server._tool_run(self.req())
+        require_units(self)
+        require_sandbox(self)
+        with self._hold([legacy]):   # an old broker mid-campaign
+            self.assertIn("harness exit 0", self.server._tool_run(self.req()))
 
     def test_cancel_during_setup_starts_no_unit(self) -> None:
         rec = self.server._InFlight()
@@ -331,27 +343,98 @@ class RunTests(Fixture):
                 self.server._tool_run(self.req(), rec)
         finally:
             self.server._checkout_harness = real
-        self.assertEqual(list(self.out.glob("*/out/runs/*")), [])
-        self.assertEqual(list(self.out.glob("*/harness")), [])
-        with self._hold(self.policy["slots"]):
-            pass  # every slot was given back
+        # Nothing of the campaign is left: no run, no harness, no campaign dir.
+        self.assertEqual(list(self.out.glob("*")), [])
+        self._assert_slots_free()
 
     def test_cancel_during_fetch_skips_the_rest_of_setup(self) -> None:
         rec = self.server._InFlight()
-        real, calls = self.server._update_mirror, []
+        real, resolved = self.server._update_mirror, []
         def fetch_then_cancel(policy):
             real(policy)
             rec.cancelled = True
         self.server._update_mirror = fetch_then_cancel
-        real_checkout = self.server._checkout_harness
-        self.server._checkout_harness = lambda *a, **k: calls.append(1) or real_checkout(*a, **k)
-        try:
-            with self.assertRaisesRegex(RuntimeError, "cancelled during campaign setup"):
-                self.server._tool_run(self.req(), rec)
-        finally:
-            self.server._update_mirror = real
-            self.server._checkout_harness = real_checkout
-        self.assertEqual(calls, [])
+        real_resolve = self.server._resolve
+        self.server._resolve = lambda *a: resolved.append(a) or real_resolve(*a)
+        with self.assertRaisesRegex(RuntimeError, "cancelled during campaign setup"):
+            self.server._tool_run(self.req(), rec)
+        self.assertEqual(resolved, [])
+        self.assertEqual(list(self.out.glob("*")), [])
+
+    def test_cancel_after_the_scenario_checks_extracts_nothing(self) -> None:
+        rec = self.server._InFlight()
+        real_prune, real_extract, extracted = self.server._prune, self.server._extract_scenarios, []
+        def prune_then_cancel(campaigns):
+            real_prune(campaigns)
+            rec.cancelled = True
+        self.server._prune = prune_then_cancel
+        self.server._extract_scenarios = lambda *a: extracted.append(a) or real_extract(*a)
+        with self.assertRaisesRegex(RuntimeError, "cancelled during campaign setup"):
+            self.server._tool_run(self.req(), rec)
+        self.assertEqual(extracted, [])
+        self.assertEqual(list(self.out.glob("*")), [])
+
+    def test_cancel_during_the_harness_clone_skips_its_checkout(self) -> None:
+        rec = self.server._InFlight()
+        real, after_cancel = self.server._git_run, []
+        def git_run(policy, argv, *a, **k):
+            if rec.cancelled:
+                after_cancel.append(argv)
+            done = real(policy, argv, *a, **k)
+            if argv[0] == "clone":
+                rec.cancelled = True
+            return done
+        self.server._git_run = git_run
+        with self.assertRaisesRegex(RuntimeError, "cancelled during campaign setup"):
+            self.server._tool_run(self.req(), rec)
+        self.assertEqual(after_cancel, [])
+
+    def test_lock_fd_is_closed_when_flock_fails_otherwise(self) -> None:
+        import errno, fcntl, types
+        self.policy["lock"].parent.mkdir(mode=0o700, exist_ok=True)
+        def no_locks(fd, op):
+            raise OSError(errno.ENOLCK, os.strerror(errno.ENOLCK))
+        self.server.fcntl = types.SimpleNamespace(flock=no_locks, LOCK_EX=fcntl.LOCK_EX,
+                                                  LOCK_NB=fcntl.LOCK_NB)
+        real_open, opened = self.server._open_lock, []
+        self.server._open_lock = lambda p: opened.append(real_open(p)) or opened[-1]
+        with self.assertRaises(OSError):
+            self.server._acquire([self.policy["lock"]], time.monotonic() + 1, None, "x", "busy")
+        self.assertEqual(len(opened), 1)
+        with self.assertRaises(OSError, msg="the lock fd was left open"):
+            os.fstat(opened[0])
+
+    def test_mirror_lock_frees_soon_after_the_git_timeout_when_the_broker_dies(self) -> None:
+        import fcntl, multiprocessing, signal
+        self.policy["lock"].parent.mkdir(mode=0o700, exist_ok=True)
+        started = Path(self.tmp.name) / "git-started"
+
+        def broker() -> None:
+            fd = self.server._open_lock(self.policy["lock"])
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            self.policy["mirror_fd"] = fd
+            self.server._git_run(self.policy, ["-c", f"alias.stall=!touch {started}; sleep 60",
+                                               "stall"], timeout=2)
+
+        proc = multiprocessing.get_context("fork").Process(target=broker)
+        proc.start()
+        deadline = time.monotonic() + 10
+        while not started.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(started.exists(), "the stalled git never started")
+        os.kill(proc.pid, signal.SIGKILL)   # nothing in the broker enforces the timeout now
+        proc.join()
+        # The 2s timeout plus the kill grace, with slack; a stalled git otherwise
+        # keeps the mirror locked for its whole 60s.
+        deadline, freed = time.monotonic() + 10, False
+        while not freed and time.monotonic() < deadline:
+            with open(self.policy["lock"], "w") as fh:
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    freed = True
+                except BlockingIOError:
+                    time.sleep(0.2)
+        self.assertTrue(freed, "a stalled git kept the mirror lock long past its timeout")
 
     def test_timed_out_git_takes_its_children_with_it(self) -> None:
         import subprocess as sp
@@ -364,6 +447,8 @@ class RunTests(Fixture):
         self.assertFalse(marker.exists(), "git's child outlived the timeout")
 
     def test_runs_while_another_campaign_holds_a_slot(self) -> None:
+        require_units(self)
+        require_sandbox(self)
         with self._hold(self.policy["slots"][:1]):
             text = self.server._tool_run(self.req())
         self.assertIn("harness exit 0", text)
@@ -378,19 +463,29 @@ class RunTests(Fixture):
         threading.Timer(1.0, release).start()
         return released
 
-    def _assert_campaign_after(self, released: list) -> None:
-        # The campaign dir is made only after both locks are held, so it must
-        # postdate the release.
-        dirs = list(self.out.glob("*"))
-        self.assertEqual(len(dirs), 1, dirs)
+    def _record_setup_start(self) -> list:
+        real, started = self.server._update_mirror, []
+        def update(policy):
+            started.append(time.time())
+            return real(policy)
+        self.server._update_mirror = update
+        return started
+
+    def _assert_setup_after(self, started: list, released: list) -> None:
+        # Setup's first step runs only once both locks are held, so it must
+        # postdate the release (stamped just before the lock is let go).
         self.assertTrue(released, "lock never released")
-        self.assertGreaterEqual(dirs[0].stat().st_ctime, released[0] - 0.05)
+        self.assertEqual(len(started), 1, started)
+        self.assertGreaterEqual(started[0], released[0])
 
     def test_waits_for_a_slot_then_runs(self) -> None:
+        require_units(self)
+        require_sandbox(self)
+        started = self._record_setup_start()
         released = self._release_later(self.policy["slots"])
         text = self.server._tool_run(self.req())
         self.assertIn("harness exit 0", text)
-        self._assert_campaign_after(released)
+        self._assert_setup_after(started, released)
 
     def test_all_slots_busy_past_the_queue_limit_refuses(self) -> None:
         with self._hold(self.policy["slots"]):
@@ -408,10 +503,13 @@ class RunTests(Fixture):
                 self.server._tool_run(self.req(), rec)
 
     def test_mirror_lock_waits_rather_than_refuses(self) -> None:
+        require_units(self)
+        require_sandbox(self)
+        started = self._record_setup_start()
         released = self._release_later([self.policy["lock"]])
         text = self.server._tool_run(self.req())
         self.assertIn("harness exit 0", text)
-        self._assert_campaign_after(released)
+        self._assert_setup_after(started, released)
 
     def test_mirror_lock_wait_shares_the_queue_deadline(self) -> None:
         # Slots free at 1s (taken at the 2s poll), mirror busy throughout, 3s
@@ -445,8 +543,7 @@ class RunTests(Fixture):
             with self.assertRaisesRegex(RuntimeError, "cancelled while waiting for the mirror"):
                 self.server._tool_run(self.req(), rec)
         # The slot taken before the mirror wait is given back.
-        with self._hold(self.policy["slots"]):
-            pass
+        self._assert_slots_free()
 
     def test_slot_is_never_opened_through_a_symlink(self) -> None:
         owner_file = Path(self.tmp.name) / "owner-file"
@@ -614,6 +711,7 @@ class UnitBindTests(Fixture):
             shutil.rmtree(secret, ignore_errors=True)
 
     def test_scenario_code_reads_the_bash_guard_config_the_harness_copies(self) -> None:
+        require_units(self)
         require_sandbox(self)
         config = self.home / ".config/dcg/config.toml"
         if not config.is_file():
