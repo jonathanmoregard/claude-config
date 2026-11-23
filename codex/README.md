@@ -35,10 +35,10 @@ manifest is still updated.
 
 `~/.codex/<name>.config.toml` files, which `codex --profile <name>` layers over
 `config.toml`, are outside the mirror: the sync neither writes nor removes
-them. The check layers each over `config.toml` the way Codex does and fails,
-naming the file, when the result breaks one of `config.toml`'s safety floors
-or points an agent role at a file that does. Keys that cannot widen a session,
-such as `model`, pass.
+them. The check allows them only keys that cannot widen a session (`model`,
+`model_reasoning_effort`, `tui`, ...: the keys `config.toml` carries over from
+the live file, less `projects` and `apps`) and fails, naming the file and the
+key, on any other.
 
 `client-support.toml` classifies what Codex supports; `clients/codex/` holds
 the Codex adaptation of the `orchestrate` skill that the renderer substitutes.

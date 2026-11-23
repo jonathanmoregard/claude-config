@@ -156,56 +156,83 @@ def test_unsupported_budget_keys_are_rejected() -> None:
         assert f"unsupported budget setting {key} must not be generated" in errors_after(edit)
 
 
-def test_profile_layer_with_only_harmless_keys_passes() -> None:
-    # `codex --profile p` layers ~/.codex/p.config.toml over config.toml.
-    # Keys that cannot widen the session, and a server edit that keeps the
-    # floors (tables merge key by key), are the profile's business.
+# The profile key allowlist, written out here. `codex --profile p` layers
+# ~/.codex/p.config.toml over config.toml, so any key added to check's set
+# is one a hand-made profile could widen the session with.
+PROFILE_ALLOWLIST = frozenset(
+    {
+        "model",
+        "personality",
+        "service_tier",
+        "model_reasoning_effort",
+        "notice",
+        "tui",
+        "windows_wsl_setup_acknowledged",
+    }
+)
+# Keys config.toml carries over from the live file that widen authority, so a
+# profile must not set them. Codex 0.161.0: a profile marking a project
+# trusted makes Codex load that project's .codex/config.toml, a layer that
+# can set anything (`codex --profile p debug prompt-input` shows it loaded).
+# apps.<id>.enabled = true turns on a connector's tools.
+AUTHORITY_RUNTIME_KEYS = frozenset({"projects", "apps"})
+
+
+def test_check_states_the_whole_profile_key_allowlist() -> None:
+    assert check.PROFILE_KEYS == PROFILE_ALLOWLIST
+
+
+def test_profile_allowlist_is_the_runtime_keys_that_cannot_widen_a_session() -> None:
+    # A key the renderer starts carrying over from the live config.toml is
+    # one Codex writes at runtime; whether a profile may set it is a decision
+    # this turns red until someone makes it.
+    assert check.PROFILE_KEYS == frozenset(render_codex.CODEX_RUNTIME_KEYS) - AUTHORITY_RUNTIME_KEYS
+    assert AUTHORITY_RUNTIME_KEYS <= frozenset(render_codex.CODEX_RUNTIME_KEYS)
+
+
+def test_profile_with_only_allowlisted_keys_passes() -> None:
     harmless = {
         "model": "gpt-5",
         "model_reasoning_effort": "low",
-        "skills": {"max_context_tokens": 5440},
-        "mcp_servers": {"git_broker": {"env": {"A": "1"}}, "memory": {"args": ["--x"]}},
+        "personality": "pragmatic",
+        "service_tier": "fast",
+        "notice": {"hide_full_access_warning": True},
+        "tui": {"notifications": True, "theme": "dark"},
+        "windows_wsl_setup_acknowledged": True,
     }
-    assert check.profile_invariant_errors(safe_config(), harmless) == []
+    assert check.profile_invariant_errors(harmless) == []
 
 
-def test_profile_layer_cannot_loosen_the_floors_of_config_toml() -> None:
-    # Codex 0.161.0 merges a profile's tables into config.toml's key by key
-    # and replaces every other value, arrays included (`codex --profile p mcp
-    # get` shows both), so each floor holds on the merged config.
+def test_profile_may_set_no_key_outside_the_allowlist() -> None:
+    # An allowlist, as for agent role files: a denylist of config.toml's
+    # floors let a profile replace the Git broker's command, add an MCP
+    # server, or turn on live web search, and passed.
     cases = [
-        ({"approval_policy": "on-request"}, "approval_policy must be never"),
-        ({"default_permissions": "repos_readonly"}, "default_permissions must be repos_dev"),
-        ({"sandbox_mode": "danger-full-access"}, "legacy sandbox_mode must be absent"),
-        ({"approvals_reviewer": "auto_review"}, "legacy approvals_reviewer must be absent"),
-        # arftl-allow: permission-widened (a profile layer the check must reject)
-        ({"permissions": {"repos_dev": {}}}, "repos_dev must be absent from user config"),
-        ({"features": {"hooks": False}}, "features.hooks must be true"),
-        ({"mcp_servers": {"git_broker": {"required": False}}}, "git_broker must be required"),
-        ({"mcp_servers": {"git_broker": {"disabled_tools": []}}}, "generic exec tool"),
-        ({"mcp_servers": {"git_broker": {"enabled_tools": ["exec"]}}}, "generic exec tool"),
-        (
-            {"mcp_servers": {"github": {"disabled_tools": ["delete_file"]}}},
-            "mcp_servers.github: GitHub server must disable",
-        ),
-        (
-            {"mcp_servers": {"github_new_owner": {"command": "gh-mcp"}}},
-            "mcp_servers.github_new_owner: GitHub server must disable",
-        ),
-        ({"apps": {CONNECTOR: {"enabled": True}}}, "built-in GitHub connector must be disabled"),
+        {
+            "web_search": "live",
+            "mcp_servers": {
+                "git_broker": {"command": "/tmp/x", "args": []},
+                "sh": {"command": "sh-mcp"},
+            },
+        },
+        {"mcp_servers": {"git_broker": {"command": "/tmp/x"}}},
+        {"mcp_servers": {"sh": {"command": "sh-mcp"}}},
+        {"approval_policy": "never"},
+        {"approval_policy": "on-request"},
+        {"default_permissions": "repos_readonly"},
+        {"sandbox_mode": "danger-full-access"},
+        {"features": {"hooks": False}},
+        {"shell_environment_policy": {"inherit": "all"}},
+        {"notify": ["/tmp/x"]},
+        {"agents": {"reviewer": {"config_file": "/tmp/role.toml"}}},
+        {"projects": {"/": {"trust_level": "trusted"}}},
+        {"apps": {CONNECTOR: {"enabled": True}}},
     ]
-    for profile, expected in cases:
-        errors = check.profile_invariant_errors(safe_config(), profile)
-        assert any(expected in error for error in errors), (profile, expected, errors)
-
-
-def test_profile_layer_is_not_blamed_for_what_config_toml_breaks() -> None:
-    # config.toml's own findings are reported against config.toml.
-    base = safe_config()
-    base["approval_policy"] = "on-request"
-    assert check.profile_invariant_errors(base, {"model": "gpt-5"}) == []
-    assert check.profile_invariant_errors(None, {"model": "gpt-5"}) == []
-    assert check.profile_invariant_errors(None, {"approval_policy": "never"}) == []
+    for profile in cases:
+        errors = check.profile_invariant_errors({"model": "gpt-5", **profile})
+        assert errors == [
+            f"{key} must not be set in a profile file" for key in sorted(profile)
+        ], (profile, errors)
 
 
 def test_rules_reject_persisted_allow_in_direct_calls() -> None:
@@ -400,9 +427,10 @@ if __name__ == "__main__":
     test_every_github_server_keeps_the_exclusion_floor()
     test_builtin_github_connector_must_stay_disabled()
     test_unsupported_budget_keys_are_rejected()
-    test_profile_layer_with_only_harmless_keys_passes()
-    test_profile_layer_cannot_loosen_the_floors_of_config_toml()
-    test_profile_layer_is_not_blamed_for_what_config_toml_breaks()
+    test_check_states_the_whole_profile_key_allowlist()
+    test_profile_allowlist_is_the_runtime_keys_that_cannot_widen_a_session()
+    test_profile_with_only_allowlisted_keys_passes()
+    test_profile_may_set_no_key_outside_the_allowlist()
     test_rules_reject_persisted_allow_in_direct_calls()
     test_rules_reject_prefix_rule_references_that_are_not_direct_calls()
     test_rules_fail_closed_on_unknown_decisions_and_syntax()

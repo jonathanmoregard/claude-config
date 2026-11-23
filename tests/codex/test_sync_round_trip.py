@@ -1363,34 +1363,34 @@ def test_profile_config_files_cannot_loosen_the_session() -> None:
     # `codex --profile <name>` layers ~/.codex/<name>.config.toml over
     # config.toml; with approval_policy = "on-request" there, `codex debug
     # prompt-input` shows the escalation instructions. Such a file is outside
-    # the mirror, so the sync neither renders nor removes it; the check floors
-    # what it can loosen and names it.
+    # the mirror, so the sync neither renders nor removes it; the check allows
+    # it only keys that cannot widen a session, and names the file.
     with round_trip() as rt:
         loose = rt.codex / "p.config.toml"
         loose.write_text('approval_policy = "on-request"\n', encoding="utf-8")
         harmless = rt.codex / "work.config.toml"
         harmless.write_text('model = "gpt-5"\nmodel_reasoning_effort = "low"\n', encoding="utf-8")
-        # A profile can point an agent role at a file the check must read too.
-        outside = rt.home / "role.toml"
-        outside.write_text('name = "x"\napproval_policy = "on-request"\n', encoding="utf-8")
+        # A profile could point an agent role at any file.
         roles = rt.codex / "roles.config.toml"
-        roles.write_text(f'[agents.reviewer]\nconfig_file = "{outside}"\n', encoding="utf-8")
+        roles.write_text(
+            f'[agents.reviewer]\nconfig_file = "{rt.home / "role.toml"}"\n', encoding="utf-8"
+        )
         # Not a file Codex can load as a layer.
         (rt.codex / "dir.config.toml").mkdir()
 
         result = assert_check_fails(
             rt,
-            f"{loose}: approval_policy must be never",
-            f"{outside}: approval_policy must be absent or never",
+            f"{loose}: approval_policy must not be set in a profile file",
+            f"{roles}: agents must not be set in a profile file",
         )
         assert str(harmless) not in result.stdout, describe(result)
         assert "dir.config.toml" not in result.stdout, describe(result)
 
-        loose.write_text('approval_policy = "never"\n', encoding="utf-8")
-        outside.write_text('name = "x"\n', encoding="utf-8")
+        loose.write_text('model = "gpt-5"\n', encoding="utf-8")
+        roles.unlink()
         rt.sync_ok()
-        assert loose.read_text(encoding="utf-8") == 'approval_policy = "never"\n'
-        assert harmless.exists() and roles.exists()
+        assert loose.read_text(encoding="utf-8") == 'model = "gpt-5"\n'
+        assert harmless.exists()
 
 
 def test_a_direct_sync_whose_check_fails_leaves_the_home_as_it_was() -> None:
@@ -1420,7 +1420,9 @@ def test_a_direct_sync_whose_check_fails_leaves_the_home_as_it_was() -> None:
         result = rt.sync()
         assert result.returncode == 1, describe(result)
         assert "ai-client-config check FAILED" in result.stdout, describe(result)
-        assert f"{profile}: approval_policy must be never" in result.stdout, describe(result)
+        assert (
+            f"{profile}: approval_policy must not be set in a profile file" in result.stdout
+        ), describe(result)
         after = snapshot(rt.home, ("",))
         changed = sorted(
             key for key in before.keys() | after.keys() if before.get(key) != after.get(key)
