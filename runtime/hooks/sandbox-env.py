@@ -33,12 +33,10 @@ def main() -> int:
     path = os.environ.get("CLAUDE_ENV_FILE")
     if not path:
         return 0
-    try:
+    if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
             if MARKER in f.read():
                 return 0
-    except FileNotFoundError:
-        pass
     with open(path, "a", encoding="utf-8") as f:
         f.write(BLOCK)
     return 0
