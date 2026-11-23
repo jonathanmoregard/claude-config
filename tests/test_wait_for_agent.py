@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -124,13 +125,46 @@ def test_unknown_agent_is_exit_3_after_the_missing_limit(tmp_path: Path) -> None
 def test_deleted_transcript_is_exit_3(tmp_path: Path) -> None:
     env = make_env(tmp_path)
     t = write_agent(tmp_path, "hhh9", age=0)
-    p = subprocess.Popen([str(WAIT_FOR), "agent", "hhh9", "--idle", "2", "--timeout", "8"],
+    # --idle 30, not 2: mtimes are whole seconds, so a short limit can call the
+    # fresh transcript stalled before the unlink lands (sleep is stubbed).
+    p = subprocess.Popen([str(WAIT_FOR), "agent", "hhh9", "--idle", "30", "--timeout", "8"],
                          env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     time.sleep(0.7)
     t.unlink()
     out, err = p.communicate(timeout=30)
     assert p.returncode == 3, (p.returncode, out, err)
     assert "no transcript" in out
+
+
+def test_missing_limit_is_120_seconds_of_naps(tmp_path: Path) -> None:
+    """At the default step (30 s) exit 3 comes after four naps, not three."""
+    env = make_env(tmp_path)
+    (Path(env["STUB_DIR"]) / "bin" / "sleep").write_text(
+        '#!/bin/sh\necho "$1" >> "$STUB_DIR/naps.log"\n')
+    rc, out = run(env, "jjj1", "--idle", "7200")
+    assert rc == 3 and "no transcript" in out
+    naps = (Path(env["STUB_DIR"]) / "naps.log").read_text().split()
+    assert naps == ["30"] * 4, naps
+
+
+def test_default_timeout_outlasts_the_default_idle(tmp_path: Path) -> None:
+    """Agent mode's default timeout (86400) must exceed the 2 h idle limit, or
+    the waiter times out (124) before the alarm can ever fire. A fake clock
+    advances 3700 s per `date +%s`; with a 3600 s timeout this exits 124."""
+    env = make_env(tmp_path)
+    real_date = shutil.which("date")
+    assert real_date
+    clock = Path(env["STUB_DIR"]) / "clock"
+    clock.write_text(str(int(time.time())))
+    date = Path(env["STUB_DIR"]) / "bin" / "date"
+    date.write_text(
+        '#!/bin/sh\n[ "$*" = "+%s" ] || exec ' + real_date + ' "$@"\n'
+        't=$(cat "$STUB_DIR/clock"); echo "$t"; echo $((t + 3700)) > "$STUB_DIR/clock"\n')
+    date.chmod(0o755)
+    write_agent(tmp_path, "kkk2", age=0)
+    env.pop("WAIT_FOR_AGENT_IDLE", None)
+    rc, out = run(env, "kkk2")
+    assert rc == 5, out
 
 
 def test_bad_id_is_a_usage_error(tmp_path: Path) -> None:
@@ -188,9 +222,12 @@ def test_non_agent_mode_leading_zero_timeout_is_eight_seconds(tmp_path: Path) ->
         (p.returncode, p.stdout, p.stderr, took)
 
 
-def hook(payload: object) -> str:
+def hook(payload: object, idle: str | None = None) -> str:
+    env = {k: v for k, v in os.environ.items() if k != "WAIT_FOR_AGENT_IDLE"}
+    if idle is not None:
+        env["WAIT_FOR_AGENT_IDLE"] = idle
     p = subprocess.run(["python3", "-S", "-E", str(HOOK)], input=json.dumps(payload),
-                       capture_output=True, text=True, timeout=10)
+                       capture_output=True, text=True, timeout=10, env=env)
     assert p.returncode == 0
     return p.stdout
 
@@ -213,6 +250,17 @@ def test_hook_silent_otherwise() -> None:
     assert hook({"tool_name": "Agent", "agent_id": "sub", "tool_response": launched}) == ""
     assert hook({"tool_name": "Bash", "tool_response": launched}) == ""
     assert hook({"tool_name": "Agent", "tool_response": {**launched, "agentId": "a b;c"}}) == ""
+    assert hook({"tool_name": "Agent", "tool_response": {**launched, "agentId": "abc\n"}}) == ""
+
+
+def test_hook_names_a_custom_idle_limit() -> None:
+    launched = {"tool_name": "Agent", "tool_response": {"status": "async_launched", "agentId": "abc"}}
+    text = lambda idle: json.loads(hook(launched, idle))["hookSpecificOutput"]["additionalContext"]
+    assert "quiet for 900 seconds" in text("900")
+    assert "quiet for 2 hours" in text("7200")
+    assert "quiet for 2 hours" in text("0")
+    assert "quiet for 2 hours" in text("x")
+    assert "needs a new waiter" in text("900")
     p = subprocess.run(["python3", "-S", "-E", str(HOOK)], input="not json",
                        capture_output=True, text=True, timeout=10)
     assert p.returncode == 0 and p.stdout == ""

@@ -30,10 +30,11 @@ def context_for(payload: object) -> str | None:
     if not isinstance(response, dict) or response.get("status") != "async_launched":
         return None
     agent = response.get("agentId")
-    if not isinstance(agent, str) or not AGENT_ID.match(agent):
+    if not isinstance(agent, str) or not AGENT_ID.fullmatch(agent):
         return None
     limit = os.environ.get("WAIT_FOR_AGENT_IDLE", "")
-    quiet = f"{limit} seconds" if limit.isdigit() and limit != "7200" else "2 hours"
+    valid = limit.isascii() and limit.isdigit() and int(limit) > 0
+    quiet = f"{int(limit)} seconds" if valid and int(limit) != 7200 else "2 hours"
     return (
         f"Background agent {agent} has no idle alarm yet. Arm "
         f"`~/.claude/scripts/wait-for agent {agent}` in the background "
@@ -41,7 +42,8 @@ def context_for(payload: object) -> str | None:
         f"transcript has been quiet for {quiet}, which usually means it "
         "stalled or ended its turn waiting on something: then read the "
         "transcript tail and unblock it, replace it, or re-arm with a longer "
-        "--idle. Stop the waiter (TaskStop) once you have the agent's result. "
+        "--idle. This alarm fires once: an agent that carries on after it "
+        "(unblocked, or its replacement) needs a new waiter. Stop the waiter (TaskStop) once you have the agent's result. "
         "Exit 124 means the wait timed out; arm it again."
     )
 

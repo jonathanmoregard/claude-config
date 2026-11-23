@@ -24,7 +24,9 @@ notify_path = run / "notify.log"
 notify = notify_path.read_text(errors="replace") if notify_path.exists() else ""
 transcript = (run / "transcript.jsonl").read_text(errors="replace")
 
-dispatched = re.search(r"async_launched|Async agent launched|agentId", transcript) is not None
+# Only a background launch counts: a foreground Agent result carries agentId
+# too, and the hook rightly stays silent for it.
+dispatched = re.search(r"async_launched|Async agent launched", transcript) is not None
 if not dispatched:
     print("no background Agent dispatch")
     sys.exit(2)
@@ -39,20 +41,45 @@ stalled_seen = re.search(r"agent [A-Za-z0-9]+ stalled: no activity", transcript)
 fired = "stalled" in notify
 
 
+BACKGROUND_ID = re.compile(
+    r'running in background with ID: ([A-Za-z0-9_-]+)|"backgroundTaskId":\s*"([A-Za-z0-9_-]+)"')
+
+
+def blocks(event: dict, kind: str) -> list[dict]:
+    content = (event.get("message") or {}).get("content")
+    return [b for b in content if isinstance(b, dict) and b.get("type") == kind] \
+        if isinstance(content, list) else []
+
+
 def stopped_waiter() -> bool:
-    """The parent's own tool calls: TaskStop/KillShell, or kill/pkill of wait-for."""
+    """The parent stopped the wait-for task itself: TaskStop/KillShell naming the
+    background id of its `wait-for agent` Bash call, or kill/pkill of wait-for.
+    Stopping some other task (the subagent) leaves the waiter running."""
+    events = []
     for line in transcript.splitlines():
         try:
             event = json.loads(line)
         except ValueError:
             continue
-        if not isinstance(event, dict) or event.get("type") != "assistant" or event.get("agent_id"):
+        if isinstance(event, dict) and not event.get("agent_id"):
+            events.append((event, line))
+    waiter_calls = {b.get("id") for e, _ in events if e.get("type") == "assistant"
+                    for b in blocks(e, "tool_use") if b.get("name") == "Bash"
+                    and "wait-for agent" in str((b.get("input") or {}).get("command", ""))}
+    waiter_ids = set()
+    for e, line in events:
+        if e.get("type") == "user" and any(b.get("tool_use_id") in waiter_calls
+                                           for b in blocks(e, "tool_result")):
+            for pair in BACKGROUND_ID.findall(line):
+                waiter_ids |= {i for i in pair if i}
+    for e, _ in events:
+        if e.get("type") != "assistant":
             continue
-        content = (event.get("message") or {}).get("content")
-        for block in content if isinstance(content, list) else []:
-            if isinstance(block, dict) and block.get("type") == "tool_use" \
-                    and block.get("name") in ("TaskStop", "KillShell"):
-                return True
+        for b in blocks(e, "tool_use"):
+            if b.get("name") in ("TaskStop", "KillShell"):
+                given = {str(v) for v in (b.get("input") or {}).values()}
+                if given & waiter_ids:
+                    return True
     return re.search(r"\b(?:pkill|kill)\b[^\n]*wait-for", commands) is not None
 
 

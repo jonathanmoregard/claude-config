@@ -716,13 +716,14 @@ wait_agent() {
     if [ -z "$transcript" ]; then
       # The transcript appears with the agent's first entry; give it two
       # minutes before calling the id unknown.
-      missing=$(( missing + step ))
       [ "$missing" -lt 120 ] || {
         echo "wait-for: no transcript for agent $target under $HOME/.claude/projects/*/*/subagents"
         exit 3
       }
+      missing=$(( missing + step ))
       nap "$step"; continue
     fi
+    missing=0
     now=$(date +%s)
     # A transcript that went away (session cleaned up) is looked up again, and
     # the missing-transcript limit above ends the wait.
