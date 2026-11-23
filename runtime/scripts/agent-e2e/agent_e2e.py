@@ -45,8 +45,9 @@ FIDELITY
     permissions, defaultMode), skills, agents and commands, so hooks referencing
     $HOME/.claude run the candidate's scripts. The one change to the staged
     settings: an absolute-path deny covering the staged HOME itself (meant for
-    reviewers of run dirs) is dropped, and named in the run's provenance.
-    Credentials, the plugin cache and
+    reviewers of run dirs) is replaced by denies of just the account material
+    (.claude.json, .credentials.json, .ssh, .codex) of every run under it, and
+    both are named in the run's provenance. Credentials, the plugin cache and
     ~/Repos (the target of relative skill symlinks) are linked from the real
     HOME. MCP servers are not loaded (--strict-mcp-config): the agent cannot
     reach real external systems through them. A scenario that needs an MCP
@@ -240,13 +241,16 @@ _PATH_RULE = re.compile(r"(Read|Edit|Write|MultiEdit|NotebookEdit)\((//.+)\)")
 
 
 def _glob_covers(pattern: str, path: str) -> bool:
-    """Whether permission glob PATTERN (gitignore style: `*` within one
-    segment, a `**` segment across any number) matches absolute PATH."""
+    """Whether permission glob PATTERN covers absolute PATH, by gitignore
+    rules (Claude Code's documented syntax for path rules): `*` within one
+    segment, a `**` segment across any number, and a pattern that matches a
+    directory covers everything under it, so matching PATH or any ancestor
+    of it is enough."""
     pat, parts = pattern.strip("/").split("/"), path.strip("/").split("/")
 
     def match(i: int, j: int) -> bool:
         if i == len(pat):
-            return j == len(parts)
+            return True  # PATTERN matched parts[:j]: PATH or an ancestor
         if pat[i] == "**":
             return any(match(i + 1, k) for k in range(j, len(parts) + 1))
         return (j < len(parts) and fnmatch.fnmatchcase(parts[j], pat[i])
@@ -254,16 +258,32 @@ def _glob_covers(pattern: str, path: str) -> bool:
     return match(0, 0)
 
 
-def drop_own_home_denies(home: pathlib.Path) -> list[str]:
-    """Remove, from the staged HOME's settings.json only, every absolute
-    path deny that covers the staged HOME itself, and return them.
+def _account_denies(tool: str, glob: str) -> list[str]:
+    """TOOL denies of the account material the scrub removes, by the same
+    names, at any depth under the directory part of GLOB."""
+    segs = glob.rstrip("/").split("/")
+    while segs[-1] in ("*", "**"):
+        segs.pop()
+    under = "/".join(segs) + "/**/"  # `//` stays: `//**` gives `//**/`
+    return ([f"{tool}({under}{name}*)" for name in SECRET_FILE_PREFIXES]
+            + [f"{tool}({under}{name}/**)" for name in SECRET_DIRS])
+
+
+def drop_own_home_denies(home: pathlib.Path) -> tuple[list[str], list[str]]:
+    """In the staged HOME's settings.json only, replace every absolute path
+    deny that covers the staged HOME itself by denies of the account
+    material under the same tree. Returns (dropped, added).
 
     The real settings deny Read of every staged HOME under the e2e state tree
     so a reviewer cannot read account material in a run dir. Staged, the same
     rule names the agent under test's own HOME and denies it its skills'
-    references and its notes. Only a `Tool(//glob)` rule whose glob matches a
+    references and its notes. Only a `Tool(//glob)` rule whose glob covers a
     plain child of HOME goes; rules for one named file, `~/` rules (the same
-    meaning in a real session) and every other key stay. The scrub after the
+    meaning in a real session) and every other key stay. The rule also covered
+    every other run's HOME (other arms, samples, campaigns), so in its place
+    the same tool stays denied the .claude.json, .credentials.json, .ssh and
+    .codex of every run under the same prefix, its own included: the CLI reads
+    its own login files directly, never through a tool. The scrub after the
     run still removes the account material either way. A settings.json that is
     a link is replaced by a file, never written through."""
     settings = home / ".claude/settings.json"
@@ -271,28 +291,38 @@ def drop_own_home_denies(home: pathlib.Path) -> list[str]:
         data = json.loads(settings.read_text(encoding="utf-8"))
         deny = data["permissions"]["deny"]
     except (OSError, ValueError, KeyError, TypeError):
-        return []
+        return [], []
     if not isinstance(deny, list):
-        return []
+        return [], []
     probes = {str(home.absolute() / "x"), str(home.resolve() / "x")}
-    dropped = [r for r in deny if isinstance(r, str) and (m := _PATH_RULE.fullmatch(r))
-               and any(_glob_covers(m.group(2), p) for p in probes)]
+    dropped, added, kept = [], [], []
+    for rule in deny:
+        m = isinstance(rule, str) and _PATH_RULE.fullmatch(rule)
+        if not (m and any(_glob_covers(m.group(2), p) for p in probes)):
+            kept.append(rule)
+            continue
+        dropped.append(rule)
+        new = [r for r in _account_denies(m.group(1), m.group(2))
+               if r not in deny and r not in added]
+        added += new
+        kept += new
     if not dropped:
-        return []
-    data["permissions"]["deny"] = [r for r in deny if r not in dropped]
+        return [], []
+    data["permissions"]["deny"] = kept
     settings.unlink()
     fd = os.open(settings, _WRITE_NOFOLLOW | os.O_EXCL, 0o644)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
-    return dropped
+    return dropped, added
 
 
 def stage(src: str, home: pathlib.Path) -> str:
     """Build a sandbox HOME whose ~/.claude is config SRC."""
     provenance = copy_config(src, home / ".claude")
-    dropped = drop_own_home_denies(home)
+    dropped, added = drop_own_home_denies(home)
     if dropped:
-        provenance += "; own-HOME deny dropped: " + ", ".join(dropped)
+        provenance += ("; own-HOME deny dropped: " + ", ".join(dropped)
+                       + "; replaced by: " + ", ".join(added))
     for rel, target in LINKS.items():
         link = home / rel
         if link.exists() or link.is_symlink():

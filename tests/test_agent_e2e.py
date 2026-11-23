@@ -164,7 +164,13 @@ def test_stage_drops_only_the_deny_that_covers_the_staged_home(tmp_path):
     staged = home / ".claude/settings.json"
     assert not staged.is_symlink()
     got = json.loads(staged.read_text())
-    assert got["permissions"]["deny"] == kept
+    # Every other deny stays, in order; the narrow account-material denies
+    # standing in for the dropped ones are the only additions.
+    deny = got["permissions"]["deny"]
+    added = [d for d in deny if d not in kept]
+    assert [d for d in deny if d in kept] == kept
+    assert added and all(d.startswith(("Read(", "Edit(")) and d in r.stdout
+                         for d in added)
     assert list(got) == list(settings)
     assert {k: v for k, v in got.items() if k != "permissions"} == \
         {k: v for k, v in settings.items() if k != "permissions"}
@@ -182,6 +188,109 @@ def test_stage_leaves_settings_alone_when_no_deny_covers_the_home(tmp_path):
     r = harness("stage", "--config", str(src), "--home", str(home))
     assert r.returncode == 0, r.stderr
     assert (home / ".claude/settings.json").read_text() == text
+
+
+def _denied(deny: list[str], tool: str, path: pathlib.Path) -> bool:
+    """Whether a `TOOL(//glob)` rule in DENY covers PATH, by gitignore rules
+    as Claude Code documents them: `**` spans any number of segments, and a
+    pattern matching a directory covers everything under it. Independent of
+    the harness's own matcher on purpose."""
+    for rule in deny:
+        if not (rule.startswith(f"{tool}(//") and rule.endswith(")")):
+            continue
+        glob = rule[len(tool) + 2:-1].rstrip("/") or "/"
+        if any(p.full_match(glob) for p in (path, *path.parents)):
+            return True
+    return False
+
+
+# Account material in a staged HOME, as the harness's scrub finds it by name.
+_ACCOUNT_FILES = (".claude.json", ".claude.json.backup", ".claude/.credentials.json",
+                  ".claude/backups/.claude.json.backup.1", ".ssh/id_ed25519",
+                  ".codex/auth.json")
+
+
+def _stage_with_deny(tmp_path, deny: list[str], home_rel="out/runs/s/new/1/home",
+                     home_arg: pathlib.Path | None = None):
+    src = tmp_path / "cfg"
+    src.mkdir()
+    # arftl-allow: permission-widened (a deny-only fixture for a staged copy)
+    (src / "settings.json").write_text(json.dumps({"permissions": {"deny": deny}}))
+    home = home_arg or tmp_path / home_rel
+    r = harness("stage", "--config", str(src), "--home", str(home))
+    assert r.returncode == 0, r.stderr
+    got = json.loads((home / ".claude/settings.json").read_text())
+    return r, got["permissions"]["deny"]
+
+
+@pytest.mark.parametrize("glob", ["/{t}/**/home/**", "/{t}/**/home/*", "//**"])
+def test_stage_keeps_every_runs_account_material_denied(tmp_path, glob):
+    """The dropped reviewer deny covers every staged HOME under its prefix,
+    not just the run's own. Without a replacement the agent under test could
+    Read a sibling arm's, sample's or campaign's .claude.json or refreshed
+    .credentials.json. Its own HOME stays readable apart from those."""
+    rule = f"Read({glob.format(t=tmp_path)})"
+    r, deny = _stage_with_deny(tmp_path, [rule])
+    assert rule not in deny
+    runs = tmp_path / "out/runs"
+    for home in (runs / "s/old/1/home", runs / "s/new/2/home",
+                 runs / "other/new/1/home", runs / "s/new/1/home"):
+        for rel in _ACCOUNT_FILES:
+            assert _denied(deny, "Read", home / rel), home / rel
+    own = runs / "s/new/1/home"
+    for rel in (".claude/skills/s/references/r.md", ".local/state/claude-tasks/x/n.md",
+                ".claude/settings.json"):
+        assert not _denied(deny, "Read", own / rel), rel
+    assert "replaced by" in r.stdout and all(d in r.stdout for d in deny)
+
+
+def test_stage_replacement_mirrors_the_dropped_rules_tool(tmp_path):
+    rule = f"Edit(/{tmp_path}/**/home/**)"
+    _, deny = _stage_with_deny(tmp_path, [rule])
+    sibling = tmp_path / "out/runs/s/old/1/home"
+    assert _denied(deny, "Edit", sibling / ".claude/.credentials.json")
+    assert not _denied(deny, "Read", sibling / ".claude/.credentials.json")
+
+
+@pytest.mark.parametrize("glob", ["/{t}/**/home", "/{t}/out", "/{t}/out/runs/",
+                                  "/{t}/out/*/s"])
+def test_stage_drops_a_deny_naming_an_ancestor_of_the_home(tmp_path, glob):
+    """Gitignore semantics: a pattern that matches a directory covers all of
+    it, so a deny naming HOME or any directory above it denies the agent its
+    own HOME just the same, and goes like the `/**` form does."""
+    rule = f"Read({glob.format(t=tmp_path)})"
+    r, deny = _stage_with_deny(tmp_path, [rule])
+    assert rule not in deny and rule in r.stdout
+    own = tmp_path / "out/runs/s/new/1/home"
+    assert not _denied(deny, "Read", own / ".claude/skills/s/references/r.md")
+    assert _denied(deny, "Read", tmp_path / "out/runs/s/old/1/home/.claude.json")
+
+
+@pytest.mark.parametrize("tool", ["Write", "MultiEdit", "NotebookEdit"])
+def test_stage_drops_an_own_home_deny_of_every_path_tool(tmp_path, tool):
+    rule = f"{tool}(/{tmp_path}/**/home/**)"
+    r, deny = _stage_with_deny(tmp_path, [rule])
+    assert rule not in deny and rule in r.stdout
+
+
+@pytest.mark.parametrize("named", ["real", "link"])
+def test_drop_own_home_denies_matches_both_names_of_a_linked_home(tmp_path, named):
+    """Both CLI callers resolve HOME first, so only an in-process call can
+    hand drop_own_home_denies a HOME reached through a link (a symlinked
+    state dir). A deny naming either the link or its target covers it."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("agent_e2e_inproc", HARNESS)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    (tmp_path / "real").mkdir()
+    (tmp_path / "link").symlink_to(tmp_path / "real")
+    home = tmp_path / "link/runs/s/new/1/home"
+    (home / ".claude").mkdir(parents=True)
+    rule = f"Read(/{tmp_path}/{named}/**/home/**)"
+    # arftl-allow: permission-widened (a deny-only fixture for a staged copy)
+    (home / ".claude/settings.json").write_text(json.dumps({"permissions": {"deny": [rule]}}))
+    dropped, _ = mod.drop_own_home_denies(home)
+    assert dropped == [rule]
 
 
 def _scenario(tmp_path, check_body: str) -> pathlib.Path:
