@@ -15,6 +15,7 @@ import sys
 import tomllib
 from typing import Any, Callable
 
+import common
 from common import (
     AGENTS_HOME,
     CLAUDE,
@@ -2614,7 +2615,10 @@ def publish_config(plan: RenderPlan) -> None:
 
 def publish_render_plan(plan: RenderPlan) -> None:
     """Write the plan where common.located puts the output: into a stage
-    for sync_codex, which checks it before anything reaches the home."""
+    for sync_codex, which checks it before anything reaches the home. With
+    no stage set it refuses: it would write into the home unchecked."""
+    if common.STAGE is None:
+        raise RuntimeError(f"render_codex writes only into a stage; run {SYNC}")
     ensure_legacy_plugin_link()
     for path, text in stable_hook_script_files(plan).items():
         put_file(path, text, mode=0o755)

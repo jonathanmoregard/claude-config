@@ -1803,6 +1803,27 @@ def test_the_renderer_alone_publishes_nothing_and_names_the_checked_sync() -> No
             assert snapshot(rt.home, ("",)) == before
 
 
+def test_the_renderer_imported_outside_a_stage_publishes_nothing() -> None:
+    # Only __main__ refused: imported and called with no stage set, the
+    # render wrote into the home unchecked.
+    call = "import sys; sys.path.insert(0, sys.argv[1]); import render_codex; render_codex.main()"
+    with round_trip() as rt:
+        (rt.codex / "AGENTS.md").write_text("hand edit\n", encoding="utf-8")
+        before = snapshot(rt.home, ("",))
+        result = subprocess.run(
+            [sys.executable, "-B", "-c", call, str(rt.repo / "scripts")],
+            env={**os.environ, "HOME": str(rt.home)},
+            cwd=rt.home,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert result.returncode != 0, describe(result)
+        refusal = result.stderr.strip().splitlines()[-1]
+        assert refusal.endswith(f"run {rt.repo / 'scripts' / 'sync_codex.py'}"), refusal
+        assert snapshot(rt.home, ("",)) == before
+
+
 def test_frontmatter_invariant_covers_plugin_and_command_wrappers() -> None:
     # Codex reads skills from both roots, and commands render as skills too.
     with round_trip() as rt:
@@ -2073,6 +2094,7 @@ if __name__ == "__main__":
     test_a_second_direct_sync_changes_nothing_while_one_holds_the_home()
     test_check_remediation_names_the_checked_sync()
     test_the_renderer_alone_publishes_nothing_and_names_the_checked_sync()
+    test_the_renderer_imported_outside_a_stage_publishes_nothing()
     test_frontmatter_invariant_covers_plugin_and_command_wrappers()
     test_sync_converges_after_claude_agents_are_removed_or_renamed()
     test_sync_prunes_references_to_removed_agents_and_disabled_plugins()

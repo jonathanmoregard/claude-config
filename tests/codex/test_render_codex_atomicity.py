@@ -150,6 +150,9 @@ def isolated_renderer(
         patch.object(render_codex, "REPORT_DIR", codex / "report"),
         patch.object(render_codex, "RESERVED_SKILL_NAMES", frozenset()),
         patch.object(render_codex, "load_support", return_value=support),
+        # The fixture root, which holds every output path patched above,
+        # stands for the stage publish_render_plan writes only into.
+        common.staged_output(root),
     ):
         yield
 
