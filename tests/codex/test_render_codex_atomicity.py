@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -687,6 +688,59 @@ def test_rollback_that_cannot_restore_keeps_its_snapshot_and_names_it() -> None:
             shutil.rmtree(kept, ignore_errors=True)
 
 
+def test_a_stop_signal_cannot_hide_a_failed_rollbacks_snapshot() -> None:
+    # A stop signal held off during a rollback must not then replace the
+    # error that names the kept snapshot: the run ends either way, and only
+    # that error says where the pre-publish state is.
+    def stop(signum: int, frame: object) -> None:
+        raise SystemExit(128 + signum)
+
+    with tempfile.TemporaryDirectory() as td:
+        target = Path(td) / "AGENTS.md"
+        target.write_text("before\n", encoding="utf-8")
+        rolling_back = False
+        real_copy2 = shutil.copy2
+
+        def copy2(source: object, destination: object, *args: object, **kwargs: object) -> object:
+            if rolling_back:
+                os.kill(os.getpid(), signal.SIGTERM)
+                raise OSError("injected restore failure")
+            return real_copy2(source, destination, *args, **kwargs)
+
+        mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+        previous = signal.signal(signal.SIGTERM, stop)
+        failure: BaseException | None = None
+        try:
+            with patch.object(render_codex.shutil, "copy2", side_effect=copy2):
+                try:
+                    with render_codex.rollback_paths_on_error([target]):
+                        target.write_text("after\n", encoding="utf-8")
+                        rolling_back = True
+                        raise OSError("injected publication failure")
+                except BaseException as exc:
+                    failure = exc
+            # Nor may it leave the stop signals held: the mask is process
+            # state every later child inherits.
+            left_mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+            left_pending = signal.sigpending()
+        finally:
+            # Ignoring a signal drops it if still pending; then put back both.
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+            signal.signal(signal.SIGTERM, previous)
+
+        assert isinstance(failure, RuntimeError), repr(failure)
+        assert left_mask == mask, left_mask
+        assert signal.SIGTERM not in left_pending, left_pending
+        message = str(failure)
+        kept = Path(message.split("snapshot is kept at ", 1)[1].split()[0].rstrip(";,."))
+        try:
+            entries = json.loads((kept / "snapshot.json").read_text(encoding="utf-8"))
+            assert [entry["path"] for entry in entries] == [str(target)], entries
+        finally:
+            shutil.rmtree(kept, ignore_errors=True)
+
+
 def test_rollback_never_leaves_a_restored_path_missing() -> None:
     # A rollback removed every target before restoring any: a Codex session
     # starting meanwhile found no config.toml or hooks.json. Each one is
@@ -1238,6 +1292,7 @@ if __name__ == "__main__":
     test_late_publication_failure_rolls_back_all_live_paths()
     test_interrupted_publication_rolls_back_like_a_failed_one()
     test_rollback_that_cannot_restore_keeps_its_snapshot_and_names_it()
+    test_a_stop_signal_cannot_hide_a_failed_rollbacks_snapshot()
     test_rollback_never_leaves_a_restored_path_missing()
     test_rollback_leaves_no_snapshot_behind()
     test_unclassified_hook_preserves_both_wrapper_trees()

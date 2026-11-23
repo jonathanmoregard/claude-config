@@ -24,13 +24,14 @@ class CheckFailed(Exception):
     """The published output failed the check; the rollback undoes it."""
 
 
-STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+STOP_SIGNALS = render_codex.STOP_SIGNALS
 
 
 def stop(signum: int, frame: FrameType | None) -> None:
     """A stop signal as an exception, so the rollback runs: by default
     SIGTERM and SIGHUP end the process without unwinding, and the unchecked
-    output would stay live. A repeat cannot interrupt the rollback."""
+    output would stay live. The rollback holds off any stop signal, its own
+    start aside, until it has restored; a repeat after that is ignored."""
     for other in STOP_SIGNALS:
         signal.signal(other, signal.SIG_IGN)
     raise SystemExit(128 + signum)

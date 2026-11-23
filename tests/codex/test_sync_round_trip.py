@@ -1507,6 +1507,64 @@ def test_a_direct_sync_stopped_during_its_check_leaves_the_home_as_it_was() -> N
             assert changed == [], (changed, context)
 
 
+# Runs sync_codex.main() with a failing check, and signals itself from inside
+# the rollback that failure starts, at the first entry it restores.
+SIGNALLED_ROLLBACK_SYNC = """
+import os, signal, sys
+sys.path.insert(0, sys.argv[1])
+import check, render_codex, sync_codex
+check.main = lambda: 1
+real = render_codex.restore_snapshot_entry
+calls = []
+def restore(*args, **kwargs):
+    calls.append(args)
+    if len(calls) == 1:
+        os.kill(os.getpid(), getattr(signal, sys.argv[2]))
+    return real(*args, **kwargs)
+render_codex.restore_snapshot_entry = restore
+raise SystemExit(sync_codex.main())
+"""
+
+
+def test_a_signal_during_a_failed_checks_rollback_waits_for_the_restore() -> None:
+    # A failed check starts the rollback with the stop handlers still armed:
+    # SIGTERM in the restore raised past it, leaving the home half restored
+    # and the snapshot unnamed in TMPDIR. The rollback finishes first; the
+    # signal still ends the run.
+    with round_trip() as rt:
+        (rt.codex / "AGENTS.md").write_text("hand edit\n", encoding="utf-8")
+        (rt.codex / "hooks.json").unlink()
+        rt.edit_config(lambda config: config.pop("features"))
+        before = snapshot(rt.home, ("",))
+        for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            scratch = rt.home.parent / f"tmp-{signum.name}"
+            scratch.mkdir()
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    "-c",
+                    SIGNALLED_ROLLBACK_SYNC,
+                    str(rt.repo / "scripts"),
+                    signum.name,
+                ],
+                env={**os.environ, "HOME": str(rt.home), "TMPDIR": str(scratch)},
+                cwd=rt.home,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            context = f"{signum.name} {describe(result)}"
+            assert result.returncode == 128 + signum, context
+            after = snapshot(rt.home, ("",))
+            changed = sorted(
+                key for key in before.keys() | after.keys() if before.get(key) != after.get(key)
+            )
+            assert changed == [], (changed, context)
+            assert list(scratch.iterdir()) == [], context
+
+
 def test_frontmatter_invariant_covers_plugin_and_command_wrappers() -> None:
     # Codex reads skills from both roots, and commands render as skills too.
     with round_trip() as rt:
@@ -1740,6 +1798,7 @@ if __name__ == "__main__":
     test_a_direct_sync_whose_check_fails_leaves_the_home_as_it_was()
     test_check_remediation_names_the_checked_sync()
     test_a_direct_sync_stopped_during_its_check_leaves_the_home_as_it_was()
+    test_a_signal_during_a_failed_checks_rollback_waits_for_the_restore()
     test_frontmatter_invariant_covers_plugin_and_command_wrappers()
     test_sync_converges_after_claude_agents_are_removed_or_renamed()
     test_sync_prunes_references_to_removed_agents_and_disabled_plugins()

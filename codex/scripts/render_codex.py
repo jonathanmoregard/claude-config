@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import signal
 import sys
 import tempfile
 import tomllib
@@ -2590,6 +2591,23 @@ def restore_snapshot_entry(path: Path, kind: str, saved: Path | str) -> None:
         shutil.rmtree(holder, ignore_errors=True)
 
 
+# What stops a run (systemd, a closed terminal, Ctrl-C); see rollback_paths_on_error.
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+
+
+def release_stop_signals(held: set[signal.Signals], *, deliver: bool) -> None:
+    """Put back the signal mask held was taken from, first dropping any
+    stop signal pending unless it is to be delivered now."""
+    if not deliver:
+        for signum in signal.sigpending() & set(STOP_SIGNALS):
+            handler = signal.getsignal(signum)
+            # Ignoring a pending signal discards it.
+            signal.signal(signum, signal.SIG_IGN)
+            if handler is not None:
+                signal.signal(signum, handler)
+    signal.pthread_sigmask(signal.SIG_SETMASK, held)
+
+
 @contextmanager
 def rollback_paths_on_error(paths: list[Path]) -> Iterator[None]:
     """Snapshot paths, and put them back if the block raises anything, an
@@ -2600,6 +2618,12 @@ def rollback_paths_on_error(paths: list[Path]) -> Iterator[None]:
     has restored everything. A rollback that itself fails keeps it, with
     snapshot.json mapping each entry to the path it came from, and raises
     naming it, chained to the failure that started the rollback.
+
+    STOP_SIGNALS are held off for the whole rollback, whatever started it,
+    so a stop cannot leave the restore half done; one that came meanwhile
+    is delivered once the restore has finished. After a rollback that
+    failed it is dropped instead: the run is ending on the error naming the
+    snapshot, which the stop would otherwise replace.
     """
     targets = outermost_paths(paths)
     missing_parents: set[Path] = set()
@@ -2647,6 +2671,7 @@ def rollback_paths_on_error(paths: list[Path]) -> Iterator[None]:
     try:
         yield
     except BaseException as failure:
+        held = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
         try:
             # Restored in place, so a Codex session starting now never finds
             # config.toml or hooks.json missing; then what the run added goes.
@@ -2656,6 +2681,7 @@ def rollback_paths_on_error(paths: list[Path]) -> Iterator[None]:
                 if path not in snapshots and (path.exists() or path.is_symlink()):
                     remove_path(path)
         except Exception as error:
+            release_stop_signals(held, deliver=False)
             raise RuntimeError(
                 f"rollback failed: {type(error).__name__}: {error}; the pre-publish "
                 f"snapshot is kept at {snapshot_root} (snapshot.json maps it)"
@@ -2666,6 +2692,8 @@ def rollback_paths_on_error(paths: list[Path]) -> Iterator[None]:
         for parent in sorted(missing_parents, key=lambda item: len(item.parts), reverse=True):
             if parent.is_dir() and not parent.is_symlink() and not any(parent.iterdir()):
                 parent.rmdir()
+        # A stop held off above is delivered here, the rollback complete.
+        release_stop_signals(held, deliver=True)
         raise
     shutil.rmtree(snapshot_root, ignore_errors=True)
 
