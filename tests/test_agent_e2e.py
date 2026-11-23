@@ -410,6 +410,25 @@ def test_a_failed_scrub_record_does_not_cost_the_verdict(tmp_path):
             (run / "home/.ssh/locked").chmod(0o700)
 
 
+def test_a_non_utf8_name_in_scrub_errors_does_not_cost_the_verdict(tmp_path):
+    _require_sandbox()
+    # A name in bytes that are not UTF-8 reaches the error text as surrogates;
+    # writing that out must not raise in run_one's finally.
+    claude = fake_claude(tmp_path, _ok(
+        _PLANT + '\nbad="$HOME/.ssh/$(printf \'\\377\')"; mkdir -p "$bad/x"; chmod 000 "$bad"'))
+    _, out, verdicts = _run(tmp_path, _scenario(tmp_path, "exit 0"), claude)
+    run = out / "sc/new/1"
+    bad = run / "home/.ssh" / os.fsdecode(b"\xff")
+    try:
+        assert verdicts[0]["verdict"] == "PASS", verdicts[0]
+        assert verdicts[0]["scrub_errors"]
+        assert b"\xff" in (run / "scrub-errors.txt").read_bytes()
+        assert json.loads((run / "verdict.json").read_text())["scrub_errors"]
+    finally:
+        if bad.exists():
+            bad.chmod(0o700)
+
+
 def test_scrub_subcommand_cleans_runs_a_killed_harness_left(tmp_path):
     # A SIGKILLed harness never reaches run_one's finally; the broker runs
     # `scrub` over the output dir after every campaign instead.

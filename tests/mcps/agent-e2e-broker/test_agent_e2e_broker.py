@@ -274,6 +274,52 @@ class ScrubRunsTests(unittest.TestCase):
             server.subprocess.run = real
         self.assertEqual(seen.get("XDG_RUNTIME_DIR"), f"/run/user/{os.getuid()}")
 
+    def test_probe_raises_when_systemctl_fails(self) -> None:
+        server = load_server()
+        real = subprocess.run
+        server.subprocess.run = lambda argv, **kw: real(["false"], capture_output=True, text=True)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "systemctl exit 1"):
+                server._unit_state({"path": os.environ["PATH"].split(":")}, "x")
+        finally:
+            server.subprocess.run = real
+
+    def test_a_failed_mark_is_reported_not_raised(self) -> None:
+        server = load_server()
+        server._unit_state = lambda policy, unit: "inactive"
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._campaign(Path(tmp), "c-done")
+            (Path(tmp) / "c-done").chmod(0o500)
+            try:
+                self.assertIn("could not mark c-done",
+                              server._scrub_settled({}, Path(tmp), Path(tmp) / "x"))
+                self.assertIn("could not mark c-done",
+                              server._scrub_after_unit({}, Path(tmp) / "c-done"))
+            finally:
+                (Path(tmp) / "c-done").chmod(0o700)
+            self.assertFalse((home / ".claude.json").exists())
+            self.assertFalse((Path(tmp) / "c-done/scrubbed").exists())
+
+    def test_post_unit_scrub_marks_only_a_stopped_unit(self) -> None:
+        server = load_server()
+
+        def broken(policy, unit):
+            raise RuntimeError("no bus")
+        for state, marked, said in (("inactive", True, None), ("failed", True, None),
+                                    ("active", False, "still active"),
+                                    ("deactivating", False, "still deactivating"),
+                                    (broken, False, "no bus")):
+            server._unit_state = state if callable(state) else (lambda p, u, s=state: s)
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as tmp:
+                home = self._campaign(Path(tmp), "c")
+                report = server._scrub_after_unit({}, Path(tmp) / "c")
+                self.assertFalse((home / ".claude.json").exists(), "scrub skipped")
+                self.assertEqual((Path(tmp) / "c/scrubbed").exists(), marked)
+                if said:
+                    self.assertIn(said, report)
+                else:
+                    self.assertEqual(report, "")
+
 
 class KilledCampaignTests(Fixture):
     def test_a_campaign_killed_mid_run_is_scrubbed_by_the_broker(self) -> None:
@@ -302,6 +348,40 @@ class KilledCampaignTests(Fixture):
         self.assertTrue(list(self.out.glob("*/out/runs/*/*/*/planted")), "stub never ran")
         self.assertEqual(list(self.out.glob("*/out/runs/**/.claude.json")), [])
         self.assertTrue(list(self.out.glob("*/scrubbed")), "clean campaign left unmarked")
+
+    def test_scrub_and_sweep_reports_lead_the_response(self) -> None:
+        # The stub leaves an entry the scrub cannot remove, and an earlier
+        # campaign whose unit has stopped waits for the sweep; both reports must
+        # come before the header lines a truncated response still carries.
+        require_units(self)
+        require_sandbox(self)
+        self.claude.write_text(
+            "#!/usr/bin/env bash\nmkdir -p \"$HOME/.ssh/l\"; touch \"$HOME/.ssh/l/k\"\n"
+            "chmod 000 \"$HOME/.ssh/l\"\n"
+            "echo '{\"type\":\"result\",\"result\":\"hi\",\"is_error\":false,"
+            "\"total_cost_usd\":0.01}'\n")
+        for d in (self.policy["stateDir"], self.out):
+            d.mkdir(mode=0o700, parents=True, exist_ok=True)
+            d.chmod(0o700)
+        settled = self.out / "00-settled"
+        (settled / "out/runs/sc/new/1/home").mkdir(parents=True)
+        (settled / "out/runs/sc/new/1/home/.claude.json").write_text("s\n")
+        (settled / "out/runs/sc/new/1/home/.ssh/l").mkdir(parents=True)
+        (settled / "out/runs/sc/new/1/home/.ssh/l").chmod(0o000)
+        real = self.server._unit_state
+        self.server._unit_state = lambda policy, unit: (
+            "inactive" if unit.endswith("00-settled") else real(policy, unit))
+        try:
+            text = self.server._tool_run(self.req(n=1))
+        finally:
+            for lock in self.out.glob("*/out/runs/**/.ssh/l"):
+                lock.chmod(0o700)
+        head = text.split("harness = origin/master")[0]
+        self.assertIn("00-settled/out/runs incomplete", head)
+        own = [c for c in self.out.iterdir() if c.name != "00-settled"]
+        self.assertEqual(len(own), 1)
+        self.assertIn(f"{own[0]}/out/runs incomplete", head)
+        self.assertFalse((settled / "out/runs/sc/new/1/home/.claude.json").exists())
 
 
 class ValidationTests(Fixture):

@@ -329,7 +329,9 @@ def write_run_file(run: pathlib.Path, name: str, text: str) -> None:
             raise
         os.unlink(path)
         fd = os.open(path, _WRITE_NOFOLLOW, 0o644)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
+    # surrogateescape: a run can name files in bytes that are not UTF-8, and
+    # those names reach scrub-errors.txt and verdict.json.
+    with os.fdopen(fd, "w", encoding="utf-8", errors="surrogateescape") as f:
         f.write(text)
 
 
@@ -522,7 +524,7 @@ def run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
                                  if verdict is not None else ())):
                 try:
                     write_run_file(run, name, text)
-                except OSError as exc:
+                except (OSError, ValueError) as exc:
                     print(f"could not record scrub errors in {run / name}: {exc}",
                           file=sys.stderr)
 

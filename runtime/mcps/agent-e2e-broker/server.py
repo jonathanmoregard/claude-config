@@ -540,9 +540,31 @@ def _unit_state(policy: dict, unit: str) -> str:
     return p.stdout.strip()
 
 
-def _mark_scrubbed(campaign: Path) -> None:
-    os.close(os.open(campaign / SCRUBBED_MARK, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
-                     | os.O_CLOEXEC, 0o600))
+def _mark_scrubbed(campaign: Path) -> str:
+    """Mark CAMPAIGN done. Returns an error report, or "" ; never raises: an
+    unmarked campaign is only scrubbed again by the next sweep."""
+    try:
+        os.close(os.open(campaign / SCRUBBED_MARK, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
+                         | os.O_CLOEXEC, 0o600))
+    except OSError as exc:
+        return f"{TAG} could not mark {campaign.name} scrubbed; the next sweep retries: {exc}"
+    return ""
+
+
+def _scrub_after_unit(policy: dict, campaign: Path) -> str:
+    """Post-unit scrub of CAMPAIGN. Scrubs best-effort either way, but marks it
+    only once systemd says its unit has stopped: a unit that outlived the
+    broker's wait can still write, so the sweep must look at it again."""
+    report = _scrub_runs(campaign / "out" / "runs")
+    try:
+        state = _unit_state(policy, UNIT_PREFIX + campaign.name)
+    except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+        return "\n".join(p for p in (report, f"{TAG} cannot ask systemd about "
+                                     f"{campaign.name}: {exc}; left for the sweep") if p)
+    if state not in ("inactive", "failed"):
+        return "\n".join(p for p in (report, f"{TAG} unit for {campaign.name} still "
+                                     f"{state or 'unknown'}; left for the sweep") if p)
+    return report or _mark_scrubbed(campaign)
 
 
 def _scrub_settled(policy: dict, campaigns: Path, skip: Path) -> str:
@@ -565,11 +587,9 @@ def _scrub_settled(policy: dict, campaigns: Path, skip: Path) -> str:
             break
         if state not in ("inactive", "failed"):
             continue
-        report = _scrub_runs(campaign / "out" / "runs")
+        report = _scrub_runs(campaign / "out" / "runs") or _mark_scrubbed(campaign)
         if report:
             reports.append(report)
-        else:
-            _mark_scrubbed(campaign)
     return "\n".join(reports)
 
 
@@ -755,9 +775,7 @@ def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
             rc, _, client = _run_argv(proc, req["call_timeout"] + 60, rec)
             stdout, stderr = (_read_beneath(campaign, name) for name in ("harness.out", "harness.err"))
         finally:
-            scrubbed = _scrub_runs(out / "runs")
-            if not scrubbed:
-                _mark_scrubbed(campaign)
+            scrubbed = _scrub_after_unit(policy, campaign)
             shutil.rmtree(campaign / "harness", ignore_errors=True)
         stderr = "\n".join(part for part in (stderr.rstrip(), client.strip()) if part)
     finally:
