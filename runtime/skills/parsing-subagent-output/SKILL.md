@@ -1,6 +1,6 @@
 ---
 name: parsing-subagent-output
-description: Use when code, a script, a hook, a Workflow script or a test reads what an LLM, subagent or headless agent (`claude -p`, `codex exec`, the Anthropic API) returned and acts on it — routing or classifying on a model's answer, extracting a verdict, category, score, path or field, grading an agent's final message in an e2e check or judge. Also when about to grep, regex, case-match, string-compare, sed/awk, or "reply with exactly one word" a model's reply.
+description: Use when writing or fixing code that sets a variable, branch or verdict from a model's reply — `answer=$(claude -p ...)`, `codex exec`, an Anthropic API call, a subagent or Workflow agent result — in a script, hook, test or e2e grader; classifying, routing, triaging or scoring on what Claude/an LLM answered; filling in "parse the answer" TODOs. Also when about to grep, regex, case-match, string-compare, sed/awk/tr, or "reply with exactly one word" a model's output.
 ---
 
 # Parsing subagent output
