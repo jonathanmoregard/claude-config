@@ -395,3 +395,7 @@ tasks
 # is untracked here, so an unignored spine would be committed straight back in.
 /proposals
 /recursive-self-improvement/proposals
+
+# Claude->Codex renderer: the importer's generated manifest (codex/scripts/
+# import_claude.py writes it beside the renderer). Rebuilt on every sync.
+/codex/imports/
