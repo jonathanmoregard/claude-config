@@ -269,10 +269,7 @@ class ScrubRunsTests(unittest.TestCase):
             return real(["true"], capture_output=True, text=True)
         server.subprocess.run = spy
         try:
-            server._unit_state({"path": os.environ["PATH"].split(":"), "envPassthrough": []},
-                               "x")
-        except (KeyError, RuntimeError):
-            pass
+            self.assertEqual(server._unit_state({"path": os.environ["PATH"].split(":")}, "x"), "")
         finally:
             server.subprocess.run = real
         self.assertEqual(seen.get("XDG_RUNTIME_DIR"), f"/run/user/{os.getuid()}")
