@@ -1075,12 +1075,13 @@ def is_binary_blob(top: str, tip: str, path: str) -> bool:
     return blob is not None and "\0" in blob[:8000]
 
 
-def exists_at_tip(top: str, tip: str, path: str) -> bool:
-    """True when PATH names an entry at TIP. False only on git's own answer
-    that it does not (ls-tree succeeds and lists nothing), which a deleted
-    path gets; git failing or timing out counts as present, so an error can
-    never excuse a file from being read."""
-    return git(top, "ls-tree", "--full-tree", tip, "--", path) != ""
+def paths_at_tip(top: str, tip: str) -> set[str] | None:
+    """Every file path at TIP, or None when git cannot say. One listing,
+    matched literally by the caller: no pathspec is parsed (a file named
+    ':x' once passed for deleted), and names are decoded exactly as numstat
+    decodes them, so a non-UTF-8 name still matches itself."""
+    out = git(top, "ls-tree", "-r", "-z", "--name-only", "--full-tree", tip)
+    return None if out is None else set(filter(None, out.split("\0")))
 
 
 def _shown(paths: list[str]) -> str:
@@ -1122,9 +1123,11 @@ def evidence_problem(records: list[dict], info: dict, branch: str, tip: str,
     # A file the branch deletes has nothing left at the tip for a Read to open,
     # so no review could ever cover it; the deletion is in the diff the
     # passing review saw, and the branch verdict and drift still apply.
+    # A listing git could not produce excuses nothing.
     trusted = sorted((r for r in mine if not r.get("suspect")), key=lambda r: r.get("ts", 0))
+    present = paths_at_tip(info["top"], tip)
     readable = sorted(p for p, n in changes
-                      if exists_at_tip(info["top"], tip, p)
+                      if (present is None or p in present)
                       and (n is not None or not is_binary_blob(info["top"], tip, p)))
     unread, blocked, changed = [], [], []
     for path in readable:

@@ -405,21 +405,56 @@ def test_deleted_file_need_not_be_read_by_a_passing_review(sb):
     assert sb.gate() is None
 
 
-def test_deleted_file_still_needs_a_passing_review_on_the_branch(sb):
+def test_deletion_after_the_review_is_drift(sb):
+    old = _old_script_on_main(sb)
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    sb.review("PASS", reads=["scripts/run.sh", old])
+    git(sb.work, "rm", "-q", old)
+    git(sb.work, "commit", "-qm", "drop old after the review")
+    out = sb.gate()
+    assert is_deny(out) and "drifted" in reason(out)
+
+
+@pytest.mark.parametrize("name", [":run.sh", ":(top)x.sh", ":/x.sh"])
+def test_present_file_named_like_a_pathspec_still_needs_a_read(sb, name):
+    # The name is matched literally against the tip's file list; read as a
+    # pathspec it named nothing and passed for deleted (measured).
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    sb.commit(name, "".join(f"echo {i}\n" for i in range(40)))
+    sb.review("PASS", reads=["scripts/run.sh"])
+    out = sb.gate()
+    assert is_deny(out) and name in reason(out)
+
+
+def test_present_file_with_a_non_utf8_name_still_needs_a_read(sb):
+    # Both the change list and the tip's file list decode the name the same
+    # lossy way, so it still matches; looked up by its decoded spelling it
+    # named nothing and passed for deleted (measured).
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    raw = os.path.join(os.fsencode(str(sb.work)), b"scripts", b"caf\xe9.sh")
+    with open(raw, "wb") as f:
+        f.write("".join(f"echo {i}\n" for i in range(40)).encode())
+    git(sb.work, "add", "-A")
+    git(sb.work, "commit", "-qm", "latin-1 name")
+    sb.review("PASS", reads=["scripts/run.sh"])
+    out = sb.gate()
+    assert is_deny(out) and "scripts/caf" in reason(out)
+
+
+def test_file_replaced_by_a_directory_counts_as_deleted(sb):
     old = _old_script_on_main(sb)
     git(sb.work, "rm", "-q", old)
-    git(sb.work, "commit", "-qm", "drop old")
-    out = sb.gate()
-    assert is_deny(out) and "no advisor verdict is recorded" in reason(out)
+    sb.commit(f"{old}/bar.sh", SCRIPT_BODY, msg="old becomes a directory")
+    sb.review("PASS", reads=[f"{old}/bar.sh"])
+    assert sb.gate() is None
 
 
-def test_git_failing_never_counts_as_deleted(sb, tmp_path):
-    # A deleted path is excused from a read; git erroring must not be.
+def test_tip_listing_failing_excuses_nothing(sb, tmp_path):
     tip = git(sb.work, "rev-parse", "HEAD").strip()
-    assert artl_gate.exists_at_tip(str(sb.work), tip, "src/app.py") is True
-    assert artl_gate.exists_at_tip(str(sb.work), tip, "gone.sh") is False
-    assert artl_gate.exists_at_tip(str(tmp_path / "no-repo"), tip, "gone.sh") is True
-    assert artl_gate.exists_at_tip(str(sb.work), "0" * 40, "gone.sh") is True
+    assert artl_gate.paths_at_tip(str(sb.work), tip) is not None
+    assert "src/app.py" in artl_gate.paths_at_tip(str(sb.work), tip)
+    assert artl_gate.paths_at_tip(str(tmp_path / "no-repo"), tip) is None
+    assert artl_gate.paths_at_tip(str(sb.work), "0" * 40) is None
 
 
 def test_deleted_then_recreated_file_still_needs_a_read(sb):
