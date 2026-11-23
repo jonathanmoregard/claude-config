@@ -73,7 +73,8 @@ def grade(run: pathlib.Path, mode: str) -> tuple[int, str]:
 
     waiter_tool = {e["task_id"]: e.get("tool_use_id") for e in events
                    if e.get("type") == "system" and e.get("subtype") == "task_started"
-                   and e.get("task_type") == "local_bash" and not e.get("owned_by_subagent")
+                   and e.get("task_type") == "local_bash" and e.get("is_backgrounded") is not False
+                   and not e.get("owned_by_subagent")
                    and isinstance(e.get("task_id"), str)
                    and any(watches_agent(commands.get(e.get("tool_use_id"), ""), i) for i in ids)}
     waiters = set(waiter_tool)
@@ -136,7 +137,7 @@ def grade(run: pathlib.Path, mode: str) -> tuple[int, str]:
             return 2, summary + " (waiter stopped by Claude Code before the alarm)"
         return 1, summary
     if mode == "quiet":
-        if not armed or fired or broken:
+        if not armed or fired or broken or any(code == 5 for _, _, code in exits):
             return 1, summary
         if live or not stopped_after:
             return 2, summary + " (waiter not stopped after the result, or one left running)"
