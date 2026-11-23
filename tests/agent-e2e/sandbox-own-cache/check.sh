@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -uo pipefail
 run=${1:?run dir}
-seen=$run/seen
+seen=$run/work/seen
 [ -f "$seen" ] || { echo "INCONCLUSIVE: probe.sh never ran"; exit 2; }
 summary=$(tr '\n' ' ' <"$seen")
 grep -qx 'sandbox=1' "$seen" || { echo "INCONCLUSIVE: probe ran outside the sandbox: $summary"; exit 2; }

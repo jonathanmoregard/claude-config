@@ -8,6 +8,6 @@ run=$2
 here=$(dirname "$(readlink -f "$0")")
 {
   echo '#!/usr/bin/env bash'
-  echo "printf 'sandbox=%s\nxdg=%s\ncargo=%s\n' \"\${SANDBOX_RUNTIME:-}\" \"\${XDG_CACHE_HOME:-}\" \"\${CARGO_HOME:-}\" | tee '$run/seen'"
+  echo "printf 'sandbox=%s\nxdg=%s\ncargo=%s\n' \"\${SANDBOX_RUNTIME:-}\" \"\${XDG_CACHE_HOME:-}\" \"\${CARGO_HOME:-}\" | tee seen"
 } >"$work/probe.sh"
 source "$here/../_lib/sandbox-on.sh"
