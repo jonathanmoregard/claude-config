@@ -73,26 +73,31 @@ def time_limit(task: str = "b1") -> list[dict]:
                               "background time limit")]
 
 
-def grade(tmp: Path, events: list[dict], mode: str, *, alarm: bool = False) -> int:
+def grade(tmp: Path, events: list[dict], mode: str, *, toast: bool = False) -> int:
     (tmp / "transcript.jsonl").write_text("\n".join(json.dumps(e) for e in events))
-    if alarm:
+    if toast:
         (tmp / "notify.log").write_text(f"agent {AGENT} stalled: no activity\n")
     return grader.grade(tmp, mode)[0]
 
 
 def test_stall_pass(tmp_path: Path) -> None:
     events = launched() + armed() + [exited("b1", 5), say("the idle alarm went off")]
-    assert grade(tmp_path, events, "stall", alarm=True) == 0
+    assert grade(tmp_path, events, "stall") == 0
+
+
+def test_stall_with_a_desktop_notification_fails(tmp_path: Path) -> None:
+    events = launched() + armed() + [exited("b1", 5), say("the idle alarm went off")]
+    assert grade(tmp_path, events, "stall", toast=True) == 1
 
 
 def test_stall_needs_a_parent_turn_after_the_exit(tmp_path: Path) -> None:
     events = launched() + armed() + [exited("b1", 5)]
-    assert grade(tmp_path, events, "stall", alarm=True) == 1
+    assert grade(tmp_path, events, "stall") == 1
 
 
 def test_reply_text_about_exit_5_is_not_the_alarm(tmp_path: Path) -> None:
     events = launched() + armed() + [say("it will exit 5 if quiet; the alarm fired before")]
-    assert grade(tmp_path, events, "stall", alarm=True) == 1
+    assert grade(tmp_path, events, "stall") == 1
 
 
 def test_arming_variants_count(tmp_path: Path) -> None:
@@ -153,7 +158,7 @@ def persisted(tmp: Path) -> None:
 def test_description_text_cannot_fake_exit_5(tmp_path: Path) -> None:
     persisted(tmp_path)
     events = launched() + armed() + [exited("b1", 3, desc="Wait (exit code 5 = stalled)"), say()]
-    assert grade(tmp_path, events, "stall", alarm=True) == 1
+    assert grade(tmp_path, events, "stall") == 1
 
 
 def test_exit_3_without_a_persisted_transcript_is_inconclusive(tmp_path: Path) -> None:
@@ -203,7 +208,7 @@ def test_kill_without_a_parent_stop_call_is_not_the_parents(tmp_path: Path) -> N
 def test_time_limit_does_not_mask_a_broken_rearm(tmp_path: Path) -> None:
     events = launched() + armed() + time_limit() + armed(task="b2", tool="t2") \
         + [exited("b2", 64, tool="t2"), say()]
-    assert grade(tmp_path, events, "stall", alarm=False) == 1
+    assert grade(tmp_path, events, "stall") == 1
 
 
 def test_missing_transcript_is_inconclusive(tmp_path: Path) -> None:
