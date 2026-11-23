@@ -9,8 +9,8 @@ import tempfile
 import time
 
 
-ROOT = Path(__file__).resolve().parents[2] / "codex"
-FANOUT = ROOT / "scripts" / "codex_hook_fanout.py"
+RENDERER = Path(__file__).resolve().parents[2] / "codex"
+FANOUT = RENDERER / "scripts" / "codex_hook_fanout.py"
 
 
 def write_wrapper(path: Path, body: str) -> Path:

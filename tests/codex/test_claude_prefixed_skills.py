@@ -5,8 +5,8 @@ from pathlib import Path
 import sys
 
 
-ROOT = Path(__file__).resolve().parents[2] / "codex"
-sys.path.insert(0, str(ROOT / "scripts"))
+RENDERER = Path(__file__).resolve().parents[2] / "codex"
+sys.path.insert(0, str(RENDERER / "scripts"))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from roundtrip_support import Inputs, describe, round_trip  # noqa: E402

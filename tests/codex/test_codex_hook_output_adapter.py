@@ -8,8 +8,8 @@ import sys
 import tempfile
 
 
-ROOT = Path(__file__).resolve().parents[2] / "codex"
-sys.path.insert(0, str(ROOT / "scripts"))
+RENDERER = Path(__file__).resolve().parents[2] / "codex"
+sys.path.insert(0, str(RENDERER / "scripts"))
 
 import codex_hook_output_adapter as adapter  # noqa: E402
 
@@ -110,7 +110,7 @@ def test_main_executes_wrapper_without_shell_interpretation() -> None:
         wrapper.chmod(0o755)
 
         result = subprocess.run(
-            [sys.executable, str(ROOT / "scripts" / "codex_hook_output_adapter.py"), "SessionStart", str(wrapper)],
+            [sys.executable, str(RENDERER / "scripts" / "codex_hook_output_adapter.py"), "SessionStart", str(wrapper)],
             cwd=root,
             text=True,
             capture_output=True,
@@ -133,7 +133,7 @@ def test_context_hook_failure_is_silent_and_fail_open() -> None:
         wrapper.chmod(0o755)
 
         result = subprocess.run(
-            [sys.executable, str(ROOT / "scripts" / "codex_hook_output_adapter.py"), "UserPromptSubmit", str(wrapper)],
+            [sys.executable, str(RENDERER / "scripts" / "codex_hook_output_adapter.py"), "UserPromptSubmit", str(wrapper)],
             text=True,
             input=json.dumps({"hook_event_name": "UserPromptSubmit"}),
             capture_output=True,
@@ -156,7 +156,7 @@ def test_enforcement_hook_failure_remains_a_failure() -> None:
         wrapper.chmod(0o755)
 
         result = subprocess.run(
-            [sys.executable, str(ROOT / "scripts" / "codex_hook_output_adapter.py"), "PreToolUse", str(wrapper)],
+            [sys.executable, str(RENDERER / "scripts" / "codex_hook_output_adapter.py"), "PreToolUse", str(wrapper)],
             text=True,
             input=json.dumps({"hook_event_name": "PreToolUse"}),
             capture_output=True,
@@ -244,7 +244,7 @@ if payload["tool_input"]["file_path"] == ".claude/settings.json":
         result = subprocess.run(
             [
                 sys.executable,
-                str(ROOT / "scripts" / "codex_hook_output_adapter.py"),
+                str(RENDERER / "scripts" / "codex_hook_output_adapter.py"),
                 "PreToolUse",
                 str(launcher),
                 "--adapt-file-tools",

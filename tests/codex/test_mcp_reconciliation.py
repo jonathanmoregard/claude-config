@@ -10,8 +10,8 @@ from unittest.mock import patch
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[2] / "codex"
-sys.path.insert(0, str(ROOT / "scripts"))
+RENDERER = Path(__file__).resolve().parents[2] / "codex"
+sys.path.insert(0, str(RENDERER / "scripts"))
 
 import import_claude  # noqa: E402
 import render_codex  # noqa: E402
@@ -692,7 +692,7 @@ def test_codex_instructions_route_every_git_mutation_through_broker() -> None:
 
 def test_orchestrate_adapter_names_dedicated_git_broker() -> None:
     adapter = (
-        ROOT / "clients" / "codex" / "skills" / "orchestrate" / "SKILL.md"
+        RENDERER / "clients" / "codex" / "skills" / "orchestrate" / "SKILL.md"
     ).read_text(encoding="utf-8")
 
     assert "mcp__git_broker__git" in adapter

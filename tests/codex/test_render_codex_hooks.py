@@ -8,8 +8,8 @@ import tempfile
 from unittest.mock import patch
 
 
-ROOT = Path(__file__).resolve().parents[2] / "codex"
-sys.path.insert(0, str(ROOT / "scripts"))
+RENDERER = Path(__file__).resolve().parents[2] / "codex"
+sys.path.insert(0, str(RENDERER / "scripts"))
 
 import check  # noqa: E402
 import import_claude  # noqa: E402

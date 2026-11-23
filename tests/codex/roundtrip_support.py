@@ -25,8 +25,8 @@ from typing import Callable, Iterator
 from mcp_test_support import DEFAULT_OWNER_CHILDREN, shared_broker_registrations
 
 
-ROOT = Path(__file__).resolve().parents[2] / "codex"
-sys.path.insert(0, str(ROOT / "scripts"))
+RENDERER = Path(__file__).resolve().parents[2] / "codex"
+sys.path.insert(0, str(RENDERER / "scripts"))
 
 import render_codex  # noqa: E402
 
@@ -270,12 +270,12 @@ def assert_check_fails(
 def copy_repo(destination: Path) -> Path:
     destination.mkdir(parents=True)
     shutil.copytree(
-        ROOT / "scripts",
+        RENDERER / "scripts",
         destination / "scripts",
         ignore=shutil.ignore_patterns("__pycache__"),
     )
-    shutil.copytree(ROOT / "clients", destination / "clients")
-    shutil.copy2(ROOT / "client-support.toml", destination / "client-support.toml")
+    shutil.copytree(RENDERER / "clients", destination / "clients")
+    shutil.copy2(RENDERER / "client-support.toml", destination / "client-support.toml")
     return destination
 
 

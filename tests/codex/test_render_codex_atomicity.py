@@ -16,8 +16,8 @@ from typing import Iterator
 from unittest.mock import patch
 
 
-ROOT = Path(__file__).resolve().parents[2] / "codex"
-sys.path.insert(0, str(ROOT / "scripts"))
+RENDERER = Path(__file__).resolve().parents[2] / "codex"
+sys.path.insert(0, str(RENDERER / "scripts"))
 
 import common  # noqa: E402
 import render_codex  # noqa: E402

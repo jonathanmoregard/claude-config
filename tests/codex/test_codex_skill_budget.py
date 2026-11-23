@@ -13,8 +13,8 @@ import tomllib
 from unittest.mock import patch
 
 
-ROOT = Path(__file__).resolve().parents[2] / "codex"
-sys.path.insert(0, str(ROOT / "scripts"))
+RENDERER = Path(__file__).resolve().parents[2] / "codex"
+sys.path.insert(0, str(RENDERER / "scripts"))
 
 import import_claude  # noqa: E402
 import probe_codex_skills  # noqa: E402
@@ -129,19 +129,19 @@ def test_import_retains_budget_and_complete_plugin_state() -> None:
 def test_plugin_inventory_only_collects_enabled_existing_skills() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
-        enabled_root = root / "enabled-kit"
-        disabled_root = root / "disabled-kit"
-        truthy_root = root / "truthy-kit"
+        enabled_kit = root / "enabled-kit"
+        disabled_kit = root / "disabled-kit"
+        truthy_kit = root / "truthy-kit"
         write_skill(
-            enabled_root / "skills" / "enabled-skill" / "SKILL.md",
+            enabled_kit / "skills" / "enabled-skill" / "SKILL.md",
             "Enabled fixture skill.",
         )
         write_skill(
-            disabled_root / "skills" / "disabled-skill" / "SKILL.md",
+            disabled_kit / "skills" / "disabled-skill" / "SKILL.md",
             "Disabled fixture skill.",
         )
         write_skill(
-            truthy_root / "skills" / "truthy-skill" / "SKILL.md",
+            truthy_kit / "skills" / "truthy-skill" / "SKILL.md",
             "Non-boolean fixture skill.",
         )
         settings = claude_settings()
@@ -153,13 +153,13 @@ def test_plugin_inventory_only_collects_enabled_existing_skills() -> None:
             "plugins": {
                 "enabled-kit@example": [
                     {"installPath": str(root / "old-enabled-kit"), "version": "1.0.0"},
-                    {"installPath": str(enabled_root), "version": "1.2.3"},
+                    {"installPath": str(enabled_kit), "version": "1.2.3"},
                 ],
                 "disabled-kit@example": [
-                    {"installPath": str(disabled_root), "version": "4.5.6"}
+                    {"installPath": str(disabled_kit), "version": "4.5.6"}
                 ],
                 "truthy-kit@example": [
-                    {"installPath": str(truthy_root), "version": "7.8.9"}
+                    {"installPath": str(truthy_kit), "version": "7.8.9"}
                 ],
             }
         }
@@ -174,7 +174,7 @@ def test_plugin_inventory_only_collects_enabled_existing_skills() -> None:
         assert plugins[1] == {
             "id": "enabled-kit@example",
             "enabled": True,
-            "path": str(enabled_root),
+            "path": str(enabled_kit),
             "version": "1.2.3",
             "exists": True,
         }
@@ -189,15 +189,15 @@ def test_main_writes_stable_plugin_state_and_loads_installed_once() -> None:
         state_path = root / ".claude.json"
         manifest_path = root / "manifest.json"
         installed_path = claude / "plugins" / "installed_plugins.json"
-        enabled_root = root / "enabled-kit"
-        disabled_root = root / "disabled-kit"
+        enabled_kit = root / "enabled-kit"
+        disabled_kit = root / "disabled-kit"
 
         write_skill(
-            enabled_root / "skills" / "enabled-skill" / "SKILL.md",
+            enabled_kit / "skills" / "enabled-skill" / "SKILL.md",
             "Enabled fixture skill.",
         )
         write_skill(
-            disabled_root / "skills" / "disabled-skill" / "SKILL.md",
+            disabled_kit / "skills" / "disabled-skill" / "SKILL.md",
             "Disabled fixture skill.",
         )
         write_json(claude / "settings.json", claude_settings())
@@ -207,10 +207,10 @@ def test_main_writes_stable_plugin_state_and_loads_installed_once() -> None:
             {
                 "plugins": {
                     "enabled-kit@example": [
-                        {"installPath": str(enabled_root), "version": "1.2.3"}
+                        {"installPath": str(enabled_kit), "version": "1.2.3"}
                     ],
                     "disabled-kit@example": [
-                        {"installPath": str(disabled_root), "version": "4.5.6"}
+                        {"installPath": str(disabled_kit), "version": "4.5.6"}
                     ],
                 }
             },
@@ -242,14 +242,14 @@ def test_main_writes_stable_plugin_state_and_loads_installed_once() -> None:
             {
                 "id": "disabled-kit@example",
                 "enabled": False,
-                "path": str(disabled_root),
+                "path": str(disabled_kit),
                 "version": "4.5.6",
                 "exists": True,
             },
             {
                 "id": "enabled-kit@example",
                 "enabled": True,
-                "path": str(enabled_root),
+                "path": str(enabled_kit),
                 "version": "1.2.3",
                 "exists": True,
             },
