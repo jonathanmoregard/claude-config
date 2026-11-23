@@ -623,6 +623,7 @@ CODEX_UNSUPPORTED_HOOK_EVENTS = frozenset(
         "InstructionsLoaded",
         "MessageDisplay",
         "PermissionDenied",
+        "PostToolUseFailure",
         "StopFailure",
     }
 )
@@ -2410,7 +2411,7 @@ def prepare_report_files(
         "skipped": skipped,
         "known_gaps": [
             "research-agent normal/deep uses Claude first and automatically retries with Codex when Claude's usage limit is exhausted; scanner/provider outages still fail closed.",
-            "Claude ConfigChange, CwdChanged, InstructionsLoaded, MessageDisplay, PermissionDenied, and StopFailure hooks remain in the source manifest and report but are not rendered because Codex 0.146 does not support those events.",
+            "Claude ConfigChange, CwdChanged, InstructionsLoaded, MessageDisplay, PermissionDenied, PostToolUseFailure, and StopFailure hooks remain in the source manifest and report but are not rendered because Codex 0.146 does not support those events.",
             "Supported Claude commands render as Codex skills; templates that depend on Claude-only argument interpolation or stop-hook behavior remain reported but unexposed.",
             "Claude agents render as native Codex roles, but Claude model identifiers and exact per-tool allowlists have no direct Codex equivalent; read-only source agents are sandboxed read-only.",
             "Codex 0.146 renders hook-provided model context in the TUI; suppressOutput cannot make UserPromptSubmit or SessionStart context model-only.",

@@ -317,6 +317,22 @@ def test_trash_follows_a_link_before_its_dotdot(home: Path) -> None:
         os.fsencode(project / "sub" / "item")
 
 
+@pytest.mark.parametrize("arg", ["missing/../item", "file/../item", "loop/../item"],
+                         ids=["absent", "not-a-dir", "link-loop"])
+def test_trash_refuses_a_path_whose_parent_cannot_be_walked(home: Path, arg: str) -> None:
+    # A non-strict resolve collapsed missing/.. as text and moved ./item
+    # (reproduced at 3c3f162); the kernel would refuse that path.
+    project = home / "worktrees" / "project"
+    (project / "item").write_text("x")
+    (project / "file").write_text("y")
+    (project / "loop").symlink_to("loop")
+    before = sorted(str(p) for p in home.rglob("*"))
+    proc = run_trash(home, arg, cwd=project)
+    assert proc.returncode == 1, proc.stderr
+    assert (project / "item").read_text() == "x"
+    assert sorted(str(p) for p in home.rglob("*")) == before
+
+
 def test_trash_moves_a_final_link_itself_and_takes_a_trailing_slash(home: Path) -> None:
     project = home / "worktrees" / "project"
     (project / "sub").mkdir()
