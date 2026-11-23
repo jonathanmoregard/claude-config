@@ -663,8 +663,10 @@ wait_unit() {
 
 # The Claude Code sandbox hides the user bus on purpose (a transient unit would
 # run outside it), so there the job is a child of this call and ends with it.
-# The log's last line stands in for the retained unit: a finished run is
-# adopted, never repeated, until its log is removed.
+# /tmp/<slug>.status stands in for the retained unit: a finished run is adopted,
+# never repeated, until that file is removed. It is written only once the job's
+# exit is seen, by rename, so a run cut off by the deadline or a stop leaves
+# none; the log's last line cannot stand in, as the job writes the log too.
 stop_job() {
   trap '' TERM INT HUP
   kill -TERM "$child" 2>/dev/null
@@ -673,7 +675,7 @@ stop_job() {
 }
 
 run_job_in_sandbox() {
-  local log=/tmp/$target.log rc last remaining sig pending
+  local log=/tmp/$target.log status=/tmp/$target.status rc last="" remaining sig pending tmp
   # Opened read-write, a FIFO does not block; each is then used only through
   # its descriptor, so nothing swapped in under the name later is opened.
   exec 9<>"/tmp/$target.lock" && [ -f /dev/fd/9 ] || {
@@ -681,15 +683,21 @@ run_job_in_sandbox() {
   }
   flock -n 9 || flock -w "$(left)" 9 || timed_out
   exec 8<>"$log" && [ -f /dev/fd/8 ] || { echo "wait-for: cannot use $log as a log file" >&2; exit 3; }
-  last=$(tail -n 1 -- /dev/fd/8 2>/dev/null)
+  # Only a regular file counts, and reading it is bounded by the deadline.
+  if [ -f "$status" ] && [ ! -L "$status" ]; then
+    last=$(command timeout "$(left)" head -n 1 -- "$status" 2>/dev/null)
+  fi
   case $last in
     MARKER_OK)
-      echo "job $target already ran inside the sandbox result=success status=0 log=$log (remove the log to run it again)"
+      echo "job $target already ran inside the sandbox result=success status=0 log=$log (remove $status to run it again)"
       exit 0 ;;
     "MARKER_FAILED rc="*)
-      echo "job $target already ran inside the sandbox result=exit-code status=${last#MARKER_FAILED rc=} log=$log (remove the log to run it again)"
+      echo "job $target already ran inside the sandbox result=exit-code status=${last#MARKER_FAILED rc=} log=$log (remove $status to run it again)"
       exit 1 ;;
   esac
+  rm -f -- "$status" && [ ! -e "$status" ] && [ ! -L "$status" ] || {
+    echo "wait-for: cannot use $status as a status file" >&2; exit 3;
+  }
   : >/dev/fd/8 || { echo "wait-for: cannot write $log" >&2; exit 3; }
   # `timeout 0` would mean no limit at all.
   remaining=$(left)
@@ -708,12 +716,17 @@ run_job_in_sandbox() {
   # 137 is how GNU timeout reports the KILL after the grace period.
   case $rc in 124|137) [ "$(left)" -gt 0 ] || timed_out ;; esac
   [ "$(tail -c 1 -- /dev/fd/8 | od -An -tx1 | tr -d ' ')" = 0a ] || echo >>/dev/fd/8
+  if [ "$rc" = 0 ]; then last=MARKER_OK; else last="MARKER_FAILED rc=$rc"; fi
+  echo "$last" >>/dev/fd/8
+  # Whole or absent: a reader never sees half a record.
+  if ! { tmp=$(mktemp "$status.XXXXXX") && echo "$last" >"$tmp" && mv -fT -- "$tmp" "$status"; }; then
+    [ -z "${tmp:-}" ] || rm -f -- "$tmp"
+    echo "wait-for: could not record the result in $status; a repeat will run the job again" >&2
+  fi
   if [ "$rc" = 0 ]; then
-    echo MARKER_OK >>/dev/fd/8
     echo "job $target ran inside the sandbox result=success status=0 log=$log"
     exit 0
   fi
-  echo "MARKER_FAILED rc=$rc" >>/dev/fd/8
   echo "job $target ran inside the sandbox result=exit-code status=$rc log=$log"
   exit 1
 }
