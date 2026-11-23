@@ -2967,7 +2967,9 @@ def render_plan_drift(plan: RenderPlan) -> list[str]:
 def load_render_plan() -> RenderPlan:
     manifest = load_json(MANIFEST, {})
     if not manifest:
-        raise SystemExit(f"missing manifest; run {REPO / 'scripts' / 'import_claude.py'}")
+        # The checked sync, as check.py advises: import, then this script,
+        # would publish unchecked.
+        raise SystemExit(f"missing manifest; run {REPO / 'scripts' / 'sync_codex.py'}")
     return prepare_render_plan(manifest, load_support())
 
 

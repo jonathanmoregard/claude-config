@@ -1457,6 +1457,17 @@ def test_check_remediation_names_the_checked_sync() -> None:
         assert unusable.endswith(f"run {sync}"), unusable
 
 
+def test_render_without_a_manifest_names_the_checked_sync() -> None:
+    # The renderer's own advice named the importer: following it (import,
+    # then render_codex.py again) publishes unchecked.
+    with round_trip() as rt:
+        rt.manifest.unlink()
+        result = rt.run("render_codex.py")
+        assert result.returncode != 0, describe(result)
+        missing = result.stderr.strip().splitlines()[-1]
+        assert missing.endswith(f"run {rt.repo / 'scripts' / 'sync_codex.py'}"), missing
+
+
 # Runs sync_codex.main() with the check parked until a signal arrives: the
 # publish is live and unchecked when the parent sends it.
 PARKED_CHECK_SYNC = """
@@ -1801,6 +1812,7 @@ if __name__ == "__main__":
     test_profile_config_files_cannot_loosen_the_session()
     test_a_direct_sync_whose_check_fails_leaves_the_home_as_it_was()
     test_check_remediation_names_the_checked_sync()
+    test_render_without_a_manifest_names_the_checked_sync()
     test_a_direct_sync_stopped_during_its_check_leaves_the_home_as_it_was()
     test_a_signal_during_a_failed_checks_rollback_waits_for_the_restore()
     test_frontmatter_invariant_covers_plugin_and_command_wrappers()
