@@ -61,7 +61,8 @@ def stopped_waiter() -> bool:
             event = json.loads(line)
         except ValueError:
             continue
-        if isinstance(event, dict) and not event.get("agent_id"):
+        # stream-json marks a subagent's events with parent_tool_use_id.
+        if isinstance(event, dict) and not event.get("parent_tool_use_id"):
             events.append((event, line))
     waiter_calls = {b.get("id") for e, _ in events if e.get("type") == "assistant"
                     for b in blocks(e, "tool_use") if b.get("name") == "Bash"
@@ -80,7 +81,19 @@ def stopped_waiter() -> bool:
                 given = {str(v) for v in (b.get("input") or {}).values()}
                 if given & waiter_ids:
                     return True
-    return re.search(r"\b(?:pkill|kill)\b[^\n]*wait-for", commands) is not None
+    # Or the parent's own Bash killed it: one shell segment that is a kill
+    # naming wait-for (`pkill -f x; wait-for agent X` is a re-arm, not a stop).
+    for e, _ in events:
+        if e.get("type") != "assistant":
+            continue
+        for b in blocks(e, "tool_use"):
+            if b.get("name") != "Bash":
+                continue
+            command = str((b.get("input") or {}).get("command", ""))
+            for segment in re.split(r"[;&|\n]+", command):
+                if re.match(r"\s*(?:sudo\s+)?p?kill\b", segment) and "wait-for" in segment:
+                    return True
+    return False
 
 
 stopped = stopped_waiter()

@@ -147,6 +147,25 @@ def test_missing_limit_is_120_seconds_of_naps(tmp_path: Path) -> None:
     assert naps == ["30"] * 4, naps
 
 
+def test_transcript_seen_then_deleted_gets_the_full_missing_limit(tmp_path: Path) -> None:
+    """The 120 s missing limit restarts once the transcript is found: missing
+    for 2 naps, present for 1, then deleted -> 4 more naps, 7 in all."""
+    env = make_env(tmp_path)
+    d = tmp_path / "home" / ".claude" / "projects" / "p" / "sess" / "subagents"
+    d.mkdir(parents=True)
+    t = d / "agent-mmm3.jsonl"
+    (Path(env["STUB_DIR"]) / "bin" / "sleep").write_text(
+        '#!/bin/sh\necho "$1" >> "$STUB_DIR/naps.log"\n'
+        'n=$(wc -l < "$STUB_DIR/naps.log")\n'
+        f'[ "$n" -eq 2 ] && echo x > "{t}"\n'
+        f'[ "$n" -eq 3 ] && rm -f "{t}"\n'
+        'exit 0\n')
+    rc, out = run(env, "mmm3", "--idle", "7200")
+    assert rc == 3 and "no transcript" in out, out
+    naps = (Path(env["STUB_DIR"]) / "naps.log").read_text().split()
+    assert len(naps) == 7, naps
+
+
 def test_default_timeout_outlasts_the_default_idle(tmp_path: Path) -> None:
     """Agent mode's default timeout (86400) must exceed the 2 h idle limit, or
     the waiter times out (124) before the alarm can ever fire. A fake clock
