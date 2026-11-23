@@ -499,6 +499,10 @@ section("settings.json: the permission surface the switchover creates")
 
 _ALLOW = SETTINGS.get("permissions", {}).get("allow", [])
 _DENY_ALL = SETTINGS.get("permissions", {}).get("deny", [])
+_SANDBOX = SETTINGS.get("sandbox", {})
+# Sandboxed Bash is auto-allowed once the sandbox is on, which replaces the bare allow.
+_BASH_REACHABLE = "Bash" in _ALLOW or (
+    _SANDBOX.get("enabled") is True and _SANDBOX.get("autoAllowBashIfSandboxed") is True)
 
 check(
     # L1. Until this is gone the guards are unreachable: the CLI refuses the
@@ -517,10 +521,11 @@ check(
 check(
     # A7 / W11, arm (b). Absence here is not neutral: it silently converts
     # every Bash call in every unattended run into a permission prompt.
-    "arm (b) is in force: `Bash` is allowed, matching the posture safe-bash had",
-    "Bash" in _ALLOW,
-    "permissions.allow must carry `Bash`; see the block comment above for why "
-    "the other two arms were rejected",
+    "arm (b) is in force: `Bash` runs without a prompt, bare or sandboxed",
+    _BASH_REACHABLE,
+    "permissions.allow must carry `Bash`, or the sandbox must be on with "
+    "autoAllowBashIfSandboxed; see the block comment above for why the other "
+    "two arms were rejected",
 )
 check(
     "`ask` stays empty — the switchover adds no new prompt surface",
@@ -2373,8 +2378,8 @@ with open(os.path.join(_LEDGER, "run-evaluate.sh"), encoding="utf-8") as fh:
 # but until then they are load-bearing.
 _perms = SETTINGS.get("permissions", {})
 check(
-    "precondition: settings.json allows bare Bash and does not deny it",
-    "Bash" in _perms.get("allow", []) and "Bash" not in _perms.get("deny", []),
+    "precondition: settings.json lets Bash run (bare or sandboxed) and does not deny it",
+    _BASH_REACHABLE and "Bash" not in _perms.get("deny", []),
     f"allow_has_bash={'Bash' in _perms.get('allow', [])} "
     f"deny_has_bash={'Bash' in _perms.get('deny', [])}",
 )

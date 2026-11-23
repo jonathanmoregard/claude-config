@@ -7,8 +7,11 @@ HOOK = Path(__file__).resolve().parents[1] / "runtime" / "hooks" / "sandbox-env.
 
 
 def run_hook(env_file: Path) -> None:
-    env = {"PATH": os.environ["PATH"], "CLAUDE_ENV_FILE": str(env_file)}
+    home = env_file.parent
+    env = {"PATH": os.environ["PATH"], "HOME": str(home), "CLAUDE_ENV_FILE": str(env_file)}
     subprocess.run([sys.executable, "-S", "-E", str(HOOK)], env=env, check=True)
+    # The sandbox mounts this write root, so it must exist before Bash runs.
+    assert (home / ".cache" / "claude-sandbox").is_dir()
 
 
 def sourced(env_file: Path, home: Path, extra: dict) -> dict:
@@ -64,4 +67,4 @@ def test_repeated_session_start_appends_once(tmp_path):
 
 def test_no_env_file_is_a_no_op(tmp_path):
     subprocess.run([sys.executable, "-S", "-E", str(HOOK)],
-                   env={"PATH": os.environ["PATH"]}, check=True)
+                   env={"PATH": os.environ["PATH"], "HOME": str(tmp_path)}, check=True)

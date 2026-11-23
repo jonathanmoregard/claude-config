@@ -195,7 +195,8 @@ def _build_candidate(path: str) -> dict:
     # to the three guards and repointed at this worktree, so the probe cannot
     # exercise the installed copy by accident.
     # arftl-allow: permission-widened — verbatim copy into a scratch file.
-    cand = {"permissions": SETTINGS["permissions"], "hooks": hooks}
+    cand = {"permissions": SETTINGS["permissions"], "hooks": hooks,
+            "sandbox": SETTINGS.get("sandbox", {})}
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(cand, fh, indent=2)
     return cand
@@ -234,7 +235,9 @@ for _basename, _event in (
         )
 check(
     "the candidate carries the real permission surface",
-    "Bash" in CAND["permissions"]["allow"]
+    ("Bash" in CAND["permissions"]["allow"]
+     or (CAND["sandbox"].get("enabled") is True
+         and CAND["sandbox"].get("autoAllowBashIfSandboxed") is True))
     and "Bash" not in CAND["permissions"]["deny"]
     and len([r for r in CAND["permissions"]["deny"] if r.startswith("Bash(")]) > 40,
     f"allow={[a for a in CAND['permissions']['allow'] if 'Bash' in a]} "
