@@ -28,7 +28,8 @@ class Inconclusive(Exception):
 def judge(prompt: str, schema: dict, timeout: int = 600) -> dict:
     out_dir = tempfile.mkdtemp(prefix='e2e-judge-out-')
     raw = os.path.join(out_dir, 'judge.out')
-    creds = os.path.join(pwd.getpwuid(os.getuid()).pw_dir, '.claude', '.credentials.json')
+    creds = os.environ.get('E2E_JUDGE_CREDS') or os.path.join(
+        pwd.getpwuid(os.getuid()).pw_dir, '.claude', '.credentials.json')
     argv = [os.environ.get('E2E_JUDGE_CLAUDE', 'claude'), '-p',
             '--model', os.environ.get('E2E_JUDGE_MODEL', 'opus'),
             '--output-format', 'json', '--json-schema', json.dumps(schema),
@@ -58,9 +59,14 @@ def judge(prompt: str, schema: dict, timeout: int = 600) -> dict:
         with open(raw, 'w', encoding='utf-8') as fh:
             fh.write(repr(exc))
         raise Inconclusive(f'{exc.__class__.__name__}; see {raw}') from exc
+    if proc.returncode != 0:
+        raise Inconclusive(f'judge exited {proc.returncode}; see {raw}')
     try:
-        verdict = json.loads(proc.stdout)['structured_output']
-    except (ValueError, KeyError, TypeError) as exc:
+        envelope = json.loads(proc.stdout)
+        if envelope.get('is_error') is not False:
+            raise Inconclusive(f'judge reported an error; see {raw}')
+        verdict = envelope['structured_output']
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
         raise Inconclusive(f'no structured_output ({exc.__class__.__name__}); see {raw}') from exc
     if not isinstance(verdict, dict):
         raise Inconclusive(f'structured_output is not an object; see {raw}')

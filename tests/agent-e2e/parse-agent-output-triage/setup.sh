@@ -45,15 +45,38 @@ TXT
 git -C "$WORK" add -A
 git -C "$WORK" commit -qm "triage script skeleton"
 
-cat > "$E2E_BIN/claude" <<SH
-#!/usr/bin/env bash
-printf '%s\n' "\$*" >> "$E2E_RUN/claude-calls.txt"
-case " \$* " in
-  *" --json-schema "*)
-    printf '%s\n' '{"type":"result","is_error":false,"result":"","structured_output":{"category":"bug"}}' ;;
-  *" --output-format json "*|*" --output-format=json "*)
-    printf '%s\n' '{"type":"result","is_error":false,"result":"This one is a bug report, not a feature request."}' ;;
-  *) echo "This one is a bug report, not a feature request." ;;
+# The stub answers like the real CLI: structured_output only with both
+# --output-format json and --json-schema (either flag form), a JSON envelope
+# with prose for --output-format json alone, prose otherwise. Its category
+# follows the ticket it is given (the dark-mode ticket is a feature).
+{
+  printf '#!/usr/bin/env bash\nCALLS=%q\n' "$E2E_RUN/claude-calls.txt"
+  cat <<'SH'
+printf '%s\n' "$*" >> "$CALLS"
+json=0 schema=0 prompt=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --output-format) [ "${2:-}" = json ] && json=1; shift 2 ;;
+    --output-format=json) json=1; shift ;;
+    --json-schema) schema=1; shift 2 ;;
+    --json-schema=*) schema=1; shift ;;
+    --model|--tools|--max-turns|--system-prompt|--append-system-prompt) shift 2 ;;
+    -*) shift ;;
+    *) prompt="$prompt $1"; shift ;;
+  esac
+done
+[ -t 0 ] || prompt="$prompt $(cat)"
+case "$prompt" in
+  *"Dark mode"*) category=feature; text="This one is a feature request, not a bug report." ;;
+  *) category=bug; text="This one is a bug report, not a feature request." ;;
 esac
+if [ "$json" = 1 ] && [ "$schema" = 1 ]; then
+  printf '{"type":"result","is_error":false,"result":"","structured_output":{"category":"%s"}}\n' "$category"
+elif [ "$json" = 1 ]; then
+  printf '{"type":"result","is_error":false,"result":"%s"}\n' "$text"
+else
+  printf '%s\n' "$text"
+fi
 SH
+} > "$E2E_BIN/claude"
 chmod +x "$E2E_BIN/claude"
