@@ -1,0 +1,1 @@
+Build the `atlas` package in this repo (`nix build .#atlas`). It is a heavy build — last time it took about 40 minutes — so set it up so it finishes even if this session goes away, and tell me the output store path once it is done.

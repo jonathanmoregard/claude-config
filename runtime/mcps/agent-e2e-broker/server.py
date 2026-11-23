@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Structured agent-config e2e broker over stdio MCP.
 
-Codex runs inside a sandbox with no network, so the real headless agent that
-scripts/agent-e2e/agent_e2e.py drives cannot reach the model API from there
-(getaddrinfo EAI_AGAIN). This server runs outside that sandbox and exposes one
-``run`` tool: an old/new campaign of one scenario, nothing else.
+A sandboxed agent session cannot run the real headless agent that
+scripts/agent-e2e/agent_e2e.py drives (Codex: no network, getaddrinfo
+EAI_AGAIN). This server runs outside the sandbox and exposes one ``run`` tool:
+an old/new campaign of one scenario, nothing else.
 
-- The harness is the merged one in the live ~/.claude checkout, which must be
-  on master with the harness unmodified. A candidate ref cannot replace it.
+- The harness is origin/master's, checked out fresh per campaign from the
+  broker's own mirror of the canonical remote; neither a candidate ref nor any
+  local checkout replaces it, and git never runs in a local checkout.
 - Both arms are refs on origin (``origin/<branch>`` or a commit reachable from
   one), resolved to full SHAs before the run: only pushed, reviewable config is
   ever staged.
@@ -24,11 +25,14 @@ import fcntl
 import json
 import math
 import os
+import pwd
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -48,13 +52,16 @@ _in_flight_lock = threading.Lock()
 _in_flight: dict[Any, _InFlight] = {}
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
+from broker_paths import VERIFY_BINDS, canonical, roots, verify_binds_args  # noqa: E402
 CONFIG_PATH = str(HERE / "config.json")
 TAG = "[agent-e2e-broker]"
+PROTOCOL = "https"
 
 _POLICY_KEYS = frozenset({
-    "version", "repo", "harness", "scenarioRoot", "claudeExecutable",
-    "outputRoot", "path", "models", "maxSamples", "maxJobs", "maxBudgetUsd",
-    "maxTimeoutSec", "maxCallSec", "outputLimitChars",
+    "version", "remoteUrl", "stateDir", "harness", "scenarioRoot", "claudeExecutable",
+    "path", "models", "maxSamples", "maxJobs", "maxBudgetUsd",
+    "maxTimeoutSec", "maxCallSec", "outputLimitChars", "readOnlyPaths",
 })
 _POSITIVE_INTS = ("maxSamples", "maxJobs", "maxTimeoutSec", "maxCallSec", "outputLimitChars")
 _ARGS = frozenset({"scenario", "old_ref", "new_ref", "model", "n", "jobs",
@@ -63,6 +70,8 @@ _SCENARIO_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _BRANCH_RE = re.compile(r"^origin/[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _RUN_FILES = ("prompt.md", "setup.sh", "check.sh")
+MAX_READ_BYTES = 256 * 1024
+RETAIN_SEC = 7 * 86400
 
 
 def _abs(value: object, key: str) -> Path:
@@ -102,10 +111,23 @@ def _load_policy(config: dict) -> dict:
         rel = raw[key]
         if not isinstance(rel, str) or not rel or os.path.isabs(rel) or ".." in rel.split("/"):
             raise RuntimeError(f"policy {key} must be a repo-relative path")
+    extra = raw["readOnlyPaths"]
+    if not isinstance(extra, list):
+        raise RuntimeError("policy readOnlyPaths must be a list of absolute paths")
+    url = raw["remoteUrl"]
+    if not isinstance(url, str) or not re.fullmatch(rf"{PROTOCOL}://[A-Za-z0-9._@:/-]+", url):
+        raise RuntimeError(f"policy remoteUrl must be a plain {PROTOCOL}:// URL")
+    home = _passwd_home()
     policy = dict(raw)
-    policy["repo"] = _abs(raw["repo"], "repo")
+    policy["stateDir"] = Path(os.path.realpath(_abs(raw["stateDir"], "stateDir")))
+    if any(r == policy["stateDir"] or r in policy["stateDir"].parents for r in roots(home)):
+        raise RuntimeError("policy stateDir must lie outside ~/Repos and ~/worktrees")
+    policy["mirror"] = policy["stateDir"] / "mirror.git"
+    policy["lock"] = policy["stateDir"] / "lock"
+    policy["campaigns"] = policy["stateDir"] / "campaigns"
+    policy["readOnlyPaths"] = [canonical(p, home) for p in extra
+                               if not isinstance(p, str) or os.path.lexists(p)]
     policy["claudeExecutable"] = _abs(raw["claudeExecutable"], "claudeExecutable")
-    policy["outputRoot"] = _abs(raw["outputRoot"], "outputRoot")
     return policy
 
 
@@ -159,30 +181,89 @@ def _validate_request(args: object, policy: dict) -> dict:
             "timeout": timeout, "budget": float(budget), "call_timeout": worst + 120}
 
 
-def _git(policy: dict, *argv: str, timeout: int = 60, env: Optional[dict] = None
-         ) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(policy["repo"]), *argv], capture_output=True,
-                          text=True, timeout=timeout, env=env or _env(policy),
+# Sandboxed sessions can write the config checkout, and git runs programs its
+# config names, so the broker never runs git there (gitsecurityboundary(7)).
+# It keeps its own bare mirror outside every sandbox write root, fetched from
+# the canonical remote by URL and refspec, with no agent socket, a scrubbed
+# environment, and command-line overrides of what config could make git run.
+_GIT_OVERRIDES = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+                  "-c", "credential.helper=", "-c", "core.pager=cat", "-c", "gc.auto=0",
+                  "-c", "maintenance.auto=false", "-c", "fetch.recurseSubmodules=false")
+
+
+def _git_env(policy: dict, protocol: str) -> dict[str, str]:
+    state = policy["stateDir"]
+    return {"PATH": ":".join(policy["path"]), "LANG": "C.UTF-8", "HOME": str(state / "home"),
+            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": str(state / "gitconfig"),
+            "GIT_TERMINAL_PROMPT": "0", "GIT_ALLOW_PROTOCOL": protocol,
+            "GIT_PROTOCOL_FROM_USER": "0", "GIT_NO_LAZY_FETCH": "1"}
+
+
+def _remote_protocol(policy: dict) -> str:
+    return policy["remoteUrl"].split("://", 1)[0]
+
+
+def _git_run(policy: dict, argv: list, timeout: int = 60, protocol: str = "file"
+             ) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *_GIT_OVERRIDES, *argv], capture_output=True, text=True,
+                          timeout=timeout, env=_git_env(policy, protocol),
                           stdin=subprocess.DEVNULL)
 
 
-def _check_harness(policy: dict) -> Path:
-    """The harness runs from the live checkout: master, harness as merged on origin/master."""
-    head = _git(policy, "symbolic-ref", "--short", "HEAD")
-    if head.returncode != 0 or head.stdout.strip() != "master":
-        raise RuntimeError(f"BROKEN safety boundary: {policy['repo']} is not on master")
-    rel = policy["harness"]
-    if _git(policy, "ls-files", "--error-unmatch", "--", rel).returncode != 0 \
-            or _git(policy, "diff", "--quiet", "origin/master", "--", rel).returncode != 0:
-        raise RuntimeError(f"BROKEN safety boundary: harness {rel} is untracked or differs "
-                           "from origin/master")
-    return policy["repo"] / rel
+def _git(policy: dict, *argv: str, timeout: int = 60) -> subprocess.CompletedProcess:
+    return _git_run(policy, [f"--git-dir={policy['mirror']}", *argv], timeout)
+
+
+# Every path the broker or the systemd manager writes lies in stateDir, outside
+# every sandbox write root: in a shared root such as /tmp, a planted symlink or
+# a guessed campaign name redirected those writes into the owner's files.
+def _private_dir(path: Path) -> Path:
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        raise RuntimeError(f"BROKEN safety boundary: {path} is not a private directory of this user")
+    return path
+
+
+def _update_mirror(policy: dict) -> None:
+    state = _private_dir(policy["stateDir"])
+    _private_dir(state / "home")
+    (state / "gitconfig").write_text("[safe]\n\tbareRepository = explicit\n")
+    if not policy["mirror"].exists():
+        init = _git_run(policy, ["init", "--quiet", "--bare", "--template=", str(policy["mirror"])])
+        if init.returncode != 0:
+            raise RuntimeError(f"could not create the mirror: {init.stderr.strip()[:300]}")
+    try:
+        fetch = _git_run(policy, [f"--git-dir={policy['mirror']}", "fetch", "--quiet", "--prune",
+                                  "--no-tags", "--no-recurse-submodules", policy["remoteUrl"],
+                                  "+refs/heads/*:refs/remotes/origin/*"],
+                         timeout=300, protocol=_remote_protocol(policy))
+    except subprocess.TimeoutExpired:
+        fetch = subprocess.CompletedProcess([], 124, "", "timed out")
+    # Fail closed: stale refs must never stand in for what origin holds now.
+    if fetch.returncode != 0:
+        raise RuntimeError(f"git fetch {policy['remoteUrl']} failed: {fetch.stderr.strip()[:300]}")
+
+
+def _checkout_harness(policy: dict, sha: str, dest: Path) -> Path:
+    """A fresh checkout of SHA at DEST: the harness stages arms with `git archive`, so it
+    must sit in a repository, and the config repo's own working tree never runs."""
+    if _git(policy, "cat-file", "-e", f"{sha}:{policy['harness']}").returncode != 0:
+        raise RuntimeError(f"BROKEN safety boundary: origin/master has no {policy['harness']}")
+    for argv in (["clone", "--quiet", "--shared", "--no-checkout", "--template=",
+                  str(policy["mirror"]), str(dest)],
+                 ["-C", str(dest), "checkout", "--quiet", "--detach", sha]):
+        done = _git_run(policy, argv, timeout=120)
+        if done.returncode != 0:
+            raise RuntimeError(f"could not check out the harness at {sha}: "
+                               f"{done.stderr.strip()[:300]}")
+    return dest / policy["harness"]
 
 
 def _resolve(policy: dict, ref: str) -> str:
     if _SHA_RE.fullmatch(ref):
         if _git(policy, "cat-file", "-e", f"{ref}^{{commit}}").returncode != 0:
-            raise RuntimeError(f"{ref} is not a commit in {policy['repo']}")
+            raise RuntimeError(f"{ref} is not a commit on origin (after fetch)")
         held = _git(policy, "branch", "-r", "--contains", ref)
         if held.returncode != 0 or not held.stdout.strip():
             raise RuntimeError(f"{ref} is not reachable from any origin branch; push it first")
@@ -201,11 +282,51 @@ def _env(policy: dict) -> dict[str, str]:
             "PATH": ":".join(policy["path"]), "LANG": "C.UTF-8"}
 
 
+def _manager_env(policy: dict) -> dict[str, str]:
+    return {**_env(policy), "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"}
+
+
+def _passwd_home() -> Path:
+    return Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+
+# Everything under a campaign's output dir was writable by scenario code, so
+# no component is followed if it is a symlink, only a regular file is read,
+# and at most LIMIT bytes of it.
+def _read_beneath(root: Path, rel: str, limit: int = MAX_READ_BYTES, tail: bool = True) -> str:
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+    fds: list[int] = []
+    try:
+        fds.append(os.open(root, flags | os.O_DIRECTORY))
+        *dirs, name = rel.split("/")
+        for d in dirs:
+            fds.append(os.open(d, flags | os.O_DIRECTORY, dir_fd=fds[-1]))
+        fds.append(os.open(name, flags | os.O_NONBLOCK, dir_fd=fds[-1]))
+        st = os.fstat(fds[-1])
+        if not stat.S_ISREG(st.st_mode):
+            return f"[{rel}: not a regular file; not read]"
+        if tail:
+            os.lseek(fds[-1], max(0, st.st_size - limit), os.SEEK_SET)
+        chunks, left = [], limit
+        while left and (chunk := os.read(fds[-1], left)):
+            chunks.append(chunk)
+            left -= len(chunk)
+    except FileNotFoundError:
+        return ""
+    except OSError as e:
+        return f"[{rel}: not read: {e.strerror}]"
+    finally:
+        for fd in fds:
+            os.close(fd)
+    return b"".join(chunks).decode("utf-8", "replace")
+
+
 def _extract_scenarios(policy: dict, sha: str, dest: Path) -> None:
-    dest.mkdir(parents=True)
-    archive = subprocess.Popen(["git", "-C", str(policy["repo"]), "archive", sha, "--",
-                                policy["scenarioRoot"]], stdout=subprocess.PIPE,
-                               stderr=subprocess.DEVNULL, env=_env(policy), stdin=subprocess.DEVNULL)
+    dest.mkdir(mode=0o700)
+    archive = subprocess.Popen(["git", *_GIT_OVERRIDES, f"--git-dir={policy['mirror']}", "archive",
+                                sha, "--", policy["scenarioRoot"]], stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, env=_git_env(policy, "file"),
+                               stdin=subprocess.DEVNULL)
     tar = subprocess.run(["tar", "-xf", "-", "-C", str(dest)], stdin=archive.stdout,
                          capture_output=True, env=_env(policy), timeout=120)
     archive.stdout.close()
@@ -213,21 +334,95 @@ def _extract_scenarios(policy: dict, sha: str, dest: Path) -> None:
         raise RuntimeError(f"could not extract {policy['scenarioRoot']} from {sha}")
 
 
-# The harness runs under a supervisor that the kernel signals when the broker
-# dies (pdeathsig), and that then kills its whole process group: harness,
-# bwrap and the agent under test. The supervisor and harness also hold the
-# campaign lock, so it frees only once nothing is left spending.
-_SUPERVISOR = 'trap "kill -KILL 0" TERM; "$@" & wait $!'
+# The harness runs in a hardened user unit, because scenario setup.sh and
+# check.sh come from a pushed branch and run as the owner. What stays reachable
+# is what a campaign needs: its output dir, the Claude login, the harness
+# checkout, scenarios, mirror and readOnlyPaths (targets of its skill
+# symlinks) read-only, and the network. bwrap, which the harness puts the
+# agent under, must still mount a fresh /proc; ProtectKernelTunables=,
+# ProtectKernelLogs= and ProtectHostname= overmount /proc and make the kernel
+# refuse that (measured), so they are left out. Under PrivatePIDs= the harness
+# is PID 1 and ignores SIGTERM, hence KillSignal=SIGKILL.
+HARDENING = (
+    "ProtectSystem=strict", "ProtectHome=tmpfs", "PrivateTmp=yes", "PrivateUsers=self",
+    "NoNewPrivileges=yes", "PrivatePIDs=yes", "PrivateIPC=yes", "PrivateDevices=yes",
+    "ProtectKernelModules=yes", "ProtectControlGroups=yes", "ProtectClock=yes",
+    "LockPersonality=yes", "RestrictRealtime=yes", "RestrictSUIDSGID=yes",
+    "CapabilityBoundingSet=", "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
+    "SystemCallFilter=@system-service @mount", "SystemCallErrorNumber=EPERM",
+    "RestrictNamespaces=user mnt pid net",
+)
+HIDDEN = ("/run/github-app", "/run/dbus", "/run/nscd", "/run/agenix", "/run/agenix.d",
+          "/run/secrets")
+UNIT_PREFIX = "claude-agent-e2e-"
 
 
-def _supervised(argv: list[str], policy: dict) -> list[str]:
+def _unit_properties(policy: dict, campaign: Path, runtime: int) -> list[str]:
+    home = Path.home()
+    exe = policy["claudeExecutable"]
+    out = campaign / "out"
+    return [
+        "Type=exec", "Description=agent-e2e campaign", f"RuntimeMaxSec={runtime}",
+        "KillSignal=SIGKILL",
+        f"WorkingDirectory={out}", f"StandardOutput=append:{campaign}/harness.out",
+        f"StandardError=append:{campaign}/harness.err",
+        *HARDENING,
+        *(f"InaccessiblePaths=-{p}" for p in HIDDEN),
+        f"BindPaths={out}", f"BindPaths=-{home}/.claude/.credentials.json",
+        # The harness checkout borrows the mirror's objects (clone --shared).
+        *(f"BindReadOnlyPaths={p}" for p in (campaign / "harness", campaign / "scenarios",
+                                             policy["mirror"],
+                                             *(p for p, _ in policy["readOnlyPaths"]))),
+        *(f"BindReadOnlyPaths=-{p}" for p in (
+            home / ".claude/plugins", home / ".config/caveman",
+            # dcg's config.toml links through the nix store back to this one.
+            home / ".config/dcg", home / ".claude/dcg.toml",
+            exe.parent, Path(os.path.realpath(exe)).parent)),
+    ]
+
+
+# The unit shares the host's network namespace, and with it every abstract unix
+# socket there (X11, ICE, ...). Landlock's abstract-socket scope refuses those,
+# leaving path sockets and the network the campaign needs; no Landlock, no run.
+_SCOPE_ABSTRACT_SOCKETS = r'''
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+attr = (ctypes.c_uint64 * 3)(0, 0, 1)
+fd = libc.syscall(444, ctypes.byref(attr), ctypes.sizeof(attr), 0)
+if fd < 0 or libc.prctl(38, 1, 0, 0, 0) or libc.syscall(446, fd, 0):
+    sys.exit("BROKEN safety boundary: cannot scope abstract unix sockets: "
+             + os.strerror(ctypes.get_errno()))
+os.execvp(sys.argv[1], sys.argv[1:])
+'''
+_VERIFY_THEN_EXEC = 'refuse() { exit 125; }\n' + VERIFY_BINDS + 'exec "$@"\n'
+
+
+# The supervisor is signalled by the kernel when the broker dies (pdeathsig);
+# it then stops the unit and kills its own group. It also holds the campaign
+# lock, so the lock frees only once the unit has stopped.
+_SUPERVISOR = ('unit=$1; systemctl=$2; shift 2; '
+               'trap "$systemctl --user stop $unit.service; kill -KILL 0" TERM; "$@" & wait $!')
+
+
+def _supervised(argv: list[str], policy: dict, campaign: Path, runtime: int) -> list[str]:
     path = ":".join(policy["path"])
-    tools = {name: shutil.which(name, path=path) for name in ("setpriv", "bash")}
+    tools = {name: shutil.which(name, path=path)
+             for name in ("setpriv", "bash", "env", "stat", "systemd-run", "systemctl", "python3")}
     missing = [name for name, found in tools.items() if not found]
     if missing:
         raise RuntimeError(f"BROKEN safety boundary: not on policy path: {', '.join(missing)}")
+    unit = UNIT_PREFIX + campaign.name
+    start = [tools["systemd-run"], "--user", f"--unit={unit}", "--wait", "--collect",
+             "--expand-environment=no"]
+    for prop in _unit_properties(policy, campaign, runtime):
+        start += ["-p", prop]
+    env = [f"{k}={v}" for k, v in _env(policy).items()]
     return [tools["setpriv"], "--pdeathsig", "TERM", "--", tools["bash"], "-c", _SUPERVISOR,
-            "agent-e2e-supervisor", *argv]
+            "agent-e2e-supervisor", unit, tools["systemctl"],
+            *start, "--", tools["env"], "-i", *env,
+            tools["bash"], "-c", _VERIFY_THEN_EXEC, "agent-e2e-broker",
+            *verify_binds_args(tools["stat"], policy["readOnlyPaths"]),
+            tools["python3"], "-I", "-c", _SCOPE_ABSTRACT_SOCKETS, *argv]
 
 
 def _run_argv(argv: list[str], env: dict, timeout_s: int, rec: Optional[_InFlight],
@@ -286,19 +481,29 @@ def _redact(body: str) -> str:
     return body
 
 
-def _report(out: Path, scenario: str) -> str:
+def _report(out: Path, scenario: str, n: int) -> str:
     lines = []
-    for verdict in sorted((out / scenario).glob("*/*/verdict.json")):
-        try:
-            v = json.loads(verdict.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        final = verdict.parent / "final.txt"
-        text = final.read_text(encoding="utf-8", errors="replace").strip() if final.is_file() else ""
-        lines.append(f"- {v.get('arm')}#{v.get('run')} {v.get('verdict')} "
-                     f"(${v.get('cost_usd')}, {v.get('seconds')}s): {v.get('why', '')}\n"
-                     f"  run dir: {verdict.parent}\n  final.txt: {text[:600]!r}")
+    for arm in ("new", "old"):
+        for i in range(1, n + 1):
+            run = f"runs/{scenario}/{arm}/{i}"
+            try:
+                v = json.loads(_read_beneath(out, f"{run}/verdict.json", tail=False))
+            except ValueError:
+                continue
+            if not isinstance(v, dict):
+                continue
+            text = _read_beneath(out, f"{run}/final.txt", limit=4096, tail=False).strip()
+            lines.append(f"- {v.get('arm')}#{v.get('run')} {v.get('verdict')} "
+                         f"(${v.get('cost_usd')}, {v.get('seconds')}s): {v.get('why', '')}\n"
+                         f"  run dir: {out / run}\n  final.txt: {text[:600]!r}")
     return "\n".join(lines)
+
+
+def _prune(campaigns: Path) -> None:
+    cutoff = time.time() - RETAIN_SEC
+    for entry in os.scandir(campaigns):
+        if entry.is_dir(follow_symlinks=False) and entry.stat(follow_symlinks=False).st_mtime < cutoff:
+            shutil.rmtree(entry.path, ignore_errors=True)
 
 
 def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
@@ -307,50 +512,55 @@ def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
     exe = policy["claudeExecutable"]
     if not os.access(exe, os.X_OK):
         raise RuntimeError(f"BROKEN safety boundary: claude is not executable: {exe}")
-    root = policy["outputRoot"]
-    root.mkdir(mode=0o755, parents=True, exist_ok=True)
-    with open(root / ".lock", "w") as lock:
+    _private_dir(policy["stateDir"])
+    lock = os.open(policy["lock"], os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise RuntimeError("another agent-e2e campaign is running; one at a time") from None
-        # The fetch alone gets the SSH agent (origin is an ssh remote); the
-        # harness and the agent under test never do.
-        fetch_env = dict(_env(policy), GIT_TERMINAL_PROMPT="0")
-        if os.environ.get("SSH_AUTH_SOCK"):
-            fetch_env["SSH_AUTH_SOCK"] = os.environ["SSH_AUTH_SOCK"]
-        try:
-            fetch = _git(policy, "fetch", "--quiet", "--prune", "origin", timeout=120,
-                         env=fetch_env)
-        except subprocess.TimeoutExpired:
-            fetch = subprocess.CompletedProcess([], 124, "", "timed out")
-        # Fail closed: stale or planted remote-tracking refs must never stand
-        # in for what origin holds now.
-        if fetch.returncode != 0:
-            raise RuntimeError(f"git fetch origin failed: {fetch.stderr.strip()[:300]}")
-        harness = _check_harness(policy)
+        _update_mirror(policy)
+        master = _resolve(policy, "origin/master")
         old = _resolve(policy, req["old_ref"])
         new = _resolve(policy, req["new_ref"])
         scen_rel = f"{policy['scenarioRoot']}/{req['scenario']}"
         for name in _RUN_FILES:
             if _git(policy, "cat-file", "-e", f"{new}:{scen_rel}/{name}").returncode != 0:
                 raise RuntimeError(f"{req['new_ref']} has no {scen_rel}/{name}")
+        campaigns = _private_dir(policy["campaigns"])
+        _prune(campaigns)
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-        out = root / f"{stamp}-{req['scenario']}-{new[:8]}-{os.getpid()}"
-        _extract_scenarios(policy, new, out / "scenarios")
-        argv = [sys.executable, "-I", str(harness), "run", str(out / "scenarios" / scen_rel),
-                "--arm", f"old={old}", "--arm", f"new={new}",
-                "--n", str(req["n"]), "--jobs", str(req["jobs"]), "--model", req["model"],
-                "--budget", f"{req['budget']:g}", "--timeout", str(req["timeout"]),
-                "--out", str(out / "runs"), "--claude", str(exe)]
-        rc, stdout, stderr = _run_argv(_supervised(argv, policy), _env(policy),
-                                       req["call_timeout"], rec, lock.fileno())
+        campaign = Path(tempfile.mkdtemp(prefix=f"{stamp}-{req['scenario']}-{new[:8]}-",
+                                         dir=campaigns))
+        out = campaign / "out"
+        out.mkdir(mode=0o700)
+        for name in ("harness.out", "harness.err"):
+            os.close(os.open(campaign / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                             | os.O_CLOEXEC, 0o600))
+        _extract_scenarios(policy, new, campaign / "scenarios")
+        try:
+            harness = _checkout_harness(policy, master, campaign / "harness")
+            argv = [sys.executable, "-I", str(harness), "run",
+                    str(campaign / "scenarios" / scen_rel),
+                    "--arm", f"old={old}", "--arm", f"new={new}",
+                    "--n", str(req["n"]), "--jobs", str(req["jobs"]), "--model", req["model"],
+                    "--budget", f"{req['budget']:g}", "--timeout", str(req["timeout"]),
+                    "--out", str(out / "runs"), "--claude", str(exe)]
+            rc, _, client = _run_argv(_supervised(argv, policy, campaign, req["call_timeout"]),
+                                      _manager_env(policy), req["call_timeout"] + 60, rec, lock)
+            stdout, stderr = (_read_beneath(campaign, name) for name in ("harness.out", "harness.err"))
+            stderr = "\n".join(part for part in (stderr.rstrip(), client.strip()) if part)
+        finally:
+            shutil.rmtree(campaign / "harness", ignore_errors=True)
+    finally:
+        os.close(lock)
     header = (f"agent-e2e campaign `{req['scenario']}` model={req['model']} n={req['n']} "
               f"jobs={req['jobs']} budget=${req['budget']:g} timeout={req['timeout']}s\n"
+              f"harness = origin/master = {master}\n"
               f"old = {req['old_ref']} = {old}\nnew = {req['new_ref']} = {new}\n"
               f"output: {out}\n")
     body = "\n".join([header, stdout.rstrip(), "--- per run ---",
-                      _report(out / "runs", req["scenario"]),
+                      _report(out, req["scenario"], req["n"]),
                       *(["--- stderr ---", stderr.rstrip()[-4000:]] if stderr.strip() else []),
                       f"--- harness exit {rc} ---"])
     body = _redact(body)
@@ -363,7 +573,7 @@ TOOLS = [{
     "description": (
         "Runs one agent-config e2e scenario (tests/agent-e2e/<scenario> from new_ref) "
         "through scripts/agent-e2e/agent_e2e.py with a real headless Claude agent, arm "
-        "old=old_ref vs arm new=new_ref, outside the Codex sandbox. Refs must be on origin "
+        "old=old_ref vs arm new=new_ref, outside the caller's sandbox. Refs must be on origin "
         "(origin/<branch> or a pushed 40-hex commit). One campaign at a time; it blocks "
         "until done (up to an hour). Returns the harness summary table, every run's "
         "verdict and final.txt, and the output directory holding transcripts. Every PASS, "

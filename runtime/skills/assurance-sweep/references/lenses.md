@@ -7,11 +7,21 @@ Send the shared preamble, then exactly one lens block.
 ```text
 REPORT dispatch
 Lens: <name>. Repository (read-only): <absolute path> @ <commit>.
+Tier: <production | personal, from the inventory>. On a personal project
+propose no production machinery — observability, alerting, restore
+rehearsals, leak checks, growth measurement — mark those methods n/a, and
+judge "would break" by the owner's own use, not by production load. Neat
+types, clear structure and working tests still apply in full.
 Read first, in full and in this order: <dir>/inventory.md; <recorded
-decisions file>; every earlier lens file in <dir> (do not repeat their
-items).
+rules file>; every decision file in <notes>/decisions/ (keep decisions
+included); every earlier lens file in <dir> (do not repeat their items).
 
-A recorded user decision is not a finding. Verify each item by reading the
+A recorded rule, or a decision to keep something, is not a finding. A
+decision listed under "Decided, not done" is work still to do: report it in
+your lens with its sites and counts, marked `decided`; never SKIP it as
+already decided. Code under "Leaving soon" is skipped even when a decision
+covers it: a decided deletion or replacement is reported by the inventory,
+not by the lenses. Verify each item by reading the
 code path it names; cite file:line. A comment, docstring or test name saying
 something is safe, checked or unreachable is a claim to verify, never
 evidence. Skip code the inventory lists as leaving soon.
@@ -19,14 +29,19 @@ evidence. Skip code the inventory lists as leaving soon.
 
 Where a deterministic tool could do a check you would otherwise do by
 reading, and the project has no such tool, do not propose adding one: name
-the missing tool category under "Not covered".
+the missing tool category under "Not covered". A lens block that names its
+own guard overrides this for that guard only.
 
 Bar for RECOMMEND: builds on how the code already works instead of
 reworking it; focused and minimal; ordinary industry practice; the simplest thing
 that deals with the problem. If the caller of a proposed check, type or lint
-can sidestep it, the item is SKIP.
+can sidestep it, the item is SKIP. A type only a parser can build is not sidestepped
+when a guard keeps it so: one test in the existing suite, using the
+project's own type checker, that fails for every way the language allows to
+build the type outside its parser. Proposed together with that guard, the
+type is not SKIP; proposed without it, it is.
 
-Output, at most 700 words, in this shape:
+Output, at most 700 words unless the lens block sets its own cap, in this shape:
 Coverage: what you read; what you did not.
 Items, ranked by harm prevented over effort, one per line:
   N VERDICT EFFORT title — where (file:line) — what goes wrong today — the
@@ -48,7 +63,7 @@ of something a dependency already in use provides. Look in scripts, test
 helpers, client code and deployment config as well as the main source.
 For each, answer: what happens when the copies diverge? Diverging with harm:
 RECOMMEND one home. Identical but redundant: RECOMMEND only at effort S.
-Separate on purpose — a different trust domain, a recorded decision: SKIP
+Separate on purpose — a different trust domain, a recorded rule or keep decision: SKIP
 with the reason.
 ```
 
@@ -62,11 +77,71 @@ second instance running. For each: name the ordinary way, what adopting it
 removes, and what it costs. Prefer extending a pattern already in this
 codebase over importing a new one. Every item is ADVISE unless it has a
 concrete wrong outcome today. Mark an item CONFIRM when your claim about
-ordinary practice comes from memory. SKIP where a recorded decision chose
+ordinary practice comes from memory. SKIP where a recorded rule or keep decision chose
 the unusual way.
 ```
 
-## 3 — Defect classes
+## 3 — Domain model
+
+```text
+Read the core: the code that decides what the application does, as opposed
+to the adapters that talk to storage, networks, devices, UIs and other
+systems. The inventory says which is which; with no such split, say so and
+treat the whole as core. Count every site, per file, in these categories
+(the Output rule below says how many to cite):
+1. A value whose set is closed carried as a string, integer or boolean. It
+   should be a sum type whose labels say what each value means — not 0..4,
+   not 'a' | 'b' codes — matched exhaustively. Order is no reason to keep
+   numbers: an ordered set is an ordered list of its labels. A range type
+   (category 2) is for quantities, not for a handful of named steps.
+2. A bounded number carried as a plain number. It should be a range type
+   only a parser can build.
+3. An identifier carried as a plain string. Each kind gets its own id type,
+   so two kinds cannot be mixed.
+4. A sentinel for "none" or "unknown" (-1, '', 0, an invented default). It
+   should be an explicit case.
+5. A check, default, cast or non-null assertion inside the core on a value
+   an edge parser should already have settled. Parse once at the edge.
+6. Adapter vocabulary in the core: table, topic, entity, service or endpoint
+   names; wire documents passed through unread; lists of actions or calls
+   for something else to perform. The core holds state, pure updates (an
+   event and the state give the new state) and derivations from state; the
+   adapter reads the world in, saves what changed, and makes the world match.
+7. Names that describe mechanism (plan, args, parts, data, info, manager,
+   handle) where a domain word exists. Take domain words from the user's own
+   words in the recorded rules, decision files and conversation records the inventory
+   names. Return a vocabulary table: each mechanism name, the domain term
+   that replaces it, and where the user used that term; mark a term with no
+   such source.
+For each category give the target type as a short sketch and where its
+parser belongs. The guard described below keeps categories 1 to 4 from
+coming back; it reads the core's exported signatures, with an allowlist whose every
+entry needs a reason. A genuinely open value — text shown to a
+person, real-number arithmetic — is SKIP with that reason. Types narrow what
+the code accepts; they add no runtime machinery, and wire formats stay as
+they are.
+
+The guard needs no new tool: it is one test in the existing suite that uses
+the project's own type checker to read the core's exported signatures, and
+outside their parsers it makes every way of building the new types fail.
+List the ways the language allows and plant one of each as the RED: in
+TypeScript, casts (also through a generic helper), `any` or `unknown`
+flowing in, type predicates and assertion functions, overloads whose
+implementation returns the plain type, `declare` and `.d.ts` declarations,
+`@ts-ignore` / `@ts-expect-error` / `@ts-nocheck`, JSDoc casts in
+JavaScript files, numeric `enum`s (any number assigns to one: use
+string-literal unions), and brands an object literal can spell (brand with
+an unexported `unique symbol`). The checker's configuration covers every file that can
+call the core, tests and scripts included. That is why a type it protects is
+not SKIP for being castable. Recommend the guard as its own item.
+
+Output: one item per category, not per site — per-file counts and at most
+three representative file:line sites — plus one item for the vocabulary
+table and one for the guard. Every item carries a VERDICT. At most 1200
+words.
+```
+
+## 4 — Defect classes
 
 ```text
 From the defect history, group defects into classes: the same root shape at
@@ -87,7 +162,7 @@ how many signatures and call sites it touches, and the failing build or test
 that is the RED.
 ```
 
-## 4 — Races
+## 5 — Races
 
 ```text
 List the operations that change shared state and the invariant each must
@@ -104,7 +179,7 @@ pairs serialised by a lock you can cite, and three-way combinations unless
 no pairwise test can express the bug.
 ```
 
-## 5 — Extrapolation
+## 6 — Extrapolation
 
 ```text
 Find existing tests that would cover materially more for a small edit: a
@@ -117,7 +192,7 @@ it would then catch. New test suites belong to the Venues lens: SKIP them
 here.
 ```
 
-## 6 — Venues
+## 7 — Venues
 
 ```text
 From the defect history: name the recurring classes and how each instance
@@ -126,8 +201,11 @@ each class, which method would have caught it mechanically, and is that
 method present, weak (say how: few cases, happy path only, cannot fail), or
 absent. Rank methods by classes covered over effort. Also check: gates that
 cannot fail (does each trip on a planted defect?); evidence older than the
-code it covers; critical machinery no test touches; growth nobody measured;
-failures nobody is told about. For the top items give first steps: where,
+code it covers; critical machinery no test touches; and, on a production
+project only, growth nobody measured and failures nobody is told about; on a personal
+project write one line in your own reply marking observability, alerting,
+restore rehearsals, leak checks and growth measurement n/a, even when the
+inventory already does, and propose none of them. For the top items give first steps: where,
 how, the invariants, effort, and any decision the user must make. SKIP
 surfaces a trusted third party owns.
 ```
