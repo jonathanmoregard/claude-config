@@ -128,6 +128,10 @@ def grade(run: pathlib.Path, mode: str) -> tuple[int, str]:
                f"alarm_seen={seen} parent_killed={sorted(parent_kills)} "
                f"system_stopped={sorted(system_stopped)} live={live} other_exits={broken}")
     armed = bool(waiters)
+    if 3 in broken and not any((run / "home").glob(".claude/projects/*/*/subagents/agent-*.jsonl")):
+        # No subagent transcript was ever written: the harness did not persist
+        # the session, so wait-for could only say "no transcript". Not a verdict.
+        return 2, summary + " (no subagent transcript persisted)"
     if mode == "stall":
         if armed and fired and seen:
             return 0, summary

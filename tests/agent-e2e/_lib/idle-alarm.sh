@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Shared setup for the idle-alarm-* scenarios: a notify-send stub that logs to
 # RUN/notify.log, a short idle limit (WAIT_FOR_AGENT_IDLE, set through the
-# staged settings.json `env`, which the session and its Bash calls inherit), and
-# a persisted session so subagent transcripts land under ~/.claude/projects.
+# staged settings.json `env`, which the session and its Bash calls inherit).
+# Each scenario also needs an empty `persist-session` marker file: without it
+# subagent transcripts never land under ~/.claude/projects and wait-for exits 3.
 set -euo pipefail
 WORK="${E2E_WORK:?}" RUN="${E2E_RUN:?}" BIN="${E2E_BIN:?}"
 IDLE="${IDLE_ALARM_IDLE:-60}"
