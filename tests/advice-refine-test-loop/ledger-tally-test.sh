@@ -109,10 +109,13 @@ expect "and reported on stderr" "ledger-tally: $ROOT/repo2/review-ledger.tsv:11:
 DEC="$ROOT/decisions.tsv"
 printf 'fp_reason\tdecision\tdate\n' > "$DEC"
 printf 'test-only path\trejected\t2026-11-23\n' >> "$DEC"
-out=$("$TALLY" --root "$ROOT" --decided "$DEC")
+out=$("$TALLY" --root "$ROOT" --decided "$DEC"); rc=$?
+expect "tally with decisions exits 0" 0 "$rc"
+expect "per-check lines still print with decisions" "D3${T}2${T}2${T}1${T}1${T}1${T}0${T}-" "$(line D3)"
 expect "a rejected reason is not proposed" "" "$(grep -E "^exclude\?${T}" <<<"$out")"
 printf 'fp_reason\tdecision\tdate\ntest-only path\taccepted\t2026-11-23\n' > "$DEC"
-out=$("$TALLY" --root "$ROOT" --decided "$DEC")
+out=$("$TALLY" --root "$ROOT" --decided "$DEC"); rc=$?
+expect "tally with an accepted decision exits 0" 0 "$rc"
 expect "an accepted reason is not proposed" "" "$(grep -E "^exclude\?${T}" <<<"$out")"
 printf 'fp_reason\tdecision\tdate\nsome other reason\trejected\t2026-11-23\n' > "$DEC"
 out=$("$TALLY" --root "$ROOT" --decided "$DEC")
@@ -121,8 +124,26 @@ expect "an undecided reason is still proposed" \
 out=$("$TALLY" --root "$ROOT" --decided "$ROOT/missing.tsv")
 expect "a missing decisions file decides nothing" \
   "exclude?${T}test-only path${T}3${T}2" "$(grep -E "^exclude\?${T}" <<<"$out")"
-SHIPPED="$(dirname "$TALLY")/../references/exclusion-decisions.tsv"
-expect "the shipped decisions file exists" yes "$([[ -f $SHIPPED ]] && echo yes)"
+printf 'fp_reason\tdecision\tdate\ntest-only path\tmaybe\t2026-11-23\n' > "$DEC"
+out=$("$TALLY" --root "$ROOT" --decided "$DEC")
+expect "a row with no accepted/rejected decision decides nothing" \
+  "exclude?${T}test-only path${T}3${T}2" "$(grep -E "^exclude\?${T}" <<<"$out")"
+
+# --- with no --decided, the shipped decisions file is read ---------------
+mkdir -p "$ROOT/shipped/x"
+{
+  echo "$header"
+  while IFS=$'\t' read -r reason _; do
+    [[ $reason == fp_reason || -z $reason ]] && continue
+    row s/r1 S refuted - "$reason"; row s/r1 S refuted - "$reason"; row s/r2 S refuted - "$reason"
+  done < "$(dirname "$TALLY")/../references/exclusion-decisions.tsv"
+  for _ in 1 2; do row s/r1 S refuted - "undecided here"; done
+  row s/r2 S refuted - "undecided here"
+} > "$ROOT/shipped/x/review-ledger.tsv"
+out=$("$TALLY" --root "$ROOT/shipped"); rc=$?
+expect "default-path tally exits 0" 0 "$rc"
+expect "every shipped decision is suppressed by default; others still proposed" \
+  "exclude?${T}undecided here${T}3${T}2" "$(grep -E "^exclude\?${T}" <<<"$out")"
 
 if (( fails )); then echo "FAIL: $fails ledger-tally assertion(s)"; exit 1; fi
 echo "PASS: ledger-tally"

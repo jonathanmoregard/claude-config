@@ -55,8 +55,9 @@ Then propose, to the user, never on your own:
 
 Every answer to rule 3, yes or no, also gets a row in
 `exclusion-decisions.tsv` (`fp_reason`, `accepted` or `rejected`, date) in
-the same change. The tally never proposes a listed reason again, so a
-decided category is never put to the user twice.
+the same change. The tally never proposes a listed `fp_reason` again. It
+matches the exact string, so write new rows' `fp_reason` in the wording
+already listed, and never put a listed reason to the user.
 
 `A` cannot be dropped; it is reworded. A change the user accepts goes through
 the normal change process for these files, tally included.

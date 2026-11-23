@@ -8,8 +8,8 @@
 # where propose is drop, reword or -, from the thresholds in ledger.md. Then
 # one line per fp_reason that meets the exclusion threshold:
 #   exclude? reason rows runs
-# A reason listed in the decisions file (the user already accepted or rejected
-# it) is never proposed again. Named checks restrict the per-check lines only.
+# A reason the decisions file marks accepted or rejected (exact fp_reason
+# string) is never proposed again. Named checks restrict the per-check lines only.
 # No ledger files: prints nothing, exits 0. --root defaults to
 # ~/.local/state/claude-tasks, --decided to ../references/exclusion-decisions.tsv.
 set -euo pipefail
@@ -35,7 +35,7 @@ BEGIN {
   n = split(only, w, "\t"); for (i = 1; i <= n; i++) want[w[i]] = 1
   while ((getline line < decided) > 0) {            # fp_reason decision date
     split(line, d, "\t")
-    if (d[1] != "fp_reason" && d[1] != "") done[d[1]] = 1
+    if (d[2] == "accepted" || d[2] == "rejected") done[d[1]] = 1
   }
 }
 FNR == 1 && $1 == "date" { next }                   # header row
