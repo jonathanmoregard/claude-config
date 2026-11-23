@@ -1,0 +1,1 @@
+I'm partway through the advice-refine-test-loop close-out on this branch. Rounds 1 and 2 are done: every finding was adjudicated and is in the review ledger, and round 2's fixes are committed (the last commit). The gate (scripts/check) is green. Round 2's fixes are in, continue the close-out from here; commit any fixes on this branch. I'll merge it myself.
