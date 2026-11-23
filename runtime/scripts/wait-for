@@ -49,7 +49,10 @@
 # launched are read from its own transcript: `systemd-run --unit=`, `wait-for
 # job <slug>` and the jobs broker's start tool. While one of them is still
 # running the agent is waiting on real work, so it is not stalled however long
-# it has been quiet. On a stall it also sends a desktop notification, so the
+# it has been quiet; when one ends, the quiet clock restarts from that moment.
+# Where systemctl cannot reach a user bus (a sandbox), unit state is unknown and
+# counts as not running, so a long job there can raise a false stall; the stall
+# line says so. On a stall it also sends a desktop notification, so the
 # stall is seen even when the parent session is gone.
 #
 # A retained unit keeps its result AND its name: `job` adopts it rather than
@@ -106,9 +109,11 @@ else
     esac
   done
 fi
-case $idle in ''|*[!0-9]*) usage ;; esac
-if [ "$mode" = agent ] && [ -z "$timeout_set" ]; then
-  timeout=$(( idle + 3600 > 14400 ? idle + 3600 : 14400 ))
+if [ "$mode" = agent ]; then
+  # Only `agent` reads the idle limit, so only `agent` rejects a bad one: a
+  # stray WAIT_FOR_AGENT_IDLE must not break the other modes.
+  case $idle in ''|*[!0-9]*) usage ;; esac
+  [ -n "$timeout_set" ] || timeout=$(( idle + 3600 > 14400 ? idle + 3600 : 14400 ))
 fi
 case $timeout in ''|*[!0-9]*) usage ;; esac
 deadline=$(( $(date +%s) + timeout ))
@@ -710,13 +715,15 @@ agent_tool_uses() {
           | select(type == "object" and .type == "tool_use")' "$1" 2>/dev/null
 }
 
-# Units the agent launched: `systemd-run … --unit=<name>` / `--unit <name>`,
-# `wait-for job <slug>`, and the jobs broker's `claude-job-<slug>`.
+# Units the agent launched: `systemd-run … --unit=<name>` / `--unit <name>` /
+# `-u <name>` (a backslash-newline continuation is joined first), `wait-for job
+# <slug>`, and the jobs broker's `claude-job-<slug>`. A name held in a shell
+# variable cannot be read from the transcript and is not found.
 agent_units() {
   agent_tool_uses "$1" | jq -r '
     if .name == "Bash" then
-      (.input.command // "" | tostring) as $c
-      | ([$c | scan("systemd-run[^\n;|&]*?--unit[= ]+[\"\\x27]?([A-Za-z0-9@._:-]+)")]
+      (.input.command // "" | tostring | gsub("\\\\\n"; " ")) as $c
+      | ([$c | scan("systemd-run[^\n;|&]*?(?:--unit[= ]+|[ \t]-u[ \t]+)[\"\\x27]?([A-Za-z0-9@._:-]+)")]
          + [$c | scan("wait-for[ \t]+job[ \t]+([A-Za-z0-9._-]+)")]) | .[][]
     elif .name == "mcp__jobs_broker__start" then
       (.input.slug // empty | tostring | select(test("^[A-Za-z0-9_-]+$")) | "claude-job-" + .)
@@ -725,7 +732,9 @@ agent_units() {
 
 # Background commands the agent launched that have not reported back, one
 # "<task-id><TAB><command>" per line. A launch is the tool result "Command
-# running in background with ID: <id>"; its end is a task notification naming
+# running in background with ID: <id>" of one of its own `run_in_background`
+# Bash calls (that text in any other result, such as a log it read, is not a
+# launch); its end is a task notification naming
 # `<task-id><id></task-id>`, or the agent stopping that task itself. Measured on
 # the 2026-11-22 stall: the worker launched a wait loop in the background, ended
 # its turn ("I'll wait for that notification") and its meta.json read
@@ -739,12 +748,16 @@ agent_pending_tasks() {
     | ($uses | map(select(.id | type == "string")
                    | {key: .id, value: (.input.command // .name // "" | tostring)})
        | from_entries) as $cmd
+    | ($uses | map(select(.name == "Bash" and .input.run_in_background == true
+                          and (.id | type == "string")) | {key: .id, value: true})
+       | from_entries) as $bg
     | ($e | map(.message.content? // empty | tostring) | join("\n")) as $all
     | ($uses | map(select(.name | test("^(TaskStop|KillShell|KillBash)$"))
        | .input | tostring) | join("\n")) as $stops
     | $e[] | select(.type == "user") | .message.content
     | if type == "array" then .[] else empty end
     | select(type == "object" and .type == "tool_result")
+    | select($bg[.tool_use_id // ""] == true)
     | . as $r
     | (.content | if type == "array" then map(.text? // "") | join("") else tostring end)
     | capture("Command running in background with ID: (?<id>[A-Za-z0-9]+)")?
@@ -771,16 +784,21 @@ agent_last_command() {
   printf '%s\n' "${last:-none}"
 }
 
-# Prints the first launched unit still running; returns 1 when none is.
-# A RemainAfterExit unit stays active/exited after its job ends, so
-# active/exited counts as done. An unreadable manager counts as not running:
-# a false stall wakes the parent once, while a false "running" is the silence
-# this mode exists to end.
+# Prints the first launched unit still running and returns 0; returns 1 when
+# none is, 2 when none is known to run but some could not be read. A
+# RemainAfterExit unit stays active/exited after its job ends, so active/exited
+# counts as done. An unreadable manager (no user bus, as inside a sandbox)
+# counts as not running: a false stall wakes the parent once, and its line says
+# the units were unreadable, while a false "running" is the silence this mode
+# exists to end.
 agent_live_unit() {
-  local u snap state sub
+  local u snap state sub unreadable=1
   while IFS= read -r u; do
     [ -n "$u" ] || continue
-    snap=$(systemctl --user show "$u" -p ActiveState -p SubState 2>/dev/null) || continue
+    if ! snap=$(systemctl --user show "$u" -p ActiveState -p SubState 2>/dev/null) ||
+       [ -z "$snap" ]; then
+      unreadable=2; continue
+    fi
     state=$(snapshot_field "$snap" ActiveState)
     sub=$(snapshot_field "$snap" SubState)
     case $state in
@@ -788,7 +806,7 @@ agent_live_unit() {
       active) [ "$sub" = exited ] || { printf '%s\n' "$u"; return 0; } ;;
     esac
   done <<<"$(agent_units "$1")"
-  return 1
+  return "$unreadable"
 }
 
 wait_agent() {
@@ -800,6 +818,7 @@ wait_agent() {
   [ -n "${HOME:-}" ] || { echo "wait-for: HOME is unavailable, cannot find agent $target"; exit 3; }
   local step=$(( idle < 120 ? (idle / 4 > 0 ? idle / 4 : 1) : 30 ))
   local transcript="" meta="" missing=0 now quiet mt mm line pending
+  local last_live=0 units_note rc
   while :; do
     [ -n "$transcript" ] || transcript=$(agent_file .jsonl) || transcript=""
     [ -n "$meta" ] || meta=$(agent_file .meta.json) || meta=""
@@ -824,12 +843,19 @@ wait_agent() {
     mt=$(stat -c %Y -- "$transcript" 2>/dev/null || echo "$now")
     mm=$( [ -n "$meta" ] && stat -c %Y -- "$meta" 2>/dev/null || echo 0)
     [ "$mm" -gt "$mt" ] && mt=$mm
+    # A launched unit seen running is activity: once it ends, the agent gets a
+    # full idle period to wake on its completion before it counts as stalled.
+    [ "$last_live" -gt "$mt" ] && mt=$last_live
     quiet=$(( now - mt ))
     if [ "$quiet" -ge "$idle" ]; then
-      if agent_live_unit "$transcript" >/dev/null; then
+      agent_live_unit "$transcript" >/dev/null; rc=$?
+      if [ "$rc" = 0 ]; then
+        last_live=$now
         nap "$step"; continue  # waiting on a running unit: real work
       fi
-      line="agent $target stalled: no activity for $(( quiet / 60 ))m$(( quiet % 60 ))s (idle limit ${idle}s), no launched unit running; last: $(agent_last_command "$transcript")"
+      units_note="no launched unit running"
+      [ "$rc" = 2 ] && units_note="no launched unit known to run (systemctl could not read some: no user bus?)"
+      line="agent $target stalled: no activity for $(( quiet / 60 ))m$(( quiet % 60 ))s (idle limit ${idle}s), $units_note; last: $(agent_last_command "$transcript")"
       echo "$line"
       notify-send -a "Claude Code" -u critical "Background agent stalled" "$line" >/dev/null 2>&1 || true
       exit 5

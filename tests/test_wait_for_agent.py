@@ -121,10 +121,23 @@ def test_running_unit_holds_off_the_alarm_until_it_ends(tmp_path: Path) -> None:
         bash("~/.claude/scripts/wait-for unit build-x --user", bg=True),
     ], finished=False)
     (Path(env["STUB_DIR"]) / "units" / "build-x").write_text("3")
-    rc, out = run(env, "ddd4", "--idle", "60")
-    assert rc == 5, out
+    # A unit seen running counts as activity, so it is looked at again only
+    # after another full idle period: one poll, no stall within the timeout.
+    rc, out = run(env, "ddd4", "--idle", "60", "--timeout", "2")
+    assert rc == 124, out
     polls = (Path(env["STUB_DIR"]) / "systemctl.log").read_text().split()
-    assert polls.count("build-x") == 4  # three running answers, then exited
+    assert polls.count("build-x") == 1
+    assert notified(env) == ""
+
+
+def test_stall_after_a_unit_ends_counts_from_its_end(tmp_path: Path) -> None:
+    env = make_env(tmp_path)
+    write_agent(tmp_path, "ddd5", [bash("systemd-run --user --unit=build-y -- make")], finished=False)
+    (Path(env["STUB_DIR"]) / "units" / "build-y").write_text("1")
+    started = time.time()
+    rc, out = run(env, "ddd5", "--idle", "2", "--timeout", "20")
+    assert rc == 5, out
+    assert time.time() - started >= 2  # a full idle period after the unit ended
 
 
 def test_units_from_every_launcher_are_checked(tmp_path: Path) -> None:
