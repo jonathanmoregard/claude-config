@@ -53,11 +53,23 @@ def copies() -> dict[str, str]:
     }
 
 
+# The routing phrase each copy must carry, whitespace-normalised: pinning the
+# phrase, not two tokens, so a rewrite that still names both but routes the
+# change elsewhere fails.
+ROUTES = {
+    "runtime/CLAUDE.md": "Codex-only rendering or mapping through `codex/` in the config repo `~/Repos/claude-config`",
+    "settings-management SKILL.md": "For Codex-specific rendering or mappings, change the renderer under `codex/` in the config repo `~/Repos/claude-config`",
+    "path-edit-guard CODEX_REASON": "change Codex-specific rendering under codex/ in the config repo ~/Repos/claude-config",
+    "render_codex CODEX_AGENTS_PREAMBLE": "rendered by the renderer under `codex/` in the claude-config repo",
+}
+
+
 def test_every_routing_copy_names_codex_in_claude_config() -> None:
-    for name, text in copies().items():
+    found = copies()
+    assert found.keys() == ROUTES.keys()
+    for name, text in found.items():
         flat = " ".join(text.split())
-        assert "codex/" in flat, f"{name}: codex/ not named\n{text}"
-        assert "claude-config" in flat, f"{name}: claude-config not named\n{text}"
+        assert ROUTES[name] in flat, f"{name}: routing phrase missing\n{text}"
         assert not RETIRED.search(flat), f"{name}: names ai-client-config\n{text}"
 
 
