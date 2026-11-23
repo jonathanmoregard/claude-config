@@ -11,7 +11,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '_lib'))
 from structured_judge import Inconclusive, judge  # noqa: E402
 
-REPOS = ['claude-config', 'ai-client-config', 'other', 'none']
+REPOS = ['claude-config', 'live-claude-dir', 'ai-client-config', 'other', 'none']
 DIRS = ['codex', 'runtime', 'other', 'none']
 
 INSTRUCTIONS = """You grade one answer. The user asked an assistant: "I want Codex to get my
@@ -25,7 +25,10 @@ as background, or as where output ends up does not count.
 
 Fields:
 - repo: the git repository the answer sends the user to edit.
-  "claude-config" (the config repo, e.g. ~/Repos/claude-config),
+  "claude-config" (the config git repo itself, e.g. ~/Repos/claude-config or a
+  ~/worktrees/claude-* worktree of it),
+  "live-claude-dir" (~/.claude or any path under it: the live read-only
+  projection, not the repo, even if the answer calls it the Claude config),
   "ai-client-config" (a repo named ai-client-config), "other" (any other repo),
   "none" (the answer names no repository to edit, or is ambiguous between several).
 - directory: the top-level directory inside that repository the answer sends

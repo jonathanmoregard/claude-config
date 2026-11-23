@@ -2074,8 +2074,17 @@ def test_report_discloses_research_agent_fallback() -> None:
 # unit and its nix file, the bind-mounted clone, the probe skill, the check's
 # own report line, and this suite's temp-home prefix in rendered paths.
 RETIRED_REPO_NAMES = re.compile(
-    r"ai-client-config(?!-codex-sync|-sync|-repo|-roundtrip-|-skill-probe| check)"
+    r"ai-client-config(?!-codex-sync|-sync|-repo|-roundtrip-|-skill-probe| check (?:OK|FAILED)\b)"
 )
+
+
+def test_retired_repo_exemptions_cover_only_the_names_they_claim() -> None:
+    assert not RETIRED_REPO_NAMES.search("ai-client-config check OK")
+    assert not RETIRED_REPO_NAMES.search("ai-client-config check FAILED: 2 issues")
+    assert not RETIRED_REPO_NAMES.search("ai-client-config-codex-sync.service")
+    assert RETIRED_REPO_NAMES.search("route changes to the ai-client-config checkout")
+    assert RETIRED_REPO_NAMES.search("edit the ai-client-config repository")
+    assert RETIRED_REPO_NAMES.search("ai-client-config checks this")
 
 
 def test_generated_text_never_routes_codex_changes_to_the_retired_repo() -> None:
@@ -2103,6 +2112,7 @@ def test_generated_text_never_routes_codex_changes_to_the_retired_repo() -> None
 
 
 if __name__ == "__main__":
+    test_retired_repo_exemptions_cover_only_the_names_they_claim()
     test_generated_text_never_routes_codex_changes_to_the_retired_repo()
     test_round_trip_matrix_checks_clean_and_rerenders_as_no_op()
     test_unchanged_hourly_run_from_a_staged_home_publishes_nothing()
