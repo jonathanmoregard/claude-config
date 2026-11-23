@@ -33,6 +33,20 @@ import render_codex  # noqa: E402
 
 # Every directory under HOME the render publishes into.
 MANAGED_ROOTS = (".codex", "plugins", ".agents")
+# Runs sync_codex.main() and copies the stage aside once its check has
+# judged it (argv: scripts directory, where to keep the copy).
+KEEP_STAGE_SYNC = """
+import shutil, sys
+sys.path.insert(0, sys.argv[1])
+import check, common, sync_codex
+real = check.main
+def judged():
+    status = real()
+    shutil.copytree(common.STAGE, sys.argv[2], symlinks=True)
+    return status
+check.main = judged
+raise SystemExit(sync_codex.main())
+"""
 # Tools a Claude `mcp__<server>__<tool>` allow approves, per server.
 PER_TOOL_ALLOWS = {
     "git_broker": "git",
@@ -229,11 +243,23 @@ class RoundTrip:
     def check(self) -> subprocess.CompletedProcess[str]:
         return self.run("check.py")
 
-    def render_unchecked(self) -> None:
-        """Publish the render without the check: what a failed sync rolled
-        back, for a test that names the files its check reported."""
-        result = self.run("render_codex.py")
-        assert result.returncode == 0, describe(result)
+    def sync_keeping_stage(self, keep: Path) -> subprocess.CompletedProcess[str]:
+        """sync(), with a copy of the stage its check judged left at keep:
+        what a failed sync never published, for a test that reads the files
+        its check reported, or compares the home with what passed."""
+        return subprocess.run(
+            [sys.executable, "-B", "-c", KEEP_STAGE_SYNC, str(self.repo / "scripts"), str(keep)],
+            env={**os.environ, "HOME": str(self.home)},
+            cwd=self.home,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            stdin=subprocess.DEVNULL,
+        )
+
+    def staged(self, keep: Path, path: Path) -> Path:
+        """Where the kept stage holds the file path names under the home."""
+        return keep / path.relative_to(self.home)
 
     def sync_ok(self) -> None:
         result = self.sync()

@@ -12,8 +12,9 @@ Two independent layers, both must pass:
    function they borrow is the hook fan-out's own plan loader: what it
    rejects, the runtime rejects.
 
-Every read of the output goes through common.located; every path the check
-names is the one under HOME.
+Run by itself, the check judges the home. sync_codex runs it on the stage it
+rendered into, before anything reaches the home: every read of the output
+goes through common.located, and every path it names is the one under HOME.
 """
 from __future__ import annotations
 
@@ -748,8 +749,8 @@ def output_invariant_errors() -> list[str]:
     return errors
 
 
-# The remediation: import, render and this check, rolled back if it fails.
-# render_codex.py alone would publish unchecked.
+# The remediation: import, render into a stage, this check on it, and a
+# publish of only what passed. render_codex.py alone publishes nothing.
 SYNC = REPO / "scripts" / "sync_codex.py"
 
 

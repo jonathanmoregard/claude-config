@@ -176,20 +176,20 @@ def test_a_candidate_hook_disabled_under_codex_fails_the_sync() -> None:
         hooks_root = rt.codex / "hooks"
         for wrapper in wrappers:
             assert wrapper.is_relative_to(hooks_root), f"{wrapper} outside {hooks_root}"
-            # The failed check rolled the run back, so the guarded wrapper it
-            # rendered must not be left published.
-            assert not wrapper.exists(), f"{wrapper} still published after rollback"
+            # The check judged the run's stage and failed it, so the guarded
+            # wrapper it rendered there must never reach the home.
+            assert not wrapper.exists(), f"{wrapper} published despite the failed check"
         assert not any(
             check.HOOK_DISABLE_GUARD in path.read_text(encoding="utf-8")
             for path in hooks_root.rglob("*.sh")
-        ), f"a guarded wrapper survived the rollback\n{describe(result)}"
+        ), f"a guarded wrapper reached the home\n{describe(result)}"
         # Not only the wrappers: the HOME had no Codex output before the run,
-        # so the rollback leaves none of it (config.toml, hooks.json, skills,
-        # the plugin), nor the directories the publish created for it.
+        # and a failed check publishes none of it (config.toml, hooks.json,
+        # skills, the plugin), nor any directory for it.
         left = sorted(snapshot(rt.home))
-        assert left == [], f"the rollback left {len(left)} published paths: {left[:10]}"
+        assert left == [], f"the failed sync published {len(left)} paths: {left[:10]}"
         roots = [name for name in MANAGED_ROOTS if (rt.home / name).exists()]
-        assert roots == [], f"the rollback left {roots} in the HOME"
+        assert roots == [], f"the failed sync left {roots} in the HOME"
 
 
 if __name__ == "__main__":

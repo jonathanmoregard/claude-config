@@ -13,25 +13,35 @@ next sync replaces or prunes it.
 python3 -B codex/scripts/sync_codex.py
 ```
 
-One run does three steps, all against `$HOME`:
+One run does four steps:
 
 1. `import_claude.py` reads `~/.claude` and `~/.claude.json` (read-only) into
    a manifest at `codex/imports/claude-live/manifest.json` (gitignored).
-2. `render_codex.py` builds the render plan from that manifest and publishes
-   it into the managed paths: `~/.codex/{config.toml,rules,scripts,hooks,
-   hooks.json,mcps,agents,skills,AGENTS.md,claude-setup-mirror}`, the
-   `~/.codex/plugins/claude-mirror` link, `~/.agents/plugins` and
-   `~/plugins/claude-mirror` (`managed_paths()` is the list).
-3. `check.py` compares disk with the renderer's own plan and holds the output
-   to safety floors it states independently (permission profile, Git broker,
-   GitHub tool exclusions, no persisted exec-policy allow rule, no hook the
-   blanket disable guard turns off, ...). The sync exits non-zero if it fails.
+2. `render_codex.py` builds the render plan from that manifest and writes it
+   into a fresh stage directory, laid out like the managed paths:
+   `~/.codex/{config.toml,rules,scripts,hooks,hooks.json,mcps,agents,skills,
+   AGENTS.md,claude-setup-mirror}`, the `~/.codex/plugins/claude-mirror` link,
+   `~/.agents/plugins` and `~/plugins/claude-mirror` (`managed_paths()` is the
+   list). The output still names those paths under `$HOME`; `common.located`
+   is the one place that maps them into the stage.
+3. `check.py` judges the stage: it compares it with the renderer's own plan
+   and holds it to safety floors it states independently (permission profile,
+   Git broker, GitHub tool exclusions, no persisted exec-policy allow rule, no
+   hook the blanket disable guard turns off, ...).
+4. Only if the check passed, `sync_codex.publish_stage` copies the stage into
+   the managed paths under `$HOME`, pruning what the stage does not hold.
 
-Production renders into a staged home, checks it, and publishes only what
-passed. A direct run renders in place (the output names absolute paths under
-`$HOME`), then checks; when the check fails it puts every managed path back
-as it was before the run, `config.toml` included, and exits 1. The importer's
-manifest is still updated.
+A failed check, an error or a stop before step 4 leaves `$HOME` exactly as it
+was; the sync exits non-zero, and only the importer's manifest is updated. The
+copy has no rollback: a run killed during it can leave a mix of the previous
+and the new render, each checked, which the next run repairs. One run at a
+time per home; a second one exits 75 and changes nothing. `render_codex.py`
+run by itself publishes nothing and names `sync_codex.py`; `check.py` run by
+itself judges `$HOME`.
+
+Production (nixos-config `home/ai-client-config-sync.nix`) runs the same
+sync inside a mount namespace whose `$HOME` is a staged home, and rsyncs the
+managed paths into the live home only after it exits 0.
 
 `~/.codex/<name>.config.toml` files, which `codex --profile <name>` layers over
 `config.toml`, are outside the mirror: the sync neither writes nor removes

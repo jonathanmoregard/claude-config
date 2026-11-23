@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 import ast
 import datetime as dt
@@ -12,12 +11,9 @@ import os
 from pathlib import Path
 import re
 import shlex
-import shutil
-import signal
 import sys
-import tempfile
 import tomllib
-from typing import Any, Callable, Iterator
+from typing import Any, Callable
 
 from common import (
     AGENTS_HOME,
@@ -40,7 +36,6 @@ from common import (
     located,
     mkdir,
     remove_path,
-    replace_entry,
     toml_array,
     toml_scalar,
     toml_string,
@@ -593,10 +588,8 @@ def prepare_skills(
 
 
 def publish_prepared_skills(prepared: tuple[tuple[Path, str], ...]) -> None:
-    """Publish every wrapper, or on failure leave both skill roots as they were."""
-    with rollback_paths_on_error([dst for dst, _ in prepared]):
-        for dst, text in prepared:
-            publish_wrapper_skill(dst, text)
+    for dst, text in prepared:
+        publish_wrapper_skill(dst, text)
 
 
 def render_skills(
@@ -857,8 +850,7 @@ def wrong_type_path(path: Path, *, directory: bool = False) -> Path | None:
 
 def make_room(path: Path, *, directory: bool = False) -> None:
     """Remove what stands in the way of putting path. Codex config is a
-    mirror: a wrong type is replaced like wrong content, with no copy kept.
-    render_plan_paths holds it, so a failed publish puts it back."""
+    mirror: a wrong type is replaced like wrong content, with no copy kept."""
     blocking = wrong_type_path(path, directory=directory)
     if blocking is not None:
         remove_path(blocking)
@@ -885,18 +877,10 @@ def put_tree(src: Path, dst: Path) -> None:
 
 def publish_hook_generation(files: dict[Path, str]) -> None:
     # Active Codex sessions can retain dispatcher paths from an older hooks.json.
-    # These files are content-addressed: add deltas, never prune prior generations.
-    # A file that still matches its address yet differs from the plan is a
-    # real digest collision with a generation a session may run: refuse. One
-    # that no longer matches its address was damaged after publication and no
-    # session can rely on it: rewrite it, so the next sync repairs the drift.
-    for path, text in files.items():
-        if (
-            path.is_file()
-            and path.read_bytes() != text.encode("utf-8")
-            and hook_file_matches_its_address(path)
-        ):
-            raise ValueError(f"content-addressed hook collision: {path}")
+    # These files are content-addressed: add deltas, never prune prior
+    # generations. A sync renders into a fresh stage holding none of them;
+    # sync_codex.publish_stage, which sees the home's, refuses a digest
+    # collision with one.
     for path, text in files.items():
         put_file(path, text, mode=0o755 if path.suffix == ".sh" else None)
 
@@ -2027,8 +2011,9 @@ def stable_hook_script_files(plan: RenderPlan) -> dict[Path, str]:
 
 def merge_input_text(path: Path) -> str | None:
     """A merge input's text, or None when no regular file stands there:
-    the production wrapper carries one into its staged home only if
-    `[ -f ]`, and anything else at the path is the mirror's to replace."""
+    the production wrapper, and sync_codex.seed_stage, carry one into the
+    stage only if it is a file, and anything else at the path is the
+    mirror's to replace."""
     on_disk = located(path)
     return on_disk.read_text(encoding="utf-8") if on_disk.is_file() else None
 
@@ -2252,7 +2237,8 @@ def managed_paths() -> tuple[Path, ...]:
     """Every path the mirror owns, the production publish's managed_paths.
 
     /etc/nixos/home/ai-client-config-sync.nix renders into a home built from
-    scratch and rsyncs each of these over the live one with --delete-after.
+    scratch and rsyncs each of these over the live one with --delete-after;
+    sync_codex.publish_stage copies each from its stage the same way.
     Codex config is a mirror of the Claude config: inside these paths the
     render plan is the whole truth, so anything else there is pruned and
     anything of the wrong type or content replaced, with no backup. Outside
@@ -2334,8 +2320,9 @@ def unplanned_paths(plan: RenderPlan) -> list[Path]:
 def beside_managed_path(root: Path) -> list[Path]:
     """What sits beside a managed path but counts as inside it: a *.bak-*,
     as in the production publish, which prunes those too, and the holder a
-    run killed inside replace_entry (.<name>.swap-*) or put_file
-    (.<name>.tmp-*) left there, perhaps with the original moved aside."""
+    run killed inside replace_entry (.<name>.swap-*) or write_file
+    (.<name>.tmp-*) left there, perhaps with the original moved aside: a
+    publish copying a stage into the home, or a render in place."""
     parent = located(root.parent)
     if not parent.is_dir():
         return []
@@ -2513,7 +2500,7 @@ def prepare_render_plan(
             announce=announce,
         )
 
-    # Fail before any live write; publish_config renders again against the
+    # Fail before any write; publish_config renders again against the
     # file as it is then.
     render_config(existing_config, announce=False)
     rules_path = CODEX / "rules" / "default.rules"
@@ -2572,198 +2559,6 @@ def prepare_render_plan(
     return plan
 
 
-def outermost_paths(paths: list[Path]) -> list[Path]:
-    result: list[Path] = []
-    for path in sorted(set(paths), key=lambda item: (len(item.parts), str(item))):
-        if not any(parent == path or parent in path.parents for parent in result):
-            result.append(path)
-    return result
-
-
-def restore_snapshot_entry(path: Path, kind: str, saved: Path | str) -> None:
-    """Put one snapshot entry back at path without removing path first
-    (replace_entry): a Codex session starting meanwhile finds it in place."""
-
-    def build(staged: Path) -> None:
-        if kind == "symlink":
-            staged.symlink_to(str(saved), target_is_directory=True)
-        elif kind == "directory":
-            shutil.copytree(Path(saved), staged, symlinks=True)
-        else:
-            shutil.copy2(Path(saved), staged)
-
-    replace_entry(path, build)
-
-
-# What stops a run (systemd, a closed terminal, Ctrl-C); see rollback_paths_on_error.
-STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
-
-
-def release_stop_signals(held: set[signal.Signals], *, deliver: bool) -> None:
-    """Put back the signal mask held was taken from, first dropping any
-    stop signal pending unless it is to be delivered now."""
-    if not deliver:
-        for signum in signal.sigpending() & set(STOP_SIGNALS):
-            handler = signal.getsignal(signum)
-            # Ignoring a pending signal discards it.
-            signal.signal(signum, signal.SIG_IGN)
-            if handler is not None:
-                signal.signal(signum, handler)
-    signal.pthread_sigmask(signal.SIG_SETMASK, held)
-
-
-@contextmanager
-def rollback_paths_on_error(paths: list[Path]) -> Iterator[None]:
-    """Snapshot paths, and put them back if the block raises anything, an
-    interrupt (KeyboardInterrupt, SystemExit) included: it leaves as
-    half-published a mirror as an error does.
-
-    The snapshot is scratch, removed once the block stands or the rollback
-    has restored everything. A rollback that itself fails keeps it, with
-    snapshot.json mapping each entry to the path it came from, and raises
-    naming it, chained to the failure that started the rollback.
-
-    STOP_SIGNALS are held off for the whole rollback, whatever started it,
-    so a stop cannot leave the restore half done; one that came meanwhile
-    is delivered once the restore has finished, as is one whose handler
-    ran as the rollback started. After a rollback that failed it is dropped
-    instead: the run is ending on the error naming the snapshot, which the
-    stop would otherwise replace.
-    """
-    # The mask to put back, taken before the block: a stop handler can run
-    # inside the rollback's own SIG_BLOCK, which then returns nothing.
-    held = signal.pthread_sigmask(signal.SIG_BLOCK, [])
-    targets = outermost_paths(paths)
-    missing_parents: set[Path] = set()
-    for target in targets:
-        parent = target.parent
-        while parent != parent.parent and not parent.exists():
-            missing_parents.add(parent)
-            parent = parent.parent
-
-    snapshot_root = Path(tempfile.mkdtemp(prefix="codex-render-rollback-"))
-    snapshots: dict[Path, tuple[str, Path | str]] = {}
-    try:
-        for index, path in enumerate(targets):
-            snapshot = snapshot_root / str(index)
-            if path.is_symlink():
-                snapshots[path] = ("symlink", os.readlink(path))
-            elif path.is_dir():
-                shutil.copytree(path, snapshot, symlinks=True)
-                snapshots[path] = ("directory", snapshot)
-            elif path.exists():
-                shutil.copy2(path, snapshot)
-                snapshots[path] = ("file", snapshot)
-        # json, not dump_json: publication serializes nothing of the plan.
-        (snapshot_root / "snapshot.json").write_text(
-            json.dumps(
-                [
-                    {
-                        "path": str(path),
-                        "kind": kind,
-                        ("target" if kind == "symlink" else "snapshot"): (
-                            str(saved) if kind == "symlink" else Path(saved).name
-                        ),
-                    }
-                    for path, (kind, saved) in snapshots.items()
-                ],
-                indent=2,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-    except BaseException:
-        shutil.rmtree(snapshot_root, ignore_errors=True)
-        raise
-
-    try:
-        yield
-    except BaseException as failure:
-        # A stop that came after the block failed runs its handler at
-        # Python's next signal check, inside pthread_sigmask at the latest
-        # (CPython checks there): its exit waits for the restore.
-        stopped: BaseException | None = None
-        while True:
-            try:
-                signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
-                break
-            except (SystemExit, KeyboardInterrupt) as stop:
-                stopped = stop
-        restored = False
-        try:
-            try:
-                # Restored in place, so a Codex session starting now never finds
-                # config.toml or hooks.json missing; then what the run added goes.
-                for path, (kind, saved) in snapshots.items():
-                    restore_snapshot_entry(path, kind, saved)
-                for path in targets:
-                    if path not in snapshots and (path.exists() or path.is_symlink()):
-                        remove_path(path)
-            except Exception as error:
-                raise RuntimeError(
-                    f"rollback failed: {type(error).__name__}: {error}; the pre-publish "
-                    f"snapshot is kept at {snapshot_root} (snapshot.json maps it)"
-                ) from failure
-            restored = True
-            shutil.rmtree(snapshot_root, ignore_errors=True)
-            # Parents the publish created, deepest first, once nothing is left
-            # in them; one that still holds something was never the publish's
-            # alone. Tidying only: one that cannot go is reported, never raised
-            # over the failure that started the rollback.
-            for parent in sorted(missing_parents, key=lambda item: len(item.parts), reverse=True):
-                try:
-                    if parent.is_dir() and not parent.is_symlink() and not any(parent.iterdir()):
-                        parent.rmdir()
-                except OSError as error:
-                    print(
-                        f"codex render rollback: left {parent}, which this run "
-                        f"created: {type(error).__name__}: {error}",
-                        file=sys.stderr,
-                    )
-        finally:
-            # A stop held off above is delivered here once the restore is
-            # complete, and dropped after one that failed (see above).
-            release_stop_signals(held, deliver=restored)
-        if stopped is not None:
-            raise stopped
-        raise
-    shutil.rmtree(snapshot_root, ignore_errors=True)
-
-
-def render_plan_paths(plan: RenderPlan) -> list[Path]:
-    """What a publish may change, for the rollback set: every managed path
-    but config.toml (see publish_config) and what beside_managed_path names.
-
-    A managed path holding a never-pruned one is taken entry by entry around
-    it, so the rollback cannot touch what the publish leaves alone; the
-    paths the plan adds there come on top: this hook generation's files and
-    whatever stands in their way, and the skill wrappers.
-    """
-    kept = set(never_pruned_paths())
-
-    def around(path: Path) -> list[Path]:
-        real_dir = path.is_dir() and not path.is_symlink()
-        if path in kept:
-            return [] if real_dir else [path]
-        if real_dir and any(path in other.parents for other in kept):
-            return [entry for child in sorted(path.iterdir()) for entry in around(child)]
-        return [path]
-
-    paths: list[Path] = []
-    for root in managed_paths():
-        if root != CODEX / "config.toml":
-            paths.extend(around(root))
-        paths.extend(beside_managed_path(root))
-    paths.extend(plan.hook_wrapper_files)
-    paths.extend(
-        blocking
-        for path in plan.hook_wrapper_files
-        if (blocking := wrong_type_path(path)) is not None
-    )
-    paths.extend(dst for dst, _ in plan.skill_wrappers)
-    return paths
-
-
 def canonical(value: Any) -> str:
     # Order-insensitive and nan-safe: Codex may reorder tables when it saves.
     def sort(node: Any) -> Any:
@@ -2777,9 +2572,8 @@ def canonical(value: Any) -> str:
 
 
 def publish_config(plan: RenderPlan) -> None:
-    # config.toml is outside the rollback set and written last but one: Codex
-    # writes runtime state into it at any time, and restoring a snapshot would
-    # discard that. The merge runs against the file as it is right now.
+    # Written last but one, and merged against the file as it is right now:
+    # Codex writes runtime state into it at any time.
     path = CODEX / "config.toml"
     live = merge_input_text(path) or ""
     rendered = plan.render_config(live)
@@ -2794,35 +2588,33 @@ def publish_config(plan: RenderPlan) -> None:
     put_file(path, rendered)
 
 
-def publish_render_plan(plan: RenderPlan, *, rollback: bool = True) -> None:
-    """rollback=False is for a caller whose own rollback covers
-    render_plan_paths (sync_codex): one nested in it would keep a snapshot
-    of its own, and name it, when it failed and the caller's restored."""
-    with rollback_paths_on_error(render_plan_paths(plan)) if rollback else nullcontext():
-        ensure_legacy_plugin_link()
-        for path, text in stable_hook_script_files(plan).items():
-            put_file(path, text, mode=0o755)
-        publish_hook_generation(plan.hook_wrapper_files)
-        if plan.mcp_assets:
-            publish_mcp_assets(plan.mcp_assets)
-        for root in sorted(planned_entries(plan)[1]):
-            put_dir(root)
-        publish_references(plan.reference_links)
-        for path, text in plan.agent_role_files.items():
-            put_file(path, text)
-        put_file(CODEX / "rules" / "default.rules", plan.execpolicy_text)
-        update_marketplace(plan.marketplace_text)
-        render_plugin(plan.manifest, plan.mcp, plan.hooks, plan.plugin_files)
-        for path, text in plan.report_files.items():
-            put_file(path, text)
-        put_file(CODEX / "AGENTS.md", plan.agents_text)
-        publish_prepared_skills(plan.skill_wrappers)
-        publish_config(plan)
-        put_file(CODEX / "hooks.json", plan.codex_hooks_text)
-        # Last, as the production publish prunes after its transfer: nothing
-        # the new entry points name is gone before they are in place.
-        for path in unplanned_paths(plan):
-            remove_path(path)
+def publish_render_plan(plan: RenderPlan) -> None:
+    """Write the plan where common.located puts the output: into a stage
+    for sync_codex, which checks it before anything reaches the home."""
+    ensure_legacy_plugin_link()
+    for path, text in stable_hook_script_files(plan).items():
+        put_file(path, text, mode=0o755)
+    publish_hook_generation(plan.hook_wrapper_files)
+    if plan.mcp_assets:
+        publish_mcp_assets(plan.mcp_assets)
+    for root in sorted(planned_entries(plan)[1]):
+        put_dir(root)
+    publish_references(plan.reference_links)
+    for path, text in plan.agent_role_files.items():
+        put_file(path, text)
+    put_file(CODEX / "rules" / "default.rules", plan.execpolicy_text)
+    update_marketplace(plan.marketplace_text)
+    render_plugin(plan.manifest, plan.mcp, plan.hooks, plan.plugin_files)
+    for path, text in plan.report_files.items():
+        put_file(path, text)
+    put_file(CODEX / "AGENTS.md", plan.agents_text)
+    publish_prepared_skills(plan.skill_wrappers)
+    publish_config(plan)
+    put_file(CODEX / "hooks.json", plan.codex_hooks_text)
+    # Last, as the production publish prunes after its transfer: nothing
+    # the new entry points name is gone before they are in place.
+    for path in unplanned_paths(plan):
+        remove_path(path)
 
 
 # Drift is the inverse of publish_render_plan: each step there has its
@@ -2996,17 +2788,22 @@ def render_plan_drift(plan: RenderPlan) -> list[str]:
     return errors
 
 
+# The one way to publish: import, render into a stage, check it, and copy
+# into the home only what passed.
+SYNC = REPO / "scripts" / "sync_codex.py"
+
+
 def load_render_plan() -> RenderPlan:
     manifest = load_json(MANIFEST, {})
     if not manifest:
-        # The checked sync, as check.py advises: import, then this script,
+        # The checked sync, as check.py advises: import, then a render,
         # would publish unchecked.
-        raise SystemExit(f"missing manifest; run {REPO / 'scripts' / 'sync_codex.py'}")
+        raise SystemExit(f"missing manifest; run {SYNC}")
     return prepare_render_plan(manifest, load_support())
 
 
-def publish(plan: RenderPlan, *, rollback: bool = True) -> None:
-    publish_render_plan(plan, rollback=rollback)
+def publish(plan: RenderPlan) -> None:
+    publish_render_plan(plan)
     print(
         "rendered Codex: "
         f"skills={len(plan.skills)} "
@@ -3017,9 +2814,12 @@ def publish(plan: RenderPlan, *, rollback: bool = True) -> None:
 
 
 def main() -> int:
+    """Render the manifest where common.located puts the output: the stage
+    sync_codex checks before it publishes."""
     publish(load_render_plan())
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # Run alone, this rendered into the home unchecked.
+    raise SystemExit(f"render_codex.py publishes nothing by itself; run {SYNC}")

@@ -1,53 +1,71 @@
 #!/usr/bin/env python3
-"""Import ~/.claude, render ~/.codex, check it; publish only what passes.
+"""Import ~/.claude, render it into a stage, check the stage, and publish
+only what passed.
+
+The output names absolute paths under HOME (hook commands, wrappers, role
+files, link targets), so it is rendered for HOME but written elsewhere: the
+render and the check run under common.staged_output, where every write and
+every read of the output lands in a fresh stage directory (common.located)
+while every path the output names stays the one under HOME. The stage is
+seeded with what the render merges and the check reads from outside the
+mirror (seed_stage).
+
+Nothing writes to HOME before the check has passed: a failed check, an
+error, or a stop signal or kill before publish_stage leaves the home as it
+was. (SIGTERM, SIGHUP or SIGKILL leaves the stage behind in TMPDIR.) Then
+publish_stage copies the managed paths from the stage into HOME, entry by
+entry and each atomically, with no rollback: a run killed during the copy
+can leave a mix of files from the previous render and this one, each from a
+render whose check passed, which the next run repairs. Codex writes runtime
+state into config.toml; a write between seed_stage and the copy is lost.
 
 Production (/etc/nixos/home/ai-client-config-sync.nix) runs this inside a
 mount namespace whose HOME is a staged home, and rsyncs the managed paths
-into the live home only after it exits 0. A direct run renders in place,
-since the output names absolute paths under HOME (hook commands, wrappers,
-role files), so it publishes first and checks the result: a failed check
-rolls every path the publish may change back to what was there before the
-run, config.toml included, as production's backup restore does. So does
-SIGTERM, SIGHUP or SIGINT before the check has passed.
+into the live home only after it exits 0; there, this run's copy lands in
+that staged home.
 
-One direct run at a time per home: a second one that snapshotted the
-first's unchecked output would restore it after its own failed check.
+One direct run at a time per home: two copies at once could interleave into
+a mix of files neither run checked, while both report success.
 """
 from __future__ import annotations
 
 import fcntl
 import os
-import signal
+from pathlib import Path
+import shutil
 import sys
-from types import FrameType
+import tempfile
 
 import check
 import common
 import import_claude
 import render_codex
+from common import AGENTS_HOME, CODEX, PLUGIN_ROOT
 
 
-class CheckFailed(Exception):
-    """The published output failed the check; the rollback undoes it."""
-
-
-STOP_SIGNALS = render_codex.STOP_SIGNALS
 # The home itself, locked as a directory: a lock file would be left behind
-# in a home whose first run failed, which the rollback leaves without ~/.codex.
+# in a home that held nothing before a failed run.
 LOCK = common.HOME
 # EX_TEMPFAIL: another run holds the home; this one changed nothing.
 BUSY = 75
-
-
-def stop(signum: int, frame: FrameType | None) -> None:
-    """A stop signal as an exception, so the rollback runs: by default
-    SIGTERM and SIGHUP end the process without unwinding, and the unchecked
-    output would stay live. The rollback ends the run with any stop only
-    once it has restored, one this raised as it started included; a repeat
-    after this is ignored."""
-    for other in STOP_SIGNALS:
-        signal.signal(other, signal.SIG_IGN)
-    raise SystemExit(128 + signum)
+# What the render merges, carried into the stage as the production wrapper
+# carries it into its staged home.
+MERGE_INPUTS = (
+    CODEX / "config.toml",
+    CODEX / "rules" / "default.rules",
+    AGENTS_HOME / "plugins" / "marketplace.json",
+)
+# What Codex reads first and what names the rest: copied once everything
+# they name is in place, and before the prune, as the production publish
+# orders its two rsync passes.
+ENTRY_POINTS = (
+    CODEX / "config.toml",
+    CODEX / "hooks.json",
+    AGENTS_HOME / "plugins" / "marketplace.json",
+    PLUGIN_ROOT / ".codex-plugin" / "plugin.json",
+    PLUGIN_ROOT / ".mcp.json",
+    PLUGIN_ROOT / "hooks.json",
+)
 
 
 def main() -> int:
@@ -67,29 +85,104 @@ def main() -> int:
 
 
 def sync() -> int:
-    for signum in STOP_SIGNALS:
-        # One the caller ignores (nohup) stays ignored.
-        if signal.getsignal(signum) is not signal.SIG_IGN:
-            signal.signal(signum, stop)
     import_claude.main()
-    plan = render_codex.load_render_plan()
-    # config.toml is outside the publish's own rollback set, because Codex
-    # writes runtime state into it; a failed check restores it anyway. A
-    # Codex write to it between the publish and the check is lost.
-    paths = [*render_codex.render_plan_paths(plan), render_codex.CODEX / "config.toml"]
-    try:
-        # The only rollback: the publish's own would nest in this one.
-        with render_codex.rollback_paths_on_error(paths):
-            render_codex.publish(plan, rollback=False)
-            if check.main() != 0:
-                raise CheckFailed
-    except CheckFailed:
-        print(
-            "ai-client-config sync: check failed; every managed path is back "
-            "as it was before this run"
-        )
-        return 1
+    with tempfile.TemporaryDirectory(prefix="codex-sync-stage-") as stage_name:
+        stage = Path(stage_name)
+        seed_stage(stage)
+        with common.staged_output(stage):
+            render_codex.main()
+            passed = check.main() == 0
+        if not passed:
+            print("ai-client-config sync: check failed; nothing was published")
+            return 1
+        publish_stage(stage)
     return 0
+
+
+def seed_stage(stage: Path) -> None:
+    """Copy into stage the merge inputs, and the profiles the check floors
+    (~/.codex/<name>.config.toml, outside the mirror), from the home. A
+    regular file only, a link followed: anything else at a merge input is
+    the mirror's to replace, and no profile Codex can load."""
+    for path in (*MERGE_INPUTS, *sorted(CODEX.glob("*.config.toml"))):
+        if path.is_file():
+            target = common.in_stage(path, stage)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+
+
+def publish_stage(stage: Path) -> None:
+    """Make the home's managed paths what they are in stage: files by bytes
+    and mode, links by target, directories by mode. What
+    render_codex.never_pruned_paths names is never pruned: the hook
+    generations live sessions may run are only added to, and Codex's bundled
+    skills, which no stage holds, are left alone."""
+    refuse_hook_collisions(stage)
+    for root in render_codex.managed_paths():
+        copy_into_home(root, stage, skip=ENTRY_POINTS)
+    for path in ENTRY_POINTS:
+        copy_into_home(path, stage)
+    for root in render_codex.managed_paths():
+        prune_home(root, stage)
+        for leftover in render_codex.beside_managed_path(root):
+            common.remove_path(leftover)
+
+
+def refuse_hook_collisions(stage: Path) -> None:
+    """A home hook file that still matches its address yet differs from the
+    stage's is a real digest collision with a generation a session may run:
+    refuse, before anything is copied. One that no longer matches its
+    address was damaged after publication and no session can rely on it:
+    the copy rewrites it."""
+    root = render_codex.HOOK_WRAPPER_ROOT
+    staged_root = common.in_stage(root, stage)
+    for staged in sorted(staged_root.rglob("*")):
+        path = root / staged.relative_to(staged_root)
+        if (
+            staged.is_file()
+            and path.is_file()
+            and path.read_bytes() != staged.read_bytes()
+            and render_codex.hook_file_matches_its_address(path)
+        ):
+            raise ValueError(f"content-addressed hook collision: {path}")
+
+
+def copy_into_home(path: Path, stage: Path, skip: tuple[Path, ...] = ()) -> None:
+    """Put at path what stage holds there, recursively: add and replace,
+    each entry atomically (common.replace_entry), never remove."""
+    if path in skip:
+        return
+    staged = common.in_stage(path, stage)
+    if staged.is_dir() and not staged.is_symlink():
+        if not (path.is_dir() and not path.is_symlink()):
+            common.replace_entry(path, lambda entry: entry.mkdir())
+        mode = staged.stat().st_mode & 0o7777
+        if path.stat().st_mode & 0o7777 != mode:
+            path.chmod(mode)
+        for name in sorted(os.listdir(staged)):
+            copy_into_home(path / name, stage, skip)
+    elif staged.exists() or staged.is_symlink():
+        if common.entry_state(staged) != common.entry_state(path):
+            common.replace_entry(
+                path, lambda entry: shutil.copy2(staged, entry, follow_symlinks=False)
+            )
+
+
+def prune_home(path: Path, stage: Path) -> None:
+    """Remove what the home holds at or under path that stage does not,
+    never a never-pruned path or what holds one."""
+    kept = render_codex.never_pruned_paths()
+    if path in kept:
+        return
+    staged = common.in_stage(path, stage)
+    if path.is_dir() and not path.is_symlink() and (
+        (staged.is_dir() and not staged.is_symlink())
+        or any(path in other.parents for other in kept)
+    ):
+        for name in sorted(os.listdir(path)):
+            prune_home(path / name, stage)
+    elif (path.exists() or path.is_symlink()) and not (staged.exists() or staged.is_symlink()):
+        common.remove_path(path)
 
 
 if __name__ == "__main__":

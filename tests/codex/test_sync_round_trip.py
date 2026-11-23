@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from roundtrip_support import (  # noqa: E402
     LEAF_KINDS,
+    Entry,
     Inputs,
     RoundTrip,
     assert_check_fails,
@@ -313,9 +314,9 @@ def test_the_stage_holds_every_managed_path_and_what_sits_beside_it() -> None:
 # Where a backup machinery used to keep what the sync removed. The mirror
 # keeps none: nothing may appear there or beside a replaced file.
 BACKUP_ROOT = Path(".local/state/ai-client-config-sync/backups")
-# What the rollback tests snapshot: the published roots, and .local, where a
-# backup root used to appear.
-ROLLBACK_SNAPSHOT_ROOTS = (".codex", "plugins", ".agents", ".local")
+# What a test of a sync that changes nothing snapshots: the published roots,
+# and .local, where a backup root used to appear.
+HOME_SNAPSHOT_ROOTS = (".codex", "plugins", ".agents", ".local")
 USER_SKILL_TEXT = "---\nname: demo-skill\ndescription: mine, hand written\n---\n\nMy own steps.\n"
 
 
@@ -366,9 +367,9 @@ def test_sync_replaces_a_hand_made_skill_at_a_planned_name_without_backup() -> N
         assert files_holding(rt.home, b"my notes\n") == []
         assert_nothing_backed_up(rt.home)
 
-        before = snapshot(rt.home, ROLLBACK_SNAPSHOT_ROOTS)
+        before = snapshot(rt.home, HOME_SNAPSHOT_ROOTS)
         rt.sync_ok()
-        assert snapshot(rt.home, ROLLBACK_SNAPSHOT_ROOTS) == before
+        assert snapshot(rt.home, HOME_SNAPSHOT_ROOTS) == before
 
 
 def test_sync_prunes_skills_the_plan_does_not_hold_but_not_codex_system_skills() -> None:
@@ -400,21 +401,24 @@ def test_sync_prunes_skills_the_plan_does_not_hold_but_not_codex_system_skills()
         assert_nothing_backed_up(rt.home)
 
 
+# Runs sync_codex.main() with a render that fails once the skills are written.
 FAIL_AFTER_SKILL_PUBLISH = """
-import render_codex
+import sys
+sys.path.insert(0, sys.argv[1])
+import render_codex, sync_codex
 
 def fail(plan):
     raise RuntimeError("injected failure after the skill publish")
 
 render_codex.publish_config = fail
-raise SystemExit(render_codex.main())
+raise SystemExit(sync_codex.main())
 """
 
 
-def assert_publish_fails_after_the_skill_publish(rt: RoundTrip) -> None:
+def assert_sync_fails_after_the_skill_publish(rt: RoundTrip) -> None:
     failed = subprocess.run(
-        [sys.executable, "-B", "-c", FAIL_AFTER_SKILL_PUBLISH],
-        env={**os.environ, "HOME": str(rt.home), "PYTHONPATH": str(rt.repo / "scripts")},
+        [sys.executable, "-B", "-c", FAIL_AFTER_SKILL_PUBLISH, str(rt.repo / "scripts")],
+        env={**os.environ, "HOME": str(rt.home)},
         cwd=rt.home,
         capture_output=True,
         text=True,
@@ -425,27 +429,27 @@ def assert_publish_fails_after_the_skill_publish(rt: RoundTrip) -> None:
     assert "injected failure after the skill publish" in failed.stderr, describe(failed)
 
 
-def test_failed_publish_restores_the_skill_it_replaced() -> None:
-    # Rollback is generator-state recovery: a later step failing puts back
-    # what the publish replaced, like every other publish write.
+def test_a_sync_whose_render_fails_part_way_leaves_the_skill_it_would_replace() -> None:
+    # The render writes into the stage only: one failing after the skill
+    # wrappers were written there has published none of them.
     with round_trip() as rt:
         replace_with_users_own_skill(rt.codex / "skills" / "demo-skill")
-        before = snapshot(rt.home, ROLLBACK_SNAPSHOT_ROOTS)
-        assert_publish_fails_after_the_skill_publish(rt)
-        assert snapshot(rt.home, ROLLBACK_SNAPSHOT_ROOTS) == before
+        before = snapshot(rt.home, HOME_SNAPSHOT_ROOTS)
+        assert_sync_fails_after_the_skill_publish(rt)
+        assert snapshot(rt.home, HOME_SNAPSHOT_ROOTS) == before
 
 
 def test_sync_replaces_a_regular_file_at_a_planned_wrapper_name() -> None:
-    # A file where the sync publishes a wrapper directory: a failed publish
-    # puts it back, a successful one replaces it with no copy kept.
+    # A file where the sync publishes a wrapper directory: a failed sync
+    # leaves it, a successful one replaces it with no copy kept.
     with round_trip() as rt:
         skill_dir = rt.codex / "skills" / "demo-skill"
         wrapper = (skill_dir / "SKILL.md").read_bytes()
         shutil.rmtree(skill_dir)
         skill_dir.write_text("my notes\n", encoding="utf-8")
-        before = snapshot(rt.home, ROLLBACK_SNAPSHOT_ROOTS)
-        assert_publish_fails_after_the_skill_publish(rt)
-        assert snapshot(rt.home, ROLLBACK_SNAPSHOT_ROOTS) == before
+        before = snapshot(rt.home, HOME_SNAPSHOT_ROOTS)
+        assert_sync_fails_after_the_skill_publish(rt)
+        assert snapshot(rt.home, HOME_SNAPSHOT_ROOTS) == before
 
         result = rt.sync()
         assert result.returncode == 0, describe(result)
@@ -632,10 +636,12 @@ def test_mirror_prunes_every_unplanned_path_inside_the_managed_paths_only() -> N
 
 
 def test_sync_prunes_what_a_killed_run_left_beside_a_managed_path() -> None:
-    # A run killed (SIGKILL) inside replace_entry or put_file leaves its
-    # holder, perhaps with the original moved aside, beside the path it
-    # was replacing. Inside a managed directory the walk prunes it; beside a
-    # top-level managed path (~/.codex/.hooks.json.swap-*) nothing did.
+    # A run killed (SIGKILL) inside replace_entry, as the publish copies the
+    # checked stage into the home, leaves its holder, perhaps with the
+    # original moved aside, beside the path it was replacing; a render in
+    # place killed inside write_file left its temporary file. Inside a
+    # managed directory the prune removes them; beside a top-level managed
+    # path (~/.codex/.hooks.json.swap-*) nothing did.
     with round_trip() as rt:
         swap = Path(tempfile.mkdtemp(prefix=".hooks.json.swap-", dir=rt.codex))
         (swap / "aside").write_text("{}\n", encoding="utf-8")
@@ -645,7 +651,7 @@ def test_sync_prunes_what_a_killed_run_left_beside_a_managed_path() -> None:
         os.close(fd)
         left = {swap, plugin_swap, Path(name)}
 
-        # A failed check puts them back with the rest of the home.
+        # A failed check leaves them, with the rest of the home.
         profile = rt.codex / "p.config.toml"
         profile.write_text('approval_policy = "on-request"\n', encoding="utf-8")
         before = snapshot(rt.home, ("",))
@@ -762,9 +768,9 @@ def test_sync_repairs_generator_owned_hook_paths_of_the_wrong_type() -> None:
             assert (rt.codex / "scripts" / "codex_hook_fanout.py").is_file(), label
 
 
-def test_paths_cleared_for_the_wrong_type_are_replaced_and_rolled_back() -> None:
+def test_paths_of_the_wrong_type_are_replaced_only_by_a_sync_that_passes() -> None:
     # What stands where the sync installs its own file is replaced with no
-    # copy kept; a publish that fails later still puts it back.
+    # copy kept; a sync whose render fails leaves it where it was.
     def directory_at_a_wrapper(rt: RoundTrip) -> Path:
         root = rt.codex / "hooks" / "claude-mirror"
         path = next(
@@ -793,9 +799,9 @@ def test_paths_cleared_for_the_wrong_type_are_replaced_and_rolled_back() -> None
         with round_trip() as rt:
             published = hook_generation_files(rt)
             damage(rt)
-            before = snapshot(rt.home, ROLLBACK_SNAPSHOT_ROOTS)
-            assert_publish_fails_after_the_skill_publish(rt)
-            assert snapshot(rt.home, ROLLBACK_SNAPSHOT_ROOTS) == before, label
+            before = snapshot(rt.home, HOME_SNAPSHOT_ROOTS)
+            assert_sync_fails_after_the_skill_publish(rt)
+            assert snapshot(rt.home, HOME_SNAPSHOT_ROOTS) == before, label
 
             result = rt.sync()
             assert result.returncode == 0, describe(result)
@@ -975,26 +981,52 @@ def test_sync_rewrites_a_stable_hook_script_whose_content_differs() -> None:
             assert path.stat().st_mode & 0o111
 
 
-def test_hook_publication_still_refuses_a_genuine_address_collision() -> None:
+# Publishes the stage at argv 2 into the home: the copy step of a sync whose
+# check passed.
+PUBLISH_STAGE = """
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import sync_codex
+sync_codex.publish_stage(Path(sys.argv[2]))
+"""
+
+
+def test_the_publish_refuses_a_genuine_hook_address_collision() -> None:
     # A file whose own content hashes to its name is a generation a live Codex
     # session may still run. A different text claiming the same name is a
-    # real collision: overwriting would change that session's hook.
-    # SHA-256 cannot be made to collide here, so hand publish a different text
-    # for a path whose current content is a valid generation, as a colliding
-    # digest would.
+    # real collision: overwriting would change that session's hook. Only the
+    # publish sees the home's generations, the stage being rendered fresh.
+    # SHA-256 cannot be made to collide here, so hand the publish a stage
+    # holding a different text for a path whose current content is a valid
+    # generation, as a colliding digest would.
     with round_trip() as rt:
         files = hook_generation_files(rt)
+        (rt.codex / "AGENTS.md").write_text("hand edit\n", encoding="utf-8")
         for path in (
             next(p for p in files if p.name.startswith("stop-") and "-fanout-" not in p.name and "-plan-" not in p.name),
             next(p for p in files if p.parent.name.startswith("runtime-")),
         ):
-            try:
-                render_codex.publish_hook_generation({path: "#!/usr/bin/env bash\necho other\n"})
-            except ValueError as exc:
-                assert str(exc) == f"content-addressed hook collision: {path}", exc
-            else:
-                raise AssertionError(f"a genuine collision at {path} was overwritten")
-            assert path.read_bytes() == files[path]
+            stage = rt.home.parent / f"stage-{path.name}"
+            for root in (".codex", ".agents", "plugins"):
+                shutil.copytree(rt.home / root, stage / root, symlinks=True)
+            # The stage would also repair AGENTS.md; refused, it repairs nothing.
+            (stage / ".codex" / "AGENTS.md").write_text("rendered\n", encoding="utf-8")
+            rt.staged(stage, path).write_text("#!/usr/bin/env bash\necho other\n", encoding="utf-8")
+            before = snapshot(rt.home, ("",))
+            result = subprocess.run(
+                [sys.executable, "-B", "-c", PUBLISH_STAGE, str(rt.repo / "scripts"), str(stage)],
+                env={**os.environ, "HOME": str(rt.home)},
+                cwd=rt.home,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                stdin=subprocess.DEVNULL,
+            )
+            assert result.returncode != 0, describe(result)
+            last = result.stderr.strip().splitlines()[-1]
+            assert last == f"ValueError: content-addressed hook collision: {path}", describe(result)
+            assert snapshot(rt.home, ("",)) == before, path
 
 
 def test_sync_removes_rules_files_it_does_not_generate() -> None:
@@ -1053,9 +1085,9 @@ def test_sync_prunes_role_and_rules_files_it_does_not_render_without_backup() ->
             assert files_holding(rt.home, text.encode()) == [], text
         assert_nothing_backed_up(rt.home)
 
-        before = snapshot(rt.home, ROLLBACK_SNAPSHOT_ROOTS)
+        before = snapshot(rt.home, HOME_SNAPSHOT_ROOTS)
         rt.sync_ok()
-        assert snapshot(rt.home, ROLLBACK_SNAPSHOT_ROOTS) == before
+        assert snapshot(rt.home, HOME_SNAPSHOT_ROOTS) == before
 
 
 def test_sync_strips_a_network_allow_codex_persisted() -> None:
@@ -1082,12 +1114,12 @@ def test_nested_allow_fails_closed_with_an_actionable_message() -> None:
             + 'if True:\n    prefix_rule(pattern=["sh"], decision="allow")\n',
             encoding="utf-8",
         )
-        for _ in range(2):
-            result = rt.sync()
+        for attempt in range(2):
             # As rendered: the render may reflow the text around its block,
-            # and the failed sync rolled its output back.
-            rt.render_unchecked()
-            line = rules.read_text(encoding="utf-8").splitlines().index(
+            # and the failed sync published nothing; read the stage it checked.
+            stage = rt.home.parent / f"stage-{attempt}"
+            result = rt.sync_keeping_stage(stage)
+            line = rt.staged(stage, rules).read_text(encoding="utf-8").splitlines().index(
                 '    prefix_rule(pattern=["sh"], decision="allow")'
             ) + 1
             assert result.returncode == 1, describe(result)
@@ -1186,15 +1218,16 @@ def test_hook_command_invariants_read_the_generated_wrappers() -> None:
     guarded = '[ -n "${CODEX_CLAUDE_MIRROR_ENABLE_HOOKS:-}" ] || exit 0; echo stopped'
     inputs = Inputs(hooks={"Stop": [{"hooks": [{"type": "command", "command": guarded}]}]})
     with round_trip(inputs, synced=False) as rt:
-        results = (rt.sync(), rt.sync())
-        # The failed syncs rolled their output back; name what they checked.
-        rt.render_unchecked()
-        for result in results:
+        # The failed syncs published nothing; read the stage each checked.
+        for attempt in range(2):
+            stage = rt.home.parent / f"stage-{attempt}"
+            result = rt.sync_keeping_stage(stage)
             assert result.returncode == 1, describe(result)
-            wrapper = next(
-                path
-                for path in hook_generation_files(rt)
-                if path.suffix == ".sh" and guarded in path.read_text(encoding="utf-8")
+            assert not (rt.codex / "hooks").exists(), describe(result)
+            wrapper = rt.codex / next(
+                path.relative_to(stage / ".codex")
+                for path in (stage / ".codex" / "hooks" / "claude-mirror").rglob("*.sh")
+                if guarded in path.read_text(encoding="utf-8")
             )
             assert f"- {wrapper}: hook wrapper contains the blanket disable guard" in (
                 result.stdout
@@ -1296,12 +1329,13 @@ def test_a_claude_matcher_the_fan_out_cannot_compile_fails_the_sync() -> None:
         ]
     }
     with round_trip(Inputs(hooks=hooks), synced=False) as rt:
-        result = rt.sync()
+        stage = rt.home.parent / "stage"
+        result = rt.sync_keeping_stage(stage)
         assert result.returncode == 1, describe(result)
-        # The failed sync rolled its output back; name what it checked.
-        rt.render_unchecked()
-        plan = next(
-            path for path in hook_generation_files(rt) if path.name.startswith("pretooluse-plan-")
+        # The failed sync published nothing; name the plan its check read.
+        plan = rt.codex / next(
+            path.relative_to(stage / ".codex")
+            for path in (stage / ".codex" / "hooks" / "claude-mirror").glob("pretooluse-plan-*")
         )
         assert f"- {plan}: handlers[0].matcher is not a valid regex: " in result.stdout, (
             describe(result)
@@ -1441,17 +1475,16 @@ def test_profile_config_files_cannot_loosen_the_session() -> None:
 
 
 def test_a_direct_sync_whose_check_fails_leaves_the_home_as_it_was() -> None:
-    # Production checks a staged home and publishes only what passed; a
-    # direct run publishes in place, so a failed check must undo the publish.
-    # The importer's manifest, under the repository, is the one thing the
-    # run changes.
+    # A direct run renders into a stage and copies into the home only what
+    # its check passed: a failed check publishes nothing. The importer's
+    # manifest, under the repository, is the one thing the run changes.
     with round_trip() as rt:
-        # Give the publish something to do: a new Claude skill, and drift in
-        # the managed paths, config.toml included.
+        # Give the render something to publish: a new Claude skill, and drift
+        # in the managed paths, config.toml included.
         skill = rt.home / ".claude" / "skills" / "new-skill" / "SKILL.md"
         skill.parent.mkdir(parents=True)
         skill.write_text(
-            "---\nname: new-skill\ndescription: Use when testing rollback.\n---\n",
+            "---\nname: new-skill\ndescription: Use when testing a failed check.\n---\n",
             encoding="utf-8",
         )
         (rt.codex / "AGENTS.md").write_text("hand edit\n", encoding="utf-8")
@@ -1482,37 +1515,68 @@ def test_a_direct_sync_whose_check_fails_leaves_the_home_as_it_was() -> None:
         assert (rt.codex / "skills" / "new-skill" / "SKILL.md").is_file()
 
 
-def test_check_remediation_names_the_checked_sync() -> None:
-    # The check's advice is what a user runs next: it must name a script that
-    # exists, and the one that checks and rolls back, not the bare renderer,
-    # which publishes unchecked.
-    with round_trip() as rt:
-        sync = rt.repo / "scripts" / "sync_codex.py"
-        assert sync.is_file(), sync
-        (rt.home / ".claude" / "CLAUDE.md").write_text("changed\n", encoding="utf-8")
-        result = assert_check_fails(rt, "Claude source drift detected")
-        drift = next(line for line in result.stdout.splitlines() if "source drift" in line)
-        assert drift.endswith(f"run {sync}"), drift
-
-        rt.manifest.unlink()
-        result = assert_check_fails(rt, "unusable")
-        unusable = next(line for line in result.stdout.splitlines() if "unusable" in line)
-        assert unusable.endswith(f"run {sync}"), unusable
+def under(key: str, roots: tuple[Path, ...]) -> bool:
+    path = Path(key)
+    return any(path == root or root in path.parents for root in roots)
 
 
-def test_render_without_a_manifest_names_the_checked_sync() -> None:
-    # The renderer's own advice named the importer: following it (import,
-    # then render_codex.py again) publishes unchecked.
-    with round_trip() as rt:
-        rt.manifest.unlink()
-        result = rt.run("render_codex.py")
-        assert result.returncode != 0, describe(result)
-        missing = result.stderr.strip().splitlines()[-1]
-        assert missing.endswith(f"run {rt.repo / 'scripts' / 'sync_codex.py'}"), missing
+def mirrored(state: dict[str, Entry]) -> dict[str, Entry]:
+    """A snapshot's entries the publish makes equal to the stage: inside the
+    managed paths, less what it never prunes."""
+    return {
+        key: entry
+        for key, entry in state.items()
+        if under(key, PUBLISH_MANAGED_PATHS) and not under(key, PUBLISH_NEVER_PRUNED_PATHS)
+    }
+
+
+def test_a_direct_sync_publishes_exactly_the_stage_its_check_passed() -> None:
+    # The check judges the stage; the publish makes the home's managed paths
+    # equal to it. So what the home held there before, unsafe content the
+    # check would reject included, is neither judged nor kept, while what the
+    # publish never prunes, and everything outside the managed paths, stays.
+    with round_trip(RICH_INPUTS) as rt:
+        unsafe = {
+            rt.codex / "rules" / "extra.rules": 'prefix_rule(pattern=["rm"], decision="allow")\n',
+            rt.codex / "agents" / "rogue.toml": 'name = "rogue"\napproval_policy = "on-request"\n',
+            rt.codex / "skills" / "junk" / "SKILL.md": "Mirrored from Claude skill:\n",
+            rt.codex / "config.toml.bak-20260101-000000": "model = 'old'\n",
+        }
+        kept = {
+            rt.codex / "hooks" / "claude-mirror" / "stop-000000000000000000000000.sh": "echo old\n",
+            rt.codex / "skills" / ".system" / "imagegen" / "SKILL.md": "bundled\n",
+            rt.codex / "auth.json": "{}\n",
+        }
+        for path, text in {**unsafe, **kept}.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+        (rt.codex / "AGENTS.md").write_text("hand edit\n", encoding="utf-8")
+        (rt.codex / "AGENTS.md").chmod(0o600)
+        rt.edit_config(lambda config: config.pop("features"))
+        assert_check_fails(rt, *(str(path) for path in unsafe))
+
+        stage = rt.home.parent / "stage"
+        result = rt.sync_keeping_stage(stage)
+        assert result.returncode == 0, describe(result)
+        assert "ai-client-config check OK" in result.stdout, describe(result)
+        published = snapshot(rt.home)
+        assert mirrored(published) == mirrored(snapshot(stage)), describe(result)
+        for path, text in kept.items():
+            assert path.read_text(encoding="utf-8") == text, path
+        generations = {
+            key: entry
+            for key, entry in snapshot(stage).items()
+            if under(key, PUBLISH_NEVER_PRUNED_PATHS)
+        }
+        assert generations and generations.items() <= published.items()
+        assert rt.check().returncode == 0
+
+        rt.sync_ok()
+        assert snapshot(rt.home) == published
 
 
 # Runs sync_codex.main() with the check parked until a signal arrives: the
-# publish is live and unchecked when the parent sends it.
+# render is done and its stage unchecked when the parent sends it.
 PARKED_CHECK_SYNC = """
 import signal, sys
 sys.path.insert(0, sys.argv[1])
@@ -1526,18 +1590,16 @@ raise SystemExit(sync_codex.main())
 """
 
 
-def test_a_direct_sync_stopped_during_its_check_leaves_the_home_as_it_was() -> None:
-    # SIGTERM (systemd stop, timeout) or SIGHUP (a closed terminal) between
-    # the publish and the end of the check killed the run without unwinding:
-    # the unchecked output stayed live, and a later failed run rolled back to
-    # it. Signalled, the run rolls back like a failed check. SIGINT (Ctrl-C)
-    # too, ending with the same 128 + signal status as the other two.
+def test_a_direct_sync_stopped_before_it_publishes_leaves_the_home_as_it_was() -> None:
+    # SIGTERM (systemd stop, timeout), SIGHUP (a closed terminal), SIGINT
+    # (Ctrl-C) or SIGKILL during the check: the render wrote only to its
+    # stage, so whatever ends the run there, the home is as it was.
     with round_trip() as rt:
         (rt.codex / "AGENTS.md").write_text("hand edit\n", encoding="utf-8")
         (rt.codex / "hooks.json").unlink()
         rt.edit_config(lambda config: config.pop("features"))
         before = snapshot(rt.home, ("",))
-        for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT, signal.SIGKILL):
             sync = subprocess.Popen(
                 [sys.executable, "-B", "-c", PARKED_CHECK_SYNC, str(rt.repo / "scripts")],
                 env={**os.environ, "HOME": str(rt.home)},
@@ -1553,156 +1615,44 @@ def test_a_direct_sync_stopped_during_its_check_leaves_the_home_as_it_was() -> N
                 output.append(line)
                 if line.strip() == "CHECK PARKED":
                     break
-            assert snapshot(rt.home, ("",)) != before, "".join(output)
+            parked = snapshot(rt.home, ("",))
             sync.send_signal(signum)
             output.append(sync.communicate(timeout=60)[0])
             context = f"{signum.name} rc={sync.returncode}\n{''.join(output)}"
-            assert sync.returncode == 128 + signum, context
-            after = snapshot(rt.home, ("",))
-            changed = sorted(
-                key for key in before.keys() | after.keys() if before.get(key) != after.get(key)
-            )
-            assert changed == [], (changed, context)
+            assert sync.returncode != 0, context
+            for state in (parked, snapshot(rt.home, ("",))):
+                changed = sorted(
+                    key for key in before.keys() | state.keys() if before.get(key) != state.get(key)
+                )
+                assert changed == [], (changed, context)
+        rt.sync_ok()
+        assert (rt.codex / "hooks.json").is_file()
 
 
-# Runs sync_codex.main() with a failing check, and signals itself from inside
-# the rollback that failure starts, at the first entry it restores.
-SIGNALLED_ROLLBACK_SYNC = """
-import os, signal, sys
-sys.path.insert(0, sys.argv[1])
-import check, render_codex, sync_codex
-check.main = lambda: 1
-real = render_codex.restore_snapshot_entry
-calls = []
-def restore(*args, **kwargs):
-    calls.append(args)
-    if len(calls) == 1:
-        os.kill(os.getpid(), getattr(signal, sys.argv[2]))
-    return real(*args, **kwargs)
-render_codex.restore_snapshot_entry = restore
-raise SystemExit(sync_codex.main())
-"""
-
-
-def test_a_signal_during_a_failed_checks_rollback_waits_for_the_restore() -> None:
-    # A failed check starts the rollback with the stop handlers still armed:
-    # SIGTERM in the restore raised past it, leaving the home half restored
-    # and the snapshot unnamed in TMPDIR. The rollback finishes first; the
-    # signal still ends the run.
-    with round_trip() as rt:
-        (rt.codex / "AGENTS.md").write_text("hand edit\n", encoding="utf-8")
-        (rt.codex / "hooks.json").unlink()
-        rt.edit_config(lambda config: config.pop("features"))
-        before = snapshot(rt.home, ("",))
-        for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
-            scratch = rt.home.parent / f"tmp-{signum.name}"
-            scratch.mkdir()
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "-B",
-                    "-c",
-                    SIGNALLED_ROLLBACK_SYNC,
-                    str(rt.repo / "scripts"),
-                    signum.name,
-                ],
-                env={**os.environ, "HOME": str(rt.home), "TMPDIR": str(scratch)},
-                cwd=rt.home,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            context = f"{signum.name} {describe(result)}"
-            assert result.returncode == 128 + signum, context
-            after = snapshot(rt.home, ("",))
-            changed = sorted(
-                key for key in before.keys() | after.keys() if before.get(key) != after.get(key)
-            )
-            assert changed == [], (changed, context)
-            assert list(scratch.iterdir()) == [], context
-
-
-# Runs sync_codex.main() with a publish that fails once config.toml is
-# written, and a rollback whose first copy fails.
-FAILED_ROLLBACK_SYNC = """
-import shutil, sys
-sys.path.insert(0, sys.argv[1])
-import render_codex, sync_codex
-state = {"rolling_back": False, "copies_failed": 0}
-real_publish_config = render_codex.publish_config
-def publish_config(plan):
-    real_publish_config(plan)
-    state["rolling_back"] = True
-    raise OSError("injected publication failure")
-render_codex.publish_config = publish_config
-real_copy2 = shutil.copy2
-def copy2(*args, **kwargs):
-    if state["rolling_back"] and not state["copies_failed"]:
-        state["copies_failed"] += 1
-        raise OSError("injected restore failure")
-    return real_copy2(*args, **kwargs)
-shutil.copy2 = copy2
-raise SystemExit(sync_codex.main())
-"""
-
-
-def test_a_direct_syncs_failed_rollback_names_one_snapshot_of_all_it_changed() -> None:
-    # The publish's own rollback nested inside the sync's: when the inner
-    # one failed, the outer restored the home, yet the run ended sending
-    # the user to the inner snapshot, which lacks config.toml, and left it
-    # in TMPDIR for good. One rollback: what it names is all there is.
-    with round_trip() as rt:
-        (rt.codex / "AGENTS.md").write_text("hand edit\n", encoding="utf-8")
-        rt.edit_config(lambda config: config.pop("features"))
-        scratch = rt.home.parent / "tmp"
-        scratch.mkdir()
-        result = subprocess.run(
-            [sys.executable, "-B", "-c", FAILED_ROLLBACK_SYNC, str(rt.repo / "scripts")],
-            env={**os.environ, "HOME": str(rt.home), "TMPDIR": str(scratch)},
-            cwd=rt.home,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        context = describe(result)
-        assert result.returncode != 0, context
-        failed = [line for line in result.stderr.splitlines() if "rollback failed" in line]
-        assert failed, context
-        kept = Path(failed[-1].split("snapshot is kept at ", 1)[1].split()[0])
-        assert list(scratch.iterdir()) == [kept], (sorted(scratch.iterdir()), context)
-        entries = json.loads((kept / "snapshot.json").read_text(encoding="utf-8"))
-        assert str(rt.config) in {entry["path"] for entry in entries}, entries
-
-
-# Runs sync_codex.main() parked until a line on stdin: in its check (argv 2
-# "check", after the publish) or before its publish (after the snapshot).
-PARKED_SYNC = """
+# Runs sync_codex.main() parked until a line on stdin as it starts to publish.
+PARKED_PUBLISH_SYNC = """
 import sys
 sys.path.insert(0, sys.argv[1])
-import check, render_codex, sync_codex
-def parking(name, real):
-    def parked(*args, **kwargs):
-        print(name + " PARKED", flush=True)
-        sys.stdin.readline()
-        return real(*args, **kwargs)
-    return parked
-if sys.argv[2] == "check":
-    check.main = parking("CHECK", check.main)
-else:
-    render_codex.publish = parking("PUBLISH", render_codex.publish)
+import sync_codex
+real = sync_codex.publish_stage
+def parked(*args, **kwargs):
+    print("PUBLISH PARKED", flush=True)
+    sys.stdin.readline()
+    return real(*args, **kwargs)
+sync_codex.publish_stage = parked
 raise SystemExit(sync_codex.main())
 """
 
 
-def test_overlapping_direct_syncs_leave_the_home_as_it_was() -> None:
-    # A published and parked in its failing check; B snapshotted that
-    # unchecked output; A restored; B published, failed and restored A's
-    # output. Both said the home was back as it was. One run at a time.
-    def start(rt: RoundTrip, where: str) -> subprocess.Popen[str]:
-        return subprocess.Popen(
-            [sys.executable, "-B", "-c", PARKED_SYNC, str(rt.repo / "scripts"), where],
+def test_a_second_direct_sync_changes_nothing_while_one_holds_the_home() -> None:
+    # Two publishes copying into the same home at once could interleave
+    # into a mix of their files that neither checked, each reporting OK.
+    # One run at a time: a second one exits EX_TEMPFAIL, having changed
+    # nothing, while the first goes on to publish.
+    with round_trip() as rt:
+        (rt.codex / "AGENTS.md").write_text("hand edit\n", encoding="utf-8")
+        first = subprocess.Popen(
+            [sys.executable, "-B", "-c", PARKED_PUBLISH_SYNC, str(rt.repo / "scripts")],
             env={**os.environ, "HOME": str(rt.home)},
             cwd=rt.home,
             stdin=subprocess.PIPE,
@@ -1710,37 +1660,55 @@ def test_overlapping_direct_syncs_leave_the_home_as_it_was() -> None:
             stderr=subprocess.STDOUT,
             text=True,
         )
-
-    def parks(sync: subprocess.Popen[str], marker: str) -> bool:
-        assert sync.stdout is not None
-        return any(line.strip() == marker for line in sync.stdout)
-
-    with round_trip() as rt:
-        (rt.codex / "AGENTS.md").write_text("hand edit\n", encoding="utf-8")
-        # The check fails on a profile outside the mirror, which no publish fixes.
-        (rt.codex / "p.config.toml").write_text('approval_policy = "on-request"\n')
-        before = snapshot(rt.home, ("",))
-        first = start(rt, "check")
-        second: subprocess.Popen[str] | None = None
         try:
-            assert parks(first, "CHECK PARKED")
-            assert snapshot(rt.home, ("",)) != before
-            second = start(rt, "publish")
-            second_parked = parks(second, "PUBLISH PARKED")
-            first.communicate("\n", timeout=120)
-            second.communicate("\n" if second_parked else None, timeout=120)
+            assert first.stdout is not None
+            assert any(line.strip() == "PUBLISH PARKED" for line in first.stdout)
+            before = snapshot(rt.home, ("",))
+            second = rt.sync()
+            assert second.returncode == 75, describe(second)
+            assert "another sync holds a lock" in second.stderr, describe(second)
+            assert snapshot(rt.home, ("",)) == before
+            output = first.communicate("\n", timeout=120)[0]
         finally:
-            for sync in (first, second):
-                if sync is not None and sync.poll() is None:
-                    sync.kill()
-                    sync.wait()
-        assert first.returncode == 1, first.returncode
-        assert second.returncode != 0, second.returncode
-        after = snapshot(rt.home, ("",))
-        changed = sorted(
-            key for key in before.keys() | after.keys() if before.get(key) != after.get(key)
-        )
-        assert changed == [], changed
+            if first.poll() is None:
+                first.kill()
+                first.wait()
+        assert first.returncode == 0, output
+        assert (rt.codex / "AGENTS.md").read_text(encoding="utf-8") != "hand edit\n"
+
+
+def test_check_remediation_names_the_checked_sync() -> None:
+    # The check's advice is what a user runs next: it must name a script that
+    # exists, and the one that checks before it publishes, not the bare
+    # renderer.
+    with round_trip() as rt:
+        sync = rt.repo / "scripts" / "sync_codex.py"
+        assert sync.is_file(), sync
+        (rt.home / ".claude" / "CLAUDE.md").write_text("changed\n", encoding="utf-8")
+        result = assert_check_fails(rt, "Claude source drift detected")
+        drift = next(line for line in result.stdout.splitlines() if "source drift" in line)
+        assert drift.endswith(f"run {sync}"), drift
+
+        rt.manifest.unlink()
+        result = assert_check_fails(rt, "unusable")
+        unusable = next(line for line in result.stdout.splitlines() if "unusable" in line)
+        assert unusable.endswith(f"run {sync}"), unusable
+
+
+def test_the_renderer_alone_publishes_nothing_and_names_the_checked_sync() -> None:
+    # render_codex.py run by itself published into the home unchecked. It
+    # refuses instead, with or without a manifest, naming the sync.
+    for keep_manifest in (True, False):
+        with round_trip() as rt:
+            (rt.codex / "AGENTS.md").write_text("hand edit\n", encoding="utf-8")
+            if not keep_manifest:
+                rt.manifest.unlink()
+            before = snapshot(rt.home, ("",))
+            result = rt.run("render_codex.py")
+            assert result.returncode != 0, describe(result)
+            missing = result.stderr.strip().splitlines()[-1]
+            assert missing.endswith(f"run {rt.repo / 'scripts' / 'sync_codex.py'}"), missing
+            assert snapshot(rt.home, ("",)) == before
 
 
 def test_frontmatter_invariant_covers_plugin_and_command_wrappers() -> None:
@@ -1945,7 +1913,7 @@ if __name__ == "__main__":
     test_the_stage_holds_every_managed_path_and_what_sits_beside_it()
     test_sync_replaces_a_hand_made_skill_at_a_planned_name_without_backup()
     test_sync_prunes_skills_the_plan_does_not_hold_but_not_codex_system_skills()
-    test_failed_publish_restores_the_skill_it_replaced()
+    test_a_sync_whose_render_fails_part_way_leaves_the_skill_it_would_replace()
     test_sync_replaces_a_regular_file_at_a_planned_wrapper_name()
     test_first_sync_takes_a_planned_skill_name_whoever_made_it()
     test_check_rejects_edited_skill_wrapper_that_stays_generated()
@@ -1955,12 +1923,12 @@ if __name__ == "__main__":
     test_sync_prunes_what_a_killed_run_left_beside_a_managed_path()
     test_sync_repairs_a_modified_content_addressed_hook_file()
     test_sync_repairs_generator_owned_hook_paths_of_the_wrong_type()
-    test_paths_cleared_for_the_wrong_type_are_replaced_and_rolled_back()
+    test_paths_of_the_wrong_type_are_replaced_only_by_a_sync_that_passes()
     test_sync_replaces_every_planned_path_of_the_wrong_type()
     test_sync_replaces_a_symlink_where_the_plan_writes_a_file()
     test_sync_replaces_a_symlink_where_the_plan_needs_a_directory()
     test_sync_rewrites_a_stable_hook_script_whose_content_differs()
-    test_hook_publication_still_refuses_a_genuine_address_collision()
+    test_the_publish_refuses_a_genuine_hook_address_collision()
     test_sync_removes_rules_files_it_does_not_generate()
     test_sync_prunes_role_and_rules_files_it_does_not_render_without_backup()
     test_sync_strips_a_network_allow_codex_persisted()
@@ -1976,12 +1944,11 @@ if __name__ == "__main__":
     test_agent_role_files_cannot_loosen_the_session()
     test_profile_config_files_cannot_loosen_the_session()
     test_a_direct_sync_whose_check_fails_leaves_the_home_as_it_was()
+    test_a_direct_sync_publishes_exactly_the_stage_its_check_passed()
+    test_a_direct_sync_stopped_before_it_publishes_leaves_the_home_as_it_was()
+    test_a_second_direct_sync_changes_nothing_while_one_holds_the_home()
     test_check_remediation_names_the_checked_sync()
-    test_render_without_a_manifest_names_the_checked_sync()
-    test_a_direct_sync_stopped_during_its_check_leaves_the_home_as_it_was()
-    test_a_signal_during_a_failed_checks_rollback_waits_for_the_restore()
-    test_a_direct_syncs_failed_rollback_names_one_snapshot_of_all_it_changed()
-    test_overlapping_direct_syncs_leave_the_home_as_it_was()
+    test_the_renderer_alone_publishes_nothing_and_names_the_checked_sync()
     test_frontmatter_invariant_covers_plugin_and_command_wrappers()
     test_sync_converges_after_claude_agents_are_removed_or_renamed()
     test_sync_prunes_references_to_removed_agents_and_disabled_plugins()
