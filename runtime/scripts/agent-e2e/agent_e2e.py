@@ -277,12 +277,15 @@ def scrub_dir(path: pathlib.Path, *, require_redaction: bool = False) -> list[st
     redact secrets in every file kept (ledgers, notes, transcripts) for
     review. Returns the errors; one failed item never stops the others.
     See redact_dir for REQUIRE_REDACTION."""
-    errors = _remove_secrets(path)
+    errors, opened = _remove_secrets(path)
+    if not opened:
+        return errors  # a refused or absent root: nothing to redact either
     return errors + redact_dir(path, required=require_redaction)
 
 
-def _remove_secrets(path: pathlib.Path) -> list[str]:
-    """The removal pass of scrub_dir.
+def _remove_secrets(path: pathlib.Path) -> tuple[list[str], bool]:
+    """The removal pass of scrub_dir. Returns the errors and whether PATH
+    was opened as a directory at all.
 
     Runs outside the sandbox on a tree a run could rewrite, so nothing here
     follows a link: PATH itself is opened O_NOFOLLOW and every step after it
@@ -293,9 +296,9 @@ def _remove_secrets(path: pathlib.Path) -> list[str]:
     try:
         root = os.open(path, _DIR_NOFOLLOW)
     except FileNotFoundError:
-        return errors
+        return errors, False
     except OSError as exc:  # a link planted at PATH (ELOOP) included
-        return [f"{path}: {exc}"]
+        return [f"{path}: {exc}"], False
     def record(exc: BaseException) -> None:
         errors.append(f"{path}: {exc}")
 
@@ -326,7 +329,7 @@ def _remove_secrets(path: pathlib.Path) -> list[str]:
         record(exc)
     finally:
         os.close(root)
-    return errors
+    return errors, True
 
 
 # Account material a run PRINTED rather than left as a file: an agent that

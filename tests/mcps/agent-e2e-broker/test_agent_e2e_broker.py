@@ -23,7 +23,8 @@ import unittest
 HERE = Path(__file__).resolve().parents[3] / "runtime" / "mcps" / "agent-e2e-broker"
 SERVER = HERE / "server.py"
 HARNESS = HERE.parents[1] / "scripts" / "agent-e2e" / "agent_e2e.py"
-REDACTION = HERE.parents[1] / "hooks" / "secret_redaction.py"
+RUNTIME = HERE.parents[1]
+REDACTION = RUNTIME / "hooks" / "secret_redaction.py"
 # A stand-in `secret-redact` (the real one is a nixos-config package no CI
 # runner has): same contract, finds `sk-ant-` tokens, fails on FAIL-THE-SCAN.
 FAKE_REDACT = HERE.parents[2] / "tests" / "stubs" / "secret-redact-fake"
