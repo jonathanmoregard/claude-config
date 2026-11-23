@@ -35,5 +35,5 @@ case "${NP_FIXTURE:?}" in
     git push -q -u origin feature
     printf '# demo\n\nA tiny demo project.\n' > README.md
     git commit -q --amend -am "docs: describe the project"
-    git -C "$RUN/origin.git" rev-parse feature > "$RUN/remote-before.txt" ;;
+    git --git-dir "$RUN/origin.git" rev-parse feature > "$RUN/remote-before.txt" ;;
 esac
